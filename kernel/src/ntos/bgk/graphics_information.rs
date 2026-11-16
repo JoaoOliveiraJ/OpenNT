@@ -157,6 +157,10 @@ pub fn initialize_firmware_display() -> Option<BootFrameBuffer> {
     if frame_buffer.frame_buffer == 0 || !video_bios(0x4F02, mode | 0x4000, 0, 0, 0).0 {
         return None;
     }
+    // A fonte do BIOS de vídeo, para os textos da tela de bugcheck.
+    if !super::boot_font::load_firmware_font() {
+        crate::debug_print!("[bgk] fonte de 8x16 do BIOS de video indisponivel");
+    }
     *FRAME_BUFFER.lock() = Some(frame_buffer);
     INITIALIZED.store(true, Ordering::Release);
     crate::debug_print!("[bgk] video de boot: modo VBE {:#x} {}x{}x32, framebuffer {:#x}, {} pixels por linha", mode, frame_buffer.width, frame_buffer.height, frame_buffer.frame_buffer, frame_buffer.pixel_stride);

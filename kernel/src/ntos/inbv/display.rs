@@ -48,8 +48,9 @@ pub fn display_state() -> u32 {
     DISPLAY.lock().state
 }
 
-/// BvgaAcquireDisplayOwnership.
-fn acquire_display_ownership() {
+/// BvgaAcquireDisplayOwnership (o InbvAcquireDisplayOwnership do
+/// KiDisplayBlueScreen).
+pub fn acquire_display_ownership() {
     let reset = {
         let display = DISPLAY.lock();
         if display.state == DISPLAY_STATE_LOST { display.reset_display_parameters } else { 0 }
@@ -89,4 +90,28 @@ pub fn notify_display_ownership_change(owned: bool, _context: u64) -> u32 {
 /// InbvSetVirtualFrameBuffer(FrameBuffer, Context).
 pub fn set_virtual_frame_buffer(_frame_buffer: u64, _context: u64) -> u32 {
     STATUS_NOT_IMPLEMENTED
+}
+
+/// Colunas e linhas da tela de texto do vídeo de boot.
+pub fn text_size() -> (usize, usize) {
+    (vga::COLUMNS, vga::ROWS)
+}
+
+/// InbvSolidColorFill da tela inteira no modo texto: espaços com o
+/// atributo (fundo nos 4 bits altos, texto nos baixos).
+pub fn solid_color_fill(attribute: u8) {
+    if display_state() == DISPLAY_STATE_OWNED {
+        vga::fill_screen(attribute);
+    }
+}
+
+/// InbvDisplayString numa posição: bytes da página de código 437 a partir
+/// de (coluna, linha), cortados na borda direita.
+pub fn display_string_at(column: usize, row: usize, text: &[u8], attribute: u8) {
+    if display_state() != DISPLAY_STATE_OWNED {
+        return;
+    }
+    for (offset, &byte) in text.iter().enumerate() {
+        vga::put_cell(column + offset, row, byte, attribute);
+    }
 }

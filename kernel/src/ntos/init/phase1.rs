@@ -60,6 +60,9 @@ pub fn init() {
     // CurrentControlSet, as hives SOFTWARE, SAM, SECURITY e DEFAULT e a
     // lista de hives; sem um arquivo, as mesmas chaves em memória.
     crate::ntos::cm::hive_init::initialize_hives().unwrap_or_else(|error| panic!("hives de maquina: {error}"));
+    // IopReadDumpRegistry: o AutoReboot e o despejo do CrashControl, que o
+    // KeBugCheckEx consulta sem tocar no Registro.
+    crate::ntos::ke::bugcheck::read_crash_control();
     // Definições WNF da hive (Control\Notifications), que NTDLL e KERNELBASE
     // consultam; os dados só existem depois de publicação real.
     crate::ntos::cm::wnf_defaults::initialize().unwrap_or_else(|error| panic!("{error}"));

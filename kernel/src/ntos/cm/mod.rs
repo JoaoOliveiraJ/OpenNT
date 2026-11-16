@@ -40,6 +40,7 @@ pub mod primitive_provider;
 pub mod registry;
 pub mod arbiters;
 pub mod pnp_control;
+pub mod crash_control;
 pub mod seed;
 pub mod session_manager;
 pub mod ini_file_mapping;

@@ -213,6 +213,28 @@ pub fn consume(
     })
 }
 
+/// KiInvokeBugCheckEntryCallbacks(KbCallbackReserved1, NULL, 0): os
+/// callbacks de entrada do bugcheck, com dados nulos; devolve quantos
+/// rodaram.
+pub fn invoke_entry_callbacks() -> usize {
+    let mut invoked = 0;
+    let result = consume(
+        1,
+        &mut |record, invoke| {
+            let entry = record_at(record);
+            super::bugcheck::announce_callback(1, entry.callback_routine.get(), entry.component.get());
+            invoke(0, 0);
+            invoked += 1;
+            Ok(())
+        },
+        0,
+    );
+    if let Err(error) = result {
+        debug_print!("[bugcheck] callbacks de entrada: {}", error);
+    }
+    invoked
+}
+
 // ---- dados secundários (motivo 2) ------------------------------------------
 
 fn workspace() -> Result<(u64, u64), KernelError> {
@@ -258,6 +280,10 @@ pub fn publish_secondary_data(selected_record: u64) -> Result<(), KernelError> {
     let result = consume(
         2,
         &mut |record, invoke| {
+            if super::bugcheck::is_active() {
+                let entry = record_at(record);
+                super::bugcheck::announce_callback(2, entry.callback_routine.get(), entry.component.get());
+            }
             clear_descriptor();
             // OutBuffer nulo pede o tamanho; InBuffer já oferece memória real.
             invoke(descriptor_address, KbugcheckSecondaryDumpData::SIZE);

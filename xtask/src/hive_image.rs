@@ -44,6 +44,8 @@ mod cm {
     pub mod arbiters;
     #[path = "../../../../kernel/src/ntos/cm/pnp_control.rs"]
     pub mod pnp_control;
+    #[path = "../../../../kernel/src/ntos/cm/crash_control.rs"]
+    pub mod crash_control;
     pub mod service {
         #[path = "../../../../../kernel/src/ntos/cm/service/boot_services.rs"]
         pub mod boot_services;

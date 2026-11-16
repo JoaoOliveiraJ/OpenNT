@@ -1922,6 +1922,51 @@ fn ke_process_attachment(assert: Assert) {
     assert(bugcheck_reason::publish_secondary_data(0).is_ok(), "bugcheck2: coleta sem callbacks registrados");
 }
 
+/// KeGetBugMessageText, a lista do KeRegisterBugCheckCallback, o tipo de
+/// tela do BcpGetDisplayType e os textos de boot da tela de bugcheck.
+fn ke_bugcheck(assert: Assert) {
+    use crate::ntos::bgk::bugcheck_screen;
+    use crate::ntos::inc::types::extra_ke_misc::KbugcheckCallbackRecord;
+    use crate::ntos::ke::bugcheck;
+    // Os nomes da tabela de mensagens do ntoskrnl.exe (com o CR LF da
+    // mensagem); um código sem mensagem não tem texto.
+    let named = |code: u32, name: &[u8]| bugcheck::bug_message_text(code).is_some_and(|text| text.strip_suffix(b"\r\n") == Some(name));
+    assert(named(0xE2, b"MANUALLY_INITIATED_CRASH") && named(0xD1, b"DRIVER_IRQL_NOT_LESS_OR_EQUAL") && named(0x1, b"APC_INDEX_MISMATCH") && bugcheck::bug_message_text(0x0012_3456).is_none(), "bugcheck: KeGetBugMessageText pelo KiBugCodeMessages da imagem do kernel");
+    // KeRegisterBugCheckCallback insere pela cabeça (a varredura roda o mais
+    // novo primeiro), com o checksum e o estado BufferInserted.
+    let block = guest::alloc_bytes(2 * KbugcheckCallbackRecord::SIZE);
+    let (first, second) = (block, block + KbugcheckCallbackRecord::SIZE);
+    let component = b"phase6\0".as_ptr() as u64;
+    let registered = (call_export("KeRegisterBugCheckCallback", &[first, 0x1111, 0x2000, 0x10, component]), call_export("KeRegisterBugCheckCallback", &[second, 0x3333, 0x4000, 0x20, component]));
+    let record = |address: u64| at::<KbugcheckCallbackRecord>(address);
+    let linked = record(second).entry.flink.get() == first && record(first).entry.blink.get() == second;
+    let fields = record(first).state.get() == 1 && record(first).checksum.get() == 0x1111 + 0x2000 + 0x10 + component && record(first).component.get() == component;
+    let again = call_export("KeRegisterBugCheckCallback", &[first, 0x1111, 0x2000, 0x10, component]);
+    assert(registered == (Some(1), Some(1)) && linked && fields && again == Some(0), "bugcheck: KeRegisterBugCheckCallback insere pela cabeca com checksum e estado");
+    let removed = call_export("KeDeregisterBugCheckCallback", &[first]);
+    let unlinked = record(second).entry.flink.get() != first && record(first).state.get() == 0;
+    assert(removed == Some(1) && unlinked && call_export("KeDeregisterBugCheckCallback", &[first]) == Some(0) && call_export("KeDeregisterBugCheckCallback", &[second]) == Some(1), "bugcheck: KeDeregisterBugCheckCallback tira da lista e zera o estado");
+    guest::free_bytes(block);
+    // KiDumpParameterImages: o driver que contém um parâmetro (o kernel e os
+    // valores pequenos não contam).
+    if let Some(hal) = crate::ntos::mm::loaded_images::find_by_base_name("hal.dll") {
+        let mut name = [0u8; 64];
+        let length = bugcheck::parameter_driver(&[0x10, crate::ntos::mm::memory_map::KERNEL_VIRTUAL_BASE + 0x1000, hal.image_base + 0x10, 0], &mut name);
+        let mut none = [0u8; 64];
+        assert(name[..length].eq_ignore_ascii_case(b"hal.dll") && bugcheck::parameter_driver(&[0, 1, 2, 3], &mut none) == 0, "bugcheck: KiBugCheckDriver pelo parametro dentro de um driver");
+    }
+    // BcpGetDisplayType: o último tipo cuja resolução mínima a tela alcança.
+    let kinds = [(640, 480), (641, 481), (1024, 768), (1920, 1080), (2560, 1440)].map(|(width, height)| bugcheck_screen::display_type(width, height));
+    assert(kinds == [0, 1, 2, 3, 4] && bugcheck_screen::display_type(1023, 768) == 1, "bugcheck: tipo de tela pela tabela do kernel");
+    // Os textos da tela: o MUI de recursos de boot do bundle, com o
+    // progresso cortado em volta do "%1".
+    if crate::hal::bundle::read("apps/bootres.dll.mui").is_some() {
+        let label = bugcheck_screen::find_message(bugcheck_screen::MESSAGE_STOP_CODE).is_some_and(|text| !text.as_slice().is_empty() && !text.as_slice().contains(&'\r'));
+        let (_, suffix) = bugcheck_screen::progress_messages(bugcheck_screen::MESSAGE_PROGRESS);
+        assert(label && suffix.as_slice().first() == Some(&'%'), "bugcheck: textos da tela pelo bootres.dll.mui");
+    }
+}
+
 fn ntoskrnl_ke_group(assert: Assert) {
     use crate::ntos::ke::{clock, irql, smp};
     use crate::ntos::ps::process;
@@ -14726,6 +14771,7 @@ pub fn run(assert: Assert) {
     ntoskrnl_thread_information(assert);
     ntoskrnl_ex_group(assert);
     ke_process_attachment(assert);
+    ke_bugcheck(assert);
     ntoskrnl_ke_group(assert);
     ntoskrnl_mm_group(assert);
     ntoskrnl_driver_lifecycle(assert);

@@ -4767,7 +4767,7 @@ fn boot_services_hive(assert: Assert) {
     let values = (dword("KeyboardDataQueueSize"), dword("MouseDataQueueSize"), dword("PollStatusIterations"), dword("PollingIterations"), dword("ResendIterations"), dword("OverrideKeyboardType"), dword("CrashOnCtrlScroll"));
     let classes = pnp::read_class_upper_filters("{4D36E96B-E325-11CE-BFC1-08002BE10318}") == [String::from("kbdclass")] && pnp::read_class_upper_filters("{4D36E96F-E325-11CE-BFC1-08002BE10318}") == [String::from("mouclass")];
     assert(seeded && vgk_seeded, "bootservices: pilhas de teclado/mouse, armazenamento e vgk semeadas na hive");
-    assert(values == (Some(0x64), Some(0x64), Some(0x2000), Some(0x1900), Some(3), Some(0), Some(0)) && classes, "bootservices: parametros do i8042prt e UpperFilters das classes");
+    assert(values == (Some(0x64), Some(0x64), Some(0x2000), Some(0x1900), Some(3), Some(0), Some(1)) && classes, "bootservices: parametros do i8042prt e UpperFilters das classes");
     // A fase 1 percorreu os serviços de boot e concluiu a fase de drivers.
     assert(boot_drivers_state::is_initialized(), "bootservices: fase de drivers de boot concluida pela fase 1");
 }

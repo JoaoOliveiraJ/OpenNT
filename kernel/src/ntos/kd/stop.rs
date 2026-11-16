@@ -678,6 +678,20 @@ pub fn bug_check(code: u32, parameters: [u64; 4]) {
     unsafe { opennt_kd_bugcheck_break() };
 }
 
+/// O KiSendFreeze do KeBugCheckEx: os outros processadores ficam presos
+/// pela NMI de congelamento (com o quadro publicado, como numa parada do
+/// depurador) até um degelo; devolve quantos estão presos.
+pub fn freeze_for_bug_check() -> usize {
+    let number = current_processor();
+    freeze_others(number);
+    (0..MAX_CPUS).filter(|&other| other != number && PROCESSORS[other].frozen.load(Ordering::Acquire)).count()
+}
+
+/// O KiSendThawExecution do KeBugCheckEx antes do reinício.
+pub fn thaw_after_bug_check() {
+    thaw_others(current_processor());
+}
+
 /// Pânico do kernel com o depurador ativo: para antes de travar a CPU.
 pub fn panic_stop() {
     if active() && !stopped() {

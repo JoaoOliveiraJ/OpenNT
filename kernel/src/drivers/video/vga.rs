@@ -124,6 +124,29 @@ pub fn clear() {
     screen.hardware_cursor();
 }
 
+/// Pinta a tela inteira com espaços no atributo dado e leva o cursor ao
+/// canto (a tela de bugcheck em modo texto).
+pub fn fill_screen(attribute: u8) {
+    let mut screen = SCREEN.lock();
+    screen.attribute = attribute;
+    for y in 0..HEIGHT {
+        screen.clear_line(y);
+    }
+    screen.cx = 0;
+    screen.cy = 0;
+    screen.hardware_cursor();
+}
+
+/// Grava um byte da página de código 437 numa célula, sem mover o cursor.
+pub fn put_cell(x: usize, y: usize, byte: u8, attribute: u8) {
+    if x < WIDTH && y < HEIGHT {
+        physical::write16(cell(x, y), (attribute as u16) << 8 | byte as u16);
+    }
+}
+
+pub const COLUMNS: usize = WIDTH;
+pub const ROWS: usize = HEIGHT;
+
 pub fn set_attribute(attribute: u8) {
     SCREEN.lock().attribute = attribute;
 }

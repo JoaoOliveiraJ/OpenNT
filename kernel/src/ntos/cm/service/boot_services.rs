@@ -41,7 +41,10 @@ const DRIVERS: &[(&str, &str, u32, u32)] = &[
     ("watchdog", "watchdog.sys", 3, SERVICE_KERNEL_DRIVER),
 ];
 
-/// Os parâmetros do i8042prt que o INF criaria.
+/// Os parâmetros do i8042prt que o INF criaria, com o CrashOnCtrlScroll
+/// ligado: o despejo manual pelo teclado da documentação do Windows (Ctrl
+/// direito pressionado e Scroll Lock duas vezes), em que o próprio
+/// i8042prt.sys chama KeBugCheckEx(MANUALLY_INITIATED_CRASH).
 const I8042PRT_PARAMETERS: &[(&str, u32)] = &[
     ("KeyboardDataQueueSize", 0x64),
     ("MouseDataQueueSize", 0x64),
@@ -49,7 +52,7 @@ const I8042PRT_PARAMETERS: &[(&str, u32)] = &[
     ("PollingIterations", 0x1900),
     ("ResendIterations", 3),
     ("OverrideKeyboardType", 0),
-    ("CrashOnCtrlScroll", 0),
+    ("CrashOnCtrlScroll", 1),
 ];
 
 /// Classes de dispositivo com os UpperFilters que o PnP anexa sobre o FDO.

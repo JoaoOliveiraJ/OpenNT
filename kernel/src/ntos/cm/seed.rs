@@ -113,6 +113,7 @@ pub fn system_keys(smss_boot: bool) -> Vec<SeedKey> {
     keys.extend(super::service::boot_services::parameter_keys());
     keys.extend(super::arbiters::seed_keys());
     keys.extend(super::pnp_control::seed_keys());
+    keys.extend(super::crash_control::seed_keys());
     if smss_boot {
         keys.extend(super::session_manager::seed_keys());
     }
