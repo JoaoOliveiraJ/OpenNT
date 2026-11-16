@@ -157,3 +157,10 @@ pub fn acpi_root() -> bool {
 pub fn usb() -> bool {
     flag(name::USB)
 }
+
+/// `MEMORYPRESSURE` (`--memory-pressure`): depois que o smss cria o arquivo
+/// de paginação, um programa de usuário comita mais memória que a RAM e a
+/// relê (`test/memory_pressure.rs`).
+pub fn memory_pressure_test() -> bool {
+    flag(name::MEMORY_PRESSURE)
+}

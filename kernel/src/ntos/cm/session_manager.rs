@@ -4,13 +4,15 @@
 //! de uma instalação do Windows 10 19041: os subsistemas (o `Required` com
 //! `Debug` e `Windows`, e a linha de comando do csrss), as DLLs conhecidas
 //! (um valor por DLL), os dispositivos DOS, o ambiente do sistema, os
-//! diretórios de objetos e os parâmetros do Memory Management.
+//! diretórios de objetos e os parâmetros do Memory Management, e o
+//! `Control\CrashControl` que o smss abre antes dos arquivos de paginação.
 //!
 //! O `SubSystems` leva o `Kmode` da instalação
 //! (`\SystemRoot\System32\win32k.sys`): o smss da sessão o carrega pela
 //! SystemExtendServiceTableInformation antes de criar o csrss. Ficam de fora
 //! o que pertence a outro marco ou à máquina de origem: o `BootExecute` (o
-//! autochk), os arquivos de paginação e as renomeações pendentes; do
+//! autochk) e as renomeações pendentes; o arquivo de paginação fica no
+//! volume de dados (D:) em vez do C: da instalação; do
 //! ambiente saem os caminhos de programas de terceiros. Só o boot do
 //! processo inicial real (`--initial-process=smss`) leva esta configuração.
 //!
@@ -140,8 +142,11 @@ const ENVIRONMENT: &[(&str, Value)] = &[
     ("windir", Value::Text(REG_EXPAND_SZ, "%SystemRoot%")),
 ];
 
-/// `Memory Management`, sem os arquivos de paginação.
+/// `Memory Management`. O `PagingFiles` segue o formato da instalação
+/// (`caminho mínimo máximo`, em MB), com o arquivo de paginação no volume de
+/// dados D:, que o smss cria pelo NtCreatePagingFile.
 const MEMORY_MANAGEMENT: &[(&str, Value)] = &[
+    ("PagingFiles", Value::Strings(&["D:\\pagefile.sys 192 256"])),
     ("ClearPageFileAtShutdown", Value::Number(0)),
     ("DisablePagingExecutive", Value::Number(0)),
     ("LargeSystemCache", Value::Number(0)),
@@ -155,6 +160,21 @@ const MEMORY_MANAGEMENT: &[(&str, Value)] = &[
     ("SystemPages", Value::Number(0)),
     ("PhysicalAddressExtension", Value::Number(0x1)),
     ("FeatureSettings", Value::Number(0)),
+];
+
+/// `Control\CrashControl` da instalação: o SmpPagefileInitialize abre a
+/// chave antes de criar os arquivos de paginação.
+const CRASH_CONTROL: &[(&str, Value)] = &[
+    ("AutoReboot", Value::Number(0x1)),
+    ("CrashDumpEnabled", Value::Number(0x7)),
+    ("DumpFile", Value::Text(REG_EXPAND_SZ, "%SystemRoot%\\MEMORY.DMP")),
+    ("DumpLogLevel", Value::Number(0)),
+    ("EnableLogFile", Value::Number(0x1)),
+    ("LogEvent", Value::Number(0x1)),
+    ("MinidumpDir", Value::Text(REG_EXPAND_SZ, "%SystemRoot%\\Minidump")),
+    ("MinidumpsCount", Value::Number(0x5)),
+    ("Overwrite", Value::Number(0x1)),
+    ("DumpFilters", Value::Strings(&["dumpfve.sys"])),
 ];
 
 /// UTF-16LE com NUL.
@@ -188,5 +208,10 @@ fn key(relative: &str, values: &[(&str, Value)]) -> SeedKey {
 pub fn seed_keys() -> Vec<SeedKey> {
     let known: Vec<(&str, Value)> = KNOWN_DLLS.iter().map(|&(name, dll)| (name, Value::Text(REG_SZ, dll))).collect();
     let devices: Vec<(&str, Value)> = DOS_DEVICES.iter().map(|&(name, target)| (name, Value::Text(REG_SZ, target))).collect();
-    alloc::vec![key("", ROOT), key("SubSystems", SUBSYSTEMS), key("KnownDLLs", &known), key("DOS Devices", &devices), key("Environment", ENVIRONMENT), key("Memory Management", MEMORY_MANAGEMENT)]
+    let mut crash_control = SeedKey::new("CurrentControlSet\\Control\\CrashControl");
+    for (name, value) in CRASH_CONTROL {
+        let (kind, data) = encode(value);
+        crash_control.value(name, kind, data);
+    }
+    alloc::vec![key("", ROOT), key("SubSystems", SUBSYSTEMS), key("KnownDLLs", &known), key("DOS Devices", &devices), key("Environment", ENVIRONMENT), key("Memory Management", MEMORY_MANAGEMENT), crash_control]
 }

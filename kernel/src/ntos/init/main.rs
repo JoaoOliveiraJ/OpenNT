@@ -207,6 +207,9 @@ pub fn kmain() -> ! {
         if let Err(error) = crate::ntos::init::initial_process::start() {
             debug_print!("[init] processo inicial nao criado: {}", error);
         }
+        if boot_config::memory_pressure_test() {
+            crate::ntos::test::memory_pressure::start();
+        }
     } else if boot_config::user_program() == "shell" {
         scheduler::spawn("shell", crate::shell::main());
     } else {

@@ -54,6 +54,9 @@ pub const PNP_ROOT: &str = "PNPROOT";
 pub const SHUTDOWN_TEST: &str = "SHUTDOWNTEST";
 /// A pilha USB 3 e HID real sobe pelo PnP na controladora xHCI.
 pub const USB: &str = "USB";
+/// O teste de pressão de memória sobre o arquivo de paginação, no boot do
+/// smss (`test/memory_pressure.rs`).
+pub const MEMORY_PRESSURE: &str = "MEMORYPRESSURE";
 
 /// O valor de `NOME=valor`.
 pub fn value<'a>(text: &'a str, name: &str) -> Option<&'a str> {

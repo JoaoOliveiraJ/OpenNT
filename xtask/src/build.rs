@@ -29,6 +29,9 @@ pub const TARGET: &str = "x86_64-unknown-none";
 const STAGE2_MAX: usize = 64 * 512; // reserva do stage2 na imagem (LBA 1..64)
 /// Posição do bloco de opções de carga na imagem de boot.
 const LOAD_OPTIONS_OFFSET: u64 = load_options::SECTOR as u64 * 512;
+/// Espaço livre do volume NTFS do boot do smss, em MiB: o máximo do arquivo
+/// de paginação (`cm/session_manager.rs`) e folga para o resto do boot.
+const SMSS_FREE_SPACE_MIB: usize = 288;
 /// Os binários do Windows do bundle, para todo build (`--windows-dir` troca):
 /// o caminho entra no build do kernel, então uma pasta só faz builds com
 /// `--build-dir` diferentes reaproveitarem o mesmo kernel compilado.
@@ -82,6 +85,9 @@ pub struct BuildOptions {
     /// `--usb`: a máquina ganha a controladora xHCI com teclado e tablet USB
     /// e o PnP sobe a pilha USB 3 e HID do Windows sobre ela.
     pub usb: bool,
+    /// `--memory-pressure`: o teste de pressão de memória sobre o arquivo de
+    /// paginação do boot do smss.
+    pub memory_pressure: bool,
 }
 
 impl BuildOptions {
@@ -123,6 +129,9 @@ impl BuildOptions {
         if self.usb {
             words.push(String::from(name::USB));
         }
+        if self.memory_pressure {
+            words.push(String::from(name::MEMORY_PRESSURE));
+        }
         Ok(words.join(" "))
     }
 
@@ -154,6 +163,7 @@ impl BuildOptions {
             kd: String::new(),
             shutdown_test: String::new(),
             usb: false,
+            memory_pressure: false,
             ..self.clone()
         }
     }
@@ -338,7 +348,10 @@ pub fn build(options: &BuildOptions) -> Result<BuildOutput, String> {
     for (name, image) in crate::hive_image::machine_hives(options.initial_process == "smss") {
         ntfs_files.push((format!("Windows/System32/config/{name}"), image));
     }
-    let ntfs_bytes = crate::ntfs_image::build(&ntfs_path, &ntfs_files, 32, 256)?;
+    // O boot do smss cria o arquivo de paginação do `PagingFiles` (192 MB a
+    // 256 MB em D:): o volume dele tem espaço livre para o máximo.
+    let free_space_mib = if options.initial_process == "smss" { SMSS_FREE_SPACE_MIB } else { 32 };
+    let ntfs_bytes = crate::ntfs_image::build(&ntfs_path, &ntfs_files, free_space_mib, 256)?;
     // O disco do controlador NVMe do QEMU, particionado, com um volume NTFS
     // próprio: montado em todo build (a opção de carga `--storage=nvme`
     // não muda as imagens), ligado só às máquinas com a opção.
@@ -379,6 +392,7 @@ mod tests {
             kd: String::new(),
             shutdown_test: String::new(),
             usb: false,
+            memory_pressure: false,
         }
     }
 

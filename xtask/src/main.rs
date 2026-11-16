@@ -20,7 +20,9 @@
 //! `--display=basic`, `--windows-dir=DIR`, `--pnp-root=acpi|internal` (a raiz da árvore de
 //! dispositivos: o acpi.sys real, o padrão, ou o barramento PCI interno), `--kd=com2` (o
 //! depurador do kernel na COM2), `--shutdown-test=poweroff|reboot` (o teste do desligamento),
-//! `--usb` (também opção de máquina: a controladora xHCI com teclado e tablet USB).
+//! `--usb` (também opção de máquina: a controladora xHCI com teclado e tablet USB),
+//! `--memory-pressure` (o teste de pressão de memória sobre o arquivo de paginação do boot do
+//! smss).
 //! Fora `--release` e `--windows-dir`, elas não recompilam o kernel: vão no bloco de opções de
 //! carga da imagem de boot (`build.rs`), e o `--initial-process=smss` também troca o volume
 //! NTFS.
@@ -74,6 +76,8 @@ opcoes de build:   --release --build-dir=DIR --user-program=shell
                    --usb (controladora xHCI com teclado e tablet USB)
                    --kd=com2 (depurador do kernel na COM2)
                    --shutdown-test=poweroff|reboot (com --start-driver=ntfs: grava e desliga)
+                   --memory-pressure (com --initial-process=smss: teste de pressao de memoria
+                   sobre o arquivo de paginacao)
 opcoes de maquina: --accel=tcg|whpx --memory-mb=N --smp=N --kd-port=N --monitor-port=N
 test-boot:         --keys=TEXTO (\\n = Enter) --expect=TEXTO (repetivel)
                    --hold=MS (segue rodando MS ms sem falha depois da ultima saida)
@@ -142,6 +146,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             kd: String::new(),
             shutdown_test: String::new(),
             usb: false,
+            memory_pressure: false,
         },
         machine: MachineOptions { accelerator: "tcg".into(), memory_mb: 4096, smp: 4, kd_port: None, usb: false, monitor_port: None },
         positional: Vec::new(),
@@ -179,6 +184,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             "--kernel-test-scope" => parsed.build.kernel_test_scope = required()?,
             "--start-driver" => parsed.build.start_driver = required()?,
             "--trace-driver-api" => parsed.build.trace_driver_api = true,
+            "--memory-pressure" => parsed.build.memory_pressure = true,
             "--initial-process" => parsed.build.initial_process = required()?,
             "--storage" => parsed.build.storage = required()?,
             "--display" => parsed.build.display = required()?,
