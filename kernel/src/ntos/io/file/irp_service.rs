@@ -37,14 +37,19 @@
 //! - Classes de informação que o próprio I/O Manager responde, sem IRP:
 //!   FileAccessInformation, FileModeInformation, FileAlignmentInformation e,
 //!   num arquivo síncrono, FilePositionInformation (consulta e mudança) e
-//!   FileModeInformation (mudança).
+//!   FileModeInformation (mudança); a FileCompletionInformation e a
+//!   FileIoCompletionNotificationInformation (a porta de conclusão do
+//!   arquivo e os modos FO_SKIP_*, `io/completion/file_port.rs`).
+//! - A conclusão de um arquivo com porta e com ApcContext (o
+//!   UserApcContext do IRP) põe o pacote na IOCP; sem UserEvent, o
+//!   FO_SKIP_SET_EVENT deixa o evento do arquivo como está.
 //!
 //! Fora do NT: o KAPC da conclusão é alocado à parte, não o Tail.Apc do IRP
 //! (os últimos bytes do Tail guardam o IrpExtension, que o IoFreeIrp
 //! libera); o Fast I/O não é tentado (o IRP chega ao mesmo resultado);
-//! METHOD_IN_DIRECT/METHOD_OUT_DIRECT, dispositivos DO_DIRECT_IO, a rotina
-//! de APC de usuário (ApcRoutine) e a porta de conclusão do arquivo ainda
-//! não são atendidos (STATUS_NOT_SUPPORTED).
+//! METHOD_IN_DIRECT/METHOD_OUT_DIRECT, dispositivos DO_DIRECT_IO e a rotina
+//! de APC de usuário (ApcRoutine) ainda não são atendidos
+//! (STATUS_NOT_SUPPORTED).
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -56,6 +61,7 @@ use crate::ntos::inc::types::{DeviceObject, FileObject, IoStackLocation, IoStatu
 use crate::ntos::io::file::{information, query};
 use crate::ntos::io::irp_builder::{self, BuildOptions};
 use crate::ntos::io::threads::thread_requests;
+use crate::ntos::io::completion::file_port;
 use crate::ntos::io::{cancel, io_manager};
 use crate::ntos::ke::{apc, dispatcher, irql};
 use crate::ntos::mm::guest_memory as guest;
@@ -126,6 +132,8 @@ const FILE_ACCESS_INFORMATION: u32 = 8;
 const FILE_POSITION_INFORMATION: u32 = 14;
 const FILE_MODE_INFORMATION: u32 = 16;
 const FILE_ALIGNMENT_INFORMATION: u32 = 17;
+const FILE_COMPLETION_INFORMATION: u32 = 30;
+const FILE_IO_COMPLETION_NOTIFICATION_INFORMATION: u32 = 41;
 /// FILE_USE_FILE_POINTER_POSITION (ByteOffset.HighPart = -1, LowPart = -2).
 const FILE_USE_FILE_POINTER_POSITION: i64 = -2;
 /// IoStatus.Status ainda não gravado pela conclusão (IO_STATUS_BLOCK local).
@@ -162,6 +170,8 @@ struct Request {
     /// A thread saiu (IoCancelThreadIo): a conclusão não toca na memória de
     /// usuário.
     abandoned: bool,
+    /// O UserApcContext do IRP: o contexto do pacote da porta do arquivo.
+    apc_context: u64,
 }
 
 static REQUESTS: SpinLock<BTreeMap<u64, Request>> = SpinLock::new(BTreeMap::new());
@@ -294,11 +304,12 @@ fn top_location(packet: u64) -> &'static IoStackLocation {
 /// Registra a requisição, enfileira o IRP na thread e liga a conclusão. A
 /// requisição retém o FILE_OBJECT até o IopCompleteRequest; o serviço
 /// guarda a própria referência até sair da cauda, que ainda lê o arquivo.
-fn track(packet: u64, target: &Target, event: Option<Arc<EventObject>>, local: u64) {
+fn track(packet: u64, target: &Target, event: Option<Arc<EventObject>>, local: u64, apc_context: u64) {
     let _ = file_objects::reference(target.file);
+    irp_at(packet).overlay.asynchronous_parameters.user_apc_context.set(apc_context);
     let thread = process::get_current_thread();
     let queued = thread != 0 && thread_requests::insert(packet, thread).is_ok();
-    REQUESTS.lock().insert(packet, Request { thread, process: process::get_current_process(), file: target.file, event, local, synchronous: target.synchronous(), queued, apc: 0, abandoned: false });
+    REQUESTS.lock().insert(packet, Request { thread, process: process::get_current_process(), file: target.file, event, local, synchronous: target.synchronous(), queued, apc: 0, abandoned: false, apc_context });
     io_manager::manage_completion(packet, Box::new(move |_, _| completed(packet)));
 }
 
@@ -503,9 +514,12 @@ fn complete(packet: u64, in_thread: bool) {
                 }
                 None => {
                     file.final_status.set(status as i32);
-                    dispatcher::set_event(file.event.address());
+                    if !file_port::skips_file_event(request.file) {
+                        dispatcher::set_event(file.event.address());
+                    }
                 }
             }
+            file_port::complete(request.file, request.apc_context, status, information, irp.pending_returned.get() != 0);
         }
     }
     if request.queued {
@@ -662,7 +676,7 @@ pub fn transfer(arguments: &Transfer, write: bool) -> u32 {
     } else {
         location.parameters.read.key.set(key);
     }
-    track(packet, &target, event, 0);
+    track(packet, &target, event, 0, arguments.apc_context);
     synchronous_service_tail(&target, packet)
 }
 
@@ -745,7 +759,7 @@ pub fn fs_control(arguments: &Control) -> u32 {
     control.input_buffer_length.set(arguments.input_length);
     control.fs_control_code.set(arguments.code);
     control.type3_input_buffer.set(if method == METHOD_NEITHER { arguments.input } else { 0 });
-    track(packet, &target, event, 0);
+    track(packet, &target, event, 0, arguments.apc_context);
     synchronous_service_tail(&target, packet)
 }
 
@@ -834,7 +848,7 @@ pub fn query_information(handle: u64, io_status: u64, buffer: u64, length: u32, 
     let parameters = &top_location(packet).parameters.query_file;
     parameters.length.set(length);
     parameters.file_information_class.set(crate::ntos::inc::types::FileInformationClass(class as i32));
-    track(packet, &target, None, local);
+    track(packet, &target, None, local, 0);
     information_tail(&target, packet, local, io_status)
 }
 
@@ -881,6 +895,14 @@ pub fn set_information(handle: u64, io_status: u64, buffer: u64, length: u32, cl
         }
         file.current_byte_offset.quad_part.set(position);
         let status = if write_user_iosb(io_status, STATUS_SUCCESS, 0).is_err() { STATUS_ACCESS_VIOLATION } else { STATUS_SUCCESS };
+        return conclude(&target, false, None, status);
+    }
+    // A porta de conclusão do arquivo e os modos de notificação também são
+    // do I/O Manager (`io/completion/file_port.rs`).
+    if class == FILE_COMPLETION_INFORMATION || class == FILE_IO_COMPLETION_NOTIFICATION_INFORMATION {
+        let word = |at: usize| u64::from_le_bytes(input[at..at + 8].try_into().unwrap_or([0; 8]));
+        let status = if class == FILE_COMPLETION_INFORMATION { file_port::associate(target.file, word(0), word(8)) } else { file_port::set_notification_modes(target.file, u32::from_le_bytes(input[..4].try_into().unwrap_or([0; 4]))) };
+        let status = if status == STATUS_SUCCESS && write_user_iosb(io_status, STATUS_SUCCESS, 0).is_err() { STATUS_ACCESS_VIOLATION } else { status };
         return conclude(&target, false, None, status);
     }
     if class == FILE_MODE_INFORMATION {
@@ -934,6 +956,6 @@ pub fn set_information(handle: u64, io_status: u64, buffer: u64, length: u32, cl
     parameters.length.set(length);
     parameters.file_information_class.set(crate::ntos::inc::types::FileInformationClass(class as i32));
     parameters.file_object.set(0);
-    track(packet, &target, None, local);
+    track(packet, &target, None, local, 0);
     information_tail(&target, packet, local, io_status)
 }

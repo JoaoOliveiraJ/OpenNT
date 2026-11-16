@@ -238,8 +238,10 @@ pub fn dereference(pointer: u64) -> Result<Option<u32>, KernelError> {
             guest::free_bytes(record.name_buffer);
         }
     }
-    // IopDeleteFile: FILE_OBJECT.FileObjectExtension vai junto.
+    // IopDeleteFile: FILE_OBJECT.FileObjectExtension e a porta de conclusão
+    // (CompletionContext) vão junto.
     crate::ntos::io::extensions::free_file_object_extension(pointer);
+    crate::ntos::io::completion::file_port::release(pointer);
     guest::free_bytes(pointer);
     Ok(Some(0))
 }

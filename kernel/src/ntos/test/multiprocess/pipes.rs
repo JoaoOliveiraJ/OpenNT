@@ -27,7 +27,12 @@
 //!   handle assíncrono e escreve "hello world" de uma vez com um evento; o
 //!   servidor lê 5 e depois 6 bytes (modo byte) e responde "ok", que o
 //!   cliente lê de forma assíncrona: STATUS_PENDING e NtWaitForSingleObject
-//!   no evento, sinalizado pela conclusão vinda do outro processo.
+//!   no evento, sinalizado pela conclusão vinda do outro processo. O handle
+//!   assíncrono ganha uma porta de conclusão (FileCompletionInformation, que
+//!   recusa a segunda) e o FILE_SKIP_SET_EVENT_ON_HANDLE
+//!   (FileIoCompletionNotificationInformation): a escrita sem ApcContext
+//!   não deixa pacote, e a leitura com ApcContext deixa na porta a chave, o
+//!   contexto e o IO_STATUS_BLOCK dela (NtRemoveIoCompletion).
 //! - O cliente abre o mailslot e escreve "mail"; o servidor o lê (leitura
 //!   sem prazo, que espera a mensagem). O servidor desconecta os dois pipes
 //!   (FSCTL_PIPE_DISCONNECT), os dois fecham os handles e saem com os
@@ -79,6 +84,7 @@ const PEEK_ROUNDS: u32 = 2000;
 
 const STATUS_SUCCESS: u32 = 0;
 const STATUS_PENDING: u32 = 0x103;
+const STATUS_TIMEOUT: u32 = 0x102;
 const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 const STATUS_PIPE_CONNECTED: u32 = 0xC000_00B2;
@@ -89,6 +95,12 @@ const GENERIC_WRITE: u64 = 0x4000_0000;
 const SYNCHRONIZE: u64 = 0x10_0000;
 const FILE_READ_ATTRIBUTES: u64 = 0x80;
 const EVENT_ALL_ACCESS: u64 = 0x1F_0003;
+const IO_COMPLETION_ALL_ACCESS: u64 = 0x1F_0003;
+/// FILE_SKIP_SET_EVENT_ON_HANDLE (SetFileCompletionNotificationModes).
+const FILE_SKIP_SET_EVENT_ON_HANDLE: u8 = 2;
+/// A chave da porta do pipe de bytes e o contexto da leitura.
+const COMPLETION_KEY: u64 = 0x5A5A;
+const COMPLETION_CONTEXT: u64 = 0xC0C0;
 const FILE_SHARE_READ_WRITE: u64 = 3;
 const FILE_OPEN: u64 = 1;
 const FILE_OPEN_IF: u64 = 3;
@@ -114,6 +126,8 @@ const FSCTL_PIPE_GET_CONNECTION_ATTRIBUTE: u64 = 0x11_0030;
 /// O nome do atributo de conexão do PID do cliente, ANSI com o NUL.
 const CLIENT_PROCESS_ID: &[u8] = b"ClientProcessId\0";
 /// Classes de informação.
+const FILE_COMPLETION_INFORMATION: u64 = 30;
+const FILE_IO_COMPLETION_NOTIFICATION_INFORMATION: u64 = 41;
 const FILE_PIPE_INFORMATION: u64 = 23;
 const FILE_PIPE_LOCAL_INFORMATION: u64 = 24;
 
@@ -122,7 +136,7 @@ const PIPE_BYTES: &str = "opennt-bytes";
 const MAILSLOT: &str = "opennt-correio";
 
 /// Os serviços encaminhados, na ordem da tabela de teste (índices 0x1000..).
-const FORWARDED: [&str; 13] = [
+const FORWARDED: [&str; 15] = [
     "NtCreateNamedPipeFile",
     "NtCreateMailslotFile",
     "NtFsControlFile",
@@ -136,6 +150,8 @@ const FORWARDED: [&str; 13] = [
     "NtClose",
     "NtCreateEvent",
     "NtWaitForSingleObject",
+    "NtCreateIoCompletion",
+    "NtRemoveIoCompletion",
 ];
 const CREATE_NAMED_PIPE: u32 = 0x1000;
 const CREATE_MAILSLOT: u32 = 0x1001;
@@ -150,9 +166,11 @@ const YIELD_EXECUTION: u32 = 0x1009;
 const CLOSE: u32 = 0x100A;
 const CREATE_EVENT: u32 = 0x100B;
 const WAIT_SINGLE: u32 = 0x100C;
+const CREATE_IO_COMPLETION: u32 = 0x100D;
+const REMOVE_IO_COMPLETION: u32 = 0x100E;
 
-static SERVICE_TABLE: [AtomicU32; 13] = [const { AtomicU32::new(0) }; 13];
-static SERVICE_ARGUMENTS: [AtomicU8; 13] = [const { AtomicU8::new(0) }; 13];
+static SERVICE_TABLE: [AtomicU32; 15] = [const { AtomicU32::new(0) }; 15];
+static SERVICE_ARGUMENTS: [AtomicU8; 15] = [const { AtomicU8::new(0) }; 15];
 
 /// Encaminha ao handler real, como o portão nativo: a pilha do usuário
 /// (KPCR.UserRsp, de onde saem os argumentos 5 em diante) e o registro de
@@ -171,7 +189,7 @@ macro_rules! forwarders {
                 forward(FORWARDED[$index], [a, b, c, d])
             }
         )*
-        const ROUTINES: [extern "win64" fn(u64, u64, u64, u64) -> u64; 13] = [$($routine),*];
+        const ROUTINES: [extern "win64" fn(u64, u64, u64, u64) -> u64; 15] = [$($routine),*];
     };
 }
 
@@ -189,6 +207,8 @@ forwarders! {
     close_service = 10;
     create_event_service = 11;
     wait_single_service = 12;
+    create_io_completion_service = 13;
+    remove_io_completion_service = 14;
 }
 
 /// Publica a tabela 1 de teste; devolve a anterior, para restaurar.
@@ -724,6 +744,15 @@ fn client_program(terminate: u32) -> Vec<u8> {
     let hello = data.bytes(b"hello world");
     let ok = data.bytes(b"ok");
     let mail = data.bytes(b"mail");
+    // FILE_COMPLETION_INFORMATION (o handle da porta, gravado pelo
+    // NtCreateIoCompletion, e a chave), os modos e a retirada.
+    let completion = data.alloc(16, 8);
+    data.put(completion + 8, &COMPLETION_KEY.to_le_bytes());
+    let skip_mode = data.bytes(&[FILE_SKIP_SET_EVENT_ON_HANDLE, 0, 0, 0]);
+    let removed_key = data.u64(0);
+    let removed_context = data.u64(0);
+    let removed = data.alloc(IoStatusBlock::SIZE as usize, 8);
+    let no_wait = data.u64(0);
 
     let mut asm = Asm::new(terminate);
     let fs_control = |asm: &mut Asm, handle: usize, code: u64, input: Arg, input_length: u64, output: Arg, output_length: u64| {
@@ -752,6 +781,12 @@ fn client_program(terminate: u32) -> Vec<u8> {
     asm.expect(STATUS_SUCCESS);
     open(&mut asm, handle_bytes, bytes, GENERIC_READ | GENERIC_WRITE, 0, FILE_NON_DIRECTORY_FILE);
     asm.checked(CREATE_EVENT, &[Addr(event), Imm(EVENT_ALL_ACCESS), Imm(0), Imm(0), Imm(0)], STATUS_SUCCESS);
+    // A porta de conclusão do handle assíncrono (FileCompletionInformation,
+    // uma vez só) e o FILE_SKIP_SET_EVENT_ON_HANDLE.
+    asm.checked(CREATE_IO_COMPLETION, &[Addr(completion), Imm(IO_COMPLETION_ALL_ACCESS), Imm(0), Imm(0)], STATUS_SUCCESS);
+    asm.checked(SET_INFORMATION, &[Load(handle_bytes), Addr(iosb), Addr(completion), Imm(16), Imm(FILE_COMPLETION_INFORMATION)], STATUS_SUCCESS);
+    asm.checked(SET_INFORMATION, &[Load(handle_bytes), Addr(iosb), Addr(completion), Imm(16), Imm(FILE_COMPLETION_INFORMATION)], STATUS_INVALID_PARAMETER);
+    asm.checked(SET_INFORMATION, &[Load(handle_bytes), Addr(iosb), Addr(skip_mode), Imm(4), Imm(FILE_IO_COMPLETION_NOTIFICATION_INFORMATION)], STATUS_SUCCESS);
     asm.call(WRITE_FILE, &[Load(handle_bytes), Load(event), Imm(0), Imm(0), Addr(iosb), Addr(hello), Imm(11), Imm(0), Imm(0)]);
     // STATUS_SUCCESS ou STATUS_PENDING; a conclusão sinaliza o evento.
     asm.put(&[0x85, 0xC0]);
@@ -761,8 +796,11 @@ fn client_program(terminate: u32) -> Vec<u8> {
     asm.checked(WAIT_SINGLE, &[Load(event), Imm(0), Imm(0)], STATUS_SUCCESS);
     asm.check_u32(status, STATUS_SUCCESS, 5);
     asm.check_u32(information, 11, 6);
-    // A resposta: a leitura fica pendente até o servidor escrever.
-    asm.call(READ_FILE, &[Load(handle_bytes), Load(event), Imm(0), Imm(0), Addr(iosb), Addr(buffer), Imm(64), Imm(0), Imm(0)]);
+    // A escrita sem ApcContext não deixa pacote na porta.
+    asm.checked(REMOVE_IO_COMPLETION, &[Load(completion), Addr(removed_key), Addr(removed_context), Addr(removed), Addr(no_wait)], STATUS_TIMEOUT);
+    // A resposta: a leitura fica pendente até o servidor escrever; com
+    // ApcContext, a conclusão põe o pacote na porta.
+    asm.call(READ_FILE, &[Load(handle_bytes), Load(event), Imm(0), Imm(COMPLETION_CONTEXT), Addr(iosb), Addr(buffer), Imm(64), Imm(0), Imm(0)]);
     asm.put(&[0x85, 0xC0]);
     let read = asm.forward(0x84);
     asm.expect(STATUS_PENDING);
@@ -771,11 +809,16 @@ fn client_program(terminate: u32) -> Vec<u8> {
     asm.check_u32(status, STATUS_SUCCESS, 7);
     asm.check_u32(information, 2, 8);
     asm.check_bytes(buffer, ok, 2, 9);
+    asm.checked(REMOVE_IO_COMPLETION, &[Load(completion), Addr(removed_key), Addr(removed_context), Addr(removed), Addr(no_wait)], STATUS_SUCCESS);
+    asm.check_u32(removed_key, COMPLETION_KEY as u32, 11);
+    asm.check_u32(removed_context, COMPLETION_CONTEXT as u32, 12);
+    asm.check_u32(removed + core::mem::offset_of!(IoStatusBlock, status), STATUS_SUCCESS, 13);
+    asm.check_u32(removed + core::mem::offset_of!(IoStatusBlock, information), 2, 14);
     // O mailslot.
     open(&mut asm, handle_mailslot, mailslot, GENERIC_WRITE | SYNCHRONIZE, FILE_SHARE_READ_WRITE, FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE);
     asm.checked(WRITE_FILE, &[Load(handle_mailslot), Imm(0), Imm(0), Imm(0), Addr(iosb), Addr(mail), Imm(4), Imm(0), Imm(0)], STATUS_SUCCESS);
     asm.check_u32(information, 4, 10);
-    for handle in [handle_mailslot, handle_bytes, handle_messages, handle_root, event] {
+    for handle in [handle_mailslot, handle_bytes, handle_messages, handle_root, event, completion] {
         asm.checked(CLOSE, &[Load(handle)], STATUS_SUCCESS);
     }
     asm.exit(CLIENT_CODE);
