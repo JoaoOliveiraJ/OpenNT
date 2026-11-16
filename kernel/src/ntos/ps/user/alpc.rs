@@ -590,10 +590,35 @@ fn server_sid(pointer: u64) -> u32 {
 }
 
 fn nt_alpc_connect_port(out: u64, name: u64, oa: u64, port_attributes: u64, rsp: u64) -> Result<u32, KernelError> {
-    state::guarded(|| connect_port(out, name, oa, port_attributes, rsp))
+    state::guarded(|| connect_port(out, name, oa, port_attributes, rsp, true))
 }
 
-fn connect_port(out: u64, name: u64, oa: u64, port_attributes: u64, rsp: u64) -> Result<u32, KernelError> {
+/// NtAlpcConnectPortEx(PortHandle*, ConnectionPortObjectAttributes,
+/// ClientPortObjectAttributes, PortAttributes, Flags,
+/// ServerSecurityRequirements, ConnectionMessage, BufferLength,
+/// OutMessageAttributes, InMessageAttributes, Timeout): a mesma conexão do
+/// NtAlpcConnectPort, com o nome da porta no OBJECT_ATTRIBUTES (sem
+/// RootDirectory) e, no lugar do SID exigido, o SECURITY_DESCRIPTOR que o
+/// servidor deve satisfazer, que os endpoints daqui (o System ou o processo
+/// dono da porta) não conferem.
+fn nt_alpc_connect_port_ex(out: u64, connection: u64, oa: u64, port_attributes: u64, rsp: u64) -> Result<u32, KernelError> {
+    state::guarded(|| {
+        if !state::probe_user_read(connection, ObjectAttributes::SIZE) {
+            return Ok(AV);
+        }
+        let attributes = state::user_struct::<ObjectAttributes>(connection)?;
+        if attributes.root_directory.probe_get()? != 0 {
+            return Ok(INVALID);
+        }
+        let name = attributes.object_name.probe_get()?;
+        if name == 0 {
+            return Ok(0xC000_0033);
+        }
+        connect_port(out, name, oa, port_attributes, rsp, false)
+    })
+}
+
+fn connect_port(out: u64, name: u64, oa: u64, port_attributes: u64, rsp: u64, required_sid: bool) -> Result<u32, KernelError> {
     if !state::probe_user_write(out, 8) || !state::probe_user_read(name, UnicodeString::SIZE) || !state::probe_syscall_stack(rsp, 56) || (oa != 0 && !state::probe_user_read(oa, ObjectAttributes::SIZE)) || (port_attributes != 0 && !state::probe_user_read(port_attributes, AlpcPortAttributes::SIZE)) {
         return Ok(AV);
     }
@@ -620,7 +645,7 @@ fn connect_port(out: u64, name: u64, oa: u64, port_attributes: u64, rsp: u64) ->
     if flags & !0x2_0000 != 0 {
         return Ok(0xC000_00BB);
     }
-    let mut status = server_sid(state::stack_arg(rsp, 6));
+    let mut status = if required_sid { server_sid(state::stack_arg(rsp, 6)) } else { 0 };
     if status == 0 {
         status = attributes(send_attributes, true, 1);
     }
@@ -1370,6 +1395,7 @@ pub fn init() {
     // continuam no seu emissor.
     *LPC_SEND_RECEIVE.lock() = state::handler("NtAlpcSendWaitReceivePort");
     state::register_handler("NtAlpcConnectPort", nt_alpc_connect_port);
+    state::register_handler("NtAlpcConnectPortEx", nt_alpc_connect_port_ex);
     state::register_handler("NtAlpcCreatePort", nt_alpc_create_port);
     state::register_handler("NtAlpcAcceptConnectPort", nt_alpc_accept_connect_port);
     state::register_handler("NtAlpcOpenSenderProcess", nt_alpc_open_sender_process);
