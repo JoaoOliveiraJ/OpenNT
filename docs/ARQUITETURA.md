@@ -1342,10 +1342,20 @@ controladora, o usbhub3.sys no hub raiz (USB\ROOT_HUB30), o hidusb.sys com o
 hidclass.sys nos dispositivos HID (USB\Class_03) e o kbdhid.sys e o
 mouhid.sys nas coleções de teclado e de mouse, com os filtros de classe
 kbdclass e mouclass. Como as ações do PnP manager do NT, que rodam numa
-worker thread, o processamento da árvore roda numa thread de sistema e o
-contexto de boot espera por ela girando as interrupções, os DPCs, os work
-items e o escalonador: um work item rodado nessa espera não fica empilhado
-sobre um START que segura as travas da máquina de estados PnP do KMDF. As
+worker thread, a árvore construída uma vez no fim da fase 1
+(`device_tree::build`, com qualquer raiz) é processada numa thread de
+sistema (`tree::process_on_system_thread`) e o contexto de boot espera por
+ela girando as interrupções, os DPCs, os work items e o escalonador: um work
+item rodado nessa espera não fica empilhado sobre um START que segura as
+travas da máquina de estados PnP do KMDF. A controladora entra nessa
+árvore; a pilha USB só espera a enumeração das portas e confere os marcos.
+Com a raiz ACPI (o padrão) a controladora é enumerada pelo pci.sys real e
+instalada pelo usbxhci.inf, mas o árbitro de IRQ do acpi.sys, que no NT
+arbitra também as mensagens (IrqArbpFindSuitableRangeMsi, com os vetores
+do IDT por processador, e grava ele mesmo os dados de conexão pelo
+IoSetDevicePropertyData), recusa as duas listas do pci.sys: a do MSI-X com
+STATUS_UNSUCCESSFUL e a da linha com STATUS_INVALID_PARAMETER, e o nó fica
+com CM_PROB_NORMAL_CONFLICT; o teste `usb` usa `--pnp-root=internal`. As
 portas são enumeradas depois do START: o IoInvalidateDeviceRelations do hub
 enfileira a reenumeração e a ação (o PipRequestDeviceAction), que uma
 thread de sistema das ações processa (`tree.rs`, um processamento por vez;
@@ -1388,7 +1398,8 @@ como agrupamento e os vetores de buffers comuns).
   linha; um para n mensagens no MSI, com uma mensagem e a linha como
   alternativas). Como a instalação reinicia o nó no NT, o PnP pede os
   requisitos de novo depois de instalar;
-- o PnP manager (`pnp/message_interrupts.rs`) não arbitra as mensagens
+- sem árbitro de IRQ de driver (a raiz do barramento PCI interno), os
+  árbitros da raiz (`pnp/message_interrupts.rs`) não arbitram as mensagens
   contra as linhas: o recurso bruto leva o token e o MessageCount, e a
   tradução pede à HAL um bloco de vetores (`hal/message_interrupts.rs`:
   0x50-0xCF, IRQL = vetor >> 4, destino físico no processador 0, endereço
