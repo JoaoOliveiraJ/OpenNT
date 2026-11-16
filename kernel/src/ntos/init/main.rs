@@ -120,6 +120,7 @@ fn start_boot_driver(name: &str) {
         crate::ntos::test::file_system_mount::after_driver_start(name);
         crate::ntos::test::console_driver::after_driver_start(name);
         crate::ntos::test::import_cycle::after_driver_start(name);
+        crate::ntos::test::minifilters::after_driver_start(name);
     }
 }
 

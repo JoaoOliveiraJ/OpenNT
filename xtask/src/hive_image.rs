@@ -51,6 +51,8 @@ mod cm {
         pub mod boot_services;
         #[path = "../../../../../kernel/src/ntos/cm/service/inbox_drivers.rs"]
         pub mod inbox_drivers;
+        #[path = "../../../../../kernel/src/ntos/cm/service/file_system_filters.rs"]
+        pub mod file_system_filters;
     }
 }
 

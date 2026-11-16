@@ -19,7 +19,7 @@ O OpenNT avança em fases. Cada fase termina com o kernel compilando, iniciando 
 
 **Próximo.** O csrss terminar a inicialização (falta a porta LPC de servidor em modo usuário, o NtCreatePort da \Windows\SbApiPort) para o smss da sessão executar o wininit.exe, que cria a WinSta0 com as Desktops Winlogon e Default (WINSTA0_OK).
 
-Hoje: **43 de 65** binários da Microsoft rodam (20 parciais); o kernel exporta **2.049 dos 3.070** nomes do `ntoskrnl.exe` do Windows 10 22H2 (66,7%). Detalhes em [O que roda](site/o-que-roda.html), [Componentes](site/componentes.html), [Exports](site/ntoskrnl.html) e [Testes](site/testes.html).
+Hoje: **47 de 69** binários da Microsoft rodam (20 parciais); o kernel exporta **2.059 dos 3.070** nomes do `ntoskrnl.exe` do Windows 10 22H2 (67,1%). Detalhes em [O que roda](site/o-que-roda.html), [Componentes](site/componentes.html), [Exports](site/ntoskrnl.html) e [Testes](site/testes.html).
 
 ## Fase 1 — base (concluída)
 
@@ -129,5 +129,5 @@ Cache Manager e os drivers reais do Windows para a tela gráfica (win32k.sys, dx
 | win32k.sys, win32kbase.sys e win32kfull.sys | Parcial | win32k, win32k-display |
 | acpi.sys e pci.sys | Parcial | acpi |
 | dxgkrnl.sys e BasicDisplay.sys | Parcial | dxgkrnl, basicdisplay, win32k-display, fase6 |
-| ntfs.sys, fastfat.sys e fltmgr.sys | Parcial | ntfs, shutdown, reboot |
+| ntfs.sys, fastfat.sys e fltmgr.sys | Parcial | ntfs, shutdown, reboot, minifilters |
 | ndis.sys, tcpip.sys e E1G6032E.sys | Parcial | ndis, afd, tcpip |

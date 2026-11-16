@@ -2130,6 +2130,72 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     dá STATUS_FILE_CORRUPT_ERROR sem ele. O xtask (e o gravador NTFS do
     kernel) grava os nomes 8.3 maiúsculos como Win32+DOS (3), como o NTFS,
     e os demais no espaço POSIX (0).
+- **Minifiltros reais sobre o Filter Manager** (`cm/service/file_system_filters.rs`,
+  `mm/prefetcher_file_info.rs`, `ntos/test/minifilters.rs`):
+  - As chaves do FltMgr e dos minifiltros são as da instalação (Type 2,
+    Group, DependOnService, SupportedFeatures e a subchave `Instances` com
+    a DefaultInstance e a Altitude/Flags de cada instância), com Start 3
+    como os outros drivers inbox. O DependOnService faz o gerenciador de
+    serviços subir o FltMgr pela chave dele antes do primeiro minifiltro;
+    um ntfs.sys iniciado depois acha o `\Driver\FltMgr` já carregado pelo
+    import do clipsp.sys. O FltRegisterFilter de cada minifiltro lê as
+    `Instances` pelo caminho do serviço que o DriverEntry recebe.
+  - O DriverEntry do FileInfo abre `Session Manager\Memory Management\PrefetchParameters`
+    (a semente leva o EnablePrefetcher = 3 da instalação) e se liga ao
+    prefetcher pelo PfFileInfoNotify: números de sequência dos streams
+    (Type 7) e o registro da sua interface (Type 0xA, que entrega ao
+    RegisterGlobalBlockNotify do FileInfo a rotina de conflito do
+    prefetcher, uma rotina por ponteiro de `hal/amd64/routine_stubs.rs`).
+    As notificações de E/S e de nomes só alimentariam traços de cenário e o
+    log do Superfetch, que o OpenNT não tem.
+  - O FileInfo e o Wof se anexam sozinhos a todo volume NTFS (no
+    FltStartFiltering aos já montados, na montagem aos novos). O storqosflt,
+    o bindflt e o wcifs só aceitam a anexação manual no InstanceSetup (a
+    que os serviços de QoS de armazenamento e de contêiner pedem pelo
+    FilterAttach); o teste anexa o storqosflt e o bindflt por
+    FltAttachVolume com a instância padrão da chave. O wcifs carrega e se
+    registra, mas o InstanceSetup dele pede o nome GUID do volume
+    (FltGetVolumeGuidName, IOCTL_MOUNTMGR_QUERY_POINTS ao mount manager), e
+    o volume ATA ainda não se anuncia ao mount manager
+    (MOUNTDEV_MOUNTED_DEVICE_GUID): STATUS_INVALID_PARAMETER.
+  - O que as cargas e as anexações pediram do kernel: os caminhos lentos
+    de push lock (ExfAcquirePushLockExclusive/Shared, ExfReleasePushLock),
+    PsSetCurrentThreadPrefetching, IoGetSiloParameters, _i64tow_s, o
+    RtlDecompressBuffer/Ex e o RtlDecompressFragment (o Wof), o
+    ZwQuerySystemInformation(SystemBasicInformation) de modo kernel (o
+    FileInfo mede a memória física por ela), o
+    WmiQueryTraceInformation(FltIoNotifyRoutinesClass), que dá ao FltMgr o
+    endereço da tabela de rotinas de notificação de E/S dos minifiltros (NULL
+    sem sessão de rastreamento; o FltMgr a lê em cada callback), e a
+    largura certa dos argumentos do RtlInitializeSid (UCHAR) e do
+    RtlSubAuthoritySid (ULONG). A extensão do FILE_OBJECT
+    (IopAllocateFileObjectExtension) é uma só, do I/O Manager, também
+    para os contextos por FILE_OBJECT do FsRtl que o FltMgr usa, e é
+    liberada com o FILE_OBJECT.
+    O volume ATA responde o IOCTL_DISK_GET_CLUSTER_INFO como o partmgr.sys
+    responde por um disco fora de cluster (o storqosflt pergunta se o volume
+    é um CSV oculto), e o volume do xtask marca o $Secure e os índices do
+    $Extend com DUP_VIEW_INDEX_PRESENT, sem o qual o ntfs.sys recusa abrir
+    `$Extend\$Reparse:$R:$INDEX_ALLOCATION` (o Wof enumera os pontos de
+    reparse na anexação).
+  - O FltCreateFileEx de um minifiltro chega ao IoCreateFileEx com o
+    IO_DRIVER_CREATE_CONTEXT (`io/parse.rs`): a lista de ECPs vai no
+    Irp->UserBuffer do IRP_MJ_CREATE, onde o FltMgr acha a sua (que diz
+    abaixo de qual instância a abertura começa), e a dica de dispositivo,
+    conferida na pilha do volume, recebe o IRP e fica no FILE_OBJECT para o
+    IoGetRelatedDeviceObject. A abertura sem nome de um volume montado com
+    acesso além do de uma abertura direta (FILE_READ_ATTRIBUTES, READ_CONTROL,
+    WRITE_DAC, WRITE_OWNER, SYNCHRONIZE, ACCESS_SYSTEM_SECURITY) vai ao file
+    system como a abertura do volume, como no IopParseDevice: é a do Wof e a
+    do wcifs, que consultam o volume (FileFsSizeInformation) na anexação.
+    Sem o RAW, um volume ainda não montado continua aberto direto no
+    dispositivo.
+  - O teste `minifilters` pergunta ao FltMgr, pelos exports dele, os
+    filtros, os volumes e as instâncias (InstanceFullInformation), confere
+    filtro/instância/altitude no volume NTFS, abre e lê HELLO.TXT abaixo da
+    instância de um filtro (FltCreateFileEx, FltReadFile, FltClose) e repete
+    as operações de arquivo do teste do ntfs.sys com a pilha de filtros
+    sobre o volume, cujo topo é o dispositivo do FltMgr.
 - **Itens de trabalho como worker threads** (`io/work_items.rs`): a fila
   do ExQueueWorkItem/IoQueueWorkItem é drenada nos pumps de PASSIVE_LEVEL
   de quem espera, com duas regras das worker threads do NT: um item não

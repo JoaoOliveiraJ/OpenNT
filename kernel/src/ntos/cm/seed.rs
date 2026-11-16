@@ -13,7 +13,8 @@
 //! em memória quando um arquivo não existe (`cm/hive_init.rs`). Por isso
 //! este arquivo e as tabelas que ele reúne (`cm/session_manager.rs`,
 //! `cm/ini_file_mapping.rs`, `cm/crypto_defaults.rs`, `cm/arbiters.rs`,
-//! `cm/service/boot_services.rs` e `cm/service/inbox_drivers.rs`) são
+//! `cm/service/boot_services.rs`, `cm/service/inbox_drivers.rs` e
+//! `cm/service/file_system_filters.rs`) são
 //! dados puros: não usam nada do kernel e o `xtask` os inclui por `#[path]`
 //! na mesma árvore de módulos (`cm`, `cm::service`).
 //!
@@ -110,6 +111,7 @@ fn in_control_set(mut key: SeedKey) -> SeedKey {
 pub fn system_keys(smss_boot: bool) -> Vec<SeedKey> {
     let mut keys = super::service::boot_services::driver_keys();
     keys.extend(super::service::inbox_drivers::seed_keys(smss_boot));
+    keys.extend(super::service::file_system_filters::seed_keys());
     keys.extend(super::service::boot_services::parameter_keys());
     keys.extend(super::arbiters::seed_keys());
     keys.extend(super::pnp_control::seed_keys());

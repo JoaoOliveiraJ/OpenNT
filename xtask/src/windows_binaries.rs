@@ -162,6 +162,25 @@ const NTFS_FILES: &[(&str, &str)] = &[
         "Windows/System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Shared-814DB60DB621E2916AD769AF5F228BED19224212D92876A292990439227807A6~31bf3856ad364e35~amd64~~10.0.19041.7664.cat",
         "System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Shared-814DB60DB621E2916AD769AF5F228BED19224212D92876A292990439227807A6~31bf3856ad364e35~amd64~~10.0.19041.7664.cat",
     ),
+    // Os minifiltros de file system que o FltMgr hospeda sobre o volume do
+    // ntfs.sys (`--start-driver=FileInfo,...`); os catálogos 0511 e 0516
+    // acima cobrem o bindflt.sys, o wcifs.sys e o storqosflt.sys, o 0515
+    // cobre o FileInfo.sys, o Wof.sys e o CldFlt.sys, e o 0519, o luafv.sys.
+    ("FILEINFO.SYS", "System32/drivers/FileInfo.sys"),
+    ("WOF.SYS", "System32/drivers/Wof.sys"),
+    ("STORQOSFLT.SYS", "System32/drivers/storqosflt.sys"),
+    ("BINDFLT.SYS", "System32/drivers/bindflt.sys"),
+    ("WCIFS.SYS", "System32/drivers/wcifs.sys"),
+    ("LUAFV.SYS", "System32/drivers/luafv.sys"),
+    ("CLDFLT.SYS", "System32/drivers/CldFlt.sys"),
+    (
+        "Windows/System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package0515~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
+        "System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package0515~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
+    ),
+    (
+        "Windows/System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package0519~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
+        "System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package0519~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
+    ),
     // O fastfat.sys real (`--start-driver=fastfat`) e o catálogo que o cobre.
     ("FASTFAT.SYS", "System32/drivers/fastfat.sys"),
     (

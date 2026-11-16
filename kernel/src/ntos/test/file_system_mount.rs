@@ -79,18 +79,29 @@ fn disk_file_system_registered() -> bool {
 
 /// Depois do início de um driver pelo `--start-driver`.
 pub fn after_driver_start(name: &str) {
-    if service_type(name) != 2 || !disk_file_system_registered() {
+    // O FltMgr e os minifiltros também são SERVICE_FILE_SYSTEM_DRIVER, mas
+    // não montam volumes (o teste deles é `test/minifilters.rs`).
+    if service_type(name) != 2 || !disk_file_system_registered() || crate::ntos::cm::service::file_system_filters::is_filter(name) {
         return;
     }
     // Com `--trace-driver-api`, as APIs que o file system chama na montagem
     // também vão para a serial.
     crate::ntos::init::exports::set_api_trace(crate::ntos::init::boot_config::trace_driver_api());
-    let result = mount_and_read();
+    let result = file_operations("OPENNT-NOVO.TXT", b"Gravado pelo ntfs.sys sobre o volume do OpenNT.\r\n");
     crate::ntos::init::exports::set_api_trace(false);
     match result {
         Ok(()) => debug_print!("FILE_SYSTEM_MOUNT_OK name={}", name),
         Err(message) => debug_print!("FILE_SYSTEM_MOUNT_FALHOU name={}: {}", name, message),
     }
+}
+
+/// As operações de arquivo do teste no volume do segundo disco: abre e lê
+/// HELLO.TXT (montando o volume na primeira vez) e cria, grava, fecha,
+/// reabre e lê de volta `new_file`. Também usadas pelo teste dos
+/// minifiltros, com a pilha de filtros sobre o volume.
+pub fn file_operations(new_file: &str, content: &[u8]) -> Result<(), alloc::string::String> {
+    mount_and_read()?;
+    write_and_read_back(new_file, content)
 }
 
 fn mount_and_read() -> Result<(), alloc::string::String> {
@@ -130,18 +141,16 @@ fn mount_and_read() -> Result<(), alloc::string::String> {
     if closed != 0 {
         return Err(format!("ZwClose devolveu {closed:#x}"));
     }
-    write_and_read_back()
+    Ok(())
 }
 
 /// Um arquivo novo do volume: criado, gravado e fechado pelo file system
 /// (a escrita vai ao Cache Manager), depois reaberto e lido de volta.
-fn write_and_read_back() -> Result<(), alloc::string::String> {
+fn write_and_read_back(new_file: &str, content: &[u8]) -> Result<(), alloc::string::String> {
     use alloc::format;
-    const NEW_FILE: &str = "OPENNT-NOVO.TXT";
-    const CONTENT: &[u8] = b"Gravado pelo ntfs.sys sobre o volume do OpenNT.\r\n";
     let block = guest::alloc_bytes(0x400);
     let buffer = guest::alloc_bytes(0x1000);
-    let path = format!("\\Device\\{}\\{}", ata_volume::DEVICE_NAME, NEW_FILE);
+    let path = format!("\\Device\\{}\\{}", ata_volume::DEVICE_NAME, new_file);
     let attributes = object_attributes(block, &path);
     let (handle, iosb, offset) = (block + 0x300, block + 0x310, block + 0x320);
     let result = (|| -> Result<(), alloc::string::String> {
@@ -151,13 +160,13 @@ fn write_and_read_back() -> Result<(), alloc::string::String> {
             return Err(format!("criacao devolveu {created:#x}"));
         }
         let file_handle = guest::read64(handle);
-        guest::write_bytes(buffer, CONTENT);
+        guest::write_bytes(buffer, content);
         guest::write64(offset, 0);
-        let written = call_export("ZwWriteFile", &[file_handle, 0, 0, 0, iosb, buffer, CONTENT.len() as u64, offset, 0]).unwrap_or(u64::MAX) as u32;
+        let written = call_export("ZwWriteFile", &[file_handle, 0, 0, 0, iosb, buffer, content.len() as u64, offset, 0]).unwrap_or(u64::MAX) as u32;
         let count = guest::read64(iosb + 8);
         let closed = call_export("ZwClose", &[file_handle]).unwrap_or(u64::MAX) as u32;
         debug_print!("[fs-mount] ZwWriteFile -> {:#x}, {} bytes; ZwClose -> {:#x}", written, count, closed);
-        if written != 0 || count != CONTENT.len() as u64 || closed != 0 {
+        if written != 0 || count != content.len() as u64 || closed != 0 {
             return Err(format!("escrita {written:#x} com {count} bytes, fechamento {closed:#x}"));
         }
         let opened = call_export("ZwCreateFile", &[handle, FILE_GENERIC_READ, attributes, iosb, 0, 0, FILE_SHARE_READ, FILE_OPEN, FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE, 0, 0]).unwrap_or(u64::MAX) as u32;
@@ -172,10 +181,10 @@ fn write_and_read_back() -> Result<(), alloc::string::String> {
         let bytes = guest::read_bytes(buffer, count.min(0x1000));
         let closed = call_export("ZwClose", &[file_handle]).unwrap_or(u64::MAX) as u32;
         debug_print!("[fs-mount] releitura -> {:#x}, {} bytes: {:?}; ZwClose -> {:#x}", read, count, core::str::from_utf8(&bytes).unwrap_or("<binario>"), closed);
-        if read != 0 || bytes != CONTENT || closed != 0 {
+        if read != 0 || bytes != content || closed != 0 {
             return Err(format!("releitura {read:#x} com {count} bytes diferentes do que foi gravado"));
         }
-        debug_print!("FILE_SYSTEM_WRITE_OK {}", NEW_FILE);
+        debug_print!("FILE_SYSTEM_WRITE_OK {}", new_file);
         Ok(())
     })();
     guest::free_bytes(buffer);
@@ -201,6 +210,8 @@ static MOUNT_FLAGS: AtomicU32 = AtomicU32::new(0);
 static CREATE_FILE: AtomicU64 = AtomicU64::new(0);
 static CREATE_OPTIONS: AtomicU64 = AtomicU64::new(0);
 static CREATE_ACCESS: AtomicU32 = AtomicU32::new(0);
+/// Irp->UserBuffer do último IRP_MJ_CREATE (a lista de ECPs).
+static CREATE_ECP_LIST: AtomicU64 = AtomicU64::new(0);
 
 const STATUS_UNRECOGNIZED_VOLUME: u32 = 0xC000_014F;
 const FS_CONTEXT: u64 = 0x5A5A_F5C0;
@@ -245,6 +256,7 @@ extern "win64" fn accepting_dispatch(_device: u64, irp: u64) -> i32 {
             CREATE_OPTIONS.store(create.options.get() as u64 | (create.share_access.get() as u64) << 32, Ordering::SeqCst);
             let context = create.security_context.get();
             CREATE_ACCESS.store(if context != 0 { guest::read32(context + 0x10) } else { 0 }, Ordering::SeqCst);
+            CREATE_ECP_LIST.store(at::<nt::Irp>(irp).user_buffer.get(), Ordering::SeqCst);
             at::<nt::FileObject>(file).fs_context.set(FS_CONTEXT);
             complete(irp, 0, 1)
         }
@@ -383,6 +395,67 @@ fn directory_records(assert: Assert) {
     guest::free_bytes(block);
 }
 
+/// ZwCreateFile do dispositivo sem nome restante: com FILE_READ_DATA é a
+/// abertura do volume (o IRP_MJ_CREATE vai ao file system com FileName
+/// vazio); só com FILE_READ_ATTRIBUTES | SYNCHRONIZE é a abertura direta do
+/// dispositivo. IoCreateFileEx com IO_DRIVER_CREATE_CONTEXT: a lista de ECPs
+/// chega ao file system em Irp->UserBuffer, a dica de dispositivo recebe o
+/// IRP e fica como o IoGetRelatedDeviceObject do arquivo, e uma dica fora da
+/// pilha do volume é STATUS_INVALID_DEVICE_OBJECT_PARAMETER.
+fn volume_open_and_create_context(assert: Assert, block: u64, volume_device: u64, foreign_device: u64) {
+    let volume_name = alloc::format!("\\Device\\{}", ata_volume::DEVICE_NAME);
+    let (handle, iosb) = (block + 0x300, block + 0x310);
+    let creates = CREATES.load(Ordering::SeqCst);
+    let attributes = object_attributes(block, &volume_name);
+    let opened = call_export("ZwCreateFile", &[handle, FILE_GENERIC_READ, attributes, iosb, 0, 0, FILE_SHARE_READ, FILE_OPEN, FILE_SYNCHRONOUS_IO_NONALERT, 0, 0]).unwrap_or(u64::MAX) as u32;
+    let file = CREATE_FILE.load(Ordering::SeqCst);
+    let name_length = at::<nt::FileObject>(file).file_name.length.get();
+    let volume_handle = guest::read64(handle);
+    let volume_open = opened == 0 && CREATES.load(Ordering::SeqCst) == creates + 1 && file == crate::ntos::io::file::zw::file_object_of_handle(volume_handle) && name_length == 0;
+    if opened == 0 {
+        call_export("ZwClose", &[volume_handle]);
+    }
+    let attributes = object_attributes(block, &volume_name);
+    let direct = call_export("ZwCreateFile", &[handle, 0x0010_0080, attributes, iosb, 0, 0, FILE_SHARE_READ, FILE_OPEN, FILE_SYNCHRONOUS_IO_NONALERT, 0, 0]).unwrap_or(u64::MAX) as u32;
+    let direct_bypasses = direct == 0 && CREATES.load(Ordering::SeqCst) == creates + 1;
+    if direct == 0 {
+        call_export("ZwClose", &[guest::read64(handle)]);
+    }
+    debug_print!("[fs-mount] abertura do volume {:#x} (FileName {} bytes), abertura direta {:#x}", opened, name_length, direct);
+    assert(volume_open && direct_bypasses, "fs-mount: abertura do volume vai ao file system; a direta (FILE_READ_ATTRIBUTES) ao dispositivo");
+
+    // IoCreateFileEx com a lista de ECPs e a dica do volume.
+    let list_cell = guest::alloc_bytes(8);
+    let listed = call_export("FsRtlAllocateExtraCreateParameterList", &[0, list_cell]).unwrap_or(u64::MAX) as u32;
+    let list = guest::read64(list_cell);
+    let context = guest::alloc_bytes(0x28);
+    guest::write_bytes(context, &[0u8; 0x28]);
+    guest::write16(context, 0x28);
+    guest::write64(context + 8, list);
+    guest::write64(context + 0x10, volume_device);
+    let path = alloc::format!("{volume_name}\\CONTEXTO.TXT");
+    let attributes = object_attributes(block, &path);
+    CREATE_ECP_LIST.store(0, Ordering::SeqCst);
+    let created = call_export("IoCreateFileEx", &[handle, FILE_GENERIC_READ, attributes, iosb, 0, 0, FILE_SHARE_READ, FILE_OPEN, FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE, 0, 0, 0, 0, 0, context]).unwrap_or(u64::MAX) as u32;
+    let file_handle = guest::read64(handle);
+    let file_object = if created == 0 { crate::ntos::io::file::zw::file_object_of_handle(file_handle) } else { 0 };
+    let related = if file_object != 0 { call_export("IoGetRelatedDeviceObject", &[file_object]).unwrap_or(0) } else { 0 };
+    let ecp_seen = CREATE_ECP_LIST.load(Ordering::SeqCst);
+    if created == 0 {
+        call_export("ZwClose", &[file_handle]);
+    }
+    guest::write64(context + 0x10, foreign_device);
+    let attributes = object_attributes(block, &path);
+    let refused = call_export("IoCreateFileEx", &[handle, FILE_GENERIC_READ, attributes, iosb, 0, 0, FILE_SHARE_READ, FILE_OPEN, FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE, 0, 0, 0, 0, 0, context]).unwrap_or(u64::MAX) as u32;
+    debug_print!("[fs-mount] IoCreateFileEx com contexto {:#x} (ECP {:#x}/{:#x}, relacionado {:#x}/{:#x}), dica alheia {:#x}", created, ecp_seen, list, related, volume_device, refused);
+    if listed == 0 {
+        call_export("FsRtlFreeExtraCreateParameterList", &[list]);
+    }
+    guest::free_bytes(context);
+    guest::free_bytes(list_cell);
+    assert(listed == 0 && created == 0 && ecp_seen == list && related == volume_device && refused == 0xC000_0369, "fs-mount: IoCreateFileEx leva as ECPs no IRP_MJ_CREATE e a dica de dispositivo");
+}
+
 pub fn run(assert: Assert) {
     directory_records(assert);
     // IoCreateDevice: VPB, DeviceLock e SectorSize de um FILE_DEVICE_DISK.
@@ -463,6 +536,7 @@ pub fn run(assert: Assert) {
     call_export("ZwClose", &[second_handle]);
     call_export("ZwClose", &[handle]);
     assert(CLEANUPS.load(Ordering::SeqCst) == 2 && CLOSES.load(Ordering::SeqCst) == 2 && vpb.reference_count.get() == 0, "fs-mount: fechamento manda CLEANUP e CLOSE e devolve o VPB");
+    volume_open_and_create_context(assert, block, volume_device, disk);
 
     // Volume desmontado de novo para os próximos testes; a fila volta ao que era.
     vpb.flags.set(0);

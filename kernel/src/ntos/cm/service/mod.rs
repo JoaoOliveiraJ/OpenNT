@@ -7,4 +7,5 @@ pub mod rpc;
 pub mod driver;
 pub mod system_drivers;
 pub mod inbox_drivers;
+pub mod file_system_filters;
 pub mod boot_services;
