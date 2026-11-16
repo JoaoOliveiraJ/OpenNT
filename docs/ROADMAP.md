@@ -17,9 +17,9 @@ O OpenNT avança em fases. Cada fase termina com o kernel compilando, iniciando 
 
 **Marco atual.** O NtUserInitialize do csrss.exe real volta com sucesso: o dxgkrnl.sys inicia o BasicDisplay.sys pela sessão do win32k e o InitVideo da sessão 0 monta a configuração de exibição sobre o dispositivo desconectado do win32k.
 
-**Próximo.** O csrss terminar a inicialização (falta a porta LPC de servidor em modo usuário, o NtCreatePort da \Windows\SbApiPort) para o smss da sessão executar o wininit.exe, que cria a WinSta0 com as Desktops Winlogon e Default (WINSTA0_OK).
+**Próximo.** O wininit.exe criar a WinSta0 com as Desktops Winlogon e Default (WINSTA0_OK): o NtUserCreateWindowStation faz callbacks ao user32 do wininit, que precisa dos recursos do user32.dll.mui no idioma da interface (en-US no convidado; esta máquina só tem pt-BR).
 
-Hoje: **49 de 71** binários da Microsoft rodam (20 parciais); o kernel exporta **2.059 dos 3.070** nomes do `ntoskrnl.exe` do Windows 10 22H2 (67,1%). Detalhes em [O que roda](site/o-que-roda.html), [Componentes](site/componentes.html), [Exports](site/ntoskrnl.html) e [Testes](site/testes.html).
+Hoje: **49 de 79** binários da Microsoft rodam (28 parciais); o kernel exporta **2.064 dos 3.070** nomes do `ntoskrnl.exe` do Windows 10 22H2 (67,2%). Detalhes em [O que roda](site/o-que-roda.html), [Componentes](site/componentes.html), [Exports](site/ntoskrnl.html) e [Testes](site/testes.html).
 
 ## Fase 1 — base (concluída)
 
@@ -64,7 +64,7 @@ I/O Manager, ACPI e PCI, gerência de energia, ETW, drivers de barramento, disco
 | I/O Manager | Parcial | fase4, teclado, pipes |
 | Desligamento e reinício | Funciona | shutdown, reboot, shell-shutdown |
 | Console | Parcial | boot, shell, condrv |
-| Barramento PCI | Parcial | fase4, storage, basicdisplay |
+| Barramento PCI | Parcial | fase4, storage, basicdisplay, usb |
 | Dispositivos da placa-mãe | Parcial | fase4 |
 | Disco ATA (interno) | Parcial | fase4 |
 | NTFS (leitor do kernel) | Parcial | fase4 |
@@ -97,7 +97,7 @@ Carregador de PE, funções exportadas pelo kernel, Code Integrity real (ci.dll)
 | cng.sys | Funciona | drivers |
 | ci.dll (Code Integrity) | Funciona | watchdog |
 | watchdog.sys | Funciona | watchdog |
-| KMDF (WdfLdr.sys e Wdf01000.sys) | Funciona | kmdf, basicdisplay |
+| KMDF (WdfLdr.sys e Wdf01000.sys) | Funciona | kmdf, basicdisplay, usb |
 | ksecdd.sys | Funciona | ksecdd |
 | null.sys | Funciona | null |
 | beep.sys | Funciona | beep |
@@ -128,6 +128,7 @@ Cache Manager e os drivers reais do Windows para a tela gráfica (win32k.sys, dx
 | Cache Manager | Parcial | fase6, ntfs |
 | win32k.sys, win32kbase.sys e win32kfull.sys | Parcial | win32k, win32k-display |
 | acpi.sys e pci.sys | Parcial | acpi |
+| Pilha USB 3 e HID (usbxhci.sys, ucx01000.sys, usbhub3.sys, hidusb.sys, hidclass.sys, kbdhid.sys e mouhid.sys) | Parcial | usb |
 | dxgkrnl.sys e BasicDisplay.sys | Parcial | dxgkrnl, basicdisplay, win32k-display, fase6 |
 | ntfs.sys, fastfat.sys e fltmgr.sys | Parcial | ntfs, shutdown, reboot, minifilters |
 | ndis.sys, tcpip.sys e E1G6032E.sys | Parcial | ndis, afd, tcpip |

@@ -1249,9 +1249,9 @@ READ/WRITE_CONFIG. As rotinas que um driver recebe por ponteiro (interfaces
 de barramento, DMA_OPERATIONS) são stubs nativos de `hal/amd64/
 routine_stubs.rs` (ids privados 0x80000400+). O adaptador de DMA é o da HAL
 (`hal/dma.rs`: o HalGetAdapterV2 com a tabela V2 de operações e, para uma
-DEVICE_DESCRIPTION da versão 3, o HalGetAdapterV3 com a tabela V3, a
-largura de endereço do DmaAddressWidth, o GetDmaAdapterInfo, o
-FlushDmaBuffer e o FlushAdapterBuffersEx), alcançado pelo IoGetDmaAdapter
+DEVICE_DESCRIPTION da versão 3, o HalGetAdapterV3 com a largura de endereço
+do DmaAddressWidth e a tabela V3 de `hal/dma_v3.rs`, descrita abaixo com a
+pilha USB), alcançado pelo IoGetDmaAdapter
 através da interface do barramento. IoGetDeviceProperty,
 IoOpenDeviceRegistryKey, IoRegisterDeviceInterface (links
 `\??\<instância>#{guid}`) e o IoConnectInterruptEx LINE_BASED leem o
@@ -1386,10 +1386,12 @@ aceita as três versões com o layout de cada uma, e o KMDF guarda a tabela
 de notificação do WDF que o WmiQueryTraceInformation (classe 15,
 `etw/wmi.rs`) devolve, nula sem sessão de trace.
 
-O KMDF pede o adaptador de DMA com a DEVICE_DESCRIPTION da versão 3; o
-adaptador é o de `hal/dma.rs` com a tabela HalpDmaOperationsV3
-(`hal/dma_v3.rs`): as rotinas da versão 3 no caminho de bus master do NT
-sem IOMMU (GetDmaAdapterInfo com ADAPTER_INFO_API_BYPASS, GetDmaTransferInfo,
+O KMDF (e o storport.sys, quando o miniport prefere o DMA v3) pede o
+adaptador de DMA com a DEVICE_DESCRIPTION da versão 3; o adaptador é o de
+`hal/dma.rs` com a tabela HalpDmaOperationsV3, uma só, em `hal/dma_v3.rs`:
+as rotinas da versão 3 no caminho de bus master do NT sem IOMMU
+(GetDmaAdapterInfo com ADAPTER_INFO_API_BYPASS e a largura do adaptador,
+FlushAdapterBuffersEx, FlushDmaBuffer pelo alinhamento, GetDmaTransferInfo,
 InitializeDmaTransferContext, Get/BuildScatterGatherListEx pelo Offset da
 cadeia de MDLs, AllocateAdapterChannelEx, MapTransferEx, os domínios de DMA
 como agrupamento e os vetores de buffers comuns).
