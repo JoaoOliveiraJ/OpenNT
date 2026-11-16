@@ -13,6 +13,14 @@
 //! do kernel (o KdpAllowDisable recusa desligar o depurador com algum
 //! habilitado ali).
 //!
+//! Breakpoints na metade de usuário: o 0xCC vai ao quadro físico pela raiz
+//! do processo escolhido (`kd::process_context`). Um quadro de código
+//! compartilhado (a ntdll e as DLLs mapeadas por seção de imagem) leva o
+//! 0xCC a todos os processos que o mapeiam; o `int 3` de outro processo é
+//! reconhecido pelo quadro físico e passa sem parar (`classify_user_hit`).
+//! Antes de gravar num endereço de usuário, o byte atual é conferido: um
+//! processo que saiu não leva bytes alheios.
+//!
 //! Só o dono da parada altera as tabelas; a entrada de um trap só consulta.
 
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
@@ -22,6 +30,23 @@ use crate::ntos::ke::pcr;
 
 const SOFTWARE_SLOTS: usize = 64;
 const INT3: u8 = 0xCC;
+/// Endereços abaixo daqui são da metade de usuário (a raiz importa).
+const USER_LIMIT: u64 = 0x8000_0000_0000;
+
+/// Grava `byte` em `address` pela raiz `cr3`; num endereço de usuário, só
+/// se o byte atual for `expected` (a página ainda é a do breakpoint).
+fn write_checked(cr3: u64, address: u64, expected: u8, byte: u8) {
+    if address < USER_LIMIT && memory::read_u8(cr3, address) != Some(expected) {
+        return;
+    }
+    memory::write(cr3, address, &[byte]);
+}
+
+/// O byte em `address` pela raiz `at` é o mesmo byte físico do breakpoint
+/// gravado pela raiz `slot` (sempre, na metade de sistema).
+fn same_frame(slot: u64, at: u64, address: u64) -> bool {
+    address >= USER_LIMIT || slot == at || matches!((memory::translate(slot, address), memory::translate(at, address)), (Some(a), Some(b)) if a == b)
+}
 
 struct Software {
     /// 0 = livre.
@@ -66,9 +91,37 @@ pub fn insert(cr3: u64, address: u64) -> bool {
 pub fn remove(address: u64) -> bool {
     let Some(slot) = find(address) else { return false };
     let cr3 = slot.cr3.load(Ordering::Relaxed);
-    memory::write(cr3, address, &[slot.original.load(Ordering::Relaxed)]);
+    if !slot.suspended.load(Ordering::Acquire) {
+        write_checked(cr3, address, INT3, slot.original.load(Ordering::Relaxed));
+    }
     slot.address.store(0, Ordering::Release);
     true
+}
+
+/// De quem é o `int 3` de usuário em `address` executado com a raiz `cr3`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HitOwner {
+    /// Do processo do breakpoint: a parada.
+    Mine,
+    /// Outro processo que mapeia o mesmo quadro: passa sem parar.
+    Foreign,
+    /// Nenhum breakpoint do depurador naquele byte físico.
+    None,
+}
+
+pub fn classify_user_hit(address: u64, cr3: u64) -> HitOwner {
+    let Some(slot) = find(address) else { return HitOwner::None };
+    if slot.suspended.load(Ordering::Acquire) {
+        return HitOwner::None;
+    }
+    let root = slot.cr3.load(Ordering::Relaxed);
+    if root == cr3 {
+        HitOwner::Mine
+    } else if same_frame(root, cr3, address) {
+        HitOwner::Foreign
+    } else {
+        HitOwner::None
+    }
 }
 
 /// Remove todos (o host se desligou).
@@ -114,7 +167,7 @@ pub fn inserted_at(address: u64) -> bool {
 pub fn suspend(address: u64) -> bool {
     let Some(slot) = find(address) else { return false };
     if !slot.suspended.swap(true, Ordering::AcqRel) {
-        memory::write(slot.cr3.load(Ordering::Relaxed), address, &[slot.original.load(Ordering::Relaxed)]);
+        write_checked(slot.cr3.load(Ordering::Relaxed), address, INT3, slot.original.load(Ordering::Relaxed));
     }
     true
 }
@@ -123,36 +176,36 @@ pub fn suspend(address: u64) -> bool {
 pub fn restore(address: u64) {
     if let Some(slot) = find(address) {
         if slot.suspended.swap(false, Ordering::AcqRel) {
-            memory::write(slot.cr3.load(Ordering::Relaxed), address, &[INT3]);
+            write_checked(slot.cr3.load(Ordering::Relaxed), address, slot.original.load(Ordering::Relaxed), INT3);
         }
     }
 }
 
-/// Troca, numa leitura de `bytes` em `address`, cada 0xCC de breakpoint pelo
-/// byte original.
-pub fn mask_read(address: u64, bytes: &mut [u8]) {
+/// Troca, numa leitura de `bytes` em `address` pela raiz `cr3`, cada 0xCC
+/// de breakpoint pelo byte original.
+pub fn mask_read(cr3: u64, address: u64, bytes: &mut [u8]) {
     for slot in SOFTWARE.iter() {
         let at = slot.address.load(Ordering::Acquire);
         if at == 0 || slot.suspended.load(Ordering::Acquire) {
             continue;
         }
         let offset = at.wrapping_sub(address);
-        if offset < bytes.len() as u64 {
+        if offset < bytes.len() as u64 && same_frame(slot.cr3.load(Ordering::Relaxed), cr3, at) {
             bytes[offset as usize] = slot.original.load(Ordering::Relaxed);
         }
     }
 }
 
-/// Uma escrita do host sobre breakpoints muda o byte original guardado e
-/// mantém o 0xCC na memória.
-pub fn shadow_write(address: u64, bytes: &mut [u8]) {
+/// Uma escrita do host (pela raiz `cr3`) sobre breakpoints muda o byte
+/// original guardado e mantém o 0xCC na memória.
+pub fn shadow_write(cr3: u64, address: u64, bytes: &mut [u8]) {
     for slot in SOFTWARE.iter() {
         let at = slot.address.load(Ordering::Acquire);
         if at == 0 || slot.suspended.load(Ordering::Acquire) {
             continue;
         }
         let offset = at.wrapping_sub(address);
-        if offset < bytes.len() as u64 {
+        if offset < bytes.len() as u64 && same_frame(slot.cr3.load(Ordering::Relaxed), cr3, at) {
             slot.original.store(bytes[offset as usize], Ordering::Relaxed);
             bytes[offset as usize] = INT3;
         }

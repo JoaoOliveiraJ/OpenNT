@@ -517,6 +517,53 @@ fn enter(number: usize, frame: u64, fx: u64, error_code: bool, signal: u8, kind:
     }
 }
 
+/// Como uma parada do modo usuário sai (decidido pelo host).
+pub enum UserResume {
+    /// Continua; `pass` devolve a exceção ao processo.
+    Continue { pass: bool },
+    /// Uma instrução da thread de usuário (o TF no CONTEXT dela).
+    Step,
+}
+
+/// Parada pedida pelo despacho de uma exceção do anel 3 (`kd::user_debug`),
+/// com interrupções desligadas por quem chama. `frame` é um quadro de trap
+/// montado do CONTEXT da thread (o host lê e grava nele) e `fx` a área
+/// FltSave do CONTEXT. A posse, o congelamento e a sessão são os de uma
+/// parada do anel 0; o passo e a saída de um breakpoint ficam com quem
+/// chamou, pelo TF da thread. `None` com o depurador desligado.
+pub fn enter_user(frame: u64, fx: u64, signal: u8, kind: Kind, data: u64, user_gs_base: u64) -> Option<UserResume> {
+    if !active() {
+        return None;
+    }
+    let number = current_processor();
+    let me = number as u32 + 1;
+    if OWNER.load(Ordering::Acquire) == me {
+        return None;
+    }
+    // Outro processador no depurador: este fica congelado pela NMI dele e
+    // entra depois do degelo.
+    while OWNER.compare_exchange(0, me, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        core::hint::spin_loop();
+    }
+    capture(number, frame, fx, false);
+    // O GS do anel 3 é a TEB.
+    PROCESSORS[number].gs_base.store(user_gs_base, Ordering::Relaxed);
+    breakpoints::disarm_processor();
+    transport::seize(number);
+    freeze_others(number);
+    trace::abandon();
+    record_stop(number, signal, kind, data);
+    let resume = session::run(number);
+    // O rastro passo a passo é do anel 0: armado aqui, fica desfeito.
+    trace::disarm();
+    let view = view(number).unwrap_or_default();
+    continue_execution(number, &view);
+    Some(match resume {
+        Resume::Step => UserResume::Step,
+        Resume::Continue { pass } => UserResume::Continue { pass },
+    })
+}
+
 /// Entrada dos trampolins (vetores 1, 2 e 3 do anel 0 e o tique do relógio
 /// com byte na porta).
 #[no_mangle]

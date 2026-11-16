@@ -247,6 +247,7 @@ fn build_info(record: &NotifyRecord, command: &mut u64) -> Result<u64, KernelErr
 
 /// Notifica criação/saída; devolve CreationStatus (Ex) ou zero.
 pub fn notify(pointer: u64, pid: u64, record: &NotifyRecord, created: bool) -> Result<u32, KernelError> {
+    crate::ntos::kd::events::process(pointer, pid, created);
     // Ex cobre processos executáveis; tarefas do kernel não têm imagem.
     let any = {
         let state = STATE.lock();

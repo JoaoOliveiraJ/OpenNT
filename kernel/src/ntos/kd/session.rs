@@ -10,7 +10,9 @@
 //! suporte). As consultas próprias do OpenNT vêm pelo `qRcmd` (`monitor`
 //! no GDB, `kd::monitor`), a lista de módulos também pelo
 //! `qXfer:libraries:read`, e os registros do rastro de instruções pelo
-//! `qOpenNTTrace:offset,tamanho` (`kd::trace`).
+//! `qOpenNTTrace:offset,tamanho` (`kd::trace`). Com um processo escolhido
+//! pelo `monitor .process`, `m`/`M`/`X` e o `Z0` usam a raiz dele
+//! (`kd::process_context`) até a máquina seguir.
 //!
 //! Anexar: o primeiro pacote válido do host liga KdDebuggerNotPresent =
 //! FALSE e o bit de presença do KUSER_SHARED_DATA.KdDebuggerEnabled, como o
@@ -25,7 +27,7 @@ use super::breakpoints::{self, Watch};
 use super::packet::{self, Payload, Received, PACKET_SIZE};
 use super::registers::{self, View};
 use super::stop::{self, Kind, Resume};
-use super::{debugger, memory, monitor};
+use super::{debugger, memory, monitor, process_context};
 use crate::ntos::mm::memory_map::MAX_CPUS;
 
 /// Um host trocou pacotes e não se desligou.
@@ -78,6 +80,7 @@ fn detach() {
     ATTACHED.store(false, Ordering::Release);
     HOST_WAITING.store(false, Ordering::Release);
     breakpoints::remove_all();
+    super::user_debug::reset();
     packet::set_no_ack(false);
     REPORT_SOFTWARE_BREAK.store(false, Ordering::Release);
     REPORT_HARDWARE_BREAK.store(false, Ordering::Release);
@@ -179,14 +182,17 @@ pub fn run(number: usize) -> Resume {
             }
             Action::Resume(resume) => {
                 HOST_WAITING.store(true, Ordering::Release);
+                process_context::clear();
                 return resume;
             }
             Action::Detach => {
                 packet::send(b"OK");
+                process_context::clear();
                 detach();
                 return Resume::Continue { pass: false };
             }
             Action::Kill => {
+                process_context::clear();
                 detach();
                 return Resume::Continue { pass: false };
             }
@@ -337,18 +343,20 @@ fn read_memory(number: usize, text: &[u8], reply: &mut Payload, data: &mut [u8])
         return;
     };
     let length = length.min((PACKET_SIZE - 8) / 2).min(data.len());
-    let done = memory::read(stop::address_space(number), address, &mut data[..length]);
+    let cr3 = process_context::memory_space(number);
+    let done = memory::read(cr3, address, &mut data[..length]);
     if done == 0 && length != 0 {
         reply.push_str("E14");
         return;
     }
-    breakpoints::mask_read(address, &mut data[..done]);
+    breakpoints::mask_read(cr3, address, &mut data[..done]);
     reply.push_hex(&data[..done]);
 }
 
 fn store(number: usize, address: u64, bytes: &mut [u8], reply: &mut Payload) {
-    breakpoints::shadow_write(address, bytes);
-    if memory::write(stop::address_space(number), address, bytes) == bytes.len() {
+    let cr3 = process_context::memory_space(number);
+    breakpoints::shadow_write(cr3, address, bytes);
+    if memory::write(cr3, address, bytes) == bytes.len() {
         reply.push_str("OK");
     } else {
         reply.push_str("E14");
@@ -399,7 +407,7 @@ fn breakpoint(owner: usize, insert: bool, text: &[u8], reply: &mut Payload) {
         return;
     };
     let done = match kind {
-        b"0" if insert => breakpoints::insert(stop::address_space(owner), address),
+        b"0" if insert => breakpoints::insert(process_context::memory_space(owner), address),
         b"0" => breakpoints::remove(address),
         b"1" | b"2" | b"4" => {
             let watch = match kind {

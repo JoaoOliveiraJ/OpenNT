@@ -15,7 +15,7 @@ use core::fmt::Write;
 use core::mem::offset_of;
 
 use super::packet::Payload;
-use super::{breakpoints, debugger, inspect, memory, print_log, stop, trace};
+use super::{breakpoints, debugger, events, handles, inspect, memory, print_log, process_context, regions, stop, trace, user_debug};
 use crate::ntos::inc::types::{ClientId, Eprocess, Ethread, EthreadView1, KapcState, Kpcr, Kprcb, Kprocess, Kthread, KthreadView1};
 use crate::ntos::mm::loaded_images;
 use crate::ntos::mm::memory_map::MAX_CPUS;
@@ -41,6 +41,13 @@ const HELP: &str = "comandos do OpenNT:
   drvobj <end|nome>  DRIVER_OBJECT, os dispositivos e a tabela de despacho
   handle <pid> <h>   a entrada da tabela de handles do processo
   trace start|resume|stop|status   rastro de instrucoes passo a passo no convidado
+  .process [pid|end|0]  processo das leituras e dos breakpoints de usuario (ate seguir)
+  handles <pid|end> [i] tabela de handles: objeto, tipo, acesso, nome
+  vad <pid|end> [i]  regioes de usuario: base, tamanho, tipo, protecao, nome
+  uthreads <pid|end> threads de usuario: TEB, inicio, CONTEXT, rip/rsp, espera, LastError
+  kmap               faixas do espaco de sistema
+  events             ultimos eventos de processo, thread e imagem (e os simbolos deles)
+  uex [on|off]       parar nas excecoes de primeira chance do anel 3
 ";
 
 fn read_u64(cr3: u64, address: u64) -> u64 {
@@ -352,6 +359,13 @@ pub fn run(owner: usize, line: &str, out: &mut Payload) {
         "drvobj" => inspect::driver_object(owner, rest, out),
         "handle" => inspect::handle(owner, rest, out),
         "trace" => trace::command(owner, rest, out),
+        ".process" => process_context::command(owner, rest, out),
+        "handles" => handles::command(owner, rest, out),
+        "vad" => regions::vad(owner, rest, out),
+        "uthreads" => regions::user_threads(owner, rest, out),
+        "kmap" => regions::kernel_map(out),
+        "events" => events::command(out),
+        "uex" => user_debug::command(rest, out),
         _ => out.push_str(HELP),
     }
 }

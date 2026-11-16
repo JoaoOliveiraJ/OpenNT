@@ -129,6 +129,7 @@ pub struct NotifyOptions {
 /// Monta IMAGE_INFO_EX e chama cada rotina com (FullImageName, ProcessId,
 /// ImageInfo) numa região crítica.
 pub fn notify(image: Image, options: &NotifyOptions) -> Result<(), KernelError> {
+    crate::ntos::kd::events::image(image.image_base, image.size_of_image, options.name.as_deref(), options.system, options.process_id);
     if options.no_execute || REGISTRATIONS.lock().iter().all(Option::is_none) {
         return Ok(());
     }

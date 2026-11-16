@@ -214,6 +214,7 @@ pub fn wants(point: NotifyPoint) -> bool {
 /// Chama as rotinas que o ponto `point` seleciona (ProcessId, ThreadId,
 /// Create).
 pub fn notify(owner_id: u64, thread_id: u64, point: NotifyPoint) -> Result<(), KernelError> {
+    crate::ntos::kd::events::thread(owner_id, thread_id, point as u64);
     if !wants(point) {
         return Ok(());
     }

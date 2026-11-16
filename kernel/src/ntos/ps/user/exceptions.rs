@@ -174,6 +174,10 @@ pub fn hardware(thread: &UserThread, status: u32) -> u32 {
         put(information, &access.to_le_bytes());
         put(information + 8, &block.fault_cr2.get().to_le_bytes());
     }
+    // O depurador do kernel antes da entrega (breakpoints de usuário, passo).
+    if crate::ntos::kd::user_debug::exception(live, vector, thread.with(|thread| thread.teb_va)) {
+        return 0;
+    }
     deliver(thread, &record)
 }
 

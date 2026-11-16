@@ -8,23 +8,32 @@
 //! em `memory`, os registradores em `registers`, as consultas do OpenNT em
 //! `monitor` e `inspect` (objetos do NT), o rastro de instruções em `trace`,
 //! a saída do DbgPrint em `print_log` e o serviço de depuração (`int 0x2D`)
-//! do modo usuário em `debug_service`.
+//! do modo usuário em `debug_service`. Para os processos de usuário: o
+//! processo das leituras em `process_context`, as paradas do anel 3 em
+//! `user_debug`, os pontos de evento (processo, thread, imagem) em `events`,
+//! a tabela de handles em `handles` e as regiões e threads de usuário em
+//! `regions`.
 pub mod breakpoints;
 pub mod debug_filter;
 pub mod debug_service;
 pub mod debugger;
+pub mod events;
 pub mod exports;
+pub mod handles;
 pub mod inspect;
 pub mod memory;
 pub mod monitor;
 pub mod packet;
 pub mod power;
 pub mod print_log;
+pub mod process_context;
+pub mod regions;
 pub mod registers;
 pub mod session;
 pub mod stop;
 pub mod trace;
 pub mod transport;
+pub mod user_debug;
 
 use crate::ntos::init::boot_config;
 

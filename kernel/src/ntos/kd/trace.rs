@@ -167,6 +167,11 @@ pub fn armed() -> bool {
     ARMED.load(Ordering::Acquire)
 }
 
+/// Desarma um rastro pedido e ainda não começado (a parada era do anel 3).
+pub fn disarm() {
+    ARMED.store(false, Ordering::Release);
+}
+
 pub fn active() -> bool {
     ACTIVE.load(Ordering::Acquire)
 }
