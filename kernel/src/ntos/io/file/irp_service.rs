@@ -1,7 +1,7 @@
 //! Os serviços de arquivo de modo usuário sobre um FILE_OBJECT aberto num
-//! driver: NtReadFile, NtWriteFile, NtFsControlFile (o IopXxxControlFile),
-//! NtQueryInformationFile e NtSetInformationFile, montados como o I/O
-//! Manager do ntoskrnl 19041 os monta.
+//! driver: NtReadFile, NtWriteFile, NtFsControlFile e NtDeviceIoControlFile
+//! (o IopXxxControlFile), NtQueryInformationFile e NtSetInformationFile,
+//! montados como o I/O Manager do ntoskrnl 19041 os monta.
 //!
 //! - O handle de usuário dá o FILE_OBJECT e o acesso concedido (conferido
 //!   contra o que a operação exige). O IRP sai do StackSize do dispositivo
@@ -44,12 +44,20 @@
 //!   UserApcContext do IRP) põe o pacote na IOCP; sem UserEvent, o
 //!   FO_SKIP_SET_EVENT deixa o evento do arquivo como está.
 //!
+//! - NtFsControlFile e NtDeviceIoControlFile (o IRP_MJ_DEVICE_CONTROL do
+//!   handle de dispositivo, `ps/user/files.rs`) nos quatro métodos: em
+//!   METHOD_IN_DIRECT e METHOD_OUT_DIRECT a entrada vai num SystemBuffer e a
+//!   saída num MDL das páginas de usuário travadas (Irp->MdlAddress), que a
+//!   conclusão destrava e libera.
+//!
 //! Fora do NT: o KAPC da conclusão é alocado à parte, não o Tail.Apc do IRP
 //! (os últimos bytes do Tail guardam o IrpExtension, que o IoFreeIrp
-//! libera); o Fast I/O não é tentado (o IRP chega ao mesmo resultado);
-//! METHOD_IN_DIRECT/METHOD_OUT_DIRECT, dispositivos DO_DIRECT_IO e a rotina
-//! de APC de usuário (ApcRoutine) ainda não são atendidos
-//! (STATUS_NOT_SUPPORTED).
+//! libera); o Fast I/O não é tentado nas leituras, nas escritas e no
+//! NtFsControlFile (o IRP chega ao mesmo resultado); leituras e escritas de
+//! dispositivos DO_DIRECT_IO e a rotina de APC de usuário (ApcRoutine) ainda
+//! não são atendidas (STATUS_NOT_SUPPORTED). O MmMapLockedPagesSpecifyCache
+//! de um MDL de usuário devolve a VA de usuário (`mm/mdl.rs`): um driver que
+//! escreve nela fora do processo de quem pediu não alcança as páginas.
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -120,12 +128,15 @@ const IRP_MJ_WRITE: u8 = 0x04;
 const IRP_MJ_QUERY_INFORMATION: u8 = 0x05;
 const IRP_MJ_SET_INFORMATION: u8 = 0x06;
 const IRP_MJ_FILE_SYSTEM_CONTROL: u8 = 0x0D;
+const IRP_MJ_DEVICE_CONTROL: u8 = 0x0E;
 const IRP_MN_USER_FS_REQUEST: u8 = 0x00;
 /// Modos do KeWaitForSingleObject.
 const KERNEL_MODE: u8 = 0;
 const USER_MODE: u8 = 1;
 /// Métodos de transferência (CTL_CODE).
 const METHOD_BUFFERED: u32 = 0;
+const METHOD_IN_DIRECT: u32 = 1;
+const METHOD_OUT_DIRECT: u32 = 2;
 const METHOD_NEITHER: u32 = 3;
 /// FILE_INFORMATION_CLASS respondidas pelo I/O Manager.
 const FILE_ACCESS_INFORMATION: u32 = 8;
@@ -700,6 +711,22 @@ pub struct Control {
 /// NtFsControlFile de modo usuário: o IopXxxControlFile com
 /// IRP_MJ_FILE_SYSTEM_CONTROL / IRP_MN_USER_FS_REQUEST.
 pub fn fs_control(arguments: &Control) -> u32 {
+    control(arguments, IRP_MJ_FILE_SYSTEM_CONTROL, IRP_MN_USER_FS_REQUEST)
+}
+
+/// NtDeviceIoControlFile de modo usuário pelo IRP: o IopXxxControlFile com
+/// IRP_MJ_DEVICE_CONTROL, depois do FastIoDeviceControl que quem chama já
+/// tentou.
+pub fn device_control(arguments: &Control) -> u32 {
+    control(arguments, IRP_MJ_DEVICE_CONTROL, 0)
+}
+
+/// O IopXxxControlFile: o acesso que o código pede, os buffers do método
+/// e o IRP do `major`. METHOD_IN_DIRECT e METHOD_OUT_DIRECT levam a entrada
+/// num SystemBuffer e a saída num MDL das páginas de usuário sondadas e
+/// travadas (IoAllocateMdl + MmProbeAndLockPages), que a conclusão
+/// destrava e libera.
+fn control(arguments: &Control, major: u8, minor: u8) -> u32 {
     let target = match reference(arguments.handle) {
         Ok(target) => target,
         Err(status) => return status,
@@ -713,10 +740,13 @@ pub fn fs_control(arguments: &Control) -> u32 {
     if !probe(arguments.io_status, IoStatusBlock::SIZE, true) {
         return conclude(&target, false, None, STATUS_ACCESS_VIOLATION);
     }
-    if arguments.apc_routine != 0 || (method != METHOD_BUFFERED && method != METHOD_NEITHER) {
+    if arguments.apc_routine != 0 {
         return conclude(&target, false, None, STATUS_NOT_SUPPORTED);
     }
-    if method == METHOD_BUFFERED && (!probe(arguments.input, arguments.input_length as u64, false) || !probe(arguments.output, arguments.output_length as u64, true)) {
+    let direct = method == METHOD_IN_DIRECT || method == METHOD_OUT_DIRECT;
+    // A saída de METHOD_IN_DIRECT é lida pelo driver (IoReadAccess); a de
+    // METHOD_OUT_DIRECT, escrita (IoWriteAccess).
+    if method != METHOD_NEITHER && (!probe(arguments.input, arguments.input_length as u64, false) || !probe(arguments.output, arguments.output_length as u64, method != METHOD_IN_DIRECT)) {
         return conclude(&target, false, None, STATUS_ACCESS_VIOLATION);
     }
     let event = match reference_event(arguments.event) {
@@ -730,8 +760,13 @@ pub fn fs_control(arguments: &Control) -> u32 {
     dispatcher::clear_event(file_at(target.file).event.address());
     let mut system = 0;
     let mut flags = 0;
-    if method == METHOD_BUFFERED && (arguments.input_length != 0 || arguments.output_length != 0) {
-        system = guest::alloc_bytes(arguments.input_length.max(arguments.output_length) as u64);
+    let buffered_length = match method {
+        METHOD_BUFFERED => arguments.input_length.max(arguments.output_length),
+        _ if direct => arguments.input_length,
+        _ => 0,
+    };
+    if buffered_length != 0 {
+        system = guest::alloc_bytes(buffered_length as u64);
         if system == 0 {
             return conclude(&target, synchronous, event, STATUS_INSUFFICIENT_RESOURCES);
         }
@@ -744,20 +779,31 @@ pub fn fs_control(arguments: &Control) -> u32 {
                 }
             }
         }
-        flags = IRP_BUFFERED_IO | IRP_DEALLOCATE_BUFFER | if arguments.output_length != 0 { IRP_INPUT_OPERATION } else { 0 };
+        flags = IRP_BUFFERED_IO | IRP_DEALLOCATE_BUFFER | if method == METHOD_BUFFERED && arguments.output_length != 0 { IRP_INPUT_OPERATION } else { 0 };
     }
     let user_event = event.as_ref().map_or(0, |event| event.pointer);
-    let packet = allocate(&target, BuildOptions { major: IRP_MJ_FILE_SYSTEM_CONTROL, minor: IRP_MN_USER_FS_REQUEST, buffer: system, user_event, user_iosb: arguments.io_status, user_buffer: arguments.output, ..BuildOptions::default() }, flags);
+    let packet = allocate(&target, BuildOptions { major, minor, buffer: system, user_event, user_iosb: arguments.io_status, user_buffer: arguments.output, ..BuildOptions::default() }, flags);
     if packet == 0 {
         if system != 0 {
             let _ = pool_allocation::free(system, 0);
         }
         return conclude(&target, synchronous, event, STATUS_INSUFFICIENT_RESOURCES);
     }
-    let control = &top_location(packet).parameters.file_system_control;
+    if direct && arguments.output_length != 0 {
+        if crate::ntos::io::mdl::allocate_mdl_for_irp(arguments.output, arguments.output_length, false, packet) == 0 {
+            irp_builder::free_irp(packet);
+            if system != 0 {
+                let _ = pool_allocation::free(system, 0);
+            }
+            return conclude(&target, synchronous, event, STATUS_INSUFFICIENT_RESOURCES);
+        }
+        crate::ntos::mm::mdl::probe_and_lock_pages(irp_at(packet).mdl_address.get());
+    }
+    // O FileSystemControl e o DeviceIoControl têm o mesmo leiaute.
+    let control = &top_location(packet).parameters.device_io_control;
     control.output_buffer_length.set(arguments.output_length);
     control.input_buffer_length.set(arguments.input_length);
-    control.fs_control_code.set(arguments.code);
+    control.io_control_code.set(arguments.code);
     control.type3_input_buffer.set(if method == METHOD_NEITHER { arguments.input } else { 0 });
     track(packet, &target, event, 0, arguments.apc_context);
     synchronous_service_tail(&target, packet)

@@ -280,9 +280,11 @@ fn nt_fs_control_file(handle: u64, event: u64, apc_routine: u64, apc_context: u6
 }
 
 /// NtDeviceIoControlFile: IRP gerenciado (resultado copiado para a saída)
-/// ou IRP nativo METHOD_BUFFERED/NEITHER na pilha (Direct I/O e eventos
-/// assíncronos nativos ainda recusados).
-fn nt_device_io_control_file(handle: u64, event: u64, apc: u64, _context: u64, rsp: u64) -> Result<u32, KernelError> {
+/// ou, num driver nativo, o FastIoDeviceControl e depois o IRP: METHOD_BUFFERED
+/// e METHOD_NEITHER sem evento na pilha; METHOD_IN_DIRECT, METHOD_OUT_DIRECT
+/// e os pedidos com evento pelo IopXxxControlFile de `io/file/irp_service.rs`
+/// (MDL das páginas de usuário, conclusão assíncrona e porta do arquivo).
+fn nt_device_io_control_file(handle: u64, event: u64, apc: u64, context: u64, rsp: u64) -> Result<u32, KernelError> {
     let Some(entry) = state::get_user_handle(handle).filter(|entry| entry.kind() == "device") else { return Ok(STATUS_INVALID_HANDLE) };
     let Some(device) = entry.downcast::<UserDevice>() else { return Ok(STATUS_INVALID_HANDLE) };
     let iosb = state::stack_arg(rsp, 5);
@@ -361,12 +363,12 @@ fn nt_device_io_control_file(handle: u64, event: u64, apc: u64, _context: u64, r
         FastControl::Handled { status, .. } => return Ok(status),
         FastControl::NotHandled => {}
     }
-    // Direct I/O exige MDLs fixadas: nunca descrito como METHOD_BUFFERED.
-    if code & 3 == 1 || code & 3 == 2 {
-        return Ok(0xC000_00BB);
-    }
-    if event != 0 {
-        return Ok(0xC000_00BB);
+    // Direct I/O (o MDL das páginas travadas) e o evento do pedido: o
+    // IopXxxControlFile completo. O lsass.exe deixa assim pendente no
+    // \Device\KsecDD o pedido METHOD_OUT_DIRECT 0x39006a, concluído na
+    // porta de conclusão do arquivo.
+    if code & 3 == 1 || code & 3 == 2 || event != 0 {
+        return Ok(irp_service::device_control(&irp_service::Control { handle, event, apc_routine: apc, apc_context: context, io_status: iosb, code, input, input_length, output, output_length }));
     }
     let packet = io_manager::build_device_io_control_request(code, top, input, input_length, output, output_length, 0, 0, iosb, Some(RequestContext { file_object: device.file_object, requestor_mode: 1, thread: process::get_current_thread() }));
     if packet == 0 {

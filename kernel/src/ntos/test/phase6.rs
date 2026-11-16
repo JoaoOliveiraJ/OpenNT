@@ -1329,7 +1329,7 @@ fn user_device_io(assert: Assert) {
     }
     let driver_object = at::<nt::DriverObject>(driver);
     let base = driver_object.driver_start.get();
-    for major in [0u64, 2, 3, 4] {
+    for major in [0u64, 2, 3, 4, 0xE] {
         driver_object.major_function[major as usize].set(base + 0x1300);
     }
     let kernel = guest::alloc_bytes(0x200);
@@ -1387,6 +1387,28 @@ fn user_device_io(assert: Assert) {
     let cancel_any = call("NtCancelIoFileEx", handle, 0, iosb, 0);
     let cancel_bad = call("NtCancelIoFile", 0x7FF0, iosb, 0, 0);
     assert(neither_ok && unbuffered == Some(0xC000_00BB) && cancel_thread == Some(0) && cancel_any == Some(0xC000_0225) && cancel_bad == Some(0xC000_0008), "devio: leitura neither com o buffer de usuario, DO_DIRECT_IO recusado e cancelamentos");
+    // IOCTL METHOD_OUT_DIRECT pelo IopXxxControlFile: a entrada no
+    // SystemBuffer (onde o despacho grava), a saída num MDL das páginas de
+    // usuário, destravado e liberado na conclusão; a saída fica intacta.
+    let output = block + 0x500;
+    guest::write64(buffer, 0x1234_5678);
+    guest::write64(output, 0x7777_7777_7777_7777);
+    let thread = crate::ntos::ps::process::get_current_thread();
+    stack(&[iosb, 0x22_2002, buffer, 8, output, 16]);
+    let direct = call("NtDeviceIoControlFile", handle, 0, 0, 0);
+    let direct_ok = direct == Some(0) && io_status.status.get() == 0 && io_status.information.get() == 4 && guest::read64(output) == 0x7777_7777_7777_7777 && guest::read64(buffer) == 0x1234_5678 && crate::ntos::io::file::irp_service::pending_for_thread(thread) == 0;
+    // METHOD_BUFFERED com evento: o mesmo caminho copia o SystemBuffer para
+    // a saída (IRP_INPUT_OPERATION) e sinaliza o evento.
+    stack(&[0, 0]);
+    let created = call("NtCreateEvent", block + 0x18, 0x1F_0003, 0, 0);
+    let event = guest::read64(block + 0x18);
+    stack(&[iosb, 0x22_2000, buffer, 8, output, 16]);
+    let with_event = call("NtDeviceIoControlFile", handle, event, 0, 0);
+    guest::write64(block + 0x20, 0);
+    let signaled = call("NtWaitForSingleObject", event, 0, block + 0x20, 0);
+    let event_ok = created == Some(0) && with_event == Some(0) && io_status.information.get() == 4 && guest::read32(output) == 0x4443_4241 && signaled == Some(0);
+    let _ = call("NtClose", event, 0, 0, 0);
+    assert(direct_ok && event_ok, &alloc::format!("devio: IOCTL METHOD_OUT_DIRECT com MDL e METHOD_BUFFERED com evento pelo IopXxxControlFile (direto {direct:?}, evento {with_event:?}/{signaled:?})"));
     let _ = call("NtClose", handle, 0, 0, 0);
     guest::free_bytes(kernel);
     if let Some(region) = memory::find_region(block) {
