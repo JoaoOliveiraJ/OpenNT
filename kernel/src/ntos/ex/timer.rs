@@ -41,7 +41,12 @@ fn ex_timer(timer_pointer: u64) -> &'static ExTimer {
 fn ex_timer_dpc(dpc_pointer: u64, _context: u64, _first: u64, _second: u64) {
     let timer_pointer = dpc_pointer - core::mem::offset_of!(ExTimer, dpc) as u64;
     let body = ex_timer(timer_pointer);
-    native_call::call(body.callback.get(), &[timer_pointer, body.context.get()]);
+    // Um EX_TIMER sem callback (ExAllocateTimer(NULL, ...)) só sinaliza quem
+    // espera nele, como o KTIMER2 sem rotina do ExAllocateTimerInternal2.
+    let callback = body.callback.get();
+    if callback != 0 {
+        native_call::call(callback, &[timer_pointer, body.context.get()]);
+    }
 }
 
 /// ExAllocateTimer(callback, context): 0 quando falta memória.
