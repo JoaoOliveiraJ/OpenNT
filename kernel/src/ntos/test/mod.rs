@@ -43,6 +43,7 @@ pub mod registry_model;
 pub mod support_exports;
 pub mod shutdown;
 pub mod kernel_debugger;
+pub mod user_debug_service;
 pub mod rtl_crt_exports;
 pub mod security_alpc_exports;
 pub mod io_fsrtl_exports;

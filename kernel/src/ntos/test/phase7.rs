@@ -2229,6 +2229,13 @@ fn user_ring3(assert: Assert) {
     guest::write_bytes(code, &[0x0F, 0x0B]);
     let faulted = usermode::exec_user_mode(code, stack_top, 0, 0, 0, 0);
     assert(faulted == 0xC000_001D && usermode::block().fault_vector.get() == 6 && usermode::block().fault_rip.get() == code, "userring3: excecao de usuario termina o processo com o NTSTATUS");
+    // 3b. O `int 0x2D` do DebugPrint da ntdll: o portão de DPL 3 da IDT
+    // (KiDebugServiceTrap) entrega o vetor 0x2D como STATUS_BREAKPOINT, com o
+    // RIP salvo no `int3` seguinte. Com o portão de DPL 0, a CPU dava uma
+    // falta de proteção geral (STATUS_ACCESS_VIOLATION).
+    guest::write_bytes(code, &[0xB8, 0x01, 0x00, 0x00, 0x00, 0xCD, 0x2D, 0xCC]);
+    let service = usermode::exec_user_mode(code, stack_top, 0, 0, 0, 0);
+    assert(service == 0x8000_0003 && usermode::block().fault_vector.get() == 0x2D && usermode::block().fault_rip.get() == code + 7, "userring3: int 0x2D do anel 3 chega pelo portao de DPL 3 como STATUS_BREAKPOINT");
     // 4. Um intervalo de escalonamento termina na syscall com o CONTEXT salvo.
     let mut program: alloc::vec::Vec<u8> = alloc::vec![0x48, 0xB9];
     program.extend_from_slice(&string.to_le_bytes());
@@ -5080,6 +5087,7 @@ pub fn run(assert: Assert) {
     user_wnf(assert);
     user_thread_context(assert);
     user_exceptions(assert);
+    super::user_debug_service::run(assert);
     usermode_syscalls_exports(assert);
     user_process_information_hooks(assert);
     memory_partition(assert);
