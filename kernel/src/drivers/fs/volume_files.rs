@@ -78,6 +78,37 @@ impl ReadCache {
     }
 }
 
+/// O nome de um arquivo do volume relativo ao dispositivo, como o
+/// IopParseDevice o deixa no FILE_OBJECT.FileName: o caminho depois da
+/// unidade ou do dispositivo do volume (`\SystemRoot` é o `\Windows` dele),
+/// sem os aliases de instalação de [`nt_path_to_volume_path`] — o
+/// `C:\Windows\System32\kbdus.dll` continua `\Windows\System32\kbdus.dll`.
+pub fn nt_path_to_device_name(nt_path: &str) -> Option<String> {
+    let mut path = nt_path.replace('/', "\\");
+    for prefix in ["\\??\\", "\\\\?\\", "\\?\\", "\\DosDevices\\", "\\GLOBAL??\\"] {
+        if path.len() >= prefix.len() && path[..prefix.len()].eq_ignore_ascii_case(prefix) {
+            path = String::from(&path[prefix.len()..]);
+            break;
+        }
+    }
+    let bytes = path.as_bytes();
+    let rest = if bytes.len() >= 2 && bytes[1] == b':' {
+        String::from(&path[2..])
+    } else {
+        let trimmed = path.trim_start_matches('\\');
+        let lower = trimmed.to_lowercase();
+        if let Some(rest) = ["device\\kernelvolume1"].iter().find_map(|device| lower.strip_prefix(device).map(|_| &trimmed[device.len()..])) {
+            String::from(rest)
+        } else if lower == "systemroot" || lower.starts_with("systemroot\\") {
+            alloc::format!("\\Windows{}", &trimmed["systemroot".len()..])
+        } else {
+            return None;
+        }
+    };
+    let rest = alloc::format!("\\{}", rest.trim_start_matches('\\'));
+    Some(if rest == "\\" { String::new() } else { rest })
+}
+
 /// Normaliza separadores e prefixos NT/DOS, aceita as unidades C e D e
 /// preserva subdiretórios; só os aliases de instalação apontam para a raiz
 /// do disco de boot. `.`/`..` e caracteres proibidos são recusados.

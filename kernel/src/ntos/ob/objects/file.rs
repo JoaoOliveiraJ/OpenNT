@@ -300,7 +300,16 @@ pub fn create_source(source: Arc<dyn FileSource>) -> Result<u64, KernelError> {
     };
     // Um arquivo de volume do kernel ganha o dispositivo e o VPB do volume.
     let binding = match (source.volume(), source.volume_path()) {
-        (Some(volume), Some(path)) => crate::drivers::fs::volume_device::bind_file(pointer, volume, &path).unwrap_or_default(),
+        (Some(volume), Some(path)) => {
+            let binding = crate::drivers::fs::volume_device::bind_file(pointer, volume, &path).unwrap_or_default();
+            // O FileName é o caminho da abertura relativo ao dispositivo (o
+            // `\Windows\System32\...` que o win32k compara com o
+            // `\SystemRoot`), não a posição interna no volume.
+            if let Some(name) = crate::drivers::fs::volume_files::nt_path_to_device_name(source.name()) {
+                let _ = set_name(pointer, &name);
+            }
+            binding
+        }
         _ => crate::drivers::fs::volume_device::Binding::default(),
     };
     let releaser = source.clone();
