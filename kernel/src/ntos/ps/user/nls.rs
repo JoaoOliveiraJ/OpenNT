@@ -13,7 +13,6 @@ use super::sections::{self, CreateOptions, MapRequest, Section, SectionFile};
 use super::state::{self, probe_user_write};
 use crate::ntos::cm::registry;
 use crate::drivers::fs::volume_files;
-use crate::ntos::rtl::nls_configuration::{DEFAULT_LOCALE, DEFAULT_UI_LANGUAGE};
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
 
@@ -89,7 +88,7 @@ fn nt_initialize_nls_files(base: u64, locale: u64, casing_size: u64, version: u6
     };
     // PVOID *BaseAddress, LCID *DefaultLocaleId, LARGE_INTEGER
     // *DefaultCasingTableSize e ULONG *CurrentNLSVersion, sondados acima.
-    let written = guest::try_write::<u64>(base, view).and_then(|()| guest::try_write::<u32>(locale, DEFAULT_LOCALE)).and_then(|()| {
+    let written = guest::try_write::<u64>(base, view).and_then(|()| guest::try_write::<u32>(locale, crate::ntos::ps::locale::default_system_locale())).and_then(|()| {
         // A ABI x64 atual deixa as saídas legadas zeradas: o casing é a seção
         // independente do tipo 10 (PEB.UnicodeCaseTableData).
         if casing_size != 0 {
@@ -134,20 +133,33 @@ fn nt_get_nls_section_ptr(section_type: u64, data: u64, context: u64, out: u64, 
     Ok(if written.is_err() { 0xC000_0005 } else { 0 })
 }
 
-fn nt_query_default_locale(_user: u64, out: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
+/// NtQueryDefaultLocale(UserProfile, DefaultLocaleId*): o LCID do usuário
+/// ou do sistema (`ps/locale`).
+fn nt_query_default_locale(user: u64, out: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
     if !probe_user_write(out, 4) {
         return Ok(0xC000_0005);
     }
     // LCID de saída (sondado acima).
-    Ok(if guest::try_write::<u32>(out, DEFAULT_LOCALE).is_err() { 0xC000_0005 } else { 0 })
+    Ok(if guest::try_write::<u32>(out, crate::ntos::ps::locale::default_locale(user as u8 != 0)).is_err() { 0xC000_0005 } else { 0 })
 }
 
-fn nt_query_default_ui_language(out: u64, _a2: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
+/// LANGID de saída de um serviço de idioma, sondado.
+fn write_language(out: u64, language: u32) -> u32 {
     if !probe_user_write(out, 2) {
-        return Ok(0xC000_0005);
+        return 0xC000_0005;
     }
     // LANGID de saída (sondado acima).
-    Ok(if guest::try_write::<u16>(out, DEFAULT_UI_LANGUAGE as u16).is_err() { 0xC000_0005 } else { 0 })
+    if guest::try_write::<u16>(out, language as u16).is_err() { 0xC000_0005 } else { 0 }
+}
+
+/// NtQueryDefaultUILanguage: o PsDefaultUILanguageId.
+fn nt_query_default_ui_language(out: u64, _a2: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
+    Ok(write_language(out, crate::ntos::ps::locale::default_ui_language()))
+}
+
+/// NtQueryInstallUILanguage: o PsInstallUILanguageId.
+fn nt_query_install_ui_language(out: u64, _a2: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
+    Ok(write_language(out, crate::ntos::ps::locale::install_ui_language()))
 }
 
 /// NtIsUILanguageComitted() (`ps/locale`).
@@ -161,5 +173,5 @@ pub fn init() {
     state::register_handler("NtGetNlsSectionPtr", nt_get_nls_section_ptr);
     state::register_handler("NtQueryDefaultLocale", nt_query_default_locale);
     state::register_handler("NtQueryDefaultUILanguage", nt_query_default_ui_language);
-    state::register_handler("NtQueryInstallUILanguage", nt_query_default_ui_language);
+    state::register_handler("NtQueryInstallUILanguage", nt_query_install_ui_language);
 }

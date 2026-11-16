@@ -39,7 +39,6 @@ use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::loaded_images;
 use crate::ntos::rtl::guest_strings;
 use crate::ntos::rtl::image;
-use crate::ntos::rtl::nls_configuration;
 use crate::ntos::rtl::resource::configuration::{self as resource_configuration, Configuration};
 use crate::ntos::rtl::resource::satellites::{self as resource_satellites, Primary};
 use crate::ntos::rtl::resource::tree::Key;
@@ -336,8 +335,8 @@ fn search(dll: u64, path: &[Element], length: u32, flags: u32) -> Result<Result<
     let try_neutral = boot_drivers && flags & NO_NEUTRAL_SATELLITE == 0;
     let saved = [path[0].clone(), if levels >= 2 { path[1].clone() } else { Element::Id(0) }];
     // PsMachineUILanguageId, PsInstallUILanguageId e PsDefaultSystemLocaleId.
-    let machine = nls_configuration::DEFAULT_UI_LANGUAGE as u16;
-    let install = nls_configuration::INSTALL_UI_LANGUAGE as u16;
+    let machine = crate::ntos::ps::locale::default_ui_language() as u16;
+    let install = crate::ntos::ps::locale::install_ui_language() as u16;
     let locale = crate::ntos::ps::locale::default_system_locale();
     let neutral_primary = language & 0x3FF == 0;
 

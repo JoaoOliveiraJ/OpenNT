@@ -4,8 +4,10 @@
 //! NtSetDefaultLocale, NtQueryDefaultUILanguage e NtSetDefaultUILanguage
 //! leem e trocam; aqui, as formas Zw (modo kernel, sem sonda).
 //!
-//! Os valores começam com a configuração da instalação
-//! (`rtl/nls_configuration`). NtSetDefaultLocale com UserProfile troca o
+//! Os valores começam com o padrão de `rtl/nls_configuration` e, carregada a
+//! SYSTEM, passam aos da instalação (`Control\Nls\Language`, o
+//! PsInstallUILanguageId e o PsDefaultSystemLocaleId do
+//! CmGetSystemControlValues). NtSetDefaultLocale com UserProfile troca o
 //! LCID do usuário e, sem, o do sistema; LCID 0 é recusado com
 //! STATUS_INVALID_PARAMETER. NtSetDefaultUILanguage troca o idioma de
 //! interface; 0 é recusado. Em modo kernel não há checagem de privilégio.
@@ -13,13 +15,66 @@
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::ntos::inc::field::{Field, NtStruct};
-use crate::ntos::rtl::nls_configuration::{DEFAULT_LOCALE, DEFAULT_UI_LANGUAGE};
+use crate::ntos::rtl::nls_configuration::{DEFAULT_LOCALE, DEFAULT_UI_LANGUAGE, INSTALL_UI_LANGUAGE};
 
 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 
 static SYSTEM_LOCALE: AtomicU32 = AtomicU32::new(DEFAULT_LOCALE);
 static USER_LOCALE: AtomicU32 = AtomicU32::new(DEFAULT_LOCALE);
 static UI_LANGUAGE: AtomicU32 = AtomicU32::new(DEFAULT_UI_LANGUAGE);
+/// PsInstallUILanguageId.
+static INSTALL_LANGUAGE: AtomicU32 = AtomicU32::new(INSTALL_UI_LANGUAGE);
+
+/// A chave de idioma da instalação na SYSTEM.
+const LANGUAGE_KEY: &str = "\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Nls\\Language";
+
+/// Um identificador de idioma como o Registro o guarda: REG_SZ com o número
+/// em hexadecimal ("0416"). Zero ou texto inválido não conta.
+pub fn parse_language_id(text: &str) -> Option<u32> {
+    let value = u32::from_str_radix(text.trim_end_matches('\0').trim(), 16).ok()?;
+    (value != 0 && value <= 0xFFFF).then_some(value)
+}
+
+fn registry_language(name: &str) -> Option<u32> {
+    let value = crate::ntos::cm::registry::read_value_by_path(LANGUAGE_KEY, name)?;
+    if value.value_type != 1 && value.value_type != 2 {
+        return None;
+    }
+    let units: alloc::vec::Vec<u16> = value.data.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect();
+    parse_language_id(&alloc::string::String::from_utf16_lossy(&units))
+}
+
+/// CmGetSystemControlValues do `Control\Nls\Language` da SYSTEM, logo
+/// depois da carga dela: o `Default` dá o PsDefaultSystemLocaleId (e o
+/// LCID padrão das threads), o `InstallLanguage` o PsInstallUILanguageId,
+/// que também é o idioma de interface padrão (PsDefaultUILanguageId).
+/// Valor ausente ou inválido deixa o padrão (`rtl/nls_configuration`).
+pub fn initialize_from_registry() {
+    if let Some(locale) = registry_language("Default") {
+        SYSTEM_LOCALE.store(locale, Ordering::Release);
+        USER_LOCALE.store(locale, Ordering::Release);
+    }
+    if let Some(language) = registry_language("InstallLanguage") {
+        INSTALL_LANGUAGE.store(language, Ordering::Release);
+        UI_LANGUAGE.store(language, Ordering::Release);
+    }
+    crate::debug_print!("[nls] localidade {:#x}, idioma de interface {:#x} (instalacao {:#x})", default_system_locale(), default_ui_language(), install_ui_language());
+}
+
+/// PsInstallUILanguageId (o NtQueryInstallUILanguage).
+pub fn install_ui_language() -> u32 {
+    INSTALL_LANGUAGE.load(Ordering::Acquire)
+}
+
+/// PsDefaultUILanguageId (o NtQueryDefaultUILanguage).
+pub fn default_ui_language() -> u32 {
+    UI_LANGUAGE.load(Ordering::Acquire)
+}
+
+/// O LCID padrão do usuário (`true`) ou do sistema.
+pub fn default_locale(user_profile: bool) -> u32 {
+    locale_cell(user_profile).load(Ordering::Acquire)
+}
 
 /// PsUILanguageComitted: começa desligado (o valor da imagem do ntoskrnl)
 /// e só o NtFlushInstallUILanguage com SetComittedFlag o liga.

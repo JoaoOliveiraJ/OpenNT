@@ -380,6 +380,11 @@ fn code_pages(assert: Assert) {
     };
     let (ansi, oem, tag) = (data("NlsAnsiCodePage"), data("NlsOemCodePage"), data("NlsMbCodePageTag"));
     assert(ansi.is_some_and(|cell| guest::read16(cell) as u32 == nls_configuration::ANSI_CODE_PAGE) && oem.is_some_and(|cell| guest::read16(cell) as u32 == crate::ntos::rtl::oem_code_page::OEM_CODE_PAGE) && tag.is_some_and(|cell| guest::read8(cell) == 0), "nls: NlsAnsiCodePage = 1252, NlsOemCodePage = 437 e NlsMbCodePageTag = FALSE");
+    // O idioma da instalação como o `Control\Nls\Language` o guarda.
+    {
+        use crate::ntos::ps::locale::parse_language_id;
+        assert(parse_language_id("0416") == Some(0x416) && parse_language_id("0409\0") == Some(0x409) && parse_language_id("0") == None && parse_language_id("zz") == None && parse_language_id("10000") == None, "nls: o identificador de idioma em hexadecimal do Registro");
+    }
     let scratch = guest::alloc_bytes(0x1000);
     let defaults = status("RtlGetDefaultCodePage", &[scratch, scratch + 2]);
     assert(defaults != u32::MAX && guest::read16(scratch) == 1252 && guest::read16(scratch + 2) == 437, "nls: RtlGetDefaultCodePage devolve as duas paginas");

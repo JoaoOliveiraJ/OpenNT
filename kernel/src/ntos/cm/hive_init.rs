@@ -145,6 +145,8 @@ pub fn initialize_hives() -> Result<(), KernelError> {
     let from_file = load_machine_hive(SYSTEM_MOUNT, SYSTEM_FILE, || seed::system_keys(smss))?;
     SYSTEM_FROM_FILE.store(from_file, Ordering::Release);
     create_control_set()?;
+    // CmGetSystemControlValues: o idioma da instalação (`Control\Nls\Language`).
+    crate::ntos::ps::locale::initialize_from_registry();
     // A lista de hives existe a partir daqui (CmpHiveFileListHandle): as
     // hives já ligadas entram nela e as próximas entram na carga.
     hive_list::start_hive_list();
