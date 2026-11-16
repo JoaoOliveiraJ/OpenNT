@@ -304,6 +304,12 @@ fn fill_capabilities(function: &PciFunction, address: u64) {
     }
     capabilities.system_wake.set(SystemPowerState::POWER_SYSTEM_UNSPECIFIED);
     capabilities.device_wake.set(DevicePowerState::POWER_DEVICE_UNSPECIFIED);
+    // Como o PciDevice_QueryCapabilities: só a ponte de host (classe 06.00)
+    // é RawDeviceOK (e SurpriseRemovalOK); ela não tem driver funcional
+    // (NO_DRV do machine.inf) e inicia só com o PDO.
+    let host_bridge = function.class_code == 0x06 && function.sub_class == 0x00;
+    capabilities.set_raw_device_ok(host_bridge as u32);
+    capabilities.set_surprise_removal_ok(host_bridge as u32);
 }
 
 /// Copia o espaço de configuração (READ_CONFIG/WRITE_CONFIG).

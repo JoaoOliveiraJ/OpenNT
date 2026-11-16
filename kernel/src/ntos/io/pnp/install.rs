@@ -5,7 +5,10 @@
 //! máquina que atendem o hardware emulado (mshdc.inf, disk.inf, volume.inf,
 //! volmgr.inf, o display.inf, que dá o BasicDisplay.sys a todo adaptador de
 //! classe VGA, PCI\CC_0300, e o machine.inf, que dá o msisadrv.sys, um
-//! driver KMDF, às pontes PCI-ISA, PCI\CC_0601), com o que cada seção de instalação grava: o serviço
+//! driver KMDF, às pontes PCI-ISA, PCI\CC_0601, e o driver nulo das seções
+//! NO_DRV às pontes de host, PCI\CC_0600, e, com a raiz ACPI, ao HPET, ao
+//! relógio CMOS, aos barramentos de recursos, ao contêiner dos processadores
+//! e ao botão de função fixa), com o que cada seção de instalação grava: o serviço
 //! (`[*.Services]`/`AddService`), a classe (`[Version]` e o INF da classe:
 //! c_hdc.inf, c_diskdrive.inf, c_volume.inf, a classe System), os valores
 //! da chave do driver (`AddReg` de `[DDInstall]`, HKR = Control\Class\
@@ -230,6 +233,39 @@ const ATAPI_HARDWARE: &[RegValue] = &[
     RegValue { subkey: "", name: "UseBusDeviceDesc", data: RegData::Dword(1) },
 ];
 
+/// machine.inf `[NO_DRV_X_REG]` e `[NO_DRV_X_PNP_REG]` (HKR = chave do driver).
+const NO_DRV_X_VALUES: &[RegValue] = &[
+    RegValue { subkey: "", name: "ResourcePickerExceptions", data: RegData::Text("IO@0-0xFF:*;IO:HAL,MBRES;IRQ:HAL,*") },
+    RegValue { subkey: "", name: "ResourcePickerTags", data: RegData::Text("MBRES") },
+];
+/// machine.inf `[NO_DRV_HPET_REG]`.
+const NO_DRV_HPET_VALUES: &[RegValue] = &[
+    RegValue { subkey: "", name: "ResourcePickerExceptions", data: RegData::Text("MEM:HAL,MBRES,*;IRQ:HAL,MBRES,*") },
+    RegValue { subkey: "", name: "ResourcePickerTags", data: RegData::Text("MBRES") },
+];
+
+/// Uma linha do `[GENDEV_SYS.NTamd64]` do machine.inf com uma seção de
+/// driver nulo (`AddService = , %SPSVCINST_ASSOCSERVICE%`): o dispositivo
+/// fica instalado, sem serviço.
+const fn machine_no_driver(section: &'static str, id: &'static str, description_key: &'static str, description: &'static str, driver_values: &'static [RegValue]) -> InfDriver {
+    InfDriver {
+        inf: "machine.inf",
+        section,
+        id,
+        description_key,
+        description,
+        manufacturer_key: "GENDEV_MFG",
+        manufacturer: "(Standard system devices)",
+        provider: "Microsoft",
+        driver_version: "10.0.19041.3636",
+        service: None,
+        class: &CLASS_SYSTEM,
+        driver_values,
+        device_values: &[],
+        exclude_ids: &[],
+    }
+}
+
 /// As linhas de modelo, na ordem dos INFs.
 pub const DRIVERS: &[InfDriver] = &[
     InfDriver {
@@ -392,6 +428,7 @@ pub const DRIVERS: &[InfDriver] = &[
         device_values: &[],
         exclude_ids: &["PCI\\VEN_1414&DEV_5353"],
     },
+    machine_no_driver("NO_DRV", "PCI\\CC_0600", "PCI\\CC_0600_Desc", "PCI standard host CPU bridge", &[]),
     InfDriver {
         inf: "machine.inf",
         section: "MSISADRV",
@@ -496,6 +533,14 @@ pub const ACPI_ROOT_DRIVERS: &[InfDriver] = &[
         device_values: PCI_ROOT_HARDWARE,
         exclude_ids: &[],
     },
+    // Os dispositivos do namespace que o machine.inf instala com o driver
+    // nulo: o HPET, o relógio CMOS, os barramentos de recursos (PNP0A06), o
+    // contêiner dos processadores e o botão de função fixa.
+    machine_no_driver("NO_DRV_HPET", "*PNP0103", "*PNP0103_Desc", "High precision event timer", NO_DRV_HPET_VALUES),
+    machine_no_driver("NO_DRV_X", "*PNP0B00", "*PNP0B00_Desc", "System CMOS/real time clock", NO_DRV_X_VALUES),
+    machine_no_driver("NO_DRV_X_PNP", "*PNP0A06", "*PNP0A06_Desc", "Extended IO Bus", NO_DRV_X_VALUES),
+    machine_no_driver("NO_DRV_X_PNP", "*ACPI0010", "ACPI0010_Desc", "ACPI Processor Container Device", NO_DRV_X_VALUES),
+    machine_no_driver("NO_DRV", "ACPI\\FixedButton", "ACPI\\FixedButton_Desc", "ACPI Fixed Feature Button", &[]),
     // O teclado e o mouse PS/2 que o acpi.sys relata sob a ponte PCI-ISA:
     // keyboard.inf `*PNP0303` (STANDARD_Inst) e msmouse.inf `*PNP0F13`
     // (PS2_Inst), os dois com o i8042prt e os filtros de classe.
