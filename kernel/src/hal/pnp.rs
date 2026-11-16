@@ -14,6 +14,9 @@
 //! - QUERY_CAPABILITIES: UniqueID e SilentInstall (sem Lock, Eject,
 //!   Removable, Dock e RawDeviceOK), Address e UINumber 0xFFFFFFFF, D0 em
 //!   S0 e D3 em S4/S5, latências zero;
+//! - QUERY_INTERFACE (o HalpQueryInterface): GUID_BUS_INTERFACE_STANDARD,
+//!   pelo qual o acpi.sys passa ao pci.sys o adaptador de DMA da HAL
+//!   (HalPnpGetDmaAdapter), e GUID_DMA_CACHE_COHERENCY_INTERFACE;
 //! - START e as consultas de parada e remoção, QUERY_PNP_DEVICE_STATE e
 //!   DEVICE_USAGE_NOTIFICATION: sucesso; TargetDeviceRelation: o próprio PDO;
 //! - o resto mantém o status recebido.
@@ -38,7 +41,10 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use crate::hal::amd64::routine_stubs::{self, Routine};
+use crate::ntos::inc::types::extra_storage::{BusInterfaceStandard, Interface};
 use crate::ntos::inc::types::{BusQueryIdType, DeviceCapabilities, DeviceObject, DevicePowerState, DeviceRelationType, DeviceRelations, IoStackLocation, Irp, NtStruct};
+use crate::ntos::init::exports::Call;
 use crate::ntos::io::io_manager::{self, irp_mj, irp_mn};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::ob::objects::device as device_objects;
@@ -200,6 +206,7 @@ fn answer_acpi_root(device: u64, location: &IoStackLocation) -> Option<(i32, u64
         }
         irp_mn::QUERY_RESOURCE_REQUIREMENTS => Some((0, acpi_root_requirements())),
         irp_mn::QUERY_RESOURCES => Some((0, acpi_root_boot_configuration())),
+        irp_mn::QUERY_INTERFACE => query_interface(location),
         irp_mn::QUERY_ID => match location.parameters.query_id.id_type.get() {
             BusQueryIdType::BUS_QUERY_DEVICE_ID | BusQueryIdType::BUS_QUERY_HARDWARE_I_DS => Some((0, pool_strings(&ACPI_ROOT_IDS))),
             BusQueryIdType::BUS_QUERY_INSTANCE_ID => Some((0, pool_strings(&[INSTANCE_ID]))),
@@ -207,6 +214,89 @@ fn answer_acpi_root(device: u64, location: &IoStackLocation) -> Option<(i32, u64
         },
         _ => None,
     }
+}
+
+/// GUID_BUS_INTERFACE_STANDARD {496b8280-6f25-11d0-beaf-08002be2092f}.
+const GUID_BUS_INTERFACE_STANDARD: [u8; 16] = [0x80, 0x82, 0x6B, 0x49, 0x25, 0x6F, 0xD0, 0x11, 0xBE, 0xAF, 0x08, 0x00, 0x2B, 0xE2, 0x09, 0x2F];
+/// GUID_DMA_CACHE_COHERENCY_INTERFACE {b520f7fa-8a5a-4e40-a3f6-6be1e162d935}.
+const GUID_DMA_CACHE_COHERENCY_INTERFACE: [u8; 16] = [0xFA, 0xF7, 0x20, 0xB5, 0x5A, 0x8A, 0x40, 0x4E, 0xA3, 0xF6, 0x6B, 0xE1, 0xE1, 0x62, 0xD9, 0x35];
+const STATUS_BUFFER_TOO_SMALL: i32 = 0xC000_0023_u32 as i32;
+const STATUS_INVALID_PARAMETER: i32 = 0xC000_000D_u32 as i32;
+/// Tamanhos das interfaces (wdm.h).
+const BUS_INTERFACE_STANDARD_SIZE: u16 = 0x40;
+const DMA_CACHE_COHERENCY_INTERFACE_SIZE: u16 = 0x28;
+
+/// Rotinas da HAL entregues por ponteiro nas interfaces do AcpiRootPdo.
+pub const ROUTINES: &[Routine] = &[
+    // InterfaceReference/InterfaceDereference: retornam sem efeito.
+    Routine { name: "HalpPnpInterfaceReference", handler: interface_reference },
+    // HalPnpGetDmaAdapter: o HalpGetAdapter com a DEVICE_DESCRIPTION.
+    Routine { name: "HalPnpGetDmaAdapter", handler: get_dma_adapter },
+    // SetBusData/GetBusData do barramento da HAL: nenhum byte (0).
+    Routine { name: "HalpPnpBusData", handler: bus_data },
+];
+
+fn interface_reference(_: &Call) -> Result<u64, KernelError> {
+    Ok(0)
+}
+
+/// HalPnpGetDmaAdapter(Context, DeviceDescription, NumberOfMapRegisters*).
+fn get_dma_adapter(call: &Call) -> Result<u64, KernelError> {
+    Ok(crate::hal::dma::get_adapter(call.arg(1), call.arg(2), call.arg(3)))
+}
+
+fn bus_data(_: &Call) -> Result<u64, KernelError> {
+    Ok(0)
+}
+
+/// HalpQueryInterface do AcpiRootPdo: GUID_BUS_INTERFACE_STANDARD (Size
+/// 0x40, versão 1; o Context é o InterfaceSpecificData do pedido, que o
+/// acpi.sys preenche com o PDO de quem pergunta; TranslateBusAddress nulo;
+/// GetDmaAdapter = HalPnpGetDmaAdapter) e GUID_DMA_CACHE_COHERENCY_INTERFACE
+/// (Size 0x28, versão 1, coerente). Information = o tamanho escrito.
+fn query_interface(location: &IoStackLocation) -> Option<(i32, u64)> {
+    let parameters = &location.parameters.query_interface;
+    let guid: [u8; 16] = guest::read_bytes(parameters.interface_type.get(), 16).try_into().ok()?;
+    let (size, version, interface, context) = (parameters.size.get(), parameters.version.get(), parameters.interface.get(), parameters.interface_specific_data.get());
+    if guid == GUID_BUS_INTERFACE_STANDARD {
+        if size < BUS_INTERFACE_STANDARD_SIZE {
+            return Some((STATUS_BUFFER_TOO_SMALL, BUS_INTERFACE_STANDARD_SIZE as u64));
+        }
+        if context == 0 {
+            return Some((STATUS_INVALID_PARAMETER, BUS_INTERFACE_STANDARD_SIZE as u64));
+        }
+        // SAFETY: buffer INTERFACE do pedido com pelo menos 0x40 bytes.
+        let bus = unsafe { BusInterfaceStandard::at(interface) };
+        bus.interface.size.set(BUS_INTERFACE_STANDARD_SIZE);
+        bus.interface.version.set(1);
+        bus.interface.context.set(context);
+        bus.interface.interface_reference.set(routine_stubs::address("HalpPnpInterfaceReference").ok()?);
+        bus.interface.interface_dereference.set(routine_stubs::address("HalpPnpInterfaceReference").ok()?);
+        bus.translate_bus_address.set(0);
+        bus.get_dma_adapter.set(routine_stubs::address("HalPnpGetDmaAdapter").ok()?);
+        bus.set_bus_data.set(routine_stubs::address("HalpPnpBusData").ok()?);
+        bus.get_bus_data.set(routine_stubs::address("HalpPnpBusData").ok()?);
+        return Some((0, BUS_INTERFACE_STANDARD_SIZE as u64));
+    }
+    if guid == GUID_DMA_CACHE_COHERENCY_INTERFACE {
+        if size < DMA_CACHE_COHERENCY_INTERFACE_SIZE {
+            return Some((STATUS_BUFFER_TOO_SMALL, 0));
+        }
+        if version == 0 {
+            return Some((STATUS_NOT_SUPPORTED, 0));
+        }
+        // SAFETY: buffer INTERFACE do pedido com pelo menos 0x28 bytes.
+        let header = unsafe { Interface::at(interface) };
+        header.size.set(DMA_CACHE_COHERENCY_INTERFACE_SIZE);
+        header.version.set(1);
+        header.context.set(0);
+        header.interface_reference.set(routine_stubs::address("HalpPnpInterfaceReference").ok()?);
+        header.interface_dereference.set(routine_stubs::address("HalpPnpInterfaceReference").ok()?);
+        // DMA_CACHE_COHERENCY_INTERFACE.CacheCoherent.
+        guest::write8(interface + 0x20, 1);
+        return Some((0, DMA_CACHE_COHERENCY_INTERFACE_SIZE as u64));
+    }
+    None
 }
 
 /// Os vetores da IDT para dispositivos (HalpQueryAcpiResourceRequirements):
