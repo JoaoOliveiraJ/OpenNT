@@ -1106,6 +1106,54 @@ pub fn itoa_s(value: i32, buffer: u64, size: u64, radix: u32) -> Result<u32, Ker
     Ok(0)
 }
 
+/// _i64tow_s(Value, Buffer, SizeInCharacters, Radix) (0x3d6580 -> x64tow_s
+/// 0x3d661c): devolve o errno. Buffer NULL ou tamanho 0 = EINVAL; Buffer[0]
+/// = 0 antes do resto; sem espaço para o sinal (base 10 negativa) e um
+/// dígito = ERANGE; base fora de 2..=36 = EINVAL. Os dígitos saem do menos
+/// significativo enquanto cabem; sem espaço para o NUL, Buffer[0] = 0 e
+/// ERANGE (os dígitos gravados ficam).
+pub fn i64tow_s(value: i64, buffer: u64, size: u64, radix: u32) -> Result<u32, KernelError> {
+    if buffer == 0 || size == 0 {
+        return Ok(CRT_EINVAL);
+    }
+    let negative = radix == 10 && value < 0;
+    guest::try_write_bytes(buffer, &[0, 0])?;
+    if size <= if negative { 2 } else { 1 } {
+        return Ok(CRT_ERANGE);
+    }
+    if !(2..=36).contains(&radix) {
+        return Ok(CRT_EINVAL);
+    }
+    let mut written = 0u64;
+    let mut magnitude = value as u64;
+    if negative {
+        guest::try_write_bytes(buffer, &(b'-' as u16).to_le_bytes())?;
+        written = 1;
+        magnitude = magnitude.wrapping_neg();
+    }
+    let first = written;
+    loop {
+        let digit = (magnitude % radix as u64) as u16;
+        magnitude /= radix as u64;
+        let unit = if digit > 9 { digit - 10 + b'a' as u16 } else { digit + b'0' as u16 };
+        guest::try_write_bytes(buffer + written * 2, &unit.to_le_bytes())?;
+        written += 1;
+        if magnitude == 0 || written >= size {
+            break;
+        }
+    }
+    if written >= size {
+        guest::try_write_bytes(buffer, &[0, 0])?;
+        return Ok(CRT_ERANGE);
+    }
+    guest::try_write_bytes(buffer + written * 2, &[0, 0])?;
+    // Os dígitos saíram do menos significativo: inverte no lugar.
+    let digits = guest::read_bytes(buffer + first * 2, ((written - first) * 2) as usize);
+    let reversed: alloc::vec::Vec<u8> = digits.chunks_exact(2).rev().flatten().copied().collect();
+    guest::try_write_bytes(buffer + first * 2, &reversed)?;
+    Ok(0)
+}
+
 /// strcat_s(Destination, Size, Source): devolve o errno.
 pub fn strcat_s(destination: u64, size: u64, source: u64) -> Result<u32, KernelError> {
     if destination == 0 || size == 0 {

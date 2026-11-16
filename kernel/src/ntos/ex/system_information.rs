@@ -137,10 +137,46 @@ pub fn query(class: u32, output: u64, length: u32, returned: u64) -> Result<u32,
         }
         // SystemBootGraphicsInformation: a tela de boot (Bgk).
         126 => return crate::ntos::bgk::graphics_information::query_system_information(output, length, returned),
+        // SystemBasicInformation e as variantes Emulation/NativeBasic x64.
+        0 | 62 | 114 => return Ok(basic_information(output, length, returned)),
         5 => {}
         _ => return Ok(0xC000_000D),
     }
     system_process_information::query(output, length as u64, returned, false)
+}
+
+/// SYSTEM_BASIC_INFORMATION para um chamador de modo kernel, com os valores
+/// da consulta de modo usuário (`ps/user/syscalls_core.rs`): resolução do
+/// timer de 15,625 ms, páginas de 4 KB, a memória física, a granularidade de
+/// alocação, a faixa de endereços de usuário e os processadores ativos.
+/// Buffer menor que a estrutura: STATUS_INFO_LENGTH_MISMATCH com o tamanho
+/// em ReturnLength.
+fn basic_information(output: u64, length: u32, returned: u64) -> u32 {
+    use crate::ntos::inc::types::SystemBasicInformation;
+    use crate::ntos::mm::memory_map;
+    let size = SystemBasicInformation::SIZE as u32;
+    if returned != 0 {
+        // SAFETY: o PULONG ReturnLength do chamador (modo kernel).
+        unsafe { Field::<u32>::at(returned) }.set(size);
+    }
+    if length < size {
+        return 0xC000_0004;
+    }
+    let pages = crate::hal::kmalloc::ram_top() / 0x1000;
+    let processors = crate::ntos::ke::smp::online_cpu_count();
+    guest::write_bytes(output, &[0u8; SystemBasicInformation::SIZE as usize]);
+    // SAFETY: o buffer de saída do chamador, com o tamanho da estrutura.
+    let basic = unsafe { SystemBasicInformation::at(output) };
+    basic.timer_resolution.set(156_250);
+    basic.page_size.set(0x1000);
+    basic.number_of_physical_pages.set(pages as u32);
+    basic.highest_physical_page_number.set((pages - 1) as u32);
+    basic.allocation_granularity.set(memory_map::ALLOCATION_GRANULARITY as u32);
+    basic.minimum_user_mode_address.set(memory_map::LOWEST_USER_ADDRESS);
+    basic.maximum_user_mode_address.set(memory_map::HIGHEST_USER_ADDRESS);
+    basic.active_processors_affinity_mask.set((1u64 << processors) - 1);
+    basic.number_of_processors.set(processors as i8);
+    0
 }
 
 // ---- NtQuerySystemInformationEx / ZwQuerySystemInformationEx (modo kernel) --

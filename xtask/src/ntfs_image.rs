@@ -71,10 +71,14 @@ const HELLO_DATA: &[u8] = b"Ola do NTFS no OpenNT!\r\n";
 const HELLO_RECORD: u64 = 16;
 const ROOT: u64 = 5;
 const EXTEND: u64 = 11;
-/// Atributos de arquivo: oculto | sistema e o diretório das informações
-/// duplicadas (DUP_FILE_NAME_INDEX_PRESENT).
+/// Atributos de arquivo: oculto | sistema e, nas informações duplicadas,
+/// o diretório (DUP_FILE_NAME_INDEX_PRESENT) e o índice de visão
+/// (DUP_VIEW_INDEX_PRESENT: o $Secure e os índices do $Extend; o ntfs.sys
+/// só abre um índice com nome diferente de $I30, como `$Reparse:$R:$INDEX_ALLOCATION`,
+/// num arquivo que o tem).
 const HIDDEN_SYSTEM: u32 = 0x06;
 const DIRECTORY_DUPLICATE: u32 = 0x1000_0000;
+const VIEW_INDEX_DUPLICATE: u32 = 0x2000_0000;
 const FILE_ARCHIVE: u32 = 0x20;
 /// Flags do registro: em uso, diretório ($I30) e índice de visão.
 const IN_USE: u16 = 1;
@@ -667,15 +671,15 @@ pub fn build(output: &Path, extras: &[(String, Vec<u8>)], free_space_mib: usize,
     let sii = view_entry(&SECURITY_ID.to_le_bytes(), &header, &[]);
     let sdh_key = [hash.to_le_bytes(), SECURITY_ID.to_le_bytes()].concat();
     let sdh = view_entry(&sdh_key, &header, &[b'I', 0, b'I', 0]);
-    system_file(&mut records, &mut children, 9, ROOT, "$Secure", VIEW_INDEX, HIDDEN_SYSTEM, (0, 0), vec![
+    system_file(&mut records, &mut children, 9, ROOT, "$Secure", VIEW_INDEX, VIEW_INDEX_DUPLICATE | HIDDEN_SYSTEM, (0, 0), vec![
         nonresident(0x80, "$SDS", vec![(Some(sds_lcn), sds_count)], sds_length as u64),
         resident(0x90, "$SDH", index_root_value(0, 0x12, &[sdh, end_entry(None)].concat(), false)),
         resident(0x90, "$SII", index_root_value(0, 0x10, &[sii, end_entry(None)].concat(), false)),
     ])?;
     // Arquivos do $Extend: índices de visão vazios.
-    system_file(&mut records, &mut children, quota, EXTEND, "$Quota", VIEW_INDEX, HIDDEN_SYSTEM, (0, 0), vec![resident(0x90, "$O", index_root_value(0, 0x11, &end_entry(None), false)), resident(0x90, "$Q", index_root_value(0, 0x10, &end_entry(None), false))])?;
-    system_file(&mut records, &mut children, object_id, EXTEND, "$ObjId", VIEW_INDEX, HIDDEN_SYSTEM, (0, 0), vec![resident(0x90, "$O", index_root_value(0, 0x13, &end_entry(None), false))])?;
-    system_file(&mut records, &mut children, reparse, EXTEND, "$Reparse", VIEW_INDEX, HIDDEN_SYSTEM, (0, 0), vec![resident(0x90, "$R", index_root_value(0, 0x13, &end_entry(None), false))])?;
+    system_file(&mut records, &mut children, quota, EXTEND, "$Quota", VIEW_INDEX, VIEW_INDEX_DUPLICATE | HIDDEN_SYSTEM, (0, 0), vec![resident(0x90, "$O", index_root_value(0, 0x11, &end_entry(None), false)), resident(0x90, "$Q", index_root_value(0, 0x10, &end_entry(None), false))])?;
+    system_file(&mut records, &mut children, object_id, EXTEND, "$ObjId", VIEW_INDEX, VIEW_INDEX_DUPLICATE | HIDDEN_SYSTEM, (0, 0), vec![resident(0x90, "$O", index_root_value(0, 0x13, &end_entry(None), false))])?;
+    system_file(&mut records, &mut children, reparse, EXTEND, "$Reparse", VIEW_INDEX, VIEW_INDEX_DUPLICATE | HIDDEN_SYSTEM, (0, 0), vec![resident(0x90, "$R", index_root_value(0, 0x13, &end_entry(None), false))])?;
     // Registros 12..15: reservados, em uso.
     for number in 12..16 {
         records.push((number, IN_USE, vec![standard_information(HIDDEN_SYSTEM), resident(0x80, "", Vec::new())]));

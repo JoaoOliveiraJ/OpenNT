@@ -83,6 +83,9 @@ const IOCTL_DISK_IS_WRITABLE: u32 = 0x0007_0024;
 const IOCTL_DISK_GET_PARTITION_INFO_EX: u32 = 0x0007_0048;
 const IOCTL_DISK_GET_LENGTH_INFO: u32 = 0x0007_405C;
 const IOCTL_DISK_GET_DRIVE_GEOMETRY_EX: u32 = 0x0007_00A0;
+const IOCTL_DISK_GET_CLUSTER_INFO: u32 = 0x0007_0214;
+/// DISK_CLUSTER_INFO.Version (o tamanho da estrutura).
+const DISK_CLUSTER_INFO_SIZE: u32 = 0x20;
 const IOCTL_DISK_CHECK_VERIFY: u32 = 0x0007_4800;
 const IOCTL_DISK_MEDIA_REMOVAL: u32 = 0x0007_4804;
 const IOCTL_STORAGE_MEDIA_REMOVAL: u32 = 0x002D_4804;
@@ -464,6 +467,14 @@ fn device_control(volume: &Volume, irp: &Irp, stack: &IoStackLocation) -> (u32, 
             reply(irp, output_length, &bytes)
         }
         IOCTL_DISK_IS_WRITABLE => (STATUS_SUCCESS, 0),
+        // DISK_CLUSTER_INFO como o partmgr.sys responde por um disco que não é
+        // de cluster: Version = 0x20 e Flags, FlagsMask e Notify zerados (o
+        // storqosflt pergunta se o volume é um CSV oculto).
+        IOCTL_DISK_GET_CLUSTER_INFO => {
+            let mut bytes = alloc::vec![0u8; DISK_CLUSTER_INFO_SIZE as usize];
+            bytes[..4].copy_from_slice(&DISK_CLUSTER_INFO_SIZE.to_le_bytes());
+            reply(irp, output_length, &bytes)
+        }
         IOCTL_DISK_CHECK_VERIFY | IOCTL_STORAGE_CHECK_VERIFY | IOCTL_STORAGE_CHECK_VERIFY2 => {
             if output_length >= 4 {
                 reply(irp, output_length, &0u32.to_le_bytes())

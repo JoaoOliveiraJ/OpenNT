@@ -121,6 +121,13 @@ pub fn transaction_parameter_block(file: &FileObject) -> u64 {
     existing_file_extension(file).map_or(0, |extension| extension.fo_ext_per_type_extension[FO_EXT_TRANSACTION_PARAMETERS].get())
 }
 
+/// IoGetSiloParameters (RVA 0x302f30): o bloco de parâmetros do silo em
+/// FoExtPerTypeExtension[7] (NULL sem extensão), o mesmo de que o IoGetSilo
+/// lê o silo.
+pub fn silo_parameters(file: &FileObject) -> u64 {
+    existing_file_extension(file).map_or(0, |extension| extension.fo_ext_per_type_extension[FO_EXT_SILO].get())
+}
+
 /// IoGetSilo (RVA 0x3618f0): FoExtPerTypeExtension[7]->Silo (o segundo ponteiro do bloco).
 pub fn file_object_silo(file: &FileObject) -> u64 {
     let context = existing_file_extension(file).map_or(0, |extension| extension.fo_ext_per_type_extension[FO_EXT_SILO].get());
@@ -429,6 +436,27 @@ pub fn copy_device_object_hint(source: &crate::ntos::inc::types::FileObject, tar
     }
     // SAFETY: bloco recém-alocado com o tamanho de DeviceHintExtension.
     unsafe { DeviceHintExtension::at(block) }.device_object_hint.set(hint.device_object_hint.get());
+    Ok(HINT_STATUS_SUCCESS)
+}
+
+/// IopSetFileObjectExtension(File, 1, Hint) da abertura com
+/// DeviceObjectHint: o FILE_OBJECT ganha o bloco da dica com o dispositivo.
+pub fn set_device_object_hint(file: &crate::ntos::inc::types::FileObject, device: u64) -> Result<u32, crate::rtl::KernelError> {
+    use crate::ntos::inc::field::NtStruct;
+    let Some(extension) = file_object_extension(file.address())? else { return Ok(HINT_STATUS_INSUFFICIENT_RESOURCES) };
+    let block = crate::ntos::mm::guest_memory::alloc_bytes(DeviceHintExtension::SIZE);
+    if block == 0 {
+        return Ok(HINT_STATUS_INSUFFICIENT_RESOURCES);
+    }
+    crate::ntos::mm::guest_memory::write_bytes(block, &[0u8; DeviceHintExtension::SIZE as usize]);
+    // SAFETY: bloco recém-alocado com o tamanho de DeviceHintExtension.
+    unsafe { DeviceHintExtension::at(block) }.device_object_hint.set(device);
+    // SAFETY: extensão instalada no FILE_OBJECT.
+    let slot = &unsafe { crate::ntos::inc::types::IopFileObjectExtension::at(extension) }.fo_ext_per_type_extension[HINT_EXTENSION_SLOT];
+    if slot.atomic().compare_exchange(0, block, core::sync::atomic::Ordering::SeqCst, core::sync::atomic::Ordering::SeqCst).is_err() {
+        crate::ntos::mm::guest_memory::free_bytes(block);
+        return Ok(HINT_STATUS_UNSUCCESSFUL);
+    }
     Ok(HINT_STATUS_SUCCESS)
 }
 

@@ -87,8 +87,7 @@ pub mod wmi {
     }
 
     fn query_trace_information(call: &Call) -> Result<u64, KernelError> {
-        wmi::query_trace_information(call.arg(2), call.arg(3) as u32, call.arg(4));
-        Ok(0)
+        Ok(signed_status(wmi::query_trace_information(call.arg(1) as u32, call.arg(2), call.arg(3) as u32, call.arg(4))))
     }
 
     pub static GROUP: Group = Group {

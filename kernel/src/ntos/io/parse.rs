@@ -16,9 +16,20 @@
 //! dispositivo relacionado (IoGetRelatedDeviceObject), depois do
 //! IRP_MJ_CLEANUP do último handle.
 //!
-//! Fora daqui (e do NT): a abertura direta de um dispositivo sem nome
-//! restante segue por `io_manager::open_device`, sem montagem; STATUS_REPARSE,
-//! EAs e arquivo relacionado ainda não são tratados.
+//! O IO_DRIVER_CREATE_CONTEXT de um IoCreateFileEx chega aqui como
+//! [`DriverCreateContext`]: a lista de ECPs vai no Irp->UserBuffer do
+//! IRP_MJ_CREATE (o FsRtlGetEcpListFromIrp a lê, e a lista ganha a flag de
+//! "dentro de um IRP"), e o DeviceObjectHint, que precisa estar na pilha do
+//! volume montado (senão STATUS_INVALID_DEVICE_OBJECT_PARAMETER), recebe o
+//! IRP no lugar do topo e fica como a dica do FILE_OBJECT (o
+//! IoGetRelatedDeviceObject para nele). É o caminho do FltCreateFileEx de um
+//! minifiltro, que manda a abertura começar abaixo da sua instância.
+//!
+//! Sem nome restante, a abertura é do volume (o file system abre o volume
+//! inteiro) quando o acesso pede mais que uma abertura direta do dispositivo
+//! ([`is_volume_open`]); a abertura direta, sem montagem, segue por
+//! `io_manager::open_device`. STATUS_REPARSE, EAs e arquivo relacionado ainda
+//! não são tratados.
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -64,6 +75,23 @@ const FO_RANDOM_ACCESS: u32 = 0x10_0000;
 /// e FILE_ALL_ACCESS.
 const FILE_GENERIC_MAPPING: [u32; 4] = [0x0012_0089, 0x0012_0116, 0x0012_00A0, 0x001F_01FF];
 
+const STATUS_INVALID_DEVICE_OBJECT_PARAMETER: u32 = 0xC000_0369;
+const VPB_MOUNTED: u16 = 0x01;
+/// O acesso de uma abertura direta do dispositivo (IopParseDevice, ntoskrnl
+/// 19041): FILE_READ_ATTRIBUTES, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
+/// SYNCHRONIZE e ACCESS_SYSTEM_SECURITY. Pedir qualquer outro bit sem nome
+/// restante é abrir o volume.
+const DIRECT_DEVICE_OPEN_ACCESS: u32 = !0xFEE1_FF7F;
+
+/// IO_DRIVER_CREATE_CONTEXT de um IoCreateFileEx (ou o DeviceObject do
+/// IoCreateFileSpecifyDeviceObjectHint): a lista de ECPs e a dica de
+/// dispositivo (0 quando ausentes).
+#[derive(Clone, Copy, Default)]
+pub struct DriverCreateContext {
+    pub extra_create_parameter: u64,
+    pub device_object_hint: u64,
+}
+
 /// Os parâmetros do ZwCreateFile que chegam ao file system.
 #[derive(Clone, Copy, Default)]
 pub struct OpenRequest {
@@ -73,6 +101,49 @@ pub struct OpenRequest {
     pub disposition: u32,
     pub create_options: u32,
     pub case_insensitive: bool,
+    pub driver_context: DriverCreateContext,
+}
+
+/// Uma abertura sem nome restante de um dispositivo com VPB é a do volume
+/// quando o acesso passa do de uma abertura direta (e não há arquivo
+/// relacionado, que o chamador já excluiu).
+pub fn is_volume_open(desired_access: u32) -> bool {
+    desired_access & !DIRECT_DEVICE_OPEN_ACCESS != 0
+}
+
+/// O dispositivo `\Device\X` cujo volume já está montado por um file
+/// system com pilha de IRP (o da abertura do volume). Os volumes do kernel,
+/// servidos pelo file system embutido, ficam de fora; um volume ainda não
+/// montado segue aberto direto no dispositivo, porque sem o RAW a montagem
+/// pela abertura do volume não tem para onde cair quando nenhum file system
+/// o reconhece.
+pub fn volume_device_for_open(path: &str) -> Option<u64> {
+    let (Some(node), None) = object_manager::resolve(path) else { return None };
+    let device = io_manager::device(node)?.native_device;
+    if device == 0 || device_at(device).vpb.get() == 0 {
+        return None;
+    }
+    // SAFETY: o VPB do dispositivo.
+    let vpb = unsafe { crate::ntos::inc::types::Vpb::at(device_at(device).vpb.get()) };
+    let mounted = vpb.device_object.get();
+    if vpb.flags.get() & VPB_MOUNTED == 0 || mounted == 0 || crate::drivers::fs::volume_device::is_volume_device(mounted) {
+        return None;
+    }
+    Some(device)
+}
+
+/// O dispositivo está na pilha que começa em `base` (ele ou um acima).
+fn on_stack(base: u64, device: u64) -> bool {
+    let mut current = base;
+    let mut steps = 0;
+    while current != 0 && steps < 64 {
+        if current == device {
+            return true;
+        }
+        current = device_at(current).attached_device.get();
+        steps += 1;
+    }
+    false
 }
 
 /// Resultado do IRP_MJ_CREATE: status, Information (FILE_OPENED...) e o
@@ -245,7 +316,13 @@ pub fn open_file(device: u64, remaining: &str, request: &OpenRequest) -> Result<
     };
     // SAFETY: o VPB montado e referenciado acima.
     let volume = unsafe { crate::ntos::inc::types::Vpb::at(vpb) }.device_object.get();
-    let target = device_objects::top(volume);
+    let hint = request.driver_context.device_object_hint;
+    if hint != 0 && !on_stack(volume, hint) {
+        let _ = file_system::dereference_vpb(vpb);
+        release_device();
+        return Ok(Opened { status: STATUS_INVALID_DEVICE_OBJECT_PARAMETER, information: 0, file_object: 0 });
+    }
+    let target = if hint != 0 { hint } else { device_objects::top(volume) };
     let file = match file_objects::create(device, remaining) {
         Ok(file) => file,
         Err(error) => {
@@ -273,7 +350,12 @@ pub fn open_file(device: u64, remaining: &str, request: &OpenRequest) -> Result<
     security.access_state.set(access);
     security.desired_access.set(request.desired_access);
     security.full_create_options.set(request.create_options);
-    let (status, information) = call_file_irp(target, file, IRP_MJ_CREATE, IRP_CREATE_OPERATION | IRP_SYNCHRONOUS_API, |_, stack| {
+    let ecp_list = request.driver_context.extra_create_parameter;
+    let (status, information) = call_file_irp(target, file, IRP_MJ_CREATE, IRP_CREATE_OPERATION | IRP_SYNCHRONOUS_API, |irp, stack| {
+        if ecp_list != 0 {
+            // SAFETY: a _ECP_LIST do IO_DRIVER_CREATE_CONTEXT do chamador.
+            crate::ntos::fsrtl::ecp::set_list_into_irp(irp, unsafe { crate::ntos::inc::types::extra_fsrtl::EcpList::at(ecp_list) });
+        }
         stack.major_function.set(IRP_MJ_CREATE);
         stack.flags.set(if request.case_insensitive { 0 } else { SL_CASE_SENSITIVE });
         let create = &stack.parameters.create;
@@ -291,6 +373,10 @@ pub fn open_file(device: u64, remaining: &str, request: &OpenRequest) -> Result<
         let _ = file_system::dereference_vpb(vpb);
         release_device();
         return Ok(Opened { status, information: 0, file_object: 0 });
+    }
+    if hint != 0 {
+        // A dica fica no FILE_OBJECT: os IRPs seguintes param nela.
+        crate::ntos::io::extensions::set_device_object_hint(object, hint)?;
     }
     file_objects::set_callbacks(file, FileCallbacks {
         cleanup: Some(Arc::new(move || send_close(file, IRP_MJ_CLEANUP))),

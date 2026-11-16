@@ -1277,6 +1277,44 @@ pub mod ex_push_lock_convert {
     };
 }
 
+pub mod ex_push_lock_fast {
+    //! ExfAcquirePushLockExclusive, ExfAcquirePushLockShared e
+    //! ExfReleasePushLock: os caminhos lentos que as macros de push lock
+    //! dos drivers chamam; a lógica mora em `ex/push_lock`.
+    //!
+    //! ntoskrnl 19041: ExfAcquirePushLockExclusive (0x2732f0) e
+    //! ExfAcquirePushLockShared (0x273520) chamam os Exf*Ex com Flags 0 (o
+    //! chamador já está numa região crítica); ExfReleasePushLock (0x271ac0)
+    //! solta como leitor quando a palavra tem aguardantes ou referências de
+    //! leitor (>= 0x10) e como escritor nos demais casos.
+
+    use crate::ntos::ex::push_lock;
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::rtl::KernelError;
+
+    fn acquire_exclusive(call: &Call) -> Result<u64, KernelError> {
+        push_lock::acquire_exclusive(call.arg(1), 0)?;
+        Ok(0)
+    }
+
+    fn acquire_shared(call: &Call) -> Result<u64, KernelError> {
+        push_lock::acquire_shared(call.arg(1), 0)?;
+        Ok(0)
+    }
+
+    fn release(call: &Call) -> Result<u64, KernelError> {
+        push_lock::release_any(call.arg(1), 0)?;
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "ex-push-lock-fast",
+        names: &["ExfAcquirePushLockExclusive", "ExfAcquirePushLockShared", "ExfReleasePushLock"],
+        handlers: &[acquire_exclusive, acquire_shared, release],
+        data_exports: &[],
+    };
+}
+
 pub mod ex_extension_unregister {
     //! ExUnregisterExtension; a lógica mora em `ex/extension_host`.
 

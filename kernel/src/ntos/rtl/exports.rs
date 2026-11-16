@@ -902,11 +902,14 @@ pub mod rtl_security {
     fn add_access_allowed_ace_ex(call: &Call) -> Result<u64, KernelError> {
         Ok(signed_status(acl::add_known_ace(call.arg(1), call.arg(2) as u32, call.arg(3) as u32, call.arg(4) as u32, call.arg(5), 0)))
     }
+    /// RtlInitializeSid(Sid, IdentifierAuthority, UCHAR SubAuthorityCount):
+    /// só o byte baixo do terceiro registrador é o argumento.
     fn initialize_sid(call: &Call) -> Result<u64, KernelError> {
-        Ok(signed_status(sid::initialize(call.arg(1), call.arg(2), call.arg(3) as u32)))
+        Ok(signed_status(sid::initialize(call.arg(1), call.arg(2), call.arg(3) as u8 as u32)))
     }
+    /// RtlSubAuthoritySid(Sid, ULONG SubAuthority).
     fn sub_authority_sid(call: &Call) -> Result<u64, KernelError> {
-        Ok(sid::sub_authority(call.arg(1), call.arg(2)))
+        Ok(sid::sub_authority(call.arg(1), call.arg(2) as u32 as u64))
     }
     fn length_required_sid(call: &Call) -> Result<u64, KernelError> {
         Ok(sid::length_required(call.arg(1) as u32) as u64)
@@ -1622,13 +1625,13 @@ pub mod rtl_compression {
     /// RtlDecompressBufferEx2(Format, Uncompressed, UncompressedSize, Compressed,
     /// CompressedSize, UncompressedChunkSize, *FinalSize, WorkSpace).
     fn decompress_buffer(call: &Call) -> Result<u64, KernelError> {
-        Ok(signed_status(compression::decompress_buffer(call.arg(1) as u16, call.arg(2), call.arg(3) as u32, call.arg(4), call.arg(5) as u32, call.arg(6) as u32, out(call.arg(7)), call.arg(8))))
+        Ok(signed_status(compression::decompress_buffer_ex2(call.arg(1) as u16, call.arg(2), call.arg(3) as u32, call.arg(4), call.arg(5) as u32, call.arg(6) as u32, out(call.arg(7)), call.arg(8))))
     }
 
     /// RtlDecompressFragmentEx(Format, Fragment, FragmentSize, Compressed,
     /// CompressedSize, FragmentOffset, UncompressedChunkSize, *FinalSize, WorkSpace).
     fn decompress_fragment(call: &Call) -> Result<u64, KernelError> {
-        Ok(signed_status(compression::decompress_fragment(call.arg(1) as u16, call.arg(2), call.arg(3) as u32, call.arg(4), call.arg(5) as u32, call.arg(6) as u32, call.arg(7) as u32, out(call.arg(8)), call.arg(9))))
+        Ok(signed_status(compression::decompress_fragment_ex(call.arg(1) as u16, call.arg(2), call.arg(3) as u32, call.arg(4), call.arg(5) as u32, call.arg(6) as u32, call.arg(7) as u32, out(call.arg(8)), call.arg(9))))
     }
 
     pub static GROUP: Group = Group {
@@ -3106,4 +3109,60 @@ pub mod rtl_volume_dos_name {
     }
 
     pub static GROUP: Group = Group { name: "rtl-volume-dos-name", names: &["RtlVolumeDeviceToDosName"], handlers: &[volume_device_to_dos_name], data_exports: &[] };
+}
+
+pub mod crt_i64tow_s {
+    //! _i64tow_s; a lógica mora em `rtl/crt`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::rtl::crt;
+    use crate::rtl::KernelError;
+
+    /// _i64tow_s(Value, Buffer, SizeInCharacters, Radix) -> errno_t.
+    fn i64tow_s(call: &Call) -> Result<u64, KernelError> {
+        Ok(crt::i64tow_s(call.arg(1) as i64, call.arg(2), call.arg(3), call.arg(4) as u32)? as u64)
+    }
+
+    pub static GROUP: Group = Group { name: "crt-i64tow-s", names: &["_i64tow_s"], handlers: &[i64tow_s], data_exports: &[] };
+}
+
+pub mod rtl_decompression {
+    //! RtlDecompressBuffer, RtlDecompressBufferEx e RtlDecompressFragment (as
+    //! formas sem UncompressedChunkSize); a lógica mora em `rtl/compression`.
+
+    use crate::ntos::inc::types::{Field, NtStruct};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::rtl::compression;
+    use crate::rtl::KernelError;
+
+    /// PULONG de saída do chamador.
+    fn out(address: u64) -> &'static Field<u32> {
+        // SAFETY: parâmetro de saída obrigatório (kernel/driver), vivo e alinhado.
+        unsafe { Field::<u32>::at(address) }
+    }
+
+    /// RtlDecompressBuffer(Format, Uncompressed, UncompressedSize, Compressed,
+    /// CompressedSize, *FinalUncompressedSize) -> NTSTATUS.
+    fn decompress_buffer(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(compression::decompress_buffer(call.arg(1) as u16, call.arg(2), call.arg(3) as u32, call.arg(4), call.arg(5) as u32, out(call.arg(6)))))
+    }
+
+    /// RtlDecompressBufferEx(Format, Uncompressed, UncompressedSize, Compressed,
+    /// CompressedSize, *FinalUncompressedSize, WorkSpace) -> NTSTATUS.
+    fn decompress_buffer_ex(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(compression::decompress_buffer_ex(call.arg(1) as u16, call.arg(2), call.arg(3) as u32, call.arg(4), call.arg(5) as u32, out(call.arg(6)), call.arg(7))))
+    }
+
+    /// RtlDecompressFragment(Format, Fragment, FragmentSize, Compressed,
+    /// CompressedSize, FragmentOffset, *FinalUncompressedSize, WorkSpace) -> NTSTATUS.
+    fn decompress_fragment(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(compression::decompress_fragment(call.arg(1) as u16, call.arg(2), call.arg(3) as u32, call.arg(4), call.arg(5) as u32, call.arg(6) as u32, out(call.arg(7)), call.arg(8))))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "rtl-decompression",
+        names: &["RtlDecompressBuffer", "RtlDecompressBufferEx", "RtlDecompressFragment"],
+        handlers: &[decompress_buffer, decompress_buffer_ex, decompress_fragment],
+        data_exports: &[],
+    };
 }

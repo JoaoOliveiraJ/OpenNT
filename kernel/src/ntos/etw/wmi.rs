@@ -18,9 +18,52 @@ pub fn trace_message(format: u64, arguments: [u64; 4]) -> Result<(), KernelError
     Ok(())
 }
 
-/// WmiQueryTraceInformation(class, buffer, length, &required, ...): zera até
-/// 0x30 bytes em palavras de quatro bytes, sem distinguir classes.
-pub fn query_trace_information(buffer: u64, length: u32, required_out: u64) {
+/// TRACE_INFORMATION_CLASS.FltIoNotifyRoutinesClass.
+const FLT_IO_NOTIFY_ROUTINES_CLASS: u32 = 13;
+/// EtwpFltIoNotifyRoutines: seis rotinas que o ETW do kernel preenche quando
+/// uma sessão rastreia a E/S dos minifiltros.
+const FLT_IO_NOTIFY_ROUTINES_SIZE: u64 = 0x30;
+
+/// A tabela EtwpFltIoNotifyRoutines (memória do kernel, criada uma vez).
+static FLT_IO_NOTIFY_ROUTINES: crate::rtl::SpinLock<u64> = crate::rtl::SpinLock::new(0);
+
+fn flt_io_notify_routines() -> u64 {
+    let mut table = FLT_IO_NOTIFY_ROUTINES.lock();
+    if *table == 0 {
+        let address = guest::alloc_bytes(FLT_IO_NOTIFY_ROUTINES_SIZE);
+        guest::write_bytes(address, &[0u8; FLT_IO_NOTIFY_ROUTINES_SIZE as usize]);
+        *table = address;
+    }
+    *table
+}
+
+/// WmiQueryTraceInformation(class, buffer, length, &required, ...).
+///
+/// FltIoNotifyRoutinesClass (13), como o ntoskrnl 19041 (0x7888a0): grava 8
+/// em *ReturnLength (quando dado), exige Length 8 (senão
+/// STATUS_INFO_LENGTH_MISMATCH) e o buffer (senão
+/// STATUS_INVALID_PARAMETER_2) e devolve nele o endereço da tabela de
+/// rotinas de notificação de E/S dos minifiltros, que o fltmgr.sys consulta
+/// antes e depois de cada callback; sem sessão rastreando essa E/S as
+/// rotinas são NULL.
+///
+/// As outras classes zeram até 0x30 bytes em palavras de quatro bytes.
+pub fn query_trace_information(class: u32, buffer: u64, length: u32, required_out: u64) -> u32 {
+    if class == FLT_IO_NOTIFY_ROUTINES_CLASS {
+        if required_out != 0 {
+            // SAFETY: PULONG de saída do driver.
+            unsafe { Field::<u32>::at(required_out) }.set(8);
+        }
+        if length != 8 {
+            return 0xC000_0004;
+        }
+        if buffer == 0 {
+            return 0xC000_00F0;
+        }
+        // SAFETY: o buffer de 8 bytes do driver.
+        unsafe { Field::<u64>::at(buffer) }.set(flt_io_notify_routines());
+        return 0;
+    }
     let reported = length.min(0x30);
     // Zera em DWORDs inteiros, como antes (um resto menor que 4 também).
     guest::write_bytes(buffer, &alloc::vec![0u8; reported.div_ceil(4) as usize * 4]);
@@ -28,6 +71,7 @@ pub fn query_trace_information(buffer: u64, length: u32, required_out: u64) {
         // SAFETY: PULONG de saída do driver.
         unsafe { Field::<u32>::at(required_out) }.set(reported);
     }
+    0
 }
 
 // ---- Relógio do WMI/ETW (WmiGetClock, ntoskrnl 19041 0x5a66a0) ----------------

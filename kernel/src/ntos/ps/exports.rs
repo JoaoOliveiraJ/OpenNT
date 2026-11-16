@@ -1793,3 +1793,19 @@ pub mod nt_query_information_process {
 
     pub static GROUP: Group = Group { name: "nt-query-information-process", names: &["NtQueryInformationProcess"], handlers: &[query_information_process], data_exports: &[] };
 }
+
+pub mod ps_thread_prefetching {
+    //! PsSetCurrentThreadPrefetching; a lógica mora em `ps/silo/query`, ao
+    //! lado do PsIsCurrentThreadPrefetching.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::ps::silo::query;
+    use crate::rtl::KernelError;
+
+    /// PsSetCurrentThreadPrefetching(BOOLEAN) -> BOOLEAN anterior.
+    fn set_prefetching(call: &Call) -> Result<u64, KernelError> {
+        Ok(query::set_prefetching(call.arg(1) as u8 != 0)? as u64)
+    }
+
+    pub static GROUP: Group = Group { name: "ps-thread-prefetching", names: &["PsSetCurrentThreadPrefetching"], handlers: &[set_prefetching], data_exports: &[] };
+}

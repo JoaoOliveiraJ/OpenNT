@@ -129,6 +129,18 @@ pub fn is_prefetching() -> bool {
     ethread(process::get_current_thread()).prefetching() != 0
 }
 
+/// PsSetCurrentThreadPrefetching(Prefetching) -> o valor anterior (0x633190):
+/// troca o bit 6 de SameThreadApcFlags da thread corrente dentro de uma
+/// região guardada (o byte é da própria thread, mudado sem APC especial).
+pub fn set_prefetching(prefetching: bool) -> Result<bool, crate::rtl::KernelError> {
+    let thread = ethread(process::get_current_thread());
+    crate::ntos::ke::critical_region::enter_guarded()?;
+    let previous = thread.prefetching() != 0;
+    thread.set_prefetching(prefetching as u8);
+    crate::ntos::ke::critical_region::leave_guarded()?;
+    Ok(previous)
+}
+
 // ---- ps-process-info: sessão de serviço do silo (ntoskrnl 19041) -----------
 
 /// PsGetServerSiloServiceSessionId (0x32d5c0): SILO_USER_SHARED_DATA.

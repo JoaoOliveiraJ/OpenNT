@@ -367,7 +367,7 @@ fn ntoskrnl_exports(assert: Assert) {
     use crate::{ntos::init::export_names as abi_names, ntos::init::exports};
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions, ResolvedImport};
     exports::init();
-    assert(abi_names::EXPORT_NAMES.len() == 2045 && abi_names::GROUP_LAYOUT.len() == 496 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 2045 exports em 496 grupos");
+    assert(abi_names::EXPORT_NAMES.len() == 2055 && abi_names::GROUP_LAYOUT.len() == 502 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 2055 exports em 502 grupos");
     // Ordinais públicos: os slots de função seguidos dos dados sem nome repetido.
     let public_count = abi_names::EXPORT_NAMES.len() + crate::ntos::mm::kernel_data_layout::DEFINITIONS.iter().filter(|entry| !abi_names::EXPORT_NAMES.contains(&entry.name)).count();
     assert(matches!(exports::lookup_ordinal("ntoskrnl.exe", 547), Some(ResolvedImport::Thunk(578))) && exports::lookup("ntoskrnl.exe", "LdrResSearchResource").is_some() && exports::lookup("ntoskrnl.exe", "NaoExisteNoKernel").is_none() && exports::lookup_ordinal("ntoskrnl.exe", 0).is_none() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32).is_some() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32 + 1).is_none(), "ntoskrnl: ordinais, todos os exports com provedor e nome desconhecido");
@@ -2057,7 +2057,7 @@ fn ntoskrnl_mm_group(assert: Assert) {
     use crate::ntos::mm::{image_paging, paging};
     use crate::ntos::init::exports;
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions};
-    assert(exports::implemented() == 2045 && exports::export_names().len() == 2045, "ntoskrnl: 496 grupos com os 2045 exports implementados");
+    assert(exports::implemented() == 2055 && exports::export_names().len() == 2055, "ntoskrnl: 502 grupos com os 2055 exports implementados");
     let block = guest::alloc_bytes(0x200);
     // MmGetSystemRoutineAddress: trampolim chamável e nome desconhecido.
     let name: alloc::vec::Vec<u16> = "KeGetCurrentIrql".encode_utf16().collect();
@@ -10200,7 +10200,8 @@ fn io_file_system_support_exports(assert: Assert) {
     object_attributes.object_name.set(name);
     object_attributes.attributes.set(0x240);
     let (handle, io_status) = (guest::alloc_bytes(8), guest::alloc_bytes(nt::IoStatusBlock::SIZE));
-    let arguments = [handle, 0x10_0080, attributes, io_status, 0, 0, 7, 1, 0x20, 0, 0, 0, 0, 0];
+    // O 15º argumento: DeviceObject do Hint / IO_DRIVER_CREATE_CONTEXT do Ex (nenhum).
+    let arguments = [handle, 0x10_0080, attributes, io_status, 0, 0, 7, 1, 0x20, 0, 0, 0, 0, 0, 0];
     // O IoCreateFileEx do OpenNT devolve o NTSTATUS sem extensão de sinal: compara os 32 bits.
     let hinted = call_export("IoCreateFileSpecifyDeviceObjectHint", &arguments).map(|status| status as u32);
     let plain_create = call_export("IoCreateFileEx", &arguments).map(|status| status as u32);
@@ -15121,6 +15122,8 @@ pub fn run(assert: Assert) {
     super::io_fsrtl_exports::run(assert);
     super::ps_ke_mm_exports::run(assert);
     super::executive_misc_exports::run(assert);
+    super::minifilter_support::run(assert);
+    super::rtl_decompression::run(assert);
     debug_print!("PHASE6_SELFTEST_OK");
 }
 

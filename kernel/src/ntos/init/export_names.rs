@@ -502,9 +502,15 @@ pub static GROUP_LAYOUT: &[(&str, usize, usize)] = &[
     ("ob-nt-wait-single", 2042, 1),
     ("tm-query-transaction", 2043, 1),
     ("io-report-resource-usage", 2044, 1),
+    ("ex-push-lock-fast", 2045, 3),
+    ("ps-thread-prefetching", 2048, 1),
+    ("io-silo-parameters", 2049, 1),
+    ("crt-i64tow-s", 2050, 1),
+    ("pf-file-info-notify", 2051, 1),
+    ("rtl-decompression", 2052, 3),
 ];
 
-/// Os 2045 exports de função, na ordem da ABI.
+/// Os 2055 exports de função, na ordem da ABI.
 pub static EXPORT_NAMES: &[&str] = &[
     "DbgPrint",
     "DbgPrintEx",
@@ -2551,4 +2557,14 @@ pub static EXPORT_NAMES: &[&str] = &[
     "NtWaitForSingleObject",
     "ZwQueryInformationTransaction",
     "IoReportResourceUsage",
+    "ExfAcquirePushLockExclusive",
+    "ExfAcquirePushLockShared",
+    "ExfReleasePushLock",
+    "PsSetCurrentThreadPrefetching",
+    "IoGetSiloParameters",
+    "_i64tow_s",
+    "PfFileInfoNotify",
+    "RtlDecompressBuffer",
+    "RtlDecompressBufferEx",
+    "RtlDecompressFragment",
 ];

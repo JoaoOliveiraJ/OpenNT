@@ -1079,3 +1079,18 @@ pub mod mm_physical_remove_cache {
 
     pub static GROUP: Group = Group { name: "mm-physical-remove-cache", names: &["MmRemovePhysicalMemory", "MmSetPermanentCacheAttribute"], handlers: &[remove_physical_memory, set_permanent_cache_attribute], data_exports: &[] };
 }
+
+pub mod pf_file_info_notify {
+    //! PfFileInfoNotify; a lógica mora em `mm/prefetcher_file_info.rs`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::mm::prefetcher_file_info;
+    use crate::rtl::KernelError;
+
+    /// PfFileInfoNotify(Notify) -> NTSTATUS.
+    fn file_info_notify(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(prefetcher_file_info::file_info_notify(call.arg(1))?))
+    }
+
+    pub static GROUP: Group = Group { name: "pf-file-info-notify", names: &["PfFileInfoNotify"], handlers: &[file_info_notify], data_exports: &[] };
+}

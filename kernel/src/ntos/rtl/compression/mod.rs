@@ -1,5 +1,6 @@
 //! Compressão do Rtl, como no NT: RtlGetCompressionWorkSpaceSize,
-//! RtlCompressBuffer, RtlDecompressBufferEx2 e RtlDecompressFragmentEx.
+//! RtlCompressBuffer, RtlDecompressBuffer, RtlDecompressBufferEx,
+//! RtlDecompressBufferEx2, RtlDecompressFragment e RtlDecompressFragmentEx.
 //!
 //! Contrato (ntoskrnl 10.0.19045): o formato é o byte baixo de
 //! `CompressionFormatAndEngine` (0/1 → STATUS_INVALID_PARAMETER; acima de 4 →
@@ -16,12 +17,26 @@
 //! O engine (`& 0xFF00`) só vale 0 (standard) ou 0x100 (maximum); outro valor dá
 //! STATUS_NOT_SUPPORTED sem tocar nas saídas. A descompressão ignora o engine.
 //!
+//! As formas sem `UncompressedChunkSize` são o mesmo proc com esse argumento 0:
+//! RtlDecompressBuffer passa também WorkSpace NULL (o XPRESS_HUFF, que monta a
+//! tabela de decodificação no workspace, dá então STATUS_INVALID_USER_BUFFER),
+//! RtlDecompressBufferEx repassa o workspace e RtlDecompressFragment chama o
+//! proc de fragmento. O workspace de descompressão do XPRESS_HUFF tem o tamanho
+//! de fragmento (0x1429: a tabela alinhada a 8); o LZNT1 usa o de fragmento
+//! (0x1000) só em RtlDecompressFragment*.
+//!
 //! Os buffers de bytes são copiados em bloco (`read_bytes`/`write_bytes`),
-//! processados e devolvidos só nas faixas que o NT escreve (inclusive a saída parcial
-//! dos caminhos de erro). O LZNT1 e os três descompressores reproduzem o
-//! ntoskrnl byte a byte (conferido contra o mesmo código do `ntdll.dll`); os
-//! compressores XPRESS geram fluxos MS-XCA válidos com o mesmo contrato de
-//! status, mas não a mesma escolha de matches do compressor da Microsoft.
+//! processados e devolvidos só nas faixas que o NT escreve. Os três
+//! descompressores reproduzem o ntoskrnl (conferido contra o mesmo código do
+//! `ntdll.dll`, em fluxos válidos, truncados e corrompidos) no status, em
+//! `*FinalUncompressedSize` e na saída dos caminhos de sucesso; o LZNT1 também
+//! na saída parcial dos caminhos de erro. Nos dois XPRESS, a saída parcial de um
+//! erro pode diferir: o NT decodifica a maior parte do fluxo num laço rápido
+//! com cópias largas (4, 8 e 16 bytes) que escrevem além da posição corrente,
+//! detecta o estouro de um match longo só depois de copiar parte dele e, no
+//! laço final, grava os literais aos pares. Os compressores XPRESS geram fluxos
+//! MS-XCA válidos com o mesmo contrato de status, mas não a mesma escolha de
+//! matches do compressor da Microsoft.
 
 pub mod lznt1;
 pub mod xpress;
@@ -119,10 +134,23 @@ pub fn compress_buffer(format_and_engine: u16, uncompressed: u64, uncompressed_s
     }
 }
 
+/// RtlDecompressBuffer(Format, Uncompressed, UncompressedSize, Compressed,
+/// CompressedSize, *FinalUncompressedSize): UncompressedChunkSize 0 e
+/// WorkSpace NULL.
+pub fn decompress_buffer(format_and_engine: u16, uncompressed: u64, uncompressed_size: u32, compressed: u64, compressed_size: u32, final_size_out: &Field<u32>) -> u32 {
+    decompress_buffer_ex2(format_and_engine, uncompressed, uncompressed_size, compressed, compressed_size, 0, final_size_out, 0)
+}
+
+/// RtlDecompressBufferEx(Format, Uncompressed, UncompressedSize, Compressed,
+/// CompressedSize, *FinalUncompressedSize, WorkSpace): UncompressedChunkSize 0.
+pub fn decompress_buffer_ex(format_and_engine: u16, uncompressed: u64, uncompressed_size: u32, compressed: u64, compressed_size: u32, final_size_out: &Field<u32>, work_space: u64) -> u32 {
+    decompress_buffer_ex2(format_and_engine, uncompressed, uncompressed_size, compressed, compressed_size, 0, final_size_out, work_space)
+}
+
 /// RtlDecompressBufferEx2(Format, Uncompressed, UncompressedSize, Compressed,
 /// CompressedSize, UncompressedChunkSize, *FinalUncompressedSize, WorkSpace).
 #[allow(clippy::too_many_arguments)]
-pub fn decompress_buffer(format_and_engine: u16, uncompressed: u64, uncompressed_size: u32, compressed: u64, compressed_size: u32, chunk_size: u32, final_size_out: &Field<u32>, work_space: u64) -> u32 {
+pub fn decompress_buffer_ex2(format_and_engine: u16, uncompressed: u64, uncompressed_size: u32, compressed: u64, compressed_size: u32, chunk_size: u32, final_size_out: &Field<u32>, work_space: u64) -> u32 {
     match format(format_and_engine) {
         Err(status) => status,
         Ok(Format::Lznt1) => lznt1::decompress_buffer(uncompressed, uncompressed_size, compressed, compressed_size, chunk_size, final_size_out),
@@ -136,12 +164,20 @@ pub fn decompress_buffer(format_and_engine: u16, uncompressed: u64, uncompressed
     }
 }
 
+/// RtlDecompressFragment(Format, Fragment, FragmentSize, Compressed,
+/// CompressedSize, FragmentOffset, *FinalUncompressedSize, WorkSpace):
+/// UncompressedChunkSize 0.
+#[allow(clippy::too_many_arguments)]
+pub fn decompress_fragment(format_and_engine: u16, fragment: u64, fragment_size: u32, compressed: u64, compressed_size: u32, fragment_offset: u32, final_size_out: &Field<u32>, work_space: u64) -> u32 {
+    decompress_fragment_ex(format_and_engine, fragment, fragment_size, compressed, compressed_size, fragment_offset, 0, final_size_out, work_space)
+}
+
 /// RtlDecompressFragmentEx(Format, Fragment, FragmentSize, Compressed,
 /// CompressedSize, FragmentOffset, UncompressedChunkSize,
 /// *FinalUncompressedSize, WorkSpace): só o LZNT1 tem fragmentos
 /// (`RtlDecompressFragmentNS` para os XPRESS).
 #[allow(clippy::too_many_arguments)]
-pub fn decompress_fragment(format_and_engine: u16, fragment: u64, fragment_size: u32, compressed: u64, compressed_size: u32, fragment_offset: u32, chunk_size: u32, final_size_out: &Field<u32>, work_space: u64) -> u32 {
+pub fn decompress_fragment_ex(format_and_engine: u16, fragment: u64, fragment_size: u32, compressed: u64, compressed_size: u32, fragment_offset: u32, chunk_size: u32, final_size_out: &Field<u32>, work_space: u64) -> u32 {
     match format(format_and_engine) {
         Err(status) => status,
         Ok(Format::Lznt1) => lznt1::decompress_fragment(fragment, fragment_size, compressed, compressed_size, fragment_offset, chunk_size, final_size_out, work_space),

@@ -57,7 +57,6 @@ pub const FCB_PUSH_LOCK: u64 = core::mem::offset_of!(FsrtlAdvancedFcbHeader, pus
 const FSRTL_FLAG2_SUPPORTS_FILTER_CONTEXTS: u8 = 0x02;
 const TAG_FSFC: u32 = 0x6366_5346; // 'FSfc'
 const TAG_FOCX: u32 = 0x5843_4F46; // 'FOCX'
-const TAG_IO: u32 = 0x2020_6F49; // 'Io  '
 const NON_PAGED_POOL_NX: u32 = 0x200;
 /// FoExtPerTypeExtension[3]: o contexto de filtro do FILE_OBJECT (+0x20).
 const FILTER_CONTEXT_EXTENSION_SLOT: usize = 3;
@@ -303,18 +302,16 @@ pub fn remove_per_file_context(pointer: &Field<u64>, owner: u64, instance: u64) 
 
 /// IopAllocateFileObjectExtension / IoGetFileObjectFilterContext: a extensão
 /// do FILE_OBJECT, criada sob demanda quando `allocate` (None se ausente ou
-/// sem memória).
+/// sem memória). A extensão é uma só por FILE_OBJECT, do alocador do I/O
+/// Manager (`io/extensions.rs`), que também a libera com o FILE_OBJECT.
 pub fn file_object_extension(file_object: &FileObject, allocate: bool) -> Result<Option<&'static IopFileObjectExtension>, KernelError> {
     let mut extension = file_object.file_object_extension.get();
     if extension == 0 {
         if !allocate {
             return Ok(None);
         }
-        let fresh = allocate_zeroed(IopFileObjectExtension::SIZE, TAG_IO)?;
-        if fresh == 0 {
-            return Ok(None);
-        }
-        extension = publish(&file_object.file_object_extension, fresh)?;
+        let Some(fresh) = crate::ntos::io::extensions::file_object_extension(file_object.address())? else { return Ok(None) };
+        extension = fresh;
     }
     // SAFETY: a extensão de um FILE_OBJECT vivo.
     Ok(Some(unsafe { IopFileObjectExtension::at(extension) }))

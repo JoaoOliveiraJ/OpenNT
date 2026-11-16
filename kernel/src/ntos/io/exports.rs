@@ -117,9 +117,20 @@ fn io_get_driver_object_extension(call: &Call) -> Result<u64, KernelError> {
 fn io_get_current_process(_: &Call) -> Result<u64, KernelError> {
     Ok(process::get_current_process())
 }
-/// IoCreateFile/IoCreateFileEx: a abertura completa do ZwCreateFile.
+/// IoCreateFile: a abertura completa do ZwCreateFile.
 fn io_create_file(call: &Call) -> Result<u64, KernelError> {
     Ok(zw_files::create_kernel_file(call.arg(1), call.arg(2) as u32, call.arg(3), call.arg(4), call.arg(7) as u32, call.arg(8) as u32, call.arg(9) as u32)? as u64)
+}
+/// IoCreateFileEx: a do IoCreateFile com o IO_DRIVER_CREATE_CONTEXT do 15º
+/// argumento (Size, ExtraCreateParameter em +8, DeviceObjectHint em +0x10).
+fn io_create_file_ex(call: &Call) -> Result<u64, KernelError> {
+    let driver_context = call.variadic_arg(15);
+    let context = if driver_context != 0 {
+        crate::ntos::io::parse::DriverCreateContext { extra_create_parameter: crate::ntos::mm::guest_memory::read64(driver_context + 8), device_object_hint: crate::ntos::mm::guest_memory::read64(driver_context + 0x10) }
+    } else {
+        crate::ntos::io::parse::DriverCreateContext::default()
+    };
+    Ok(zw_files::create_kernel_file_with_context(call.arg(1), call.arg(2) as u32, call.arg(3), call.arg(4), call.arg(7) as u32, call.arg(8) as u32, call.arg(9) as u32, context)? as u64)
 }
 fn io_get_related_device_object(call: &Call) -> Result<u64, KernelError> {
     file_information::related_device_object(call.arg(1))
@@ -383,7 +394,7 @@ pub static GROUP: Group = Group {
         "IoCreateDevice", "IoCreateSymbolicLink", "IoDeleteDevice", "IoDeleteSymbolicLink", "IoAllocateIrp", "IoFreeIrp", "IoCompleteRequest", "IofCompleteRequest", "IoAllocateWorkItem", "IoQueueWorkItem", "IoFreeWorkItem", "IoCallDriver", "IofCallDriver", "IoAttachDeviceToDeviceStack", "IoDetachDevice", "IoGetDeviceObjectPointer", "IoBuildSynchronousFsdRequest", "IoBuildDeviceIoControlRequest", "IoInitializeTimer", "IoStartTimer", "IoStopTimer", "IoQueueWorkItemEx", "IoAllocateMdl", "IoFreeMdl", "IoGetCurrentThread", "IoSetCancelRoutine", "IoCancelIrp", "IoAllocateDriverObjectExtension", "IoGetDriverObjectExtension", "IoGetCurrentProcess", "IoCreateFile", "IoGetRelatedDeviceObject", "IoGetDeviceProperty", "IoGetStackLimits", "IoInitializeRemoveLockEx", "IoAcquireRemoveLockEx", "IoReleaseRemoveLockEx", "IoReleaseRemoveLockAndWaitEx", "IoAllocateErrorLogEntry", "IoWriteErrorLogEntry", "IoAcquireCancelSpinLock", "IoReleaseCancelSpinLock", "IoRegisterDeviceInterface", "IoSetDeviceInterfaceState", "IoRegisterPlugPlayNotification", "IoUnregisterPlugPlayNotification", "IoRegisterDriverReinitialization", "IoOpenDeviceRegistryKey", "IoWMIRegistrationControl", "IoConnectInterrupt", "IoDisconnectInterrupt", "IoCreateController", "IoDeleteController", "IoAllocateController", "IoFreeController", "IoStartPacket", "IoStartNextPacket", "IoSetStartIoAttributes", "IoGetAttachedDeviceReference", "IoInvalidateDeviceState", "IoQueryDeviceDescription", "IoConnectInterruptEx", "IoDisconnectInterruptEx", "IoReadPartitionTableEx", "IoGetConfigurationInformation", "IoInvalidateDeviceRelations", "IoGetGenericIrpExtension", "IoSetGenericIrpExtension", "IoPropagateIrpExtensionEx", "IoGetActivityIdIrp", "IoSetActivityIdIrp", "IoGetActivityIdThread", "IoClearActivityIdThread", "IoPropagateActivityIdToThread", "IoIsActivityTracingEnabled", "IoReuseIrp", "IoInitializeIrp", "IoSetMasterIrpStatus", "IoBuildPartialMdl", "IoSizeofWorkItem", "IoAllocateSfioStreamIdentifier", "IoGetSfioStreamIdentifier", "IoFreeSfioStreamIdentifier", "IoGetIoAttributionHandle", "IoRecordIoAttribution", "IoGetIoPriorityHint", "IoGetPagingIoPriority", "IoGetRequestorProcess", "IoIs32bitProcess", "IoGetDeviceAttachmentBaseRef", "IoGetDevicePropertyData", "IoSetHardErrorOrVerifyDevice", "IoSetThreadHardErrorMode", "IoRegisterShutdownNotification", "IoUnregisterShutdownNotification", "IoReportTargetDeviceChangeAsynchronous", "IoRegisterPriorityCallback", "IoUnregisterPriorityCallback", "IoWMIDeviceObjectToProviderId", "IoWMIWriteEvent", "IoCreateFileEx", "IoInitializeWorkItem", "IoQueryFileInformation", "IoUnregisterPlugPlayNotificationEx",
     ],
     handlers: &[
-        io_create_device, io_create_symbolic_link, io_delete_device, io_delete_symbolic_link, io_allocate_irp, io_free_irp, io_complete_request, io_complete_request, io_allocate_work_item, io_queue_work_item, io_free_work_item, io_call_driver, io_call_driver, io_attach_device_to_device_stack, io_detach_device, get_device_object_pointer_export, io_build_synchronous_fsd_request, io_build_device_io_control_request, io_initialize_timer, io_start_timer, io_stop_timer, io_queue_work_item_ex, io_allocate_mdl, io_free_mdl, io_get_current_thread, io_set_cancel_routine, io_cancel_irp, io_allocate_driver_object_extension, io_get_driver_object_extension, io_get_current_process, io_create_file, io_get_related_device_object, io_get_device_property, io_get_stack_limits, io_initialize_remove_lock, io_acquire_remove_lock, io_release_remove_lock, io_release_remove_lock_and_wait, io_allocate_error_log_entry, io_write_error_log_entry, io_acquire_cancel_spin_lock, io_release_cancel_spin_lock, io_register_device_interface, io_set_device_interface_state, io_register_plug_play_notification, io_unregister_plug_play_notification, io_register_driver_reinitialization, io_open_device_registry_key, io_wmi_registration_control, io_connect_interrupt, io_disconnect_interrupt, io_create_controller, io_delete_controller, io_allocate_controller, io_free_controller, io_start_packet, io_start_next_packet, io_set_start_io_attributes, io_get_attached_device_reference, io_invalidate_device_state, io_query_device_description, io_connect_interrupt_ex, io_disconnect_interrupt_ex, io_read_partition_table_ex, io_get_configuration_information, io_invalidate_device_relations, io_get_generic_irp_extension, io_set_generic_irp_extension, io_propagate_irp_extension, io_get_activity_id_irp, io_set_activity_id_irp, io_get_activity_id_thread, io_clear_activity_id_thread, io_propagate_activity_id_to_thread, zero, io_reuse_irp, io_initialize_irp, io_set_master_irp_status, io_build_partial_mdl, io_sizeof_work_item, io_allocate_sfio_stream_identifier, zero, zero, io_get_io_attribution_handle, io_record_io_attribution, io_get_io_priority_hint, zero, io_get_requestor_process, zero, io_get_device_attachment_base_ref, io_get_device_property_data, io_set_hard_error_or_verify_device, io_set_thread_hard_error_mode, io_register_shutdown_notification, io_unregister_shutdown_notification, io_report_target_device_change_asynchronous, io_register_priority_callback, io_unregister_priority_callback, io_wmi_device_object_to_provider_id, zero, io_create_file, io_initialize_work_item, io_query_file_information, io_unregister_plug_play_notification,
+        io_create_device, io_create_symbolic_link, io_delete_device, io_delete_symbolic_link, io_allocate_irp, io_free_irp, io_complete_request, io_complete_request, io_allocate_work_item, io_queue_work_item, io_free_work_item, io_call_driver, io_call_driver, io_attach_device_to_device_stack, io_detach_device, get_device_object_pointer_export, io_build_synchronous_fsd_request, io_build_device_io_control_request, io_initialize_timer, io_start_timer, io_stop_timer, io_queue_work_item_ex, io_allocate_mdl, io_free_mdl, io_get_current_thread, io_set_cancel_routine, io_cancel_irp, io_allocate_driver_object_extension, io_get_driver_object_extension, io_get_current_process, io_create_file, io_get_related_device_object, io_get_device_property, io_get_stack_limits, io_initialize_remove_lock, io_acquire_remove_lock, io_release_remove_lock, io_release_remove_lock_and_wait, io_allocate_error_log_entry, io_write_error_log_entry, io_acquire_cancel_spin_lock, io_release_cancel_spin_lock, io_register_device_interface, io_set_device_interface_state, io_register_plug_play_notification, io_unregister_plug_play_notification, io_register_driver_reinitialization, io_open_device_registry_key, io_wmi_registration_control, io_connect_interrupt, io_disconnect_interrupt, io_create_controller, io_delete_controller, io_allocate_controller, io_free_controller, io_start_packet, io_start_next_packet, io_set_start_io_attributes, io_get_attached_device_reference, io_invalidate_device_state, io_query_device_description, io_connect_interrupt_ex, io_disconnect_interrupt_ex, io_read_partition_table_ex, io_get_configuration_information, io_invalidate_device_relations, io_get_generic_irp_extension, io_set_generic_irp_extension, io_propagate_irp_extension, io_get_activity_id_irp, io_set_activity_id_irp, io_get_activity_id_thread, io_clear_activity_id_thread, io_propagate_activity_id_to_thread, zero, io_reuse_irp, io_initialize_irp, io_set_master_irp_status, io_build_partial_mdl, io_sizeof_work_item, io_allocate_sfio_stream_identifier, zero, zero, io_get_io_attribution_handle, io_record_io_attribution, io_get_io_priority_hint, zero, io_get_requestor_process, zero, io_get_device_attachment_base_ref, io_get_device_property_data, io_set_hard_error_or_verify_device, io_set_thread_hard_error_mode, io_register_shutdown_notification, io_unregister_shutdown_notification, io_report_target_device_change_asynchronous, io_register_priority_callback, io_unregister_priority_callback, io_wmi_device_object_to_provider_id, zero, io_create_file_ex, io_initialize_work_item, io_query_file_information, io_unregister_plug_play_notification,
     ],
     data_exports: &[("IoDriverObjectType", io_driver_object_type), ("IoFileObjectType", io_file_object_type)],
 };
@@ -1401,11 +1412,10 @@ pub mod io_file_system_support {
     /// ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes,
     /// ShareAccess, Disposition, CreateOptions, EaBuffer, EaLength,
     /// CreateFileType, InternalParameters, Options, DeviceObject) = IoCreateFileEx
-    /// com IO_DRIVER_CREATE_CONTEXT{DeviceObjectHint}: o mesmo caminho do
-    /// IoCreateFileEx do OpenNT (que não modela DriverContext; o 15º argumento
-    /// fica além dos 14 do trampolim).
+    /// com IO_DRIVER_CREATE_CONTEXT{DeviceObjectHint = o 15º argumento}.
     fn create_file_specify_device_object_hint(call: &Call) -> Result<u64, KernelError> {
-        zw_files::create_kernel_file(call.arg(1), call.arg(2) as u32, call.arg(3), call.arg(4), call.arg(7) as u32, call.arg(8) as u32, call.arg(9) as u32).map(signed_status)
+        let context = crate::ntos::io::parse::DriverCreateContext { extra_create_parameter: 0, device_object_hint: call.variadic_arg(15) };
+        zw_files::create_kernel_file_with_context(call.arg(1), call.arg(2) as u32, call.arg(3), call.arg(4), call.arg(7) as u32, call.arg(8) as u32, call.arg(9) as u32, context).map(signed_status)
     }
 
     /// IoCreateStreamFileObjectEx(FileObject, DeviceObject, *FileHandle) -> PFILE_OBJECT.
@@ -2316,4 +2326,22 @@ pub mod io_interface_alias {
     }
 
     pub static GROUP: Group = Group { name: "io-interface-alias", names: &["IoGetDeviceInterfaceAlias"], handlers: &[get_device_interface_alias], data_exports: &[] };
+}
+
+pub mod io_silo_parameters {
+    //! IoGetSiloParameters; a lógica mora em `io/extensions.rs`, ao lado do
+    //! IoGetSilo.
+
+    use crate::ntos::inc::types::{FileObject, NtStruct};
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::io::extensions;
+    use crate::rtl::KernelError;
+
+    /// IoGetSiloParameters(FileObject) -> PIO_FOEXT_SILO_PARAMETERS.
+    fn silo_parameters(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: FILE_OBJECT vivo do chamador.
+        Ok(extensions::silo_parameters(unsafe { FileObject::at(call.arg(1)) }))
+    }
+
+    pub static GROUP: Group = Group { name: "io-silo-parameters", names: &["IoGetSiloParameters"], handlers: &[silo_parameters], data_exports: &[] };
 }
