@@ -89,6 +89,22 @@ expect pilha de dispositivos
 lmv ksecdd
 expect ksecdd.sys
 
+# Extensões para os processos de usuário: o processo das leituras, a
+# tabela de handles do System, as faixas do sistema, os pontos de evento e
+# as exceções do anel 3.
+.process 4
+expect EPROCESS
+.process 0
+expect o do processador
+handles 4
+expect EPROCESS
+kmap
+expect pool do kernel
+events
+expect opennt_kd_image_event
+uex
+expect excecoes do anel 3
+
 # Um passo: o `push rbp` do prólogo.
 save rsp0 %rsp
 save rbp0 %rbp
