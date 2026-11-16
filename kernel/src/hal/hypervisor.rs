@@ -248,3 +248,44 @@ pub fn partition_isolation_type() -> u32 {
     }
     cpu::cpuid(LEAF_ISOLATION_CONFIGURATION)[1] & 0xF
 }
+
+// ---- VslCreateSecureSection / VslDeleteSecureSection -----------------------
+//
+// ntoskrnl 19041 (sem conexão VSM, o caso do OpenNT, como as rotinas acima):
+//   VslCreateSecureSection rva 0x88f0c0 (*Handle, TargetProcess, Mdl,
+//     PageProtection, Flags): zera *Handle; Flags com bits além do 0 =
+//     STATUS_INVALID_PARAMETER_6; sem o bit 0, um MDL com ByteCount fora de
+//     página inteira ou ByteOffset não nulo = STATUS_INVALID_PARAMETER_3; as
+//     páginas do MDL ficam travadas durante a chamada ao IUM
+//     (VslpLockPagesForTransfer) e o VslpEnterIumSecureMode sem VSM
+//     (HvlQueryVsmConnection falso) devolve STATUS_DEVICE_NOT_CONNECTED.
+//   VslDeleteSecureSection rva 0x88f4e0 (Handle): só o VslpEnterIumSecureMode,
+//     o mesmo STATUS_DEVICE_NOT_CONNECTED.
+// O usbxhci.sys cria assim a seção que o companheiro seguro dele usaria.
+
+const VSL_STATUS_INVALID_PARAMETER_3: u32 = 0xC000_00F1;
+const VSL_STATUS_INVALID_PARAMETER_6: u32 = 0xC000_00F4;
+/// Flags: bit 0, a seção sem a exigência de páginas inteiras.
+const VSL_SECTION_FLAGS_VALID: u32 = 1;
+
+/// VslCreateSecureSection(*Handle, TargetProcess, Mdl, PageProtection, Flags).
+pub fn create_secure_section(handle: u64, _process: u64, mdl: u64, _protection: u32, flags: u32) -> u32 {
+    // SAFETY: PHANDLE de saída de um chamador de modo kernel.
+    unsafe { crate::ntos::inc::field::Field::<u64>::at(handle) }.set(0);
+    if flags & !VSL_SECTION_FLAGS_VALID != 0 {
+        return VSL_STATUS_INVALID_PARAMETER_6;
+    }
+    if flags & 1 == 0 {
+        // SAFETY: MDL descrito pelo chamador.
+        let descriptor = unsafe { crate::ntos::inc::types::Mdl::at(mdl) };
+        if descriptor.byte_count.get() & 0xFFF != 0 || descriptor.byte_offset.get() != 0 {
+            return VSL_STATUS_INVALID_PARAMETER_3;
+        }
+    }
+    VSL_STATUS_DEVICE_NOT_CONNECTED
+}
+
+/// VslDeleteSecureSection(Handle).
+pub fn delete_secure_section(_handle: u64) -> u32 {
+    VSL_STATUS_DEVICE_NOT_CONNECTED
+}

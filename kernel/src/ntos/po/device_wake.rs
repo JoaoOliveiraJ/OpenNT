@@ -63,6 +63,19 @@ pub fn set_directed_drips_flags(pdo: u64, flags: u32) -> u32 {
     0
 }
 
+/// PoSetSystemWakeDevice(DeviceObject) (ntoskrnl 19041 rva 0x565310): a base
+/// da pilha do dispositivo (IoGetDeviceAttachmentBaseRefWithTag 'PoIr') vai
+/// ao PopUpdateWakeSource, que só registra a fonte de despertar quando há
+/// um despertar em registro (PopCurrentWakeInfo, que a volta de um estado
+/// de suspensão preenche); sem ele, a entrada alocada é descartada. O
+/// OpenNT nunca suspende, então nada é registrado; a referência da base é
+/// tomada e devolvida, como no NT.
+pub fn set_system_wake_device(device: u64) {
+    if let Ok(base) = crate::ntos::ob::objects::device::attached_reference(device, true) {
+        let _ = crate::ntos::ob::objects::device::dereference(base);
+    }
+}
+
 /// Flags acumulados de um PDO (autoteste).
 pub fn directed_drips_flags(pdo: u64) -> u32 {
     DIRECTED_DRIPS_FLAGS.lock().get(&pdo).copied().unwrap_or(0)

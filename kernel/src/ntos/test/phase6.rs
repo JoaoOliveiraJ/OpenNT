@@ -367,7 +367,7 @@ fn ntoskrnl_exports(assert: Assert) {
     use crate::{ntos::init::export_names as abi_names, ntos::init::exports};
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions, ResolvedImport};
     exports::init();
-    assert(abi_names::EXPORT_NAMES.len() == 2055 && abi_names::GROUP_LAYOUT.len() == 502 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 2055 exports em 502 grupos");
+    assert(abi_names::EXPORT_NAMES.len() == 2059 && abi_names::GROUP_LAYOUT.len() == 506 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 2059 exports em 506 grupos");
     // Ordinais públicos: os slots de função seguidos dos dados sem nome repetido.
     let public_count = abi_names::EXPORT_NAMES.len() + crate::ntos::mm::kernel_data_layout::DEFINITIONS.iter().filter(|entry| !abi_names::EXPORT_NAMES.contains(&entry.name)).count();
     assert(matches!(exports::lookup_ordinal("ntoskrnl.exe", 547), Some(ResolvedImport::Thunk(578))) && exports::lookup("ntoskrnl.exe", "LdrResSearchResource").is_some() && exports::lookup("ntoskrnl.exe", "NaoExisteNoKernel").is_none() && exports::lookup_ordinal("ntoskrnl.exe", 0).is_none() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32).is_some() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32 + 1).is_none(), "ntoskrnl: ordinais, todos os exports com provedor e nome desconhecido");
@@ -2108,7 +2108,7 @@ fn ntoskrnl_mm_group(assert: Assert) {
     use crate::ntos::mm::{image_paging, paging};
     use crate::ntos::init::exports;
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions};
-    assert(exports::implemented() == 2055 && exports::export_names().len() == 2055, "ntoskrnl: 502 grupos com os 2055 exports implementados");
+    assert(exports::implemented() == 2059 && exports::export_names().len() == 2059, "ntoskrnl: 506 grupos com os 2059 exports implementados");
     let block = guest::alloc_bytes(0x200);
     // MmGetSystemRoutineAddress: trampolim chamável e nome desconhecido.
     let name: alloc::vec::Vec<u16> = "KeGetCurrentIrql".encode_utf16().collect();
@@ -12678,6 +12678,54 @@ fn vsl_secure_pci_exports(assert: Assert) {
 }
 
 
+/// Os exports que a pilha USB e HID importa e o OpenNT ainda não tinha:
+/// vsl-secure-section (usbxhci.sys), po-system-wake-device (usbhub3.sys),
+/// se-query-session-id-token (hidclass.sys) e o dado NtBuildNumber.
+fn usb_driver_support_exports(assert: Assert) {
+    use crate::ntos::init::exports::signed_status;
+    use crate::ntos::ob::objects::device as device_objects;
+    // VslCreateSecureSection sem VSM: *Handle zerado, Flags e MDL validados
+    // antes do STATUS_DEVICE_NOT_CONNECTED do IUM.
+    let handle = guest::alloc_bytes(8);
+    let mdl = guest::alloc_bytes(nt::Mdl::SIZE);
+    let descriptor = at::<nt::Mdl>(mdl);
+    let create = |count: u32, offset: u32, flags: u64| {
+        guest::write64(handle, u64::MAX);
+        descriptor.byte_count.set(count);
+        descriptor.byte_offset.set(offset);
+        (call_export("VslCreateSecureSection", &[handle, 0, mdl, 4, flags]), guest::read64(handle))
+    };
+    assert(
+        create(0x1000, 0, 2) == (Some(signed_status(0xC000_00F4)), 0)
+            && create(0x800, 0, 0) == (Some(signed_status(0xC000_00F1)), 0)
+            && create(0x1000, 0x10, 0) == (Some(signed_status(0xC000_00F1)), 0)
+            && create(0x2000, 0, 0) == (Some(signed_status(0xC000_009D)), 0)
+            && create(0x800, 0x10, 1) == (Some(signed_status(0xC000_009D)), 0)
+            && call_export("VslDeleteSecureSection", &[0x1234]) == Some(signed_status(0xC000_009D)),
+        "vsl-secure-section: flags e MDL validados, *Handle zerado e STATUS_DEVICE_NOT_CONNECTED sem VSM",
+    );
+    // PoSetSystemWakeDevice: sem despertar em registro nada fica, e a
+    // referência da base da pilha é devolvida.
+    let pdo = crate::drivers::bus::pci::devices().first().map_or(0, |function| function.pdo_pointer);
+    let before = device_objects::reference_count(pdo);
+    let _ = call_export("PoSetSystemWakeDevice", &[pdo]);
+    assert(pdo != 0 && before.is_some() && device_objects::reference_count(pdo) == before, "po-system-wake-device: referencia da base tomada e devolvida");
+    // SeQuerySessionIdToken: o SessionId do token primário do System.
+    let current = crate::ntos::ps::process::get_current_process();
+    let primary = crate::ntos::ps::process::get_primary_token(current).unwrap_or(0);
+    let session = crate::ntos::se::token::tokens::with(primary, |token| token.session_id);
+    let output = guest::alloc_bytes(8);
+    guest::write64(output, 0xEEEE_EEEE_EEEE_EEEE);
+    assert(session.is_some() && call_export("SeQuerySessionIdToken", &[primary, output]) == Some(0) && Some(guest::read32(output)) == session && guest::read32(output + 4) == 0xEEEE_EEEE, "se-query-session-id-token: SessionId do token num ULONG");
+    // NtBuildNumber: o build publicado com o nibble 0xF do build de produção.
+    let cell = match crate::ntos::init::exports::lookup("ntoskrnl.exe", "NtBuildNumber") {
+        Some(crate::ntos::mm::pe_loader::ResolvedImport::Address { address, .. }) => address,
+        _ => 0,
+    };
+    let shared = crate::ntos::mm::shared_user_data::data().map_or(0, |data| data.nt_build_number.get());
+    assert(cell != 0 && guest::read32(cell) == 0xF000_65F4 && guest::read32(cell) == 0xF000_0000 | shared, "nt-build-number: 0xF00065F4, o build do KUSER_SHARED_DATA");
+}
+
 fn whea_error_source_exports(assert: Assert) {
     use crate::ntos::inc::types::extra_storage::{WheaErrorPacketV2, WheaErrorRecordHeader, WheaErrorSourceConfigurationDeviceDriverV1, WheaErrorSourceDescriptor};
     use crate::ntos::init::exports::signed_status;
@@ -15145,6 +15193,7 @@ pub fn run(assert: Assert) {
     rtl_crt_rand_exports(assert);
     vf_device_verification_exports(assert);
     vsl_secure_pci_exports(assert);
+    usb_driver_support_exports(assert);
     whea_error_source_exports(assert);
     zw_event_exports(assert);
     ex_wnf_subscription_exports(assert);

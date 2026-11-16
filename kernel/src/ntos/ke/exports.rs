@@ -1311,3 +1311,12 @@ pub mod ke_triage_dump_data {
 
     pub static GROUP: Group = Group { name: "ke-triage-dump-data", names: &["KeInitializeTriageDumpDataArray", "KeAddTriageDumpDataBlock"], handlers: &[initialize_triage_dump_data_array, add_triage_dump_data_block], data_exports: &[] };
 }
+
+pub mod nt_build_number {
+    //! O export de dado NtBuildNumber: a célula da `.kdata` (`ke/version`).
+
+    use crate::ntos::init::exports::Group;
+    use crate::ntos::ke::version;
+
+    pub static GROUP: Group = Group { name: "nt-build-number", names: &[], handlers: &[], data_exports: &[("NtBuildNumber", version::build_number_cell)] };
+}

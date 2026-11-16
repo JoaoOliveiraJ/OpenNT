@@ -66,7 +66,7 @@ pub struct Group {
 }
 
 /// Grupos implementados (qualquer ordem: a posição vem de `GROUP_LAYOUT`).
-fn groups() -> [&'static Group; 502] {
+fn groups() -> [&'static Group; 506] {
     [
         &crate::ntos::ps::exports::ps_jobs::GROUP,
         &crate::ntos::alpc::exports::zw_alpc_server::GROUP,
@@ -571,6 +571,10 @@ fn groups() -> [&'static Group; 502] {
         &crate::ntos::rtl::exports::crt_i64tow_s::GROUP,
         &crate::ntos::mm::exports::pf_file_info_notify::GROUP,
         &crate::ntos::rtl::exports::rtl_decompression::GROUP,
+        &crate::hal::exports::vsl_secure_section::GROUP,
+        &crate::ntos::po::exports::po_system_wake_device::GROUP,
+        &crate::ntos::se::exports::se_query_session_id_token::GROUP,
+        &crate::ntos::ke::exports::nt_build_number::GROUP,
     ]
 }
 

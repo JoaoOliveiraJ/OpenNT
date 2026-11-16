@@ -372,6 +372,20 @@ pub mod se_token_info {
     };
 }
 
+pub mod se_query_session_id_token {
+    //! SeQuerySessionIdToken — lógica em `se/token/information.rs`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::se::token::information;
+    use crate::rtl::KernelError;
+
+    fn query_session_id_token(call: &Call) -> Result<u64, KernelError> {
+        Ok(information::query_session_id_token(call.arg(1), call.arg(2)) as u64)
+    }
+
+    pub static GROUP: Group = Group { name: "se-query-session-id-token", names: &["SeQuerySessionIdToken"], handlers: &[query_session_id_token], data_exports: &[] };
+}
+
 pub mod se_assign {
     //! Atribuição, consulta e ajuste do SECURITY_DESCRIPTOR de objetos, que os
     //! drivers reais de FS/IPC (ntfs, refs, npfs, msfs, clfs, afd, http, ks…)

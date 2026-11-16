@@ -508,9 +508,13 @@ pub static GROUP_LAYOUT: &[(&str, usize, usize)] = &[
     ("crt-i64tow-s", 2050, 1),
     ("pf-file-info-notify", 2051, 1),
     ("rtl-decompression", 2052, 3),
+    ("vsl-secure-section", 2055, 2),
+    ("po-system-wake-device", 2057, 1),
+    ("se-query-session-id-token", 2058, 1),
+    ("nt-build-number", 2059, 0),
 ];
 
-/// Os 2055 exports de função, na ordem da ABI.
+/// Os 2059 exports de função, na ordem da ABI.
 pub static EXPORT_NAMES: &[&str] = &[
     "DbgPrint",
     "DbgPrintEx",
@@ -2567,4 +2571,8 @@ pub static EXPORT_NAMES: &[&str] = &[
     "RtlDecompressBuffer",
     "RtlDecompressBufferEx",
     "RtlDecompressFragment",
+    "VslCreateSecureSection",
+    "VslDeleteSecureSection",
+    "PoSetSystemWakeDevice",
+    "SeQuerySessionIdToken",
 ];

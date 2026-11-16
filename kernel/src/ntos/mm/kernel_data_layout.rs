@@ -148,6 +148,10 @@ pub const DEFINITIONS: &[KernelDataEntry] = &[
     // bytes) que a guarda; o boot liga a cabeça e inicializa o recurso.
     KernelDataEntry { name: "PsLoadedModuleList", size: 16, storage_size: 16, alignment: 8, initial: &[0; 16] },
     KernelDataEntry { name: "PsLoadedModuleResource", size: 0x68, storage_size: 0x68, alignment: 8, initial: &[0; 0x68] },
+    // ULONG NtBuildNumber: o número do build com 0xF no nibble alto (o build
+    // de produção; o ntoskrnl 19041 guarda 0xF0004A61). O OpenNT se
+    // apresenta como o build 26100 (`ke/version`): 0xF00065F4.
+    KernelDataEntry { name: "NtBuildNumber", size: 4, storage_size: 4, alignment: 4, initial: &[0xF4, 0x65, 0x00, 0xF0] },
 ];
 
 /// Offset de cada entrada dentro da seção, na ordem de `DEFINITIONS`.

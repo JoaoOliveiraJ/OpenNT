@@ -217,6 +217,21 @@ pub mod po_device_wake {
     };
 }
 
+pub mod po_system_wake_device {
+    //! PoSetSystemWakeDevice; a lógica mora em `po/device_wake`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::po::device_wake;
+    use crate::rtl::KernelError;
+
+    fn set_system_wake_device(call: &Call) -> Result<u64, KernelError> {
+        device_wake::set_system_wake_device(call.arg(1));
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group { name: "po-system-wake-device", names: &["PoSetSystemWakeDevice"], handlers: &[set_system_wake_device], data_exports: &[] };
+}
+
 pub mod po_system_state {
     //! PoLatencySensitivityHint, PoSetUserPresent e PoRequestShutdownEvent;
     //! a lógica mora em `po/system_state`.

@@ -30,6 +30,17 @@ pub fn get_version(major: u64, minor: u64, build: u64, csd_version: u64) -> bool
     true
 }
 
+/// NtBuildNumber: a célula ULONG da imagem do kernel (`.kdata`), com o build
+/// publicado e 0xF no nibble alto (o build de produção).
+pub fn build_number_cell() -> u64 {
+    crate::ntos::mm::kernel_data::required_address("NtBuildNumber")
+}
+
+/// O valor que o NtBuildNumber publica.
+pub const fn build_number() -> u32 {
+    0xF000_0000 | VERSION.2
+}
+
 /// InitSafeBootMode: boot normal.
 pub fn safe_boot_mode() -> u64 {
     0

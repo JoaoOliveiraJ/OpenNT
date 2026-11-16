@@ -393,3 +393,19 @@ pub mod hvl_hypervisor_queries {
         data_exports: &[],
     };
 }
+
+pub mod vsl_secure_section {
+    use crate::hal::hypervisor;
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::rtl::KernelError;
+
+    fn create_secure_section(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(hypervisor::create_secure_section(call.arg(1), call.arg(2), call.arg(3), call.arg(4) as u32, call.arg(5) as u32)))
+    }
+
+    fn delete_secure_section(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(hypervisor::delete_secure_section(call.arg(1))))
+    }
+
+    pub static GROUP: Group = Group { name: "vsl-secure-section", names: &["VslCreateSecureSection", "VslDeleteSecureSection"], handlers: &[create_secure_section, delete_secure_section], data_exports: &[] };
+}

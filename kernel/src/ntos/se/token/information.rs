@@ -214,6 +214,15 @@ pub fn query_authentication_id(token: u64, output: u64) -> u32 {
     0
 }
 
+/// SeQuerySessionIdToken(Token, *SessionId) (ntoskrnl 19041 rva 0x6773c0):
+/// o SessionId do token lido sob o lock dele em leitura, sempre
+/// STATUS_SUCCESS (o NT não valida o token).
+pub fn query_session_id_token(token: u64, output: u64) -> u32 {
+    let session = tokens::with(token, |token| token.session_id).unwrap_or(0);
+    out::<u32>(output).set(session);
+    0
+}
+
 // ---- Acessores de campo (via side-table, não via offset nativo) ----------
 
 /// SeTokenType = TOKEN_TYPE (1 primário, 2 impersonação) do registro.
