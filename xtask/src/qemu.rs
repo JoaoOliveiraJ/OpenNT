@@ -273,6 +273,93 @@ pub struct TestOptions {
     /// `--expect-poweroff`: depois das saídas esperadas, o QEMU precisa sair
     /// sozinho pelo desligamento ACPI.
     pub expect_poweroff: bool,
+    /// `--watch-screen`: o xtask lê a tela do QEMU durante o teste e põe o
+    /// marcador `FIRST_PIXEL_OK` no log da serial quando a tela gráfica
+    /// mostra pixels desenhados ([`drawn_pixels`]).
+    pub watch_screen: bool,
+}
+
+/// O marcador do `--watch-screen`.
+pub const FIRST_PIXEL_MARKER: &str = "FIRST_PIXEL_OK";
+/// Intervalo entre duas leituras da tela.
+const SCREEN_POLL: Duration = Duration::from_secs(2);
+/// Pixels não pretos que uma tela gráfica precisa ter.
+const DRAWN_MINIMUM: usize = 64;
+/// Um canal acima disto não é preto.
+const BLACK_LEVEL: u8 = 0x20;
+/// O fundo da tela de bugcheck (`bgk/bugcheck_screen.rs`).
+const BUGCHECK_BACKGROUND: [u8; 3] = [0x00, 0x77, 0xD6];
+
+/// Os pixels desenhados numa tela do QEMU, ou None. Só conta uma tela
+/// gráfica de pelo menos 800x600, como o vídeo de boot (1024x768): a de
+/// texto da VGA (720x400) mostra o console do carregador, e o aviso do
+/// QEMU antes da VGA iniciar ocupa 640x480. O vídeo de boot do OpenNT é
+/// todo preto e o kernel só desenha nele a tela de bugcheck, então pixels
+/// não pretos que não são o fundo azul dela vêm de quem desenha na tela
+/// depois do boot.
+pub fn drawn_pixels(image: &crate::png::Image) -> Option<String> {
+    if image.height < 600 || image.width < 800 {
+        return None;
+    }
+    let mut drawn = 0usize;
+    let mut bugcheck = 0usize;
+    let mut colors: std::collections::HashMap<[u8; 3], usize> = std::collections::HashMap::new();
+    let (mut left, mut top, mut right, mut bottom) = (usize::MAX, usize::MAX, 0usize, 0usize);
+    for (index, pixel) in image.rgb.chunks_exact(3).enumerate() {
+        let rgb = [pixel[0], pixel[1], pixel[2]];
+        if rgb == BUGCHECK_BACKGROUND {
+            bugcheck += 1;
+        }
+        if rgb.iter().all(|&channel| channel <= BLACK_LEVEL) {
+            continue;
+        }
+        drawn += 1;
+        *colors.entry(rgb).or_default() += 1;
+        let (x, y) = (index % image.width, index / image.width);
+        left = left.min(x);
+        right = right.max(x);
+        top = top.min(y);
+        bottom = bottom.max(y);
+    }
+    if drawn < DRAWN_MINIMUM || bugcheck * 2 > image.width * image.height {
+        return None;
+    }
+    let mut common: Vec<([u8; 3], usize)> = colors.into_iter().collect();
+    common.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let palette: Vec<String> = common.iter().take(4).map(|(rgb, count)| format!("#{:02x}{:02x}{:02x} x{count}", rgb[0], rgb[1], rgb[2])).collect();
+    Some(format!(
+        "{drawn} pixels desenhados na tela {}x{}, de ({left},{top}) a ({right},{bottom}); cores: {}",
+        image.width,
+        image.height,
+        palette.join(", ")
+    ))
+}
+
+/// A vigia da tela (`--watch-screen`): a cada [`SCREEN_POLL`] lê a tela
+/// pelo QMP e, na primeira com pixels desenhados, escreve a descrição e o
+/// marcador no log da serial e grava o PNG em `first` (se houver).
+fn watch_screen(port: u16, scratch: PathBuf, first: Option<PathBuf>, output: Arc<Mutex<String>>, stop: Arc<std::sync::atomic::AtomicBool>) {
+    use std::sync::atomic::Ordering;
+    while !stop.load(Ordering::Acquire) {
+        thread::sleep(SCREEN_POLL);
+        if stop.load(Ordering::Acquire) || qmp_screendump(port, &scratch).is_err() {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&scratch) else { continue };
+        let Ok(image) = crate::png::read_ppm(&bytes) else { continue };
+        let Some(description) = drawn_pixels(&image) else { continue };
+        let line = format!("\n[xtask] tela: {description}\n{FIRST_PIXEL_MARKER}\n");
+        print!("{line}");
+        output.lock().unwrap().push_str(&line);
+        if let Some(target) = first {
+            let png = crate::png::encode_capture(&image, &[("opennt-data", crate::png::today().as_str()), ("opennt-resultado", "primeira tela desenhada"), ("opennt-serial", description.as_str())], CAPTURE_LIMIT);
+            if std::fs::write(&target, &png).is_ok() {
+                println!("[xtask] primeira tela desenhada: {}", target.display());
+            }
+        }
+        break;
+    }
+    let _ = std::fs::remove_file(&scratch);
 }
 
 /// Limite de tamanho de uma captura (a tela gráfica é reduzida até caber).
@@ -660,14 +747,14 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
         "-monitor".to_string(),
         format!("tcp:127.0.0.1:{port},server=on,wait=off"),
     ]);
-    // O QMP só entra com a captura: o `screendump` sai por ele.
-    let qmp_port = match test.capture {
-        Some(_) => {
-            let qmp = free_port()?;
-            arguments.extend(["-qmp".to_string(), format!("tcp:127.0.0.1:{qmp},server=on,wait=off")]);
-            Some(qmp)
-        }
-        None => None,
+    // O QMP só entra com a captura ou a vigia da tela: o `screendump` sai
+    // por ele.
+    let qmp_port = if test.capture.is_some() || test.watch_screen {
+        let qmp = free_port()?;
+        arguments.extend(["-qmp".to_string(), format!("tcp:127.0.0.1:{qmp},server=on,wait=off")]);
+        Some(qmp)
+    } else {
+        None
     };
     // Um segundo QMP só para os eventos de fim da máquina.
     let events_port = if test.expect_poweroff || test.power_cycles > 0 {
@@ -681,6 +768,17 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
     let output = Arc::new(Mutex::new(String::new()));
     let current = std::cell::RefCell::new(launch(&qemu, &arguments, &output, events_port)?);
     let cycles_left = std::cell::Cell::new(test.power_cycles);
+    // A vigia da tela roda durante o teste; o QMP atende um cliente por vez,
+    // então ela para antes da captura do fim.
+    let screen_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let screen_watcher = match (test.watch_screen, qmp_port) {
+        (true, Some(qmp)) => {
+            let (scratch, first) = (log.with_file_name("tela.ppm"), Some(log.with_file_name("primeira-tela.png")));
+            let (serial, stop) = (Arc::clone(&output), Arc::clone(&screen_stop));
+            Some(thread::spawn(move || watch_screen(qmp, scratch, first, serial, stop)))
+        }
+        _ => None,
+    };
 
     let deadline = Instant::now() + test.timeout;
     // Com `--expect-stop`, o STOP do bugcheck é o próprio teste.
@@ -811,6 +909,10 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
         },
         (result, _) => result,
     };
+    screen_stop.store(true, std::sync::atomic::Ordering::Release);
+    if let Some(watcher) = screen_watcher {
+        let _ = watcher.join();
+    }
     let mut machine = current.into_inner();
     // A captura sai com o QEMU ainda vivo, passe o teste ou não; se ela
     // falhar, o resultado do teste não muda.
@@ -838,5 +940,42 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
             Ok(())
         }
         Err(error) => Err(format!("TEST-BOOT FALHOU: {error} (serial em {})", log.display())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::png::Image;
+
+    fn screen(width: usize, height: usize, fill: [u8; 3]) -> Image {
+        Image { width, height, rgb: fill.iter().copied().cycle().take(width * height * 3).collect() }
+    }
+
+    #[test]
+    fn drawn_pixels_needs_a_graphics_screen_with_drawing() {
+        // Preto: o vídeo de boot.
+        assert!(drawn_pixels(&screen(1024, 768, [0, 0, 0])).is_none());
+        // A tela de texto da VGA (720x400) e o aviso do QEMU (640x480) não
+        // contam.
+        assert!(drawn_pixels(&screen(720, 400, [0xAA, 0xAA, 0xAA])).is_none());
+        assert!(drawn_pixels(&screen(640, 480, [0xFF, 0xFF, 0xFF])).is_none());
+        // A tela de bugcheck não conta.
+        assert!(drawn_pixels(&screen(1024, 768, BUGCHECK_BACKGROUND)).is_none());
+        // Um retângulo branco de 16x16 conta, com a caixa e a cor.
+        let mut image = screen(1024, 768, [0, 0, 0]);
+        for y in 100..116 {
+            for x in 200..216 {
+                let at = (y * 1024 + x) * 3;
+                image.rgb[at..at + 3].copy_from_slice(&[0xFF, 0xFF, 0xFF]);
+            }
+        }
+        let description = drawn_pixels(&image).expect("16x16 desenhados");
+        assert!(description.starts_with("256 pixels desenhados na tela 1024x768, de (200,100) a (215,115)"), "{description}");
+        assert!(description.contains("#ffffff x256"), "{description}");
+        // Menos que o mínimo: ruído, não desenho.
+        let mut few = screen(1024, 768, [0, 0, 0]);
+        few.rgb[0..3].copy_from_slice(&[0xFF, 0, 0]);
+        assert!(drawn_pixels(&few).is_none());
     }
 }

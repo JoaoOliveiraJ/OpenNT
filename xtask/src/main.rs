@@ -5,7 +5,7 @@
 //! cargo xtask run        [opções de build] [opções de máquina]
 //! cargo xtask test-boot  [MARCADOR] [TIMEOUT_MS] [opções] [--keys=TEXTO] [--expect=TEXTO]... [--hold=MS]
 //!                        [--build-only|--no-build [--image-dir=DIR]] [--kd=com2 --script=ARQ] [--capture=ARQ.png]
-//!                        [--expect-stop]
+//!                        [--expect-stop] [--watch-screen]
 //!                        [--expect-poweroff] [--power-cycles=N] [--allow-reboot]
 //! cargo xtask test-all   [--jobs=N] [--only=ID,...] [--skip=ID,...] [--repeat=N] [--keep] [--cpu-friendly]
 //! cargo xtask capturas   [--jobs=N] [--only=ID,...] [--skip=ID,...] [--keep] [--cpu-friendly]
@@ -87,6 +87,8 @@ test-boot:         --keys=TEXTO (\\n = Enter) --expect=TEXTO (repetivel)
                    deste teste numa copia do os.img em --build-dir, onde tambem ficam os logs)
                    --script=ARQ (com --kd: roteiro do cliente do depurador em paralelo)
                    --capture=ARQ.png (no fim do teste, a tela do QEMU pelo screendump do QMP)
+                   --watch-screen (le a tela durante o teste; FIRST_PIXEL_OK na serial quando
+                   a tela grafica mostra pixels desenhados)
                    --expect-poweroff (no fim o QEMU sai sozinho pelo desligamento ACPI)
                    --power-cycles=N (religa ate N vezes o QEMU que o convidado desligou)
                    --allow-reboot (o reinicio do convidado reinicia a maquina)
@@ -120,6 +122,8 @@ struct Arguments {
     capture: Option<PathBuf>,
     /// `--expect-stop`: o STOP do bugcheck faz parte do teste.
     expect_stop: bool,
+    /// `--watch-screen`: a vigia da tela do test-boot.
+    watch_screen: bool,
     /// `--expect-poweroff`, `--power-cycles=N` e `--allow-reboot`.
     expect_poweroff: bool,
     power_cycles: u32,
@@ -164,6 +168,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
         headless: false,
         capture: None,
         expect_stop: false,
+        watch_screen: false,
         expect_poweroff: false,
         power_cycles: 0,
         allow_reboot: false,
@@ -210,6 +215,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             "--headless" if parsed.command == "debug" => parsed.headless = true,
             "--capture" => parsed.capture = Some(PathBuf::from(required()?)),
             "--expect-stop" => parsed.expect_stop = true,
+            "--watch-screen" => parsed.watch_screen = true,
             "--accel" => parsed.machine.accelerator = required()?,
             "--memory-mb" => {
                 parsed.machine.memory_mb = required()?.parse().map_err(|_| "--memory-mb invalido")?
@@ -255,6 +261,9 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
     }
     if parsed.capture.is_some() && (parsed.command != "test-boot" || parsed.build_only) {
         return Err("--capture e opcao do test-boot que roda o QEMU".into());
+    }
+    if parsed.watch_screen && (parsed.command != "test-boot" || parsed.build_only) {
+        return Err("--watch-screen e opcao do test-boot que roda o QEMU".into());
     }
     if parsed.build_only && parsed.no_build {
         return Err("--build-only e --no-build se excluem".into());
@@ -357,6 +366,7 @@ fn execute(arguments: Arguments) -> Result<(), String> {
                     power_cycles: arguments.power_cycles,
                     allow_reboot: arguments.allow_reboot,
                     expect_poweroff: arguments.expect_poweroff,
+                    watch_screen: arguments.watch_screen,
                 },
                 &log,
                 session,
