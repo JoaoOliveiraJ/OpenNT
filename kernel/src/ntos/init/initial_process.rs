@@ -220,12 +220,14 @@ static WINSTA0_OK: AtomicBool = AtomicBool::new(false);
 /// o `WINSTA0_OK` sai quando o wininit.exe tem as Desktops Winlogon e
 /// Default da WinSta0, como as que ele cria na partida da sessão 0.
 pub fn desktop_opened(window_station: &str, desktop: &str) {
-    if !boot_config::smss_boot() || WINSTA0_OK.load(Ordering::Acquire) {
+    if !boot_config::smss_boot() {
         return;
     }
+    // Cada abertura sai no log (as do winlogon.exe da sessão 1 vêm depois do
+    // marcador); só as do wininit.exe contam para ele.
     let name = image_name(process::get_current_process());
     crate::debug_print!("[init] {} (pid {}): Desktop {}\\{} aberta pela ParseProcedure da WindowStation", name, process::get_current_process_id(), window_station, desktop);
-    if !name.eq_ignore_ascii_case("wininit.exe") || !window_station.eq_ignore_ascii_case("WinSta0") {
+    if WINSTA0_OK.load(Ordering::Acquire) || !name.eq_ignore_ascii_case("wininit.exe") || !window_station.eq_ignore_ascii_case("WinSta0") {
         return;
     }
     let complete = {
