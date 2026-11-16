@@ -564,6 +564,16 @@ sistema dentro dos próprios contextos agendados, por eventos esperados de
 dentro deles, e faz um AP chamar um export enquanto o BSP está num contexto
 agendado. A rotina que retorna termina a thread,
 e o PsTerminateSystemThread termina de dentro do serviço pela última troca.
+Como no PsCreateSystemThreadEx do 19041, o handle da thread é sempre de
+kernel (OBJ_KERNEL_HANDLE ligado nos atributos do chamador). Sem
+ProcessHandle a thread é do System. Com ele, o ObReferenceObjectByHandle
+(PROCESS_CREATE_THREAD, KernelMode) escolhe o processo da thread, e a recusa
+é o status devolvido. A thread de modo kernel roda então com a raiz desse
+processo e vê o espaço de sessão dele: o cdd.dll cria assim a thread de
+apresentação (PresentWorkerThread) no csrss da sessão. O autoteste
+`ntos/test/multiprocess/attach_cr3.rs` cria a thread num processo com
+espaço próprio e confere que ela lê a página do espaço dele pela VA de
+usuário.
 Pedido de dentro de uma thread de kernel (o pump de uma espera genérica, o
 ZwYieldExecution com outra pronta, um SharedLock disputado), o tick não
 aninha: a thread cede a vez. Uma thread em execução dada como pronta
@@ -2824,7 +2834,29 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   win32kfull, depois do da RawInputThread do csrss da sessão 1, que entra
   pelo xxxCreateSystemThreads). Depois cria uma thread, carrega o kbdus.dll
   e o winsta.dll e para ali; nada é desenhado no framebuffer. Cada abertura
-  de Desktop sai no log. O marcador `WINSTA0_OK`
+  de Desktop sai no log. A thread principal está no WinStationWaitForConnect
+  do winsta.dll (g_WinlogonStage 0xe, evento WLEvt_WaitForLSM_Start): o
+  WaitForLsmStart espera sem prazo o `Global\TermSrvReadyEvent`, que o
+  winsrvext.dll do csrss cria (CreateTermSrvReadyEvent) e que o Local
+  Session Manager (lsm.dll, num svchost criado pelo services.exe) sinaliza
+  quando sobe; depois o winsta chama o LSM pelo RPC `ncalrpc:[LSMApi]`. A
+  outra thread (LaunchUmfdHostWithVirtualAccountThreadProc) espera o LSA
+  (WaitForLsa) antes de criar o fontdrvhost.exe. O vídeo físico da sessão 1
+  também vem do LSM: o dxgkrnl só tem sessão de console
+  (DXGSESSIONMGR::SetConsoleSession) depois do DxgkSessionConnected, que o
+  win32k chama só no xxxRemoteConnect, o NtUserRemoteConnect que o
+  W32WinStationDoConnect do csrss faz a pedido do LSM pela
+  `\SmSsWinStationApiPort` (a TerminalServerRequestThread do csrss espera o
+  TermSrvReadyEvent antes de conectar). Até lá o InitVideo da sessão 1 (com
+  o gProtocolType de console, 0) monta a configuração de exibição só com o
+  dispositivo desconectado (`\Device\Disc`, TSDDD, o stub sem imagem do
+  ldevLoadDriver): o cdd.dll não é carregado e o xxxSwitchDesktop pinta a
+  superfície desconectada. O RtlGetActiveConsoleId lê o ActiveConsoleId da
+  KUSER_SHARED_DATA (`rtl/shared_data.rs`), que o win32k grava: 0 no
+  DriverEntry da sessão 0, -1 quando o InitVideo dela fecha os dispositivos
+  de vídeo e o id da primeira sessão interativa no DriverEntry dela (o
+  CheckInitialSessions cria o `\UniqueInteractiveSessionIdEvent`); o
+  watchdog (SMgrGetConsoleSessionId) e o dxgkrnl leem esse valor. O marcador `WINSTA0_OK`
   (`initial_process::desktop_opened`) sai quando o wininit.exe tem as
   Desktops Winlogon e Default da WinSta0, abertas pela ParseProcedure da
   WindowStation, e o `WINLOGON_DESKTOPS_OK` quando o winlogon.exe da sessão
@@ -3361,6 +3393,16 @@ QMP e, no fim do teste (passando ou não), o `screendump` grava a tela em PPM (o
 QEMU desta máquina não tem a libpng), que o `xtask/src/png.rs` converte em PNG
 sem moldura, com paleta e deflate próprio, abaixo de 60 KB, com a data e o
 resultado nos textos do PNG; o `cargo xtask status` os lê de lá.
+
+O `test-boot --watch-screen` lê a tela durante o teste, pelo mesmo QMP, a
+cada 2 s (`qemu::watch_screen`). Uma tela gráfica de pelo menos 800x600 com
+64 pixels ou mais fora do preto, que não seja o fundo azul da tela de
+bugcheck, põe no log da serial uma linha `[xtask] tela:` (quantos pixels, a
+caixa que os contém e as cores mais comuns) e o marcador `FIRST_PIXEL_OK`, e
+grava a tela em `<build>/primeira-tela.png`. A tela de texto da VGA (720x400)
+e o aviso do QEMU antes da VGA iniciar (640x480) não contam. O vídeo de boot
+do OpenNT (o modo VBE 1024x768) é todo preto, e o kernel só desenha nele a
+tela de bugcheck: o que aparece ali vem de quem desenha depois do boot.
 
 ## 7. O nome OpenNT nos arquivos
 

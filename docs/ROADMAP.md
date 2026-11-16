@@ -17,7 +17,7 @@ O OpenNT avança em fases. Cada fase termina com o kernel compilando, iniciando 
 
 **Marco atual.** O winlogon.exe real da sessão 1 registra o processo de logon pelo RPC de kernel do msrpc.sys, abre as Desktops Winlogon, Disconnect e Default da WinSta0 dele e chama o SwitchDesktop. Na sessão 0, o wininit.exe real cria a WinSta0 e as Desktops dele e cria o services.exe real.
 
-**Próximo.** O BaseSrvCreateProcess do csrss aceitar o services.exe (o CsrImpersonateClient sem a thread CSR do cliente devolve STATUS_BAD_IMPERSONATION_LEVEL) e o winlogon.exe da sessão 1 seguir depois do winsta.dll até desenhar no framebuffer.
+**Próximo.** O BaseSrvCreateProcess do csrss aceitar o services.exe (o CsrImpersonateClient sem a thread CSR do cliente devolve STATUS_BAD_IMPERSONATION_LEVEL), o services.exe subir o svchost do Local Session Manager (lsm.dll) e o LSM sinalizar o TermSrvReadyEvent e conectar a sessão 1 ao console. O winlogon.exe espera esse evento no WinStationWaitForConnect, e o win32k da sessão 1 só recebe o vídeo físico pelo NtUserRemoteConnect que o csrss faz a pedido do LSM (teste primeiro-pixel).
 
 Hoje: **49 de 79** binários da Microsoft rodam (28 parciais); o kernel exporta **2.078 dos 3.070** nomes do `ntoskrnl.exe` do Windows 10 22H2 (67,7%). Detalhes em [O que roda](site/o-que-roda.html), [Componentes](site/componentes.html), [Exports](site/ntoskrnl.html) e [Testes](site/testes.html).
 
