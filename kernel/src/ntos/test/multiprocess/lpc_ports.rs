@@ -503,14 +503,16 @@ fn scenario(assert: Assert, terminate: u32) {
     };
     // O servidor anda só pelo tick até bloquear no NtListenPort.
     let main = threads::of_process(server_pointer).first().cloned();
-    let listening = || main.as_ref().is_some_and(|thread| thread.waiting() && thread.blocked_in_kernel()) && object_manager::lookup(PORT_NAME).is_some();
+    // A recepção espera pela espera do serviço (wait_custom), sem pilha de
+    // kernel bloqueada: a thread fica em espera.
+    let listening = || main.as_ref().is_some_and(|thread| thread.waiting()) && object_manager::lookup(PORT_NAME).is_some();
     let deadline = clock::uptime_ms() + WAIT_DEADLINE_MS;
     while clock::uptime_ms() < deadline && process_state::get(server_pointer).is_some() && !listening() {
         scheduler::tick(-1);
     }
     let blocked = listening();
     crate::debug_print!("[lpc] servidor bloqueado no NtListenPort={} (saida {:#x})", blocked, exit_status(server_pointer));
-    check(assert, blocked, "lpc: o servidor cria a porta LPC em anel 3 (NtCreatePort, com as recusas do MaxMessageLength e do nome repetido) e bloqueia no kernel em NtListenPort");
+    check(assert, blocked, "lpc: o servidor cria a porta LPC em anel 3 (NtCreatePort, com as recusas do MaxMessageLength e do nome repetido) e espera no NtListenPort");
 
     let client_started = if blocked {
         launch(client)
