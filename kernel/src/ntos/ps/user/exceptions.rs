@@ -15,6 +15,7 @@ use super::threads::{self, UserThread};
 use super::{index, state, syscalls_core};
 use crate::hal::amd64::usermode;
 use crate::ntos::inc::types::{Context, ContextEx, ExceptionRecord, MachineFrame, NtStruct, XsaveFormat};
+use crate::ntos::kd::debug_service;
 use crate::ntos::mm::page_residency;
 use crate::ntos::ps::context::registers::{self, INTEGER};
 use crate::rtl::{KernelError, SpinLock};
@@ -28,6 +29,9 @@ const CONTEXT_EX_OFFSET: u64 = CONTEXT_SIZE;
 const RECORD_OFFSET: u64 = 0x4F0;
 const MACHINE_OFFSET: u64 = 0x590;
 const FRAME_SIZE: u64 = 0x5C0;
+/// O serviço de depuração (`int 0x2D`), que o anel 3 chama pelo portão de
+/// DPL 3 da IDT.
+const DEBUG_SERVICE_VECTOR: u32 = 0x2D;
 
 const _: () = assert!(CONTEXT_EX_OFFSET + ContextEx::SIZE <= RECORD_OFFSET && RECORD_OFFSET + RECORD_SIZE <= MACHINE_OFFSET && MACHINE_OFFSET + MachineFrame::SIZE <= FRAME_SIZE);
 
@@ -145,6 +149,19 @@ pub fn hardware(thread: &UserThread, status: u32) -> u32 {
     let mut record = alloc::vec![0u8; RECORD_SIZE as usize];
     let mut put = |offset: usize, bytes: &[u8]| record[offset..offset + bytes.len()].copy_from_slice(bytes);
     put(offset_of!(ExceptionRecord, exception_code), &status.to_le_bytes());
+    if vector == DEBUG_SERVICE_VECTOR {
+        // KiDebugServiceTrap: o RIP salvo é o do `int3` depois do `int 0x2D`;
+        // o endereço da exceção fica depois dele e o serviço (RAX) vai em
+        // ExceptionInformation[0]. O KiDispatchException deixa o RIP do
+        // CONTEXT no `int3` e, com um serviço, o KdTrap vem antes da entrega.
+        let service = live.rax.get();
+        address = address.wrapping_add(1);
+        put(offset_of!(ExceptionRecord, number_parameters), &1u32.to_le_bytes());
+        put(offset_of!(ExceptionRecord, exception_information), &service.to_le_bytes());
+        if service != 0 && debug_service::user_trap(live) {
+            return 0;
+        }
+    }
     put(offset_of!(ExceptionRecord, exception_address), &address.to_le_bytes());
     if vector == 14 {
         let error = block.error_code.get() as u32;

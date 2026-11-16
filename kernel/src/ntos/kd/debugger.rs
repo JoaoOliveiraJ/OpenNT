@@ -104,6 +104,11 @@ fn not_present() -> bool {
     cell == 0 || volatile::read8(cell) != 0
 }
 
+/// KdDebuggerNotPresent: nenhum host troca pacotes.
+pub fn debugger_not_present() -> bool {
+    not_present()
+}
+
 fn shared_flags(update: impl FnOnce(u8) -> u8) {
     if let Some(shared) = shared_user_data::data() {
         shared.kd_debugger_enabled.set(update(shared.kd_debugger_enabled.get()));

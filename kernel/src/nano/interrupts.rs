@@ -64,8 +64,9 @@ fn set_gate(vector: u16, handler_address: u64) {
     physical::write16(base, (handler_address & 0xFFFF) as u16);
     physical::write16(base + 2, CODE64_SELECTOR);
     physical::write8(base + 4, 0);
-    // INT3 e a interrupção de fast-fail do NT podem ser chamadas do ring 3.
-    let dpl = if vector == 3 || vector == 0x29 { 0x60 } else { 0 };
+    // INT3, o fast fail (0x29) e o serviço de depuração (0x2D) podem ser
+    // chamados do ring 3, como os portões de DPL 3 do KiInterruptInitTable.
+    let dpl = if matches!(vector, 3 | 0x29 | 0x2D) { 0x60 } else { 0 };
     physical::write8(base + 5, INTERRUPT_GATE | dpl);
     physical::write16(base + 6, ((handler_address >> 16) & 0xFFFF) as u16);
     physical::write32(base + 8, (handler_address >> 32) as u32);

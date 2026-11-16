@@ -6,10 +6,12 @@
 //! `session`), com as paradas, o congelamento dos outros processadores e
 //! os passos em `stop`, os breakpoints em `breakpoints`, o acesso à memória
 //! em `memory`, os registradores em `registers`, as consultas do OpenNT em
-//! `monitor` e `inspect` (objetos do NT), o rastro de instruções em `trace`
-//! e a saída do DbgPrint em `print_log`.
+//! `monitor` e `inspect` (objetos do NT), o rastro de instruções em `trace`,
+//! a saída do DbgPrint em `print_log` e o serviço de depuração (`int 0x2D`)
+//! do modo usuário em `debug_service`.
 pub mod breakpoints;
 pub mod debug_filter;
+pub mod debug_service;
 pub mod debugger;
 pub mod exports;
 pub mod inspect;

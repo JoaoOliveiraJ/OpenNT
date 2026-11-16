@@ -398,6 +398,8 @@ irq_user_context_saved:
     je irq_user_divide
     cmp r10d, 3
     je irq_user_breakpoint
+    cmp r10d, 0x2D                  # servico de depuracao: STATUS_BREAKPOINT
+    je irq_user_breakpoint
     cmp r10d, 1
     je irq_user_single_step
     jmp irq_user_terminate
@@ -421,6 +423,9 @@ irq_user_terminate:
     mov gs:[{fault_rsp}], rax
     mov rax, cr2
     mov gs:[{fault_cr2}], rax
+    # O servico de depuracao e uma chamada, nao uma falha: sem a linha.
+    cmp r10d, 0x2D
+    je user_terminate_current
     mov dx, 0x3F8
     mov al, 0x20
     out dx, al
