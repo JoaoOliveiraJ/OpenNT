@@ -11,6 +11,7 @@ use alloc::vec::Vec;
 
 use crate::ntos::ex::callback_security;
 use crate::ntos::ke::irql;
+use crate::ntos::ob::handles::namespace as namespace_handles;
 use crate::ntos::ob::object_manager::{self, NodeId};
 use crate::ntos::ob::objects::namespace as namespace_objects;
 use crate::ntos::ob::{object_access, object_types, open_pointer};
@@ -127,11 +128,17 @@ fn root_directory(handle: u64, mode: u8) -> Result<NodeId, u32> {
     let current = process::get_current_process();
     if !kernel && current != process::get_system_process() {
         let entry = if state::is_user_process(current) { state::get_user_handle(handle) } else { None };
-        let Some(entry) = entry else { return Err(0xC000_0008) };
-        if entry.kind() != "directory" {
-            return Err(0xC000_0024);
+        if let Some(entry) = entry {
+            if entry.kind() != "directory" {
+                return Err(0xC000_0024);
+            }
+            return entry.object.namespace_node().ok_or(0xC000_0008);
         }
-        return entry.object.namespace_node().ok_or(0xC000_0008);
+        // O handle do NtOpenDirectoryObject mora na tabela do Object
+        // Manager com o processo como dono (o LdrpKnownDllDirectoryHandle
+        // do ntdll): mesma resolução do serviço de diretório.
+        let opened = namespace_handles::resolve(handle, mode != 0)?;
+        return if opened.directory { Ok(opened.node) } else { Err(0xC000_0024) };
     }
     let identifier = (handle & 0x7FFF_FFFF) as u32;
     let Some(record) = object_manager::handle_record(identifier) else { return Err(0xC000_0008) };
