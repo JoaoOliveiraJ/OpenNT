@@ -5,10 +5,10 @@
 //! ProcessDefaultHardErrorMode e ProcessHandleCheckingMode do
 //! NtSetInformationProcess (`ps/set_process_information`), as classes de
 //! tamanho fixo do NtQuerySystemInformation (`ex/system_information`) e os
-//! vizinhos NtPulseEvent e NtSetEventBoostPriority.
+//! vizinhos NtPulseEvent, NtSetEventBoostPriority e NtQueryDirectoryObject.
 
 use crate::ntos::inc::field::NtStruct;
-use crate::ntos::inc::types::{Eprocess, Ethread, HandleTable};
+use crate::ntos::inc::types::{Eprocess, Ethread, HandleTable, ObjectAttributes};
 use crate::ntos::ke::dispatcher;
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::ps::process;
@@ -40,6 +40,7 @@ pub fn run(assert: Assert) {
     process_classes(assert, block, &call);
     system_classes(assert, block, &call);
     events(assert, block, rsp, &call);
+    directory_query(assert, block, rsp, &call);
     if let Some(region) = memory::find_region(block) {
         memory::release_private_region(&region);
     }
@@ -179,6 +180,74 @@ fn events(assert: Assert, block: u64, rsp: u64, call: Call) {
     let signaled = pointer(synchronization) != 0 && dispatcher::read_state(pointer(synchronization)) == 1;
     assert(synchronization_created == 0 && mismatch == STATUS_OBJECT_TYPE_MISMATCH && boosted == 0 && signaled, "userboot: NtSetEventBoostPriority recusa o evento de notificacao e sinaliza o de sincronizacao");
     for handle in [notification, synchronization] {
+        let _ = call("NtClose", handle, 0, 0, 0);
+    }
+}
+
+/// OBJECT_ATTRIBUTES de usuário em `block` com o nome em `block + 0x100`.
+fn attributes(block: u64, name: &str) -> u64 {
+    state::write_user_wide(block + 0x100, name);
+    state::write_unicode_string(block + 0x40, block + 0x100, name);
+    // SAFETY: memória de usuário do teste, mapeada pelo kernel.
+    let object = unsafe { ObjectAttributes::at(block) };
+    object.length.set(ObjectAttributes::SIZE as u32);
+    object.root_directory.set(0);
+    object.object_name.set(block + 0x40);
+    object.attributes.set(0x40);
+    object.security_descriptor.set(0);
+    object.security_quality_of_service.set(0);
+    block
+}
+
+/// NtQueryDirectoryObject de modo usuário num diretório com dois filhos.
+fn directory_query(assert: Assert, block: u64, rsp: u64, call: Call) {
+    let (oa, out, buffer, context, returned) = (block + 0x1000, block + 0x500, block + 0x600, block + 0x510, block + 0x518);
+    let create = |name: &str, access: u64| {
+        guest::write64(out, 0);
+        let status = call("NtCreateDirectoryObject", out, access, attributes(oa, name), 0);
+        (status, guest::read64(out))
+    };
+    let (root_status, root) = create("\\OpenNtDirConsulta", 0xF);
+    let (first_status, first) = create("\\OpenNtDirConsulta\\Sub1", 0xF);
+    let (second_status, second) = create("\\OpenNtDirConsulta\\Sub2", 0xF);
+    let query = |handle: u64, address: u64, length: u64, single: u64, restart: u64| {
+        guest::write64(rsp + 0x28, restart);
+        guest::write64(rsp + 0x30, context);
+        guest::write64(rsp + 0x38, returned);
+        guest::write32(returned, 0xFFFF_FFFF);
+        call("NtQueryDirectoryObject", handle, address, length, single)
+    };
+    let text = |unicode: u64| {
+        let length = guest::read16(unicode) as usize;
+        let pointer = guest::read64(unicode + 8);
+        let units: alloc::vec::Vec<u16> = (0..length / 2).map(|index| guest::read16(pointer + index as u64 * 2)).collect();
+        alloc::string::String::from_utf16_lossy(&units)
+    };
+    // Uma entrada: 0x20 do descritor, 0x20 do terminador, "Sub1" e
+    // "Directory" com os terminadores.
+    let entry_total = 0x40 + 10 + 20;
+    let one = query(root, buffer, 0x200, 1, 1);
+    let first_entry = (text(buffer), text(buffer + 0x10), guest::read32(context), guest::read32(returned));
+    let two = query(root, buffer, 0x200, 1, 0);
+    let second_name = text(buffer);
+    let second_context = guest::read32(context);
+    assert(
+        root_status == 0 && first_status == 0 && second_status == 0 && one == 0 && first_entry.0 == "Sub1" && first_entry.1 == "Directory" && first_entry.2 == 1 && first_entry.3 == entry_total && two == 0 && second_name == "Sub2" && second_context == 2,
+        "userboot: NtQueryDirectoryObject devolve uma entrada por vez com o nome, o tipo e o contexto",
+    );
+    guest::write_bytes(buffer, &[0xEE; 0x40]);
+    let none = query(root, buffer, 0x200, 1, 0);
+    assert(none == 0x8000_001A && guest::read32(returned) == 0x20 && guest::read32(context) == 2 && guest::read64(buffer) == 0, "userboot: NtQueryDirectoryObject sem mais entradas devolve o terminador, ReturnLength 0x20 e o contexto intacto");
+    let more = query(root, buffer, 0x30, 0, 1);
+    let more_context = guest::read32(context);
+    let small = query(root, buffer, 0x30, 1, 1);
+    assert(more == 0x105 && more_context == 0 && small == 0xC000_0023 && guest::read32(returned) == entry_total, "userboot: NtQueryDirectoryObject com a primeira entrada grande demais: STATUS_MORE_ENTRIES sem ReturnSingleEntry, STATUS_BUFFER_TOO_SMALL com");
+    // Alinhamento de WCHAR e DIRECTORY_QUERY no handle.
+    guest::write64(out, 0);
+    let opened = call("NtOpenDirectoryObject", out, 2, attributes(oa, "\\OpenNtDirConsulta"), 0);
+    let traverse = guest::read64(out);
+    assert(query(root, buffer + 1, 0x200, 1, 1) == 0x8000_0002 && opened == 0 && query(traverse, buffer, 0x200, 1, 1) == STATUS_ACCESS_DENIED, "userboot: NtQueryDirectoryObject exige buffer alinhado e DIRECTORY_QUERY");
+    for handle in [traverse, second, first, root] {
         let _ = call("NtClose", handle, 0, 0, 0);
     }
 }

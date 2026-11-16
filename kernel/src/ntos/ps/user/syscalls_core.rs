@@ -873,13 +873,22 @@ fn nt_query_license_value(name: u64, type_pointer: u64, data: u64, data_size: u6
     crate::ntos::ex::license::values::query_user(name, type_pointer, data, data_size as u32, state::stack_arg(rsp, 5))
 }
 
+/// NtQueryDirectoryObject(DirectoryHandle, Buffer, Length,
+/// ReturnSingleEntry, RestartScan, Context*, ReturnLength*)
+/// (`ob/handles/namespace`).
+fn nt_query_directory_object(handle: u64, buffer: u64, length: u64, single: u64, rsp: u64) -> Result<u32, KernelError> {
+    let restart = state::stack_arg32(rsp, 5) & 0xFF != 0;
+    Ok(namespace_handles::query_directory_mode(handle, buffer, length as u32, single & 0xFF != 0, restart, stack_arg(rsp, 6), stack_arg(rsp, 7), true))
+}
+
 /// NtApphelpCacheControl(Service, ServiceData) (`ps/apphelp_cache`).
 fn nt_apphelp_cache_control(service: u64, data: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
     crate::ntos::ps::apphelp_cache::control(service as u32 as i32, data, 1)
 }
 
 pub fn init() {
-    let handlers: [(&'static str, state::SyscallHandler); 30] = [
+    let handlers: [(&'static str, state::SyscallHandler); 31] = [
+        ("NtQueryDirectoryObject", nt_query_directory_object),
         ("NtApphelpCacheControl", nt_apphelp_cache_control),
         ("NtQueryLicenseValue", nt_query_license_value),
         ("NtGetCurrentProcessorNumber", nt_get_current_processor_number),

@@ -294,80 +294,123 @@ pub fn make_temporary_object(handle: u64) -> Result<u32, KernelError> {
 /// textos UTF-16 no mesmo buffer, a partir do índice do contexto.
 #[allow(clippy::too_many_arguments)]
 pub fn query_directory(handle: u64, output_buffer: u64, length: u32, single_entry: bool, restart_scan: bool, context: u64, output_length: u64) -> u32 {
-    let item = match resolve(handle, false) {
+    query_directory_mode(handle, output_buffer, length, single_entry, restart_scan, context, output_length, false)
+}
+
+/// NtQueryDirectoryObject(DirectoryHandle, Buffer, Length, ReturnSingleEntry,
+/// RestartScan, Context*, ReturnLength*) (ntoskrnl 19041, rva 0x6da0a0). Em
+/// UserMode o Buffer passa pelo ProbeForWrite com alinhamento de WCHAR e o
+/// Context e o ReturnLength pela sonda de escrita de um ULONG; o Context é
+/// lido antes do handle (sem RestartScan). Length + 0x20 que estoura é
+/// STATUS_INVALID_PARAMETER; o handle precisa de DIRECTORY_QUERY num
+/// diretório.
+#[allow(clippy::too_many_arguments)]
+pub fn query_directory_mode(handle: u64, output_buffer: u64, length: u32, single_entry: bool, restart_scan: bool, context: u64, output_length: u64, from_user_mode: bool) -> u32 {
+    if from_user_mode {
+        if length != 0 && (output_buffer & 1 != 0) {
+            return 0x8000_0002;
+        }
+        if (length != 0 && !user_probe::probe_user_write(output_buffer, u64::from(length))) || !user_probe::probe_user_write(context, 4) || (output_length != 0 && !user_probe::probe_user_write(output_length, 4)) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+    } else if context == 0 {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    let start = if restart_scan {
+        0
+    } else {
+        match read_field::<u32>(context, 0) {
+            Ok(start) => start as usize,
+            Err(status) => return status,
+        }
+    };
+    if length.checked_add(ObjectDirectoryInformation::SIZE as u32).is_none() {
+        return 0xC000_000D;
+    }
+    let item = match resolve(handle, from_user_mode) {
         Ok(item) => item,
         Err(status) => return status,
     };
     if !item.directory {
         return STATUS_OBJECT_TYPE_MISMATCH;
     }
-    if context == 0 {
-        return STATUS_ACCESS_VIOLATION;
+    if from_user_mode && item.access & 1 == 0 {
+        return STATUS_ACCESS_DENIED;
     }
-    match query_directory_into(&item, output_buffer, length, single_entry, restart_scan, context, output_length) {
+    match query_directory_into(&item, output_buffer, length, single_entry, start, context, output_length) {
         Ok(status) | Err(status) => status,
     }
 }
 
-/// Descritores OBJECT_DIRECTORY_INFORMATION, terminador e textos no buffer
-/// do chamador; Context e ReturnLength sondados.
-#[allow(clippy::too_many_arguments)]
-fn query_directory_into(item: &Opened, output_buffer: u64, length: u32, single_entry: bool, restart_scan: bool, context: u64, output_length: u64) -> Result<u32, u32> {
-    let entry_size = ObjectDirectoryInformation::SIZE;
+/// A varredura do NtQueryDirectoryObject: a imagem de saída é montada num
+/// buffer zerado (descritores OBJECT_DIRECTORY_INFORMATION, o terminador
+/// vazio e os textos, com os ponteiros já no buffer do chamador) e os
+/// min(Length, total) primeiros bytes vão para o chamador; o ReturnLength
+/// recebe o total e o Context o índice seguinte, salvo nas falhas.
+/// - sem entradas a partir do índice: STATUS_NO_MORE_ENTRIES, total 0x20;
+/// - uma entrada que não cabe: com ReturnSingleEntry,
+///   STATUS_BUFFER_TOO_SMALL e o total que ela pediria; sem, a varredura
+///   para ali com STATUS_MORE_ENTRIES (mesmo sem nenhuma entrada copiada);
+/// - senão STATUS_SUCCESS.
+fn query_directory_into(item: &Opened, output_buffer: u64, length: u32, single_entry: bool, start: usize, context: u64, output_length: u64) -> Result<u32, u32> {
+    let entry_size = ObjectDirectoryInformation::SIZE as u32;
     // Ordem de inserção: os ids da arena são alocados na inserção.
     let mut children: Vec<(NodeId, String, String)> = object_manager::node(item.node)
         .and_then(|node| node.children)
         .map(|children| children.values().filter_map(|&child| object_manager::node(child).map(|node| (child, node.name, node.type_name))).collect())
         .unwrap_or_default();
     children.sort_by_key(|(id, _, _)| *id);
-    let start = if restart_scan { 0 } else { read_field::<u32>(context, 0)? as usize };
-    if start >= children.len() {
-        if output_length != 0 {
-            write_field::<u32>(output_length, 0, 0)?;
-        }
-        return Ok(0x8000_001A);
-    }
     let mut rows = Vec::new();
-    let mut required = entry_size as u32;
-    for child in &children[start..] {
-        let entry = entry_size as u32 + (child.1.encode_utf16().count() + child.2.encode_utf16().count() + 2) as u32 * 2;
-        if required + entry > length {
-            if rows.is_empty() {
-                if output_length != 0 {
-                    write_field::<u32>(output_length, 0, required + entry)?;
-                }
-                return Ok(0xC000_0023);
+    let mut total = entry_size;
+    let mut status = 0x8000_001A;
+    let mut next = start;
+    for child in children.iter().skip(start) {
+        let entry = entry_size + (child.1.encode_utf16().count() + child.2.encode_utf16().count() + 2) as u32 * 2;
+        if total + entry > length {
+            if single_entry {
+                status = 0xC000_0023;
+                total += entry;
+            } else {
+                status = 0x105;
             }
             break;
         }
         rows.push(child);
-        required += entry;
+        total += entry;
+        next += 1;
+        status = 0;
         if single_entry {
             break;
         }
     }
-    let mut strings = output_buffer + (rows.len() as u64 + 1) * entry_size;
-    // Descritores e terminador zerados numa cópia.
-    write_text(output_buffer, &vec![0u8; ((rows.len() as u64 + 1) * entry_size) as usize])?;
-    for (index, row) in rows.iter().enumerate() {
-        let descriptor = output_buffer + index as u64 * entry_size;
-        for (offset, text) in [(offset_of!(ObjectDirectoryInformation, name), &row.1), (offset_of!(ObjectDirectoryInformation, type_name), &row.2)] {
-            let unicode = descriptor + offset as u64;
-            let mut bytes = utf16_bytes(&text.encode_utf16().collect::<Vec<u16>>());
-            let text_length = bytes.len() as u64;
-            write_field::<u16>(unicode, offset_of!(UnicodeString, length), text_length as u16)?;
-            write_field::<u16>(unicode, offset_of!(UnicodeString, maximum_length), text_length as u16 + 2)?;
-            write_field::<u64>(unicode, offset_of!(UnicodeString, buffer), strings)?;
-            bytes.extend_from_slice(&[0, 0]);
-            write_text(strings, &bytes)?;
-            strings += text_length + 2;
+    if status == 0 && !single_entry && next < children.len() {
+        status = 0x105;
+    }
+    let mut image = vec![0u8; total as usize];
+    if status & 0x8000_0000 == 0 {
+        let mut strings = (rows.len() + 1) * entry_size as usize;
+        for (index, row) in rows.iter().enumerate() {
+            let descriptor = index * entry_size as usize;
+            for (offset, text) in [(offset_of!(ObjectDirectoryInformation, name), &row.1), (offset_of!(ObjectDirectoryInformation, type_name), &row.2)] {
+                let unicode = descriptor + offset;
+                let bytes = utf16_bytes(&text.encode_utf16().collect::<Vec<u16>>());
+                let text_length = bytes.len();
+                image[unicode + offset_of!(UnicodeString, length)..][..2].copy_from_slice(&(text_length as u16).to_le_bytes());
+                image[unicode + offset_of!(UnicodeString, maximum_length)..][..2].copy_from_slice(&(text_length as u16 + 2).to_le_bytes());
+                image[unicode + offset_of!(UnicodeString, buffer)..][..8].copy_from_slice(&(output_buffer + strings as u64).to_le_bytes());
+                image[strings..][..text_length].copy_from_slice(&bytes);
+                strings += text_length + 2;
+            }
         }
     }
-    write_field::<u32>(context, 0, (start + rows.len()) as u32)?;
+    write_text(output_buffer, &image[..total.min(length) as usize])?;
     if output_length != 0 {
-        write_field::<u32>(output_length, 0, required)?;
+        write_field::<u32>(output_length, 0, total)?;
     }
-    Ok(if !single_entry && start + rows.len() < children.len() { 0x105 } else { 0 })
+    if status & 0x8000_0000 == 0 {
+        write_field::<u32>(context, 0, next as u32)?;
+    }
+    Ok(status)
 }
 
 /// ObMakeTemporaryObject(Object) (ntoskrnl 0x6f6210): limpa OBJ_PERMANENT
