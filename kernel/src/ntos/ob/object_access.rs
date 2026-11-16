@@ -50,15 +50,20 @@ pub fn map_generic_access(mask: u32, object_type: &ObjectType) -> u32 {
 pub type AccessResult = Result<u32, u32>;
 
 /// Valida máscara, privilégios, DACL e integridade, mantendo os direitos
-/// explícitos separados de MAXIMUM_ALLOWED.
+/// explícitos separados de MAXIMUM_ALLOWED. Sem checagem (KernelMode), o
+/// acesso concedido é o pedido com os direitos fora do tipo descartados,
+/// como o ObpCreateHandle do 19041 o grava (GrantedAccess &=
+/// ValidAccessMask | ACCESS_SYSTEM_SECURITY): o win32k abre a Desktop
+/// Disconnect com 0x1F0003 (o SYNCHRONIZE fica de fora do 0xF01FF dela).
 pub fn check(policy: &SecurityPolicy, token: Option<u64>, requested: u32, object_type: &ObjectType, from_kernel_mode: bool) -> AccessResult {
     let mask = map_generic_access(requested, object_type);
     let explicit = mask & !0x0200_0000;
-    if explicit & !(object_type.valid_access | 0x0100_0000) != 0 {
-        return Err(0xC000_0022);
-    }
+    let valid = object_type.valid_access | 0x0100_0000;
     if from_kernel_mode {
-        return Ok(explicit | if mask & 0x0200_0000 != 0 { object_type.valid_access } else { 0 });
+        return Ok((explicit & valid) | if mask & 0x0200_0000 != 0 { object_type.valid_access } else { 0 });
+    }
+    if explicit & !valid != 0 {
+        return Err(0xC000_0022);
     }
     let Some(token) = token.and_then(tokens::get) else { return Err(0xC000_007C) };
     check_token(policy, &token, requested, object_type)
