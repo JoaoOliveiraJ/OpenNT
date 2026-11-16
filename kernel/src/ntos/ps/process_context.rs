@@ -11,9 +11,8 @@
 use super::process;
 use crate::ntos::ke::{apc, context_switch};
 use crate::rtl::KernelError;
-use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::inc::field::NtStruct;
-use crate::ntos::inc::types::{Ethread, KapcState};
+use crate::ntos::inc::types::Ethread;
 
 /// KAPC_STATE_INDEX: AttachedApcEnvironment.
 const ATTACHED_APC_ENVIRONMENT: u8 = 1;
@@ -31,7 +30,12 @@ pub fn with_process<T>(target: u64, body: impl FnOnce() -> T) -> Result<T, Kerne
     context_switch::require_loadable(target)?;
     let index = tcb.apc_state_index.get();
     let depth = apc::begin_attachment(thread, None, None)?;
-    guest::write_bytes(state.address(), &[0; KapcState::SIZE as usize]);
+    // O KiAttachProcess reinicia só os campos do KAPC_STATE: o resto dos 0x30
+    // bytes é o KTHREAD (Priority em +0xC3 e os campos seguintes dividem o
+    // espaço do padding do ApcState embutido).
+    state.in_progress_flags.set(0);
+    state.kernel_apc_pending.set(0);
+    state.user_apc_pending_all.set(0);
     for head in &state.apc_list_head {
         head.flink.set(head.address());
         head.blink.set(head.address());
