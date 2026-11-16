@@ -10,6 +10,11 @@
 //!   KeAttachProcess/KeDetachProcess fazem o mesmo;
 //! - a troca de thread corrente carrega a raiz do processo da nova thread e
 //!   a restauração volta à do System;
+//! - o PsCreateSystemThread com o ProcessHandle de um processo cria a thread
+//!   de modo kernel nele: ela roda com a raiz dele e lê a página do espaço
+//!   dele pela VA de usuário, o KTHREAD.Process é o processo e o handle
+//!   publicado é de kernel; um ProcessHandle inválido devolve
+//!   STATUS_INVALID_HANDLE sem criar a thread;
 //! - o delete de um espaço carregado é recusado sem mudar nada e passa
 //!   depois do detach.
 
@@ -102,6 +107,7 @@ pub fn run(assert: Assert) {
             stack_attach(assert, [a, b], [a_root, b_root], a_frame);
             legacy_attach(assert, b, b_root);
             current_thread(assert, a, a_root);
+            system_thread_in_process(assert, a);
         }
         for root in [a_root, b_root] {
             paging::unmap_page_in(root, USER_VA, MapOptions { skip_invalidate: true, ..MapOptions::default() });
@@ -172,6 +178,68 @@ fn current_thread(assert: Assert, a: u64, a_root: u64) {
     assert(loaded(SYSTEM_ROOT) && faults(), "attach-cr3: restaurar a thread anterior volta a raiz do System");
     let _ = process::release_thread(thread);
     assert(loaded(SYSTEM_ROOT), "attach-cr3: o termino da thread (rodado como ela) volta a raiz do System");
+}
+
+/// PsCreateSystemThread com o ProcessHandle de `a`: a thread de modo kernel
+/// roda no espaço de `a` (como a thread de apresentação que o cdd.dll cria no
+/// csrss da sessão) e lê a página dele pela VA de usuário.
+fn system_thread_in_process(assert: Assert, a: u64) {
+    use crate::ntos::inc::types::Kthread;
+    use crate::ntos::ob::object_manager;
+    use crate::ntos::ps::scheduler;
+    use crate::ntos::test::phase6::call_export;
+    const PROCESS_ALL_ACCESS: u32 = 0x1F_FFFF;
+    const MARK: u64 = 0x5A;
+    // [0] o valor lido em USER_VA, [8] a KPRCB.CurrentThread, [0x10] o fim,
+    // [0x18] o handle publicado.
+    let block = guest::alloc_bytes(0x20);
+    let code = crate::ntos::test::executable_code::reserve(0x40);
+    let process_handle = process::open_handle(a, PROCESS_ALL_ACCESS).unwrap_or(0);
+    if block == 0 || code == 0 || process_handle == 0 {
+        assert(false, "attach-cr3: bloco, codigo e handle do processo para o PsCreateSystemThread");
+        return;
+    }
+    guest::write_bytes(block, &[0; 0x20]);
+    // mov rax, [USER_VA]; mov [rcx], rax; mov rax, gs:[188h]; mov [rcx+8], rax;
+    // mov qword [rcx+10h], 5Ah; xor eax, eax; ret.
+    let mut routine = alloc::vec![0x48, 0xA1];
+    routine.extend_from_slice(&USER_VA.to_le_bytes());
+    routine.extend_from_slice(&[0x48, 0x89, 0x01, 0x65, 0x48, 0x8B, 0x04, 0x25, 0x88, 0x01, 0x00, 0x00, 0x48, 0x89, 0x41, 0x08, 0x48, 0xC7, 0x41, 0x10, MARK as u8, 0x00, 0x00, 0x00, 0x31, 0xC0, 0xC3]);
+    guest::write_bytes(code, &routine);
+    let invalid = call_export("PsCreateSystemThread", &[block + 0x18, 0x1F_FFFF, 0, 0x7FF0, 0, code, block]).map(|status| status as u32);
+    assert(invalid == Some(0xC000_0008) && guest::read64(block + 0x18) == 0, "attach-cr3: PsCreateSystemThread com ProcessHandle invalido devolve STATUS_INVALID_HANDLE");
+    let status = call_export("PsCreateSystemThread", &[block + 0x18, 0x1F_FFFF, 0, process_handle as u64, 0, code, block]).map(|status| status as u32);
+    let published = guest::read64(block + 0x18);
+    let _ = object_manager::close(process_handle);
+    if status != Some(0) || published == 0 {
+        assert(false, "attach-cr3: PsCreateSystemThread com o ProcessHandle do processo");
+        guest::free_bytes(block);
+        crate::ntos::test::executable_code::release(code);
+        return;
+    }
+    let _ = object_manager::close((published & 0x7FFF_FFFC) as u32);
+    let mut finished = false;
+    for _ in 0..256 {
+        if guest::read64(block + 0x10) == MARK {
+            finished = true;
+            break;
+        }
+        scheduler::tick(-1);
+    }
+    let thread = guest::read64(block + 8);
+    // SAFETY: a ETHREAD gravada pela thread do teste, viva até o ceifador;
+    // só lida quando a thread chegou ao fim da rotina.
+    let owner = if finished && thread != 0 { unsafe { Kthread::at(thread) }.process.get() } else { 0 };
+    assert(published >> 31 == 0x1_FFFF_FFFF, "attach-cr3: o handle da thread do PsCreateSystemThread e de kernel");
+    assert(finished && guest::read64(block) == A_VALUE + 1, "attach-cr3: a thread do PsCreateSystemThread no processo le a pagina do espaco dele pela VA de usuario");
+    assert(owner == a, "attach-cr3: o KTHREAD.Process da thread e o processo do ProcessHandle");
+    // A thread termina e o ceifador a recolhe antes do delete do espaço.
+    for _ in 0..64 {
+        scheduler::tick(-1);
+    }
+    assert(loaded(SYSTEM_ROOT), "attach-cr3: depois da thread no processo, a raiz do System volta");
+    guest::free_bytes(block);
+    crate::ntos::test::executable_code::release(code);
 }
 
 /// O delete de um espaço carregado é recusado sem mudar nada.

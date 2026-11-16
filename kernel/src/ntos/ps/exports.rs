@@ -13,8 +13,7 @@ use crate::rtl::KernelError;
 
 /// PsCreateSystemThread(handle*, access, oa, process, clientId*, start, context).
 fn create_system_thread(call: &Call) -> Result<u64, KernelError> {
-    kernel_threads::create_system_thread_with_attributes(call.arg(1), call.arg(2) as u32, call.arg(3), call.arg(5), call.arg(6), call.arg(7))?;
-    Ok(0)
+    Ok(kernel_threads::create_system_thread_with_attributes(call.arg(1), call.arg(2) as u32, call.arg(3), call.arg(4), call.arg(5), call.arg(6), call.arg(7))? as u64)
 }
 
 fn terminate_system_thread(call: &Call) -> Result<u64, KernelError> {

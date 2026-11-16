@@ -257,15 +257,18 @@ impl ObjectHooks for ThreadHooks {
     }
 }
 
-/// Opções do handle publicado: dono e atributos OBJ_* do chamador.
+/// Opções do handle publicado (dono e atributos OBJ_* do chamador) e o
+/// processo da thread (o System quando None).
 #[derive(Clone, Copy, Default)]
 pub struct HandleOptions {
     pub owner_process: Option<u64>,
     pub attributes: u32,
+    pub thread_process: Option<u64>,
 }
 
-/// PsCreateSystemThread: KTHREAD do System com pilha de kernel própria e a
-/// rotina inicial, posta no escalonador; devolve o handle publicado.
+/// PsCreateSystemThread: KTHREAD com pilha de kernel própria e a rotina
+/// inicial, posta no escalonador; devolve o handle publicado. A thread é do
+/// System, ou do processo de `HandleOptions::thread_process`.
 pub fn create_system_thread(output_handle: u64, start_routine: u64, context_pointer: u64, access: u32, client_id: u64, handle_options: Option<HandleOptions>) -> Result<u64, KernelError> {
     create_thread(output_handle, start_routine, context_pointer, access, client_id, handle_options, None)
 }
@@ -281,7 +284,11 @@ fn create_thread(output_handle: u64, start_routine: u64, context_pointer: u64, a
         // A pilha própria vai com a KTHREAD: o ceifador a devolve.
         let stack = kernel_stack::create_for_kernel_thread()?;
         let system = process::get_system_process();
-        let pointer = process::create_kernel_thread(system, id, true, 0, Some(stack))?;
+        // O processo da thread: o System, ou o do ProcessHandle do
+        // PsCreateSystemThread (uma thread de modo kernel no espaço de
+        // endereçamento dele, que vê a sessão dele).
+        let owner = handle_options.and_then(|options| options.thread_process).unwrap_or(system);
+        let pointer = process::create_kernel_thread(owner, id, true, 0, Some(stack))?;
         if pointer == 0 {
             return Err(KernelError::new("no thread object"));
         }
@@ -332,7 +339,7 @@ fn create_thread(output_handle: u64, start_routine: u64, context_pointer: u64, a
         process::notify_thread_created(pointer)?;
         let reaped = thread.clone();
         let body = thread.clone();
-        scheduler::spawn_into_process(&format!("kt-{id}"), system, pointer, Box::new(move || thread_body(body)), Some(Box::new(move || {
+        scheduler::spawn_into_process(&format!("kt-{id}"), owner, pointer, Box::new(move || thread_body(body)), Some(Box::new(move || {
             {
                 let mut thread = reaped.lock();
                 thread.terminated = true;
@@ -361,14 +368,37 @@ fn create_thread(output_handle: u64, start_routine: u64, context_pointer: u64, a
     result
 }
 
+/// OBJ_KERNEL_HANDLE.
+const OBJ_KERNEL_HANDLE: u32 = 0x200;
+/// PROCESS_CREATE_THREAD.
+const PROCESS_CREATE_THREAD: u32 = 0x2;
+
 /// PsCreateSystemThread(handle*, access, oa, process, clientId*, start,
-/// context) pelos OBJECT_ATTRIBUTES do chamador: OBJ_KERNEL_HANDLE escolhe a
-/// tabela do System; senão, a do processo corrente.
-pub fn create_system_thread_with_attributes(output_handle: u64, access: u32, object_attributes: u64, client_id: u64, start_routine: u64, context_pointer: u64) -> Result<u64, KernelError> {
+/// context), como o PsCreateSystemThreadEx do ntoskrnl 19041 (rva
+/// 0x6fd980): o handle é sempre de kernel (os atributos do chamador com
+/// OBJ_KERNEL_HANDLE ligado, ou só OBJ_KERNEL_HANDLE sem OBJECT_ATTRIBUTES).
+/// Sem ProcessHandle a thread é do System; com ele, o
+/// ObReferenceObjectByHandle(PROCESS_CREATE_THREAD, PsProcessType,
+/// KernelMode) escolhe o processo da thread (o cdd.dll cria assim a thread
+/// de apresentação no csrss da sessão, que vê o espaço de sessão), e a
+/// recusa dele é o status devolvido. Devolve o NTSTATUS.
+pub fn create_system_thread_with_attributes(output_handle: u64, access: u32, object_attributes: u64, process_handle: u64, client_id: u64, start_routine: u64, context_pointer: u64) -> Result<u32, KernelError> {
     // SAFETY: OBJECT_ATTRIBUTES do chamador de kernel (opcional).
-    let flags = if object_attributes != 0 { unsafe { ObjectAttributes::at(object_attributes) }.attributes.get() } else { 0 };
-    let owner = if flags & 0x200 != 0 { process::get_system_process() } else { process::get_current_process() };
-    create_system_thread(output_handle, start_routine, context_pointer, access, client_id, Some(HandleOptions { owner_process: Some(owner), attributes: flags }))
+    let flags = if object_attributes != 0 { unsafe { ObjectAttributes::at(object_attributes) }.attributes.get() } else { 0 } | OBJ_KERNEL_HANDLE;
+    let target = if process_handle != 0 {
+        match super::query_process::reference_process(process_handle, PROCESS_CREATE_THREAD)? {
+            Ok(target) => Some(target),
+            Err(status) => return Ok(status),
+        }
+    } else {
+        None
+    };
+    let options = HandleOptions { owner_process: Some(process::get_system_process()), attributes: flags, thread_process: target };
+    let result = create_system_thread(output_handle, start_routine, context_pointer, access, client_id, Some(options));
+    if let Some(target) = target {
+        super::query_process::release_process(target)?;
+    }
+    result.map(|_| 0)
 }
 
 /// PsTerminateSystemThread: a thread de sistema corrente termina de dentro
