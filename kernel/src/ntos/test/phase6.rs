@@ -13904,6 +13904,15 @@ fn se_logon_session_exports(assert: Assert) {
     assert(duplicated == Some(0) && pointer != 0 && set(copy, 3) == Some(0) && session() == before, "se-logon-session: sessao do token achada; so os tokens ligados a sessao mudam");
     let _ = tokens::update(pointer, |token| token.authentication_id = 0x7_0000_1234);
     assert(set(copy, 3) == Some(0xC000_005F), "se-logon-session: token sem sessao de logon = STATUS_NO_SUCH_LOGON_SESSION");
+    // Os comandos RmCreateLogonSession e RmDeleteLogonSession do LSA
+    // (SepCreateLogonSessionTrack e SepDeleteLogonSessionTrack).
+    let created = logon_session::create_track(0x7_0000_1234);
+    let collision = logon_session::create_track(0x7_0000_1234);
+    let in_use = logon_session::delete_track(0x7_0000_1234);
+    let linked = set(copy, 3);
+    let _ = tokens::update(pointer, |token| token.authentication_id = logon_session::SYSTEM_LUID);
+    let deleted = logon_session::delete_track(0x7_0000_1234);
+    assert(created == 0 && collision == 0xC000_00EE && in_use == 0xC000_0104 && linked == Some(0) && deleted == 0 && logon_session::delete_track(0x7_0000_1234) == 0xC000_005F && !logon_session::exists(0x7_0000_1234, 0), "se-logon-session: sessao criada pelo LSA (colisao), apagada so sem token que a use, depois inexistente");
     assert(set(0x7FFF_FFF8, 3) == Some(0xC000_0008), "se-logon-session: handle invalido");
     let _ = call_export("ZwClose", &[copy]);
     let _ = call_export("ZwClose", &[system_token]);
@@ -13919,6 +13928,18 @@ fn se_non_ob_audit_exports(assert: Assert) {
     let before = crate::ntos::se::audit::events().len();
     let alarm = |granted: u64, privileges: u64| call_export("SeOpenObjectAuditAlarmForNonObObject", &[subsystem, 0, type_name, object_name, 0, context, 3, 3, privileges, granted, generate]);
     assert(alarm(1, 0).is_some() && alarm(0, 0).is_some() && alarm(1, privileges).is_some() && guest::read8(generate) == 0x5A && crate::ntos::se::audit::events().len() == before, "se-non-ob-audit: politica de boot zerada nao gera evento nem toca GenerateOnClose");
+    // O RmAuditSetCommand do LSA (SepRmSetAuditEventWrkr): na categoria 0
+    // (5 subcategorias) todas com sucesso e uma com falha; na 1 (12) algumas
+    // com sucesso; na 2 nenhuma. O código de cada categoria: 1 todas, 2
+    // algumas, 4 nenhuma (sucesso no nibble baixo, falha no alto).
+    use crate::ntos::se::audit;
+    let mut policy = [0u16; audit::LSA_POLICY_SUBCATEGORIES];
+    policy[..5].copy_from_slice(&[1, 1, 3, 1, 1]);
+    policy[5] = 1;
+    audit::set_policy_from_lsa(&policy);
+    let pushed = (audit::category_policy(0), audit::category_policy(1), audit::category_policy(2));
+    audit::set_policy_from_lsa(&[0; audit::LSA_POLICY_SUBCATEGORIES]);
+    assert(pushed == (0x21, 0x42, 0x44) && audit::category_policy(0) == 0x44, "se-audit: politica do RmAuditSetCommand por categoria (todas, algumas, nenhuma)");
     call_export("SeReleaseSubjectContext", &[context]);
 }
 

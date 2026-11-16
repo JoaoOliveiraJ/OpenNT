@@ -70,10 +70,10 @@ pub fn fips_crypto_selftests(general: u32, causing: u32, extra: u32) {
 // - A política vive em `SeAuditingState` (rva 0xc1d5a0: 64 subcategorias a
 //   partir do id 100, um byte de sucesso e um de falha cada) e em
 //   `SeAuditingStateByCategory` (rva 0xc1d560: máscara por categoria, 0x03 =
-//   sucesso, 0x30 = falha). No NT o LSA empurra a política pelo
-//   `SeRmCommandPort`; o OpenNT não tem LSA nem esse comando, então a tabela
-//   fica no estado de boot anterior ao push — toda zerada — e os portões
-//   abaixo respondem como o NT responde nesse estado.
+//   sucesso, 0x30 = falha). O LSA empurra a política pelo RmAuditSetCommand
+//   da `SeRmCommandPort` ([`set_policy_from_lsa`]); antes disso a tabela fica
+//   no estado de boot, toda zerada, e os portões abaixo respondem como o NT
+//   responde nesse estado.
 // - A política por usuário (`SepTokenPolicyCounter*`) só é consultada quando
 //   algum token carrega política própria; os tokens do OpenNT não carregam,
 //   então os contadores são zero e esse ramo do NT nunca é tomado.
@@ -112,6 +112,40 @@ struct AuditPolicy {
 }
 
 static POLICY: SpinLock<AuditPolicy> = SpinLock::new(AuditPolicy { by_subcategory: [[false; 2]; SUBCATEGORY_COUNT], by_category: [0; CATEGORY_COUNT] });
+
+/// AdtpPerCategoryCount (ntoskrnl 19041 rva 0xd2d1a0): as subcategorias de
+/// cada uma das nove categorias, na ordem do SeAuditingState.
+const SUBCATEGORIES_PER_CATEGORY: [usize; 9] = [5, 12, 14, 3, 6, 6, 6, 4, 4];
+/// As palavras de política que o RmAuditSetCommand traz, uma por
+/// subcategoria.
+pub const LSA_POLICY_SUBCATEGORIES: usize = 60;
+
+/// SepRmSetAuditEventWrkr (rva 0x7c5270), o RmAuditSetCommand que o LSA manda
+/// pela `\SeRmCommandPort` (`se/reference_monitor.rs`): cada palavra liga o
+/// sucesso (bit 0) e a falha (bit 1) da subcategoria; cada categoria recebe
+/// o código de sucesso (1 todas, 2 algumas, 4 nenhuma) no nibble baixo e o de
+/// falha no alto.
+pub fn set_policy_from_lsa(policy: &[u16; LSA_POLICY_SUBCATEGORIES]) {
+    let code = |count: usize, total: usize| if count == 0 { 4 } else if count == total { 1 } else { 2 };
+    let mut state = POLICY.lock();
+    let mut index = 0;
+    for (category, &total) in SUBCATEGORIES_PER_CATEGORY.iter().enumerate() {
+        let (mut successes, mut failures) = (0, 0);
+        for flags in &policy[index..index + total] {
+            let entry = [flags & 1 != 0, flags & 2 != 0];
+            successes += entry[0] as usize;
+            failures += entry[1] as usize;
+            state.by_subcategory[index] = entry;
+            index += 1;
+        }
+        state.by_category[category] = code(successes, total) | code(failures, total) << 4;
+    }
+}
+
+/// O SeAuditingStateByCategory da categoria (0 fora da tabela).
+pub fn category_policy(category: usize) -> u32 {
+    POLICY.lock().by_category.get(category).copied().unwrap_or(0)
+}
 
 /// SepAuditingEnabledForSubcategory.
 fn enabled_for_subcategory(subcategory: u32, success: bool, failure: bool) -> bool {

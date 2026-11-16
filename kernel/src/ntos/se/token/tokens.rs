@@ -371,6 +371,11 @@ pub fn release(pointer: u64) -> Result<u64, KernelError> {
     Ok(remaining)
 }
 
+/// Algum token vivo satisfaz `predicate`.
+pub fn any(predicate: impl Fn(&Token) -> bool) -> bool {
+    TOKENS.lock().records.values().any(|token| predicate(token))
+}
+
 pub fn exists(pointer: u64) -> bool {
     TOKENS.lock().records.contains_key(&pointer)
 }

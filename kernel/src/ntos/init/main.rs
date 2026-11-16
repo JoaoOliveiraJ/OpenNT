@@ -199,6 +199,13 @@ pub fn kmain() -> ! {
         }
     }
 
+    // SeRmInitPhase1: a \SeRmCommandPort e a thread do servidor de comandos
+    // do Reference Monitor, antes do primeiro processo de usuário (o lsass.exe
+    // conecta nela ao iniciar).
+    if let Err(error) = crate::ntos::se::reference_monitor::initialize_phase1() {
+        debug_print!("[se] Reference Monitor nao iniciado: {}", error);
+    }
+
     // processos: serviço de teclado (IPC) + shell; no boot do processo
     // inicial real, o smss.exe no lugar do shell
     message_channels::create_channel("kbd");

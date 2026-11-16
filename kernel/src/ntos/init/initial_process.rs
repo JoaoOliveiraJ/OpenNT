@@ -307,3 +307,35 @@ pub fn win32k_requested(service_number: u32) {
         crate::ntos::init::exports::set_api_trace(true);
     }
 }
+
+static SERVICES_STARTED: AtomicBool = AtomicBool::new(false);
+static LSASS_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// A porta ALPC de servidor `name` foi criada pelo processo corrente
+/// (`alpc/server.rs`): o `SERVICES_STARTED` sai quando o services.exe
+/// publica a interface RPC do gerenciador de serviços (a
+/// `\RPC Control\ntsvcs` do RpcServerUseProtseqEp do ScEnableRpcInterface,
+/// depois do ScInitDatabase).
+pub fn server_port_created(name: &str) {
+    if !boot_config::smss_boot() || SERVICES_STARTED.load(Ordering::Acquire) || !name.eq_ignore_ascii_case("\\RPC Control\\ntsvcs") {
+        return;
+    }
+    if image_name(process::get_current_process()).eq_ignore_ascii_case("services.exe") && !SERVICES_STARTED.swap(true, Ordering::AcqRel) {
+        crate::debug_print!("[init] services.exe (pid {}): interface RPC do gerenciador de servicos em {}", process::get_current_process_id(), name);
+        crate::debug_print!("SERVICES_STARTED");
+    }
+}
+
+/// O Reference Monitor terminou a conexão com o LSA do processo
+/// `process_id` (`se/reference_monitor.rs`): o `LSASS_STARTED` sai quando
+/// ele é o lsass.exe, que passa do LsapRmInitializeServer.
+pub fn lsa_connected(process_id: u64) {
+    if !boot_config::smss_boot() || LSASS_STARTED.load(Ordering::Acquire) {
+        return;
+    }
+    let Some(entry) = process::list_active_processes().into_iter().find(|entry| entry.pid == process_id) else { return };
+    if image_name(entry.address).eq_ignore_ascii_case("lsass.exe") && !LSASS_STARTED.swap(true, Ordering::AcqRel) {
+        crate::debug_print!("[init] lsass.exe (pid {}): conectado ao Reference Monitor pela \\SeRmCommandPort e com a \\SeLsaCommandPort", process_id);
+        crate::debug_print!("LSASS_STARTED");
+    }
+}

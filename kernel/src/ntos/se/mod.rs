@@ -43,6 +43,7 @@ pub mod access_state;
 pub mod set_security;
 pub mod extension_hosts;
 pub mod logon_session;
+pub mod reference_monitor;
 pub mod sddl;
 pub mod system_dacls;
 pub mod signing_level;

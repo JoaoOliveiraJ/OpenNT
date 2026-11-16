@@ -94,3 +94,36 @@ const _: () = {
     assert!(core::mem::offset_of!(AuthzbasepSecurityAttributeValue, value) == 0x28);
     assert!(core::mem::offset_of!(AuthzbasepSecurityAttributeValue, name) == 0x30);
 };
+
+/// `RM_COMMAND_MESSAGE`: o comando que o LSA manda ao Reference Monitor pela
+/// `\SeRmCommandPort` (o layout que o SepRmCommandServerThread do ntoskrnl
+/// 19041 lê): o PORT_MESSAGE, o CommandNumber e os parâmetros. 0x200 bytes.
+#[repr(C)]
+pub struct RmCommandMessage {
+    pub message_header: PortMessage,
+    pub command_number: Field<u32>,
+    pub command_params: [Field<u8>; 0x1D4],
+}
+
+unsafe impl NtStruct for RmCommandMessage {}
+
+/// `RM_REPLY_MESSAGE`: a resposta do Reference Monitor, com o PORT_MESSAGE,
+/// o ReturnedStatus que o trabalhador do comando grava e o buffer de
+/// resposta. 0x200 bytes.
+#[repr(C)]
+pub struct RmReplyMessage {
+    pub message_header: PortMessage,
+    pub returned_status: Field<u32>,
+    pub reply_buffer: [Field<u8>; 0x1D4],
+}
+
+unsafe impl NtStruct for RmReplyMessage {}
+
+const _: () = {
+    assert!(core::mem::size_of::<RmCommandMessage>() == 0x200);
+    assert!(core::mem::offset_of!(RmCommandMessage, command_number) == 0x28);
+    assert!(core::mem::offset_of!(RmCommandMessage, command_params) == 0x2C);
+    assert!(core::mem::size_of::<RmReplyMessage>() == 0x200);
+    assert!(core::mem::offset_of!(RmReplyMessage, returned_status) == 0x28);
+    assert!(core::mem::offset_of!(RmReplyMessage, reply_buffer) == 0x2C);
+};

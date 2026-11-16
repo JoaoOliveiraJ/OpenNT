@@ -6,8 +6,10 @@
 //! (SeSystemAuthenticationId, 0x3E7) e ANONYMOUS (SeAnonymousAuthenticationId,
 //! 0x3E6), ambas no silo hospedeiro, sem token de sessão (o Token que o LSA
 //! liga pelo SepSetLogonSessionToken) e sem sessão irmã (BuddyLogonId, que o
-//! LSA liga pelo SepLinkLogonSessions). O OpenNT não tem LSA, então o banco
-//! fica nesse estado de boot.
+//! LSA liga pelo SepLinkLogonSessions). O LSA cria e apaga sessões pelos
+//! comandos RmCreateLogonSession e RmDeleteLogonSession da `SeRmCommandPort`
+//! (`se/reference_monitor.rs`, [`create_track`] e [`delete_track`]); o token
+//! de sessão e a sessão irmã ainda não são ligados.
 //!
 //! SeSetSessionIdTokenWithLinked (rva 0x91c8b0): referencia o token pelo
 //! handle (TOKEN_QUERY, no modo anterior), recusa um token já em uso como
@@ -24,6 +26,8 @@ use crate::rtl::{KernelError, SpinLock};
 
 const STATUS_TOKEN_ALREADY_IN_USE: u32 = 0xC000_012B;
 const STATUS_NO_SUCH_LOGON_SESSION: u32 = 0xC000_005F;
+const STATUS_LOGON_SESSION_COLLISION: u32 = 0xC000_00EE;
+const STATUS_BAD_LOGON_SESSION_STATE: u32 = 0xC000_0104;
 const TOKEN_QUERY: u32 = 0x8;
 
 /// SeSystemAuthenticationId e SeAnonymousAuthenticationId.
@@ -44,19 +48,49 @@ struct LogonSession {
 static SESSIONS: SpinLock<Vec<LogonSession>> = SpinLock::new(Vec::new());
 
 /// SepRmDbInitialization: as sessões de boot, criadas na primeira consulta.
-fn with_sessions<T>(body: impl FnOnce(&[LogonSession]) -> T) -> T {
+fn with_sessions<T>(body: impl FnOnce(&mut Vec<LogonSession>) -> T) -> T {
     let mut sessions = SESSIONS.lock();
     if sessions.is_empty() {
         for logon_id in [SYSTEM_LUID, ANONYMOUS_LUID] {
             sessions.push(LogonSession { logon_id, server_silo: 0, token: 0, buddy_logon_id: 0 });
         }
     }
-    body(&sessions)
+    body(&mut sessions)
 }
 
 /// SepReferenceLogonSessionSilo: a sessão do LogonId no silo.
 fn find(logon_id: u64, server_silo: u64) -> Option<LogonSession> {
     with_sessions(|sessions| sessions.iter().copied().find(|session| session.logon_id == logon_id && session.server_silo == server_silo))
+}
+
+/// SepCreateLogonSessionTrack (rva 0x6850ac), o RmCreateLogonSession do LSA
+/// (`se/reference_monitor.rs`): a sessão nova no silo hospedeiro (o OpenNT não
+/// cria silos de servidor), sem token de sessão nem irmã;
+/// STATUS_LOGON_SESSION_COLLISION se o LogonId já existe. Devolve o NTSTATUS.
+pub fn create_track(logon_id: u64) -> u32 {
+    with_sessions(|sessions| {
+        if sessions.iter().any(|session| session.logon_id == logon_id && session.server_silo == 0) {
+            return STATUS_LOGON_SESSION_COLLISION;
+        }
+        sessions.push(LogonSession { logon_id, server_silo: 0, token: 0, buddy_logon_id: 0 });
+        0
+    })
+}
+
+/// SepDeleteLogonSessionTrack (rva 0x77a490) sem a revogação de handles, o
+/// RmDeleteLogonSession do LSA: STATUS_NO_SUCH_LOGON_SESSION se a sessão não
+/// existe no silo e STATUS_BAD_LOGON_SESSION_STATE enquanto algum token dela
+/// existe (no NT, o ReferenceCount acima da referência da própria sessão).
+/// Devolve o NTSTATUS.
+pub fn delete_track(logon_id: u64) -> u32 {
+    with_sessions(|sessions| {
+        let Some(position) = sessions.iter().position(|session| session.logon_id == logon_id && session.server_silo == 0) else { return STATUS_NO_SUCH_LOGON_SESSION };
+        if tokens::any(|token| token.authentication_id == logon_id && token.server_silo == 0) {
+            return STATUS_BAD_LOGON_SESSION_STATE;
+        }
+        sessions.remove(position);
+        0
+    })
 }
 
 /// A sessão de logon existe no silo (a consulta do SepReferenceLogonSession).

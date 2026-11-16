@@ -983,6 +983,9 @@ fn create_listener(out: u64, attributes: u64, name: Option<String>, initial: Por
         }
         port.set_started(true);
         crate::debug_print!("[alpc] porta de servidor {} criada pelo pid {} (modo {})", name.as_deref().unwrap_or("(sem nome)"), port.process_id(), mode);
+        if let Some(name) = &name {
+            crate::ntos::init::initial_process::server_port_created(name);
+        }
         Ok(STATUS_SUCCESS)
     });
     if !matches!(result, Ok(STATUS_SUCCESS)) {
