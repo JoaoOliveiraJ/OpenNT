@@ -126,6 +126,26 @@ fn ob_object_support(assert: Assert) {
     let unnamed = status(call_export("ObCreateObject", &[0, desktop, 0, 0, 0, 0x40, 0, 0, unnamed_out]));
     let unnamed_object = guest::read64(unnamed_out);
     assert(named && unnamed == 0 && call_export("ObQueryNameInfo", &[unnamed_object]) == Some(0), "ob: ObQueryNameInfo devolve o OBJECT_HEADER_NAME_INFO do objeto com nome (so o componente final) e NULL sem nome");
+    // ObQueryNameString de um objeto com nome fora de qualquer diretório (a
+    // Desktop que a ParseProcedure da WindowStation cria, cujo nome o
+    // GetDesktopName do win32k termina em NUL): `\` mais o Name do NameInfo;
+    // sem nome, o UNICODE_STRING vazio com Buffer NULL.
+    let loose_attributes = object_attributes(block + 0x600, "SuporteDesktopSolto", 0x200);
+    let (loose_out, name_buffer, name_length) = (block + 0x800, block + 0x900, block + 0xA00);
+    let loose = status(call_export("ObCreateObject", &[0, desktop, loose_attributes, 0, 0, 0x40, 0, 0, loose_out])) == 0;
+    let loose_object = guest::read64(loose_out);
+    let loose_name = loose && status(call_export("ObQueryNameString", &[loose_object, name_buffer, 0x100, name_length])) == 0 && {
+        let name = at::<nt::ObjectNameInformation>(name_buffer);
+        name.name.buffer.get() == name_buffer + nt::ObjectNameInformation::SIZE && crate::ntos::rtl::guest_strings::read_unicode_string(name.name.address()) == "\\SuporteDesktopSolto"
+    };
+    let unnamed_name = status(call_export("ObQueryNameString", &[unnamed_object, name_buffer, 0x100, name_length])) == 0 && {
+        let name = at::<nt::ObjectNameInformation>(name_buffer);
+        name.name.length.get() == 0 && name.name.buffer.get() == 0
+    };
+    assert(loose_name && unnamed_name, "ob: ObQueryNameString de um objeto com nome fora do namespace devolve \\Nome, e o de um sem nome o UNICODE_STRING vazio");
+    if loose {
+        let _ = call_export("ObDeleteCapturedInsertInfo", &[loose_object]);
+    }
     let _ = call_export("ObDeleteCapturedInsertInfo", &[unnamed_object]);
 
     // ObAssignSecurity: o descritor atribuído vira o do objeto.

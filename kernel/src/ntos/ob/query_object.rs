@@ -336,6 +336,50 @@ fn find_path_by_native_pointer(pointer: u64) -> Option<String> {
     crate::ntos::ob::open_pointer::namespace_path_of(pointer)
 }
 
+/// O nome de um objeto com OBJECT_HEADER, como o ObQueryNameString do NT o
+/// monta: o caminho do namespace; fora dele, o Name do NameInfo precedido
+/// dos nomes da cadeia NameInfo.Directory até a raiz ou até um diretório
+/// sem diretório pai. Uma Desktop do win32k (nomeada pela ParseProcedure da
+/// WindowStation, fora de qualquer diretório) sai como `\Default`. Sem
+/// NameInfo com nome, `None` (o UNICODE_STRING vazio).
+fn header_name_path(pointer: u64) -> Option<String> {
+    use crate::ntos::inc::types::ObjectHeaderNameInfo;
+    use crate::ntos::ob::object_header;
+    let path_of = |body: u64| object_header::name_node(body).and_then(object_manager::path_of);
+    if let Some(path) = path_of(pointer) {
+        return Some(path);
+    }
+    let directory_of = |body: u64| {
+        let info = object_header::name_info(body);
+        // SAFETY: NameInfo vivo no cabeçalho do objeto referenciado.
+        if info == 0 { 0 } else { unsafe { ObjectHeaderNameInfo::at(info) }.directory.get() }
+    };
+    let mut parts = alloc::vec![object_header::name(pointer).filter(|name| !name.is_empty())?];
+    let mut prefix = String::new();
+    let mut directory = directory_of(pointer);
+    // Limite de profundidade contra uma cadeia corrompida.
+    for _ in 0..64 {
+        if directory == 0 {
+            break;
+        }
+        if let Some(path) = path_of(directory) {
+            prefix = if path == "\\" { String::new() } else { path };
+            break;
+        }
+        match object_header::name(directory).filter(|name| !name.is_empty()) {
+            Some(name) => parts.push(name),
+            None => break,
+        }
+        directory = directory_of(directory);
+    }
+    let mut path = prefix;
+    for part in parts.iter().rev() {
+        path.push('\\');
+        path.push_str(part);
+    }
+    Some(path)
+}
+
 /// ObQueryNameString: o caminho completo do objeto (callbacks pelo nome
 /// próprio). Como no NT, o OBJECT_NAME_INFORMATION é montado no buffer com
 /// Name.Buffer logo depois da estrutura, e ReturnLength conta a estrutura,
@@ -349,8 +393,7 @@ pub fn query_name_string(pointer: u64, output: u64, size: u32, returned: u64) ->
         if let Some(status) = crate::ntos::ob::type_procedures::query_name(object_type, pointer, has_name, output, size, returned, 0) {
             return status;
         }
-        let path = crate::ntos::ob::object_header::name_node(pointer).and_then(crate::ntos::ob::object_manager::path_of);
-        return write_name_information(path.as_deref(), output, size, returned);
+        return write_name_information(header_name_path(pointer).as_deref(), output, size, returned);
     }
     if callbacks::exists(pointer) {
         return write_name_information(callbacks::name(pointer).as_deref(), output, size, returned);
