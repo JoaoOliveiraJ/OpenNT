@@ -733,9 +733,15 @@ pub fn report_detected_device(driver: u64, _bus_type: u32, _bus_number: u32, _sl
     }
     let device_id = format!("ROOT\\{}", service.to_uppercase());
     io_manager::register_device(node, io_manager::DeviceEntry { native_device: pdo, resources: list, pdo: true, hardware_ids: Some(alloc::vec![device_id.clone()]), stack_enumerated: true, pnp_started: true, ..Default::default() });
-    // Com a árvore de dispositivos montada, o PDO relatado vira um devnode
-    // filho da raiz, já iniciado, na instância ROOT\<serviço>\NNNN com o
-    // serviço do driver (o que o IoReportDetectedDevice grava em Enum).
+    // O PDO relatado vira na hora um devnode filho da raiz, já iniciado, na
+    // instância ROOT\<serviço>\NNNN com o serviço do driver (o que o
+    // IoReportDetectedDevice grava em Enum). No NT o nó raiz existe desde o
+    // IoInitSystem: um driver de boot que relata o seu dispositivo no
+    // DriverEntry (o volmgr.sys) antes da árvore do boot também o encontra,
+    // e o IoRegisterDeviceInterface do AddDevice dele acha a instância.
+    if devnode::root() == 0 && tree::initialize().is_err() {
+        debug_print!("[pnp] IoReportDetectedDevice sem a raiz do PnP");
+    }
     if devnode::root() != 0 {
         let instance_path = format!("{device_id}\\{instance:04}");
         let mut detected = devnode::DeviceNode::new(pdo, devnode::root(), 1);

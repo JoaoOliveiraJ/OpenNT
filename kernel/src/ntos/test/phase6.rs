@@ -12338,6 +12338,13 @@ fn io_pnp_device_exports(assert: Assert) {
         "io-pnp-device: IoReportDetectedDevice cria o PDO raiz do PnpManager",
     );
     assert(call_export("IoReportDetectedDevice", &[driver_address, 0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFFF, 0, 0, 1, output]) == Some(0) && pdo_cell.get() == pdo, "io-pnp-device: PDO ja relatado reaproveitado");
+    // O PDO relatado é na hora um devnode iniciado, filho da raiz do PnP
+    // (que existe desde o boot, como o IopRootDeviceNode).
+    {
+        use crate::ntos::io::pnp::devnode;
+        let reported_node = devnode::get(pdo).is_some_and(|node| node.parent == devnode::root() && devnode::root() != 0 && node.state == devnode::State::Started && node.instance_path.starts_with("ROOT\\OPENNTDETECT\\") && node.service.as_deref() == Some("OpenNtDetect"));
+        assert(reported_node, "io-pnp-device: PDO relatado vira devnode filho da raiz");
+    }
 
     // QUERY_ID(BusQueryDeviceID) e QUERY_DEVICE_RELATIONS(TargetDeviceRelation) pelo PDO.
     let send = |minor: u8, parameter: i32| {
