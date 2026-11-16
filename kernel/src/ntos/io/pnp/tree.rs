@@ -533,7 +533,9 @@ fn start_device_node(pdo: u64) -> Result<(), KernelError> {
                     (Some(raw), Some(translated))
                 }
                 None => {
-                    debug_print!("[pnp] {}: conflito de recursos", node.instance_path);
+                    // Cada lista alternativa: (tipo, flags, mínimo, máximo, tamanho) de cada opção.
+                    let wanted: Vec<Vec<Vec<(u8, u16, u64, u64, u32)>>> = requirements.alternatives.iter().map(|alternative| alternative.iter().map(|options| options.iter().map(|choice| (choice.resource_type, choice.flags, choice.minimum, choice.maximum, choice.length)).collect()).collect()).collect();
+                    debug_print!("[pnp] {}: conflito de recursos (requisitos {:x?})", node.instance_path, wanted);
                     devnode::update(pdo, |node| {
                         node.state = State::Failed;
                         node.problem = problem::NORMAL_CONFLICT;
