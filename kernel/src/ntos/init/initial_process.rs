@@ -220,7 +220,7 @@ static WINSTA0_OK: AtomicBool = AtomicBool::new(false);
 /// o `WINSTA0_OK` sai quando o wininit.exe tem as Desktops Winlogon e
 /// Default da WinSta0, como as que ele cria na partida da sessão 0.
 pub fn desktop_opened(window_station: &str, desktop: &str) {
-    if !boot_config::SMSS_BOOT || WINSTA0_OK.load(Ordering::Acquire) {
+    if !boot_config::smss_boot() || WINSTA0_OK.load(Ordering::Acquire) {
         return;
     }
     let name = image_name(process::get_current_process());

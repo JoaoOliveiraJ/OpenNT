@@ -179,7 +179,7 @@ fn open_through_parse(attributes_pointer: u64, object_type: u64, mode: u8, acces
 /// WindowStation (o componente final do NameInfo) e o da Desktop.
 fn observe_parsed(parse_object: u64, remaining: &[u16], found: u64) {
     use crate::ntos::inc::types::ObjectHeaderNameInfo;
-    if !crate::ntos::init::boot_config::SMSS_BOOT || object_header::object_type(found) != Some(crate::ntos::mm::kernel_data::read("ExDesktopObjectType")) {
+    if !crate::ntos::init::boot_config::smss_boot() || object_header::object_type(found) != Some(crate::ntos::mm::kernel_data::read("ExDesktopObjectType")) {
         return;
     }
     let info = object_header::name_info(parse_object);
