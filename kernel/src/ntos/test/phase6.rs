@@ -12398,6 +12398,45 @@ fn io_interrupt_state_exports(assert: Assert) {
     assert(!interrupt_object::interrupt_reported_inactive(object) && !interrupt_object::interrupt_reported_inactive(second), "io-interrupt-state: MESSAGE_BASED reativa todas as mensagens");
 }
 
+/// O IRP_MJ_CREATE de uma abertura por nome leva a thread que abre em
+/// Irp->Tail.Overlay.Thread, como o IopParseDevice: o despacho nativo devolve
+/// em IoStatus.Information o ponteiro que achou no IRP.
+fn io_create_thread(assert: Assert) {
+    use crate::ntos::io::{io_manager, lifecycle};
+    use crate::drivers::fs::memory_file_system;
+    // push rbx; sub rsp,0x20; mov rbx,rdx; mov dword [rbx+0x30],0 (Status);
+    // mov rax,[rbx+0x98] (Tail.Overlay.Thread); mov [rbx+0x38],rax
+    // (Information); IofCompleteRequest(irp, 0) pela IAT; xor eax,eax; ret.
+    let mut image = ntoskrnl_importer(b"IofCompleteRequest\0");
+    let displacement = (0x4200u32 - (0x1300 + 0x25)).to_le_bytes();
+    let mut dispatch = alloc::vec![0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x89, 0xD3, 0xC7, 0x43, 0x30, 0, 0, 0, 0, 0x48, 0x8B, 0x83, 0x98, 0, 0, 0, 0x48, 0x89, 0x43, 0x38, 0x48, 0x89, 0xD9, 0x31, 0xD2, 0xFF, 0x15];
+    dispatch.extend_from_slice(&displacement);
+    dispatch.extend_from_slice(&[0x31, 0xC0, 0x48, 0x83, 0xC4, 0x20, 0x5B, 0xC3]);
+    image[0x1300..0x1300 + dispatch.len()].copy_from_slice(&dispatch);
+    image[0x1340..0x1343].copy_from_slice(&[0x31, 0xC0, 0xC3]);
+    put32(&mut image, 0x58 + 16, 0x1340);
+    let _ = memory_file_system::write_bytes("/opennt-createthread.sys", image);
+    let loaded = lifecycle::load_driver("/opennt-createthread.sys", &lifecycle::DriverOptions::default());
+    let driver = crate::ntos::ob::object_manager::lookup("\\Driver\\opennt-createthread").and_then(crate::ntos::ob::object_manager::node).and_then(|node| node.data).map_or(0, |data| data.native_pointer);
+    if loaded.is_err() || driver == 0 {
+        assert(false, "create-thread: driver nativo carregado");
+        return;
+    }
+    let driver_object = at::<nt::DriverObject>(driver);
+    driver_object.major_function[0].set(driver_object.driver_start.get() + 0x1300);
+    let kernel = guest::alloc_bytes(0x200);
+    let name = unicode_at(kernel, "\\Device\\OpenNtCreateThread");
+    let _ = call_export("IoCreateDevice", &[driver, 0, name, 0x22, 0, 0, kernel + 0x100]);
+    let device = guest::read64(kernel + 0x100);
+    let flags = &at::<nt::DeviceObject>(device).flags;
+    flags.set(flags.get() & !0x80);
+    let thread = crate::ntos::ps::process::get_current_thread();
+    let opened = io_manager::open_device("\\Device\\OpenNtCreateThread", false);
+    let information = opened.as_ref().map_or(0, |opened| opened.information);
+    assert(opened.is_ok_and(|opened| opened.status == 0) && thread != 0 && information == thread, "create-thread: Tail.Overlay.Thread do IRP_MJ_CREATE e a thread corrente");
+    guest::free_bytes(kernel);
+}
+
 /// Interrupções por mensagem de ponta a ponta sem o dispositivo: a
 /// arbitragem e a tradução do PnP manager (vetores da HAL, a lista bruta com
 /// o MessageCount e os dados de conexão InterruptTypeMessageRequest), a rota
@@ -15271,6 +15310,7 @@ pub fn run(assert: Assert) {
     io_boot_disk_exports(assert);
     io_driver_notification_exports(assert);
     io_interrupt_state_exports(assert);
+    io_create_thread(assert);
     io_message_interrupt_exports(assert);
     io_pnp_device_exports(assert);
     io_wdm_headless_exports(assert);

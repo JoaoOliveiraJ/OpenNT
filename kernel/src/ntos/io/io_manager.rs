@@ -985,8 +985,8 @@ fn file_object_flags(create: &CreateParameters) -> u32 {
 
 /// A abertura de `name` (o resto do caminho depois do dispositivo, vazio
 /// para o próprio dispositivo) no dispositivo `path`: o FILE_OBJECT com o
-/// nome e, com `create`, o IRP_MJ_CREATE com o contexto de segurança e as
-/// opções (o IopParseDevice). O Information do IRP (FILE_OPENED,
+/// nome e o IRP_MJ_CREATE com a thread que abre e, com `create`, o contexto
+/// de segurança e as opções (o IopParseDevice). O Information do IRP (FILE_OPENED,
 /// FILE_CREATED...) volta em `Opened::information`.
 pub fn open_device_file(path: &str, name: &str, create: Option<CreateParameters>, external_handles: bool) -> Result<Opened, KernelError> {
     open_file_object(path, name, 0, create, external_handles, false)
@@ -1026,10 +1026,11 @@ fn open_file_object(path: &str, name: &str, related_file_object: u64, create: Op
     }
     let major = create.as_ref().map_or(irp_mj::CREATE, CreateParameters::major);
     let user_mode = create.as_ref().is_some_and(|create| create.user_mode);
-    let mut parameters = IoParams { create, requestor_mode: user_mode as u8, ..IoParams::default() };
-    if user_mode || parse {
-        parameters.thread = process::get_current_thread();
-    }
+    // Como no IopParseDevice, o IRP_MJ_CREATE leva sempre a thread que abre
+    // (Irp->Tail.Overlay.Thread): o IoGetRequestorSessionId e o
+    // IoGetRequestorProcess dos drivers (o hidclass.sys recusa a abertura de
+    // uma coleção sem a sessão de quem pede) leem dela.
+    let mut parameters = IoParams { create, requestor_mode: user_mode as u8, thread: process::get_current_thread(), ..IoParams::default() };
     if parse {
         dispatcher::initialize_event(event, 0, false);
         parameters.user_event = event;
