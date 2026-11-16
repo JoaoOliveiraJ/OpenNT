@@ -189,6 +189,13 @@ comando = "cargo xtask test-boot PHASE6_SELFTEST_OK 900000 --kernel-test-scope=a
 descricao = "Dentro da fase 7: um servidor e um cliente de modo usuário, programas gerados pelo próprio teste que fazem as chamadas de sistema do Windows, conversam pelos npfs.sys e msfs.sys reais, iniciados no boot. O servidor cria um pipe de mensagens, um de bytes e um mailslot e bloqueia no FSCTL_PIPE_LISTEN; o cliente espera o pipe (FSCTL_PIPE_WAIT), conecta e faz um FSCTL_PIPE_TRANSCEIVE; o servidor confere a conexão (FilePipeLocalInformation), espera a mensagem pelo FSCTL_PIPE_PEEK, lê, consulta o PID do cliente (o atributo de conexão ClientProcessId, pelo FSCTL_PIPE_GET_CONNECTION_ATTRIBUTE, como o GetNamedPipeClientProcessId) e responde; no pipe de bytes o cliente escreve e lê de forma assíncrona, esperando o evento que a conclusão vinda do outro processo sinaliza; o cliente escreve no mailslot e o servidor lê; o servidor desconecta e os dois saem com os próprios códigos. As esperas entre os processos bloqueiam de verdade. O PIPES_OK sai só se tudo isso passar."
 
 [[teste]]
+id = "lpc"
+titulo = "Portas LPC entre processos"
+marcador = "LPC_PORTS_OK"
+comando = "cargo xtask test-boot PHASE6_SELFTEST_OK 900000 --kernel-test-scope=all --build-dir=build/lpc --smp=1 --expect=LPC_PORTS_OK --expect=PHASE7_SELFTEST_OK"
+descricao = "Dentro da fase 7: um servidor e um cliente de modo usuário, programas gerados pelo próprio teste, conversam pelas portas LPC do Windows, que no kernel são portas ALPC no modo LPC. O servidor cria a porta (NtCreatePort; o MaxMessageLength acima do limite e o nome repetido são recusados) e espera a conexão (NtListenPort). O cliente conecta (NtConnectPort) com uma seção de 64 KB como vista de transferência e 8 bytes de informação de conexão; o servidor confere a mensagem de conexão (o PID do cliente e o tamanho da vista), aceita com o seu PortContext e a resposta (NtAcceptConnectPort, NtCompleteConnectPort) e recebe a vista do cliente mapeada no próprio espaço. O cliente escreve um marcador na vista e faz dois pedidos síncronos (NtRequestWaitReplyPort, o segundo reaproveitando o buffer da resposta, como o CsrClientCallServer) e um datagrama (NtRequestPort); o servidor recebe cada um (NtReplyWaitReceivePort, com o PortContext e o CLIENT_ID), lê o marcador pela vista dele, impersona o cliente (NtImpersonateClientOfPort), consulta a porta (NtQueryInformationPort), responde (NtReplyPort; a segunda resposta ao mesmo pedido é recusada) e recebe o aviso de fechamento quando o cliente fecha a porta. Os dois saem com os próprios códigos e o nome da porta sai do namespace. O LPC_PORTS_OK sai só se tudo isso passar."
+
+[[teste]]
 id = "shell"
 titulo = "Teste do shell"
 marcador = "[shell] pronto"

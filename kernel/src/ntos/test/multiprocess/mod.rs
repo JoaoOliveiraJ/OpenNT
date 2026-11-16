@@ -30,5 +30,6 @@ pub mod queue_wait;
 pub mod process_tables;
 pub mod heap_nx;
 pub mod pipes;
+pub mod lpc_ports;
 pub mod jobs;
 pub mod native_interleave;

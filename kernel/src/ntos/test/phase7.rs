@@ -5085,6 +5085,7 @@ pub fn run(assert: Assert) {
     crate::ntos::test::executive_support::run_user(assert);
     crate::ntos::test::multiprocess::process_queries::run(assert);
     crate::ntos::test::multiprocess::pipes::run(assert);
+    crate::ntos::test::multiprocess::lpc_ports::run(assert);
     crate::ntos::test::multiprocess::jobs::run(assert);
     crate::ntos::test::object_header::run_user(assert);
     crate::ntos::test::user_half::run(assert);
