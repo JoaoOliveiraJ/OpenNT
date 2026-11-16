@@ -837,6 +837,13 @@ fn trace_details(name: &str, call: &Call) {
                 debug_print!("[api]   rotina: {}", text);
             }
         }
+        // A thread que espera ou sinaliza e, numa espera múltipla, cada
+        // objeto com o SignalState do DISPATCHER_HEADER.
+        "KeWaitForMultipleObjects" | "KeWaitForSingleObject" | "KeSetEvent" | "KePulseEvent" => {
+            let objects: alloc::vec::Vec<u64> = if name == "KeWaitForMultipleObjects" { (0..call.arg(1).min(64)).map(|index| guest::try_read::<u64>(call.arg(2) + index * 8).unwrap_or(0)).collect() } else { alloc::vec![call.arg(1)] };
+            let states: alloc::vec::Vec<alloc::string::String> = objects.iter().map(|&object| alloc::format!("{object:#x}={}", guest::try_read::<i32>(object + 4).map_or(-1, |state| state))).collect();
+            debug_print!("[api]   tid {} objetos {}", crate::ntos::ps::process::get_current_thread_id(), states.join(" "));
+        }
         "ZwQueryValueKey" | "ZwSetValueKey" | "ZwDeleteValueKey" => {
             if let Some(text) = unicode(call.arg(2)) {
                 debug_print!("[api]   valor: {}", text);
