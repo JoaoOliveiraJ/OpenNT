@@ -1150,21 +1150,50 @@ A árvore de dispositivos do NT mora em `ntos/io/pnp/`:
   AddDevice (LowerFilters da instância e da classe, serviço, UpperFilters);
   FILTER_RESOURCE_REQUIREMENTS, arbitragem e tradução; START_DEVICE com as
   duas listas; QUERY_CAPABILITIES e QUERY_PNP_DEVICE_STATE; enumeração. O
+  PnP marca cada PDO que um barramento relata com DO_BUS_ENUMERATED_DEVICE.
+  Um nó instalado com o driver nulo (classe sem serviço, as seções NO_DRV
+  do machine.inf) inicia cru, só com o PDO, se o barramento o declara
+  RawDeviceOK (a ponte de host do pci.sys, os PNP0A06, o PNP0B00, o
+  ACPI0010 e o botão de função fixa do acpi.sys), e fica sem iniciar, sem
+  problema, se não (o HPET), como o PipCallDriverAddDevice. O
   IoInvalidateDeviceRelations de um nó da árvore enfileira a reenumeração.
 - `install.rs`: as linhas de modelo dos INFs da caixa que atendem o
   hardware emulado (mshdc.inf, disk.inf, volume.inf, volmgr.inf, o
   display.inf com o BasicDisplay.sys para PCI\CC_0300 e o machine.inf com
-  o msisadrv.sys para PCI\CC_0601), com o serviço, a classe, os AddReg e
-  o ExcludeID de cada seção. O posto segue o instalador (HardwareIDs antes
+  o msisadrv.sys para PCI\CC_0601 e o driver nulo das seções NO_DRV), com
+  o serviço, a classe, os AddReg e o ExcludeID de cada seção. O posto segue o instalador (HardwareIDs antes
   de CompatibleIDs): PCI\VEN_8086&DEV_7010 instala o intelide.sys antes do
   pciide.sys de PCI\CC_0101. O ServiceBinary de um driver do repositório
   de drivers (`%13%`, como o BasicDisplay.sys) vai inteiro para o
   ImagePath (`\SystemRoot\System32\DriverStore\FileRepository\...`),
   que o carregador resolve sob o `\Windows` do volume do kernel
   (`\Device\KernelVolume1\Windows`, o destino de `\SystemRoot`).
-- `resources.rs`: as listas do NT, os árbitros (primeira opção livre,
-  alternativas, compartilhamento) e o tradutor da HAL (IRQ de linha `n` →
-  vetor `0x20 + n`, IRQL `n`).
+- `arbiter.rs`: os árbitros e tradutores dos drivers de barramento, como o
+  IopSetupArbiterAndTranslators. Para cada requisito, o PnP sobe a árvore
+  perguntando a cada ancestral pelo árbitro do tipo (IRP_MN_QUERY_INTERFACE,
+  GUID_ARBITER_INTERFACE_STANDARD, Size 0x30, o tipo no
+  InterfaceSpecificData; um árbitro ARBITER_PARTIAL, como os do pci.sys,
+  responde ao ArbiterActionQueryArbitrate se o pedido cabe nas janelas da
+  ponte) e, a partir do próprio nó, pelo tradutor
+  (GUID_TRANSLATOR_INTERFACE_STANDARD, Size 0x34), que abaixo do árbitro
+  traduz o requisito (TranslateResourceRequirements). As respostas ficam por
+  nó e tipo. A atribuição de uma lista alternativa é a do
+  IopTestConfiguration/IopCommitConfiguration: os ARBITER_LIST_ENTRY de
+  cada árbitro vão ao ArbiterHandler com TestAllocation e, se todos aceitam,
+  CommitAllocation (senão RollbackAllocation e a próxima lista). O recurso
+  bruto volta pelos tradutores abaixo do árbitro (ParentToChild) e o
+  traduzido sobe por todos até um STATUS_TRANSLATION_COMPLETE. A liberação
+  é o pedido nulo do PDO a cada árbitro. Com a raiz ACPI, as portas, a
+  memória e os números de barramento das funções PCI e dos dispositivos ISA
+  são do árbitro do pci.sys (as janelas do _CRS do PCI0), as IRQs são do
+  árbitro do acpi.sys na raiz ACPI (o _PRT e os dispositivos de link ficam
+  com ele) e o tradutor de interrupções do acpi.sys dá o vetor do IDT e o
+  IRQL que o árbitro escolheu; o tradutor de ponte do acpi.sys traduz as
+  portas e a memória do barramento PCI.
+- `resources.rs`: as listas do NT, os árbitros da raiz (os IopRoot*Arbiter:
+  primeira opção livre, alternativas, compartilhamento, sem janelas de
+  barramento) e o tradutor da raiz: sem ACPI, a HAL traduz a IRQ de linha
+  `n` para o vetor `0x20 + n`, IRQL `n`; com a raiz ACPI, a identidade.
 - `root.rs`: o barramento raiz; o barramento PCI interno
   (`drivers/bus/pci.rs`, PCI_HAL\PNP0A03\0) é filho dele. Um
   IoReportDetectedDevice com a árvore montada vira um devnode
@@ -1201,9 +1230,13 @@ IoOpenDeviceRegistryKey, IoRegisterDeviceInterface (links
 `\??\<instância>#{guid}`) e o IoConnectInterruptEx LINE_BASED leem o
 devnode.
 
-A árvore sobe no fim da fase 1 com `--storage=real` ou `--display=basic`.
-`drivers/bus/device_tree.rs` prepara a raiz com o barramento PCI interno e
-deixa com nó do kernel (sem instalação nem AddDevice, como um dispositivo
+A árvore sobe uma vez no fim da fase 1 (`drivers/bus/device_tree.rs`,
+`build`): o que cada pilha pedida precisa antes dela (os setores de
+referência, o Registro e os drivers de boot da pilha de armazenamento; o
+vídeo de boot), a raiz, o processamento da árvore inteira e as
+conferências de cada pilha. A raiz é a ACPI (abaixo); com
+`--pnp-root=internal`, `prepare` monta a raiz com o barramento PCI interno
+e deixa com nó do kernel (sem instalação nem AddDevice, como um dispositivo
 com driver de boot) as funções que um driver interno já serve naquele
 boot: a controladora IDE sem `--storage=real` (o driver ATA interno serve o
 volume do boot) e o adaptador VGA sem `--display=basic` (o console em modo
@@ -1212,8 +1245,12 @@ msisadrv.sys, um driver KMDF, e passa pelo AddDevice e pelo START do
 framework.
 
 Com `--storage=real` (`drivers/storage/storage_stack.rs`) sobe a pilha IDE
-real: intelide.sys/pciidex.sys na controladora, atapi.sys/ataport.sys nos
-canais, disk.sys/classpnp.sys nos discos.
+real nos nós que o pci.sys relata: intelide.sys/pciidex.sys na
+controladora, atapi.sys/ataport.sys nos canais (as IRQs 14 e 15 pelo
+árbitro e pelo tradutor do acpi.sys), disk.sys/classpnp.sys nos discos. O
+adaptador de DMA chega ao pciidex pela BUS_INTERFACE_STANDARD que o
+acpi.sys pede ao AcpiRootPdo (`hal/pnp.rs`, o HalpQueryInterface, com o
+HalPnpGetDmaAdapter).
 
 Com `--display=basic` (`drivers/video/display_stack.rs`) o adaptador VGA
 recebe o BasicDisplay.sys real. O DriverEntry dele carrega o dxgkrnl.sys
@@ -1224,8 +1261,8 @@ início do adaptador (DpiFdoStartAdapterThread, com o DxgkDdiStartDevice)
 para a criação da primeira sessão, que o win32k.sys anuncia
 (watchdog!SMgrNotifySessionChange no NtUserInitialize).
 
-Com `--pnp-root=acpi` (`drivers/bus/acpi_stack.rs`) a raiz da árvore é a
-de um PC ACPI do Windows, no lugar do barramento PCI interno:
+A raiz da árvore (`drivers/bus/acpi_stack.rs`; `--pnp-root=internal` volta
+ao barramento PCI interno) é a de um PC ACPI do Windows:
 
 - **A HAL** (`hal/pnp.rs`, o HalpDispatchPnp) relata o computador
   `ROOT\ACPI_HAL\0000` (HardwareID `acpiapic`; o kernel é o driver dele) e,
@@ -1256,7 +1293,15 @@ de um PC ACPI do Windows, no lugar do barramento PCI interno:
 - **A SCI**: o acpi.sys grava os dados de conexão da interrupção no
   AcpiRootPdo (INTERRUPT_CONNECTION_DATA_PKEY) e chama o IoConnectInterruptEx
   LINE_BASED; como o IopConnectLineBasedInterrupt, a conexão usa esses dados
-  (a GSIV 9 da FADT, entregue pelo 8259 no vetor 0x29).
+  (a GSIV 9 da FADT e o vetor que ele atribuiu).
+- **A entrega das interrupções de linha** (`hal/interrupt_lines.rs`): o
+  árbitro de IRQ do acpi.sys escolhe o vetor do IDT de cada GSI no conjunto
+  da raiz (GSIs no mesmo IRQL podem dividir um vetor) e o tradutor dele o
+  entrega na lista traduzida. A HAL do NT programaria o IOAPIC; a do OpenNT
+  entrega as linhas pelo 8259 no vetor fixo `0x20 + linha`, registra cada
+  linha com o vetor atribuído a ela (pela tradução no PnP ou pelos dados de
+  conexão) e o KINTERRUPT conectado num vetor atribuído fica na cadeia
+  dele, que as linhas desse vetor despacham.
 - **Destinos de interrupção** (`hal/interrupt_targets.rs`): HalGetProcessorIdByNtNumber,
   HalGetInterruptTargetInformation (modo físico), HalGetMessageRoutingInfo,
   HalConvertDeviceIdtToIrql e HalGetMemoryCachingRequirements, que o acpi.sys
@@ -1281,16 +1326,17 @@ acpi.sys sobre o PDO dela relata os dispositivos ISA do namespace
 mouse PS/2 são instalados pelas linhas do keyboard.inf e do msmouse.inf
 (`io/pnp/install.rs`) com o i8042prt.sys e os filtros de classe, e a
 pilha do teclado do boot é a desse nó (`drivers/input/keyboard_stack.rs`).
-O barramento PCI
-interno do kernel fica fora dessa árvore; as funções dos drivers internos
-são reconhecidas pelos ids de classe do pci.sys (`device_tree.rs`). Os
-filhos do pci.sys ainda passam pelo árbitro plano do PnP manager, e não
-pelos árbitros dos drivers de barramento; esse árbitro aloca as portas,
-a memória e os números de barramento de um nó dentro das janelas do
-barramento acima dele (o PCI com o `_CRS`), e as janelas do pai não
-colidem com os filhos (`io/pnp/resources.rs`).
-
-Sem as opções nada disso roda.
+Os recursos de todos esses nós passam pelos árbitros e tradutores dos
+drivers de barramento (`io/pnp/arbiter.rs`): o teclado recebe as portas
+0x60/0x64 do árbitro do pci.sys e a IRQ 1 do árbitro do acpi.sys, com o
+vetor que o tradutor dele dá. Os dispositivos sem driver na caixa ficam
+sem instalação (CM_PROB_FAILED_INSTALL): a placa de rede e1000 (o driver
+dela vem do repositório de drivers, nete1g3e.inf), a controladora de
+disquete (fdc.inf), as portas serial e paralela (msports.inf; o serial.sys
+tomaria a COM1, que é a saída do log do kernel), o fw_cfg do QEMU e o
+processador (cpu.inf). O barramento PCI interno do kernel fica fora dessa
+árvore; as funções dos drivers internos são reconhecidas pelos ids de
+classe do pci.sys (`device_tree.rs`).
 
 ### 3.6 A interface x86 BIOS
 
@@ -2559,14 +2605,19 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   memória desse processo (alocados dentro do corpo de `with_test_process`,
   ou anexado a ele): o modo estrito de posse recusa a memória de outro.
 - **Drivers reais**: `--start-driver=<serviço>` sobe um driver do volume e
-  `--trace-driver-api` mostra cada export chamado (veja o README). Os testes
-  `watchdog` e `dxgkrnl` do `components.toml` iniciam assim o watchdog.sys e
-  o núcleo gráfico (serviço `DXGKrnl`, com os valores da chave do Windows) e
-  esperam `DRIVER_START_COMPLETED name=<serviço> state=4 win32=0`; depois,
-  com a CI ainda ativa, a pilha PS/2 passa pela validação
-  (`CI_KERNEL_IMAGE_RESULT name=\FS\i8042prt.sys status=0x0`), o serviço de
+  `--trace-driver-api` mostra cada export chamado (veja o README). O
+  `--start-driver` liga o Code Integrity já no fim da fase 1, antes da
+  árvore de dispositivos, como no NT: os drivers que o PnP carrega (o
+  acpi.sys, o pci.sys, o msisadrv.sys com o KMDF, o i8042prt.sys e os
+  filtros de classe) passam pela validação
+  (`CI_KERNEL_IMAGE_RESULT name=\FS\i8042prt.sys status=0x0`). Os testes
+  `watchdog` e `dxgkrnl` do `components.toml` esperam essa validação e
+  depois iniciam o watchdog.sys e o núcleo gráfico (serviço `DXGKrnl`, com
+  os valores da chave do Windows) com
+  `DRIVER_START_COMPLETED name=<serviço> state=4 win32=0`; o serviço de
   teclado lê do i8042prt.sys e o `--hold=30000` mantém o sistema rodando
-  30 s sem falha na serial. Uma imagem recusada pela CI falha com o status
+  30 s sem falha na serial. Um serviço que o PnP já iniciou (o msisadrv do
+  teste `kmdf`) volta ERROR_SERVICE_ALREADY_RUNNING (1056) com state=4. Uma imagem recusada pela CI falha com o status
   real: o NTSTATUS da carga (STATUS_INVALID_IMAGE_HASH) segue até o SCM,
   que mostra o 577 do Windows.
   As chaves
