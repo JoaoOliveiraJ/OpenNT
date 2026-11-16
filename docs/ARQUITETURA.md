@@ -2262,7 +2262,27 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   `\Device\DeviceApi\CMApi` no CMApiEntry (`io/pnp/device_api.rs`); o
   csrss usa o NtNotifyChangeKey (`cm/notify.rs`) e o NtQueryLicenseValue
   (`ex/license/values.rs::query_user`) de modo usuário, e o winsrvext
-  chama o NtUserInitialize. A sessão do dxgkrnl
+  chama o NtUserInitialize. Outros serviços que o smss e o csrss pedem no
+  caminho, cada um no componente dono e com o handler de `ps/user` só
+  ligando: o NtInitializeRegistry do smss (`cm/hive_init.rs`, cada etapa
+  uma vez só: CM_BOOT_FLAG_SMSS, o aviso dos arquivos de paginação e o
+  aceite do boot; as hives já foram ligadas na fase 1), o
+  NtApphelpCacheControl da ntdll (`ps/apphelp_cache.rs`, o IOCTL ao
+  `\Device\ahcache` ou, sem ele, o status pré-definido de cada serviço), o
+  NtIsUILanguageComitted do csrss (`ps/locale.rs`), as classes
+  ProcessDefaultHardErrorMode e ProcessHandleCheckingMode do
+  NtSet/NtQueryInformationProcess (`ps/set_process_information.rs`,
+  `ps/query_process.rs`, com o ProbeForRead do alinhamento de cada classe),
+  a ThreadBreakOnTermination do NtSetInformationThread
+  (`ps/set_thread_information.rs`) e as classes de tamanho fixo
+  SystemFlagsInformation, SystemPhysicalMemoryInformation e
+  SystemHypervisorSharedPageInformation do NtQuerySystemInformation
+  (`ex/system_information.rs::query_fixed`, também no Zw). Um serviço sem
+  provedor nenhum (nem handler de usuário nem export) cai na falha comum da
+  tabela nativa, que devolve STATUS_NOT_IMPLEMENTED sem passar pelo
+  despacho; a entrada de syscall de usuário avisa uma vez por serviço
+  (`[usermode] syscall X sem implementacao (sem provedor)`,
+  `ex/system_services.rs::note_user_target`). A sessão do dxgkrnl
   (DpiSessionCreateCallback) espera o primeiro adaptador de vídeo
   iniciado, como no Windows: sem `--display=basic` o csrss fica ali. Com
   `--display=basic` o vídeo de boot do carregador
