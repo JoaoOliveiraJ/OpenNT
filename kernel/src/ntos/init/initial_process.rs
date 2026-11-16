@@ -211,35 +211,51 @@ pub fn win32k_service_returned(service_number: u32, result: u64) {
     }
 }
 
-/// As Desktops abertas pela ParseProcedure da WinSta0 (`WINSTA0_OK`).
-static WINSTA0_DESKTOPS: SpinLock<Vec<String>> = SpinLock::new(Vec::new());
-static WINSTA0_OK: AtomicBool = AtomicBool::new(false);
+/// O marcador de um processo que abre as Desktops Winlogon e Default da
+/// WinSta0 da sessão dele.
+struct DesktopMarker {
+    process: &'static str,
+    marker: &'static str,
+    opened: SpinLock<Vec<String>>,
+    done: AtomicBool,
+}
+
+/// `WINSTA0_OK`: o wininit.exe da sessão 0; `WINLOGON_DESKTOPS_OK`: o
+/// winlogon.exe da sessão 1.
+static DESKTOP_MARKERS: [DesktopMarker; 2] = [
+    DesktopMarker { process: "wininit.exe", marker: "WINSTA0_OK", opened: SpinLock::new(Vec::new()), done: AtomicBool::new(false) },
+    DesktopMarker { process: "winlogon.exe", marker: "WINLOGON_DESKTOPS_OK", opened: SpinLock::new(Vec::new()), done: AtomicBool::new(false) },
+];
 
 /// Uma Desktop aberta (criada ou reaberta) pela ParseProcedure de uma
 /// WindowStation, pelo ObOpenObjectByName do win32k (`ob/object_open.rs`):
-/// o `WINSTA0_OK` sai quando o wininit.exe tem as Desktops Winlogon e
-/// Default da WinSta0, como as que ele cria na partida da sessão 0.
+/// o marcador do processo sai quando ele tem as Desktops Winlogon e Default
+/// da WinSta0, como as que o wininit.exe cria na partida da sessão 0 e o
+/// winlogon.exe na da sessão 1.
 pub fn desktop_opened(window_station: &str, desktop: &str) {
     if !boot_config::smss_boot() {
         return;
     }
-    // Cada abertura sai no log (as do winlogon.exe da sessão 1 vêm depois do
-    // marcador); só as do wininit.exe contam para ele.
     let name = image_name(process::get_current_process());
     crate::debug_print!("[init] {} (pid {}): Desktop {}\\{} aberta pela ParseProcedure da WindowStation", name, process::get_current_process_id(), window_station, desktop);
-    if WINSTA0_OK.load(Ordering::Acquire) || !name.eq_ignore_ascii_case("wininit.exe") || !window_station.eq_ignore_ascii_case("WinSta0") {
+    if !window_station.eq_ignore_ascii_case("WinSta0") {
         return;
     }
-    let complete = {
-        let mut desktops = WINSTA0_DESKTOPS.lock();
-        if !desktops.iter().any(|known| known.eq_ignore_ascii_case(desktop)) {
-            desktops.push(String::from(desktop));
+    for tracker in &DESKTOP_MARKERS {
+        if tracker.done.load(Ordering::Acquire) || !name.eq_ignore_ascii_case(tracker.process) {
+            continue;
         }
-        ["Winlogon", "Default"].iter().all(|wanted| desktops.iter().any(|known| known.eq_ignore_ascii_case(wanted)))
-    };
-    if complete && !WINSTA0_OK.swap(true, Ordering::AcqRel) {
-        crate::debug_print!("[init] wininit.exe (pid {}): WinSta0 com as Desktops Winlogon e Default", process::get_current_process_id());
-        crate::debug_print!("WINSTA0_OK");
+        let complete = {
+            let mut desktops = tracker.opened.lock();
+            if !desktops.iter().any(|known| known.eq_ignore_ascii_case(desktop)) {
+                desktops.push(String::from(desktop));
+            }
+            ["Winlogon", "Default"].iter().all(|wanted| desktops.iter().any(|known| known.eq_ignore_ascii_case(wanted)))
+        };
+        if complete && !tracker.done.swap(true, Ordering::AcqRel) {
+            crate::debug_print!("[init] {} (pid {}): WinSta0 com as Desktops Winlogon e Default", tracker.process, process::get_current_process_id());
+            crate::debug_print!("{}", tracker.marker);
+        }
     }
 }
 
