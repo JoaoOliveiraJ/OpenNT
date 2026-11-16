@@ -83,6 +83,24 @@ fn write_result(result: Result<Vec<u8>, u32>, out: u64, length: u32, returned: u
     query_token::write_encoded(result, out, length, returned, true)
 }
 
+/// NtAllocateLocallyUniqueId(Luid*): o LUID sondado (ULONG alinhado) e um
+/// valor novo do contador único (o ExAllocateLocallyUniqueId).
+fn nt_allocate_locally_unique_id(luid: u64, _a2: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
+    if luid & 3 != 0 {
+        return Ok(0x8000_0002);
+    }
+    if !probe_user_write(luid, 8) {
+        return Ok(0xC000_0005);
+    }
+    let value = tokens::allocate_luid();
+    // LUID: LowPart e HighPart (ULONG e LONG).
+    let written = guest::try_write::<u32>(luid, value as u32).and_then(|_| guest::try_write::<u32>(luid + 4, (value >> 32) as u32));
+    Ok(match written {
+        Ok(()) => 0,
+        Err(error) => error.status,
+    })
+}
+
 /// A classe 10 usa a mesma ordem de sondagens, handles e escritas do Zw.
 fn nt_query_information_token(handle: u64, class: u64, out: u64, length: u64, rsp: u64) -> Result<u32, KernelError> {
     let class = class as u32;
@@ -170,5 +188,6 @@ pub fn init() {
     state::register_handler("NtOpenThreadToken", nt_open_thread_token);
     state::register_handler("NtOpenThreadTokenEx", nt_open_thread_token_ex);
     state::register_handler("NtQueryInformationToken", nt_query_information_token);
+    state::register_handler("NtAllocateLocallyUniqueId", nt_allocate_locally_unique_id);
     state::register_handler("NtQuerySecurityAttributesToken", nt_query_security_attributes_token);
 }
