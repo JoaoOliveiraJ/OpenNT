@@ -275,6 +275,28 @@ const SMSS_PROGRAMS: &[&str] = &[
     "wldap32.dll",
     "ws2_32.dll",
     "msvcrt.dll",
+    // O que o wininit carrega na partida (o kernel.appcore das APIs de
+    // aplicativo e o dwminit da inicialização do DWM), o comando inicial da
+    // sessão 1 (winlogon.exe) e as DLLs de carga atrasada que o services.exe
+    // e o lsass.exe usam ao iniciar (o servidor SSPI, o SAM, a criptografia
+    // e a rede local).
+    "kernel.appcore.dll",
+    "dwminit.dll",
+    "winlogon.exe",
+    "sspisrv.dll",
+    "samsrv.dll",
+    "samlib.dll",
+    "authz.dll",
+    "crypt32.dll",
+    "cryptsp.dll",
+    "cryptdll.dll",
+    "ncrypt.dll",
+    "netutils.dll",
+    "srvcli.dll",
+    "wintrust.dll",
+    "nsi.dll",
+    "iphlpapi.dll",
+    "dnsapi.dll",
 ];
 
 /// As imagens de kernel do caminho do smss (`--initial-process=smss`): o
