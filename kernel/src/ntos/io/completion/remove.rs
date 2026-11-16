@@ -10,7 +10,7 @@ use alloc::vec::Vec;
 use crate::ntos::alpc::completion_reference::{self, Reference};
 use crate::ntos::alpc::kernel_wait;
 use crate::ntos::alpc::message::buffer as message_buffer;
-use crate::ntos::ke::{clock, context_switch, dispatcher, thread_alert, thread_dispatch};
+use crate::ntos::ke::{clock, context_switch, dispatcher, thread_alert};
 use crate::ntos::ke::wait as ke_wait;
 use crate::ntos::ob::objects::completion::{self as completion_objects, Packet, Waiter};
 use crate::ntos::ps::process;
@@ -152,7 +152,7 @@ impl Active {
     }
 
     fn reserve(&mut self) -> bool {
-        reserve(&self.shared, self.port(), &self.alerts, self.consumer, self.count, self.thread)
+        reserve(&self.shared, self.port(), &self.alerts, self.consumer, self.count)
     }
 
     fn poll(&mut self) -> Option<u32> {
@@ -187,7 +187,7 @@ impl Active {
 }
 
 /// O lote sai da FIFO antes de qualquer callback de liberação.
-fn reserve(shared: &SpinLock<Shared>, port: &completion_objects::Port, alerts: &SpinLock<thread_alert::AlertWait>, consumer: u64, count: u32, thread: u64) -> bool {
+fn reserve(shared: &SpinLock<Shared>, port: &completion_objects::Port, alerts: &SpinLock<thread_alert::AlertWait>, consumer: u64, count: u32) -> bool {
     {
         let state = shared.lock();
         if state.completed.is_some() || state.batch.is_some() {
@@ -204,15 +204,12 @@ fn reserve(shared: &SpinLock<Shared>, port: &completion_objects::Port, alerts: &
         Some(batch)
     });
     let Some(batch) = batch else { return false };
-    let armed = {
-        let mut state = shared.lock();
-        state.batch = Some(batch);
-        state.armed
-    };
+    shared.lock().batch = Some(batch);
+    // Só o fim da espera de alertas: quem apronta a thread de kernel parada
+    // é o KiUnwaitThread da espera dela (`completion::notify` chama o
+    // `ke::wait::wake`); a de usuário bloqueada numa syscall é sondada pelo
+    // despachante de usuário.
     let _ = alerts.lock().finish(0);
-    if armed && thread_dispatch::owner(thread).is_some() {
-        let _ = thread_dispatch::make_ready(thread);
-    }
     true
 }
 
@@ -306,7 +303,7 @@ pub fn begin(handle: u64, output: u64, count: u32, removed: u64, timeout: u64, a
         })),
         reserve: Some(alloc::boxed::Box::new(move || {
             let armed = reserve_shared.lock().armed;
-            armed && reserve_alerts.lock().interrupted().is_none() && reserve(&reserve_shared, &reserve_port, &reserve_alerts, consumer, count, thread)
+            armed && reserve_alerts.lock().interrupted().is_none() && reserve(&reserve_shared, &reserve_port, &reserve_alerts, consumer, count)
         })),
     });
     reference.port.with(|state| state.waiters.push(waiter.clone()));

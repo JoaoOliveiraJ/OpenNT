@@ -198,11 +198,13 @@ impl AlertWait {
         self.previous_waiter = previous_waiter;
         self.previous_fields = previous_fields;
         self.armed = true;
-        // A fila nativa perde o vínculo pronto quando a thread passa a esperar.
-        if thread_dispatch::owner(thread).is_some() {
-            thread_dispatch::suspend(thread, thread_dispatch::state::WAITING)?;
-        } else {
-            target.state.set(STATE_WAITING);
+        // A thread de usuário perde o vínculo pronto quando passa a esperar.
+        // A de kernel do escalonador segue Running na CPU: só a troca de
+        // contexto da espera a deixa Waiting (`scheduler::run_step`).
+        match thread_dispatch::owner(thread) {
+            Some(owner) if kernel_scheduled(owner) => {}
+            Some(_) => thread_dispatch::suspend(thread, thread_dispatch::state::WAITING)?,
+            None => target.state.set(STATE_WAITING),
         }
         Ok(())
     }
@@ -235,13 +237,27 @@ impl AlertWait {
                 target.wait_status.set(status as i64);
             }
         });
-        if self.cooperative && thread_dispatch::owner(thread).is_some() {
-            thread_dispatch::suspend(thread, self.previous_state)?;
-        } else if thread_dispatch::owner(thread).is_none() {
-            target.state.set(self.previous_state);
+        // O KTHREAD.State de uma thread de kernel do escalonador é do
+        // despachante. O fim da espera pode vir de outra thread (a reserva de
+        // pacotes da porta de conclusão roda no contexto de quem publica),
+        // com a thread parada fora da CPU: um Running restaurado aqui faria o
+        // KiReadyThread do KiUnwaitThread pular a thread, que nunca mais
+        // seria escolhida. Quem a tira da espera a apronta, e o despachante a
+        // põe Running ao retomá-la.
+        match thread_dispatch::owner(thread) {
+            Some(owner) if kernel_scheduled(owner) => {}
+            Some(_) if self.cooperative => thread_dispatch::suspend(thread, self.previous_state)?,
+            Some(_) => {}
+            None => target.state.set(self.previous_state),
         }
         Ok(())
     }
+}
+
+/// A thread é do escalonador de kernel (uma thread de sistema ou um processo
+/// de kernel, que roda na própria pilha), não do despachante de usuário.
+fn kernel_scheduled(owner: thread_dispatch::Owner) -> bool {
+    owner.runtime & thread_dispatch::USER_RUNTIME == 0
 }
 
 /// Espera alertável: `poll` devolve `Some(status)` quando pronta; um alerta

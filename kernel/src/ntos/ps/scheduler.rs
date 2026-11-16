@@ -395,7 +395,7 @@ fn run_step(pid: u32, thread: u64) -> Result<(), KernelError> {
     let started = clock::uptime_100ns();
     let reason = context_switch::resume(thread);
     process::set_current_thread(previous);
-    let (new_state, yield_requested) = {
+    let (new_state, yield_requested, registered_wait) = {
         let mut state = STATE.lock();
         let Some(process) = state.processes.iter_mut().find(|process| process.pid == pid) else {
             return Err(KernelError::new("running context disappeared"));
@@ -403,23 +403,18 @@ fn run_step(pid: u32, thread: u64) -> Result<(), KernelError> {
         match reason {
             SwitchReason::Exit => {
                 process.state = ProcessState::Done;
-                (thread_dispatch::state::TERMINATED, false)
+                (thread_dispatch::state::TERMINATED, false, false)
             }
             SwitchReason::Yield { retain } => {
                 process.state = ProcessState::Ready;
-                (thread_dispatch::state::READY, !retain)
+                (thread_dispatch::state::READY, !retain, false)
             }
             SwitchReason::Wait => {
                 // Uma espera sondada fica com o despachante; a de um objeto
-                // (ke::wait) é confirmada aqui, e a já satisfeita entre a
-                // saída da thread e este ponto volta direto à fila.
-                if process.prepare_dispatch.is_some() || wait::commit(thread) {
-                    process.state = ProcessState::Waiting;
-                    (thread_dispatch::state::WAITING, false)
-                } else {
-                    process.state = ProcessState::Ready;
-                    (thread_dispatch::state::READY, false)
-                }
+                // (ke::wait) é confirmada depois que a thread sai da
+                // execução como Waiting (abaixo).
+                process.state = ProcessState::Waiting;
+                (thread_dispatch::state::WAITING, false, process.prepare_dispatch.is_none())
             }
         }
     };
@@ -427,7 +422,19 @@ fn run_step(pid: u32, thread: u64) -> Result<(), KernelError> {
         thread_dispatch::request_yield(thread)?;
     }
     process::account_thread(thread, true, clock::uptime_100ns() - started);
-    thread_dispatch::end_execution(thread, new_state)
+    thread_dispatch::end_execution(thread, new_state)?;
+    // O KiCommitThreadWait: com a thread já Waiting e fora da CPU, a espera
+    // passa a WaitCommitted, e o KiUnwaitThread seguinte a apronta pelo
+    // KiReadyThread. A espera satisfeita antes deste ponto (marcada
+    // WaitAborted, sem aprontar ninguém) volta à fila aqui. Confirmar antes
+    // de a thread ficar Waiting deixaria um sinal de outra CPU nesse
+    // intervalo aprontá-la ainda em execução, e o Waiting gravado depois
+    // a perderia.
+    if registered_wait && !wait::commit(thread) {
+        thread_dispatch::make_ready(thread)?;
+        thread_readied(thread);
+    }
+    Ok(())
 }
 
 /// Uma APC de kernel para uma thread de kernel parada numa espera sondada:
