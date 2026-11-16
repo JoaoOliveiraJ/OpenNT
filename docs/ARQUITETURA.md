@@ -2034,7 +2034,7 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     PID do cliente, as classes de pipe, o mailslot e o DISCONNECT, com as
     esperas entre processos bloqueando de verdade.
 - **Cadeia smss -> csrss real** (`--initial-process=smss`,
-  `init/boot_config.rs::SMSS_BOOT`): o primeiro processo de usuário é o
+  `init/boot_config.rs::smss_boot`): o primeiro processo de usuário é o
   `\SystemRoot\System32\smss.exe` real (`init/initial_process.rs`), criado
   pelo caminho único com PS_PROTECTION WinTcb-Light (0x61) e
   BreakOnTermination, com a ntdll real. O build põe no volume os binários da
@@ -2299,27 +2299,59 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   900 s) e todo `[[teste]]` de `docs/status/components.toml`, cujo `comando`
   é um `cargo xtask test-boot` completo (o test-all troca só o
   `--build-dir`). Cada execução tem a pasta `build/test-all/<id>` (`<id>.<n>`
-  com `--repeat`). Uma thread monta as imagens em sequência
-  (`test-boot --build-only`), com as execuções de mesma configuração de build
-  juntas e as de prazo maior primeiro: as opções do build viram constantes
-  do kernel (`init/boot_config.rs`), então ele recompila uma vez por
-  configuração, e dois builds nunca disputam o `target/`. Os binários do
-  Windows do bundle ficam numa pasta só (`--windows-dir`), e a cópia deles
-  preserva a data do original e pula o que já está em dia, para que nem o
-  caminho nem a cópia recompilem o kernel. `--jobs` pistas rodam o QEMU na
-  imagem pronta (`test-boot --no-build`), com a saída em `test-boot.log` e a
-  serial em `serial.log`; uma execução que passa do prazo do test-boot mais
-  o `--hold` e 2 minutos é morta com o QEMU. Cada QEMU compromete ao subir
-  toda a memória do convidado (uns 5 GB com `-m 4096`), e com o commit do
-  host esgotado processos morrem sem mensagem (o próprio test-all, o cargo,
-  o rustc): os QEMUs começam um de cada vez, só quando o commit livre
-  (GlobalMemoryStatusEx) cobre a memória do convidado, 1 GB do QEMU e uma
-  margem de 6 GB para o build. A pasta de uma execução que
-  passou é apagada (`--keep` guarda); a de uma falha fica, com o
-  `kernel.elf` para simbolizar endereços. No fim sai a tabela (teste,
+  com `--repeat`). As opções de boot dos testes (`--kernel-test-scope`,
+  `--start-driver`, `--kd`, `--initial-process`, `--storage`, `--display`,
+  `--pnp-root`, `--trace-driver-api`, `--console-mirror`) não entram no
+  build: vão no bloco de opções de carga da imagem de boot (abaixo), então
+  a rodada inteira compila um kernel só. Uma thread monta as imagens
+  (`test-boot --build-only`) uma vez por chave de imagem
+  (`BuildOptions::image_key`), em `build/test-all/imagem-<n>`: uma para os
+  testes do boot comum e outra para os do smss, cujo volume NTFS leva os
+  programas da cadeia e outra hive SYSTEM. Os binários do Windows do bundle
+  ficam numa pasta só para todo build (`build/windows`, ou `--windows-dir`);
+  a cópia deles preserva a data do original, pula o que já está em dia e
+  troca de lugar inteira, para que nem o caminho, nem a cópia, nem um build
+  em paralelo recompilem o kernel, e um `cargo xtask build` ou `test-boot`
+  com qualquer `--build-dir` reaproveita o kernel que o test-all compilou (e
+  vice-versa). `--jobs` pistas rodam o QEMU sobre as imagens prontas, as de
+  prazo maior primeiro (`test-boot --no-build --image-dir=<imagens>`): a
+  pasta da execução recebe a cópia do `os.img` com as opções de carga dela,
+  a saída em `test-boot.log` e a serial em `serial.log`, e o volume NTFS da
+  pasta de imagens entra com `snapshot=on` (as escritas do convidado ficam
+  num arquivo temporário do QEMU), então as pistas o dividem e cada execução
+  começa dele intacto, como o `test-boot` sempre faz; uma execução que passa
+  do prazo do test-boot mais o `--hold` e 2 minutos é morta com o QEMU. Cada
+  QEMU compromete ao subir toda a memória do convidado (uns 5 GB com
+  `-m 4096`), e com o commit do host esgotado processos morrem sem mensagem
+  (o próprio test-all, o cargo, o rustc): os QEMUs começam um de cada vez,
+  só quando o commit livre (GlobalMemoryStatusEx) cobre a memória do
+  convidado, 1 GB do QEMU, uma margem de 6 GB para o build e a memória dos
+  QEMUs que subiram há menos de 3 s (que talvez ainda não apareça no
+  commit), sem espera fixa entre um QEMU e o próximo. A pasta de uma
+  execução que passou é apagada, e a de imagens no fim, quando todas as
+  execuções dela passaram (`--keep` guarda tudo); a de uma falha fica, e a
+  de imagens dela também, com o `kernel.elf` para simbolizar endereços. No
+  fim sai a tabela (teste,
   resultado, build, tempo, log) e, por falha, o motivo dado pelo test-boot, o
   trecho da serial a partir do primeiro marcador de falha (ou as últimas
-  linhas, num prazo esgotado) e o comando que repete o QEMU na mesma imagem.
+  linhas, num prazo esgotado) e o comando que repete o QEMU na mesma imagem
+  (`--no-build --image-dir=build/test-all/imagem-<n>`).
+- **Opções de carga**: como o LoadOptions que o winload monta das opções do
+  BCD, o kernel recebe as opções de boot num texto (`DEBUG DEBUGPORT=COM2
+  KERNELTESTSCOPE=all STARTDRIVER=NDIS,AFD ...`, `init/load_options.rs`)
+  que o xtask grava no último setor da reserva do stage2 (LBA 64), com
+  assinatura `LOP1` e tamanho. O setor de boot carrega os 64 setores do
+  stage2 em 0x7E00, então o bloco chega em `BOOT_LOAD_OPTIONS_PHYS`
+  (0xFC00); o kernel o copia na entrada, antes de qualquer outra CPU e
+  antes de o trampolim dos APs reusar aquela memória, e
+  `init/boot_config.rs` responde a partir dele (`smss_boot()`,
+  `start_driver()`, `kernel_debugger()`...). Sem o bloco, o boot segue sem
+  opções. O mesmo `load_options.rs` entra no xtask (`#[path]`), que monta o
+  bloco; `test-boot --no-build` regrava só esse setor, então um kernel
+  montado serve a qualquer combinação de opções. A ntdll de bring-up está
+  sempre no bundle, mas só os boots com autoteste a enxergam
+  (`hal/bundle.rs`); `OPENNT_TRACE_SYSCALLS`, um diagnóstico sem opção no
+  xtask, continua lido no build.
   `espera_falha = true` no `[[teste]]` conta a falha à parte, sem reprovar a
   rodada (e avisa quando o teste passa); `coberto_pela_suite = true` tira do
   padrão um teste cujos marcadores as suítes conferem (roda com `--only`).
@@ -2476,9 +2508,7 @@ resultado nos textos do PNG; o `cargo xtask status` os lê de lá.
 
 Banners, prompt do shell (`OpenNT> `), mensagens do `xtask`, rótulo do volume
 em memória, arquivo de paginação (`/$opennt-pool-page-N.sys`) e as variáveis
-de build (`OPENNT_USER_PROGRAM`, `OPENNT_KERNEL_TEST_SCOPE`,
-`OPENNT_CONSOLE_MIRROR`, `OPENNT_START_DRIVER`, `OPENNT_TRACE_DRIVER_API`,
-`OPENNT_KD`)
+de build (`OPENNT_WINDOWS_BINARIES`, `OPENNT_TRACE_SYSCALLS`, `OPENNT_VGK_SYS`)
 usam o nome OpenNT. Continuam iguais: os marcadores de boot, o nome do binário
 `kernel`, os artefatos `build/kernel.elf`, `kernel.pe` e `os.img` e os nomes
 dos pacotes (`kernel`, `boot`).

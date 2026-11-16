@@ -240,20 +240,31 @@ Opções de máquina: `--accel=tcg|whpx`,
 Enter; `--expect` pode se repetir. O `test-boot` falha se a serial mostrar
 `*** PANIC`, `*** EXCECAO` ou `SELFTEST FALHOU`. Com `--build-only` ele só
 monta a imagem do teste; com `--no-build` roda o QEMU na imagem já montada em
-`--build-dir`; com `--capture=ARQ.png`, no fim do teste (passando ou não) grava a
-tela do QEMU nesse PNG, pelo `screendump` do QMP.
+`--build-dir` (ou, com `--image-dir=DIR`, nas imagens de DIR, deixando em
+`--build-dir` só a cópia do `os.img` e os logs); com `--capture=ARQ.png`, no fim
+do teste (passando ou não) grava a tela do QEMU nesse PNG, pelo `screendump` do
+QMP. O volume NTFS entra no QEMU do `test-boot` com `snapshot=on`: todo teste
+começa do volume que o build montou.
 
-O `test-all` monta as imagens uma de cada vez (`test-boot --build-only`), com
-as execuções de mesma configuração juntas, para o kernel recompilar uma vez
-por configuração e nunca haver dois builds no mesmo `target/`, e roda o QEMU
-em `--jobs=N` pistas (`test-boot --no-build`; padrão: metade das CPUs). Cada
-QEMU compromete toda a memória do convidado ao subir, então um QEMU só
-começa quando o commit livre do host o cobre com folga.
+As opções de boot (`--kernel-test-scope`, `--start-driver`, `--kd`,
+`--initial-process`, `--storage`, `--display`, `--pnp-root`,
+`--trace-driver-api`, `--console-mirror`, `--user-program`) não recompilam o
+kernel: vão no bloco de opções de carga da imagem de boot (como as opções de
+boot do Windows no LoadOptions do loader), que o kernel lê ao entrar e mostra
+na serial (`[boot] opcoes de carga: ...`). Só o `--initial-process=smss` muda
+também o volume NTFS. Um kernel compilado serve a todo `--build-dir`.
+
+O `test-all` compila o kernel uma vez e monta as imagens uma vez por volume
+(`build/test-all/imagem-<n>`: a do boot comum e a do smss), e roda o QEMU em
+`--jobs=N` pistas (`test-boot --no-build --image-dir`; padrão: metade das
+CPUs), cada execução com as próprias opções de carga. Cada QEMU compromete
+toda a memória do convidado ao subir, então um QEMU só começa quando o
+commit livre do host o cobre com folga.
 Opções: `--only=ID,...`, `--skip=ID,...`, `--suite` (só as suítes,
 `suite-smp4` e `suite-smp1`) ou `--no-suite`, `--repeat=N` (cada teste N
 vezes, para caçar falhas intermitentes), `--keep` (guarda a pasta de toda
-execução; sem ele, só as das falhas ficam, com `build.log`, `test-boot.log` e
-`serial.log`), `--cpu-friendly` (o test-all, o cargo e o QEMU com prioridade
+execução e das imagens; sem ele, só as das falhas ficam, com `test-boot.log` e
+`serial.log`, e as imagens que elas usaram, com o `build.log`), `--cpu-friendly` (o test-all, o cargo e o QEMU com prioridade
 abaixo do normal e sem 4 CPUs lógicas na afinidade) e `--list` (mostra os
 testes e os comandos). No `components.toml`, `espera_falha = true` marca uma
 falha conhecida, contada à parte sem reprovar a rodada, e
