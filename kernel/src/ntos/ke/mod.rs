@@ -29,6 +29,7 @@ pub mod kernel_exception;
 pub mod spin_lock;
 pub mod processor_group;
 pub mod affinity;
+pub mod affinity_set;
 pub mod callout;
 pub mod user_callback;
 pub mod debug_print;

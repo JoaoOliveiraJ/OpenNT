@@ -1168,3 +1168,110 @@ pub mod ke_sweep_local_caches {
 
     pub static GROUP: Group = Group { name: "ke-sweep-local-caches", names: &["KeSweepLocalCaches"], handlers: &[sweep_local_caches], data_exports: &[] };
 }
+
+pub mod ke_affinity_ex {
+    //! Conjuntos KAFFINITY_EX e a enumeração de processadores: só adaptadores.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::inc::types::{Field, GroupAffinity, KaffinityEx, NtStruct};
+    use crate::ntos::ke::affinity_set::{self, EnumerationContext};
+    use crate::rtl::KernelError;
+
+    fn affinity(address: u64) -> &'static KaffinityEx {
+        // SAFETY: o PKAFFINITY_EX do driver.
+        unsafe { KaffinityEx::at(address) }
+    }
+
+    /// O PKAFFINITY_EX de resultado opcional.
+    fn optional(address: u64) -> Option<&'static KaffinityEx> {
+        (address != 0).then(|| affinity(address))
+    }
+
+    fn initialize_affinity_ex(call: &Call) -> Result<u64, KernelError> {
+        affinity_set::initialize(affinity(call.arg(1)));
+        Ok(0)
+    }
+    fn add_processor_affinity_ex(call: &Call) -> Result<u64, KernelError> {
+        affinity_set::add_processor(affinity(call.arg(1)), call.arg(2) as u32);
+        Ok(0)
+    }
+    fn remove_processor_affinity_ex(call: &Call) -> Result<u64, KernelError> {
+        affinity_set::remove_processor(affinity(call.arg(1)), call.arg(2) as u32);
+        Ok(0)
+    }
+    fn check_processor_affinity_ex(call: &Call) -> Result<u64, KernelError> {
+        Ok(affinity_set::check_processor(affinity(call.arg(1)), call.arg(2) as u32) as u64)
+    }
+    fn is_empty_affinity_ex(call: &Call) -> Result<u64, KernelError> {
+        Ok(affinity_set::is_empty(affinity(call.arg(1))) as u64)
+    }
+    fn is_equal_affinity_ex(call: &Call) -> Result<u64, KernelError> {
+        Ok(affinity_set::is_equal(affinity(call.arg(1)), affinity(call.arg(2))) as u64)
+    }
+    fn copy_affinity_ex(call: &Call) -> Result<u64, KernelError> {
+        affinity_set::copy(affinity(call.arg(1)), affinity(call.arg(2)));
+        Ok(0)
+    }
+    fn or_affinity_ex(call: &Call) -> Result<u64, KernelError> {
+        Ok(affinity_set::or(affinity(call.arg(1)), affinity(call.arg(2)), optional(call.arg(3))) as u64)
+    }
+    fn and_affinity_ex(call: &Call) -> Result<u64, KernelError> {
+        Ok(affinity_set::and(affinity(call.arg(1)), affinity(call.arg(2)), optional(call.arg(3))) as u64)
+    }
+    fn add_group_affinity_ex(call: &Call) -> Result<u64, KernelError> {
+        affinity_set::add_group(affinity(call.arg(1)), call.arg(2) as u16, call.arg(3));
+        Ok(0)
+    }
+    fn count_set_bits_affinity_ex(call: &Call) -> Result<u64, KernelError> {
+        Ok(affinity_set::count_set_bits(affinity(call.arg(1))) as u64)
+    }
+    fn find_first_set_left_group_affinity(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: o PGROUP_AFFINITY do driver.
+        Ok(affinity_set::find_first_set_left(unsafe { GroupAffinity::at(call.arg(1)) }) as u64)
+    }
+    fn query_active_processor_affinity(call: &Call) -> Result<u64, KernelError> {
+        Ok(affinity_set::query_active_processor_affinity(affinity(call.arg(1))) as u64)
+    }
+    fn enumerate_next_processor(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: o PULONG de saída e o contexto de enumeração do driver.
+        let (index, context) = unsafe { (Field::<u32>::at(call.arg(1)), EnumerationContext::at(call.arg(2))) };
+        Ok(signed_status(affinity_set::enumerate_next(index, context)))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "ke-affinity-ex",
+        names: &[
+            "KeInitializeAffinityEx",
+            "KeAddProcessorAffinityEx",
+            "KeRemoveProcessorAffinityEx",
+            "KeCheckProcessorAffinityEx",
+            "KeIsEmptyAffinityEx",
+            "KeIsEqualAffinityEx",
+            "KeCopyAffinityEx",
+            "KeOrAffinityEx",
+            "KeAndAffinityEx",
+            "KeAddGroupAffinityEx",
+            "KeCountSetBitsAffinityEx",
+            "KeFindFirstSetLeftGroupAffinity",
+            "KeQueryActiveProcessorAffinity",
+            "KeEnumerateNextProcessor",
+        ],
+        handlers: &[
+            initialize_affinity_ex,
+            add_processor_affinity_ex,
+            remove_processor_affinity_ex,
+            check_processor_affinity_ex,
+            is_empty_affinity_ex,
+            is_equal_affinity_ex,
+            copy_affinity_ex,
+            or_affinity_ex,
+            and_affinity_ex,
+            add_group_affinity_ex,
+            count_set_bits_affinity_ex,
+            find_first_set_left_group_affinity,
+            query_active_processor_affinity,
+            enumerate_next_processor,
+        ],
+        data_exports: &[],
+    };
+}

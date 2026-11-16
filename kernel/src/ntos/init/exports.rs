@@ -66,7 +66,7 @@ pub struct Group {
 }
 
 /// Grupos implementados (qualquer ordem: a posição vem de `GROUP_LAYOUT`).
-fn groups() -> [&'static Group; 451] {
+fn groups() -> [&'static Group; 452] {
     [
         &crate::ntos::ps::exports::ps_jobs::GROUP,
         &crate::ntos::alpc::exports::zw_alpc_server::GROUP,
@@ -520,6 +520,7 @@ fn groups() -> [&'static Group; 451] {
         &crate::ntos::io::exports::io_interface_key_keep_alive::GROUP,
         &crate::ntos::ex::exports::zw_create_wnf_state_name::GROUP,
         &crate::ntos::etw::exports::etw_write_ex::GROUP,
+        &crate::ntos::ke::exports::ke_affinity_ex::GROUP,
     ]
 }
 

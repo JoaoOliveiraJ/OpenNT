@@ -457,9 +457,10 @@ pub static GROUP_LAYOUT: &[(&str, usize, usize)] = &[
     ("io-interface-key-keep-alive", 1947, 4),
     ("zw-create-wnf-state-name", 1951, 1),
     ("etw-write-ex", 1952, 2),
+    ("ke-affinity-ex", 1954, 14),
 ];
 
-/// Os 1954 exports de função, na ordem da ABI.
+/// Os 1968 exports de função, na ordem da ABI.
 pub static EXPORT_NAMES: &[&str] = &[
     "DbgPrint",
     "DbgPrintEx",
@@ -2415,4 +2416,18 @@ pub static EXPORT_NAMES: &[&str] = &[
     "ZwCreateWnfStateName",
     "EtwWriteEx",
     "EtwWriteString",
+    "KeInitializeAffinityEx",
+    "KeAddProcessorAffinityEx",
+    "KeRemoveProcessorAffinityEx",
+    "KeCheckProcessorAffinityEx",
+    "KeIsEmptyAffinityEx",
+    "KeIsEqualAffinityEx",
+    "KeCopyAffinityEx",
+    "KeOrAffinityEx",
+    "KeAndAffinityEx",
+    "KeAddGroupAffinityEx",
+    "KeCountSetBitsAffinityEx",
+    "KeFindFirstSetLeftGroupAffinity",
+    "KeQueryActiveProcessorAffinity",
+    "KeEnumerateNextProcessor",
 ];

@@ -367,7 +367,7 @@ fn ntoskrnl_exports(assert: Assert) {
     use crate::{ntos::init::export_names as abi_names, ntos::init::exports};
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions, ResolvedImport};
     exports::init();
-    assert(abi_names::EXPORT_NAMES.len() == 1954 && abi_names::GROUP_LAYOUT.len() == 451 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1954 exports em 451 grupos");
+    assert(abi_names::EXPORT_NAMES.len() == 1968 && abi_names::GROUP_LAYOUT.len() == 452 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1968 exports em 452 grupos");
     // Ordinais públicos: os slots de função seguidos dos dados sem nome repetido.
     let public_count = abi_names::EXPORT_NAMES.len() + crate::ntos::mm::kernel_data_layout::DEFINITIONS.iter().filter(|entry| !abi_names::EXPORT_NAMES.contains(&entry.name)).count();
     assert(matches!(exports::lookup_ordinal("ntoskrnl.exe", 547), Some(ResolvedImport::Thunk(578))) && exports::lookup("ntoskrnl.exe", "LdrResSearchResource").is_some() && exports::lookup("ntoskrnl.exe", "NaoExisteNoKernel").is_none() && exports::lookup_ordinal("ntoskrnl.exe", 0).is_none() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32).is_some() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32 + 1).is_none(), "ntoskrnl: ordinais, todos os exports com provedor e nome desconhecido");
@@ -2057,7 +2057,7 @@ fn ntoskrnl_mm_group(assert: Assert) {
     use crate::ntos::mm::{image_paging, paging};
     use crate::ntos::init::exports;
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions};
-    assert(exports::implemented() == 1954 && exports::export_names().len() == 1954, "ntoskrnl: 451 grupos com os 1954 exports implementados");
+    assert(exports::implemented() == 1968 && exports::export_names().len() == 1968, "ntoskrnl: 452 grupos com os 1968 exports implementados");
     let block = guest::alloc_bytes(0x200);
     // MmGetSystemRoutineAddress: trampolim chamável e nome desconhecido.
     let name: alloc::vec::Vec<u16> = "KeGetCurrentIrql".encode_utf16().collect();
@@ -11564,6 +11564,74 @@ fn hvi_hardware_exports(assert: Assert) {
 }
 
 
+/// Os KAFFINITY_EX e a enumeração de processadores (`ke/affinity_set`),
+/// pelos exports, com os valores das rotinas do ntoskrnl 19041.
+fn ke_affinity_ex_exports(assert: Assert) {
+    let online = crate::ntos::ke::smp::online_cpu_count() as u64;
+    let active = if online >= 64 { u64::MAX } else { (1u64 << online) - 1 };
+    let size = nt::KaffinityEx::SIZE;
+    let block = guest::alloc_bytes(size * 4 + 0x40);
+    let (a, b, c, d) = (block, block + size, block + 2 * size, block + 3 * size);
+    let set = |address: u64| at::<nt::KaffinityEx>(address);
+    let flag = |name: &str, arguments: &[u64]| call_export(name, arguments).map(|value| value as u8);
+    guest::write_bytes(block, &alloc::vec![0xCC; (size * 4) as usize]);
+    call_export("KeInitializeAffinityEx", &[a]);
+    let fresh = set(a).count.get() == 1 && set(a).size.get() == 0x14 && set(a).reserved.get() == 0 && set(a).bitmap.iter().all(|cell| cell.get() == 0);
+    assert(fresh && flag("KeIsEmptyAffinityEx", &[a]) == Some(1), "ke-affinity-ex: KeInitializeAffinityEx (Count 1, Size 0x14, Bitmap zerado) e vazio");
+    // Processador 70 = grupo 1, bit 6: Count cresce até 2.
+    call_export("KeAddProcessorAffinityEx", &[a, 0]);
+    call_export("KeAddProcessorAffinityEx", &[a, 70]);
+    let added = set(a).count.get() == 2 && set(a).bitmap[0].get() == 1 && set(a).bitmap[1].get() == 1 << 6;
+    let checked = flag("KeCheckProcessorAffinityEx", &[a, 70]) == Some(1) && flag("KeCheckProcessorAffinityEx", &[a, 1]) == Some(0);
+    assert(added && checked && call_export("KeCountSetBitsAffinityEx", &[a]).map(|value| value as u32) == Some(2), "ke-affinity-ex: KeAddProcessorAffinityEx cresce Count ate o grupo; KeCheckProcessorAffinityEx e KeCountSetBitsAffinityEx");
+    call_export("KeRemoveProcessorAffinityEx", &[a, 70]);
+    call_export("KeCopyAffinityEx", &[b, a]);
+    let copied = set(b).count.get() == 2 && set(b).size.get() == 0x14 && set(b).reserved.get() == 0 && set(b).bitmap[0].get() == 1 && set(b).bitmap[1].get() == 0;
+    // C = {processador 0} com Count 1: igual a A, que tem o grupo 1 vazio.
+    call_export("KeInitializeAffinityEx", &[c]);
+    call_export("KeAddProcessorAffinityEx", &[c, 0]);
+    let equal = flag("KeIsEqualAffinityEx", &[a, c]) == Some(1);
+    call_export("KeAddGroupAffinityEx", &[c, 2, 0x30]);
+    let grouped = set(c).count.get() == 3 && set(c).bitmap[2].get() == 0x30;
+    let unequal = flag("KeIsEqualAffinityEx", &[a, c]) == Some(0);
+    assert(copied && equal && grouped && unequal, "ke-affinity-ex: KeCopyAffinityEx, KeIsEqualAffinityEx com Counts diferentes e KeAddGroupAffinityEx");
+    guest::write_bytes(d, &alloc::vec![0xCC; size as usize]);
+    let ored = flag("KeOrAffinityEx", &[a, c, d]) == Some(1) && set(d).count.get() == 3 && set(d).bitmap[0].get() == 1 && set(d).bitmap[2].get() == 0x30 && set(d).bitmap[3].get() == 0 && set(d).reserved.get() == 0 && set(d).size.get() == 0x14;
+    let anded = flag("KeAndAffinityEx", &[a, c, d]) == Some(1) && set(d).count.get() == 2 && set(d).bitmap[0].get() == 1 && set(d).bitmap[2].get() == 0;
+    call_export("KeRemoveProcessorAffinityEx", &[b, 0]);
+    let disjoint = flag("KeAndAffinityEx", &[b, c, 0]) == Some(0) && flag("KeOrAffinityEx", &[b, c, 0]) == Some(1) && flag("KeIsEmptyAffinityEx", &[b]) == Some(1);
+    assert(ored && anded && disjoint, "ke-affinity-ex: KeOrAffinityEx e KeAndAffinityEx (Count, zeros alem de Count e o resultado opcional)");
+    // GROUP_AFFINITY: o bit mais alto vira o índice (grupo * 64 + bit).
+    let group_affinity = block + size * 4;
+    let ga = at::<nt::GroupAffinity>(group_affinity);
+    ga.mask.set(0);
+    ga.group.set(0);
+    let none = call_export("KeFindFirstSetLeftGroupAffinity", &[group_affinity]).map(|value| value as u32) == Some(u32::MAX);
+    ga.mask.set(0b1001_0000);
+    ga.group.set(1);
+    let found = call_export("KeFindFirstSetLeftGroupAffinity", &[group_affinity]).map(|value| value as u32) == Some(71);
+    assert(none && found, "ke-affinity-ex: KeFindFirstSetLeftGroupAffinity = o bit mais alto, ou 0xFFFFFFFF sem bits");
+    let count = call_export("KeQueryActiveProcessorAffinity", &[d]).map(|value| value as u32);
+    assert(count == Some(online as u32) && set(d).count.get() == 1 && set(d).size.get() == 0x14 && set(d).bitmap[0].get() == active, "ke-affinity-ex: KeQueryActiveProcessorAffinity copia KeActiveProcessors e devolve KeNumberProcessors");
+    // KeEnumerateNextProcessor sobre C = {0} | grupo 2 {4, 5}.
+    let context = group_affinity + 0x10;
+    let index = context + 0x18;
+    guest::write64(context, c);
+    guest::write64(context + 8, set(c).bitmap[0].get());
+    guest::write64(context + 0x10, 0);
+    let mut seen = alloc::vec::Vec::new();
+    let mut last = 0u32;
+    for _ in 0..8 {
+        last = call_export("KeEnumerateNextProcessor", &[index, context]).map_or(1, |value| value as u32);
+        if last != 0 {
+            break;
+        }
+        seen.push(guest::read32(index));
+    }
+    assert(seen == [0, 132, 133] && last == 0xC000_0225, "ke-affinity-ex: KeEnumerateNextProcessor percorre os grupos do conjunto e termina com STATUS_NOT_FOUND");
+    guest::free_bytes(block);
+}
+
 fn ke_processors_exports(assert: Assert) {
     let native = |pointer: u64| crate::ntos::mm::kernel_address::image_address(pointer).unwrap_or(pointer);
     let online = crate::ntos::ke::smp::online_cpu_count() as u64;
@@ -14938,6 +15006,7 @@ pub fn run(assert: Assert) {
     se_set_security_exports(assert);
     hvi_hardware_exports(assert);
     ke_processors_exports(assert);
+    ke_affinity_ex_exports(assert);
     ke_kernel_stacks_exports(assert);
     ke_service_tables_exports(assert);
     ke_queues_exports(assert);
