@@ -36,6 +36,8 @@ use crate::hal::physical;
 use crate::rtl::{KernelError, SpinLock};
 
 const PHYSICAL_ADDRESS_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+/// MMPTE_TRANSITION.Transition.
+const PAGE_TRANSITION: u64 = 1 << 11;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Operation {
@@ -218,6 +220,12 @@ impl Tracker {
         // Folhas NOACCESS mantêm backing sem PRESENT; marcadores com PFN zero
         // não criam referência à página física zero.
         if !present && entry & PHYSICAL_ADDRESS_MASK == 0 {
+            return;
+        }
+        // Uma PTE de arquivo de paginação (MMPTE_SOFTWARE sem Transition, com
+        // PageFileHigh nos bits 32..63) guarda o endereço no arquivo, não um
+        // frame. A PTE de transição (Transition, bit 11) segue dona do frame.
+        if level == 1 && !present && entry & PAGE_TRANSITION == 0 && entry >> 32 != 0 {
             return;
         }
         let byte_length = 1u64 << shift;

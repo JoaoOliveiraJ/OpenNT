@@ -68,6 +68,8 @@ use crate::ntos::mm::pfn;
 use crate::ntos::mm::copy_virtual;
 use crate::ntos::mm::process_address_space::SYSTEM_ROOT;
 use crate::ntos::mm::process_commit;
+use crate::ntos::mm::paging_file::Slot as PageFileSlot;
+use crate::ntos::mm::working_set;
 use crate::ntos::mm::section::handles::{self as section_handles, Kind};
 use crate::ntos::mm::section::{address as section_address, views as section_views};
 use crate::ntos::ke::context_switch;
@@ -95,10 +97,35 @@ const USER_MODE: u8 = 1;
 pub const USER_ALLOCATION_TOP: u64 = map::HIGHEST_VAD_ADDRESS + 1;
 
 pub struct PrivateMut {
+    /// O frame de cada página residente ou em transição.
     pub frames: BTreeMap<u64, u64>,
     pub committed_pages: BTreeSet<u64>,
     pub page_protects: BTreeMap<u64, u32>,
     pub protected_frames: BTreeMap<u64, u64>,
+    /// Páginas que o corte do working set tirou do working set
+    /// (`mm/working_set`): em transição (o frame segue em `frames`, numa
+    /// lista de páginas modificadas ou de reserva) ou só no arquivo de
+    /// paginação (sem frame).
+    pub paging: BTreeMap<u64, PagedPage>,
+    /// Páginas residentes cuja cópia no arquivo de paginação ainda vale (a
+    /// página voltou de lá e não foi escrita desde então).
+    pub clean: BTreeMap<u64, PageFileSlot>,
+    /// Operações em curso que trabalham com os frames da região (proteção,
+    /// liberação): o corte do working set não toca a região enquanto há
+    /// alguma.
+    pub busy: u32,
+}
+
+/// Uma página fora do working set (o estado que a PTE de transição ou de
+/// arquivo de paginação descreve no NT).
+#[derive(Clone, Copy, Debug)]
+pub struct PagedPage {
+    /// A cópia no arquivo de paginação, quando há.
+    pub slot: Option<PageFileSlot>,
+    /// Os bits da PTE válida para a volta (U/S, R/W, NX).
+    pub template: u64,
+    /// Em transição (com frame) ou só no arquivo de paginação.
+    pub transition: bool,
 }
 
 /// Região privada (NtAllocateVirtualMemory, pilha e estruturas): commit
@@ -109,12 +136,37 @@ pub struct PrivateRegion {
     pub protect: u32,
     pub allocation_protect: u32,
     pub allocation_type: u32,
+    /// Alocação do NtAllocateVirtualMemory, cujas páginas o corte do working
+    /// set pode levar ao arquivo de paginação. As estruturas que o kernel
+    /// monta para o processo (pilha inicial, PEB, TEB, parâmetros) ficam
+    /// residentes: o kernel as lê também com spin locks retidos, onde uma
+    /// falta de página com E/S não pode ser atendida.
+    pub pageable: bool,
     pub state: SpinLock<PrivateMut>,
 }
 
 impl PrivateRegion {
-    fn new(base: u64, size: u64, protect: u32, allocation_type: u32) -> Arc<Self> {
-        Arc::new(Self { base, size, protect, allocation_protect: protect, allocation_type, state: SpinLock::new(PrivateMut { frames: BTreeMap::new(), committed_pages: BTreeSet::new(), page_protects: BTreeMap::new(), protected_frames: BTreeMap::new() }) })
+    fn new(base: u64, size: u64, protect: u32, allocation_type: u32, pageable: bool) -> Arc<Self> {
+        let state = PrivateMut { frames: BTreeMap::new(), committed_pages: BTreeSet::new(), page_protects: BTreeMap::new(), protected_frames: BTreeMap::new(), paging: BTreeMap::new(), clean: BTreeMap::new(), busy: 0 };
+        Arc::new(Self { base, size, protect, allocation_protect: protect, allocation_type, pageable, state: SpinLock::new(state) })
+    }
+
+    /// Retém a região contra o corte do working set enquanto o guard vive.
+    pub fn hold(&self) -> RegionHold<'_> {
+        self.state.lock().busy += 1;
+        RegionHold { region: self }
+    }
+}
+
+/// A retenção de [`PrivateRegion::hold`].
+pub struct RegionHold<'a> {
+    region: &'a PrivateRegion,
+}
+
+impl Drop for RegionHold<'_> {
+    fn drop(&mut self) {
+        let mut state = self.region.state.lock();
+        state.busy = state.busy.saturating_sub(1);
     }
 }
 
@@ -544,7 +596,7 @@ pub fn allocate_in(space: Space, base_pointer: u64, size_pointer: u64, allocatio
         Ok(base) => base,
         Err(status) => return Ok(status),
     };
-    let region = PrivateRegion::new(base, size, protect, allocation_type);
+    let region = PrivateRegion::new(base, size, protect, allocation_type, true);
     if allocation_type & MEM_COMMIT != 0 {
         // O commit da região inteira é cobrado do processo (e dos jobs dele)
         // antes das páginas.
@@ -579,7 +631,7 @@ fn register_user_region(space: Space, size: u64, alignment: u64, top_down: bool)
         return Err(KernelError::with_status("regiao de usuario num processo sem VAD", STATUS_PROCESS_IS_TERMINATING));
     }
     let base = find_free(space, size, alignment, top_down).map_err(|status| KernelError::with_status("sem VA livre na metade de usuario", status))?;
-    let region = PrivateRegion::new(base, size, 4, MEM_COMMIT | MEM_RESERVE);
+    let region = PrivateRegion::new(base, size, 4, MEM_COMMIT | MEM_RESERVE, false);
     let charged = process_commit::charge(space.process(), size / PAGE);
     if charged != 0 {
         return Err(KernelError::with_status("commit da regiao de usuario acima do limite", charged));
@@ -898,17 +950,20 @@ pub fn free_in(space: Space, base_pointer: u64, size_pointer: u64, free_type: u3
     let mut decommitted = 0;
     while va < end {
         let index = (va - owner.base) / PAGE;
-        let frame = {
+        let (frame, paged, clean) = {
             let mut state = owner.state.lock();
             if state.committed_pages.remove(&index) {
                 decommitted += 1;
                 state.page_protects.remove(&index);
                 state.protected_frames.remove(&index);
-                state.frames.remove(&index)
+                (state.frames.remove(&index), state.paging.remove(&index), state.clean.remove(&index))
             } else {
-                None
+                (None, None, None)
             }
         };
+        // Uma página fora do working set devolve a cópia no arquivo de
+        // paginação e a PTE de software.
+        working_set::discard(space.root(), va, paged, clean);
         if let Some(frame) = frame {
             paging::unmap_page_in(space.root(), va, MapOptions::default());
             pfn::free_page(frame);
@@ -987,6 +1042,16 @@ pub fn protect_in(space: Space, base_pointer: u64, size_pointer: u64, new_protec
         }
     }
     let root = space.root();
+    // As páginas de uma alocação privada voltam ao working set antes da
+    // troca, e a região fica retida contra o corte enquanto ela dura.
+    let owner = private(&region);
+    let _hold = owner.map(|owner| owner.hold());
+    if let Some(owner) = owner {
+        let status = working_set::make_resident(root, owner, (base - owner.base) / PAGE, (end - owner.base) / PAGE);
+        if status != 0 {
+            return Ok(status);
+        }
+    }
     let committed = region.committed_pages();
     let mut changes = Vec::new();
     let mut va = base;
@@ -1078,14 +1143,20 @@ pub fn release_private_region(region: &Region) {
 /// Desmapeia da raiz `root` e devolve ao PFN as páginas comitadas de uma
 /// região privada de `process`, devolvendo o commit delas.
 fn free_region_pages(process: u64, root: u64, owner: &PrivateRegion) {
-    let (pages, committed): (Vec<(u64, u64)>, u64) = {
+    let (pages, committed, paged, clean) = {
         let mut state = owner.state.lock();
-        let pages = state.committed_pages.iter().filter_map(|&index| state.frames.get(&index).map(|&frame| (index, frame))).collect();
+        let pages: Vec<(u64, u64)> = state.committed_pages.iter().filter_map(|&index| state.frames.get(&index).map(|&frame| (index, frame))).collect();
         let committed = state.committed_pages.len() as u64;
         state.committed_pages.clear();
         state.frames.clear();
-        (pages, committed)
+        (pages, committed, core::mem::take(&mut state.paging), core::mem::take(&mut state.clean))
     };
+    for (index, page) in paged {
+        working_set::discard(root, owner.base + index * PAGE, Some(page), None);
+    }
+    for (index, slot) in clean {
+        working_set::discard(root, owner.base + index * PAGE, None, Some(slot));
+    }
     process_commit::release(process, committed);
     for (index, frame) in pages {
         paging::unmap_page_in(root, owner.base + index * PAGE, MapOptions::default());
@@ -1129,8 +1200,15 @@ fn query(process: u64, base: u64, class: u64, buffer: u64, rsp: u64) -> Result<u
     memory_query::query_virtual_memory(process, base, class, buffer, rsp)
 }
 
-/// Registra os handlers Nt*VirtualMemory.
+/// NtCreatePagingFile(PageFileName, MinimumSize, MaximumSize, Priority):
+/// `mm/paging_file/create`.
+fn nt_create_paging_file(name: u64, minimum: u64, maximum: u64, priority: u64, _rsp: u64) -> Result<u32, KernelError> {
+    crate::ntos::mm::paging_file::create::nt_create_paging_file(name, minimum, maximum, priority as u32)
+}
+
+/// Registra os handlers Nt*VirtualMemory e o NtCreatePagingFile.
 pub fn init() {
+    state::register_handler("NtCreatePagingFile", nt_create_paging_file);
     state::register_handler("NtAllocateVirtualMemory", nt_allocate_virtual_memory);
     state::register_handler("NtAllocateVirtualMemoryEx", nt_allocate_virtual_memory_ex);
     state::register_handler("NtFreeVirtualMemory", nt_free_virtual_memory);

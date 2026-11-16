@@ -71,17 +71,50 @@ pub fn unmap_locked_pages(descriptor: u64) {
     set_flags(mdl(descriptor), 0, MDL_MAPPED_TO_SYSTEM_VA);
 }
 
+/// As páginas cobertas pelo buffer do MDL: (primeira VA, quantidade).
+fn covered_pages(descriptor: &Mdl) -> (u64, u64) {
+    let first = descriptor.start_va.get() + descriptor.byte_offset.get() as u64;
+    let count = descriptor.byte_count.get() as u64;
+    (first & !0xFFF, ((first & 0xFFF) + count).div_ceil(0x1000))
+}
+
+/// O buffer do MDL é de usuário (páginas pagináveis).
+fn user_buffer(descriptor: &Mdl) -> bool {
+    descriptor.start_va.get() < memory_map::USER_ADDRESS_LIMIT
+}
+
 /// MmProbeAndLockPages — o pool é residente: as páginas já estão travadas;
-/// o PFN array é real.
+/// o PFN array é real. Num buffer de usuário as páginas voltam ao working
+/// set pela sonda e os frames ficam travados contra o corte do working set
+/// até o MmUnlockPages.
 pub fn probe_and_lock_pages(descriptor: u64) {
     let descriptor = mdl(descriptor);
+    let user = user_buffer(descriptor);
+    let (first, pages) = covered_pages(descriptor);
+    if user {
+        for page in 0..pages {
+            let _ = guest::try_read::<u8>(first + page * 0x1000);
+        }
+    }
     fill_pfn_array(descriptor);
+    if user {
+        for entry in pfn_array(descriptor, pages) {
+            super::working_set::lock_frame(entry.get() * 0x1000);
+        }
+    }
     set_flags(descriptor, MDL_PAGES_LOCKED, 0);
 }
 
 /// MmUnlockPages.
 pub fn unlock_pages(descriptor: u64) {
-    set_flags(mdl(descriptor), 0, MDL_PAGES_LOCKED);
+    let descriptor = mdl(descriptor);
+    if descriptor.mdl_flags.get() & MDL_PAGES_LOCKED != 0 && user_buffer(descriptor) {
+        let (_, pages) = covered_pages(descriptor);
+        for entry in pfn_array(descriptor, pages) {
+            super::working_set::unlock_frame(entry.get() * 0x1000);
+        }
+    }
+    set_flags(descriptor, 0, MDL_PAGES_LOCKED);
 }
 
 // ---- MmAdvanceMdl ------------------------------------------------------------

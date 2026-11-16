@@ -13,7 +13,10 @@
 //!
 //! Cobram aqui as páginas privadas que o NtAllocateVirtualMemory comita e as
 //! regiões privadas que o kernel monta para o processo (pilha, PEB, TEB);
-//! as vistas de seções e as imagens não entram no commit do processo.
+//! as vistas de seções e as imagens não entram no commit do processo. As
+//! mesmas páginas entram antes no commit do sistema (`mm/commit`, o
+//! MiChargeCommit do MiAllocateVirtualMemory), devolvido se o processo ou o
+//! job recusar.
 
 use core::sync::atomic::Ordering;
 
@@ -74,12 +77,17 @@ pub fn charge(process: u64, pages: u64) -> u32 {
     if pages == 0 || process == 0 {
         return 0;
     }
+    if !super::commit::charge(pages) {
+        return STATUS_COMMITMENT_LIMIT;
+    }
     let target = eprocess(process);
     if !charge_process(target, pages) {
+        super::commit::release(pages);
         return STATUS_COMMITMENT_LIMIT;
     }
     if !limits::charge_jobs(process, pages as i64) {
         target.commit_charge.atomic().fetch_sub(pages, Ordering::SeqCst);
+        super::commit::release(pages);
         return STATUS_COMMITMENT_LIMIT;
     }
     0
@@ -92,4 +100,5 @@ pub fn release(process: u64, pages: u64) {
     }
     limits::charge_jobs(process, -(pages as i64));
     eprocess(process).commit_charge.atomic().fetch_sub(pages, Ordering::SeqCst);
+    super::commit::release(pages);
 }

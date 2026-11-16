@@ -69,6 +69,18 @@ pub trait FileSystem: Sync {
     fn copy_range_to_physical(&self, _path: &str, _offset: u64, _address: u64, _length: u64) -> Option<Result<(), KernelError>> {
         None
     }
+    /// Leitura de paginação (IRP_PAGING_IO de um arquivo de paginação): a
+    /// página em `offset` direto das runs do arquivo para o frame
+    /// `physical`, sem tocar metadado; `None` = sem suporte.
+    fn paging_read(&self, _path: &str, _offset: u64, _physical: u64) -> Option<Result<(), KernelError>> {
+        None
+    }
+    /// Escrita de paginação: os bytes direto nas runs já alocadas do
+    /// arquivo, dentro do tamanho dele, sem tocar metadado; `None` = sem
+    /// suporte.
+    fn paging_write(&self, _path: &str, _offset: u64, _bytes: &[u8]) -> Option<Result<(), KernelError>> {
+        None
+    }
     /// Cria vazio ou trunca.
     fn truncate(&self, _path: &str) -> Result<(), KernelError> {
         Err(KernelError::with_status("volume is read-only", STATUS_MEDIA_WRITE_PROTECTED))

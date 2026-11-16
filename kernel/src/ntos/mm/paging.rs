@@ -755,6 +755,44 @@ pub fn unmap_page_in(root: u64, va: u64, options: MapOptions<'_>) -> bool {
     true
 }
 
+/// A folha de 4 KB inteira de `va` na raiz `root` (presente ou não, com
+/// NX), numa leitura de 64 bits; `None` se a tabela de páginas não existe
+/// ou a VA está numa página grande.
+pub fn read_leaf_in(root: u64, va: u64) -> Option<u64> {
+    let pd_entry_address = pd_entry_address(root, va, false, false);
+    if pd_entry_address == 0 {
+        return None;
+    }
+    let entry = read_entry(pd_entry_address);
+    if entry & PAGE_PRESENT == 0 || entry & PAGE_PS != 0 {
+        return None;
+    }
+    Some(read_entry_exact(table_of(entry) + pt_index(va) * 8))
+}
+
+/// Grava a folha de 4 KB inteira de `va` (com NX) numa tabela de páginas
+/// que já existe, numa única escrita de 64 bits: a PTE válida ou os
+/// formatos de software do Mm (transição e arquivo de paginação). Invalida
+/// a VA quando a raiz é a carregada; `false` sem tabela.
+pub fn write_leaf_in(root: u64, va: u64, value: u64) -> bool {
+    if is_recursive_mapping_address(va) {
+        return false;
+    }
+    let pd_entry_address = pd_entry_address(root, va, false, false);
+    if pd_entry_address == 0 {
+        return false;
+    }
+    let entry = read_entry(pd_entry_address);
+    if entry & PAGE_PRESENT == 0 || entry & PAGE_PS != 0 {
+        return false;
+    }
+    write_entry(table_of(entry) + pt_index(va) * 8, value, value & NX_BIT != 0);
+    if root == current_root() {
+        cpu::invalidate_page(va);
+    }
+    true
+}
+
 /// Mapeia uma página de 2MB na raiz corrente.
 pub fn map_large_page(va: u64, pa: u64, flags: u64, nx: bool) -> bool {
     map_large_page_in(current_root(), va, pa, flags, nx)

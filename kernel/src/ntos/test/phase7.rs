@@ -5105,6 +5105,8 @@ pub fn run(assert: Assert) {
     crate::ntos::test::multiprocess::lpc_ports::run(assert);
     crate::ntos::test::multiprocess::jobs::run(assert);
     crate::ntos::test::object_header::run_user(assert);
+    // Deixa um arquivo de paginação na lista: por último.
+    crate::ntos::test::paging_file::run(assert);
     crate::ntos::test::user_half::run(assert);
     debug_print!("PHASE7_SELFTEST_OK");
 }

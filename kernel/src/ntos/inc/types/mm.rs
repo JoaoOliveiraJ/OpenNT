@@ -4995,3 +4995,275 @@ const _: () = {
     assert!(core::mem::size_of::<MmpfnU4>() == 0x8);
     assert!(core::mem::offset_of!(MmpfnU4, entire_field) == 0x0);
 };
+
+/// `_MMPAGING_FILE` (0x120 bytes).
+///
+/// Membros sobrepostos (uniões anônimas do C) ficam nas vistas
+/// `MmpagingFileView1`, alcançada por `Deref`.
+#[repr(C)]
+pub struct MmpagingFile {
+    pub size: Field<u64>,
+    pub maximum_size: Field<u64>,
+    pub minimum_size: Field<u64>,
+    pub free_space: Field<u64>,
+    pub peak_usage: Field<u64>,
+    pub highest_page: Field<u64>,
+    pub free_reservation_space: Field<u64>,
+    /// -> `_FILE_OBJECT`
+    pub file: Field<u64>,
+    /// -> `_MMMOD_WRITER_MDL_ENTRY*`
+    pub entry: Field<u64>,
+    pub number_of_mod_writer_entries: Field<u32>,
+    _pad_4c: Reserved<0x4>,
+    pub pfns_to_free: SlistHeader,
+    pub page_file_name: UnicodeString,
+    /// -> `_MI_PAGING_FILE_SPACE_BITMAPS`
+    pub bitmaps: Field<u64>,
+    pub allocation_bitmap_hint: Field<u32>,
+    pub largest_allocation_cluster: Field<u32>,
+    pub refresh_allocation_cluster: Field<u32>,
+    pub last_refresh_allocation_cluster: Field<u32>,
+    pub reserved_cluster_size_aggregate: Field<u32>,
+    pub maximum_run_length_in_bitmaps: Field<u32>,
+    pub bitmaps_cache_length_tree: RtlRbTree,
+    pub bitmaps_cache_location_tree: RtlRbTree,
+    pub bitmaps_cache_free_list: ListEntry,
+    /// -> `_MI_PAGEFILE_BITMAPS_CACHE_ENTRY`
+    pub bitmaps_cache_entries: Field<u64>,
+    pub to_be_evicted_count: Field<u32>,
+    pub bitfield_cc: Field<u16>,
+    pub bitfield_ce: Field<u8>,
+    pub bitfield_cf: Field<u8>,
+    pub page_hash_pages: Field<u32>,
+    pub page_hash_pages_peak: Field<u32>,
+    /// -> `u32`
+    pub page_hash: Field<u64>,
+    /// -> `void`
+    pub file_handle: Field<u64>,
+    pub spin_lock: Field<i32>,
+    _pad_ec: Reserved<0x4>,
+    pub flow_through_read_root: RtlAvlTree,
+    /// -> `_MI_PARTITION`
+    pub partition: Field<u64>,
+    pub file_object_node: RtlBalancedNode,
+    _pad_118: Reserved<0x8>,
+}
+
+/// Vista 1 de `_MMPAGING_FILE` (membros sobrepostos à vista anterior).
+#[repr(C)]
+pub struct MmpagingFileView1 {
+    _align: [u64; 0],
+    _pad_0: Reserved<0xc8>,
+    pub hybrid_priority: Field<u32>,
+    _pad_cc: Reserved<0x54>,
+}
+
+impl core::ops::Deref for MmpagingFile {
+    type Target = MmpagingFileView1;
+    #[inline(always)]
+    fn deref(&self) -> &MmpagingFileView1 {
+        // SAFETY: vistas do mesmo objeto, mesmo tamanho e alinhamento, só de células.
+        unsafe { &*(self as *const Self).cast::<MmpagingFileView1>() }
+    }
+}
+
+unsafe impl NtStruct for MmpagingFile {}
+
+impl MmpagingFile {
+    /// `PageFileNumber`: bits 0..=3 de `bitfield_cc`.
+    pub const PAGE_FILE_NUMBER_SHIFT: u32 = 0;
+    pub const PAGE_FILE_NUMBER_MASK: u16 = 0xf;
+    #[inline(always)]
+    pub fn page_file_number(&self) -> u16 {
+        self.bitfield_cc.bits(0, 4) as u16
+    }
+    #[inline(always)]
+    pub fn set_page_file_number(&self, value: u16) {
+        self.bitfield_cc.set_bits(0, 4, value as u64)
+    }
+    /// `WsSwapPagefile`: bits 4..=4 de `bitfield_cc`.
+    pub const WS_SWAP_PAGEFILE_SHIFT: u32 = 4;
+    pub const WS_SWAP_PAGEFILE_MASK: u16 = 0x10;
+    #[inline(always)]
+    pub fn ws_swap_pagefile(&self) -> u16 {
+        self.bitfield_cc.bits(4, 1) as u16
+    }
+    #[inline(always)]
+    pub fn set_ws_swap_pagefile(&self, value: u16) {
+        self.bitfield_cc.set_bits(4, 1, value as u64)
+    }
+    /// `NoReservations`: bits 5..=5 de `bitfield_cc`.
+    pub const NO_RESERVATIONS_SHIFT: u32 = 5;
+    pub const NO_RESERVATIONS_MASK: u16 = 0x20;
+    #[inline(always)]
+    pub fn no_reservations(&self) -> u16 {
+        self.bitfield_cc.bits(5, 1) as u16
+    }
+    #[inline(always)]
+    pub fn set_no_reservations(&self, value: u16) {
+        self.bitfield_cc.set_bits(5, 1, value as u64)
+    }
+    /// `VirtualStorePagefile`: bits 6..=6 de `bitfield_cc`.
+    pub const VIRTUAL_STORE_PAGEFILE_SHIFT: u32 = 6;
+    pub const VIRTUAL_STORE_PAGEFILE_MASK: u16 = 0x40;
+    #[inline(always)]
+    pub fn virtual_store_pagefile(&self) -> u16 {
+        self.bitfield_cc.bits(6, 1) as u16
+    }
+    #[inline(always)]
+    pub fn set_virtual_store_pagefile(&self, value: u16) {
+        self.bitfield_cc.set_bits(6, 1, value as u64)
+    }
+    /// `SwapSupported`: bits 7..=7 de `bitfield_cc`.
+    pub const SWAP_SUPPORTED_SHIFT: u32 = 7;
+    pub const SWAP_SUPPORTED_MASK: u16 = 0x80;
+    #[inline(always)]
+    pub fn swap_supported(&self) -> u16 {
+        self.bitfield_cc.bits(7, 1) as u16
+    }
+    #[inline(always)]
+    pub fn set_swap_supported(&self, value: u16) {
+        self.bitfield_cc.set_bits(7, 1, value as u64)
+    }
+    /// `NodeInserted`: bits 8..=8 de `bitfield_cc`.
+    pub const NODE_INSERTED_SHIFT: u32 = 8;
+    pub const NODE_INSERTED_MASK: u16 = 0x100;
+    #[inline(always)]
+    pub fn node_inserted(&self) -> u16 {
+        self.bitfield_cc.bits(8, 1) as u16
+    }
+    #[inline(always)]
+    pub fn set_node_inserted(&self, value: u16) {
+        self.bitfield_cc.set_bits(8, 1, value as u64)
+    }
+    /// `StackNotified`: bits 9..=9 de `bitfield_cc`.
+    pub const STACK_NOTIFIED_SHIFT: u32 = 9;
+    pub const STACK_NOTIFIED_MASK: u16 = 0x200;
+    #[inline(always)]
+    pub fn stack_notified(&self) -> u16 {
+        self.bitfield_cc.bits(9, 1) as u16
+    }
+    #[inline(always)]
+    pub fn set_stack_notified(&self, value: u16) {
+        self.bitfield_cc.set_bits(9, 1, value as u64)
+    }
+    /// `BackedBySCM`: bits 10..=10 de `bitfield_cc`.
+    pub const BACKED_BY_SCM_SHIFT: u32 = 10;
+    pub const BACKED_BY_SCM_MASK: u16 = 0x400;
+    #[inline(always)]
+    pub fn backed_by_scm(&self) -> u16 {
+        self.bitfield_cc.bits(10, 1) as u16
+    }
+    #[inline(always)]
+    pub fn set_backed_by_scm(&self, value: u16) {
+        self.bitfield_cc.set_bits(10, 1, value as u64)
+    }
+    /// `SpecialPurposeMemory`: bits 11..=11 de `bitfield_cc`.
+    pub const SPECIAL_PURPOSE_MEMORY_SHIFT: u32 = 11;
+    pub const SPECIAL_PURPOSE_MEMORY_MASK: u16 = 0x800;
+    #[inline(always)]
+    pub fn special_purpose_memory(&self) -> u16 {
+        self.bitfield_cc.bits(11, 1) as u16
+    }
+    #[inline(always)]
+    pub fn set_special_purpose_memory(&self, value: u16) {
+        self.bitfield_cc.set_bits(11, 1, value as u64)
+    }
+    /// `Spare0`: bits 12..=14 de `bitfield_cc`.
+    pub const SPARE0_SHIFT: u32 = 12;
+    pub const SPARE0_MASK: u16 = 0x7000;
+    #[inline(always)]
+    pub fn spare0(&self) -> u16 {
+        self.bitfield_cc.bits(12, 3) as u16
+    }
+    #[inline(always)]
+    pub fn set_spare0(&self, value: u16) {
+        self.bitfield_cc.set_bits(12, 3, value as u64)
+    }
+    /// `AdriftMdls`: bits 0..=0 de `bitfield_ce`.
+    pub const ADRIFT_MDLS_SHIFT: u32 = 0;
+    pub const ADRIFT_MDLS_MASK: u8 = 0x1;
+    #[inline(always)]
+    pub fn adrift_mdls(&self) -> u8 {
+        self.bitfield_ce.bits(0, 1) as u8
+    }
+    #[inline(always)]
+    pub fn set_adrift_mdls(&self, value: u8) {
+        self.bitfield_ce.set_bits(0, 1, value as u64)
+    }
+    /// `Spare1`: bits 1..=7 de `bitfield_ce`.
+    pub const SPARE1_SHIFT: u32 = 1;
+    pub const SPARE1_MASK: u8 = 0xfe;
+    #[inline(always)]
+    pub fn spare1(&self) -> u8 {
+        self.bitfield_ce.bits(1, 7) as u8
+    }
+    #[inline(always)]
+    pub fn set_spare1(&self, value: u8) {
+        self.bitfield_ce.set_bits(1, 7, value as u64)
+    }
+    /// `IgnoreReservations`: bits 0..=0 de `bitfield_cf`.
+    pub const IGNORE_RESERVATIONS_SHIFT: u32 = 0;
+    pub const IGNORE_RESERVATIONS_MASK: u8 = 0x1;
+    #[inline(always)]
+    pub fn ignore_reservations(&self) -> u8 {
+        self.bitfield_cf.bits(0, 1) as u8
+    }
+    #[inline(always)]
+    pub fn set_ignore_reservations(&self, value: u8) {
+        self.bitfield_cf.set_bits(0, 1, value as u64)
+    }
+    /// `Spare2`: bits 1..=7 de `bitfield_cf`.
+    pub const SPARE2_SHIFT: u32 = 1;
+    pub const SPARE2_MASK: u8 = 0xfe;
+    #[inline(always)]
+    pub fn spare2(&self) -> u8 {
+        self.bitfield_cf.bits(1, 7) as u8
+    }
+    #[inline(always)]
+    pub fn set_spare2(&self, value: u8) {
+        self.bitfield_cf.set_bits(1, 7, value as u64)
+    }
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<MmpagingFile>() == 0x120);
+    assert!(core::mem::offset_of!(MmpagingFile, size) == 0x0);
+    assert!(core::mem::offset_of!(MmpagingFile, maximum_size) == 0x8);
+    assert!(core::mem::offset_of!(MmpagingFile, minimum_size) == 0x10);
+    assert!(core::mem::offset_of!(MmpagingFile, free_space) == 0x18);
+    assert!(core::mem::offset_of!(MmpagingFile, peak_usage) == 0x20);
+    assert!(core::mem::offset_of!(MmpagingFile, highest_page) == 0x28);
+    assert!(core::mem::offset_of!(MmpagingFile, free_reservation_space) == 0x30);
+    assert!(core::mem::offset_of!(MmpagingFile, file) == 0x38);
+    assert!(core::mem::offset_of!(MmpagingFile, entry) == 0x40);
+    assert!(core::mem::offset_of!(MmpagingFile, number_of_mod_writer_entries) == 0x48);
+    assert!(core::mem::offset_of!(MmpagingFile, pfns_to_free) == 0x50);
+    assert!(core::mem::offset_of!(MmpagingFile, page_file_name) == 0x60);
+    assert!(core::mem::offset_of!(MmpagingFile, bitmaps) == 0x70);
+    assert!(core::mem::offset_of!(MmpagingFile, allocation_bitmap_hint) == 0x78);
+    assert!(core::mem::offset_of!(MmpagingFile, largest_allocation_cluster) == 0x7c);
+    assert!(core::mem::offset_of!(MmpagingFile, refresh_allocation_cluster) == 0x80);
+    assert!(core::mem::offset_of!(MmpagingFile, last_refresh_allocation_cluster) == 0x84);
+    assert!(core::mem::offset_of!(MmpagingFile, reserved_cluster_size_aggregate) == 0x88);
+    assert!(core::mem::offset_of!(MmpagingFile, maximum_run_length_in_bitmaps) == 0x8c);
+    assert!(core::mem::offset_of!(MmpagingFile, bitmaps_cache_length_tree) == 0x90);
+    assert!(core::mem::offset_of!(MmpagingFile, bitmaps_cache_location_tree) == 0xa0);
+    assert!(core::mem::offset_of!(MmpagingFile, bitmaps_cache_free_list) == 0xb0);
+    assert!(core::mem::offset_of!(MmpagingFile, bitmaps_cache_entries) == 0xc0);
+    assert!(core::mem::offset_of!(MmpagingFile, to_be_evicted_count) == 0xc8);
+    assert!(core::mem::offset_of!(MmpagingFile, bitfield_cc) == 0xcc);
+    assert!(core::mem::offset_of!(MmpagingFile, bitfield_ce) == 0xce);
+    assert!(core::mem::offset_of!(MmpagingFile, bitfield_cf) == 0xcf);
+    assert!(core::mem::offset_of!(MmpagingFile, page_hash_pages) == 0xd0);
+    assert!(core::mem::offset_of!(MmpagingFile, page_hash_pages_peak) == 0xd4);
+    assert!(core::mem::offset_of!(MmpagingFile, page_hash) == 0xd8);
+    assert!(core::mem::offset_of!(MmpagingFile, file_handle) == 0xe0);
+    assert!(core::mem::offset_of!(MmpagingFile, spin_lock) == 0xe8);
+    assert!(core::mem::offset_of!(MmpagingFile, flow_through_read_root) == 0xf0);
+    assert!(core::mem::offset_of!(MmpagingFile, partition) == 0xf8);
+    assert!(core::mem::offset_of!(MmpagingFile, file_object_node) == 0x100);
+    assert!(core::mem::size_of::<MmpagingFileView1>() == 0x120);
+    assert!(core::mem::align_of::<MmpagingFileView1>() == core::mem::align_of::<MmpagingFile>());
+    assert!(core::mem::offset_of!(MmpagingFileView1, hybrid_priority) == 0xc8);
+};

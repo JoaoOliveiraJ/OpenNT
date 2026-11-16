@@ -2264,6 +2264,53 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   drenadas também (`drain_kernel_apcs`); os pumps de ALPC, de pacotes de
   espera e de timers só mexem em memória do kernel. O modo estrito de posse
   (seção 3.3) confere tudo isso. Teste: `ntos/test/multiprocess/ownership.rs`.
+- **Arquivos de paginação e working set** (`mm/paging_file/`,
+  `mm/working_set.rs`, `mm/modified_writer.rs`, `mm/commit.rs`,
+  `mm/memory_information.rs`). Estruturas e formatos do ntoskrnl 19041.
+  - `paging_file/create.rs`: NtCreatePagingFile (MiCreatePagingFile).
+    Confere Priority, SeCreatePagefilePrivilege, tamanhos e nome. Cria o
+    arquivo com IO_OPEN_PAGING_FILE e a DACL de Administradores e
+    LocalSystem, põe o fim do arquivo no tamanho mínimo e zera a primeira
+    página por E/S de paginação. O adaptador de usuário está em
+    `ps/user/memory.rs`.
+  - O smss.exe real chama o NtCreatePagingFile com o valor `PagingFiles` do
+    Session Manager (`cm/session_manager.rs`: `D:\pagefile.sys 192 256`).
+    Antes ele abre `Control\CrashControl` e lista os volumes com o
+    ProcessDeviceMap (`ob/device_map.rs`, montado a partir dos links `X:`
+    do `\GLOBAL??`).
+  - Até 16 arquivos, cada um com um `_MMPAGING_FILE` do PDB no pool. O
+    espaço livre é um bitmap do tamanho máximo; as páginas 0 e 1 ficam
+    reservadas.
+  - `commit.rs`: commit do sistema. O limite começa nas páginas físicas e
+    sobe com o tamanho de cada arquivo. A página privada comitada cobra do
+    sistema antes do processo. Acima do limite a alocação falha com
+    STATUS_COMMITMENT_LIMIT.
+  - E/S: IoPageRead e IoSynchronousPageWrite (IRP_PAGING_IO,
+    `io/paging_io.rs`), enviados ao dispositivo do IoGetRelatedDeviceObject.
+    No D: (file system embutido) o volume atende esses IRPs direto nas runs
+    do arquivo (`drivers/fs/volume_device.rs`, `Ntfs::paging_write`).
+  - Página fora do working set: entrada no `paging` da região
+    (`ps/user/memory.rs`) e PTE de transição ou de arquivo de paginação
+    (PageFileLow = arquivo, PageFileHigh = página).
+  - Corte do working set: roda quando falta memória (recuperador do PFN).
+    Usa segunda chance pelo bit Accessed. Página suja vai para a lista de
+    modificadas; página limpa com cópia no arquivo vai para a de reserva.
+  - MiModifiedPageWriter: thread de prioridade 18 que grava as modificadas
+    em clusters de até 16 páginas. Quem espera memória também grava, no
+    próprio contexto.
+  - Faltas: a de transição volta a mapear o frame sem E/S; a de arquivo de
+    paginação lê a página num frame novo. Falta de usuário, falta de kernel
+    em VA de usuário e sondas de `guest_memory` passam por
+    `working_set::page_in`. MmProbeAndLockPages trava os frames até o
+    MmUnlockPages.
+  - NtQuerySystemInformation: SystemPerformanceInformation e
+    SystemPageFileInformation(Ex).
+  - Diferenças: sem working set por processo; pilha inicial, PEB, TEB e
+    parâmetros do processo ficam residentes; o writer é síncrono; o arquivo
+    não cresce nem encolhe.
+  - Testes: `ntos/test/paging_file.rs` (fase 7) e o [[teste]] `pagefile`
+    (`PAGEFILE_OK` e o `MEMORY_PRESSURE_OK` de
+    `ntos/test/memory_pressure.rs`).
 - **Montagem de volumes por um file system real** (`io/file_system.rs`,
   `io/parse.rs`, `drivers/storage/ata_volume.rs`), como no NT:
   - IoCreateDevice dá a todo dispositivo montável (disco, CD-ROM, fita,

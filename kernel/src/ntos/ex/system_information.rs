@@ -142,6 +142,9 @@ pub fn query(class: u32, output: u64, length: u32, returned: u64) -> Result<u32,
         126 => return crate::ntos::bgk::graphics_information::query_system_information(output, length, returned),
         // SystemBasicInformation e as variantes Emulation/NativeBasic x64.
         0 | 62 | 114 => return Ok(basic_information(output, length, returned)),
+        // SystemPerformanceInformation e SystemPageFileInformation(Ex):
+        // `mm/memory_information`.
+        2 | 18 | 144 => return query_memory_information(class, output, length, returned),
         5 => {}
         _ => return Ok(0xC000_000D),
     }
@@ -180,6 +183,27 @@ fn basic_information(output: u64, length: u32, returned: u64) -> u32 {
     basic.active_processors_affinity_mask.set((1u64 << processors) - 1);
     basic.number_of_processors.set(processors as i8);
     0
+}
+
+/// As classes de memória do Mm, de modo kernel.
+fn query_memory_information(class: u32, output: u64, length: u32, returned: u64) -> Result<u32, KernelError> {
+    use crate::ntos::mm::memory_information;
+    let set_returned = |value: u32| {
+        if returned != 0 {
+            // SAFETY: o PULONG ReturnLength do chamador (modo kernel).
+            unsafe { Field::<u32>::at(returned) }.set(value);
+        }
+    };
+    if class != 2 {
+        let entry = memory_information::page_file_entry_size(class == 144);
+        if length < entry {
+            set_returned(entry);
+            return Ok(memory_information::STATUS_INFO_LENGTH_MISMATCH);
+        }
+    }
+    let (status, size) = if class == 2 { memory_information::performance_information(output, length)? } else { memory_information::page_file_information(output, length, class == 144)? };
+    set_returned(size);
+    Ok(status)
 }
 
 // ---- NtQuerySystemInformationEx / ZwQuerySystemInformationEx (modo kernel) --

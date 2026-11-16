@@ -1,0 +1,124 @@
+//! As classes do NtQuerySystemInformation que o Mm responde sobre a
+//! memória virtual do sistema, como o ExpQuerySystemInformation do ntoskrnl
+//! 19041:
+//!
+//! - SystemPerformanceInformation (2, o ExpQuerySystemPerformanceInformation
+//!   em rva 0x6bf5c0): a estrutura de 0x158 bytes; um buffer menor que 0x138
+//!   (a versão antiga) é STATUS_INFO_LENGTH_MISMATCH com ReturnLength 0x158,
+//!   senão vão min(Length, 0x158) bytes e esse é o ReturnLength. Do Mm saem
+//!   AvailablePages, CommittedPages, CommitLimit e PeakCommitment (o pico
+//!   nunca abaixo do commit), as contagens de faltas, de leituras e de
+//!   escritas do arquivo de paginação e ResidentAvailablePages; os
+//!   contadores que o OpenNT não mantém (E/S de arquivo, pool, Cc, trocas
+//!   de contexto) ficam zerados.
+//! - SystemPageFileInformation (18) e SystemPageFileInformationEx (144), o
+//!   MmGetPageFileInformation (rva 0x6a1644): uma entrada por arquivo de
+//!   paginação (0x20 bytes, 0x28 na Ex com MinimumSize e MaximumSize), em
+//!   páginas, com TotalInUse = Size - FreeSpace - 2, o nome logo depois da
+//!   entrada (MaximumLength = Length + 2, terminado em NUL) e
+//!   NextEntryOffset até a próxima entrada alinhada a 8 (0 na última).
+//!   Sem espaço para a próxima entrada ou para o nome, ReturnLength diz até
+//!   onde ia e o status é STATUS_INFO_LENGTH_MISMATCH. Sem arquivos, a
+//!   primeira entrada fica com NextEntryOffset e TotalSize zero e
+//!   ReturnLength 0.
+
+use core::sync::atomic::Ordering;
+
+use super::{commit, paging_file, pfn, working_set};
+use crate::ntos::mm::guest_memory as guest;
+use crate::rtl::KernelError;
+
+pub const PERFORMANCE_INFORMATION_SIZE: u32 = 0x158;
+const PERFORMANCE_INFORMATION_MINIMUM: u32 = 0x138;
+pub const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
+
+/// Deslocamentos da SYSTEM_PERFORMANCE_INFORMATION.
+mod performance {
+    pub const AVAILABLE_PAGES: u64 = 0x2C;
+    pub const COMMITTED_PAGES: u64 = 0x30;
+    pub const COMMIT_LIMIT: u64 = 0x34;
+    pub const PEAK_COMMITMENT: u64 = 0x38;
+    pub const PAGE_FAULT_COUNT: u64 = 0x3C;
+    pub const TRANSITION_COUNT: u64 = 0x44;
+    pub const PAGE_READ_COUNT: u64 = 0x50;
+    pub const PAGE_READ_IO_COUNT: u64 = 0x54;
+    pub const DIRTY_PAGES_WRITE_COUNT: u64 = 0x60;
+    pub const DIRTY_WRITE_IO_COUNT: u64 = 0x64;
+    pub const RESIDENT_AVAILABLE_PAGES: u64 = 0x148;
+}
+
+fn clamp32(value: u64) -> u32 {
+    value.min(u32::MAX as u64) as u32
+}
+
+/// SystemPerformanceInformation em `buffer` (sondado pelo chamador):
+/// (NTSTATUS, ReturnLength).
+pub fn performance_information(buffer: u64, length: u32) -> Result<(u32, u32), KernelError> {
+    if length < PERFORMANCE_INFORMATION_MINIMUM {
+        return Ok((STATUS_INFO_LENGTH_MISMATCH, PERFORMANCE_INFORMATION_SIZE));
+    }
+    let mut image = [0u8; PERFORMANCE_INFORMATION_SIZE as usize];
+    let mut put = |offset: u64, value: u32| image[offset as usize..offset as usize + 4].copy_from_slice(&value.to_le_bytes());
+    let commitment = commit::snapshot();
+    let available = pfn::free_count();
+    put(performance::AVAILABLE_PAGES, clamp32(available));
+    put(performance::COMMITTED_PAGES, clamp32(commitment.committed));
+    put(performance::COMMIT_LIMIT, clamp32(commitment.limit));
+    put(performance::PEAK_COMMITMENT, clamp32(commitment.peak.max(commitment.committed)));
+    let counters = &working_set::COUNTERS;
+    put(performance::PAGE_FAULT_COUNT, clamp32(counters.page_faults.load(Ordering::Relaxed)));
+    put(performance::TRANSITION_COUNT, clamp32(counters.transition_faults.load(Ordering::Relaxed)));
+    put(performance::PAGE_READ_COUNT, clamp32(counters.page_reads.load(Ordering::Relaxed)));
+    put(performance::PAGE_READ_IO_COUNT, clamp32(counters.page_read_ios.load(Ordering::Relaxed)));
+    put(performance::DIRTY_PAGES_WRITE_COUNT, clamp32(counters.dirty_pages_written.load(Ordering::Relaxed)));
+    put(performance::DIRTY_WRITE_IO_COUNT, clamp32(counters.dirty_write_ios.load(Ordering::Relaxed)));
+    image[performance::RESIDENT_AVAILABLE_PAGES as usize..performance::RESIDENT_AVAILABLE_PAGES as usize + 8].copy_from_slice(&available.to_le_bytes());
+    let copied = length.min(PERFORMANCE_INFORMATION_SIZE);
+    guest::try_write_bytes(buffer, &image[..copied as usize])?;
+    Ok((0, copied))
+}
+
+/// O tamanho mínimo do buffer da SystemPageFileInformation(Ex).
+pub fn page_file_entry_size(extended: bool) -> u32 {
+    if extended {
+        0x28
+    } else {
+        0x20
+    }
+}
+
+/// MmGetPageFileInformation em `buffer` (sondado pelo chamador, com pelo
+/// menos uma entrada): (NTSTATUS, ReturnLength).
+pub fn page_file_information(buffer: u64, length: u32, extended: bool) -> Result<(u32, u32), KernelError> {
+    let entry_size = page_file_entry_size(extended);
+    guest::try_write::<u32>(buffer + 4, 0)?;
+    let mut used = 0u32;
+    let mut last = buffer;
+    for file in paging_file::information() {
+        let entry = buffer + used as u64;
+        let after_entry = used.checked_add(entry_size).filter(|&end| end <= length);
+        let Some(after_entry) = after_entry else { return Ok((STATUS_INFO_LENGTH_MISMATCH, used + entry_size)) };
+        last = entry;
+        guest::try_write::<u32>(entry + 4, clamp32(file.total_size))?;
+        guest::try_write::<u32>(entry + 8, clamp32(file.total_in_use))?;
+        guest::try_write::<u32>(entry + 0xC, clamp32(file.peak_usage))?;
+        if extended {
+            guest::try_write::<u32>(entry + 0x20, clamp32(file.minimum))?;
+            guest::try_write::<u32>(entry + 0x24, clamp32(file.maximum))?;
+        }
+        let units: alloc::vec::Vec<u16> = file.name.encode_utf16().collect();
+        let name_length = units.len() as u32 * 2;
+        guest::try_write::<u16>(entry + 0x10, name_length as u16)?;
+        guest::try_write::<u16>(entry + 0x12, name_length as u16 + 2)?;
+        guest::try_write::<u64>(entry + 0x18, entry + entry_size as u64)?;
+        let aligned = (name_length + 2 + 7) & !7;
+        let Some(after_name) = after_entry.checked_add(aligned).filter(|&end| end <= length) else { return Ok((STATUS_INFO_LENGTH_MISMATCH, after_entry + aligned)) };
+        let mut bytes: alloc::vec::Vec<u8> = units.iter().flat_map(|unit| unit.to_le_bytes()).collect();
+        bytes.extend_from_slice(&[0, 0]);
+        guest::try_write_bytes(entry + entry_size as u64, &bytes)?;
+        guest::try_write::<u32>(entry, aligned + entry_size)?;
+        used = after_name;
+    }
+    guest::try_write::<u32>(last, 0)?;
+    Ok((0, used))
+}

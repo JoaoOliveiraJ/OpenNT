@@ -11,6 +11,10 @@
 //! conclusão o NT copia o IO_STATUS_BLOCK inteiro para UserIosb, sinaliza
 //! UserEvent e libera o IRP (o MDL é do Mm).
 //!
+//! O IRP vai ao dispositivo do IoGetRelatedDeviceObject do arquivo, também
+//! nos volumes do próprio kernel, cujo file system embutido atende a E/S de
+//! paginação dos arquivos de paginação (`drivers/fs/volume_device.rs`).
+//!
 //! Diferenças declaradas: os IRPs de reserva/"backpocket" do NT para falta de
 //! memória não existem (sem IRP -> STATUS_INSUFFICIENT_RESOURCES, o mesmo
 //! status do NT quando eles também faltam); o IRP não entra na lista de IRPs
@@ -32,6 +36,7 @@ use crate::ntos::ps::process;
 use crate::rtl::{KernelError, SpinLock};
 
 pub const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
+const STATUS_INVALID_DEVICE_REQUEST: u32 = 0xC000_0010;
 
 const IRP_PAGING_IO: u32 = 0x02;
 const IRP_SYNCHRONOUS_PAGING_IO: u32 = 0x40;
@@ -142,7 +147,10 @@ pub fn page_read(request: &PagingRequest<'_>, file_tags: u64, descriptor_tags: u
     if descriptor_tags & 2 != 0 {
         tags |= READ_MDL_TAG_TWO;
     }
-    let device = information::related_device(request.file.address())?;
+    let device = information::related_device_object(request.file.address())?;
+    if device == 0 {
+        return Ok(STATUS_INVALID_DEVICE_REQUEST);
+    }
     let flags = if tags & READ_MDL_TAG_ONE != 0 { PAGING_READ_ALTERNATE_FLAGS } else { PAGING_FLAGS };
     // Leitura marcada (bit 0 do FileObject) reserva a extensão embutida (DeviceObject -1).
     let target = if tags & READ_FILE_TAG_ONE != 0 { u64::MAX } else { device };
@@ -171,7 +179,10 @@ pub fn page_read(request: &PagingRequest<'_>, file_tags: u64, descriptor_tags: u
 /// IoSynchronousPageWrite(FileObject, MemoryDescriptorList, StartingOffset,
 /// Event, IoStatusBlock) = IoSynchronousPageWriteEx(..., 0, NULL).
 pub fn synchronous_page_write(request: &PagingRequest<'_>) -> Result<u32, KernelError> {
-    let device = information::related_device(request.file.address())?;
+    let device = information::related_device_object(request.file.address())?;
+    if device == 0 {
+        return Ok(STATUS_INVALID_DEVICE_REQUEST);
+    }
     let packet = irp_request::allocate_irp_ex(device, device_stack_size(device), false);
     if packet == 0 {
         return Ok(STATUS_INSUFFICIENT_RESOURCES);

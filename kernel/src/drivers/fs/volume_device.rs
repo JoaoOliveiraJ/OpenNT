@@ -20,14 +20,18 @@
 //! pilha de IRP: o I/O Manager responde no lugar as operações dos arquivos
 //! dele (`io/file/information.rs::related_device` não acha dispositivo de
 //! despacho), e um IRP que um driver mande ao dispositivo de volume termina
-//! com STATUS_INVALID_DEVICE_REQUEST.
+//! com STATUS_INVALID_DEVICE_REQUEST. A exceção é a E/S de paginação dos
+//! arquivos de paginação (MmIsFileObjectAPagingFile): o IoPageRead e o
+//! IoSynchronousPageWrite do Mm chegam aqui como IRP_MJ_READ/WRITE com
+//! IRP_PAGING_IO e um MDL de páginas inteiras, e vão direto às runs do
+//! arquivo (`FileSystem::paging_read`/`paging_write`).
 
 use alloc::string::String;
 use alloc::vec::Vec;
 
 use super::volume::{self, FileSystem};
 use crate::ntos::inc::field::NtStruct;
-use crate::ntos::inc::types::{DeviceObject, DriverExtension, DriverObject, FileObject, Irp, Vpb};
+use crate::ntos::inc::types::{DeviceObject, DriverExtension, DriverObject, FileObject, IoStackLocation, Irp, Mdl, Vpb};
 use crate::ntos::io::{file_system, io_manager};
 use crate::ntos::ke::dispatcher;
 use crate::ntos::mm::guest_memory as guest;
@@ -41,6 +45,13 @@ const FILE_DEVICE_DISK: u32 = 0x07;
 const FILE_DEVICE_DISK_FILE_SYSTEM: u32 = 0x08;
 const STATUS_SUCCESS: u32 = 0;
 const STATUS_INVALID_DEVICE_REQUEST: u32 = 0xC000_0010;
+const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+const STATUS_UNEXPECTED_IO_ERROR: u32 = 0xC000_00E9;
+const IRP_MJ_READ: u8 = 3;
+const IRP_MJ_WRITE: u8 = 4;
+/// IRP.Flags: IRP_PAGING_IO.
+const IRP_PAGING_IO: u32 = 0x02;
+const PAGE: u64 = 0x1000;
 /// Nome do DRIVER_OBJECT do file system embutido.
 const DRIVER_NAME: &str = "\\FileSystem\\KernelVolume";
 
@@ -202,13 +213,66 @@ pub fn bind_file(file: u64, file_system: &'static dyn FileSystem, path: &str) ->
     Ok(Binding { vpb: entry.vpb })
 }
 
+/// IRP_MJ_READ/WRITE com IRP_PAGING_IO num arquivo de paginação deste
+/// volume: (NTSTATUS, Information); `None` para qualquer outro IRP.
+fn paging_io(device: u64, irp: &Irp) -> Option<(u32, u64)> {
+    if irp.flags.get() & IRP_PAGING_IO == 0 {
+        return None;
+    }
+    // SAFETY: a stack location corrente do IRP entregue a este dispositivo.
+    let stack = unsafe { IoStackLocation::at(irp.tail.overlay.current_stack_location.get()) };
+    let major = stack.major_function.get();
+    let file = stack.file_object.get();
+    if (major != IRP_MJ_READ && major != IRP_MJ_WRITE) || !crate::ntos::mm::paging_file::is_paging_file(file) {
+        return None;
+    }
+    let entry = VOLUMES.lock().iter().copied().find(|entry| entry.volume == device)?;
+    let (file_system, path) = crate::ntos::io::file::zw::file_backing(file).filter(|(file_system, _)| volume::same(*file_system, entry.file_system))?;
+    let length = stack.parameters.read.length.get() as u64;
+    let offset = stack.parameters.read.byte_offset.quad_part.get() as u64;
+    let descriptor = irp.mdl_address.get();
+    // SAFETY: o MDL do IRP de paginação, com o vetor de PFNs logo depois.
+    let byte_offset = if descriptor != 0 { unsafe { Mdl::at(descriptor) }.byte_offset.get() } else { 1 };
+    if descriptor == 0 || byte_offset != 0 || length == 0 || length % PAGE != 0 || offset % PAGE != 0 {
+        return Some((STATUS_INVALID_PARAMETER, 0));
+    }
+    let frames: Vec<u64> = (0..length / PAGE).map(|index| guest::read64(descriptor + Mdl::SIZE + index * 8) * PAGE).collect();
+    let result: Result<Option<()>, KernelError> = if major == IRP_MJ_READ {
+        let mut outcome = Ok(Some(()));
+        for (index, &frame) in frames.iter().enumerate() {
+            match file_system.paging_read(&path, offset + index as u64 * PAGE, frame) {
+                Some(Ok(())) => {}
+                Some(Err(error)) => {
+                    outcome = Err(error);
+                    break;
+                }
+                None => {
+                    outcome = Ok(None);
+                    break;
+                }
+            }
+        }
+        outcome
+    } else {
+        let bytes: Vec<u8> = frames.iter().flat_map(|&frame| crate::hal::physical::read_bytes(frame, PAGE as usize)).collect();
+        file_system.paging_write(&path, offset, &bytes).transpose()
+    };
+    match result {
+        Ok(Some(())) => Some((STATUS_SUCCESS, length)),
+        Ok(None) => None,
+        Err(error) => Some((if error.status != 0 { error.status } else { STATUS_UNEXPECTED_IO_ERROR }, 0)),
+    }
+}
+
 /// A rotina de despacho do file system embutido: os arquivos dele são
-/// respondidos no lugar pelo I/O Manager, então todo IRP é recusado.
-extern "win64" fn dispatch(_device: u64, packet: u64) -> i32 {
+/// respondidos no lugar pelo I/O Manager, então todo IRP é recusado, salvo
+/// a E/S de paginação dos arquivos de paginação.
+extern "win64" fn dispatch(device: u64, packet: u64) -> i32 {
     // SAFETY: IRP vivo entregue ao dispositivo de volume.
     let irp = unsafe { Irp::at(packet) };
-    irp.io_status.status.set(STATUS_INVALID_DEVICE_REQUEST as i32);
-    irp.io_status.information.set(0);
+    let (status, information) = paging_io(device, irp).unwrap_or((STATUS_INVALID_DEVICE_REQUEST, 0));
+    irp.io_status.status.set(status as i32);
+    irp.io_status.information.set(information);
     io_manager::iof_complete_request(packet);
-    STATUS_INVALID_DEVICE_REQUEST as i32
+    status as i32
 }

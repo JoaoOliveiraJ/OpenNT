@@ -16,7 +16,7 @@ use super::threads;
 use crate::hal::{amd64::usermode, cpu, kmalloc, serial};
 use crate::ntos::ex::boot_environment_information;
 use crate::ntos::ke::{clock, dispatcher, pcr, processor_information, smp};
-use crate::ntos::mm::{memory_map, pfn};
+use crate::ntos::mm::{memory_information, memory_map, pfn};
 use crate::ntos::ob::handles::namespace as namespace_handles;
 use crate::ntos::ps::{image_information, system_process_information};
 use crate::ntos::ps::context::registers as thread_context_registers;
@@ -385,6 +385,23 @@ fn query_system_information(class: u32, buffer: u64, length: u64, returned: u64)
             73 => {
                 let (status, required) = crate::ntos::ke::processor_topology::build_logical_processor_information(0, buffer, length as u32, &mut |address, bytes| guest::try_write_bytes(address, bytes).is_ok());
                 set_returned(required)?;
+                Ok(status)
+            }
+            // SystemPerformanceInformation e SystemPageFileInformation(Ex):
+            // `mm/memory_information`.
+            2 => {
+                let (status, size) = memory_information::performance_information(buffer, length as u32)?;
+                set_returned(size)?;
+                Ok(status)
+            }
+            18 | 144 => {
+                let entry = memory_information::page_file_entry_size(class == 144);
+                if (length as u32) < entry {
+                    set_returned(entry)?;
+                    return Ok(STATUS_INFO_LENGTH_MISMATCH);
+                }
+                let (status, size) = memory_information::page_file_information(buffer, length as u32, class == 144)?;
+                set_returned(size)?;
                 Ok(status)
             }
             // SystemRangeStartInformation: um ULONG_PTR.

@@ -36,7 +36,10 @@ use crate::ntos::inc::types::{
 const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
 const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
 const STATUS_MEDIA_WRITE_PROTECTED: u32 = 0xC000_00A2;
+const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+/// FileEndOfFileInformation.
+const FILE_END_OF_FILE_INFORMATION: u32 = 20;
 
 /// Disposições FILE_* (wdm.h) e resultados em IO_STATUS_BLOCK.Information.
 const FILE_SUPERSEDE: u32 = 0;
@@ -654,8 +657,27 @@ pub fn query_volume_information_file(handle: u64, io_status: u64, buffer: u64, l
 
 /// ZwSetInformationFile: FileDisposition[Ex]Information apaga de fato no
 /// volume gravável; volume somente leitura = MEDIA_WRITE_PROTECTED.
+/// FileEndOfFileInformation (20) muda o tamanho de um arquivo de volume,
+/// como o NtSetInformationFile de modo usuário (`ps/user/file_io.rs`), com
+/// FILE_WRITE_DATA no handle.
 pub fn set_information_file(handle: u64, io_status: u64, input: u64, class: u32) -> Result<u32, KernelError> {
     let Some(entry) = entry_of(handle) else { return Ok(STATUS_INVALID_HANDLE) };
+    if class == FILE_END_OF_FILE_INFORMATION {
+        let Backing::Volume { volume, path } = &entry.backing else { return Ok(STATUS_INVALID_PARAMETER) };
+        if entry.access & 2 == 0 {
+            return Ok(STATUS_ACCESS_DENIED);
+        }
+        // SAFETY: FILE_END_OF_FILE_INFORMATION (um LARGE_INTEGER) do chamador Zw.
+        let size = unsafe { Field::<u64>::at(input) }.get();
+        match volume.resize(path, size) {
+            None => return Ok(STATUS_MEDIA_WRITE_PROTECTED),
+            Some(result) => {
+                result?;
+            }
+        }
+        write_io_status(io_status, 0, 0);
+        return Ok(0);
+    }
     if class != 13 && class != 64 {
         return Ok(STATUS_INVALID_PARAMETER);
     }

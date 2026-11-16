@@ -306,6 +306,14 @@ impl super::volume::FileSystem for Ntfs {
         Some(Ntfs::copy_range_to_physical(self, path, offset, address, length))
     }
 
+    fn paging_read(&self, path: &str, offset: u64, physical: u64) -> Option<Result<(), KernelError>> {
+        Some(Ntfs::copy_range_to_physical(self, path, offset, physical, 0x1000))
+    }
+
+    fn paging_write(&self, path: &str, offset: u64, bytes: &[u8]) -> Option<Result<(), KernelError>> {
+        Some(Ntfs::paging_write(self, path, offset, bytes))
+    }
+
     fn truncate(&self, path: &str) -> Result<(), KernelError> {
         if Ntfs::exists(self, path)? {
             Ntfs::resize(self, path, 0).map(|_| ())
@@ -790,6 +798,39 @@ impl Ntfs {
             return Err(error("NTFS: runlist menor que o tamanho do arquivo"));
         }
         Ok(())
+    }
+
+    /// Escrita de paginação: `bytes` (setores inteiros) em `offset` do $DATA
+    /// não residente, direto nas runs já alocadas e dentro do tamanho do
+    /// arquivo, sem transação nem metadado, como a E/S de paginação de um
+    /// arquivo de paginação no NTFS (o mapa de runs fica residente e a
+    /// escrita vai ao disco pelos LCNs dele).
+    pub fn paging_write(&self, path: &str, offset: u64, bytes: &[u8]) -> Result<(), KernelError> {
+        let _shared = self.resource().acquire_shared();
+        let length = bytes.len() as u64;
+        if offset % 512 != 0 || length % 512 != 0 {
+            return Err(error("NTFS: escrita de paginacao desalinhada"));
+        }
+        let layout = self.file_layout(path)?.filter(|layout| offset + length <= layout.size).ok_or_else(|| error("NTFS: escrita de paginacao fora do arquivo"))?;
+        let runs = layout.runs.ok_or_else(|| error("NTFS: arquivo de paginacao residente"))?;
+        let (mut cursor, mut done, mut run_start) = (offset, 0u64, 0u64);
+        for run in runs {
+            let run_end = run_start + run.sectors * 512;
+            if cursor >= run_end {
+                run_start = run_end;
+                continue;
+            }
+            let take = (length - done).min(run_end - cursor);
+            let lba = run.lba + (cursor - run_start) / 512;
+            ata_pio::write_sectors(lba, &bytes[done as usize..(done + take) as usize], self.drive)?;
+            cursor += take;
+            done += take;
+            if done == length {
+                return Ok(());
+            }
+            run_start = run_end;
+        }
+        Err(error("NTFS: runlist menor que o tamanho do arquivo"))
     }
 
     /// Só metadado (registro e runlist); -1 quando o arquivo não existe.
