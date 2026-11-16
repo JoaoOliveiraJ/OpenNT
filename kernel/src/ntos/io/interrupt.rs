@@ -12,6 +12,15 @@
 //! atribuiu a ela: a HAL registra a linha do 8259 que alimenta o vetor
 //! (`hal::interrupt_lines`); sem vetor atribuído, a linha chega no vetor
 //! fixo dela (`resources::translate_interrupt`). O modo vem do próprio dado.
+//!
+//! O MESSAGE_BASED é o do IoConnectInterruptEx do NT: o
+//! IopConnectMessageBasedInterrupt falha quando o dispositivo não recebeu
+//! interrupções por mensagem (o barramento PCI do OpenNT só atribui a linha),
+//! e então, com um FallBackServiceRoutine, a interrupção de linha do PDO é
+//! conectada com essa rotina (IopConnectLineBasedInterrupt, com o
+//! ConnectionContext como *InterruptObject) e o Version de entrada vira
+//! CONNECT_LINE_BASED, que o driver lê para saber o que recebeu (o
+//! storport.sys pede assim e cai na linha INTx).
 
 use crate::ntos::init::exports::signed_status;
 use crate::ntos::inc::types::{GroupAffinity, InterruptConnectionType, InterruptVectorData, IoConnectInterruptParameters, IoDisconnectInterruptParameters, Kinterrupt, NtStruct};
@@ -19,15 +28,21 @@ use crate::ntos::io::device_resources;
 use crate::ntos::ke::interrupt_object;
 use crate::rtl::KernelError;
 
-/// CONNECT_FULLY_SPECIFIED, CONNECT_LINE_BASED e CONNECT_FULLY_SPECIFIED_GROUP.
+/// CONNECT_FULLY_SPECIFIED, CONNECT_LINE_BASED, CONNECT_MESSAGE_BASED e
+/// CONNECT_FULLY_SPECIFIED_GROUP.
 const CONNECT_FULLY_SPECIFIED: u32 = 1;
 const CONNECT_LINE_BASED: u32 = 2;
+const CONNECT_MESSAGE_BASED: u32 = 3;
 const CONNECT_FULLY_SPECIFIED_GROUP: u32 = 4;
+/// STATUS_NOT_SUPPORTED (o versão desconhecida e o MESSAGE_BASED sem
+/// mensagens nem rotina de recuo).
+const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
 
 /// IoConnectInterruptEx: LINE_BASED (2) pelo recurso do PDO; FULLY_SPECIFIED
-/// (1/4) pelos campos; MESSAGE_BASED (MSI) sem suporte. O KINTERRUPT vai
-/// para *InterruptObject. Devolve o valor do export: as falhas próprias com
-/// sinal, o status do IoConnectInterrupt sem sinal.
+/// (1/4) pelos campos; MESSAGE_BASED (3) cai na linha com o
+/// FallBackServiceRoutine. O KINTERRUPT vai para *InterruptObject. Devolve o
+/// valor do export: as falhas próprias com sinal, o status do
+/// IoConnectInterrupt sem sinal.
 pub fn connect_interrupt_ex(parameters: u64) -> Result<u64, KernelError> {
     // SAFETY: IO_CONNECT_INTERRUPT_PARAMETERS do driver (modo kernel).
     let parameters = unsafe { IoConnectInterruptParameters::at(parameters) };
@@ -40,49 +55,7 @@ pub fn connect_interrupt_ex(parameters: u64) -> Result<u64, KernelError> {
     let spin_lock = fully.spin_lock.get();
     let output = fully.interrupt_object.get();
     if version == CONNECT_LINE_BASED {
-        let physical = parameters.line_based.physical_device_object.get();
-        if let Some(line) = connection_data_line(physical) {
-            // O vetor e o IRQL que o árbitro de IRQ atribuiu à GSIV: a HAL
-            // entrega a linha nele; sem vetor atribuído, o vetor fixo da linha.
-            let (vector, level) = if line.vector != 0 {
-                crate::hal::interrupt_lines::route_vector(line.vector, line.gsiv);
-                (line.vector, line.irql as u32)
-            } else {
-                crate::ntos::io::pnp::resources::translate_interrupt(line.gsiv)
-            };
-            let status = interrupt_object::io_connect_interrupt(output, service_routine, service_context, spin_lock, vector, level as u8, level as u8, line.mode, true)?;
-            debug_print!("[io] interrupt LINE_BASED pelos dados de conexao: GSIV {} vetor 0x{:x} irql {} -> ISR 0x{:x}", line.gsiv, vector, level, service_routine);
-            return Ok(status as u64);
-        }
-        // PDO da árvore do PnP: as interrupções de linha da lista traduzida
-        // do devnode, como o IopConnectInterruptExLineBased.
-        if let Some(node) = crate::ntos::io::pnp::devnode::get(physical) {
-            let list = crate::ntos::io::pnp::resources::CmList::read(node.resources_translated).unwrap_or_default();
-            let interrupts: alloc::vec::Vec<_> = list.resources.iter().filter(|resource| resource.resource_type == crate::ntos::io::pnp::resources::resource_type::INTERRUPT).copied().collect();
-            let Some(first) = interrupts.first() else {
-                debug_print!("[io] IoConnectInterruptEx LINE_BASED: {} sem interrupcao atribuida", node.instance_path);
-                return Ok(signed_status(0xC000_000D));
-            };
-            if interrupts.len() > 1 {
-                debug_print!("[io] IoConnectInterruptEx LINE_BASED: {} tem {} interrupcoes; conecta a primeira", node.instance_path, interrupts.len());
-            }
-            // CM_RESOURCE_INTERRUPT_LATCHED (bit 0) -> Latched; senão LevelSensitive.
-            let mode = if first.flags & 1 != 0 { 1 } else { 0 };
-            let share = first.share == crate::ntos::io::pnp::resources::SHARE_SHARED;
-            let level = first.start as u8;
-            let status = interrupt_object::io_connect_interrupt(output, service_routine, service_context, spin_lock, first.length, level, level, mode, share)?;
-            debug_print!("[io] interrupt LINE_BASED {}: vetor 0x{:x} irql {} -> ISR 0x{:x}", node.instance_path, first.length, level, service_routine);
-            return Ok(status as u64);
-        }
-        let Some(resource) = device_resources::consume_next_interrupt(physical) else {
-            debug_print!("[io] IoConnectInterruptEx LINE_BASED: PDO 0x{:x} sem IRQ restante", physical);
-            return Ok(signed_status(0xC000_009A));
-        };
-        // O modo vem do recurso (LEVEL_SENSITIVE), como a HAL faz.
-        let mode = if resource.flags & 2 != 0 { 1 } else { 0 };
-        let status = interrupt_object::io_connect_interrupt(output, service_routine, service_context, spin_lock, resource.vector, resource.level as u8, resource.level as u8, mode, false)?;
-        debug_print!("[io] interrupt LINE_BASED: vetor 0x{:x} -> ISR 0x{:x}", resource.vector, service_routine);
-        return Ok(status as u64);
+        return connect_line_based(parameters.line_based.physical_device_object.get(), output, service_routine, service_context, spin_lock);
     }
     if version == CONNECT_FULLY_SPECIFIED || version == CONNECT_FULLY_SPECIFIED_GROUP {
         let synchronize = fully.synchronize_irql.get();
@@ -93,8 +66,70 @@ pub fn connect_interrupt_ex(parameters: u64) -> Result<u64, KernelError> {
         debug_print!("[io] interrupt FULLY_SPECIFIED: vetor 0x{:x} irql {} -> ISR 0x{:x}", vector, level, service_routine);
         return Ok(interrupt_object::io_connect_interrupt(output, service_routine, service_context, spin_lock, vector, level, synchronize, mode, share != 0)? as u64);
     }
-    debug_print!("[io] IoConnectInterruptEx: version {} (MESSAGE_BASED) sem suporte — MSI nao configurado", version);
-    Ok(signed_status(0xC000_00BB))
+    if version == CONNECT_MESSAGE_BASED {
+        // Nenhum dispositivo recebe interrupções por mensagem: o
+        // IopConnectMessageBasedInterrupt não tem o que conectar.
+        let message = &parameters.message_based;
+        let fall_back = message.fall_back_service_routine.get();
+        if fall_back == 0 {
+            debug_print!("[io] IoConnectInterruptEx MESSAGE_BASED: sem interrupcoes por mensagem e sem FallBackServiceRoutine");
+            return Ok(signed_status(STATUS_NOT_SUPPORTED));
+        }
+        let status = connect_line_based(message.physical_device_object.get(), message.connection_context.get(), fall_back, message.service_context.get(), message.spin_lock.get())?;
+        parameters.version.set(CONNECT_LINE_BASED);
+        debug_print!("[io] IoConnectInterruptEx MESSAGE_BASED sem mensagens: linha pelo FallBackServiceRoutine 0x{:x} -> {:#x}", fall_back, status as u32);
+        return Ok(status);
+    }
+    debug_print!("[io] IoConnectInterruptEx: version {} sem suporte", version);
+    Ok(signed_status(STATUS_NOT_SUPPORTED))
+}
+
+/// O IopConnectLineBasedInterrupt: a interrupção de linha do PDO (os dados de
+/// conexão, a lista traduzida do devnode ou o recurso registrado) para a
+/// rotina dada, com o KINTERRUPT em *`output`.
+fn connect_line_based(physical: u64, output: u64, service_routine: u64, service_context: u64, spin_lock: u64) -> Result<u64, KernelError> {
+    if let Some(line) = connection_data_line(physical) {
+        // O vetor e o IRQL que o árbitro de IRQ atribuiu à GSIV: a HAL
+        // entrega a linha nele; sem vetor atribuído, o vetor fixo da linha.
+        let (vector, level) = if line.vector != 0 {
+            crate::hal::interrupt_lines::route_vector(line.vector, line.gsiv);
+            (line.vector, line.irql as u32)
+        } else {
+            crate::ntos::io::pnp::resources::translate_interrupt(line.gsiv)
+        };
+        let status = interrupt_object::io_connect_interrupt(output, service_routine, service_context, spin_lock, vector, level as u8, level as u8, line.mode, true)?;
+        debug_print!("[io] interrupt LINE_BASED pelos dados de conexao: GSIV {} vetor 0x{:x} irql {} -> ISR 0x{:x}", line.gsiv, vector, level, service_routine);
+        return Ok(status as u64);
+    }
+    // PDO da árvore do PnP: as interrupções de linha da lista traduzida
+    // do devnode, como o IopConnectInterruptExLineBased.
+    if let Some(node) = crate::ntos::io::pnp::devnode::get(physical) {
+        let list = crate::ntos::io::pnp::resources::CmList::read(node.resources_translated).unwrap_or_default();
+        let interrupts: alloc::vec::Vec<_> = list.resources.iter().filter(|resource| resource.resource_type == crate::ntos::io::pnp::resources::resource_type::INTERRUPT).copied().collect();
+        let Some(first) = interrupts.first() else {
+            debug_print!("[io] IoConnectInterruptEx LINE_BASED: {} sem interrupcao atribuida", node.instance_path);
+            return Ok(signed_status(0xC000_000D));
+        };
+        if interrupts.len() > 1 {
+            debug_print!("[io] IoConnectInterruptEx LINE_BASED: {} tem {} interrupcoes; conecta a primeira", node.instance_path, interrupts.len());
+        }
+        // CM_RESOURCE_INTERRUPT_LATCHED (bit 0) -> Latched; senão LevelSensitive.
+        let mode = if first.flags & 1 != 0 { 1 } else { 0 };
+        let share = first.share == crate::ntos::io::pnp::resources::SHARE_SHARED;
+        let level = first.start as u8;
+        let status = interrupt_object::io_connect_interrupt(output, service_routine, service_context, spin_lock, first.length, level, level, mode, share)?;
+        debug_print!("[io] interrupt LINE_BASED {}: vetor 0x{:x} irql {} -> ISR 0x{:x}", node.instance_path, first.length, level, service_routine);
+        return Ok(status as u64);
+    }
+    let Some(resource) = device_resources::consume_next_interrupt(physical) else {
+        debug_print!("[io] IoConnectInterruptEx LINE_BASED: PDO 0x{:x} sem IRQ restante", physical);
+        return Ok(signed_status(0xC000_009A));
+    };
+    // O modo vem do recurso (LEVEL_SENSITIVE), como a HAL faz.
+    let mode = if resource.flags & 2 != 0 { 1 } else { 0 };
+    let status = interrupt_object::io_connect_interrupt(output, service_routine, service_context, spin_lock, resource.vector, resource.level as u8, resource.level as u8, mode, false)?;
+    debug_print!("[io] interrupt LINE_BASED: vetor 0x{:x} -> ISR 0x{:x}", resource.vector, service_routine);
+    Ok(status as u64)
 }
 
 /// INTERRUPT_CONNECTION_DATA_PKEY {f0e20f09-d97a-49a9-8046-bb6e22e6bb2e}, 2.

@@ -80,6 +80,10 @@ fn interrupt_object(object: u64) -> &'static InterruptObject {
 const NATIVE_KEYBOARD_INTERRUPT_FLAG: u64 = 0x81510;
 /// Tabela de níveis consultada pelo caminho nativo de interrupção imediata.
 const INTERRUPT_LEVEL_TABLE: u64 = 0x81600;
+/// As linhas do PIC por nível com ISR conectada (o u16 do stub de IRQ).
+const LEVEL_LINES: u64 = crate::hal::amd64::irqstubs::LEVEL_LINES;
+/// KINTERRUPT_MODE LevelSensitive.
+const LEVEL_SENSITIVE: u32 = 0;
 
 static CHAINS: SpinLock<BTreeMap<u32, u64>> = SpinLock::new(BTreeMap::new());
 
@@ -124,6 +128,27 @@ pub fn service_during_wait() {
     }
 }
 
+/// Interrupções de dispositivo durante uma espera ocupada de driver
+/// (KeStallExecutionProcessor). No NT a interrupção preempta o código que
+/// roda abaixo do DIRQL do dispositivo, mesmo numa espera ocupada em
+/// DISPATCH_LEVEL, e a DPC que a ISR enfileira roda assim que o IRQL fica
+/// abaixo de DISPATCH_LEVEL: um miniport que espera pela conclusão de um
+/// comando que só a ISR e a DPC processam (o stornvme.sys na inicialização
+/// passiva) vê a conclusão durante a espera. Aqui as ISRs são adiadas: a
+/// espera despacha as linhas pendentes cujo IRQL está acima do corrente e,
+/// abaixo de DISPATCH_LEVEL, a fila de DPCs.
+pub fn service_during_stall() {
+    let current = super::irql::get_irql();
+    interrupts::dispatch_pending_device_vectors(|vector| {
+        let chain = crate::hal::interrupt_lines::chain_vector(vector as u32);
+        let head = CHAINS.lock().get(&chain).copied().unwrap_or(0);
+        head != 0 && interrupt_object(head).irql.get() > current
+    });
+    if current < super::irql::DISPATCH_LEVEL {
+        let _ = super::dpc::run_queue();
+    }
+}
+
 /// Percorre os objetos do vetor chamando as ISRs nativas. Para quando uma
 /// ISR trata a interrupção e Mode vale zero (latched). Como o despacho
 /// encadeado do ntoskrnl 19041 (rva 0x3ff080), cada ISR roda no IRQL do
@@ -132,6 +157,16 @@ pub fn service_during_wait() {
 fn dispatch_chain(vector: u8, _count: u32) {
     // A linha do 8259 despacha a cadeia do vetor atribuído a ela (HAL).
     let chain = crate::hal::interrupt_lines::chain_vector(vector as u32);
+    run_chain(chain);
+    // Uma linha por nível chega mascarada pelo stub: as ISRs já atenderam o
+    // dispositivo, e a linha volta a ser entregue (se algum objeto da cadeia
+    // estiver ativo).
+    if is_level_line(vector as u32) && !all_objects_inactive(chain) {
+        set_legacy_line_masked(vector as u32, false);
+    }
+}
+
+fn run_chain(chain: u32) {
     let mut pointer = CHAINS.lock().get(&chain).copied().unwrap_or(0);
     while pointer != 0 {
         let object = interrupt_object(pointer);
@@ -199,6 +234,9 @@ pub fn io_connect_interrupt(
     body.chain_next.set(previous_head);
     for &delivery in &deliveries {
         physical::write32(INTERRUPT_LEVEL_TABLE + delivery as u64 * 4, level as u32);
+        if mode == LEVEL_SENSITIVE {
+            set_level_line(delivery, true);
+        }
         clear_and_unmask_controller(delivery);
         // Uma linha nova de um vetor já conectado também passa a despachar
         // a cadeia dele.
@@ -237,6 +275,11 @@ pub fn io_disconnect_interrupt(object: u64) {
             }
             interrupt_object(object).connected.set(0);
             guest::free_bytes(object);
+            if !chain_has_level_object(vector) {
+                for delivery in crate::hal::interrupt_lines::delivery_vectors(vector) {
+                    set_level_line(delivery, false);
+                }
+            }
             if next == 0 && previous_link == 0 && !CHAINS.lock().contains_key(&vector) {
                 for delivery in crate::hal::interrupt_lines::delivery_vectors(vector) {
                     physical::write32(INTERRUPT_LEVEL_TABLE + delivery as u64 * 4, 0);
@@ -309,6 +352,47 @@ const CONNECT_FULLY_SPECIFIED: u32 = 1;
 const CONNECT_LINE_BASED: u32 = 2;
 const CONNECT_MESSAGE_BASED: u32 = 3;
 const CONNECT_FULLY_SPECIFIED_GROUP: u32 = 4;
+
+/// O bit da linha do PIC (vetores 0x20..0x2F) nas linhas por nível que o
+/// stub de IRQ mascara até o despacho.
+fn set_level_line(vector: u32, level: bool) {
+    let Some(irq) = vector.checked_sub(0x20).filter(|&irq| irq <= 15) else { return };
+    let current = physical::read16(LEVEL_LINES);
+    physical::write16(LEVEL_LINES, if level { current | 1 << irq } else { current & !(1 << irq) });
+}
+
+fn is_level_line(vector: u32) -> bool {
+    vector.checked_sub(0x20).filter(|&irq| irq <= 15).is_some_and(|irq| physical::read16(LEVEL_LINES) & 1 << irq != 0)
+}
+
+/// Algum objeto ainda conectado ao vetor é por nível.
+fn chain_has_level_object(vector: u32) -> bool {
+    let mut pointer = CHAINS.lock().get(&vector).copied().unwrap_or(0);
+    while pointer != 0 {
+        if interrupt_object(pointer).mode.get() == LEVEL_SENSITIVE {
+            return true;
+        }
+        pointer = interrupt_object(pointer).chain_next.get();
+    }
+    false
+}
+
+/// Todos os objetos conectados ao vetor foram reportados inativos
+/// (IoReportInterruptInactive): a linha fica mascarada.
+fn all_objects_inactive(vector: u32) -> bool {
+    let inactive = INACTIVE_INTERRUPTS.lock();
+    let mut pointer = CHAINS.lock().get(&vector).copied().unwrap_or(0);
+    if pointer == 0 {
+        return false;
+    }
+    while pointer != 0 {
+        if !inactive.contains(&pointer) {
+            return false;
+        }
+        pointer = interrupt_object(pointer).chain_next.get();
+    }
+    true
+}
 
 /// Máscara da linha do PIC legado de um vetor 0x20..0x2F (portas de I/O).
 fn set_legacy_line_masked(vector: u32, masked: bool) {

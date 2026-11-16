@@ -130,7 +130,7 @@ fn query_performance_counter(call: &Call) -> Result<u64, KernelError> {
     Ok(clock::query_performance_counter(call.arg(1)))
 }
 fn stall_execution_processor(call: &Call) -> Result<u64, KernelError> {
-    clock::stall_execution_processor(call.arg(1) as u32);
+    clock::stall_execution_processor_for_driver(call.arg(1) as u32);
     Ok(0)
 }
 fn bug_check_ex(call: &Call) -> Result<u64, KernelError> {

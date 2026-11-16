@@ -12,6 +12,10 @@
 //!                                     dados 256B @+0x408)
 //!   +0x510: byte de controle — não zero quando um port driver nativo
 //!           (i8042prt) é dono da porta 0x60
+//!   +0x520: u16 das linhas do PIC por nível com ISR conectada (bit n = IRQ
+//!           n): o stub mascara a linha no PIC antes do EOI, porque a ISR
+//!           roda depois, no despacho, e a linha ainda ativa voltaria logo
+//!           depois do EOI; o despacho desmascara depois de rodar a cadeia
 //!
 //! Exceções (vetores 0–31), o fast-fail `int 0x29` e o serviço de depuração
 //! `int 0x2D` não podem voltar com IRET cego: no anel 3 o processo morre com o
@@ -47,6 +51,7 @@ pub const KEYBOARD_HEAD: u64 = IRQ_PAGE_PHYS + 0x400;
 pub const KEYBOARD_TAIL: u64 = IRQ_PAGE_PHYS + 0x404;
 pub const KEYBOARD_DATA: u64 = IRQ_PAGE_PHYS + 0x408;
 pub const NATIVE_KEYBOARD_OWNER: u64 = IRQ_PAGE_PHYS + 0x510;
+pub const LEVEL_LINES: u64 = IRQ_PAGE_PHYS + 0x520;
 /// Registrador de EOI do LAPIC (xAPIC) pelo mapa direto.
 const LAPIC_EOI: u64 = memory_map::direct_map(memory_map::LAPIC_PHYS + 0xB0);
 
@@ -239,10 +244,35 @@ irq_context_saved:
 irq_no_key:
     # EOI: vetores >= 0x40 sao do LAPIC (timer etc.)
     cmp edi, 0x40
-    jb irq_pic_eoi
+    jb irq_pic_level
     movabs rax, {lapic_eoi}
     mov dword ptr [rax], 0
     jmp irq_restore
+irq_pic_level:
+    # Linha do PIC por nivel com ISR conectada: mascarada antes do EOI ate o
+    # despacho rodar a cadeia (a ISR e adiada; a linha ainda ativa voltaria
+    # logo depois do EOI).
+    lea ecx, [rdi - 0x20]
+    cmp ecx, 16
+    jae irq_pic_eoi
+    movzx eax, word ptr [r9 + {level_lines}]
+    bt eax, ecx
+    jnc irq_pic_eoi
+    cmp ecx, 8
+    jae irq_pic_mask_slave
+    mov edx, 1
+    shl edx, cl
+    in al, 0x21
+    or al, dl
+    out 0x21, al
+    jmp irq_pic_eoi
+irq_pic_mask_slave:
+    sub ecx, 8
+    mov edx, 1
+    shl edx, cl
+    in al, 0xA1
+    or al, dl
+    out 0xA1, al
 irq_pic_eoi:
     # IRQs 8-15 (vetores 0x28+) tambem no slave
     cmp edi, 0x28
@@ -610,6 +640,7 @@ irq_exception_halt:
     lapic_eoi = const LAPIC_EOI,
     irq_count = const IRQ_COUNT_BASE - IRQ_PAGE_PHYS,
     native_keyboard = const NATIVE_KEYBOARD_OWNER - IRQ_PAGE_PHYS,
+    level_lines = const LEVEL_LINES - IRQ_PAGE_PHYS,
     kbd_head = const KEYBOARD_HEAD - IRQ_PAGE_PHYS,
     kbd_tail = const KEYBOARD_TAIL - IRQ_PAGE_PHYS,
     kbd_data = const KEYBOARD_DATA - IRQ_PAGE_PHYS,

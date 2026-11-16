@@ -215,6 +215,13 @@ pub fn dispatch_pending_devices() {
     dispatch_pending_where(|vector| vector != VECTOR_LAPIC_TIMER);
 }
 
+/// Despacha as IRQs de dispositivo pendentes dos vetores que `selected`
+/// aceita (o timer do LAPIC fica de fora, como em
+/// [`dispatch_pending_devices`]).
+pub fn dispatch_pending_device_vectors(selected: impl Fn(u8) -> bool) {
+    dispatch_pending_where(|vector| vector != VECTOR_LAPIC_TIMER && selected(vector));
+}
+
 fn dispatch_pending_where(selected: impl Fn(u8) -> bool) {
     // Os handlers rodam sem o lock da tabela: podem registrar outros vetores.
     let mut due: Vec<(u8, IrqHandler, u32)> = Vec::new();

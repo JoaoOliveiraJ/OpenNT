@@ -309,6 +309,21 @@ pub fn stall_execution_processor(microseconds: u32) {
     }
 }
 
+/// O KeStallExecutionProcessor dos drivers: a mesma espera ocupada, com as
+/// interrupções de dispositivo e as DPCs que o NT entregaria durante ela
+/// (`interrupt_object::service_during_stall`).
+pub fn stall_execution_processor_for_driver(microseconds: u32) {
+    let ticks = tsc_frequency_hz() / 1_000_000 * (microseconds as u64);
+    let start = cpu::rdtsc();
+    loop {
+        super::interrupt_object::service_during_stall();
+        if cpu::rdtsc().wrapping_sub(start) >= ticks {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+}
+
 /// KeQueryUnbiasedInterruptTime: sem suspensão, unbiased == interrupt time.
 pub fn unbiased_interrupt_time() -> u64 {
     uptime_ms() * 10_000

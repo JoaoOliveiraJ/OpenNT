@@ -432,6 +432,77 @@ fn pci_bus_driver(assert: Assert) {
     assert(synthetic_descriptors[1].u.interrupt.affinity.get() as u32 == 0xFFFF_FFFF, "pcibus: afinidade padrao");
     assert(device_resources::consume_next_interrupt(fake_pdo) == Some(device_resources::Interrupt { level: 15, vector: 0x2F, flags: 0 }) && device_resources::consume_next_interrupt(fake_pdo).is_some_and(|found| found.level == 14) && device_resources::consume_next_interrupt(fake_pdo).is_none() && device_resources::consume_next_interrupt(0x9999).is_none(), "devres: interrupcoes LINE_BASED na ordem declarada");
     assert(device_resources::lookup_resource_list(fake_pdo) == synthetic && device_resources::lookup_resource_list(fake_pdo & 0xFFFF_FFFF) == 0, "devres: chave e lista com os 64 bits do PDO");
+    message_based_fall_back(assert);
+}
+
+/// IoConnectInterruptEx MESSAGE_BASED num dispositivo sem interrupções por
+/// mensagem: com o FallBackServiceRoutine, a linha do PDO é conectada com
+/// essa rotina e o Version vira CONNECT_LINE_BASED; sem ela,
+/// STATUS_NOT_SUPPORTED. A IRQ 5, que nenhum dispositivo do QEMU usa, não
+/// dispara durante o teste.
+fn message_based_fall_back(assert: Assert) {
+    use crate::drivers::bus::pci::{self, cm_resource_type, Resource};
+    use crate::ntos::inc::types::{IoConnectInterruptParameters, IoDisconnectInterruptParameters, NtStruct};
+    use crate::ntos::io::device_resources;
+    use crate::ntos::ke::interrupt_object::InterruptObject;
+    let pdo = 0x7_0000_2000;
+    let list = pci::build_resource_list(&[Resource { resource_type: cm_resource_type::INTERRUPT, flags: 0, start: 0, length: 0, level: 5, vector: 0x25, affinity: 0 }]);
+    device_resources::register_device_resources(pdo, list);
+    // A ISR conta as chamadas e não reconhece a interrupção:
+    // mov rax, contador; lock inc qword [rax]; xor eax, eax; ret.
+    let counter = guest::alloc_bytes(8);
+    let mut code = alloc::vec![0x48, 0xB8];
+    code.extend_from_slice(&counter.to_le_bytes());
+    code.extend_from_slice(&[0xF0, 0x48, 0xFF, 0x00, 0x31, 0xC0, 0xC3]);
+    let routine = crate::ntos::test::executable_code::place(&code);
+    let parameters_address = guest::alloc_bytes(IoConnectInterruptParameters::SIZE);
+    let output = guest::alloc_bytes(8);
+    // SAFETY: bloco recém-alocado do tamanho dos parâmetros.
+    let parameters = unsafe { IoConnectInterruptParameters::at(parameters_address) };
+    let message = &parameters.message_based;
+    parameters.version.set(3);
+    message.physical_device_object.set(pdo);
+    message.connection_context.set(output);
+    message.message_service_routine.set(routine);
+    let refused = crate::ntos::io::interrupt::connect_interrupt_ex(parameters_address).unwrap_or(0) as u32;
+    message.fall_back_service_routine.set(routine);
+    let connected = crate::ntos::io::interrupt::connect_interrupt_ex(parameters_address).unwrap_or(u64::MAX) as u32;
+    let object = guest::read64(output);
+    // SAFETY: o KINTERRUPT criado pela conexão.
+    let (vector, service) = if object != 0 { unsafe { (InterruptObject::at(object).vector.get(), InterruptObject::at(object).service_routine.get()) } } else { (0, 0) };
+    assert(refused == 0xC000_00BB && connected == 0 && parameters.version.get() == 2 && object != 0 && vector == 0x25 && service == routine, "devres: MESSAGE_BASED sem mensagens cai na linha pelo FallBackServiceRoutine (Version = LINE_BASED)");
+    // A linha por nível: o stub de IRQ a mascara no PIC antes do EOI (a ISR
+    // é adiada) e o despacho a desmascara depois de rodar a cadeia. A
+    // interrupção vem por software (int 0x25), pelo mesmo stub.
+    let level_lines = || crate::hal::physical::read16(crate::hal::amd64::irqstubs::LEVEL_LINES);
+    let line_masked = || crate::hal::port::read8(0x21) & 1 << 5 != 0;
+    let marked = level_lines() & 1 << 5 != 0;
+    let unmasked_before = !line_masked();
+    // SAFETY: interrupção de software no vetor da IRQ 5, tratada pelo stub.
+    unsafe { core::arch::asm!("int 0x25") };
+    let masked_by_stub = line_masked();
+    // A espera ocupada de um driver (KeStallExecutionProcessor) entrega a
+    // interrupção pendente, como a preempção do NT: a ISR roda durante ela.
+    let before_stall = guest::read64(counter);
+    let _ = super::phase6::call_export("KeStallExecutionProcessor", &[10]);
+    let isr_calls = guest::read64(counter) - before_stall;
+    let unmasked_after = !line_masked();
+    assert(marked && unmasked_before && masked_by_stub && unmasked_after, "devres: linha por nivel mascarada pelo stub ate o despacho da cadeia");
+    assert(isr_calls == 1, "devres: KeStallExecutionProcessor de driver entrega a interrupcao pendente (a ISR roda na espera)");
+    if object != 0 {
+        let disconnect = guest::alloc_bytes(IoDisconnectInterruptParameters::SIZE);
+        // SAFETY: bloco recém-alocado.
+        let parameters = unsafe { IoDisconnectInterruptParameters::at(disconnect) };
+        parameters.version.set(2);
+        parameters.connection_context.set(object);
+        crate::ntos::io::interrupt::disconnect_interrupt_ex(disconnect);
+        guest::free_bytes(disconnect);
+        assert(level_lines() & 1 << 5 == 0, "devres: linha por nivel desmarcada quando a cadeia fica vazia");
+    }
+    crate::ntos::test::executable_code::release(routine);
+    guest::free_bytes(parameters_address);
+    guest::free_bytes(output);
+    guest::free_bytes(counter);
 }
 
 fn motherboard_bus_driver(assert: Assert) {
