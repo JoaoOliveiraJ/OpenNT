@@ -2,7 +2,8 @@
 //! barramento importam: pedidos térmicos sobre um dispositivo sintético
 //! que responde a GUID_THERMAL_COOLING_INTERFACE, o callback de vigia de
 //! DRIPS do PoFx, PoSetHiberRange, ZwInitiatePowerAction, o grafo de
-//! dependências, IoRequestDeviceRemovalForReset, IoAssignResources e
+//! dependências, IoRequestDeviceRemovalForReset, IoAssignResources,
+//! IoReportResourceUsage e
 //! IoWMIExecuteMethod, cada um chamado pelo nome.
 //!
 //! Os valores esperados vêm das instruções de cada rotina no ntoskrnl
@@ -26,6 +27,7 @@ const STATUS_INVALID_PARAMETER: u64 = 0xC000_000D;
 const STATUS_OBJECT_TYPE_MISMATCH: u64 = 0xC000_0024;
 const STATUS_NOT_SUPPORTED: u64 = 0xC000_00BB;
 const STATUS_TOO_LATE: u64 = 0xC000_0189;
+const STATUS_CONFLICTING_ADDRESSES: u64 = 0xC000_0018;
 
 /// As chamadas que o driver sintético recebeu: (rotina, argumento).
 static COOLING_CALLS: SpinLock<Vec<(u8, u64)>> = SpinLock::new(Vec::new());
@@ -249,6 +251,29 @@ fn io_support_exports(assert: Assert) {
     guest::write32(requirements + 0x1C, 0);
     let empty = status("IoAssignResources", &[0, 0, target.driver, target.device, requirements, allocated]);
     assert(released == 0 && empty == 0 && guest::read64(allocated) == 0, "io: IoAssignResources sem pedido libera e devolve NULL");
+    // IoReportResourceUsage: um dispositivo legado relata uma faixa livre
+    // (sem conflito), outro relata a mesma (conflito), a lista vazia libera
+    // e o segundo passa. Memória acima do que a raiz já atribuiu.
+    let other = synthetic_device();
+    let conflict = block + 0x80;
+    let list = crate::ntos::io::pnp::resources::CmList {
+        interface_type: 0,
+        bus_number: 0,
+        resources: alloc::vec![crate::ntos::io::pnp::resources::Resource { resource_type: crate::ntos::io::pnp::resources::resource_type::MEMORY, share: 1, flags: 0, start: 0x33_0000_0000, length: 0x1000, extra: [0; 3] }],
+    }
+    .write();
+    let report = |device: &Synthetic, resources: u64| -> (u64, u8) {
+        guest::write8(conflict, 0x55);
+        (status("IoReportResourceUsage", &[0, device.driver, 0, 0, device.device, resources, if resources != 0 { 0x28 } else { 0 }, 0, conflict]), guest::read8(conflict))
+    };
+    let first = report(&target, list);
+    let colliding = report(&other, list);
+    let released = report(&target, 0);
+    let second = report(&other, list);
+    let cleared = report(&other, 0);
+    assert(first == (0, 0) && colliding == (STATUS_CONFLICTING_ADDRESSES, 1) && released == (0, 0) && second == (0, 0) && cleared == (0, 0), "io: IoReportResourceUsage relata sem conflito, acusa o conflito (STATUS_CONFLICTING_ADDRESSES e ConflictDetected) e a lista vazia libera");
+    guest::free_bytes(list);
+    release(other);
     // IoWMIExecuteMethod sem objeto e com um objeto que não é de GUID WMI.
     let (size, buffer, instance) = (block + 0x40, block + 0x60, block + 0x48);
     guest::write32(size, 8);

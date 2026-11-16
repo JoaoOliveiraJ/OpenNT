@@ -1193,7 +1193,14 @@ A árvore de dispositivos do NT mora em `ntos/io/pnp/`:
 - `resources.rs`: as listas do NT, os árbitros da raiz (os IopRoot*Arbiter:
   primeira opção livre, alternativas, compartilhamento, sem janelas de
   barramento) e o tradutor da raiz: sem ACPI, a HAL traduz a IRQ de linha
-  `n` para o vetor `0x20 + n`, IRQL `n`; com a raiz ACPI, a identidade.
+  `n` para o vetor `0x20 + n`, IRQL `n`; com a raiz ACPI, a identidade. O
+  IoReportResourceUsage (`io/legacy_resources.rs`, o
+  IopLegacyResourceAllocation com ArbiterRequestLegacyReported) relata os
+  recursos de um dispositivo ou driver legado como requisitos fixos aos
+  árbitros da raiz: livres, ficam com ele; ocupados, STATUS_CONFLICTING_
+  ADDRESSES e ConflictDetected; a lista vazia os libera. O desvio do NT
+  para o barramento legado do tipo de interface da lista
+  (IopFindLegacyBusDeviceNode) ainda não existe.
 - `root.rs`: o barramento raiz; o barramento PCI interno
   (`drivers/bus/pci.rs`, PCI_HAL\PNP0A03\0) é filho dele. Um
   IoReportDetectedDevice com a árvore montada vira um devnode

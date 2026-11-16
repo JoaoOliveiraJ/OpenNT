@@ -2047,6 +2047,27 @@ pub mod io_device_reset_resources {
     };
 }
 
+pub mod io_report_resource_usage {
+    //! IoReportResourceUsage; a lógica mora em `io/legacy_resources.rs`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::inc::field::{Field, NtStruct};
+    use crate::ntos::io::legacy_resources;
+    use crate::rtl::KernelError;
+
+    /// IoReportResourceUsage(DriverClassName, DriverObject, DriverList,
+    /// DriverListSize, DeviceObject, DeviceList, DeviceListSize,
+    /// OverrideConflict, ConflictDetected).
+    fn report_resource_usage(call: &Call) -> Result<u64, KernelError> {
+        let request = legacy_resources::ReportRequest { driver_object: call.arg(2), driver_list: call.arg(3), device_object: call.arg(5), device_list: call.arg(6) };
+        // SAFETY: o PBOOLEAN ConflictDetected do chamador.
+        let conflict = (call.arg(9) != 0).then(|| unsafe { Field::<u8>::at(call.arg(9)) });
+        Ok(signed_status(legacy_resources::report_usage(&request, conflict)))
+    }
+
+    pub static GROUP: Group = Group { name: "io-report-resource-usage", names: &["IoReportResourceUsage"], handlers: &[report_resource_usage], data_exports: &[] };
+}
+
 pub mod io_error_log_free {
     //! IoFreeErrorLogEntry; a lógica mora em `io/small.rs` (`error_log`).
 

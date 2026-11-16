@@ -501,9 +501,10 @@ pub static GROUP_LAYOUT: &[(&str, usize, usize)] = &[
     ("ex-nt-create-event", 2041, 1),
     ("ob-nt-wait-single", 2042, 1),
     ("tm-query-transaction", 2043, 1),
+    ("io-report-resource-usage", 2044, 1),
 ];
 
-/// Os 2044 exports de função, na ordem da ABI.
+/// Os 2045 exports de função, na ordem da ABI.
 pub static EXPORT_NAMES: &[&str] = &[
     "DbgPrint",
     "DbgPrintEx",
@@ -2549,4 +2550,5 @@ pub static EXPORT_NAMES: &[&str] = &[
     "NtCreateEvent",
     "NtWaitForSingleObject",
     "ZwQueryInformationTransaction",
+    "IoReportResourceUsage",
 ];
