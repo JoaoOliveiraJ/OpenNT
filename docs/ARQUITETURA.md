@@ -51,7 +51,8 @@ kernel/src/
 │   │   ├── notify/    rotinas de notificação (psnotify)
 │   │   ├── silo/      silos de servidor
 │   │   └── user/      serviços Nt* chamados pelo modo usuário
-│   ├── se/            segurança: descritores, ACLs, SIDs, integridade de código
+│   ├── se/            segurança: descritores, ACLs, SIDs, SDDL, integridade de
+│   │                  código e níveis de assinatura
 │   │   ├── token/     tokens de acesso
 │   │   └── capability/ capacidades e AppContainer
 │   ├── ex/            executive: push locks, rundown, lookaside, callbacks, pool,
@@ -2311,6 +2312,44 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     `ntos/test/console_driver.rs` abre o servidor, a referência e a conexão
     de um console e troca as mensagens CONNECT e DISCONNECT pelos IOCTLs do
     condrv (`CONDRV_OK`).
+- **Os exports que eram os últimos imports de drivers de software** (76,
+  cada um no componente dono, conferidos contra o ntoskrnl 19041):
+  - SDDL em `se/sddl.rs` (SeConvertSidToStringSid, SeConvertStringSidToSid
+    e SeConvertSecurityDescriptorToStringSecurityDescriptor, com as tabelas
+    de apelidos de SID, tipos, flags e direitos de ACE do binário e o
+    comprimento reservado que o original devolve) e os níveis de assinatura
+    em `se/signing_level.rs`, pelos slots nomeados da tabela de callbacks da
+    CI (`se/code_integrity.rs`); sem CI inicializada, FALSE/STATUS_UNSUCCESSFUL;
+  - o rastreamento de I/O (`io/io_perf.rs`): com um IoRegisterIoTracking
+    ativo, o IofCallDriver carimba a extensão Timestamp do IRP e o
+    IofCompleteRequest entrega o tempo decorrido e o DeviceType a cada
+    rotina registrada; sem registro os dois ganchos só leem um contador;
+  - as rotinas de filtro do FsRtl (`fsrtl/fs_filter.rs`): o
+    FsRtlAcquireFileExclusive/FsRtlReleaseFile percorre os callbacks Pre de
+    filtro descendo a pilha e os Post subindo, e cai no Fast I/O
+    AcquireFileForNtCreateSection ou no ERESOURCE principal do FCB;
+  - os links de interface (`io/device_interface.rs`): o link simbólico do
+    Object Manager é o nome sem a referência, e quem abre
+    `<link>\<referência>` chega ao PDO com a referência no FileName do
+    IRP_MJ_CREATE, como no NT; o IoGetDeviceInterfaceAlias monta a irmã de
+    outra classe pela instância, pelo GUID e pela referência;
+  - as notificações de thread (`ps/notify/thread.rs`) têm os três pontos do
+    PsSetCreateThreadNotifyRoutineEx: a criação no contexto de quem cria, a
+    de rotinas não de sistema no contexto da thread de usuário nova e a saída;
+  - o ExRegisterBootDevice (`ex/boot_device.rs`) cria a thread de espera de
+    prioridade 31 que, num aviso de remoção, chama o callback do driver até
+    60 vezes antes do bugcheck 0x7B;
+  - o RtlFreeAnsiString libera pelo ExFreePool (o RtlpFreeStringRoutine), o
+    que vale para as strings que a Rtl aloca no pool;
+  - a tabela de trampolins (`hal/amd64/win32_thunk.rs`, MAX_WIN32) tem 4096
+    stubs, o bastante para os 3070 exports do ntoskrnl 19041.
+  O que depende de estado que o OpenNT não tem segue o caminho do NT para
+  esse estado: sem hipervisor, o HvlInvokeHypercall devolve 0x1000 e as
+  consultas do Hvl STATUS_UNSUCCESSFUL; com firmware BIOS, o
+  ExSetFirmwareEnvironmentVariable dá STATUS_NOT_IMPLEMENTED; sem tm.sys, o
+  ZwQueryInformationTransaction dá STATUS_NOT_SUPPORTED; sem mup.sys, os
+  FsRtlMupGet* também; o MmRemovePhysicalMemory valida e devolve
+  STATUS_INSUFFICIENT_RESOURCES, porque o banco de PFN não encolhe.
 - O `xtask` lê fontes do kernel por `#[path]`:
   `ntos/mm/kernel_data_layout.rs` (`.kdata`/`.edata` do PE e páginas de status),
   `ntos/init/export_names.rs` e `ntos/init/native_export_layout.rs` (a EAT do
