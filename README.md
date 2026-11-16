@@ -139,7 +139,7 @@ do kernel, no QEMU.
 | `kernel/src/drivers/` | VGA, console, teclado PS/2, barramentos, disco ATA e sistemas de arquivos (`drivers/fs/`: RAMFS e NTFS) |
 | `kernel/src/shell/`, `kernel/src/apps/` | Shell e programas de exemplo |
 | `xtask/` | Build, PE32+ do kernel, `os.img`, QEMU, `test-boot`, `test-all`, `capturas`, `status`, `debug` |
-| `tools/` | Ferramentas de desenvolvimento: `kd-client` (o cliente do depurador do kernel) e `kd-gui` (o depurador gráfico `opennt-dbg`) |
+| `tools/` | Ferramentas de desenvolvimento: `kd-client` (o cliente do depurador do kernel), `kd-gui` (o depurador gráfico `opennt-dbg`) e `kd-re` (o depurador de engenharia reversa `opennt-re`) |
 | `docs/` | Roadmap, arquitetura e o site de status |
 
 A árvore completa, as regras de dependência de cada componente e as convenções
@@ -212,6 +212,11 @@ cargo run -p kd-gui --release -- --connect=127.0.0.1:1234
 # Testes do cliente e o teste de fumaça do depurador gráfico (abre o QEMU).
 cargo test -p kd-client
 cargo test -p kd-gui --release -- --ignored --nocapture
+
+# O depurador de engenharia reversa (opennt-re): kernel e processos de usuário.
+# Com --initial-process=smss o csrss.exe real roda e pode ser depurado.
+cargo run -p kd-re --release -- --launch --initial-process=smss --smp=1
+cargo test -p kd-re --release -- --ignored --nocapture
 
 # O site de status (docs/site), os selos e o roadmap; as capturas de tela
 # do fim de cada [[teste]] (docs/site/capturas/<id>.png).
@@ -319,6 +324,54 @@ depurador gráfico `opennt-dbg` (`cargo run -p kd-gui --release -- --launch`).
 ![A análise do bugcheck 0xE2 provocado pelo CrashOnCtrlScroll do i8042prt.sys](docs/screenshots/kd-gui-bugcheck.png)
 
 ![O painel Rastro: run_kernel_tasks passo a passo, com os registradores e os operandos de memória](docs/screenshots/kd-gui-rastro.png)
+
+### Depurador de engenharia reversa (opennt-re)
+
+O `opennt-re` (`tools/kd-re`) usa o mesmo cliente e o mesmo depurador do
+kernel, com o layout dos depuradores de engenharia reversa: abas no alto e a
+aba CPU com quatro painéis. Serve ao kernel e aos processos de usuário que
+rodam no OpenNT (csrss.exe, smss.exe, wininit.exe).
+
+- Processos de usuário: clique duplo na aba Processos escolhe o processo.
+  A memória é lida pela raiz dele; os módulos saem da PEB.Ldr e do VAD, com
+  os PDBs públicos da ntdll, do CSRSRV e das outras DLLs. Breakpoints de
+  usuário só param no processo dono. Parada na criação e na saída de
+  processo e de thread e na carga de uma DLL num processo
+  (`sxe ld:csrss!basesrv.dll`). Threads de usuário com TEB, início, motivo
+  da espera e LastError; a pilha de usuário sai do CONTEXT salvo.
+- Aba CPU: desmontagem com as setas dos desvios, a linha do RIP, as
+  instruções executadas (do rastro), comentários, rótulos e marcadores,
+  caixa de informação com os operandos; registradores com flags e
+  segmentos; Dump 1-5 em hexadecimal, texto e tipos; pilha com os endereços
+  de retorno nomeados.
+- Grafo de fluxo da função (G), com o bloco corrente destacado.
+- Procurar: referências a strings (ASCII e UTF-16), constantes, chamadas
+  entre módulos e xrefs, num módulo, em todos ou numa faixa; padrões com
+  curingas (Ctrl+B); strings soltas. A aba Referências tem filtro por texto
+  ou regex, contagem e clique duplo que leva à instrução.
+- Patches: Espaço monta uma instrução; a aba Patches desfaz e exporta.
+- Breakpoints de log (`bp x /log "rcx={@rcx}"`), com comandos de parada, em
+  grupos, condicionais e com contagem; vigia de faixa com até quatro
+  comparadores.
+- Mapa de memória (imagens com seções e faixas do kernel; regiões do VAD de
+  um processo), handles com tipo e nome, pilha com argumentos, tratadores de
+  exceção dos quadros (SEH), símbolos, exports e imports por módulo.
+- Script: comandos do depurador com variáveis, `if`, `while`, `for` e
+  `log`; `--script=arquivo` roda um roteiro depois do attach.
+- Teclas: F2 breakpoint, F7 entra, F8 passa por cima, F9 executa, Ctrl+F9
+  até o retorno, Alt+F9 até o código de usuário, F4 até o cursor, F12
+  pausa, Ctrl+G vai para, `;` comentário, `:` rótulo, Espaço monta, Ctrl+B
+  padrão, G grafo, `*` volta ao RIP. Tema claro e escuro.
+
+![opennt-re parado dentro do dxgkrnl.sys real (a volta do IoCreateDevice), na aba CPU](docs/screenshots/kd-re-cpu.png)
+
+![O csrss.exe real parado no ntdll!LdrLoadDll por um breakpoint de usuário](docs/screenshots/kd-re-usuario.png)
+
+![O grafo de fluxo da função do driver](docs/screenshots/kd-re-grafo.png)
+
+![Referências a strings do driver, com o filtro por expressão regular](docs/screenshots/kd-re-referencias.png)
+
+![O mapa de memória do csrss.exe: regiões do VAD e as seções das imagens](docs/screenshots/kd-re-memoria.png)
 
 ## Fora do escopo
 

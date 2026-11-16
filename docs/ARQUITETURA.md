@@ -14,6 +14,7 @@ exporta; a HAL, os drivers e a inicialização ficam separados, como no NT.
 | `xtask` | build, PE do kernel, imagem de disco, volume NTFS, QEMU, `test-boot`, `test-all`, `capturas`, `status` e o cliente de texto do depurador do kernel (`debug`) |
 | `tools/kd-client` | o cliente do depurador do kernel, só com a biblioteca padrão: protocolo remoto do GDB, símbolos (`kernel.elf`, exports dos PEs, PDBs públicos com cache e download), pilha pela `.pdata` e pelos frame pointers, tipos do PDB do ntoskrnl, expressões, breakpoints, rastro de instruções e os comandos de texto; usado pelo `xtask` e pelo `kd-gui` |
 | `tools/kd-gui` | `opennt-dbg`, o depurador gráfico (egui/eframe, painéis do `egui_dock`, desmontagem do iced-x86, linhas e variáveis do DWARF pelo `addr2line`/`gimli`); as dependências dele não entram no build do kernel nem do `xtask` |
+| `tools/kd-re` | `opennt-re`, o depurador de engenharia reversa (layout no estilo dos depuradores de engenharia reversa) para o kernel e os processos de usuário, sobre o mesmo cliente; as dependências dele também ficam fora do kernel e do `xtask` |
 
 ## 2. Árvore do kernel
 
@@ -1938,6 +1939,40 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     RawInputThread: a espera dela numa seção crítica disputada voltava com
     STATUS_TIMEOUT (a PEB saía com CriticalSectionTimeout 0) e a ntdll
     avisava pelo DbgPrint.
+  - Processos de usuário:
+    - Processo das leituras (`kd/process_context.rs`): `monitor .process
+      <pid|eprocess>` troca a raiz de `m`/`M`/`X` e do `Z0` pela
+      KPROCESS.DirectoryTableBase do processo, até a máquina seguir. Sem
+      argumento, mostra o processo do CR3 do processador.
+    - Paradas do anel 3 (`kd/user_debug.rs`): o despacho de primeira chance
+      (`ps/user/exceptions.rs::hardware`) chama `user_debug::exception`
+      antes da entrega ao processo. O `int 3` de um breakpoint do depurador
+      gravado pela raiz deste processo para a máquina; o host vê um quadro
+      montado do CONTEXT (CS 0x33, GS = TEB, x87/SSE do FltSave), e o quadro
+      volta ao CONTEXT na saída (`stop::enter_user`). O 0xCC vai ao quadro
+      físico: num quadro de código compartilhado (a ntdll), o `int 3` de
+      outro processo é reconhecido pelo quadro físico
+      (`breakpoints::classify_user_hit`) e passa sem parar, com o byte
+      original de volta por um passo da thread. O passo e a saída de um
+      breakpoint usam o TF no CONTEXT; o #DB do passo volta pelo mesmo
+      caminho e é reconhecido pelo endereço do CONTEXT. `monitor uex on`
+      para também nas outras exceções do anel 3. Antes de gravar num
+      endereço de usuário, o byte atual é conferido. Os comparadores de
+      hardware do depurador valem só no anel 0: na entrada do anel 3 a HAL
+      troca o banco de depuração pelo da thread (o CONTEXT dela).
+    - Eventos (`kd/events.rs`): as notificações do Ps (`ps/notify`) chamam
+      `opennt_kd_process_event`, `opennt_kd_thread_event` e
+      `opennt_kd_image_event` (sysv64, argumentos nos registradores) antes de
+      olhar as rotinas registradas. O host arma breakpoints nelas e lê os
+      argumentos.
+    - Consultas: `handles` (a HANDLE_TABLE inteira, com o tipo pelo
+      TypeIndex e o ObHeaderCookie, o nome pelo NameInfo, pelo FILE_OBJECT
+      ou pelo ImageFileName, e o tipo da tabela de usuário quando a linha
+      nativa não o dá), `vad` (as regiões do `ProcessState`: base, tamanho,
+      tipo, proteção, nome), `uthreads` (TEB, início, CONTEXT salvo,
+      RIP/RSP, estado, motivo da espera, LastError) e `kmap` (as faixas
+      fixas do espaço de sistema). As listas são paginadas (`mais: N`);
+      `vad` e `uthreads` só rodam com as travas livres.
   - Os APs ainda usam a própria IDT de três vetores: só o BSP trata
     `int 3`/#DB, e os comparadores de hardware são carregados só no
     processador da parada.
@@ -3215,6 +3250,26 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     (`ps::notify::image::notify`): o cliente relê a lista de módulos, arma
     os adiados e segue sozinho quando o módulo novo não é o pedido.
     `.bpsave`/`.bpload` gravam e recriam a lista.
+  - Processos de usuário (`user.rs`, `client.rs`): `.process` escolhe o
+    processo e o cliente o reaplica a cada parada; numa parada do anel 3, o
+    processo dela vira o das leituras. Os módulos de usuário (a PEB.Ldr e as
+    imagens do VAD) entram nos símbolos à parte (`set_user_modules`), com os
+    exports do PE desta máquina e o PDB público. A pilha de uma thread de
+    usuário sai do CONTEXT salvo dela. Comandos: `.process`, `lmu`,
+    `handles`, `vad`, `uthreads`, `ustack`, `kmap`, `events`, `uex`.
+  - Eventos e breakpoints com ação: `sxe cpr[:nome]`, `epr`, `ct[:pid]`,
+    `et` e `ld:processo!dll` (breakpoints internos nos pontos de evento do
+    kernel, filtrados pelo cliente); `bp x /log "texto {expr}"` registra e
+    segue; `/cmd "r; k"` roda comandos na parada; `/g grupo` com `bgd` e
+    `bge`; `bar w|a <início> <tamanho>` divide a faixa em até quatro
+    comparadores.
+  - Análise (`analysis/`): um decodificador x86-64 próprio (tamanho,
+    desvios, operandos relativos ao RIP e imediatos; conferido contra o
+    iced-x86 em 8 milhões de instruções dos binários da máquina), o grafo de
+    fluxo de uma função com layout em camadas, as buscas de referências a
+    strings ASCII e UTF-16, constantes, chamadas entre módulos e xrefs, os
+    padrões com curingas, as strings soltas, a linguagem de roteiros e as
+    notas (comentários, rótulos, marcadores) e patches por módulo + RVA.
   - Bugcheck (`bugcheck.rs`): `!analyze` dá o nome do código, o sentido de
     cada parâmetro (os códigos comuns da referência pública), o driver
     culpado (o módulo da instrução que falhou, o primeiro quadro fora do
@@ -3314,6 +3369,56 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     parado no retorno do IoCreateDevice),
     `docs/screenshots/kd-gui-rastro.png` o `trace` e
     `docs/screenshots/kd-gui-bugcheck.png` o `bugcheck`.
+- **Depurador de engenharia reversa** (`tools/kd-re`, binário `opennt-re`).
+  - Uso: `cargo run -p kd-re --release -- --launch` (com
+    `--initial-process=smss` o csrss.exe real roda); `--connect=HOST:PORTA`;
+    `--script=ARQ` roda um roteiro depois do attach.
+  - Layout no estilo dos depuradores de engenharia reversa: abas no alto
+    (CPU, Grafo, Log, Notas, Breakpoints, Mapa de memória, Pilha de
+    chamadas, SEH, Script, Símbolos, Código-fonte, Referências, Threads,
+    Handles, Rastro, Strings, Patches, Comentários/Rótulos, Processos,
+    Observação, Objetos do NT, Bugcheck), barra de comando e barra de estado
+    (Pausado ou Rodando e a última mensagem). As abas são do `egui_dock`; o
+    menu Exibir reabre uma aba e restaura o arranjo. Tema claro (padrão) e
+    escuro.
+  - Aba CPU: desmontagem (setas dos desvios, linha do RIP, instruções do
+    último rastro, comentários e rótulos do usuário, marcadores, menu de
+    contexto com Procurar), caixa de informação (operandos de memória com o
+    valor, registradores lidos, destino), registradores com flags e
+    segmentos, Dump 1-5 (hexadecimal com ASCII ou UTF-16, word, dword,
+    qword, endereço, float, double; um byte editado vira patch) e pilha com
+    os endereços de retorno nomeados.
+  - Backend (`backend.rs`, `backend/views.rs`): além do snapshot do
+    `opennt-dbg`, monta o processo escolhido, os Dumps, a pilha, a caixa de
+    informação, os argumentos dos quadros (o espaço de home e os primeiros
+    da pilha), os tratadores de exceção (UNWIND_INFO, com a tabela do
+    `__C_specific_handler`), o grafo, as buscas, o mapa de memória, os
+    handles, as threads de usuário, os símbolos e imports de um módulo, os
+    patches e os roteiros.
+  - Imagens para as buscas (`scan.rs`): o PE desta máquina (cabeçalhos e
+    seções nas RVAs) ou o `kernel.elf`; só o que não tem arquivo é lido do
+    alvo. Os patches da sessão são aplicados por cima, e o cache de
+    resultados por módulo vale até o próximo patch.
+  - Montador (`asm.rs`): uma linha em sintaxe Intel; cada código do iced
+    com o mnemônico é tentado com os operandos e fica a codificação mais
+    curta. A instrução que sai é completada com NOP.
+  - Notas: comentários, rótulos e marcadores em
+    `<build>/opennt-re/notas.txt` (módulo + RVA), notas livres em
+    `anotacoes.txt`; breakpoints em `breakpoints.txt`; o arranjo, o tema,
+    o histórico e o roteiro em `%APPDATA%/opennt-re/estado.json`.
+  - Teste de fumaça (`cargo test -p kd-re --release -- --ignored`,
+    `tests/smoke.rs`), sem janela, com `--initial-process=smss --smp=1`: para
+    na carga do basesrv.dll no csrss.exe real (o evento de imagem), confere
+    o contexto (PEB, módulos da PEB.Ldr com os símbolos da ntdll), para num
+    breakpoint de usuário no ntdll!LdrLoadDll com a pilha até o CSRSRV, lê
+    threads de usuário, handles e o mapa de memória, monta o grafo de uma
+    função do kernel e de uma da ntdll, acha referências conhecidas no
+    ACPI.sys real (`PNP0A03` em ASCII e uma UTF-16) e no CSRSRV.dll, roda um
+    roteiro e desenha a janela fora da tela.
+  - Capturas: `opennt-re --launch --screenshot-dir=docs/screenshots
+    --scenario=kernel` grava `kd-re-cpu.png`, `kd-re-grafo.png` e
+    `kd-re-referencias.png`; `--scenario=usuario` grava `kd-re-usuario.png`,
+    `kd-re-memoria.png` e `kd-re-referencias-usuario.png`.
 - **Teste do depurador**: o teste `kd` é um `test-boot` com
   `--kd=com2 --script=xtask/scripts/kd.txt`. O roteiro roda contra a COM2
   em paralelo ao boot e a falha dele derruba o teste. Passos:
