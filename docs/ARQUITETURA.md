@@ -12,8 +12,8 @@ exporta; a HAL, os drivers e a inicialização ficam separados, como no NT.
 | `boot` | setor de boot e stage2 em `global_asm!` (modo real → protegido → 64 bits) |
 | `kernel` | binário `no_std` ligado na VA de sistema 0xFFFFF800_40001000 por `kernel/link.ld` (código PIC, executável estático) e empacotado pelo `xtask` como PE32+ de base fixa 0xFFFFF800_40000000 |
 | `xtask` | build, PE do kernel, imagem de disco, volume NTFS, QEMU, `test-boot`, `test-all`, `capturas`, `status` e o cliente de texto do depurador do kernel (`debug`) |
-| `tools/kd-client` | o cliente do depurador do kernel, só com a biblioteca padrão: protocolo remoto do GDB, símbolos (`kernel.elf`, exports dos PEs, públicos de PDB), pilha pelos frame pointers, passo por cima e para fora, breakpoints e os comandos de texto; usado pelo `xtask` e pelo `kd-gui` |
-| `tools/kd-gui` | `opennt-dbg`, o depurador gráfico (egui/eframe, painéis do `egui_dock`, desmontagem do iced-x86, linhas do DWARF pelo `addr2line`); as dependências dele não entram no build do kernel nem do `xtask` |
+| `tools/kd-client` | o cliente do depurador do kernel, só com a biblioteca padrão: protocolo remoto do GDB, símbolos (`kernel.elf`, exports dos PEs, PDBs públicos com cache e download), pilha pela `.pdata` e pelos frame pointers, tipos do PDB do ntoskrnl, expressões, breakpoints, rastro de instruções e os comandos de texto; usado pelo `xtask` e pelo `kd-gui` |
+| `tools/kd-gui` | `opennt-dbg`, o depurador gráfico (egui/eframe, painéis do `egui_dock`, desmontagem do iced-x86, linhas e variáveis do DWARF pelo `addr2line`/`gimli`); as dependências dele não entram no build do kernel nem do `xtask` |
 
 ## 2. Árvore do kernel
 
@@ -73,7 +73,8 @@ kernel/src/
 │   │   └── resource/  recursos de imagens (ldrrsrc) e tabelas de mensagens
 │   ├── alpc/          ALPC (connect/, message/, resource/)
 │   ├── kd/            depurador do kernel: o estado que os drivers veem e o
-│   │                  próprio depurador do OpenNT (protocolo remoto do GDB)
+│   │                  próprio depurador do OpenNT (protocolo remoto do GDB,
+│   │                  consultas de objetos do NT, rastro de instruções)
 │   ├── po/ etw/ dbgk/ fsrtl/
 │   ├── bgk/           console do vídeo de boot (Bgk*), fonte e tela de bugcheck
 │   ├── inbv/          vídeo de boot: posse do vídeo entre kernel e driver
@@ -1786,50 +1787,75 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   OpenNT, a transição do ntoskrnl (bit 30 força, D0 reprograma a UART,
   D1-D3 sem efeito, outro estado recusado). DbgCommandString é o serviço 5
   do `int 0x2D` num corpo nativo.
-- **Depurador do kernel** (`kd/`): código do próprio OpenNT, ligado por
+- **Depurador do kernel** (`kd/`): código do próprio OpenNT. Liga com
   `--kd=com2` (`com3`, `com4`; a COM1 é o log). Sem a opção, o boot é o de
-  um Windows sem /DEBUG (KdPitchDebugger). Com ela, a fase 0 programa a
-  UART (`kd/transport.rs`, E/S programada sem IRQ, FIFO intocada para não
-  perder um pedido que chegou antes) e o estado que os drivers veem fica
-  como o do KdInitSystem com transporte (`kd/debugger.rs`):
-  KdDebuggerEnabled e o bit 0 do KUSER_SHARED_DATA.KdDebuggerEnabled
-  ligados, KdComPortInUse com a porta do transporte (como o transporte
-  serial do NT a grava), KdDebuggerNotPresent TRUE até um host trocar
-  pacotes (então
-  FALSE, com o bit 1), e KdDisableDebugger/KdEnableDebugger/KdChangeOption/
-  KdRefreshDebuggerNotPresent com a lógica do ntoskrnl (KdDisableCount,
-  KdPreviouslyEnabled, KdBlockEnable, a recusa do desligamento com
-  KernelDr7 habilitado). O host fala o protocolo remoto do GDB
-  (`kd/packet.rs`, `kd/session.rs`): cada processador é uma thread do
-  protocolo; `g`/`G`/`p`/`P` sobre o quadro do trap (`kd/registers.rs`, a
-  ordem do GDB para x86-64, x87/SSE da área FXSAVE64 da entrada); `m`/`M`/
-  `X` andam nas tabelas de páginas do CR3 do processador pelo mapa direto,
-  sem travas nem faltas (`kd/memory.rs`); `Z0` grava o 0xCC pelo quadro
-  físico, `Z1`/`Z2`/`Z4` são DR0-DR3 (`kd/breakpoints.rs`, publicados em
-  KPRCB.ProcessorState.SpecialRegisters); `qRcmd` (o `monitor`) traz as
-  consultas do OpenNT (`kd/monitor.rs`: processos e threads pelas listas
-  nativas, os registradores de uma thread fora da CPU pelo quadro de troca
-  que KTHREAD.KernelStack aponta, módulos, processadores com IRQL e thread
-  corrente, objeto por nome, o anel do DbgPrint, breakpoints, bugcheck);
-  `qXfer:libraries:read`
-  dá a lista de módulos ao GDB. As paradas (`kd/stop.rs`) vêm dos
-  trampolins (`hal/amd64/irqstubs.rs`): `int 3` e #DB do anel 0 vão ao
-  depurador antes do SEH (o KiDebugRoutine), o tique do relógio no anel 0
-  consulta o LSR (o 0x03 do host, ou o começo de um pacote, para a máquina,
-  como o KdPollBreakIn), a exceção sem tratador e o KeBugCheckEx param antes
-  do diagnóstico e da tela de STOP, e o pânico antes de travar. O dono da
-  parada congela os outros processadores com NMI pelo código de IPI do Ke
-  (`smp::send_nmi_to_application_processors`; a NMI dos APs prende o
-  processador em `rs_kd_freeze_processor` com o quadro publicado) e só os
-  degela ao continuar; o passo roda só no dono, com o IF mascarado durante
-  a instrução (o original volta depois, e um `pushfq` passo a passo grava o
-  IF original), e continuar de um breakpoint dá antes um passo com o byte
-  original. Nada da parada aloca nem toma trava: as consultas que usam
-  estruturas do Rust (módulos, objeto por nome) só rodam quando nenhum
-  processador parado tinha SpinLock ou SharedLock. O DbgPrint vai ao host
-  como pacote `O` com a máquina rodando (`kd/print_log.rs`). Os APs ainda
-  usam a própria IDT de três vetores: só o BSP trata `int 3`/#DB, e os
-  comparadores de hardware são carregados só no dono da parada.
+  um Windows sem /DEBUG (KdPitchDebugger).
+  - Transporte (`kd/transport.rs`): a fase 0 programa a UART com E/S
+    programada, sem IRQ. A FIFO fica intocada para não perder um pedido que
+    chegou antes.
+  - Estado visto pelos drivers (`kd/debugger.rs`), como o KdInitSystem com
+    transporte: KdDebuggerEnabled e o bit 0 do
+    KUSER_SHARED_DATA.KdDebuggerEnabled ligados; KdComPortInUse com a porta;
+    KdDebuggerNotPresent TRUE até um host trocar pacotes (então FALSE, com o
+    bit 1). KdDisableDebugger, KdEnableDebugger, KdChangeOption e
+    KdRefreshDebuggerNotPresent seguem a lógica do ntoskrnl (KdDisableCount,
+    KdPreviouslyEnabled, KdBlockEnable, recusa com KernelDr7 habilitado).
+  - Protocolo (`kd/packet.rs`, `kd/session.rs`): o protocolo remoto do GDB.
+    Cada processador é uma thread do protocolo. `g`/`G`/`p`/`P` usam o
+    quadro do trap (`kd/registers.rs`: a ordem do GDB para x86-64, x87/SSE
+    da área FXSAVE64). `m`/`M`/`X` andam nas tabelas de páginas do CR3 do
+    processador pelo mapa direto, sem travas nem faltas (`kd/memory.rs`).
+    `Z0` grava o 0xCC pelo quadro físico; `Z1`/`Z2`/`Z4` são DR0-DR3
+    (`kd/breakpoints.rs`, publicados em KPRCB.ProcessorState.SpecialRegisters).
+    `qXfer:libraries:read` dá a lista de módulos ao GDB.
+  - Consultas pelo `qRcmd` (o `monitor` do GDB): `kd/monitor.rs` lista
+    processos e threads pelas listas nativas, os registradores de uma thread
+    fora da CPU pelo quadro de troca, módulos, processadores com IRQL e
+    thread corrente, objeto por nome, o anel do DbgPrint, breakpoints e o
+    bugcheck (código, nome do KiBugCodeMessages e o driver de um parâmetro).
+    `kd/inspect.rs` mostra objetos do NT com os layouts do PDB
+    (`inc::types`): `process` (EPROCESS e as threads), `thread` (estado,
+    motivo da espera, prioridades, pilha de kernel, IRPs pendentes), `irp`
+    (os campos e cada IO_STACK_LOCATION com major/minor, dispositivo,
+    arquivo, rotina de conclusão e parâmetros), `devobj` (DEVICE_OBJECT e a
+    pilha de dispositivos por AttachedDevice e AttachedTo), `drvobj`
+    (DRIVER_OBJECT, os dispositivos e a tabela de despacho) e `handle` (a
+    entrada da HANDLE_TABLE nativa, pelo caminho do
+    ExpLookupHandleTableEntry).
+  - Rastro de instruções (`kd/trace.rs`): o host arma com `monitor trace
+    start` (número de instruções, endereço final, até o retorno,
+    profundidade máxima, faixas puladas, entrar ou sair de uma faixa,
+    endereço vigiado) e continua. O processador da parada executa passo a passo
+    (TF) e cada #DB grava um registro compacto num buffer de 256 KB: classe
+    da instrução (call, ret), RIP, profundidade, thread quando muda, valor
+    vigiado quando muda e só os registradores que mudaram. Não há volta ao
+    host por instrução. O lote para no fim pedido, num breakpoint, antes de
+    `iretq`/`sysret`/`hlt`/`int` ou com o buffer cheio (`trace resume`
+    continua). O host lê o buffer por `qOpenNTTrace:offset,tamanho`. Os
+    outros processadores ficam congelados e as interrupções mascaradas, como
+    no passo comum. O formato é o de `tools/kd-client/src/trace.rs`.
+  - Paradas (`kd/stop.rs`), pelos trampolins (`hal/amd64/irqstubs.rs`):
+    `int 3` e #DB do anel 0 antes do SEH (o KiDebugRoutine); o tique do
+    relógio no anel 0 consulta o LSR (o 0x03 do host, ou o começo de um
+    pacote, para a máquina, como o KdPollBreakIn); a exceção sem tratador e
+    o KeBugCheckEx param antes do diagnóstico e da tela de STOP; o pânico
+    para antes de travar.
+  - Congelamento: o processador da parada congela os outros com NMI
+    pelo código de IPI do Ke (`smp::send_nmi_to_application_processors`; a
+    NMI dos APs prende o processador em `rs_kd_freeze_processor` com o
+    quadro publicado) e só os degela ao continuar.
+  - Passo: roda só no processador da parada, com o IF mascarado durante a
+    instrução. O IF original volta depois, e um `pushfq` passo a passo grava
+    o IF original. Continuar de um breakpoint dá antes um passo com o byte
+    original.
+  - Nada da parada aloca nem toma trava. As consultas que usam estruturas
+    do Rust (módulos, objeto por nome) só rodam quando nenhum processador
+    parado tinha SpinLock ou SharedLock.
+  - O DbgPrint vai ao host como pacote `O` com a máquina rodando
+    (`kd/print_log.rs`).
+  - Os APs ainda usam a própria IDT de três vetores: só o BSP trata
+    `int 3`/#DB, e os comparadores de hardware são carregados só no
+    processador da parada.
 - **Bugcheck** (`ke/bugcheck.rs`, `ke/bugcheck_reason.rs`,
   `bgk/bugcheck_screen.rs`, `bgk/boot_font.rs`): o KeBugCheckEx segue o
   KeBugCheck2 — KiBugCheckActive (o segundo processador gira até ser
@@ -2935,63 +2961,172 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   IOCTL_BEEP_SET ao `\Device\Beep` do beep.sys pelo StartIo dele
   (`BEEP_DEVICE_OK`), e os reconhecedores do fs_rec.sys respondem a um
   IRP_MN_MOUNT_VOLUME sobre o volume NTFS (`FS_REC_OK`).
-- **Depurador do kernel**: `cargo xtask debug` compila com `--kd=com2`, abre
-  o QEMU com a COM2 num socket TCP local e o prompt do cliente; o protocolo
-  remoto do GDB, os símbolos (`kernel.elf` com os nomes do Rust legíveis,
-  exports dos PEs desta máquina e os públicos de um PDB já no cache do
-  `nt-types`), a pilha pelos frame pointers, o passo por cima (`p`, um
-  breakpoint temporário depois do `call`, com o RSP de volta conferido para
-  ignorar uma recursão mais funda) e para fora (`gu`, pelo endereço de
-  retorno do prólogo ou de RBP + 8), os breakpoints do cliente (`bd`/`be`
-  desligam e religam) e os comandos ficam no crate `tools/kd-client`, que o
-  `xtask/src/debug` (o prompt) e o depurador gráfico usam;
-  `--connect=HOST:PORTA` só conecta (a um `cargo xtask run --kd=com2`, porta
-  1234, onde o GDB também entra), e `--launch --no-client [--headless]` só
-  compila e abre o QEMU para outro cliente (imprime `KD_READY 127.0.0.1:PORTA`
-  e fecha o QEMU quando a entrada padrão fecha). Os testes do cliente
-  (`cargo test -p kd-client`) cobrem os pacotes, a resposta de parada, os
-  registradores, os símbolos, a pilha sobre uma pilha capturada, o tamanho
-  dos `call` e, contra um alvo de mentira num socket local
-  (`tools/kd-client/tests/fake_target.rs`), a sessão inteira com os
-  breakpoints e o passo por cima numa recursão.
-- **Depurador gráfico** (`tools/kd-gui`, binário `opennt-dbg`):
-  `cargo run -p kd-gui --release -- --launch` roda o mesmo build e QEMU do
-  `cargo xtask debug --launch` e abre a janela; `--connect=HOST:PORTA` entra
-  num QEMU aberto. A interface é egui/eframe (Rust puro, backend OpenGL
-  `glow`, sem wgpu) com painéis encaixáveis do `egui_dock`: Comando (os
-  comandos do prompt de texto), Desmontagem (iced-x86, sintaxe MASM, em
-  volta do RIP, com símbolos, destinos dos desvios e a margem que liga e
-  tira breakpoints), Fonte (a linha do DWARF do `kernel.elf` pelo
-  `addr2line`, só para o código do OpenNT), Registradores (por processador
-  ou thread, editáveis com a máquina parada), Memória (hexadecimal e ASCII
-  num endereço ou símbolo, editável), Pilha de chamadas, Módulos, Processos
-  (com os processadores), Threads (escolher uma mostra os registradores e a
-  pilha dela, pelo quadro de troca quando está fora da CPU), Breakpoints
-  (software, hardware e vigias, ligar e desligar), DbgPrint e o log da COM1.
-  Barra: Parar (Ctrl+B), Continuar (F5), Entrar (F11), Passar (F10), Sair
-  (Shift+F11), Reiniciar (fecha o QEMU, recompila e abre de novo) e o estado
-  da conexão. O backend (`backend.rs`) fala com o alvo numa thread e publica
-  um snapshot por parada; a janela nunca espera o socket. O teste de fumaça
-  (`cargo test -p kd-gui --release -- --ignored`, `tests/smoke.rs`) roda o
-  backend sem janela: abre o OpenNT com o QEMU sem tela, anexa, confere
-  registradores, módulos, pilha, desmontagem e a linha de código, pede a
-  parada com a máquina rodando, para num breakpoint em
-  `kernel::ntos::ke::run_kernel_tasks`, passa por cima e sai da função até o
-  `kmain`, roda um comando e desenha a janela fora da tela. A captura
-  `docs/screenshots/kd-gui.png` sai de `opennt-dbg --launch --break-at=EXPR
-  --screenshot=ARQ`: o egui roda sem janela e um rasterizador de software
-  (`offscreen.rs`) pinta os triângulos do `tessellate` com o atlas das
-  fontes, sem GPU.
+- **Depurador do kernel, cliente** (`tools/kd-client`): só a biblioteca
+  padrão. O prompt do `cargo xtask debug` (`xtask/src/debug`) e o
+  depurador gráfico usam o mesmo código.
+  - Modos do `cargo xtask debug`: sem opções, compila com `--kd=com2`, abre
+    o QEMU com a COM2 num socket TCP local e o prompt.
+    `--connect=HOST:PORTA` só conecta (a um `cargo xtask run --kd=com2`,
+    porta 1234, onde o GDB também entra). `--launch --no-client
+    [--headless]` só compila e abre o QEMU para outro cliente: imprime
+    `KD_MONITOR 127.0.0.1:PORTA` (com `--monitor-port`, o monitor HMP do
+    QEMU) e `KD_READY 127.0.0.1:PORTA`, e fecha o QEMU quando a entrada
+    padrão fecha.
+  - Símbolos (`symbols.rs`, `pe.rs`, `pdb.rs`): o `kernel.elf` com os nomes
+    do Rust legíveis; para cada binário da Microsoft carregado, os exports
+    do PE desta máquina e os nomes públicos do PDB público dele. O PDB vem
+    do cache `build/symbols` (`OPENNT_SYMBOLS` troca a pasta) ou do servidor
+    público de símbolos, baixado pelo `curl` numa thread
+    (`OPENNT_SYMBOL_DOWNLOAD=0` desliga). O download é o mesmo do
+    `cargo xtask nt-types`. Os módulos aparecem sem extensão
+    (`ntfs!NtfsCommonCreate+0x1a3`); `nt` é o kernel.
+  - Pilha (`unwind.rs`): o contexto (RIP, RSP e os registradores
+    conhecidos) passa de quadro em quadro. Nos binários da Microsoft, o
+    desenrolar virtual do x64 pela `.pdata` e pelo UNWIND_INFO (push,
+    alocação, registrador de quadro, registradores salvos, quadro de
+    máquina, informação encadeada; epílogo reconhecido no quadro de cima;
+    função folha). A tabela vem do arquivo desta máquina ou da memória do
+    alvo. No código do OpenNT, os frame pointers (e o prólogo no quadro de
+    cima). Um driver chamado pelo kernel e o kernel chamado pelo driver
+    desenrolam um sobre o outro. O `gu` sai pelo quadro de cima do mesmo
+    desenrolar.
+  - Tipos (`tpi.rs`, `types.rs`): o TPI do `build/symbols/ntkrnlmp.pdb` (o
+    mesmo leitor do `cargo xtask nt-types`, que agora o usa daqui).
+    `dt _IRP endereço` mostra a struct campo a campo; enums com o nome do
+    valor, bitfields, arrays de caracteres como texto, ponteiros com o
+    símbolo. O PDB carrega na primeira expressão tipada.
+  - Expressões (`expr.rs`): números (`0x`, `` ` ``, `0n`, hexadecimal sem
+    prefixo), registradores (`@rax`, `%rax`, `rax`), `$variáveis`,
+    símbolos do Rust e `módulo!símbolo`, `poi`/`by`/`wo`/`dwo`/`qwo`,
+    `[x]`, `$iment(módulo)`, `sizeof(tipo)`, os operadores do C e os acessos
+    tipados (`((_IRP*)@rcx)->Tail.Overlay.CurrentStackLocation`, `*p`,
+    `&s.Campo`, `p[2]`).
+  - Breakpoints (`client.rs`): software, hardware de execução, escrita e
+    acesso (`ba e1|w4|r8`), condição (`bp x 3 /w "@rax == 7"`: a partir do
+    terceiro acerto, só com a condição verdadeira; os outros acertos seguem
+    sozinhos), adiados (`bu`: o símbolo de um módulo que ainda vai carregar)
+    e parada por carga de módulo (`sxe ld:ntfs.sys`). Os dois últimos usam
+    um breakpoint interno na notificação de carga de imagem do kernel
+    (`ps::notify::image::notify`): o cliente relê a lista de módulos, arma
+    os adiados e segue sozinho quando o módulo novo não é o pedido.
+    `.bpsave`/`.bpload` gravam e recriam a lista.
+  - Bugcheck (`bugcheck.rs`): `!analyze` dá o nome do código, o sentido de
+    cada parâmetro (os códigos comuns da referência pública), o driver
+    culpado (o módulo da instrução que falhou, o primeiro quadro fora do
+    kernel, o KiBugCheckDriver do alvo ou o módulo de um parâmetro) e a
+    pilha.
+  - Rastro (`trace.rs`, `commands.rs`): `trace [n] [ate <expr>] [ret]
+    [over] [entra|sai <módulo>] [pula <módulo>] [vigia <expr> [bytes]]` arma
+    o rastro no alvo e lê os lotes até o fim. O cliente guarda o estado dos
+    registradores com pontos de controle a cada 256 registros e monta a
+    árvore de chamadas pela profundidade. `trace show`, `trace tree`, `trace
+    save` (CSV), `trace ref` e `trace diff <arq.csv>` (a primeira
+    divergência entre dois rastros, alinhados pelo primeiro RIP comum).
+  - Comandos do WinDbg: `k`, `r`, `db`/`dw`/`dd`/`dq`/`da`/`du`, `bp`,
+    `bu`, `ba`, `bl`, `bc`, `bd`/`be`, `g`, `p`, `t`, `gu`, `lm`, `lmv`, `?`,
+    `ln`, `dt`, `sxe`/`sxd`, `.reload`, `!process`, `!thread`, `!irp`,
+    `!devobj`, `!drvobj`, `!object`, `!handle`, `!analyze`, além dos do
+    OpenNT (`ps`, `threads`, `cpus`, `obj`, `log`, `btt`, `context`...).
+  - Testes (`cargo test -p kd-client`): pacotes, resposta de parada,
+    registradores, PE e `.pdata`, UNWIND_INFO e o desenrolar misto sobre uma
+    pilha montada, públicos de PDB, tipos sobre um TPI montado, expressões,
+    bugcheck, o formato do rastro, a árvore de chamadas e a comparação. Contra
+    um alvo de mentira num socket local (`tests/fake_target.rs`): a sessão
+    inteira com breakpoints, passo por cima numa recursão, breakpoint
+    condicional com contagem e a parada por carga de módulo.
+- **Depurador gráfico** (`tools/kd-gui`, binário `opennt-dbg`).
+  - Uso: `cargo run -p kd-gui --release -- --launch` roda o mesmo build e
+    QEMU do `cargo xtask debug --launch` e abre a janela; `--connect=HOST:PORTA`
+    entra num QEMU aberto.
+  - Interface: egui/eframe (Rust puro, backend OpenGL `glow`, sem wgpu) com
+    painéis encaixáveis do `egui_dock`. Arranjo padrão: Desmontagem e
+    Código-fonte no centro; Registradores, Observação e Variáveis locais à
+    direita; Pilha de chamadas, Breakpoints, Módulos, Threads, Processos e
+    CPUs e Objetos do NT embaixo à direita; Comandos, Rastro e Memória
+    embaixo; DbgPrint e o log da COM1 no canto. O arranjo, o tema, as
+    expressões observadas e o histórico de comandos ficam em
+    `%APPDATA%\opennt-dbg\estado.json`. O menu Painéis reabre um painel
+    fechado e restaura o arranjo padrão. Os breakpoints da sessão ficam em
+    `<build>/opennt-dbg/breakpoints.txt` e voltam no próximo attach
+    (adiados quando o módulo ainda não carregou).
+  - Barra de ferramentas com ícones desenhados e dicas; teclas do WinDbg:
+    F5 continua, F10 passa por cima, F11 entra, Shift+F11 sai, F9 liga ou
+    tira o breakpoint na linha escolhida, Ctrl+B para. Barra de estado:
+    conexão, estado do alvo, CPU, thread, processo e IRQL. Tema escuro e
+    claro.
+  - Painéis: Desmontagem (iced-x86, sintaxe MASM, marcador do RIP, margem
+    de breakpoints, destinos dos desvios); Código-fonte (a linha do DWARF);
+    Registradores (os que mudaram em vermelho, editáveis); Observação
+    (expressões com valor e tipo; um valor tipado abre a struct campo a
+    campo, e campos de struct e ponteiros abrem de novo); Variáveis locais
+    (parâmetros e variáveis do quadro de cima pelo DWARF do `kernel.elf`:
+    frame base, registradores e listas de posições, pelo `gimli`); Memória
+    (bytes, words, dwords, qwords, ASCII, UTF-16; procura de bytes, texto ou
+    UTF-16; clique duplo num qword segue o ponteiro); Pilha de chamadas (RSP
+    de cada quadro e o método do desenrolar); Breakpoints (condição,
+    contagem, acertos, adiados, carga de módulo); Módulos (PDB baixado ou
+    não; clique abre o `lmv`); Objetos do NT (as consultas do `kd/inspect.rs`,
+    o módulo e qualquer struct do PDB; endereços azuis abrem como IRP,
+    dispositivo, driver, thread ou processo pelo botão direito); Análise do
+    bugcheck (abre sozinha numa parada pelo KeBugCheckEx); Rastro; Comandos
+    (histórico e Tab para completar comandos, símbolos e tipos); DbgPrint e
+    o log da COM1.
+  - Rastro: os modos do `trace` (N instruções, até um endereço, até o
+    retorno, até entrar ou sair de um módulo), "só a função corrente",
+    módulos pulados e um endereço vigiado. A tabela é virtual (centenas de
+    milhares de linhas), com filtro por módulo, símbolo ou instrução.
+    Escolher uma linha mostra os registradores naquele ponto (os que
+    mudaram em vermelho) e os operandos de memória da instrução, com o
+    endereço calculado pelos registradores e o valor lido (o registrador de
+    destino no passo seguinte) ou gravado. Também: a árvore de chamadas,
+    "na desmontagem", exportar CSV, usar como referência ou carregar uma
+    referência, e a comparação que vai à primeira divergência.
+  - Rastro rápido (QEMU, TCG): liga o log de execução do QEMU (`log
+    exec,nochain` pelo monitor HMP) enquanto a máquina roda, até um
+    endereço ou por um tempo, e expande cada bloco executado nas instruções
+    dele (até o primeiro desvio ou o começo do bloco seguinte). Só RIPs, sem
+    registradores. O QEMU 11.1 desta máquina tem o suporte a plugins TCG
+    (`-plugin` existe), mas a instalação não traz os plugins de exemplo
+    (`libexeclog.dll`): por isso o caminho é o log do `-d`.
+  - O backend (`backend.rs`) fala com o alvo numa thread e publica um
+    snapshot por parada; a janela nunca espera o socket. `scenario.rs` tem
+    os roteiros sem janela do teste e das capturas.
+  - Teste de fumaça (`cargo test -p kd-gui --release -- --ignored`,
+    `tests/smoke.rs`), sem janela: abre o OpenNT com o QEMU sem tela, anexa
+    no começo do boot, para na carga do ACPI.sys real (`sxe ld`), para
+    dentro dele no retorno de uma chamada ao IoCreateDevice e confere a
+    pilha pela `.pdata` com os nomes do PDB público, rastreia 200 instruções
+    no driver, mostra o objeto de driver, um IRP de PnP e o dispositivo dele
+    na rotina IRP_MJ_PNP do driver, pede a parada com a máquina rodando,
+    rastreia `kernel::ntos::ke::run_kernel_tasks` até o retorno (árvore com
+    as chamadas), passa por cima e sai da função até o `kmain`, provoca o
+    bugcheck 0xE2 pelo CrashOnCtrlScroll do i8042prt.sys real (teclas pelo
+    monitor HMP), confere a análise e desenha a janela fora da tela.
+  - Capturas: `opennt-dbg --launch --screenshot=ARQ --scenario=driver|trace|bugcheck`.
+    O egui roda sem janela e um rasterizador de software (`offscreen.rs`)
+    pinta os triângulos do `tessellate` com o atlas das fontes, sem GPU.
+    `docs/screenshots/kd-gui.png` é o cenário `driver` (o mountmgr.sys real
+    parado no retorno do IoCreateDevice),
+    `docs/screenshots/kd-gui-rastro.png` o `trace` e
+    `docs/screenshots/kd-gui-bugcheck.png` o `bugcheck`.
 - **Teste do depurador**: o teste `kd` é um `test-boot` com
-  `--kd=com2 --script=xtask/scripts/kd.txt`: o roteiro roda contra a COM2
-  em paralelo ao boot e a falha dele derruba o teste. Ele anexa,
-  confere o estado do depurador e os processadores congelados, lê e grava
-  memória, pede a parada com a máquina rodando, para num breakpoint de
-  software no laço principal, confere a saída do DbgPrint do ksecdd.sys real
-  e as consultas do OpenNT (com a pilha de uma thread de kernel bloqueada,
-  pelo quadro de troca), dá um passo, para num breakpoint de hardware e se
-  desliga; o boot segue até o shell, que o roteiro espera na COM1. O boot com `--kd` roda também
-  `ntos/test/kernel_debugger.rs` (`KD_EXPORTS_OK`).
+  `--kd=com2 --script=xtask/scripts/kd.txt`. O roteiro roda contra a COM2
+  em paralelo ao boot e a falha dele derruba o teste. Passos:
+  - anexa, confere o estado do depurador e os processadores congelados;
+  - lê e grava memória; pede a parada com a máquina rodando;
+  - para num breakpoint de software no laço principal; confere a saída do
+    DbgPrint do ksecdd.sys real;
+  - consultas do OpenNT: processos, threads, a pilha de uma thread de kernel
+    bloqueada pelo quadro de troca até o ACPI.sys, módulos, processadores,
+    `obj`, `k`, uma expressão e `!process`, `!thread`, `!drvobj \Driver\ACPI`,
+    `!devobj` de um dispositivo dele e `lmv`;
+  - dá um passo; para num breakpoint de hardware;
+  - rastreia 300 instruções a partir da entrada da função, mostra a árvore
+    e rastreia até o retorno;
+  - desliga; o boot segue até o shell, que o roteiro espera na COM1.
+
+  O boot com `--kd` roda também `ntos/test/kernel_debugger.rs`
+  (`KD_EXPORTS_OK`).
 - **Marcadores**: `HELLO_KERNEL_OK`, `KERNEL_RS_OK`, `SELFTEST_OK`,
   `PHASE3_SELFTEST_OK` a `PHASE7_SELFTEST_OK`, `MULTIPROCESS_OK` (o
   NtCreateUserProcess de um processo pai real, na fase 7), `PIPES_OK` (o

@@ -196,7 +196,8 @@ cargo xtask test-all --jobs 4 --cpu-friendly
 cargo xtask test-all --only dxgkrnl --repeat 10
 
 # Depurador do kernel: build com --kd=com2, QEMU e o prompt do cliente
-# (break, c, s, regs, x, bp/hbp, bt, ps, threads, lm, cpus, obj, log...).
+# (comandos do WinDbg: k, r, db/dq, bp, bu, ba, bl, g, p, t, gu, lm, dt,
+# !process, !thread, !irp, !devobj, !drvobj, !analyze; trace; help).
 cargo xtask debug
 # Só o cliente (ou um GDB: target remote 127.0.0.1:1234) contra
 # `cargo xtask run --kd=com2`.
@@ -281,18 +282,43 @@ Comandos do shell: `help`, `version`, `clear`, `echo`, `mem`, `ls`, `cat`,
 
 ### Depurador do kernel
 
-O OpenNT tem o próprio depurador de kernel: com `--kd=com2` o kernel atende o
-protocolo remoto do GDB na COM2, com as consultas do OpenNT (processos,
-threads, módulos, processadores, objetos, DbgPrint). Há dois clientes, com o
-mesmo código de protocolo, símbolos e pilha (`tools/kd-client`): o prompt de
-texto `cargo xtask debug` e o depurador gráfico `opennt-dbg`
-(`cargo run -p kd-gui --release -- --launch`), com desmontagem, fonte (pelo
-DWARF do kernel), registradores e memória editáveis, pilha, módulos,
-processos, threads, breakpoints e o DbgPrint em painéis encaixáveis. Teclas:
-F5 continua, F10 passa por cima, F11 entra, Shift+F11 sai da função, Ctrl+B
-para; um clique na margem da desmontagem liga ou tira um breakpoint.
+O OpenNT tem o próprio depurador de kernel. Com `--kd=com2` o kernel atende o
+protocolo remoto do GDB na COM2, com consultas próprias. Há dois clientes com
+o mesmo código (`tools/kd-client`): o prompt de texto `cargo xtask debug` e o
+depurador gráfico `opennt-dbg` (`cargo run -p kd-gui --release -- --launch`).
 
-![opennt-dbg parado num breakpoint no laço principal do kernel](docs/screenshots/kd-gui.png)
+- Pilha correta através dos drivers da Microsoft: desenrolar pela `.pdata`
+  deles e pelos frame pointers do OpenNT, com os nomes dos PDBs públicos
+  (baixados do servidor de símbolos para `build/symbols`):
+  `ACPI!ACPIDispatchAddDevice+0xc8`.
+- Objetos do NT: processo, thread (estado, motivo da espera, pilha), IRP
+  (pilha de E/S), dispositivo (pilha de dispositivos), driver (tabela de
+  despacho), objeto por nome ou handle, módulo e qualquer struct do PDB do
+  ntoskrnl campo a campo (`dt _IRP endereço`).
+- Bugcheck: numa parada pelo KeBugCheckEx, a análise abre sozinha com o
+  nome do código, os parâmetros explicados, o driver culpado e a pilha.
+- Breakpoints condicionais e com contagem, de dados (escrita, acesso,
+  execução), adiados para um módulo que ainda vai carregar e parada na carga
+  de um módulo (`sxe ld:ntfs.sys`); a lista volta na próxima sessão.
+- Rastro de instruções passo a passo dentro do convidado, em lotes: N
+  instruções, até um endereço, até o retorno, até entrar ou sair de um
+  módulo, só a função corrente. Tabela com os registradores e os operandos
+  de memória de cada passo, árvore de chamadas, CSV e comparação de dois
+  rastros. No TCG, um rastro rápido pelo log de execução do QEMU.
+- Janela: desmontagem, código-fonte e variáveis locais (DWARF do kernel),
+  registradores, observação com structs tipadas, memória em vários formatos
+  com busca, pilha, breakpoints, módulos, threads, processos, objetos do NT,
+  rastro, comandos com histórico e Tab, DbgPrint e o log da COM1, em painéis
+  encaixáveis. O arranjo fica salvo; o menu Painéis reabre um painel e
+  restaura o padrão. Tema escuro e claro.
+- Teclas do WinDbg: F5 continua, F10 passa por cima, F11 entra, Shift+F11
+  sai da função, F9 liga ou tira um breakpoint, Ctrl+B para.
+
+![opennt-dbg parado dentro do mountmgr.sys real (o DriverEntry chamando o IoCreateDevice), com a pilha pela .pdata e os nomes do PDB público](docs/screenshots/kd-gui.png)
+
+![A análise do bugcheck 0xE2 provocado pelo CrashOnCtrlScroll do i8042prt.sys](docs/screenshots/kd-gui-bugcheck.png)
+
+![O painel Rastro: run_kernel_tasks passo a passo, com os registradores e os operandos de memória](docs/screenshots/kd-gui-rastro.png)
 
 ## Fora do escopo
 
