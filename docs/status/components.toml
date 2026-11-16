@@ -308,6 +308,13 @@ comando = "cargo xtask test-boot DRIVER_START_COMPLETED 400000 --start-driver=ks
 descricao = "O ksecpkg.sys da Microsoft (o pacote de segurança do KSecDD) sobe pela chave KSecPkg da instalação, validado pelo catálogo, com os imports resolvidos no ntoskrnl, no cng.sys e no ksecdd.sys, e o DriverEntry retorna sucesso (state=4)."
 
 [[teste]]
+id = "usb"
+titulo = "Pilha USB 3 e HID real com interrupções por mensagem"
+marcador = "USB_HID_OK"
+comando = "cargo xtask test-boot USB_HID_OK 600000 --usb --build-dir=build/usb --smp=1 --keys=a --expect=USB_KEY_OK"
+descricao = "Com --usb, a máquina ganha a controladora xHCI do QEMU (qemu-xhci) com um teclado e um tablet USB. O PnP instala a controladora pelo usbxhci.inf com o usbxhci.sys real (KMDF, com a extensão de classe ucx01000.sys que a WdfLdr carrega pela chave da classe Ucx) e, porque o INF pede (MSISupported), o barramento pede 16 mensagens MSI-X: o PnP manager dá a cada uma um vetor da HAL e grava os dados de conexão do PDO, o START do barramento programa a tabela MSI-X pelo HalGetMessageRoutingInfo e o KMDF conecta os 16 vetores; o DMA vem do adaptador da versão 3 da HAL. O hub raiz que a UCX relata (USB\\ROOT_HUB30) recebe o usbhub3.sys, as portas são enumeradas pelo trabalhador das ações do PnP e o USB_HUB_OK sai com um dispositivo nas portas; os dispositivos HID recebem o hidusb.sys com o hidclass.sys (input.inf) e as coleções de teclado e de mouse o kbdhid.sys e o mouhid.sys com o kbdclass e o mouclass: USB_HID_OK (que só sai depois do USB_HUB_OK). Com o teclado USB, o QEMU entrega a ele as teclas: o teste manda 'a' pelo monitor (sendkey), e a tecla chega pelo relatório HID do usbxhci ao kbdhid e ao kbdclass, onde o serviço de teclado a lê: USB_KEY_OK."
+
+[[teste]]
 id = "storage"
 titulo = "Pilha de armazenamento real pelo PnP"
 marcador = "STORAGE_REAL_OK"
@@ -610,9 +617,9 @@ icone = "bus"
 descricao = "Percorre o barramento PCI e descobre os dispositivos e os recursos de cada um (portas, memória, interrupções)."
 estado = "em desenvolvimento"
 caminhos = ["kernel/src/drivers/bus/pci.rs", "kernel/src/drivers/bus/pci_pnp.rs", "kernel/src/drivers/bus/device_tree.rs", "kernel/src/hal/pci_config.rs"]
-testes = ["fase4", "storage", "basicdisplay"]
+testes = ["fase4", "storage", "basicdisplay", "usb"]
 fase = "4"
-notas = "Suporte de boot do próprio kernel: enumera as funções PCI no início da fase 1 (o driver ATA interno e os autotestes usam as funções), e com --pnp-root=internal faz a enumeração que no Windows é do pci.sys, criando um PDO por função, filhos de um PDO de barramento raiz (PCI_HAL\\PNP0A03\\0). Os PDOs respondem como o pci.sys: QUERY_ID com os formatos dele (DeviceID PCI\\VEN_v&DEV_d&SUBSYS_s&REV_r, as listas de HardwareIDs e CompatibleIDs e o InstanceID do slot), capacidades (a ponte de host RawDeviceOK, como o PciDevice_QueryCapabilities), requisitos e configuração de boot dos BARs (sem os do canal IDE legado; um BAR de memória pré-buscável com CM_RESOURCE_MEMORY_PREFETCHABLE), START_DEVICE que programa os BARs e liga I/O, memória e bus master, informação de barramento, os textos da tabela de mensagens do pci.sys, BUS_INTERFACE_STANDARD (espaço de configuração e o adaptador de DMA da HAL) e PCI_BUS_INTERFACE_STANDARD, READ_CONFIG/WRITE_CONFIG. No boot comum a raiz da árvore é ACPI e quem enumera é o pci.sys real (veja acpi.sys e pci.sys)."
+notas = "Suporte de boot do próprio kernel: enumera as funções PCI no início da fase 1 (o driver ATA interno e os autotestes usam as funções), e com --pnp-root=internal faz a enumeração que no Windows é do pci.sys, criando um PDO por função, filhos de um PDO de barramento raiz (PCI_HAL\\PNP0A03\\0). Os PDOs respondem como o pci.sys: QUERY_ID com os formatos dele (DeviceID PCI\\VEN_v&DEV_d&SUBSYS_s&REV_r, as listas de HardwareIDs e CompatibleIDs e o InstanceID do slot), capacidades (a ponte de host RawDeviceOK, como o PciDevice_QueryCapabilities), requisitos e configuração de boot dos BARs (sem os do canal IDE legado; um BAR de memória pré-buscável com CM_RESOURCE_MEMORY_PREFETCHABLE), START_DEVICE que programa os BARs e liga I/O, memória e bus master, informação de barramento, os textos da tabela de mensagens do pci.sys, interrupções por mensagem (`pci_msi.rs`: com MSISupported na chave Interrupt Management do dispositivo, os requisitos pedem as mensagens MSI-X ou MSI no formato do pci.sys, e o START programa o endereço e o dado de cada mensagem na tabela MSI-X ou na capacidade MSI pelo HalGetMessageRoutingInfo, com os vetores que o PnP manager deu), BUS_INTERFACE_STANDARD (espaço de configuração e o adaptador de DMA da HAL) e PCI_BUS_INTERFACE_STANDARD, READ_CONFIG/WRITE_CONFIG. No boot comum a raiz da árvore é ACPI e quem enumera é o pci.sys real (veja acpi.sys e pci.sys)."
 
 [[componente]]
 nome = "Dispositivos da placa-mãe"
@@ -773,9 +780,9 @@ icone = "chip"
 descricao = "O Kernel-Mode Driver Framework da Microsoft: a WdfLdr.sys liga cada driver KMDF ao runtime Wdf01000.sys, que implementa o framework. Cerca de 65 drivers KMDF desta instalação (msisadrv, cdrom, ucx01000, winusb, hidi2c, sercx, spbcx, acpidev...) já têm todos os imports do ntoskrnl atendidos e dependem dele para carregar."
 estado = "implementado"
 caminhos = ["kernel/src/ntos/mm/sysload.rs", "kernel/src/ntos/cm/service/driver.rs", "kernel/src/ntos/cm/service/inbox_drivers.rs", "xtask/src/windows_binaries.rs"]
-testes = ["kmdf", "basicdisplay"]
+testes = ["kmdf", "basicdisplay", "usb"]
 fase = "6"
-notas = "Roda com `--start-driver=msisadrv`: DRIVER_START_COMPLETED name=msisadrv state=4 win32=0 ntstatus=0x0. Os binários reais vão para o volume NTFS com os catálogos da Microsoft que os assinam, e as chaves de serviço do Wdf01000 e do msisadrv têm os valores desta instalação (só o Start fica 3, para o boot comum não subir o framework). O Code Integrity valida o msisadrv.sys; a WdfLdr.sys carrega como biblioteca de import (DllInitialize); o WdfVersionBind do driver acha o serviço da biblioteca em Control\\Wdf\\Kmdf\\KmdfLibrary\\Versions e chama o ZwLoadDriver do Wdf01000, cujo ImagePath relativo (system32\\drivers\\Wdf01000.sys) o kernel resolve sob o \\SystemRoot. O Wdf01000.sys e a SleepStudyHelper.sys que ele importa (com a WppRecorder.sys) passam pelo Code Integrity e todos os imports resolvem no ntoskrnl; o DriverEntry do runtime cria \\Device\\KMDF0, se registra na WdfLdr (que o abre pelo IoGetDeviceObjectPointer, com o IRP_MJ_CREATE atendido pelo próprio runtime), lê as configurações, registra os provedores ETW/WPP, o WMI e os callbacks de bugcheck e grava a versão no Registro. O bind registra o cliente e devolve a tabela de funções, e o WdfDriverCreate do msisadrv tem sucesso (extensão do DRIVER_OBJECT, Parameters\\Wdf lido). Pela árvore do PnP (com `--display=basic` ou `--storage=real`), o machine.inf instala o msisadrv.sys na ponte PCI-ISA do QEMU (PCI\\CC_0601, seção MSISADRV): o PnP carrega o driver, o AddDevice do KMDF (o do runtime, que o WdfDriverCreate instala) cria e anexa o FDO e o START_DEVICE passa pela máquina de estados PnP do framework e conclui com sucesso (teste basicdisplay, KMDF_PNP_OK). O VfIsRuleClassEnabled, que o runtime procura pelo MmGetSystemRoutineAddress, ainda não existe; sem ele o runtime segue com o verificador desligado."
+notas = "Roda com `--start-driver=msisadrv`: DRIVER_START_COMPLETED name=msisadrv state=4 win32=0 ntstatus=0x0. Os binários reais vão para o volume NTFS com os catálogos da Microsoft que os assinam, e as chaves de serviço do Wdf01000 e do msisadrv têm os valores desta instalação (só o Start fica 3, para o boot comum não subir o framework). O Code Integrity valida o msisadrv.sys; a WdfLdr.sys carrega como biblioteca de import (DllInitialize); o WdfVersionBind do driver acha o serviço da biblioteca em Control\\Wdf\\Kmdf\\KmdfLibrary\\Versions e chama o ZwLoadDriver do Wdf01000, cujo ImagePath relativo (system32\\drivers\\Wdf01000.sys) o kernel resolve sob o \\SystemRoot. O Wdf01000.sys e a SleepStudyHelper.sys que ele importa (com a WppRecorder.sys) passam pelo Code Integrity e todos os imports resolvem no ntoskrnl; o DriverEntry do runtime cria \\Device\\KMDF0, se registra na WdfLdr (que o abre pelo IoGetDeviceObjectPointer, com o IRP_MJ_CREATE atendido pelo próprio runtime), lê as configurações, registra os provedores ETW/WPP, o WMI e os callbacks de bugcheck e grava a versão no Registro. O bind registra o cliente e devolve a tabela de funções, e o WdfDriverCreate do msisadrv tem sucesso (extensão do DRIVER_OBJECT, Parameters\\Wdf lido). Pela árvore do PnP (com `--display=basic` ou `--storage=real`), o machine.inf instala o msisadrv.sys na ponte PCI-ISA do QEMU (PCI\\CC_0601, seção MSISADRV): o PnP carrega o driver, o AddDevice do KMDF (o do runtime, que o WdfDriverCreate instala) cria e anexa o FDO e o START_DEVICE passa pela máquina de estados PnP do framework e conclui com sucesso (teste basicdisplay, KMDF_PNP_OK). Com --usb (teste usb), o usbxhci.sys com a extensão de classe ucx01000.sys e o usbhub3.sys sobem pelo framework: DMA pelo adaptador da versão 3 da HAL, registro no power framework pelo PO_FX_DEVICE_V2 e a tabela de notificação do WDF pela classe WdfNotifyRoutinesClass do WmiQueryTraceInformation. O VfIsRuleClassEnabled, que o runtime procura pelo MmGetSystemRoutineAddress, ainda não existe; sem ele o runtime segue com o verificador desligado."
 
 [[componente]]
 nome = "ksecdd.sys"
@@ -864,6 +871,17 @@ caminhos = ["kernel/src/drivers/bus/acpi_stack.rs", "kernel/src/hal/pnp.rs", "ke
 testes = ["acpi"]
 fase = "8"
 notas = "Com --pnp-root=acpi o acpi.sys real é a raiz da árvore: a HAL relata ROOT\\ACPI_HAL\\0000 e o AcpiRootPdo ACPI_HAL\\PNP0C08\\0 como o HalpDispatchPnp (ids, capacidades, os vetores da IDT de dispositivos como requisitos e configuração de boot), o acpi.inf o instala (serviço ACPI com Tag 2 e Group Core), o HalInitPowerManagement entrega a HalAcpiDispatchTable (tabelas do firmware pelo cache da HAL, FACS mapeada, registradores de PM da FADT, configuração PCI, o modelo APIC e as linhas dos IOAPICs da MADT), o HalQuerySystemInformation responde as classes que ele consulta (BadIOAddrList com o tratador de 0xCF8, depurador, controladores secundários, limite de MSI), o carregador deixa o MultifunctionAdapter 'ACPI BIOS' com a RSDT e o mapa E820 e a hive SYSTEM tem o Control\\Arbiters da instalação. O DriverEntry, o AddDevice e o START do acpi.sys têm sucesso: o interpretador AML dele carrega a DSDT do QEMU, entra no modo ACPI, conecta a SCI (GSIV 9, vetor 0x29, pelos dados de conexão que ele grava no PDO e que o IoConnectInterruptEx LINE_BASED usa, como o IopConnectLineBasedInterrupt) e as BusRelations da raiz são ACPI\\PNP0A03\\0, ACPI\\PNP0103, ACPI\\ACPI0010 e ACPI\\FixedButton, com o mesmo prefixo de instância (2&daba3ff&0) da instalação desta máquina. O nó PNP0A03 recebe o pci.sys pelo pci.inf; a pshed.dll carrega como DLL de modo kernel com os imports atendidos (KeGetEffectiveIrql, RtlPcToFileName, WheaLogInternalEvent, as variáveis de ambiente Ex e o HalBugCheckSystem). O Errata Manager carrega o banco do errata.inf (5 tipos de entrada, 26 callbacks, 76 regras, 224 cadeias e 68 regras-alvo), com os callbacks da HAL sobre as tabelas ACPI e os embutidos; o DriverEntry do pci.sys tem sucesso (as regras IgnorePciRootBusNumberRange e afins são FALSE com o OEMID BOCHS), o AddDevice abre o Control\\PnP\\Pci\\CardList e o START no ACPI\\PNP0A03 recebe as janelas do _CRS; o pci.sys lê a configuração pela interface de barramento PCI que o acpi.sys dá ao PDO, avalia as regras de PCIDevice com os próprios callbacks (o PIIX3 IDE recebe o LOCK_RESOURCES) e relata as funções com os ids dele (PCI_ROOT_OK). A ponte PCI-ISA sobe com o msisadrv.sys e o filtro do acpi.sys sobre o PDO dela relata os dispositivos ISA do namespace (PNP0303, PNP0F13, PNP0700, PNP0400, PNP0501, PNP0B00). Os filhos de um barramento com janelas atribuídas são arbitrados dentro delas (as janelas do pai não colidem com eles), e o PnP instala o ACPI\\PNP0303 e o ACPI\\PNP0F13 pelo keyboard.inf e pelo msmouse.inf com o i8042prt.sys, o kbdclass e o mouclass: a pilha do teclado do boot é a desse nó. Os recursos de todos os nós passam pelos árbitros e tradutores dos drivers de barramento (io/pnp/arbiter.rs, como o IopSetupArbiterAndTranslators): os do pci.sys para as portas, a memória e os números de barramento (ARBITER_PARTIAL, pelo QueryArbitrate das janelas da ponte), o de IRQ do acpi.sys na raiz ACPI (o _PRT e os dispositivos de link LNKA-D ficam com ele) e o tradutor de interrupções do acpi.sys, que dá o vetor do IDT e o IRQL atribuídos; a HAL liga cada vetor atribuído à linha do 8259 que o alimenta. O AcpiRootPdo responde a BUS_INTERFACE_STANDARD (o adaptador de DMA da HAL para as funções PCI) e a DMA_CACHE_COHERENCY. A pilha IDE real e o BasicDisplay.sys sobem nos nós do pci.sys, e os dispositivos do machine.inf com driver nulo iniciam crus quando o barramento os declara RawDeviceOK. A raiz ACPI é o padrão de todo boot (--pnp-root=internal volta ao barramento PCI interno). Falta: um dispositivo PCI com interrupção INTx e driver na caixa no QEMU dos testes (a e1000 tem o driver no repositório de drivers, fora das tabelas de instalação); as interrupções por mensagem (MSI) e o IOAPIC (a HAL entrega pelo 8259)."
+
+[[componente]]
+nome = "Pilha USB 3 e HID (usbxhci.sys, ucx01000.sys, usbhub3.sys, hidusb.sys, hidclass.sys, kbdhid.sys e mouhid.sys)"
+categoria = "Drivers do Windows"
+icone = "keyboard"
+descricao = "A pilha USB da Microsoft sobre a controladora xHCI do QEMU (--usb): a controladora, o hub raiz, os dispositivos HID e o teclado e o mouse USB."
+estado = "em desenvolvimento"
+caminhos = ["kernel/src/drivers/bus/usb_stack.rs", "kernel/src/ntos/io/pnp/install_usb.rs", "kernel/src/drivers/bus/pci_msi.rs", "kernel/src/ntos/io/pnp/message_interrupts.rs", "kernel/src/hal/message_interrupts.rs", "kernel/src/ntos/io/message_interrupt.rs", "kernel/src/hal/dma_v3.rs", "kernel/src/ntos/po/fx.rs"]
+testes = ["usb"]
+fase = "8"
+notas = "Com --usb o PnP instala a controladora qemu-xhci pelo usbxhci.inf com o usbxhci.sys real (KMDF, com a extensão de classe ucx01000.sys pela chave da classe Ucx da WdfLdr) e, como o INF pede MSISupported, com 16 mensagens MSI-X: o barramento pede as mensagens nos requisitos como o pci.sys, o PnP manager dá a cada uma um vetor da HAL (0x50-0xCF, IRQL = vetor >> 4, destino físico no processador 0) e grava os dados de conexão do PDO (InterruptTypeMessageRequest com o endereço e o dado no IntRemapInfo), o START do barramento programa a tabela MSI-X pelo HalGetMessageRoutingInfo e o KMDF conecta os 16 vetores (IoConnectInterruptEx FULLY_SPECIFIED); o IoConnectInterruptEx MESSAGE_BASED monta a IO_INTERRUPT_MESSAGE_INFO como o IopConnectMessageBasedInterrupt. O DMA vem do adaptador da versão 3 da HAL (a DEVICE_DESCRIPTION do KMDF). O hub raiz (USB\\ROOT_HUB30) recebe o usbhub3.sys, com o registro no power framework pelo PO_FX_DEVICE_V2, e os dispositivos das portas (o teclado e o tablet) são enumerados pela thread das ações do PnP e instalados pelo input.inf com o hidusb.sys e o hidclass.sys (que assina pela SleepStudyHelper o nome WNF_PO_SCENARIO_CHANGE da hive); as coleções de teclado e de mouse recebem o kbdhid.sys e o mouhid.sys com o kbdclass e o mouclass. Com o Services\\kbdclass\\Parameters de uma instalação (ConnectMultiplePorts = 0), o teclado USB tem o próprio \\Device\\KeyboardClassN, que o serviço de teclado abre com FILE_READ_DATA (o kbdhid só lê os relatórios da coleção numa abertura de leitura) e lê: a abertura desce pelo kbdhid até a coleção do hidclass, que pede a sessão de quem abre (IoGetRequestorSessionId, com a thread que o IRP_MJ_CREATE leva como no IopParseDevice), e a tecla mandada pelo monitor do QEMU chega pelo relatório HID que o usbxhci recebe por MSI-X (USB_KEY_OK). Faltavam para a pilha: VslCreate/DeleteSecureSection, PoSetSystemWakeDevice, SeQuerySessionIdToken, NtBuildNumber, a classe WdfNotifyRoutinesClass do WmiQueryTraceInformation, o DMA V3, o PO_FX_DEVICE_V2/V3, as ações do PnP numa thread de sistema e a thread no IRP_MJ_CREATE; todos existem e têm autoteste. A linha (INTx) fica como alternativa no MSI e é do estágio de roteamento de linhas."
 
 [[componente]]
 nome = "dxgkrnl.sys e BasicDisplay.sys"
@@ -1475,6 +1493,12 @@ teste = ["teclado", "shell"]
 faz = "O i8042prt.sys e o kbdclass.sys sobem pelo PnP e as teclas chegam ao shell pela IRQ 1, pela ISR e pelo DPC do driver."
 
 [[roda]]
+nome = "Teclado e mouse USB pela pilha do Windows"
+grupo = "marco"
+teste = "usb"
+faz = "Na controladora xHCI do QEMU, com interrupções MSI-X, o usbxhci.sys, o usbhub3.sys, o hidusb.sys e o kbdhid.sys e o mouhid.sys sobem pelo PnP, e a tecla mandada pelo monitor do QEMU chega pelo teclado USB ao kbdclass."
+
+[[roda]]
 nome = "Pipes e mailslots entre processos"
 grupo = "marco"
 teste = "pipes"
@@ -1726,6 +1750,30 @@ grupo = "driver"
 teste = ["win32k-display", "dxgkrnl"]
 faz = "Cria o \\Device\\DxgKrnl; com o BasicDisplay, inicia o adaptador quando o win32k anuncia a sessão e cria o \\Device\\Video0."
 para = "Nada aparece na tela ainda: a sessão 0 usa o dispositivo de exibição desconectado do win32k."
+
+[[roda]]
+nome = "usbxhci.sys e ucx01000.sys"
+grupo = "driver"
+teste = "usb"
+faz = "Instalados pelo PnP na controladora xHCI do QEMU (--usb), com 16 mensagens MSI-X e o DMA da versão 3; a UCX relata o hub raiz."
+
+[[roda]]
+nome = "usbhub3.sys"
+grupo = "driver"
+teste = "usb"
+faz = "Inicia no hub raiz, liga as portas e enumera o teclado e o tablet USB do QEMU."
+
+[[roda]]
+nome = "hidusb.sys, hidclass.sys e hidparse.sys"
+grupo = "driver"
+teste = "usb"
+faz = "Instalados pelo input.inf nos dispositivos USB HID; o hidclass relata as coleções de teclado e de mouse."
+
+[[roda]]
+nome = "kbdhid.sys e mouhid.sys"
+grupo = "driver"
+teste = "usb"
+faz = "Sobem nas coleções HID com o kbdclass e o mouclass; as teclas do teclado USB chegam ao serviço de teclado."
 
 [[roda]]
 nome = "BasicDisplay.sys"

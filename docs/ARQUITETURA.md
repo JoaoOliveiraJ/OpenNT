@@ -1332,6 +1332,81 @@ início do adaptador (DpiFdoStartAdapterThread, com o DxgkDdiStartDevice)
 para a criação da primeira sessão, que o win32k.sys anuncia
 (watchdog!SMgrNotifySessionChange no NtUserInitialize).
 
+Com `--usb` (a opção de carga `USB`, `drivers/bus/usb_stack.rs`; no xtask, também
+os dispositivos do QEMU) a máquina tem a controladora xHCI
+do QEMU (qemu-xhci, PCI\VEN_1B36&DEV_000D) com um teclado e um tablet USB, e
+a árvore sobe a pilha USB 3 e HID da caixa pelas linhas de modelo de
+`pnp/install_usb.rs`: o usbxhci.sys (KMDF, com a extensão de classe
+ucx01000.sys, que a WdfLdr carrega pela chave Control\Wdf\Kmdf\Ucx) na
+controladora, o usbhub3.sys no hub raiz (USB\ROOT_HUB30), o hidusb.sys com o
+hidclass.sys nos dispositivos HID (USB\Class_03) e o kbdhid.sys e o
+mouhid.sys nas coleções de teclado e de mouse, com os filtros de classe
+kbdclass e mouclass. Como as ações do PnP manager do NT, que rodam numa
+worker thread, o processamento da árvore roda numa thread de sistema e o
+contexto de boot espera por ela girando as interrupções, os DPCs, os work
+items e o escalonador: um work item rodado nessa espera não fica empilhado
+sobre um START que segura as travas da máquina de estados PnP do KMDF. As
+portas são enumeradas depois do START: o IoInvalidateDeviceRelations do hub
+enfileira a reenumeração e a ação (o PipRequestDeviceAction), que uma
+thread de sistema das ações processa (`tree.rs`, um processamento por vez;
+antes do processo System, um work item). O teclado USB passa a ser o da
+máquina: o QEMU entrega a ele as teclas e o serviço de teclado lê do
+kbdclass sobre o kbdhid. A hive leva o `Services\kbdclass\Parameters` de
+uma instalação (ConnectMultiplePorts = 0, KeyboardDeviceBaseName =
+KeyboardClass): cada porta de teclado, o i8042prt e o kbdhid de cada teclado
+HID, recebe o próprio FDO nomeado `\Device\KeyboardClassN`; sem a chave o
+kbdclass fica no modo "grand master", com um só dispositivo nomeado e os
+FDOs das portas sem nome. O serviço de teclado abre o `\Device\KeyboardClassN`
+com FILE_READ_DATA (o kbdhid só começa a ler os relatórios da coleção numa
+abertura com acesso de leitura); a abertura desce pelo
+kbdhid até a coleção do hidclass, que pede a sessão de quem abre
+(IoGetRequestorSessionId): como no IopParseDevice, todo IRP_MJ_CREATE de uma
+abertura por nome leva a thread que abre em Irp->Tail.Overlay.Thread
+(`io_manager::open_file_object`; teste `io_create_thread` na fase 6).
+
+O KMDF registra os dispositivos no power framework com o PO_FX_DEVICE_V2
+(e o V3 do Directed Power Management): o PoFxRegisterDevice (`po/fx.rs`)
+aceita as três versões com o layout de cada uma, e o KMDF guarda a tabela
+de notificação do WDF que o WmiQueryTraceInformation (classe 15,
+`etw/wmi.rs`) devolve, nula sem sessão de trace.
+
+O KMDF pede o adaptador de DMA com a DEVICE_DESCRIPTION da versão 3; o
+adaptador é o de `hal/dma.rs` com a tabela HalpDmaOperationsV3
+(`hal/dma_v3.rs`): as rotinas da versão 3 no caminho de bus master do NT
+sem IOMMU (GetDmaAdapterInfo com ADAPTER_INFO_API_BYPASS, GetDmaTransferInfo,
+InitializeDmaTransferContext, Get/BuildScatterGatherListEx pelo Offset da
+cadeia de MDLs, AllocateAdapterChannelEx, MapTransferEx, os domínios de DMA
+como agrupamento e os vetores de buffers comuns).
+
+**Interrupções por mensagem (MSI e MSI-X)**, com a divisão do NT:
+- o barramento (`drivers/bus/pci_msi.rs`, o papel do pci.sys) acha as
+  capacidades MSI e MSI-X e, quando o INF pediu (o `MSISupported` da chave
+  `Interrupt Management\MessageSignaledInterruptProperties` do hardware,
+  limitado pelo `MessageNumberLimit`), pede as mensagens nos requisitos:
+  descritores de interrupção LATCHED|MESSAGE com Mínimo/Máximo até o
+  CM_RESOURCE_INTERRUPT_MESSAGE_TOKEN (um por mensagem no MSI-X, sem a
+  linha; um para n mensagens no MSI, com uma mensagem e a linha como
+  alternativas). Como a instalação reinicia o nó no NT, o PnP pede os
+  requisitos de novo depois de instalar;
+- o PnP manager (`pnp/message_interrupts.rs`) não arbitra as mensagens
+  contra as linhas: o recurso bruto leva o token e o MessageCount, e a
+  tradução pede à HAL um bloco de vetores (`hal/message_interrupts.rs`:
+  0x50-0xCF, IRQL = vetor >> 4, destino físico no processador 0, endereço
+  0xFEE00000 | APIC ID << 12 e o vetor no dado) e grava os dados de conexão
+  do PDO (INTERRUPT_CONNECTION_DATA_PKEY) com uma entrada
+  InterruptTypeMessageRequest por mensagem, o endereço e o dado no
+  IntRemapInfo.u.Msi;
+- o START do barramento lê essas entradas, pede o endereço e o dado ao
+  HalGetMessageRoutingInfo, programa a tabela MSI-X (ou o MSI), liga a
+  capacidade e desliga o INTx;
+- o IoConnectInterruptEx MESSAGE_BASED (`io/message_interrupt.rs`) monta a
+  IO_INTERRUPT_MESSAGE_INFO como o IopConnectMessageBasedInterrupt (o
+  UnifiedIrql, um objeto por mensagem com a MessageServiceRoutine chamada
+  com o MessageID, e a linha pela FallBackServiceRoutine quando não há
+  mensagens); o KMDF conecta cada mensagem com FULLY_SPECIFIED pelo vetor
+  traduzido. Os vetores de mensagem são de borda e do APIC local (os
+  trampolins mandam o EOI dos vetores 0x40 em diante a ele).
+
 A raiz da árvore (`drivers/bus/acpi_stack.rs`; `--pnp-root=internal` volta
 ao barramento PCI interno) é a de um PC ACPI do Windows:
 
@@ -2744,7 +2819,7 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   `--build-dir`). Cada execução tem a pasta `build/test-all/<id>` (`<id>.<n>`
   com `--repeat`). As opções de boot dos testes (`--kernel-test-scope`,
   `--start-driver`, `--kd`, `--initial-process`, `--storage`, `--display`,
-  `--pnp-root`, `--trace-driver-api`, `--console-mirror`) não entram no
+  `--pnp-root`, `--usb`, `--trace-driver-api`, `--console-mirror`) não entram no
   build: vão no bloco de opções de carga da imagem de boot (abaixo), então
   a rodada inteira compila um kernel só. Uma thread monta as imagens
   (`test-boot --build-only`) uma vez por chave de imagem
