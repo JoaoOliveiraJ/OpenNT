@@ -2609,6 +2609,39 @@ fn user_tokens(assert: Assert) {
     assert(query(token, 2, 0x400) == 0 && unsafe { nt::TokenGroups::at(buffer) }.group_count.get() as u64 * nt::SidAndAttributes::SIZE + core::mem::offset_of!(nt::TokenGroups, groups) as u64 <= guest::read32(returned) as u64 && query(token, 25, 0x100) == 0 && unsafe { nt::SidAndAttributes::at(buffer) }.attributes.get() == 0x60, "usertokens: grupos e rotulo de integridade");
     // Pseudo-handles: -4 consulta o primário; -5 sem impersonação não tem token.
     assert(query((-4i64) as u64, 12, 4) == 0 && query((-5i64) as u64, 1, 0x100) == 0xC000_007C && query((-4i64) as u64, 7, 16) == 0xC000_0022, "usertokens: pseudo-handles de token");
+    // NtDuplicateToken, como o RtlAcquirePrivilege da ntdll: um primário novo
+    // pelo handle com TOKEN_DUPLICATE; sem o direito, STATUS_ACCESS_DENIED;
+    // TokenType inválido, STATUS_INVALID_PARAMETER.
+    let _ = call("NtOpenProcessToken", u64::MAX, 0xA, out, 0);
+    let duplicable = guest::read64(out);
+    guest::write64(rsp + 0x28, 1);
+    guest::write64(rsp + 0x30, out + 8);
+    let duplicated = call("NtDuplicateToken", duplicable, 8, 0, 0) == 0 && state::get_user_handle(guest::read64(out + 8)).is_some_and(|entry| entry.kind() == "token");
+    let copy = guest::read64(out + 8);
+    let denied = call("NtDuplicateToken", token, 8, 0, 0) == 0xC000_0022;
+    guest::write64(rsp + 0x28, 3);
+    let invalid = call("NtDuplicateToken", duplicable, 8, 0, 0) == 0xC000_000D;
+    for handle in [copy, duplicable] {
+        let _ = call("NtClose", handle, 0, 0, 0);
+    }
+    assert(duplicated && denied && invalid, "usertokens: NtDuplicateToken de modo usuario com TOKEN_DUPLICATE, recusas de acesso e de tipo");
+    // NtPrivilegeCheck: o SeChangeNotifyPrivilege (23) e um LUID inexistente;
+    // com Control 0 basta um, com PRIVILEGE_SET_ALL_NECESSARY são todos; só o
+    // habilitado no token ganha SE_PRIVILEGE_USED_FOR_ACCESS.
+    let set = buffer + 0x300;
+    let check = |control: u32| {
+        guest::write32(set, 2);
+        guest::write32(set + 4, control);
+        guest::write64(set + 8, 23);
+        guest::write32(set + 16, 0);
+        guest::write64(set + 20, 0xFFFF);
+        guest::write32(set + 28, 0);
+        guest::write8(out, 0x5A);
+        (call("NtPrivilegeCheck", token, set, out, 0), guest::read8(out), guest::read32(set + 16) & 0x8000_0000 != 0, guest::read32(set + 28) & 0x8000_0000 != 0)
+    };
+    let (any_status, any, used, unknown_used) = check(0);
+    let (all_status, all, _, _) = check(1);
+    assert(any_status == 0 && all_status == 0 && any == used as u8 && all == 0 && !unknown_used && call("NtPrivilegeCheck", token, set + 2, out, 0) == 0x8000_0002, "usertokens: NtPrivilegeCheck marca os privilegios habilitados e respeita PRIVILEGE_SET_ALL_NECESSARY");
     // TokenStatistics pela variante de syscall (frame bruto).
     for (index, value) in [token, 10, buffer, 56, returned].into_iter().enumerate() {
         guest::write64(raw + (index as u64 + 1) * 8, value);

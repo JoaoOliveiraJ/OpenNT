@@ -90,6 +90,28 @@ pub fn privilege_check(set: u64, subject_context: u64, mode: u32) -> bool {
     if all_necessary { held_all } else { held_any }
 }
 
+/// SepPrivilegeCheck(Token, RequiredPrivileges, Count, Control, PreviousMode)
+/// sobre os LUID_AND_ATTRIBUTES já capturados (o corpo do NtPrivilegeCheck):
+/// KernelMode passa direto; senão cada privilégio habilitado no token ganha
+/// SE_PRIVILEGE_USED_FOR_ACCESS, e o resultado é ter todos (com
+/// PRIVILEGE_SET_ALL_NECESSARY no Control) ou algum.
+pub fn token_privilege_check(token: u64, required: &mut [(u64, u32)], control: u32, mode: u32) -> bool {
+    if mode == 0 {
+        return true;
+    }
+    let held = tokens::with(token, |token| token.privileges.clone()).unwrap_or_default();
+    let (mut held_all, mut held_any) = (true, false);
+    for (luid, attributes) in required.iter_mut() {
+        if held.iter().any(|privilege| privilege.id == *luid && privilege.attributes & SE_PRIVILEGE_ENABLED != 0) {
+            held_any = true;
+            *attributes |= SE_PRIVILEGE_USED_FOR_ACCESS;
+        } else {
+            held_all = false;
+        }
+    }
+    if control & PRIVILEGE_SET_ALL_NECESSARY != 0 { held_all } else { held_any }
+}
+
 /// SeAppendPrivileges(AccessState, Privileges): acrescenta o PRIVILEGE_SET
 /// ao conjunto inline (INITIAL_PRIVILEGE_SET@0x50); no transbordo (> 3)
 /// aloca um PRIVILEGE_SET agrupado, copia inline + novos, marca

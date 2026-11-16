@@ -199,9 +199,13 @@ pub fn kmain() -> ! {
         }
     }
 
-    // SeRmInitPhase1: a \SeRmCommandPort e a thread do servidor de comandos
-    // do Reference Monitor, antes do primeiro processo de usuário (o lsass.exe
-    // conecta nela ao iniciar).
+    // SepInitializationPhase1 e SeRmInitPhase1, antes do primeiro processo de
+    // usuário: o \Security\LSA_AUTHENTICATION_INITIALIZED que o lsass.exe abre
+    // e a \SeRmCommandPort, com a thread do servidor de comandos do Reference
+    // Monitor, em que ele conecta ao iniciar.
+    if let Err(error) = crate::ntos::se::initialization::initialize_phase1() {
+        debug_print!("[se] LSA_AUTHENTICATION_INITIALIZED nao criado: {}", error);
+    }
     if let Err(error) = crate::ntos::se::reference_monitor::initialize_phase1() {
         debug_print!("[se] Reference Monitor nao iniciado: {}", error);
     }

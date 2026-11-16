@@ -102,6 +102,83 @@ fn nt_impersonate_thread(server: u64, client: u64, qos: u64, _a4: u64, _rsp: u64
     ps_security::impersonate_thread(server.pointer(), client.pointer(), captured)
 }
 
+/// RtlIsSandboxedToken: o token efetivo de quem chama tem integridade abaixo
+/// de média (SECURITY_MANDATORY_MEDIUM_RID) ou é de AppContainer.
+fn caller_sandboxed() -> bool {
+    const MEDIUM_RID: u32 = 0x2000;
+    crate::ntos::se::token::thread::effective(process::get_current_thread(), false)
+        .and_then(|token| tokens::with(token, |token| {
+            let rid = token.integrity.len().checked_sub(4).map_or(0, |at| u32::from_le_bytes([token.integrity[at], token.integrity[at + 1], token.integrity[at + 2], token.integrity[at + 3]]));
+            rid < MEDIUM_RID || token.app_container.is_some()
+        }))
+        .unwrap_or(false)
+}
+
+/// NtDuplicateToken(ExistingToken, DesiredAccess, ObjectAttributes,
+/// EffectiveOnly, TokenType, NewToken): o `se/token/duplicate.rs` em
+/// UserMode (as capturas sondadas, o handle novo na tabela de quem chama).
+/// O RtlAcquirePrivilege da ntdll (o ScGetPrivilege do services.exe)
+/// duplica assim o próprio token para ligar um privilégio. Lacuna: quem
+/// chama de um token sandboxed (o SepNewTokenAsRestrictedAsProcessToken do
+/// 19041) recebe STATUS_NOT_SUPPORTED, com registro.
+fn nt_duplicate_token(existing: u64, access: u64, attributes: u64, effective_only: u64, rsp: u64) -> Result<u32, KernelError> {
+    if !state::probe_syscall_stack(rsp, 16) {
+        return Ok(0xC000_0005);
+    }
+    if caller_sandboxed() {
+        crate::debug_print!("[se] NtDuplicateToken de um token sandboxed sem suporte");
+        return Ok(0xC000_00BB);
+    }
+    crate::ntos::se::token::duplicate::duplicate(token_argument(1, existing), access as u32, attributes, effective_only & 0xFF != 0, state::stack_arg32(rsp, 5), stack_arg(rsp, 6), 1)
+}
+
+/// NtPrivilegeCheck(ClientToken, RequiredPrivileges, Result), como o 19041:
+/// o token com TOKEN_QUERY (um token de impersonação abaixo de
+/// SecurityIdentification dá STATUS_BAD_IMPERSONATION_LEVEL); o
+/// PRIVILEGE_SET alinhado a 4 e sondado para escrita no tamanho do
+/// PrivilegeCount, e o BOOLEAN do resultado; o SepPrivilegeCheck nos
+/// privilégios capturados, que voltam ao PRIVILEGE_SET com
+/// SE_PRIVILEGE_USED_FOR_ACCESS nos que o token tem habilitados. O
+/// ScGetPrivilege do services.exe confere assim o privilégio que acabou de
+/// ligar.
+fn nt_privilege_check(token_handle: u64, required: u64, result: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
+    let token = match lookup(token_argument(1, token_handle), 8) {
+        Ok(token) => token,
+        Err(status) => return Ok(status),
+    };
+    if tokens::with(token, |token| token.kind == 2 && token.impersonation_level < 1).unwrap_or(false) {
+        return Ok(0xC000_00A5);
+    }
+    if required & 3 != 0 {
+        return Ok(0x8000_0002);
+    }
+    if !probe_user_write(required, 8) {
+        return Ok(0xC000_0005);
+    }
+    let Ok(count) = guest::try_read::<u32>(required) else { return Ok(0xC000_0005) };
+    let size = (count as u64).saturating_sub(1) * 12 + 0x14;
+    if !probe_user_write(required, size) || !probe_user_write(result, 1) {
+        return Ok(0xC000_0005);
+    }
+    let Ok(control) = guest::try_read::<u32>(required + 4) else { return Ok(0xC000_0005) };
+    let mut entries = Vec::with_capacity(count as usize);
+    for index in 0..count as u64 {
+        let entry = required + 8 + index * 12;
+        let (Ok(low), Ok(high), Ok(attributes)) = (guest::try_read::<u32>(entry), guest::try_read::<u32>(entry + 4), guest::try_read::<u32>(entry + 8)) else { return Ok(0xC000_0005) };
+        entries.push((low as u64 | (high as u64) << 32, attributes));
+    }
+    let granted = crate::ntos::se::privilege::token_privilege_check(token, &mut entries, control, 1);
+    for (index, (_, attributes)) in entries.iter().enumerate() {
+        if guest::try_write::<u32>(required + 8 + index as u64 * 12 + 8, *attributes).is_err() {
+            return Ok(0xC000_0005);
+        }
+    }
+    if guest::try_write::<u8>(result, granted as u8).is_err() {
+        return Ok(0xC000_0005);
+    }
+    Ok(0)
+}
+
 fn nt_open_thread_token(thread: u64, access: u64, as_self: u64, out: u64, _rsp: u64) -> Result<u32, KernelError> {
     token_handles::open_thread(thread, access as u32, as_self & 0xFF != 0, 0, out, true)
 }
@@ -222,6 +299,8 @@ pub fn init() {
     state::register_handler("NtOpenProcessTokenEx", nt_open_process_token_ex);
     state::register_handler("NtImpersonateAnonymousToken", nt_impersonate_anonymous_token);
     state::register_handler("NtImpersonateThread", nt_impersonate_thread);
+    state::register_handler("NtDuplicateToken", nt_duplicate_token);
+    state::register_handler("NtPrivilegeCheck", nt_privilege_check);
     state::register_handler("NtOpenThreadToken", nt_open_thread_token);
     state::register_handler("NtOpenThreadTokenEx", nt_open_thread_token_ex);
     state::register_handler("NtQueryInformationToken", nt_query_information_token);
