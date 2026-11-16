@@ -2,7 +2,7 @@
 //!
 //! Duas camadas convivem:
 //! - a árvore de dispositivos do NT (`tree`, `devnode`, `install`,
-//!   `resources`, `irp`, `root`): devnodes com ids, chave `Enum`, instalação
+//!   `resources`, `arbiter`, `irp`, `root`): devnodes com ids, chave `Enum`, instalação
 //!   pelos INFs, AddDevice de filtros e serviço, arbitragem e tradução de
 //!   recursos, START e enumeração; é por ela que a pilha de armazenamento
 //!   real sobe (`--storage=real`);
@@ -11,6 +11,7 @@
 //!   (START_DEVICE com a CM_RESOURCE_LIST do PDO) e enumera os filhos, usado
 //!   pela pilha PS/2 da placa-mãe.
 
+pub mod arbiter;
 pub mod cm_api;
 pub mod cm_notify;
 pub mod device_api;

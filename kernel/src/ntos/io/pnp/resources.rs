@@ -1,30 +1,33 @@
-//! Recursos de hardware do PnP: leitura e escrita das listas do NT,
-//! arbitragem e tradução.
+//! Recursos de hardware do PnP: leitura e escrita das listas do NT, o
+//! árbitro e o tradutor da raiz.
 //!
 //! - `Requirements` é uma IO_RESOURCE_REQUIREMENTS_LIST lida da memória: as
 //!   listas alternativas e, em cada uma, os requisitos (um descritor e as
-//!   alternativas dele, IO_RESOURCE_ALTERNATIVE); os descritores
+//!   alternativas dele, IO_RESOURCE_ALTERNATIVE), cada opção com o endereço
+//!   do IO_RESOURCE_DESCRIPTOR de onde veio; os descritores
 //!   CmResourceTypeConfigData só levam a prioridade da lista.
-//! - `assign` é o papel dos árbitros do NT: para a primeira lista
-//!   alternativa que cabe, escolhe em cada requisito a primeira opção dentro
-//!   de [Mínimo, Máximo], alinhada, sem conflito com as faixas exclusivas já
-//!   atribuídas a outros nós (CmResourceShareShared divide). Portas,
-//!   memória, IRQs, canais de DMA e números de barramento têm árbitros;
-//!   CmResourceTypeDevicePrivate passa direto para a lista. Portas,
-//!   memória e números de barramento de um nó sob uma ponte (o primeiro
-//!   ancestral com números de barramento atribuídos: o PCI0 com o _CRS)
-//!   ficam dentro das faixas desse tipo atribuídas à ponte, as janelas
-//!   dela, e as faixas dela e dos ancestrais dela não colidem com as dos
-//!   filhos, como no árbitro do barramento que aloca os filhos nas janelas
-//!   dele. O BAR de um dispositivo sem números de barramento (a
-//!   controladora IDE dos canais) não é janela.
-//! - `translate` é o tradutor da HAL: portas e memória não mudam (PC, sem
-//!   janela de I/O deslocada); a IRQ de linha `n` (Level = Vector = n na lista
-//!   bruta) vira o vetor do IDT `0x20 + n` com IRQL `n`, a convenção da HAL
-//!   do OpenNT para o PIC, afinidade em todos os processadores.
+//! - `place_at_root`/`assign` são os árbitros da raiz da árvore (os
+//!   IopRoot*Arbiter do NT), para os requisitos que nenhum driver de
+//!   barramento acima do nó arbitra (`arbiter.rs` acha quem arbitra cada
+//!   tipo): a primeira opção dentro de [Mínimo, Máximo], alinhada, sem
+//!   conflito com as faixas exclusivas já atribuídas na raiz
+//!   (CmResourceShareShared divide). Portas, memória, IRQs, canais de DMA e
+//!   números de barramento; CmResourceTypeDevicePrivate passa direto para a
+//!   lista. As faixas que um driver de barramento aloca nos árbitros dele
+//!   não passam por aqui.
+//! - `translate_at_root` é a tradução da HAL na raiz: portas e memória não
+//!   mudam (PC, sem janela de I/O deslocada). Com a HAL sem ACPI (o
+//!   barramento PCI interno do boot comum) a IRQ de linha `n` (Level =
+//!   Vector = n na lista bruta) vira o vetor do IDT `0x20 + n` com IRQL `n`,
+//!   a convenção da HAL do OpenNT para o 8259, afinidade em todos os
+//!   processadores; com a raiz ACPI o tradutor da raiz é a identidade (o
+//!   IopTranslatorHandlerCm), porque o tradutor de interrupções do acpi.sys
+//!   já traduziu.
 //! - `CmList` escreve e lê CM_RESOURCE_LIST com um FULL descriptor.
 
 use alloc::vec::Vec;
+
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::ntos::inc::types::{CmPartialResourceDescriptor, CmResourceList, InterfaceType, IoResourceDescriptor, IoResourceRequirementsList, NtStruct};
 use crate::ntos::mm::guest_memory as guest;
@@ -97,37 +100,7 @@ impl CmList {
         // SAFETY: os descritores seguem a lista parcial no mesmo bloco.
         let descriptors = unsafe { CmPartialResourceDescriptor::array_at(partial.partial_descriptors[0].address(), self.resources.len()) };
         for (descriptor, resource) in descriptors.iter().zip(&self.resources) {
-            descriptor.type_.set(resource.resource_type);
-            descriptor.share_disposition.set(resource.share);
-            descriptor.flags.set(resource.flags);
-            match resource.resource_type {
-                resource_type::INTERRUPT => {
-                    let interrupt = &descriptor.u.interrupt;
-                    interrupt.level.set(resource.start as u16);
-                    interrupt.group.set(0);
-                    interrupt.vector.set(resource.length);
-                    interrupt.affinity.set(resource.extra[0] as u64 | (resource.extra[1] as u64) << 32);
-                }
-                resource_type::DMA => {
-                    descriptor.u.dma.channel.set(resource.start as u32);
-                    descriptor.u.dma.port.set(resource.length);
-                    descriptor.u.dma.reserved1.set(0);
-                }
-                resource_type::BUS_NUMBER => {
-                    descriptor.u.bus_number.start.set(resource.start as u32);
-                    descriptor.u.bus_number.length.set(resource.length);
-                    descriptor.u.bus_number.reserved.set(0);
-                }
-                resource_type::DEVICE_PRIVATE => {
-                    for (cell, value) in descriptor.u.device_private.data.iter().zip(resource.extra) {
-                        cell.set(value);
-                    }
-                }
-                _ => {
-                    descriptor.u.port.start.quad_part.set(resource.start as i64);
-                    descriptor.u.port.length.set(resource.length);
-                }
-            }
+            write_partial(descriptor.address(), resource);
         }
         address
     }
@@ -147,42 +120,81 @@ impl CmList {
         let count = partial.count.get() as usize;
         // SAFETY: descritores declarados pela lista.
         let descriptors = unsafe { CmPartialResourceDescriptor::array_at(partial.partial_descriptors[0].address(), count) };
-        let resources = descriptors
-            .iter()
-            .map(|descriptor| {
-                let resource_type = descriptor.type_.get();
-                let mut resource = Resource { resource_type, share: descriptor.share_disposition.get(), flags: descriptor.flags.get(), start: 0, length: 0, extra: [0; 3] };
-                match resource_type {
-                    resource_type::INTERRUPT => {
-                        let interrupt = &descriptor.u.interrupt;
-                        resource.start = interrupt.level.get() as u64;
-                        resource.length = interrupt.vector.get();
-                        let affinity = interrupt.affinity.get();
-                        resource.extra = [affinity as u32, (affinity >> 32) as u32, 0];
-                    }
-                    resource_type::DMA => {
-                        resource.start = descriptor.u.dma.channel.get() as u64;
-                        resource.length = descriptor.u.dma.port.get();
-                    }
-                    resource_type::BUS_NUMBER => {
-                        resource.start = descriptor.u.bus_number.start.get() as u64;
-                        resource.length = descriptor.u.bus_number.length.get();
-                    }
-                    resource_type::DEVICE_PRIVATE => {
-                        for (slot, cell) in resource.extra.iter_mut().zip(descriptor.u.device_private.data.iter()) {
-                            *slot = cell.get();
-                        }
-                    }
-                    _ => {
-                        resource.start = descriptor.u.port.start.quad_part.get() as u64;
-                        resource.length = descriptor.u.port.length.get();
-                    }
-                }
-                resource
-            })
-            .collect();
+        let resources = descriptors.iter().map(|descriptor| read_partial(descriptor.address())).collect();
         Some(CmList { interface_type: full.interface_type.get().0, bus_number: full.bus_number.get(), resources })
     }
+}
+
+/// Grava um recurso num CM_PARTIAL_RESOURCE_DESCRIPTOR.
+pub fn write_partial(address: u64, resource: &Resource) {
+    // SAFETY: CM_PARTIAL_RESOURCE_DESCRIPTOR do chamador.
+    let descriptor = unsafe { CmPartialResourceDescriptor::at(address) };
+    descriptor.type_.set(resource.resource_type);
+    descriptor.share_disposition.set(resource.share);
+    descriptor.flags.set(resource.flags);
+    match resource.resource_type {
+        resource_type::INTERRUPT => {
+            let interrupt = &descriptor.u.interrupt;
+            interrupt.level.set(resource.start as u16);
+            interrupt.group.set(0);
+            interrupt.vector.set(resource.length);
+            interrupt.affinity.set(resource.extra[0] as u64 | (resource.extra[1] as u64) << 32);
+        }
+        resource_type::DMA => {
+            descriptor.u.dma.channel.set(resource.start as u32);
+            descriptor.u.dma.port.set(resource.length);
+            descriptor.u.dma.reserved1.set(0);
+        }
+        resource_type::BUS_NUMBER => {
+            descriptor.u.bus_number.start.set(resource.start as u32);
+            descriptor.u.bus_number.length.set(resource.length);
+            descriptor.u.bus_number.reserved.set(0);
+        }
+        resource_type::DEVICE_PRIVATE => {
+            for (cell, value) in descriptor.u.device_private.data.iter().zip(resource.extra) {
+                cell.set(value);
+            }
+        }
+        _ => {
+            descriptor.u.port.start.quad_part.set(resource.start as i64);
+            descriptor.u.port.length.set(resource.length);
+        }
+    }
+}
+
+/// Lê um CM_PARTIAL_RESOURCE_DESCRIPTOR.
+pub fn read_partial(address: u64) -> Resource {
+    // SAFETY: CM_PARTIAL_RESOURCE_DESCRIPTOR vivo do chamador.
+    let descriptor = unsafe { CmPartialResourceDescriptor::at(address) };
+    let resource_type = descriptor.type_.get();
+    let mut resource = Resource { resource_type, share: descriptor.share_disposition.get(), flags: descriptor.flags.get(), start: 0, length: 0, extra: [0; 3] };
+    match resource_type {
+        resource_type::INTERRUPT => {
+            let interrupt = &descriptor.u.interrupt;
+            resource.start = interrupt.level.get() as u64;
+            resource.length = interrupt.vector.get();
+            let affinity = interrupt.affinity.get();
+            resource.extra = [affinity as u32, (affinity >> 32) as u32, 0];
+        }
+        resource_type::DMA => {
+            resource.start = descriptor.u.dma.channel.get() as u64;
+            resource.length = descriptor.u.dma.port.get();
+        }
+        resource_type::BUS_NUMBER => {
+            resource.start = descriptor.u.bus_number.start.get() as u64;
+            resource.length = descriptor.u.bus_number.length.get();
+        }
+        resource_type::DEVICE_PRIVATE => {
+            for (slot, cell) in resource.extra.iter_mut().zip(descriptor.u.device_private.data.iter()) {
+                *slot = cell.get();
+            }
+        }
+        _ => {
+            resource.start = descriptor.u.port.start.quad_part.get() as u64;
+            resource.length = descriptor.u.port.length.get();
+        }
+    }
+    resource
 }
 
 /// Uma opção de um requisito (um IO_RESOURCE_DESCRIPTOR).
@@ -198,6 +210,8 @@ pub struct Choice {
     /// DevicePrivate: os três u32 de dados.
     pub private: [u32; 3],
     pub affinity: u64,
+    /// O IO_RESOURCE_DESCRIPTOR de onde a opção veio (0 = opção montada à mão).
+    pub address: u64,
 }
 
 /// Uma IO_RESOURCE_REQUIREMENTS_LIST: listas alternativas de requisitos,
@@ -210,9 +224,15 @@ pub struct Requirements {
     pub alternatives: Vec<Vec<Vec<Choice>>>,
 }
 
+/// A opção de um IO_RESOURCE_DESCRIPTOR.
+pub fn choice_at(address: u64) -> Choice {
+    // SAFETY: IO_RESOURCE_DESCRIPTOR vivo do chamador.
+    read_choice(unsafe { IoResourceDescriptor::at(address) })
+}
+
 fn read_choice(descriptor: &IoResourceDescriptor) -> Choice {
     let resource_type = descriptor.type_.get();
-    let mut choice = Choice { resource_type, share: descriptor.share_disposition.get(), flags: descriptor.flags.get(), length: 0, alignment: 1, minimum: 0, maximum: 0, private: [0; 3], affinity: 0 };
+    let mut choice = Choice { resource_type, share: descriptor.share_disposition.get(), flags: descriptor.flags.get(), length: 0, alignment: 1, minimum: 0, maximum: 0, private: [0; 3], affinity: 0, address: descriptor.option.address() };
     let union_address = descriptor.u.port.length.address();
     match resource_type {
         resource_type::PORT | resource_type::MEMORY => {
@@ -283,44 +303,12 @@ impl Requirements {
     }
 }
 
-/// Faixas atribuídas pelos árbitros: (PDO dono, recurso).
+/// Faixas atribuídas pelos árbitros da raiz: (PDO dono, recurso).
 static ASSIGNED: SpinLock<Vec<(u64, Resource)>> = SpinLock::new(Vec::new());
 
-/// O nó que pede e os ancestrais dele na árvore (o pai primeiro).
-struct Requester {
-    owner: u64,
-    ancestors: Vec<u64>,
-}
-
-impl Requester {
-    fn new(owner: u64) -> Requester {
-        let mut ancestors = Vec::new();
-        let mut current = crate::ntos::io::pnp::devnode::get(owner).map(|node| node.parent);
-        while let Some(parent) = current.filter(|&parent| parent != 0 && parent != owner && !ancestors.contains(&parent)) {
-            ancestors.push(parent);
-            current = crate::ntos::io::pnp::devnode::get(parent).map(|node| node.parent);
-        }
-        Requester { owner, ancestors }
-    }
-
-    /// As janelas da ponte acima do nó: o primeiro ancestral com números de
-    /// barramento atribuídos (o barramento PCI com o _CRS), as faixas do
-    /// tipo atribuídas a ele e quantos ancestrais ficam abaixo dele. O
-    /// árbitro da ponte aloca os filhos dentro delas, e não contra elas; sem
-    /// ponte acima, `None`.
-    fn windows(&self, resource_type: u8) -> Option<(usize, Vec<(u64, u64)>)> {
-        let assigned = ASSIGNED.lock();
-        let (position, bridge) = self.ancestors.iter().enumerate().find(|&(_, &ancestor)| assigned.iter().any(|(holder, resource)| *holder == ancestor && resource.resource_type == resource_type::BUS_NUMBER))?;
-        let ranges: Vec<(u64, u64)> = assigned.iter().filter(|(holder, resource)| holder == bridge && resource.resource_type == resource_type).map(|(_, resource)| (resource.start, resource.start + resource.length.max(1) as u64)).collect();
-        Some((position, ranges))
-    }
-}
-
 /// A faixa [start, start+length) colide com uma atribuição exclusiva de
-/// outro nó; as faixas de `outside` (o barramento produtor e os ancestrais
-/// dele) não colidem com os filhos.
-fn conflicts(requester: &Requester, outside: &[u64], resource_type: u8, start: u64, length: u64, share: u8, pending: &[Resource]) -> bool {
-    let owner = requester.owner;
+/// outro nó na raiz ou com uma escolha pendente do mesmo pedido.
+fn conflicts(owner: u64, resource_type: u8, start: u64, length: u64, share: u8, pending: &[Resource]) -> bool {
     let overlaps = |other: &Resource| {
         if other.resource_type != resource_type {
             return false;
@@ -331,11 +319,12 @@ fn conflicts(requester: &Requester, outside: &[u64], resource_type: u8, start: u
         };
         start < other.start + other_length && other.start < start + length && !(share == SHARE_SHARED && other.share == SHARE_SHARED)
     };
-    ASSIGNED.lock().iter().any(|(holder, other)| *holder != owner && !outside.contains(holder) && overlaps(other)) || pending.iter().any(overlaps)
+    ASSIGNED.lock().iter().any(|(holder, other)| *holder != owner && overlaps(other)) || pending.iter().any(overlaps)
 }
 
-/// A primeira posição livre de uma opção (None = não cabe).
-fn place(requester: &Requester, choice: &Choice, pending: &[Resource]) -> Option<Resource> {
+/// A primeira posição livre de uma opção nos árbitros da raiz (None = não
+/// cabe); `pending` são as escolhas do mesmo pedido ainda não registradas.
+pub fn place_at_root(owner: u64, choice: &Choice, pending: &[Resource]) -> Option<Resource> {
     let share = if choice.share == 0 { SHARE_DEVICE_EXCLUSIVE } else { choice.share };
     let make = |start: u64, length: u32, extra: [u32; 3]| Resource { resource_type: choice.resource_type, share, flags: choice.flags, start, length, extra };
     match choice.resource_type {
@@ -345,12 +334,9 @@ fn place(requester: &Requester, choice: &Choice, pending: &[Resource]) -> Option
                 return None;
             }
             let alignment = choice.alignment.max(1);
-            let domain = requester.windows(choice.resource_type);
-            let outside: &[u64] = domain.as_ref().map_or(&[], |(position, _)| &requester.ancestors[*position..]);
-            let inside = |start: u64| domain.as_ref().is_none_or(|(_, windows)| windows.iter().any(|&(low, high)| start >= low && start + length <= high));
             let mut start = choice.minimum.div_ceil(alignment) * alignment;
             while start.checked_add(length - 1).is_some_and(|end| end <= choice.maximum) {
-                if inside(start) && !conflicts(requester, outside, choice.resource_type, start, length, share, pending) {
+                if !conflicts(owner, choice.resource_type, start, length, share, pending) {
                     return Some(make(start, choice.length, [0; 3]));
                 }
                 start += alignment;
@@ -358,7 +344,7 @@ fn place(requester: &Requester, choice: &Choice, pending: &[Resource]) -> Option
             None
         }
         resource_type::INTERRUPT | resource_type::DMA => {
-            (choice.minimum..=choice.maximum).find(|&value| !conflicts(requester, &[], choice.resource_type, value, 1, share, pending)).map(|value| {
+            (choice.minimum..=choice.maximum).find(|&value| !conflicts(owner, choice.resource_type, value, 1, share, pending)).map(|value| {
                 // Lista bruta: Level = Vector = a linha.
                 let affinity = if choice.affinity == 0 { u64::MAX } else { choice.affinity };
                 make(value, value as u32, [affinity as u32, (affinity >> 32) as u32, 0])
@@ -369,13 +355,13 @@ fn place(requester: &Requester, choice: &Choice, pending: &[Resource]) -> Option
     }
 }
 
-/// Arbitra os requisitos de `owner`: a lista bruta atribuída, ou None se
-/// nenhuma lista alternativa cabe. As faixas ficam registradas para o nó.
+/// Arbitra na raiz todos os requisitos de `owner`: a lista bruta atribuída,
+/// ou None se nenhuma lista alternativa cabe. As faixas ficam registradas
+/// para o nó.
 pub fn assign(owner: u64, requirements: &Requirements) -> Option<CmList> {
-    let requester = Requester::new(owner);
     for alternative in &requirements.alternatives {
         let mut chosen: Vec<Resource> = Vec::new();
-        let fits = alternative.iter().all(|options| match options.iter().find_map(|choice| place(&requester, choice, &chosen)) {
+        let fits = alternative.iter().all(|options| match options.iter().find_map(|choice| place_at_root(owner, choice, &chosen)) {
             Some(resource) => {
                 chosen.push(resource);
                 true
@@ -383,9 +369,10 @@ pub fn assign(owner: u64, requirements: &Requirements) -> Option<CmList> {
             None => false,
         });
         if fits {
+            let list = CmList { interface_type: requirements.interface_type, bus_number: requirements.bus_number, resources: chosen };
             release(owner);
-            ASSIGNED.lock().extend(chosen.iter().filter(|resource| resource.resource_type != resource_type::DEVICE_PRIVATE).map(|&resource| (owner, resource)));
-            return Some(CmList { interface_type: requirements.interface_type, bus_number: requirements.bus_number, resources: chosen });
+            reserve(owner, &list);
+            return Some(list);
         }
     }
     None
@@ -407,18 +394,26 @@ pub fn translate_interrupt(line: u32) -> (u32, u32) {
     (PIC_VECTOR_BASE + line, line)
 }
 
-/// Tradução de uma lista bruta (o tradutor de barramento da HAL).
+/// A raiz traduz as linhas de interrupção (a HAL sem ACPI); desligado com a
+/// raiz ACPI, em que o tradutor da raiz é a identidade.
+static ROOT_LINE_TRANSLATION: AtomicBool = AtomicBool::new(true);
+
+/// Liga ou desliga a tradução de linhas na raiz (a HAL da árvore montada).
+pub fn set_root_line_translation(enabled: bool) {
+    ROOT_LINE_TRANSLATION.store(enabled, Ordering::Release);
+}
+
+/// A tradução da raiz de um recurso bruto que nenhum tradutor de driver
+/// completou: as linhas de interrupção na HAL sem ACPI, o resto igual.
+pub fn translate_at_root(resource: &Resource) -> Resource {
+    if resource.resource_type != resource_type::INTERRUPT || !ROOT_LINE_TRANSLATION.load(Ordering::Acquire) {
+        return *resource;
+    }
+    let (vector, level) = translate_interrupt(resource.length);
+    Resource { start: level as u64, length: vector, ..*resource }
+}
+
+/// Tradução de uma lista bruta inteira na raiz.
 pub fn translate(raw: &CmList) -> CmList {
-    let resources = raw
-        .resources
-        .iter()
-        .map(|resource| {
-            if resource.resource_type != resource_type::INTERRUPT {
-                return *resource;
-            }
-            let (vector, level) = translate_interrupt(resource.length);
-            Resource { start: level as u64, length: vector, ..*resource }
-        })
-        .collect();
-    CmList { interface_type: raw.interface_type, bus_number: raw.bus_number, resources }
+    CmList { interface_type: raw.interface_type, bus_number: raw.bus_number, resources: raw.resources.iter().map(translate_at_root).collect() }
 }

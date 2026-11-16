@@ -14,7 +14,8 @@
 //!    LowerFilters da instância e da classe, do serviço e dos UpperFilters
 //!    da instância e da classe, nessa ordem.
 //! 4. Atribuição: FILTER_RESOURCE_REQUIREMENTS à pilha inteira com a lista
-//!    do nó, arbitragem e tradução (`resources`).
+//!    do nó, arbitragem e tradução pelos árbitros e tradutores dos drivers
+//!    de barramento acima do nó ou pelos da raiz (`arbiter`, `resources`).
 //! 5. START_DEVICE com as listas bruta e traduzida; depois
 //!    QUERY_CAPABILITIES e QUERY_PNP_DEVICE_STATE à pilha.
 //! 6. PipEnumerateDevice: QUERY_DEVICE_RELATIONS(BusRelations) à pilha; os
@@ -30,13 +31,17 @@ use alloc::vec::Vec;
 use super::devnode::{self, capability, problem, DeviceNode, State};
 use super::install;
 use super::irp;
-use super::resources::{self, CmList, Requirements};
+use super::resources::{CmList, Requirements};
+use super::arbiter;
 use crate::ntos::cm::service::system_drivers as services;
-use crate::ntos::inc::types::{BusQueryIdType, DeviceRelationType, DeviceTextType};
+use crate::ntos::inc::types::{BusQueryIdType, DeviceObject, DeviceRelationType, DeviceTextType, NtStruct};
 use crate::ntos::io::{lifecycle, work_items};
 use crate::ntos::ob::object_manager;
 use crate::ntos::ob::objects::device as device_objects;
 use crate::rtl::{KernelError, SpinLock};
+
+/// DEVICE_OBJECT.Flags de um PDO relatado por um barramento.
+const DO_BUS_ENUMERATED_DEVICE: u32 = 0x1000;
 
 /// Nós com BusRelations a reenumerar (IoInvalidateDeviceRelations).
 static PENDING: SpinLock<VecDeque<u64>> = SpinLock::new(VecDeque::new());
@@ -136,6 +141,10 @@ fn enumerate_device(pdo: u64) -> Result<(), KernelError> {
         device_objects::dereference(*child)?;
     }
     for &child in &fresh {
+        // O PnP marca cada PDO que um barramento relata (PipEnumerateCompleted).
+        // SAFETY: DEVICE_OBJECT relatado (e referenciado) pelo barramento.
+        let flags = &unsafe { DeviceObject::at(child) }.flags;
+        flags.set(flags.get() | DO_BUS_ENUMERATED_DEVICE);
         devnode::insert(DeviceNode::new(child, pdo, node.level + 1));
         if let Err(error) = process_new_device_node(child) {
             debug_print!("[pnp] nó novo falhou: {}", error);
@@ -238,12 +247,16 @@ fn process_new_device_node(pdo: u64) -> Result<(), KernelError> {
     }
     let mut service = install::read_text(&key, "Service");
     let internal = is_internal(pdo) || is_internal_by_ids(&hardware_ids, &compatible_ids);
-    if service.is_none() && !internal {
+    // Uma instância com classe e sem serviço foi instalada com o driver nulo
+    // (as seções NO_DRV do machine.inf).
+    let mut installed = service.is_some() || install::read_text(&key, "ClassGUID").is_some();
+    if !installed && !internal {
         match install::select_driver(&hardware_ids, &compatible_ids) {
             Some(driver) => {
                 let matching = hardware_ids.iter().chain(compatible_ids.iter()).find(|id| id.eq_ignore_ascii_case(driver.id)).cloned().unwrap_or_default();
                 service = install::install_device(&instance_path, driver, &matching)?;
-                debug_print!("[pnp] {}: instalado por {} [{}] -> {}", instance_path, driver.inf, driver.section, service.as_deref().unwrap_or("-"));
+                installed = true;
+                debug_print!("[pnp] {}: instalado por {} [{}] -> {}", instance_path, driver.inf, driver.section, service.as_deref().unwrap_or("sem driver funcional"));
             }
             None => debug_print!("[pnp] {}: sem driver nos INFs", instance_path),
         }
@@ -263,7 +276,7 @@ fn process_new_device_node(pdo: u64) -> Result<(), KernelError> {
         node.requirements = requirements;
         node.internal_driver = internal;
         node.service = service.clone();
-        if service.is_some() || internal {
+        if installed || internal {
             node.state = State::Initialized;
         } else {
             node.state = State::Failed;
@@ -300,7 +313,19 @@ fn add_drivers(pdo: u64) -> Result<(), KernelError> {
         devnode::update(pdo, |node| node.state = State::DriversAdded);
         return Ok(());
     }
-    let Some(service) = node.service.clone() else { return Ok(()) };
+    let Some(service) = node.service.clone() else {
+        // Sem driver funcional (PipCallDriverAddDevice, serviço não
+        // encontrado): o dispositivo que o barramento declara RawDeviceOK
+        // inicia cru, só com o PDO; os demais ficam sem iniciar, sem
+        // problema.
+        if node.capability_bit(capability::RAW_DEVICE_OK) {
+            debug_print!("[pnp] {}: sem driver funcional, inicia cru (RawDeviceOK)", node.instance_path);
+            devnode::update(pdo, |node| node.state = State::DriversAdded);
+        } else {
+            debug_print!("[pnp] {}: sem driver funcional e sem RawDeviceOK, fica sem iniciar", node.instance_path);
+        }
+        return Ok(());
+    };
     let key = enum_key(&node.instance_path);
     let class_key = install::read_text(&key, "ClassGUID").map(|guid| format!("{}\\Control\\Class\\{guid}", install::CONTROL_SET));
     let class_filters = |name: &str| class_key.as_deref().map(|class| filters(class, name)).unwrap_or_default();
@@ -337,11 +362,8 @@ fn start_device_node(pdo: u64) -> Result<(), KernelError> {
             requirements_list = irp::filter_resource_requirements(pdo, requirements_list)?;
         }
         match Requirements::read(requirements_list) {
-            Some(requirements) if requirements.alternatives.iter().any(|alternative| !alternative.is_empty()) => match resources::assign(pdo, &requirements) {
-                Some(raw) => {
-                    let translated = resources::translate(&raw);
-                    (Some(raw), Some(translated))
-                }
+            Some(requirements) if requirements.alternatives.iter().any(|alternative| !alternative.is_empty()) => match arbiter::allocate(pdo, &requirements)? {
+                Some((raw, translated)) => (Some(raw), Some(translated)),
                 None => {
                     debug_print!("[pnp] {}: conflito de recursos", node.instance_path);
                     devnode::update(pdo, |node| {
@@ -364,13 +386,16 @@ fn start_device_node(pdo: u64) -> Result<(), KernelError> {
         node.resources_translated = translated_list;
         node.state = State::ResourcesAssigned;
     });
-    if let Some(raw) = &raw {
+    if let (Some(raw), Some(translated)) = (&raw, &translated) {
         debug_print!("[pnp] {}: recursos {:x?}", node.instance_path, raw.resources.iter().map(|resource| (resource.resource_type, resource.start, resource.length)).collect::<Vec<_>>());
+        if translated.resources != raw.resources {
+            debug_print!("[pnp] {}: traduzidos {:x?}", node.instance_path, translated.resources.iter().map(|resource| (resource.resource_type, resource.start, resource.length)).collect::<Vec<_>>());
+        }
     }
     let status = irp::start_device(pdo, raw_list, translated_list)?;
     debug_print!("[pnp] START_DEVICE {} -> {:#x}", node.instance_path, status as u32);
     if status < 0 {
-        resources::release(pdo);
+        arbiter::release(pdo);
         devnode::update(pdo, |node| {
             node.state = State::Failed;
             node.problem = problem::FAILED_START;
