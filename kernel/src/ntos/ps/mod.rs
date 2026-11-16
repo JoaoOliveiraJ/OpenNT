@@ -36,6 +36,7 @@ pub mod property_set;
 pub mod win32;
 pub mod job;
 pub mod memory_reserve;
+pub mod mitigation_policy;
 pub mod wake_counter;
 pub mod locale;
 pub mod fault_information;

@@ -53,6 +53,10 @@
 //!   PROCESS_SET_LIMITED_INFORMATION e o PsSetProcessPriorityByClass com o
 //!   modo de primeiro plano ou de fundo (o csrss põe os processos novos em
 //!   fundo).
+//! - ProcessBasePriority (5): um ULONG com a base de 1 a 31 e, no bit 31, a
+//!   prioridade de memória 2; subir acima da base do processo exige
+//!   SeIncreaseBasePriorityPrivilege; depois a base vai ao processo e às
+//!   threads (o lsass.exe pede a base 9 ao iniciar e sai sem ela).
 //!
 //! Em UserMode, antes da classe, o buffer passa pelo ProbeForRead com o
 //! alinhamento da classe (STATUS_DATATYPE_MISALIGNMENT,
@@ -94,6 +98,7 @@ const PRIORITY_CLASS_ABOVE_NORMAL: u8 = 6;
 /// JOB_OBJECT_LIMIT_PRIORITY_CLASS.
 const JOB_OBJECT_LIMIT_PRIORITY_CLASS: u32 = 0x20;
 /// PROCESSINFOCLASS.
+pub const PROCESS_BASE_PRIORITY: u32 = 5;
 pub const PROCESS_EXCEPTION_PORT: u32 = 8;
 pub const PROCESS_DEFAULT_HARD_ERROR_MODE: u32 = 12;
 pub const PROCESS_PRIORITY_CLASS: u32 = 18;
@@ -102,7 +107,7 @@ pub const PROCESS_BREAK_ON_TERMINATION: u32 = 29;
 pub const PROCESS_DEBUG_FLAGS: u32 = 31;
 pub const PROCESS_HANDLE_CHECKING_MODE: u32 = 54;
 /// As classes desta área.
-pub const CLASSES: [u32; 7] = [PROCESS_EXCEPTION_PORT, PROCESS_DEFAULT_HARD_ERROR_MODE, PROCESS_PRIORITY_CLASS, PROCESS_FOREGROUND_INFORMATION, PROCESS_BREAK_ON_TERMINATION, PROCESS_DEBUG_FLAGS, PROCESS_HANDLE_CHECKING_MODE];
+pub const CLASSES: [u32; 8] = [PROCESS_BASE_PRIORITY, PROCESS_EXCEPTION_PORT, PROCESS_DEFAULT_HARD_ERROR_MODE, PROCESS_PRIORITY_CLASS, PROCESS_FOREGROUND_INFORMATION, PROCESS_BREAK_ON_TERMINATION, PROCESS_DEBUG_FLAGS, PROCESS_HANDLE_CHECKING_MODE];
 /// PROCESS_DEBUG_INHERIT, o único bit de ProcessDebugFlags.
 const PROCESS_DEBUG_INHERIT: u32 = 1;
 /// SEM_NOALIGNMENTFAULTEXCEPT do modo de erro.
@@ -133,6 +138,34 @@ pub fn probe_input(class: u32, buffer: u64, length: u32) -> Result<(), u32> {
         return Err(STATUS_ACCESS_VIOLATION);
     }
     Ok(())
+}
+
+/// ProcessBasePriority (o ramo da classe 5 do NtSetInformationProcess do
+/// 19041): o bit 31 pede a prioridade de memória 2 (sem ele, 0) e o resto é
+/// a prioridade base, de 1 a 31 (senão STATUS_INVALID_PARAMETER); subir
+/// acima da base do processo exige SeIncreaseBasePriorityPrivilege
+/// (STATUS_PRIVILEGE_NOT_HELD). Depois o KeSetPriorityAndQuantumProcess (a
+/// base do processo e das threads) e o MmSetMemoryPriorityProcess. O lsass.exe
+/// pede assim a base 9 ao iniciar.
+fn set_base_priority(mode: u8, value: u32, process_of: impl FnOnce(u32) -> Result<u64, u32>) -> Result<u32, KernelError> {
+    let memory_priority = if value & 0x8000_0000 != 0 { 2 } else { 0 };
+    let base = value & 0x7FFF_FFFF;
+    if !(1..=31).contains(&base) {
+        return Ok(STATUS_INVALID_PARAMETER);
+    }
+    let process = match process_of(PROCESS_SET_INFORMATION) {
+        Ok(process) => process,
+        Err(status) => return Ok(status),
+    };
+    // SAFETY: EPROCESS retido pelo handle que o nomeou (ou o corrente).
+    let eprocess = unsafe { Eprocess::at(process) };
+    if base as i32 > eprocess.pcb.base_priority.get() as i32 && !crate::ntos::se::privilege::single_privilege_check(INCREASE_BASE_PRIORITY_PRIVILEGE, mode as u32) {
+        return Ok(STATUS_PRIVILEGE_NOT_HELD);
+    }
+    let threads = crate::ntos::ps::process::threads_of_process(process);
+    crate::ntos::ke::thread_priority::set_process_base_priority(process, base as i32, &threads)?;
+    eprocess.vm.instance.flags.memory_priority.set(memory_priority);
+    Ok(0)
 }
 
 /// PspSetProcessDefaultHardErrorMode(Process, Thread, Mode).
@@ -199,6 +232,16 @@ pub fn set_information(mode: u8, class: u32, buffer: u64, length: u32, process_o
         }
     }
     match class {
+        PROCESS_BASE_PRIORITY => {
+            if length != 4 {
+                return Ok(STATUS_INFO_LENGTH_MISMATCH);
+            }
+            let value = match read_ulong(mode, buffer)? {
+                Ok(value) => value,
+                Err(status) => return Ok(status),
+            };
+            set_base_priority(mode, value, process_of)
+        }
         PROCESS_DEFAULT_HARD_ERROR_MODE => {
             if length != 4 {
                 return Ok(STATUS_INFO_LENGTH_MISMATCH);

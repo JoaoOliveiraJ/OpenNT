@@ -1658,6 +1658,9 @@ fn user_wait_packets(assert: Assert) {
     assert(call("NtCancelWaitCompletionPacket", packet_handle, 0, 0, 0) == 0x103 && call("NtCancelWaitCompletionPacket", packet_handle, 1, 0, 0) == 0 && depth() == 0 && phase() == 0, "userwaitpackets: cancelamento do pacote enfileirado");
     assert(call("NtCancelWaitCompletionPacket", packet_handle, 0, 0, 0) == 0xC000_0120, "userwaitpackets: cancelamento sem associacao");
     assert(associate(event) == 0 && call("NtCancelWaitCompletionPacket", packet_handle, 0, 0, 0) == 0 && phase() == 0, "userwaitpackets: cancelamento da associacao pendente");
+    // Um processo também é alvo (o wininit espera assim o fim do
+    // services.exe): o processo corrente, vivo, deixa a associação pendente.
+    assert(associate(u64::MAX) == 0 && guest::read8(already) == 0 && phase() == 1 && depth() == 0 && call("NtCancelWaitCompletionPacket", packet_handle, 0, 0, 0) == 0 && phase() == 0, "userwaitpackets: processo como alvo, pendente enquanto vive");
     assert(associate(port_handle) == 0xC000_0024 && call("NtCancelWaitCompletionPacket", event, 0, 0, 0) == 0xC000_0024, "userwaitpackets: tipos invalidos");
     // O último handle do pacote desfaz a associação e o corpo é liberado.
     let _ = associate(event);
@@ -2093,6 +2096,34 @@ fn user_syscalls_core(assert: Assert) {
     let cookie = (call("NtQueryInformationProcess", u64::MAX, 36, buffer, 4) == 0).then(|| guest::read32(buffer)).unwrap_or(0);
     assert(cookie != 0 && call("NtQueryInformationProcess", u64::MAX, 36, buffer, 4) == 0 && guest::read32(buffer) == cookie && call("NtQueryInformationProcess", u64::MAX, 31, buffer, 4) == 0 && guest::read32(buffer) == 1, "usercore: cookie estavel e sem depurador");
     assert(call("NtQueryInformationProcess", u64::MAX, 27, buffer, 0x100) == 0 && { let image_name = unsafe { nt::UnicodeString::at(buffer) }; image_name.length.get() > 0 && image_name.buffer.get() == buffer + nt::UnicodeString::SIZE } && call("NtQueryInformationProcess", u64::MAX, 99, buffer, 8) == 0xC000_0003 && call("NtSetInformationProcess", u64::MAX, 99, buffer, 8) == 0xC000_0003, "usercore: nome da imagem e classes invalidas");
+    // ProcessMitigationPolicy (52), como o SetProcessMitigationPolicy do
+    // services.exe: ExtensionPointDisable e DisableNonSystemFonts ligados no
+    // MitigationFlags; desligar depois é STATUS_ACCESS_DENIED; tamanho,
+    // flags e política inválidos recusados; outro processo só aceita a de
+    // código dinâmico. As flags do processo voltam ao fim.
+    let saved = current.mitigation_flags.get();
+    let mitigation = |policy: u32, flags: u32, length: u64, handle: u64| {
+        guest::write32(buffer, policy);
+        guest::write32(buffer + 4, flags);
+        call("NtSetInformationProcess", handle, 52, buffer, length)
+    };
+    let extension = mitigation(6, 1, 8, u64::MAX) == 0 && current.mitigation_flags.get() & 0x80 != 0 && mitigation(6, 0, 8, u64::MAX) == 0xC000_0022;
+    let fonts = mitigation(9, 1, 8, u64::MAX) == 0 && current.mitigation_flags.get() & 0x3_0000 == 0x1_0000 && mitigation(9, 2, 8, u64::MAX) == 0xC000_0022;
+    let refused = mitigation(6, 2, 8, u64::MAX) == 0xC000_000D && mitigation(6, 1, 4, u64::MAX) == 0xC000_0004 && mitigation(5, 0, 8, u64::MAX) == 0xC000_00BB && mitigation(6, 1, 8, 0x10) == 0xC000_000D;
+    current.mitigation_flags.set(saved);
+    assert(extension && fonts && refused, "usercore: ProcessMitigationPolicy liga as protecoes e recusa desliga-las");
+    // ProcessBasePriority (5), como o lsass.exe ao iniciar: a base corrente
+    // aceita sem mudar nada; base fora de 1..31 e tamanho errado recusados.
+    let base = current.pcb.base_priority.get() as u32;
+    let memory_priority = current.vm.instance.flags.memory_priority.get();
+    guest::write32(buffer, base);
+    let same = call("NtSetInformationProcess", u64::MAX, 5, buffer, 4) == 0 && current.pcb.base_priority.get() as u32 == base;
+    guest::write32(buffer, 32);
+    let above = call("NtSetInformationProcess", u64::MAX, 5, buffer, 4) == 0xC000_000D;
+    guest::write32(buffer, 0x8000_0000);
+    let zero = call("NtSetInformationProcess", u64::MAX, 5, buffer, 4) == 0xC000_000D;
+    current.vm.instance.flags.memory_priority.set(memory_priority);
+    assert(same && above && zero && call("NtSetInformationProcess", u64::MAX, 5, buffer, 2) == 0xC000_0004, "usercore: ProcessBasePriority com a base do processo; base fora da faixa e tamanho errado recusados");
     // Esperas reais sobre eventos.
     guest::write64(rsp + 0x28, 0);
     let _ = call("NtCreateEvent", out, 0x1F_0003, 0, 1);

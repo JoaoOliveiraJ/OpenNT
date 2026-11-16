@@ -174,11 +174,11 @@ pub fn associate(handle: u64, port_handle: u64, target_handle: u64, completion: 
         }
     };
     let target = match state::get_user_handle(target_handle) {
-        Some(target) if !["event", "timer", "semaphore", "thread"].contains(&target.kind()) => Err(0xC000_0024),
+        Some(target) if !WAITABLE_KINDS.contains(&target.kind()) => Err(0xC000_0024),
         Some(target) if target.access() & SYNCHRONIZE == 0 => Err(0xC000_0022),
         Some(target) => Ok((target.object.native_body().map_or(0, |body| body.pointer), Held::Handle(target))),
         None => reference_object(target_handle, SYNCHRONIZE, previous_mode).and_then(|pointer| {
-            if open_pointer::type_name(pointer).is_some_and(|name| ["Event", "Timer", "Semaphore", "Thread"].contains(&name.as_str())) {
+            if open_pointer::type_name(pointer).is_some_and(|name| WAITABLE_TYPES.contains(&name.as_str())) {
                 Ok((pointer, Held::Object(pointer)))
             } else {
                 release(&Held::Object(pointer));
@@ -206,6 +206,15 @@ pub fn associate(handle: u64, port_handle: u64, target_handle: u64, completion: 
     PENDING.lock().push(packet.clone());
     Ok(poll(&packet))
 }
+
+/// Os alvos de uma associação: os tipos cujo objeto de espera
+/// (ObpGetWaitObject) é o próprio cabeçalho de despacho do corpo — evento,
+/// mutante, semáforo, timer, processo e thread (o wininit espera o fim do
+/// services.exe por um pacote de espera do pool de threads). Os outros dão
+/// STATUS_OBJECT_TYPE_MISMATCH, como no NtAssociateWaitCompletionPacket do
+/// 19041.
+const WAITABLE_KINDS: [&str; 6] = ["event", "mutant", "semaphore", "timer", "process", "thread"];
+const WAITABLE_TYPES: [&str; 6] = ["Event", "Mutant", "Semaphore", "Timer", "Process", "Thread"];
 
 /// SYNCHRONIZE, o direito que o alvo de uma associação exige, e
 /// IO_COMPLETION_MODIFY_STATE, o da IOCP.

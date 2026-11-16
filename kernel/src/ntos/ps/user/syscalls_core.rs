@@ -857,6 +857,9 @@ pub fn query_image_information(rsp: u64) -> Result<u32, KernelError> {
 
 /// NtSetInformationProcess: instrumentação (40), TLS (35) e as classes de
 /// `ps/set_process_information`.
+/// ProcessMitigationPolicy.
+const PROCESS_MITIGATION_POLICY: u32 = 52;
+
 fn nt_set_information_process(handle: u64, class: u64, buffer: u64, length: u64, _rsp: u64) -> Result<u32, KernelError> {
     let setter = match class as u32 {
         40 => *INSTRUMENTATION_SET.lock(),
@@ -865,6 +868,17 @@ fn nt_set_information_process(handle: u64, class: u64, buffer: u64, length: u64,
     };
     if let Some(setter) = setter {
         return setter(handle, buffer, length);
+    }
+    // ProcessMitigationPolicy: a política e as flags (`ps/mitigation_policy`).
+    if class as u32 == PROCESS_MITIGATION_POLICY {
+        if length != 8 {
+            return Ok(0xC000_0004);
+        }
+        if !probe_user_read(buffer, 8) {
+            return Ok(0xC000_0005);
+        }
+        let (Ok(policy), Ok(flags)) = (guest::try_read::<u32>(buffer), guest::try_read::<u32>(buffer + 4)) else { return Ok(0xC000_0005) };
+        return Ok(crate::ntos::ps::mitigation_policy::set(handle as u32 == u32::MAX, policy, flags));
     }
     // As classes que mudam o EPROCESS (`ps/set_process_information`).
     use crate::ntos::ps::set_process_information as set_process;
