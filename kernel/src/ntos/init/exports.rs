@@ -66,7 +66,7 @@ pub struct Group {
 }
 
 /// Grupos implementados (qualquer ordem: a posição vem de `GROUP_LAYOUT`).
-fn groups() -> [&'static Group; 450] {
+fn groups() -> [&'static Group; 451] {
     [
         &crate::ntos::ps::exports::ps_jobs::GROUP,
         &crate::ntos::alpc::exports::zw_alpc_server::GROUP,
@@ -519,6 +519,7 @@ fn groups() -> [&'static Group; 450] {
         &crate::ntos::mm::exports::ps_loaded_module_list::GROUP,
         &crate::ntos::io::exports::io_interface_key_keep_alive::GROUP,
         &crate::ntos::ex::exports::zw_create_wnf_state_name::GROUP,
+        &crate::ntos::etw::exports::etw_write_ex::GROUP,
     ]
 }
 
@@ -662,6 +663,7 @@ pub fn init() {
     crate::ntos::ps::user::process::init();
     crate::ntos::ps::user::user_apc::init();
     crate::ntos::ke::user_callback::init();
+    crate::ntos::etw::syscalls::init();
     // Os tipos de objeto que o executive cria no boot (idempotente).
     crate::ntos::ex::win32::initialize();
     crate::ntos::ex::timer::initialize_type();

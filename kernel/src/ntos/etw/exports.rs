@@ -15,19 +15,20 @@ fn register(call: &Call) -> Result<u64, KernelError> {
 }
 
 fn unregister(call: &Call) -> Result<u64, KernelError> {
-    Ok(provider_state::unregister_with_traits(call.arg(1))? as u64)
+    Ok(signed_status(provider_state::unregister(call.arg(1))?))
 }
 
 fn write(call: &Call) -> Result<u64, KernelError> {
-    Ok(provider_state::write(call.arg(1), call.arg(2), activity::resolve(call.arg(3)), 0, call.arg(4) as u32, call.arg(5))? as u64)
+    Ok(signed_status(provider_state::write(call.arg(1), call.arg(2), call.arg(3), 0, call.arg(4) as u32, call.arg(5))?))
 }
 
 fn write_transfer(call: &Call) -> Result<u64, KernelError> {
-    Ok(provider_state::write(call.arg(1), call.arg(2), activity::resolve(call.arg(3)), call.arg(4), call.arg(5) as u32, call.arg(6))? as u64)
+    Ok(signed_status(provider_state::write(call.arg(1), call.arg(2), call.arg(3), call.arg(4), call.arg(5) as u32, call.arg(6))?))
 }
 
+/// EtwSetInformation(RegHandle, InformationClass, EventInformation, InformationLength).
 fn set_information(call: &Call) -> Result<u64, KernelError> {
-    Ok(signed_status(provider_state::set_information(call.arg(1), call.arg(2) as u32, call.arg(3))))
+    Ok(signed_status(provider_state::set_information(call.arg(1), call.arg(2) as u32, call.arg(3), call.arg(4) as u32)))
 }
 
 /// A entrada clássica também associa um novo handle aos bytes do GUID.
@@ -205,4 +206,25 @@ pub mod etw_provider_enabled {
     }
 
     pub static GROUP: Group = Group { name: "etw-provider-enabled", names: &["EtwProviderEnabled"], handlers: &[provider_enabled], data_exports: &[] };
+}
+
+pub mod etw_write_ex {
+    //! EtwWriteEx e EtwWriteString; a lógica mora em `etw/provider_state`.
+
+    use crate::ntos::etw::provider_state;
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::rtl::KernelError;
+
+    /// EtwWriteEx(RegHandle, EventDescriptor, Filter, Flags, ActivityId,
+    /// RelatedActivityId, UserDataCount, UserData).
+    fn write_ex(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(provider_state::write_ex(call.arg(1), call.arg(2), call.arg(5), call.arg(6), call.arg(7) as u32, call.arg(8))?))
+    }
+
+    /// EtwWriteString(RegHandle, Level, Keyword, ActivityId, String).
+    fn write_string(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(provider_state::write_string(call.arg(1), call.arg(2) as u8, call.arg(3), call.arg(4), call.arg(5))?))
+    }
+
+    pub static GROUP: Group = Group { name: "etw-write-ex", names: &["EtwWriteEx", "EtwWriteString"], handlers: &[write_ex, write_string], data_exports: &[] };
 }

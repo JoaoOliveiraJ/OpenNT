@@ -1,19 +1,37 @@
 //! Sessões de log ETW e o NtTraceControl — o logger do NT.
 //!
 //! Cada sessão (WMI_LOGGER_INFORMATION, 0xB0 bytes) tem um LoggerId de 1 a
-//! MaxLoggers-1 e uma sessão interna de `provider_state`, cujo consumidor conta
-//! os eventos entregues pelos provedores habilitados para ela. O despacho do
-//! NtTraceControl segue o ntoskrnl 19041: captura dos buffers, validação do
-//! WMI_LOGGER_INFORMATION (tamanho, WNODE_FLAG_TRACED_GUID) e a busca da sessão
-//! pelo GUID do logger do kernel, pelo nome ou pelo LoggerId.
+//! MaxLoggers-1, uma sessão interna de `provider_state` e os seus buffers:
+//! `MinimumBuffers` blocos de `BufferSize` KB do pool, cada um com um
+//! WMI_BUFFER_HEADER (0x48 bytes) seguido dos registros. Cada evento aceito
+//! pela sessão vira um registro EVENT_HEADER (HeaderType 0xC013, o
+//! EventMarker de 64 bits do WMI_LOGGER_CONTEXT) com os itens estendidos e
+//! os dados do usuário, alinhado a 8. Um buffer cheio passa a Flush
+//! (BuffersWritten) e o seguinte livre recebe os eventos; sem buffer livre,
+//! o modo circular (EVENT_TRACE_FILE_MODE_CIRCULAR ou
+//! EVENT_TRACE_BUFFERING_MODE) recicla o mais antigo e os outros contam
+//! EventsLost. Sem arquivo nem consumidor de tempo real, os buffers ficam
+//! na memória até o Stop.
+//!
+//! O despacho do NtTraceControl segue o ntoskrnl 19041 (rva 0x5eaf60): o
+//! bit alto do código em UserMode marca o chamador WoW64; as sondas da
+//! entrada (faixa abaixo de MM_USER_PROBE_ADDRESS), da saída (ProbeForWrite)
+//! e do ReturnLength obrigatório; a cópia de trabalho com o maior dos dois
+//! tamanhos (os códigos 12, 14 e 27 usam os buffers do chamador direto); a
+//! validação de tamanhos de cada código; e a cópia de volta e o
+//! ReturnLength só em sucesso, exceto STATUS_BUFFER_TOO_SMALL dos códigos
+//! 15, 16, 21 e 22 e os códigos 19, 23, 32-34, 36 e 38-40, que sempre o
+//! devolvem.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicU32, Ordering};
+use alloc::vec::Vec;
 
-use super::provider_state;
+use super::{activity, provider_state, user_registration};
+use crate::ntos::inc::types::{EtwBufferState, EventHeader, NtStruct, WmiBufferHeader};
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::mm::kernel_pool::{self, AllocateOptions};
 use crate::rtl::{KernelError, SpinLock};
 
 /// EtwpMaxLoggers padrão.
@@ -24,12 +42,22 @@ pub const INFORMATION_SIZE: usize = 0xB0;
 const SYSTEM_TRACE_CONTROL_GUID: [u8; 16] = [0xAD, 0x4A, 0x81, 0x9E, 0x04, 0x32, 0xD2, 0x11, 0x9A, 0x82, 0x00, 0x60, 0x08, 0xA8, 0x69, 0x39];
 const KERNEL_LOGGER_NAME: &str = "NT Kernel Logger";
 const WNODE_FLAG_TRACED_GUID: u32 = 0x2_0000;
+const EVENT_TRACE_FILE_MODE_CIRCULAR: u32 = 0x2;
 const EVENT_TRACE_FILE_MODE_NEWFILE: u32 = 0x8;
 const EVENT_TRACE_REAL_TIME_MODE: u32 = 0x100;
+const EVENT_TRACE_BUFFERING_MODE: u32 = 0x400;
+/// WMI_LOGGER_CONTEXT.EventMarker[0]: o HeaderType de um EVENT_HEADER de 64 bits.
+const EVENT_HEADER_MARKER: u16 = 0xC013;
+/// EVENT_HEADER_EXT_TYPE_RELATED_ACTIVITYID.
+const EXT_TYPE_RELATED_ACTIVITYID: u16 = 1;
+/// Tag dos buffers de sessão ('EtwB').
+const BUFFER_TAG: u32 = 0x4277_7445;
+const BUFFER_HEADER_SIZE: u32 = core::mem::size_of::<WmiBufferHeader>() as u32;
 
 pub const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
 pub const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 pub const STATUS_INVALID_DEVICE_REQUEST: u32 = 0xC000_0010;
+pub const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
 pub const STATUS_OBJECT_NAME_COLLISION: u32 = 0xC000_0035;
 pub const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 pub const STATUS_INVALID_BUFFER_SIZE: u32 = 0xC000_0206;
@@ -63,6 +91,188 @@ mod info {
     pub const REAL_TIME_CONSUMER_COUNT: usize = 0xA0;
 }
 
+/// Os buffers de uma sessão e os contadores do que passou por eles.
+struct Buffers {
+    logger_id: u16,
+    clock: u32,
+    circular: bool,
+    size: u32,
+    blocks: Vec<u64>,
+    /// Buffer que recebe os eventos (None: todos cheios).
+    current: Option<usize>,
+    /// Ordem em que os buffers encheram (o mais antigo primeiro).
+    full: Vec<usize>,
+    sequence: i64,
+    events: u32,
+    events_lost: u32,
+    buffers_written: u32,
+}
+
+fn header(block: u64) -> &'static WmiBufferHeader {
+    // SAFETY: bloco de buffer de sessão do pool (BufferSize bytes).
+    unsafe { WmiBufferHeader::at(block) }
+}
+
+/// O relógio da sessão (WNODE_HEADER.ClientContext): 1 contador de
+/// desempenho, 2 hora do sistema, 3 ciclos.
+fn timestamp(clock: u32) -> i64 {
+    match clock {
+        2 => crate::ntos::ke::clock::system_time_100ns() as i64,
+        3 => crate::hal::cpu::rdtsc() as i64,
+        _ => crate::ntos::ke::clock::query_performance_counter(0) as i64,
+    }
+}
+
+impl Buffers {
+    fn new(logger_id: u16, clock: u32, circular: bool, size_kb: u32, count: u32) -> Result<Self, u32> {
+        let size = size_kb * 1024;
+        let mut buffers = Self { logger_id, clock, circular, size, blocks: Vec::new(), current: None, full: Vec::new(), sequence: 0, events: 0, events_lost: 0, buffers_written: 0 };
+        for _ in 0..count {
+            let block = kernel_pool::allocate(size as u64, AllocateOptions { tag: BUFFER_TAG, zero: true, ..Default::default() }).map_err(|_| STATUS_INSUFFICIENT_RESOURCES);
+            match block {
+                Ok(block) => buffers.blocks.push(block),
+                Err(status) => {
+                    buffers.release();
+                    return Err(status);
+                }
+            }
+        }
+        buffers.activate(0);
+        Ok(buffers)
+    }
+
+    /// Entrega o buffer `index` ao log: cabeçalho novo e estado GeneralLogging.
+    fn activate(&mut self, index: usize) {
+        let block = self.blocks[index];
+        guest::write_bytes(block, &alloc::vec![0u8; BUFFER_HEADER_SIZE as usize]);
+        let header = header(block);
+        header.buffer_size.set(self.size);
+        header.current_offset.set(BUFFER_HEADER_SIZE);
+        header.time_stamp.quad_part.set(timestamp(self.clock));
+        self.sequence += 1;
+        header.sequence_number.set(self.sequence);
+        header.set_clock_type(self.clock as u64);
+        header.client_context.processor_number.set(crate::ntos::ke::processor_group::current_processor_number() as u8);
+        header.client_context.alignment.set(8);
+        header.client_context.logger_id.set(self.logger_id);
+        header.state.set(EtwBufferState::ETW_BUFFER_STATE_GENERAL_LOGGING);
+        self.current = Some(index);
+    }
+
+    /// O buffer corrente encheu: estado Flush, SavedOffset/Offset fixados.
+    fn retire(&mut self, index: usize) {
+        let header = header(self.blocks[index]);
+        let used = header.current_offset.get();
+        header.saved_offset.set(used);
+        header.offset.set(used);
+        header.state.set(EtwBufferState::ETW_BUFFER_STATE_FLUSH);
+        self.full.push(index);
+        self.buffers_written += 1;
+        self.current = None;
+    }
+
+    fn next_buffer(&mut self) -> Option<usize> {
+        let free = (0..self.blocks.len()).find(|index| !self.full.contains(index) && Some(*index) != self.current);
+        let index = match free {
+            Some(index) => index,
+            None if self.circular && !self.full.is_empty() => self.full.remove(0),
+            None => return None,
+        };
+        self.activate(index);
+        Some(index)
+    }
+
+    /// Grava o registro do evento (EVENT_HEADER, itens estendidos e dados).
+    fn log(&mut self, event: &provider_state::Event) {
+        let extended = if event.has_related { 0x18 } else { 0 };
+        let data: usize = event.data.iter().map(Vec::len).sum();
+        let record = (EventHeader::SIZE as usize + extended + data) as u32;
+        let aligned = (record + 7) & !7;
+        if aligned > self.size - BUFFER_HEADER_SIZE || record > 0xFFFF {
+            self.events_lost += 1;
+            return;
+        }
+        let mut index = self.current;
+        if let Some(current) = index {
+            if header(self.blocks[current]).current_offset.get() + aligned > self.size {
+                self.retire(current);
+                index = None;
+            }
+        }
+        let index = match index.or_else(|| self.next_buffer()) {
+            Some(index) => index,
+            None => {
+                self.events_lost += 1;
+                return;
+            }
+        };
+        let block = self.blocks[index];
+        let buffer_header = header(block);
+        let offset = buffer_header.current_offset.get();
+        let mut bytes = alloc::vec![0u8; aligned as usize];
+        bytes[0..2].copy_from_slice(&(record as u16).to_le_bytes());
+        bytes[2..4].copy_from_slice(&EVENT_HEADER_MARKER.to_le_bytes());
+        let flags = event.flags | if event.has_related { provider_state::header_flags::EXTENDED_INFO } else { 0 };
+        bytes[4..6].copy_from_slice(&flags.to_le_bytes());
+        bytes[6..8].copy_from_slice(&event.event_property.to_le_bytes());
+        bytes[8..12].copy_from_slice(&event.thread_id.to_le_bytes());
+        bytes[12..16].copy_from_slice(&event.process_id.to_le_bytes());
+        bytes[16..24].copy_from_slice(&timestamp(self.clock).to_le_bytes());
+        bytes[24..40].copy_from_slice(&event.provider);
+        bytes[40..56].copy_from_slice(&event.descriptor);
+        bytes[64..80].copy_from_slice(&event.activity);
+        let mut cursor = EventHeader::SIZE as usize;
+        if event.has_related {
+            // Item estendido no buffer: Size, ExtType, Linkage, DataSize e o GUID.
+            bytes[cursor..cursor + 2].copy_from_slice(&0x18u16.to_le_bytes());
+            bytes[cursor + 2..cursor + 4].copy_from_slice(&EXT_TYPE_RELATED_ACTIVITYID.to_le_bytes());
+            bytes[cursor + 6..cursor + 8].copy_from_slice(&0x10u16.to_le_bytes());
+            bytes[cursor + 8..cursor + 24].copy_from_slice(&event.related_activity);
+            cursor += 0x18;
+        }
+        for segment in &event.data {
+            bytes[cursor..cursor + segment.len()].copy_from_slice(segment);
+            cursor += segment.len();
+        }
+        guest::write_bytes(block + offset as u64, &bytes);
+        buffer_header.current_offset.set(offset + aligned);
+        self.events += 1;
+    }
+
+    fn free_count(&self) -> u32 {
+        (self.blocks.len() - self.full.len() - self.current.is_some() as usize) as u32
+    }
+
+    fn release(&mut self) {
+        for block in self.blocks.drain(..) {
+            let _ = kernel_pool::free(block, None);
+        }
+        self.current = None;
+        self.full.clear();
+    }
+
+    /// Os registros gravados, do buffer mais antigo ao corrente.
+    fn records(&self) -> Vec<Vec<u8>> {
+        let mut order = self.full.clone();
+        order.extend(self.current);
+        let mut records = Vec::new();
+        for index in order {
+            let block = self.blocks[index];
+            let end = header(block).current_offset.get();
+            let mut offset = BUFFER_HEADER_SIZE;
+            while offset + EventHeader::SIZE as u32 <= end {
+                let size = guest::read::<u16>(block + offset as u64) as u32;
+                if size == 0 {
+                    break;
+                }
+                records.push(guest::read_bytes(block + offset as u64, size as usize));
+                offset += (size + 7) & !7;
+            }
+        }
+        records
+    }
+}
+
 struct Logger {
     id: u16,
     name: String,
@@ -78,7 +288,7 @@ struct Logger {
     age_limit: u32,
     log_file_name: String,
     session: u16,
-    events: Arc<AtomicU32>,
+    buffers: Arc<SpinLock<Buffers>>,
 }
 
 static LOGGERS: SpinLock<BTreeMap<u16, Logger>> = SpinLock::new(BTreeMap::new());
@@ -160,12 +370,11 @@ fn fill(buffer: &mut [u8], logger: &Logger) {
     put32(buffer, info::FLUSH_TIMER, logger.flush_timer);
     put32(buffer, info::ENABLE_FLAGS, logger.enable_flags);
     put32(buffer, info::AGE_LIMIT, logger.age_limit);
-    put32(buffer, info::NUMBER_OF_BUFFERS, logger.minimum_buffers);
-    put32(buffer, info::FREE_BUFFERS, logger.minimum_buffers);
-    put32(buffer, info::EVENTS_LOST, 0);
-    let events = logger.events.load(Ordering::Relaxed);
-    let per_buffer = (logger.buffer_size.max(1) * 1024 / 0x80).max(1);
-    put32(buffer, info::BUFFERS_WRITTEN, events.div_ceil(per_buffer));
+    let buffers = logger.buffers.lock();
+    put32(buffer, info::NUMBER_OF_BUFFERS, buffers.blocks.len() as u32);
+    put32(buffer, info::FREE_BUFFERS, buffers.free_count());
+    put32(buffer, info::EVENTS_LOST, buffers.events_lost);
+    put32(buffer, info::BUFFERS_WRITTEN, buffers.buffers_written);
     put32(buffer, info::LOG_BUFFERS_LOST, 0);
     put32(buffer, info::REAL_TIME_BUFFERS_LOST, 0);
     put64(buffer, info::LOGGER_THREAD_ID, 0);
@@ -197,52 +406,70 @@ fn start(buffer: &mut [u8]) -> Result<(), u32> {
         }
         (1..MAX_LOGGERS as u16).find(|id| !loggers.contains_key(id)).ok_or(STATUS_INSUFFICIENT_RESOURCES)?
     };
-    let events = Arc::new(AtomicU32::new(0));
-    let counter = events.clone();
-    let consumer: provider_state::Consumer = Arc::new(move |_event| {
-        counter.fetch_add(1, Ordering::Relaxed);
-    });
-    let session = provider_state::open_session(consumer, None, Some(guid(buffer))).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+    let clock = match get32(buffer, info::CLIENT_CONTEXT) {
+        0 => 1,
+        clock => clock,
+    };
+    let log_file_mode = get32(buffer, info::LOG_FILE_MODE);
+    let circular = log_file_mode & (EVENT_TRACE_FILE_MODE_CIRCULAR | EVENT_TRACE_BUFFERING_MODE) != 0;
+    let buffers = Arc::new(SpinLock::new(Buffers::new(id, clock, circular, buffer_size, minimum_buffers)?));
+    let sink = buffers.clone();
+    let consumer: provider_state::Consumer = Arc::new(move |event| sink.lock().log(event));
+    let session = match provider_state::open_session(consumer, None, Some(guid(buffer))) {
+        Ok(session) => session,
+        Err(_) => {
+            buffers.lock().release();
+            return Err(STATUS_INSUFFICIENT_RESOURCES);
+        }
+    };
     let logger = Logger {
         id,
         name,
         guid: guid(buffer),
-        clock: match get32(buffer, info::CLIENT_CONTEXT) {
-            0 => 1,
-            clock => clock,
-        },
+        clock,
         buffer_size,
         minimum_buffers,
         maximum_buffers,
         maximum_file_size: get32(buffer, info::MAXIMUM_FILE_SIZE),
-        log_file_mode: get32(buffer, info::LOG_FILE_MODE),
+        log_file_mode,
         flush_timer: get32(buffer, info::FLUSH_TIMER),
         enable_flags: get32(buffer, info::ENABLE_FLAGS),
         age_limit: get32(buffer, info::AGE_LIMIT),
         log_file_name,
         session,
-        events,
+        buffers,
     };
     fill(buffer, &logger);
     let mut loggers = LOGGERS.lock();
     if loggers.contains_key(&id) {
         drop(loggers);
         let _ = provider_state::close_session(session);
+        logger.buffers.lock().release();
         return Err(STATUS_OBJECT_NAME_COLLISION);
     }
     loggers.insert(id, logger);
     Ok(())
 }
 
-/// Stop: as propriedades finais e a sessão encerrada.
+/// Stop: os provedores desabilitados, o buffer corrente fechado, as
+/// propriedades finais e os buffers devolvidos.
 fn stop(buffer: &mut [u8]) -> Result<(), u32> {
     let logger = {
         let mut loggers = LOGGERS.lock();
         let id = find(&loggers, buffer)?;
         loggers.remove(&id).unwrap()
     };
-    fill(buffer, &logger);
     let _ = provider_state::close_session(logger.session);
+    {
+        let mut buffers = logger.buffers.lock();
+        if let Some(current) = buffers.current {
+            if header(buffers.blocks[current]).current_offset.get() > BUFFER_HEADER_SIZE {
+                buffers.retire(current);
+            }
+        }
+    }
+    fill(buffer, &logger);
+    logger.buffers.lock().release();
     Ok(())
 }
 
@@ -274,75 +501,166 @@ fn update(buffer: &mut [u8]) -> Result<(), u32> {
     })
 }
 
+/// Flush: o buffer corrente com eventos passa a Flush e o próximo assume.
+fn flush(buffer: &mut [u8]) -> Result<(), u32> {
+    with_logger(buffer, |logger, _| {
+        let mut buffers = logger.buffers.lock();
+        if let Some(current) = buffers.current {
+            if header(buffers.blocks[current]).current_offset.get() > BUFFER_HEADER_SIZE {
+                buffers.retire(current);
+                buffers.next_buffer();
+            }
+        }
+        Ok(())
+    })
+}
+
+/// A operação de um código do NtTraceControl sobre a cópia de trabalho:
+/// Ok(ReturnLength) ou (status, ReturnLength).
+type Outcome = Result<u32, (u32, u32)>;
+
+fn status_only(status: u32) -> Outcome {
+    if status & 0x8000_0000 == 0 { Ok(0) } else { Err((status, 0)) }
+}
+
+/// Códigos 1-7: EtwpValidateUserModeLoggerInfo e a operação da sessão.
+fn logger_control(code: u32, buffer: &mut [u8], input_length: u32, output_length: u32) -> Outcome {
+    let mut run = || -> Result<(), u32> {
+        if (input_length as usize) < INFORMATION_SIZE || (output_length as usize) < INFORMATION_SIZE {
+            return Err(STATUS_INVALID_BUFFER_SIZE);
+        }
+        validate(buffer)?;
+        if get32(buffer, info::BUFFER_SIZE_WNODE) > input_length {
+            return Err(STATUS_INVALID_BUFFER_SIZE);
+        }
+        match code {
+            1 => start(buffer),
+            2 => stop(buffer),
+            3 => with_logger(buffer, |_, _| Ok(())),
+            4 => update(buffer),
+            5 => flush(buffer),
+            6 => with_logger(buffer, |logger, _| if logger.log_file_mode & EVENT_TRACE_FILE_MODE_NEWFILE != 0 { Ok(()) } else { Err(STATUS_INVALID_PARAMETER) }),
+            _ => with_logger(buffer, |logger, _| {
+                logger.log_file_mode |= EVENT_TRACE_REAL_TIME_MODE;
+                Ok(())
+            }),
+        }
+    };
+    run().map(|()| INFORMATION_SIZE as u32).map_err(|status| (status, INFORMATION_SIZE as u32))
+}
+
 /// NtTraceControl/ZwTraceControl: `mode` é o modo anterior do chamador.
 pub fn trace_control(code: u32, input: u64, input_length: u32, output: u64, output_length: u32, return_length: u64, mode: u8) -> Result<u32, KernelError> {
-    let code = if mode != 0 { code & 0x7FFF_FFFF } else { code };
-    if mode != 0 {
-        let limit = crate::ntos::mm::memory_map::USER_ADDRESS_LIMIT;
-        if input != 0 && input_length != 0 && (input + input_length as u64 > limit || input + (input_length as u64) < input) {
+    let user = mode != 0;
+    let wow64 = user && code & 0x8000_0000 != 0;
+    let code = if user { code & 0x7FFF_FFFF } else { code };
+    let (input_length, output_length) = (if input == 0 { 0 } else { input_length }, if output == 0 { 0 } else { output_length });
+    if user {
+        let limit = crate::ntos::mm::memory_map::USER_PROBE_ADDRESS;
+        let end = input.wrapping_add(input_length as u64);
+        if input_length != 0 && (end > limit || end < input) {
             return Ok(STATUS_ACCESS_VIOLATION);
         }
-        if output != 0 && output_length != 0 && output + output_length as u64 > limit {
+        if output_length != 0 && !crate::ntos::ps::user::state::probe_user_write(output, output_length as u64) {
             return Ok(STATUS_ACCESS_VIOLATION);
         }
         if return_length == 0 {
             return Ok(STATUS_INVALID_PARAMETER);
         }
+        if !crate::ntos::ps::user::state::probe_user_write(return_length.min(limit), 4) {
+            return Ok(STATUS_ACCESS_VIOLATION);
+        }
     }
-    let (input_length, output_length) = (if input == 0 { 0 } else { input_length }, if output == 0 { 0 } else { output_length });
-    // A cópia de trabalho tem o maior dos dois tamanhos, zerada.
-    let mut buffer = alloc::vec![0u8; input_length.max(output_length) as usize];
-    if input_length != 0 {
+    // 12 (EtwActivityIdCreate), 14 (EtwRealtimeDisconnect) e 27
+    // (EtwAddNotificationEvent) usam os buffers do chamador; os outros, a
+    // cópia de trabalho zerada com o maior dos dois tamanhos.
+    let direct = matches!(code, 12 | 14 | 27);
+    let mut buffer = alloc::vec![0u8; if direct { 0 } else { input_length.max(output_length) as usize }];
+    if !direct && input_length != 0 {
         match guest::try_read_bytes(input, input_length as usize) {
             Ok(bytes) => buffer[..bytes.len()].copy_from_slice(&bytes),
             Err(_) => return Ok(STATUS_ACCESS_VIOLATION),
         }
     }
-    let result: Result<u32, u32> = match code {
-        1..=7 => (|| {
-            if (input_length as usize) < INFORMATION_SIZE || (output_length as usize) < INFORMATION_SIZE {
-                return Err(STATUS_INVALID_BUFFER_SIZE);
-            }
-            validate(&buffer)?;
-            if get32(&buffer, info::BUFFER_SIZE_WNODE) > input_length {
-                return Err(STATUS_INVALID_BUFFER_SIZE);
-            }
-            match code {
-                1 => start(&mut buffer)?,
-                2 => stop(&mut buffer)?,
-                3 | 5 => with_logger(&mut buffer, |_, _| Ok(()))?,
-                4 => update(&mut buffer)?,
-                6 => with_logger(&mut buffer, |logger, _| if logger.log_file_mode & EVENT_TRACE_FILE_MODE_NEWFILE != 0 { Ok(()) } else { Err(STATUS_INVALID_PARAMETER) })?,
-                _ => with_logger(&mut buffer, |logger, _| {
-                    logger.log_file_mode |= EVENT_TRACE_REAL_TIME_MODE;
-                    Ok(())
-                })?,
-            }
-            Ok(INFORMATION_SIZE as u32)
-        })(),
+    let invalid: Outcome = Err((STATUS_INVALID_PARAMETER, 0));
+    let unsupported: Outcome = Err((STATUS_INVALID_DEVICE_REQUEST, 0));
+    let result: Outcome = match code {
+        1..=7 => logger_control(code, &mut buffer, input_length, output_length),
+        // EtwRealtimeConnect: nenhuma sessão entrega em tempo real.
+        11 if input_length != 0x60 || output_length != 0x60 => invalid,
+        12 if output_length != 0x10 => invalid,
+        12 => match activity::create_id(output) {
+            Ok(()) => Ok(0),
+            Err(_) => Err((STATUS_ACCESS_VIOLATION, 0)),
+        },
+        // WDI e o desligamento de consumidores de tempo real.
+        13 if input_length != 0x30 || output_length != 0 => invalid,
+        14 if input_length != 8 || output_length != 0 => invalid,
+        15 if input_length != 0xA0 || !(0xA0..=0x1_0000).contains(&output_length) => invalid,
+        15 => user_registration::register_guid(&mut buffer, output_length, wow64),
+        16 if input_length != 0 || !(0x48..=0x1_0000).contains(&output_length) => invalid,
+        16 => user_registration::receive_notification(&mut buffer, output_length, wow64),
+        17 if input_length < 0x48 || output_length != 0x48 || get32(&buffer, 4) != input_length => invalid,
+        17 if get32(&buffer, 0) == 3 && input_length < 0x78 => invalid,
+        18 if input_length < 0x48 || get32(&buffer, 4) != input_length => invalid,
+        19 if input_length != 8 => invalid,
+        20 if input_length != 0 || output_length != 0 => invalid,
+        22 if input_length != 0x10 => invalid,
+        24 if input_length != 0 || output_length != 0 => invalid,
+        25 if input_length != 4 || output_length != 0x10 => invalid,
+        26 if input_length != 8 => invalid,
+        26 => status_only(user_registration::track_provider_binary(u64::from_le_bytes(buffer[0..8].try_into().unwrap()), mode)?),
+        27 if input_length != 4 => invalid,
+        27 => match guest::try_read::<u32>(input) {
+            Err(_) => Err((STATUS_ACCESS_VIOLATION, 0)),
+            Ok(0) => invalid,
+            Ok(handle) => status_only(user_registration::add_notification_event(handle as u64, wow64, mode)?),
+        },
+        28 if input_length < 8 || get32(&buffer, 4) as u64 * 16 + 8 != input_length as u64 => invalid,
+        30 if input_length != 0x18 || !(0x78..=0x1_0000).contains(&output_length) => invalid,
+        30 => user_registration::set_traits(&buffer, mode),
+        31 if input_length != 0x10 || output_length != 0 => invalid,
+        31 => status_only(user_registration::use_descriptor_type(u64::from_le_bytes(buffer[0..8].try_into().unwrap()), buffer[8], mode)?),
+        33 if input_length != 0x10 => invalid,
+        34 if input_length != 8 => invalid,
+        35 if input_length != 0x10 || output_length != 0 => invalid,
+        36 if input_length != 8 || output_length != 0x10 => invalid,
+        37 if input_length < 0xC => invalid,
+        38 if input_length < 8 || input_length % 8 != 0 || output_length < 2 => invalid,
+        39 if input_length < 2 || output_length < 8 => invalid,
+        40 if input_length < 8 || output_length < 2 => invalid,
+        41 if input_length < 8 => invalid,
         // MaxLoggers da silo e os contadores PMC do ETW (nenhum sem PMC na HAL).
+        42 | 43 if output_length < 4 => invalid,
         42 | 43 => {
-            if output_length < 4 {
-                Err(STATUS_INVALID_PARAMETER)
-            } else {
-                put32(&mut buffer, 0, if code == 42 { MAX_LOGGERS } else { 0 });
-                Ok(4)
-            }
+            put32(&mut buffer, 0, if code == 42 { MAX_LOGGERS } else { 0 });
+            Ok(4)
         }
-        _ => Err(STATUS_INVALID_DEVICE_REQUEST),
+        // 8-10 e 29 não existem; os demais pedem consumidores de tempo
+        // real, WDI, respostas a notificações, listas e compressão que
+        // nenhuma sessão daqui oferece.
+        _ => unsupported,
     };
-    match result {
-        Ok(length) => {
-            if length != 0 && guest::try_write_bytes(output, &buffer[..length as usize]).is_err() {
-                return Ok(STATUS_ACCESS_VIOLATION);
-            }
-            if guest::try_write32(return_length, length).is_err() {
-                return Ok(STATUS_ACCESS_VIOLATION);
-            }
-            Ok(0)
+    let (status, length) = match result {
+        Ok(length) => (0, length),
+        Err((status, length)) => (status, length),
+    };
+    let write_length = |length: u32| guest::try_write32(return_length, length).is_ok();
+    if status & 0x8000_0000 == 0 {
+        if length != 0 && guest::try_write_bytes(output, &buffer[..length as usize]).is_err() {
+            return Ok(STATUS_ACCESS_VIOLATION);
         }
-        Err(status) => Ok(status),
+        if !write_length(length) {
+            return Ok(STATUS_ACCESS_VIOLATION);
+        }
     }
+    let always = matches!(code, 19 | 23 | 32 | 33 | 34 | 36 | 38 | 39 | 40);
+    if (status == STATUS_BUFFER_TOO_SMALL && matches!(code, 15 | 16 | 21 | 22)) || always {
+        if !write_length(length) {
+            return Ok(STATUS_ACCESS_VIOLATION);
+        }
+    }
+    Ok(status)
 }
 
 /// EtwEnableTrace: habilita (1), desabilita (0) ou pede captura de estado
@@ -363,7 +681,29 @@ pub fn enable_trace(provider: u64, _source: u64, logger_id: u16, control_code: u
     Ok(0)
 }
 
+/// Habilita um provedor (16 bytes do GUID) na sessão do LoggerId, como o
+/// EtwEnableTrace com nível e keywords.
+pub fn enable_provider(logger_id: u16, provider: [u8; 16], level: u8, any_keyword: u64) -> Result<u32, KernelError> {
+    let Some(session) = LOGGERS.lock().get(&logger_id).map(|logger| logger.session) else { return Ok(STATUS_WMI_INSTANCE_NOT_FOUND) };
+    provider_state::enable_identifier(session, provider, provider_state::EnableOptions { level, any_keyword, ..Default::default() })?;
+    Ok(0)
+}
+
 /// Quantas sessões estão ativas (autotestes).
 pub fn active_sessions() -> usize {
     LOGGERS.lock().len()
+}
+
+/// Os registros EVENT_HEADER gravados nos buffers da sessão, em ordem.
+pub fn records(logger_id: u16) -> Option<Vec<Vec<u8>>> {
+    let buffers = LOGGERS.lock().get(&logger_id).map(|logger| logger.buffers.clone())?;
+    let records = buffers.lock().records();
+    Some(records)
+}
+
+/// (eventos gravados, perdidos, buffers escritos) da sessão.
+pub fn counters(logger_id: u16) -> Option<(u32, u32, u32)> {
+    let buffers = LOGGERS.lock().get(&logger_id).map(|logger| logger.buffers.clone())?;
+    let buffers = buffers.lock();
+    Some((buffers.events, buffers.events_lost, buffers.buffers_written))
 }

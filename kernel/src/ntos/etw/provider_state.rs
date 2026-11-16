@@ -1,35 +1,75 @@
-//! Registros e habilitações ETW.
+//! Registros e habilitações ETW: o registro único de provedores.
+//!
+//! Cada GUID tem uma ETW_GUID_ENTRY nativa (por silo e por tipo: provedor de
+//! trace ou GUID de notificação) com os oito TRACE_ENABLE_INFO das sessões
+//! e o ProviderEnableInfo agregado; cada registro é um ETW_REG_ENTRY ligado
+//! no RegListHead da entrada. Os registros de kernel (EtwRegister) vêm do
+//! pool e têm rotina de habilitação nativa; os de modo usuário
+//! (NtTraceControl EtwRegisterGuids) são o corpo de um objeto
+//! EtwRegistration (`user_registration`) e recebem as mudanças de
+//! habilitação como notificação na fila do processo.
 //!
 //! Uma sessão só existe com um consumidor real; registrar um provedor não
-//! habilita eventos sozinho. Rotinas de habilitação nativas e consumidores
-//! rodam sem o lock retido (um callback pode remover o próprio registro).
-//! Os traits de EtwSetInformation ficam guardados por registro.
+//! habilita eventos sozinho. Rotinas de habilitação nativas, notificações e
+//! consumidores rodam sem o lock retido (um callback pode remover o próprio
+//! registro).
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use super::event_enabled;
+use super::{activity, event_enabled};
 use crate::hal::amd64::native_call;
 use crate::ntos::ke::irql;
 use crate::ntos::mm::kernel_pool::{self, AllocateOptions};
 use crate::ntos::ps::silo::query as silo_query;
-use crate::ntos::inc::types::{EtwGuidEntry, EtwRegEntry, EventDataDescriptor, EventDescriptor, Field, Guid, ListEntry, NtStruct, TraceEnableInfo};
+use crate::ntos::inc::types::{EtwGuidEntry, EtwRegEntry, EventDataDescriptor, Field, Guid, ListEntry, NtStruct, TraceEnableInfo};
 use crate::ntos::mm::guest_memory as guest;
 use crate::rtl::{KernelError, SpinLock};
 
 const ALL_KEYWORDS: u64 = u64::MAX;
 const REGISTRATION_SIZE: u64 = core::mem::size_of::<EtwRegEntry>() as u64;
 const GUID_ENTRY_SIZE: u64 = core::mem::size_of::<EtwGuidEntry>() as u64;
-/// ETW_REG_ENTRY.Flags: DbgKernelRegistration | DbgInserted, mais
-/// DbgClassicRegistration para os provedores clássicos.
-const REGISTRATION_FLAGS: u16 = 0x81;
-const CLASSIC_REGISTRATION: u16 = 0x08;
-/// ETW_REG_ENTRY.Flags.DbgClosed.
-const REGISTRATION_CLOSED: u16 = 0x40;
-/// EVENT_INFO_CLASS EventProviderSetTraits.
+
+/// ETW_REG_ENTRY.Flags.
+pub mod flags {
+    /// DbgKernelRegistration.
+    pub const KERNEL: u16 = 0x01;
+    /// DbgUserRegistration.
+    pub const USER: u16 = 0x02;
+    /// DbgClassicRegistration.
+    pub const CLASSIC: u16 = 0x08;
+    /// DbgTrackedBinary: o EtwpTrackProviderBinary já rodou.
+    pub const TRACKED_BINARY: u16 = 0x20;
+    /// DbgClosed.
+    pub const CLOSED: u16 = 0x40;
+    /// DbgInserted.
+    pub const INSERTED: u16 = 0x80;
+    /// DbgWow64: registrado por um processo WoW64.
+    pub const WOW64: u16 = 0x100;
+    /// DbgUseDescriptorType (também ligado por traits aceitos).
+    pub const USE_DESCRIPTOR_TYPE: u16 = 0x200;
+}
+
+/// EVENT_INFO_CLASS.
 const EVENT_PROVIDER_SET_TRAITS: u32 = 2;
+const EVENT_PROVIDER_USE_DESCRIPTOR_TYPE: u32 = 3;
+
+pub const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
+pub const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+pub const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+pub const STATUS_INVALID_DEVICE_REQUEST: u32 = 0xC000_0010;
+pub const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
+/// STATUS_FILE_CORRUPT_ERROR: traits mal formados.
+pub const STATUS_FILE_CORRUPT_ERROR: u32 = 0xC000_0102;
+
+/// EVENT_HEADER.Flags.
+pub mod header_flags {
+    pub const EXTENDED_INFO: u16 = 0x0001;
+    pub const STRING_ONLY: u16 = 0x0004;
+    pub const SIXTY_FOUR_BIT_HEADER: u16 = 0x0040;
+}
 
 fn guid_entry(pointer: u64) -> &'static EtwGuidEntry {
     // SAFETY: entrada alocada por `acquire_entry` (pool do kernel).
@@ -37,11 +77,16 @@ fn guid_entry(pointer: u64) -> &'static EtwGuidEntry {
 }
 
 fn registration(pointer: u64) -> &'static EtwRegEntry {
-    // SAFETY: registro alocado por `register` (o REGHANDLE).
+    // SAFETY: registro alocado por `register` (o REGHANDLE) ou corpo de um
+    // objeto EtwRegistration vivo.
     unsafe { EtwRegEntry::at(pointer) }
 }
 const GUID_TAG: u32 = 0x4777_7445;
 const REGISTRATION_TAG: u32 = 0x5277_7445;
+/// Tag dos traits ('EtwT').
+const TRAITS_TAG: u32 = 0x5477_7445;
+/// Cabeçalho dos traits guardados (nó da árvore e contagem) antes da cópia.
+const TRAITS_HEADER: u64 = 0x1C;
 /// GUID reservado comparado literalmente pelo EtwpRegisterProvider medido.
 const RESERVED_GUID: [u8; 16] = [37, 150, 132, 84, 120, 84, 148, 73, 165, 186, 62, 59, 3, 40, 195, 13];
 
@@ -53,6 +98,20 @@ pub struct Information {
     pub properties: u32,
     pub any_keyword: u64,
     pub all_keyword: u64,
+}
+
+impl Information {
+    /// Os 0x20 bytes do TRACE_ENABLE_INFO (LoggerId 0, como o agregado do
+    /// EtwpComputeRegEntryEnableInfo).
+    pub fn bytes(&self) -> [u8; 0x20] {
+        let mut bytes = [0u8; 0x20];
+        bytes[0..4].copy_from_slice(&self.enabled.to_le_bytes());
+        bytes[4] = self.level;
+        bytes[8..12].copy_from_slice(&self.properties.to_le_bytes());
+        bytes[0x10..0x18].copy_from_slice(&self.any_keyword.to_le_bytes());
+        bytes[0x18..0x20].copy_from_slice(&self.all_keyword.to_le_bytes());
+        bytes
+    }
 }
 
 fn empty_information() -> Information {
@@ -87,6 +146,17 @@ struct GuidEntry {
     information: Information,
 }
 
+/// Dono de modo usuário de um registro.
+#[derive(Clone, Copy, Debug)]
+pub struct UserOwner {
+    /// EPROCESS registrador (referenciado pelo registro).
+    pub process: u64,
+    /// Índice do registro na tabela da ntdll (ETWP_NOTIFICATION_HEADER.RegIndex).
+    pub index: u16,
+    /// ETW_NOTIFICATION_TYPE do registro.
+    pub kind: u32,
+}
+
 struct Registration {
     pointer: u64,
     entry: String,
@@ -94,6 +164,7 @@ struct Registration {
     context: u64,
     active: u32,
     closing: bool,
+    user: Option<UserOwner>,
 }
 
 /// Evento entregue ao consumidor (cópias dos buffers do chamador).
@@ -103,6 +174,13 @@ pub struct Event {
     pub descriptor: [u8; 16],
     pub activity: [u8; 16],
     pub related_activity: [u8; 16],
+    /// O chamador passou RelatedActivityId (item estendido no registro).
+    pub has_related: bool,
+    /// EVENT_HEADER.Flags pedidos pelo chamador (STRING_ONLY...).
+    pub flags: u16,
+    pub event_property: u16,
+    pub process_id: u32,
+    pub thread_id: u32,
     pub data: Vec<Vec<u8>>,
 }
 
@@ -144,12 +222,18 @@ fn read_guid(pointer: u64) -> [u8; 16] {
     bytes
 }
 
-fn identifier_key(identifier: &[u8; 16], silo: u64) -> String {
-    let mut key = alloc::format!("{silo:x}:");
+/// Chave da entrada: o tipo de GUID (EtwTraceGuidType 0, EtwNotificationGuidType
+/// 1), o silo e o GUID.
+fn entry_key(identifier: &[u8; 16], silo: u64, notification: bool) -> String {
+    let mut key = alloc::format!("{}:{silo:x}:", notification as u8);
     for byte in identifier {
         key.push_str(&alloc::format!("{byte:02x}"));
     }
     key
+}
+
+fn identifier_key(identifier: &[u8; 16], silo: u64) -> String {
+    entry_key(identifier, silo, false)
 }
 
 /// Retira IsEnabled enquanto os outros campos são publicados.
@@ -203,8 +287,8 @@ fn discard_unused_entry(etw: &mut Etw, key: &str) {
     }
 }
 
-fn acquire_entry(etw: &mut Etw, identifier: [u8; 16], silo: u64) -> Option<String> {
-    let key = identifier_key(&identifier, silo);
+fn acquire_entry_of(etw: &mut Etw, identifier: [u8; 16], silo: u64, notification: bool) -> Option<String> {
+    let key = entry_key(&identifier, silo, notification);
     if etw.entries.contains_key(&key) {
         return Some(key);
     }
@@ -219,13 +303,29 @@ fn acquire_entry(etw: &mut Etw, identifier: [u8; 16], silo: u64) -> Option<Strin
     Some(key)
 }
 
+fn acquire_entry(etw: &mut Etw, identifier: [u8; 16], silo: u64) -> Option<String> {
+    acquire_entry_of(etw, identifier, silo, false)
+}
+
+fn release_traits(pointer: u64) {
+    let traits = registration(pointer).traits.get();
+    if traits != 0 {
+        registration(pointer).traits.set(0);
+        let _ = kernel_pool::free(traits, None);
+    }
+}
+
 fn finalize_registration(etw: &mut Etw, pointer: u64) {
     let finished = etw.registrations.get(&pointer).is_some_and(|record| record.closing && record.active == 0);
     if !finished {
         return;
     }
     let Some(record) = etw.registrations.remove(&pointer) else { return };
-    let _ = kernel_pool::free(record.pointer, None);
+    release_traits(record.pointer);
+    // O corpo de um registro de modo usuário é do gerenciador de objetos.
+    if record.user.is_none() {
+        let _ = kernel_pool::free(record.pointer, None);
+    }
     if let Some(entry) = etw.entries.get_mut(&record.entry) {
         entry.references -= 1;
         guid_entry(entry.pointer).ref_count.set(entry.references as i64);
@@ -233,19 +333,50 @@ fn finalize_registration(etw: &mut Etw, pointer: u64) {
     discard_unused_entry(etw, &record.entry);
 }
 
+/// O que uma mudança de habilitação entrega a um registro de modo usuário.
+#[derive(Clone, Copy, Debug)]
+pub struct UserNotification {
+    pub owner: UserOwner,
+    pub registration: u64,
+    pub provider: [u8; 16],
+    pub source: [u8; 16],
+    pub information: Information,
+}
+
 /// Copia os argumentos antes da chamada nativa; a referência retém o
-/// registro e o GUID mesmo se o callback remover o próprio registro.
+/// registro e o GUID mesmo se o callback remover o próprio registro. Um
+/// registro de modo usuário recebe a notificação na fila do processo.
 fn notify_registration(pointer: u64, source: Option<[u8; 16]>, control: Option<u64>) -> Result<(), KernelError> {
+    enum Delivery {
+        Native(u64, u64, Information),
+        User(UserNotification),
+    }
     let call = with(|etw| {
         let record = etw.registrations.get_mut(&pointer)?;
-        if record.callback == 0 || record.closing {
+        if record.closing {
+            return None;
+        }
+        let (information, provider) = etw.entries.get(&record.entry).map_or_else(|| (empty_information(), [0; 16]), |entry| (entry.information, entry.identifier));
+        if let Some(owner) = record.user {
+            return Some(Delivery::User(UserNotification { owner, registration: pointer, provider, source: source.unwrap_or([0; 16]), information }));
+        }
+        if record.callback == 0 {
             return None;
         }
         record.active += 1;
-        let information = etw.entries.get(&record.entry).map_or_else(empty_information, |entry| entry.information);
-        Some((record.callback, record.context, information))
+        Some(Delivery::Native(record.callback, record.context, information))
     });
-    let Some((callback, context, information)) = call else { return Ok(()) };
+    let (callback, context, information) = match call {
+        None => return Ok(()),
+        Some(Delivery::User(notification)) => {
+            // EVENT_CONTROL_CODE_CAPTURE_STATE não chega ao modo usuário por aqui.
+            if control.is_none() {
+                super::user_registration::queue_enable(&notification);
+            }
+            return Ok(());
+        }
+        Some(Delivery::Native(callback, context, information)) => (callback, context, information),
+    };
     let frame = kernel_pool::allocate(80, AllocateOptions { tag: REGISTRATION_TAG, zero: true, ..Default::default() });
     let result = match frame {
         Ok(frame) => {
@@ -302,7 +433,7 @@ pub fn register(identifier_pointer: u64, callback: u64, context: u64, output: u6
     handle_out.set(0);
     let identifier = read_guid(identifier_pointer);
     if (callback == 0 && context != 0) || (classic && callback == 0) || identifier == RESERVED_GUID {
-        return Ok(0xC000_000D);
+        return Ok(STATUS_INVALID_PARAMETER);
     }
     let silo = if classic { 0 } else { silo_query::current_server_silo() };
     let created = with(|etw| {
@@ -318,16 +449,16 @@ pub fn register(identifier_pointer: u64, callback: u64, context: u64, output: u6
         native.guid_entry.set(entry.pointer);
         native.callback_context.set(context);
         native.callback.set(callback);
-        native.flags.set(if classic { REGISTRATION_FLAGS | CLASSIC_REGISTRATION } else { REGISTRATION_FLAGS });
+        native.flags.set(flags::KERNEL | flags::INSERTED | if classic { flags::CLASSIC } else { 0 });
         entry.registrations.push(pointer);
         entry.references += 1;
         let enabled = entry.information.enabled != 0;
-        etw.registrations.insert(pointer, Registration { pointer, entry: key.clone(), callback, context, active: 0, closing: false });
+        etw.registrations.insert(pointer, Registration { pointer, entry: key.clone(), callback, context, active: 0, closing: false, user: None });
         synchronize(etw, &key);
         let enabled = enabled || etw.entries.get(&key).is_some_and(|entry| entry.information.enabled != 0);
         Some((pointer, enabled))
     });
-    let Some((pointer, enabled)) = created else { return Ok(0xC000_009A) };
+    let Some((pointer, enabled)) = created else { return Ok(STATUS_INSUFFICIENT_RESOURCES) };
     handle_out.set(pointer);
     if enabled {
         if let Err(error) = notify_registration(pointer, None, None) {
@@ -339,21 +470,87 @@ pub fn register(identifier_pointer: u64, callback: u64, context: u64, output: u6
     Ok(0)
 }
 
+/// O estado de habilitação de um registro de modo usuário recém-criado
+/// (EtwpRegisterUMGuid): a máscara de sessões e o agregado delas.
+#[derive(Clone, Copy, Debug)]
+pub struct UserRegistrationState {
+    pub enable_mask: u8,
+    pub information: Information,
+}
+
+/// EtwpAddUmRegEntry sobre um corpo EtwRegistration recém-criado: liga o
+/// registro na entrada do GUID (provedor de trace para os tipos 2 e 3,
+/// GUID de notificação para os demais) com o processo, o índice e o
+/// contexto da ntdll.
+pub fn register_user(identifier: [u8; 16], body: u64, owner: UserOwner, context: u64, wow64: bool) -> Result<UserRegistrationState, u32> {
+    let notification = !matches!(owner.kind, 2 | 3);
+    let silo = silo_query::current_server_silo();
+    with(|etw| {
+        let key = acquire_entry_of(etw, identifier, silo, notification).ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        let native = registration(body);
+        native.group_reg_list.flink.set(native.group_reg_list.address());
+        native.group_reg_list.blink.set(native.group_reg_list.address());
+        let entry = etw.entries.get_mut(&key).expect("entrada adquirida");
+        native.guid_entry.set(entry.pointer);
+        native.process.set(owner.process);
+        native.callback.set(context);
+        native.index.set(owner.index);
+        let mut value = flags::USER | flags::INSERTED;
+        if owner.kind == 2 {
+            value |= flags::CLASSIC;
+        }
+        if wow64 {
+            value |= flags::WOW64;
+        }
+        native.flags.set(value);
+        entry.registrations.push(body);
+        entry.references += 1;
+        etw.registrations.insert(body, Registration { pointer: body, entry: key.clone(), callback: 0, context, active: 0, closing: false, user: Some(owner) });
+        synchronize(etw, &key);
+        let information = etw.entries.get(&key).map_or_else(empty_information, |entry| entry.information);
+        Ok(UserRegistrationState { enable_mask: native.enable_mask.get(), information })
+    })
+}
+
+/// EtwpDeleteRegistrationObject: o registro sai da entrada do GUID.
+/// Devolve o dono (o processo a desreferenciar) se o corpo era um registro.
+pub fn delete_user(body: u64) -> Option<UserOwner> {
+    with(|etw| {
+        let record = etw.registrations.get_mut(&body)?;
+        let owner = record.user;
+        record.closing = true;
+        let key = record.entry.clone();
+        if let Some(entry) = etw.entries.get_mut(&key) {
+            entry.registrations.retain(|&pointer| pointer != body);
+        }
+        let native_flags = &registration(body).flags;
+        native_flags.set(native_flags.get() | flags::CLOSED);
+        synchronize(etw, &key);
+        finalize_registration(etw, body);
+        owner
+    })
+}
+
+/// O dono de modo usuário de um registro vivo.
+pub fn user_owner(body: u64) -> Option<UserOwner> {
+    with(|etw| etw.registrations.get(&body).filter(|record| !record.closing).and_then(|record| record.user))
+}
+
 /// EtwUnregister.
 pub fn unregister(handle: u64) -> Result<u32, KernelError> {
     require_passive_level()?;
     Ok(with(|etw| {
-        let Some(record) = etw.registrations.get_mut(&handle) else { return 0xC000_0008 };
-        if record.closing {
-            return 0xC000_0008;
+        let Some(record) = etw.registrations.get_mut(&handle) else { return STATUS_INVALID_HANDLE };
+        if record.closing || record.user.is_some() {
+            return STATUS_INVALID_HANDLE;
         }
         record.closing = true;
         let key = record.entry.clone();
         if let Some(entry) = etw.entries.get_mut(&key) {
             entry.registrations.retain(|&pointer| pointer != handle);
         }
-        let flags = &registration(handle).flags;
-        flags.set(flags.get() | REGISTRATION_CLOSED);
+        let native_flags = &registration(handle).flags;
+        native_flags.set(native_flags.get() | flags::CLOSED);
         synchronize(etw, &key);
         finalize_registration(etw, handle);
         0
@@ -390,8 +587,12 @@ impl Default for EnableOptions {
 }
 
 pub fn enable(session: u16, identifier_pointer: u64, options: EnableOptions) -> Result<(), KernelError> {
+    enable_identifier(session, read_guid(identifier_pointer), options)
+}
+
+/// Habilita o provedor `identifier` (16 bytes) na sessão.
+pub fn enable_identifier(session: u16, identifier: [u8; 16], options: EnableOptions) -> Result<(), KernelError> {
     require_passive_level()?;
-    let identifier = read_guid(identifier_pointer);
     let (key, source) = with(|etw| {
         let silo = etw.sessions.get(&session).map(|found| found.silo).ok_or_else(|| KernelError::new("closed ETW session"))?;
         let key = acquire_entry(etw, identifier, silo).ok_or_else(|| KernelError::new("ETW GUID entry allocation failed"))?;
@@ -466,22 +667,56 @@ pub fn close_session(session: u16) -> Result<(), KernelError> {
     Ok(())
 }
 
-/// EtwWrite: um provedor sem sessões nem lê os buffers do chamador; cada
-/// sessão casada recebe uma cópia do evento.
-pub fn write(handle: u64, descriptor: u64, activity: u64, related: u64, count: u32, data: u64) -> Result<u32, KernelError> {
+/// Os dados de um evento: o descritor e os segmentos de usuário, lidos da
+/// origem só depois de alguma sessão aceitar o evento.
+pub struct Payload {
+    pub activity: [u8; 16],
+    pub related_activity: Option<[u8; 16]>,
+    pub flags: u16,
+    pub event_property: u16,
+    pub segments: Vec<Vec<u8>>,
+}
+
+/// Até 128 EVENT_DATA_DESCRIPTOR e 0xFFFF bytes com o EVENT_HEADER.
+const MAXIMUM_DESCRIPTORS: u32 = 128;
+const MAXIMUM_EVENT_SIZE: u64 = 0xFFFF;
+const STATUS_BUFFER_OVERFLOW: u32 = 0x8000_0005;
+
+/// Lê os segmentos de usuário (`read` decide se a origem é sondada).
+pub fn read_segments(count: u32, data: u64, read: impl Fn(u64, usize) -> Result<Vec<u8>, KernelError>) -> Result<Result<Vec<Vec<u8>>, u32>, KernelError> {
+    if count > MAXIMUM_DESCRIPTORS {
+        return Ok(Err(STATUS_INVALID_PARAMETER));
+    }
+    let mut segments = Vec::new();
+    let mut total = core::mem::size_of::<crate::ntos::inc::types::EventHeader>() as u64;
+    for index in 0..count as u64 {
+        let item = read(data + index * EventDataDescriptor::SIZE, EventDataDescriptor::SIZE as usize)?;
+        let pointer = u64::from_le_bytes(item[0..8].try_into().unwrap());
+        let size = u32::from_le_bytes(item[8..12].try_into().unwrap()) as u64;
+        total += size;
+        if total > MAXIMUM_EVENT_SIZE {
+            return Ok(Err(STATUS_BUFFER_OVERFLOW));
+        }
+        segments.push(if size == 0 { Vec::new() } else { read(pointer, size as usize)? });
+    }
+    Ok(Ok(segments))
+}
+
+/// Entrega um evento de um registro: um provedor sem sessões nem lê os
+/// buffers do chamador; cada sessão cujo TRACE_ENABLE_INFO aceita o nível e
+/// a keyword recebe uma cópia.
+pub fn deliver(handle: u64, descriptor: [u8; 16], payload: impl FnOnce() -> Result<Result<Payload, u32>, KernelError>) -> Result<u32, KernelError> {
     let prepared = with(|etw| {
         let record = etw.registrations.get(&handle).filter(|record| !record.closing)?;
         let entry = etw.entries.get(&record.entry)?;
         Some((entry.information.enabled != 0, entry.pointer, entry.identifier, entry.slots))
     });
-    let Some((enabled, entry_pointer, provider, slots)) = prepared else { return Ok(0xC000_0008) };
+    let Some((enabled, entry_pointer, provider, slots)) = prepared else { return Ok(STATUS_INVALID_HANDLE) };
     if !enabled {
         return Ok(0);
     }
-    // SAFETY: PCEVENT_DESCRIPTOR do driver.
-    let event_descriptor = unsafe { EventDescriptor::at(descriptor) };
-    let keyword = event_descriptor.keyword.get();
-    let level = event_descriptor.level.get();
+    let level = descriptor[4];
+    let keyword = u64::from_le_bytes(descriptor[8..16].try_into().unwrap());
     let native = guid_entry(entry_pointer);
     let recipients: Vec<u16> = slots
         .iter()
@@ -491,28 +726,22 @@ pub fn write(handle: u64, descriptor: u64, activity: u64, related: u64, count: u
     if recipients.is_empty() {
         return Ok(0);
     }
-    if count > 128 {
-        return Ok(0xC000_000D);
-    }
-    let mut segments = Vec::new();
-    let mut total = 80u64; // EVENT_HEADER antes dos dados de usuário
-    // SAFETY: vetor EVENT_DATA_DESCRIPTOR[UserDataCount] do driver.
-    let user_data = if count == 0 { &[][..] } else { unsafe { EventDataDescriptor::array_at(data, count as usize) } };
-    for item in user_data {
-        let pointer = item.ptr.get();
-        let size = item.size.get() as u64;
-        total += size;
-        if total > 0xFFFF {
-            return Ok(0x8000_0005);
-        }
-        segments.push(guest::read_bytes(pointer, size as usize));
-    }
+    let payload = match payload()? {
+        Ok(payload) => payload,
+        Err(status) => return Ok(status),
+    };
+    let thread = crate::ntos::ke::pcr::current_thread();
     let event = Event {
         provider,
-        descriptor: read_guid(descriptor),
-        activity: if activity != 0 { read_guid(activity) } else { [0; 16] },
-        related_activity: if related != 0 { read_guid(related) } else { [0; 16] },
-        data: segments,
+        descriptor,
+        activity: payload.activity,
+        related_activity: payload.related_activity.unwrap_or([0; 16]),
+        has_related: payload.related_activity.is_some(),
+        flags: payload.flags,
+        event_property: payload.event_property,
+        process_id: if thread != 0 { crate::ntos::ps::thread_accessors::process_id(thread) as u32 } else { 0 },
+        thread_id: if thread != 0 { crate::ntos::ps::thread_accessors::id(thread) as u32 } else { 0 },
+        data: payload.segments,
     };
     for session in recipients {
         let Some(consumer) = with(|etw| etw.sessions.get_mut(&session).map(|found| {
@@ -526,9 +755,50 @@ pub fn write(handle: u64, descriptor: u64, activity: u64, related: u64, count: u
     Ok(0)
 }
 
+/// EtwWrite/EtwWriteTransfer/EtwWriteEx de um chamador de kernel: ActivityId
+/// nulo usa a atividade da thread.
+pub fn write_ex(handle: u64, descriptor: u64, activity_pointer: u64, related: u64, count: u32, data: u64) -> Result<u32, KernelError> {
+    let descriptor_bytes = read_guid(descriptor);
+    deliver(handle, descriptor_bytes, || {
+        let segments = match read_segments(count, data, |address, length| Ok(guest::read_bytes(address, length)))? {
+            Ok(segments) => segments,
+            Err(status) => return Ok(Err(status)),
+        };
+        Ok(Ok(Payload { activity: activity::resolve(activity_pointer), related_activity: (related != 0).then(|| read_guid(related)), flags: header_flags::SIXTY_FOUR_BIT_HEADER, event_property: 0, segments }))
+    })
+}
+
+/// EtwWrite(RegHandle, EventDescriptor, ActivityId, UserDataCount, UserData)
+/// (EtwWriteTransfer passa também o RelatedActivityId).
+pub fn write(handle: u64, descriptor: u64, activity_pointer: u64, related: u64, count: u32, data: u64) -> Result<u32, KernelError> {
+    write_ex(handle, descriptor, activity_pointer, related, count, data)
+}
+
+/// EtwWriteString(RegHandle, Level, Keyword, ActivityId, String): um evento
+/// só de texto (EVENT_HEADER_FLAG_STRING_ONLY), a cadeia com o NUL.
+pub fn write_string(handle: u64, level: u8, keyword: u64, activity_pointer: u64, string: u64) -> Result<u32, KernelError> {
+    let mut descriptor = [0u8; 16];
+    descriptor[4] = level;
+    descriptor[8..16].copy_from_slice(&keyword.to_le_bytes());
+    deliver(handle, descriptor, || {
+        let text = crate::ntos::rtl::guest_strings::read_wide_string(string);
+        let mut bytes: Vec<u8> = text.encode_utf16().flat_map(|unit| unit.to_le_bytes()).collect();
+        bytes.extend_from_slice(&[0, 0]);
+        if bytes.len() as u64 + core::mem::size_of::<crate::ntos::inc::types::EventHeader>() as u64 > MAXIMUM_EVENT_SIZE {
+            return Ok(Err(STATUS_BUFFER_OVERFLOW));
+        }
+        Ok(Ok(Payload { activity: activity::resolve(activity_pointer), related_activity: None, flags: header_flags::SIXTY_FOUR_BIT_HEADER | header_flags::STRING_ONLY, event_property: 0, segments: alloc::vec![bytes] }))
+    })
+}
+
 /// (registros, GUIDs, sessões).
 pub fn statistics() -> (usize, usize, usize) {
     with(|etw| (etw.registrations.values().filter(|record| !record.closing).count(), etw.entries.len(), etw.sessions.len()))
+}
+
+/// Registros de modo usuário vivos.
+pub fn user_registrations() -> usize {
+    with(|etw| etw.registrations.values().filter(|record| !record.closing && record.user.is_some()).count())
 }
 
 /// O registro existe, mesmo em fechamento.
@@ -544,26 +814,107 @@ pub fn delivered(session: u16) -> Option<u64> {
     with(|etw| etw.sessions.get(&session).map(|found| found.delivered))
 }
 
-/// EventProviderSetTraits: tamanho dos traits por registro.
-static TRAITS: SpinLock<BTreeMap<u64, u32>> = SpinLock::new(BTreeMap::new());
+// ---- Traits (EventProviderSetTraits) ---------------------------------------
 
-/// EtwSetInformation(RegHandle, InformationClass, Information): atualiza os
-/// metadados de um registro conforme a classe (2 = traits). Devolve o
-/// NTSTATUS (STATUS_INVALID_HANDLE sem o registro).
-pub fn set_information(handle: u64, class: u32, information: u64) -> u32 {
-    if !exists(handle) {
-        return 0xC000_0008;
+/// A validação do EtwpSetProviderTraitsCommon: TotalSize (USHORT inicial) =
+/// tamanho, o nome do provedor terminado em NUL e, depois dele, itens que
+/// começam pelo próprio USHORT de tamanho e fecham exatamente o total.
+pub fn validate_traits(traits: &[u8]) -> Result<(), u32> {
+    let size = traits.len();
+    if size < 3 || u16::from_le_bytes([traits[0], traits[1]]) as usize != size {
+        return Err(STATUS_FILE_CORRUPT_ERROR);
     }
-    if class == EVENT_PROVIDER_SET_TRAITS && information != 0 {
-        // Traits: bytes do driver (sem alinhamento) que começam pelo USHORT
-        // TotalSize; um único acesso desalinhado de 16 bits.
-        TRAITS.lock().insert(handle, guest::read::<u16>(information) as u32);
+    let name = traits[2..].iter().position(|&byte| byte == 0).unwrap_or(size - 2);
+    let mut offset = name + 3;
+    if offset > size {
+        return Err(STATUS_FILE_CORRUPT_ERROR);
     }
+    while offset < size {
+        if offset + 2 > size {
+            return Err(STATUS_FILE_CORRUPT_ERROR);
+        }
+        let item = u16::from_le_bytes([traits[offset], traits[offset + 1]]) as usize;
+        // Um item de tamanho zero nunca fecharia o total.
+        if item == 0 {
+            return Err(STATUS_FILE_CORRUPT_ERROR);
+        }
+        offset += item;
+    }
+    if offset == size { Ok(()) } else { Err(STATUS_FILE_CORRUPT_ERROR) }
+}
+
+/// Guarda os traits no registro (ETW_REG_ENTRY.Traits, o bloco 'EtwT' com a
+/// cópia depois do cabeçalho): traits já guardados são STATUS_UNSUCCESSFUL;
+/// aceitos, o registro passa a usar o tipo dos descritores.
+pub fn set_traits(handle: u64, traits: &[u8]) -> u32 {
+    if let Err(status) = validate_traits(traits) {
+        return status;
+    }
+    let native = registration(handle);
+    if native.traits.get() != 0 {
+        return STATUS_UNSUCCESSFUL;
+    }
+    let Ok(block) = kernel_pool::allocate(TRAITS_HEADER + traits.len() as u64, AllocateOptions { tag: TRAITS_TAG, zero: true, ..Default::default() }) else { return STATUS_INSUFFICIENT_RESOURCES };
+    guest::write32(block + 0x18, 1);
+    guest::write_bytes(block + TRAITS_HEADER, traits);
+    if native.traits.atomic().compare_exchange(0, block, core::sync::atomic::Ordering::SeqCst, core::sync::atomic::Ordering::SeqCst).is_err() {
+        let _ = kernel_pool::free(block, None);
+        return STATUS_UNSUCCESSFUL;
+    }
+    native.flags.atomic().fetch_or(flags::USE_DESCRIPTOR_TYPE, core::sync::atomic::Ordering::SeqCst);
     0
 }
 
-/// EtwUnregister: os traits guardados saem antes do próprio registro.
-pub fn unregister_with_traits(handle: u64) -> Result<u32, KernelError> {
-    TRAITS.lock().remove(&handle);
-    unregister(handle)
+/// Os traits guardados de um registro (vazio sem eles).
+pub fn traits(handle: u64) -> Vec<u8> {
+    let block = registration(handle).traits.get();
+    if block == 0 {
+        return Vec::new();
+    }
+    let size = guest::read::<u16>(block + TRAITS_HEADER) as usize;
+    guest::read_bytes(block + TRAITS_HEADER, size)
+}
+
+/// EventProviderUseDescriptorType: 1 liga e 0 desliga o uso do Type dos
+/// EVENT_DATA_DESCRIPTOR; outro valor é STATUS_INVALID_PARAMETER.
+pub fn use_descriptor_type(handle: u64, value: u8) -> u32 {
+    let native_flags = &registration(handle).flags;
+    match value {
+        1 => native_flags.atomic().fetch_or(flags::USE_DESCRIPTOR_TYPE, core::sync::atomic::Ordering::SeqCst),
+        0 => native_flags.atomic().fetch_and(!flags::USE_DESCRIPTOR_TYPE, core::sync::atomic::Ordering::SeqCst),
+        _ => return STATUS_INVALID_PARAMETER,
+    };
+    0
+}
+
+/// EtwSetInformation(RegHandle, InformationClass, EventInformation,
+/// InformationLength), como no ntoskrnl 19041: REGHANDLE nulo é
+/// STATUS_INVALID_HANDLE (um REGHANDLE que não é registro vivo também, em
+/// vez de ser seguido); EventProviderSetTraits (2) pede informação não
+/// nula de 3 a 0x7FFF bytes num registro de kernel não clássico e
+/// EventProviderUseDescriptorType (3) um BOOLEAN; as outras classes são
+/// STATUS_INVALID_DEVICE_REQUEST.
+pub fn set_information(handle: u64, class: u32, information: u64, length: u32) -> u32 {
+    if handle == 0 || !is_registered(handle) {
+        return STATUS_INVALID_HANDLE;
+    }
+    match class {
+        EVENT_PROVIDER_SET_TRAITS => {
+            if information == 0 || !(3..=0x7FFF).contains(&length) {
+                return STATUS_INVALID_PARAMETER;
+            }
+            let value = registration(handle).flags.get();
+            if value & flags::CLASSIC != 0 || value & flags::KERNEL == 0 {
+                return STATUS_INVALID_PARAMETER;
+            }
+            set_traits(handle, &guest::read_bytes(information, length as usize))
+        }
+        EVENT_PROVIDER_USE_DESCRIPTOR_TYPE => {
+            if information == 0 || length != 1 {
+                return STATUS_INVALID_PARAMETER;
+            }
+            use_descriptor_type(handle, guest::read::<u8>(information))
+        }
+        _ => STATUS_INVALID_DEVICE_REQUEST,
+    }
 }

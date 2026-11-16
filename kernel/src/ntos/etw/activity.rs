@@ -1,80 +1,129 @@
-//! Atividade corrente do ETW (EtwActivityIdControl).
+//! Identificadores de atividade do ETW (EtwActivityIdControl e o
+//! EtwActivityIdCreate do NtTraceControl).
 //!
-//! Um GUID de atividade corrente (16 bytes no pool do convidado), que
-//! EtwWrite e EtwWriteTransfer usam quando o chamador não passa um ID, e o
-//! gerador de IDs novos: uuid v4 por xorshift32 semeado no TSC (o mesmo
-//! padrão do Ex).
+//! Como no ntoskrnl 19041:
+//! - um ID novo vem da semente por processador em KPRCB.EtwSupport
+//!   (EtwpCreateActivityId): os oito primeiros bytes do GUID são a base da
+//!   semente e os oito últimos o contador dela incrementado atomicamente. O
+//!   EtwpInitializeActivityIdSeed monta a base com o KUSER_SHARED_DATA.SystemTime
+//!   (sem o GUID do Headless, ausente aqui): ULONG baixo, USHORT seguinte e
+//!   o número do processador; o contador parte do mesmo SystemTime;
+//! - a atividade corrente é a da thread, no TEB (TEB.ActivityId, +0x1710):
+//!   thread de sistema (KTHREAD.MiscFlags.SystemThread) ou anexada a outro
+//!   processo (ApcStateIndex 1) não tem TEB e GET/SET devolvem
+//!   STATUS_NOT_SUPPORTED; CREATE_ID não depende da thread.
 
-use crate::hal::cpu;
-use crate::ntos::inc::types::{Guid, NtStruct};
+use crate::ntos::inc::types::{Guid, Kthread, NtStruct};
+use crate::ntos::ke::{clock, pcr};
 use crate::ntos::mm::guest_memory as guest;
-use crate::rtl::SpinLock;
+use crate::ntos::mm::kernel_pool::{self, AllocateOptions};
 
 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
+/// KTHREAD.MiscFlags.SystemThread.
+const SYSTEM_THREAD: i32 = 0x400;
+/// Tamanho da semente (base e contador).
+const SEED_SIZE: u64 = 16;
+/// Tag do bloco por processador ('EtwP').
+const SEED_TAG: u32 = 0x5077_7445;
 
-struct Activity {
-    /// GUID da atividade corrente (16 bytes).
-    current: u64,
-    /// Estado do gerador xorshift32 (CREATE_ID).
-    random: u32,
+pub const EVENT_ACTIVITY_CTRL_GET_ID: u32 = 1;
+pub const EVENT_ACTIVITY_CTRL_SET_ID: u32 = 2;
+pub const EVENT_ACTIVITY_CTRL_CREATE_ID: u32 = 3;
+pub const EVENT_ACTIVITY_CTRL_GET_SET_ID: u32 = 4;
+pub const EVENT_ACTIVITY_CTRL_CREATE_SET_ID: u32 = 5;
+
+/// A semente do processador corrente (KPRCB.EtwSupport), criada na primeira
+/// vez como o EtwInitializeProcessor.
+fn seed() -> u64 {
+    let prcb = &pcr::current().prcb;
+    let current = prcb.etw_support.get();
+    if current != 0 {
+        return current;
+    }
+    let Ok(block) = kernel_pool::allocate(SEED_SIZE, AllocateOptions { tag: SEED_TAG, zero: true, ..Default::default() }) else { return 0 };
+    let time = clock::system_time_100ns();
+    guest::write32(block, time as u32);
+    guest::write16(block + 4, (time >> 32) as u16);
+    guest::write16(block + 6, prcb.number.get() as u16);
+    guest::write64(block + 8, time);
+    prcb.etw_support.set(block);
+    block
 }
 
-static ACTIVITY: SpinLock<Activity> = SpinLock::new(Activity { current: 0, random: 0 });
-
-/// Sem ID explícito vale a atividade mantida pelo EtwActivityIdControl.
-pub fn resolve(explicit: u64) -> u64 {
-    if explicit != 0 { explicit } else { ACTIVITY.lock().current }
+/// EtwpCreateActivityId: o GUID novo em `output` (16 bytes graváveis).
+pub fn create_id(output: u64) -> Result<(), crate::rtl::KernelError> {
+    let seed = seed();
+    if seed == 0 {
+        return Err(crate::rtl::KernelError::new("ETW activity seed allocation failed"));
+    }
+    // SAFETY: a semente do processador (16 bytes do pool, alinhados).
+    let counter = unsafe { crate::ntos::inc::field::Field::<u64>::at(seed + 8) }.atomic().fetch_add(1, core::sync::atomic::Ordering::SeqCst).wrapping_add(1);
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&guest::read64(seed).to_le_bytes());
+    bytes[8..].copy_from_slice(&counter.to_le_bytes());
+    guest::try_write_bytes(output, &bytes)
 }
 
-fn xorshift(state: &mut u32) {
-    *state ^= *state << 13;
-    *state ^= *state >> 17;
-    *state ^= *state << 5;
+/// O TEB.ActivityId da thread corrente (0 sem TEB).
+fn thread_activity() -> u64 {
+    let thread = pcr::current_thread();
+    if thread == 0 {
+        return 0;
+    }
+    // SAFETY: KTHREAD da thread corrente.
+    let kthread = unsafe { Kthread::at(thread) };
+    if kthread.misc_flags.get() & SYSTEM_THREAD != 0 || kthread.apc_state_index.get() == 1 {
+        return 0;
+    }
+    match kthread.teb.get() {
+        0 => 0,
+        teb => teb + core::mem::offset_of!(crate::ntos::inc::types::Teb, activity_id) as u64,
+    }
 }
 
-/// EtwActivityIdControl(code, &guid): GET_ID=1, SET_ID=2, CREATE_ID=3,
-/// GET_SET_ID=4, CREATE_SET_ID=5 (evntprov.h) sobre o GUID corrente.
-/// Devolve o NTSTATUS.
+/// O ID de atividade de um evento: o explícito ou o da thread (GUID nulo
+/// sem TEB). Devolve os 16 bytes.
+pub fn resolve(explicit: u64) -> [u8; 16] {
+    let source = if explicit != 0 { explicit } else { thread_activity() };
+    let mut bytes = [0u8; 16];
+    if source != 0 {
+        if let Ok(read) = guest::try_read_bytes(source, Guid::SIZE as usize) {
+            bytes.copy_from_slice(&read);
+        }
+    }
+    bytes
+}
+
+/// EtwActivityIdControl(ControlCode, ActivityId). Devolve o NTSTATUS.
 pub fn control(code: u32, pointer: u64) -> u32 {
-    let mut activity = ACTIVITY.lock();
-    if activity.current == 0 {
-        activity.current = guest::alloc_bytes(Guid::SIZE);
+    if code == EVENT_ACTIVITY_CTRL_CREATE_ID {
+        return match create_id(pointer) {
+            Ok(()) => 0,
+            Err(_) => 0xC000_0005,
+        };
     }
-    let current = activity.current;
-    let copy_current = || guest::write_bytes(pointer, &guest::read_bytes(current, Guid::SIZE as usize));
-    let store_current = || guest::write_bytes(current, &guest::read_bytes(pointer, Guid::SIZE as usize));
-    // uuid v4 por xorshift32 semeado no TSC (o mesmo padrão do Ex).
-    let generate = |state: &mut u32| {
-        xorshift(state);
-        if *state == 0 {
-            *state = match cpu::rdtsc() as u32 {
-                0 => 0x2545_F491,
-                seed => seed,
-            };
-        }
-        let mut bytes = [0u8; 16];
-        for word in bytes.chunks_exact_mut(4) {
-            xorshift(state);
-            word.copy_from_slice(&state.to_le_bytes());
-        }
-        // Versão 4 e variante RFC (ordem de bytes RFC, como antes).
-        bytes[6] = (bytes[6] & 0x0F) | 0x40;
-        bytes[8] = (bytes[8] & 0x3F) | 0x80;
-        guest::write_bytes(pointer, &bytes);
-    };
-    match code {
-        1 => copy_current(),
-        2 => store_current(),
-        3 => generate(&mut activity.random),
-        4 => {
-            copy_current();
-            store_current();
-        }
-        5 => {
-            generate(&mut activity.random);
-            store_current();
-        }
-        _ => return STATUS_INVALID_PARAMETER,
+    let current = thread_activity();
+    if current == 0 {
+        return STATUS_NOT_SUPPORTED;
     }
-    0
+    let read = |address: u64| guest::try_read_bytes(address, Guid::SIZE as usize);
+    let result = (|| -> Result<u32, crate::rtl::KernelError> {
+        match code {
+            EVENT_ACTIVITY_CTRL_GET_ID => guest::try_write_bytes(pointer, &read(current)?)?,
+            EVENT_ACTIVITY_CTRL_SET_ID => guest::try_write_bytes(current, &read(pointer)?)?,
+            EVENT_ACTIVITY_CTRL_GET_SET_ID => {
+                let (old, new) = (read(current)?, read(pointer)?);
+                guest::try_write_bytes(current, &new)?;
+                guest::try_write_bytes(pointer, &old)?;
+            }
+            EVENT_ACTIVITY_CTRL_CREATE_SET_ID => {
+                guest::try_write_bytes(pointer, &read(current)?)?;
+                create_id(current)?;
+            }
+            _ => return Ok(STATUS_INVALID_PARAMETER),
+        }
+        Ok(0)
+    })();
+    result.unwrap_or(0xC000_0005)
 }

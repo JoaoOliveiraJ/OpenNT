@@ -367,7 +367,7 @@ fn ntoskrnl_exports(assert: Assert) {
     use crate::{ntos::init::export_names as abi_names, ntos::init::exports};
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions, ResolvedImport};
     exports::init();
-    assert(abi_names::EXPORT_NAMES.len() == 1952 && abi_names::GROUP_LAYOUT.len() == 450 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1952 exports em 450 grupos");
+    assert(abi_names::EXPORT_NAMES.len() == 1954 && abi_names::GROUP_LAYOUT.len() == 451 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 1954 exports em 451 grupos");
     // Ordinais públicos: os slots de função seguidos dos dados sem nome repetido.
     let public_count = abi_names::EXPORT_NAMES.len() + crate::ntos::mm::kernel_data_layout::DEFINITIONS.iter().filter(|entry| !abi_names::EXPORT_NAMES.contains(&entry.name)).count();
     assert(matches!(exports::lookup_ordinal("ntoskrnl.exe", 547), Some(ResolvedImport::Thunk(578))) && exports::lookup("ntoskrnl.exe", "LdrResSearchResource").is_some() && exports::lookup("ntoskrnl.exe", "NaoExisteNoKernel").is_none() && exports::lookup_ordinal("ntoskrnl.exe", 0).is_none() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32).is_some() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32 + 1).is_none(), "ntoskrnl: ordinais, todos os exports com provedor e nome desconhecido");
@@ -1535,19 +1535,33 @@ fn ntoskrnl_security_groups(assert: Assert) {
     let guid = guest::alloc_bytes(16);
     guest::write_bytes(guid, &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xF0, 0x0F]);
     let handle = guest::alloc_bytes(8);
+    // Traits: TotalSize 8, o nome "ab" com NUL e um item de 3 bytes.
     let traits = guest::alloc_bytes(8);
-    guest::write32(traits, 8);
+    guest::write_bytes(traits, &[8, 0, b'a', b'b', 0, 3, 0, 1]);
     let descriptor = guest::alloc_bytes(16);
     assert(call_export("EtwRegister", &[guid, 0, 0, handle]) == Some(0) && guest::read64(handle) != 0, "etw: EtwRegister devolve o REGHANDLE");
     let registration = guest::read64(handle);
-    assert(call_export("EtwSetInformation", &[registration, 1, traits, 4]) == Some(0) && call_export("EtwSetInformation", &[0xDEAD_0000, 1, traits, 4]) == Some(0xFFFF_FFFF_C000_0008), "etw: traits do registro e handle invalido");
+    let flags = || at::<nt::EtwRegEntry>(registration).flags.get();
+    assert(call_export("EtwSetInformation", &[registration, 1, traits, 8]) == Some(0xFFFF_FFFF_C000_0010) && call_export("EtwSetInformation", &[0, 2, traits, 8]) == Some(0xFFFF_FFFF_C000_0008) && call_export("EtwSetInformation", &[registration, 2, traits, 2]) == Some(0xFFFF_FFFF_C000_000D), "etw: EtwSetInformation recusa a classe 1, o REGHANDLE nulo e traits curtos");
+    assert(call_export("EtwSetInformation", &[registration, 2, traits, 8]) == Some(0) && flags() & 0x200 != 0 && crate::ntos::etw::provider_state::traits(registration) == [8, 0, b'a', b'b', 0, 3, 0, 1] && call_export("EtwSetInformation", &[registration, 2, traits, 8]) == Some(0xFFFF_FFFF_C000_0001), "etw: traits guardados uma vez no registro (EventProviderSetTraits)");
+    let validate = crate::ntos::etw::provider_state::validate_traits;
+    assert(validate(&[9, 0, b'a', 0, 3, 0, 1, 0]) == Err(0xC000_0102) && validate(&[6, 0, b'a', b'b', b'c', b'd']) == Err(0xC000_0102) && validate(&[7, 0, b'a', 0, 4, 0, 1]) == Err(0xC000_0102) && validate(&[4, 0, b'a', 0]) == Ok(()), "etw: traits mal formados sao STATUS_FILE_CORRUPT_ERROR");
+    guest::write8(traits, 0);
+    let cleared = call_export("EtwSetInformation", &[registration, 3, traits, 1]) == Some(0) && flags() & 0x200 == 0;
+    guest::write8(traits, 2);
+    assert(cleared && call_export("EtwSetInformation", &[registration, 3, traits, 1]) == Some(0xFFFF_FFFF_C000_000D) && call_export("EtwSetInformation", &[registration, 3, traits, 2]) == Some(0xFFFF_FFFF_C000_000D), "etw: EventProviderUseDescriptorType liga e desliga a marca");
     assert(call_export("EtwWrite", &[registration, descriptor, 0, 0, 0]).is_some_and(|status| status as u32 & 0x8000_0000 == 0), "etw: EtwWrite sem sessao ativa");
     let first = guest::alloc_bytes(16);
     let second = guest::alloc_bytes(16);
-    let first_guid = at::<nt::Guid>(first);
-    assert(call_export("EtwActivityIdControl", &[3, first]) == Some(0) && (first_guid.data3.get() & 0xFF) >> 4 == 4 && first_guid.data4[0].get() >> 6 == 2, "etw: CREATE_ID gera uuid v4");
-    assert(call_export("EtwActivityIdControl", &[2, first]) == Some(0) && call_export("EtwActivityIdControl", &[1, second]) == Some(0) && guest::read_bytes(first, 16) == guest::read_bytes(second, 16), "etw: SET_ID e GET_ID da atividade corrente");
-    assert(call_export("EtwActivityIdControl", &[9, first]) == Some(0xFFFF_FFFF_C000_000D) && call_export("EtwUnregister", &[registration]) == Some(0), "etw: codigo invalido e EtwUnregister");
+    // CREATE_ID pela semente do processador: base igual, contador seguinte
+    // (em DISPATCH_LEVEL, para as duas chamadas ficarem na mesma CPU).
+    let old_irql = call_export("KfRaiseIrql", &[2]).unwrap_or(0);
+    let created = call_export("EtwActivityIdControl", &[3, first]) == Some(0) && call_export("EtwActivityIdControl", &[3, second]) == Some(0);
+    let processor = crate::ntos::ke::processor_group::current_processor_number();
+    let _ = call_export("KeLowerIrql", &[old_irql]);
+    assert(created && guest::read64(first) == guest::read64(second) && guest::read64(second + 8) == guest::read64(first + 8).wrapping_add(1) && guest::read16(first + 6) as u32 == processor, "etw: CREATE_ID pela semente do KPRCB.EtwSupport");
+    // A thread de sistema não tem TEB: a atividade corrente não existe.
+    assert(call_export("EtwActivityIdControl", &[1, first]) == Some(0xFFFF_FFFF_C000_00BB) && call_export("EtwActivityIdControl", &[2, first]) == Some(0xFFFF_FFFF_C000_00BB) && call_export("EtwActivityIdControl", &[9, first]) == Some(0xFFFF_FFFF_C000_00BB) && call_export("EtwUnregister", &[registration]) == Some(0), "etw: GET/SET sem TEB sao STATUS_NOT_SUPPORTED e EtwUnregister");
     for buffer in [guid, handle, traits, descriptor, first, second] {
         guest::free_bytes(buffer);
     }
@@ -1998,7 +2012,7 @@ fn ntoskrnl_mm_group(assert: Assert) {
     use crate::ntos::mm::{image_paging, paging};
     use crate::ntos::init::exports;
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions};
-    assert(exports::implemented() == 1952 && exports::export_names().len() == 1952, "ntoskrnl: 450 grupos com os 1952 exports implementados");
+    assert(exports::implemented() == 1954 && exports::export_names().len() == 1954, "ntoskrnl: 451 grupos com os 1954 exports implementados");
     let block = guest::alloc_bytes(0x200);
     // MmGetSystemRoutineAddress: trampolim chamável e nome desconhecido.
     let name: alloc::vec::Vec<u16> = "KeGetCurrentIrql".encode_utf16().collect();
@@ -4124,6 +4138,177 @@ fn etw_trace_control(assert: Assert) {
     let max_loggers = call_export("ZwTraceControl", &[42, 0, 0, properties, 4, returned]);
     let invalid = call_export("ZwTraceControl", &[8, 0, 0, 0, 0, returned]);
     assert(no_flag == Some(0xFFFF_FFFF_C000_000D) && small == Some(0xFFFF_FFFF_C000_0206) && max_loggers == Some(0) && guest::read32(properties) == 64 && invalid == Some(0xFFFF_FFFF_C000_0010), "etw: validacoes e MaxLoggers");
+    etw_trace_session(assert, block, &prepare);
+    etw_user_registration(assert, block, &prepare);
+    guest::free_bytes(block);
+}
+
+/// (chamadas, ControlCode, nível, MatchAnyKeyword) da rotina de habilitação.
+static ETW_SESSION_CALLBACK: [core::sync::atomic::AtomicU64; 4] = [const { core::sync::atomic::AtomicU64::new(0) }; 4];
+
+extern "win64" fn etw_session_callback(_source: u64, control: u64, level: u64, any: u64, _all: u64, _filter: u64, _context: u64) -> u64 {
+    use core::sync::atomic::Ordering::SeqCst;
+    ETW_SESSION_CALLBACK[0].fetch_add(1, SeqCst);
+    ETW_SESSION_CALLBACK[1].store(control, SeqCst);
+    ETW_SESSION_CALLBACK[2].store(level, SeqCst);
+    ETW_SESSION_CALLBACK[3].store(any, SeqCst);
+    0
+}
+
+/// Uma sessão de verdade: StartTrace, EtwEnableTrace (a rotina do provedor
+/// recebe nível e keywords), EtwWrite/EtwWriteTransfer/EtwWriteString nos
+/// buffers como registros EVENT_HEADER, Flush e Stop.
+fn etw_trace_session(assert: Assert, block: u64, prepare: &dyn Fn(u32)) {
+    use crate::ntos::etw::logger;
+    use core::sync::atomic::Ordering::SeqCst;
+    let (properties, returned) = (block, block + 0x180);
+    let control = |code: u64| call_export("ZwTraceControl", &[code, properties, 0xB0, properties, 0xB0, returned]);
+    prepare(0x2_0000);
+    guest::write32(properties + 0x30, 4);
+    let started = control(1);
+    let logger_id = guest::read64(properties + 8) & 0xFFFF;
+    let buffers = guest::read32(properties + 0x60);
+    assert(started == Some(0) && logger_id != 0 && guest::read32(properties + 0x30) == 4 && buffers >= 2 && guest::read32(properties + 0x64) == buffers - 1, "etw-session: StartTrace com buffers de 4 KB alocados");
+    let scratch = guest::alloc_bytes(0x100);
+    guest::write_bytes(scratch, &[0u8; 0x100]);
+    let (provider, handle, descriptor, data, payload, related, text) = (scratch, scratch + 0x10, scratch + 0x18, scratch + 0x28, scratch + 0x38, scratch + 0x40, scratch + 0x50);
+    guest::write_bytes(provider, &[0x45, 0x54, 0x57, 0x2D, 0x53, 0x65, 0x73, 0x73, 0x61, 0x6F, 0x2D, 0x4F, 0x70, 0x65, 0x6E, 0x4E]);
+    for slot in &ETW_SESSION_CALLBACK {
+        slot.store(0, SeqCst);
+    }
+    let callback = etw_session_callback as extern "win64" fn(u64, u64, u64, u64, u64, u64, u64) -> u64 as usize as u64;
+    let registered = call_export("EtwRegister", &[provider, callback, 0, handle]);
+    let registration = guest::read64(handle);
+    let enabled = call_export("EtwEnableTrace", &[provider, 0, logger_id, 1, 4, 0x10, 0, 0]);
+    assert(registered == Some(0) && enabled == Some(0) && ETW_SESSION_CALLBACK[0].load(SeqCst) == 1 && ETW_SESSION_CALLBACK[1].load(SeqCst) == 1 && ETW_SESSION_CALLBACK[2].load(SeqCst) == 4 && ETW_SESSION_CALLBACK[3].load(SeqCst) == 0x10, "etw-session: EtwEnableTrace chama a rotina do provedor com nivel e keywords");
+    // EVENT_DESCRIPTOR Id 7, Level 4, Keyword 0x10 e um segmento "etw!".
+    guest::write16(descriptor, 7);
+    guest::write8(descriptor + 4, 4);
+    guest::write64(descriptor + 8, 0x10);
+    guest::write_bytes(payload, b"etw!");
+    guest::write64(data, payload);
+    guest::write32(data + 8, 4);
+    guest::write_bytes(related, &[0xAB; 16]);
+    let text_units: Vec<u8> = "oi".encode_utf16().flat_map(|unit| unit.to_le_bytes()).chain([0, 0]).collect();
+    guest::write_bytes(text, &text_units);
+    let written = call_export("EtwWrite", &[registration, descriptor, 0, 1, data]);
+    let transfer = call_export("EtwWriteTransfer", &[registration, descriptor, 0, related, 1, data]);
+    let string = call_export("EtwWriteString", &[registration, 4, 0x10, 0, text]);
+    guest::write64(descriptor + 8, 0x20);
+    let filtered = call_export("EtwWrite", &[registration, descriptor, 0, 1, data]);
+    guest::write64(descriptor + 8, 0x10);
+    guest::write8(descriptor + 4, 5);
+    let verbose = call_export("EtwWriteEx", &[registration, descriptor, 0, 0, 0, 0, 1, data]);
+    let records = logger::records(logger_id as u16).unwrap_or_default();
+    let word = |record: &Vec<u8>, offset: usize| u16::from_le_bytes([record[offset], record[offset + 1]]);
+    assert(written == Some(0) && transfer == Some(0) && string == Some(0) && filtered == Some(0) && verbose == Some(0) && records.len() == 3, "etw-session: so os eventos aceitos pelo nivel e pela keyword chegam aos buffers");
+    if records.len() == 3 {
+        let plain = &records[0];
+        assert(plain.len() == 0x54 && word(plain, 0) == 0x54 && word(plain, 2) == 0xC013 && word(plain, 4) == 0x40 && plain[0x18..0x28] == guest::read_bytes(provider, 16)[..] && word(plain, 0x28) == 7 && plain[0x2C] == 4 && &plain[0x50..0x54] == b"etw!", "etw-session: EVENT_HEADER de 64 bits com provedor, descritor e dados");
+        let transferred = &records[1];
+        assert(transferred.len() == 0x6C && word(transferred, 4) == 0x41 && word(transferred, 0x50) == 0x18 && word(transferred, 0x52) == 1 && word(transferred, 0x56) == 0x10 && transferred[0x58..0x68] == [0xAB; 16] && &transferred[0x68..0x6C] == b"etw!", "etw-session: RelatedActivityId como item estendido");
+        let only_text = &records[2];
+        assert(word(only_text, 4) == 0x44 && only_text[0x50..] == text_units[..], "etw-session: EtwWriteString com EVENT_HEADER_FLAG_STRING_ONLY");
+    }
+    prepare(0x2_0000);
+    let flushed = control(5);
+    let after_flush = guest::read32(properties + 0x6C);
+    prepare(0x2_0000);
+    let stopped = control(2);
+    let callback_after = ETW_SESSION_CALLBACK[1].load(SeqCst);
+    assert(flushed == Some(0) && after_flush == 1 && stopped == Some(0) && guest::read32(properties + 0x68) == 0 && guest::read32(properties + 0x6C) == 1 && callback_after == 0 && logger::records(logger_id as u16).is_none(), "etw-session: Flush escreve o buffer, Stop desabilita o provedor e devolve os buffers");
+    let unregistered = call_export("EtwUnregister", &[registration]);
+    // EtwActivityIdCreate (12) e as validações do despacho.
+    let out = scratch + 0x80;
+    let activity = call_export("ZwTraceControl", &[12, 0, 0, out, 0x10, returned]);
+    let short = call_export("ZwTraceControl", &[12, 0, 0, out, 8, returned]);
+    let nonexistent = call_export("ZwTraceControl", &[29, 0, 0, 0, 0, returned]);
+    let register_size = call_export("ZwTraceControl", &[15, properties, 0x90, properties, 0xA0, returned]);
+    let no_event = call_export("ZwTraceControl", &[27, 0, 0, 0, 0, returned]);
+    assert(unregistered == Some(0) && activity == Some(0) && guest::read64(out) != 0 && short == Some(0xFFFF_FFFF_C000_000D) && nonexistent == Some(0xFFFF_FFFF_C000_0010) && register_size == Some(0xFFFF_FFFF_C000_000D) && no_event == Some(0xFFFF_FFFF_C000_000D), "etw-session: EtwActivityIdCreate e as validacoes de tamanho do NtTraceControl");
+    guest::free_bytes(scratch);
+}
+
+/// O caminho de um provedor de modo usuário pelo próprio NtTraceControl: o
+/// evento de notificação (27), o registro (15) com handle EtwRegistration,
+/// o pacote de habilitação na fila (16), o evento pelo NtTraceEvent 0x300
+/// nos buffers da sessão e o fechamento do handle.
+fn etw_user_registration(assert: Assert, block: u64, prepare: &dyn Fn(u32)) {
+    use crate::ntos::etw::{logger, provider_state, user_registration};
+    let (properties, returned) = (block, block + 0x180);
+    let scratch = guest::alloc_bytes(0x400);
+    guest::write_bytes(scratch, &[0u8; 0x400]);
+    let (event_out, attributes, request, packet, fields, data, payload) = (scratch, scratch + 0x10, scratch + 0x100, scratch + 0x200, scratch + 0x300, scratch + 0x380, scratch + 0x3A0);
+    // O EtwAddNotificationEvent lê o handle como ULONG (handle de processo,
+    // nunca um OBJ_KERNEL_HANDLE com o bit alto de 64 bits).
+    guest::write32(attributes, 0x30);
+    let created = call_export("ZwCreateEvent", &[event_out, 0x1F_0003, attributes, 0, 0]);
+    let event_handle = guest::read64(event_out);
+    guest::write32(scratch + 0x40, event_handle as u32);
+    let process = crate::ntos::ps::thread_accessors::current_process();
+    let no_source = call_export("ZwTraceControl", &[16, 0, 0, packet, 0x48, returned]);
+    let added = call_export("ZwTraceControl", &[27, scratch + 0x40, 4, 0, 0, returned]);
+    let again = call_export("ZwTraceControl", &[27, scratch + 0x40, 4, 0, 0, returned]);
+    assert(created == Some(0) && (no_source == Some(0xFFFF_FFFF_C000_000D) || added == Some(0xFFFF_FFFF_C000_0718)) && (added == Some(0) || added == Some(0xFFFF_FFFF_C000_0718)) && again == Some(0xFFFF_FFFF_C000_0718), "etw-user: EtwAddNotificationEvent guarda o evento no EtwDataSource uma vez");
+    // EtwRegisterGuids: GUID, EtwNotificationTypeEnable, RegIndex 7, contexto.
+    let provider: [u8; 16] = [0x55, 0x4D, 0x2D, 0x50, 0x72, 0x6F, 0x76, 0x2D, 0x4F, 0x70, 0x65, 0x6E, 0x4E, 0x54, 0x21, 0x21];
+    guest::write_bytes(request, &provider);
+    guest::write32(request + 0x10, 3);
+    guest::write32(request + 0x14, 7);
+    guest::write64(request + 0x20, 0x1234);
+    let before = provider_state::user_registrations();
+    let registered = call_export("ZwTraceControl", &[15, request, 0xA0, request, 0xA0, returned]);
+    let handle = guest::read64(request + 0x18);
+    assert(registered == Some(0) && handle != 0 && guest::read32(returned) == 0xA0 && guest::read32(request + 0x2C) == 0xA0 && guest::read32(request + 0x70) == 0 && provider_state::user_registrations() == before + 1, "etw-user: EtwRegisterGuids devolve o handle EtwRegistration sem sessao habilitada");
+    guest::write_bytes(request, &user_registration_security_guid());
+    let security = call_export("ZwTraceControl", &[15, request, 0xA0, request, 0xA0, returned]);
+    let empty = call_export("ZwTraceControl", &[16, 0, 0, packet, 0x48, returned]);
+    assert(security == Some(0xFFFF_FFFF_C000_0022) && empty == Some(0xFFFF_FFFF_8000_001A), "etw-user: GUID do provedor de seguranca recusado e fila vazia");
+    // Uma sessão habilita o provedor: o pacote chega à fila e ao evento.
+    prepare(0x2_0000);
+    guest::write32(properties + 0x30, 4);
+    let started = call_export("ZwTraceControl", &[1, properties, 0xB0, properties, 0xB0, returned]);
+    let logger_id = (guest::read64(properties + 8) & 0xFFFF) as u16;
+    let enabled = logger::enable_provider(logger_id, provider, 3, 0xF0);
+    let signaled = call_export("KeReadStateEvent", &[user_registration_event(process)]);
+    let pending = user_registration::pending(process);
+    let small = call_export("ZwTraceControl", &[16, 0, 0, packet, 0x48, returned]);
+    let small_length = guest::read32(returned);
+    let received = call_export("ZwTraceControl", &[16, 0, 0, packet, 0x100, returned]);
+    let header = |offset: u64| guest::read32(packet + offset);
+    assert(started == Some(0) && matches!(enabled, Ok(0)) && signaled == Some(1) && pending == 1 && small == Some(0xFFFF_FFFF_C000_0023) && small_length == 0x78 && received == Some(0) && guest::read32(returned) == 0x78, "etw-user: a habilitacao vira um pacote de 0x78 bytes e sinaliza o evento");
+    assert(header(0) == 3 && header(4) == 0x78 && header(0x14) == 1 && guest::read64(packet + 0x18) == 7 && guest::read_bytes(packet + 0x28, 16) == provider && header(0x48) == 1 && guest::read8(packet + 0x4C) == 3 && guest::read64(packet + 0x58) == 0xF0, "etw-user: ETWP_NOTIFICATION_HEADER com RegIndex e o TRACE_ENABLE_INFO agregado");
+    // NtTraceEvent 0x300 com o handle do registro: o evento entra nos buffers.
+    guest::write16(fields + 0x28, 9);
+    guest::write8(fields + 0x2C, 2);
+    guest::write64(fields + 0x30, 0x10);
+    guest::write32(fields + 0x54, 1);
+    guest::write64(fields + 0x58, data);
+    guest::write_bytes(payload, b"um!");
+    guest::write64(data, payload);
+    guest::write32(data + 8, 3);
+    let traced = user_registration::trace_event(handle, 0x300, 0x78, fields, 0);
+    let records = logger::records(logger_id).unwrap_or_default();
+    assert(matches!(traced, Ok(0)) && records.len() == 1 && records.first().is_some_and(|record| record[0x18..0x28] == provider && u16::from_le_bytes([record[0x28], record[0x29]]) == 9 && &record[0x50..] == b"um!"), "etw-user: NtTraceEvent do registro de modo usuario grava o evento na sessao");
+    prepare(0x2_0000);
+    let stopped = call_export("ZwTraceControl", &[2, properties, 0xB0, properties, 0xB0, returned]);
+    let disabled = call_export("ZwTraceControl", &[16, 0, 0, packet, 0x100, returned]);
+    assert(stopped == Some(0) && disabled == Some(0) && header(0x48) == 0, "etw-user: o Stop entrega o pacote de desabilitacao");
+    let closed = call_export("ZwClose", &[handle]);
+    let bad = call_export("ZwTraceControl", &[26, scratch + 0x18, 8, 0, 0, returned]);
+    assert(closed == Some(0) && provider_state::user_registrations() == before && bad == Some(0xFFFF_FFFF_C000_0008), "etw-user: fechar o handle apaga o registro e um handle invalido e recusado");
+    let _ = call_export("ZwClose", &[event_handle]);
+    guest::free_bytes(scratch);
+}
+
+fn user_registration_security_guid() -> [u8; 16] {
+    [0x25, 0x96, 0x84, 0x54, 0x78, 0x54, 0x94, 0x49, 0xA5, 0xBA, 0x3E, 0x3B, 0x03, 0x28, 0xC3, 0x0D]
+}
+
+/// O KEVENT nativo do EtwDataSource do processo.
+fn user_registration_event(process: u64) -> u64 {
+    let block = at::<nt::Eprocess>(process).etw_data_source.get();
+    if block == 0 { 0 } else { guest::read64(block) }
 }
 
 /// RtlCreate/Set*SecurityDescriptor, RtlCreateAcl, RtlAddAccessAllowedAce[Ex],

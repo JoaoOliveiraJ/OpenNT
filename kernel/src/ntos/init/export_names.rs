@@ -456,9 +456,10 @@ pub static GROUP_LAYOUT: &[(&str, usize, usize)] = &[
     ("ps-loaded-module-list", 1947, 0),
     ("io-interface-key-keep-alive", 1947, 4),
     ("zw-create-wnf-state-name", 1951, 1),
+    ("etw-write-ex", 1952, 2),
 ];
 
-/// Os 1952 exports de função, na ordem da ABI.
+/// Os 1954 exports de função, na ordem da ABI.
 pub static EXPORT_NAMES: &[&str] = &[
     "DbgPrint",
     "DbgPrintEx",
@@ -2412,4 +2413,6 @@ pub static EXPORT_NAMES: &[&str] = &[
     "IoDecrementKeepAliveCount",
     "IoCreateUnprotectedSymbolicLink",
     "ZwCreateWnfStateName",
+    "EtwWriteEx",
+    "EtwWriteString",
 ];

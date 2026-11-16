@@ -481,11 +481,6 @@ fn nt_query_system_information_ex(class: u64, input: u64, input_length: u64, buf
     })
 }
 
-/// NtTraceEvent: aceito e descartado (sessão ETW sem consumidor).
-fn nt_trace_event(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
-    Ok(STATUS_SUCCESS)
-}
-
 /// NtRaiseHardError(status, count, unicodeMask, params*, responseType,
 /// response*): registra a mensagem e responde ResponseAbort.
 fn nt_raise_hard_error(status: u64, count: u64, unicode_mask: u64, parameters: u64, rsp: u64) -> Result<u32, KernelError> {
@@ -842,7 +837,7 @@ fn nt_query_license_value(name: u64, type_pointer: u64, data: u64, data_size: u6
 }
 
 pub fn init() {
-    let handlers: [(&'static str, state::SyscallHandler); 30] = [
+    let handlers: [(&'static str, state::SyscallHandler); 29] = [
         ("NtQueryLicenseValue", nt_query_license_value),
         ("NtGetCurrentProcessorNumber", nt_get_current_processor_number),
         ("NtGetCurrentProcessorNumberEx", nt_get_current_processor_number_ex),
@@ -857,7 +852,6 @@ pub fn init() {
         ("NtQuerySystemInformationEx", nt_query_system_information_ex),
         ("NtSetSystemInformation", nt_set_system_information),
         ("NtSerializeBoot", nt_serialize_boot),
-        ("NtTraceEvent", nt_trace_event),
         ("NtRaiseHardError", nt_raise_hard_error),
         ("NtFlushInstructionCache", nt_flush_instruction_cache),
         ("NtQueryInformationProcess", nt_query_information_process),
