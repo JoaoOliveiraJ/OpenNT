@@ -587,10 +587,18 @@ const OWNER_SECURITY_INFORMATION: u32 = 1;
 const GROUP_SECURITY_INFORMATION: u32 = 2;
 const IRP_MJ_SET_SECURITY: u8 = 0x15;
 
-/// IRP_MJ_SET_SECURITY síncrono ao dispositivo do arquivo.
+/// IRP_MJ_SET_SECURITY síncrono ao dispositivo do arquivo. Como o
+/// IopGetSetSecurityObject, um file system sem segurança
+/// (STATUS_INVALID_DEVICE_REQUEST) ignora a alteração com STATUS_SUCCESS; os
+/// arquivos dos volumes do próprio kernel, sem DEVICE_OBJECT de file system,
+/// são esse caso (a consulta deles devolve o descritor de World).
 fn set_file_security(file: u64, information: u32, captured: u64) -> Result<u32, crate::rtl::KernelError> {
     use crate::ntos::inc::types::{IoStackLocation, IoStatusBlock, Irp, Kevent};
+    const STATUS_INVALID_DEVICE_REQUEST: u32 = 0xC000_0010;
     let device = crate::ntos::io::file::information::related_device(file)?;
+    if device == 0 {
+        return Ok(0);
+    }
     let event = guest::alloc_bytes(Kevent::SIZE);
     let io_status = guest::alloc_bytes(IoStatusBlock::SIZE);
     crate::ntos::ke::dispatcher::initialize_event(event, 0, false);
@@ -615,7 +623,7 @@ fn set_file_security(file: u64, information: u32, captured: u64) -> Result<u32, 
     }
     guest::free_bytes(event);
     guest::free_bytes(io_status);
-    Ok(status)
+    Ok(if status == STATUS_INVALID_DEVICE_REQUEST { 0 } else { status })
 }
 
 /// O acesso que o handle precisa para alterar as partes pedidas
