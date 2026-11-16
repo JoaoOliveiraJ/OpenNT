@@ -13,6 +13,7 @@
 //! - `WheaErrorSourceConfigurationDeviceDriverV1` / `WheaErrorSourceConfigurationDeviceDriver` —
 //!   WHEA_ERROR_SOURCE_CONFIGURATION_DEVICE_DRIVER_V1 / _DEVICE_DRIVER (ntddk.h), 0x2C / 0x54
 //! - `PciBusInterfaceStandard` — PCI_BUS_INTERFACE_STANDARD (wdm.h, versão 1), 0x40
+//! - `TranslatorInterface` — TRANSLATOR_INTERFACE (wdm.h), 0x30
 //! - `PnpBusInformation` — PNP_BUS_INFORMATION (wdm.h), 0x18
 //!
 //! As estruturas do WHEA são `#pragma pack(1)` no ntddk.h: os membros de 64 bits
@@ -217,6 +218,26 @@ const _: () = {
     assert!(core::mem::size_of::<PciBusInterfaceStandard>() == 0x40);
     assert!(core::mem::offset_of!(PciBusInterfaceStandard, read_config) == 0x20);
     assert!(core::mem::offset_of!(PciBusInterfaceStandard, line_to_pin) == 0x38);
+};
+
+/// TRANSLATOR_INTERFACE (wdm.h): o tradutor de recursos que um driver de
+/// barramento entrega pelo IRP_MN_QUERY_INTERFACE
+/// (GUID_TRANSLATOR_INTERFACE_STANDARD).
+#[repr(C)]
+pub struct TranslatorInterface {
+    pub interface: Interface,
+    /// -> `PTRANSLATE_RESOURCE_HANDLER`
+    pub translate_resources: Field<u64>,
+    /// -> `PTRANSLATE_RESOURCE_REQUIREMENTS_HANDLER`
+    pub translate_resource_requirements: Field<u64>,
+}
+
+unsafe impl NtStruct for TranslatorInterface {}
+
+const _: () = {
+    assert!(core::mem::size_of::<TranslatorInterface>() == 0x30);
+    assert!(core::mem::offset_of!(TranslatorInterface, translate_resources) == 0x20);
+    assert!(core::mem::offset_of!(TranslatorInterface, translate_resource_requirements) == 0x28);
 };
 
 /// PNP_BUS_INFORMATION (wdm.h): a resposta do IRP_MN_QUERY_BUS_INFORMATION.

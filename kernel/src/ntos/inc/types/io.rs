@@ -4882,6 +4882,393 @@ const _: () = {
     assert!(core::mem::offset_of!(IoSecurityContext, full_create_options) == 0x14);
 };
 
+/// `_ARBITER_INTERFACE` (0x30 bytes).
+#[repr(C)]
+pub struct ArbiterInterface {
+    pub size: Field<u16>,
+    pub version: Field<u16>,
+    _pad_4: Reserved<0x4>,
+    /// -> `void`
+    pub context: Field<u64>,
+    /// -> `fn`
+    pub interface_reference: Field<u64>,
+    /// -> `fn`
+    pub interface_dereference: Field<u64>,
+    /// -> `fn`
+    pub arbiter_handler: Field<u64>,
+    pub flags: Field<u32>,
+    _pad_2c: Reserved<0x4>,
+}
+
+unsafe impl NtStruct for ArbiterInterface {}
+
+const _: () = {
+    assert!(core::mem::size_of::<ArbiterInterface>() == 0x30);
+    assert!(core::mem::offset_of!(ArbiterInterface, size) == 0x0);
+    assert!(core::mem::offset_of!(ArbiterInterface, version) == 0x2);
+    assert!(core::mem::offset_of!(ArbiterInterface, context) == 0x8);
+    assert!(core::mem::offset_of!(ArbiterInterface, interface_reference) == 0x10);
+    assert!(core::mem::offset_of!(ArbiterInterface, interface_dereference) == 0x18);
+    assert!(core::mem::offset_of!(ArbiterInterface, arbiter_handler) == 0x20);
+    assert!(core::mem::offset_of!(ArbiterInterface, flags) == 0x28);
+};
+
+/// `_ARBITER_LIST_ENTRY` (0x60 bytes).
+#[repr(C)]
+pub struct ArbiterListEntry {
+    pub list_entry: ListEntry,
+    pub alternative_count: Field<u32>,
+    _pad_14: Reserved<0x4>,
+    /// -> `_IO_RESOURCE_DESCRIPTOR`
+    pub alternatives: Field<u64>,
+    /// -> `_DEVICE_OBJECT`
+    pub physical_device_object: Field<u64>,
+    pub request_source: Field<ArbiterRequestSource>,
+    pub flags: Field<u32>,
+    pub work_space: Field<i64>,
+    pub interface_type: Field<InterfaceType>,
+    pub slot_number: Field<u32>,
+    pub bus_number: Field<u32>,
+    _pad_44: Reserved<0x4>,
+    /// -> `_CM_PARTIAL_RESOURCE_DESCRIPTOR`
+    pub assignment: Field<u64>,
+    /// -> `_IO_RESOURCE_DESCRIPTOR`
+    pub selected_alternative: Field<u64>,
+    pub result: Field<ArbiterResult>,
+    _pad_5c: Reserved<0x4>,
+}
+
+unsafe impl NtStruct for ArbiterListEntry {}
+
+const _: () = {
+    assert!(core::mem::size_of::<ArbiterListEntry>() == 0x60);
+    assert!(core::mem::offset_of!(ArbiterListEntry, list_entry) == 0x0);
+    assert!(core::mem::offset_of!(ArbiterListEntry, alternative_count) == 0x10);
+    assert!(core::mem::offset_of!(ArbiterListEntry, alternatives) == 0x18);
+    assert!(core::mem::offset_of!(ArbiterListEntry, physical_device_object) == 0x20);
+    assert!(core::mem::offset_of!(ArbiterListEntry, request_source) == 0x28);
+    assert!(core::mem::offset_of!(ArbiterListEntry, flags) == 0x2c);
+    assert!(core::mem::offset_of!(ArbiterListEntry, work_space) == 0x30);
+    assert!(core::mem::offset_of!(ArbiterListEntry, interface_type) == 0x38);
+    assert!(core::mem::offset_of!(ArbiterListEntry, slot_number) == 0x3c);
+    assert!(core::mem::offset_of!(ArbiterListEntry, bus_number) == 0x40);
+    assert!(core::mem::offset_of!(ArbiterListEntry, assignment) == 0x48);
+    assert!(core::mem::offset_of!(ArbiterListEntry, selected_alternative) == 0x50);
+    assert!(core::mem::offset_of!(ArbiterListEntry, result) == 0x58);
+};
+
+/// `_ARBITER_REQUEST_SOURCE`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(transparent)]
+pub struct ArbiterRequestSource(pub i32);
+
+impl ArbiterRequestSource {
+    pub const ARBITER_REQUEST_UNDEFINED: Self = Self(-1);
+    pub const ARBITER_REQUEST_LEGACY_REPORTED: Self = Self(0);
+    pub const ARBITER_REQUEST_HAL_REPORTED: Self = Self(1);
+    pub const ARBITER_REQUEST_LEGACY_ASSIGNED: Self = Self(2);
+    pub const ARBITER_REQUEST_PNP_DETECTED: Self = Self(3);
+    pub const ARBITER_REQUEST_PNP_ENUMERATED: Self = Self(4);
+}
+
+impl GuestScalar for ArbiterRequestSource {
+    const SIZE: u64 = 4;
+    #[inline(always)]
+    fn from_bits(bits: u64) -> Self {
+        Self(bits as u32 as i32)
+    }
+    #[inline(always)]
+    fn to_bits(self) -> u64 {
+        self.0 as u32 as u64
+    }
+}
+
+/// `_ARBITER_RESULT`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(transparent)]
+pub struct ArbiterResult(pub i32);
+
+impl ArbiterResult {
+    pub const ARBITER_RESULT_UNDEFINED: Self = Self(-1);
+    pub const ARBITER_RESULT_SUCCESS: Self = Self(0);
+    pub const ARBITER_RESULT_EXTERNAL_CONFLICT: Self = Self(1);
+    pub const ARBITER_RESULT_NULL_REQUEST: Self = Self(2);
+}
+
+impl GuestScalar for ArbiterResult {
+    const SIZE: u64 = 4;
+    #[inline(always)]
+    fn from_bits(bits: u64) -> Self {
+        Self(bits as u32 as i32)
+    }
+    #[inline(always)]
+    fn to_bits(self) -> u64 {
+        self.0 as u32 as u64
+    }
+}
+
+/// `_ARBITER_PARAMETERS` (0x20 bytes).
+#[repr(C)]
+pub struct ArbiterParameters {
+    pub parameters: ArbiterParametersParameters,
+}
+
+unsafe impl NtStruct for ArbiterParameters {}
+
+const _: () = {
+    assert!(core::mem::size_of::<ArbiterParameters>() == 0x20);
+    assert!(core::mem::offset_of!(ArbiterParameters, parameters) == 0x0);
+};
+
+/// `_ARBITER_PARAMETERS::Parameters` (0x20 bytes).
+///
+/// Membros sobrepostos (uniões anônimas do C) ficam nas vistas
+/// `ArbiterParametersParametersView1`..`ArbiterParametersParametersView6`, alcançadas por `Deref`.
+#[repr(C)]
+pub struct ArbiterParametersParameters {
+    pub test_allocation: ArbiterTestAllocationParameters,
+    _pad_18: Reserved<0x8>,
+}
+
+/// Vista 1 de `_ARBITER_PARAMETERS::Parameters` (membros sobrepostos à vista anterior).
+#[repr(C)]
+pub struct ArbiterParametersParametersView1 {
+    pub retest_allocation: ArbiterRetestAllocationParameters,
+    _pad_18: Reserved<0x8>,
+}
+
+/// Vista 2 de `_ARBITER_PARAMETERS::Parameters` (membros sobrepostos à vista anterior).
+#[repr(C)]
+pub struct ArbiterParametersParametersView2 {
+    pub boot_allocation: ArbiterBootAllocationParameters,
+    _pad_8: Reserved<0x18>,
+}
+
+/// Vista 3 de `_ARBITER_PARAMETERS::Parameters` (membros sobrepostos à vista anterior).
+#[repr(C)]
+pub struct ArbiterParametersParametersView3 {
+    pub query_allocated_resources: ArbiterQueryAllocatedResourcesParameters,
+    _pad_8: Reserved<0x18>,
+}
+
+/// Vista 4 de `_ARBITER_PARAMETERS::Parameters` (membros sobrepostos à vista anterior).
+#[repr(C)]
+pub struct ArbiterParametersParametersView4 {
+    pub query_conflict: ArbiterQueryConflictParameters,
+}
+
+/// Vista 5 de `_ARBITER_PARAMETERS::Parameters` (membros sobrepostos à vista anterior).
+#[repr(C)]
+pub struct ArbiterParametersParametersView5 {
+    pub query_arbitrate: ArbiterQueryArbitrateParameters,
+    _pad_8: Reserved<0x18>,
+}
+
+/// Vista 6 de `_ARBITER_PARAMETERS::Parameters` (membros sobrepostos à vista anterior).
+#[repr(C)]
+pub struct ArbiterParametersParametersView6 {
+    pub add_reserved: ArbiterAddReservedParameters,
+    _pad_8: Reserved<0x18>,
+}
+
+impl core::ops::Deref for ArbiterParametersParameters {
+    type Target = ArbiterParametersParametersView1;
+    #[inline(always)]
+    fn deref(&self) -> &ArbiterParametersParametersView1 {
+        // SAFETY: vistas do mesmo objeto, mesmo tamanho e alinhamento, só de células.
+        unsafe { &*(self as *const Self).cast::<ArbiterParametersParametersView1>() }
+    }
+}
+
+impl core::ops::Deref for ArbiterParametersParametersView1 {
+    type Target = ArbiterParametersParametersView2;
+    #[inline(always)]
+    fn deref(&self) -> &ArbiterParametersParametersView2 {
+        // SAFETY: vistas do mesmo objeto, mesmo tamanho e alinhamento, só de células.
+        unsafe { &*(self as *const Self).cast::<ArbiterParametersParametersView2>() }
+    }
+}
+
+impl core::ops::Deref for ArbiterParametersParametersView2 {
+    type Target = ArbiterParametersParametersView3;
+    #[inline(always)]
+    fn deref(&self) -> &ArbiterParametersParametersView3 {
+        // SAFETY: vistas do mesmo objeto, mesmo tamanho e alinhamento, só de células.
+        unsafe { &*(self as *const Self).cast::<ArbiterParametersParametersView3>() }
+    }
+}
+
+impl core::ops::Deref for ArbiterParametersParametersView3 {
+    type Target = ArbiterParametersParametersView4;
+    #[inline(always)]
+    fn deref(&self) -> &ArbiterParametersParametersView4 {
+        // SAFETY: vistas do mesmo objeto, mesmo tamanho e alinhamento, só de células.
+        unsafe { &*(self as *const Self).cast::<ArbiterParametersParametersView4>() }
+    }
+}
+
+impl core::ops::Deref for ArbiterParametersParametersView4 {
+    type Target = ArbiterParametersParametersView5;
+    #[inline(always)]
+    fn deref(&self) -> &ArbiterParametersParametersView5 {
+        // SAFETY: vistas do mesmo objeto, mesmo tamanho e alinhamento, só de células.
+        unsafe { &*(self as *const Self).cast::<ArbiterParametersParametersView5>() }
+    }
+}
+
+impl core::ops::Deref for ArbiterParametersParametersView5 {
+    type Target = ArbiterParametersParametersView6;
+    #[inline(always)]
+    fn deref(&self) -> &ArbiterParametersParametersView6 {
+        // SAFETY: vistas do mesmo objeto, mesmo tamanho e alinhamento, só de células.
+        unsafe { &*(self as *const Self).cast::<ArbiterParametersParametersView6>() }
+    }
+}
+
+unsafe impl NtStruct for ArbiterParametersParameters {}
+
+const _: () = {
+    assert!(core::mem::size_of::<ArbiterParametersParameters>() == 0x20);
+    assert!(core::mem::offset_of!(ArbiterParametersParameters, test_allocation) == 0x0);
+    assert!(core::mem::size_of::<ArbiterParametersParametersView1>() == 0x20);
+    assert!(core::mem::align_of::<ArbiterParametersParametersView1>() == core::mem::align_of::<ArbiterParametersParameters>());
+    assert!(core::mem::offset_of!(ArbiterParametersParametersView1, retest_allocation) == 0x0);
+    assert!(core::mem::size_of::<ArbiterParametersParametersView2>() == 0x20);
+    assert!(core::mem::align_of::<ArbiterParametersParametersView2>() == core::mem::align_of::<ArbiterParametersParameters>());
+    assert!(core::mem::offset_of!(ArbiterParametersParametersView2, boot_allocation) == 0x0);
+    assert!(core::mem::size_of::<ArbiterParametersParametersView3>() == 0x20);
+    assert!(core::mem::align_of::<ArbiterParametersParametersView3>() == core::mem::align_of::<ArbiterParametersParameters>());
+    assert!(core::mem::offset_of!(ArbiterParametersParametersView3, query_allocated_resources) == 0x0);
+    assert!(core::mem::size_of::<ArbiterParametersParametersView4>() == 0x20);
+    assert!(core::mem::align_of::<ArbiterParametersParametersView4>() == core::mem::align_of::<ArbiterParametersParameters>());
+    assert!(core::mem::offset_of!(ArbiterParametersParametersView4, query_conflict) == 0x0);
+    assert!(core::mem::size_of::<ArbiterParametersParametersView5>() == 0x20);
+    assert!(core::mem::align_of::<ArbiterParametersParametersView5>() == core::mem::align_of::<ArbiterParametersParameters>());
+    assert!(core::mem::offset_of!(ArbiterParametersParametersView5, query_arbitrate) == 0x0);
+    assert!(core::mem::size_of::<ArbiterParametersParametersView6>() == 0x20);
+    assert!(core::mem::align_of::<ArbiterParametersParametersView6>() == core::mem::align_of::<ArbiterParametersParameters>());
+    assert!(core::mem::offset_of!(ArbiterParametersParametersView6, add_reserved) == 0x0);
+};
+
+/// `_ARBITER_TEST_ALLOCATION_PARAMETERS` (0x18 bytes).
+#[repr(C)]
+pub struct ArbiterTestAllocationParameters {
+    /// -> `_LIST_ENTRY`
+    pub arbitration_list: Field<u64>,
+    pub allocate_from_count: Field<u32>,
+    _pad_c: Reserved<0x4>,
+    /// -> `_CM_PARTIAL_RESOURCE_DESCRIPTOR`
+    pub allocate_from: Field<u64>,
+}
+
+unsafe impl NtStruct for ArbiterTestAllocationParameters {}
+
+const _: () = {
+    assert!(core::mem::size_of::<ArbiterTestAllocationParameters>() == 0x18);
+    assert!(core::mem::offset_of!(ArbiterTestAllocationParameters, arbitration_list) == 0x0);
+    assert!(core::mem::offset_of!(ArbiterTestAllocationParameters, allocate_from_count) == 0x8);
+    assert!(core::mem::offset_of!(ArbiterTestAllocationParameters, allocate_from) == 0x10);
+};
+
+/// `_ARBITER_RETEST_ALLOCATION_PARAMETERS` (0x18 bytes).
+#[repr(C)]
+pub struct ArbiterRetestAllocationParameters {
+    /// -> `_LIST_ENTRY`
+    pub arbitration_list: Field<u64>,
+    pub allocate_from_count: Field<u32>,
+    _pad_c: Reserved<0x4>,
+    /// -> `_CM_PARTIAL_RESOURCE_DESCRIPTOR`
+    pub allocate_from: Field<u64>,
+}
+
+unsafe impl NtStruct for ArbiterRetestAllocationParameters {}
+
+const _: () = {
+    assert!(core::mem::size_of::<ArbiterRetestAllocationParameters>() == 0x18);
+    assert!(core::mem::offset_of!(ArbiterRetestAllocationParameters, arbitration_list) == 0x0);
+    assert!(core::mem::offset_of!(ArbiterRetestAllocationParameters, allocate_from_count) == 0x8);
+    assert!(core::mem::offset_of!(ArbiterRetestAllocationParameters, allocate_from) == 0x10);
+};
+
+/// `_ARBITER_BOOT_ALLOCATION_PARAMETERS` (0x8 bytes).
+#[repr(C)]
+pub struct ArbiterBootAllocationParameters {
+    /// -> `_LIST_ENTRY`
+    pub arbitration_list: Field<u64>,
+}
+
+unsafe impl NtStruct for ArbiterBootAllocationParameters {}
+
+const _: () = {
+    assert!(core::mem::size_of::<ArbiterBootAllocationParameters>() == 0x8);
+    assert!(core::mem::offset_of!(ArbiterBootAllocationParameters, arbitration_list) == 0x0);
+};
+
+/// `_ARBITER_QUERY_ALLOCATED_RESOURCES_PARAMETERS` (0x8 bytes).
+#[repr(C)]
+pub struct ArbiterQueryAllocatedResourcesParameters {
+    /// -> `_CM_PARTIAL_RESOURCE_LIST*`
+    pub allocated_resources: Field<u64>,
+}
+
+unsafe impl NtStruct for ArbiterQueryAllocatedResourcesParameters {}
+
+const _: () = {
+    assert!(core::mem::size_of::<ArbiterQueryAllocatedResourcesParameters>() == 0x8);
+    assert!(core::mem::offset_of!(ArbiterQueryAllocatedResourcesParameters, allocated_resources) == 0x0);
+};
+
+/// `_ARBITER_QUERY_CONFLICT_PARAMETERS` (0x20 bytes).
+#[repr(C)]
+pub struct ArbiterQueryConflictParameters {
+    /// -> `_DEVICE_OBJECT`
+    pub physical_device_object: Field<u64>,
+    /// -> `_IO_RESOURCE_DESCRIPTOR`
+    pub conflicting_resource: Field<u64>,
+    /// -> `u32`
+    pub conflict_count: Field<u64>,
+    /// -> `_ARBITER_CONFLICT_INFO*`
+    pub conflicts: Field<u64>,
+}
+
+unsafe impl NtStruct for ArbiterQueryConflictParameters {}
+
+const _: () = {
+    assert!(core::mem::size_of::<ArbiterQueryConflictParameters>() == 0x20);
+    assert!(core::mem::offset_of!(ArbiterQueryConflictParameters, physical_device_object) == 0x0);
+    assert!(core::mem::offset_of!(ArbiterQueryConflictParameters, conflicting_resource) == 0x8);
+    assert!(core::mem::offset_of!(ArbiterQueryConflictParameters, conflict_count) == 0x10);
+    assert!(core::mem::offset_of!(ArbiterQueryConflictParameters, conflicts) == 0x18);
+};
+
+/// `_ARBITER_QUERY_ARBITRATE_PARAMETERS` (0x8 bytes).
+#[repr(C)]
+pub struct ArbiterQueryArbitrateParameters {
+    /// -> `_LIST_ENTRY`
+    pub arbitration_list: Field<u64>,
+}
+
+unsafe impl NtStruct for ArbiterQueryArbitrateParameters {}
+
+const _: () = {
+    assert!(core::mem::size_of::<ArbiterQueryArbitrateParameters>() == 0x8);
+    assert!(core::mem::offset_of!(ArbiterQueryArbitrateParameters, arbitration_list) == 0x0);
+};
+
+/// `_ARBITER_ADD_RESERVED_PARAMETERS` (0x8 bytes).
+#[repr(C)]
+pub struct ArbiterAddReservedParameters {
+    /// -> `_DEVICE_OBJECT`
+    pub reserve_device: Field<u64>,
+}
+
+unsafe impl NtStruct for ArbiterAddReservedParameters {}
+
+const _: () = {
+    assert!(core::mem::size_of::<ArbiterAddReservedParameters>() == 0x8);
+    assert!(core::mem::offset_of!(ArbiterAddReservedParameters, reserve_device) == 0x0);
+};
+
 /// `_DMA_ADAPTER` (0x10 bytes).
 #[repr(C)]
 pub struct DmaAdapter {
