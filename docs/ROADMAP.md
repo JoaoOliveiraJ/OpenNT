@@ -17,7 +17,7 @@ O OpenNT avança em fases. Cada fase termina com o kernel compilando, iniciando 
 
 **Marco atual.** O NtUserInitialize do csrss.exe real volta com sucesso: o dxgkrnl.sys inicia o BasicDisplay.sys pela sessão do win32k e o InitVideo da sessão 0 monta a configuração de exibição sobre o dispositivo desconectado do win32k.
 
-**Próximo.** O wininit.exe criar a WinSta0 com as Desktops Winlogon e Default (WINSTA0_OK): o NtUserCreateWindowStation faz callbacks ao user32 do wininit, que precisa dos recursos do user32.dll.mui no idioma da interface (en-US no convidado; esta máquina só tem pt-BR).
+**Próximo.** O NtUserCreateDesktopEx da Desktop Winlogon voltar (a thread da Desktop do csrss responder às mensagens do xxxCreateDesktopEx do wininit e do xxxSwitchDesktop da RawInputThread), a Desktop Default (WINSTA0_OK) e depois as Desktops do winlogon.exe da sessão 1 com o primeiro desenho do win32k no framebuffer.
 
 Hoje: **49 de 79** binários da Microsoft rodam (28 parciais); o kernel exporta **2.078 dos 3.070** nomes do `ntoskrnl.exe` do Windows 10 22H2 (67,7%). Detalhes em [O que roda](site/o-que-roda.html), [Componentes](site/componentes.html), [Exports](site/ntoskrnl.html) e [Testes](site/testes.html).
 

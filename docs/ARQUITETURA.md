@@ -2724,11 +2724,27 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   NtSetInformationWorkerFactory) responde que a fábrica ainda cresce. No
   CreateWindowStationW, o user32 abre o kbdus.dll e o NtUserCreateWindowStation
   manda ao csrss um pedido síncrono de kernel direto à porta de conexão
-  `\Windows\ApiPort` (`server::connection_request`); o csrss responde, mas
-  o NtUserCreateWindowStation ainda falha: nos callbacks ao user32 do
-  wininit, o carregador de recursos procura o `en-US\USER32.dll.mui` (o
-  idioma da interface do convidado), que esta máquina não tem (só pt-BR),
-  e o wininit sai com ERROR_MUI_FILE_NOT_LOADED. O smss da sessão 1 cria o
+  `\Windows\ApiPort` (`server::connection_request`). O idioma do convidado
+  é o desta instalação (o xtask copia o `Control\Nls\Language`, o
+  `Control\MUI\UILanguages` e o perfil de idioma da DEFAULT do Registro
+  desta máquina, e põe no volume os `.mui` dos programas nos idiomas de
+  interface daqui; o kernel lê o `Control\Nls\Language` no boot,
+  `ps/locale.rs`): os callbacks ao user32 do wininit acham o
+  `<idioma>\USER32.dll.mui`. O ConvertHandleAndVerifyLoc do win32kbase
+  confere o layout de teclado pelo nome do ObQueryNameString do
+  FILE_OBJECT (a QueryNameProcedure do tipo File, `io/file/information.rs`,
+  com o FileName do caminho da abertura) contra o `\SystemRoot\System32\`
+  e o reabre pelo dispositivo (o alias de System32 do volume de boot vale
+  também nessa abertura), e o NtUserCreateWindowStation devolve a WinSta0.
+  O SetDefaultWinstaSecurity põe a DACL com o GenericMapping e o
+  ValidAccessMask que o win32k gravou no TypeInfo do tipo WindowStation (o
+  Ob lê o TypeInfo corrente, `ob/object_types.rs`), e o CreateDesktopW abre a
+  Desktop Winlogon pela ParseProcedure da WinSta0. O NtUserCreateDesktopEx
+  ainda não volta: o xxxCreateDesktopEx do wininit e o xxxSwitchDesktop da
+  RawInputThread do csrss mandam mensagens (xxxSetWindowPos ->
+  xxxInterSendMsgEx) e esperam a resposta em xxxRealSleepThread, e a thread
+  da Desktop do csrss segue parada no LegacyInputDispatcher::WaitAndDispatch
+  sem ser acordada. O smss da sessão 1 cria o
   csrss e o winlogon.exe (o NtOpenSection relativo ao `\KnownDlls`, aberto
   pela tabela do Object Manager, e o powrprof.dll e o imm32.dll no
   volume). O marcador `WINSTA0_OK`
@@ -3227,8 +3243,9 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   `USER_INITIALIZED` (o NtUserInitialize do csrss volta com sucesso,
   `initial_process::win32k_service_returned`; no mesmo teste) e
   `WINSTA0_OK` (o wininit.exe com as Desktops Winlogon e Default da
-  WinSta0; ainda não sai: o wininit para no NtUserCreateWindowStation, sem
-  o USER32.dll.mui do idioma da interface);
+  WinSta0; ainda não sai: a Desktop Winlogon é criada, mas o
+  NtUserCreateDesktopEx não volta, com o wininit e a RawInputThread
+  esperando a resposta de mensagens à thread da Desktop do csrss);
   os de falha são `*** PANIC`, `*** EXCECAO`, `SELFTEST FALHOU` e `*** STOP`
   (a parada do KeBugCheckEx; com `--expect-stop` o STOP faz parte do teste,
   como no `bugcheck`). O `test-boot` procura falhas desde o boot até

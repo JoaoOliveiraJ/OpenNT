@@ -1479,7 +1479,7 @@ notas = "Uma suíte planejada conta como pronta quando o arquivo de teste de mes
 [marco]
 atual = "O NtUserInitialize do csrss.exe real volta com sucesso: o dxgkrnl.sys inicia o BasicDisplay.sys pela sessão do win32k e o InitVideo da sessão 0 monta a configuração de exibição sobre o dispositivo desconectado do win32k."
 teste = "win32k-display"
-proximo = "O wininit.exe criar a WinSta0 com as Desktops Winlogon e Default (WINSTA0_OK): o NtUserCreateWindowStation faz callbacks ao user32 do wininit, que precisa dos recursos do user32.dll.mui no idioma da interface (en-US no convidado; esta máquina só tem pt-BR)."
+proximo = "O NtUserCreateDesktopEx da Desktop Winlogon voltar (a thread da Desktop do csrss responder às mensagens do xxxCreateDesktopEx do wininit e do xxxSwitchDesktop da RawInputThread), a Desktop Default (WINSTA0_OK) e depois as Desktops do winlogon.exe da sessão 1 com o primeiro desenho do win32k no framebuffer."
 
 [[roda]]
 nome = "O smss.exe cria o csrss.exe"
@@ -1498,7 +1498,7 @@ nome = "Adaptador de vídeo iniciado"
 grupo = "marco"
 teste = "win32k-display"
 faz = "Com o BasicDisplay.sys sobre o dxgkrnl.sys, a sessão do win32k faz o dxgkrnl iniciar o adaptador, que usa o framebuffer VBE 1024x768 e cria o \\Device\\Video0; o InitVideo da sessão 0 termina e o NtUserInitialize do csrss volta com sucesso."
-para = "O csrss segue: cria a \\Windows\\SbApiPort, o smss executa o wininit.exe e o winlogon.exe da sessão 1, e o wininit para no NtUserCreateWindowStation da WinSta0 (o user32 sem o user32.dll.mui)."
+para = "O csrss segue: cria a \\Windows\\SbApiPort, o smss executa o wininit.exe e o winlogon.exe da sessão 1, o wininit cria a WinSta0 e a Desktop Winlogon, e o NtUserCreateDesktopEx não volta (o wininit e a RawInputThread esperam a resposta da thread da Desktop do csrss)."
 
 [[roda]]
 nome = "Tela de bugcheck do Windows 10"
