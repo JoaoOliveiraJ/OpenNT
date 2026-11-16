@@ -368,6 +368,44 @@ entre duas barreiras): cada uma vê em gs:[188h] a própria thread, e dela o
 próprio processo e TID, e o PsGetCurrentThread do BSP no meio da janela
 devolve a dele.
 
+**Identidade de cada CPU.** Cada processador monta a própria KPRCB com o
+próprio CPUID, como o ntoskrnl 19041 no boot de cada CPU
+(`ke/processor_identity.rs`): o BSP logo depois de `pcr::init`, cada AP por
+um job depois de `smp::init`. São o KiGetCpuVendor (VendorString e
+CpuVendor: 1 AMD/Hygon, 2 Intel, 3 Centaur), o KiGetProcessorSignature
+(CpuType, CpuStep, CpuID), o KiSetProcessorSignature (o FeatureBits de 64
+bits pela KiCpuFeatureTable — 47 testes de bit do CPUID com filtro de
+fabricante, iguais aos do ntoskrnl 19041 — e pelas tabelas de MSR do
+IA32_ARCH_CAPABILITIES; os bits do segundo conjunto em KeFeatureBits2;
+ProcessorFlags e ProcessorSignature), o KiSetFeatureBits (os recursos
+exigidos, o bit do fabricante, SLAT e firmware de virtualização,
+InitialApicId, CFlushSize, lógicos por núcleo e núcleos por pacote pelas
+folhas 0x1F/0xB/4/1 ou 0x80000008/0x8000001E, ApicMask, UpdateSignature e o
+IA32_TSC_AUX), o KiSetCacheInformation (Cache[], CacheCount, o L2 da KPCR,
+KeLargestCacheLine e KiLargestCacheSize) e a frequência (MHz e
+StallScaleFactor). Com todos online, os conjuntos do KiInitializeKernel:
+PackageProcessorSet, PackageId, CoreProcessorSet e CacheProcessorMask. O
+KeFeatureBits é o FeatureBits do BSP com o NX (EFER.NXE) e o XSTATE (que o
+OpenNT não habilita: só FXSAVE); dele saem os PF_* da KUSER_SHARED_DATA pela
+lista do KiInitializeKernel e do KiPublishProcessorFeatures, o
+SystemProcessorInformation e o SystemProcessorFeaturesInformation. O
+KeQueryLogicalProcessorRelationship, o SystemLogicalProcessorInformation
+(o KeBuildLogicalProcessorSystemInformation) e o
+NtQuerySystemInformationEx(107) de modo usuário leem essas KPRCBs, e o
+KeQueryPrcbAddress devolve a de cada processador. O que o binário muda na
+CPU nessa passagem e o OpenNT não repete — CR4 (SMEP, FSGSBASE, SMAP, UMIP,
+PCIDE), EFER.FFXSR, MSRs de SYSENTER, MISC_ENABLE e DE_CFG — fica de fora, e
+SMEP e FSGSBASE só entram no FeatureBits com o bit do CR4 ligado, como no
+NT, que os liga juntos. Os conjuntos KAFFINITY_EX (Initialize, Add/Remove/
+CheckProcessor, IsEmpty, IsEqual, Copy, Or, And, AddGroup, CountSetBits), o
+KeFindFirstSetLeftGroupAffinity, o KeQueryActiveProcessorAffinity e o
+KeEnumerateNextProcessor, que os drivers de energia do processador
+(processr.sys, amdppm.sys, intelppm.sys) importam, seguem as rotinas do
+binário em `ke/affinity_set.rs`. O autoteste
+`ntos/test/multiprocess/processor_identity.rs` confere cada KPRCB com o
+CPUID do próprio processador, os PF_* com o CPUID (e a visão de usuário que
+o IsProcessorFeaturePresent lê) e as consultas pela chamada de sistema.
+
 **IPIs medidos em tempo.** Toda espera de resposta a um IPI (`ke/smp.rs`:
 o ICR voltar a ocioso depois do envio e as confirmações do shootdown de
 TLB) passa por `smp::stall_on_targets`, que compara o TSC (o contador do
