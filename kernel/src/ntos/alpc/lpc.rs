@@ -23,12 +23,29 @@
 //!   MaxMessageLength recebe o da porta. As vistas de seção do LPC
 //!   (ClientView/ServerView) ainda não são montadas nesta entrada:
 //!   STATUS_NOT_SUPPORTED, com registro.
+//!
+//! E o lado servidor de modo kernel, o do servidor de comandos do Reference
+//! Monitor (`se/reference_monitor.rs`):
+//!
+//! - ZwCreatePort ([`create_port`]): a porta de conexão LPC com nome
+//!   (LPC_MODE e ALLOW_LPC_REQUESTS) e o handle de kernel;
+//! - ZwReplyWaitReceivePort ([`reply_wait_receive_port`]): a resposta ao
+//!   pedido anterior e a próxima mensagem, com o PortContext, numa espera de
+//!   kernel sem prazo (a thread sai das prontas até chegar uma mensagem);
+//! - ZwAcceptConnectPort ([`accept_connect_port`]): a aceitação ou a recusa
+//!   da conexão do PORT_MESSAGE, com o REMOTE_PORT_VIEW do cliente; o
+//!   PORT_VIEW do servidor não é oferecido nesta entrada
+//!   (STATUS_NOT_SUPPORTED, com registro);
+//! - ZwCompleteConnectPort ([`complete_connect_port`]): no 19041 só devolve
+//!   STATUS_SUCCESS, porque a aceitação já acorda o cliente.
 
 use alloc::sync::Arc;
 
 use crate::ntos::alpc::kernel_entry::{self, Completed, Pending};
+use crate::ntos::alpc::port_reference;
+use crate::ntos::alpc::server::{self, LegacyViews};
 use crate::ntos::inc::field::{Field, NtStruct};
-use crate::ntos::inc::types::{AlpcPortAttributes, PortMessage, SecurityQualityOfService};
+use crate::ntos::inc::types::{AlpcPortAttributes, PortMessage, RemotePortView, SecurityQualityOfService};
 use crate::ntos::ke::critical_region;
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::ob::objects::port::{self as port_objects, Port};
@@ -155,4 +172,57 @@ fn port_maximum(handle: u64) -> Option<u32> {
     let maximum = reference.port.maximum();
     let _ = reference.release();
     Some(maximum)
+}
+
+// ---- o lado servidor de modo kernel -----------------------------------------
+
+/// ZwCreatePort(PortHandle*, ObjectAttributes, MaxConnectionInfoLength,
+/// MaxMessageLength, MaxPoolUsage): o NtCreatePort em KernelMode. O
+/// MaxConnectionInfoLength e o MaxPoolUsage não entram, como no 19041.
+/// Devolve o NTSTATUS.
+pub fn create_port(out: u64, attributes: u64, maximum_message_length: u32) -> Result<u32, KernelError> {
+    server::create_legacy_port(out, attributes, maximum_message_length, false, 0)
+}
+
+/// ZwReplyWaitReceivePort(PortHandle, PortContext*, ReplyMessage,
+/// ReceiveMessage) numa porta de servidor LPC de kernel. A porta fica
+/// referenciada durante a espera. Devolve o NTSTATUS.
+pub fn reply_wait_receive_port(handle: u64, port_context: u64, reply: u64, receive: u64) -> Result<u32, KernelError> {
+    let mut reference = match port_reference::reference(handle, 0, 0)? {
+        Ok(reference) => reference,
+        Err(status) => return Ok(status),
+    };
+    let port = reference.port.clone();
+    let status = match port.run(|| server::begin_kernel_legacy_receive(&port, reply, receive, port_context)) {
+        Ok(pending) => Ok(kernel_entry::drive(pending)),
+        Err(error) => Err(error),
+    };
+    let _ = reference.release();
+    status
+}
+
+/// ZwAcceptConnectPort(PortHandle*, PortContext, ConnectionRequest,
+/// AcceptConnection, ServerView, ClientView) em KernelMode. Devolve o
+/// NTSTATUS.
+pub fn accept_connect_port(out: u64, port_context: u64, request: u64, accept: bool, server_view: u64, client_view: u64) -> Result<u32, KernelError> {
+    if server_view != 0 {
+        crate::debug_print!("[lpc] ZwAcceptConnectPort com PORT_VIEW do servidor (sem suporte)");
+        return Ok(STATUS_NOT_SUPPORTED);
+    }
+    let accepted = match server::accept_legacy(out, port_context, request, accept, LegacyViews { server_section: None }, 0)? {
+        Ok(accepted) => accepted,
+        Err(status) => return Ok(status),
+    };
+    if accept && client_view != 0 {
+        // SAFETY: PREMOTE_PORT_VIEW do chamador de kernel.
+        let target = unsafe { RemotePortView::at(client_view) };
+        target.view_size.set(accepted.client_view.as_ref().map_or(0, |view| view.size));
+        target.view_base.set(accepted.client_view.as_ref().map_or(0, |view| view.base));
+    }
+    Ok(0)
+}
+
+/// ZwCompleteConnectPort(PortHandle): STATUS_SUCCESS, como o 19041.
+pub fn complete_connect_port(_handle: u64) -> u32 {
+    0
 }

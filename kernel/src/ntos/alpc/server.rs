@@ -716,9 +716,10 @@ pub struct LegacyAccepted {
 /// a aceitação cria a porta de comunicação do servidor (com o PortContext e o
 /// handle em `out`), expõe a vista do cliente no servidor, mapeia a seção do
 /// servidor nele e no cliente e responde ao cliente com os dados do
-/// PORT_MESSAGE. Devolve o NTSTATUS e as vistas.
-pub fn accept_legacy(out: u64, port_context: u64, request: u64, accept: bool, views: LegacyViews) -> Result<Result<LegacyAccepted, u32>, KernelError> {
-    let header = match message_buffer::capture_message_with(request, u16::MAX as u32, 1, true) {
+/// PORT_MESSAGE. Devolve o NTSTATUS e as vistas. Em KernelMode (`mode` 0, o
+/// ZwAcceptConnectPort) os buffers não são sondados e o handle é de kernel.
+pub fn accept_legacy(out: u64, port_context: u64, request: u64, accept: bool, views: LegacyViews, mode: u8) -> Result<Result<LegacyAccepted, u32>, KernelError> {
+    let header = match message_buffer::capture_message_with(request, u16::MAX as u32, mode, true) {
         Ok(captured) => captured,
         Err(status) => return Ok(Err(status)),
     };
@@ -746,7 +747,7 @@ pub fn accept_legacy(out: u64, port_context: u64, request: u64, accept: bool, vi
         kernel_entry::notify_waiters();
         return Ok(Ok(LegacyAccepted::default()));
     }
-    if !state::probe_user_write(out, 8) {
+    if mode != 0 && !state::probe_user_write(out, 8) {
         return Ok(Err(STATUS_ACCESS_VIOLATION));
     }
     let mut accepted = LegacyAccepted::default();
@@ -771,7 +772,7 @@ pub fn accept_legacy(out: u64, port_context: u64, request: u64, accept: bool, vi
         };
         accepted.server_view = Some((local, remote));
     }
-    let status = establish(&server, &pending, out, port_context, 0, 1, header.data.clone(), &accepted)?;
+    let status = establish(&server, &pending, out, port_context, 0, mode, header.data.clone(), &accepted)?;
     if status != STATUS_SUCCESS {
         if let Some((local, remote)) = accepted.server_view.take() {
             let _ = sections::unmap(&local, None);
@@ -919,12 +920,15 @@ const WAITABLE_PORT: u32 = 0x4_0000;
 /// atributos padrão do LPC (Flags LPC_MODE|ALLOW_LPC_REQUESTS, mais
 /// WAITABLE_PORT na esperável) e o MaxMessageLength dado, que não passa do
 /// LpcLegacyMaxMessageLength (STATUS_INVALID_PARAMETER). O
-/// MaxConnectionInfoLength e o MaxPoolUsage não entram, como no 19041.
-pub fn create_legacy_port(out: u64, attributes: u64, maximum_message_length: u32, waitable: bool) -> Result<u32, KernelError> {
-    if !state::probe_user_write(out, 8) || (attributes != 0 && !state::probe_user_read(attributes, ObjectAttributes::SIZE)) {
+/// MaxConnectionInfoLength e o MaxPoolUsage não entram, como no 19041. Em
+/// KernelMode (`mode` 0, o ZwCreatePort do servidor de comandos do
+/// Reference Monitor) o OBJECT_ATTRIBUTES de kernel não é sondado e o handle
+/// vem do ObOpenObjectByPointer.
+pub fn create_legacy_port(out: u64, attributes: u64, maximum_message_length: u32, waitable: bool, mode: u8) -> Result<u32, KernelError> {
+    if mode != 0 && (!state::probe_user_write(out, 8) || (attributes != 0 && !state::probe_user_read(attributes, ObjectAttributes::SIZE))) {
         return Ok(STATUS_ACCESS_VIOLATION);
     }
-    let name = match port_name(attributes) {
+    let name = match if mode != 0 { port_name(attributes) } else { kernel_port_name(attributes) } {
         Ok(name) => name,
         Err(status) => return Ok(status),
     };
@@ -932,7 +936,7 @@ pub fn create_legacy_port(out: u64, attributes: u64, maximum_message_length: u32
         return Ok(STATUS_INVALID_PARAMETER);
     }
     let port_flags = LPC_MODE | ALLOW_LPC_REQUESTS | if waitable { WAITABLE_PORT } else { 0 };
-    create_listener(out, attributes, name, PortState { role: Role::Listener, port_flags, ..PortState::default() }, maximum_message_length, 1)
+    create_listener(out, attributes, name, PortState { role: Role::Listener, port_flags, ..PortState::default() }, maximum_message_length, mode)
 }
 
 /// A porta de conexão com o servidor: o nó AlpcPort do nome (o diretório pai
@@ -1195,6 +1199,44 @@ impl crate::ntos::alpc::kernel_entry::Pending for ConnectionRequest {
         state.requests.remove(&self.id);
         state.senders.remove(&self.id);
     }
+}
+
+/// ZwReplyWaitReceivePort(PortHandle, PortContext*, ReplyMessage,
+/// ReceiveMessage) numa porta de servidor LPC de kernel (o
+/// AlpcpReceiveLegacyMessage em KernelMode): a resposta `reply` ao pedido do
+/// MessageId dela, depois a próxima mensagem da fila em `receive`, com o
+/// Type sem os bits internos e o PortContext da porta de comunicação em
+/// `port_context`; os buffers do chamador não são sondados e a espera é a
+/// continuação de kernel, sem prazo.
+pub fn begin_kernel_legacy_receive(port: &Arc<Port>, reply: u64, receive: u64, port_context: u64) -> Result<Box<dyn crate::ntos::alpc::kernel_entry::Pending>, KernelError> {
+    use crate::ntos::alpc::kernel_entry::Completed;
+    use crate::ntos::alpc::kernel_wait;
+    let Some(server) = server_of(port) else { return Ok(Box::new(Completed(STATUS_INVALID_PORT_HANDLE))) };
+    if reply != 0 {
+        let status = send_reply(&server, reply, 0);
+        if status != 0 {
+            return Ok(Box::new(Completed(status)));
+        }
+    }
+    if receive == 0 {
+        return Ok(Box::new(Completed(STATUS_SUCCESS)));
+    }
+    let buffer = match message_buffer::capture_length(receive, 0, 0) {
+        Ok(buffer) => buffer,
+        Err(status) => return Ok(Box::new(Completed(status))),
+    };
+    let timeout = match kernel_wait::capture_timeout(0, 0) {
+        Ok(timeout) => timeout,
+        Err(status) => return Ok(Box::new(Completed(status))),
+    };
+    let options = ReceiveOptions { legacy: server.legacy(), port_context, connections_only: false };
+    if let Some(status) = receive_one(&server, &buffer, 0, options) {
+        return Ok(Box::new(Completed(status)));
+    }
+    let waiting = server.clone();
+    let operation = kernel_wait::Operation { poll: Box::new(move || receive_one(&waiting, &buffer, 0, options)), cleanup: Box::new(|_| {}) };
+    let request = kernel_wait::begin(operation, timeout, 0, false)?;
+    Ok(Box::new(request))
 }
 
 /// ZwAlpcSendWaitReceivePort na porta de conexão ou de comunicação de um

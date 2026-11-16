@@ -156,7 +156,7 @@ pub fn kernel_service_handle(handle: u64) -> bool {
 /// NtCreatePort/NtCreateWaitablePort(PortHandle*, ObjectAttributes,
 /// MaxConnectionInfoLength, MaxMessageLength, MaxPoolUsage).
 pub fn create_port(out: u64, attributes: u64, maximum_message_length: u32, waitable: bool) -> Result<u32, KernelError> {
-    state::guarded(|| server::create_legacy_port(out, attributes, maximum_message_length, waitable))
+    state::guarded(|| server::create_legacy_port(out, attributes, maximum_message_length, waitable, 1))
 }
 
 // ---- NtSecureConnectPort -----------------------------------------------------
@@ -557,7 +557,7 @@ fn accept_captured(out: u64, port_context: u64, request: u64, accept: bool, serv
         views.server_section = Some((section, view.section_offset.probe_get()? as u64, view.view_size.probe_get()?));
         section_reference = Some(reference);
     }
-    let accepted = server::accept_legacy(out, port_context, request, accept, views);
+    let accepted = server::accept_legacy(out, port_context, request, accept, views, 1);
     if let Some(reference) = section_reference {
         let _ = reference.release();
     }

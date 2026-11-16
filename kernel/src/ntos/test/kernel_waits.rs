@@ -18,6 +18,12 @@
 //!   o servidor cria a porta e espera a conexão, aceita, espera o pedido e
 //!   responde; o cliente conecta e manda o pedido síncrono, e as duas
 //!   esperas bloqueiam de fato até a outra thread agir;
+//! - o mesmo par no LPC de modo kernel (o servidor de comandos do Reference
+//!   Monitor): o servidor cria a porta pelo ZwCreatePort e recebe a conexão
+//!   (com os dados de conexão do cliente) pelo ZwReplyWaitReceivePort, aceita
+//!   com um PortContext, recebe o pedido com esse PortContext e responde na
+//!   chamada seguinte; o cliente conecta pelo ZwSecureConnectPort (o
+//!   MaxMessageLength 0x200 da porta) e manda o pedido síncrono;
 //! - o tick que não aninha: um processo de kernel em execução que é dado como
 //!   pronto continua em execução (não entra na fila), e a espera dele deixa a
 //!   CPU sem girar o escalonador na pilha dele; ela vence pelo prazo com
@@ -35,6 +41,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::phase6::{call_export, kernel_handle_attributes, object_attributes_for, port_message_with, unicode_string_for};
+use crate::ntos::alpc::lpc;
 use crate::ntos::inc::types::{Kevent, Kqueue, Kthread, NtStruct, PortMessage};
 use crate::ntos::ke::{clock, dispatcher, thread_dispatch, wait};
 use crate::ntos::mm::guest_memory as guest;
@@ -365,6 +372,105 @@ fn alpc_kernel_pair(assert: Assert) {
     guest::free_bytes(block);
 }
 
+// ---- par LPC de kernel ----------------------------------------------------
+
+/// A porta do par LPC; o bloco usa os mesmos campos do par ALPC.
+const LPC_PAIR_NAME: &str = "\\OpenNtLpcPair";
+
+extern "win64" fn lpc_server(block: u64) {
+    let (server_out, communication_out, context, receive, reply) = (block, block + 8, block + 0x10, block + 0x100, block + 0x300);
+    let object_attributes = object_attributes_for(block + 0x700, LPC_PAIR_NAME, 0x200);
+    let created = lpc::create_port(server_out, object_attributes, 0x200).unwrap_or(u32::MAX);
+    record(block, 0, created as u64);
+    call_export("KeSetEvent", &[block + 0x28, 0, 0]);
+    if created != 0 {
+        return;
+    }
+    let server = guest::read64(server_out);
+    // SAFETY: PORT_MESSAGE recebido.
+    let message = unsafe { PortMessage::at(receive) };
+    // A conexão: o ZwReplyWaitReceivePort bloqueia até o cliente conectar.
+    let me = process::get_current_thread();
+    let before = context_switches(me);
+    let connection = lpc::reply_wait_receive_port(server, context, 0, receive).unwrap_or(u32::MAX);
+    record(block, 10, context_switches(me).wrapping_sub(before));
+    record(block, 1, connection as u64);
+    record(block, 2, (message.u2.s2.type_.get() as u64 & 0xFF) << 32 | guest::read32(receive + 0x28) as u64);
+    let accepted = lpc::accept_connect_port(communication_out, 0xC0DE, receive, true, 0, 0).unwrap_or(u32::MAX);
+    record(block, 3, accepted as u64 | (lpc::complete_connect_port(guest::read64(communication_out)) as u64) << 32);
+    // O pedido, com o PortContext da porta de comunicação.
+    let request = lpc::reply_wait_receive_port(server, context, 0, receive).unwrap_or(u32::MAX);
+    record(block, 4, request as u64);
+    record(block, 5, (message.u2.s2.type_.get() as u64 & 0xFF) << 32 | guest::read32(receive + 0x28) as u64);
+    record(block, 12, guest::read64(context));
+    // A resposta vai na chamada seguinte, sem recepção.
+    port_message_with(reply, b"PONG");
+    // SAFETY: PORT_MESSAGE montado acima.
+    unsafe { PortMessage::at(reply) }.message_id.set(message.message_id.get());
+    let replied = lpc::reply_wait_receive_port(server, context, reply, 0).unwrap_or(u32::MAX);
+    record(block, 6, replied as u64);
+}
+
+extern "win64" fn lpc_client(block: u64) {
+    let (client_out, maximum, information, information_length, exchange, length) = (block + 0x20, block + 0x50, block + 0x58, block + 0x68, block + 0x500, block + 0x18);
+    let ready = call_export("KeWaitForSingleObject", &[block + 0x28, 0, 0, 0, 0]).unwrap_or(u64::MAX);
+    if ready != 0 || guest::read64(block + RESULTS) != 0 {
+        record(block, 7, ready | 0x1_0000_0000);
+        return;
+    }
+    let name = guest::read64(block + 0x800);
+    guest::write_bytes(information, b"HELO");
+    guest::write32(information_length, 4);
+    let connected = lpc::secure_connect_port(client_out, name, 0, 0, 0, 0, maximum, information, information_length).unwrap_or(u32::MAX);
+    record(block, 7, connected as u64 | (guest::read32(maximum) as u64) << 32);
+    if connected != 0 {
+        return;
+    }
+    let client = guest::read64(client_out);
+    port_message_with(exchange, b"PING");
+    guest::write64(length, 0x200);
+    let me = process::get_current_thread();
+    let before = context_switches(me);
+    let exchanged = call_export("ZwAlpcSendWaitReceivePort", &[client, 0x2_0000, exchange, 0, exchange, length, 0, 0]).unwrap_or(u64::MAX);
+    record(block, 11, context_switches(me).wrapping_sub(before));
+    record(block, 8, exchanged);
+    record(block, 9, guest::read32(exchange + 0x28) as u64);
+    call_export("ZwClose", &[client]);
+}
+
+/// O lado servidor LPC de modo kernel (o do servidor de comandos do Reference
+/// Monitor): ZwCreatePort, ZwReplyWaitReceivePort, ZwAcceptConnectPort e
+/// ZwCompleteConnectPort numa thread de sistema, com um cliente de kernel
+/// (ZwSecureConnectPort e o pedido síncrono) noutra.
+fn lpc_kernel_pair(assert: Assert) {
+    let block = guest::alloc_bytes(0xA00);
+    guest::write_bytes(block, &alloc::vec![0; 0xA00]);
+    for index in 0..13 {
+        record(block, index, PENDING_RESULT);
+    }
+    dispatcher::initialize_event(block + 0x28, 0, false);
+    let name = unicode_string_for(LPC_PAIR_NAME);
+    guest::write64(block + 0x800, name);
+    let (server_handle, server) = start(lpc_server, block);
+    let (client_handle, client) = start(lpc_client, block);
+    let finished = server != 0 && client != 0 && pump(20_000, &|| kernel_threads::is_terminated(server) && kernel_threads::is_terminated(client));
+    let results: Vec<u64> = (0..13).map(|index| guest::read64(block + RESULTS + index * 8)).collect();
+    let parked = results[10] != PENDING_RESULT && results[10] > 0 && results[11] != PENDING_RESULT && results[11] > 0;
+    debug_print!("[kwait] par LPC: {:x?}", results);
+    let word = |bytes: &[u8; 4]| u32::from_le_bytes(*bytes) as u64;
+    assert(
+        finished && parked && results[0] == 0 && results[1] == 0 && results[2] == (10 << 32 | word(b"HELO")) && results[3] == 0 && results[4] == 0 && results[5] == (1 << 32 | word(b"PING")) && results[12] == 0xC0DE && results[6] == 0 && results[7] == 0x200 << 32 && results[8] == 0 && results[9] == word(b"PONG"),
+        "kwait: servidor LPC de kernel (ZwCreatePort, ZwReplyWaitReceivePort, ZwAcceptConnectPort) e cliente de kernel: conexao com dados, PortContext no pedido, resposta pela recepcao seguinte",
+    );
+    let _ = call_export("ZwClose", &[guest::read64(block + 8)]);
+    let _ = call_export("ZwClose", &[guest::read64(block)]);
+    for handle in [server_handle, client_handle] {
+        let _ = object_manager::close(handle as u32);
+    }
+    guest::free_bytes(name);
+    guest::free_bytes(block);
+}
+
 // ---- o tick que não aninha ------------------------------------------------
 
 /// [0] status da espera, [1] estado da thread depois de ser dada como
@@ -620,6 +726,7 @@ pub fn run(assert: Assert) {
     queue_ping_pong(assert);
     nested_tick(assert);
     alpc_kernel_pair(assert);
+    lpc_kernel_pair(assert);
     shared_queue_waiters(assert, true);
     shared_queue_waiters(assert, false);
 }
