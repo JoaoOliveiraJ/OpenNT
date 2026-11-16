@@ -181,6 +181,10 @@ const NTFS_FILES: &[(&str, &str)] = &[
         "Windows/System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package0519~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
         "System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package0519~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
     ),
+    // A pilha NVMe que o PnP sobe com `--storage=nvme`: o miniport
+    // stornvme.sys e o driver de porta storport.sys, que ele importa.
+    ("STORPORT.SYS", "System32/drivers/storport.sys"),
+    ("STORNVME.SYS", "System32/drivers/stornvme.sys"),
     // O fastfat.sys real (`--start-driver=fastfat`) e o catálogo que o cobre.
     ("FASTFAT.SYS", "System32/drivers/fastfat.sys"),
     (

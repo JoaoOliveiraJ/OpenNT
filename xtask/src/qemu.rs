@@ -77,7 +77,8 @@ pub fn find_qemu() -> Result<PathBuf, String> {
     Err("QEMU nao encontrado: defina a variavel QEMU com o caminho de qemu-system-x86_64".into())
 }
 
-/// Os discos da máquina: o de boot (`os.img`) e o volume NTFS de dados.
+/// Os discos da máquina: o de boot (`os.img`), o volume NTFS de dados e o
+/// disco do controlador NVMe (`--storage=nvme`).
 pub struct Disks {
     pub boot: PathBuf,
     pub data: Option<PathBuf>,
@@ -85,15 +86,26 @@ pub struct Disks {
     /// arquivo temporário do QEMU, e a imagem fica como o build a deixou
     /// (várias execuções dividem a mesma).
     pub data_snapshot: bool,
+    pub nvme: Option<PathBuf>,
+    /// O disco NVMe com `snapshot=on`, pelo mesmo motivo; a cópia gravável
+    /// do volume num religamento não muda o disco NVMe.
+    pub nvme_snapshot: bool,
 }
 
 impl Disks {
     /// Os discos de uma pasta de build: o `ntfs.img` ao lado da imagem de
-    /// boot, quando gerado, gravável.
-    pub fn beside(image: &Path) -> Disks {
+    /// boot, quando gerado, gravável; o `nvme.img` com `--storage=nvme`.
+    pub fn beside(image: &Path, storage: &str) -> Disks {
         let ntfs = image.with_file_name("ntfs.img");
-        Disks { boot: image.to_path_buf(), data: ntfs.exists().then_some(ntfs), data_snapshot: false }
+        Disks { boot: image.to_path_buf(), data: ntfs.exists().then_some(ntfs), data_snapshot: false, nvme: nvme_disk(image, storage), nvme_snapshot: false }
     }
+}
+
+/// O `nvme.img` ao lado da imagem de boot, para uma máquina com
+/// `--storage=nvme`.
+pub fn nvme_disk(image: &Path, storage: &str) -> Option<PathBuf> {
+    let nvme = image.with_file_name(crate::build::NVME_IMAGE);
+    (storage == "nvme" && nvme.exists()).then_some(nvme)
 }
 
 /// Os argumentos da máquina; `no_reboot` faz o reinício do convidado
@@ -130,6 +142,17 @@ fn machine_arguments(disks: &Disks, machine: &MachineOptions, no_reboot: bool) -
     if let Some(ntfs) = &disks.data {
         let snapshot = if disks.data_snapshot { ",snapshot=on" } else { "" };
         arguments.extend(["-drive".to_string(), format!("format=raw,if=ide,index=1,media=disk{snapshot},file={}", ntfs.display())]);
+    }
+    // Controlador NVMe (PCI\VEN_1B36&DEV_0010, classe 01.08.02) com o disco
+    // particionado, com `--storage=nvme`.
+    if let Some(nvme) = &disks.nvme {
+        let snapshot = if disks.nvme_snapshot { ",snapshot=on" } else { "" };
+        arguments.extend([
+            "-drive".to_string(),
+            format!("if=none,id=nvm,format=raw{snapshot},file={}", nvme.display()),
+            "-device".to_string(),
+            "nvme,serial=opennt,drive=nvm".to_string(),
+        ]);
     }
     arguments
 }
@@ -535,8 +558,8 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
     // cópia gravável dele.
     let data_copy = if test.power_cycles > 0 { private_data_disk(disks, log)? } else { None };
     let disks = match &data_copy {
-        Some(copy) => Disks { boot: disks.boot.clone(), data: Some(copy.clone()), data_snapshot: false },
-        None => Disks { boot: disks.boot.clone(), data: disks.data.clone(), data_snapshot: disks.data_snapshot },
+        Some(copy) => Disks { boot: disks.boot.clone(), data: Some(copy.clone()), data_snapshot: false, nvme: disks.nvme.clone(), nvme_snapshot: disks.nvme_snapshot },
+        None => Disks { boot: disks.boot.clone(), data: disks.data.clone(), data_snapshot: disks.data_snapshot, nvme: disks.nvme.clone(), nvme_snapshot: disks.nvme_snapshot },
     };
     let mut arguments = machine_arguments(&disks, machine, !test.allow_reboot);
     arguments.extend([

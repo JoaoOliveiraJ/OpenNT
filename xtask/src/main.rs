@@ -16,7 +16,7 @@
 //!
 //! Opções de build: `--release`, `--build-dir=DIR` (padrão `build`),
 //! `--user-program=shell`, `--kernel-test-scope=none|all|disk-stress`, `--console-mirror`,
-//! `--start-driver=NOME[,NOME...]`, `--trace-driver-api`, `--initial-process=smss`, `--storage=real`,
+//! `--start-driver=NOME[,NOME...]`, `--trace-driver-api`, `--initial-process=smss`, `--storage=real|nvme`,
 //! `--display=basic`, `--windows-dir=DIR`, `--pnp-root=acpi|internal` (a raiz da árvore de
 //! dispositivos: o acpi.sys real, o padrão, ou o barramento PCI interno), `--kd=com2` (o
 //! depurador do kernel na COM2), `--shutdown-test=poweroff|reboot` (o teste do desligamento).
@@ -66,7 +66,7 @@ const USAGE: &str = "uso: cargo xtask <build|run|test-boot|test-all|capturas|deb
   nt-types   gera kernel/src/ntos/inc/types do PDB do ntoskrnl (cargo xtask nt-types --help)
 opcoes de build:   --release --build-dir=DIR --user-program=shell
                    --kernel-test-scope=none|all|disk-stress --console-mirror --start-driver=NOME[,NOME...]
-                   --trace-driver-api --initial-process=smss --storage=real --display=basic
+                   --trace-driver-api --initial-process=smss --storage=real|nvme --display=basic
                    --windows-dir=DIR (binarios do Windows do bundle; padrao build/windows)
                    --pnp-root=acpi|internal (raiz da arvore de dispositivos; padrao acpi)
                    --kd=com2 (depurador do kernel na COM2)
@@ -213,6 +213,9 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
     if !matches!(parsed.build.initial_process.as_str(), "" | "smss") {
         return Err(format!("--initial-process aceita apenas smss ({} recebido)", parsed.build.initial_process));
     }
+    if !matches!(parsed.build.storage.as_str(), "" | "real" | "nvme") {
+        return Err(format!("--storage aceita real ou nvme ({} recebido)", parsed.build.storage));
+    }
     if !matches!(parsed.build.pnp_root.as_str(), "" | "acpi" | "internal") {
         return Err(format!("--pnp-root aceita acpi ou internal ({} recebido)", parsed.build.pnp_root));
     }
@@ -281,7 +284,7 @@ fn execute(arguments: Arguments) -> Result<(), String> {
             if !arguments.build.kd.is_empty() && machine.kd_port.is_none() {
                 machine.kd_port = Some(1234);
             }
-            qemu::run(&qemu::Disks::beside(&output.image), &machine)
+            qemu::run(&qemu::Disks::beside(&output.image, &arguments.build.storage), &machine)
         }
         "debug" => debug_command(arguments),
         "test-boot" => {
@@ -322,7 +325,8 @@ fn execute(arguments: Arguments) -> Result<(), String> {
             // O volume de dados fica como o build o deixou: cada teste começa
             // dele, e execuções paralelas dividem o mesmo arquivo.
             let ntfs = images.join("ntfs.img");
-            let disks = qemu::Disks { boot: image, data: ntfs.exists().then_some(ntfs), data_snapshot: true };
+            let nvme = qemu::nvme_disk(&images.join("os.img"), &options.storage);
+            let disks = qemu::Disks { boot: image, data: ntfs.exists().then_some(ntfs), data_snapshot: true, nvme, nvme_snapshot: true };
             qemu::test_boot(
                 &disks,
                 &machine,
@@ -399,10 +403,10 @@ fn debug_command(arguments: Arguments) -> Result<(), String> {
     let output = build::build(&options)?;
     let log = output.image.with_file_name("serial.log");
     if arguments.no_client {
-        let qemu = qemu::spawn(&qemu::Disks::beside(&output.image), &machine, &log, !arguments.headless)?;
+        let qemu = qemu::spawn(&qemu::Disks::beside(&output.image, &options.storage), &machine, &log, !arguments.headless)?;
         return debug::serve(qemu, &address);
     }
-    let mut qemu = qemu::spawn(&qemu::Disks::beside(&output.image), &machine, &log, true)?;
+    let mut qemu = qemu::spawn(&qemu::Disks::beside(&output.image, &options.storage), &machine, &log, true)?;
     let result = debug::interactive(&address, &root, &elf);
     let _ = qemu.kill();
     let _ = qemu.wait();

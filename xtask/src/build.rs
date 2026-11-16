@@ -33,6 +33,11 @@ const LOAD_OPTIONS_OFFSET: u64 = load_options::SECTOR as u64 * 512;
 /// o caminho entra no build do kernel, então uma pasta só faz builds com
 /// `--build-dir` diferentes reaproveitarem o mesmo kernel compilado.
 pub const WINDOWS_DIR: &str = "build/windows";
+/// O disco do controlador NVMe (`--storage=nvme`), ao lado do `os.img`.
+pub const NVME_IMAGE: &str = "nvme.img";
+/// O arquivo de texto do volume NVMe, que o teste lê pelo ntfs.sys.
+const NVME_FILE: &str = "NVME.TXT";
+const NVME_FILE_DATA: &[u8] = b"Volume NTFS no disco NVMe do OpenNT.\r\n";
 
 /// As opções de um build. As de boot (do `user_program` ao `kd`, menos o
 /// `release`, o `build_dir` e o `windows_dir`) não mudam o kernel compilado:
@@ -52,7 +57,9 @@ pub struct BuildOptions {
     /// `--initial-process=smss`: o kernel inicia o smss.exe real como o
     /// primeiro processo de usuário (vazio = o boot comum).
     pub initial_process: String,
-    /// `--storage=real`: a pilha de armazenamento do Windows sobe pelo PnP.
+    /// `--storage=real`: a pilha de armazenamento do Windows sobe pelo PnP
+    /// na controladora IDE. `--storage=nvme`: o QEMU ganha um controlador
+    /// NVMe com o `nvme.img` e o storport.sys com o stornvme.sys sobem nele.
     pub storage: String,
     /// `--display=basic`: o PnP instala o BasicDisplay.sys real no adaptador
     /// VGA e o inicia sobre o dxgkrnl.sys real.
@@ -325,6 +332,11 @@ pub fn build(options: &BuildOptions) -> Result<BuildOutput, String> {
         ntfs_files.push((format!("Windows/System32/config/{name}"), image));
     }
     let ntfs_bytes = crate::ntfs_image::build(&ntfs_path, &ntfs_files, 32, 256)?;
+    // O disco do controlador NVMe do QEMU, particionado, com um volume NTFS
+    // próprio: montado em todo build (a opção de carga `--storage=nvme`
+    // não muda as imagens), ligado só às máquinas com a opção.
+    let files = [(String::from(NVME_FILE), NVME_FILE_DATA.to_vec())];
+    crate::ntfs_image::build_partitioned(&build_dir.join(NVME_IMAGE), &files, 16, 64)?;
 
     let text = options.load_options()?;
     println!(

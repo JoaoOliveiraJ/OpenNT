@@ -1,5 +1,7 @@
 //! Gera `ntfs.img`: um volume NTFS 3.1 que o leitor do kernel
-//! (`drivers/fs/ntfs`) lê como D: e que o ntfs.sys real monta.
+//! (`drivers/fs/ntfs`) lê como D: e que o ntfs.sys real monta; e, com
+//! `--storage=nvme`, o `nvme.img`: um disco particionado (MBR com uma
+//! partição NTFS a partir do LBA 2048) com um volume do mesmo formato.
 //!
 //! Layout: setor = cluster = 512 B, registros de arquivo de 4 KB (o "large
 //! FRS" do NTFS) e blocos de índice de 4 KB. Clusters: 0..16 = $Boot (o setor
@@ -575,8 +577,56 @@ fn attribute_definitions() -> Vec<u8> {
     table
 }
 
-/// Monta a imagem com os arquivos extras `(nome no volume, bytes)`.
+/// Monta a imagem com os arquivos extras `(nome no volume, bytes)` e a grava
+/// em `output`; devolve o tamanho.
 pub fn build(output: &Path, extras: &[(String, Vec<u8>)], free_space_mib: usize, extra_records: usize) -> Result<usize, String> {
+    let image = volume_image(extras, free_space_mib, extra_records, 0)?;
+    write(output, &image)?;
+    Ok(image.len())
+}
+
+fn write(output: &Path, image: &[u8]) -> Result<(), String> {
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
+    }
+    fs::write(output, image).map_err(|error| format!("{}: {error}", output.display()))
+}
+
+/// Primeiro setor da partição do disco particionado (o alinhamento de 1 MB
+/// que o particionador do Windows usa).
+const PARTITION_START_LBA: usize = 2048;
+/// Tipo de partição MBR do NTFS (PARTITION_IFS).
+const PARTITION_IFS: u8 = 0x07;
+/// Assinatura de disco MBR do disco particionado.
+const DISK_SIGNATURE: u32 = 0x4F4E_5654;
+
+/// Grava em `output` um disco particionado: MBR com uma partição NTFS
+/// (tipo 0x07, ativa, a partir do LBA 2048) que ocupa o volume inteiro, com
+/// os arquivos extras. O setor de boot do volume leva o deslocamento da
+/// partição em HiddenSectors, como o formatador grava. Devolve o tamanho.
+pub fn build_partitioned(output: &Path, extras: &[(String, Vec<u8>)], free_space_mib: usize, extra_records: usize) -> Result<usize, String> {
+    let volume = volume_image(extras, free_space_mib, extra_records, PARTITION_START_LBA as u32)?;
+    let volume_sectors = volume.len() / SECTOR;
+    let mut disk = vec![0u8; (PARTITION_START_LBA + volume_sectors) * SECTOR];
+    put32(&mut disk, 0x1B8, DISK_SIGNATURE);
+    let entry = 0x1BE;
+    disk[entry] = 0x80;
+    // CHS de início e fim: os valores de um LBA além de 1024 cilindros.
+    disk[entry + 1..entry + 4].copy_from_slice(&[0xFE, 0xFF, 0xFF]);
+    disk[entry + 4] = PARTITION_IFS;
+    disk[entry + 5..entry + 8].copy_from_slice(&[0xFE, 0xFF, 0xFF]);
+    put32(&mut disk, entry + 8, PARTITION_START_LBA as u32);
+    put32(&mut disk, entry + 12, volume_sectors as u32);
+    disk[510] = 0x55;
+    disk[511] = 0xAA;
+    disk[PARTITION_START_LBA * SECTOR..].copy_from_slice(&volume);
+    write(output, &disk)?;
+    Ok(disk.len())
+}
+
+/// A imagem do volume; `hidden_sectors` é o LBA do início da partição que a
+/// contém (0 num disco sem partições).
+fn volume_image(extras: &[(String, Vec<u8>)], free_space_mib: usize, extra_records: usize, hidden_sectors: u32) -> Result<Vec<u8>, String> {
     // Diretórios intermediários dos nomes com '/', na ordem de criação.
     let mut directories: Vec<String> = Vec::new();
     for (name, _) in extras {
@@ -794,6 +844,7 @@ pub fn build(output: &Path, extras: &[(String, Vec<u8>)], free_space_mib: usize,
     boot[0x15] = 0xF8; // disco fixo
     put16(&mut boot, 0x18, 63);
     put16(&mut boot, 0x1A, 255);
+    put32(&mut boot, 0x1C, hidden_sectors);
     put32(&mut boot, 0x24, 0x0080_0080);
     put64(&mut boot, 0x28, volume_clusters as u64 * (CLUSTER / SECTOR) as u64);
     put64(&mut boot, 0x30, MFT_LCN as u64);
@@ -829,9 +880,5 @@ pub fn build(output: &Path, extras: &[(String, Vec<u8>)], free_space_mib: usize,
     let mirror = image[mft_offset..mft_offset + MIRROR_RECORDS * RECORD_SIZE].to_vec();
     let mirror_offset = mirror_lcn as usize * CLUSTER;
     image[mirror_offset..mirror_offset + mirror.len()].copy_from_slice(&mirror);
-    if let Some(parent) = output.parent() {
-        fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
-    }
-    fs::write(output, &image).map_err(|error| format!("{}: {error}", output.display()))?;
-    Ok(total_sectors * SECTOR)
+    Ok(image)
 }
