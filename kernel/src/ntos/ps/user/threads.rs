@@ -1744,6 +1744,8 @@ fn nt_query_information_thread(handle: u64, class: u64, out: u64, length: u64, r
         9 => 8,
         17 => 1,
         12 => 4,
+        // ThreadIsTerminated (ULONG).
+        20 => 4,
         _ => return Ok(0xC000_0003),
     };
     if returned != 0 && !probe_user_write(returned, 4) {
@@ -1789,6 +1791,13 @@ fn nt_query_information_thread(handle: u64, class: u64, out: u64, length: u64, r
             9 => guest::try_write::<u64>(out, start)?,
             // ThreadHideFromDebugger (BOOLEAN).
             17 => guest::try_write::<u8>(out, hidden as u8)?,
+            // ThreadIsTerminated: o PsIsThreadTerminating (o bit Terminated
+            // do CrossThreadFlags, ligado quando o fim é pedido).
+            20 => {
+                // SAFETY: a ETHREAD retida pelo handle resolvido.
+                let flags = unsafe { crate::ntos::inc::types::Ethread::at(pointer) }.cross_thread_flags.get();
+                guest::try_write::<u32>(out, (dead || flags & crate::ntos::inc::types::Ethread::TERMINATED_MASK != 0) as u32)?;
+            }
             // ThreadAmILastThread (ULONG): as threads do processo corrente.
             _ => guest::try_write::<u32>(out, (of_process(process::get_current_process()).iter().filter(|thread| !thread.dead()).count() == 1) as u32)?,
         }
