@@ -8,6 +8,9 @@
 //! endereço do cabeçalho, na ObTypeIndexTable. O nome vem do
 //! OBJECT_HEADER_NAME_INFO; num File, do FILE_OBJECT.FileName; num Process,
 //! do ImageFileName. Tudo pelo leitor de memória do depurador, sem travas.
+//! Um handle de processo de usuário cuja linha nativa não dá o tipo (a
+//! identidade publicada pelo `ps/user`) recebe o tipo da tabela de handles
+//! de usuário do processo, quando nenhum processador parado tinha trava.
 //! A saída é paginada: a última linha dá o índice seguinte (`mais: N`).
 
 use core::fmt::Write;
@@ -17,6 +20,7 @@ use super::packet::Payload;
 use super::{memory, process_context, stop};
 use crate::ntos::inc::types::{ClientId, Eprocess, Ethread, FileObject, HandleTable, HandleTableEntry, ObjectHeader, ObjectHeaderNameInfo, ObjectType, UnicodeString};
 use crate::ntos::ob::{object_header, object_types};
+use crate::ntos::ps::user::{process_state, state as user_state};
 
 /// Entradas por página da tabela.
 const PER_PAGE: u64 = 0x1000 / 16;
@@ -147,6 +151,8 @@ pub fn command(owner: usize, argument: &str, out: &mut Payload) {
     let limit = memory::read_u32(cr3, table + offset_of!(HandleTable, next_handle_needing_pool) as u64).unwrap_or(0) as u64 / 4;
     let _ = writeln!(out, "EPROCESS {:#x} HANDLE_TABLE {:#x} TableCode {:#x} entradas {}", eprocess, table, code, limit);
     let _ = writeln!(out, "{:>8} {:>18} {:>10} {:<16} nome", "handle", "objeto", "acesso", "tipo");
+    // A tabela de usuário do processo (só com as travas livres).
+    let user_table = if stop::locks_held() { None } else { process_state::get(eprocess) };
     let mut lines = 0;
     let mut index = start.max(1);
     while index < limit {
@@ -175,7 +181,17 @@ pub fn command(owner: usize, argument: &str, out: &mut Payload) {
         }
         let body = header + offset_of!(ObjectHeader, body) as u64;
         let mut name = [0u8; 24];
-        let length = type_name(cr3, object_type(cr3, header), &mut name);
+        let mut length = type_name(cr3, object_type(cr3, header), &mut name);
+        if length == 0 {
+            if let Some(entry) = user_table.as_ref().and_then(|table| user_state::get_user_handle_in(table, (index - 1) * 4)) {
+                let user_kind = entry.kind().as_bytes();
+                length = user_kind.len().min(name.len());
+                name[..length].copy_from_slice(&user_kind[..length]);
+                if let Some(first) = name.first_mut() {
+                    first.make_ascii_uppercase();
+                }
+            }
+        }
         let kind = if length == 0 { &b"?"[..] } else { &name[..length] };
         let _ = write!(out, "{:>#8x} {:>#18x} {:>#10x} ", (index - 1) * 4, body, high & 0x1FF_FFFF);
         for &byte in kind {

@@ -4,12 +4,13 @@
 # só compilam pelo `cargo xtask`, que escolhe o alvo, empacota o kernel como
 # PE32+ e monta a imagem de disco. O `xtask` roda no host. As ferramentas de
 # desenvolvimento ficam em `tools/`: `kd-client` (o cliente do depurador do
-# kernel, só a biblioteca padrão, usado pelo `xtask`) e `kd-gui` (o
-# depurador gráfico `opennt-dbg`, com as dependências de interface; nunca
-# entra no build do kernel nem do `xtask`).
+# kernel, só a biblioteca padrão, usado pelo `xtask`), `kd-gui` (o
+# depurador gráfico `opennt-dbg`) e `kd-re` (o depurador de engenharia
+# reversa `opennt-re`), os dois com as dependências de interface; nunca
+# entram no build do kernel nem do `xtask`.
 [workspace]
 resolver = "2"
-members = ["boot", "kernel", "xtask", "tools/kd-client", "tools/kd-gui"]
+members = ["boot", "kernel", "xtask", "tools/kd-client", "tools/kd-gui", "tools/kd-re"]
 default-members = ["xtask"]
 
 [workspace.package]

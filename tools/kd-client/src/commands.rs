@@ -880,7 +880,17 @@ impl Client {
                 }
                 Ok(output)
             }
-            "handles" | "vad" | "uthreads" | "kmap" | "events" | "uex" => self.monitor(line),
+            "handles" | "vad" | "uthreads" => {
+                // O processo pode vir de uma expressão ($nome, @reg, módulo!símbolo).
+                let process = match words.first() {
+                    Some(first) if first.starts_with(['$', '@']) || first.contains(['!', '(']) => format!("{:#x}", self.evaluate(first)?),
+                    Some(first) => first.to_string(),
+                    None => return Err(format!("uso: {command} <pid|eprocess> [indice]")),
+                };
+                let tail = words.get(1).map(|start| format!(" {start}")).unwrap_or_default();
+                self.monitor(&format!("{command} {process}{tail}"))
+            }
+            "kmap" | "events" | "uex" => self.monitor(line),
             "ustack" => {
                 let tid = words.first().and_then(|text| parse_number(text)).ok_or("uso: ustack <tid> [n] (processo escolhido com .process)")?;
                 let limit = words.get(1).and_then(|text| parse_number(text)).unwrap_or(32) as usize;

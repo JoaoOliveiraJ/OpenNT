@@ -165,7 +165,8 @@ struct RunTo {
     address: u64,
     /// O breakpoint é só deste passo (não havia um do usuário ali).
     inserted: bool,
-    expected_rsp: u64,
+    /// `None`: qualquer RSP serve (o "rodar até aqui").
+    expected_rsp: Option<u64>,
 }
 
 /// Como a máquina ficou depois de um passo por cima ou para fora.
@@ -423,7 +424,7 @@ impl Client {
         }
         if let Some(run_to) = self.run_to.take() {
             let at_target = self.register("rip").ok() == Some(run_to.address) && stop.reasons.contains(&Reason::SoftwareBreak);
-            if at_target && self.register("rsp").ok() != Some(run_to.expected_rsp) {
+            if at_target && run_to.expected_rsp.is_some() && self.register("rsp").ok() != run_to.expected_rsp {
                 self.run_to = Some(run_to);
                 self.resume("c")?;
                 return Ok(None);
@@ -974,7 +975,18 @@ impl Client {
         Ok(Resumed::Running)
     }
 
+    /// Roda até `address` (um breakpoint temporário); com `expected_rsp`,
+    /// só para quando o RSP for esse (o mesmo quadro).
+    pub fn run_until(&mut self, address: u64, expected_rsp: Option<u64>) -> Result<(), String> {
+        self.require_stopped()?;
+        self.run_to_inner(address, expected_rsp)
+    }
+
     fn run_to(&mut self, address: u64, expected_rsp: u64) -> Result<(), String> {
+        self.run_to_inner(address, Some(expected_rsp))
+    }
+
+    fn run_to_inner(&mut self, address: u64, expected_rsp: Option<u64>) -> Result<(), String> {
         let existing = self.hook_at(address) || self.breakpoints.iter().any(|breakpoint| breakpoint.enabled && breakpoint.kind == BreakpointKind::Software && breakpoint.address == address);
         if !existing {
             let reply = self.request(&format!("Z0,{address:x},1"))?;
