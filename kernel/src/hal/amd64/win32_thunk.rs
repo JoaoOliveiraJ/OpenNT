@@ -20,8 +20,9 @@
 /// Quantidade de stubs. Os ids 0–31 são do kernel32 e cada export do ntoskrnl
 /// ocupa o id `32 + índice`, então a tabela precisa de `32 + EXPORT_NAMES.len()`
 /// stubs — o boot verifica isso (`init::exports`). O `.rept` abaixo usa esta
-/// constante, então os dois não divergem.
-pub const MAX_WIN32: u32 = 2048;
+/// constante, então os dois não divergem. 4096 cobre os 3070 exports do
+/// ntoskrnl 19041 inteiro.
+pub const MAX_WIN32: u32 = 4096;
 /// Bytes por stub.
 pub const STUB_SIZE: u64 = 10;
 
