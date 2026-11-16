@@ -25,10 +25,9 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::drivers::bus::device_tree;
 use crate::ntos::inc::types::{DeviceObject, NtStruct};
 use crate::ntos::io::lifecycle;
-use crate::ntos::io::pnp::{self, devnode};
+use crate::ntos::io::pnp::devnode;
 
 /// `--pnp-root=acpi`: a raiz da árvore é o acpi.sys sobre a HAL.
 pub fn enabled() -> bool {
@@ -82,22 +81,9 @@ fn check_pci_root() -> Result<String, String> {
     Ok(format!("{}: {} funcao(oes) PCI {:?}, {} filho(s) no total", node.instance_path, functions.len(), functions, children.len()))
 }
 
-/// Monta a árvore com a raiz ACPI e confere os marcadores.
-pub fn initialize() {
-    debug_print!("[acpi] arvore de dispositivos com a raiz ACPI (acpi.sys e pci.sys)");
-    if let Err(error) = device_tree::prepare() {
-        debug_print!("[acpi] raiz do PnP: {}", error);
-        return;
-    }
-    crate::ntos::init::exports::set_api_trace(crate::ntos::init::boot_config::trace_driver_api());
-    let processed = pnp::tree::process();
-    crate::ntos::init::exports::set_api_trace(false);
-    if let Err(error) = processed {
-        debug_print!("[acpi] arvore do PnP: {}", error);
-    }
-    for (path, state, problem, service) in pnp::tree::summary() {
-        debug_print!("[acpi] devnode {} estado {:?} problema {:#x} servico {}", path, state, problem, service.as_deref().unwrap_or("-"));
-    }
+/// Confere os marcadores da raiz ACPI na árvore montada
+/// (`device_tree::build`).
+pub fn check() {
     match check_acpi_root() {
         Ok(summary) => {
             debug_print!("[acpi] {}", summary);

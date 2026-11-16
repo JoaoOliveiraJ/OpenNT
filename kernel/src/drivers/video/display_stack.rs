@@ -1,7 +1,8 @@
 //! A pilha de vídeo real do Windows (`--display=basic`).
 //!
-//! Com a opção, o fim da fase 1 monta a árvore de dispositivos do PnP sobre
-//! o barramento PCI interno e o adaptador VGA do QEMU (PCI\VEN_1234&
+//! Com a opção, na árvore de dispositivos do fim da fase 1
+//! (`device_tree::build`, sobre o pci.sys real com a raiz ACPI ou o
+//! barramento PCI interno) o adaptador VGA do QEMU (PCI\VEN_1234&
 //! DEV_1111, classe 03.00) é instalado como no Windows: o display.inf dá o
 //! serviço BasicDisplay a todo PCI\CC_0300 (seção MSBDA, classe Display). O
 //! PnP carrega o BasicDisplay.sys real do repositório de drivers; o
@@ -67,7 +68,7 @@ const IRP_MJ_PNP: usize = 0x1B;
 
 /// O adaptador instalado com o BasicDisplay, pronto até onde o dxgkrnl o
 /// leva sem sessão: nó iniciado; FDO de vídeo do \Driver\BasicDisplay
-/// sobre o PDO; o despacho do driver (PnP e AddDevice) dentro do dxgkrnl.sys.
+/// na pilha do PDO; o despacho do driver (PnP e AddDevice) dentro do dxgkrnl.sys.
 fn check_adapter() -> Result<String, String> {
     let adapter = devnode::all().into_iter().find(|node| node.service.as_deref() == Some("BasicDisplay")).ok_or("nenhum adaptador instalado com o BasicDisplay")?;
     if adapter.state != devnode::State::Started {
@@ -92,33 +93,28 @@ fn check_adapter() -> Result<String, String> {
         return Err(String::from("sem FDO sobre o PDO do adaptador"));
     }
     // SAFETY: DEVICE_OBJECT do FDO criado no AddDevice.
-    let (owner, device_type, attached) = unsafe {
+    let (owner, device_type) = unsafe {
         let device = DeviceObject::at(fdo);
-        (device.driver_object.get(), device.device_type.get(), DeviceObject::at(adapter.pdo).attached_device.get())
+        (device.driver_object.get(), device.device_type.get())
     };
-    if owner != miniport || device_type != FILE_DEVICE_VIDEO || attached != fdo {
-        return Err(format!("FDO {fdo:#x}: driver {owner:#x}, tipo {device_type:#x}, anexado ao PDO {attached:#x}"));
+    if owner != miniport || device_type != FILE_DEVICE_VIDEO || !device_tree::attached_above(adapter.pdo, fdo) {
+        return Err(format!("FDO {fdo:#x}: driver {owner:#x}, tipo {device_type:#x}, fora da pilha do PDO {:#x}", adapter.pdo));
     }
     Ok(adapter.instance_path)
 }
 
-/// Sobe a pilha de vídeo e confere o adaptador. Só com `--display=basic`.
-pub fn initialize() {
+/// Antes da árvore: o vídeo de boot que o carregador deixa numa máquina com
+/// adaptador de vídeo (o BGFX de um boot por BIOS), antes do driver de
+/// vídeo.
+pub fn before_tree() {
     debug_print!("[display] pilha de video real pelo PnP");
-    if let Err(error) = crate::drivers::bus::device_tree::prepare() {
-        debug_print!("[display] raiz do PnP: {}", error);
-        return;
+    if crate::ntos::bgk::graphics_information::initialize_firmware_display().is_none() {
+        debug_print!("[bgk] sem modo VBE para o video de boot");
     }
-    // `--trace-driver-api` rastreia as APIs que os drivers da árvore chamam.
-    crate::ntos::init::exports::set_api_trace(crate::ntos::init::boot_config::trace_driver_api());
-    let processed = pnp::tree::process();
-    crate::ntos::init::exports::set_api_trace(false);
-    if let Err(error) = processed {
-        debug_print!("[display] arvore do PnP: {}", error);
-    }
-    for (path, state, problem, service) in pnp::tree::summary() {
-        debug_print!("[display] devnode {} estado {:?} problema {:#x} servico {}", path, state, problem, service.as_deref().unwrap_or("-"));
-    }
+}
+
+/// Depois da árvore: o adaptador e a ponte KMDF.
+pub fn check() {
     let links: Vec<String> = device_interface::class_links(&GUID_DEVINTERFACE_DISPLAY_ADAPTER, true);
     let enabled = device_interface::enabled_links(&GUID_DEVINTERFACE_DISPLAY_ADAPTER);
     debug_print!("[display] interfaces de adaptador: {:?} (habilitadas: {:?})", links, enabled);

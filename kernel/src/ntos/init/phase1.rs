@@ -114,23 +114,12 @@ pub fn init() {
     }
     // Rotinas de IoRegisterDriverReinitialization, como no NT.
     crate::ntos::io::lifecycle::run_reinitialization_routines();
-    // `--pnp-root=acpi`: a raiz da árvore de dispositivos é o acpi.sys real
-    // sobre o dispositivo ACPI da HAL, com o pci.sys no barramento PCI.
-    if crate::drivers::bus::acpi_stack::enabled() {
-        crate::drivers::bus::acpi_stack::initialize();
-    }
-    // `--storage=real`: a pilha de armazenamento do Windows sobe pelo PnP.
-    if crate::drivers::storage::storage_stack::enabled() {
-        crate::drivers::storage::storage_stack::initialize();
-    }
-    // `--display=basic`: o BasicDisplay.sys real sobe pelo PnP no adaptador
-    // VGA, sobre o dxgkrnl.sys real.
-    if crate::drivers::video::display_stack::enabled() {
-        // O vídeo de boot que o carregador deixa numa máquina com adaptador
-        // de vídeo (o BGFX de um boot por BIOS), antes do driver de vídeo.
-        if crate::ntos::bgk::graphics_information::initialize_firmware_display().is_none() {
-            debug_print!("[bgk] sem modo VBE para o video de boot");
-        }
-        crate::drivers::video::display_stack::initialize();
+    // A árvore de dispositivos do PnP, uma vez, com as pilhas pedidas:
+    // `--pnp-root=acpi` (a raiz é o acpi.sys real sobre o dispositivo ACPI
+    // da HAL, com o pci.sys no barramento PCI), `--storage=real` (a pilha de
+    // armazenamento do Windows) e `--display=basic` (o BasicDisplay.sys real
+    // no adaptador VGA, sobre o dxgkrnl.sys real).
+    if crate::drivers::bus::acpi_stack::enabled() || crate::drivers::storage::storage_stack::enabled() || crate::drivers::video::display_stack::enabled() {
+        crate::drivers::bus::device_tree::build();
     }
 }

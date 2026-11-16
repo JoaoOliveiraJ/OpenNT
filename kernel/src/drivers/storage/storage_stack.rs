@@ -1,8 +1,10 @@
 //! A pilha de armazenamento real do Windows (`--storage=real`).
 //!
-//! Com a opção, o fim da fase 1 sobe pelo PnP manager a pilha da
-//! controladora IDE do PIIX3 como o Windows: o barramento PCI interno
-//! relata as funções, o PnP instala cada uma pelos INFs da caixa
+//! Com a opção, a árvore de dispositivos do fim da fase 1
+//! (`device_tree::build`) sobe pelo PnP manager a pilha da controladora IDE
+//! do PIIX3 como o Windows: o barramento PCI (o pci.sys real com a raiz
+//! ACPI, ou o interno) relata as funções, o PnP instala cada uma pelos INFs
+//! da caixa
 //! (PCI\VEN_8086&DEV_7010 -> intelide.sys com o pciidex.sys; os canais
 //! Internal_IDE_Channel -> atapi.sys com o ataport.sys; os discos GenDisk ->
 //! disk.sys com o classpnp.sys e o filtro de classe partmgr.sys; Root\VOLMGR
@@ -25,7 +27,7 @@ use alloc::vec::Vec;
 
 use crate::ntos::inc::types::{IoStatusBlock, Irp, Kevent, LargeInteger, NtStruct};
 use crate::ntos::io::io_manager::{self, irp_mj};
-use crate::ntos::io::pnp::{self, install};
+use crate::ntos::io::pnp::install;
 use crate::ntos::ke::dispatcher;
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::ob::object_manager;
@@ -136,24 +138,22 @@ fn log_published_objects() {
     }
 }
 
-/// Sobe a pilha real e confere a leitura. Só com `--storage=real`.
-pub fn initialize() {
+/// Antes da árvore: os setores de referência lidos pelo driver interno
+/// antes de a pilha real assumir a controladora, o Registro da pilha e os
+/// drivers de boot sem dispositivo a esperar. Devolve a referência (None =
+/// a pilha não sobe).
+pub fn before_tree() -> Option<Vec<u8>> {
     debug_print!("[storage] pilha de armazenamento real pelo PnP");
-    // Referência: os setores lidos pelo driver interno antes da troca.
     let reference = match crate::drivers::storage::ata_pio::read_sectors(0, SECTORS, DATA_DRIVE) {
         Ok(bytes) => bytes,
         Err(error) => {
             debug_print!("[storage] leitura de referencia falhou: {}", error);
-            return;
+            return None;
         }
     };
     if let Err(error) = seed_registry() {
         debug_print!("[storage] Registro: {}", error);
-        return;
-    }
-    if let Err(error) = crate::drivers::bus::device_tree::prepare() {
-        debug_print!("[storage] raiz do PnP: {}", error);
-        return;
+        return None;
     }
     // Os drivers de boot sem dispositivo a esperar, na ordem dos grupos
     // (Boot Bus Extender, System Bus Extender): o volmgr.sys relata o
@@ -163,19 +163,19 @@ pub fn initialize() {
             debug_print!("[storage] servico {} nao carregou", service);
         }
     }
-    if let Err(error) = pnp::tree::process() {
-        debug_print!("[storage] arvore do PnP: {}", error);
-    }
-    for (path, state, problem, service) in pnp::tree::summary() {
-        debug_print!("[storage] devnode {} estado {:?} problema {:#x} servico {}", path, state, problem, service.as_deref().unwrap_or("-"));
-    }
+    Some(reference)
+}
+
+/// Depois da árvore: os objetos publicados e a leitura pela pilha real
+/// comparada com a referência.
+pub fn check(reference: &[u8]) {
     log_published_objects();
     let Some(disk) = disk_device(1) else {
         debug_print!("[storage] \\Device\\Harddisk1\\DR1 nao existe: o disco 1 nao chegou ao disk.sys");
         return;
     };
     match read_through_stack(disk, 0) {
-        Ok(mut bytes) if signature_only_difference(&bytes, &reference) => {
+        Ok(mut bytes) if signature_only_difference(&bytes, reference) => {
             // O partmgr.sys dá uma assinatura de disco MBR (offset 0x1B8 do
             // setor 0) a um disco que não tem nenhuma, como no Windows: o
             // único byte a mudar no disco desde a leitura de referência.
@@ -192,7 +192,7 @@ pub fn initialize() {
             }
         }
         Ok(bytes) => {
-            let first = bytes.iter().zip(&reference).position(|(left, right)| left != right).unwrap_or(0);
+            let first = bytes.iter().zip(reference).position(|(left, right)| left != right).unwrap_or(0);
             debug_print!("[storage] leitura pela pilha real difere da imagem no byte {}", first);
         }
         Err(error) => debug_print!("[storage] leitura pela pilha real falhou: {}", error),
