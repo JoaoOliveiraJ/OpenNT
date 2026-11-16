@@ -99,7 +99,7 @@ pub fn handle(number: u32, arguments: [u64; 4], rip: u64, user_rsp: u64) -> Resu
 fn traced_object_name(name: &str, arguments: &[u64; 4]) -> Option<alloc::string::String> {
     let attributes = match name {
         "NtQueryAttributesFile" | "NtQueryFullAttributesFile" | "NtDeleteFile" => arguments[0],
-        "NtAlpcCreatePort" => arguments[1],
+        "NtAlpcCreatePort" | "NtAlpcConnectPortEx" => arguments[1],
         "NtOpenProcessToken" | "NtOpenProcessTokenEx" | "NtOpenThreadToken" | "NtOpenThreadTokenEx" => return None,
         _ if name.starts_with("NtOpen") || name.starts_with("NtCreate") => arguments[2],
         _ => return None,

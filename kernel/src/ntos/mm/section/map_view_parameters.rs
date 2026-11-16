@@ -168,9 +168,6 @@ pub fn decode(section: &SectionTraits, input: &MapInput, decoded: Option<Prefix>
     if inherit != 1 && inherit != 2 {
         return Decoded::Status(INVALID);
     }
-    if (base | offset) & 0xFFFF != 0 {
-        return Decoded::Status(0xC000_0220);
-    }
     if allocation & 0x9F2B_DFFF != 0 || allocation & 0x4000_0000 != 0 {
         return Decoded::Status(INVALID);
     }
@@ -205,6 +202,11 @@ pub fn decode(section: &SectionTraits, input: &MapInput, decoded: Option<Prefix>
     if size == 0 {
         size = section_size.wrapping_sub(offset) & U64;
     }
+    // Como o MiMapViewOfSection do 19041 sem o modo estrito (que só o
+    // NtMapViewOfSectionEx pede), o deslocamento e a base desalinhados são
+    // arredondados para baixo, e a vista de dados cresce o que o
+    // deslocamento perdeu (o win32k mapeia a seção compartilhada a partir de
+    // 0x201000 em cada processo GUI).
     let offset_delta = offset & (alignment - 1);
     offset -= offset_delta;
     if !section.is_image {
