@@ -95,6 +95,9 @@ fn remove_worker(factory: &Factory, thread: &Arc<UserThread>) {
     if !factory.remove_worker(thread) {
         return;
     }
+    if thread.with(|thread| thread.worker_ready) {
+        factory.set_ready_workers(factory.ready_workers().saturating_sub(1));
+    }
     thread.with(|thread| thread.worker_factory = 0);
     dereference(factory);
 }
@@ -289,6 +292,70 @@ fn set_thread_soft_maximum(handle: u64, input: u64, length: u32) -> u32 {
     0
 }
 
+/// A classe 9 do NtSetInformationWorkerFactory (ntoskrnl 19041, rva
+/// 0x2dc2c7): um ULONG que a ntdll manda em volta de um callback longo. 1 é
+/// o TpCallbackMayRunLong e 2 o TpCallbackIndependent; 0 desfaz no
+/// TppCallbackEpilog e 3 vem da saída do worker (TppWorkerThread). 0 sobe a
+/// contagem dos workers prontos (STATUS_UNSUCCESSFUL se ela já é o total de
+/// workers); 2 e 3 a descem (STATUS_UNSUCCESSFUL em zero) e, quando ela
+/// zera, pedem um worker como o 1; outro valor é STATUS_INVALID_PARAMETER. O pedido de worker
+/// recusa com STATUS_TOO_MANY_THREADS a contagem no máximo da fábrica e
+/// cria um worker se nenhum está sendo criado e cabe mais um (o servidor
+/// LRPC do rpcrt4 recusa o bind com ERROR_MAX_THRDS_REACHED se o
+/// TpCallbackMayRunLong falha).
+fn set_long_callback(handle: u64, input: u64, length: u32) -> Result<u32, KernelError> {
+    if length != 4 {
+        return Ok(0xC000_0004);
+    }
+    if !state::probe_user_read(input, 4) {
+        return Ok(0xC000_0005);
+    }
+    // ULONG de entrada, sondado acima.
+    let value = match guest::try_read::<u32>(input) {
+        Ok(value) => value,
+        Err(error) => return Ok(error.status),
+    };
+    let factory = match resolve(handle, 4) {
+        Ok((_, factory)) => factory,
+        Err(status) => return Ok(status),
+    };
+    let count = factory.ready_workers();
+    let total = live(&factory).len() as u32;
+    let grow = match value {
+        0 => {
+            if count == total {
+                return Ok(0xC000_0001);
+            }
+            factory.set_ready_workers(count + 1);
+            false
+        }
+        1 => true,
+        2 | 3 => {
+            if count == 0 {
+                return Ok(0xC000_0001);
+            }
+            factory.set_ready_workers(count - 1);
+            count == 1
+        }
+        _ => return Ok(0xC000_000D),
+    };
+    if !grow {
+        return Ok(0);
+    }
+    if factory.shutdown() {
+        return Ok(0x80);
+    }
+    let count = factory.ready_workers();
+    if count >= factory.maximum() {
+        return Ok(0xC000_0129);
+    }
+    // A falha da criação fica no LastThreadCreationStatus da fábrica.
+    if !factory.creating() && total < factory.maximum() {
+        create_workers(&factory, total + 1)?;
+    }
+    Ok(0)
+}
+
 fn dispose(factory: &Arc<Factory>) {
     if let Some(listener) = factory.on_queued.lock().take() {
         factory.port.listeners.lock().retain(|candidate| !Arc::ptr_eq(candidate, &listener));
@@ -393,7 +460,10 @@ fn nt_worker_factory_worker_ready(handle: u64, _: u64, _: u64, _: u64, _rsp: u64
         Err(status) => return Ok(status),
     };
     let Some(thread) = threads::current().filter(|thread| thread.with(|thread| thread.worker_factory) == factory.pointer) else { return Ok(0xC000_000D) };
-    thread.with(|thread| thread.worker_ready = true);
+    // O primeiro WorkerReady do worker o conta entre os prontos.
+    if !thread.with(|thread| core::mem::replace(&mut thread.worker_ready, true)) {
+        factory.set_ready_workers(factory.ready_workers() + 1);
+    }
     Ok(if factory.shutdown() { 0xC000_010A } else { 0 })
 }
 
@@ -404,6 +474,9 @@ fn nt_set_information_worker_factory(handle: u64, class: u64, input: u64, length
     }
     if class == 14 {
         return Ok(set_thread_soft_maximum(handle, input, length));
+    }
+    if class == 9 {
+        return set_long_callback(handle, input, length);
     }
     let factory = match resolve(handle, 4) {
         Ok((_, factory)) => factory,

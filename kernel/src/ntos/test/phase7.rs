@@ -3879,6 +3879,10 @@ fn user_worker_factory(assert: Assert) {
     let last = factory.last_status();
     let back = set(4, 0, 4);
     assert(minimum.is_some_and(|status| status != 0) && last == minimum.unwrap_or(0) && back == Some(0) && factory.minimum() == 0, "userwf: minimo com falha de criacao registrada");
+    // A classe 9 (o callback longo da ntdll): valores, contagem e o pedido
+    // de worker, cuja falha de criação fica no último status.
+    let long = (set(9, 5, 4), set(9, 2, 4), set(9, 0, 4), set(9, 1, 8), set(9, 1, 4));
+    assert(long == (Some(0xC000_000D), Some(0xC000_0001), Some(0xC000_0001), Some(0xC000_0004), Some(0)) && factory.ready_workers() == 0, "userwf: classe 9 recusa valor, contagem zerada e tamanho e aceita o TpCallbackMayRunLong");
     // Liberação de worker: pacote de dreno na IOCP.
     let released = call("NtReleaseWorkerFactoryWorker", handle, 0, 0, 0);
     let packets = port.as_ref().map_or(0, |port| port.with(|state| state.packets.len()));

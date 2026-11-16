@@ -69,7 +69,11 @@ struct FactoryBody {
     soft_maximum: Field<u32>,
     soft_creation_phase: Field<u32>,
     loader_worker: Field<u32>,
-    _reserved: Reserved<4>,
+    /// Os workers prontos que contam para o objetivo da fábrica
+    /// (EX_WORKER_FACTORY+0x120): o NtWorkerFactoryWorkerReady soma, a saída
+    /// do worker desconta e a classe 9 do NtSetInformationWorkerFactory
+    /// ajusta em volta de um callback longo.
+    ready_workers: Field<u32>,
 }
 
 // SAFETY: #[repr(C)] só de células.
@@ -352,6 +356,7 @@ impl Factory {
     field32!(last_status, set_last_status, last_status);
     field32!(soft_maximum, set_soft_maximum, soft_maximum);
     field32!(soft_creation_phase, set_soft_creation_phase, soft_creation_phase);
+    field32!(ready_workers, set_ready_workers, ready_workers);
     field64!(process_pointer, set_process_pointer, process_pointer, u64);
     field64!(process_id, set_process_id, process_id, u64);
     field64!(start, set_start, start, u64);
