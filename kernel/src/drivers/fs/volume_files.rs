@@ -78,6 +78,22 @@ impl ReadCache {
     }
 }
 
+/// O alias de instalação para um caminho já relativo ao volume de boot (a
+/// abertura pelo dispositivo, `\Device\KernelVolume1\Windows\System32\X`):
+/// os programas de System32 ficam na raiz do volume, então
+/// `/Windows/System32/X` que não existe vira `/X` quando este existe. Fora
+/// disso, `None` (o caminho fica como está).
+pub fn install_alias(volume_path: &str, exists: impl Fn(&str) -> bool) -> Option<String> {
+    const SYSTEM32: &str = "/windows/system32/";
+    let lower = volume_path.replace('\\', "/").to_lowercase();
+    let rest = lower.strip_prefix(SYSTEM32).map(|_| &volume_path[SYSTEM32.len()..])?;
+    if rest.is_empty() || exists(volume_path) {
+        return None;
+    }
+    let aliased = alloc::format!("/{rest}");
+    exists(&aliased).then_some(aliased)
+}
+
 /// O nome de um arquivo do volume relativo ao dispositivo, como o
 /// IopParseDevice o deixa no FILE_OBJECT.FileName: o caminho depois da
 /// unidade ou do dispositivo do volume (`\SystemRoot` é o `\Windows` dele),

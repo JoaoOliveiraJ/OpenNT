@@ -152,7 +152,16 @@ pub fn file_path_from_object_attributes(attributes: u64) -> Result<String, u32> 
 pub fn resolve_mounted_file(object_name: &str) -> Option<(&'static dyn FileSystem, String)> {
     let (node, rest) = object_manager::resolve(object_name);
     let mount = object_manager::node(node?)?.mount?;
-    Some((mount, format!("/{}", rest.unwrap_or_default())))
+    let path = format!("/{}", rest.unwrap_or_default());
+    // No volume de boot, o alias de instalação de System32 (os programas na
+    // raiz), o mesmo das aberturas por C:\Windows\System32.
+    let boot = crate::drivers::fs::volume_files::fixed_volume().is_some_and(|fixed| crate::drivers::fs::volume::same(mount, fixed as &'static dyn FileSystem));
+    if boot {
+        if let Some(aliased) = crate::drivers::fs::volume_files::install_alias(&path, |candidate| mount.exists(candidate)) {
+            return Some((mount, aliased));
+        }
+    }
+    Some((mount, path))
 }
 
 fn release_entry(entry: &FileEntry) {

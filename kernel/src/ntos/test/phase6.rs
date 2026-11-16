@@ -2520,6 +2520,14 @@ fn zw_kernel_files(assert: Assert) {
     assert(named == Some(0) && queried_name.starts_with("\\Device\\") && queried_name.to_lowercase().ends_with("\\opennt-zw.txt") && guest::read32(name_length) == nt::ObjectNameInformation::SIZE as u32 + queried_name.encode_utf16().count() as u32 * 2 + 2 && short == Some(0xC000_0004), "zwfile: ObQueryNameString de um FILE_OBJECT da o dispositivo e o arquivo");
     guest::free_bytes(name_buffer);
     guest::free_bytes(name_length);
+    // O alias de instalação do volume de boot (System32 na raiz).
+    {
+        use crate::drivers::fs::volume_files::install_alias;
+        let root_only = install_alias("/Windows/System32/kbdus.dll", |path| path == "/kbdus.dll");
+        let literal = install_alias("/Windows/System32/config/SYSTEM", |path| path == "/Windows/System32/config/SYSTEM" || path == "/config/SYSTEM");
+        let outside = install_alias("/Windows/kbdus.dll", |_| true);
+        assert(root_only.as_deref() == Some("/kbdus.dll") && literal.is_none() && outside.is_none() && install_alias("/Windows/System32/ausente.dll", |_| false).is_none(), "zwfile: o alias de System32 do volume de boot so vale quando o caminho literal falta e a raiz tem o arquivo");
+    }
     let again = zw_files::create_kernel_file(output, 0x12019F, attributes, io_status, 3, 2, 0x20);
     let second = guest::read64(output);
     let exists = again.is_ok_and(|status| status == 0) && iosb.information.get() == 4;
