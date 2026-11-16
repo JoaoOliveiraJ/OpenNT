@@ -524,22 +524,42 @@ pub(crate) fn references_tab(ui: &mut Ui, state: &mut UiState, strings: bool) {
     }
     let height = row_height(ui);
     let third = if strings { "String" } else { "String / destino" };
-    ui.horizontal(|ui| {
-        ui.add_sized([260.0, height], egui::Label::new(RichText::new("Endereço").strong()));
-        ui.add_sized([300.0, height], egui::Label::new(RichText::new(if strings { "Bytes" } else { "Desmontagem" }).strong()));
-        ui.label(RichText::new(third).strong());
-    });
+    // Colunas fixas (em caracteres): endereço, desmontagem, string.
+    let font = egui::FontId::monospace(ui.text_style_height(&TextStyle::Monospace) - 1.0);
+    let glyph = ui.fonts_mut(|fonts| fonts.glyph_width(&font, '0'));
+    let columns = [0.0, glyph * 44.0, glyph * 84.0];
+    let fit = |text: &str, width: usize| -> String {
+        if text.chars().count() <= width {
+            text.to_string()
+        } else {
+            let mut cut: String = text.chars().take(width.saturating_sub(1)).collect();
+            cut.push('…');
+            cut
+        }
+    };
+    {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), Sense::hover());
+        let painter = ui.painter_at(rect);
+        let strong = ui.visuals().strong_text_color();
+        for (offset, title) in columns.iter().zip(["Endereço", if strings { "Bytes" } else { "Desmontagem" }, third]) {
+            painter.text(egui::pos2(rect.left() + 4.0 + offset, rect.center().y), egui::Align2::LEFT_CENTER, title, egui::FontId::proportional(13.0), strong);
+        }
+    }
     let mut follow_dump = None;
     egui::ScrollArea::both().id_salt(("re-refs", strings)).auto_shrink([false, false]).show_rows(ui, height, rows.len(), |ui, range| {
+        let text_color = ui.visuals().text_color();
         for index in range {
             let row = rows[index];
-            let response = ui.horizontal(|ui| {
-                let response = ui.add_sized([260.0, height], egui::Button::selectable(selected == Some(index), mono(&row.location)));
-                ui.add_sized([300.0, height], egui::Label::new(mono(&row.disassembly)).truncate());
-                ui.label(mono(&row.text).color(colors.green));
-                response
-            });
-            let response = response.inner;
+            let width = (columns[2] + glyph * 120.0).max(ui.available_width());
+            let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), Sense::click());
+            let painter = ui.painter_at(rect);
+            if selected == Some(index) {
+                painter.rect_filled(rect, 0.0, colors.selection);
+            }
+            let y = rect.center().y;
+            painter.text(egui::pos2(rect.left() + 4.0 + columns[0], y), egui::Align2::LEFT_CENTER, fit(&row.location, 42), font.clone(), text_color);
+            painter.text(egui::pos2(rect.left() + 4.0 + columns[1], y), egui::Align2::LEFT_CENTER, fit(&row.disassembly, 38), font.clone(), text_color);
+            painter.text(egui::pos2(rect.left() + 4.0 + columns[2], y), egui::Align2::LEFT_CENTER, fit(&row.text, 160), font.clone(), colors.green);
             if response.clicked() {
                 selected = Some(index);
             }

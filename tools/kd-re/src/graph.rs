@@ -102,7 +102,9 @@ pub(crate) fn graph_tab(ui: &mut Ui, state: &mut UiState) {
     // Ajusta à área quando chega um grafo novo (ou com "Ajustar").
     let key = graph.function ^ ((graph.blocks.len() as u64) << 48) ^ graph.focus.rotate_left(17);
     if state.graph_fit != key && bounds.is_positive() {
-        let zoom = (canvas.width() / (bounds.width() + 40.0)).min(canvas.height() / (bounds.height() + 40.0)).clamp(0.2, 1.0);
+        // Cabendo, o grafo inteiro; senão um zoom que ainda deixa ler, com o
+        // bloco corrente à vista.
+        let zoom = (canvas.width() / (bounds.width() + 40.0)).min(canvas.height() / (bounds.height() + 40.0)).clamp(0.75, 1.0);
         state.graph_zoom = zoom;
         // O bloco corrente à vista: centrado em x, perto do topo.
         let anchor = graph.current.and_then(|index| rects.get(index)).copied().unwrap_or(bounds);
@@ -145,7 +147,12 @@ pub(crate) fn graph_tab(ui: &mut Ui, state: &mut UiState) {
             let spread = (edge_index as f32 - (block.edges.len() as f32 - 1.0) / 2.0) * 12.0 * zoom;
             let start = Pos2::new(from.center().x + spread, from.bottom());
             let end = Pos2::new(to.center().x, to.top());
-            let points = if to.top() > from.bottom() {
+            // Blocos entre as duas pontas: a aresta contorna pela direita.
+            let blocking = rects.iter().enumerate().filter(|(other, _)| *other != index && *other != *target).map(|(_, rect)| place(rect)).filter(|rect| rect.top() > from.bottom() && rect.bottom() < to.top() && rect.left() < start.x.max(end.x) && rect.right() > start.x.min(end.x)).fold(None::<f32>, |right, rect| Some(right.map_or(rect.right(), |value: f32| value.max(rect.right()))));
+            let points = if let (true, Some(right)) = (to.top() > from.bottom(), blocking) {
+                let corridor = right + (12.0 + 6.0 * edge_index as f32) * zoom;
+                vec![start, Pos2::new(start.x, start.y + 8.0 * zoom), Pos2::new(corridor, start.y + 8.0 * zoom), Pos2::new(corridor, end.y - 14.0 * zoom), Pos2::new(end.x, end.y - 14.0 * zoom), Pos2::new(end.x, end.y - 6.0 * zoom)]
+            } else if to.top() > from.bottom() {
                 let middle = (from.bottom() + to.top()) / 2.0;
                 vec![start, Pos2::new(start.x, middle), Pos2::new(end.x, middle), Pos2::new(end.x, end.y - 6.0 * zoom)]
             } else {

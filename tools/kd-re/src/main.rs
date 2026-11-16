@@ -193,6 +193,12 @@ fn screenshots(config: Config, target: Option<Target>, options: &Options, direct
                 let call = shared.snapshot.code.lines.iter().rev().find(|line| line.address < rip && line.text.starts_with("call")).map(|line| line.address);
                 (rip, call)
             };
+            // A caixa de informação da chamada escolhida.
+            if call.is_some() {
+                let before = backend.shared().snapshot.generation;
+                backend.send(Request::SelectInstruction(call));
+                scenario::wait(&backend, "a caixa de informacao", Duration::from_secs(120), &log, |shared| shared.snapshot.generation > before && shared.activity.is_empty())?;
+            }
             backend = capture(backend, options, &directory.join("kd-re-cpu.png"), |app| {
                 app.annotate(rip, "volta do IoCreateDevice", "");
                 if let Some(call) = call {
@@ -205,8 +211,14 @@ fn screenshots(config: Config, target: Option<Target>, options: &Options, direct
             backend = capture(backend, options, &directory.join("kd-re-grafo.png"), |app| app.focus(Tab::Graph))?;
             let base = scenario::module_base(&backend.shared(), &module).unwrap_or(rip);
             scenario::search(&backend, SearchKind::StringReferences, SearchScope::Module(base), &log)?;
+            // Um filtro que tem a ver com o driver da parada.
+            let filter = match module.to_ascii_lowercase().as_str() {
+                "dxgkrnl" => "EDID|Monitor|GraphicsDrivers",
+                "acpi" => "PNP0A0|Thermal|Windows 20",
+                _ => "Registry|Device",
+            };
             capture(backend, options, &directory.join("kd-re-referencias.png"), |app| {
-                app.set_reference_filter("PNP|Thermal|Windows 20", true);
+                app.set_reference_filter(filter, true);
                 app.focus(Tab::References);
             })?;
         }
