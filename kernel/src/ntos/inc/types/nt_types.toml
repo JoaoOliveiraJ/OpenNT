@@ -83,6 +83,8 @@ raizes = [
   "_CM_INDEX", "_CM_BIG_DATA",
   # pipes nomeados e mailslots
   "_NAMED_PIPE_CREATE_PARAMETERS", "_MAILSLOT_CREATE_PARAMETERS",
+  # Etw: buffers de sessão, registros de evento e notificações de modo usuário
+  "_WMI_BUFFER_HEADER", "_EVENT_HEADER", "_ETWP_NOTIFICATION_HEADER",
 ]
 
 # O PDB do ntoskrnl.exe 10.0.19041 que os tipos seguem (GUID e idade do RSDS
@@ -213,7 +215,7 @@ prefixos = ["HAL_", "WHEA_", "ACPI", "MCA", "MCE", "INTERRUPT_", "XPF_", "AER_"]
 [[familia]]
 nome = "etw"
 doc = "Etw: estruturas de rastreamento."
-prefixos = ["ETW_", "WMI_", "PERFINFO", "EVENT_", "TRACE_"]
+prefixos = ["ETW_", "ETWP_", "WMI_", "PERFINFO", "EVENT_", "TRACE_"]
 
 [[familia]]
 nome = "ke"
