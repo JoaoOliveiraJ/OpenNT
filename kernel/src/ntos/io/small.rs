@@ -7,7 +7,6 @@
 //! - `thread_io` — I/O pendente por thread
 //! - `configuration_information` — a CONFIGURATION_INFORMATION global
 //! - `error_log` — entradas do log de erros de I/O
-//! - `shutdown_notification` — dispositivos que recebem IRP_MJ_SHUTDOWN
 //! - `priority_callbacks` — callbacks de prioridade de I/O registrados
 //! - `wmi_registration` — dispositivos com classes WMI registradas
 //! - `sfio_stream` — identificadores de stream do Storage QoS
@@ -281,39 +280,6 @@ pub mod error_log {
         entry.time_stamp.set(crate::ntos::mm::guest_memory::read64(0xFFFF_F780_0000_0014));
         debug_print!("[errorlog] codigo=0x{:x}", code);
         free_entry(packet);
-    }
-}
-
-/// IoRegister/UnregisterShutdownNotification: dispositivos que recebem
-/// IRP_MJ_SHUTDOWN no desligamento.
-pub mod shutdown_notification {
-    use alloc::format;
-    use alloc::vec::Vec;
-
-    use crate::ntos::io::{device, io_manager};
-    use crate::rtl::SpinLock;
-
-    static SHUTDOWN_DEVICES: SpinLock<Vec<u64>> = SpinLock::new(Vec::new());
-
-    pub fn register(device: u64) {
-        SHUTDOWN_DEVICES.lock().push(device);
-    }
-
-    pub fn unregister(device: u64) {
-        let mut devices = SHUTDOWN_DEVICES.lock();
-        if let Some(index) = devices.iter().position(|&candidate| candidate == device) {
-            devices.remove(index);
-        }
-    }
-
-    /// Chamado no desligamento: IRP_MJ_SHUTDOWN a cada dispositivo registrado.
-    pub fn run_shutdown_notifications() {
-        let devices = SHUTDOWN_DEVICES.lock().clone();
-        for device in devices {
-            let Some(node) = device::find_device_node_by_pointer(device) else { continue };
-            let mut request = io_manager::make_io_request(io_manager::irp_mj::SHUTDOWN, io_manager::IoParams::default());
-            let _ = io_manager::call_driver(&format!("\\Device\\{}", device::device_name(node)), &mut request);
-        }
     }
 }
 

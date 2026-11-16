@@ -38,7 +38,9 @@ const HELP: &[&str] = &[
     "ps                lista processos",
     "spawn <prog>      cria processo embutido (pisca)",
     "kill <pid>        mata processo",
-    "halt              desliga",
+    "halt              para o processador",
+    "shutdown          desligamento ordenado e desliga a maquina (ACPI S5)",
+    "reboot            desligamento ordenado e reinicia a maquina",
 ];
 
 /// Aceita caminhos estilo Windows (`C:\foo`, `C:/foo`, `\foo`) -> `/foo`.
@@ -177,8 +179,25 @@ fn cmd_objects(_: &[&str]) {
 }
 
 fn cmd_halt(_: &[&str]) {
-    console::print("desligando...");
+    console::print("processador parado");
     cpu::halt_forever();
+}
+
+/// NtShutdownSystem(Action) do modo kernel: só volta em falha.
+fn shutdown_with(action: u32, text: &str) {
+    console::print(text);
+    match crate::ntos::po::shutdown::shutdown_system(action) {
+        Ok(status) => console::print(&format!("desligamento recusado: {status:#x}")),
+        Err(error) => console::print(&format!("desligamento falhou: {error}")),
+    }
+}
+
+fn cmd_shutdown(_: &[&str]) {
+    shutdown_with(2, "desligando (ShutdownPowerOff)...");
+}
+
+fn cmd_reboot(_: &[&str]) {
+    shutdown_with(1, "reiniciando (ShutdownReboot)...");
 }
 
 type Command = fn(&[&str]);
@@ -201,6 +220,8 @@ const COMMANDS: &[(&str, Command)] = &[
     ("loaddriver", cmd_load_driver),
     ("objects", cmd_objects),
     ("halt", cmd_halt),
+    ("shutdown", cmd_shutdown),
+    ("reboot", cmd_reboot),
 ];
 
 fn print_line(text: &str) {

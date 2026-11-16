@@ -719,6 +719,7 @@ pub fn init() {
     crate::ntos::ps::user::nls::init();
     crate::ntos::ps::user::syscalls_core::init();
     crate::ntos::ps::user::tokens::init();
+    crate::ntos::po::shutdown::register_user_services();
     crate::ntos::ps::user::index::register();
     crate::ntos::ps::process_image::init();
     crate::ntos::ps::user::index::set_user_mode_init(crate::hal::amd64::usermode::user_mode_init);

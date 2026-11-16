@@ -117,6 +117,9 @@ pub fn system_keys(smss_boot: bool) -> Vec<SeedKey> {
     if smss_boot {
         keys.extend(super::session_manager::seed_keys());
     }
+    // Control\Windows: onde o ExpRecordShutdownTime grava o ShutdownTime de
+    // cada desligamento.
+    keys.push(SeedKey::new("CurrentControlSet\\Control\\Windows"));
     let mut keys: Vec<SeedKey> = keys.into_iter().map(in_control_set).collect();
     // Select: o conjunto corrente, o padrão, o que falhou (nenhum) e o
     // último bom, que o CmpCreateControlSet lê.

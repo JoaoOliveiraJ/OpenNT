@@ -14,7 +14,8 @@ use crate::ntos::io::{cancel, device, device_interface, device_property, interru
 use crate::ntos::io::file::zw as zw_files;
 use crate::ntos::cm::hw_description;
 use crate::ntos::io::controller::{controller, start_io};
-use crate::ntos::io::small::{configuration_information, delete_device, error_log, partition_table, priority_callbacks, sfio_stream, shutdown_notification, thread_io, wmi_registration};
+use crate::ntos::io::small::{configuration_information, delete_device, error_log, partition_table, priority_callbacks, sfio_stream, thread_io, wmi_registration};
+use crate::ntos::io::shutdown as shutdown_queues;
 use crate::ntos::io::small::initial_stack as kernel_stack;
 use crate::ntos::io::threads::{io_timer, thread_activity};
 use crate::ntos::io::file::information as file_information;
@@ -338,11 +339,10 @@ fn io_set_thread_hard_error_mode(call: &Call) -> Result<u64, KernelError> {
     Ok(thread_io::set_hard_error_mode(call.arg(1) as u8)? as u64)
 }
 fn io_register_shutdown_notification(call: &Call) -> Result<u64, KernelError> {
-    shutdown_notification::register(call.arg(1));
-    Ok(0)
+    Ok(signed_status(shutdown_queues::register_shutdown(call.arg(1))?))
 }
 fn io_unregister_shutdown_notification(call: &Call) -> Result<u64, KernelError> {
-    shutdown_notification::unregister(call.arg(1));
+    shutdown_queues::unregister(call.arg(1))?;
     Ok(0)
 }
 /// IoReportTargetDeviceChangeAsynchronous(PhysicalDeviceObject,

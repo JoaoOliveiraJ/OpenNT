@@ -116,6 +116,28 @@ pub fn shutdown_waiters() -> Vec<u64> {
     SHUTDOWN.lock().threads.clone()
 }
 
+/// O começo do PopGracefulShutdown (rva 0x9b1118): KeSetEvent no
+/// PopShutdownEvent, a lista fechada (PopShutdownListAvailable = FALSE: o
+/// PoRequestShutdownEvent passa a falhar) e a espera do fim de cada thread
+/// da lista (KeWaitForSingleObject na ETHREAD), cuja referência volta.
+/// Devolve quantas threads foram esperadas.
+pub fn notify_shutdown_waiters() -> Result<usize, KernelError> {
+    let event = shutdown_event();
+    if event != 0 {
+        dispatcher::set_event(event);
+    }
+    let threads = {
+        let mut list = SHUTDOWN.lock();
+        list.closed = true;
+        core::mem::take(&mut list.threads)
+    };
+    for &thread in &threads {
+        dispatcher::wait_for_single_object(thread, 0, 0, false);
+        process::dereference_thread(thread)?;
+    }
+    Ok(threads.len())
+}
+
 // ---- PoSetSystemState, PoRegisterSystemState, PoUnregisterSystemState,
 // ---- PoSetPowerButtonHoldState e PoSetFixedWakeSource (ntoskrnl 19041) -------
 //

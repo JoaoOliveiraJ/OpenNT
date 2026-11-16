@@ -12,10 +12,16 @@
 //! (`io/file_system.rs::mount_volume`).
 //!
 //! O leitor NTFS do kernel continua dono do mesmo disco como D:, então o que
-//! o file system grava não vai ao disco: fica numa sobreposição em memória,
-//! por página de 4 KB, e é o que as leituras seguintes do volume devolvem
-//! (o disco e o leitor do kernel continuam vendo a imagem do boot). Para o
-//! file system o volume é um disco gravável comum. IRP_MJ_READ lê setores
+//! o file system grava não vai ao disco durante o boot: fica numa
+//! sobreposição em memória, por página de 4 KB com os setores gravados
+//! marcados, e é o que as leituras seguintes do volume devolvem (o disco e o
+//! leitor do kernel continuam vendo a imagem do boot). A sobreposição é o
+//! cache de escrita do dispositivo: no desligamento o volume, registrado na
+//! fila de última chance (IoRegisterLastChanceShutdownNotification, depois
+//! dos file systems), recebe o IRP_MJ_SHUTDOWN e grava no disco só os
+//! setores que o file system gravou, seguidos do FLUSH CACHE do drive; dali
+//! em diante as escritas vão direto ao disco. Para o file system o volume é
+//! um disco gravável comum. IRP_MJ_READ lê setores
 //! inteiros para o buffer do MDL (DO_DIRECT_IO) pelo DMA do driver ATA e
 //! aplica a sobreposição; IRP_MJ_WRITE grava nela. Os IOCTLs de disco,
 //! armazenamento e mount manager que um file system pede na montagem são
@@ -25,6 +31,7 @@
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::drivers::storage::ata_pio;
 use crate::ntos::inc::field::NtStruct;
@@ -67,6 +74,7 @@ const IRP_MJ_WRITE: u8 = 0x04;
 const IRP_MJ_FLUSH_BUFFERS: u8 = 0x09;
 const IRP_MJ_DEVICE_CONTROL: u8 = 0x0E;
 const IRP_MJ_INTERNAL_DEVICE_CONTROL: u8 = 0x0F;
+const IRP_MJ_SHUTDOWN: u8 = 0x10;
 const IRP_MJ_CLEANUP: u8 = 0x12;
 
 const IOCTL_DISK_GET_DRIVE_GEOMETRY: u32 = 0x0007_0000;
@@ -106,11 +114,22 @@ struct Volume {
 }
 
 static VOLUME: SpinLock<Option<Volume>> = SpinLock::new(None);
-/// Páginas de 4 KB gravadas pelo file system (índice da página -> bytes).
-static OVERLAY: SpinLock<BTreeMap<u64, Box<[u8; PAGE]>>> = SpinLock::new(BTreeMap::new());
+/// Uma página de 4 KB da sobreposição: os bytes e os setores (bit por setor)
+/// que o file system gravou.
+struct OverlayPage {
+    data: Box<[u8; PAGE]>,
+    dirty: u8,
+}
+
+/// Páginas gravadas pelo file system (índice da página -> página).
+static OVERLAY: SpinLock<BTreeMap<u64, OverlayPage>> = SpinLock::new(BTreeMap::new());
 const PAGE: usize = 4096;
 const SECTORS_PER_PAGE: u64 = PAGE as u64 / SECTOR;
 static UNKNOWN_CONTROLS: SpinLock<BTreeSet<u32>> = SpinLock::new(BTreeSet::new());
+/// O IRP_MJ_SHUTDOWN já gravou a sobreposição: as escritas vão ao disco.
+static WRITE_THROUGH: AtomicBool = AtomicBool::new(false);
+/// Setores gravados no disco pelo desligamento.
+static COMMITTED: AtomicU64 = AtomicU64::new(0);
 
 /// O DEVICE_OBJECT do volume, se já criado.
 pub fn device() -> Option<u64> {
@@ -151,6 +170,8 @@ pub fn create(drive: u8) -> Result<u64, KernelError> {
     io_manager::register_device(node, io_manager::DeviceEntry { native_device: address, ..Default::default() });
     *VOLUME.lock() = Some(Volume { device: address, drive, sectors });
     io_manager::register_pdo_native_answerer(answer);
+    // Depois dos file systems no desligamento: o cache de escrita vai ao disco.
+    crate::ntos::io::shutdown::register_last_chance(address)?;
     debug_print!("[atavol] \\Device\\{} criado sobre o drive {} ({} setores, escrita em memoria)", DEVICE_NAME, drive, sectors);
     Ok(address)
 }
@@ -202,6 +223,7 @@ fn answer(device: u64, packet: u64) -> Option<i32> {
         IRP_MJ_CREATE | IRP_MJ_CLOSE | IRP_MJ_CLEANUP | IRP_MJ_FLUSH_BUFFERS => (STATUS_SUCCESS, 0),
         IRP_MJ_READ => read(&volume, irp, stack),
         IRP_MJ_WRITE => write(&volume, irp, stack),
+        IRP_MJ_SHUTDOWN => commit(&volume),
         IRP_MJ_DEVICE_CONTROL | IRP_MJ_INTERNAL_DEVICE_CONTROL => device_control(&volume, irp, stack),
         // PnP sem tratamento mantém STATUS_NOT_SUPPORTED, como manda o WDM.
         _ => (STATUS_NOT_SUPPORTED, 0),
@@ -268,7 +290,8 @@ fn apply_overlay(first: u64, bytes: &mut [u8]) {
         return;
     }
     let overlay = OVERLAY.lock();
-    for (&page, data) in overlay.range(first / SECTORS_PER_PAGE..=(first + count - 1) / SECTORS_PER_PAGE) {
+    for (&page, stored) in overlay.range(first / SECTORS_PER_PAGE..=(first + count - 1) / SECTORS_PER_PAGE) {
+        let data = &stored.data;
         for sector in page * SECTORS_PER_PAGE..(page + 1) * SECTORS_PER_PAGE {
             if (first..first + count).contains(&sector) {
                 let source = ((sector - page * SECTORS_PER_PAGE) * SECTOR) as usize;
@@ -296,6 +319,15 @@ fn write(volume: &Volume, irp: &Irp, stack: &IoStackLocation) -> (u32, u64) {
         return (STATUS_INVALID_PARAMETER, 0);
     }
     let data = guest::read_bytes(buffer, length as usize);
+    if WRITE_THROUGH.load(Ordering::Acquire) {
+        return match ata_pio::write_sectors(first, &data, volume.drive) {
+            Ok(()) => (STATUS_SUCCESS, length),
+            Err(error) => {
+                debug_print!("[atavol] escrita do setor {} falhou: {}", first, error);
+                (STATUS_DEVICE_DATA_ERROR, 0)
+            }
+        };
+    }
     for index in 0..length / SECTOR {
         let sector = first + index;
         let page = sector / SECTORS_PER_PAGE;
@@ -306,15 +338,64 @@ fn write(volume: &Volume, irp: &Irp, stack: &IoStackLocation) -> (u32, u64) {
             };
             let mut fresh = Box::new([0u8; PAGE]);
             fresh[..original.len()].copy_from_slice(&original);
-            OVERLAY.lock().entry(page).or_insert(fresh);
+            OVERLAY.lock().entry(page).or_insert(OverlayPage { data: fresh, dirty: 0 });
         }
         let source = (index * SECTOR) as usize;
-        let target = ((sector - page * SECTORS_PER_PAGE) * SECTOR) as usize;
+        let slot = sector - page * SECTORS_PER_PAGE;
+        let target = (slot * SECTOR) as usize;
         if let Some(stored) = OVERLAY.lock().get_mut(&page) {
-            stored[target..target + SECTOR as usize].copy_from_slice(&data[source..source + SECTOR as usize]);
+            stored.data[target..target + SECTOR as usize].copy_from_slice(&data[source..source + SECTOR as usize]);
+            stored.dirty |= 1 << slot;
         }
     }
     (STATUS_SUCCESS, length)
+}
+
+/// IRP_MJ_SHUTDOWN: os setores gravados da sobreposição vão ao disco, em
+/// séries contíguas, e o drive descarrega o cache dele (FLUSH CACHE). As
+/// páginas gravadas saem da sobreposição e as escritas seguintes vão direto
+/// ao disco.
+fn commit(volume: &Volume) -> (u32, u64) {
+    let pages = core::mem::take(&mut *OVERLAY.lock());
+    WRITE_THROUGH.store(true, Ordering::Release);
+    let mut sectors: Vec<(u64, &[u8])> = Vec::new();
+    for (&page, stored) in &pages {
+        for slot in 0..SECTORS_PER_PAGE {
+            if stored.dirty & (1 << slot) != 0 {
+                let offset = (slot * SECTOR) as usize;
+                sectors.push((page * SECTORS_PER_PAGE + slot, &stored.data[offset..offset + SECTOR as usize]));
+            }
+        }
+    }
+    let mut index = 0;
+    let mut written = 0u64;
+    while index < sectors.len() {
+        let first = sectors[index].0;
+        let mut run = Vec::new();
+        while index < sectors.len() && sectors[index].0 == first + (run.len() as u64 / SECTOR) && (run.len() as u64) < CHUNK_SECTORS * SECTOR {
+            run.extend_from_slice(sectors[index].1);
+            index += 1;
+        }
+        if let Err(error) = ata_pio::write_sectors(first, &run, volume.drive) {
+            debug_print!("[atavol] desligamento: gravacao do setor {} falhou: {}", first, error);
+            return (STATUS_DEVICE_DATA_ERROR, 0);
+        }
+        written += run.len() as u64 / SECTOR;
+    }
+    let flushed = ata_pio::flush(volume.drive);
+    COMMITTED.fetch_add(written, Ordering::AcqRel);
+    debug_print!("[atavol] desligamento: {} setores gravados no disco, FLUSH CACHE {}", written, if flushed.is_ok() { "ok" } else { "falhou" });
+    (if flushed.is_ok() { STATUS_SUCCESS } else { STATUS_DEVICE_DATA_ERROR }, 0)
+}
+
+/// Setores da sobreposição gravados no disco pelo desligamento.
+pub fn committed_sectors() -> u64 {
+    COMMITTED.load(Ordering::Acquire)
+}
+
+/// Setores gravados pelo file system que ainda estão só na sobreposição.
+pub fn pending_sectors() -> u64 {
+    OVERLAY.lock().values().map(|page| page.dirty.count_ones() as u64).sum()
 }
 
 /// Grava a resposta no SystemBuffer se couber: (status, Information).

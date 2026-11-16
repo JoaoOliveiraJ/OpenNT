@@ -346,6 +346,44 @@ pub fn unregister_file_system(device: &DeviceObject) -> Result<(), KernelError> 
     Ok(())
 }
 
+/// RemoveHeadList com as checagens do NT: o primeiro elo da fila, com
+/// Flink/Blink dele zerados (o IopShutdownBaseFileSystems).
+fn remove_head(head: &ListEntry) -> Result<Option<&'static ListEntry>, KernelError> {
+    let first = head.flink.get();
+    if first == head.address() || first == 0 {
+        return Ok(None);
+    }
+    let entry = list(first);
+    remove_entry(entry)?;
+    entry.flink.set(0);
+    entry.blink.set(0);
+    Ok(Some(entry))
+}
+
+/// A parte de file systems do IoShutdownSystem(1) (rva 0x9ab03f): o
+/// IopDatabaseResource exclusivo, que não é mais solto, e o
+/// IopShutdownBaseFileSystems (rva 0x9ab274) das filas de disco, CD-ROM e
+/// fita, nessa ordem: cada CDO sai da fila, ganha uma referência de objeto e
+/// uma do dispositivo e recebe o IRP_MJ_SHUTDOWN (`deliver`) no topo da
+/// pilha (IoGetAttachedDevice, sem referência), quando há um anexado; depois
+/// as duas referências voltam. A fila de rede fica como está.
+pub fn shutdown_base_file_systems(mut deliver: impl FnMut(u64)) -> Result<(), KernelError> {
+    let database = database()?;
+    resource::acquire_exclusive(database.resource.address(), true)?;
+    for head in [&database.disk, &database.cd_rom, &database.tape] {
+        while let Some(entry) = remove_head(head)? {
+            let control = device_object(entry.address() - QUEUE_LINK);
+            invoke_handler("ObfReferenceObject", &[control.address()])?;
+            reference_device(control);
+            let target = if control.attached_device.get() != 0 { device_objects::top(control.address()) } else { control.address() };
+            deliver(target);
+            dereference_device(control);
+            invoke_handler("ObfDereferenceObject", &[control.address()])?;
+        }
+    }
+    Ok(())
+}
+
 /// IopNotifyAlreadyRegisteredFileSystems: o último da fila (RAW) é pulado nas
 /// filas locais.
 fn notify_already_registered(head: &ListEntry, routine: u64, skip_last: bool) {

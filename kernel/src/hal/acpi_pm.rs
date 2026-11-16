@@ -164,15 +164,39 @@ pub fn interrupt_model() -> u32 {
 }
 
 /// HaliAcpiMachineStateInit(SleepValues, *InterruptModel): o estado de
-/// despertar e o modelo de interrupção para o _PIC. Os tratadores de S1-S4
-/// (HaliAcpiSleep pelo ZwPowerInformation(SystemPowerStateHandler)) não são
-/// registrados: o Po do OpenNT não suspende o sistema.
-pub fn machine_state_init(_sleep_values: u64, interrupt_model_out: u64) {
+/// despertar, o modelo de interrupção para o _PIC e o contexto do S5. Os
+/// tratadores de S1-S4 (HaliAcpiSleep pelo
+/// ZwPowerInformation(SystemPowerStateHandler)) não são registrados: o Po do
+/// OpenNT não suspende o sistema.
+///
+/// SleepValues é o HAL_SLEEP_VAL[5] que o acpi.sys monta dos objetos \_Sx:
+/// 3 bytes por estado (Supported, Pm1aVal, Pm1bVal), S1 em +0 e S5 em +0xC.
+/// Com o S5 suportado, o HalpShutdownContext fica (Pm1bVal & 0xF | 0x850) <<
+/// 4 | Pm1aVal & 0xF, que o HalpShutdown grava no PM1x_CNT.
+pub fn machine_state_init(sleep_values: u64, interrupt_model_out: u64) {
     WAKEUP_STATE.store(1, Ordering::SeqCst);
     if interrupt_model_out != 0 {
         // SAFETY: parâmetro de saída do acpi.sys.
         unsafe { Field::<u32>::at(interrupt_model_out) }.set(interrupt_model());
     }
+    if sleep_values != 0 && guest::read8(sleep_values + 0xC) != 0 {
+        let (pm1a, pm1b) = (guest::read8(sleep_values + 0xD) as u32, guest::read8(sleep_values + 0xE) as u32);
+        SHUTDOWN_CONTEXT.store(shutdown_context(pm1a, pm1b), Ordering::SeqCst);
+        debug_print!("[hal] HaliAcpiMachineStateInit: S5 SLP_TYPa={} SLP_TYPb={} (HalpShutdownContext {:#x})", pm1a, pm1b, shutdown_context(pm1a, pm1b));
+    }
+}
+
+/// HalpShutdownContext: 0 enquanto o acpi.sys não informou o S5.
+static SHUTDOWN_CONTEXT: AtomicU32 = AtomicU32::new(0);
+
+/// O HalpShutdownContext dos valores de SLP_TYP do S5.
+pub fn shutdown_context(pm1a: u32, pm1b: u32) -> u32 {
+    ((pm1b & 0xF) | 0x850) << 4 | (pm1a & 0xF)
+}
+
+/// O HalpShutdownContext que o acpi.sys deu (0 = nenhum).
+pub fn acpi_shutdown_context() -> u32 {
+    SHUTDOWN_CONTEXT.load(Ordering::SeqCst)
 }
 
 // ---- tabelas ---------------------------------------------------------------
