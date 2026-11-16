@@ -91,9 +91,13 @@ pub fn build() {
     }
     // `--trace-driver-api` rastreia as APIs que os drivers da árvore chamam.
     crate::ntos::init::exports::set_api_trace(crate::ntos::init::boot_config::trace_driver_api());
-    // O processamento roda numa thread de sistema, como as ações do PnP
-    // manager do NT (`tree::process_on_system_thread`).
-    let processed = pnp::tree::process_on_system_thread();
+    // Com a pilha USB, o processamento roda numa thread de sistema, como as
+    // ações do PnP manager do NT (`tree::process_on_system_thread`): o START
+    // do usbxhci.sys (KMDF) espera work items que o contexto de boot roda
+    // durante a espera. Os demais boots seguem no contexto de boot: as
+    // leituras do Code Integrity pelo driver ATA interno (`--start-driver`)
+    // ainda param numa thread de sistema.
+    let processed = if crate::drivers::bus::usb_stack::enabled() { pnp::tree::process_on_system_thread() } else { pnp::tree::process() };
     crate::ntos::init::exports::set_api_trace(false);
     if let Err(error) = processed {
         debug_print!("[pnp] arvore do PnP: {}", error);

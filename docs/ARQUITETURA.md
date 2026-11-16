@@ -1342,12 +1342,14 @@ controladora, o usbhub3.sys no hub raiz (USB\ROOT_HUB30), o hidusb.sys com o
 hidclass.sys nos dispositivos HID (USB\Class_03) e o kbdhid.sys e o
 mouhid.sys nas coleções de teclado e de mouse, com os filtros de classe
 kbdclass e mouclass. Como as ações do PnP manager do NT, que rodam numa
-worker thread, a árvore construída uma vez no fim da fase 1
-(`device_tree::build`, com qualquer raiz) é processada numa thread de
-sistema (`tree::process_on_system_thread`) e o contexto de boot espera por
-ela girando as interrupções, os DPCs, os work items e o escalonador: um work
+worker thread, com a pilha USB a árvore construída uma vez no fim da fase 1
+(`device_tree::build`) é processada numa thread de sistema
+(`tree::process_on_system_thread`) e o contexto de boot espera por ela
+girando as interrupções, os DPCs, os work items e o escalonador: um work
 item rodado nessa espera não fica empilhado sobre um START que segura as
-travas da máquina de estados PnP do KMDF. A controladora entra nessa
+travas da máquina de estados PnP do KMDF. Os demais boots seguem no
+contexto de boot: as leituras do Code Integrity (`--start-driver`) pelo
+driver ATA interno ainda param numa thread de sistema. A controladora entra nessa
 árvore; a pilha USB só espera a enumeração das portas e confere os marcos.
 Com a raiz ACPI (o padrão) a controladora é enumerada pelo pci.sys real e
 instalada pelo usbxhci.inf, mas o árbitro de IRQ do acpi.sys, que no NT
@@ -1355,7 +1357,12 @@ arbitra também as mensagens (IrqArbpFindSuitableRangeMsi, com os vetores
 do IDT por processador, e grava ele mesmo os dados de conexão pelo
 IoSetDevicePropertyData), recusa as duas listas do pci.sys: a do MSI-X com
 STATUS_UNSUCCESSFUL e a da linha com STATUS_INVALID_PARAMETER, e o nó fica
-com CM_PROB_NORMAL_CONFLICT; o teste `usb` usa `--pnp-root=internal`. As
+com CM_PROB_NORMAL_CONFLICT; o teste `usb` usa `--pnp-root=internal`.
+O IRP_MN_FILTER_RESOURCE_REQUIREMENTS com lista começa com STATUS_SUCCESS,
+como no IopFilterResourceRequirementsCall: o KMDF do usbxhci.sys troca a
+lista (libera a recebida e devolve outra em Information) e completa com o
+status que veio de baixo; com STATUS_NOT_SUPPORTED o PnP ficava com a lista
+liberada. As
 portas são enumeradas depois do START: o IoInvalidateDeviceRelations do hub
 enfileira a reenumeração e a ação (o PipRequestDeviceAction), que uma
 thread de sistema das ações processa (`tree.rs`, um processamento por vez;
