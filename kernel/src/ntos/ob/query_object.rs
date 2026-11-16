@@ -349,6 +349,14 @@ pub fn query_name_string(pointer: u64, output: u64, size: u32, returned: u64) ->
     if callbacks::exists(pointer) {
         return write_name_information(callbacks::name(pointer).as_deref(), output, size, returned);
     }
+    // Um FILE_OBJECT: a QueryNameProcedure do tipo File (IopQueryName).
+    if crate::ntos::ob::objects::file::is_file(pointer) {
+        return match crate::ntos::io::file::information::query_object_name(pointer) {
+            Ok(Ok(units)) => write_name_information(Some(&String::from_utf16_lossy(&units)), output, size, returned),
+            Ok(Err(status)) => status,
+            Err(_) => 0xC000_0001,
+        };
+    }
     let Some(path) = find_path_by_native_pointer(pointer) else {
         if returned != 0 {
             return_length(returned).set(0);

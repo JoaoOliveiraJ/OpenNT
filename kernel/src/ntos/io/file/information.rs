@@ -494,12 +494,7 @@ fn dos_device_prefix(device: &DeviceObject) -> Result<alloc::vec::Vec<u16>, Kern
     }
     guest::free_bytes(scratch);
     // ObQueryNameString do dispositivo: um dispositivo sem nome dá nome vazio.
-    let path = crate::ntos::io::io_manager::devices()
-        .into_iter()
-        .find(|(_, entry)| entry.native_device == device.address() || entry.stack_top == device.address())
-        .and_then(|(node, _)| crate::ntos::ob::object_manager::path_of(node))
-        .unwrap_or_default();
-    Ok(path.encode_utf16().collect())
+    Ok(device_nt_name(device.address()))
 }
 
 /// FileName do FILE_NAME_INFORMATION (classe 9), crescendo o buffer em
@@ -532,6 +527,55 @@ fn dos_file_name(file: u64) -> Result<Result<alloc::vec::Vec<u16>, u32>, KernelE
         }
         return Ok(Ok(bytes.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect()));
     }
+}
+
+/// O nome NT de um dispositivo (o ObQueryNameString dele): o caminho do nó
+/// no namespace; um dispositivo sem nome dá nome vazio.
+fn device_nt_name(device: u64) -> alloc::vec::Vec<u16> {
+    crate::ntos::io::io_manager::devices()
+        .into_iter()
+        .find(|(_, entry)| entry.native_device == device || entry.stack_top == device)
+        .and_then(|(node, _)| crate::ntos::ob::object_manager::path_of(node))
+        .unwrap_or_default()
+        .encode_utf16()
+        .collect()
+}
+
+/// IopQueryName (a QueryNameProcedure do tipo File, que o ObQueryNameString
+/// de um FILE_OBJECT chama; o IopQueryNameInternal sem UseDosDeviceName): o
+/// nome NT do dispositivo do arquivo e, fora de uma abertura direta do
+/// dispositivo, o FileNameInformation do FS (as falhas de "classe não
+/// suportada" dão só o dispositivo). O volume embutido do kernel não recebe
+/// IRPs: ali o nome do arquivo é o FileName do FILE_OBJECT, o caminho que
+/// o próprio file system deu na abertura.
+pub fn query_object_name(file: u64) -> Result<Result<alloc::vec::Vec<u16>, u32>, KernelError> {
+    let object = file_at(file);
+    let device = object.device_object.get();
+    if device == 0 {
+        return Ok(Err(SET_STATUS_INVALID_DEVICE_REQUEST));
+    }
+    let mut name = device_nt_name(device);
+    if object.flags.get() & FO_DIRECT_DEVICE_OPEN != 0 {
+        return Ok(Ok(name));
+    }
+    if related_device(file)? == 0 {
+        let length = object.file_name.length.get() as usize;
+        let buffer = object.file_name.buffer.get();
+        if length != 0 && buffer != 0 {
+            let bytes = guest::read_bytes(buffer, length & !1);
+            let units: alloc::vec::Vec<u16> = bytes.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect();
+            if units.first() != Some(&(b'\\' as u16)) {
+                name.push(b'\\' as u16);
+            }
+            name.extend_from_slice(&units);
+        }
+        return Ok(Ok(name));
+    }
+    match dos_file_name(file)? {
+        Ok(path) => name.extend_from_slice(&path),
+        Err(status) => return Ok(Err(status)),
+    }
+    Ok(Ok(name))
 }
 
 /// IoQueryFileDosDeviceName(FileObject, *ObjectNameInformation).

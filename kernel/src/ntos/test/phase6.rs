@@ -2510,6 +2510,16 @@ fn zw_kernel_files(assert: Assert) {
     let file = zw_files::file_object_of_handle(handle);
     assert(created.is_ok_and(|status| status == 0) && iosb.information.get() == 2 && memory_file_system::exists("/opennt-zw.txt") && file != 0 && at::<nt::FileObject>(file).flags.get() & 2 != 0, "zwfile: ZwCreateFile cria no disco em memoria com FILE_OBJECT sincrono");
     assert(zw_files::file_backing(file).is_some_and(|(_, path)| path == "/opennt-zw.txt") && zw_files::query_file_handle(handle, false).is_some_and(|entry| entry.is_ok_and(|(pointer, _, options)| pointer == file && options == 0x20)), "zwfile: backing do FILE_OBJECT e consulta do handle");
+    // ObQueryNameString do FILE_OBJECT (IopQueryName): o dispositivo do
+    // volume e o nome do arquivo.
+    let name_buffer = guest::alloc_bytes(0x200);
+    let name_length = guest::alloc_bytes(8);
+    let named = call_export("ObQueryNameString", &[file, name_buffer, 0x200, name_length]).map(|status| status as u32);
+    let queried_name = guest_strings_read(name_buffer);
+    let short = call_export("ObQueryNameString", &[file, name_buffer, 8, name_length]).map(|status| status as u32);
+    assert(named == Some(0) && queried_name.starts_with("\\Device\\") && queried_name.to_lowercase().ends_with("\\opennt-zw.txt") && guest::read32(name_length) == nt::ObjectNameInformation::SIZE as u32 + queried_name.encode_utf16().count() as u32 * 2 + 2 && short == Some(0xC000_0004), "zwfile: ObQueryNameString de um FILE_OBJECT da o dispositivo e o arquivo");
+    guest::free_bytes(name_buffer);
+    guest::free_bytes(name_length);
     let again = zw_files::create_kernel_file(output, 0x12019F, attributes, io_status, 3, 2, 0x20);
     let second = guest::read64(output);
     let exists = again.is_ok_and(|status| status == 0) && iosb.information.get() == 4;
