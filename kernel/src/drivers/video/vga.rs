@@ -124,8 +124,9 @@ pub fn clear() {
     screen.hardware_cursor();
 }
 
-/// Pinta a tela inteira com espaços no atributo dado e leva o cursor ao
-/// canto (a tela de bugcheck em modo texto).
+/// Pinta a tela inteira com espaços no atributo dado e esconde o cursor de
+/// hardware (o bit 5 do registrador de início do cursor, CRTC 0x0A): a tela
+/// de bugcheck em modo texto.
 pub fn fill_screen(attribute: u8) {
     let mut screen = SCREEN.lock();
     screen.attribute = attribute;
@@ -134,7 +135,8 @@ pub fn fill_screen(attribute: u8) {
     }
     screen.cx = 0;
     screen.cy = 0;
-    screen.hardware_cursor();
+    port::write8(0x3D4, 0x0A);
+    port::write8(0x3D5, 0x20);
 }
 
 /// Grava um byte da página de código 437 numa célula, sem mover o cursor.
