@@ -440,7 +440,11 @@ vale a mediana de três janelas, então uma CPU virtual tirada de execução
 pelo hospedeiro no meio da medida não a distorce. Sem o timer do ACPI, o
 canal 0 do PIT da mesma forma (contagem por latch). O autoteste
 (`self_test.rs`) mede de novo contra a mesma referência e exige até 0,5% de
-diferença.
+diferença. O timer do LAPIC, que dá o quantum de 10 ms, é medido contra o
+TSC da mesma forma (`nano/interrupts.rs`): três janelas one-shot de 50 ms,
+vale a mediana. Com o hospedeiro carregado, uma janela única chegou a medir
+o contador emulado do LAPIC 18 vezes acima do real, e o quantum e as esperas
+por tempo ficavam 18 vezes mais longos.
 
 **Pilhas de kernel por thread.** Toda thread que executa tem pilha de kernel
 própria, do `mm/kernel_stack.rs` (o MmCreateKernelStack/MmDeleteKernelStack):
@@ -2269,6 +2273,9 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   aceite do boot; as hives já foram ligadas na fase 1), o
   NtApphelpCacheControl da ntdll (`ps/apphelp_cache.rs`, o IOCTL ao
   `\Device\ahcache` ou, sem ele, o status pré-definido de cada serviço), o
+  NtQueryDirectoryObject que o smss importa (`ob/handles/namespace.rs`,
+  com as sondas de modo usuário, DIRECTORY_QUERY e as respostas do 19041
+  para o fim da lista e a entrada que não cabe), o
   NtIsUILanguageComitted do csrss (`ps/locale.rs`), as classes
   ProcessDefaultHardErrorMode e ProcessHandleCheckingMode do
   NtSet/NtQueryInformationProcess (`ps/set_process_information.rs`,
