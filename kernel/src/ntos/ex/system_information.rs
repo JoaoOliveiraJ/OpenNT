@@ -584,13 +584,17 @@ pub fn extend_service_table(buffer: u64, length: u32) -> Result<u32, KernelError
     let entry_point = image_base + unsafe { crate::ntos::inc::types::ImageNtHeaders64::at(header) }.optional_header.address_of_entry_point.get() as u64;
     // `--trace-driver-api` no boot do smss: o DriverEntry do driver de sessão
     // (o win32k.sys e o que ele carrega) imprime cada export que chama.
+    // O rastreio volta ao estado anterior: depois do portão do smss ele
+    // segue ligado para os drivers (o win32k da sessão seguinte não o
+    // desliga).
     let trace = crate::ntos::init::boot_config::trace_driver_api() && crate::ntos::init::boot_config::smss_boot();
+    let previous = crate::ntos::init::exports::api_trace_enabled();
     if trace {
         crate::ntos::init::exports::set_api_trace(true);
     }
     let status = initialize_session_driver(entry_point, image_base);
     if trace {
-        crate::ntos::init::exports::set_api_trace(false);
+        crate::ntos::init::exports::set_api_trace(previous);
     }
     debug_print!("[ex] driver de sessao {}: DriverEntry -> {:#x}", name, status);
     crate::ntos::init::initial_process::session_driver_initialized(&name, image_base, status);

@@ -16,7 +16,14 @@ use crate::rtl::KernelError;
 /// adiante; as demais falhas internas são fatais.
 fn finish(what: &str, result: Result<u32, KernelError>) -> Result<u64, KernelError> {
     match result {
-        Ok(status) => Ok(signed_status(status)),
+        Ok(status) => {
+            // O rastreio de serviços cobre também os Zw do ALPC, que os
+            // clientes de kernel (o msrpc.sys do win32k) chamam.
+            if crate::ntos::init::boot_config::TRACE_SYSCALLS {
+                crate::debug_print!("[alpc-zw] {} = {:#x}", what, status);
+            }
+            Ok(signed_status(status))
+        }
         Err(error) if native_context::is_transfer(&error) => Err(error),
         Err(error) => panic!("[alpc] fatal {what}: {error}"),
     }
