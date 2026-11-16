@@ -141,7 +141,7 @@ pub fn create_control_set() -> Result<(), KernelError> {
 /// hives.
 pub fn initialize_hives() -> Result<(), KernelError> {
     create_master_keys()?;
-    let smss = crate::ntos::init::boot_config::SMSS_BOOT;
+    let smss = crate::ntos::init::boot_config::smss_boot();
     let from_file = load_machine_hive(SYSTEM_MOUNT, SYSTEM_FILE, || seed::system_keys(smss))?;
     SYSTEM_FROM_FILE.store(from_file, Ordering::Release);
     create_control_set()?;

@@ -536,7 +536,7 @@ pub const ACPI_ROOT_DRIVERS: &[InfDriver] = &[
 /// As linhas que o instalador considera neste boot: as dos INFs da caixa e,
 /// com a raiz ACPI, as do acpi.inf e do pci.inf.
 fn candidates() -> impl Iterator<Item = &'static InfDriver> {
-    let acpi: &'static [InfDriver] = if crate::drivers::bus::acpi_stack::ENABLED { ACPI_ROOT_DRIVERS } else { &[] };
+    let acpi: &'static [InfDriver] = if crate::drivers::bus::acpi_stack::enabled() { ACPI_ROOT_DRIVERS } else { &[] };
     DRIVERS.iter().chain(acpi.iter())
 }
 

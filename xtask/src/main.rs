@@ -4,7 +4,7 @@
 //! cargo xtask build      [opções de build]
 //! cargo xtask run        [opções de build] [opções de máquina]
 //! cargo xtask test-boot  [MARCADOR] [TIMEOUT_MS] [opções] [--keys=TEXTO] [--expect=TEXTO]... [--hold=MS]
-//!                        [--build-only|--no-build] [--kd=com2 --script=ARQ] [--capture=ARQ.png]
+//!                        [--build-only|--no-build [--image-dir=DIR]] [--kd=com2 --script=ARQ] [--capture=ARQ.png]
 //! cargo xtask test-all   [--jobs=N] [--only=ID,...] [--skip=ID,...] [--repeat=N] [--keep] [--cpu-friendly]
 //! cargo xtask capturas   [--jobs=N] [--only=ID,...] [--skip=ID,...] [--keep] [--cpu-friendly]
 //! cargo xtask debug      [opções] [--launch [--no-client [--headless]]] [--connect=HOST:PORTA]
@@ -16,7 +16,9 @@
 //! `--user-program=shell`, `--kernel-test-scope=none|all|disk-stress`, `--console-mirror`,
 //! `--start-driver=NOME[,NOME...]`, `--trace-driver-api`, `--initial-process=smss`, `--storage=real`,
 //! `--display=basic`, `--windows-dir=DIR`, `--pnp-root=acpi`, `--kd=com2` (o depurador do
-//! kernel na COM2).
+//! kernel na COM2). Fora `--release` e `--windows-dir`, elas não recompilam o kernel: vão
+//! no bloco de opções de carga da imagem de boot (`build.rs`), e o `--initial-process=smss`
+//! também troca o volume NTFS.
 //! Opções de máquina: `--accel=tcg|whpx`, `--memory-mb=N`, `--smp=N`, `--kd-port=N`
 //! (a porta TCP da COM2; `run` usa 1234 por padrão).
 //! Em `--keys`, `\n` digita Enter.
@@ -61,13 +63,15 @@ const USAGE: &str = "uso: cargo xtask <build|run|test-boot|test-all|capturas|deb
 opcoes de build:   --release --build-dir=DIR --user-program=shell
                    --kernel-test-scope=none|all|disk-stress --console-mirror --start-driver=NOME[,NOME...]
                    --trace-driver-api --initial-process=smss --storage=real --display=basic
-                   --windows-dir=DIR (binarios do Windows do bundle; padrao <build-dir>/windows)
+                   --windows-dir=DIR (binarios do Windows do bundle; padrao build/windows)
                    --pnp-root=acpi
                    --kd=com2 (depurador do kernel na COM2)
 opcoes de maquina: --accel=tcg|whpx --memory-mb=N --smp=N --kd-port=N
 test-boot:         --keys=TEXTO (\\n = Enter) --expect=TEXTO (repetivel)
                    --hold=MS (segue rodando MS ms sem falha depois da ultima saida)
                    --build-only (so monta a imagem do teste) --no-build (usa a imagem ja montada)
+                   --image-dir=DIR (com --no-build: as imagens de DIR, com as opcoes de carga
+                   deste teste numa copia do os.img em --build-dir, onde tambem ficam os logs)
                    --script=ARQ (com --kd: roteiro do cliente do depurador em paralelo)
                    --capture=ARQ.png (no fim do teste, a tela do QEMU pelo screendump do QMP)";
 
@@ -84,6 +88,10 @@ struct Arguments {
     build_only: bool,
     /// `--no-build`: o test-boot usa a imagem já montada em `--build-dir`.
     no_build: bool,
+    /// `--image-dir=DIR` (com `--no-build`): as imagens montadas vêm de DIR;
+    /// a `--build-dir` recebe a cópia do `os.img` com as opções de carga
+    /// deste teste e os logs. Várias execuções dividem as mesmas imagens.
+    image_dir: Option<PathBuf>,
     script: Option<String>,
     connect: Option<String>,
     /// `debug --no-client`: só o build e o QEMU (o cliente é outro).
@@ -122,6 +130,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
         console_mirror_set: false,
         build_only: false,
         no_build: false,
+        image_dir: None,
         script: None,
         connect: None,
         no_client: false,
@@ -169,6 +178,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             "--hold" => parsed.hold_ms = required()?.parse().map_err(|_| "--hold invalido")?,
             "--build-only" => parsed.build_only = true,
             "--no-build" => parsed.no_build = true,
+            "--image-dir" => parsed.image_dir = Some(PathBuf::from(required()?)),
             "--help" | "-h" => return Err(USAGE.to_string()),
             _ if name.starts_with("--") => return Err(format!("opcao desconhecida: {name}\n{USAGE}")),
             _ => parsed.positional.push(argument),
@@ -194,6 +204,9 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
     }
     if parsed.build_only && parsed.no_build {
         return Err("--build-only e --no-build se excluem".into());
+    }
+    if parsed.image_dir.is_some() && !parsed.no_build {
+        return Err("--image-dir e opcao do test-boot --no-build".into());
     }
     if parsed.headless && !parsed.no_client {
         return Err("--headless e opcao do debug --no-client (o prompt precisa da janela do QEMU)".into());
@@ -233,20 +246,31 @@ fn execute(arguments: Arguments) -> Result<(), String> {
             if !arguments.build.kd.is_empty() && machine.kd_port.is_none() {
                 machine.kd_port = Some(1234);
             }
-            qemu::run(&output.image, &machine)
+            qemu::run(&qemu::Disks::beside(&output.image), &machine)
         }
         "debug" => debug_command(arguments),
         "test-boot" => {
             let options = test_build_options(&arguments);
             let (marker, timeout_ms) = marker_and_timeout(&arguments)?;
+            let build_dir = build::in_workspace(&options.build_dir);
+            // A pasta das imagens montadas (o kernel, o volume NTFS e o
+            // kernel.elf dos símbolos).
+            let images = arguments.image_dir.as_deref().map_or_else(|| build_dir.clone(), build::in_workspace);
             let image = if arguments.no_build {
-                let image = build::in_workspace(&options.build_dir).join("os.img");
-                if !image.is_file() {
+                let source = images.join("os.img");
+                if !source.is_file() {
                     return Err(format!(
                         "--no-build: {} nao existe (monte antes com o mesmo test-boot e --build-only)",
-                        image.display()
+                        source.display()
                     ));
                 }
+                let image = build_dir.join("os.img");
+                if images != build_dir {
+                    std::fs::create_dir_all(&build_dir).map_err(|error| format!("{}: {error}", build_dir.display()))?;
+                    std::fs::copy(&source, &image).map_err(|error| format!("{}: {error}", image.display()))?;
+                }
+                // As opções de carga deste teste, sobre as do build.
+                build::stamp_load_options(&image, &options)?;
                 image
             } else {
                 build::build(&options)?.image
@@ -254,14 +278,18 @@ fn execute(arguments: Arguments) -> Result<(), String> {
             if arguments.build_only {
                 return Ok(());
             }
-            let log = image.with_file_name("serial.log");
+            let log = build_dir.join("serial.log");
             let mut machine = arguments.machine.clone();
             if !options.kd.is_empty() && machine.kd_port.is_none() {
                 machine.kd_port = Some(qemu::free_port()?);
             }
-            let session = script_session(&arguments, &options, &machine)?;
+            let session = script_session(&arguments, &options, &machine, &images)?;
+            // O volume de dados fica como o build o deixou: cada teste começa
+            // dele, e execuções paralelas dividem o mesmo arquivo.
+            let ntfs = images.join("ntfs.img");
+            let disks = qemu::Disks { boot: image, data: ntfs.exists().then_some(ntfs), data_snapshot: true };
             qemu::test_boot(
-                &image,
+                &disks,
                 &machine,
                 &TestOptions {
                     marker,
@@ -281,7 +309,7 @@ fn execute(arguments: Arguments) -> Result<(), String> {
 
 /// `test-boot --kd=com2 --script=ARQ`: o roteiro do cliente do depurador
 /// roda contra a COM2 em paralelo ao teste (a falha dele derruba o teste).
-fn script_session(arguments: &Arguments, options: &BuildOptions, machine: &MachineOptions) -> Result<Option<qemu::Session>, String> {
+fn script_session(arguments: &Arguments, options: &BuildOptions, machine: &MachineOptions, images: &Path) -> Result<Option<qemu::Session>, String> {
     let Some(script) = &arguments.script else { return Ok(None) };
     let (Some(port), false) = (machine.kd_port, options.kd.is_empty()) else {
         return Err("--script exige --kd=com2 (o depurador do kernel)".into());
@@ -289,7 +317,7 @@ fn script_session(arguments: &Arguments, options: &BuildOptions, machine: &Machi
     let root = build::workspace_root();
     let path = if Path::new(script).is_absolute() { PathBuf::from(script) } else { root.join(script) };
     let text = std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
-    let elf = debug::kernel_elf(&build::in_workspace(&options.build_dir));
+    let elf = debug::kernel_elf(images);
     let address = format!("127.0.0.1:{port}");
     Ok(Some(Box::new(move |serial| debug::run_script(&address, &root, &elf, &text, Some(serial)))))
 }
@@ -332,10 +360,10 @@ fn debug_command(arguments: Arguments) -> Result<(), String> {
     let output = build::build(&options)?;
     let log = output.image.with_file_name("serial.log");
     if arguments.no_client {
-        let qemu = qemu::spawn(&output.image, &machine, &log, !arguments.headless)?;
+        let qemu = qemu::spawn(&qemu::Disks::beside(&output.image), &machine, &log, !arguments.headless)?;
         return debug::serve(qemu, &address);
     }
-    let mut qemu = qemu::spawn(&output.image, &machine, &log, true)?;
+    let mut qemu = qemu::spawn(&qemu::Disks::beside(&output.image), &machine, &log, true)?;
     let result = debug::interactive(&address, &root, &elf);
     let _ = qemu.kill();
     let _ = qemu.wait();

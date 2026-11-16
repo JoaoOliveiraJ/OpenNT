@@ -40,6 +40,35 @@ extern "win64" fn ap_test_job(first: u64, second: u64, third: u64, fourth: u64) 
     first + second + third + fourth
 }
 
+/// As opções de carga do loader: este boot chegou com o autoteste pelo
+/// bloco (`KERNELTESTSCOPE=all`), que também mostra a ntdll de bring-up do
+/// bundle; e o leitor segue o formato do LoadOptions (nome sem diferença de
+/// maiúsculas, valor como escrito, a primeira ocorrência vale, bloco sem
+/// assinatura ou com texto fora do ASCII imprimível ignorado).
+fn load_options() {
+    use crate::ntos::init::{boot_config, load_options as options};
+    let text = boot_config::load_options();
+    assert(options::value(text, options::KERNEL_TEST_SCOPE) == Some(boot_config::kernel_test_scope()) && boot_config::kernel_tests(), "opcoes de carga: o autoteste veio do bloco do loader");
+    assert(crate::hal::bundle::read("apps/ntdll.dll").is_some(), "opcoes de carga: ntdll de bring-up visivel com o autoteste");
+    let sample = "DEBUG debugport=COM2 STARTDRIVER=NDIS,AFD startdriver=beep CONSOLEMIRROR";
+    assert(options::flag(sample, "debug") && options::flag(sample, options::CONSOLE_MIRROR) && !options::flag(sample, options::DEBUG_PORT), "opcoes de carga: flags");
+    assert(options::value(sample, options::DEBUG_PORT) == Some("COM2") && options::value(sample, options::START_DRIVER) == Some("NDIS,AFD"), "opcoes de carga: valores");
+    assert(options::value(sample, options::DISPLAY).is_none() && options::value("", options::DISPLAY).is_none(), "opcoes de carga: ausentes");
+    let mut block = [0u8; options::BLOCK_SIZE];
+    block[..4].copy_from_slice(&options::SIGNATURE.to_le_bytes());
+    block[4..8].copy_from_slice(&5u32.to_le_bytes());
+    block[8..13].copy_from_slice(b"DEBUG");
+    assert(options::text_of(&block) == Some("DEBUG"), "opcoes de carga: bloco valido");
+    block[10] = 0;
+    assert(options::text_of(&block).is_none(), "opcoes de carga: texto fora do ASCII");
+    block[10] = b'B';
+    block[4..8].copy_from_slice(&(options::TEXT_MAX as u32 + 1).to_le_bytes());
+    assert(options::text_of(&block).is_none(), "opcoes de carga: tamanho fora do setor");
+    block[4..8].copy_from_slice(&5u32.to_le_bytes());
+    block[0] ^= 1;
+    assert(options::text_of(&block).is_none(), "opcoes de carga: sem assinatura");
+}
+
 fn is_text(data: Option<FileData>, expected: &str) -> bool {
     matches!(data, Some(FileData::Text(text)) if text == expected)
 }
@@ -47,11 +76,12 @@ fn is_text(data: Option<FileData>, expected: &str) -> bool {
 pub fn run() {
     // `--kernel-test-scope=disk-stress`: só a estressa do caminho de escrita
     // do disco, com mais rodadas.
-    if crate::ntos::init::boot_config::KERNEL_TEST_SCOPE == "disk-stress" {
+    if crate::ntos::init::boot_config::kernel_test_scope() == "disk-stress" {
         super::phase7::disk_write_stress(assert, 300, 3);
         debug_print!("DISK_STRESS_OK");
         return;
     }
+    load_options();
     // MemoryFileSystem
     let _ = memory_file_system::write("/tmp/a.txt", "hello OpenNT");
     assert(is_text(memory_file_system::read("/tmp/a.txt"), "hello OpenNT"), "vfs read/write");

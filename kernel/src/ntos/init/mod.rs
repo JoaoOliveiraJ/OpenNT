@@ -5,6 +5,7 @@
 //! tabela de exports do ntoskrnl.
 
 pub mod boot_config;
+pub mod load_options;
 pub mod main;
 pub mod phase0;
 pub mod phase1;

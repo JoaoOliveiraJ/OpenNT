@@ -3,7 +3,7 @@
 //! do `test-boot` que o `comando` dele dá.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use crate::status::toml;
@@ -43,9 +43,12 @@ pub struct Test {
     /// `coberto_pela_suite = true`: os marcadores dele as suítes já
     /// conferem; só roda quando pedido por `--only`.
     pub covered_by_suite: bool,
-    /// As opções de build que o kernel e o volume embutem: execuções com a
-    /// mesma chave reaproveitam o kernel compilado.
-    pub build_key: String,
+    /// O que as imagens embutem (`BuildOptions::image_key`): execuções com a
+    /// mesma chave rodam nas mesmas imagens, cada uma com as próprias opções
+    /// de carga.
+    pub image_key: String,
+    /// O kernel compilado (`BuildOptions::kernel_key`).
+    pub kernel_key: String,
     /// Tempo máximo do `test-boot --no-build` (prazo + hold + folga).
     pub limit: Duration,
     /// Commit que o QEMU do teste faz ao subir (a memória do convidado
@@ -58,20 +61,21 @@ impl Test {
         let mut command = vec![String::from("test-boot")];
         command.extend(arguments.iter().cloned());
         let parsed = crate::parse(command).map_err(|error| format!("teste {id}: {error}"))?;
-        if parsed.build_only || parsed.no_build || parsed.build.windows_dir.is_some() || parsed.capture.is_some() {
-            return Err(format!("teste {id}: --windows-dir, --build-only, --no-build e --capture sao escolhidos pelo test-all"));
+        if parsed.build_only || parsed.no_build || parsed.image_dir.is_some() || parsed.build.windows_dir.is_some() || parsed.capture.is_some() {
+            return Err(format!("teste {id}: --windows-dir, --build-only, --no-build, --image-dir e --capture sao escolhidos pelo test-all"));
         }
         let (_, timeout_ms) = crate::marker_and_timeout(&parsed).map_err(|error| format!("teste {id}: {error}"))?;
-        let mut options = crate::test_build_options(&parsed);
-        options.build_dir = PathBuf::new();
+        let options = crate::test_build_options(&parsed);
+        // As opções de carga que valem no QEMU: as do teste, inteiras.
+        options.load_options_block().map_err(|error| format!("teste {id}: {error}"))?;
         Ok(Test {
             id: id.to_string(),
             arguments,
             suite,
             expected_failure,
             covered_by_suite,
-            // O Debug lista todas as opções, inclusive as que vierem a existir.
-            build_key: format!("{options:?}"),
+            image_key: options.image_key(),
+            kernel_key: options.kernel_key(),
             limit: Duration::from_millis(timeout_ms.saturating_add(parsed.hold_ms)) + GRACE,
             memory: (u64::from(parsed.machine.memory_mb) << 20) + QEMU_OVERHEAD,
         })
@@ -245,20 +249,23 @@ pub fn select(tests: &[Test], only: &[String], skip: &[String], suites: Suites) 
     Ok(chosen)
 }
 
-/// Uma execução: um teste e a pasta dela (`<id>` ou `<id>.<n>` com
-/// `--repeat`).
+/// Uma execução: um teste, a pasta dela (`<id>` ou `<id>.<n>` com
+/// `--repeat`) e as imagens em que roda.
 pub struct Run {
     pub name: String,
     pub test: usize,
+    /// O índice da chave de imagem (`image_key`) entre as desta rodada.
+    pub image: usize,
 }
 
-/// As execuções na ordem dos builds: as de mesma configuração juntas (o
-/// kernel recompila uma vez por configuração) e os grupos de teste mais
-/// longo primeiro, para as suítes começarem cedo.
+/// As execuções na ordem em que vão para as pistas: as de mesmas imagens
+/// juntas (montadas uma vez), os grupos de teste mais longo primeiro e, em
+/// cada grupo, as de prazo maior primeiro, para as longas (as suítes)
+/// começarem cedo e as curtas fecharem a rodada.
 pub fn runs(tests: &[Test], chosen: &[usize], repeat: usize) -> Vec<Run> {
     let mut groups: Vec<(&str, Vec<usize>)> = Vec::new();
     for &index in chosen {
-        let key = tests[index].build_key.as_str();
+        let key = tests[index].image_key.as_str();
         match groups.iter_mut().find(|(group, _)| *group == key) {
             Some((_, members)) => members.push(index),
             None => groups.push((key, vec![index])),
@@ -267,12 +274,13 @@ pub fn runs(tests: &[Test], chosen: &[usize], repeat: usize) -> Vec<Run> {
     let longest = |members: &[usize]| members.iter().map(|&index| tests[index].limit).max().unwrap_or_default();
     groups.sort_by_key(|(_, members)| std::cmp::Reverse(longest(members)));
     let mut runs = Vec::new();
-    for (_, members) in groups {
+    for (image, (_, mut members)) in groups.into_iter().enumerate() {
+        members.sort_by_key(|&index| std::cmp::Reverse(tests[index].limit));
         for index in members {
             for round in 1..=repeat {
                 let id = &tests[index].id;
                 let name = if repeat > 1 { format!("{id}.{round}") } else { id.clone() };
-                runs.push(Run { name, test: index });
+                runs.push(Run { name, test: index, image });
             }
         }
     }

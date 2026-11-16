@@ -32,24 +32,10 @@ use crate::ntos::ob::object_manager;
 use crate::ntos::ob::objects::device as device_objects;
 use crate::rtl::KernelError;
 
-const fn equals(value: Option<&str>, expected: &str) -> bool {
-    let Some(value) = value else { return false };
-    let (left, right) = (value.as_bytes(), expected.as_bytes());
-    if left.len() != right.len() {
-        return false;
-    }
-    let mut index = 0;
-    while index < left.len() {
-        if left[index] != right[index] {
-            return false;
-        }
-        index += 1;
-    }
-    true
-}
-
 /// `--storage=real`: a pilha de armazenamento sobe pelo PnP.
-pub const ENABLED: bool = equals(option_env!("OPENNT_STORAGE"), "real");
+pub fn enabled() -> bool {
+    crate::ntos::init::boot_config::real_storage()
+}
 
 /// Setores comparados (os 4 KB do começo do volume NTFS).
 const SECTORS: u32 = 8;

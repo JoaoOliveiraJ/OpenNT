@@ -5,19 +5,23 @@
 //! um é um `cargo xtask test-boot`), cada execução na própria pasta
 //! `build/test-all/<id>`:
 //!
-//! 1. uma thread monta as imagens, uma de cada vez (`test-boot
-//!    --build-only`), com as execuções de mesma configuração de build juntas:
-//!    o kernel só recompila quando as opções que ele embute mudam e nunca há
-//!    dois builds no mesmo `target/`. Os binários do Windows do bundle ficam
-//!    numa pasta só (`build/test-all/windows`), para o caminho dela não
-//!    recompilar o kernel;
-//! 2. `--jobs` pistas pegam as imagens prontas e rodam o QEMU (`test-boot
-//!    --no-build`), com a saída em `test-boot.log` e a serial em
-//!    `serial.log`; a pasta de uma execução que passou é apagada (`--keep`
-//!    guarda todas). Cada QEMU compromete toda a memória do convidado logo
-//!    ao subir; um QEMU só começa quando o commit livre do sistema cobre a
-//!    memória dele e uma margem, porque com o commit esgotado processos
-//!    morrem sem mensagem (o próprio test-all, o cargo, o rustc);
+//! 1. uma thread monta as imagens (`test-boot --build-only`), uma vez por
+//!    chave de imagem, em `build/test-all/imagem-<n>`. As opções de boot dos
+//!    testes não mudam o kernel (vão no bloco de opções de carga da imagem
+//!    de boot): todos dividem um kernel compilado, e só o volume NTFS do
+//!    boot do smss pede outra pasta de imagens;
+//! 2. `--jobs` pistas rodam o QEMU sobre as imagens prontas (`test-boot
+//!    --no-build --image-dir`): a pasta da execução recebe a cópia do
+//!    `os.img` com as opções de carga dela, a saída em `test-boot.log` e a
+//!    serial em `serial.log`, e o volume NTFS da pasta de imagens entra com
+//!    `snapshot=on`, então execuções paralelas o dividem e cada uma começa
+//!    dele intacto. A pasta de uma execução que passou é apagada, e a de
+//!    imagens no fim, se todas as execuções dela passaram (`--keep` guarda
+//!    todas). Cada QEMU compromete toda a memória do convidado logo ao
+//!    subir; um QEMU só começa quando o commit livre do sistema cobre a
+//!    memória dele e uma margem, contando a dos QEMUs que acabaram de subir,
+//!    porque com o commit esgotado processos morrem sem mensagem (o próprio
+//!    test-all, o cargo, o rustc);
 //! 3. no fim, a tabela com o resultado de cada uma e, para cada falha, o
 //!    trecho da serial que a explica.
 //!
@@ -36,12 +40,11 @@ mod report;
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashMap;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -79,14 +82,11 @@ pub const CAPTURE_DIR: &str = "docs/site/capturas";
 
 /// Pasta das execuções, relativa à raiz do workspace.
 const OUTPUT_DIR: &str = "build/test-all";
-/// Imagens prontas esperando uma pista: o build adianta pouco, para não
-/// ocupar disco com pastas que ainda não rodam.
-const READY_AHEAD: usize = 1;
 /// Commit que fica livre além dos QEMUs: o rustc do build do kernel (até
 /// uns 4 GB) e o resto do sistema.
 const COMMIT_RESERVE: u64 = 6 << 30;
-/// Tempo para um QEMU recém-criado comprometer a memória do convidado antes
-/// de a próxima pista conferir o commit livre.
+/// Tempo para um QEMU recém-criado comprometer a memória do convidado: até
+/// lá, a próxima pista conta a memória dele como já comprometida.
 const SETTLE: Duration = Duration::from_secs(3);
 
 struct Options {
@@ -180,8 +180,9 @@ struct Context {
     console: Console,
     /// Largura da coluna de nomes nas linhas ao vivo.
     width: usize,
-    /// Um QEMU começa de cada vez, depois de conferir o commit livre.
-    memory_gate: Mutex<()>,
+    /// Um QEMU começa de cada vez, depois de conferir o commit livre; o gate
+    /// guarda quando subiram os QEMUs recentes e quanto cada um compromete.
+    memory_gate: Mutex<Vec<(Instant, u64)>>,
     /// QEMUs rodando agora.
     running: AtomicUsize,
     /// `capturas`: a pasta dos PNG de cada teste.
@@ -198,17 +199,30 @@ impl Context {
         format!("{OUTPUT_DIR}/{}/{file}", run.name)
     }
 
-    /// Um `test-boot` do próprio xtask (sem passar de novo pelo cargo).
-    fn test_boot(&self, test: &Test, directory: &Path, stage: &str, log: &Path) -> Result<Child, String> {
+    /// A pasta das imagens de índice `image`, relativa à raiz.
+    fn image_relative(image: usize) -> String {
+        format!("{OUTPUT_DIR}/imagem-{}", image + 1)
+    }
+
+    fn image_directory(&self, image: usize) -> PathBuf {
+        self.root.join(Self::image_relative(image))
+    }
+
+    /// Quantas pastas de imagens a rodada usa.
+    fn image_count(&self) -> usize {
+        self.runs.iter().map(|run| run.image + 1).max().unwrap_or(0)
+    }
+
+    /// Um `test-boot` do próprio xtask (sem passar de novo pelo cargo); com
+    /// `images`, sobre as imagens montadas daquela pasta.
+    fn test_boot(&self, test: &Test, directory: &Path, stage: &str, log: &Path, images: Option<&Path>) -> Result<Child, String> {
         let file = File::create(log).map_err(|error| format!("{}: {error}", log.display()))?;
         let errors = file.try_clone().map_err(|error| format!("{}: {error}", log.display()))?;
         let mut command = Command::new(&self.executable);
-        command
-            .arg("test-boot")
-            .args(&test.arguments)
-            .arg(format!("--build-dir={}", directory.display()))
-            .arg(format!("--windows-dir={}", self.root.join(OUTPUT_DIR).join("windows").display()))
-            .arg(stage);
+        command.arg("test-boot").args(&test.arguments).arg(format!("--build-dir={}", directory.display())).arg(stage);
+        if let Some(images) = images {
+            command.arg(format!("--image-dir={}", images.display()));
+        }
         if let (Some(capture), "--no-build") = (&self.capture, stage) {
             command.arg(format!("--capture={}", capture.join(format!("{}.png", test.id)).display()));
         }
@@ -221,40 +235,47 @@ impl Context {
     }
 }
 
-/// Uma imagem montada (ou o erro do build), a caminho de uma pista.
+/// Uma execução com as imagens dela montadas (ou o erro do build), a
+/// caminho de uma pista.
 struct Prepared {
     run: usize,
+    /// O tempo do build das imagens, na primeira execução que as usa (zero
+    /// nas outras).
     build: Result<Duration, String>,
 }
 
-/// Monta as imagens em sequência; um build que falhou não se repete para as
-/// outras execuções da mesma configuração.
-fn builder(context: &Context, ready: SyncSender<Prepared>) {
-    let mut failed: HashMap<&str, &str> = HashMap::new();
-    for (index, run) in context.runs.iter().enumerate() {
-        let test = &context.tests[run.test];
+/// Uma pasta vazia (a de uma rodada anterior, com a serial velha, sai antes).
+fn fresh_directory(directory: &Path) -> Result<(), String> {
+    if directory.exists() {
+        fs::remove_dir_all(directory).map_err(|error| format!("{}: {error}", directory.display()))?;
+    }
+    fs::create_dir_all(directory).map_err(|error| format!("{}: {error}", directory.display()))
+}
+
+/// Monta cada pasta de imagens uma vez, em sequência, e entrega às pistas
+/// as execuções dela; um build que falhou vale para todas elas.
+fn builder(context: &Context, ready: Sender<Prepared>) {
+    for image in 0..context.image_count() {
+        let members: Vec<usize> = (0..context.runs.len()).filter(|&index| context.runs[index].image == image).collect();
+        let Some(&first) = members.first() else { continue };
         let started = Instant::now();
-        let build = match failed.get(test.build_key.as_str()) {
-            Some(first) => Err(format!("build falhou (mesma configuracao de {first})")),
-            None => prepare(context, run, test),
-        };
-        if build.is_err() {
-            failed.entry(test.build_key.as_str()).or_insert(run.name.as_str());
-        }
-        if ready.send(Prepared { run: index, build: build.map(|()| started.elapsed()) }).is_err() {
-            break;
+        let build = build_images(context, image, &context.tests[context.runs[first].test]).map(|()| started.elapsed());
+        for (position, &run) in members.iter().enumerate() {
+            let build = match &build {
+                Ok(time) => Ok(if position == 0 { *time } else { Duration::ZERO }),
+                Err(error) => Err(error.clone()),
+            };
+            if ready.send(Prepared { run, build }).is_err() {
+                return;
+            }
         }
     }
 }
 
-fn prepare(context: &Context, run: &Run, test: &Test) -> Result<(), String> {
-    let directory = context.directory(run);
-    // A pasta de uma rodada anterior (com a serial velha) sai antes.
-    if directory.exists() {
-        fs::remove_dir_all(&directory).map_err(|error| format!("{}: {error}", directory.display()))?;
-    }
-    fs::create_dir_all(&directory).map_err(|error| format!("{}: {error}", directory.display()))?;
-    let mut child = context.test_boot(test, &directory, "--build-only", &directory.join("build.log"))?;
+fn build_images(context: &Context, image: usize, test: &Test) -> Result<(), String> {
+    let directory = context.image_directory(image);
+    fresh_directory(&directory)?;
+    let mut child = context.test_boot(test, &directory, "--build-only", &directory.join("build.log"), None)?;
     let status = child.wait().map_err(|error| error.to_string())?;
     if status.success() {
         Ok(())
@@ -280,13 +301,17 @@ fn gib(bytes: u64) -> String {
     format!("{:.1} GB", bytes as f64 / (1u64 << 30) as f64)
 }
 
-/// Espera o commit livre cobrir o QEMU e a margem. Sem nenhum QEMU nosso
-/// rodando, segue mesmo assim (um de cada vez), para a rodada não parar.
-fn wait_for_memory(context: &Context, run: &Run, test: &Test) {
+/// Espera o commit livre cobrir o QEMU e a margem, com a memória dos QEMUs
+/// que subiram há menos de [`SETTLE`] contada como já comprometida (`recent`,
+/// o conteúdo do gate). Sem nenhum QEMU nosso rodando, segue mesmo assim (um
+/// de cada vez), para a rodada não parar.
+fn wait_for_memory(context: &Context, run: &Run, test: &Test, recent: &mut Vec<(Instant, u64)>) {
     let need = test.memory + COMMIT_RESERVE;
     let mut warned = false;
     while let Some(available) = host::available_commit() {
-        if available >= need || context.running.load(Ordering::SeqCst) == 0 {
+        recent.retain(|(started, _)| started.elapsed() < SETTLE);
+        let starting: u64 = recent.iter().map(|(_, memory)| memory).sum();
+        if available >= need + starting || context.running.load(Ordering::SeqCst) == 0 {
             break;
         }
         if !warned {
@@ -300,22 +325,26 @@ fn wait_for_memory(context: &Context, run: &Run, test: &Test) {
             ));
             warned = true;
         }
-        thread::sleep(Duration::from_secs(5));
+        // Um QEMU recente que ainda não apareceu no commit sai da conta em
+        // até SETTLE; um commit que falta de verdade espera mais.
+        thread::sleep(if starting > 0 { Duration::from_millis(500) } else { Duration::from_secs(5) });
     }
 }
 
-/// Roda o QEMU na imagem montada; `Ok(true)` se o test-boot passou.
+/// Roda o QEMU sobre as imagens montadas; `Ok(true)` se o test-boot passou.
 fn execute(context: &Context, run: &Run, test: &Test, build: Duration) -> Result<(bool, Duration), String> {
     let directory = context.directory(run);
+    fresh_directory(&directory)?;
+    let images = context.image_directory(run.image);
     let (mut child, started) = {
-        let _gate = context.memory_gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        wait_for_memory(context, run, test);
+        let mut recent = context.memory_gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        wait_for_memory(context, run, test, &mut recent);
         let width = context.width;
         context.console.say(&format!("{:<14} {:<width$}  (build {})", "rodando", run.name, report::duration(build)));
-        let child = context.test_boot(test, &directory, "--no-build", &directory.join("test-boot.log"))?;
+        let child = context.test_boot(test, &directory, "--no-build", &directory.join("test-boot.log"), Some(&images))?;
         let started = Instant::now();
         context.running.fetch_add(1, Ordering::SeqCst);
-        thread::sleep(SETTLE);
+        recent.push((started, test.memory));
         (child, started)
     };
     let result = loop {
@@ -345,8 +374,8 @@ fn lane(context: &Context, ready: &Mutex<Receiver<Prepared>>, outcomes: &Mutex<V
         let width = context.width;
         let (passed, build, time, reason, excerpt, log) = match prepared.build {
             Err(error) => {
-                let text = report::read_lossy(&directory.join("build.log")).unwrap_or_default();
-                (false, None, None, error, report::build_excerpt(&text), context.relative(run, "build.log"))
+                let text = report::read_lossy(&context.image_directory(run.image).join("build.log")).unwrap_or_default();
+                (false, None, None, error, report::build_excerpt(&text), format!("{}/build.log", Context::image_relative(run.image)))
             }
             Ok(build) => {
                 let started = Instant::now();
@@ -392,7 +421,10 @@ fn lane(context: &Context, ready: &Mutex<Receiver<Prepared>>, outcomes: &Mutex<V
             outcomes.len() + 1,
             context.runs.len()
         ));
-        let repeat_command = if build.is_some() { test.command_line(&format!("{OUTPUT_DIR}/{}", run.name), "--no-build") } else { String::new() };
+        let repeat_command = match build {
+            Some(_) => test.command_line(&format!("{OUTPUT_DIR}/{}", run.name), &format!("--no-build --image-dir={}", Context::image_relative(run.image))),
+            None => String::new(),
+        };
         outcomes.push(Outcome { name: run.name.clone(), verdict, build, test: time, reason, excerpt, log, repeat_command });
     }
 }
@@ -447,7 +479,7 @@ fn run_with(mut options: Options, capture: bool) -> Result<(), String> {
         keep: options.keep,
         console: Console { started: Instant::now(), lock: Mutex::new(()) },
         width,
-        memory_gate: Mutex::new(()),
+        memory_gate: Mutex::new(Vec::new()),
         running: AtomicUsize::new(0),
         capture: capture.then(|| build::workspace_root().join(CAPTURE_DIR)),
     };
@@ -469,16 +501,19 @@ fn run_with(mut options: Options, capture: bool) -> Result<(), String> {
         cpus = applied.cpus;
     }
     let jobs = options.jobs.unwrap_or((cpus / 2).max(1)).min(context.runs.len());
-    let configurations = {
-        let mut keys: Vec<&str> = context.runs.iter().map(|run| context.tests[run.test].build_key.as_str()).collect();
+    let kernels = {
+        let mut keys: Vec<&str> = context.runs.iter().map(|run| context.tests[run.test].kernel_key.as_str()).collect();
         keys.sort_unstable();
         keys.dedup();
         keys.len()
     };
     println!(
-        "test-all: {} execucoes ({} configuracoes de build) em {jobs} pistas; pastas em {OUTPUT_DIR}/",
+        "test-all: {} execucoes ({} {} do kernel, {} {} de imagens) em {jobs} pistas; pastas em {OUTPUT_DIR}/",
         context.runs.len(),
-        configurations
+        kernels,
+        if kernels == 1 { "build" } else { "builds" },
+        context.image_count(),
+        if context.image_count() == 1 { "pasta" } else { "pastas" }
     );
     if let Some(available) = host::available_commit() {
         let largest = context.runs.iter().map(|run| context.tests[run.test].memory).max().unwrap_or(0);
@@ -490,7 +525,10 @@ fn run_with(mut options: Options, capture: bool) -> Result<(), String> {
         );
     }
 
-    let (sender, receiver) = mpsc::sync_channel::<Prepared>(READY_AHEAD);
+    // A pasta dos binários do Windows do formato anterior do test-all: o
+    // build usa a de todos (build/windows), com o mesmo kernel compilado.
+    let _ = fs::remove_dir_all(context.root.join(OUTPUT_DIR).join("windows"));
+    let (sender, receiver) = mpsc::channel::<Prepared>();
     let receiver = Mutex::new(receiver);
     let outcomes = Mutex::new(Vec::new());
     thread::scope(|scope| {
@@ -508,6 +546,18 @@ fn run_with(mut options: Options, capture: bool) -> Result<(), String> {
         (context.runs.get(position).map_or(usize::MAX, |run| run.test), position)
     };
     outcomes.sort_by_key(|outcome| order(&outcome.name));
+    // As imagens de quem passou saem; as de uma falha ficam para o comando
+    // que repete o QEMU.
+    if !context.keep {
+        for image in 0..context.image_count() {
+            let failed = outcomes.iter().any(|outcome| {
+                !outcome.verdict.passed() && context.runs.iter().any(|run| run.name == outcome.name && run.image == image)
+            });
+            if !failed {
+                let _ = fs::remove_dir_all(context.image_directory(image));
+            }
+        }
+    }
     let failed = report::summary(&outcomes, context.console.started.elapsed());
     if let Some(directory) = &context.capture {
         return capture_report(&context, directory);

@@ -75,7 +75,7 @@ pub fn after_driver_start(name: &str) {
     }
     // Com `--trace-driver-api`, as APIs que o file system chama na montagem
     // também vão para a serial.
-    crate::ntos::init::exports::set_api_trace(crate::ntos::init::boot_config::TRACE_DRIVER_API);
+    crate::ntos::init::exports::set_api_trace(crate::ntos::init::boot_config::trace_driver_api());
     let result = mount_and_read();
     crate::ntos::init::exports::set_api_trace(false);
     match result {

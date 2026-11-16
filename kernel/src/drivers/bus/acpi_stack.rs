@@ -30,24 +30,10 @@ use crate::ntos::inc::types::{DeviceObject, NtStruct};
 use crate::ntos::io::lifecycle;
 use crate::ntos::io::pnp::{self, devnode};
 
-const fn equals(value: Option<&str>, expected: &str) -> bool {
-    let Some(value) = value else { return false };
-    let (left, right) = (value.as_bytes(), expected.as_bytes());
-    if left.len() != right.len() {
-        return false;
-    }
-    let mut index = 0;
-    while index < left.len() {
-        if left[index] != right[index] {
-            return false;
-        }
-        index += 1;
-    }
-    true
-}
-
 /// `--pnp-root=acpi`: a raiz da árvore é o acpi.sys sobre a HAL.
-pub const ENABLED: bool = equals(option_env!("OPENNT_PNP_ROOT"), "acpi");
+pub fn enabled() -> bool {
+    crate::ntos::init::boot_config::acpi_root()
+}
 
 /// O nó com este serviço iniciado, com o FDO do driver sobre o PDO, e os
 /// DeviceIDs dos filhos.
@@ -103,7 +89,7 @@ pub fn initialize() {
         debug_print!("[acpi] raiz do PnP: {}", error);
         return;
     }
-    crate::ntos::init::exports::set_api_trace(crate::ntos::init::boot_config::TRACE_DRIVER_API);
+    crate::ntos::init::exports::set_api_trace(crate::ntos::init::boot_config::trace_driver_api());
     let processed = pnp::tree::process();
     crate::ntos::init::exports::set_api_trace(false);
     if let Err(error) = processed {

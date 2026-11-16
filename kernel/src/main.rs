@@ -50,6 +50,9 @@ pub extern "C" fn kernel_main() -> ! {
         let length = end as usize - start as usize;
         core::ptr::write_bytes(start, 0, length);
     }
+    // As opções de carga que o loader deixou na memória baixa, antes de
+    // qualquer uso delas.
+    ntos::init::boot_config::capture();
     // Nada do kernel fica na metade de usuário: a página de 2 MB em que o
     // stage2 ligou a paginação deixa de existir.
     ntos::mm::paging::remove_boot_identity();
@@ -60,6 +63,10 @@ pub extern "C" fn kernel_main() -> ! {
     hal::serial::puts("[OpenNT] kernel 64-bit vivo (BIOS real mode -> long mode)\n");
     // O teste de boot reconhece este marcador antes de entrar no kernel.
     hal::serial::puts("HELLO_KERNEL_OK\n");
+    let options = ntos::init::boot_config::load_options();
+    hal::serial::puts("[boot] opcoes de carga: ");
+    hal::serial::puts(if options.is_empty() { "(nenhuma)" } else { options });
+    hal::serial::puts("\n");
 
     ntos::init::main::kmain()
 }

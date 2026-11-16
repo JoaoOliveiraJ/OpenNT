@@ -38,12 +38,7 @@ static PUSHBACK: AtomicU16 = AtomicU16::new(0);
 
 /// Base de E/S das portas que o depurador aceita. A COM1 é o log do kernel.
 pub fn port_base(name: &str) -> Option<u16> {
-    match name {
-        "com2" => Some(0x2F8),
-        "com3" => Some(0x3E8),
-        "com4" => Some(0x2E8),
-        _ => None,
-    }
+    [("com2", 0x2F8), ("com3", 0x3E8), ("com4", 0x2E8)].into_iter().find(|(port, _)| port.eq_ignore_ascii_case(name)).map(|(_, base)| base)
 }
 
 /// Programa a UART em `base`; `false` se não há porta ali (o registrador de

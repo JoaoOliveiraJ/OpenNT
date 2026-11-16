@@ -36,20 +36,20 @@ use crate::rtl::KernelError;
 fn internally_driven(function: &pci::PciFunction) -> bool {
     let ide = function.class_code == 0x01 && function.sub_class == 0x01;
     let vga = function.class_code == 0x03 && function.sub_class == 0x00;
-    (ide && !storage_stack::ENABLED) || (vga && !display_stack::ENABLED)
+    (ide && !storage_stack::enabled()) || (vga && !display_stack::enabled())
 }
 
 /// Uma função relatada pelo pci.sys que um driver interno do kernel serve
 /// neste boot, pelos ids de classe do pci.sys (PCI\CC_ccss).
 fn internally_driven_ids(hardware_ids: &[String], compatible_ids: &[String]) -> bool {
     let has = |id: &str| hardware_ids.iter().chain(compatible_ids.iter()).any(|candidate| candidate.eq_ignore_ascii_case(id));
-    (has("PCI\\CC_0101") && !storage_stack::ENABLED) || (has("PCI\\CC_0300") && !display_stack::ENABLED)
+    (has("PCI\\CC_0101") && !storage_stack::enabled()) || (has("PCI\\CC_0300") && !display_stack::enabled())
 }
 
 /// Cria a raiz da árvore com o barramento PCI interno e marca as funções
 /// dos drivers internos; com a raiz ACPI, o computador da HAL. Idempotente.
 pub fn prepare() -> Result<(), KernelError> {
-    if acpi_stack::ENABLED {
+    if acpi_stack::enabled() {
         let computer = crate::hal::pnp::create()?;
         pnp::tree::initialize()?;
         pnp::root::add_platform_bus(computer);

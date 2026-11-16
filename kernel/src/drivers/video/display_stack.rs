@@ -32,24 +32,10 @@ use crate::ntos::io::pnp::{self, devnode};
 use crate::ntos::io::{device_interface, lifecycle};
 use crate::ntos::ob::object_manager;
 
-const fn equals(value: Option<&str>, expected: &str) -> bool {
-    let Some(value) = value else { return false };
-    let (left, right) = (value.as_bytes(), expected.as_bytes());
-    if left.len() != right.len() {
-        return false;
-    }
-    let mut index = 0;
-    while index < left.len() {
-        if left[index] != right[index] {
-            return false;
-        }
-        index += 1;
-    }
-    true
-}
-
 /// `--display=basic`: o BasicDisplay.sys sobe pelo PnP no adaptador VGA.
-pub const ENABLED: bool = equals(option_env!("OPENNT_DISPLAY"), "basic");
+pub fn enabled() -> bool {
+    crate::ntos::init::boot_config::basic_display()
+}
 
 /// GUID_DEVINTERFACE_DISPLAY_ADAPTER {5b45201d-f2f2-4f3b-85bb-30ff1f953599}.
 const GUID_DEVINTERFACE_DISPLAY_ADAPTER: [u8; 16] = [0x1D, 0x20, 0x45, 0x5B, 0xF2, 0xF2, 0x3B, 0x4F, 0x85, 0xBB, 0x30, 0xFF, 0x1F, 0x95, 0x35, 0x99];
@@ -63,7 +49,7 @@ static ADAPTER_STARTED: core::sync::atomic::AtomicBool = core::sync::atomic::Ato
 /// dispositivo de vídeo de um adaptador do BasicDisplay habilitada é o
 /// adaptador iniciado pelo dxgkrnl (`ADAPTER_STARTED`).
 pub fn interface_enabled(class: &[u8; 16], link: &str) {
-    if !ENABLED || *class != GUID_DISPLAY_DEVICE_ARRIVAL || ADAPTER_STARTED.load(core::sync::atomic::Ordering::Acquire) {
+    if !enabled() || *class != GUID_DISPLAY_DEVICE_ARRIVAL || ADAPTER_STARTED.load(core::sync::atomic::Ordering::Acquire) {
         return;
     }
     let started = pnp::tree::summary().into_iter().find(|(path, state, _, service)| service.as_deref() == Some("BasicDisplay") && *state == devnode::State::Started && link.to_uppercase().contains(&path.replace('\\', "#").to_uppercase()));
@@ -124,7 +110,7 @@ pub fn initialize() {
         return;
     }
     // `--trace-driver-api` rastreia as APIs que os drivers da árvore chamam.
-    crate::ntos::init::exports::set_api_trace(crate::ntos::init::boot_config::TRACE_DRIVER_API);
+    crate::ntos::init::exports::set_api_trace(crate::ntos::init::boot_config::trace_driver_api());
     let processed = pnp::tree::process();
     crate::ntos::init::exports::set_api_trace(false);
     if let Err(error) = processed {

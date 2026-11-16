@@ -101,7 +101,7 @@ fn start_boot_driver(name: &str) {
     use crate::ntos::cm::service::{driver as driver_services, database as service_database};
     let (mut win32, mut ntstatus) = (0u32, 0u32);
     let started = crate::ntos::se::code_integrity::initialize().map_err(|error| (31, error.status, error.message)).and_then(|_| {
-        crate::ntos::init::exports::set_api_trace(boot_config::TRACE_DRIVER_API);
+        crate::ntos::init::exports::set_api_trace(boot_config::trace_driver_api());
         let started = driver_services::start(name).map(|_| ()).map_err(|error| (error.win32, error.ntstatus.unwrap_or(0), error.message));
         crate::ntos::init::exports::set_api_trace(false);
         started
@@ -142,12 +142,12 @@ pub fn kmain() -> ! {
     // ciclo de vida do SCM/CM, na ordem da lista (a dos grupos de boot do
     // Windows: NDIS antes do Tcpip, o Tcpip antes do AFD). O marcador de
     // cada um registra a conclusão, não o sucesso da carga.
-    for name in boot_config::START_DRIVER.split(',').filter(|name| !name.is_empty()) {
+    for name in boot_config::start_driver().split(',').filter(|name| !name.is_empty()) {
         start_boot_driver(name);
     }
 
     // Com o depurador do kernel (`--kd`), o contrato que os drivers veem.
-    if !boot_config::KERNEL_DEBUGGER.is_empty() {
+    if !boot_config::kernel_debugger().is_empty() {
         crate::ntos::test::kernel_debugger::run();
     }
 
@@ -158,17 +158,17 @@ pub fn kmain() -> ! {
     }
 
     // Os drivers iniciados, usados por um processo de teste (null, beep, fs_rec).
-    for name in boot_config::START_DRIVER.split(',').filter(|name| !name.is_empty()) {
+    for name in boot_config::start_driver().split(',').filter(|name| !name.is_empty()) {
         crate::ntos::test::boot_drivers::after_start(name);
     }
 
-    if boot_config::KERNEL_TEST_SCOPE != "none" {
+    if boot_config::kernel_test_scope() != "none" {
         crate::ntos::test::self_test::run();
     }
 
     // O boot comum inicializa a pilha PS/2 real antes de despachar os
     // processos; a suíte de testes já a inicializa.
-    if boot_config::KERNEL_TEST_SCOPE == "none" && crate::drivers::input::keyboard_stack::binaries_present() {
+    if boot_config::kernel_test_scope() == "none" && crate::drivers::input::keyboard_stack::binaries_present() {
         if let Err(error) = crate::drivers::input::keyboard_stack::initialize() {
             debug_print!("[kbd] pilha PS/2 real nao inicializou: {}", error);
         }
@@ -178,14 +178,14 @@ pub fn kmain() -> ! {
     // inicial real, o smss.exe no lugar do shell
     message_channels::create_channel("kbd");
     scheduler::spawn("kbd-service", keyboard_service());
-    if boot_config::SMSS_BOOT {
+    if boot_config::smss_boot() {
         if let Err(error) = crate::ntos::init::initial_process::start() {
             debug_print!("[init] processo inicial nao criado: {}", error);
         }
-    } else if boot_config::USER_PROGRAM == "shell" {
+    } else if boot_config::user_program() == "shell" {
         scheduler::spawn("shell", crate::shell::main());
     } else {
-        debug_print!("[boot] programa de usuario desconhecido: {}", boot_config::USER_PROGRAM);
+        debug_print!("[boot] programa de usuario desconhecido: {}", boot_config::user_program());
     }
 
     // Se a plataforma não entregar IRQs, cai no modo cooperativo com log claro.

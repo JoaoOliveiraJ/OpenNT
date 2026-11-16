@@ -28,7 +28,7 @@ pub fn initialize() -> Result<Option<NodeId>, KernelError> {
     if let Some(stack) = *KEYBOARD_STACK.lock() {
         return Ok(stack);
     }
-    if crate::drivers::bus::acpi_stack::ENABLED {
+    if crate::drivers::bus::acpi_stack::enabled() {
         let stack = acpi_keyboard_stack();
         if let Some(fdo) = stack {
             open_port(fdo)?;

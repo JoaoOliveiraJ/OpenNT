@@ -104,7 +104,7 @@ pub fn seed_registry_for_user_mode() -> Result<(), KernelError> {
     // No boot do processo inicial real, o smss lê a configuração do Session
     // Manager da hive SYSTEM (`cm/session_manager.rs`) e cria ele mesmo o
     // \KnownDlls; o IniFileMapping vem da hive SOFTWARE (`cm/seed.rs`).
-    if !crate::ntos::init::boot_config::SMSS_BOOT {
+    if !crate::ntos::init::boot_config::smss_boot() {
         // KnownDlls: a lista das DLLs conhecidas que o kernel provisiona e o
         // diretório delas.
         let known = registry::open_or_create("\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Session Manager\\KnownDlls", None)?;

@@ -253,6 +253,9 @@ fn up_to_date(source: &Path, copy: &Path) -> bool {
     }
 }
 
+/// Sufixo das cópias em andamento (`<nome>.parcial-<pid>`).
+const PARTIAL: &str = ".parcial-";
+
 /// Copia as imagens do bundle para `output`; as ausentes ficam de fora com
 /// aviso (o kernel registra a ausência ao carregá-las).
 ///
@@ -266,7 +269,8 @@ pub fn stage(output: &Path) -> Result<usize, String> {
     let names: Vec<&std::ffi::OsStr> = BUNDLED.iter().filter_map(|relative| Path::new(relative).file_name()).collect();
     if let Ok(entries) = fs::read_dir(output) {
         for entry in entries.filter_map(|entry| entry.ok()) {
-            if !names.contains(&entry.file_name().as_os_str()) {
+            let partial = entry.file_name().to_string_lossy().contains(PARTIAL);
+            if !names.contains(&entry.file_name().as_os_str()) && !partial {
                 let _ = fs::remove_file(entry.path());
             }
         }
@@ -282,14 +286,24 @@ pub fn stage(output: &Path) -> Result<usize, String> {
             continue;
         }
         if !up_to_date(&source, &copy) {
-            fs::copy(&source, &copy).map_err(|error| format!("{}: {error}", source.display()))?;
+            // A cópia nasce com outro nome e troca de lugar inteira: outro
+            // build que use a mesma pasta nunca embute um arquivo pela metade.
+            let partial = output.join(format!("{}{PARTIAL}{}", name.to_string_lossy(), std::process::id()));
+            fs::copy(&source, &partial).map_err(|error| format!("{}: {error}", source.display()))?;
             let modified = fs::metadata(&source).and_then(|metadata| metadata.modified());
             if let Ok(modified) = modified {
                 fs::File::options()
                     .write(true)
-                    .open(&copy)
+                    .open(&partial)
                     .and_then(|file| file.set_modified(modified))
-                    .map_err(|error| format!("{}: {error}", copy.display()))?;
+                    .map_err(|error| format!("{}: {error}", partial.display()))?;
+            }
+            if let Err(error) = fs::rename(&partial, &copy) {
+                let _ = fs::remove_file(&partial);
+                // Outro build pôs a mesma cópia no lugar antes.
+                if !up_to_date(&source, &copy) {
+                    return Err(format!("{}: {error}", copy.display()));
+                }
             }
         }
         copied += 1;

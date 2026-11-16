@@ -27,7 +27,7 @@ use crate::ntos::init::boot_config;
 /// fase 0 com o transporte: sem a opção, nada muda. Um pedido de parada do
 /// host que já esteja na porta para a máquina aqui mesmo.
 pub fn initialize() {
-    let name = boot_config::KERNEL_DEBUGGER;
+    let name = boot_config::kernel_debugger();
     if name.is_empty() {
         return;
     }

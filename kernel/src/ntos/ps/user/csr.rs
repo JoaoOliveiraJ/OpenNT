@@ -229,7 +229,7 @@ fn request(port: &Arc<Port>, data: &mut [u8]) -> u32 {
 /// do processo inicial real (`--initial-process=smss`) ela não existe: as
 /// portas, a seção e os nomes do CSR pertencem ao csrss.exe real.
 pub fn init() {
-    if crate::ntos::init::boot_config::SMSS_BOOT {
+    if crate::ntos::init::boot_config::smss_boot() {
         return;
     }
     index::set_late_initializer(late::CSR, initialize);

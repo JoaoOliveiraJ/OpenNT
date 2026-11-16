@@ -124,7 +124,7 @@ fn namespace() -> Result<(), crate::rtl::KernelError> {
     object_manager::create_directory("\\Driver")?;
     // O \KnownDlls é do smss: no boot do processo inicial real
     // (`--initial-process=smss`) o kernel não o cria.
-    if !crate::ntos::init::boot_config::SMSS_BOOT {
+    if !crate::ntos::init::boot_config::smss_boot() {
         object_manager::create_directory("\\KnownDlls")?;
         object_manager::create_symlink("\\KnownDlls\\KnownDllPath", "C:\\Windows\\System32")?;
     }
@@ -144,7 +144,7 @@ fn namespace() -> Result<(), crate::rtl::KernelError> {
     // Os dispositivos DOS dos file systems de pipes e mailslots, com os
     // nomes e destinos do `DOS Devices` do Session Manager. No boot do
     // processo inicial real quem os cria é o smss, a partir do Registro.
-    if !crate::ntos::init::boot_config::SMSS_BOOT {
+    if !crate::ntos::init::boot_config::smss_boot() {
         object_manager::create_symlink("\\GLOBAL??\\PIPE", "\\Device\\NamedPipe")?;
         object_manager::create_symlink("\\GLOBAL??\\MAILSLOT", "\\Device\\MailSlot")?;
     }

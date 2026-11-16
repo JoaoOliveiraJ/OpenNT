@@ -166,6 +166,11 @@ pub const BOOT_FIRMWARE_PHYS: u64 = 0x4FE0;
 /// bits em +2).
 pub const BOOT_GDTR_PHYS: u64 = 0x4FE8;
 pub const BOOT_FLAGS_PHYS: u64 = 0x4FD0;
+/// Bloco das opções de carga (`init/load_options.rs`): o último dos 64
+/// setores que o setor de boot carrega em 0x7E00 com o stage2. O kernel o
+/// copia na entrada, antes de o trampolim e a caixa de correio dos APs
+/// reusarem a memória do stage2.
+pub const BOOT_LOAD_OPTIONS_PHYS: u64 = 0xFC00;
 pub const E820_COUNT_PHYS: u64 = 0x4FF0;
 pub const E820_TABLE_PHYS: u64 = 0x5000;
 pub const E820_MAX_ENTRIES: u64 = 170;
@@ -301,6 +306,7 @@ pub const USER_PML4_ENTRIES: u64 = 256;
 
 pub const AP_TRAMPOLINE_PHYS: u64 = 0x9000;
 pub const SMP_MAILBOX_PHYS: u64 = 0xA000;
+const _: () = assert!(BOOT_LOAD_OPTIONS_PHYS >= SMP_MAILBOX_PHYS + PAGE_SIZE && BOOT_LOAD_OPTIONS_PHYS + 512 <= 0x7E00 + 64 * 512);
 pub const AP_STACK_BASE: u64 = 0x60000;
 pub const AP_STACK_SIZE: u64 = 0x1000;
 pub const MAX_CPUS: usize = 16;

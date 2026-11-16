@@ -1,9 +1,11 @@
 // O kernel é ligado na sua VA de sistema (0xFFFFF800_40001000) pelo script
-// `link.ld`. As opções de boot (init/boot_config.rs) chegam como variáveis de
-// ambiente.
+// `link.ld`. As opções de boot não entram no build: chegam no bloco de
+// opções de carga do loader (init/load_options.rs), então um kernel serve a
+// todas.
 //
-// Nos builds com testes, o build também gera a ntdll.dll de bring-up do
-// bundle a partir da tabela única de syscalls (`src/ntos/ke/services.rs`):
+// O build também gera a ntdll.dll de bring-up do bundle (só os boots com
+// autoteste a enxergam) a partir da tabela única de syscalls
+// (`src/ntos/ke/services.rs`):
 // um PE32+ com o DllMain e os stubs `mov r10, rcx; mov eax, N; syscall; ret`,
 // exportados por nome. O caminho final usa a ntdll real do volume.
 
@@ -138,16 +140,15 @@ fn main() {
     println!("cargo:rerun-if-changed=link.ld");
     println!("cargo:rerun-if-changed=../apps");
     println!("cargo:rerun-if-changed=src/ntos/ke/services.rs");
-    for variable in ["OPENNT_USER_PROGRAM", "OPENNT_KERNEL_TEST_SCOPE", "OPENNT_CONSOLE_MIRROR", "OPENNT_STORAGE", "OPENNT_DISPLAY"] {
-        println!("cargo:rerun-if-env-changed={variable}");
-    }
     // Binários reais do Windows copiados pelo xtask (hal.dll e as pilhas de
     // teclado/mouse e armazenamento): a lista gerada os embute no bundle.
     println!("cargo:rerun-if-env-changed=OPENNT_WINDOWS_BINARIES");
     let mut binaries = String::from("pub static WINDOWS_BINARIES: &[BundleFile] = &[\n");
     if let Ok(directory) = std::env::var("OPENNT_WINDOWS_BINARIES") {
         println!("cargo:rerun-if-changed={directory}");
-        let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(&directory).map(|entries| entries.filter_map(|entry| entry.ok()).map(|entry| entry.path()).filter(|path| path.is_file()).collect()).unwrap_or_default();
+        // Sem as cópias em andamento de outro build (`<nome>.parcial-<pid>`).
+        let complete = |path: &std::path::Path| path.is_file() && !path.file_name().is_some_and(|name| name.to_string_lossy().contains(".parcial-"));
+        let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(&directory).map(|entries| entries.filter_map(|entry| entry.ok()).map(|entry| entry.path()).filter(|path| complete(path)).collect()).unwrap_or_default();
         entries.sort();
         for path in entries {
             println!("cargo:rerun-if-changed={}", path.display());
@@ -157,12 +158,8 @@ fn main() {
     }
     binaries.push_str("];\n");
     std::fs::write(std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("windows_binaries.rs"), binaries).expect("lista de binarios do Windows");
-    // Só os builds com testes levam a ntdll de bring-up no bundle.
-    println!("cargo::rustc-check-cfg=cfg(opennt_test_bundle)");
-    let scope = std::env::var("OPENNT_KERNEL_TEST_SCOPE").unwrap_or_default();
-    if !scope.is_empty() && scope != "none" {
-        let output = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("ntdll.dll");
-        std::fs::write(output, bring_up_ntdll()).expect("ntdll de bring-up");
-        println!("cargo:rustc-cfg=opennt_test_bundle");
-    }
+    // A ntdll de bring-up do bundle (hal/bundle.rs a mostra só aos boots
+    // com autoteste).
+    let output = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("ntdll.dll");
+    std::fs::write(output, bring_up_ntdll()).expect("ntdll de bring-up");
 }

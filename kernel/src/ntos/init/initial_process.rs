@@ -107,7 +107,7 @@ pub fn start() -> Result<(), KernelError> {
 
 /// Registra um NtCreateUserProcess bem-sucedido de um processo de usuário.
 pub fn record_creation(creator_pointer: u64, child_pointer: u64) {
-    if !boot_config::SMSS_BOOT {
+    if !boot_config::smss_boot() {
         return;
     }
     // SAFETY: os dois EPROCESS estão retidos por quem cria.
@@ -119,7 +119,7 @@ pub fn record_creation(creator_pointer: u64, child_pointer: u64) {
 
 /// O driver de sessão da classe 38 voltou do DriverEntry com `status`.
 pub fn session_driver_initialized(name: &str, image_base: u64, status: u32) {
-    if !boot_config::SMSS_BOOT || !name.eq_ignore_ascii_case(WIN32K_PATH) || status & 0x8000_0000 != 0 {
+    if !boot_config::smss_boot() || !name.eq_ignore_ascii_case(WIN32K_PATH) || status & 0x8000_0000 != 0 {
         return;
     }
     let shadow = crate::ntos::ex::service_table::shadow_second_table().unwrap_or([0; 4]);
@@ -191,7 +191,7 @@ fn user_service_number(module: &str, export: &str) -> Option<u32> {
 /// `USER_INITIALIZED` sai quando o NtUserInitialize do csrss.exe (o número
 /// do stub do win32u.dll dele) volta com sucesso.
 pub fn win32k_service_returned(service_number: u32, result: u64) {
-    if !boot_config::SMSS_BOOT || USER_INITIALIZED.load(Ordering::Acquire) {
+    if !boot_config::smss_boot() || USER_INITIALIZED.load(Ordering::Acquire) {
         return;
     }
     if !image_name(process::get_current_process()).eq_ignore_ascii_case("csrss.exe") {
@@ -245,7 +245,7 @@ pub fn desktop_opened(window_station: &str, desktop: &str) {
 /// csrss.exe voltou com `status`: a primeira é anotada.
 pub fn gui_thread_converted(status: u32) {
     static NOTED: AtomicBool = AtomicBool::new(false);
-    if !boot_config::SMSS_BOOT || status == STATUS_ALREADY_WIN32 {
+    if !boot_config::smss_boot() || status == STATUS_ALREADY_WIN32 {
         return;
     }
     let current = process::get_current_process();
@@ -259,7 +259,7 @@ pub fn gui_thread_converted(status: u32) {
 /// Uma thread do processo corrente pediu pela primeira vez um serviço da
 /// tabela do win32k (o KiSystemCall64 vai convertê-la em thread GUI).
 pub fn win32k_requested(service_number: u32) {
-    if !boot_config::SMSS_BOOT || GATE_REACHED.load(Ordering::Acquire) {
+    if !boot_config::smss_boot() || GATE_REACHED.load(Ordering::Acquire) {
         return;
     }
     let current = process::get_current_process();
@@ -285,7 +285,7 @@ pub fn win32k_requested(service_number: u32) {
     crate::debug_print!("SMSS_CSRSS_OK");
     // `--trace-driver-api` no boot do smss: depois do portão, cada export
     // que os drivers (o win32k, o dxgkrnl e o miniport) chamam é impresso.
-    if boot_config::TRACE_DRIVER_API {
+    if boot_config::trace_driver_api() {
         crate::ntos::init::exports::set_api_trace(true);
     }
 }

@@ -72,7 +72,26 @@ pub fn find_qemu() -> Result<PathBuf, String> {
     Err("QEMU nao encontrado: defina a variavel QEMU com o caminho de qemu-system-x86_64".into())
 }
 
-fn machine_arguments(image: &Path, machine: &MachineOptions) -> Vec<String> {
+/// Os discos da máquina: o de boot (`os.img`) e o volume NTFS de dados.
+pub struct Disks {
+    pub boot: PathBuf,
+    pub data: Option<PathBuf>,
+    /// O volume com `snapshot=on`: as escritas do convidado vão para um
+    /// arquivo temporário do QEMU, e a imagem fica como o build a deixou
+    /// (várias execuções dividem a mesma).
+    pub data_snapshot: bool,
+}
+
+impl Disks {
+    /// Os discos de uma pasta de build: o `ntfs.img` ao lado da imagem de
+    /// boot, quando gerado, gravável.
+    pub fn beside(image: &Path) -> Disks {
+        let ntfs = image.with_file_name("ntfs.img");
+        Disks { boot: image.to_path_buf(), data: ntfs.exists().then_some(ntfs), data_snapshot: false }
+    }
+}
+
+fn machine_arguments(disks: &Disks, machine: &MachineOptions) -> Vec<String> {
     let mut arguments = vec![
         "-accel".to_string(),
         // No WHPX, um RDMSR/WRMSR de MSR não suportado precisa gerar #GP (como
@@ -95,13 +114,13 @@ fn machine_arguments(image: &Path, machine: &MachineOptions) -> Vec<String> {
         "-smp".to_string(),
         machine.smp.to_string(),
         "-drive".to_string(),
-        format!("format=raw,file={}", image.display()),
+        format!("format=raw,file={}", disks.boot.display()),
         "-no-reboot".to_string(),
     ]);
     // Volume NTFS de dados no mestre-escravo primário, quando gerado.
-    let ntfs = image.with_file_name("ntfs.img");
-    if ntfs.exists() {
-        arguments.extend(["-drive".to_string(), format!("format=raw,if=ide,index=1,media=disk,file={}", ntfs.display())]);
+    if let Some(ntfs) = &disks.data {
+        let snapshot = if disks.data_snapshot { ",snapshot=on" } else { "" };
+        arguments.extend(["-drive".to_string(), format!("format=raw,if=ide,index=1,media=disk{snapshot},file={}", ntfs.display())]);
     }
     arguments
 }
@@ -109,9 +128,9 @@ fn machine_arguments(image: &Path, machine: &MachineOptions) -> Vec<String> {
 /// QEMU em segundo plano (com janela, ou sem tela com `window` falso), a
 /// COM1 num arquivo (o terminal fica para o prompt do depurador) e a COM2
 /// no socket do depurador.
-pub fn spawn(image: &Path, machine: &MachineOptions, log: &Path, window: bool) -> Result<Child, String> {
+pub fn spawn(disks: &Disks, machine: &MachineOptions, log: &Path, window: bool) -> Result<Child, String> {
     let qemu = find_qemu()?;
-    let mut arguments = machine_arguments(image, machine);
+    let mut arguments = machine_arguments(disks, machine);
     if !window {
         arguments.extend(["-display".to_string(), "none".to_string()]);
     }
@@ -122,9 +141,9 @@ pub fn spawn(image: &Path, machine: &MachineOptions, log: &Path, window: bool) -
 }
 
 /// Shell interativo numa janela do QEMU; a serial fica neste terminal.
-pub fn run(image: &Path, machine: &MachineOptions) -> Result<(), String> {
+pub fn run(disks: &Disks, machine: &MachineOptions) -> Result<(), String> {
     let qemu = find_qemu()?;
-    let mut arguments = machine_arguments(image, machine);
+    let mut arguments = machine_arguments(disks, machine);
     arguments.extend(["-serial".to_string(), "stdio".to_string()]);
     arguments.extend(kd_serial(machine));
     if let Some(port) = machine.kd_port {
@@ -365,10 +384,10 @@ pub const FAILURE_MARKERS: &[&str] = &["*** PANIC", "*** EXCECAO", "SELFTEST FAL
 /// Boot sem tela: sucesso quando o marcador (e as saídas esperadas depois
 /// das teclas) aparecem na serial antes do prazo.
 /// Com `session` (o roteiro do depurador), ela roda em paralelo ao teste.
-pub fn test_boot(image: &Path, machine: &MachineOptions, test: &TestOptions, log: &Path, session: Option<Session>) -> Result<(), String> {
+pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, log: &Path, session: Option<Session>) -> Result<(), String> {
     let qemu = find_qemu()?;
     let port = free_port()?;
-    let mut arguments = machine_arguments(image, machine);
+    let mut arguments = machine_arguments(disks, machine);
     arguments.extend([
         "-display".to_string(),
         "none".to_string(),

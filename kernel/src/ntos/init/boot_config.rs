@@ -1,44 +1,137 @@
-//! Configuração de boot. O `cargo xtask build` passa as opções como variáveis de
-//! ambiente lidas em tempo de compilação.
+//! Configuração de boot: as opções de carga que o loader entrega
+//! (`load_options.rs`), lidas uma vez na entrada do kernel, antes de qualquer
+//! outra CPU ou thread existir, e só lidas depois disso. Sem o bloco do
+//! loader, o boot segue sem opções (o boot comum, com o shell).
 
-const fn or_default(value: Option<&'static str>, default: &'static str) -> &'static str {
-    match value {
-        Some(value) => value,
-        None => default,
+use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+use super::load_options::{self as name, BLOCK_SIZE, TEXT_MAX};
+use crate::ntos::mm::memory_map;
+
+const _: () = assert!(memory_map::BOOT_LOAD_OPTIONS_PHYS == name::STAGE2_LOAD_ADDRESS + (name::SECTOR as u64 - 1) * 512);
+
+/// O texto das opções, copiado do bloco do loader.
+struct Text(UnsafeCell<[u8; TEXT_MAX]>);
+
+// SAFETY: `capture` grava o texto uma vez, no BSP, antes de qualquer leitura
+// e de qualquer outra CPU; depois dele o texto só é lido.
+unsafe impl Sync for Text {}
+
+static TEXT: Text = Text(UnsafeCell::new([0; TEXT_MAX]));
+/// Tamanho do texto válido em [`TEXT`], publicado depois da cópia.
+static LENGTH: AtomicUsize = AtomicUsize::new(0);
+
+/// Copia as opções do bloco que o setor de boot deixou em
+/// `BOOT_LOAD_OPTIONS_PHYS` (a memória baixa ainda é a do loader). Chamada
+/// uma vez, na entrada do kernel.
+pub fn capture() {
+    let mut block = [0u8; BLOCK_SIZE];
+    for (offset, byte) in block.iter_mut().enumerate() {
+        *byte = crate::hal::physical::read8(memory_map::BOOT_LOAD_OPTIONS_PHYS + offset as u64);
     }
+    let Some(text) = name::text_of(&block) else { return };
+    // SAFETY: ninguém lê o texto antes de LENGTH ser publicado, e esta é a
+    // única escrita (ver `Text`).
+    unsafe { (&mut *TEXT.0.get())[..text.len()].copy_from_slice(text.as_bytes()) };
+    LENGTH.store(text.len(), Ordering::Release);
 }
 
-/// `--user-program`: programa iniciado depois do boot (`shell` por padrão).
-pub const USER_PROGRAM: &str = or_default(option_env!("OPENNT_USER_PROGRAM"), "shell");
+/// O texto das opções de carga deste boot (vazio sem o bloco).
+pub fn load_options() -> &'static str {
+    let length = LENGTH.load(Ordering::Acquire);
+    // SAFETY: os `length` primeiros bytes já foram gravados por `capture`
+    // (ASCII validado por `text_of`) e não mudam mais.
+    let bytes = unsafe { &(&*TEXT.0.get())[..length] };
+    core::str::from_utf8(bytes).unwrap_or("")
+}
 
-/// `--kernel-test-scope`: `none` no build normal; `all` roda o self-test.
-pub const KERNEL_TEST_SCOPE: &str = or_default(option_env!("OPENNT_KERNEL_TEST_SCOPE"), "none");
+fn value(option: &str) -> Option<&'static str> {
+    name::value(load_options(), option)
+}
 
-/// `--start-driver`: serviços de driver iniciados pelo SCM antes do programa
-/// de usuário, separados por vírgula e na ordem dada, com a CI fiscalizando
-/// as cargas (vazio = nenhum).
-pub const START_DRIVER: &str = or_default(option_env!("OPENNT_START_DRIVER"), "");
+fn flag(option: &str) -> bool {
+    name::flag(load_options(), option)
+}
 
-/// `--trace-driver-api`: imprime cada chamada de API do driver de
-/// `--start-driver` enquanto ele inicia.
-pub const TRACE_DRIVER_API: bool = option_env!("OPENNT_TRACE_DRIVER_API").is_some();
+/// `USERPROGRAM` (`--user-program`): programa iniciado depois do boot
+/// (`shell` por padrão).
+pub fn user_program() -> &'static str {
+    value(name::USER_PROGRAM).unwrap_or("shell")
+}
+
+/// `KERNELTESTSCOPE` (`--kernel-test-scope`): `none` no boot comum; `all`
+/// roda o autoteste.
+pub fn kernel_test_scope() -> &'static str {
+    value(name::KERNEL_TEST_SCOPE).unwrap_or("none")
+}
+
+/// O boot roda o autoteste (`KERNELTESTSCOPE` diferente de `none`).
+pub fn kernel_tests() -> bool {
+    kernel_test_scope() != "none"
+}
+
+/// `STARTDRIVER` (`--start-driver`): serviços de driver iniciados pelo SCM
+/// antes do programa de usuário, separados por vírgula e na ordem dada, com
+/// a CI fiscalizando as cargas (vazio = nenhum).
+pub fn start_driver() -> &'static str {
+    value(name::START_DRIVER).unwrap_or("")
+}
+
+/// `TRACEDRIVERAPI` (`--trace-driver-api`): imprime cada chamada de API do
+/// driver de `--start-driver` enquanto ele inicia.
+pub fn trace_driver_api() -> bool {
+    flag(name::TRACE_DRIVER_API)
+}
 
 /// `OPENNT_TRACE_SYSCALLS` no ambiente do build: imprime cada serviço de
 /// modo usuário despachado, com os argumentos e o resultado (diagnóstico).
 pub const TRACE_SYSCALLS: bool = option_env!("OPENNT_TRACE_SYSCALLS").is_some();
 
-/// `--console-mirror`: espelha o texto do console na serial.
-pub const CONSOLE_SERIAL_MIRROR: bool = option_env!("OPENNT_CONSOLE_MIRROR").is_some();
+/// `CONSOLEMIRROR` (`--console-mirror`): espelha o texto do console na
+/// serial.
+pub fn console_serial_mirror() -> bool {
+    flag(name::CONSOLE_MIRROR)
+}
 
-/// `--initial-process=smss`: o kernel inicia o smss.exe real como o primeiro
-/// processo de usuário (`init/initial_process.rs`), com o CSR emulado e o
-/// `\KnownDlls` do kernel desligados; vazio no boot comum.
-pub const INITIAL_PROCESS: &str = or_default(option_env!("OPENNT_INITIAL_PROCESS"), "");
+/// `INITIALPROCESS=smss` (`--initial-process=smss`): o kernel inicia o
+/// smss.exe real como o primeiro processo de usuário
+/// (`init/initial_process.rs`), com o CSR emulado e o `\KnownDlls` do kernel
+/// desligados; vazio no boot comum.
+pub fn initial_process() -> &'static str {
+    value(name::INITIAL_PROCESS).unwrap_or("")
+}
 
 /// O boot do processo inicial real (`--initial-process=smss`).
-pub const SMSS_BOOT: bool = matches!(INITIAL_PROCESS.as_bytes(), b"smss");
+pub fn smss_boot() -> bool {
+    initial_process() == "smss"
+}
 
-/// `--kd=com2` (ou `com3`, `com4`): o depurador do kernel atende um host pelo
-/// protocolo remoto do GDB nessa porta serial (`ntos::kd`); vazio = sem
-/// depurador, como um boot do Windows sem /DEBUG.
-pub const KERNEL_DEBUGGER: &str = or_default(option_env!("OPENNT_KD"), "");
+/// `DEBUG DEBUGPORT=COM2` (`--kd=com2`; ou `COM3`, `COM4`): o depurador do
+/// kernel atende um host pelo protocolo remoto do GDB nessa porta serial
+/// (`ntos::kd`); vazio = sem depurador, como um boot do Windows sem /DEBUG.
+pub fn kernel_debugger() -> &'static str {
+    if flag(name::DEBUG) {
+        value(name::DEBUG_PORT).unwrap_or("")
+    } else {
+        ""
+    }
+}
+
+/// `STORAGE=real` (`--storage=real`): a pilha de armazenamento do Windows
+/// sobe pelo PnP.
+pub fn real_storage() -> bool {
+    value(name::STORAGE) == Some("real")
+}
+
+/// `DISPLAY=basic` (`--display=basic`): o PnP instala o BasicDisplay.sys real
+/// no adaptador VGA.
+pub fn basic_display() -> bool {
+    value(name::DISPLAY) == Some("basic")
+}
+
+/// `PNPROOT=acpi` (`--pnp-root=acpi`): a raiz da árvore de dispositivos é o
+/// acpi.sys real sobre a HAL.
+pub fn acpi_root() -> bool {
+    value(name::PNP_ROOT) == Some("acpi")
+}

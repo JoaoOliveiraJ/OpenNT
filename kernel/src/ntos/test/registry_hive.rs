@@ -155,7 +155,7 @@ fn system_hive_from_file(assert: Assert) {
     assert(hive_init::system_hive_from_file() && hive.is_some_and(|(_, is_root)| is_root), "hive: \\Registry\\Machine\\SYSTEM carregada de \\SystemRoot\\System32\\config\\SYSTEM");
     let Some((identifier, _)) = hive else { return };
     let mut complete = true;
-    for key in seed::system_keys(crate::ntos::init::boot_config::SMSS_BOOT) {
+    for key in seed::system_keys(crate::ntos::init::boot_config::smss_boot()) {
         let path = alloc::format!("\\Registry\\Machine\\System\\{}", key.path);
         for (name, value_type, data) in key.values {
             complete &= registry::read_value_by_path(&path, &name).is_some_and(|value| value.value_type == value_type && value.data == data);

@@ -14,7 +14,7 @@ use crate::ntos::init::boot_config;
 
 pub fn write(text: &str) {
     vga::write(text);
-    if boot_config::CONSOLE_SERIAL_MIRROR {
+    if boot_config::console_serial_mirror() {
         serial::puts(text);
     }
 }
@@ -27,7 +27,7 @@ pub fn print(text: &str) {
 /// Tela + serial.
 pub fn log(text: &str) {
     print(text);
-    if !boot_config::CONSOLE_SERIAL_MIRROR {
+    if !boot_config::console_serial_mirror() {
         debug_print!("{}", text);
     }
 }

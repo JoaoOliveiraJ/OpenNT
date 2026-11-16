@@ -29,11 +29,31 @@ fn every_components_test_is_a_valid_test_boot() {
     let only = plan::select(&tests, &[String::from("suite-smp1")], &[], Suites::Included).unwrap();
     assert_eq!(only.len(), 1);
     assert!(plan::select(&tests, &[String::from("nao-existe")], &[], Suites::Included).is_err());
-    // As duas suítes dividem a configuração de build: um kernel só.
+    // As duas suítes dividem as imagens.
     let runs = plan::runs(&tests, &plan::select(&tests, &[], &[], Suites::Only).unwrap(), 2);
     let names: Vec<&str> = runs.iter().map(|run| run.name.as_str()).collect();
     assert_eq!(names, ["suite-smp4.1", "suite-smp4.2", "suite-smp1.1", "suite-smp1.2"]);
-    assert_eq!(tests[runs[0].test].build_key, tests[runs[3].test].build_key);
+    assert!(runs.iter().all(|run| run.image == 0));
+    assert_eq!(tests[runs[0].test].image_key, tests[runs[3].test].image_key);
+}
+
+/// A rodada inteira compila um kernel só: as opções de boot dos testes vão
+/// nas opções de carga, e só o volume do smss pede outra pasta de imagens.
+#[test]
+fn the_whole_round_compiles_one_kernel() {
+    let tests = plan::load(&crate::build::workspace_root()).unwrap();
+    let all: Vec<String> = tests.iter().map(|test| test.id.clone()).collect();
+    let runs = plan::runs(&tests, &plan::select(&tests, &all, &[], Suites::Included).unwrap(), 1);
+    let mut kernels: Vec<&str> = runs.iter().map(|run| tests[run.test].kernel_key.as_str()).collect();
+    kernels.dedup();
+    assert_eq!(kernels.len(), 1, "builds do kernel diferentes na rodada");
+    let images = runs.iter().map(|run| run.image + 1).max().unwrap_or(0);
+    assert!(images <= 2, "{images} pastas de imagens");
+    // As execuções de uma pasta vêm juntas, e a de cada teste é a da chave dele.
+    for pair in runs.windows(2) {
+        assert!(pair[0].image <= pair[1].image);
+        assert_eq!(pair[0].image == pair[1].image, tests[pair[0].test].image_key == tests[pair[1].test].image_key);
+    }
 }
 
 #[test]
