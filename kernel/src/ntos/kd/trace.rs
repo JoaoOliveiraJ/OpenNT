@@ -21,11 +21,15 @@
 //!            [thread u64] [vigia u64] [pulados u32] | valores u64 por bit da máscara
 //! ```
 //!
-//! Nada aqui aloca nem toma trava: só o dono da parada mexe no estado.
+//! O buffer é reservado no boot com `--kd` (`reserve`, fora da imagem do
+//! kernel); depois disso nada aqui aloca nem toma trava: só o processador
+//! da parada mexe no estado.
 
+use alloc::boxed::Box;
+use alloc::vec;
 use core::cell::UnsafeCell;
 use core::fmt::Write;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 use super::packet::Payload;
 use super::registers::View;
@@ -108,8 +112,16 @@ struct Cell<T>(UnsafeCell<T>);
 // congelados) usa o estado.
 unsafe impl<T> Sync for Cell<T> {}
 
-/// Os registros (zerados: ficam no `.bss`).
-static BUFFER: Cell<[u8; BUFFER_SIZE]> = Cell(UnsafeCell::new([0; BUFFER_SIZE]));
+/// Os registros: `BUFFER_SIZE` bytes reservados no boot (nulo sem `--kd`).
+static BUFFER: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Reserva o buffer do rastro (o `kd::initialize` com o depurador ligado).
+pub fn reserve() {
+    if BUFFER.load(Ordering::Acquire).is_null() {
+        let buffer: &'static mut [u8] = Box::leak(vec![0u8; BUFFER_SIZE].into_boxed_slice());
+        BUFFER.store(buffer.as_mut_ptr(), Ordering::Release);
+    }
+}
 
 static STATE: Cell<State> = Cell(UnsafeCell::new(State {
     count: 0,
@@ -144,9 +156,11 @@ fn state() -> &'static mut State {
     unsafe { &mut *STATE.0.get() }
 }
 
-fn buffer() -> &'static mut [u8; BUFFER_SIZE] {
-    // SAFETY: ver `Cell`.
-    unsafe { &mut *BUFFER.0.get() }
+fn buffer() -> Option<&'static mut [u8]> {
+    let pointer = BUFFER.load(Ordering::Acquire);
+    // SAFETY: `BUFFER_SIZE` bytes vivos para sempre (`reserve`), usados só
+    // pelo processador da parada (ver `Cell`).
+    (!pointer.is_null()).then(|| unsafe { core::slice::from_raw_parts_mut(pointer, BUFFER_SIZE) })
 }
 
 pub fn armed() -> bool {
@@ -209,8 +223,8 @@ fn read_registers(view: &View) -> [u64; REGISTERS] {
 
 fn push(state: &mut State, bytes: &[u8]) {
     let end = state.length + bytes.len();
-    if end <= BUFFER_SIZE {
-        buffer()[state.length..end].copy_from_slice(bytes);
+    if let Some(buffer) = buffer().filter(|_| end <= BUFFER_SIZE) {
+        buffer[state.length..end].copy_from_slice(bytes);
         state.length = end;
     }
 }
@@ -366,7 +380,7 @@ pub fn read(offset: usize, output: &mut [u8]) -> usize {
     header[12..16].copy_from_slice(&(state.length as u32).to_le_bytes());
     header[16..24].copy_from_slice(&state.steps.to_le_bytes());
     let total = HEADER_SIZE + state.length;
-    let buffer = buffer();
+    let Some(buffer) = buffer() else { return 0 };
     let mut written = 0;
     let mut position = offset;
     while written < output.len() && position < total {
@@ -392,6 +406,11 @@ pub fn command(owner: usize, line: &str, out: &mut Payload) {
     let mut words = line.split_whitespace();
     match words.next().unwrap_or("status") {
         "start" => {
+            if buffer().is_none() {
+                out.push_str("trace: sem o buffer do rastro
+");
+                return;
+            }
             let mut count = 1000u64;
             let mut until = 0;
             let mut stop_on_return = false;

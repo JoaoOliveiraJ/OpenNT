@@ -46,6 +46,7 @@ pub fn initialize() {
         debug_print!("[kd] estado do depurador nao publicado: {}", error);
         return;
     }
+    trace::reserve();
     stop::activate(transport::line_status_port());
     debug_print!("[kd] depurador do kernel na {} (porta {:#x}, protocolo remoto do GDB)", name, base);
     if transport::byte_pending() {

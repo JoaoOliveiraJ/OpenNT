@@ -1826,7 +1826,9 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     start` (número de instruções, endereço final, até o retorno,
     profundidade máxima, faixas puladas, entrar ou sair de uma faixa,
     endereço vigiado) e continua. O processador da parada executa passo a passo
-    (TF) e cada #DB grava um registro compacto num buffer de 256 KB: classe
+    (TF) e cada #DB grava um registro compacto num buffer de 256 KB
+    (reservado no `kd::initialize` só com `--kd`, fora da imagem do kernel,
+    que tem teto fixo: `KERNEL_IMAGE_MAX`): classe
     da instrução (call, ret), RIP, profundidade, thread quando muda, valor
     vigiado quando muda e só os registradores que mudaram. Não há volta ao
     host por instrução. O lote para no fim pedido, num breakpoint, antes de
