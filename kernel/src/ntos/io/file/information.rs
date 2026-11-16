@@ -536,6 +536,8 @@ fn device_nt_name(device: u64) -> alloc::vec::Vec<u16> {
         .into_iter()
         .find(|(_, entry)| entry.native_device == device || entry.stack_top == device)
         .and_then(|(node, _)| crate::ntos::ob::object_manager::path_of(node))
+        // Um dispositivo publicado só no namespace (o volume embutido).
+        .or_else(|| crate::ntos::ob::query_object::native_object_path(device))
         .unwrap_or_default()
         .encode_utf16()
         .collect()

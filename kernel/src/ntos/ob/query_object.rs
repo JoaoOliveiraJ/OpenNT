@@ -314,6 +314,12 @@ pub fn query(handle: u64, class: u32, output: u64, length: u32, returned: u64) -
     Ok(result)
 }
 
+/// O caminho do namespace de um objeto nomeado pelo corpo nativo (o nome
+/// que o ObQueryNameString dá a um dispositivo).
+pub fn native_object_path(pointer: u64) -> Option<String> {
+    find_path_by_native_pointer(pointer)
+}
+
 /// Caminho completo pelo corpo nativo (\Device, \Driver e \KernelObjects).
 fn find_path_by_native_pointer(pointer: u64) -> Option<String> {
     for root in ["\\Device", "\\Driver", "\\KernelObjects"] {
@@ -352,7 +358,13 @@ pub fn query_name_string(pointer: u64, output: u64, size: u32, returned: u64) ->
     // Um FILE_OBJECT: a QueryNameProcedure do tipo File (IopQueryName).
     if crate::ntos::ob::objects::file::is_file(pointer) {
         return match crate::ntos::io::file::information::query_object_name(pointer) {
-            Ok(Ok(units)) => write_name_information(Some(&String::from_utf16_lossy(&units)), output, size, returned),
+            Ok(Ok(units)) => {
+                let name = String::from_utf16_lossy(&units);
+                if crate::ntos::init::boot_config::TRACE_SYSCALLS {
+                    crate::debug_print!("[ob] ObQueryNameString do arquivo {:#x}: {}", pointer, name);
+                }
+                write_name_information(Some(&name), output, size, returned)
+            }
             Ok(Err(status)) => status,
             Err(_) => 0xC000_0001,
         };
