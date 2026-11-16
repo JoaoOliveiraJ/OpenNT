@@ -9,7 +9,10 @@
 //!   nibble. O contexto vem do acpi.sys (HaliAcpiMachineStateInit, ver
 //!   `acpi_pm`); sem o acpi.sys carregado, o suporte de boot do OpenNT tira
 //!   o SLP_TYPa do pacote `\_S5_` da DSDT, o mesmo objeto que o acpi.sys
-//!   avaliaria. Se a máquina não desliga, segue o reinício, como no NT.
+//!   avaliaria. Se a máquina não desliga, segue o reinício, como no NT,
+//!   depois de 2 s de espera: o corte de energia não é síncrono com a
+//!   escrita (num emulador, outra thread atende o pedido), e o reinício
+//!   imediato podia passar na frente do desligamento.
 //! - HalHaltRoutine (0), HalRestartRoutine (2) e HalRebootRoutine (3): o
 //!   HalpPowerWriteResetCommand (rva 0x4be25c), num boot de BIOS (o
 //!   HalpMiscIsLegacyPcType): a CMOS 0x0F (estado de desligamento) volta a
@@ -174,7 +177,16 @@ fn shutdown() {
     if let Some(current) = pm_read(register::PM1B_CNT) {
         pm_write(register::PM1B_CNT, sleep_control(current, context >> 4));
     }
+    // A plataforma corta a energia depois da escrita, não na instrução
+    // seguinte (num emulador o pedido de desligamento é atendido por outra
+    // thread): o reinício só vem depois de um prazo.
+    for _ in 0..POWER_OFF_GRACE_MS {
+        crate::ntos::ke::clock::stall_execution_processor(1000);
+    }
 }
+
+/// Quanto o HalpShutdown espera a máquina desligar antes do reinício.
+const POWER_OFF_GRACE_MS: u32 = 2000;
 
 /// HalpPlatformFlags da FADT (HalpSetPlatformFlags, sem a opção de carga
 /// FORCELEGACYPLATFORM): 7, estreitado só numa FADT de revisão >= 5.
