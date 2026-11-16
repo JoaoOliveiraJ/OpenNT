@@ -139,8 +139,9 @@ pub fn basic_display() -> bool {
     value(name::DISPLAY) == Some("basic")
 }
 
-/// `PNPROOT=acpi` (`--pnp-root=acpi`): a raiz da árvore de dispositivos é o
-/// acpi.sys real sobre a HAL.
+/// A raiz da árvore de dispositivos é o acpi.sys real sobre a HAL, o padrão;
+/// `PNPROOT=internal` (`--pnp-root=internal`) volta ao barramento PCI
+/// interno do kernel.
 pub fn acpi_root() -> bool {
-    value(name::PNP_ROOT) == Some("acpi")
+    value(name::PNP_ROOT) != Some("internal")
 }

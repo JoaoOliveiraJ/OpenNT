@@ -61,8 +61,10 @@ pub struct BuildOptions {
     /// bundle do kernel (padrão [`WINDOWS_DIR`]). Builds que dividem a pasta
     /// não recompilam o kernel só porque o caminho dela mudou.
     pub windows_dir: Option<PathBuf>,
-    /// `--pnp-root=acpi`: a raiz da árvore de dispositivos é o acpi.sys real
-    /// sobre o dispositivo ACPI da HAL, com o pci.sys real no barramento PCI.
+    /// `--pnp-root=acpi|internal`: a raiz da árvore de dispositivos é o
+    /// acpi.sys real sobre o dispositivo ACPI da HAL, com o pci.sys real no
+    /// barramento PCI (o padrão, vazio ou `acpi`), ou o barramento PCI
+    /// interno do kernel (`internal`).
     pub pnp_root: String,
     /// `--kd=com2`: o depurador do kernel nessa porta serial (vazio = sem
     /// depurador).

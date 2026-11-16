@@ -45,7 +45,8 @@ pub const INITIAL_PROCESS: &str = "INITIALPROCESS";
 pub const STORAGE: &str = "STORAGE";
 /// `basic`: o BasicDisplay.sys real no adaptador VGA.
 pub const DISPLAY: &str = "DISPLAY";
-/// `acpi`: a raiz da árvore de dispositivos é o acpi.sys real.
+/// A raiz da árvore de dispositivos: `acpi` (o acpi.sys real, o padrão) ou
+/// `internal` (o barramento PCI interno do kernel).
 pub const PNP_ROOT: &str = "PNPROOT";
 /// `poweroff` ou `reboot`: o teste do desligamento depois do
 /// `STARTDRIVER=ntfs`.

@@ -17,10 +17,12 @@
 //! Opções de build: `--release`, `--build-dir=DIR` (padrão `build`),
 //! `--user-program=shell`, `--kernel-test-scope=none|all|disk-stress`, `--console-mirror`,
 //! `--start-driver=NOME[,NOME...]`, `--trace-driver-api`, `--initial-process=smss`, `--storage=real`,
-//! `--display=basic`, `--windows-dir=DIR`, `--pnp-root=acpi`, `--kd=com2` (o depurador do
-//! kernel na COM2), `--shutdown-test=poweroff|reboot` (o teste do desligamento). Fora `--release` e `--windows-dir`, elas não recompilam o kernel: vão
-//! no bloco de opções de carga da imagem de boot (`build.rs`), e o `--initial-process=smss`
-//! também troca o volume NTFS.
+//! `--display=basic`, `--windows-dir=DIR`, `--pnp-root=acpi|internal` (a raiz da árvore de
+//! dispositivos: o acpi.sys real, o padrão, ou o barramento PCI interno), `--kd=com2` (o
+//! depurador do kernel na COM2), `--shutdown-test=poweroff|reboot` (o teste do desligamento).
+//! Fora `--release` e `--windows-dir`, elas não recompilam o kernel: vão no bloco de opções de
+//! carga da imagem de boot (`build.rs`), e o `--initial-process=smss` também troca o volume
+//! NTFS.
 //! Opções de máquina: `--accel=tcg|whpx`, `--memory-mb=N`, `--smp=N`, `--kd-port=N`
 //! (a porta TCP da COM2; `run` usa 1234 por padrão).
 //! Em `--keys`, `\n` digita Enter.
@@ -66,7 +68,7 @@ opcoes de build:   --release --build-dir=DIR --user-program=shell
                    --kernel-test-scope=none|all|disk-stress --console-mirror --start-driver=NOME[,NOME...]
                    --trace-driver-api --initial-process=smss --storage=real --display=basic
                    --windows-dir=DIR (binarios do Windows do bundle; padrao build/windows)
-                   --pnp-root=acpi
+                   --pnp-root=acpi|internal (raiz da arvore de dispositivos; padrao acpi)
                    --kd=com2 (depurador do kernel na COM2)
                    --shutdown-test=poweroff|reboot (com --start-driver=ntfs: grava e desliga)
 opcoes de maquina: --accel=tcg|whpx --memory-mb=N --smp=N --kd-port=N
@@ -211,8 +213,8 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
     if !matches!(parsed.build.initial_process.as_str(), "" | "smss") {
         return Err(format!("--initial-process aceita apenas smss ({} recebido)", parsed.build.initial_process));
     }
-    if !matches!(parsed.build.pnp_root.as_str(), "" | "acpi") {
-        return Err(format!("--pnp-root aceita apenas acpi ({} recebido)", parsed.build.pnp_root));
+    if !matches!(parsed.build.pnp_root.as_str(), "" | "acpi" | "internal") {
+        return Err(format!("--pnp-root aceita acpi ou internal ({} recebido)", parsed.build.pnp_root));
     }
     if !matches!(parsed.build.shutdown_test.as_str(), "" | "poweroff" | "reboot") {
         return Err(format!("--shutdown-test aceita poweroff ou reboot ({} recebido)", parsed.build.shutdown_test));

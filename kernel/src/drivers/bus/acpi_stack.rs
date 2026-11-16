@@ -1,6 +1,7 @@
-//! A raiz ACPI da árvore de dispositivos (`--pnp-root=acpi`).
+//! A raiz ACPI da árvore de dispositivos (o padrão; `--pnp-root=internal`
+//! volta ao barramento PCI interno).
 //!
-//! Com a opção, a árvore do PnP é a do Windows num PC ACPI: sob
+//! A árvore do PnP é a do Windows num PC ACPI: sob
 //! HTREE\ROOT\0 o computador que a HAL relata (`ROOT\ACPI_HAL\0000`) e, sob
 //! ele, o dispositivo ACPI raiz da HAL (`ACPI_HAL\PNP0C08\0`, `hal::pnp`),
 //! instalado pelo acpi.inf com o acpi.sys real. O DriverEntry do acpi.sys
@@ -29,7 +30,8 @@ use crate::ntos::inc::types::{DeviceObject, NtStruct};
 use crate::ntos::io::lifecycle;
 use crate::ntos::io::pnp::devnode;
 
-/// `--pnp-root=acpi`: a raiz da árvore é o acpi.sys sobre a HAL.
+/// A raiz da árvore é o acpi.sys sobre a HAL, salvo com
+/// `--pnp-root=internal` (o barramento PCI interno do kernel).
 pub fn enabled() -> bool {
     crate::ntos::init::boot_config::acpi_root()
 }

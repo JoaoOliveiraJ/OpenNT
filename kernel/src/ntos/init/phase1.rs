@@ -114,12 +114,20 @@ pub fn init() {
     }
     // Rotinas de IoRegisterDriverReinitialization, como no NT.
     crate::ntos::io::lifecycle::run_reinitialization_routines();
-    // A árvore de dispositivos do PnP, uma vez, com as pilhas pedidas:
-    // `--pnp-root=acpi` (a raiz é o acpi.sys real sobre o dispositivo ACPI
-    // da HAL, com o pci.sys no barramento PCI), `--storage=real` (a pilha de
-    // armazenamento do Windows) e `--display=basic` (o BasicDisplay.sys real
-    // no adaptador VGA, sobre o dxgkrnl.sys real).
+    // A árvore de dispositivos do PnP, uma vez: a raiz é o acpi.sys real
+    // sobre o dispositivo ACPI da HAL, com o pci.sys no barramento PCI (o
+    // padrão; `--pnp-root=internal` volta ao barramento PCI interno), com as
+    // pilhas pedidas: `--storage=real` (a pilha de armazenamento do Windows)
+    // e `--display=basic` (o BasicDisplay.sys real no adaptador VGA, sobre o
+    // dxgkrnl.sys real).
     if crate::drivers::bus::acpi_stack::enabled() || crate::drivers::storage::storage_stack::enabled() || crate::drivers::video::display_stack::enabled() {
+        // `--start-driver` liga o Code Integrity: como no NT, ele já valida
+        // os drivers que a árvore carrega (acpi.sys, pci.sys, i8042prt.sys...).
+        if !crate::ntos::init::boot_config::start_driver().is_empty() {
+            if let Err(error) = crate::ntos::se::code_integrity::initialize() {
+                debug_print!("[boot] Code Integrity antes da arvore de dispositivos: {}", error);
+            }
+        }
         crate::drivers::bus::device_tree::build();
     }
 }
