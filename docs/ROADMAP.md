@@ -19,7 +19,7 @@ O OpenNT avança em fases. Cada fase termina com o kernel compilando, iniciando 
 
 **Próximo.** O csrss terminar a inicialização (falta a porta LPC de servidor em modo usuário, o NtCreatePort da \Windows\SbApiPort) para o smss da sessão executar o wininit.exe, que cria a WinSta0 com as Desktops Winlogon e Default (WINSTA0_OK).
 
-Hoje: **43 de 65** binários da Microsoft rodam (20 parciais); o kernel exporta **2.048 dos 3.070** nomes do `ntoskrnl.exe` do Windows 10 22H2 (66,7%). Detalhes em [O que roda](site/o-que-roda.html), [Componentes](site/componentes.html), [Exports](site/ntoskrnl.html) e [Testes](site/testes.html).
+Hoje: **43 de 65** binários da Microsoft rodam (20 parciais); o kernel exporta **2.049 dos 3.070** nomes do `ntoskrnl.exe` do Windows 10 22H2 (66,7%). Detalhes em [O que roda](site/o-que-roda.html), [Componentes](site/componentes.html), [Exports](site/ntoskrnl.html) e [Testes](site/testes.html).
 
 ## Fase 1 — base (concluída)
 

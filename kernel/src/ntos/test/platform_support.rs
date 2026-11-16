@@ -304,35 +304,49 @@ fn work_item_exports(assert: Assert) {
 }
 
 static STALLED_WAIT: AtomicU64 = AtomicU64::new(u64::MAX);
+/// As threads que rodaram o item de fora e o de dentro.
+static STALLED_THREADS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
-/// O item de dentro: sinaliza o evento do bloco.
+/// O item de dentro: guarda a thread que o roda e sinaliza o evento do
+/// bloco.
 extern "win64" fn stalled_inner(block: u64) {
+    STALLED_THREADS[1].store(crate::ntos::ps::process::get_current_thread(), Ordering::SeqCst);
     let _ = call_export("KeSetEvent", &[block, 0, 0]);
 }
 
-/// O item de fora: enfileira o de dentro e espera (até 5 s) o evento que
-/// ele sinaliza, como o acpi.sys que repassa o START ao pci.sys numa worker
-/// e espera o work item do pci.sys.
+/// O item de fora: enfileira o de dentro e espera o evento que ele
+/// sinaliza, como o acpi.sys que repassa o START ao pci.sys numa worker e
+/// espera o work item do pci.sys. O prazo (60 s) só pega um travamento: com
+/// o host carregado, o relógio do convidado pode saltar segundos entre dois
+/// passos, e o que importa é quem rodou o item, não quanto demorou.
 extern "win64" fn stalled_outer(block: u64) {
+    STALLED_THREADS[0].store(crate::ntos::ps::process::get_current_thread(), Ordering::SeqCst);
     let _ = call_export("ExInitializeWorkItem", &[block + 0x20, stalled_inner as extern "win64" fn(u64) as usize as u64, block]);
     let _ = call_export("ExQueueWorkItem", &[block + 0x20, 1]);
-    guest::write64(block + 0x40, (-50_000_000i64) as u64);
+    guest::write64(block + 0x40, (-600_000_000i64) as u64);
     STALLED_WAIT.store(call_export("KeWaitForSingleObject", &[block, 0, 0, 0, block + 0x40]).unwrap_or(u64::MAX), Ordering::SeqCst);
 }
 
 /// A worker bloqueada numa espera dentro de um item: o item que ela espera
 /// ganha uma worker dinâmica depois de um intervalo (o balance manager) e a
-/// espera termina com sucesso, sem o item rodar aninhado na pilha dela.
+/// espera termina com sucesso, sem o item rodar aninhado na pilha dela: o
+/// item de dentro roda numa thread que não é a do de fora, e nunca antes do
+/// intervalo inteiro (os dois instantes pelo mesmo relógio do convidado).
 fn stalled_worker(assert: Assert) {
     let block = guest::alloc_bytes(0x100);
     let _ = call_export("KeInitializeEvent", &[block, 0, 0]);
     let _ = call_export("ExInitializeWorkItem", &[block + 0x60, stalled_outer as extern "win64" fn(u64) as usize as u64, block]);
     STALLED_WAIT.store(u64::MAX, Ordering::SeqCst);
+    for thread in &STALLED_THREADS {
+        thread.store(0, Ordering::SeqCst);
+    }
     let started = clock::uptime_ms();
     let _ = call_export("ExQueueWorkItem", &[block + 0x60, 1]);
     work_items::run_queue();
     let elapsed = clock::uptime_ms() - started;
-    assert(STALLED_WAIT.load(Ordering::SeqCst) == 0 && (1000..5000).contains(&elapsed), "ex: a worker bloqueada esperando um item da fila ganha uma worker dinamica depois do intervalo do balance manager");
+    let (outer, inner) = (STALLED_THREADS[0].load(Ordering::SeqCst), STALLED_THREADS[1].load(Ordering::SeqCst));
+    debug_print!("[work] worker bloqueada: espera {:#x} em {} ms, item de fora na thread {:#x}, de dentro na {:#x}", STALLED_WAIT.load(Ordering::SeqCst), elapsed, outer, inner);
+    assert(STALLED_WAIT.load(Ordering::SeqCst) == 0 && outer != 0 && inner != 0 && inner != outer && elapsed >= 1000, "ex: a worker bloqueada esperando um item da fila ganha uma worker dinamica depois do intervalo do balance manager");
     guest::free_bytes(block);
 }
 
