@@ -87,6 +87,19 @@ fn boot_object_types(assert: Assert) {
             && info.parse_procedure.get() == if index == 0 { routines[4] } else { 0 }
     });
     assert(win32_routines, "tipos do boot: rotinas ExpWin32* nos tipos Win32 e a ParseProcedure so na WindowStation");
+    // O GenericMapping e o ValidAccessMask que quem usa o tipo reescreve no
+    // TypeInfo (o win32k nos tipos Win32) valem para o Ob.
+    {
+        let pointer = guest::read64(kernel_data::address("ExWindowStationObjectType").unwrap_or(0));
+        let info = &at::<nt::ObjectType>(pointer).type_info;
+        let saved = (info.generic_mapping.generic_all.get(), info.valid_access_mask.get());
+        info.generic_mapping.generic_all.set(0xF_037F);
+        info.valid_access_mask.set(0xF_037F);
+        let seen = object_types::find(pointer).map(|object_type| (object_type.mapping[3], object_type.valid_access));
+        info.generic_mapping.generic_all.set(saved.0);
+        info.valid_access_mask.set(saved.1);
+        assert(seen == Some((0xF_037F, 0xF_037F)), "tipos do boot: o Ob le o GenericMapping e o ValidAccessMask correntes do TypeInfo");
+    }
     let charges = |cell: &str| at::<nt::ObjectType>(guest::read64(kernel_data::address(cell).unwrap_or(0))).type_info.default_non_paged_pool_charge.get();
     assert(charges("ExTimerObjectType") == 0x148 && charges("PsJobType") == 0x640, "tipos do boot: cobranca nao paginavel do Timer e do Job");
 }

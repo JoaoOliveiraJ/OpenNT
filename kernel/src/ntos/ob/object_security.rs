@@ -856,6 +856,11 @@ pub fn check_create_object_access(directory: u64, create_access: u32, mode: u8, 
     let object_type = type_of(directory).unwrap_or_else(object_types::directory_type);
     let policy = open_pointer::describe(directory).map_or_else(|| object_access::capture(None), |described| described_policy(&described));
     let result = object_access::check(&policy, object_access::subject(), create_access, &object_type, mode == 0);
+    if crate::ntos::init::boot_config::TRACE_SYSCALLS && result.is_err() {
+        let descriptor = object_access::descriptor_of(&policy, &object_type);
+        let dacl: alloc::string::String = descriptor.as_ref().ok().and_then(|descriptor| descriptor.dacl.as_ref()).map(|dacl| dacl.iter().map(|byte| alloc::format!("{byte:02x}")).collect()).unwrap_or_default();
+        crate::debug_print!("[ob] ObCheckCreateObjectAccess {:#x} ({}) acesso {:#x} modo {} -> {:?}; control {:?} DACL {}", directory, object_type.name, create_access, mode, result, descriptor.as_ref().map(|descriptor| descriptor.control), dacl);
+    }
     if status_out != 0 {
         out::<u32>(status_out).set(result.err().unwrap_or(STATUS_SUCCESS));
     }

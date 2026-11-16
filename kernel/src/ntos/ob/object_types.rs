@@ -504,18 +504,32 @@ pub fn raise_peaks(name: &str, peak_objects: u32, peak_handles: u32) {
     }
 }
 
+/// O GenericMapping e o ValidAccessMask correntes do TypeInfo do
+/// OBJECT_TYPE: quem cria objetos de um tipo do executive pode ajustá-los
+/// (o win32k reescreve os dos tipos Win32 na inicialização), e o Ob do NT
+/// lê sempre o TypeInfo.
+fn current(mut info: ObjectType) -> ObjectType {
+    if info.pointer != 0 {
+        let type_info = &native(info.pointer).type_info;
+        let generic = &type_info.generic_mapping;
+        info.mapping = [generic.generic_read.get(), generic.generic_write.get(), generic.generic_execute.get(), generic.generic_all.get()];
+        info.valid_access = type_info.valid_access_mask.get();
+    }
+    info
+}
+
 pub fn bound(pointer: u64) -> Option<ObjectType> {
     let types = TYPES.lock();
     let name = types.by_body.get(&pointer)?;
-    types.by_name.get(name).map(|record| record.info.clone())
+    types.by_name.get(name).map(|record| current(record.info.clone()))
 }
 
 pub fn find(pointer: u64) -> Option<ObjectType> {
-    TYPES.lock().by_name.values().find(|record| record.info.pointer == pointer).map(|record| record.info.clone())
+    TYPES.lock().by_name.values().find(|record| record.info.pointer == pointer).map(|record| current(record.info.clone()))
 }
 
 pub fn by_name(name: &str) -> Option<ObjectType> {
-    TYPES.lock().by_name.get(name).map(|record| record.info.clone())
+    TYPES.lock().by_name.get(name).map(|record| current(record.info.clone()))
 }
 
 /// Tipos na ordem de criação.
