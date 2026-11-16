@@ -148,17 +148,29 @@ fn start_lapic_timer() {
     lapic::write(LAPIC_LVT_TIMER, 0x10000); // timer mascarado para medir
     lapic::write(LAPIC_TIMER_DIVIDE, 0x3); // divide por 16
 
-    // mede a frequência do timer do LAPIC com o relógio TSC (50 ms one-shot)
-    lapic::write(LAPIC_TIMER_CURRENT, 0);
-    lapic::write(LAPIC_TIMER_INITIAL, 0xFFFF_FFFF);
-    let measure_end = clock::uptime_ms() + 50;
-    while clock::uptime_ms() < measure_end {
-        cpu::pause();
+    // mede a frequência do timer do LAPIC contra o TSC: três janelas
+    // one-shot de 50 ms, vale a mediana. Num hipervisor carregado a vCPU
+    // pode ficar parada no meio de uma janela e o contador emulado do LAPIC
+    // anda aos saltos (uma janela chegou a medir 18 vezes o valor real, com
+    // o quantum 18 vezes mais longo); a mediana descarta a janela distorcida.
+    let tsc_hertz = clock::tsc_frequency_hz().max(1);
+    let mut samples = [0u64; 3];
+    for sample in samples.iter_mut() {
+        lapic::write(LAPIC_TIMER_INITIAL, 0xFFFF_FFFF);
+        let started = cpu::rdtsc();
+        let window = tsc_hertz / 20;
+        while cpu::rdtsc().wrapping_sub(started) < window {
+            cpu::pause();
+        }
+        let elapsed_ticks = 0xFFFF_FFFFu32 - lapic::read(LAPIC_TIMER_CURRENT);
+        let elapsed_tsc = cpu::rdtsc().wrapping_sub(started).max(1);
+        *sample = (elapsed_ticks as u128 * tsc_hertz as u128 / elapsed_tsc as u128) as u64;
+        lapic::write(LAPIC_TIMER_INITIAL, 0);
     }
-    let elapsed_ticks = 0xFFFF_FFFFu32 - lapic::read(LAPIC_TIMER_CURRENT);
     lapic::write(LAPIC_LVT_TIMER, 0x10000); // para (máscara)
     lapic::write(LAPIC_TIMER_CURRENT, 0);
-    let ticks_per_second = elapsed_ticks as u64 * 20; // 50 ms -> 1 s
+    samples.sort_unstable();
+    let ticks_per_second = samples[1];
     let ticks_per_quantum = (ticks_per_second / 100).max(1000) as u32;
 
     // liga o timer periódico no vetor 0x40 a 100 Hz
