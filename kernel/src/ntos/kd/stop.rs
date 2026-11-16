@@ -546,7 +546,9 @@ pub fn enter_user(frame: u64, fx: u64, signal: u8, kind: Kind, data: u64, user_g
         core::hint::spin_loop();
     }
     capture(number, frame, fx, false);
-    // O GS do anel 3 é a TEB.
+    // Os seletores e o GS do anel 3 (DS, ES e GS 0x2B, FS 0x53; a base de
+    // GS é a TEB).
+    PROCESSORS[number].segments.store(0x2B | 0x2B << 16 | 0x53 << 32 | 0x2B << 48, Ordering::Relaxed);
     PROCESSORS[number].gs_base.store(user_gs_base, Ordering::Relaxed);
     breakpoints::disarm_processor();
     transport::seize(number);

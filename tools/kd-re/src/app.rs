@@ -818,7 +818,7 @@ impl DebuggerApp {
         egui::CentralPanel::no_frame().show(ui, |ui| {
             let mut style = Style::from_egui(ui.style().as_ref());
             style.tab_bar.fill_tab_bar = true;
-            DockArea::new(&mut self.dock).style(style).show_leaf_close_all_buttons(false).show_leaf_collapse_buttons(false).show_inside(ui, &mut Viewer { state: &mut self.state });
+            DockArea::new(&mut self.dock).style(style).show_close_buttons(false).show_leaf_close_all_buttons(false).show_leaf_collapse_buttons(false).show_inside(ui, &mut Viewer { state: &mut self.state });
         });
         dialogs(ui, &mut self.state);
         // Observação: as expressões e as vistas abertas vão ao backend.

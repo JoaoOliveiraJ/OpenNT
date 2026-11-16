@@ -498,8 +498,8 @@ fn register_row(ui: &mut Ui, state: &mut UiState, row: &crate::backend::Register
                 ui.close();
             }
         });
-        // O módulo do valor, quando ele aponta para uma imagem.
-        let note = state.module_at(value).map(|module| format!("{}+{:#x}", module.name, value - module.base)).unwrap_or_default();
+        // O símbolo do valor, quando ele aponta para uma imagem.
+        let note = state.snapshot.register_notes.get(&row.name).cloned().or_else(|| state.module_at(value).map(|module| format!("{}+{:#x}", module.name, value - module.base))).unwrap_or_default();
         ui.label(mono(note).color(colors.dim));
     } else {
         ui.label("");

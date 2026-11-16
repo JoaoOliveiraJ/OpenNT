@@ -178,7 +178,6 @@ pub struct SymbolView {
 }
 
 /// O estado das vistas do opennt-re dentro do backend.
-#[derive(Default)]
 pub struct ReState {
     pub dumps: [String; 5],
     pub selected_instruction: Option<u64>,
@@ -194,6 +193,28 @@ pub struct ReState {
     pub handles: Option<Arc<Result<Vec<Handle>, String>>>,
     pub user_threads: Option<Arc<Result<Vec<UserThread>, String>>>,
     pub symbol_view: Option<Arc<SymbolView>>,
+}
+
+impl Default for ReState {
+    fn default() -> Self {
+        ReState {
+            // O Dump 1 começa na pilha.
+            dumps: ["@rsp".to_string(), String::new(), String::new(), String::new(), String::new()],
+            selected_instruction: None,
+            images: HashMap::new(),
+            elf_image: None,
+            patches: Patches::default(),
+            patch_generation: 0,
+            reference_cache: HashMap::new(),
+            graph: None,
+            references: None,
+            strings: None,
+            memory_map: None,
+            handles: None,
+            user_threads: None,
+            symbol_view: None,
+        }
+    }
 }
 
 /// Lê bytes por um cliente, sem erro (os vazios viram `None`).
@@ -252,6 +273,11 @@ impl Worker {
         let Some(client) = self.client.as_mut() else { return };
         snapshot.process = client.process().cloned();
         snapshot.user_mode = client.stopped_in_user_mode();
+        for row in &snapshot.registers {
+            if let Some(value) = row.value.filter(|&value| client.symbols.module_at(value).is_some()) {
+                snapshot.register_notes.insert(row.name.clone(), client.symbols.describe(value));
+            }
+        }
         // Dump 1-5.
         snapshot.dumps = dumps
             .iter()

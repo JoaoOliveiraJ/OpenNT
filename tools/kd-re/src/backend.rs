@@ -371,6 +371,8 @@ pub struct Snapshot {
     pub patches: Vec<Patch>,
     /// LastErrorValue e LastStatusValue da TEB numa parada de usuário.
     pub last_error: Option<(u64, u64)>,
+    /// O símbolo do valor de cada registrador que aponta para um módulo.
+    pub register_notes: HashMap<String, String>,
 }
 
 /// Uma entrada do painel de comandos.
