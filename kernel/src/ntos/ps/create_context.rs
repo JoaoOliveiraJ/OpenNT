@@ -30,8 +30,10 @@
 //!   (`process_parameters::capture`);
 //! - os OBJECT_ATTRIBUTES de processo e thread (sem nome; OBJ_INHERIT vai
 //!   para o handle) e as flags: PROCESS_CREATE_FLAGS_* conhecidas são
-//!   aceitas, as que pedem um processo diferente (suspenso inteiro, mínimo,
-//!   sessão nova, espaço de outro) dão STATUS_NOT_SUPPORTED;
+//!   aceitas, as que pedem um processo diferente (mínimo, clone, auxiliar,
+//!   store, espaço de outro) dão STATUS_NOT_SUPPORTED; o bit 0x200, que o
+//!   kernelbase liga em toda criação sem CREATE_SUSPENDED, só escolhe o
+//!   OwnerProcessId (o PspAllocateProcess);
 //!   PROTECTED_PROCESS cria o processo com o PS_PROTECTION do atributo
 //!   ProtectionLevel (sem ele, STATUS_NOT_SUPPORTED: o processo protegido
 //!   legado não existe aqui): quem cria (o pai declarado ou quem chama)
@@ -100,9 +102,15 @@ const OBJ_INHERIT: u32 = 2;
 /// AUXILIARY_PROCESS, CREATE_STORE e USE_PROTECTED_ENVIRONMENT.
 const PROCESS_FLAGS_KNOWN: u32 = 0x0006_FFFF;
 /// As que pedem um processo diferente, sem suporte aqui:
-/// OVERRIDE_ADDRESS_SPACE, SUSPENDED, MINIMAL_PROCESS, CLONE_MINIMAL,
+/// OVERRIDE_ADDRESS_SPACE, MINIMAL_PROCESS, CLONE_MINIMAL,
 /// CLONE_MINIMAL_REDUCED_COMMIT, AUXILIARY_PROCESS e CREATE_STORE.
-const PROCESS_FLAGS_UNSUPPORTED: u32 = 0x0002_EA08;
+const PROCESS_FLAGS_UNSUPPORTED: u32 = 0x0002_E808;
+/// O bit 0x200 (o PROCESS_CREATE_FLAGS_SUSPENDED dos cabeçalhos): o
+/// CreateProcessInternalW do kernelbase o liga em toda criação sem
+/// CREATE_SUSPENDED, e o PspAllocateProcess do 19041 só o lê para o
+/// OwnerProcessId do processo novo (o UniqueProcessId de quem cria, com o
+/// bit 2 quando ele falta); a thread principal não muda.
+const PROCESS_OWNER_PLAIN: u32 = 0x200;
 /// PROCESS_CREATE_FLAGS_CREATE_SESSION: o processo novo abre uma sessão
 /// (o bit que o MiMapProcessExecutable do NT testa para o MiSessionCreate).
 const PROCESS_CREATE_SESSION: u32 = 0x80;
@@ -568,6 +576,13 @@ fn capture_and_create(request: &UserCreateRequest) -> Result<u32, u32> {
     if let Some(class) = attributes.priority_class {
         // SAFETY: o EPROCESS recém-criado, retido pelo processo criado.
         unsafe { Eprocess::at(created.process_pointer) }.priority_class.set(class);
+    }
+    // O OwnerProcessId do PspAllocateProcess: o processo que cria.
+    let creator = crate::ntos::ps::process::get_current_process();
+    if creator != 0 {
+        // SAFETY: o EPROCESS de quem chama e o recém-criado, vivos.
+        let owner = unsafe { Eprocess::at(creator) }.unique_process_id.get() | if request.process_flags & PROCESS_OWNER_PLAIN != 0 { 0 } else { 2 };
+        unsafe { Eprocess::at(created.process_pointer) }.owner_process_id.set(owner);
     }
     let summary = Created {
         process_pointer: created.process_pointer,

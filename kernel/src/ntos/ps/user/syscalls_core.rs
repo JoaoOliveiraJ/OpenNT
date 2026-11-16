@@ -790,6 +790,34 @@ fn nt_query_information_process(handle: u64, class: u64, buffer: u64, length: u6
             set_returned(4)?;
             Ok(STATUS_SUCCESS)
         }
+        // ProcessConsoleHostProcess (ULONG_PTR): o EPROCESS.OwnerProcessId
+        // que o PspAllocateProcess grava (o processo que criou, com o bit 2
+        // sem o 0x200 das flags de criação); ProcessSequenceNumber
+        // (ULONGLONG): o EPROCESS.SequenceNumber. As duas pelo handle com
+        // PROCESS_QUERY_LIMITED_INFORMATION, como o NtQueryInformationProcess
+        // 19041; outro comprimento é STATUS_INFO_LENGTH_MISMATCH. O csrss as
+        // lê no BaseSrvCreateProcess de cada processo novo.
+        49 | 92 => {
+            if length != 8 {
+                return Ok(STATUS_INFO_LENGTH_MISMATCH);
+            }
+            if buffer & 7 != 0 && class == 92 {
+                return Ok(0x8000_0002);
+            }
+            if !probe_user_write(buffer, 8) {
+                return Ok(0xC000_0005);
+            }
+            let target = match queried_process(handle) {
+                Ok(target) => target,
+                Err(status) => return Ok(status),
+            };
+            // SAFETY: o EPROCESS do handle, retido pela tabela de handles.
+            let process = unsafe { Eprocess::at(target) };
+            let value = if class == 49 { process.owner_process_id.get() } else { process.sequence_number.get() };
+            guest::try_write::<u64>(buffer, value)?;
+            set_returned(8)?;
+            Ok(STATUS_SUCCESS)
+        }
         _ => {
             crate::debug_print!("[usermode] NtQueryInformationProcess classe {}", class);
             Ok(STATUS_INVALID_INFO_CLASS)

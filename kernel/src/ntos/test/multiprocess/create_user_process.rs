@@ -28,7 +28,7 @@
 //!   com PsCreateFailOnFileOpen, sem handles. O pai sai com o código dele.
 //! - Direto no handler, do System: um número de atributo desconhecido, a
 //!   ausência do ImageName e um Size errado no PS_CREATE_INFO dão
-//!   STATUS_INVALID_PARAMETER; DebugObject e PROCESS_CREATE_FLAGS_SUSPENDED,
+//!   STATUS_INVALID_PARAMETER; DebugObject e PROCESS_CREATE_FLAGS_MINIMAL_PROCESS,
 //!   STATUS_NOT_SUPPORTED; nenhum cria processo. Com INHERIT_HANDLES e sem
 //!   ParentProcess, a criação direta herda os handles de quem chama.
 //! - `process_parameters::capture` de um bloco normalizado (Buffers
@@ -885,10 +885,10 @@ fn rejections(assert: Assert) {
     let debug = call_create(&scratch, 0, &valid, &attribute_list(&[image_name, (ATTRIBUTE_DEBUG_OBJECT, 8, 0, 0)]));
     let nameless = call_create(&scratch, 0, &valid, &attribute_list(&[(ATTRIBUTE_ERROR_MODE, 4, 0, 0)]));
     let short_info = call_create(&scratch, 0, &create_info(0x50), &attribute_list(&[image_name]));
-    let suspended_process = call_create(&scratch, 0x200, &valid, &attribute_list(&[image_name]));
-    crate::debug_print!("[ntcreateuserprocess] recusas: {:x?} {:x?} {:x?} {:x?} {:x?}", unknown, debug, nameless, short_info, suspended_process);
+    let minimal_process = call_create(&scratch, 0x800, &valid, &attribute_list(&[image_name]));
+    crate::debug_print!("[ntcreateuserprocess] recusas: {:x?} {:x?} {:x?} {:x?} {:x?}", unknown, debug, nameless, short_info, minimal_process);
     assert(unknown == (STATUS_INVALID_PARAMETER, 0) && nameless == (STATUS_INVALID_PARAMETER, 0) && short_info == (STATUS_INVALID_PARAMETER, 0), "ntcreateuserprocess: atributo desconhecido, ImageName ausente e PS_CREATE_INFO de tamanho errado dao STATUS_INVALID_PARAMETER");
-    assert(debug == (STATUS_NOT_SUPPORTED, 0) && suspended_process == (STATUS_NOT_SUPPORTED, 0), "ntcreateuserprocess: DebugObject e PROCESS_CREATE_FLAGS_SUSPENDED dao STATUS_NOT_SUPPORTED");
+    assert(debug == (STATUS_NOT_SUPPORTED, 0) && minimal_process == (STATUS_NOT_SUPPORTED, 0), "ntcreateuserprocess: DebugObject e PROCESS_CREATE_FLAGS_MINIMAL_PROCESS dao STATUS_NOT_SUPPORTED");
     assert(process::list_active_processes().len() == before, "ntcreateuserprocess: nenhuma recusa cria processo");
 }
 
