@@ -1,11 +1,16 @@
 //! Portas de conclusão de E/S.
 //!
-//! Cada porta tem sua fila de pacotes, as threads associadas e o limite de
-//! concorrência. O corpo privado de 0x40 bytes espelha os contadores (refs
-//! +0, handles +8, fechada +0x10, concorrência +0x14, pacotes +0x18, ativas
-//! +0x1c, esperas +0x20); pacotes e esperas ficam nas coleções do kernel.
-//! As threads são identificadas pelo ETHREAD; a elegibilidade (morta ou
-//! suspensa) vem do gancho instalado por `ps/user/threads`.
+//! O corpo do IoCompletion é uma KQUEUE (0x40), como no 19041: o
+//! DISPATCHER_HEADER (Type QueueObject, SignalState = pacotes na fila), o
+//! CurrentCount (consumidores ativos) e o MaximumCount (a concorrência).
+//! Uma thread de kernel espera a porta direto no KeWaitForMultipleObjects (o
+//! win32k espera assim a porta da fila de mensagens de cada thread): a fila
+//! com pacotes satisfaz a espera sem consumir, e a fila que ganha pacotes
+//! testa as esperas registradas no cabeçalho. Os pacotes, as threads
+//! associadas e os consumidores da retirada ficam nas coleções do kernel; a
+//! EntryListHead e a ThreadListHead seguem vazias. As threads são
+//! identificadas pelo ETHREAD; a elegibilidade (morta ou suspensa) vem do
+//! gancho instalado por `ps/user/threads`.
 
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -14,39 +19,16 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use crate::ntos::ke::{queue as ke_queue, wait as ke_wait};
 use crate::ntos::ob::objects::dispatcher::{self as dispatcher_objects, DispatcherHooks};
 use crate::ntos::ob::object_manager::{self, NodeId};
 use crate::ntos::ps::process;
 use crate::rtl::{KernelError, SpinLock};
-use crate::ntos::inc::field::{Field, NtStruct, Reserved};
-use crate::ntos::inc::types::IoMiniCompletionPacketUser;
+use crate::ntos::inc::field::NtStruct;
+use crate::ntos::inc::types::{IoMiniCompletionPacketUser, Kqueue};
 use crate::ntos::mm::guest_memory as guest;
 
-/// Corpo privado da porta de conclusão (layout do OpenNT, do tamanho de
-/// uma KQUEUE): contagens espelhadas pelo despachante e o estado da porta.
-#[repr(C)]
-struct CompletionBody {
-    references: Field<u64>,
-    handles: Field<u32>,
-    _pad_c: Reserved<4>,
-    closed: Field<u32>,
-    concurrency: Field<u32>,
-    packet_count: Field<u32>,
-    active_count: Field<u32>,
-    waiter_count: Field<u32>,
-    _reserved: Reserved<0x1C>,
-}
-
-// SAFETY: #[repr(C)] só de células.
-unsafe impl NtStruct for CompletionBody {}
-
-const _: () = {
-    assert!(core::mem::size_of::<CompletionBody>() == 0x40);
-    assert!(core::mem::offset_of!(CompletionBody, closed) == 0x10);
-    assert!(core::mem::offset_of!(CompletionBody, waiter_count) == 0x20);
-};
-
-pub const SIZE: u64 = CompletionBody::SIZE;
+pub const SIZE: u64 = Kqueue::SIZE;
 
 /// Pacote de conclusão: valores próprios ou lidos do pacote nativo.
 #[derive(Default)]
@@ -96,38 +78,49 @@ pub struct Port {
     pub node: SpinLock<Option<NodeId>>,
     pub exclusive_process: AtomicU64,
     notifying: AtomicBool,
+    /// Fechada pelo último handle ou pelo fim do objeto.
+    closed: AtomicBool,
     state: SpinLock<PortState>,
     /// Observadores de cada enfileiramento (pacotes de espera).
     pub listeners: SpinLock<Vec<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl Port {
-    fn body(&self) -> &'static CompletionBody {
+    fn queue(&self) -> &'static Kqueue {
         // SAFETY: corpo alocado por `create`, liberado só no `dispose`.
-        unsafe { CompletionBody::at(self.pointer) }
+        unsafe { Kqueue::at(self.pointer) }
     }
 
     pub fn closed(&self) -> bool {
-        self.body().closed.get() != 0
+        self.closed.load(Ordering::Acquire)
     }
 
     /// Marca a porta fechada; devolve se ela já estava fechada.
     fn mark_closed(&self) -> bool {
-        self.body().closed.atomic().swap(1, Ordering::AcqRel) != 0
+        self.closed.swap(true, Ordering::AcqRel)
     }
 
+    /// A concorrência: o MaximumCount da KQUEUE.
     pub fn concurrency(&self) -> u32 {
-        self.body().concurrency.get()
+        self.queue().maximum_count.get()
     }
 
-    /// Altera as coleções e publica os contadores no corpo nativo.
+    /// Altera as coleções e publica na KQUEUE os pacotes (SignalState) e os
+    /// consumidores ativos (CurrentCount). A fila que ganhou pacotes testa
+    /// as esperas do cabeçalho (o KiWaitTest), fora do lock da porta.
     pub fn with<R>(&self, body: impl FnOnce(&mut PortState) -> R) -> R {
-        let mut state = self.state.lock();
-        let result = body(&mut state);
-        let counts = self.body();
-        counts.packet_count.set(state.packets.len() as u32);
-        counts.active_count.set(state.active.len() as u32);
-        counts.waiter_count.set(state.waiters.len() as u32);
+        let (result, grew) = {
+            let mut state = self.state.lock();
+            let result = body(&mut state);
+            let queue = self.queue();
+            let depth = state.packets.len() as i32;
+            let previous = queue.header.signal_state.atomic().swap(depth, Ordering::SeqCst);
+            queue.current_count.set(state.active.len() as u32);
+            (result, depth > previous)
+        };
+        if grew {
+            ke_wait::signal(self.pointer);
+        }
         result
     }
 }
@@ -280,9 +273,9 @@ pub fn create(name: &str, concurrency: u32, attributes: u64, from_user_mode: boo
     if pointer == 0 {
         return Err(KernelError::with_status("completion body allocation failed", 0xC000_009A));
     }
-    // SAFETY: alocação nova (zerada) do tamanho do corpo.
-    unsafe { CompletionBody::at(pointer) }.concurrency.set(concurrency);
-    let port = Arc::new(Port { pointer, name: SpinLock::new(String::from(name)), node: SpinLock::new(None), exclusive_process: AtomicU64::new(0), notifying: AtomicBool::new(false), state: SpinLock::new(PortState { packets: VecDeque::new(), active: BTreeSet::new(), waiters: Vec::new(), associated: BTreeSet::new() }), listeners: SpinLock::new(Vec::new()) });
+    // SAFETY: alocação nova do tamanho da KQUEUE.
+    ke_queue::initialize(unsafe { Kqueue::at(pointer) }, concurrency);
+    let port = Arc::new(Port { pointer, name: SpinLock::new(String::from(name)), node: SpinLock::new(None), exclusive_process: AtomicU64::new(0), notifying: AtomicBool::new(false), closed: AtomicBool::new(false), state: SpinLock::new(PortState { packets: VecDeque::new(), active: BTreeSet::new(), waiters: Vec::new(), associated: BTreeSet::new() }), listeners: SpinLock::new(Vec::new()) });
     if let Err(error) = dispatcher_objects::create(pointer, "completion", dispose, None, attributes, from_user_mode, DispatcherHooks { before_handle_open: Some(before_handle_open), on_last_handle_close: Some(on_last_handle_close) }) {
         guest::free_bytes(pointer);
         return Err(error);

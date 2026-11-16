@@ -35,8 +35,10 @@
 //! alertável termina com STATUS_ALERTED (ou STATUS_USER_APC em UserMode) e a
 //! thread volta a ocupar a vaga. Limites: uma thread associada que espera
 //! outro objeto não libera a vaga (o KiActivateWaiterQueue do NT depende de
-//! ganchos do escalonador); KeWaitForSingleObject direto numa KQUEUE não está
-//! no `dispatcher::acquire_status`.
+//! ganchos do escalonador). A KQUEUE também é um objeto de espera comum: com
+//! SignalState > 0 ela satisfaz um KeWaitForSingleObject/Multiple sem
+//! consumir (`dispatcher::acquire_status`), e a inserção que fica na lista
+//! testa essas esperas.
 //!
 //! O estado das filas fica sob o lock do despachante (`wait::lock`), o
 //! mesmo das listas de espera: a entrega direta e a espera não se cruzam.
@@ -166,6 +168,9 @@ pub fn insert_entry(queue: &Kqueue, entry: &ListEntry, at_head: bool) -> i32 {
     }
     queue.header.signal_state.atomic().fetch_add(1, Ordering::SeqCst);
     insert(&queue.entry_list_head, entry, at_head);
+    // Quem espera a fila como objeto (KeWaitForSingleObject/Multiple) sai da
+    // espera com a fila sinalizada; os blocos WaitDequeue ficam.
+    lock.wait_test(queue.address());
     previous
 }
 

@@ -29,6 +29,7 @@ mod object_type {
     pub const EVENT_SYNCHRONIZATION: u8 = 1;
     pub const MUTANT: u8 = 2;
     pub const PROCESS: u8 = 3;
+    pub const QUEUE: u8 = 4;
     pub const SEMAPHORE: u8 = 5;
     pub const THREAD: u8 = 6;
     pub const TIMER_NOTIFICATION: u8 = 8;
@@ -256,6 +257,9 @@ pub fn acquire_status_for(object: u64, consume: bool, owner: u64) -> Option<u32>
         // Eventos de notificação, timers de notificação e threads e processos
         // terminados.
         object_type::EVENT_NOTIFICATION | object_type::TIMER_NOTIFICATION | object_type::TIMER2_NOTIFICATION | object_type::THREAD | object_type::PROCESS => (state.get() != 0).then_some(0),
+        // Uma fila (KQUEUE, o corpo do IoCompletion) com entradas satisfaz a
+        // espera sem consumir: as entradas saem só pela retirada.
+        object_type::QUEUE => (state.get() > 0).then_some(0),
         // Eventos e timers de sincronização consomem o sinal.
         object_type::EVENT_SYNCHRONIZATION | object_type::TIMER_SYNCHRONIZATION | object_type::TIMER2_SYNCHRONIZATION => {
             let signalled = if consume { state.atomic().swap(0, Ordering::SeqCst) } else { state.get() };

@@ -520,8 +520,15 @@ pub fn run_user(assert: Assert) {
         let associated = status(call_export("ZwAssociateWaitCompletionPacket", &[packet, port, signaled, 0x11, 0x22, 0x33, 0x44, kernel + 0x10])) == 0 && guest::read8(kernel + 0x10) == 1;
         let posted = status(call_export("ZwSetIoCompletionEx", &[port, 0, 0x55, 0x66, 0x77, 0x88])) == 0 && status(call_export("ZwSetIoCompletionEx", &[port, 0x1234, 0x55, 0x66, 0x77, 0x88])) == 0xC000_0008;
         let depth = |port: u64| crate::ntos::ps::user::io_completion::resolve(port, 0).map_or(usize::MAX, |(_, port)| port.with(|state| state.packets.len()));
-        let native_posted = status(call_export("ZwSetIoCompletionEx", &[native_port, 0, 0x99, 0, 0, 0])) == 0 && crate::ntos::ob::open_pointer::resolve(native_port, false).and_then(|opened| opened.ok()).and_then(|opened| crate::ntos::ob::objects::completion::port_of(opened.item.pointer)).is_some_and(|port| port.with(|state| state.packets.len()) == 1);
-        let queued = depth(port) == 2 && native_posted;
+        // O corpo da IOCP é uma KQUEUE: o KeWaitForSingleObject direto nele
+        // (o xxxRealSleepThread do win32k) vence o prazo com a fila vazia e
+        // volta com pacotes, sem consumi-los.
+        let native_body = crate::ntos::ob::open_pointer::resolve(native_port, false).and_then(|opened| opened.ok()).map_or(0, |opened| opened.item.pointer);
+        let empty_wait = native_body != 0 && status(call_export("KeWaitForSingleObject", &[native_body, 0, 0, 0, zero])) == 0x102;
+        let native_posted = status(call_export("ZwSetIoCompletionEx", &[native_port, 0, 0x99, 0, 0, 0])) == 0 && crate::ntos::ob::objects::completion::port_of(native_body).is_some_and(|port| port.with(|state| state.packets.len()) == 1);
+        let queue_wait = empty_wait && (0..2).all(|_| status(call_export("KeWaitForSingleObject", &[native_body, 0, 0, 0, zero])) == 0);
+        crate::debug_print!("[suporte-zw] espera na KQUEUE da IOCP: vazia={} com pacote={}", empty_wait, queue_wait);
+        let queued = depth(port) == 2 && native_posted && queue_wait;
         let _ = call_export("ZwClose", &[native_port]);
         let cancelled = status(call_export("ZwCancelWaitCompletionPacket", &[packet, 1])) == 0 && depth(port) == 1;
         let packets = port_created && packet_created && associated && posted && queued && cancelled;

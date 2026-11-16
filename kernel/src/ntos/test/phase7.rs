@@ -1405,7 +1405,7 @@ fn user_io_completion(assert: Assert) {
     let front = port.as_ref().and_then(|port| port.with(|state| state.packets.front().map(|packet| packet.values())));
     assert(posted == 0 && front == Some((0x1122_3344_5566_7788, 0xAABB_CCDD_0000_0001, 0x103, 0x99)), "usercompletion: pacote com chave, contexto, status e informacao");
     guest::write64(rsp + 0x28, 0);
-    assert(call("NtQueryIoCompletion", handle, 0, info, 4) == 0 && unsafe { nt::IoCompletionBasicInformation::at(info) }.depth.get() == 1 && port.as_ref().is_some_and(|port| guest::read32(port.pointer + 0x18) == 1), "usercompletion: profundidade espelhada no corpo");
+    assert(call("NtQueryIoCompletion", handle, 0, info, 4) == 0 && unsafe { nt::IoCompletionBasicInformation::at(info) }.depth.get() == 1 && port.as_ref().is_some_and(|port| { let queue = unsafe { nt::Kqueue::at(port.pointer) }; queue.header.type_.get() == 4 && queue.header.signal_state.get() == 1 }), "usercompletion: o corpo e uma KQUEUE com a profundidade no SignalState");
     assert(call("NtSetIoCompletion", 0x7FF0, 0, 0, 0) == 0xC000_0008 && call("NtQueryIoCompletion", out, 0, info, 4) == 0xC000_0008, "usercompletion: handle invalido");
     // Pacote de memória do kernel e associação de thread.
     if let Some(port) = port.as_ref() {
