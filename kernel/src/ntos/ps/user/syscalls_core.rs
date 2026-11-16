@@ -674,6 +674,44 @@ fn nt_query_information_process(handle: u64, class: u64, buffer: u64, length: u6
             set_returned(4)?;
             Ok(STATUS_SUCCESS)
         }
+        // ProcessDeviceMap (`ob/device_map.rs`): o ProbeForWrite com
+        // alinhamento 4; o PROCESS_DEVICEMAP_INFORMATION de 0x24 bytes ou o
+        // _EX de 0x30 com Flags (só PROCESS_LUID_DOSDEVICES_ONLY), outro
+        // comprimento dá STATUS_INFO_LENGTH_MISMATCH; o handle com
+        // PROCESS_QUERY_INFORMATION; o DriveMap e o DriveType[32] no buffer e
+        // o comprimento no ReturnLength.
+        23 => {
+            if length != 0 && buffer & 3 != 0 {
+                return Ok(0x8000_0002);
+            }
+            if (length != 0 && !probe_user_write(buffer, length)) || (returned != 0 && !probe_user_write(returned, 4)) {
+                return Ok(0xC000_0005);
+            }
+            let flags = match length {
+                0x24 => 0,
+                0x30 => {
+                    let flags = guest::try_read::<u32>(buffer + 0x28)?;
+                    if flags & !1 != 0 {
+                        return Ok(0xC000_000D);
+                    }
+                    flags
+                }
+                _ => return Ok(STATUS_INFO_LENGTH_MISMATCH),
+            };
+            if handle as u32 != u32::MAX {
+                if let Err(status) = super::handles::process_pointer(handle, 0x400) {
+                    return Ok(status);
+                }
+            }
+            let information = match crate::ntos::ob::device_map::query(flags) {
+                Ok(information) => information,
+                Err(status) => return Ok(status),
+            };
+            guest::try_write::<u32>(buffer, information.drive_map)?;
+            guest::try_write_bytes(buffer + 4, &information.drive_type)?;
+            set_returned(length as u32)?;
+            Ok(STATUS_SUCCESS)
+        }
         // ProcessLUIDDeviceMapsEnabled (ULONG): o NtQueryInformationProcess
         // 19041 sonda o buffer (alinhamento 4) e responde a constante 1 sem
         // consultar o handle; comprimento diferente de 4 é

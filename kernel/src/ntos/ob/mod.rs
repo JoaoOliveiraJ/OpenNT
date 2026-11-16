@@ -28,3 +28,4 @@ pub mod name_info;
 pub mod handle_attributes;
 pub mod exports;
 pub mod audit;
+pub mod device_map;

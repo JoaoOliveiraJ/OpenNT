@@ -2028,6 +2028,18 @@ fn user_syscalls_core(assert: Assert) {
     let luid = call("NtQueryInformationProcess", u64::MAX, 28, buffer, 4) == 0 && guest::read32(buffer) == 1 && guest::read32(info) == 4 && call("NtQueryInformationProcess", u64::MAX, 28, buffer, 8) == 0xC000_0004 && call("NtQueryInformationProcess", u64::MAX, 28, buffer + 2, 4) == 0x8000_0002;
     guest::write64(rsp + 0x28, 0);
     assert(luid, "usercore: ProcessLUIDDeviceMapsEnabled responde 1 e confere comprimento e alinhamento");
+    // ProcessDeviceMap: o C: do \GLOBAL?? no DriveMap com o tipo pelo
+    // DEVICE_OBJECT do destino; o _EX de 0x30 com Flags e as recusas.
+    let expected = crate::ntos::ob::device_map::query(0).unwrap_or_default();
+    guest::write_bytes(buffer, &[0xAA; 0x30]);
+    guest::write64(rsp + 0x28, info);
+    let mapped = call("NtQueryInformationProcess", u64::MAX, 23, buffer, 0x24) == 0 && guest::read32(info) == 0x24 && guest::read32(buffer) == expected.drive_map && expected.drive_map & 4 != 0 && guest::read_bytes(buffer + 4, 32) == expected.drive_type.to_vec() && guest::read8(buffer + 6) != crate::ntos::ob::device_map::DRIVE_UNKNOWN && guest::read8(buffer + 0x24) == 0xAA;
+    guest::write32(buffer + 0x28, 1);
+    let extended = call("NtQueryInformationProcess", u64::MAX, 23, buffer, 0x30) == 0 && guest::read32(info) == 0x30 && guest::read32(buffer) == expected.drive_map;
+    guest::write32(buffer + 0x28, 2);
+    let refused = call("NtQueryInformationProcess", u64::MAX, 23, buffer, 0x30) == 0xC000_000D && call("NtQueryInformationProcess", u64::MAX, 23, buffer, 0x28) == 0xC000_0004 && call("NtQueryInformationProcess", u64::MAX, 23, buffer + 2, 0x24) == 0x8000_0002;
+    guest::write64(rsp + 0x28, 0);
+    assert(mapped && extended && refused, "usercore: ProcessDeviceMap da o C: no DriveMap com o tipo da unidade, aceita o _EX com Flags e confere Flags, comprimento e alinhamento");
     guest::write64(buffer, u64::MAX);
     assert(call("NtQuerySystemInformation", 192, buffer, 8, info) == 0 && guest::read64(buffer) == 0 && call("NtQuerySystemInformation", 80, buffer, 22 * 8, 0) == 0 && unsafe { nt::extra_test_p7::SystemMemoryListInformation::at(buffer) }.free_page_count.get() == crate::ntos::mm::pfn::free_count() && call("NtQuerySystemInformation", 999, buffer, 8, 0) == 0xC000_0003, "usercore: recurso ausente zerado, lista de memoria e classe invalida");
     guest::write32(rsp + 0x28, 80);
