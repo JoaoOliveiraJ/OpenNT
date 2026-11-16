@@ -1959,11 +1959,22 @@ fn ke_process_attachment(assert: Assert) {
     let original = kthread.apc_state.process.get();
     let stack_count = kprocess.stack_count.value.get();
     let state = guest::alloc_bytes(0x30);
+    // O Priority (+0xC3) e o UserIdealProcessor (+0xC4) dividem os 0x30 bytes
+    // do ApcState embutido; o KiAttachProcess e o KiMoveApcState não os tocam.
+    // A thread corrente é o contexto de boot, fora das filas prontas.
+    let saved = (kthread.priority.get(), kthread.user_ideal_processor.get());
+    kthread.priority.set(13);
+    kthread.user_ideal_processor.set(0x5A);
     let attached = process_attachment::attach(target, state);
     let during = (kthread.apc_state.process.get(), kthread.apc_state_index.get(), kprocess.stack_count.value.get(), kprocess.active_processors.bitmap[0].get() != 0);
+    let kept = (kthread.priority.get(), kthread.user_ideal_processor.get());
     assert(attached.is_ok() && during.0 == target && during.1 == 1 && during.2 == stack_count + 8 && during.3, "attach: KeStackAttachProcess troca o ApcState e publica a CPU no destino");
     let detached = process_attachment::detach(state);
     assert(detached.is_ok() && kthread.apc_state.process.get() == original && kthread.apc_state_index.get() == 0 && kprocess.stack_count.value.get() == stack_count, "attach: KeUnstackDetachProcess restaura o processo e a contagem de pilhas");
+    let restored = (kthread.priority.get(), kthread.user_ideal_processor.get());
+    kthread.priority.set(saved.0);
+    kthread.user_ideal_processor.set(saved.1);
+    assert(kept == (13, 0x5A) && restored == (13, 0x5A), "attach: KeStackAttachProcess e KeUnstackDetachProcess preservam o Priority e o UserIdealProcessor da thread");
     // Anexar ao processo corrente só grava o marcador.
     assert(process_attachment::attach(original, state).is_ok() && at::<nt::KapcState>(state).process.get() == 1 && process_attachment::detach(state).is_ok(), "attach: processo corrente usa o marcador 1");
     assert(process_attachment::detach(guest::alloc_bytes(0x30)).is_err(), "attach: desanexacao sem anexacao recusada");

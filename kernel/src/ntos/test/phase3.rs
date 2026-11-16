@@ -1215,6 +1215,20 @@ fn process_accessors(assert: Assert) {
     let thread = process::create_kernel_thread(target, 0x7C54, false, 0, None).unwrap_or(0);
     let inside = process_context::with_process(target, process::get_current_process);
     assert(matches!(inside, Ok(current) if current == target) && process::get_current_process() == system, "ps: anexacao com escopo ao processo");
+    // O KAPC_STATE tem 0x2B bytes: o Priority (+0xC3) e o UserIdealProcessor
+    // (+0xC4) da KTHREAD ocupam o resto dos 0x30 bytes do ApcState embutido,
+    // e o attach não os toca, como o KiAttachProcess.
+    // SAFETY: a KTHREAD da thread corrente (o contexto de boot, fora das
+    // filas prontas: a escrita direta não muda a fila de ninguém).
+    let me = unsafe { Kthread::at(process::get_current_thread()) };
+    let saved = (me.priority.get(), me.user_ideal_processor.get());
+    me.priority.set(13);
+    me.user_ideal_processor.set(0x5A);
+    let during = process_context::with_process(target, || (me.priority.get(), me.user_ideal_processor.get()));
+    let after = (me.priority.get(), me.user_ideal_processor.get());
+    me.priority.set(saved.0);
+    me.user_ideal_processor.set(saved.1);
+    assert(matches!(during, Ok((13, 0x5A))) && after == (13, 0x5A), "ps: a anexacao com escopo preserva o Priority e o UserIdealProcessor da thread");
     let references = process::reference_count(target).unwrap_or(0);
     let charged = pool_quota::charge(target, false, 0x100);
     assert(matches!(&charged, Ok(Ok(Some(_)))) && process::reference_count(target) == Some(references + 1), "quota: cobranca retem o EPROCESS");

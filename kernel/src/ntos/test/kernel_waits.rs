@@ -22,7 +22,14 @@
 //!   pronto continua em execução (não entra na fila), e a espera dele deixa a
 //!   CPU sem girar o escalonador na pilha dele; ela vence pelo prazo com
 //!   STATUS_TIMEOUT sem a thread gastar CPU, e o processo sai com o próprio
-//!   código.
+//!   código;
+//! - duas consumidoras numa mesma fila, com as entregas vindas de fora: duas
+//!   threads de sistema repetem o ZwRemoveIoCompletionEx numa porta de
+//!   conclusão (e, na outra rodada, o KeRemoveQueueEx numa KQUEUE), e uma
+//!   terceira publica dois pacotes por rodada e espera as duas confirmações.
+//!   Cada pacote chega a uma consumidora já parada (Waiting, WrQueue, fora da
+//!   CPU): ela sai da espera Ready, nunca Running, e nenhuma se perde nas 64
+//!   rodadas.
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -449,9 +456,170 @@ fn nested_tick(assert: Assert) {
     );
 }
 
+// ---- duas consumidoras numa fila, entregas de fora --------------------------
+
+/// O bloco das consumidoras: [0] handle da porta de conclusão, [0x20] o
+/// KSEMAPHORE das confirmações, [0x40] rodadas, [0x80] a KQUEUE,
+/// [SLOTS + i * SLOT] a área da consumidora i, [ENTRIES + 0x10 * n] as
+/// entradas da KQUEUE (LIST_ENTRY), n de 1 a 2 * ROUNDS + 1 os dados e as
+/// duas seguintes as de fim. Cada área: [0] o FILE_IO_COMPLETION_INFORMATION
+/// (0x20), [0x20] o ULONG retirado ou a entrada retirada, [0x28] pacotes
+/// recebidos, [0x30] o bloco, [0x38] o primeiro status inválido, [0x40] a
+/// soma das chaves.
+const SLOTS: u64 = 0x100;
+const SLOT: u64 = 0x60;
+const ENTRIES: u64 = 0x200;
+/// A chave do pacote de fim (a consumidora sai).
+const STOP_KEY: u64 = 0xFFFF_FFFF;
+/// Pacotes de dados: um da partida (chave 1) e dois por rodada.
+const PACKETS: u64 = 2 * ROUNDS + 1;
+
+fn slot(block: u64, index: u64) -> u64 {
+    block + SLOTS + index * SLOT
+}
+
+fn queue_entry(block: u64, number: u64) -> u64 {
+    block + ENTRIES + 0x10 * number
+}
+
+/// Conta o pacote recebido e confirma pelo semáforo.
+fn consumed(slot: u64, key: u64) {
+    let block = guest::read64(slot + 0x30);
+    guest::write64(slot + 0x28, guest::read64(slot + 0x28) + 1);
+    guest::write64(slot + 0x40, guest::read64(slot + 0x40) + key);
+    call_export("KeReleaseSemaphore", &[block + 0x20, 0, 1, 0]);
+}
+
+extern "win64" fn completion_consumer(slot: u64) {
+    let port = guest::read64(guest::read64(slot + 0x30));
+    loop {
+        let status = call_export("ZwRemoveIoCompletionEx", &[port, slot, 1, slot + 0x20, 0, 0]).map_or(u32::MAX, |status| status as u32);
+        if status != 0 || guest::read32(slot + 0x20) != 1 {
+            guest::write64(slot + 0x38, status as u64 | 0x1_0000_0000);
+            return;
+        }
+        // FILE_IO_COMPLETION_INFORMATION.KeyContext.
+        let key = guest::read64(slot);
+        if key == STOP_KEY {
+            return;
+        }
+        consumed(slot, key);
+    }
+}
+
+extern "win64" fn queue_consumer(slot: u64) {
+    let block = guest::read64(slot + 0x30);
+    loop {
+        let removed = call_export("KeRemoveQueueEx", &[block + 0x80, 0, 0, 0, slot + 0x20, 1]).unwrap_or(0) as u32;
+        let entry = guest::read64(slot + 0x20);
+        let number = entry.wrapping_sub(block + ENTRIES) / 0x10;
+        if removed != 1 || entry < queue_entry(block, 1) || number > PACKETS + 2 || entry & 0xF != 0 {
+            guest::write64(slot + 0x38, entry | 1);
+            return;
+        }
+        if number > PACKETS {
+            return;
+        }
+        consumed(slot, number);
+    }
+}
+
+/// A publicadora: dois pacotes por rodada (chaves 2 em diante), e espera as
+/// duas confirmações antes da rodada seguinte; no fim, os dois de fim.
+extern "win64" fn completion_poster(block: u64) {
+    let (port, rounds) = (guest::read64(block), guest::read64(block + 0x40));
+    for round in 0..rounds {
+        for key in [2 + 2 * round, 3 + 2 * round] {
+            call_export("ZwSetIoCompletionEx", &[port, 0, key, 0, 0, 0]);
+        }
+        for _ in 0..2 {
+            call_export("KeWaitForSingleObject", &[block + 0x20, 0, 0, 0, 0]);
+        }
+    }
+    for _ in 0..2 {
+        call_export("ZwSetIoCompletionEx", &[port, 0, STOP_KEY, 0, 0, 0]);
+    }
+}
+
+extern "win64" fn queue_poster(block: u64) {
+    let rounds = guest::read64(block + 0x40);
+    for round in 0..rounds {
+        for number in [2 + 2 * round, 3 + 2 * round] {
+            call_export("KeInsertQueue", &[block + 0x80, queue_entry(block, number)]);
+        }
+        for _ in 0..2 {
+            call_export("KeWaitForSingleObject", &[block + 0x20, 0, 0, 0, 0]);
+        }
+    }
+    for number in [PACKETS + 1, PACKETS + 2] {
+        call_export("KeInsertQueue", &[block + 0x80, queue_entry(block, number)]);
+    }
+}
+
+/// Uma rodada do teste: `completion` escolhe a porta de conclusão ou a
+/// KQUEUE.
+fn shared_queue_waiters(assert: Assert, completion: bool) {
+    let what = if completion { "ZwRemoveIoCompletionEx" } else { "KeRemoveQueueEx" };
+    let size = ENTRIES + 0x10 * (PACKETS + 3);
+    let block = guest::alloc_bytes(size);
+    guest::write_bytes(block, &alloc::vec![0; size as usize]);
+    dispatcher::initialize_semaphore(block + 0x20, 0, 0x1000);
+    guest::write64(block + 0x40, ROUNDS);
+    let attributes = kernel_handle_attributes();
+    let created = if completion { call_export("ZwCreateIoCompletion", &[block, 0x001F_0003, attributes, 2]) == Some(0) } else { call_export("KeInitializeQueue", &[block + 0x80, 2]).is_some() };
+    let consumer = if completion { completion_consumer } else { queue_consumer };
+    let mut threads = Vec::new();
+    for index in 0..2 {
+        guest::write64(slot(block, index) + 0x30, block);
+        threads.push(start(consumer, slot(block, index)));
+    }
+    let consumers = [threads[0].1, threads[1].1];
+    // As duas param fora da CPU: Waiting, WrQueue, sem espera pendente de
+    // confirmação.
+    let parked = created && consumers.iter().all(|&thread| thread != 0) && pump(5000, &|| consumers.iter().all(|&thread| wait::is_waiting(thread) && thread_dispatch::thread_state(thread) == thread_dispatch::state::WAITING));
+    assert(parked && consumers.iter().all(|&thread| kthread(thread).wait_reason.get() == wait::reason::WR_QUEUE), if completion { "kwait: duas threads de sistema param no ZwRemoveIoCompletionEx da mesma porta (Waiting, WrQueue)" } else { "kwait: duas threads de sistema param no KeRemoveQueueEx da mesma KQUEUE (Waiting, WrQueue)" });
+    // O primeiro pacote, publicado pelo contexto de boot: a consumidora que o
+    // recebe sai da espera Ready (o KiReadyThread do KiUnwaitThread), e a
+    // outra segue parada.
+    let posted = if completion { call_export("ZwSetIoCompletionEx", &[guest::read64(block), 0, 1, 0, 0, 0]) == Some(0) } else { call_export("KeInsertQueue", &[block + 0x80, queue_entry(block, 1)]).is_some() };
+    let woken: Vec<u64> = consumers.iter().copied().filter(|&thread| !wait::is_waiting(thread)).collect();
+    let readied = posted && woken.len() == 1 && thread_dispatch::thread_state(woken[0]) == thread_dispatch::state::READY && consumers.iter().any(|&thread| wait::is_waiting(thread) && thread_dispatch::thread_state(thread) == thread_dispatch::state::WAITING);
+    debug_print!("[kwait] {}: entrega a uma consumidora parada: acordadas={} estados={}/{}", what, woken.len(), thread_dispatch::thread_state(consumers[0]), thread_dispatch::thread_state(consumers[1]));
+    assert(readied, if completion { "kwait: o pacote publicado na porta tira a consumidora parada da espera como Ready (nunca Running fora da CPU)" } else { "kwait: o KeInsertQueue tira a consumidora parada da espera como Ready" });
+    // A confirmação do primeiro pacote, consumida aqui; então a publicadora.
+    let acknowledged = pump(5000, &|| dispatcher::acquire_status(block + 0x20, false) == Some(0) && consumers.iter().all(|&thread| wait::is_waiting(thread)));
+    let _ = dispatcher::acquire_status(block + 0x20, true);
+    threads.push(start(if completion { completion_poster } else { queue_poster }, block));
+    let all = [threads[0].1, threads[1].1, threads[2].1];
+    let finished = acknowledged && all[2] != 0 && pump(20_000, &|| all.iter().all(|&thread| kernel_threads::is_terminated(thread)));
+    let counts = [guest::read64(slot(block, 0) + 0x28), guest::read64(slot(block, 1) + 0x28)];
+    let sums = guest::read64(slot(block, 0) + 0x40) + guest::read64(slot(block, 1) + 0x40);
+    let errors = [guest::read64(slot(block, 0) + 0x38), guest::read64(slot(block, 1) + 0x38)];
+    debug_print!("[kwait] {}: fim={} pacotes={:?} soma={:#x} erros={:x?} estados={}/{}/{}", what, finished, counts, sums, errors, thread_dispatch::thread_state(all[0]), thread_dispatch::thread_state(all[1]), thread_dispatch::thread_state(all[2]));
+    assert(
+        finished && counts[0] + counts[1] == PACKETS && counts[0] > 0 && counts[1] > 0 && sums == PACKETS * (PACKETS + 1) / 2 && errors == [0, 0],
+        if completion { "kwait: duas consumidoras da porta de conclusao recebem os 129 pacotes publicados por outra thread, cada um entregue a uma consumidora parada, e nenhuma se perde" } else { "kwait: duas consumidoras da KQUEUE recebem as 129 entradas inseridas por outra thread, e nenhuma se perde" },
+    );
+    for (handle, _) in threads {
+        let _ = object_manager::close(handle as u32);
+    }
+    guest::free_bytes(attributes);
+    // Uma consumidora perdida ainda aponta para o bloco e para a porta: na
+    // falha, os dois ficam.
+    if !finished {
+        return;
+    }
+    if completion {
+        let _ = call_export("ZwClose", &[guest::read64(block)]);
+    }
+    guest::free_bytes(block);
+}
+
 pub fn run(assert: Assert) {
     event_ping_pong(assert);
     queue_ping_pong(assert);
     nested_tick(assert);
     alpc_kernel_pair(assert);
+    shared_queue_waiters(assert, true);
+    shared_queue_waiters(assert, false);
 }
