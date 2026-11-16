@@ -216,6 +216,57 @@ fn dma_adapter(assert: Assert) {
     native_call::call(operations.free_common_buffer.get(), &[adapter, 0x2000, guest::read64(logical), va, 1]);
     native_call::call(operations.put_dma_adapter.get(), &[adapter]);
     assert(!crate::hal::dma::is_adapter(adapter), "pnp-storage: PutDmaAdapter");
+    // DEVICE_DESCRIPTION da versão 3 (a do KMDF): a tabela HalpDmaOperationsV3.
+    device_description.version.set(3);
+    device_description.dma_address_width.set(32);
+    let adapter = super::phase6::call_export("IoGetDmaAdapter", &[ide.pdo_pointer, description, registers]).unwrap_or(0);
+    if adapter != 0 {
+        // SAFETY: DMA_ADAPTER e DMA_OPERATIONS devolvidos pela HAL.
+        let operations = unsafe { DmaOperations::at(DmaAdapter::at(adapter).dma_operations.get()) };
+        assert(operations.size.get() == 0x138 && operations.get_dma_adapter_info.get() == routine_stubs::address("HalGetDmaAdapterInfo").unwrap_or(1) && operations.build_scatter_gather_list_ex.get() == routine_stubs::address("HalBuildScatterGatherListEx").unwrap_or(1) && operations.free_common_buffer_vector.get() != 0, "pnp-storage: IoGetDmaAdapter da versao 3 com a tabela V3 completa");
+        // GetDmaAdapterInfo: só a versão 1; o caminho de bus master.
+        let information = guest::alloc_bytes(0x18);
+        guest::write32(information, 2);
+        let refused = native_call::call(operations.get_dma_adapter_info.get(), &[adapter, information]);
+        guest::write32(information, 1);
+        let answered = native_call::call(operations.get_dma_adapter_info.get(), &[adapter, information]);
+        let fields: alloc::vec::Vec<u32> = (0..6).map(|index| guest::read32(information + index * 4)).collect();
+        assert(refused as u32 == 0xC000_00BB && answered == 0 && fields == [1, 0, u32::MAX, 32, 3, 1], "pnp-storage: GetDmaAdapterInfo V1 (largura 32, SYNCHRONOUS_CALLBACK | API_BYPASS)");
+        // InitializeDmaTransferContext: Version 1 e o bit 1 de +0x24.
+        let context = guest::alloc_bytes(0x80);
+        guest::write_bytes(context, &[0xAA; 0x80]);
+        native_call::call(operations.initialize_dma_transfer_context.get(), &[adapter, context]);
+        let cleared = guest::read_bytes(context, 0x80);
+        assert(guest::read32(context) == 1 && guest::read32(context + 0x24) == 2 && cleared.iter().enumerate().all(|(index, &byte)| index < 4 || (0x24..0x28).contains(&index) || byte == 0), "pnp-storage: InitializeDmaTransferContext zera o contexto com Version 1");
+        // GetDmaTransferInfo e BuildScatterGatherListEx no MDL do buffer comum
+        // (Offset a partir do início do MDL).
+        let va = native_call::call(operations.allocate_common_buffer.get(), &[adapter, 0x2000, logical, 1]);
+        let mdl = crate::ntos::io::mdl::allocate_mdl(va + 0x100, 0x1000);
+        crate::ntos::mm::mdl::build_for_non_paged_pool(mdl);
+        let transfer = guest::alloc_bytes(0x14);
+        guest::write32(transfer, 1);
+        let info = native_call::call(operations.get_dma_transfer_info.get(), &[adapter, mdl, 0x10, 0x800, 0, transfer]);
+        assert(info == 0 && guest::read32(transfer + 4) == 1 && guest::read32(transfer + 8) == 1 && guest::read32(transfer + 0xC) == 0x28, "pnp-storage: GetDmaTransferInfo V1 (uma pagina, um elemento, lista de 0x28 bytes)");
+        let buffer = guest::alloc_bytes(0x40);
+        let list_cell = guest::alloc_bytes(8);
+        let built = native_call::call(operations.build_scatter_gather_list_ex.get(), &[adapter, 0, context, mdl, 0x10, 0x800, 1, 0, 0, 1, buffer, 0x40, 0, 0, list_cell]);
+        let physical = guest::read64(logical);
+        assert(built == 0 && guest::read64(list_cell) == buffer && guest::read32(buffer) == 1 && guest::read64(buffer + 0x10) == physical + 0x110 && guest::read32(buffer + 0x18) == 0x800, "pnp-storage: BuildScatterGatherListEx sincrono com o trecho fisico do Offset");
+        let small = native_call::call(operations.build_scatter_gather_list_ex.get(), &[adapter, 0, context, mdl, 0, 0x1000, 1, 0, 0, 1, buffer, 0x20, 0, 0, list_cell]);
+        assert(small as u32 == 0xC000_0023, "pnp-storage: BuildScatterGatherListEx com buffer pequeno = STATUS_BUFFER_TOO_SMALL");
+        let got = native_call::call(operations.get_scatter_gather_list_ex.get(), &[adapter, 0, context, mdl, 0, 0x1000, 1, 0, 0, 1, 0, 0, list_cell]);
+        let list = guest::read64(list_cell);
+        assert(got == 0 && list != buffer && guest::read32(list) == 1 && guest::read64(list + 0x10) == physical + 0x100, "pnp-storage: GetScatterGatherListEx sincrono aloca a lista");
+        native_call::call(operations.put_scatter_gather_list.get(), &[adapter, list, 1]);
+        assert(native_call::call(operations.cancel_mapped_transfer.get(), &[adapter, context]) as u32 == 0xC000_000D && native_call::call(operations.get_dma_domain.get(), &[adapter]) == 0, "pnp-storage: bus master sem transferencia mapeada a cancelar nem dominio");
+        native_call::call(operations.free_common_buffer.get(), &[adapter, 0x2000, physical, va, 1]);
+        native_call::call(operations.put_dma_adapter.get(), &[adapter]);
+        for block in [information, context, mdl, transfer, buffer, list_cell] {
+            guest::free_bytes(block);
+        }
+    } else {
+        assert(false, "pnp-storage: IoGetDmaAdapter da versao 3");
+    }
     for block in [mdl, length, size, logical, registers, description] {
         guest::free_bytes(block);
     }
@@ -250,7 +301,7 @@ fn dma_adapter_v3(assert: Assert, pdo: u64) {
     let operations = unsafe { DmaOperations::at(DmaAdapter::at(adapter).dma_operations.get()) };
     let slot = |name: &str| routine_stubs::address(name).unwrap_or(1);
     assert(
-        operations.size.get() == 0x138 && operations.free_common_buffer.get() == slot("HalFreeCommonBufferV3") && operations.build_scatter_gather_list.get() == slot("HalBuildScatterGatherListV3") && operations.get_scatter_gather_list.get() == slot("HalGetScatterGatherList") && operations.get_dma_adapter_info.get() == slot("HalGetDmaAdapterInfo") && operations.flush_dma_buffer.get() == slot("HalFlushDmaBuffer") && operations.get_dma_transfer_info.get() == 0,
+        operations.size.get() == 0x138 && operations.free_common_buffer.get() == slot("HalFreeCommonBufferV3") && operations.build_scatter_gather_list.get() == slot("HalBuildScatterGatherListV3") && operations.get_scatter_gather_list.get() == slot("HalGetScatterGatherList") && operations.get_dma_adapter_info.get() == slot("HalGetDmaAdapterInfo") && operations.flush_dma_buffer.get() == slot("HalFlushDmaBuffer") && operations.get_dma_transfer_info.get() == slot("HalGetDmaTransferInfo"),
         "pnp-storage: tabela de operacoes V3 (Size 0x138, as variantes V3 e o FlushDmaBuffer)",
     );
     // GetDmaAdapterInfo: só a versão 1.

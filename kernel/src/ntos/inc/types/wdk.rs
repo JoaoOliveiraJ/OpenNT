@@ -3245,6 +3245,123 @@ const _: () = {
     assert!(core::mem::offset_of!(PoFxDeviceV1, components) == 0x40);
 };
 
+/// `_PO_FX_COMPONENT_V2` (wdm.h; 0x38 bytes).
+#[repr(C)]
+pub struct PoFxComponentV2 {
+    pub id: Guid,
+    pub flags: Field<u64>,
+    pub deepest_wakeable_idle_state: Field<u32>,
+    pub idle_state_count: Field<u32>,
+    /// -> `_PO_FX_COMPONENT_IDLE_STATE`
+    pub idle_states: Field<u64>,
+    pub provider_count: Field<u32>,
+    _pad_2c: Reserved<0x4>,
+    /// -> `ULONG`
+    pub providers: Field<u64>,
+}
+
+unsafe impl NtStruct for PoFxComponentV2 {}
+
+const _: () = {
+    assert!(core::mem::size_of::<PoFxComponentV2>() == 0x38);
+    assert!(core::mem::offset_of!(PoFxComponentV2, id) == 0x0);
+    assert!(core::mem::offset_of!(PoFxComponentV2, flags) == 0x10);
+    assert!(core::mem::offset_of!(PoFxComponentV2, deepest_wakeable_idle_state) == 0x18);
+    assert!(core::mem::offset_of!(PoFxComponentV2, idle_state_count) == 0x1c);
+    assert!(core::mem::offset_of!(PoFxComponentV2, idle_states) == 0x20);
+    assert!(core::mem::offset_of!(PoFxComponentV2, provider_count) == 0x28);
+    assert!(core::mem::offset_of!(PoFxComponentV2, providers) == 0x30);
+};
+
+/// `_PO_FX_DEVICE_V2` (wdm.h; 0x88 bytes): Flags e os componentes V2.
+#[repr(C)]
+pub struct PoFxDeviceV2 {
+    pub version: Field<u32>,
+    _pad_4: Reserved<0x4>,
+    pub flags: Field<u64>,
+    /// -> `void`
+    pub component_active_condition_callback: Field<u64>,
+    /// -> `void`
+    pub component_idle_condition_callback: Field<u64>,
+    /// -> `void`
+    pub component_idle_state_callback: Field<u64>,
+    /// -> `void`
+    pub device_power_required_callback: Field<u64>,
+    /// -> `void`
+    pub device_power_not_required_callback: Field<u64>,
+    /// -> `void`
+    pub power_control_callback: Field<u64>,
+    /// -> `void`
+    pub device_context: Field<u64>,
+    pub component_count: Field<u32>,
+    _pad_4c: Reserved<0x4>,
+    pub components: [PoFxComponentV2; 1],
+}
+
+unsafe impl NtStruct for PoFxDeviceV2 {}
+
+const _: () = {
+    assert!(core::mem::size_of::<PoFxDeviceV2>() == 0x88);
+    assert!(core::mem::offset_of!(PoFxDeviceV2, version) == 0x0);
+    assert!(core::mem::offset_of!(PoFxDeviceV2, flags) == 0x8);
+    assert!(core::mem::offset_of!(PoFxDeviceV2, component_active_condition_callback) == 0x10);
+    assert!(core::mem::offset_of!(PoFxDeviceV2, component_idle_condition_callback) == 0x18);
+    assert!(core::mem::offset_of!(PoFxDeviceV2, component_idle_state_callback) == 0x20);
+    assert!(core::mem::offset_of!(PoFxDeviceV2, device_power_required_callback) == 0x28);
+    assert!(core::mem::offset_of!(PoFxDeviceV2, device_power_not_required_callback) == 0x30);
+    assert!(core::mem::offset_of!(PoFxDeviceV2, power_control_callback) == 0x38);
+    assert!(core::mem::offset_of!(PoFxDeviceV2, device_context) == 0x40);
+    assert!(core::mem::offset_of!(PoFxDeviceV2, component_count) == 0x48);
+    assert!(core::mem::offset_of!(PoFxDeviceV2, components) == 0x50);
+};
+
+/// `_PO_FX_DEVICE_V3` (wdm.h; 0xa0 bytes): o V2 com os callbacks e o prazo
+/// do Directed Power Management.
+#[repr(C)]
+pub struct PoFxDeviceV3 {
+    pub version: Field<u32>,
+    _pad_4: Reserved<0x4>,
+    pub flags: Field<u64>,
+    /// -> `void`
+    pub component_active_condition_callback: Field<u64>,
+    /// -> `void`
+    pub component_idle_condition_callback: Field<u64>,
+    /// -> `void`
+    pub component_idle_state_callback: Field<u64>,
+    /// -> `void`
+    pub device_power_required_callback: Field<u64>,
+    /// -> `void`
+    pub device_power_not_required_callback: Field<u64>,
+    /// -> `void`
+    pub power_control_callback: Field<u64>,
+    /// -> `void`
+    pub directed_power_up_callback: Field<u64>,
+    /// -> `void`
+    pub directed_power_down_callback: Field<u64>,
+    pub directed_fx_timeout_in_seconds: Field<u32>,
+    _pad_54: Reserved<0x4>,
+    /// -> `void`
+    pub device_context: Field<u64>,
+    pub component_count: Field<u32>,
+    _pad_64: Reserved<0x4>,
+    pub components: [PoFxComponentV2; 1],
+}
+
+unsafe impl NtStruct for PoFxDeviceV3 {}
+
+const _: () = {
+    assert!(core::mem::size_of::<PoFxDeviceV3>() == 0xa0);
+    assert!(core::mem::offset_of!(PoFxDeviceV3, flags) == 0x8);
+    assert!(core::mem::offset_of!(PoFxDeviceV3, component_active_condition_callback) == 0x10);
+    assert!(core::mem::offset_of!(PoFxDeviceV3, power_control_callback) == 0x38);
+    assert!(core::mem::offset_of!(PoFxDeviceV3, directed_power_up_callback) == 0x40);
+    assert!(core::mem::offset_of!(PoFxDeviceV3, directed_power_down_callback) == 0x48);
+    assert!(core::mem::offset_of!(PoFxDeviceV3, directed_fx_timeout_in_seconds) == 0x50);
+    assert!(core::mem::offset_of!(PoFxDeviceV3, device_context) == 0x58);
+    assert!(core::mem::offset_of!(PoFxDeviceV3, component_count) == 0x60);
+    assert!(core::mem::offset_of!(PoFxDeviceV3, components) == 0x68);
+};
+
 /// O dispositivo primário do PoFxRegisterPrimaryDevice (ntoskrnl 19041
 /// 0x8e4380; 0x70 bytes): Version 1, Flags (bit 0 = sem retomada rápida),
 /// os seis callbacks do PO_FX_DEVICE_V1 mais o de transição crítica de

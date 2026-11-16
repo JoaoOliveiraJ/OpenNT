@@ -18,50 +18,55 @@ pub fn trace_message(format: u64, arguments: [u64; 4]) -> Result<(), KernelError
     Ok(())
 }
 
-/// TRACE_INFORMATION_CLASS.FltIoNotifyRoutinesClass.
-const FLT_IO_NOTIFY_ROUTINES_CLASS: u32 = 13;
-/// EtwpFltIoNotifyRoutines: seis rotinas que o ETW do kernel preenche quando
-/// uma sessão rastreia a E/S dos minifiltros.
-const FLT_IO_NOTIFY_ROUTINES_SIZE: u64 = 0x30;
+/// As tabelas de rotinas de notificação que o ETW publica para os
+/// componentes que rastreiam por ele (EtwpDiskIoNotifyRoutines, 0x20 bytes;
+/// EtwpFltIoNotifyRoutines, 0x30; EtwpWdfNotifyRoutines, 0x28): ponteiros
+/// nulos enquanto nenhuma sessão de trace pede esses eventos, o caso do
+/// OpenNT. O KMDF guarda a tabela do WDF e chama as rotinas não nulas a cada
+/// DPC, work item, timer e interrupção que despacha.
+static NOTIFY_ROUTINES: crate::rtl::SpinLock<[u64; 3]> = crate::rtl::SpinLock::new([0; 3]);
 
-/// A tabela EtwpFltIoNotifyRoutines (memória do kernel, criada uma vez).
-static FLT_IO_NOTIFY_ROUTINES: crate::rtl::SpinLock<u64> = crate::rtl::SpinLock::new(0);
+/// TRACE_INFORMATION_CLASS das tabelas de notificação (DiskIoNotifyRoutinesClass,
+/// FltIoNotifyRoutinesClass e WdfNotifyRoutinesClass) e o tamanho de cada uma.
+const NOTIFY_ROUTINE_CLASSES: [(u32, u64); 3] = [(11, 0x20), (13, 0x30), (15, 0x28)];
 
-fn flt_io_notify_routines() -> u64 {
-    let mut table = FLT_IO_NOTIFY_ROUTINES.lock();
-    if *table == 0 {
-        let address = guest::alloc_bytes(FLT_IO_NOTIFY_ROUTINES_SIZE);
-        guest::write_bytes(address, &[0u8; FLT_IO_NOTIFY_ROUTINES_SIZE as usize]);
-        *table = address;
+/// A tabela de notificação de uma classe (alocada zerada na primeira vez).
+pub fn notify_routines(class: u32) -> Option<u64> {
+    let index = NOTIFY_ROUTINE_CLASSES.iter().position(|&(known, _)| known == class)?;
+    let mut tables = NOTIFY_ROUTINES.lock();
+    if tables[index] == 0 {
+        tables[index] = guest::alloc_bytes(NOTIFY_ROUTINE_CLASSES[index].1);
     }
-    *table
+    Some(tables[index])
 }
 
-/// WmiQueryTraceInformation(class, buffer, length, &required, ...).
-///
-/// FltIoNotifyRoutinesClass (13), como o ntoskrnl 19041 (0x7888a0): grava 8
-/// em *ReturnLength (quando dado), exige Length 8 (senão
-/// STATUS_INFO_LENGTH_MISMATCH) e o buffer (senão
-/// STATUS_INVALID_PARAMETER_2) e devolve nele o endereço da tabela de
-/// rotinas de notificação de E/S dos minifiltros, que o fltmgr.sys consulta
-/// antes e depois de cada callback; sem sessão rastreando essa E/S as
-/// rotinas são NULL.
-///
-/// As outras classes zeram até 0x30 bytes em palavras de quatro bytes.
+const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
+const STATUS_INVALID_PARAMETER_2: u32 = 0xC000_00F0;
+
+/// WmiQueryTraceInformation(class, buffer, length, &required, ...). Como no
+/// ntoskrnl 19041 (rva 0x7888a0), o *ReturnLength começa zerado; as classes
+/// das tabelas de notificação (11, 13 e 15) devolvem o ponteiro da tabela
+/// num buffer de exatamente 8 bytes (*ReturnLength = 8; outro tamanho é
+/// STATUS_INFO_LENGTH_MISMATCH e o buffer nulo STATUS_INVALID_PARAMETER_2).
+/// As demais classes zeram até 0x30 bytes em palavras de quatro bytes.
 pub fn query_trace_information(class: u32, buffer: u64, length: u32, required_out: u64) -> u32 {
-    if class == FLT_IO_NOTIFY_ROUTINES_CLASS {
+    if required_out != 0 {
+        // SAFETY: PULONG de saída do driver.
+        unsafe { Field::<u32>::at(required_out) }.set(0);
+    }
+    if let Some(table) = notify_routines(class) {
         if required_out != 0 {
             // SAFETY: PULONG de saída do driver.
             unsafe { Field::<u32>::at(required_out) }.set(8);
         }
         if length != 8 {
-            return 0xC000_0004;
+            return STATUS_INFO_LENGTH_MISMATCH;
         }
         if buffer == 0 {
-            return 0xC000_00F0;
+            return STATUS_INVALID_PARAMETER_2;
         }
-        // SAFETY: o buffer de 8 bytes do driver.
-        unsafe { Field::<u64>::at(buffer) }.set(flt_io_notify_routines());
+        // SAFETY: o PVOID de saída do driver.
+        unsafe { Field::<u64>::at(buffer) }.set(table);
         return 0;
     }
     let reported = length.min(0x30);

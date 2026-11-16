@@ -1503,6 +1503,14 @@ fn ntoskrnl_medium_groups(assert: Assert) {
     let length = guest::alloc_bytes(8);
     guest::write_bytes(buffer, &[0xFF; 0x40]);
     assert(call_export("WmiQueryTraceInformation", &[1, buffer, 0x40, length, 0]) == Some(0) && guest::read32(length) == 0x30 && guest::read64(buffer + 0x28) == 0 && guest::read32(buffer + 0x30) == 0xFFFF_FFFF, "wmi: WmiQueryTraceInformation zera ate 0x30 bytes");
+    // WdfNotifyRoutinesClass (15): o ponteiro da tabela de notificação do
+    // WDF (0x28 bytes, nula sem trace), num buffer de exatamente 8 bytes.
+    guest::write_bytes(buffer, &[0xFF; 0x40]);
+    let wdf = call_export("WmiQueryTraceInformation", &[15, buffer, 8, length, 0]);
+    let table = guest::read64(buffer);
+    let mismatch = call_export("WmiQueryTraceInformation", &[15, buffer, 4, length, 0]);
+    let null_buffer = call_export("WmiQueryTraceInformation", &[15, 0, 8, 0, 0]);
+    assert(wdf == Some(0) && guest::read32(length) == 8 && table != 0 && table != u64::MAX && guest::read_bytes(table, 0x28).iter().all(|&byte| byte == 0) && mismatch == Some(0xFFFF_FFFF_C000_0004) && null_buffer == Some(0xFFFF_FFFF_C000_00F0), "wmi: WdfNotifyRoutinesClass devolve a tabela de notificacao do WDF");
     let format = guest::alloc_bytes(32);
     guest::write_bytes(format, b"valor=%d\n\0");
     assert(call_export("WmiTraceMessage", &[0, 0, 0, 0, format, 42]) == Some(0) && call_export("WmiTraceMessageVa", &[0, 0, 0, 0, 0]) == Some(0xFFFF_FFFF_C000_0008), "wmi: trace formatado e logger inexistente");
@@ -4710,6 +4718,45 @@ fn po_fx_exports(assert: Assert) {
         "po-fx: PoFxUnregisterDevice aceita o handle",
     );
 
+    // PO_FX_DEVICE_V2 (o do KMDF): ComponentCount em +0x48 e DeviceContext em
+    // +0x40; o DevicePowerRequiredCallback (+0x28) recebe o contexto no
+    // PoFxStartDevicePowerManagement. A rotina grava o contexto em +0x300 do
+    // bloco do PDO.
+    let record = pdo + 0x300;
+    // mov rax, record; mov [rax], rcx; ret
+    let mut code = alloc::vec![0x48u8, 0xB8];
+    code.extend_from_slice(&record.to_le_bytes());
+    code.extend_from_slice(&[0x48, 0x89, 0x08, 0xC3]);
+    let required = super::executable_code::place(&code);
+    let v2 = guest::alloc_bytes(nt::PoFxDeviceV2::SIZE + nt::PoFxComponentV2::SIZE);
+    let fx_v2 = at::<nt::PoFxDeviceV2>(v2);
+    fx_v2.version.set(2);
+    fx_v2.component_count.set(2);
+    fx_v2.device_context.set(0x5151_0002);
+    fx_v2.device_power_required_callback.set(required);
+    let registered_v2 = call_export("PoFxRegisterDevice", &[pdo, v2, handle_cell]);
+    let handle_v2 = guest::read64(handle_cell);
+    call_export("PoFxStartDevicePowerManagement", &[handle_v2]);
+    assert(registered_v2 == Some(0) && handle_v2 != 0 && at::<nt::PopFxDevice>(handle_v2).component_count.get() == 2 && guest::read64(record) == 0x5151_0002, "po-fx: PO_FX_DEVICE_V2 registrado, DevicePowerRequired com o DeviceContext");
+    call_export("PoFxUnregisterDevice", &[handle_v2]);
+    // V3: os dois callbacks dirigidos ou nenhum; versão 4 recusada.
+    let v3 = guest::alloc_bytes(nt::PoFxDeviceV3::SIZE);
+    let fx_v3 = at::<nt::PoFxDeviceV3>(v3);
+    fx_v3.version.set(3);
+    fx_v3.component_count.set(1);
+    fx_v3.directed_power_up_callback.set(required);
+    let half = call_export("PoFxRegisterDevice", &[pdo, v3, handle_cell]).map(|status| status as u32);
+    fx_v3.directed_power_down_callback.set(required);
+    let both = call_export("PoFxRegisterDevice", &[pdo, v3, handle_cell]);
+    let handle_v3 = guest::read64(handle_cell);
+    fx_v3.version.set(4);
+    let unknown = call_export("PoFxRegisterDevice", &[pdo, v3, handle_cell]).map(|status| status as u32);
+    assert(half == Some(0xC000_000D) && both == Some(0) && handle_v3 != 0 && at::<nt::PopFxDevice>(handle_v3).component_count.get() == 1 && unknown == Some(0xC000_000D), "po-fx: V3 com os dois callbacks dirigidos; um so ou versao 4 = STATUS_INVALID_PARAMETER");
+    call_export("PoFxUnregisterDevice", &[handle_v3]);
+    super::executable_code::release(required);
+
+    guest::free_bytes(v2);
+    guest::free_bytes(v3);
     guest::free_bytes(handle_cell);
     guest::free_bytes(device);
     guest::free_bytes(pdo);

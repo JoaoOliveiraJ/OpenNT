@@ -1,6 +1,6 @@
 //! PoFx — o power framework de runtime (PoFx*) com um motor inerte.
 //!
-//! Registra os dispositivos PO_FX_DEVICE_V1 com o layout interno real do
+//! Registra os dispositivos PO_FX_DEVICE (V1, V2 e V3) com o layout interno real do
 //! POHANDLE (ComponentCount em +0x33c, vetor de componentes em +0x340) e
 //! mantém cada dispositivo em D0 e cada componente em F0: os callbacks que o
 //! driver precisa para concluir o handshake de energia são disparados, os de
@@ -11,7 +11,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use crate::hal::amd64::native_call;
-use crate::ntos::inc::types::{Field, NtStruct, PoFxDeviceV1, PoFxPrimaryDeviceV1, PopFxDevice};
+use crate::ntos::inc::types::{Field, NtStruct, PoFxDeviceV1, PoFxDeviceV2, PoFxDeviceV3, PoFxPrimaryDeviceV1, PopFxDevice};
 use crate::ntos::mm::guest_memory as guest;
 use crate::rtl::SpinLock;
 
@@ -51,30 +51,68 @@ struct PoFxDevice {
 /// Registry keyed on the POHANDLE value we hand back to the driver.
 static DEVICES: SpinLock<BTreeMap<u64, PoFxDevice>> = SpinLock::new(BTreeMap::new());
 
-/// PoFxRegisterDevice(PDEVICE_OBJECT Pdo, PPO_FX_DEVICE Dev, POHANDLE* Handle).
-/// Validates Version==1, snapshots DeviceContext + 6 callbacks, allocates the
-/// opaque handle with the real internal layout, writes `*Handle`, SUCCESS.
-/// Devolve o NTSTATUS.
+/// PoFxRegisterDevice(PDEVICE_OBJECT Pdo, PPO_FX_DEVICE Dev, POHANDLE* Handle)
+/// (ntoskrnl 19041 rva 0x7b4e50): as três versões do PO_FX_DEVICE, cada uma
+/// com o seu layout — V1 (ComponentCount em +4, os seis callbacks em +8,
+/// DeviceContext em +0x38), V2 (Flags em +8, os callbacks em +0x10,
+/// DeviceContext em +0x40, ComponentCount em +0x48) e V3 (o V2 com os
+/// callbacks de Directed Power Management em +0x40/+0x48, que vêm os dois ou
+/// nenhum, DeviceContext em +0x58 e ComponentCount em +0x60); outra versão
+/// ou um só callback dirigido é STATUS_INVALID_PARAMETER. O motor guarda o
+/// DeviceContext e os callbacks, aloca o POHANDLE com o layout interno e
+/// grava `*Handle`. Devolve o NTSTATUS.
 pub fn register_device(device: u64, handle_out: u64) -> u32 {
     if device == 0 {
         return STATUS_INVALID_PARAMETER;
     }
-    // SAFETY: PPO_FX_DEVICE do driver.
-    let description = unsafe { PoFxDeviceV1::at(device) };
-    // Only PO_FX_DEVICE_V1 is modeled; V2/V3 use a different layout.
-    if description.version.get() != 1 {
-        return STATUS_NOT_SUPPORTED;
-    }
-
-    let callbacks = [
-        description.component_active_condition_callback.get(),
-        description.component_idle_condition_callback.get(),
-        description.component_idle_state_callback.get(),
-        description.device_power_required_callback.get(),
-        description.device_power_not_required_callback.get(),
-        description.power_control_callback.get(),
-    ];
-    register(description.component_count.get(), description.device_context.get(), callbacks, 0, handle_out)
+    // SAFETY: PPO_FX_DEVICE do driver (Version no início de todas as versões).
+    let version = unsafe { Field::<u32>::at(device) }.get();
+    let (count, context, callbacks) = match version {
+        1 => {
+            // SAFETY: PO_FX_DEVICE_V1 do driver.
+            let description = unsafe { PoFxDeviceV1::at(device) };
+            let callbacks = [
+                description.component_active_condition_callback.get(),
+                description.component_idle_condition_callback.get(),
+                description.component_idle_state_callback.get(),
+                description.device_power_required_callback.get(),
+                description.device_power_not_required_callback.get(),
+                description.power_control_callback.get(),
+            ];
+            (description.component_count.get(), description.device_context.get(), callbacks)
+        }
+        2 => {
+            // SAFETY: PO_FX_DEVICE_V2 do driver.
+            let description = unsafe { PoFxDeviceV2::at(device) };
+            let callbacks = [
+                description.component_active_condition_callback.get(),
+                description.component_idle_condition_callback.get(),
+                description.component_idle_state_callback.get(),
+                description.device_power_required_callback.get(),
+                description.device_power_not_required_callback.get(),
+                description.power_control_callback.get(),
+            ];
+            (description.component_count.get(), description.device_context.get(), callbacks)
+        }
+        3 => {
+            // SAFETY: PO_FX_DEVICE_V3 do driver.
+            let description = unsafe { PoFxDeviceV3::at(device) };
+            if (description.directed_power_up_callback.get() == 0) != (description.directed_power_down_callback.get() == 0) {
+                return STATUS_INVALID_PARAMETER;
+            }
+            let callbacks = [
+                description.component_active_condition_callback.get(),
+                description.component_idle_condition_callback.get(),
+                description.component_idle_state_callback.get(),
+                description.device_power_required_callback.get(),
+                description.device_power_not_required_callback.get(),
+                description.power_control_callback.get(),
+            ];
+            (description.component_count.get(), description.device_context.get(), callbacks)
+        }
+        _ => return STATUS_INVALID_PARAMETER,
+    };
+    register(count, context, callbacks, 0, handle_out)
 }
 
 /// PoFxRegisterPrimaryDevice(Pdo, Device, Handle*) (ntoskrnl 19041
