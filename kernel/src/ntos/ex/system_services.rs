@@ -7,8 +7,9 @@
 //! a falha explícita do runtime; os demais recebem o gateway do número. A
 //! tabela gráfica (números a partir de 0x1000) é do win32k, não daqui.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
+use core::sync::atomic::{AtomicU64, Ordering};
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -49,6 +50,10 @@ struct Binding {
 }
 
 static BINDINGS: SpinLock<BTreeMap<u32, Binding>> = SpinLock::new(BTreeMap::new());
+/// O endereço da falha comum dos slots sem provedor, depois do registro.
+static UNAVAILABLE: AtomicU64 = AtomicU64::new(0);
+/// Serviços sem provedor já relatados (um aviso por serviço).
+static REPORTED: SpinLock<BTreeSet<u32>> = SpinLock::new(BTreeSet::new());
 static REGISTERED: SpinLock<Option<BTreeMap<u32, String>>> = SpinLock::new(None);
 /// `invoke_service(name, a1..a4, retorno, rsp)` de `ps/user/index`.
 static USER_INVOKER: SpinLock<Option<fn(&str, [u64; 4], u64, u64) -> Result<u32, KernelError>>> = SpinLock::new(None);
@@ -110,6 +115,7 @@ pub fn register(input: &BTreeMap<u32, String>) -> Result<(), KernelError> {
         pending.push((number, Binding { name: name.clone(), kernel, user }));
     }
     service_table::install(&targets, &stack_arguments)?;
+    UNAVAILABLE.store(unavailable, Ordering::Release);
     let providers = pending.len();
     BINDINGS.lock().extend(pending);
     *REGISTERED.lock() = Some(names.clone());
@@ -147,6 +153,22 @@ pub fn copy_arguments(destination: u64, user_rsp: u64, count: u64) -> u32 {
         guest::write64(destination + (index + 4) * 8, value);
     }
     0
+}
+
+/// A entrada de syscall de usuário escolheu `target` para o serviço nativo
+/// `number`: a falha comum de um slot sem provedor (nem handler de usuário
+/// nem export) devolve STATUS_NOT_IMPLEMENTED sem passar pelo despacho, e o
+/// aviso sai aqui, uma vez por serviço.
+pub fn note_user_target(number: u64, target: u64) {
+    if number & 0x1000 != 0 || target == 0 || target != UNAVAILABLE.load(Ordering::Acquire) {
+        return;
+    }
+    let number = (number & 0xFFF) as u32;
+    if !REPORTED.lock().insert(number) {
+        return;
+    }
+    let name = state::with(|state| state.name_by_number.get(&number).cloned());
+    crate::debug_print!("[usermode] syscall {} sem implementacao (sem provedor)", name.as_deref().unwrap_or("?"));
 }
 
 pub fn owns(id: u64) -> bool {

@@ -1126,6 +1126,7 @@ pub extern "C" fn opennt_user_syscall(frame: *mut u64) -> u64 {
             Err(status) => result = u64::from(status),
         }
     }
+    system_services::note_user_target(number, target);
     capture_syscall_registers(frame, number);
     STATE.lock().frame_context = block().context.get();
     {
