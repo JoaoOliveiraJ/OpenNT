@@ -615,7 +615,15 @@ de conclusão (ZwRemoveIoCompletion[Ex]) e as esperas do ALPC
 um pedido síncrono) são esperas explícitas (`wait::wait_woken`): a entrega dos
 pacotes pela porta, uma mensagem na fila de uma porta, um pedido, uma
 resposta, a decisão de uma conexão ou o fecho de uma porta aprontam a thread
-(`wait::wake`), que sonda a operação de novo. As demais esperas genéricas de
+(`wait::wake`), que sonda a operação de novo. A porta de conclusão também é
+um objeto de espera comum: o corpo do IoCompletion é uma KQUEUE
+(`ob/objects/completion.rs`, SignalState = pacotes na fila, CurrentCount e
+MaximumCount da concorrência), e uma KQUEUE com entradas satisfaz o
+KeWaitForSingleObject/Multiple sem consumir (`dispatcher::acquire_status`);
+a fila que ganha pacotes, e o KeInsertQueue que deixa a entrada na lista,
+testam as esperas do cabeçalho. O win32k espera assim a porta da fila de
+mensagens de cada thread GUI (o pacote de espera do evento da fila a
+alimenta). As demais esperas genéricas de
 uma condição sem objeto a sinalizar (`context_switch::wait_until`, como a
 remoção de um callback à espera do fim das chamadas em curso) tiram a thread
 das prontas com a condição sondada pelo despachante a cada tick
@@ -2739,18 +2747,42 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   O SetDefaultWinstaSecurity põe a DACL com o GenericMapping e o
   ValidAccessMask que o win32k gravou no TypeInfo do tipo WindowStation (o
   Ob lê o TypeInfo corrente, `ob/object_types.rs`), e o CreateDesktopW abre a
-  Desktop Winlogon pela ParseProcedure da WinSta0. O NtUserCreateDesktopEx
-  ainda não volta: o xxxCreateDesktopEx do wininit e o xxxSwitchDesktop da
-  RawInputThread do csrss mandam mensagens (xxxSetWindowPos ->
-  xxxInterSendMsgEx) e esperam a resposta em xxxRealSleepThread, e a thread
-  da Desktop do csrss segue parada no LegacyInputDispatcher::WaitAndDispatch
-  sem ser acordada. O smss da sessão 1 cria o
-  csrss e o winlogon.exe (o NtOpenSection relativo ao `\KnownDlls`, aberto
-  pela tabela do Object Manager, e o powrprof.dll e o imm32.dll no
-  volume). O marcador `WINSTA0_OK`
-  (`initial_process::desktop_opened`) sai quando o wininit.exe tem as
-  Desktops Winlogon e Default da WinSta0, abertas pela ParseProcedure da
-  WindowStation.
+  Desktop Winlogon pela ParseProcedure da WinSta0. As mensagens que o
+  xxxCreateDesktopEx do wininit e o xxxSwitchDesktop da RawInputThread do
+  csrss mandam (xxxSetWindowPos -> xxxInterSendMsgEx) acordam a thread da
+  Desktop do csrss pela porta de conclusão da fila de mensagens dela: o
+  evento da fila alimenta, pelo pacote de espera, a IOCP que o
+  LegacyInputDispatcher::WaitAndDispatch e o xxxRealSleepThread esperam
+  direto no KeWaitForMultipleObjects (o corpo do IoCompletion é uma KQUEUE,
+  `ob/objects/completion.rs`). O xxxCreateDisconnectDesktop cria a Desktop
+  Disconnect e a abre no csrss com ObOpenObjectByPointer(0x1F0003) em
+  KernelMode, que concede o pedido sem os direitos fora do ValidAccessMask
+  do tipo, como o ObpCreateHandle (`ob/object_access.rs`); o DestroyDesktop
+  termina em NUL o nome que o ObQueryNameString dá a uma Desktop (`\Nome`,
+  fora do namespace, `ob/query_object.rs`). O wininit cria então a Desktop
+  Default, chama o SwitchDesktop e o SetThreadDesktop e sobe o servidor RPC
+  de pipe nomeado `\PIPE\InitShutdown` (a porta de conclusão e os modos de
+  notificação de um arquivo de driver, `io/completion/file_port.rs`). O
+  CreateProcessW do services.exe chega ao NtCreateUserProcess com o bit
+  0x200 que o kernelbase liga em toda criação sem CREATE_SUSPENDED (no
+  19041 ele só escolhe o OwnerProcessId, `ps/create_context.rs`), e o
+  BaseSrvCreateProcess do csrss lê a ProcessConsoleHostProcess (o
+  OwnerProcessId) e a ProcessSequenceNumber do processo novo
+  (`ps/user/syscalls_core.rs`). Ali o caminho para: o CsrImpersonateClient
+  do csrss não acha a thread CSR do cliente no TEB.CsrClientThread e o
+  pedido volta STATUS_BAD_IMPERSONATION_LEVEL, o kernelbase termina o
+  services.exe e o wininit sai com ERROR_BAD_IMPERSONATION_LEVEL. O smss da
+  sessão 1 cria o csrss e o winlogon.exe (o NtOpenSection relativo ao
+  `\KnownDlls`, aberto pela tabela do Object Manager, e o powrprof.dll e o
+  imm32.dll no volume); o NtUserInitialize do csrss da sessão 1 volta com
+  sucesso, e o RegisterLogonProcess do winlogon fica no
+  LRPC_CASSOCIATION::OpenSecurityContext do msrpc.sys: o pacote vai para a
+  IOCP do msrpc, mas a única thread de trabalho dele, parada de novo no
+  ZwRemoveIoCompletionEx depois de atender o wininit, não volta a rodar
+  (o KTHREAD dela fica Running, fora da CPU, na troca da espera explícita).
+  O marcador `WINSTA0_OK` (`initial_process::desktop_opened`) sai quando o
+  wininit.exe tem as Desktops Winlogon e Default da WinSta0, abertas pela
+  ParseProcedure da WindowStation.
 - **As portas LPC de modo usuário** (`alpc/lpc_ports.rs` sobre
   `alpc/server.rs`, adaptadores em `ps/user/lpc.rs`): como no 19041, os
   serviços do LPC antigo são finos sobre o ALPC, e uma porta LPC é uma ALPC

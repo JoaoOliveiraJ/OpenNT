@@ -231,6 +231,13 @@ comando = "cargo xtask test-boot BASICDISPLAY_OK 600000 --initial-process=smss -
 descricao = "Com o smss real e --display=basic, o boot deixa o vídeo de boot do carregador (o modo VBE 1024x768x32 com framebuffer linear, pelo BIOS de vídeo emulado) e o BasicDisplay.sys sobe pelo PnP sobre o dxgkrnl.sys. Quando o csrss.exe real chama o NtUserInitialize, o win32k.sys anuncia a sessão (watchdog!SMgrNotifySessionChange -> DxgkNotifySessionStateChange -> DpiSessionCreateCallback) e o dxgkrnl inicia o adaptador: o DxgkDdiStartDevice do BasicDisplay usa o framebuffer do vídeo de boot (SystemBootGraphicsInformation) e o serviço de BDD do dxgkrnl (o DriverName \\Driver\\BasicDisplay), e o DpiFdoStartAdapter cria o \\Device\\Video0 e habilita a interface de chegada de dispositivo de vídeo: ADAPTER_STARTED. Depois o InitVideo do win32k enumera o \\Device\\Video0 e, como a sessão 0 é a de serviços, monta a configuração de exibição sobre o dispositivo desconectado do win32k (\\Device\\Disc, pela chave Services\\TSDDD\\Device0 da instalação); o InitUserScreen termina e o NtUserInitialize do csrss volta com sucesso: USER_INITIALIZED. Depois disso o csrss para no NtCreatePort da \\Windows\\SbApiPort (as portas LPC de servidor em modo usuário ainda não existem), fora da janela do teste."
 
 [[teste]]
+id = "winsta0"
+titulo = "WinSta0 e Desktops do wininit.exe real"
+marcador = "WINSTA0_OK"
+comando = "cargo xtask test-boot WINSTA0_OK 900000 --initial-process=smss --display=basic --build-dir=build/winsta0 --smp=1 --expect=USER_INITIALIZED \"--expect=criou services.exe\""
+descricao = "Com o smss real e --display=basic, o csrss.exe da sessão 0 sobe a \\Windows\\SbApiPort e o smss cria o wininit.exe, que registra o processo de logon (o RegisterLogonProcess do win32k pelo RPC de kernel do msrpc.sys) e cria a WinSta0 pelo NtUserCreateWindowStation. O NtUserCreateDesktopEx da Desktop Winlogon manda mensagens à thread da Desktop do csrss, que as recebe pela porta de conclusão da fila de mensagens dela (o pacote de espera do evento da fila alimenta a IOCP que o win32k espera com KeWaitForMultipleObjects; o corpo do IoCompletion é uma KQUEUE); o xxxCreateDisconnectDesktop cria a Desktop Disconnect e a abre no csrss em KernelMode com os direitos fora do tipo descartados, como o ObpCreateHandle. O wininit cria a Desktop Default (WINSTA0_OK), chama o SwitchDesktop, sobe o servidor RPC de pipe nomeado \\PIPE\\InitShutdown (a porta de conclusão e os modos de notificação do arquivo do npfs.sys) e cria o services.exe real pelo CreateProcessW, com o BaseSrvCreateProcess do csrss atendido (ProcessConsoleHostProcess e ProcessSequenceNumber)."
+
+[[teste]]
 id = "pagefile"
 titulo = "Arquivo de paginação do smss.exe real e pressão de memória"
 marcador = "PAGEFILE_OK"
@@ -1477,9 +1484,9 @@ notas = "Uma suíte planejada conta como pronta quando o arquivo de teste de mes
 # faz (uma linha: o que funciona) e para (opcional: onde para).
 
 [marco]
-atual = "O NtUserInitialize do csrss.exe real volta com sucesso: o dxgkrnl.sys inicia o BasicDisplay.sys pela sessão do win32k e o InitVideo da sessão 0 monta a configuração de exibição sobre o dispositivo desconectado do win32k."
-teste = "win32k-display"
-proximo = "O NtUserCreateDesktopEx da Desktop Winlogon voltar (a thread da Desktop do csrss responder às mensagens do xxxCreateDesktopEx do wininit e do xxxSwitchDesktop da RawInputThread), a Desktop Default (WINSTA0_OK) e depois as Desktops do winlogon.exe da sessão 1 com o primeiro desenho do win32k no framebuffer."
+atual = "O wininit.exe real cria a WinSta0 e as Desktops Winlogon, Disconnect e Default (as mensagens do win32k acordam a thread da Desktop do csrss pela porta de conclusão da fila de mensagens), chama o SwitchDesktop e cria o services.exe real."
+teste = "winsta0"
+proximo = "O BaseSrvCreateProcess do csrss aceitar o services.exe (o CsrImpersonateClient sem a thread CSR do cliente devolve STATUS_BAD_IMPERSONATION_LEVEL) e a thread de trabalho do msrpc.sys voltar a rodar para o RegisterLogonProcess do winlogon.exe da sessão 1, que então cria as Desktops dele e desenha no framebuffer."
 
 [[roda]]
 nome = "O smss.exe cria o csrss.exe"
@@ -1498,7 +1505,14 @@ nome = "Adaptador de vídeo iniciado"
 grupo = "marco"
 teste = "win32k-display"
 faz = "Com o BasicDisplay.sys sobre o dxgkrnl.sys, a sessão do win32k faz o dxgkrnl iniciar o adaptador, que usa o framebuffer VBE 1024x768 e cria o \\Device\\Video0; o InitVideo da sessão 0 termina e o NtUserInitialize do csrss volta com sucesso."
-para = "O csrss segue: cria a \\Windows\\SbApiPort, o smss executa o wininit.exe e o winlogon.exe da sessão 1, o wininit cria a WinSta0 e a Desktop Winlogon, e o NtUserCreateDesktopEx não volta (o wininit e a RawInputThread esperam a resposta da thread da Desktop do csrss)."
+para = "O csrss segue: cria a \\Windows\\SbApiPort, o smss executa o wininit.exe e o winlogon.exe da sessão 1, e o wininit cria a WinSta0 com as Desktops dele (teste winsta0)."
+
+[[roda]]
+nome = "A WinSta0 do wininit.exe"
+grupo = "marco"
+teste = "winsta0"
+faz = "O wininit.exe real registra o processo de logon, cria a WinSta0 e as Desktops Winlogon, Disconnect e Default, chama o SwitchDesktop, sobe o servidor RPC \\PIPE\\InitShutdown e cria o services.exe."
+para = "O csrss recusa o services.exe no BaseSrvCreateProcess (STATUS_BAD_IMPERSONATION_LEVEL) e o wininit sai; o RegisterLogonProcess do winlogon.exe da sessão 1 espera a thread de trabalho do msrpc.sys, e nada é desenhado no framebuffer."
 
 [[roda]]
 nome = "Tela de bugcheck do Windows 10"
@@ -1564,7 +1578,7 @@ para = "A sessão 0 é a de serviços e usa o dispositivo de exibição desconec
 [[roda]]
 nome = "Programas Win32 (.exe)"
 grupo = "marco"
-faz = "Fora o smss.exe e o csrss.exe, nenhum programa do Windows roda ainda."
+faz = "O smss.exe, o csrss.exe, o wininit.exe e o winlogon.exe reais rodam no boot com o smss; o services.exe é criado, mas o csrss o recusa."
 para = "O shell ainda não executa .exe e não há sessão de usuário."
 
 [[roda]]
