@@ -5,10 +5,14 @@
 //! comprometidas de cima para baixo como o MiCreatePebOrTeb, e pertencem ao
 //! processo até o término dele. A PEB recebe o que o loader da ntdll lê na
 //! inicialização (LdrInitializeThunk): a imagem, o apiset, as tabelas NLS,
-//! os parâmetros de heap, a versão do sistema e o subsistema da imagem. Os
+//! os parâmetros de heap, o prazo das seções críticas, a versão do sistema e
+//! o subsistema da imagem. Os
 //! offsets da PEB foram conferidos na ntdll 24H2 (NLS em +0xA0/+0xA8/+0xB0,
 //! ApiSetMap em +0x68). PEB.Ldr nasce NULL: a ntdll publica a dela.
 
+use core::sync::atomic::{AtomicI64, Ordering};
+
+use crate::ntos::cm::registry;
 use crate::ntos::inc::field::NtStruct;
 use crate::ntos::inc::types::{Eprocess, ImageDosHeader, ImageNtHeaders64, Peb, Teb};
 use crate::ntos::ke::smp;
@@ -23,6 +27,38 @@ const PEB_REGION: u64 = 0x1000;
 const PROCESS_HEAPS_OFFSET: u64 = 0x800;
 /// A TEB x64 passa de uma página (TLS, FLS e SameTebFlags vão até +0x1838).
 const TEB_REGION: u64 = 0x2000;
+
+/// O `CriticalSectionTimeout` do Session Manager, em segundos: o padrão da
+/// imagem em MmRegistryState+0x24 (0x278D00, 30 dias), que o CmControlVector
+/// sobrepõe com até quatro bytes do valor.
+const SESSION_MANAGER: &str = "\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Session Manager";
+const DEFAULT_CRITICAL_SECTION_TIMEOUT: u32 = 0x278D00;
+/// MmCriticalSectionTimeout em 100 ns (negativo, relativo); 0 enquanto não
+/// foi calculado.
+static CRITICAL_SECTION_TIMEOUT: AtomicI64 = AtomicI64::new(0);
+
+/// MmCriticalSectionTimeout (MiState+0x1560), que o MmCreatePeb copia para
+/// PEB.CriticalSectionTimeout: os segundos do registro lidos como LONG vezes
+/// -10.000.000 (o MiInitializeBootDefaults). A ntdll copia o valor para o
+/// RtlpTimeout e desliga o prazo das seções críticas quando ele passa de uma
+/// hora (RtlpTimeoutDisable); com 0, toda espera numa seção crítica disputada
+/// voltava na hora com STATUS_TIMEOUT e o aviso "RTL: Enter CriticalSection
+/// Timeout" no DbgPrint.
+pub fn critical_section_timeout() -> i64 {
+    let cached = CRITICAL_SECTION_TIMEOUT.load(Ordering::Acquire);
+    if cached != 0 {
+        return cached;
+    }
+    let mut seconds = DEFAULT_CRITICAL_SECTION_TIMEOUT.to_le_bytes();
+    if let Some(value) = registry::read_value_by_path(SESSION_MANAGER, "CriticalSectionTimeout") {
+        for (byte, &data) in seconds.iter_mut().zip(value.data.iter()) {
+            *byte = data;
+        }
+    }
+    let timeout = i32::from_le_bytes(seconds) as i64 * -10_000_000;
+    CRITICAL_SECTION_TIMEOUT.store(timeout, Ordering::Release);
+    timeout
+}
 
 /// A primeira thread (ou uma thread nova) do processo, como a TEB a descreve.
 pub struct TebDescription {
@@ -67,6 +103,7 @@ pub fn create_peb(process: u64, image_base: u64) -> Result<u64, KernelError> {
     block.oem_code_page_data.set(nls.oem);
     block.unicode_case_table_data.set(nls.unicode);
     block.number_of_processors.set(processors as u32);
+    block.critical_section_timeout.quad_part.set(critical_section_timeout());
     block.heap_segment_reserve.set(0x10_0000); // reserva do heap
     block.heap_segment_commit.set(0x2000); // commit inicial dos segmentos
     block.heap_de_commit_total_free_threshold.set(0x10000); // decommit total livre

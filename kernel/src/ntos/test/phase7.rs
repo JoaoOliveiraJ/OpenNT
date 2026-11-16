@@ -1811,6 +1811,11 @@ fn user_system_services(assert: Assert) {
             assert(teb_view.nt_tib.self_.get() == teb && teb_view.client_id.unique_thread.get() == test.thread_id && teb_view.client_id.unique_process.get() == test.process_id && teb_view.process_environment_block.get() == peb && separate && unsafe { nt::Eprocess::at(test.process) }.peb.get() == peb && peb != test.peb && teb_view.nt_tib.stack_base.get() == 0x30_0000 && teb_view.nt_tib.stack_limit.get() == 0x20_0000 && teb_view.deallocation_stack.get() == 0x20_0000, "userservices: TEB (com a pilha dada e o CLIENT_ID do processo) fora da regiao da PEB, e PEB publicada no EPROCESS");
             let identity_ldr = crate::ntos::ps::user::process_state::get(test.process).map_or(0, |identity| identity.ldr());
             assert(identity_ldr == ldr && peb_view.image_base_address.get() == image_base && peb_view.ldr.get() == 0 && peb_view.os_major_version.get() == 10 && peb_view.os_build_number.get() == 26100 && peb_view.number_of_processors.get() == crate::ntos::ke::smp::online_cpu_count() as u32 && peb_view.image_subsystem.get() == 3 && peb_view.image_subsystem_major_version.get() == 6 && peb_view.image_subsystem_minor_version.get() == 0, "userservices: campos do PEB 24H2, subsistema da imagem, PEB.Ldr para a ntdll e PEB_LDR_DATA do kernel no estado do processo");
+            // MmCriticalSectionTimeout: os 0x278D00 segundos (30 dias) do
+            // CriticalSectionTimeout vezes -10.000.000. Com o 0 de antes, a
+            // ntdll fazia toda espera numa seção crítica disputada voltar na
+            // hora com STATUS_TIMEOUT.
+            assert(peb_view.critical_section_timeout.quad_part.get() == 0x278D00 * -10_000_000i64, "userservices: PEB.CriticalSectionTimeout com o MmCriticalSectionTimeout de 30 dias");
             assert(ldr_data.initialized.get() == 1 && ldr_data.in_load_order_module_list.flink.get() == ldr_data.in_load_order_module_list.address() && ldr_data.in_initialization_order_module_list.blink.get() == ldr_data.in_initialization_order_module_list.address(), "userservices: PEB_LDR_DATA com listas vazias");
             let image_path = parameters.image_path_name.buffer.get();
             let environment = parameters.environment.get();
