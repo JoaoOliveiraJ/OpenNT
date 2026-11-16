@@ -578,7 +578,19 @@ WaitBlock[3] e a chave STATUS_TIMEOUT; a KTHREAD publica State Waiting,
 WaitReason, WaitMode, Alertable, WaitBlockList, WaitBlockCount e o
 KWAIT_STATUS_REGISTER (WaitInProgress até o despachante confirmar a saída da
 CPU, WaitCommitted depois; uma saída antes disso a marca WaitAborted e a
-thread volta direto à fila). Quem apronta é o sinal (o KiWaitTest,
+thread volta direto à fila). O despachante confirma a espera só depois de a
+thread sair da execução como Waiting (`scheduler::run_step`). Na ordem
+inversa, um sinal de outra CPU no intervalo aprontaria a thread ainda em
+execução, e o Waiting gravado depois a perderia. O KTHREAD.State de uma
+thread de kernel do escalonador só muda pelo despachante: Running ao
+retomá-la, Waiting na troca da espera, Ready pelo KiReadyThread do
+KiUnwaitThread. A espera de alertas (`ke/thread_alert.rs`), que as retiradas
+de porta de conclusão e as esperas sondadas armam, não grava esse State. O
+fim dela pode vir de outra thread: a reserva de pacotes da porta roda no
+contexto de quem publica. Um Running restaurado ali marcava a thread parada
+fora da CPU como Running, o KiReadyThread a pulava e ela nunca mais era
+escolhida (a thread de trabalho do msrpc.sys no RegisterLogonProcess do
+winlogon). Quem apronta é o sinal (o KiWaitTest,
 `wait::signal`): KeSetEvent, KePulseEvent, KeReleaseSemaphore,
 KeReleaseMutex, o vencimento de um timer (o tick vence os timers devidos,
 como a interrupção de relógio), o fim de uma thread ou de um processo
@@ -641,7 +653,12 @@ de kernel em threads de sistema e um processo de kernel em execução dado como
 pronto, que segue fora da fila e espera um prazo sem gastar CPU: pela
 contabilidade da própria thread, o KTHREAD.CycleTime não muda em nenhuma das
 amostras tiradas enquanto ela está Waiting e ela é despachada uma única vez
-(a que a acorda), o que a carga do hospedeiro não altera.
+(a que a acorda), o que a carga do hospedeiro não altera. O mesmo autoteste
+põe duas threads de sistema a repetir o ZwRemoveIoCompletionEx numa porta de
+conclusão, e depois o KeRemoveQueueEx numa KQUEUE, com uma terceira thread a
+publicar dois pacotes por rodada. Cada pacote chega a uma consumidora já
+parada, que sai da espera Ready, e as 129 entregas chegam sem nenhuma
+consumidora perdida.
 
 **Esperas que bloqueiam.** Uma thread de usuário que espera dentro de uma
 syscall deixa a CPU, como no KiSwapContext do NT, em vez de girar o
@@ -2775,14 +2792,21 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   sessão 1 cria o csrss e o winlogon.exe (o NtOpenSection relativo ao
   `\KnownDlls`, aberto pela tabela do Object Manager, e o powrprof.dll e o
   imm32.dll no volume); o NtUserInitialize do csrss da sessão 1 volta com
-  sucesso, e o RegisterLogonProcess do winlogon fica no
+  sucesso. O RegisterLogonProcess do winlogon passa pelo
   LRPC_CASSOCIATION::OpenSecurityContext do msrpc.sys: o pacote vai para a
-  IOCP do msrpc, mas a única thread de trabalho dele, parada de novo no
-  ZwRemoveIoCompletionEx depois de atender o wininit, não volta a rodar
-  (o KTHREAD dela fica Running, fora da CPU, na troca da espera explícita).
-  O marcador `WINSTA0_OK` (`initial_process::desktop_opened`) sai quando o
-  wininit.exe tem as Desktops Winlogon e Default da WinSta0, abertas pela
-  ParseProcedure da WindowStation.
+  IOCP do msrpc e acorda a única thread de trabalho dele, parada de novo no
+  ZwRemoveIoCompletionEx depois de atender o wininit (ela sai da espera
+  Ready; antes, o fim da espera de alertas a deixava Running fora da CPU).
+  O winlogon abre então as Desktops Winlogon, Disconnect e Default da
+  WinSta0 da sessão 1 e chama o NtUserSwitchDesktop (o xxxSwitchDesktop do
+  win32kfull, depois do da RawInputThread do csrss da sessão 1, que entra
+  pelo xxxCreateSystemThreads). Depois cria uma thread, carrega o kbdus.dll
+  e o winsta.dll e para ali; nada é desenhado no framebuffer. Cada abertura
+  de Desktop sai no log. O marcador `WINSTA0_OK`
+  (`initial_process::desktop_opened`) sai quando o wininit.exe tem as
+  Desktops Winlogon e Default da WinSta0, abertas pela ParseProcedure da
+  WindowStation, e o `WINLOGON_DESKTOPS_OK` quando o winlogon.exe da sessão
+  1 tem as dele (o teste winlogon).
 - **As portas LPC de modo usuário** (`alpc/lpc_ports.rs` sobre
   `alpc/server.rs`, adaptadores em `ps/user/lpc.rs`): como no 19041, os
   serviços do LPC antigo são finos sobre o ALPC, e uma porta LPC é uma ALPC
