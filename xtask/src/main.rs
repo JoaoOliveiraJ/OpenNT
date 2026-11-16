@@ -19,7 +19,8 @@
 //! `--start-driver=NOME[,NOME...]`, `--trace-driver-api`, `--initial-process=smss`, `--storage=real|nvme`,
 //! `--display=basic`, `--windows-dir=DIR`, `--pnp-root=acpi|internal` (a raiz da árvore de
 //! dispositivos: o acpi.sys real, o padrão, ou o barramento PCI interno), `--kd=com2` (o
-//! depurador do kernel na COM2), `--shutdown-test=poweroff|reboot` (o teste do desligamento).
+//! depurador do kernel na COM2), `--shutdown-test=poweroff|reboot` (o teste do desligamento),
+//! `--usb` (também opção de máquina: a controladora xHCI com teclado e tablet USB).
 //! Fora `--release` e `--windows-dir`, elas não recompilam o kernel: vão no bloco de opções de
 //! carga da imagem de boot (`build.rs`), e o `--initial-process=smss` também troca o volume
 //! NTFS.
@@ -69,6 +70,7 @@ opcoes de build:   --release --build-dir=DIR --user-program=shell
                    --trace-driver-api --initial-process=smss --storage=real|nvme --display=basic
                    --windows-dir=DIR (binarios do Windows do bundle; padrao build/windows)
                    --pnp-root=acpi|internal (raiz da arvore de dispositivos; padrao acpi)
+                   --usb (controladora xHCI com teclado e tablet USB)
                    --kd=com2 (depurador do kernel na COM2)
                    --shutdown-test=poweroff|reboot (com --start-driver=ntfs: grava e desliga)
 opcoes de maquina: --accel=tcg|whpx --memory-mb=N --smp=N --kd-port=N
@@ -138,8 +140,9 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             pnp_root: String::new(),
             kd: String::new(),
             shutdown_test: String::new(),
+            usb: false,
         },
-        machine: MachineOptions { accelerator: "tcg".into(), memory_mb: 4096, smp: 4, kd_port: None },
+        machine: MachineOptions { accelerator: "tcg".into(), memory_mb: 4096, smp: 4, kd_port: None, usb: false },
         positional: Vec::new(),
         keys: None,
         expect: Vec::new(),
@@ -185,6 +188,10 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             "--expect-poweroff" => parsed.expect_poweroff = true,
             "--power-cycles" => parsed.power_cycles = required()?.parse().map_err(|_| "--power-cycles invalido")?,
             "--allow-reboot" => parsed.allow_reboot = true,
+            "--usb" => {
+                parsed.build.usb = true;
+                parsed.machine.usb = true;
+            }
             "--kd-port" => parsed.machine.kd_port = Some(required()?.parse().map_err(|_| "--kd-port invalido")?),
             "--script" => parsed.script = Some(required()?),
             "--connect" => parsed.connect = Some(required()?),

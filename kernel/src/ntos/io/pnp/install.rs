@@ -37,6 +37,7 @@ pub const CONTROL_SET: &str = "\\Registry\\Machine\\System\\CurrentControlSet";
 /// Tipos de valor do Registro.
 const REG_SZ: u32 = 1;
 const REG_EXPAND_SZ: u32 = 2;
+const REG_BINARY: u32 = 3;
 const REG_DWORD: u32 = 4;
 const REG_MULTI_SZ: u32 = 7;
 
@@ -53,6 +54,10 @@ pub enum RegData {
     Dword(u32),
     Text(&'static str),
     MultiText(&'static [&'static str]),
+    /// REG_BINARY (FLG_ADDREG_BINVALUETYPE).
+    Binary(&'static [u8]),
+    /// Só a chave, sem valor (FLG_ADDREG_KEYONLY).
+    KeyOnly,
 }
 
 /// Serviço de `AddService` (o `[*_Service_Inst]` do INF).
@@ -634,12 +639,12 @@ pub const ACPI_ROOT_DRIVERS: &[InfDriver] = &[
     },
 ];
 
-/// As linhas que o instalador considera neste boot: as dos INFs da caixa e,
-/// com a raiz ACPI, as do acpi.inf e do pci.inf.
+/// As linhas que o instalador considera neste boot: as dos INFs da caixa
+/// (com as da pilha USB e HID, `install_usb`) e, com a raiz ACPI, as do
+/// acpi.inf e do pci.inf.
 fn candidates() -> impl Iterator<Item = &'static InfDriver> {
     let acpi: &'static [InfDriver] = if crate::drivers::bus::acpi_stack::enabled() { ACPI_ROOT_DRIVERS } else { &[] };
-    DRIVERS.iter().chain(acpi.iter())
-}
+    DRIVERS.iter().chain(super::install_usb::USB_DRIVERS.iter()).chain(acpi.iter())}
 
 /// O driver de melhor posto para os ids: HardwareIDs na ordem, depois os
 /// CompatibleIDs (sem diferenciar maiúsculas).
@@ -692,6 +697,10 @@ fn apply_values(root: &str, values: &[RegValue]) -> Result<(), KernelError> {
             RegData::Dword(number) => write_dword(&path, value.name, number)?,
             RegData::Text(text) => write_text(&path, value.name, text)?,
             RegData::MultiText(items) => write_value(&path, value.name, REG_MULTI_SZ, multi_sz(items))?,
+            RegData::Binary(bytes) => write_value(&path, value.name, REG_BINARY, bytes.to_vec())?,
+            RegData::KeyOnly => {
+                registry::close_handle(registry::open_or_create(&path, None)?);
+            }
         }
     }
     Ok(())

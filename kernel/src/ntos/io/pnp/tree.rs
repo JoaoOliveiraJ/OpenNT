@@ -9,23 +9,31 @@
 //!    tudo ao PDO; a chave `Enum\<instância>` recebe HardwareID,
 //!    CompatibleIDs, Capabilities, UINumber, LocationInformation e
 //!    ParentIdPrefix.
-//! 2. Instalação, se a instância ainda não tem Service (`install`).
+//! 2. Instalação, se a instância ainda não tem Service (`install`); como o
+//!    nó instalado reinicia no NT, os requisitos são pedidos de novo, já com
+//!    a chave de hardware que a instalação gravou.
 //! 3. PipCallDriverAddDevice: carrega e chama o AddDevice, com o PDO, dos
 //!    LowerFilters da instância e da classe, do serviço e dos UpperFilters
 //!    da instância e da classe, nessa ordem.
 //! 4. Atribuição: FILTER_RESOURCE_REQUIREMENTS à pilha inteira com a lista
 //!    do nó, arbitragem e tradução pelos árbitros e tradutores dos drivers
-//!    de barramento acima do nó ou pelos da raiz (`arbiter`, `resources`).
+//!    de barramento acima do nó ou pelos da raiz (`arbiter`, `resources`;
+//!    as interrupções por mensagem em `message_interrupts`, com os dados de
+//!    conexão do PDO).
 //! 5. START_DEVICE com as listas bruta e traduzida; depois
 //!    QUERY_CAPABILITIES e QUERY_PNP_DEVICE_STATE à pilha.
 //! 6. PipEnumerateDevice: QUERY_DEVICE_RELATIONS(BusRelations) à pilha; os
 //!    PDOs novos voltam ao passo 1.
 //! IoInvalidateDeviceRelations de um nó desta árvore enfileira o pedido (o
 //! PnpRequestDeviceAction): `process` drena a fila até ela esvaziar, com os
-//! work items rodando entre os pedidos; fora dele, o pedido põe na fila de
-//! trabalho atrasada o PnpDeviceActionWorker, que a drena (o volume que o
-//! volmgr.sys relata quando o partmgr.sys lhe entrega uma partição, de um
-//! work item, depois de a árvore já ter sido processada).
+//! work items rodando entre os pedidos; fora dele, o pedido entrega a fila
+//! ao PnpDeviceActionWorker, que a drena (o volume que o volmgr.sys relata
+//! quando o partmgr.sys lhe entrega uma partição, de um work item, depois de
+//! a árvore já ter sido processada; as portas que o hub USB enumera). Como
+//! as threads de trabalho do sistema do NT, o worker roda numa thread de
+//! sistema (os START_DEVICE que ele manda esperam o hardware e os work items
+//! dos drivers sem ficar empilhados sobre quem pediu); antes do processo
+//! System, num work item da fila atrasada.
 
 use alloc::collections::VecDeque;
 use alloc::format;
@@ -161,7 +169,34 @@ fn request_worker() {
     worker.queued = true;
     let item = worker.item;
     drop(worker);
+    if crate::ntos::ps::process::get_system_process() != 0 {
+        let entry: extern "win64" fn(u64) = device_action_thread;
+        let started = crate::ntos::mm::kernel_address::image_address(entry as usize as u64).ok().and_then(|start| crate::ntos::ps::kernel_threads::create_system_thread(0, start, item, 0x1F_FFFF, 0, None).ok());
+        if let Some(handle) = started {
+            let _ = object_manager::close(handle as u32);
+            return;
+        }
+    }
     work_items::queue_kernel_ex_work_item(item, device_action_worker, 0);
+}
+
+/// A thread de sistema que hospeda o PnpDeviceActionWorker.
+extern "win64" fn device_action_thread(item: u64) {
+    device_action_worker(item, 0);
+}
+
+/// Drena os pedidos de reenumeração que chegaram desde o último
+/// processamento, se ninguém mais os drena agora (o worker ou `process`).
+pub fn process_pending() -> Result<(), KernelError> {
+    if core::mem::replace(&mut WORKER.lock().active, true) {
+        return Ok(());
+    }
+    let result = drain();
+    WORKER.lock().active = false;
+    if !PENDING.lock().is_empty() {
+        request_worker();
+    }
+    result
 }
 
 /// PnpDeviceActionWorker: drena os pedidos em PASSIVE_LEVEL.

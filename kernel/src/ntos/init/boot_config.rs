@@ -151,3 +151,9 @@ pub fn basic_display() -> bool {
 pub fn acpi_root() -> bool {
     value(name::PNP_ROOT) != Some("internal")
 }
+
+/// `USB` (`--usb`): a máquina tem a controladora xHCI com teclado e tablet
+/// USB, e o PnP sobe a pilha USB 3 e HID real sobre ela.
+pub fn usb() -> bool {
+    flag(name::USB)
+}

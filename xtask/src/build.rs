@@ -39,7 +39,7 @@ pub const NVME_IMAGE: &str = "nvme.img";
 const NVME_FILE: &str = "NVME.TXT";
 const NVME_FILE_DATA: &[u8] = b"Volume NTFS no disco NVMe do OpenNT.\r\n";
 
-/// As opções de um build. As de boot (do `user_program` ao `kd`, menos o
+/// As opções de um build. As de boot (do `user_program` ao `usb`, menos o
 /// `release`, o `build_dir` e o `windows_dir`) não mudam o kernel compilado:
 /// vão no bloco de opções de carga da imagem ([`BuildOptions::load_options`]).
 #[derive(Clone, Debug)]
@@ -79,6 +79,9 @@ pub struct BuildOptions {
     /// `--shutdown-test=poweroff|reboot`: o teste do desligamento depois do
     /// `--start-driver=ntfs` (vazio = sem o teste).
     pub shutdown_test: String,
+    /// `--usb`: a máquina ganha a controladora xHCI com teclado e tablet USB
+    /// e o PnP sobe a pilha USB 3 e HID do Windows sobre ela.
+    pub usb: bool,
 }
 
 impl BuildOptions {
@@ -117,6 +120,9 @@ impl BuildOptions {
         if self.console_mirror {
             words.push(String::from(name::CONSOLE_MIRROR));
         }
+        if self.usb {
+            words.push(String::from(name::USB));
+        }
         Ok(words.join(" "))
     }
 
@@ -147,6 +153,7 @@ impl BuildOptions {
             pnp_root: String::new(),
             kd: String::new(),
             shutdown_test: String::new(),
+            usb: false,
             ..self.clone()
         }
     }
@@ -371,6 +378,7 @@ mod tests {
             pnp_root: String::new(),
             kd: String::new(),
             shutdown_test: String::new(),
+            usb: false,
         }
     }
 
@@ -389,11 +397,12 @@ mod tests {
         options.trace_driver_api = true;
         options.console_mirror = true;
         options.shutdown_test = "reboot".into();
+        options.usb = true;
         let block = options.load_options_block().unwrap();
         assert_eq!(block.len(), load_options::BLOCK_SIZE);
         let text = load_options::text_of(&block).unwrap();
-        assert_eq!(text, "DEBUG DEBUGPORT=COM2 KERNELTESTSCOPE=all STARTDRIVER=NDIS,AFD INITIALPROCESS=smss DISPLAY=basic SHUTDOWNTEST=reboot TRACEDRIVERAPI CONSOLEMIRROR");
-        assert!(load_options::flag(text, load_options::DEBUG) && load_options::flag(text, "consolemirror"));
+        assert_eq!(text, "DEBUG DEBUGPORT=COM2 KERNELTESTSCOPE=all STARTDRIVER=NDIS,AFD INITIALPROCESS=smss DISPLAY=basic SHUTDOWNTEST=reboot TRACEDRIVERAPI CONSOLEMIRROR USB");
+        assert!(load_options::flag(text, load_options::DEBUG) && load_options::flag(text, "consolemirror") && load_options::flag(text, load_options::USB));
         assert_eq!(load_options::value(text, load_options::START_DRIVER), Some("NDIS,AFD"));
         assert_eq!(load_options::value(text, load_options::STORAGE), None);
         assert!(!load_options::flag(text, load_options::DEBUG_PORT));
@@ -421,6 +430,7 @@ mod tests {
         let mut driver = options();
         driver.start_driver = "ksecdd".into();
         driver.kd = "com2".into();
+        driver.usb = true;
         driver.build_dir = PathBuf::from("build/kd");
         assert_eq!(base.image_key(), driver.image_key());
         let mut smss = options();

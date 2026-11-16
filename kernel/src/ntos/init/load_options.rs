@@ -52,6 +52,8 @@ pub const PNP_ROOT: &str = "PNPROOT";
 /// `poweroff` ou `reboot`: o teste do desligamento depois do
 /// `STARTDRIVER=ntfs`.
 pub const SHUTDOWN_TEST: &str = "SHUTDOWNTEST";
+/// A pilha USB 3 e HID real sobe pelo PnP na controladora xHCI.
+pub const USB: &str = "USB";
 
 /// O valor de `NOME=valor`.
 pub fn value<'a>(text: &'a str, name: &str) -> Option<&'a str> {

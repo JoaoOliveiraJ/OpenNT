@@ -14,7 +14,9 @@
 //! raiz ACPI da árvore de dispositivos (acpi.sys, pci.sys e a pshed.dll), o
 //! banco de errata (`\SystemRoot\INF\errata.inf`), a
 //! pilha de vídeo (dxgkrnl.sys, dxgmms2.sys e o BasicDisplay.sys do
-//! repositório de drivers), os
+//! repositório de drivers), a pilha USB 3 e HID (usbxhci.sys, ucx01000.sys,
+//! usbhub3.sys, usbd.sys, hidusb.sys, hidclass.sys, hidparse.sys, kbdhid.sys
+//! e mouhid.sys), os
 //! arquivos que o vgk.sys abre pelo caminho
 //! completo, o PE do kernel e o próprio vgk.sys quando houver um: um
 //! `vgk.sys` na raiz do repositório ou o caminho em `OPENNT_VGK_SYS`.
@@ -25,8 +27,8 @@
 //! DLLs de servidor do csrss e o fecho dos imports delas (estáticos e pelos
 //! API sets do apisetschema.dll desta máquina), o wininit.exe da sessão 0
 //! com o services.exe e o lsass.exe que ele cria, e as imagens de kernel do
-//! subsistema Win32 (win32k.sys, win32kbase.sys, win32kfull.sys, com o
-//! hidparse.sys e o cdd.dll).
+//! subsistema Win32 (win32k.sys, win32kbase.sys, win32kfull.sys e o
+//! cdd.dll; o hidparse.sys que o win32kbase importa já vem com a pilha USB).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -129,6 +131,20 @@ const NTFS_FILES: &[(&str, &str)] = &[
     ("ACPI.SYS", "System32/drivers/acpi.sys"),
     ("PCI.SYS", "System32/drivers/pci.sys"),
     ("PSHED.DLL", "System32/pshed.dll"),
+    // A pilha USB 3 e HID (`--usb`): o driver da controladora xHCI com a
+    // extensão de classe UCX (biblioteca de classe do KMDF, carregada pela
+    // WdfLdr), o hub USB 3 com a biblioteca USBD, o minidriver HID de USB
+    // com a classe HID e o interpretador de relatórios, e os drivers HID de
+    // teclado e mouse (o kbdclass e o mouclass vêm do bundle).
+    ("USBXHCI.SYS", "System32/drivers/USBXHCI.SYS"),
+    ("UCX01000.SYS", "System32/drivers/Ucx01000.sys"),
+    ("USBHUB3.SYS", "System32/drivers/USBHUB3.SYS"),
+    ("USBD.SYS", "System32/drivers/usbd.sys"),
+    ("HIDUSB.SYS", "System32/drivers/hidusb.sys"),
+    ("HIDCLASS.SYS", "System32/drivers/hidclass.sys"),
+    ("HIDPARSE.SYS", "System32/drivers/hidparse.sys"),
+    ("KBDHID.SYS", "System32/drivers/kbdhid.sys"),
+    ("MOUHID.SYS", "System32/drivers/mouhid.sys"),
     // O banco do Errata Manager: o carregador entrega a imagem do
     // \SystemRoot\INF\errata.inf ao kernel, que a interpreta no boot.
     ("Windows/INF/errata.inf", "INF/errata.inf"),
@@ -308,14 +324,14 @@ const SMSS_PROGRAMS: &[&str] = &[
 
 /// As imagens de kernel do caminho do smss (`--initial-process=smss`): o
 /// win32k.sys que o smss da sessão carrega pela classe 38, o win32kbase.sys
-/// e o win32kfull.sys que ele carrega como imagens de sessão, o hidparse.sys
-/// que vem antes do win32kfull e o cdd.dll (o driver de exibição do GDI).
+/// e o win32kfull.sys que ele carrega como imagens de sessão e o cdd.dll (o
+/// driver de exibição do GDI); o hidparse.sys que vem antes do win32kfull
+/// está no volume de todo boot (`NTFS_FILES`).
 /// (caminho no volume, origem no Windows).
 const SMSS_KERNEL_IMAGES: &[(&str, &str)] = &[
     ("WIN32K.SYS", "System32/win32k.sys"),
     ("WIN32KBASE.SYS", "System32/win32kbase.sys"),
     ("WIN32KFULL.SYS", "System32/win32kfull.sys"),
-    ("HIDPARSE.SYS", "System32/drivers/hidparse.sys"),
     ("CDD.DLL", "System32/cdd.dll"),
 ];
 

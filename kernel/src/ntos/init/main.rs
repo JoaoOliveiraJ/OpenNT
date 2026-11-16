@@ -31,6 +31,9 @@ fn pump_keyboard_data(records: &[u8]) {
     for record in records.chunks_exact(size_of::<KeyboardInputData>()) {
         let make_code = field(record, offset_of!(KeyboardInputData, make_code));
         let flags = field(record, offset_of!(KeyboardInputData, flags));
+        if crate::drivers::bus::usb_stack::enabled() {
+            crate::drivers::bus::usb_stack::key_received(make_code, flags);
+        }
         let scancode = if flags & 1 != 0 { make_code as u8 | 0x80 } else { make_code as u8 };
         if let Some(character) = keyboard::decode(scancode) {
             message_channels::send("kbd", character);
@@ -42,17 +45,24 @@ fn pump_keyboard_data(records: &[u8]) {
 /// canal `kbd` (fluxo nanokernel: driver -> IPC -> shell).
 ///
 /// Mantém um READ pendente em `\Device\KeyboardClass0` (i8042prt.sys +
-/// kbdclass.sys reais) com um evento de notificação. Sem a pilha real (os
-/// binários não vieram no build), lê do driver PS/2 interno: IRQ1 -> ring
-/// buffer -> decode -> canal.
+/// kbdclass.sys reais; com `--usb`, o kbdclass sobre o kbdhid.sys, o
+/// teclado USB que recebe a entrada da máquina) com um evento de
+/// notificação. Sem a pilha real (os binários não vieram no build), lê do
+/// driver PS/2 interno: IRQ1 -> ring buffer -> decode -> canal.
 async fn keyboard_service() -> u32 {
     use crate::ntos::io::io_manager::{self, IoParams, IoResult};
     use crate::ntos::inc::types::{Irp, NtStruct};
     use crate::ntos::ke::dispatcher;
     use crate::ntos::mm::guest_memory as guest;
-    let opened = io_manager::open_device("\\Device\\KeyboardClass0", false);
+    let usb_keyboard = crate::drivers::bus::usb_stack::keyboard_class_device();
+    let class_device = usb_keyboard.clone().unwrap_or_else(|| alloc::string::String::from("\\Device\\KeyboardClass0"));
+    // Quem lê teclas abre com FILE_READ_DATA: o kbdhid só começa a ler os
+    // relatórios da coleção HID numa abertura com acesso de leitura.
+    let create = io_manager::CreateParameters { access: 0x1, disposition: 1, ..Default::default() };
+    let opened = io_manager::open_device_file(&class_device, "", Some(create), false);
+    let status = opened.as_ref().map_or(u32::MAX, |opened| opened.status as u32);
     let Some(handle) = opened.ok().filter(|opened| opened.status == 0).map(|opened| opened.handle) else {
-        debug_print!("[kbd] KeyboardClass0 indisponivel; lendo do driver PS/2 interno (IRQ1 + ring buffer)");
+        debug_print!("[kbd] {} indisponivel (status {:#x}); lendo do driver PS/2 interno (IRQ1 + ring buffer)", class_device, status);
         loop {
             while let Some(character) = keyboard::poll_key() {
                 message_channels::send("kbd", character);
@@ -60,7 +70,10 @@ async fn keyboard_service() -> u32 {
             scheduler::yield_now().await;
         }
     };
-    debug_print!("[kbd] lendo teclas do driver real (i8042prt+kbdclass)");
+    match &usb_keyboard {
+        Some(device) => debug_print!("[kbd] lendo teclas do driver real (kbdhid+kbdclass, {})", device),
+        None => debug_print!("[kbd] lendo teclas do driver real (i8042prt+kbdclass)"),
+    }
     let event = guest::alloc_bytes(0x18);
     let zero_timeout = guest::alloc_bytes(8); // LARGE_INTEGER 0
     let mut pending: Option<io_manager::IoRequest> = None;

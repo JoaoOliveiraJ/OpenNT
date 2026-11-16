@@ -131,4 +131,8 @@ pub fn init() {
         }
         crate::drivers::bus::device_tree::build();
     }
+    // `--usb`: a pilha USB 3 e HID real sobe pelo PnP na controladora xHCI.
+    if crate::drivers::bus::usb_stack::enabled() {
+        crate::drivers::bus::usb_stack::initialize();
+    }
 }

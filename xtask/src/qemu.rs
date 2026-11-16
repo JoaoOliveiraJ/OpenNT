@@ -29,6 +29,9 @@ pub struct MachineOptions {
     pub smp: u32,
     /// Porta TCP da COM2 (o depurador do kernel), se houver.
     pub kd_port: Option<u16>,
+    /// `--usb`: a controladora xHCI do QEMU (qemu-xhci, PCI 1B36:000D) com um
+    /// teclado e um tablet USB nas portas dela.
+    pub usb: bool,
 }
 
 /// A COM2 como servidor TCP local, depois da COM1 (a ordem dos `-serial`
@@ -153,6 +156,9 @@ fn machine_arguments(disks: &Disks, machine: &MachineOptions, no_reboot: bool) -
             "-device".to_string(),
             "nvme,serial=opennt,drive=nvm".to_string(),
         ]);
+    }
+    if machine.usb {
+        arguments.extend(["-device", "qemu-xhci,id=xhci", "-device", "usb-kbd,bus=xhci.0", "-device", "usb-tablet,bus=xhci.0"].map(String::from));
     }
     arguments
 }

@@ -366,7 +366,18 @@ fn tree_support(assert: Assert) {
     let before = tree::pending_requests();
     let single = tree::invalidate_relations(queued_device, 5) && tree::pending_requests() == before + 1;
     let removal = tree::invalidate_relations(queued_device, 3) && tree::pending_requests() == before + 1;
-    crate::ntos::io::work_items::run_queue();
+    // O worker roda numa thread de sistema (antes do processo System, num
+    // work item): a espera dá a vez a ele.
+    let interval = guest::alloc_bytes(8);
+    for _ in 0..200 {
+        crate::ntos::io::work_items::run_queue();
+        if tree::pending_requests() == 0 {
+            break;
+        }
+        guest::write64(interval, (-50_000i64) as u64);
+        let _ = crate::ntos::ke::timer::delay_execution_thread(interval, 0, false);
+    }
+    guest::free_bytes(interval);
     let drained = tree::pending_requests() == 0;
     let _ = devnode::remove(queued_device);
     assert(single && removal && drained, "pnp-storage: SingleBusRelations enfileira a reenumeracao e o PnpDeviceActionWorker a drena");
