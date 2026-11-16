@@ -721,6 +721,7 @@ pub fn init() {
     crate::ntos::ps::user::process::init();
     crate::ntos::ps::user::user_apc::init();
     crate::ntos::ke::user_callback::init();
+    crate::ntos::kd::debug_filter::register_user_services();
     crate::ntos::etw::syscalls::init();
     // Os tipos de objeto que o executive cria no boot (idempotente).
     crate::ntos::ex::win32::initialize();

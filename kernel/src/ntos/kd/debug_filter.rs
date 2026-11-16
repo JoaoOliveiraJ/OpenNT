@@ -15,6 +15,10 @@
 //!   (DPFLTR_DEFAULT_ID);
 //! - Level <= 31 vira o bit 1 << Level, acima disso já é a máscara;
 //! - State TRUE liga os bits, FALSE desliga; sempre STATUS_SUCCESS.
+//!
+//! A consulta (NtQueryDebugFilterState, KdpPrint) escolhe a máscara de outro
+//! jeito: um ComponentId fora da tabela, o -1 inclusive, vai para
+//! DPFLTR_DEFAULT_ID com o nível 3 (`print_enabled`).
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -67,4 +71,28 @@ pub fn set_filter_state(component: u32, level: u32, state: bool) -> u32 {
 /// Valor atual da máscara de um componente (as mesmas regras de seleção).
 pub fn component_mask(component: u32) -> u32 {
     mask_cell(component).load(Ordering::Acquire)
+}
+
+/// O filtro do KdpPrint (0x9b96c8) e do NtQueryDebugFilterState
+/// (0x364540): um ComponentId abaixo de 0x9C usa a própria máscara com o
+/// Level pedido; qualquer outro (o -1 do DbgPrint inclusive) usa a de
+/// DPFLTR_DEFAULT_ID com o nível 3. O texto passa quando Kd_WIN2000_Mask ou
+/// a máscara do componente tem o bit do nível.
+pub fn print_enabled(component: u32, level: u32) -> bool {
+    let (index, level) = if (component as usize) < COMPONENT_COUNT { (component as usize, level) } else { (DEFAULT_COMPONENT, 3) };
+    let mask = level_mask(level);
+    WIN2000_MASK.load(Ordering::Acquire) & mask != 0 || COMPONENT_MASKS[index].load(Ordering::Acquire) & mask != 0
+}
+
+/// NtQueryDebugFilterState(ComponentId, Level): TRUE ou FALSE pelo filtro,
+/// sem outro status. O DbgPrintEx da ntdll pergunta antes de formatar o
+/// texto; um status de erro valeria como TRUE e todo texto iria ao
+/// `int 0x2D`.
+fn nt_query_debug_filter_state(component: u64, level: u64, _: u64, _: u64, _rsp: u64) -> Result<u32, crate::rtl::KernelError> {
+    Ok(print_enabled(component as u32, level as u32) as u32)
+}
+
+/// Registra o serviço NtQueryDebugFilterState.
+pub fn register_user_services() {
+    crate::ntos::ps::user::state::register_handler("NtQueryDebugFilterState", nt_query_debug_filter_state);
 }
