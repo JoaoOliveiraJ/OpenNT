@@ -514,6 +514,12 @@ fn system_state(assert: Assert) {
     let _ = status("RtlSetActiveConsoleId", &[7]);
     let _ = status("RtlSetConsoleSessionForegroundProcessId", &[0x1234]);
     let written = shared.active_console_id.get() == 7 && shared.console_session_foreground_process_id.get() == 0x1234;
+    // O RtlGetActiveConsoleId lê o mesmo campo (o win32k da sessão 1 grava 1
+    // e o dxgkrnl lê de volta), também o -1 da sessão 0 sem vídeo.
+    let read_back = status("RtlGetActiveConsoleId", &[]) == 7;
+    shared.active_console_id.set(0xFFFF_FFFF);
+    let read_none = status("RtlGetActiveConsoleId", &[]) == 0xFFFF_FFFF;
+    assert(read_back && read_none, "rtl: RtlGetActiveConsoleId le o ActiveConsoleId da KUSER_SHARED_DATA");
     shared.active_console_id.set(console);
     shared.console_session_foreground_process_id.set(foreground);
     assert(written && status("RtlGetCurrentServiceSessionId", &[]) == 0, "rtl: RtlSetActiveConsoleId/RtlSetConsoleSessionForegroundProcessId gravam a KUSER_SHARED_DATA e o host tem sessao de servico 0");

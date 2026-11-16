@@ -811,9 +811,10 @@ pub mod io_diagnostics {
         Ok(0)
     }
 
-    /// RtlGetActiveConsoleId: a sessão de console ativa é a 0.
+    /// RtlGetActiveConsoleId: a sessão de console ativa
+    /// (`rtl/shared_data.rs`).
     fn get_active_console_id(_: &Call) -> Result<u64, KernelError> {
-        Ok(0)
+        Ok(crate::ntos::rtl::shared_data::active_console_id()? as u64)
     }
 
     /// ZwFlushBuffersFileEx: as escritas do OpenNT já são síncronas; valida o

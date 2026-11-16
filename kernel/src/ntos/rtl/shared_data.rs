@@ -47,6 +47,20 @@ pub fn query_elevation_flags(output: &Field<u32>) -> u32 {
     0
 }
 
+/// RtlGetActiveConsoleId (ntoskrnl 19041 rva 0x34adc0): fora de um silo de
+/// servidor, o KUSER_SHARED_DATA.ActiveConsoleId; dentro dele, o do
+/// SILO_USER_SHARED_DATA do silo da thread. O valor é o que o win32k de cada
+/// sessão grava pelo RtlSetActiveConsoleId: 0 no DriverEntry da sessão 0, -1
+/// quando o InitVideo dela fecha os dispositivos de vídeo e o id da primeira
+/// sessão interativa no DriverEntry dela. O dxgkrnl e o watchdog só entregam
+/// o vídeo físico à sessão que bate com esse id.
+pub fn active_console_id() -> Result<u32, KernelError> {
+    match silo::user_shared_data(silo::current_server_silo()) {
+        Some(data) => Ok(data.active_console_id.get()),
+        None => Ok(shared_user_data::data().ok_or_else(|| KernelError::new("KUSER_SHARED_DATA ausente"))?.active_console_id.get()),
+    }
+}
+
 /// RtlSetActiveConsoleId(ConsoleId).
 pub fn set_active_console_id(console: u32) -> Result<(), KernelError> {
     match silo::user_shared_data(silo::current_server_silo()) {
