@@ -17,7 +17,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::hal::{cpu, physical};
 use crate::hal::amd64::native_call;
-use crate::ntos::inc::types::{Kpcr, NtStruct};
+use crate::ntos::inc::types::{Kpcr, Kprcb, NtStruct};
 use crate::ntos::mm::paging::{self, MapOptions};
 use crate::ntos::mm::{kernel_address, memory_map as map, pfn};
 use crate::rtl::{KernelError, SpinLock};
@@ -295,12 +295,20 @@ pub fn get_pcr_address() -> u64 {
     ADDRESS.load(Ordering::Acquire)
 }
 
-/// KeQueryPrcbAddress: entrada de KiProcessorBlock — a KPRCB embutida na
-/// KPCR de cada processador que tem uma (o OpenNT publica a do processador
-/// de boot); sem KPRCB, NULL.
+/// KiProcessorBlock[number]: a KPRCB embutida na KPCR do processador
+/// `number`, entre os que estão online (KeNumberProcessors); None para os
+/// demais.
+pub fn processor_block(number: u32) -> Option<&'static Kprcb> {
+    if number as usize >= super::smp::online_cpu_count() {
+        return None;
+    }
+    all().into_iter().map(|kpcr| &kpcr.prcb).find(|prcb| prcb.number.get() == number)
+}
+
+/// KeQueryPrcbAddress: a entrada de KiProcessorBlock do processador; sem
+/// KPRCB, NULL.
 pub fn query_prcb_address(number: u32) -> u64 {
-    let base = get_pcr_address();
-    if number == 0 && base != 0 { base + layout::PRCB } else { 0 }
+    processor_block(number).map_or(0, |prcb| prcb.address())
 }
 
 /// Todas as KPCRs publicadas (a do BSP primeiro).

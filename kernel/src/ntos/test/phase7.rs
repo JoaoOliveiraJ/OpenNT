@@ -2034,9 +2034,12 @@ fn user_syscalls_core(assert: Assert) {
     guest::write64(rsp + 0x30, info);
     guest::write32(string, 4);
     let topology = call("NtQuerySystemInformationEx", 107, string, 4, buffer);
-    assert(topology == 0 && { let relation = unsafe { nt::SystemLogicalProcessorInformationEx::at(buffer) }; relation.relationship.get() == 4 && relation.group.active_group_count.get() == 1 && relation.group.group_info[0].active_processor_count.get() == crate::ntos::ke::smp::online_cpu_count() as u8 } && call("NtQuerySystemInformationEx", 107, string, 8, buffer) == 0xC000_000D, "usercore: topologia do grupo 0 e entrada invalida");
+    assert(topology == 0 && { let relation = unsafe { nt::SystemLogicalProcessorInformationEx::at(buffer) }; relation.relationship.get() == 4 && relation.group.active_group_count.get() == 1 && relation.group.group_info[0].active_processor_count.get() == crate::ntos::ke::smp::online_cpu_count() as u8 } && call("NtQuerySystemInformationEx", 107, string, 2, buffer) == 0xC000_000D, "usercore: topologia do grupo 0 e entrada curta (menos de 4 bytes) invalida");
     guest::write32(string, 9);
-    assert(call("NtQuerySystemInformationEx", 107, string, 4, buffer) == 0xC000_0003, "usercore: relacao de topologia invalida");
+    // Como o ExpQuerySystemInformation: a relação vai direto ao
+    // KeQueryLogicalProcessorRelationship, que sem registros devolve
+    // STATUS_UNSUCCESSFUL.
+    assert(call("NtQuerySystemInformationEx", 107, string, 4, buffer) == 0xC000_0001, "usercore: relacao de topologia desconhecida sem registros");
     // Erro fatal e informações do processo.
     guest::write64(rsp + 0x30, info);
     guest::write64(string, 0x1234);
@@ -4997,6 +5000,7 @@ pub fn run(assert: Assert) {
     crate::ntos::test::multiprocess::address_space::run(assert);
     crate::ntos::test::multiprocess::handles::run(assert);
     crate::ntos::test::multiprocess::per_cpu::run(assert);
+    crate::ntos::test::multiprocess::processor_identity::run(assert);
     crate::ntos::test::multiprocess::ipi_stall::run(assert);
     crate::ntos::test::multiprocess::current_thread::run(assert);
     crate::ntos::test::multiprocess::native_interleave::run(assert);

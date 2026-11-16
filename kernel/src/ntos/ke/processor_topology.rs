@@ -1,37 +1,33 @@
-//! Topologia lógica dos processadores: núcleos, pacotes, caches e o maior
-//! line size (KeQueryLogicalProcessorRelationship e
+//! Topologia lógica dos processadores: núcleos, pacotes e caches
+//! (KeQueryLogicalProcessorRelationship, o SystemLogicalProcessorInformation
+//! do KeBuildLogicalProcessorSystemInformation e
 //! KeGetRecommendedSharedDataAlignment).
 //!
-//! Segue o ntoskrnl 19041: o KiSetFeatureBits deriva LogicalProcessorsPerCore
-//! e CoresPerPhysicalProcessor do CPUID (níveis 0x1F/0xB, CPUID 1/4 legado, ou
-//! 0x80000008/0x8000001E na AMD) e o KiInitializeKernel agrupa os
-//! InitialApicId sob -(LogicalPerCore) e -(Cores*LogicalPerCore). Os
-//! descritores de cache vêm do KiSetStandardizedCacheInformation (folha 4, ou
-//! 0x8000001D na AMD com TopoExt) ou do KiSetCacheInformationAmd legado
-//! (0x80000005/0x80000006), e KeLargestCacheLine parte de 64 e sobe ao maior
-//! LineSize dos caches L2+ unificados ou de dados (KiSetCacheInformation).
-//!
-//! O CPUID roda no processador corrente; os demais entram pelos APIC ids da
-//! MADT (`smp`). Um grupo e um nó NUMA (sem SRAT nem mais de 64 CPUs);
-//! EfficiencyClass 0 (núcleos homogêneos).
+//! Os descritores de cache vêm do KiSetStandardizedCacheInformation (folha
+//! 4, ou 0x8000001D na AMD com TopoExt) ou do KiSetCacheInformationAmd
+//! legado (0x80000005/0x80000006); `processor_identity` os grava na KPRCB de
+//! cada processador, com os conjuntos que o KiInitializeKernel monta
+//! (PackageProcessorSet, CoreProcessorSet, CacheProcessorMask). As consultas
+//! leem essas KPRCBs, como o binário. Um grupo e um nó NUMA (sem SRAT nem
+//! mais de 64 CPUs); EfficiencyClass 0 (núcleos homogêneos).
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
 
-use super::{processor_group, processor_information, smp};
+use super::processor_identity::vendor;
+use super::{pcr, processor_group, processor_identity, smp};
 use crate::hal::cpu;
 use crate::ntos::inc::status::{STATUS_INVALID_PARAMETER, STATUS_SUCCESS, STATUS_UNSUCCESSFUL};
-use crate::ntos::inc::types::{Field, GroupAffinity, NtStruct, ProcessorGroupInfo, ProcessorNumber, SystemLogicalProcessorInformationEx};
+use crate::ntos::inc::types::{CacheDescriptor, Field, GroupAffinity, Kprcb, NtStruct, ProcessorGroupInfo, ProcessorNumber, SystemLogicalProcessorInformationEx};
 use crate::ntos::mm::guest_memory as guest;
 use crate::rtl::KernelError;
 
 const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
 /// KiMaximumGroups = KiActiveGroups = KeNumberNodes no OpenNT.
 const GROUP_COUNT: u16 = 1;
-/// Valor inicial de KeLargestCacheLine no .data do ntoskrnl.
-const DEFAULT_LARGEST_CACHE_LINE: u32 = 64;
 /// KPRCB.Cache[5].
 const MAXIMUM_CACHES: usize = 5;
+/// sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION).
+const LEGACY_RECORD_SIZE: u64 = 0x20;
 
 /// LOGICAL_PROCESSOR_RELATIONSHIP.
 pub mod relation {
@@ -53,7 +49,7 @@ pub mod cache_type {
 
 /// Quem compartilha um cache (KPRCB.CacheProcessorMask).
 #[derive(Clone, Copy)]
-enum Sharing {
+pub(super) enum Sharing {
     /// Máscara 0 na KPRCB: o registro sai só com o próprio processador.
     Own,
     /// Processadores cujo InitialApicId coincide sob a máscara.
@@ -64,22 +60,13 @@ enum Sharing {
 
 /// CACHE_DESCRIPTOR mais o compartilhamento.
 #[derive(Clone, Copy)]
-struct Cache {
-    level: u8,
-    associativity: u8,
-    line_size: u16,
-    size: u32,
-    kind: u32,
-    sharing: Sharing,
-}
-
-static LARGEST_CACHE_LINE: AtomicU32 = AtomicU32::new(0);
-/// Valor inicial de KiLargestCacheSize no .data do ntoskrnl.
-const DEFAULT_LARGEST_CACHE_SIZE: u32 = 0x10000;
-static LARGEST_CACHE_SIZE: AtomicU32 = AtomicU32::new(0);
-
-fn is_amd(vendor: &str) -> bool {
-    matches!(vendor, "AuthenticAMD" | "HygonGenuine")
+pub(super) struct Cache {
+    pub(super) level: u8,
+    pub(super) associativity: u8,
+    pub(super) line_size: u16,
+    pub(super) size: u32,
+    pub(super) kind: u32,
+    pub(super) sharing: Sharing,
 }
 
 /// bsr(value), value != 0.
@@ -155,85 +142,17 @@ fn amd_legacy_caches(family: u16) -> Vec<Cache> {
     caches
 }
 
-/// KiSetCacheInformation: AMD por 0x8000001D (TopoExt) ou legado; os demais
-/// fabricantes pela folha 4 quando 4 <= máximo <= 0x7FFFFFFF.
-fn cache_descriptors(amd: bool, family: u16) -> Vec<Cache> {
-    if amd {
-        if cpu::cpuid(0x8000_0001)[2] & (1 << 22) != 0 {
-            return standardized_caches(0x8000_001D);
-        }
-        return amd_legacy_caches(family);
+/// KiSetCacheInformation: AMD por 0x8000001D (TopoExt) ou legado; Intel e
+/// Centaur pela folha 4 quando 3 <= máximo <= 0x7FFFFFFF
+/// (KiSetCacheInformationIntel); outro fabricante é UNSUPPORTED_PROCESSOR
+/// no NT, e aqui fica sem caches.
+pub(super) fn cache_descriptors(cpu_vendor: u8, family: u16) -> Vec<Cache> {
+    match cpu_vendor {
+        vendor::AMD if cpu::cpuid(0x8000_0001)[2] & (1 << 22) != 0 => standardized_caches(0x8000_001D),
+        vendor::AMD => amd_legacy_caches(family),
+        vendor::INTEL | vendor::CENTAUR if (3..=0x7FFF_FFFF).contains(&cpu::cpuid(0)[0]) => standardized_caches(4),
+        _ => Vec::new(),
     }
-    let maximum = cpu::cpuid(0)[0];
-    if (4..=0x7FFF_FFFF).contains(&maximum) { standardized_caches(4) } else { Vec::new() }
-}
-
-/// KeLargestCacheLine: 64, ou o maior LineSize dos caches L2+ unificados ou
-/// de dados.
-fn largest_cache_line(caches: &[Cache]) -> u32 {
-    caches
-        .iter()
-        .filter(|cache| cache.level >= 2 && (cache.kind == cache_type::UNIFIED || cache.kind == cache_type::DATA))
-        .fold(DEFAULT_LARGEST_CACHE_LINE, |largest, cache| largest.max(cache.line_size as u32))
-}
-
-/// KiSetFeatureBits: (LogicalProcessorsPerCore, CoresPerPhysicalProcessor).
-fn topology_counts(amd: bool) -> (u32, u32) {
-    if amd {
-        let maximum_extended = cpu::cpuid(0x8000_0000)[0];
-        if maximum_extended < 0x8000_0008 {
-            return (1, 1);
-        }
-        let ecx = cpu::cpuid_subleaf(0x8000_0008, 0)[2];
-        let mut shift = (ecx >> 12) & 0xF;
-        if shift == 0 {
-            shift = highest_bit((ecx & 0xFF) * 2 + 1);
-        }
-        let mut cores = 1u32 << shift;
-        let mut per_core = 1;
-        if maximum_extended >= 0x8000_001E && cpu::cpuid(0x8000_0001)[2] & (1 << 22) != 0 {
-            per_core = ((cpu::cpuid_subleaf(0x8000_001E, 0)[1] >> 8) & 0xFF) + 1;
-            cores /= per_core;
-        }
-        return (per_core, cores.max(1));
-    }
-    let maximum = cpu::cpuid(0)[0];
-    let leaf = if maximum >= 0x1F && cpu::cpuid_subleaf(0x1F, 0)[1] != 0 {
-        0x1F
-    } else if maximum >= 0xB && cpu::cpuid_subleaf(0xB, 0)[1] != 0 {
-        0xB
-    } else {
-        0
-    };
-    if leaf != 0 {
-        let (mut per_core, mut per_package) = (1u32, 1u32);
-        for subleaf in 0..16 {
-            let [eax, ebx, ecx, _] = cpu::cpuid_subleaf(leaf, subleaf);
-            let level_type = ecx >> 8;
-            if level_type != 0 {
-                let shift = eax & 0x1F;
-                if level_type == 1 {
-                    per_core = 1 << shift;
-                } else {
-                    per_package = 1 << shift;
-                }
-            }
-            if ebx & 0xFFFF == 0 {
-                break;
-            }
-        }
-        return (per_core, (per_package / per_core).max(1));
-    }
-    // CPUID legado: núcleos pela folha 4, lógicos por CPUID.1 com HTT.
-    let cores = if maximum >= 4 { 1u32 << highest_bit((cpu::cpuid_subleaf(4, 0)[0] >> 26) * 2 + 1) } else { 1 };
-    let [_, ebx, _, edx] = cpu::cpuid(1);
-    let per_core = if edx & (1 << 28) != 0 {
-        let logical = ((ebx >> 16) & 0xFF).max(1);
-        ((1u32 << highest_bit(logical * 2 - 1)) / cores).max(1)
-    } else {
-        1
-    };
-    (per_core, cores)
 }
 
 /// APIC id de cada processador ativo na ordem dos índices: 0 = BSP, k = slot
@@ -256,84 +175,61 @@ pub fn processor_apic_ids() -> Vec<u32> {
     identifiers
 }
 
+/// As KPRCBs dos processadores ativos, na ordem dos números
+/// (KiProcessorBlock[0..KeNumberProcessors)).
+fn processor_blocks() -> Vec<&'static Kprcb> {
+    (0..smp::online_cpu_count() as u32).filter_map(pcr::processor_block).collect()
+}
+
+/// Os conjuntos de cada processador, lidos da KPRCB dele.
 struct Topology {
-    apic: Vec<u32>,
-    core_mask: u32,
-    package_mask: u32,
-    caches: Vec<Cache>,
+    blocks: Vec<&'static Kprcb>,
 }
 
 impl Topology {
-    fn capture() -> Result<Topology, KernelError> {
-        let snapshot = processor_information::snapshot()?;
-        let amd = is_amd(&snapshot.vendor);
-        let (per_core, cores) = topology_counts(amd);
-        Ok(Topology {
-            apic: processor_apic_ids(),
-            core_mask: !(per_core - 1),
-            package_mask: !(per_core.wrapping_mul(cores).wrapping_sub(1)),
-            caches: cache_descriptors(amd, snapshot.level),
-        })
+    fn capture() -> Topology {
+        Topology { blocks: processor_blocks() }
     }
 
-    /// Processadores (bits por índice no grupo 0) com o mesmo APIC id sob `mask`.
-    fn siblings(&self, processor: usize, mask: u32) -> u64 {
-        let mine = self.apic[processor] & mask;
-        self.apic.iter().enumerate().filter(|&(_, &identifier)| identifier & mask == mine).fold(0, |set, (index, _)| set | 1u64 << index)
+    /// KPRCB.GroupSetMember.
+    fn own(&self, processor: usize) -> u64 {
+        self.blocks[processor].group_set_member.get()
     }
 
+    /// KPRCB.CoreProcessorSet.
     fn core_set(&self, processor: usize) -> u64 {
-        self.siblings(processor, self.core_mask)
+        self.blocks[processor].core_processor_set.get()
     }
 
+    /// KPRCB.PackageProcessorSet, a parte do grupo 0.
     fn package_set(&self, processor: usize) -> u64 {
-        self.siblings(processor, self.package_mask)
+        self.blocks[processor].package_processor_set.bitmap[0].get()
     }
 
-    /// KPRCB.CacheProcessorMask[i]; 0 = só o próprio processador.
-    fn cache_set(&self, processor: usize, cache: &Cache) -> u64 {
-        match cache.sharing {
-            Sharing::Own => 0,
-            Sharing::ApicMask(mask) => self.siblings(processor, mask),
-            Sharing::Package => self.package_set(processor),
-        }
+    /// KPRCB.Cache[0..CacheCount] com o CacheProcessorMask de cada um (0 =
+    /// só o próprio processador).
+    fn caches(&self, processor: usize) -> impl Iterator<Item = (&'static CacheDescriptor, u64)> {
+        let prcb = self.blocks[processor];
+        let count = (prcb.cache_count.get() as usize).min(MAXIMUM_CACHES);
+        prcb.cache[..count].iter().zip(prcb.cache_processor_mask.iter().map(|mask| mask.get()))
     }
 
     fn active_mask(&self) -> u64 {
-        if self.apic.len() >= 64 { u64::MAX } else { (1u64 << self.apic.len()) - 1 }
+        self.blocks.iter().fold(0, |mask, prcb| mask | prcb.group_set_member.get())
     }
 }
 
-/// KiLargestCacheSize: 64 KB (o valor inicial no .data do ntoskrnl), ou o
-/// maior Size dos caches L2+ unificados ou de dados (KiSetCacheInformation),
-/// calculado uma vez.
+/// KiLargestCacheSize: 64 KB (o valor inicial no .data do ntoskrnl) ou o
+/// maior Size dos caches L2+ unificados ou de dados de todos os
+/// processadores (KiSetCacheInformation).
 pub fn largest_cache_size() -> u32 {
-    let size = LARGEST_CACHE_SIZE.load(Ordering::Acquire);
-    if size != 0 {
-        return size;
-    }
-    let caches = match processor_information::snapshot() {
-        Ok(snapshot) => cache_descriptors(is_amd(&snapshot.vendor), snapshot.level),
-        Err(_) => Vec::new(),
-    };
-    let size = caches
-        .iter()
-        .filter(|cache| cache.level >= 2 && (cache.kind == cache_type::UNIFIED || cache.kind == cache_type::DATA))
-        .fold(DEFAULT_LARGEST_CACHE_SIZE, |largest, cache| largest.max(cache.size));
-    LARGEST_CACHE_SIZE.store(size, Ordering::Release);
-    size
+    processor_identity::largest_cache_size()
 }
 
-/// KeGetRecommendedSharedDataAlignment: KeLargestCacheLine, calculado uma vez.
+/// KeGetRecommendedSharedDataAlignment: KeLargestCacheLine (64, ou o maior
+/// LineSize dos caches L2+ unificados ou de dados).
 pub fn recommended_shared_data_alignment() -> Result<u32, KernelError> {
-    let line = LARGEST_CACHE_LINE.load(Ordering::Acquire);
-    if line != 0 {
-        return Ok(line);
-    }
-    let snapshot = processor_information::snapshot()?;
-    let line = largest_cache_line(&cache_descriptors(is_amd(&snapshot.vendor), snapshot.level));
-    LARGEST_CACHE_LINE.store(line, Ordering::Release);
-    Ok(line)
+    Ok(processor_identity::largest_cache_line())
 }
 
 /// Buffer de SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX: o tamanho exigido
@@ -378,14 +274,14 @@ impl Output {
 
     /// CACHE_RELATIONSHIP (0x38). O GroupCount fica 0, como o binário 19041
     /// grava (o campo entrou em SDKs posteriores).
-    fn cache(&mut self, cache: &Cache, mask: u64) {
+    fn cache(&mut self, cache: &CacheDescriptor, mask: u64) {
         if let Some(record) = self.reserve(relation::CACHE, 0x38) {
             let relation = &record.cache;
-            relation.level.set(cache.level);
-            relation.associativity.set(cache.associativity);
-            relation.line_size.set(cache.line_size);
-            relation.cache_size.set(cache.size);
-            relation.type_.set(cache.kind as i32);
+            relation.level.set(cache.level.get());
+            relation.associativity.set(cache.associativity.get());
+            relation.line_size.set(cache.line_size.get());
+            relation.cache_size.set(cache.size.get());
+            relation.type_.set(cache.type_.get().0);
             relation.group_mask.mask.set(mask);
         }
     }
@@ -420,8 +316,11 @@ impl Output {
 /// com o tamanho exigido; nada emitido = STATUS_UNSUCCESSFUL; processador
 /// inválido = STATUS_INVALID_PARAMETER sem tocar o Length.
 pub fn query_logical_processor_relationship(number: Option<&ProcessorNumber>, relationship: u32, information: u64, length: u64) -> Result<u32, KernelError> {
-    let topology = Topology::capture()?;
-    let count = topology.apic.len();
+    let topology = Topology::capture();
+    let count = topology.blocks.len();
+    if count == 0 {
+        return Ok(STATUS_UNSUCCESSFUL);
+    }
     let (first, last, specific) = if let Some(number) = number {
         let index = processor_group::processor_index_from_number(number);
         if index >= count as u64 {
@@ -438,7 +337,7 @@ pub fn query_logical_processor_relationship(number: Option<&ProcessorNumber>, re
     let (mut packages, mut cores) = (0u64, 0u64);
     let mut cache_sets = [0u64; MAXIMUM_CACHES];
     for processor in first..=last {
-        let own = 1u64 << processor;
+        let own = topology.own(processor);
         if relationship == relation::PACKAGE || all {
             let set = topology.package_set(processor);
             if specific || packages & set == 0 {
@@ -455,8 +354,7 @@ pub fn query_logical_processor_relationship(number: Option<&ProcessorNumber>, re
             }
         }
         if relationship == relation::CACHE || all {
-            for (index, cache) in topology.caches.iter().enumerate() {
-                let set = topology.cache_set(processor, cache);
+            for (index, (cache, set)) in topology.caches(processor).enumerate() {
                 if set == 0 {
                     output.cache(cache, own);
                     continue;
@@ -484,4 +382,64 @@ pub fn query_logical_processor_relationship(number: Option<&ProcessorNumber>, re
     }
     length.set(output.used as u32);
     Ok(status)
+}
+
+/// KeBuildLogicalProcessorSystemInformation(Group, Buffer, Length,
+/// ReturnLength): os SYSTEM_LOGICAL_PROCESSOR_INFORMATION (0x20 bytes) de um
+/// grupo. Por processador do grupo: o pacote e o núcleo quando ele é o
+/// processador de número mais alto do conjunto (KeFindFirstSetLeftGroupAffinity),
+/// os caches com máscara (idem) e os sem máscara com o próprio
+/// processador; depois um registro por nó com processadores no grupo. O
+/// tamanho exigido cresce sempre; só grava o que cabe. Devolve (status,
+/// tamanho exigido).
+pub fn build_logical_processor_information(group: u16, buffer: u64, length: u32, write: &mut dyn FnMut(u64, &[u8]) -> bool) -> (u32, u32) {
+    let blocks = processor_blocks();
+    let highest = |mask: u64| (mask != 0).then(|| 63 - mask.leading_zeros());
+    let mut used = 0u64;
+    let mut status = STATUS_SUCCESS;
+    let mut emit = |mask: u64, relationship: u32, payload: [u8; 16]| {
+        used += LEGACY_RECORD_SIZE;
+        if used > length as u64 {
+            status = STATUS_INFO_LENGTH_MISMATCH;
+            return;
+        }
+        let mut record = [0u8; LEGACY_RECORD_SIZE as usize];
+        record[..8].copy_from_slice(&mask.to_le_bytes());
+        record[8..12].copy_from_slice(&relationship.to_le_bytes());
+        record[16..].copy_from_slice(&payload);
+        if !write(buffer + used - LEGACY_RECORD_SIZE, &record) {
+            status = 0xC000_0005;
+        }
+    };
+    for prcb in blocks.iter().filter(|prcb| prcb.group.get() as u16 == group) {
+        let number = prcb.number.get();
+        let package = prcb.package_processor_set.bitmap[(group as usize).min(19)].get();
+        if highest(package) == Some(number) {
+            emit(package, relation::PACKAGE, [0; 16]);
+        }
+        let core = prcb.core_processor_set.get();
+        if highest(core) == Some(number) {
+            let mut payload = [0u8; 16];
+            // ProcessorCore.Flags: LTP_PC_SMT quando o núcleo tem outros
+            // processadores lógicos.
+            payload[0] = (prcb.group_set_member.get() != core) as u8;
+            emit(core, relation::CORE, payload);
+        }
+        let count = (prcb.cache_count.get() as usize).min(MAXIMUM_CACHES);
+        for (cache, mask) in prcb.cache[..count].iter().zip(prcb.cache_processor_mask.iter().map(|mask| mask.get())) {
+            let set = if mask == 0 { prcb.group_set_member.get() } else { mask };
+            if mask != 0 && highest(mask) != Some(number) {
+                continue;
+            }
+            let mut payload = [0u8; 16];
+            payload[..12].copy_from_slice(&guest::read_bytes(cache.address(), 12));
+            emit(set, relation::CACHE, payload);
+        }
+    }
+    // KeNodeBlock: um nó, o 0, com os processadores ativos do grupo 0.
+    let node_mask = if group == 0 { blocks.iter().fold(0, |mask, prcb| mask | prcb.group_set_member.get()) } else { 0 };
+    if node_mask != 0 {
+        emit(node_mask, relation::NUMA_NODE, [0; 16]);
+    }
+    (status, used as u32)
 }

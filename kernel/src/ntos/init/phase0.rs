@@ -44,11 +44,15 @@ pub fn init() {
     kernel_data::write("MmUserProbeAddress", memory_map::USER_PROBE_ADDRESS);
     kernel_data::write("MmHighestUserAddress", memory_map::HIGHEST_USER_ADDRESS);
     pcr::init().unwrap_or_else(|error| panic!("KPCR: {error}")); // KPCR do BSP + IA32_GS_BASE
+    // identidade do BSP na KPRCB (CPUID, FeatureBits, topologia, caches, MHz)
+    crate::ntos::ke::processor_identity::initialize_boot_processor().unwrap_or_else(|error| panic!("{error}"));
     pool_lock::init().unwrap_or_else(|error| panic!("pool lock: {error}")); // lock nativo da arena NT
     crate::ntos::io::volume_parameters::init().unwrap_or_else(|error| panic!("{error}")); // LockQueueIoVpbLock antes dos drivers nativos
     crate::hal::pci_config::init().unwrap_or_else(|error| panic!("{error}")); // lock CF8/CFC antes dos APs
     shared_user_data::init(); // página KUSER_SHARED_DATA mapeada (drivers WDK)
     smp::init().unwrap_or_else(|error| panic!("SMP: {error}")); // ACPI MADT + INIT-SIPI dos APs (LAPIC)
+    // identidade de cada AP na própria KPRCB e os conjuntos de pacote, núcleo e cache
+    crate::ntos::ke::processor_identity::initialize_application_processors().unwrap_or_else(|error| panic!("{error}"));
     crate::ntos::kd::initialize(); // depurador do kernel (`--kd`): KdInitSystem com o transporte serial
     crate::ntos::mm::user_half::assert_user_only(); // trampolim desfeito: nada do kernel abaixo de MmSystemRangeStart
     crate::ntos::mm::image_paging::init().unwrap_or_else(|error| panic!("image paging: {error}"));

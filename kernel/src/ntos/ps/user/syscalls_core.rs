@@ -24,7 +24,7 @@ use crate::ntos::se::{code_integrity_information, secure_boot_information};
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::inc::types::extra_ps_user::SystemMemoryListInformation;
-use crate::ntos::inc::types::{Context, Eprocess, NtStruct, ProcessBasicInformation, ProcessExtendedBasicInformation, ProcessorNumber, SystemBasicInformation, SystemLogicalProcessorInformationEx, SystemNumaInformation, UnicodeString, XsaveFormat};
+use crate::ntos::inc::types::{Context, Eprocess, NtStruct, ProcessBasicInformation, ProcessExtendedBasicInformation, ProcessorNumber, SystemBasicInformation, SystemNumaInformation, UnicodeString, XsaveFormat};
 
 /// Gancho: (userRsp, retLen*) → status.
 pub type StackQuery = fn(u64, u64) -> Result<u32, KernelError>;
@@ -332,6 +332,7 @@ fn query_system_information(class: u32, buffer: u64, length: u64, returned: u64)
         157 => return crate::ntos::ex::manufacturing_information::query(buffer, length, returned, true),
         3 => return crate::ntos::ex::time_of_day_information::query(buffer, length, returned, true),
         1 | 63 => return Ok(processor_information::query(buffer, length as u32, returned, true, class == 63)),
+        154 => return Ok(processor_information::query_features(buffer, length as u32, returned, true)),
         5 => return system_process_information::query(buffer, length, returned, true),
         _ => {}
     }
@@ -364,6 +365,13 @@ fn query_system_information(class: u32, buffer: u64, length: u64, returned: u64)
                 basic.number_of_processors.probe_set(smp::online_cpu_count() as i8)?;
                 set_returned(SystemBasicInformation::SIZE as u32)?;
                 Ok(STATUS_SUCCESS)
+            }
+            // SystemLogicalProcessorInformation: o KeBuildLogicalProcessorSystemInformation
+            // do grupo da thread (o 0), escrito sondado no buffer do chamador.
+            73 => {
+                let (status, required) = crate::ntos::ke::processor_topology::build_logical_processor_information(0, buffer, length as u32, &mut |address, bytes| guest::try_write_bytes(address, bytes).is_ok());
+                set_returned(required)?;
+                Ok(status)
             }
             // SystemRangeStartInformation: um ULONG_PTR.
             50 => {
@@ -418,6 +426,9 @@ fn query_system_information(class: u32, buffer: u64, length: u64, returned: u64)
     })
 }
 
+/// Teto do buffer do kernel da topologia de processadores.
+const TOPOLOGY_SCRATCH_LIMIT: u32 = 0x1_0000;
+
 /// NtQuerySystemInformationEx(class, input, inputLength, buffer, length,
 /// returnLength*): a topologia de processadores e, no resto, a variante
 /// sem entrada.
@@ -433,51 +444,45 @@ fn nt_query_system_information_ex(class: u64, input: u64, input_length: u64, buf
     if class != 107 {
         return query_system_information(class, buffer, length, returned);
     }
-    if input_length as u32 != 4 || input == 0 {
+    // O NtQuerySystemInformationEx recusa entrada nula ou curta; a classe 107
+    // lê a LOGICAL_PROCESSOR_RELATIONSHIP sondada.
+    if input == 0 || (input_length as u32) < 4 {
         return Ok(STATUS_INVALID_PARAMETER);
     }
-    // InputBuffer e ReturnLength são sondados antes do uso.
-    if !probe_user_read(input, 4) || (returned != 0 && !probe_user_write(returned, 4)) {
+    if !probe_user_read(input, 4) || (buffer != 0 && !probe_user_write(buffer, length)) || (returned != 0 && !probe_user_write(returned, 4)) {
         return Ok(0xC000_0005);
     }
     state::guarded(|| {
-        // LOGICAL_PROCESSOR_RELATIONSHIP.
         let relationship = guest::try_read::<u32>(input)?;
         crate::debug_print!("[usermode] topologia: relationship={}", relationship);
-        let need = match relationship {
-            4 => 80u64,
-            1 | 6 => 48,
-            _ => return Ok(STATUS_INVALID_INFO_CLASS),
-        };
-        if returned != 0 {
-            guest::try_write::<u32>(returned, need as u32)?;
+        // O KeQueryLogicalProcessorRelationship num buffer do kernel (no
+        // máximo 64 KB, que cobrem 64 processadores), copiado para o do
+        // chamador; o ReturnLength recebe o tamanho exigido.
+        let capacity = (length as u32).min(TOPOLOGY_SCRATCH_LIMIT);
+        let scratch = guest::alloc_bytes(capacity as u64 + 8);
+        if scratch == 0 {
+            return Ok(0xC000_009A);
         }
-        if length < need {
+        let cell = scratch + capacity as u64;
+        guest::write32(cell, capacity);
+        let status = crate::ntos::ke::processor_topology::query_logical_processor_relationship(None, relationship, scratch, cell);
+        let required = guest::read32(cell);
+        let bytes = guest::read_bytes(scratch, required.min(capacity) as usize);
+        guest::free_bytes(scratch);
+        let status = match status {
+            Ok(status) => status,
+            Err(_) => return Ok(0xC000_0001),
+        };
+        if required > capacity && status == STATUS_SUCCESS {
             return Ok(STATUS_INFO_LENGTH_MISMATCH);
         }
-        if buffer == 0 || !probe_user_write(buffer, need) {
-            return Ok(0xC000_0005);
+        if status == STATUS_SUCCESS && !bytes.is_empty() {
+            guest::try_write_bytes(buffer, &bytes)?;
         }
-        guest::try_write_bytes(buffer, &alloc::vec![0; need as usize])?;
-        let information = state::user_struct::<SystemLogicalProcessorInformationEx>(buffer)?;
-        information.relationship.probe_set(relationship as i32)?;
-        information.size.probe_set(need as u32)?;
-        if relationship == 4 {
-            // RelationGroup: o grupo 0 com as CPUs que deram boot.
-            let group = &information.group;
-            group.maximum_group_count.probe_set(1)?;
-            group.active_group_count.probe_set(1)?;
-            let info = &group.group_info[0];
-            info.maximum_processor_count.probe_set(64)?;
-            info.active_processor_count.probe_set(smp::online_cpu_count() as u8)?;
-            info.active_processor_mask.probe_set(online_mask())?;
-        } else {
-            // NUMA_NODE_RELATIONSHIP: um único nó.
-            let node = &information.numa_node;
-            node.group_count.probe_set(1)?;
-            node.group_mask.mask.probe_set(online_mask())?;
+        if returned != 0 {
+            guest::try_write::<u32>(returned, required)?;
         }
-        Ok(STATUS_SUCCESS)
+        Ok(status)
     })
 }
 

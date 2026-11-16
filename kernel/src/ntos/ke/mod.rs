@@ -8,6 +8,7 @@ pub mod dump_memory;
 pub mod interrupt_object;
 pub mod irql;
 pub mod pcr;
+pub mod processor_identity;
 pub mod processor_information;
 pub mod smp;
 pub mod thread_dispatch;

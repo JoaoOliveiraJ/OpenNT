@@ -13,10 +13,9 @@ use super::paging::{self, MapOptions};
 use super::pfn;
 use crate::hal::{kmalloc, physical};
 use crate::ntos::cm::state_separation;
-use crate::ntos::ke::{clock, processor_information, smp};
+use crate::ntos::ke::{clock, processor_identity, smp};
 use crate::rtl::time::UNIX_TO_NT_EPOCH_MILLISECONDS;
 use crate::ntos::inc::field::NtStruct;
-use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::inc::types::{KsystemTime, KuserSharedData, NtProductType};
 
 pub const SHARED_USER_DATA_VA: u64 = 0xFFFF_F780_0000_0000;
@@ -104,10 +103,9 @@ pub fn init() -> bool {
     data.product_type_is_valid.set(1);
     data.native_processor_architecture.set(9); // PROCESSOR_ARCHITECTURE_AMD64
     // Nível e revisão do processador não fazem parte desta página no 19041
-    // (vêm de SystemProcessorInformation); só os recursos são publicados.
-    if let Ok(cpu) = processor_information::snapshot() {
-        guest::write_bytes(data.processor_features[0].address(), &cpu.features);
-    }
+    // (vêm de SystemProcessorInformation); os recursos (PF_*) saem de
+    // KeFeatureBits, como no KiInitializeKernel.
+    processor_identity::publish_processor_features(data);
     data.suite_mask.set(0x110);
     data.number_of_physical_pages.set((kmalloc::ram_top() / 0x1000) as u32);
     data.active_processor_count.set(smp::online_cpu_count() as u32);
@@ -121,6 +119,14 @@ pub fn init() -> bool {
     update_system_times();
     debug_print!("[mm] KUSER_SHARED_DATA mapeada (frame {:#x})", frame);
     true
+}
+
+/// ActiveProcessorCount: os processadores online, atualizado quando um AP
+/// sobe (o KiUpdateProcessorCount do NT).
+pub fn update_active_processor_count() {
+    if let Some(data) = data() {
+        data.active_processor_count.set(smp::online_cpu_count() as u32);
+    }
 }
 
 /// Chamado a cada volta do kernel: mantém o relógio compartilhado.

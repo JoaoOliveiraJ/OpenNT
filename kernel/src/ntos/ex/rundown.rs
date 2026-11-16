@@ -10,7 +10,7 @@ use core::sync::atomic::{AtomicU64, Ordering::SeqCst};
 
 use crate::hal::cpu;
 use crate::ntos::inc::field::{Field, NtStruct};
-use crate::ntos::inc::types::{ExRundownRef, ExRundownRefCacheAware, Kevent, Kpcr};
+use crate::ntos::inc::types::{ExRundownRef, ExRundownRefCacheAware, Kevent};
 use crate::ntos::ke::{dispatcher, irql, pcr, smp};
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
@@ -285,8 +285,7 @@ fn cache_line_alignment() -> u32 {
 
 /// KeGetCurrentProcessorNumberEx: KPCR->Prcb.Number.
 fn current_processor_number() -> u32 {
-    // SAFETY: o KPCR da CPU corrente.
-    unsafe { Kpcr::at(pcr::get_pcr_address()) }.prcb.number.get()
+    pcr::current().prcb.number.get()
 }
 
 fn cache_reference_slots(pointer: u64) -> Result<Vec<u64>, KernelError> {

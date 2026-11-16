@@ -56,6 +56,21 @@ pub fn query(class: u32, output: u64, length: u32, returned: u64) -> Result<u32,
         3 => return crate::ntos::ex::time_of_day_information::query(output, length as u64, returned, false),
         11 | 77 => return module_queries::query_system_modules(class, output, length as u64, returned),
         1 | 63 => return Ok(processor_information::query(output, length, returned, false, class == 63)),
+        // SystemProcessorFeaturesInformation.
+        154 => return Ok(processor_information::query_features(output, length, returned, false)),
+        // SystemLogicalProcessorInformation: o KeBuildLogicalProcessorSystemInformation
+        // do grupo da thread (o 0).
+        73 => {
+            let (status, required) = crate::ntos::ke::processor_topology::build_logical_processor_information(0, output, length, &mut |address, bytes| {
+                guest::write_bytes(address, bytes);
+                true
+            });
+            if returned != 0 {
+                // SAFETY: o PULONG ReturnLength do chamador (modo kernel).
+                unsafe { Field::<u32>::at(returned) }.set(required);
+            }
+            return Ok(status);
+        }
         // SystemCodeIntegrityCertificateManagementInformation: nenhuma
         // operação de certificados pendente (o cng percorre e segue).
         117 => {

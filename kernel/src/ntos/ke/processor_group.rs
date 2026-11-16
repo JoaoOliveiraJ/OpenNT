@@ -1,13 +1,13 @@
 //! Processadores, grupos e nós vistos pelos drivers.
 //!
-//! O código dos drivers roda no processador de boot (KeGetCurrentProcessorNumber
-//! é 0). Os processadores ativos são os da MADT que subiram, todos no grupo 0
-//! e no nó NUMA 0 (sem SRAT). KeNumberProcessors é a célula ULONG real da
-//! imagem: 1 pelo processador de boot e mais 1 por processador que sobe.
+//! KeGetCurrentProcessorNumber(Ex) leem a KPRCB da CPU que executa. Os
+//! processadores ativos são os da MADT que subiram, todos no grupo 0 e no nó
+//! NUMA 0 (sem SRAT). KeNumberProcessors é a célula ULONG real da imagem: 1
+//! pelo processador de boot e mais 1 por processador que sobe.
 
 use core::sync::atomic::Ordering;
 
-use super::smp;
+use super::{pcr, smp};
 use crate::ntos::inc::status::{STATUS_INVALID_PARAMETER, STATUS_SUCCESS};
 use crate::ntos::inc::types::{Field, GroupAffinity, NtStruct, ProcessorNumber};
 use crate::ntos::mm::guest_memory as guest;
@@ -69,18 +69,33 @@ pub fn processor_group_affinity(affinity: &GroupAffinity, index: u32) {
     affinity.mask.set(1u64 << (number & 0x3F));
 }
 
-/// KeGetCurrentProcessorNumber: todo código de driver roda no BSP.
+/// KeGetCurrentProcessorNumber: KPRCB.Number da CPU corrente (gs:[KPCR.Prcb]);
+/// 0 antes da KPCR do BSP.
 pub fn current_processor_number() -> u32 {
-    0
+    if pcr::get_pcr_address() == 0 {
+        return 0;
+    }
+    pcr::current().prcb.number.get()
 }
 
-/// KeGetCurrentProcessorNumberEx: PROCESSOR_NUMBER do BSP (grupo 0, número 0)
-/// na saída opcional; devolve o índice 0.
+/// KeGetCurrentProcessorNumberEx: o PROCESSOR_NUMBER {Group, GroupIndex} da
+/// KPRCB corrente na saída opcional; devolve KPRCB.Number.
 pub fn current_processor_number_ex(processor_number: u64) -> u32 {
-    if processor_number != 0 {
-        write_processor_number(processor_number, 0);
+    if pcr::get_pcr_address() == 0 {
+        if processor_number != 0 {
+            write_processor_number(processor_number, 0);
+        }
+        return 0;
     }
-    0
+    let prcb = &pcr::current().prcb;
+    if processor_number != 0 {
+        // SAFETY: PPROCESSOR_NUMBER de saída do chamador.
+        let target = unsafe { ProcessorNumber::at(processor_number) };
+        target.group.set(prcb.group.get() as u16);
+        target.number.set(prcb.group_index.get());
+        target.reserved.set(0);
+    }
+    prcb.number.get()
 }
 
 /// PROCESSOR_NUMBER de saída do chamador: grupo 0, número e Reserved zero.
