@@ -13,8 +13,11 @@
 //! valores daqui: as chaves de serviço desses quatro (com Parameters e
 //! Security), a ordem dos grupos de serviço (`Control\ServiceGroupOrder`) e,
 //! na SOFTWARE, os grupos do svchost (`Microsoft\Windows NT\CurrentVersion\
-//! Svchost`, os valores com a lista de serviços de cada grupo). Fora do
-//! Windows nada é copiado.
+//! Svchost`, os valores com a lista de serviços de cada grupo). E a
+//! configuração das extensões do LSA (`Control\LsaExtensionConfig`: o
+//! lsasrv.dll, o efslsaext.dll e a interface do dpapisrv.dll), que o
+//! LsapLoadRequiredExtensions do lsass.exe lê depois de conectar ao
+//! Reference Monitor. Fora do Windows nada é copiado.
 
 use crate::host_language::HostKey;
 
@@ -33,6 +36,7 @@ pub fn system_keys(control_set: &str) -> Vec<HostKey> {
             registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\Services\\{service}"), &format!("{control_set}\\Services\\{service}"), true, &mut keys);
         }
         registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\Control\\ServiceGroupOrder"), &format!("{control_set}\\Control\\ServiceGroupOrder"), false, &mut keys);
+        registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\Control\\LsaExtensionConfig"), &format!("{control_set}\\Control\\LsaExtensionConfig"), true, &mut keys);
     }
     #[cfg(not(windows))]
     let _ = control_set;
