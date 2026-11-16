@@ -119,19 +119,14 @@ pub fn begin_connection_ex(arguments: &[u64; 11]) -> Result<Box<dyn Pending>, Ke
 }
 
 /// Conduz a operação retomável até concluir; o cancelamento final é inócuo
-/// depois da conclusão (e desfaz a que a espera deixou pela metade).
+/// depois da conclusão (e desfaz a que a espera deixou pela metade). Fora de
+/// uma thread de kernel, a espera é a do `context_switch::wait_until`: uma
+/// thread de usuário num serviço (o win32k chamando o msrpc.sys, que manda o
+/// pedido síncrono a um servidor RPC de modo usuário) bloqueia e deixa o
+/// servidor rodar, em vez de girar o pump do kernel.
 pub fn drive(mut operation: Box<dyn Pending>) -> u32 {
-    let status = if context_switch::kernel_thread_can_block() {
-        let (deadline, mode, alertable) = operation.wait_parameters();
-        wait_transport(&mut || operation.poll(), deadline, mode, alertable)
-    } else {
-        loop {
-            if let Some(status) = operation.poll() {
-                break status;
-            }
-            dispatcher::pump_kernel();
-        }
-    };
+    let (deadline, mode, alertable) = operation.wait_parameters();
+    let status = wait_transport(&mut || operation.poll(), deadline, mode, alertable);
     operation.cancel();
     status
 }
