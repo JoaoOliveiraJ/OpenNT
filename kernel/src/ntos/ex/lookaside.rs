@@ -300,12 +300,20 @@ pub fn maintain() {
     }
 }
 
-/// Devolve só entradas livres e mede os PFNs efetivamente liberados.
+/// Devolve só entradas livres e mede os PFNs efetivamente liberados. Só as
+/// listas que liberam pelo ExFreePool: o FreeEx próprio de um driver roda
+/// no contexto de quem chama o ExFreeToLookasideListEx (o de um driver de
+/// sessão só existe nos processos da sessão), e o NT nunca o chama de outro
+/// contexto (o ExpScanGeneralLookasideList só ajusta a Depth).
 pub fn reclaim(requested: u64) -> u64 {
     let initial = pfn::free_count();
     let gained = || pfn::free_count().saturating_sub(initial);
+    let Ok(pool_free) = exported_callback("ExFreePool") else { return 0 };
     let lists: alloc::vec::Vec<u64> = STATE.lock().lists.keys().copied().collect();
     for list in lists {
+        if lookaside(list).free_ex.get() != pool_free {
+            continue;
+        }
         while gained() < requested {
             let Ok(entry) = slist::pop(list) else { break };
             if entry == 0 || release_entry(list, entry).is_err() {
