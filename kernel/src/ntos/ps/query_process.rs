@@ -20,6 +20,51 @@ const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 /// PROCESS_QUERY_INFORMATION.
 const PROCESS_QUERY_INFORMATION: u32 = 0x400;
 
+/// PROCESSINFOCLASS ProcessDefaultHardErrorMode e ProcessHandleCheckingMode.
+pub const PROCESS_DEFAULT_HARD_ERROR_MODE: u32 = 12;
+pub const PROCESS_HANDLE_CHECKING_MODE: u32 = 54;
+const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+
+/// NtQueryInformationProcess das classes de modo do processo (ntoskrnl
+/// 19041, rvas 0x621eda e 0x6240d6), com o buffer e o ReturnLength já
+/// sondados em UserMode; `process_of` resolve o handle com o acesso pedido.
+///
+/// - ProcessDefaultHardErrorMode (12): um ULONG (outro tamanho dá
+///   STATUS_INFO_LENGTH_MISMATCH), PROCESS_QUERY_LIMITED_INFORMATION, o
+///   EPROCESS.DefaultHardErrorProcessing e ReturnLength 4.
+/// - ProcessHandleCheckingMode (54): um ULONG, PROCESS_QUERY_INFORMATION, 1
+///   com HANDLE_TABLE.EnableHandleExceptions ligado (ExQueryHandleExceptions)
+///   e 0 sem; sem tabela, STATUS_PROCESS_IS_TERMINATING. O ReturnLength não
+///   é gravado.
+pub fn query_mode(class: u32, output: u64, length: u32, returned: u64, process_of: impl FnOnce(u32) -> Result<u64, u32>) -> Result<u32, KernelError> {
+    if length != 4 {
+        return Ok(STATUS_INFO_LENGTH_MISMATCH);
+    }
+    let access = if class == PROCESS_DEFAULT_HARD_ERROR_MODE { PROCESS_QUERY_LIMITED_INFORMATION } else { PROCESS_QUERY_INFORMATION };
+    let process = match process_of(access) {
+        Ok(process) => process,
+        Err(status) => return Ok(status),
+    };
+    // SAFETY: EPROCESS retido pelo handle que o nomeou (ou o corrente).
+    let eprocess = unsafe { Eprocess::at(process) };
+    if class == PROCESS_DEFAULT_HARD_ERROR_MODE {
+        guest::try_write::<u32>(output, eprocess.default_hard_error_processing.get())?;
+        if returned != 0 {
+            guest::try_write::<u32>(returned, 4)?;
+        }
+        return Ok(0);
+    }
+    let table = crate::ntos::ob::handles::process::reference(process)?;
+    if table == 0 {
+        return Ok(STATUS_PROCESS_IS_TERMINATING);
+    }
+    // SAFETY: HANDLE_TABLE do EPROCESS.ObjectTable, retida pelo rundown.
+    let enabled = unsafe { crate::ntos::inc::types::HandleTable::at(table) }.enable_handle_exceptions() != 0;
+    crate::ntos::ob::handles::process::release(process)?;
+    guest::try_write::<u32>(output, enabled as u32)?;
+    Ok(0)
+}
+
 /// ObReferenceObjectByHandle(handle, access, PsProcessType, KernelMode):
 /// `Ok(Ok(EPROCESS))` com uma referência que [`release_process`] solta, ou o
 /// NTSTATUS da recusa.

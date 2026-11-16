@@ -189,6 +189,32 @@ fn nt_clear_event(handle: u64, _a2: u64, _a3: u64, _a4: u64, _rsp: u64) -> Resul
     Ok(modify(handle, 0, dispatcher::reset_event))
 }
 
+/// NtPulseEvent(EventHandle, PreviousState*) (ntoskrnl 19041, rva
+/// 0x6bf4f0): a mesma ordem do NtSetEvent (sonda, EVENT_MODIFY_STATE) com o
+/// KePulseEvent, que acorda os que esperam e deixa o evento não sinalizado.
+fn nt_pulse_event(handle: u64, previous: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
+    Ok(modify(handle, previous, dispatcher::pulse_event))
+}
+
+/// NtSetEventBoostPriority(EventHandle) (rva 0x94f390): EVENT_MODIFY_STATE;
+/// um evento de notificação dá STATUS_OBJECT_TYPE_MISMATCH; num de
+/// sincronização, o KeSetEventBoostPriority sinaliza e solta um que espera
+/// (o OpenNT não aplica o reforço de prioridade).
+fn nt_set_event_boost_priority(handle: u64, _a2: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
+    let object = match reference(handle, 2) {
+        Ok(object) => object,
+        Err(status) => return Ok(status),
+    };
+    let status = if object.event_type == 0 {
+        0xC000_0024
+    } else {
+        dispatcher::set_event(object.pointer);
+        0
+    };
+    release(&object);
+    Ok(status)
+}
+
 /// NtQueryEvent(EventBasicInformation): tipo e estado.
 fn nt_query_event(handle: u64, class: u64, out: u64, length: u64, rsp: u64) -> Result<u32, KernelError> {
     let object = match reference(handle, 1) {
@@ -248,5 +274,7 @@ pub fn init() {
     state::register_handler("NtSetEvent", nt_set_event);
     state::register_handler("NtResetEvent", nt_reset_event);
     state::register_handler("NtClearEvent", nt_clear_event);
+    state::register_handler("NtPulseEvent", nt_pulse_event);
+    state::register_handler("NtSetEventBoostPriority", nt_set_event_boost_priority);
     state::register_handler("NtQueryEvent", nt_query_event);
 }

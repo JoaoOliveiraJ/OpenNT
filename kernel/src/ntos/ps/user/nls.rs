@@ -150,7 +150,13 @@ fn nt_query_default_ui_language(out: u64, _a2: u64, _a3: u64, _a4: u64, _rsp: u6
     Ok(if guest::try_write::<u16>(out, DEFAULT_UI_LANGUAGE as u16).is_err() { 0xC000_0005 } else { 0 })
 }
 
+/// NtIsUILanguageComitted() (`ps/locale`).
+fn nt_is_ui_language_comitted(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
+    Ok(crate::ntos::ps::locale::is_ui_language_committed())
+}
+
 pub fn init() {
+    state::register_handler("NtIsUILanguageComitted", nt_is_ui_language_comitted);
     state::register_handler("NtInitializeNlsFiles", nt_initialize_nls_files);
     state::register_handler("NtGetNlsSectionPtr", nt_get_nls_section_ptr);
     state::register_handler("NtQueryDefaultLocale", nt_query_default_locale);

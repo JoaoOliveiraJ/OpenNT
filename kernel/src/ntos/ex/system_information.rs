@@ -45,9 +45,63 @@ pub fn entropy_registrations() -> Vec<EntropyRegistration> {
     ENTROPY_TIMING_REGISTRATIONS.lock().clone()
 }
 
+/// SYSTEM_INFORMATION_CLASS das classes de tamanho fixo de `query_fixed`.
+pub const SYSTEM_FLAGS_INFORMATION: u32 = 9;
+pub const SYSTEM_PHYSICAL_MEMORY_INFORMATION: u32 = 184;
+pub const SYSTEM_HYPERVISOR_SHARED_PAGE_INFORMATION: u32 = 197;
+
+/// A classe é uma das de `query_fixed`.
+pub fn is_fixed_class(class: u32) -> bool {
+    matches!(class, SYSTEM_FLAGS_INFORMATION | SYSTEM_PHYSICAL_MEMORY_INFORMATION | SYSTEM_HYPERVISOR_SHARED_PAGE_INFORMATION)
+}
+
+/// Classes de tamanho fixo do ExpQuerySystemInformation 19041, com o buffer
+/// já sondado (alinhamento 4) quando o chamador é de modo usuário. Devolve
+/// (NTSTATUS, ReturnLength); o ReturnLength vale também na recusa de
+/// tamanho. `None` para as classes que não são daqui.
+///
+/// - SystemFlagsInformation (9, rva 0x6cad8e): exatamente 4 bytes, o
+///   NtGlobalFlag.
+/// - SystemPhysicalMemoryInformation (184, rva 0x6ca3d3): exatamente 0x18
+///   bytes: o total de RAM (MmGetNumberOfPhysicalPages << 12), o endereço do
+///   menor frame (MmGetLowestPhysicalPage << 12) e o último byte do maior
+///   (MmGetHighestPhysicalPage << 12 | 0xFFF).
+/// - SystemHypervisorSharedPageInformation (197, rva 0x6cced4): pelo menos
+///   8 bytes, o endereço de usuário da página compartilhada do hypervisor
+///   (MiState); sem hypervisor que a publique, 0.
+pub fn query_fixed(class: u32, output: u64, length: u32) -> Option<Result<(u32, u32), KernelError>> {
+    // (tamanho, exato, dados)
+    let (required, exact, data) = match class {
+        SYSTEM_FLAGS_INFORMATION => (4, true, crate::ntos::rtl::shared_data::nt_global_flag().to_le_bytes().to_vec()),
+        SYSTEM_PHYSICAL_MEMORY_INFORMATION => {
+            let (lowest, highest) = crate::ntos::mm::pfn::physical_page_bounds();
+            let mut data = Vec::with_capacity(0x18);
+            data.extend_from_slice(&(crate::ntos::mm::pfn::total_count() << 12).to_le_bytes());
+            data.extend_from_slice(&(lowest << 12).to_le_bytes());
+            data.extend_from_slice(&((highest << 12) + 0xFFF).to_le_bytes());
+            (0x18, true, data)
+        }
+        SYSTEM_HYPERVISOR_SHARED_PAGE_INFORMATION => (8, false, 0u64.to_le_bytes().to_vec()),
+        _ => return None,
+    };
+    let fits = if exact { length == required } else { length >= required };
+    if !fits {
+        return Some(Ok((STATUS_INFO_LENGTH_MISMATCH, required)));
+    }
+    Some(guest::try_write_bytes(output, &data).map(|()| (0, required)))
+}
+
 /// ZwQuerySystemInformation/NtQuerySystemInformation (o mesmo corpo).
 pub fn query(class: u32, output: u64, length: u32, returned: u64) -> Result<u32, KernelError> {
     debug_print!("[zw] QuerySystemInformation classe {} buf={}", class, length);
+    if let Some(result) = query_fixed(class, output, length) {
+        let (status, required) = result?;
+        if returned != 0 {
+            // SAFETY: o PULONG ReturnLength do chamador de modo kernel.
+            unsafe { Field::<u32>::at(returned) }.set(required);
+        }
+        return Ok(status);
+    }
     match class {
         90 => return boot_environment_information::query(output, length as u64, returned, false),
         103 => return code_integrity_information::query(output, length as u64, returned, false),

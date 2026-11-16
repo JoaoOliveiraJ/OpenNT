@@ -1894,8 +1894,9 @@ fn set_priority_class(handle: u64, class: u64, input: u64, length: u64) -> Resul
 }
 
 fn nt_set_information_thread(handle: u64, class: u64, input: u64, length: u64, rsp: u64) -> Result<u32, KernelError> {
-    // A classe 24 tem ordem própria e aceita alterar uma ETHREAD retida.
-    if requested_class(class) == 24 {
+    // As classes 18 e 24 têm ordem própria (`ps/set_thread_information`) e
+    // aceitam alterar uma ETHREAD retida.
+    if matches!(requested_class(class), 18 | 24) {
         return set_thread_information::set_user(rsp);
     }
     if matches!(class, THREAD_PRIORITY | THREAD_BASE_PRIORITY) {

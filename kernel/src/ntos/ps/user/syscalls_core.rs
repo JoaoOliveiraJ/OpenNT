@@ -343,6 +343,16 @@ fn query_system_information(class: u32, buffer: u64, length: u64, returned: u64)
     }
     state::guarded(|| {
         let set_returned = |value: u32| if returned != 0 { guest::try_write::<u32>(returned, value) } else { Ok(()) };
+        // As classes de tamanho fixo (`ex/system_information`): o
+        // ProbeForWrite delas exige alinhamento 4.
+        if crate::ntos::ex::system_information::is_fixed_class(class) && length != 0 && buffer & 3 != 0 {
+            return Ok(0x8000_0002);
+        }
+        if let Some(result) = crate::ntos::ex::system_information::query_fixed(class, buffer, length as u32) {
+            let (status, required) = result?;
+            set_returned(required)?;
+            return Ok(status);
+        }
         match class {
             // Basic/EmulationBasic/NativeBasic x64.
             0 | 62 | 114 => {
@@ -401,9 +411,10 @@ fn query_system_information(class: u32, buffer: u64, length: u64, returned: u64)
             }
             _ => {
                 crate::debug_print!("[usermode] NtQuerySystemInformation classe {} (nao coberta ainda)", class);
-                // Classes de política/recurso ausente: buffer zerado, nunca
+                // SystemFlushInformation ainda sem os bits de flush da CPU
+                // (KeFeatureBits, KPRCB.CFlushSize): buffer zerado, nunca
                 // INVALID_INFO_CLASS (a 24H2 trata como fatal no loader).
-                if class == 192 || class == 197 {
+                if class == 192 {
                     guest::try_write_bytes(buffer, &alloc::vec![0; length as usize])?;
                     set_returned(length as u32)?;
                     return Ok(STATUS_SUCCESS);
@@ -558,6 +569,26 @@ fn nt_query_information_process(handle: u64, class: u64, buffer: u64, length: u6
             }
         }
         return Ok(0xC000_0005);
+    }
+    // ProcessDefaultHardErrorMode e ProcessHandleCheckingMode
+    // (`ps/query_process`): o ProbeForWrite com alinhamento 4 e a sonda do
+    // ReturnLength antes da classe.
+    if matches!(class, 12 | 54) {
+        if length != 0 && buffer & 3 != 0 {
+            return Ok(0x8000_0002);
+        }
+        if (length != 0 && !probe_user_write(buffer, length)) || (returned != 0 && !probe_user_write(returned, 4)) {
+            return Ok(0xC000_0005);
+        }
+        return state::guarded(|| {
+            crate::ntos::ps::query_process::query_mode(class, buffer, length as u32, returned, |access| {
+                if handle as u32 == u32::MAX {
+                    Ok(crate::ntos::ps::process::get_current_process())
+                } else {
+                    super::handles::process_pointer(handle, access)
+                }
+            })
+        });
     }
     state::guarded(|| match class {
         // ProcessBasicInformation (ou a estendida com Size e Flags), do
@@ -737,7 +768,8 @@ pub fn query_image_information(rsp: u64) -> Result<u32, KernelError> {
     image_information::query(handle, output, length, returned, 1, Some(probe))
 }
 
-/// NtSetInformationProcess: instrumentação (40) e TLS (35).
+/// NtSetInformationProcess: instrumentação (40), TLS (35) e as classes de
+/// `ps/set_process_information`.
 fn nt_set_information_process(handle: u64, class: u64, buffer: u64, length: u64, _rsp: u64) -> Result<u32, KernelError> {
     let setter = match class as u32 {
         40 => *INSTRUMENTATION_SET.lock(),
@@ -747,9 +779,9 @@ fn nt_set_information_process(handle: u64, class: u64, buffer: u64, length: u64,
     if let Some(setter) = setter {
         return setter(handle, buffer, length);
     }
-    // ProcessBreakOnTermination e ProcessDebugFlags.
-    use crate::ntos::ps::set_process_information::{self as set_process, PROCESS_BREAK_ON_TERMINATION, PROCESS_DEBUG_FLAGS};
-    if matches!(class as u32, PROCESS_BREAK_ON_TERMINATION | PROCESS_DEBUG_FLAGS) {
+    // As classes que mudam o EPROCESS (`ps/set_process_information`).
+    use crate::ntos::ps::set_process_information as set_process;
+    if set_process::CLASSES.contains(&(class as u32)) {
         return set_process::set_information(1, class as u32, buffer, length as u32, |access| {
             if handle as u32 == u32::MAX {
                 Ok(crate::ntos::ps::process::get_current_process())
@@ -841,8 +873,14 @@ fn nt_query_license_value(name: u64, type_pointer: u64, data: u64, data_size: u6
     crate::ntos::ex::license::values::query_user(name, type_pointer, data, data_size as u32, state::stack_arg(rsp, 5))
 }
 
+/// NtApphelpCacheControl(Service, ServiceData) (`ps/apphelp_cache`).
+fn nt_apphelp_cache_control(service: u64, data: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
+    crate::ntos::ps::apphelp_cache::control(service as u32 as i32, data, 1)
+}
+
 pub fn init() {
-    let handlers: [(&'static str, state::SyscallHandler); 29] = [
+    let handlers: [(&'static str, state::SyscallHandler); 30] = [
+        ("NtApphelpCacheControl", nt_apphelp_cache_control),
         ("NtQueryLicenseValue", nt_query_license_value),
         ("NtGetCurrentProcessorNumber", nt_get_current_processor_number),
         ("NtGetCurrentProcessorNumberEx", nt_get_current_processor_number_ex),

@@ -10,7 +10,7 @@
 //! STATUS_INVALID_PARAMETER. NtSetDefaultUILanguage troca o idioma de
 //! interface; 0 é recusado. Em modo kernel não há checagem de privilégio.
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::ntos::inc::field::{Field, NtStruct};
 use crate::ntos::rtl::nls_configuration::{DEFAULT_LOCALE, DEFAULT_UI_LANGUAGE};
@@ -20,6 +20,17 @@ const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 static SYSTEM_LOCALE: AtomicU32 = AtomicU32::new(DEFAULT_LOCALE);
 static USER_LOCALE: AtomicU32 = AtomicU32::new(DEFAULT_LOCALE);
 static UI_LANGUAGE: AtomicU32 = AtomicU32::new(DEFAULT_UI_LANGUAGE);
+
+/// PsUILanguageComitted: começa desligado (o valor da imagem do ntoskrnl)
+/// e só o NtFlushInstallUILanguage com SetComittedFlag o liga.
+static UI_LANGUAGE_COMMITTED: AtomicBool = AtomicBool::new(false);
+
+/// NtIsUILanguageComitted (ntoskrnl 19041, rva 0x771f10): sem sonda nem
+/// privilégio, STATUS_SUCCESS com o idioma de interface da instalação já
+/// confirmado e STATUS_OBJECT_NAME_NOT_FOUND antes disso.
+pub fn is_ui_language_committed() -> u32 {
+    if UI_LANGUAGE_COMMITTED.load(Ordering::Acquire) { 0 } else { 0xC000_0034 }
+}
 
 fn locale_cell(user_profile: bool) -> &'static AtomicU32 {
     if user_profile { &USER_LOCALE } else { &SYSTEM_LOCALE }

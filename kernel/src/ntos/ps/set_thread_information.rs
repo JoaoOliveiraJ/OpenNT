@@ -1,5 +1,6 @@
 //! Zw/NtSetInformationThread.
 //!
+//! ThreadBreakOnTermination liga ou desliga a thread crítica.
 //! ThreadPagePriority altera só os três bits medidos na ETHREAD original. A
 //! ordem medida é sondagem, tamanho, captura/valor, referência, alteração
 //! atômica e liberação. A variante de syscall de usuário (`set_user`) entra
@@ -16,6 +17,9 @@ use crate::ntos::inc::field::NtStruct;
 use crate::ntos::inc::types::Ethread;
 
 const THREAD_PAGE_PRIORITY: u32 = 24;
+pub const THREAD_BREAK_ON_TERMINATION: u32 = 18;
+/// SeDebugPrivilege.
+const DEBUG_PRIVILEGE: u64 = 20;
 const THREAD_SET_INFORMATION: u32 = 0x20;
 const REJECTED_SET_CLASSES: [u32; 17] = [0, 6, 8, 11, 12, 16, 20, 21, 23, 26, 27, 28, 35, 37, 40, 41, 45];
 
@@ -58,6 +62,9 @@ pub fn set(thread_handle: u64, information_class: u32, input: u64, input_length:
     if information_class > 50 || REJECTED_SET_CLASSES.contains(&information_class) {
         return Ok(0xC000_0003);
     }
+    if information_class == THREAD_BREAK_ON_TERMINATION {
+        return set_break_on_termination(thread_handle, input, input_length, access_mode);
+    }
     if information_class != THREAD_PAGE_PRIORITY {
         return Ok(0xC000_0002);
     }
@@ -87,6 +94,33 @@ pub fn set(thread_handle: u64, information_class: u32, input: u64, input_length:
     result
 }
 
+
+/// ThreadBreakOnTermination (ntoskrnl 19041, rva 0x64b41e; o
+/// RtlSetThreadIsCritical): um ULONG (outro tamanho dá
+/// STATUS_INFO_LENGTH_MISMATCH), SeDebugPrivilege no modo anterior
+/// (STATUS_PRIVILEGE_NOT_HELD), o handle com THREAD_SET_INFORMATION, e o
+/// valor liga ou desliga ETHREAD.CrossThreadFlags.BreakOnTermination (o fim
+/// da thread derruba o sistema).
+fn set_break_on_termination(thread_handle: u64, input: u64, input_length: u32, access_mode: u8) -> Result<u32, KernelError> {
+    if input_length != 4 {
+        return Ok(0xC000_0004);
+    }
+    if access_mode != 0 && !user_probe::probe_user_read(input, 4) {
+        return Ok(STATUS_ACCESS_VIOLATION);
+    }
+    let Ok(value) = guest::try_read::<u32>(input) else { return Ok(STATUS_ACCESS_VIOLATION) };
+    if !crate::ntos::se::privilege::single_privilege_check(DEBUG_PRIVILEGE, u32::from(access_mode)) {
+        return Ok(0xC000_0061);
+    }
+    let mut reference = match thread_handles::reference(thread_handle, THREAD_SET_INFORMATION, access_mode)? {
+        Ok(reference) => reference,
+        Err(status) => return Ok(status),
+    };
+    // SAFETY: ETHREAD referenciado pelo handle; o bit muda por CAS atômico.
+    unsafe { Ethread::at(reference.pointer) }.set_break_on_termination((value != 0) as u32);
+    reference.release()?;
+    Ok(0)
+}
 
 /// Variante de syscall: recupera os argumentos originais, inclusive o lixo
 /// nos bits altos de ULONG.

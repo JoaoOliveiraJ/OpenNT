@@ -5025,6 +5025,7 @@ pub fn run(assert: Assert) {
     volume_file_lookup(assert);
     user_registry(assert);
     super::user_cm_services::run(assert);
+    super::user_boot_services::run(assert);
     user_file_io(assert);
     user_file_io_more(assert);
     disk_write_stress(assert, 12, 3);

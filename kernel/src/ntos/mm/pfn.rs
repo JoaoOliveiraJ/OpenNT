@@ -259,6 +259,15 @@ pub fn total_count() -> u64 {
     DATABASE.lock().partition.total
 }
 
+/// MmGetLowestPhysicalPage e MmGetHighestPhysicalPage: o primeiro e o último
+/// frame das faixas de RAM do banco (0, 0 antes do init).
+pub fn physical_page_bounds() -> (u64, u64) {
+    let database = DATABASE.lock();
+    let lowest = database.ranges.first().map_or(0, |range| range.base / FRAME_SIZE);
+    let highest = database.ranges.last().map_or(0, |range| range.top / FRAME_SIZE - 1);
+    (lowest, highest)
+}
+
 pub fn partition() -> Partition {
     DATABASE.lock().partition
 }

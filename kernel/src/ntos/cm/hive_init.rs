@@ -159,6 +159,80 @@ pub fn initialize_hives() -> Result<(), KernelError> {
     Ok(())
 }
 
+/// CmFirstTime, CmBootAcceptFirstTime e CmpBootPageFilesCreated: cada etapa
+/// do NtInitializeRegistry roda uma vez só (os valores iniciais da imagem do
+/// ntoskrnl são 1, 1 e 0).
+static FIRST_TIME: AtomicBool = AtomicBool::new(true);
+static BOOT_ACCEPT_FIRST_TIME: AtomicBool = AtomicBool::new(true);
+static BOOT_PAGE_FILES_CREATED: AtomicBool = AtomicBool::new(false);
+
+const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+const STATUS_PRIVILEGE_NOT_HELD: u32 = 0xC000_0061;
+const STATUS_TOO_LATE: u32 = 0xC000_0189;
+/// SeBackupPrivilege.
+const SE_BACKUP_PRIVILEGE: u64 = 17;
+/// CM_BOOT_FLAG_ACCEPTED: 0x1000 + o conjunto de controle aceito (até 999).
+const BOOT_FLAG_ACCEPTED: u16 = 0x1000;
+const BOOT_FLAG_MAX: u16 = BOOT_FLAG_ACCEPTED + 999;
+/// O pedido de cópia periódica de uma hive (o RegIdleBackup), só de modo
+/// usuário.
+const BOOT_FLAG_SYNC_BACKUP: u16 = 0x13E8;
+
+/// NtInitializeRegistry(BootCondition) (ntoskrnl 19041, rva 0x78d320).
+///
+/// De modo usuário, 0x13E8 exige SeBackupPrivilege e vai ao
+/// CmpSyncNextBackupHive; o resto entra de novo pelo ZwInitializeRegistry,
+/// em modo kernel, onde:
+/// - 0x1000..=0x13E7 (CM_BOOT_FLAG_ACCEPTED + n, o NotifyBootConfigStatus do
+///   services.exe) é o CmpAcceptBoot: uma vez só (depois
+///   STATUS_ACCESS_DENIED); 0x1000 puro consome a vez e dá
+///   STATUS_INVALID_PARAMETER; sem LastKnownGood (o CmpLKGEnabled fica 0 sem
+///   o valor `LastKnownGood\Enabled`) não há conjunto de controle a salvar;
+/// - 2 é o CmpHandlePageFileOpenNotification, que o smss pede depois de
+///   criar os arquivos de paginação: uma vez só (depois
+///   STATUS_ACCESS_DENIED); avisa os volumes das hives, e o OpenNT não tem
+///   volumes de hive com política de paginação;
+/// - 0 (CM_BOOT_FLAG_SMSS) e 1 (setup) são o
+///   CmCompleteRegistryInitialization: uma vez só (depois
+///   STATUS_ACCESS_DENIED). No NT ele liga a SOFTWARE, a SAM, a SECURITY e
+///   a DEFAULT e inicia os escritores preguiçosos (CmpCmdInit); no OpenNT a
+///   fase 1 já fez isso (`initialize_hives`);
+/// - o resto é STATUS_INVALID_PARAMETER.
+pub fn initialize_registry(boot_condition: u16, previous_mode: u8) -> u32 {
+    if previous_mode != 0 && boot_condition == BOOT_FLAG_SYNC_BACKUP {
+        if !crate::ntos::se::privilege::single_privilege_check(SE_BACKUP_PRIVILEGE, u32::from(previous_mode)) {
+            return STATUS_PRIVILEGE_NOT_HELD;
+        }
+        // CmpSyncNextBackupHive sem o processamento ocioso do Cm
+        // (CmpDoIdleProcessing): STATUS_TOO_LATE.
+        return STATUS_TOO_LATE;
+    }
+    if (BOOT_FLAG_ACCEPTED..=BOOT_FLAG_MAX).contains(&boot_condition) {
+        if !BOOT_ACCEPT_FIRST_TIME.swap(false, Ordering::AcqRel) {
+            return STATUS_ACCESS_DENIED;
+        }
+        return if boot_condition == BOOT_FLAG_ACCEPTED { STATUS_INVALID_PARAMETER } else { 0 };
+    }
+    match boot_condition {
+        2 => {
+            if BOOT_PAGE_FILES_CREATED.swap(true, Ordering::AcqRel) {
+                STATUS_ACCESS_DENIED
+            } else {
+                0
+            }
+        }
+        0 | 1 => {
+            if FIRST_TIME.swap(false, Ordering::AcqRel) {
+                0
+            } else {
+                STATUS_ACCESS_DENIED
+            }
+        }
+        _ => STATUS_INVALID_PARAMETER,
+    }
+}
+
 /// A hive SYSTEM veio do arquivo no boot.
 pub fn system_hive_from_file() -> bool {
     SYSTEM_FROM_FILE.load(Ordering::Acquire)

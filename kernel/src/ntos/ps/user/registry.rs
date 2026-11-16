@@ -321,8 +321,14 @@ fn nt_compress_key(key: u64, _a2: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<
     Ok(hive_services::compress_key(key, true))
 }
 
+/// NtInitializeRegistry(BootCondition), de modo usuário (`cm/hive_init`).
+fn nt_initialize_registry(boot_condition: u64, _a2: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
+    Ok(crate::ntos::cm::hive_init::initialize_registry(boot_condition as u16, 1))
+}
+
 /// Registra os handlers Nt*Key e a tabela de handles `key` do processo.
 pub fn init() {
+    state::register_handler("NtInitializeRegistry", nt_initialize_registry);
     state::register_handler("NtLoadKey", nt_load_key);
     state::register_handler("NtLoadKey2", nt_load_key2);
     state::register_handler("NtLoadKeyEx", nt_load_key_ex);
