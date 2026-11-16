@@ -15,9 +15,9 @@ O OpenNT avança em fases. Cada fase termina com o kernel compilando, iniciando 
 | 7 | modo usuário | em andamento |
 | 8 | vídeo, arquivos e rede | planejada |
 
-**Marco atual.** O adaptador de vídeo inicia pela sessão do win32k: o csrss.exe real chama o NtUserInitialize, o win32k.sys real anuncia a sessão e o dxgkrnl.sys inicia o BasicDisplay.sys, que cria o \Device\Video0.
+**Marco atual.** O NtUserInitialize do csrss.exe real volta com sucesso: o dxgkrnl.sys inicia o BasicDisplay.sys pela sessão do win32k e o InitVideo da sessão 0 monta a configuração de exibição sobre o dispositivo desconectado do win32k.
 
-**Próximo.** O InitVideo do win32k montar a configuração de exibição sobre o \Device\Video0 (hoje ele para com VIDEO_DRIVER_INIT_FAILURE, 0xB4) e a sessão gráfica seguir.
+**Próximo.** O csrss terminar a inicialização (falta a porta LPC de servidor em modo usuário, o NtCreatePort da \Windows\SbApiPort) para o smss da sessão executar o wininit.exe, que cria a WinSta0 com as Desktops Winlogon e Default (WINSTA0_OK).
 
 Hoje: **39 de 61** binários da Microsoft rodam (20 parciais); o kernel exporta **1.956 dos 3.070** nomes do `ntoskrnl.exe` do Windows 10 22H2 (63,7%). Detalhes em [O que roda](site/o-que-roda.html), [Componentes](site/componentes.html), [Exports](site/ntoskrnl.html) e [Testes](site/testes.html).
 
