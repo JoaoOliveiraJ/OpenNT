@@ -12605,6 +12605,10 @@ fn whea_error_source_exports(assert: Assert) {
     let data = guest::alloc_bytes(16);
     let guid = guest::alloc_bytes(16);
     assert(call_export("WheaReportHwErrorDeviceDriverEx", &[id as u64, 0, data, 16, 0, 0, guid, 0, 2, 0]) == Some(0), "whea-error-source: erro corrigido aceito");
+    // Severidade fatal pelo relatório comum de driver: vai ao registro do
+    // WHEA sem parar a máquina (o WheaReportHwError do NT não chama o
+    // PshedBugCheckSystem para um relatório de driver).
+    assert(call_export("WheaReportHwErrorDeviceDriverEx", &[id as u64, 0, data, 16, 0, 0, guid, 0, 1, 0]) == Some(0), "whea-error-source: relatorio de driver com severidade fatal aceito sem bugcheck");
     assert(call_export("WheaReportHwErrorDeviceDriverEx", &[0xFFFF, 0, data, 16, 0, 0, guid, 0, 2, 0]) == Some(signed_status(0xC000_009A)), "whea-error-source: fonte inexistente = STATUS_INSUFFICIENT_RESOURCES");
     // Validação do V1.
     configuration.version.set(2);

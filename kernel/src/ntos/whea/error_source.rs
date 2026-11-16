@@ -314,15 +314,25 @@ pub fn report_hw_error(packet: u64) -> u32 {
 
 /// WheaReportHwErrorDeviceDriverEx / WheaReportFatalHwErrorDeviceDriverEx
 /// (ErrorSourceId, DeviceObject, ErrorData, ErrorDataLength, ..., SectionTypeGuid,
-/// ..., ErrorSeverity, DeviceFriendlyName).
-pub fn report_device_driver_error(source_id: u32, _device: u64, _data: u64, _length: u32, _section_type: u64, severity: u32, fatal: bool) -> u32 {
+/// ..., ErrorSeverity, DeviceFriendlyName). Só o relatório fatal para a
+/// máquina: no WheaReportHwErrorDeviceDriverEx a severidade vai ao pacote
+/// com o bit de relatório de driver (WheaHwErrorReportSetSeverityDeviceDriver),
+/// e o WheaReportHwError do NT manda um relatório de driver de severidade
+/// fatal para a fila de trabalho do WHEA (o registro é gravado), sem o
+/// PshedBugCheckSystem: o storport.sys relata assim o dispositivo que um
+/// miniport marcou como falho (StorpMarkDeviceFailed).
+pub fn report_device_driver_error(source_id: u32, _device: u64, data: u64, length: u32, _section_type: u64, severity: u32, fatal: bool) -> u32 {
     let descriptor = get_error_source(source_id);
     if descriptor == 0 || descriptor_at(descriptor).type_.get().0 as u32 != SOURCE_TYPE_DEVICE_DRIVER {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
-    if fatal || severity == SEVERITY_FATAL {
+    if fatal {
         crate::ntos::ke::bugcheck::bug_check_ex(WHEA_UNCORRECTABLE_ERROR, SOURCE_TYPE_DEVICE_DRIVER as u64, descriptor, source_id as u64, 0);
     }
-    debug_print!("[whea] erro de dispositivo reportado: fonte {} severidade {}", source_id, severity);
+    // Os dados da seção do driver vão ao log (até 128 bytes), no lugar do
+    // registro de erros do WHEA que o OpenNT não grava.
+    let shown = if data != 0 { guest::read_bytes(data, length.min(128) as usize) } else { Vec::new() };
+    let hex: alloc::string::String = shown.iter().map(|byte| alloc::format!("{byte:02x}")).collect();
+    debug_print!("[whea] erro de dispositivo reportado: fonte {} severidade {}, {} bytes: {}", source_id, severity, length, hex);
     STATUS_SUCCESS
 }
