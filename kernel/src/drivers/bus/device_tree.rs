@@ -78,6 +78,7 @@ pub fn prepare() -> Result<(), KernelError> {
 /// relatou.
 pub fn build() {
     let storage = if storage_stack::enabled() { storage_stack::before_tree() } else { None };
+    let nvme = crate::drivers::storage::nvme_stack::enabled() && crate::drivers::storage::nvme_stack::before_tree();
     if display_stack::enabled() {
         display_stack::before_tree();
     }
@@ -103,6 +104,9 @@ pub fn build() {
     }
     if let Some(reference) = storage {
         storage_stack::check(&reference);
+    }
+    if nvme {
+        crate::drivers::storage::nvme_stack::check();
     }
     if display_stack::enabled() {
         display_stack::check();

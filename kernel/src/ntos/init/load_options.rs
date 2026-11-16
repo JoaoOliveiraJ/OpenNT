@@ -41,7 +41,8 @@ pub const TRACE_DRIVER_API: &str = "TRACEDRIVERAPI";
 pub const CONSOLE_MIRROR: &str = "CONSOLEMIRROR";
 /// `smss`: o primeiro processo de usuário é o smss.exe real.
 pub const INITIAL_PROCESS: &str = "INITIALPROCESS";
-/// `real`: a pilha de armazenamento do Windows sobe pelo PnP.
+/// `real`: a pilha de armazenamento do Windows sobe pelo PnP na controladora
+/// IDE; `nvme`: o storport.sys com o stornvme.sys no controlador NVMe.
 pub const STORAGE: &str = "STORAGE";
 /// `basic`: o BasicDisplay.sys real no adaptador VGA.
 pub const DISPLAY: &str = "DISPLAY";

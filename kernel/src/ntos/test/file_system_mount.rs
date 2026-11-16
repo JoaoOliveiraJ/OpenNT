@@ -101,15 +101,24 @@ pub fn after_driver_start(name: &str) {
 /// minifiltros, com a pilha de filtros sobre o volume.
 pub fn file_operations(new_file: &str, content: &[u8]) -> Result<(), alloc::string::String> {
     mount_and_read()?;
-    write_and_read_back(new_file, content)
+    write_and_read_back(&alloc::format!("\\Device\\{}", ata_volume::DEVICE_NAME), new_file, content)
 }
 
 fn mount_and_read() -> Result<(), alloc::string::String> {
     use alloc::format;
     let expected = crate::drivers::fs::ntfs::mounted().and_then(|volume| volume.read_bytes(&format!("/{KNOWN_FILE}")).ok().flatten()).ok_or("o leitor do kernel nao achou o arquivo conhecido")?;
     let device = ata_volume::create(1).map_err(|error| format!("dispositivo do volume: {error}"))?;
+    let volume = format!("\\Device\\{}", ata_volume::DEVICE_NAME);
+    read_known_file(device, &volume, KNOWN_FILE, &expected)
+}
+
+/// Abre `<volume>\<arquivo>` pelos exports (o IopParseDevice monta o volume
+/// de `device` pelo IopMountVolume, se ainda não montado), lê pelo file
+/// system e confere os bytes com `expected` e a leitura pelo Cache Manager.
+pub fn read_known_file(device: u64, volume: &str, file: &str, expected: &[u8]) -> Result<(), alloc::string::String> {
+    use alloc::format;
     let block = guest::alloc_bytes(0x400);
-    let path = format!("\\Device\\{}\\{}", ata_volume::DEVICE_NAME, KNOWN_FILE);
+    let path = format!("{volume}\\{file}");
     let attributes = object_attributes(block, &path);
     let (handle, iosb, buffer, offset) = (block + 0x300, block + 0x310, guest::alloc_bytes(0x1000), block + 0x320);
     let created = call_export("ZwCreateFile", &[handle, FILE_GENERIC_READ, attributes, iosb, 0, 0, FILE_SHARE_READ, FILE_OPEN, FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE, 0, 0]).unwrap_or(u64::MAX) as u32;
@@ -118,6 +127,8 @@ fn mount_and_read() -> Result<(), alloc::string::String> {
     let vpb = at::<nt::Vpb>(vpb_address);
     debug_print!("[fs-mount] ZwCreateFile({}) -> {:#x}, Information {}; VPB flags {:#x}, volume {:#x}", path, created, guest::read64(iosb + 8), vpb.flags.get(), vpb.device_object.get());
     if created != 0 {
+        guest::free_bytes(buffer);
+        guest::free_bytes(block);
         return Err(format!("ZwCreateFile devolveu {created:#x}"));
     }
     let file_handle = guest::read64(handle);
@@ -144,13 +155,14 @@ fn mount_and_read() -> Result<(), alloc::string::String> {
     Ok(())
 }
 
-/// Um arquivo novo do volume: criado, gravado e fechado pelo file system
-/// (a escrita vai ao Cache Manager), depois reaberto e lido de volta.
-fn write_and_read_back(new_file: &str, content: &[u8]) -> Result<(), alloc::string::String> {
+/// Um arquivo novo `new_file` no volume `volume` (o caminho do
+/// dispositivo): criado, gravado com `content` e fechado pelo file system (a
+/// escrita vai ao Cache Manager), depois reaberto e lido de volta.
+pub fn write_and_read_back(volume: &str, new_file: &str, content: &[u8]) -> Result<(), alloc::string::String> {
     use alloc::format;
     let block = guest::alloc_bytes(0x400);
     let buffer = guest::alloc_bytes(0x1000);
-    let path = format!("\\Device\\{}\\{}", ata_volume::DEVICE_NAME, new_file);
+    let path = format!("{volume}\\{new_file}");
     let attributes = object_attributes(block, &path);
     let (handle, iosb, offset) = (block + 0x300, block + 0x310, block + 0x320);
     let result = (|| -> Result<(), alloc::string::String> {

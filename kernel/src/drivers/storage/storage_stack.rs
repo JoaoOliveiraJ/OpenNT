@@ -45,12 +45,12 @@ const SECTOR_SIZE: usize = 512;
 /// Disco do volume NTFS (mestre-escravo primário: o segundo disco).
 const DATA_DRIVE: u8 = 1;
 
-/// O que a instalação do Windows deixa no Registro para esta pilha e que o
-/// OpenNT ainda não tem: os serviços de boot partmgr e volmgr e as classes
-/// de dispositivo. Os serviços dos dispositivos (intelide, atapi, disk)
-/// entram com a instalação de cada devnode, e a instância ROOT\VOLMGR\0000
-/// nasce do IoReportDetectedDevice do próprio volmgr.sys.
-fn seed_registry() -> Result<(), KernelError> {
+/// O que a instalação do Windows deixa no Registro para as pilhas de disco
+/// e que o OpenNT ainda não tem: os serviços de boot partmgr e volmgr e as
+/// classes de dispositivo. Os serviços dos dispositivos (intelide, atapi,
+/// stornvme, disk) entram com a instalação de cada devnode, e a instância
+/// ROOT\VOLMGR\0000 nasce do IoReportDetectedDevice do próprio volmgr.sys.
+pub fn seed_registry() -> Result<(), KernelError> {
     use install::ServiceSpec;
     // partmgr: o filtro de classe do DiskDrive (c_diskdrive.inf); a chave do
     // serviço vem da instalação do sistema (Group "Boot Bus Extender",
@@ -68,10 +68,10 @@ fn seed_registry() -> Result<(), KernelError> {
     Ok(())
 }
 
-/// Lê `SECTORS` setores do disco pela pilha real: IRP_MJ_READ (MDL do
+/// Lê `sectors` setores do disco pela pilha real: IRP_MJ_READ (MDL do
 /// IoBuildSynchronousFsdRequest) no topo da pilha do disco.
-fn read_through_stack(disk: u64, lba: u64) -> Result<Vec<u8>, KernelError> {
-    let length = SECTORS * SECTOR_SIZE as u32;
+pub fn read_through_stack(disk: u64, lba: u64, sectors: u32) -> Result<Vec<u8>, KernelError> {
+    let length = sectors * SECTOR_SIZE as u32;
     let buffer = guest::alloc_aligned(length as u64, 0x1000, true);
     let event = guest::alloc_bytes(Kevent::SIZE);
     let io_status = guest::alloc_bytes(IoStatusBlock::SIZE);
@@ -125,7 +125,7 @@ fn signature_only_difference(bytes: &[u8], reference: &[u8]) -> bool {
 }
 
 /// O DEVICE_OBJECT de `\Device\HarddiskN\DR N` criado pelo disk.sys.
-fn disk_device(number: u32) -> Option<u64> {
+pub fn disk_device(number: u32) -> Option<u64> {
     let node = object_manager::lookup(&format!("\\Device\\Harddisk{number}\\DR{number}"))?;
     io_manager::device(node).map(|entry| entry.native_device).filter(|&device| device != 0)
 }
@@ -174,7 +174,7 @@ pub fn check(reference: &[u8]) {
         debug_print!("[storage] \\Device\\Harddisk1\\DR1 nao existe: o disco 1 nao chegou ao disk.sys");
         return;
     };
-    match read_through_stack(disk, 0) {
+    match read_through_stack(disk, 0, SECTORS) {
         Ok(mut bytes) if signature_only_difference(&bytes, reference) => {
             // O partmgr.sys dá uma assinatura de disco MBR (offset 0x1B8 do
             // setor 0) a um disco que não tem nenhuma, como no Windows: o

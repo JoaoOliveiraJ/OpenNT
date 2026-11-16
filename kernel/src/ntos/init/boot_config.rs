@@ -133,6 +133,12 @@ pub fn real_storage() -> bool {
     value(name::STORAGE) == Some("real")
 }
 
+/// `STORAGE=nvme` (`--storage=nvme`): o storport.sys com o stornvme.sys sobem
+/// pelo PnP no controlador NVMe do QEMU.
+pub fn nvme_storage() -> bool {
+    value(name::STORAGE) == Some("nvme")
+}
+
 /// `DISPLAY=basic` (`--display=basic`): o PnP instala o BasicDisplay.sys real
 /// no adaptador VGA.
 pub fn basic_display() -> bool {

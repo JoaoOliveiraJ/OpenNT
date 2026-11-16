@@ -117,10 +117,11 @@ pub fn init() {
     // A árvore de dispositivos do PnP, uma vez: a raiz é o acpi.sys real
     // sobre o dispositivo ACPI da HAL, com o pci.sys no barramento PCI (o
     // padrão; `--pnp-root=internal` volta ao barramento PCI interno), com as
-    // pilhas pedidas: `--storage=real` (a pilha de armazenamento do Windows)
-    // e `--display=basic` (o BasicDisplay.sys real no adaptador VGA, sobre o
-    // dxgkrnl.sys real).
-    if crate::drivers::bus::acpi_stack::enabled() || crate::drivers::storage::storage_stack::enabled() || crate::drivers::video::display_stack::enabled() {
+    // pilhas pedidas: `--storage=real` (a pilha de armazenamento do Windows),
+    // `--storage=nvme` (o storport.sys com o stornvme.sys no controlador
+    // NVMe) e `--display=basic` (o BasicDisplay.sys real no adaptador VGA,
+    // sobre o dxgkrnl.sys real).
+    if crate::drivers::bus::acpi_stack::enabled() || crate::drivers::storage::storage_stack::enabled() || crate::drivers::storage::nvme_stack::enabled() || crate::drivers::video::display_stack::enabled() {
         // `--start-driver` liga o Code Integrity: como no NT, ele já valida
         // os drivers que a árvore carrega (acpi.sys, pci.sys, i8042prt.sys...).
         if !crate::ntos::init::boot_config::start_driver().is_empty() {
