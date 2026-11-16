@@ -19,7 +19,7 @@ O OpenNT avança em fases. Cada fase termina com o kernel compilando, iniciando 
 
 **Próximo.** O csrss terminar a inicialização (falta a porta LPC de servidor em modo usuário, o NtCreatePort da \Windows\SbApiPort) para o smss da sessão executar o wininit.exe, que cria a WinSta0 com as Desktops Winlogon e Default (WINSTA0_OK).
 
-Hoje: **39 de 61** binários da Microsoft rodam (20 parciais); o kernel exporta **1.956 dos 3.070** nomes do `ntoskrnl.exe` do Windows 10 22H2 (63,7%). Detalhes em [O que roda](site/o-que-roda.html), [Componentes](site/componentes.html), [Exports](site/ntoskrnl.html) e [Testes](site/testes.html).
+Hoje: **39 de 61** binários da Microsoft rodam (20 parciais); o kernel exporta **1.972 dos 3.070** nomes do `ntoskrnl.exe` do Windows 10 22H2 (64,2%). Detalhes em [O que roda](site/o-que-roda.html), [Componentes](site/componentes.html), [Exports](site/ntoskrnl.html) e [Testes](site/testes.html).
 
 ## Fase 1 — base (concluída)
 
@@ -86,7 +86,7 @@ Carregador de PE, funções exportadas pelo kernel, Code Integrity real (ci.dll)
 | Depurador do kernel | Funciona | kd |
 | Carregador de PE e exports do kernel | Parcial | fase6, boot |
 | hal.dll | Funciona | drivers |
-| i8042prt.sys | Funciona | teclado, drivers, shell |
+| i8042prt.sys | Funciona | teclado, drivers, shell, bugcheck |
 | kbdclass.sys | Funciona | teclado, drivers, shell |
 | mouclass.sys | Funciona | drivers, teclado |
 | wmilib.sys e WppRecorder.sys | Funciona | teclado, drivers |
