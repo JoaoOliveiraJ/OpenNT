@@ -150,11 +150,13 @@ fn nt_query_performance_counter(counter: u64, frequency: u64, _a3: u64, _a4: u64
     if counter == 0 || !probe_user_write(counter, 8) || (frequency != 0 && !probe_user_write(frequency, 8)) {
         return Ok(0xC000_0005);
     }
+    super::time_services::count_performance_counter_call();
     state::guarded(|| {
-        // LARGE_INTEGER.QuadPart de cada saída: um store de qword sondado.
-        guest::try_write::<u64>(counter, cpu::rdtsc())?;
+        // LARGE_INTEGER.QuadPart de cada saída: um store de qword sondado
+        // (o KeQueryPerformanceCounter e a frequência de 10 MHz).
+        guest::try_write::<u64>(counter, clock::query_performance_counter_value())?;
         if frequency != 0 {
-            guest::try_write::<u64>(frequency, clock::tsc_frequency_hz())?;
+            guest::try_write::<u64>(frequency, clock::QPC_FREQUENCY)?;
         }
         Ok(STATUS_SUCCESS)
     })
@@ -331,6 +333,8 @@ fn query_system_information(class: u32, buffer: u64, length: u64, returned: u64)
         143 => return secure_boot_information::query(buffer, length, returned, true),
         157 => return crate::ntos::ex::manufacturing_information::query(buffer, length, returned, true),
         3 => return crate::ntos::ex::time_of_day_information::query(buffer, length, returned, true),
+        44 | 102 => return Ok(crate::ntos::ex::time_zone::query(class, buffer, length, returned, true)),
+        124 => return Ok(crate::ntos::ex::time_of_day_information::query_counter_class(buffer, length, returned, true)),
         1 | 63 => return Ok(processor_information::query(buffer, length as u32, returned, true, class == 63)),
         154 => return Ok(processor_information::query_features(buffer, length as u32, returned, true)),
         5 => return system_process_information::query(buffer, length, returned, true),

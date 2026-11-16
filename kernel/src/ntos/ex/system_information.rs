@@ -68,7 +68,8 @@ pub fn is_fixed_class(class: u32) -> bool {
 ///   (MmGetHighestPhysicalPage << 12 | 0xFFF).
 /// - SystemHypervisorSharedPageInformation (197, rva 0x6cced4): pelo menos
 ///   8 bytes, o endereço de usuário da página compartilhada do hypervisor
-///   (MiState); sem hypervisor que a publique, 0.
+///   (MiState): a página de referência do QPC que a KUSER_SHARED_DATA
+///   anuncia (o `shared_user_data` do Mm).
 pub fn query_fixed(class: u32, output: u64, length: u32) -> Option<Result<(u32, u32), KernelError>> {
     // (tamanho, exato, dados)
     let (required, exact, data) = match class {
@@ -81,7 +82,7 @@ pub fn query_fixed(class: u32, output: u64, length: u32) -> Option<Result<(u32, 
             data.extend_from_slice(&((highest << 12) + 0xFFF).to_le_bytes());
             (0x18, true, data)
         }
-        SYSTEM_HYPERVISOR_SHARED_PAGE_INFORMATION => (8, false, 0u64.to_le_bytes().to_vec()),
+        SYSTEM_HYPERVISOR_SHARED_PAGE_INFORMATION => (8, false, crate::ntos::mm::shared_user_data::hypervisor_shared_user_va().to_le_bytes().to_vec()),
         _ => return None,
     };
     let fits = if exact { length == required } else { length >= required };
@@ -108,6 +109,8 @@ pub fn query(class: u32, output: u64, length: u32, returned: u64) -> Result<u32,
         143 => return secure_boot_information::query(output, length as u64, returned, false),
         157 => return crate::ntos::ex::manufacturing_information::query(output, length as u64, returned, false),
         3 => return crate::ntos::ex::time_of_day_information::query(output, length as u64, returned, false),
+        44 | 102 => return Ok(crate::ntos::ex::time_zone::query(class, output, length as u64, returned, false)),
+        124 => return Ok(crate::ntos::ex::time_of_day_information::query_counter_class(output, length as u64, returned, false)),
         11 | 77 => return module_queries::query_system_modules(class, output, length as u64, returned),
         1 | 63 => return Ok(processor_information::query(output, length, returned, false, class == 63)),
         // SystemProcessorFeaturesInformation.
@@ -323,6 +326,7 @@ fn query_interrupt_steering(input: u64, input_length: u32, output: u64, length: 
 pub fn set(class: u32, buffer: u64, length: u32) -> u32 {
     let status_of = |error: KernelError| if error.status != 0 { error.status } else { 0xC000_0001 };
     match class {
+        44 | 102 => return crate::ntos::ex::time_zone::set(class, buffer, length, false),
         SYSTEM_EXTEND_SERVICE_TABLE_INFORMATION => return extend_service_table(buffer, length).unwrap_or_else(status_of),
         SYSTEM_LOAD_GDI_DRIVER_INFORMATION => return load_gdi_driver(buffer, length, true).unwrap_or_else(status_of),
         SYSTEM_LOAD_GDI_DRIVER_IN_SYSTEM_SPACE => return load_gdi_driver(buffer, length, false).unwrap_or_else(status_of),
@@ -506,6 +510,9 @@ pub fn set_from_user_mode(class: u32, buffer: u64, length: u32) -> Result<u32, K
         if end > crate::ntos::mm::memory_map::USER_PROBE_ADDRESS || end < buffer {
             return Ok(STATUS_ACCESS_VIOLATION);
         }
+    }
+    if matches!(class, 44 | 102) {
+        return Ok(crate::ntos::ex::time_zone::set(class, buffer, length, true));
     }
     if matches!(class, SYSTEM_LOAD_GDI_DRIVER_INFORMATION | SYSTEM_UNLOAD_GDI_DRIVER_INFORMATION | SYSTEM_LOAD_GDI_DRIVER_IN_SYSTEM_SPACE) {
         let expected = if class == SYSTEM_UNLOAD_GDI_DRIVER_INFORMATION { 8 } else { crate::ntos::inc::types::extra_ps_user::SystemGdiDriverInformation::SIZE as u32 };

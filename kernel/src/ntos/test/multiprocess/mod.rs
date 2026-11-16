@@ -22,6 +22,7 @@ pub mod access_control;
 pub mod create_user_process;
 pub mod cross_memory;
 pub mod user_callback;
+pub mod time_services;
 
 pub mod process_queries;
 pub mod ipi_stall;

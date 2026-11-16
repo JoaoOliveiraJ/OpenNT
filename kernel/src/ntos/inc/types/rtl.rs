@@ -1456,3 +1456,46 @@ const _: () = {
     assert!(core::mem::size_of::<RtlpRangeListEntryMerged>() == 0x10);
     assert!(core::mem::offset_of!(RtlpRangeListEntryMerged, list_head) == 0x0);
 };
+
+/// `_RTL_TIME_ZONE_INFORMATION` (0xac bytes).
+#[repr(C)]
+pub struct RtlTimeZoneInformation {
+    pub bias: Field<i32>,
+    pub standard_name: [Field<u16>; 32],
+    pub standard_start: TimeFields,
+    pub standard_bias: Field<i32>,
+    pub daylight_name: [Field<u16>; 32],
+    pub daylight_start: TimeFields,
+    pub daylight_bias: Field<i32>,
+}
+
+unsafe impl NtStruct for RtlTimeZoneInformation {}
+
+const _: () = {
+    assert!(core::mem::size_of::<RtlTimeZoneInformation>() == 0xac);
+    assert!(core::mem::offset_of!(RtlTimeZoneInformation, bias) == 0x0);
+    assert!(core::mem::offset_of!(RtlTimeZoneInformation, standard_name) == 0x4);
+    assert!(core::mem::offset_of!(RtlTimeZoneInformation, standard_start) == 0x44);
+    assert!(core::mem::offset_of!(RtlTimeZoneInformation, standard_bias) == 0x54);
+    assert!(core::mem::offset_of!(RtlTimeZoneInformation, daylight_name) == 0x58);
+    assert!(core::mem::offset_of!(RtlTimeZoneInformation, daylight_start) == 0x98);
+    assert!(core::mem::offset_of!(RtlTimeZoneInformation, daylight_bias) == 0xa8);
+};
+
+/// `_RTL_DYNAMIC_TIME_ZONE_INFORMATION` (0x1b0 bytes).
+#[repr(C)]
+pub struct RtlDynamicTimeZoneInformation {
+    pub tzi: RtlTimeZoneInformation,
+    pub time_zone_key_name: [Field<u16>; 128],
+    pub dynamic_daylight_time_disabled: Field<u8>,
+    _pad_1ad: Reserved<0x3>,
+}
+
+unsafe impl NtStruct for RtlDynamicTimeZoneInformation {}
+
+const _: () = {
+    assert!(core::mem::size_of::<RtlDynamicTimeZoneInformation>() == 0x1b0);
+    assert!(core::mem::offset_of!(RtlDynamicTimeZoneInformation, tzi) == 0x0);
+    assert!(core::mem::offset_of!(RtlDynamicTimeZoneInformation, time_zone_key_name) == 0xac);
+    assert!(core::mem::offset_of!(RtlDynamicTimeZoneInformation, dynamic_daylight_time_disabled) == 0x1ac);
+};

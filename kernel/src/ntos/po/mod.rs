@@ -15,3 +15,4 @@ pub mod shutdown;
 pub mod reason_context;
 pub mod thermal;
 pub mod power_action;
+pub mod time_change;

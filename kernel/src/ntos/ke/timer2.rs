@@ -118,7 +118,8 @@ fn absolute_due(now: u64, interval: u64) -> u64 {
 /// KeSetTimer2(Timer, DueTime, Period, Parameters): TRUE se o timer já
 /// estava inserido.
 pub fn set(timer: &Ktimer2, due_time: i64, period: i64, parameters: u64) -> bool {
-    let period = if period != 0 && period < clock::CLOCK_TIME_INCREMENT as i64 { clock::CLOCK_TIME_INCREMENT as i64 } else { period };
+    // Um período abaixo de KeMinimumIncrement sobe a ele.
+    let period = if period != 0 && period < clock::MINIMUM_INCREMENT as i64 { clock::MINIMUM_INCREMENT as i64 } else { period };
     let absolute = due_time > 0;
     // Prazo absoluto: o intervalo até ele na hora do sistema (0 se passou).
     let interval = if absolute {

@@ -157,7 +157,7 @@ fn system_classes(assert: Assert, block: u64, call: Call) {
     let shared = query(197, buffer, 16);
     let shared_page = guest::read64(buffer);
     let shared_returned = guest::read32(returned);
-    assert(shared == 0 && shared_page == 0 && shared_returned == 8 && query(197, buffer, 4) == STATUS_INFO_LENGTH_MISMATCH && guest::read32(returned) == 8 && query(197, buffer + 2, 8) == STATUS_DATATYPE_MISALIGNMENT, "userboot: SystemHypervisorSharedPageInformation sem hypervisor publica 0");
+    assert(shared == 0 && shared_page == crate::ntos::mm::shared_user_data::hypervisor_shared_user_va() && shared_page != 0 && shared_returned == 8 && query(197, buffer, 4) == STATUS_INFO_LENGTH_MISMATCH && guest::read32(returned) == 8 && query(197, buffer + 2, 8) == STATUS_DATATYPE_MISALIGNMENT, "userboot: SystemHypervisorSharedPageInformation publica a pagina de referencia do QPC");
 }
 
 fn events(assert: Assert, block: u64, rsp: u64, call: Call) {

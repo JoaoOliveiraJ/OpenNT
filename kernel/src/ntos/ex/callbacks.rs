@@ -706,6 +706,14 @@ pub fn name(pointer: u64) -> Option<String> {
     STATE.lock().objects.get(&pointer).filter(|item| item.named).and_then(|item| item.name.clone())
 }
 
+/// Um dos objetos permanentes de [`init`] pelo nome (`SetSystemTime`,
+/// `PowerState`, `ProcessorAdd`): os ponteiros ExCbSetSystemTime,
+/// ExCbPowerState e ExCbProcessorAdd do NT.
+pub fn system_callback(name: &str) -> Option<u64> {
+    let full = alloc::format!("\\Callback\\{name}");
+    STATE.lock().objects.iter().find(|(_, item)| item.named && item.permanent && item.name.as_deref().is_some_and(|own| own.eq_ignore_ascii_case(&full))).map(|(&pointer, _)| pointer)
+}
+
 /// (referências, handles, registros) de um objeto vivo.
 pub fn counts(pointer: u64) -> Option<(u32, u32, usize)> {
     STATE.lock().objects.get(&pointer).map(|item| (item.references, item.handles, item.registrations.len()))

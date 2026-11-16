@@ -33,6 +33,8 @@ pub mod event;
 pub mod boot_device;
 pub mod extension_host;
 pub mod system_time;
+pub mod time_zone;
+pub mod timer_resolution;
 pub mod interlocked_list;
 pub mod system_information;
 pub mod boot_display;

@@ -35,6 +35,7 @@ pub mod syscall_scan;
 pub mod loader;
 pub mod nls;
 pub mod syscalls_core;
+pub mod time_services;
 pub mod index;
 pub mod process;
 pub mod tokens;

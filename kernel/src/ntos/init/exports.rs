@@ -66,7 +66,7 @@ pub struct Group {
 }
 
 /// Grupos implementados (qualquer ordem: a posição vem de `GROUP_LAYOUT`).
-fn groups() -> [&'static Group; 506] {
+fn groups() -> [&'static Group; 507] {
     [
         &crate::ntos::ps::exports::ps_jobs::GROUP,
         &crate::ntos::alpc::exports::zw_alpc_server::GROUP,
@@ -575,6 +575,7 @@ fn groups() -> [&'static Group; 506] {
         &crate::ntos::po::exports::po_system_wake_device::GROUP,
         &crate::ntos::se::exports::se_query_session_id_token::GROUP,
         &crate::ntos::ke::exports::nt_build_number::GROUP,
+        &crate::ntos::ex::exports::time_keeping::GROUP,
     ]
 }
 
@@ -731,6 +732,8 @@ pub fn init() {
     crate::ntos::ps::user::wait_packets::init();
     crate::ntos::ps::user::nls::init();
     crate::ntos::ps::user::syscalls_core::init();
+    crate::ntos::ps::user::time_services::init();
+    crate::ntos::ex::timer_resolution::initialize();
     crate::ntos::ps::user::tokens::init();
     crate::ntos::po::shutdown::register_user_services();
     crate::ntos::ps::user::index::register();

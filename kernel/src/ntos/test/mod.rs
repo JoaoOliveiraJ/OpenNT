@@ -49,3 +49,4 @@ pub mod io_fsrtl_exports;
 pub mod ps_ke_mm_exports;
 pub mod executive_misc_exports;
 pub mod rtl_decompression;
+pub mod time_keeping;

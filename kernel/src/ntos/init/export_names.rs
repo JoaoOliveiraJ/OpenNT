@@ -512,9 +512,10 @@ pub static GROUP_LAYOUT: &[(&str, usize, usize)] = &[
     ("po-system-wake-device", 2057, 1),
     ("se-query-session-id-token", 2058, 1),
     ("nt-build-number", 2059, 0),
+    ("time-keeping", 2059, 14),
 ];
 
-/// Os 2059 exports de função, na ordem da ABI.
+/// Os 2073 exports de função, na ordem da ABI.
 pub static EXPORT_NAMES: &[&str] = &[
     "DbgPrint",
     "DbgPrintEx",
@@ -2575,4 +2576,18 @@ pub static EXPORT_NAMES: &[&str] = &[
     "VslDeleteSecureSection",
     "PoSetSystemWakeDevice",
     "SeQuerySessionIdToken",
+    "HalQueryRealTimeClock",
+    "HalSetRealTimeClock",
+    "ExRealTimeIsUniversal",
+    "RtlQueryTimeZoneInformation",
+    "RtlSetTimeZoneInformation",
+    "RtlQueryDynamicTimeZoneInformation",
+    "RtlSetDynamicTimeZoneInformation",
+    "RtlLocalTimeToSystemTime",
+    "RtlTimeToSecondsSince1970",
+    "RtlTimeToSecondsSince1980",
+    "RtlSecondsSince1980ToTime",
+    "ZwQueryTimerResolution",
+    "ZwSetTimerResolution",
+    "ZwSetSystemTime",
 ];

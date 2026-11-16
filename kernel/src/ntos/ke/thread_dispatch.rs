@@ -332,9 +332,9 @@ pub fn query_runtime_thread(thread: u64, user_time: u64) -> u64 {
     let (kernel, user) = crate::ntos::ps::process::thread_record(thread).map_or((0, 0), |record| (record.kernel_time, record.user_time));
     if user_time != 0 {
         // SAFETY: PULONG UserTime opcional do chamador.
-        unsafe { Field::<u32>::at(user_time) }.set((user / clock::TIME_INCREMENT) as u32);
+        unsafe { Field::<u32>::at(user_time) }.set((user / clock::MAXIMUM_INCREMENT as u64) as u32);
     }
-    kernel / clock::TIME_INCREMENT & 0xFFFF_FFFF
+    kernel / clock::MAXIMUM_INCREMENT as u64 & 0xFFFF_FFFF
 }
 
 /// A thread de boot do System não é o processo Idle.

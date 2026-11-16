@@ -1175,7 +1175,6 @@ pub mod ex_legacy_support {
     use crate::ntos::ex::{interlocked, pool_allocation};
     use crate::ntos::inc::types::{Field, ListEntry, NtStruct};
     use crate::ntos::init::exports::{Call, Group};
-    use crate::ntos::ke::clock;
     use crate::rtl::KernelError;
 
     fn allocate_pool(call: &Call) -> Result<u64, KernelError> {
@@ -1191,7 +1190,7 @@ pub mod ex_legacy_support {
     fn query_timer_resolution(call: &Call) -> Result<u64, KernelError> {
         // SAFETY: PULONG de saída de um chamador de modo kernel.
         let (maximum, minimum, current) = unsafe { (Field::<u32>::at(call.arg(1)), Field::<u32>::at(call.arg(2)), Field::<u32>::at(call.arg(3))) };
-        clock::query_timer_resolution(maximum, minimum, current);
+        crate::ntos::ex::timer_resolution::query_timer_resolution(maximum, minimum, current);
         Ok(0)
     }
 
@@ -1337,16 +1336,15 @@ pub mod ex_extension_unregister {
 }
 
 pub mod ex_timer_resolution {
-    //! ExSetTimerResolution; a lógica mora em `ke/clock`, junto do
-    //! ExQueryTimerResolution.
+    //! ExSetTimerResolution; a lógica mora em `ex/timer_resolution`, junto
+    //! do ExQueryTimerResolution.
 
     use crate::ntos::init::exports::{Call, Group};
-    use crate::ntos::ke::clock;
     use crate::rtl::KernelError;
 
     /// ExSetTimerResolution(DesiredTime, SetResolution) -> ULONG.
     fn set_timer_resolution(call: &Call) -> Result<u64, KernelError> {
-        Ok(clock::set_timer_resolution(call.arg(1) as u32, call.arg(2) as u8 != 0) as u64)
+        Ok(crate::ntos::ex::timer_resolution::set_timer_resolution(call.arg(1) as u32, call.arg(2) as u8 != 0) as u64)
     }
 
     pub static GROUP: Group = Group {
@@ -1631,4 +1629,119 @@ pub mod ex_nt_create_event {
     }
 
     pub static GROUP: Group = Group { name: "ex-nt-create-event", names: &["NtCreateEvent"], handlers: &[nt_create_event], data_exports: &[] };
+}
+
+pub mod time_keeping {
+    //! O relógio de tempo real, o fuso e a resolução do relógio: a lógica
+    //! mora em `hal/rtc`, `ex/time_zone`, `ex/system_time`,
+    //! `ex/timer_resolution` e `rtl/time`.
+
+    use crate::ntos::ex::{system_time, time_zone, timer_resolution};
+    use crate::ntos::inc::types::{Field, LargeInteger, NtStruct, TimeFields};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::rtl::time::{self, Fields};
+    use crate::rtl::KernelError;
+
+    // SAFETY (adaptadores deste grupo): ponteiros de um chamador de modo
+    // kernel, vivos e alinhados.
+    fn fields_at(address: u64) -> &'static TimeFields {
+        unsafe { TimeFields::at(address) }
+    }
+    fn time_at(address: u64) -> &'static LargeInteger {
+        unsafe { LargeInteger::at(address) }
+    }
+
+    /// HalQueryRealTimeClock(TimeFields*) -> BOOLEAN.
+    fn hal_query_real_time_clock(call: &Call) -> Result<u64, KernelError> {
+        Ok(match crate::hal::rtc::query_real_time_clock() {
+            Some(fields) => {
+                fields.write(fields_at(call.arg(1)));
+                1
+            }
+            None => 0,
+        })
+    }
+
+    /// HalSetRealTimeClock(TimeFields*) -> BOOLEAN.
+    fn hal_set_real_time_clock(call: &Call) -> Result<u64, KernelError> {
+        Ok(crate::hal::rtc::set_real_time_clock(&Fields::read(fields_at(call.arg(1)))) as u64)
+    }
+
+    /// ExRealTimeIsUniversal() -> BOOLEAN.
+    fn real_time_is_universal(_: &Call) -> Result<u64, KernelError> {
+        Ok(time_zone::real_time_is_universal() as u64)
+    }
+
+    /// RtlQueryTimeZoneInformation(TimeZoneInformation*) -> NTSTATUS.
+    fn query_time_zone_information(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(time_zone::query_information_export(call.arg(1), false)))
+    }
+
+    /// RtlSetTimeZoneInformation(TimeZoneInformation*) -> NTSTATUS.
+    fn set_time_zone_information(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(time_zone::set_information_export(call.arg(1), false)))
+    }
+
+    /// RtlQueryDynamicTimeZoneInformation(DynamicTimeZoneInformation*) -> NTSTATUS.
+    fn query_dynamic_time_zone_information(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(time_zone::query_information_export(call.arg(1), true)))
+    }
+
+    /// RtlSetDynamicTimeZoneInformation(DynamicTimeZoneInformation*) -> NTSTATUS.
+    fn set_dynamic_time_zone_information(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(time_zone::set_information_export(call.arg(1), true)))
+    }
+
+    /// RtlLocalTimeToSystemTime(LocalTime*, SystemTime*) -> NTSTATUS.
+    fn local_time_to_system_time(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(time::local_time_to_system_time(time_at(call.arg(1)), time_at(call.arg(2)))))
+    }
+
+    /// RtlTimeToSecondsSince1970(Time*, ElapsedSeconds*) -> BOOLEAN.
+    fn time_to_seconds_since_1970(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PULONG de saída do chamador.
+        Ok(time::time_to_seconds_since(time_at(call.arg(1)), time::SECONDS_TO_START_OF_1970, unsafe { Field::<u32>::at(call.arg(2)) }) as u64)
+    }
+
+    /// RtlTimeToSecondsSince1980(Time*, ElapsedSeconds*) -> BOOLEAN.
+    fn time_to_seconds_since_1980(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PULONG de saída do chamador.
+        Ok(time::time_to_seconds_since(time_at(call.arg(1)), time::SECONDS_TO_START_OF_1980, unsafe { Field::<u32>::at(call.arg(2)) }) as u64)
+    }
+
+    /// RtlSecondsSince1980ToTime(ElapsedSeconds, Time*).
+    fn seconds_since_1980_to_time(call: &Call) -> Result<u64, KernelError> {
+        time::seconds_since_1980_to_time(call.arg(1) as u32, time_at(call.arg(2)));
+        Ok(0)
+    }
+
+    /// ZwQueryTimerResolution(MaximumTime*, MinimumTime*, CurrentTime*) -> NTSTATUS.
+    fn zw_query_timer_resolution(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(timer_resolution::nt_query_timer_resolution(call.arg(1), call.arg(2), call.arg(3), false)))
+    }
+
+    /// ZwSetTimerResolution(DesiredTime, SetResolution, ActualTime*) -> NTSTATUS.
+    fn zw_set_timer_resolution(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(timer_resolution::nt_set_timer_resolution(call.arg(1) as u32, call.arg(2) as u8 != 0, call.arg(3), false)))
+    }
+
+    /// ZwSetSystemTime(SystemTime*, PreviousTime*) -> NTSTATUS.
+    fn zw_set_system_time(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(system_time::set_system_time(call.arg(1), call.arg(2), false)))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "time-keeping",
+        names: &[
+            "HalQueryRealTimeClock", "HalSetRealTimeClock", "ExRealTimeIsUniversal", "RtlQueryTimeZoneInformation", "RtlSetTimeZoneInformation",
+            "RtlQueryDynamicTimeZoneInformation", "RtlSetDynamicTimeZoneInformation", "RtlLocalTimeToSystemTime", "RtlTimeToSecondsSince1970",
+            "RtlTimeToSecondsSince1980", "RtlSecondsSince1980ToTime", "ZwQueryTimerResolution", "ZwSetTimerResolution", "ZwSetSystemTime",
+        ],
+        handlers: &[
+            hal_query_real_time_clock, hal_set_real_time_clock, real_time_is_universal, query_time_zone_information, set_time_zone_information,
+            query_dynamic_time_zone_information, set_dynamic_time_zone_information, local_time_to_system_time, time_to_seconds_since_1970,
+            time_to_seconds_since_1980, seconds_since_1980_to_time, zw_query_timer_resolution, zw_set_timer_resolution, zw_set_system_time,
+        ],
+        data_exports: &[],
+    };
 }

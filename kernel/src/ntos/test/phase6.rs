@@ -367,7 +367,7 @@ fn ntoskrnl_exports(assert: Assert) {
     use crate::{ntos::init::export_names as abi_names, ntos::init::exports};
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions, ResolvedImport};
     exports::init();
-    assert(abi_names::EXPORT_NAMES.len() == 2059 && abi_names::GROUP_LAYOUT.len() == 506 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 2059 exports em 506 grupos");
+    assert(abi_names::EXPORT_NAMES.len() == 2073 && abi_names::GROUP_LAYOUT.len() == 507 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 2059 exports em 506 grupos");
     // Ordinais públicos: os slots de função seguidos dos dados sem nome repetido.
     let public_count = abi_names::EXPORT_NAMES.len() + crate::ntos::mm::kernel_data_layout::DEFINITIONS.iter().filter(|entry| !abi_names::EXPORT_NAMES.contains(&entry.name)).count();
     assert(matches!(exports::lookup_ordinal("ntoskrnl.exe", 547), Some(ResolvedImport::Thunk(578))) && exports::lookup("ntoskrnl.exe", "LdrResSearchResource").is_some() && exports::lookup("ntoskrnl.exe", "NaoExisteNoKernel").is_none() && exports::lookup_ordinal("ntoskrnl.exe", 0).is_none() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32).is_some() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32 + 1).is_none(), "ntoskrnl: ordinais, todos os exports com provedor e nome desconhecido");
@@ -1934,7 +1934,7 @@ fn ntoskrnl_ex_group(assert: Assert) {
     guest::write64(output, 0);
     assert(call_export("ExRegisterExtension", &[output, 1, registration]) == Some(0xFFFF_FFFF_C000_000D) && guest::read64(output) == 0, "ex: ExRegisterExtension recusa a versao de registro sem 0x10000");
     at::<nt::LargeInteger>(block + 0x1B8).quad_part.set(0x01DA_0000_1234_5678);
-    assert(call_export("ExSystemTimeToLocalTime", &[block + 0x1B8, block + 0x1C0]) == Some(0) && at::<nt::LargeInteger>(block + 0x1C0).quad_part.get() == 0x01DA_0000_1234_5678 && call_export("EmClientQueryRuleState", &[0, 0]) == Some(0xFFFF_FFFF_C000_000D), "ex: hora local sem fuso e regra nula");
+    assert(call_export("ExSystemTimeToLocalTime", &[block + 0x1B8, block + 0x1C0]) == Some(0) && at::<nt::LargeInteger>(block + 0x1C0).quad_part.get() == 0x01DA_0000_1234_5678 - crate::ntos::ex::time_zone::time_zone_bias() && call_export("EmClientQueryRuleState", &[0, 0]) == Some(0xFFFF_FFFF_C000_000D), "ex: hora local pelo vies do fuso e regra nula");
     // EX_TIMER e ExEventObjectType.
     let timer = call_export("ExAllocateTimer", &[0x1234, 0x5678, 0]).unwrap_or(0);
     assert(timer != 0 && guest::read64(timer + 0x80) == 0x1234 && call_export("ExCancelTimer", &[timer]) == Some(0) && call_export("ExDeleteTimer", &[timer, 1, 0, 0]) == Some(0), "ex: EX_TIMER alocado, cancelado e removido");
@@ -2059,9 +2059,9 @@ fn ntoskrnl_ke_group(assert: Assert) {
     let timer = block + 0xC0;
     call_export("KeInitializeTimer", &[timer]);
     assert(call_export("KeReadStateTimer", &[timer]) == Some(0) && call_export("KeSetTimer", &[timer, (-10_000_000i64) as u64, 0]) == Some(0) && call_export("KeCancelTimer", &[timer]) == Some(1), "ke: timer agendado e cancelado");
-    assert(call_export("PsGetVersion", &[block + 0x100, block + 0x104, block + 0x108, 0]) == Some(1) && guest::read32(block + 0x100) == 10 && guest::read32(block + 0x108) == 26100 && call_export("KeQueryTimeIncrement", &[]) == Some(100_000), "ke: PsGetVersion e KeQueryTimeIncrement");
+    assert(call_export("PsGetVersion", &[block + 0x100, block + 0x104, block + 0x108, 0]) == Some(1) && guest::read32(block + 0x100) == 10 && guest::read32(block + 0x108) == 26100 && call_export("KeQueryTimeIncrement", &[]) == Some(156_250), "ke: PsGetVersion e KeQueryTimeIncrement (KeMaximumIncrement)");
     assert(call_export("KeQueryActiveProcessorCount", &[]) == Some(smp::online_cpu_count() as u64) && call_export("KeGetProcessorNumberFromIndex", &[999, block + 0x110]) == Some(0xFFFF_FFFF_C000_000D), "ke: processadores ativos");
-    assert(call_export("KeQueryPerformanceCounter", &[block + 0x118]).is_some_and(|counter| counter != 0) && at::<nt::LargeInteger>(block + 0x118).quad_part.get() as u64 == clock::tsc_frequency_hz() && call_export("KeStallExecutionProcessor", &[10]) == Some(0), "ke: contador de desempenho e espera ocupada");
+    assert(call_export("KeQueryPerformanceCounter", &[block + 0x118]).is_some_and(|counter| counter != 0) && at::<nt::LargeInteger>(block + 0x118).quad_part.get() as u64 == clock::QPC_FREQUENCY && call_export("KeStallExecutionProcessor", &[10]) == Some(0), "ke: contador de desempenho de 10 MHz e espera ocupada");
     // Regiões críticas e guardadas.
     call_export("KeEnterCriticalRegion", &[]);
     let critical = call_export("KeAreApcsDisabled", &[]);
@@ -2108,7 +2108,7 @@ fn ntoskrnl_mm_group(assert: Assert) {
     use crate::ntos::mm::{image_paging, paging};
     use crate::ntos::init::exports;
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions};
-    assert(exports::implemented() == 2059 && exports::export_names().len() == 2059, "ntoskrnl: 506 grupos com os 2059 exports implementados");
+    assert(exports::implemented() == 2073 && exports::export_names().len() == 2073, "ntoskrnl: 507 grupos com os 2073 exports implementados");
     let block = guest::alloc_bytes(0x200);
     // MmGetSystemRoutineAddress: trampolim chamável e nome desconhecido.
     let name: alloc::vec::Vec<u16> = "KeGetCurrentIrql".encode_utf16().collect();
@@ -12262,11 +12262,11 @@ fn ex_legacy_support_exports(assert: Assert) {
         call_export("ExInterlockedInsertHeadList", &[head_address, second_address, lock_address]) == Some(first_address) && head.flink.get() == second_address && second.flink.get() == first_address && first.blink.get() == second_address && lock.get() == 0,
         "ex-legacy-support: nova cabeca devolve a anterior e solta o lock",
     );
-    // ExQueryTimerResolution: 10 ms nos três.
+    // ExQueryTimerResolution: KeMaximumIncrement, KeMinimumIncrement e KeTimeIncrement.
     let times = guest::alloc_bytes(12);
     let _ = call_export("ExQueryTimerResolution", &[times, times + 4, times + 8]);
     let time = |offset: u64| at::<nt::Field<u32>>(times + offset).get();
-    assert(time(0) == 100_000 && time(4) == 100_000 && time(8) == 100_000, "ex-legacy-support: ExQueryTimerResolution = KeQueryTimeIncrement");
+    assert(time(0) == 156_250 && time(4) == 5_000 && time(8) == crate::ntos::ke::clock::time_increment(), "ex-legacy-support: ExQueryTimerResolution = maximo, minimo e incremento corrente");
 }
 
 
@@ -13764,13 +13764,16 @@ fn ex_extension_host_exports(assert: Assert) {
 }
 
 fn ex_timer_resolution_exports(assert: Assert) {
+    use crate::ntos::ex::timer_resolution;
     use crate::ntos::ke::clock;
     let set = |time: u64, enable: u64| call_export("ExSetTimerResolution", &[time, enable]);
-    let before = clock::kernel_resolution_requests();
-    assert(before.0 == 0 && set(5000, 1) == Some(100_000) && clock::kernel_resolution_requests() == (1, 5000, 5000), "ex-timer-resolution: primeiro pedido grava a resolucao pedida; o relogio de 100 Hz continua em 10 ms");
-    assert(set(200_000, 1) == Some(100_000) && clock::kernel_resolution_requests() == (2, 5000, 5000), "ex-timer-resolution: pedido mais grosso so conta");
-    assert(set(0, 0) == Some(100_000) && clock::kernel_resolution_requests().0 == 1 && set(0, 0) == Some(100_000) && clock::kernel_resolution_requests() == (0, 0, 100_000), "ex-timer-resolution: o ultimo cancelamento volta ao periodo padrao");
-    assert(set(0, 0) == Some(100_000) && clock::kernel_resolution_requests().0 == 0, "ex-timer-resolution: cancelamento sem pedido nao estoura a contagem");
+    let before = timer_resolution::kernel_resolution_requests();
+    assert(before.0 == 0 && timer_resolution::process_request_count() == 0 && clock::time_increment() == 156_250, "ex-timer-resolution: sem pedidos o relogio esta em KeMaximumIncrement");
+    assert(set(5000, 1) == Some(5000) && timer_resolution::kernel_resolution_requests() == (1, 5000, 5000) && clock::time_increment() == 5000, "ex-timer-resolution: o primeiro pedido grava a resolucao e o relogio passa a 0,5 ms");
+    assert(set(200_000, 1) == Some(5000) && timer_resolution::kernel_resolution_requests() == (2, 5000, 5000), "ex-timer-resolution: pedido mais grosso so conta");
+    assert(set(0, 0) == Some(5000) && timer_resolution::kernel_resolution_requests().0 == 1 && set(0, 0) == Some(156_250) && timer_resolution::kernel_resolution_requests() == (0, 0, 156_250) && clock::time_increment() == 156_250, "ex-timer-resolution: o ultimo cancelamento volta a KeMaximumIncrement");
+    assert(set(0, 0) == Some(156_250) && timer_resolution::kernel_resolution_requests().0 == 0, "ex-timer-resolution: cancelamento sem pedido nao estoura a contagem");
+    assert(set(1000, 1) == Some(5000) && clock::time_increment() == 5000 && set(0, 0) == Some(156_250), "ex-timer-resolution: um pedido abaixo do minimo sobe a KeMinimumIncrement");
 }
 
 fn rtl_security_error_exports(assert: Assert) {
@@ -15405,6 +15408,7 @@ pub fn run(assert: Assert) {
     super::system_images::run(assert);
     super::user_half::run(assert);
     super::support_exports::run(assert);
+    super::time_keeping::run(assert);
     super::rtl_crt_exports::run(assert);
     super::security_alpc_exports::run(assert);
     super::io_fsrtl_exports::run(assert);

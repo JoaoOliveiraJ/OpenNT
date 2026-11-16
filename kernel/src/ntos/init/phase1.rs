@@ -63,6 +63,9 @@ pub fn init() {
     // IopReadDumpRegistry: o AutoReboot e o despejo do CrashControl, que o
     // KeBugCheckEx consulta sem tocar no Registro.
     crate::ntos::ke::bugcheck::read_crash_control();
+    // O fuso do Registro: a hora do relógio da CMOS (local) com o
+    // ActiveTimeBias e o ExpRefreshTimeZoneInformation.
+    crate::ntos::ex::time_zone::initialize();
     // Definições WNF da hive (Control\Notifications), que NTDLL e KERNELBASE
     // consultam; os dados só existem depois de publicação real.
     crate::ntos::cm::wnf_defaults::initialize().unwrap_or_else(|error| panic!("{error}"));

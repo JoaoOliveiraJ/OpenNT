@@ -519,7 +519,8 @@ fn routine(name: &str, call: &Call) -> Result<u64, KernelError> {
             }
             cpu::rdtsc()
         }
-        // Timer do relógio: LAPIC periódico de 100 Hz por CPU (10 ms fixos).
+        // Timer do relógio: os limites do incremento do relógio (KeMaximumIncrement
+        // e KeMinimumIncrement do KiSetupTimeIncrement, 15,625 ms e 0,5 ms).
         "HalpTimerGetClockConfiguration" => {
             let address = call.arg(1);
             guest::write_bytes(address, &[0; HalClockTimerConfiguration::SIZE as usize]);
@@ -528,14 +529,14 @@ fn routine(name: &str, call: &Call) -> Result<u64, KernelError> {
             configuration.flags.set(1 << 2); // PerCpuTimer
             configuration.known_type.set(0);
             configuration.capabilities.set(1);
-            configuration.max_increment.set(100_000);
-            configuration.min_increment.set(100_000);
+            configuration.max_increment.set(crate::ntos::ke::clock::MAXIMUM_INCREMENT as u64);
+            configuration.min_increment.set(crate::ntos::ke::clock::MINIMUM_INCREMENT);
             0
         }
         "HalpTimerClockActivate" | "HalpTimerClockInitialize" | "HalpTimerClockStop" => 0,
         "HalpTimerClockArm" => {
             if call.arg(3) != 0 {
-                output::<u64>(call.arg(3)).set(100_000);
+                output::<u64>(call.arg(3)).set(crate::ntos::ke::clock::time_increment() as u64);
             }
             STATUS_SUCCESS
         }
@@ -548,7 +549,11 @@ fn routine(name: &str, call: &Call) -> Result<u64, KernelError> {
         // Sem contador auxiliar nem contador de referência do hipervisor.
         "HalpTimerConvertPerformanceCounterToAuxiliaryCounter" | "HalpTimerConvertAuxiliaryCounterToPerformanceCounter" | "HalpTimerQueryAuxiliaryCounterFrequency" | "HalpTimerQueryHostPerformanceCounter" => STATUS_NOT_SUPPORTED,
         "HalpTimerQueryAndResetRtcErrors" => 0,
-        "HalpTimerGetReferencePage" => 0,
+        // A página de referência do QPC (HalpTimerReferencePage).
+        "HalpTimerGetReferencePage" => match crate::ntos::mm::shared_user_data::reference_frame() {
+            0 => 0,
+            frame => crate::hal::physical::range_to_virtual(frame, 0x1000),
+        },
         // ---- interrupções ----------------------------------------------------
         // Sem controladores secundários.
         "HalpSecondaryInterruptQueryPrimaryInformation" => STATUS_NOT_FOUND,

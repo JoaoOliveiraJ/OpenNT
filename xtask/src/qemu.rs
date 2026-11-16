@@ -114,6 +114,48 @@ pub fn nvme_disk(image: &Path, storage: &str) -> Option<PathBuf> {
     (storage == "nvme" && nvme.exists()).then_some(nvme)
 }
 
+/// Milissegundos Unix do relógio do hospedeiro.
+fn host_unix_milliseconds() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |duration| duration.as_millis() as u64)
+}
+
+/// `AAAA-MM-DDTHH:MM:SS` da hora local de um fuso com viés `bias_minutes`
+/// (UTC − local), para o `-rtc base=` do QEMU.
+fn local_rtc_base(bias_minutes: i32) -> String {
+    let seconds = (host_unix_milliseconds() / 1000) as i64 - bias_minutes as i64 * 60;
+    let (days, of_day) = (seconds.div_euclid(86_400), seconds.rem_euclid(86_400));
+    // Calendário civil a partir dos dias desde 1970 (algoritmo de Hinnant).
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era = (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = if month_prime < 10 { month_prime + 3 } else { month_prime - 9 };
+    let year = year_of_era + era * 400 + if month <= 2 { 1 } else { 0 };
+    format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}", of_day / 3600, of_day % 3600 / 60, of_day % 60)
+}
+
+/// A linha `UTC=<ms Unix>` que o kernel imprime quando o fuso entra em
+/// vigor: a distância, em ms, entre a hora do convidado e a do hospedeiro.
+fn guest_clock_offset(line: &str) -> Option<i64> {
+    let digits: String = line.split("UTC=").nth(1)?.chars().take_while(char::is_ascii_digit).collect();
+    let guest = digits.parse::<u64>().ok()?;
+    Some(guest as i64 - host_unix_milliseconds() as i64)
+}
+
+/// Maior distância aceita entre a hora do convidado e a do hospedeiro: o
+/// relógio da CMOS conta segundos inteiros e a base do `-rtc` é tomada um
+/// instante antes de o QEMU subir.
+const CLOCK_TOLERANCE_MS: i64 = 5_000;
+
+/// `base=<hora local>,clock=host` do `-rtc`: o relógio da CMOS com a hora
+/// local do fuso da hive (o ActiveTimeBias), andando com o do hospedeiro.
+fn rtc_argument() -> String {
+    format!("base={},clock=host", local_rtc_base(crate::hive_image::active_time_bias_minutes()))
+}
+
 /// Os argumentos da máquina; `no_reboot` faz o reinício do convidado
 /// encerrar o QEMU.
 fn machine_arguments(disks: &Disks, machine: &MachineOptions, no_reboot: bool) -> Vec<String> {
@@ -133,6 +175,9 @@ fn machine_arguments(disks: &Disks, machine: &MachineOptions, no_reboot: bool) -
         "whpx" => arguments.extend(["-cpu".to_string(), "host".to_string()]),
         _ => {}
     }
+    // O relógio da CMOS com a hora local do fuso da hive (o que um PC com o
+    // Windows guarda), andando com o relógio do hospedeiro.
+    arguments.extend(["-rtc".to_string(), rtc_argument()]);
     arguments.extend([
         "-m".to_string(),
         machine.memory_mb.to_string(),
@@ -445,9 +490,10 @@ impl Drop for QemuProcess {
     }
 }
 
-/// Falhas na serial: pânico do Rust, exceção de kernel, autoteste e a parada
-/// fatal do KeBugCheckEx (`*** STOP`, que sempre para a máquina).
-pub const FAILURE_MARKERS: &[&str] = &["*** PANIC", "*** EXCECAO", "SELFTEST FALHOU", "*** STOP"];
+/// Falhas na serial: pânico do Rust, exceção de kernel, autoteste, a parada
+/// fatal do KeBugCheckEx (`*** STOP`, que sempre para a máquina) e a hora do
+/// convidado longe da do hospedeiro (`*** RELOGIO`, que o test-boot acrescenta).
+pub const FAILURE_MARKERS: &[&str] = &["*** PANIC", "*** EXCECAO", "SELFTEST FALHOU", "*** STOP", "*** RELOGIO"];
 
 /// O motivo de fim da máquina que o QMP anuncia quando o convidado se
 /// desliga pelo ACPI (S5).
@@ -513,9 +559,23 @@ fn watch_shutdown_events(port: u16, reason: Arc<Mutex<Option<String>>>) {
 }
 
 /// Sobe um QEMU com os argumentos dados; a serial vai para `output`.
+/// Os argumentos com o `-rtc` refeito na hora corrente.
+fn with_current_rtc(arguments: &[String]) -> Vec<String> {
+    let mut fresh = arguments.to_vec();
+    for index in 1..fresh.len() {
+        if fresh[index - 1] == "-rtc" {
+            fresh[index] = rtc_argument();
+        }
+    }
+    fresh
+}
+
 fn launch(qemu: &Path, arguments: &[String], output: &Arc<Mutex<String>>, events_port: Option<u16>) -> Result<Machine, String> {
+    // Cada QEMU (também o religado de um ciclo de energia) começa com o
+    // relógio da CMOS na hora local corrente.
+    let arguments = with_current_rtc(arguments);
     let mut child = Command::new(qemu)
-        .args(arguments)
+        .args(&arguments)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -526,6 +586,7 @@ fn launch(qemu: &Path, arguments: &[String], output: &Arc<Mutex<String>>, events
     let sink = Arc::clone(output);
     let reader = thread::spawn(move || {
         let mut buffer = [0u8; 4096];
+        let mut line = String::new();
         while let Ok(count) = stdout.read(&mut buffer) {
             if count == 0 {
                 break;
@@ -534,6 +595,23 @@ fn launch(qemu: &Path, arguments: &[String], output: &Arc<Mutex<String>>, events
             print!("{text}");
             let _ = std::io::stdout().flush();
             sink.lock().unwrap().push_str(&text);
+            // A hora do convidado contra a do hospedeiro, no instante em que
+            // a linha chega.
+            for character in text.chars() {
+                if character != '\n' {
+                    line.push(character);
+                    continue;
+                }
+                if line.starts_with("[time]") {
+                    if let Some(offset) = guest_clock_offset(&line) {
+                        let verdict = if offset.abs() > CLOCK_TOLERANCE_MS { "*** RELOGIO fora da hora do hospedeiro" } else { "relogio de acordo com o hospedeiro" };
+                        let report = format!("[xtask] {verdict}: hora do convidado a {offset} ms\n");
+                        print!("{report}");
+                        sink.lock().unwrap().push_str(&report);
+                    }
+                }
+                line.clear();
+            }
         }
     });
     let shutdown_reason = Arc::new(Mutex::new(None));

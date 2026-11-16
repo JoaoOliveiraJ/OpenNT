@@ -172,7 +172,7 @@ pub fn create(process: u64) -> Result<u64, KernelError> {
 
 /// Desfaz uma raiz de [`create`] que nunca foi publicada.
 fn discard(root: u64) {
-    if let Err(error) = paging::release_user_half_in(root, &[shared_user_data::MM_SHARED_USER_DATA_VA]).and_then(|_| delete_root(root)) {
+    if let Err(error) = paging::release_user_half_in(root, &shared_user_data::shared_user_pages()).and_then(|_| delete_root(root)) {
         debug_print!("[mm] raiz {:#x} descartada com erro: {}", root, error);
     }
 }
@@ -192,7 +192,7 @@ pub fn delete(process: u64) -> Result<(), KernelError> {
         SPACES.lock().insert(process, root);
         return Err(KernelError::new("address space is loaded on a processor"));
     }
-    let released = paging::release_user_half_in(root, &[shared_user_data::MM_SHARED_USER_DATA_VA]).and_then(|_| delete_root(root));
+    let released = paging::release_user_half_in(root, &shared_user_data::shared_user_pages()).and_then(|_| delete_root(root));
     if let Err(error) = released {
         SPACES.lock().insert(process, root);
         return Err(error);

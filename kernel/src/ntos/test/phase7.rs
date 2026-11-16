@@ -1989,7 +1989,7 @@ fn user_syscalls_core(assert: Assert) {
     state::write_user_wide(string + 0x10, "OpenNT usuario\r\n");
     state::write_unicode_string(string, string + 0x10, "OpenNT usuario\r\n");
     assert(call("NtDisplayString", string, 0, 0, 0) == 0, "usercore: NtDisplayString");
-    assert(call("NtQueryPerformanceCounter", out, out + 8, 0, 0) == 0 && counter.quad_part.get() != 0 && frequency.quad_part.get() as u64 == crate::ntos::ke::clock::tsc_frequency_hz() && call("NtQueryPerformanceCounter", 0, 0, 0, 0) == 0xC000_0005, "usercore: contador e frequencia");
+    assert(call("NtQueryPerformanceCounter", out, out + 8, 0, 0) == 0 && counter.quad_part.get() != 0 && frequency.quad_part.get() as u64 == crate::ntos::ke::clock::QPC_FREQUENCY && call("NtQueryPerformanceCounter", 0, 0, 0, 0) == 0xC000_0005, "usercore: contador e frequencia de 10 MHz");
     let exit_cell = crate::hal::amd64::usermode::block().exit_code.get();
     assert(call("NtTerminateProcess", u64::MAX, 0x42, 0, 0) == state::TERMINATE_MAGIC && crate::hal::amd64::usermode::block().exit_code.get() == 0x42, "usercore: NtTerminateProcess publica o codigo para a HAL");
     crate::hal::amd64::usermode::block().exit_code.set(exit_cell);
@@ -2000,7 +2000,7 @@ fn user_syscalls_core(assert: Assert) {
     // comprimento acima de 0x30.
     guest::write_bytes(buffer, &[0xAA; 0x40]);
     let boot = crate::ntos::ke::clock::boot_time();
-    let time_of_day = call("NtQuerySystemInformation", 3, buffer, 0x30, info) == 0 && guest::read32(info) == 0x30 && guest::read64(buffer) == boot && guest::read64(buffer + 8) >= boot && guest::read64(buffer + 0x10) as i64 == crate::ntos::ex::system_time::time_zone_bias() && guest::read32(buffer + 0x18) == 0 && guest::read32(buffer + 0x1C) == 0 && guest::read64(buffer + 0x20) == 0 && guest::read8(buffer + 0x30) == 0xAA;
+    let time_of_day = call("NtQuerySystemInformation", 3, buffer, 0x30, info) == 0 && guest::read32(info) == 0x30 && guest::read64(buffer) == boot && guest::read64(buffer + 8) >= boot && guest::read64(buffer + 0x10) as i64 == crate::ntos::ex::system_time::time_zone_bias() && guest::read32(buffer + 0x18) == crate::ntos::ex::system_time::time_zone_id() && guest::read32(buffer + 0x1C) == 0 && guest::read64(buffer + 0x20) == crate::ntos::ke::clock::boot_time_bias() && guest::read8(buffer + 0x30) == 0xAA;
     guest::write_bytes(buffer, &[0xAA; 0x40]);
     let prefix = call("NtQuerySystemInformation", 3, buffer, 8, info) == 0 && guest::read32(info) == 8 && guest::read64(buffer) == boot && guest::read8(buffer + 8) == 0xAA;
     let long = call("NtQuerySystemInformation", 3, buffer, 0x31, info) == 0xC000_0004 && guest::read32(info) == 0x30 && call("NtQuerySystemInformation", 3, buffer + 1, 0x30, 0) == 0x8000_0002;
@@ -3812,7 +3812,7 @@ fn user_alpc_zw_group(assert: Assert) {
     let _ = open_pointer::close(handle);
     let _ = open_pointer::close(second);
     transport::unregister(&listener);
-    assert(disconnected == Some(0) && again == Some(0xC000_0037) && port_objects::port_of(pointer).is_none() && exports::implemented() == 2059, "zwalpc: desconexao e grupo com 15 exports");
+    assert(disconnected == Some(0) && again == Some(0xC000_0037) && port_objects::port_of(pointer).is_none() && exports::implemented() == 2073, "zwalpc: desconexao e grupo com 15 exports");
     if let Some(region) = memory::find_region(block) {
         memory::release_private_region(&region);
     }
@@ -5098,6 +5098,7 @@ pub fn run(assert: Assert) {
     crate::ntos::test::multiprocess::cross_memory::run(assert);
     crate::ntos::test::rtl_atom_heap_nls::run_phase7(assert);
     crate::ntos::test::multiprocess::user_callback::run(assert);
+    crate::ntos::test::multiprocess::time_services::run(assert);
     crate::ntos::test::executive_support::run_user(assert);
     crate::ntos::test::multiprocess::process_queries::run(assert);
     crate::ntos::test::multiprocess::pipes::run(assert);

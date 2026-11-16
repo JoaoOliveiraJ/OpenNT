@@ -86,7 +86,7 @@ fn timer2_exports(assert: Assert) {
     let latest = guest::read64(timer + 0x50);
     let again = call_export("KeSetTimer2", &[timer, (-100_000_000i64) as u64, 5, 0]);
     let period = guest::read64(timer + 0x58);
-    assert(first == Some(0) && again == Some(1) && timer_flags(timer) & 1 != 0 && due >= before + 100_000_000 && due <= after + 100_000_000 && latest == due && period == clock::CLOCK_TIME_INCREMENT as u64 && guest::read32(timer + 4) == 0, "timer2: KeSetTimer2 insere, devolve se ja estava e sobe o periodo ao minimo");
+    assert(first == Some(0) && again == Some(1) && timer_flags(timer) & 1 != 0 && due >= before + 100_000_000 && due <= after + 100_000_000 && latest == due && period == clock::MINIMUM_INCREMENT as u64 && guest::read32(timer + 4) == 0, "timer2: KeSetTimer2 insere, devolve se ja estava e sobe o periodo ao minimo");
     // A combinação 0 (CollectionIndex 0x15) ignora a tolerância; a NoWake a soma.
     guest::write64(parameters + 8, 50_000);
     let _ = call_export("KeSetTimer2", &[timer, (-100_000_000i64) as u64, 0, parameters]);

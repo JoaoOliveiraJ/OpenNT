@@ -169,8 +169,9 @@ fn ps_get_version(call: &Call) -> Result<u64, KernelError> {
 fn kf_raise_irql(call: &Call) -> Result<u64, KernelError> {
     Ok(irql::kf_raise_irql(call.arg(1) as u8) as u64)
 }
+/// KeQueryTimeIncrement (rva 0x24be00): KeMaximumIncrement.
 fn query_time_increment(_: &Call) -> Result<u64, KernelError> {
-    Ok(clock::TIME_INCREMENT)
+    Ok(clock::MAXIMUM_INCREMENT as u64)
 }
 fn query_dpc_watchdog_information(call: &Call) -> Result<u64, KernelError> {
     dpc::query_watchdog_information(call.arg(1));
@@ -281,7 +282,7 @@ fn query_active_processor_count_ex(call: &Call) -> Result<u64, KernelError> {
     Ok(processor_group::active_processor_count_ex(call.arg(1) as u32))
 }
 fn query_system_time_precise(call: &Call) -> Result<u64, KernelError> {
-    clock::query_system_time(call.arg(1));
+    clock::query_system_time_precise(call.arg(1));
     Ok(0)
 }
 fn initialize_mutant(call: &Call) -> Result<u64, KernelError> {

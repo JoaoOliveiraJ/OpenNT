@@ -104,6 +104,8 @@ pub fn check_timers() {
     // vence os timers (drivers medem tempo por KeQueryTickCount, que lê a
     // página direto).
     crate::ntos::mm::shared_user_data::update_system_times();
+    // Os timers da próxima troca de fuso e do ano novo.
+    crate::ntos::ex::time_zone::check_cutover();
     let system_now = clock::system_time_100ns();
     let uptime_now = clock::uptime_100ns();
     let mut fired = Vec::new();

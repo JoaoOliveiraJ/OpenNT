@@ -25,8 +25,7 @@ use alloc::format;
 use crate::ntos::inc::types::{Eprocess, Kprocess, NtStruct, Peb};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::process_address_space::{self as address_space, SYSTEM_ROOT};
-use crate::ntos::mm::shared_user_data::MM_SHARED_USER_DATA_VA;
-use crate::ntos::mm::{kernel_stack, memory_map as map, paging, pfn};
+use crate::ntos::mm::{kernel_stack, paging, pfn};
 use crate::ntos::ps::create::{self, CreatedProcess, ImageOrigin};
 use crate::ntos::ps::{process, process_context};
 use crate::ntos::ps::user::process::{self as user_process, RunOptions};
@@ -93,10 +92,10 @@ fn inspect(process: u64, peb: u64, ntdll: u64, mark_at: u64, mark: Option<u64>) 
     .flatten()
 }
 
-/// A metade de usuário da raiz só tem a visão da KUSER_SHARED_DATA.
+/// A metade de usuário da raiz só tem as páginas compartilhadas (a
+/// KUSER_SHARED_DATA e a página de referência do QPC).
 fn only_kuser(root: u64) -> bool {
-    let kuser_end = MM_SHARED_USER_DATA_VA + 0x1000;
-    paging::find_mapping_in(root, map::LOWEST_USER_ADDRESS, MM_SHARED_USER_DATA_VA - map::LOWEST_USER_ADDRESS).is_none() && paging::find_mapping_in(root, kuser_end, map::USER_ADDRESS_LIMIT - kuser_end).is_none() && paging::translate_in(root, MM_SHARED_USER_DATA_VA) != 0
+    crate::ntos::mm::shared_user_data::only_shared_user_pages(root)
 }
 
 pub fn run(assert: Assert) {

@@ -46,6 +46,8 @@ mod cm {
     pub mod pnp_control;
     #[path = "../../../../kernel/src/ntos/cm/crash_control.rs"]
     pub mod crash_control;
+    #[path = "../../../../kernel/src/ntos/cm/time_zone_information.rs"]
+    pub mod time_zone_information;
     pub mod service {
         #[path = "../../../../../kernel/src/ntos/cm/service/boot_services.rs"]
         pub mod boot_services;
@@ -335,6 +337,12 @@ fn write_hive(keys: &[Key], time: u64, file_name: &str) -> Vec<u8> {
 }
 
 /// FILETIME de agora (100 ns desde 1601).
+/// O ActiveTimeBias da hive SYSTEM (UTC − hora local, em minutos): o
+/// relógio da máquina virtual guarda a hora local desse fuso.
+pub fn active_time_bias_minutes() -> i32 {
+    cm::time_zone_information::ACTIVE_TIME_BIAS
+}
+
 fn now_filetime() -> u64 {
     let since_unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|duration| duration.as_nanos() / 100).unwrap_or(0) as u64;
     since_unix + 116_444_736_000_000_000

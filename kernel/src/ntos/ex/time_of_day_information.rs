@@ -64,3 +64,49 @@ pub fn query(output: u64, buffer_length: u64, output_length: u64, from_user_mode
     let written = guest::try_write_bytes(output, &bytes[..length as usize]).and_then(|()| set_returned(length));
     Ok(written.map_or(STATUS_ACCESS_VIOLATION, |()| 0))
 }
+
+// ---- SystemQueryPerformanceCounterInformation (124) ------------------------
+//
+// ExpQuerySystemInformation 19041: sempre 0xC em ReturnLength; menos de 4
+// bytes é STATUS_INFO_LENGTH_MISMATCH; a Version do buffer tem de ser 1
+// (senão STATUS_NOT_SUPPORTED); menos de 0xC é STATUS_INFO_LENGTH_MISMATCH;
+// senão ValidFlags = Flags = QPC_KERNEL_TRANSITION (1), e Flags perde o bit
+// quando KUSER_SHARED_DATA.QpcBypassEnabled não é zero (o QPC de usuário não
+// entra no kernel).
+
+const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
+/// SYSTEM_QUERY_PERFORMANCE_COUNTER_INFORMATION.
+const COUNTER_INFORMATION_SIZE: u32 = 0xC;
+
+/// A classe 124: (buffer, capacidade, PULONG ReturnLength, modo de usuário).
+pub fn query_counter_class(output: u64, buffer_length: u64, output_length: u64, from_user_mode: bool) -> u32 {
+    let length = buffer_length as u32 as u64;
+    if from_user_mode {
+        if length != 0 && output & 3 != 0 {
+            return STATUS_DATATYPE_MISALIGNMENT;
+        }
+        if (length != 0 && !user_probe::probe_user_write(output, length)) || (output_length != 0 && !user_probe::probe_user_write(output_length, 4)) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+    }
+    let status = (|| -> Result<u32, KernelError> {
+        if length < 4 {
+            return Ok(STATUS_INFO_LENGTH_MISMATCH);
+        }
+        if guest::try_read::<u32>(output)? != 1 {
+            return Ok(STATUS_NOT_SUPPORTED);
+        }
+        if length < COUNTER_INFORMATION_SIZE as u64 {
+            return Ok(STATUS_INFO_LENGTH_MISMATCH);
+        }
+        let bypass = shared_user_data::data().map_or(0, |shared| shared.qpc_data.get() & 0xFF);
+        guest::try_write::<u32>(output + 8, 1)?;
+        guest::try_write::<u32>(output + 4, if bypass != 0 { 0 } else { 1 })?;
+        Ok(0)
+    })();
+    let status = status.unwrap_or(STATUS_ACCESS_VIOLATION);
+    if output_length != 0 && guest::try_write::<u32>(output_length, COUNTER_INFORMATION_SIZE).is_err() {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    status
+}

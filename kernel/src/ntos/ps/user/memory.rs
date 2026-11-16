@@ -322,7 +322,7 @@ pub fn occupied(space: Space) -> Vec<section_address::Region> {
     let root = space.root();
     let span = |region: &Region| section_address::Region { base: region.base(), size: region.size() };
     let mut occupied: Vec<section_address::Region> = state::with(|state| state.shared_user_regions.iter().chain(state.section_kernel_views.iter()).map(span).collect());
-    occupied.push(section_address::Region { base: state::KUSER_SHARED_DATA_USER_VA, size: PAGE });
+    occupied.extend(crate::ntos::mm::shared_user_data::shared_user_pages().into_iter().filter(|&page| page != 0).map(|base| section_address::Region { base, size: PAGE }));
     occupied.extend(super::loader::system_image_ranges().into_iter().map(|(base, size)| section_address::Region { base, size }));
     for state in process_state::all() {
         if state.directory_table_base.load(core::sync::atomic::Ordering::Acquire) != root {
@@ -354,7 +354,7 @@ pub fn find_region(va: u64) -> Option<Region> {
 /// vistas de sistema e as imagens de sistema mapeadas uma vez (ntdll e
 /// apiset).
 pub fn shared_system_range(va: u64) -> bool {
-    va & !(PAGE - 1) == state::KUSER_SHARED_DATA_USER_VA
+    crate::ntos::mm::shared_user_data::is_shared_user_page(va)
         || super::loader::system_image(va)
         || state::with(|state| state.shared_user_regions.iter().chain(state.section_kernel_views.iter()).any(|region| contains(region, va)))
 }
