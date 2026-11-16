@@ -297,6 +297,10 @@ const SMSS_PROGRAMS: &[&str] = &[
     "nsi.dll",
     "iphlpapi.dll",
     "dnsapi.dll",
+    // O powrprof.dll dos imports de energia do winlogon (api-ms-win-power-*)
+    // e o imm32.dll que o user32 carrega ao inicializar.
+    "powrprof.dll",
+    "imm32.dll",
 ];
 
 /// As imagens de kernel do caminho do smss (`--initial-process=smss`): o
