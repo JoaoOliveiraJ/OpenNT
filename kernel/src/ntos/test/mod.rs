@@ -39,3 +39,8 @@ pub mod x86_bios;
 pub mod registry_model;
 pub mod support_exports;
 pub mod kernel_debugger;
+pub mod rtl_crt_exports;
+pub mod security_alpc_exports;
+pub mod io_fsrtl_exports;
+pub mod ps_ke_mm_exports;
+pub mod executive_misc_exports;

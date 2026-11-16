@@ -15110,6 +15110,11 @@ pub fn run(assert: Assert) {
     super::system_images::run(assert);
     super::user_half::run(assert);
     super::support_exports::run(assert);
+    super::rtl_crt_exports::run(assert);
+    super::security_alpc_exports::run(assert);
+    super::io_fsrtl_exports::run(assert);
+    super::ps_ke_mm_exports::run(assert);
+    super::executive_misc_exports::run(assert);
     debug_print!("PHASE6_SELFTEST_OK");
 }
 
