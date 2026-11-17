@@ -15,6 +15,9 @@
 //!   (o comprimento do texto, sem o NUL);
 //! - as hives de máquina vêm de `\SystemRoot\System32\config`: SOFTWARE,
 //!   SAM, SECURITY e DEFAULT (`\REGISTRY\USER\.DEFAULT`), além da SYSTEM;
+//!   depois da DEFAULT, o CmpFinishSystemHivesLoad liga
+//!   `\Registry\User\S-1-5-18` a ela (CmpLinkKeyToHive: link volátil com
+//!   o `SymbolicLinkValue` `\Registry\User\.Default`);
 //! - cada hive ligada entra na lista de hives, a chave volátil
 //!   `\registry\machine\system\currentcontrolset\control\hivelist`
 //!   (CmpAddToHiveFileList, rva 0x6a1cfc): um REG_SZ com o nome da raiz da
@@ -135,6 +138,27 @@ pub fn create_control_set() -> Result<(), KernelError> {
     Ok(())
 }
 
+/// O perfil do LocalSystem e o perfil padrão (o par do
+/// CmpFinishSystemHivesLoad depois da hive DEFAULT).
+const LOCAL_SYSTEM_USER: &str = "\\Registry\\User\\S-1-5-18";
+const DEFAULT_USER: &str = "\\Registry\\User\\.Default";
+
+/// CmpLinkKeyToHive (rva 0x7a7e10): `link` criado com KEY_CREATE_LINK,
+/// REG_OPTION_VOLATILE | REG_OPTION_CREATE_LINK e, só quando a chave é
+/// nova, o `SymbolicLinkValue` REG_LINK = `target` (sem o NUL).
+fn link_key_to_hive(link: &str, target: &str) -> Result<(), KernelError> {
+    let resolved = registry::resolve_path(link, true).unwrap_or_else(|_| String::from(link));
+    let (handle, created) = registry::create_resolved(&resolved, None, true, true)?;
+    if handle == 0 {
+        return Err(KernelError::new("CmpLinkKeyToHive"));
+    }
+    if created {
+        registry::set_value(handle, registry::SYMBOLIC_LINK_VALUE, registry::REG_LINK, target.encode_utf16().flat_map(u16::to_le_bytes).collect());
+    }
+    registry::close_handle(handle);
+    Ok(())
+}
+
 /// CmInitSystem1 / CmpInitializeHiveList na fase 1: a SYSTEM do arquivo do
 /// volume em `\Registry\Machine\SYSTEM` (sem ele, as chaves estáticas em
 /// memória), o `CurrentControlSet`, as outras hives de máquina e a lista de
@@ -160,6 +184,7 @@ pub fn initialize_hives() -> Result<(), KernelError> {
     load_machine_hive(sam.0, sam.1, seed::sam_keys)?;
     load_machine_hive(security.0, security.1, seed::security_keys)?;
     load_machine_hive(default.0, default.1, seed::default_keys)?;
+    link_key_to_hive(LOCAL_SYSTEM_USER, DEFAULT_USER)?;
     // CmpCmdInit: os escritores preguiçosos, ainda retidos até o fim do
     // atraso do boot.
     lazy_flush::initialize();

@@ -174,6 +174,13 @@ fn machine_hives(assert: Assert) {
         let suffix = alloc::format!("\\windows\\system32\\config\\{}", file.to_lowercase());
         assert(listed.as_ref().is_some_and(|(kind, name)| *kind == 1 && name.to_lowercase().ends_with(&suffix)), "cmmodel: a lista de hives leva o nome do arquivo de cada hive de maquina");
     }
+    // CmpLinkKeyToHive: S-1-5-18 é link volátil para .Default.
+    let (opened, system_user) = open_with("\\Registry\\User\\S-1-5-18", 0, 0x340, false, 0);
+    let shape = registry::get_node(system_user as u32).and_then(|node| registry::with_node(node, |key| (key.link, key.volatile, key.value("symboliclinkvalue").cloned())));
+    close(system_user);
+    let expected = link_data("\\Registry\\User\\.Default");
+    let followed = registry::node_by_path("\\Registry\\User\\S-1-5-18");
+    assert(opened == 0 && shape.is_some_and(|(is_link, volatile, value)| is_link && volatile && value.is_some_and(|value| value.value_type == 6 && value.data == expected)) && followed.is_some() && followed == registry::node_by_path("\\Registry\\User\\.Default"), "cmmodel: \\Registry\\User\\S-1-5-18 e link volatil para \\Registry\\User\\.Default");
     let hardware = registry::node_by_path("\\Registry\\Machine\\Hardware");
     let volatile = hardware.is_some_and(|node| registry::hive_of(node).is_some_and(|(_, root)| root) && hive_list::is_volatile_hive(node));
     let listed = registry::read_value_by_path(HIVE_LIST, "\\REGISTRY\\MACHINE\\HARDWARE");
