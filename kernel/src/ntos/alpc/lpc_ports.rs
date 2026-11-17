@@ -682,6 +682,14 @@ pub fn impersonate_client(handle: u64, message: u64, legacy: bool) -> Result<u32
         let id = state::user_struct::<PortMessage>(message)?.message_id.probe_get()?;
         with_port(handle, 0, |port| {
             let Some(origin) = server::sender_of(port, id) else { return Ok(STATUS_ALPC_MESSAGE_NOT_FOUND) };
+            // Um pedido com contexto de segurança (o atributo de segurança)
+            // impersona o token capturado nele, como o AlpcpImpersonateMessage
+            // pelo SeImpersonateClientEx do contexto.
+            if let Some((token, level, effective_only)) = server::received_security(port, id) {
+                let status = ps_security::impersonate_client(process::get_current_thread(), token, true, effective_only, level);
+                let _ = crate::ntos::se::token::tokens::release(token);
+                return status;
+            }
             let thread = origin.sender.thread_pointer;
             if thread == 0 {
                 return Ok(STATUS_ALPC_MESSAGE_NOT_FOUND);

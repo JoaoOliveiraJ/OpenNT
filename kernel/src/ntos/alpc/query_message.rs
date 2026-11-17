@@ -93,17 +93,30 @@ fn query_token(port: &Arc<Port>, identity: &Identity, class: u32, output: u64, l
 
 /// As classes de token (AlpcMessageSidInformation e
 /// AlpcMessageTokenModifiedIdInformation) de um pedido ainda pendente num
-/// servidor de modo usuário: o token efetivo da thread do cliente, que espera
-/// a resposta (o de impersonação, senão o primário do processo dela), como o
-/// contexto de segurança dinâmico do AlpcpGetEffectiveTokenMessage.
+/// servidor de modo usuário: o token do contexto de segurança que o pedido
+/// levou, senão o token efetivo da thread do cliente, que espera a resposta
+/// (o de impersonação, senão o primário do processo dela), como o
+/// AlpcpGetEffectiveTokenMessage.
 fn query_server_token(port: &Arc<Port>, identifier: u32, class: u32, output: u64, length: u32, returned: u64, mode: u8) -> Result<u32, KernelError> {
     if class == 1 && length < 8 {
         let status = write_length(returned, 8, mode);
         return Ok(if status != 0 { status } else { BUFFER_TOO_SMALL });
     }
     let Some(origin) = super::server::sender_of(port, identifier) else { return Ok(0xC000_0702) };
-    let Some(token) = super::server::sender_effective_token(origin.sender.thread_pointer) else { return Ok(0xC000_0702) };
-    let bytes: Vec<u8> = if class == 0 { tokens::with(token, |token| token.user.clone()).unwrap_or_default() } else { token_statistics::encode(token)?[48..56].to_vec() };
+    // O contexto de segurança que o pedido levou vale antes do token da
+    // thread do cliente.
+    let (token, retained) = match super::server::received_security(port, identifier) {
+        Some((token, _, _)) => (token, true),
+        None => match super::server::sender_effective_token(origin.sender.thread_pointer) {
+            Some(token) => (token, false),
+            None => return Ok(0xC000_0702),
+        },
+    };
+    let encoded = if class == 0 { Ok(tokens::with(token, |token| token.user.clone()).unwrap_or_default()) } else { token_statistics::encode(token).map(|statistics| statistics[48..56].to_vec()) };
+    if retained {
+        let _ = tokens::release(token);
+    }
+    let bytes: Vec<u8> = encoded?;
     let status = write_length(returned, bytes.len() as u32, mode);
     if status != 0 {
         return Ok(status);
@@ -115,6 +128,24 @@ fn query_server_token(port: &Arc<Port>, identifier: u32, class: u32, output: u64
 }
 
 fn query_handle(port: &Arc<Port>, identity: &Identity, output: u64, length: u32, returned: u64, mode: u8) -> Result<u32, KernelError> {
+    query_handle_entries(port, identity.with(|state| state.handles.clone()), output, length, returned, mode)
+}
+
+/// A classe 3 de um pedido já recebido por um servidor de modo usuário
+/// (`alpc/server.rs`): os handles que ele levou, duplicados no servidor com as
+/// regras da porta de comunicação ligada ao cliente (a porta consultada, sem
+/// ela).
+fn query_server_handle(port: &Arc<Port>, identifier: u32, output: u64, length: u32, returned: u64, mode: u8) -> Result<u32, KernelError> {
+    let (handles, link) = match super::server::received_handles(port, identifier) {
+        Some((handles, link)) => (Some(handles), link),
+        None => (None, None),
+    };
+    query_handle_entries(link.as_ref().unwrap_or(port), handles, output, length, returned, mode)
+}
+
+/// ALPC_MESSAGE_HANDLE_INFORMATION do índice pedido, com o handle duplicado
+/// na tabela do dono de `port`.
+fn query_handle_entries(port: &Arc<Port>, handles: Option<Arc<message_handles::HandleData>>, output: u64, length: u32, returned: u64, mode: u8) -> Result<u32, KernelError> {
     let size = AlpcMessageHandleInformation::SIZE as u32;
     if length != size {
         return Ok(0xC000_0004);
@@ -127,7 +158,7 @@ fn query_handle(port: &Arc<Port>, identity: &Identity, output: u64, length: u32,
         Ok(index) => index,
         Err(status) => return Ok(status),
     };
-    let Some(handles) = identity.with(|state| state.handles.clone()) else { return Ok(0xC000_0008) };
+    let Some(handles) = handles else { return Ok(0xC000_0008) };
     let duplicated = {
         let entries = handles.entries.lock();
         let Some(entry) = entries.get(index as usize) else { return Ok(0xC000_0008) };
@@ -197,6 +228,9 @@ pub fn query(handle: u64, message: u64, class: u32, output: u64, length: u32, re
                 // chega com o MessageId do servidor.
                 Err(0xC000_0702) if class <= 1 && super::server::sender_of(&port, identifier).is_some() => {
                     return query_server_token(&port, identifier, class, output, length, returned, mode);
+                }
+                Err(0xC000_0702) if class == 3 && super::server::sender_of(&port, identifier).is_some() => {
+                    return query_server_handle(&port, identifier, output, length, returned, mode);
                 }
                 Err(status) => return Ok(status),
             };

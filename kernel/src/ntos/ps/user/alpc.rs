@@ -1382,8 +1382,8 @@ fn nt_alpc_accept_connect_port(out: u64, connection: u64, _flags: u64, attribute
     if !state::probe_syscall_stack(rsp, 5 * 8) {
         return Ok(AV);
     }
-    let (port_context, request, accept) = (state::stack_arg(rsp, 6), state::stack_arg(rsp, 7), state::stack_arg32(rsp, 9) as u8 != 0);
-    state::guarded(|| crate::ntos::alpc::server::accept_connect_port(out, connection, attributes, port_context, request, accept, 1))
+    let (port_attributes, port_context, request, accept) = (state::stack_arg(rsp, 5), state::stack_arg(rsp, 6), state::stack_arg(rsp, 7), state::stack_arg32(rsp, 9) as u8 != 0);
+    state::guarded(|| crate::ntos::alpc::server::accept_connect_port_with(out, connection, attributes, port_attributes, port_context, request, accept, 1))
 }
 
 /// NtAlpcOpenSenderProcess(ProcessHandle*, PortHandle, PortMessage, Flags,

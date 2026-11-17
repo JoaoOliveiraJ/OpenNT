@@ -314,6 +314,14 @@ impl crate::ntos::alpc::message::identity::Retained for Borrowed {
     }
 }
 
+impl Borrowed {
+    /// O handle do contexto na porta de quem o criou (zero num contexto sem
+    /// handle), que o receptor vê no ContextHandle do atributo de segurança.
+    pub fn handle(&self) -> u64 {
+        if self.record.table.is_some() { self.record.handle } else { 0 }
+    }
+}
+
 pub fn borrow(record: &Arc<ContextRecord>) -> Borrowed {
     Borrowed { token: record.client.token, level: record.client.level, effective_only: record.client.effective_only, record: record.clone(), released: SpinLock::new(false) }
 }

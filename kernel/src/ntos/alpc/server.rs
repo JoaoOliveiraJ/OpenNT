@@ -68,7 +68,10 @@ use crate::ntos::alpc::port_reference;
 use crate::ntos::alpc::small::context_attribute;
 use crate::ntos::alpc::transport::{self, Job, JobResult, Listener, Reply, Request, Sender, Service};
 use crate::ntos::inc::field::NtStruct;
-use crate::ntos::inc::types::{AlpcDataViewAttr, AlpcMessageAttributes, AlpcPortAttributes, ObjectAttributes, PortMessage};
+use crate::ntos::alpc::message::handles::HandleData;
+use crate::ntos::alpc::message::identity::Retained;
+use crate::ntos::alpc::security_contexts::Borrowed;
+use crate::ntos::inc::types::{AlpcDataViewAttr, AlpcHandleAttr, AlpcMessageAttributes, AlpcPortAttributes, AlpcSecurityAttr, ObjectAttributes, PortMessage};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::ob::object_manager;
 use crate::ntos::ob::objects::port::{self as port_objects, Port, PortState, Role};
@@ -110,6 +113,14 @@ const VIEW_ATTRIBUTE: u32 = 0x4000_0000;
 /// ALPC_MESSAGE_TOKEN_ATTRIBUTE (ALPC_TOKEN_ATTR: TokenId, AuthenticationId
 /// e ModifiedId do token do cliente).
 const TOKEN_ATTRIBUTE: u32 = 0x0800_0000;
+/// ALPC_MESSAGE_SECURITY_ATTRIBUTE e ALPC_MESSAGE_HANDLE_ATTRIBUTE.
+const SECURITY_ATTRIBUTE: u32 = 0x8000_0000;
+const HANDLE_ATTRIBUTE: u32 = 0x1000_0000;
+/// ALPC_PORFLG_ALLOW_DUP_OBJECT e ALPC_PORFLG_ALLOW_MULTIHANDLE_ATTRIBUTE.
+const ALLOW_DUP_OBJECT: u32 = 0x8_0000;
+const ALLOW_MULTIHANDLE_ATTRIBUTE: u32 = 0x200_0000;
+/// ALPC_HANDLEFLG_INDIRECT: os handles se pedem um a um pela classe 3.
+const HANDLE_INDIRECT: u32 = 0x4_0000;
 /// O maior PORT_MESSAGE de uma porta ALPC.
 const MAXIMUM_MESSAGE_LENGTH: u64 = 0xFFFF;
 /// OBJ_INHERIT e OBJ_KERNEL_HANDLE não valem para um handle de usuário.
@@ -139,6 +150,44 @@ struct Delivery {
     /// A sequência da mensagem na porta de destino (a de comunicação do
     /// cliente, ou a de conexão), que o ALPC_CONTEXT_ATTR publica.
     sequence: u32,
+    /// O contexto de segurança e os handles que o envio levou.
+    attributes: SentAttributes,
+    /// A porta de comunicação do servidor ligada ao cliente que enviou (as
+    /// regras de handles dela).
+    link_port: Option<Arc<Port>>,
+}
+
+/// O contexto de segurança (o atributo de segurança) e os handles (o atributo
+/// de handles) que um envio leva ao servidor, tirados da identidade do
+/// pedido: ficam com a mensagem até a resposta e são soltos quando ela sai.
+#[derive(Default)]
+struct SentAttributes {
+    handles: Option<Arc<HandleData>>,
+    security: Option<Arc<Borrowed>>,
+}
+
+impl SentAttributes {
+    fn is_empty(&self) -> bool {
+        self.handles.is_none() && self.security.is_none()
+    }
+}
+
+impl Drop for SentAttributes {
+    fn drop(&mut self) {
+        if let Some(handles) = self.handles.take() {
+            handles.release();
+        }
+        if let Some(security) = self.security.take() {
+            security.release();
+        }
+    }
+}
+
+/// Os atributos de um pedido já recebido pelo servidor, até a resposta (o
+/// NtAlpcQueryInformationMessage da classe 3 e a impersonação os consultam).
+struct Received {
+    attributes: SentAttributes,
+    link_port: Option<Arc<Port>>,
 }
 
 /// A seção de transferência de um cliente LPC: o PORT_VIEW do NtConnectPort,
@@ -258,6 +307,9 @@ struct ServerState {
     links: BTreeMap<u64, Link>,
     /// A vista que cada pedido recebido trouxe ao servidor, até a resposta.
     exposed_views: BTreeMap<u32, Arc<crate::ntos::alpc::section_views::ViewBinding>>,
+    /// O contexto de segurança e os handles de cada pedido recebido, até a
+    /// resposta.
+    received: BTreeMap<u32, Received>,
     closed: bool,
 }
 
@@ -310,12 +362,12 @@ impl UserServer {
     /// O servidor fechou a porta de conexão: as conexões pendentes são
     /// recusadas e o nome sai do namespace.
     fn close(&self) {
-        let (connections, requests, _queue, _views) = {
+        let (connections, requests, _queue, _views, _received) = {
             let mut state = self.state.lock();
             state.closed = true;
-            // As mensagens e vistas saem fora da trava (a vista de dados solta
-            // a seção que retinha).
-            (core::mem::take(&mut state.connections), core::mem::take(&mut state.requests), core::mem::take(&mut state.queue), core::mem::take(&mut state.exposed_views))
+            // As mensagens, vistas e atributos saem fora da trava (a vista de
+            // dados solta a seção que retinha; os atributos, os objetos).
+            (core::mem::take(&mut state.connections), core::mem::take(&mut state.requests), core::mem::take(&mut state.queue), core::mem::take(&mut state.exposed_views), core::mem::take(&mut state.received))
         };
         for connection in connections.values() {
             refuse(connection);
@@ -429,20 +481,22 @@ impl Service for UserServer {
             sender.thread_pointer = request.identity.with(|state| state.sender_thread);
         }
         let slot: ReplySlot = Arc::new(ReplyCell::default());
-        // A vista de dados do envio passa à mensagem do servidor.
-        let data_view = request.identity.with(|state| state.view.take());
-        let (id, context, sequence) = {
+        // A vista de dados, o contexto de segurança e os handles do envio
+        // passam à mensagem do servidor.
+        let (data_view, handles, security) = request.identity.with(|state| (state.view.take(), state.handles.take(), state.security.take()));
+        let attributes = SentAttributes { handles, security };
+        let (id, context, sequence, link_port) = {
             let mut state = self.state.lock();
-            let Some((context, sequence)) = state.links.get(&port.pointer).map(|link| (link.context, next_sequence(&link.server_port))) else { return Reply::Now(JobResult { status: STATUS_PORT_DISCONNECTED, ..JobResult::default() }) };
+            let Some((context, sequence, link_port)) = state.links.get(&port.pointer).map(|link| (link.context, next_sequence(&link.server_port), link.server_port.clone())) else { return Reply::Now(JobResult { status: STATUS_PORT_DISCONNECTED, ..JobResult::default() }) };
             let id = UserServer::next_id(&mut state);
             if !datagram {
                 state.requests.insert(id, slot.clone());
             }
             state.senders.insert(id, Origin { sender, client: port.pointer });
-            (id, context, sequence)
+            (id, context, sequence, link_port)
         };
         let message_type = if datagram { LPC_DATAGRAM } else if synchronous { LPC_REQUEST | LPC_CONTINUATION_REQUIRED } else { LPC_REQUEST };
-        self.enqueue(Delivery { id, message_type, data: Vec::from(data), sender, port_context: context, data_view, sequence, ..Delivery::default() });
+        self.enqueue(Delivery { id, message_type, data: Vec::from(data), sender, port_context: context, data_view, sequence, attributes, link_port: Some(link_port), ..Delivery::default() });
         if datagram {
             return Reply::Now(JobResult::default());
         }
@@ -519,12 +573,31 @@ fn publish_attributes(attributes: u64, delivery: &Delivery, sequence: u32, view:
         let at = crate::ntos::ps::user::alpc::attribute_address(attributes, CONTEXT_ATTRIBUTE);
         context_attribute::try_write(at, delivery.port_context, 0, sequence, delivery.id, 0)?;
     }
+    // O ALPC_SECURITY_ATTR, como o AlpcpExposeAttributes: Flags zero e o
+    // ContextHandle do contexto que o cliente mandou (o PQOS fica como
+    // está).
+    if let Some(security) = delivery.attributes.security.as_ref().filter(|_| allocated & SECURITY_ATTRIBUTE != 0) {
+        let at = crate::ntos::ps::user::alpc::attribute_address(attributes, SECURITY_ATTRIBUTE);
+        let attribute = state::user_struct::<AlpcSecurityAttr>(at).map_err(|error| error.status)?;
+        attribute.flags.probe_set(0).map_err(|error| error.status)?;
+        attribute.context_handle.probe_set(security.handle()).map_err(|error| error.status)?;
+        valid |= SECURITY_ATTRIBUTE;
+    }
+    if let Some(handles) = delivery.attributes.handles.as_ref().filter(|_| allocated & HANDLE_ATTRIBUTE != 0) {
+        if let Some(bytes) = expose_handles(handles, delivery.link_port.as_ref()) {
+            let at = crate::ntos::ps::user::alpc::attribute_address(attributes, HANDLE_ATTRIBUTE);
+            guest::try_write_bytes(at, &bytes).map_err(|_| STATUS_ACCESS_VIOLATION)?;
+            valid |= HANDLE_ATTRIBUTE;
+        }
+    }
     // O ALPC_TOKEN_ATTR, como o AlpcpExposeTokenAttribute: TokenId,
-    // AuthenticationId e ModifiedId do token efetivo de quem enviou (o RPC
-    // do servidor lê a identidade do cliente por ele, o
+    // AuthenticationId e ModifiedId do token efetivo da mensagem (o do
+    // contexto de segurança que ela leva, senão o de quem enviou; o RPC do
+    // servidor lê a identidade do cliente por ele, o
     // I_RpcBindingInqClientTokenAttributes).
     if allocated & TOKEN_ATTRIBUTE != 0 {
-        if let Some(statistics) = sender_effective_token(delivery.sender.thread_pointer).and_then(|token| crate::ntos::se::token::statistics::encode(token).ok()) {
+        let token = delivery.attributes.security.as_ref().map(|security| security.token).or_else(|| sender_effective_token(delivery.sender.thread_pointer));
+        if let Some(statistics) = token.and_then(|token| crate::ntos::se::token::statistics::encode(token).ok()) {
             let at = crate::ntos::ps::user::alpc::attribute_address(attributes, TOKEN_ATTRIBUTE);
             let mut bytes = [0u8; 24];
             bytes[..8].copy_from_slice(&statistics[..8]);
@@ -547,6 +620,36 @@ fn publish_attributes(attributes: u64, delivery: &Delivery, sequence: u32, view:
         valid |= VIEW_ATTRIBUTE;
     }
     header.valid_attributes.probe_set(valid).map_err(|error| error.status)
+}
+
+/// O ALPC_HANDLE_ATTR de recepção (AlpcpExposeHandleAttribute), pelas regras
+/// da porta de comunicação ligada ao cliente: sem ALLOW_DUP_OBJECT nada sai;
+/// com ALLOW_MULTIHANDLE_ATTRIBUTE, {Flags INDIRECT, Handle 0, ObjectType = o
+/// número de handles}, e o servidor pede cada um pela classe 3; senão um
+/// handle só, já duplicado no servidor, com o tipo e o acesso concedido.
+fn expose_handles(handles: &HandleData, link_port: Option<&Arc<Port>>) -> Option<[u8; 24]> {
+    let port = link_port?;
+    let flags = port.with(|state| state.port_flags);
+    if flags & ALLOW_DUP_OBJECT == 0 {
+        return None;
+    }
+    let entries = handles.entries.lock();
+    let mut bytes = [0u8; 24];
+    let put32 = |bytes: &mut [u8; 24], offset: usize, value: u32| bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    if flags & ALLOW_MULTIHANDLE_ATTRIBUTE != 0 {
+        put32(&mut bytes, offset_of!(AlpcHandleAttr, flags), HANDLE_INDIRECT);
+        put32(&mut bytes, offset_of!(AlpcHandleAttr, object_type), entries.len() as u32);
+        return Some(bytes);
+    }
+    if entries.len() != 1 {
+        return None;
+    }
+    let duplicated = crate::ntos::alpc::message::handles::duplicate(&entries[0], port, 1).ok()?.ok()?;
+    let handle = offset_of!(AlpcHandleAttr, handle);
+    bytes[handle..handle + 8].copy_from_slice(&(duplicated.handle as u64).to_le_bytes());
+    put32(&mut bytes, offset_of!(AlpcHandleAttr, object_type), duplicated.object_type);
+    put32(&mut bytes, offset_of!(AlpcHandleAttr, desired_access), duplicated.granted);
+    Some(bytes)
 }
 
 /// O que a recepção faz além de entregar a mensagem.
@@ -624,10 +727,20 @@ fn receive_one(server: &UserServer, buffer: &Buffer, attributes: u64, options: R
             Some((binding, carried)) => message_view::publish(attributes, binding, carried).map(|_| ()),
             None => Ok(()),
         });
-        // Um pedido que espera resposta guarda a vista até ela.
-        if let Some((binding, _)) = data_binding.filter(|_| published.is_ok() && delivery.message_type & 0xFF == LPC_REQUEST) {
-            server.state.lock().exposed_views.insert(delivery.id, binding);
+        // Um pedido que espera resposta guarda a vista e os atributos até
+        // ela; um datagrama os solta já.
+        let mut delivery = delivery;
+        if delivery.message_type & 0xFF == LPC_REQUEST {
+            let attributes = core::mem::take(&mut delivery.attributes);
+            let mut state = server.state.lock();
+            if let Some((binding, _)) = data_binding.filter(|_| published.is_ok()) {
+                state.exposed_views.insert(delivery.id, binding);
+            }
+            if !attributes.is_empty() {
+                state.received.insert(delivery.id, Received { attributes, link_port: delivery.link_port.clone() });
+            }
         }
+        drop(delivery);
         return Some(published.err().unwrap_or(STATUS_SUCCESS));
     }
 }
@@ -678,16 +791,16 @@ fn send_reply(server: &UserServer, port: &Arc<Port>, input: u64, attributes: u64
         Ok(captured) => captured,
         Err(status) => return status,
     };
-    let (slot, exposed) = {
+    let (slot, exposed, _received) = {
         let mut state = server.state.lock();
         let slot = state.requests.remove(&id);
-        let exposed = if slot.is_some() {
+        let (exposed, received) = if slot.is_some() {
             state.senders.remove(&id);
-            state.exposed_views.remove(&id)
+            (state.exposed_views.remove(&id), state.received.remove(&id))
         } else {
-            None
+            (None, None)
         };
-        (slot, exposed)
+        (slot, exposed, received)
     };
     let Some(slot) = slot else { return STATUS_REPLY_MESSAGE_MISMATCH };
     // A resposta com UNMAP_EXISTING apaga a vista que o pedido trouxe ao
@@ -838,6 +951,27 @@ pub fn sender_of(port: &Arc<Port>, id: u32) -> Option<Origin> {
     server_of(port)?.state.lock().senders.get(&id).copied()
 }
 
+/// Os handles que o pedido `id`, já recebido pelo servidor da porta, levou, e
+/// a porta de comunicação ligada ao cliente (o NtAlpcQueryInformationMessage
+/// da classe 3 os duplica no servidor).
+pub fn received_handles(port: &Arc<Port>, id: u32) -> Option<(Arc<HandleData>, Option<Arc<Port>>)> {
+    let server = server_of(port)?;
+    let state = server.state.lock();
+    let received = state.received.get(&id)?;
+    Some((received.attributes.handles.clone()?, received.link_port.clone()))
+}
+
+/// O contexto de segurança que o pedido `id`, já recebido pelo servidor da
+/// porta, levou: o token capturado (retido para quem chama, que o solta), o
+/// nível e o EffectiveOnly.
+pub fn received_security(port: &Arc<Port>, id: u32) -> Option<(u64, u32, bool)> {
+    let server = server_of(port)?;
+    let state = server.state.lock();
+    let security = state.received.get(&id)?.attributes.security.as_ref()?;
+    crate::ntos::se::token::tokens::retain(security.token).ok()?;
+    Some((security.token, security.level, security.effective_only))
+}
+
 /// O token efetivo da thread `thread` de um cliente: o de impersonação dela,
 /// senão o primário do processo dono (o contexto de segurança dinâmico do
 /// AlpcpGetEffectiveTokenMessage).
@@ -946,8 +1080,17 @@ pub fn accept_legacy(out: u64, port_context: u64, request: u64, accept: bool, vi
 /// conexão e a vista da seção do servidor no cliente.
 #[allow(clippy::too_many_arguments)]
 fn establish(server: &Arc<UserServer>, pending: &Arc<PendingConnection>, out: u64, port_context: u64, attributes: u64, mode: u8, data: Vec<u8>, accepted: &LegacyAccepted) -> Result<u32, KernelError> {
+    establish_with(server, pending, out, port_context, attributes, None, mode, data, accepted)
+}
+
+/// [`establish`] com o Flags e o DupObjectTypes do ALPC_PORT_ATTRIBUTES da
+/// aceitação, que valem para a porta de comunicação (as regras de handles
+/// dos pedidos do cliente).
+#[allow(clippy::too_many_arguments)]
+fn establish_with(server: &Arc<UserServer>, pending: &Arc<PendingConnection>, out: u64, port_context: u64, attributes: u64, port_attributes: Option<(u32, u32)>, mode: u8, data: Vec<u8>, accepted: &LegacyAccepted) -> Result<u32, KernelError> {
     let object_flags = object_flags(attributes)?;
-    let port_flags = server.listener.with(|state| state.port_flags) & LPC_MODE;
+    let (accepted_flags, duplicate_object_types) = port_attributes.unwrap_or((0, 0));
+    let port_flags = (server.listener.with(|state| state.port_flags) & LPC_MODE) | (accepted_flags & !LPC_MODE);
     let mut views = Vec::new();
     if let Some(view) = pending.view.as_ref().and_then(|view| view.server()) {
         views.push(view);
@@ -955,7 +1098,7 @@ fn establish(server: &Arc<UserServer>, pending: &Arc<PendingConnection>, out: u6
     if let Some((local, _)) = &accepted.server_view {
         views.push(local.clone());
     }
-    let initial = PortState { role: Role::Server, port_context, port_flags, views, ..PortState::default() };
+    let initial = PortState { role: Role::Server, port_context, port_flags, duplicate_object_types, views, ..PortState::default() };
     let disconnecting = server.clone();
     let client_pointer = pending.client.pointer;
     // A sequência da porta de comunicação começa em zero: a primeira
@@ -1162,6 +1305,14 @@ fn create_listener(out: u64, attributes: u64, name: Option<String>, initial: Por
 /// ConnectionMessageAttributes, AcceptConnection).
 #[allow(clippy::too_many_arguments)]
 pub fn accept_connect_port(out: u64, connection: u64, attributes: u64, port_context: u64, request: u64, accept: bool, mode: u8) -> Result<u32, KernelError> {
+    accept_connect_port_with(out, connection, attributes, 0, port_context, request, accept, mode)
+}
+
+/// [`accept_connect_port`] com o ALPC_PORT_ATTRIBUTES da aceitação
+/// (`port_attributes`, zero sem ele): o Flags e o DupObjectTypes passam à
+/// porta de comunicação, como no AlpcpAcceptConnectPort.
+#[allow(clippy::too_many_arguments)]
+pub fn accept_connect_port_with(out: u64, connection: u64, attributes: u64, port_attributes: u64, port_context: u64, request: u64, accept: bool, mode: u8) -> Result<u32, KernelError> {
     let mut reference = match port_reference::reference(connection, 0, mode)? {
         Ok(reference) => reference,
         Err(status) => return Ok(status),
@@ -1184,6 +1335,15 @@ pub fn accept_connect_port(out: u64, connection: u64, attributes: u64, port_cont
         if mode != 0 && !state::probe_user_write(out, 8) {
             return Ok(STATUS_ACCESS_VIOLATION);
         }
+        let accepted_attributes = if port_attributes != 0 {
+            if mode != 0 && !state::probe_user_read(port_attributes, AlpcPortAttributes::SIZE) {
+                return Ok(STATUS_ACCESS_VIOLATION);
+            }
+            let captured = state::user_struct::<AlpcPortAttributes>(port_attributes)?;
+            Some((captured.flags.probe_get()?, captured.dup_object_types.probe_get()?))
+        } else {
+            None
+        };
         // A vista de um cliente LPC já entrou no servidor na recepção (o
         // atributo de vista) ou entra agora, e fica com a comunicação.
         if let Some(view) = &pending.view {
@@ -1191,7 +1351,7 @@ pub fn accept_connect_port(out: u64, connection: u64, attributes: u64, port_cont
                 return Ok(status);
             }
         }
-        establish(&server, &pending, out, port_context, attributes, mode, captured.data.clone(), &LegacyAccepted::default())
+        establish_with(&server, &pending, out, port_context, attributes, accepted_attributes, mode, captured.data.clone(), &LegacyAccepted::default())
     })();
     let _ = reference.release();
     result
