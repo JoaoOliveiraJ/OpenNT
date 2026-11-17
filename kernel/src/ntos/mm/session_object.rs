@@ -20,6 +20,11 @@
 //! - o MiSessionObjectDelete (rva 0x8c8b20): devolve a ProcessReferenceTo
 //!   Session do bit 0x40.
 //!
+//! - o NtOpenSession (rva 0x6a3080): o ObOpenObjectByName do nome com o
+//!   MmSessionObjectType, que o Local Session Manager (lsm.dll) usa para
+//!   abrir `\KernelObjects\Session<id>` e avisar o I/O Manager das mudanças
+//!   de estado da sessão (`io/session_notification.rs`).
+//!
 //! O fim da sessão (MiDereferenceSessionFinal) fecha o handle e solta o
 //! objeto antes de desfazer o MM_SESSION_SPACE.
 
@@ -46,6 +51,9 @@ const BODY_SIZE: u32 = 0x28;
 const OBJ_KERNEL_HANDLE: u32 = 0x200;
 /// O bit de LongFlags do MM_SESSION_SPACE com a referência do objeto.
 const SESSION_OBJECT_REFERENCE: u32 = 0x40;
+const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 
 /// O corpo do objeto Session.
 #[repr(C)]
@@ -230,4 +238,53 @@ pub fn by_id(id: u32) -> u64 {
         return object;
     }
     0
+}
+
+/// NtOpenSession(SessionHandle, DesiredAccess, ObjectAttributes) no modo
+/// `mode` (rva 0x6a3080): em UserMode o PHANDLE é sondado para escrita; o
+/// ObOpenObjectByName com o MmSessionObjectType abre o objeto pelo nome
+/// (`\KernelObjects\Session<id>`) e o handle (0 na recusa) sempre volta ao
+/// chamador. Devolve o NTSTATUS.
+pub fn open(handle_out: u64, access: u32, attributes: u64, mode: u8) -> Result<u32, KernelError> {
+    if mode != 0 && !crate::ntos::ps::user_probe::probe_user_write(handle_out, 8) {
+        return Ok(STATUS_ACCESS_VIOLATION);
+    }
+    let (status, handle) = if attributes == 0 { (STATUS_INVALID_PARAMETER, 0) } else { open_named(attributes, access, mode)? };
+    if mode != 0 {
+        if guest::try_write::<u64>(handle_out, handle).is_err() {
+            return Ok(STATUS_ACCESS_VIOLATION);
+        }
+    } else {
+        guest::write64(handle_out, handle);
+    }
+    Ok(status)
+}
+
+/// O ObOpenObjectByName dos atributos (capturados em UserMode): o NTSTATUS
+/// e o handle, 0 na recusa.
+fn open_named(attributes: u64, access: u32, mode: u8) -> Result<(u32, u64), KernelError> {
+    let captured = if mode != 0 {
+        match crate::ntos::ob::object_open::capture_user_attributes(attributes) {
+            Ok(block) => Some(block),
+            Err(status) => return Ok((status, 0)),
+        }
+    } else {
+        None
+    };
+    let cell = guest::alloc_bytes(8);
+    if cell == 0 {
+        if let Some(block) = captured {
+            guest::free_bytes(block);
+        }
+        return Ok((STATUS_INSUFFICIENT_RESOURCES, 0));
+    }
+    guest::write64(cell, 0);
+    let result = crate::ntos::ob::object_open::open_by_name(captured.unwrap_or(attributes), session_type(), mode, access, cell);
+    let handle = guest::read64(cell);
+    guest::free_bytes(cell);
+    if let Some(block) = captured {
+        guest::free_bytes(block);
+    }
+    let status = result? as u32;
+    Ok((status, if status & 0x8000_0000 != 0 { 0 } else { handle }))
 }

@@ -136,6 +136,83 @@ fn writable(root: u64, va: u64) -> bool {
     paging::query_page_in(root, va, false).is_some_and(|query| query.flags & paging::PAGE_RW != 0)
 }
 
+/// O NtOpenSession e o NtNotifyChangeSession de modo usuário (o caminho do
+/// Local Session Manager), num processo da sessão `session` (id `id`):
+/// abrir `\KernelObjects\Session<id>` por nome (um nome ausente devolve o
+/// handle 0); a sequência que avança com o número certo e fica com um
+/// número atrasado; o IoState gravado com o NewState; o Event 0 só conta a
+/// sequência; o payload acima de 0x100 bytes e o handle inválido
+/// recusados; o aviso de um evento assíncrono (Connected) devolve o evento
+/// de sincronização só depois do worker.
+fn session_notifications(assert: Assert, process: u64, session: u64, id: u32) {
+    let outcome = inside(process, || {
+        let block = crate::ntos::ps::user::memory::map_user_region(0x1000).ok()?;
+        let (attributes, text, unicode, handle, payload, rsp) = (block, block + 0x100, block + 0x80, block + 0x200, block + 0x300, block + 0x800);
+        let name = format!("\\KernelObjects\\Session{id}");
+        crate::ntos::ps::user::state::write_user_wide(text, &name);
+        crate::ntos::ps::user::state::write_unicode_string(unicode, text, &name);
+        // SAFETY: OBJECT_ATTRIBUTES no bloco do processo da sessão.
+        let object_attributes = unsafe { crate::ntos::inc::types::ObjectAttributes::at(attributes) };
+        object_attributes.length.set(crate::ntos::inc::types::ObjectAttributes::SIZE as u32);
+        object_attributes.object_name.set(unicode);
+        object_attributes.attributes.set(0x40);
+        let call = |name: &str, a1: u64, a2: u64, a3: u64, a4: u64| state::handler(name).map_or(1, |handler| handler(a1, a2, a3, a4, rsp).unwrap_or(1));
+        let notify = |session_handle: u64, sequence: u32, event: u32, new_state: u32, data: u64, size: u32| {
+            guest::write64(rsp + 0x28, new_state as u64);
+            guest::write64(rsp + 0x30, 0);
+            guest::write64(rsp + 0x38, data);
+            guest::write64(rsp + 0x40, size as u64);
+            call("NtNotifyChangeSession", session_handle, sequence as u64, 0, event as u64)
+        };
+        let opened = call("NtOpenSession", handle, 0xC000_0000, attributes, 0);
+        let session_handle = guest::read64(handle);
+        let state_now = || (space(session).io_state_sequence.get(), space(session).io_state.get().0);
+        let first = state_now().0;
+        let created = notify(session_handle, first, 1, 2, 0, 0);
+        let after_created = state_now();
+        let stale = notify(session_handle, first, 0, 0, 0, 0);
+        let after_stale = state_now();
+        let ignored = notify(session_handle, first + 1, 0, 0, 0, 0);
+        let after_ignored = state_now();
+        guest::write64(payload, 0x5E55_0000_0000_0001);
+        let with_payload = notify(session_handle, first + 2, 2, 8, payload, 8);
+        let oversized = notify(session_handle, first + 3, 1, 2, payload, 0x101);
+        let invalid = notify(0x7FFC, first + 3, 1, 2, 0, 0);
+        let connected = notify(session_handle, first + 3, 3, 3, payload, 8);
+        // O worker solta o evento de sincronização: a espera (com prazo de
+        // 1 s) o consome e o devolve sinalizado.
+        let event = space(session).io_notification_event.address();
+        crate::ntos::io::work_items::run_queue();
+        let timeout = guest::alloc_bytes(8);
+        guest::write::<i64>(timeout, -10_000_000);
+        let released = crate::ntos::ke::dispatcher::wait_for_single_object(event, timeout, 0, false) == 0;
+        guest::free_bytes(timeout);
+        if released {
+            crate::ntos::ke::dispatcher::set_event(event);
+        }
+        let after_connected = state_now();
+        guest::write64(handle, u64::MAX);
+        crate::ntos::ps::user::state::write_user_wide(text, "\\KernelObjects\\SessionNada");
+        crate::ntos::ps::user::state::write_unicode_string(unicode, text, "\\KernelObjects\\SessionNada");
+        let missing = call("NtOpenSession", handle, 0xC000_0000, attributes, 0);
+        let missing_handle = guest::read64(handle);
+        call("NtClose", session_handle, 0, 0, 0);
+        if let Some(region) = crate::ntos::ps::user::memory::find_region(block) {
+            crate::ntos::ps::user::memory::release_private_region(&region);
+        }
+        Some((opened, session_handle, first, (created, after_created), (stale, after_stale), (ignored, after_ignored), with_payload, oversized, invalid, (connected, released, after_connected), (missing, missing_handle)))
+    })
+    .flatten();
+    let Some((opened, session_handle, first, created, stale, ignored, with_payload, oversized, invalid, connected, missing)) = outcome else {
+        assert(false, "sessao: NtOpenSession e NtNotifyChangeSession no processo da sessao");
+        return;
+    };
+    assert(opened == 0 && session_handle != 0 && missing == (0xC000_0034, 0), "sessao: NtOpenSession abre \\KernelObjects\\Session<id> por nome; um nome ausente devolve STATUS_OBJECT_NAME_NOT_FOUND e o handle 0");
+    assert(created == (0, (first + 1, 2)) && stale == (0, (first + 1, 2)) && ignored == (0, (first + 2, 2)), "sessao: NtNotifyChangeSession avanca a sequencia com o numero certo, grava o NewState e deixa a sequencia com um numero atrasado ou o Event 0");
+    assert(with_payload == 0 && oversized == 0xC000_00F4 && invalid == 0xC000_0008, "sessao: NtNotifyChangeSession aceita o payload de 8 bytes e recusa o de 0x101 (STATUS_INVALID_PARAMETER_6) e o handle invalido");
+    assert(connected == (0, true, (first + 4, 3)), "sessao: o aviso Connected vai ao worker, que solta o evento de sincronizacao da sessao");
+}
+
 pub fn run(assert: Assert) {
     if process::get_current_thread() == 0 {
         assert(false, "sessao: thread corrente para anexar");
@@ -224,6 +301,7 @@ pub fn run(assert: Assert) {
     })
     .flatten();
     assert(linked == Some((0, 0, 0xC000_0022, object_a)), "sessao: ObjectSessionObjectInformation liga o objeto Session da sessao ao diretorio uma vez; a segunda e STATUS_ACCESS_DENIED");
+    session_notifications(assert, a, sa, id_a);
 
     // Tabela de topo por sessão, ligada na raiz de cada processo dela.
     let (top_a, top_b) = (session::tables(sa).map_or(0, |(top, _)| top), session::tables(sb).map_or(0, |(top, _)| top));

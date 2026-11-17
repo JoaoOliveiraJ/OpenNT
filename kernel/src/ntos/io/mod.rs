@@ -5,6 +5,7 @@
 pub mod work_items;
 pub mod io_manager;
 pub mod root_directories;
+pub mod session_notification;
 pub mod device_security;
 pub mod device_resources;
 pub mod cancel;

@@ -33,7 +33,7 @@ use super::{ejob, flags, job_type, limit, membership, Outbox, JOBS};
 use super::{STATUS_ACCESS_VIOLATION, STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_PARAMETER};
 use crate::ntos::ex::{list_entry, resource as eresource, uuid};
 use crate::ntos::inc::field::{Field, NtStruct};
-use crate::ntos::inc::types::{Ejob, ListEntry, ObjectAttributes, UnicodeString};
+use crate::ntos::inc::types::{Ejob, ListEntry};
 use crate::ntos::ke::dispatcher;
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::ob::objects::dispatcher as dispatcher_objects;
@@ -176,32 +176,6 @@ pub fn create(handle_out: u64, access: u32, attributes: u64, mode: u8) -> Result
     result
 }
 
-/// OBJECT_ATTRIBUTES de modo usuário copiados para o kernel (o caminho
-/// inteiro, sem RootDirectory): o OA, o UNICODE_STRING e o texto num bloco.
-fn capture_user_attributes(attributes: u64) -> Result<u64, u32> {
-    use crate::ntos::ps::user::registry::{parse_user_object_attributes, user_object_attributes};
-    let Some(parsed) = parse_user_object_attributes(attributes) else { return Err(STATUS_ACCESS_VIOLATION) };
-    let flags = user_object_attributes(attributes).map_err(|error| if error.status != 0 { error.status } else { STATUS_ACCESS_VIOLATION })?;
-    let wide: alloc::vec::Vec<u8> = parsed.path.encode_utf16().flat_map(u16::to_le_bytes).collect();
-    let block = guest::alloc_bytes(ObjectAttributes::SIZE + UnicodeString::SIZE + wide.len() as u64 + 2);
-    if block == 0 {
-        return Err(STATUS_INSUFFICIENT_RESOURCES);
-    }
-    let name = block + ObjectAttributes::SIZE;
-    let text = name + UnicodeString::SIZE;
-    guest::write_bytes(block, &[0u8; (ObjectAttributes::SIZE + UnicodeString::SIZE) as usize]);
-    guest::write_bytes(text, &wide);
-    // SAFETY: o bloco recém-alocado do kernel, do tamanho dos dois tipos.
-    let (object, string) = unsafe { (ObjectAttributes::at(block), UnicodeString::at(name)) };
-    string.length.set(wide.len() as u16);
-    string.maximum_length.set(wide.len() as u16);
-    string.buffer.set(text);
-    object.length.set(ObjectAttributes::SIZE as u32);
-    object.object_name.set(name);
-    object.attributes.set(flags);
-    Ok(block)
-}
-
 /// NtOpenJobObject no modo `mode`. Devolve o NTSTATUS.
 pub fn open(handle_out: u64, access: u32, attributes: u64, mode: u8) -> Result<u32, KernelError> {
     if mode != 0 && !user_probe::probe_user_write(handle_out, 8) {
@@ -214,7 +188,7 @@ pub fn open(handle_out: u64, access: u32, attributes: u64, mode: u8) -> Result<u
         return Ok(STATUS_INVALID_PARAMETER);
     }
     let captured = if mode != 0 {
-        match capture_user_attributes(attributes) {
+        match object_open::capture_user_attributes(attributes) {
             Ok(block) => Some(block),
             Err(status) => return Ok(status),
         }

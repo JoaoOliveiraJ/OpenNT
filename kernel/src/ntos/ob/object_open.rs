@@ -19,7 +19,7 @@
 //! (ObpCreateHandle com ObOpenHandle) e a referência da busca é solta.
 
 use crate::ntos::ex::callbacks as executive_callbacks;
-use crate::ntos::inc::types::{Field, NtStruct, ObjectAttributes};
+use crate::ntos::inc::types::{Field, NtStruct, ObjectAttributes, UnicodeString};
 use crate::ntos::init::exports::signed_status;
 use crate::ntos::ob::object_manager::{self, NodeId};
 use crate::ntos::ob::object_reference::{native_pointer_of_node, reference_device, type_differs};
@@ -34,6 +34,8 @@ use crate::rtl::KernelError;
 const NAME_NOT_FOUND: u32 = 0xC000_0034;
 const TYPE_MISMATCH: u32 = 0xC000_0024;
 const ACCESS_DENIED: u32 = 0xC000_0022;
+const ACCESS_VIOLATION: u32 = 0xC000_0005;
+const INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 
 /// Saída escalar (`PVOID*`, `PHANDLE`, `PULONG`...) de um chamador de kernel.
 fn out<T: Copy>(address: u64) -> &'static Field<T> {
@@ -190,6 +192,34 @@ fn observe_parsed(parse_object: u64, remaining: &[u16], found: u64) {
     let station = guest_strings::try_read_unicode_string(unsafe { ObjectHeaderNameInfo::at(info) }.name.address()).unwrap_or_default();
     let desktop = String::from_utf16_lossy(remaining);
     crate::ntos::init::initial_process::desktop_opened(station.rsplit('\\').next().unwrap_or(""), desktop.trim_start_matches('\\'));
+}
+
+/// OBJECT_ATTRIBUTES de modo usuário copiados para o kernel (o caminho
+/// inteiro, sem RootDirectory): o OA, o UNICODE_STRING e o texto num bloco,
+/// que o chamador libera. Os NtOpen* de modo usuário passam este bloco ao
+/// ObOpenObjectByName.
+pub fn capture_user_attributes(attributes: u64) -> Result<u64, u32> {
+    use crate::ntos::ps::user::registry::{parse_user_object_attributes, user_object_attributes};
+    let Some(parsed) = parse_user_object_attributes(attributes) else { return Err(ACCESS_VIOLATION) };
+    let flags = user_object_attributes(attributes).map_err(|error| if error.status != 0 { error.status } else { ACCESS_VIOLATION })?;
+    let wide: alloc::vec::Vec<u8> = parsed.path.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let block = guest::alloc_bytes(ObjectAttributes::SIZE + UnicodeString::SIZE + wide.len() as u64 + 2);
+    if block == 0 {
+        return Err(INSUFFICIENT_RESOURCES);
+    }
+    let name = block + ObjectAttributes::SIZE;
+    let text = name + UnicodeString::SIZE;
+    guest::write_bytes(block, &[0u8; (ObjectAttributes::SIZE + UnicodeString::SIZE) as usize]);
+    guest::write_bytes(text, &wide);
+    // SAFETY: o bloco recém-alocado do kernel, do tamanho dos dois tipos.
+    let (object, string) = unsafe { (ObjectAttributes::at(block), UnicodeString::at(name)) };
+    string.length.set(wide.len() as u16);
+    string.maximum_length.set(wide.len() as u16);
+    string.buffer.set(text);
+    object.length.set(ObjectAttributes::SIZE as u32);
+    object.object_name.set(name);
+    object.attributes.set(flags);
+    Ok(block)
 }
 
 /// ObOpenObjectByName sem ACCESS_STATE nem ParseContext.
