@@ -181,6 +181,49 @@ pub fn run(assert: Assert) {
     let notify_file = crate::ntos::io::file::query::resolve(notify_handle, false).map_or(0, |selected| selected.pointer);
     let notify_context = (notify_file != 0).then(|| unsafe { FileObject::at(notify_file) });
     assert(notify_opened == 0 && notify_context.is_some_and(|file| file.fs_context.get() == 4 && file.fs_context2.get() == 0), "deviceapi: \\CMNotify abre com o indice 4 e FsContext2 zerado");
+    // O registro (0x470800): o nome do módulo e o CM_NOTIFY_FILTER de uma
+    // classe de interface; a saída recebe um nome WNF temporário e o
+    // contexto fica no FsContext2. Recusas de tamanho e de filtro.
+    let (register_input, register_output) = (block + 0x1400, block + 0x1800);
+    let notify_control = |code: u32, input_length: u32, output_length: u32| -> (u32, u64) {
+        guest::write64(register_output, 0);
+        let returned = status(call_export("ZwDeviceIoControlFile", &[notify_handle, 0, 0, 0, iosb, code as u64, register_input, input_length as u64, register_output, output_length as u64]));
+        (returned, unsafe { crate::ntos::inc::types::IoStatusBlock::at(iosb) }.information.get())
+    };
+    let filter = |flags: u32, filter_type: u32| {
+        guest::write_bytes(register_input, &[0u8; 0x3A8]);
+        crate::ntos::rtl::guest_strings::write_wide_string(register_input, "C:\\Windows\\System32\\lsm.dll");
+        guest::write32(register_input + 0x208, 0x1A0);
+        guest::write32(register_input + 0x20C, flags);
+        guest::write32(register_input + 0x210, filter_type);
+        guest::write_bytes(register_input + 0x218, &[0x80, 0x51, 0xA0, 0x1C, 0x99, 0xA6, 0x0A, 0x45, 0x9A, 0x0C, 0xDE, 0x4F, 0xBE, 0x3D, 0xDD, 0x89]);
+    };
+    filter(0, 0);
+    let short = notify_control(0x47_0800, 0x3A0, 8);
+    let bad_flags = { filter(4, 0); notify_control(0x47_0800, 0x3A8, 8) };
+    let all_classes_instance = { filter(1, 2); notify_control(0x47_0800, 0x3A8, 8) };
+    let refused_context = notify_context.map_or(1, |file| file.fs_context2.get());
+    filter(0, 0);
+    let (registered, registered_information) = notify_control(0x47_0800, 0x3A8, 8);
+    let state_name = guest::read64(register_output);
+    let context = notify_context.map_or(0, |file| file.fs_context2.get());
+    let registration = crate::ntos::io::pnp::cm_notify::registrations().into_iter().find(|(entry, _)| *entry == context).map(|(_, registration)| registration);
+    let unregistered = notify_control(0x47_080C, 0, 0).0;
+    let get_event = notify_control(0x47_0804, 0, 0).0;
+    assert(
+        short.0 == STATUS_INVALID_PARAMETER
+            && bad_flags.0 == STATUS_INVALID_PARAMETER
+            && all_classes_instance.0 == STATUS_INVALID_PARAMETER
+            && refused_context == 0
+            && registered == 0
+            && registered_information == 8
+            && state_name != 0
+            && state_name & 0xF != 0
+            && registration.is_some_and(|registration| registration.state_name == state_name && registration.target.is_some())
+            && unregistered == 0
+            && get_event == 0xC000_0002,
+        "deviceapi: \\CMNotify registra uma classe de interface com um nome WNF temporario e recusa tamanho e filtro",
+    );
     if notify_opened == 0 {
         let _ = close::close(notify_handle, Some(0));
     }

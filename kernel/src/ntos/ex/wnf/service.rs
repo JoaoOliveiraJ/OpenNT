@@ -363,6 +363,59 @@ pub fn delete_state_name_user(state_name: u64) -> Result<u32, KernelError> {
     Ok(result)
 }
 
+/// ZwDeleteWnfStateName(StateName) de um nome temporário, o NtDeleteWnfStateName
+/// do 19041 com PreviousMode KernelMode: o escopo resolvido para o processo
+/// System (PsInitialSystemProcess), sem o ExpWnfCheckCallerAccess, o criador
+/// do nome igual ao System (o de todo nome criado pelo ZwCreateWnfStateName;
+/// senão STATUS_ACCESS_DENIED), o aviso de nome destruído aos assinantes
+/// (fora do contexto de quem chama) e o ExpWnfDeleteNameInstance. Os nomes
+/// permanentes e persistentes devolvem STATUS_NOT_IMPLEMENTED, como no caminho
+/// de modo usuário.
+pub fn delete_state_name_kernel(encoded: u64) -> Result<u32, KernelError> {
+    let name = wnf_name::decode(encoded);
+    if name.status != 0 {
+        return Ok(name.status);
+    }
+    if name.lifetime == 0 {
+        return Ok(0xC000_000D);
+    }
+    if name.lifetime != 3 {
+        return Ok(0xC000_0002);
+    }
+    if !ensure_service()? {
+        return Ok(0xC000_009A);
+    }
+    critical_region::enter_critical()?;
+    let result = (|| -> Result<u32, KernelError> {
+        let system = process::get_system_process();
+        let scope = match namespace::resolve_kernel_scope(system, name.scope, 0)? {
+            Ok(scope) => scope,
+            Err(status) => return Ok(status),
+        };
+        let outcome = (|| -> Result<u32, KernelError> {
+            let found = match namespace::lookup_name(scope, name.decoded_name)? {
+                Ok(found) => found,
+                Err(status) => return Ok(status),
+            };
+            if found.creator_process() != system {
+                namespace::release_name(&found)?;
+                return Ok(0xC000_0022);
+            }
+            notifications::notify_name(found.pointer, WNF_NAME_DESTROYED, true, false)?;
+            let pointer = found.pointer;
+            namespace::release_name(&found)?;
+            namespace::delete_name(pointer)?;
+            Ok(0)
+        })();
+        namespace::release_scope(scope)?;
+        outcome
+    })();
+    let left = critical_region::leave_critical();
+    let result = result?;
+    left?;
+    Ok(result)
+}
+
 /// NtDeleteWnfStateData(StateName, ExplicitScope) de modo usuário (19041,
 /// ExpNtDeleteWnfStateData, rva 0x7cd64c): o nome sondado e decodificado, o
 /// escopo explícito capturado (com o ExpWnfCheckCrossScopeAccess), o escopo
