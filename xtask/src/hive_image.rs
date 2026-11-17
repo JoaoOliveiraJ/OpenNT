@@ -17,7 +17,9 @@
 //!   8 (negativo = alocada), o resto de cada bin numa célula livre;
 //! - 'nk' com o nome comprimido em bytes (KEY_COMP_NAME), a raiz com
 //!   KEY_HIVE_ENTRY | KEY_NO_DELETE e pai nil; listas de subchaves 'lh'
-//!   ordenadas pelo nome sem caixa, com o hash h = h * 37 + maiúscula(c);
+//!   ordenadas pelo nome sem caixa, com o hash h = h * 37 + maiúscula(c),
+//!   e, numa chave com mais de 1012 subchaves, folhas 'lh' de 506 entradas
+//!   sob uma raiz 'ri';
 //!   'vk' com o nome comprimido (VALUE_COMP_NAME) e até 4 bytes de dado no
 //!   próprio campo (bit 31 do tamanho); acima de 16344 bytes, 'db';
 //! - uma célula 'sk' (lista circular dela mesma) com o descritor de todas
@@ -65,6 +67,10 @@ const HBIN_HEADER: usize = 0x20;
 const NIL: u32 = 0xFFFF_FFFF;
 const MINOR: u32 = 5;
 const BIG_SEGMENT: usize = 0x3fd8;
+/// Entradas de uma folha de subchaves: o CmpAddSubKeyEx passa a folha com
+/// 1013 entradas para baixo de uma raiz 'ri', dividida ao meio.
+const MAX_LEAF: usize = 1012;
+const SPLIT_LEAF: usize = MAX_LEAF / 2;
 
 /// SID S-1-5-18 (SYSTEM).
 const SYSTEM_SID: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0];
@@ -288,23 +294,38 @@ fn write_hive(keys: &[Key], time: u64, file_name: &str) -> Vec<u8> {
             }
         }
     }
-    // Listas 'lh', com as células dos filhos já conhecidas.
+    // Listas 'lh', com as células dos filhos já conhecidas; acima de
+    // MAX_LEAF subchaves, folhas 'lh' sob uma raiz 'ri'.
     for &(index, _) in &order {
         let key = &keys[index];
         if key.children.is_empty() {
             continue;
         }
-        assert!(key.children.len() <= 1012, "mais de 1012 subchaves numa chave da hive");
         let mut children: Vec<usize> = key.children.values().copied().collect();
         children.sort_by_key(|&child| upcase(&keys[child].name));
-        let list = bins.cell(4 + children.len() * 8);
-        bins.put(list, 0, b"lh");
-        bins.put16(list, 2, children.len() as u16);
-        for (position, &child) in children.iter().enumerate() {
-            let hash = upcase(&keys[child].name).iter().fold(0u32, |hash, &unit| hash.wrapping_mul(37).wrapping_add(unit as u32));
-            bins.put32(list, 4 + position * 8, cells[child]);
-            bins.put32(list, 8 + position * 8, hash);
-        }
+        let leaf = |bins: &mut Bins, children: &[usize]| -> u32 {
+            let list = bins.cell(4 + children.len() * 8);
+            bins.put(list, 0, b"lh");
+            bins.put16(list, 2, children.len() as u16);
+            for (position, &child) in children.iter().enumerate() {
+                let hash = upcase(&keys[child].name).iter().fold(0u32, |hash, &unit| hash.wrapping_mul(37).wrapping_add(unit as u32));
+                bins.put32(list, 4 + position * 8, cells[child]);
+                bins.put32(list, 8 + position * 8, hash);
+            }
+            list
+        };
+        let list = if children.len() <= MAX_LEAF {
+            leaf(&mut bins, &children)
+        } else {
+            let leaves: Vec<u32> = children.chunks(SPLIT_LEAF).map(|chunk| leaf(&mut bins, chunk)).collect();
+            let root = bins.cell(4 + leaves.len() * 4);
+            bins.put(root, 0, b"ri");
+            bins.put16(root, 2, leaves.len() as u16);
+            for (position, &leaf) in leaves.iter().enumerate() {
+                bins.put32(root, 4 + position * 4, leaf);
+            }
+            root
+        };
         bins.put32(cells[index], 0x1c, list);
     }
     if !bins.data.is_empty() {
@@ -419,4 +440,56 @@ pub fn machine_hives(smss_boot: bool) -> Vec<(&'static str, Vec<u8>)> {
         ("DEFAULT", default),
     ];
     hives.into_iter().map(|(name, seeds)| (name, hive_from_seeds(seeds, &format!("\\SystemRoot\\System32\\config\\{name}")))).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{cm, hive_from_seeds, HBLOCK, MAX_LEAF, SPLIT_LEAF};
+
+    fn u16_at(bytes: &[u8], offset: usize) -> u16 {
+        u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap())
+    }
+
+    fn u32_at(bytes: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+    }
+
+    /// Os dados de uma célula (depois do tamanho).
+    fn cell(index: u32) -> usize {
+        HBLOCK + index as usize + 4
+    }
+
+    /// O nome comprimido de uma 'nk'.
+    fn name(hive: &[u8], nk: u32) -> String {
+        let at = cell(nk);
+        let length = u16_at(hive, at + 0x48) as usize;
+        String::from_utf8(hive[at + 0x4c..at + 0x4c + length].to_vec()).unwrap()
+    }
+
+    /// Uma chave com mais subchaves que uma folha leva uma raiz 'ri' com
+    /// folhas 'lh' em ordem, como o CmpAddSubKeyEx deixa depois de dividir.
+    #[test]
+    fn many_subkeys_go_under_an_index_root() {
+        let total = MAX_LEAF + 100;
+        let seeds: Vec<cm::seed::SeedKey> = (0..total).map(|number| cm::seed::SeedKey::new(&format!("Many\\Key{number:05}"))).collect();
+        let hive = hive_from_seeds(seeds, "TEST");
+        let root = u32_at(&hive, 0x24);
+        let many = u32_at(&hive, cell(u32_at(&hive, cell(root) + 0x1c)) + 4);
+        assert_eq!(name(&hive, many), "Many");
+        assert_eq!(u32_at(&hive, cell(many) + 0x14) as usize, total);
+        let list = cell(u32_at(&hive, cell(many) + 0x1c));
+        assert_eq!(&hive[list..list + 2], b"ri");
+        let leaves = u16_at(&hive, list + 2) as usize;
+        assert_eq!(leaves, total.div_ceil(SPLIT_LEAF));
+        let mut names = Vec::new();
+        for position in 0..leaves {
+            let leaf = cell(u32_at(&hive, list + 4 + position * 4));
+            assert_eq!(&hive[leaf..leaf + 2], b"lh");
+            for entry in 0..u16_at(&hive, leaf + 2) as usize {
+                names.push(name(&hive, u32_at(&hive, leaf + 4 + entry * 8)));
+            }
+        }
+        let expected: Vec<String> = (0..total).map(|number| format!("Key{number:05}")).collect();
+        assert_eq!(names, expected);
+    }
 }
