@@ -26,6 +26,12 @@ pub fn query() -> u32 {
     STATUS_NOT_FOUND
 }
 
+/// RtlQueryFeatureConfigurationChangeStamp: sem configuração publicada, o
+/// carimbo de mudança nunca saiu de zero.
+pub fn change_stamp() -> u64 {
+    0
+}
+
 /// RtlRegisterFeatureConfigurationChangeNotification: o handle devolvido é o
 /// próprio callback.
 pub fn register_change_notification(callback: u64, context: u64, handle_out: u64) {

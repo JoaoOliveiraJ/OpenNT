@@ -526,6 +526,11 @@ fn nt_query_system_information_ex(class: u64, input: u64, input_length: u64, buf
     if class == 181 {
         return crate::ntos::ex::supported_architectures::query(input, input_length, buffer, length, returned, queried_process);
     }
+    // A configuração de features (`cm/feature_configuration`).
+    use crate::ntos::cm::feature_configuration;
+    if matches!(class, feature_configuration::SYSTEM_FEATURE_CONFIGURATION_INFORMATION | feature_configuration::SYSTEM_FEATURE_CONFIGURATION_SECTION_INFORMATION) {
+        return feature_configuration::query_user(class, input, input_length as u32, buffer, length as u32, returned);
+    }
     if class != 107 {
         return query_system_information(class, buffer, length, returned);
     }

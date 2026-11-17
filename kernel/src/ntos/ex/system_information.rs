@@ -395,6 +395,8 @@ pub fn query_ex(class: u32, input: u64, input_length: u32, output: u64, length: 
             }
         }
         SYSTEM_INTERRUPT_STEERING_INFORMATION => query_interrupt_steering(input, input_length, output, length, &mut reported),
+        crate::ntos::cm::feature_configuration::SYSTEM_FEATURE_CONFIGURATION_INFORMATION => crate::ntos::cm::feature_configuration::query_single(input, input_length, output, length, &mut reported)?,
+        crate::ntos::cm::feature_configuration::SYSTEM_FEATURE_CONFIGURATION_SECTION_INFORMATION => crate::ntos::cm::feature_configuration::query_sections(input, input_length, output, length, &mut reported)?,
         _ => {
             debug_print!("[zw] QuerySystemInformationEx classe {} (sem suporte)", class);
             return Ok(STATUS_INVALID_INFO_CLASS);

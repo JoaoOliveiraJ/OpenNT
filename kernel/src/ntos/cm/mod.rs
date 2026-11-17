@@ -19,6 +19,7 @@ pub mod cng_defaults;
 pub mod computer_name;
 pub mod crypto_defaults;
 pub mod current_version;
+pub mod feature_configuration;
 pub mod feature_usage;
 pub mod feature_usage_buffer;
 pub mod feature_usage_delivery;
