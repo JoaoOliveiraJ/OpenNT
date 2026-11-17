@@ -54,6 +54,19 @@ pub fn single_privilege_check(privilege: u64, previous_mode: u32) -> bool {
     tokens::with(token, |token| token.privileges.iter().any(|held| held.id == privilege && held.attributes & SE_PRIVILEGE_ENABLED != 0)).unwrap_or(false)
 }
 
+/// SeCheckAuditPrivilege: o SeAuditPrivilege (21) habilitado no token
+/// primário do processo corrente (não no de impersonação da thread), como no
+/// NT; KernelMode passa direto. É o que os serviços de alarme de auditoria
+/// pedem.
+pub fn audit_privilege_check(previous_mode: u32) -> bool {
+    if previous_mode == 0 {
+        return true;
+    }
+    let process = crate::ntos::ps::process::get_current_process();
+    let Some(token) = crate::ntos::ps::process::get_primary_token(process) else { return false };
+    tokens::with(token, |token| token.privileges.iter().any(|held| held.id == 21 && held.attributes & SE_PRIVILEGE_ENABLED != 0)).unwrap_or(false)
+}
+
 /// SePrivilegeCheck(RequiredPrivileges, Subj, Mode): KernelMode → TRUE
 /// imediato; senão testa cada LUID do PRIVILEGE_SET contra os privilégios
 /// habilitados do token efetivo, marcando os usados.

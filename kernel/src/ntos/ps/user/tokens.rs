@@ -401,7 +401,7 @@ fn nt_access_check(descriptor: u64, client_token: u64, desired: u64, mapping: u6
 /// PRIVILEGE_SET sondado; o alarme é `se::audit`.
 fn nt_privileged_service_audit_alarm(_subsystem: u64, service: u64, client_token: u64, privileges: u64, rsp: u64) -> Result<u32, KernelError> {
     let granted = stack_arg(rsp, 5) as u8 != 0;
-    if !crate::ntos::se::privilege::single_privilege_check(SE_AUDIT_PRIVILEGE, 1) {
+    if !crate::ntos::se::privilege::audit_privilege_check(1) {
         return Ok(0xC000_0061);
     }
     let token = match lookup(client_token, 8) {
@@ -424,15 +424,13 @@ fn nt_privileged_service_audit_alarm(_subsystem: u64, service: u64, client_token
     Ok(crate::ntos::se::audit::privileged_service_audit_alarm(&service_name, kind, level, count, granted))
 }
 
-/// SeAuditPrivilege.
-const SE_AUDIT_PRIVILEGE: u64 = 21;
 
 /// NtCloseObjectAuditAlarm e NtDeleteObjectAuditAlarm(SubsystemName,
 /// HandleId, GenerateOnClose): o SubsystemName sondado só com
 /// GenerateOnClose; o alarme é `se::audit`.
 fn object_audit_alarm(subsystem: u64, handle_id: u64, generate_on_close: u64, delete: bool) -> Result<u32, KernelError> {
     let generate = generate_on_close as u8 != 0;
-    let privileged = generate && crate::ntos::se::privilege::single_privilege_check(SE_AUDIT_PRIVILEGE, 1);
+    let privileged = generate && crate::ntos::se::privilege::audit_privilege_check(1);
     let name = if generate && privileged {
         if subsystem == 0 || !probe_user_read(subsystem, UnicodeString::SIZE) {
             return Ok(0xC000_0005);
@@ -442,6 +440,38 @@ fn object_audit_alarm(subsystem: u64, handle_id: u64, generate_on_close: u64, de
         String::new()
     };
     Ok(crate::ntos::se::audit::close_object_audit_alarm(&name, handle_id, generate, privileged, delete))
+}
+
+/// NtAccessCheckAndAuditAlarm e NtAccessCheckByTypeAndAuditAlarm: o
+/// SeAuditPrivilege do token primário (STATUS_PRIVILEGE_NOT_HELD), o
+/// descritor, o GENERIC_MAPPING e as três saídas sondados, e a checagem de
+/// `se::access_check` com o token de impersonação da thread.
+#[allow(clippy::too_many_arguments)]
+fn access_check_and_audit_alarm(descriptor: u64, desired: u32, mapping: u64, granted: u64, status: u64, generate: u64) -> Result<u32, KernelError> {
+    if !crate::ntos::se::privilege::audit_privilege_check(1) {
+        return Ok(0xC000_0061);
+    }
+    if !probe_user_read(mapping, 16) || !probe_user_write(granted, 4) || !probe_user_write(status, 4) || !probe_user_write(generate, 1) {
+        return Ok(0xC000_0005);
+    }
+    let Some(impersonation) = thread_tokens::get(process::get_current_thread()) else { return Ok(0xC000_005C) };
+    Ok(crate::ntos::se::access_check::check_and_audit_alarm(descriptor, impersonation.token, impersonation.level, desired, mapping, granted, status, generate))
+}
+
+/// NtAccessCheckAndAuditAlarm(SubsystemName, HandleId, ObjectTypeName,
+/// ObjectName, SecurityDescriptor, DesiredAccess, GenericMapping,
+/// ObjectCreation, GrantedAccess*, AccessStatus*, GenerateOnClose*).
+fn nt_access_check_and_audit_alarm(_subsystem: u64, _handle_id: u64, _type_name: u64, _object_name: u64, rsp: u64) -> Result<u32, KernelError> {
+    access_check_and_audit_alarm(stack_arg(rsp, 5), stack_arg(rsp, 6) as u32, stack_arg(rsp, 7), stack_arg(rsp, 9), stack_arg(rsp, 10), stack_arg(rsp, 11))
+}
+
+/// NtAccessCheckByTypeAndAuditAlarm(SubsystemName, HandleId,
+/// ObjectTypeName, ObjectName, SecurityDescriptor, PrincipalSelfSid,
+/// DesiredAccess, AuditType, Flags, ObjectTypeList, ObjectTypeListLength,
+/// GenericMapping, ObjectCreation, GrantedAccess*, AccessStatus*,
+/// GenerateOnClose*).
+fn nt_access_check_by_type_and_audit_alarm(_subsystem: u64, _handle_id: u64, _type_name: u64, _object_name: u64, rsp: u64) -> Result<u32, KernelError> {
+    access_check_and_audit_alarm(stack_arg(rsp, 5), stack_arg(rsp, 7) as u32, stack_arg(rsp, 12), stack_arg(rsp, 14), stack_arg(rsp, 15), stack_arg(rsp, 16))
 }
 
 fn nt_close_object_audit_alarm(subsystem: u64, handle_id: u64, generate_on_close: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
@@ -455,6 +485,8 @@ fn nt_delete_object_audit_alarm(subsystem: u64, handle_id: u64, generate_on_clos
 pub fn init() {
     state::register_handler("NtPrivilegedServiceAuditAlarm", nt_privileged_service_audit_alarm);
     state::register_handler("NtCloseObjectAuditAlarm", nt_close_object_audit_alarm);
+    state::register_handler("NtAccessCheckAndAuditAlarm", nt_access_check_and_audit_alarm);
+    state::register_handler("NtAccessCheckByTypeAndAuditAlarm", nt_access_check_by_type_and_audit_alarm);
     state::register_handler("NtDeleteObjectAuditAlarm", nt_delete_object_audit_alarm);
     state::register_handler("NtCreateToken", nt_create_token);
     state::register_handler("NtAccessCheck", nt_access_check);

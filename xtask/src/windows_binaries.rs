@@ -398,6 +398,8 @@ const SMSS_PROGRAMS: &[&str] = &[
     "pku2u.dll",
     "cloudap.dll",
     "ntmarta.dll",
+    // O dsrole.dll que o scecli.dll do lsass carrega.
+    "dsrole.dll",
 ];
 
 /// As imagens de kernel do caminho do smss (`--initial-process=smss`): o

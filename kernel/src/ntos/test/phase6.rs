@@ -14332,6 +14332,12 @@ fn se_logon_session_exports(assert: Assert) {
     let _ = tokens::update(pointer, |token| token.authentication_id = logon_session::SYSTEM_LUID);
     guest::free_bytes(value);
     assert(session_created == 0 && held == 0xC000_0104 && nonzero == 0xC000_000D && short == 0xC000_0004 && released == 0 && deleted_with_token == 0, "se-logon-session: TokenSessionReference 0 solta a sessao (outros valores e tamanhos recusados)");
+    // NtAccessCheckAndAuditAlarm: o nível de impersonação da thread precisa
+    // ser SecurityIdentification ou mais.
+    let outputs = guest::alloc_bytes(0x20);
+    let anonymous_refused = crate::ntos::se::access_check::check_and_audit_alarm(0, pointer, 0, 0x8000_0000, outputs, outputs + 8, outputs + 0xC, outputs + 0x10);
+    guest::free_bytes(outputs);
+    assert(anonymous_refused == 0xC000_00A5, "se-access-check: NtAccessCheckAndAuditAlarm com impersonacao anonima = STATUS_BAD_IMPERSONATION_LEVEL");
     let _ = call_export("ZwClose", &[copy]);
     let _ = call_export("ZwClose", &[system_token]);
 }

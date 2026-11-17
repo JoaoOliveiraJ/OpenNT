@@ -145,6 +145,45 @@ pub fn access_check(descriptor: u64, subject_context: u64, desired: u32, previou
     decide(descriptor, subject_of_token(token), desired, previous, mapping, granted_out, status_out)
 }
 
+/// O núcleo do NtAccessCheck e do NtAccessCheck*AndAuditAlarm de UserMode:
+/// o descritor capturado (self-relative do kernel, com dono e grupo), o
+/// token do cliente e o GENERIC_MAPPING do chamador. Devolve (GrantedAccess,
+/// AccessStatus) ou o NTSTATUS do serviço.
+fn evaluate_user(descriptor: u64, token: u64, desired: u32, mapping: u64) -> Result<(u32, u32), u32> {
+    const STATUS_NO_IMPERSONATION_TOKEN: u32 = 0xC000_005C;
+    const STATUS_INVALID_SECURITY_DESCR: u32 = 0xC000_0079;
+    const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+    // SeCaptureSecurityDescriptor em UserMode: a cópia self-relative do
+    // kernel é validada e lida (o RtlValidSid do kernel recusa SIDs de
+    // usuário).
+    if descriptor == 0 {
+        return Err(STATUS_INVALID_SECURITY_DESCR);
+    }
+    let captured_cell = guest::alloc_bytes(8);
+    let status = descriptor::capture_mode(descriptor, 1, captured_cell);
+    let captured = if status == 0 { guest::read64(captured_cell) } else { 0 };
+    guest::free_bytes(captured_cell);
+    if status != 0 {
+        return Err(status);
+    }
+    let components = query_descriptor::read_descriptor(captured);
+    descriptor::release_captured(captured);
+    let Some(components) = components else { return Err(STATUS_INVALID_SECURITY_DESCR) };
+    if components.owner.is_none() || components.group.is_none() {
+        return Err(STATUS_INVALID_SECURITY_DESCR);
+    }
+    let Some(subject) = subject_of_token(token) else { return Err(STATUS_NO_IMPERSONATION_TOKEN) };
+    let mut mapped = [0u32; 4];
+    for (index, entry) in mapped.iter_mut().enumerate() {
+        let Ok(value) = guest::try_read::<u32>(mapping + index as u64 * 4) else { return Err(STATUS_ACCESS_VIOLATION) };
+        *entry = value;
+    }
+    Ok(match access_evaluation::access_check(Some(&components), &subject, desired, 0, &mapped) {
+        Ok(granted) => (granted, 0),
+        Err(status) => (0, status),
+    })
+}
+
 /// NtAccessCheck(SecurityDescriptor, ClientToken, DesiredAccess,
 /// GenericMapping, PrivilegeSet, PrivilegeSetLength*, GrantedAccess*,
 /// AccessStatus*) de UserMode, como o SeAccessCheckByType do ntoskrnl 19041
@@ -164,7 +203,6 @@ pub fn access_check(descriptor: u64, subject_context: u64, desired: u32, previou
 #[allow(clippy::too_many_arguments)]
 pub fn check_by_token(descriptor: u64, token: u64, pseudo: bool, desired: u32, mapping: u64, privilege_set: u64, privilege_length: u64, granted_out: u64, status_out: u64) -> u32 {
     const STATUS_NO_IMPERSONATION_TOKEN: u32 = 0xC000_005C;
-    const STATUS_INVALID_SECURITY_DESCR: u32 = 0xC000_0079;
     const STATUS_GENERIC_NOT_MAPPED: u32 = 0xC000_0126;
     const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
     const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
@@ -185,39 +223,51 @@ pub fn check_by_token(descriptor: u64, token: u64, pseudo: bool, desired: u32, m
     if available < PRIVILEGE_SET_SIZE {
         return if guest::try_write::<u32>(privilege_length, PRIVILEGE_SET_SIZE).is_ok() { STATUS_BUFFER_TOO_SMALL } else { STATUS_ACCESS_VIOLATION };
     }
-    // SeCaptureSecurityDescriptor em UserMode: a cópia self-relative do
-    // kernel é validada e lida (o RtlValidSid do kernel recusa SIDs de
-    // usuário).
-    if descriptor == 0 {
-        return STATUS_INVALID_SECURITY_DESCR;
-    }
-    let captured_cell = guest::alloc_bytes(8);
-    let status = descriptor::capture_mode(descriptor, 1, captured_cell);
-    let captured = if status == 0 { guest::read64(captured_cell) } else { 0 };
-    guest::free_bytes(captured_cell);
-    if status != 0 {
-        return status;
-    }
-    let components = query_descriptor::read_descriptor(captured);
-    descriptor::release_captured(captured);
-    let Some(components) = components else { return STATUS_INVALID_SECURITY_DESCR };
-    if components.owner.is_none() || components.group.is_none() {
-        return STATUS_INVALID_SECURITY_DESCR;
-    }
-    let Some(subject) = subject_of_token(token) else { return STATUS_NO_IMPERSONATION_TOKEN };
-    let mut mapped = [0u32; 4];
-    for (index, entry) in mapped.iter_mut().enumerate() {
-        let Ok(value) = guest::try_read::<u32>(mapping + index as u64 * 4) else { return STATUS_ACCESS_VIOLATION };
-        *entry = value;
-    }
-    let (granted, status) = match access_evaluation::access_check(Some(&components), &subject, desired, 0, &mapped) {
-        Ok(granted) => (granted, 0),
-        Err(status) => (0, status),
+    let (granted, status) = match evaluate_user(descriptor, token, desired, mapping) {
+        Ok(result) => result,
+        Err(status) => return status,
     };
     let written = guest::try_write::<u32>(privilege_set, 0)
         .and_then(|_| guest::try_write::<u32>(privilege_set + 4, 0))
         .and_then(|_| guest::try_write::<u32>(granted_out, granted))
         .and_then(|_| guest::try_write::<u32>(status_out, status));
+    if written.is_err() { STATUS_ACCESS_VIOLATION } else { 0 }
+}
+
+/// NtAccessCheckAndAuditAlarm e NtAccessCheckByTypeAndAuditAlarm de UserMode
+/// (o SepAccessCheckAndAuditAlarm do ntoskrnl 19041) sobre o ClientToken do
+/// contexto de segurança da thread, que o chamador já conferiu (sem
+/// impersonação, STATUS_NO_IMPERSONATION_TOKEN): `level` é o nível de
+/// impersonação da thread (o token pode ser o primário do cliente, como no
+/// PsImpersonateClient), e abaixo de SecurityIdentification a resposta é
+/// STATUS_BAD_IMPERSONATION_LEVEL. O acesso pedido é mapeado pelo
+/// GENERIC_MAPPING; o resultado vai para GrantedAccess e AccessStatus, e
+/// GenerateOnClose sai FALSE (sem SACL de auditoria no OpenNT). A lista de
+/// tipos de objeto do ByType não muda o resultado de raiz. Devolve o
+/// NTSTATUS do serviço.
+#[allow(clippy::too_many_arguments)]
+pub fn check_and_audit_alarm(descriptor: u64, token: u64, level: u32, desired: u32, mapping: u64, granted_out: u64, status_out: u64, generate_out: u64) -> u32 {
+    const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+    if level < 1 {
+        return STATUS_BAD_IMPERSONATION_LEVEL;
+    }
+    let mut generic = [0u32; 4];
+    for (index, entry) in generic.iter_mut().enumerate() {
+        let Ok(value) = guest::try_read::<u32>(mapping + index as u64 * 4) else { return STATUS_ACCESS_VIOLATION };
+        *entry = value;
+    }
+    // RtlMapGenericMask.
+    let mut mapped = desired & !0xF000_0000;
+    for (bit, value) in [(0x8000_0000u32, generic[0]), (0x4000_0000, generic[1]), (0x2000_0000, generic[2]), (0x1000_0000, generic[3])] {
+        if desired & bit != 0 {
+            mapped |= value;
+        }
+    }
+    let (granted, status) = match evaluate_user(descriptor, token, mapped, mapping) {
+        Ok(result) => result,
+        Err(status) => return status,
+    };
+    let written = guest::try_write::<u32>(granted_out, granted).and_then(|_| guest::try_write::<u32>(status_out, status)).and_then(|_| guest::try_write::<u8>(generate_out, 0));
     if written.is_err() { STATUS_ACCESS_VIOLATION } else { 0 }
 }
 

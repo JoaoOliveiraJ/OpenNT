@@ -3179,7 +3179,22 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   dependências obrigatórias dele (`xtask/src/side_by_side.rs`); o
   services.exe lê as chaves de serviço da cadeia do LSM (DcomLaunch,
   RpcEptMapper, RpcSs e LSM), o Control\ServiceGroupOrder e os grupos do
-  svchost (`xtask/src/user_services.rs`).
+  svchost (`xtask/src/user_services.rs`). A inicialização do LSA (o
+  LsapInitLsa e o LsapStartLsa do lsasrv) pede ainda: o
+  NtQueryInformationProcess das classes ProcessWow64Information (0) e
+  ProcessProtectionInformation (o PS_PROTECTION do EPROCESS); os alarmes de
+  auditoria de modo usuário (`ps/user/tokens.rs` sobre `se/audit.rs` e
+  `se/access_check.rs`): NtPrivilegedServiceAuditAlarm,
+  NtCloseObjectAuditAlarm e NtDeleteObjectAuditAlarm (sem GenerateOnClose,
+  sucesso sem pedir privilégio), e o NtAccessCheckAndAuditAlarm e o
+  NtAccessCheckByTypeAndAuditAlarm, todos com o SeAuditPrivilege do token
+  primário (o SeCheckAuditPrivilege) e, nos dois últimos, o ClientToken e o
+  nível de impersonação da thread (sem impersonação,
+  STATUS_NO_IMPERSONATION_TOKEN; o token pode ser o primário do cliente);
+  e as DLLs que o lsasrv carrega (os pacotes de segurança e as cargas
+  atrasadas deles, `xtask/src/windows_binaries.rs`). O lsasrv levanta um
+  erro grave (o LsapNotifyInitializationFinish) quando um desses passos
+  falha.
 - **O RPC local entre o services.exe e o lsass.exe**: um pedido a um
   servidor ALPC de modo usuário (`alpc/server.rs`) chega com o MessageId do
   servidor. O NtAlpcQueryInformationMessage das classes de token
