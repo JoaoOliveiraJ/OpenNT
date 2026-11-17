@@ -209,6 +209,11 @@ pub fn kmain() -> ! {
     if let Err(error) = crate::ntos::se::reference_monitor::initialize_phase1() {
         debug_print!("[se] Reference Monitor nao iniciado: {}", error);
     }
+    // DbgkpInitializePhase1: o \KernelObjects\SystemErrorPortReady que o
+    // winsrvext.dll do csrss abre.
+    if let Err(error) = crate::ntos::dbgk::silo_state::initialize_phase1() {
+        debug_print!("[dbgk] SystemErrorPortReady nao criado: {}", error);
+    }
 
     // processos: serviço de teclado (IPC) + shell; no boot do processo
     // inicial real, o smss.exe no lugar do shell

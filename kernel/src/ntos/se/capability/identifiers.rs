@@ -26,6 +26,22 @@ const LEGACY_CAPABILITY_NAMES: [&str; 12] = [
     "CONTACTS",
 ];
 
+/// O SID de capability (S-1-15-3-...) de um nome ASCII, o mesmo do
+/// RtlDeriveCapabilitySidsFromName: um dos 12 nomes legados vira
+/// S-1-15-3-<índice + 1>; os outros, S-1-15-3-1024 seguido do SHA-256 do
+/// nome em maiúsculas (UTF-16LE). Para quem monta descritores no kernel.
+pub fn capability_sid(name: &str) -> alloc::vec::Vec<u8> {
+    let upper = name.to_ascii_uppercase();
+    if let Some(index) = LEGACY_CAPABILITY_NAMES.iter().position(|&legacy| legacy == upper) {
+        return crate::ntos::se::model::sid(15, &[3, index as u32 + 1]);
+    }
+    let bytes: alloc::vec::Vec<u8> = upper.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let digest = sha256::hash_bytes(&bytes);
+    let mut parts = alloc::vec![3u32, 1024];
+    parts.extend(digest.chunks_exact(4).map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]])));
+    crate::ntos::se::model::sid(15, &parts)
+}
+
 /// Ordem de publicação do cabeçalho nativo (vale com buffers sobrepostos).
 fn initialize_identifier(pointer: u64, sub_authority_count: u8, authority: u8) {
     let identifier = sid::at(pointer);

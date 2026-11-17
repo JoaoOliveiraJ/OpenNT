@@ -430,6 +430,20 @@ fn executive_support(assert: Assert) {
     let recorded = live_dump::registration(routine) == Some(live_dump::Registration { callback: routine, context: 0x77, flags: 1 });
     live_dump::unregister(routine);
     assert(registered == 0 && again == 0xC000_0718 && invalid == 0xC000_000D && recorded, "dbgk: DbgkLkmdRegisterCallback guarda rotina, contexto e flags, recusa a repetida e as flags 3");
+
+    // DbgkpInitializePhase1SiloState: o evento de notificação não
+    // sinalizado com a DACL do DbgkpCreateNotificationEvent (o SID da
+    // capability lpacInstrumentation é o S-1-15-3-1024-... do nome).
+    use crate::ntos::dbgk::silo_state;
+    let created = silo_state::initialize_phase1().is_ok() && silo_state::initialize_phase1().is_ok();
+    let node = crate::ntos::ob::object_manager::lookup(silo_state::SYSTEM_ERROR_PORT_READY);
+    let pointer = node.and_then(crate::ntos::ob::object_manager::node).and_then(|node| node.data).map_or(0, |data| data.native_pointer);
+    let policy = crate::ntos::ob::objects::dispatcher::security(pointer);
+    let expected = silo_state::notification_dacl();
+    let lpac = &expected[2];
+    let lpac_shape = lpac.sid.as_ref().is_some_and(|sid| sid.len() == 48 && sid[1] == 10 && sid[7] == 15 && sid[8..12] == 3u32.to_le_bytes() && sid[12..16] == 1024u32.to_le_bytes());
+    let dacl_ok = policy.as_ref().and_then(|policy| policy.dacl.as_ref()).is_some_and(|dacl| dacl.len() == 5 && dacl.iter().zip(expected.iter()).all(|(ace, want)| ace.sid == want.sid && ace.mask == want.mask && !ace.deny));
+    assert(created && pointer != 0 && crate::ntos::ke::dispatcher::read_state(pointer) == 0 && lpac_shape && dacl_ok, "dbgk: \\KernelObjects\\SystemErrorPortReady nao sinalizado com a DACL do DbgkpCreateNotificationEvent");
     guest::free_bytes(block);
 }
 
