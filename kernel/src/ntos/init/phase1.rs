@@ -111,6 +111,13 @@ pub fn init() {
     // DriverEntry: antes dos drivers de sistema, entre os quais ele está no
     // boot do smss.
     crate::ntos::cm::graphics_defaults::initialize().unwrap_or_else(|error| panic!("GraphicsDrivers: {error}"));
+    // `--display=basic`: a instância ROOT\BASICRENDER do adaptador de
+    // renderização, antes de qualquer enumeração da raiz do PnP.
+    if crate::drivers::video::display_stack::enabled() {
+        if let Err(error) = crate::drivers::video::display_stack::seed_render_device() {
+            debug_print!("[display] instancia ROOT\\BASICRENDER: {}", error);
+        }
+    }
     // Drivers de serviço lidos do Registry + PnP START. O provedor de status
     // dos drivers entra com `cm::service::driver`.
     crate::ntos::cm::service::driver::init();

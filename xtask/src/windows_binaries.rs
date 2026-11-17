@@ -13,8 +13,8 @@
 //! SleepStudyHelper.sys e msisadrv.sys) e os catálogos que os assinam, a
 //! raiz ACPI da árvore de dispositivos (acpi.sys, pci.sys e a pshed.dll), o
 //! banco de errata (`\SystemRoot\INF\errata.inf`), a
-//! pilha de vídeo (dxgkrnl.sys, dxgmms2.sys e o BasicDisplay.sys do
-//! repositório de drivers), a pilha USB 3 e HID (usbxhci.sys, ucx01000.sys,
+//! pilha de vídeo (dxgkrnl.sys, dxgmms2.sys e o BasicDisplay.sys e o
+//! BasicRender.sys do repositório de drivers), a pilha USB 3 e HID (usbxhci.sys, ucx01000.sys,
 //! usbhub3.sys, usbd.sys, hidusb.sys, hidclass.sys, hidparse.sys, kbdhid.sys
 //! e mouhid.sys), os
 //! arquivos que o vgk.sys abre pelo caminho
@@ -75,6 +75,14 @@ const NTFS_FILES: &[(&str, &str)] = &[
     (
         "Windows/System32/DriverStore/FileRepository/basicdisplay.inf_amd64_19e58b6267591a82/BasicDisplay.sys",
         "System32/DriverStore/FileRepository/basicdisplay.inf_amd64_19e58b6267591a82/BasicDisplay.sys",
+    ),
+    // O driver de renderização básico (o adaptador WARP do dxgkrnl, na
+    // instância ROOT\BasicRender da raiz), também no repositório de drivers
+    // (o ImagePath do serviço BasicRender); os catálogos 0110 e 0516 abaixo o
+    // cobrem.
+    (
+        "Windows/System32/DriverStore/FileRepository/basicrender.inf_amd64_eebb5a8467eb88ec/BasicRender.sys",
+        "System32/DriverStore/FileRepository/basicrender.inf_amd64_eebb5a8467eb88ec/BasicRender.sys",
     ),
     // A CI original e a sua dependência, carregadas do volume.
     ("CI.DLL", "System32/ci.dll"),

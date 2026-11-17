@@ -5,7 +5,8 @@
 //! máquina que atendem o hardware emulado (mshdc.inf, o stornvme.inf, que dá
 //! o stornvme.sys a todo controlador NVMe, PCI\CC_010802, disk.inf,
 //! volume.inf, volmgr.inf, o display.inf, que dá o BasicDisplay.sys a todo adaptador de
-//! classe VGA, PCI\CC_0300, e o machine.inf, que dá o msisadrv.sys, um
+//! classe VGA, PCI\CC_0300, o basicrender.inf, que dá o BasicRender.sys ao
+//! adaptador de renderização da raiz, ROOT\BASICRENDER, e o machine.inf, que dá o msisadrv.sys, um
 //! driver KMDF, às pontes PCI-ISA, PCI\CC_0601, e o driver nulo das seções
 //! NO_DRV às pontes de host, PCI\CC_0600, e, com a raiz ACPI, ao HPET, ao
 //! relógio CMOS, aos barramentos de recursos, ao contêiner dos processadores
@@ -146,6 +147,19 @@ const SERVICE_BASIC_DISPLAY: ServiceSpec = ServiceSpec {
     group: Some("Video"),
     owner: "display.inf",
     values: &[],
+};
+/// basicrender.inf `[BasicRender_Generic_Service_Inst]` com o
+/// `[BasicRender_Generic_Service_AddReg]`: ServiceBinary
+/// `%13%\BasicRender.sys`, no repositório de drivers.
+const SERVICE_BASIC_RENDER: ServiceSpec = ServiceSpec {
+    name: "BasicRender",
+    display_name: None,
+    start: 1,
+    error_control: 0,
+    binary: "\\SystemRoot\\System32\\DriverStore\\FileRepository\\basicrender.inf_amd64_eebb5a8467eb88ec\\BasicRender.sys",
+    group: Some("Video"),
+    owner: "basicrender.inf",
+    values: &[RegValue { subkey: "Parameters", name: "SingleDeviceInstall", data: RegData::Dword(1) }],
 };
 
 /// stornvme.inf `[Stornvme_Service_Inst]` com o `[nvme_registry_values]` e
@@ -488,6 +502,24 @@ pub const DRIVERS: &[InfDriver] = &[
         driver_values: &[],
         device_values: &[],
         exclude_ids: &["PCI\\VEN_1414&DEV_5353"],
+    },
+    // basicrender.inf `[BasicRender.Mfg.NTamd64]`: o adaptador de
+    // renderização WARP, enumerado pela raiz (ROOT\BASICRENDER).
+    InfDriver {
+        inf: "basicrender.inf",
+        section: "BasicRender",
+        id: "ROOT\\BASICRENDER",
+        description_key: "BasicRender",
+        description: "Microsoft Basic Render Driver",
+        manufacturer_key: "MS",
+        manufacturer: "Microsoft",
+        provider: "Microsoft",
+        driver_version: "10.0.19041.6216",
+        service: Some(&SERVICE_BASIC_RENDER),
+        class: &CLASS_SYSTEM,
+        driver_values: &[],
+        device_values: &[],
+        exclude_ids: &[],
     },
     machine_no_driver("NO_DRV", "PCI\\CC_0600", "PCI\\CC_0600_Desc", "PCI standard host CPU bridge", &[]),
     InfDriver {

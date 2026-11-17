@@ -1297,7 +1297,8 @@ A árvore de dispositivos do NT mora em `ntos/io/pnp/`:
   partmgr.sys chega assim, de um work item).
 - `install.rs`: as linhas de modelo dos INFs da caixa que atendem o
   hardware emulado (mshdc.inf, disk.inf, volume.inf, volmgr.inf, o
-  display.inf com o BasicDisplay.sys para PCI\CC_0300 e o machine.inf com
+  display.inf com o BasicDisplay.sys para PCI\CC_0300, o basicrender.inf
+  com o BasicRender.sys para ROOT\BASICRENDER e o machine.inf com
   o msisadrv.sys para PCI\CC_0601 e o driver nulo das seções NO_DRV), com
   o serviço, a classe, os AddReg e o ExcludeID de cada seção. O posto segue o instalador (HardwareIDs antes
   de CompatibleIDs): PCI\VEN_8086&DEV_7010 instala o intelide.sys antes do
@@ -1478,7 +1479,16 @@ AddDevice e o START_DEVICE vão ao dxgkrnl (DpiAddDevice, com o
 DxgkDdiAddDevice do miniport, e DpiFdoHandleStartDevice). O dxgkrnl deixa o
 início do adaptador (DpiFdoStartAdapterThread, com o DxgkDdiStartDevice)
 para a criação da primeira sessão, que o win32k.sys anuncia
-(watchdog!SMgrNotifySessionChange no NtUserInitialize).
+(watchdog!SMgrNotifySessionChange no NtUserInitialize). Com a mesma opção a
+fase 1 grava, antes de qualquer enumeração da raiz, a instância
+`ROOT\BasicRender\0000` só com o HardwareID (a que o IoReportRootDevice do
+DriverEntry do BasicRender.sys cria no primeiro boot de uma instalação); a
+raiz a enumera e o PnP a instala pelo basicrender.inf com o BasicRender.sys
+real do repositório de drivers, que o dxgkrnl trata como o adaptador WARP
+(`\Driver\BasicRender`): o adaptador de renderização em que o cdd.dll cria o
+dispositivo da sessão e que leva o dxgkrnl a carregar o dxgmms2.sys
+(`BASICRENDER_OK` depois da árvore, `RENDER_ADAPTER_STARTED` quando o
+adaptador inicia).
 
 Com `--usb` (a opção de carga `USB`, `drivers/bus/usb_stack.rs`; no xtask, também
 os dispositivos do QEMU) a máquina tem a controladora xHCI

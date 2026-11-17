@@ -53,7 +53,12 @@
 //! ImagePath da instalação, no repositório de drivers
 //! (System32\DriverStore\FileRepository\basicdisplay.inf_amd64_...), os
 //! Owners (display.inf e basicdisplay.inf) e o Parameters\SingleDeviceInstall
-//! que o AddReg do basicdisplay.inf grava.
+//! que o AddReg do basicdisplay.inf grava. O driver de renderização básico
+//! (BasicRender, o adaptador WARP do dxgkrnl; Start 1, Group "Video" e Tag 2
+//! na instalação) fica igual: o PnP o carrega quando instala o
+//! ROOT\BASICRENDER pelo basicrender.inf (`--display=basic`). A chave tem o
+//! ImagePath da instalação no repositório de drivers, o Owners
+//! (basicrender.inf) e o Parameters\SingleDeviceInstall do AddReg do INF.
 //!
 //! O dispositivo de exibição desconectado do win32k (`\Device\Disc`, o da
 //! sessão sem console, como a sessão 0 dos serviços) aponta, pelo
@@ -159,6 +164,18 @@ const DRIVERS: &[InboxDriver] = &[
         tag: Some(1),
         dwords: &[],
     },
+    InboxDriver {
+        name: "BasicRender",
+        display_name: None,
+        service_type: SERVICE_KERNEL_DRIVER,
+        image_path: Some("\\SystemRoot\\System32\\DriverStore\\FileRepository\\basicrender.inf_amd64_eebb5a8467eb88ec\\BasicRender.sys"),
+        start: SERVICE_DEMAND_START,
+        smss_start: None,
+        error_control: 0,
+        group: "Video",
+        tag: Some(2),
+        dwords: &[],
+    },
     // Drivers de software sem hardware (Group "": a chave da instalação não tem Group).
     InboxDriver { name: "ahcache", display_name: Some("@%systemroot%\\system32\\drivers\\ahcache.sys,-102"), service_type: SERVICE_KERNEL_DRIVER, image_path: Some("system32\\DRIVERS\\ahcache.sys"), start: SERVICE_DEMAND_START, smss_start: None, error_control: 1, group: "", tag: None, dwords: &[] },
     InboxDriver { name: "ws2ifsl", display_name: Some("@%systemroot%\\System32\\drivers\\ws2ifsl.sys,-1000"), service_type: SERVICE_KERNEL_DRIVER, image_path: Some("\\SystemRoot\\system32\\drivers\\ws2ifsl.sys"), start: SERVICE_DEMAND_START, smss_start: None, error_control: 1, group: "PNP_TDI", tag: None, dwords: &[] },
@@ -186,6 +203,8 @@ const INSTALLED_VALUES: &[(&str, &str, Installed)] = &[
     ("Services\\CLFS\\Parameters", "MasterFilePath", Installed::String("\\SystemRoot\\System32\\config")),
     ("Services\\BasicDisplay", "Owners", Installed::Strings(&["display.inf", "basicdisplay.inf"])),
     ("Services\\BasicDisplay\\Parameters", "SingleDeviceInstall", Installed::Dword(1)),
+    ("Services\\BasicRender", "Owners", Installed::Strings(&["basicrender.inf"])),
+    ("Services\\BasicRender\\Parameters", "SingleDeviceInstall", Installed::Dword(1)),
     ("Services\\TSDDD\\Device0", "InstalledDisplayDrivers", Installed::Strings(&["TSDDD"])),
     ("Services\\TSDDD\\Device0", "VgaCompatible", Installed::Dword(0)),
 ];
