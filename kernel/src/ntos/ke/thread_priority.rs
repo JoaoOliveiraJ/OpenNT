@@ -240,3 +240,17 @@ pub fn set_process_base_priority(process: u64, base: i32, threads: &[u64]) -> Re
     }
     Ok(previous)
 }
+
+/// KeSetQuantumProcess(Process, QuantumReset): quando muda, o QuantumReset
+/// do KPROCESS e o de cada thread de `threads` (a ThreadListHead dele).
+pub fn set_quantum_process(process: u64, quantum: u8, threads: &[u64]) {
+    // SAFETY: KPROCESS vivo do chamador.
+    let kprocess = unsafe { Kprocess::at(process) };
+    if kprocess.quantum_reset.get() as u8 == quantum {
+        return;
+    }
+    kprocess.quantum_reset.set(quantum as i8);
+    for &thread in threads {
+        kthread(thread).quantum_reset.set(quantum);
+    }
+}

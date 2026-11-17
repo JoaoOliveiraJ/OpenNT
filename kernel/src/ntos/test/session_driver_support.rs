@@ -125,6 +125,13 @@ fn user_mode_branch(assert: Assert) {
     assert(status(38, 0x1_0000, 8) == STATUS_INFO_LENGTH_MISMATCH as u32, "ntsetsysinfo: classe 38 exige uma UNICODE_STRING (0x10)");
     assert(status(38, 0x1_0000, 0x10) == STATUS_PRIVILEGE_NOT_HELD, "ntsetsysinfo: classe 38 fora de um mestre de sessao = STATUS_PRIVILEGE_NOT_HELD");
     assert(status(26, 0x1_0000, 0x38) == STATUS_PRIVILEGE_NOT_HELD && status(54, 0x1_0000, 0x38) == STATUS_PRIVILEGE_NOT_HELD && status(27, 0x1_0000, 8) == STATUS_PRIVILEGE_NOT_HELD && status(27, 0x1_0000, 4) == STATUS_INFO_LENGTH_MISMATCH as u32, "ntsetsysinfo: as classes dos drivers do GDI sao so de modo kernel");
+    assert(status(39, 0x1_0000, 8) == STATUS_INFO_LENGTH_MISMATCH as u32 && status(39, 0x1_0000, 0) == STATUS_INFO_LENGTH_MISMATCH as u32, "ntsetsysinfo: classe 39 (SystemPrioritySeperation) exige 4 bytes");
+    let separation = guest::alloc_bytes(8);
+    guest::write32(separation, 2);
+    let kernel = call_export("ZwSetSystemInformation", &[39, separation, 4]).map(|status| status & 0xFFFF_FFFF);
+    let short = call_export("ZwSetSystemInformation", &[39, separation, 2]).map(|status| status & 0xFFFF_FFFF);
+    guest::free_bytes(separation);
+    assert(kernel == Some(0) && short == Some(STATUS_INFO_LENGTH_MISMATCH) && crate::ntos::ps::quantum::priority_separation() == 2 && crate::ntos::ps::quantum::foreground_quantum() == [6, 12, 18], "ntsetsysinfo: classe 39 em modo kernel (PsChangeQuantumTable com 2: separacao 2 e a metade curta da tabela variavel)");
 }
 
 fn session_power(assert: Assert) {

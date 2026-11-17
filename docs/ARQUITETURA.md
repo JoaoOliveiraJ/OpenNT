@@ -3187,7 +3187,12 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   KeSetActualBasePriorityThread, que troca a base absoluta da thread
   (`ke/thread_priority.rs`), e a RawInputThread pede a classe 82 do
   NtSetSystemInformation (SystemThreadPriorityClientIdInformation), que usa
-  esse serviço. O RtlGetActiveConsoleId lê o ActiveConsoleId da
+  esse serviço. O winsrvext do csrss pede a classe 39
+  (SystemPrioritySeperation) com o Win32PrioritySeparation de
+  `Control\PriorityControl`: Length 4, o SeTcbPrivilege e o
+  PsChangeQuantumTable (`ps/quantum.rs`), que escolhe a tabela de quantum
+  do primeiro plano e dá a cada processo ativo o quantum do
+  PspComputeQuantum (KeSetQuantumProcess). O RtlGetActiveConsoleId lê o ActiveConsoleId da
   KUSER_SHARED_DATA (`rtl/shared_data.rs`), que o win32k grava: 0 no
   DriverEntry da sessão 0, -1 quando o InitVideo dela fecha os dispositivos
   de vídeo e o id da primeira sessão interativa no DriverEntry dela (o

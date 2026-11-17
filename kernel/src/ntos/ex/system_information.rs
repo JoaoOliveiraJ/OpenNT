@@ -420,6 +420,7 @@ pub fn set(class: u32, buffer: u64, length: u32) -> u32 {
         SYSTEM_LOAD_GDI_DRIVER_IN_SYSTEM_SPACE => return load_gdi_driver(buffer, length, false).unwrap_or_else(status_of),
         SYSTEM_UNLOAD_GDI_DRIVER_INFORMATION => return unload_gdi_driver(buffer, length).unwrap_or_else(status_of),
         SYSTEM_THREAD_PRIORITY_CLIENT_ID_INFORMATION => return thread_priority_client_id(buffer, length, 0).unwrap_or_else(status_of),
+        SYSTEM_PRIORITY_SEPERATION => return priority_seperation(buffer, length, 0),
         _ => {}
     }
     if class == 131 {
@@ -641,6 +642,39 @@ pub fn thread_priority_client_id(buffer: u64, length: u32, previous_mode: u32) -
     result
 }
 
+// ---- SystemPrioritySeperation (39): a tabela de quantum -------------------
+//
+// NtSetSystemInformation 19041 (rva 0x70811b): Length diferente de 4 dá
+// STATUS_INFO_LENGTH_MISMATCH; o SeTcbPrivilege no modo anterior vem antes
+// da leitura (senão STATUS_PRIVILEGE_NOT_HELD); o ULONG é lido sob __try e
+// vai ao PsChangeQuantumTable(TRUE, valor). O winsrvext do csrss pede a
+// classe com o Win32PrioritySeparation de `Control\PriorityControl`.
+
+pub const SYSTEM_PRIORITY_SEPERATION: u32 = 39;
+/// SE_TCB_PRIVILEGE.
+const SE_TCB_PRIVILEGE: u64 = 7;
+
+/// SystemPrioritySeperation no modo anterior `previous_mode`: o NTSTATUS.
+pub fn priority_seperation(buffer: u64, length: u32, previous_mode: u32) -> u32 {
+    if length != 4 {
+        return EXTEND_STATUS_INFO_LENGTH_MISMATCH;
+    }
+    if !crate::ntos::se::privilege::single_privilege_check(SE_TCB_PRIVILEGE, previous_mode) {
+        return STATUS_PRIVILEGE_NOT_HELD;
+    }
+    let value = if previous_mode != 0 {
+        match guest::try_read::<u32>(buffer) {
+            Ok(value) => value,
+            Err(error) => return error.status,
+        }
+    } else {
+        // SAFETY: entrada de modo kernel com os 4 bytes conferidos.
+        unsafe { Field::<u32>::at(buffer) }.get()
+    };
+    crate::ntos::ps::quantum::change_quantum_table(true, value);
+    0
+}
+
 // ---- NtSetSystemInformation de modo usuário --------------------------------
 //
 // ntoskrnl 19041 (NtSetSystemInformation 0x707b70) com PreviousMode =
@@ -684,6 +718,9 @@ pub fn set_from_user_mode(class: u32, buffer: u64, length: u32) -> Result<u32, K
     }
     if class == SYSTEM_THREAD_PRIORITY_CLIENT_ID_INFORMATION {
         return thread_priority_client_id(buffer, length, 1);
+    }
+    if class == SYSTEM_PRIORITY_SEPERATION {
+        return Ok(priority_seperation(buffer, length, 1));
     }
     if class != SYSTEM_EXTEND_SERVICE_TABLE_INFORMATION {
         debug_print!("[usermode] NtSetSystemInformation classe {} (sem suporte de modo usuario)", class);
