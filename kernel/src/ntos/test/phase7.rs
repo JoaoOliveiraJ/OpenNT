@@ -515,6 +515,43 @@ fn section_creation(assert: Assert) {
     guest::free_bytes(block);
 }
 
+/// \Device\PhysicalMemory do MiSectionInitialization: o corpo SECTION e a
+/// CONTROL_AREA de memória física, o ZwOpenSection de modo kernel que o
+/// VIDMM_GLOBAL::Init do dxgmms2.sys faz (SECTION_ALL_ACCESS,
+/// OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE), a permanência depois do último
+/// handle e o KernelOnlyAccess do OBJ_KERNEL_EXCLUSIVE.
+fn physical_memory_section(assert: Assert) {
+    use crate::ntos::mm::section::physical_memory;
+    use crate::ntos::ob::objects::section as section_objects;
+    use crate::ntos::ob::open_pointer::{HandleOpen, OpenReason};
+    use crate::ntos::ob::{object_manager, open_pointer};
+    let pointer = physical_memory::section();
+    // SAFETY: o corpo SECTION que o boot publicou.
+    let body = (pointer != 0).then(|| unsafe { nt::Section::at(pointer) });
+    let control_area = body.map_or(0, |body| body.u1.control_area.get());
+    assert(body.is_some_and(|body| body.size_of_section.get() == 0xFFFF_FFFF_FFFF && body.initial_page_protection() == 0x40 && body.u.long_flags.get() == 0) && control_area != 0, "physmem: corpo SECTION do MiSectionInitialization");
+    if control_area != 0 {
+        // SAFETY: a CONTROL_AREA ligada ao corpo e o SEGMENT dela.
+        let area = unsafe { nt::ControlArea::at(control_area) };
+        let segment = area.segment.get();
+        assert(area.u.flags.physical_memory() == 1 && area.number_of_section_references.get() == 1 && segment != 0 && unsafe { nt::Segment::at(segment) }.control_area.get() == control_area, "physmem: CONTROL_AREA de memoria fisica com o SEGMENT");
+    }
+    let block = guest::alloc_bytes(0x200);
+    let output = block + 0x1F0;
+    let attributes = object_attributes_named(block, physical_memory::NAME, 0x240);
+    let status = crate::ntos::mm::section::open::open(output, 0xF_001F, attributes, 0);
+    let handle = guest::read64(output);
+    let opened = open_pointer::resolve(handle, false).and_then(|resolved| resolved.ok()).map_or(0, |resolved| resolved.item.pointer);
+    assert(status.is_ok_and(|status| status == 0) && handle & 0xFFFF_FFFF_8000_0000 == 0xFFFF_FFFF_8000_0000 && opened == pointer && pointer != 0, "physmem: ZwOpenSection de modo kernel com SECTION_ALL_ACCESS");
+    assert(open_pointer::close(handle) == Some(0) && section_objects::is_section(pointer) && object_manager::lookup(physical_memory::NAME).is_some(), "physmem: permanente depois do ultimo handle");
+    guest::free_bytes(block);
+    let mut user = HandleOpen { reason: OpenReason::Open, access_mode: 1, process: 0, granted: 4, attributes: 0 };
+    let mut forced = HandleOpen { access_mode: 0, attributes: 0x400, ..user };
+    let mut kernel = HandleOpen { access_mode: 0, ..user };
+    let denied = |result: Option<Result<(), KernelError>>| result.is_some_and(|result| result.is_err_and(|error| error.status == 0xC000_0022));
+    assert(open_pointer::describe(pointer).is_some_and(|item| denied(item.owner.open_handle_for(pointer, &mut user)) && denied(item.owner.open_handle_for(pointer, &mut forced)) && item.owner.open_handle_for(pointer, &mut kernel).is_none()), "physmem: KernelOnlyAccess recusa UserMode e OBJ_FORCE_ACCESS_CHECK");
+}
+
 fn section_open_and_map(assert: Assert) {
     use crate::ntos::mm::section::{create as create_section, map_view, open as open_section, unmap_view};
     use crate::ntos::mm::paging;
@@ -5528,6 +5565,7 @@ pub fn run(assert: Assert) {
     section_image_views(assert);
     section_creation(assert);
     section_open_and_map(assert);
+    physical_memory_section(assert);
     system_space_views(assert);
     virtual_memory_queries(assert);
     user_virtual_memory(assert);

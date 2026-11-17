@@ -11,7 +11,7 @@ use alloc::sync::Arc;
 
 use crate::ntos::ob::object_manager::{self, ObjectData, ObjectHooks};
 use crate::ntos::ob::object_types::{self, ObjectType};
-use crate::ntos::ob::open_pointer::{self, ObjectOwner, Slot};
+use crate::ntos::ob::open_pointer::{self, HandleOpen, ObjectOwner, Slot};
 use crate::ntos::ob::object_access;
 use crate::ntos::se::model::SecurityPolicy;
 use crate::rtl::{KernelError, SpinLock};
@@ -26,6 +26,9 @@ pub struct SectionState {
     pub handles: u32,
     pub views: u32,
     pub permanent: bool,
+    /// KernelOnlyAccess (o OBJ_KERNEL_EXCLUSIVE da criação): handle só em
+    /// KernelMode sem OBJ_FORCE_ACCESS_CHECK.
+    pub kernel_only: bool,
     pub image_file_object: u64,
     /// OBJ_EXCLUSIVE: único processo que pode abrir handles.
     pub exclusive_process: u64,
@@ -55,6 +58,9 @@ struct Record {
 
 static SECTIONS: SpinLock<BTreeMap<u64, Record>> = SpinLock::new(BTreeMap::new());
 
+const OBJ_FORCE_ACCESS_CHECK: u32 = 0x400;
+const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+
 struct SectionOwner;
 
 static OWNER: SectionOwner = SectionOwner;
@@ -71,6 +77,14 @@ impl ObjectOwner for SectionOwner {
     }
     fn open_handle(&self, pointer: u64) -> Option<Result<(), KernelError>> {
         Some(retain(pointer))
+    }
+    /// A recusa do ObpIncrementHandleCountEx num objeto KernelOnlyAccess:
+    /// UserMode (ou OBJ_FORCE_ACCESS_CHECK) dá STATUS_ACCESS_DENIED. Os
+    /// demais seguem pelo `open_handle`.
+    fn open_handle_for(&self, pointer: u64, open: &mut HandleOpen) -> Option<Result<(), KernelError>> {
+        let access_mode = if open.attributes & OBJ_FORCE_ACCESS_CHECK != 0 { 1 } else { open.access_mode };
+        let kernel_only = SECTIONS.lock().get(&pointer).is_some_and(|record| record.state.kernel_only);
+        (kernel_only && access_mode != 0).then(|| Err(KernelError::with_status("secao so de modo kernel", STATUS_ACCESS_DENIED)))
     }
     fn close_handle(&self, pointer: u64) -> Option<Result<(), KernelError>> {
         Some(release(pointer))

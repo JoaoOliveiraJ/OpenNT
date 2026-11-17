@@ -59,6 +59,9 @@ pub fn map(section_handle: u64, process_handle: u64, base_pointer: u64, zero_bit
         }
         let captured = (|| -> Result<(u64, u64, u64), KernelError> { Ok((guest::try_read64(base_pointer)?, guest::try_read64(size_pointer)?, if offset_pointer != 0 { guest::try_read64(offset_pointer)? } else { 0 })) })();
         let Ok((base, size, offset)) = captured else { return Ok(0xC000_0005) };
+        if crate::ntos::mm::section::physical_memory::is_physical_memory(reference.pointer) {
+            debug_print!("[section] vista de \\Device\\PhysicalMemory (offset {:#x}, tamanho {:#x}) ainda sem suporte", offset, size);
+        }
         let Some(section) = reference.section.clone() else { return Ok(0xC000_0024) };
         let traits = SectionTraits { is_image: section.is_image, size: section.size, page_protect: section.page_protect(), cache_flags: section.state.lock().cache_flags };
         let input = MapInput { zero: zero_bits, protect, base, size, offset, allocation, inherit, numa_nodes: 0, commit: commit_size };

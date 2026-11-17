@@ -20,4 +20,5 @@ pub mod secured_views;
 pub mod session_view;
 pub mod backing_file;
 pub mod object_pointers;
+pub mod physical_memory;
 pub mod query;

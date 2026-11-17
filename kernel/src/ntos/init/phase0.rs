@@ -151,6 +151,8 @@ fn namespace() -> Result<(), crate::rtl::KernelError> {
     object_manager::create_directory("\\KernelObjects")?;
     crate::ntos::mm::partition::init()?;
     crate::ntos::mm::partition::install();
+    // MiSectionInitialization: a seção nomeada da memória física.
+    crate::ntos::mm::section::physical_memory::initialize()?;
     // Os eventos de memória do MiInitializeMemoryEvents (a tabela
     // MiMemoryEventNames, na ordem dela): pool paginável e não paginável,
     // memória, commit, erros de memória e mudança da memória física. Com o

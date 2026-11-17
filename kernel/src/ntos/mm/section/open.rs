@@ -306,6 +306,9 @@ pub fn open(output: u64, desired: u32, attributes: u64, mode: u8) -> Result<u32,
         if status != 0 {
             return Ok(status);
         }
+        if crate::ntos::mm::section::physical_memory::is_physical_memory(pointer) {
+            debug_print!("[section] \\Device\\PhysicalMemory aberta (acesso {:#x}, modo {})", desired, mode);
+        }
         handle = opened;
         Ok(0)
     })();

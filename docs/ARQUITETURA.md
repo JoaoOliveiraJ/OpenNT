@@ -915,6 +915,16 @@ além da KUSER_SHARED_DATA:
   cópias da tabela de exports no heap (a da carga e a do processo); com
   uns dez processos e as DLLs deles, o heap de 64 MB acabava no boot do
   smss real ao mapear o scesrv.dll no services.exe.
+- **`\Device\PhysicalMemory`** (`mm/section/physical_memory.rs`, o
+  MiSectionInitialization): criada no boot com o namespace, permanente e
+  com OBJ_KERNEL_EXCLUSIVE. O corpo SECTION aponta para uma CONTROL_AREA
+  com u.Flags.PhysicalMemory e um SEGMENT ligado a ela, com SizeOfSection
+  0xFFFFFFFFFFFF. O ZwOpenSection de modo kernel abre (o dxgmms2.sys a
+  abre ao iniciar um adaptador de renderização); UserMode ou
+  OBJ_FORCE_ACCESS_CHECK recebem STATUS_ACCESS_DENIED, o KernelOnlyAccess
+  que `ob/objects/section.rs` aplica às seções marcadas. Vistas dela (o
+  MiMapViewOfPhysicalSection) ainda não existem: o NtMapViewOfSection
+  recusa com uma linha `[section]` na serial.
 - **Cópias de sistema** (`ps/user/loader.rs`): a ntdll, o apiset e as
   tabelas NLS são mapeados uma vez, na raiz do System (o mapeamento roda
   anexado ao System, venha o pedido de onde vier), e fotografados logo
