@@ -269,7 +269,7 @@ pub fn init() {
     // RtlUdiv128(10^7 << 64, frequência): cabe em 64 bits com TSC > 10 MHz.
     let scale = ((QPC_FREQUENCY as u128) << 64) / frequency.max(QPC_FREQUENCY + 1) as u128;
     TSC_SCALE.store(scale as u64, Ordering::Relaxed);
-    QPC_BIAS.store(0u64.wrapping_sub(scaled(cpu::rdtsc())), Ordering::Relaxed);
+    QPC_BIAS.store(0u64.wrapping_sub(scaled(cpu::rdtsc_ordered())), Ordering::Relaxed);
 
     let rtc = crate::hal::rtc::read();
     let fields = crate::ntos::rtl::time::Fields { year: rtc.year as i16, month: rtc.month as i16, day: rtc.day as i16, hour: rtc.hour as i16, minute: rtc.minute as i16, second: rtc.second as i16, milliseconds: rtc.milliseconds as i16, weekday: rtc.weekday as i16 };
@@ -287,9 +287,11 @@ pub fn init() {
 }
 
 /// O contador de desempenho (KeQueryPerformanceCounter): alto(TSC ×
-/// TscScale) + QpcBias.
+/// TscScale) + QpcBias, com o TSC lido na ordem das instruções anteriores
+/// (`cpu::rdtsc_ordered`, o QueryCounter do temporizador TSC do NT): um
+/// valor que outra CPU publicou antes nunca é maior que o lido depois.
 pub fn query_performance_counter_value() -> u64 {
-    scaled(cpu::rdtsc()).wrapping_add(QPC_BIAS.load(Ordering::Relaxed))
+    scaled(cpu::rdtsc_ordered()).wrapping_add(QPC_BIAS.load(Ordering::Relaxed))
 }
 
 /// Unidades de 100 ns desde o boot (o QPC a 10 MHz: o tempo de interrupção
@@ -416,11 +418,12 @@ pub fn qpc_bypass_flags() -> u8 {
     const QPC_BYPASS_USE_MFENCE: u8 = 0x10;
     const QPC_BYPASS_USE_LFENCE: u8 = 0x20;
     const QPC_BYPASS_USE_RDTSCP: u8 = 0x80;
-    let extended = cpu::cpuid(0x8000_0000)[0];
-    let rdtscp = extended >= 0x8000_0001 && cpu::cpuid(0x8000_0001)[3] & (1 << 27) != 0;
-    let vendor = cpu::cpuid(0);
-    let amd = vendor[1] == u32::from_le_bytes(*b"Auth");
-    let read = if rdtscp { QPC_BYPASS_USE_RDTSCP } else if amd { QPC_BYPASS_USE_MFENCE } else { QPC_BYPASS_USE_LFENCE };
+    // A mesma leitura do contador do kernel.
+    let read = match cpu::tsc_read_method() {
+        cpu::TscRead::Rdtscp => QPC_BYPASS_USE_RDTSCP,
+        cpu::TscRead::Lfence => QPC_BYPASS_USE_LFENCE,
+        cpu::TscRead::Mfence => QPC_BYPASS_USE_MFENCE,
+    };
     QPC_BYPASS_ENABLED | QPC_BYPASS_USE_HV_PAGE | read
 }
 

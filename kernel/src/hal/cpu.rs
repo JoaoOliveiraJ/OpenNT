@@ -1,4 +1,5 @@
-//! Instruções privilegiadas e de identificação da CPU: CPUID, RDTSC, MSRs,
+//! Instruções privilegiadas e de identificação da CPU: CPUID, RDTSC (também
+//! na ordem das instruções anteriores, a do contador de desempenho), MSRs,
 //! registradores de controle, IDT, interrupções, caches, FXSAVE, HLT e
 //! RDRAND.
 
@@ -17,6 +18,61 @@ pub fn cpuid_subleaf(leaf: u32, subleaf: u32) -> [u32; 4] {
 #[inline]
 pub fn rdtsc() -> u64 {
     unsafe { core::arch::x86_64::_rdtsc() }
+}
+
+/// Como o contador de desempenho lê o TSC sem que a leitura suba acima das
+/// instruções anteriores: o HalpTscQueryCounterOrdered do NT (RDTSCP)
+/// quando o processador tem RDTSCP (CPUID.80000001H:EDX[27]), senão o
+/// HalpTscQueryCounter com a cerca do HalpTscFenceRequired antes do RDTSC
+/// (LFENCE na Intel, MFENCE na AMD). Um RDTSC sem ordem pode executar antes
+/// de uma leitura de memória anterior, e um valor publicado por outra CPU
+/// ficaria maior que o lido depois dele.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TscRead {
+    Rdtscp = 1,
+    Lfence = 2,
+    Mfence = 3,
+}
+
+/// O [`TscRead`] decidido (0 = ainda não).
+static TSC_READ: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+pub fn tsc_read_method() -> TscRead {
+    use core::sync::atomic::Ordering;
+    let method = match TSC_READ.load(Ordering::Relaxed) {
+        1 => return TscRead::Rdtscp,
+        2 => return TscRead::Lfence,
+        3 => return TscRead::Mfence,
+        _ => {
+            let rdtscp = cpuid(0x8000_0000)[0] >= 0x8000_0001 && cpuid(0x8000_0001)[3] & (1 << 27) != 0;
+            let amd = cpuid(0)[1] == u32::from_le_bytes(*b"Auth");
+            if rdtscp {
+                TscRead::Rdtscp
+            } else if amd {
+                TscRead::Mfence
+            } else {
+                TscRead::Lfence
+            }
+        }
+    };
+    TSC_READ.store(method as u8, Ordering::Relaxed);
+    method
+}
+
+/// O TSC lido depois das instruções anteriores ([`TscRead`]).
+#[inline]
+pub fn rdtsc_ordered() -> u64 {
+    let (low, high): (u32, u32);
+    // SAFETY: RDTSCP, LFENCE, MFENCE e RDTSC não tocam a memória nem a
+    // pilha; o RDTSCP também escreve o IA32_TSC_AUX em ECX, descartado.
+    unsafe {
+        match tsc_read_method() {
+            TscRead::Rdtscp => asm!("rdtscp", out("eax") low, out("edx") high, out("ecx") _, options(nomem, nostack, preserves_flags)),
+            TscRead::Lfence => asm!("lfence", "rdtsc", out("eax") low, out("edx") high, options(nomem, nostack, preserves_flags)),
+            TscRead::Mfence => asm!("mfence", "rdtsc", out("eax") low, out("edx") high, options(nomem, nostack, preserves_flags)),
+        }
+    }
+    (high as u64) << 32 | low as u64
 }
 
 pub fn read_msr(index: u32) -> u64 {

@@ -201,6 +201,11 @@ fn tick_and_counters(assert: Assert, block: u64) {
     };
     let bypass = data.qpc_data.get();
     assert(data.tick_count_multiplier.get() == 0x0FA0_0000 && data.qpc_frequency.get() == 10_000_000 && data.qpc_system_time_increment.get() == 1 << 63 && data.qpc_system_time_increment_shift.get() == 1 && data.qpc_interrupt_time_increment.get() == 1 << 63 && bypass & 0x03 == 0x03 && bypass & 0xFF00 == 0 && data.qpc_bias.get() == clock::qpc_bias(), "time: TickCountMultiplier, QpcFrequency, os incrementos QPC e o atalho do TSC com a pagina de referencia (QpcShift zero)");
+    // O QPC do kernel lê o TSC como o de modo usuário: RDTSCP quando a CPU
+    // tem, senão a cerca antes do RDTSC.
+    let rdtscp = crate::hal::cpu::cpuid(0x8000_0000)[0] >= 0x8000_0001 && crate::hal::cpu::cpuid(0x8000_0001)[3] & (1 << 27) != 0;
+    let method = crate::hal::cpu::tsc_read_method();
+    assert((method == crate::hal::cpu::TscRead::Rdtscp) == rdtscp && (bypass & 0x80 != 0) == rdtscp && bypass & 0xB0 != 0, "time: o QPC le o TSC na ordem das instrucoes anteriores (RDTSCP ou a cerca), como o de modo usuario");
     // A página de referência: 'HalT', TscScale = 10^7 << 64 / frequência.
     let frame = shared_user_data::reference_frame();
     let scale = ((10_000_000u128) << 64) / clock::tsc_frequency_hz() as u128;
