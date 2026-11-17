@@ -85,11 +85,45 @@ pub fn query(handle: u64, information_class: u32, output: u64, length: u32, retu
     };
     let result = if information_class == 10 {
         statistics(reference.token, output, length, returned, from_user_mode)
+    } else if information_class == TOKEN_LINKED_TOKEN_CLASS {
+        linked_token(reference.token, length, returned, from_user_mode)
     } else {
         Ok(write_encoded(encode(reference.token, information_class, output), output, length, returned, from_user_mode))
     };
     reference.release()?;
     result
+}
+
+/// TokenLinkedToken.
+const TOKEN_LINKED_TOKEN_CLASS: u32 = 19;
+const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
+const STATUS_NO_SUCH_LOGON_SESSION: u32 = 0xC000_005F;
+
+/// TokenLinkedToken (o ramo da classe 19 do NtQueryInformationToken 19041,
+/// rva 0x6d1f0b), depois da referência com TOKEN_QUERY: o ReturnLength
+/// recebe 8 antes de tudo; outro Length dá STATUS_INFO_LENGTH_MISMATCH. O
+/// token ligado é o da sessão irmã da sessão de logon do token (o
+/// SepReferenceLogonSessionSilo do BuddyLogonId); sem ela,
+/// STATUS_NO_SUCH_LOGON_SESSION, o status que o winlogon e o lsm esperam de
+/// um token sem par de UAC. O OpenNT não tem o modo S sem administrador
+/// (o outro ramo do mesmo status), e os comandos do LSA ainda não ligam
+/// sessões irmãs (`se/logon_session.rs`): o par de tokens de UAC, que o
+/// NT duplica (SepDuplicateToken) e devolve num handle novo, não existe.
+fn linked_token(token: u64, length: u32, returned: u64, from_user_mode: bool) -> Result<u32, KernelError> {
+    use crate::ntos::se::logon_session;
+    if !writable(returned, 4, from_user_mode) || guest::try_write::<u32>(returned, 8).is_err() {
+        return Ok(STATUS_ACCESS_VIOLATION);
+    }
+    if length != 8 {
+        return Ok(STATUS_INFO_LENGTH_MISMATCH);
+    }
+    let Some((logon_id, server_silo)) = tokens::with(token, |record| (record.authentication_id, record.server_silo)) else { return Ok(STATUS_INVALID_HANDLE) };
+    let buddy = logon_session::buddy_logon_id(logon_id, server_silo);
+    if buddy == 0 || !logon_session::exists(buddy, server_silo) {
+        return Ok(STATUS_NO_SUCH_LOGON_SESSION);
+    }
+    crate::debug_print!("[token] TokenLinkedToken com sessao irma {:#x}: duplicacao do token ligado sem suporte", buddy);
+    Ok(crate::ntos::inc::status::STATUS_NOT_IMPLEMENTED)
 }
 
 /// TOKEN_STATISTICS na saída do chamador, sondada campo a campo.
