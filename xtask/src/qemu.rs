@@ -263,6 +263,19 @@ fn rtc_argument() -> String {
     format!("base={},clock=host", local_rtc_base(crate::hive_image::active_time_bias_minutes()))
 }
 
+/// O `-machine` de uma máquina. No WHPX, o LAPIC fica no QEMU
+/// (`kernel-irqchip=off`), como o IOAPIC e o 8259. O OpenNT recebe as
+/// interrupções de dispositivo pelo 8259, e com o LAPIC no hipervisor
+/// (`kernel-irqchip=on`, o modo x2APIC do WHPX) o QEMU só entrega uma
+/// interrupção do 8259 numa saída posterior da CPU virtual: medido com ele,
+/// o win32k levou 66 s até o WIN32K_LOADED (19 s com o LAPIC no QEMU), 33 s
+/// só na criação do arquivo de paginação. O que o LAPIC no hipervisor ganha
+/// são os IPIs: o suite-smp4 chega ao KBDTEST_OK em 40 s com ele e em 59 s
+/// sem.
+fn whpx_machine(machine: &MachineOptions) -> String {
+    if machine.accelerator == "whpx" { "pc,kernel-irqchip=off" } else { "pc" }.to_string()
+}
+
 /// Os argumentos da máquina; `no_reboot` faz o reinício do convidado
 /// encerrar o QEMU.
 fn machine_arguments(disks: &Disks, machine: &MachineOptions, no_reboot: bool) -> Vec<String> {
@@ -273,12 +286,7 @@ fn machine_arguments(disks: &Disks, machine: &MachineOptions, no_reboot: bool) -
         // tratam a exceção dependem disso. Requer QEMU 11.1+.
         if machine.accelerator == "whpx" { "whpx,ignore-unknown-msr=off".to_string() } else { machine.accelerator.clone() },
         "-machine".to_string(),
-        // O LAPIC no hipervisor (modo x2APIC do WHPX): IPIs, EOIs e o timer
-        // do LAPIC não saem para o QEMU. Medido no suite-smp4: 40 s contra
-        // 59 s com o LAPIC no QEMU (kernel-irqchip=off), quase tudo nos IPIs
-        // da fase 7. O QEMU deste host (sem as funções de monitoramento de
-        // desempenho do WHPX, "legacy") só o liga quando pedido.
-        if machine.accelerator == "whpx" { "pc,kernel-irqchip=on" } else { "pc" }.to_string(),
+        whpx_machine(machine),
     ];
     // TCG emula o modelo mais completo; em WHPX o modelo padrão (qemu64)
     // esconde RDRAND, que o boot exige, então a CPU do host é repassada.
@@ -695,10 +703,12 @@ impl Drop for QemuProcess {
     }
 }
 
-/// Falhas na serial: pânico do Rust, exceção de kernel, autoteste, a parada
-/// fatal do KeBugCheckEx (`*** STOP`, que sempre para a máquina) e a hora do
-/// convidado longe da do hospedeiro (`*** RELOGIO`, que o test-boot acrescenta).
-pub const FAILURE_MARKERS: &[&str] = &["*** PANIC", "*** EXCECAO", "SELFTEST FALHOU", "*** STOP", "*** RELOGIO"];
+/// Falhas na serial: pânico do Rust, exceção de kernel, autoteste (também o
+/// da pressão de memória, `MEMORY_PRESSURE FALHOU`, que antes só aparecia
+/// quando o prazo de 30 min do teste vencia), a parada fatal do KeBugCheckEx
+/// (`*** STOP`, que sempre para a máquina) e a hora do convidado longe da do
+/// hospedeiro (`*** RELOGIO`, que o test-boot acrescenta).
+pub const FAILURE_MARKERS: &[&str] = &["*** PANIC", "*** EXCECAO", "SELFTEST FALHOU", "MEMORY_PRESSURE FALHOU", "*** STOP", "*** RELOGIO"];
 
 /// O motivo de fim da máquina que o QMP anuncia quando o convidado se
 /// desliga pelo ACPI (S5).
@@ -971,8 +981,7 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
     // Quando cada saída esperada chegou, contado da subida do QEMU (o
     // tempo de cada fase do boot no test-boot.log).
     let started = Instant::now();
-    let arrived = |needle: &str| println!("
-[xtask] {needle:?} aos {:.1} s", started.elapsed().as_secs_f64());
+    let arrived = |needle: &str| println!("\n[xtask] {needle:?} aos {:.1} s", started.elapsed().as_secs_f64());
     let result = (|| -> Result<(), String> {
         let mut cursor = wait_for(&test.marker, 0)?;
         arrived(&test.marker);
