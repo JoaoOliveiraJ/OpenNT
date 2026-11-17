@@ -19,9 +19,10 @@
 //!   comunicação do servidor, com o PortContext dado, e a resposta de
 //!   conexão (os dados da mensagem que o servidor devolve) para o cliente;
 //!   a recusa devolve STATUS_PORT_CONNECTION_REFUSED;
-//! - os pedidos do cliente (`Service::exchange`): LPC_REQUEST (com
-//!   LPC_CONTINUATION_REQUIRED quando o cliente espera a resposta) ou
-//!   LPC_DATAGRAM na fila do servidor; a resposta chega ao cliente pela
+//! - os pedidos do cliente (`Service::exchange`): LPC_REQUEST com
+//!   LPC_CONTINUATION_REQUIRED (todo envio sem ALPC_MSGFLG_RELEASE_MESSAGE,
+//!   síncrono ou não) ou LPC_DATAGRAM na fila do servidor; a resposta chega
+//!   ao cliente pela
 //!   continuação (o job), quando o servidor envia uma mensagem com o
 //!   MessageId do pedido;
 //! - a recepção do servidor ([`exchange`], pelo NtAlpcSendWaitReceivePort
@@ -104,7 +105,8 @@ const LPC_DATAGRAM: u16 = 3;
 const LPC_PORT_CLOSED: u16 = 5;
 const LPC_CLIENT_DIED: u16 = 6;
 const LPC_CONNECTION_REQUEST: u16 = 10;
-/// O cliente espera a resposta (envio com ALPC_MSGFLG_SYNC_REQUEST).
+/// A mensagem espera resposta: todo envio novo sem
+/// ALPC_MSGFLG_RELEASE_MESSAGE, como no AlpcpDispatchNewMessage.
 const LPC_CONTINUATION_REQUIRED: u16 = 0x2000;
 /// ALPC_MESSAGE_CONTEXT_ATTRIBUTE.
 const CONTEXT_ATTRIBUTE: u32 = 0x2000_0000;
@@ -478,9 +480,9 @@ impl Service for UserServer {
 
     /// LPC_REQUEST ou LPC_DATAGRAM na fila; a resposta conclui o job.
     fn exchange(&self, port: &Arc<Port>, data: &[u8], request: &Arc<Request>) -> Reply {
-        let (synchronous, datagram, mut sender) = {
+        let (datagram, mut sender) = {
             let state = request.state.lock();
-            (state.synchronous, state.datagram, state.sender)
+            (state.datagram, state.sender)
         };
         // A thread que enviou (para a impersonação do cliente).
         if sender.thread_pointer == 0 {
@@ -501,7 +503,11 @@ impl Service for UserServer {
             state.senders.insert(id, Origin { sender, client: port.pointer });
             (id, context, sequence, link_port)
         };
-        let message_type = if datagram { LPC_DATAGRAM } else if synchronous { LPC_REQUEST | LPC_CONTINUATION_REQUIRED } else { LPC_REQUEST };
+        // AlpcpSendMessage: um envio com RELEASE_MESSAGE é LPC_DATAGRAM, os
+        // outros LPC_REQUEST; o AlpcpDispatchNewMessage liga o 0x2000 em todo
+        // envio sem RELEASE_MESSAGE (um pedido assíncrono ou de reserva também
+        // espera a resposta).
+        let message_type = if datagram { LPC_DATAGRAM } else { LPC_REQUEST | LPC_CONTINUATION_REQUIRED };
         self.enqueue(Delivery { id, message_type, data: Vec::from(data), sender, port_context: context, data_view, sequence, attributes, link_port: Some(link_port), ..Delivery::default() });
         if datagram {
             return Reply::Now(JobResult::default());
