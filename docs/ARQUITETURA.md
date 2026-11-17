@@ -680,7 +680,8 @@ das prontas com a condição sondada pelo despachante a cada tick
 lock do despachante (`wait::lock`), o mesmo do estado das filas. O
 contexto de boot, que é o próprio despachante da CPU, espera girando o
 `pump_kernel` (interrupções de dispositivo abaixo de DISPATCH_LEVEL, timers,
-DPCs, work items e o tick, que entra nas threads de kernel). O autoteste
+DPCs, o gerenciador das worker threads e o tick, que entra nas threads de
+kernel, as workers dos work items inclusive). O autoteste
 `ntos/test/kernel_waits.rs` (fase 6) roda duas threads de sistema em
 pingue-pongue por dois eventos e por duas KQUEUE (a parada tem o bloco na
 WaitListHead, fica Waiting e não gasta ciclo nem troca de contexto enquanto o
@@ -1433,12 +1434,25 @@ o `\Device\HarddiskVolume1` e relata o devnode STORAGE\Volume por
 SingleBusRelations; no START o volmgr apaga o IsDeleted da chave de
 hardware do volume com RtlDeleteRegistryValue(RTL_REGISTRY_HANDLE), que,
 como o RtlCreateRegistryKey e o RtlWriteRegistryValue, usa a chave do
-handle sem fechá-la. O volume.sys ainda fica fora do bundle: com o volume
-iniciado, o mountmgr.sys enfileira o WorkerThread dele, que espera até
-1000 s pelo `\Device\VolumesSafeForWriteAccess` do smss, e um work item
-ainda roda no contexto de boot (não numa worker thread do sistema), que
-ficaria preso nele. Montar a partição com o ntfs.sys (`NVME_VOLUME_OK`)
-depende disso. Com 4 GB de RAM o
+handle sem fechá-la. O devnode do volume é instalado pelo volume.inf com o
+volume.sys (no bundle, como o volmgr.sys), sem os filtros de classe que
+uma instalação acrescenta à classe Volume (volsnap, fvevol, rdyboost,
+iorate). Com o volume iniciado, o mountmgr.sys recebe a chegada da
+interface do volume (MountMgrMountedDeviceArrival: nome, identificador
+único, IOCTL_VOLUME_GET_GPT_ATTRIBUTES) e, como a rotina de
+reinicialização dele (MountMgrDriverReinitialization, depois dos drivers
+de sistema) já ligou a atribuição automática, dá ao volume a primeira
+letra livre: grava `\DosDevices\E:` no MountedDevices e cria o
+`\GLOBAL??\E:`. O WorkerThread que ele enfileira (`QueueWorkItem`) abre o
+`\Device\VolumesSafeForWriteAccess` e espera o smss sinalizá-lo antes de
+reconciliar os bancos de pontos de montagem; sem smss a espera não
+termina, como no NT, mas prende só uma worker thread do sistema. O
+ntfs.sys monta a partição (`NVME_VOLUME_OK`): lê o arquivo que o xtask
+gravou e grava, fecha, reabre e lê de volta um arquivo novo por `\??\E:`.
+No caminho, o FsRtlNotifyVolumeEventEx do ntfs.sys pergunta o PDO do
+volume (IoGetRelatedTargetDevice, IRP_MN_QUERY_DEVICE_RELATIONS
+TargetDeviceRelation) e a lista que o driver devolve volta ao pool dele
+pelo ExFreePool, como no PnpGetRelatedTargetDevice. Com 4 GB de RAM o
 SeaBIOS põe o BAR0 de 64 bits acima de 4 GB, fora do mapa direto que o
 MmMapIoSpace usa; o teste roda com 3 GB, e o BAR fica na janela de 32 bits.
 
@@ -1464,9 +1478,9 @@ kbdclass e mouclass. Como as ações do PnP manager do NT, que rodam numa
 worker thread, com a pilha USB a árvore construída uma vez no fim da fase 1
 (`device_tree::build`) é processada numa thread de sistema
 (`tree::process_on_system_thread`) e o contexto de boot espera por ela
-girando as interrupções, os DPCs, os work items e o escalonador: um work
-item rodado nessa espera não fica empilhado sobre um START que segura as
-travas da máquina de estados PnP do KMDF. Os demais boots seguem no
+girando as interrupções, os DPCs e o escalonador, que entra nas worker
+threads dos work items: nenhum work item fica empilhado sobre um START que
+segura as travas da máquina de estados PnP do KMDF. Os demais boots seguem no
 contexto de boot: as leituras do Code Integrity (`--start-driver`) pelo
 driver ATA interno ainda param numa thread de sistema. A controladora entra nessa
 árvore; a pilha USB só espera a enumeração das portas e confere os marcos.
@@ -2569,6 +2583,11 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     $Reparse depois dos registros de usuário (o NTFS só aceita uma entrada de
     índice que aponte um registro abaixo de 16 na raiz), os índices $I30 nomeados e em B-tree quando não cabem no
     registro, e a cópia do setor de boot no último setor, fora do volume.
+    Nas runlists, a contagem de clusters também leva o byte de sinal livre,
+    porque o ntfs.sys a lê com sinal: o $Bad do volume de 41796 clusters do
+    `nvme.img` (0xA344) vai em três bytes (44 A3 00); em dois seria um run
+    de -23740 clusters e o NtfsCheckFileRecord recusaria o $BadClus
+    (STATUS_FILE_CORRUPT_ERROR na montagem).
     O leitor do kernel lê o mesmo volume; a listagem dele esconde os
     registros abaixo de 16, como a enumeração do NTFS.
   - O ntfs.sys importa o clfs.sys (pelo ext-ms-win-fs-clfs) e o clipsp.sys
@@ -2666,22 +2685,50 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     instância de um filtro (FltCreateFileEx, FltReadFile, FltClose) e repete
     as operações de arquivo do teste do ntfs.sys com a pilha de filtros
     sobre o volume, cujo topo é o dispositivo do FltMgr.
-- **Itens de trabalho como worker threads** (`io/work_items.rs`): a fila
-  do ExQueueWorkItem/IoQueueWorkItem é drenada nos pumps de PASSIVE_LEVEL
-  de quem espera, com duas regras das worker threads do NT: um item não
-  começa enquanto outro roda na mesma CPU (uma worker que espera não roda
-  outros itens) e uma drenagem só roda os itens que já estavam na fila
-  quando ela começou. Assim quem espera pelo fim de um item (o FltMgr pela
-  montagem postada à FSP do NTFS) confere a espera antes de rodar os itens
-  enfileirados por ele — um deles pode esperar pelo que essa thread retém
-  (o DeviceLock da montagem em curso). Teste:
-  `work_items_one_worker_per_item` na fase 6. Como o
-  ExpWorkerThreadBalanceManager, quando a worker desta CPU está bloqueada
-  numa espera dentro de um item, o item comum que já espera há 1 s ganha
-  uma worker dinâmica (uma thread de sistema que o executa e termina):
-  o acpi.sys repassa o START da ponte PCI-ISA ao pci.sys numa worker e
-  espera o work item que o pci.sys enfileira. Teste: `stalled_worker`
-  (`test/platform_support.rs`).
+- **Worker threads do sistema** (`io/work_items.rs`): como no NT, o
+  ExQueueWorkItem/IoQueueWorkItem põe o item na fila e as worker threads
+  (o ExpWorkerThread) o executam em PASSIVE_LEVEL, cada item na pilha de uma
+  delas, no processo System. O ExpWorkerInitialization da fase 1
+  (`initialize_workers`, logo depois dos exports, como o ExInitSystem antes
+  do IoInitSystem) cria as quatro workers iniciais; antes disso a fila só
+  guarda os itens, que rodam quando elas nascem. A worker sem item espera o
+  evento de sincronização da fila, que o item novo sinaliza. Cada item roda
+  na prioridade do seu tipo de fila (o ExpTypeToPriority do ntoskrnl 19041 e
+  a tabela ExpBuiltinPriorities: Critical 13, Delayed 12, HyperCritical 15,
+  Normal 8, Background 7, RealTime 18, SuperCritical 14, e QueueType - 32 de
+  32 em diante). Uma worker que espera dentro de um item não roda outro.
+  Como o gerenciador das filas do NT (ExpWorkQueueManagerThread), quando
+  nenhuma worker está livre e o item pronto mais antigo espera há 1 s, o
+  pool ganha uma worker, no máximo uma por segundo e até 64 (`balance`, que
+  os pumps do despachante chamam: o `pump_kernel`, os pumps do
+  KeDelayExecutionThread e o laço ocioso). Nenhum item roda no contexto de
+  boot nem na pilha de quem espera: o acpi.sys que repassa o START da ponte
+  PCI-ISA ao pci.sys numa worker e espera o work item do pci.sys, o
+  FsRtlWaitForSmssEvent sem smss e o WorkerThread do mountmgr.sys à espera
+  do `\Device\VolumesSafeForWriteAccess` só prendem a própria worker.
+  `run_queue` não executa nada: espera que os itens já enfileirados
+  terminem ou que as workers deles parem numa espera (KTHREAD.State
+  Waiting), saindo das prontas numa thread e girando o despachante no
+  contexto de boot. Testes: `work_items_on_worker_threads` na fase 6 (os
+  itens em workers do System, o item parado que só prende a sua worker, a
+  prioridade por tipo de fila) e `stalled_worker`
+  (`test/platform_support.rs`: o item que uma worker espera roda noutra; com
+  todas as workers presas, o item novo roda numa worker que o gerenciador só
+  cria depois do intervalo).
+- **Volumes seguros para escrita** (`fsrtl/volume_support.rs`): como o
+  FsRtlInitSystem do 19041 (FsRtlInitializeSmssEvent, rva 0xa6bb14), a
+  fase 1, antes dos drivers, cria o evento de notificação permanente
+  `\Device\VolumesSafeForWriteAccess`, não sinalizado, e enfileira na
+  DelayedWorkQueue o FsRtlWaitForSmssEvent, que o espera sem prazo, liga o
+  FsRtlpVolumeStartupApplicationsComplete (que o
+  FsRtlAreVolumeStartupApplicationsComplete devolve) e solta a referência.
+  Quem sinaliza é o smss.exe: o SmpInit abre o evento (NtOpenEvent,
+  EVENT_ALL_ACCESS) e o SmpLoadDataFromRegistry o sinaliza logo depois dos
+  comandos BootExecute. O WorkerThread do mountmgr.sys espera o mesmo
+  evento antes de gravar nos volumes. Sem smss ninguém o sinaliza e as duas
+  workers ficam paradas, como no NT. Teste: `fsrtl_smss_event` (fase 6: o
+  evento, a abertura pelo nome com ZwOpenEvent, a worker parada nele e o
+  FALSE do FsRtlAreVolumeStartupApplicationsComplete).
 - **Lazy writer do Cache Manager** (`cc/lazy_writer.rs`): o
   CcScheduleLazyWriteScan arma o ScanTimer (CcFirstDelay, 3 s; FastScan
   acorda já), a DPC dele acorda a thread do lazy writer — uma thread de
