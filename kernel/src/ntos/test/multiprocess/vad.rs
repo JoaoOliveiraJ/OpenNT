@@ -19,7 +19,8 @@ type Assert = fn(bool, &str);
 const MEM_COMMIT: u32 = 0x1000;
 const MEM_FREE: u32 = 0x1_0000;
 const MEM_RELEASE: u64 = 0x8000;
-const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+/// STATUS_MEMORY_NOT_ALLOCATED: o MmFreeVirtualMemory sem VAD na base.
+const STATUS_MEMORY_NOT_ALLOCATED: u32 = 0xC000_00A0;
 
 /// Ponteiros dos serviços numa área de kernel: BaseAddress, RegionSize e a
 /// pilha de argumentos (arg5 em +0x28 do rsp).
@@ -112,7 +113,7 @@ pub fn run(assert: Assert) {
 
     // NtFreeVirtualMemory em B não acha a região de A.
     let freed = within(second, &|| scratch.release(a_region) as u64) as u32;
-    assert(freed == STATUS_INVALID_PARAMETER && seen(first, a_region) && paging::translate(a_region) != 0, "vad: NtFreeVirtualMemory em B nao libera a regiao de A");
+    assert(freed == STATUS_MEMORY_NOT_ALLOCATED && seen(first, a_region) && paging::translate(a_region) != 0, "vad: NtFreeVirtualMemory em B nao libera a regiao de A");
 
     // O término de A devolve as regiões de A, e só elas.
     assert(process::terminate_process(first, 0).is_ok() && process_state::get(first).is_none() && [a_out, a_region, a_second].iter().all(|&base| paging::translate(base) == 0), "vad: termino de A devolve as regioes de A");

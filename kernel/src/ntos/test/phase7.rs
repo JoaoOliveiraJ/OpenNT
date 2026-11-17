@@ -795,7 +795,19 @@ fn user_virtual_memory(assert: Assert) {
         memory::nt_free_virtual_memory(u64::MAX, base_pointer, size_pointer, kind, 0).unwrap_or(1)
     };
     assert(free(reserved + 0x1000, 0x1000, 0x4000) == 0 && paging::translate(reserved + 0x1000) == 0 && memory::find_region(reserved).is_some(), "usermemory: MEM_DECOMMIT desmapeia e conserva a reserva");
-    assert(free(reserved, 0x1000, 0x8000) == 0xC000_000D && free(reserved, 0, 0x8000) == 0 && memory::find_region(reserved).is_none() && free(0x8000, 0, 0x8000) == 0xC000_000D, "usermemory: MEM_RELEASE de parte da regiao recusado; base com tamanho zero libera a regiao");
+    // MEM_RELEASE de parte da região (o MiFreeVadRange do 19041): o começo
+    // (o RtlCreateHeap libera assim a folga aleatória da reserva), o meio e
+    // os pedaços que sobram, cada um uma região própria com as páginas dela.
+    let tail_value = 0x4F70_656E_4E54_u64;
+    let tail_committed = allocate(reserved + 0x3000, 0x1000, 0x1000, 4) == 0 && guest::try_write::<u64>(reserved + 0x3000, tail_value).is_ok();
+    let head = free(reserved, 0x1000, 0x8000) == 0 && guest::read64(base_pointer) == reserved && guest::read64(size_pointer) == 0x1000 && memory::find_region(reserved).is_none() && memory::find_region(reserved + 0x1000).is_some_and(|region| region.base() == reserved + 0x1000 && region.size() == 0x3000);
+    assert(tail_committed && head, "usermemory: MEM_RELEASE do comeco da regiao deixa o resto como regiao propria");
+    let middle = free(reserved + 0x2000, 0x1000, 0x8000) == 0 && memory::find_region(reserved + 0x2000).is_none() && memory::find_region(reserved + 0x1000).is_some_and(|region| region.base() == reserved + 0x1000 && region.size() == 0x1000) && memory::find_region(reserved + 0x3000).is_some_and(|region| region.base() == reserved + 0x3000 && region.size() == 0x1000);
+    let moved = memory_query::describe(reserved + 0x3000, &Context::current());
+    assert(middle && moved.state == 0x1000 && moved.allocation_base == reserved + 0x3000 && guest::try_read::<u64>(reserved + 0x3000).ok() == Some(tail_value), "usermemory: MEM_RELEASE do meio separa a regiao e a pagina confirmada segue no pedaco de cima");
+    assert(free(reserved + 0x3800, 0, 0x8000) == 0xC000_009F && free(reserved + 0x1000, 0x2000, 0x8000) == 0xC000_001A && free(reserved + 0x1000, 0, 0) == 0xC000_00F2 && free(reserved + 0x1000, 0, 0xC000) == 0xC000_00F2 && free(reserved + 0x1000, 0, 0x8003) == 0xC000_000D && free(reserved + 0x1000, 0x1000, 0x8002) == 0xC000_0018 && free(reserved + 0x1000, 0, 0x8010) == 0xC000_00F2 && free(0x8000, 0, 0x8000) == 0xC000_00A0 && free(0x7FFF_FFFF_0000, 0, 0x8000) == 0xC000_00F0 && free(0x7FFF_FFFE_0000, 0x2_0000, 0x8000) == 0xC000_00F1, "usermemory: recusas do MmFreeVirtualMemory (base, faixa, tipo e placeholder)");
+    assert(free(reserved + 0x3000, 0, 0x4000) == 0 && guest::read64(base_pointer) == reserved + 0x3000 && guest::read64(size_pointer) == 0 && paging::translate(reserved + 0x3000) == 0 && memory::find_region(reserved + 0x3000).is_some(), "usermemory: MEM_DECOMMIT com tamanho zero devolve RegionSize 0 e conserva a reserva");
+    assert(free(reserved + 0x1000, 0, 0x8000) == 0 && free(reserved + 0x3000, 0, 0x8000) == 0 && guest::read64(size_pointer) == 0x1000 && memory::find_region(reserved + 0x1000).is_none() && memory::find_region(reserved + 0x3000).is_none(), "usermemory: os pedacos liberados com tamanho zero");
     // Estruturas do processo e regiões compartilhadas.
     let structures = memory::map_user_region(0x1800);
     assert(structures.as_ref().is_ok_and(|&va| va % 0x1000 == 0 && va > data && va + 0x2000 <= memory::USER_ALLOCATION_TOP && paging::translate(va + 0x1000) != 0 && memory::find_region(va).is_some_and(|region| region.base() == va && region.size() == 0x2000)), "usermemory: regiao de estruturas de cima para baixo, pelo alocador");

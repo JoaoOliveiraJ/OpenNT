@@ -3422,7 +3422,11 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   o NtSetInformationVirtualMemory de modo usuário (as validações do serviço
   e a pré-busca, `mm/prefetch.rs`; a VmImageHotPatchInformation que a ntdll
   pede a cada DLL é STATUS_NOT_SUPPORTED, sem reserva de hot patch) e o
-  MEM_RELEASE com a faixa da região inteira. O marcador `SMSS_CSRSS_OK` sai
+  NtFreeVirtualMemory do MmFreeVirtualMemory (`ps/user/memory.rs::free_in`:
+  as recusas de FreeType, base e faixa, e o MEM_RELEASE de parte de uma
+  região privada, que deixa o resto como região própria; o RtlCreateHeap
+  de todo processo reserva o heap com uma folga aleatória e libera o começo
+  dela). O marcador `SMSS_CSRSS_OK` sai
   quando uma thread do csrss.exe criado por um smss pede pela primeira vez
   um serviço da tabela do win32k (`ex/service_table.rs::out_of_range` ->
   `initial_process::win32k_requested`, antes da conversão em thread GUI)

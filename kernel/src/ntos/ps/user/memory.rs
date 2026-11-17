@@ -842,11 +842,18 @@ pub fn allocate_ex_in(space: Space, base_pointer: u64, size_pointer: u64, alloca
     allocate_in(space, base_pointer, size_pointer, allocation_type, protect, lowest, highest, align)
 }
 
-/// NtFreeVirtualMemory, no processo do handle (PROCESS_VM_OPERATION):
-/// MEM_DECOMMIT desmapeia a subfaixa (a região fica reservada); MEM_RELEASE
-/// libera a região privada inteira; seções usam UnmapView.
+/// NtFreeVirtualMemory, no processo do handle (PROCESS_VM_OPERATION), como
+/// o MmFreeVirtualMemory do 19041 (`free_in`): o FreeType e a faixa são
+/// conferidos antes do handle.
 pub fn nt_free_virtual_memory(process: u64, base_pointer: u64, size_pointer: u64, free_type: u64, _user_rsp: u64) -> Result<u32, KernelError> {
-    with_process_handle(process, PROCESS_VM_OPERATION, |target| state::guarded(|| free_in(Space::of(target), base_pointer, size_pointer, free_type as u32)))
+    let free_type = free_type as u32;
+    state::guarded(|| {
+        let (base, size) = (guest::try_read::<u64>(base_pointer)?, guest::try_read::<u64>(size_pointer)?);
+        if let Err(status) = free_range_request(base, size, free_type) {
+            return Ok(status);
+        }
+        with_process_handle(process, PROCESS_VM_OPERATION, |target| state::guarded(|| free_in(Space::of(target), base_pointer, size_pointer, free_type)))
+    })
 }
 
 /// NtSetInformationVirtualMemory(process, class, NumberOfEntries,
@@ -925,33 +932,148 @@ pub fn validate_committed(space: Space, base_pointer: u64, size_pointer: u64) ->
     Ok(0)
 }
 
-/// MEM_DECOMMIT/MEM_RELEASE no espaço dado.
+const MEM_DECOMMIT: u32 = 0x4000;
+const MEM_RELEASE: u32 = 0x8000;
+const MEM_COALESCE_PLACEHOLDERS: u32 = 0x1;
+const MEM_PRESERVE_PLACEHOLDER: u32 = 0x2;
+const STATUS_INVALID_PARAMETER_2: u32 = 0xC000_00F0;
+const STATUS_INVALID_PARAMETER_3: u32 = 0xC000_00F1;
+const STATUS_INVALID_PARAMETER_4: u32 = 0xC000_00F2;
+const STATUS_UNABLE_TO_FREE_VM: u32 = 0xC000_001A;
+const STATUS_UNABLE_TO_DELETE_SECTION: u32 = 0xC000_001B;
+const STATUS_FREE_VM_NOT_AT_BASE: u32 = 0xC000_009F;
+const STATUS_MEMORY_NOT_ALLOCATED: u32 = 0xC000_00A0;
+
+/// O FreeType conferido pelo MmFreeVirtualMemory.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FreeKind {
+    Decommit,
+    Release,
+    /// MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER.
+    PreservePlaceholder,
+    /// MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS.
+    CoalescePlaceholders,
+}
+
+/// As conferências do MmFreeVirtualMemory (ntoskrnl 19041, rva 0x63ad20)
+/// antes do handle: exatamente um de MEM_DECOMMIT e MEM_RELEASE
+/// (STATUS_INVALID_PARAMETER_4), a base até MM_HIGHEST_USER_ADDRESS
+/// (STATUS_INVALID_PARAMETER_2) e a faixa abaixo de MmUserProbeAddress
+/// (STATUS_INVALID_PARAMETER_3); os dois bits de placeholder juntos dão
+/// STATUS_INVALID_PARAMETER, e um deles só vale com MEM_RELEASE e a faixa em
+/// páginas inteiras. Devolve o FreeType sem os bits de placeholder.
+fn free_range_request(base: u64, size: u64, free_type: u32) -> Result<(u32, Option<FreeKind>), u32> {
+    if matches!(free_type & (MEM_DECOMMIT | MEM_RELEASE), 0 | 0xC000) {
+        return Err(STATUS_INVALID_PARAMETER_4);
+    }
+    if base > map::HIGHEST_USER_ADDRESS {
+        return Err(STATUS_INVALID_PARAMETER_2);
+    }
+    if USER_ADDRESS_LIMIT - base < size {
+        return Err(STATUS_INVALID_PARAMETER_3);
+    }
+    let mut remaining = free_type;
+    let placeholder = if remaining & MEM_PRESERVE_PLACEHOLDER != 0 {
+        if remaining & MEM_COALESCE_PLACEHOLDERS != 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        remaining &= !MEM_PRESERVE_PLACEHOLDER;
+        Some(FreeKind::PreservePlaceholder)
+    } else if remaining & MEM_COALESCE_PLACEHOLDERS != 0 {
+        remaining &= !MEM_COALESCE_PLACEHOLDERS;
+        Some(FreeKind::CoalescePlaceholders)
+    } else {
+        None
+    };
+    if placeholder.is_some() {
+        if remaining != MEM_RELEASE {
+            return Err(STATUS_INVALID_PARAMETER_4);
+        }
+        if size == 0 || size & (PAGE - 1) != 0 {
+            return Err(STATUS_INVALID_PARAMETER_3);
+        }
+        if base & (PAGE - 1) != 0 {
+            return Err(STATUS_INVALID_PARAMETER_2);
+        }
+    }
+    Ok((remaining, placeholder))
+}
+
+/// O FreeType inteiro: depois do handle, nenhum bit além de MEM_DECOMMIT e
+/// MEM_RELEASE (os internos do kernel não vêm deste caminho).
+fn free_request(base: u64, size: u64, free_type: u32) -> Result<FreeKind, u32> {
+    let (remaining, placeholder) = free_range_request(base, size, free_type)?;
+    if remaining & !(MEM_DECOMMIT | MEM_RELEASE) != 0 {
+        return Err(STATUS_INVALID_PARAMETER_4);
+    }
+    Ok(placeholder.unwrap_or(if remaining == MEM_RELEASE { FreeKind::Release } else { FreeKind::Decommit }))
+}
+
+/// MEM_DECOMMIT/MEM_RELEASE no espaço dado, como o MmFreeVirtualMemory do
+/// 19041. A região é a que contém a página da base (sem região,
+/// STATUS_MEMORY_NOT_ALLOCATED); a faixa é a pedida, arredondada a páginas,
+/// ou, com RegionSize 0, da base ao fim da região (o MEM_RELEASE exige a base
+/// na primeira página dela: STATUS_FREE_VM_NOT_AT_BASE). Uma faixa que passa
+/// do fim da região dá STATUS_UNABLE_TO_FREE_VM e uma vista ou imagem
+/// STATUS_UNABLE_TO_DELETE_SECTION. MEM_DECOMMIT devolve as páginas e deixa
+/// a reserva (com RegionSize 0 devolve RegionSize 0, como o 19041);
+/// MEM_RELEASE devolve a faixa e tira do VAD a região inteira ou só a parte
+/// liberada (o MiFreeVadRange: o RtlCreateHeap reserva a pilha do heap com
+/// uma folga aleatória e libera o começo dela). O OpenNT não cria reservas
+/// de placeholder: MEM_COALESCE_PLACEHOLDERS e MEM_PRESERVE_PLACEHOLDER dão
+/// STATUS_CONFLICTING_ADDRESSES, a resposta do 19041 para VADs comuns.
 pub fn free_in(space: Space, base_pointer: u64, size_pointer: u64, free_type: u32) -> Result<u32, KernelError> {
     let base = guest::try_read::<u64>(base_pointer)?;
     let size = guest::try_read::<u64>(size_pointer)?;
-    let Some(region) = space.find(base) else {
-        debug_print!("[usermode] NtFreeVirtualMemory: base 0x{:x} size 0x{:x} tipo 0x{:x} - NAO MAPEADO", base, size, free_type);
-        return Ok(STATUS_INVALID_PARAMETER);
+    let kind = match free_request(base, size, free_type) {
+        Ok(kind) => kind,
+        Err(status) => return Ok(status),
     };
-    if region.section().is_some() {
-        return Ok(0xC000_001B);
+    if kind == FreeKind::CoalescePlaceholders {
+        return Ok(STATUS_CONFLICTING_ADDRESSES);
     }
-    let Some(owner) = private(&region) else { return Ok(STATUS_INVALID_PARAMETER) };
-    let release = free_type == 0x8000;
-    let decommit = free_type == 0x4000;
-    // MEM_RELEASE com RegionSize: a faixa arredondada a páginas que cobre a
-    // região inteira a libera como RegionSize 0 (o RtlpAllocDeallocQueryBuffer
-    // da ntdll devolve assim o buffer que alocou, com o tamanho devolvido
-    // pela alocação).
-    let whole = size != 0 && base.checked_add(size).is_some_and(|end| base & !(PAGE - 1) == owner.base && end.div_ceil(PAGE) * PAGE == owner.base + owner.size);
-    if (!release && !decommit) || (release && !whole && (base != owner.base || size != 0)) {
-        return Ok(STATUS_INVALID_PARAMETER);
+    let start = base & !(PAGE - 1);
+    let Some(region) = space.find(start) else {
+        return Ok(if space.state().is_none() { STATUS_PROCESS_IS_TERMINATING } else { STATUS_MEMORY_NOT_ALLOCATED });
+    };
+    let release = kind != FreeKind::Decommit;
+    let (region_start, region_end) = (region.base(), region.base() + region.size());
+    if size == 0 && release && start != region_start {
+        return Ok(STATUS_FREE_VM_NOT_AT_BASE);
     }
-    let first = if release || size == 0 { owner.base } else { base & !(PAGE - 1) };
-    let end = if release || size == 0 { owner.base + owner.size } else { (base + size).div_ceil(PAGE) * PAGE };
-    if first < owner.base || end > owner.base + owner.size || (size == 0 && base != owner.base) {
-        return Ok(STATUS_INVALID_PARAMETER);
+    let (first, end) = if size == 0 { (if release { region_start } else { start }, region_end) } else { (start, (base + size).div_ceil(PAGE) * PAGE) };
+    if end > region_end {
+        return Ok(STATUS_UNABLE_TO_FREE_VM);
     }
+    let Some(owner) = private(&region) else { return Ok(STATUS_UNABLE_TO_DELETE_SECTION) };
+    if kind == FreeKind::PreservePlaceholder {
+        return Ok(STATUS_CONFLICTING_ADDRESSES);
+    }
+    if !release && size == 0 && start != region_start {
+        return Ok(STATUS_FREE_VM_NOT_AT_BASE);
+    }
+    let whole = (first, end) == (region_start, region_end);
+    // SAFETY: o EPROCESS do espaço, retido por quem pediu a liberação.
+    if release && !whole && unsafe { crate::ntos::inc::types::Eprocess::at(space.process()) }.relinquished_commit() != 0 {
+        return Ok(STATUS_PROCESS_IS_TERMINATING);
+    }
+    decommit_private_pages(space, owner, first, end);
+    if release {
+        if whole {
+            space.remove(&region);
+        } else {
+            split_private_region(space, &region, owner, first, end);
+        }
+    }
+    guest::try_write::<u64>(base_pointer, first)?;
+    guest::try_write::<u64>(size_pointer, if !release && size == 0 { 0 } else { end - first })?;
+    Ok(0)
+}
+
+/// O MiDecommitRegion de uma região privada: as páginas confirmadas de
+/// [first, end) saem (frame, cópia no arquivo de paginação, proteção e
+/// trava) e o commit volta ao processo.
+fn decommit_private_pages(space: Space, owner: &PrivateRegion, first: u64, end: u64) {
     let mut va = first;
     let mut decommitted = 0;
     while va < end {
@@ -978,12 +1100,70 @@ pub fn free_in(space: Space, base_pointer: u64, size_pointer: u64, free_type: u3
         va += PAGE;
     }
     process_commit::release(space.process(), decommitted);
-    if release {
-        space.remove(&region);
+}
+
+/// As entradas de `[from, to)` saem do mapa e voltam reindexadas a partir de 0.
+fn take_pages<V>(map: &mut BTreeMap<u64, V>, from: u64, to: u64) -> BTreeMap<u64, V> {
+    let mut taken = map.split_off(&from);
+    let mut after = taken.split_off(&to);
+    map.append(&mut after);
+    taken.into_iter().map(|(index, value)| (index - from, value)).collect()
+}
+
+/// O mesmo para um conjunto de índices.
+fn take_indices(set: &mut BTreeSet<u64>, from: u64, to: u64) -> BTreeSet<u64> {
+    let mut taken = set.split_off(&from);
+    let mut after = taken.split_off(&to);
+    set.append(&mut after);
+    taken.into_iter().map(|index| index - from).collect()
+}
+
+/// O MiFreeVadRange de uma faixa interna (já sem páginas): a parte da região
+/// antes de [first, end) e a parte depois viram regiões novas no VAD, no
+/// lugar da original e com a mesma proteção, cada uma com as páginas dela
+/// reindexadas (frames, commit, proteções, cópias no arquivo de paginação e
+/// travas). As páginas em transição voltam às listas de modificadas e de
+/// reserva pela região nova; as entradas pela região antiga deixam de valer
+/// (o frame já não é dela).
+fn split_private_region(space: Space, region: &Region, owner: &PrivateRegion, first: u64, end: u64) {
+    let root = space.root();
+    let mut relisted: Vec<(working_set::ListedPage, bool)> = Vec::new();
+    space.with_vad(|vad| {
+        let Some(position) = vad.regions.iter().position(|candidate| state::same_region(candidate, region)) else { return };
+        let mut old = owner.state.lock();
+        vad.regions.remove(position);
+        for (start, stop) in [(owner.base, first), (end, owner.base + owner.size)] {
+            if stop <= start {
+                continue;
+            }
+            let piece = PrivateRegion::new(start, stop - start, owner.protect, owner.allocation_type, owner.pageable);
+            let entry: Region = piece.clone();
+            let (from, to) = ((start - owner.base) / PAGE, (stop - owner.base) / PAGE);
+            {
+                let mut moved = piece.state.lock();
+                moved.frames = take_pages(&mut old.frames, from, to);
+                moved.committed_pages = take_indices(&mut old.committed_pages, from, to);
+                moved.page_protects = take_pages(&mut old.page_protects, from, to);
+                moved.protected_frames = take_pages(&mut old.protected_frames, from, to);
+                moved.paging = take_pages(&mut old.paging, from, to);
+                moved.clean = take_pages(&mut old.clean, from, to);
+                moved.locked = take_pages(&mut old.locked, from, to);
+                for (&index, paged) in moved.paging.iter().filter(|(_, paged)| paged.transition) {
+                    if let Some(&frame) = moved.frames.get(&index) {
+                        relisted.push((working_set::ListedPage { region: entry.clone(), root, index, frame }, paged.slot.is_none()));
+                    }
+                }
+            }
+            vad.regions.push(entry);
+        }
+    });
+    for (page, modified) in relisted {
+        if modified {
+            crate::ntos::mm::modified_writer::insert_modified(page);
+        } else {
+            crate::ntos::mm::modified_writer::insert_standby(page);
+        }
     }
-    guest::try_write::<u64>(base_pointer, first)?;
-    guest::try_write::<u64>(size_pointer, end - first)?;
-    Ok(0)
 }
 
 /// NtProtectVirtualMemory(process, base*, size*, newProtect, oldProtect*),
