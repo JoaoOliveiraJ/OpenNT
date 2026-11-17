@@ -1,7 +1,7 @@
 //! Zw/NtQueryInformationThread.
 //!
 //! Contrato ThreadPagePriority medido nos bytes originais e em chamadas do
-//! Windows. `access_mode` separa Nt (chamador usuário) de Zw (parâmetros de
+//! Windows; a ThreadIoPriority segue o mesmo caminho. `access_mode` separa Nt (chamador usuário) de Zw (parâmetros de
 //! kernel). A variante de syscall de usuário (`query_user`) entra com o
 //! estado de modo usuário (fase 7).
 
@@ -15,6 +15,11 @@ use crate::ntos::inc::field::NtStruct;
 use crate::ntos::inc::types::Ethread;
 
 const THREAD_PAGE_PRIORITY: u32 = 24;
+/// ThreadIoPriority: os bits 9..11 do CrossThreadFlags (o ramo da classe 22
+/// do NtQueryInformationThread 19041, rva 0x5fbf01), com o mesmo contrato da
+/// ThreadPagePriority: um ULONG, THREAD_QUERY_LIMITED_INFORMATION, o valor e
+/// depois o ReturnLength 4.
+const THREAD_IO_PRIORITY: u32 = 22;
 const THREAD_QUERY_LIMITED_INFORMATION: u32 = 0x800;
 const PAGE_PRIORITY_SIZE: u64 = 4;
 /// MmUserProbeAddress.
@@ -76,7 +81,7 @@ pub fn query(thread_handle: u64, information_class: u32, output: u64, output_len
         return Ok(0xC000_0003);
     }
     // Classes válidas ainda sem provedor falham explicitamente.
-    if information_class != THREAD_PAGE_PRIORITY {
+    if information_class != THREAD_PAGE_PRIORITY && information_class != THREAD_IO_PRIORITY {
         return Ok(0xC000_0002);
     }
     if output_length as u64 != PAGE_PRIORITY_SIZE {
@@ -88,7 +93,8 @@ pub fn query(thread_handle: u64, information_class: u32, output: u64, output_len
     };
     let result = (|| {
         // SAFETY: ETHREAD referenciado pelo handle.
-        let page_priority = unsafe { Ethread::at(reference.pointer) }.thread_page_priority();
+        let thread = unsafe { Ethread::at(reference.pointer) };
+        let page_priority = if information_class == THREAD_IO_PRIORITY { thread.thread_io_priority() } else { thread.thread_page_priority() };
         // A escrita vem depois da referência; erros anteriores preservam os buffers.
         if !can_write_priority_output(output, from_user_mode) {
             return STATUS_ACCESS_VIOLATION;

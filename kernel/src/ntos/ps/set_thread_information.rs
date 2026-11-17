@@ -2,6 +2,8 @@
 //!
 //! ThreadBreakOnTermination liga ou desliga a thread crítica.
 //! ThreadImpersonationToken impersona um token (ou encerra a impersonação).
+//! ThreadIoPriority troca a prioridade de E/S da thread (o
+//! PsSetIoPriorityThread).
 //! ThreadPagePriority altera só os três bits medidos na ETHREAD original. A
 //! ordem medida é sondagem, tamanho, captura/valor, referência, alteração
 //! atômica e liberação. A variante de syscall de usuário (`set_user`) entra
@@ -19,6 +21,12 @@ use crate::ntos::inc::types::Ethread;
 
 const THREAD_PAGE_PRIORITY: u32 = 24;
 pub const THREAD_BREAK_ON_TERMINATION: u32 = 18;
+/// ThreadIoPriority, IoPriorityHigh, IoPriorityCritical e
+/// SeIncreaseBasePriorityPrivilege.
+const THREAD_IO_PRIORITY: u32 = 22;
+const IO_PRIORITY_HIGH: u32 = 3;
+const IO_PRIORITY_CRITICAL: u32 = 4;
+const SE_INCREASE_BASE_PRIORITY_PRIVILEGE: u64 = 14;
 /// SeDebugPrivilege.
 const DEBUG_PRIVILEGE: u64 = 20;
 const THREAD_SET_INFORMATION: u32 = 0x20;
@@ -75,6 +83,9 @@ pub fn set(thread_handle: u64, information_class: u32, input: u64, input_length:
     }
     if information_class == THREAD_IMPERSONATION_TOKEN {
         return impersonation_token(thread_handle, input, input_length, access_mode);
+    }
+    if information_class == THREAD_IO_PRIORITY {
+        return set_io_priority(thread_handle, input, input_length, access_mode);
     }
     if information_class != THREAD_PAGE_PRIORITY {
         return Ok(0xC000_0002);
@@ -170,6 +181,43 @@ fn set_break_on_termination(thread_handle: u64, input: u64, input_length: u32, a
     };
     // SAFETY: ETHREAD referenciado pelo handle; o bit muda por CAS atômico.
     unsafe { Ethread::at(reference.pointer) }.set_break_on_termination((value != 0) as u32);
+    reference.release()?;
+    Ok(0)
+}
+
+/// ThreadIoPriority (o ramo da classe 22 do NtSetInformationThread 19041,
+/// rva 0x64aa67): 4 bytes (o IO_PRIORITY_HINT) ou 8 (o valor e, no ULONG de
+/// cima, o pedido de reforço); outro tamanho dá STATUS_INFO_LENGTH_MISMATCH.
+/// O valor é capturado uma vez: IoPriorityCritical (4) ou acima é
+/// STATUS_INVALID_PARAMETER, IoPriorityHigh (3) exige o
+/// SeIncreaseBasePriorityPrivilege (SeCheckPrivilegedObject, senão
+/// STATUS_PRIVILEGE_NOT_HELD); o handle com THREAD_SET_INFORMATION e o
+/// PsSetIoPriorityThread troca os bits do CrossThreadFlags por CAS. O
+/// reforço da forma de 8 bytes (IoBoostThreadIoPriority) eleva a prioridade
+/// dos IRPs pendentes da thread, e o I/O Manager do OpenNT não guarda
+/// prioridade por IRP: nada a elevar.
+fn set_io_priority(thread_handle: u64, input: u64, input_length: u32, access_mode: u8) -> Result<u32, KernelError> {
+    if input_length.wrapping_sub(4) & !4 != 0 {
+        return Ok(0xC000_0004);
+    }
+    if access_mode != 0 && !user_probe::probe_user_read(input, input_length as u64) {
+        return Ok(STATUS_ACCESS_VIOLATION);
+    }
+    let captured = if input_length == 8 { guest::try_read::<u64>(input) } else { guest::try_read::<u32>(input).map(u64::from) };
+    let Ok(captured) = captured else { return Ok(STATUS_ACCESS_VIOLATION) };
+    let priority = captured as u32;
+    if priority >= IO_PRIORITY_CRITICAL {
+        return Ok(0xC000_000D);
+    }
+    if priority == IO_PRIORITY_HIGH && !crate::ntos::se::privilege::single_privilege_check(SE_INCREASE_BASE_PRIORITY_PRIVILEGE, u32::from(access_mode)) {
+        return Ok(0xC000_0061);
+    }
+    let mut reference = match thread_handles::reference(thread_handle, THREAD_SET_INFORMATION, access_mode)? {
+        Ok(reference) => reference,
+        Err(status) => return Ok(status),
+    };
+    // SAFETY: ETHREAD referenciado pelo handle; os bits mudam por CAS atômico.
+    unsafe { Ethread::at(reference.pointer) }.set_thread_io_priority(priority);
     reference.release()?;
     Ok(0)
 }
