@@ -23,6 +23,21 @@ license = "MIT"
 panic = "abort"
 opt-level = 1
 
+# O kernel dos builds comuns (build, run, test-boot, test-all) leva só as
+# tabelas de linha do DWARF: o depurador acha arquivo:linha e o nome de cada
+# função (inclusive as expandidas inline), e o kernel compila e liga mais
+# rápido e ocupa menos disco.
+[profile.dev.package.kernel]
+debug = "line-tables-only"
+
+# `cargo xtask debug` (e os depuradores gráficos, que o chamam): o DWARF
+# completo, com os tipos e as variáveis locais que eles mostram.
+[profile.depuracao]
+inherits = "dev"
+
+[profile.depuracao.package.kernel]
+debug = "full"
+
 [profile.release]
 panic = "abort"
 opt-level = 2

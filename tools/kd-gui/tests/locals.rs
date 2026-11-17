@@ -21,6 +21,9 @@ fn parameters_of_a_kernel_function() {
     symbols.load_kernel(&elf).unwrap();
     let start = symbols.lookup("kernel::ntos::io::device::create_device").unwrap();
     let table = LineTable::load(&elf).unwrap();
+    // O arquivo e a linha da entrada da função (as tabelas de linha bastam).
+    let position = table.locate(start).expect("create_device sem arquivo:linha no DWARF");
+    assert!(position.file.replace('\\', "/").ends_with("ntos/io/device.rs") && position.line > 0, "{} {}", position.file, position.line);
     // Registradores e uma pilha de mentira: o que importa são os nomes.
     let stack = 0xffff_8000_0010_0000u64;
     let registers: Vec<(String, u64)> = ["rax", "rbx", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"].iter().map(|name| (name.to_string(), 0x1000)).chain([("rsp".to_string(), stack), ("rbp".to_string(), stack + 0x400)]).collect();

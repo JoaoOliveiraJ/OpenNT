@@ -23,6 +23,8 @@
 //! `--usb` (também opção de máquina: a controladora xHCI com teclado e tablet USB),
 //! `--memory-pressure` (o teste de pressão de memória sobre o arquivo de paginação do boot do
 //! smss).
+//! O kernel dos builds comuns leva só as tabelas de linha do DWARF; o `debug` compila o perfil
+//! `depuracao`, com o DWARF completo (as variáveis locais dos depuradores gráficos).
 //! Fora `--release` e `--windows-dir`, elas não recompilam o kernel: vão no bloco de opções de
 //! carga da imagem de boot (`build.rs`), e o `--initial-process=smss` também troca o volume
 //! NTFS.
@@ -144,6 +146,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
         command: command.clone(),
         build: BuildOptions {
             release: false,
+            full_debuginfo: false,
             build_dir: PathBuf::from("build"),
             user_program: "shell".into(),
             kernel_test_scope: "none".into(),
@@ -433,6 +436,8 @@ fn debug_command(arguments: Arguments) -> Result<(), String> {
     if options.kd.is_empty() {
         options.kd = "com2".into();
     }
+    // O depurador mostra as variáveis locais e os tipos: o DWARF completo.
+    options.full_debuginfo = true;
     let mut machine = arguments.machine.clone();
     machine.accelerator = qemu::resolve_accelerator(&machine.accelerator)?;
     let port = match machine.kd_port {

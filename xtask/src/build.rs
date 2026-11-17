@@ -48,6 +48,10 @@ const NVME_FILE_DATA: &[u8] = b"Volume NTFS no disco NVMe do OpenNT.\r\n";
 #[derive(Clone, Debug)]
 pub struct BuildOptions {
     pub release: bool,
+    /// O perfil `depuracao` (o DWARF completo do kernel, com tipos e
+    /// variáveis locais): o do `cargo xtask debug` e dos depuradores
+    /// gráficos. Sem ele, o `dev` leva só as tabelas de linha.
+    pub full_debuginfo: bool,
     pub build_dir: PathBuf,
     pub user_program: String,
     pub kernel_test_scope: String,
@@ -133,6 +137,17 @@ impl BuildOptions {
             words.push(String::from(name::MEMORY_PRESSURE));
         }
         Ok(words.join(" "))
+    }
+
+    /// O perfil do cargo: `release`, `depuracao` (o DWARF completo) ou `dev`.
+    pub fn cargo_profile(&self) -> &'static str {
+        if self.release {
+            "release"
+        } else if self.full_debuginfo {
+            "depuracao"
+        } else {
+            "dev"
+        }
     }
 
     /// O bloco do LBA 64: assinatura, tamanho e o texto.
@@ -254,15 +269,17 @@ fn cargo_build(root: &Path, package: &str, options: &BuildOptions, windows_binar
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
     let mut command = Command::new(cargo);
     command.current_dir(root).args(["build", "--package", package, "--target", TARGET]);
-    if options.release {
-        command.arg("--release");
+    let profile = options.cargo_profile();
+    if profile != "dev" {
+        command.args(["--profile", profile]);
     }
     match windows_binaries {
         Some(directory) => command.env("OPENNT_WINDOWS_BINARIES", directory),
         None => command.env_remove("OPENNT_WINDOWS_BINARIES"),
     };
     run(&mut command)?;
-    let profile = if options.release { "release" } else { "debug" };
+    // A pasta do perfil `dev` se chama `debug`.
+    let profile = if profile == "dev" { "debug" } else { profile };
     // O cargo filho herda o CARGO_TARGET_DIR (relativo, vale a partir da
     // raiz): o binário fica onde ele mandar, e duas rodadas podem compilar
     // em pastas separadas ao mesmo tempo.
@@ -378,6 +395,7 @@ mod tests {
     fn options() -> BuildOptions {
         BuildOptions {
             release: false,
+            full_debuginfo: false,
             build_dir: PathBuf::from("build"),
             user_program: "shell".into(),
             kernel_test_scope: "none".into(),
@@ -454,5 +472,10 @@ mod tests {
         let mut release = options();
         release.release = true;
         assert_ne!(base.kernel_key(), release.kernel_key());
+        // O DWARF completo do `debug` é outro kernel compilado.
+        let mut full = options();
+        full.full_debuginfo = true;
+        assert_ne!(base.kernel_key(), full.kernel_key());
+        assert_eq!((base.cargo_profile(), full.cargo_profile(), release.cargo_profile()), ("dev", "depuracao", "release"));
     }
 }
