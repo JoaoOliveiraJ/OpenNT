@@ -34,13 +34,11 @@ pub fn is_being_debugged(process: u64) -> bool {
     debug_port(process) != 0
 }
 
-/// PsGetProcessSessionIdEx: (ULONG)-1 para quem não pertence a uma sessão
-/// (o processo de sistema).
+/// PsGetProcessSessionIdEx: no ntoskrnl 19041 (0x315400) é o
+/// MmGetSessionIdEx, (ULONG)-1 para um processo sem sessão (Session NULL,
+/// como o smss mestre) e para o processo de sistema.
 pub fn query_ex(process: u64) -> u32 {
-    if eprocess(process).system_process() != 0 {
-        return 0xFFFF_FFFF;
-    }
-    query(process)
+    crate::ntos::mm::session::session_id_ex(process)
 }
 
 /// PsGetThreadSessionId: a sessão do processo dono da thread.
