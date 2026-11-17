@@ -332,6 +332,13 @@ const SMSS_PROGRAMS: &[&str] = &[
     "rpcepmap.dll",
     "lsm.dll",
     "dwmapi.dll",
+    // As cargas atrasadas do lsm.dll no caminho de subida: o sysntfy.dll
+    // (SysNotifyStartServer do CWinlogonNotify), o WMsgAPI.dll
+    // (WmsgSendMessage, os avisos de sessão ao winlogon) e o usermgrcli.dll
+    // (CamIsCandidateUser do CSessionArbitrationDefault::Initialize).
+    "sysntfy.dll",
+    "wmsgapi.dll",
+    "usermgrcli.dll",
     // As extensões do LSA que o lsass.exe carrega (o efslsaext.dll e o
     // dpapisrv.dll, com o ntasn1.dll e o shcore.dll que eles importam).
     "efslsaext.dll",

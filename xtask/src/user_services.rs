@@ -16,7 +16,8 @@
 //! Svchost`, os valores com a lista de serviços de cada grupo, e
 //! `Microsoft\Rpc\SecurityService`, os provedores de autenticação do RPC, e
 //! os valores de `Microsoft\Windows NT\CurrentVersion\WUDF`).
-//! E a
+//! A SYSTEM leva ainda o `Control\Terminal Server` com as subchaves, que o
+//! lsm.dll exige ao subir. E a
 //! configuração das extensões do LSA (`Control\LsaExtensionConfig`: o
 //! lsasrv.dll, o efslsaext.dll e a interface do dpapisrv.dll), que o
 //! LsapLoadRequiredExtensions do lsass.exe lê depois de conectar ao
@@ -41,6 +42,12 @@ pub fn system_keys(control_set: &str) -> Vec<HostKey> {
         }
         registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\Control\\ServiceGroupOrder"), &format!("{control_set}\\Control\\ServiceGroupOrder"), false, &mut keys);
         registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\Control\\LsaExtensionConfig"), &format!("{control_set}\\Control\\LsaExtensionConfig"), true, &mut keys);
+        // A configuração dos Serviços de Terminal com as subchaves
+        // (WinStations, AddIns, TerminalTypes, RCM e as outras): o
+        // CPolicyMonitor do CService::Start do lsm.dll abre `Terminal Server`
+        // e `Terminal Server\WinStations` e falha sem elas; o lsm lê ainda o
+        // TSAppCompat, o DelayReadyEventTimeout e o TSServerDrainMode.
+        registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\Control\\Terminal Server"), &format!("{control_set}\\Control\\Terminal Server"), true, &mut keys);
         // Os valores do LSA (os pacotes de autenticação e de notificação que
         // o lsass carrega, o tipo de produto) e as subchaves dele (o MSV1_0,
         // as políticas de acesso central que o LsapOpenCapDb abre, a
