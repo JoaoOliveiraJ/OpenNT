@@ -704,12 +704,19 @@ fn receive_one(server: &UserServer, buffer: &Buffer, attributes: u64, options: R
             None => None,
         };
         // A vista de dados entra no processo do servidor, registrada na porta
-        // de conexão (por onde o servidor a apaga).
+        // de conexão (por onde o servidor a apaga). Uma vista que não pode
+        // ser mapeada não prende a fila: a mensagem sai sem o atributo.
         let data_binding = match data_view.as_ref().filter(|_| wants_view) {
             Some(carried) => match message_view::expose(&server.listener, carried) {
                 Ok(Ok(binding)) => Some((binding, carried.clone())),
-                Ok(Err(status)) => return Some(status),
-                Err(error) => return Some(if error.status != 0 { error.status } else { 0xC000_0001 }),
+                Ok(Err(status)) => {
+                    crate::debug_print!("[alpc] vista de dados da mensagem {} sem mapeamento no servidor: {:#x}", id, status);
+                    None
+                }
+                Err(error) => {
+                    crate::debug_print!("[alpc] vista de dados da mensagem {} sem mapeamento no servidor: {}", id, error);
+                    None
+                }
             },
             None => None,
         };
