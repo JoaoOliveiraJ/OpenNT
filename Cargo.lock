@@ -1044,6 +1044,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "kd-mcp"
+version = "0.6.0"
+dependencies = [
+ "iced-x86",
+ "kd-client",
+ "serde_json",
+]
+
+[[package]]
 name = "kd-re"
 version = "0.6.0"
 dependencies = [
@@ -1053,6 +1062,7 @@ dependencies = [
  "iced-x86",
  "image",
  "kd-client",
+ "kd-mcp",
  "regex",
  "serde",
  "serde_json",
