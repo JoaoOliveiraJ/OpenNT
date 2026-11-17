@@ -292,7 +292,8 @@ fn acquire_entry_of(etw: &mut Etw, identifier: [u8; 16], silo: u64, notification
     if etw.entries.contains_key(&key) {
         return Some(key);
     }
-    let pointer = kernel_pool::allocate(GUID_ENTRY_SIZE, AllocateOptions { tag: GUID_TAG, zero: true, ..Default::default() }).ok()?;
+    // O pool esgotado devolve NULL (Ok(0)), como o ExAllocatePool.
+    let pointer = kernel_pool::allocate(GUID_ENTRY_SIZE, AllocateOptions { tag: GUID_TAG, zero: true, ..Default::default() }).ok().filter(|&pointer| pointer != 0)?;
     let native = guid_entry(pointer);
     for head in [&native.guid_list, &native.silo_guid_list, &native.reg_list_head] {
         head.flink.set(head.address());
@@ -377,9 +378,9 @@ fn notify_registration(pointer: u64, source: Option<[u8; 16]>, control: Option<u
         }
         Some(Delivery::Native(callback, context, information)) => (callback, context, information),
     };
-    let frame = kernel_pool::allocate(80, AllocateOptions { tag: REGISTRATION_TAG, zero: true, ..Default::default() });
+    let frame = kernel_pool::allocate(80, AllocateOptions { tag: REGISTRATION_TAG, zero: true, ..Default::default() }).ok().filter(|&frame| frame != 0);
     let result = match frame {
-        Ok(frame) => {
+        Some(frame) => {
             guest::write_bytes(frame, &source.unwrap_or([0; 16]));
             // ControlCode: 0/1 pelo estado agregado, ou 2 (CAPTURE_STATE).
             let control = control.unwrap_or(information.enabled as u64);
@@ -387,7 +388,7 @@ fn notify_registration(pointer: u64, source: Option<[u8; 16]>, control: Option<u
             let _ = kernel_pool::free(frame, None);
             Ok(())
         }
-        Err(_) => Err(KernelError::new("ETW enable callback allocation failed")),
+        None => Err(KernelError::new("ETW enable callback allocation failed")),
     };
     with(|etw| {
         if let Some(record) = etw.registrations.get_mut(&pointer) {
@@ -438,7 +439,7 @@ pub fn register(identifier_pointer: u64, callback: u64, context: u64, output: u6
     let silo = if classic { 0 } else { silo_query::current_server_silo() };
     let created = with(|etw| {
         let key = acquire_entry(etw, identifier, silo)?;
-        let Ok(pointer) = kernel_pool::allocate(REGISTRATION_SIZE, AllocateOptions { tag: REGISTRATION_TAG, zero: true, ..Default::default() }) else {
+        let Some(pointer) = kernel_pool::allocate(REGISTRATION_SIZE, AllocateOptions { tag: REGISTRATION_TAG, zero: true, ..Default::default() }).ok().filter(|&pointer| pointer != 0) else {
             discard_unused_entry(etw, &key);
             return None;
         };
@@ -854,7 +855,7 @@ pub fn set_traits(handle: u64, traits: &[u8]) -> u32 {
     if native.traits.get() != 0 {
         return STATUS_UNSUCCESSFUL;
     }
-    let Ok(block) = kernel_pool::allocate(TRAITS_HEADER + traits.len() as u64, AllocateOptions { tag: TRAITS_TAG, zero: true, ..Default::default() }) else { return STATUS_INSUFFICIENT_RESOURCES };
+    let Some(block) = kernel_pool::allocate(TRAITS_HEADER + traits.len() as u64, AllocateOptions { tag: TRAITS_TAG, zero: true, ..Default::default() }).ok().filter(|&block| block != 0) else { return STATUS_INSUFFICIENT_RESOURCES };
     guest::write32(block + 0x18, 1);
     guest::write_bytes(block + TRAITS_HEADER, traits);
     if native.traits.atomic().compare_exchange(0, block, core::sync::atomic::Ordering::SeqCst, core::sync::atomic::Ordering::SeqCst).is_err() {

@@ -41,7 +41,7 @@ fn seed() -> u64 {
     if current != 0 {
         return current;
     }
-    let Ok(block) = kernel_pool::allocate(SEED_SIZE, AllocateOptions { tag: SEED_TAG, zero: true, ..Default::default() }) else { return 0 };
+    let Some(block) = kernel_pool::allocate(SEED_SIZE, AllocateOptions { tag: SEED_TAG, zero: true, ..Default::default() }).ok().filter(|&block| block != 0) else { return 0 };
     let time = clock::system_time_100ns();
     guest::write32(block, time as u32);
     guest::write16(block + 4, (time >> 32) as u16);
