@@ -42,13 +42,19 @@ fn copy_entry(destination: &LuidAndAttributes, source: &LuidAndAttributes) {
     destination.attributes.set(source.attributes.get());
 }
 
-/// SeSinglePrivilegeCheck(PrivilegeValue, PreviousMode): KernelMode (0)
+/// SeSinglePrivilegeCheck(PrivilegeValue, PreviousMode) (ntoskrnl 19041,
+/// 0x627a60): o SeCaptureSubjectContext + SePrivilegeCheck. KernelMode (0)
 /// passa direto; UserMode exige o privilégio habilitado no token efetivo da
-/// thread corrente (o de personificação, quando há, senão o primário), como
-/// o SeCaptureSubjectContext + SePrivilegeCheck do NT.
+/// thread corrente: o de impersonação, quando há, senão o primário. Uma
+/// impersonação abaixo de SecurityImpersonation (Anonymous ou
+/// Identification) não deixa passar nenhum privilégio.
 pub fn single_privilege_check(privilege: u64, previous_mode: u32) -> bool {
     if previous_mode == 0 {
         return true;
+    }
+    let thread = crate::ntos::ps::process::get_current_thread();
+    if crate::ntos::se::token::thread::get(thread).is_some_and(|impersonation| impersonation.level < SECURITY_IMPERSONATION.0 as u32) {
+        return false;
     }
     let Some(token) = crate::ntos::ob::object_access::subject() else { return false };
     tokens::with(token, |token| token.privileges.iter().any(|held| held.id == privilege && held.attributes & SE_PRIVILEGE_ENABLED != 0)).unwrap_or(false)
@@ -85,9 +91,11 @@ pub fn audit_privilege_check(previous_mode: u32) -> bool {
     tokens::with(token, |token| token.privileges.iter().any(|held| held.id == 21 && held.attributes & SE_PRIVILEGE_ENABLED != 0)).unwrap_or(false)
 }
 
-/// SePrivilegeCheck(RequiredPrivileges, Subj, Mode): KernelMode → TRUE
-/// imediato; senão testa cada LUID do PRIVILEGE_SET contra os privilégios
-/// habilitados do token efetivo, marcando os usados.
+/// SePrivilegeCheck(RequiredPrivileges, Subj, Mode) (ntoskrnl 19041,
+/// 0x6cdd00): KernelMode → TRUE imediato; um ClientToken abaixo de
+/// SecurityImpersonation → FALSE; senão o SepPrivilegeCheck testa cada LUID
+/// do PRIVILEGE_SET contra os privilégios habilitados do ClientToken (ou do
+/// PrimaryToken, sem cliente), marcando os usados.
 pub fn privilege_check(set: u64, subject_context: u64, mode: u32) -> bool {
     if mode == 0 {
         return true;
@@ -95,10 +103,12 @@ pub fn privilege_check(set: u64, subject_context: u64, mode: u32) -> bool {
     // SAFETY: PSECURITY_SUBJECT_CONTEXT do chamador de SePrivilegeCheck.
     let context = unsafe { SecuritySubjectContext::at(subject_context) };
     let client = context.client_token.get();
-    let token = if client != 0 && context.impersonation_level.get().0 >= SECURITY_IMPERSONATION.0 {
+    let token = if client == 0 {
+        context.primary_token.get()
+    } else if context.impersonation_level.get().0 >= SECURITY_IMPERSONATION.0 {
         client
     } else {
-        context.primary_token.get()
+        return false;
     };
     let Some(held) = tokens::with(token, |token| token.privileges.clone()) else {
         return false;

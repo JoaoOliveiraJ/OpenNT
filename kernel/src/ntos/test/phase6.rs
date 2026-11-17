@@ -14319,6 +14319,19 @@ fn se_token_assignable(assert: Assert) {
         !primary_holds_disabled || (crate::ntos::se::privilege::acquired_privilege_check(3, 1) && !crate::ntos::se::privilege::acquired_privilege_check(0x7F, 1)),
         "se-token-assignable: o privilegio presente e desabilitado no primario passa pelo RtlAcquirePrivilege",
     );
+    // SeSinglePrivilegeCheck/SePrivilegeCheck do 19041: impersonando abaixo
+    // de SecurityImpersonation nenhum privilégio passa, nem o
+    // SeChangeNotifyPrivilege habilitado do token.
+    let thread = crate::ntos::ps::process::get_current_thread();
+    let previous = crate::ntos::se::token::thread::get(thread);
+    let before = crate::ntos::se::privilege::single_privilege_check(23, 1);
+    let at_identification = identification != 0 && crate::ntos::se::token::thread::assign(thread, Some(identification), 1, false, false).is_ok() && !crate::ntos::se::privilege::single_privilege_check(23, 1);
+    let at_impersonation = sibling != 0 && crate::ntos::se::token::thread::assign(thread, Some(sibling), 2, false, false).is_ok() && crate::ntos::se::privilege::single_privilege_check(23, 1);
+    let restored = match previous {
+        Some(previous) => crate::ntos::se::token::thread::assign(thread, Some(previous.token), previous.level, previous.copy_on_open, previous.effective_only),
+        None => crate::ntos::se::token::thread::release(thread),
+    };
+    assert(before && at_identification && at_impersonation && restored.is_ok(), "se-privilege: impersonacao de identificacao nao passa no SeSinglePrivilegeCheck; de impersonacao passa");
     for token in [sibling, other_logon, higher, identification, filtered] {
         if token != 0 {
             let _ = tokens::release(token);
