@@ -344,6 +344,17 @@ fn namespace(assert: Assert) {
     let fs = om::lookup("\\FS");
     assert(fs.is_some() && om::lookup("\\??\\C:") == fs && om::lookup("\\DosDevices\\C:") == fs && om::lookup("\\GLOBAL??\\GLOBALROOT\\FS") == fs, "ob: links DOS e GLOBALROOT");
     assert(om::lookup("\\device") == om::lookup("\\Device") && om::lookup("\\Device").is_some(), "ob: resolucao sem caixa");
+    // IopCreateUmdfDirectory: diretório permanente com a DACL do SYSTEM e do
+    // serviço WudfSvc, o GENERIC_ALL mapeado pelo tipo Directory.
+    {
+        use crate::ntos::io::root_directories;
+        let umdf = om::lookup(root_directories::UMDF_DIRECTORY);
+        let expected = [crate::ntos::se::model::sid(5, &[18]), root_directories::wudf_service_sid()];
+        let dacl_ok = umdf.map(crate::ntos::se::object_security::directory).is_some_and(|policy| {
+            policy.dacl.as_ref().is_some_and(|dacl| dacl.len() == 2 && dacl.iter().zip(expected.iter()).all(|(ace, sid)| ace.sid.as_ref() == Some(sid) && ace.mask == 0xF000F && !ace.deny))
+        });
+        assert(umdf.and_then(om::node).is_some_and(|node| node.type_name == "Directory" && node.permanent == Some(true)) && dacl_ok, "io: \\UMDFCommunicationPorts permanente com a DACL do SYSTEM e do WudfSvc");
+    }
     assert(om::lookup("\\KnownDlls\\Nada").is_none(), "ob: nome inexistente");
     let (mounted, rest) = om::resolve("\\??\\C:\\hello.exe");
     assert(mounted == fs && rest.as_deref() == Some("hello.exe"), "ob: resto delegado ao volume montado");
