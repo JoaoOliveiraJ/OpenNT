@@ -2944,9 +2944,14 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   `ps/query_process.rs`, com o ProbeForRead do alinhamento de cada classe),
   a ThreadBreakOnTermination do NtSetInformationThread
   (`ps/set_thread_information.rs`) e as classes de tamanho fixo
-  SystemFlagsInformation, SystemPhysicalMemoryInformation e
+  SystemFlagsInformation, SystemPhysicalMemoryInformation,
+  SystemKernelDebuggerInformation (o KdDebuggerEnabled e o
+  KdDebuggerNotPresent, sondagem de alinhamento 1) e
   SystemHypervisorSharedPageInformation do NtQuerySystemInformation
-  (`ex/system_information.rs::query_fixed`, também no Zw). Um serviço sem
+  (`ex/system_information.rs::query_fixed`, também no Zw). O NtCreateTimer,
+  o NtSetTimer e o NtCancelTimer de modo usuário são adaptadores do ETIMER
+  do Executive (`ex/timer_object.rs`, PreviousMode UserMode, em
+  `ps/user/timer_objects.rs`). Um serviço sem
   provedor nenhum (nem handler de usuário nem export) cai na falha comum da
   tabela nativa, que devolve STATUS_NOT_IMPLEMENTED sem passar pelo
   despacho; a entrada de syscall de usuário avisa uma vez por serviço
@@ -3057,15 +3062,20 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   LsaLookupGetDomainInfo do ScGetAccountDomainInfo). A chamada passa pela
   identidade do cliente (o ALPC_TOKEN_ATTR) e pelo NtAccessCheck do
   descritor da interface, e a resposta volta pelo envio adiado do worker
-  factory. Ali para: o encaminhador do lsass.exe (LsaLookuprOpenPolicy2)
-  responde STATUS_NOT_IMPLEMENTED, porque a extensão de consulta do lsasrv
-  (o gLsapLookupExtension, que o LsapLsaExtensionLoad registra pelo
-  LsaRegisterExtension depois do LsapInitLsa) está vazia. O SvcctrlMain do
-  services.exe sai pelo caminho de erro: o ScesrvTerminateServer carrega o
-  scesrv.dll e o processo termina com código 0, antes do
-  ScEnableRpcInterface e do início automático; o svchost do LSM não é
-  criado. O mapeamento do scesrv.dll não esgota mais o heap do kernel (as
-  seções de imagem, acima). O smss da
+  factory. Com o LSA inicializado (o LsapStartLsa registra a extensão de
+  consulta do lsasrv), o ScGetAccountDomainInfo passa e o SvcctrlMain
+  segue: o ScEnableRpcInterface publica o `\RPC Control\ntsvcs` e o
+  `\pipe\ntsvcs` (`SERVICES_STARTED`; a imitação do gerenciador de serviços
+  do kernel fica desligada nesse boot), o servidor do SCE do scesrv.dll
+  sobe o `\pipe\scerpc` e o InitWudfDriverManager carrega o
+  WUDFPlatform.dll, lê a chave WUDF da SOFTWARE, cria um ETIMER de modo
+  usuário (NtCreateTimer) e a porta ALPC
+  `\UMDFCommunicationPorts\ProcessManagement`, no diretório que o kernel
+  cria no IopCreateRootDirectories (`io/root_directories.rs`). O
+  ScAutoStartServices roda até o fim e a thread principal sai pelo
+  ExitThread do SvcctrlMain, mas nenhum serviço da cadeia do LSM é
+  iniciado: o conjunto de início das duas fases fica vazio e nenhum
+  svchost é criado. O smss da
   sessão 1 cria o csrss e o winlogon.exe (o NtOpenSection relativo ao
   `\KnownDlls`, aberto pela tabela do Object Manager, e o powrprof.dll e o
   imm32.dll no volume); o NtUserInitialize do csrss da sessão 1 volta com
@@ -3196,7 +3206,15 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   e as DLLs que o lsasrv carrega (os pacotes de segurança e as cargas
   atrasadas deles, `xtask/src/windows_binaries.rs`). O lsasrv levanta um
   erro grave (o LsapNotifyInitializationFinish) quando um desses passos
-  falha.
+  falha. As hives SAM e SECURITY do convidado saem vazias, como as de um
+  sistema novo (`cm/seed.rs`), e o lsass cria os bancos dele no primeiro
+  boot: o samsrv só cria o banco de contas fora da instalação do Windows
+  com o `Control\Lsa` `CreatePolicyDatabaseOnFirstBoot` diferente de zero
+  (o SampSKUAllowsHiveCreation), que o xtask grava na chave do LSA copiada
+  desta máquina. O RpcServerRegisterAuthInfo do lsass lê os provedores de
+  autenticação do RPC em `SOFTWARE\Microsoft\Rpc\SecurityService`, também
+  copiado. O marcador `LSA_POLICY_READY` sai quando o lsass publica o
+  `\RPC Control\LSARPC_ENDPOINT` (o LsapRPCInit).
 - **O RPC local entre o services.exe e o lsass.exe**: um pedido a um
   servidor ALPC de modo usuário (`alpc/server.rs`) chega com o MessageId do
   servidor. O NtAlpcQueryInformationMessage das classes de token
