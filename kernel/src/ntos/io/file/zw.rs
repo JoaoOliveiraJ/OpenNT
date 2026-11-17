@@ -320,11 +320,17 @@ pub fn create_kernel_file_with_context(output: u64, desired_access: u32, attribu
         }
     }
     if device_node {
-        let opened = io_manager::open_device(&object_name, true);
-        let Ok(opened) = opened.map_err(|_| ()).and_then(|opened| if opened.status == 0 { Ok(opened) } else { Err(()) }) else {
+        let Ok(opened) = io_manager::open_device(&object_name, true) else {
             write_io_status(io_status, STATUS_OBJECT_NAME_NOT_FOUND, 0);
             return Ok(STATUS_OBJECT_NAME_NOT_FOUND);
         };
+        // Como o IopParseDevice, um IRP_MJ_CREATE recusado devolve o status
+        // que o driver deu (STATUS_DEVICE_NOT_READY, STATUS_ACCESS_DENIED...).
+        if opened.status != 0 {
+            let status = opened.status as u32;
+            write_io_status(io_status, status, opened.information);
+            return Ok(status);
+        }
         // SAFETY: FILE_OBJECT vivo devolvido pelo open_device.
         unsafe { FileObject::at(opened.file_object) }.flags.atomic().fetch_or(option_flags(options), core::sync::atomic::Ordering::SeqCst);
         let entry = FileEntry { backing: Backing::Device { path: object_name, handle: opened.handle }, file_object: opened.file_object, access, share: share_access, options, owner_process, attributes: open_flags & 2, kernel_handle: open_flags & 0x200 != 0, binding: None, closed: false, scan_index: None };

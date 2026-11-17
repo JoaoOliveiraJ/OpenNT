@@ -182,6 +182,20 @@ extern "win64" fn test_power_dispatch(_device: u64, _packet: u64) -> u64 {
     0x103
 }
 
+/// IRP_MJ_CREATE como o do KMDF para um EvtDeviceFileCreate: IoMarkIrpPending,
+/// a conclusão com sucesso (FILE_OPENED) dentro do despacho e STATUS_PENDING.
+extern "win64" fn test_pending_create_dispatch(device: u64, packet: u64) -> u64 {
+    const SL_PENDING_RETURNED: u8 = 0x01;
+    record(0, device);
+    let irp = unsafe { Irp::at(packet) };
+    let location = unsafe { IoStackLocation::at(irp.tail.overlay.current_stack_location.get()) };
+    location.control.set(location.control.get() | SL_PENDING_RETURNED);
+    irp.io_status.status.set(0);
+    irp.io_status.information.set(1);
+    crate::ntos::io::io_manager::iof_complete_request(packet);
+    0x103
+}
+
 extern "win64" fn test_completion(device: u64, _packet: u64, context: u64) -> u64 {
     record(1, context);
     record(2, device);
@@ -403,6 +417,17 @@ fn io_manager_devices(assert: Assert) {
     let related = if stacked.file_object != 0 { crate::ntos::io::file::information::related_device_object(stacked.file_object).unwrap_or(0) } else { 0 };
     assert(stacked.status == 0 && file_device == named_device && named.reference_count.get() == 1 && upper.reference_count.get() == 0 && seen(0) == upper_device && related == upper_device, "iomdev: FILE_OBJECT.DeviceObject e o dispositivo do nome e o CREATE vai ao topo da pilha");
     assert(matches!(iom::close_device(stacked.handle), Ok(0)) && named.reference_count.get() == 0, "iomdev: o CLOSE solta a referencia do dispositivo do nome");
+    // Um CREATE que o driver devolve com STATUS_PENDING (o KMDF faz isso com
+    // todo create que entrega ao EvtDeviceFileCreate): como o IopParseDevice,
+    // a abertura espera a conclusão do IRP e fica com o status final.
+    major_function(driver_object, irp_mj::CREATE, test_pending_create_dispatch as extern "win64" fn(u64, u64) -> u64 as usize as u64);
+    record(0, 0);
+    let pending = iom::open_device("\\Device\\Phase4Stacked", false).unwrap_or(iom::Opened { status: -1, handle: 0, file_object: 0, information: 0 });
+    assert(pending.status == 0 && pending.handle != 0 && pending.information == 1 && seen(0) == upper_device, "iomdev: CREATE pendente concluido no despacho abre com o status final");
+    if pending.handle != 0 {
+        let _ = iom::close_device(pending.handle);
+    }
+    major_function(driver_object, irp_mj::CREATE, test_read_dispatch as extern "win64" fn(u64, u64) -> u64 as usize as u64);
     let _ = om::unlink("\\Device\\Phase4Stacked");
     guest::free_bytes(named_device);
     guest::free_bytes(upper_device);

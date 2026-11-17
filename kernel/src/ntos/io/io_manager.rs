@@ -1002,9 +1002,11 @@ fn file_object_flags(create: &CreateParameters) -> u32 {
 /// para o próprio dispositivo) no dispositivo `path`: o FILE_OBJECT com o
 /// nome e o IRP_MJ_CREATE com a thread que abre e, com `create`, o contexto
 /// de segurança e as opções (o IopParseDevice). O Information do IRP (FILE_OPENED,
-/// FILE_CREATED...) volta em `Opened::information`.
+/// FILE_CREATED...) volta em `Opened::information`. Como no IopParseDevice,
+/// um STATUS_PENDING do driver espera a conclusão do IRP: o KMDF devolve
+/// STATUS_PENDING de todo create que entrega ao EvtDeviceFileCreate.
 pub fn open_device_file(path: &str, name: &str, create: Option<CreateParameters>, external_handles: bool) -> Result<Opened, KernelError> {
-    open_file_object(path, name, 0, create, external_handles, false)
+    open_file_object(path, name, 0, create, external_handles)
 }
 
 /// A abertura por nome do ZwCreateFile de modo kernel, como o
@@ -1014,10 +1016,10 @@ pub fn open_device_file(path: &str, name: &str, create: Option<CreateParameters>
 /// (Tail.Overlay.Thread) e a espera de um STATUS_PENDING do driver até a
 /// conclusão do IRP.
 pub fn open_related_device_file(path: &str, name: &str, related_file_object: u64, create: Option<CreateParameters>, external_handles: bool) -> Result<Opened, KernelError> {
-    open_file_object(path, name, related_file_object, create, external_handles, true)
+    open_file_object(path, name, related_file_object, create, external_handles)
 }
 
-fn open_file_object(path: &str, name: &str, related_file_object: u64, create: Option<CreateParameters>, external_handles: bool, parse: bool) -> Result<Opened, KernelError> {
+fn open_file_object(path: &str, name: &str, related_file_object: u64, create: Option<CreateParameters>, external_handles: bool) -> Result<Opened, KernelError> {
     let Some(node) = lookup_device(path) else {
         return Ok(Opened { status: status::NOT_FOUND, handle: 0, file_object: 0, information: 0 });
     };
@@ -1034,8 +1036,8 @@ fn open_file_object(path: &str, name: &str, related_file_object: u64, create: Op
     if let Some(create) = &create {
         object.flags.set(object.flags.get() | file_object_flags(create));
     }
-    let event = if parse { guest::alloc_bytes(0x18) } else { 0 };
-    if parse && event == 0 {
+    let event = guest::alloc_bytes(0x18);
+    if event == 0 {
         let _ = file_objects::dereference(file_object);
         return Err(KernelError::with_status("IRP_MJ_CREATE sem memoria para o evento", 0xC000_009A));
     }
@@ -1046,19 +1048,15 @@ fn open_file_object(path: &str, name: &str, related_file_object: u64, create: Op
     // IoGetRequestorProcess dos drivers (o hidclass.sys recusa a abertura de
     // uma coleção sem a sessão de quem pede) leem dela.
     let mut parameters = IoParams { create, requestor_mode: user_mode as u8, thread: process::get_current_thread(), ..IoParams::default() };
-    if parse {
-        dispatcher::initialize_event(event, 0, false);
-        parameters.user_event = event;
-    }
+    dispatcher::initialize_event(event, 0, false);
+    parameters.user_event = event;
     let mut request = make_io_request(major, parameters);
     request.file_object = file_object;
     let called = call_driver(path, &mut request);
-    if parse && called.is_ok() && request.status == status::PENDING && request.pending_irp != 0 {
+    if called.is_ok() && request.status == status::PENDING && request.pending_irp != 0 {
         wait_pending_io_request(&mut request, 0);
     }
-    if event != 0 {
-        guest::free_bytes(event);
-    }
+    guest::free_bytes(event);
     called?;
     if request.status != status::SUCCESS {
         let _ = file_objects::dereference(file_object);
