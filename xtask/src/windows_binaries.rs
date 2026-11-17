@@ -413,6 +413,13 @@ const SMSS_PROGRAMS: &[&str] = &[
     "WUDFPlatform.dll",
 ];
 
+/// Os outros serviços do grupo DcomLaunch do svchost (o mesmo processo do
+/// LSM), pelo mapa da cadeia (`docs/mapa-cadeia.md`): o umpo.dll do serviço
+/// Power, o psmsrv.dll do BrokerInfrastructure e o
+/// SystemEventsBrokerServer.dll do SystemEventsBroker, com o brokerlib.dll
+/// que ele importa. Os imports estáticos deles já estão no volume.
+const SERVICE_CHAIN_PROGRAMS: &[&str] = &["umpo.dll", "psmsrv.dll", "SystemEventsBrokerServer.dll", "brokerlib.dll"];
+
 /// As imagens de kernel do caminho do smss (`--initial-process=smss`): o
 /// win32k.sys que o smss da sessão carrega pela classe 38, o win32kbase.sys
 /// e o win32kfull.sys que ele carrega como imagens de sessão e o cdd.dll (o
@@ -626,7 +633,7 @@ pub fn ntfs_files(root: &Path, kernel_pe: &[u8], initial_process: &str) -> Resul
     println!("tabelas NLS no volume NTFS: {nls}");
     if initial_process == "smss" {
         let mut staged = 0;
-        for name in SMSS_PROGRAMS {
+        for name in SMSS_PROGRAMS.iter().chain(SERVICE_CHAIN_PROGRAMS) {
             let source = system32.join(name);
             match fs::read(&source) {
                 Ok(bytes) => {
@@ -637,7 +644,7 @@ pub fn ntfs_files(root: &Path, kernel_pe: &[u8], initial_process: &str) -> Resul
                 Err(_) => println!("AVISO: {} ausente no Windows desta maquina", source.display()),
             }
         }
-        println!("programas de modo usuario do smss no volume NTFS: {staged} de {}", SMSS_PROGRAMS.len());
+        println!("programas de modo usuario do smss no volume NTFS: {staged} de {}", SMSS_PROGRAMS.len() + SERVICE_CHAIN_PROGRAMS.len());
         let mut images = 0;
         for (name, relative) in SMSS_KERNEL_IMAGES {
             let source = windows.join(relative);
@@ -655,7 +662,7 @@ pub fn ntfs_files(root: &Path, kernel_pe: &[u8], initial_process: &str) -> Resul
         // carregador de recursos procura pelo idioma do convidado (o mesmo
         // daqui, `host_language`).
         let languages = crate::host_language::ui_languages();
-        let names = SMSS_PROGRAMS.iter().copied().chain(SMSS_KERNEL_IMAGES.iter().filter_map(|(_, relative)| relative.strip_prefix("System32/").filter(|rest| !rest.contains('/'))));
+        let names = SMSS_PROGRAMS.iter().chain(SERVICE_CHAIN_PROGRAMS).copied().chain(SMSS_KERNEL_IMAGES.iter().filter_map(|(_, relative)| relative.strip_prefix("System32/").filter(|rest| !rest.contains('/'))));
         let mut resources = 0;
         for name in names {
             for (path, source) in crate::host_language::mui_files(&system32, name, &languages) {
