@@ -3771,6 +3771,50 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   velha era reenviada a cada espera (STATUS_INVALID_PARAMETER ou
   STATUS_REPLY_MESSAGE_MISMATCH, e uma resposta velha podia chegar a um
   pedido novo com o mesmo MessageId).
+- **O ALPC dos servidores de modo usuário** (`alpc/server.rs`,
+  `alpc/message/view.rs`, adaptadores em `ps/user/alpc.rs`), no que o LRPC
+  do rpcrt4 usa:
+  - a associação da IOCP (NtAlpcSetInformation classe 2) posta um pacote
+    para cada mensagem que já estava na fila da porta de conexão, como o
+    AlpcpAssociateIoCompletionPort: o rpcrt4 cria a porta com nome antes de
+    associar o pool, e uma conexão que chega nesse intervalo esperava para
+    sempre;
+  - o atributo de vista leva as mensagens grandes (pedidos acima de 0xF98
+    bytes, respostas acima de 0xFC0): o envio acha a seção pelo handle e a
+    vista pela base na porta de quem envia; a recepção mapeia a mesma região
+    no processo de quem recebe, registrada na porta de conexão do servidor
+    (ou na porta do cliente, para a resposta), que a apaga pelo
+    NtAlpcDeleteSectionView; a resposta com UNMAP_EXISTING apaga a vista que
+    o pedido trouxe ao servidor, e o reenvio da resposta recebida com
+    UNMAP_EXISTING apaga a do cliente. NtAlpcDeleteSectionView e
+    NtAlpcDeletePortSection existem em modo usuário;
+  - a sequência do ALPC_CONTEXT_ATTR e do AlpcBasicInformation conta por
+    porta de comunicação do servidor (pedidos, datagramas e o
+    LPC_PORT_CLOSED do cliente; uma conexão conta na porta de conexão), que
+    é o que o rpcrt4 compara para liberar a associação de um cliente que
+    fechou;
+  - o contexto de segurança e os handles do envio chegam ao servidor: o
+    ALPC_SECURITY_ATTR com o ContextHandle do cliente, o ALPC_HANDLE_ATTR
+    pelas regras da porta de comunicação (o Flags e o DupObjectTypes do
+    NtAlpcAcceptConnectPort; com ALLOW_MULTIHANDLE_ATTRIBUTE, o número de
+    handles e a classe 3 do NtAlpcQueryInformationMessage para cada um), o
+    ALPC_TOKEN_ATTR e as classes de token pelo token do contexto, e o
+    NtAlpcImpersonateClientOfPort impersona o token capturado no contexto;
+  - todo pedido sem RELEASE_MESSAGE chega com LPC_CONTINUATION_REQUIRED
+    (os assíncronos também), e a desconexão ou o fechamento da porta de
+    comunicação pelo servidor termina com STATUS_PORT_DISCONNECTED os
+    pedidos que o cliente espera e os envios seguintes dele;
+  - o RequiredServerSid do NtAlpcConnectPort é comparado com o usuário do
+    token primário do dono da porta de conexão, e o descritor do
+    NtAlpcConnectPortEx com o mesmo token (MAXIMUM_ALLOWED); a recusa é
+    STATUS_SERVER_SID_MISMATCH;
+  - a segurança da porta segue o ObInsertObject: uma porta com nome exige
+    DIRECTORY_CREATE_OBJECT no diretório pai; sem descritor no
+    OBJECT_ATTRIBUTES, recebe as ACEs herdáveis do pai (num `\RPC Control`,
+    Everyone e RESTRICTED com PORT_CONNECT); a conexão de modo usuário passa
+    pelo SeAccessCheck de PORT_CONNECT contra o descritor atual da porta
+    (STATUS_ACCESS_DENIED, com uma linha `[alpc] PORT_CONNECT ... recusado`
+    no log).
 - **Os tokens de logon** (`se/token/create.rs`, `se/token/set_information.rs`):
   o NtCreateToken e o NtCreateTokenEx do LSA (SeCreateTokenPrivilege
   habilitado, TokenType, o nível pelo QoS num token de impersonação, a sessão
