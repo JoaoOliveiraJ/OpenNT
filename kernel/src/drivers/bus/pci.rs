@@ -170,12 +170,26 @@ pub fn create_root_bus() -> Result<u64, KernelError> {
     Ok(pdo)
 }
 
-/// Mede um BAR: escreve 1s, lê a máscara e restaura, numa transação.
+/// Bits do registrador de comando (offset 0x04) da configuração PCI.
+const COMMAND_IO_SPACE: u32 = 0x0001;
+const COMMAND_MEMORY_SPACE: u32 = 0x0002;
+const COMMAND_BUS_MASTER: u32 = 0x0004;
+const COMMAND_INTERRUPT_DISABLE: u32 = 0x0400;
+
+/// Mede um BAR numa transação: desliga a decodificação de I/O e de memória e
+/// o bus master e mascara o INTx no comando, como o PciPreScanDisconnectDevice
+/// do pci.sys antes de medir os BARs; escreve 1s, lê a máscara e restaura o
+/// BAR e o comando. Com a decodificação ligada, o BAR com 1s responderia no
+/// topo dos 4 GB, por cima da ROM do BIOS e de outros dispositivos, enquanto
+/// dura a medida (no QEMU com WHPX, o remapeamento da ROM falha e o boot para).
 fn size_bar(bus: u32, device: u32, function: u32, offset: u32, original: u32) -> Result<u32, KernelError> {
     let mask = pci_config::transaction(bus, device, function, |io| {
+        let command = io.read(0x04, 2)?;
+        io.write(0x04, 2, (command & !(COMMAND_IO_SPACE | COMMAND_MEMORY_SPACE | COMMAND_BUS_MASTER)) | COMMAND_INTERRUPT_DISABLE)?;
         io.write(offset, 4, 0xFFFF_FFFF)?;
         let mask = io.read(offset, 4);
         io.write(offset, 4, original)?;
+        io.write(0x04, 2, command)?;
         mask
     })?;
     if mask == 0 || mask == 0xFFFF_FFFF {
