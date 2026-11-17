@@ -58,12 +58,19 @@ pub enum BreakpointKind {
     /// (thread, com `:pid` opcional) e `ld:processo!dll` (carga de uma DLL
     /// num processo; `*` vale qualquer processo).
     Event,
+    /// Breakpoint de memória por página (`monitor membp`): qualquer acesso,
+    /// escrita ou execução numa página do processo, pelo bit reservado da
+    /// entrada da tabela de páginas (a proteção que o processo consulta não
+    /// muda).
+    MemoryAccess,
+    MemoryWrite,
+    MemoryExecute,
 }
 
 impl BreakpointKind {
     fn packet_type(self) -> u8 {
         match self {
-            Self::Software | Self::Module | Self::Event => 0,
+            Self::Software | Self::Module | Self::Event | Self::MemoryAccess | Self::MemoryWrite | Self::MemoryExecute => 0,
             Self::Hardware => 1,
             Self::Write => 2,
             Self::Access => 4,
@@ -78,6 +85,9 @@ impl BreakpointKind {
             Self::Access => "acesso",
             Self::Module => "carga de modulo",
             Self::Event => "evento",
+            Self::MemoryAccess => "memoria-acesso",
+            Self::MemoryWrite => "memoria-escrita",
+            Self::MemoryExecute => "memoria-execucao",
         }
     }
 
@@ -89,8 +99,25 @@ impl BreakpointKind {
             "acesso" => Self::Access,
             "modulo" | "carga de modulo" => Self::Module,
             "evento" => Self::Event,
+            "memoria-acesso" => Self::MemoryAccess,
+            "memoria-escrita" => Self::MemoryWrite,
+            "memoria-execucao" => Self::MemoryExecute,
             _ => return None,
         })
+    }
+
+    /// O breakpoint de memória por página (o `membp` do alvo).
+    pub fn is_memory(self) -> bool {
+        matches!(self, Self::MemoryAccess | Self::MemoryWrite | Self::MemoryExecute)
+    }
+
+    /// A letra do `membp` (a, w, x).
+    fn memory_letter(self) -> &'static str {
+        match self {
+            Self::MemoryWrite => "w",
+            Self::MemoryExecute => "x",
+            _ => "a",
+        }
     }
 
     /// O nome curto do arquivo de sessão.
@@ -100,6 +127,27 @@ impl BreakpointKind {
             other => other.name(),
         }
     }
+}
+
+/// O que um breakpoint faz num acerto, além de parar: as opções do editor
+/// de breakpoints (nome, condições de log e de comando, uma vez só, sem
+/// a linha de acerto no log e o retorno rápido).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BreakpointOptions {
+    pub name: String,
+    /// O log só sai quando esta condição der diferente de zero (vazia =
+    /// sempre).
+    pub log_condition: String,
+    /// Os comandos só rodam quando esta condição der diferente de zero
+    /// (vazia = quando o breakpoint para).
+    pub command_condition: String,
+    /// Some depois da primeira parada.
+    pub single_shot: bool,
+    /// Sem a linha `[bp #n] acerto` no log.
+    pub silent: bool,
+    /// Quando não para, segue na hora: sem reler os módulos nem a linha de
+    /// acerto.
+    pub fast_resume: bool,
 }
 
 /// Um breakpoint do cliente: desligado, continua na lista mas sai do alvo.
@@ -130,6 +178,7 @@ pub struct Breakpoint {
     /// O EPROCESS do processo dono de um breakpoint de usuário (0 = o espaço
     /// do processador).
     pub process: u64,
+    pub options: BreakpointOptions,
 }
 
 /// O que pedir num breakpoint novo.
@@ -148,12 +197,17 @@ pub struct BreakpointRequest {
     pub group: String,
     /// O EPROCESS dono (0 = o processo escolhido no momento, se houver).
     pub process: u64,
+    pub options: BreakpointOptions,
 }
 
 impl BreakpointRequest {
     pub fn new(kind: BreakpointKind, expression: &str) -> Self {
-        let length = if matches!(kind, BreakpointKind::Write | BreakpointKind::Access) { 8 } else { 1 };
-        Self { kind, expression: expression.trim().to_string(), length, condition: String::new(), pass_count: 0, deferred: false, enabled: true, log: String::new(), command: String::new(), group: String::new(), process: 0 }
+        let length = match kind {
+            BreakpointKind::Write | BreakpointKind::Access => 8,
+            kind if kind.is_memory() => 0x1000,
+            _ => 1,
+        };
+        Self { kind, expression: expression.trim().to_string(), length, condition: String::new(), pass_count: 0, deferred: false, enabled: true, log: String::new(), command: String::new(), group: String::new(), process: 0, options: BreakpointOptions::default() }
     }
 }
 
@@ -234,6 +288,12 @@ pub struct Client {
     event_hooks: Vec<(u64, &'static str, bool)>,
     /// Saída dos breakpoints de log e dos comandos de parada.
     pub(crate) log_lines: Vec<String>,
+    /// Os comandos do breakpoint que parou a máquina (a condição de comando
+    /// já conferida).
+    pending_commands: Option<(u32, String)>,
+    /// O breakpoint de uma vez só que acabou de parar (sai no fim da
+    /// parada).
+    single_shot: Option<u32>,
 }
 
 impl ReadMemory for Client {
@@ -336,6 +396,8 @@ impl Client {
             process_context: None,
             event_hooks: Vec::new(),
             log_lines: Vec::new(),
+            pending_commands: None,
+            single_shot: None,
         }
     }
 
@@ -433,9 +495,12 @@ impl Client {
                 let _ = self.request(&format!("z0,{:x},1", run_to.address));
             }
         }
+        self.pending_commands = None;
         // Módulos carregados desde a última parada entram nos símbolos (a
-        // primeira parada, a do attach, ainda não tem o ELF carregado).
-        if !self.symbols.modules.is_empty() {
+        // primeira parada, a do attach, ainda não tem o ELF carregado). Um
+        // breakpoint de retorno rápido não espera essa releitura.
+        let fast = stop.reasons.contains(&Reason::SoftwareBreak) && self.register("rip").is_ok_and(|rip| self.fast_resume_at(rip));
+        if !self.symbols.modules.is_empty() && !fast {
             let _ = self.reload_modules();
         }
         let mut note = String::new();
@@ -447,6 +512,11 @@ impl Client {
                 }
                 Hit::Stop(text) => note = text,
                 Hit::None => {}
+            }
+        }
+        if let Some(id) = self.single_shot.take() {
+            if self.remove_breakpoint(id).is_ok() {
+                note.push_str(" (breakpoint de uma vez so removido)");
             }
         }
         self.last_stop = format!("{}{note} [{}]", self.describe_stop(&stop), packet);
@@ -513,37 +583,99 @@ impl Client {
             Reason::Watch { address, .. } => Some(*address),
             _ => None,
         });
+        let memory = stop.reasons.iter().find_map(|reason| match reason {
+            Reason::Memory { address } => Some(*address),
+            _ => None,
+        });
         let hardware = stop.reasons.contains(&Reason::HardwareBreak);
         let index = self.breakpoints.iter().position(|breakpoint| {
             breakpoint.enabled
                 && !breakpoint.pending
                 && match breakpoint.kind {
                     BreakpointKind::Software => software && breakpoint.address == rip,
-                    BreakpointKind::Hardware => hardware && breakpoint.address == rip,
-                    BreakpointKind::Write | BreakpointKind::Access => watched == Some(breakpoint.address),
+                    BreakpointKind::Hardware => hardware && memory.is_none() && breakpoint.address == rip,
+                    BreakpointKind::Write | BreakpointKind::Access => memory.is_none() && watched == Some(breakpoint.address),
+                    BreakpointKind::MemoryAccess | BreakpointKind::MemoryWrite | BreakpointKind::MemoryExecute => memory.is_some_and(|address| address >= breakpoint.address && address < breakpoint.address + breakpoint.length.max(1)),
                     BreakpointKind::Module | BreakpointKind::Event => false,
                 }
         });
-        let Some(index) = index else { return Hit::None };
+        let Some(index) = index else {
+            // Um acesso à página vigiada fora da faixa pedida: segue.
+            if memory.is_some() && self.breakpoints.iter().any(|breakpoint| breakpoint.enabled && breakpoint.kind.is_memory()) {
+                return Hit::Continue;
+            }
+            return Hit::None;
+        };
         self.breakpoints[index].hits += 1;
         let breakpoint = self.breakpoints[index].clone();
         if breakpoint.pass_count > 1 && breakpoint.hits < breakpoint.pass_count {
             return Hit::Continue;
         }
-        let mut text = format!(" (breakpoint #{}, acerto {})", breakpoint.id, breakpoint.hits);
-        if !breakpoint.condition.trim().is_empty() {
+        let options = breakpoint.options.clone();
+        let label = if options.name.is_empty() { format!("#{}", breakpoint.id) } else { format!("#{} {}", breakpoint.id, options.name) };
+        let mut text = format!(" (breakpoint {label}, acerto {})", breakpoint.hits);
+        // A condição de parada; sem ela, um breakpoint com log só registra
+        // (o `/log` do prompt).
+        let stop_now = if breakpoint.condition.trim().is_empty() {
+            breakpoint.log.trim().is_empty()
+        } else {
             match self.evaluate(&breakpoint.condition) {
-                Ok(0) => return Hit::Continue,
-                Ok(_) => text = format!(" (breakpoint #{}, condicao verdadeira, acerto {})", breakpoint.id, breakpoint.hits),
-                Err(error) => return Hit::Stop(format!(" (breakpoint #{}: erro na condicao: {error})", breakpoint.id)),
+                Ok(0) => false,
+                Ok(_) => {
+                    text = format!(" (breakpoint {label}, condicao verdadeira, acerto {})", breakpoint.hits);
+                    true
+                }
+                Err(error) => return Hit::Stop(format!(" (breakpoint {label}: erro na condicao: {error})")),
             }
-        }
-        if !breakpoint.log.trim().is_empty() {
-            let line = format!("[bp #{}] {}", breakpoint.id, self.format_log(&breakpoint.log));
+        };
+        let condition_true = |client: &mut Client, condition: &str, default: bool| if condition.trim().is_empty() { default } else { client.evaluate(condition).map(|value| value != 0).unwrap_or(true) };
+        if !breakpoint.log.trim().is_empty() && condition_true(self, &options.log_condition, true) {
+            let line = format!("[bp {label}] {}", self.format_log(&breakpoint.log));
             self.push_log(line);
+        }
+        let run_commands = !breakpoint.command.trim().is_empty() && condition_true(self, &options.command_condition, stop_now);
+        if !stop_now {
+            if run_commands {
+                self.run_hit_commands(breakpoint.id, &breakpoint.command);
+            }
+            if !options.silent && !options.fast_resume && breakpoint.log.trim().is_empty() {
+                let line = format!("[bp {label}] acerto {} em {:#x} {} (segue)", breakpoint.hits, rip, self.symbols.describe(rip));
+                self.push_log(line);
+            }
             return Hit::Continue;
         }
+        if !options.silent {
+            let line = format!("[bp {label}] acerto {} em {:#x} {}", breakpoint.hits, rip, self.symbols.describe(rip));
+            self.push_log(line);
+        }
+        if run_commands {
+            self.pending_commands = Some((breakpoint.id, breakpoint.command.clone()));
+        }
+        if options.single_shot {
+            self.single_shot = Some(breakpoint.id);
+        }
         Hit::Stop(text)
+    }
+
+    /// Os comandos de um acerto que não para: rodam aqui mesmo (os que
+    /// fariam a máquina seguir ficam de fora), com a saída no log.
+    fn run_hit_commands(&mut self, id: u32, commands: &str) {
+        for command in commands.split(';').map(str::trim).filter(|command| !command.is_empty()) {
+            let word = command.split_whitespace().next().unwrap_or("");
+            if matches!(word, "g" | "c" | "continue" | "p" | "t" | "s" | "step" | "gu" | "trace" | "detach" | "q" | "quit") {
+                continue;
+            }
+            let output = match self.execute(command) {
+                Ok(text) => text,
+                Err(error) => format!("erro: {error}"),
+            };
+            self.push_log(format!("[bp #{id}] > {command}\n{}", output.trim_end()));
+        }
+    }
+
+    /// Um breakpoint de software ligado em `address` com o retorno rápido.
+    fn fast_resume_at(&self, address: u64) -> bool {
+        !self.hook_at(address) && !self.event_hooks.iter().any(|(hook, _, _)| *hook == address) && self.breakpoints.iter().any(|breakpoint| breakpoint.enabled && breakpoint.kind == BreakpointKind::Software && breakpoint.address == address && breakpoint.options.fast_resume)
     }
 
     /// Um texto de breakpoint de log: cada `{expr}` vira o valor (`{expr:d}`
@@ -754,6 +886,46 @@ impl Client {
             return Err(format!("{name}: {reply}"));
         }
         registers::parse_little_endian(&reply).ok_or_else(|| format!("{name} indisponivel"))
+    }
+
+    /// O x87, o SSE, a metade alta dos YMM e os registradores de depuração
+    /// do processador escolhido (os do `g` e as extensões do OpenNT por
+    /// `p`; o que o alvo não tem fica `None`).
+    pub fn extended_registers(&mut self) -> Result<registers::ExtendedState, String> {
+        self.general_registers()?;
+        let mut state = registers::parse_extended(self.registers.as_deref().unwrap_or(""));
+        let read = |client: &mut Client, number: usize| -> Option<Vec<u8>> {
+            let reply = client.request(&format!("p{number:x}")).ok()?;
+            (!reply.is_empty() && !reply.starts_with('E') && !reply.contains('x')).then(|| unhex(&reply))
+        };
+        // Sem resposta ao primeiro YMM (alvo sem a extensão ou sem AVX), os
+        // outros nem são pedidos.
+        if let Some(first) = read(self, registers::YMM_HIGH_FIRST) {
+            state.ymm_high[0] = first.try_into().ok();
+            for index in 1..16 {
+                state.ymm_high[index] = read(self, registers::YMM_HIGH_FIRST + index).and_then(|bytes| bytes.try_into().ok());
+            }
+        }
+        for (index, layout) in registers::DEBUG.iter().enumerate() {
+            state.debug[index] = read(self, layout.number).map(|bytes| {
+                let mut value = [0u8; 8];
+                value[..bytes.len().min(8)].copy_from_slice(&bytes[..bytes.len().min(8)]);
+                u64::from_le_bytes(value)
+            });
+        }
+        Ok(state)
+    }
+
+    /// Grava bytes num registrador pelo número do protocolo (XMM, ST).
+    pub fn write_register_bytes(&mut self, number: usize, bytes: &[u8]) -> Result<(), String> {
+        self.require_stopped()?;
+        let reply = self.request(&format!("P{number:x}={}", hex(bytes)))?;
+        self.registers = None;
+        if reply == "OK" {
+            Ok(())
+        } else {
+            Err(format!("registrador {number}: {reply}"))
+        }
     }
 
     /// Grava um registrador do processador escolhido.
@@ -1021,6 +1193,17 @@ impl Client {
         if switch {
             self.monitor(&format!(".process {process:#x}"))?;
         }
+        if kind.is_memory() {
+            // O breakpoint de memória por página vai pelo `monitor membp`.
+            let command = if insert { format!("membp set {address:#x} {length:#x} {}", kind.memory_letter()) } else { format!("membp clear {address:#x}") };
+            let result = self.monitor(&command);
+            if switch {
+                let restore = self.process_context.as_ref().map_or("0".to_string(), |context| format!("{:#x}", context.eprocess));
+                let _ = self.monitor(&format!(".process {restore}"));
+            }
+            let text = result?;
+            return if text.contains("membp ok") { Ok(()) } else { Err(format!("breakpoint de memoria em {address:#x}: {}", text.trim())) };
+        }
         let reply = self.request(&format!("{}{},{:x},{:x}", if insert { 'Z' } else { 'z' }, kind.packet_type(), address, length));
         if switch {
             let restore = self.process_context.as_ref().map_or("0".to_string(), |context| format!("{:#x}", context.eprocess));
@@ -1085,9 +1268,18 @@ impl Client {
             }
             Err(error) => return Err(error),
         };
+        // O breakpoint de memória vale por página inteira.
+        let (address, length) = if kind.is_memory() {
+            let start = address & !0xFFF;
+            let end = (address + request.length.max(1) + 0xFFF) & !0xFFF;
+            (start, end - start)
+        } else {
+            (address, request.length)
+        };
         if let Some(index) = self.breakpoints.iter().position(|breakpoint| breakpoint.kind == kind && breakpoint.address == address && !breakpoint.pending) {
             if !self.breakpoints[index].enabled && request.enabled {
-                self.insert(kind, address, self.breakpoints[index].length, true)?;
+                let (length, process) = (self.breakpoints[index].length, self.breakpoints[index].process);
+                self.insert_in(kind, address, length, true, process)?;
                 self.breakpoints[index].enabled = true;
             }
             self.breakpoints[index].condition = request.condition.clone();
@@ -1095,6 +1287,7 @@ impl Client {
             self.breakpoints[index].log = request.log.clone();
             self.breakpoints[index].command = request.command.clone();
             self.breakpoints[index].group = request.group.clone();
+            self.breakpoints[index].options = request.options.clone();
             return Ok(self.breakpoints[index].clone());
         }
         let process = if request.process != 0 {
@@ -1105,14 +1298,35 @@ impl Client {
             0
         };
         if request.enabled {
-            self.insert_in(kind, address, request.length, true, process)?;
+            self.insert_in(kind, address, length, true, process)?;
         }
         let mut breakpoint = self.push_breakpoint(request, address, false);
         if let Some(entry) = self.breakpoints.iter_mut().find(|entry| entry.id == breakpoint.id) {
             entry.process = process;
+            entry.length = length;
             breakpoint.process = process;
+            breakpoint.length = length;
         }
         Ok(breakpoint)
+    }
+
+    /// Troca todas as opções de um breakpoint (o editor): condição,
+    /// contagem, log, comandos, grupo e as opções de acerto. Zera os
+    /// acertos.
+    pub fn edit_breakpoint(&mut self, id: u32, request: &BreakpointRequest) -> Result<Breakpoint, String> {
+        let breakpoint = self.breakpoints.iter_mut().find(|breakpoint| breakpoint.id == id).ok_or_else(|| format!("breakpoint {id} nao existe"))?;
+        breakpoint.condition = request.condition.trim().to_string();
+        breakpoint.pass_count = request.pass_count;
+        breakpoint.log = request.log.trim().to_string();
+        breakpoint.command = request.command.trim().to_string();
+        breakpoint.group = request.group.trim().to_string();
+        breakpoint.options = request.options.clone();
+        breakpoint.hits = 0;
+        let copy = breakpoint.clone();
+        if copy.enabled != request.enabled {
+            self.set_breakpoint_enabled(id, request.enabled)?;
+        }
+        Ok(self.breakpoints.iter().find(|breakpoint| breakpoint.id == id).cloned().unwrap_or(copy))
     }
 
     fn push_breakpoint(&mut self, request: &BreakpointRequest, address: u64, pending: bool) -> Breakpoint {
@@ -1131,6 +1345,7 @@ impl Client {
             command: request.command.trim().to_string(),
             group: request.group.trim().to_string(),
             process: request.process,
+            options: request.options.clone(),
         };
         self.next_breakpoint += 1;
         self.breakpoints.push(breakpoint.clone());
@@ -1262,9 +1477,7 @@ impl Client {
     /// Os comandos de parada do breakpoint que parou a máquina por último
     /// (o número dele e o texto).
     pub fn stop_commands(&self) -> Option<(u32, String)> {
-        let id = self.last_stop.split("breakpoint #").nth(1).and_then(|rest| rest.split(|character: char| !character.is_ascii_digit()).next()).and_then(|id| id.parse::<u32>().ok())?;
-        let breakpoint = self.breakpoints.iter().find(|breakpoint| breakpoint.id == id)?;
-        (!breakpoint.command.trim().is_empty()).then(|| (id, breakpoint.command.clone()))
+        self.pending_commands.clone()
     }
 
     /// Arma ou tira os breakpoints internos nos pontos de evento conforme os
@@ -1463,8 +1676,14 @@ impl Client {
             .iter()
             .map(|breakpoint| {
                 let mut line = format!("{}\t{}\t{}\t{}\t{}\t{}", breakpoint.kind.key(), breakpoint.enabled as u8, breakpoint.length, breakpoint.pass_count, breakpoint.expression, breakpoint.condition);
-                if !breakpoint.log.is_empty() || !breakpoint.command.is_empty() || !breakpoint.group.is_empty() {
+                let options = &breakpoint.options;
+                let flags: String = [(options.single_shot, 's'), (options.silent, 'q'), (options.fast_resume, 'f')].iter().filter(|(on, _)| *on).map(|(_, letter)| *letter).collect();
+                let extended = !options.name.is_empty() || !options.log_condition.is_empty() || !options.command_condition.is_empty() || !flags.is_empty();
+                if extended || !breakpoint.log.is_empty() || !breakpoint.command.is_empty() || !breakpoint.group.is_empty() {
                     line.push_str(&format!("\t{}\t{}\t{}", breakpoint.log, breakpoint.command, breakpoint.group));
+                }
+                if extended {
+                    line.push_str(&format!("\t{}\t{}\t{}\t{flags}", options.name, options.log_condition, options.command_condition));
                 }
                 line.push('\n');
                 line
@@ -1490,6 +1709,13 @@ impl Client {
             request.log = fields.get(6).copied().unwrap_or("").to_string();
             request.command = fields.get(7).copied().unwrap_or("").to_string();
             request.group = fields.get(8).copied().unwrap_or("").to_string();
+            request.options.name = fields.get(9).copied().unwrap_or("").to_string();
+            request.options.log_condition = fields.get(10).copied().unwrap_or("").to_string();
+            request.options.command_condition = fields.get(11).copied().unwrap_or("").to_string();
+            let flags = fields.get(12).copied().unwrap_or("");
+            request.options.single_shot = flags.contains('s');
+            request.options.silent = flags.contains('q');
+            request.options.fast_resume = flags.contains('f');
             request.deferred = true;
             if let Err(error) = self.add_breakpoint_with(&request) {
                 errors.push(format!("{}: {error}", request.expression));

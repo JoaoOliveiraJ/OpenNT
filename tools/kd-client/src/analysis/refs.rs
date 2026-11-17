@@ -248,6 +248,28 @@ pub fn callers(insns: &[Insn], function: u64) -> Vec<u64> {
     insns.iter().filter(|insn| insn.flow == Flow::Call && insn.target == Some(function)).map(|insn| insn.address).collect()
 }
 
+/// O índice de referências cruzadas de um módulo: para cada endereço
+/// referenciado, as instruções que o referenciam (destino de desvio,
+/// operando de memória e imediato). Imediatos só entram quando caem dentro
+/// de `range` (um número qualquer não é referência). Feito uma vez por
+/// módulo, responde qualquer "quem referencia X" na hora.
+pub fn xref_index(insns: &[Insn], range: (u64, u64)) -> std::collections::HashMap<u64, Vec<(u64, RefKind)>> {
+    let mut index: std::collections::HashMap<u64, Vec<(u64, RefKind)>> = std::collections::HashMap::new();
+    let inside = |address: u64| address >= range.0 && address < range.1;
+    for insn in insns {
+        if let Some(target) = insn.target {
+            index.entry(target).or_default().push((insn.address, branch_kind(insn)));
+        }
+        if let Some(memory) = insn.memory {
+            index.entry(memory).or_default().push((insn.address, RefKind::Memory));
+        }
+        if let Some(value) = insn.immediate.filter(|&value| inside(value)) {
+            index.entry(value).or_default().push((insn.address, RefKind::Immediate));
+        }
+    }
+    index
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::decode::decode_all;
@@ -372,5 +394,23 @@ mod tests {
         assert_eq!(calls[0].slot, Some(DATA + 0x90));
         assert_eq!(calls[0].target, 0x7FF8_0000_1234);
         assert_eq!((calls[1].target, calls[1].slot), (0x7000_0000, None));
+    }
+
+    #[test]
+    fn cross_reference_index() {
+        let fake = sample();
+        let insns = decode_all(&fake.code, CODE);
+        let index = xref_index(&insns, (DATA, DATA + 0x100));
+        // A primeira instrução: chamada pelo `call rel32`.
+        assert_eq!(index[&CODE], vec![(callers(&insns, CODE)[0], RefKind::Call)]);
+        assert_eq!(index[&DATA], vec![(CODE, RefKind::Memory)]);
+        // O imediato do `push` cai na faixa; o 0x1234 do `mov ecx`, não.
+        assert_eq!(index[&(DATA + 0x40)][0].1, RefKind::Immediate);
+        assert!(!index.contains_key(&0x1234));
+        // O índice responde o mesmo que a varredura direta.
+        for (target, list) in &index {
+            let direct: Vec<u64> = references_to(&insns, *target).into_iter().map(|(address, _)| address).collect();
+            assert!(list.iter().all(|(address, _)| direct.contains(address)), "{target:#x}");
+        }
     }
 }

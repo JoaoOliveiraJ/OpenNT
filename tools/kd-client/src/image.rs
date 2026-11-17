@@ -1,6 +1,6 @@
-//! A imagem de um módulo para as análises do opennt-re (busca de
-//! referências, strings, padrões, grafo de fluxo, mapa de memória, imports
-//! e tratadores de exceção).
+//! A imagem de um módulo para as análises (busca de referências, strings,
+//! padrões, grafo de fluxo, limites de função, referências cruzadas, mapa
+//! de memória, imports e tratadores de exceção).
 //!
 //! A ligação serial com o alvo é lenta para ler imagens inteiras. Por isso a
 //! imagem vem, quando dá, do arquivo desta máquina: o PE da Microsoft
@@ -11,9 +11,9 @@
 
 use std::sync::Arc;
 
-use kd_client::analysis::decode::{self, Insn};
-use kd_client::elf::{Elf, SHF_ALLOC};
-use kd_client::pe::PeImage;
+use crate::analysis::decode::{self, Insn};
+use crate::elf::{Elf, SHF_ALLOC};
+use crate::pe::PeImage;
 
 /// SHF_EXECINSTR do ELF.
 const SHF_EXECINSTR: u64 = 4;

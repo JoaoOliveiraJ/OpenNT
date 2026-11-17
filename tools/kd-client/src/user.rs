@@ -48,6 +48,14 @@ pub struct UserThread {
     pub state: String,
     pub wait_reason: String,
     pub last_error: Option<u64>,
+    /// As colunas que um alvo novo manda além dessas (KTHREAD): prioridade,
+    /// contagem de suspensão, tempo de kernel e de usuário (tiques) e
+    /// ciclos.
+    pub priority: Option<u64>,
+    pub suspend_count: Option<u64>,
+    pub kernel_time: Option<u64>,
+    pub user_time: Option<u64>,
+    pub cycles: Option<u64>,
 }
 
 /// Uma entrada da tabela de handles (`handles`).
@@ -159,6 +167,11 @@ pub fn parse_user_threads(text: &str) -> Vec<UserThread> {
                 state: fields[7].to_string(),
                 wait_reason: fields[8].to_string(),
                 last_error: parse_number(fields[9]),
+                priority: fields.get(10).and_then(|text| parse_number(text)),
+                suspend_count: fields.get(11).and_then(|text| parse_number(text)),
+                kernel_time: fields.get(12).and_then(|text| parse_number(text)),
+                user_time: fields.get(13).and_then(|text| parse_number(text)),
+                cycles: fields.get(14).and_then(|text| parse_number(text)),
             })
         })
         .collect()
@@ -366,7 +379,12 @@ mod tests {
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].wait_reason, "UserRequest");
         assert_eq!(list[0].last_error, Some(0));
-        let map = "            inicio                fim  faixa\n           0x10000     0x7fffffff0000  metade de usuario\n";
+        assert_eq!(list[0].priority, None);
+        // As colunas novas: prioridade, suspensão, tempos e ciclos.
+        let threads = "   416 0xffffa00000600000 0x3a3000 0x7ffd00001000 0xffffa00000700000 0x7ffd00002000 0x8fe00 Waiting UserRequest 0x0 9 1 12 30 0x1234\n";
+        let list = parse_user_threads(threads);
+        assert_eq!((list[0].priority, list[0].suspend_count, list[0].kernel_time, list[0].user_time, list[0].cycles), (Some(9), Some(1), Some(12), Some(30), Some(0x1234)));
+        let map ="            inicio                fim  faixa\n           0x10000     0x7fffffff0000  metade de usuario\n";
         assert_eq!(parse_kernel_map(map), vec![KernelRange { start: 0x10000, end: 0x7fffffff0000, name: "metade de usuario".into() }]);
     }
 

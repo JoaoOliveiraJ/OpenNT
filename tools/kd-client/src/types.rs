@@ -181,6 +181,12 @@ impl TypeDb {
             .collect()
     }
 
+    /// O deslocamento de um campo de uma struct pelo nome dos dois.
+    pub fn field_offset(&self, structure: &str, field: &str) -> Option<u64> {
+        let index = self.find(structure)?;
+        self.member(index, field).map(|member| member.offset)
+    }
+
     /// Um membro pelo nome (sem diferença de caixa se não houver o exato).
     pub fn member(&self, index: u32, name: &str) -> Option<Member> {
         let members = self.members(index);

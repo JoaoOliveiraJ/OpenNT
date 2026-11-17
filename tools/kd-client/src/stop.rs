@@ -12,6 +12,9 @@ pub enum Reason {
     /// Vigia de escrita (`watch`) ou de acesso (`awatch`/`rwatch`), com o
     /// endereço.
     Watch { kind: String, address: u64 },
+    /// Breakpoint de memória por página do OpenNT (`membp:endereço`): o
+    /// endereço que a instrução acessou.
+    Memory { address: u64 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,6 +42,7 @@ impl StopReply {
                 "swbreak" => reply.reasons.push(Reason::SoftwareBreak),
                 "hwbreak" => reply.reasons.push(Reason::HardwareBreak),
                 "watch" | "awatch" | "rwatch" => reply.reasons.push(Reason::Watch { kind: key.to_string(), address: u64::from_str_radix(value, 16).unwrap_or(0) }),
+                "membp" => reply.reasons.push(Reason::Memory { address: u64::from_str_radix(value, 16).unwrap_or(0) }),
                 _ => {}
             }
         }
@@ -62,6 +66,7 @@ impl StopReply {
                 Reason::SoftwareBreak => "swbreak".to_string(),
                 Reason::HardwareBreak => "hwbreak".to_string(),
                 Reason::Watch { kind, address } => format!("{kind} {address:x}"),
+                Reason::Memory { address } => format!("membp {address:x}"),
             })
             .collect::<Vec<_>>()
             .join(" ")
@@ -90,6 +95,9 @@ mod tests {
         let stop = StopReply::parse("S02").unwrap();
         assert_eq!(stop.signal, 2);
         assert_eq!(stop.thread, None);
+        let stop = StopReply::parse("T05thread:1;watch:7ff600001000;membp:7ff600001008;").unwrap();
+        assert_eq!(stop.reasons[1], Reason::Memory { address: 0x7ff600001008 });
+        assert_eq!(stop.reason_text(), "watch 7ff600001000 membp 7ff600001008");
         assert!(StopReply::parse("OK").is_none());
         assert!(StopReply::parse("E01").is_none());
     }

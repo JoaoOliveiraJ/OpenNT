@@ -6,181 +6,13 @@
 //! cliente segue sozinho até o RSP certo), o breakpoint condicional e a
 //! parada pela carga de um módulo.
 
-use std::collections::VecDeque;
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration, Instant};
+mod support;
 
-use kd_client::client::Resumed;
-use kd_client::rsp::{encode, hex, unhex, Connection, Decoder, Frame};
-use kd_client::symbols::{Module, Symbol};
-use kd_client::{BreakpointKind, Client};
+use std::time::Duration;
 
-const STACK: u64 = 0xffff_8000_0010_0f00;
-const CODE: u64 = 0xfffff800_4010_0000;
-
-/// O que o alvo faz no próximo `c`: os novos RIP e RSP e a resposta.
-struct Stop {
-    rip: u64,
-    rsp: u64,
-    packet: &'static str,
-    /// O RAX da parada (as condições dos breakpoints).
-    rax: u64,
-    /// Um módulo que aparece no `lm` a partir desta parada.
-    load: Option<&'static str>,
-}
-
-struct Target {
-    registers: [u64; 24],
-    memory: Vec<(u64, Vec<u8>)>,
-    stops: VecDeque<Stop>,
-    log: Arc<Mutex<Vec<String>>>,
-    modules: Vec<String>,
-}
-
-impl Target {
-    fn read(&self, address: u64, length: usize) -> Option<Vec<u8>> {
-        self.memory.iter().find(|(base, bytes)| address >= *base && address < base + bytes.len() as u64).map(|(base, bytes)| {
-            let start = (address - base) as usize;
-            bytes[start..(start + length).min(bytes.len())].to_vec()
-        })
-    }
-
-    fn registers_packet(&self) -> String {
-        let mut reply = String::new();
-        for (index, value) in self.registers.iter().enumerate() {
-            let size = if index <= 16 { 8 } else { 4 };
-            reply.push_str(&hex(&value.to_le_bytes()[..size]));
-        }
-        reply
-    }
-
-    fn answer(&mut self, packet: &str, stream: &mut TcpStream) -> Option<String> {
-        self.log.lock().unwrap().push(packet.to_string());
-        let reply = if packet.starts_with("qSupported") {
-            "PacketSize=1000;swbreak+;hwbreak+;QStartNoAckMode+".to_string()
-        } else if packet == "QStartNoAckMode" || packet.starts_with('Z') || packet.starts_with('z') || packet.starts_with("Hg") || packet.starts_with('M') || packet.starts_with('P') {
-            if let Some(rest) = packet.strip_prefix('P') {
-                let (number, value) = rest.split_once('=').unwrap();
-                let mut bytes = unhex(value);
-                bytes.resize(8, 0);
-                self.registers[usize::from_str_radix(number, 16).unwrap()] = u64::from_le_bytes(bytes.try_into().unwrap());
-            }
-            "OK".to_string()
-        } else if packet == "?" {
-            "T02thread:1;".to_string()
-        } else if packet == "g" {
-            self.registers_packet()
-        } else if let Some(rest) = packet.strip_prefix('m') {
-            let (address, length) = rest.split_once(',').unwrap();
-            match self.read(u64::from_str_radix(address, 16).unwrap(), usize::from_str_radix(length, 16).unwrap()) {
-                Some(bytes) => hex(&bytes),
-                None => "E14".to_string(),
-            }
-        } else if let Some(command) = packet.strip_prefix("qRcmd,") {
-            let text = String::from_utf8(unhex(command)).unwrap();
-            let output = match text.as_str() {
-                "lm" => format!("              base                fim  nome             caminho\n{}", self.modules.join("")),
-                "bl" => "nenhum breakpoint\n".to_string(),
-                _ => "comandos do OpenNT\n".to_string(),
-            };
-            stream.write_all(&encode(&format!("O{}", hex(output.as_bytes())))).unwrap();
-            "OK".to_string()
-        } else if packet == "c" || packet == "s" {
-            let stop = self.stops.pop_front().expect("parada roteirizada");
-            self.registers[16] = stop.rip;
-            self.registers[7] = stop.rsp;
-            self.registers[0] = stop.rax;
-            if let Some(name) = stop.load {
-                let base = 0xfffff800_4300_0000u64 + self.modules.len() as u64 * 0x10000;
-                self.modules.push(format!("{base:#x} {:#x}  {name}   \\SystemRoot\\System32\\drivers\\{name}\n", base + 0x10000));
-            }
-            stop.packet.to_string()
-        } else if packet == "D" {
-            "OK".to_string()
-        } else {
-            String::new()
-        };
-        Some(reply)
-    }
-}
-
-/// Sobe o alvo; devolve o endereço e o registro dos pacotes recebidos.
-fn start(stops: Vec<Stop>) -> (String, Arc<Mutex<Vec<String>>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap().to_string();
-    let log = Arc::new(Mutex::new(Vec::new()));
-    // Um driver que não existe nesta máquina (sem símbolos).
-    let modules = vec!["0xfffff80042000000 0xfffff80042010000  alvo-falso.sys   \\SystemRoot\\System32\\drivers\\alvo-falso.sys\n".to_string()];
-    let mut target = Target { registers: [0; 24], memory: Vec::new(), stops: stops.into(), log: Arc::clone(&log), modules };
-    // Pilha: o quadro corrente em STACK + 0x20 com dois chamadores.
-    let mut stack = vec![0u8; 0x100];
-    let mut put = |offset: usize, value: u64| stack[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
-    put(0x20, STACK + 0x60);
-    put(0x28, CODE + 0x2010);
-    put(0x60, 0);
-    put(0x68, CODE + 0x3020);
-    target.memory.push((STACK, stack));
-    // Código: `sub rsp, 0x20`, `call rel32`, `nop`.
-    let mut code = vec![0x48, 0x83, 0xEC, 0x20, 0xE8, 0, 0, 0, 0, 0x90];
-    code.resize(0x4000, 0x90);
-    target.memory.push((CODE, code));
-    target.registers[16] = CODE;
-    target.registers[7] = STACK;
-    target.registers[6] = STACK + 0x20;
-    target.registers[17] = 0x246;
-    thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut decoder = Decoder::default();
-        let mut no_ack = false;
-        let mut chunk = [0u8; 4096];
-        loop {
-            while let Some(frame) = decoder.next_frame() {
-                let Frame::Packet(packet) = frame else { continue };
-                if !no_ack {
-                    stream.write_all(b"+").unwrap();
-                }
-                if let Some(reply) = target.answer(&packet, &mut stream) {
-                    stream.write_all(&encode(&reply)).unwrap();
-                }
-                if packet == "QStartNoAckMode" {
-                    no_ack = true;
-                }
-            }
-            match stream.read(&mut chunk) {
-                Ok(0) | Err(_) => return,
-                Ok(count) => decoder.push(&chunk[..count]),
-            }
-        }
-    });
-    (address, log)
-}
-
-fn connect(address: &str) -> Client {
-    let connection = Connection::connect(address, Instant::now() + Duration::from_secs(10)).unwrap();
-    let mut client = Client::new(connection, PathBuf::from("."), PathBuf::from("inexistente/kernel.elf"));
-    let text = client.attach(Duration::from_secs(10)).unwrap();
-    assert!(text.contains("sem os simbolos do kernel"), "{text}");
-    assert!(client.is_stopped());
-    assert!(client.last_stop().contains("SIGINT"), "{}", client.last_stop());
-    client.symbols.set_kernel(Module::new(
-        "kernel",
-        "kernel.elf",
-        0xfffff800_40000000,
-        0xfffff800_41000000,
-        vec![
-            Symbol { address: CODE, size: 0x100, name: "kernel::alvo::corrente".into(), function: true },
-            Symbol { address: CODE + 0x1000, size: 0x100, name: "kernel::ntos::ps::notify::image::notify".into(), function: true },
-            Symbol { address: CODE + 0x2000, size: 0x100, name: "kernel::alvo::chamador".into(), function: true },
-            Symbol { address: CODE + 0x3000, size: 0x100, name: "kernel::alvo::kmain".into(), function: true },
-        ],
-        "teste",
-    ));
-    client
-}
+use kd_client::client::{BreakpointOptions, BreakpointRequest, Resumed};
+use kd_client::BreakpointKind;
+use support::fake_stub::{connect, start, Stop, CODE, STACK, USER_DATA};
 
 #[test]
 fn backtrace_registers_and_memory() {
@@ -298,4 +130,87 @@ fn stops_when_a_module_loads() {
     assert_eq!(sent, vec!["Z0,fffff80040101000,1", "c", "c"]);
     let list = client.execute("bl").unwrap();
     assert!(list.contains("ld:novo") && list.contains("(adiado)"), "{list}");
+}
+
+#[test]
+fn extended_registers_and_debug_registers() {
+    let (address, _) = start(Vec::new());
+    let mut client = connect(&address);
+    let state = client.extended_registers().unwrap();
+    // XMM0 = 00..0f, XMM15 = 0f..1e (pelo `g`); MXCSR padrão.
+    assert_eq!(state.xmm[0].unwrap()[1], 1);
+    assert_eq!(state.xmm[15].unwrap()[0], 15);
+    assert_eq!(state.mxcsr, Some(0x1F80));
+    // As extensões do OpenNT por `p`: a metade alta dos YMM e os DRs.
+    assert_eq!(state.ymm_high[3], Some([0xA3; 16]));
+    assert_eq!(state.ymm(3).unwrap()[16], 0xA3);
+    assert_eq!(state.debug[0], Some(0xD0));
+    assert_eq!(state.debug[5], Some(0x401));
+    assert_eq!(client.evaluate("@dr7").unwrap(), 0x401);
+}
+
+#[test]
+fn breakpoint_options_log_condition_single_shot_and_silent() {
+    // Três acertos em CODE + 0x10 com RAX 1, 2 e 3: a condição de parada é
+    // `@rax == 3`, o log só sai com `@rax >= 2` e o breakpoint some depois
+    // de parar (uma vez só).
+    let stops = vec![
+        Stop { rip: CODE + 0x10, rsp: STACK, packet: "T05thread:1;swbreak:;", rax: 1, load: None },
+        Stop { rip: CODE + 0x10, rsp: STACK, packet: "T05thread:1;swbreak:;", rax: 2, load: None },
+        Stop { rip: CODE + 0x10, rsp: STACK, packet: "T05thread:1;swbreak:;", rax: 3, load: None },
+    ];
+    let (address, log) = start(stops);
+    let mut client = connect(&address);
+    let mut request = BreakpointRequest::new(BreakpointKind::Software, "kernel::alvo::corrente+0x10");
+    request.condition = "@rax == 3".into();
+    request.log = "rax={@rax:d}".into();
+    request.command = "r rax".into();
+    request.options = BreakpointOptions { name: "laco".into(), log_condition: "@rax >= 2".into(), command_condition: String::new(), single_shot: true, silent: true, fast_resume: false };
+    let breakpoint = client.add_breakpoint_with(&request).unwrap();
+    client.go().unwrap();
+    let stop = client.wait_stop(Duration::from_secs(10)).unwrap();
+    assert!(stop.contains("breakpoint #0 laco, condicao verdadeira, acerto 3"), "{stop}");
+    assert!(stop.contains("uma vez so removido"), "{stop}");
+    // O log saiu nos acertos 2 e 3; sem a linha de acerto (silencioso).
+    assert_eq!(client.log_lines(), &["[bp #0 laco] rax=2".to_string(), "[bp #0 laco] rax=3".to_string()]);
+    // Os comandos ficam para quem trata a parada (a condição vazia vale a
+    // da parada).
+    assert_eq!(client.stop_commands(), Some((breakpoint.id, "r rax".into())));
+    assert!(client.breakpoints().is_empty());
+    assert!(log.lock().unwrap().iter().any(|packet| packet == "z0,fffff80040100010,1"));
+    // As opções voltam pelo arquivo de sessão.
+    let mut request = BreakpointRequest::new(BreakpointKind::Software, "kernel::alvo::chamador");
+    request.options = BreakpointOptions { name: "nome".into(), log_condition: "1".into(), command_condition: "@rax".into(), single_shot: false, silent: true, fast_resume: true };
+    client.add_breakpoint_with(&request).unwrap();
+    let specs = client.breakpoint_specs();
+    assert!(specs.trim_end().ends_with("\tnome\t1\t@rax\tqf"), "{specs:?}");
+    let id = client.breakpoints()[0].id;
+    client.remove_breakpoint(id).unwrap();
+    assert!(client.restore_breakpoints(&specs).is_empty());
+    assert_eq!(client.breakpoints()[0].options, request.options);
+}
+
+#[test]
+fn memory_breakpoint_by_page() {
+    // A primeira parada é de outra página vigiada (nenhum breakpoint do
+    // cliente a cobre: segue); a segunda cai na página pedida.
+    let stops = vec![
+        Stop { rip: CODE + 0x20, rsp: STACK, packet: "T05thread:1;awatch:7ff600005008;membp:7ff600005008;", rax: 0, load: None },
+        Stop { rip: CODE + 0x24, rsp: STACK, packet: "T05thread:1;watch:7ff600001010;membp:7ff600001010;", rax: 0, load: None },
+    ];
+    let (address, log) = start(stops);
+    let mut client = connect(&address);
+    let text = client.execute(&format!("bpm w {:#x} 0x20", USER_DATA + 0x10)).unwrap();
+    assert!(text.contains("breakpoint de memoria (memoria-escrita)"), "{text}");
+    // A faixa vira páginas inteiras.
+    let breakpoint = client.breakpoints()[0].clone();
+    assert_eq!((breakpoint.address, breakpoint.length), (USER_DATA, 0x1000));
+    assert!(client.monitor("membp").unwrap().contains("0x7ff600001000 0x1000 w"));
+    client.go().unwrap();
+    let stop = client.wait_stop(Duration::from_secs(10)).unwrap();
+    assert!(stop.contains("breakpoint #0, acerto 1"), "{stop}");
+    assert_eq!(log.lock().unwrap().iter().filter(|packet| *packet == "c").count(), 2);
+    client.execute(&format!("bpmc {:#x}", USER_DATA)).unwrap();
+    assert!(client.breakpoints().is_empty());
+    assert!(client.monitor("membp").unwrap().contains("nenhum"));
 }

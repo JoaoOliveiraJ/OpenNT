@@ -27,8 +27,13 @@
 //!   threads de usuário com o CONTEXT salvo);
 //! - `client`, `commands`: a sessão (comandos de texto e a API tipada que a
 //!   interface gráfica usa);
-//! - `analysis`: decodificador, grafo de fluxo, referências e strings,
-//!   padrões, roteiros e as notas e patches por módulo + RVA.
+//! - `analysis`: decodificador, grafo de fluxo, limites de função e laços,
+//!   argumentos de chamadas e protótipos, referências e strings, padrões,
+//!   roteiros e as notas e patches por módulo + RVA;
+//! - `image`: a imagem de um módulo para as análises (o arquivo desta
+//!   máquina ou a memória do alvo);
+//! - `launcher`: o `cargo xtask debug --launch --no-client` (build e QEMU)
+//!   para os clientes que abrem o próprio alvo (`opennt-re`, `opennt-mcp`).
 
 pub mod analysis;
 pub mod bugcheck;
@@ -37,6 +42,8 @@ pub mod commands;
 pub mod demangle;
 pub mod elf;
 pub mod expr;
+pub mod image;
+pub mod launcher;
 pub mod monitor;
 pub mod msf;
 pub mod pdb;

@@ -72,6 +72,7 @@ const HELP: &str = "attach | break | c/g | wait-stop [ms] | s/t [n] | p [n] | gu
 x <expr> [bytes] | db/dw/dd/dq <expr> [L<n>] | da/du <expr> | write <expr> <hex> | poke <1|2|4|8> <expr> <valor>
 bp <expr> [N] [/w \"cond\"] | bu <expr> | bc <expr|#n|all> | bd/be <n> | bl | hbp/hbc <expr>
 ba <e|w|r><1|2|4|8> <expr> | watch/unwatch <expr> <bytes> [w|a] | sxe/sxd ld:<modulo> | .bpsave/.bpload <arq>
+bpm <a|w|x> <expr> [bytes] | bpmc <expr> (breakpoint de memoria por pagina, no processo escolhido)
 bt [n] | k [n] | btt <ethread> [n] | context <ethread> | ? <expr> | sym <expr> | ln <expr> | addr <nome>
 dt <tipo> [expr] | thread <n> | cpulist | modules | lmv <modulo> | .reload
 ps | threads [pid] | lm | cpus | irql | obj <caminho> | log [bytes] | bugcheck | kd | monitor <texto>
@@ -737,6 +738,28 @@ impl Client {
                 request.length = parse_number(size).filter(|size| matches!(size, 1 | 2 | 4 | 8)).unwrap_or(1);
                 self.breakpoint_command(request)
             }
+            "bpm" | "bpmc" => {
+                // bpm <a|w|x> <expr> [bytes]: breakpoint de memória por página.
+                let usage = "uso: bpm <a|w|x> <expr> [bytes] | bpmc <expr>";
+                if command == "bpmc" {
+                    let address = self.evaluate(words.first().ok_or(usage)?)? & !0xFFF;
+                    let id = self.breakpoints.iter().find(|breakpoint| breakpoint.kind.is_memory() && breakpoint.address == address).map(|breakpoint| breakpoint.id).ok_or_else(|| format!("nenhum breakpoint de memoria em {address:#x}"))?;
+                    let breakpoint = self.remove_breakpoint(id)?;
+                    return Ok(format!("removido o breakpoint de memoria em {:#x}", breakpoint.address));
+                }
+                let kind = match words.first().copied() {
+                    Some("a" | "r") => BreakpointKind::MemoryAccess,
+                    Some("w") => BreakpointKind::MemoryWrite,
+                    Some("x" | "e") => BreakpointKind::MemoryExecute,
+                    _ => return Err(usage.into()),
+                };
+                let mut request = BreakpointRequest::new(kind, words.get(1).ok_or(usage)?);
+                if let Some(length) = words.get(2).and_then(|text| parse_number(text)) {
+                    request.length = length;
+                }
+                let breakpoint = self.add_breakpoint_with(&request)?;
+                Ok(format!("breakpoint de memoria ({}) em {:#x}+{:#x} (#{})", kind.name(), breakpoint.address, breakpoint.length, breakpoint.id))
+            }
             "watch" | "unwatch" => {
                 let target = words.first().ok_or("uso: watch <endereco> <bytes> [w|a]")?;
                 let length = words.get(1).and_then(|text| parse_number(text)).unwrap_or(8);
@@ -925,7 +948,7 @@ impl Client {
     /// Os comandos e aliases conhecidos (o autocompletar).
     pub fn command_names() -> &'static [&'static str] {
         &[
-            "attach", "break", "c", "g", "continue", "wait-stop", "s", "t", "step", "p", "gu", "regs", "r", "x", "db", "dw", "dd", "dq", "da", "du", "write", "poke", "bp", "bu", "bc", "hbp", "hbc", "ba", "watch", "unwatch", "sxe", "sxd", "bd", "be", "bl", ".bpsave", ".bpload", "bt", "k", "context", "btt", "?", "sym", "ln", "addr", "dt", "thread", "cpulist", "ps",
+            "attach", "break", "c", "g", "continue", "wait-stop", "s", "t", "step", "p", "gu", "regs", "r", "x", "db", "dw", "dd", "dq", "da", "du", "write", "poke", "bp", "bu", "bc", "hbp", "hbc", "ba", "bpm", "bpmc", "watch", "unwatch", "sxe", "sxd", "bd", "be", "bl", ".bpsave", ".bpload", "bt", "k", "context", "btt", "?", "sym", "ln", "addr", "dt", "thread", "cpulist", "ps",
             "threads", "lm", "lmv", "cpus", "irql", "obj", "log", "bugcheck", "kd", ".reload", "!process", "!thread", "!irp", "!devobj", "!drvobj", "!object", "!handle", "!analyze", "trace", "monitor", "modules", "detach", "help",
             ".process", "lmu", "handles", "vad", "uthreads", "ustack", "kmap", "events", "uex", "bgd", "bge", "bar",
         ]
