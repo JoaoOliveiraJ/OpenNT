@@ -14316,6 +14316,22 @@ fn se_logon_session_exports(assert: Assert) {
     let (account, authority): (Vec<u16>, Vec<u16>) = ("SYSTEM".encode_utf16().collect(), "NT AUTHORITY".encode_utf16().collect());
     let informed = logon_session::add_info(logon_session::SYSTEM_LUID, &account, &authority);
     assert(informed == 0 && logon_session::names(logon_session::SYSTEM_LUID) == Some((account.clone(), authority.clone())) && logon_session::add_info(0x7_0000_1234, &account, &authority) == 0xC000_005F, "se-logon-session: comando 4 grava AccountName e AuthorityName; sessao inexistente recusada");
+    // TokenSessionReference (14) do NtSetInformationToken: só o 0, e o
+    // token larga a sessão, que pode ser apagada com ele vivo.
+    use crate::ntos::se::token::set_information;
+    let value = guest::alloc_bytes(8);
+    let session_created = logon_session::create_track(0x7_0000_1235);
+    let _ = tokens::update(pointer, |token| token.authentication_id = 0x7_0000_1235);
+    let held = logon_session::delete_track(0x7_0000_1235);
+    guest::write32(value, 1);
+    let nonzero = set_information::set(pointer, 14, value, 4, 0).unwrap_or(u32::MAX);
+    let short = set_information::set(pointer, 14, value, 2, 0).unwrap_or(u32::MAX);
+    guest::write32(value, 0);
+    let released = set_information::set(pointer, 14, value, 4, 0).unwrap_or(u32::MAX);
+    let deleted_with_token = logon_session::delete_track(0x7_0000_1235);
+    let _ = tokens::update(pointer, |token| token.authentication_id = logon_session::SYSTEM_LUID);
+    guest::free_bytes(value);
+    assert(session_created == 0 && held == 0xC000_0104 && nonzero == 0xC000_000D && short == 0xC000_0004 && released == 0 && deleted_with_token == 0, "se-logon-session: TokenSessionReference 0 solta a sessao (outros valores e tamanhos recusados)");
     let _ = call_export("ZwClose", &[copy]);
     let _ = call_export("ZwClose", &[system_token]);
 }
@@ -15161,6 +15177,35 @@ fn virtual_memory_lock_exports(assert: Assert) {
     let process_unlock = unlock(u64::MAX, 0x1_0010, 0x1000, 1);
     let untouched = guest::read64(base) == 0x1_0010 && guest::read64(size) == 0x1000;
     assert(process_unlock == Some(signed_status(0xC000_002A)) && untouched && unlock(u64::MAX, 0x1_0000, 0x3000, 2) == Some(signed_status(0xC000_002A)), "virtual-memory-lock: nada travado = STATUS_NOT_LOCKED sem gravar a faixa");
+    // A trava do NtLockVirtualMemory numa alocação privada: 0x3000
+    // reservados com as duas primeiras páginas comitadas.
+    use crate::ntos::mm::virtual_lock;
+    use crate::ntos::ps::user::memory::Space;
+    guest::write64(base, 0);
+    guest::write64(size, 0x3000);
+    let reserved = call_export("ZwAllocateVirtualMemory", &[u64::MAX, base, 0, size, 0x2000, 4]);
+    let address = guest::read64(base);
+    guest::write64(size, 0x2000);
+    let committed = call_export("ZwAllocateVirtualMemory", &[u64::MAX, base, 0, size, 0x1000, 4]);
+    let space = Space::current();
+    let first = virtual_lock::lock(space, address, address + 0x1000, virtual_lock::MAP_PROCESS);
+    let again = virtual_lock::lock(space, address, address + 0x1000, virtual_lock::MAP_PROCESS);
+    let reserved_page = virtual_lock::lock(space, address + 0x1000, address + 0x3000, virtual_lock::MAP_PROCESS);
+    assert(reserved == Some(0) && committed == Some(0) && first == 0 && again == 0x4000_0019 && reserved_page == 0xC000_0005, "virtual-memory-lock: trava de pagina comitada; a mesma de novo = STATUS_WAS_LOCKED; pagina so reservada = STATUS_ACCESS_VIOLATION");
+    let other_type = unlock(u64::MAX, address + 0x10, 0x10, 2);
+    let released = unlock(u64::MAX, address + 0x10, 0x10, 1);
+    let rounded = guest::read64(base) == address && guest::read64(size) == 0x1000;
+    let twice = unlock(u64::MAX, address, 0x1000, 1);
+    assert(other_type == Some(signed_status(0xC000_002A)) && released == Some(0) && rounded && twice == Some(signed_status(0xC000_002A)), "virtual-memory-lock: destrava so no tipo travado, com a faixa em paginas inteiras; a segunda = STATUS_NOT_LOCKED");
+    let relocked = virtual_lock::lock(space, address + 0x1000, address + 0x2000, virtual_lock::MAP_PROCESS);
+    guest::write64(base, address + 0x1000);
+    guest::write64(size, 0x1000);
+    let decommitted = call_export("ZwFreeVirtualMemory", &[u64::MAX, base, size, 0x4000]);
+    let after_decommit = unlock(u64::MAX, address + 0x1000, 0x1000, 1);
+    guest::write64(base, address);
+    guest::write64(size, 0);
+    let freed = call_export("ZwFreeVirtualMemory", &[u64::MAX, base, size, 0x8000]);
+    assert(relocked == 0 && decommitted == Some(0) && after_decommit == Some(signed_status(0xC000_002A)) && freed == Some(0), "virtual-memory-lock: o decommit leva a trava junto");
     guest::free_bytes(block);
 }
 

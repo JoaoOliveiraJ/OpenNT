@@ -436,7 +436,7 @@ fn trim_region(root: u64, region: &Region, owner: &PrivateRegion, first_index: u
     let mut moved = 0;
     for (index, frame) in resident {
         let va = owner.base + index * PAGE;
-        if io_pins::is_pinned(va) || locked(frame) {
+        if io_pins::is_pinned(va) || locked(frame) || state.locked.contains_key(&index) {
             continue;
         }
         let Some(pte) = paging::read_leaf_in(root, va) else { continue };

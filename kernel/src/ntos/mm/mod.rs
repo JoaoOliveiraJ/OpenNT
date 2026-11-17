@@ -49,6 +49,7 @@ pub mod small;
 pub mod user_half;
 pub mod virtual_memory;
 pub mod virtual_memory_services;
+pub mod virtual_lock;
 pub mod image_paging;
 pub mod system_image_pages;
 pub mod partition;

@@ -15,6 +15,12 @@
 //! - TokenDefaultDacl (6): o TOKEN_DEFAULT_DACL (pelo menos 8 bytes); uma ACL
 //!   nula tira a DACL padrão.
 //! - TokenSessionId (12): o ULONG (4 bytes), com o SeTcbPrivilege.
+//! - TokenSessionReference (14): o ULONG 0 (outro valor é
+//!   STATUS_INVALID_PARAMETER), com o SeTcbPrivilege: o token larga a
+//!   referência à sessão de logon (TOKEN_SESSION_NOT_REFERENCED em
+//!   TokenFlags, o SepStopReferencingLogonSession). O LSA faz isso com o
+//!   token de cada sessão que guarda (o LsapSetSessionToken), e a sessão
+//!   pode ser apagada com esse token vivo.
 //! - TokenSecurityAttributes (39): o
 //!   TOKEN_SECURITY_ATTRIBUTES_AND_OPERATION_INFORMATION (16 bytes: os
 //!   atributos e o vetor de operações), com o SeTcbPrivilege. As operações,
@@ -170,6 +176,23 @@ pub fn set(token: u64, class: u32, information: u64, length: u32, mode: u8) -> R
                 return Ok(STATUS_PRIVILEGE_NOT_HELD);
             }
             tokens::update(token, |record| record.session_id = session_id).map_or(STATUS_INVALID_PARAMETER, |_| 0)
+        }
+        // TokenSessionReference: só o 0 (o token larga a sessão de logon,
+        // o SepStopReferencingLogonSession), com o SeTcbPrivilege. Não muda
+        // o ModifiedId.
+        14 => {
+            if length != 4 {
+                return Ok(STATUS_INFO_LENGTH_MISMATCH);
+            }
+            let Ok(value) = guest::try_read::<u32>(information) else { return Ok(STATUS_ACCESS_VIOLATION) };
+            if !tcb() {
+                return Ok(STATUS_PRIVILEGE_NOT_HELD);
+            }
+            if value != 0 {
+                return Ok(STATUS_INVALID_PARAMETER);
+            }
+            tokens::stop_referencing_logon_session(token);
+            return Ok(0);
         }
         39 => {
             if information == 0 || length < 16 {

@@ -106,12 +106,13 @@ pub fn names(logon_id: u64) -> Option<(Vec<u16>, Vec<u16>)> {
 /// SepDeleteLogonSessionTrack (rva 0x77a490) sem a revogação de handles, o
 /// RmDeleteLogonSession do LSA: STATUS_NO_SUCH_LOGON_SESSION se a sessão não
 /// existe no silo e STATUS_BAD_LOGON_SESSION_STATE enquanto algum token dela
-/// existe (no NT, o ReferenceCount acima da referência da própria sessão).
+/// a referencia (no NT, o ReferenceCount acima da referência da própria
+/// sessão; um token com TOKEN_SESSION_NOT_REFERENCED não conta).
 /// Devolve o NTSTATUS.
 pub fn delete_track(logon_id: u64) -> u32 {
     with_sessions(|sessions| {
         let Some(position) = sessions.iter().position(|session| session.logon_id == logon_id && session.server_silo == 0) else { return STATUS_NO_SUCH_LOGON_SESSION };
-        if tokens::any(|token| token.authentication_id == logon_id && token.server_silo == 0) {
+        if tokens::any(|token| token.authentication_id == logon_id && token.server_silo == 0 && tokens::references_logon_session(token)) {
             return STATUS_BAD_LOGON_SESSION_STATE;
         }
         sessions.remove(position);

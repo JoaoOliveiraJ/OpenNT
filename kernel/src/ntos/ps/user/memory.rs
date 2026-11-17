@@ -70,6 +70,7 @@ use crate::ntos::mm::process_address_space::SYSTEM_ROOT;
 use crate::ntos::mm::process_commit;
 use crate::ntos::mm::paging_file::Slot as PageFileSlot;
 use crate::ntos::mm::working_set;
+use crate::ntos::mm::virtual_lock;
 use crate::ntos::mm::section::handles::{self as section_handles, Kind};
 use crate::ntos::mm::section::{address as section_address, views as section_views};
 use crate::ntos::ke::context_switch;
@@ -88,6 +89,8 @@ const STATUS_PROCESS_IS_TERMINATING: u32 = 0xC000_010A;
 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
 /// Direitos de acesso do handle de processo que os serviços exigem.
 const PROCESS_VM_OPERATION: u32 = 0x8;
+/// SeLockMemoryPrivilege.
+const SE_LOCK_MEMORY_PRIVILEGE: u64 = 4;
 const PROCESS_VM_READ: u32 = 0x10;
 const PROCESS_VM_WRITE: u32 = 0x20;
 pub const PROCESS_QUERY_INFORMATION: u32 = 0x400;
@@ -114,6 +117,9 @@ pub struct PrivateMut {
     /// liberação): o corte do working set não toca a região enquanto há
     /// alguma.
     pub busy: u32,
+    /// As páginas travadas pelo NtLockVirtualMemory (`mm/virtual_lock`):
+    /// MAP_PROCESS e MAP_SYSTEM em bits; o corte do working set não as leva.
+    pub locked: BTreeMap<u64, u8>,
 }
 
 /// Uma página fora do working set (o estado que a PTE de transição ou de
@@ -147,7 +153,7 @@ pub struct PrivateRegion {
 
 impl PrivateRegion {
     fn new(base: u64, size: u64, protect: u32, allocation_type: u32, pageable: bool) -> Arc<Self> {
-        let state = PrivateMut { frames: BTreeMap::new(), committed_pages: BTreeSet::new(), page_protects: BTreeMap::new(), protected_frames: BTreeMap::new(), paging: BTreeMap::new(), clean: BTreeMap::new(), busy: 0 };
+        let state = PrivateMut { frames: BTreeMap::new(), committed_pages: BTreeSet::new(), page_protects: BTreeMap::new(), protected_frames: BTreeMap::new(), paging: BTreeMap::new(), clean: BTreeMap::new(), busy: 0, locked: BTreeMap::new() };
         Arc::new(Self { base, size, protect, allocation_protect: protect, allocation_type, pageable, state: SpinLock::new(state) })
     }
 
@@ -954,6 +960,7 @@ pub fn free_in(space: Space, base_pointer: u64, size_pointer: u64, free_type: u3
             let mut state = owner.state.lock();
             if state.committed_pages.remove(&index) {
                 decommitted += 1;
+                state.locked.remove(&index);
                 state.page_protects.remove(&index);
                 state.protected_frames.remove(&index);
                 (state.frames.remove(&index), state.paging.remove(&index), state.clean.remove(&index))
@@ -1218,8 +1225,45 @@ fn nt_create_paging_file(name: u64, minimum: u64, maximum: u64, priority: u64, _
     crate::ntos::mm::paging_file::create::nt_create_paging_file(name, minimum, maximum, priority as u32)
 }
 
+/// NtLockVirtualMemory(process, base*, size*, MapType) e
+/// NtUnlockVirtualMemory: o processo do handle com PROCESS_VM_OPERATION, o
+/// SeLockMemoryPrivilege para MAP_SYSTEM e a trava de `mm/virtual_lock`;
+/// BaseAddress e RegionSize voltam arredondados a páginas no sucesso.
+fn lock_or_unlock(process: u64, base_pointer: u64, size_pointer: u64, map_type: u64, lock: bool) -> Result<u32, KernelError> {
+    let map_type = map_type as u32;
+    let (base, size) = match (guest::try_read::<u64>(base_pointer), guest::try_read::<u64>(size_pointer)) {
+        (Ok(base), Ok(size)) if state::probe_user_write(base_pointer, 8) && state::probe_user_write(size_pointer, 8) => (base, size),
+        _ => return Ok(STATUS_ACCESS_VIOLATION),
+    };
+    let (first, end) = match virtual_lock::validate(map_type, base, size) {
+        Ok(range) => range,
+        Err(status) => return Ok(status),
+    };
+    with_process_handle(process, PROCESS_VM_OPERATION, |target| {
+        if map_type & virtual_lock::MAP_SYSTEM != 0 && !crate::ntos::se::privilege::single_privilege_check(SE_LOCK_MEMORY_PRIVILEGE, USER_MODE as u32) {
+            return Ok(0xC000_0061);
+        }
+        let space = Space::of(target);
+        let status = if lock { virtual_lock::lock(space, first, end, map_type) } else { virtual_lock::unlock(space, first, end, map_type) };
+        if status & 0x8000_0000 == 0 && (guest::try_write::<u64>(base_pointer, first).is_err() || guest::try_write::<u64>(size_pointer, end - first).is_err()) {
+            return Ok(STATUS_ACCESS_VIOLATION);
+        }
+        Ok(status)
+    })
+}
+
+fn nt_lock_virtual_memory(process: u64, base_pointer: u64, size_pointer: u64, map_type: u64, _user_rsp: u64) -> Result<u32, KernelError> {
+    lock_or_unlock(process, base_pointer, size_pointer, map_type, true)
+}
+
+fn nt_unlock_virtual_memory(process: u64, base_pointer: u64, size_pointer: u64, map_type: u64, _user_rsp: u64) -> Result<u32, KernelError> {
+    lock_or_unlock(process, base_pointer, size_pointer, map_type, false)
+}
+
 /// Registra os handlers Nt*VirtualMemory e o NtCreatePagingFile.
 pub fn init() {
+    state::register_handler("NtLockVirtualMemory", nt_lock_virtual_memory);
+    state::register_handler("NtUnlockVirtualMemory", nt_unlock_virtual_memory);
     state::register_handler("NtCreatePagingFile", nt_create_paging_file);
     state::register_handler("NtAllocateVirtualMemory", nt_allocate_virtual_memory);
     state::register_handler("NtAllocateVirtualMemoryEx", nt_allocate_virtual_memory_ex);

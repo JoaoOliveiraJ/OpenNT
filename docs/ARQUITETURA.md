@@ -1935,7 +1935,13 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   (WMI_BUFFER_HEADER e registros EVENT_HEADER com HeaderType 0xC013, itens
   estendidos e dados), Flush e Stop; EtwWrite/EtwWriteTransfer/EtwWriteEx/
   EtwWriteString e o NtTraceEvent 0x300 da ntdll entregam só às sessões
-  cujo nível e keywords aceitam o evento. EtwSetInformation guarda os
+  cujo nível e keywords aceitam o evento. O NtTraceControl 24 (o
+  EtwpRegisterSecurityProvider) registra o primeiro processo como provedor
+  de eventos de segurança (o lsass.exe, pelo EtwRegisterSecurityProvider do
+  AdtpInitializeAuditingCommon); um segundo registro dá
+  STATUS_ACCESS_DENIED. O NtTraceEvent 0x500 (o EtwWriteUMSecurityEvent)
+  só aceita esse processo e vai às sessões de segurança, que o OpenNT não
+  tem: o evento é aceito sem destino. EtwSetInformation guarda os
   traits validados (STATUS_FILE_CORRUPT_ERROR mal formados) e liga o tipo
   dos descritores; EtwActivityIdControl usa o TEB.ActivityId da thread
   (thread de sistema: STATUS_NOT_SUPPORTED) e a semente do
@@ -2520,6 +2526,18 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     em VA de usuário e sondas de `guest_memory` passam por
     `working_set::page_in`. MmProbeAndLockPages trava os frames até o
     MmUnlockPages.
+  - NtLockVirtualMemory e NtUnlockVirtualMemory (`mm/virtual_lock.rs`, com
+    o ZwUnlockVirtualMemory): as validações do MiLockUnlockCommon (MapType
+    MAP_PROCESS/MAP_SYSTEM, faixa de usuário, PROCESS_VM_OPERATION e o
+    SeLockMemoryPrivilege do MAP_SYSTEM em UserMode) e a faixa em páginas
+    inteiras. A trava pede páginas comitadas de uma alocação privada
+    (STATUS_ACCESS_VIOLATION senão), traz de volta as que estão fora do
+    working set e marca cada página com o tipo; o corte não leva as
+    travadas. Tudo já travado dá STATUS_WAS_LOCKED; a destrava de uma página
+    não travada no tipo dá STATUS_NOT_LOCKED. O decommit leva a trava. O
+    VirtualLock do LsaInitializeProtectedMemory do lsasrv passa por aqui.
+    A trava de uma vista de seção fica recusada (STATUS_NOT_SUPPORTED), já
+    que o corte do OpenNT só toca alocações privadas.
   - NtQuerySystemInformation: SystemPerformanceInformation e
     SystemPageFileInformation(Ex).
   - Diferenças: sem working set por processo; pilha inicial, PEB, TEB e
@@ -3186,7 +3204,12 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   servidor RPC sai pelo envio adiado do NtWaitForWorkViaWorkerFactory (o
   WORKER_FACTORY_DEFERRED_WORK: a mensagem, a porta e as flags altas, sem
   pedido síncrono), que manda a mensagem antes de esperar trabalho
-  (`ps/user/alpc.rs::deferred_send`).
+  (`ps/user/alpc.rs::deferred_send`). O envio só acontece com o bit 0 do
+  Flags do bloco, como no 19041: o rpcrt4 deixa no bloco a mensagem do
+  envio anterior e liga o bit só quando há resposta nova. Antes, a mensagem
+  velha era reenviada a cada espera (STATUS_INVALID_PARAMETER ou
+  STATUS_REPLY_MESSAGE_MISMATCH, e uma resposta velha podia chegar a um
+  pedido novo com o mesmo MessageId).
 - **Os tokens de logon** (`se/token/create.rs`, `se/token/set_information.rs`):
   o NtCreateToken e o NtCreateTokenEx do LSA (SeCreateTokenPrivilege
   habilitado, TokenType, o nível pelo QoS num token de impersonação, a sessão
@@ -3196,7 +3219,10 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   e o NtSetInformationToken das classes TokenOwner, TokenPrimaryGroup,
   TokenDefaultDacl, TokenSessionId e TokenSecurityAttributes (as operações
   ADD, DELETE, REPLACE e REPLACE_ALL), com a máscara de classes e os acessos
-  do 19041. O CreateProcessAsUser passa o token no PS_ATTRIBUTE_TOKEN do
+  do 19041. O TokenSessionReference (só o valor 0, com o SeTcbPrivilege) faz
+  o token largar a sessão de logon (TOKEN_SESSION_NOT_REFERENCED em
+  TokenFlags): o LsapSetSessionToken do lsasrv faz isso com o token de cada
+  sessão que guarda, e o RmDeleteLogonSession não conta esse token. O CreateProcessAsUser passa o token no PS_ATTRIBUTE_TOKEN do
   NtCreateUserProcess: o processo novo recebe uma cópia dele com o SessionId
   da sessão do processo (o SeSubProcessToken do
   PspInitializeProcessSecurity), e quem cria precisa do
@@ -3221,7 +3247,15 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   1/2/4 por categoria), e o RmCreateLogonSession e o RmDeleteLogonSession
   criam e apagam sessões de logon (`se/logon_session.rs`, com
   STATUS_LOGON_SESSION_COLLISION e STATUS_BAD_LOGON_SESSION_STATE como no
-  NT). Os comandos 4 a 12 respondem STATUS_NOT_SUPPORTED, com registro. A
+  NT). O comando 4 grava o AccountName e o AuthorityName da sessão (o
+  SepUpdateLogonSessionTrack). O comando 5 instala a SACL global de um tipo
+  de objeto (`audit::set_global_sacl_from_lsa`, o SepRmGlobalSaclSetWrkr):
+  o valor padrão de `SECURITY\Policy\GlobalSaclName<tipo>`; sem a chave, a
+  resposta é STATUS_OBJECT_NAME_NOT_FOUND, que o LsapAdtInitialize do
+  lsasrv aceita. O comando 7 liga a auditoria da linha de comando. Os
+  comandos 6 e 8 a 12 respondem STATUS_NOT_SUPPORTED, com registro (o 6, as
+  políticas de acesso central, é o LsapApplyCAPsUpdate, cuja falha o lsasrv
+  só registra). A
   conexão de volta ainda não leva o PORT_VIEW de 4 KB do NT (o
   ZwSecureConnectPort de kernel não monta vistas), e o SepRmCallLsa (os
   comandos do Reference Monitor ao LSA) ainda não existe. O lado servidor
@@ -3326,7 +3360,17 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   alternados) e as faixas sujas no primário, entre o bloco base
   invalidado e o validado (`hive/sync.rs`); a carga de um primário
   invalidado aplica os logs (`hive/log.rs`). As chaves voláteis não ganham
-  célula.
+  célula. A classe de uma chave (o Class do NtCreateKey, capturado como no
+  CmCreateKey: Length ímpar dá STATUS_INVALID_PARAMETER) fica no nó e numa
+  célula própria da hive (Class e ClassLength do 'nk', com o MaxClassLen
+  do pai). O KeyNodeInformation a põe depois do nome, com o ClassOffset
+  alinhado a 8, e o KeyFullInformation logo depois do cabeçalho (0x2C),
+  como o CmpPopulateKeyNodeInformation e o CmpPopulateKeyFullInformation;
+  sem classe, o ClassOffset é 0xFFFFFFFF (`key/information.rs`). O
+  WxSaveSysKey do lsasrv grava assim a chave de sistema nas classes de
+  `Control\Lsa\{JD,Skew1,GBG,Data}`. A hive SECURITY do build não tem a
+  chave `Policy`: o lsasrv instala o banco de política de um sistema novo
+  no primeiro boot (o LsapDbInstallPolicyObject).
 - **Montagem das hives do boot** (`cm/hive_init.rs`, o CmInitSystem1 e o
   CmpInitializeHiveList): a fase 0 cria as chaves mestras
   (`\REGISTRY\MACHINE`, `\REGISTRY\USER` e `\REGISTRY\A`) e a hive volátil

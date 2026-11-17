@@ -8,7 +8,7 @@
 
 use crate::ntos::inc::field::{Field, NtStruct};
 use crate::ntos::ke::irql;
-use crate::ntos::mm::{memory_map, query_virtual};
+use crate::ntos::mm::{memory_map, query_virtual, virtual_lock};
 use crate::ntos::ps::process;
 use crate::ntos::ps::user::memory::{self, Space};
 use crate::rtl::KernelError;
@@ -141,33 +141,27 @@ pub fn protect(process_handle: u64, base_pointer: u64, size_pointer: u64, new_pr
     with_target(process_handle, |space| memory::protect_in(space, base_pointer, size_pointer, new_protect, old_pointer, false))
 }
 
-/// MAP_PROCESS | MAP_SYSTEM.
-const MAP_TYPE_MASK: u32 = 3;
-const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
-const STATUS_NOT_LOCKED: u32 = 0xC000_002A;
-
 /// ZwUnlockVirtualMemory(Process, BaseAddress*, RegionSize*, MapType) em
 /// KernelMode, como o NtUnlockVirtualMemory do ntoskrnl 19041 (0x2ae5c0):
-/// o MiLockUnlockCommon recusa MapType fora de MAP_PROCESS/MAP_SYSTEM ou
-/// sem nenhum dos dois, base acima de MM_HIGHEST_USER_ADDRESS, faixa além de
-/// MM_USER_PROBE_ADDRESS e tamanho zero com STATUS_INVALID_PARAMETER, depois
-/// referencia o processo (PROCESS_VM_OPERATION; o SeLockMemoryPrivilege do
-/// MAP_SYSTEM é sempre concedido em KernelMode). Cada página da faixa precisa
-/// estar travada no working set (MAP_PROCESS) ou na memória física
-/// (MAP_SYSTEM); uma faixa fora dos VADs ou uma página não travada termina
-/// com STATUS_NOT_LOCKED, sem gravar BaseAddress e RegionSize. Só o
-/// NtLockVirtualMemory trava páginas, e o OpenNT não o implementa: nenhuma
-/// página está travada, então toda faixa válida devolve STATUS_NOT_LOCKED.
+/// as validações do MiLockUnlockCommon e a destrava de `mm/virtual_lock`
+/// (o SeLockMemoryPrivilege do MAP_SYSTEM é sempre concedido em
+/// KernelMode). Cada página da faixa precisa estar travada no tipo; senão
+/// STATUS_NOT_LOCKED, sem gravar BaseAddress e RegionSize.
 pub fn unlock(process_handle: u64, base_pointer: u64, size_pointer: u64, map_type: u32) -> Result<u32, KernelError> {
-    if map_type & !MAP_TYPE_MASK != 0 || map_type & MAP_TYPE_MASK == 0 {
-        return Ok(STATUS_INVALID_PARAMETER);
-    }
     // SAFETY: PVOID*/SIZE_T* de um chamador de modo kernel, não sondados.
-    let (base, size) = unsafe { (Field::<u64>::at(base_pointer).get(), Field::<u64>::at(size_pointer).get()) };
-    if base > memory_map::HIGHEST_USER_ADDRESS || memory_map::USER_PROBE_ADDRESS - base < size || size == 0 {
-        return Ok(STATUS_INVALID_PARAMETER);
-    }
-    with_target(process_handle, |_space| Ok(STATUS_NOT_LOCKED))
+    let (base_field, size_field) = unsafe { (Field::<u64>::at(base_pointer), Field::<u64>::at(size_pointer)) };
+    let (first, end) = match virtual_lock::validate(map_type, base_field.get(), size_field.get()) {
+        Ok(range) => range,
+        Err(status) => return Ok(status),
+    };
+    with_target(process_handle, |space| {
+        let status = virtual_lock::unlock(space, first, end, map_type);
+        if status == 0 {
+            base_field.set(first);
+            size_field.set(end - first);
+        }
+        Ok(status)
+    })
 }
 
 const STATUS_INVALID_PARAMETER_2: u32 = 0xC000_00F0;

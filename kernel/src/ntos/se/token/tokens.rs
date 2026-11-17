@@ -42,6 +42,21 @@ const _: () = {
 
 /// TOKEN_LOWBOX em TokenFlags: token de AppContainer.
 const TOKEN_LOWBOX: u32 = 0x4000;
+/// TOKEN_SESSION_NOT_REFERENCED em TokenFlags: o token não segura mais a
+/// sessão de logon dele.
+pub const TOKEN_SESSION_NOT_REFERENCED: u32 = 0x20;
+
+/// SepStopReferencingLogonSession: o token larga a referência à sessão de
+/// logon (TOKEN_SESSION_NOT_REFERENCED). Devolve se ainda a segurava.
+pub fn stop_referencing_logon_session(pointer: u64) -> bool {
+    let flags = body(pointer).token_flags.atomic().fetch_or(TOKEN_SESSION_NOT_REFERENCED, core::sync::atomic::Ordering::SeqCst);
+    flags & TOKEN_SESSION_NOT_REFERENCED == 0
+}
+
+/// O token ainda segura a sessão de logon dele.
+pub fn references_logon_session(token: &Token) -> bool {
+    body(token.pointer).token_flags.get() & TOKEN_SESSION_NOT_REFERENCED == 0
+}
 
 pub fn set_luid(luid: &Luid, value: u64) {
     luid.low_part.set(value as u32);

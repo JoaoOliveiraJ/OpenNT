@@ -357,6 +357,14 @@ const SMSS_PROGRAMS: &[&str] = &[
     // wldp.dll carrega.
     "msprivs.dll",
     "ole32.dll",
+    // Os pacotes de segurança que o LoadPackages do lsasrv carrega (o
+    // negoexts.dll e o kerberos.dll) e o netlogon.dll que o samsrv.dll
+    // carrega, com o logoncli.dll e o gmsaclient.dll que ele importa.
+    "negoexts.dll",
+    "kerberos.dll",
+    "netlogon.dll",
+    "logoncli.dll",
+    "gmsaclient.dll",
 ];
 
 /// As imagens de kernel do caminho do smss (`--initial-process=smss`): o
