@@ -617,6 +617,13 @@ pub fn initialize() -> Result<(), KernelError> {
     Ok(())
 }
 
+/// No boot do processo inicial real (`--initial-process=smss`) o gerenciador
+/// de serviços é o services.exe real: o `\RPC Control\ntsvcs` (o
+/// RpcServerUseProtseqEp do ScEnableRpcInterface) e o evento de
+/// disponibilidade são dele, e o kernel não registra nada.
 pub fn init() {
+    if crate::ntos::init::boot_config::smss_boot() {
+        return;
+    }
     index::set_late_initializer(index::late::SERVICE_RPC, initialize);
 }

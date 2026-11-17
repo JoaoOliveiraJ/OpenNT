@@ -979,6 +979,7 @@ fn create_listener(out: u64, attributes: u64, name: Option<String>, initial: Por
     let (parent, leaf) = match &name {
         Some(path) => {
             if object_manager::lookup(path).is_some() {
+                crate::debug_print!("[alpc] porta de servidor {} ja existe (pid {})", path, process::get_current_process_id());
                 return Ok(STATUS_OBJECT_NAME_COLLISION);
             }
             let split = path.rfind('\\').unwrap_or(0);

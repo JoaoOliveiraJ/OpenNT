@@ -2833,7 +2833,9 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   (`cm/ini_file_mapping.rs`) e, na hive volátil HARDWARE, fica o
   `HARDWARE\DESCRIPTION\System\CentralProcessor\<n>` do CPUID
   (`cm/hw_description.rs`). Nesse boot ficam desligados a imitação do csrss
-  (`ps/user/csr.rs`), o `\KnownDlls` montado pelo kernel, o provisionamento
+  (`ps/user/csr.rs`), a do gerenciador de serviços (`cm/service/rpc.rs`, o
+  `\RPC Control\ntsvcs` e o `SvcctrlStartEvent_A3752DX`, que são do
+  services.exe real), o `\KnownDlls` montado pelo kernel, o provisionamento
   de KnownDlls de `mm/section/open.rs` e o multi-sz de KnownDLLs que o
   kernel semeava: o próprio smss monta o `\KnownDlls`, os DosDevices,
   `\Sessions` e os prefixos protegidos dos pipes e mailslots. O smss é

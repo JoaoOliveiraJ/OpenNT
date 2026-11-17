@@ -317,12 +317,29 @@ static LSASS_STARTED: AtomicBool = AtomicBool::new(false);
 /// `\RPC Control\ntsvcs` do RpcServerUseProtseqEp do ScEnableRpcInterface,
 /// depois do ScInitDatabase).
 pub fn server_port_created(name: &str) {
+    lsa_endpoint_created(name);
     if !boot_config::smss_boot() || SERVICES_STARTED.load(Ordering::Acquire) || !name.eq_ignore_ascii_case("\\RPC Control\\ntsvcs") {
         return;
     }
     if image_name(process::get_current_process()).eq_ignore_ascii_case("services.exe") && !SERVICES_STARTED.swap(true, Ordering::AcqRel) {
         crate::debug_print!("[init] services.exe (pid {}): interface RPC do gerenciador de servicos em {}", process::get_current_process_id(), name);
         crate::debug_print!("SERVICES_STARTED");
+    }
+}
+
+static LSA_POLICY_READY: AtomicBool = AtomicBool::new(false);
+
+/// O `LSA_POLICY_READY` sai quando o lsass.exe publica o
+/// `\RPC Control\LSARPC_ENDPOINT` (o LsapRPCInit do LsapInitLsa do lsasrv):
+/// o banco de política instalado, a auditoria, as sessões de logon, as
+/// credenciais e os pacotes de segurança já inicializados.
+fn lsa_endpoint_created(name: &str) {
+    if !boot_config::smss_boot() || LSA_POLICY_READY.load(Ordering::Acquire) || !name.eq_ignore_ascii_case("\\RPC Control\\LSARPC_ENDPOINT") {
+        return;
+    }
+    if image_name(process::get_current_process()).eq_ignore_ascii_case("lsass.exe") && !LSA_POLICY_READY.swap(true, Ordering::AcqRel) {
+        crate::debug_print!("[init] lsass.exe (pid {}): LsapInitLsa publicou {}", process::get_current_process_id(), name);
+        crate::debug_print!("LSA_POLICY_READY");
     }
 }
 
