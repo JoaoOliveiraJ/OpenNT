@@ -3027,7 +3027,9 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   é o desta instalação (o xtask copia o `Control\Nls\Language`, o
   `Control\MUI\UILanguages` e o perfil de idioma da DEFAULT do Registro
   desta máquina, e põe no volume os `.mui` dos programas nos idiomas de
-  interface daqui; o kernel lê o `Control\Nls\Language` no boot,
+  interface daqui, ou no idioma de fallback (o `DefaultFallback` do idioma
+  e o `InstallLanguageFallback`, como o en-US) para um programa sem `.mui`
+  neles; o kernel lê o `Control\Nls\Language` no boot,
   `ps/locale.rs`): os callbacks ao user32 do wininit acham o
   `<idioma>\USER32.dll.mui`. O ConvertHandleAndVerifyLoc do win32kbase
   confere o layout de teclado pelo nome do ObQueryNameString do

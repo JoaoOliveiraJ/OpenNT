@@ -696,19 +696,21 @@ pub fn ntfs_files(root: &Path, kernel_pe: &[u8], initial_process: &str) -> Resul
         // Os recursos dos programas e das imagens de System32 nos idiomas de
         // interface desta máquina (`System32\<idioma>\<nome>.mui`), que o
         // carregador de recursos procura pelo idioma do convidado (o mesmo
-        // daqui, `host_language`).
+        // daqui, `host_language`), ou no idioma de fallback quando o
+        // arquivo não tem `.mui` neles.
         let languages = crate::host_language::ui_languages();
+        let fallbacks = crate::host_language::fallback_languages(&languages);
         let names = SMSS_PROGRAMS.iter().chain(SERVICE_CHAIN_PROGRAMS).copied().chain(SMSS_KERNEL_IMAGES.iter().filter_map(|(_, relative)| relative.strip_prefix("System32/").filter(|rest| !rest.contains('/'))));
         let mut resources = 0;
         for name in names {
-            for (path, source) in crate::host_language::mui_files(&system32, name, &languages) {
+            for (path, source) in crate::host_language::mui_files(&system32, name, &languages, &fallbacks) {
                 if let Ok(bytes) = fs::read(&source) {
                     files.push((path, bytes));
                     resources += 1;
                 }
             }
         }
-        println!("recursos .mui no volume NTFS: {resources} (idiomas {})", languages.join(", "));
+        println!("recursos .mui no volume NTFS: {resources} (idiomas {}; fallback {})", languages.join(", "), fallbacks.join(", "));
         // Os manifestos dos assemblies lado a lado (o contexto de ativação
         // padrão do sistema e os controles comuns da versão 6, de
         // `side_by_side`) e os arquivos deles, no caminho de WinSxS.

@@ -1,7 +1,8 @@
 //! O idioma desta instalação do Windows, lido do Registro desta máquina no
 //! build: o convidado do boot do processo inicial real
 //! (`--initial-process=smss`) tem a mesma configuração de idioma, e o
-//! volume leva os arquivos `.mui` do mesmo idioma.
+//! volume leva os arquivos `.mui` do mesmo idioma (ou, para um arquivo que
+//! não tem `.mui` nele, os do idioma de fallback, como o en-US).
 //!
 //! As chaves vêm inteiras, com os valores e os tipos como estão aqui:
 //! - na SYSTEM, `Control\Nls\Language` (o `Default`, que o kernel lê como
@@ -121,6 +122,18 @@ pub(crate) mod registry {
     pub fn list(root: Hkey, path: &str) -> Vec<String> {
         open(root, path).map(|key| subkeys(&key)).unwrap_or_default()
     }
+
+    /// As cadeias do valor `name` de `path` (REG_SZ, REG_EXPAND_SZ ou
+    /// REG_MULTI_SZ), sem as vazias.
+    pub fn strings(root: Hkey, path: &str, name: &str) -> Vec<String> {
+        let Some(key) = open(root, path) else { return Vec::new() };
+        let Some((_, kind, data)) = values(&key).into_iter().find(|(value, _, _)| value.eq_ignore_ascii_case(name)) else { return Vec::new() };
+        if !matches!(kind, 1 | 2 | 7) {
+            return Vec::new();
+        }
+        let units: Vec<u16> = data.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect();
+        units.split(|&unit| unit == 0).filter(|text| !text.is_empty()).map(String::from_utf16_lossy).collect()
+    }
 }
 
 /// As chaves de idioma da SYSTEM, já no conjunto de controle que a hive
@@ -162,12 +175,44 @@ pub fn ui_languages() -> Vec<String> {
     }
 }
 
+/// Os idiomas de recurso para um arquivo sem `.mui` nos idiomas de
+/// interface, na ordem em que o carregador os procura: o `DefaultFallback`
+/// de cada idioma de interface (`Control\MUI\UILanguages\<idioma>`) e o
+/// `InstallLanguageFallback` de `Control\Nls\Language`, sem os idiomas de
+/// interface.
+pub fn fallback_languages(languages: &[String]) -> Vec<String> {
+    #[cfg(windows)]
+    {
+        let mut fallbacks: Vec<String> = Vec::new();
+        let control = "SYSTEM\\CurrentControlSet\\Control";
+        let candidates = languages
+            .iter()
+            .flat_map(|language| registry::strings(registry::LOCAL_MACHINE, &format!("{control}\\MUI\\UILanguages\\{language}"), "DefaultFallback"))
+            .chain(registry::strings(registry::LOCAL_MACHINE, &format!("{control}\\Nls\\Language"), "InstallLanguageFallback"));
+        for candidate in candidates {
+            let known = |list: &[String]| list.iter().any(|language| language.eq_ignore_ascii_case(&candidate));
+            if !known(languages) && !known(&fallbacks) {
+                fallbacks.push(candidate);
+            }
+        }
+        fallbacks
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = languages;
+        Vec::new()
+    }
+}
+
 /// Os `.mui` de `name` (um arquivo de `directory`) nos idiomas de interface
-/// desta máquina: (caminho relativo `idioma/NOME.MUI`, arquivo de origem).
-pub fn mui_files(directory: &Path, name: &str, languages: &[String]) -> Vec<(String, std::path::PathBuf)> {
-    languages
-        .iter()
-        .map(|language| (format!("{language}/{}.MUI", name.to_uppercase()), directory.join(language).join(format!("{name}.mui"))))
-        .filter(|(_, source)| source.is_file())
-        .collect()
+/// desta máquina ou, se nenhum deles tiver o arquivo, no primeiro idioma de
+/// `fallbacks` que o tiver: (caminho relativo `idioma/NOME.MUI`, arquivo de
+/// origem).
+pub fn mui_files(directory: &Path, name: &str, languages: &[String], fallbacks: &[String]) -> Vec<(String, std::path::PathBuf)> {
+    let candidate = |language: &String| (format!("{language}/{}.MUI", name.to_uppercase()), directory.join(language).join(format!("{name}.mui")));
+    let found: Vec<(String, std::path::PathBuf)> = languages.iter().map(candidate).filter(|(_, source)| source.is_file()).collect();
+    if !found.is_empty() {
+        return found;
+    }
+    fallbacks.iter().map(candidate).find(|(_, source)| source.is_file()).into_iter().collect()
 }
