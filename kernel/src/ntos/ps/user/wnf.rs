@@ -74,7 +74,15 @@ fn nt_delete_wnf_state_data(state_name: u64, explicit_scope: u64, _: u64, _: u64
     wnf_service::delete_state_data_user(state_name, explicit_scope)
 }
 
+/// NtGetCompleteWnfStateSubscription(OldDescriptorStateName,
+/// OldSubscriptionId, OldDescriptorEventMask, OldDescriptorStatus,
+/// NewDeliveryDescriptor, DescriptorSize).
+fn nt_get_complete_wnf_state_subscription(old_name: u64, old_id: u64, old_mask: u64, old_status: u64, rsp: u64) -> Result<u32, KernelError> {
+    wnf_service::get_complete_subscription_user(old_name, old_id, old_mask as u32, old_status as u32, state::stack_arg(rsp, 5), state::stack_arg32(rsp, 6))
+}
+
 pub fn init() {
+    state::register_handler("NtGetCompleteWnfStateSubscription", nt_get_complete_wnf_state_subscription);
     state::register_handler("NtDeleteWnfStateData", nt_delete_wnf_state_data);
     state::register_handler("NtUnsubscribeWnfStateChange", nt_unsubscribe_wnf_state_change);
     state::register_handler("NtDeleteWnfStateName", nt_delete_wnf_state_name);

@@ -500,6 +500,69 @@ pub fn delete_state_data_user(state_name: u64, explicit_scope: u64) -> Result<u3
     Ok(result)
 }
 
+/// NtGetCompleteWnfStateSubscription(OldDescriptorStateName,
+/// OldSubscriptionId, OldDescriptorEventMask, OldDescriptorStatus,
+/// NewDeliveryDescriptor, DescriptorSize) de modo usuário (19041, rva
+/// 0x60e320), o laço do RtlpWnfNotificationThread da ntdll:
+///
+/// - sem o WnfContext do processo, STATUS_INVALID_PARAMETER;
+/// - com o nome e o SubscriptionId anteriores, a máscara não pode ser zero e
+///   o status só pode ser 0 ou STATUS_RETRY (senão
+///   STATUS_INVALID_PARAMETER); os dois são capturados antes de qualquer
+///   escrita (a ntdll aponta para dentro do mesmo buffer do descritor novo)
+///   e o ExpWnfCompleteThreadSubscriptions conclui a entrega anterior;
+/// - com DescriptorSize, ele precisa de 0x1030 bytes
+///   (STATUS_BUFFER_TOO_SMALL), o buffer é sondado com alinhamento 8 e o
+///   ExpWnfDeliverThreadNotifications escreve o próximo descritor;
+/// - sem as duas partes, STATUS_INVALID_PARAMETER.
+pub fn get_complete_subscription_user(old_name: u64, old_id: u64, old_mask: u32, old_status: u32, descriptor: u64, size: u32) -> Result<u32, KernelError> {
+    use crate::ntos::mm::guest_memory as guest;
+    use crate::ntos::ps::user::state as user_state;
+    const MINIMUM_DESCRIPTOR: u32 = 0x1030;
+    critical_region::enter_critical()?;
+    let result = (|| -> Result<u32, KernelError> {
+        let context = super::objects::process_at(process::get_current_process()).wnf_context.get();
+        if context == 0 {
+            return Ok(0xC000_000D);
+        }
+        let mut status = 0xC000_000D;
+        if old_name != 0 && old_id != 0 {
+            if old_mask == 0 || (old_status != 0 && old_status != 0xC000_022D) {
+                return Ok(0xC000_000D);
+            }
+            if !user_state::probe_user_read(old_name, 8) || !user_state::probe_user_read(old_id, 8) {
+                return Ok(STATUS_ACCESS_VIOLATION);
+            }
+            let (Ok(encoded), Ok(identifier)) = (guest::try_read::<u64>(old_name), guest::try_read::<u64>(old_id)) else { return Ok(STATUS_ACCESS_VIOLATION) };
+            let name = wnf_name::decode(encoded);
+            if name.status != 0 {
+                return Ok(0xC000_000D);
+            }
+            status = notifications::complete_thread_subscriptions(context, name.decoded_name, identifier, old_mask, old_status)?;
+            if status & 0x8000_0000 != 0 {
+                return Ok(status);
+            }
+        }
+        if size != 0 {
+            if size < MINIMUM_DESCRIPTOR {
+                return Ok(0xC000_0023);
+            }
+            if descriptor & 7 != 0 {
+                return Ok(0x8000_0002);
+            }
+            if !user_state::probe_user_write(descriptor, size as u64) {
+                return Ok(STATUS_ACCESS_VIOLATION);
+            }
+            status = notifications::deliver_thread_notifications(context, descriptor, size)?;
+        }
+        Ok(status)
+    })();
+    let left = critical_region::leave_critical();
+    let result = result?;
+    left?;
+    Ok(result)
+}
+
 /// NtUnsubscribeWnfStateChange(StateName) de modo usuário: o nome sondado e
 /// decodificado e a inscrição do processo corrente removida
 /// (`notifications::delete_subscription_by_name`).

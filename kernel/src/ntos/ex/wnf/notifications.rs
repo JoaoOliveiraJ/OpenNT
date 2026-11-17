@@ -509,6 +509,235 @@ pub fn delete_subscription_by_name(process: u64, decoded_name: u64) -> Result<u3
 }
 
 /// Versões para o ciclo de vida do namespace (`fn` sem resultado).
+const STATUS_RETRY: u32 = 0xC000_022D;
+const STATUS_NO_MORE_ENTRIES: u32 = 0x8000_001A;
+const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+/// O cabeçalho WNF_DELIVERY_DESCRIPTOR antes dos dados.
+const DELIVERY_HEADER: u64 = 0x30;
+
+/// ExpWnfCompleteThreadSubscriptions (19041, rva 0x60e73c): o fim da
+/// entrega anterior do processo. Sob o ProcessSubscriptionListLock
+/// (compartilhado) e o DeliveryPendingListLock (exclusivo), procura na fila
+/// a inscrição com o SubscriptionId e o nome dados.
+///
+/// - Achada, só age com a máscara igual ao InDeliveryEventSet e o estado em
+///   entrega (> 1). Com sinais novos chegados na entrega, volta a READY (e
+///   STATUS_RETRY religa o bit 0); sem eles, STATUS_RETRY a deixa em RETRY
+///   na fila e o sucesso a tira da fila (estado 0). Nos dois primeiros casos
+///   a entrega dos dados que acabou (bit 0 entregue e não sinalizado de
+///   novo) desconta o CurrentDeliveryCount do nome, e o InDeliveryEventSet
+///   zera.
+/// - Não achada, com o bit 0 na máscara: o nome do escopo do processo
+///   desconta o CurrentDeliveryCount.
+///
+/// O nome cujo contador chega a zero recebe, fora das travas, o aviso de
+/// entrega concluída (máscara 8).
+pub fn complete_thread_subscriptions(context: u64, decoded_name: u64, subscription_id: u64, event_mask: u32, status: u32) -> Result<u32, KernelError> {
+    let pending_lock = process_context_at(context).delivery_pending_list_lock.address();
+    let pending_head = process_context_at(context).delivery_pending_list_head.address();
+    let (found, kept) = locked(process_context_at(context).process_subscription_list_lock.address(), false, || {
+        locked(pending_lock, true, || {
+            let mut entry = list_entry::at(pending_head).flink.get();
+            while entry != pending_head {
+                let subscription = entry - offset_of!(WnfSubscription, pending_subscription_list_entry) as u64;
+                let record = subscription_at(subscription);
+                if record.subscription_id.get() != subscription_id || record.state_name.bitfield_0.get() != decoded_name {
+                    entry = list_entry::at(entry).flink.get();
+                    continue;
+                }
+                if event_mask != record.in_delivery_event_set.get() || record.subscription_state.get().0 <= 1 {
+                    return Ok((true, 0));
+                }
+                let signaled = record.signaled_event_set.get();
+                if signaled != 0 {
+                    record.subscription_state.set(WnfSubscriptionState(1));
+                    if status == STATUS_RETRY && signaled & 1 == 0 {
+                        record.signaled_event_set.set(signaled | 1);
+                    }
+                } else if status != 0 {
+                    record.subscription_state.set(WnfSubscriptionState(3));
+                    return Ok((true, 0));
+                } else {
+                    record.subscription_state.set(WnfSubscriptionState(0));
+                    unlink(entry)?;
+                }
+                let mut kept = 0;
+                let name = record.name_instance.get();
+                if record.signaled_event_set.get() & 1 == 0 && record.in_delivery_event_set.get() & 1 != 0 && name != 0 && change_counter(&name_at(name).current_delivery_count, -1)? == 0 && rundown::acquire(name_at(name).run_ref.address())? {
+                    kept = name;
+                }
+                record.in_delivery_event_set.set(0);
+                return Ok((true, kept));
+            }
+            Ok((false, 0))
+        })
+    })?;
+    let mut kept = kept;
+    let mut lookup = None;
+    if !found && event_mask & 1 != 0 {
+        let process = process_context_at(context).process.get();
+        if let Ok(scope) = super::namespace::resolve_creator_scope(process, ((decoded_name >> 6) & 0xF) as u32)? {
+            if let Ok(state) = super::namespace::lookup_name(scope, decoded_name)? {
+                if change_counter(&name_at(state.pointer).current_delivery_count, -1)? == 0 {
+                    kept = state.pointer;
+                    lookup = Some(state);
+                } else {
+                    super::namespace::release_name(&state)?;
+                }
+            }
+            super::namespace::release_scope(scope)?;
+        }
+    }
+    if kept != 0 {
+        notify_name(kept, 8, true, true)?;
+        match lookup {
+            Some(state) => super::namespace::release_name(&state)?,
+            None => rundown::release(name_at(kept).run_ref.address())?,
+        }
+    }
+    Ok(0)
+}
+
+/// O fim de uma inscrição sem nada a entregar (o caminho frio do
+/// ExpWnfDeliverThreadNotifications): sai da fila, estado 0, sinais e
+/// entrega zerados. Devolve o nome a avisar quando a entrega de dados
+/// pendente zera o CurrentDeliveryCount dele.
+fn retire_pending(entry: u64, name: u64) -> Result<u64, KernelError> {
+    let record = subscription_at(entry - offset_of!(WnfSubscription, pending_subscription_list_entry) as u64);
+    unlink(entry)?;
+    record.subscription_state.set(WnfSubscriptionState(0));
+    let old = record.signaled_event_set.get();
+    record.signaled_event_set.set(0);
+    record.in_delivery_event_set.set(0);
+    if name != 0 && old & 1 != 0 && change_counter(&name_at(name).current_delivery_count, -1)? == 0 {
+        return Ok(name);
+    }
+    Ok(0)
+}
+
+/// O resultado de um passo da busca do ExpWnfDeliverThreadNotifications.
+enum Delivery {
+    /// O status final (um descritor escrito, nada pendente ou a falha).
+    Done(u32),
+    /// Um nome a avisar fora das travas; a busca recomeça do início.
+    Restart(u64),
+}
+
+/// ExpWnfDeliverThreadNotifications (19041, rva 0x60e474): a próxima
+/// inscrição READY da fila do processo vira um WNF_DELIVERY_DESCRIPTOR no
+/// buffer do chamador (o SubscriptionId, o nome externo, a máscara e, com o
+/// bit 0, o TypeId, o ChangeStamp e os dados depois dos 0x30 bytes do
+/// cabeçalho). A inscrição fica na fila em entrega (estado 2) com a máscara
+/// entregue no InDeliveryEventSet; uma por chamada. A que não tem o que
+/// entregar sai da fila. Sem nenhuma, STATUS_NO_MORE_ENTRIES; uma leitura de
+/// dados que falha vale como resultado se nenhuma outra entrega ocorrer.
+pub fn deliver_thread_notifications(context: u64, descriptor: u64, size: u32) -> Result<u32, KernelError> {
+    let available = size.saturating_sub(DELIVERY_HEADER as u32);
+    let pending_lock = process_context_at(context).delivery_pending_list_lock.address();
+    let pending_head = process_context_at(context).delivery_pending_list_head.address();
+    loop {
+        let step = locked(process_context_at(context).process_subscription_list_lock.address(), false, || {
+            locked(pending_lock, true, || -> Result<Delivery, KernelError> {
+                let mut result = STATUS_NO_MORE_ENTRIES;
+                let mut entry = list_entry::at(pending_head).flink.get();
+                while entry != pending_head {
+                    let next = list_entry::at(entry).flink.get();
+                    let record = subscription_at(entry - offset_of!(WnfSubscription, pending_subscription_list_entry) as u64);
+                    if record.subscription_state.get().0 != 1 {
+                        entry = next;
+                        continue;
+                    }
+                    let mut name = record.name_instance.get();
+                    if name != 0 && !rundown::acquire(name_at(name).run_ref.address())? {
+                        name = 0;
+                    }
+                    let mut mask = record.subscribed_event_set.get() & record.signaled_event_set.get();
+                    if name == 0 {
+                        mask &= !1;
+                    }
+                    if mask == 0 {
+                        let notify = retire_pending(entry, name)?;
+                        if notify != 0 {
+                            return Ok(Delivery::Restart(notify));
+                        }
+                        if name != 0 {
+                            rundown::release(name_at(name).run_ref.address())?;
+                        }
+                        entry = next;
+                        continue;
+                    }
+                    let mut header = [0u8; DELIVERY_HEADER as usize];
+                    header[0..8].copy_from_slice(&record.subscription_id.get().to_le_bytes());
+                    header[8..16].copy_from_slice(&(record.state_name.bitfield_0.get() ^ wnf_name::NAME_MASK).to_le_bytes());
+                    let (mut stamp, mut read_status) = (0u32, 0u32);
+                    let written = (|| -> Result<(), KernelError> {
+                        if mask & 1 != 0 {
+                            let type_identifier = name_at(name).state_name_info.type_id.get();
+                            if type_identifier != 0 {
+                                header[0x1C..0x2C].copy_from_slice(&guest::read_bytes(type_identifier, 16));
+                            }
+                            let cells = guest::alloc_bytes(8);
+                            if cells == 0 {
+                                return Err(KernelError::new("WNF delivery cells allocation failed"));
+                            }
+                            guest::write64(cells, 0);
+                            read_status = super::data_block::read(&super::namespace::describe_name(name), cells, descriptor + DELIVERY_HEADER, available, cells + 4)?;
+                            if read_status & 0x8000_0000 == 0 {
+                                stamp = guest::read32(cells);
+                                header[0x10..0x14].copy_from_slice(&stamp.to_le_bytes());
+                                header[0x14..0x18].copy_from_slice(&guest::read32(cells + 4).to_le_bytes());
+                            }
+                            guest::free_bytes(cells);
+                        }
+                        header[0x18..0x1C].copy_from_slice(&mask.to_le_bytes());
+                        header[0x2C..0x30].copy_from_slice(&(DELIVERY_HEADER as u32).to_le_bytes());
+                        guest::try_write_bytes(descriptor, &header)
+                    })();
+                    if name != 0 {
+                        rundown::release(name_at(name).run_ref.address())?;
+                    }
+                    if let Err(error) = written {
+                        if error.status == STATUS_ACCESS_VIOLATION {
+                            return Ok(Delivery::Done(STATUS_ACCESS_VIOLATION));
+                        }
+                        return Err(error);
+                    }
+                    if read_status == STATUS_ACCESS_VIOLATION {
+                        return Ok(Delivery::Done(STATUS_ACCESS_VIOLATION));
+                    }
+                    if read_status & 0x8000_0000 != 0 {
+                        if result == STATUS_NO_MORE_ENTRIES {
+                            result = read_status;
+                        }
+                        entry = next;
+                        continue;
+                    }
+                    if stamp == 0 {
+                        mask &= !1;
+                    }
+                    if mask == 0 {
+                        retire_pending(entry, 0)?;
+                        entry = next;
+                        continue;
+                    }
+                    record.in_delivery_event_set.set(mask);
+                    record.signaled_event_set.set(0);
+                    record.subscription_state.set(WnfSubscriptionState(2));
+                    return Ok(Delivery::Done(0));
+                }
+                Ok(Delivery::Done(result))
+            })
+        })?;
+        match step {
+            Delivery::Done(status) => return Ok(status),
+            Delivery::Restart(name) => {
+                notify_name(name, 8, true, true)?;
+                rundown::release(name_at(name).run_ref.address())?;
+            }
+        }
+    }
+}
+
 pub fn detach_name_hook(name: u64) {
     if let Err(error) = detach_name(name) {
         debug_print!("[wnf] {}", error);

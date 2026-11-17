@@ -4372,6 +4372,49 @@ fn user_wnf(assert: Assert) {
         let again = call("NtSetWnfProcessNotificationEvent", event, 0, 0, 0);
         let invalid = call("NtSetWnfProcessNotificationEvent", 0x7FFF_0000, 0, 0, 0);
         assert(created == Some(0) && registered == Some(0) && again == Some(0xC000_0718) && invalid.is_some_and(|status| status & 0x8000_0000 != 0), "userwnf: evento de notificacao do processo registrado uma vez");
+        // NtGetCompleteWnfStateSubscription: recusas, a fila vazia e a
+        // entrega de uma escrita de kernel no nome assinado (o descritor com
+        // o SubscriptionId, o nome externo, a máscara, o carimbo e os dados
+        // depois dos 0x30 bytes), concluída em seguida.
+        if let Ok(delivery) = memory::map_user_region(0x2000) {
+            let complete = |old_name: u64, old_id: u64, old_mask: u64, old_status: u64, descriptor: u64, size: u64| {
+                guest::write64(own_rsp + 0x28, descriptor);
+                guest::write64(own_rsp + 0x30, size);
+                call("NtGetCompleteWnfStateSubscription", old_name, old_id, old_mask, old_status)
+            };
+            let nothing = complete(0, 0, 0, 0, 0, 0);
+            let small = complete(0, 0, 0, 0, delivery, 0x100);
+            let misaligned = complete(0, 0, 0, 0, delivery + 4, 0x1030);
+            let bad_status = complete(name, identifier, 1, 0xC000_0001, delivery, 0x1030);
+            let empty = complete(0, 0, 0, 0, delivery, 0x1030);
+            let kernel_name = guest::alloc_bytes(0x10);
+            guest::write64(kernel_name, 0x0280_032E_A3BC_0875);
+            guest::write32(kernel_name + 8, 0x0BAD_F00D);
+            let updated = crate::ntos::ex::wnf::service::update(kernel_name, kernel_name + 8, 4, 0, 0, 0, false).ok();
+            guest::free_bytes(kernel_name);
+            let delivered = complete(0, 0, 0, 0, delivery, 0x1030);
+            let header = (guest::read64(delivery), guest::read64(delivery + 8), guest::read32(delivery + 0x14), guest::read32(delivery + 0x18), guest::read32(delivery + 0x2C), guest::read32(delivery + 0x30));
+            let stamp = guest::read32(delivery + 0x10);
+            let finished = complete(delivery + 8, delivery, header.3 as u64, 0, delivery, 0x1030);
+            assert(
+                nothing == Some(0xC000_000D)
+                    && small == Some(0xC000_0023)
+                    && misaligned == Some(0x8000_0002)
+                    && bad_status == Some(0xC000_000D)
+                    && empty == Some(0x8000_001A)
+                    && updated == Some(0)
+                    && delivered == Some(0)
+                    && header == (subscription, 0x0280_032E_A3BC_0875, 4, 1, 0x30, 0x0BAD_F00D)
+                    && stamp != 0
+                    && finished == Some(0x8000_001A),
+                "userwnf: NtGetCompleteWnfStateSubscription entrega o descritor da escrita e conclui a entrega",
+            );
+            if let Some(region) = memory::find_region(delivery) {
+                memory::release_private_region(&region);
+            }
+        } else {
+            assert(false, "userwnf: memoria do descritor de entrega");
+        }
         // NtUnsubscribeWnfStateChange: a inscrição do processo sai uma vez.
         let unsubscribed = call("NtUnsubscribeWnfStateChange", name, 0, 0, 0);
         let unsubscribed_again = call("NtUnsubscribeWnfStateChange", name, 0, 0, 0);
