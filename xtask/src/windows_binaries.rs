@@ -29,6 +29,11 @@
 //! com o services.exe e o lsass.exe que ele cria, e as imagens de kernel do
 //! subsistema Win32 (win32k.sys, win32kbase.sys, win32kfull.sys e o
 //! cdd.dll; o hidparse.sys que o win32kbase importa já vem com a pilha USB).
+//! Leva também a tela de logon da sessão 1 (o dwm.exe e o LogonUI.exe com o
+//! fecho dos imports, o XAML e os provedores de credencial), os `.mui` dos
+//! programas (no idioma de fallback quando o de interface não tem), os
+//! recursos deles em `\Windows\SystemResources` e os assemblies de WinSxS
+//! (`side_by_side`).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -456,6 +461,107 @@ const SMSS_PROGRAMS: &[&str] = &[
 /// que ele importa. Os imports estáticos deles já estão no volume.
 const SERVICE_CHAIN_PROGRAMS: &[&str] = &["umpo.dll", "psmsrv.dll", "SystemEventsBrokerServer.dll", "brokerlib.dll"];
 
+/// A tela de logon da sessão 1: o dwm.exe que o dwminit.dll do winlogon
+/// cria e o LogonUI.exe do StartLogonUI, com o fecho dos imports estáticos
+/// deles (pelos API sets desta máquina) e as cargas sob demanda do caminho
+/// até o primeiro quadro.
+const LOGON_SCREEN_PROGRAMS: &[&str] = &[
+    // O compositor: o dwm.exe com o uDWM.dll e o dwmredir.dll, o motor
+    // dwmcore.dll e o que ele importa (D2D, D3D11, o compilador de shaders,
+    // a DirectComposition, o CoreMessaging, o CoreUIComponents e o
+    // wintypes.dll); o d3d10warp.dll, o driver de modo usuário do WARP que o
+    // D3D11 usa no adaptador de renderização básico; e as cargas atrasadas da
+    // partida: o dwmghost.dll (DWMGhostInitialize), o avrt.dll do dwmredir,
+    // o d3dscache.dll e o dxcore.dll do d3d11.dll, o DWrite.dll com o
+    // TextShaping.dll, o WindowsCodecs.dll e o rometadata.dll do wintypes.dll.
+    "dwm.exe",
+    "uDWM.dll",
+    "dwmredir.dll",
+    "dwmcore.dll",
+    "dwmghost.dll",
+    "d2d1.dll",
+    "d3d11.dll",
+    "d3d10warp.dll",
+    "D3DCOMPILER_47.dll",
+    "D3DSCache.dll",
+    "dxcore.dll",
+    "dcomp.dll",
+    "CoreMessaging.dll",
+    "CoreUIComponents.dll",
+    "wintypes.dll",
+    "avrt.dll",
+    "DWrite.dll",
+    "TextShaping.dll",
+    "WindowsCodecs.dll",
+    "rometadata.dll",
+    // O LogonUI.exe, o controlador logoncontroller.dll (CLSID
+    // {0bdc6fc7-83e3-46a4-bfa0-1bc14dbf8b38}) e a experiência de logon
+    // Windows.UI.Logon.dll que ele ativa, o authui.dll e os imports deles,
+    // com as cargas atrasadas do logoncontroller.dll (os idiomas, o
+    // MSCTF.dll e o credui.dll) e o tema do winlogon (o
+    // ThemesOnEarlyCreateSession do uxinit.dll, com o UxTheme.dll).
+    "LogonUI.exe",
+    "logoncontroller.dll",
+    "Windows.UI.Logon.dll",
+    "authui.dll",
+    "wincorlib.dll",
+    "wtsapi32.dll",
+    "shlwapi.dll",
+    "propsys.dll",
+    "Bcp47Langs.dll",
+    "WinLangdb.dll",
+    "MSCTF.dll",
+    "credui.dll",
+    "uxinit.dll",
+    "UxTheme.dll",
+    // O XAML da experiência de logon: as classes WinRT Windows.UI.Xaml.*, o
+    // XAMLHostWindow, o Windows.UI.dll, o Windows.Globalization.dll e o
+    // modelo de dados dos provedores de credencial (CredProvDataModel.dll),
+    // os temas do XAML, o MRT (mrmcorer.dll, os recursos ms-appx dos .pri),
+    // e os imports estáticos deles.
+    "Windows.UI.Xaml.dll",
+    "Windows.UI.Xaml.Controls.dll",
+    "Windows.UI.XamlHost.dll",
+    "Windows.UI.Xaml.Resources.Common.dll",
+    "Windows.UI.Xaml.Resources.19h1.dll",
+    "Windows.UI.dll",
+    "Windows.Globalization.dll",
+    "Windows.Globalization.Fontgroups.dll",
+    "CredProvDataModel.dll",
+    "iertutil.dll",
+    "WindowManagementAPI.dll",
+    "TextInputFramework.dll",
+    "InputHost.dll",
+    "bcp47mrm.dll",
+    "twinapi.appcore.dll",
+    "MrmCoreR.dll",
+    "XmlLite.dll",
+    // Os provedores de credencial registrados
+    // (`Authentication\Credential Providers`) e os imports deles.
+    "credprovs.dll",
+    "credprovslegacy.dll",
+    "BioCredProv.dll",
+    "certCredProvider.dll",
+    "cngcredui.dll",
+    "cxcredprov.dll",
+    "devicengccredprov.dll",
+    "DeviceCredential.dll",
+    "FaceCredentialProvider.dll",
+    "fidocredprov.dll",
+    "mgmtrefreshcredprov.dll",
+    "ngccredprov.dll",
+    "rdpcredentialprovider.dll",
+    "SmartcardCredentialProvider.dll",
+    "TrustedSignalCredProv.dll",
+    "wlidcredprov.dll",
+    "AadAuthHelper.dll",
+    "cryptngc.dll",
+    "ngckeyenum.dll",
+    "dsreg.dll",
+    "msvcp110_win.dll",
+    "wkscli.dll",
+];
+
 /// As imagens de kernel do caminho do smss (`--initial-process=smss`): o
 /// win32k.sys que o smss da sessão carrega pela classe 38, o win32kbase.sys
 /// e o win32kfull.sys que ele carrega como imagens de sessão e o cdd.dll (o
@@ -471,6 +577,51 @@ const SMSS_KERNEL_IMAGES: &[(&str, &str)] = &[
 
 pub fn windows_directory() -> PathBuf {
     std::env::var("SystemRoot").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("C:/Windows"))
+}
+
+/// Os programas de modo usuário do boot do smss, na raiz do volume.
+pub fn user_programs() -> impl Iterator<Item = &'static str> {
+    SMSS_PROGRAMS.iter().chain(SERVICE_CHAIN_PROGRAMS).chain(LOGON_SCREEN_PROGRAMS).copied()
+}
+
+/// Os nomes de arquivo de `directory`.
+fn entries(directory: &Path) -> Vec<String> {
+    fs::read_dir(directory).map(|entries| entries.filter_map(|entry| entry.ok()).filter_map(|entry| entry.file_name().into_string().ok()).collect()).unwrap_or_default()
+}
+
+/// Os recursos de `\Windows\SystemResources` dos programas de
+/// [`user_programs`]: o `<nome>.mun` e, para um módulo com pasta própria, o
+/// `<módulo>.pri` e o `pris\<módulo>.<idioma>.pri` dos idiomas de interface
+/// (ou do primeiro idioma de fallback que o tiver). (caminho no volume,
+/// arquivo de origem), com os nomes desta máquina.
+fn system_resource_files(windows: &Path, languages: &[String], fallbacks: &[String]) -> Vec<(String, PathBuf)> {
+    let directory = windows.join("SystemResources");
+    let listing = entries(&directory);
+    let find = |names: &[String], wanted: &str| names.iter().find(|name| name.eq_ignore_ascii_case(wanted)).cloned();
+    let mut files = Vec::new();
+    for program in user_programs() {
+        if let Some(name) = find(&listing, &format!("{program}.mun")).filter(|name| directory.join(name).is_file()) {
+            files.push((format!("SystemResources/{name}"), directory.join(name)));
+        }
+        let stem = program.rsplit_once('.').map_or(program, |(stem, _)| stem);
+        let Some(folder) = find(&listing, stem).filter(|folder| directory.join(folder).is_dir()) else { continue };
+        let package = directory.join(&folder);
+        let contents = entries(&package);
+        if let Some(name) = find(&contents, &format!("{stem}.pri")) {
+            files.push((format!("SystemResources/{folder}/{name}"), package.join(name)));
+        }
+        let Some(pris) = find(&contents, "pris") else { continue };
+        let localized = entries(&package.join(&pris));
+        let pick = |language: &String| find(&localized, &format!("{stem}.{language}.pri"));
+        let mut chosen: Vec<String> = languages.iter().filter_map(pick).collect();
+        if chosen.is_empty() {
+            chosen.extend(fallbacks.iter().find_map(pick));
+        }
+        for name in chosen {
+            files.push((format!("SystemResources/{folder}/{pris}/{name}"), package.join(&pris).join(name)));
+        }
+    }
+    files
 }
 
 /// Mesmo tamanho e mesma data de modificação: a cópia está em dia.
@@ -669,7 +820,7 @@ pub fn ntfs_files(root: &Path, kernel_pe: &[u8], initial_process: &str) -> Resul
     println!("tabelas NLS no volume NTFS: {nls}");
     if initial_process == "smss" {
         let mut staged = 0;
-        for name in SMSS_PROGRAMS.iter().chain(SERVICE_CHAIN_PROGRAMS) {
+        for name in user_programs() {
             let source = system32.join(name);
             match fs::read(&source) {
                 Ok(bytes) => {
@@ -680,7 +831,7 @@ pub fn ntfs_files(root: &Path, kernel_pe: &[u8], initial_process: &str) -> Resul
                 Err(_) => println!("AVISO: {} ausente no Windows desta maquina", source.display()),
             }
         }
-        println!("programas de modo usuario do smss no volume NTFS: {staged} de {}", SMSS_PROGRAMS.len() + SERVICE_CHAIN_PROGRAMS.len());
+        println!("programas de modo usuario do smss no volume NTFS: {staged} de {}", user_programs().count());
         let mut images = 0;
         for (name, relative) in SMSS_KERNEL_IMAGES {
             let source = windows.join(relative);
@@ -700,7 +851,7 @@ pub fn ntfs_files(root: &Path, kernel_pe: &[u8], initial_process: &str) -> Resul
         // arquivo não tem `.mui` neles.
         let languages = crate::host_language::ui_languages();
         let fallbacks = crate::host_language::fallback_languages(&languages);
-        let names = SMSS_PROGRAMS.iter().chain(SERVICE_CHAIN_PROGRAMS).copied().chain(SMSS_KERNEL_IMAGES.iter().filter_map(|(_, relative)| relative.strip_prefix("System32/").filter(|rest| !rest.contains('/'))));
+        let names = user_programs().chain(SMSS_KERNEL_IMAGES.iter().filter_map(|(_, relative)| relative.strip_prefix("System32/").filter(|rest| !rest.contains('/'))));
         let mut resources = 0;
         for name in names {
             for (path, source) in crate::host_language::mui_files(&system32, name, &languages, &fallbacks) {
@@ -711,6 +862,18 @@ pub fn ntfs_files(root: &Path, kernel_pe: &[u8], initial_process: &str) -> Resul
             }
         }
         println!("recursos .mui no volume NTFS: {resources} (idiomas {}; fallback {})", languages.join(", "), fallbacks.join(", "));
+        // Os módulos de recursos de `\Windows\SystemResources` dos
+        // programas: o `<nome>.mun` que o carregador abre no lugar da seção
+        // de recursos do módulo e o pacote MRT `<módulo>\<módulo>.pri` (com
+        // `pris\<módulo>.<idioma>.pri`) dos componentes WinRT.
+        let mut packages = 0;
+        for (path, source) in system_resource_files(&windows, &languages, &fallbacks) {
+            if let Ok(bytes) = fs::read(&source) {
+                files.push((path, bytes));
+                packages += 1;
+            }
+        }
+        println!("recursos de SystemResources no volume NTFS: {packages}");
         // Os manifestos dos assemblies lado a lado (o contexto de ativação
         // padrão do sistema e os controles comuns da versão 6, de
         // `side_by_side`) e os arquivos deles, no caminho de WinSxS.

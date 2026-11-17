@@ -3262,7 +3262,10 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   `xtask/src/side_by_side.rs`); o services.exe lê as chaves de serviço da
   cadeia do LSM (DcomLaunch, RpcEptMapper, RpcSs e LSM), o
   Control\ServiceGroupOrder e os grupos do svchost
-  (`xtask/src/user_services.rs`). A inicialização do LSA (o
+  (`xtask/src/user_services.rs`). A tela de logon da sessão 1 leva o fecho
+  de imports do dwm.exe e do LogonUI.exe com o XAML e os provedores de
+  credencial (`LOGON_SCREEN_PROGRAMS` em `xtask/src/windows_binaries.rs`) e
+  os `.mun` e os `.pri` de `\Windows\SystemResources` desses programas. A inicialização do LSA (o
   LsapInitLsa e o LsapStartLsa do lsasrv) pede ainda: o
   NtQueryInformationProcess das classes ProcessWow64Information (0) e
   ProcessProtectionInformation (o PS_PROTECTION do EPROCESS); os alarmes de
