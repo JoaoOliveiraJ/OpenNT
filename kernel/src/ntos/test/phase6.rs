@@ -14383,6 +14383,19 @@ fn se_non_ob_audit_exports(assert: Assert) {
         }
     }
     assert(missing == 0xC000_0034 && stored && installed == 0 && found == Some(sacl) && emptied && registry::node_by_path(policy_path).is_some() == policy_existed, "se-audit: comando 5 instala a SACL global do registro, tira com valor vazio e da OBJECT_NAME_NOT_FOUND sem a chave");
+    // NtPrivilegedServiceAuditAlarm: token de impersonação anônima
+    // (SecurityAnonymous) = STATUS_BAD_IMPERSONATION_LEVEL; com a política
+    // zerada, sucesso sem evento.
+    let events_before = audit::events().len();
+    let anonymous = audit::privileged_service_audit_alarm("LsaRegisterLogonProcess()", 2, 0, 1, true);
+    let primary = audit::privileged_service_audit_alarm("LsaRegisterLogonProcess()", 1, 0, 1, true);
+    assert(anonymous == 0xC000_00A5 && primary == 0 && audit::events().len() == events_before, "se-audit: NtPrivilegedServiceAuditAlarm recusa impersonacao anonima e nao gera evento com a politica zerada");
+    // NtCloseObjectAuditAlarm: sem GenerateOnClose, sucesso sem privilégio
+    // nem evento; com ele, o SeAuditPrivilege e o evento 4658.
+    let quiet = audit::close_object_audit_alarm("Security", 0x10, false, false, false);
+    let refused = audit::close_object_audit_alarm("Security", 0x10, true, false, false);
+    let logged = audit::close_object_audit_alarm("Security", 0x10, true, true, false);
+    assert(quiet == 0 && refused == 0xC000_0061 && logged == 0 && audit::events().len() == events_before + 1, "se-audit: NtCloseObjectAuditAlarm so pede privilegio e audita com GenerateOnClose");
     // O comando 7 (SepRmProcessCreationCommandLineAuditSettingsWrkr).
     let on = audit::set_process_command_line_audit(true) == 0 && audit::audit_process_command_line();
     let off = audit::set_process_command_line_audit(false) == 0 && !audit::audit_process_command_line();

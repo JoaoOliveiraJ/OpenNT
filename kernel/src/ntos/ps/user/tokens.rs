@@ -395,7 +395,67 @@ fn nt_access_check(descriptor: u64, client_token: u64, desired: u64, mapping: u6
     Ok(crate::ntos::se::access_check::check_by_token(descriptor, token, pseudo, desired as u32, mapping, privilege_set, privilege_length, granted, status))
 }
 
+/// NtPrivilegedServiceAuditAlarm(SubsystemName, ServiceName, ClientToken,
+/// Privileges, AccessGranted): o SeAuditPrivilege do chamador
+/// (STATUS_PRIVILEGE_NOT_HELD), o token do cliente com TOKEN_QUERY e o
+/// PRIVILEGE_SET sondado; o alarme é `se::audit`.
+fn nt_privileged_service_audit_alarm(_subsystem: u64, service: u64, client_token: u64, privileges: u64, rsp: u64) -> Result<u32, KernelError> {
+    let granted = stack_arg(rsp, 5) as u8 != 0;
+    if !crate::ntos::se::privilege::single_privilege_check(SE_AUDIT_PRIVILEGE, 1) {
+        return Ok(0xC000_0061);
+    }
+    let token = match lookup(client_token, 8) {
+        Ok(token) => token,
+        Err(status) => return Ok(status),
+    };
+    if !probe_user_read(privileges, 8) {
+        return Ok(0xC000_0005);
+    }
+    let count = guest::try_read::<u32>(privileges).unwrap_or(0);
+    if !probe_user_read(privileges, 8 + count as u64 * 12) {
+        return Ok(0xC000_0005);
+    }
+    let service_name = if service != 0 && probe_user_read(service, UnicodeString::SIZE) {
+        crate::ntos::rtl::guest_strings::read_unicode_string(service)
+    } else {
+        String::new()
+    };
+    let Some((kind, level)) = tokens::with(token, |token| (token.kind, token.impersonation_level)) else { return Ok(0xC000_0008) };
+    Ok(crate::ntos::se::audit::privileged_service_audit_alarm(&service_name, kind, level, count, granted))
+}
+
+/// SeAuditPrivilege.
+const SE_AUDIT_PRIVILEGE: u64 = 21;
+
+/// NtCloseObjectAuditAlarm e NtDeleteObjectAuditAlarm(SubsystemName,
+/// HandleId, GenerateOnClose): o SubsystemName sondado só com
+/// GenerateOnClose; o alarme é `se::audit`.
+fn object_audit_alarm(subsystem: u64, handle_id: u64, generate_on_close: u64, delete: bool) -> Result<u32, KernelError> {
+    let generate = generate_on_close as u8 != 0;
+    let privileged = generate && crate::ntos::se::privilege::single_privilege_check(SE_AUDIT_PRIVILEGE, 1);
+    let name = if generate && privileged {
+        if subsystem == 0 || !probe_user_read(subsystem, UnicodeString::SIZE) {
+            return Ok(0xC000_0005);
+        }
+        crate::ntos::rtl::guest_strings::read_unicode_string(subsystem)
+    } else {
+        String::new()
+    };
+    Ok(crate::ntos::se::audit::close_object_audit_alarm(&name, handle_id, generate, privileged, delete))
+}
+
+fn nt_close_object_audit_alarm(subsystem: u64, handle_id: u64, generate_on_close: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
+    object_audit_alarm(subsystem, handle_id, generate_on_close, false)
+}
+
+fn nt_delete_object_audit_alarm(subsystem: u64, handle_id: u64, generate_on_close: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
+    object_audit_alarm(subsystem, handle_id, generate_on_close, true)
+}
+
 pub fn init() {
+    state::register_handler("NtPrivilegedServiceAuditAlarm", nt_privileged_service_audit_alarm);
+    state::register_handler("NtCloseObjectAuditAlarm", nt_close_object_audit_alarm);
+    state::register_handler("NtDeleteObjectAuditAlarm", nt_delete_object_audit_alarm);
     state::register_handler("NtCreateToken", nt_create_token);
     state::register_handler("NtAccessCheck", nt_access_check);
     state::register_handler("NtSetInformationToken", nt_set_information_token);

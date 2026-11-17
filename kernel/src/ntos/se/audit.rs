@@ -498,6 +498,41 @@ pub fn privilege_object_audit_alarm(handle: u64, desired_access: u32, privileges
     true
 }
 
+/// NtPrivilegedServiceAuditAlarm(SubsystemName, ServiceName, ClientToken,
+/// Privileges, AccessGranted) sobre o token do cliente já referenciado
+/// (TOKEN_QUERY): como no ntoskrnl 19041, um token de impersonação abaixo de
+/// SecurityIdentification é STATUS_BAD_IMPERSONATION_LEVEL; o PRIVILEGE_SET
+/// é capturado (STATUS_ACCESS_VIOLATION fora da faixa) e, com a auditoria de
+/// uso de privilégio ligada para o resultado, o evento 4673 vai ao anel.
+/// Devolve o NTSTATUS (STATUS_SUCCESS mesmo sem evento).
+pub fn privileged_service_audit_alarm(service: &str, token_kind: u32, impersonation_level: u32, privilege_count: u32, granted: bool) -> u32 {
+    if token_kind == 2 && impersonation_level < 1 {
+        return 0xC000_00A5;
+    }
+    if audit_this_event(SUBCATEGORY_SENSITIVE_PRIVILEGE_USE, granted, !granted) {
+        record_audit_event("privileged service", format!("event=4673 service={service} privileges={privilege_count} granted={granted}"));
+    }
+    0
+}
+
+/// NtCloseObjectAuditAlarm e NtDeleteObjectAuditAlarm(SubsystemName,
+/// HandleId, GenerateOnClose), como no ntoskrnl 19041 (NtCloseObjectAuditAlarm
+/// 0x684fd0): sem GenerateOnClose, STATUS_SUCCESS sem mais nada; com ele, o
+/// SeAuditPrivilege do chamador (STATUS_PRIVILEGE_NOT_HELD) e o evento de
+/// fechamento (4658) ou de exclusão (4660) do handle. `privileged` é o
+/// SeCheckAuditPrivilege já feito pelo adaptador.
+pub fn close_object_audit_alarm(subsystem: &str, handle_id: u64, generate_on_close: bool, privileged: bool, delete: bool) -> u32 {
+    if !generate_on_close {
+        return 0;
+    }
+    if !privileged {
+        return 0xC000_0061;
+    }
+    let (kind, event) = if delete { ("delete object", 4660) } else { ("close object", 4658) };
+    record_audit_event(kind, format!("event={event} subsystem={subsystem} handle={handle_id:#x}"));
+    0
+}
+
 /// SeOpenObjectAuditAlarmForNonObObject(SubsystemName, HandleId,
 /// ObjectTypeName, ObjectName, Sd, SubjectContext, DesiredAccess,
 /// GrantedAccess, Privileges, AccessGranted, *GenerateOnClose): o alarme de

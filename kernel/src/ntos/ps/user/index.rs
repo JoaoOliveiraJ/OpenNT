@@ -131,7 +131,7 @@ pub fn handle_service(name: Option<&str>, arguments: [u64; 4], rip: u64, user_rs
     if crate::ntos::init::boot_config::TRACE_SYSCALLS {
         crate::debug_print!("[sys] {}:{} {}({:#x}, {:#x}, {:#x}, {:#x}) = {:#x} (rip {:#x}){}", crate::ntos::ps::process::get_current_process_id(), crate::ntos::ps::process::get_current_thread_id(), name, arguments[0], arguments[1], arguments[2], arguments[3], result, rip, traced_name.map_or_else(alloc::string::String::new, |path| alloc::format!(" \"{path}\"")));
     }
-    if result & 0x8000_0000 != 0 && ![0xC000_0034, 0xC000_0225, 0x102, 0xC000_0023, 0xC000_0353, 0xC000_0002].contains(&result) {
+    if result & 0x8000_0000 != 0 && ![0xC000_0034, 0xC000_0225, 0x102, 0xC000_0023, 0xC000_0353].contains(&result) {
         crate::debug_print!("[usermode] {} FALHOU com {:#x} (rip {:#x})", name, result, rip);
     }
     Ok(result)

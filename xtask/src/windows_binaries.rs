@@ -365,6 +365,39 @@ const SMSS_PROGRAMS: &[&str] = &[
     "netlogon.dll",
     "logoncli.dll",
     "gmsaclient.dll",
+    // As cargas atrasadas do kerberos.dll e do LSA que um sistema sem elas
+    // transforma em exceção (VcppException ERROR_MOD_NOT_FOUND) no
+    // SpmpBootPackage: o kerbclientshared.dll, o winhttp.dll, o
+    // httpprxc.dll e o netprovfw.dll; e o secur32.dll, o dsparse.dll, o
+    // samcli.dll e o laps.dll do lsasrv, do samsrv e do netlogon.
+    "kerbclientshared.dll",
+    "winhttp.dll",
+    "httpprxc.dll",
+    "netprovfw.dll",
+    "secur32.dll",
+    "dsparse.dll",
+    "samcli.dll",
+    "laps.dll",
+    // E as cargas atrasadas desses: o joinutil.dll e o winbrand.dll do
+    // netprovfw.dll, e o webio.dll, o websocket.dll, o dhcpcsvc.dll, o
+    // ondemandconnroutehelper.dll e o firewallapi.dll do winhttp.dll e do
+    // kerberos.dll.
+    "joinutil.dll",
+    "winbrand.dll",
+    "webio.dll",
+    "websocket.dll",
+    "dhcpcsvc.dll",
+    "ondemandconnroutehelper.dll",
+    "firewallapi.dll",
+    // Os outros pacotes de segurança da lista interna do lsasrv (o
+    // wdigest.dll, o tspkg.dll, o schannel.dll, o pku2u.dll e o cloudap.dll,
+    // com o ntmarta.dll que ele importa).
+    "wdigest.dll",
+    "tspkg.dll",
+    "schannel.dll",
+    "pku2u.dll",
+    "cloudap.dll",
+    "ntmarta.dll",
 ];
 
 /// As imagens de kernel do caminho do smss (`--initial-process=smss`): o

@@ -549,7 +549,7 @@ fn nt_raise_hard_error(status: u64, count: u64, unicode_mask: u64, parameters: u
                 texts.push(alloc::format!("{value:#x}"));
             }
         }
-        crate::debug_print!("[usermode] HARDERROR: status={:#x} params={}", status as u32, texts.join(" | "));
+        crate::debug_print!("[usermode] HARDERROR: status={:#x} params={} (pid {}, retorno {:#x})", status as u32, texts.join(" | "), crate::ntos::ps::process::get_current_process_id(), guest::try_read::<u64>(rsp).unwrap_or(0));
         if response != 0 {
             guest::try_write::<u32>(response, 2)?; // ResponseAbort
         }
@@ -816,6 +816,46 @@ fn nt_query_information_process(handle: u64, class: u64, buffer: u64, length: u6
             let value = if class == 49 { process.owner_process_id.get() } else { process.sequence_number.get() };
             guest::try_write::<u64>(buffer, value)?;
             set_returned(8)?;
+            Ok(STATUS_SUCCESS)
+        }
+        // ProcessWow64Information (ULONG_PTR): o PEB de 32 bits do processo
+        // WoW64, pelo handle com PROCESS_QUERY_LIMITED_INFORMATION; outro
+        // comprimento é STATUS_INFO_LENGTH_MISMATCH. O OpenNT só roda
+        // processos nativos de 64 bits: 0.
+        26 => {
+            if length != 8 {
+                return Ok(STATUS_INFO_LENGTH_MISMATCH);
+            }
+            if !probe_user_write(buffer, 8) {
+                return Ok(0xC000_0005);
+            }
+            if let Err(status) = queried_process(handle) {
+                return Ok(status);
+            }
+            guest::try_write::<u64>(buffer, 0)?;
+            set_returned(8)?;
+            Ok(STATUS_SUCCESS)
+        }
+        // ProcessProtectionInformation (PS_PROTECTION, 1 byte): o
+        // EPROCESS.Protection pelo handle com
+        // PROCESS_QUERY_LIMITED_INFORMATION; outro comprimento é
+        // STATUS_INFO_LENGTH_MISMATCH. O SspiSrv do lsass lê o nível de
+        // proteção do próprio processo.
+        61 => {
+            if length != 1 {
+                return Ok(STATUS_INFO_LENGTH_MISMATCH);
+            }
+            if !probe_user_write(buffer, 1) {
+                return Ok(0xC000_0005);
+            }
+            let target = match queried_process(handle) {
+                Ok(target) => target,
+                Err(status) => return Ok(status),
+            };
+            // SAFETY: o EPROCESS do handle, retido pela tabela de handles.
+            let level = unsafe { Eprocess::at(target) }.protection.level.get();
+            guest::try_write::<u8>(buffer, level)?;
+            set_returned(1)?;
             Ok(STATUS_SUCCESS)
         }
         _ => {
