@@ -1326,10 +1326,19 @@ fn license_boot_values_and_anonymous(assert: Assert) {
     assert(invalid_context != 0 && invalid_diagnostics.publication_status == Some(0xC000_003F) && guest::read32(invalid_context + 0xB78C) == 5 && SECTION_VIEWS.load(Ordering::SeqCst) == 0, "licenseboot: rodape invalido recusado e vista desfeita");
     let _ = boot::destroy(invalid_context);
     boot::restore_kernel_section_backend();
-    // Contexto do boot real: sem ProductPolicy na hive, cabeçalho recusado.
+    // Contexto do boot real: com o ProductPolicy da hive SYSTEM, a política
+    // publicada numa SECTION e consultável; sem ele, o cabeçalho recusado
+    // marca o contexto corrompido.
     let host = values::host_context();
-    assert(host != 0 && matches!(values::current_context(), Ok(context) if context == host) && guest::read8(host + 0xB790) == 1, "licensevalues: contexto do boot sem politica marcado corrompido");
-    assert(matches!(values::query(name, 0, output, 4, length), Ok(0xC000_003E)), "licensevalues: consulta comum devolve DATA_ERROR");
+    let has_policy = crate::ntos::cm::registry::read_value_by_path(values::PRODUCT_OPTIONS, "ProductPolicy").is_some();
+    assert(host != 0 && matches!(values::current_context(), Ok(context) if context == host), "licensevalues: contexto do boot criado");
+    if has_policy {
+        assert(guest::read8(host + 0xB790) == 0 && guest::read64(host + 0xB6F0) != 0, "licensevalues: politica da SYSTEM publicada no contexto do boot");
+        assert(matches!(values::query(name, 0, output, 4, length), Ok(0)) && guest::read32(length) == 4, "licensevalues: Kernel-ProductInfo pela politica da SYSTEM");
+    } else {
+        assert(guest::read8(host + 0xB790) == 1, "licensevalues: contexto do boot sem politica marcado corrompido");
+        assert(matches!(values::query(name, 0, output, 4, length), Ok(0xC000_003E)), "licensevalues: consulta comum devolve DATA_ERROR");
+    }
     license_unicode(name, "Kernel-Session-Machine-Identifier");
     assert(matches!(values::query(name, 0, output, 16, length), Ok(0)) && guest::read32(length) == 16, "licensevalues: identificador de sessao do boot");
     // ImpersonateAnonymousToken na thread corrente.
@@ -1352,14 +1361,24 @@ fn capability_policy_and_check(assert: Assert) {
     license_unicode(name, "internetClient");
     let multi = policy::is_multi_session();
     assert(multi <= 1, "capabilitypolicy: SKU multissessao pelo KUSER_SHARED_DATA");
-    // Sem ProductPolicy no boot, o contexto de licenças está corrompido.
+    // Com o ProductPolicy da SYSTEM, `Security-System-Capability-internetClient`
+    // não existe na política (STATUS_OBJECT_NAME_NOT_FOUND, que o
+    // RtlCapabilityCheck trata como ausência de restrição); sem ele, o
+    // contexto de licenças está corrompido.
+    let has_policy = crate::ntos::cm::registry::read_value_by_path(crate::ntos::ex::license::values::PRODUCT_OPTIONS, "ProductPolicy").is_some();
     guest::write_bytes(output, &[0; 16]);
     let policy_string = unsafe { UnicodeString::at(output) };
-    assert(matches!(policy::query_system_policy(name, output), Ok(0xC000_003E)) && policy_string.buffer.get() == 0 && policy_string.length.get() == 0, "capabilitypolicy: politica do sistema sem ProductPolicy");
+    let expected = if has_policy { 0xC000_0034 } else { 0xC000_003E };
+    assert(matches!(policy::query_system_policy(name, output), Ok(status) if status == expected) && policy_string.buffer.get() == 0 && policy_string.length.get() == 0, "capabilitypolicy: politica do sistema para internetClient");
     assert(matches!(policy::query_system_policy(0, output), Ok(0xC000_000D)), "capabilitypolicy: nome nulo");
     // RtlCapabilityCheck em modo kernel chega à política do sistema.
     guest::write8(output, 0x55);
-    assert(matches!(capability::check(0, name, output), Ok(0xC000_003E)) && guest::read8(output) == 0, "capabilitycheck: politica do sistema invalida zera o resultado");
+    let checked = capability::check(0, name, output);
+    if has_policy {
+        assert(matches!(checked, Ok(status) if status & 0x8000_0000 == 0), "capabilitycheck: capability sem politica do sistema segue o token");
+    } else {
+        assert(matches!(checked, Ok(0xC000_003E)) && guest::read8(output) == 0, "capabilitycheck: politica do sistema invalida zera o resultado");
+    }
     assert(matches!(capability::check(0, 0, output), Ok(0xC000_000D)) && capability::check(0, name, 0).is_err(), "capabilitycheck: argumentos nulos (saida nula e falha terminal)");
     guest::free_bytes(name);
     guest::free_bytes(output);

@@ -1,16 +1,15 @@
 //! FASE 0 do boot (estilo NT).
 //!
-//! Em ordem: política da hive, licenças, firmware e identidade
-//! do boot, relógio e interrupções, memória (PFN, mapeamento recursivo,
-//! metade de sistema congelada, descritores nativos, imagens carregadas,
-//! células de dado), KPCR, SMP,
-//! pool, escalonador com o EPROCESS do System, os tipos de objeto e as suas
-//! células, o sistema de arquivos em memória com as apps embutidas, o
-//! namespace NT (com a partição e os eventos `\KernelObjects`) e a hive de
-//! hardware (a descrição e o mapa de memória). A hive SYSTEM, com os
-//! serviços e as definições WNF, só existe na fase 1, quando o volume que
-//! guarda o arquivo dela está montado: nada da fase 0 escreve em
-//! `\Registry\Machine\System`.
+//! Em ordem: política da hive, firmware e identidade do boot, relógio e
+//! interrupções, memória (PFN, mapeamento recursivo, metade de sistema
+//! congelada, descritores nativos, imagens carregadas, células de dado),
+//! KPCR, SMP, pool, escalonador com o EPROCESS do System, os tipos de objeto
+//! e as suas células, o sistema de arquivos em memória com as apps
+//! embutidas, o namespace NT (com a partição e os eventos `\KernelObjects`)
+//! e a hive de hardware (a descrição e o mapa de memória). A hive SYSTEM,
+//! com os serviços, as definições WNF e o ProductPolicy do licenciamento,
+//! só existe na fase 1, quando o volume que guarda o arquivo dela está
+//! montado: nada da fase 0 lê nem escreve `\Registry\Machine\System`.
 
 use crate::hal::bundle;
 use crate::nano::interrupts;
@@ -30,7 +29,6 @@ pub fn init() {
     clock::init(); // relógio TSC de alta resolução (calibra com o PIT)
     state_separation::init(Some(|key, name| crate::ntos::cm::registry::read_value_by_path(key, name).map(|value| value.data)));
     state_separation::require_supported_boot().unwrap_or_else(|error| panic!("{error}"));
-    crate::ntos::ex::license::values::init(); // captura ProductPolicy sem criar licenças nem capabilities
     interrupts::init();
     // memory manager: alocador de frames físicos, tabelas supervisoras reais
     // (antes dos APs) e descritores nativos ligados ao PFN e às PTEs
@@ -90,8 +88,6 @@ pub fn init() {
     crate::ntos::ex::boot_environment::init().unwrap_or_else(|error| panic!("boot environment: {error}")); // identidade única e flags reais, antes das consultas de drivers
     crate::ntos::se::platform_manifest::init(None).unwrap_or_else(|error| panic!("{error}"));
     crate::ntos::se::secure_boot_policy::init(None).unwrap_or_else(|error| panic!("{error}"));
-    // contexto de licenças próprio: estado, locks e (com política válida) a SECTION
-    crate::ntos::ex::license::values::init_runtime(&crate::ntos::ex::license::boot::BootProviders::default()).unwrap_or_else(|error| panic!("{error}"));
     memory_file_system::init(clock::now_ms());
 
     // apps embutidas viram arquivos do VFS ( /<basename> )

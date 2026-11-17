@@ -1,7 +1,10 @@
 //! Seleção do contexto de licenciamento.
 //!
-//! A hive é capturada na fase 0; o dono nativo só é criado depois de pool,
-//! threads e objetos (e das seções que recebem a política).
+//! O ProductPolicy é capturado no CmGetSystemControlValues, logo depois de a
+//! hive SYSTEM ser ligada (`cm/hive_init.rs`, na fase 1: antes disso só a
+//! semente em memória responde, sem a política); o contexto do host é criado
+//! e a política publicada em seguida (`init/phase1.rs`), já com os exports
+//! de seção do kernel e antes do primeiro driver.
 
 use alloc::vec::Vec;
 
@@ -24,8 +27,8 @@ struct Values {
 
 static VALUES: SpinLock<Values> = SpinLock::new(Values { captured: false, policy: None, host_context: 0 });
 
-/// Cópia própria deste boot: mudanças posteriores da hive não trocam o que
-/// foi entregue ao contexto nativo.
+/// Cópia própria deste boot, da hive SYSTEM já ligada: mudanças posteriores
+/// da hive não trocam o que foi entregue ao contexto nativo.
 pub fn init() {
     let mut values = VALUES.lock();
     if values.captured {

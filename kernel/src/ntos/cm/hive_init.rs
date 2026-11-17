@@ -145,10 +145,13 @@ pub fn initialize_hives() -> Result<(), KernelError> {
     let from_file = load_machine_hive(SYSTEM_MOUNT, SYSTEM_FILE, || seed::system_keys(smss))?;
     SYSTEM_FROM_FILE.store(from_file, Ordering::Release);
     create_control_set()?;
-    // CmGetSystemControlValues: o idioma da instalação (`Control\Nls\Language`)
-    // e o ObjectSecurityMode do Session Manager.
+    // CmGetSystemControlValues: o idioma da instalação (`Control\Nls\Language`),
+    // o ObjectSecurityMode do Session Manager e o `ProductOptions\ProductPolicy`
+    // (a entrada do CmControlVector que enche o buffer primário do
+    // licenciamento, o ExpHostBootLicensingData).
     crate::ntos::ps::locale::initialize_from_registry();
     crate::ntos::ex::system_information::initialize_control_values();
+    crate::ntos::ex::license::values::init();
     // A lista de hives existe a partir daqui (CmpHiveFileListHandle): as
     // hives já ligadas entram nela e as próximas entram na carga.
     hive_list::start_hive_list();

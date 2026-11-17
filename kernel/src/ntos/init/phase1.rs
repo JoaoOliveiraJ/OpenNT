@@ -64,6 +64,14 @@ pub fn init() {
     // CurrentControlSet, as hives SOFTWARE, SAM, SECURITY e DEFAULT e a
     // lista de hives; sem um arquivo, as mesmas chaves em memória.
     crate::ntos::cm::hive_init::initialize_hives().unwrap_or_else(|error| panic!("hives de maquina: {error}"));
+    // O contexto de licenciamento do host com o ProductPolicy capturado da
+    // SYSTEM: a inicialização que o Phase1InitializationIoReady do NT faz
+    // (a rotina em rva 0x7ab058: cabeçalho validado, política publicada numa
+    // SECTION pelo SLUpdateLicenseDataInternal). No NT os drivers de boot
+    // anteriores a ela já leem a política pelo buffer primário que o
+    // CmGetSystemControlValues encheu na fase 0; aqui a SYSTEM só existe
+    // agora, então a publicação vem antes do primeiro driver.
+    crate::ntos::ex::license::values::init_runtime(&crate::ntos::ex::license::boot::BootProviders::default()).unwrap_or_else(|error| panic!("{error}"));
     // IopReadDumpRegistry: o AutoReboot e o despejo do CrashControl, que o
     // KeBugCheckEx consulta sem tocar no Registro.
     crate::ntos::ke::bugcheck::read_crash_control();
