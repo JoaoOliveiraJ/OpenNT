@@ -552,6 +552,11 @@ pub fn load_gdi_driver(buffer: u64, length: u32, session: bool) -> Result<u32, K
         other => other,
     };
     guest::free_bytes(outputs);
+    let name = crate::ntos::rtl::guest_strings::read_unicode_string(information.driver_name.address());
+    match &status {
+        Ok(code) => debug_print!("[gdi] driver {} carregado pela classe {}: {:#x}", name, if session { 26 } else { 54 }, code),
+        Err(error) => debug_print!("[gdi] driver {} pela classe {}: {}", name, if session { 26 } else { 54 }, error),
+    }
     status
 }
 
