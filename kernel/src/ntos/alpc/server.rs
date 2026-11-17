@@ -136,6 +136,9 @@ struct Delivery {
     view: Option<Arc<ClientView>>,
     /// A vista de dados que o envio levou (o atributo de vista).
     data_view: Option<Arc<message_view::Carried>>,
+    /// A sequência da mensagem na porta de destino (a de comunicação do
+    /// cliente, ou a de conexão), que o ALPC_CONTEXT_ATTR publica.
+    sequence: u32,
 }
 
 /// A seção de transferência de um cliente LPC: o PORT_VIEW do NtConnectPort,
@@ -245,7 +248,6 @@ struct Link {
 #[derive(Default)]
 struct ServerState {
     next_id: u32,
-    sequence: u32,
     queue: VecDeque<Delivery>,
     connections: BTreeMap<u32, Arc<PendingConnection>>,
     requests: BTreeMap<u32, ReplySlot>,
@@ -270,6 +272,18 @@ pub struct UserServer {
 /// próprio ponteiro, com o servidor e a porta do cliente.
 static SERVERS: SpinLock<BTreeMap<u64, Arc<UserServer>>> = SpinLock::new(BTreeMap::new());
 static COMMUNICATION: SpinLock<BTreeMap<u64, (Arc<UserServer>, u64)>> = SpinLock::new(BTreeMap::new());
+
+/// A próxima sequência de uma porta de servidor (o `lock xadd` no contador
+/// da porta do AlpcpDispatchNewMessage, do AlpcpDispatchConnectionRequest e
+/// do AlpcpDispatchCloseMessage): cada mensagem posta para um cliente
+/// conectado avança o contador da porta de comunicação dele; uma conexão, o
+/// da porta de conexão. Chamada sob a trava do servidor, que é a única que
+/// avança esses contadores; o AlpcBasicInformation lê o mesmo valor.
+fn next_sequence(port: &Port) -> u32 {
+    let sequence = port.sequence().wrapping_add(1);
+    port.set_sequence(sequence);
+    sequence
+}
 
 impl UserServer {
     fn next_id(state: &mut ServerState) -> u32 {
@@ -330,7 +344,7 @@ impl UserServer {
     pub fn request_connection(&self, port: &Arc<Port>, data: &[u8], view: Option<Arc<ClientView>>) -> Decision {
         let sender = current_sender();
         let pending = Arc::new(PendingConnection { client: port.clone(), sender, view: view.clone(), decision: SpinLock::new(None) });
-        let id = {
+        let (id, sequence) = {
             let mut state = self.state.lock();
             if state.closed {
                 return Decision { status: STATUS_PORT_CONNECTION_REFUSED, ..Decision::default() };
@@ -338,9 +352,9 @@ impl UserServer {
             let id = UserServer::next_id(&mut state);
             state.connections.insert(id, pending.clone());
             state.senders.insert(id, Origin { sender, client: port.pointer });
-            id
+            (id, next_sequence(&self.listener))
         };
-        self.enqueue(Delivery { id, message_type: LPC_CONNECTION_REQUEST, data: Vec::from(data), sender, port_context: 0, view, ..Delivery::default() });
+        self.enqueue(Delivery { id, message_type: LPC_CONNECTION_REQUEST, data: Vec::from(data), sender, port_context: 0, view, sequence, ..Delivery::default() });
         let decision = pending.clone();
         let status = kernel_entry::wait_transport(&mut || decision.decision.lock().as_ref().map(|decision| decision.status), crate::ntos::ke::wait::Deadline::Infinite, 0, false);
         let decision = pending.decision.lock().take().unwrap_or(Decision { status, ..Decision::default() });
@@ -417,18 +431,18 @@ impl Service for UserServer {
         let slot: ReplySlot = Arc::new(ReplyCell::default());
         // A vista de dados do envio passa à mensagem do servidor.
         let data_view = request.identity.with(|state| state.view.take());
-        let (id, context) = {
+        let (id, context, sequence) = {
             let mut state = self.state.lock();
-            let Some(context) = state.links.get(&port.pointer).map(|link| link.context) else { return Reply::Now(JobResult { status: STATUS_PORT_DISCONNECTED, ..JobResult::default() }) };
+            let Some((context, sequence)) = state.links.get(&port.pointer).map(|link| (link.context, next_sequence(&link.server_port))) else { return Reply::Now(JobResult { status: STATUS_PORT_DISCONNECTED, ..JobResult::default() }) };
             let id = UserServer::next_id(&mut state);
             if !datagram {
                 state.requests.insert(id, slot.clone());
             }
             state.senders.insert(id, Origin { sender, client: port.pointer });
-            (id, context)
+            (id, context, sequence)
         };
         let message_type = if datagram { LPC_DATAGRAM } else if synchronous { LPC_REQUEST | LPC_CONTINUATION_REQUIRED } else { LPC_REQUEST };
-        self.enqueue(Delivery { id, message_type, data: Vec::from(data), sender, port_context: context, data_view, ..Delivery::default() });
+        self.enqueue(Delivery { id, message_type, data: Vec::from(data), sender, port_context: context, data_view, sequence, ..Delivery::default() });
         if datagram {
             return Reply::Now(JobResult::default());
         }
@@ -437,15 +451,16 @@ impl Service for UserServer {
 
     /// O cliente saiu: LPC_PORT_CLOSED na fila, com o PortContext dele.
     fn disconnect(&self, port: &Arc<Port>) {
-        let (link, id) = {
+        let (link, id, sequence) = {
             let mut state = self.state.lock();
             let Some(link) = state.links.remove(&port.pointer) else { return };
             let id = UserServer::next_id(&mut state);
-            (link, id)
+            let sequence = next_sequence(&link.server_port);
+            (link, id, sequence)
         };
         COMMUNICATION.lock().remove(&link.server_port.pointer);
         let sender = Sender { process: port.process_id(), thread: port.thread_id(), thread_pointer: 0 };
-        self.enqueue(Delivery { id, message_type: LPC_PORT_CLOSED, sender, port_context: link.context, ..Delivery::default() });
+        self.enqueue(Delivery { id, message_type: LPC_PORT_CLOSED, sender, port_context: link.context, sequence, ..Delivery::default() });
     }
 }
 
@@ -489,7 +504,8 @@ fn message_bytes(delivery: &Delivery, legacy: bool) -> Vec<u8> {
 }
 
 /// O ALPC_MESSAGE_ATTRIBUTES de recepção (já validado): o ALPC_CONTEXT_ATTR,
-/// quando alocado, com o PortContext, a sequência e o MessageId; o
+/// quando alocado, com o PortContext, a sequência da mensagem na porta de
+/// destino e o MessageId; o
 /// ALPC_DATA_VIEW_ATTR da vista do cliente exposta no servidor (a base e o
 /// tamanho nele), quando alocado; e o ValidAttributes correspondente.
 fn publish_attributes(attributes: u64, delivery: &Delivery, sequence: u32, view: Option<&Arc<View>>) -> Result<(), u32> {
@@ -595,8 +611,6 @@ fn receive_one(server: &UserServer, buffer: &Buffer, attributes: u64, options: R
         if status != 0 {
             return Some(status);
         }
-        state.sequence = state.sequence.wrapping_add(1);
-        let sequence = state.sequence;
         let delivery = state.queue.pop_front()?;
         // Um aviso de fechamento não espera resposta nem abertura do remetente.
         if delivery.message_type == LPC_PORT_CLOSED {
@@ -606,7 +620,7 @@ fn receive_one(server: &UserServer, buffer: &Buffer, attributes: u64, options: R
         if options.port_context != 0 && guest::try_write::<u64>(options.port_context, delivery.port_context).is_err() {
             return Some(STATUS_ACCESS_VIOLATION);
         }
-        let published = publish_attributes(attributes, &delivery, sequence, exposed.as_ref()).and_then(|_| match &data_binding {
+        let published = publish_attributes(attributes, &delivery, delivery.sequence, exposed.as_ref()).and_then(|_| match &data_binding {
             Some((binding, carried)) => message_view::publish(attributes, binding, carried).map(|_| ()),
             None => Ok(()),
         });
@@ -796,15 +810,18 @@ pub fn post_datagram(port: &Arc<Port>, message_type: u16, data: &[u8], sender: S
         let Some(server) = found else { return };
         (server, Some(port.pointer))
     };
-    let (id, context) = {
+    let (id, context, sequence) = {
         let mut state = server.state.lock();
         if state.closed {
             return;
         }
-        let context = client.and_then(|client| state.links.get(&client).map(|link| link.context)).unwrap_or(0);
-        (UserServer::next_id(&mut state), context)
+        let (context, sequence) = match client.and_then(|client| state.links.get(&client)) {
+            Some(link) => (link.context, next_sequence(&link.server_port)),
+            None => (0, next_sequence(&server.listener)),
+        };
+        (UserServer::next_id(&mut state), context, sequence)
     };
-    server.enqueue(Delivery { id, message_type, data: data.to_vec(), sender, port_context: context, ..Delivery::default() });
+    server.enqueue(Delivery { id, message_type, data: data.to_vec(), sender, port_context: context, sequence, ..Delivery::default() });
 }
 
 /// O NtReplyPort no lado servidor: a resposta ao pedido do MessageId.
@@ -941,7 +958,9 @@ fn establish(server: &Arc<UserServer>, pending: &Arc<PendingConnection>, out: u6
     let initial = PortState { role: Role::Server, port_context, port_flags, views, ..PortState::default() };
     let disconnecting = server.clone();
     let client_pointer = pending.client.pointer;
-    let communication = match port_objects::create("alpc", initial, server.listener.maximum(), 1, attributes, Box::new(move |port: &Arc<Port>| {
+    // A sequência da porta de comunicação começa em zero: a primeira
+    // mensagem do cliente é a 1.
+    let communication = match port_objects::create("alpc", initial, server.listener.maximum(), 0, attributes, Box::new(move |port: &Arc<Port>| {
         COMMUNICATION.lock().remove(&port.pointer);
         disconnecting.state.lock().links.remove(&client_pointer);
         for view in port.with(|state| core::mem::take(&mut state.views)) {
@@ -1099,7 +1118,7 @@ fn create_listener(out: u64, attributes: u64, name: Option<String>, initial: Por
         None => (String::new(), String::new()),
     };
     let object_flags = object_flags(attributes)?;
-    let port = match port_objects::create("alpc", initial, maximum, 1, attributes, Box::new(|listener: &Arc<Port>| {
+    let port = match port_objects::create("alpc", initial, maximum, 0, attributes, Box::new(|listener: &Arc<Port>| {
         if let Some(server) = SERVERS.lock().remove(&listener.pointer) {
             server.close();
         }
@@ -1275,7 +1294,7 @@ fn connection_request(server: &Arc<UserServer>, input: u64, receive: crate::ntos
     };
     let sender = current_sender();
     let slot: ReplySlot = Arc::new(ReplyCell::default());
-    let id = {
+    let (id, sequence) = {
         let mut state = server.state.lock();
         if state.closed {
             return Box::new(Completed(STATUS_PORT_DISCONNECTED));
@@ -1283,10 +1302,10 @@ fn connection_request(server: &Arc<UserServer>, input: u64, receive: crate::ntos
         let id = UserServer::next_id(&mut state);
         state.requests.insert(id, slot.clone());
         state.senders.insert(id, Origin { sender, client: 0 });
-        id
+        (id, next_sequence(&server.listener))
     };
     let message_type = if server.legacy() { LPC_REQUEST } else { LPC_REQUEST | LPC_CONTINUATION_REQUIRED };
-    server.enqueue(Delivery { id, message_type, data: captured.data, sender, ..Delivery::default() });
+    server.enqueue(Delivery { id, message_type, data: captured.data, sender, sequence, ..Delivery::default() });
     Box::new(ConnectionRequest { server: server.clone(), id, slot, output: receive.output, length: receive.length, done: false })
 }
 
