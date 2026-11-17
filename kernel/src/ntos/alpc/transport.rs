@@ -154,15 +154,21 @@ pub fn register(path: &str, service: Arc<dyn Service>) -> Result<Arc<Listener>, 
 }
 
 /// Associa o serviço ao nó AlpcPort já criado, com a identidade de quem
-/// chama (a porta de conexão de um servidor de modo usuário).
+/// chama e o descritor padrão do token dele (um serviço hospedado no kernel).
 pub fn attach(node: NodeId, service: Arc<dyn Service>) -> Arc<Listener> {
+    attach_with_security(node, service, object_access::capture(object_access::subject()))
+}
+
+/// [`attach`] com o descritor da porta de conexão (a de um servidor de modo
+/// usuário: o que o NtAlpcCreatePort recebeu, ou o herdado do diretório).
+pub fn attach_with_security(node: NodeId, service: Arc<dyn Service>, security: SecurityPolicy) -> Arc<Listener> {
     let listener = Arc::new(Listener {
         node,
         process: process::get_current_process(),
         thread: process::get_current_thread(),
         process_id: process::get_current_process_id(),
         thread_id: process::get_current_thread_id(),
-        security: object_access::capture(object_access::subject()),
+        security,
         service,
     });
     LISTENERS.lock().insert(node, listener.clone());

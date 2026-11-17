@@ -884,6 +884,24 @@ pub fn server_of_node(node: object_manager::NodeId) -> Option<Arc<UserServer>> {
     SERVERS.lock().values().find(|server| server.endpoint.lock().as_ref().is_some_and(|endpoint| endpoint.node == node)).cloned()
 }
 
+/// A conexão de modo usuário a uma porta de servidor (o
+/// ObReferenceObjectByName do AlpcpCreateClientPort com DesiredAccess
+/// PORT_CONNECT): o SeAccessCheck do token efetivo de quem conecta contra o
+/// descritor atual da porta de conexão; a recusa é STATUS_ACCESS_DENIED. Os
+/// serviços hospedados no kernel não têm porta de conexão e não passam por
+/// aqui.
+pub fn check_connect_access(node: object_manager::NodeId, path: &str) -> Result<(), u32> {
+    let Some(server) = server_of_node(node) else { return Ok(()) };
+    let Some(policy) = crate::ntos::ob::objects::dispatcher::security(server.listener.pointer) else { return Ok(()) };
+    let Some(alpc_type) = crate::ntos::ob::object_types::user_type("alpc") else { return Err(0xC000_0024) };
+    crate::ntos::ob::object_access::check(&policy, crate::ntos::ob::object_access::subject(), PORT_CONNECT, &alpc_type, false).map(|_| ()).inspect_err(|status| {
+        crate::debug_print!("[alpc] PORT_CONNECT em {} recusado ao pid {}: {:#x}", path, process::get_current_process_id(), status);
+    })
+}
+
+/// PORT_CONNECT.
+const PORT_CONNECT: u32 = 1;
+
 /// O servidor do lado servidor de uma porta (de conexão ou de comunicação).
 pub fn server_for(port: &Arc<Port>) -> Option<Arc<UserServer>> {
     server_of(port)
@@ -1310,6 +1328,17 @@ fn create_listener(out: u64, attributes: u64, name: Option<String>, initial: Por
         None => (String::new(), String::new()),
     };
     let object_flags = object_flags(attributes)?;
+    // Um nome de modo usuário passa pelo ObInsertObject: DIRECTORY_CREATE_OBJECT
+    // no diretório pai e, sem descritor no OBJECT_ATTRIBUTES, o descritor do
+    // SeAssignSecurity com as ACEs herdáveis do pai (num `\RPC Control`, as
+    // do descritor liberal do smss).
+    let parent_node = if mode != 0 && name.is_some() { object_manager::lookup(&parent) } else { None };
+    if let Some(node) = parent_node {
+        if let Err(status) = crate::ntos::ob::object_security::check_create_in(node, false) {
+            return Ok(status);
+        }
+    }
+    let explicit = if mode != 0 && attributes != 0 { state::user_struct::<ObjectAttributes>(attributes)?.security_descriptor.probe_get()? } else { 0 };
     let port = match port_objects::create("alpc", initial, maximum, 0, attributes, Box::new(|listener: &Arc<Port>| {
         if let Some(server) = SERVERS.lock().remove(&listener.pointer) {
             server.close();
@@ -1322,12 +1351,22 @@ fn create_listener(out: u64, attributes: u64, name: Option<String>, initial: Por
     let server = Arc::new(UserServer { listener: port.clone(), endpoint: SpinLock::new(None), state: SpinLock::new(ServerState::default()) });
     SERVERS.lock().insert(port.pointer, server.clone());
     let result = port.run(|| -> Result<u32, KernelError> {
+        if let Some(parent_node) = parent_node.filter(|_| explicit == 0) {
+            let Some(alpc_type) = crate::ntos::ob::object_types::user_type("alpc") else { return Err(KernelError::new("ALPC Port type missing")) };
+            match crate::ntos::ob::object_security::assign_new(&alpc_type, Some(parent_node), 0, true) {
+                Ok(policy) => crate::ntos::ob::objects::dispatcher::set_security(port.pointer, policy),
+                Err(status) => return Ok(status),
+            }
+        }
         if name.is_some() {
             let node = match object_manager::create_object(&parent, &leaf, "AlpcPort", None) {
                 Ok(node) => node,
                 Err(error) => return Ok(if error.status != 0 { error.status } else { STATUS_OBJECT_NAME_COLLISION }),
             };
-            *server.endpoint.lock() = Some(transport::attach(node, server.clone()));
+            // O endpoint leva o descritor da própria porta (o que o
+            // NtAlpcCreatePort recebeu, ou o herdado).
+            let security = crate::ntos::ob::objects::dispatcher::security(port.pointer).unwrap_or_default();
+            *server.endpoint.lock() = Some(transport::attach_with_security(node, server.clone(), security));
         }
         let status = publish_created(&port, out, object_flags, mode)?;
         if status != 0 {

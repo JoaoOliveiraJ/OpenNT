@@ -644,6 +644,9 @@ fn connect_port(out: u64, name: u64, oa: u64, port_attributes: u64, rsp: u64, re
         return Ok(0xC000_0024);
     }
     let Some(listener) = crate::ntos::alpc::transport::listener_of(node) else { return Ok(0xC000_0042) };
+    if let Err(status) = crate::ntos::alpc::server::check_connect_access(node, &path) {
+        return Ok(status);
+    }
     let flags = state::stack_arg32(rsp, 5);
     let message = state::stack_arg(rsp, 7);
     let length = state::stack_arg(rsp, 8);
