@@ -47,10 +47,12 @@ pub fn entropy_registrations() -> Vec<EntropyRegistration> {
 
 /// SYSTEM_INFORMATION_CLASS das classes de tamanho fixo de `query_fixed`.
 pub const SYSTEM_FLAGS_INFORMATION: u32 = 9;
+pub const SYSTEM_KERNEL_DEBUGGER_INFORMATION: u32 = 35;
 pub const SYSTEM_PHYSICAL_MEMORY_INFORMATION: u32 = 184;
 pub const SYSTEM_HYPERVISOR_SHARED_PAGE_INFORMATION: u32 = 197;
 
-/// A classe é uma das de `query_fixed`.
+/// A classe é uma das de `query_fixed` com o buffer sondado com alinhamento
+/// 4 (a SystemKernelDebuggerInformation sonda com alinhamento 1).
 pub fn is_fixed_class(class: u32) -> bool {
     matches!(class, SYSTEM_FLAGS_INFORMATION | SYSTEM_PHYSICAL_MEMORY_INFORMATION | SYSTEM_HYPERVISOR_SHARED_PAGE_INFORMATION)
 }
@@ -66,6 +68,9 @@ pub fn is_fixed_class(class: u32) -> bool {
 ///   bytes: o total de RAM (MmGetNumberOfPhysicalPages << 12), o endereço do
 ///   menor frame (MmGetLowestPhysicalPage << 12) e o último byte do maior
 ///   (MmGetHighestPhysicalPage << 12 | 0xFFF).
+/// - SystemKernelDebuggerInformation (35, rva 0x6cb336): pelo menos 2
+///   bytes, o KdDebuggerEnabled e o KdDebuggerNotPresent
+///   (SYSTEM_KERNEL_DEBUGGER_INFORMATION).
 /// - SystemHypervisorSharedPageInformation (197, rva 0x6cced4): pelo menos
 ///   8 bytes, o endereço de usuário da página compartilhada do hypervisor
 ///   (MiState): a página de referência do QPC que a KUSER_SHARED_DATA
@@ -82,6 +87,7 @@ pub fn query_fixed(class: u32, output: u64, length: u32) -> Option<Result<(u32, 
             data.extend_from_slice(&((highest << 12) + 0xFFF).to_le_bytes());
             (0x18, true, data)
         }
+        SYSTEM_KERNEL_DEBUGGER_INFORMATION => (2, false, alloc::vec![crate::ntos::kd::debugger::enabled() as u8, crate::ntos::kd::debugger::debugger_not_present() as u8]),
         SYSTEM_HYPERVISOR_SHARED_PAGE_INFORMATION => (8, false, crate::ntos::mm::shared_user_data::hypervisor_shared_user_va().to_le_bytes().to_vec()),
         _ => return None,
     };

@@ -5,7 +5,9 @@
 //! ProcessDefaultHardErrorMode e ProcessHandleCheckingMode do
 //! NtSetInformationProcess (`ps/set_process_information`), as classes de
 //! tamanho fixo do NtQuerySystemInformation (`ex/system_information`) e os
-//! vizinhos NtPulseEvent, NtSetEventBoostPriority e NtQueryDirectoryObject.
+//! vizinhos NtPulseEvent, NtSetEventBoostPriority e NtQueryDirectoryObject,
+//! e o objeto Timer do Executive de modo usuário (NtCreateTimer, NtSetTimer
+//! e NtCancelTimer, que o WUDFPlatform.dll do services.exe pede).
 
 use crate::ntos::inc::field::NtStruct;
 use crate::ntos::inc::types::{Eprocess, Ethread, HandleTable, ObjectAttributes};
@@ -41,6 +43,7 @@ pub fn run(assert: Assert) {
     system_classes(assert, block, &call);
     events(assert, block, rsp, &call);
     directory_query(assert, block, rsp, &call);
+    executive_timer(assert, block, rsp, &call);
     if let Some(region) = memory::find_region(block) {
         memory::release_private_region(&region);
     }
@@ -158,6 +161,45 @@ fn system_classes(assert: Assert, block: u64, call: Call) {
     let shared_page = guest::read64(buffer);
     let shared_returned = guest::read32(returned);
     assert(shared == 0 && shared_page == crate::ntos::mm::shared_user_data::hypervisor_shared_user_va() && shared_page != 0 && shared_returned == 8 && query(197, buffer, 4) == STATUS_INFO_LENGTH_MISMATCH && guest::read32(returned) == 8 && query(197, buffer + 2, 8) == STATUS_DATATYPE_MISALIGNMENT, "userboot: SystemHypervisorSharedPageInformation publica a pagina de referencia do QPC");
+    // SystemKernelDebuggerInformation: dois bytes, sem exigência de
+    // alinhamento (o ProbeForWrite de alinhamento 1).
+    guest::write32(buffer, u32::MAX);
+    let debugger = query(35, buffer + 1, 4);
+    let (debugger_enabled, debugger_absent) = (guest::read8(buffer + 1), guest::read8(buffer + 2));
+    let debugger_returned = guest::read32(returned);
+    let debugger_short = query(35, buffer, 1);
+    assert(
+        debugger == 0 && debugger_enabled == crate::ntos::kd::debugger::enabled() as u8 && debugger_absent == crate::ntos::kd::debugger::debugger_not_present() as u8 && debugger_returned == 2 && guest::read8(buffer + 3) == 0xFF && debugger_short == STATUS_INFO_LENGTH_MISMATCH && guest::read32(returned) == 2,
+        "userboot: SystemKernelDebuggerInformation com o KdDebuggerEnabled e o KdDebuggerNotPresent",
+    );
+}
+
+/// O ETIMER de modo usuário: o TimerType acima de SynchronizationTimer e o
+/// período negativo recusados, o estado anterior e o corrente pelos
+/// BOOLEANs de saída e o handle fechado.
+fn executive_timer(assert: Assert, block: u64, rsp: u64, call: Call) {
+    let (handle_cell, due, previous, current) = (block + 0x600, block + 0x608, block + 0x610, block + 0x611);
+    let invalid_type = call("NtCreateTimer", handle_cell, 0x1F_0003, 0, 2);
+    let created = call("NtCreateTimer", handle_cell, 0x1F_0003, 0, 0);
+    let handle = guest::read64(handle_cell);
+    // Prazo relativo de 1 s, sem APC, sem ResumeTimer, período 0.
+    guest::write64(due, (-10_000_000i64) as u64);
+    guest::write64(rsp + 0x28, 0);
+    guest::write64(rsp + 0x30, (-1i64) as u64);
+    guest::write64(rsp + 0x38, previous);
+    let negative_period = call("NtSetTimer", handle, due, 0, 0);
+    guest::write64(rsp + 0x30, 0);
+    guest::write8(previous, 0xFF);
+    let set = call("NtSetTimer", handle, due, 0, 0);
+    let previous_state = guest::read8(previous);
+    guest::write8(current, 0xFF);
+    let cancelled = call("NtCancelTimer", handle, current, 0, 0);
+    let current_state = guest::read8(current);
+    let closed = call("NtClose", handle, 0, 0, 0);
+    assert(
+        invalid_type == 0xC000_00F2 && created == 0 && handle != 0 && negative_period == 0xC000_00F4 && set == 0 && previous_state == 0 && cancelled == 0 && current_state == 0 && closed == 0,
+        "userboot: NtCreateTimer, NtSetTimer e NtCancelTimer do ETIMER de modo usuario",
+    );
 }
 
 fn events(assert: Assert, block: u64, rsp: u64, call: Call) {

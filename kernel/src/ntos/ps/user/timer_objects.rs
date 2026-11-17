@@ -1,4 +1,6 @@
-//! Timers de usuário (NtCreateTimer2).
+//! Timers de usuário (NtCreateTimer2) e os adaptadores de modo usuário do
+//! objeto Timer do Executive (NtCreateTimer, NtSetTimer e NtCancelTimer,
+//! sobre `ex/timer_object.rs` com PreviousMode UserMode).
 //!
 //! O prazo e o período ficam em unidades de 100 ns inteiras (sem ponto
 //! flutuante e sem perder a fração de ms).
@@ -17,6 +19,10 @@ use crate::ntos::ob::object_manager::{self, NodeId};
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::inc::types::{Ktimer, NtStruct, T2SetParameters, TimerBasicInformation};
+use crate::ntos::ex::timer_object;
+
+/// PreviousMode dos adaptadores do ETIMER.
+const USER_MODE: u8 = 1;
 
 /// Prazo (absoluto, em 100 ns do relógio do sistema) e período.
 #[derive(Clone, Copy, Default)]
@@ -246,7 +252,29 @@ pub fn pump() {
     }
 }
 
+/// NtCreateTimer(TimerHandle, DesiredAccess, ObjectAttributes, TimerType).
+fn nt_create_timer(out: u64, access: u64, attributes: u64, timer_type: u64, _rsp: u64) -> Result<u32, KernelError> {
+    timer_object::create(out, access as u32, attributes, timer_type as u32, USER_MODE)
+}
+
+/// NtSetTimer(TimerHandle, DueTime, TimerApcRoutine, TimerContext,
+/// ResumeTimer, Period, PreviousState): os três últimos na pilha.
+fn nt_set_timer(handle: u64, due: u64, apc_routine: u64, apc_context: u64, rsp: u64) -> Result<u32, KernelError> {
+    let resume = state::stack_arg(rsp, 5) as u8 != 0;
+    let period = state::stack_arg32(rsp, 6) as i32;
+    let previous_state = state::stack_arg(rsp, 7);
+    timer_object::set(handle, due, apc_routine, apc_context, resume, period, previous_state, USER_MODE)
+}
+
+/// NtCancelTimer(TimerHandle, CurrentState).
+fn nt_cancel_timer(handle: u64, current_state: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
+    timer_object::cancel(handle, current_state, USER_MODE)
+}
+
 pub fn init() {
+    state::register_handler("NtCreateTimer", nt_create_timer);
+    state::register_handler("NtSetTimer", nt_set_timer);
+    state::register_handler("NtCancelTimer", nt_cancel_timer);
     state::register_handler("NtCreateTimer2", nt_create_timer2);
     state::register_handler("NtSetTimer2", nt_set_timer2);
     state::register_handler("NtCancelTimer2", nt_cancel_timer2);
