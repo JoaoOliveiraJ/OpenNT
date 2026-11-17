@@ -39,6 +39,7 @@ use alloc::vec::Vec;
 use crate::ntos::cm::hive::key_cells;
 use crate::ntos::cm::hive::storage::Storage;
 use crate::ntos::cm::hive::tree::{FlatKey, NewKey};
+use crate::ntos::cm::key::notify as key_notify;
 use crate::ntos::cm::key::policy as key_policy;
 use crate::ntos::ke::clock;
 use crate::ntos::ob::handle_ids;
@@ -270,6 +271,44 @@ pub fn unwatch(identifier: u64) -> bool {
     observers.len() != before
 }
 
+/// O nó e os ancestrais dele até a raiz (a pilha de KCBs que o
+/// CmpReportNotifyHelper sobe para achar os blocos de notificação).
+fn ancestry(hive: &Hive, node: NodeId) -> Vec<NodeId> {
+    let mut chain = Vec::new();
+    let mut current = Some(node);
+    while let Some(id) = current {
+        chain.push(id);
+        current = hive.nodes.get(&id).and_then(|key| key.parent);
+    }
+    chain
+}
+
+/// [`ancestry`] com a trava.
+pub fn ancestors(node: NodeId) -> Vec<NodeId> {
+    with_hive(|hive| ancestry(hive, node))
+}
+
+/// CmpReportNotify de uma mudança na chave `chain[0]` com o filtro
+/// REG_NOTIFY_CHANGE_* dela, fora das travas.
+fn report_change(chain: &[NodeId], filter: u32) {
+    if !chain.is_empty() {
+        key_notify::report(chain, filter);
+    }
+}
+
+/// O nó existente mais fundo de um caminho já resolvido: o pai da primeira
+/// chave que uma criação acrescentaria.
+fn deepest_existing(hive: &Hive, path: &str) -> NodeId {
+    let mut node = ROOT;
+    for component in split_path(path) {
+        match hive.nodes[&node].child(&component.to_lowercase()) {
+            Some(child) => node = child,
+            None => break,
+        }
+    }
+    node
+}
+
 /// Notifica uma cópia da lista (inscrição e remoção durante a entrega são
 /// permitidas); nenhum lock fica retido durante os callbacks.
 fn notify_path_changed(path: &str) {
@@ -428,12 +467,16 @@ pub fn create_resolved(path: &str, security: Option<Captured>, volatile: bool, l
 /// [`create_resolved`] com a classe da chave final quando criada (o Class
 /// do NtCreateKey); uma chave que já existe fica com a classe dela.
 pub fn create_resolved_class(path: &str, security: Option<Captured>, volatile: bool, link: bool, class: &[u16]) -> Result<(u32, bool), KernelError> {
-    let (handle, created) = with_hive(|hive| -> Result<(u32, bool), KernelError> {
+    let (handle, created, parent_chain) = with_hive(|hive| -> Result<(u32, bool, Vec<NodeId>), KernelError> {
         let existing = walk(hive, path, false, None, false)?;
-        let Some(node) = walk_link(hive, path, true, security, volatile, link, class)? else { return Ok((0, false)) };
-        Ok((publish(hive, path, node)?, existing.is_none()))
+        let parent = deepest_existing(hive, path);
+        let Some(node) = walk_link(hive, path, true, security, volatile, link, class)? else { return Ok((0, false, Vec::new())) };
+        let created = existing.is_none();
+        Ok((publish(hive, path, node)?, created, if created { ancestry(hive, parent) } else { Vec::new() }))
     })?;
     if created {
+        // CmpCreateChild: REG_NOTIFY_CHANGE_NAME no pai.
+        report_change(&parent_chain, key_notify::REG_NOTIFY_CHANGE_NAME);
         notify_path_changed(path);
     }
     Ok((handle, created))
@@ -491,6 +534,7 @@ pub fn delete_node(node: NodeId, path: &str) -> bool {
         // caminho resolvido, e a árvore é a fonte de verdade.
         let (parent, lower) = (key.parent?, key.name.to_lowercase());
         let real = node_path(hive, node);
+        let parent_chain = ancestry(hive, parent);
         let parent = hive.nodes.get_mut(&parent)?;
         let before = parent.children.len();
         parent.children.retain(|(name, child)| !(*name == lower && *child == node));
@@ -504,10 +548,15 @@ pub fn delete_node(node: NodeId, path: &str) -> bool {
         if let Some(key) = hive.nodes.get_mut(&node) {
             key.cell = None;
         }
-        Some(real)
+        Some((real, parent_chain))
     });
     match removed {
-        Some(real) => {
+        Some((real, parent_chain)) => {
+            // CmDeleteKey: REG_NOTIFY_CHANGE_NAME no pai; os pedidos nos
+            // handles da chave excluída completam com STATUS_NOTIFY_CLEANUP
+            // (CmpFlushNotifiesOnKeyBodyList).
+            report_change(&parent_chain, key_notify::REG_NOTIFY_CHANGE_NAME);
+            key_notify::flush_node(node);
             notify_path_changed(if path.is_empty() { &real } else { path });
             true
         }
@@ -569,10 +618,11 @@ pub fn set_value(handle: u32, name: &str, value_type: u32, data: Vec<u8>) -> boo
     set_node_value(entry.node, &entry.path, name, value_type, data)
 }
 
-/// Grava o valor, atualiza LastWriteTime e avisa os observadores.
+/// Grava o valor, atualiza LastWriteTime e avisa os observadores
+/// (CmSetValueKey: REG_NOTIFY_CHANGE_LAST_SET na chave).
 pub fn set_node_value(node: NodeId, path: &str, name: &str, value_type: u32, data: Vec<u8>) -> bool {
     let written = with_hive(|hive| {
-        let Some(key) = hive.nodes.get_mut(&node).filter(|key| !key.deleted) else { return false };
+        let Some(key) = hive.nodes.get_mut(&node).filter(|key| !key.deleted) else { return None };
         let lower = name.to_lowercase();
         let value = Value { name: name.to_string(), value_type, data };
         let stored = value.clone();
@@ -582,12 +632,16 @@ pub fn set_node_value(node: NodeId, path: &str, name: &str, value_type: u32, dat
         }
         key.last_write_time = now();
         mirror(hive, node, |storage, cell, time| key_cells::set_value(storage, cell, &stored.name, stored.value_type, &stored.data, time));
-        true
+        Some(ancestry(hive, node))
     });
-    if written {
-        notify_path_changed(path);
+    match written {
+        Some(chain) => {
+            report_change(&chain, key_notify::REG_NOTIFY_CHANGE_LAST_SET);
+            notify_path_changed(path);
+            true
+        }
+        None => false,
     }
-    written
 }
 
 pub fn get_value(handle: u32, name: &str) -> Option<Value> {
@@ -600,24 +654,29 @@ pub fn delete_value(handle: u32, name: &str) -> bool {
     delete_node_value(entry.node, &entry.path, name)
 }
 
-/// Remove um valor existente e só então atualiza o tempo e notifica.
+/// Remove um valor existente e só então atualiza o tempo e notifica
+/// (CmDeleteValueKey: REG_NOTIFY_CHANGE_LAST_SET na chave).
 pub fn delete_node_value(node: NodeId, path: &str, name: &str) -> bool {
     let removed = with_hive(|hive| {
-        let Some(key) = hive.nodes.get_mut(&node).filter(|key| !key.deleted) else { return false };
+        let Some(key) = hive.nodes.get_mut(&node).filter(|key| !key.deleted) else { return None };
         let lower = name.to_lowercase();
         let before = key.values.len();
         key.values.retain(|(candidate, _)| *candidate != lower);
-        let removed = key.values.len() != before;
-        if removed {
-            key.last_write_time = now();
-            mirror(hive, node, |storage, cell, time| key_cells::delete_value(storage, cell, name, time));
+        if key.values.len() == before {
+            return None;
         }
-        removed
+        key.last_write_time = now();
+        mirror(hive, node, |storage, cell, time| key_cells::delete_value(storage, cell, name, time));
+        Some(ancestry(hive, node))
     });
-    if removed {
-        notify_path_changed(path);
+    match removed {
+        Some(chain) => {
+            report_change(&chain, key_notify::REG_NOTIFY_CHANGE_LAST_SET);
+            notify_path_changed(path);
+            true
+        }
+        None => false,
     }
-    removed
 }
 
 /// O nó de um caminho, seguindo os links.
@@ -745,7 +804,7 @@ fn node_path(hive: &Hive, node: NodeId) -> String {
 /// dela, STATUS_CANNOT_DELETE, salvo `force` (REG_FORCE_UNLOAD), que deixa
 /// os handles apontando para chaves excluídas. Devolve as células.
 pub fn unlink_hive(identifier: u32, force: bool) -> Result<Storage, u32> {
-    let (storage, path) = with_hive(|hive| {
+    let (storage, path, parent_chain) = with_hive(|hive| {
         let Some(&(_, root)) = hive.storages.get(&identifier) else { return Err(STATUS_OBJECT_NAME_NOT_FOUND) };
         let nodes = subtree(hive, root);
         if !force && has_open_handles(hive, &nodes) {
@@ -753,6 +812,7 @@ pub fn unlink_hive(identifier: u32, force: bool) -> Result<Storage, u32> {
         }
         let path = node_path(hive, root);
         let lower = hive.nodes[&root].name.to_lowercase();
+        let parent_chain = hive.nodes[&root].parent.map(|parent| ancestry(hive, parent)).unwrap_or_default();
         if let Some(parent) = hive.nodes[&root].parent.and_then(|parent| hive.nodes.get_mut(&parent)) {
             parent.children.retain(|(name, _)| *name != lower);
         }
@@ -763,8 +823,10 @@ pub fn unlink_hive(identifier: u32, force: bool) -> Result<Storage, u32> {
             }
         }
         let (storage, _) = hive.storages.remove(&identifier).expect("hive registrada");
-        Ok((storage, path))
+        Ok((storage, path, parent_chain))
     })?;
+    // CmpPerformUnloadKey: a raiz some do pai.
+    report_change(&parent_chain, key_notify::REG_NOTIFY_CHANGE_NAME);
     notify_path_changed(&path);
     Ok(storage)
 }

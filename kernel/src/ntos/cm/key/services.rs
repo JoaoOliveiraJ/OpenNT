@@ -377,6 +377,19 @@ pub fn reference_key(handle: u64, previous_mode: bool, required: u32) -> Result<
     }
 }
 
+/// CmObReferenceObjectByHandle para a notificação de mudança: o corpo do
+/// handle (onde fica o bloco de notificação), o nó e o caminho.
+/// `Err(NTSTATUS)`.
+pub fn reference_key_body(handle: u64, previous_mode: bool, required: u32) -> Result<(u64, NodeId, String), u32> {
+    let resolved = match resolve_key_handle(handle, previous_mode, required) {
+        Ok(resolved) => resolved,
+        Err(Fail::Status(status)) => return Err(status),
+        Err(Fail::Kernel(error)) => return Err(if error.status != 0 { error.status } else { 0xC000_0001 }),
+    };
+    let body = key_objects::for_handle(resolved.khandle).ok_or(0xC000_009Au32)?;
+    Ok((body, resolved.node, resolved.path))
+}
+
 fn close_from_table(_process: u64, handle: u32) {
     registry::close_handle(handle);
 }

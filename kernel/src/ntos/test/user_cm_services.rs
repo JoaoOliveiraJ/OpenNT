@@ -19,6 +19,7 @@ const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
 const STATUS_NO_MEMORY: u32 = 0xC000_0017;
 const STATUS_NOTIFY_ENUM_DIR: u32 = 0x10C;
+const STATUS_NOTIFY_CLEANUP: u32 = 0x10B;
 const STATUS_NO_SUCH_DEVICE: u32 = 0xC000_000E;
 const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
 const NOTIFY_KEY: &str = "\\Registry\\Machine\\Software\\OpenNtNotifyUser";
@@ -114,31 +115,62 @@ fn notify(assert: Assert, block: u64, call: Call, stack: Stack) {
         pending == STATUS_PENDING && reset && queued == 1 && fired && io_status.status.get() as u32 == STATUS_NOTIFY_ENUM_DIR && io_status.information.get() == 0 && crate::ntos::cm::notify::pending_count(pid) == 0,
         "usercm: NtNotifyChangeKey assincrono devolve STATUS_PENDING, zera o evento e a mudanca na chave grava STATUS_NOTIFY_ENUM_DIR e sinaliza",
     );
-    // Sem WatchTree, uma subchave neta não dispara (a filha já existe antes
-    // do pedido); a mudança direta na chave dispara.
+    // A filha criada sem pedido esperando (REG_NOTIFY_CHANGE_NAME na chave)
+    // fica pendente no bloco do handle: o próximo pedido completa na hora,
+    // com STATUS_SUCCESS (CmpNotifyChangeKey com NotifyPending).
     let child_handle = registry::open_or_create(&alloc::format!("{NOTIFY_KEY}\\A"), None);
     if let Ok(handle) = child_handle {
         registry::close_handle(handle);
     }
     stack(&[iosb, 0xF, 0, 0, 0, 1]);
     io_status.status.set(0);
+    let kept = call("NtNotifyChangeKey", key, event, 0, 0);
+    let kept_fired = event_pointer != 0 && dispatcher::read_state(event_pointer) != 0;
+    assert(kept == 0 && kept_fired && io_status.status.get() as u32 == STATUS_NOTIFY_ENUM_DIR && crate::ntos::cm::notify::pending_count(pid) == 0, "usercm: a mudanca entre a conclusao e o novo pedido completa o pedido na hora");
+    // Sem WatchTree, uma subchave neta não dispara; a mudança direta na
+    // chave dispara.
+    stack(&[iosb, 0xF, 0, 0, 0, 1]);
+    io_status.status.set(0);
     let shallow = call("NtNotifyChangeKey", key, event, 0, 0);
     let deep = alloc::format!("{NOTIFY_KEY}\\A\\B");
     let deep_handle = registry::open_or_create(&deep, None);
     let shallow_fired = event_pointer != 0 && dispatcher::read_state(event_pointer) != 0;
-    // O pedido ainda pendente sai no fim do processo; aqui ele é disparado
-    // pela mudança direta.
     if let Ok(handle) = kernel_key {
         registry::set_value(handle, "Touched", 4, alloc::vec![2, 0, 0, 0]);
     }
     assert(shallow == STATUS_PENDING && !shallow_fired && io_status.status.get() as u32 == STATUS_NOTIFY_ENUM_DIR, "usercm: sem WatchTree a neta nao dispara e a mudanca direta sim");
+    // O filtro do bloco: REG_NOTIFY_CHANGE_LAST_SET não dispara na criação
+    // de subchave (nem a guarda como pendente) e dispara no valor.
+    let last_set = open(0x2_0019);
+    stack(&[iosb, 4, 0, 0, 0, 1]);
+    io_status.status.set(0);
+    let armed = call("NtNotifyChangeKey", last_set, event, 0, 0);
+    let named = registry::open_or_create(&alloc::format!("{NOTIFY_KEY}\\C"), None);
+    if let Ok(handle) = named {
+        registry::close_handle(handle);
+    }
+    let name_fired = event_pointer != 0 && dispatcher::read_state(event_pointer) != 0;
+    if let Ok(handle) = kernel_key {
+        registry::set_value(handle, "Touched", 4, alloc::vec![3, 0, 0, 0]);
+    }
+    let value_fired = event_pointer != 0 && dispatcher::read_state(event_pointer) != 0;
+    assert(last_set != 0 && armed == STATUS_PENDING && !name_fired && value_fired && io_status.status.get() as u32 == STATUS_NOTIFY_ENUM_DIR, "usercm: o filtro REG_NOTIFY_CHANGE_LAST_SET ignora a subchave nova e dispara no valor");
+    // Fechar o handle completa o pedido com STATUS_NOTIFY_CLEANUP.
+    stack(&[iosb, 4, 0, 0, 0, 1]);
+    io_status.status.set(0);
+    let rearmed = call("NtNotifyChangeKey", last_set, event, 0, 0);
+    let closed = call("NtClose", last_set, 0, 0, 0);
+    let cleanup_fired = event_pointer != 0 && dispatcher::read_state(event_pointer) != 0;
+    assert(rearmed == STATUS_PENDING && closed == 0 && cleanup_fired && io_status.status.get() as u32 == STATUS_NOTIFY_CLEANUP && crate::ntos::cm::notify::pending_count(pid) == 0, "usercm: o fechamento do handle completa o pedido com STATUS_NOTIFY_CLEANUP");
     if let Ok(handle) = deep_handle {
         registry::delete_key(handle);
         registry::close_handle(handle);
     }
-    if let Some(handle) = registry::open(&alloc::format!("{NOTIFY_KEY}\\A")).ok() {
-        registry::delete_key(handle);
-        registry::close_handle(handle);
+    for child in ["A", "C"] {
+        if let Some(handle) = registry::open(&alloc::format!("{NOTIFY_KEY}\\{child}")).ok() {
+            registry::delete_key(handle);
+            registry::close_handle(handle);
+        }
     }
     for handle in [key, query_only, event] {
         let _ = call("NtClose", handle, 0, 0, 0);

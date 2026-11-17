@@ -5,6 +5,7 @@
 
 use alloc::vec::Vec;
 
+use crate::ntos::cm::key::notify as key_notify;
 use crate::ntos::cm::key::objects as key_objects;
 use crate::ntos::cm::key::policy as key_policy;
 use crate::ntos::cm::registry;
@@ -136,7 +137,8 @@ pub fn query(body: u64, information: u32, buffer: u64, capacity: u32) -> Result<
 /// uma chave): as partes de `information` do descritor capturado trocam as
 /// do descritor do nó (SeSetSecurityDescriptorInfo com o mapeamento do tipo
 /// Key), e as aberturas seguintes leem o descritor novo. Uma chave apagada
-/// dá STATUS_KEY_DELETED.
+/// dá STATUS_KEY_DELETED. A troca relata REG_NOTIFY_CHANGE_ATTRIBUTES |
+/// REG_NOTIFY_CHANGE_SECURITY na chave (CmpSetKeySecurity).
 pub fn set(node: registry::NodeId, information: u32, captured: u64) -> u32 {
     let Some((deleted, current)) = registry::with_node(node, |key| (key.deleted, owned(&key.security))) else { return 0xC000_0034 };
     if deleted {
@@ -147,6 +149,7 @@ pub fn set(node: registry::NodeId, information: u32, captured: u64) -> u32 {
         Ok(merged) => {
             let security = Captured { control: merged.control & 0x7FFF, owner: merged.owner.unwrap_or_default(), group: merged.group.unwrap_or_default(), dacl: merged.dacl, sacl: merged.sacl };
             registry::with_node_mut(node, |key| key.security = security);
+            key_notify::report(&registry::ancestors(node), key_notify::REG_NOTIFY_CHANGE_ATTRIBUTES | key_notify::REG_NOTIFY_CHANGE_SECURITY);
             0
         }
         Err(status) => status,

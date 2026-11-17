@@ -86,6 +86,8 @@ fn collect(bodies: &mut Bodies, pointer: u64) -> bool {
 }
 
 fn free_body(pointer: u64) {
+    // O bloco de notificação do corpo (CmpFlushNotify) sai com ele.
+    crate::ntos::cm::key::notify::flush(pointer);
     // RegNtCallbackObjectContextCleanup: os contextos dos filtros neste
     // objeto saem antes dele.
     crate::ntos::cm::callbacks::object_destroyed(pointer);
@@ -153,17 +155,22 @@ pub fn release(pointer: u64) -> Result<(), KernelError> {
     Ok(())
 }
 
-/// Remove a associação de um handle.
+/// Remove a associação de um handle. O fechamento do último handle do
+/// corpo completa os pedidos de notificação dele (CmpCloseKeyObject →
+/// CmpFlushNotify), mesmo com uma operação ainda retendo o corpo.
 pub fn detach(handle: u32) {
-    let freed = with(|bodies| {
+    let detached = with(|bodies| {
         let pointer = bodies.by_handle.remove(&handle)?;
-        if let Some(body) = bodies.by_pointer.get_mut(&pointer) {
+        let last = bodies.by_pointer.get_mut(&pointer).is_some_and(|body| {
             body.handles -= 1;
-        }
-        collect(bodies, pointer).then_some(pointer)
+            body.handles == 0
+        });
+        Some((pointer, last, collect(bodies, pointer)))
     });
-    if let Some(pointer) = freed {
-        free_body(pointer);
+    match detached {
+        Some((pointer, _, true)) => free_body(pointer),
+        Some((pointer, true, false)) => crate::ntos::cm::key::notify::flush(pointer),
+        _ => {}
     }
 }
 

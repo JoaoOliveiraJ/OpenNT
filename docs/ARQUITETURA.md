@@ -67,7 +67,8 @@ kernel/src/
 │   │   │              das hives de máquina (seed)
 │   │   ├── hive/      formato regf: bloco base, bins e células, listas de
 │   │   │              subchaves, 'sk', 'nk'/'vk'/'db', logs e descarga
-│   │   ├── key/       chaves e serviços Nt/Zw de chave
+│   │   ├── key/       chaves e serviços Nt/Zw de chave, blocos de notificação
+│   │   │              de mudança por corpo de chave (notify)
 │   │   └── service/   serviços e drivers (base, canal, RPC)
 │   ├── rtl/           a Rtl do NT: strings, Unicode, páginas de código, AVL, árvore
 │   │   │              rubro-negra (rb_tree), bitmap, exceções, imagens PE, tabelas de

@@ -12594,9 +12594,16 @@ fn cm_key_notify_exports(assert: Assert) {
     iosb.status.set(0);
     let _ = key_services::open_path(&alloc::format!("{path}\\Other"), true);
     assert(iosb.status.get() == 0, "cm-key-notify: notificacao e de disparo unico");
+    // A mudança sem pedido esperando ficou pendente no bloco do handle: o
+    // próximo pedido completa na hora, com STATUS_SUCCESS.
+    let kept = call_export("ZwNotifyChangeKey", &[key, event, 0, 0, io_status, 5, 0, 0, 0, 1]);
+    assert(kept == Some(0) && dispatcher::read_state(event) != 0 && iosb.status.get() == 0x10C, "cm-key-notify: mudanca pendente completa o pedido seguinte na hora");
     assert(call_export("ZwNotifyChangeKey", &[0x7FFF_FFF0, event, 0, 0, io_status, 5, 0, 0, 0, 1]) == Some(signed_status(0xC000_0008)), "cm-key-notify: handle invalido recusado");
+    // Fechar o handle completa o pedido armado com STATUS_NOTIFY_CLEANUP.
+    let rearmed = call_export("ZwNotifyChangeKey", &[key, event, 0, 0, io_status, 5, 0, 0, 0, 1]);
     let _ = call_export("ZwClose", &[child]);
     let _ = call_export("ZwClose", &[key]);
+    assert(rearmed == Some(0x103) && dispatcher::read_state(event) != 0 && iosb.status.get() == 0x10B, "cm-key-notify: fechamento do handle completa com STATUS_NOTIFY_CLEANUP");
 }
 
 
