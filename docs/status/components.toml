@@ -249,8 +249,7 @@ id = "primeiro-pixel"
 titulo = "Primeiro pixel do win32k.sys na tela"
 marcador = "FIRST_PIXEL_OK"
 comando = "cargo xtask test-boot FIRST_PIXEL_OK 600000 --initial-process=smss --display=basic --build-dir=build/primeiro-pixel --smp=1 --watch-screen"
-espera_falha = true
-descricao = "O boot do teste winlogon com o xtask lendo a tela do QEMU a cada 2 s (--watch-screen). O vídeo de boot (o modo VBE 1024x768 do BasicDisplay.sys) é todo preto. O marcador FIRST_PIXEL_OK sai quando uma tela gráfica de pelo menos 800x600 mostra 64 pixels ou mais fora do preto, sem ser a tela de bugcheck, e a tela vai para build/primeiro-pixel/primeira-tela.png. Ainda falha: o vídeo físico da sessão 1 só chega ao win32k quando o Local Session Manager (lsm.dll, num svchost do services.exe) conecta a sessão ao console. O csrss faz então o NtUserRemoteConnect, o win32k chama o DxgkSessionConnected e o dxgkrnl entrega o adaptador à sessão, que carrega o cdd.dll. Sem o LSM, o InitVideo da sessão 1 usa só o dispositivo desconectado (\\Device\\Disc) e nada chega ao framebuffer."
+descricao = "O boot do teste winlogon com o xtask lendo a tela do QEMU a cada 2 s (--watch-screen). O vídeo de boot (o modo VBE 1024x768 do BasicDisplay.sys) é todo preto. O marcador FIRST_PIXEL_OK sai quando uma tela gráfica de pelo menos 800x600 mostra 64 pixels ou mais fora do preto, sem ser a tela de bugcheck, e a tela vai para build/primeiro-pixel/primeira-tela.png. O PnP instala o BasicRender.sys em ROOT\\BASICRENDER (o adaptador de renderização WARP do dxgkrnl, com o dxgmms2.sys e o \\Device\\PhysicalMemory) e o monitor.sys no monitor que o BasicDisplay relata. Dentro do NtUserInitialize da sessão 1, o InitVideo do win32kbase abre o \\Device\\Video0, marca o dispositivo como WDDM e carrega o cdd.dll pelo ZwSetSystemInformation(26); o cdd acha o adaptador de renderização no dxgkrnl. O win32k põe o ponteiro do mouse no centro da tela e o BasicDisplay.sys o desenha direto no framebuffer: 73 pixels brancos. A Desktop do Winlogon é preta."
 
 [[teste]]
 id = "services"
@@ -1527,9 +1526,9 @@ notas = "Uma suíte planejada conta como pronta quando o arquivo de teste de mes
 # faz (uma linha: o que funciona) e para (opcional: onde para).
 
 [marco]
-atual = "Na sessão 0, o wininit.exe real cria o services.exe e o lsass.exe reais. O lsass instala o banco de política e o banco de contas de um sistema novo, inicializa a auditoria, as sessões de logon, as credenciais e os pacotes de segurança e publica as interfaces RPC do LSA; o services.exe consulta o domínio da conta no lsass, publica a interface RPC do gerenciador de serviços e cria o svchost do grupo DcomLaunch com o token do logon de serviço; o serviço Power desse svchost conecta ao \\PowerPort do kernel. Na sessão 1, o winlogon.exe real registra o processo de logon pelo RPC de kernel do msrpc.sys, abre as Desktops Winlogon, Disconnect e Default da WinSta0 dele e chama o SwitchDesktop."
-teste = "svchost-dcomlaunch"
-proximo = "Os serviços do svchost do DcomLaunch subirem (o Power, o DcomLaunch, o BrokerInfrastructure e o LSM) e o RpcSs e o RpcEptMapper no svchost do rpcss. O Local Session Manager (lsm.dll) sinaliza o TermSrvReadyEvent e conecta a sessão 1 pela \\SmSsWinStationApiPort. Em paralelo, o InitVideo da sessão 1 precisa carregar o cdd.dll (o adaptador de renderização do BasicRender) para o win32k desenhar o primeiro pixel (teste primeiro-pixel)."
+atual = "Na sessão 0, o wininit.exe real cria o services.exe e o lsass.exe reais. O lsass instala o banco de política e o banco de contas de um sistema novo, inicializa a auditoria, as sessões de logon, as credenciais e os pacotes de segurança e publica as interfaces RPC do LSA; o services.exe consulta o domínio da conta no lsass, publica a interface RPC do gerenciador de serviços e cria os svchost dos grupos DcomLaunch e rpcss com o token do logon de serviço; sobem o Power, o DcomLaunch, o RpcEptMapper e o RpcSs, e o lsm.dll do Local Session Manager é carregado. Na sessão 1, o winlogon.exe real registra o processo de logon pelo RPC de kernel do msrpc.sys, abre as Desktops Winlogon, Disconnect e Default da WinSta0 dele e chama o SwitchDesktop; o InitVideo da sessão carrega o cdd.dll sobre o adaptador de renderização do BasicRender.sys e o win32k desenha o ponteiro do mouse na tela pelo BasicDisplay.sys (o primeiro pixel)."
+teste = "primeiro-pixel"
+proximo = "O Local Session Manager registrar o endpoint dele no epmapper (a conexão ALPC confere o RequiredServerSid contra o usuário do token do servidor, a conta NetworkService do svchost do rpcss), sinalizar o TermSrvReadyEvent e conectar a sessão 1 pela \\SmSsWinStationApiPort. Depois o winlogon cria o LogonUI e o dwm, que desenham a tela de logon."
 
 [[roda]]
 nome = "O smss.exe cria o csrss.exe"
@@ -1576,21 +1575,21 @@ nome = "O svchost do DcomLaunch"
 grupo = "marco"
 teste = "svchost-dcomlaunch"
 faz = "O services.exe cria o svchost do grupo DcomLaunch com o token do logon de serviço; o serviço Power (umpo.dll) conecta ao \\PowerPort do kernel, sobe o endpoint umpo e lê o NtPowerInformation de modo usuário."
-para = "Os serviços do svchost ainda param antes do LSM: o Power sai depois do umpo e o RpcSs e o RpcEptMapper não sobem."
+para = "O RpcSs e o RpcEptMapper sobem no svchost do rpcss e o lsm.dll é carregado; o LSM para no registro do endpoint RPC dele no epmapper (a conferência do RequiredServerSid na conexão ALPC)."
 
 [[roda]]
 nome = "As Desktops do winlogon.exe"
 grupo = "marco"
 teste = "winlogon"
 faz = "O winlogon.exe real da sessão 1 registra o processo de logon pelo RPC de kernel do msrpc.sys, abre as Desktops Winlogon, Disconnect e Default da WinSta0 da sessão dele e chama o SwitchDesktop."
-para = "Depois do SwitchDesktop o winlogon carrega o winsta.dll e espera no WinStationWaitForConnect o TermSrvReadyEvent, que o Local Session Manager sinaliza quando sobe; o LSM roda no svchost do DcomLaunch, que ainda não chega a ele (teste svchost-dcomlaunch)."
+para = "Depois do SwitchDesktop o winlogon carrega o winsta.dll e espera no WinStationWaitForConnect o TermSrvReadyEvent, que o Local Session Manager sinaliza quando sobe; o LSM roda no svchost do DcomLaunch e ainda para antes de sinalizar o evento (teste svchost-dcomlaunch)."
 
 [[roda]]
 nome = "Primeiro pixel do win32k.sys"
 grupo = "marco"
 teste = "primeiro-pixel"
-faz = "O xtask lê a tela do QEMU durante o boot do smss real com o BasicDisplay.sys e espera pixels fora do preto do vídeo de boot."
-para = "O win32k da sessão 1 só recebe o vídeo físico quando o Local Session Manager conecta a sessão ao console (NtUserRemoteConnect do csrss, DxgkSessionConnected do dxgkrnl). Sem o LSM, a sessão 1 usa o dispositivo desconectado e o cdd.dll não é carregado."
+faz = "O InitVideo da sessão 1 carrega o cdd.dll sobre o adaptador de renderização do BasicRender.sys, e o win32k desenha o ponteiro do mouse pelo BasicDisplay.sys: o primeiro pixel na tela."
+para = "A Desktop do Winlogon fica preta: a tela de logon (o LogonUI sobre o dwm) vem depois do Local Session Manager, que para no registro do endpoint RPC (a conferência do RequiredServerSid na conexão ALPC ao epmapper)."
 
 [[roda]]
 nome = "Tela de bugcheck do Windows 10"

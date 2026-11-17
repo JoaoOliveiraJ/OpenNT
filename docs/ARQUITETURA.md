@@ -3164,9 +3164,16 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   PowerInformationInternal 4). As definições WNF desta máquina
   (`Control\Notifications`), a ProductOptions e a ProfileList vêm do
   xtask, e o NtGetCompleteWnfStateSubscription entrega ao modo usuário os
-  callbacks WNF (`ex/wnf/notifications.rs`). Ali para: o serviço Power
-  para e desconecta do `\PowerPort` (NtAlpcDisconnectPort), e o kernel trava
-  logo depois. O smss da
+  callbacks WNF (`ex/wnf/notifications.rs`). O svchost do rpcss sobe o
+  RpcEptMapper (`\RPC Control\epmapper`) e o RpcSs, que pede o
+  NtPowerInformation 58 (o PowerSettingRegisterNotification do powrprof),
+  e o services.exe inicia o LSM: o lsm.dll cria a
+  `\SmSsWinStationApiPort`, abre a sessão (NtOpenSession) e registra a
+  notificação de dispositivo no `\CMNotify`. Ali para: o
+  SysNotifyStartServer do sysntfy.dll registra o endpoint no epmapper, e a
+  conexão ALPC ao `\RPC Control\epmapper` confere o RequiredServerSid só
+  contra o SYSTEM (o svchost do rpcss roda como NetworkService); o LSM
+  falha e encerra os processos da sessão 1. O smss da
   sessão 1 cria o csrss e o winlogon.exe (o NtOpenSection relativo ao
   `\KnownDlls`, aberto pela tabela do Object Manager, e o powrprof.dll e o
   imm32.dll no volume); o NtUserInitialize do csrss da sessão 1 volta com
@@ -3194,11 +3201,13 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   lista de drivers dele vira "cdd") e o DrvSetDisplayConfig pede ao dxgkrnl
   os caminhos ativos (DxgkGetPathsModality) antes do hCreateHDEV, que
   carrega o cdd.dll pelo ZwSetSystemInformation(26) (a linha `[gdi]` do
-  log). Nesse boot o cdd.dll ainda não é carregado: a sessão 1 fica só com
-  o dispositivo desconectado (`\Device\Disc`, TSDDD, o stub sem imagem do
-  ldevLoadDriver) e o xxxSwitchDesktop pinta a superfície desconectada. O
-  cdd.dll pede ao dxgkrnl um adaptador de renderização, que só o
-  BasicRender registra. O lsm.dll cria a porta ALPC
+  log). O cdd.dll pede ao dxgkrnl um adaptador de renderização, que o
+  BasicRender.sys registra (o adaptador WARP em ROOT\BASICRENDER, com o
+  dxgmms2.sys); além dele, a sessão 1 tem o dispositivo desconectado
+  (`\Device\Disc`, TSDDD). O win32k põe o ponteiro do mouse no centro da
+  tela e o BasicDisplay.sys o desenha direto no framebuffer: o primeiro
+  pixel (`FIRST_PIXEL_OK`, teste primeiro-pixel). A Desktop do Winlogon é
+  preta. O lsm.dll cria a porta ALPC
   `\SmSsWinStationApiPort` (o CCsrMgr, mensagens de 0x4070 bytes); o csrss
   de cada sessão cria o `Global\TermSrvReadyEvent`, o lsm o sinaliza, e o
   winsrvext.dll conecta à porta e manda um pedido síncrono cuja resposta é
