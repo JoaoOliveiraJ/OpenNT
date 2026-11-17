@@ -189,6 +189,25 @@ pub fn get(pointer: u64) -> Option<KeyBody> {
     with(|bodies| bodies.by_pointer.get(&pointer).cloned())
 }
 
+/// O CM_KEY_BODY de um corpo vivo deste módulo.
+fn key_body(pointer: u64) -> Option<&'static CmKeyBody> {
+    // SAFETY: corpo próprio (sizeof(CM_KEY_BODY)) registrado em by_pointer.
+    with(|bodies| bodies.by_pointer.contains_key(&pointer)).then(|| unsafe { CmKeyBody::at(pointer) })
+}
+
+/// CM_KEY_BODY.HandleTags (o KeyHandleTagsInformation do NtQueryKey).
+pub fn handle_tags(pointer: u64) -> u32 {
+    key_body(pointer).map_or(0, |body| body.handle_tags())
+}
+
+/// O KeySetHandleTagsInformation do NtSetInformationKey: a palavra baixa
+/// das tags no HandleTags do corpo (`mov word ptr [body+0x32]`).
+pub fn set_handle_tags(pointer: u64, tags: u32) {
+    if let Some(body) = key_body(pointer) {
+        body.set_handle_tags(tags & 0xFFFF);
+    }
+}
+
 pub fn by_handle(handle: u32) -> Option<u64> {
     with(|bodies| bodies.by_handle.get(&handle).copied())
 }

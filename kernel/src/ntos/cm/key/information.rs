@@ -26,13 +26,18 @@ struct Snapshot {
     value_data: Vec<u32>,
 }
 
-/// Basic(0), Node(1), Full(2), Name(3), Cached(4) e HandleTags(7). Buffer
-/// menor que o cabeçalho não recebe dados; nome truncado dá BUFFER_OVERFLOW.
-/// A classe da chave, como no CmpPopulateKeyNodeInformation e no
-/// CmpPopulateKeyFullInformation do 19041: no Node ela vem depois do nome,
-/// com o ClassOffset alinhado a 8; no Full, logo depois do cabeçalho (0x2C).
-/// Sem classe, ClassOffset é 0xFFFFFFFF.
+/// Basic(0), Node(1), Full(2), Name(3), Cached(4) e HandleTags(7), este
+/// com as tags do corpo do handle. Buffer menor que o cabeçalho não recebe
+/// dados; nome truncado dá BUFFER_OVERFLOW. A classe da chave, como no
+/// CmpPopulateKeyNodeInformation e no CmpPopulateKeyFullInformation do
+/// 19041: no Node ela vem depois do nome, com o ClassOffset alinhado a 8;
+/// no Full, logo depois do cabeçalho (0x2C). Sem classe, ClassOffset é
+/// 0xFFFFFFFF. Classe acima de 8 é STATUS_INVALID_PARAMETER (NtQueryKey);
+/// Flags (5), Virtualization (6) e Trust (8) ainda não são servidas.
 pub fn write(node: NodeId, absolute_path: &str, class: u32, output: u64, buffer_length: u32, output_length: u64, handle_tags: u32) -> u32 {
+    if class > 8 {
+        return 0xC000_000D;
+    }
     if class > 4 && class != 7 {
         return 0xC000_0003;
     }

@@ -71,14 +71,12 @@ struct NativeRecord {
     attributes: u32,
     access: u32,
     binding: Option<Binding>,
-    handle_tags: u32,
     closing: bool,
 }
 
 #[derive(Default)]
 struct State {
     records: BTreeMap<u32, NativeRecord>,
-    user_tags: BTreeMap<u64, u32>,
     user: Option<UserHandles>,
 }
 
@@ -326,18 +324,13 @@ fn notify_and_perform(
     callbacks::perform_fallible(&operation, || action(&read_fields(information, layout, initial)))?
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Entry {
-    None,
-    Native(u32),
-    User(u64),
-}
-
 struct Resolved {
     khandle: u32,
     node: NodeId,
-    entry: Entry,
     path: String,
+    /// O GrantedAccess do handle (o OBJECT_HANDLE_INFORMATION do
+    /// ObReferenceObjectByHandle); nenhum para um handle interno do Cm.
+    granted: Option<u32>,
 }
 
 /// Resolve handles de usuário ou nativos, confere direitos de usuário e o
@@ -347,7 +340,7 @@ fn resolve_key_handle(handle: u64, previous_mode: bool, required: u32) -> Flow<R
         return status(0xC000_0008);
     }
     let mut khandle = handle as u32;
-    let entry;
+    let granted;
     if previous_mode {
         let provider = with(|state| state.user);
         let Some(record) = provider.and_then(|provider| (provider.get)(handle)) else { return status(0xC000_0008) };
@@ -355,22 +348,22 @@ fn resolve_key_handle(handle: u64, previous_mode: bool, required: u32) -> Flow<R
             return status(0xC000_0022);
         }
         khandle = record.khandle;
-        entry = Entry::User(handle);
+        granted = Some(record.access);
     } else {
-        let record = with(|state| state.records.get(&khandle).map(|record| (record.kernel_handle, record.owner_process)));
-        if let Some((kernel_handle, owner)) = record {
+        let record = with(|state| state.records.get(&khandle).map(|record| (record.kernel_handle, record.owner_process, record.access)));
+        if let Some((kernel_handle, owner, access)) = record {
             if !kernel_handle && owner != process::get_current_process() {
                 return status(0xC000_0008);
             }
-            entry = Entry::Native(khandle);
+            granted = Some(access);
         } else {
-            entry = Entry::None;
+            granted = None;
         }
     }
     let Some(node) = registry::get_node(khandle) else {
         return status(if registry::handle_entry(khandle).is_some() { 0xC000_017C } else { 0xC000_0008 });
     };
-    Ok(Resolved { khandle, node, entry, path: registry::get_path(khandle).unwrap_or_default() })
+    Ok(Resolved { khandle, node, path: registry::get_path(khandle).unwrap_or_default(), granted })
 }
 
 /// CmObReferenceObjectByHandle para os serviços de hive: o nó e o caminho
@@ -407,7 +400,7 @@ fn publish_key_handle(output: u64, khandle: u32, attributes: u32, granted: u32, 
             &description,
             close_from_table,
             Some(&mut |binding: &Binding| {
-                with(|state| state.records.insert(khandle, NativeRecord { owner_process: owner, kernel_handle, attributes: attributes & 2, access: granted, binding: Some(*binding), handle_tags: 0, closing: false }));
+                with(|state| state.records.insert(khandle, NativeRecord { owner_process: owner, kernel_handle, attributes: attributes & 2, access: granted, binding: Some(*binding), closing: false }));
                 Ok(())
             }),
         )?;
@@ -810,12 +803,10 @@ fn notification_layout(kind: Kind) -> (u32, u32, u64, u64, Layout) {
     }
 }
 
-fn handle_tags(entry: Entry) -> u32 {
-    with(|state| match entry {
-        Entry::Native(handle) => state.records.get(&handle).map_or(0, |record| record.handle_tags),
-        Entry::User(handle) => state.user_tags.get(&handle).copied().unwrap_or(0),
-        Entry::None => 0,
-    })
+/// KeyNameInformation (3) e KeyHandleTagsInformation (7): o NtQueryKey do
+/// 19041 referencia o handle com DesiredAccess 0 para essas duas classes.
+fn query_key_needs_no_access(klass: Option<u64>) -> bool {
+    matches!(klass, Some(3) | Some(7))
 }
 
 /// Consulta, enumeração, alteração ou exclusão com captura de buffers,
@@ -824,15 +815,26 @@ fn handle_tags(entry: Entry) -> u32 {
 pub fn key_operation(kind: Kind, handle: u64, arguments: &Fields, previous_mode: bool) -> Result<u32, KernelError> {
     install_hooks();
     with_request(|request| {
+        let klass = arguments.get("klass").copied();
+        // NtQueryKey: KeyInformationClass acima de KeyTrustInformation (8)
+        // é STATUS_INVALID_PARAMETER antes de qualquer referência.
+        if kind == Kind::QueryKey && klass.unwrap_or(0) as u32 > 8 {
+            return Ok(0xC000_000D);
+        }
         let required = match kind {
             Kind::Set | Kind::DeleteValue => 2,
             Kind::DeleteKey => 0x10000,
             Kind::EnumerateKey => 8,
             Kind::EnumerateValue | Kind::QueryValue => 1,
-            Kind::QueryKey => if arguments.get("klass").copied() == Some(3) { 0 } else { 1 },
+            Kind::QueryKey => if query_key_needs_no_access(klass) { 0 } else { 1 },
             Kind::SetInfo => 0,
         };
         let resolved = resolve_key_handle(handle, previous_mode, required)?;
+        // Sem direito pedido, o handle ainda precisa ter algum acesso
+        // concedido (o GrantedAccess zero é STATUS_ACCESS_DENIED).
+        if kind == Kind::QueryKey && query_key_needs_no_access(klass) && resolved.granted == Some(0) {
+            return Ok(0xC000_0022);
+        }
         let body = if callbacks::has() { request.retain_key_body(key_objects::for_handle(resolved.khandle))? } else { 0 };
         let mut operation = arguments.clone();
         operation.insert("object", body);
@@ -919,19 +921,16 @@ pub fn key_operation(kind: Kind, handle: u64, arguments: &Fields, previous_mode:
                         } else if field("length") != 4 {
                             0xC000_0004
                         } else {
+                            // KeySetHandleTagsInformation: os 16 bits baixos
+                            // vão ao HandleTags do corpo do handle.
                             let tags: u32 = captured(field("data"), offset_of!(KeyHandleTagsInformation, handle_tags))?;
-                            with(|state| match resolved.entry {
-                                Entry::Native(handle) => {
-                                    if let Some(record) = state.records.get_mut(&handle) {
-                                        record.handle_tags = tags;
-                                    }
+                            match key_objects::for_handle(resolved.khandle) {
+                                Some(body) => {
+                                    key_objects::set_handle_tags(body, tags);
+                                    0
                                 }
-                                Entry::User(handle) => {
-                                    state.user_tags.insert(handle, tags);
-                                }
-                                Entry::None => {}
-                            });
-                            0
+                                None => 0xC000_009A,
+                            }
                         }
                     }
                     Kind::QueryValue | Kind::EnumerateValue => {
@@ -955,7 +954,10 @@ pub fn key_operation(kind: Kind, handle: u64, arguments: &Fields, previous_mode:
                         } else {
                             match child {
                                 None => 0x8000_001A,
-                                Some(child) => key_information::write(child, if kind == Kind::QueryKey { &path } else { "" }, field("klass") as u32, field("out"), field("length") as u32, field("returned"), handle_tags(resolved.entry)),
+                                Some(child) => {
+                                    let tags = if kind == Kind::QueryKey { key_objects::for_handle(resolved.khandle).map_or(0, key_objects::handle_tags) } else { 0 };
+                                    key_information::write(child, if kind == Kind::QueryKey { &path } else { "" }, field("klass") as u32, field("out"), field("length") as u32, field("returned"), tags)
+                                }
                             }
                         }
                     }

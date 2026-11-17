@@ -329,6 +329,11 @@ fn key_services_kernel_mode(assert: Assert) {
     assert(matches!(keys::key_operation(Kind::SetInfo, child, &fields(&[("klass", 5), ("data", buffer), ("length", 8)]), false), Ok(0xC000_0004)) && matches!(keys::key_operation(Kind::SetInfo, child, &fields(&[("klass", 1), ("data", buffer), ("length", 4)]), false), Ok(0xC000_0003)), "keyservices: classe e tamanho de SetInformation");
     assert(matches!(keys::key_operation(Kind::QueryKey, child, &fields(&[("klass", 7), ("out", buffer), ("length", 4), ("returned", returned)]), false), Ok(0)) && tags.get() == 0x5A, "keyservices: tags por handle");
     assert(matches!(keys::key_operation(Kind::QueryKey, second, &fields(&[("klass", 7), ("out", buffer), ("length", 4), ("returned", returned)]), false), Ok(0)) && tags.get() == 0, "keyservices: tags independentes por handle");
+    // HandleTags é a palavra baixa no corpo do handle (CM_KEY_BODY +0x32).
+    tags.set(0x1_0F01);
+    let body_tags = crate::ntos::cm::key::objects::for_handle(child as u32).map_or(0, crate::ntos::cm::key::objects::handle_tags);
+    assert(matches!(keys::key_operation(Kind::SetInfo, child, &fields(&[("klass", 5), ("data", buffer), ("length", 4)]), false), Ok(0)) && crate::ntos::cm::key::objects::for_handle(child as u32).map_or(0, crate::ntos::cm::key::objects::handle_tags) == 0xF01 && body_tags == 0x5A, "keyservices: tags no corpo do handle, 16 bits");
+    assert(matches!(keys::key_operation(Kind::QueryKey, child, &fields(&[("klass", 9), ("out", buffer), ("length", 4), ("returned", returned)]), false), Ok(0xC000_000D)), "keyservices: NtQueryKey com classe acima de 8");
     // Filtros veem as operações e o fechamento.
     license_unicode(storage + 0x300, "320000");
     let logger = test_key_logger as extern "win64" fn(u64, u64, u64) -> u64 as usize as u64;
