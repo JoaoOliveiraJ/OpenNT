@@ -106,7 +106,71 @@ fn usable(process_pointer: u64) -> bool {
     process::with_record(process_pointer, |record| !record.exiting && !record.terminated).unwrap_or(false)
 }
 
-fn create_workers(factory: &Arc<Factory>, desired: u32) -> Result<u32, KernelError> {
+/// CREATE_SUSPENDED e LoaderWorker do RtlpCreateUserThreadEx.
+const CREATE_SUSPENDED: u32 = 1;
+const CREATE_LOADER_WORKER: u32 = 0x10;
+
+/// Um worker, como o ExpWorkerFactoryCreateThread do 19041: a thread nasce
+/// sempre suspensa (CREATE_SUSPENDED, mais LoaderWorker pela classe 13),
+/// entra na fábrica e só então é retomada. Assim o TppWorkerThread, em
+/// qualquer CPU, já se acha worker desta fábrica no primeiro
+/// NtWorkerFactoryWorkerReady e na primeira espera. Devolve o status da
+/// criação, guardado também no LastThreadCreationStatus.
+fn create_thread(factory: &Arc<Factory>) -> Result<u32, KernelError> {
+    if factory.shutdown() {
+        return Ok(0x80);
+    }
+    if !usable(factory.process_pointer()) {
+        shutdown(factory);
+        factory.set_last_status(0xC000_010A);
+        return Ok(0xC000_010A);
+    }
+    // O runtime atual possui um espaço de usuário: a criação usa o EPROCESS
+    // real da fábrica e o seu runtime de usuário.
+    let parameter = factory.parameter();
+    let request = CreateRequest {
+        start: factory.start(),
+        argument_words: [parameter as u32, (parameter >> 32) as u32],
+        // A classe 13 marca os próximos workers para o carregador da NTDLL;
+        // a criação materializa LoaderWorker no TEB real.
+        flags: CREATE_SUSPENDED | if factory.loader_worker() { CREATE_LOADER_WORKER } else { 0 },
+        zero_bits: 0,
+        commit: factory.commit(),
+        reserve: factory.reserve(),
+    };
+    // Só um processo de usuário vivo recebe workers.
+    let created = if !state::is_user_process_id(factory.process_id()) { Err(0xC000_00BB) } else { process_context::with_process(factory.process_pointer(), || threads::create_user_thread(&request))? };
+    let thread = match created {
+        Ok(thread) => {
+            factory.set_last_status(0);
+            thread
+        }
+        Err(status) => {
+            factory.set_last_status(status);
+            factory.set_retry_at(clock::uptime_ms() as i64 - factory.retry_timeout() / 10_000);
+            return Ok(status);
+        }
+    };
+    let pointer = thread.pointer();
+    if thread.dead() || (pointer != 0 && process::thread_record(pointer).is_some_and(|record| record.exiting)) {
+        factory.set_last_status(0xC000_010A);
+        return Ok(0xC000_010A);
+    }
+    // Os callbacks de criação podem fechar todos os handles: a referência
+    // do worker retém a fábrica até ele sair dela.
+    reference(factory);
+    thread.with(|thread| {
+        thread.worker_factory = factory.pointer;
+        thread.worker_ready = false;
+    });
+    factory.add_worker(thread);
+    threads::resume_thread(pointer);
+    Ok(0)
+}
+
+/// Cria workers um a um enquanto `done` for falso, como a única criação em
+/// andamento da fábrica; devolve a primeira falha.
+fn create_until(factory: &Arc<Factory>, done: impl Fn(&Factory) -> bool) -> Result<u32, KernelError> {
     if factory.port.closed() {
         shutdown(factory);
         return Ok(0xC000_010A);
@@ -117,61 +181,22 @@ fn create_workers(factory: &Arc<Factory>, desired: u32) -> Result<u32, KernelErr
     reference(factory);
     factory.set_creating(true);
     let result = (|| -> Result<u32, KernelError> {
-        let desired = desired.max(factory.minimum()).min(factory.maximum());
-        while !factory.shutdown() && !factory.paused() && (live(factory).len() as u32) < desired {
-            if !usable(factory.process_pointer()) {
-                shutdown(factory);
-                factory.set_last_status(0xC000_010A);
-                return Ok(0xC000_010A);
+        while !factory.shutdown() && !factory.paused() && !done(factory) {
+            let status = create_thread(factory)?;
+            if status != 0 {
+                return Ok(status);
             }
-            // O runtime atual possui um espaço de usuário: a criação usa o
-            // EPROCESS real da fábrica e o seu runtime de usuário.
-            let parameter = factory.parameter();
-            let request = CreateRequest {
-                start: factory.start(),
-                argument_words: [parameter as u32, (parameter >> 32) as u32],
-                // A classe 13 marca os próximos workers para o carregador da
-                // NTDLL; a criação materializa LoaderWorker no TEB real.
-                flags: if factory.loader_worker() { 0x10 } else { 0 },
-                zero_bits: 0,
-                commit: factory.commit(),
-                reserve: factory.reserve(),
-            };
-            // Só um processo de usuário vivo recebe workers.
-            let created = if !state::is_user_process_id(factory.process_id()) { Err(0xC000_00BB) } else { process_context::with_process(factory.process_pointer(), || threads::create_user_thread(&request))? };
-            let thread = match created {
-                Ok(thread) => {
-                    factory.set_last_status(0);
-                    thread
-                }
-                Err(status) => {
-                    factory.set_last_status(status);
-                    factory.set_retry_at(clock::uptime_ms() as i64 - factory.retry_timeout() / 10_000);
-                    return Ok(status);
-                }
-            };
-            let pointer = thread.pointer();
-            if thread.dead() || (pointer != 0 && process::thread_record(pointer).is_some_and(|record| record.exiting)) {
-                factory.set_last_status(0xC000_010A);
-                return Ok(0xC000_010A);
-            }
-            // Os callbacks de criação podem fechar todos os handles: a
-            // referência da operação retém a fábrica até o worker ter a sua.
-            reference(factory);
-            let priority = factory.priority();
-            thread.with(|thread| {
-                thread.worker_factory = factory.pointer;
-                thread.worker_ready = false;
-                thread.priority = priority;
-                thread.base_priority = priority;
-            });
-            factory.add_worker(thread);
         }
         Ok(0)
     })();
     factory.set_creating(false);
     dereference(factory);
     result
+}
+
+fn create_workers(factory: &Arc<Factory>, desired: u32) -> Result<u32, KernelError> {
+    let desired = desired.max(factory.minimum()).min(factory.maximum());
+    create_until(factory, |factory| live(factory).len() as u32 >= desired)
 }
 
 fn shutdown(factory: &Arc<Factory>) {
