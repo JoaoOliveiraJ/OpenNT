@@ -852,6 +852,18 @@ fn user_registry(assert: Assert) {
     assert(khandle != 0 && registry::get_path(khandle).is_some() && state::close_user_handle(handle, true, false).is_ok_and(|status| status == 0) && registry::get_path(khandle).is_none() && state::get_user_handle(handle).is_none(), "userregistry: fechamento libera o handle interno da hive");
     let missing = write_attributes(0, "\\Registry\\Machine\\NaoExisteOpenNt");
     assert(key_services::open(output, 0x2_0019, missing, true, 0).is_ok_and(|status| status == 0xC000_0034), "userregistry: chave ausente");
+    // O RegOpenKeyExW(HKLM, "SYSTEM\CurrentControlSet\Services\<ausente>",
+    // KEY_READ) do FwCheckWhetherWFWIsInstalled do RpcRtRemote.dll (a chave
+    // do BFE): relativo ao handle de \Registry\Machine, pelo link do
+    // CurrentControlSet, exatamente STATUS_OBJECT_NAME_NOT_FOUND
+    // (ERROR_FILE_NOT_FOUND); outro status faz o RpcEptMapper parar.
+    let machine = write_attributes(0, "\\Registry\\Machine");
+    let machine_opened = key_services::open(output, 0x2_0019, machine, true, 0).is_ok_and(|status| status == 0);
+    let machine_handle = guest::read64(output);
+    let service_missing = write_attributes(machine_handle, "SYSTEM\\CurrentControlSet\\Services\\OpenNtAusente");
+    let service_status = key_services::open(output + 8, 0x2_0019, service_missing, true, 0);
+    let _ = state::close_user_handle(machine_handle, true, false);
+    assert(machine_opened && service_status.is_ok_and(|status| status == 0xC000_0034), "userregistry: servico ausente relativo ao HKLM pelo CurrentControlSet");
     if let Some(region) = memory::find_region(block) {
         memory::release_private_region(&region);
     }
