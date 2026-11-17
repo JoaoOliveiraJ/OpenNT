@@ -25,6 +25,9 @@ use kd_client::{BreakpointKind, Client};
 use serde_json::{json, Map, Value};
 
 use crate::annotate::{self, Live};
+
+#[path = "tools_extra.rs"]
+mod extra;
 use crate::disasm;
 use crate::engine::Engine;
 use crate::screenshot;
@@ -190,6 +193,9 @@ pub fn definitions() -> Vec<(&'static str, &'static str, Value)> {
         ("command", "Um comando de texto do depurador (os do cargo xtask debug: r, k, db, bp, !process, lm...).", object(json!({"text": text("o comando")}), &["text"])),
         ("screenshot", "Grava a tela do convidado em PNG (screendump do monitor do QEMU aberto pelo launch).", object(json!({"path": text("arquivo .png (padrao <build>/mcp-tela.png)")}), &[])),
     ]
+    .into_iter()
+    .chain(extra::definitions())
+    .collect()
 }
 
 /// O `tools/list`.
@@ -277,7 +283,7 @@ pub fn call(engine: &mut dyn Engine, name: &str, arguments: &Value) -> ToolResul
     let map = arguments.as_object().unwrap_or(&empty);
     let args = Arguments(map);
     let result = run(engine, name, &args);
-    if !matches!(name, "status" | "read_serial_log" | "breakpoint_list" | "symbol_lookup" | "symbol_resolve") {
+    if !matches!(name, "status" | "read_serial_log" | "breakpoint_list" | "symbol_lookup" | "symbol_resolve" | "snapshot_list" | "api_monitor_fetch" | "irp_trace_fetch" | "registry_list" | "registry_read" | "object_list" | "file_list" | "file_read" | "view_struct") {
         engine.changed();
     }
     result
@@ -781,7 +787,7 @@ fn run(engine: &mut dyn Engine, name: &str, args: &Arguments) -> ToolResult {
             let (width, height) = screenshot::capture(&monitor, &path)?;
             Ok(json!({"path": path.display().to_string(), "width": width, "height": height, "format": "png"}))
         }
-        _ => Err(ToolError::InvalidParams(format!("ferramenta desconhecida: {name}"))),
+        _ => extra::run(engine, name, args).unwrap_or_else(|| Err(ToolError::InvalidParams(format!("ferramenta desconhecida: {name}")))),
     }
 }
 

@@ -33,24 +33,41 @@
 //! - `image`: a imagem de um módulo para as análises (o arquivo desta
 //!   máquina ou a memória do alvo);
 //! - `launcher`: o `cargo xtask debug --launch --no-client` (build e QEMU)
-//!   para os clientes que abrem o próprio alvo (`opennt-re`, `opennt-mcp`).
+//!   para os clientes que abrem o próprio alvo (`opennt-re`, `opennt-mcp`);
+//! - `stream`, `api_monitor`, `irp_timeline`, `ntstatus`: o fluxo de
+//!   registros do alvo (`qOpenNTStream` e os `O` com a máquina rodando), o
+//!   monitor de APIs e a vida dos IRPs;
+//! - `explore`: as respostas dos exploradores do Registro, do namespace e
+//!   dos arquivos;
+//! - `struct_view`: um endereço como tipo do PDB, em árvore editável;
+//! - `hmp`: o monitor do QEMU (snapshots e record/replay);
+//! - `monitoring`: a sessão com tudo isso e os passos para trás da
+//!   reprodução.
 
 pub mod analysis;
+pub mod api_monitor;
 pub mod bugcheck;
 pub mod client;
 pub mod commands;
 pub mod demangle;
 pub mod elf;
+pub mod explore;
 pub mod expr;
+pub mod hmp;
 pub mod image;
+pub mod irp_timeline;
 pub mod launcher;
 pub mod monitor;
+pub mod monitoring;
 pub mod msf;
+pub mod ntstatus;
 pub mod pdb;
 pub mod pe;
 pub mod registers;
 pub mod rsp;
 pub mod stop;
+pub mod stream;
+pub mod struct_view;
 pub mod symbols;
 pub mod tpi;
 pub mod trace;

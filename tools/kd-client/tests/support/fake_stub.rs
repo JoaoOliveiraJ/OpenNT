@@ -48,6 +48,63 @@ struct Target {
     modules: Vec<String>,
     /// Os breakpoints de memória armados (`membp`).
     memory_breakpoints: Vec<(u64, u64, String)>,
+    /// O monitor de APIs ou o rastreador ligado: o fluxo tem registros.
+    stream_enabled: bool,
+}
+
+/// Os registros do fluxo do alvo de mentira: uma chamada ao IoCreateDevice
+/// vinda do código (sucesso, com o nome copiado) e um IRP de CREATE que
+/// passa por dois dispositivos e é concluído.
+pub fn stream_records() -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let header = |kind: u8, sequence: u64, time: u64| {
+        let mut record = vec![0u8; 24];
+        record[2] = kind;
+        record[8..16].copy_from_slice(&sequence.to_le_bytes());
+        record[16..24].copy_from_slice(&time.to_le_bytes());
+        record
+    };
+    let finish = |mut record: Vec<u8>, bytes: &mut Vec<u8>| {
+        let length = record.len() as u16;
+        record[0..2].copy_from_slice(&length.to_le_bytes());
+        bytes.extend(record);
+    };
+    // IoCreateDevice(DriverObject, 0x40, "\Device\Falso", 0x22, 0, FALSE, &DeviceObject) = 0.
+    let mut call = header(1, 0, 1000);
+    call.extend_from_slice(&40u32.to_le_bytes());
+    call.push(7);
+    call.push(1);
+    call.extend_from_slice(&[0, 0]);
+    call.extend_from_slice(&4u32.to_le_bytes());
+    call.extend_from_slice(&8u32.to_le_bytes());
+    call.extend_from_slice(&0xffff_a000_0000_0100u64.to_le_bytes());
+    call.extend_from_slice(&(CODE + 0x10D).to_le_bytes());
+    call.extend_from_slice(&30u64.to_le_bytes());
+    call.extend_from_slice(&0u64.to_le_bytes());
+    for argument in [0xffff_a000_0000_1000u64, 0x40, 0xffff_a000_0000_2000, 0x22, 0, 0, 0xffff_a000_0000_3000] {
+        call.extend_from_slice(&argument.to_le_bytes());
+    }
+    let name = b"\\Device\\Falso";
+    call.push(3);
+    call.push(1);
+    call.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    call.extend_from_slice(name);
+    finish(call, &mut bytes);
+    let irp = |kind: u8, sequence: u64, time: u64, device: u64, driver: u64, value: u64, location: u8, bytes: &mut Vec<u8>| {
+        let mut record = header(kind, sequence, time);
+        for field in [0xffff_a000_0000_9000u64, device, driver, 0xffff_a000_0000_0100, CODE + 0x10D, CODE + 0x2000, value, 0x5] {
+            record.extend_from_slice(&field.to_le_bytes());
+        }
+        record.extend_from_slice(&[0, 0, location, 2]);
+        record.extend_from_slice(&4u32.to_le_bytes());
+        finish(record, bytes);
+    };
+    irp(0x11, 1, 2000, 0xffff_a000_0000_d100, 0xffff_a000_0000_5100, 0, 2, &mut bytes);
+    irp(0x11, 2, 2100, 0xffff_a000_0000_d200, 0xffff_a000_0000_5200, 0, 1, &mut bytes);
+    irp(0x13, 3, 2200, 0, 0, 0, 1, &mut bytes);
+    irp(0x12, 4, 2300, 0xffff_a000_0000_d200, 0xffff_a000_0000_5200, 0, 0, &mut bytes);
+    irp(0x12, 5, 2400, 0xffff_a000_0000_d100, 0xffff_a000_0000_5100, 0, 0, &mut bytes);
+    bytes
 }
 
 /// Os registradores além dos gerais: x87 e SSE (no `g`) e as extensões
@@ -107,6 +164,31 @@ impl Target {
             }
             ["membp"] if self.memory_breakpoints.is_empty() => "nenhum breakpoint de memoria\n".to_string(),
             ["membp"] => self.memory_breakpoints.iter().map(|(address, length, kind)| format!("{address:#x} {length:#x} {kind}\n")).collect(),
+            // O monitor de APIs, o rastreador de IRPs e o fluxo.
+            ["api", "names", "0"] => "40 IoCreateDevice\n41 ExAllocatePoolWithTag\nmais: 2\n".to_string(),
+            ["api", "names", _] => "42 IofCallDriver\n43 IofCompleteRequest\n".to_string(),
+            ["api", "clear"] => "api: faixas e especificacoes limpas\n".to_string(),
+            ["api", "spec", specs @ ..] => format!("api: {} especificacoes ({} no total)\n", specs.len(), specs.len()),
+            ["api", "on", ..] => {
+                self.stream_enabled = true;
+                "api: monitor ligado (todos os chamadores)\n".to_string()
+            }
+            ["api", "off"] => "api: monitor desligado\n".to_string(),
+            ["irptrace", "on"] => {
+                self.stream_enabled = true;
+                "irptrace: rastreador ligado\n".to_string()
+            }
+            ["irptrace", "off"] => "irptrace: rastreador desligado\n".to_string(),
+            ["stream", _] => "fluxo: ok\n".to_string(),
+            // Os exploradores.
+            ["reg", "keys", "\\Registry\\Machine\\SYSTEM\\Select", ..] => "chave\t\\REGISTRY\\MACHINE\\SYSTEM\\Select\t0\t2\t0x1d9a0b0c0d0e0f0\t0\t0\t\\SystemRoot\\System32\\Config\\SYSTEM\n".to_string(),
+            ["reg", "values", "\\Registry\\Machine\\SYSTEM\\Select", ..] => "v\tCurrent\t4\t4\t01000000\nv\tDefault\t4\t4\t01000000\n".to_string(),
+            ["reg", "value", "\\Registry\\Machine\\SYSTEM\\Select", "Current", ..] => "valor\tCurrent\t4\t4\t0\t01000000\n".to_string(),
+            ["reg", ..] => "chave nao encontrada\n".to_string(),
+            ["objdir", ..] => "diretorio\t\\Device\tDirectory\t0xffff800000001000\t2\no\tNull\tDevice\t0xffff800000002000\t0\t\no\tHarddiskVolume1\tSymbolicLink\t0x0\t0\t\\Device\\Harddisk0\\Partition1\n".to_string(),
+            ["fs", "ls", ..] => "pasta\t/\t2\nf\tWindows\t1\t0\t0x10\t0x0\nf\tteste.txt\t0\t5\t0x20\t0x1d9a0b0c0d0e0f0\n".to_string(),
+            ["fs", "read", _, offset, ..] if *offset == "0" => "dados\t/teste.txt\t5\t0\t6f6c612121\n".to_string(),
+            ["fs", "read", ..] => "dados\t/teste.txt\t5\t5\t\n".to_string(),
             _ => "comandos do OpenNT\n".to_string(),
         }
     }
@@ -114,7 +196,7 @@ impl Target {
     fn answer(&mut self, packet: &str, stream: &mut TcpStream) -> Option<String> {
         self.log.lock().unwrap().push(packet.to_string());
         let reply = if packet.starts_with("qSupported") {
-            "PacketSize=1000;swbreak+;hwbreak+;QStartNoAckMode+".to_string()
+            "PacketSize=1000;swbreak+;hwbreak+;QStartNoAckMode+;ReverseStep+;ReverseContinue+".to_string()
         } else if packet == "QStartNoAckMode" || packet.starts_with('Z') || packet.starts_with('z') || packet.starts_with("Hg") || packet.starts_with('M') || packet.starts_with('P') {
             if let Some(rest) = packet.strip_prefix('P') {
                 let (number, value) = rest.split_once('=').unwrap();
@@ -161,7 +243,22 @@ impl Target {
             let output = self.monitor(&text);
             stream.write_all(&encode(&format!("O{}", hex(output.as_bytes())))).unwrap();
             "OK".to_string()
-        } else if packet == "c" || packet == "s" {
+        } else if let Some(sequence) = packet.strip_prefix("qOpenNTStream:") {
+            let from = u64::from_str_radix(sequence, 16).unwrap_or(0);
+            let records = if self.stream_enabled { stream_records() } else { Vec::new() };
+            let count = if self.stream_enabled { 6u64 } else { 0 };
+            let mut reply = Vec::new();
+            reply.extend_from_slice(&count.to_le_bytes());
+            reply.extend_from_slice(&0u64.to_le_bytes());
+            reply.extend_from_slice(&0u64.to_le_bytes());
+            reply.extend_from_slice(&(self.stream_enabled as u32 | 4).to_le_bytes());
+            reply.extend_from_slice(&[0; 4]);
+            // Só os registros a partir do pedido (o cliente lê de novo até o fim).
+            if from == 0 {
+                reply.extend(records);
+            }
+            hex(&reply)
+        } else if packet == "c" || packet == "s" || packet == "bs" || packet == "bc" {
             let stop = self.stops.pop_front().expect("parada roteirizada");
             self.registers[16] = stop.rip;
             self.registers[7] = stop.rsp;
@@ -187,7 +284,7 @@ pub fn start(stops: Vec<Stop>) -> (String, Arc<Mutex<Vec<String>>>) {
     let log = Arc::new(Mutex::new(Vec::new()));
     // Um driver que não existe nesta máquina (sem símbolos).
     let modules = vec!["0xfffff80042000000 0xfffff80042010000  alvo-falso.sys   \\SystemRoot\\System32\\drivers\\alvo-falso.sys\n".to_string()];
-    let mut target = Target { registers: [0; 24], memory: Vec::new(), stops: stops.into(), log: Arc::clone(&log), modules, memory_breakpoints: Vec::new() };
+    let mut target = Target { registers: [0; 24], memory: Vec::new(), stops: stops.into(), log: Arc::clone(&log), modules, memory_breakpoints: Vec::new(), stream_enabled: false };
     // Pilha: o quadro corrente em STACK + 0x20 com dois chamadores.
     let mut stack = vec![0u8; 0x100];
     let mut put = |offset: usize, value: u64| stack[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
@@ -258,6 +355,17 @@ pub fn kernel_module() -> Module {
 }
 
 /// Conecta, anexa e põe os símbolos de mentira.
+/// Uma sessão de reprodução (o gdbstub do QEMU): os módulos vêm da
+/// gravação e as consultas do OpenNT não vão ao alvo.
+pub fn connect_replay(address: &str, modules: Vec<(u64, u64, String)>) -> Client {
+    let connection = Connection::connect(address, Instant::now() + Duration::from_secs(10)).unwrap();
+    let mut client = Client::new(connection, PathBuf::from("."), PathBuf::from("inexistente/kernel.elf"));
+    client.set_replay(modules);
+    client.attach(Duration::from_secs(10)).unwrap();
+    client.symbols.set_kernel(kernel_module());
+    client
+}
+
 pub fn connect(address: &str) -> Client {
     let connection = Connection::connect(address, Instant::now() + Duration::from_secs(10)).unwrap();
     let mut client = Client::new(connection, PathBuf::from("."), PathBuf::from("inexistente/kernel.elf"));

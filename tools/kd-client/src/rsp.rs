@@ -35,6 +35,13 @@ pub fn console_text(packet: &str) -> Option<String> {
     (!hex.is_empty() && hex.len() % 2 == 0 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())).then(|| decode_hex_text(hex))
 }
 
+/// O conteúdo de um `O` do fluxo de registros (começa com o marcador).
+pub fn stream_bytes(packet: &str) -> Option<Vec<u8>> {
+    let hex = packet.strip_prefix('O')?;
+    let marker: String = super::stream::MARKER.iter().map(|byte| format!("{byte:02x}")).collect();
+    hex.starts_with(&marker).then(|| unhex(hex))
+}
+
 /// Desfaz a compressão `x*n` (repetição) de uma resposta.
 pub fn expand_run_length(payload: &[u8]) -> Vec<u8> {
     let mut output = Vec::with_capacity(payload.len());
@@ -136,6 +143,8 @@ pub struct Connection {
     no_ack: bool,
     /// Saída `O` recebida e ainda não consumida.
     console: String,
+    /// Os `O` do fluxo de registros (`stream::MARKER`), crus.
+    records: Vec<Vec<u8>>,
 }
 
 impl Connection {
@@ -146,7 +155,7 @@ impl Connection {
             match TcpStream::connect(address) {
                 Ok(stream) => {
                     stream.set_nodelay(true).map_err(|error| error.to_string())?;
-                    return Ok(Self { stream, decoder: Decoder::default(), no_ack: false, console: String::new() });
+                    return Ok(Self { stream, decoder: Decoder::default(), no_ack: false, console: String::new(), records: Vec::new() });
                 }
                 Err(error) if Instant::now() > deadline => return Err(format!("depurador em {address}: {error}")),
                 Err(_) => std::thread::sleep(Duration::from_millis(50)),
@@ -167,7 +176,10 @@ impl Connection {
                 self.decoder.push(&chunk[..count]);
                 Ok(())
             }
-            Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => Err(TIMEOUT.into()),
+            Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut | std::io::ErrorKind::Interrupted) => Err(TIMEOUT.into()),
+            // ERROR_IO_PENDING (997): no Windows, um recv com prazo curto que
+            // venceu durante a operação; os bytes chegam na próxima leitura.
+            Err(error) if error.raw_os_error() == Some(997) => Err(TIMEOUT.into()),
             Err(error) => Err(error.to_string()),
         }
     }
@@ -223,16 +235,26 @@ impl Connection {
         }
     }
 
-    /// Próximo pacote que não é saída `O` (a saída acumula no console).
+    /// Próximo pacote que não é saída `O` (a saída acumula no console; os
+    /// registros do fluxo ficam à parte).
     pub fn receive(&mut self, timeout: Duration) -> Result<String, String> {
         let deadline = Instant::now() + timeout;
         loop {
             let packet = self.receive_raw(deadline)?;
+            if let Some(bytes) = stream_bytes(&packet) {
+                self.records.push(bytes);
+                continue;
+            }
             match console_text(&packet) {
                 Some(text) => self.console.push_str(&text),
                 None => return Ok(packet),
             }
         }
+    }
+
+    /// Consome os `O` do fluxo de registros recebidos.
+    pub fn take_records(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.records)
     }
 
     /// Pacote e resposta.

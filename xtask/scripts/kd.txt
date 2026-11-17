@@ -118,6 +118,22 @@ expect opennt_kd_image_event
 uex
 expect excecoes do anel 3
 
+# Ferramentas de engenharia reversa: o Registro vivo, o namespace do Object
+# Manager e o monitor de APIs e o rastreador de IRPs, ligados e desligados
+# com a maquina parada.
+reg \Registry\Machine\SYSTEM\Select
+expect Current
+objdir \Driver
+expect ACPI
+apimon on
+expect monitor ligado
+irptrace on
+expect rastreador ligado
+apimon off
+irptrace off
+apimon status
+expect desligado
+
 # Um passo: o `push rbp` do prólogo.
 save rsp0 %rsp
 save rbp0 %rbp

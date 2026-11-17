@@ -6,7 +6,9 @@
 //! - `server`: as mensagens do MCP (`initialize`, `tools/list`,
 //!   `tools/call`, `resources/*`, `ping`);
 //! - `tools`: as ferramentas (esquemas, conferência dos argumentos e a
-//!   execução) e os recursos;
+//!   execução) e os recursos; as das extensões de engenharia reversa
+//!   (monitor de APIs, IRPs, snapshots, passos para trás, vista como tipo,
+//!   Registro, namespace e arquivos) em `tools_extra.rs`;
 //! - `engine`: o dono da sessão (`Engine`): o `Standalone` do binário, ou o
 //!   backend da janela do opennt-re;
 //! - `transport`: stdio e HTTP local (127.0.0.1);

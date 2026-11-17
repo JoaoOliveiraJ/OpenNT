@@ -12,7 +12,36 @@ use std::time::Duration;
 
 use kd_client::client::{BreakpointOptions, BreakpointRequest, Resumed};
 use kd_client::BreakpointKind;
-use support::fake_stub::{connect, start, Stop, CODE, STACK, USER_DATA};
+use support::fake_stub::{connect, connect_replay, start, Stop, CODE, STACK, USER_DATA};
+
+/// A reprodução: os módulos da gravação, as consultas recusadas sem ir ao
+/// alvo, um passo para a frente e o passo para trás de volta ao RIP de
+/// antes, e o "voltar até o breakpoint".
+#[test]
+fn replay_steps_back_to_the_previous_rip() {
+    let stops = vec![Stop::at(CODE + 4, "T05thread:1;"), Stop::at(CODE, "T05thread:1;"), Stop::at(CODE + 0x2000, "T05thread:1;swbreak:;")];
+    let (address, log) = start(stops);
+    let recorded = vec![(0xfffff800_4200_0000, 0xfffff800_4201_0000, "\\SystemRoot\\System32\\drivers\\gravado.sys".to_string())];
+    let mut client = connect_replay(&address, recorded);
+    assert!(client.is_replay());
+    assert!(client.reverse_supported());
+    assert!(client.symbols.modules.iter().any(|module| module.name == "gravado"), "{:?}", client.symbols.modules.iter().map(|module| module.name.clone()).collect::<Vec<_>>());
+    assert!(client.monitor("ps").unwrap_err().contains("reproducao"));
+    assert!(!log.lock().unwrap().iter().any(|packet| packet.starts_with("qRcmd")));
+    let before = client.register("rip").unwrap();
+    client.step().unwrap();
+    assert_eq!(client.register("rip").unwrap(), CODE + 4);
+    client.reverse_step().unwrap();
+    assert_eq!(client.register("rip").unwrap(), before);
+    assert!(log.lock().unwrap().iter().any(|packet| packet == "bs"));
+    let stop = client.reverse_continue().unwrap();
+    assert!(stop.contains("kernel::alvo::chamador"), "{stop}");
+    assert!(log.lock().unwrap().iter().any(|packet| packet == "bc"));
+    // Fora da reprodução, os passos para trás são recusados.
+    let (address, _) = start(Vec::new());
+    let mut normal = connect(&address);
+    assert!(normal.reverse_step().unwrap_err().contains("reproducao"));
+}
 
 #[test]
 fn backtrace_registers_and_memory() {

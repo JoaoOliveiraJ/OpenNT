@@ -147,6 +147,59 @@ fn tools_against_the_fake_stub() {
 }
 
 #[test]
+fn reverse_engineering_tools_against_the_fake_stub() {
+    let (address, log) = start(Vec::new());
+    let mut server = Server::new();
+    let mut engine = Standalone::new(std::path::PathBuf::from("."));
+    request(&mut server, &mut engine, 1, "initialize", json!({"protocolVersion": "2025-06-18"}));
+    call(&mut server, &mut engine, 2, "connect", json!({"address": address, "elf": "inexistente/kernel.elf"}));
+    engine.client.as_mut().unwrap().symbols.set_kernel(fake_stub::kernel_module());
+    // O monitor de APIs: as especificações dos protótipos e a chamada lida.
+    let started = call(&mut server, &mut engine, 3, "api_monitor_start", json!({}));
+    assert_eq!(started["enabled"], true);
+    assert!(log.lock().unwrap().iter().any(|packet| packet.starts_with("qRcmd,") && String::from_utf8(kd_client::rsp::unhex(&packet[6..])).unwrap().starts_with("api spec 40:7:3:1:7:6")));
+    let fetched = call(&mut server, &mut engine, 4, "api_monitor_fetch", json!({"export": "createdevice"}));
+    assert_eq!(fetched["matching"], 1, "{fetched}");
+    let row = &fetched["rows"][0];
+    assert_eq!(row["export"], "IoCreateDevice");
+    assert_eq!(row["status"]["name"], "STATUS_SUCCESS");
+    assert!(row["arguments"].as_str().unwrap().contains("DeviceName=\"\\Device\\Falso\""), "{row}");
+    assert_eq!(row["return_address"], format!("{:#x}", CODE + 0x10D));
+    assert_eq!(call(&mut server, &mut engine, 5, "api_monitor_fetch", json!({"failures_only": true}))["matching"], 0);
+    // O rastreador de IRPs: o CREATE pelos dois dispositivos, concluído.
+    assert_eq!(call(&mut server, &mut engine, 6, "irp_trace_start", json!({}))["enabled"], true);
+    let irps = call(&mut server, &mut engine, 7, "irp_trace_fetch", json!({"major": "create"}));
+    assert_eq!(irps["matching"], 1, "{irps}");
+    assert_eq!(irps["irps"][0]["hops"], 2);
+    assert_eq!(irps["irps"][0]["completed"], true);
+    let detail = call(&mut server, &mut engine, 8, "irp_trace_fetch", json!({"irp": "0"}));
+    assert_eq!(detail["final_status"]["name"], "STATUS_SUCCESS");
+    assert_eq!(detail["steps"].as_array().unwrap().len(), 3);
+    // Os exploradores.
+    let key = call(&mut server, &mut engine, 9, "registry_list", json!({"path": "\\Registry\\Machine\\SYSTEM\\Select"}));
+    assert_eq!(key["values"][0]["name"], "Current");
+    assert_eq!(key["values"][0]["type"], "REG_DWORD");
+    let value = call(&mut server, &mut engine, 10, "registry_read", json!({"path": "\\Registry\\Machine\\SYSTEM\\Select", "name": "Current"}));
+    assert_eq!(value["text"], "0x00000001 (1)");
+    let objects = call(&mut server, &mut engine, 11, "object_list", json!({"path": "\\Device"}));
+    assert_eq!(objects["objects"][1]["target"], "\\Device\\Harddisk0\\Partition1");
+    let files = call(&mut server, &mut engine, 12, "file_list", json!({}));
+    assert_eq!(files["entries"][1]["name"], "teste.txt");
+    let data = call(&mut server, &mut engine, 13, "file_read", json!({"path": "/teste.txt"}));
+    assert_eq!(data["text"], "ola!!");
+    // Sem reprodução e sem o monitor do QEMU: erros claros.
+    let reverse = request(&mut server, &mut engine, 14, "tools/call", json!({"name": "reverse_step", "arguments": {}}));
+    assert_eq!(reverse["result"]["isError"], true);
+    assert!(reverse["result"]["content"][0]["text"].as_str().unwrap().contains("reproducao"), "{reverse}");
+    let snapshots = request(&mut server, &mut engine, 15, "tools/call", json!({"name": "snapshot_list", "arguments": {}}));
+    assert_eq!(snapshots["result"]["isError"], true);
+    // A vista como tipo: um tipo que não existe no PDB (ou o PDB ausente).
+    let typed = request(&mut server, &mut engine, 16, "tools/call", json!({"name": "view_struct", "arguments": {"type": "_TIPO_QUE_NAO_EXISTE", "address": "@rip"}}));
+    assert_eq!(typed["result"]["isError"], true);
+    assert_eq!(call(&mut server, &mut engine, 17, "api_monitor_stop", json!({}))["enabled"], false);
+}
+
+#[test]
 fn stdio_binary_round_trip() {
     let (address, _) = start(Vec::new());
     let mut child = Command::new(env!("CARGO_BIN_EXE_opennt-mcp")).arg("--root=.").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();

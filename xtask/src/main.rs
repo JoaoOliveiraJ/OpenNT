@@ -10,6 +10,7 @@
 //! cargo xtask test-all   [--jobs=N] [--only=ID,...] [--skip=ID,...] [--repeat=N] [--keep] [--cpu-friendly]
 //! cargo xtask capturas   [--jobs=N] [--only=ID,...] [--skip=ID,...] [--keep] [--cpu-friendly]
 //! cargo xtask debug      [opções] [--launch [--no-client [--headless]]] [--connect=HOST:PORTA]
+//!                        [--vm-snapshots | --record=ARQ | --replay=ARQ [--gdb-port=N]]
 //! cargo xtask status     [--reference=NTOSKRNL.EXE]
 //! cargo xtask nt-types   [--check] [--pdb=ARQ]
 //! ```
@@ -47,6 +48,7 @@ mod logon_screen;
 mod nt_types;
 mod ntfs_image;
 mod png;
+mod qcow2;
 mod qemu;
 mod service_chain;
 mod side_by_side;
@@ -54,6 +56,7 @@ mod user_services;
 mod windows_binaries;
 mod status;
 mod test_all;
+mod time_travel;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -74,7 +77,10 @@ const USAGE: &str = "uso: cargo xtask <build|run|test-boot|test-all|capturas|deb
   debug      depurador do kernel: build com --kd=com2, QEMU e o prompt do cliente
              (--connect=HOST:PORTA so conecta; --script=ARQ roda o roteiro como teste;
              --launch --no-client so compila e abre o QEMU para outro cliente, com
-             --headless sem janela; o opennt-dbg --launch usa este modo)
+             --headless sem janela; o opennt-dbg --launch usa este modo;
+             --vm-snapshots discos em overlays qcow2 para o savevm/loadvm;
+             --record=ARQ grava a execucao (TCG) e --replay=ARQ a reproduz com o
+             gdbstub do QEMU (--gdb-port=N) e os passos para tras)
   status     gera docs/site/*.html e docs/status/*.svg (cargo xtask status --help)
   nt-types   gera kernel/src/ntos/inc/types do PDB do ntoskrnl (cargo xtask nt-types --help)
 opcoes de build:   --release --build-dir=DIR --user-program=shell
@@ -137,6 +143,10 @@ struct Arguments {
     expect_poweroff: bool,
     power_cycles: u32,
     allow_reboot: bool,
+    /// `debug --vm-snapshots | --record=ARQ | --replay=ARQ`.
+    time_travel: Option<time_travel::Mode>,
+    /// `debug --replay --gdb-port=N`: a porta do gdbstub do QEMU.
+    gdb_port: Option<u16>,
 }
 
 fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
@@ -192,6 +202,8 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
         expect_poweroff: false,
         power_cycles: 0,
         allow_reboot: false,
+        time_travel: None,
+        gdb_port: None,
     };
     for argument in iterator {
         let (name, value) = match argument.split_once('=') {
@@ -233,6 +245,10 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             "--launch" if parsed.command == "debug" => {}
             "--no-client" if parsed.command == "debug" => parsed.no_client = true,
             "--headless" if parsed.command == "debug" => parsed.headless = true,
+            "--vm-snapshots" if parsed.command == "debug" => parsed.time_travel = Some(time_travel::Mode::Snapshots),
+            "--record" if parsed.command == "debug" => parsed.time_travel = Some(time_travel::Mode::Record(PathBuf::from(required()?))),
+            "--replay" if parsed.command == "debug" => parsed.time_travel = Some(time_travel::Mode::Replay(PathBuf::from(required()?))),
+            "--gdb-port" if parsed.command == "debug" => parsed.gdb_port = Some(required()?.parse().map_err(|_| "--gdb-port invalido")?),
             "--capture" => parsed.capture = Some(PathBuf::from(required()?)),
             "--expect-stop" => parsed.expect_stop = true,
             "--watch-screen" => parsed.watch_screen = true,
@@ -431,7 +447,7 @@ fn debug_command(arguments: Arguments) -> Result<(), String> {
                 let text = std::fs::read_to_string(script).map_err(|error| format!("{script}: {error}"))?;
                 debug::run_script(address, &root, &elf, &text, None)
             }
-            None => debug::interactive(address, &root, &elf),
+            None => debug::interactive(address, &root, &elf, arguments.machine.monitor_port.map(|port| format!("127.0.0.1:{port}")), None),
         };
     }
     let mut options = arguments.build.clone();
@@ -458,17 +474,54 @@ fn debug_command(arguments: Arguments) -> Result<(), String> {
     }
     let output = build::build(&options)?;
     let log = output.image.with_file_name("serial.log");
+    // Snapshots e gravação: os arquivos relativos ficam a partir da raiz.
+    let mode = arguments.time_travel.clone().map(|mode| match mode {
+        time_travel::Mode::Record(file) if file.is_relative() => time_travel::Mode::Record(root.join(file)),
+        time_travel::Mode::Replay(file) if file.is_relative() => time_travel::Mode::Replay(root.join(file)),
+        other => other,
+    });
+    let gdb_port = match (&mode, arguments.gdb_port) {
+        (Some(time_travel::Mode::Replay(_)), None) => Some(qemu::free_port()?),
+        (_, port) => port,
+    };
+    if machine.monitor_port.is_none() {
+        // O prompt usa o monitor do QEMU nos snapshots (`snap`).
+        machine.monitor_port = Some(qemu::free_port()?);
+    }
+    if let Some(time_travel::Mode::Record(file)) = &mode {
+        // O prompt guarda os módulos ao lado da gravação.
+        std::env::set_var("OPENNT_KD_RECORDING", file);
+    }
+    let disks = qemu::Disks::beside(&output.image, &options.storage);
+    let spawn = |window: bool| match &mode {
+        None => qemu::spawn(&disks, &machine, &log, window),
+        Some(mode) => {
+            let effective = time_travel::machine(&machine, mode);
+            qemu::spawn_adjusted(&disks, &effective, &log, window, |base| time_travel::arguments(base, &disks, &effective, mode, gdb_port))
+        }
+    };
+    // Na reprodução o cliente fala com o gdbstub do QEMU.
+    let address = match (&mode, gdb_port) {
+        (Some(time_travel::Mode::Replay(_)), Some(port)) => format!("127.0.0.1:{port}"),
+        _ => address,
+    };
+    let monitor = machine.monitor_port.map(|port| format!("127.0.0.1:{port}"));
     if arguments.no_client {
-        let qemu = qemu::spawn(&qemu::Disks::beside(&output.image, &options.storage), &machine, &log, !arguments.headless)?;
-        let monitor = machine.monitor_port.map(|port| format!("127.0.0.1:{port}"));
+        let qemu = spawn(!arguments.headless)?;
+        if let Some(time_travel::Mode::Replay(file)) = &mode {
+            println!("KD_REPLAY {}", file.display());
+        }
         let result = debug::serve(qemu, &address, monitor.as_deref());
         qemu::remove_temp_dir(&qemu::temp_dir_beside(&log));
         return result;
     }
-    let mut qemu = qemu::spawn(&qemu::Disks::beside(&output.image, &options.storage), &machine, &log, true)?;
-    let result = debug::interactive(&address, &root, &elf);
-    let _ = qemu.kill();
-    let _ = qemu.wait();
+    let mut qemu = spawn(true)?;
+    let replay = match &mode {
+        Some(time_travel::Mode::Replay(file)) => Some(file.clone()),
+        _ => None,
+    };
+    let result = debug::interactive(&address, &root, &elf, monitor.clone(), replay);
+    debug::stop_qemu(&mut qemu, monitor.as_deref());
     qemu::remove_temp_dir(&qemu::temp_dir_beside(&log));
     result
 }

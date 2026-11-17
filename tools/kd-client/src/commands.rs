@@ -49,6 +49,15 @@
 //! bp <expr> /log "texto {expr}" | /cmd "r; k" | /g grupo   log, comandos de parada, grupo
 //! bgd | bge <grupo>          desliga / religa um grupo de breakpoints
 //! bar <w|a> <expr> <bytes>   vigia uma faixa com ate quatro comparadores
+//! apimon on [modulo...] | off | show [n] [texto] | fails [n] | save <arq.csv> | clear | status
+//!                            monitor de APIs (os exports chamados pelos drivers)
+//! irptrace on | off | show [n] [texto] | irp <n|endereco>   rastreador de IRPs
+//! reg <caminho> | regv <caminho> <nome>   o Registro vivo (chaves e valores)
+//! objdir [caminho]           diretorio do namespace do Object Manager
+//! fsls [caminho] | fscat <caminho> [desl] [bytes]   arquivos do volume do kernel
+//! dtv [modulo!]<tipo> <expr> [abertos,...]   o endereco como tipo, em arvore
+//! snap save|load|del <nome> | snap list   snapshots da maquina (monitor do QEMU)
+//! rstep | rcont              passo para tras e para tras ate o breakpoint (reproducao)
 //! detach | quit
 //! ```
 //!
@@ -83,6 +92,11 @@ ps | threads [pid] | lm | cpus | irql | obj <caminho> | log [bytes] | bugcheck |
 sxe cpr[:nome]|epr[:nome]|ct[:pid]|et[:pid]|ld:proc!dll | bp <expr> /log \"txt {expr}\" /cmd \"r\" /g grupo | bgd/bge <grupo> | bar <w|a> <expr> <bytes>
 trace [n] [ate <expr>] [ret] [over] [entra|sai <mod>] [pula <mod>] [vigia <expr> [bytes]]
 trace show [de] [n] | trace tree [n] | trace save <arq> | trace diff <arq> | trace ref | trace status
+apimon on [modulo...] | off | show [n] [texto] | fails [n] | save <arq.csv> | clear | status (monitor de APIs)
+irptrace on | off | show [n] [texto] | irp <n|endereco> (rastreador de IRPs)
+reg <caminho> | regv <caminho> <nome> | objdir [caminho] | fsls [caminho] | fscat <caminho> [desl] [bytes]
+dtv [modulo!]<tipo> <expr> [abertos,...] (o endereco como tipo, em arvore) | snap save|load|del <nome> | snap list
+rstep | rcont (passo para tras e para tras ate o breakpoint, na reproducao com --replay)
 detach | quit
 expressoes: 0x.., decimais, $nome, @reg, simbolos, poi() by() wo() dwo() [..], operadores do C, ((_IRP*)x)->Campo
 ";
@@ -973,6 +987,7 @@ impl Client {
                 let created = self.add_range_watch(kind, start, length)?;
                 Ok(created.iter().map(|breakpoint| format!("#{} {:#x} ({} bytes)", breakpoint.id, breakpoint.address, breakpoint.length)).collect::<Vec<_>>().join("\n"))
             }
+            "apimon" | "irptrace" | "reg" | "regv" | "objdir" | "fsls" | "fscat" | "dtv" | "rstep" | "rcont" | "snap" => self.re_command(command, &words),
             "modules" => Ok(self.symbols.modules.iter().map(|module| format!("{:#018x} {:#018x} {:<16} {} simbolos ({})\n", module.base, module.end, module.name, module.symbols.len(), module.source)).collect()),
             "detach" => self.detach(),
             "help" => Ok(HELP.to_string()),
@@ -986,6 +1001,7 @@ impl Client {
             "attach", "break", "c", "g", "continue", "wait-stop", "s", "t", "step", "p", "gu", "regs", "r", "rx", "x", "db", "dw", "dd", "dq", "da", "du", "write", "poke", "bp", "bu", "bc", "hbp", "hbc", "ba", "bpm", "bpmc", "watch", "unwatch", "sxe", "sxd", "bd", "be", "bl", ".bpsave", ".bpload", "bt", "k", "context", "btt", "?", "sym", "ln", "addr", "dt", "thread", "cpulist", "ps",
             "threads", "lm", "lmv", "cpus", "irql", "obj", "log", "bugcheck", "kd", ".reload", "!process", "!thread", "!irp", "!devobj", "!drvobj", "!object", "!handle", "!analyze", "trace", "monitor", "modules", "detach", "help",
             ".process", "lmu", "handles", "vad", "uthreads", "ustack", "kmap", "events", "uex", "bgd", "bge", "bar",
+            "apimon", "irptrace", "reg", "regv", "objdir", "fsls", "fscat", "dtv", "rstep", "rcont", "snap",
         ]
     }
 

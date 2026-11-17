@@ -241,7 +241,7 @@ enum Hit {
 }
 
 pub struct Client {
-    connection: Connection,
+    pub(crate) connection: Connection,
     pub symbols: Symbols,
     pub(crate) root: PathBuf,
     elf: PathBuf,
@@ -295,6 +295,13 @@ pub struct Client {
     /// O breakpoint de uma vez só que acabou de parar (sai no fim da
     /// parada).
     single_shot: Option<u32>,
+    /// O monitor de APIs e o rastreador de IRPs (`monitoring.rs`).
+    pub monitors: super::monitoring::Monitors,
+    /// O monitor HMP do QEMU (snapshots, record/replay), quando conhecido.
+    pub qemu_monitor: Option<String>,
+    /// Sessão de reprodução: o gdbstub do QEMU no lugar do depurador do
+    /// kernel (sem as consultas do OpenNT; os módulos vêm da gravação).
+    pub(crate) replay: Option<super::monitoring::Replay>,
 }
 
 impl ReadMemory for Client {
@@ -399,6 +406,9 @@ impl Client {
             log_lines: Vec::new(),
             pending_commands: None,
             single_shot: None,
+            monitors: super::monitoring::Monitors::default(),
+            qemu_monitor: None,
+            replay: None,
         }
     }
 
@@ -793,6 +803,7 @@ impl Client {
     pub fn attach(&mut self, timeout: Duration) -> Result<String, String> {
         let supported = self.connection.request("qSupported:swbreak+;hwbreak+;vContSupported+", timeout)?;
         self.collect_console();
+        self.note_replay_features(&supported);
         if supported.contains("QStartNoAckMode+") && self.request("QStartNoAckMode")? == "OK" {
             self.connection.set_no_ack();
         }
@@ -810,9 +821,27 @@ impl Client {
         Ok(output)
     }
 
+    /// Depois de um `loadvm`: a memória e a sessão do alvo voltaram ao
+    /// ponto do snapshot. A parada é relida e os breakpoints de software
+    /// ligados da sessão voltam a ser gravados (o alvo ignora os repetidos).
+    pub(crate) fn resync_after_restore(&mut self) -> Result<(), String> {
+        self.stopped = true;
+        self.registers = None;
+        let stop = self.request("?")?;
+        let addresses: Vec<u64> = self.breakpoints.iter().filter(|breakpoint| breakpoint.enabled && breakpoint.kind == BreakpointKind::Software && !breakpoint.pending && breakpoint.process == 0).map(|breakpoint| breakpoint.address).collect();
+        for address in addresses {
+            let _ = self.request(&format!("Z0,{address:x},1"));
+        }
+        self.on_stop(stop).map(|_| ())
+    }
+
     /// Lê a lista de módulos do alvo e os símbolos de cada um.
     pub fn reload_modules(&mut self) -> Result<(), String> {
-        let list: Vec<(u64, u64, String)> = self.loaded_modules()?.into_iter().map(|module| (module.base, module.end, module.path)).collect();
+        let list: Vec<(u64, u64, String)> = match &self.replay {
+            // Na reprodução, os módulos da gravação (a execução é a mesma).
+            Some(replay) => replay.modules.clone(),
+            None => self.loaded_modules()?.into_iter().map(|module| (module.base, module.end, module.path)).collect(),
+        };
         self.symbols.set_modules(&list, &self.root);
         Ok(())
     }
@@ -829,6 +858,10 @@ impl Client {
     /// `OK` (com a máquina parada não há DbgPrint misturado).
     pub fn monitor(&mut self, command: &str) -> Result<String, String> {
         self.require_stopped()?;
+        if self.replay.is_some() {
+            // O `qRcmd` do gdbstub do QEMU vai ao monitor HMP dele.
+            return Err(format!("monitor {command}: indisponivel na reproducao (o gdbstub do QEMU nao tem as consultas do OpenNT)"));
+        }
         self.collect_console();
         let reply = self.connection.request(&format!("qRcmd,{}", hex(command.as_bytes())), self.timeout)?;
         let text = self.connection.take_console();
@@ -1074,10 +1107,12 @@ impl Client {
         match self.connection.receive(timeout) {
             Ok(packet) => {
                 self.collect_console();
+                self.collect_records();
                 self.on_stop(packet)
             }
             Err(error) if is_timeout(&error) => {
                 self.collect_console();
+                self.collect_records();
                 Ok(None)
             }
             Err(error) => Err(error),

@@ -123,9 +123,15 @@ impl Standalone {
         }
     }
 
-    fn open(&mut self, address: &str, elf: PathBuf, timeout: Duration) -> Result<String, String> {
+    fn open(&mut self, address: &str, elf: PathBuf, timeout: Duration, replay: Option<PathBuf>) -> Result<String, String> {
         let connection = Connection::connect(address, Instant::now() + Duration::from_secs(60))?;
         let mut client = Client::new(connection, self.root.clone(), elf);
+        // O monitor do QEMU (snapshots) e, na reprodução, os módulos da gravação.
+        client.set_qemu_monitor(self.launch.as_ref().and_then(|launch| launch.monitor.clone()));
+        if let Some(recording) = replay {
+            let modules = std::fs::read_to_string(kd_client::monitoring::modules_file(&recording)).map(|text| kd_client::monitoring::parse_modules(&text)).unwrap_or_default();
+            client.set_replay(modules);
+        }
         let text = client.attach(timeout)?;
         self.client = Some(client);
         self.cache.clear();
@@ -152,7 +158,8 @@ impl Engine for Standalone {
         self.launch = Some(launch);
         self.serial = Some(build.join("serial.log"));
         self.build = Some(build.clone());
-        match self.open(&address, build.join("kernel.elf"), timeout) {
+        let replay = kd_client::monitoring::replay_recording(&options.extra, &options.root);
+        match self.open(&address, build.join("kernel.elf"), timeout, replay) {
             Ok(text) => Ok(text),
             Err(error) => {
                 if let Some(mut launch) = self.launch.take() {
@@ -173,7 +180,7 @@ impl Engine for Standalone {
                 self.serial = Some(log);
             }
         }
-        self.open(address, elf, Duration::from_secs(180))
+        self.open(address, elf, Duration::from_secs(180), None)
     }
 
     fn detach(&mut self) -> Result<String, String> {

@@ -336,9 +336,15 @@ fn machine_arguments(disks: &Disks, machine: &MachineOptions, no_reboot: bool) -
 /// no socket do depurador. A pasta temporária dele é a [`QEMU_TEMP_DIR`]
 /// ao lado do log: quem para o QEMU a apaga com [`remove_temp_dir`].
 pub fn spawn(disks: &Disks, machine: &MachineOptions, log: &Path, window: bool) -> Result<Child, String> {
+    spawn_adjusted(disks, machine, log, window, Ok)
+}
+
+/// O `spawn` com os argumentos da máquina ajustados por `adjust` (os
+/// discos e o relógio do `debug --vm-snapshots | --record | --replay`).
+pub fn spawn_adjusted(disks: &Disks, machine: &MachineOptions, log: &Path, window: bool, adjust: impl FnOnce(Vec<String>) -> Result<Vec<String>, String>) -> Result<Child, String> {
     let qemu = find_qemu()?;
     let temp = QemuTemp::beside(log)?;
-    let mut arguments = machine_arguments(disks, machine, true);
+    let mut arguments = adjust(machine_arguments(disks, machine, true))?;
     if !window {
         arguments.extend(["-display".to_string(), "none".to_string()]);
     }
