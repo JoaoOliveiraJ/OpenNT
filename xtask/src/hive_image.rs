@@ -429,7 +429,7 @@ pub fn machine_hives(smss_boot: bool) -> Vec<(&'static str, Vec<u8>)> {
         software.extend(crate::service_chain::software_keys().into_iter().map(seed_of));
         default.extend(crate::host_language::default_keys().into_iter().map(seed_of));
         // E a SOFTWARE, os assemblies lado a lado do contexto de ativação
-        // padrão do sistema (`side_by_side`).
+        // padrão do sistema e dos controles comuns (`side_by_side`).
         software.extend(crate::side_by_side::software_keys(&crate::windows_binaries::windows_directory()).into_iter().map(seed_of));
     }
     let hives: [(&'static str, Vec<cm::seed::SeedKey>); 5] = [

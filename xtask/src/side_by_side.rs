@@ -12,29 +12,38 @@
 //! `Microsoft.Windows.IsolationAutomation.ProxyStub`). Sem eles, o sxs.dll
 //! devolve STATUS_SXS_CANT_GEN_ACTCTX e o csrss encerra o processo novo.
 //!
+//! O LogonUI.exe e o dwm.exe da tela de logon (e o authui.dll e outras
+//! DLLs dela) trazem no RT_MANIFEST a dependência do
+//! `Microsoft.Windows.Common-Controls` 6.0: sem o assembly, o contexto de
+//! ativação do processo não é gerado e o csrss encerra o processo novo.
+//! Com ele, o user32 carrega o comctl32.dll da versão 6 de WinSxS para as
+//! classes de janela que o manifesto redireciona.
+//!
 //! Como os binários de System32, os dados vêm desta máquina no build: a
-//! subchave de Winners de cada assembly (com as versões vencedoras) e os
-//! manifestos dessas versões, com os nomes e os valores daqui. As
-//! dependências opcionais (`optional="yes"`) ficam de fora: sem a chave de
-//! Winners, o sxs.dll as pula. Fora do Windows nada é copiado.
+//! subchave de Winners de cada assembly (com as versões vencedoras), os
+//! manifestos dessas versões e os arquivos que eles listam (`<file
+//! name=...>`, na pasta do componente em WinSxS), com os nomes e os valores
+//! daqui. As dependências opcionais (`optional="yes"`) ficam de fora: sem a
+//! chave de Winners, o sxs.dll as pula. Fora do Windows nada é copiado.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use crate::host_language::HostKey;
 
-/// A raiz da resolução: o assembly do contexto de ativação padrão do
-/// sistema (nome em minúsculas e token de chave pública).
-const ROOTS: &[(&str, &str)] = &[("microsoft.windows.systemcompatible", "6595b64144ccf1df")];
+/// As raízes da resolução (nome em minúsculas e token de chave pública): o
+/// assembly do contexto de ativação padrão do sistema e os controles comuns
+/// que os manifestos dos programas da tela de logon pedem.
+const ROOTS: &[(&str, &str)] = &[("microsoft.windows.systemcompatible", "6595b64144ccf1df"), ("microsoft.windows.common-controls", "6595b64144ccf1df")];
 
 /// A chave de Winners relativa à raiz da hive SOFTWARE.
 const WINNERS: &str = "Microsoft\\Windows\\CurrentVersion\\SideBySide\\Winners";
 
-/// Um assembly resolvido: o nome da subchave de Winners, as chaves copiadas
-/// e os manifestos (caminho no volume, arquivo de origem).
+/// Os assemblies resolvidos: as chaves copiadas e os arquivos (caminho no
+/// volume, arquivo de origem): os manifestos e os arquivos deles.
 struct Resolved {
     keys: Vec<HostKey>,
-    manifests: Vec<(String, PathBuf)>,
+    files: Vec<(String, PathBuf)>,
 }
 
 /// O nome do assembly nos nomes de WinSxS: até 40 caracteres inteiro; acima
@@ -78,10 +87,20 @@ fn dependencies(manifest: &str) -> Vec<(String, String)> {
     found
 }
 
+/// Os arquivos que um manifesto lista (`<file name="...">`).
+fn payload(manifest: &str) -> Vec<String> {
+    manifest
+        .split("<file")
+        .skip(1)
+        .filter(|element| element.starts_with(char::is_whitespace))
+        .filter_map(|element| attribute(element.split('>').next().unwrap_or(""), "name"))
+        .collect()
+}
+
 /// Os assemblies de [`ROOTS`] e as dependências obrigatórias deles, com as
-/// chaves de Winners e os manifestos desta máquina.
+/// chaves de Winners, os manifestos e os arquivos desta máquina.
 fn resolve(windows: &Path) -> Resolved {
-    let mut resolved = Resolved { keys: Vec::new(), manifests: Vec::new() };
+    let mut resolved = Resolved { keys: Vec::new(), files: Vec::new() };
     #[cfg(windows)]
     {
         use crate::host_language::registry;
@@ -106,13 +125,22 @@ fn resolve(windows: &Path) -> Resolved {
                 let manifest = format!("amd64_{}_{token}_{version}_none_", abbreviated(&name));
                 for file in files.iter().filter(|file| file.to_lowercase().starts_with(&manifest) && file.to_lowercase().ends_with(".manifest")) {
                     let source = directory.join(file);
+                    // A pasta do componente tem o nome do manifesto sem a
+                    // extensão.
+                    let component = &file[..file.len() - ".manifest".len()];
                     if let Ok(text) = std::fs::read_to_string(&source) {
                         pending.extend(dependencies(&text));
+                        for name in payload(&text) {
+                            let payload = windows.join("WinSxS").join(component).join(&name);
+                            if payload.is_file() {
+                                resolved.files.push((format!("WinSxS/{component}/{name}"), payload));
+                            }
+                        }
                     }
                     // Como os outros subdiretórios do diretório do Windows
                     // que o modo usuário abre por `C:\Windows\...`, o WinSxS
                     // fica na raiz do volume.
-                    resolved.manifests.push((format!("WinSxS/Manifests/{file}"), source));
+                    resolved.files.push((format!("WinSxS/Manifests/{file}"), source));
                 }
             }
         }
@@ -128,9 +156,11 @@ pub fn software_keys(windows: &Path) -> Vec<HostKey> {
     resolve(windows).keys
 }
 
-/// Os manifestos dos assemblies: (caminho no volume, arquivo de origem).
-pub fn manifest_files(windows: &Path) -> Vec<(String, PathBuf)> {
-    let mut files = resolve(windows).manifests;
+/// Os manifestos dos assemblies e os arquivos deles: (caminho no volume,
+/// arquivo de origem).
+pub fn assembly_files(windows: &Path) -> Vec<(String, PathBuf)> {
+    let mut files = resolve(windows).files;
     files.sort();
+    files.dedup();
     files
 }

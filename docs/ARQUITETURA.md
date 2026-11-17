@@ -3253,10 +3253,14 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   no build: o contexto de ativação padrão do sistema, que o sxssrv.dll gera
   no primeiro CreateProcessW, precisa das chaves de SideBySide\Winners e dos
   manifestos de WinSxS do Microsoft.Windows.SystemCompatible e das
-  dependências obrigatórias dele (`xtask/src/side_by_side.rs`); o
-  services.exe lê as chaves de serviço da cadeia do LSM (DcomLaunch,
-  RpcEptMapper, RpcSs e LSM), o Control\ServiceGroupOrder e os grupos do
-  svchost (`xtask/src/user_services.rs`). A inicialização do LSA (o
+  dependências obrigatórias dele, e o contexto do LogonUI.exe, do dwm.exe e
+  das DLLs da tela de logon com manifesto próprio pede o
+  Microsoft.Windows.Common-Controls 6.0 (as chaves, os manifestos e os
+  arquivos que eles listam, como o comctl32.dll da versão 6,
+  `xtask/src/side_by_side.rs`); o services.exe lê as chaves de serviço da
+  cadeia do LSM (DcomLaunch, RpcEptMapper, RpcSs e LSM), o
+  Control\ServiceGroupOrder e os grupos do svchost
+  (`xtask/src/user_services.rs`). A inicialização do LSA (o
   LsapInitLsa e o LsapStartLsa do lsasrv) pede ainda: o
   NtQueryInformationProcess das classes ProcessWow64Information (0) e
   ProcessProtectionInformation (o PS_PROTECTION do EPROCESS); os alarmes de

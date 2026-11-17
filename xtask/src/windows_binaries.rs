@@ -709,16 +709,17 @@ pub fn ntfs_files(root: &Path, kernel_pe: &[u8], initial_process: &str) -> Resul
             }
         }
         println!("recursos .mui no volume NTFS: {resources} (idiomas {})", languages.join(", "));
-        // Os manifestos dos assemblies lado a lado do contexto de ativação
-        // padrão do sistema (`side_by_side`), no caminho de WinSxS.
-        let mut manifests = 0;
-        for (path, source) in crate::side_by_side::manifest_files(&windows) {
+        // Os manifestos dos assemblies lado a lado (o contexto de ativação
+        // padrão do sistema e os controles comuns da versão 6, de
+        // `side_by_side`) e os arquivos deles, no caminho de WinSxS.
+        let mut assemblies = 0;
+        for (path, source) in crate::side_by_side::assembly_files(&windows) {
             if let Ok(bytes) = fs::read(&source) {
                 files.push((path, bytes));
-                manifests += 1;
+                assemblies += 1;
             }
         }
-        println!("manifestos de WinSxS no volume NTFS: {manifests}");
+        println!("arquivos de WinSxS no volume NTFS: {assemblies}");
     }
     files.push((String::from("NTOSKRNL.EXE"), kernel_pe.to_vec()));
     files.push((String::from("Windows/System32/ntoskrnl.exe"), kernel_pe.to_vec()));
