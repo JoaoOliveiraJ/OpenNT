@@ -41,7 +41,8 @@ pub fn clone(attributes: &[SecurityAttribute], inherit: bool) -> Vec<SecurityAtt
     attributes.iter().filter(|attribute| !inherit || attribute.flags & 1 == 0).cloned().collect()
 }
 
-fn equal_names(left: &str, right: &str) -> Result<bool, KernelError> {
+/// Nomes iguais sem caixa (a tabela de maiúsculas do NLS).
+pub fn equal_names(left: &str, right: &str) -> Result<bool, KernelError> {
     let left: Vec<u16> = left.encode_utf16().collect();
     let right: Vec<u16> = right.encode_utf16().collect();
     if left.len() != right.len() {

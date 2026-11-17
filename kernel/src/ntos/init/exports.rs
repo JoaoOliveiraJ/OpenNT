@@ -739,6 +739,10 @@ pub fn init() {
     crate::ntos::ex::timer_resolution::initialize();
     crate::ntos::ps::user::tokens::init();
     crate::ntos::po::shutdown::register_user_services();
+    crate::ntos::po::system_state::register_user_services();
+    crate::ntos::ob::compare_objects::register_user_services();
+    crate::ntos::se::token::compare::register_user_services();
+    crate::ntos::ex::uuid::register_user_services();
     crate::ntos::ps::user::index::register();
     crate::ntos::ps::process_image::init();
     crate::ntos::ps::user::index::set_user_mode_init(crate::hal::amd64::usermode::user_mode_init);

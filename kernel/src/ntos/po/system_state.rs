@@ -14,6 +14,12 @@
 //!   (referenciada) na lista de espera de shutdown e devolve o
 //!   PopShutdownEvent, um KEVENT de notificação; com a lista já fechada, a
 //!   referência volta e o resultado é STATUS_UNSUCCESSFUL.
+//! - PopFullWake: o PoInitSystem da fase 0 grava 1. O PopUserPresentSet
+//!   liga o bit 1 só quando os bits 0 e 1 estão zerados (o que só acontece
+//!   depois de uma transição de sono, que zera o valor); o
+//!   PopDispatchFullWake liga o bit 0. O NtIsSystemResumeAutomatic devolve
+//!   `(PopFullWake & 3) == 0` em AL (`mov eax, PopFullWake; test al, 3;
+//!   sete al`): o resto de EAX é o próprio PopFullWake.
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -31,10 +37,35 @@ const STATUS_NO_MEMORY: u32 = 0xC000_0017;
 static USER_PRESENCE: AtomicU32 = AtomicU32::new(0);
 static LATENCY_HINT: AtomicU32 = AtomicU32::new(0);
 static LATENCY_HINT_TIME: AtomicU64 = AtomicU64::new(0);
+/// PopFullWake, com o valor que o PoInitSystem da fase 0 grava.
+static FULL_WAKE: AtomicU32 = AtomicU32::new(1);
 
 /// PoSetUserPresent: o PopUserPresentSet.
 pub fn set_user_present(presence: u32) {
     USER_PRESENCE.store(presence, Ordering::Release);
+    // O bit de presença do usuário só entra num PopFullWake sem wake
+    // registrado.
+    let _ = FULL_WAKE.try_update(Ordering::AcqRel, Ordering::Acquire, |value| (value & 3 == 0).then_some(value | 2));
+}
+
+/// O PopFullWake corrente.
+pub fn full_wake() -> u32 {
+    FULL_WAKE.load(Ordering::Acquire)
+}
+
+/// NtIsSystemResumeAutomatic: o BOOLEAN em AL sobre o PopFullWake em EAX.
+pub fn is_system_resume_automatic() -> u32 {
+    let value = full_wake();
+    (value & !0xFF) | (value & 3 == 0) as u32
+}
+
+fn nt_is_system_resume_automatic(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
+    Ok(is_system_resume_automatic())
+}
+
+/// O handler do serviço NtIsSystemResumeAutomatic.
+pub fn register_user_services() {
+    crate::ntos::ps::user::state::register_handler("NtIsSystemResumeAutomatic", nt_is_system_resume_automatic);
 }
 
 /// O último USER_ACTIVITY_PRESENCE informado.

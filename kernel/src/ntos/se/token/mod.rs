@@ -24,3 +24,4 @@ pub mod create;
 pub mod set_information;
 pub mod assignable;
 pub mod adjust_groups;
+pub mod compare;

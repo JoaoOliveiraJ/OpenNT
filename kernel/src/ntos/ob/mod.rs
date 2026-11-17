@@ -29,3 +29,4 @@ pub mod handle_attributes;
 pub mod exports;
 pub mod audit;
 pub mod device_map;
+pub mod compare_objects;
