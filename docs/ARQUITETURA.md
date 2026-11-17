@@ -3935,9 +3935,12 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     interrupção, não sobre a hora do sistema; T2_SET_PARAMETERS inválido dá
     STATUS_INVALID_PARAMETER_3) e o vencimento pelo pump dos timers do Ke;
   - os objetos de reserva em `ps/memory_reserve.rs` (UserApcReserve e
-    IoCompletionReserve, NtAllocateReserveObject), com o pacote embutido que
-    o ZwSetIoCompletionEx publica (`io/completion/set.rs`) e a retirada
-    devolve;
+    IoCompletionReserve, NtAllocateReserveObject também de modo usuário),
+    com o pacote embutido que o NtSetIoCompletionEx/ZwSetIoCompletionEx
+    publica (`io/completion/set.rs`) e a retirada devolve, e a KAPC embutida
+    que o NtQueueApcThreadEx(2) com handle de reserva enfileira
+    (`ps/user/user_apc.rs`; o PspUserApcReserveRundownRoutine devolve a
+    reserva na entrega ou no rundown);
   - NtQuerySystemInformationEx de modo kernel em `ex/system_information.rs`
     (classes 107, 121 e 180, com o KeNodeDistance e o steering de
     interrupções de `ke/`), PsChargeProcessPoolQuota/PsReturnPoolQuota em

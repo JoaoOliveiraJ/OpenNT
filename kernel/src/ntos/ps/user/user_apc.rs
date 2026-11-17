@@ -27,6 +27,7 @@ use crate::ntos::ke::test_alert;
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::kernel_pool::{self, AllocateOptions};
 use crate::ntos::ps::context::registers;
+use crate::ntos::ps::memory_reserve;
 use crate::rtl::KernelError;
 
 const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
@@ -34,7 +35,6 @@ const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
 const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 const STATUS_NO_MEMORY: u32 = 0xC000_0017;
-const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
 const STATUS_STACK_OVERFLOW: u32 = 0xC000_00FD;
 const STATUS_ENTRYPOINT_NOT_FOUND: u32 = 0xC000_0139;
 const STATUS_ALERTED: u32 = 0x101;
@@ -102,10 +102,7 @@ pub fn queue(thread: &Arc<UserThread>, routine: u64, argument1: u64, argument2: 
     if packet == 0 {
         return Ok(STATUS_NO_MEMORY);
     }
-    apc::initialize(packet, pointer, 0, kernel_routine, free, routine, 1, argument1);
-    // SAFETY: KAPC recém-alocada e inicializada acima.
-    unsafe { Kapc::at(packet) }.all_flags.set(callback_data as u8);
-    if !apc::insert(packet, argument2, argument3) {
+    if !insert_user_apc(packet, pointer, kernel_routine, free, routine, [argument1, argument2, argument3], callback_data) {
         kernel_pool::free(packet, None)?;
         return Ok(STATUS_UNSUCCESSFUL);
     }
@@ -116,6 +113,32 @@ pub fn queue(thread: &Arc<UserThread>, routine: u64, argument1: u64, argument2: 
     // KiSignalThreadForApc: a espera alertável de UserMode volta com
     // STATUS_USER_APC na próxima sondagem (`thread_alert::consume`).
     Ok(0)
+}
+
+/// KeInitializeApc (UserMode, OriginalApcEnvironment) e KeInsertQueueApc da
+/// KAPC `packet` na thread `pointer`, com CallbackDataContext em AllFlags;
+/// `false` quando a thread já não aceita APCs.
+fn insert_user_apc(packet: u64, pointer: u64, kernel_routine: u64, rundown_routine: u64, routine: u64, arguments: [u64; 3], callback_data: bool) -> bool {
+    apc::initialize(packet, pointer, 0, kernel_routine, rundown_routine, routine, 1, arguments[0]);
+    // SAFETY: KAPC inicializada acima.
+    unsafe { Kapc::at(packet) }.all_flags.set(callback_data as u8);
+    apc::insert(packet, arguments[1], arguments[2])
+}
+
+/// A APC de usuário na KAPC embutida numa UserApcReserve (o
+/// NtQueueApcThreadEx2 com ReserveHandle, 19041 rva 0x5cf9b0): nada é
+/// alocado; KernelRoutine e RundownRoutine são o
+/// PspUserApcReserveRundownRoutine, que devolve a reserva na entrega ou no
+/// rundown. A thread que já sai (KeInsertQueueApc recusa) devolve a reserva
+/// na hora, com STATUS_UNSUCCESSFUL.
+fn queue_reserved(thread: &Arc<UserThread>, packet: u64, routine: u64, arguments: [u64; 3], callback_data: bool) -> u32 {
+    let pointer = thread.pointer();
+    let release = memory_reserve::user_apc_reserve_routine();
+    if pointer == 0 || thread.dead() || !insert_user_apc(packet, pointer, release, release, routine, arguments, callback_data) {
+        memory_reserve::release_user_apc_reserve(packet);
+        return STATUS_UNSUCCESSFUL;
+    }
+    0
 }
 
 /// NtQueueApcThreadEx2(thread, reserve, flags, routine, arg1, arg2, arg3):
@@ -138,10 +161,13 @@ fn queue_apc_thread(handle: u64, reserve: u64, flags: u32, routine: u64, argumen
         return Ok(STATUS_INVALID_HANDLE);
     }
     // Sem WoW64 neste kernel: a checagem da rotina x86 codificada não se
-    // aplica. Objetos de reserva (NtAllocateReserveObject) não existem: um
-    // handle de outro tipo é OBJECT_TYPE_MISMATCH, um ausente é inválido.
+    // aplica. A reserva (UserApcReserve, acesso 2, em UserMode) é tomada por
+    // CAS: em uso dá STATUS_INVALID_PARAMETER_2.
     if reserve != 0 {
-        return Ok(if state::get_user_handle(reserve).is_some() { STATUS_OBJECT_TYPE_MISMATCH } else { STATUS_INVALID_HANDLE });
+        return Ok(match memory_reserve::take_user_apc_reserve(reserve, 1)? {
+            Ok(packet) => queue_reserved(&thread, packet, routine, [argument1, argument2, argument3], flags & CALLBACK_DATA_CONTEXT != 0),
+            Err(status) => status,
+        });
     }
     queue(&thread, routine, argument1, argument2, argument3, special, flags & CALLBACK_DATA_CONTEXT != 0)
 }
