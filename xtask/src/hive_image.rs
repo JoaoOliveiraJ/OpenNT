@@ -402,6 +402,10 @@ pub fn machine_hives(smss_boot: bool) -> Vec<(&'static str, Vec<u8>)> {
         // Os serviços Win32 da cadeia do LSM (`user_services`).
         system.extend(crate::user_services::system_keys(&control_set).into_iter().map(seed_of));
         software.extend(crate::user_services::software_keys().into_iter().map(seed_of));
+        // As chaves que os serviços do início automático e o LSM leem
+        // (`service_chain`).
+        system.extend(crate::service_chain::system_keys(&control_set).into_iter().map(seed_of));
+        software.extend(crate::service_chain::software_keys().into_iter().map(seed_of));
         default.extend(crate::host_language::default_keys().into_iter().map(seed_of));
         // E a SOFTWARE, os assemblies lado a lado do contexto de ativação
         // padrão do sistema (`side_by_side`).

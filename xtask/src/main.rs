@@ -43,6 +43,7 @@ mod nt_types;
 mod ntfs_image;
 mod png;
 mod qemu;
+mod service_chain;
 mod side_by_side;
 mod user_services;
 mod windows_binaries;
