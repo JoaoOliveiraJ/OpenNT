@@ -11,6 +11,7 @@ pub(crate) fn out<T: Copy>(address: u64) -> &'static Field<T> {
 }
 
 pub mod model;
+pub mod capture;
 pub mod object_security;
 pub mod security_attributes;
 pub mod capability;

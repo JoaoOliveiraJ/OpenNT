@@ -2845,6 +2845,40 @@ fn user_create_token(assert: Assert) {
         // processo (-4) não passa por essa recusa (o SYSTEM não é o dono).
         let primary_refused = check(token, 0x200_0000, 0x40) == 0xC000_005C;
         let pseudo_accepted = check((-4i64) as u64, 0x200_0000, 0x40) == 0 && guest::read32(granted) == 3 && guest::read32(status_out) == 0;
+        // NtFilterToken, como o CreateRestrictedToken do dwminit: o Everyone
+        // de SidsToDisable vira deny-only (os Attributes do pedido são
+        // zerados no buffer de quem chama), o SeChangeNotifyPrivilege de
+        // PrivilegesToDelete sai e o handle novo tem o acesso do de origem;
+        // um SID restrito com Attributes é STATUS_INVALID_PARAMETER.
+        let (disable, delete, restricted) = (data + 0x940, data + 0x980, data + 0x9C0);
+        guest::write32(disable, 1);
+        guest::write64(disable + 8, everyone);
+        guest::write32(disable + 16, 7);
+        guest::write32(delete, 1);
+        guest::write64(delete + 4, 23);
+        guest::write32(delete + 12, 0);
+        guest::write32(restricted, 1);
+        guest::write64(restricted + 8, everyone);
+        guest::write32(restricted + 16, 7);
+        let filter = |restricted_sids: u64| {
+            guest::write64(rsp + 0x28, restricted_sids);
+            guest::write64(rsp + 0x30, out + 16);
+            call("NtFilterToken", token, 0, disable, delete)
+        };
+        let filtered = filter(0) == 0;
+        let new_token = guest::read64(out + 16);
+        let zeroed = guest::read32(disable + 16) == 0;
+        let source_access = state::get_user_handle(token).map(|entry| entry.access());
+        let same_access = state::get_user_handle(new_token).is_some_and(|entry| entry.kind() == "token" && Some(entry.access()) == source_access);
+        let query_new = |class: u64, length: u64| {
+            guest::write64(rsp + 0x28, returned);
+            call("NtQueryInformationToken", new_token, class, buffer, length)
+        };
+        let deny_only = query_new(2, 0x200) == 0 && guest::read32(buffer) == 1 && guest::read32(buffer + 16) == 0x10;
+        let no_privileges = query_new(3, 0x40) == 0 && guest::read32(buffer) == 0;
+        let restricted_refused = filter(restricted) == 0xC000_000D;
+        let _ = call("NtClose", new_token, 0, 0, 0);
+        assert(filtered && zeroed && same_access && deny_only && no_privileges && restricted_refused, "usercreatetoken: NtFilterToken desabilita o grupo, tira o privilegio, herda o acesso do handle e recusa SID restrito com atributos");
         let _ = call("NtClose", token, 0, 0, 0);
         let (attributes, quality) = (data + 0x600, data + 0x640);
         guest::write32(quality, 12);

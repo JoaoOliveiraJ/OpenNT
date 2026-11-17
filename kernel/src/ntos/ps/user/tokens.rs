@@ -132,6 +132,16 @@ fn nt_duplicate_token(existing: u64, access: u64, attributes: u64, effective_onl
     crate::ntos::se::token::duplicate::duplicate(token_argument(1, existing), access as u32, attributes, effective_only & 0xFF != 0, state::stack_arg32(rsp, 5), stack_arg(rsp, 6), 1)
 }
 
+/// NtFilterToken(ExistingTokenHandle, Flags, SidsToDisable,
+/// PrivilegesToDelete, RestrictedSids, NewTokenHandle)
+/// (`se/token/filter.rs::filter_from_user`).
+fn nt_filter_token(existing: u64, flags: u64, sids_to_disable: u64, privileges_to_delete: u64, rsp: u64) -> Result<u32, KernelError> {
+    if !state::probe_syscall_stack(rsp, 16) {
+        return Ok(0xC000_0005);
+    }
+    crate::ntos::se::token::filter::filter_from_user(token_argument(1, existing), flags as u32, sids_to_disable, privileges_to_delete, stack_arg(rsp, 5), stack_arg(rsp, 6))
+}
+
 /// NtPrivilegeCheck(ClientToken, RequiredPrivileges, Result), como o 19041:
 /// o token com TOKEN_QUERY (um token de impersonação abaixo de
 /// SecurityIdentification dá STATUS_BAD_IMPERSONATION_LEVEL); o
@@ -550,4 +560,5 @@ pub fn init() {
     state::register_handler("NtQueryInformationToken", nt_query_information_token);
     state::register_handler("NtAllocateLocallyUniqueId", nt_allocate_locally_unique_id);
     state::register_handler("NtQuerySecurityAttributesToken", nt_query_security_attributes_token);
+    state::register_handler("NtFilterToken", nt_filter_token);
 }

@@ -1,7 +1,12 @@
-//! SeFilterToken: um token novo, restrito a partir de outro.
+//! SeFilterToken e NtFilterToken: um token novo, restrito a partir de outro.
 //!
 //! ntoskrnl 10.0.19041: SeFilterToken 0x798c70 -> SepFilterToken 0x5db0fc
-//! (KernelMode) -> SepRemoveDisabledGroupsAndPrivileges 0x5da360.
+//! (KernelMode) -> SepRemoveDisabledGroupsAndPrivileges 0x5da360; o
+//! NtFilterToken 0x5d9fb0 captura as listas de modo usuário e chama o mesmo
+//! SepFilterToken (`filter_from_user`). O CreateRestrictedToken da
+//! kernelbase chega aqui: o dwminit do winlogon com os privilégios do DWM a
+//! tirar, e o ScMakeServiceTokenWriteRestricted do services.exe com
+//! WRITE_RESTRICTED para os serviços de SID restrito.
 //!
 //! - Entrada: TOKEN_GROUPS SidsToDisable, TOKEN_PRIVILEGES PrivilegesToDelete
 //!   e TOKEN_GROUPS RestrictedSids (Attributes não nulos nestes são
@@ -27,23 +32,31 @@
 //!   LUA_TOKEN aplica a máscara de privilégios do LUA e cada LUID 2..=0x24
 //!   de PrivilegesToDelete sai. Perder privilégios marca IS_FILTERED.
 //!
-//! O token resultante volta referenciado e sem handle. A verificação de
-//! token sandboxed de quem chama (SepNewTokenAsRestrictedAsProcessToken) não
-//! se aplica: o OpenNT não tem processos sandboxed chamando de modo kernel.
+//! O SeFilterToken devolve o token referenciado e sem handle. A verificação
+//! de token sandboxed de quem chama (SepNewTokenAsRestrictedAsProcessToken)
+//! não se aplica a ele: o OpenNT não tem processos sandboxed chamando de
+//! modo kernel.
 
 use alloc::vec::Vec;
 use core::cell::Cell;
 
 use crate::ntos::inc::field::Field;
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::ps::process;
+use crate::ntos::ps::{process, user_probe};
+use crate::ntos::se::capture;
 use crate::ntos::se::model::{sid, Group, Sid};
 use crate::ntos::se::security_attributes;
 use crate::ntos::se::sid as sids;
-use crate::ntos::se::token::{capability_access, tokens};
+use crate::ntos::se::token::{capability_access, duplicate, handles as token_handles, reference as token_reference, thread as thread_tokens, tokens};
 use crate::rtl::KernelError;
 
 pub const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
+const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+const STATUS_NO_TOKEN: u32 = 0xC000_007C;
+const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
+const TOKEN_DUPLICATE: u32 = 0x2;
+const USER_MODE: u8 = 1;
 
 /// Flags de SeFilterToken.
 pub const DISABLE_MAX_PRIVILEGE: u32 = 0x1;
@@ -127,13 +140,25 @@ pub fn filter_token(existing: u64, flags: u32, sids_to_disable: u64, privileges_
     if restricted.iter().any(|(_, attributes)| *attributes != 0) {
         return Ok(STATUS_INVALID_PARAMETER);
     }
+    Ok(match filter(existing, flags, &disable, &delete, &restricted)? {
+        Ok(token) => {
+            filtered.set(token);
+            0
+        }
+        Err(status) => status,
+    })
+}
+
+/// SepFilterToken sobre as listas já capturadas: o token novo, referenciado
+/// e sem handle, ou o NTSTATUS da recusa.
+fn filter(existing: u64, flags: u32, disable: &[(Sid, u32)], delete: &[u32], restricted: &[(Sid, u32)]) -> Result<Result<u64, u32>, KernelError> {
     let source = tokens::get(existing).ok_or_else(|| KernelError::new("SeFilterToken: invalid token"))?;
     let source_flags = tokens::body(existing).token_flags.get();
     if flags & WRITE_RESTRICTED != 0 && source_flags & RESTRICTION_FLAGS != 0 {
-        return Ok(STATUS_INVALID_PARAMETER);
+        return Ok(Err(STATUS_INVALID_PARAMETER));
     }
     if restricted.iter().any(|(identifier, _)| is_app_package_identifier(identifier, 2) || is_app_package_identifier(identifier, 3)) {
-        return Ok(STATUS_INVALID_PARAMETER);
+        return Ok(Err(STATUS_INVALID_PARAMETER));
     }
     let kept: Vec<Group> = restricted
         .iter()
@@ -144,7 +169,7 @@ pub fn filter_token(existing: u64, flags: u32, sids_to_disable: u64, privileges_
     let modified = tokens::allocate_luid();
     if !source.restricted_sids.is_empty() && kept.is_empty() {
         tokens::allocate_luid();
-        return Ok(STATUS_INVALID_PARAMETER);
+        return Ok(Err(STATUS_INVALID_PARAMETER));
     }
     let sandbox_inert = flags & SANDBOX_INERT != 0 && caller_is_system_context();
     let groups_filtered = Cell::new(false);
@@ -195,7 +220,7 @@ pub fn filter_token(existing: u64, flags: u32, sids_to_disable: u64, privileges_
                 let mask = if elevated { LUA_ELEVATED_MASK } else { LUA_MASK };
                 token.privileges.retain(|privilege| privilege.id < 64 && (mask >> privilege.id) & 1 != 0);
             }
-            for &luid in &delete {
+            for &luid in delete {
                 if (2..=0x24).contains(&luid) {
                     token.privileges.retain(|privilege| privilege.id != luid as u64);
                 }
@@ -218,6 +243,124 @@ pub fn filter_token(existing: u64, flags: u32, sids_to_disable: u64, privileges_
         token_flags |= TOKEN_IS_FILTERED;
     }
     tokens::body(token).token_flags.set(token_flags);
-    filtered.set(token);
-    Ok(0)
+    Ok(Ok(token))
+}
+
+/// Um TOKEN_GROUPS ou TOKEN_PRIVILEGES de modo usuário do NtFilterToken: o
+/// ponteiro alinhado a 4, o primeiro byte sondado e o contador lido; o
+/// vetor que segue (de +8 ou +4) vai à captura com esse contador.
+fn user_count(pointer: u64) -> Result<u32, u32> {
+    if pointer & 3 != 0 {
+        return Err(STATUS_DATATYPE_MISALIGNMENT);
+    }
+    if !user_probe::probe_user_read(pointer, 1) {
+        return Err(STATUS_ACCESS_VIOLATION);
+    }
+    guest::try_read::<u32>(pointer).map_err(|_| STATUS_ACCESS_VIOLATION)
+}
+
+/// As três listas de modo usuário do NtFilterToken, na ordem do 19041:
+/// SidsToDisable (com os Attributes zerados no buffer de quem chama antes da
+/// captura), PrivilegesToDelete e RestrictedSids; a primeira falha para.
+fn capture_user_lists(sids_to_disable: u64, privileges_to_delete: u64, restricted_sids: u64) -> Result<(Vec<(Sid, u32)>, Vec<u32>, Vec<(Sid, u32)>), u32> {
+    let pairs = |groups: Vec<Group>| groups.into_iter().map(|group| (group.sid, group.attributes)).collect::<Vec<_>>();
+    let mut disable = Vec::new();
+    if sids_to_disable != 0 {
+        let count = user_count(sids_to_disable)?;
+        for index in 0..count as u64 {
+            let attributes = sids_to_disable + 16 + index * 16;
+            if !user_probe::probe_user_write(attributes, 4) || guest::try_write::<u32>(attributes, 0).is_err() {
+                return Err(STATUS_ACCESS_VIOLATION);
+            }
+        }
+        disable = pairs(capture::sid_and_attributes_array(sids_to_disable + 8, count, USER_MODE)?);
+    }
+    let mut delete = Vec::new();
+    if privileges_to_delete != 0 {
+        let count = user_count(privileges_to_delete)?;
+        // O SepRemoveDisabledGroupsAndPrivileges só olha o LowPart.
+        delete = capture::luid_and_attributes_array(privileges_to_delete + 4, count, USER_MODE)?.iter().map(|privilege| privilege.id as u32).collect();
+    }
+    let mut restricted = Vec::new();
+    if restricted_sids != 0 {
+        let count = user_count(restricted_sids)?;
+        restricted = pairs(capture::sid_and_attributes_array(restricted_sids + 8, count, USER_MODE)?);
+    }
+    Ok((disable, delete, restricted))
+}
+
+/// NtFilterToken(ExistingTokenHandle, Flags, SidsToDisable,
+/// PrivilegesToDelete, RestrictedSids, NewTokenHandle) de modo usuário
+/// (ntoskrnl 19041, 0x5d9fb0): o NewTokenHandle sondado para escrita; as
+/// três listas capturadas (`capture_user_lists`); um SID restrito com
+/// Attributes não nulos é STATUS_INVALID_PARAMETER antes do handle; o token
+/// de origem pelo handle com TOKEN_DUPLICATE; o SepFilterToken; o token novo
+/// recebe o descritor do SeAssignSecurity de quem chama (o dono e a DACL
+/// padrão dele, com o TOKEN_QUERY de Administrators do
+/// SepFinalizeTokenAcls) e um handle com o acesso concedido ao handle de
+/// origem (o ObInsertObjectEx); por fim o handle vai ao NewTokenHandle.
+///
+/// Lacuna: quem chama de um token sandboxed (o
+/// SepNewTokenAsRestrictedAsProcessToken do 19041) recebe
+/// STATUS_NOT_SUPPORTED, com registro.
+pub fn filter_from_user(handle: u64, flags: u32, sids_to_disable: u64, privileges_to_delete: u64, restricted_sids: u64, output: u64) -> Result<u32, KernelError> {
+    if !user_probe::probe_user_write(output, 8) {
+        return Ok(STATUS_ACCESS_VIOLATION);
+    }
+    let (disable, delete, restricted) = match capture_user_lists(sids_to_disable, privileges_to_delete, restricted_sids) {
+        Ok(lists) => lists,
+        Err(status) => return Ok(status),
+    };
+    if restricted.iter().any(|(_, attributes)| *attributes != 0) {
+        return Ok(STATUS_INVALID_PARAMETER);
+    }
+    let mut reference = match token_reference::reference(handle, TOKEN_DUPLICATE, USER_MODE, false)? {
+        Ok(reference) => reference,
+        Err(status) => return Ok(status),
+    };
+    let mut created = 0;
+    let result = (|| -> Result<u32, KernelError> {
+        if caller_is_sandboxed() {
+            crate::debug_print!("[se] NtFilterToken de um token sandboxed sem suporte");
+            return Ok(STATUS_NOT_SUPPORTED);
+        }
+        let Some(subject) = thread_tokens::effective(process::get_current_thread(), false) else { return Ok(STATUS_NO_TOKEN) };
+        let creation = match duplicate::capture_creation(0, USER_MODE, subject) {
+            Ok(creation) => creation,
+            Err(status) => return Ok(status),
+        };
+        created = match filter(reference.token, flags, &disable, &delete, &restricted)? {
+            Ok(token) => token,
+            Err(status) => return Ok(status),
+        };
+        tokens::update(created, |token| token.security = creation.policy.clone());
+        let new_handle = match token_handles::create(created, reference.granted_access, 0, true) {
+            Ok(new_handle) => new_handle,
+            Err(error) if error.status != 0 => return Ok(error.status),
+            Err(error) => return Err(error),
+        };
+        if guest::try_write::<u64>(output, new_handle).is_err() {
+            return Ok(STATUS_ACCESS_VIOLATION);
+        }
+        Ok(0)
+    })();
+    if created != 0 {
+        tokens::release(created)?;
+    }
+    reference.release()?;
+    result
+}
+
+/// RtlIsSandboxedToken do token efetivo de quem chama: integridade abaixo
+/// de Medium ou AppContainer.
+fn caller_is_sandboxed() -> bool {
+    const MEDIUM_RID: u32 = 0x2000;
+    thread_tokens::effective(process::get_current_thread(), false)
+        .and_then(|token| tokens::with(token, |token| integrity_rid(&token.integrity) < MEDIUM_RID || token.app_container.is_some()))
+        .unwrap_or(false)
+}
+
+/// A última subautoridade de um SID de integridade (0 sem nenhuma).
+pub(super) fn integrity_rid(integrity: &Sid) -> u32 {
+    integrity.len().checked_sub(4).filter(|&at| at >= 8).map_or(0, |at| u32::from_le_bytes([integrity[at], integrity[at + 1], integrity[at + 2], integrity[at + 3]]))
 }

@@ -3393,6 +3393,16 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   da sessão do processo (o SeSubProcessToken do
   PspInitializeProcessSecurity), e quem cria precisa do
   SeAssignPrimaryTokenPrivilege habilitado no token efetivo.
+- **Tokens restritos** (`se/token/filter.rs`, `se/capture.rs`): o
+  NtFilterToken de modo usuário (o CreateRestrictedToken da kernelbase)
+  captura SidsToDisable, PrivilegesToDelete e RestrictedSids com o
+  SeCaptureSidAndAttributesArray e o SeCaptureLuidAndAttributesArray,
+  referencia o token com TOKEN_DUPLICATE e passa pelo mesmo SepFilterToken
+  do SeFilterToken. O token novo recebe o descritor do SeAssignSecurity de
+  quem chama (com o TOKEN_QUERY de Administrators) e um handle com o acesso
+  do handle de origem. O dwminit do winlogon tira assim os privilégios do
+  token da conta DWM-n, e o services.exe faz o token WRITE_RESTRICTED dos
+  serviços de SID restrito.
 - **O servidor de comandos do Reference Monitor** (`se/reference_monitor.rs`
   sobre o lado servidor LPC de modo kernel de `alpc/lpc.rs`): o
   SeRmInitPhase1 cria a porta LPC `\SeRmCommandPort` (ZwCreatePort,
