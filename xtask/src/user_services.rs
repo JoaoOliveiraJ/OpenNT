@@ -37,6 +37,11 @@ pub fn system_keys(control_set: &str) -> Vec<HostKey> {
         }
         registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\Control\\ServiceGroupOrder"), &format!("{control_set}\\Control\\ServiceGroupOrder"), false, &mut keys);
         registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\Control\\LsaExtensionConfig"), &format!("{control_set}\\Control\\LsaExtensionConfig"), true, &mut keys);
+        // Os valores do LSA (os pacotes de autenticação e de notificação que
+        // o lsass carrega, o tipo de produto) e os do MSV1_0, sem as
+        // subchaves com a chave de boot da instalação (JD, Skew1, GBG, Data).
+        registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\Control\\Lsa"), &format!("{control_set}\\Control\\Lsa"), false, &mut keys);
+        registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\Control\\Lsa\\MSV1_0"), &format!("{control_set}\\Control\\Lsa\\MSV1_0"), false, &mut keys);
     }
     #[cfg(not(windows))]
     let _ = control_set;

@@ -335,6 +335,14 @@ const SMSS_PROGRAMS: &[&str] = &[
     "dpapisrv.dll",
     "ntasn1.dll",
     "shcore.dll",
+    // O servidor da configuração de segurança que o services.exe carrega
+    // (ext-ms-win-scesrv-server) e o pacote de notificação dele no lsass.
+    "scesrv.dll",
+    "scecli.dll",
+    // O pacote de autenticação do LSA (Control\Lsa, Authentication
+    // Packages) que atende o LogonUserExExW dos serviços.
+    "msv1_0.dll",
+    "ntlmshared.dll",
 ];
 
 /// As imagens de kernel do caminho do smss (`--initial-process=smss`): o
