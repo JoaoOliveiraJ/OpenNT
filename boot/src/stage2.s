@@ -4,8 +4,9 @@
 # 1. E820 (mapa de memoria) -> 0x4FF0 (count u16) / 0x5000 (entradas 24B)
 # 2. A20 via porta 0x92
 # 3. Modo protegido (GDT flat)
-# 4. Kernel do disco p/ 0x100000 via ATA PIO (LBA 65, sem BIOS) e conferencia
-#    do cabecalho PE (ImageBase, SizeOfImage, entrada)
+# 4. Kernel do disco p/ 0x100000 (LBA 65, sem BIOS) por DMA de barramento do
+#    controlador IDE, com ATA PIO como reserva, e conferencia do cabecalho PE
+#    (ImageBase, SizeOfImage, entrada)
 # 5. Paginacao: identidade transitoria so de [0, 2MB) (este codigo enquanto
 #    liga a paginacao), mapa direto em 0xFFFFB000_00000000 (2MB pages, NX),
 #    imagem do kernel na sua ImageBase de sistema (PTEs de 4KB) e pilha de
@@ -167,13 +168,155 @@ stage2_pm32:
     mov al, 'P'
     call stage2_putc32
 
-    # ---- ATA PIO: kernel_sectors setores do LBA KERNEL_LBA p/ 0x100000
+    # ---- kernel_sectors setores do LBA KERNEL_LBA p/ 0x100000 ----
+    # Por DMA de barramento (bus master IDE): um READ DMA leva ate 256
+    # setores direto para a memoria, sem uma porta de I/O por palavra. Sem
+    # controlador IDE com bus master no barramento PCI 0, ou com erro num
+    # comando, o resto sai por ATA PIO, um setor por comando.
+    # esi = LBA, edi = destino, [stage2_sectors_left] = setores que faltam.
     movzx ecx, word ptr [kernel_sectors]
     test ecx, ecx
     jz stage2_no_disk
     mov dword ptr [stage2_sectors_left], ecx
     mov esi, {KERNEL_LBA}
     mov edi, {KERNEL_PHYS}
+
+    # Controlador IDE (classe 01.01) no barramento 0 com o canal primario em
+    # modo de compatibilidade (0x1F0) e bus master (progif bit 0 = 0, bit 7
+    # = 1), pelo mecanismo 1 de configuracao PCI (0xCF8/0xCFC).
+    xor ebx, ebx
+stage2_pci_scan:
+    mov eax, ebx
+    or eax, 0x80000008          # classe, subclasse, progif, revisao
+    mov dx, 0xCF8
+    out dx, eax
+    mov dx, 0xCFC
+    in eax, dx
+    mov ecx, eax
+    shr ecx, 16
+    cmp cx, 0x0101
+    jne stage2_pci_next
+    and ah, 0x81
+    cmp ah, 0x80
+    je stage2_pci_found
+stage2_pci_next:
+    add ebx, 0x100              # proxima funcao (32 dispositivos x 8)
+    cmp ebx, 0x10000
+    jb stage2_pci_scan
+    jmp stage2_sector
+stage2_pci_found:
+    mov eax, ebx
+    or eax, 0x80000020          # BAR4: I/O do bus master
+    mov dx, 0xCF8
+    out dx, eax
+    mov dx, 0xCFC
+    in eax, dx
+    test al, 1
+    jz stage2_sector
+    and eax, 0xFFFC
+    jz stage2_sector
+    mov ebp, eax                # ebp = base do bus master do canal primario
+    mov eax, ebx
+    or eax, 0x80000004          # comando: espaco de I/O + bus master
+    mov dx, 0xCF8
+    out dx, eax
+    mov dx, 0xCFC
+    in ax, dx
+    or ax, 0x05
+    out dx, ax
+
+stage2_dma_command:
+    mov ecx, dword ptr [stage2_sectors_left]
+    cmp ecx, 256
+    jbe stage2_dma_count
+    mov ecx, 256
+stage2_dma_count:
+    # Tabela PRD: o destino e 64 KB alinhado e cada comando leva ate 128
+    # KB, entao no maximo duas entradas de 64 KB (tamanho 0 = 64 KB),
+    # nenhuma cruzando 64 KB; bit 15 da ultima = fim da tabela.
+    mov eax, ecx
+    shl eax, 9
+    mov dword ptr [stage2_prd], edi
+    cmp eax, 0x10000
+    jbe stage2_dma_single
+    mov dword ptr [stage2_prd + 4], 0
+    lea edx, [edi + 0x10000]
+    mov dword ptr [stage2_prd + 8], edx
+    sub eax, 0x10000
+    mov word ptr [stage2_prd + 12], ax
+    mov word ptr [stage2_prd + 14], 0x8000
+    jmp stage2_dma_table
+stage2_dma_single:
+    mov word ptr [stage2_prd + 4], ax
+    mov word ptr [stage2_prd + 6], 0x8000
+stage2_dma_table:
+    mov edx, ebp
+    xor eax, eax
+    out dx, al                  # bus master parado
+    add edx, 4
+    lea eax, [stage2_prd]
+    out dx, eax                 # endereco da tabela PRD
+    mov edx, ebp
+    add edx, 2
+    mov al, 0x06                # limpa os bits de interrupcao e de erro
+    out dx, al
+    mov dx, 0x1F7
+stage2_dma_wait_ready:
+    in al, dx
+    test al, 0x80
+    jnz stage2_dma_wait_ready
+    mov dx, 0x1F2
+    mov al, cl                  # 256 setores = 0
+    out dx, al
+    mov dx, 0x1F3
+    mov eax, esi
+    out dx, al
+    shr eax, 8
+    mov dx, 0x1F4
+    out dx, al
+    shr eax, 8
+    mov dx, 0x1F5
+    out dx, al
+    shr eax, 8
+    and al, 0x0F
+    or al, 0xE0
+    mov dx, 0x1F6
+    out dx, al
+    mov dx, 0x1F7
+    mov al, 0xC8                # READ DMA
+    out dx, al
+    mov edx, ebp
+    mov al, 0x09                # inicia, do disco para a memoria
+    out dx, al
+    add edx, 2
+    # O bus master fica ativo (bit 0) ate o fim da tabela; erro no bit 1.
+stage2_dma_wait:
+    in al, dx
+    test al, 0x02
+    jnz stage2_dma_failed
+    test al, 0x01
+    jnz stage2_dma_wait
+    mov edx, ebp
+    xor eax, eax
+    out dx, al                  # bus master parado
+    mov dx, 0x1F7
+stage2_dma_wait_done:
+    in al, dx
+    test al, 0x80
+    jnz stage2_dma_wait_done
+    test al, 0x21               # ERR ou DF
+    jnz stage2_sector
+    add esi, ecx
+    shl ecx, 9
+    add edi, ecx
+    shr ecx, 9
+    sub dword ptr [stage2_sectors_left], ecx
+    jnz stage2_dma_command
+    jmp stage2_no_disk
+stage2_dma_failed:
+    mov edx, ebp
+    xor eax, eax
+    out dx, al                  # bus master parado; o resto vai por PIO
 stage2_sector:
     mov dx, 0x1F7
 stage2_wait_busy:
@@ -422,6 +565,7 @@ stage2_lm64:
     jne stage2_bad_kernel
     mov eax, dword ptr [stage2_entry_rva]
     add rax, rbx
+    xor ebp, ebp                # fim da cadeia de quadros do kernel
     jmp rax
 stage2_bad_kernel:
     mov al, '!'
@@ -459,5 +603,10 @@ stage2_image_size:
 
 stage2_sectors_left:
     .long 0
+
+# Tabela PRD do DMA (duas entradas: endereco, tamanho, fim).
+.balign 8
+stage2_prd:
+    .long 0, 0, 0, 0
 .popsection
 .code64
