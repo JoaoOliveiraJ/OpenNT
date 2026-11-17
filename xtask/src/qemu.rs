@@ -62,6 +62,78 @@ fn wait_finished<T>(handle: &thread::JoinHandle<T>, timeout: Duration) -> bool {
     true
 }
 
+/// A pasta temporária de cada QEMU, dentro da pasta de build. Um disco com
+/// `snapshot=on` grava as escritas do convidado num arquivo `vl.XXXXXX` na
+/// pasta temporária do processo, e o QEMU só o apaga quando sai sozinho; o
+/// QEMU morto no fim de um teste o deixaria na pasta temporária do usuário.
+/// Com TMP/TEMP/TMPDIR apontando para esta pasta, o arquivo fica junto da
+/// execução e sai com ela.
+pub const QEMU_TEMP_DIR: &str = "qemu-tmp";
+
+/// Variáveis de ambiente da pasta temporária: o GLib do QEMU lê a TEMP no
+/// Windows e a TMPDIR fora dele; a TMP é a do GetTempPath.
+const TEMP_VARIABLES: [&str; 3] = ["TMP", "TEMP", "TMPDIR"];
+
+/// Apaga uma pasta temporária de QEMU. O Windows só libera os arquivos
+/// abertos um instante depois do fim do processo, então a remoção tenta de
+/// novo por até um segundo.
+pub fn remove_temp_dir(directory: &Path) {
+    for attempt in 0..10 {
+        if !directory.exists() || std::fs::remove_dir_all(directory).is_ok() {
+            return;
+        }
+        if attempt < 9 {
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+    eprintln!("aviso: {} ficou para tras", directory.display());
+}
+
+/// A pasta temporária de um QEMU, vazia ao criar e apagada no `drop`. Quem
+/// a guarda precisa soltá-la depois do processo do QEMU (a ordem inversa da
+/// declaração faz isso numa função).
+pub struct QemuTemp(PathBuf);
+
+impl QemuTemp {
+    /// A pasta [`QEMU_TEMP_DIR`] ao lado de `beside` (o log da serial).
+    pub fn beside(beside: &Path) -> Result<QemuTemp, String> {
+        let directory = temp_dir_beside(beside);
+        remove_temp_dir(&directory);
+        std::fs::create_dir_all(&directory).map_err(|error| format!("{}: {error}", directory.display()))?;
+        Ok(QemuTemp(directory))
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+
+    /// Deixa a pasta no disco (o QEMU segue rodando depois da função que a
+    /// criou); [`temp_dir_beside`] dá o caminho para apagá-la depois.
+    fn keep(self) {
+        std::mem::forget(self);
+    }
+}
+
+/// A pasta temporária do QEMU cujo log da serial é `log`.
+pub fn temp_dir_beside(log: &Path) -> PathBuf {
+    log.with_file_name(QEMU_TEMP_DIR)
+}
+
+impl Drop for QemuTemp {
+    fn drop(&mut self) {
+        remove_temp_dir(&self.0);
+    }
+}
+
+/// O comando do QEMU com a pasta temporária dada.
+fn qemu_command(qemu: &Path, temp: &Path) -> Command {
+    let mut command = Command::new(qemu);
+    for variable in TEMP_VARIABLES {
+        command.env(variable, temp);
+    }
+    command
+}
+
 /// Localiza o QEMU: variável `QEMU`, PATH, ou a instalação padrão.
 pub fn find_qemu() -> Result<PathBuf, String> {
     if let Ok(path) = std::env::var("QEMU") {
@@ -213,9 +285,11 @@ fn machine_arguments(disks: &Disks, machine: &MachineOptions, no_reboot: bool) -
 
 /// QEMU em segundo plano (com janela, ou sem tela com `window` falso), a
 /// COM1 num arquivo (o terminal fica para o prompt do depurador) e a COM2
-/// no socket do depurador.
+/// no socket do depurador. A pasta temporária dele é a [`QEMU_TEMP_DIR`]
+/// ao lado do log: quem para o QEMU a apaga com [`remove_temp_dir`].
 pub fn spawn(disks: &Disks, machine: &MachineOptions, log: &Path, window: bool) -> Result<Child, String> {
     let qemu = find_qemu()?;
+    let temp = QemuTemp::beside(log)?;
     let mut arguments = machine_arguments(disks, machine, true);
     if !window {
         arguments.extend(["-display".to_string(), "none".to_string()]);
@@ -226,19 +300,23 @@ pub fn spawn(disks: &Disks, machine: &MachineOptions, log: &Path, window: bool) 
         arguments.extend(["-monitor".to_string(), format!("tcp:127.0.0.1:{port},server=on,wait=off")]);
     }
     println!("QEMU com o log do kernel em {}", log.display());
-    Command::new(&qemu).args(&arguments).stdin(Stdio::null()).spawn().map_err(|error| format!("{}: {error}", qemu.display()))
+    let child = qemu_command(&qemu, temp.path()).args(&arguments).stdin(Stdio::null()).spawn().map_err(|error| format!("{}: {error}", qemu.display()))?;
+    // A pasta fica enquanto o QEMU roda.
+    temp.keep();
+    Ok(child)
 }
 
 /// Shell interativo numa janela do QEMU; a serial fica neste terminal.
 pub fn run(disks: &Disks, machine: &MachineOptions) -> Result<(), String> {
     let qemu = find_qemu()?;
+    let temp = QemuTemp::beside(&disks.boot)?;
     let mut arguments = machine_arguments(disks, machine, true);
     arguments.extend(["-serial".to_string(), "stdio".to_string()]);
     arguments.extend(kd_serial(machine));
     if let Some(port) = machine.kd_port {
         eprintln!("depurador do kernel: COM2 em 127.0.0.1:{port} (cargo xtask debug --connect=127.0.0.1:{port}, ou target remote no GDB)");
     }
-    let status = Command::new(&qemu)
+    let status = qemu_command(&qemu, temp.path())
         .args(&arguments)
         .status()
         .map_err(|error| format!("{}: {error}", qemu.display()))?;
@@ -657,11 +735,11 @@ fn with_current_rtc(arguments: &[String]) -> Vec<String> {
     fresh
 }
 
-fn launch(qemu: &Path, arguments: &[String], output: &Arc<Mutex<String>>, events_port: Option<u16>) -> Result<Machine, String> {
+fn launch(qemu: &Path, temp: &Path, arguments: &[String], output: &Arc<Mutex<String>>, events_port: Option<u16>) -> Result<Machine, String> {
     // Cada QEMU (também o religado de um ciclo de energia) começa com o
     // relógio da CMOS na hora local corrente.
     let arguments = with_current_rtc(arguments);
-    let mut child = Command::new(qemu)
+    let mut child = qemu_command(qemu, temp)
         .args(&arguments)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -765,8 +843,11 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
         None
     };
     arguments.extend(kd_serial(machine));
+    // A pasta temporária sai depois do QEMU: declarada antes da máquina, ela
+    // é solta depois dela também nos retornos de erro.
+    let temp = QemuTemp::beside(log)?;
     let output = Arc::new(Mutex::new(String::new()));
-    let current = std::cell::RefCell::new(launch(&qemu, &arguments, &output, events_port)?);
+    let current = std::cell::RefCell::new(launch(&qemu, temp.path(), &arguments, &output, events_port)?);
     let cycles_left = std::cell::Cell::new(test.power_cycles);
     // A vigia da tela roda durante o teste; o QMP atende um cliente por vez,
     // então ela para antes da captura do fim.
@@ -807,7 +888,7 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
             cycles_left.set(cycles_left.get() - 1);
             output.lock().unwrap().push_str("\n[xtask] o convidado desligou a maquina; QEMU religado sobre o mesmo disco\n");
             println!("\n[xtask] QEMU religado sobre o mesmo disco");
-            *machine = launch(&qemu, &arguments, &output, events_port)?;
+            *machine = launch(&qemu, temp.path(), &arguments, &output, events_port)?;
             return Ok(None);
         }
         Ok(Some(format!("{status}, evento SHUTDOWN do QMP: {}", reason.as_deref().unwrap_or("nenhum"))))
@@ -928,6 +1009,7 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
     }
     drop(machine.process);
     machine.reader.take();
+    drop(temp);
     if let Some(copy) = &data_copy {
         let _ = std::fs::remove_file(copy);
     }
@@ -947,6 +1029,41 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
 mod tests {
     use super::*;
     use crate::png::Image;
+
+    /// O QEMU recebe a pasta temporária da execução nas três variáveis, e a
+    /// pasta sai inteira no fim, com o que o processo deixou nela (o arquivo
+    /// `vl.XXXXXX` de um disco com snapshot=on de um QEMU morto).
+    #[test]
+    fn qemu_temporary_files_stay_in_the_run_directory() {
+        let root = std::env::temp_dir().join(format!("opennt-qemu-tmp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let log = root.join("serial.log");
+        let directory = temp_dir_beside(&log);
+        // Uma sobra de uma execução anterior sai ao criar.
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("vl.antigo"), b"x").unwrap();
+        let temp = QemuTemp::beside(&log).unwrap();
+        assert_eq!(temp.path(), directory);
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+        let command = qemu_command(Path::new("qemu"), temp.path());
+        for variable in TEMP_VARIABLES {
+            let value = command.get_envs().find(|(name, _)| *name == variable).and_then(|(_, value)| value);
+            assert_eq!(value, Some(directory.as_os_str()), "{variable}");
+        }
+        // Um processo filho grava na pasta temporária que recebeu.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            let mut child = qemu_command(Path::new("cmd"), temp.path());
+            let status = child.raw_arg("/C echo x> \"%TEMP%\\vl.ABC123\"").status().unwrap();
+            assert!(status.success());
+            assert!(directory.join("vl.ABC123").is_file());
+        }
+        drop(temp);
+        assert!(!directory.exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     fn screen(width: usize, height: usize, fill: [u8; 3]) -> Image {
         Image { width, height, rgb: fill.iter().copied().cycle().take(width * height * 3).collect() }

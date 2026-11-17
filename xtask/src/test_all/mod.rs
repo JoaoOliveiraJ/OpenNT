@@ -361,6 +361,10 @@ fn execute(context: &Context, run: &Run, test: &Test, build: Duration) -> Result
         thread::sleep(Duration::from_millis(200));
     };
     context.running.fetch_sub(1, Ordering::SeqCst);
+    // O test-boot apaga a pasta temporária do QEMU ao terminar; um test-boot
+    // morto pelo prazo não chega lá, e o volume com snapshot=on deixaria o
+    // arquivo de escritas dele na pasta da execução que falhou.
+    crate::qemu::remove_temp_dir(&directory.join(crate::qemu::QEMU_TEMP_DIR));
     result
 }
 

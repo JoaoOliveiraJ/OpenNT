@@ -433,12 +433,15 @@ fn debug_command(arguments: Arguments) -> Result<(), String> {
     if arguments.no_client {
         let qemu = qemu::spawn(&qemu::Disks::beside(&output.image, &options.storage), &machine, &log, !arguments.headless)?;
         let monitor = machine.monitor_port.map(|port| format!("127.0.0.1:{port}"));
-        return debug::serve(qemu, &address, monitor.as_deref());
+        let result = debug::serve(qemu, &address, monitor.as_deref());
+        qemu::remove_temp_dir(&qemu::temp_dir_beside(&log));
+        return result;
     }
     let mut qemu = qemu::spawn(&qemu::Disks::beside(&output.image, &options.storage), &machine, &log, true)?;
     let result = debug::interactive(&address, &root, &elf);
     let _ = qemu.kill();
     let _ = qemu.wait();
+    qemu::remove_temp_dir(&qemu::temp_dir_beside(&log));
     result
 }
 
