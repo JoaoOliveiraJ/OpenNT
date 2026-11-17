@@ -2848,7 +2848,9 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
 - **Memória entre processos** (`ps/user/memory.rs`, `mm/copy_virtual.rs`):
   - NtAllocateVirtualMemory(Ex), NtFreeVirtualMemory e
     NtProtectVirtualMemory (PROCESS_VM_OPERATION) e NtQueryVirtualMemory
-    (PROCESS_QUERY_INFORMATION) agem sobre o processo do handle
+    (PROCESS_QUERY_LIMITED_INFORMATION; PROCESS_QUERY_INFORMATION nas
+    classes 1, 4 e 11 para quem não é administrador nem tem
+    SeProfileSingleProcessPrivilege) agem sobre o processo do handle
     (`memory::with_process_handle`, o ObReferenceObjectByHandle em UserMode:
     pseudo-handle, tabela de quem chama, direito ausente →
     STATUS_ACCESS_DENIED, processo retido durante a operação). Os ponteiros

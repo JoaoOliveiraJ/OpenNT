@@ -765,6 +765,29 @@ fn user_virtual_memory(assert: Assert) {
     assert(memory::nt_read_virtual_memory(u64::MAX, data + 0x100, data + 0x200, 6, transfer_rsp).is_ok_and(|status| status == 0) && guest::read_bytes(data + 0x200, 6) == b"OpenNT" && guest::read64(data + 0x900) == 6, "usermemory: NtReadVirtualMemory copia e informa o total");
     assert(memory::nt_read_virtual_memory(u64::MAX, reserved + 0x1FFC, data + 0x300, 8, transfer_rsp).is_ok_and(|status| status == 0x8000_000D) && guest::read64(data + 0x900) == 4, "usermemory: copia parcial ate a pagina nao confirmada");
     assert(memory::nt_write_virtual_memory(u64::MAX, reserved + 0x1000, data + 0x200, 4, transfer_rsp).is_ok_and(|status| status == 0x8000_000D) && guest::read64(data + 0x900) == 0, "usermemory: escrita recusada pela PTE somente leitura");
+    // NtQueryVirtualMemory por classe, como o MmQueryVirtualMemory do 19041:
+    // a classe 8 igual à 0, o MEM_FREE com PAGE_NOACCESS, as classes de VAD
+    // num endereço livre com STATUS_INVALID_ADDRESS, a imagem de memória
+    // privada zerada, o RegionType e o ReturnLength pelo comprimento.
+    let (info_out, returned, query_rsp) = (data + 0x400, data + 0x480, block + 0xC0);
+    let query = |base: u64, class: u64, length: u64| {
+        guest::write64(query_rsp + 0x28, length);
+        guest::write64(query_rsp + 0x30, returned);
+        guest::write64(returned, 0xDEAD);
+        guest::write_bytes(info_out, &[0xCC; 0x30]);
+        memory_query::query_virtual_memory(u64::MAX, base, class, info_out, query_rsp).unwrap_or(1)
+    };
+    // SAFETY: buffer de usuário confirmado deste processo.
+    let basic = unsafe { nt::MemoryBasicInformation::at(info_out) };
+    // SAFETY: o mesmo buffer, lido como MEMORY_REGION_INFORMATION.
+    let region_info = unsafe { nt::MemoryRegionInformation::at(info_out) };
+    assert(query(data, 8, 0x30) == 0 && guest::read64(returned) == 0x30 && basic.base_address.get() == data && basic.allocation_base.get() == data && basic.type_.get() == 0x2_0000 && basic.state.get() == 0x1000, "queryuser: MemoryPrivilegedBasicInformation igual a MemoryBasicInformation");
+    assert(query(unreserved, 0, 0x30) == 0 && basic.state.get() == 0x1_0000 && basic.protect.get() == 1 && basic.allocation_base.get() == 0 && basic.type_.get() == 0, "queryuser: endereco livre com PAGE_NOACCESS");
+    assert([2, 3, 6, 7].iter().all(|&class| query(unreserved, class, 0x30) == 0xC000_0141 && guest::read64(returned) == 0xDEAD), "queryuser: classes de VAD num endereco livre dao STATUS_INVALID_ADDRESS");
+    assert(query(data, 6, 0x18) == 0 && guest::read64(returned) == 0x18 && guest::read_bytes(info_out, 0x18).iter().all(|&byte| byte == 0) && query(data, 2, 0x100) == 0xC000_0141, "queryuser: memoria privada sem imagem nem nome");
+    assert(query(data, 3, 0x18) == 0 && guest::read64(returned) == 0x18 && region_info.region_type.get() == 0x2_0000 && region_info.region_size.get() == 0x3000 && region_info.commit_size.get() == 0xCCCC_CCCC_CCCC_CCCC, "queryuser: MemoryRegionInformation de 24 bytes com o Type da regiao");
+    assert(query(data, 3, 0x30) == 0 && guest::read64(returned) == 0x30 && region_info.commit_size.get() == 0x3000 && region_info.node_preference.get() == 0xFFFF_FFFF && query(data, 7, 0x20) == 0 && guest::read64(returned) == 0x20 && region_info.region_type.get() == 1, "queryuser: MemoryRegionInformation inteira e RegionInformationEx privada");
+    assert(query(data, 3, 0x17) == 0xC000_0004 && query(data, 0, 0x2F) == 0xC000_0004 && query(data, 9, 0x30) == 0xC000_0003 && query(data, 10, 0x30) == 0xC000_0003 && query(0x7FFF_FFFF_0000, 0, 0x30) == 0xC000_000D, "queryuser: classe, comprimento e endereco recusados");
     // NtFreeVirtualMemory: decommit e release.
     let free = |base: u64, size: u64, kind: u64| {
         guest::write64(base_pointer, base);
