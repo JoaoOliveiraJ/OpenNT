@@ -4025,6 +4025,22 @@ fn rtl_group_exports(assert: Assert) {
     assert(casing.as_ref().map_or_else(|error| error.message.contains("l_intl"), |&upper| upper == b'A' as u16 && call("RtlEqualUnicodeString", &[first, second, 1]) == 1), "rtl: RtlEqualUnicodeString sem caixa pela tabela l_intl.nls (ou ausencia reportada)");
     let lower = block + 0x80;
     assert(call("RtlDowncaseUnicodeString", &[lower, second, 1]) == 0 && guest_strings_read(lower) == "opennt" && call("RtlFreeUnicodeString", &[lower]) == 0 && at::<nt::UnicodeString>(lower).buffer.get() == 0, "rtl: RtlDowncaseUnicodeString aloca e RtlFreeUnicodeString libera");
+    // Sem alocar, o destino só precisa de Source.Length (sem lugar para NUL,
+    // como o nome do protocolo que o NdisRegisterProtocolDriver sobe no
+    // próprio bloco): o texto vai sem terminador e o byte seguinte fica; com
+    // MaximumLength menor que Source.Length, STATUS_BUFFER_OVERFLOW.
+    let exact = block + 0x1C0;
+    let exact_text = block + 0x1E0;
+    guest::write_bytes(exact_text, &[0xAAu8; 16]);
+    let exact_string = at::<nt::UnicodeString>(exact);
+    exact_string.length.set(0);
+    exact_string.maximum_length.set(10);
+    exact_string.buffer.set(exact_text);
+    let source = unicode_at(block + 0x200, "tcpip");
+    let upcased = call("RtlUpcaseUnicodeString", &[exact, source, 0]);
+    assert(upcased == 0 && exact_string.length.get() == 10 && guest_strings_read(exact) == "TCPIP" && guest::read_bytes(exact_text + 10, 2) == [0xAA, 0xAA], "rtl: RtlUpcaseUnicodeString com MaximumLength igual a Source.Length, sem NUL");
+    exact_string.maximum_length.set(8);
+    assert(call("RtlUpcaseUnicodeString", &[exact, source, 0]) as u32 == 0x8000_0005, "rtl: RtlUpcaseUnicodeString sem espaco devolve STATUS_BUFFER_OVERFLOW");
     // Inteiros.
     let value = block + 0x100;
     let number = unicode_at(block + 0xC0, "0x1F");
@@ -4069,6 +4085,20 @@ fn rtl_group_exports(assert: Assert) {
     assert(call("_snprintf_s", &[block + 0x290, 4, u32::MAX as u64, block + 0x270, 123_456]) == 3 && guest_strings::read_c_string(block + 0x290) == "123", "rtl: _snprintf_s trunca com _TRUNCATE");
     guest_strings::write_wide_string(block + 0x2A0, "%u-%X");
     assert(call("swprintf_s", &[block + 0x2C0, 16, block + 0x2A0, 7, 255]) == 4 && guest_strings::read_wide_string(block + 0x2C0) == "7-FF", "rtl: swprintf_s");
+    // Os argumentos variádicos além dos registradores e dos 14 do trampolim
+    // vêm da pilha do chamador: o caminho de um objeto do NetworkSetup2 que
+    // o ndis.sys monta (13 argumentos depois do formato, o último %ws).
+    let path_format = guest::alloc_bytes(0x400);
+    guest_strings::write_wide_string(path_format, "\\NetworkSetup2\\%ws\\{%08x-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x}%ws");
+    guest_strings::write_wide_string(path_format + 0x100, "Interfaces");
+    guest_strings::write_wide_string(path_format + 0x140, "\\Kernel");
+    let guid_args = [0x0BB5_C712, 0x33A7, 0x4FD3, 0x8E, 0x99, 0xCA, 0x24, 0x3E, 0x03, 0x14, 0x2C];
+    let mut arguments = alloc::vec![path_format + 0x200, 0x80, path_format, path_format + 0x100];
+    arguments.extend_from_slice(&guid_args);
+    arguments.push(path_format + 0x140);
+    let written = call("swprintf_s", &arguments);
+    assert(written == 71 && guest_strings::read_wide_string(path_format + 0x200) == "\\NetworkSetup2\\Interfaces\\{0bb5c712-33a7-4fd3-8e99-ca243e03142c}\\Kernel", "rtl: swprintf_s le os argumentos variadicos da pilha do chamador");
+    guest::free_bytes(path_format);
     guest_strings::write_wide_string(block + 0x2E0, "AbC");
     guest_strings::write_wide_string(block + 0x2F0, "abc");
     assert(call("_wcsicmp", &[block + 0x2E0, block + 0x2F0]) == 0 && call("wcscmp", &[block + 0x2E0, block + 0x2F0]) as i64 == -1 && call("wcslen", &[block + 0x2E0]) == 3, "rtl: _wcsicmp, wcscmp e wcslen");

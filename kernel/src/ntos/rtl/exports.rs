@@ -152,10 +152,10 @@ fn strstr(call: &Call) -> Result<u64, KernelError> {
 }
 /// sprintf(buf, fmt, ...): seis argumentos variádicos.
 fn sprintf(call: &Call) -> Result<u64, KernelError> {
-    printf::sprintf(call.arg(1), call.arg(2), &[call.arg(3), call.arg(4), call.arg(5), call.arg(6), call.arg(7), call.arg(8)])
+    printf::sprintf(call.arg(1), call.arg(2), &mut |index| call.variadic_arg(3 + index))
 }
 fn snprintf(call: &Call) -> Result<u64, KernelError> {
-    printf::snprintf(call.arg(1), call.arg(2), call.arg(3), &[call.arg(4), call.arg(5), call.arg(6), call.arg(7), call.arg(8)])
+    printf::snprintf(call.arg(1), call.arg(2), call.arg(3), &mut |index| call.variadic_arg(4 + index))
 }
 fn random(call: &Call) -> Result<u64, KernelError> {
     Ok(math::random(call.arg(1)) as u64)
@@ -297,10 +297,10 @@ fn qsort(call: &Call) -> Result<u64, KernelError> {
 }
 /// _snprintf_s(buffer, size, count, format, ...).
 fn snprintf_s(call: &Call) -> Result<u64, KernelError> {
-    printf::snprintf_s(call.arg(1), call.arg(2) as u32, call.arg(3) as u32 as i32, call.arg(4), &[call.arg(5), call.arg(6), call.arg(7), call.arg(8), call.arg(9), call.arg(10)])
+    printf::snprintf_s(call.arg(1), call.arg(2) as u32, call.arg(3) as u32 as i32, call.arg(4), &mut |index| call.variadic_arg(5 + index))
 }
 fn swprintf_s(call: &Call) -> Result<u64, KernelError> {
-    printf::swprintf_s(call.arg(1), call.arg(2) as u32 as u64, call.arg(3), &[call.arg(4), call.arg(5), call.arg(6), call.arg(7), call.arg(8), call.arg(9)])
+    printf::swprintf_s(call.arg(1), call.arg(2) as u32 as u64, call.arg(3), &mut |index| call.variadic_arg(4 + index))
 }
 fn vswprintf_s(call: &Call) -> Result<u64, KernelError> {
     printf::vswprintf_s(call.arg(1), call.arg(2) as u32 as u64, call.arg(3), call.arg(4))
@@ -1029,7 +1029,7 @@ pub mod rtl_crt_extended {
         Ok(crt::wcsncpy_s(call.arg(1), call.arg(2), call.arg(3), call.arg(4)))
     }
     fn snwprintf(call: &Call) -> Result<u64, KernelError> {
-        printf::snwprintf(call.arg(1), call.arg(2), call.arg(3), &[call.arg(4), call.arg(5), call.arg(6), call.arg(7), call.arg(8), call.arg(9)])
+        printf::snwprintf(call.arg(1), call.arg(2), call.arg(3), &mut |index| call.variadic_arg(4 + index))
     }
     fn wcslwr(call: &Call) -> Result<u64, KernelError> {
         Ok(crt::wcslwr(call.arg(1)))
@@ -1367,7 +1367,7 @@ pub mod crt_formatting {
     }
     /// Variádicos: do quarto argumento em diante.
     fn sprintf_s(call: &Call) -> Result<u64, KernelError> {
-        printf::sprintf_s(call.arg(1), call.arg(2), call.arg(3), &call.args[3..])
+        printf::sprintf_s(call.arg(1), call.arg(2), call.arg(3), &mut |index| call.variadic_arg(4 + index))
     }
 
     pub static GROUP: Group = Group {
@@ -2551,7 +2551,7 @@ pub mod rtl_crt_snwprintf_s {
 
     /// _snwprintf_s(buffer, sizeOfBuffer, count, format, ...) -> int.
     fn snwprintf_s(call: &Call) -> Result<u64, KernelError> {
-        printf::snwprintf_s(call.arg(1), call.arg(2), call.arg(3), call.arg(4), &[call.arg(5), call.arg(6), call.arg(7), call.arg(8), call.arg(9), call.arg(10)])
+        printf::snwprintf_s(call.arg(1), call.arg(2), call.arg(3), call.arg(4), &mut |index| call.variadic_arg(5 + index))
     }
 
     pub static GROUP: Group = Group { name: "rtl-crt-snwprintf-s", names: &["_snwprintf_s"], handlers: &[snwprintf_s], data_exports: &[] };

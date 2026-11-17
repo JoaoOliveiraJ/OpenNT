@@ -4,8 +4,10 @@
 //! vDbgPrintExWithPrefix.
 //!
 //! O texto sai do formatador comum (`guest_strings::format_guest_text`); as
-//! variantes variádicas recebem os argumentos já lidos, as `v*` leem a
-//! va_list do convidado. Cada rotina devolve o valor de retorno da CRT.
+//! variantes variádicas recebem o leitor dos argumentos (o adaptador os lê
+//! dos registradores e da pilha do chamador, sem limite de quantidade, como
+//! o va_start da CRT), as `v*` leem a va_list do convidado. Cada rotina
+//! devolve o valor de retorno da CRT.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -14,14 +16,9 @@ use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::rtl::{crt, guest_strings};
 use crate::rtl::KernelError;
 
-/// Argumento variádico `index` (zero além dos lidos).
-fn variadic(arguments: &[u64]) -> impl FnMut(usize) -> u64 + '_ {
-    move |index| arguments.get(index).copied().unwrap_or(0)
-}
-
 /// sprintf(buf, fmt, ...): devolve o tamanho do texto.
-pub fn sprintf(buffer: u64, format: u64, arguments: &[u64]) -> Result<u64, KernelError> {
-    let text = guest_strings::format_guest_text(&guest_strings::read_c_string(format), &mut variadic(arguments), false)?;
+pub fn sprintf(buffer: u64, format: u64, arguments: &mut dyn FnMut(usize) -> u64) -> Result<u64, KernelError> {
+    let text = guest_strings::format_guest_text(&guest_strings::read_c_string(format), arguments, false)?;
     crt::write_c_text(buffer, &text, None);
     Ok(text.len() as u64)
 }
@@ -44,8 +41,8 @@ pub fn vsprintf(buffer: u64, format: u64, va_list: u64) -> Result<u64, KernelErr
 }
 
 /// _snprintf(buf, count, fmt, ...).
-pub fn snprintf(buffer: u64, count: u64, format: u64, arguments: &[u64]) -> Result<u64, KernelError> {
-    let text = guest_strings::format_guest_text(&guest_strings::read_c_string(format), &mut variadic(arguments), false)?;
+pub fn snprintf(buffer: u64, count: u64, format: u64, arguments: &mut dyn FnMut(usize) -> u64) -> Result<u64, KernelError> {
+    let text = guest_strings::format_guest_text(&guest_strings::read_c_string(format), arguments, false)?;
     Ok(guest_strings::write_formatted_text(buffer, count, &text, false, false) as u64)
 }
 
@@ -58,8 +55,8 @@ pub fn vsnprintf(buffer: u64, count: u64, format: u64, va_list: u64) -> Result<u
 
 /// _snprintf_s(buffer, size, count, format, ...): _TRUNCATE (-1) limita ao
 /// buffer; truncar com `count` explícito devolve -1.
-pub fn snprintf_s(buffer: u64, size: u32, count: i32, format: u64, arguments: &[u64]) -> Result<u64, KernelError> {
-    let text = guest_strings::format_guest_text(&guest_strings::read_c_string(format), &mut variadic(arguments), false)?;
+pub fn snprintf_s(buffer: u64, size: u32, count: i32, format: u64, arguments: &mut dyn FnMut(usize) -> u64) -> Result<u64, KernelError> {
+    let text = guest_strings::format_guest_text(&guest_strings::read_c_string(format), arguments, false)?;
     let capacity = size as i64;
     let limit = if count < 0 { capacity - 1 } else { (count as i64).min(capacity - 1) };
     let bytes = text.as_bytes();
@@ -82,8 +79,8 @@ pub fn vsnwprintf(buffer: u64, count: u64, format: u64, va_list: u64) -> Result<
 
 /// _snwprintf(wchar_t*, size_t, const wchar_t*, ...): formatador largo
 /// (semântica legada: -1 quando a saída não cabe).
-pub fn snwprintf(buffer: u64, count: u64, format: u64, arguments: &[u64]) -> Result<u64, KernelError> {
-    let text = guest_strings::format_guest_text(&guest_strings::read_wide_string(format), &mut variadic(arguments), true)?;
+pub fn snwprintf(buffer: u64, count: u64, format: u64, arguments: &mut dyn FnMut(usize) -> u64) -> Result<u64, KernelError> {
+    let text = guest_strings::format_guest_text(&guest_strings::read_wide_string(format), arguments, true)?;
     Ok(guest_strings::write_formatted_text(buffer, count, &text, true, true) as u64)
 }
 
@@ -93,7 +90,7 @@ pub fn snwprintf(buffer: u64, count: u64, format: u64, arguments: &[u64]) -> Res
 /// WCHARs e o NUL; mais texto que isso devolve -1 com o texto truncado. Senão
 /// grava até SizeOfBuffer - 1 e o NUL; truncar devolve -1, mantendo o texto
 /// só com count = _TRUNCATE (senão Buffer[0] = 0).
-pub fn snwprintf_s(buffer: u64, size: u64, count: u64, format: u64, arguments: &[u64]) -> Result<u64, KernelError> {
+pub fn snwprintf_s(buffer: u64, size: u64, count: u64, format: u64, arguments: &mut dyn FnMut(usize) -> u64) -> Result<u64, KernelError> {
     const FAILED: u64 = -1i64 as u64;
     if format == 0 {
         return Ok(FAILED);
@@ -104,7 +101,7 @@ pub fn snwprintf_s(buffer: u64, size: u64, count: u64, format: u64, arguments: &
     if buffer == 0 || size == 0 {
         return Ok(FAILED);
     }
-    let text = guest_strings::format_guest_text(&guest_strings::read_wide_string(format), &mut variadic(arguments), true)?;
+    let text = guest_strings::format_guest_text(&guest_strings::read_wide_string(format), arguments, true)?;
     let units: Vec<u16> = text.encode_utf16().collect();
     // O auxiliar da CRT grava até capacity - 1 WCHARs e o NUL.
     let capacity = if size > count { count + 1 } else { size };
@@ -150,8 +147,8 @@ pub fn swprintf(buffer: u64, format: u64, arguments: &[u64]) -> Result<u64, Kern
 }
 
 /// swprintf_s(buffer, capacity, format, ...).
-pub fn swprintf_s(buffer: u64, capacity: u64, format: u64, arguments: &[u64]) -> Result<u64, KernelError> {
-    let text = guest_strings::format_guest_text(&guest_strings::read_wide_string(format), &mut variadic(arguments), true)?;
+pub fn swprintf_s(buffer: u64, capacity: u64, format: u64, arguments: &mut dyn FnMut(usize) -> u64) -> Result<u64, KernelError> {
+    let text = guest_strings::format_guest_text(&guest_strings::read_wide_string(format), arguments, true)?;
     Ok(write_wide_bounded(buffer, capacity, &text))
 }
 
@@ -231,8 +228,8 @@ fn print_secure(buffer: u64, size: u64, format: u64, arguments: &mut dyn FnMut(u
 
 /// sprintf_s(Buffer, SizeOfBuffer, Format, ...): o va_list começa no quarto
 /// argumento.
-pub fn sprintf_s(buffer: u64, size: u64, format: u64, arguments: &[u64]) -> Result<u64, KernelError> {
-    print_secure(buffer, size, format, &mut variadic(arguments))
+pub fn sprintf_s(buffer: u64, size: u64, format: u64, arguments: &mut dyn FnMut(usize) -> u64) -> Result<u64, KernelError> {
+    print_secure(buffer, size, format, arguments)
 }
 
 /// vsprintf_s(Buffer, SizeOfBuffer, Format, ArgList).

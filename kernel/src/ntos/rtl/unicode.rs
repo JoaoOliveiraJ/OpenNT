@@ -8,8 +8,6 @@
 //! concatenação, a duplicação, a validação e o hash X65599 das
 //! UNICODE_STRING.
 
-use alloc::vec::Vec;
-
 use super::unicode_case::upcase_char;
 use crate::ntos::inc::types::{Field, Guid, NtStruct, UnicodeString};
 use crate::ntos::mm::guest_memory as guest;
@@ -227,36 +225,47 @@ pub fn init(output: u64, source: u64) {
     guest_strings::write_string_fields(output, count * 2, count * 2 + 2, source);
 }
 
-/// Escreve o texto numa UNICODE_STRING de destino (alocando se pedido ou
-/// sem buffer; respeitando MaximumLength). Devolve o NTSTATUS.
-fn write_converted_string(destination: &UnicodeString, text: &str, allocate: bool) -> u32 {
-    let units: Vec<u16> = text.encode_utf16().collect();
-    let needed = units.len() as u64 * 2 + 2;
-    let mut buffer = destination.buffer.get();
-    if allocate || buffer == 0 {
-        buffer = guest::alloc_bytes(needed);
+/// 'Strg', a etiqueta do ExpAllocateStringRoutine.
+const STRING_POOL_TAG: u32 = 0x6772_7453;
+const STATUS_NO_MEMORY: u32 = 0xC000_0017;
+
+/// A troca de caixa com destino do RtlUpcaseUnicodeString e do
+/// RtlDowncaseUnicodeString (ntoskrnl 19041, 0x62f0c0 e 0x67b500): com
+/// AllocateDestinationString, MaximumLength = Source.Length e o buffer do
+/// ExpAllocateStringRoutine (falha = STATUS_NO_MEMORY); sem ele, Source.Length
+/// acima do MaximumLength do destino = STATUS_BUFFER_OVERFLOW. Cada WCHAR de
+/// Source.Length passa pela tabela (um para um), o destino recebe
+/// Length = Source.Length e nenhum NUL é gravado.
+fn convert_case(destination: u64, source: u64, allocate: bool, convert: fn(u16) -> u16) -> u32 {
+    // SAFETY: PUNICODE_STRING do chamador.
+    let (destination, source) = unsafe { (UnicodeString::at(destination), UnicodeString::at(source)) };
+    let length = source.length.get();
+    if allocate {
+        destination.maximum_length.set(length);
+        let buffer = crate::ntos::ex::pool_allocation::allocate_tagged(1, length as u64, STRING_POOL_TAG).unwrap_or(0);
         destination.buffer.set(buffer);
-        destination.maximum_length.set(needed as u16);
-    } else if (destination.maximum_length.get() as u64) < needed {
+        if buffer == 0 {
+            return STATUS_NO_MEMORY;
+        }
+    } else if length > destination.maximum_length.get() {
         return STATUS_BUFFER_OVERFLOW;
     }
-    guest::write_bytes(buffer, &guest_strings::wide_bytes_with_nul(text));
-    destination.length.set(units.len() as u16 * 2);
+    let (from, to) = (source.buffer.get(), destination.buffer.get());
+    for index in 0..(length as u64 >> 1) {
+        guest::write16(to + index * 2, convert(guest::read16(from + index * 2)));
+    }
+    destination.length.set(length);
     0
 }
 
-/// RtlUpcaseUnicodeString.
+/// RtlUpcaseUnicodeString: NLS_UPCASE por WCHAR.
 pub fn upcase_string(destination: u64, source: u64, allocate: bool) -> u32 {
-    let text = guest_strings::read_unicode_string(source).to_uppercase();
-    // SAFETY: PUNICODE_STRING do chamador.
-    write_converted_string(unsafe { UnicodeString::at(destination) }, &text, allocate)
+    convert_case(destination, source, allocate, super::unicode_case::nls_upcase)
 }
 
-/// RtlDowncaseUnicodeString.
+/// RtlDowncaseUnicodeString: NLS_DOWNCASE por WCHAR.
 pub fn downcase_string(destination: u64, source: u64, allocate: bool) -> u32 {
-    let text = guest_strings::read_unicode_string(source).to_lowercase();
-    // SAFETY: PUNICODE_STRING do chamador.
-    write_converted_string(unsafe { UnicodeString::at(destination) }, &text, allocate)
+    convert_case(destination, source, allocate, super::unicode_case::nls_downcase)
 }
 
 /// RtlPrefixUnicodeString.
