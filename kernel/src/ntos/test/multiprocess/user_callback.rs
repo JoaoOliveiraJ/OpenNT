@@ -24,7 +24,15 @@
 //!   NtCallbackReturn(NULL, 0, 0x777);
 //! - uma entrada maior que o espaço do usuário falha na sonda com
 //!   STATUS_ACCESS_VIOLATION sem rodar callback;
-//! - o NtCallbackReturn fora de um callback dá STATUS_NO_CALLBACK_ACTIVE.
+//! - o NtCallbackReturn fora de um callback dá STATUS_NO_CALLBACK_ACTIVE;
+//! - a API 4 espera de dentro do callback: uma syscall cujo serviço espera
+//!   no kernel (`context_switch::wait_until`) e outra que volta PENDING com
+//!   uma espera adiada (`threads::wait_custom`). As duas condições só
+//!   concluem quando o despachante as sonda com a thread fora da CPU (o
+//!   intervalo encerrado, `usermode::executing()` falso): a thread deixa a
+//!   CPU dentro do callback, como no NT, e é retomada com o status de cada
+//!   espera (o do serviço retomado e o RAX do callback) antes de devolver
+//!   0x4444. Uma espera girada no lugar desiste com 0xBAD.
 //!
 //! Depois de cada callback a KTHREAD volta à pilha anterior, o aninhamento
 //! cai e a pilha do callback volta ao Mm. Sem o KeUserModeCallback (ou sem
@@ -33,19 +41,20 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+use alloc::boxed::Box;
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 use super::identity::with_test_process;
 use crate::hal::amd64::usermode;
 use crate::ntos::ex::service_table;
 use crate::ntos::inc::types::extra_fs_fat::KernelStackControl;
 use crate::ntos::inc::types::{Context, Ethread, Kthread, NtStruct};
-use crate::ntos::ke::pcr;
+use crate::ntos::ke::{context_switch, dispatcher, pcr};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::ke::user_callback;
 use crate::ntos::mm::pe_loader::{self, LoadOptions};
 use crate::ntos::mm::{kernel_stack, memory_map, peb_teb};
-use crate::ntos::ps::user::threads::{self, UserThread};
+use crate::ntos::ps::user::threads::{self, UserThread, Wait};
 use crate::ntos::ps::user::{loader, memory, state};
 use crate::ntos::ps::{cid, process};
 use crate::ntos::test::phase6::call_export;
@@ -56,6 +65,11 @@ type Assert = fn(bool, &str);
 const CALLBACK_SERVICE: u32 = 0x1000;
 const PROBE_SERVICE: u32 = 0x1001;
 const EXIT_SERVICE: u32 = 0x1002;
+const KERNEL_WAIT_SERVICE: u32 = 0x1003;
+const DEFERRED_WAIT_SERVICE: u32 = 0x1004;
+/// Sondagens com a thread na CPU depois das quais uma espera de teste
+/// desiste (o bloqueio dentro do callback não aconteceu).
+const IN_PLACE_LIMIT: u32 = 20_000;
 /// A entrada da API 1: 37 bytes (não múltiplo de 16).
 const INPUT_LENGTH: u32 = 37;
 /// Uma entrada que não cabe no espaço do usuário.
@@ -93,6 +107,12 @@ opennt_ucb_start:
     mov r10, rcx
     syscall
     mov dword ptr [rip + opennt_ucb_main4], eax
+    mov ecx, 4
+    xor edx, edx
+    mov eax, {callback}
+    mov r10, rcx
+    syscall
+    mov dword ptr [rip + opennt_ucb_main6], eax
     xor ecx, ecx
     xor edx, edx
     xor r8d, r8d
@@ -161,6 +181,25 @@ opennt_ucb_routine3:
     mov eax, 0x777
     ret
 
+.global opennt_ucb_routine4
+opennt_ucb_routine4:
+    mov eax, {kernel_wait}
+    mov r10, rcx
+    syscall
+    mov dword ptr [rip + opennt_ucb_r4_kernel], eax
+    mov eax, {deferred_wait}
+    mov r10, rcx
+    syscall
+    mov dword ptr [rip + opennt_ucb_r4_deferred], eax
+    xor ecx, ecx
+    xor edx, edx
+    mov r8d, 0x4444
+    mov eax, 5
+    mov r10, rcx
+    syscall
+opennt_ucb_r4_hang:
+    jmp opennt_ucb_r4_hang
+
 .balign 16
 .global opennt_ucb_data
 opennt_ucb_data:
@@ -174,8 +213,12 @@ opennt_ucb_r1_after: .long 0xFFFFFFFF
 opennt_ucb_r1_length: .long 0
 opennt_ucb_r1_buffer: .quad 0
 opennt_ucb_r1_rsp: .quad 0
+opennt_ucb_main6: .long 0xFFFFFFFF
+opennt_ucb_r4_kernel: .long 0xFFFFFFFF
+opennt_ucb_r4_deferred: .long 0xFFFFFFFF
+    .long 0
 .global opennt_ucb_table
-opennt_ucb_table: .quad 0, 0, 0, 0
+opennt_ucb_table: .quad 0, 0, 0, 0, 0
 .global opennt_ucb_output
 opennt_ucb_output: .zero 64
 .global opennt_ucb_end
@@ -185,6 +228,8 @@ opennt_ucb_end:
     callback = const CALLBACK_SERVICE,
     probe = const PROBE_SERVICE,
     exit = const EXIT_SERVICE,
+    kernel_wait = const KERNEL_WAIT_SERVICE,
+    deferred_wait = const DEFERRED_WAIT_SERVICE,
 );
 
 extern "C" {
@@ -192,6 +237,7 @@ extern "C" {
     static opennt_ucb_routine1: u8;
     static opennt_ucb_routine2: u8;
     static opennt_ucb_routine3: u8;
+    static opennt_ucb_routine4: u8;
     static opennt_ucb_data: u8;
     static opennt_ucb_table: u8;
     static opennt_ucb_output: u8;
@@ -214,8 +260,9 @@ fn program() -> &'static [u8] {
 }
 
 /// As células de resultado no começo dos dados: os cinco da principal, o
-/// do callback aninhado e o depois do NtCallbackReturn, e o último tamanho,
-/// buffer e RSP que a rotina 1 viu.
+/// do callback aninhado e o depois do NtCallbackReturn, o último tamanho,
+/// buffer e RSP que a rotina 1 viu, o sexto da principal (a API 4) e os
+/// status das duas esperas da rotina 4.
 mod cell {
     pub const MAIN: [u64; 5] = [0, 4, 8, 12, 16];
     pub const NESTED: u64 = 20;
@@ -223,6 +270,9 @@ mod cell {
     pub const LENGTH: u64 = 28;
     pub const BUFFER: u64 = 32;
     pub const RSP: u64 = 40;
+    pub const MAIN6: u64 = 48;
+    pub const KERNEL_WAIT: u64 = 52;
+    pub const DEFERRED_WAIT: u64 = 56;
 }
 
 /// O que um KeUserModeCallback devolveu, visto pelo serviço.
@@ -235,6 +285,11 @@ struct Record {
     output_matches: bool,
     frame_ok: bool,
     nesting: (u8, u8),
+    /// InitialStack, StackBase e StackLimit de volta aos de antes.
+    stacks_restored: bool,
+    /// Também a contagem de pilhas vivas (a do callback voltou ao Mm). Um
+    /// callback que deixou a CPU não a confere: as outras threads e os
+    /// workers criam e devolvem pilhas enquanto ele espera.
     restored: bool,
 }
 
@@ -247,8 +302,12 @@ struct Probe {
     frame: u64,
 }
 
-static SERVICE_TABLE: [AtomicU32; 3] = [const { AtomicU32::new(0) }; 3];
-static SERVICE_ARGUMENTS: [AtomicU8; 3] = [const { AtomicU8::new(0) }; 3];
+static SERVICE_TABLE: [AtomicU32; 5] = [const { AtomicU32::new(0) }; 5];
+static SERVICE_ARGUMENTS: [AtomicU8; 5] = [const { AtomicU8::new(0) }; 5];
+/// O despachante sondou cada espera da rotina 4 com a thread fora da CPU.
+static KERNEL_WAIT_LEFT_CPU: AtomicBool = AtomicBool::new(false);
+static DEFERRED_WAIT_LEFT_CPU: AtomicBool = AtomicBool::new(false);
+static DEFERRED_IN_PLACE: AtomicU32 = AtomicU32::new(0);
 static RECORDS: SpinLock<Vec<Record>> = SpinLock::new(Vec::new());
 static PROBES: SpinLock<Vec<Probe>> = SpinLock::new(Vec::new());
 /// A entrada (memória do kernel) e o programa copiado no processo.
@@ -305,7 +364,7 @@ extern "win64" fn callback_service(api: u64, mode: u64, _: u64, _: u64) -> u64 {
     let expected_output = CODE.load(Ordering::SeqCst) + offset(unsafe { &opennt_ucb_output });
     let output_matches = output == expected_output && (0..INPUT_LENGTH as u64).all(|index| guest::read8(output + index) == input_byte(index) ^ 0x5A);
     let frame_ok = mode == 1 || frame_matches(api, length, syscall);
-    RECORDS.lock().push(Record { api, status, output, output_length, output_matches, frame_ok, nesting: (nesting, tcb.callback_nesting_level.get()), restored: before == after });
+    RECORDS.lock().push(Record { api, status, output, output_length, output_matches, frame_ok, nesting: (nesting, tcb.callback_nesting_level.get()), stacks_restored: before.0 == after.0 && before.1 == after.1 && before.2 == after.2, restored: before == after });
     guest::free_bytes(out);
     status as u64
 }
@@ -324,6 +383,40 @@ extern "win64" fn probe_service(_: u64, _: u64, _: u64, _: u64) -> u64 {
         && kernel_stack::find(base).is_some_and(|stack| stack.initial == initial && stack.limit == limit);
     PROBES.lock().push(Probe { nesting: tcb.callback_nesting_level.get(), on_callback_stack, previous_initial: control.previous.initial_stack.get(), frame: control.previous.kernel_stack.get() });
     0
+}
+
+/// Uma espera de kernel de dentro do callback (o xxxSleepThread do win32k
+/// esperando outra thread): só conclui quando o despachante a sonda com a
+/// thread fora da CPU.
+extern "win64" fn kernel_wait_service(_: u64, _: u64, _: u64, _: u64) -> u64 {
+    let mut in_place = 0u32;
+    let status = context_switch::wait_until(
+        &mut || {
+            if !usermode::executing() {
+                KERNEL_WAIT_LEFT_CPU.store(true, Ordering::SeqCst);
+                return Some(0x55);
+            }
+            in_place += 1;
+            (in_place > IN_PLACE_LIMIT).then_some(0xBAD)
+        },
+        dispatcher::pump_kernel,
+    );
+    status as u64
+}
+
+/// Uma espera adiada de dentro do callback (a de um objeto, a de uma seção
+/// crítica): o serviço instala a espera e volta PENDING; ela só conclui
+/// quando o despachante a sonda com a thread fora da CPU.
+extern "win64" fn deferred_wait_service(_: u64, _: u64, _: u64, _: u64) -> u64 {
+    DEFERRED_IN_PLACE.store(0, Ordering::SeqCst);
+    let poll = || {
+        if !usermode::executing() {
+            DEFERRED_WAIT_LEFT_CPU.store(true, Ordering::SeqCst);
+            return Some(0x66);
+        }
+        (DEFERRED_IN_PLACE.fetch_add(1, Ordering::SeqCst) > IN_PLACE_LIMIT).then_some(0xBAD)
+    };
+    threads::wait_custom(Wait { poll: Some(Box::new(poll)), ..Wait::default() }, 0, Some(None)) as u64
 }
 
 /// NtTerminateThread da thread corrente.
@@ -349,6 +442,9 @@ fn allocate(size: u64, protect: u32) -> u64 {
 struct Outcome {
     ran: bool,
     main: [u32; 5],
+    main6: u32,
+    kernel_wait: u32,
+    deferred_wait: u32,
     nested: u32,
     after: u32,
     length: u32,
@@ -366,7 +462,7 @@ fn scenario() -> Option<Outcome> {
         let stack = kernel_stack::create(false).ok();
         let stack_base = stack.map_or(0, |stack| stack.base);
         let pointer = stack.and_then(|stack| process::create_kernel_thread(test.process, cid::ALLOCATE, true, 1, Some(stack)).ok());
-        let mut outcome = Outcome { ran: false, main: [0; 5], nested: 0, after: 0, length: 0, buffer: 0, routine_rsp: 0, original_initial: 0, restored: false, stacks_released: false };
+        let mut outcome = Outcome { ran: false, main: [0; 5], main6: 0, kernel_wait: 0, deferred_wait: 0, nested: 0, after: 0, length: 0, buffer: 0, routine_rsp: 0, original_initial: 0, restored: false, stacks_released: false };
         if let (Some(pointer), true) = (pointer, code != 0 && stacks != 0 && input != 0) {
             // SAFETY: ETHREAD recém-criada, retida pela thread de usuário.
             let ethread = unsafe { Ethread::at(pointer) };
@@ -383,7 +479,7 @@ fn scenario() -> Option<Outcome> {
             CODE.store(code, Ordering::SeqCst);
             guest::write_bytes(code, program());
             // SAFETY: os rótulos do programa.
-            let (table, routines) = unsafe { (code + offset(&opennt_ucb_table), [offset(&opennt_ucb_routine1), offset(&opennt_ucb_routine2), offset(&opennt_ucb_routine3)]) };
+            let (table, routines) = unsafe { (code + offset(&opennt_ucb_table), [offset(&opennt_ucb_routine1), offset(&opennt_ucb_routine2), offset(&opennt_ucb_routine3), offset(&opennt_ucb_routine4)]) };
             for (index, routine) in routines.iter().enumerate() {
                 guest::write64(table + (index as u64 + 1) * 8, code + routine);
             }
@@ -392,6 +488,8 @@ fn scenario() -> Option<Outcome> {
             outcome.original_initial = kthread(pointer).initial_stack.get();
             RECORDS.lock().clear();
             PROBES.lock().clear();
+            KERNEL_WAIT_LEFT_CPU.store(false, Ordering::SeqCst);
+            DEFERRED_WAIT_LEFT_CPU.store(false, Ordering::SeqCst);
             // A ntdll real do volume, mapeada no processo, publica o
             // despachante de callbacks durante o cenário.
             let ntdll = loader::ntfs_volume().and_then(|volume| volume.read_bytes("/Windows/System32/ntdll.dll").ok().flatten()).and_then(|bytes| pe_loader::load_user(bytes, &LoadOptions { notify_image: false, ..LoadOptions::default() }).ok());
@@ -407,6 +505,9 @@ fn scenario() -> Option<Outcome> {
             // SAFETY: os dados do programa.
             let data = code + unsafe { offset(&opennt_ucb_data) };
             outcome.main = cell::MAIN.map(|offset| guest::read32(data + offset));
+            outcome.main6 = guest::read32(data + cell::MAIN6);
+            outcome.kernel_wait = guest::read32(data + cell::KERNEL_WAIT);
+            outcome.deferred_wait = guest::read32(data + cell::DEFERRED_WAIT);
             outcome.nested = guest::read32(data + cell::NESTED);
             outcome.after = guest::read32(data + cell::AFTER);
             outcome.length = guest::read32(data + cell::LENGTH);
@@ -445,7 +546,7 @@ pub fn run(assert: Assert) {
         return;
     };
     let table = SERVICE_TABLE.as_ptr() as u64;
-    let routines: [extern "win64" fn(u64, u64, u64, u64) -> u64; 3] = [callback_service, probe_service, exit_service];
+    let routines: [extern "win64" fn(u64, u64, u64, u64) -> u64; 5] = [callback_service, probe_service, exit_service, kernel_wait_service, deferred_wait_service];
     let mut encoded = true;
     for (slot, routine) in SERVICE_TABLE.iter().zip(routines) {
         match service_table::encode_entry(table, routine as usize as u64, 0) {
@@ -453,7 +554,7 @@ pub fn run(assert: Assert) {
             Err(_) => encoded = false,
         }
     }
-    if !encoded || service_table::publish_shadow_second_table(table, 3, SERVICE_ARGUMENTS.as_ptr() as u64).is_err() {
+    if !encoded || service_table::publish_shadow_second_table(table, 5, SERVICE_ARGUMENTS.as_ptr() as u64).is_err() {
         assert(false, "callback: tabela 1 de teste");
         let _ = service_table::restore_shadow_second_table(saved_shadow);
         return;
@@ -466,15 +567,18 @@ pub fn run(assert: Assert) {
     assert(ok, "callback: thread de usuario com TEB, PEB e KernelCallbackTable no despachante");
     if let Some(outcome) = outcome.filter(|_| ok) {
         assert(outcome.main == [0x1234, 0x4321, 0x777, 0xC000_0005, 0xC000_0258], "callback: as syscalls da principal devolvem o status de cada NtCallbackReturn, ACCESS_VIOLATION na entrada grande e NO_CALLBACK_ACTIVE fora de um callback");
-        assert(records.len() == 5, "callback: cinco KeUserModeCallback (API 1, a 1 aninhada, a 2, a 3 e a entrada grande)");
-        if let [first, inner, second, third, huge] = records[..] {
+        assert(records.len() == 6, "callback: seis KeUserModeCallback (API 1, a 1 aninhada, a 2, a 3, a entrada grande e a 4)");
+        if let [first, inner, second, third, huge, fourth] = records[..] {
             assert(first.api == 1 && first.status == 0x1234 && first.output_length == INPUT_LENGTH && first.output_matches, "callback: a API 1 devolve pelo NtCallbackReturn o status, o buffer de saida transformado e o tamanho");
             assert(first.frame_ok && inner.frame_ok && second.frame_ok && third.frame_ok, "callback: UCALLOUT_FRAME abaixo do RSP da syscall (Buffer, Length, ApiNumber, RIP e RSP) com a entrada alinhada a 16");
             assert(inner.api == 1 && inner.status == 0x1234 && inner.output_matches && inner.nesting == (1, 1) && second.api == 2 && second.status == 0x4321 && second.output == 0 && second.output_length == 0 && outcome.nested == 0x1234, "callback: um callback aninhado dentro do callback da API 2");
             assert(third.api == 3 && third.status == 0x777 && third.output == 0 && third.output_length == 0, "callback: a rotina que retorna volta pelo NtCallbackReturn(NULL, 0, retorno) do KiUserCallbackDispatcher");
             assert(huge.status == 0xC000_0005 && huge.output == SENTINEL, "callback: entrada maior que a pilha do usuario falha na sonda com ACCESS_VIOLATION, sem saida");
             assert([first, inner, second, third, huge].iter().all(|record| record.restored && record.nesting.0 == record.nesting.1), "callback: depois de cada callback a KTHREAD volta a pilha anterior, o aninhamento cai e a pilha do callback volta ao Mm");
+            assert(fourth.api == 4 && fourth.status == 0x4444 && fourth.frame_ok && fourth.stacks_restored && fourth.nesting == (0, 0) && outcome.main6 == 0x4444, "callback: o callback que espera duas vezes volta pelo NtCallbackReturn com o proprio status, a pilha anterior e sem aninhamento");
         }
+        assert(outcome.kernel_wait == 0x55 && KERNEL_WAIT_LEFT_CPU.load(Ordering::SeqCst), "callback: uma espera de kernel dentro do callback deixa a CPU (o despachante a sonda com a thread fora dela) e o servico aninhado retoma com o status");
+        assert(outcome.deferred_wait == 0x66 && DEFERRED_WAIT_LEFT_CPU.load(Ordering::SeqCst), "callback: a espera PENDING de uma syscall aninhada deixa a CPU e o status chega ao RAX do callback");
         assert(probes.len() == 2, "callback: duas sondas (API 1 e a 1 aninhada)");
         if let [outer, nested] = probes[..] {
             assert(outer.nesting == 1 && outer.on_callback_stack && outer.previous_initial == outcome.original_initial && (outer.frame as i64) < 0, "callback: a syscall do callback roda na pilha nova (InitialStack, StackBase, StackLimit e RspBase), com a pilha anterior e o quadro do callout no KERNEL_STACK_CONTROL");

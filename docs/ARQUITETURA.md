@@ -955,15 +955,28 @@ DLL de sistema é mapeada), com os registradores do KiCallUserMode; as
 syscalls do callback caem na pilha nova, abaixo dos quadros do serviço de
 fora. `threads::run_callback` despacha esses intervalos até o
 NtCallbackReturn, que acha o quadro do callout pelo KERNEL_STACK_CONTROL da
-InitialStack corrente e grava a saída e o status: syscalls e timer seguem, a
-espera PENDING de um serviço aninhado é sondada no lugar (dentro de um
-callback a thread não bloqueia: `can_block` recusa com aninhamento), APCs e
+InitialStack corrente e grava a saída e o status: syscalls seguem, APCs e
 exceções são entregues no CONTEXT do callback e uma thread terminada encerra
-o laço. Na volta, a KTHREAD retoma a pilha anterior e a do callback volta ao
-Mm. O autoteste `ntos/test/multiprocess/user_callback.rs` roda callbacks
-simples, aninhados, a volta pelo NtCallbackReturn do KiUserCallbackDispatcher
-real, a entrada que não cabe na pilha e o NtCallbackReturn fora de um
-callback.
+o laço. Dentro do callback a thread continua escalonável, como no NT: os
+intervalos aninhados terminam no laço do callback, não no despachante, então
+é o laço que repassa a troca. Um serviço aninhado que bloqueia no kernel sai
+do intervalo aninhado com EXIT_BLOCKED e deixa o quadro de troca em
+KTHREAD.KernelStack; uma syscall aninhada que volta PENDING deixa a espera
+adiada instalada; o timer encerra o intervalo no fim do quantum. Nos três
+casos o laço põe na KTHREAD a pilha do serviço de fora (`CalloutStacks`),
+bloqueia esse serviço pela espera já instalada
+(`context_switch::block_installed_wait`) e o despachante roda as outras
+threads; retomado, o laço reinstala a pilha do callback e volta ao serviço
+aninhado (`usermode::resume_user_callback`, um intervalo aninhado que entra no
+quadro de troca salvo) ou põe o status da espera adiada no RAX do callback.
+Com callbacks aninhados cada nível repassa ao de fora até o despachante, e a
+retomada desce nível a nível. Na volta, a KTHREAD retoma a pilha anterior e a
+do callback volta ao Mm. O autoteste `ntos/test/multiprocess/user_callback.rs`
+roda callbacks simples, aninhados, a volta pelo NtCallbackReturn do
+KiUserCallbackDispatcher real, a entrada que não cabe na pilha, o
+NtCallbackReturn fora de um callback e um callback que espera no kernel e
+numa espera adiada, conferindo que o despachante sonda as duas com a thread
+fora da CPU.
 
 O espaço de usuário segue o Windows 10 19041 x64, sem nenhuma janela fixa
 além da KUSER_SHARED_DATA:

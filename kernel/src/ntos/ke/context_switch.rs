@@ -252,11 +252,26 @@ fn current_rsp() -> u64 {
 }
 
 /// Uma espera pode deixar a CPU: a thread corrente é a thread de usuário de
-/// uma syscall despachada nesta CPU (o BSP, no M0), roda na própria pilha de
-/// kernel e é a execução em curso (nada de contexto aninhado: um passo do
-/// escalonador, uma APC drenada em nome de outra thread, um callback de
-/// modo usuário), abaixo de
-/// DISPATCH_LEVEL e sem SpinLock nem SharedLock retidos.
+/// uma syscall despachada nesta CPU (o BSP, no M0), roda na pilha de kernel
+/// corrente dela (KTHREAD.InitialStack/StackLimit) e é a execução em curso
+/// (nada de contexto aninhado: um passo do escalonador, uma APC drenada em
+/// nome de outra thread), abaixo de DISPATCH_LEVEL e sem SpinLock nem
+/// SharedLock retidos.
+///
+/// Uma thread dentro de um KeUserModeCallback também bloqueia, como no NT
+/// (lá o KiCallUserMode só troca de pilha; a thread continua escalonável e
+/// uma syscall aninhada que espera passa pelo KiSwapContext como qualquer
+/// outra). Antes isto recusava com CallbackNestingLevel diferente de zero:
+/// a syscall aninhada roda num intervalo aninhado cujo `dispatcher_rsp` é o
+/// quadro do `usermode::exec_user_callback` na pilha do serviço de fora, e
+/// não o do despachante, então bloquear ali só voltava ao laço do callback,
+/// que não sabia repassar o bloqueio; a espera girava no lugar e nenhuma
+/// outra thread de usuário rodava até o callback acabar. Hoje esse laço
+/// (`threads::run_callback`) recebe o bloqueio (EXIT_BLOCKED), guarda o
+/// quadro de troca do serviço aninhado, bloqueia por sua vez o serviço de
+/// fora ([`block_installed_wait`]) e, retomado, volta ao aninhado
+/// (`usermode::resume_user_callback`). A pilha conferida aqui é a do
+/// callback, que o KeUserModeCallback instalou na KTHREAD.
 pub fn can_block() -> bool {
     let Some(thread) = threads::current() else { return false };
     let pointer = thread.pointer();
@@ -271,11 +286,6 @@ pub fn can_block() -> bool {
     }
     // SAFETY: a KTHREAD da thread corrente está viva enquanto ela executa.
     let kthread = unsafe { Kthread::at(pointer) };
-    // Dentro de um callback de modo usuário o intervalo é aninhado: quem o
-    // conclui é o laço do KeUserModeCallback, não o despachante.
-    if kthread.callback_nesting_level.get() != 0 {
-        return false;
-    }
     let (initial, limit, rsp) = (kthread.initial_stack.get(), kthread.stack_limit.get(), current_rsp());
     map::is_kernel_stack(initial) && rsp > limit && rsp < initial
 }
@@ -330,13 +340,49 @@ pub fn block_current(poll: &mut dyn FnMut() -> Option<u32>) -> u32 {
     if wait_irql != irql::PASSIVE_LEVEL {
         irql::lower_irql(irql::PASSIVE_LEVEL as u64);
     }
-    usermode::block_in_service(&kthread.kernel_stack);
-    // Retomada por `switch_to`, na própria pilha: nenhum quadro salvo.
-    kthread.kernel_stack.set(kthread.initial_stack.get());
+    leave_cpu(kthread);
     if wait_irql > irql::get_irql() {
         irql::raise_irql(wait_irql);
     }
     threads::take_kernel_wait_status(&thread)
+}
+
+/// A troca em si: o serviço em curso fica suspenso na pilha da thread e a CPU
+/// volta ao despachante do intervalo; volta aqui na retomada.
+fn leave_cpu(kthread: &Kthread) {
+    usermode::block_in_service(&kthread.kernel_stack);
+    // Retomada por `switch_to`, na própria pilha: nenhum quadro salvo.
+    kthread.kernel_stack.set(kthread.initial_stack.get());
+}
+
+/// Um nível de callback de modo usuário (`threads::run_callback`, no serviço
+/// que chamou o KeUserModeCallback) deixa a CPU por uma espera que já está
+/// instalada na thread corrente, com o serviço marcado bloqueado
+/// (`KernelState::Blocked`): a de um serviço aninhado que bloqueou e saiu
+/// pelo intervalo aninhado, ou a espera PENDING que uma syscall aninhada
+/// deixou. O despachante a sonda como qualquer outra e retoma este quadro
+/// quando ela conclui; o status fica com quem a instalou. `record_irql`
+/// grava o IRQL corrente em KTHREAD.WaitIrql (a espera é deste nível); sem
+/// ele fica o que o serviço aninhado gravou ao bloquear. Quem chama já pôs
+/// na KTHREAD a pilha do serviço de fora, a deste quadro. Devolve `false`,
+/// sem trocar, quando a thread não pode deixar a CPU aqui ([`can_block`]).
+pub fn block_installed_wait(record_irql: bool) -> bool {
+    if !can_block() {
+        return false;
+    }
+    let thread = threads::current().expect("bloqueio sem thread de usuario corrente");
+    // A espera pode ter concluído entre a instalação e aqui (o fim do
+    // processo a conclui): nada a esperar.
+    if thread.kernel_state() != (threads::KernelState::Blocked { status: None }) {
+        return true;
+    }
+    // SAFETY: a KTHREAD da thread corrente está viva enquanto ela executa.
+    let kthread = unsafe { Kthread::at(thread.pointer()) };
+    if record_irql {
+        kthread.wait_irql.set(irql::get_irql());
+    }
+    leave_cpu(kthread);
+    true
 }
 
 /// O lado de entrada do KiSwapContext, chamado pelo despachante com a thread

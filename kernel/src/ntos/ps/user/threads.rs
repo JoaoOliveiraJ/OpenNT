@@ -49,6 +49,7 @@ use super::memory;
 use super::process_state;
 use super::state::{self, probe_user_read, probe_user_write, NativeBody, Region, UserHandle, UserObject};
 use crate::hal::amd64::context_switch::EXIT_BLOCKED;
+use crate::ntos::ke::user_callback::CalloutStacks;
 use crate::ntos::ke::{apc, clock, context_switch, dispatcher, irql, smp, thread_alert, thread_dispatch, thread_priority};
 use crate::ntos::ob::objects::completion as completion_objects;
 use crate::ntos::ps::{alert_thread, cid, process, query_thread, set_thread_information, system_process_information};
@@ -1049,43 +1050,83 @@ pub fn block_in_kernel(thread: &UserThread, wait: Wait) {
 /// NtCallbackReturn dela). Enquanto isso o CONTEXT do callback é o da
 /// thread: a espera de um serviço aninhado conclui nele, e as APCs de
 /// usuário e as exceções são entregues nele. Cada saída é tratada como o
-/// despachante trataria: syscall e timer seguem; a espera PENDING de um
-/// serviço aninhado é sondada no lugar, girando os pumps (dentro do
-/// callback a thread não deixa a CPU, como `context_switch::can_block`
-/// garante); exceções e capturas passam pelo tratador de saída. Uma thread
-/// terminada (por outra, ou o fim do processo pedido de dentro do callback,
-/// que fica com o despachante) encerra o laço com STATUS_THREAD_IS_TERMINATING.
-/// Devolve 0 quando o callback retornou.
-pub fn run_callback(thread: &Arc<UserThread>, context: u64, returned: &dyn Fn() -> bool) -> u32 {
+/// despachante trataria: syscalls seguem; exceções e capturas passam pelo
+/// tratador de saída. Uma thread terminada (por outra, ou o fim do processo
+/// pedido de dentro do callback, que fica com o despachante) encerra o laço
+/// com STATUS_THREAD_IS_TERMINATING. Devolve 0 quando o callback retornou.
+///
+/// Dentro do callback a thread deixa a CPU como qualquer outra (no NT ela
+/// continua escalonável durante o KeUserModeCallback). Os intervalos
+/// aninhados terminam neste laço, não no despachante, então é ele que
+/// repassa a troca: este nível bloqueia o serviço de fora, na pilha de fora
+/// (`stacks`, o `ke::user_callback::CalloutStacks`), e o despachante roda
+/// as outras threads até a espera concluir. Três casos:
+///
+/// - um serviço aninhado bloqueou no kernel (uma espera do win32k, um
+///   KeWaitFor*): o intervalo aninhado saiu com EXIT_BLOCKED, a espera dele
+///   está instalada e o quadro de troca dele está em KTHREAD.KernelStack.
+///   O laço guarda o quadro, bloqueia e, retomado, volta ao serviço
+///   aninhado (`usermode::resume_user_callback`), que recebe o status;
+/// - uma syscall aninhada voltou PENDING com a espera adiada instalada (as
+///   esperas de objeto, de alerta por id, das seções críticas): o laço a
+///   sonda uma vez, bloqueia e, retomado, põe o status no RAX do CONTEXT do
+///   callback;
+/// - o timer encerrou o intervalo aninhado (o fim do quantum): a thread
+///   cede a vez com uma espera que conclui na primeira sondagem, como uma
+///   thread fora de callback no fim do intervalo.
+///
+/// Com callbacks aninhados cada nível repassa ao de fora, até o
+/// despachante, e a retomada desce nível a nível. Se a troca não couber
+/// (só com o estado do serviço de fora impróprio, o que o bloqueio do
+/// aninhado já excluiu), a espera é sondada aqui, girando os pumps.
+pub fn run_callback(thread: &Arc<UserThread>, context: u64, returned: &dyn Fn() -> bool, stacks: &CalloutStacks) -> u32 {
     let (outer, teb, process_pointer) = thread.with(|thread| (core::mem::replace(&mut thread.context, context), thread.teb_va, thread.process_pointer));
+    // O quadro de troca do serviço aninhado que bloqueou, a retomar.
+    let mut suspended: Option<u64> = None;
     let status = loop {
-        if thread.dead() {
-            break THREAD_IS_TERMINATING;
-        }
-        if let Some(mut wait) = thread.take_wait() {
-            let status = loop {
+        let exit = if let Some(saved) = suspended.take() {
+            // O serviço aninhado é retomado mesmo numa thread terminada: ele
+            // recebe THREAD_IS_TERMINATING e se desfaz.
+            leave_cpu_in_callback(thread, stacks, false);
+            crate::hal::amd64::usermode::resume_user_callback(saved, teb)
+        } else {
+            if thread.dead() {
+                break THREAD_IS_TERMINATING;
+            }
+            if let Some(mut wait) = thread.take_wait() {
                 if let Some(status) = poll_wait(&mut wait) {
-                    break status;
+                    finish_wait(thread, wait, status);
+                    continue;
                 }
-                dispatcher::pump_kernel();
-                let pumps = *PUMPS.lock();
-                for routine in pumps.into_iter().flatten() {
-                    routine();
-                }
-            };
-            finish_wait(thread, wait, status);
-            continue;
-        }
-        let undeliverable = super::user_apc::deliver(thread);
-        if undeliverable != 0 {
-            crate::ntos::ps::create::exit_process(process_pointer, undeliverable);
-            continue;
-        }
-        let (status, exit_kind) = crate::hal::amd64::usermode::exec_user_callback(context, teb);
+                thread.restore_wait(wait);
+                thread.with(|thread| thread.kernel = KernelState::Blocked { status: None });
+                leave_cpu_in_callback(thread, stacks, true);
+                let status = take_kernel_wait_status(thread);
+                // O resultado da syscall aninhada que deixou a espera.
+                // SAFETY: o CONTEXT do callback (memória do kernel).
+                unsafe { Context::at(context) }.rax.set(status as u64);
+                continue;
+            }
+            let undeliverable = super::user_apc::deliver(thread);
+            if undeliverable != 0 {
+                crate::ntos::ps::create::exit_process(process_pointer, undeliverable);
+                continue;
+            }
+            crate::hal::amd64::usermode::exec_user_callback(context, teb)
+        };
+        let (status, exit_kind) = exit;
         let failed = match exit_kind {
             // NtTerminateProcess de dentro do callback: o fim do processo.
             0 => Some(status),
-            1 | 2 => None,
+            1 => None,
+            2 => {
+                yield_in_callback(thread, stacks);
+                None
+            }
+            EXIT_BLOCKED => {
+                suspended = Some(kernel_thread(thread.pointer()).kernel_stack.get());
+                continue;
+            }
             _ => {
                 let handler = *EXIT_HANDLER.lock();
                 match handler {
@@ -1105,6 +1146,56 @@ pub fn run_callback(thread: &Arc<UserThread>, context: u64, returned: &dyn Fn() 
     };
     thread.with(|thread| thread.context = outer);
     status
+}
+
+/// O laço de um callback deixa a CPU pela espera instalada na thread (com o
+/// serviço marcado bloqueado) e volta quando ela conclui; o status fica no
+/// estado de kernel da thread. Sem a troca, a espera é sondada no lugar.
+fn leave_cpu_in_callback(thread: &UserThread, stacks: &CalloutStacks, record_irql: bool) {
+    if stacks.block_outer_service(record_irql) {
+        return;
+    }
+    while thread.kernel_state() == (KernelState::Blocked { status: None }) {
+        if let Some(mut wait) = thread.take_wait() {
+            match poll_wait(&mut wait) {
+                Some(status) => {
+                    finish_wait(thread, wait, status);
+                    break;
+                }
+                None => thread.restore_wait(wait),
+            }
+        }
+        dispatcher::pump_kernel();
+        let pumps = *PUMPS.lock();
+        for routine in pumps.into_iter().flatten() {
+            routine();
+        }
+    }
+}
+
+/// O fim do quantum dentro de um callback: a thread cede a vez com uma
+/// espera que conclui na primeira sondagem do despachante, que põe na fila
+/// as prontas e escolhe a mais prioritária.
+fn yield_in_callback(thread: &UserThread, stacks: &CalloutStacks) {
+    // Uma thread terminada só segue até o laço a encerrar.
+    if thread.dead() {
+        return;
+    }
+    thread.with(|thread| {
+        thread.wait = Some(Wait { poll: Some(Box::new(|| Some(0))), ..Wait::default() });
+        thread.waiting = true;
+        thread.kernel = KernelState::Blocked { status: None };
+    });
+    if stacks.block_outer_service(true) {
+        let _ = take_kernel_wait_status(thread);
+        return;
+    }
+    // Sem a troca, o intervalo só segue.
+    thread.with(|thread| {
+        thread.wait = None;
+        thread.waiting = false;
+        thread.kernel = KernelState::User;
+    });
 }
 
 /// O status da espera de uma thread que o laço retomou no kernel; o

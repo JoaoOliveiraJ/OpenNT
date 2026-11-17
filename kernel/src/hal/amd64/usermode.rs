@@ -925,11 +925,48 @@ pub fn resume_kernel_context(saved_rsp: u64, teb: u64) -> u32 {
 /// entra no CONTEXT `context` com a pilha de kernel da KTHREAD corrente (a
 /// pilha do callback, que o Ke instalou em InitialStack antes), então as
 /// syscalls e interrupções dele caem nela, abaixo dos quadros do serviço de
-/// fora. Termina como qualquer intervalo (syscall, timer, exceção ou
-/// término) e devolve o resultado e o tipo de saída dele.
+/// fora. Termina como qualquer intervalo (syscall, timer, exceção, término
+/// ou o bloqueio de um serviço aninhado, [`context_switch::EXIT_BLOCKED`]) e
+/// devolve o resultado e o tipo de saída dele.
+///
+/// Um serviço aninhado que bloqueia sai por este quadro, não pelo do
+/// despachante: o `dispatcher_rsp` é o que este intervalo gravou. Quem chama
+/// (`threads::run_callback`) bloqueia então o serviço de fora e, retomado,
+/// volta ao aninhado por [`resume_user_callback`].
 pub fn exec_user_callback(context: u64, teb: u64) -> (u32, u32) {
-    assert!(in_service(), "callback de usuario fora de um servico despachado");
     assert!(context & 15 == 0, "execUserCallback: unaligned CONTEXT");
+    nested_interval(teb, |block, stack| {
+        block.context.set(context);
+        block.continue_flag.set(0);
+        // SAFETY: dentro de um serviço despachado nesta CPU, com a pilha de
+        // kernel do intervalo aninhado carregada; o fim dele volta a este
+        // quadro pelo `dispatcher_rsp` que o stub grava.
+        unsafe { user_exec_context(context, stack) }
+    })
+}
+
+/// O lado de entrada do KiSwapContext para um serviço aninhado num callback
+/// de modo usuário: retoma o quadro de troca `saved_rsp` que ele gravou ao
+/// bloquear (na pilha do callback, que o Ke reinstalou em InitialStack), num
+/// intervalo aninhado novo, como [`exec_user_callback`]. O serviço aninhado
+/// recoloca o próprio estado por CPU ao voltar do bloqueio e segue até
+/// terminar o intervalo (ou bloquear de novo); devolve o resultado e o tipo
+/// de saída.
+pub fn resume_user_callback(saved_rsp: u64, teb: u64) -> (u32, u32) {
+    nested_interval(teb, |_, _| {
+        // SAFETY: `saved_rsp` é o KernelStack que `block_in_service` gravou
+        // na pilha do callback, ainda viva e não retomada; o fim do intervalo
+        // volta ao quadro do despachante que a retomada grava.
+        unsafe { context_switch::resume(saved_rsp) }
+    })
+}
+
+/// O corpo comum de [`exec_user_callback`] e [`resume_user_callback`]:
+/// guarda o estado por CPU do serviço de fora, carrega a pilha de kernel da
+/// KTHREAD (a do callback) em RspBase/RSP0 e o GS do usuário, entra no
+/// intervalo aninhado por `enter` e, no fim dele, recoloca tudo.
+fn nested_interval(teb: u64, enter: impl FnOnce(&UserExecutionBlock, u64) -> u64) -> (u32, u32) {
+    assert!(in_service(), "callback de usuario fora de um servico despachado");
     assert_boot_processor();
     let block = block();
     let kpcr = pcr::current();
@@ -957,18 +994,13 @@ pub fn exec_user_callback(context: u64, teb: u64) -> (u32, u32) {
     let swap_gs = cpu::read_msr(MSR_KERNEL_GS_BASE);
     let outer_area = block.xstate_area.get();
     let area = current_xstate_area();
-    block.context.set(context);
     block.exit_kind.set(0);
-    block.continue_flag.set(0);
     block.xstate_area.set(area);
     // O estado estendido vivo é o do usuário de fora (o kernel não o toca):
     // o callback parte dele, como no KiCallUserMode.
     crate::ntos::ke::xstate::save_current(area);
     cpu::write_msr(MSR_KERNEL_GS_BASE, teb);
-    // SAFETY: dentro de um serviço despachado nesta CPU, com a pilha de
-    // kernel do intervalo aninhado carregada; o fim dele volta a este quadro
-    // pelo `dispatcher_rsp` que o stub grava.
-    let result = unsafe { user_exec_context(context, stack) };
+    let result = enter(block, stack);
     // O fim do intervalo voltou com STI: o IF do serviço de fora volta.
     unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
     let nested_kind = block.exit_kind.get();

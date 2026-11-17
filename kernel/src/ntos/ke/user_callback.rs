@@ -29,7 +29,10 @@
 //!   syscall). O despachante da ntdll chama a rotina da tabela e, se ela
 //!   voltar, chama NtCallbackReturn(NULL, 0, retorno);
 //! - as syscalls do callback rodam aninhadas no serviço, na pilha nova
-//!   (`threads::run_callback`), até o NtCallbackReturn: ele acha o quadro
+//!   (`threads::run_callback`); a thread continua escalonável como no NT:
+//!   uma syscall aninhada que espera deixa a CPU e as outras threads rodam
+//!   (o laço repassa o bloqueio ao serviço de fora, ver [`CalloutStacks`]),
+//!   até o NtCallbackReturn: ele acha o quadro
 //!   do callout pelo KERNEL_STACK_CONTROL da InitialStack corrente, grava o
 //!   ponteiro e o tamanho de saída nas variáveis do chamador e o status; sem
 //!   callback ativo, STATUS_NO_CALLBACK_ACTIVE;
@@ -47,7 +50,7 @@ use crate::hal::amd64::usermode;
 use crate::ntos::inc::field::{Field, NtStruct, Reserved};
 use crate::ntos::inc::types::extra_fs_fat::KernelStackControl;
 use crate::ntos::inc::types::{Context, Kthread, Teb};
-use crate::ntos::ke::{bugcheck, irql};
+use crate::ntos::ke::{bugcheck, context_switch, irql};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::{kernel_stack, memory_map};
 use crate::ntos::ps::user::{state, threads};
@@ -129,6 +132,48 @@ struct CalloutFrame {
 
 // SAFETY: #[repr(C)] só de células.
 unsafe impl NtStruct for CalloutFrame {}
+
+/// Os dois segmentos de pilha de kernel de um KeUserModeCallback em curso
+/// (InitialStack, StackBase, StackLimit): o do serviço que chamou e o do
+/// callback.
+///
+/// Enquanto o callback roda, a KTHREAD fica no segmento do callback, como
+/// depois do KiCallUserMode. O laço do callback (`threads::run_callback`)
+/// roda no segmento de fora, e quando ele deixa a CPU (o bloqueio de um
+/// serviço aninhado repassado, uma espera PENDING de uma syscall aninhada, o
+/// fim do quantum) a KTHREAD volta a esse segmento: a troca de contexto
+/// grava o quadro dele em KTHREAD.KernelStack, e o despacho confere esse
+/// quadro contra InitialStack/StackLimit e carrega InitialStack em
+/// RspBase/RSP0 na retomada. Retomado, o laço reinstala o segmento do
+/// callback antes de voltar ao anel 3 ou ao serviço aninhado. O
+/// KERNEL_STACK_CONTROL da pilha do callback (o segmento anterior e o quadro
+/// do callout) não muda nesse meio-tempo.
+#[derive(Clone, Copy)]
+pub struct CalloutStacks {
+    thread: u64,
+    outer: (u64, u64, u64),
+    callback: (u64, u64, u64),
+}
+
+impl CalloutStacks {
+    fn install(&self, (initial, base, limit): (u64, u64, u64)) {
+        // SAFETY: a KTHREAD corrente está viva enquanto o callback dela roda.
+        let thread = unsafe { Kthread::at(self.thread) };
+        thread.initial_stack.set(initial);
+        thread.stack_base.set(base);
+        thread.stack_limit.set(limit);
+    }
+
+    /// O laço do callback deixa a CPU por uma espera já instalada na thread
+    /// (`context_switch::block_installed_wait`), no segmento de fora, e volta
+    /// com o segmento do callback. `false` quando não pôde trocar.
+    pub fn block_outer_service(&self, record_irql: bool) -> bool {
+        self.install(self.outer);
+        let blocked = context_switch::block_installed_wait(record_irql);
+        self.install(self.callback);
+        blocked
+    }
+}
 
 /// O fim de um KeUserModeCallback: desfaz o aninhamento e devolve a pilha
 /// do callback ao Mm.
@@ -264,15 +309,11 @@ pub fn user_mode_callback(api_number: u32, input: u64, input_length: u32, output
 
     // KiCallUserMode: a thread passa para a pilha do callback.
     control.previous.kernel_stack.set(callout);
-    let previous = (thread.initial_stack.get(), thread.stack_base.get(), thread.stack_limit.get());
-    thread.initial_stack.set(stack.initial);
-    thread.stack_base.set(stack.base);
-    thread.stack_limit.set(stack.limit);
-    let exit = threads::run_callback(&user, callback_context, &|| frame_cells.returned.get() != 0);
+    let stacks = CalloutStacks { thread: pointer, outer: (thread.initial_stack.get(), thread.stack_base.get(), thread.stack_limit.get()), callback: (stack.initial, stack.base, stack.limit) };
+    stacks.install(stacks.callback);
+    let exit = threads::run_callback(&user, callback_context, &|| frame_cells.returned.get() != 0, &stacks);
     // A volta do NtCallbackReturn: a pilha anterior.
-    thread.initial_stack.set(previous.0);
-    thread.stack_base.set(previous.1);
-    thread.stack_limit.set(previous.2);
+    stacks.install(stacks.outer);
     let status = if exit == 0 { frame_cells.status.get() } else { exit };
     flush_gdi_batch(pointer, syscall);
     guest::free_bytes(callout);
