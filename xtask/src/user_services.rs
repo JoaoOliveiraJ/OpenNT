@@ -13,11 +13,14 @@
 //! valores daqui: as chaves de serviço desses quatro e as do Power, do
 //! BrokerInfrastructure e do SystemEventsBroker (com Parameters e
 //! Security), a ordem dos grupos de serviço (`Control\ServiceGroupOrder`),
-//! a configuração de energia (`Control\Power`) e,
+//! a configuração de energia (`Control\Power`), as definições WNF
+//! (`Control\Notifications`), as opções do produto (`Control\ProductOptions`)
+//! e,
 //! na SOFTWARE, os grupos do svchost (`Microsoft\Windows NT\CurrentVersion\
 //! Svchost`, os valores com a lista de serviços de cada grupo, e
 //! `Microsoft\Rpc\SecurityService`, os provedores de autenticação do RPC, e
-//! os valores de `Microsoft\Windows NT\CurrentVersion\WUDF`).
+//! os valores de `Microsoft\Windows NT\CurrentVersion\WUDF` e da
+//! `ProfileList`, só com os perfis das contas de serviço).
 //! A SYSTEM leva ainda o `Control\Terminal Server` com as subchaves, que o
 //! lsm.dll exige ao subir. E a
 //! configuração das extensões do LSA (`Control\LsaExtensionConfig`: o
@@ -46,6 +49,11 @@ pub fn system_keys(control_set: &str) -> Vec<HostKey> {
             registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\Services\\{service}"), &format!("{control_set}\\Services\\{service}"), true, &mut keys);
         }
         registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\Control\\ServiceGroupOrder"), &format!("{control_set}\\Control\\ServiceGroupOrder"), false, &mut keys);
+        // As opções do produto: o tipo, a suíte e a política de licença
+        // (ProductPolicy) que o NtQueryLicenseValue lê; sem ela toda
+        // consulta de licença volta STATUS_DATA_ERROR e o GetProductInfo dá
+        // PRODUCT_UNDEFINED.
+        registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\Control\\ProductOptions"), &format!("{control_set}\\Control\\ProductOptions"), false, &mut keys);
         // A configuração de energia que o serviço Power (o umpo.dll) lê: os
         // esquemas, as configurações e os padrões (o Control\Power com as
         // subchaves que esta conta lê).
@@ -120,6 +128,15 @@ pub fn software_keys() -> Vec<HostKey> {
         // services.exe recusa a falta do DefaultHostProcessGUID, e o
         // SvcctrlMain sai antes do início automático.
         registry::copy(registry::LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\WUDF", "Microsoft\\Windows NT\\CurrentVersion\\WUDF", false, &mut keys);
+        // A lista de perfis: os diretórios (ProgramData, Public, Default e
+        // ProfilesDirectory), que o wininit lê para definir o %ProgramData% e
+        // as outras variáveis do sistema, e os perfis das contas de serviço
+        // (S-1-5-18, -19 e -20). Os perfis das contas de usuário desta
+        // máquina ficam de fora.
+        registry::copy(registry::LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList", "Microsoft\\Windows NT\\CurrentVersion\\ProfileList", false, &mut keys);
+        for account in ["S-1-5-18", "S-1-5-19", "S-1-5-20"] {
+            registry::copy(registry::LOCAL_MACHINE, &format!("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList\\{account}"), &format!("Microsoft\\Windows NT\\CurrentVersion\\ProfileList\\{account}"), true, &mut keys);
+        }
     }
     keys
 }
