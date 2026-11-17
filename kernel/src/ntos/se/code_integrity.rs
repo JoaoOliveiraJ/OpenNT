@@ -48,7 +48,10 @@ struct CiCallbacks {
     _reserved_68: Reserved<0x8>,
     /// Nível de assinatura exigido: precisa ficar NULL neste contrato.
     required_signing_level: Field<u64>,
-    _reserved_78: Reserved<0x18>,
+    _reserved_78: Reserved<0x10>,
+    /// A consulta de política (o SeCodeIntegrityQueryPolicyInformation a
+    /// chama).
+    query_policy_information: Field<u64>,
     /// CiValidateDynamicCodePages (o MmChangeImageProtection a chama).
     validate_dynamic_code_pages: Field<u64>,
     _reserved_98: Reserved<0x48>,
@@ -425,6 +428,24 @@ fn query_information(buffer: u64, length: u32, returned: u64) -> Result<u32, Ker
 pub fn validate_dynamic_code_pages(context: u64, mdl: u64, address: u64, size: u64, offset: u64) -> Option<u32> {
     let routine = callback(|table| &table.validate_dynamic_code_pages).ok()?;
     Some(invoke(routine, &[context, mdl, address, size, offset]))
+}
+
+/// SeCodeIntegrityQueryPolicyInformation (ntoskrnl 19041, rva 0x65f160), as
+/// classes de política de CI do NtQuerySystemInformation(Ex)
+/// (SystemCodeIntegrityPolicyInformation, 164, e as que dividem o ramo
+/// dela): o callback de SeCiCallbacks+0x88 com (classe, entrada, tamanho da
+/// entrada, saída, tamanho, &tamanho devolvido); sem a CI carregada (o slot
+/// NULL), STATUS_UNSUCCESSFUL. O tamanho vai para a célula local do
+/// ExpQuerySystemInformation (`reported`), que o serviço copia para o
+/// ReturnLength.
+pub fn query_policy_information(class: u32, input: u64, input_length: u32, output: u64, length: u32, reported: &mut u32) -> Result<u32, KernelError> {
+    let Ok(routine) = callback(|table| &table.query_policy_information) else { return Ok(0xC000_0001) };
+    let local = allocate(8)?;
+    let status = invoke(routine, &[class as u64, input, input_length as u64, output, length as u64, local]);
+    // SAFETY: a célula ULONG própria, recém-alocada.
+    *reported = unsafe { Field::<u32>::at(local) }.get();
+    guest::free_bytes(local);
+    Ok(status)
 }
 
 /// A CI publicou o CiValidateDynamicCodePages.

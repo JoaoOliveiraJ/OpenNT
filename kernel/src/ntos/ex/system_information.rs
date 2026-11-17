@@ -53,10 +53,83 @@ pub const SYSTEM_OBJECT_SECURITY_MODE: u32 = 70;
 pub const SYSTEM_ENERGY_ESTIMATION_CONFIG_INFORMATION: u32 = 158;
 pub const SYSTEM_ISOLATED_USER_MODE_INFORMATION: u32 = 165;
 pub const SYSTEM_MEMORY_USAGE_INFORMATION: u32 = 182;
-/// SystemCpuQuotaInformation (rva 0x6cc225): o PsQueryCpuQuotaInformation
-/// (`ps/session`), com o ReturnLength da célula local do serviço, que fica
-/// zero quando ele não a toca.
+pub const SYSTEM_SHADOW_STACK_INFORMATION: u32 = 221;
 pub const SYSTEM_CPU_QUOTA_INFORMATION: u32 = 113;
+pub const SYSTEM_PLATFORM_BINARY_INFORMATION: u32 = 133;
+pub const SYSTEM_MEMORY_TOPOLOGY_INFORMATION: u32 = 138;
+/// SystemCodeIntegrityPolicyInformation e as classes de política de CI que
+/// dividem o ramo dela no ExpQuerySystemInformation (rva 0x6cc0f9).
+pub const SYSTEM_CODE_INTEGRITY_POLICY_CLASSES: [u32; 5] = [164, 172, 189, 190, 199];
+/// SeTcbPrivilege.
+const SE_TCB_PRIVILEGE: u64 = 7;
+const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
+
+/// As classes cujo tamanho é a célula local do ExpQuerySystemInformation
+/// (zero no começo, gravada pela folha e copiada para o ReturnLength na
+/// saída comum, também nas falhas), com o buffer de saída já sondado
+/// (alinhamento 4) quando o chamador é de modo usuário. Devolve o NTSTATUS
+/// e o tamanho a gravar (`None` quando o serviço sai sem tocar no
+/// ReturnLength); `None` para as classes que não são daqui.
+///
+/// - SystemCpuQuotaInformation (113, rva 0x6cc225): o
+///   PsQueryCpuQuotaInformation (`ps/session`).
+/// - SystemPlatformBinaryInformation (133, rva 0x6cbcf7): o SeTcbPrivilege
+///   do modo anterior antes de tudo (senão STATUS_PRIVILEGE_NOT_HELD, sem
+///   ReturnLength); o ExpGetSystemPlatformBinary
+///   ([`platform_binary_information`]).
+/// - SystemMemoryTopologyInformation (138, rva 0x6cbd61):
+///   `mm/memory_information::memory_topology_information`.
+/// - SystemCodeIntegrityPolicyInformation (164) e as classes do mesmo ramo:
+///   o SeCodeIntegrityQueryPolicyInformation (`se/code_integrity`), sem
+///   entrada pelo NtQuerySystemInformation.
+pub fn query_reported(class: u32, output: u64, length: u32, previous_mode: u8) -> Option<Result<(u32, Option<u32>), KernelError>> {
+    let mut reported = 0u32;
+    let status = match class {
+        SYSTEM_CPU_QUOTA_INFORMATION => Ok(crate::ntos::ps::session::query_cpu_quota_information()),
+        SYSTEM_PLATFORM_BINARY_INFORMATION => {
+            if !crate::ntos::se::privilege::single_privilege_check(SE_TCB_PRIVILEGE, previous_mode as u32) {
+                return Some(Ok((STATUS_PRIVILEGE_NOT_HELD, None)));
+            }
+            platform_binary_information(output, length)
+        }
+        SYSTEM_MEMORY_TOPOLOGY_INFORMATION => crate::ntos::mm::memory_information::memory_topology_information(output, length, &mut reported),
+        _ if SYSTEM_CODE_INTEGRITY_POLICY_CLASSES.contains(&class) => crate::ntos::se::code_integrity::query_policy_information(class, 0, 0, output, length, &mut reported),
+        _ => return None,
+    };
+    Some(status.map(|status| (status, Some(reported))))
+}
+
+/// ExpGetSystemPlatformBinary (ntoskrnl 19041, rva 0x7cfd64): o
+/// SYSTEM_PLATFORM_BINARY_INFORMATION de entrada e saída tem pelo menos 0x20
+/// bytes (senão STATUS_INVALID_PARAMETER); dele saem HandoffBufferSize
+/// (+0x18) e CommandLineBufferSize (+0x1c). O binário de plataforma vem da
+/// tabela ACPI WPBT; sem ela (o caso do OpenNT: o firmware do QEMU não a
+/// publica e o cache da tabela fica vazio) os tamanhos pedidos têm de ser
+/// zero (senão STATUS_INVALID_PARAMETER) e a busca da tabela pelo provedor
+/// 'ACPI' falha: STATUS_NOT_SUPPORTED. O smss!SmpGetPlatformBinary segue sem
+/// binário de plataforma.
+fn platform_binary_information(output: u64, length: u32) -> Result<u32, KernelError> {
+    if length < 0x20 {
+        return Ok(STATUS_INVALID_PARAMETER);
+    }
+    let handoff = guest::try_read::<u32>(output + 0x18)?;
+    let command_line = guest::try_read::<u32>(output + 0x1c)?;
+    if handoff != 0 || command_line != 0 {
+        return Ok(STATUS_INVALID_PARAMETER);
+    }
+    if crate::hal::acpi::get_table("WPBT", 0, false).is_some() {
+        debug_print!("[ex] tabela WPBT presente: binario de plataforma sem suporte");
+    }
+    Ok(STATUS_NOT_SUPPORTED)
+}
+
+/// SystemShadowStackInformation (221, rva 0x6ccacb): o ULONG de flags com o
+/// KeIsCetCapable no bit 0 e o KeIsUserCetAllowed no bit 1 (o bit 8 é
+/// constante zero no 19041; num server silo tudo fica zero). O OpenNT não
+/// liga o CET (KiCetCapable e KiUserCetAllowed zerados): zero.
+fn shadow_stack_information() -> u32 {
+    0
+}
 pub const SYSTEM_PHYSICAL_MEMORY_INFORMATION: u32 = 184;
 pub const SYSTEM_FLUSH_INFORMATION: u32 = 192;
 pub const SYSTEM_WRITE_CONSTRAINT_INFORMATION: u32 = 195;
@@ -102,7 +175,7 @@ pub fn flush_information() -> Vec<u8> {
 /// A classe é uma das de `query_fixed` com o buffer sondado com alinhamento
 /// 4 (a SystemKernelDebuggerInformation sonda com alinhamento 1).
 pub fn is_fixed_class(class: u32) -> bool {
-    matches!(class, SYSTEM_FLAGS_INFORMATION | SYSTEM_RECOMMENDED_SHARED_DATA_ALIGNMENT | SYSTEM_OBJECT_SECURITY_MODE | SYSTEM_ISOLATED_USER_MODE_INFORMATION | SYSTEM_MEMORY_USAGE_INFORMATION | SYSTEM_PHYSICAL_MEMORY_INFORMATION | SYSTEM_FLUSH_INFORMATION | SYSTEM_WRITE_CONSTRAINT_INFORMATION | SYSTEM_HYPERVISOR_SHARED_PAGE_INFORMATION)
+    matches!(class, SYSTEM_FLAGS_INFORMATION | SYSTEM_RECOMMENDED_SHARED_DATA_ALIGNMENT | SYSTEM_OBJECT_SECURITY_MODE | SYSTEM_ISOLATED_USER_MODE_INFORMATION | SYSTEM_MEMORY_USAGE_INFORMATION | SYSTEM_PHYSICAL_MEMORY_INFORMATION | SYSTEM_FLUSH_INFORMATION | SYSTEM_WRITE_CONSTRAINT_INFORMATION | SYSTEM_HYPERVISOR_SHARED_PAGE_INFORMATION | SYSTEM_SHADOW_STACK_INFORMATION)
 }
 
 /// Classes de tamanho fixo do ExpQuerySystemInformation 19041, com o buffer
@@ -134,6 +207,8 @@ pub fn is_fixed_class(class: u32) -> bool {
 ///   PoEnergyEstimationEnabled (`po/power_information`).
 /// - SystemMemoryUsageInformation (182, rva 0x6ca289): exatamente 0x38
 ///   bytes, o `mm/memory_information::memory_usage_information`.
+/// - SystemShadowStackInformation (221, rva 0x6ccacb): exatamente 4 bytes,
+///   o [`shadow_stack_information`].
 /// - SystemFlushInformation (192, rva 0x6cc82d): pelo menos 0x20 bytes, o
 ///   [`flush_information`].
 /// - SystemWriteConstraintInformation (195, rva 0x6ccdc6): pelo menos 8
@@ -171,6 +246,7 @@ pub fn query_fixed(class: u32, output: u64, length: u32) -> Option<Result<(u32, 
         SYSTEM_FLUSH_INFORMATION => (0x20, false, flush_information()),
         SYSTEM_WRITE_CONSTRAINT_INFORMATION => (8, false, alloc::vec![0u8; 8]),
         SYSTEM_HYPERVISOR_SHARED_PAGE_INFORMATION => (8, false, crate::ntos::mm::shared_user_data::hypervisor_shared_user_va().to_le_bytes().to_vec()),
+        SYSTEM_SHADOW_STACK_INFORMATION => (4, true, shadow_stack_information().to_le_bytes().to_vec()),
         _ => return None,
     };
     let fits = if exact { length == required } else { length >= required };
@@ -188,6 +264,14 @@ pub fn query(class: u32, output: u64, length: u32, returned: u64) -> Result<u32,
         if returned != 0 {
             // SAFETY: o PULONG ReturnLength do chamador de modo kernel.
             unsafe { Field::<u32>::at(returned) }.set(required);
+        }
+        return Ok(status);
+    }
+    if let Some(result) = query_reported(class, output, length, 0) {
+        let (status, reported) = result?;
+        if let (Some(reported), true) = (reported, returned != 0) {
+            // SAFETY: o PULONG ReturnLength do chamador (modo kernel).
+            unsafe { Field::<u32>::at(returned) }.set(reported);
         }
         return Ok(status);
     }
@@ -228,13 +312,6 @@ pub fn query(class: u32, output: u64, length: u32, returned: u64) -> Result<u32,
         }
         // SystemBootGraphicsInformation: a tela de boot (Bgk).
         126 => return crate::ntos::bgk::graphics_information::query_system_information(output, length, returned),
-        SYSTEM_CPU_QUOTA_INFORMATION => {
-            if returned != 0 {
-                // SAFETY: o PULONG ReturnLength do chamador (modo kernel).
-                unsafe { Field::<u32>::at(returned) }.set(0);
-            }
-            return Ok(crate::ntos::ps::session::query_cpu_quota_information());
-        }
         // SystemBasicInformation e as variantes Emulation/NativeBasic x64.
         0 | 62 | 114 => return Ok(basic_information(output, length, returned)),
         // SystemPerformanceInformation e SystemPageFileInformation(Ex):
@@ -685,8 +762,6 @@ pub fn thread_priority_client_id(buffer: u64, length: u32, previous_mode: u32) -
 // classe com o Win32PrioritySeparation de `Control\PriorityControl`.
 
 pub const SYSTEM_PRIORITY_SEPERATION: u32 = 39;
-/// SE_TCB_PRIVILEGE.
-const SE_TCB_PRIVILEGE: u64 = 7;
 
 /// SystemPrioritySeperation no modo anterior `previous_mode`: o NTSTATUS.
 pub fn priority_seperation(buffer: u64, length: u32, previous_mode: u32) -> u32 {

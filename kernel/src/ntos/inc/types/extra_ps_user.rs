@@ -324,6 +324,47 @@ const _: () = {
     assert!(core::mem::offset_of!(VmCountersEx2, shared_commit_usage) == 0x68);
 };
 
+/// O cabeçalho da SystemMemoryTopologyInformation (NtQuerySystemInformation
+/// classe 138, o MmGetNodeChannelRanges do ntoskrnl 19041; 0x10 bytes,
+/// seguidos de NumberOfRuns [`MemoryTopologyRun`]).
+#[repr(C)]
+pub struct SystemMemoryTopologyInformation {
+    pub number_of_runs: Field<u64>,
+    pub number_of_nodes: Field<u32>,
+    pub number_of_channels: Field<u32>,
+}
+
+unsafe impl NtStruct for SystemMemoryTopologyInformation {}
+
+const _: () = {
+    assert!(core::mem::size_of::<SystemMemoryTopologyInformation>() == 0x10);
+    assert!(core::mem::offset_of!(SystemMemoryTopologyInformation, number_of_runs) == 0x0);
+    assert!(core::mem::offset_of!(SystemMemoryTopologyInformation, number_of_nodes) == 0x8);
+    assert!(core::mem::offset_of!(SystemMemoryTopologyInformation, number_of_channels) == 0xC);
+};
+
+/// Uma faixa de páginas físicas da SystemMemoryTopologyInformation: o nó, o
+/// canal de memória, a primeira página, a contagem e as flags (0x20 bytes).
+#[repr(C)]
+pub struct MemoryTopologyRun {
+    pub node_number: Field<u32>,
+    pub channel_number: Field<u32>,
+    pub base_page: Field<u64>,
+    pub page_count: Field<u64>,
+    pub flags: Field<u64>,
+}
+
+unsafe impl NtStruct for MemoryTopologyRun {}
+
+const _: () = {
+    assert!(core::mem::size_of::<MemoryTopologyRun>() == 0x20);
+    assert!(core::mem::offset_of!(MemoryTopologyRun, node_number) == 0x0);
+    assert!(core::mem::offset_of!(MemoryTopologyRun, channel_number) == 0x4);
+    assert!(core::mem::offset_of!(MemoryTopologyRun, base_page) == 0x8);
+    assert!(core::mem::offset_of!(MemoryTopologyRun, page_count) == 0x10);
+    assert!(core::mem::offset_of!(MemoryTopologyRun, flags) == 0x18);
+};
+
 /// `_SYSTEM_MEMORY_USAGE_INFORMATION` (NtQuerySystemInformation
 /// (SystemMemoryUsageInformation, classe 182); 0x38 bytes).
 #[repr(C)]

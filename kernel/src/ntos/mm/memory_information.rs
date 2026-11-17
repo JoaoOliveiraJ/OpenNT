@@ -118,6 +118,51 @@ pub fn memory_usage_information() -> Result<alloc::vec::Vec<u8>, KernelError> {
     Ok(bytes)
 }
 
+/// SystemMemoryTopologyInformation (138, o ExpQueryMemoryTopologyInformation
+/// do ntoskrnl 19041, rva 0x7c8270, sobre o MmGetNodeChannelRanges): o
+/// cabeçalho com NumberOfRuns, NumberOfNodes (KeNumberNodes) e
+/// NumberOfChannels (MmNumberOfChannels, 1 sem topologia de canais do
+/// firmware) e uma entrada por faixa de RAM da partição (as mesmas do
+/// MmGetPhysicalMemoryRanges, `mm/physical_layout`), com o nó e o canal da
+/// faixa (0 e 0 numa máquina de um nó e um canal), a primeira página, a
+/// contagem e as flags (1 com o canal desligado pelo gerenciamento de
+/// energia de memória, que o OpenNT não tem: 0). O tamanho, 0x10 + 0x20 por
+/// faixa, vai sempre para `reported`; um buffer menor dá
+/// STATUS_BUFFER_TOO_SMALL sem cópia. O buffer foi sondado pelo chamador.
+pub fn memory_topology_information(output: u64, length: u32, reported: &mut u32) -> Result<u32, KernelError> {
+    use crate::ntos::inc::field::NtStruct;
+    use crate::ntos::inc::types::extra_ps_user::{MemoryTopologyRun, SystemMemoryTopologyInformation};
+    let runs = super::physical_layout::ranges();
+    let size = SystemMemoryTopologyInformation::SIZE + runs.len() as u64 * MemoryTopologyRun::SIZE;
+    *reported = size as u32;
+    if size > u32::MAX as u64 {
+        return Ok(0xC000_009A);
+    }
+    if size > length as u64 {
+        return Ok(0xC000_0023);
+    }
+    let scratch = guest::alloc_bytes(size);
+    if scratch == 0 {
+        return Ok(0xC000_009A);
+    }
+    guest::write_bytes(scratch, &alloc::vec![0u8; size as usize]);
+    // SAFETY: a moldura própria recém-alocada, com o cabeçalho e as faixas.
+    let header = unsafe { SystemMemoryTopologyInformation::at(scratch) };
+    header.number_of_runs.set(runs.len() as u64);
+    header.number_of_nodes.set(crate::ntos::ke::processor_group::number_nodes() as u32);
+    header.number_of_channels.set(1);
+    // SAFETY: as faixas logo depois do cabeçalho, dentro da moldura.
+    let entries = unsafe { MemoryTopologyRun::array_at(scratch + SystemMemoryTopologyInformation::SIZE, runs.len()) };
+    for (entry, &(base, top)) in entries.iter().zip(runs.iter()) {
+        entry.base_page.set(base >> 12);
+        entry.page_count.set((top - base) >> 12);
+    }
+    let bytes = guest::read_bytes(scratch, size as usize);
+    guest::free_bytes(scratch);
+    guest::try_write_bytes(output, &bytes)?;
+    Ok(0)
+}
+
 /// O tamanho mínimo do buffer da SystemPageFileInformation(Ex).
 pub fn page_file_entry_size(extended: bool) -> u32 {
     if extended {
