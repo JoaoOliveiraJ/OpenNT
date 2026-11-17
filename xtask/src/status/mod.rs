@@ -159,6 +159,8 @@ pub struct TestRow {
     pub expected_failure: bool,
     /// `coberto_pela_suite = true`: as suítes já conferem os marcadores.
     pub covered_by_suite: bool,
+    /// `acelerador = "tcg"`: o acelerador fixado do teste.
+    pub accelerator: Option<String>,
     /// Arquivo das fontes Rust em que o marcador aparece.
     pub location: Option<String>,
     pub capture: Option<Capture>,
@@ -386,6 +388,7 @@ fn test_rows(document: &toml::Document, root: &Path, rust: &[(String, String)], 
             description: entry.string("descricao").unwrap_or_default().into(),
             expected_failure,
             covered_by_suite: flag(entry, "coberto_pela_suite"),
+            accelerator: entry.string("acelerador").map(String::from),
             location,
             capture,
             marker,

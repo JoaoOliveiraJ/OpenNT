@@ -25,9 +25,15 @@
 //! 3. no fim, a tabela com o resultado de cada uma e, para cada falha, o
 //!    trecho da serial que a explica.
 //!
-//! `espera_falha = true` marca um teste que falha conhecidamente (sai à
-//! parte, sem reprovar a rodada); `coberto_pela_suite = true` marca um teste
-//! cujos marcadores as suítes já conferem (só roda com `--only`).
+//! `espera_falha = true` marca um teste que falha conhecidamente: fica fora
+//! da rodada padrão (não gasta o prazo inteiro dele em toda validação) e roda
+//! com `--espera-falha`, `--all` ou `--only`, contado à parte, sem reprovar a
+//! rodada. `coberto_pela_suite = true` marca um teste cujos marcadores as
+//! suítes já conferem (roda com `--all` ou `--only`).
+//!
+//! O acelerador: cada execução roda no padrão da rodada, o WHPX quando o
+//! QEMU o tem e a partição sobe nesta máquina, senão o TCG (`--accel`
+//! troca). `acelerador = "tcg"` num `[[teste]]` fixa o dele.
 //!
 //! `cargo xtask capturas` usa a mesma máquina para as capturas de tela das
 //! páginas: roda cada `[[teste]]` (sem as suítes, com os cobertos por elas)
@@ -50,7 +56,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::build;
-use plan::{Run, Suites, Test};
+use plan::{Extras, Run, Suites, Test};
 pub use plan::{SUITE, SUITE_CPUS};
 use report::{Outcome, Verdict};
 
@@ -60,6 +66,9 @@ pub const USAGE: &str = "uso: cargo xtask test-all [opcoes]
   --only=ID[,ID]    so estes testes (inclusive os coberto_pela_suite)
   --skip=ID[,ID]    deixa estes de fora
   --suite           so as duas suites; --no-suite: so os [[teste]]
+  --espera-falha    inclui os espera_falha (fora da rodada padrao)
+  --all             todos: as suites e os [[teste]], inclusive espera_falha e coberto_pela_suite
+  --accel=tcg|whpx  acelerador dos testes sem a chave acelerador (padrao: whpx quando a maquina tem)
   --repeat=N        roda cada teste N vezes (falhas intermitentes)
   --keep            guarda a pasta de toda execucao (padrao: so das que falharam)
   --cpu-friendly    prioridade abaixo do normal e 4 CPUs logicas livres (Windows)
@@ -73,6 +82,7 @@ pub const CAPTURE_USAGE: &str = "uso: cargo xtask capturas [opcoes]
   --jobs=N          execucoes em paralelo (padrao: metade das CPUs)
   --only=ID[,ID]    so estes testes
   --skip=ID[,ID]    deixa estes de fora
+  --accel=tcg|whpx  acelerador dos testes sem a chave acelerador (padrao: whpx quando a maquina tem)
   --keep            guarda a pasta de toda execucao
   --cpu-friendly    prioridade abaixo do normal e 4 CPUs logicas livres (Windows)
   --list            mostra os testes e os comandos, sem rodar";
@@ -94,6 +104,9 @@ struct Options {
     only: Vec<String>,
     skip: Vec<String>,
     suites: Suites,
+    extras: Extras,
+    /// `--accel`: o acelerador padrão da rodada (sem ele, o detectado).
+    accelerator: Option<String>,
     repeat: usize,
     keep: bool,
     cpu_friendly: bool,
@@ -108,6 +121,8 @@ fn parse_options(arguments: &[String], capture: bool) -> Result<Options, String>
         only: Vec::new(),
         skip: Vec::new(),
         suites: Suites::Included,
+        extras: Extras::default(),
+        accelerator: None,
         repeat: 1,
         keep: false,
         cpu_friendly: false,
@@ -133,12 +148,22 @@ fn parse_options(arguments: &[String], capture: bool) -> Result<Options, String>
             "--only" => options.only.extend(ids(value()?)),
             "--skip" => options.skip.extend(ids(value()?)),
             "--repeat" => options.repeat = number(value()?)?,
-            "--keep" | "--suite" | "--no-suite" | "--cpu-friendly" | "--list" if inline.is_some() => {
+            "--accel" => {
+                let accelerator = value()?;
+                if !plan::ACCELERATORS.contains(&accelerator.as_str()) {
+                    return Err(format!("--accel aceita {} ({accelerator} recebido)", plan::ACCELERATORS.join(", ")));
+                }
+                options.accelerator = Some(accelerator);
+            }
+            "--espera-falha" | "--all" if capture => return Err(format!("{name} nao vale no capturas\n{CAPTURE_USAGE}")),
+            "--keep" | "--suite" | "--no-suite" | "--cpu-friendly" | "--list" | "--espera-falha" | "--all" if inline.is_some() => {
                 return Err(format!("{name} nao aceita valor"));
             }
             "--keep" => options.keep = true,
             "--cpu-friendly" => options.cpu_friendly = true,
             "--list" => options.list = true,
+            "--espera-falha" => options.extras.expected_failures = true,
+            "--all" => options.extras = Extras { expected_failures: true, covered_by_suite: true },
             "--suite" | "--no-suite" => {
                 if suite_flag {
                     return Err("use --suite ou --no-suite, uma vez".into());
@@ -152,6 +177,9 @@ fn parse_options(arguments: &[String], capture: bool) -> Result<Options, String>
     }
     if suite_flag && !options.only.is_empty() {
         return Err("--only ja escolhe os testes; tire o --suite/--no-suite".into());
+    }
+    if (options.extras.expected_failures || options.extras.covered_by_suite) && !options.only.is_empty() {
+        return Err("--only ja escolhe os testes; tire o --espera-falha/--all".into());
     }
     Ok(options)
 }
@@ -187,6 +215,8 @@ struct Context {
     running: AtomicUsize,
     /// `capturas`: a pasta dos PNG de cada teste.
     capture: Option<PathBuf>,
+    /// O acelerador dos testes sem a chave `acelerador`.
+    accelerator: String,
 }
 
 impl Context {
@@ -208,6 +238,11 @@ impl Context {
         self.root.join(Self::image_relative(image))
     }
 
+    /// O acelerador em que o teste roda.
+    fn accelerator<'a>(&'a self, test: &'a Test) -> &'a str {
+        test.accelerator.as_deref().unwrap_or(&self.accelerator)
+    }
+
     /// Quantas pastas de imagens a rodada usa.
     fn image_count(&self) -> usize {
         self.runs.iter().map(|run| run.image + 1).max().unwrap_or(0)
@@ -222,6 +257,7 @@ impl Context {
         command.arg("test-boot").args(&test.arguments).arg(format!("--build-dir={}", directory.display())).arg(stage);
         if let Some(images) = images {
             command.arg(format!("--image-dir={}", images.display()));
+            command.arg(format!("--accel={}", self.accelerator(test)));
         }
         if let (Some(capture), "--no-build") = (&self.capture, stage) {
             command.arg(format!("--capture={}", capture.join(format!("{}.png", test.id)).display()));
@@ -427,7 +463,10 @@ fn lane(context: &Context, ready: &Mutex<Receiver<Prepared>>, outcomes: &Mutex<V
             context.runs.len()
         ));
         let repeat_command = match build {
-            Some(_) => test.command_line(&format!("{OUTPUT_DIR}/{}", run.name), &format!("--no-build --image-dir={}", Context::image_relative(run.image))),
+            Some(_) => test.command_line(
+                &format!("{OUTPUT_DIR}/{}", run.name),
+                &format!("--no-build --image-dir={} --accel={}", Context::image_relative(run.image), context.accelerator(test)),
+            ),
             None => String::new(),
         };
         outcomes.push(Outcome { name: run.name.clone(), verdict, build, test: time, reason, excerpt, log, repeat_command });
@@ -444,7 +483,9 @@ fn list(context: &Context, chosen: &[usize]) {
         if test.covered_by_suite {
             notes.push("coberto pela suite");
         }
-        let notes = if notes.is_empty() { String::new() } else { format!(" ({})", notes.join(", ")) };
+        let accelerator = format!("acelerador {}", context.accelerator(test));
+        notes.push(&accelerator);
+        let notes = format!(" ({})", notes.join(", "));
         println!("[{mark}] {}{notes}", test.id);
         println!("      {}", test.command_line(&format!("{OUTPUT_DIR}/{}", test.id), ""));
     }
@@ -469,13 +510,24 @@ fn run_with(mut options: Options, capture: bool) -> Result<(), String> {
         // Todos os [[teste]], inclusive os que só as suítes rodam.
         options.only = tests.iter().filter(|test| !test.suite).map(|test| test.id.clone()).collect();
     }
-    let chosen = plan::select(&tests, &options.only, &options.skip, options.suites)?;
+    let chosen = plan::select(&tests, &options.only, &options.skip, options.suites, options.extras)?;
     if capture && chosen.iter().any(|&index| tests[index].suite) {
         return Err("as suites nao tem captura: escolha ids de [[teste]]".into());
     }
     let runs = plan::runs(&tests, &chosen, options.repeat);
     let width = runs.iter().map(|run| run.name.len()).max().unwrap_or(0);
     let executable = std::env::current_exe().map_err(|error| format!("executavel do xtask: {error}"))?;
+    // Detectado uma vez para a rodada: cada test-boot recebe o --accel dele.
+    let detected = crate::qemu::detect_accelerator()?;
+    let accelerator = options.accelerator.clone().unwrap_or_else(|| detected.to_string());
+    if detected != "whpx" && (accelerator == "whpx" || chosen.iter().any(|&index| tests[index].accelerator.as_deref() == Some("whpx"))) {
+        return Err("o WHPX foi pedido, mas o QEMU ou esta maquina nao o tem".into());
+    }
+    let skipped = if options.only.is_empty() && !options.extras.expected_failures {
+        tests.iter().filter(|test| test.expected_failure && !test.covered_by_suite).map(|test| test.id.clone()).collect()
+    } else {
+        Vec::new()
+    };
     let context = Context {
         tests,
         runs,
@@ -487,6 +539,7 @@ fn run_with(mut options: Options, capture: bool) -> Result<(), String> {
         memory_gate: Mutex::new(Vec::new()),
         running: AtomicUsize::new(0),
         capture: capture.then(|| build::workspace_root().join(CAPTURE_DIR)),
+        accelerator,
     };
     if options.list {
         list(&context, &chosen);
@@ -520,6 +573,19 @@ fn run_with(mut options: Options, capture: bool) -> Result<(), String> {
         context.image_count(),
         if context.image_count() == 1 { "pasta" } else { "pastas" }
     );
+    let fixed: Vec<String> = context
+        .runs
+        .iter()
+        .filter_map(|run| context.tests[run.test].accelerator.as_ref().map(|accelerator| format!("{} ({accelerator})", context.tests[run.test].id)))
+        .collect();
+    println!(
+        "acelerador: {}{}",
+        context.accelerator,
+        if fixed.is_empty() { String::new() } else { format!("; fixado no components.toml: {}", fixed.join(", ")) }
+    );
+    if !skipped.is_empty() {
+        println!("fora da rodada (espera_falha; --espera-falha os inclui): {}", skipped.join(", "));
+    }
     if let Some(available) = host::available_commit() {
         let largest = context.runs.iter().map(|run| context.tests[run.test].memory).max().unwrap_or(0);
         println!(

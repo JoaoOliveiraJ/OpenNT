@@ -12,6 +12,12 @@ fn test_item(test: &TestRow) -> String {
     if test.covered_by_suite {
         chips.push_str(" <span class=\"chip tag\" title=\"coberto_pela_suite = true: as suítes já conferem os marcadores\">nas suítes</span>");
     }
+    if let Some(accelerator) = &test.accelerator {
+        chips.push_str(&format!(
+            " <span class=\"chip tag\" title=\"acelerador = &quot;{0}&quot; no components.toml: roda sempre neste acelerador\">{0}</span>",
+            escape(accelerator)
+        ));
+    }
     let summary = first_sentence(&test.description);
     let details = if summary.len() + 2 < test.description.len() {
         format!("<details><summary>Descrição completa</summary><p class=\"more\">{}</p></details>", escape(&test.description))
@@ -60,11 +66,15 @@ pub fn page(report: &Report) -> String {
          um QEMU quando a memória livre do host o cobre.</li>\
          <li>No fim, mostra a tabela com o resultado e, de cada falha, o trecho da serial que a explica; sai com erro se \
          algum teste falhar.</li>\
-         <li>{} marcado{} <code>espera_falha</code> (falha conhecida) sai à parte e não reprova a rodada; {} com \
-         <code>coberto_pela_suite</code> só roda{} à parte com <code>--only</code>.</li></ul>\n\
+         <li>Roda no WHPX (a virtualização do processador) quando o QEMU e a máquina o têm, senão no TCG; um teste com \
+         <code>acelerador = \"tcg\"</code> no <code>components.toml</code> roda sempre no TCG.</li>\
+         <li>{} marcado{} <code>espera_falha</code> (falha conhecida) fica fora da rodada padrão e roda com \
+         <code>--espera-falha</code>, sem reprovar a rodada; {} com <code>coberto_pela_suite</code> só roda{} à parte \
+         com <code>--only</code>. <code>--all</code> roda todos.</li></ul>\n\
          <p>Opções: <code>--only=ID,...</code>, <code>--skip=ID,...</code>, <code>--jobs=N</code>, <code>--repeat=N</code> \
-         (falhas intermitentes), <code>--suite</code> ou <code>--no-suite</code>, <code>--keep</code>, \
-         <code>--cpu-friendly</code> e <code>--list</code>.</p>\n\
+         (falhas intermitentes), <code>--suite</code> ou <code>--no-suite</code>, <code>--espera-falha</code>, \
+         <code>--all</code>, <code>--accel=tcg|whpx</code>, <code>--keep</code>, <code>--cpu-friendly</code> e \
+         <code>--list</code>.</p>\n\
          <h2>Um teste só</h2>\n<pre><code>cargo xtask test-all --only=ntfs\ncargo xtask test-boot SMSS_CSRSS_OK 300000 \
          --initial-process=smss --smp=1</code></pre>\n\
          <h2>Capturas de tela</h2>\n<pre><code>cargo xtask capturas\ncargo xtask capturas --only=win32k-display</code></pre>\n\

@@ -155,6 +155,41 @@ pub fn find_qemu() -> Result<PathBuf, String> {
     Err("QEMU nao encontrado: defina a variavel QEMU com o caminho de qemu-system-x86_64".into())
 }
 
+/// Os aceleradores que o `--accel` aceita; `auto` é o padrão do test-boot.
+pub const ACCELERATORS: &[&str] = &["auto", "tcg", "whpx"];
+
+/// O dispositivo inexistente da sondagem do WHPX.
+const PROBE_DEVICE: &str = "opennt-sonda";
+
+/// O acelerador de `--accel=auto`: o WHPX quando o QEMU o lista no
+/// `-accel help` e a partição dele sobe nesta máquina, senão o TCG. A
+/// sondagem sobe o QEMU com o WHPX e um dispositivo que não existe: o QEMU
+/// cria a partição antes dos dispositivos, então o erro do dispositivo
+/// prova que o WHPX iniciou (uns 100 ms), e qualquer outro erro é o do
+/// acelerador (sem o recurso Windows Hypervisor Platform, por exemplo).
+pub fn detect_accelerator() -> Result<&'static str, String> {
+    let qemu = find_qemu()?;
+    let help = Command::new(&qemu).args(["-accel", "help"]).output().map_err(|error| format!("{}: {error}", qemu.display()))?;
+    if !String::from_utf8_lossy(&help.stdout).lines().any(|line| line.trim() == "whpx") {
+        return Ok("tcg");
+    }
+    let probe = Command::new(&qemu)
+        .args(["-accel", "whpx", "-machine", "pc", "-cpu", "host", "-m", "64", "-display", "none", "-nodefaults", "-device", PROBE_DEVICE])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("{}: {error}", qemu.display()))?;
+    let errors = String::from_utf8_lossy(&probe.stderr);
+    Ok(if errors.contains(PROBE_DEVICE) { "whpx" } else { "tcg" })
+}
+
+/// Resolve o `auto` de `--accel`; `tcg` e `whpx` ficam como estão.
+pub fn resolve_accelerator(requested: &str) -> Result<String, String> {
+    match requested {
+        "auto" => detect_accelerator().map(String::from),
+        other => Ok(other.to_string()),
+    }
+}
+
 /// Os discos da máquina: o de boot (`os.img`), o volume NTFS de dados e o
 /// disco do controlador NVMe (`--storage=nvme`).
 pub struct Disks {
@@ -238,7 +273,12 @@ fn machine_arguments(disks: &Disks, machine: &MachineOptions, no_reboot: bool) -
         // tratam a exceção dependem disso. Requer QEMU 11.1+.
         if machine.accelerator == "whpx" { "whpx,ignore-unknown-msr=off".to_string() } else { machine.accelerator.clone() },
         "-machine".to_string(),
-        if machine.accelerator == "whpx" { "pc,kernel-irqchip=off" } else { "pc" }.to_string(),
+        // O LAPIC no hipervisor (modo x2APIC do WHPX): IPIs, EOIs e o timer
+        // do LAPIC não saem para o QEMU. Medido no suite-smp4: 40 s contra
+        // 59 s com o LAPIC no QEMU (kernel-irqchip=off), quase tudo nos IPIs
+        // da fase 7. O QEMU deste host (sem as funções de monitoramento de
+        // desempenho do WHPX, "legacy") só o liga quando pedido.
+        if machine.accelerator == "whpx" { "pc,kernel-irqchip=on" } else { "pc" }.to_string(),
     ];
     // TCG emula o modelo mais completo; em WHPX o modelo padrão (qemu64)
     // esconde RDRAND, que o boot exige, então a CPU do host é repassada.
@@ -928,8 +968,14 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
         }
     };
 
+    // Quando cada saída esperada chegou, contado da subida do QEMU (o
+    // tempo de cada fase do boot no test-boot.log).
+    let started = Instant::now();
+    let arrived = |needle: &str| println!("
+[xtask] {needle:?} aos {:.1} s", started.elapsed().as_secs_f64());
     let result = (|| -> Result<(), String> {
         let mut cursor = wait_for(&test.marker, 0)?;
+        arrived(&test.marker);
         if let Some(keys) = &test.keys {
             cursor = wait_for("[shell] pronto", 0)?;
             let mut monitor = connect_monitor(port, deadline)?;
@@ -937,6 +983,7 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
         }
         for expected in &test.expect {
             cursor = wait_for(expected, cursor)?;
+            arrived(expected);
         }
         if test.expect_poweroff {
             // O convidado precisa desligar a máquina sozinho, pelo ACPI.

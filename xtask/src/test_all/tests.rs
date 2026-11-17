@@ -1,7 +1,7 @@
 //! Testes do `test-all`: a leitura dos comandos do `components.toml`, a
 //! seleção e o trecho mostrado de uma falha.
 
-use super::plan::{self, split_words, Suites};
+use super::plan::{self, split_words, Extras, Suites};
 use super::report;
 
 #[test]
@@ -15,22 +15,27 @@ fn commands_split_like_the_shell() {
 
 /// Todo `[[teste]]` do `components.toml` vira um `test-boot` válido, com
 /// id único, e a seleção padrão leva as suítes e deixa de fora os cobertos
-/// por elas.
+/// por elas e os que esperam falha; `--espera-falha` e `--all` os trazem.
 #[test]
 fn every_components_test_is_a_valid_test_boot() {
     let tests = plan::load(&crate::build::workspace_root()).unwrap();
     assert!(tests.len() > 2);
-    let chosen = plan::select(&tests, &[], &[], Suites::Included).unwrap();
+    let chosen = plan::select(&tests, &[], &[], Suites::Included, Extras::default()).unwrap();
+    let with_failures = plan::select(&tests, &[], &[], Suites::Included, Extras { expected_failures: true, covered_by_suite: false }).unwrap();
+    let all = plan::select(&tests, &[], &[], Suites::Included, Extras { expected_failures: true, covered_by_suite: true }).unwrap();
+    assert_eq!(all.len(), tests.len());
     for (index, test) in tests.iter().enumerate() {
-        assert!(!test.arguments.iter().any(|word| word.starts_with("--build-dir=")), "{}", test.id);
-        assert_eq!(chosen.contains(&index), !test.covered_by_suite, "{}", test.id);
+        assert!(!test.arguments.iter().any(|word| word.starts_with("--build-dir=") || word.starts_with("--accel")), "{}", test.id);
+        assert_eq!(chosen.contains(&index), !test.covered_by_suite && !test.expected_failure, "{}", test.id);
+        assert_eq!(with_failures.contains(&index), !test.covered_by_suite, "{}", test.id);
+        assert!(test.accelerator.as_deref().is_none_or(|accelerator| plan::ACCELERATORS.contains(&accelerator)), "{}", test.id);
     }
     assert!(chosen.iter().any(|&index| tests[index].id == "suite-smp4"));
-    let only = plan::select(&tests, &[String::from("suite-smp1")], &[], Suites::Included).unwrap();
+    let only = plan::select(&tests, &[String::from("suite-smp1")], &[], Suites::Included, Extras::default()).unwrap();
     assert_eq!(only.len(), 1);
-    assert!(plan::select(&tests, &[String::from("nao-existe")], &[], Suites::Included).is_err());
+    assert!(plan::select(&tests, &[String::from("nao-existe")], &[], Suites::Included, Extras::default()).is_err());
     // As duas suítes dividem as imagens.
-    let runs = plan::runs(&tests, &plan::select(&tests, &[], &[], Suites::Only).unwrap(), 2);
+    let runs = plan::runs(&tests, &plan::select(&tests, &[], &[], Suites::Only, Extras::default()).unwrap(), 2);
     let names: Vec<&str> = runs.iter().map(|run| run.name.as_str()).collect();
     assert_eq!(names, ["suite-smp4.1", "suite-smp4.2", "suite-smp1.1", "suite-smp1.2"]);
     assert!(runs.iter().all(|run| run.image == 0));
@@ -43,7 +48,7 @@ fn every_components_test_is_a_valid_test_boot() {
 fn the_whole_round_compiles_one_kernel() {
     let tests = plan::load(&crate::build::workspace_root()).unwrap();
     let all: Vec<String> = tests.iter().map(|test| test.id.clone()).collect();
-    let runs = plan::runs(&tests, &plan::select(&tests, &all, &[], Suites::Included).unwrap(), 1);
+    let runs = plan::runs(&tests, &plan::select(&tests, &all, &[], Suites::Included, Extras::default()).unwrap(), 1);
     let mut kernels: Vec<&str> = runs.iter().map(|run| tests[run.test].kernel_key.as_str()).collect();
     kernels.dedup();
     assert_eq!(kernels.len(), 1, "builds do kernel diferentes na rodada");

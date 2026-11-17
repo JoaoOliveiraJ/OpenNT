@@ -10,6 +10,9 @@ use crate::status::toml;
 
 const COMPONENTS: &str = "docs/status/components.toml";
 
+/// Os valores da chave `acelerador` de um `[[teste]]`.
+pub const ACCELERATORS: &[&str] = &["tcg", "whpx"];
+
 /// A suíte completa de autoteste, rodada com 4 CPUs e com 1 (`--smp`).
 pub const SUITE: &[&str] = &[
     "PHASE3_SELFTEST_OK",
@@ -38,7 +41,8 @@ pub struct Test {
     pub arguments: Vec<String>,
     /// Uma das suítes completas (fora do `components.toml`).
     pub suite: bool,
-    /// `espera_falha = true`: falha conhecida, contada à parte.
+    /// `espera_falha = true`: falha conhecida; fora da rodada padrão, roda
+    /// com `--espera-falha`, `--all` ou `--only` e é contada à parte.
     pub expected_failure: bool,
     /// `coberto_pela_suite = true`: os marcadores dele as suítes já
     /// conferem; só roda quando pedido por `--only`.
@@ -49,6 +53,9 @@ pub struct Test {
     pub image_key: String,
     /// O kernel compilado (`BuildOptions::kernel_key`).
     pub kernel_key: String,
+    /// `acelerador = "tcg"`: o teste roda sempre neste acelerador; sem a
+    /// chave, no padrão da rodada (o WHPX quando a máquina o tem).
+    pub accelerator: Option<String>,
     /// Tempo máximo do `test-boot --no-build` (prazo + hold + folga).
     pub limit: Duration,
     /// Commit que o QEMU do teste faz ao subir (a memória do convidado
@@ -57,12 +64,20 @@ pub struct Test {
 }
 
 impl Test {
-    fn new(id: &str, arguments: Vec<String>, suite: bool, expected_failure: bool, covered_by_suite: bool) -> Result<Test, String> {
+    fn new(id: &str, arguments: Vec<String>, suite: bool, expected_failure: bool, covered_by_suite: bool, accelerator: Option<String>) -> Result<Test, String> {
         let mut command = vec![String::from("test-boot")];
         command.extend(arguments.iter().cloned());
         let parsed = crate::parse(command).map_err(|error| format!("teste {id}: {error}"))?;
         if parsed.build_only || parsed.no_build || parsed.image_dir.is_some() || parsed.build.windows_dir.is_some() || parsed.capture.is_some() {
             return Err(format!("teste {id}: --windows-dir, --build-only, --no-build, --image-dir e --capture sao escolhidos pelo test-all"));
+        }
+        if arguments.iter().any(|word| word.starts_with("--accel")) {
+            return Err(format!("teste {id}: o acelerador vem da chave acelerador do components.toml, nao de --accel no comando"));
+        }
+        if let Some(accelerator) = &accelerator {
+            if !ACCELERATORS.contains(&accelerator.as_str()) {
+                return Err(format!("teste {id}: acelerador aceita {} ({accelerator} recebido)", ACCELERATORS.join(", ")));
+            }
         }
         let (_, timeout_ms) = crate::marker_and_timeout(&parsed).map_err(|error| format!("teste {id}: {error}"))?;
         let options = crate::test_build_options(&parsed);
@@ -74,6 +89,7 @@ impl Test {
             suite,
             expected_failure,
             covered_by_suite,
+            accelerator,
             image_key: options.image_key(),
             kernel_key: options.kernel_key(),
             limit: Duration::from_millis(timeout_ms.saturating_add(parsed.hold_ms)) + GRACE,
@@ -174,7 +190,7 @@ pub fn load(root: &Path) -> Result<Vec<Test>, String> {
     for cpus in SUITE_CPUS {
         let mut arguments: Vec<String> = SUITE.iter().map(|word| word.to_string()).collect();
         arguments.push(format!("--smp={cpus}"));
-        tests.push(Test::new(&format!("suite-smp{cpus}"), arguments, true, false, false)?);
+        tests.push(Test::new(&format!("suite-smp{cpus}"), arguments, true, false, false, None)?);
     }
     let path = root.join(COMPONENTS);
     let text = fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
@@ -191,10 +207,15 @@ pub fn load(root: &Path) -> Result<Vec<Test>, String> {
         };
         let expected_failure = flag(entry, "espera_falha").map_err(|error| format!("teste {id}: {error}"))?;
         let covered_by_suite = flag(entry, "coberto_pela_suite").map_err(|error| format!("teste {id}: {error}"))?;
+        let accelerator = match entry.get("acelerador") {
+            None => None,
+            Some(toml::Value::String(value)) => Some(value.clone()),
+            Some(_) => return Err(format!("teste {id}: acelerador deve ser um texto")),
+        };
         if tests.iter().any(|test: &Test| test.id == id) {
             return Err(format!("{COMPONENTS}: id de teste repetido: {id}"));
         }
-        tests.push(Test::new(id, arguments, false, expected_failure, covered_by_suite)?);
+        tests.push(Test::new(id, arguments, false, expected_failure, covered_by_suite, accelerator)?);
     }
     Ok(tests)
 }
@@ -210,9 +231,19 @@ pub enum Suites {
     Excluded,
 }
 
+/// O que entra na rodada sem `--only`, além dos testes comuns.
+#[derive(Clone, Copy, Default)]
+pub struct Extras {
+    /// Os `espera_falha` (`--espera-falha` ou `--all`).
+    pub expected_failures: bool,
+    /// Os `coberto_pela_suite` (`--all`).
+    pub covered_by_suite: bool,
+}
+
 /// Índices dos testes escolhidos: os de `only` na ordem dada, ou todos os
-/// que não são `coberto_pela_suite`; depois saem os de `skip`.
-pub fn select(tests: &[Test], only: &[String], skip: &[String], suites: Suites) -> Result<Vec<usize>, String> {
+/// que não são `coberto_pela_suite` nem `espera_falha` (os dois entram com
+/// `extras`); depois saem os de `skip`.
+pub fn select(tests: &[Test], only: &[String], skip: &[String], suites: Suites, extras: Extras) -> Result<Vec<usize>, String> {
     let find = |id: &str| {
         tests
             .iter()
@@ -227,7 +258,8 @@ pub fn select(tests: &[Test], only: &[String], skip: &[String], suites: Suites) 
                 Suites::Only => test.suite,
                 Suites::Excluded => !test.suite,
             };
-            if wanted && !test.covered_by_suite {
+            let extra = (test.covered_by_suite && !extras.covered_by_suite) || (test.expected_failure && !extras.expected_failures);
+            if wanted && !extra {
                 chosen.push(index);
             }
         }

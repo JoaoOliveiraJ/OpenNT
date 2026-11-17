@@ -26,7 +26,8 @@
 //! Fora `--release` e `--windows-dir`, elas não recompilam o kernel: vão no bloco de opções de
 //! carga da imagem de boot (`build.rs`), e o `--initial-process=smss` também troca o volume
 //! NTFS.
-//! Opções de máquina: `--accel=tcg|whpx`, `--memory-mb=N`, `--smp=N`, `--kd-port=N`,
+//! Opções de máquina: `--accel=auto|tcg|whpx` (o test-boot usa `auto`, o WHPX quando a máquina
+//! o tem; o `run` e o `debug` usam o TCG), `--memory-mb=N`, `--smp=N`, `--kd-port=N`,
 //! `--monitor-port=N` (o monitor HMP do QEMU num socket local, no `debug`)
 //! (a porta TCP da COM2; `run` usa 1234 por padrão).
 //! Em `--keys`, `\n` digita Enter.
@@ -84,7 +85,8 @@ opcoes de build:   --release --build-dir=DIR --user-program=shell
                    --shutdown-test=poweroff|reboot (com --start-driver=ntfs: grava e desliga)
                    --memory-pressure (com --initial-process=smss: teste de pressao de memoria
                    sobre o arquivo de paginacao)
-opcoes de maquina: --accel=tcg|whpx --memory-mb=N --smp=N --kd-port=N --monitor-port=N
+opcoes de maquina: --accel=auto|tcg|whpx (test-boot: auto = whpx quando a maquina tem; run e debug: tcg)
+                   --memory-mb=N --smp=N --kd-port=N --monitor-port=N
 test-boot:         --keys=TEXTO (\\n = Enter) --expect=TEXTO (repetivel)
                    --hold=MS (segue rodando MS ms sem falha depois da ultima saida)
                    --build-only (so monta a imagem do teste) --no-build (usa a imagem ja montada)
@@ -139,7 +141,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
     let mut iterator = arguments.into_iter();
     let command = iterator.next().ok_or_else(|| USAGE.to_string())?;
     let mut parsed = Arguments {
-        command,
+        command: command.clone(),
         build: BuildOptions {
             release: false,
             build_dir: PathBuf::from("build"),
@@ -158,7 +160,17 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             usb: false,
             memory_pressure: false,
         },
-        machine: MachineOptions { accelerator: "tcg".into(), memory_mb: 4096, smp: 4, kd_port: None, usb: false, monitor_port: None },
+        // O test-boot roda no WHPX quando a máquina o tem (`auto`); o `run`
+        // e o `debug` ficam no TCG, que o rastro de instruções do depurador
+        // gráfico exige.
+        machine: MachineOptions {
+            accelerator: if command == "test-boot" { "auto" } else { "tcg" }.into(),
+            memory_mb: 4096,
+            smp: 4,
+            kd_port: None,
+            usb: false,
+            monitor_port: None,
+        },
         positional: Vec::new(),
         keys: None,
         expect: Vec::new(),
@@ -255,6 +267,9 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
     if parsed.expect_poweroff && parsed.hold_ms > 0 {
         return Err("--expect-poweroff e --hold se excluem (a maquina desliga)".into());
     }
+    if !qemu::ACCELERATORS.contains(&parsed.machine.accelerator.as_str()) {
+        return Err(format!("--accel aceita {} ({} recebido)", qemu::ACCELERATORS.join(", "), parsed.machine.accelerator));
+    }
     if !matches!(parsed.build.kd.as_str(), "" | "com2" | "com3" | "com4") {
         return Err(format!("--kd aceita com2, com3 ou com4 ({} recebido; a COM1 e o log do kernel)", parsed.build.kd));
     }
@@ -311,6 +326,7 @@ fn execute(arguments: Arguments) -> Result<(), String> {
         "run" => {
             let output = build::build(&arguments.build)?;
             let mut machine = arguments.machine.clone();
+            machine.accelerator = qemu::resolve_accelerator(&machine.accelerator)?;
             if !arguments.build.kd.is_empty() && machine.kd_port.is_none() {
                 machine.kd_port = Some(1234);
             }
@@ -348,6 +364,7 @@ fn execute(arguments: Arguments) -> Result<(), String> {
             }
             let log = build_dir.join("serial.log");
             let mut machine = arguments.machine.clone();
+            machine.accelerator = qemu::resolve_accelerator(&machine.accelerator)?;
             if !options.kd.is_empty() && machine.kd_port.is_none() {
                 machine.kd_port = Some(qemu::free_port()?);
             }
@@ -417,6 +434,7 @@ fn debug_command(arguments: Arguments) -> Result<(), String> {
         options.kd = "com2".into();
     }
     let mut machine = arguments.machine.clone();
+    machine.accelerator = qemu::resolve_accelerator(&machine.accelerator)?;
     let port = match machine.kd_port {
         Some(port) => port,
         None => qemu::free_port()?,
