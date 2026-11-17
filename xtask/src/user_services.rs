@@ -10,8 +10,10 @@
 //! `svchost.exe -k rpcss -p`).
 //!
 //! Como os binários de System32, as chaves vêm desta máquina no build, com os
-//! valores daqui: as chaves de serviço desses quatro (com Parameters e
-//! Security), a ordem dos grupos de serviço (`Control\ServiceGroupOrder`) e,
+//! valores daqui: as chaves de serviço desses quatro e as do Power, do
+//! BrokerInfrastructure e do SystemEventsBroker (com Parameters e
+//! Security), a ordem dos grupos de serviço (`Control\ServiceGroupOrder`),
+//! a configuração de energia (`Control\Power`) e,
 //! na SOFTWARE, os grupos do svchost (`Microsoft\Windows NT\CurrentVersion\
 //! Svchost`, os valores com a lista de serviços de cada grupo, e
 //! `Microsoft\Rpc\SecurityService`, os provedores de autenticação do RPC, e
@@ -26,8 +28,11 @@
 
 use crate::host_language::HostKey;
 
-/// Os serviços da cadeia do LSM.
-const SERVICES: &[&str] = &["DcomLaunch", "RpcEptMapper", "RpcSs", "LSM"];
+/// Os serviços da cadeia do LSM e os do mesmo svchost do DcomLaunch que o
+/// início automático sobe com ele: o Power (o umpo.dll, que o
+/// ScAutoStartServices inicia pelo nome antes dos outros), o
+/// BrokerInfrastructure e o SystemEventsBroker.
+const SERVICES: &[&str] = &["DcomLaunch", "RpcEptMapper", "RpcSs", "LSM", "Power", "BrokerInfrastructure", "SystemEventsBroker"];
 
 /// As chaves da hive SYSTEM, já no conjunto de controle que a hive guarda
 /// (`control_set`, como `ControlSet001`).
@@ -41,6 +46,10 @@ pub fn system_keys(control_set: &str) -> Vec<HostKey> {
             registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\Services\\{service}"), &format!("{control_set}\\Services\\{service}"), true, &mut keys);
         }
         registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\Control\\ServiceGroupOrder"), &format!("{control_set}\\Control\\ServiceGroupOrder"), false, &mut keys);
+        // A configuração de energia que o serviço Power (o umpo.dll) lê: os
+        // esquemas, as configurações e os padrões (o Control\Power com as
+        // subchaves que esta conta lê).
+        registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\Control\\Power"), &format!("{control_set}\\Control\\Power"), true, &mut keys);
         registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\Control\\LsaExtensionConfig"), &format!("{control_set}\\Control\\LsaExtensionConfig"), true, &mut keys);
         // A configuração dos Serviços de Terminal com as subchaves
         // (WinStations, AddIns, TerminalTypes, RCM e as outras): o
