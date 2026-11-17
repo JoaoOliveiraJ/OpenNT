@@ -2951,7 +2951,20 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   (`ex/system_information.rs::query_fixed`, também no Zw). O NtCreateTimer,
   o NtSetTimer e o NtCancelTimer de modo usuário são adaptadores do ETIMER
   do Executive (`ex/timer_object.rs`, PreviousMode UserMode, em
-  `ps/user/timer_objects.rs`). Um serviço sem
+  `ps/user/timer_objects.rs`). O services.exe e o lsass pedem ainda as
+  classes ProcessTimes (4), ProcessImageFileNameWin32 (43) e
+  ProcessMitigationPolicy (52) do NtQueryInformationProcess
+  (`ps/query_process.rs`), a ProcessRaiseUMExceptionOnInvalidHandleClose
+  (71) do NtSetInformationProcess, a TokenMandatoryPolicy (27) do
+  NtSetInformationToken, as classes SystemObjectSecurityMode (70),
+  SystemIsolatedUserModeInformation (165), SystemFlushInformation (192) e
+  SystemWriteConstraintInformation (195) do NtQuerySystemInformation, o
+  NtQuerySystemEnvironmentValueEx (o privilégio antes do
+  STATUS_NOT_IMPLEMENTED do firmware BIOS) e o NtUpdateWnfStateData e o
+  NtCreateWnfStateName de modo usuário (`ex/wnf/service.rs`), todos como
+  no 19041. Um NtCreateKey com componente intermediário ausente devolve
+  STATUS_OBJECT_NAME_NOT_FOUND, como o CmpDoParseKey: é o status que faz o
+  kernelbase criar o caminho um componente de cada vez. Um serviço sem
   provedor nenhum (nem handler de usuário nem export) cai na falha comum da
   tabela nativa, que devolve STATUS_NOT_IMPLEMENTED sem passar pelo
   despacho; a entrada de syscall de usuário avisa uma vez por serviço
@@ -3106,7 +3119,30 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   o gProtocolType de console, 0) monta a configuração de exibição só com o
   dispositivo desconectado (`\Device\Disc`, TSDDD, o stub sem imagem do
   ldevLoadDriver): o cdd.dll não é carregado e o xxxSwitchDesktop pinta a
-  superfície desconectada. O RtlGetActiveConsoleId lê o ActiveConsoleId da
+  superfície desconectada. O lsm.dll cria a porta ALPC
+  `\SmSsWinStationApiPort` (o CCsrMgr, mensagens de 0x4070 bytes); o csrss
+  de cada sessão cria o `Global\TermSrvReadyEvent`, o lsm o sinaliza, e o
+  winsrvext.dll conecta à porta e manda um pedido síncrono cuja resposta é
+  o próximo comando. O comando de conexão chega ao W32WinStationDoConnect:
+  o NtUserRemoteConnect do win32kfull chama o xxxRemoteConnect do
+  win32kbase, que no console só chama o GreDxgkSessionConnected (o
+  InitVideo da sessão já rodou); o DxgkSessionConnected do dxgkrnl chama o
+  DXGSESSIONMGR::SetConsoleSession, avisa o TTM e enfileira o callout de
+  troca de tela, que volta ao win32k pelo SMgrGdiCallout do watchdog.sys
+  num work item; o win32k carrega então o cdd.dll pelo
+  ZwSetSystemInformation(26). O lsm exige o `Control\Terminal Server` e o
+  `WinStations` (copiados desta máquina pelo xtask), carrega o sysntfy.dll,
+  o WMsgAPI.dll e o usermgrcli.dll, abre o `\KernelObjects\Session<id>` de
+  cada sessão pelo NtOpenSession (`mm/session_object.rs`) e avisa as
+  mudanças de estado pelo NtNotifyChangeSession
+  (`io/session_notification.rs`: a IoStateSequence sob o evento de
+  sincronização do MM_SESSION_SPACE, o IoState e o aviso ao
+  IopSessionCallbackObject, síncrono para Created e Terminated e pelo
+  IopSessionChangeWorker para os outros). O cdd.dll importa o
+  KeSetActualBasePriorityThread, que troca a base absoluta da thread
+  (`ke/thread_priority.rs`), e a RawInputThread pede a classe 82 do
+  NtSetSystemInformation (SystemThreadPriorityClientIdInformation), que usa
+  esse serviço. O RtlGetActiveConsoleId lê o ActiveConsoleId da
   KUSER_SHARED_DATA (`rtl/shared_data.rs`), que o win32k grava: 0 no
   DriverEntry da sessão 0, -1 quando o InitVideo dela fecha os dispositivos
   de vídeo e o id da primeira sessão interativa no DriverEntry dela (o
