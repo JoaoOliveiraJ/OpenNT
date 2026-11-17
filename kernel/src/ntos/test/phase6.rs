@@ -14351,6 +14351,29 @@ fn se_logon_session_exports(assert: Assert) {
         policy_set == 0 && policy_value == 3 && modified_after != modified_before && policy_short == 0xC000_0004 && policy_invalid == 0xC000_000D && primary != 0 && policy_in_use == 0xC000_012B,
         "se-token: TokenMandatoryPolicy grava a politica (bits invalidos, tamanho e token em uso recusados)",
     );
+    // TokenOrigin (17): 8 bytes, só o primeiro valor fica; o
+    // NtQueryInformationToken devolve o OriginatingLogonSession.
+    // TokenAuditPolicy (16): uma vez só; com buffer copia os 0x1F bytes.
+    let buffer = guest::alloc_bytes(0x40);
+    let _ = tokens::update(pointer, |token| {
+        token.originating_logon_session = 0;
+        token.audit_policy_status = 0;
+    });
+    guest::write64(buffer, 0x3E7);
+    let origin_set = set_information::set(pointer, 17, buffer, 8, 0).unwrap_or(u32::MAX);
+    guest::write64(buffer, 0x1234);
+    let origin_again = set_information::set(pointer, 17, buffer, 8, 0).unwrap_or(u32::MAX);
+    let origin_short = set_information::set(pointer, 17, buffer, 4, 0).unwrap_or(u32::MAX);
+    let origin_value = tokens::with(pointer, |token| token.originating_logon_session).unwrap_or(0);
+    guest::write_bytes(buffer, &[0x11; 0x1F]);
+    let audit_set = set_information::set(pointer, 16, buffer, 0x1F, 0).unwrap_or(u32::MAX);
+    let audit_again = set_information::set(pointer, 16, 0, 0, 0).unwrap_or(u32::MAX);
+    let (audit_status, audit_policy) = tokens::with(pointer, |token| (token.audit_policy_status, token.audit_policy)).unwrap_or((0, [0; 0x1F]));
+    guest::free_bytes(buffer);
+    assert(
+        origin_set == 0 && origin_again == 0 && origin_short == 0xC000_0004 && origin_value == 0x3E7 && audit_set == 0 && audit_again == 0xC000_000D && audit_status == 2 && audit_policy == [0x11; 0x1F],
+        "se-token: TokenOrigin grava so a primeira origem; TokenAuditPolicy grava a politica uma vez",
+    );
     // NtAccessCheckAndAuditAlarm: o nível de impersonação da thread precisa
     // ser SecurityIdentification ou mais.
     let outputs = guest::alloc_bytes(0x20);

@@ -29,6 +29,12 @@
 //!   STATUS_OBJECT_NAME_COLLISION), DELETE (3, um nome ausente é
 //!   STATUS_NOT_FOUND) e REPLACE (4, troca ou acrescenta).
 //!
+//! - TokenAuditPolicy (16): com o SeTcbPrivilege e uma vez só (outro
+//!   pedido é STATUS_INVALID_PARAMETER); sem buffer marca o token sem
+//!   política, com buffer copia o TOKEN_AUDIT_POLICY de 0x1F bytes.
+//! - TokenOrigin (17): o LUID OriginatingLogonSession (8 bytes), com o
+//!   SeTcbPrivilege; só o primeiro valor fica. O LSA grava os dois no token
+//!   de cada logon (o LsapCreateTokenObject).
 //! - TokenMandatoryPolicy (27): o TOKEN_MANDATORY_POLICY (4 bytes), com o
 //!   SeTcbPrivilege; o token primário de um processo vivo (TokenInUse) é
 //!   STATUS_TOKEN_ALREADY_IN_USE, e bits fora de NO_WRITE_UP e
@@ -59,6 +65,7 @@ const STATUS_INVALID_OWNER: u32 = 0xC000_005A;
 const STATUS_INVALID_PRIMARY_GROUP: u32 = 0xC000_005B;
 const STATUS_PRIVILEGE_NOT_HELD: u32 = 0xC000_0061;
 const STATUS_TOKEN_ALREADY_IN_USE: u32 = 0xC000_012B;
+const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
 const STATUS_INVALID_ACL: u32 = 0xC000_0077;
 const STATUS_INVALID_SID: u32 = 0xC000_0078;
 const STATUS_NOT_FOUND: u32 = 0xC000_0225;
@@ -203,6 +210,56 @@ pub fn set(token: u64, class: u32, information: u64, length: u32, mode: u8) -> R
             }
             tokens::stop_referencing_logon_session(token);
             return Ok(0);
+        }
+        // TokenAuditPolicy: com o SeTcbPrivilege, uma vez só (um
+        // PolicySetStatus já gravado é STATUS_INVALID_PARAMETER); sem
+        // buffer o token fica marcado sem política (1), com buffer o
+        // TOKEN_AUDIT_POLICY (0x1F bytes, alinhado a 4 em UserMode, o
+        // SepCaptureAuditPolicy) é copiado (2).
+        16 => {
+            if !tcb() {
+                return Ok(STATUS_PRIVILEGE_NOT_HELD);
+            }
+            if tokens::with(token, |record| record.audit_policy_status != 0).unwrap_or(true) {
+                return Ok(STATUS_INVALID_PARAMETER);
+            }
+            let policy = if information == 0 {
+                None
+            } else {
+                if mode != 0 && information & 3 != 0 {
+                    return Ok(STATUS_DATATYPE_MISALIGNMENT);
+                }
+                let Ok(bytes) = guest::try_read_bytes(information, tokens::TOKEN_AUDIT_POLICY_SIZE) else { return Ok(STATUS_ACCESS_VIOLATION) };
+                let mut policy = [0u8; tokens::TOKEN_AUDIT_POLICY_SIZE];
+                policy.copy_from_slice(&bytes);
+                Some(policy)
+            };
+            tokens::update(token, |record| match policy {
+                Some(policy) => {
+                    record.audit_policy = policy;
+                    record.audit_policy_status = 2;
+                }
+                None => record.audit_policy_status = 1,
+            })
+            .map_or(STATUS_INVALID_PARAMETER, |_| 0)
+        }
+        // TokenOrigin: o LUID OriginatingLogonSession (8 bytes), com o
+        // SeTcbPrivilege; só o primeiro valor fica (um token que já tem a
+        // origem a conserva), e o ModifiedId muda de qualquer modo.
+        17 => {
+            if length != 8 {
+                return Ok(STATUS_INFO_LENGTH_MISMATCH);
+            }
+            let Ok(origin) = guest::try_read::<u64>(information) else { return Ok(STATUS_ACCESS_VIOLATION) };
+            if !tcb() {
+                return Ok(STATUS_PRIVILEGE_NOT_HELD);
+            }
+            tokens::update(token, |record| {
+                if record.originating_logon_session == 0 {
+                    record.originating_logon_session = origin;
+                }
+            })
+            .map_or(STATUS_INVALID_PARAMETER, |_| 0)
         }
         // TokenMandatoryPolicy: o TOKEN_MANDATORY_POLICY (4 bytes) com o
         // SeTcbPrivilege, num token que não é o primário de um processo

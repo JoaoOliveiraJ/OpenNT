@@ -139,7 +139,18 @@ pub struct Token {
     /// TOKEN_SOURCE (SourceName e SourceIdentifier) de um token criado pelo
     /// NtCreateToken; `None` nos tokens do contexto de boot.
     pub source: Option<([u8; 8], u64)>,
+    /// TokenOrigin: o OriginatingLogonSession, zero até o LSA gravá-lo (uma
+    /// vez só); as cópias herdam o do pai.
+    pub originating_logon_session: u64,
+    /// TokenAuditPolicy: o PolicySetStatus do SEP_AUDIT_POLICY (0 sem
+    /// política, 1 marcada sem política, 2 com a política) e o
+    /// TOKEN_AUDIT_POLICY gravado.
+    pub audit_policy_status: u8,
+    pub audit_policy: [u8; TOKEN_AUDIT_POLICY_SIZE],
 }
+
+/// O TOKEN_AUDIT_POLICY (o PerUserPolicy das subcategorias de auditoria).
+pub const TOKEN_AUDIT_POLICY_SIZE: usize = 0x1F;
 
 struct Storage {
     pointer: u64,
@@ -354,6 +365,9 @@ pub fn create(parent: Option<u64>, initialize: Option<&dyn Fn(&mut Token)>) -> R
         // token do System; as cópias conservam a do pai.
         mandatory_policy: parent.as_ref().map_or(TOKEN_MANDATORY_POLICY_NO_WRITE_UP, |parent| parent.mandatory_policy),
         source: parent.as_ref().and_then(|parent| parent.source),
+        originating_logon_session: parent.as_ref().map_or(0, |parent| parent.originating_logon_session),
+        audit_policy_status: parent.as_ref().map_or(0, |parent| parent.audit_policy_status),
+        audit_policy: parent.as_ref().map_or([0; TOKEN_AUDIT_POLICY_SIZE], |parent| parent.audit_policy),
     };
     // Identidades especiais definem seus campos antes do armazenamento dinâmico.
     if let Some(initialize) = initialize {

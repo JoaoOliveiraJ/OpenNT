@@ -259,9 +259,10 @@ pub fn encode(token_pointer: u64, class: u32, base: u64) -> Result<Vec<u8>, u32>
         30 => layout.groups(&token.capabilities),
         29 => layout.scalar(token.app_container.is_some() as u32),
         12 => layout.scalar(token.session_id),
+        // TokenOrigin: o OriginatingLogonSession (zero até o LSA gravá-lo).
         17 => {
             layout.reserve(8);
-            layout.u64(0, token.authentication_id);
+            layout.u64(0, token.originating_logon_session);
         }
         // TokenElevationTypeDefault: sem token vinculado ou filtrado.
         18 => layout.scalar(1),
