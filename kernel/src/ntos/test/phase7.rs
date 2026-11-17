@@ -1677,8 +1677,15 @@ fn user_threads_in(assert: Assert, test: &TestProcess) {
     assert(call("NtAlertThreadByThreadId", thread.thread_id, 0, 0, 0) == 0 && call("NtWaitForAlertByThreadId", 0, 0, 0, 0) == 0x101 && call("NtAlertThreadByThreadId", 0xFFFF_0000, 0, 0, 0) == 0xC000_000B, "userthreads: alerta por id consumido");
     delay.quad_part.set(0);
     assert(call("NtWaitForAlertByThreadId", 0, timeout, 0, 0) == 0x102, "userthreads: espera de alerta com prazo zero");
-    delay.quad_part.set(-1);
-    assert(call("NtDelayExecution", 0, timeout, 0, 0) == 0 && !thread.waiting(), "userthreads: atraso vencido retorna sem bloquear");
+    // Atraso zero não alertável: só a troca do NtYieldExecution (sucesso
+    // ou STATUS_NO_YIELD_PERFORMED), sem espera; alertável, a espera de
+    // prazo zero vence com STATUS_SUCCESS.
+    let yielded = call("NtDelayExecution", 0, timeout, 0, 0);
+    assert((yielded == 0 || yielded == 0x4000_0024) && !thread.waiting() && call("NtDelayExecution", 1, timeout, 0, 0) == 0 && !thread.waiting(), "userthreads: atraso zero cede a vez sem bloquear");
+    // Um prazo não nulo abaixo de 1 ms espera o próximo ms, em vez de vencer
+    // de imediato; o absoluto já passado vence.
+    let rounding = [(Some(-1), Some(1)), (Some(-10_000), Some(1)), (Some(-10_001), Some(2)), (Some(0), Some(0)), (Some(1), Some(0)), (None, None)];
+    assert(rounding.iter().all(|&(value, ms)| crate::ntos::ke::dispatcher::timeout_value_to_ms(value) == ms), "userthreads: prazos abaixo de 1 ms arredondados para cima");
     let immediate = threads::wait_custom(Wait { poll: Some(alloc::boxed::Box::new(|| Some(0x77))), cleanup: Some(alloc::boxed::Box::new(|status| THREAD_WAIT_CLEANUP.store(status, Ordering::Release))), ..Wait::default() }, 0, Some(None));
     assert(immediate == 0x77 && THREAD_WAIT_CLEANUP.load(Ordering::Acquire) == 0x77, "userthreads: espera personalizada imediata com limpeza");
     // Retirada de IOCP: pacote disponível e espera bloqueada.

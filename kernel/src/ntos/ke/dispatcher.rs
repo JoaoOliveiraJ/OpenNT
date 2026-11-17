@@ -312,15 +312,18 @@ pub fn timeout_value_to_100ns(value: i64) -> u64 {
     (value as u64).saturating_sub(clock::system_time_100ns())
 }
 
-/// Prazo apontado por `timeout_pointer`, em ms inteiros.
+/// Prazo apontado por `timeout_pointer`, em ms inteiros arredondados para
+/// cima: um prazo não nulo abaixo de 1 ms espera até o próximo ms (como o
+/// NT, que nunca vence um prazo não nulo antes do próximo tick), em vez de
+/// vencer de imediato.
 pub fn timeout_pointer_to_ms(timeout_pointer: u64) -> Option<u64> {
-    timeout_to_100ns(timeout_pointer).map(|value| value / 10_000)
+    timeout_to_100ns(timeout_pointer).map(|value| value.div_ceil(10_000))
 }
 
 /// O prazo capturado de uma espera de modo usuário (`None` = sem prazo), em
-/// ms inteiros.
+/// ms inteiros arredondados para cima, como [`timeout_pointer_to_ms`].
 pub fn timeout_value_to_ms(value: Option<i64>) -> Option<u64> {
-    value.map(|value| timeout_value_to_100ns(value) / 10_000)
+    value.map(|value| timeout_value_to_100ns(value).div_ceil(10_000))
 }
 
 static LAST_SCHEDULER_TICK: SpinLock<u64> = SpinLock::new(0);

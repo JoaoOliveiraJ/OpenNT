@@ -1820,11 +1820,28 @@ fn nt_query_information_thread(handle: u64, class: u64, out: u64, length: u64, r
     })
 }
 
-fn nt_delay_execution(alertable: u64, timeout: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
-    if !probe_user_read(timeout, 8) {
-        return Ok(0xC000_0005);
+/// NtDelayExecution(Alertable, DelayInterval*), como o
+/// KeDelayExecutionThread 19041: o intervalo é capturado; zero, sem
+/// Alertable e sem UserApcPending, é só a troca de thread do
+/// NtYieldExecution (STATUS_SUCCESS se outra thread pronta assumiu,
+/// STATUS_NO_YIELD_PERFORMED se não); senão a espera do timer da thread:
+/// STATUS_SUCCESS no vencimento (um intervalo não nulo nunca vence antes do
+/// próximo tick, nem abaixo de 1 ms), STATUS_ALERTED ou STATUS_USER_APC.
+fn nt_delay_execution(alertable: u64, interval: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
+    let interval = match state::capture_large_integer(interval) {
+        Ok(interval) => interval,
+        Err(status) => return Ok(status),
+    };
+    let alertable = alertable & 0xFF != 0;
+    if interval == 0 && !alertable {
+        // A UserApcPending já publicada encerra a espera não alertável de
+        // UserMode antes da troca (KiBeginThreadWait).
+        if let Some(status) = thread_alert::consume(process::get_current_thread(), 1, false) {
+            return Ok(status);
+        }
+        return nt_yield_execution(0, 0, 0, 0, 0);
     }
-    Ok(wait_custom(Wait { delay: true, alertable: Some(alertable & 0xFF != 0), ..Wait::default() }, timeout, None))
+    Ok(wait_custom(Wait { delay: true, alertable: Some(alertable), ..Wait::default() }, 0, Some(dispatcher::timeout_value_to_ms(Some(interval)))))
 }
 
 fn nt_alert_thread(handle: u64, _a2: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
@@ -1838,14 +1855,15 @@ fn nt_yield_execution(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _rsp: u64) -> Resu
 }
 
 fn nt_wait_for_alert_by_thread_id(_address: u64, timeout: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
-    if timeout != 0 && !probe_user_read(timeout, 8) {
-        return Ok(0xC000_0005);
-    }
+    let timeout = match state::capture_timeout(timeout) {
+        Ok(timeout) => timeout,
+        Err(status) => return Ok(status),
+    };
     let Some(current) = current() else { return Ok(NOT_SUPPORTED) };
     if current.with(|thread| core::mem::replace(&mut thread.alerted, false)) {
         return Ok(0x101);
     }
-    let ms = dispatcher::timeout_pointer_to_ms(timeout);
+    let ms = dispatcher::timeout_value_to_ms(timeout);
     if ms == Some(0) {
         return Ok(0x102);
     }

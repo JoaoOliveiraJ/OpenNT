@@ -859,7 +859,12 @@ WaitAll recusa com STATUS_INVALID_HANDLE) e, nos demais tipos, o
 ObpDefaultObject (um evento de notificação sempre sinalizado); Count fora de
 1..64 dá STATUS_INVALID_PARAMETER_1, WaitType além de WaitAny
 STATUS_INVALID_PARAMETER_3, e um objeto repetido só é recusado no WaitAll
-(STATUS_INVALID_PARAMETER_MIX). O autoteste
+(STATUS_INVALID_PARAMETER_MIX). Os prazos dessas esperas sondadas contam em
+ms arredondados para cima (um prazo não nulo abaixo de 1 ms espera o
+próximo ms, nunca vence de imediato). O NtDelayExecution com intervalo zero,
+sem Alertable e sem UserApcPending, é a troca do NtYieldExecution
+(STATUS_SUCCESS ou STATUS_NO_YIELD_PERFORMED), como no
+KeDelayExecutionThread. O autoteste
 `ntos/test/multiprocess/blocking_wait.rs` roda duas threads de um processo
 real no despachante: a 1 espera um KEVENT sem prazo numa syscall de teste e
 a 2, que só fica pronta depois disso, a vê bloqueada (Waiting, KernelStack
