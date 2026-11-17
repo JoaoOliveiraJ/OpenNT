@@ -24,13 +24,24 @@ pub fn init() {
     FIFO_SIZE.store(size, Ordering::Relaxed);
 }
 
+/// Um lote de até uma FIFO cheia depois de THRE, numa instrução só (`rep
+/// outsb`): sob um hipervisor, cada OUT é uma saída da máquina virtual, e a
+/// instrução de string inteira sai uma vez.
 fn send(bytes: &[u8]) {
     let flags = cpu::save_and_disable_interrupts();
     while port::read8(COM1 + 5) & 0x20 == 0 {
         core::hint::spin_loop();
     }
-    for &byte in bytes {
-        port::write8(COM1, byte);
+    // SAFETY: lê `bytes.len()` bytes de `bytes` (DF é zero pela ABI) e os
+    // escreve na porta de dados da COM1.
+    unsafe {
+        core::arch::asm!(
+            "rep outsb",
+            in("dx") COM1,
+            inout("rsi") bytes.as_ptr() => _,
+            inout("rcx") bytes.len() => _,
+            options(nostack, preserves_flags, readonly),
+        );
     }
     cpu::restore_interrupts(flags);
 }
