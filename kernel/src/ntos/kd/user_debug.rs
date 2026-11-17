@@ -18,16 +18,27 @@
 //!   pulado (o RIP + 1 do KdpTrap) e as outras exceções seguem ao processo,
 //!   a menos que o host tenha mudado o RIP.
 //!
+//! - #DB de um comparador de hardware de usuário do depurador
+//!   (`kd::user_hardware`, o DR6 do CONTEXT) na thread de um processo com a
+//!   mesma raiz: a máquina para; continuar de um comparador de execução
+//!   desliga o comparador por um passo da thread;
+//! - #PF com o bit RSVD numa página com breakpoint de memória
+//!   (`kd::page_breakpoints`): a página volta ao normal, a máquina para se
+//!   o tipo de acesso bate, e a instrução executa num passo antes de o bit
+//!   voltar.
+//!
 //! Na parada, o host vê um quadro de trap montado do CONTEXT (CS 0x33, a
 //! TEB como base de GS, x87/SSE do FltSave) e o espaço de endereços é o do
-//! processo. O quadro volta ao CONTEXT na saída.
+//! processo. Os registradores de depuração que ele lê são os do CONTEXT. O
+//! quadro volta ao CONTEXT na saída.
 
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use super::breakpoints::{self, HitOwner};
+use super::breakpoints::{self, HitOwner, Watch};
 use super::packet::Payload;
 use super::stop::{self, Kind, UserResume};
+use super::{page_breakpoints, user_hardware};
 use crate::hal::amd64::irqstubs::TrapFrame;
 use crate::hal::cpu;
 use crate::ntos::inc::field::NtStruct;
@@ -38,6 +49,7 @@ const USER_CODE: u64 = 0x33;
 const USER_DATA: u64 = 0x2B;
 const VECTOR_DEBUG: u32 = 1;
 const VECTOR_BREAKPOINT: u32 = 3;
+const VECTOR_PAGE_FAULT: u32 = 14;
 const VECTOR_DEBUG_SERVICE: u32 = 0x2D;
 
 /// O CONTEXT da thread que dá um passo do depurador (0 = nenhuma).
@@ -51,6 +63,35 @@ static BREAK_ON_EXCEPTIONS: AtomicBool = AtomicBool::new(false);
 /// Paradas e passagens (para o `monitor uex`).
 static STOPS: AtomicU64 = AtomicU64::new(0);
 static FOREIGN_HITS: AtomicU64 = AtomicU64::new(0);
+/// O CONTEXT da thread parada agora (0 = nenhuma parada de usuário).
+static CURRENT_CONTEXT: AtomicU64 = AtomicU64::new(0);
+/// O comparador de usuário desligado pelo passo (índice + 1; 0 = nenhum).
+static STEP_HARDWARE: AtomicU64 = AtomicU64::new(0);
+/// A página de breakpoint de memória a rearmar depois do passo (página |
+/// 1; 0 = nenhuma) e a raiz dela.
+static STEP_PAGE: AtomicU64 = AtomicU64::new(0);
+static STEP_PAGE_ROOT: AtomicU64 = AtomicU64::new(0);
+
+/// O CONTEXT da thread de usuário da parada corrente, se a parada é do
+/// anel 3 (os registradores de depuração que o host lê).
+pub fn current_context() -> Option<u64> {
+    match CURRENT_CONTEXT.load(Ordering::Acquire) {
+        0 => None,
+        address => Some(address),
+    }
+}
+
+/// O fim do passo: o comparador e a página voltam.
+fn finish_step_extras(context: &Context) {
+    let hardware = STEP_HARDWARE.swap(0, Ordering::AcqRel);
+    if hardware != 0 {
+        user_hardware::set_enabled_in_context(context, hardware as usize - 1, true);
+    }
+    let page = STEP_PAGE.swap(0, Ordering::AcqRel);
+    if page != 0 {
+        page_breakpoints::rearm(STEP_PAGE_ROOT.load(Ordering::Acquire), page & !1);
+    }
+}
 
 /// Sinal do GDB para o vetor de uma exceção de usuário.
 fn signal(vector: u32) -> u8 {
@@ -80,6 +121,7 @@ pub fn exception(context: &Context, vector: u32, teb: u64) -> bool {
         if over != 0 {
             breakpoints::restore(over);
         }
+        finish_step_extras(context);
         if STEP_SILENT.load(Ordering::Acquire) || !stop::active() || !super::session::attached() {
             return true;
         }
@@ -87,6 +129,43 @@ pub fn exception(context: &Context, vector: u32, teb: u64) -> bool {
     }
     if !stop::active() || !super::session::attached() {
         return false;
+    }
+    let root = cpu::read_cr3();
+    // Um comparador de hardware de usuário do depurador.
+    if vector == VECTOR_DEBUG && user_hardware::any() {
+        if let Some((index, watch, address)) = user_hardware::hit(context, root) {
+            let kind = if watch == Watch::Execute { Kind::HardwareBreak } else { Kind::Watch(watch) };
+            if watch == Watch::Execute {
+                // A instrução de novo dispararia: o comparador sai por um
+                // passo (religado no fim dele).
+                STEP_HARDWARE.store(index as u64 + 1, Ordering::Release);
+                user_hardware::set_enabled_in_context(context, index, false);
+            }
+            return stop_with_data(context, teb, stop::SIGTRAP, kind, address);
+        }
+    }
+    // Uma página com breakpoint de memória (o #PF com o bit reservado).
+    if vector == VECTOR_PAGE_FAULT && page_breakpoints::any() {
+        let block = crate::hal::amd64::usermode::block();
+        let (cr2, error) = (block.fault_cr2.get(), block.error_code.get() as u32);
+        if let Some((matches, page)) = page_breakpoints::fault(root, cr2, error) {
+            STEP_PAGE_ROOT.store(root, Ordering::Release);
+            STEP_PAGE.store(page | 1, Ordering::Release);
+            if !matches {
+                // Outro tipo de acesso: a instrução executa num passo com a
+                // página normal, sem parar.
+                begin_step(context, 0, true);
+                return true;
+            }
+            let watch = if error & 2 != 0 {
+                Watch::Write
+            } else if error & 0x10 != 0 {
+                Watch::Execute
+            } else {
+                Watch::Access
+            };
+            return stop_with_data(context, teb, stop::SIGTRAP, Kind::Memory(watch), cr2);
+        }
     }
     if vector == VECTOR_BREAKPOINT {
         match breakpoints::classify_user_hit(rip, cpu::read_cr3()) {
@@ -164,17 +243,34 @@ fn store_frame(context: &Context, frame: &TrapFrame) {
 /// A parada com o CONTEXT da thread. `skip_int3`: a exceção é um `int 3`
 /// que não é do depurador (ao continuar, o RIP pula o byte).
 fn stop_here(context: &Context, teb: u64, signal: u8, kind: Kind, skip_int3: bool) -> bool {
+    stop_inner(context, teb, signal, kind, 0, skip_int3)
+}
+
+/// A parada com um dado na resposta (o endereço vigiado).
+fn stop_with_data(context: &Context, teb: u64, signal: u8, kind: Kind, data: u64) -> bool {
+    stop_inner(context, teb, signal, kind, data, false)
+}
+
+fn stop_inner(context: &Context, teb: u64, signal: u8, kind: Kind, data: u64, skip_int3: bool) -> bool {
     let mut frame = frame_of(context);
     let fx = context.flt_save.address();
     let before = context.rip.get();
     STOPS.fetch_add(1, Ordering::Relaxed);
     let flags = cpu::save_and_disable_interrupts();
-    let resume = stop::enter_user(&mut frame as *mut TrapFrame as u64, fx, signal, kind, 0, teb);
+    CURRENT_CONTEXT.store(context.address(), Ordering::Release);
+    let resume = stop::enter_user(&mut frame as *mut TrapFrame as u64, fx, signal, kind, data, teb);
+    CURRENT_CONTEXT.store(0, Ordering::Release);
     cpu::restore_interrupts(flags);
     store_frame(context, &frame);
     let rip = context.rip.get();
+    let debugger_kind = matches!(kind, Kind::HardwareBreak | Kind::Watch(_) | Kind::Memory(_));
     match resume {
-        None => false,
+        None => {
+            // Sem a parada (depurador desligado no caminho): o comparador e
+            // a página voltam já.
+            finish_step_extras(context);
+            debugger_kind
+        }
         Some(UserResume::Step) => {
             let over = if breakpoints::inserted_at(rip) && breakpoints::suspend(rip) { rip } else { 0 };
             begin_step(context, over, false);
@@ -187,7 +283,13 @@ fn stop_here(context: &Context, teb: u64, signal: u8, kind: Kind, skip_int3: boo
                 begin_step(context, rip, true);
                 return true;
             }
-            if kind == Kind::SoftwareBreak || rip != before {
+            if STEP_HARDWARE.load(Ordering::Acquire) != 0 || STEP_PAGE.load(Ordering::Acquire) != 0 {
+                // O comparador desligado ou a página normal valem por uma
+                // instrução.
+                begin_step(context, 0, true);
+                return true;
+            }
+            if kind == Kind::SoftwareBreak || debugger_kind || rip != before {
                 return true;
             }
             if skip_int3 && !pass {

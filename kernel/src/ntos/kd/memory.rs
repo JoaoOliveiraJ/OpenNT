@@ -58,7 +58,43 @@ pub fn translate(cr3: u64, address: u64) -> Option<u64> {
     if pt & PRESENT == 0 {
         return None;
     }
+    // Uma página com breakpoint de memória tem o bit reservado ligado.
+    let pt = if super::page_breakpoints::any() { super::page_breakpoints::unmarked(pt) } else { pt };
     Some((pt & TABLE_ADDRESS) + (address & 0xFFF))
+}
+
+/// O endereço físico da PTE de uma página de 4 KB (`None` numa página
+/// grande ou sem tabela).
+pub fn pte_address(cr3: u64, address: u64) -> Option<u64> {
+    if !canonical(address) {
+        return None;
+    }
+    let pml4 = table_entry(cr3, (address >> 39) & 511)?;
+    if pml4 & PRESENT == 0 {
+        return None;
+    }
+    let pdpt = table_entry(pml4, (address >> 30) & 511)?;
+    if pdpt & PRESENT == 0 || pdpt & LARGE_PAGE != 0 {
+        return None;
+    }
+    let pd = table_entry(pdpt, (address >> 21) & 511)?;
+    if pd & PRESENT == 0 || pd & LARGE_PAGE != 0 {
+        return None;
+    }
+    let physical = (pd & TABLE_ADDRESS) + ((address >> 12) & 511) * 8;
+    (physical + 8 <= PHYSICAL_MEMORY_LIMIT).then_some(physical)
+}
+
+/// Lê um qword físico pelo mapa direto.
+pub fn read_physical_u64(physical: u64) -> u64 {
+    // SAFETY: `physical` vem de `pte_address` (abaixo do limite).
+    unsafe { core::ptr::read_volatile(direct_map(physical) as *const u64) }
+}
+
+/// Grava um qword físico pelo mapa direto.
+pub fn write_physical_u64(physical: u64, value: u64) {
+    // SAFETY: como em `read_physical_u64`.
+    unsafe { core::ptr::write_volatile(direct_map(physical) as *mut u64, value) }
 }
 
 /// Pedaço acessível a partir de `address` (até o fim da página), como VA

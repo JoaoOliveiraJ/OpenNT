@@ -128,7 +128,7 @@ pub fn user_threads(owner: usize, argument: &str, out: &mut Payload) {
     };
     let root = process_context::root_of(cr3, eprocess).unwrap_or(cr3);
     let _ = writeln!(out, "EPROCESS {:#x} CR3 {:#x}", eprocess, root);
-    let _ = writeln!(out, "{:>6} {:>18} {:>14} {:>18} {:>18} {:>18} {:>14} {:<13} {:<16} {:>10}", "TID", "ETHREAD", "TEB", "inicio", "CONTEXT", "rip", "rsp", "estado", "espera", "LastError");
+    let _ = writeln!(out, "{:>6} {:>18} {:>14} {:>18} {:>18} {:>18} {:>14} {:<13} {:<16} {:>10} {:>4} {:>4} {:>8} {:>8} {:>14}", "TID", "ETHREAD", "TEB", "inicio", "CONTEXT", "rip", "rsp", "estado", "espera", "LastError", "prio", "susp", "kernel", "usuario", "ciclos");
     let threads = state.threads.lock();
     for (count, thread) in threads.iter().enumerate() {
         if count == PAGE_LINES {
@@ -143,9 +143,17 @@ pub fn user_threads(owner: usize, argument: &str, out: &mut Payload) {
         // TEB.LastErrorValue (0x68) pela raiz do processo.
         let last_error = if teb != 0 { memory::read_u32(root, teb + 0x68).map_or("?".into(), |value| alloc::format!("{:#x}", value)) } else { alloc::string::String::from("-") };
         let state_text = if dead { "Terminated" } else { THREAD_STATES.get(state_code as usize).copied().unwrap_or("?") };
+        // Prioridade, suspensão, tempos (tiques) e ciclos do KTHREAD.
+        let byte_at = |offset: usize| if ethread != 0 { memory::read_u8(cr3, ethread + offset as u64).unwrap_or(0) } else { 0 };
+        let dword_at = |offset: usize| if ethread != 0 { memory::read_u32(cr3, ethread + offset as u64).unwrap_or(0) } else { 0 };
+        let priority = byte_at(offset_of!(KthreadView1, priority)) as i8;
+        let suspend = byte_at(offset_of!(KthreadView1, suspend_count)) as i8;
+        let kernel_time = dword_at(offset_of!(KthreadView1, kernel_time));
+        let user_time = dword_at(offset_of!(KthreadView1, user_time));
+        let cycles = if ethread != 0 { read_u64(cr3, ethread + offset_of!(crate::ntos::inc::types::Kthread, cycle_time) as u64) } else { 0 };
         let _ = writeln!(
             out,
-            "{:>6} {:>#18x} {:>#14x} {:>#18x} {:>#18x} {:>#18x} {:>#14x} {:<13} {:<16} {:>10}",
+            "{:>6} {:>#18x} {:>#14x} {:>#18x} {:>#18x} {:>#18x} {:>#14x} {:<13} {:<16} {:>10} {:>4} {:>4} {:>8} {:>8} {:>#14x}",
             thread.thread_id,
             ethread,
             teb,
@@ -155,7 +163,12 @@ pub fn user_threads(owner: usize, argument: &str, out: &mut Payload) {
             rsp,
             state_text,
             WAIT_REASONS.get(wait as usize).copied().unwrap_or("-"),
-            last_error
+            last_error,
+            priority,
+            suspend,
+            kernel_time,
+            user_time,
+            cycles
         );
     }
 }

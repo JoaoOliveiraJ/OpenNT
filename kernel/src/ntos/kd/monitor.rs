@@ -15,7 +15,7 @@ use core::fmt::Write;
 use core::mem::offset_of;
 
 use super::packet::Payload;
-use super::{breakpoints, debugger, events, handles, inspect, memory, print_log, process_context, regions, stop, trace, user_debug};
+use super::{breakpoints, debugger, events, handles, inspect, memory, page_breakpoints, print_log, process_context, regions, stop, trace, user_debug, user_hardware};
 use crate::ntos::inc::types::{ClientId, Eprocess, Ethread, EthreadView1, KapcState, Kpcr, Kprcb, Kprocess, Kthread, KthreadView1};
 use crate::ntos::mm::loaded_images;
 use crate::ntos::mm::memory_map::MAX_CPUS;
@@ -48,6 +48,8 @@ const HELP: &str = "comandos do OpenNT:
   kmap               faixas do espaco de sistema
   events             ultimos eventos de processo, thread e imagem (e os simbolos deles)
   uex [on|off]       parar nas excecoes de primeira chance do anel 3
+  membp [set <inicio> <tamanho> <a|w|x> | clear <inicio>]  breakpoints de memoria por pagina no processo escolhido
+  uhw                comparadores de hardware de usuario (por processo)
 ";
 
 fn read_u64(cr3: u64, address: u64) -> u64 {
@@ -366,6 +368,8 @@ pub fn run(owner: usize, line: &str, out: &mut Payload) {
         "kmap" => regions::kernel_map(out),
         "events" => events::command(out),
         "uex" => user_debug::command(rest, out),
+        "membp" => page_breakpoints::command(owner, rest, out),
+        "uhw" => user_hardware::command(out),
         _ => out.push_str(HELP),
     }
 }

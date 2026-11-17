@@ -54,6 +54,11 @@ pub extern "sysv64" fn opennt_kd_image_event(base: u64, size: u64, process_id: u
 /// O gancho de `ps::notify::process::notify`.
 pub fn process(pointer: u64, process_id: u64, created: bool) {
     if stop::active() {
+        // Um processo saindo leva os breakpoints de memória dele antes de o
+        // espaço de endereços ser desmontado.
+        if !created {
+            super::page_breakpoints::process_exited(pointer);
+        }
         opennt_kd_process_event(pointer, process_id, created as u64);
     }
 }

@@ -138,6 +138,9 @@ pub enum Kind {
     SoftwareBreak,
     HardwareBreak,
     Watch(Watch),
+    /// Breakpoint de memória por página (`kd::page_breakpoints`): o dado da
+    /// parada é o endereço acessado.
+    Memory(Watch),
 }
 
 impl Kind {
@@ -148,6 +151,9 @@ impl Kind {
             Kind::HardwareBreak => 2,
             Kind::Watch(Watch::Write) => 3,
             Kind::Watch(_) => 4,
+            Kind::Memory(Watch::Write) => 5,
+            Kind::Memory(Watch::Execute) => 6,
+            Kind::Memory(Watch::Access) => 7,
         }
     }
 
@@ -157,6 +163,9 @@ impl Kind {
             2 => Kind::HardwareBreak,
             3 => Kind::Watch(Watch::Write),
             4 => Kind::Watch(Watch::Access),
+            5 => Kind::Memory(Watch::Write),
+            6 => Kind::Memory(Watch::Execute),
+            7 => Kind::Memory(Watch::Access),
             _ => Kind::Signal,
         }
     }
@@ -346,6 +355,8 @@ fn park(number: usize, frame: u64, fx: u64, error_code: bool) {
     while FREEZE.load(Ordering::Acquire) != 0 {
         core::hint::spin_loop();
     }
+    // As PTEs mudaram na parada (breakpoint de memória): o TLB sai.
+    super::page_breakpoints::after_thaw();
     PROCESSORS[number].frozen.store(false, Ordering::Release);
 }
 
@@ -618,6 +629,7 @@ extern "sysv64" fn rs_kd_trap(frame: *mut TrapFrame, fx: u64, reason: u32) -> u3
                 core::arch::asm!("mov {}, dr6", out(reg) status, options(nomem, nostack));
                 core::arch::asm!("mov dr6, {}", in(reg) 0xFFFF_0FF0u64, options(nomem, nostack));
             }
+            super::extended_state::set_entry_dr6(status);
             if stepping && status & DR6_SINGLE_STEP != 0 {
                 if trace::active() {
                     // Um passo do rastro: grava e segue sem voltar ao host.

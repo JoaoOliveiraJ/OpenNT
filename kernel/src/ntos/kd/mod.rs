@@ -12,18 +12,23 @@
 //! processo das leituras em `process_context`, as paradas do anel 3 em
 //! `user_debug`, os pontos de evento (processo, thread, imagem) em `events`,
 //! a tabela de handles em `handles` e as regiões e threads de usuário em
-//! `regions`.
+//! `regions`. Extensões do OpenNT: a metade alta dos YMM e os registradores
+//! de depuração por `p` em `extended_state`, os breakpoints de hardware do
+//! modo usuário por processo em `user_hardware` e os breakpoints de memória
+//! por página em `page_breakpoints`.
 pub mod breakpoints;
 pub mod debug_filter;
 pub mod debug_service;
 pub mod debugger;
 pub mod events;
 pub mod exports;
+pub mod extended_state;
 pub mod handles;
 pub mod inspect;
 pub mod memory;
 pub mod monitor;
 pub mod packet;
+pub mod page_breakpoints;
 pub mod power;
 pub mod print_log;
 pub mod process_context;
@@ -34,6 +39,7 @@ pub mod stop;
 pub mod trace;
 pub mod transport;
 pub mod user_debug;
+pub mod user_hardware;
 
 use crate::ntos::init::boot_config;
 

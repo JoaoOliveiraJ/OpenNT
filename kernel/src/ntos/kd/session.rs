@@ -80,6 +80,9 @@ fn detach() {
     ATTACHED.store(false, Ordering::Release);
     HOST_WAITING.store(false, Ordering::Release);
     breakpoints::remove_all();
+    super::user_hardware::remove_all();
+    super::page_breakpoints::remove_all();
+    super::page_breakpoints::resume();
     super::user_debug::reset();
     packet::set_no_ack(false);
     REPORT_SOFTWARE_BREAK.store(false, Ordering::Release);
@@ -133,6 +136,20 @@ fn stop_reply(reply: &mut Payload) {
         Kind::Watch(_) => {
             let _ = write!(reply, "awatch:{:x};", data);
         }
+        // Breakpoint de memória: a vigia padrão (escrita ou acesso) para um
+        // cliente GDB e o `membp` do OpenNT com o endereço acessado.
+        Kind::Memory(watch) => {
+            match watch {
+                Watch::Write => {
+                    let _ = write!(reply, "watch:{:x};", data);
+                }
+                Watch::Access => {
+                    let _ = write!(reply, "awatch:{:x};", data);
+                }
+                Watch::Execute => {}
+            }
+            let _ = write!(reply, "membp:{:x};", data);
+        }
         _ => {}
     }
 }
@@ -182,6 +199,10 @@ pub fn run(number: usize) -> Resume {
             }
             Action::Resume(resume) => {
                 HOST_WAITING.store(true, Ordering::Release);
+                // Os comparadores de usuário voltam às threads (as novas os
+                // recebem aqui) e o TLB sai se as PTEs mudaram.
+                super::user_hardware::refresh();
+                super::page_breakpoints::resume();
                 process_context::clear();
                 return resume;
             }
@@ -218,7 +239,7 @@ fn handle(owner: usize, command: &mut [u8], reply: &mut Payload, data: &mut [u8]
         b'?' => stop_reply(reply),
         b'g' => read_registers(selected(owner), reply),
         b'G' => write_registers(selected(owner), &command[1..], reply),
-        b'p' => read_register(selected(owner), &command[1..], reply),
+        b'p' => read_register(owner, selected(owner), &command[1..], reply),
         b'P' => write_register(selected(owner), &command[1..], reply),
         b'm' => read_memory(selected(owner), &command[1..], reply, data),
         b'M' => write_memory_hex(selected(owner), &command[1..], reply, data),
@@ -296,7 +317,7 @@ fn write_registers(number: usize, hex: &[u8], reply: &mut Payload) {
     reply.push_str("OK");
 }
 
-fn read_register(number: usize, text: &[u8], reply: &mut Payload) {
+fn read_register(owner: usize, number: usize, text: &[u8], reply: &mut Payload) {
     let (Some(view), Some(register)) = (stop::view(number), packet::parse_number(text)) else {
         reply.push_str("E01");
         return;
@@ -308,7 +329,14 @@ fn read_register(number: usize, text: &[u8], reply: &mut Payload) {
     }
     let width = registers::size(register);
     let mut value = [0u8; 16];
-    if view.read(register, &mut value) {
+    // YMM alto e registradores de depuração (extensões do OpenNT).
+    let available = if super::extended_state::size(register) != 0 {
+        let context = if number == owner { super::user_debug::current_context() } else { None };
+        super::extended_state::read(register, number == owner, context, &mut value)
+    } else {
+        view.read(register, &mut value)
+    };
+    if available {
         reply.push_hex(&value[..width]);
     } else {
         for _ in 0..width * 2 {
@@ -415,10 +443,14 @@ fn breakpoint(owner: usize, insert: bool, text: &[u8], reply: &mut Payload) {
                 b"2" => Watch::Write,
                 _ => Watch::Access,
             };
-            if insert {
-                breakpoints::insert_hardware(watch, address, length)
-            } else {
-                breakpoints::remove_hardware(watch, address)
+            // Endereço de usuário com processo escolhido: o comparador vai
+            // ao CONTEXT das threads do processo (`kd::user_hardware`).
+            let user = address < 0x8000_0000_0000 && process_context::selected().is_some();
+            match (user, insert) {
+                (true, true) => super::user_hardware::insert(watch, address, length, process_context::selected().unwrap_or(0), process_context::memory_space(owner)),
+                (true, false) => super::user_hardware::remove(watch, address, process_context::selected().unwrap_or(0)) || breakpoints::remove_hardware(watch, address),
+                (false, true) => breakpoints::insert_hardware(watch, address, length),
+                (false, false) => breakpoints::remove_hardware(watch, address) || super::user_hardware::remove(watch, address, 0),
             }
         }
         // Só leitura: o x86 não vigia; sem suporte.

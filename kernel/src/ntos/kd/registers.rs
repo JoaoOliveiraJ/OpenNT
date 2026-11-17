@@ -12,6 +12,7 @@
 //! | 40-55  | xmm0-xmm15                           | 16    |
 //! | 56     | mxcsr                                | 4     |
 //! | 57-58  | fs_base gs_base (só por `p`)         | 8     |
+//! | 59-80  | ymm0h-ymm15h, dr0-dr3, dr6, dr7 (só por `p`, `kd::extended_state`) | 16/8 |
 //!
 //! Os inteiros vêm do quadro de trap (`TrapFrame`, com o quadro do hardware
 //! depois do vetor); x87 e SSE da área FXSAVE64 da entrada do depurador (um
@@ -25,7 +26,7 @@ use crate::hal::amd64::irqstubs::TrapFrame;
 /// Registradores do pacote `g`.
 pub const PACKET_REGISTERS: usize = 57;
 /// Último número aceito por `p`/`P`.
-pub const LAST_REGISTER: usize = 58;
+pub const LAST_REGISTER: usize = 80;
 
 const RIP: usize = 16;
 const EFLAGS: usize = 17;
@@ -40,7 +41,7 @@ pub fn size(number: usize) -> usize {
         40..=55 => 16,
         56 => 4,
         57 | 58 => 8,
-        _ => 0,
+        _ => super::extended_state::size(number),
     }
 }
 
