@@ -1106,7 +1106,7 @@ fn nt_apphelp_cache_control(service: u64, data: u64, _a3: u64, _a4: u64, _rsp: u
 }
 
 pub fn init() {
-    let handlers: [(&'static str, state::SyscallHandler); 32] = [
+    let handlers: [(&'static str, state::SyscallHandler); 33] = [
         ("NtQueryDirectoryObject", nt_query_directory_object),
         ("NtApphelpCacheControl", nt_apphelp_cache_control),
         ("NtQueryLicenseValue", nt_query_license_value),
