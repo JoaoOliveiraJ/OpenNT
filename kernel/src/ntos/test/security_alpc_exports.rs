@@ -351,7 +351,7 @@ fn nt_set_security_object(assert: Assert) {
     relative.revision.set(1);
     relative.control.set(0x8004);
     let set = |handle: u64, information: u64, descriptor: u64| status("NtSetSecurityObject", &[handle, information, descriptor]);
-    assert(key != 0 && set(handle, 4, 0) == 0xC000_0005 && set(handle, 1, descriptor) == 0xC000_005A && set(handle, 2, descriptor) == 0xC000_005B && set(0x7FFF_FFF0, 4, descriptor) == 0xC000_0008, "ob-nt-set-security: em KernelMode valida como o ZwSetSecurityObject");
+    assert(key != 0 && set(handle, 4, 0) == 0xC000_0005 && set(handle, 1, descriptor) == 0xC000_0079 && set(handle, 2, descriptor) == 0xC000_0079 && set(0x7FFF_FFF0, 4, descriptor) == 0xC000_0008, "ob-nt-set-security: em KernelMode valida como o ZwSetSecurityObject");
     let applied = set(handle, 4, descriptor);
     // O descritor gravado volta pelo ZwQuerySecurityObject (a chave guarda o
     // dela na hive, pelo método de segurança do tipo Key).

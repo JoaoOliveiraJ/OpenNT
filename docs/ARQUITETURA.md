@@ -1805,6 +1805,11 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   ZwQueryObject e o Nt/ZwQuerySecurityObject (que passa pelo
   SecurityProcedure de cada tipo: IRP_MJ_QUERY_SECURITY nos arquivos, o
   DEVICE_OBJECT, o nó da chave, o SeQuerySecurityDescriptorInfo nos demais).
+  O SecurityInformation não é validado: só dá o acesso que o handle precisa
+  (o SeQuerySecurityAccessMask e o SeSetSecurityAccessMask,
+  `se/query_descriptor.rs::query_access_mask` e
+  `se/set_security.rs::set_access_mask`), e cada parte desconhecida fica
+  fora do descritor devolvido.
   O Nt/ZwSetSecurityObject (`set_object_security`) mescla as partes pedidas
   no descritor corrente (SeSetSecurityDescriptorInfo com o mapeamento do tipo
   e o dono validado pelo token efetivo) e grava o resultado no mesmo lugar

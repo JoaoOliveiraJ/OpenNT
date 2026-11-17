@@ -13101,8 +13101,8 @@ fn ob_set_security_exports(assert: Assert) {
     relative.revision.set(1);
     relative.control.set(0x8004);
     assert(call_export("ZwSetSecurityObject", &[handle, 4, 0]) == Some(signed_status(0xC000_0005)), "ob-set-security: SD NULL = STATUS_ACCESS_VIOLATION");
-    assert(call_export("ZwSetSecurityObject", &[handle, 1, descriptor]) == Some(signed_status(0xC000_005A)), "ob-set-security: OWNER pedido sem Owner = STATUS_INVALID_OWNER");
-    assert(call_export("ZwSetSecurityObject", &[handle, 2, descriptor]) == Some(signed_status(0xC000_005B)), "ob-set-security: GROUP pedido sem Group = STATUS_INVALID_PRIMARY_GROUP");
+    assert(call_export("ZwSetSecurityObject", &[handle, 1, descriptor]) == Some(signed_status(0xC000_0079)), "ob-set-security: OWNER pedido sem Owner = STATUS_INVALID_SECURITY_DESCR");
+    assert(call_export("ZwSetSecurityObject", &[handle, 2, descriptor]) == Some(signed_status(0xC000_0079)), "ob-set-security: GROUP pedido sem Group = STATUS_INVALID_SECURITY_DESCR");
     // A DACL nula vai para o descritor do nó da chave (o CmpSecurityMethod),
     // que a consulta seguinte devolve.
     let queried = guest::alloc_bytes(0x100);

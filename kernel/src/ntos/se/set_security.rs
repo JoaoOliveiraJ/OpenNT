@@ -86,6 +86,37 @@ const SE_GROUP_OWNER: u32 = 0x08;
 const SE_PRIVILEGE_ENABLED: u32 = 0x02;
 const SE_RESTORE_PRIVILEGE: u64 = 18;
 
+const WRITE_DAC: u32 = 0x4_0000;
+const WRITE_OWNER: u32 = 0x8_0000;
+const BACKUP_SECURITY_INFORMATION: u32 = 0x1_0000;
+/// PROTECTED_SACL_SECURITY_INFORMATION | UNPROTECTED_SACL_SECURITY_INFORMATION.
+const SACL_PROTECTION_SELECTORS: u32 = 0x5000_0000;
+
+/// SeSetSecurityAccessMask (ntoskrnl 19041, 0x67bb98): o acesso que o
+/// handle precisa para trocar as partes pedidas. OWNER, GROUP e LABEL pedem
+/// WRITE_OWNER; DACL, ATTRIBUTE, PROCESS_TRUST_LABEL e ACCESS_FILTER pedem
+/// WRITE_DAC; SACL e SCOPE pedem ACCESS_SYSTEM_SECURITY, como uma parte da
+/// SACL pedida junto com PROTECTED/UNPROTECTED_SACL; BACKUP pede os três.
+pub fn set_access_mask(information: u32) -> u32 {
+    let mut mask = 0;
+    if information & BACKUP_SECURITY_INFORMATION != 0 {
+        mask = WRITE_DAC | WRITE_OWNER | ACCESS_SYSTEM_SECURITY;
+    }
+    if information & 0x13 != 0 {
+        mask |= WRITE_OWNER;
+    }
+    if information & 0x1A4 != 0 {
+        mask |= WRITE_DAC;
+    }
+    if information & 0x48 != 0 {
+        mask |= ACCESS_SYSTEM_SECURITY;
+    }
+    if information & SYSTEM_ACL_SELECTORS != 0 && information & SACL_PROTECTION_SELECTORS != 0 {
+        mask |= ACCESS_SYSTEM_SECURITY;
+    }
+    mask
+}
+
 /// ACEs de uma ACL serializada.
 fn entries(acl: Option<&Vec<u8>>) -> Vec<Vec<u8>> {
     let Some(acl) = acl else { return Vec::new() };

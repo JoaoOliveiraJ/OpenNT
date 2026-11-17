@@ -39,24 +39,33 @@ fn query_object(pointer: u64, type_name: &str, information: u32, buffer: u64, ca
 }
 
 /// NtQuerySecurityObject(Handle, SecurityInformation, Buffer, Length,
-/// LengthNeeded*) de modo usuário: o handle com o acesso que as partes
-/// pedem (READ_CONTROL; ACCESS_SYSTEM_SECURITY para a SACL), o
-/// LengthNeeded sondado e gravado, um buffer curto com
-/// STATUS_BUFFER_TOO_SMALL e o descritor copiado no buffer sondado.
+/// LengthNeeded*) de modo usuário, como o 19041 (0x66c0d0): o LengthNeeded
+/// e o buffer (alinhado a 4 quando Length não é zero) sondados para escrita
+/// antes do handle; o SecurityInformation não é validado, só dá o acesso
+/// que o handle precisa (`query_descriptor::query_access_mask`); o
+/// SecurityProcedure do tipo devolve as partes que conhece (um buffer curto
+/// dá STATUS_BUFFER_TOO_SMALL) e o tamanho vai ao LengthNeeded.
 pub fn query_from_user(handle: u64, information: u32, buffer: u64, length: u32, length_needed: u64) -> Result<u32, KernelError> {
+    use crate::ntos::ps::user_probe;
+    if !user_probe::probe_user_write(length_needed, 4) {
+        return Ok(0xC000_0005);
+    }
+    if length != 0 {
+        if buffer & 3 != 0 {
+            return Ok(0x8000_0002);
+        }
+        if !user_probe::probe_user_write(buffer, length as u64) {
+            return Ok(0xC000_0005);
+        }
+    }
+    let desired = query_descriptor::query_access_mask(information);
     let (pointer, type_name, access) = match crate::ntos::ob::object_security::resolve_user_handle(handle) {
         Ok(resolved) => resolved,
         Err(status) => return Ok(status),
     };
-    if information & !0x1F != 0 {
-        return Ok(0xC000_000D);
-    }
-    let needed_access = (if information & 0x17 != 0 { 0x2_0000 } else { 0 }) | (if information & 8 != 0 { 0x100_0000 } else { 0 });
-    if access & needed_access != needed_access {
+    if access & desired != desired {
+        crate::debug_print!("[ob] NtQuerySecurityObject: handle {:#x} ({}) com acesso {:#x}; as partes {:#x} pedem {:#x}", handle, type_name, access, information, desired);
         return Ok(0xC000_0022);
-    }
-    if !crate::ntos::ps::user_probe::probe_user_write(length_needed, 4) || (length != 0 && !crate::ntos::ps::user_probe::probe_user_write(buffer, length as u64)) {
-        return Ok(0xC000_0005);
     }
     let result = query_object(pointer, &type_name, information, buffer, length, 1)?;
     if crate::ntos::mm::guest_memory::try_write::<u32>(length_needed, result.needed as u32).is_err() {

@@ -2197,7 +2197,10 @@ fn user_syscalls_core(assert: Assert) {
     assert(call("NtWaitForMultipleObjects", 2, buffer, 1, 0) == 0xC000_000D, "usercore: handles repetidos recusados");
     // Segurança do objeto e namespace.
     guest::write64(rsp + 0x28, info);
-    assert(call("NtQuerySecurityObject", first, 4, buffer, 0x200) == 0 && guest::read32(info) > 0 && call("NtQuerySecurityObject", first, 4, buffer, 1) == 0xC000_0023 && call("NtQuerySecurityObject", first, 0x20, buffer, 0x200) == 0xC000_000D, "usercore: descritor do evento e recusas");
+    // Como o 19041: SecurityInformation sem validação (ATTRIBUTE pede
+    // READ_CONTROL, a SACL pede ACCESS_SYSTEM_SECURITY, que o handle não tem)
+    // e o buffer alinhado a 4.
+    assert(call("NtQuerySecurityObject", first, 4, buffer, 0x200) == 0 && guest::read32(info) > 0 && call("NtQuerySecurityObject", first, 4, buffer, 1) == 0xC000_0023 && call("NtQuerySecurityObject", first, 0x20, buffer, 0x200) == 0 && call("NtQuerySecurityObject", first, 8, buffer, 0x200) == 0xC000_0022 && call("NtQuerySecurityObject", first, 4, buffer + 2, 0x100) == 0x8000_0002, "usercore: descritor do evento e recusas");
     state::write_user_wide(attributes + 0x80, "\\");
     state::write_unicode_string(attributes + 0x40, attributes + 0x80, "\\");
     set_object_attributes(unsafe { nt::ObjectAttributes::at(attributes) }, nt::ObjectAttributes::SIZE as u32, 0, attributes + 0x40, 0x40);

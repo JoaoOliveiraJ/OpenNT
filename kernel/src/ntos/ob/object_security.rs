@@ -565,12 +565,16 @@ pub fn dereference_security_descriptor(descriptor: u64, count: u32) -> Result<()
 //
 // ntoskrnl 19041 NtSetSecurityObject rva 0x67b860:
 //   SecurityDescriptor NULL                         -> STATUS_ACCESS_VIOLATION
-//   o acesso pedido ao handle vem de SeSetSecurityAccessMask (WRITE_OWNER para
-//   OWNER/GROUP/LABEL, WRITE_DAC para DACL, ACCESS_SYSTEM_SECURITY para SACL) —
-//   em KernelMode não é comparado ao concedido;
+//   BACKUP_SECURITY_INFORMATION soma as partes 0x1FF (PROCESS_TRUST_LABEL e
+//   ACCESS_FILTER só quando pedidas também);
+//   o acesso pedido ao handle vem de SeSetSecurityAccessMask
+//   (`se::set_security::set_access_mask`) — em KernelMode não é comparado ao
+//   concedido;
 //   o descritor é capturado (SeCaptureSecurityDescriptor, cópia self-relative);
-//   OWNER_SECURITY_INFORMATION sem Owner        -> STATUS_INVALID_OWNER
-//   GROUP_SECURITY_INFORMATION sem Group        -> STATUS_INVALID_PRIMARY_GROUP
+//   BACKUP com um descritor sem SE_SACL_PRESENT deixa de fora as partes da
+//   SACL (SecurityInformation & 0xFFFFFE07);
+//   OWNER_SECURITY_INFORMATION sem Owner ou GROUP_SECURITY_INFORMATION sem
+//   Group                                       -> STATUS_INVALID_SECURITY_DESCR
 //   ObSetSecurityObjectByPointer chama o SecurityProcedure do tipo: para
 //   arquivos o IopGetSetSecurityObject envia IRP_MJ_SET_SECURITY ao dispositivo
 //   do arquivo (Parameters.SetSecurity { SecurityInformation, SecurityDescriptor });
@@ -580,11 +584,12 @@ pub fn dereference_security_descriptor(descriptor: u64, count: u32) -> Result<()
 // do corpo recebe a mescla, e as aberturas e consultas seguintes o leem.
 
 const SET_SECURITY_STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
-const SET_SECURITY_STATUS_INVALID_OWNER: u32 = 0xC000_005A;
-const SET_SECURITY_STATUS_INVALID_PRIMARY_GROUP: u32 = 0xC000_005B;
+const SET_SECURITY_STATUS_INVALID_SECURITY_DESCR: u32 = 0xC000_0079;
 const SET_SECURITY_STATUS_PENDING: u32 = 0x103;
 const OWNER_SECURITY_INFORMATION: u32 = 1;
 const GROUP_SECURITY_INFORMATION: u32 = 2;
+const BACKUP_SECURITY_INFORMATION: u32 = 0x1_0000;
+const SE_SACL_PRESENT: u16 = 0x10;
 const IRP_MJ_SET_SECURITY: u8 = 0x15;
 
 /// IRP_MJ_SET_SECURITY síncrono ao dispositivo do arquivo. Como o
@@ -626,21 +631,32 @@ fn set_file_security(file: u64, information: u32, captured: u64) -> Result<u32, 
     Ok(if status == STATUS_INVALID_DEVICE_REQUEST { 0 } else { status })
 }
 
-/// O acesso que o handle precisa para alterar as partes pedidas
-/// (SeSetSecurityAccessMask): dono, grupo e rótulo pedem WRITE_OWNER, a DACL
-/// WRITE_DAC e a SACL ACCESS_SYSTEM_SECURITY.
-fn set_security_access_mask(information: u32) -> u32 {
-    let mut mask = 0;
-    if information & (OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | 0x10) != 0 {
-        mask |= 0x8_0000;
+/// BACKUP_SECURITY_INFORMATION do NtSetSecurityObject: soma as partes 0x1FF,
+/// mas PROCESS_TRUST_LABEL (0x80) e ACCESS_FILTER (0x100) só ficam quando
+/// pedidos também.
+fn expand_backup_information(information: u32) -> u32 {
+    if information & BACKUP_SECURITY_INFORMATION == 0 {
+        return information;
     }
-    if information & 4 != 0 {
-        mask |= 0x4_0000;
+    (information | 0x1FF) & !(!information & 0x180)
+}
+
+/// O fim do NtSetSecurityObject sobre o descritor já capturado
+/// (self-relative, liberado aqui): BACKUP com um descritor sem
+/// SE_SACL_PRESENT deixa de fora as partes da SACL; OWNER ou GROUP pedidos
+/// sem o componente são STATUS_INVALID_SECURITY_DESCR; depois o
+/// SecurityProcedure do tipo (o IRP_MJ_SET_SECURITY num arquivo).
+fn set_captured_security(pointer: u64, file: bool, information: u32, captured: u64) -> Result<u32, crate::rtl::KernelError> {
+    let control = crate::ntos::se::descriptor::control(captured);
+    let information = if information & BACKUP_SECURITY_INFORMATION != 0 && control & SE_SACL_PRESENT == 0 { information & 0xFFFF_FE07 } else { information };
+    let missing = |bit: u32, index: u64| information & bit != 0 && crate::ntos::se::descriptor::component(captured, control, index) == 0;
+    if missing(OWNER_SECURITY_INFORMATION, 0) || missing(GROUP_SECURITY_INFORMATION, 1) {
+        guest::free_bytes(captured);
+        return Ok(SET_SECURITY_STATUS_INVALID_SECURITY_DESCR);
     }
-    if information & 8 != 0 {
-        mask |= 0x100_0000;
-    }
-    mask
+    let status = if file { set_file_security(pointer, information, captured) } else { Ok(set_object_security(pointer, information, captured)) };
+    guest::free_bytes(captured);
+    status
 }
 
 /// NtSetSecurityObject(Handle, SecurityInformation, SecurityDescriptor) de
@@ -677,12 +693,14 @@ pub fn set_security_object_from_user(handle: u64, information: u32, descriptor: 
     if descriptor == 0 {
         return Ok(SET_SECURITY_STATUS_ACCESS_VIOLATION);
     }
-    let desired = set_security_access_mask(information);
+    let information = expand_backup_information(information);
+    let desired = crate::ntos::se::set_security::set_access_mask(information);
     let (pointer, type_name, access) = match resolve_user_handle(handle) {
         Ok(resolved) => resolved,
         Err(status) => return Ok(status),
     };
     if access & desired != desired {
+        crate::debug_print!("[ob] NtSetSecurityObject: handle {:#x} ({}) com acesso {:#x}; as partes {:#x} pedem {:#x}", handle, type_name, access, information, desired);
         return Ok(STATUS_ACCESS_DENIED);
     }
     let output = guest::alloc_bytes(8);
@@ -693,23 +711,7 @@ pub fn set_security_object_from_user(handle: u64, information: u32, descriptor: 
     if captured_status != 0 {
         return Ok(captured_status);
     }
-    let control = crate::ntos::se::descriptor::control(captured);
-    if information & OWNER_SECURITY_INFORMATION != 0 && crate::ntos::se::descriptor::component(captured, control, 0) == 0 {
-        guest::free_bytes(captured);
-        return Ok(SET_SECURITY_STATUS_INVALID_OWNER);
-    }
-    if information & GROUP_SECURITY_INFORMATION != 0 && crate::ntos::se::descriptor::component(captured, control, 1) == 0 {
-        guest::free_bytes(captured);
-        return Ok(SET_SECURITY_STATUS_INVALID_PRIMARY_GROUP);
-    }
-    if type_name == object_types::file_type().name {
-        let status = set_file_security(pointer, information, captured);
-        guest::free_bytes(captured);
-        return status;
-    }
-    let status = set_object_security(pointer, information, captured);
-    guest::free_bytes(captured);
-    Ok(status)
+    set_captured_security(pointer, type_name == object_types::file_type().name, information, captured)
 }
 
 /// ZwSetSecurityObject(Handle, SecurityInformation, SecurityDescriptor).
@@ -717,6 +719,7 @@ pub fn set_security_object(handle: u64, information: u32, descriptor: u64) -> Re
     if descriptor == 0 {
         return Ok(SET_SECURITY_STATUS_ACCESS_VIOLATION);
     }
+    let information = expand_backup_information(information);
     let mut reference = match crate::ntos::ob::handles::security::reference_kernel_handle(handle)? {
         Ok(reference) => reference,
         Err(status) => return Ok(status),
@@ -730,24 +733,8 @@ pub fn set_security_object(handle: u64, information: u32, descriptor: u64) -> Re
         if captured_status != 0 {
             return Ok(captured_status);
         }
-        let control = crate::ntos::se::descriptor::control(captured);
-        if information & OWNER_SECURITY_INFORMATION != 0 && crate::ntos::se::descriptor::component(captured, control, 0) == 0 {
-            guest::free_bytes(captured);
-            return Ok(SET_SECURITY_STATUS_INVALID_OWNER);
-        }
-        if information & GROUP_SECURITY_INFORMATION != 0 && crate::ntos::se::descriptor::component(captured, control, 1) == 0 {
-            guest::free_bytes(captured);
-            return Ok(SET_SECURITY_STATUS_INVALID_PRIMARY_GROUP);
-        }
-        if reference.object_type.name == object_types::file_type().name {
-            let status = set_file_security(reference.pointer, information, captured);
-            guest::free_bytes(captured);
-            return status;
-        }
         // As partes pedidas do descritor capturado entram no do objeto.
-        let status = set_object_security(reference.pointer, information, captured);
-        guest::free_bytes(captured);
-        Ok(status)
+        set_captured_security(reference.pointer, reference.object_type.name == object_types::file_type().name, information, captured)
     })();
     reference.release()?;
     result

@@ -15,6 +15,28 @@ fn align4(length: usize) -> usize {
     (length + 3) & !3
 }
 
+const READ_CONTROL: u32 = 0x2_0000;
+const ACCESS_SYSTEM_SECURITY: u32 = 0x100_0000;
+
+/// SeQuerySecurityAccessMask (ntoskrnl 19041, 0x66c268): o acesso que o
+/// handle precisa para consultar as partes pedidas. OWNER, GROUP, DACL,
+/// LABEL, ATTRIBUTE, SCOPE, PROCESS_TRUST_LABEL e ACCESS_FILTER pedem
+/// READ_CONTROL; a SACL pede ACCESS_SYSTEM_SECURITY; BACKUP pede os dois.
+/// Bits desconhecidos não pedem nada e não são recusados.
+pub fn query_access_mask(information: u32) -> u32 {
+    let mut mask = 0;
+    if information & 0x1_0000 != 0 {
+        mask = READ_CONTROL | ACCESS_SYSTEM_SECURITY;
+    }
+    if information & 0x1F7 != 0 {
+        mask |= READ_CONTROL;
+    }
+    if information & 0x8 != 0 {
+        mask |= ACCESS_SYSTEM_SECURITY;
+    }
+    mask
+}
+
 /// Aceita os dois layouts NT; descritor NULL = sem componentes.
 pub fn read_descriptor(pointer: u64) -> Option<OwnedDescriptor> {
     if pointer == 0 {
