@@ -253,13 +253,20 @@ impl UserServer {
         state.next_id
     }
 
-    /// Põe a mensagem na fila e avisa a IOCP da porta de conexão.
+    /// Põe a mensagem na fila e avisa a IOCP da porta de conexão. Com um
+    /// objeto Callback registrado na porta (o NtAlpcSetInformation 9), o
+    /// ExNotifyCallback roda em seguida, no contexto de quem enviou e fora
+    /// das travas, como no AlpcpCompleteDispatchMessage do 19041.
     fn enqueue(&self, delivery: Delivery) {
+        let id = delivery.id;
         self.state.lock().queue.push_back(delivery);
         if let Some(completion) = self.listener.with(|state| state.completion.clone()) {
             completion.notify();
         }
         kernel_entry::notify_waiters();
+        if let Some((object, context)) = self.listener.with(|state| state.callback) {
+            let _ = crate::ntos::ex::callbacks::notify(object, context, id as u64);
+        }
     }
 
     /// O servidor fechou a porta de conexão: as conexões pendentes são

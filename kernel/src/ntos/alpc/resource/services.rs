@@ -463,7 +463,30 @@ pub fn set_information(handle: u64, class: u32, input: u64, length: u32, mode: u
                     };
                     return completion_association::associate(port, completion, key, mode);
                 }
-                if [1, 5, 6, 7, 8, 9, 10].contains(&class) {
+                if class == 9 {
+                    // AlpcRegisterCallbackInformation: só de modo kernel; o
+                    // objeto Callback é referenciado e fica, com o contexto,
+                    // na porta.
+                    if mode != 0 {
+                        return Ok(INVALID_PARAMETER);
+                    }
+                    if length != 16 {
+                        return Ok(0xC000_0004);
+                    }
+                    let (object, context) = match (read_field::<u64>(input, 0), read_field::<u64>(input, 8)) {
+                        (Ok(object), Ok(context)) => (object, context),
+                        (Err(status), _) | (_, Err(status)) => return Ok(status),
+                    };
+                    if object == 0 || crate::ntos::ex::callbacks::reference(object).is_none() {
+                        return Ok(INVALID_PARAMETER);
+                    }
+                    let previous = port.with(|state| state.callback.replace((object, context)));
+                    if let Some((old_object, _)) = previous {
+                        let _ = crate::ntos::ex::callbacks::dereference(old_object);
+                    }
+                    return Ok(0);
+                }
+                if [1, 5, 6, 7, 8, 10].contains(&class) {
                     return Ok(0xC000_00BB);
                 }
                 Ok(INVALID_PARAMETER)

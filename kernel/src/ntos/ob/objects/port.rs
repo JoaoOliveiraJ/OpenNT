@@ -123,6 +123,11 @@ pub struct PortState {
     pub permanent: bool,
     pub message_sequence: u32,
     pub completion: Option<Arc<dyn PortCompletion>>,
+    /// AlpcRegisterCallbackInformation (o NtAlpcSetInformation 9 de modo
+    /// kernel): o objeto Callback (referenciado) e o contexto que o
+    /// AlpcpCompleteDispatchMessage passa ao ExNotifyCallback a cada mensagem
+    /// posta na fila da porta (ALPC_PORT+0x170 e +0x178).
+    pub callback: Option<(u64, u64)>,
     pub named_node: Option<NodeId>,
     pub transport_cleanup: bool,
     pub on_disconnect: Option<fn(&Arc<Port>, &Arc<Port>, bool)>,

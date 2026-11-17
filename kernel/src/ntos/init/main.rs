@@ -175,6 +175,11 @@ pub fn kmain() -> ! {
     if let Err(error) = crate::ntos::ps::user::index::init() {
         debug_print!("[usermode] anel 3 nao armado: {}", error);
     }
+    // O canal ALPC do Power Manager com o serviço Power de modo usuário
+    // (o PopUmpoInitializeChannel do PoInitSystem): o \PowerPort.
+    if let Err(error) = crate::ntos::po::umpo_channel::initialize() {
+        debug_print!("[po] \\PowerPort nao criada: {}", error);
+    }
 
     // Os drivers iniciados, usados por um processo de teste (null, beep, fs_rec).
     for name in boot_config::start_driver().split(',').filter(|name| !name.is_empty()) {

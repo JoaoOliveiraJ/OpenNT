@@ -355,6 +355,16 @@ fn namespace(assert: Assert) {
         });
         assert(umdf.and_then(om::node).is_some_and(|node| node.type_name == "Directory" && node.permanent == Some(true)) && dacl_ok, "io: \\UMDFCommunicationPorts permanente com a DACL do SYSTEM e do WudfSvc");
     }
+    // PopUmpoInitializeChannel: a porta de conexão \PowerPort com o objeto
+    // Callback registrado (AlpcRegisterCallbackInformation) e sem cliente.
+    {
+        let node = om::lookup(crate::ntos::po::umpo_channel::PORT_NAME);
+        let callback = node.and_then(crate::ntos::alpc::server::server_of_node).map(|server| server.listener().with(|state| state.callback));
+        assert(
+            node.and_then(om::node).is_some_and(|node| node.type_name == "AlpcPort") && callback.is_some_and(|callback| callback.is_some_and(|(object, _)| crate::ntos::ex::callbacks::exists(object))) && !crate::ntos::po::umpo_channel::client_connected(),
+            "po: \\PowerPort com o callback do PopUmpoMessageCallback",
+        );
+    }
     assert(om::lookup("\\KnownDlls\\Nada").is_none(), "ob: nome inexistente");
     let (mounted, rest) = om::resolve("\\??\\C:\\hello.exe");
     assert(mounted == fs && rest.as_deref() == Some("hello.exe"), "ob: resto delegado ao volume montado");
