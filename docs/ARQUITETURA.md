@@ -3388,7 +3388,11 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   do 19041. O TokenSessionReference (só o valor 0, com o SeTcbPrivilege) faz
   o token largar a sessão de logon (TOKEN_SESSION_NOT_REFERENCED em
   TokenFlags): o LsapSetSessionToken do lsasrv faz isso com o token de cada
-  sessão que guarda, e o RmDeleteLogonSession não conta esse token. O CreateProcessAsUser passa o token no PS_ATTRIBUTE_TOKEN do
+  sessão que guarda, e o RmDeleteLogonSession não conta esse token. O
+  TokenIntegrityLevel troca o nível do SID de integridade do token (subir
+  pede o SeTcbPrivilege e um token sem uso; abaixo de High e de Medium os
+  privilégios fora das máscaras do 19041 ficam desligados, mas presentes):
+  o dwminit do winlogon sobe assim o token da conta DWM-n para System. O CreateProcessAsUser passa o token no PS_ATTRIBUTE_TOKEN do
   NtCreateUserProcess: o processo novo recebe uma cópia dele com o SessionId
   da sessão do processo (o SeSubProcessToken do
   PspInitializeProcessSecurity), e quem cria precisa do

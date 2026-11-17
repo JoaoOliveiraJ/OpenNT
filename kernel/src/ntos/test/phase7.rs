@@ -2845,6 +2845,28 @@ fn user_create_token(assert: Assert) {
         // processo (-4) não passa por essa recusa (o SYSTEM não é o dono).
         let primary_refused = check(token, 0x200_0000, 0x40) == 0xC000_005C;
         let pseudo_accepted = check((-4i64) as u64, 0x200_0000, 0x40) == 0 && guest::read32(granted) == 3 && guest::read32(status_out) == 0;
+        // NtSetInformationToken(TokenIntegrityLevel), como o dwminit e o
+        // LaunchUmfdHostWithVirtualAccount do winlogon: tamanho curto,
+        // autoridade fora de S-1-16 e nível acima de System recusados; descer
+        // a Low tira TOKEN_NOT_LOW e deixa o SeChangeNotifyPrivilege ligado;
+        // subir de novo a System passa com o SeTcbPrivilege do processo de
+        // teste, num token que não é primário de nenhum processo.
+        use crate::ntos::se::token::{handles::UserToken, tokens as token_records};
+        let pointer = state::get_user_handle(token).and_then(|entry| entry.downcast::<UserToken>().map(|object| object.token)).unwrap_or(0);
+        let (mandatory, level_sid) = (data + 0x900, data + 0x920);
+        guest::write64(mandatory, level_sid);
+        guest::write32(mandatory + 8, 0x20);
+        let label_set = |authority: u8, level: u32, length: u64| {
+            guest::write_bytes(level_sid, &[1, 1, 0, 0, 0, 0, 0, authority]);
+            guest::write32(level_sid + 8, level);
+            set(25, mandatory, length)
+        };
+        let level_of = || if query(25, 0x100) == 0 { guest::read32(guest::read64(buffer) + 8) } else { u32::MAX };
+        let refusals = label_set(16, 0x1000, 15) == 0xC000_0004 && label_set(5, 0x1000, 16) == 0xC000_0446 && label_set(16, 0x5000, 16) == 0xC000_0446;
+        let lowered = label_set(16, 0x1000, 16) == 0 && level_of() == 0x1000 && token_records::token_flags(pointer) & 0x2000 == 0;
+        let change_notify_kept = query(3, 0x40) == 0 && guest::read32(buffer) == 1 && guest::read32(buffer + 12) == 3;
+        let raised = label_set(16, 0x4000, 16) == 0 && level_of() == 0x4000 && token_records::token_flags(pointer) & 0x2000 != 0;
+        assert(pointer != 0 && refusals && lowered && change_notify_kept && raised, "usercreatetoken: TokenIntegrityLevel desce a Low, sobe a System com o SeTcbPrivilege e recusa tamanho, autoridade e nivel invalidos");
         // NtFilterToken, como o CreateRestrictedToken do dwminit: o Everyone
         // de SidsToDisable vira deny-only (os Attributes do pedido são
         // zerados no buffer de quem chama), o SeChangeNotifyPrivilege de

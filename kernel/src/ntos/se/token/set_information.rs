@@ -35,6 +35,12 @@
 //! - TokenOrigin (17): o LUID OriginatingLogonSession (8 bytes), com o
 //!   SeTcbPrivilege; só o primeiro valor fica. O LSA grava os dois no token
 //!   de cada logon (o LsapCreateTokenObject).
+//! - TokenIntegrityLevel (25): o TOKEN_MANDATORY_LABEL (16 bytes, o
+//!   SID_AND_ATTRIBUTES capturado pelo SeCaptureSidAndAttributesArray) troca
+//!   o nível de integridade do token (`set_integrity_level`). O dwminit do
+//!   winlogon sobe assim o token da conta DWM-n para System antes do
+//!   CreateRestrictedToken, e o LaunchUmfdHostWithVirtualAccount desce o da
+//!   conta UMFD-n para Low.
 //! - TokenMandatoryPolicy (27): o TOKEN_MANDATORY_POLICY (4 bytes), com o
 //!   SeTcbPrivilege; o token primário de um processo vivo (TokenInUse) é
 //!   STATUS_TOKEN_ALREADY_IN_USE, e bits fora de NO_WRITE_UP e
@@ -48,6 +54,7 @@
 use alloc::vec::Vec;
 
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::se::capture;
 use crate::ntos::se::model::{equal_sids, Sid};
 use crate::ntos::se::policy_descriptor;
 use crate::ntos::se::privilege;
@@ -69,10 +76,28 @@ const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
 const STATUS_INVALID_ACL: u32 = 0xC000_0077;
 const STATUS_INVALID_SID: u32 = 0xC000_0078;
 const STATUS_NOT_FOUND: u32 = 0xC000_0225;
+const STATUS_INVALID_LABEL: u32 = 0xC000_0446;
 /// As classes do NtSetInformationToken 19041 (bit = classe).
 const VALID_CLASSES: u64 = 0x2480_0F8B_5070;
 /// SeTcbPrivilege.
 const SE_TCB_PRIVILEGE: u64 = 7;
+/// A IdentifierAuthority do SeUntrustedMandatorySid (S-1-16).
+const MANDATORY_LABEL_AUTHORITY: [u8; 6] = [0, 0, 0, 0, 0, 16];
+const SECURITY_MANDATORY_MEDIUM_RID: u32 = 0x2000;
+const SECURITY_MANDATORY_HIGH_RID: u32 = 0x3000;
+const SECURITY_MANDATORY_SYSTEM_RID: u32 = 0x4000;
+/// TokenFlags: TOKEN_UIACCESS e TOKEN_NOT_LOW.
+const TOKEN_UIACCESS: u32 = 0x1000;
+const TOKEN_NOT_LOW: u32 = 0x2000;
+/// Os privilégios que podem ficar ligados abaixo de High (a máscara do LUA:
+/// sem SeCreateToken, SeTcb, SeTakeOwnership, SeLoadDriver, SeBackup,
+/// SeRestore, SeDebug, SeImpersonate, SeRelabel e
+/// SeDelegateSessionUserImpersonate) e abaixo de Medium (só SeChangeNotify,
+/// SeUndock e SeIncreaseWorkingSet), por LUID.
+const BELOW_HIGH_PRIVILEGES: u64 = 0xFFFF_FFEE_DFE9_F97B;
+const BELOW_MEDIUM_PRIVILEGES: u64 = 0x2_0280_0000;
+/// SE_PRIVILEGE_ENABLED_BY_DEFAULT | SE_PRIVILEGE_ENABLED.
+const SE_PRIVILEGE_ENABLED_AND_DEFAULT: u32 = 0x3;
 /// SE_GROUP_OWNER.
 const SE_GROUP_OWNER: u32 = 0x8;
 /// TOKEN_MANDATORY_POLICY_NO_WRITE_UP | TOKEN_MANDATORY_POLICY_NEW_PROCESS_MIN.
@@ -131,6 +156,99 @@ fn apply_operations(current: &mut Vec<SecurityAttribute>, attributes: Vec<Securi
         }
     }
     Ok(())
+}
+
+/// A última subautoridade de um SID (0 sem nenhuma).
+fn last_sub_authority(sid: &Sid) -> u32 {
+    let count = sid.get(1).copied().unwrap_or(0) as usize;
+    if count == 0 || sid.len() < 8 + count * 4 {
+        return 0;
+    }
+    let at = 8 + (count - 1) * 4;
+    u32::from_le_bytes([sid[at], sid[at + 1], sid[at + 2], sid[at + 3]])
+}
+
+/// O TokenIntegrityLevel do NtSetInformationToken (ntoskrnl 19041,
+/// 0x6ee53e) com o rótulo já capturado: a autoridade do SID tem de ser a do
+/// SeUntrustedMandatorySid (S-1-16) e o nível (a última subautoridade, 0
+/// sem nenhuma) no máximo System, senão STATUS_INVALID_LABEL; um token sem
+/// grupo de integridade também é STATUS_INVALID_LABEL. Subir o nível exige
+/// o SeTcbPrivilege (STATUS_PRIVILEGE_NOT_HELD) e um token que não é o
+/// primário de um processo vivo (STATUS_TOKEN_ALREADY_IN_USE); descer tira
+/// TOKEN_UIACCESS. O nível novo vai à última subautoridade do SID de
+/// integridade do token (STATUS_INVALID_PARAMETER quando não há nenhuma).
+/// Abaixo de High, os privilégios fora da máscara do LUA ficam desligados;
+/// abaixo de Medium, só SeChangeNotify, SeUndock e SeIncreaseWorkingSet
+/// podem ficar ligados e TOKEN_NOT_LOW sai; de Medium para cima,
+/// TOKEN_NOT_LOW entra e um token LowBox deixa de ser (o SID de pacote sai
+/// da DACL padrão e o pacote e as capacidades são largados). Os privilégios
+/// continuam presentes: só os bits Enabled e EnabledByDefault mudam.
+fn set_integrity_level(token: u64, label: &Sid, mode: u8) -> u32 {
+    if label.len() < 8 || label[2..8] != MANDATORY_LABEL_AUTHORITY {
+        return STATUS_INVALID_LABEL;
+    }
+    let level = last_sub_authority(label);
+    if level > SECURITY_MANDATORY_SYSTEM_RID {
+        return STATUS_INVALID_LABEL;
+    }
+    // O NT faz tudo com o token travado; aqui a verificação de privilégio e
+    // a busca do processo dono ficam fora da trava dos registros de token.
+    let Some(integrity) = tokens::with(token, |record| record.integrity.clone()) else { return STATUS_INVALID_PARAMETER };
+    if integrity.is_empty() {
+        return STATUS_INVALID_LABEL;
+    }
+    let current = last_sub_authority(&integrity);
+    if level > current {
+        if !privilege::single_privilege_check(SE_TCB_PRIVILEGE, mode as u32) {
+            return STATUS_PRIVILEGE_NOT_HELD;
+        }
+        if tokens::in_use(token) {
+            return STATUS_TOKEN_ALREADY_IN_USE;
+        }
+    }
+    let flags = &tokens::body(token).token_flags;
+    let clear_flags = |bits: u32| {
+        flags.atomic().fetch_and(!bits, core::sync::atomic::Ordering::SeqCst);
+    };
+    if level < current {
+        clear_flags(TOKEN_UIACCESS);
+    }
+    tokens::update(token, |record| {
+        let count = record.integrity.get(1).copied().unwrap_or(0) as usize;
+        if count == 0 || record.integrity.len() < 8 + count * 4 {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let at = 8 + (count - 1) * 4;
+        record.integrity[at..at + 4].copy_from_slice(&level.to_le_bytes());
+        let keep_enabled = |mask: u64, privileges: &mut Vec<crate::ntos::se::model::Privilege>| {
+            for privilege in privileges.iter_mut() {
+                if privilege.id >= 64 || (mask >> privilege.id) & 1 == 0 {
+                    privilege.attributes &= !SE_PRIVILEGE_ENABLED_AND_DEFAULT;
+                }
+            }
+        };
+        if level < SECURITY_MANDATORY_HIGH_RID {
+            keep_enabled(BELOW_HIGH_PRIVILEGES, &mut record.privileges);
+        }
+        if level < SECURITY_MANDATORY_MEDIUM_RID {
+            keep_enabled(BELOW_MEDIUM_PRIVILEGES, &mut record.privileges);
+            clear_flags(TOKEN_NOT_LOW);
+        } else {
+            // SepRemoveAceFromTokenDefaultDacl: a primeira ACE do SID de
+            // pacote; depois o pacote e as capacidades.
+            if let Some(package) = record.app_container.take() {
+                if let Some(dacl) = record.default_dacl.as_mut() {
+                    if let Some(index) = dacl.iter().position(|ace| ace.sid.as_ref() == Some(&package)) {
+                        dacl.remove(index);
+                    }
+                }
+                record.capabilities.clear();
+            }
+            flags.atomic().fetch_or(TOKEN_NOT_LOW, core::sync::atomic::Ordering::SeqCst);
+        }
+        0
+    })
+    .unwrap_or(STATUS_INVALID_PARAMETER)
 }
 
 /// O corpo do NtSetInformationToken sobre o token já referenciado (o
@@ -280,6 +398,15 @@ pub fn set(token: u64, class: u32, information: u64, length: u32, mode: u8) -> R
                 return Ok(STATUS_INVALID_PARAMETER);
             }
             tokens::update(token, |record| record.mandatory_policy = policy).map_or(STATUS_INVALID_PARAMETER, |_| 0)
+        }
+        25 => {
+            if length < 16 {
+                return Ok(STATUS_INFO_LENGTH_MISMATCH);
+            }
+            match capture::sid_and_attributes_array(information, 1, mode) {
+                Ok(label) => set_integrity_level(token, &label[0].sid, mode),
+                Err(status) => status,
+            }
         }
         39 => {
             if information == 0 || length < 16 {
