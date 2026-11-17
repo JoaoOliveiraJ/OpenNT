@@ -14,7 +14,8 @@
 //! Security), a ordem dos grupos de serviço (`Control\ServiceGroupOrder`) e,
 //! na SOFTWARE, os grupos do svchost (`Microsoft\Windows NT\CurrentVersion\
 //! Svchost`, os valores com a lista de serviços de cada grupo, e
-//! `Microsoft\Rpc\SecurityService`, os provedores de autenticação do RPC).
+//! `Microsoft\Rpc\SecurityService`, os provedores de autenticação do RPC, e
+//! os valores de `Microsoft\Windows NT\CurrentVersion\WUDF`).
 //! E a
 //! configuração das extensões do LSA (`Control\LsaExtensionConfig`: o
 //! lsasrv.dll, o efslsaext.dll e a interface do dpapisrv.dll), que o
@@ -73,8 +74,8 @@ pub fn system_keys(control_set: &str) -> Vec<HostKey> {
     keys
 }
 
-/// As chaves da hive SOFTWARE: os grupos do svchost e os provedores de
-/// autenticação do RPC.
+/// As chaves da hive SOFTWARE: os grupos do svchost, os provedores de
+/// autenticação do RPC e a configuração do WUDF.
 pub fn software_keys() -> Vec<HostKey> {
     let mut keys = Vec::new();
     #[cfg(windows)]
@@ -87,6 +88,12 @@ pub fn software_keys() -> Vec<HostKey> {
         // do rpcrt4.dll lê. Sem a chave, o RpcServerRegisterAuthInfo do lsass
         // volta RPC_S_UNKNOWN_AUTHN_SERVICE.
         registry::copy(registry::LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Rpc\\SecurityService", "Microsoft\\Rpc\\SecurityService", false, &mut keys);
+        // A configuração do gerenciador de drivers de modo usuário (os
+        // valores do WUDF, sem a lista de drivers UMDF desta máquina): o
+        // WdfDriverManager::LoadRegistrySettings do InitWudfDriverManager do
+        // services.exe recusa a falta do DefaultHostProcessGUID, e o
+        // SvcctrlMain sai antes do início automático.
+        registry::copy(registry::LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\WUDF", "Microsoft\\Windows NT\\CurrentVersion\\WUDF", false, &mut keys);
     }
     keys
 }

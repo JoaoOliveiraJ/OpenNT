@@ -400,6 +400,10 @@ const SMSS_PROGRAMS: &[&str] = &[
     "ntmarta.dll",
     // O dsrole.dll que o scecli.dll do lsass carrega.
     "dsrole.dll",
+    // O WUDFPlatform.dll do gerenciador de drivers de modo usuário que o
+    // InitWudfDriverManager do services.exe inicializa antes do início
+    // automático; sem ele o SvcctrlMain sai.
+    "WUDFPlatform.dll",
 ];
 
 /// As imagens de kernel do caminho do smss (`--initial-process=smss`): o
