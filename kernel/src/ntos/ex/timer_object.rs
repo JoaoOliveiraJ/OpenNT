@@ -43,13 +43,14 @@
 
 use alloc::vec::Vec;
 
+use crate::ntos::ex::ir_timer;
 use crate::ntos::ex::timer as executive_timers;
 use crate::ntos::inc::field::{Field, NtStruct, Reserved};
-use crate::ntos::inc::types::{Ethread, Kapc, Kdpc, Ktimer, ListEntry, TimerBasicInformation};
+use crate::ntos::inc::types::{Ethread, Kapc, Kdpc, Ktimer, ListEntry, TimerBasicInformation, TimerSetCoalescableTimerInfo};
 use crate::ntos::init::exports::private_routines;
 use crate::ntos::ke::{apc, clock, dpc, spin_lock, timer};
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::ob::{object_create, object_reference, object_types, reference_trace};
+use crate::ntos::ob::{object_create, object_reference, object_types, open_pointer, reference_trace};
 use crate::ntos::ps::{previous_mode, process, user_probe};
 use crate::rtl::KernelError;
 
@@ -57,12 +58,17 @@ const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
 const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
 const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
 const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
+const STATUS_INVALID_PARAMETER_3: u32 = 0xC000_00F1;
 const STATUS_INVALID_PARAMETER_4: u32 = 0xC000_00F2;
 const STATUS_INVALID_PARAMETER_6: u32 = 0xC000_00F4;
 /// TIMER_QUERY_STATE e TIMER_MODIFY_STATE.
 const TIMER_QUERY_STATE: u32 = 1;
 const TIMER_MODIFY_STATE: u32 = 2;
+/// TIMER_SET_INFORMATION_CLASS: TimerSetCoalescableTimer, a única.
+const TIMER_SET_COALESCABLE_TIMER: u32 = 0;
 /// SynchronizationTimer, o maior TIMER_TYPE.
 const SYNCHRONIZATION_TIMER: u32 = 1;
 /// CurrentApcEnvironment.
@@ -192,11 +198,17 @@ fn cancel_locked(timer: &Etimer) -> Result<u32, KernelError> {
 
 /// Referencia o handle como um ETIMER com `access` no modo dado.
 fn reference_timer(handle: u64, access: u32, mode: u8) -> Result<Result<u64, u32>, KernelError> {
+    reference_object(handle, access, mode, timer_type())
+}
+
+/// O ObReferenceObjectByHandle com `access` no modo dado e o tipo
+/// `object_type` (0 = qualquer tipo).
+fn reference_object(handle: u64, access: u32, mode: u8, object_type: u64) -> Result<Result<u64, u32>, KernelError> {
     let slot = guest::alloc_bytes(8);
     if slot == 0 {
         return Ok(Err(STATUS_INSUFFICIENT_RESOURCES));
     }
-    let status = object_reference::reference_by_handle(handle, access, timer_type(), mode, slot, 0)?;
+    let status = object_reference::reference_by_handle(handle, access, object_type, mode, slot, 0)?;
     // SAFETY: célula PVOID recém-alocada.
     let pointer = unsafe { Field::<u64>::at(slot) }.get();
     guest::free_bytes(slot);
@@ -267,13 +279,91 @@ pub fn set(handle: u64, due_time: u64, apc_routine: u64, apc_context: u64, resum
         Ok(pointer) => pointer,
         Err(status) => return Ok(status),
     };
+    set_object(pointer, mode, due, apc_routine, apc_context, resume, period as u32, 0, previous_state)
+}
+
+/// NtSetTimerEx(TimerHandle, TimerSetInformationClass, TimerSetInformation,
+/// TimerSetInformationLength) no modo `mode`, como no 19041: em UserMode o
+/// buffer é sondado (alinhamento 4) antes de tudo; só existe a classe
+/// TimerSetCoalescableTimer (0, senão STATUS_INVALID_INFO_CLASS), de 0x30
+/// bytes (senão STATUS_INFO_LENGTH_MISMATCH), capturados de uma vez.
+pub fn set_ex(handle: u64, class: u32, information: u64, length: u32, mode: u8) -> Result<u32, KernelError> {
+    if mode != 0 && length != 0 {
+        if information & 3 != 0 {
+            return Ok(STATUS_DATATYPE_MISALIGNMENT);
+        }
+        if !user_probe::probe_user_read(information, length as u64) {
+            return Ok(STATUS_ACCESS_VIOLATION);
+        }
+    }
+    if class != TIMER_SET_COALESCABLE_TIMER {
+        return Ok(STATUS_INVALID_INFO_CLASS);
+    }
+    if length != TimerSetCoalescableTimerInfo::SIZE as u32 {
+        return Ok(STATUS_INFO_LENGTH_MISMATCH);
+    }
+    let size = TimerSetCoalescableTimerInfo::SIZE as usize;
+    let copied = if mode != 0 { guest::try_read_bytes(information, size).ok() } else { Some(guest::read_bytes(information, size)) };
+    let Some(bytes) = copied else { return Ok(STATUS_ACCESS_VIOLATION) };
+    let captured = guest::alloc_bytes(TimerSetCoalescableTimerInfo::SIZE);
+    if captured == 0 {
+        return Ok(STATUS_INSUFFICIENT_RESOURCES);
+    }
+    guest::write_bytes(captured, &bytes);
+    // SAFETY: a cópia de kernel recém-preenchida acima.
+    let result = set_coalescable(handle, unsafe { TimerSetCoalescableTimerInfo::at(captured) }, mode);
+    guest::free_bytes(captured);
+    result
+}
+
+/// O NtSetTimerEx depois da captura: Period acima de MAXLONG dá
+/// STATUS_INVALID_PARAMETER_3; o handle é referenciado com
+/// TIMER_MODIFY_STATE sem tipo e despachado pelo tipo do objeto: o ETIMER
+/// vai ao ExpSetTimerObject com o TolerableDelay (um WakeContext pede o
+/// ResumeTimer; o OpenNT não captura o contexto de razão do Po nem acorda a
+/// máquina); o IRTimer exige APC, contexto, WakeContext, TolerableDelay e
+/// PreviousState nulos (senão STATUS_INVALID_PARAMETER) e vai ao
+/// ExpSetTimerObject2 com o período em 100 ns; outro tipo dá
+/// STATUS_OBJECT_TYPE_MISMATCH.
+fn set_coalescable(handle: u64, info: &TimerSetCoalescableTimerInfo, mode: u8) -> Result<u32, KernelError> {
+    let period = info.period.get();
+    if period > i32::MAX as u32 {
+        return Ok(STATUS_INVALID_PARAMETER_3);
+    }
+    let (due, apc_routine, apc_context, wake_context) = (info.due_time.quad_part.get(), info.timer_apc_routine.get(), info.timer_context.get(), info.wake_context.get());
+    let (tolerable_delay, previous_state) = (info.tolerable_delay.get(), info.previous_state.get());
+    let pointer = match reference_object(handle, TIMER_MODIFY_STATE, mode, 0)? {
+        Ok(pointer) => pointer,
+        Err(status) => return Ok(status),
+    };
+    let object_type = open_pointer::describe(pointer).map_or(0, |item| item.object_type.pointer);
+    if object_type != 0 && object_type == ir_timer::timer_type() {
+        if apc_routine != 0 || apc_context != 0 || wake_context != 0 || tolerable_delay != 0 || previous_state != 0 {
+            dereference(pointer, 1)?;
+            return Ok(STATUS_INVALID_PARAMETER);
+        }
+        return Ok(ir_timer::set_object(pointer, Some(due), period as i64 * 10_000, None));
+    }
+    if object_type != timer_type() {
+        dereference(pointer, 1)?;
+        return Ok(STATUS_OBJECT_TYPE_MISMATCH);
+    }
+    set_object(pointer, mode, due, apc_routine, apc_context, wake_context != 0, period, tolerable_delay, previous_state)
+}
+
+/// ExpSetTimerObject(Timer, PreviousMode, DueTime, TimerApcRoutine,
+/// TimerContext, ResumeTimer, Period, TolerableDelay, PreviousState) sobre
+/// o ETIMER já referenciado: a referência do handle fica com a associação
+/// da APC ou é solta aqui.
+#[allow(clippy::too_many_arguments)]
+fn set_object(pointer: u64, mode: u8, due: i64, apc_routine: u64, apc_context: u64, resume: bool, period: u32, tolerable_delay: u32, previous_state: u64) -> Result<u32, KernelError> {
     let body = etimer(pointer);
     let irql = spin_lock::acquire(body.lock.address());
     let outcome = (|| -> Result<(u32, u32), KernelError> {
         let released = cancel_locked(body)?;
         let previous = body.ke_timer.header.signal_state.get() as u32;
-        body.period.set(period as u32);
-        body.tolerable_delay.set(0);
+        body.period.set(period);
+        body.tolerable_delay.set(tolerable_delay);
         let flags = body.timer_flags.get() & !RESUME_REQUESTED;
         body.timer_flags.set(if resume { flags | RESUME_REQUESTED } else { flags });
         let mut drop_handle_reference = 1;
@@ -285,7 +375,7 @@ pub fn set(handle: u64, due_time: u64, apc_routine: u64, apc_context: u64, resum
             drop_handle_reference = 0;
             (body.timer_dpc.address(), 0)
         } else {
-            (0, period as u32)
+            (0, period)
         };
         timer::set_timer(body.ke_timer.address(), due, dpc_pointer, timer_period);
         Ok((released + drop_handle_reference, previous))

@@ -2649,6 +2649,36 @@ const _: () = {
     assert!(core::mem::offset_of!(TimerBasicInformation, timer_state) == 0x8);
 };
 
+/// `_TIMER_SET_COALESCABLE_TIMER_INFO` (NtSetTimerEx, classe
+/// TimerSetCoalescableTimer; 0x30 bytes).
+#[repr(C)]
+pub struct TimerSetCoalescableTimerInfo {
+    pub due_time: LargeInteger,
+    /// -> `fn`
+    pub timer_apc_routine: Field<u64>,
+    /// -> `void`
+    pub timer_context: Field<u64>,
+    /// -> `_COUNTED_REASON_CONTEXT`
+    pub wake_context: Field<u64>,
+    pub period: Field<u32>,
+    pub tolerable_delay: Field<u32>,
+    /// -> `u8`
+    pub previous_state: Field<u64>,
+}
+
+unsafe impl NtStruct for TimerSetCoalescableTimerInfo {}
+
+const _: () = {
+    assert!(core::mem::size_of::<TimerSetCoalescableTimerInfo>() == 0x30);
+    assert!(core::mem::offset_of!(TimerSetCoalescableTimerInfo, due_time) == 0x0);
+    assert!(core::mem::offset_of!(TimerSetCoalescableTimerInfo, timer_apc_routine) == 0x8);
+    assert!(core::mem::offset_of!(TimerSetCoalescableTimerInfo, timer_context) == 0x10);
+    assert!(core::mem::offset_of!(TimerSetCoalescableTimerInfo, wake_context) == 0x18);
+    assert!(core::mem::offset_of!(TimerSetCoalescableTimerInfo, period) == 0x20);
+    assert!(core::mem::offset_of!(TimerSetCoalescableTimerInfo, tolerable_delay) == 0x24);
+    assert!(core::mem::offset_of!(TimerSetCoalescableTimerInfo, previous_state) == 0x28);
+};
+
 /// `_SECTION_BASIC_INFORMATION` (NtQuerySection; 0x18 bytes).
 #[repr(C)]
 pub struct SectionBasicInformation {

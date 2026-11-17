@@ -45,6 +45,7 @@ pub fn run(assert: Assert) {
     events(assert, block, rsp, &call);
     directory_query(assert, block, rsp, &call);
     executive_timer(assert, block, rsp, &call);
+    coalescable_timer(assert, block, rsp, &call);
     adjust_groups(assert, block, rsp, &call);
     power_information(assert, block, rsp, &call);
     if let Some(region) = memory::find_region(block) {
@@ -355,6 +356,51 @@ fn executive_timer(assert: Assert, block: u64, rsp: u64, call: Call) {
         "userboot: NtCreateTimer, NtSetTimer e NtCancelTimer do ETIMER de modo usuario",
     );
     assert(query_ok && query_refused && idle, "userboot: NtQueryTimer do ETIMER (restante, estado, recusas e timer fora da fila)");
+}
+
+/// NtSetTimerEx no ETIMER (o SetWaitableTimer do kernelbase): as recusas de
+/// classe, tamanho, alinhamento e período, o set com TolerableDelay e
+/// PreviousState, a espera de modo usuário no handle nativo do ETIMER e um
+/// handle de outro tipo.
+fn coalescable_timer(assert: Assert, block: u64, rsp: u64, call: Call) {
+    let (handle_cell, info, previous, zero, event_cell) = (block + 0x680, block + 0x6C0, block + 0x6F8, block + 0x700, block + 0x708);
+    let created = call("NtCreateTimer", handle_cell, 0x1F_0003, 0, 0);
+    let handle = guest::read64(handle_cell);
+    let fill = |due: i64, period: u32, tolerable_delay: u32| {
+        guest::write64(info, due as u64);
+        guest::write64(info + 0x08, 0);
+        guest::write64(info + 0x10, 0);
+        guest::write64(info + 0x18, 0);
+        guest::write32(info + 0x20, period);
+        guest::write32(info + 0x24, tolerable_delay);
+        guest::write64(info + 0x28, previous);
+    };
+    fill(-10_000_000, 0, 50);
+    let refused = call("NtSetTimerEx", handle, 1, info, 0x30) == 0xC000_0003 && call("NtSetTimerEx", handle, 0, info, 0x28) == 0xC000_0004 && call("NtSetTimerEx", handle, 0, info + 2, 0x30) == STATUS_DATATYPE_MISALIGNMENT;
+    fill(-10_000_000, 0x8000_0000, 50);
+    let period_refused = call("NtSetTimerEx", handle, 0, info, 0x30) == 0xC000_00F1;
+    fill(-10_000_000, 0, 50);
+    guest::write8(previous, 0xFF);
+    let set = call("NtSetTimerEx", handle, 0, info, 0x30) == 0 && guest::read8(previous) == 0;
+    // A espera de modo usuário resolve o handle nativo do ETIMER.
+    guest::write64(zero, 0);
+    let pending = call("NtWaitForSingleObject", handle, 0, zero, 0) == 0x102;
+    // Prazo absoluto já passado: o timer de notificação fica sinalizado.
+    fill(116_444_736_000_000_000, 0, 0);
+    let expired = call("NtSetTimerEx", handle, 0, info, 0x30) == 0 && {
+        crate::ntos::ke::timer::check_timers();
+        call("NtWaitForSingleObject", handle, 0, zero, 0) == 0 && call("NtWaitForSingleObject", handle, 0, zero, 0) == 0
+    };
+    let _ = call("NtCancelTimer", handle, 0, 0, 0);
+    let closed = call("NtClose", handle, 0, 0, 0) == 0;
+    guest::write64(rsp + 0x28, 0);
+    let event = call("NtCreateEvent", event_cell, 0x1F_0003, 0, 0) == 0;
+    let mismatch = call("NtSetTimerEx", guest::read64(event_cell), 0, info, 0x30) == 0xC000_0024;
+    let _ = call("NtClose", guest::read64(event_cell), 0, 0, 0);
+    assert(
+        created == 0 && refused && period_refused && set && pending && expired && closed && event && mismatch,
+        "userboot: NtSetTimerEx no ETIMER (recusas, TolerableDelay, PreviousState, espera no handle nativo e outro tipo)",
+    );
 }
 
 /// NtPowerInformation de modo usuário: PlatformInformation e PlatformRole

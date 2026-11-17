@@ -3622,7 +3622,13 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     ExpTimerApcRoutine, ExpDeleteTimer e PspIoMiniPacketCallbackRoutine são
     rotinas privadas (`init/exports.rs::private_routines`); o NtQueryTimer
     (só ETIMER: RemainingTime = KeQueryTimerDueTime menos o tempo de
-    interrupção, TimerState = o SignalState);
+    interrupção, TimerState = o SignalState); o NtSetTimerEx de todo
+    SetWaitableTimer(Ex) (a classe TimerSetCoalescableTimer, 0x30 bytes
+    capturados, Period acima de MAXLONG dá STATUS_INVALID_PARAMETER_3; o
+    handle referenciado sem tipo vai ao ExpSetTimerObject com o
+    TolerableDelay num ETIMER, ao ExpSetTimerObject2 num IRTimer, que não
+    aceita APC, WakeContext, TolerableDelay nem PreviousState, e dá
+    STATUS_OBJECT_TYPE_MISMATCH em outro tipo);
   - o objeto IRTimer do NtCreateTimer2 em `ex/ir_timer.rs`: tipo "IRTimer"
     próprio (o ETIMER e o IRTimer não se confundem no
     ObReferenceObjectByHandle), corpo de 0xA8 bytes com o KTIMER2 de

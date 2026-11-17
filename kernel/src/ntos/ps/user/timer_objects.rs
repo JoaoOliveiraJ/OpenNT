@@ -1,9 +1,10 @@
 //! Os adaptadores de modo usuário dos timers: o ETIMER do Executive
 //! (NtCreateTimer, NtSetTimer, NtCancelTimer e NtQueryTimer, sobre
-//! `ex/timer_object.rs` com PreviousMode UserMode) e o IRTimer do
+//! `ex/timer_object.rs` com PreviousMode UserMode), o IRTimer do
 //! NtCreateTimer2 (NtCreateTimer2, NtCreateIRTimer, NtSetTimer2,
-//! NtSetIRTimer e NtCancelTimer2, sobre `ex/ir_timer.rs`). Aqui ficam só a
-//! leitura dos argumentos e a captura dos parâmetros de usuário.
+//! NtSetIRTimer e NtCancelTimer2, sobre `ex/ir_timer.rs`) e o NtSetTimerEx,
+//! que serve os dois. Aqui ficam só a leitura dos argumentos e a captura dos
+//! parâmetros de usuário.
 
 use super::state;
 use crate::ntos::ex::{ir_timer, timer_object};
@@ -95,6 +96,13 @@ fn nt_set_timer(handle: u64, due: u64, apc_routine: u64, apc_context: u64, rsp: 
     timer_object::set(handle, due, apc_routine, apc_context, resume, period, previous_state, USER_MODE)
 }
 
+/// NtSetTimerEx(TimerHandle, TimerSetInformationClass,
+/// TimerSetInformation, TimerSetInformationLength): o SetWaitableTimer e o
+/// SetWaitableTimerEx do kernelbase, no ETIMER e no IRTimer.
+fn nt_set_timer_ex(handle: u64, class: u64, information: u64, length: u64, _rsp: u64) -> Result<u32, KernelError> {
+    timer_object::set_ex(handle, class as u32, information, length as u32, USER_MODE)
+}
+
 /// NtCancelTimer(TimerHandle, CurrentState).
 fn nt_cancel_timer(handle: u64, current_state: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
     timer_object::cancel(handle, current_state, USER_MODE)
@@ -103,6 +111,7 @@ fn nt_cancel_timer(handle: u64, current_state: u64, _a3: u64, _a4: u64, _rsp: u6
 pub fn init() {
     state::register_handler("NtCreateTimer", nt_create_timer);
     state::register_handler("NtSetTimer", nt_set_timer);
+    state::register_handler("NtSetTimerEx", nt_set_timer_ex);
     state::register_handler("NtCancelTimer", nt_cancel_timer);
     state::register_handler("NtCreateTimer2", nt_create_timer2);
     state::register_handler("NtSetTimer2", nt_set_timer2);

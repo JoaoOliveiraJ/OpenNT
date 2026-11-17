@@ -1412,6 +1412,22 @@ fn user_mutants_and_timers(assert: Assert) {
     due_time.quad_part.set(-10_000_000);
     let cancelled = call("NtSetTimer2", timer, due, 0, 0) == 0 && call("NtCancelTimer2", timer, due, 0, 0) == 0 && ktimer2(timer).is_some_and(|body| body.header.lock.get() & 0x100 == 0);
     assert(cancelled && call("NtQueryTimer", timer, 0, info, 16) == 0xC000_0024 && call("NtQueryTimer", timer, 0, info, 8) == 0xC000_0004, "usermutants: cancelamento e NtQueryTimer recusado no IRTimer");
+    // NtSetTimerEx num IRTimer: só prazo e período (em ms); APC, contexto,
+    // WakeContext, TolerableDelay ou PreviousState dão
+    // STATUS_INVALID_PARAMETER.
+    let coalescable = block + 0x200;
+    let fill = |period: u32, tolerable_delay: u32| {
+        guest::write64(coalescable, (-10_000_000i64) as u64);
+        guest::write_bytes(coalescable + 8, &[0u8; 0x18]);
+        guest::write32(coalescable + 0x20, period);
+        guest::write32(coalescable + 0x24, tolerable_delay);
+        guest::write64(coalescable + 0x28, 0);
+    };
+    fill(250, 0);
+    let periodic = call("NtSetTimerEx", timer, 0, coalescable, 0x30) == 0 && ktimer2(timer).is_some_and(|body| body.period.get() == 2_500_000 && body.header.lock.get() & 0x100 != 0);
+    fill(0, 10);
+    let tolerable_refused = call("NtSetTimerEx", timer, 0, coalescable, 0x30) == 0xC000_000D;
+    assert(periodic && tolerable_refused && call("NtCancelTimer2", timer, 0, 0, 0) == 0, "usermutants: NtSetTimerEx no IRTimer (periodo em 100 ns e TolerableDelay recusado)");
     // T2_SET_PARAMETERS: Version 0 e NoWakeTolerance >= -1; DueTime NULL.
     let parameters = info;
     guest::write32(parameters, 1);
