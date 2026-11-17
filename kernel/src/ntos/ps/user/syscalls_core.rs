@@ -329,6 +329,37 @@ fn nt_wait_for_multiple_objects(count: u64, handles: u64, wait_type: u64, alerta
     })
 }
 
+/// NtSignalAndWaitForSingleObject(SignalHandle, WaitHandle, Alertable,
+/// Timeout*), como no 19041: o prazo capturado; o SignalHandle referenciado
+/// sem direito e o WaitHandle com SYNCHRONIZE (o objeto de espera do tipo);
+/// o sinal pelo tipo do primeiro (`ob/wait::SignalObject::signal`) e, só
+/// com ele bem-sucedido, a espera no segundo. Toda a CPU de usuário é do
+/// serviço até a espera ser instalada, então o sinal e a espera são
+/// atômicos para as outras threads.
+fn nt_signal_and_wait_for_single_object(signal: u64, wait: u64, alertable: u64, timeout: u64, _rsp: u64) -> Result<u32, KernelError> {
+    let timeout = match state::capture_timeout(timeout) {
+        Ok(timeout) => timeout,
+        Err(status) => return Ok(status),
+    };
+    let signal_object = match ob_wait::reference_signal_object(signal, USER_MODE) {
+        Ok(object) => object,
+        Err(status) => return Ok(status),
+    };
+    let set = match ob_wait::reference_objects(&[wait], USER_MODE, ob_wait::WAIT_ANY) {
+        Ok(set) => set,
+        Err(status) => {
+            signal_object.release();
+            return Ok(status);
+        }
+    };
+    let status = signal_object.signal(USER_MODE);
+    if status != 0 {
+        set.release();
+        return Ok(status);
+    }
+    Ok(wait_captured(set, ob_wait::WAIT_ANY, timeout, alertable & 0xFF != 0))
+}
+
 /// NtSerializeBoot(): `io/pnp::serialize_boot`, de modo usuário.
 fn nt_serialize_boot(_: u64, _: u64, _: u64, _: u64, _rsp: u64) -> Result<u32, KernelError> {
     Ok(crate::ntos::io::pnp::serialize_boot(1))
@@ -1088,6 +1119,7 @@ pub fn init() {
         ("NtContinueEx", nt_continue_ex),
         ("NtWaitForSingleObject", nt_wait_for_single_object),
         ("NtWaitForMultipleObjects", nt_wait_for_multiple_objects),
+        ("NtSignalAndWaitForSingleObject", nt_signal_and_wait_for_single_object),
         ("NtQuerySystemInformation", nt_query_system_information),
         ("NtQuerySystemInformationEx", nt_query_system_information_ex),
         ("NtQuerySystemEnvironmentValueEx", nt_query_system_environment_value_ex),

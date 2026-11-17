@@ -1,7 +1,8 @@
 //! Espera por handle (ZwWaitForSingleObject, ZwWaitForMultipleObjects,
 //! ObWaitForSingleObject, ObWaitForMultipleObjects, o export
-//! NtWaitForSingleObject no modo anterior do chamador e a captura dos
-//! objetos de espera que os serviços de modo usuário usam).
+//! NtWaitForSingleObject no modo anterior do chamador, a captura dos
+//! objetos de espera que os serviços de modo usuário usam e o sinal do
+//! NtSignalAndWaitForSingleObject).
 //!
 //! O handle é resolvido na ordem: a tabela nativa (abertos por ponteiro),
 //! threads de sistema, os eventos abertos pelo núcleo de handles de kernel do
@@ -225,6 +226,71 @@ pub fn reference_objects(handles: &[u64], previous_mode: u8, wait_type: u32) -> 
         return Err(STATUS_INVALID_PARAMETER_MIX);
     }
     Ok(set)
+}
+
+/// EVENT_MODIFY_STATE e SEMAPHORE_MODIFY_STATE.
+const EVENT_MODIFY_STATE: u32 = 2;
+const SEMAPHORE_MODIFY_STATE: u32 = 2;
+const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
+
+/// O objeto a sinalizar do NtSignalAndWaitForSingleObject, retido até o
+/// sinal.
+pub struct SignalObject {
+    type_name: alloc::string::String,
+    pointer: u64,
+    access: u32,
+    held: Held,
+}
+
+/// O ObReferenceObjectByHandle(SignalHandle, 0, NULL) do
+/// NtSignalAndWaitForSingleObject: qualquer tipo, sem direito exigido na
+/// referência (o direito depende do tipo, no sinal).
+pub fn reference_signal_object(handle: u64, previous_mode: u8) -> Result<SignalObject, u32> {
+    match open_pointer::resolve(handle, previous_mode != 0) {
+        Some(Err(status)) => return Err(status),
+        Some(Ok(opened)) => {
+            opened.item.reference();
+            let (type_name, pointer) = (opened.item.object_type.name.clone(), opened.item.pointer);
+            return Ok(SignalObject { type_name, pointer, access: opened.access, held: Held::Native(opened.item) });
+        }
+        None => {}
+    }
+    let Some(entry) = state::get_user_handle(handle) else { return Err(STATUS_INVALID_HANDLE) };
+    let (type_name, pointer) = entry.object.native_body().map(|body| (body.type_name, body.pointer)).unwrap_or_default();
+    let access = entry.access();
+    state::retain_user_handle_reference(&entry);
+    Ok(SignalObject { type_name, pointer, access, held: Held::User(entry) })
+}
+
+impl SignalObject {
+    /// O sinal do NtSignalAndWaitForSingleObject 19041 pelo tipo do objeto:
+    /// evento (em UserMode com EVENT_MODIFY_STATE, senão
+    /// STATUS_ACCESS_DENIED) pelo KeSetEvent; mutant pelo KeReleaseMutant
+    /// (STATUS_MUTANT_NOT_OWNED sem a posse); semáforo (em UserMode com
+    /// SEMAPHORE_MODIFY_STATE) pelo KeReleaseSemaphore de 1
+    /// (STATUS_SEMAPHORE_LIMIT_EXCEEDED no limite); outro tipo,
+    /// STATUS_OBJECT_TYPE_MISMATCH. Solta a referência.
+    pub fn signal(self, previous_mode: u8) -> u32 {
+        let user = previous_mode != 0;
+        let status = match self.type_name.as_str() {
+            "Event" if user && self.access & EVENT_MODIFY_STATE == 0 => STATUS_ACCESS_DENIED,
+            "Event" => {
+                dispatcher::set_event(self.pointer);
+                0
+            }
+            "Mutant" => dispatcher::release_mutant(self.pointer, false).map_or_else(|status| status, |_| 0),
+            "Semaphore" if user && self.access & SEMAPHORE_MODIFY_STATE == 0 => STATUS_ACCESS_DENIED,
+            "Semaphore" => dispatcher::release_semaphore(self.pointer, 1).map_or_else(|status| status, |_| 0),
+            _ => STATUS_OBJECT_TYPE_MISMATCH,
+        };
+        self.held.release();
+        status
+    }
+
+    /// Solta a referência sem sinalizar.
+    pub fn release(self) {
+        self.held.release();
+    }
 }
 
 /// O KeWaitForMultipleObjects (UserRequest) sobre objetos já capturados, com

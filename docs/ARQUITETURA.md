@@ -864,7 +864,15 @@ ms arredondados para cima (um prazo não nulo abaixo de 1 ms espera o
 próximo ms, nunca vence de imediato). O NtDelayExecution com intervalo zero,
 sem Alertable e sem UserApcPending, é a troca do NtYieldExecution
 (STATUS_SUCCESS ou STATUS_NO_YIELD_PERFORMED), como no
-KeDelayExecutionThread. O autoteste
+KeDelayExecutionThread. O NtSignalAndWaitForSingleObject referencia o
+objeto a sinalizar sem direito e o de espera com SYNCHRONIZE, sinaliza pelo
+tipo (`ob/wait::SignalObject`: evento com EVENT_MODIFY_STATE, mutant com a
+posse, semáforo com SEMAPHORE_MODIFY_STATE e o limite, outro tipo
+STATUS_OBJECT_TYPE_MISMATCH) e só então espera; a CPU de usuário é do
+serviço até a espera ser instalada, então o par é atômico. O
+NtAlertThreadByThreadId recusa a thread de outro processo (o KTHREAD.Process
+dela contra o da corrente) com STATUS_ACCESS_DENIED, sem deixar o alerta
+pendente. O autoteste
 `ntos/test/multiprocess/blocking_wait.rs` roda duas threads de um processo
 real no despachante: a 1 espera um KEVENT sem prazo numa syscall de teste e
 a 2, que só fica pronta depois disso, a vê bloqueada (Waiting, KernelStack

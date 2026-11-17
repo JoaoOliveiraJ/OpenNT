@@ -1871,8 +1871,18 @@ fn nt_wait_for_alert_by_thread_id(_address: u64, timeout: u64, _a3: u64, _a4: u6
     Ok(PENDING)
 }
 
+/// NtAlertThreadByThreadId(ThreadId), como no 19041: um id desconhecido dá
+/// STATUS_INVALID_CID (o PsLookupThreadByThreadId); uma thread de outro
+/// processo dá STATUS_ACCESS_DENIED sem alerta; senão o alerta fica
+/// pendente na thread (um só, não acumula) até o próximo
+/// NtWaitForAlertByThreadId dela.
 fn nt_alert_thread_by_thread_id(id: u64, _a2: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
     let Some(thread) = all().into_iter().find(|thread| thread.thread_id == id && !thread.dead()) else { return Ok(0xC000_000B) };
+    // O KTHREAD.Process (Tcb.Process) do alvo contra o da thread corrente.
+    let owner = |pointer: u64| if pointer != 0 { kernel_thread(pointer).process.get() } else { 0 };
+    if owner(thread.pointer()) != owner(process::get_current_thread()) {
+        return Ok(0xC000_0022);
+    }
     thread.with(|thread| thread.alerted = true);
     Ok(0)
 }

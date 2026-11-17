@@ -1671,6 +1671,10 @@ fn user_threads_in(assert: Assert, test: &TestProcess) {
     assert(refused && impersonated && copied && reverted, "userthreads: NtImpersonateThread com direitos dos handles, copia estatica e retorno ao proprio token");
     // Alertas por id e esperas, com a thread retomada como corrente (laço real).
     let previous_thread = process::get_current_thread();
+    // Da thread do teste (outro processo), o alerta é recusado e não fica
+    // pendente.
+    let foreign = call("NtAlertThreadByThreadId", thread.thread_id, 0, 0, 0) == 0xC000_0022 && !thread.with(|thread| thread.alerted);
+    assert(foreign, "userthreads: alerta por id de outro processo recusado");
     let _ = call("NtResumeThread", handle, 0, 0, 0);
     process::set_current_thread(pointer);
     threads::set_running(true, Some(thread.clone()));
@@ -2282,6 +2286,24 @@ fn user_syscalls_core(assert: Assert) {
     let default_all = call("NtWaitForMultipleObjects", 2, buffer, 0, 0) == 0xC000_0030;
     let _ = call("NtClose", waitable, 0, 0, 0);
     assert(denied && synchronized && default_any && default_all, "usercore: objeto sem espera propria sinalizado pelo objeto padrao e SYNCHRONIZE exigido");
+    // NtSignalAndWaitForSingleObject: o sinal pelo tipo e a espera no outro.
+    // `first` (sincronização) e `second` (notificação) estão sem sinal.
+    let signal_wait = |signal: u64, wait: u64| call("NtSignalAndWaitForSingleObject", signal, wait, 0, string);
+    let event_then_timeout = signal_wait(first, second) == 0x102 && call("NtWaitForSingleObject", first, 0, string, 0) == 0;
+    let same_object = signal_wait(second, second) == 0;
+    let _ = call("NtResetEvent", second, 0, 0, 0);
+    let mismatch = signal_wait(directory, second) == 0xC000_0024 && signal_wait(first, 0x7FF0) == 0xC000_0008;
+    let _ = call("NtCreateMutant", out, 0x1F_0001, 0, 0);
+    let mutant = guest::read64(out);
+    guest::write64(rsp + 0x28, 1);
+    let _ = call("NtCreateSemaphore", out, 0x1F_0003, 0, 1);
+    let semaphore = guest::read64(out);
+    let refused = signal_wait(mutant, second) == 0xC000_0046 && signal_wait(semaphore, second) == 0xC000_0047 && call("NtWaitForSingleObject", first, 0, string, 0) == 0x102;
+    for value in [mutant, semaphore] {
+        let _ = call("NtClose", value, 0, 0, 0);
+    }
+    guest::write64(rsp + 0x28, info);
+    assert(event_then_timeout && same_object && mismatch && refused, "usercore: NtSignalAndWaitForSingleObject (evento, mesmo objeto, tipo invalido, mutante sem posse e limite do semaforo)");
     // OBJ_KERNEL_HANDLE de UserMode é ignorado (o ObpCaptureObjectCreateInformation
     // tira o bit), como o services.exe abre o \DriverStores.
     set_object_attributes(unsafe { nt::ObjectAttributes::at(attributes) }, nt::ObjectAttributes::SIZE as u32, 0, attributes + 0x40, 0x240);
