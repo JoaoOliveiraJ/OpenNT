@@ -98,7 +98,7 @@ pub(crate) fn breakpoints_tab(ui: &mut Ui, state: &mut UiState) {
     let stopped = state.status == Status::Stopped;
     ui.horizontal_wrapped(|ui| {
         egui::ComboBox::from_id_salt("re-bp-kind").selected_text(state.breakpoint_kind.name()).show_ui(ui, |ui| {
-            for kind in [BreakpointKind::Software, BreakpointKind::Hardware, BreakpointKind::Write, BreakpointKind::Access, BreakpointKind::Module, BreakpointKind::Event] {
+            for kind in [BreakpointKind::Software, BreakpointKind::Hardware, BreakpointKind::Write, BreakpointKind::Access, BreakpointKind::MemoryAccess, BreakpointKind::MemoryWrite, BreakpointKind::MemoryExecute, BreakpointKind::Module, BreakpointKind::Event] {
                 ui.selectable_value(&mut state.breakpoint_kind, kind, kind.name());
             }
         });
@@ -126,6 +126,9 @@ pub(crate) fn breakpoints_tab(ui: &mut Ui, state: &mut UiState) {
         }
         if ui.add_enabled(stopped, egui::Button::new("Vigiar faixa...")).on_hover_text("escrita ou acesso numa faixa, com até quatro comparadores de hardware").clicked() {
             state.dialog = Some(Dialog::RangeWatch(String::new(), "10".into(), true));
+        }
+        if ui.add_enabled(stopped, egui::Button::new("Editor...")).on_hover_text("o editor completo: condição de parada, log e condição de log, comandos e condição de comando, nome, contagem, uma vez só, silencioso, retorno rápido").clicked() {
+            state.breakpoint_form = Some(crate::editor::BreakpointForm::new(state.breakpoint_kind, &state.breakpoint_expression));
         }
     });
     // Os grupos.
@@ -169,8 +172,8 @@ pub(crate) fn breakpoints_tab(ui: &mut Ui, state: &mut UiState) {
     }
     ui.separator();
     egui::ScrollArea::both().id_salt("re-breakpoints").auto_shrink([false, false]).show(ui, |ui| {
-        egui::Grid::new("re-bp-grid").num_columns(11).striped(true).spacing([10.0, 2.0]).show(ui, |ui| {
-            for title in ["#", "tipo", "endereço", "símbolo / expressão", "estado", "acertos", "condição", "log", "comandos", "grupo", "processo"] {
+        egui::Grid::new("re-bp-grid").num_columns(13).striped(true).spacing([10.0, 2.0]).show(ui, |ui| {
+            for title in ["#", "tipo", "endereço", "símbolo / expressão", "nome", "estado", "acertos", "condição", "log", "comandos", "opções", "grupo", "processo"] {
                 ui.label(RichText::new(title).strong());
             }
             ui.end_row();
@@ -183,6 +186,7 @@ pub(crate) fn breakpoints_tab(ui: &mut Ui, state: &mut UiState) {
                     state.go_to_code(breakpoint.address);
                 }
                 ui.label(mono(&breakpoint.expression));
+                ui.label(&breakpoint.options.name);
                 let mut enabled = breakpoint.enabled;
                 if ui.add_enabled(stopped, egui::Checkbox::new(&mut enabled, if breakpoint.pending { "adiado" } else { "" })).changed() {
                     state.requests.push(Request::EnableBreakpoint(breakpoint.id, enabled));
@@ -190,15 +194,23 @@ pub(crate) fn breakpoints_tab(ui: &mut Ui, state: &mut UiState) {
                 ui.label(mono(breakpoint.hits.to_string()));
                 let pass = if breakpoint.pass_count > 1 { format!(" a partir de {}", breakpoint.pass_count) } else { String::new() };
                 ui.label(mono(format!("{}{pass}", breakpoint.condition)));
-                ui.label(mono(&breakpoint.log).color(colors.green));
-                ui.label(mono(&breakpoint.command));
+                let log = if breakpoint.options.log_condition.is_empty() { breakpoint.log.clone() } else { format!("{} (se {})", breakpoint.log, breakpoint.options.log_condition) };
+                ui.label(mono(log).color(colors.green));
+                let command = if breakpoint.options.command_condition.is_empty() { breakpoint.command.clone() } else { format!("{} (se {})", breakpoint.command, breakpoint.options.command_condition) };
+                ui.label(mono(command));
+                let options = [(breakpoint.options.single_shot, "uma vez"), (breakpoint.options.silent, "silencioso"), (breakpoint.options.fast_resume, "rápido")].iter().filter(|(on, _)| *on).map(|(_, name)| *name).collect::<Vec<_>>().join(", ");
+                ui.label(options);
                 ui.label(mono(&breakpoint.group));
                 ui.label(mono(if breakpoint.process != 0 { format!("{:#x}", breakpoint.process) } else { String::new() }));
                 ui.end_row();
                 let id = breakpoint.id;
                 let copy = breakpoint.clone();
                 response.union(link).context_menu(|ui| {
-                    if ui.button("Editar").clicked() {
+                    if ui.button("Editar...").clicked() {
+                        state.breakpoint_form = Some(crate::editor::BreakpointForm::from_breakpoint(&copy));
+                        ui.close();
+                    }
+                    if ui.button("Editar na linha").clicked() {
                         state.breakpoint_edit = Some((id, copy.condition.clone(), if copy.pass_count > 1 { copy.pass_count.to_string() } else { String::new() }, copy.log.clone(), copy.command.clone(), copy.group.clone()));
                         ui.close();
                     }
@@ -236,23 +248,30 @@ pub(crate) fn memory_map_tab(ui: &mut Ui, state: &mut UiState) {
         ui.label(RichText::new(error).color(colors.red));
     }
     let filter = Filter::new(&state.map_filter, false);
-    let rows: Vec<&crate::backend::MapRow> = map.rows.iter().filter(|row| filter.matches(&[&row.name, &row.kind, &row.section, &row.protection])).collect();
+    let rows: Vec<&crate::backend::MapRow> = map.rows.iter().filter(|row| filter.matches(&[&row.name, &row.kind, &row.section, &row.protection, &row.content, &row.party])).collect();
     let height = row_height(ui);
+    let highlight = state.map_highlight;
+    hint(ui, "as regiões executáveis ficam em vermelho; botão direito no endereço: seguir, buscas e gravar a região num arquivo");
     egui::ScrollArea::both().id_salt("re-map").auto_shrink([false, false]).show_rows(ui, height, rows.len() + 1, |ui, range| {
-        egui::Grid::new("re-map-grid").num_columns(6).striped(true).spacing([12.0, 2.0]).show(ui, |ui| {
-            for title in ["endereço", "tamanho", "tipo", "proteção", "módulo / nome", "seção"] {
+        egui::Grid::new("re-map-grid").num_columns(8).striped(true).spacing([12.0, 2.0]).show(ui, |ui| {
+            for title in ["Endereço", "Tamanho", "Parte", "Informação", "Conteúdo", "Tipo", "Proteção", "Proteção inicial"] {
                 ui.label(RichText::new(title).strong());
             }
             ui.end_row();
             for index in range.start.saturating_sub(1)..range.end.saturating_sub(1).min(rows.len()) {
                 let row = rows[index];
                 let section = row.kind == "Seção";
-                let address = ui.add(egui::Label::new(mono(if section { format!("  {}", hex(row.base)) } else { hex(row.base) }).color(colors.blue)).sense(Sense::click()));
-                ui.label(mono(format!("{:x}", row.size)));
-                ui.label(mono(&row.kind).color(if section { colors.dim } else { ui.visuals().text_color() }));
-                ui.label(mono(&row.protection));
-                ui.label(mono(&row.name));
-                ui.label(mono(&row.section));
+                let marked = highlight.is_some_and(|address| address >= row.base && address < row.base + row.size);
+                let color = if marked { colors.yellow } else if row.executable { colors.red } else { ui.visuals().text_color() };
+                let address = ui.add(egui::Label::new(mono(if section { format!("  {}", hex(row.base)) } else { hex(row.base) }).color(if marked { colors.yellow } else { colors.blue })).sense(Sense::click()));
+                ui.label(mono(format!("{:x}", row.size)).color(color));
+                ui.label(mono(&row.party).color(colors.dim));
+                let info = if row.section.is_empty() { row.name.clone() } else { format!("{} {}", row.name, row.section) };
+                ui.label(mono(info).color(color));
+                ui.label(mono(&row.content).color(color));
+                ui.label(mono(&row.kind).color(if section { colors.dim } else { color }));
+                ui.label(mono(&row.protection).color(color));
+                ui.label(mono(&row.initial_protection).color(colors.dim));
                 ui.end_row();
                 let base = row.base;
                 let size = row.size;
@@ -260,6 +279,18 @@ pub(crate) fn memory_map_tab(ui: &mut Ui, state: &mut UiState) {
                     state.follow_in_dump(base);
                 }
                 address.context_menu(|ui| {
+                    if ui.add_enabled(stopped, egui::Button::new("Gravar a região num arquivo...")).clicked() {
+                        state.dialog = Some(Dialog::DumpRegion(base, format!("{size:x}"), state.dump_path.clone()));
+                        ui.close();
+                    }
+                    if ui.add_enabled(stopped, egui::Button::new("Breakpoint de memória (acesso)")).clicked() {
+                        state.requests.push(Request::AddBreakpointWith({
+                            let mut request = BreakpointRequest::new(BreakpointKind::MemoryAccess, &format!("{base:#x}"));
+                            request.length = size.min(64 * 0x1000);
+                            request
+                        }));
+                        ui.close();
+                    }
                     if ui.button("Seguir no dump").clicked() {
                         state.follow_in_dump(base);
                         ui.close();
@@ -284,8 +315,9 @@ pub(crate) fn memory_map_tab(ui: &mut Ui, state: &mut UiState) {
     });
 }
 
-/// A aba Pilha de chamadas: o quadro, o endereço de retorno, a função, os
-/// argumentos (o espaço de home e os primeiros da pilha) e o método.
+/// A aba Pilha de chamadas: o endereço do quadro na pilha, para onde volta
+/// (Para), de qual função (De), o tamanho do quadro, o comentário, a parte
+/// (usuário ou sistema), os argumentos e o método do desenrolar.
 pub(crate) fn call_stack_tab(ui: &mut Ui, state: &mut UiState) {
     let colors = palette(ui);
     let snapshot = Arc::clone(&state.snapshot);
@@ -293,21 +325,29 @@ pub(crate) fn call_stack_tab(ui: &mut Ui, state: &mut UiState) {
         hint(ui, "sem pilha (a máquina não parou ainda)");
         return;
     }
-    hint(ui, "argumentos: os quatro slots de home (rcx, rdx, r8, r9, quando a função os guardou) e os dois primeiros da pilha, no RSP de quem chamou");
+    hint(ui, "Para: o endereço de retorno; De: a função de onde ele volta; argumentos: os slots de home (rcx, rdx, r8, r9) e os dois primeiros da pilha");
     egui::ScrollArea::both().id_salt("re-callstack").auto_shrink([false, false]).show(ui, |ui| {
-        egui::Grid::new("re-callstack-grid").num_columns(6).striped(true).spacing([10.0, 2.0]).show(ui, |ui| {
-            for title in ["#", "Child-SP", "endereço", "função", "argumentos", "como"] {
+        egui::Grid::new("re-callstack-grid").num_columns(9).striped(true).spacing([10.0, 2.0]).show(ui, |ui| {
+            for title in ["#", "Endereço", "Para", "De", "Tamanho", "Comentário", "Parte", "argumentos", "como"] {
                 ui.label(RichText::new(title).strong());
             }
             ui.end_row();
             for (index, frame) in snapshot.frames.iter().enumerate() {
+                let callee = index.checked_sub(1).and_then(|below| snapshot.frames.get(below));
+                let from = callee.map(|below| below.name.split('+').next().unwrap_or(&below.name).to_string()).unwrap_or_default();
+                let size = callee.map(|below| frame.stack.saturating_sub(below.stack)).unwrap_or(0);
+                let user = frame.address < 0x8000_0000_0000;
                 ui.label(mono(format!("{index:02}")).color(colors.dim));
                 ui.label(mono(hex(frame.stack)).color(colors.dim));
                 let address = ui.add(egui::Label::new(mono(hex(frame.address)).color(colors.blue)).sense(Sense::click()));
-                if ui.selectable_label(index == snapshot.selected_frame, mono(&frame.name)).clicked() {
+                ui.label(mono(&from));
+                ui.label(mono(if size != 0 { format!("{size:#x}") } else { String::new() }));
+                let comment = if index == 0 { frame.name.clone() } else { format!("retorno para {} de {from}", frame.name) };
+                if ui.selectable_label(index == snapshot.selected_frame, mono(comment)).clicked() {
                     state.requests.push(Request::SelectFrame(index));
                     state.focus_tab.push(Tab::Cpu);
                 }
+                ui.label(RichText::new(if user { "Usuário" } else { "Sistema" }).color(if user { colors.green } else { colors.dim }));
                 let arguments = frame.arguments.iter().map(|value| format!("{value:x}")).collect::<Vec<_>>().join(" ");
                 ui.label(mono(arguments));
                 ui.label(RichText::new(frame.method).color(colors.dim));
@@ -315,6 +355,17 @@ pub(crate) fn call_stack_tab(ui: &mut Ui, state: &mut UiState) {
                 if address.double_clicked() {
                     state.go_to_code(frame.address);
                 }
+                let target = frame.address;
+                address.context_menu(|ui| {
+                    if ui.button("Seguir na desmontagem").clicked() {
+                        state.go_to_code(target);
+                        ui.close();
+                    }
+                    if ui.button("Copiar o endereço").clicked() {
+                        ui.ctx().copy_text(format!("{target:#x}"));
+                        ui.close();
+                    }
+                });
             }
         });
     });
@@ -614,27 +665,38 @@ pub(crate) fn threads_tab(ui: &mut Ui, state: &mut UiState) {
         });
         match snapshot.user_threads.as_deref() {
             Some(Ok(threads)) => {
-                egui::Grid::new("re-user-threads").num_columns(8).striped(true).spacing([10.0, 2.0]).show(ui, |ui| {
-                    for title in ["TID", "TEB", "início", "rip", "rsp", "estado", "espera", "LastError"] {
-                        ui.label(RichText::new(title).strong());
-                    }
-                    ui.end_row();
-                    for thread in threads {
-                        let selected = snapshot.view == View::UserThread(thread.tid);
-                        if ui.selectable_label(selected, mono(thread.tid.to_string())).on_hover_text("registradores e pilha de usuário desta thread (o CONTEXT salvo)").clicked() {
-                            state.requests.push(Request::SelectUserThread(thread.tid));
-                            state.focus_tab.push(Tab::Cpu);
+                egui::ScrollArea::horizontal().id_salt("re-user-threads-scroll").show(ui, |ui| {
+                    egui::Grid::new("re-user-threads").num_columns(14).striped(true).spacing([10.0, 2.0]).show(ui, |ui| {
+                        for title in ["n.º", "ID", "Entrada", "TEB", "RIP", "RSP", "Suspensão", "Prioridade", "Estado", "Espera", "LastError", "Tempo de usuário", "Tempo de kernel", "Ciclos"] {
+                            ui.label(RichText::new(title).strong());
                         }
-                        ui.label(mono(format!("{:x}", thread.teb)));
-                        let start = state.module_at(thread.start).map(|module| format!("{}+{:#x}", module.name, thread.start - module.base)).unwrap_or_else(|| format!("{:#x}", thread.start));
-                        ui.label(mono(start));
-                        ui.label(mono(format!("{:x}", thread.rip)));
-                        ui.label(mono(format!("{:x}", thread.rsp)));
-                        ui.label(mono(&thread.state));
-                        ui.label(mono(&thread.wait_reason));
-                        ui.label(mono(thread.last_error.map_or("-".into(), |value| format!("{value:#x}"))));
                         ui.end_row();
-                    }
+                        for (number, thread) in threads.iter().enumerate() {
+                            let selected = snapshot.view == View::UserThread(thread.tid);
+                            ui.label(mono(number.to_string()).color(colors.dim));
+                            if ui.selectable_label(selected, mono(thread.tid.to_string())).on_hover_text("registradores e pilha de usuário desta thread (o CONTEXT salvo)").clicked() {
+                                state.requests.push(Request::SelectUserThread(thread.tid));
+                                state.focus_tab.push(Tab::Cpu);
+                            }
+                            let start = state.module_at(thread.start).map(|module| format!("{}+{:#x}", module.name, thread.start - module.base)).unwrap_or_else(|| format!("{:#x}", thread.start));
+                            ui.label(mono(start));
+                            ui.label(mono(format!("{:x}", thread.teb)));
+                            ui.label(mono(format!("{:x}", thread.rip)));
+                            ui.label(mono(format!("{:x}", thread.rsp)));
+                            let optional = |value: Option<u64>| value.map_or("-".to_string(), |value| value.to_string());
+                            ui.label(mono(optional(thread.suspend_count)));
+                            ui.label(mono(optional(thread.priority)));
+                            ui.label(mono(&thread.state));
+                            ui.label(mono(&thread.wait_reason));
+                            ui.label(mono(thread.last_error.map_or("-".into(), |value| format!("{value:#x}"))).color(if thread.last_error.unwrap_or(0) != 0 { colors.red } else { ui.visuals().text_color() }));
+                            // Os tempos do KTHREAD são tiques do relógio (15,625 ms).
+                            let time = |ticks: Option<u64>| ticks.map_or("-".to_string(), |ticks| format!("{:.3} s", ticks as f64 * 0.015625));
+                            ui.label(mono(time(thread.user_time)));
+                            ui.label(mono(time(thread.kernel_time)));
+                            ui.label(mono(thread.cycles.map_or("-".into(), |cycles| format!("{cycles:#x}"))));
+                            ui.end_row();
+                        }
+                    });
                 });
             }
             Some(Err(error)) => {

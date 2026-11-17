@@ -27,10 +27,11 @@ const USAGE: &str = "uso: opennt-re [opcoes] [opcoes do xtask]
   --root=DIR             raiz do repositorio (padrao: a deste checkout)
   --script=ARQ           roteiro para rodar depois do attach (a linguagem da aba Script)
   --screenshot-dir=DIR   sem janela: roda o cenario e grava as capturas kd-re-*.png em DIR
-  --scenario=NOME        com --screenshot-dir: kernel (cpu, grafo, referencias) ou usuario (usuario, memoria)
+  --scenario=NOME        com --screenshot-dir: kernel (cpu, registradores, breakpoint, observacao, grafo, referencias) ou usuario (usuario, memoria)
   --size=LxA             tamanho da captura (padrao 1600x1000)
   outras --opcoes vao para o xtask (--accel=whpx, --smp=1, --initial-process=smss...)";
 
+#[derive(Clone)]
 struct Options {
     launch: bool,
     connect: Option<String>,
@@ -199,13 +200,54 @@ fn screenshots(config: Config, target: Option<Target>, options: &Options, direct
                 backend.send(Request::SelectInstruction(call));
                 scenario::wait(&backend, "a caixa de informacao", Duration::from_secs(120), &log, |shared| shared.snapshot.generation > before && shared.activity.is_empty())?;
             }
+            // A desmontagem com os colchetes das funções e dos laços, os
+            // comentários automáticos (a chamada com os argumentos) e o
+            // destaque de um registrador.
             backend = capture(backend, options, &directory.join("kd-re-cpu.png"), |app| {
                 app.annotate(rip, "volta do IoCreateDevice", "");
                 if let Some(call) = call {
-                    app.annotate(call, "cria o dispositivo do driver", "");
                     app.select_code(call);
                 }
+                app.highlight("rcx");
                 app.focus(Tab::Cpu);
+            })?;
+            // Os registradores com SSE e a caixa dos argumentos x64 (mais
+            // alta, para os painéis da direita caberem).
+            let tall = Options { size: [options.size[0], options.size[1] + 520], ..options.clone() };
+            backend = capture(backend, &tall, &directory.join("kd-re-registradores.png"), |app| {
+                app.set_xmm_format(0);
+                app.focus(Tab::Cpu);
+            })?;
+            // O editor de breakpoints na chamada.
+            let target = call.unwrap_or(rip);
+            backend = capture(backend, options, &directory.join("kd-re-breakpoint.png"), |app| {
+                let mut form = kd_re::editor::BreakpointForm::new(kd_client::BreakpointKind::Software, &format!("{target:#x}"));
+                form.name = "criacao do dispositivo".into();
+                form.break_condition = "@rdx != 0".into();
+                form.log_text = "IoCreateDevice extensao={@rdx} nome={@r8:s}".into();
+                form.log_condition = "1".into();
+                form.command_text = "k 5; r rcx".into();
+                form.hit_count = "2".into();
+                form.single_shot = true;
+                app.open_breakpoint_editor(form);
+                app.select_code(target);
+                app.focus(Tab::Cpu);
+            })?;
+            // A observação: as expressões antes e depois de um passo (o que
+            // mudou em vermelho).
+            let watches: Vec<String> = ["@rax", "@rcx", "@rdi", "@rsp", "poi(@rsp)", "@rip", "@eflags", "by(@rip)"].iter().map(|text| text.to_string()).collect();
+            backend.send(Request::SetWatches(watches.clone()));
+            refresh(&backend, &log)?;
+            // Dois passos: o segundo (o `mov edi, eax` depois do retorno)
+            // muda o RDI e o RIP.
+            for _ in 0..2 {
+                let before = backend.shared().snapshot.generation;
+                backend.send(Request::StepInto);
+                scenario::wait(&backend, "o passo da observacao", Duration::from_secs(120), &log, |shared| shared.snapshot.generation > before && shared.status == Status::Stopped && shared.activity.is_empty())?;
+            }
+            backend = capture(backend, options, &directory.join("kd-re-observacao.png"), |app| {
+                app.set_watches(watches);
+                app.focus(Tab::Watch);
             })?;
             scenario::show_graph(&backend, "", &log)?;
             backend = capture(backend, options, &directory.join("kd-re-grafo.png"), |app| app.focus(Tab::Graph))?;

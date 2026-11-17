@@ -11,7 +11,11 @@
 //!   --launch --no-client`);
 //! - `app`: a janela (abas, barra de ferramentas, atalhos, diálogos, barra
 //!   de comando e de estado); `cpu`, `graph`, `views` e `panels`: as abas;
-//! - `disasm`: a desmontagem (iced-x86) com os símbolos do cliente;
+//! - `disasm`: a desmontagem (iced-x86) com os símbolos do cliente (o
+//!   módulo do `kd-mcp`, com a análise automática em `kd_mcp::annotate`);
+//! - `highlight`: os pedaços de uma instrução para o modo de destaque (H);
+//! - `dump`: os formatos das janelas Dump;
+//! - `editor`: o modelo do editor de breakpoints;
 //! - `asm`: o montador de uma linha (patch de instrução);
 //! - `scan`: a imagem de um módulo para as buscas e o grafo;
 //! - `source`: as linhas de código e as variáveis locais pelo DWARF do
@@ -24,7 +28,10 @@ pub mod asm;
 pub mod backend;
 pub mod cpu;
 pub mod disasm;
+pub mod dump;
+pub mod editor;
 pub mod graph;
+pub mod highlight;
 pub mod launcher;
 pub mod offscreen;
 pub mod panels;

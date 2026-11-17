@@ -152,35 +152,7 @@ impl LogLines {
     }
 }
 
-/// Como uma janela de memória (Dump) aparece.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum MemoryFormat {
-    HexAscii,
-    HexUnicode,
-    Words,
-    Dwords,
-    Qwords,
-    Address,
-    Float,
-    Double,
-}
-
-impl MemoryFormat {
-    pub const ALL: [MemoryFormat; 8] = [MemoryFormat::HexAscii, MemoryFormat::HexUnicode, MemoryFormat::Words, MemoryFormat::Dwords, MemoryFormat::Qwords, MemoryFormat::Address, MemoryFormat::Float, MemoryFormat::Double];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            MemoryFormat::HexAscii => "Hex + ASCII",
-            MemoryFormat::HexUnicode => "Hex + UTF-16",
-            MemoryFormat::Words => "Word (2)",
-            MemoryFormat::Dwords => "Dword (4)",
-            MemoryFormat::Qwords => "Qword (8)",
-            MemoryFormat::Address => "Endereço",
-            MemoryFormat::Float => "Float",
-            MemoryFormat::Double => "Double",
-        }
-    }
-}
+pub use crate::dump::MemoryFormat;
 
 /// O modo do rastro pedido no painel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -231,6 +203,12 @@ pub(crate) enum Dialog {
     Constant(String, bool),
     /// Faixa de memória: início, tamanho, escrita.
     RangeWatch(String, String, bool),
+    /// Edição binária: endereço e os bytes em hexadecimal.
+    BinaryEdit(u64, String),
+    /// Preencher: endereço, tamanho e o byte.
+    Fill(u64, String, String),
+    /// Gravar uma faixa num arquivo: início, tamanho e o caminho.
+    DumpRegion(u64, String, String),
 }
 
 /// O estado salvo entre execuções.
@@ -350,6 +328,31 @@ pub struct UiState {
     pub(crate) patch_path: String,
     pub(crate) handles_filter: String,
     pub(crate) last_message: String,
+    // ---- análise, seleção, editor e servidor MCP ----
+    /// O fim de uma seleção de várias linhas (Shift+clique).
+    pub(crate) selection_end: Option<u64>,
+    /// O modo de destaque (H) e a chave do pedaço clicado.
+    pub(crate) highlight_mode: bool,
+    pub(crate) highlight_key: Option<String>,
+    /// A janela de referências cruzadas (X).
+    pub(crate) xrefs_open: bool,
+    /// O editor de breakpoints aberto e o erro da última conferência.
+    pub(crate) breakpoint_form: Option<crate::editor::BreakpointForm>,
+    pub(crate) breakpoint_form_error: Option<String>,
+    /// Cada Dump segue a expressão a cada parada (senão o endereço fica).
+    pub(crate) dump_sync: [bool; 5],
+    /// Quantos argumentos a caixa da convenção mostra.
+    pub(crate) argument_count: usize,
+    pub(crate) sent_argument_count: usize,
+    /// A expressão da janela de pilha quando ela não segue o RSP.
+    pub(crate) stack_input: String,
+    /// XMM em hexadecimal (0), floats (1) ou doubles (2).
+    pub(crate) xmm_format: usize,
+    /// A linha do mapa de memória a destacar (seguir no mapa).
+    pub(crate) map_highlight: Option<u64>,
+    pub(crate) mcp_port: String,
+    pub(crate) mcp_address: Option<String>,
+    pub(crate) dump_path: String,
 }
 
 impl UiState {
@@ -603,6 +606,21 @@ impl DebuggerApp {
                 patch_path: "build/opennt-re/patches.1337".into(),
                 handles_filter: String::new(),
                 last_message: String::new(),
+                selection_end: None,
+                highlight_mode: false,
+                highlight_key: None,
+                xrefs_open: false,
+                breakpoint_form: None,
+                breakpoint_form_error: None,
+                dump_sync: [true; 5],
+                argument_count: 5,
+                sent_argument_count: 5,
+                stack_input: String::new(),
+                xmm_format: 0,
+                map_highlight: None,
+                mcp_port: "7357".into(),
+                mcp_address: None,
+                dump_path: "build/opennt-re/regiao.bin".into(),
             },
             persist: None,
             last_saved: String::new(),
@@ -682,6 +700,27 @@ impl DebuggerApp {
         self.state.selected_code = Some(address);
     }
 
+    /// Abre o editor de breakpoints com o formulário (a captura de tela).
+    pub fn open_breakpoint_editor(&mut self, form: crate::editor::BreakpointForm) {
+        self.state.breakpoint_form = Some(form);
+    }
+
+    /// Liga o modo de destaque com a chave de um pedaço (a captura de tela).
+    pub fn highlight(&mut self, key: &str) {
+        self.state.highlight_mode = true;
+        self.state.highlight_key = Some(key.to_string());
+    }
+
+    /// Abre a janela de referências cruzadas (a captura de tela).
+    pub fn show_xrefs(&mut self) {
+        self.state.xrefs_open = true;
+    }
+
+    /// O formato dos XMM (0 hex, 1 float, 2 double).
+    pub fn set_xmm_format(&mut self, format: usize) {
+        self.state.xmm_format = format;
+    }
+
     /// Um comentário e um rótulo (a captura de tela e os testes).
     pub fn annotate(&mut self, address: u64, comment: &str, label: &str) {
         self.sync();
@@ -756,6 +795,7 @@ impl DebuggerApp {
         }
         state.status = shared.status.clone();
         state.activity = shared.activity.clone();
+        state.mcp_address = shared.mcp.clone();
         state.can_restart = shared.can_restart;
         if shared.transcript.len() < state.transcript.len() {
             state.transcript.clear();
@@ -802,6 +842,12 @@ impl DebuggerApp {
     /// Um quadro inteiro da janela.
     pub fn show(&mut self, ui: &mut Ui) {
         self.sync();
+        // Texto que o backend pôs para a área de transferência.
+        let clipboard = self.backend.shared.lock().ok().and_then(|mut shared| shared.clipboard.take());
+        if let Some(text) = clipboard {
+            ui.ctx().copy_text(text.clone());
+            self.state.last_message = format!("copiado: {text}");
+        }
         if self.state.theme_applied != Some(self.state.light) {
             crate::apply_theme(ui.ctx(), !self.state.light);
             self.state.theme_applied = Some(self.state.light);
@@ -821,6 +867,12 @@ impl DebuggerApp {
             DockArea::new(&mut self.dock).style(style).show_close_buttons(false).show_leaf_close_all_buttons(false).show_leaf_collapse_buttons(false).show_inside(ui, &mut Viewer { state: &mut self.state });
         });
         dialogs(ui, &mut self.state);
+        crate::cpu::breakpoint_editor(ui, &mut self.state);
+        crate::cpu::xrefs_window(ui, &mut self.state);
+        if self.state.argument_count != self.state.sent_argument_count {
+            self.state.sent_argument_count = self.state.argument_count;
+            self.state.requests.push(Request::SetArgumentCount(self.state.argument_count));
+        }
         // Observação: as expressões e as vistas abertas vão ao backend.
         if self.state.watches != self.state.sent_watches {
             self.state.sent_watches = self.state.watches.clone();
@@ -907,6 +959,19 @@ impl DebuggerApp {
         if pressed(Modifiers::CTRL, Key::B) {
             state.dialog = Some(Dialog::Pattern(String::new(), false));
         }
+        // Ctrl+R: referências ao endereço (a janela Xrefs).
+        if pressed(Modifiers::CTRL, Key::R) {
+            if let Some(address) = target {
+                state.requests.push(Request::Xrefs(address));
+                state.xrefs_open = true;
+            }
+        }
+        // Ctrl+* (Ctrl+Shift+8): nova origem (o RIP vai para a linha).
+        if pressed(Modifiers::CTRL | Modifiers::SHIFT, Key::Num8) || pressed(Modifiers::CTRL, Key::Num8) {
+            if let Some(address) = state.selected_code {
+                state.requests.push(Request::WriteRegister("rip".into(), address));
+            }
+        }
         // As teclas de uma letra só valem fora dos campos de texto.
         if ui.ctx().egui_wants_keyboard_input() {
             return;
@@ -936,6 +1001,18 @@ impl DebuggerApp {
                     let expression = target.map(|address| format!("{address:#x}")).unwrap_or_default();
                     state.requests.push(Request::Graph(expression));
                     state.focus_tab.push(Tab::Graph);
+                }
+                "x" | "X" => {
+                    if let Some(address) = target {
+                        state.requests.push(Request::Xrefs(address));
+                        state.xrefs_open = true;
+                    }
+                }
+                "h" | "H" => {
+                    state.highlight_mode = !state.highlight_mode;
+                    if !state.highlight_mode {
+                        state.highlight_key = None;
+                    }
                 }
                 _ => {}
             }
@@ -978,6 +1055,14 @@ fn menu_bar(ui: &mut Ui, state: &mut UiState, open: &[Tab]) {
             if ui.add_enabled(stopped, egui::Button::new("Exportar patches")).clicked() {
                 state.requests.push(Request::ExportPatches(PathBuf::from(&state.patch_path)));
             }
+            ui.separator();
+            let mut serving = state.mcp_address.is_some();
+            ui.horizontal(|ui| {
+                if ui.checkbox(&mut serving, "Servidor MCP em 127.0.0.1:").on_hover_text("a IA e você na mesma sessão: o mesmo servidor do opennt-mcp, por HTTP local em /mcp").changed() {
+                    state.requests.push(Request::SetMcp(if serving { state.mcp_port.trim().parse().ok() } else { None }));
+                }
+                ui.add_enabled(!serving, egui::TextEdit::singleline(&mut state.mcp_port).desired_width(50.0));
+            });
         });
         ui.menu_button("Exibir", |ui| {
             for tab in Tab::ALL {
@@ -1014,6 +1099,10 @@ fn menu_bar(ui: &mut Ui, state: &mut UiState, open: &[Tab]) {
                 if let Some(address) = state.selected_code {
                     state.requests.push(Request::RunToCursor(address));
                 }
+            }
+            if ui.add_enabled(stopped, egui::Button::new("Novo breakpoint...")).clicked() {
+                let address = state.selected_code.or_else(|| current_rip(&state.snapshot)).map(|address| format!("{address:#x}")).unwrap_or_default();
+                state.breakpoint_form = Some(crate::editor::BreakpointForm::new(BreakpointKind::Software, &address));
             }
             ui.separator();
             let mut exceptions = state.user_exceptions;
@@ -1305,6 +1394,14 @@ fn status_bar(ui: &mut Ui, state: &mut UiState) {
                 ui.separator();
             }
         }
+        if let Some(address) = &state.mcp_address {
+            ui.label(mono(format!("MCP {address}")).color(colors.green)).on_hover_text(format!("servidor MCP desta janela: http://{address}/mcp"));
+            ui.separator();
+        }
+        if state.highlight_mode {
+            ui.label(mono("destaque (H)").color(colors.yellow));
+            ui.separator();
+        }
         ui.label(mono(message).color(colors.dim));
         if !state.activity.is_empty() {
             ui.separator();
@@ -1403,11 +1500,14 @@ fn dialogs(ui: &mut Ui, state: &mut UiState) {
         Dialog::Pattern(text, _) => ("Procurar padrão", "48 8B ?? 05 | \"texto\" | u\"texto\"", None, text.clone()),
         Dialog::Constant(text, _) => ("Procurar constante", "expressão (0xC0000005, @rax...)", None, text.clone()),
         Dialog::RangeWatch(start, _, _) => ("Vigiar faixa de memória", "início (expressão)", None, start.clone()),
+        Dialog::BinaryEdit(address, text) => ("Edição binária", "bytes em hexadecimal: 90 90 cc", Some(*address), text.clone()),
+        Dialog::Fill(address, _, byte) => ("Preencher", "o byte (hexadecimal): 90", Some(*address), byte.clone()),
+        Dialog::DumpRegion(address, _, path) => ("Gravar a região num arquivo", "caminho do arquivo", Some(*address), path.clone()),
     };
     let mut open = true;
     let mut submit = false;
     let mut extra_text = match &dialog {
-        Dialog::RangeWatch(_, length, _) => length.clone(),
+        Dialog::RangeWatch(_, length, _) | Dialog::Fill(_, length, _) | Dialog::DumpRegion(_, length, _) => length.clone(),
         _ => String::new(),
     };
     let mut flag = match &dialog {
@@ -1433,6 +1533,12 @@ fn dialogs(ui: &mut Ui, state: &mut UiState) {
                     ui.label("tamanho:");
                     ui.add(egui::TextEdit::singleline(&mut extra_text).font(TextStyle::Monospace).desired_width(80.0));
                     ui.checkbox(&mut flag, "só escrita");
+                });
+            }
+            Dialog::Fill(..) | Dialog::DumpRegion(..) => {
+                ui.horizontal(|ui| {
+                    ui.label("tamanho (hexadecimal):");
+                    ui.add(egui::TextEdit::singleline(&mut extra_text).font(TextStyle::Monospace).desired_width(100.0));
                 });
             }
             _ => {}
@@ -1467,6 +1573,9 @@ fn dialogs(ui: &mut Ui, state: &mut UiState) {
             Dialog::Pattern(_, _) => Dialog::Pattern(text, flag),
             Dialog::Constant(_, _) => Dialog::Constant(text, flag),
             Dialog::RangeWatch(_, _, _) => Dialog::RangeWatch(text, extra_text, flag),
+            Dialog::BinaryEdit(address, _) => Dialog::BinaryEdit(address, text),
+            Dialog::Fill(address, _, _) => Dialog::Fill(address, extra_text, text),
+            Dialog::DumpRegion(address, _, _) => Dialog::DumpRegion(address, extra_text, text),
         });
         return;
     }
@@ -1507,6 +1616,22 @@ fn dialogs(ui: &mut Ui, state: &mut UiState) {
         Dialog::RangeWatch(_, _, _) => {
             let length = parse_hex(&extra_text).unwrap_or(8);
             state.requests.push(Request::AddRangeWatch(if flag { BreakpointKind::Write } else { BreakpointKind::Access }, text.trim().to_string(), length));
+        }
+        Dialog::BinaryEdit(address, _) => match crate::backend::parse_pattern(&text) {
+            Ok(bytes) if !bytes.is_empty() => state.requests.push(Request::Patch { address, bytes }),
+            _ => state.last_message = "edição binária: bytes em hexadecimal".into(),
+        },
+        Dialog::Fill(address, _, _) => {
+            let length = parse_hex(&extra_text).unwrap_or(0).min(0x10000) as usize;
+            match u8::from_str_radix(text.trim().trim_start_matches("0x"), 16) {
+                Ok(byte) if length > 0 => state.requests.push(Request::Patch { address, bytes: vec![byte; length] }),
+                _ => state.last_message = "preencher: um byte em hexadecimal e o tamanho".into(),
+            }
+        }
+        Dialog::DumpRegion(address, _, _) => {
+            let size = parse_hex(&extra_text).unwrap_or(0x1000);
+            state.dump_path = text.trim().to_string();
+            state.requests.push(Request::DumpToFile { address, size, path: PathBuf::from(text.trim()) });
         }
     }
 }

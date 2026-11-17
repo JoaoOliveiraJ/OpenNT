@@ -156,6 +156,36 @@ pub struct MapRow {
     pub name: String,
     /// A seção de uma imagem (`.text`...).
     pub section: String,
+    /// Usuário ou Sistema (a metade do espaço de endereços e o módulo).
+    pub party: String,
+    /// O que há na região (código, dados, cabeçalho PE, pilha, heap).
+    pub content: String,
+    /// A proteção da alocação (a inicial).
+    pub initial_protection: String,
+    /// A região é executável (a cor da linha).
+    pub executable: bool,
+}
+
+/// Uma referência ao endereço pedido (a janela Xrefs).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct XrefRow {
+    pub from: u64,
+    pub location: String,
+    pub kind: String,
+    pub disassembly: String,
+}
+
+/// O resultado da tecla X.
+#[derive(Clone, Debug, Default)]
+pub struct XrefView {
+    pub target: u64,
+    pub name: String,
+    pub module: String,
+    pub rows: Vec<XrefRow>,
+    pub milliseconds: u128,
+    /// O índice do módulo veio do cache.
+    pub cached: bool,
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -193,6 +223,12 @@ pub struct ReState {
     pub handles: Option<Arc<Result<Vec<Handle>, String>>>,
     pub user_threads: Option<Arc<Result<Vec<UserThread>, String>>>,
     pub symbol_view: Option<Arc<SymbolView>>,
+    /// Os laços por função (início, fim) para a margem da desmontagem.
+    pub loops: HashMap<(u64, u64), Vec<kd_client::analysis::functions::Loop>>,
+    /// O índice de referências cruzadas por módulo (com a geração dos
+    /// patches).
+    pub xref_index: HashMap<u64, (u64, Arc<HashMap<u64, Vec<(u64, refs::RefKind)>>>)>,
+    pub xrefs: Option<Arc<XrefView>>,
 }
 
 impl Default for ReState {
@@ -213,6 +249,9 @@ impl Default for ReState {
             handles: None,
             user_threads: None,
             symbol_view: None,
+            loops: HashMap::new(),
+            xref_index: HashMap::new(),
+            xrefs: None,
         }
     }
 }
@@ -298,18 +337,25 @@ impl Worker {
                 view
             })
             .collect();
-        // A pilha em qwords a partir do RSP.
+        // A pilha em qwords a partir do RSP (ou da expressão pedida).
         let rsp = snapshot.registers.iter().find(|row| row.name == "rsp").and_then(|row| row.value);
-        if let Some(rsp) = rsp {
-            if let Ok(bytes) = client.read_memory(rsp.wrapping_sub(0x20), 0x220) {
+        snapshot.stack_locked = self.stack_expression.trim().is_empty();
+        let origin = if snapshot.stack_locked { rsp } else { client.evaluate(&self.stack_expression).ok().map(|address| address & !7) };
+        if let Some(origin) = origin {
+            if let Ok(bytes) = client.read_memory(origin.wrapping_sub(0x20), 0x220) {
                 for (index, chunk) in bytes.chunks_exact(8).enumerate() {
-                    let address = rsp.wrapping_sub(0x20) + index as u64 * 8;
+                    let address = origin.wrapping_sub(0x20) + index as u64 * 8;
                     let value = u64::from_le_bytes(chunk.try_into().unwrap_or([0; 8]));
                     let mut note = String::new();
                     if client.symbols.module_at(value).is_some() {
-                        let frame = snapshot.frames.iter().skip(1).find(|frame| frame.address == value);
+                        // Um endereço de retorno da pilha: para quem volta e
+                        // de qual função (a do quadro de baixo).
+                        let frame = snapshot.frames.iter().enumerate().skip(1).find(|(_, frame)| frame.address == value);
                         note = match frame {
-                            Some(_) => format!("retorno para {}", client.symbols.describe_return(value)),
+                            Some((index, _)) => {
+                                let callee = snapshot.frames.get(index - 1).map(|below| client.symbols.function_at(below.address).map_or_else(|| client.symbols.describe(below.address), |(_, name)| name)).unwrap_or_default();
+                                format!("retorno para {} de {callee}", client.symbols.describe_return(value))
+                            }
                             None => client.symbols.describe(value),
                         };
                     }
@@ -351,6 +397,7 @@ impl Worker {
         snapshot.handles = self.re.handles.clone();
         snapshot.user_threads = self.re.user_threads.clone();
         snapshot.symbol_view = self.re.symbol_view.clone();
+        snapshot.xrefs = self.re.xrefs.clone();
         // Os tratadores de exceção dos quadros.
         let frames: Vec<FrameRow> = snapshot.frames.iter().take(16).cloned().collect();
         let mut seh = Vec::new();
@@ -683,20 +730,31 @@ impl Worker {
         let client = self.client.as_mut().ok_or("sem conexao com o alvo")?;
         let mut view = MemoryMapView::default();
         let process = client.process().cloned();
+        let row = |base: u64, size: u64, kind: &str, protection: String, name: String, section: String, content: String, initial: String| {
+            let party = if base < 0x8000_0000_0000 { "Usuário" } else { "Sistema" };
+            let executable = protection.contains('X');
+            MapRow { base, size, kind: kind.to_string(), protection, name, section, party: party.into(), content, initial_protection: initial, executable }
+        };
         match &process {
             Some(context) => {
                 view.title = format!("processo {} (PID {}, CR3 {:#x})", context.name, context.pid, context.cr3);
                 match client.regions(&format!("{:#x}", context.eprocess)) {
                     Ok(regions) => {
-                        let bases: Vec<(u64, String, String)> = regions.iter().map(|region| (region.base, region.kind.clone(), region.name.clone())).collect();
+                        let bases: Vec<u64> = regions.iter().filter(|region| region.kind == "Image").map(|region| region.base).collect();
                         for region in regions {
-                            view.rows.push(MapRow { base: region.base, size: region.size, kind: region.kind.clone(), protection: user::protection_text(if region.protect != 0 { region.protect } else { region.allocation_protect }), name: region.name.clone(), section: String::new() });
+                            let protection = user::protection_text(if region.protect != 0 { region.protect } else { region.allocation_protect });
+                            let content = match region.kind.as_str() {
+                                "Image" => "imagem".to_string(),
+                                "Mapped" => "visão mapeada".to_string(),
+                                _ if region.protect & 0xF0 != 0 => "código privado".to_string(),
+                                _ => "dados privados".to_string(),
+                            };
+                            view.rows.push(row(region.base, region.size, &region.kind, protection, region.name.clone(), String::new(), content, user::protection_text(region.allocation_protect)));
                         }
-                        for (base, kind, _) in bases.into_iter().filter(|(_, kind, _)| kind == "Image") {
-                            let _ = kind;
+                        for base in bases {
                             if let Some(image) = self.module_image(base) {
                                 for (name, start, end, characteristics) in &image.sections {
-                                    view.rows.push(MapRow { base: *start, size: end - start, kind: "Seção".into(), protection: user::section_protection(*characteristics), name: image.name.clone(), section: name.clone() });
+                                    view.rows.push(row(*start, end - start, "Seção", user::section_protection(*characteristics), image.name.clone(), name.clone(), section_content(name, *characteristics), String::new()));
                                 }
                             }
                         }
@@ -709,14 +767,25 @@ impl Worker {
                 let modules: Vec<(u64, u64, String, bool)> = client.symbols.modules.iter().filter(|module| !module.user).map(|module| (module.base, module.end, module.name.clone(), client.symbols.is_kernel(module))).collect();
                 let ranges = client.kernel_ranges().unwrap_or_default();
                 for range in ranges {
-                    view.rows.push(MapRow { base: range.start, size: range.end - range.start, kind: "Faixa".into(), protection: String::new(), name: range.name, section: String::new() });
+                    view.rows.push(row(range.start, range.end - range.start, "Faixa", String::new(), range.name.clone(), String::new(), range.name, String::new()));
                 }
                 for (base, end, name, kernel) in modules {
-                    view.rows.push(MapRow { base, size: end - base, kind: "Image".into(), protection: String::new(), name: name.clone(), section: String::new() });
+                    view.rows.push(row(base, end - base, "Image", String::new(), name.clone(), String::new(), "imagem".into(), String::new()));
                     if let Some(image) = self.module_image(base) {
                         for (section, start, finish, flags) in &image.sections {
-                            let protection = if kernel { elf_protection(*flags) } else { user::section_protection(*flags) };
-                            view.rows.push(MapRow { base: *start, size: finish - start, kind: "Seção".into(), protection, name: name.clone(), section: section.clone() });
+                            let (protection, content) = if kernel {
+                                let content = if flags & 4 != 0 {
+                                    "código"
+                                } else if flags & 1 != 0 {
+                                    "dados"
+                                } else {
+                                    "dados só de leitura"
+                                };
+                                (elf_protection(*flags), content.to_string())
+                            } else {
+                                (user::section_protection(*flags), section_content(section, *flags))
+                            };
+                            view.rows.push(row(*start, finish - start, "Seção", protection, name.clone(), section.clone(), content, String::new()));
                         }
                     }
                 }
@@ -725,6 +794,76 @@ impl Worker {
         view.rows.sort_by(|a, b| a.base.cmp(&b.base).then(b.size.cmp(&a.size)));
         self.re.memory_map = Some(Arc::new(view));
         Ok(true)
+    }
+
+    /// Quem referencia o endereço: o índice de referências cruzadas do
+    /// módulo dele (feito na primeira vez e guardado até um patch).
+    pub(super) fn xrefs(&mut self, address: u64) -> Result<bool, String> {
+        let started = Instant::now();
+        let image = self.module_image(address).ok_or_else(|| format!("{address:#x} fora dos modulos"))?;
+        let generation = self.re.patch_generation;
+        let cached = self.re.xref_index.get(&image.base).filter(|(stamp, _)| *stamp == generation).map(|(_, index)| Arc::clone(index));
+        let was_cached = cached.is_some();
+        let index = match cached {
+            Some(index) => index,
+            None => {
+                let index = Arc::new(refs::xref_index(&image.instructions(), (image.base, image.base + image.bytes.len() as u64)));
+                self.re.xref_index.insert(image.base, (generation, Arc::clone(&index)));
+                index
+            }
+        };
+        let client = self.client.as_mut().ok_or("sem conexao com o alvo")?;
+        let mut rows = Vec::new();
+        for (from, kind) in index.get(&address).cloned().unwrap_or_default() {
+            let code = image.read(from, 16).unwrap_or_default();
+            let disassembly = disasm::disassemble(from, &code, Some(&client.symbols)).into_iter().next().map(|line| line.text).unwrap_or_default();
+            let kind = match kind {
+                refs::RefKind::Call => "chamada",
+                refs::RefKind::Jump => "salto",
+                refs::RefKind::Memory => "memória",
+                refs::RefKind::Immediate => "imediato",
+            };
+            rows.push(XrefRow { from, location: client.symbols.describe(from), kind: kind.into(), disassembly });
+        }
+        rows.sort_by_key(|row| row.from);
+        self.re.xrefs = Some(Arc::new(XrefView { target: address, name: client.symbols.describe(address), module: image.name.clone(), rows, milliseconds: started.elapsed().as_millis(), cached: was_cached, error: None }));
+        Ok(true)
+    }
+
+    /// Grava `size` bytes de `address` num arquivo (o dump da região).
+    pub(super) fn dump_to_file(&mut self, address: u64, size: u64, path: &Path) -> Result<bool, String> {
+        let client = self.client.as_mut().ok_or("sem conexao com o alvo")?;
+        let size = size.min(256 << 20) as usize;
+        let mut bytes = Vec::with_capacity(size);
+        // Página a página: uma página sem mapa vira zeros.
+        let mut offset = 0usize;
+        while offset < size {
+            let chunk = (size - offset).min(0x1000 - ((address as usize + offset) & 0xFFF));
+            match client.read_memory(address + offset as u64, chunk) {
+                Ok(data) if data.len() == chunk => bytes.extend_from_slice(&data),
+                _ => bytes.extend(std::iter::repeat_n(0u8, chunk)),
+            }
+            offset += chunk;
+        }
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(path, &bytes).map_err(|error| format!("{}: {error}", path.display()))?;
+        self.transcript("(dump)", Ok(format!("{size:#x} bytes de {address:#x} em {}", path.display())));
+        Ok(false)
+    }
+
+    /// O deslocamento no arquivo de um endereço (pela seção do PE desta
+    /// máquina) vai à área de transferência.
+    pub(super) fn copy_file_offset(&mut self, address: u64) -> Result<bool, String> {
+        let client = self.client.as_mut().ok_or("sem conexao com o alvo")?;
+        let module = client.symbols.module_at(address).ok_or_else(|| format!("{address:#x} fora dos modulos"))?;
+        let image = module.image.clone().ok_or_else(|| format!("{}: sem o arquivo PE nesta maquina", module.name))?;
+        let rva = (address - module.base) as u32;
+        let offset = image.offset(rva).ok_or_else(|| format!("RVA {rva:#x} fora das secoes do arquivo"))?;
+        let text = format!("{offset:#x}");
+        self.publish(|shared| shared.clipboard = Some(text));
+        Ok(false)
     }
 
     pub(super) fn load_handles(&mut self) -> Result<bool, String> {
@@ -813,6 +952,21 @@ pub fn location_of(client: &Client, address: u64) -> Location {
         Some(module) if client.symbols.is_kernel(module) => Location::new("kernel", address - module.base),
         Some(module) => Location::new(&module.name, address - module.base),
         None => Location::absolute(address),
+    }
+}
+
+/// O conteúdo de uma seção de PE pelo nome e pelas características.
+fn section_content(name: &str, characteristics: u32) -> String {
+    match name {
+        ".text" | "PAGE" | "INIT" => "código".into(),
+        ".rdata" => "dados só de leitura".into(),
+        ".data" => "dados".into(),
+        ".pdata" => "tabela de funções".into(),
+        ".rsrc" => "recursos".into(),
+        ".reloc" => "relocações".into(),
+        _ if characteristics & 0x2000_0000 != 0 => "código".into(),
+        _ if characteristics & 0x8000_0000 != 0 => "dados".into(),
+        _ => "dados só de leitura".into(),
     }
 }
 

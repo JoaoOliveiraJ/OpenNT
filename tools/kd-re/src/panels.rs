@@ -106,7 +106,9 @@ pub(crate) fn watch_panel(ui: &mut Ui, state: &mut UiState) {
                 ui.label(mono(expression).color(colors.blue));
                 match row.map(|row| &row.value) {
                     Some(Ok(value)) => {
-                        ui.label(mono(value));
+                        // O valor que mudou desde a parada anterior em vermelho.
+                        let changed = row.is_some_and(|row| row.changed);
+                        ui.label(mono(value).color(if changed { colors.red } else { ui.visuals().text_color() })).on_hover_text(if changed { "mudou desde a parada anterior" } else { "igual à parada anterior" });
                     }
                     Some(Err(error)) => {
                         ui.label(RichText::new(error).color(colors.red));

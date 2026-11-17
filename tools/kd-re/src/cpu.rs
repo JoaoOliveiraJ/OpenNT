@@ -1,17 +1,25 @@
-//! A aba CPU: desmontagem com as setas dos desvios e a caixa de informação
-//! (em cima, à esquerda), registradores com flags e segmentos (em cima, à
-//! direita), Dump 1-5 (embaixo, à esquerda) e a pilha com os endereços de
-//! retorno nomeados (embaixo, à direita).
+//! A aba CPU: desmontagem com as setas dos desvios, os colchetes das
+//! funções e dos laços, os comentários automáticos, o modo de destaque e a
+//! caixa de informação (em cima, à esquerda), registradores com flags,
+//! segmentos, x87/MMX, SSE/AVX, registradores de depuração e a caixa dos
+//! argumentos da convenção x64 (em cima, à direita), Dump 1-5 (embaixo, à
+//! esquerda) e a pilha com os endereços de retorno nomeados (embaixo, à
+//! direita). Também o editor de breakpoints e a janela de referências
+//! cruzadas.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use eframe::egui::{self, Align2, Color32, FontId, Key, Pos2, Rect, RichText, Sense, Stroke, TextStyle, Ui, Vec2};
-use kd_client::BreakpointKind;
+use kd_client::analysis::functions::{self, Mark};
+use kd_client::{registers, BreakpointKind};
 
 use crate::app::*;
 use crate::backend::{Request, SearchKind, Status, View};
 use crate::disasm::Line;
+use crate::dump;
+use crate::editor::BreakpointForm;
+use crate::highlight;
 
 pub(crate) fn cpu_tab(ui: &mut Ui, state: &mut UiState) {
     let height = ui.available_height();
@@ -22,7 +30,7 @@ pub(crate) fn cpu_tab(ui: &mut Ui, state: &mut UiState) {
     });
     egui::Panel::right("cpu-registers").resizable(true).default_size((width * 0.27).max(300.0)).min_size(200.0).show(ui, |ui| registers_pane(ui, state));
     egui::CentralPanel::default().show(ui, |ui| {
-        egui::Panel::bottom("cpu-info").resizable(true).default_size(84.0).min_size(30.0).show(ui, |ui| info_pane(ui, state));
+        egui::Panel::bottom("cpu-info").resizable(true).default_size(118.0).min_size(30.0).show(ui, |ui| info_pane(ui, state));
         egui::CentralPanel::default().show(ui, |ui| disassembly_pane(ui, state));
     });
 }
@@ -67,6 +75,44 @@ fn jump_arrows(lines: &[Line]) -> Vec<(usize, usize, usize)> {
     arrows
 }
 
+/// A coluna (em caracteres) onde começam os operandos no texto da linha.
+fn operand_column(text: &str) -> usize {
+    let mnemonic = text.split_whitespace().next().unwrap_or("").len();
+    text[mnemonic..].find(|character: char| !character.is_whitespace()).map_or(text.len(), |offset| mnemonic + offset)
+}
+
+/// O colchete de uma marca na coluna `x` da linha `rect`.
+fn draw_bracket(painter: &egui::Painter, rect: Rect, x: f32, mark: Mark, stroke: Stroke) {
+    let (top, bottom, middle) = (rect.top() + 1.0, rect.bottom() - 1.0, rect.center().y);
+    match mark {
+        Mark::None => {}
+        Mark::Start => {
+            painter.line_segment([Pos2::new(x, middle), Pos2::new(x, rect.bottom())], stroke);
+            painter.line_segment([Pos2::new(x, middle), Pos2::new(x + 4.0, middle)], stroke);
+        }
+        Mark::Middle => {
+            painter.line_segment([Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())], stroke);
+        }
+        Mark::End => {
+            painter.line_segment([Pos2::new(x, rect.top()), Pos2::new(x, middle)], stroke);
+            painter.line_segment([Pos2::new(x, middle), Pos2::new(x + 4.0, middle)], stroke);
+        }
+        Mark::Single => {
+            painter.line_segment([Pos2::new(x, top), Pos2::new(x, bottom)], stroke);
+            painter.line_segment([Pos2::new(x, top), Pos2::new(x + 4.0, top)], stroke);
+            painter.line_segment([Pos2::new(x, bottom), Pos2::new(x + 4.0, bottom)], stroke);
+        }
+    }
+}
+
+/// As linhas escolhidas (a linha do cursor e, com Shift+clique, até o fim
+/// da seleção).
+fn selected_rows(state: &UiState, lines: &[Line]) -> Option<(usize, usize)> {
+    let start = lines.iter().position(|line| Some(line.address) == state.selected_code)?;
+    let end = state.selection_end.and_then(|address| lines.iter().position(|line| line.address == address)).unwrap_or(start);
+    Some((start.min(end), start.max(end)))
+}
+
 fn disassembly_pane(ui: &mut Ui, state: &mut UiState) {
     let colors = palette(ui);
     let snapshot = Arc::clone(&state.snapshot);
@@ -85,11 +131,19 @@ fn disassembly_pane(ui: &mut Ui, state: &mut UiState) {
         }
         if ui.small_button("RIP (*)").on_hover_text("volta à instrução corrente").clicked() {
             state.selected_code = None;
+            state.selection_end = None;
             state.requests.push(Request::ShowCode(String::new()));
             state.requests.push(Request::SelectInstruction(None));
         }
         if ui.small_button("Ir para (Ctrl+G)").clicked() {
             state.dialog = Some(Dialog::GoTo(String::new()));
+        }
+        let label = if state.highlight_mode { "Destaque: ligado (H)" } else { "Destaque (H)" };
+        if ui.selectable_label(state.highlight_mode, label).on_hover_text("com o destaque ligado, clique num registrador ou operando: as ocorrências na janela ficam marcadas").clicked() {
+            state.highlight_mode = !state.highlight_mode;
+            if !state.highlight_mode {
+                state.highlight_key = None;
+            }
         }
     });
     if let Some(error) = &snapshot.code.error {
@@ -107,9 +161,15 @@ fn disassembly_pane(ui: &mut Ui, state: &mut UiState) {
     let arrows = jump_arrows(lines);
     let arrow_columns = arrows.iter().map(|(_, _, column)| column + 1).max().unwrap_or(0).max(2);
     let gutter = 18.0 + arrow_columns as f32 * 7.0;
+    // A coluna dos colchetes: a função e, à direita, os laços.
+    let bracket_width = 18.0;
     let address_width = glyph * 17.0;
     let bytes_width = glyph * 21.0;
     let text_color = ui.visuals().text_color();
+    let spans: Vec<(u64, u64)> = lines.iter().map(|line| (line.address, (line.bytes.len() / 2).max(1) as u64)).collect();
+    let function_marks = functions::bracket_marks(&spans, &snapshot.code.functions);
+    let loop_marks = functions::loop_marks(&spans, &snapshot.code.loops);
+    let selection = selected_rows(state, lines);
     // Rola até o foco quando chega um snapshot novo.
     let focus_row = lines.iter().position(|line| line.address == snapshot.code.focus);
     let mut area = egui::ScrollArea::both().id_salt("cpu-code").auto_shrink([false, false]);
@@ -123,18 +183,21 @@ fn disassembly_pane(ui: &mut Ui, state: &mut UiState) {
     }
     let mut row_rects: Vec<Rect> = Vec::with_capacity(lines.len());
     let mut clicked_row = None;
+    let mut shift_row = None;
     let mut menu_row = None;
+    let mut highlight_click: Option<String> = None;
+    let shift = ui.input(|input| input.modifiers.shift);
     let output = area.show(ui, |ui| {
-        let total_width = (gutter + address_width + bytes_width + glyph * 70.0).max(ui.available_width());
+        let total_width = (gutter + bracket_width + address_width + bytes_width + glyph * 90.0).max(ui.available_width());
         for (row, line) in lines.iter().enumerate() {
             let (rect, response) = ui.allocate_exact_size(Vec2::new(total_width, height), Sense::click());
             row_rects.push(rect);
             let painter = ui.painter_at(rect);
-            let selected = state.selected_code == Some(line.address);
+            let in_selection = selection.is_some_and(|(low, high)| row >= low && row <= high);
             let is_rip = Some(line.address) == rip;
             if is_rip {
                 painter.rect_filled(rect, 0.0, colors.current);
-            } else if selected {
+            } else if in_selection {
                 painter.rect_filled(rect, 0.0, colors.selection);
             } else if state.executed.contains(&line.address) {
                 painter.rect_filled(rect, 0.0, colors.executed);
@@ -153,8 +216,17 @@ fn disassembly_pane(ui: &mut Ui, state: &mut UiState) {
             if state.bookmarked(line.address) {
                 painter.rect_filled(Rect::from_center_size(Pos2::new(rect.left() + 14.0, rect.center().y), Vec2::new(4.0, height - 4.0)), 1.0, colors.blue);
             }
+            // Os colchetes da função e do laço.
+            let bracket_x = rect.left() + gutter + 3.0;
+            let function_stroke = Stroke::new(1.6, if is_rip { Color32::WHITE } else { colors.dim });
+            draw_bracket(&painter, rect, bracket_x, function_marks[row], function_stroke);
+            let (loop_mark, depth) = loop_marks[row];
+            if depth > 0 {
+                let x = bracket_x + 6.0 + 2.0 * (depth.min(3) as f32 - 1.0);
+                draw_bracket(&painter, rect, x, loop_mark, Stroke::new(1.3, colors.yellow));
+            }
             // O endereço (ou o rótulo do usuário, ou o símbolo da função).
-            let mut x = rect.left() + gutter;
+            let mut x = rect.left() + gutter + bracket_width;
             let address_rect = Rect::from_min_size(Pos2::new(x, rect.top()), Vec2::new(address_width - glyph, height));
             if breakpoint.is_some_and(|breakpoint| breakpoint.enabled) {
                 painter.rect_filled(address_rect, 0.0, colors.breakpoint);
@@ -170,20 +242,46 @@ fn disassembly_pane(ui: &mut Ui, state: &mut UiState) {
             let bytes: String = line.bytes.as_bytes().chunks(2).map(|pair| std::str::from_utf8(pair).unwrap_or("")).collect::<Vec<_>>().join(" ");
             painter.text(Pos2::new(x, rect.center().y), Align2::LEFT_CENTER, truncate_to(&bytes, 20), font.clone(), if is_rip { line_color } else { colors.dim });
             x += bytes_width;
-            let (mnemonic, operands) = line.text.split_once(' ').unwrap_or((line.text.as_str(), ""));
+            // O destaque: as ocorrências do pedaço clicado.
+            if let Some(key) = &state.highlight_key {
+                for (start, end) in highlight::matches(&line.text, key) {
+                    let area = Rect::from_min_max(Pos2::new(x + glyph * start as f32 - 1.0, rect.top() + 1.0), Pos2::new(x + glyph * end as f32 + 1.0, rect.bottom() - 1.0));
+                    painter.rect_filled(area, 2.0, colors.focus);
+                }
+            }
+            let column = operand_column(&line.text);
+            let mnemonic = &line.text[..column.min(line.text.len())];
+            let operands = line.text[column.min(line.text.len())..].trim_end();
             let mnemonic_paint = if is_rip { line_color } else { mnemonic_color(&line.text, colors, line_color) };
-            painter.text(Pos2::new(x, rect.center().y), Align2::LEFT_CENTER, mnemonic, font.clone(), mnemonic_paint);
-            let operand_x = x + glyph * 8.0;
-            let galley = painter.layout_no_wrap(operands.trim().to_string(), font.clone(), line_color);
+            painter.text(Pos2::new(x, rect.center().y), Align2::LEFT_CENTER, mnemonic.trim_end(), font.clone(), mnemonic_paint);
+            let operand_x = x + glyph * column as f32;
+            let galley = painter.layout_no_wrap(operands.to_string(), font.clone(), line_color);
             let operand_width = galley.size().x;
             painter.galley(Pos2::new(operand_x, rect.center().y - galley.size().y / 2.0), galley, line_color);
             let comment_x = (operand_x + operand_width + glyph * 2.0).max(x + glyph * 44.0);
             if let Some(comment) = state.comment_at(line.address) {
                 painter.text(Pos2::new(comment_x, rect.center().y), Align2::LEFT_CENTER, format!("; {comment}"), font.clone(), if is_rip { line_color } else { colors.comment });
+            } else if let Some(comment) = snapshot.code.auto_comments.get(&line.address) {
+                painter.text(Pos2::new(comment_x, rect.center().y), Align2::LEFT_CENTER, comment, font.clone(), if is_rip { line_color } else { colors.green });
             } else if let Some(comment) = &line.comment {
                 painter.text(Pos2::new(comment_x, rect.center().y), Align2::LEFT_CENTER, comment, font.clone(), if is_rip { line_color } else { colors.dim });
             }
-            if response.clicked() || response.secondary_clicked() {
+            if response.clicked() {
+                if state.highlight_mode {
+                    if let Some(pointer) = response.interact_pointer_pos() {
+                        let column = ((pointer.x - x) / glyph).floor();
+                        if column >= 0.0 {
+                            highlight_click = Some(highlight::token_at(&line.text, column as usize).map(|token| highlight::key(&token)).unwrap_or_default());
+                        }
+                    }
+                }
+                if shift {
+                    shift_row = Some(row);
+                } else {
+                    clicked_row = Some(row);
+                }
+            }
+            if response.secondary_clicked() && !in_selection {
                 clicked_row = Some(row);
             }
             if response.double_clicked() {
@@ -195,12 +293,24 @@ fn disassembly_pane(ui: &mut Ui, state: &mut UiState) {
             }
             response.context_menu(|ui| {
                 menu_row = Some(row);
-                code_menu(ui, state, line);
+                code_menu(ui, state, line, &snapshot.code.lines);
             });
         }
     });
-    if let Some(row) = clicked_row.or(menu_row) {
+    if let Some(key) = highlight_click {
+        state.highlight_key = (!key.is_empty()).then_some(key);
+    }
+    if let Some(row) = shift_row {
         if let Some(line) = lines.get(row) {
+            if state.selected_code.is_none() {
+                state.selected_code = Some(line.address);
+            }
+            state.selection_end = Some(line.address);
+        }
+    }
+    if let Some(row) = clicked_row.or(menu_row.filter(|_| state.selected_code.is_none())) {
+        if let Some(line) = lines.get(row) {
+            state.selection_end = None;
             if state.selected_code != Some(line.address) {
                 state.selected_code = Some(line.address);
                 state.requests.push(Request::SelectInstruction(Some(line.address)));
@@ -236,18 +346,143 @@ fn truncate_to(text: &str, width: usize) -> String {
     }
 }
 
+/// O texto das linhas escolhidas (copiar a seleção) e os bytes delas.
+fn selection_text(state: &UiState, lines: &[Line], line: &Line) -> (String, String) {
+    let (low, high) = selected_rows(state, lines).unwrap_or_else(|| {
+        let row = lines.iter().position(|candidate| candidate.address == line.address).unwrap_or(0);
+        (row, row)
+    });
+    let chosen = &lines[low..=high.min(lines.len().saturating_sub(1))];
+    let text = chosen.iter().map(|line| format!("{} | {:<20} | {}", hex(line.address), line.bytes, line.text)).collect::<Vec<_>>().join("\n");
+    let bytes = chosen.iter().map(|line| line.bytes.as_bytes().chunks(2).map(|pair| std::str::from_utf8(pair).unwrap_or("")).collect::<Vec<_>>().join(" ")).collect::<Vec<_>>().join(" ");
+    (text, bytes)
+}
+
 /// O menu de contexto de uma linha da desmontagem.
-pub(crate) fn code_menu(ui: &mut Ui, state: &mut UiState, line: &Line) {
+pub(crate) fn code_menu(ui: &mut Ui, state: &mut UiState, line: &Line, lines: &[Line]) {
     let address = line.address;
     let stopped = state.status == Status::Stopped;
-    if ui.add_enabled(stopped, egui::Button::new("Breakpoint").shortcut_text("F2")).clicked() {
-        state.requests.push(Request::ToggleBreakpoint(address));
-        ui.close();
-    }
-    if ui.add_enabled(stopped, egui::Button::new("Executar até aqui").shortcut_text("F4")).clicked() {
+    ui.menu_button("Breakpoint", |ui| {
+        if ui.add_enabled(stopped, egui::Button::new("Ligar/tirar (software)").shortcut_text("F2")).clicked() {
+            state.requests.push(Request::ToggleBreakpoint(address));
+            ui.close();
+        }
+        if ui.add_enabled(stopped, egui::Button::new("Hardware, execução")).clicked() {
+            state.requests.push(Request::AddBreakpoint(BreakpointKind::Hardware, format!("{address:#x}")));
+            ui.close();
+        }
+        ui.menu_button("Memória (página)", |ui| {
+            for (label, kind) in [("Acesso", BreakpointKind::MemoryAccess), ("Escrita", BreakpointKind::MemoryWrite), ("Execução", BreakpointKind::MemoryExecute)] {
+                if ui.add_enabled(stopped, egui::Button::new(label)).clicked() {
+                    state.requests.push(Request::AddBreakpoint(kind, format!("{address:#x}")));
+                    ui.close();
+                }
+            }
+        });
+        let existing = state.snapshot.breakpoints.iter().find(|breakpoint| breakpoint.address == address && !breakpoint.pending).cloned();
+        if ui.add_enabled(stopped, egui::Button::new(if existing.is_some() { "Editar..." } else { "Com condição, log e comandos..." })).clicked() {
+            state.breakpoint_form = Some(match &existing {
+                Some(breakpoint) => BreakpointForm::from_breakpoint(breakpoint),
+                None => BreakpointForm::new(BreakpointKind::Software, &format!("{address:#x}")),
+            });
+            ui.close();
+        }
+        if let Some(breakpoint) = existing {
+            if ui.add_enabled(stopped, egui::Button::new(if breakpoint.enabled { "Desligar" } else { "Ligar" })).clicked() {
+                state.requests.push(Request::EnableBreakpoint(breakpoint.id, !breakpoint.enabled));
+                ui.close();
+            }
+            if ui.add_enabled(stopped, egui::Button::new("Remover")).clicked() {
+                state.requests.push(Request::RemoveBreakpoint(breakpoint.id));
+                ui.close();
+            }
+        }
+    });
+    if ui.add_enabled(stopped, egui::Button::new("Executar até a seleção").shortcut_text("F4")).clicked() {
         state.requests.push(Request::RunToCursor(address));
         ui.close();
     }
+    if ui.add_enabled(stopped, egui::Button::new("Nova origem aqui (RIP)").shortcut_text("Ctrl+*")).clicked() {
+        state.requests.push(Request::WriteRegister("rip".into(), address));
+        ui.close();
+    }
+    ui.separator();
+    ui.menu_button("Seguir", |ui| {
+        if let Some(target) = line.target {
+            if ui.button(format!("Na desmontagem ({target:#x})")).clicked() {
+                state.go_to_code(target);
+                ui.close();
+            }
+        }
+        let follow = line.memory.or(line.target);
+        if ui.add_enabled(follow.is_some(), egui::Button::new("No dump (operando)")).clicked() {
+            if let Some(target) = follow {
+                state.follow_in_dump(target);
+            }
+            ui.close();
+        }
+        if ui.button("Este endereço no dump").clicked() {
+            state.follow_in_dump(address);
+            ui.close();
+        }
+        if ui.add_enabled(stopped, egui::Button::new("No mapa de memória")).clicked() {
+            state.map_highlight = Some(address);
+            state.requests.push(Request::LoadMemoryMap);
+            state.focus_tab.push(Tab::MemoryMap);
+            ui.close();
+        }
+        if ui.add_enabled(stopped, egui::Button::new("Grafo da função").shortcut_text("G")).clicked() {
+            state.requests.push(Request::Graph(format!("{address:#x}")));
+            state.focus_tab.push(Tab::Graph);
+            ui.close();
+        }
+    });
+    ui.menu_button("Copiar", |ui| {
+        if ui.button("Endereço").clicked() {
+            ui.ctx().copy_text(format!("{address:#x}"));
+            ui.close();
+        }
+        if ui.button("RVA").clicked() {
+            let text = state.module_at(address).map(|module| format!("{:#x}", address - module.base)).unwrap_or_else(|| format!("{address:#x}"));
+            ui.ctx().copy_text(text);
+            ui.close();
+        }
+        if ui.add_enabled(stopped, egui::Button::new("Deslocamento no arquivo")).clicked() {
+            state.requests.push(Request::CopyFileOffset(address));
+            ui.close();
+        }
+        let (text, bytes) = selection_text(state, lines, line);
+        if ui.button("Seleção (texto)").clicked() {
+            ui.ctx().copy_text(text);
+            ui.close();
+        }
+        if ui.button("Bytes da seleção").clicked() {
+            ui.ctx().copy_text(bytes);
+            ui.close();
+        }
+        if ui.button("Símbolo (módulo+RVA)").clicked() {
+            ui.ctx().copy_text(state.location(address).display());
+            ui.close();
+        }
+    });
+    ui.menu_button("Binário", |ui| {
+        if ui.add_enabled(stopped, egui::Button::new("Editar bytes...")).clicked() {
+            state.dialog = Some(Dialog::BinaryEdit(address, line.bytes.clone()));
+            ui.close();
+        }
+        if ui.add_enabled(stopped, egui::Button::new("Preencher...")).clicked() {
+            state.dialog = Some(Dialog::Fill(address, format!("{:x}", (line.bytes.len() / 2).max(1)), "90".into()));
+            ui.close();
+        }
+        if ui.add_enabled(stopped, egui::Button::new("Preencher com NOP")).clicked() {
+            state.requests.push(Request::Patch { address, bytes: vec![0x90; (line.bytes.len() / 2).max(1)] });
+            ui.close();
+        }
+        if ui.add_enabled(stopped, egui::Button::new("Montar").shortcut_text("Espaço")).clicked() {
+            state.dialog = Some(Dialog::Assemble(address, String::new()));
+            ui.close();
+        }
+    });
     ui.separator();
     if ui.add(egui::Button::new("Comentário").shortcut_text(";")).clicked() {
         let current = state.comment_at(address).cloned().unwrap_or_default();
@@ -264,35 +499,13 @@ pub(crate) fn code_menu(ui: &mut Ui, state: &mut UiState, line: &Line) {
         state.notes.toggle_bookmark(location);
         ui.close();
     }
-    if ui.add_enabled(stopped, egui::Button::new("Montar").shortcut_text("Espaço")).clicked() {
-        state.dialog = Some(Dialog::Assemble(address, String::new()));
-        ui.close();
-    }
-    ui.separator();
-    if let Some(target) = line.target {
-        if ui.button(format!("Seguir na desmontagem ({target:#x})")).clicked() {
-            state.go_to_code(target);
-            ui.close();
-        }
-    }
-    let follow = line.memory.or(line.target);
-    if ui.add_enabled(follow.is_some(), egui::Button::new("Seguir no dump")).clicked() {
-        if let Some(target) = follow {
-            state.follow_in_dump(target);
-        }
-        ui.close();
-    }
-    if ui.button("Seguir este endereço no dump").clicked() {
-        state.follow_in_dump(address);
-        ui.close();
-    }
-    if ui.add_enabled(stopped, egui::Button::new("Grafo da função").shortcut_text("G")).clicked() {
-        state.requests.push(Request::Graph(format!("{address:#x}")));
-        state.focus_tab.push(Tab::Graph);
-        ui.close();
-    }
     ui.separator();
     ui.add_enabled_ui(stopped, |ui| {
+        if ui.add(egui::Button::new("Referências a este endereço").shortcut_text("Ctrl+R / X")).clicked() {
+            state.requests.push(Request::Xrefs(address));
+            state.xrefs_open = true;
+            ui.close();
+        }
         ui.menu_button("Procurar", |ui| {
             ui.menu_button("Módulo atual", |ui| {
                 if ui.button("Referências a strings").clicked() {
@@ -336,16 +549,7 @@ pub(crate) fn code_menu(ui: &mut Ui, state: &mut UiState, line: &Line) {
                 }
             });
         });
-        if ui.button("Referências a este endereço (xrefs)").clicked() {
-            state.selected_code = Some(address);
-            state.search(SearchKind::References(format!("{address:#x}")), false);
-            ui.close();
-        }
     });
-    if ui.button("Copiar o endereço").clicked() {
-        ui.ctx().copy_text(format!("{address:#x}"));
-        ui.close();
-    }
 }
 
 fn info_pane(ui: &mut Ui, state: &mut UiState) {
@@ -359,8 +563,14 @@ fn info_pane(ui: &mut Ui, state: &mut UiState) {
             ui.label(mono(line));
         }
         if let Some(address) = state.selected_code {
+            // O comentário automático inteiro (a chamada com os argumentos).
+            if let Some(comment) = snapshot.code.auto_comments.get(&address) {
+                ui.add(egui::Label::new(mono(comment).color(colors.green)).wrap());
+            }
             let location = state.location(address);
-            ui.label(mono(location.display()).color(colors.dim));
+            let function = snapshot.code.functions.iter().find(|function| function.contains(address));
+            let suffix = function.map(|function| format!("  função {:#x}-{:#x} ({})", function.start, function.end, function.source.name())).unwrap_or_default();
+            ui.label(mono(format!("{}{suffix}", location.display())).color(colors.dim));
         }
     });
 }
@@ -369,6 +579,15 @@ fn info_pane(ui: &mut Ui, state: &mut UiState) {
 const GENERAL_ORDER: [&str; 17] = ["rax", "rbx", "rcx", "rdx", "rbp", "rsp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rip"];
 const FLAGS: [(&str, u32); 9] = [("ZF", 6), ("PF", 2), ("AF", 4), ("OF", 11), ("SF", 7), ("DF", 10), ("CF", 0), ("TF", 8), ("IF", 9)];
 const SEGMENTS: [&str; 6] = ["gs", "fs", "es", "ds", "cs", "ss"];
+
+/// Um XMM no formato escolhido (hexadecimal, 4 floats ou 2 doubles).
+fn xmm_text(bytes: &[u8; 16], format: usize) -> String {
+    match format {
+        1 => bytes.chunks(4).rev().map(|piece| format!("{:.6}", f32::from_le_bytes(piece.try_into().unwrap_or([0; 4])))).collect::<Vec<_>>().join(" "),
+        2 => bytes.chunks(8).rev().map(|piece| format!("{:.12}", f64::from_le_bytes(piece.try_into().unwrap_or([0; 8])))).collect::<Vec<_>>().join(" "),
+        _ => bytes.iter().rev().map(|byte| format!("{byte:02X}")).collect(),
+    }
+}
 
 fn registers_pane(ui: &mut Ui, state: &mut UiState) {
     let colors = palette(ui);
@@ -429,6 +648,12 @@ fn registers_pane(ui: &mut Ui, state: &mut UiState) {
                 }
             });
         }
+        // LastError e LastStatus da TEB numa parada de usuário.
+        if let Some((error, status)) = snapshot.last_error {
+            ui.add_space(4.0);
+            ui.label(mono(format!("LastError  {error:08X}")).color(if error != 0 { colors.red } else { ui.visuals().text_color() }));
+            ui.label(mono(format!("LastStatus {status:08X}")).color(if status != 0 { colors.red } else { ui.visuals().text_color() }));
+        }
         ui.add_space(6.0);
         egui::Grid::new("re-segments").num_columns(4).spacing([8.0, 1.0]).show(ui, |ui| {
             for (index, name) in SEGMENTS.iter().enumerate() {
@@ -449,7 +674,75 @@ fn registers_pane(ui: &mut Ui, state: &mut UiState) {
         if snapshot.user_mode {
             ui.label(mono("modo usuário (GS = TEB)").color(colors.green));
         }
-        // O que não está acima (o x87/SSE do protocolo e o que vier).
+        // A caixa da convenção x64: RCX, RDX, R8, R9 e a pilha.
+        ui.add_space(6.0);
+        egui::CollapsingHeader::new(RichText::new("Argumentos (x64)").strong()).id_salt("re-arguments").default_open(true).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("quantos:");
+                ui.add(egui::DragValue::new(&mut state.argument_count).range(0..=16));
+                hint(ui, "RCX, RDX, R8, R9 e a pilha a partir de [rsp+0x28]");
+            });
+            egui::Grid::new("re-arguments-grid").num_columns(4).spacing([8.0, 1.0]).show(ui, |ui| {
+                for (number, place, value) in &snapshot.arguments {
+                    ui.label(mono(format!("{number}:")).color(colors.dim));
+                    ui.label(mono(place).color(colors.blue));
+                    ui.label(mono(value.map_or("????????????????".into(), |value| format!("{value:016X}"))));
+                    let note = value.and_then(|value| state.module_at(value).map(|module| format!("{}+{:#x}", module.name, value - module.base))).unwrap_or_default();
+                    ui.label(mono(note).color(colors.dim));
+                    ui.end_row();
+                }
+            });
+        });
+        // x87, MMX, SSE, AVX e os registradores de depuração.
+        if let Some(extended) = &snapshot.extended {
+            ui.add_space(4.0);
+            egui::CollapsingHeader::new(RichText::new("SSE (XMM0-XMM15, MXCSR)").strong()).id_salt("re-xmm").default_open(true).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for (index, label) in ["hex", "float", "double"].iter().enumerate() {
+                        ui.selectable_value(&mut state.xmm_format, index, *label);
+                    }
+                });
+                for (index, value) in extended.xmm.iter().enumerate() {
+                    let text = value.as_ref().map_or("indisponível".into(), |bytes| xmm_text(bytes, state.xmm_format));
+                    ui.label(mono(format!("XMM{index:<2} {text}")));
+                }
+                if let Some(mxcsr) = extended.mxcsr {
+                    ui.label(mono(format!("MXCSR  {mxcsr:08X}  {}", registers::mxcsr_text(mxcsr))));
+                }
+            });
+            egui::CollapsingHeader::new(RichText::new("AVX (YMM, metade alta)").strong()).id_salt("re-ymm").default_open(false).show(ui, |ui| {
+                if extended.ymm_high.iter().all(Option::is_none) {
+                    hint(ui, "indisponível: o sistema não ligou o XSAVE/AVX (CR4.OSXSAVE), ou a CPU escolhida está congelada");
+                }
+                for (index, value) in extended.ymm_high.iter().enumerate() {
+                    if let Some(bytes) = value {
+                        ui.label(mono(format!("YMM{index:<2}h {}", xmm_text(bytes, 0))));
+                    }
+                }
+            });
+            egui::CollapsingHeader::new(RichText::new("x87 e MMX").strong()).id_salt("re-x87").default_open(false).show(ui, |ui| {
+                for (index, value) in extended.st.iter().enumerate() {
+                    let text = value.as_ref().map_or("indisponível".into(), |bytes| format!("{}  {}", bytes.iter().rev().map(|byte| format!("{byte:02X}")).collect::<String>(), registers::extended_to_f64(bytes)));
+                    ui.label(mono(format!("ST{index} {text}")));
+                }
+                ui.label(mono(format!("FCW {:04X}  FSW {:04X}  FTW {:04X}  TOP {}", extended.fctrl.unwrap_or(0), extended.fstat.unwrap_or(0), extended.ftag.unwrap_or(0), extended.x87_top())));
+                for index in 0..8 {
+                    if let Some(value) = extended.mmx(index) {
+                        ui.label(mono(format!("MM{index} {value:016X}")));
+                    }
+                }
+            });
+            egui::CollapsingHeader::new(RichText::new("Depuração (DR0-DR7)").strong()).id_salt("re-dr").default_open(false).show(ui, |ui| {
+                for (index, name) in ["DR0", "DR1", "DR2", "DR3", "DR6", "DR7"].iter().enumerate() {
+                    let text = extended.debug[index].map_or("indisponível".into(), |value| format!("{value:016X}"));
+                    ui.label(mono(format!("{name} {text}")));
+                }
+                if let Some(control) = extended.debug[5] {
+                    ui.label(mono(registers::dr7_text(control)).color(colors.dim));
+                }
+            });
+        }
+        // O que não está acima (o que vier de uma thread fora da CPU).
         let shown: Vec<&str> = GENERAL_ORDER.iter().chain(SEGMENTS.iter()).copied().chain(["eflags", "fs_base", "gs_base"]).collect();
         let rest: Vec<_> = snapshot.registers.iter().filter(|row| !shown.contains(&row.name.as_str())).collect();
         if !rest.is_empty() {
@@ -497,6 +790,10 @@ fn register_row(ui: &mut Ui, state: &mut UiState, row: &crate::backend::Register
                 state.follow_in_dump(value);
                 ui.close();
             }
+            if ui.button("Copiar").clicked() {
+                ui.ctx().copy_text(format!("{value:#x}"));
+                ui.close();
+            }
         });
         // O símbolo do valor, quando ele aponta para uma imagem.
         let note = state.snapshot.register_notes.get(&row.name).cloned().or_else(|| state.module_at(value).map(|module| format!("{}+{:#x}", module.name, value - module.base))).unwrap_or_default();
@@ -522,6 +819,13 @@ fn dump_pane(ui: &mut Ui, state: &mut UiState) {
             state.requests.push(Request::ShowDump(index, state.dump_inputs[index].clone()));
         }
         let dump = snapshot.dumps.get(index);
+        // Sem sincronia, a expressão vira o endereço de agora e fica.
+        if ui.checkbox(&mut state.dump_sync[index], "sincronizar").on_hover_text("ligado: a expressão é avaliada de novo a cada parada; desligado: o endereço fica").changed() && !state.dump_sync[index] {
+            if let Some(dump) = dump.filter(|dump| dump.address != 0) {
+                state.dump_inputs[index] = format!("{:#x}", dump.address);
+                state.requests.push(Request::ShowDump(index, state.dump_inputs[index].clone()));
+            }
+        }
         if let Some(dump) = dump.filter(|dump| !dump.bytes.is_empty()) {
             if ui.small_button("-0x200").clicked() {
                 state.dump_inputs[index] = format!("{:#x}", dump.address.wrapping_sub(0x200));
@@ -553,11 +857,44 @@ fn dump_pane(ui: &mut Ui, state: &mut UiState) {
     let editable = state.status == Status::Stopped;
     let format = state.dump_formats[index];
     egui::ScrollArea::both().id_salt(("dump", index)).auto_shrink([false, false]).show(ui, |ui| {
-        for (row, chunk) in dump.bytes.chunks(16).enumerate() {
-            let base = dump.address + row as u64 * 16;
+        if format == MemoryFormat::Disassembly {
+            let lines = crate::disasm::disassemble(dump.address, &dump.bytes, None);
+            for line in lines.iter().take(160) {
+                let response = ui.add(egui::Label::new(mono(format!("{}  {:<20} {}", hex(line.address), line.bytes, line.text))).sense(Sense::click()));
+                if response.double_clicked() {
+                    state.go_to_code(line.address);
+                }
+            }
+            return;
+        }
+        let row_bytes = format.row_bytes();
+        for (row, chunk) in dump.bytes.chunks(row_bytes).enumerate() {
+            let base = dump.address + (row * row_bytes) as u64;
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
-                ui.label(mono(hex(base)).color(colors.blue));
+                let address = ui.add(egui::Label::new(mono(hex(base)).color(colors.blue)).sense(Sense::click()));
+                address.context_menu(|ui| {
+                    if ui.button("Seguir na desmontagem").clicked() {
+                        state.go_to_code(base);
+                        ui.close();
+                    }
+                    if ui.button("Copiar o endereço").clicked() {
+                        ui.ctx().copy_text(format!("{base:#x}"));
+                        ui.close();
+                    }
+                    if ui.add_enabled(editable, egui::Button::new("Gravar a região num arquivo...")).clicked() {
+                        state.dialog = Some(Dialog::DumpRegion(base, "1000".into(), state.dump_path.clone()));
+                        ui.close();
+                    }
+                    if ui.add_enabled(editable, egui::Button::new("Breakpoint de memória (escrita)")).clicked() {
+                        state.requests.push(Request::AddBreakpoint(BreakpointKind::MemoryWrite, format!("{base:#x}")));
+                        ui.close();
+                    }
+                    if ui.add_enabled(editable, egui::Button::new("Vigia de hardware (escrita, 8 bytes)")).clicked() {
+                        state.requests.push(Request::AddBreakpoint(BreakpointKind::Write, format!("{base:#x}")));
+                        ui.close();
+                    }
+                });
                 match format {
                     MemoryFormat::HexAscii | MemoryFormat::HexUnicode => {
                         for (column, &byte) in chunk.iter().enumerate() {
@@ -586,24 +923,14 @@ fn dump_pane(ui: &mut Ui, state: &mut UiState) {
                             }
                         }
                         ui.add_space(8.0);
-                        let text: String = if format == MemoryFormat::HexAscii {
-                            chunk.iter().map(|&byte| if (0x20..0x7F).contains(&byte) { byte as char } else { '.' }).collect()
-                        } else {
-                            chunk.chunks(2).map(|pair| char::from_u32(u16::from_le_bytes([pair[0], *pair.get(1).unwrap_or(&0)]) as u32).filter(|character| !character.is_control()).unwrap_or('.')).collect()
-                        };
+                        let text = if format == MemoryFormat::HexAscii { dump::ascii(chunk) } else { dump::utf16(chunk) };
                         ui.label(mono(text).color(colors.dim));
                     }
-                    MemoryFormat::Words | MemoryFormat::Dwords | MemoryFormat::Qwords | MemoryFormat::Address => {
-                        let unit = match format {
-                            MemoryFormat::Words => 2,
-                            MemoryFormat::Dwords => 4,
-                            _ => 8,
-                        };
+                    _ => {
+                        let unit = format.unit().max(1);
                         for piece in chunk.chunks(unit) {
-                            let mut raw = [0u8; 8];
-                            raw[..piece.len()].copy_from_slice(piece);
-                            let value = u64::from_le_bytes(raw);
-                            let label = ui.add(egui::Label::new(mono(format!("{value:0width$X}", width = unit * 2))).sense(Sense::click()));
+                            let value = dump::integer(piece);
+                            let label = ui.add(egui::Label::new(mono(dump::format_value(format, piece))).sense(Sense::click()));
                             if unit == 8 && label.double_clicked() {
                                 state.dump_inputs[index] = format!("{value:#x}");
                                 state.requests.push(Request::ShowDump(index, state.dump_inputs[index].clone()));
@@ -613,19 +940,6 @@ fn dump_pane(ui: &mut Ui, state: &mut UiState) {
                                     ui.label(mono(format!("{}+{:#x}", module.name, value - module.base)).color(colors.green));
                                 }
                             }
-                        }
-                    }
-                    MemoryFormat::Float => {
-                        for piece in chunk.chunks(4) {
-                            let value = f32::from_le_bytes([piece[0], *piece.get(1).unwrap_or(&0), *piece.get(2).unwrap_or(&0), *piece.get(3).unwrap_or(&0)]);
-                            ui.label(mono(format!("{value:>14.6e}")));
-                        }
-                    }
-                    MemoryFormat::Double => {
-                        for piece in chunk.chunks(8) {
-                            let mut raw = [0u8; 8];
-                            raw[..piece.len()].copy_from_slice(piece);
-                            ui.label(mono(format!("{:>24.12e}", f64::from_le_bytes(raw))));
                         }
                     }
                 }
@@ -638,6 +952,22 @@ fn stack_pane(ui: &mut Ui, state: &mut UiState) {
     let colors = palette(ui);
     let snapshot = Arc::clone(&state.snapshot);
     let rsp = snapshot.registers.iter().find(|row| row.name == "rsp").and_then(|row| row.value);
+    ui.horizontal(|ui| {
+        let mut locked = snapshot.stack_locked || state.stack_input.trim().is_empty();
+        if ui.checkbox(&mut locked, "presa ao RSP").on_hover_text("ligada: a janela segue o RSP a cada parada").changed() {
+            if locked {
+                state.stack_input.clear();
+                state.requests.push(Request::ShowStack(String::new()));
+            } else if let Some(rsp) = rsp {
+                state.stack_input = format!("{rsp:#x}");
+                state.requests.push(Request::ShowStack(state.stack_input.clone()));
+            }
+        }
+        let response = ui.add(egui::TextEdit::singleline(&mut state.stack_input).font(TextStyle::Monospace).desired_width(160.0).hint_text("endereço da pilha"));
+        if response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter)) {
+            state.requests.push(Request::ShowStack(state.stack_input.clone()));
+        }
+    });
     if snapshot.stack.is_empty() {
         hint(ui, "sem pilha (a máquina não parou ainda)");
         return;
@@ -646,7 +976,7 @@ fn stack_pane(ui: &mut Ui, state: &mut UiState) {
     let mut area = egui::ScrollArea::both().id_salt("cpu-stack").auto_shrink([false, false]);
     if let Some(row) = snapshot.stack.iter().position(|row| Some(row.address) == rsp) {
         let stack_key = rsp.unwrap_or(0) ^ snapshot.stack[0].address.rotate_left(32);
-        if state.scrolled_stack != stack_key {
+        if state.scrolled_stack != stack_key && snapshot.stack_locked {
             state.scrolled_stack = stack_key;
             area = area.vertical_scroll_offset((row as f32 * height - height * 2.0).max(0.0));
         }
@@ -673,7 +1003,7 @@ fn stack_pane(ui: &mut Ui, state: &mut UiState) {
                     state.follow_in_dump(row.value);
                 }
             }
-            let address = row.value;
+            let (address, slot) = (row.value, row.address);
             value.context_menu(|ui| {
                 if ui.button("Seguir na desmontagem").clicked() {
                     state.go_to_code(address);
@@ -683,14 +1013,150 @@ fn stack_pane(ui: &mut Ui, state: &mut UiState) {
                     state.follow_in_dump(address);
                     ui.close();
                 }
+                if ui.button("Seguir na pilha").clicked() {
+                    state.stack_input = format!("{address:#x}");
+                    state.requests.push(Request::ShowStack(state.stack_input.clone()));
+                    ui.close();
+                }
+                if ui.button("Copiar o valor").clicked() {
+                    ui.ctx().copy_text(format!("{address:#x}"));
+                    ui.close();
+                }
+                if ui.button("Copiar o endereço da pilha").clicked() {
+                    ui.ctx().copy_text(format!("{slot:#x}"));
+                    ui.close();
+                }
             });
         }
     });
 }
 
+/// O editor de breakpoints (todas as opções de um breakpoint).
+pub(crate) fn breakpoint_editor(ui: &mut Ui, state: &mut UiState) {
+    let Some(mut form) = state.breakpoint_form.clone() else { return };
+    let mut open = true;
+    let mut submit = false;
+    let mut cancel = false;
+    let title = match form.id {
+        Some(id) => format!("Editar o breakpoint #{id}"),
+        None => "Novo breakpoint".to_string(),
+    };
+    egui::Window::new(title).id(egui::Id::new("re-breakpoint-editor")).collapsible(false).resizable(false).min_width(600.0).default_width(600.0).anchor(Align2::CENTER_TOP, Vec2::new(0.0, 80.0)).open(&mut open).show(ui.ctx(), |ui| {
+        egui::Grid::new("re-bp-editor").num_columns(2).spacing([10.0, 4.0]).show(ui, |ui| {
+            ui.label("Tipo");
+            ui.add_enabled_ui(form.id.is_none(), |ui| {
+                egui::ComboBox::from_id_salt("re-bp-editor-kind").selected_text(form.kind.name()).show_ui(ui, |ui| {
+                    for kind in [BreakpointKind::Software, BreakpointKind::Hardware, BreakpointKind::Write, BreakpointKind::Access, BreakpointKind::MemoryAccess, BreakpointKind::MemoryWrite, BreakpointKind::MemoryExecute, BreakpointKind::Module, BreakpointKind::Event] {
+                        ui.selectable_value(&mut form.kind, kind, kind.name());
+                    }
+                });
+            });
+            ui.end_row();
+            let fields: [(&str, &str, &mut String); 10] = [
+                ("Endereço", "símbolo, 0x..., ntdll!LdrLoadDll", &mut form.expression),
+                ("Tamanho", "bytes (vigias: 1, 2, 4, 8; memória: as páginas da faixa)", &mut form.length),
+                ("Nome", "nome do breakpoint", &mut form.name),
+                ("Condição de parada", "vazia = sempre (com log e sem condição, só registra)", &mut form.break_condition),
+                ("Texto de log", "texto {@rcx} {@rdx:d} {@r8:s}", &mut form.log_text),
+                ("Condição de log", "vazia = sempre", &mut form.log_condition),
+                ("Comandos", "comandos separados por ; (r; k 4)", &mut form.command_text),
+                ("Condição de comando", "vazia = quando para", &mut form.command_condition),
+                ("Contagem de acertos", "para a partir deste acerto", &mut form.hit_count),
+                ("Grupo", "liga e desliga junto", &mut form.group),
+            ];
+            for (label, hint_text, value) in fields {
+                ui.label(label);
+                ui.add(egui::TextEdit::singleline(value).font(TextStyle::Monospace).desired_width(380.0).hint_text(hint_text));
+                ui.end_row();
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(&mut form.enabled, "ligado");
+            ui.checkbox(&mut form.single_shot, "uma vez só").on_hover_text("some depois da primeira parada");
+            ui.checkbox(&mut form.silent, "silencioso").on_hover_text("sem a linha de acerto no log");
+            ui.checkbox(&mut form.fast_resume, "retorno rápido").on_hover_text("quando não para, segue sem reler os módulos");
+            ui.add_enabled(form.id.is_none(), egui::Checkbox::new(&mut form.deferred, "adiado")).on_hover_text("aceita um símbolo de módulo que ainda não carregou");
+        });
+        ui.label(RichText::new(form.summary()).color(Color32::GRAY));
+        if let Some(error) = &state.breakpoint_form_error {
+            ui.label(RichText::new(error).color(Color32::from_rgb(0xC0, 0x20, 0x20)));
+        }
+        ui.horizontal(|ui| {
+            submit = ui.button("OK").clicked();
+            cancel = ui.button("Cancelar").clicked();
+        });
+    });
+    if !open || cancel {
+        state.breakpoint_form = None;
+        state.breakpoint_form_error = None;
+        return;
+    }
+    if submit {
+        match form.to_request() {
+            Ok(request) => {
+                match form.id {
+                    Some(id) => state.requests.push(Request::EditBreakpoint(id, request)),
+                    None => state.requests.push(Request::AddBreakpointWith(request)),
+                }
+                state.breakpoint_form = None;
+                state.breakpoint_form_error = None;
+                return;
+            }
+            Err(error) => state.breakpoint_form_error = Some(error),
+        }
+    }
+    state.breakpoint_form = Some(form);
+}
+
+/// A janela de referências cruzadas (tecla X ou Ctrl+R).
+pub(crate) fn xrefs_window(ui: &mut Ui, state: &mut UiState) {
+    if !state.xrefs_open {
+        return;
+    }
+    let snapshot = Arc::clone(&state.snapshot);
+    let mut open = true;
+    let mut go_to = None;
+    egui::Window::new("Referências cruzadas").id(egui::Id::new("re-xrefs")).default_size([720.0, 320.0]).open(&mut open).show(ui.ctx(), |ui| {
+        let Some(view) = &snapshot.xrefs else {
+            hint(ui, "procurando (o índice do módulo é feito na primeira vez)...");
+            return;
+        };
+        ui.label(RichText::new(format!("{} referências a {:#x} {} no módulo {} ({} ms{})", view.rows.len(), view.target, view.name, view.module, view.milliseconds, if view.cached { ", índice do cache" } else { "" })).strong());
+        if let Some(error) = &view.error {
+            ui.label(RichText::new(error).color(Color32::from_rgb(0xC0, 0x20, 0x20)));
+        }
+        egui::ScrollArea::both().id_salt("re-xrefs-list").auto_shrink([false, false]).show(ui, |ui| {
+            egui::Grid::new("re-xrefs-grid").num_columns(4).striped(true).spacing([10.0, 2.0]).show(ui, |ui| {
+                for title in ["de", "local", "tipo", "instrução"] {
+                    ui.label(RichText::new(title).strong());
+                }
+                ui.end_row();
+                for row in &view.rows {
+                    if ui.add(egui::Label::new(mono(hex(row.from))).sense(Sense::click())).on_hover_text("clique duplo: vai à instrução").double_clicked() {
+                        go_to = Some(row.from);
+                    }
+                    ui.label(mono(&row.location));
+                    ui.label(&row.kind);
+                    ui.label(mono(&row.disassembly));
+                    ui.end_row();
+                }
+            });
+            if view.rows.is_empty() {
+                hint(ui, "nenhuma referência direta no módulo (chamadas indiretas e tabelas não entram)");
+            }
+        });
+    });
+    if let Some(address) = go_to {
+        state.go_to_code(address);
+    }
+    if !open {
+        state.xrefs_open = false;
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::jump_arrows;
+    use super::{jump_arrows, operand_column, xmm_text};
     use crate::disasm::Line;
 
     fn line(address: u64, text: &str, target: Option<u64>) -> Line {
@@ -704,5 +1170,16 @@ mod tests {
         assert_eq!(arrows.len(), 2);
         // As duas faixas se sobrepõem: colunas diferentes; a chamada não tem seta.
         assert_ne!(arrows[0].2, arrows[1].2);
+    }
+
+    #[test]
+    fn operand_columns_and_xmm_formats() {
+        assert_eq!(operand_column("mov     rax, rbx"), 8);
+        assert_eq!(operand_column("vpbroadcastq ymm0, xmm1"), 13);
+        assert_eq!(operand_column("ret"), 3);
+        let mut bytes = [0u8; 16];
+        bytes[..4].copy_from_slice(&1.0f32.to_le_bytes());
+        assert_eq!(xmm_text(&bytes, 1), "0.000000 0.000000 0.000000 1.000000");
+        assert_eq!(xmm_text(&[0x11; 16], 0), "11".repeat(16));
     }
 }

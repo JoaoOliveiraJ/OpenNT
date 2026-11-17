@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use kd_client::analysis::functions::{Function, Loop};
 use kd_client::bugcheck::Analysis;
 use kd_client::client::{BreakpointRequest, Resumed};
 use kd_client::commands::TraceOptions;
@@ -27,15 +28,19 @@ use kd_client::monitor::{Process, Processor, Thread};
 use kd_client::rsp::Connection;
 use kd_client::trace::{self, Class, Source, Trace};
 use kd_client::types::Field;
+use kd_client::registers::ExtendedState;
 use kd_client::{registers, Breakpoint, BreakpointKind, Client};
+use kd_mcp::annotate::{self, Live};
 
 use crate::disasm::{self, Line};
 use crate::launcher::{Launch, LaunchOptions};
 use crate::source::{Local, LineTable};
 
+#[path = "backend/mcp.rs"]
+mod mcp;
 #[path = "backend/views.rs"]
 mod views;
-pub use views::{GraphBlock, GraphView, MapRow, MemoryMapView, ReferenceRow, ReferenceView, SearchKind, SearchQuery, SearchScope, SehRow, StackRow, SymbolView};
+pub use views::{GraphBlock, GraphView, MapRow, MemoryMapView, ReferenceRow, ReferenceView, SearchKind, SearchQuery, SearchScope, SehRow, StackRow, SymbolView, XrefRow, XrefView};
 use kd_client::analysis::notes::Patch;
 use kd_client::user::{Handle, ProcessContext, UserThread};
 
@@ -194,6 +199,22 @@ pub enum Request {
     SetBreakpointActions(u32, String, String, String),
     /// Vigia uma faixa (escrita ou acesso) com até quatro comparadores.
     AddRangeWatch(BreakpointKind, String, u64),
+    /// Todas as opções de um breakpoint (o editor).
+    EditBreakpoint(u32, BreakpointRequest),
+    /// Quem referencia o endereço (o índice do módulo, feito uma vez).
+    Xrefs(u64),
+    /// Grava uma faixa de memória num arquivo.
+    DumpToFile { address: u64, size: u64, path: PathBuf },
+    /// Quantos argumentos a caixa da convenção de chamada mostra.
+    SetArgumentCount(usize),
+    /// A janela de pilha numa expressão (vazia = presa ao RSP).
+    ShowStack(String),
+    /// O deslocamento no arquivo do endereço vai à área de transferência.
+    CopyFileOffset(u64),
+    /// Uma mensagem do servidor MCP hospedado (a resposta volta pelo canal).
+    Mcp { message: String, reply: Sender<Option<String>> },
+    /// Liga (na porta) ou desliga o servidor MCP da janela.
+    SetMcp(Option<u16>),
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -248,6 +269,12 @@ pub struct CodeView {
     pub focus: u64,
     pub lines: Vec<Line>,
     pub error: Option<String>,
+    /// As funções que cobrem as linhas (os colchetes da margem).
+    pub functions: Vec<Function>,
+    /// Os laços dessas funções.
+    pub loops: Vec<Loop>,
+    /// Os comentários automáticos (chamadas com argumentos, strings).
+    pub auto_comments: HashMap<u64, String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -294,6 +321,8 @@ pub struct WatchRow {
     /// Valor tipado que abre (endereço, tipo) e o nome do tipo.
     pub typed: Option<(u64, u32)>,
     pub type_name: String,
+    /// O valor mudou desde a parada anterior.
+    pub changed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -373,6 +402,14 @@ pub struct Snapshot {
     pub last_error: Option<(u64, u64)>,
     /// O símbolo do valor de cada registrador que aponta para um módulo.
     pub register_notes: HashMap<String, String>,
+    /// x87, MMX, SSE, AVX e os registradores de depuração do processador.
+    pub extended: Option<ExtendedState>,
+    /// A caixa da convenção x64: (n.º, onde, valor).
+    pub arguments: Vec<(String, String, Option<u64>)>,
+    /// A janela de referências cruzadas (tecla X).
+    pub xrefs: Option<Arc<XrefView>>,
+    /// A janela de pilha segue o RSP (senão, a expressão pedida).
+    pub stack_locked: bool,
 }
 
 /// Uma entrada do painel de comandos.
@@ -429,6 +466,10 @@ pub struct Shared {
     /// Os nomes de símbolo (o autocompletar), por geração dos símbolos.
     pub completions: Arc<Vec<String>>,
     pub type_names: Arc<Vec<String>>,
+    /// Texto para a área de transferência (a janela copia e limpa).
+    pub clipboard: Option<String>,
+    /// O servidor MCP hospedado (`127.0.0.1:porta`), quando ligado.
+    pub mcp: Option<String>,
 }
 
 pub struct Backend {
@@ -444,7 +485,8 @@ impl Backend {
     pub fn start(config: Config, target: Option<Target>, notify: Notify) -> Backend {
         let (requests, receiver) = mpsc::channel();
         let shared = Arc::new(Mutex::new(Shared::default()));
-        let worker = Worker::new(config, Arc::clone(&shared), notify);
+        let mut worker = Worker::new(config, Arc::clone(&shared), notify);
+        worker.requests = Some(requests.clone());
         let thread = thread::Builder::new()
             .name("kd-backend".into())
             .spawn(move || worker.run(receiver, target))
@@ -511,6 +553,15 @@ struct Worker {
     symbols_generation: u64,
     types_published: bool,
     re: views::ReState,
+    /// O canal dos pedidos (o servidor MCP hospedado manda por ele).
+    requests: Option<Sender<Request>>,
+    argument_count: usize,
+    previous_watches: HashMap<String, String>,
+    /// A expressão da janela de pilha (vazia = o RSP).
+    stack_expression: String,
+    mcp_server: kd_mcp::Server,
+    mcp_cache: kd_mcp::ImageCache,
+    mcp_stop: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Worker {
@@ -537,6 +588,13 @@ impl Worker {
             symbols_generation: u64::MAX,
             types_published: false,
             re: views::ReState::default(),
+            requests: None,
+            argument_count: 5,
+            previous_watches: HashMap::new(),
+            stack_expression: String::new(),
+            mcp_server: kd_mcp::Server::new(),
+            mcp_cache: kd_mcp::ImageCache::default(),
+            mcp_stop: None,
         }
     }
 
@@ -565,6 +623,7 @@ impl Worker {
             let running = self.client.as_ref().is_some_and(|client| !client.is_stopped());
             match receiver.recv_timeout(Duration::from_millis(if running { 20 } else { 150 })) {
                 Ok(Request::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
+                    self.set_mcp(None);
                     self.disconnect("encerrado");
                     return;
                 }
@@ -825,6 +884,21 @@ impl Worker {
                 }
                 return;
             }
+            Request::Mcp { message, reply } => {
+                self.mcp_message(&message, reply);
+                return;
+            }
+            Request::SetMcp(port) => {
+                self.set_mcp(port);
+                return;
+            }
+            Request::SetArgumentCount(count) => {
+                self.argument_count = count.min(16);
+                if self.client.as_ref().is_some_and(Client::is_stopped) {
+                    self.refresh();
+                }
+                return;
+            }
             _ => {}
         }
         if self.client.is_none() {
@@ -1014,7 +1088,23 @@ impl Worker {
             }
             Request::SendKeys(keys) => self.send_keys(&keys).map(|_| false),
             Request::Refresh => Ok(true),
-            Request::Start(_) | Request::Restart | Request::Disconnect | Request::Shutdown | Request::SetWatches(_) | Request::SetExpanded(_) => Ok(false),
+            Request::EditBreakpoint(id, request) => {
+                breakpoints_changed = true;
+                self.with_client(|client| client.edit_breakpoint(id, &request)).map(|_| true)
+            }
+            Request::Xrefs(address) => {
+                self.set_activity("referencias cruzadas (indice do modulo)");
+                let result = self.xrefs(address);
+                self.set_activity("");
+                result
+            }
+            Request::DumpToFile { address, size, path } => self.dump_to_file(address, size, &path),
+            Request::ShowStack(expression) => {
+                self.stack_expression = expression;
+                Ok(true)
+            }
+            Request::CopyFileOffset(address) => self.copy_file_offset(address),
+            Request::Start(_) | Request::Restart | Request::Disconnect | Request::Shutdown | Request::SetWatches(_) | Request::SetExpanded(_) | Request::Mcp { .. } | Request::SetMcp(_) | Request::SetArgumentCount(_) => Ok(false),
         };
         if breakpoints_changed && result.is_ok() {
             self.save_session();
@@ -1215,9 +1305,13 @@ impl Worker {
                 };
                 snapshot.registers = rows;
                 snapshot.registers_editable = true;
+                snapshot.extended = client.extended_registers().ok();
                 client.backtrace(64)?
             }
         };
+        // A caixa da convenção de chamada (RCX, RDX, R8, R9 e a pilha).
+        let named: Vec<(String, u64)> = snapshot.registers.iter().filter_map(|row| row.value.map(|value| (row.name.clone(), value))).collect();
+        snapshot.arguments = annotate::calling_convention_arguments(client, &named, self.argument_count);
         snapshot.frames = frames
             .iter()
             .map(|frame| FrameRow {
@@ -1243,7 +1337,8 @@ impl Worker {
             // O quadro de cima mostra o endereço de retorno (depois do `call`).
             Focus::Frame => frames.get(snapshot.selected_frame).map_or(0, |frame| frame.address),
         };
-        snapshot.code = code_view(client, focus);
+        let live = named.iter().find(|(name, _)| name == "rip").map(|(_, rip)| Live { rip: *rip, registers: named.clone() });
+        snapshot.code = code_view(client, focus, live.as_ref(), &mut self.re.loops);
         // Memória pedida.
         if !snapshot.memory.expression.trim().is_empty() {
             match client.evaluate(&snapshot.memory.expression) {
@@ -1293,10 +1388,16 @@ impl Worker {
                         None => (None, String::new()),
                     };
                     let symbol = client.symbols.name_at(value.number).map(|name| format!(" {name}")).unwrap_or_default();
-                    WatchRow { expression: expression.clone(), value: Ok(format!("{:#x} ({}){symbol}", value.number, value.number as i64)), typed, type_name }
+                    WatchRow { expression: expression.clone(), value: Ok(format!("{:#x} ({}){symbol}", value.number, value.number as i64)), typed, type_name, changed: false }
                 }
-                Err(error) => WatchRow { expression: expression.clone(), value: Err(error), typed: None, type_name: String::new() },
+                Err(error) => WatchRow { expression: expression.clone(), value: Err(error), typed: None, type_name: String::new(), changed: false },
             };
+            // O destaque do que mudou desde a parada anterior.
+            let mut row = row;
+            if let Ok(text) = &row.value {
+                row.changed = self.previous_watches.get(expression).is_some_and(|previous| previous != text);
+                self.previous_watches.insert(expression.clone(), text.clone());
+            }
             snapshot.watches.push(row);
         }
         let mut wanted: Vec<(u64, u32)> = self.expanded.clone();
@@ -1639,8 +1740,28 @@ fn expand_qemu_blocks(client: &mut Client, blocks: &[(u8, u64)], limit: usize) -
     trace
 }
 
-/// A desmontagem em volta de `focus`.
-fn code_view(client: &mut Client, focus: u64) -> CodeView {
+/// A desmontagem em volta de `focus`, com a análise automática: as
+/// funções, os laços (do cache por função) e os comentários.
+fn code_view(client: &mut Client, focus: u64, live: Option<&Live>, loops: &mut HashMap<(u64, u64), Vec<Loop>>) -> CodeView {
+    let mut view = code_lines(client, focus);
+    if view.lines.is_empty() {
+        return view;
+    }
+    view.functions = annotate::functions_for_lines(client, &view.lines);
+    for function in &view.functions {
+        let key = (function.start, function.end);
+        if !loops.contains_key(&key) {
+            let found = annotate::loops_for(client, std::slice::from_ref(function));
+            loops.insert(key, found);
+        }
+        view.loops.extend(loops[&key].iter().copied());
+    }
+    view.auto_comments = annotate::auto_comments(client, &view.lines, live);
+    view
+}
+
+/// As linhas da desmontagem em volta de `focus`.
+fn code_lines(client: &mut Client, focus: u64) -> CodeView {
     const BEFORE: u64 = 0x120;
     const AFTER: u64 = 0x180;
     let mut view = CodeView { focus, ..Default::default() };
