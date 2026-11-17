@@ -1373,6 +1373,15 @@ dentro dele) que não é compartilhado entre as raízes:
   ImagePath de um serviço pode ser relativo, e então é relativo ao
   \SystemRoot (`system32\drivers\Wdf01000.sys`); System32\Drivers fica na
   raiz do volume.
+- **O nome do DRIVER_OBJECT** (`io/driver_load.rs`, o
+  IopGetDriverNameFromKeyNode): o ObjectName REG_SZ da chave do serviço,
+  quando existe; senão `\FileSystem\<chave>` para os tipos 2 (file system) e
+  8 (reconhecedor) e `\Driver\<chave>` para os outros, com o nome da chave
+  como está na hive. Um driver sem chave fica em `\Driver\<nome>`. O
+  `lifecycle` guarda o nome de cada driver e o acha pelo nome do serviço
+  (`lifecycle::driver_node`); as chaves de driver semeadas não têm
+  ObjectName, como as da instalação, e o services.exe confere o estado de um
+  driver pelo mesmo nome no `\Driver` ou no `\FileSystem`.
 - **Imports entre imagens de kernel** (`mm/pe_loader.rs`, `mm/sysload.rs`),
   como no MmLoadSystemImageEx: a entrada da imagem entra na lista de imagens
   carregadas (a PsLoadedModuleList) depois da relocação e antes dos imports,

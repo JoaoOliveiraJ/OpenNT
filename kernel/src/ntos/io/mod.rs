@@ -26,6 +26,7 @@ pub mod volume_dos_name;
 pub mod volume_parameters;
 pub mod exports;
 pub mod lifecycle;
+pub mod driver_load;
 pub mod irp_builder;
 pub mod device;
 pub mod device_interface;

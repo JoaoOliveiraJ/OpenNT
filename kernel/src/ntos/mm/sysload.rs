@@ -94,7 +94,7 @@ fn cached(name: &str) -> Result<Option<Shared>, KernelError> {
     let stale = {
         let state = record.lock();
         let unloaded_image = state.loader_entry != 0 && loaded_system_image_entry(name) != Some(state.loader_entry);
-        unloaded_image || state.kind == Kind::Driver && object_manager::lookup(&alloc::format!("\\Driver\\{}", state.driver_name)) != state.driver_node
+        unloaded_image || state.kind == Kind::Driver && lifecycle::driver_node(&state.driver_name) != state.driver_node
     };
     if stale {
         let mut state = record.lock();
@@ -277,7 +277,7 @@ fn get(name: &str, dependent: bool) -> Result<Shared, KernelError> {
     let driver_name = String::from(name.trim_end_matches(".sys"));
     LOADING.lock().insert(name.clone());
     let result = (|| -> Result<Record, KernelError> {
-        let existing = if name.ends_with(".sys") { object_manager::lookup(&alloc::format!("\\Driver\\{driver_name}")) } else { None };
+        let existing = if name.ends_with(".sys") { lifecycle::driver_node(&driver_name) } else { None };
         if let Some(node) = existing {
             let driver = lifecycle::initialized_driver(&driver_name).ok_or_else(|| KernelError::new(alloc::format!("existing driver is not initialized: {name}")))?;
             let exports = lifecycle::driver_exports(&driver_name).unwrap_or_default();
@@ -289,7 +289,7 @@ fn get(name: &str, dependent: bool) -> Result<Shared, KernelError> {
             // imagem (mapeada uma vez) e do DriverEntry.
             lifecycle::load_driver(&alloc::format!("/{name}"), &lifecycle::DriverOptions::default()).map_err(|error| error.error)?;
             let driver = lifecycle::initialized_driver(&driver_name).unwrap_or(0);
-            let driver_node = object_manager::lookup(&alloc::format!("\\Driver\\{driver_name}"));
+            let driver_node = lifecycle::driver_node(&driver_name);
             let module = exported(&name, lifecycle::driver_exports(&driver_name).unwrap_or_default());
             return Ok(Record { name: name.clone(), driver_name: driver_name.clone(), kind: Kind::Driver, state: State::Ready, references: 0, pinned: false, driver, driver_node, image: None, module, initialize_status: None, unload_status: None, loader_entry: 0 });
         }

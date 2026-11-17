@@ -106,7 +106,7 @@ pub fn find_function_driver(hardware_ids: &[String]) -> Option<&'static str> {
 /// AddDevice do driver funcional sobre o PDO; devolve o FDO novo, que herda
 /// os recursos do PDO para o START_DEVICE.
 pub fn attach_function_driver(pdo: NodeId, driver_name: &str) -> Option<NodeId> {
-    let Some(driver_node) = object_manager::lookup(&format!("\\Driver\\{driver_name}")) else {
+    let Some(driver_node) = lifecycle::driver_node(driver_name) else {
         debug_print!("[pnp] driver {} nao carregado", driver_name);
         return None;
     };
@@ -306,7 +306,7 @@ fn add_pdo_stack(pdo: NodeId) -> Option<NodeId> {
         return None;
     };
     // Serviço com Start=3: carrega agora, como o SCM ao instalar o devnode.
-    if object_manager::lookup(&format!("\\Driver\\{driver_name}")).is_none() && !services::load_service_driver(driver_name) {
+    if lifecycle::driver_node(driver_name).is_none() && !services::load_service_driver(driver_name) {
         debug_print!("[pnp] servico {} indisponivel", driver_name);
         return None;
     }

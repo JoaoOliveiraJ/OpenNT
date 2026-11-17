@@ -458,7 +458,7 @@ fn filters(key: &str, name: &str) -> Vec<String> {
 
 /// Carrega o serviço (se preciso) e chama o AddDevice dele com o PDO.
 fn call_add_device(service: &str, pdo: u64) -> Result<(), u32> {
-    if object_manager::lookup(&format!("\\Driver\\{service}")).is_none() && !services::load_service_driver(service) {
+    if lifecycle::driver_node(service).is_none() && !services::load_service_driver(service) {
         debug_print!("[pnp] servico {} nao carregou", service);
         return Err(problem::DRIVER_FAILED_LOAD);
     }

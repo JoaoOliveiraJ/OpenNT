@@ -15,13 +15,12 @@
 //!   * InitializationFunction(DriverObject, NULL); falha -> objeto temporário e
 //!     desreferenciado; devolve o status da rotina.
 //!
-//! Reuso: `lifecycle::begin_driver` cria o DRIVER_OBJECT/extensão e publica
-//! `\Driver\<nome>` (o caminho dos .sys carregados), `loaded_images::find` acha
-//! o DllBase e `lifecycle::dispose_driver` desfaz na falha.
-//! Adaptações do OpenNT: o namespace de drivers nativos é só `\Driver`, então
-//! outro diretório (ex.: `\FileSystem\X`) publica `\Driver\X`; MajorFunction
-//! fica nulo, que o IofCallDriver do OpenNT já recusa como o
-//! IopInvalidDeviceRequest; DriverName segue a convenção do lifecycle.
+//! Reuso: `lifecycle::begin_driver` cria o DRIVER_OBJECT/extensão e o
+//! publica com o nome pedido (`\Driver\X`, `\FileSystem\X`), como os .sys
+//! carregados, `loaded_images::find` acha o DllBase e
+//! `lifecycle::dispose_driver` desfaz na falha.
+//! Adaptação do OpenNT: MajorFunction fica nulo, que o IofCallDriver do
+//! OpenNT já recusa como o IopInvalidDeviceRequest.
 
 use alloc::format;
 use alloc::string::String;
@@ -64,7 +63,7 @@ pub fn create(name_pointer: u64, initialize: u64) -> Result<u32, KernelError> {
     if short.contains('\\') {
         return Ok(STATUS_OBJECT_PATH_NOT_FOUND);
     }
-    if object_manager::lookup(&format!("\\Driver\\{short}")).is_some() {
+    if object_manager::lookup(&full).is_some() {
         return Ok(STATUS_OBJECT_NAME_COLLISION);
     }
     let units: Vec<u16> = full.encode_utf16().collect();
@@ -74,11 +73,15 @@ pub fn create(name_pointer: u64, initialize: u64) -> Result<u32, KernelError> {
     }
     let image_base = loaded_images::find(initialize).map_or(0, |image| image.image_base);
     let previous = lifecycle::current_driver();
-    let driver = match lifecycle::begin_driver(&short, image_base, 0, initialize) {
+    let driver = match lifecycle::begin_driver(&short, &full, image_base, 0, initialize) {
         Ok(driver) => driver,
         Err(error) => {
             lifecycle::set_current_driver(previous);
             guest::free_bytes(service_buffer);
+            // O ObInsertObject de um nome que o namespace recusa.
+            if error.status != 0 {
+                return Ok(error.status);
+            }
             return Err(error);
         }
     };

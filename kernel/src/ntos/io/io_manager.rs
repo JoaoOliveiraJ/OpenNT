@@ -614,10 +614,21 @@ pub fn create_driver(name: &str, dispatch: &[(u8, DispatchRoutine)]) -> Result<N
     Ok(node)
 }
 
-/// Cria `\Driver\<nome>` de um driver nativo: o corpo do objeto é o
-/// DRIVER_OBJECT e o despacho vem dele (MajorFunction), não do kernel.
-pub fn create_native_driver(name: &str, driver_object: u64) -> Result<NodeId, KernelError> {
-    let node = object_manager::create_object("\\Driver", name, "Driver", Some(object_manager::ObjectData::pointer(driver_object)))?;
+/// Publica o objeto de um driver nativo com o nome completo `object_name`
+/// (`\Driver\<serviço>`, `\FileSystem\<serviço>` ou outro diretório): o
+/// corpo do objeto é o DRIVER_OBJECT e o despacho vem dele (MajorFunction),
+/// não do kernel.
+pub fn create_native_driver(object_name: &str, driver_object: u64) -> Result<NodeId, KernelError> {
+    let (directory, name) = match object_name.rfind('\\') {
+        Some(0) => ("\\", &object_name[1..]),
+        Some(split) => (&object_name[..split], &object_name[split + 1..]),
+        // STATUS_OBJECT_PATH_SYNTAX_BAD: um nome relativo sem diretório raiz.
+        None => return Err(KernelError::with_status(alloc::format!("nome de driver relativo: {object_name}"), 0xC000_003B)),
+    };
+    if name.is_empty() {
+        return Err(KernelError::with_status(alloc::format!("nome de driver vazio: {object_name}"), 0xC000_0033));
+    }
+    let node = object_manager::create_object(directory, name, "Driver", Some(object_manager::ObjectData::pointer(driver_object)))?;
     DRIVERS.lock().insert(node, DriverEntry { dispatch: BTreeMap::new(), native: true, devices: Vec::new() });
     Ok(node)
 }

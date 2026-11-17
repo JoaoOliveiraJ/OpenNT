@@ -79,7 +79,7 @@ pub fn start_boot_drivers() -> usize {
         match driver_services::start(&service) {
             Ok(_) => {
                 loaded += 1;
-                if let Some(driver_node) = object_manager::lookup(&format!("\\Driver\\{service}")) {
+                if let Some(driver_node) = lifecycle::driver_node(&service) {
                     // Inicia os dispositivos já criados e tenta associar o
                     // driver ao dispositivo do HardwareId.
                     for device in io_manager::driver_devices(driver_node) {

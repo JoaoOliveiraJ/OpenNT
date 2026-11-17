@@ -320,9 +320,10 @@ pub fn native_object_path(pointer: u64) -> Option<String> {
     find_path_by_native_pointer(pointer)
 }
 
-/// Caminho completo pelo corpo nativo (\Device, \Driver e \KernelObjects).
+/// Caminho completo pelo corpo nativo (\Device, \Driver, \FileSystem e
+/// \KernelObjects).
 fn find_path_by_native_pointer(pointer: u64) -> Option<String> {
-    for root in ["\\Device", "\\Driver", "\\KernelObjects"] {
+    for root in ["\\Device", "\\Driver", "\\FileSystem", "\\KernelObjects"] {
         let Some(children) = object_manager::lookup(root).and_then(object_manager::node).and_then(|node| node.children) else { continue };
         for &child in children.values() {
             let Some(node) = object_manager::node(child) else { continue };

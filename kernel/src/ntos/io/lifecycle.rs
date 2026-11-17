@@ -26,9 +26,12 @@ use crate::ntos::mm::pe_loader::{self, LoadOptions, PeImage};
 /// Estado de um driver nativo.
 struct NativeDriver {
     name: String,
+    /// O nome do objeto no namespace (`\Driver\<serviço>`,
+    /// `\FileSystem\<serviço>` ou o ObjectName da chave).
+    object_name: String,
     node: NodeId,
     name_buffer: u64,
-    /// DriverName (`\Driver\<nome>`).
+    /// DriverName (o nome do objeto).
     object_name_buffer: u64,
     initialized: bool,
     exports: BTreeMap<String, u64>,
@@ -80,6 +83,9 @@ pub struct DriverOptions {
     pub service_name: Option<String>,
     pub registry_path: Option<String>,
     pub load: Option<LoadOptions>,
+    /// O nome do DRIVER_OBJECT; sem ele, o da chave do serviço
+    /// (`driver_load::service_driver_name`).
+    pub object_name: Option<String>,
 }
 
 /// DRIVER_OBJECT do driver em contexto ativo.
@@ -95,6 +101,15 @@ pub fn set_current_driver(driver: Option<u64>) {
 /// Nó do namespace de um DRIVER_OBJECT nativo.
 pub fn node_by_driver_object(driver: u64) -> Option<NodeId> {
     DRIVERS.lock().get(&driver).map(|entry| entry.node)
+}
+
+/// O objeto do driver do serviço `name` no namespace: o de um driver nativo
+/// carregado (em `\Driver`, em `\FileSystem` ou no ObjectName da chave),
+/// enquanto o nome dele estiver publicado; senão `\Driver\<name>` (os drivers
+/// que o próprio kernel cria).
+pub fn driver_node(name: &str) -> Option<NodeId> {
+    let candidates: Vec<(String, NodeId)> = DRIVERS.lock().values().filter(|entry| entry.name.eq_ignore_ascii_case(name)).map(|entry| (entry.object_name.clone(), entry.node)).collect();
+    candidates.into_iter().find(|(object_name, node)| object_manager::lookup(object_name) == Some(*node)).map(|(_, node)| node).or_else(|| object_manager::lookup(&format!("\\Driver\\{name}")))
 }
 
 pub fn register_reinitialization(routine: u64, context: u64) {
@@ -150,8 +165,10 @@ fn destroy_driver(driver: u64) {
     guest::free_bytes(driver);
 }
 
-/// Cria o DRIVER_OBJECT, sua extensão e o nome UTF-16 e os publica.
-pub fn begin_driver(name: &str, image_base: u64, image_size: u64, entry_point: u64) -> Result<u64, KernelError> {
+/// Cria o DRIVER_OBJECT, sua extensão e o nome UTF-16 e os publica com o
+/// nome `object_name` (`\Driver\<serviço>`, `\FileSystem\<serviço>` ou o
+/// ObjectName da chave).
+pub fn begin_driver(name: &str, object_name: &str, image_base: u64, image_size: u64, entry_point: u64) -> Result<u64, KernelError> {
     // DRIVER_OBJECT e, logo depois, a DRIVER_EXTENSION (com folga).
     let driver = guest::alloc_bytes(DriverObject::SIZE + 0x400);
     let name_units: Vec<u16> = name.encode_utf16().collect();
@@ -159,13 +176,11 @@ pub fn begin_driver(name: &str, image_base: u64, image_size: u64, entry_point: u
     // A extensão ocupa a região adicional da mesma alocação.
     let extension = driver + DriverObject::SIZE;
     guest_strings::write_wide_string(name_buffer, name);
-    // DriverName: o nome do objeto, `\Driver\<serviço>`, como o
-    // IopLoadDriver e o IoCreateDriver o gravam (o dxgkrnl reconhece o
-    // BasicDisplay por ele).
-    let object_name = format!("\\Driver\\{name}");
+    // DriverName: o nome do objeto, como o IopLoadDriver e o IoCreateDriver
+    // o gravam (o dxgkrnl reconhece o BasicDisplay por ele).
     let object_units: Vec<u16> = object_name.encode_utf16().collect();
     let object_name_buffer = guest::alloc_bytes(object_units.len() as u64 * 2 + 2);
-    guest_strings::write_wide_string(object_name_buffer, &object_name);
+    guest_strings::write_wide_string(object_name_buffer, object_name);
     // SAFETY: alocação zerada do DRIVER_OBJECT mais a extensão.
     let (object, driver_extension) = unsafe { (DriverObject::at(driver), DriverExtension::at(extension)) };
     object.type_.set(IO_TYPE_DRIVER);
@@ -188,7 +203,7 @@ pub fn begin_driver(name: &str, image_base: u64, image_size: u64, entry_point: u
     driver_extension.service_key_name.length.set(name_units.len() as u16 * 2);
     driver_extension.service_key_name.maximum_length.set(name_units.len() as u16 * 2 + 2);
     driver_extension.service_key_name.buffer.set(name_buffer);
-    let node = match io_manager::create_native_driver(name, driver) {
+    let node = match io_manager::create_native_driver(object_name, driver) {
         Ok(node) => node,
         Err(error) => {
             guest::free_bytes(name_buffer);
@@ -197,12 +212,12 @@ pub fn begin_driver(name: &str, image_base: u64, image_size: u64, entry_point: u
             return Err(error);
         }
     };
-    DRIVERS.lock().insert(driver, NativeDriver { name: name.to_string(), node, name_buffer, object_name_buffer, initialized: false, exports: BTreeMap::new(), image: None, registry_allocation: Vec::new(), import_references: 0, kernel_library_pinned: false });
+    DRIVERS.lock().insert(driver, NativeDriver { name: name.to_string(), object_name: object_name.to_string(), node, name_buffer, object_name_buffer, initialized: false, exports: BTreeMap::new(), image: None, registry_allocation: Vec::new(), import_references: 0, kernel_library_pinned: false });
     *CURRENT.lock() = Some(driver);
     // A imagem e as alocações só são liberadas quando o provedor remove a
     // última referência, inclusive depois de um unload já concluído.
     if let Err(error) = driver_objects::register(node, destroy_driver) {
-        object_manager::unlink(&format!("\\Driver\\{name}"));
+        object_manager::unlink(object_name);
         io_manager::forget_driver(node);
         DRIVERS.lock().remove(&driver);
         guest::free_bytes(name_buffer);
@@ -221,7 +236,7 @@ pub fn end_driver() {
 
 /// Endereço absoluto de um export do driver (diretório de exports real).
 pub fn get_driver_export(driver_name: &str, export_name: &str) -> u64 {
-    let Some(node) = object_manager::lookup(&format!("\\Driver\\{driver_name}")) else { return 0 };
+    let Some(node) = driver_node(driver_name) else { return 0 };
     DRIVERS.lock().values().find(|entry| entry.node == node).and_then(|entry| entry.exports.get(export_name).copied()).unwrap_or(0)
 }
 
@@ -248,10 +263,11 @@ pub fn system_driver_path(file_path: &str) -> String {
 pub fn load_driver(file_path: &str, options: &DriverOptions) -> Result<bool, LoadError> {
     let previous = *CURRENT.lock();
     let name = service_name(file_path, options);
-    if object_manager::lookup(&format!("\\Driver\\{name}")).is_some() {
-        return Err(LoadError { error: KernelError::new(format!("driver already loaded: {name}")), win32_error: 1056, ntstatus: None });
+    let object_name = options.object_name.clone().unwrap_or_else(|| super::driver_load::service_driver_name(&name));
+    if object_manager::lookup(&object_name).is_some() {
+        return Err(LoadError { error: KernelError::new(format!("driver already loaded: {object_name}")), win32_error: 1056, ntstatus: None });
     }
-    let result = load_driver_inner(file_path, &name, options);
+    let result = load_driver_inner(file_path, &name, &object_name, options);
     if let Err(error) = &result {
         let pending = DRIVERS.lock().iter().find(|(_, entry)| entry.name == name && !entry.initialized).map(|(&driver, _)| driver);
         if let Some(driver) = pending {
@@ -263,7 +279,7 @@ pub fn load_driver(file_path: &str, options: &DriverOptions) -> Result<bool, Loa
     result
 }
 
-fn load_driver_inner(file_path: &str, name: &str, options: &DriverOptions) -> Result<bool, LoadError> {
+fn load_driver_inner(file_path: &str, name: &str, object_name: &str, options: &DriverOptions) -> Result<bool, LoadError> {
     let Some(source) = kernel_image_source::source_for_path(file_path)? else {
         return Err(LoadError { error: KernelError::new(format!("driver nao encontrado: {file_path}")), win32_error: 2, ntstatus: None });
     };
@@ -279,7 +295,7 @@ fn load_driver_inner(file_path: &str, name: &str, options: &DriverOptions) -> Re
     let image = pe_loader::load_from_source(source, &load)?;
     let (image_base, size_of_image, entry_point) = (image.image_base, image.size_of_image, image.entry_point);
     let exports = image.exports.exports.clone();
-    let driver = match begin_driver(name, image_base, size_of_image, entry_point) {
+    let driver = match begin_driver(name, object_name, image_base, size_of_image, entry_point) {
         Ok(driver) => driver,
         Err(error) => {
             let mut image = image;
@@ -326,10 +342,10 @@ fn load_driver_inner(file_path: &str, name: &str, options: &DriverOptions) -> Re
 /// entrega o DRIVER_OBJECT ao provedor que controla as referências. Também é o
 /// desfecho de um IoCreateDriver cujo DriverEntry falhou.
 pub fn dispose_driver(driver: u64) {
-    let (name, node, allocations) = {
+    let (name, object_name, node, allocations) = {
         let mut drivers = DRIVERS.lock();
         let Some(entry) = drivers.get_mut(&driver) else { return };
-        (entry.name.clone(), entry.node, core::mem::take(&mut entry.registry_allocation))
+        (entry.name.clone(), entry.object_name.clone(), entry.node, core::mem::take(&mut entry.registry_allocation))
     };
     for device in io_manager::driver_devices(node) {
         if let Some(native) = io_manager::device(device).map(|entry| entry.native_device).filter(|&native| native != 0) {
@@ -340,7 +356,11 @@ pub fn dispose_driver(driver: u64) {
             }
         }
     }
-    object_manager::unlink(&format!("\\Driver\\{name}"));
+    // Só o nome deste objeto (outro driver pode ter publicado o mesmo nome
+    // depois de um unload).
+    if object_manager::lookup(&object_name) == Some(node) {
+        object_manager::unlink(&object_name);
+    }
     io_manager::forget_driver(node);
     for pointer in allocations {
         guest::free_bytes(pointer);
@@ -354,7 +374,7 @@ pub fn dispose_driver(driver: u64) {
 /// dispositivos; senão envia REMOVE_DEVICE, chama DriverUnload e retira o
 /// driver de serviço.
 pub fn unload_driver(driver_name: &str) -> bool {
-    let Some(node) = object_manager::lookup(&format!("\\Driver\\{driver_name}")) else { return false };
+    let Some(node) = driver_node(driver_name) else { return false };
     let found = DRIVERS.lock().iter().find(|(_, entry)| entry.node == node).map(|(&driver, entry)| (driver, entry.import_references, entry.kernel_library_pinned));
     let Some((driver, import_references, pinned)) = found else { return false };
     if import_references != 0 || pinned {
@@ -396,7 +416,7 @@ pub fn unload_driver(driver_name: &str) -> bool {
 /// AddDevice registrado em DriverExtension->AddDevice (o caminho real do
 /// PnP manager para instanciar um FDO sobre um PDO).
 pub fn call_add_device(driver_name: &str, physical_device: u64) -> u64 {
-    let Some(node) = object_manager::lookup(&format!("\\Driver\\{driver_name}")) else { return 0xFFFF_FFFF_C000_0034 };
+    let Some(node) = driver_node(driver_name) else { return 0xFFFF_FFFF_C000_0034 };
     let Some(driver) = DRIVERS.lock().iter().find(|(_, entry)| entry.node == node).map(|(&driver, _)| driver) else { return 0xFFFF_FFFF_C000_0034 };
     // SAFETY: DRIVER_OBJECT vivo deste registro e a extensão dele.
     let routine = unsafe { DriverExtension::at(DriverObject::at(driver).driver_extension.get()) }.add_device.get();
@@ -417,7 +437,7 @@ pub fn driver_exports(driver_name: &str) -> Option<BTreeMap<String, u64>> {
 }
 
 pub fn initialized_driver(driver_name: &str) -> Option<u64> {
-    let node = object_manager::lookup(&format!("\\Driver\\{driver_name}"))?;
+    let node = driver_node(driver_name)?;
     DRIVERS.lock().iter().find(|(_, entry)| entry.node == node && entry.initialized).map(|(&driver, _)| driver)
 }
 

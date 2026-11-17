@@ -2374,6 +2374,33 @@ fn process_information_and_driver_services(assert: Assert) {
     let key = alloc::format!("{}\\OpenNtSvcTest", service_database::ROOT);
     assert(driver_services::nt_request(&key, false) == 0 && driver_services::nt_request(&key, false) == 0xC000_010E && driver_services::nt_request(&key, true) == 0 && guest::read32(counter) == 2, "drvsvc: ZwLoadDriver/ZwUnloadDriver pelo caminho da chave");
     assert(driver_services::nt_request("\\Registry\\Machine\\Software\\X", false) == 0xC000_003A && driver_services::nt_request(&alloc::format!("{}\\NaoExiste", service_database::ROOT), false) == 0xC000_0034, "drvsvc: chave fora de Services e servico inexistente");
+    // O nome do DRIVER_OBJECT pela chave (IopGetDriverNameFromKeyNode): Type 2
+    // em \FileSystem com o nome da chave como está na hive; o ObjectName
+    // REG_SZ no lugar dele; outro tipo de ObjectName é malformado.
+    {
+        use crate::ntos::cm::registry;
+        use crate::ntos::io::driver_load;
+        use crate::ntos::ob::object_manager;
+        let file_system = service_database::install(&ConfigurationInput { name: alloc::string::String::from("OpenNtFsSvcTest"), image_path: Some(alloc::string::String::from("\\SystemRoot\\System32\\Drivers\\opennt-svc.sys")), service_type: Some(2), start: Some(3), ..Default::default() }, false);
+        let started = file_system.is_ok() && driver_services::start("OpenNtFsSvcTest").is_ok();
+        let node = object_manager::lookup("\\FileSystem\\OpenNtFsSvcTest");
+        let driver = node.and_then(object_manager::node).and_then(|node| node.data).map_or(0, |data| data.native_pointer);
+        assert(started && driver != 0 && object_manager::lookup("\\Driver\\OpenNtFsSvcTest").is_none() && guest_strings_read(at::<nt::DriverObject>(driver).driver_name.address()) == "\\FileSystem\\OpenNtFsSvcTest" && service_database::status("OpenNtFsSvcTest").is_ok_and(|status| status.current_state == 4), "drvsvc: driver de file system em \\FileSystem\\<servico>");
+        assert(driver_services::stop("OpenNtFsSvcTest").is_ok() && object_manager::lookup("\\FileSystem\\OpenNtFsSvcTest").is_none(), "drvsvc: o unload retira o \\FileSystem\\<servico>");
+        let key = registry::open(&alloc::format!("{}\\openntfssvctest", service_database::ROOT)).unwrap_or(0);
+        let by_type = driver_load::driver_name_from_key(key);
+        registry::set_value(key, "ObjectName", 2, registry::encode_wide("\\Driver\\OpenNtNamed"));
+        let expanded = driver_load::driver_name_from_key(key);
+        registry::set_value(key, "ObjectName", 1, registry::encode_wide("\\Driver\\OpenNtNamed"));
+        let named = driver_load::driver_name_from_key(key);
+        registry::delete_value(key, "ObjectName");
+        registry::delete_value(key, "Type");
+        let untyped = driver_load::driver_name_from_key(key);
+        registry::set_value(key, "Type", 4, 2u32.to_le_bytes().to_vec());
+        registry::close_handle(key);
+        assert(by_type.as_deref() == Ok("\\FileSystem\\OpenNtFsSvcTest") && expanded == Err(0xC000_0160) && named.as_deref() == Ok("\\Driver\\OpenNtNamed") && untyped == Err(0xC000_0160), "drvsvc: nome do objeto pela chave (Type, ObjectName REG_SZ, ObjectName de outro tipo, sem Type)");
+        let _ = service_database::remove("OpenNtFsSvcTest");
+    }
     let _ = service_database::remove("OpenNtSvcTest");
     guest::free_bytes(counter);
 }
