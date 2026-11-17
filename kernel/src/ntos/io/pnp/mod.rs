@@ -450,7 +450,9 @@ pub fn related_target_device(file_object: u64) -> Result<(u32, u64), crate::rtl:
     // SAFETY: DEVICE_RELATIONS devolvido pelo driver em IoStatus.Information.
     let relations = unsafe { DeviceRelations::at(information) };
     let pdo = if relations.count.get() == 1 { relations.objects[0].get() } else { 0 };
-    guest::free_bytes(information);
+    // A lista é do pool do driver que respondeu: volta pelo ExFreePool, como
+    // no PnpGetRelatedTargetDevice (rva 0x360f2c).
+    irp::free_pool(information);
     if pdo == 0 || !has_device_node(pdo) {
         return Ok((PNP_STATUS_NO_SUCH_DEVICE_TARGET, 0));
     }

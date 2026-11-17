@@ -47,11 +47,14 @@ const BUNDLED: &[&str] = &[
     "System32/drivers/wmilib.sys",
     "System32/drivers/WppRecorder.sys",
     "System32/drivers/watchdog.sys",
-    // A pilha IDE e de volumes que o PnP sobe com `--storage=real`.
+    // A pilha IDE e de volumes que o PnP sobe com `--storage=real`, e o
+    // volume.sys, o driver de função do devnode STORAGE\Volume que o
+    // volmgr.sys relata (volume.inf).
     "System32/drivers/intelide.sys",
     "System32/drivers/pciidex.sys",
     "System32/drivers/partmgr.sys",
     "System32/drivers/volmgr.sys",
+    "System32/drivers/volume.sys",
 ];
 
 /// Arquivos do volume NTFS: (caminho no volume, origem no Windows).

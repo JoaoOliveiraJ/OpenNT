@@ -14,18 +14,20 @@
 //! que o stornvme traduz em comandos NVMe). A LUN do namespace recebe o
 //! disk.sys com o classpnp.sys e o filtro partmgr.sys (GenDisk), que lê a
 //! tabela de partições e entrega a partição ao volmgr.sys, que cria o
-//! `\Device\HarddiskVolumeN` e relata o devnode STORAGE\Volume. O volume.sys
-//! (o driver de função do volume.inf) ainda fica fora do bundle: com o
-//! volume iniciado, o mountmgr.sys recebe a chegada do volume e põe na fila
-//! o WorkerThread dele, que espera até 1000 s pelo
-//! `\Device\VolumesSafeForWriteAccess` do smss, e os work items ainda rodam
-//! no contexto de boot, não em worker threads do sistema.
+//! `\Device\HarddiskVolumeN` e relata o devnode STORAGE\Volume, que o
+//! volume.inf instala com o volume.sys. Com o volume iniciado, o
+//! mountmgr.sys recebe a chegada da interface do volume e dá a ele a
+//! primeira letra livre (E:, gravada no MountedDevices), porque a
+//! reinicialização do driver (MountMgrDriverReinitialization) já ligou a
+//! atribuição automática de letras; o WorkerThread que ele põe na fila espera o
+//! `\Device\VolumesSafeForWriteAccess` numa worker thread do sistema, sem
+//! prender o boot.
 //!
 //! Os marcadores: `NVME_DISK_OK` quando o `\Device\HarddiskN\DRN` do disk.sys
 //! está sobre a LUN do storport e o setor 0 lido pela pilha é o MBR do xtask;
-//! `NVME_VOLUME_OK` quando o ntfs.sys real montou o volume da partição e um
-//! arquivo foi lido e outro gravado e lido de volta por ele (ainda não
-//! alcançado: falta o volume iniciado).
+//! `NVME_VOLUME_OK` quando o volume tem a letra do mountmgr.sys, o ntfs.sys
+//! real montou o volume da partição e leu o arquivo do xtask, e um arquivo
+//! novo foi gravado, fechado e lido de volta pela letra.
 //!
 //! Sem a opção nada disto roda e o boot comum não muda.
 
@@ -221,11 +223,25 @@ fn wait_partition_volume(disk_number: u32) -> Option<(String, u64)> {
     found
 }
 
+/// A letra que o mountmgr.sys deu ao volume `path`: o `\GLOBAL??\X:` (o
+/// `\??` e o `\DosDevices` levam a ele) que resolve no dispositivo do
+/// volume, e o valor `\DosDevices\X:` do MountedDevices com o identificador
+/// único do volume. As letras C: e D: do kernel levam aos volumes dele.
+fn drive_letter(path: &str) -> Option<(char, usize)> {
+    let target = object_manager::lookup(path)?;
+    let letter = ('C'..='Z').find(|letter| object_manager::lookup(&format!("\\GLOBAL??\\{letter}:")) == Some(target))?;
+    let unique_id = crate::ntos::cm::registry::read_value_by_path("\\Registry\\Machine\\System\\MountedDevices", &format!("\\DosDevices\\{letter}:"))?;
+    Some((letter, unique_id.data.len()))
+}
+
 /// O ntfs.sys real monta o volume da partição: abre e lê o arquivo do xtask
-/// pelo file system e grava, fecha, reabre e lê de volta um arquivo novo; o
-/// VPB do volume fica montado com o dispositivo de volume do \Driver\Ntfs.
-fn check_volume(disk_number: u32) -> Result<String, String> {
+/// pelo file system; o VPB do volume fica montado com o dispositivo de volume
+/// do \Driver\Ntfs. Depois grava, fecha, reabre e lê de volta um arquivo novo
+/// pela letra que o mountmgr.sys deu ao volume (`\??\X:`).
+fn check_volume(disk_number: u32) -> Result<(String, char), String> {
     let (path, device) = wait_partition_volume(disk_number).ok_or_else(|| format!("nenhum \\Device\\HarddiskVolumeN iniciado na particao do disco {disk_number}"))?;
+    let (letter, unique_id) = drive_letter(&path).ok_or_else(|| format!("{path} sem letra do mountmgr.sys (\\GLOBAL??\\X: e MountedDevices)"))?;
+    debug_print!("[nvme] {}: letra {}: do mountmgr.sys (MountedDevices \\DosDevices\\{}: com {} bytes de identificador)", path, letter, letter, unique_id);
     crate::ntos::cm::service::driver::start("Ntfs").map_err(|error| format!("servico Ntfs: {} ({})", error.message, error.win32))?;
     let file_system = lifecycle::initialized_driver("Ntfs").ok_or("\\Driver\\Ntfs ausente")?;
     crate::ntos::test::file_system_mount::read_known_file(device, &path, NVME_FILE, NVME_FILE_DATA)?;
@@ -238,8 +254,8 @@ fn check_volume(disk_number: u32) -> Result<String, String> {
     if vpb_flags & 1 == 0 || mounted_owner != file_system {
         return Err(format!("VPB flags {vpb_flags:#x}, dispositivo montado do driver {mounted_owner:#x} (Ntfs {file_system:#x})"));
     }
-    crate::ntos::test::file_system_mount::write_and_read_back(&path, NVME_NEW_FILE, NVME_NEW_FILE_DATA)?;
-    Ok(path)
+    crate::ntos::test::file_system_mount::write_and_read_back(&format!("\\??\\{letter}:"),NVME_NEW_FILE, NVME_NEW_FILE_DATA)?;
+    Ok((path, letter))
 }
 
 /// Antes da árvore do PnP (`device_tree::build`): o Registro das pilhas de
@@ -282,8 +298,8 @@ pub fn check() {
     debug_print!("[nvme] \\Device\\Harddisk{}\\DR{} do disk.sys sobre a LUN do storport; o setor 0 e o MBR do nvme.img", number, number);
     debug_print!("NVME_DISK_OK");
     match check_volume(number) {
-        Ok(path) => {
-            debug_print!("[nvme] {}: o ntfs.sys montou o volume da particao, leu {} e gravou e releu um arquivo novo", path, NVME_FILE);
+        Ok((path, letter)) => {
+            debug_print!("[nvme] {}: o ntfs.sys montou o volume da particao, leu {} e gravou e releu {} por {}:", path, NVME_FILE, NVME_NEW_FILE, letter);
             debug_print!("NVME_VOLUME_OK");
         }
         Err(error) => debug_print!("[nvme] volume: {}", error),

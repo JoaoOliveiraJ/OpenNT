@@ -170,12 +170,15 @@ fn nonresident(kind: u32, name: &'static str, runs: Vec<(Option<u64>, u64)>, rea
     Attribute { kind, name, body: Body::NonResident(runs, real_size) }
 }
 
-/// Runlist NTFS: contagem e delta de LCN com sinal; buraco sem LCN.
+/// Runlist NTFS: contagem e delta de LCN com sinal; buraco sem LCN. A
+/// contagem também é lida com sinal pelo ntfs.sys: o byte mais alto leva o
+/// bit de sinal livre (0xA344 clusters são três bytes, 44 A3 00; em dois, o
+/// run teria -23740 clusters e o registro seria corrompido).
 fn runlist_bytes(runs: &[(Option<u64>, u64)]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut previous = 0i64;
     for &(lcn, count) in runs {
-        let count_length = bit_length(count).div_ceil(8).max(1) as usize;
+        let count_length = ((bit_length(count) + 8) / 8).max(1) as usize;
         let count_bytes = &count.to_le_bytes()[..count_length];
         match lcn {
             None => {
