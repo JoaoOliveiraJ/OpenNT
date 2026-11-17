@@ -2072,7 +2072,7 @@ fn user_syscalls_core(assert: Assert) {
     guest::write64(rsp + 0x28, 0);
     assert(mapped && extended && refused, "usercore: ProcessDeviceMap da o C: no DriveMap com o tipo da unidade, aceita o _EX com Flags e confere Flags, comprimento e alinhamento");
     guest::write64(buffer, u64::MAX);
-    assert(call("NtQuerySystemInformation", 192, buffer, 8, info) == 0 && guest::read64(buffer) == 0 && call("NtQuerySystemInformation", 80, buffer, 22 * 8, 0) == 0 && unsafe { nt::extra_test_p7::SystemMemoryListInformation::at(buffer) }.free_page_count.get() == crate::ntos::mm::pfn::free_count() && call("NtQuerySystemInformation", 999, buffer, 8, 0) == 0xC000_0003, "usercore: recurso ausente zerado, lista de memoria e classe invalida");
+    assert(call("NtQuerySystemInformation", 192, buffer, 8, info) == 0xC000_0004 && guest::read32(info) == 0x20 && guest::read64(buffer) == u64::MAX && call("NtQuerySystemInformation", 80, buffer, 22 * 8, 0) == 0 && unsafe { nt::extra_test_p7::SystemMemoryListInformation::at(buffer) }.free_page_count.get() == crate::ntos::mm::pfn::free_count() && call("NtQuerySystemInformation", 999, buffer, 8, 0) == 0xC000_0003, "usercore: SystemFlushInformation curto recusado com 0x20, lista de memoria e classe invalida");
     guest::write32(rsp + 0x28, 80);
     guest::write64(rsp + 0x30, info);
     guest::write32(string, 4);

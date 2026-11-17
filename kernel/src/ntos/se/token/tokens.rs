@@ -53,6 +53,11 @@ pub fn stop_referencing_logon_session(pointer: u64) -> bool {
     flags & TOKEN_SESSION_NOT_REFERENCED == 0
 }
 
+/// O TokenFlags do corpo do token (o ULONG em TOKEN+0xC8).
+pub fn token_flags(pointer: u64) -> u32 {
+    body(pointer).token_flags.get()
+}
+
 /// O token ainda segura a sessão de logon dele.
 pub fn references_logon_session(token: &Token) -> bool {
     body(token.pointer).token_flags.get() & TOKEN_SESSION_NOT_REFERENCED == 0

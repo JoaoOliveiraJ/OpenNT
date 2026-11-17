@@ -48,13 +48,54 @@ pub fn entropy_registrations() -> Vec<EntropyRegistration> {
 /// SYSTEM_INFORMATION_CLASS das classes de tamanho fixo de `query_fixed`.
 pub const SYSTEM_FLAGS_INFORMATION: u32 = 9;
 pub const SYSTEM_KERNEL_DEBUGGER_INFORMATION: u32 = 35;
+pub const SYSTEM_OBJECT_SECURITY_MODE: u32 = 70;
+pub const SYSTEM_ISOLATED_USER_MODE_INFORMATION: u32 = 165;
 pub const SYSTEM_PHYSICAL_MEMORY_INFORMATION: u32 = 184;
+pub const SYSTEM_FLUSH_INFORMATION: u32 = 192;
+pub const SYSTEM_WRITE_CONSTRAINT_INFORMATION: u32 = 195;
 pub const SYSTEM_HYPERVISOR_SHARED_PAGE_INFORMATION: u32 = 197;
+
+/// ObpObjectSecurityMode: 1 na imagem do ntoskrnl; o CmControlVector o troca
+/// pelo `Session Manager\ObjectSecurityMode` da SYSTEM, quando existe.
+static OBJECT_SECURITY_MODE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
+
+/// O valor do CmControlVector (o CmGetSystemControlValues logo depois da
+/// carga da SYSTEM): os bytes do valor, até um ULONG, sobre o padrão.
+pub fn initialize_control_values() {
+    let key = "\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Session Manager";
+    if let Some(value) = crate::ntos::cm::registry::read_value_by_path(key, "ObjectSecurityMode") {
+        if !value.data.is_empty() && value.data.len() <= 4 {
+            let mut bytes = OBJECT_SECURITY_MODE.load(core::sync::atomic::Ordering::Acquire).to_le_bytes();
+            bytes[..value.data.len()].copy_from_slice(&value.data);
+            OBJECT_SECURITY_MODE.store(u32::from_le_bytes(bytes), core::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
+/// O ObpObjectSecurityMode corrente.
+pub fn object_security_mode() -> u32 {
+    OBJECT_SECURITY_MODE.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// O SYSTEM_FLUSH_INFORMATION do ExpGetSystemFlushInformation (0x20
+/// bytes): os métodos de flush (1 sempre, 2 com o bit 35 e 4 com o bit 36
+/// do KeFeatureBits), o CFlushSize do KPRCB corrente e as capacidades de
+/// flush da plataforma, que vêm da tabela NFIT do ACPI; o OpenNT ainda não as
+/// lê e, sem a tabela (o QEMU sem NVDIMM não a publica), elas são zero como
+/// no 19041.
+pub fn flush_information() -> Vec<u8> {
+    let features = crate::ntos::ke::processor_identity::feature_bits();
+    let methods: u32 = 1 | if features & 1 << 35 != 0 { 2 } else { 0 } | if features & 1 << 36 != 0 { 4 } else { 0 };
+    let mut data = alloc::vec![0u8; 0x20];
+    data[0..4].copy_from_slice(&methods.to_le_bytes());
+    data[4..8].copy_from_slice(&(crate::ntos::ke::cache_flush::cache_flush_line_size() as u32).to_le_bytes());
+    data
+}
 
 /// A classe é uma das de `query_fixed` com o buffer sondado com alinhamento
 /// 4 (a SystemKernelDebuggerInformation sonda com alinhamento 1).
 pub fn is_fixed_class(class: u32) -> bool {
-    matches!(class, SYSTEM_FLAGS_INFORMATION | SYSTEM_PHYSICAL_MEMORY_INFORMATION | SYSTEM_HYPERVISOR_SHARED_PAGE_INFORMATION)
+    matches!(class, SYSTEM_FLAGS_INFORMATION | SYSTEM_OBJECT_SECURITY_MODE | SYSTEM_ISOLATED_USER_MODE_INFORMATION | SYSTEM_PHYSICAL_MEMORY_INFORMATION | SYSTEM_FLUSH_INFORMATION | SYSTEM_WRITE_CONSTRAINT_INFORMATION | SYSTEM_HYPERVISOR_SHARED_PAGE_INFORMATION)
 }
 
 /// Classes de tamanho fixo do ExpQuerySystemInformation 19041, com o buffer
@@ -71,6 +112,18 @@ pub fn is_fixed_class(class: u32) -> bool {
 /// - SystemKernelDebuggerInformation (35, rva 0x6cb336): pelo menos 2
 ///   bytes, o KdDebuggerEnabled e o KdDebuggerNotPresent
 ///   (SYSTEM_KERNEL_DEBUGGER_INFORMATION).
+/// - SystemObjectSecurityMode (70, rva 0x6cbb93): exatamente 4 bytes, o
+///   ObpObjectSecurityMode.
+/// - SystemIsolatedUserModeInformation (165, rva 0x6cc9b0): exatamente 0x10
+///   bytes; sem o kernel seguro (VslIsSecureKernelRunning) e sem a proteção
+///   de páginas do firmware (ExpFirmwarePageProtectionSupported, de uma
+///   tabela do UEFI que o boot do OpenNT não tem), tudo zero.
+/// - SystemFlushInformation (192, rva 0x6cc82d): pelo menos 0x20 bytes, o
+///   [`flush_information`].
+/// - SystemWriteConstraintInformation (195, rva 0x6ccdc6): pelo menos 8
+///   bytes; o ExpGetSystemWriteConstraintInformation abre o
+///   `\Device\UwfvolControl` do filtro de escrita unificado e, sem ele
+///   (STATUS_OBJECT_NAME_NOT_FOUND), devolve zero.
 /// - SystemHypervisorSharedPageInformation (197, rva 0x6cced4): pelo menos
 ///   8 bytes, o endereço de usuário da página compartilhada do hypervisor
 ///   (MiState): a página de referência do QPC que a KUSER_SHARED_DATA
@@ -88,6 +141,10 @@ pub fn query_fixed(class: u32, output: u64, length: u32) -> Option<Result<(u32, 
             (0x18, true, data)
         }
         SYSTEM_KERNEL_DEBUGGER_INFORMATION => (2, false, alloc::vec![crate::ntos::kd::debugger::enabled() as u8, crate::ntos::kd::debugger::debugger_not_present() as u8]),
+        SYSTEM_OBJECT_SECURITY_MODE => (4, true, object_security_mode().to_le_bytes().to_vec()),
+        SYSTEM_ISOLATED_USER_MODE_INFORMATION => (0x10, true, alloc::vec![0u8; 0x10]),
+        SYSTEM_FLUSH_INFORMATION => (0x20, false, flush_information()),
+        SYSTEM_WRITE_CONSTRAINT_INFORMATION => (8, false, alloc::vec![0u8; 8]),
         SYSTEM_HYPERVISOR_SHARED_PAGE_INFORMATION => (8, false, crate::ntos::mm::shared_user_data::hypervisor_shared_user_va().to_le_bytes().to_vec()),
         _ => return None,
     };

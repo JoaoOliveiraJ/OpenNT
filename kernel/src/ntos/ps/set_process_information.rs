@@ -26,6 +26,12 @@
 //!   tabela de handles (processo saindo) é STATUS_PROCESS_IS_TERMINATING. O
 //!   ExEnableHandleExceptions liga HANDLE_TABLE.EnableHandleExceptions, que
 //!   não desliga mais depois de ligado.
+//! - ProcessRaiseUMExceptionOnInvalidHandleClose (71): um ULONG (outro
+//!   tamanho dá STATUS_INFO_LENGTH_MISMATCH), o handle com
+//!   PROCESS_SET_INFORMATION e, sem tabela de handles,
+//!   STATUS_PROCESS_IS_TERMINATING. O
+//!   ExEnableRaiseUMExceptionOnInvalidHandleClose desliga o bit da
+//!   HANDLE_TABLE com 0, liga com 1 e ignora outro valor.
 //! - ProcessExceptionPort (8): a porta LPC que recebe as exceções não
 //!   tratadas do processo (o csrss põe a dele, a \Windows\ApiPort, em cada
 //!   processo da sessão no CsrSbCreateSession). Como no 19041: um HANDLE (8
@@ -106,8 +112,10 @@ pub const PROCESS_FOREGROUND_INFORMATION: u32 = 25;
 pub const PROCESS_BREAK_ON_TERMINATION: u32 = 29;
 pub const PROCESS_DEBUG_FLAGS: u32 = 31;
 pub const PROCESS_HANDLE_CHECKING_MODE: u32 = 54;
+/// ProcessRaiseUMExceptionOnInvalidHandleClose (ULONG).
+pub const PROCESS_RAISE_UM_EXCEPTION_ON_INVALID_HANDLE_CLOSE: u32 = 71;
 /// As classes desta área.
-pub const CLASSES: [u32; 8] = [PROCESS_BASE_PRIORITY, PROCESS_EXCEPTION_PORT, PROCESS_DEFAULT_HARD_ERROR_MODE, PROCESS_PRIORITY_CLASS, PROCESS_FOREGROUND_INFORMATION, PROCESS_BREAK_ON_TERMINATION, PROCESS_DEBUG_FLAGS, PROCESS_HANDLE_CHECKING_MODE];
+pub const CLASSES: [u32; 9] = [PROCESS_BASE_PRIORITY, PROCESS_EXCEPTION_PORT, PROCESS_DEFAULT_HARD_ERROR_MODE, PROCESS_PRIORITY_CLASS, PROCESS_FOREGROUND_INFORMATION, PROCESS_BREAK_ON_TERMINATION, PROCESS_DEBUG_FLAGS, PROCESS_HANDLE_CHECKING_MODE, PROCESS_RAISE_UM_EXCEPTION_ON_INVALID_HANDLE_CLOSE];
 /// PROCESS_DEBUG_INHERIT, o único bit de ProcessDebugFlags.
 const PROCESS_DEBUG_INHERIT: u32 = 1;
 /// SEM_NOALIGNMENTFAULTEXCEPT do modo de erro.
@@ -210,6 +218,31 @@ fn enable_handle_exceptions(process: u64, enable: bool) -> Result<bool, KernelEr
     result.map(|()| true)
 }
 
+/// ExEnableRaiseUMExceptionOnInvalidHandleClose (ntoskrnl 19041, rva
+/// 0x68f954): sob o HandleTableLock, 0 desliga o bit
+/// RaiseUMExceptionOnInvalidHandleClose da HANDLE_TABLE, 1 liga e outro valor
+/// não muda nada. `false` quando o processo já não tem tabela de handles.
+fn raise_on_invalid_handle_close(process: u64, value: u32) -> Result<bool, KernelError> {
+    let table = process_handles::reference(process)?;
+    if table == 0 {
+        return Ok(false);
+    }
+    // SAFETY: HANDLE_TABLE do EPROCESS.ObjectTable, retida pelo rundown.
+    let handle_table = unsafe { HandleTable::at(table) };
+    let lock = handle_table.handle_table_lock.address();
+    let result = critical_region::with_critical(|| {
+        push_lock::acquire_exclusive(lock, 0)?;
+        match value {
+            0 => handle_table.set_raise_um_exception_on_invalid_handle_close(0),
+            1 => handle_table.set_raise_um_exception_on_invalid_handle_close(1),
+            _ => {}
+        }
+        push_lock::release_exclusive(lock, 0)
+    });
+    process_handles::release(process)?;
+    result.map(|()| true)
+}
+
 /// O ULONG da classe: sondado em UserMode, direto em KernelMode.
 fn read_ulong(mode: u8, buffer: u64) -> Result<Result<u32, u32>, KernelError> {
     if mode != 0 {
@@ -256,6 +289,25 @@ pub fn set_information(mode: u8, class: u32, buffer: u64, length: u32, process_o
             };
             set_default_hard_error_mode(process, value)?;
             Ok(0)
+        }
+        // O ramo da classe 71 do NtSetInformationProcess 19041 (rva
+        // 0x65b2be): exatamente 4 bytes, o handle com
+        // PROCESS_SET_INFORMATION, a tabela de handles referenciada
+        // (STATUS_PROCESS_IS_TERMINATING sem ela) e o bit ligado ou
+        // desligado sem validar o valor.
+        PROCESS_RAISE_UM_EXCEPTION_ON_INVALID_HANDLE_CLOSE => {
+            if length != 4 {
+                return Ok(STATUS_INFO_LENGTH_MISMATCH);
+            }
+            let value = match read_ulong(mode, buffer)? {
+                Ok(value) => value,
+                Err(status) => return Ok(status),
+            };
+            let process = match process_of(PROCESS_SET_INFORMATION) {
+                Ok(process) => process,
+                Err(status) => return Ok(status),
+            };
+            Ok(if raise_on_invalid_handle_close(process, value)? { 0 } else { STATUS_PROCESS_IS_TERMINATING })
         }
         PROCESS_HANDLE_CHECKING_MODE => {
             if length != 4 {

@@ -116,6 +116,59 @@ fn process_classes(assert: Assert, block: u64, call: Call) {
     assert(bad == STATUS_INVALID_PARAMETER && enabled == 0 && on && disabled == 0 && flag(), "userboot: ProcessHandleCheckingMode liga HANDLE_TABLE.EnableHandleExceptions e ele nao desliga");
     let checking = query(54, 4);
     assert(checking == 0 && guest::read32(output) == 1 && guest::read32(returned) == 0, "userboot: NtQueryInformationProcess(ProcessHandleCheckingMode) le o EnableHandleExceptions sem gravar o ReturnLength");
+    // ProcessRaiseUMExceptionOnInvalidHandleClose: 1 liga, 0 desliga, outro
+    // valor não muda o bit da HANDLE_TABLE.
+    // SAFETY: a HANDLE_TABLE do processo corrente.
+    let raise = || table != 0 && unsafe { HandleTable::at(table) }.raise_um_exception_on_invalid_handle_close() == 1;
+    let saved_raise = raise();
+    let raise_on = set(71, 1, buffer, 4);
+    let after_on = raise();
+    let raise_other = set(71, 7, buffer, 4);
+    let after_other = raise();
+    let raise_off = set(71, 0, buffer, 4);
+    let after_off = raise();
+    let raise_length = set(71, 1, buffer, 8);
+    let _ = set(71, saved_raise as u32, buffer, 4);
+    assert(raise_on == 0 && after_on && raise_other == 0 && after_other && raise_off == 0 && !after_off && raise_length == STATUS_INFO_LENGTH_MISMATCH, "userboot: ProcessRaiseUMExceptionOnInvalidHandleClose liga e desliga o bit da HANDLE_TABLE");
+    // ProcessTimes, ProcessImageFileNameWin32 e ProcessMitigationPolicy.
+    let (wide, wide_returned) = (block + 0x400, block + 0x3F0);
+    let query_wide = |class: u64, address: u64, length: u64| {
+        guest::write32(wide_returned, 0);
+        guest::write64(rsp + 0x28, wide_returned);
+        call("NtQueryInformationProcess", u64::MAX, class, address, length)
+    };
+    guest::write_bytes(wide, &[0xFF; 0x20]);
+    let times = query_wide(4, wide, 0x20);
+    let create_time = guest::read64(wide);
+    let exit_time = guest::read64(wide + 8);
+    let kernel_time = guest::read64(wide + 0x10);
+    let times_returned = guest::read32(wide_returned);
+    let increment = u64::from(crate::ntos::ke::clock::MAXIMUM_INCREMENT);
+    let quad = |time: &crate::ntos::inc::types::LargeInteger| (time.high_part.get() as u32 as u64) << 32 | time.low_part.get() as u64;
+    assert(
+        times == 0 && create_time == quad(&eprocess.create_time) && exit_time == 0 && kernel_time % increment == 0 && times_returned == 0x20 && query_wide(4, wide, 0x18) == STATUS_INFO_LENGTH_MISMATCH && query_wide(4, wide + 2, 0x20) == STATUS_DATATYPE_MISALIGNMENT,
+        "userboot: ProcessTimes com CreateTime do EPROCESS e os tempos em ticks; 0x20 bytes alinhados",
+    );
+    let image_path = crate::ntos::ps::user::process_state::get(process::get_current_process()).map(|identity| identity.image_path()).unwrap_or_default();
+    if !image_path.is_empty() {
+        let required = (image_path.trim_start_matches("\\??\\").encode_utf16().count() as u32 + 1) * 2 + 0x10;
+        let short = query_wide(43, wide, 0x10);
+        let short_returned = guest::read32(wide_returned);
+        let full = query_wide(43, wide, 0x200);
+        let text_length = u32::from(guest::read16(wide));
+        assert(short == STATUS_INFO_LENGTH_MISMATCH && short_returned == required && full == 0 && text_length + 0x12 == required && guest::read64(wide + 8) == wide + 0x10, "userboot: ProcessImageFileNameWin32 com o UNICODE_STRING e o texto depois dele");
+    }
+    let mitigation = |policy: u32| {
+        guest::write32(wide, policy);
+        guest::write32(wide + 4, 0xFFFF_FFFF);
+        (query_wide(52, wide, 8), guest::read32(wide + 4), guest::read32(wide_returned))
+    };
+    let flags = eprocess.mitigation_flags.get();
+    let aslr = mitigation(1);
+    let expected_aslr = (flags & 0x40 == 0) as u32 | if flags & 0x10 != 0 { 2 } else { 0 } | if flags & 0x20 != 0 { 4 } else { 0 } | if flags & 8 != 0 { 8 } else { 0 };
+    let unsupported = mitigation(5);
+    let dep = mitigation(0);
+    assert(aslr == (0, expected_aslr, 0) && unsupported.0 == 0xC000_00BB && dep.0 == 0xC000_00BB && query_wide(52, wide, 4) == STATUS_INFO_LENGTH_MISMATCH, "userboot: ProcessMitigationPolicy le as flags do EPROCESS por politica; 0 e 5 sem consulta");
     // ThreadBreakOnTermination na thread corrente, desligado no fim.
     // SAFETY: a ETHREAD da thread corrente.
     let ethread = unsafe { Ethread::at(process::get_current_thread()) };
@@ -172,6 +225,37 @@ fn system_classes(assert: Assert, block: u64, call: Call) {
         debugger == 0 && debugger_enabled == crate::ntos::kd::debugger::enabled() as u8 && debugger_absent == crate::ntos::kd::debugger::debugger_not_present() as u8 && debugger_returned == 2 && guest::read8(buffer + 3) == 0xFF && debugger_short == STATUS_INFO_LENGTH_MISMATCH && guest::read32(returned) == 2,
         "userboot: SystemKernelDebuggerInformation com o KdDebuggerEnabled e o KdDebuggerNotPresent",
     );
+    // SystemObjectSecurityMode, SystemIsolatedUserModeInformation,
+    // SystemFlushInformation e SystemWriteConstraintInformation.
+    let security_mode = query(70, buffer, 4);
+    let security_value = guest::read32(buffer);
+    let security_long = query(70, buffer, 8);
+    assert(security_mode == 0 && security_value == crate::ntos::ex::system_information::object_security_mode() && security_long == STATUS_INFO_LENGTH_MISMATCH && guest::read32(returned) == 4, "userboot: SystemObjectSecurityMode devolve o ObpObjectSecurityMode em exatamente 4 bytes");
+    guest::write_bytes(buffer, &[0xFF; 0x20]);
+    let isolated = query(165, buffer, 0x10);
+    let isolated_zero = guest::read64(buffer) == 0 && guest::read64(buffer + 8) == 0;
+    assert(isolated == 0 && isolated_zero && guest::read32(returned) == 0x10 && query(165, buffer, 0x20) == STATUS_INFO_LENGTH_MISMATCH, "userboot: SystemIsolatedUserModeInformation zerado sem o kernel seguro");
+    guest::write_bytes(buffer, &[0xFF; 0x28]);
+    let flush = query(192, buffer, 0x28);
+    let flush_expected = crate::ntos::ex::system_information::flush_information();
+    let flush_bytes = (0..0x20u64).map(|offset| guest::read8(buffer + offset)).collect::<alloc::vec::Vec<u8>>();
+    assert(flush == 0 && flush_bytes == flush_expected && flush_bytes[0] & 1 == 1 && guest::read32(returned) == 0x20 && query(192, buffer, 0x1F) == STATUS_INFO_LENGTH_MISMATCH, "userboot: SystemFlushInformation com os metodos do KeFeatureBits e o CFlushSize");
+    guest::write64(buffer, u64::MAX);
+    let constraint = query(195, buffer, 8);
+    assert(constraint == 0 && guest::read64(buffer) == 0 && guest::read32(returned) == 8 && query(195, buffer, 4) == STATUS_INFO_LENGTH_MISMATCH, "userboot: SystemWriteConstraintInformation zero sem o \\Device\\UwfvolControl");
+    // NtQuerySystemEnvironmentValueEx: com o SeSystemEnvironmentPrivilege, o
+    // firmware BIOS responde STATUS_NOT_IMPLEMENTED sem tocar os argumentos;
+    // sem ele (e fora de SeUserModeDriversSid), STATUS_PRIVILEGE_NOT_HELD.
+    // O PreviousMode de uma syscall de modo usuário (o RtlCheckTokenMembershipEx
+    // em KernelMode concede sempre).
+    // SAFETY: a ETHREAD da thread corrente.
+    let previous = &unsafe { Ethread::at(process::get_current_thread()) }.tcb.previous_mode;
+    let saved_previous = previous.get();
+    previous.set(1);
+    let environment = call("NtQuerySystemEnvironmentValueEx", 0, 0, 0, 0);
+    previous.set(saved_previous);
+    let environment_held = crate::ntos::se::privilege::single_privilege_check(22, 1);
+    assert(environment == if environment_held { 0xC000_0002 } else { STATUS_PRIVILEGE_NOT_HELD }, "userboot: NtQuerySystemEnvironmentValueEx confere o privilegio antes do firmware BIOS");
 }
 
 /// O ETIMER de modo usuário: o TimerType acima de SynchronizationTimer e o

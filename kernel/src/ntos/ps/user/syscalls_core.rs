@@ -432,14 +432,6 @@ fn query_system_information(class: u32, buffer: u64, length: u64, returned: u64)
             }
             _ => {
                 crate::debug_print!("[usermode] NtQuerySystemInformation classe {} (nao coberta ainda)", class);
-                // SystemFlushInformation ainda sem os bits de flush da CPU
-                // (KeFeatureBits, KPRCB.CFlushSize): buffer zerado, nunca
-                // INVALID_INFO_CLASS (a 24H2 trata como fatal no loader).
-                if class == 192 {
-                    guest::try_write_bytes(buffer, &alloc::vec![0; length as usize])?;
-                    set_returned(length as u32)?;
-                    return Ok(STATUS_SUCCESS);
-                }
                 // SystemMemoryListInformation.
                 if class == 80 {
                     let size = SystemMemoryListInformation::SIZE;
@@ -464,6 +456,13 @@ const TOPOLOGY_SCRATCH_LIMIT: u32 = 0x1_0000;
 /// NtQuerySystemInformationEx(class, input, inputLength, buffer, length,
 /// returnLength*): a topologia de processadores e, no resto, a variante
 /// sem entrada.
+/// NtQuerySystemEnvironmentValueEx(VariableName, VendorGuid, Value,
+/// ValueLength, Attributes): o acesso e o firmware em
+/// `hal/firmware_environment.rs`; no BIOS nenhum argumento é tocado.
+fn nt_query_system_environment_value_ex(_name: u64, _guid: u64, _value: u64, _length: u64, _rsp: u64) -> Result<u32, KernelError> {
+    crate::hal::firmware_environment::query_user()
+}
+
 fn nt_query_system_information_ex(class: u64, input: u64, input_length: u64, buffer: u64, rsp: u64) -> Result<u32, KernelError> {
     let length = state::stack_arg32(rsp, 5) as u64;
     let returned = stack_arg(rsp, 6);
@@ -609,6 +608,36 @@ fn nt_query_information_process(handle: u64, class: u64, buffer: u64, length: u6
                     super::handles::process_pointer(handle, access)
                 }
             })
+        });
+    }
+    // ProcessTimes, ProcessImageFileNameWin32 e ProcessMitigationPolicy
+    // (`ps/query_process`): o ProbeForWrite de alinhamento 4 só pela faixa e
+    // o ReturnLength sondado antes da classe.
+    use crate::ntos::ps::query_process;
+    if matches!(class, query_process::PROCESS_TIMES | query_process::PROCESS_IMAGE_FILE_NAME_WIN32 | query_process::PROCESS_MITIGATION_POLICY) {
+        if length != 0 {
+            if buffer & 3 != 0 {
+                return Ok(0x8000_0002);
+            }
+            let end = buffer.wrapping_add(length);
+            if end > memory_map::USER_ADDRESS_LIMIT || end < buffer {
+                return Ok(0xC000_0005);
+            }
+        }
+        if returned != 0 && !probe_user_write(returned, 4) {
+            return Ok(0xC000_0005);
+        }
+        let process_of = |access: u32| {
+            if handle as u32 == u32::MAX {
+                Ok(crate::ntos::ps::process::get_current_process())
+            } else {
+                super::handles::process_pointer(handle, access)
+            }
+        };
+        return state::guarded(|| match class {
+            query_process::PROCESS_TIMES => query_process::query_times(buffer, length as u32, returned, process_of),
+            query_process::PROCESS_IMAGE_FILE_NAME_WIN32 => query_process::query_image_file_name_win32(buffer, length as u32, returned, process_of),
+            _ => query_process::query_mitigation_policy(buffer, length as u32, process_of),
         });
     }
     state::guarded(|| match class {
@@ -1028,7 +1057,7 @@ fn nt_apphelp_cache_control(service: u64, data: u64, _a3: u64, _a4: u64, _rsp: u
 }
 
 pub fn init() {
-    let handlers: [(&'static str, state::SyscallHandler); 31] = [
+    let handlers: [(&'static str, state::SyscallHandler); 32] = [
         ("NtQueryDirectoryObject", nt_query_directory_object),
         ("NtApphelpCacheControl", nt_apphelp_cache_control),
         ("NtQueryLicenseValue", nt_query_license_value),
@@ -1043,6 +1072,7 @@ pub fn init() {
         ("NtWaitForMultipleObjects", nt_wait_for_multiple_objects),
         ("NtQuerySystemInformation", nt_query_system_information),
         ("NtQuerySystemInformationEx", nt_query_system_information_ex),
+        ("NtQuerySystemEnvironmentValueEx", nt_query_system_environment_value_ex),
         ("NtSetSystemInformation", nt_set_system_information),
         ("NtSerializeBoot", nt_serialize_boot),
         ("NtRaiseHardError", nt_raise_hard_error),

@@ -65,6 +65,40 @@ pub fn set(_name: u64, _guid: u64, _value: u64, _length: u32, _attributes: u32) 
     Err(KernelError::new("firmware variable provider unavailable"))
 }
 
+/// NtQuerySystemEnvironmentValueEx de modo usuário (ntoskrnl 19041, rva
+/// 0x6a3220): o acesso vem do SeSystemEnvironmentPrivilege do chamador ou,
+/// sem ele, de ser membro de SeUserModeDriversSid (S-1-5-84-0-0-0-0-0, o
+/// RtlCheckTokenMembershipEx do token efetivo). O ExpFirmwareAccessAppContainerCheck
+/// de um AppContainer ainda falta no OpenNT, que segue para a mesma checagem
+/// de membro. Sem acesso, STATUS_PRIVILEGE_NOT_HELD; com ele, o firmware BIOS
+/// dá STATUS_NOT_IMPLEMENTED antes de tocar os argumentos.
+pub fn query_user() -> Result<u32, KernelError> {
+    const SE_SYSTEM_ENVIRONMENT_PRIVILEGE: u64 = 22;
+    if !crate::ntos::se::privilege::single_privilege_check(SE_SYSTEM_ENVIRONMENT_PRIVILEGE, 1) && !user_mode_driver_member()? {
+        return Ok(0xC000_0061);
+    }
+    if firmware_type()? == 1 {
+        return Ok(0xC000_0002);
+    }
+    Err(KernelError::new("firmware variable provider unavailable"))
+}
+
+/// O token efetivo da thread tem o SeUserModeDriversSid.
+fn user_mode_driver_member() -> Result<bool, KernelError> {
+    use crate::ntos::mm::guest_memory as guest;
+    let sid = crate::ntos::se::model::sid(5, &[84, 0, 0, 0, 0, 0]);
+    let block = guest::alloc_bytes(sid.len() as u64 + 8);
+    if block == 0 {
+        return Ok(false);
+    }
+    guest::write_bytes(block, &sid);
+    guest::write8(block + sid.len() as u64, 0);
+    let status = crate::ntos::se::capability::token_checks::check_membership(0, block, 0, block + sid.len() as u64)?;
+    let member = status & 0x8000_0000 == 0 && guest::read8(block + sid.len() as u64) != 0;
+    guest::free_bytes(block);
+    Ok(member)
+}
+
 /// Sem sondagem, conversão de nome, alocação nem modificação de saídas,
 /// inclusive com argumentos NULL ou desalinhados.
 pub fn query(_name: u64, _guid: u64, _value: u64, _length: u64, _attributes: u64) -> Result<u32, KernelError> {

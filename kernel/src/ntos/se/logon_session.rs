@@ -126,7 +126,7 @@ pub fn exists(logon_id: u64, server_silo: u64) -> bool {
 }
 
 /// TokenInUse: o token é o primário de algum processo vivo.
-fn token_in_use(token: u64) -> bool {
+pub fn token_in_use(token: u64) -> bool {
     process::list_active_processes().iter().any(|entry| process::get_primary_token(entry.address) == Some(token))
 }
 

@@ -21,6 +21,11 @@
 //!   TokenFlags, o SepStopReferencingLogonSession). O LSA faz isso com o
 //!   token de cada sessão que guarda (o LsapSetSessionToken), e a sessão
 //!   pode ser apagada com esse token vivo.
+//! - TokenMandatoryPolicy (27): o ULONG (4 bytes), com o SeTcbPrivilege; um
+//!   token que já é o primário de um processo dá
+//!   STATUS_TOKEN_ALREADY_IN_USE e bits fora de
+//!   TOKEN_MANDATORY_POLICY_VALID_MASK (3) dão STATUS_INVALID_PARAMETER (o
+//!   SeSetMandatoryPolicyToken).
 //! - TokenSecurityAttributes (39): o
 //!   TOKEN_SECURITY_ATTRIBUTES_AND_OPERATION_INFORMATION (16 bytes: os
 //!   atributos e o vetor de operações), com o SeTcbPrivilege. As operações,
@@ -53,6 +58,9 @@ const STATUS_INVALID_PRIMARY_GROUP: u32 = 0xC000_005B;
 const STATUS_PRIVILEGE_NOT_HELD: u32 = 0xC000_0061;
 const STATUS_INVALID_ACL: u32 = 0xC000_0077;
 const STATUS_INVALID_SID: u32 = 0xC000_0078;
+const STATUS_TOKEN_ALREADY_IN_USE: u32 = 0xC000_012B;
+/// TOKEN_MANDATORY_POLICY_VALID_MASK (NO_WRITE_UP | NEW_PROCESS_MIN).
+const TOKEN_MANDATORY_POLICY_VALID_MASK: u32 = 3;
 const STATUS_NOT_FOUND: u32 = 0xC000_0225;
 /// As classes do NtSetInformationToken 19041 (bit = classe).
 const VALID_CLASSES: u64 = 0x2480_0F8B_5070;
@@ -193,6 +201,27 @@ pub fn set(token: u64, class: u32, information: u64, length: u32, mode: u8) -> R
             }
             tokens::stop_referencing_logon_session(token);
             return Ok(0);
+        }
+        // TokenMandatoryPolicy (o ramo da classe 27 do NtSetInformationToken
+        // 19041): um ULONG, o SeTcbPrivilege, o token ainda não primário de
+        // um processo (STATUS_TOKEN_ALREADY_IN_USE) e o
+        // SeSetMandatoryPolicyToken, que só aceita os bits
+        // TOKEN_MANDATORY_POLICY_VALID_MASK (3) e troca o ModifiedId.
+        27 => {
+            if length != 4 {
+                return Ok(STATUS_INFO_LENGTH_MISMATCH);
+            }
+            let Ok(policy) = guest::try_read::<u32>(information) else { return Ok(STATUS_ACCESS_VIOLATION) };
+            if !tcb() {
+                return Ok(STATUS_PRIVILEGE_NOT_HELD);
+            }
+            if crate::ntos::se::logon_session::token_in_use(token) {
+                return Ok(STATUS_TOKEN_ALREADY_IN_USE);
+            }
+            if policy & !TOKEN_MANDATORY_POLICY_VALID_MASK != 0 {
+                return Ok(STATUS_INVALID_PARAMETER);
+            }
+            tokens::update(token, |record| record.mandatory_policy = policy).map_or(STATUS_INVALID_PARAMETER, |_| 0)
         }
         39 => {
             if information == 0 || length < 16 {

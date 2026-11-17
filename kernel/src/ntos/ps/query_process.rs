@@ -315,3 +315,199 @@ pub fn query_command_line(process: &Eprocess, output: u64, buffer_length: u32, a
     rundown::release(rundown_pointer)?;
     result
 }
+
+// ---- Classes de modo usuário do NtQueryInformationProcess -----------------
+//
+// As três abaixo recebem o buffer e o ReturnLength já sondados pelo
+// adaptador de modo usuário (o ProbeForWrite de alinhamento 4 e a faixa) e
+// gravam com escrita sondada; `process_of` resolve o handle com o acesso
+// pedido para o EPROCESS, retido enquanto dura a chamada.
+
+/// ProcessTimes (4), ProcessImageFileNameWin32 (43) e
+/// ProcessMitigationPolicy (52).
+pub const PROCESS_TIMES: u32 = 4;
+pub const PROCESS_IMAGE_FILE_NAME_WIN32: u32 = 43;
+pub const PROCESS_MITIGATION_POLICY: u32 = 52;
+
+/// ProcessTimes (o ramo da classe 4, rva 0x62221e): exatamente os 0x20
+/// bytes do KERNEL_USER_TIMES, o handle com
+/// PROCESS_QUERY_LIMITED_INFORMATION; CreateTime e ExitTime do EPROCESS e os
+/// tempos de kernel e de usuário do PsQueryRuntimeProcess (as threads vivas
+/// e as que já saíram, em ticks) vezes o KeMaximumIncrement. ReturnLength
+/// 0x20.
+pub fn query_times(output: u64, length: u32, returned: u64, process_of: impl FnOnce(u32) -> Result<u64, u32>) -> Result<u32, KernelError> {
+    if length != 0x20 {
+        return Ok(STATUS_INFO_LENGTH_MISMATCH);
+    }
+    let process = match process_of(PROCESS_QUERY_LIMITED_INFORMATION) {
+        Ok(process) => process,
+        Err(status) => return Ok(status),
+    };
+    let increment = u64::from(crate::ntos::ke::clock::MAXIMUM_INCREMENT);
+    let (kernel, user, _) = process::statistics(process);
+    // SAFETY: EPROCESS retido pelo handle que o nomeou (ou o corrente).
+    let eprocess = unsafe { Eprocess::at(process) };
+    let quad = |time: &crate::ntos::inc::types::LargeInteger| (time.high_part.get() as u32 as u64) << 32 | time.low_part.get() as u64;
+    let times = [quad(&eprocess.create_time), quad(&eprocess.exit_time), (kernel / increment & 0xFFFF_FFFF) * increment, (user / increment & 0xFFFF_FFFF) * increment];
+    for (index, value) in times.iter().enumerate() {
+        guest::try_write::<u64>(output + index as u64 * 8, *value)?;
+    }
+    if returned != 0 {
+        guest::try_write::<u32>(returned, 0x20)?;
+    }
+    Ok(0)
+}
+
+/// ProcessImageFileNameWin32 (o ramo da classe 43, rva 0x621a90): o handle
+/// com PROCESS_QUERY_LIMITED_INFORMATION e o nome DOS da imagem (o
+/// IoQueryFileDosDeviceName do arquivo da imagem; aqui o caminho DOS que o
+/// processo recebeu na criação, o ImagePathName). O tamanho pedido é
+/// MaximumLength + 0x10 (o UNICODE_STRING e o texto com o terminador), que
+/// vai ao ReturnLength também na recusa; menor que isso dá
+/// STATUS_INFO_LENGTH_MISMATCH.
+pub fn query_image_file_name_win32(output: u64, length: u32, returned: u64, process_of: impl FnOnce(u32) -> Result<u64, u32>) -> Result<u32, KernelError> {
+    let process = match process_of(PROCESS_QUERY_LIMITED_INFORMATION) {
+        Ok(process) => process,
+        Err(status) => return Ok(status),
+    };
+    let path = crate::ntos::ps::user::process_state::get(process).map(|identity| identity.image_path()).unwrap_or_default();
+    let path = path.strip_prefix("\\??\\").unwrap_or(&path);
+    if path.is_empty() {
+        return Ok(STATUS_NOT_FOUND);
+    }
+    let units: alloc::vec::Vec<u16> = path.encode_utf16().collect();
+    let text_length = (units.len() * 2) as u32;
+    let maximum = text_length + 2;
+    let required = maximum + 0x10;
+    let status = if required > length {
+        STATUS_INFO_LENGTH_MISMATCH
+    } else {
+        let mut bytes: alloc::vec::Vec<u8> = units.iter().flat_map(|unit| unit.to_le_bytes()).collect();
+        bytes.extend_from_slice(&[0, 0]);
+        guest::try_write::<u16>(output, text_length as u16)?;
+        guest::try_write::<u16>(output + 2, maximum as u16)?;
+        guest::try_write_bytes(output + 0x10, &bytes)?;
+        guest::try_write::<u64>(output + 8, output + 0x10)?;
+        0
+    };
+    if returned != 0 {
+        guest::try_write::<u32>(returned, required)?;
+    }
+    Ok(status)
+}
+
+/// PROCESS_MITIGATION_POLICY sem consulta (as políticas 0, 5 e acima de 16).
+const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
+
+/// Os bits de saída ligados pelos bits de origem: em cada grupo, o primeiro
+/// (bit de origem, bit de saída) que casar (os pares de imposto ou
+/// auditoria do 19041 são exclusivos).
+fn mitigation_bits(source: u32, groups: &[&[(u32, u32)]]) -> u32 {
+    groups.iter().fold(0, |flags, group| flags | group.iter().find(|(bit, _)| source & (1 << bit) != 0).map_or(0, |(_, out)| *out))
+}
+
+/// ProcessMitigationPolicy (o ramo da classe 52 do NtQueryInformationProcess
+/// 19041, rva 0x6239a5): exatamente os 8 bytes do
+/// PROCESS_MITIGATION_POLICY_INFORMATION, a política lida do buffer; um
+/// handle que não é o pseudo-handle -1 pede
+/// PROCESS_QUERY_LIMITED_INFORMATION. As flags (o segundo ULONG) saem, por
+/// política, dos bits do EPROCESS (MitigationFlags, MitigationFlags2 e
+/// MitigationFlags3), da tabela de handles, do nível de assinatura e do
+/// TokenFlags do token primário, como a tabela de saltos do 19041; o
+/// ReturnLength não é gravado.
+pub fn query_mitigation_policy(output: u64, length: u32, process_of: impl FnOnce(u32) -> Result<u64, u32>) -> Result<u32, KernelError> {
+    if length != 8 {
+        return Ok(STATUS_INFO_LENGTH_MISMATCH);
+    }
+    let policy = guest::try_read::<u32>(output)?;
+    let process = match process_of(PROCESS_QUERY_LIMITED_INFORMATION) {
+        Ok(process) => process,
+        Err(status) => return Ok(status),
+    };
+    // SAFETY: EPROCESS retido pelo handle que o nomeou (ou o corrente).
+    let eprocess = unsafe { Eprocess::at(process) };
+    let (first, second, third) = (eprocess.mitigation_flags.get(), eprocess.mitigation_flags2.get(), eprocess.mitigation_flags3.get());
+    let token_flags = || process::get_primary_token(process).map_or(0, crate::ntos::se::token::tokens::token_flags);
+    let flags = match policy {
+        // ProcessASLRPolicy: BottomUp com StackRandomizationDisabled (bit 6)
+        // desligado, ForceRelocateImages (4), HighEntropy (5) e
+        // DisallowStrippedImages (3).
+        1 => (first & 0x40 == 0) as u32 | mitigation_bits(first, &[&[(4, 2)], &[(5, 4)], &[(3, 8)]]),
+        // ProcessDynamicCodePolicy.
+        2 => mitigation_bits(first, &[&[(8, 1), (11, 8)], &[(9, 2)], &[(10, 4)]]),
+        // ProcessStrictHandleCheckPolicy: o ExQueryHandleExceptionsPermanency
+        // (sem DebugInfo no OpenNT, o EnableHandleExceptions vale pelos dois
+        // bits).
+        3 => {
+            let table = crate::ntos::ob::handles::process::reference(process)?;
+            if table == 0 {
+                return Ok(STATUS_PROCESS_IS_TERMINATING);
+            }
+            // SAFETY: HANDLE_TABLE do EPROCESS.ObjectTable, retida pelo rundown.
+            let enabled = unsafe { crate::ntos::inc::types::HandleTable::at(table) }.enable_handle_exceptions() != 0;
+            crate::ntos::ob::handles::process::release(process)?;
+            if enabled {
+                3
+            } else {
+                0
+            }
+        }
+        // ProcessSystemCallDisablePolicy: as chamadas do win32k (bits 12 e
+        // 13) e os bits 1 e 2 do MitigationFlags3.
+        4 => mitigation_bits(first, &[&[(12, 1), (13, 2)]]) | mitigation_bits(third, &[&[(1, 4), (2, 8)]]),
+        // ProcessExtensionPointDisablePolicy.
+        6 => mitigation_bits(first, &[&[(7, 1)]]),
+        // ProcessControlFlowGuardPolicy.
+        7 => mitigation_bits(first, &[&[(0, 1)], &[(1, 2)], &[(2, 4)]]),
+        // ProcessSignaturePolicy (o PsQueryProcessSignatureMitigationPolicy):
+        // MicrosoftSignedOnly com os dois níveis de assinatura a partir de 8;
+        // sem a rotina de comparação do CI (SeCiCallbacks), os modos
+        // auditoria; e o MitigationOptIn (bit 23).
+        8 => {
+            let microsoft = eprocess.signature_level.get() >= 8 && eprocess.section_signature_level.get() >= 8;
+            let primary = if microsoft { 1 } else { mitigation_bits(first, &[&[(24, 8), (25, 0x10)]]) };
+            primary | mitigation_bits(first, &[&[(23, 4)]])
+        }
+        // ProcessFontDisablePolicy.
+        9 => mitigation_bits(first, &[&[(16, 1), (17, 2)]]),
+        // ProcessImageLoadPolicy.
+        10 => mitigation_bits(first, &[&[(19, 1), (20, 8)], &[(21, 2), (22, 0x10)], &[(18, 4)]]),
+        // ProcessSystemCallFilterPolicy: o PsGetWin32KFilterSet, que lê o
+        // processo corrente.
+        // SAFETY: o EPROCESS do processo corrente.
+        11 => unsafe { Eprocess::at(process::get_current_process()) }.win32_k_filter_set.get() & 0xF,
+        // ProcessPayloadRestrictionPolicy.
+        12 => mitigation_bits(second, &[&[(0, 1)], &[(2, 4)], &[(10, 0x10)], &[(4, 0x40)], &[(6, 0x100)], &[(8, 0x400)], &[(1, 2)], &[(3, 8)], &[(11, 0x20)], &[(5, 0x80)], &[(7, 0x200)], &[(9, 0x800)]]),
+        // ProcessChildProcessPolicy (o PspGetNoChildProcessRestrictedPolicy
+        // do TokenFlags: restrito no bit 19, exceto seguros no 20, auditoria
+        // no 21).
+        13 => {
+            let flags = token_flags();
+            match (flags & 1 << 19 != 0, flags & 1 << 20 != 0, flags & 1 << 21 != 0) {
+                (true, false, _) => 1,
+                (true, true, _) => 5,
+                (false, _, true) => 2,
+                _ => 0,
+            }
+        }
+        // ProcessSideChannelIsolationPolicy.
+        14 => mitigation_bits(first, &[&[(30, 1)], &[(31, 2)]]) | mitigation_bits(second, &[&[(12, 4)], &[(13, 8)]]),
+        // ProcessUserShadowStackPolicy.
+        15 => mitigation_bits(second, &[&[(14, 1)], &[(15, 2)], &[(17, 4)], &[(18, 8)], &[(20, 0x10)], &[(21, 0x20)], &[(22, 0x40)], &[(23, 0x80)], &[(30, 0x100)], &[(31, 0x200)]]),
+        // ProcessRedirectionTrustPolicy (o PspGetRedirectionTrustPolicy do
+        // TokenFlags: imposto no bit 23, auditoria no 24).
+        16 => {
+            let flags = token_flags();
+            if flags & 1 << 23 != 0 {
+                1
+            } else if flags & 1 << 24 != 0 {
+                2
+            } else {
+                0
+            }
+        }
+        _ => return Ok(STATUS_NOT_SUPPORTED),
+    };
+    guest::try_write::<u32>(output + 4, flags)?;
+    Ok(0)
+}
