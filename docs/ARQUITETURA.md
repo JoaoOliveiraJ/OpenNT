@@ -3692,7 +3692,10 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   assinatura e fontes, com as recusas do 19041); a ProcessBasePriority
   (`ps/set_process_information.rs`); o pacote de espera sobre um processo
   (`ps/user/wait_packets.rs`: o pool de threads do wininit espera assim o
-  fim do services.exe); e o diretório `\Security` com o evento
+  fim do services.exe), que aceita qualquer objeto com objeto de espera de
+  verdade (o `ob/wait.rs::wait_object_of`, com o FILE_OBJECT.Event de um
+  arquivo) e recusa só mutant e fila (STATUS_INVALID_PARAMETER_3), como o
+  19041; e o diretório `\Security` com o evento
   `LSA_AUTHENTICATION_INITIALIZED` do SepInitializationPhase1
   (`se/initialization.rs`), que o lsass.exe abre. Os dados vêm desta máquina
   no build: o contexto de ativação padrão do sistema, que o sxssrv.dll gera

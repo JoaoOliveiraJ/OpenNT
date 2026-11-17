@@ -15,10 +15,10 @@ use crate::ntos::ke::dispatcher;
 use crate::ntos::ob::objects::completion::{self as completion_objects, Packet};
 use crate::ntos::ob::objects::dispatcher as dispatcher_objects;
 use crate::ntos::ob::objects::work::{self as work_objects, Association, Held, Queued, WaitPacket};
-use crate::ntos::ob::{object_reference, open_pointer, reference_trace};
+use crate::ntos::ob::{object_reference, open_pointer, reference_trace, wait as ob_wait};
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::types::ObjectAttributes;
+use crate::ntos::inc::types::{DispatcherHeader, NtStruct, ObjectAttributes};
 
 /// Associações pendentes, na ordem de inserção.
 static PENDING: SpinLock<Vec<Arc<WaitPacket>>> = SpinLock::new(Vec::new());
@@ -131,32 +131,31 @@ fn nt_associate_wait_completion_packet(handle: u64, port_handle: u64, target_han
         return Ok(0xC000_0005);
     }
     let already = state::stack_arg(rsp, 8);
-    if already != 0 && !probe_user_write(already, 1) {
-        return Ok(0xC000_0005);
-    }
     let completion = (state::syscall_arg_words(rsp, 4), state::syscall_arg_words(rsp, 5), state::stack_arg32(rsp, 6), state::syscall_arg_words(rsp, 7));
     let signaled = match associate(handle, port_handle, target_handle, completion, 1) {
         Ok(signaled) => signaled,
         Err(status) => return Ok(status),
     };
-    // BOOLEAN *AlreadySignaled (sondado acima).
-    if already != 0 && guest::try_write::<u8>(already, signaled as u8).is_err() {
+    // BOOLEAN *AlreadySignaled, sondado só na gravação, depois da
+    // associação, como no 19041.
+    if already != 0 && (!probe_user_write(already, 1) || guest::try_write::<u8>(already, signaled as u8).is_err()) {
         return Ok(0xC000_0005);
     }
     Ok(0)
 }
 
-/// O núcleo do NtAssociateWaitCompletionPacket (e do Zw): associa o pacote
-/// ao objeto esperável e à IOCP, com a conclusão (chave, contexto, status e
-/// informação) que vai para a fila quando o objeto sinaliza. Devolve se ele
-/// já estava sinalizado (o pacote foi para a fila na hora).
+/// O núcleo do NtAssociateWaitCompletionPacket (e do Zw), na ordem do
+/// 19041 (rva 0x2ed670): o pacote, a IOCP (IO_COMPLETION_MODIFY_STATE) e o
+/// alvo (SYNCHRONIZE, de qualquer tipo). O alvo precisa de um objeto de
+/// espera de verdade (ObpGetWaitObject, `ob::wait::wait_object_of`) que não
+/// seja mutant nem fila, senão STATUS_INVALID_PARAMETER_3; um pacote já
+/// associado ou na fila dá STATUS_INVALID_PARAMETER_1. A conclusão (chave,
+/// contexto, status e informação) vai para a fila quando o objeto sinaliza.
+/// Devolve se ele já estava sinalizado (o pacote foi para a fila na hora).
 /// `previous_mode`: o do Nt (UserMode) ou do Zw (KernelMode), para o alvo
 /// fora da tabela de usuário.
 pub fn associate(handle: u64, port_handle: u64, target_handle: u64, completion: ([u32; 2], [u32; 2], u32, [u32; 2]), previous_mode: u8) -> Result<bool, u32> {
     let packet = resolve(handle)?;
-    if packet.association().is_some() || packet.queued().is_some() {
-        return Err(0xC000_000D);
-    }
     let (port_entry, port) = match state::get_user_handle(port_handle) {
         Some(_) => {
             let (entry, port) = io_completion::resolve(port_handle, IO_COMPLETION_MODIFY_STATE)?;
@@ -174,27 +173,28 @@ pub fn associate(handle: u64, port_handle: u64, target_handle: u64, completion: 
         }
     };
     let target = match state::get_user_handle(target_handle) {
-        Some(target) if !WAITABLE_KINDS.contains(&target.kind()) => Err(0xC000_0024),
         Some(target) if target.access() & SYNCHRONIZE == 0 => Err(0xC000_0022),
-        Some(target) => Ok((target.object.native_body().map_or(0, |body| body.pointer), Held::Handle(target))),
-        None => reference_object(target_handle, SYNCHRONIZE, previous_mode).and_then(|pointer| {
-            if open_pointer::type_name(pointer).is_some_and(|name| WAITABLE_TYPES.contains(&name.as_str())) {
-                Ok((pointer, Held::Object(pointer)))
-            } else {
-                release(&Held::Object(pointer));
-                Err(0xC000_0024)
-            }
-        }),
+        Some(target) => Ok((target.object.native_body().and_then(|body| ob_wait::wait_object_of(body.pointer, &body.type_name)), Held::Handle(target))),
+        None => reference_object(target_handle, SYNCHRONIZE, previous_mode).map(|pointer| (open_pointer::type_name(pointer).and_then(|name| ob_wait::wait_object_of(pointer, &name)), Held::Object(pointer))),
     };
-    let (target_pointer, target) = match target {
-        Ok(target) => target,
-        Err(status) => {
-            if let Held::Object(_) = port_entry {
-                release(&port_entry);
-            }
-            return Err(status);
+    let refusal = match &target {
+        Err(status) => Some(*status),
+        // Sem objeto de espera (ObpDefaultObject), ou um mutant ou fila.
+        Ok((None, _)) => Some(STATUS_INVALID_PARAMETER_3),
+        Ok((Some(wait), _)) if matches!(header_type(*wait), MUTANT_OBJECT | QUEUE_OBJECT) => Some(STATUS_INVALID_PARAMETER_3),
+        Ok(_) if packet.association().is_some() || packet.queued().is_some() => Some(STATUS_INVALID_PARAMETER_1),
+        Ok(_) => None,
+    };
+    if let Some(status) = refusal {
+        if let Ok((_, held @ Held::Object(_))) = &target {
+            release(held);
         }
-    };
+        if let Held::Object(_) = port_entry {
+            release(&port_entry);
+        }
+        return Err(status);
+    }
+    let Ok((Some(target_pointer), target)) = target else { return Err(STATUS_INVALID_PARAMETER_3) };
     packet.set_completion(completion.0, completion.1, completion.2, completion.3);
     for held in [&port_entry, &target] {
         if let Held::Handle(entry) = held {
@@ -207,14 +207,20 @@ pub fn associate(handle: u64, port_handle: u64, target_handle: u64, completion: 
     Ok(poll(&packet))
 }
 
-/// Os alvos de uma associação: os tipos cujo objeto de espera
-/// (ObpGetWaitObject) é o próprio cabeçalho de despacho do corpo — evento,
-/// mutante, semáforo, timer, processo e thread (o wininit espera o fim do
-/// services.exe por um pacote de espera do pool de threads). Os outros dão
-/// STATUS_OBJECT_TYPE_MISMATCH, como no NtAssociateWaitCompletionPacket do
-/// 19041.
-const WAITABLE_KINDS: [&str; 6] = ["event", "mutant", "semaphore", "timer", "process", "thread"];
-const WAITABLE_TYPES: [&str; 6] = ["Event", "Mutant", "Semaphore", "Timer", "Process", "Thread"];
+/// STATUS_INVALID_PARAMETER_1 (pacote já associado ou na fila) e
+/// STATUS_INVALID_PARAMETER_3 (alvo sem objeto de espera aceito).
+const STATUS_INVALID_PARAMETER_1: u32 = 0xC000_00EF;
+const STATUS_INVALID_PARAMETER_3: u32 = 0xC000_00F1;
+/// DISPATCHER_HEADER.Type que a associação recusa: MutantObject e
+/// QueueObject.
+const MUTANT_OBJECT: u8 = 2;
+const QUEUE_OBJECT: u8 = 4;
+
+/// O DISPATCHER_HEADER.Type (sem o bit alto) do objeto de espera.
+fn header_type(wait: u64) -> u8 {
+    // SAFETY: o objeto de espera de um corpo retido pela associação.
+    unsafe { DispatcherHeader::at(wait) }.type_.get() & 0x7F
+}
 
 /// SYNCHRONIZE, o direito que o alvo de uma associação exige, e
 /// IO_COMPLETION_MODIFY_STATE, o da IOCP.

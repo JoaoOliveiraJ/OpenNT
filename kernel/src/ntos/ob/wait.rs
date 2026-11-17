@@ -77,6 +77,19 @@ pub const WAIT_ANY: u32 = 1;
 /// 0); o IRTimer começa no KTIMER2 e o EJOB no KEVENT do fim do prazo do job.
 const DISPATCHER_TYPES: [&str; 8] = ["Event", "Semaphore", "Mutant", "Timer", "IRTimer", "Process", "Thread", "Job"];
 
+/// ObpGetWaitObject: o objeto de despacho de uma espera no corpo `pointer`
+/// do tipo `type_name` (o pacote de espera de um IoCompletion espera nele):
+/// o FILE_OBJECT.Event de um arquivo, o próprio corpo dos
+/// [`DISPATCHER_TYPES`] e a KQUEUE do IoCompletion, ou `None` para os tipos
+/// que esperam no ObpDefaultObject.
+pub fn wait_object_of(pointer: u64, type_name: &str) -> Option<u64> {
+    if type_name == "File" {
+        // SAFETY: FILE_OBJECT vivo, retido pelo chamador.
+        return Some(unsafe { FileObject::at(pointer) }.event.address());
+    }
+    (DISPATCHER_TYPES.contains(&type_name) || type_name == "IoCompletion").then_some(pointer)
+}
+
 /// ObpDefaultObject: o KEVENT de notificação sinalizado em que esperam os
 /// tipos sem objeto de espera próprio (criado na primeira espera).
 static DEFAULT_OBJECT: AtomicU64 = AtomicU64::new(0);

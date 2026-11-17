@@ -1776,7 +1776,9 @@ fn user_wait_packets(assert: Assert) {
         state::with_syscall_record(state::SyscallRecord::raw(raw), || call("NtAssociateWaitCompletionPacket", packet_handle, port_handle, target, 0))
     };
     assert(associate(event) == 0 && guest::read8(already) == 0 && phase() == 1 && guest::read64(packet + 0x20) != 0 && depth() == 0, "userwaitpackets: associacao pendente com evento nao sinalizado");
-    assert(associate(event) == 0xC000_000D && associate(port_handle) == 0xC000_000D, "userwaitpackets: pacote ja associado");
+    // O alvo é conferido antes da fase do pacote: a IOCP (uma fila) dá
+    // STATUS_INVALID_PARAMETER_3 mesmo com o pacote associado.
+    assert(associate(event) == 0xC000_00EF && associate(port_handle) == 0xC000_00F1, "userwaitpackets: pacote ja associado");
     assert(call("NtSetEvent", event, 0, 0, 0) == 0 && { wait_packets::pump(); depth() == 1 } && phase() == 2, "userwaitpackets: sinal publicado na porta pelo pump");
     guest::write64(rsp + 0x28, 0);
     assert(call("NtQueryEvent", event, 0, info, 8) == 0 && unsafe { nt::EventBasicInformation::at(info) }.event_state.get() == 0, "userwaitpackets: evento de sincronizacao consumido");
@@ -1791,12 +1793,16 @@ fn user_wait_packets(assert: Assert) {
     // Um processo também é alvo (o wininit espera assim o fim do
     // services.exe): o processo corrente, vivo, deixa a associação pendente.
     assert(associate(u64::MAX) == 0 && guest::read8(already) == 0 && phase() == 1 && depth() == 0 && call("NtCancelWaitCompletionPacket", packet_handle, 0, 0, 0) == 0 && phase() == 0, "userwaitpackets: processo como alvo, pendente enquanto vive");
-    assert(associate(port_handle) == 0xC000_0024 && call("NtCancelWaitCompletionPacket", event, 0, 0, 0) == 0xC000_0024, "userwaitpackets: tipos invalidos");
+    // Mutant e fila (a IOCP) não servem de alvo: STATUS_INVALID_PARAMETER_3.
+    guest::write64(rsp + 0x28, 0);
+    let _ = call("NtCreateMutant", out, 0x1F_0001, 0, 0);
+    let mutant = guest::read64(out);
+    assert(associate(port_handle) == 0xC000_00F1 && associate(mutant) == 0xC000_00F1 && phase() == 0 && call("NtCancelWaitCompletionPacket", event, 0, 0, 0) == 0xC000_0024, "userwaitpackets: tipos invalidos");
     // O último handle do pacote desfaz a associação e o corpo é liberado.
     let _ = associate(event);
     let _ = call("NtClose", packet_handle, 0, 0, 0);
     assert(work_objects::packet_of(packet).is_none(), "userwaitpackets: fechamento desfaz a associacao e libera o corpo");
-    for handle in [event, port_handle] {
+    for handle in [event, mutant, port_handle] {
         let _ = call("NtClose", handle, 0, 0, 0);
     }
     if let Some(region) = memory::find_region(block) {
