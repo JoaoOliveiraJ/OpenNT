@@ -202,7 +202,8 @@ fn send(request: &QueryEa, file: u64, device: u64, list: u64) -> Result<(u32, u6
                 if descriptor == 0 {
                     return Ok((STATUS_INSUFFICIENT_RESOURCES, u64::MAX));
                 }
-                mm_mdl::probe_and_lock_pages(descriptor);
+                // O sistema de arquivos escreve as EAs no buffer (IoWriteAccess).
+                mm_mdl::probe_and_lock_pages(descriptor, 1);
                 packet.mdl_address.set(descriptor);
             }
         } else {
@@ -315,7 +316,8 @@ fn send_set(file: u64, device: u64, buffer: u64, length: u32) -> Result<(u32, u6
                 if descriptor == 0 {
                     return Ok((STATUS_INSUFFICIENT_RESOURCES, u64::MAX));
                 }
-                mm_mdl::probe_and_lock_pages(descriptor);
+                // O sistema de arquivos lê as EAs do buffer (IoReadAccess).
+                mm_mdl::probe_and_lock_pages(descriptor, 0);
                 packet.mdl_address.set(descriptor);
             }
         } else {

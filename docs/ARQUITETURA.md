@@ -3081,7 +3081,9 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     paginação lê a página num frame novo. Falta de usuário, falta de kernel
     em VA de usuário e sondas de `guest_memory` passam por
     `working_set::page_in`. MmProbeAndLockPages trava os frames até o
-    MmUnlockPages.
+    MmUnlockPages; num endereço de sistema, traz cada página pela falta do
+    provedor dono (vistas de sistema, imagens, pool paginável) e a retém
+    contra a expulsão (`mm/io_pins.rs`) até o MmUnlockPages.
   - NtLockVirtualMemory e NtUnlockVirtualMemory (`mm/virtual_lock.rs`, com
     o ZwUnlockVirtualMemory): as validações do MiLockUnlockCommon (MapType
     MAP_PROCESS/MAP_SYSTEM, faixa de usuário, PROCESS_VM_OPERATION e o

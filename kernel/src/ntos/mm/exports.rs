@@ -42,7 +42,7 @@ fn map_io_space_ex(call: &Call) -> Result<u64, KernelError> {
 }
 /// MmProbeAndLockPages(Mdl, AccessMode, Operation).
 fn probe_and_lock_pages(call: &Call) -> Result<u64, KernelError> {
-    mdl::probe_and_lock_pages_for(call.arg(1), call.arg(3) as u32);
+    mdl::probe_and_lock_pages(call.arg(1), call.arg(3) as u32);
     Ok(0)
 }
 fn unlock_pages(call: &Call) -> Result<u64, KernelError> {

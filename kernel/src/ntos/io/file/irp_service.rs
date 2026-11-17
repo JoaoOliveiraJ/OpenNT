@@ -797,7 +797,7 @@ fn control(arguments: &Control, major: u8, minor: u8) -> u32 {
             }
             return conclude(&target, synchronous, event, STATUS_INSUFFICIENT_RESOURCES);
         }
-        crate::ntos::mm::mdl::probe_and_lock_pages(irp_at(packet).mdl_address.get());
+        crate::ntos::mm::mdl::probe_and_lock_pages(irp_at(packet).mdl_address.get(), if method == METHOD_IN_DIRECT { 0 } else { 1 });
     }
     // O FileSystemControl e o DeviceIoControl têm o mesmo leiaute.
     let control = &top_location(packet).parameters.device_io_control;

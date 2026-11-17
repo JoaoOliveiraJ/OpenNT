@@ -324,7 +324,8 @@ pub fn build_synchronous_fsd_request(major: u8, device: u64, buffer: u64, length
     if direct {
         let descriptor = super::mdl::allocate_mdl(buffer, length);
         if descriptor != 0 {
-            crate::ntos::mm::mdl::probe_and_lock_pages(descriptor);
+            // IoWriteAccess na leitura (o driver escreve no buffer), IoReadAccess na escrita.
+            crate::ntos::mm::mdl::probe_and_lock_pages(descriptor, if major == irp_mj::READ { 1 } else { 0 });
         }
         irp_at(address).mdl_address.set(descriptor);
     }

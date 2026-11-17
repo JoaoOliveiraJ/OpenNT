@@ -2171,6 +2171,22 @@ fn ntoskrnl_mm_group(assert: Assert) {
     assert(call_export("MmBuildMdlForNonPagedPool", &[descriptor]) == Some(0) && mdl_pfn(descriptor, 0) == paging::translate(buffer) >> 12 && mdl_pfn(descriptor, 1) == paging::translate(buffer + 0x1000) >> 12 && mdl_header.mdl_flags.get() & 6 == 4 && mdl_header.mapped_system_va.get() == mdl_header.start_va.get() + mdl_header.byte_offset.get() as u64, "mm: MmBuildMdlForNonPagedPool com PFNs reais, MappedSystemVa do pool e sem MDL_PAGES_LOCKED");
     assert(call_export("MmMapLockedPagesSpecifyCache", &[descriptor, 0, 1, 0, 0, 16]) == Some(buffer + 0x10) && mdl_header.mdl_flags.get() & 1 == 1 && call_export("MmUnmapLockedPages", &[buffer + 0x10, descriptor]) == Some(0) && mdl_header.mdl_flags.get() & 1 == 0, "mm: mapeamento do MDL marcado e desfeito");
     assert(call_export("MmGetPhysicalAddress", &[buffer]) == Some(paging::translate(buffer)) && call_export("MmMapLockedPagesWithReservedMapping", &[buffer, 0, descriptor, 1]) == Some(0), "mm: endereco fisico e VA nao reservada recusada");
+    // MmProbeAndLockPages num endereço de sistema (IoModifyAccess, como o
+    // cdd sobre a vista de sessão): os frames reais no vetor e a retenção de
+    // residência até o MmUnlockPages.
+    {
+        use crate::ntos::mm::io_pins;
+        let kernel_mdl = guest::alloc_bytes(0x40);
+        let kernel_header = at::<nt::Mdl>(kernel_mdl);
+        kernel_header.mdl_flags.set(0);
+        kernel_header.start_va.set(buffer);
+        kernel_header.byte_offset.set(0x10);
+        kernel_header.byte_count.set(0x1800);
+        let probed = call_export("MmProbeAndLockPages", &[kernel_mdl, 0, 2]) == Some(0) && mdl_pfn(kernel_mdl, 0) == paging::translate(buffer) >> 12 && mdl_pfn(kernel_mdl, 1) == paging::translate(buffer + 0x1000) >> 12 && kernel_header.mdl_flags.get() & 2 == 2 && io_pins::is_pinned(buffer) && io_pins::is_pinned(buffer + 0x1000);
+        let unlocked = call_export("MmUnlockPages", &[kernel_mdl]) == Some(0) && kernel_header.mdl_flags.get() & 2 == 0 && !io_pins::is_pinned(buffer) && !io_pins::is_pinned(buffer + 0x1000);
+        guest::free_bytes(kernel_mdl);
+        assert(probed && unlocked, "mm: MmProbeAndLockPages de sistema traz os frames e retem as paginas ate o MmUnlockPages");
+    }
     // MDL de um buffer de usuário travado: em KernelMode o
     // MmMapLockedPagesSpecifyCache dá VAs de sistema (PTEs de sistema) sobre
     // os PFNs do MDL, válidas em qualquer processo; o MmUnlockPages desfaz o

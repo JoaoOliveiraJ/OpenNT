@@ -9,7 +9,7 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
-use super::{memory_map, paging, pfn};
+use super::{io_pins, memory_map, paging, pfn};
 use crate::ntos::inc::field::{Field, NtStruct};
 use crate::ntos::inc::types::Mdl;
 use crate::ntos::mm::guest_memory as guest;
@@ -123,31 +123,35 @@ fn user_buffer(descriptor: &Mdl) -> bool {
     descriptor.start_va.get() < memory_map::USER_ADDRESS_LIMIT
 }
 
-/// MmProbeAndLockPages(Mdl, AccessMode, Operation): a operação de escrita
-/// (qualquer uma além de IoReadAccess) liga MDL_WRITE_OPERATION e a de
-/// leitura a desliga, como o MiProbeAndLockPrepare (rva 0x20A39B); o resto
-/// é o `probe_and_lock_pages`.
-pub fn probe_and_lock_pages_for(descriptor: u64, operation: u32) {
-    let header = mdl(descriptor);
-    if operation != 0 {
-        set_flags(header, MDL_WRITE_OPERATION, 0);
-    } else {
-        set_flags(header, 0, MDL_WRITE_OPERATION);
-    }
-    probe_and_lock_pages(descriptor);
-}
+/// As retenções de residência das páginas de kernel travadas pelo
+/// MmProbeAndLockPages, por MDL, até o MmUnlockPages.
+static KERNEL_PINS: SpinLock<BTreeMap<u64, io_pins::Pin>> = SpinLock::new(BTreeMap::new());
 
-/// MmProbeAndLockPages — o pool é residente: as páginas já estão travadas;
-/// o PFN array é real. Num buffer de usuário as páginas voltam ao working
-/// set pela sonda e os frames ficam travados contra o corte do working set
-/// até o MmUnlockPages. Como o MiProbeAndLockPrepare (rva 0x20A3CB), o MDL
-/// de um buffer de usuário guarda o processo cujo espaço foi sondado
-/// (ApcState.Process, o anexado durante um KeStackAttachProcess) e o de
-/// sistema fica com Process nulo: o BasicRender
+/// IoReadAccess: a única operação do MmProbeAndLockPages que não escreve.
+const IO_READ_ACCESS: u32 = 0;
+
+/// MmProbeAndLockPages(Mdl, AccessMode, Operation). Como o
+/// MiProbeAndLockPrepare (rva 0x20A39B), a operação de escrita (qualquer uma
+/// além de IoReadAccess) liga MDL_WRITE_OPERATION e a de leitura a desliga;
+/// o MDL de um buffer de usuário guarda o processo cujo espaço foi sondado
+/// (rva 0x20A3CB: ApcState.Process, o anexado durante um
+/// KeStackAttachProcess) e o de sistema fica com Process nulo: o BasicRender
 /// (WARPKMALLOCATION::Map) anexa ao Process do MDL para travar de novo a
-/// vista de usuário de uma alocação.
-pub fn probe_and_lock_pages(descriptor: u64) {
+/// vista de usuário de uma alocação. Num buffer de usuário as páginas voltam
+/// ao working set pela sonda e os frames ficam travados contra o corte do
+/// working set até o MmUnlockPages. Num endereço de sistema, como no 19041,
+/// cada página é trazida pela falta (o provedor de residência dono: vistas
+/// de sistema, imagens e pool paginável) e retida contra a expulsão até o
+/// MmUnlockPages (o cdd trava assim a vista de sessão da seção que desenha).
+/// O vetor de PFNs recebe os frames reais.
+pub fn probe_and_lock_pages(descriptor: u64, operation: u32) {
+    let address = descriptor;
     let descriptor = mdl(descriptor);
+    if operation != IO_READ_ACCESS {
+        set_flags(descriptor, MDL_WRITE_OPERATION, 0);
+    } else {
+        set_flags(descriptor, 0, MDL_WRITE_OPERATION);
+    }
     let user = user_buffer(descriptor);
     descriptor.process.set(if user { crate::ntos::ps::process::get_current_process() } else { 0 });
     let (first, pages) = covered_pages(descriptor);
@@ -155,11 +159,26 @@ pub fn probe_and_lock_pages(descriptor: u64) {
         for page in 0..pages {
             let _ = guest::try_read::<u8>(first + page * 0x1000);
         }
-    }
-    fill_pfn_array(descriptor);
-    if user {
+        fill_pfn_array(descriptor);
         for entry in pfn_array(descriptor, pages) {
             super::working_set::lock_frame(entry.get() * 0x1000);
+        }
+    } else {
+        match io_pins::pin(first, pages * 0x1000, operation != IO_READ_ACCESS) {
+            Ok(pin) => {
+                for (entry, page) in pfn_array(descriptor, pages).iter().zip(pin.pages.iter()) {
+                    entry.set(page.frame / 0x1000);
+                }
+                if let Some(mut previous) = KERNEL_PINS.lock().insert(address, pin) {
+                    let _ = previous.release();
+                }
+            }
+            Err(error) => {
+                // O NT levanta a exceção da sonda; sem SEH de kernel, os PFNs
+                // saem das PTEs como estão.
+                debug_print!("[mm] MmProbeAndLockPages {:#x} ({:#x} paginas, operacao {}): {}", first, pages, operation, error);
+                fill_pfn_array(descriptor);
+            }
         }
     }
     set_flags(descriptor, MDL_PAGES_LOCKED, 0);
@@ -170,11 +189,16 @@ pub fn unlock_pages(descriptor: u64) {
     if mdl(descriptor).mdl_flags.get() & MDL_MAPPED_TO_SYSTEM_VA != 0 && super::system_ptes::contains(mdl(descriptor).mapped_system_va.get()) {
         unmap_locked_pages(descriptor);
     }
+    let address = descriptor;
     let descriptor = mdl(descriptor);
-    if descriptor.mdl_flags.get() & MDL_PAGES_LOCKED != 0 && user_buffer(descriptor) {
-        let (_, pages) = covered_pages(descriptor);
-        for entry in pfn_array(descriptor, pages) {
-            super::working_set::unlock_frame(entry.get() * 0x1000);
+    if descriptor.mdl_flags.get() & MDL_PAGES_LOCKED != 0 {
+        if user_buffer(descriptor) {
+            let (_, pages) = covered_pages(descriptor);
+            for entry in pfn_array(descriptor, pages) {
+                super::working_set::unlock_frame(entry.get() * 0x1000);
+            }
+        } else if let Some(mut pin) = KERNEL_PINS.lock().remove(&address) {
+            let _ = pin.release();
         }
     }
     set_flags(descriptor, 0, MDL_PAGES_LOCKED);
@@ -684,13 +708,12 @@ pub fn page_contents_state(descriptor: u64, state: u32) -> u32 {
 }
 
 /// MmProbeAndLockProcessPages: sonda no espaço de `target`, anexando quando
-/// ele não é o processo corrente. A operação só decide o
-/// MDL_WRITE_OPERATION; o modo não muda o caminho do OpenNT (o pool é
-/// residente e as páginas já estão travadas).
+/// ele não é o processo corrente. A operação chega à sonda (o
+/// MDL_WRITE_OPERATION e a página gravável); o modo não muda o caminho do
+/// OpenNT.
 pub fn probe_and_lock_process_pages(descriptor: u64, target: u64, _access_mode: u8, operation: u32) -> Result<(), crate::rtl::KernelError> {
-    let operation = if operation == 0 { 0u32 } else { 1 };
     if target == crate::ntos::ps::process::get_current_process() {
-        probe_and_lock_pages_for(descriptor, operation);
+        probe_and_lock_pages(descriptor, operation);
         return Ok(());
     }
     let state = guest::alloc_bytes(0x30);
@@ -701,7 +724,7 @@ pub fn probe_and_lock_process_pages(descriptor: u64, target: u64, _access_mode: 
         guest::free_bytes(state);
         return Err(error);
     }
-    probe_and_lock_pages_for(descriptor, operation);
+    probe_and_lock_pages(descriptor, operation);
     let detached = crate::ntos::ke::process_attachment::detach(state);
     guest::free_bytes(state);
     detached.map(|_| ())

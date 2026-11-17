@@ -213,7 +213,8 @@ pub fn build_asynchronous_fsd_request(major: u32, device: u64, buffer: u64, leng
                 irp_builder::free_irp(packet);
                 return Ok(0);
             }
-            crate::ntos::mm::mdl::probe_and_lock_pages(descriptor);
+            // IoReadAccess na escrita (o driver lê o buffer), IoWriteAccess no resto.
+            crate::ntos::mm::mdl::probe_and_lock_pages(descriptor, if major == IRP_MJ_WRITE { 0 } else { 1 });
             irp.mdl_address.set(descriptor);
         } else {
             irp.user_buffer.set(buffer);
