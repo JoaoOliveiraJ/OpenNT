@@ -17,7 +17,8 @@
 //! BasicRender.sys do repositório de drivers e o monitor.sys com o CEA.sys
 //! e o monitor.inf), a pilha USB 3 e HID (usbxhci.sys, ucx01000.sys,
 //! usbhub3.sys, usbd.sys, hidusb.sys, hidclass.sys, hidparse.sys, kbdhid.sys
-//! e mouhid.sys), os
+//! e mouhid.sys), o miniport da placa e1000 (E1G6032E.sys, do repositório de
+//! drivers), os
 //! arquivos que o vgk.sys abre pelo caminho
 //! completo, o PE do kernel e o próprio vgk.sys quando houver um: um
 //! `vgk.sys` na raiz do repositório ou o caminho em `OPENNT_VGK_SYS`.
@@ -232,6 +233,11 @@ const NTFS_FILES: &[(&str, &str)] = &[
     // stornvme.sys e o driver de porta storport.sys, que ele importa.
     ("STORPORT.SYS", "System32/drivers/storport.sys"),
     ("STORNVME.SYS", "System32/drivers/stornvme.sys"),
+    // O miniport Intel PRO/1000 que o PnP instala na placa e1000 com
+    // `--net` (nete1g3e.inf): o `[e1000.CopyFiles]` o copia para o
+    // System32\drivers (%12%), o ImagePath do serviço E1G60; nesta máquina
+    // ele só está no repositório de drivers. O catálogo 0110 acima o cobre.
+    ("E1G6032E.SYS", "System32/DriverStore/FileRepository/nete1g3e.inf_amd64_af58b4e19562a3f9/E1G6032E.sys"),
     // O fastfat.sys real (`--start-driver=fastfat`) e o catálogo que o cobre.
     ("FASTFAT.SYS", "System32/drivers/fastfat.sys"),
     (

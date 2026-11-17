@@ -22,6 +22,7 @@
 //! dispositivos: o acpi.sys real, o padrão, ou o barramento PCI interno), `--kd=com2` (o
 //! depurador do kernel na COM2), `--shutdown-test=poweroff|reboot` (o teste do desligamento),
 //! `--usb` (também opção de máquina: a controladora xHCI com teclado e tablet USB),
+//! `--net` (também opção de máquina: a placa de rede e1000 com a rede de modo usuário do QEMU),
 //! `--memory-pressure` (o teste de pressão de memória sobre o arquivo de paginação do boot do
 //! smss).
 //! O kernel dos builds comuns leva só as tabelas de linha do DWARF; o `debug` compila o perfil
@@ -89,6 +90,7 @@ opcoes de build:   --release --build-dir=DIR --user-program=shell
                    --windows-dir=DIR (binarios do Windows do bundle; padrao build/windows)
                    --pnp-root=acpi|internal (raiz da arvore de dispositivos; padrao acpi)
                    --usb (controladora xHCI com teclado e tablet USB)
+                   --net (placa de rede e1000 com a rede de modo usuario do QEMU)
                    --kd=com2 (depurador do kernel na COM2)
                    --shutdown-test=poweroff|reboot (com --start-driver=ntfs: grava e desliga)
                    --memory-pressure (com --initial-process=smss: teste de pressao de memoria
@@ -172,6 +174,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             kd: String::new(),
             shutdown_test: String::new(),
             usb: false,
+            net: false,
             memory_pressure: false,
         },
         // O test-boot roda no WHPX quando a máquina o tem (`auto`); o `run`
@@ -183,6 +186,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             smp: 4,
             kd_port: None,
             usb: false,
+            net: false,
             monitor_port: None,
         },
         positional: Vec::new(),
@@ -237,6 +241,10 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             "--usb" => {
                 parsed.build.usb = true;
                 parsed.machine.usb = true;
+            }
+            "--net" => {
+                parsed.build.net = true;
+                parsed.machine.net = true;
             }
             "--kd-port" => parsed.machine.kd_port = Some(required()?.parse().map_err(|_| "--kd-port invalido")?),
             "--monitor-port" => parsed.machine.monitor_port = Some(required()?.parse().map_err(|_| "--monitor-port invalido")?),

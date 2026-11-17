@@ -158,6 +158,13 @@ pub fn usb() -> bool {
     flag(name::USB)
 }
 
+/// `NET` (`--net`): a máquina tem a placa de rede e1000 com a rede de modo
+/// usuário do QEMU, e o PnP sobe nela o miniport da Intel, com o NDIS e o
+/// TCP/IP reais.
+pub fn network() -> bool {
+    flag(name::NET)
+}
+
 /// `MEMORYPRESSURE` (`--memory-pressure`): depois que o smss cria o arquivo
 /// de paginação, um programa de usuário comita mais memória que a RAM e a
 /// relê (`test/memory_pressure.rs`).

@@ -91,6 +91,10 @@ pub struct BuildOptions {
     /// `--usb`: a máquina ganha a controladora xHCI com teclado e tablet USB
     /// e o PnP sobe a pilha USB 3 e HID do Windows sobre ela.
     pub usb: bool,
+    /// `--net`: a máquina ganha a placa de rede e1000 com a rede de modo
+    /// usuário do QEMU e o PnP sobe nela o miniport da Intel com o NDIS e o
+    /// TCP/IP do Windows.
+    pub net: bool,
     /// `--memory-pressure`: o teste de pressão de memória sobre o arquivo de
     /// paginação do boot do smss.
     pub memory_pressure: bool,
@@ -134,6 +138,9 @@ impl BuildOptions {
         }
         if self.usb {
             words.push(String::from(name::USB));
+        }
+        if self.net {
+            words.push(String::from(name::NET));
         }
         if self.memory_pressure {
             words.push(String::from(name::MEMORY_PRESSURE));
@@ -180,6 +187,7 @@ impl BuildOptions {
             kd: String::new(),
             shutdown_test: String::new(),
             usb: false,
+            net: false,
             memory_pressure: false,
             ..self.clone()
         }
@@ -413,6 +421,7 @@ mod tests {
             kd: String::new(),
             shutdown_test: String::new(),
             usb: false,
+            net: false,
             memory_pressure: false,
         }
     }
@@ -433,11 +442,12 @@ mod tests {
         options.console_mirror = true;
         options.shutdown_test = "reboot".into();
         options.usb = true;
+        options.net = true;
         let block = options.load_options_block().unwrap();
         assert_eq!(block.len(), load_options::BLOCK_SIZE);
         let text = load_options::text_of(&block).unwrap();
-        assert_eq!(text, "DEBUG DEBUGPORT=COM2 KERNELTESTSCOPE=all STARTDRIVER=NDIS,AFD INITIALPROCESS=smss DISPLAY=basic SHUTDOWNTEST=reboot TRACEDRIVERAPI CONSOLEMIRROR USB");
-        assert!(load_options::flag(text, load_options::DEBUG) && load_options::flag(text, "consolemirror") && load_options::flag(text, load_options::USB));
+        assert_eq!(text, "DEBUG DEBUGPORT=COM2 KERNELTESTSCOPE=all STARTDRIVER=NDIS,AFD INITIALPROCESS=smss DISPLAY=basic SHUTDOWNTEST=reboot TRACEDRIVERAPI CONSOLEMIRROR USB NET");
+        assert!(load_options::flag(text, load_options::DEBUG) && load_options::flag(text, "consolemirror") && load_options::flag(text, load_options::USB) && load_options::flag(text, load_options::NET));
         assert_eq!(load_options::value(text, load_options::START_DRIVER), Some("NDIS,AFD"));
         assert_eq!(load_options::value(text, load_options::STORAGE), None);
         assert!(!load_options::flag(text, load_options::DEBUG_PORT));
@@ -466,6 +476,7 @@ mod tests {
         driver.start_driver = "ksecdd".into();
         driver.kd = "com2".into();
         driver.usb = true;
+        driver.net = true;
         driver.build_dir = PathBuf::from("build/kd");
         assert_eq!(base.image_key(), driver.image_key());
         let mut smss = options();

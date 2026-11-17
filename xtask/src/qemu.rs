@@ -32,6 +32,10 @@ pub struct MachineOptions {
     /// `--usb`: a controladora xHCI do QEMU (qemu-xhci, PCI 1B36:000D) com um
     /// teclado e um tablet USB nas portas dela.
     pub usb: bool,
+    /// `--net`: a placa de rede Intel PRO/1000 do QEMU (e1000, PCI
+    /// 8086:100E) com a rede de modo usuário (slirp: a rede 10.0.2.0/24, o
+    /// gateway 10.0.2.2 e o DHCP do QEMU).
+    pub net: bool,
     /// Porta TCP do monitor HMP (o rastro rápido do depurador gráfico liga
     /// o log de execução do QEMU por ele), se houver.
     pub monitor_port: Option<u16>,
@@ -327,6 +331,11 @@ fn machine_arguments(disks: &Disks, machine: &MachineOptions, no_reboot: bool) -
     }
     if machine.usb {
         arguments.extend(["-device", "qemu-xhci,id=xhci", "-device", "usb-kbd,bus=xhci.0", "-device", "usb-tablet,bus=xhci.0"].map(String::from));
+    }
+    // A placa e1000 com a rede de modo usuário, explícita: o endereço MAC
+    // fixo é o padrão do QEMU (52:54:00:12:34:56).
+    if machine.net {
+        arguments.extend(["-netdev", "user,id=net0", "-device", "e1000,netdev=net0,mac=52:54:00:12:34:56"].map(String::from));
     }
     arguments
 }

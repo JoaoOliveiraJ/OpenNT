@@ -54,6 +54,9 @@ pub const PNP_ROOT: &str = "PNPROOT";
 pub const SHUTDOWN_TEST: &str = "SHUTDOWNTEST";
 /// A pilha USB 3 e HID real sobe pelo PnP na controladora xHCI.
 pub const USB: &str = "USB";
+/// A placa de rede Intel PRO/1000 (e1000) recebe o miniport real pelo PnP e
+/// a pilha de rede do Windows (NDIS e TCP/IP) sobe sobre ela.
+pub const NET: &str = "NET";
 /// O teste de pressão de memória sobre o arquivo de paginação, no boot do
 /// smss (`test/memory_pressure.rs`).
 pub const MEMORY_PRESSURE: &str = "MEMORYPRESSURE";
