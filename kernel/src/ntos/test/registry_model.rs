@@ -333,6 +333,24 @@ fn app_hives_and_open_handle(assert: Assert) {
     assert(created == 0 && refused == STATUS_INVALID_PARAMETER_7 && loaded == 0 && rooted && busy == STATUS_CANNOT_DELETE && unloaded == 0 && signaled, "cmmodel: REG_LOAD_HIVE_OPEN_HANDLE devolve a raiz e o evento da carga e sinalizado na descarga");
 }
 
+/// CmLoadAppKey com Allocate: o arquivo ausente vira uma hive nova e vazia
+/// (FILE_OPEN_IF); numa carga só de leitura, STATUS_OBJECT_NAME_NOT_FOUND.
+fn new_hive_from_missing_file(assert: Assert) {
+    const MOUNT: &str = "\\Registry\\A\\{6f70656e-6e74-4000-8000-000000000003}";
+    const FILE: &str = "\\??\\D:\\opennt-hive-nova.dat";
+    let target = attributes(MOUNT);
+    let (loaded, root) = load_ex(target, FILE, 0x10, 0, true);
+    let node = registry::node_by_path(MOUNT);
+    let empty = node.and_then(|node| registry::with_node(node, |key| key.children.is_empty() && key.values.is_empty() && key.name.eq_ignore_ascii_case("{6f70656e-6e74-4000-8000-000000000003}")));
+    let file = read_volume("/opennt-hive-nova.dat");
+    assert(loaded == 0 && root != 0 && registry::get_node(root as u32) == node && empty == Some(true) && file.len() >= 0x2000 && file[..4] == *b"regf", "cmmodel: NtLoadKeyEx de arquivo ausente cria a hive nova com a raiz vazia");
+    close(root);
+    let unloaded = registry::node_by_path(MOUNT).is_none();
+    let (read_only, _) = load_ex(target, "\\??\\D:\\opennt-hive-ausente.dat", 0x2010, 0, true);
+    guest::free_bytes(target);
+    assert(unloaded && read_only == STATUS_OBJECT_NAME_NOT_FOUND, "cmmodel: a hive nova sai no fechamento da raiz; carga so de leitura de arquivo ausente = STATUS_OBJECT_NAME_NOT_FOUND");
+}
+
 fn whole_hive_volatile(assert: Assert) {
     let user = open("\\Registry\\User", false);
     let file = create_file("\\??\\D:\\opennt-hive-vol.dat");
@@ -474,6 +492,7 @@ pub fn run(assert: Assert) {
     machine_hives(assert);
     lazy_flusher_and_refresh(assert);
     app_hives_and_open_handle(assert);
+    new_hive_from_missing_file(assert);
     whole_hive_volatile(assert);
     callback_objects(assert);
 }

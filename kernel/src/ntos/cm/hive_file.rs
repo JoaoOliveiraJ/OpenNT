@@ -31,6 +31,8 @@ const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
 /// FILE_NON_DIRECTORY_FILE.
 pub const FILE_OPEN: u32 = 1;
 pub const FILE_OPEN_IF: u32 = 3;
+/// O Information do IO_STATUS_BLOCK de uma criação: o arquivo é novo.
+pub const FILE_CREATED: u64 = 2;
 const CREATE_OPTIONS: u32 = 0x60;
 /// FILE_GENERIC_READ e FILE_GENERIC_READ | FILE_GENERIC_WRITE.
 const READ_ACCESS: u32 = 0x0012_0089;
@@ -60,6 +62,13 @@ impl HiveFile {
     /// CmpOpenHiveFile: ZwCreateFile do nome NT com handle de kernel e sem
     /// compartilhamento.
     pub fn open(name: &str, disposition: u32, write: bool) -> Result<HiveFile, u32> {
+        Self::open_with_disposition(name, disposition, write).map(|(file, _)| file)
+    }
+
+    /// [`HiveFile::open`] com o Information do IO_STATUS_BLOCK (FILE_OPENED
+    /// ou [`FILE_CREATED`]), que o CmpInitHiveFromFile confere para saber se
+    /// a hive é nova.
+    pub fn open_with_disposition(name: &str, disposition: u32, write: bool) -> Result<(HiveFile, u64), u32> {
         let units = name.encode_utf16().count() as u64;
         let block = guest::alloc_bytes(CreateRequest::SIZE + units * 2 + 2);
         if block == 0 {
@@ -79,6 +88,7 @@ impl HiveFile {
         let access = if write { READ_WRITE_ACCESS } else { READ_ACCESS };
         let status = zw_files::create_kernel_file(request.handle.address(), access, request.attributes.address(), request.io_status.address(), 0, disposition, CREATE_OPTIONS);
         let handle = request.handle.get();
+        let information = request.io_status.information.get();
         guest::free_bytes(block);
         match status {
             Ok(0) => {}
@@ -89,7 +99,7 @@ impl HiveFile {
             zw_files::close_file_entry(handle as u32);
             return Err(STATUS_OBJECT_TYPE_MISMATCH);
         };
-        Ok(HiveFile { handle, volume, path })
+        Ok((HiveFile { handle, volume, path }, information))
     }
 
     /// O arquivo de um handle do chamador (IoConvertFileHandleToKernelHandle

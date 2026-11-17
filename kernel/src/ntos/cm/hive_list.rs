@@ -14,7 +14,10 @@
 //!   de máquina avisa as notificações do
 //!   CmRegisterMachineHiveLoadedNotification (CmpNotifyMachineHiveLoaded);
 //!   a hive entra na lista de hives (CmpLoadKeyCommon chama o
-//!   CmpAddToHiveFileList), salvo uma hive de aplicativo;
+//!   CmpAddToHiveFileList), salvo uma hive de aplicativo; o arquivo ausente
+//!   vira uma hive nova e vazia (o primário abre com FILE_OPEN_IF), salvo
+//!   com REG_OPEN_READ_ONLY; as hives de máquina do boot precisam do
+//!   arquivo;
 //! - uma hive de aplicativo (CmLoadAppKey, rva 0x6e8bfc) cujo arquivo já
 //!   está carregado como hive de aplicativo não é carregada de novo: a
 //!   carga devolve a hive existente (CmpIsThisSameFile). Ela é descarregada
@@ -47,7 +50,8 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::ntos::cm::hive::storage::{Storage, HBLOCK_SIZE, STATUS_INSUFFICIENT_RESOURCES, STATUS_REGISTRY_CORRUPT};
 use crate::ntos::cm::hive::{base_block, log, sync, tree};
-use crate::ntos::cm::hive_file::{HiveFile, FILE_OPEN, FILE_OPEN_IF, STATUS_REGISTRY_IO_FAILED};
+use crate::ntos::cm::hive_file::{HiveFile, FILE_CREATED, FILE_OPEN, FILE_OPEN_IF, STATUS_REGISTRY_IO_FAILED};
+use crate::ntos::cm::key::{policy as key_policy, security as key_security};
 use crate::ntos::cm::registry::{self, NodeId};
 use crate::ntos::cm::{hive_init, machine_hive};
 use crate::ntos::io::file::request::EventReference;
@@ -200,25 +204,51 @@ pub fn create_volatile_hive(mount: &str) -> Result<u32, u32> {
     Ok(identifier)
 }
 
-/// CmLoadKey: carrega o arquivo `file_name` numa chave nova em `target`.
+/// Uma hive de máquina do boot (o CmpInitializeHiveList): o arquivo
+/// precisa existir; sem ele, `hive_init` semeia as chaves em memória.
 pub fn load(target: &str, file_name: &str, flags: u32) -> u32 {
-    match load_hive(target, file_name, flags, None) {
+    let mut unload_event = None;
+    match load_hive_files(target, file_name, flags, &mut unload_event, false) {
         Ok(_) => 0,
         Err(status) => status,
     }
 }
 
-/// [`load`] com o evento da descarga; devolve o identificador da hive.
+/// CmLoadKey: carrega o arquivo `file_name` numa chave nova em `target`,
+/// com o evento da descarga; devolve o identificador da hive. Como o
+/// CmLoadKey e o CmLoadAppKey do 19041 (Allocate = TRUE no
+/// CmpCmdHiveOpen), um arquivo ausente vira uma hive nova e vazia, salvo
+/// numa carga só de leitura.
 pub fn load_hive(target: &str, file_name: &str, flags: u32, unload_event: Option<EventReference>) -> Result<u32, u32> {
     let mut unload_event = unload_event;
-    let result = load_hive_files(target, file_name, flags, &mut unload_event);
+    let result = load_hive_files(target, file_name, flags, &mut unload_event, true);
     if let Some(mut event) = unload_event {
         event.release();
     }
     result
 }
 
-fn load_hive_files(target: &str, file_name: &str, flags: u32, unload_event: &mut Option<EventReference>) -> Result<u32, u32> {
+/// A imagem de uma hive nova e vazia para `target` (o HINIT_CREATE do
+/// CmpInitHiveFromFile e a raiz que o CmpLinkHiveToMaster cria nela): só a
+/// raiz, com o último componente do nome, KEY_HIVE_ENTRY | KEY_NO_DELETE e
+/// o descritor que a chave nova herda do pai pelo sujeito corrente.
+fn new_hive_image(target: &str, file_name: &str) -> Result<Vec<u8>, u32> {
+    let components = registry::split_path(target);
+    let name = components.last().map(|name| String::from(*name)).ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
+    let parent = registry::node_by_path(&parent_path(target)).ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
+    let parent_security = registry::with_node(parent, |key| key.security.clone()).ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
+    let security = match key_security::create(&parent_security, 0, false) {
+        Ok(Ok(security)) => security,
+        Ok(Err(status)) => return Err(status),
+        Err(_) => key_policy::boot_child(&parent_security).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?,
+    };
+    let time = now();
+    let root = tree::NewKey { name, last_write_time: time, security, values: Vec::new(), parent: None, link: false, class: Vec::new() };
+    let (storage, _) = tree::build(&[root], LATEST_MINOR, time, file_name).ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+    Ok(storage.image())
+}
+
+fn load_hive_files(target: &str, file_name: &str, flags: u32, unload_event: &mut Option<EventReference>, allocate: bool) -> Result<u32, u32> {
     if registry::node_by_path(target).is_some() {
         return Err(STATUS_OBJECT_NAME_COLLISION);
     }
@@ -226,7 +256,18 @@ fn load_hive_files(target: &str, file_name: &str, flags: u32, unload_event: &mut
         return Err(STATUS_OBJECT_NAME_NOT_FOUND);
     }
     let write = flags & REG_OPEN_READ_ONLY == 0;
-    let primary = HiveFile::open(file_name, FILE_OPEN, write)?;
+    // CmpOpenHiveFile: FILE_OPEN_IF quando a carga pode alocar a hive e não
+    // é só de leitura ((Flags & 0x21) == 1), senão FILE_OPEN.
+    let disposition = if allocate && write { FILE_OPEN_IF } else { FILE_OPEN };
+    let (primary, information) = HiveFile::open_with_disposition(file_name, disposition, write)?;
+    if information == FILE_CREATED {
+        // O arquivo foi criado agora: a hive nova vai inteira para ele e a
+        // carga segue pelo caminho normal.
+        let image = new_hive_image(target, file_name)?;
+        if primary.write(0, &image).and_then(|_| primary.set_size(image.len() as u64)).is_err() {
+            return Err(STATUS_REGISTRY_IO_FAILED);
+        }
+    }
     let (mut storage, recovered) = read_primary(&primary, file_name)?;
     let mut keys = tree::read(&storage)?;
     // CmpReorganizeHive: o pedido do NtCompressKey (LastReorganizeTime = 1)
