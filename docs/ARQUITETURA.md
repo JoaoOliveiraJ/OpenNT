@@ -2243,6 +2243,46 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
       tempos de kernel e de usuário e ciclos do KTHREAD) e `kmap` (as faixas
       fixas do espaço de sistema). As listas são paginadas (`mais: N`);
       `vad` e `uthreads` só rodam com as travas livres.
+  - Fluxo de registros (`kd/stream.rs`): um anel de 1024 posições de 384
+    bytes, reservado com `--kd`. Quem grava pega o número de sequência,
+    zera o selo da posição, copia o registro e grava o selo com o número
+    + 1; quem lê confere o selo antes e depois da cópia. Com `monitor
+    stream on` e a máquina rodando, o gravador manda os pendentes ao host
+    num pacote `O` (conteúdo `\0OSTR`, versão, registros) quando o lote
+    passa de 24 registros ou de 25 ms, se a trava do transporte estiver
+    livre (no máximo três pacotes por vez). Parado, o host lê por
+    `qOpenNTStream:SEQ` (cabeçalho com o próximo número, o mais antigo, os
+    perdidos e as flags, e os registros a partir de SEQ); o pedido não muda
+    o estado.
+  - Monitor de APIs (`kd/api_monitor.rs`, `monitor api`): o gancho no
+    `init::exports::dispatch` lê um booleano quando tudo está desligado.
+    Ligado, filtra pelo endereço de retorno (até 8 faixas de módulos ou
+    todos os chamadores) e grava, na volta do provedor, o id do export, os
+    argumentos (quantos o host disse em `api spec ID:ARGC[:ARG:TIPO]`;
+    sem especificação, quatro), PID, TID, ETHREAD, retorno, duração e
+    resultado, e até dois argumentos copiados (UNICODE_STRING,
+    ANSI_STRING, texto UTF-16 ou ASCII, o ObjectName de OBJECT_ATTRIBUTES,
+    o qword de um ponteiro de saída) pelo leitor do depurador, sem faltas.
+    `api names` dá os nomes da tabela. Os exports com corpo x64 próprio
+    (`native_export_layout`) e as rotinas privadas não passam pelo
+    despacho.
+  - Rastreador de IRPs (`kd/irp_trace.rs`, `monitor irptrace`): ganchos
+    no `io_manager::iof_call_driver` (antes e depois da rotina de
+    despacho), no `iof_complete_request` (entrada e cada rotina de
+    conclusão), no `irp_builder::free_irp` e, pelo despacho dos exports,
+    na criação por um driver (IoAllocateIrp, IoBuild*Request,
+    IoMakeAssociatedIrp). Cada gancho é uma função `#[inline]` que só lê o
+    booleano; o corpo é `#[cold]`. O chamador de um IofCallDriver é o
+    endereço de retorno do export em curso no processador (guardado pelo
+    gancho do despacho, com a ETHREAD conferida).
+  - Exploradores (`kd/explore.rs`): `reg keys|values|value` lê a arena do
+    `cm/registry` (`node_by_path`, `with_node`, `hive_of`), seguindo os
+    links; `objdir` lista um diretório do `ob/object_manager` (tipo, corpo
+    nativo, filhos, destino do link ou arquivo); `fs ls|read` usa o leitor
+    NTFS do kernel (`drivers/fs/ntfs::mounted`, ATA PIO por consulta).
+    Todos alocam e tomam as travas do Rust: só rodam com
+    `stop::locks_held()` falso. Saída paginada pelo tamanho (`mais: N`),
+    campos separados por tabulação. A linha do `qRcmd` aceita 512 bytes.
   - Os APs ainda usam a própria IDT de três vetores: só o BSP trata
     `int 3`/#DB, e os comparadores de hardware são carregados só no
     processador da parada.
@@ -3967,6 +4007,19 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     `KD_MONITOR 127.0.0.1:PORTA` (com `--monitor-port`, o monitor HMP do
     QEMU) e `KD_READY 127.0.0.1:PORTA`, e fecha o QEMU quando a entrada
     padrão fecha.
+  - `--vm-snapshots`, `--record=ARQ`, `--replay=ARQ [--gdb-port=N]`
+    (`xtask/src/time_travel.rs`, `xtask/src/qcow2.rs`): os discos entram
+    como overlays qcow2 criados pelo próprio xtask (cabeçalho da versão
+    3, clusters de 64 KB, refcount e L1 vazios, o disco cru por trás). Com
+    `--vm-snapshots` o `savevm`/`loadvm` funcionam e as imagens cruas não
+    mudam. A gravação usa `-icount shift=auto,rr=record` com o snapshot
+    inicial `inicio`, os discos atrás do `blkreplay`, sempre TCG e a data
+    da CMOS fixa no relógio virtual (`ARQ.maquina` guarda data, memória e
+    processadores para a reprodução); `OPENNT_RR_SHIFT` troca o passo do
+    icount. A reprodução abre o gdbstub do QEMU (`-gdb`, `-S`), imprime
+    `KD_REPLAY` e entrega esse endereço em `KD_READY`. Fechar a entrada
+    padrão manda `quit` ao monitor antes de matar o QEMU (a gravação só
+    vale com a saída normal).
   - Símbolos (`symbols.rs`, `pe.rs`, `pdb.rs`): o `kernel.elf` com os nomes
     do Rust legíveis; para cada binário da Microsoft carregado, os exports
     do PE desta máquina e os nomes públicos do PDB público dele. O PDB vem
@@ -4067,6 +4120,40 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     `ln`, `dt`, `sxe`/`sxd`, `.reload`, `!process`, `!thread`, `!irp`,
     `!devobj`, `!drvobj`, `!object`, `!handle`, `!analyze`, além dos do
     OpenNT (`ps`, `threads`, `cpus`, `obj`, `log`, `btt`, `context`...).
+  - Fluxo, monitor de APIs e IRPs (`stream.rs`, `api_monitor.rs`,
+    `irp_timeline.rs`, `ntstatus.rs`, `monitoring.rs`): a conexão separa
+    os `O` do fluxo do texto (`Connection::take_records`); o `Collector`
+    descarta repetidos e conta falhas de sequência. `api_monitor_start`
+    lê os nomes (`api names`), manda as especificações dos protótipos de
+    `analysis::prototypes` e liga o monitor e a entrega. Cada chamada vira
+    uma `ApiRow` (argumentos com nome, resultado com o NTSTATUS pelo tipo
+    do resultado, módulo e símbolo do chamador); filtros e CSV. A vida dos
+    IRPs (`Timeline`): começa na criação ou no primeiro IofCallDriver, os
+    saltos com profundidade e a volta casada pela pilha de chamadas
+    abertas, a conclusão, as rotinas (STATUS_MORE_PROCESSING_REQUIRED
+    devolve o IRP à vida) e o fim no IoFreeIrp ou na conclusão; o mesmo
+    endereço depois do fim é outro IRP. `fetch_records` lê o resto com a
+    máquina parada.
+  - Exploradores (`explore.rs`): as páginas de `reg`, `objdir` e `fs` em
+    estruturas, os tipos REG_* e o texto de um valor, datas do NT.
+  - Vista como tipo (`struct_view.rs`): a árvore plana de um tipo num
+    endereço (chaves pelo caminho dos nomes), com structs, arrays (até
+    256), ponteiros seguidos e listas (LIST_ENTRY pelo Flink, até 256
+    entradas, cada uma como a struct que a contém: as listas conhecidas do
+    NT ou a mesma struct pelo mesmo campo, ou `Tipo.Campo` escolhido), e a
+    edição de um escalar (inteiros com e sem sinal, ponteiros, enums pelo
+    nome, bitfields lidos e regravados, floats). `Client::types_for` usa o
+    PDB do ntoskrnl ou o de um módulo (`ntdll!_PEB`).
+  - Snapshots e reprodução (`hmp.rs`, `monitoring.rs`): o monitor HMP do
+    QEMU (`savevm`, `loadvm`, `delvm`, `info snapshots`, `info replay`).
+    Depois do `loadvm`, a parada é relida e os breakpoints de software da
+    sessão são regravados. `set_replay` passa a sessão para o gdbstub do
+    QEMU: `monitor` é recusado sem ir ao alvo (o `qRcmd` dele iria ao
+    HMP), os módulos vêm de `ARQ.modulos`, e `reverse_step`/
+    `reverse_continue` mandam `bs`/`bc` quando o `qSupported` diz
+    `ReverseStep+`.
+  - Comandos de texto: `apimon`, `irptrace`, `reg`, `regv`, `objdir`,
+    `fsls`, `fscat`, `dtv`, `snap` e `rstep`/`rcont`.
   - Testes (`cargo test -p kd-client`): pacotes, resposta de parada,
     registradores, PE e `.pdata`, UNWIND_INFO e o desenrolar misto sobre uma
     pilha montada, públicos de PDB, tipos sobre um TPI montado, expressões,
@@ -4078,7 +4165,13 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     registradores estendidos, as opções de breakpoint (condição de log, uma
     vez só, silencioso, o arquivo de sessão) e o breakpoint de memória por
     página. Também os limites de função, os laços, os argumentos, os
-    protótipos e o índice de referências cruzadas.
+    protótipos e o índice de referências cruzadas. E os registros do
+    fluxo, as linhas do monitor de APIs (especificações, decodificação,
+    filtros, CSV), a vida dos IRPs (CREATE por dois drivers, conclusão,
+    MORE_PROCESSING e IoFreeIrp), os exploradores, a árvore de tipos com
+    lista e edição, a tabela do `info snapshots` e, contra o alvo de
+    mentira, a reprodução: um passo e o passo para trás de volta ao RIP de
+    antes.
 - **Depurador gráfico** (`tools/kd-gui`, binário `opennt-dbg`).
   - Uso: `cargo run -p kd-gui --release -- --launch` roda o mesmo build e
     QEMU do `cargo xtask debug --launch` e abre a janela; `--connect=HOST:PORTA`
@@ -4251,14 +4344,45 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     função do kernel e de uma da ntdll, acha referências conhecidas no
     ACPI.sys real (`PNP0A03` em ASCII e uma UTF-16) e no CSRSRV.dll, roda um
     roteiro e desenha a janela fora da tela.
+  - Abas novas (`monitors.rs`, `explorers.rs`, `backend/extras.rs`): APIs
+    (tabela virtual, filtros, detalhe, ir para o chamador, CSV), IRPs
+    (lista e linha do tempo com as barras dos saltos), Tipos, Registro
+    (árvore lida sob demanda e os valores), Objetos (árvore do namespace,
+    consulta do NT e vista como tipo do corpo), Arquivos (pastas, prévia
+    de 4 KB, cópia para o hospedeiro) e Snapshots (o modo, gravar, voltar,
+    apagar, voltar um passo e voltar até o breakpoint). O monitor e os
+    IRPs ficam num depósito (`MonitorStore`) que a janela lê sob a trava;
+    a lista filtrada é refeita quando a geração ou o filtro mudam. O modo
+    (`TimeMode`) sai das opções do `xtask` do alvo e aparece na barra de
+    estado; o menu Arquivo reabre o alvo com snapshots, gravando ou
+    reproduzindo. O Dump tem "Ver como tipo" (Ctrl+Shift+T).
+  - Preferências e banco por módulo (`preferences.rs`): fontes, escala,
+    cores que trocam as da paleta, o editor de atalhos (as ações com a
+    tecla, conflitos em vermelho) e as paradas em eventos (mandadas ao
+    alvo na primeira parada e quando mudam), em
+    `%APPDATA%/opennt-re/preferencias.json`. O banco por módulo
+    (`<build>/opennt-re/db/<modulo>.json`) guarda comentários, rótulos,
+    marcadores e breakpoints por RVA; é lido na abertura e gravado quando
+    muda, e os breakpoints guardados são armados quando o módulo aparece.
   - Testes de unidade (`cargo test -p kd-re --release`): o destaque, os
     formatos do Dump, o modelo do editor de breakpoints, as colunas dos
-    operandos e os formatos dos XMM.
+    operandos, os formatos dos XMM e as preferências e o banco por módulo
+    (ida e volta pelo disco).
+  - Fumaça das ferramentas (`tests/smoke_tools.rs`, `--ignored`): com
+    `--start-driver=ntfs`, o monitor e o rastreador ligados no começo do
+    boot, o IoCreateDevice do ntfs.sys com STATUS_SUCCESS, um
+    IRP_MJ_CREATE concluído pelo \FileSystem\Ntfs, o `Current` de
+    `SYSTEM\Select`, o ImageFileName do EPROCESS do System, o `\Driver`
+    e a raiz do volume; com `--vm-snapshots`, um snapshot, três passos e a
+    volta ao RIP de antes.
   - Capturas: `opennt-re --launch --screenshot-dir=docs/screenshots
     --scenario=kernel` grava `kd-re-cpu.png`, `kd-re-registradores.png`,
     `kd-re-breakpoint.png`, `kd-re-observacao.png`, `kd-re-grafo.png` e
     `kd-re-referencias.png`; `--scenario=usuario` grava `kd-re-usuario.png`,
-    `kd-re-memoria.png` e `kd-re-referencias-usuario.png`.
+    `kd-re-memoria.png` e `kd-re-referencias-usuario.png`;
+    `--scenario=ferramentas` grava `kd-re-api.png`, `kd-re-irp.png`,
+    `kd-re-tipos.png` e `kd-re-registro.png`; `--scenario=voltar` grava
+    `kd-re-voltar.png`.
 - **Servidor MCP** (`tools/kd-mcp`, binário `opennt-mcp`).
   - Uso: `opennt-mcp` (stdio: uma mensagem JSON-RPC por linha na entrada,
     as respostas na saída, o log na saída de erro) ou
@@ -4284,7 +4408,11 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     `breakpoint_clear`, `breakpoint_enable`, `breakpoint_list`,
     `backtrace`, `search_strings`, `search_pattern`, `xrefs`, `nt_view`,
     `trace_start`, `trace_fetch`, `trace_stop`, `wait_for_serial`,
-    `read_serial_log`, `run_script`, `command` e `screenshot`. Endereços
+    `read_serial_log`, `run_script`, `command` e `screenshot`; e, em
+    `tools_extra.rs`, `api_monitor_start|stop|fetch`,
+    `irp_trace_start|stop|fetch`, `reverse_step`, `reverse_continue`,
+    `snapshot_save|restore|list`, `view_struct`, `registry_list`,
+    `registry_read`, `object_list`, `file_list` e `file_read`. Endereços
     são expressões em texto e os endereços dos resultados vão em texto
     (`0x...`). Cada resultado é um objeto (`structuredContent`) e o mesmo
     JSON em `content`.
@@ -4302,7 +4430,10 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     ferramentas com esquemas válidos, os erros, lotes), as ferramentas
     contra o alvo de mentira do `kd-client` (registradores estendidos,
     memória, desmontagem com o comentário da chamada ao IoCreateDevice,
-    breakpoint de uma vez só, parada, pilha, símbolos, recursos) e o
+    breakpoint de uma vez só, parada, pilha, símbolos, recursos, as
+    ferramentas novas: o monitor com a chamada ao IoCreateDevice, o IRP de
+    CREATE, o Registro, o namespace, os arquivos e os erros sem
+    reprodução e sem monitor do QEMU) e o
     binário em stdio. Ponta a ponta (`cargo test -p kd-mcp --release --
     --ignored`, `tests/e2e.rs`): o binário em stdio abre o OpenNT pelo
     `launch`, para, lê os registradores, arma um breakpoint em
@@ -4320,6 +4451,9 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     bloqueada pelo quadro de troca até o ACPI.sys, módulos, processadores,
     `obj`, `k`, uma expressão e `!process`, `!thread`, `!drvobj \Driver\ACPI`,
     `!devobj` de um dispositivo dele e `lmv`;
+  - o Registro vivo (`reg` em `SYSTEM\Select`), o namespace (`objdir
+    \Driver`) e o monitor de APIs e o rastreador de IRPs ligados e
+    desligados;
   - dá um passo; para num breakpoint de hardware;
   - rastreia 300 instruções a partir da entrada da função, mostra a árvore
     e rastreia até o retorno;
@@ -4437,3 +4571,14 @@ dos pacotes (`kernel`, `boot`).
 - `ntos/ps/user/` reúne os serviços Nt* do modo usuário; no NT cada serviço
   mora no seu componente (NtCreateFile no Io, NtAllocateVirtualMemory no Mm).
 - Nome do binário: manter `kernel` ou gerar `ntoskrnl.exe`.
+- Gravação e reprodução do depurador (`--record`/`--replay`): no QEMU 11.1
+  desta máquina, a gravação a partir do reset fica no carregador de boot
+  (as leituras ATA PIO por consulta com IF=0 do `boot/src/stage2.s` só
+  andam a cada checkpoint da gravação: 10 minutos sem chegar ao kernel), o
+  `-loadvm` de um snapshot feito fora da gravação derruba o QEMU
+  (`replay_advance_current_icount`) e, na reprodução, o `s` do gdbstub não
+  volta com as flags padrão e derruba o QEMU com `qqemu.sstep=1`; o
+  continuar, a parada pedida e o `qSupported` com `ReverseStep+` e
+  `ReverseContinue+` funcionam. Os passos para trás estão no cliente, na
+  janela e no MCP (conferidos contra o alvo de mentira); os snapshots
+  (`--vm-snapshots`) são hoje o jeito de voltar a um ponto do kernel.

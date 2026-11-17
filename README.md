@@ -217,6 +217,11 @@ cargo test -p kd-gui --release -- --ignored --nocapture
 # Com --initial-process=smss o csrss.exe real roda e pode ser depurado.
 cargo run -p kd-re --release -- --launch --initial-process=smss --smp=1
 cargo test -p kd-re --release -- --ignored --nocapture
+# Snapshots da máquina (discos em overlays qcow2) e gravação/reprodução do
+# QEMU com os passos para trás (só TCG; veja os limites abaixo).
+cargo run -p kd-re --release -- --launch --vm-snapshots
+cargo xtask debug --record=build/gravacao.bin --smp=1
+cargo xtask debug --replay=build/gravacao.bin
 
 # O servidor MCP (opennt-mcp) para agentes de IA: stdio ou HTTP local.
 cargo build -p kd-mcp --release
@@ -246,6 +251,11 @@ Registro e texto formatado), `--initial-process=smss` (o primeiro processo de
 usuário passa a ser o smss.exe real, que monta a sessão e cria o csrss.exe; o
 build põe no volume os binários dessa cadeia e o kernel deixa de montar o
 `\KnownDlls` e de imitar o csrss).
+No `cargo xtask debug`: `--vm-snapshots` (os discos em overlays qcow2 em
+`<build>/snapshots`, para o `savevm`/`loadvm` do monitor do QEMU),
+`--record=ARQ` (a gravação do QEMU, com os discos em overlays ao lado do
+arquivo) e `--replay=ARQ [--gdb-port=N]` (a reprodução, com o gdbstub do
+QEMU no lugar do depurador do kernel).
 Opções de máquina: `--accel=tcg|whpx`,
 `--memory-mb=N` (padrão 4096), `--smp=N` (padrão 4). Em `--keys`, `\n` digita
 Enter; `--expect` pode se repetir. O `test-boot` falha se a serial mostrar
@@ -401,6 +411,47 @@ rodam no OpenNT (csrss.exe, smss.exe, wininit.exe).
   executáveis em vermelho; gravar a região num arquivo).
 - O menu Arquivo liga o servidor MCP na própria janela (127.0.0.1): um
   agente de IA e você usam a mesma sessão.
+- Monitor de APIs (aba APIs): cada chamada de um driver (ou de todos) aos
+  exports do ntoskrnl e da HAL vira uma linha com o nome do export, os
+  argumentos decodificados pelos protótipos (os textos copiados pelo
+  próprio kernel na volta da chamada), o resultado com o nome do
+  NTSTATUS, a thread, o processo, a hora, a duração e o chamador. Tabela
+  virtual com filtros (driver, export, status, só falhas), "ir para o
+  chamador" e CSV. Liga e desliga com a máquina parada; os registros
+  chegam em lotes com a máquina rodando.
+- Rastreador de IRPs (aba IRPs): a vida de cada IRP pelas pilhas de
+  dispositivos (quem criou, major/minor, cada IofCallDriver com o
+  dispositivo, o driver, a rotina e o status devolvido, as rotinas de
+  conclusão, o status final e o Information, os tempos), em linha do tempo
+  e detalhe, com filtros por driver, dispositivo e major.
+- Snapshots e voltar no tempo (aba Snapshots): com `--vm-snapshots` os
+  discos entram como overlays qcow2 e a máquina inteira grava e volta a um
+  ponto da parada (`savevm`/`loadvm`). Com `--record=ARQ` o QEMU grava a
+  execução (icount, TCG); `--replay=ARQ` a reproduz com o gdbstub do QEMU,
+  e "voltar um passo" e "voltar até o breakpoint" andam para trás. A
+  barra de estado mostra o modo. Limites: a gravação e a reprodução só
+  existem no TCG com um processador (o QEMU recusa mais de um), a
+  máquina da reprodução precisa ser a da gravação (a data da CMOS, a
+  memória e os processadores ficam em `ARQ.maquina`) e o QEMU precisa
+  sair sozinho para o arquivo valer (o depurador manda `quit` ao
+  monitor). No QEMU 11.1 desta máquina, a gravação a partir do reset anda
+  devagar demais no carregador de boot (as leituras ATA PIO por consulta
+  só andam a cada checkpoint da gravação) e o passo na reprodução não
+  volta; os snapshots (`--vm-snapshots`) são o jeito de voltar a um ponto
+  do kernel.
+- Ver como tipo (aba Tipos, menu do Dump): um endereço como qualquer tipo
+  do PDB do ntoskrnl (ou de um módulo, `ntdll!_PEB`), em árvore: structs,
+  arrays, ponteiros seguidos, listas (LIST_ENTRY pelo Flink, cada entrada
+  como a struct que a contém) e campos editáveis.
+- Exploradores do convidado vivo: o Registro como o kernel o guarda
+  (chaves e valores), o namespace do Object Manager (diretórios, links,
+  dispositivos, drivers, com o tipo e o corpo) e os arquivos do volume
+  (listar, ver e copiar para o hospedeiro).
+- Preferências (menu Aparência): fontes, escala, cores, editor de atalhos
+  e paradas em eventos (criação e saída de processo, thread, carga de
+  módulo, exceções do anel 3). Comentários, rótulos, marcadores e
+  breakpoints ficam num banco por módulo + RVA
+  (`<build>/opennt-re/db/<modulo>.json`), gravado e lido sozinho.
 - Teclas: F2 breakpoint, F7 entra, F8 passa por cima, F9 executa, Ctrl+F9
   até o retorno, Alt+F9 até o código de usuário, F4 até o cursor, F12
   pausa, Ctrl+G vai para, `;` comentário, `:` rótulo, Espaço monta, Ctrl+B
@@ -441,8 +492,13 @@ pelo Model Context Protocol (JSON-RPC 2.0). Usa o mesmo cliente do
   `search_strings`, `search_pattern`, `xrefs`, `nt_view` (`!process`,
   `!thread`, `!irp`, `!devobj`, `!analyze`...), `trace_start`,
   `trace_fetch`, `trace_stop`, `wait_for_serial` (um texto no log da
-  COM1), `read_serial_log`, `run_script`, `command` e `screenshot` (a tela
-  do convidado em PNG).
+  COM1), `read_serial_log`, `run_script`, `command`, `screenshot` (a tela
+  do convidado em PNG), `api_monitor_start`, `api_monitor_stop`,
+  `api_monitor_fetch`, `irp_trace_start`, `irp_trace_stop`,
+  `irp_trace_fetch`, `reverse_step`, `reverse_continue`,
+  `snapshot_save`, `snapshot_restore`, `snapshot_list`, `view_struct`,
+  `registry_list`, `registry_read`, `object_list`, `file_list` e
+  `file_read`.
 - Recursos: o log da COM1, o DbgPrint, os breakpoints e os módulos.
 
 Para registrar num cliente MCP, use o binário compilado
