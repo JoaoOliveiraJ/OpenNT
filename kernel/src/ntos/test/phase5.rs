@@ -133,7 +133,7 @@ fn key_objects_and_security(assert: Assert) {
     key_objects::detach(handle);
     assert(key_objects::get(temporary).is_some() && key_objects::release(temporary).is_ok() && key_objects::get(temporary).is_none(), "keyobjects: corpo temporario liberado");
     // Direitos de chave.
-    assert(key_access::key_access(0x300, 0) == Err(0xC000_000D) && key_access::key_access(0x200, 0) == Err(0xC000_00BB), "keyaccess: visoes WOW64");
+    assert(key_access::key_access(0x300, 0) == Ok(0) && key_access::key_access(0x2_0219, 0) == Ok(0x2_0019) && key_access::key_access(0x2_0119, 0) == Ok(0x2_0019), "keyaccess: bits WOW64 retirados sem erro");
     assert(key_access::key_access(0x8000_0000, 0) == Ok(0x20019) && key_access::key_access(0x1000_0000 | 0x100, 0) == Ok(0xF003F) && key_access::key_access(0x200_0000, 0) == Ok(0x200_0000), "keyaccess: genericos mapeados e MAXIMUM_ALLOWED preservado");
     assert(key_access::key_access(0x40, 0) == Err(0xC000_0022), "keyaccess: bit invalido");
     // Política da hive: raiz administrada por SYSTEM, filhos herdam.

@@ -419,9 +419,9 @@ fn publish_key_handle(output: u64, khandle: u32, attributes: u32, granted: u32, 
 }
 
 /// O caminho de usuário aplica a política compartilhada; o de kernel
-/// conserva a máscara recebida.
+/// conserva a máscara recebida, sem a seleção WOW64.
 fn resolve_access_mask(desired: u32, options: u32, previous_mode: bool) -> Result<u32, u32> {
-    if previous_mode { key_access::key_access(desired, options) } else { Ok(desired) }
+    if previous_mode { key_access::key_access(desired, options) } else { Ok(desired & !key_access::KEY_WOW64_RES) }
 }
 
 fn starts_with_registry(path: &str) -> bool {
@@ -485,6 +485,10 @@ const CREATE_LAYOUT: Layout = &[
 #[allow(clippy::too_many_arguments)]
 fn open_or_create_key(create: bool, output: u64, desired: u32, attributes_pointer: u64, _title_index: u32, class_name: u64, options: u32, output_disposition: u64, previous_mode: bool) -> Result<u32, KernelError> {
     install_hooks();
+    // CmOpenKey/CmCreateKey: Wow64Flags = acesso & 0x300 e o acesso segue
+    // sem esses bits.
+    let wow64_flags = desired & key_access::KEY_WOW64_RES;
+    let desired = desired & !key_access::KEY_WOW64_RES;
     with_request(|request| {
         let output = probe(output, 8, previous_mode, true)?;
         let attributes_pointer = probe(attributes_pointer, ObjectAttributes::SIZE, previous_mode, false)?;
@@ -551,7 +555,7 @@ fn open_or_create_key(create: bool, output: u64, desired: u32, attributes_pointe
             ("resultObject", output_object),
             ("version", 1),
             ("remaining", remaining),
-            ("wow64", (desired & 0x300) as u64),
+            ("wow64", wow64_flags as u64),
             ("flags", attribute_flags as u64),
             ("mode", (previous_mode || attribute_flags & 0x400 != 0) as u64),
         ]);

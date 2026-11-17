@@ -13,19 +13,17 @@ fn has_enabled_privilege(identifier: u64) -> bool {
         .unwrap_or(false)
 }
 
-/// Valida a visão WOW64, as opções de backup/restauração e os privilégios;
-/// converte direitos genéricos antes de armazená-los no handle.
-/// `Ok(acesso)` ou `Err(NTSTATUS)`.
+/// KEY_WOW64_64KEY | KEY_WOW64_32KEY. O redirecionamento para a visão de 32
+/// bits é feito em modo usuário (o kernelbase reescreve o caminho); o
+/// CmOpenKey e o CmCreateKey do 19041 só guardam os bits como Wow64Flags e
+/// os tiram do acesso, sem erro, inclusive com os dois juntos.
+pub const KEY_WOW64_RES: u32 = 0x300;
+
+/// Tira a seleção WOW64, valida as opções de backup/restauração e os
+/// privilégios; converte direitos genéricos antes de armazená-los no
+/// handle. `Ok(acesso)` ou `Err(NTSTATUS)`.
 pub fn key_access(desired_access: u32, open_options: u32) -> Result<u32, u32> {
-    // As duas seleções WOW64 juntas são inválidas; a visão de 32 bits
-    // separada continua não implementada.
-    if desired_access & 0x300 == 0x300 {
-        return Err(0xC000_000D);
-    }
-    if desired_access & 0x200 != 0 {
-        return Err(0xC000_00BB);
-    }
-    let mut granted = desired_access & !0x300;
+    let mut granted = desired_access & !KEY_WOW64_RES;
     if open_options & 4 != 0 {
         // REG_OPTION_BACKUP_RESTORE: direitos pelos privilégios de backup e restore.
         granted = (if has_enabled_privilege(17) { 0x102_0019 } else { 0 }) | (if has_enabled_privilege(18) { 0x103_0006 } else { 0 });
