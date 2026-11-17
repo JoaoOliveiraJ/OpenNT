@@ -184,7 +184,11 @@ pub fn iof_call_driver(device: u64, packet: u64) -> i32 {
     if handler == 0 {
         return status::NOT_SUPPORTED;
     }
-    native_call::call(handler, &[device, packet]) as i32
+    // O rastreador de IRPs do depurador (`kd::irp_trace`), desligado sem custo.
+    crate::ntos::kd::irp_trace::call_driver(packet, device);
+    let result = native_call::call(handler, &[device, packet]) as i32;
+    crate::ntos::kd::irp_trace::returned(packet, device, result);
+    result
 }
 
 /// O IOSB e o buffer de um pedido de modo usuário são memória do processo
@@ -218,6 +222,7 @@ fn complete_in_requester(irp: &Irp, addresses: [u64; 2], copy_back: impl FnOnce(
 pub fn iof_complete_request(packet: u64) -> i32 {
     // Com IoRegisterIoTracking ativo, o tempo do IRP vai aos rastreadores.
     super::io_perf::on_complete_request(packet);
+    crate::ntos::kd::irp_trace::completing(packet);
     let irp = irp_at(packet);
     let stack_count = irp.stack_count.get() as u8 as u32;
     let mut current_location = irp.current_location.get() as u8 as u32;
@@ -241,6 +246,7 @@ pub fn iof_complete_request(packet: u64) -> i32 {
             let device = if current_location == stack_count + 1 { 0 } else { location_at(current_stack).device_object.get() };
             let context = location.context.get();
             let result = native_call::call(routine, &[device, packet, context]) as i32;
+            crate::ntos::kd::irp_trace::completion_routine(packet, routine, device, result);
             if result == STATUS_MORE_PROCESSING_REQUIRED {
                 return result;
             }

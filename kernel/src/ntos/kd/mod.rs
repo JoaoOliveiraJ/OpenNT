@@ -15,16 +15,22 @@
 //! `regions`. Extensões do OpenNT: a metade alta dos YMM e os registradores
 //! de depuração por `p` em `extended_state`, os breakpoints de hardware do
 //! modo usuário por processo em `user_hardware` e os breakpoints de memória
-//! por página em `page_breakpoints`.
+//! por página em `page_breakpoints`. Para as ferramentas de engenharia
+//! reversa: o fluxo de registros com a máquina rodando em `stream`, o
+//! monitor de APIs em `api_monitor`, o rastreador de IRPs em `irp_trace` e
+//! os exploradores do Registro, do namespace e dos arquivos em `explore`.
+pub mod api_monitor;
 pub mod breakpoints;
 pub mod debug_filter;
 pub mod debug_service;
 pub mod debugger;
 pub mod events;
+pub mod explore;
 pub mod exports;
 pub mod extended_state;
 pub mod handles;
 pub mod inspect;
+pub mod irp_trace;
 pub mod memory;
 pub mod monitor;
 pub mod packet;
@@ -36,6 +42,7 @@ pub mod regions;
 pub mod registers;
 pub mod session;
 pub mod stop;
+pub mod stream;
 pub mod trace;
 pub mod transport;
 pub mod user_debug;
@@ -64,6 +71,7 @@ pub fn initialize() {
         return;
     }
     trace::reserve();
+    stream::reserve();
     stop::activate(transport::line_status_port());
     debug_print!("[kd] depurador do kernel na {} (porta {:#x}, protocolo remoto do GDB)", name, base);
     if transport::byte_pending() {

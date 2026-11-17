@@ -10,7 +10,8 @@
 //! suporte). As consultas próprias do OpenNT vêm pelo `qRcmd` (`monitor`
 //! no GDB, `kd::monitor`), a lista de módulos também pelo
 //! `qXfer:libraries:read`, e os registros do rastro de instruções pelo
-//! `qOpenNTTrace:offset,tamanho` (`kd::trace`). Com um processo escolhido
+//! `qOpenNTTrace:offset,tamanho` (`kd::trace`); os do monitor de APIs e do
+//! rastreador de IRPs pelo `qOpenNTStream:SEQ` (`kd::stream`). Com um processo escolhido
 //! pelo `monitor .process`, `m`/`M`/`X` e o `Z0` usam a raiz dele
 //! (`kd::process_context`) até a máquina seguir.
 //!
@@ -608,8 +609,21 @@ fn query(owner: usize, command: &[u8], reply: &mut Payload, text: &mut [u8]) {
             return;
         }
         reply.push_hex(&text[..done]);
+    } else if let Some(sequence) = command.strip_prefix(b"qOpenNTStream:") {
+        // Os registros do fluxo (`kd::stream`) a partir da sequência pedida.
+        let Some(from) = packet::parse_number(sequence) else {
+            reply.push_str("E01");
+            return;
+        };
+        let length = ((PACKET_SIZE - 8) / 2).min(text.len());
+        let done = super::stream::read(from, &mut text[..length]);
+        if done == 0 {
+            reply.push_str("E01");
+            return;
+        }
+        reply.push_hex(&text[..done]);
     } else if let Some(hex) = command.strip_prefix(b"qRcmd,") {
-        let mut line = [0u8; 256];
+        let mut line = [0u8; 512];
         let Some(decoded) = packet::decode_hex(hex, &mut line) else {
             reply.push_str("E01");
             return;

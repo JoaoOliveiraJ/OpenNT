@@ -15,7 +15,7 @@ use core::fmt::Write;
 use core::mem::offset_of;
 
 use super::packet::Payload;
-use super::{breakpoints, debugger, events, handles, inspect, memory, page_breakpoints, print_log, process_context, regions, stop, trace, user_debug, user_hardware};
+use super::{api_monitor, breakpoints, debugger, events, explore, handles, inspect, irp_trace, memory, page_breakpoints, print_log, process_context, regions, stop, stream, trace, user_debug, user_hardware};
 use crate::ntos::inc::types::{ClientId, Eprocess, Ethread, EthreadView1, KapcState, Kpcr, Kprcb, Kprocess, Kthread, KthreadView1};
 use crate::ntos::mm::loaded_images;
 use crate::ntos::mm::memory_map::MAX_CPUS;
@@ -50,6 +50,12 @@ const HELP: &str = "comandos do OpenNT:
   uex [on|off]       parar nas excecoes de primeira chance do anel 3
   membp [set <inicio> <tamanho> <a|w|x> | clear <inicio>]  breakpoints de memoria por pagina no processo escolhido
   uhw                comparadores de hardware de usuario (por processo)
+  api on all|mod=INI-FIM... | off | spec ID:ARGC[:ARG:TIPO].. | names [i] | clear   monitor de APIs
+  irptrace on|off|status   rastreador de IRPs
+  stream on|off|clear|status   entrega dos registros com a maquina rodando (pacotes O)
+  reg keys|values <caminho> [i] | reg value <caminho> <nome> [desl]   o Registro vivo
+  objdir <caminho> [i]   diretorio do namespace do Object Manager
+  fs ls <caminho> [i] | fs read <caminho> <desl> [bytes]   arquivos do volume do kernel
 ";
 
 fn read_u64(cr3: u64, address: u64) -> u64 {
@@ -370,6 +376,12 @@ pub fn run(owner: usize, line: &str, out: &mut Payload) {
         "uex" => user_debug::command(rest, out),
         "membp" => page_breakpoints::command(owner, rest, out),
         "uhw" => user_hardware::command(out),
+        "api" => api_monitor::command(rest, out),
+        "irptrace" => irp_trace::command(rest, out),
+        "stream" => stream::command(rest, out),
+        "reg" => explore::registry(rest, out),
+        "objdir" => explore::object_directory(rest, out),
+        "fs" => explore::files(rest, out),
         _ => out.push_str(HELP),
     }
 }

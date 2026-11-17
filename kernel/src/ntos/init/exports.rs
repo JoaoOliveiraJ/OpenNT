@@ -940,6 +940,17 @@ fn trace_formatted_text(name: &str, call: &Call, result: &Result<u64, KernelErro
 }
 
 fn dispatch(id: u64, call: &Call) -> Result<u64, KernelError> {
+    // O monitor de APIs e o rastreador de IRPs do depurador (`kd`):
+    // desligados, só um booleano lido.
+    let monitored = crate::ntos::kd::api_monitor::enter(id, call);
+    let result = dispatch_traced(id, call);
+    if let Some(token) = monitored {
+        crate::ntos::kd::api_monitor::leave(token, id, call, &result);
+    }
+    result
+}
+
+fn dispatch_traced(id: u64, call: &Call) -> Result<u64, KernelError> {
     let traced = TRACE_API.load(core::sync::atomic::Ordering::Relaxed);
     if traced {
         let name = id.checked_sub(32).and_then(|index| abi_names::EXPORT_NAMES.get(index as usize)).copied().unwrap_or("?");
