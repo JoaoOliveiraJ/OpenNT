@@ -735,11 +735,13 @@ pub const ACPI_ROOT_DRIVERS: &[InfDriver] = &[
 ];
 
 /// As linhas que o instalador considera neste boot: as dos INFs da caixa
-/// (com as da pilha USB e HID, `install_usb`) e, com a raiz ACPI, as do
-/// acpi.inf e do pci.inf.
+/// (com as da pilha USB e HID, `install_usb`), com a raiz ACPI as do
+/// acpi.inf e do pci.inf e, com `--net`, a da placa de rede
+/// (`install_net`).
 fn candidates() -> impl Iterator<Item = &'static InfDriver> {
     let acpi: &'static [InfDriver] = if crate::drivers::bus::acpi_stack::enabled() { ACPI_ROOT_DRIVERS } else { &[] };
-    DRIVERS.iter().chain(super::install_usb::USB_DRIVERS.iter()).chain(acpi.iter())}
+    DRIVERS.iter().chain(super::install_usb::USB_DRIVERS.iter()).chain(acpi.iter()).chain(super::install_net::candidates().iter())
+}
 
 /// O driver de melhor posto para os ids: HardwareIDs na ordem, depois os
 /// CompatibleIDs (sem diferenciar maiúsculas).
@@ -888,6 +890,11 @@ pub fn install_device(instance_path: &str, driver: &InfDriver, matching_id: &str
     write_text(&instance, "Driver", &driver_key)?;
     write_dword(&instance, "ConfigFlags", 0)?;
     apply_values(&format!("{instance}\\Device Parameters"), driver.device_values)?;
+    // O instalador da classe Net: o NetCfgInstanceId, as diretivas de rede
+    // e as ligações do adaptador.
+    if driver.class.guid == super::install_net::CLASS_NET.guid {
+        super::install_net::configure_adapter(instance_path, &software, driver)?;
+    }
     let Some(service) = driver.service else { return Ok(None) };
     write_text(&instance, "Service", service.name)?;
     register_service_instance(service.name, instance_path)?;

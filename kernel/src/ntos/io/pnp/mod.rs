@@ -17,6 +17,7 @@ pub mod cm_notify;
 pub mod device_api;
 pub mod devnode;
 pub mod install;
+pub mod install_net;
 pub mod install_usb;
 pub mod irp;
 pub mod message_interrupts;
