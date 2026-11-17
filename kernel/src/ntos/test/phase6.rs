@@ -5706,9 +5706,10 @@ fn ke_ex_sync_exports(assert: Assert) {
 
 
 /// HalDispatchTable: HAL_DISPATCH público publicado (versão 4); o slot +0x68
-/// é o HaliInitPowerManagement e os demais slots de função apontam para o
-/// stub seguro; o slot 1 (HalQuerySystemInformation) é chamável e devolve
-/// STATUS_NOT_SUPPORTED em vez de faultar. O HalInitPowerManagement devolve a
+/// é o HaliInitPowerManagement, o +0xA8 o HalAcpiGetTableDispatch (a FACP do
+/// cache, NULL para uma assinatura ausente) e os demais slots de função
+/// apontam para o stub seguro; o slot 1 (HalQuerySystemInformation) é
+/// chamável e devolve STATUS_NOT_SUPPORTED em vez de faultar. O HalInitPowerManagement devolve a
 /// HalAcpiDispatchTable ('HAL ', versão 4, 21 rotinas) com as tabelas ACPI
 /// do firmware e os registradores de PM da FADT.
 fn hal_dispatch_table_exports(assert: Assert) {
@@ -5722,9 +5723,18 @@ fn hal_dispatch_table_exports(assert: Assert) {
     };
     let stub = private_entries::entry("hal_default_not_supported").and_then(|entry| crate::ntos::mm::kernel_address::image_address(entry).ok()).unwrap_or(0);
     let power_slot = (core::mem::offset_of!(nt::HalDispatch, hal_init_power_management) as u64 - 8) / 8;
+    let acpi_table_slot = (core::mem::offset_of!(nt::HalDispatch, hal_get_cached_acpi_table) as u64 - 8) / 8;
     let routine = crate::hal::amd64::routine_stubs::address("HaliQuerySystemInformation").unwrap_or(0);
-    let slots_ok = stub != 0 && guest::read64(table + 0x08) == routine && (0..public_dispatch::SLOT_COUNT as u64).filter(|&slot| slot != power_slot && slot != 0).all(|slot| guest::read64(table + 0x08 + slot * 8) == stub);
-    assert(table != 0 && table == public_dispatch::table_address() && at::<nt::HalDispatch>(table).version.get() == public_dispatch::VERSION && slots_ok && power_slot == 12, "hal: HalDispatchTable publicada (versao 4, HalQuerySystemInformation e HalInitPowerManagement nas rotinas da HAL, demais slots no stub seguro)");
+    let get_table = crate::hal::amd64::routine_stubs::address("HalAcpiGetTableDispatch").unwrap_or(0);
+    let slots_ok = stub != 0 && guest::read64(table + 0x08) == routine && guest::read64(table + 0x08 + acpi_table_slot * 8) == get_table && (0..public_dispatch::SLOT_COUNT as u64).filter(|&slot| slot != power_slot && slot != acpi_table_slot && slot != 0).all(|slot| guest::read64(table + 0x08 + slot * 8) == stub);
+    assert(table != 0 && table == public_dispatch::table_address() && at::<nt::HalDispatch>(table).version.get() == public_dispatch::VERSION && slots_ok && power_slot == 12 && acpi_table_slot == 20, "hal: HalDispatchTable publicada (versao 4, HalQuerySystemInformation, HalInitPowerManagement e HalGetCachedAcpiTable nas rotinas da HAL, demais slots no stub seguro)");
+    // HalGetCachedAcpiTable(Signature, OemId, OemTableId), como o tpm.sys o
+    // chama: a FACP do cache com assinatura e tamanho do cabeçalho; uma
+    // assinatura que o firmware não tem devolve NULL.
+    let cached = at::<nt::HalDispatch>(table).hal_get_cached_acpi_table.get();
+    let facp = if cached != 0 { native_call::call(cached, &[u32::from_le_bytes(*b"FACP") as u64, 0, 0]) } else { 0 };
+    let absent = if cached != 0 { native_call::call(cached, &[u32::from_le_bytes(*b"ZZZZ") as u64, 0, 0]) } else { 1 };
+    assert(facp != 0 && guest::read32(facp) == u32::from_le_bytes(*b"FACP") && guest::read32(facp + 4) >= 116 && absent == 0, "hal: HalGetCachedAcpiTable da HalDispatchTable devolve a FACP do cache e NULL para uma assinatura ausente");
     // HaliQuerySystemInformation: classe sem resposta nesta plataforma =
     // STATUS_NOT_SUPPORTED; a BadIOAddrList (0x10) com o tamanho exigido e a
     // entrada 0xCF8 com tratador; sem depurador (0x21) STATUS_UNSUCCESSFUL com

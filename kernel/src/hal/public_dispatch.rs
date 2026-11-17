@@ -9,10 +9,13 @@
 //! (HalDispatchTable no RVA 0xc00a60, seguida do KdDebuggerDataBlock em 0xc00b20).
 //!
 //! O HalQuerySystemInformation (slot +0x08) é o HaliQuerySystemInformation
-//! (`hal::system_information`, as classes que esta plataforma responde) e o
+//! (`hal::system_information`, as classes que esta plataforma responde), o
 //! HalInitPowerManagement (slot +0x68) é o HaliInitPowerManagement da HAL
 //! (`hal::acpi_pm`): troca a tabela de energia do acpi.sys pela
-//! HalAcpiDispatchTable. As demais rotinas do HAL_DISPATCH público
+//! HalAcpiDispatchTable; e o HalGetCachedAcpiTable (slot +0xA8) é o
+//! HalAcpiGetTableDispatch, que o HalpSetupAcpiPhase0 grava numa máquina
+//! ACPI: (Signature, OemId, OemTableId) -> a cópia da tabela no cache da
+//! HAL, ou NULL. O tpm.sys lê a tabela TPM2 por ele. As demais rotinas do HAL_DISPATCH público
 //! (consulta de sistema legada, tabela de partição MBR, espelhamento de
 //! memória, arbitragem de barramento) esta plataforma não oferece, então os
 //! outros slots apontam para o mesmo corpo nativo `hal_default_not_supported`
@@ -56,8 +59,9 @@ pub fn initialize() -> Result<(), KernelError> {
     }
     dispatch.hal_query_system_information.set(crate::hal::system_information::query_system_information_address()?);
     dispatch.hal_init_power_management.set(crate::hal::acpi_pm::init_power_management_address()?);
+    dispatch.hal_get_cached_acpi_table.set(crate::hal::amd64::routine_stubs::address("HalAcpiGetTableDispatch")?);
     TABLE.store(table, Ordering::SeqCst);
-    crate::debug_print!("[hal] HalDispatchTable versao {} em {:#x}: HalQuerySystemInformation, HalInitPowerManagement e {} slots -> STATUS_NOT_SUPPORTED", VERSION, table, SLOT_COUNT - 2);
+    crate::debug_print!("[hal] HalDispatchTable versao {} em {:#x}: HalQuerySystemInformation, HalInitPowerManagement, HalGetCachedAcpiTable e {} slots -> STATUS_NOT_SUPPORTED", VERSION, table, SLOT_COUNT - 3);
     Ok(())
 }
 
