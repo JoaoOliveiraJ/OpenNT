@@ -3619,7 +3619,12 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   habilitado, TokenType, o nível pelo QoS num token de impersonação, a sessão
   de logon criada pelo RmCreateLogonSession, dono e grupo primário entre o
   usuário e os grupos, os grupos obrigatórios habilitados, o rótulo de
-  integridade, a origem TOKEN_SOURCE e os atributos de segurança de usuário),
+  integridade, a origem TOKEN_SOURCE e os atributos de segurança de usuário;
+  as validações do SepCreateTokenEx: grupo repetido retirado, grupo só para
+  negação habilitado, rótulo acima de 0x4000, dono sem SE_GROUP_OWNER,
+  privilégio desconhecido, repetido ou com atributo inválido; os SIDs de
+  serviço que o services.exe pede para o svchost entram como os outros
+  grupos, com os atributos pedidos),
   e o NtSetInformationToken das classes TokenOwner, TokenPrimaryGroup,
   TokenDefaultDacl, TokenSessionId e TokenSecurityAttributes (as operações
   ADD, DELETE, REPLACE e REPLACE_ALL), com a máscara de classes e os acessos

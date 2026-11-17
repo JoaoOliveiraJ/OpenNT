@@ -2891,6 +2891,66 @@ fn user_create_token(assert: Assert) {
         let session_ok = query(12, 4) == 0 && guest::read32(buffer) == 0;
         assert(unprivileged == 0xC000_0061 && adjusted == 0 && created == 0 && state::get_user_handle(token).is_some_and(|entry| entry.kind() == "token"), "usercreatetoken: SeCreateTokenPrivilege exigido e token criado");
         assert(source_ok && user_ok && label_ok && groups_ok && session_ok, "usercreatetoken: origem, usuario, rotulo de integridade, grupo obrigatorio habilitado e sessao 0");
+        // Grupos e privilégios como o SepCreateTokenEx os valida. Os SIDs de
+        // serviço do svchost, como o ScBuildServiceTokenGroups do services.exe
+        // os pede ao LSA (NT SERVICE\RpcEptMapper, o serviço iniciado, com
+        // 0xE; NT SERVICE\Power, outro do grupo, com 0xA), entram com os
+        // atributos pedidos e servem de dono; um grupo repetido sai; grupo só
+        // para negação habilitado, rótulo acima de 0x4000, dono sem
+        // SE_GROUP_OWNER e privilégio desconhecido, repetido ou com atributo
+        // inválido são recusados.
+        let (service, other_service, bad_label, extra_groups, extra_privileges, owner_cell) = (data + 0x900, data + 0x940, data + 0x980, data + 0x9C0, data + 0xA40, data + 0xA80);
+        guest::write_bytes(service, &[1, 6, 0, 0, 0, 0, 0, 5, 80, 0, 0, 0, 198, 192, 18, 31, 70, 19, 1, 54, 3, 206, 90, 230, 56, 234, 231, 90, 98, 128, 181, 205]);
+        guest::write_bytes(other_service, &[1, 6, 0, 0, 0, 0, 0, 5, 80, 0, 0, 0, 91, 178, 173, 139, 209, 174, 129, 176, 13, 100, 173, 35, 250, 29, 103, 23, 121, 79, 218, 125]);
+        guest::write_bytes(bad_label, &[1, 1, 0, 0, 0, 0, 0, 16, 0, 0x50, 0, 0]);
+        let create_with = |group_list: &[(u64, u32)], privilege_list: &[(u64, u32)], owner: u64| {
+            guest::write32(extra_groups, group_list.len() as u32);
+            for (index, &(sid, attributes)) in group_list.iter().enumerate() {
+                guest::write64(extra_groups + 8 + index as u64 * 16, sid);
+                guest::write32(extra_groups + 16 + index as u64 * 16, attributes);
+            }
+            guest::write32(extra_privileges, privilege_list.len() as u32);
+            for (index, &(id, attributes)) in privilege_list.iter().enumerate() {
+                guest::write64(extra_privileges + 4 + index as u64 * 12, id);
+                guest::write32(extra_privileges + 12 + index as u64 * 12, attributes);
+            }
+            guest::write64(owner_cell, owner);
+            let owner_pointer = if owner != 0 { owner_cell } else { 0 };
+            for (index, value) in [luid, expiration, token_user, extra_groups, extra_privileges, 0, 0, 0, 0, owner_pointer, primary, 0, source].into_iter().enumerate() {
+                guest::write64(rsp + 0x28 + index as u64 * 8, value);
+            }
+            call("NtCreateTokenEx", out, 0xF_01FF, 0, 1)
+        };
+        let query_new = |handle: u64, class: u64| {
+            guest::write64(rsp + 0x28, returned);
+            call("NtQueryInformationToken", handle, class, buffer, 0x200)
+        };
+        let group_at = |index: u64| (guest::read_bytes(guest::read64(buffer + 8 + index * 16), 32), guest::read32(buffer + 16 + index * 16));
+        let carried = create_with(&[(everyone, 1), (service, 0xE), (other_service, 0xA), (label, 0x60)], &[(23, 3)], service) == 0;
+        let service_token = guest::read64(out);
+        let service_groups = carried
+            && query_new(service_token, 2) == 0
+            && guest::read32(buffer) == 3
+            && group_at(1) == (guest::read_bytes(service, 32), 0xE)
+            && group_at(2) == (guest::read_bytes(other_service, 32), 0xA);
+        let service_owner = carried && query_new(service_token, 4) == 0 && guest::read_bytes(guest::read64(buffer), 32) == guest::read_bytes(service, 32);
+        if carried {
+            let _ = call("NtClose", service_token, 0, 0, 0);
+        }
+        let deduplicated = create_with(&[(everyone, 1), (everyone, 7), (label, 0x60)], &[(23, 3)], 0) == 0;
+        let deduplicated_token = guest::read64(out);
+        let single = deduplicated && query_new(deduplicated_token, 2) == 0 && guest::read32(buffer) == 1 && guest::read32(buffer + 16) == 7;
+        if deduplicated {
+            let _ = call("NtClose", deduplicated_token, 0, 0, 0);
+        }
+        let deny_only = create_with(&[(everyone, 0x14)], &[(23, 3)], 0) == 0xC000_000D;
+        let label_refused = create_with(&[(everyone, 1), (bad_label, 0x60)], &[(23, 3)], 0) == 0xC000_0446;
+        let owner_refused = create_with(&[(everyone, 1)], &[(23, 3)], everyone) == 0xC000_005A;
+        let unknown_privilege = create_with(&[(everyone, 1)], &[(0x25, 3)], 0) == 0xC000_0060;
+        let duplicate_privilege = create_with(&[(everyone, 1)], &[(23, 3), (23, 0)], 0) == 0xC000_01A6;
+        let privilege_attributes = create_with(&[(everyone, 1)], &[(23, 0x10)], 0) == 0xC000_000D;
+        assert(service_groups && service_owner && single, "usercreatetoken: SIDs de servico com os atributos pedidos e dono, grupo repetido retirado");
+        assert(deny_only && label_refused && owner_refused && unknown_privilege && duplicate_privilege && privilege_attributes, "usercreatetoken: recusas de grupos e privilegios do SepCreateTokenEx");
         // NtSetInformationToken, como o ScAdjustTokenDefaultDacl e o
         // ScmSetHostIdInToken do services.exe: DACL padrão nula, dono fora
         // dos grupos de dono recusado, grupo primário trocado, um atributo de

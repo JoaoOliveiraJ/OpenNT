@@ -47,12 +47,28 @@ const STATUS_BAD_IMPERSONATION_LEVEL: u32 = 0xC000_00A5;
 const STATUS_BAD_TOKEN_TYPE: u32 = 0xC000_00A8;
 /// SeCreateTokenPrivilege.
 const SE_CREATE_TOKEN_PRIVILEGE: u64 = 2;
+const STATUS_NO_SUCH_PRIVILEGE: u32 = 0xC000_0060;
+const STATUS_DUPLICATE_PRIVILEGES: u32 = 0xC000_01A6;
+const STATUS_INVALID_LABEL: u32 = 0xC000_0446;
 /// SE_GROUP_MANDATORY, SE_GROUP_ENABLED_BY_DEFAULT | SE_GROUP_ENABLED,
-/// SE_GROUP_OWNER e SE_GROUP_INTEGRITY.
+/// SE_GROUP_OWNER, SE_GROUP_USE_FOR_DENY_ONLY, SE_GROUP_INTEGRITY e
+/// SE_GROUP_INTEGRITY_ENABLED.
 const SE_GROUP_MANDATORY: u32 = 0x1;
 const SE_GROUP_ENABLED_BOTH: u32 = 0x6;
 const SE_GROUP_OWNER: u32 = 0x8;
+const SE_GROUP_USE_FOR_DENY_ONLY: u32 = 0x10;
 const SE_GROUP_INTEGRITY: u32 = 0x20;
+const SE_GROUP_INTEGRITY_ENABLED: u32 = 0x40;
+/// A autoridade dos rótulos obrigatórios (S-1-16) e o maior RID de rótulo
+/// (SECURITY_MANDATORY_PROTECTED_PROCESS_RID).
+const MANDATORY_LABEL_AUTHORITY: [u8; 6] = [0, 0, 0, 0, 0, 16];
+const MAXIMUM_LABEL_RID: u32 = 0x4000;
+/// SE_PRIVILEGE_ENABLED_BY_DEFAULT | SE_PRIVILEGE_ENABLED.
+const SE_PRIVILEGE_ENABLED_BOTH: u32 = 0x3;
+/// SE_MAX_WELL_KNOWN_PRIVILEGE (SeDelegateSessionUserImpersonatePrivilege).
+const SE_MAX_WELL_KNOWN_PRIVILEGE: u32 = 0x24;
+/// TOKEN_MANDATORY_POLICY_NO_WRITE_UP | TOKEN_MANDATORY_POLICY_NEW_PROCESS_MIN.
+const VALID_MANDATORY_POLICY: u32 = 0x3;
 /// O maior número de subautoridades de um SID.
 const SID_MAX_SUB_AUTHORITIES: u8 = 15;
 /// A maior contagem de grupos ou privilégios aceita na captura.
@@ -147,6 +163,128 @@ fn misaligned(pointer: u64) -> bool {
     pointer & 3 != 0
 }
 
+/// O SID tem a autoridade dos rótulos obrigatórios (S-1-16, a do
+/// SeUntrustedMandatorySid).
+fn is_mandatory_label(sid: &[u8]) -> bool {
+    sid.get(2..8) == Some(&MANDATORY_LABEL_AUTHORITY)
+}
+
+/// A validação dos grupos do SepCreateTokenEx, na ordem dele:
+/// - um grupo repetido (o SID do usuário ou de um grupo anterior) sai da
+///   lista, trocado pelo último, salvo com SE_GROUP_INTEGRITY;
+/// - o usuário ou um grupo só para negação (SE_GROUP_USE_FOR_DENY_ONLY)
+///   habilitado é STATUS_INVALID_PARAMETER; um grupo obrigatório fica
+///   habilitado e habilitado por padrão;
+/// - um rótulo obrigatório (S-1-16) com RID acima de 0x4000 é
+///   STATUS_INVALID_LABEL; o que tem SE_GROUP_INTEGRITY_ENABLED dá o nível
+///   de integridade do token (um segundo é STATUS_INVALID_PARAMETER);
+/// - o grupo primário é o usuário ou um dos grupos
+///   (STATUS_INVALID_PRIMARY_GROUP); o dono padrão é o usuário ou o primeiro
+///   grupo igual a ele, que precisa de SE_GROUP_OWNER (STATUS_INVALID_OWNER).
+///
+/// Os SIDs de serviço (`NT SERVICE\<serviço>`, S-1-5-80) que o services.exe
+/// pede ao LSA (os do svchost com SE_GROUP_OWNER e habilitados por padrão, o
+/// do serviço iniciado também habilitado) não têm tratamento à parte: são
+/// grupos como os outros. Devolve os grupos do token, sem o de integridade,
+/// e o SID de integridade.
+fn validate_groups(captured: &mut Captured) -> Result<(Vec<Group>, Option<Sid>), u32> {
+    let groups = &mut captured.groups;
+    if !groups.is_empty() {
+        let mut outer = 0usize;
+        let mut reference = captured.user.clone();
+        loop {
+            let mut inner = outer;
+            while inner < groups.len() {
+                if equal_sids(&reference, &groups[inner].sid) && groups[inner].attributes & SE_GROUP_INTEGRITY == 0 {
+                    groups.swap_remove(inner);
+                } else {
+                    inner += 1;
+                }
+            }
+            if outer >= groups.len() {
+                break;
+            }
+            reference = groups[outer].sid.clone();
+            outer += 1;
+            if outer >= groups.len() {
+                break;
+            }
+        }
+    }
+    let mut primary_found = equal_sids(&captured.primary_group, &captured.user);
+    let mut owner_found = captured.owner.as_ref().is_none_or(|owner| equal_sids(owner, &captured.user));
+    if captured.user_attributes & SE_GROUP_USE_FOR_DENY_ONLY != 0 && captured.user_attributes & SE_GROUP_ENABLED_BOTH != 0 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let mut integrity_index = None;
+    for (index, group) in groups.iter_mut().enumerate() {
+        if group.attributes & SE_GROUP_MANDATORY != 0 {
+            group.attributes |= SE_GROUP_ENABLED_BOTH;
+        }
+        if group.attributes & SE_GROUP_USE_FOR_DENY_ONLY != 0 && group.attributes & SE_GROUP_ENABLED_BOTH != 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        if is_mandatory_label(&group.sid) {
+            let count = group.sid[1] as usize;
+            let rid = if count == 0 { 0 } else { u32::from_le_bytes(group.sid[4 + count * 4..8 + count * 4].try_into().unwrap_or([0; 4])) };
+            if rid > MAXIMUM_LABEL_RID {
+                return Err(STATUS_INVALID_LABEL);
+            }
+            if group.attributes & SE_GROUP_INTEGRITY_ENABLED != 0 {
+                if integrity_index.is_some() {
+                    return Err(STATUS_INVALID_PARAMETER);
+                }
+                integrity_index = Some(index);
+            }
+        }
+        if !primary_found && equal_sids(&captured.primary_group, &group.sid) {
+            primary_found = true;
+        }
+        if !owner_found && captured.owner.as_ref().is_some_and(|owner| equal_sids(owner, &group.sid)) {
+            if group.attributes & SE_GROUP_OWNER == 0 {
+                return Err(STATUS_INVALID_OWNER);
+            }
+            owner_found = true;
+        }
+    }
+    if !primary_found {
+        return Err(STATUS_INVALID_PRIMARY_GROUP);
+    }
+    if !owner_found {
+        return Err(STATUS_INVALID_OWNER);
+    }
+    let mut groups = core::mem::take(groups);
+    let integrity = integrity_index.map(|index| groups.remove(index).sid);
+    Ok((groups, integrity))
+}
+
+/// A validação dos privilégios do SepCreateTokenEx: atributos só com
+/// SE_PRIVILEGE_ENABLED_BY_DEFAULT, SE_PRIVILEGE_ENABLED,
+/// SE_PRIVILEGE_REMOVED e SE_PRIVILEGE_USED_FOR_ACCESS
+/// (STATUS_INVALID_PARAMETER), o LowPart do LUID até
+/// SE_MAX_WELL_KNOWN_PRIVILEGE (STATUS_NO_SUCH_PRIVILEGE) e sem repetição
+/// (STATUS_DUPLICATE_PRIVILEGES). O token guarda o privilégio pelo LowPart,
+/// com os dois bits de habilitação.
+fn validate_privileges(privileges: &mut [Privilege]) -> Result<(), u32> {
+    let mut present = 0u64;
+    for privilege in privileges.iter_mut() {
+        if privilege.attributes & 0x7FFF_FFF8 != 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        privilege.attributes &= SE_PRIVILEGE_ENABLED_BOTH;
+        let low_part = privilege.id as u32;
+        if low_part > SE_MAX_WELL_KNOWN_PRIVILEGE {
+            return Err(STATUS_NO_SUCH_PRIVILEGE);
+        }
+        if present & (1 << low_part) != 0 {
+            return Err(STATUS_DUPLICATE_PRIVILEGES);
+        }
+        present |= 1 << low_part;
+        privilege.id = low_part as u64;
+    }
+    Ok(())
+}
+
 /// NtCreateTokenEx de `mode` (0 KernelMode, 1 UserMode); devolve o NTSTATUS.
 pub fn create(request: &Request, mode: u8) -> Result<u32, KernelError> {
     let caller = thread_tokens::effective(process::get_current_thread(), false);
@@ -193,28 +331,17 @@ pub fn create(request: &Request, mode: u8) -> Result<u32, KernelError> {
         Ok(captured) => captured,
         Err(status) => return Ok(status),
     };
-    // Grupos obrigatórios ficam habilitados; o grupo de integridade sai da
-    // lista e dá o nível do token.
-    let mut integrity = None;
-    let mut groups = Vec::with_capacity(captured.groups.len());
-    for mut group in captured.groups.drain(..) {
-        if group.attributes & SE_GROUP_MANDATORY != 0 {
-            group.attributes |= SE_GROUP_ENABLED_BOTH;
-        }
-        if group.attributes & SE_GROUP_INTEGRITY != 0 && group.sid.get(2..8) == Some(&[0, 0, 0, 0, 0, 16]) {
-            integrity = Some(group.sid);
-            continue;
-        }
-        groups.push(group);
+    let (groups, integrity) = match validate_groups(&mut captured) {
+        Ok(validated) => validated,
+        Err(status) => return Ok(status),
+    };
+    if let Err(status) = validate_privileges(&mut captured.privileges) {
+        return Ok(status);
+    }
+    if captured.mandatory_policy.is_some_and(|policy| policy & !VALID_MANDATORY_POLICY != 0) {
+        return Ok(STATUS_INVALID_PARAMETER);
     }
     let owner = captured.owner.clone().unwrap_or_else(|| captured.user.clone());
-    let owner_valid = equal_sids(&owner, &captured.user) || groups.iter().any(|group| group.attributes & SE_GROUP_OWNER != 0 && equal_sids(&group.sid, &owner));
-    if !owner_valid {
-        return Ok(STATUS_INVALID_OWNER);
-    }
-    if !equal_sids(&captured.primary_group, &captured.user) && !groups.iter().any(|group| equal_sids(&group.sid, &captured.primary_group)) {
-        return Ok(STATUS_INVALID_PRIMARY_GROUP);
-    }
     if !logon_session::exists(captured.authentication_id, 0) {
         return Ok(STATUS_NO_SUCH_LOGON_SESSION);
     }
