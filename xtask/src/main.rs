@@ -40,6 +40,7 @@ mod fonts;
 mod hive_image;
 mod host_language;
 mod kernel_pe;
+mod logon_screen;
 mod nt_types;
 mod ntfs_image;
 mod png;

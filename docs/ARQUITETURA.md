@@ -3265,9 +3265,13 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   (`xtask/src/user_services.rs`). A tela de logon da sessão 1 leva o fecho
   de imports do dwm.exe e do LogonUI.exe com o XAML e os provedores de
   credencial (`LOGON_SCREEN_PROGRAMS` em `xtask/src/windows_binaries.rs`),
-  os `.mun` e os `.pri` de `\Windows\SystemResources` desses programas e
-  as fontes de `\SystemRoot\Fonts` com o GRE_Initialize, o
-  FontSubstitutes, o FontLink e a chave Fonts (`xtask/src/fonts.rs`). A inicialização do LSA (o
+  os `.mun` e os `.pri` de `\Windows\SystemResources` desses programas, as
+  fontes de `\SystemRoot\Fonts` com o GRE_Initialize, o FontSubstitutes, o
+  FontLink e a chave Fonts (`xtask/src/fonts.rs`), e o CLSID do
+  LogonUIController com as classes WinRT das DLLs do volume
+  (`WindowsRuntime\ActivatableClassId`, `xtask/src/logon_screen.rs`); a
+  hive gerada põe uma chave com mais de 1012 subchaves em folhas sob uma
+  raiz 'ri' (`xtask/src/hive_image.rs`). A inicialização do LSA (o
   LsapInitLsa e o LsapStartLsa do lsasrv) pede ainda: o
   NtQueryInformationProcess das classes ProcessWow64Information (0) e
   ProcessProtectionInformation (o PS_PROTECTION do EPROCESS); os alarmes de
