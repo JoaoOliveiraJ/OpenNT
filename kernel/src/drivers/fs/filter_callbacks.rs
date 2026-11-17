@@ -9,12 +9,14 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use crate::hal::amd64::native_call;
 use crate::ntos::inc::field::{Field, NtStruct};
 
-/// A tabela publicada pelo Filter Manager (sem tipo público): o kernel só
-/// chama as duas rotinas de nome de arquivo.
+/// A tabela publicada pelo Filter Manager (sem tipo público): o kernel
+/// chama a consulta de recursos do volume e as duas rotinas de nome de
+/// arquivo.
 #[repr(C)]
 struct FltMgrCallbacks {
     /// Slots que o kernel não usa.
-    other: [Field<u64>; 3],
+    other: [Field<u64>; 2],
+    get_supported_features: Field<u64>,
     get_file_name_information: Field<u64>,
     release_file_name_information: Field<u64>,
 }
@@ -22,7 +24,7 @@ struct FltMgrCallbacks {
 // SAFETY: #[repr(C)] só de células.
 unsafe impl NtStruct for FltMgrCallbacks {}
 
-const _: () = assert!(core::mem::offset_of!(FltMgrCallbacks, get_file_name_information) == 0x18);
+const _: () = assert!(core::mem::offset_of!(FltMgrCallbacks, get_supported_features) == 0x10 && core::mem::offset_of!(FltMgrCallbacks, get_file_name_information) == 0x18);
 
 fn callbacks_at(table: u64) -> &'static FltMgrCallbacks {
     // SAFETY: o dono da tabela a conserva enquanto publicada ou em execução.
@@ -39,6 +41,18 @@ pub fn exchange_callbacks(table: u64) -> u64 {
 
 pub fn current_callbacks() -> u64 {
     CALLBACKS.load(Ordering::Acquire)
+}
+
+/// FsRtlGetSupportedFeatures: slot 0x10 com DeviceObject e SupportedFeatures
+/// (o chamador já zerou `*SupportedFeatures`); sem Filter Manager,
+/// STATUS_SUCCESS com os recursos em zero.
+pub fn get_supported_features(device: u64, features: u64) -> u32 {
+    let table = current_callbacks();
+    if table == 0 {
+        return 0;
+    }
+    let callback = callbacks_at(table).get_supported_features.get();
+    native_call::call(callback, &[device, features]) as u32
 }
 
 /// FsRtlGetFileNameInformation: slot 0x18 da tabela com os quatro

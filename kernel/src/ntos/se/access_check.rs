@@ -467,42 +467,13 @@ pub fn access_check_from_state(descriptor: u64, primary_info: u64, client_info: 
 
 const STATUS_BUFFER_TOO_SMALL_TOKEN: u32 = 0xC000_0023;
 
-/// RtlSidHashInitialize(SidAttr, Count, Hash): zera o hash; com SidAttr e
-/// Count, grava ambos e marca, para os primeiros 64 SIDs, o bit i em
-/// Hash[b & 0xF] e Hash[16 + (b >> 4)], onde b é o byte baixo da última
-/// subautoridade.
-fn sid_hash_initialize(sid_attributes: u64, count: u32, hash: &crate::ntos::inc::types::SidAndAttributesHash) {
-    guest::write_bytes(hash.address(), &[0u8; SidAndAttributesHash::SIZE as usize]);
-    if sid_attributes == 0 || count == 0 {
-        return;
-    }
-    hash.sid_attr.set(sid_attributes);
-    hash.sid_count.set(count);
-    // SAFETY: SidAttr tem Count entradas SID_AND_ATTRIBUTES.
-    let entries = unsafe { SidAndAttributes::array_at(sid_attributes, count.min(64) as usize) };
-    for (index, entry) in entries.iter().enumerate() {
-        let sid = sid::at(entry.sid.get());
-        let last = sid.sub_authority_count.get() as u64;
-        // Byte baixo de SubAuthority[count - 1] (o vetor do NT é ANYSIZE_ARRAY).
-        let element = sid.sub_authority[0].address().wrapping_add(last.wrapping_sub(1).wrapping_mul(4));
-        // SAFETY: SubAuthority[count - 1] dentro do SID vivo (com count 0 o
-        // original lê os bytes 4..7 do próprio SID, como aqui).
-        let byte = (unsafe { crate::ntos::inc::types::Field::<u32>::at(element) }.get() & 0xFF) as usize;
-        let bit = 1u64 << index;
-        let low = &hash.hash[byte & 0xF];
-        low.set(low.get() | bit);
-        let high = &hash.hash[16 + (byte >> 4)];
-        high.set(high.get() | bit);
-    }
-}
-
 /// Copia um SID_AND_ATTRIBUTES_HASH (contagem, array e hash recalculado).
 fn copy_sid_hash(source: u64, count: &crate::ntos::inc::types::Field<u32>, array: &crate::ntos::inc::types::Field<u64>, hash: &crate::ntos::inc::types::SidAndAttributesHash) {
     // SAFETY: os PSID_AND_ATTRIBUTES_HASH do TOKEN_ACCESS_INFORMATION são válidos.
     let source = unsafe { SidAndAttributesHash::at(source) };
     count.set(source.sid_count.get());
     array.set(source.sid_attr.get());
-    sid_hash_initialize(source.sid_attr.get(), source.sid_count.get(), hash);
+    crate::ntos::rtl::security::sid_hash_initialize(source.sid_attr.get(), source.sid_count.get(), Some(hash));
 }
 
 /// SepTokenFromAccessInformation(Info, Token).

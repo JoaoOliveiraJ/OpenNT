@@ -109,7 +109,7 @@ fn prefix_unicode_string(call: &Call) -> Result<u64, KernelError> {
     Ok(unicode::prefix(call.arg(1), call.arg(2), call.arg(3) & 0xFF != 0) as u64)
 }
 fn append_unicode_string_to_string(call: &Call) -> Result<u64, KernelError> {
-    Ok(signed_status(unicode::append_string(call.arg(1), call.arg(2))))
+    Ok(signed_status(crate::ntos::rtl::strings_counted::append_unicode_string(call.arg(1), call.arg(2))))
 }
 fn append_unicode_to_string(call: &Call) -> Result<u64, KernelError> {
     Ok(signed_status(crate::ntos::rtl::strings_counted::append(call.arg(1), call.arg(2))))
@@ -985,8 +985,9 @@ pub mod rtl_crt_extended {
         Ok(signed_status(unicode::hash(call.arg(1), call.arg(2) & 0xFF != 0, call.arg(3) as u32, call.arg(4))))
     }
     fn format_current_user_key_path(call: &Call) -> Result<u64, KernelError> {
-        registry::format_current_user_key_path(call.arg(1));
-        Ok(0)
+        use crate::ntos::inc::types::{NtStruct, UnicodeString};
+        // SAFETY: PUNICODE_STRING CurrentUserKeyPath do chamador.
+        Ok(signed_status(registry::format_current_user_key_path(unsafe { UnicodeString::at(call.arg(1)) })?))
     }
 
     // ---- Rtl — informação do sistema (KUSER_SHARED_DATA / produto) ----------
@@ -3165,4 +3166,222 @@ pub mod rtl_decompression {
         handlers: &[decompress_buffer, decompress_buffer_ex, decompress_fragment],
         data_exports: &[],
     };
+}
+
+pub mod rtl_unicode_prefix_next {
+    //! RtlNextUnicodePrefix; a lógica mora em `rtl/unicode_prefix`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::rtl::unicode_prefix;
+    use crate::rtl::KernelError;
+
+    /// RtlNextUnicodePrefix(PrefixTable, Restart) -> PUNICODE_PREFIX_TABLE_ENTRY.
+    fn next(call: &Call) -> Result<u64, KernelError> {
+        Ok(unicode_prefix::next(call.arg(1), call.arg(2) as u8 != 0))
+    }
+
+    pub static GROUP: Group = Group { name: "rtl-unicode-prefix-next", names: &["RtlNextUnicodePrefix"], handlers: &[next], data_exports: &[] };
+}
+
+pub mod rtl_bitmap_ex_set {
+    //! RtlAreBitsSetEx sobre RTL_BITMAP_EX; a lógica mora em `rtl/bitmap.rs`.
+
+    use crate::ntos::inc::types::{NtStruct, RtlBitmapEx};
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::rtl::bitmap;
+    use crate::rtl::KernelError;
+
+    /// RtlAreBitsSetEx(BitMapHeader, StartingIndex, Length) -> BOOLEAN.
+    fn are_bits_set_ex(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: o export recebe um RTL_BITMAP_EX vivo e alinhado, como no NT.
+        Ok(bitmap::are_bits_set_ex(unsafe { RtlBitmapEx::at(call.arg(1)) }, call.arg(2), call.arg(3)) as u64)
+    }
+
+    pub static GROUP: Group = Group { name: "rtl-bitmap-ex-set", names: &["RtlAreBitsSetEx"], handlers: &[are_bits_set_ex], data_exports: &[] };
+}
+
+pub mod crt_wide_copy_format {
+    //! swprintf (`rtl/printf`) e wcsncpy (`rtl/crt`).
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::rtl::{crt, printf};
+    use crate::rtl::KernelError;
+
+    /// swprintf(Buffer, Format, ...) -> int.
+    fn swprintf(call: &Call) -> Result<u64, KernelError> {
+        printf::swprintf(call.arg(1), call.arg(2), &call.args[2..])
+    }
+
+    /// wcsncpy(Dest, Source, Count) -> wchar_t*.
+    fn wcsncpy(call: &Call) -> Result<u64, KernelError> {
+        Ok(crt::wcsncpy(call.arg(1), call.arg(2), call.arg(3)))
+    }
+
+    pub static GROUP: Group = Group { name: "crt-wide-copy-format", names: &["swprintf", "wcsncpy"], handlers: &[swprintf, wcsncpy], data_exports: &[] };
+}
+
+pub mod rtl_network_string_ex {
+    //! RtlIpv4StringToAddressExW e RtlIpv6StringToAddressExW; a lógica mora
+    //! em `rtl/network_address`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::rtl::network_address;
+    use crate::rtl::KernelError;
+
+    /// (AddressString, Strict BOOLEAN, Address, Port) -> NTSTATUS.
+    fn ipv4_string_to_address_ex(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(network_address::ipv4_string_to_address_ex(call.arg(1), call.arg(2) as u8 != 0, call.arg(3), call.arg(4))))
+    }
+
+    /// (AddressString, Address, ScopeId, Port) -> NTSTATUS.
+    fn ipv6_string_to_address_ex(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(network_address::ipv6_string_to_address_ex(call.arg(1), call.arg(2), call.arg(3), call.arg(4))))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "rtl-network-string-ex",
+        names: &["RtlIpv4StringToAddressExW", "RtlIpv6StringToAddressExW"],
+        handlers: &[ipv4_string_to_address_ex, ipv6_string_to_address_ex],
+        data_exports: &[],
+    };
+}
+
+pub mod rtl_unicode_string_ex {
+    //! RtlUnicodeStringToInt64 (`rtl/integer_conversion`) e
+    //! RtlValidateUnicodeString (`rtl/unicode`).
+
+    use crate::ntos::inc::types::{Field, NtStruct, UnicodeString};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::rtl::{integer_conversion, unicode};
+    use crate::rtl::KernelError;
+
+    /// RtlUnicodeStringToInt64(String, Base, Number, EndPointer) -> NTSTATUS.
+    fn unicode_string_to_int64(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PCUNICODE_STRING e LONG64* do chamador; PWSTR* opcional.
+        let (string, number, end) = unsafe { (UnicodeString::at(call.arg(1)), Field::<u64>::at(call.arg(3)), (call.arg(4) != 0).then(|| Field::<u64>::at(call.arg(4)))) };
+        Ok(signed_status(integer_conversion::unicode_string_to_int64(string, call.arg(2) as u32, number, end)))
+    }
+
+    /// RtlValidateUnicodeString(Flags, String) -> NTSTATUS.
+    fn validate_unicode_string(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PCUNICODE_STRING opcional do chamador.
+        let string = (call.arg(2) != 0).then(|| unsafe { UnicodeString::at(call.arg(2)) });
+        Ok(signed_status(unicode::validate(call.arg(1) as u32, string)))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "rtl-unicode-string-ex",
+        names: &["RtlUnicodeStringToInt64", "RtlValidateUnicodeString"],
+        handlers: &[unicode_string_to_int64, validate_unicode_string],
+        data_exports: &[],
+    };
+}
+
+pub mod rtl_sid_attribute_arrays {
+    //! RtlCopySidAndAttributesArray, RtlCopyLuidAndAttributesArray e
+    //! RtlSidHashInitialize; a lógica mora em `rtl/security`.
+
+    use crate::ntos::inc::types::{Field, NtStruct, SidAndAttributesHash};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::rtl::security;
+    use crate::rtl::KernelError;
+
+    /// RtlCopySidAndAttributesArray(Count, Source, SidAreaSize, Destination,
+    /// SidArea, RemainingSidArea, RemainingSidAreaSize) -> NTSTATUS.
+    fn copy_sid_and_attributes_array(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PSID* e PULONG de saída do chamador.
+        let (area, size) = unsafe { (Field::<u64>::at(call.arg(6)), Field::<u32>::at(call.arg(7))) };
+        Ok(signed_status(security::copy_sid_and_attributes_array(call.arg(1) as u32, call.arg(2), call.arg(3) as u32, call.arg(4), call.arg(5), area, size)))
+    }
+
+    /// RtlCopyLuidAndAttributesArray(Count, Source, Destination).
+    fn copy_luid_and_attributes_array(call: &Call) -> Result<u64, KernelError> {
+        security::copy_luid_and_attributes_array(call.arg(1) as u32, call.arg(2), call.arg(3));
+        Ok(0)
+    }
+
+    /// RtlSidHashInitialize(SidAttr, SidCount, SidAttrHash) -> NTSTATUS.
+    fn sid_hash_initialize(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: PSID_AND_ATTRIBUTES_HASH opcional do chamador.
+        let hash = (call.arg(3) != 0).then(|| unsafe { SidAndAttributesHash::at(call.arg(3)) });
+        Ok(signed_status(security::sid_hash_initialize(call.arg(1), call.arg(2) as u32, hash)))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "rtl-sid-attribute-arrays",
+        names: &["RtlCopySidAndAttributesArray", "RtlCopyLuidAndAttributesArray", "RtlSidHashInitialize"],
+        handlers: &[copy_sid_and_attributes_array, copy_luid_and_attributes_array, sid_hash_initialize],
+        data_exports: &[],
+    };
+}
+
+pub mod rtl_correlation_vector {
+    //! Vetores de correlação; a lógica mora em `rtl/correlation_vector`.
+
+    use crate::ntos::inc::types::{CorrelationVector, NtStruct};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::rtl::correlation_vector;
+    use crate::rtl::KernelError;
+
+    fn vector(address: u64) -> &'static CorrelationVector {
+        // SAFETY: PCORRELATION_VECTOR vivo do chamador (alinhamento 1).
+        unsafe { CorrelationVector::at(address) }
+    }
+
+    /// RtlInitializeCorrelationVector(CorrelationVector, Version, Guid) -> NTSTATUS.
+    fn initialize(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(correlation_vector::initialize(vector(call.arg(1)), call.arg(2) as u32, call.arg(3))))
+    }
+
+    /// RtlIncrementCorrelationVector(CorrelationVector) -> NTSTATUS.
+    fn increment(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(correlation_vector::increment(vector(call.arg(1)))))
+    }
+
+    /// RtlExtendCorrelationVector(CorrelationVector) -> NTSTATUS.
+    fn extend(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(correlation_vector::extend(vector(call.arg(1)))))
+    }
+
+    /// RtlValidateCorrelationVector(Vector) -> NTSTATUS.
+    fn validate(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(correlation_vector::validate((call.arg(1) != 0).then(|| vector(call.arg(1))))))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "rtl-correlation-vector",
+        names: &["RtlInitializeCorrelationVector", "RtlIncrementCorrelationVector", "RtlExtendCorrelationVector", "RtlValidateCorrelationVector"],
+        handlers: &[initialize, increment, extend, validate],
+        data_exports: &[],
+    };
+}
+
+pub mod rtl_crc32 {
+    //! RtlCrc32 (CRC-32C); a lógica mora em `rtl/checksum`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::rtl::checksum;
+    use crate::rtl::KernelError;
+
+    /// RtlCrc32(Buffer, Size, InitialCrc) -> ULONG.
+    fn crc32(call: &Call) -> Result<u64, KernelError> {
+        Ok(checksum::crc32(call.arg(1), call.arg(2), call.arg(3) as u32) as u64)
+    }
+
+    pub static GROUP: Group = Group { name: "rtl-crc32", names: &["RtlCrc32"], handlers: &[crc32], data_exports: &[] };
+}
+
+pub mod rtl_current_user_key {
+    //! RtlOpenCurrentUser; a lógica mora em `rtl/registry`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::rtl::registry;
+    use crate::rtl::KernelError;
+
+    /// RtlOpenCurrentUser(DesiredAccess, CurrentUserKey) -> NTSTATUS.
+    fn open_current_user(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(registry::open_current_user(call.arg(1) as u32, call.arg(2))?))
+    }
+
+    pub static GROUP: Group = Group { name: "rtl-current-user-key", names: &["RtlOpenCurrentUser"], handlers: &[open_current_user], data_exports: &[] };
 }

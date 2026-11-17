@@ -1,7 +1,8 @@
 //! Handles de diretórios e links do namespace.
 //!
-//! NtOpen/NtCreateDirectoryObject, NtOpen/NtCreateSymbolicLinkObject,
-//! NtQuerySymbolicLinkObject, NtQueryDirectoryObject e NtMakeTemporaryObject.
+//! NtOpen/NtCreateDirectoryObject, NtOpen/NtCreateSymbolicLinkObject (e o
+//! ZwCreateSymbolicLinkObject de modo kernel), NtQuerySymbolicLinkObject,
+//! NtQueryDirectoryObject e NtMakeTemporaryObject.
 //! Os handles de usuário do processo corrente entram com a fase 7.
 
 use alloc::string::String;
@@ -22,6 +23,7 @@ const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
 const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
 const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
 const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 
 /// Campo de uma estrutura do chamador (de modo usuário ou não): sonda e um
 /// acesso da largura do campo, o `__try` do NT. Sem exigir o alinhamento da
@@ -155,6 +157,22 @@ pub fn create_link(output_handle: u64, access: u32, attributes: u64, target: &st
         object_manager::remove_named(node);
     }
     status
+}
+
+/// ZwCreateSymbolicLinkObject(LinkHandle, DesiredAccess, ObjectAttributes,
+/// LinkTarget): o NtCreateSymbolicLinkObject (RVA 0x68ef10, cauda 0x808eb0)
+/// com PreviousMode KernelMode. O UNICODE_STRING do destino é copiado sem
+/// sonda; MaximumLength ímpar perde o bit 0; MaximumLength 0, Length acima
+/// de MaximumLength ou Length ímpar -> STATUS_INVALID_PARAMETER, sem criar
+/// nada; senão o ObCreateSymbolicLink.
+pub fn create_link_from_kernel(output_handle: u64, access: u32, attributes: u64, target: &UnicodeString) -> u32 {
+    let length = target.length.get();
+    let maximum = target.maximum_length.get() & !1;
+    if maximum == 0 || length > maximum || length & 1 != 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let text = crate::ntos::rtl::guest_strings::read_unicode_string(target.address());
+    create_link(output_handle, access, attributes, &text, false)
 }
 
 #[allow(clippy::too_many_arguments)]

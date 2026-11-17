@@ -1,7 +1,10 @@
 //! Rotinas de segurança do Rtl sobre estruturas do convidado —
 //! RtlMapGenericMask, RtlAddAce, RtlGetSaclSecurityDescriptor,
 //! Rtl{Get,Set}GroupSecurityDescriptor, RtlSetControlSecurityDescriptor,
-//! RtlSubAuthorityCountSid e RtlCopyLuid.
+//! RtlSubAuthorityCountSid e RtlCopyLuid; no fim, os vetores de
+//! SID_AND_ATTRIBUTES e LUID_AND_ATTRIBUTES (RtlCopySidAndAttributesArray,
+//! RtlCopyLuidAndAttributesArray, RtlSidHashInitialize) e o
+//! RtlLengthSidAsUnicodeString.
 //!
 //! Validação e leitura dos componentes vêm de `se::{acl, descriptor}`; os
 //! NTSTATUS seguem as convenções do componente `se`. Cada rotina com status
@@ -794,4 +797,100 @@ pub fn are_all_accesses_granted(granted: u32, desired: u32) -> bool {
 /// comum (0x6a5bf0).
 pub fn are_any_accesses_granted(granted: u32, desired: u32) -> bool {
     desired & granted != 0
+}
+
+// ---- Vetores de SID_AND_ATTRIBUTES e LUID_AND_ATTRIBUTES (ntoskrnl 19041) ----
+// RtlCopySidAndAttributesArray 0x5dc280, RtlCopyLuidAndAttributesArray
+// 0x5d9eb0, RtlSidHashInitialize 0x2d6590, RtlLengthSidAsUnicodeString
+// 0x6efae8.
+
+use crate::ntos::inc::types::{LuidAndAttributes, SidAndAttributes, SidAndAttributesHash};
+
+/// SIDs marcados no SID_AND_ATTRIBUTES_HASH (os bits de cada balde são
+/// ULONG_PTR).
+const HASHED_SIDS: usize = 64;
+
+/// RtlCopySidAndAttributesArray(Count, Source, SidAreaSize, Destination,
+/// SidArea, RemainingSidArea, RemainingSidAreaSize): para cada entrada, o
+/// SID vai para o próximo trecho da área (8 + 4 * SubAuthorityCount bytes,
+/// sem alinhar) e o destino recebe o ponteiro e os Attributes. SID que não
+/// cabe no que sobra = STATUS_BUFFER_TOO_SMALL, com as entradas anteriores
+/// já copiadas e sem gravar as saídas; senão grava o fim da área usada e o
+/// tamanho restante.
+pub fn copy_sid_and_attributes_array(count: u32, source: u64, sid_area_size: u32, destination: u64, sid_area: u64, remaining_area: &Field<u64>, remaining_size: &Field<u32>) -> u32 {
+    // SAFETY: Source e Destination têm Count entradas SID_AND_ATTRIBUTES.
+    let (sources, targets) = unsafe { (SidAndAttributes::array_at(source, count as usize), SidAndAttributes::array_at(destination, count as usize)) };
+    let mut left = sid_area_size;
+    let mut cursor = sid_area;
+    for (from, to) in sources.iter().zip(targets) {
+        let sid = from.sid.get();
+        let length = crate::ntos::se::sid::length(sid);
+        if length > left {
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+        to.sid.set(cursor);
+        left -= length;
+        to.attributes.set(from.attributes.get());
+        guest::write_bytes(cursor, &guest::read_bytes(sid, length as usize));
+        cursor += length as u64;
+    }
+    remaining_area.set(cursor);
+    remaining_size.set(left);
+    0
+}
+
+/// RtlCopyLuidAndAttributesArray(Count, Source, Destination): copia as
+/// Count entradas de 12 bytes (LUID e Attributes).
+pub fn copy_luid_and_attributes_array(count: u32, source: u64, destination: u64) {
+    // SAFETY: Source e Destination têm Count entradas LUID_AND_ATTRIBUTES.
+    let (sources, targets) = unsafe { (LuidAndAttributes::array_at(source, count as usize), LuidAndAttributes::array_at(destination, count as usize)) };
+    for (from, to) in sources.iter().zip(targets) {
+        to.luid.low_part.set(from.luid.low_part.get());
+        to.luid.high_part.set(from.luid.high_part.get());
+        to.attributes.set(from.attributes.get());
+    }
+}
+
+/// RtlSidHashInitialize(SidAttr, SidCount, SidAttrHash): Hash NULL =
+/// STATUS_INVALID_PARAMETER. Zera o hash; com SidAttr e SidCount, grava os
+/// dois (a contagem inteira) e marca, para os primeiros 64 SIDs, o bit i em
+/// Hash[b & 0xF] e Hash[16 + (b >> 4)], onde b é o byte baixo da última
+/// subautoridade (com SubAuthorityCount 0, o byte 4 do SID).
+pub fn sid_hash_initialize(sid_attributes: u64, count: u32, hash: Option<&SidAndAttributesHash>) -> u32 {
+    const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+    let Some(hash) = hash else { return STATUS_INVALID_PARAMETER };
+    guest::write_bytes(hash.address(), &[0u8; SidAndAttributesHash::SIZE as usize]);
+    if sid_attributes == 0 || count == 0 {
+        return 0;
+    }
+    hash.sid_attr.set(sid_attributes);
+    hash.sid_count.set(count);
+    // SAFETY: SidAttr tem SidCount entradas SID_AND_ATTRIBUTES.
+    let entries = unsafe { SidAndAttributes::array_at(sid_attributes, (count as usize).min(HASHED_SIDS)) };
+    for (index, entry) in entries.iter().enumerate() {
+        let sid = sid_at(entry.sid.get());
+        // Byte baixo de SubAuthority[count - 1] (o vetor do NT é ANYSIZE_ARRAY).
+        let last = sid.sub_authority[0].address().wrapping_add((sid.sub_authority_count.get() as u64).wrapping_sub(1).wrapping_mul(4));
+        let byte = guest::read8(last) as usize;
+        let bit = 1u64 << index;
+        for slot in [byte & 0xF, 16 + (byte >> 4)] {
+            let cell = &hash.hash[slot];
+            cell.set(cell.get() | bit);
+        }
+    }
+    0
+}
+
+/// RtlLengthSidAsUnicodeString(Sid, StringLength): SID inválido =
+/// STATUS_INVALID_SID; senão o teto em bytes do texto "S-1-..." sem NUL:
+/// 0x1C (0x24 se algum dos dois bytes altos da autoridade não é zero) mais
+/// 0x16 por subautoridade.
+pub fn length_sid_as_unicode_string(sid: u64) -> Result<u32, u32> {
+    const STATUS_INVALID_SID: u32 = 0xC000_0078;
+    if !crate::ntos::se::sid::valid(sid) {
+        return Err(STATUS_INVALID_SID);
+    }
+    let header = sid_at(sid);
+    let base = if header.identifier_authority.value[0].get() != 0 || header.identifier_authority.value[1].get() != 0 { 0x24 } else { 0x1C };
+    Ok(header.sub_authority_count.get() as u32 * 0x16 + base)
 }

@@ -1824,3 +1824,131 @@ pub mod fsrtl_mup_provider {
         data_exports: &[],
     };
 }
+
+pub mod fsrtl_mcb {
+    //! MCB de 32 bits (FsRtlInitializeMcb, FsRtlUninitializeMcb,
+    //! FsRtlAddMcbEntry) e FsRtlLookupLastLargeMcbEntry: a lógica mora em
+    //! `fsrtl/large_mcb.rs`.
+
+    use crate::ntos::fsrtl::large_mcb;
+    use crate::ntos::inc::types::extra_fs_fat::LargeMcb;
+    use crate::ntos::inc::types::NtStruct;
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::rtl::KernelError;
+
+    fn mcb(address: u64) -> &'static LargeMcb {
+        // SAFETY: o FS passa o MCB (o mesmo objeto do LARGE_MCB) do seu FCB.
+        unsafe { LargeMcb::at(address) }
+    }
+
+    /// FsRtlInitializeMcb(Mcb, PoolType).
+    fn initialize(call: &Call) -> Result<u64, KernelError> {
+        large_mcb::initialize(mcb(call.arg(1)), call.arg(2) as u32).map(|_| 0)
+    }
+
+    /// FsRtlUninitializeMcb(Mcb).
+    fn uninitialize(call: &Call) -> Result<u64, KernelError> {
+        large_mcb::uninitialize(mcb(call.arg(1))).map(|_| 0)
+    }
+
+    /// FsRtlAddMcbEntry(Mcb, Vbn, Lbn, SectorCount) -> BOOLEAN.
+    fn add_entry(call: &Call) -> Result<u64, KernelError> {
+        large_mcb::add_mcb_entry(mcb(call.arg(1)), call.arg(2) as u32, call.arg(3) as u32, call.arg(4) as u32).map(|added| added as u64)
+    }
+
+    /// FsRtlLookupLastLargeMcbEntry(Mcb, *LargeVbn, *LargeLbn) -> BOOLEAN.
+    fn lookup_last(call: &Call) -> Result<u64, KernelError> {
+        large_mcb::lookup_last(mcb(call.arg(1)), call.arg(2), call.arg(3)).map(|found| found as u64)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "fsrtl-mcb",
+        names: &["FsRtlInitializeMcb", "FsRtlUninitializeMcb", "FsRtlAddMcbEntry", "FsRtlLookupLastLargeMcbEntry"],
+        handlers: &[initialize, uninitialize, add_entry, lookup_last],
+        data_exports: &[],
+    };
+}
+
+pub mod fsrtl_mup_register {
+    //! FsRtlRegisterMupCalls: a tabela do MUP mora em `fsrtl/small::mup_calls`.
+
+    use crate::ntos::fsrtl::small::mup_calls;
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::rtl::KernelError;
+
+    /// FsRtlRegisterMupCalls(Callbacks) -> VOID.
+    fn register_mup_calls(call: &Call) -> Result<u64, KernelError> {
+        mup_calls::register(call.arg(1));
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group { name: "fsrtl-mup-register", names: &["FsRtlRegisterMupCalls"], handlers: &[register_mup_calls], data_exports: &[] };
+}
+
+pub mod fsrtl_notify_cleanup_all {
+    //! FsRtlNotifyCleanupAll: a lógica mora em `fsrtl/notify.rs`.
+
+    use crate::ntos::fsrtl::notify;
+    use crate::ntos::inc::types::{ListEntry, NtStruct};
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::rtl::KernelError;
+
+    /// FsRtlNotifyCleanupAll(NotifySync, NotifyList).
+    fn cleanup_all(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: a NotifyList (LIST_ENTRY) do file system.
+        notify::cleanup_all(call.arg(1), unsafe { ListEntry::at(call.arg(2)) }).map(|()| 0)
+    }
+
+    pub static GROUP: Group = Group { name: "fsrtl-notify-cleanup-all", names: &["FsRtlNotifyCleanupAll"], handlers: &[cleanup_all], data_exports: &[] };
+}
+
+pub mod fsrtl_remove_dots {
+    //! FsRtlRemoveDotsFromPath: a lógica mora em `fsrtl/name.rs`.
+
+    use crate::ntos::fsrtl::name;
+    use crate::ntos::inc::field::{Field, NtStruct};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::rtl::KernelError;
+
+    /// FsRtlRemoveDotsFromPath(OriginalString, PathLength, *NewLength) -> NTSTATUS.
+    fn remove_dots_from_path(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: o PUSHORT de saída do chamador de modo kernel.
+        Ok(signed_status(name::remove_dots_from_path(call.arg(1), call.arg(2) as u16, unsafe { Field::<u16>::at(call.arg(3)) })))
+    }
+
+    pub static GROUP: Group = Group { name: "fsrtl-remove-dots", names: &["FsRtlRemoveDotsFromPath"], handlers: &[remove_dots_from_path], data_exports: &[] };
+}
+
+pub mod fsrtl_filter_features {
+    //! FsRtlGetSupportedFeatures: a lógica mora em `fsrtl/filter.rs`.
+
+    use crate::ntos::fsrtl::filter;
+    use crate::ntos::inc::field::{Field, NtStruct};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::rtl::KernelError;
+
+    /// FsRtlGetSupportedFeatures(DeviceObject, SupportedFeatures*) -> NTSTATUS.
+    fn get_supported_features(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: o PULONG de saída do chamador de modo kernel.
+        Ok(signed_status(filter::get_supported_features(call.arg(1), unsafe { Field::<u32>::at(call.arg(2)) })))
+    }
+
+    pub static GROUP: Group = Group { name: "fsrtl-filter-features", names: &["FsRtlGetSupportedFeatures"], handlers: &[get_supported_features], data_exports: &[] };
+}
+
+pub mod fsrtl_cached_vdl {
+    //! FsRtlQueryCachedVdl: a lógica mora em `fsrtl/device_control.rs`.
+
+    use crate::ntos::fsrtl::device_control;
+    use crate::ntos::inc::field::{Field, NtStruct};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::rtl::KernelError;
+
+    /// FsRtlQueryCachedVdl(FileObject, Vdl*) -> NTSTATUS.
+    fn query_cached_vdl(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: o PLONGLONG de saída do chamador de modo kernel.
+        Ok(signed_status(device_control::query_cached_vdl(call.arg(1), unsafe { Field::<i64>::at(call.arg(2)) })?))
+    }
+
+    pub static GROUP: Group = Group { name: "fsrtl-cached-vdl", names: &["FsRtlQueryCachedVdl"], handlers: &[query_cached_vdl], data_exports: &[] };
+}

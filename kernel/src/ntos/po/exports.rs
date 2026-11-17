@@ -442,3 +442,66 @@ pub mod po_fx_primary_device {
 
     pub static GROUP: Group = Group { name: "po-fx-primary-device", names: &["PoFxSetComponentWake", "PoFxRegisterPrimaryDevice"], handlers: &[set_component_wake, register_primary_device], data_exports: &[] };
 }
+
+pub mod po_power_requests {
+    //! PoCreatePowerRequest, PoSetPowerRequest, PoClearPowerRequest e
+    //! PoDeletePowerRequest; a lógica mora em `po/power_request.rs`.
+
+    use crate::ntos::inc::field::{Field, NtStruct};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::po::power_request;
+    use crate::rtl::KernelError;
+
+    /// PoCreatePowerRequest(PowerRequest*, DeviceObject, Context) -> NTSTATUS.
+    fn create_power_request(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: o PVOID* de saída do chamador.
+        Ok(signed_status(power_request::create(unsafe { Field::<u64>::at(call.arg(1)) }, call.arg(2), call.arg(3))?))
+    }
+
+    /// PoSetPowerRequest(PowerRequest, Type) -> NTSTATUS.
+    fn set_power_request(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(power_request::set(call.arg(1), call.arg(2) as u32)))
+    }
+
+    /// PoClearPowerRequest(PowerRequest, Type) -> NTSTATUS.
+    fn clear_power_request(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(power_request::clear(call.arg(1), call.arg(2) as u32)))
+    }
+
+    /// PoDeletePowerRequest(PowerRequest).
+    fn delete_power_request(call: &Call) -> Result<u64, KernelError> {
+        power_request::delete(call.arg(1))?;
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group {
+        name: "po-power-requests",
+        names: &["PoCreatePowerRequest", "PoSetPowerRequest", "PoClearPowerRequest", "PoDeletePowerRequest"],
+        handlers: &[create_power_request, set_power_request, clear_power_request, delete_power_request],
+        data_exports: &[],
+    };
+}
+
+pub mod po_processor_power {
+    //! PoNotifyMediaBuffering e PoCpuIdledSinceLastCallImprecise; a lógica
+    //! mora em `po/processor_power.rs`.
+
+    use crate::ntos::inc::field::{Field, NtStruct};
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::po::processor_power;
+    use crate::rtl::KernelError;
+
+    /// PoNotifyMediaBuffering(Engaged).
+    fn notify_media_buffering(call: &Call) -> Result<u64, KernelError> {
+        processor_power::notify_media_buffering(call.arg(1) as u8 != 0);
+        Ok(0)
+    }
+
+    /// PoCpuIdledSinceLastCallImprecise(Processor, LastIdleTime*) -> BOOLEAN.
+    fn cpu_idled_since_last_call(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: o PULONG64 do chamador.
+        Ok(processor_power::cpu_idled_since_last_call(call.arg(1) as u32, unsafe { Field::<u64>::at(call.arg(2)) }) as u64)
+    }
+
+    pub static GROUP: Group = Group { name: "po-processor-power", names: &["PoNotifyMediaBuffering", "PoCpuIdledSinceLastCallImprecise"], handlers: &[notify_media_buffering, cpu_idled_since_last_call], data_exports: &[] };
+}

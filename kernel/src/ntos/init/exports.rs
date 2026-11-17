@@ -66,7 +66,7 @@ pub struct Group {
 }
 
 /// Grupos implementados (qualquer ordem: a posição vem de `GROUP_LAYOUT`).
-fn groups() -> [&'static Group; 509] {
+fn groups() -> [&'static Group; 551] {
     [
         &crate::ntos::ps::exports::ps_jobs::GROUP,
         &crate::ntos::alpc::exports::zw_alpc_server::GROUP,
@@ -578,6 +578,48 @@ fn groups() -> [&'static Group; 509] {
         &crate::ntos::ex::exports::time_keeping::GROUP,
         &crate::ntos::ke::exports::ke_processor_profile::GROUP,
         &crate::ntos::ke::exports::ke_xstate_support::GROUP,
+        &crate::ntos::rtl::exports::rtl_unicode_prefix_next::GROUP,
+        &crate::ntos::rtl::exports::rtl_bitmap_ex_set::GROUP,
+        &crate::ntos::rtl::exports::crt_wide_copy_format::GROUP,
+        &crate::ntos::rtl::exports::rtl_network_string_ex::GROUP,
+        &crate::ntos::rtl::exports::rtl_unicode_string_ex::GROUP,
+        &crate::ntos::rtl::exports::rtl_sid_attribute_arrays::GROUP,
+        &crate::ntos::rtl::exports::rtl_correlation_vector::GROUP,
+        &crate::ntos::rtl::exports::rtl_crc32::GROUP,
+        &crate::ntos::rtl::exports::rtl_current_user_key::GROUP,
+        &crate::ntos::se::exports::se_logon_session_notify::GROUP,
+        &crate::ntos::se::exports::se_token_session_queries::GROUP,
+        &crate::ntos::se::exports::se_token_attributes_set::GROUP,
+        &crate::ntos::se::exports::zw_compare_tokens::GROUP,
+        &crate::ntos::se::exports::se_examine_sacl::GROUP,
+        &crate::ntos::se::exports::se_cached_signing_level::GROUP,
+        &crate::ntos::se::exports::se_public_default_dacl::GROUP,
+        &crate::ntos::kse::exports::kse_shim_registration_ex::GROUP,
+        &crate::ntos::ps::exports::ps_charge_pool_quota::GROUP,
+        &crate::ntos::fsrtl::exports::fsrtl_mcb::GROUP,
+        &crate::ntos::fsrtl::exports::fsrtl_mup_register::GROUP,
+        &crate::ntos::fsrtl::exports::fsrtl_notify_cleanup_all::GROUP,
+        &crate::ntos::fsrtl::exports::fsrtl_remove_dots::GROUP,
+        &crate::ntos::fsrtl::exports::fsrtl_filter_features::GROUP,
+        &crate::ntos::fsrtl::exports::fsrtl_cached_vdl::GROUP,
+        &crate::ntos::cc::exports::cc_volume_dirty_data::GROUP,
+        &crate::ntos::io::exports::io_irp_file_parameters::GROUP,
+        &crate::ntos::io::exports::io_file_services::GROUP,
+        &crate::ntos::ob::exports::ob_symbolic_link_create::GROUP,
+        &crate::ntos::io::exports::io_irp_ex::GROUP,
+        &crate::ntos::io::exports::io_enqueue_irp::GROUP,
+        &crate::ntos::io::exports::io_attribution_irp::GROUP,
+        &crate::ntos::io::exports::io_report_resource_detection::GROUP,
+        &crate::ntos::ex::exports::ex_push_lock_release::GROUP,
+        &crate::ntos::ex::exports::ex_push_lock_address_wait::GROUP,
+        &crate::ntos::ex::exports::ex_resource_critical_wait_exclusive::GROUP,
+        &crate::ntos::ex::exports::ex_firmware_table::GROUP,
+        &crate::ntos::mm::exports::mm_mdl_pages_cached::GROUP,
+        &crate::ntos::mm::exports::mm_copy_memory::GROUP,
+        &crate::ntos::ke::exports::ke_thread_tag::GROUP,
+        &crate::ntos::ke::exports::ke_raise_user_exception::GROUP,
+        &crate::ntos::po::exports::po_power_requests::GROUP,
+        &crate::ntos::po::exports::po_processor_power::GROUP,
     ]
 }
 

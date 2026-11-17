@@ -243,6 +243,11 @@ fn filter(existing: u64, flags: u32, disable: &[(Sid, u32)], delete: &[u32], res
         token_flags |= TOKEN_IS_FILTERED;
     }
     tokens::body(token).token_flags.set(token_flags);
+    // O token filtrado ficou restrito: a sessão de logon guarda uma cópia
+    // primária do original (SepSetLogonSessionToken).
+    if !kept.is_empty() || flags & WRITE_RESTRICTED != 0 {
+        crate::ntos::se::logon_session::set_session_token(existing);
+    }
     Ok(Ok(token))
 }
 

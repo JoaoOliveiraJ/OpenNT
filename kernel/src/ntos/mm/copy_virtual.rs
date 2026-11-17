@@ -114,3 +114,113 @@ fn write_accessible(address: u64, bytes: &[u8]) -> u64 {
     }
     written as u64
 }
+
+// ---- MmCopyMemory (ntoskrnl 19041 rva 0x30c030) ---------------------------------
+//
+// MmCopyMemory(TargetAddress, SourceAddress, NumberOfBytes, Flags,
+// NumberOfBytesTransferred): *NumberOfBytesTransferred começa em zero; Flags
+// precisa ser exatamente MM_COPY_MEMORY_PHYSICAL (1) ou MM_COPY_MEMORY_VIRTUAL
+// (2), com IRQL <= APC_LEVEL, senão STATUS_INVALID_PARAMETER_4.
+// - Física: MiCheckPhysicalAddressRange recusa (STATUS_CONFLICTING_ADDRESSES)
+//   a faixa vazia ou que dá a volta, a que passa da largura física das MTRRs
+//   (KiMtrrMaskBase) e, num processador AMD, a que toca a janela do
+//   HyperTransport (0xFD_0000_0000..0xFF_FFFF_FFFF).
+// - Virtual: a faixa vazia ou que dá a volta é STATUS_CONFLICTING_ADDRESSES;
+//   inteira abaixo de MM_HIGHEST_USER_ADDRESS (o fim exclusivo também), é o
+//   ZwReadVirtualMemory do processo corrente; uma VA não canônica, ou que
+//   cruza a fronteira do usuário, é STATUS_CONFLICTING_ADDRESSES.
+// - Física e virtual de sistema andam página a página (mais de 2^32 páginas
+//   é STATUS_INVALID_PARAMETER_2): a página de sistema sem tradução
+//   (MiTranslatePageForCopy) é STATUS_INVALID_ADDRESS, um destino que falha
+//   na cópia (o __except do MiCopySinglePage) é STATUS_ACCESS_VIOLATION; a
+//   contagem é o que foi copiado antes da página que parou. A página física
+//   é lida pelo mapa de I/O do OpenNT (`io_space`); uma que ele não mapeia
+//   fica sem tradução.
+
+const MM_COPY_MEMORY_PHYSICAL: u32 = 1;
+const MM_COPY_MEMORY_VIRTUAL: u32 = 2;
+const STATUS_INVALID_PARAMETER_2: u32 = 0xC000_00F1;
+const STATUS_INVALID_PARAMETER_4: u32 = 0xC000_00F2;
+const STATUS_CONFLICTING_ADDRESSES: u32 = 0xC000_0018;
+const STATUS_INVALID_ADDRESS: u32 = 0xC000_0141;
+const MM_HIGHEST_USER_ADDRESS: u64 = 0x7FFF_FFFE_FFFF;
+const SYSTEM_RANGE_START: u64 = 0xFFFF_8000_0000_0000;
+/// A janela do HyperTransport que os processadores AMD reservam.
+const HYPERTRANSPORT_START: u64 = 0xFD_0000_0000;
+const HYPERTRANSPORT_END: u64 = 0xFF_FFFF_FFFF;
+
+/// KiMtrrMaskBase: a máscara do endereço físico das MTRRs (a largura do
+/// CPUID 0x80000008, 36 bits sem a folha), zero sem MTRR.
+fn mtrr_mask_base() -> u64 {
+    use crate::hal::cpu;
+    if cpu::cpuid(1)[3] & (1 << 12) == 0 {
+        return 0;
+    }
+    let width = if cpu::cpuid(0x8000_0000)[0] >= 0x8000_0008 { cpu::cpuid(0x8000_0008)[0] & 0xFF } else { 36 };
+    ((1u64 << width.clamp(12, 63)) - 1) & !(PAGE - 1)
+}
+
+/// MiCheckPhysicalAddressRange(Start, Length).
+fn physical_range_allowed(start: u64, length: u64) -> bool {
+    let Some(end) = start.checked_add(length).filter(|&end| end > start) else { return false };
+    let last = end - 1;
+    let mask = mtrr_mask_base();
+    if mask != 0 && last & !(PAGE - 1) > mask {
+        return false;
+    }
+    let amd = crate::ntos::ke::pcr::current().prcb.cpu_vendor.get() == crate::ntos::ke::processor_identity::vendor::AMD;
+    !(amd && last >= HYPERTRANSPORT_START && start <= HYPERTRANSPORT_END)
+}
+
+/// Lê um pedaço (dentro de uma página) da origem física ou virtual de sistema.
+fn read_piece(source: u64, length: usize, physical: bool) -> Option<Vec<u8>> {
+    if !physical {
+        return guest::try_read_bytes(source, length).ok();
+    }
+    let mapped = crate::ntos::mm::io_space::map_ex(source, length as u64);
+    if mapped == 0 {
+        return None;
+    }
+    let bytes = guest::read_bytes(mapped, length);
+    crate::ntos::mm::io_space::unmap(mapped, length as u64);
+    Some(bytes)
+}
+
+/// MmCopyMemory: (NTSTATUS, bytes copiados).
+pub fn copy_memory(target: u64, source: u64, length: u64, flags: u32) -> Result<(u32, u64), KernelError> {
+    if !matches!(flags, MM_COPY_MEMORY_PHYSICAL | MM_COPY_MEMORY_VIRTUAL) || irql::get_irql() > irql::APC_LEVEL {
+        return Ok((STATUS_INVALID_PARAMETER_4, 0));
+    }
+    let physical = flags == MM_COPY_MEMORY_PHYSICAL;
+    if physical {
+        if !physical_range_allowed(source, length) {
+            return Ok((STATUS_CONFLICTING_ADDRESSES, 0));
+        }
+    } else {
+        let Some(end) = source.checked_add(length).filter(|&end| end > source) else { return Ok((STATUS_CONFLICTING_ADDRESSES, 0)) };
+        if source <= MM_HIGHEST_USER_ADDRESS {
+            if end > MM_HIGHEST_USER_ADDRESS {
+                return Ok((STATUS_CONFLICTING_ADDRESSES, 0));
+            }
+            let current = process::get_current_process();
+            return copy_virtual_memory(current, source, current, target, length, KERNEL_MODE);
+        }
+        if source < SYSTEM_RANGE_START {
+            return Ok((STATUS_CONFLICTING_ADDRESSES, 0));
+        }
+    }
+    if (length + (PAGE - 1) + (source & (PAGE - 1))) >> 12 >= 1 << 32 {
+        return Ok((STATUS_INVALID_PARAMETER_2, 0));
+    }
+    let mut copied = 0u64;
+    while copied < length {
+        let at = source + copied;
+        let piece = (length - copied).min(PAGE - at % PAGE);
+        let Some(bytes) = read_piece(at, piece as usize, physical) else { return Ok((STATUS_INVALID_ADDRESS, copied)) };
+        if guest::try_write_bytes(target + copied, &bytes).is_err() {
+            return Ok((STATUS_ACCESS_VIOLATION, copied));
+        }
+        copied += piece;
+    }
+    Ok((0, copied))
+}

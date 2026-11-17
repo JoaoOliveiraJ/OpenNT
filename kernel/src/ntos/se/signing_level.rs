@@ -44,7 +44,7 @@ pub fn compare(actual: u8, expected: u8) -> u64 {
 
 /// SeGetCachedSigningLevel(FileObject, Flags*, SigningLevel*, Thumbprint,
 /// ThumbprintSize*, ThumbprintAlgorithm*).
-fn get_for_file_object(file_object: u64, flags: u64, level: u64, thumbprint: u64, size: u64, algorithm: u64) -> u32 {
+pub fn get_for_file_object(file_object: u64, flags: u64, level: u64, thumbprint: u64, size: u64, algorithm: u64) -> u32 {
     let routine = code_integrity::signing_callback(SigningCallback::GetFileCache);
     if routine == 0 {
         return STATUS_UNSUCCESSFUL;

@@ -437,12 +437,25 @@ pub fn find_set_bits_ex(bitmap: &crate::ntos::inc::types::RtlBitmapEx, count: u6
 /// o `bt` do bit; senão TRUE se nenhum bit de [início, início + Length)
 /// estiver ligado.
 pub fn are_bits_clear_ex(bitmap: &crate::ntos::inc::types::RtlBitmapEx, start: u64, length: u64) -> bool {
+    range_uniform_ex(bitmap, start, length, false)
+}
+
+/// RtlAreBitsSetEx(BitMapHeader, StartingIndex, Length) (0x586c10): as
+/// mesmas recusas do RtlAreBitsClearEx (início fora do mapa, Length 0, faixa
+/// que passa do fim); TRUE se todos os bits de [início, início + Length)
+/// estiverem ligados.
+pub fn are_bits_set_ex(bitmap: &crate::ntos::inc::types::RtlBitmapEx, start: u64, length: u64) -> bool {
+    range_uniform_ex(bitmap, start, length, true)
+}
+
+/// Todos os bits de [start, start + length) valem `set`.
+fn range_uniform_ex(bitmap: &crate::ntos::inc::types::RtlBitmapEx, start: u64, length: u64, set: bool) -> bool {
     let size = bitmap.size_of_bit_map.get();
     if start >= size {
         return false;
     }
     if length <= 1 {
-        return length == 1 && !test_bit_ex(bitmap, start);
+        return length == 1 && test_bit_ex(bitmap, start) == set;
     }
     if size - start < length {
         return false;
@@ -454,7 +467,8 @@ pub fn are_bits_clear_ex(bitmap: &crate::ntos::inc::types::RtlBitmapEx, start: u
         let low = if index == first_word { start & 63 } else { 0 };
         let high = if index == last_word { last & 63 } else { 63 };
         let mask = (u64::MAX >> (63 - high)) & (u64::MAX << low);
-        if word_ex(words, index).get() & mask != 0 {
+        let stored = word_ex(words, index).get();
+        if (if set { !stored } else { stored }) & mask != 0 {
             return false;
         }
     }

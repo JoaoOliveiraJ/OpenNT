@@ -1808,3 +1808,18 @@ pub mod ps_thread_prefetching {
 
     pub static GROUP: Group = Group { name: "ps-thread-prefetching", names: &["PsSetCurrentThreadPrefetching"], handlers: &[set_prefetching], data_exports: &[] };
 }
+
+pub mod ps_charge_pool_quota {
+    //! PsChargePoolQuota; a lógica mora em `ps/pool_quota`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::ps::pool_quota;
+    use crate::rtl::KernelError;
+
+    /// PsChargePoolQuota(Process, PoolType, Amount): VOID, levanta na falha.
+    fn charge(call: &Call) -> Result<u64, KernelError> {
+        pool_quota::charge_pool_quota(call.arg(1), call.arg(2) as u32, call.arg(3))
+    }
+
+    pub static GROUP: Group = Group { name: "ps-charge-pool-quota", names: &["PsChargePoolQuota"], handlers: &[charge], data_exports: &[] };
+}

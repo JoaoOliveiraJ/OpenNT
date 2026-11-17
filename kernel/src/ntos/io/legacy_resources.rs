@@ -128,6 +128,18 @@ fn fixed_requirements(list: u64) -> Option<resources::Requirements> {
     Some(resources::Requirements { interface_type: cm.interface_type, bus_number: cm.bus_number, slot_number: 0, alternatives: alloc::vec![needs] })
 }
 
+/// IoReportResourceForDetection(DriverObject, DriverList, DriverListSize,
+/// DeviceObject, DeviceList, DeviceListSize, ConflictDetected) (rva
+/// 0x89fe50): a mesma checagem de devnode do PnP (0xCA, 2, Device, Driver)
+/// e o mesmo IoReportResourceUsageInternal, com ArbiterRequestPnpDetected
+/// no lugar do ArbiterRequestLegacyReported. A diferença do 19041 entre os
+/// dois é o IopLegacyResourceAllocation não gravar o mapa de recursos no
+/// Registro para um pedido PnpDetected; o OpenNT não grava esse mapa para
+/// nenhum dos dois.
+pub fn report_for_detection(request: &ReportRequest, conflict_detected: Option<&Field<u8>>) -> u32 {
+    report_usage(request, conflict_detected)
+}
+
 /// IoReportResourceUsage.
 pub fn report_usage(request: &ReportRequest, conflict_detected: Option<&Field<u8>>) -> u32 {
     let device = request.device_object;

@@ -23,11 +23,11 @@
 //!   pode ser apagada com esse token vivo.
 //! - TokenSecurityAttributes (39): o
 //!   TOKEN_SECURITY_ATTRIBUTES_AND_OPERATION_INFORMATION (16 bytes: os
-//!   atributos e o vetor de operações), com o SeTcbPrivilege. As operações,
-//!   como o AuthzBasepSetSecurityAttributesToken: NONE (0), REPLACE_ALL (1,
-//!   troca todos), ADD (2, um nome que já existe é
-//!   STATUS_OBJECT_NAME_COLLISION), DELETE (3, um nome ausente é
-//!   STATUS_NOT_FOUND) e REPLACE (4, troca ou acrescenta).
+//!   atributos e o vetor de operações), com o SeTcbPrivilege. As operações
+//!   são as do AuthzBasepSetSecurityAttributesToken
+//!   (`se::security_attributes::apply_operations`): REPLACE_ALL (1) na
+//!   primeira troca todos, ADD (2), DELETE (3), REPLACE (4) e NONE (0), tudo
+//!   ou nada.
 //!
 //! - TokenAuditPolicy (16): com o SeTcbPrivilege e uma vez só (outro
 //!   pedido é STATUS_INVALID_PARAMETER); sem buffer marca o token sem
@@ -67,7 +67,6 @@ const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 const STATUS_NOT_IMPLEMENTED: u32 = 0xC000_0002;
-const STATUS_OBJECT_NAME_COLLISION: u32 = 0xC000_0035;
 const STATUS_INVALID_OWNER: u32 = 0xC000_005A;
 const STATUS_INVALID_PRIMARY_GROUP: u32 = 0xC000_005B;
 const STATUS_PRIVILEGE_NOT_HELD: u32 = 0xC000_0061;
@@ -75,7 +74,6 @@ const STATUS_TOKEN_ALREADY_IN_USE: u32 = 0xC000_012B;
 const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
 const STATUS_INVALID_ACL: u32 = 0xC000_0077;
 const STATUS_INVALID_SID: u32 = 0xC000_0078;
-const STATUS_NOT_FOUND: u32 = 0xC000_0225;
 const STATUS_INVALID_LABEL: u32 = 0xC000_0446;
 /// As classes do NtSetInformationToken 19041 (bit = classe).
 const VALID_CLASSES: u64 = 0x2480_0F8B_5070;
@@ -124,38 +122,6 @@ fn capture_sid(address: u64) -> Result<Sid, u32> {
         return Err(STATUS_INVALID_SID);
     }
     guest::try_read_bytes(address, 8 + header[1] as usize * 4).map_err(|_| STATUS_ACCESS_VIOLATION)
-}
-
-/// Aplica as operações de atributos de segurança ao conjunto do token.
-fn apply_operations(current: &mut Vec<SecurityAttribute>, attributes: Vec<SecurityAttribute>, operations: &[u32]) -> Result<(), u32> {
-    let position = |set: &Vec<SecurityAttribute>, name: &str| set.iter().position(|attribute| attribute.name.eq_ignore_ascii_case(name));
-    for (attribute, &operation) in attributes.into_iter().zip(operations) {
-        match operation {
-            0 => {}
-            1 => {
-                current.clear();
-                current.push(attribute);
-            }
-            2 => {
-                if position(current, &attribute.name).is_some() {
-                    return Err(STATUS_OBJECT_NAME_COLLISION);
-                }
-                current.push(attribute);
-            }
-            3 => match position(current, &attribute.name) {
-                Some(index) => {
-                    current.remove(index);
-                }
-                None => return Err(STATUS_NOT_FOUND),
-            },
-            4 => match position(current, &attribute.name) {
-                Some(index) => current[index] = attribute,
-                None => current.push(attribute),
-            },
-            _ => return Err(STATUS_INVALID_PARAMETER),
-        }
-    }
-    Ok(())
 }
 
 /// A última subautoridade de um SID (0 sem nenhuma).
@@ -429,8 +395,11 @@ pub fn set(token: u64, class: u32, information: u64, length: u32, mode: u8) -> R
             if !tcb() {
                 return Ok(STATUS_PRIVILEGE_NOT_HELD);
             }
-            tokens::update(token, |record| match apply_operations(&mut record.security_attributes, attributes, &operations) {
-                Ok(()) => 0,
+            tokens::update(token, |record| match security_attributes::apply_operations(&record.security_attributes, attributes, &operations) {
+                Ok(updated) => {
+                    record.security_attributes = updated;
+                    0
+                }
                 Err(status) => status,
             })
             .unwrap_or(STATUS_INVALID_PARAMETER)

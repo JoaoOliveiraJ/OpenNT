@@ -326,6 +326,37 @@ pub fn sample_cycles(thread: u64) -> u64 {
     kthread(thread).cycle_time.get()
 }
 
+/// KeUpdateThreadTag(Thread, Tag) (ntoskrnl 19041 rva 0x36b8a0): em
+/// DISPATCH_LEVEL, com a ThreadLock, troca KTHREAD.Tag quando muda e liga ou
+/// desliga o Header.Tagged (bit 20 da palavra do cabeçalho, LOCK BTS/BTR).
+/// Na thread corrente a troca fecha a contagem de ciclos do tag antigo
+/// (KiEndThreadCycleAccumulation) e abre a do novo; numa thread em execução
+/// em outra CPU o NT manda a troca por IPI (KiIpiUpdateThreadTag) para que a
+/// contagem feche lá. O OpenNT soma os ciclos só por thread
+/// (`sample_cycles`), sem divisão por tag: o fechamento é a amostra da
+/// thread corrente e, nas outras, a troca direta sob a trava.
+pub fn update_thread_tag(thread: u64, tag: u8) {
+    const TAGGED: i32 = (crate::ntos::inc::types::DispatcherHeader::TAGGED_MASK as i32) << 16;
+    // A amostra vem antes da ThreadLock: o `sample_cycles` toma a trava do
+    // despacho, que nunca é pedida com a ThreadLock na mão.
+    if thread == pcr::current_thread() && kthread(thread).tag.get() != tag {
+        sample_cycles(thread);
+    }
+    super::thread_lock::with_lock(thread, || {
+        let target = kthread(thread);
+        if target.tag.get() == tag {
+            return;
+        }
+        let header = target.header.lock.atomic();
+        if tag != 0 {
+            header.fetch_or(TAGGED, core::sync::atomic::Ordering::SeqCst);
+        } else {
+            header.fetch_and(!TAGGED, core::sync::atomic::Ordering::SeqCst);
+        }
+        target.tag.set(tag);
+    });
+}
+
 /// KeQueryRuntimeThread: tempo de kernel devolvido e de usuário gravado na
 /// saída opcional, em ticks do relógio (KeQueryTimeIncrement).
 pub fn query_runtime_thread(thread: u64, user_time: u64) -> u64 {

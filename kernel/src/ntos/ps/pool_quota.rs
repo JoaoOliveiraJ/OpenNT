@@ -86,6 +86,18 @@ pub fn charge_process_pool_quota(process: u64, pool_type: u32, amount: u64) -> R
     charge_counter(process, pool_type == PAGED_POOL, amount)
 }
 
+/// PsChargePoolQuota(Process, PoolType, Amount) (ntoskrnl 19041 rva
+/// 0x303000): o PsChargeProcessPoolQuota que, na falha
+/// (STATUS_QUOTA_EXCEEDED), levanta o status pelo RtlRaiseStatus em vez de
+/// devolvê-lo. No sucesso devolve 0 (o export é VOID).
+pub fn charge_pool_quota(process: u64, pool_type: u32, amount: u64) -> Result<u64, KernelError> {
+    let status = charge_process_pool_quota(process, pool_type, amount)?;
+    if status & 0x8000_0000 != 0 {
+        return crate::ntos::rtl::exceptions::raise_status(status, 0, 0, 1);
+    }
+    Ok(0)
+}
+
 /// PsReturnPoolQuota(Process, PoolType, Amount): devolve o que
 /// [`charge_process_pool_quota`] cobrou, pelo mesmo critério de tipo.
 pub fn return_pool_quota(process: u64, pool_type: u32, amount: u64) {

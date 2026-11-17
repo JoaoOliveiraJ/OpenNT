@@ -282,3 +282,18 @@ pub fn security_attribute_present(token: u64, name_pointer: u64) -> Result<bool,
     let present = security_attributes::select(&record.security_attributes, Some(&[name]))?.is_some();
     Ok(present)
 }
+
+/// SeQueryServerSiloToken(Token, Silo*) (ntoskrnl 19041 rva 0x693660): o
+/// SessionId do token, lido sob o lock dele, e o silo da sessão pelo
+/// PsGetSiloBySessionId; devolve o NTSTATUS (STATUS_INVALID_SESSION sem a
+/// sessão) e grava o silo só no sucesso.
+pub fn query_server_silo(token: u64, silo: &crate::ntos::inc::types::Field<u64>) -> u32 {
+    let session_id = tokens::with(token, |record| record.session_id).unwrap_or(u32::MAX);
+    match crate::ntos::ps::silo::query::silo_by_session_id(session_id) {
+        Ok(found) => {
+            silo.set(found);
+            0
+        }
+        Err(status) => status,
+    }
+}

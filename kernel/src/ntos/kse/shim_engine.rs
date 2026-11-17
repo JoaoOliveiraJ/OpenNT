@@ -46,3 +46,26 @@ pub fn register_shim(shim: u64, _reserved: u64, _flags: u32) -> u32 {
     debug_assert!(!engine_initialized());
     KSE_STATUS_UNSUCCESSFUL
 }
+
+// ---- KseRegisterShimEx / KseUnregisterShim ---------------------------------
+//
+// KseRegisterShimEx(Shim, Reserved, Flags, Context) (rva 0x7bdb20, o
+// corpo do KseRegisterShim, que passa Context NULL) e
+// KseUnregisterShim(Shim, Reserved1, Reserved2) (rva 0x8bfd90): Shim NULL =
+// STATUS_INVALID_PARAMETER; com o motor fora do estado inicializado (2),
+// STATUS_UNSUCCESSFUL antes de pegar o lock do motor, sem consultar a lista
+// de shims registrados (KsepIsShimRegistered) nem tocar no KSE_SHIM.
+
+/// KseRegisterShimEx(Shim, Reserved, Flags, Context).
+pub fn register_shim_ex(shim: u64, reserved: u64, flags: u32, _context: u64) -> u32 {
+    register_shim(shim, reserved, flags)
+}
+
+/// KseUnregisterShim(Shim, Reserved1, Reserved2).
+pub fn unregister_shim(shim: u64) -> u32 {
+    if shim == 0 {
+        return KSE_STATUS_INVALID_PARAMETER;
+    }
+    debug_assert!(!engine_initialized());
+    KSE_STATUS_UNSUCCESSFUL
+}

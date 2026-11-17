@@ -494,6 +494,13 @@ pub fn enter_shared(resource: u64) -> Result<u64, KernelError> {
     acquire(resource, Mode::Shared, true, true)
 }
 
+/// ExEnterCriticalRegionAndAcquireSharedWaitForExclusive (0x5b5290): o
+/// KeEnterCriticalRegion, o ExAcquireSharedWaitForExclusive(Resource, TRUE)
+/// e o KTHREAD.Win32Thread da thread corrente.
+pub fn enter_shared_wait_for_exclusive(resource: u64) -> Result<u64, KernelError> {
+    acquire(resource, Mode::WaitExclusive, true, true)
+}
+
 /// ExReleaseResourceForThreadLite: a última recursão entrega o recurso a
 /// leitores ou escritores conforme a fila e o modo anterior.
 pub fn release_for_thread(resource: u64, thread: u64) -> Result<(), KernelError> {

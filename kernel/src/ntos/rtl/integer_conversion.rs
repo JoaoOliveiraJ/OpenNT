@@ -1,5 +1,6 @@
 //! Inteiros em texto e de volta — RtlUnicodeStringToInteger,
-//! RtlIntegerToUnicodeString e RtlInt64ToUnicodeString.
+//! RtlUnicodeStringToInt64, RtlIntegerToUnicodeString e
+//! RtlInt64ToUnicodeString.
 //!
 //! As formatações aceitam as bases 2, 8, 10 e 16 (0 = 10) e gravam na
 //! UNICODE_STRING de destino já alocada; cada rotina devolve o NTSTATUS.
@@ -13,6 +14,9 @@ use crate::ntos::rtl::{guest_strings, unicode};
 
 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 const STATUS_BUFFER_OVERFLOW: u32 = 0x8000_0005;
+const STATUS_INTEGER_OVERFLOW: u32 = 0xC000_0095;
+/// WCHARs da cópia local do RtlUnicodeStringToInt64 (mais o NUL).
+const INT64_COPY_UNITS: u64 = 0x40;
 
 /// RtlUnicodeStringToInteger: base 0 = automática (0x, 0b, 0o, 0 octal).
 pub fn unicode_string_to_integer(string: u64, base: u32, value_out: u64) -> u32 {
@@ -275,4 +279,37 @@ pub fn integer_to_char(value: u32, base: u32, length: i32, output: u64) -> u32 {
     }
     guest::write_bytes(output, &digits);
     0
+}
+
+/// RtlUnicodeStringToInt64(String, Base, Number, EndPointer) (ntoskrnl 19041
+/// 0x914ef0): se o último WCHAR de MaximumLength é NUL (com MaximumLength >=
+/// Length + 2), converte direto no Buffer, até onde o wcstoxq parar (que
+/// pode passar de Length); senão converte uma cópia de até 64 WCHARs de
+/// Length, terminada em NUL. A conversão é o wcstoxq com sinal: *Number
+/// recebe o valor (saturado em LLONG_MAX/LLONG_MIN), *EndPointer (opcional)
+/// a posição correspondente no Buffer original. Estouro devolve
+/// STATUS_INTEGER_OVERFLOW; Base inválida converte 0 com sucesso.
+pub fn unicode_string_to_int64(string: &UnicodeString, base: u32, number: &Field<u64>, end_pointer: Option<&Field<u64>>) -> u32 {
+    let (length, maximum, buffer) = (string.length.get() as u64, string.maximum_length.get() as u64, string.buffer.get());
+    let direct = maximum >= length + 2 && guest::read16(buffer + (maximum >> 1) * 2 - 2) == 0;
+    let (text, copy) = if direct {
+        (buffer, 0)
+    } else {
+        let units = (length >> 1).min(INT64_COPY_UNITS);
+        let copy = guest::alloc_bytes((INT64_COPY_UNITS + 1) * 2);
+        guest::write_bytes(copy, &guest::read_bytes(buffer, units as usize * 2));
+        guest::write16(copy + units * 2, 0);
+        (copy, copy)
+    };
+    let stop = guest::alloc_bytes(8);
+    let (value, range_error) = super::crt::wcstoxq(text, stop, base, false);
+    number.set(value);
+    if let Some(end_pointer) = end_pointer {
+        end_pointer.set(buffer + (guest::read64(stop) - text) / 2 * 2);
+    }
+    guest::free_bytes(stop);
+    if copy != 0 {
+        guest::free_bytes(copy);
+    }
+    if range_error { STATUS_INTEGER_OVERFLOW } else { 0 }
 }

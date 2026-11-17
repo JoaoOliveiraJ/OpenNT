@@ -135,3 +135,52 @@ pub fn dispatch(vector: u32, registers: u64, fx: u64, interrupt: u64, workspace:
         hardware_offset,
     )?
 }
+
+// ---- KeRaiseUserException (ntoskrnl 19041 rva 0x515e60) -------------------------
+//
+// KeRaiseUserException(ExceptionStatus): em APC_LEVEL (elevando se abaixo),
+// quando a thread corrente tem um KTRAP_FRAME de modo usuário
+// (KTHREAD.TrapFrame com SegCs ímpar), grava o código em TEB.ExceptionCode e
+// troca o retorno do quadro: SegCs = 0x33 e Rip = KeRaiseUserExceptionDispatcher
+// (o KiRaiseUserExceptionDispatcher da NTDLL), que levanta o código no anel 3.
+// Fora de um quadro de usuário não faz nada. Devolve o próprio código.
+// O NT ainda prepara o retorno pelo callback de instrumentação do processo
+// (KiSetupForInstrumentationReturn) quando o quadro não está numa exceção.
+//
+// O OpenNT não publica KTRAP_FRAME para as chamadas de sistema: o estado de
+// usuário da thread é o CONTEXT salvo do runtime de modo usuário, aplicado
+// depois que a HAL grava o retorno do serviço. Numa chamada de sistema vinda
+// do anel 3, a mesma troca é feita nesse CONTEXT pelo
+// `ps::user::exceptions::raise_on_return`.
+
+const USER_CODE_SELECTOR: u16 = 0x33;
+
+/// KeRaiseUserException(ExceptionStatus) -> NTSTATUS.
+pub fn raise_user_exception(code: u32) -> u32 {
+    use crate::ntos::inc::types::{Kthread, KtrapFrame, Teb};
+    use crate::ntos::ke::irql;
+    let previous = (irql::get_irql() < irql::APC_LEVEL).then(|| irql::raise_irql(irql::APC_LEVEL));
+    let thread = crate::ntos::ps::process::get_current_thread();
+    if thread != 0 {
+        // SAFETY: a KTHREAD corrente.
+        let kthread = unsafe { Kthread::at(thread) };
+        let trap = kthread.trap_frame.get();
+        // SAFETY: KTHREAD.TrapFrame, quando não nulo, é o quadro vivo da thread.
+        let frame = (trap != 0).then(|| unsafe { KtrapFrame::at(trap) }).filter(|frame| frame.seg_cs.get() & 1 != 0);
+        match frame {
+            Some(frame) => {
+                // SAFETY: a TEB da thread corrente, mapeada no processo dela.
+                unsafe { Teb::at(kthread.teb.get()) }.exception_code.set(code as i32);
+                frame.seg_cs.set(USER_CODE_SELECTOR);
+                frame.rip.set(crate::ntos::ps::user::exceptions::raise_dispatcher());
+            }
+            None => {
+                crate::ntos::ps::user::exceptions::raise_on_return(thread, code);
+            }
+        }
+    }
+    if let Some(previous) = previous {
+        irql::lower_irql(previous as u64);
+    }
+    code
+}

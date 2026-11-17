@@ -818,13 +818,13 @@ pub mod zw {
 pub mod ex_lookaside_wnf {
     //! ExInitializeLookasideListEx / ExDeleteLookasideListEx e
     //! ExQueryWnfStateData. O lookaside reusa `ex/lookaside.rs`; a consulta WNF
-    //! reusa `ex/wnf/service::query`. A inscrição/desinscrição de kernel
+    //! pela inscrição mora em `ex/wnf/subscriptions`. A inscrição/desinscrição de kernel
     //! (ExSubscribe/ExUnsubscribeWnfStateChange) fica no grupo
     //! `ex-wnf-subscription`, depois que
     //! o motor WNF tiver remoção de assinatura.
 
     use crate::ntos::ex::lookaside;
-    use crate::ntos::ex::wnf::service as wnf_service;
+    use crate::ntos::ex::wnf::subscriptions as wnf_subscriptions;
     use crate::ntos::init::exports::{signed_status, Call, Group};
     use crate::rtl::KernelError;
 
@@ -840,11 +840,9 @@ pub mod ex_lookaside_wnf {
         Ok(0)
     }
 
-    /// ExQueryWnfStateData(StateName, TypeId, ExplicitScope, ChangeStamp,
-    /// Buffer, BufferSize): a mesma entrada do motor que o ZwQueryWnfStateData,
-    /// chamada em modo kernel. Nome indefinido devolve STATUS_OBJECT_NAME_NOT_FOUND.
+    /// ExQueryWnfStateData(Subscription, ChangeStamp, Buffer, BufferSize).
     fn query_wnf_state_data(call: &Call) -> Result<u64, KernelError> {
-        Ok(signed_status(wnf_service::query(call.arg(1), call.arg(2), call.arg(3), call.arg(4), call.arg(5), call.arg(6))?))
+        Ok(signed_status(wnf_subscriptions::query_subscription(call.arg(1), call.arg(2), call.arg(3), call.arg(4))?))
     }
 
     pub static GROUP: Group = Group {
@@ -1744,4 +1742,89 @@ pub mod time_keeping {
         ],
         data_exports: &[],
     };
+}
+
+pub mod ex_push_lock_release {
+    //! ExfReleasePushLockShared e ExfReleasePushLockExclusive: os caminhos
+    //! lentos de soltura das macros de push lock, com o modo conhecido; a
+    //! lógica mora em `ex/push_lock`.
+    //!
+    //! ntoskrnl 19041: ExfReleasePushLockShared (0x271af0) desconta um leitor
+    //! (ou, com aguardantes, o contador do bloco mais antigo) e acorda pelo
+    //! ExpWakePushLock quando cabe; ExfReleasePushLockExclusive (0x271ba0)
+    //! troca 1 por 0 ou solta o bit e acorda.
+
+    use crate::ntos::ex::push_lock;
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::rtl::KernelError;
+
+    fn release_shared(call: &Call) -> Result<u64, KernelError> {
+        push_lock::release_shared(call.arg(1), 0)?;
+        Ok(0)
+    }
+
+    fn release_exclusive(call: &Call) -> Result<u64, KernelError> {
+        push_lock::release_exclusive(call.arg(1), 0)?;
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group { name: "ex-push-lock-release", names: &["ExfReleasePushLockShared", "ExfReleasePushLockExclusive"], handlers: &[release_shared, release_exclusive], data_exports: &[] };
+}
+
+pub mod ex_push_lock_address_wait {
+    //! ExBlockOnAddressPushLock e ExUnblockOnAddressPushLockEx; a lógica mora
+    //! em `ex/unblock_push_lock`.
+
+    use crate::ntos::ex::unblock_push_lock;
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::rtl::KernelError;
+
+    /// ExBlockOnAddressPushLock(PushLock, TargetAddress, CompareAddress,
+    /// AddressSize, Timeout) -> NTSTATUS.
+    fn block_on_address(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(unblock_push_lock::block_on_address(call.arg(1), call.arg(2), call.arg(3), call.arg(4), call.arg(5))?))
+    }
+
+    /// ExUnblockOnAddressPushLockEx(PushLock, Flags).
+    fn unblock_on_address(call: &Call) -> Result<u64, KernelError> {
+        unblock_push_lock::unblock_on_address(call.arg(1), call.arg(2) as u32)?;
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group { name: "ex-push-lock-address-wait", names: &["ExBlockOnAddressPushLock", "ExUnblockOnAddressPushLockEx"], handlers: &[block_on_address, unblock_on_address], data_exports: &[] };
+}
+
+pub mod ex_resource_critical_wait_exclusive {
+    //! ExEnterCriticalRegionAndAcquireSharedWaitForExclusive; a lógica mora em
+    //! `ex/resource`.
+
+    use crate::ntos::ex::resource;
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::rtl::KernelError;
+
+    /// ExEnterCriticalRegionAndAcquireSharedWaitForExclusive(Resource) -> PVOID.
+    fn enter_shared_wait_for_exclusive(call: &Call) -> Result<u64, KernelError> {
+        resource::enter_shared_wait_for_exclusive(call.arg(1))
+    }
+
+    pub static GROUP: Group = Group { name: "ex-resource-critical-wait-exclusive", names: &["ExEnterCriticalRegionAndAcquireSharedWaitForExclusive"], handlers: &[enter_shared_wait_for_exclusive], data_exports: &[] };
+}
+
+pub mod ex_firmware_table {
+    //! ExGetSystemFirmwareTable; a lógica mora em `ex/firmware_table`.
+
+    use crate::ntos::ex::firmware_table;
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::inc::field::{Field, NtStruct};
+    use crate::rtl::KernelError;
+
+    /// ExGetSystemFirmwareTable(ProviderSignature, TableID, Buffer,
+    /// BufferLength, ReturnLength) -> NTSTATUS.
+    fn get_system_firmware_table(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: o PULONG ReturnLength opcional do chamador.
+        let returned = (call.arg(5) != 0).then(|| unsafe { Field::<u32>::at(call.arg(5)) });
+        Ok(signed_status(firmware_table::get_system_firmware_table(call.arg(1) as u32, call.arg(2) as u32, call.arg(3), call.arg(4) as u32, returned)?))
+    }
+
+    pub static GROUP: Group = Group { name: "ex-firmware-table", names: &["ExGetSystemFirmwareTable"], handlers: &[get_system_firmware_table], data_exports: &[] };
 }

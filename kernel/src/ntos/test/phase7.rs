@@ -2950,7 +2950,9 @@ fn user_create_token(assert: Assert) {
         let no_quality = create(2, luid);
         assert(bad_type == 0xC000_00A8 && no_session == 0xC000_005F && no_quality == 0xC000_00A5, "usercreatetoken: tipo, sessao de logon e nivel de impersonacao recusados");
         let _ = call("NtClose", own, 0, 0, 0);
-        assert(session == 0 && logon_session::delete_track(logon) == 0, "usercreatetoken: a sessao de logon sai depois do ultimo token");
+        // A sessão sai do banco quando o último token dela é destruído; o
+        // RmDeleteLogonSession posterior do LSA já não a acha.
+        assert(session == 0 && !logon_session::exists(logon, 0) && logon_session::delete_track(logon) == 0xC000_005F, "usercreatetoken: a sessao de logon sai com o ultimo token");
         if let Some(region) = memory::find_region(block) {
             memory::release_private_region(&region);
         }
@@ -4210,7 +4212,7 @@ fn user_alpc_zw_group(assert: Assert) {
     let _ = open_pointer::close(handle);
     let _ = open_pointer::close(second);
     transport::unregister(&listener);
-    assert(disconnected == Some(0) && again == Some(0xC000_0037) && port_objects::port_of(pointer).is_none() && exports::implemented() == 2078, "zwalpc: desconexao e grupo com 15 exports");
+    assert(disconnected == Some(0) && again == Some(0xC000_0037) && port_objects::port_of(pointer).is_none() && exports::implemented() == 2148, "zwalpc: desconexao e grupo com 15 exports");
     if let Some(region) = memory::find_region(block) {
         memory::release_private_region(&region);
     }

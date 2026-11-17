@@ -805,6 +805,31 @@ pub fn flush_buffers_file(handle: u64, io_status: u64) -> u32 {
     0
 }
 
+/// O bloco de argumentos de pilha de uma syscall (o 5º em +0x28).
+const SERVICE_STACK_ARGUMENTS: u64 = 0x28;
+
+/// NtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length,
+/// FileInformationClass) chamado por código de kernel: com PreviousMode
+/// KernelMode é o ZwSetInformationFile ([`set_information_file`], o
+/// IoStatusBlock e o buffer do chamador sem sonda); com UserMode é o serviço
+/// do sistema sobre os argumentos de quem chama (o handle da tabela do
+/// processo e os buffers de usuário sondados), com a classe no quinto
+/// argumento do bloco de pilha que a entrada de syscall entrega ao serviço.
+pub fn nt_set_information_file(previous_mode: u8, handle: u64, io_status: u64, input: u64, length: u32, class: u32) -> Result<u32, KernelError> {
+    if previous_mode == 0 {
+        return set_information_file(handle, io_status, input, class);
+    }
+    let Some(service) = crate::ntos::ps::user::state::handler("NtSetInformationFile") else { return Ok(0xC000_0002) };
+    let block = guest::alloc_bytes(SERVICE_STACK_ARGUMENTS + 8);
+    if block == 0 {
+        return Ok(0xC000_009A);
+    }
+    guest::write64(block + SERVICE_STACK_ARGUMENTS, class as u64);
+    let result = service(handle, io_status, input, length as u64, block);
+    guest::free_bytes(block);
+    result
+}
+
 /// ZwFsControlFile: IRP_MJ_FILE_SYSTEM_CONTROL ao dispositivo do handle.
 pub fn fs_control_file(handle: u64, io_status: u64, code: u32, input: u64, input_length: u32, output: u64, output_length: u32) -> Result<u32, KernelError> {
     let Some(entry) = entry_of(handle) else { return Ok(STATUS_INVALID_HANDLE) };

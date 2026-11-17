@@ -5,7 +5,8 @@
 //! FsRtlNotifyUninitializeSync 0x6a2c10, FsRtlNotifyFilterChangeDirectory 0x675020
 //! (FsRtlNotifyFullChangeDirectory 0x88d5e0 = ele sem FilterCallback),
 //! FsRtlNotifyFilterReportChange 0x6746f0 (FsRtlNotifyFullReportChange 0x88d650
-//! = ele sem FilterContext), FsRtlNotifyCleanup 0x675b00 e a variante Lite
+//! = ele sem FilterContext), FsRtlNotifyCleanup 0x675b00, FsRtlNotifyCleanupAll
+//! 0x88d4b0 e a variante Lite
 //! (FsRtlNotifyFilterChangeDirectoryLite 0x675b90,
 //! FsRtlNotifyFilterReportChangeLiteEx 0x675380; seção no fim do arquivo).
 //!
@@ -663,6 +664,25 @@ pub fn cleanup(sync: u64, list: &ListEntry, fs_context: u64) -> Result<(), Kerne
         complete_all(notify, STATUS_NOTIFY_CLEANUP);
         remove_entry(&notify.notify_list);
         dereference(notify);
+        Ok(())
+    })
+}
+
+/// FsRtlNotifyCleanupAll(NotifySync, NotifyList) (RVA 0x88d4b0): sob o
+/// NOTIFY_SYNC, o FsRtlNotifyCleanupOneEntry de cada NOTIFY_CHANGE da lista,
+/// do primeiro ao último, qualquer que seja o FsContext: CLEANUP_CALLED, os
+/// IRPs pendentes concluídos com STATUS_NOTIFY_CLEANUP, o elo fora da lista e
+/// a referência da lista solta (a última libera o SubjectContext e o
+/// NOTIFY_CHANGE).
+pub fn cleanup_all(sync: u64, list: &ListEntry) -> Result<(), KernelError> {
+    with_sync(sync, || {
+        for links in list_entries(list) {
+            let notify = notify_at(links - NOTIFY_LINKS);
+            set_flags(notify, CLEANUP_CALLED, 0);
+            complete_all(notify, STATUS_NOTIFY_CLEANUP);
+            remove_entry(&notify.notify_list);
+            dereference(notify);
+        }
         Ok(())
     })
 }

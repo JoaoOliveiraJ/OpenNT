@@ -54,6 +54,7 @@ pub mod hash_table;
 pub mod range_list;
 pub mod resource_encoding;
 pub mod checksum;
+pub mod correlation_vector;
 pub mod network_address;
 pub mod non_volatile;
 pub mod reparse;

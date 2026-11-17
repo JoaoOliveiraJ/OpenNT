@@ -4925,3 +4925,19 @@ pub type KguardedMutex = FastMutex;
 
 /// `KSPIN_LOCK` (wdm.h): um `ULONG_PTR`; use `KspinLock::at(endereço)` e `atomic()`.
 pub type KspinLock = Field<u64>;
+
+/// `CORRELATION_VECTOR` (wdm.h; 0x82 bytes): a versão (1 ou 2) e o texto
+/// ASCII do vetor, com RTL_CORRELATION_VECTOR_STRING_LENGTH (129) bytes.
+#[repr(C)]
+pub struct CorrelationVector {
+    pub version: Field<u8>,
+    pub vector: [Field<u8>; 129],
+}
+
+unsafe impl NtStruct for CorrelationVector {}
+
+const _: () = {
+    assert!(core::mem::size_of::<CorrelationVector>() == 0x82);
+    assert!(core::mem::offset_of!(CorrelationVector, version) == 0x0);
+    assert!(core::mem::offset_of!(CorrelationVector, vector) == 0x1);
+};

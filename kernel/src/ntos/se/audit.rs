@@ -338,6 +338,63 @@ fn examine_sacl(sacl: u64, token: u64, accesses: u32, granted: bool) -> (bool, b
     (audit, alarm)
 }
 
+/// SeExamineSacl(Sacl, ResourceSacl, Token, DesiredAccess, AccessGranted,
+/// GenerateAudit*, GenerateAlarm*) do ntoskrnl 19041 (rva 0x921390): o
+/// GenerateAudit. O GenerateAlarm sai sempre FALSE (o 19041 só zera).
+///
+/// Percorre as ACEs da SACL até a primeira que pede auditoria, pulando as
+/// inherit-only. Uma SYSTEM_AUDIT_ACE vale para o token quando o SID está
+/// nele pelo SepSidInToken (com as entradas só de negação) ou, num token
+/// anônimo (o usuário é S-1-5-7), quando o SID é World. Com algum bit pedido
+/// na máscara da ACE, audita a ACE SUCCESSFUL_ACCESS no acesso concedido e
+/// a FAILED_ACCESS no negado; sem bit em comum, só um pedido com
+/// MAXIMUM_ALLOWED audita, pela flag do resultado (SUCCESSFUL no concedido,
+/// FAILED no negado). As SYSTEM_AUDIT_CALLBACK_ACE sem dados de aplicação
+/// depois do SID são puladas, como no NT; as com expressão condicional
+/// também, porque o OpenNT ainda não avalia expressões condicionais
+/// (AuthzBasepEvaluateAceCondition), o mesmo que o SeSrpAccessCheck faz. O
+/// ResourceSacl só serve às expressões condicionais.
+pub fn examine_sacl_for_audit(sacl: u64, token: u64, desired: u32, granted: bool) -> bool {
+    if sacl == 0 || ace_count(sacl) == 0 {
+        return false;
+    }
+    let Some(subject) = tokens::with(token, crate::ntos::se::access_evaluation::Subject::from_token) else { return false };
+    let maximum_flag = if desired & MAXIMUM_ALLOWED == 0 {
+        0
+    } else if granted {
+        SUCCESSFUL_ACCESS_ACE_FLAG
+    } else {
+        FAILED_ACCESS_ACE_FLAG
+    };
+    let world = crate::ntos::se::model::sid(1, &[0]);
+    let anonymous = subject.user == crate::ntos::se::model::sid(5, &[7]);
+    let mut cursor = sacl + Acl::SIZE;
+    for _ in 0..ace_count(sacl) {
+        let ace_type = guest::read::<u8>(cursor + offset_of!(AceHeader, ace_type) as u64);
+        let flags = guest::read::<u8>(cursor + offset_of!(AceHeader, ace_flags) as u64);
+        let size = guest::read::<u16>(cursor + offset_of!(AceHeader, ace_size) as u64) as u64;
+        let sid_address = cursor + offset_of!(AccessAllowedAce, sid_start) as u64;
+        // SYSTEM_AUDIT_CALLBACK_ACE (0xD): pulada, veja acima.
+        if flags & INHERIT_ONLY_ACE == 0 && ace_type == SYSTEM_AUDIT_ACE_TYPE {
+            let ace_sid = sid::read(sid_address);
+            let applies = crate::ntos::se::access_evaluation::sid_in_token(&subject, &ace_sid, true) || (anonymous && ace_sid == world);
+            if applies {
+                let mask = guest::read::<u32>(cursor + offset_of!(AccessAllowedAce, mask) as u64);
+                let audit = if desired & mask != 0 {
+                    (flags & SUCCESSFUL_ACCESS_ACE_FLAG != 0 && granted) || (flags & FAILED_ACCESS_ACE_FLAG != 0 && !granted)
+                } else {
+                    flags & maximum_flag != 0
+                };
+                if audit {
+                    return true;
+                }
+            }
+        }
+        cursor += size;
+    }
+    false
+}
+
 fn name_of(pointer: u64) -> String {
     if pointer == 0 { String::new() } else { guest_strings::try_read_unicode_string(pointer).unwrap_or_default() }
 }

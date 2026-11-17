@@ -176,3 +176,20 @@ pub fn silo_identifier(silo: u64) -> u32 {
 pub fn silo_container_id(silo: u64) -> u64 {
     if silo == HOST_SILO { 0 } else { ejob(silo).container_id.address() }
 }
+
+/// PsGetSiloBySessionId(SessionId, Silo*) (ntoskrnl 19041 rva 0x6ad300):
+/// pelo MmGetSessionById, um processo da sessão, e dele o ServerSilo do
+/// MM_SESSION_SPACE; o processo é solto antes de devolver.
+/// `Err(STATUS_INVALID_SESSION)` sem a sessão.
+pub fn silo_by_session_id(session_id: u32) -> Result<u64, u32> {
+    const STATUS_INVALID_SESSION: u32 = 0xC000_0455;
+    let session_process = crate::ntos::mm::session::by_id(session_id);
+    if session_process == 0 {
+        return Err(STATUS_INVALID_SESSION);
+    }
+    let space = crate::ntos::mm::session::of_process(session_process);
+    // SAFETY: o processo referenciado mantém a sessão viva.
+    let silo = unsafe { crate::ntos::inc::types::MmSessionSpace::at(space) }.server_silo.get();
+    let _ = process::dereference(session_process);
+    Ok(silo)
+}

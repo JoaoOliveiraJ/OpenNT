@@ -317,9 +317,45 @@ pub fn raise(record: u64, context: u64, first_chance: u64) -> Result<u32, Kernel
     })
 }
 
+/// Threads com um KeRaiseUserException a aplicar no retorno ao anel 3.
+static RAISE_ON_RETURN: SpinLock<BTreeMap<u64, ()>> = SpinLock::new(BTreeMap::new());
+const USER_CODE_SELECTOR: u16 = 0x33;
+
+/// O KiRaiseUserExceptionDispatcher da NTDLL instalada (o
+/// KeRaiseUserExceptionDispatcher do kernel), ou 0 sem NTDLL.
+pub fn raise_dispatcher() -> u64 {
+    state::with(|state| state.ntdll_exports.as_ref().and_then(|exports| exports.get("KiRaiseUserExceptionDispatcher").copied())).unwrap_or(0)
+}
+
+/// KeRaiseUserException dentro de uma chamada de sistema vinda do anel 3
+/// (KTHREAD.PreviousMode UserMode na thread de usuário corrente): o código
+/// vai para TEB.ExceptionCode e o retorno do serviço é desviado para o
+/// KiRaiseUserExceptionDispatcher (SegCs 0x33). Devolve se havia esse retorno.
+pub fn raise_on_return(kthread: u64, code: u32) -> bool {
+    use crate::ntos::inc::types::{Kthread, Teb};
+    let Some(thread) = threads::current() else { return false };
+    let (pointer, teb) = thread.with(|thread| (thread.thread_pointer, thread.teb_va));
+    // SAFETY: a KTHREAD corrente do chamador.
+    if pointer != kthread || teb == 0 || unsafe { Kthread::at(kthread) }.previous_mode.get() != 1 {
+        return false;
+    }
+    if state::user_struct::<Teb>(teb).and_then(|teb| teb.exception_code.probe_set(code as i32)).is_err() {
+        return false;
+    }
+    RAISE_ON_RETURN.lock().insert(thread.thread_id, ());
+    thread.with(|thread| thread.pending_exception = true);
+    true
+}
+
 /// Aplica a exceção pendente ao CONTEXT vivo e a entrega.
 pub fn pending(thread: &UserThread) -> u32 {
     thread.with(|thread| thread.pending_exception = false);
+    if RAISE_ON_RETURN.lock().remove(&thread.thread_id).is_some() {
+        let live = live_context(thread);
+        live.seg_cs.set(USER_CODE_SELECTOR);
+        live.rip.set(raise_dispatcher());
+        return 0;
+    }
     let Some(Pending { context: saved, record, xstate }) = PENDING.lock().remove(&thread.thread_id) else { return 0 };
     let live = live_context(thread);
     // O pedaço XSTATE vai à área da thread (KxContextToKframes; o intervalo

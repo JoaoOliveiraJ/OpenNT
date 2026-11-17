@@ -62,6 +62,32 @@ pub fn append(destination: u64, source: u64) -> u32 {
     0
 }
 
+/// RtlAppendUnicodeStringToString (ntoskrnl 19041 0x3480c0): origem vazia
+/// não muda nada; Length + Source.Length acima de MaximumLength é
+/// STATUS_BUFFER_TOO_SMALL sem tocar no destino; senão copia os bytes da
+/// origem (memmove) depois do Length atual, soma ao Length e grava o NUL só
+/// se ainda couber (Length + 1 < MaximumLength). Um destino exato, sem lugar
+/// para o NUL, é aceito.
+pub fn append_unicode_string(destination: u64, source: u64) -> u32 {
+    let source = unicode(source);
+    let appended = source.length.get() as u64;
+    if appended == 0 {
+        return 0;
+    }
+    let destination = unicode(destination);
+    let length = destination.length.get() as u64;
+    if length + appended > destination.maximum_length.get() as u64 {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    let at = destination.buffer.get() + (length & !1);
+    move_bytes(at, source.buffer.get(), appended);
+    destination.length.set((length + appended) as u16);
+    if (destination.length.get() as u32) + 1 < destination.maximum_length.get() as u32 {
+        guest::write_bytes(at + (appended & !1), &[0, 0]);
+    }
+    0
+}
+
 /// RtlCopyUnicodeString: copia por bytes (inclusive comprimento ímpar).
 pub fn copy(destination: u64, source: u64) {
     let destination = unicode(destination);

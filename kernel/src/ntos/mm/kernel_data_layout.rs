@@ -152,6 +152,10 @@ pub const DEFINITIONS: &[KernelDataEntry] = &[
     // de produção; o ntoskrnl 19041 guarda 0xF0004A61). O OpenNT se
     // apresenta como o build 26100 (`ke/version`): 0xF00065F4.
     KernelDataEntry { name: "NtBuildNumber", size: 4, storage_size: 4, alignment: 4, initial: &[0xF4, 0x65, 0x00, 0xF0] },
+    // PACL SePublicDefaultDacl: o ponteiro exportado e a ACL logo depois
+    // (os 0x54 bytes que o SepInitSystemDacls do 19041 aloca), montada pelo
+    // `se/system_dacls` na primeira resolução.
+    KernelDataEntry { name: "SePublicDefaultDacl", size: 8, storage_size: 8 + 0x54, alignment: 8, initial: ZERO8 },
 ];
 
 /// Offset de cada entrada dentro da seção, na ordem de `DEFINITIONS`.

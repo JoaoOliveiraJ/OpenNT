@@ -198,6 +198,14 @@ pub mod thread_requests {
         })
     }
 
+    /// IoQueueThreadIrp e IoEnqueueIrp (0x893ad0), os dois o IopQueueThreadIrp:
+    /// a IRP entra na lista da thread dona (Irp->Tail.Overlay.Thread).
+    pub fn enqueue(request: u64) -> Result<(), KernelError> {
+        // SAFETY: IRP vivo do chamador.
+        let thread = unsafe { Irp::at(request) }.tail.overlay.thread.get();
+        insert(request, thread)
+    }
+
     /// As IRPs da IrpList da thread, da cabeça para o fim (com a trava).
     pub fn of_thread(thread: u64) -> Result<alloc::vec::Vec<u64>, KernelError> {
         let head = &thread_at(thread).irp_list;

@@ -5,7 +5,8 @@
 //! equivalência de maiúsculas, sem expansão de caracteres.
 //!
 //! Também a inicialização, as trocas de caixa com destino, o prefixo, a
-//! concatenação, a duplicação e o hash X65599 das UNICODE_STRING.
+//! concatenação, a duplicação, a validação e o hash X65599 das
+//! UNICODE_STRING.
 
 use alloc::vec::Vec;
 
@@ -284,13 +285,6 @@ pub fn append_text(destination: u64, text: &str) -> u32 {
     0
 }
 
-/// RtlAppendUnicodeStringToString: concatena no buffer do destino.
-pub fn append_string(destination: u64, source: u64) -> u32 {
-    let current = guest_strings::read_unicode_string(destination);
-    let suffix = guest_strings::read_unicode_string(source);
-    append_text(destination, &alloc::format!("{current}{suffix}"))
-}
-
 /// RtlDuplicateUnicodeString(flags, source, destination): SEMPRE aloca um
 /// buffer novo e copia a origem. `flags` não escolhe alocar — os bits são
 /// NULL_TERMINATE (1) e ALLOCATE_NULL_STRING (2); ambos juntos ou outros bits
@@ -321,6 +315,25 @@ pub fn duplicate(flags: u32, source: u64, destination: u64) -> u32 {
     destination.length.set(length as u16);
     destination.maximum_length.set((length + terminator) as u16);
     destination.buffer.set(buffer);
+    0
+}
+
+/// RtlValidateUnicodeString(Flags, String) (ntoskrnl 19041 0x2ffd90): Flags
+/// diferente de 0 é inválido; String NULL é válida. Recusa Length ou
+/// MaximumLength ímpares, Length > MaximumLength, MaximumLength > 0xFFFE e
+/// Buffer NULL com algum dos dois diferente de 0 (STATUS_INVALID_PARAMETER).
+pub fn validate(flags: u32, string: Option<&UnicodeString>) -> u32 {
+    if flags != 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let Some(string) = string else { return 0 };
+    let (length, maximum) = (string.length.get(), string.maximum_length.get());
+    if length & 1 != 0 || maximum & 1 != 0 || length > maximum || maximum > 0xFFFE {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if string.buffer.get() == 0 && (length != 0 || maximum != 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
     0
 }
 

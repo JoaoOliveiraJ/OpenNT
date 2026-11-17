@@ -9,7 +9,9 @@
 //! e os demais "ExAcquireFastMutex; FsRtlXxxBaseMcbEntry; ExReleaseFastMutex"
 //! (Add 0x2f5380, Remove 0x4ef260, Lookup 0x4eef50, LookupLastAndIndex
 //! 0x4ef080, GetNext 0x4eee60, NumberOfRuns 0x4ef200, Truncate 0x2f53f0).
-//! LARGE_MCB = { PFAST_MUTEX GuardedMutex (+0); BASE_MCB BaseMcb (+8) }.
+//! LARGE_MCB = { PFAST_MUTEX GuardedMutex (+0); BASE_MCB BaseMcb (+8) }. O
+//! MCB de 32 bits (FsRtlInitializeMcb, FsRtlUninitializeMcb, FsRtlAddMcbEntry)
+//! é o mesmo objeto (seção no fim do arquivo).
 
 use crate::ntos::fsrtl::mcb;
 use crate::ntos::inc::types::extra_fs_fat::LargeMcb;
@@ -99,4 +101,26 @@ pub fn reset(large: &LargeMcb, self_synchronized: bool) -> Result<(), KernelErro
         mcb::reset(base);
         Ok(())
     })
+}
+
+/// FsRtlLookupLastLargeMcbEntry(Mcb, *LargeVbn, *LargeLbn) -> BOOLEAN (RVA
+/// 0x4ef000): o FsRtlLookupLastBaseMcbEntry sob a mutex do LARGE_MCB.
+pub fn lookup_last(large: &LargeMcb, vbn: u64, lbn: u64) -> Result<bool, KernelError> {
+    with_mutex(large, |base| Ok(mcb::lookup_last(base, vbn, lbn)))
+}
+
+// ---- MCB de 32 bits ------------------------------------------------------------
+//
+// O MCB antigo do ntifs.h é `{ LARGE_MCB DummyFieldThatSizesThisStructureSmallerThanALargeMcb; }`:
+// as rotinas FsRtl*Mcb* são as do LARGE_MCB sobre o mesmo objeto, com os
+// argumentos ULONG estendidos com zero. FsRtlInitializeMcb (RVA 0x88b620) e
+// FsRtlUninitializeMcb (RVA 0x88b640) são chamadas diretas de
+// FsRtlInitializeLargeMcb e FsRtlUninitializeLargeMcb (`initialize` e
+// `uninitialize` acima); FsRtlAddMcbEntry (RVA 0x4eee40) é a abaixo.
+
+/// FsRtlAddMcbEntry(Mcb, Vbn, Lbn, SectorCount) -> BOOLEAN: os três ULONG
+/// estendidos com zero (`mov r9d, r9d; mov r8d, r8d; mov edx, edx`) e o
+/// FsRtlAddLargeMcbEntry.
+pub fn add_mcb_entry(large: &LargeMcb, vbn: u32, lbn: u32, sector_count: u32) -> Result<bool, KernelError> {
+    add_entry(large, vbn as u64, lbn as u64, sector_count as u64)
 }

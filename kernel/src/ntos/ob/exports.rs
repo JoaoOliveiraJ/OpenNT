@@ -624,3 +624,20 @@ pub mod ob_nt_wait_single {
 
     pub static GROUP: Group = Group { name: "ob-nt-wait-single", names: &["NtWaitForSingleObject"], handlers: &[nt_wait_for_single_object], data_exports: &[] };
 }
+
+pub mod ob_symbolic_link_create {
+    //! ZwCreateSymbolicLinkObject: a lógica mora em `ob/handles/namespace`.
+
+    use crate::ntos::inc::types::{NtStruct, UnicodeString};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::ob::handles::namespace;
+    use crate::rtl::KernelError;
+
+    /// ZwCreateSymbolicLinkObject(LinkHandle, DesiredAccess, ObjectAttributes, LinkTarget) -> NTSTATUS.
+    fn create_symbolic_link_object(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: o UNICODE_STRING do destino, de um chamador de modo kernel.
+        Ok(signed_status(namespace::create_link_from_kernel(call.arg(1), call.arg(2) as u32, call.arg(3), unsafe { UnicodeString::at(call.arg(4)) })))
+    }
+
+    pub static GROUP: Group = Group { name: "ob-symbolic-link-create", names: &["ZwCreateSymbolicLinkObject"], handlers: &[create_symbolic_link_object], data_exports: &[] };
+}

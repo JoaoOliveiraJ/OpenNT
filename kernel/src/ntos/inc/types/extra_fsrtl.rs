@@ -10,6 +10,9 @@
 //! - `FsrtlPerFileobjectContext` — FSRTL_PER_FILEOBJECT_CONTEXT (ntifs.h), 0x20
 //! - `OplockKeyContext` — OPLOCK_KEY_CONTEXT (ntifs.h), 0x28
 //! - `RequestOplockInputBuffer` — REQUEST_OPLOCK_INPUT_BUFFER (winioctl.h), 0xC
+//! - `FileRegionInput` — FILE_REGION_INPUT (winioctl.h), 0x18
+//! - `FileRegionInfo` — FILE_REGION_INFO (winioctl.h), 0x18
+//! - `FileRegionOutput` — FILE_REGION_OUTPUT (winioctl.h), 0x28
 //!
 //! `_FSRTL_ADVANCED_FCB_HEADER` e `_ECP_LIST` constam dos símbolos e são
 //! geradas (`types/io.rs`); ficam reexportadas aqui.
@@ -218,4 +221,50 @@ const _: () = {
     assert!(core::mem::size_of::<RequestOplockInputBuffer>() == 0xC);
     assert!(core::mem::offset_of!(RequestOplockInputBuffer, requested_oplock_level) == 0x4);
     assert!(core::mem::offset_of!(RequestOplockInputBuffer, flags) == 0x8);
+};
+
+/// FILE_REGION_INPUT (winioctl.h): a entrada do FSCTL_QUERY_FILE_REGIONS.
+#[repr(C)]
+pub struct FileRegionInput {
+    pub file_offset: Field<i64>,
+    pub length: Field<i64>,
+    pub desired_usage: Field<u32>,
+    _pad_14: Reserved<0x4>,
+}
+
+unsafe impl NtStruct for FileRegionInput {}
+
+/// FILE_REGION_INFO (winioctl.h): uma região da saída do
+/// FSCTL_QUERY_FILE_REGIONS.
+#[repr(C)]
+pub struct FileRegionInfo {
+    pub file_offset: Field<i64>,
+    pub length: Field<i64>,
+    pub usage: Field<u32>,
+    pub reserved: Field<u32>,
+}
+
+unsafe impl NtStruct for FileRegionInfo {}
+
+/// FILE_REGION_OUTPUT (winioctl.h): o cabeçalho seguido de
+/// `Region[RegionEntryCount]`.
+#[repr(C)]
+pub struct FileRegionOutput {
+    pub flags: Field<u32>,
+    pub total_region_entry_count: Field<u32>,
+    pub region_entry_count: Field<u32>,
+    pub reserved: Field<u32>,
+    pub region: [FileRegionInfo; 1],
+}
+
+unsafe impl NtStruct for FileRegionOutput {}
+
+const _: () = {
+    assert!(core::mem::size_of::<FileRegionInput>() == 0x18);
+    assert!(core::mem::offset_of!(FileRegionInput, desired_usage) == 0x10);
+    assert!(core::mem::size_of::<FileRegionInfo>() == 0x18);
+    assert!(core::mem::offset_of!(FileRegionInfo, usage) == 0x10);
+    assert!(core::mem::size_of::<FileRegionOutput>() == 0x28);
+    assert!(core::mem::offset_of!(FileRegionOutput, region_entry_count) == 0x8);
+    assert!(core::mem::offset_of!(FileRegionOutput, region) == 0x10);
 };

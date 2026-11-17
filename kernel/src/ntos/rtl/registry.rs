@@ -1,5 +1,6 @@
 //! Registro pelo Rtl — RtlQueryRegistryValues[Ex], RtlWriteRegistryValue,
-//! RtlCreateRegistryKey, RtlDeleteRegistryValue e RtlFormatCurrentUserKeyPath.
+//! RtlCreateRegistryKey, RtlDeleteRegistryValue, RtlFormatCurrentUserKeyPath
+//! e RtlOpenCurrentUser.
 //!
 //! Os caminhos relativos (RTL_REGISTRY_*) viram absolutos; as chaves e os
 //! valores passam pelo serviço de chaves do Cm (com as notificações de
@@ -13,7 +14,7 @@ use alloc::string::String;
 use crate::hal::amd64::native_call;
 use crate::ntos::cm::key::services as key_services;
 use crate::ntos::cm::registry as cm_registry;
-use crate::ntos::inc::types::{KeyValueFullInformation, NtStruct, ObjectAttributes, RtlQueryRegistryTable, UnicodeString};
+use crate::ntos::inc::types::{KeyValueFullInformation, NtStruct, ObjectAttributes, RtlQueryRegistryTable, SidAndAttributes, UnicodeString};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::rtl::guest_strings;
 use crate::rtl::KernelError;
@@ -569,16 +570,128 @@ pub fn delete_value(relative_to: u32, path: u64, value_name: u64) -> Result<u32,
     Ok(result?.0)
 }
 
-/// RtlFormatCurrentUserKeyPath(PUNICODE_STRING): monta "\REGISTRY\USER\<SID>"
-/// do token corrente. Sem usuário interativo o kernel roda como SYSTEM.
-pub fn format_current_user_key_path(output: u64) {
-    let text = "\\REGISTRY\\USER\\S-1-5-18";
-    let bytes = text.encode_utf16().count() as u64 * 2;
-    let buffer = guest::alloc_bytes(bytes + 2);
-    guest_strings::write_wide_string(buffer, text);
-    // SAFETY: PUNICODE_STRING CurrentUserKeyPath do chamador.
-    let output = unsafe { UnicodeString::at(output) };
-    output.length.set(bytes as u16);
-    output.maximum_length.set((bytes + 2) as u16);
+/// O TOKEN_USER do RtlFormatCurrentUserKeyPath: um buffer de 0x58 bytes.
+const TOKEN_USER_BUFFER: u32 = 0x58;
+/// TokenUser (TOKEN_INFORMATION_CLASS).
+const TOKEN_USER_CLASS: u32 = 1;
+/// NtCurrentThreadEffectiveToken(): o token de impersonação da thread ou o
+/// primário do processo.
+const CURRENT_THREAD_EFFECTIVE_TOKEN: u64 = -6i64 as u64;
+/// O prefixo do caminho e o espaço extra que o original soma ao teto do SID
+/// (o prefixo e o NUL).
+const USER_ROOT: &str = "\\REGISTRY\\USER\\";
+const USER_ROOT_RESERVE: u32 = 0x22;
+/// Chave do perfil padrão, aberta quando a do usuário não existe.
+const DEFAULT_USER_KEY: &str = "\\Registry\\User\\.Default";
+/// OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE | OBJ_FORCE_ACCESS_CHECK.
+const CURRENT_USER_ATTRIBUTES: u32 = 0x640;
+
+/// RtlFormatCurrentUserKeyPath(CurrentUserKeyPath) (ntoskrnl 19041
+/// 0x6ef9e0): o SID do usuário do token efetivo (ZwQueryInformationToken
+/// com NtCurrentThreadEffectiveToken e TokenUser, em 0x58 bytes) vira
+/// "\REGISTRY\USER\<SID>". MaximumLength = teto do
+/// RtlLengthSidAsUnicodeString + 0x22, do pool paginável com a etiqueta
+/// 'Strg' (sem memória = STATUS_NO_MEMORY, com Length 0 e MaximumLength já
+/// gravados); erro na conversão do SID libera a string. Os erros da consulta
+/// e do SID voltam como vieram.
+pub fn format_current_user_key_path(output: &UnicodeString) -> Result<u32, KernelError> {
+    let information = guest::alloc_bytes(TOKEN_USER_BUFFER as u64 + 8);
+    let returned = information + TOKEN_USER_BUFFER as u64;
+    let status = crate::ntos::se::token::query::query(CURRENT_THREAD_EFFECTIVE_TOKEN, TOKEN_USER_CLASS, information, TOKEN_USER_BUFFER, returned, 0);
+    let result = match status {
+        Ok(0) => {
+            // SAFETY: TOKEN_USER recém-gravado pela consulta (SID_AND_ATTRIBUTES no início).
+            let user = unsafe { SidAndAttributes::at(information) };
+            format_user_path(output, user.sid.get())
+        }
+        other => other,
+    };
+    guest::free_bytes(information);
+    result
+}
+
+/// O caminho do usuário de `sid` em `output` (o resto do
+/// RtlFormatCurrentUserKeyPath, depois da consulta ao token).
+fn format_user_path(output: &UnicodeString, sid: u64) -> Result<u32, KernelError> {
+    let length = match crate::ntos::rtl::security::length_sid_as_unicode_string(sid) {
+        Ok(length) => length,
+        Err(status) => return Ok(status),
+    };
+    let maximum = (length + USER_ROOT_RESERVE) as u16;
+    output.length.set(0);
+    output.maximum_length.set(maximum);
+    let buffer = crate::ntos::ex::pool_allocation::allocate_tagged(1, maximum as u64, STRING_POOL_TAG).unwrap_or(0);
     output.buffer.set(buffer);
+    if buffer == 0 {
+        return Ok(STATUS_NO_MEMORY);
+    }
+    let root = USER_ROOT.encode_utf16().count() as u64 * 2;
+    guest_strings::write_wide_string(buffer, USER_ROOT);
+    output.length.set(root as u16);
+    // A UNICODE_STRING do resto do buffer, com o teto do SID.
+    let tail = guest::alloc_bytes(UnicodeString::SIZE);
+    // SAFETY: bloco recém-alocado do tamanho de uma UNICODE_STRING.
+    let rest = unsafe { UnicodeString::at(tail) };
+    rest.length.set(0);
+    rest.maximum_length.set(length as u16);
+    rest.buffer.set(buffer + root);
+    let status = crate::ntos::rtl::security::convert_sid_to_unicode_string(tail, sid, false);
+    let converted = rest.length.get();
+    guest::free_bytes(tail);
+    let status = status?;
+    if status != 0 {
+        crate::ntos::rtl::unicode::free(output.address())?;
+        return Ok(status);
+    }
+    output.length.set(root as u16 + converted);
+    Ok(0)
+}
+
+/// ZwOpenKey(KeyHandle, DesiredAccess) de um caminho absoluto, com os
+/// atributos do RtlOpenCurrentUser.
+fn open_absolute(path: &UnicodeString, desired_access: u32, key_handle: u64) -> Result<u32, KernelError> {
+    let block = guest::alloc_bytes(ObjectAttributes::SIZE);
+    // SAFETY: bloco recém-alocado do tamanho de um OBJECT_ATTRIBUTES.
+    let attributes = unsafe { ObjectAttributes::at(block) };
+    attributes.length.set(ObjectAttributes::SIZE as u32);
+    attributes.root_directory.set(0);
+    attributes.object_name.set(path.address());
+    attributes.attributes.set(CURRENT_USER_ATTRIBUTES);
+    attributes.security_descriptor.set(0);
+    attributes.security_quality_of_service.set(0);
+    let status = key_services::open(key_handle, desired_access, block, false, 0);
+    guest::free_bytes(block);
+    status
+}
+
+/// RtlOpenCurrentUser(DesiredAccess, CurrentUserKey) (ntoskrnl 19041
+/// 0x78c3a0): abre o caminho do RtlFormatCurrentUserKeyPath (handle de
+/// kernel, sem caixa, com checagem de acesso) e libera o texto; se o caminho
+/// não existe (STATUS_OBJECT_NAME_NOT_FOUND), abre "\Registry\User\.Default"
+/// do mesmo jeito. Devolve o status da última abertura (ou o erro do
+/// RtlFormatCurrentUserKeyPath).
+pub fn open_current_user(desired_access: u32, key_handle: u64) -> Result<u32, KernelError> {
+    let block = guest::alloc_bytes(UnicodeString::SIZE);
+    // SAFETY: bloco recém-alocado do tamanho de uma UNICODE_STRING.
+    let path = unsafe { UnicodeString::at(block) };
+    path.length.set(0);
+    path.maximum_length.set(0);
+    path.buffer.set(0);
+    let mut status = format_current_user_key_path(path)?;
+    if status == 0 {
+        status = open_absolute(path, desired_access, key_handle)?;
+        crate::ntos::rtl::unicode::free(block)?;
+    }
+    if status == STATUS_OBJECT_NAME_NOT_FOUND {
+        let units = DEFAULT_USER_KEY.encode_utf16().count() as u64 * 2;
+        let default = guest::alloc_bytes(units + 2);
+        guest_strings::write_wide_string(default, DEFAULT_USER_KEY);
+        path.length.set(units as u16);
+        path.maximum_length.set(units as u16 + 2);
+        path.buffer.set(default);
+        status = open_absolute(path, desired_access, key_handle)?;
+        guest::free_bytes(default);
+    }
+    guest::free_bytes(block);
+    Ok(status)
 }

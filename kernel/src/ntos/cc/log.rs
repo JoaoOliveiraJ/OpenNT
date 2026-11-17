@@ -1,6 +1,7 @@
 //! Fluxos com log e consultas de páginas sujas — o papel do suporte a log do Cc
 //! do NT (CcSetLogHandleForFile, CcGetDirtyPages, ...), mais as consultas de
-//! sujeira por volume e o callback de erro do Cc.
+//! sujeira por volume (CcIsThereDirtyData, CcIsThereDirtyDataEx) e o callback
+//! de erro do Cc.
 //!
 //! O log handle e as rotinas (FlushToLsnRoutine, QueryLogUsageRoutine) ficam
 //! no mapa; o bit 24 de SHARED_CACHE_MAP.Flags marca o fluxo com log, como o
@@ -130,6 +131,34 @@ pub fn is_there_dirty_data(vpb: u64) -> bool {
         let file = cache_map::file_object(map.file_object);
         file.vpb.get() == vpb && map.dirty_pages() != 0 && file.flags.get() & layout::FO_TEMPORARY_FILE == 0
     })
+}
+
+/// CcIsThereDirtyDataEx(Vpb, NumberOfDirtyPages*) (RVA 0x4ea950): o NT acha
+/// o VOLUME_CACHE_MAP cujo DeviceObject é o Vpb->DeviceObject e, se ele tem
+/// DirtyPages ou PagesQueuedToDisk, devolve TRUE com a soma em
+/// *NumberOfDirtyPages (opcional). O OpenNT não guarda mapas de volume: os
+/// contadores são a soma dos mapas dos arquivos do volume (todos, também os
+/// temporários), com as páginas sujas e as que o lazy writer está gravando.
+pub fn is_there_dirty_data_ex(vpb: u64, count_pointer: u64) -> bool {
+    // SAFETY: o VPB montado que o file system passa.
+    let device = unsafe { Vpb::at(vpb) }.device_object.get();
+    let (dirty, queued) = CACHE
+        .lock()
+        .maps
+        .values()
+        .filter(|map| {
+            let (mounted, own) = volume_device(map.file_object);
+            mounted == device || own == device
+        })
+        .fold((0u32, 0u32), |(dirty, queued), map| (dirty + map.dirty_pages(), queued + map.views.values().map(|view| view.writing.count_ones()).sum::<u32>()));
+    if dirty == 0 && queued == 0 {
+        return false;
+    }
+    if count_pointer != 0 {
+        // SAFETY: PULONG de saída de kernel do file system.
+        unsafe { Field::<u32>::at(count_pointer) }.set(dirty + queued);
+    }
+    true
 }
 
 /// CcErrorCallbackRoutine(Context): só STATUS 0xC000A008 pede a drenagem de

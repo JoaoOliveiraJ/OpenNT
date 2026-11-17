@@ -180,6 +180,91 @@ pub fn record_io_attribution(_handle: u64, version: u32) -> u32 {
     0xC000_0008
 }
 
+// ---- IoSetIoAttributionIrp (RVA 0x505f60) --------------------------------------
+//
+// Flags: IO_ATTRIBUTION_FROM_THREAD (1) ou IO_ATTRIBUTION_FROM_PROCESS (2),
+// exatamente um; outro valor é STATUS_INVALID_PARAMETER.
+// - Pela thread (IoSetDiskIoAttributionFromThread 0x29c670): a thread que
+//   trabalha em nome de outra (ETHREAD.WorkOnBehalfThread) atribui ao
+//   processo dela; senão a thread corrente anexada a outro processo tenta o
+//   processo anexado (KTHREAD.ApcState.Process) e, sem atribuição lá, cai no
+//   próprio (KTHREAD.Process).
+// - Pelo processo (IopSetDiskIoAttributionFromProcess 0x31d458).
+// Um processo sem EPROCESS.DiskIoAttribution dá STATUS_NOT_FOUND; com ela, o
+// handle (o qword +0x18 da atribuição, lido sob o IopDiskIoAttributionLock)
+// vai para a extensão de tipo 6 do IRP (IopSetDiskIoAttributionExtension
+// 0x2e66dc; sem memória, STATUS_INSUFFICIENT_RESOURCES). O OpenNT ainda não
+// cria atribuições de disco (nenhum processo tem DiskIoAttribution), então o
+// desvio do 19041 para a atribuição do job do chamador (Flags3 bit 12) não
+// tem de onde ler e fica de fora.
+
+const IO_ATTRIBUTION_FROM_THREAD: u32 = 1;
+const IO_ATTRIBUTION_FROM_PROCESS: u32 = 2;
+
+/// O começo da atribuição de I/O de disco do processo (layout privado do
+/// kernel, lido na desmontagem): o handle em +0x18 e o contador em +0x20.
+#[repr(C)]
+struct DiskIoAttribution {
+    _reserved_0: crate::ntos::inc::field::Reserved<0x18>,
+    handle: Field<u64>,
+    _reference_count: Field<i64>,
+}
+
+// SAFETY: #[repr(C)] só de células.
+unsafe impl NtStruct for DiskIoAttribution {}
+
+const _: () = assert!(core::mem::offset_of!(DiskIoAttribution, handle) == 0x18);
+
+/// IopReferenceIoAttributionFromProcess(Process, TRUE): o handle da
+/// atribuição do processo, ou `None`.
+fn process_attribution_handle(process: u64) -> Option<u64> {
+    // SAFETY: EPROCESS vivo do chamador.
+    let attribution = unsafe { crate::ntos::inc::types::Eprocess::at(process) }.disk_io_attribution.atomic().load(Ordering::Acquire);
+    // SAFETY: DiskIoAttribution, quando presente, aponta para a atribuição viva.
+    (attribution != 0).then(|| unsafe { DiskIoAttribution::at(attribution) }.handle.get())
+}
+
+/// IopSetDiskIoAttributionFromProcess / o fim do IoSetDiskIoAttributionFromThread.
+fn attribute_to_process(irp: u64, process: u64) -> Result<u32, KernelError> {
+    let Some(handle) = process_attribution_handle(process) else { return Ok(STATUS_NOT_FOUND) };
+    let extension = allocate_irp_extension(irp, IRP_EXTENSION_DISK_IO_ATTRIBUTION)?;
+    if extension == 0 {
+        return Ok(STATUS_INSUFFICIENT_RESOURCES);
+    }
+    extension_at(extension).disk_io_attribution_handle.set(handle);
+    Ok(STATUS_SUCCESS)
+}
+
+/// IoSetDiskIoAttributionFromThread(Irp, Thread).
+fn attribute_from_thread(irp: u64, thread: u64) -> Result<u32, KernelError> {
+    use crate::ntos::inc::types::Ethread;
+    // SAFETY: ETHREAD viva do chamador.
+    let ethread = unsafe { Ethread::at(thread) };
+    let on_behalf = ethread.work_on_behalf_thread.get();
+    if on_behalf != 0 {
+        // SAFETY: a thread em nome de quem esta trabalha (retida pelo NT).
+        return attribute_to_process(irp, unsafe { Ethread::at(on_behalf) }.tcb.process.get());
+    }
+    let tcb = &ethread.tcb;
+    let attached = tcb.apc_state.process.get();
+    if thread == crate::ntos::ps::process::get_current_thread() && attached != tcb.process.get() {
+        let status = attribute_to_process(irp, attached)?;
+        if status & 0x8000_0000 == 0 {
+            return Ok(STATUS_SUCCESS);
+        }
+    }
+    attribute_to_process(irp, tcb.process.get())
+}
+
+/// IoSetIoAttributionIrp(Irp, AttributionSource, Flags).
+pub fn set_io_attribution_irp(irp: u64, source: u64, flags: u32) -> Result<u32, KernelError> {
+    match flags {
+        IO_ATTRIBUTION_FROM_THREAD => attribute_from_thread(irp, source),
+        IO_ATTRIBUTION_FROM_PROCESS => attribute_to_process(irp, source),
+        _ => Ok(STATUS_INVALID_PARAMETER),
+    }
+}
+
 /// IopIrpHasExtensionType (RVA 0x2e6690).
 pub fn irp_has_extension_type(irp: u64, kind: u32) -> bool {
     let packet = irp_at(irp);
@@ -503,5 +588,16 @@ pub fn clear_fs_track_offset_state(irp: &crate::ntos::inc::types::Irp) -> u32 {
     let Some(extension) = irp_extension_of_type(irp, TRACK_OFFSET_TYPE) else { return TRACK_STATUS_NOT_FOUND };
     extension.fs_track_offset_blob.set(0);
     extension.types_allocated.set(extension.types_allocated.get() & !(1u16 << TRACK_OFFSET_TYPE));
+    TRACK_STATUS_SUCCESS
+}
+
+/// IoGetFsTrackOffsetState(Irp, *RetFsTrackOffsetBlob, *RetTrackedOffset)
+/// (RVA 0x2e63d0, cauda 0x46032a): sem o tipo 5 (IopIrpHasExtensionType) ->
+/// STATUS_NOT_FOUND sem tocar nas saídas; senão o blob (+0x28) e o
+/// FsTrackedOffset (+0x30), nessa ordem.
+pub fn fs_track_offset_state(irp: &crate::ntos::inc::types::Irp, blob: &Field<u64>, tracked_offset: &Field<i64>) -> u32 {
+    let Some(extension) = irp_extension_of_type(irp, TRACK_OFFSET_TYPE) else { return TRACK_STATUS_NOT_FOUND };
+    blob.set(extension.fs_track_offset_blob.get());
+    tracked_offset.set(extension.fs_tracked_offset.get());
     TRACK_STATUS_SUCCESS
 }

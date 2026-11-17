@@ -710,3 +710,38 @@ pub fn pages_are_zero(descriptor: &Mdl) -> bool {
     let zero = system_zero_page_frame();
     pfn_array(descriptor, pages).iter().all(|frame| Some(frame.get()) == zero)
 }
+
+// ---- MmAreMdlPagesCached (ntoskrnl 19041 rva 0x3046b0) --------------------------
+//
+// Anda os PFNs das páginas que o MDL cobre (ByteOffset + StartVa e
+// ByteCount; o primeiro PFN é sempre lido, mesmo com zero páginas) e só
+// devolve TRUE se cada um é um frame possível (até 0xF_FFFF_FFFF), com
+// MMPFN.u4.PfnExists e MMPFN.u3.e1.CacheAttribute = MiCached. O MMPFN é o do
+// banco de PFNs publicado (`native_pfn_database`); um frame além dele não
+// tem descritor, como um frame sem PfnExists.
+
+/// O maior número de frame que o banco de PFNs do NT pode descrever.
+const HIGHEST_POSSIBLE_FRAME: u64 = 0xF_FFFF_FFFF;
+/// MI_PFN_CACHE_ATTRIBUTE: MiCached.
+const PFN_CACHED: u8 = 1;
+
+/// O MMPFN publicado de `frame`, se existe.
+fn existing_pfn(frame: u64) -> Option<&'static crate::ntos::inc::types::Mmpfn> {
+    let database = super::native_pfn_database::information()?;
+    if frame >= database.frame_count {
+        return None;
+    }
+    // SAFETY: descritor do banco publicado, pela VA do mapa direto.
+    let entry = unsafe { crate::ntos::inc::types::Mmpfn::at(crate::hal::physical::range_to_virtual(database.physical_base + frame * database.descriptor_size, database.descriptor_size)) };
+    (entry.u4.pfn_exists() != 0).then_some(entry)
+}
+
+/// MmAreMdlPagesCached(Mdl) -> BOOLEAN.
+pub fn are_pages_cached(descriptor: &Mdl) -> bool {
+    let start = (descriptor.byte_offset.get().wrapping_add(descriptor.start_va.get() as u32) & 0xFFF) as u64;
+    let pages = ((descriptor.byte_count.get() as u64 + 0xFFF + start) >> 12).max(1);
+    pfn_array(descriptor, pages).iter().all(|frame| {
+        let frame = frame.get();
+        frame <= HIGHEST_POSSIBLE_FRAME && existing_pfn(frame).is_some_and(|entry| entry.u3.e1.cache_attribute() == PFN_CACHED)
+    })
+}

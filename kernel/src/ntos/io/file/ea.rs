@@ -22,11 +22,28 @@
 //!
 //! Os arquivos dos volumes do próprio kernel (sem DEVICE_OBJECT de file
 //! system) respondem pelo mesmo caminho do FsRtlQueryKernelEaFile.
+//!
+//! NtSetEaFile pelo ZwSetEaFile (NtSetEaFile 0x730f20), no ramo KernelMode:
+//! - IopReferenceFileObject(handle, FILE_WRITE_EA): a falha volta sem tocar no
+//!   IO_STATUS_BLOCK;
+//! - IRP_MJ_SET_EA ao IoGetRelatedDeviceObject, com OriginalFileObject,
+//!   Thread, RequestorMode KernelMode, IRP_SYNCHRONOUS_API e
+//!   Parameters.SetEa.Length;
+//! - DO_BUFFERED_IO: com Length, um SystemBuffer do pool com a cópia da
+//!   lista, conferida pelo IoCheckEaBufferValidity antes do IRP — um status
+//!   de sinal negativo (o aviso STATUS_EA_LIST_INCONSISTENT inclusive) vai
+//!   ao IO_STATUS_BLOCK com o ErrorOffset em Information e volta sem IRP —
+//!   e IRP_BUFFERED_IO | IRP_DEALLOCATE_BUFFER; sem Length, nenhum buffer;
+//!   DO_DIRECT_IO: um MDL travado para leitura; nos demais, o próprio
+//!   UserBuffer (nesses dois a lista não é conferida pelo I/O Manager);
+//! - o IopSynchronousServiceTail espera a conclusão e o IO_STATUS_BLOCK do
+//!   chamador recebe Status e Information.
+//! Os arquivos dos volumes do próprio kernel gravam pelo FsRtlSetKernelEaFile.
 
 use crate::ntos::inc::types::{DeviceObject, IoStackLocation, Irp, NtStruct};
 use crate::ntos::io::file::{information as file_information, query as file_query};
 use crate::ntos::io::irp_builder::{self, BuildOptions};
-use crate::ntos::io::{kernel_ea, mdl as io_mdl, retained_irp};
+use crate::ntos::io::{buffer_validation, kernel_ea, mdl as io_mdl, retained_irp};
 use crate::ntos::ke::dispatcher;
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::{kernel_pool, mdl as mm_mdl};
@@ -36,8 +53,9 @@ use crate::rtl::KernelError;
 
 const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
-/// IRP_MJ_QUERY_EA.
+/// IRP_MJ_QUERY_EA e IRP_MJ_SET_EA.
 const IRP_MJ_QUERY_EA: u8 = 7;
+const IRP_MJ_SET_EA: u8 = 8;
 /// IRP.Flags.
 const IRP_SYNCHRONOUS_API: u32 = 0x4;
 const IRP_BUFFERED_IO: u32 = 0x10;
@@ -200,6 +218,113 @@ fn send(request: &QueryEa, file: u64, device: u64, list: u64) -> Result<(u32, u6
             guest::write_bytes(request.buffer, &guest::read_bytes(system_buffer, information.min(request.length as u64) as usize));
         }
         Ok((status, information))
+    })();
+    if descriptor != 0 {
+        mm_mdl::unlock_pages(descriptor);
+        io_mdl::free_mdl(descriptor);
+    }
+    free_pool(system_buffer);
+    if irp != 0 {
+        guest::free_bytes(irp);
+    }
+    guest::free_bytes(event);
+    result
+}
+
+// ---- ZwSetEaFile ---------------------------------------------------------------
+
+/// ZwSetEaFile(FileHandle, IoStatusBlock, Buffer, Length).
+pub fn set_ea_file(handle: u64, io_status: u64, buffer: u64, length: u32) -> Result<u32, KernelError> {
+    let selected = match file_query::resolve(handle, false) {
+        Ok(selected) if selected.pointer != 0 => selected,
+        Ok(_) => return Ok(STATUS_INVALID_HANDLE),
+        Err(status) => return Ok(status),
+    };
+    let file = selected.pointer;
+    if file_objects::reference(file)?.is_none() {
+        return Ok(STATUS_INVALID_HANDLE);
+    }
+    let result = (|| -> Result<(u32, u64), KernelError> {
+        let device = file_information::related_device(file)?;
+        if device == 0 {
+            // Arquivo de volume do kernel: a gravação direta no volume.
+            return Ok((kernel_ea::set(file, buffer, length)?, 0));
+        }
+        send_set(file, device, buffer, length)
+    })();
+    file_objects::dereference(file)?;
+    let (status, information) = result?;
+    if information != u64::MAX {
+        guest::write32(io_status, status);
+        guest::write64(io_status + 8, information);
+    }
+    Ok(status)
+}
+
+/// O IRP_MJ_SET_EA do NtSetEaFile ao dispositivo do file system: (status,
+/// Information), com Information = u64::MAX quando o pedido não chegou a ser
+/// concluído (o IO_STATUS_BLOCK fica como estava). Uma lista recusada pelo
+/// IoCheckEaBufferValidity volta como (status, ErrorOffset).
+fn send_set(file: u64, device: u64, buffer: u64, length: u32) -> Result<(u32, u64), KernelError> {
+    let routine = retained_irp::completion_routine()?;
+    if routine == 0 {
+        return Ok((STATUS_INSUFFICIENT_RESOURCES, u64::MAX));
+    }
+    let event = guest::alloc_bytes(40);
+    if event == 0 {
+        return Ok((STATUS_INSUFFICIENT_RESOURCES, u64::MAX));
+    }
+    // SAFETY: dispositivo relacionado ao arquivo, vivo durante o pedido.
+    let target = unsafe { DeviceObject::at(device) };
+    let count = (target.stack_size.get() as u8).max(1) as u32;
+    let irp = guest::alloc_bytes(irp_builder::size_for(count));
+    let (mut system_buffer, mut descriptor) = (0u64, 0u64);
+    let result = (|| -> Result<(u32, u64), KernelError> {
+        if irp == 0 {
+            return Ok((STATUS_INSUFFICIENT_RESOURCES, u64::MAX));
+        }
+        dispatcher::initialize_event(event, 0, false);
+        irp_builder::build(irp, &BuildOptions { major: IRP_MJ_SET_EA, device_object: device, stack_count: count, file_object: file, requestor_mode: 0, thread: process::get_current_thread(), ..BuildOptions::default() });
+        let stack = irp_builder::first_stack_location(irp, count);
+        // SAFETY: IRP recém-construído e o slot do topo dele.
+        let (packet, location) = unsafe { (Irp::at(irp), IoStackLocation::at(stack)) };
+        packet.flags.set(IRP_SYNCHRONOUS_API);
+        location.parameters.set_ea.length.set(length);
+        let device_flags = target.flags.get();
+        if device_flags & DO_BUFFERED_IO != 0 {
+            if length != 0 {
+                system_buffer = pool(length);
+                if system_buffer == 0 {
+                    return Ok((STATUS_INSUFFICIENT_RESOURCES, u64::MAX));
+                }
+                guest::write_bytes(system_buffer, &guest::read_bytes(buffer, length as usize));
+                let offset = guest::alloc_bytes(4);
+                // SAFETY: célula de rascunho do ErrorOffset.
+                let status = buffer_validation::check_ea_buffer_validity(system_buffer, length, unsafe { crate::ntos::inc::field::Field::<u32>::at(offset) });
+                let error_offset = guest::read32(offset) as u64;
+                guest::free_bytes(offset);
+                if status & 0x8000_0000 != 0 {
+                    return Ok((status, error_offset));
+                }
+                packet.associated_irp.system_buffer.set(system_buffer);
+                packet.flags.set(packet.flags.get() | IRP_BUFFERED_IO | IRP_DEALLOCATE_BUFFER);
+            }
+        } else if device_flags & DO_DIRECT_IO != 0 {
+            if length != 0 {
+                descriptor = io_mdl::allocate_mdl(buffer, length);
+                if descriptor == 0 {
+                    return Ok((STATUS_INSUFFICIENT_RESOURCES, u64::MAX));
+                }
+                mm_mdl::probe_and_lock_pages(descriptor);
+                packet.mdl_address.set(descriptor);
+            }
+        } else {
+            packet.user_buffer.set(buffer);
+        }
+        if let Some(failure) = retained_irp::dispatch(device, irp, stack, event, routine)? {
+            return Ok((failure, u64::MAX));
+        }
+        Ok((packet.io_status.status.get() as u32, packet.io_status.information.get()))
     })();
     if descriptor != 0 {
         mm_mdl::unlock_pages(descriptor);

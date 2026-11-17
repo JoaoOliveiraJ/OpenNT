@@ -46,3 +46,4 @@ pub mod processor_feature;
 pub mod auto_expand_push_lock;
 pub mod shutdown;
 pub mod ir_timer;
+pub mod firmware_table;

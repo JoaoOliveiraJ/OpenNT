@@ -367,7 +367,7 @@ fn ntoskrnl_exports(assert: Assert) {
     use crate::{ntos::init::export_names as abi_names, ntos::init::exports};
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions, ResolvedImport};
     exports::init();
-    assert(abi_names::EXPORT_NAMES.len() == 2078 && abi_names::GROUP_LAYOUT.len() == 509 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 2059 exports em 506 grupos");
+    assert(abi_names::EXPORT_NAMES.len() == 2148 && abi_names::GROUP_LAYOUT.len() == 551 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 2059 exports em 506 grupos");
     // Ordinais públicos: os slots de função seguidos dos dados sem nome repetido.
     let public_count = abi_names::EXPORT_NAMES.len() + crate::ntos::mm::kernel_data_layout::DEFINITIONS.iter().filter(|entry| !abi_names::EXPORT_NAMES.contains(&entry.name)).count();
     assert(matches!(exports::lookup_ordinal("ntoskrnl.exe", 547), Some(ResolvedImport::Thunk(578))) && exports::lookup("ntoskrnl.exe", "LdrResSearchResource").is_some() && exports::lookup("ntoskrnl.exe", "NaoExisteNoKernel").is_none() && exports::lookup_ordinal("ntoskrnl.exe", 0).is_none() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32).is_some() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32 + 1).is_none(), "ntoskrnl: ordinais, todos os exports com provedor e nome desconhecido");
@@ -2144,7 +2144,7 @@ fn ntoskrnl_mm_group(assert: Assert) {
     use crate::ntos::mm::{image_paging, paging};
     use crate::ntos::init::exports;
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions};
-    assert(exports::implemented() == 2078 && exports::export_names().len() == 2078, "ntoskrnl: 509 grupos com os 2078 exports implementados");
+    assert(exports::implemented() == 2148 && exports::export_names().len() == 2148, "ntoskrnl: 551 grupos com os 2148 exports implementados");
     let block = guest::alloc_bytes(0x200);
     // MmGetSystemRoutineAddress: trampolim chamável e nome desconhecido.
     let name: alloc::vec::Vec<u16> = "KeGetCurrentIrql".encode_utf16().collect();
@@ -5948,15 +5948,14 @@ fn ex_lookaside_wnf_exports(assert: Assert) {
     guest::free_bytes(seen);
     guest::free_bytes(list);
 
-    // WNF: nome indefinido devolve falha (sem faultar).
-    let state_name = guest::alloc_bytes(8);
-    let wnf_name = at::<nt::WnfStateName>(state_name);
-    wnf_name.data[0].set(0);
-    wnf_name.data[1].set(0);
+    // WNF: inscrição sem instância de nome (NameInstance nulo) devolve
+    // STATUS_OBJECT_NAME_NOT_FOUND sem tocar nas saídas.
+    let subscription = guest::alloc_bytes(nt::WnfSubscription::SIZE);
+    guest::write_bytes(subscription, &alloc::vec![0u8; nt::WnfSubscription::SIZE as usize]);
     let size = guest::alloc_bytes(4);
-    guest::write32(size, 0);
-    assert(call_export("ExQueryWnfStateData", &[state_name, 0, 0, 0, 0, size]).is_some_and(|status| status & 0x8000_0000 != 0), "ex: ExQueryWnfStateData devolve falha p/ nome indefinido");
-    guest::free_bytes(state_name);
+    guest::write32(size, 0x77);
+    assert(call_export("ExQueryWnfStateData", &[subscription, 0, 0, size]) == Some(crate::ntos::init::exports::signed_status(0xC000_0034)) && guest::read32(size) == 0x77, "ex: ExQueryWnfStateData de inscricao sem nome devolve STATUS_OBJECT_NAME_NOT_FOUND");
+    guest::free_bytes(subscription);
     guest::free_bytes(size);
 }
 
@@ -14090,6 +14089,15 @@ fn ex_wnf_subscription_exports(assert: Assert) {
     let updated = wnf_service::update(name, data, 4, guid, 0, 0, false);
     work_items::run_queue();
     assert(matches!(updated, Ok(0)) && EX_WNF_CALLBACK[0].load(Ordering::SeqCst) == 2 && EX_WNF_CALLBACK[2].load(Ordering::SeqCst) == stamp + 1, "ex-wnf-subscription: atualizacao entregue com o carimbo novo");
+    // ExQueryWnfStateData pela inscrição: os dados e o carimbo do nome; com
+    // BufferSize pequeno, STATUS_BUFFER_TOO_SMALL com o tamanho gravado.
+    let (query_stamp, query_buffer, query_size) = (storage + 0x40, storage + 0x48, storage + 0x50);
+    guest::write32(query_size, 4);
+    let queried = call_export("ExQueryWnfStateData", &[subscription, query_stamp, query_buffer, query_size]);
+    let read = (guest::read32(query_stamp) as u64, guest::read32(query_buffer), guest::read32(query_size));
+    guest::write32(query_size, 2);
+    let small = call_export("ExQueryWnfStateData", &[subscription, query_stamp, query_buffer, query_size]);
+    assert(queried == Some(0) && read == (stamp + 1, 0x0BAD_CAFE, 4) && small == Some(signed_status(0xC000_0023)) && guest::read32(query_size) == 4, "ex-wnf-subscription: ExQueryWnfStateData le os dados e o carimbo pela inscricao e recusa buffer pequeno");
     assert(call_export("ExUnsubscribeWnfStateChange", &[subscription]).is_some(), "ex-wnf-subscription: ExUnsubscribeWnfStateChange");
     let after = wnf_service::update(name, data, 4, guid, 0, 0, false);
     work_items::run_queue();
@@ -16083,6 +16091,10 @@ pub fn run(assert: Assert) {
     super::executive_misc_exports::run(assert);
     super::minifilter_support::run(assert);
     super::rtl_decompression::run(assert);
+    super::rtl_strings_sids_exports::run(assert);
+    super::security_session_exports::run(assert);
+    super::fsrtl_cc_file_exports::run(assert);
+    super::ke_ex_po_io_exports::run(assert);
     debug_print!("PHASE6_SELFTEST_OK");
 }
 

@@ -1040,3 +1040,148 @@ pub mod lsa_return_buffer {
 
     pub static GROUP: Group = Group { name: "lsa-return-buffer", names: &["LsaFreeReturnBuffer"], handlers: &[free_return_buffer], data_exports: &[] };
 }
+
+pub mod se_logon_session_notify {
+    //! SeRegisterLogonSessionTerminatedRoutineEx,
+    //! SeUnregisterLogonSessionTerminatedRoutineEx e
+    //! SeMarkLogonSessionForTerminationNotificationEx; a lógica mora em
+    //! `se/logon_session`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::se::{logon_session, out};
+    use crate::rtl::KernelError;
+
+    /// SeRegisterLogonSessionTerminatedRoutineEx(Routine, Context) -> NTSTATUS.
+    fn register(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(logon_session::register_terminated_routine(call.arg(1), call.arg(2))))
+    }
+
+    /// SeUnregisterLogonSessionTerminatedRoutineEx(Routine, Context) -> NTSTATUS.
+    fn unregister(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(logon_session::unregister_terminated_routine(call.arg(1), call.arg(2))))
+    }
+
+    /// SeMarkLogonSessionForTerminationNotificationEx(LogonId*, ServerSilo) -> NTSTATUS.
+    fn mark(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(logon_session::mark_for_termination_notification(out::<u64>(call.arg(1)).get(), call.arg(2))))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "se-logon-session-notify",
+        names: &["SeRegisterLogonSessionTerminatedRoutineEx", "SeUnregisterLogonSessionTerminatedRoutineEx", "SeMarkLogonSessionForTerminationNotificationEx"],
+        handlers: &[register, unregister, mark],
+        data_exports: &[],
+    };
+}
+
+pub mod se_token_session_queries {
+    //! SeGetLogonSessionToken (`se/logon_session`) e SeQueryServerSiloToken
+    //! (`se/token/information`).
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::se::token::information;
+    use crate::ntos::se::{logon_session, out};
+    use crate::rtl::KernelError;
+
+    /// SeGetLogonSessionToken(TokenHandle, AccessMode, NewTokenHandle*) -> NTSTATUS.
+    fn get_logon_session_token(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(logon_session::get_logon_session_token(call.arg(1), call.arg(2) as u8, out::<u64>(call.arg(3)))?))
+    }
+
+    /// SeQueryServerSiloToken(Token, Silo*) -> NTSTATUS.
+    fn query_server_silo(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(information::query_server_silo(call.arg(1), out::<u64>(call.arg(2)))))
+    }
+
+    pub static GROUP: Group = Group { name: "se-token-session-queries", names: &["SeGetLogonSessionToken", "SeQueryServerSiloToken"], handlers: &[get_logon_session_token, query_server_silo], data_exports: &[] };
+}
+
+pub mod se_token_attributes_set {
+    //! SeSetSecurityAttributesToken e SeSetSecurityAttributesTokenEx; a
+    //! lógica mora em `se/token/attributes`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::se::out;
+    use crate::ntos::se::token::attributes;
+    use crate::rtl::KernelError;
+
+    /// SeSetSecurityAttributesToken(TokenHandle, AccessMode, Operations,
+    /// Attributes) -> NTSTATUS.
+    fn set(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(attributes::set_security_attributes(call.arg(1), call.arg(2) as u8, false, call.arg(3), call.arg(4))?))
+    }
+
+    /// SeSetSecurityAttributesTokenEx(TokenHandle, AccessMode, Reserved,
+    /// Singleton, Operations, Attributes, SingletonSet*) -> NTSTATUS.
+    fn set_ex(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(attributes::set_security_attributes_ex(call.arg(1), call.arg(2) as u8, call.arg(3), call.arg(4) as u8 != 0, call.arg(5), call.arg(6), out::<u8>(call.arg(7)))?))
+    }
+
+    pub static GROUP: Group = Group { name: "se-token-attributes-set", names: &["SeSetSecurityAttributesToken", "SeSetSecurityAttributesTokenEx"], handlers: &[set, set_ex], data_exports: &[] };
+}
+
+pub mod zw_compare_tokens {
+    //! ZwCompareTokens: o NtCompareTokens em KernelMode (`se/token/compare`).
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::se::out;
+    use crate::ntos::se::token::compare;
+    use crate::rtl::KernelError;
+
+    /// ZwCompareTokens(FirstTokenHandle, SecondTokenHandle, Equal*) -> NTSTATUS.
+    fn compare_tokens(call: &Call) -> Result<u64, KernelError> {
+        let (status, equal) = compare::compare_tokens(call.arg(1), call.arg(2), 0)?;
+        out::<u8>(call.arg(3)).set(equal as u8);
+        Ok(signed_status(status))
+    }
+
+    pub static GROUP: Group = Group { name: "zw-compare-tokens", names: &["ZwCompareTokens"], handlers: &[compare_tokens], data_exports: &[] };
+}
+
+pub mod se_examine_sacl {
+    //! SeExamineSacl; a lógica mora em `se/audit`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::se::{audit, out};
+    use crate::rtl::KernelError;
+
+    /// SeExamineSacl(Sacl, ResourceSacl, Token, DesiredAccess, AccessGranted,
+    /// GenerateAudit*, GenerateAlarm*).
+    fn examine_sacl(call: &Call) -> Result<u64, KernelError> {
+        let audit = audit::examine_sacl_for_audit(call.arg(1), call.arg(3), call.arg(4) as u32, call.arg(5) as u8 != 0);
+        out::<u8>(call.arg(6)).set(audit as u8);
+        out::<u8>(call.arg(7)).set(0);
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group { name: "se-examine-sacl", names: &["SeExamineSacl"], handlers: &[examine_sacl], data_exports: &[] };
+}
+
+pub mod se_cached_signing_level {
+    //! SeGetCachedSigningLevel; a lógica mora em `se/signing_level`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::se::signing_level;
+    use crate::rtl::KernelError;
+
+    /// SeGetCachedSigningLevel(FileObject, Flags*, SigningLevel*, Thumbprint,
+    /// ThumbprintSize*, ThumbprintAlgorithm*) -> NTSTATUS.
+    fn get_cached(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(signing_level::get_for_file_object(call.arg(1), call.arg(2), call.arg(3), call.arg(4), call.arg(5), call.arg(6))))
+    }
+
+    pub static GROUP: Group = Group { name: "se-cached-signing-level", names: &["SeGetCachedSigningLevel"], handlers: &[get_cached], data_exports: &[] };
+}
+
+pub mod se_public_default_dacl {
+    //! O export de dado SePublicDefaultDacl (`se/system_dacls`).
+
+    use crate::ntos::init::exports::Group;
+    use crate::ntos::se::system_dacls;
+
+    fn public_default_dacl_cell() -> u64 {
+        system_dacls::public_default_dacl_cell()
+    }
+
+    pub static GROUP: Group = Group { name: "se-public-default-dacl", names: &[], handlers: &[], data_exports: &[("SePublicDefaultDacl", public_default_dacl_cell)] };
+}

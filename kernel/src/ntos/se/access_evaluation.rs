@@ -249,6 +249,13 @@ fn sid_in_subject(subject: &Subject, ace_sid: &[u8], deny: bool, restricted: boo
     subject.groups.iter().any(|(entry, attributes)| entry.as_slice() == ace_sid && group_matches(*attributes))
 }
 
+/// SepSidInToken(Token, NULL, Sid, DenyAce, FALSE) sobre a identidade do
+/// token: o usuário e os grupos pela regra do SepSidInTokenSidHash, fora da
+/// passagem restrita e sem OWNER RIGHTS.
+pub fn sid_in_token(subject: &Subject, ace_sid: &[u8], deny: bool) -> bool {
+    sid_in_subject(subject, ace_sid, deny, false, false)
+}
+
 /// As identidades de pacote de um token LowBox: o pacote, ALL RESTRICTED
 /// APPLICATION PACKAGES, ALL APPLICATION PACKAGES (fora do LPAC) e as
 /// capacidades habilitadas.

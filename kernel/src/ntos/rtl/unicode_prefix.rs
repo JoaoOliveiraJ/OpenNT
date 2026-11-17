@@ -17,18 +17,30 @@
 //! ou o prefixo termina em `\`); os primeiros `CaseInsensitiveIndex`
 //! caracteres comparam com caixa e o resto sem caixa (RtlUpcaseUnicodeChar).
 //! Inserir um prefixo que já existe (sem caixa) devolve FALSE.
+//!
+//! RtlNextUnicodePrefix (ntoskrnl 19041 0x773560) enumera a tabela com o
+//! cursor LastNextEntry, na mesma ordem do NT: dentro de cada árvore, em
+//! ordem (RtlRealSuccessor sobre os links de splay), passando pelos nós de
+//! caixa exata (RTL_NTC_UNICODE_CASE_MATCH, 0x803) do anel CaseMatch; ao
+//! esgotar uma árvore, sobe à raiz e segue para a árvore de NextPrefixTree.
+//! Com as raízes isoladas desta tabela, isso visita as entradas na ordem
+//! da lista.
 
 use alloc::vec::Vec;
 
 use crate::ntos::inc::field::NtStruct;
-use crate::ntos::inc::types::{UnicodePrefixTable, UnicodePrefixTableEntry};
-use crate::ntos::rtl::guest_strings;
+use crate::ntos::inc::types::{RtlSplayLinks, UnicodePrefixTable, UnicodePrefixTableEntry};
+use crate::ntos::rtl::{gentable, guest_strings};
 use crate::ntos::rtl::nls_translation::upcase_unicode_char;
 use crate::rtl::KernelError;
 
 /// RTL_NTC_UNICODE_PREFIX_TABLE e RTL_NTC_UNICODE_ROOT.
 const NODE_TABLE: i16 = 0x800;
 const NODE_ROOT: i16 = 0x801;
+/// RTL_NTC_UNICODE_CASE_MATCH: entrada que só difere de outra na caixa.
+const NODE_CASE_MATCH: i16 = 0x803;
+/// Deslocamento dos links de splay na entrada (o CONTAINING_RECORD).
+const LINKS_OFFSET: u64 = core::mem::offset_of!(UnicodePrefixTableEntry, links) as u64;
 
 fn table_at(address: u64) -> &'static UnicodePrefixTable {
     // SAFETY: a UNICODE_PREFIX_TABLE viva do chamador de kernel.
@@ -105,7 +117,8 @@ pub fn insert(table: u64, prefix: u64, entry: u64) -> Result<bool, KernelError> 
     item.node_type_code.set(NODE_ROOT);
     item.name_length.set(length);
     item.case_match.set(entry);
-    item.links.parent.set(entry);
+    // RtlInitializeSplayLinks: a raiz isolada aponta para os próprios links.
+    item.links.parent.set(item.links.address());
     item.links.left_child.set(0);
     item.links.right_child.set(0);
     item.prefix.set(prefix);
@@ -155,4 +168,61 @@ pub fn find(table: u64, full_name: u64, case_insensitive_index: u32) -> Result<u
         }
     }
     Ok(0)
+}
+
+fn links_at(address: u64) -> &'static RtlSplayLinks {
+    // SAFETY: os RTL_SPLAY_LINKS embutidos numa entrada viva da tabela.
+    unsafe { RtlSplayLinks::at(address) }
+}
+
+/// A entrada mais à esquerda da árvore cuja raiz é `root`.
+fn leftmost(root: u64) -> u64 {
+    let mut links = entry_at(root).links.address();
+    let mut child = links_at(links).left_child.get();
+    while child != 0 {
+        links = child;
+        child = links_at(child).left_child.get();
+    }
+    links - LINKS_OFFSET
+}
+
+/// RtlNextUnicodePrefix(PrefixTable, Restart) -> PUNICODE_PREFIX_TABLE_ENTRY:
+/// com Restart (ou sem cursor) a primeira entrada; senão a seguinte à do
+/// cursor LastNextEntry. Tabela vazia ou fim da enumeração devolvem NULL sem
+/// mexer no cursor; cada entrada devolvida vira o novo cursor.
+pub fn next(table: u64, restart: bool) -> u64 {
+    let header = table_at(table);
+    let last = header.last_next_entry.get();
+    let found = if restart || last == 0 {
+        let first = header.next_prefix_tree.get();
+        if entry_at(first).node_type_code.get() == NODE_TABLE {
+            return 0;
+        }
+        leftmost(first)
+    } else {
+        let case_match = entry_at(last).case_match.get();
+        if entry_at(case_match).node_type_code.get() == NODE_CASE_MATCH {
+            case_match
+        } else {
+            match gentable::real_successor(entry_at(case_match).links.address()) {
+                0 => {
+                    // Árvore esgotada: a raiz da árvore do cursor e a árvore seguinte.
+                    let mut links = entry_at(last).links.address();
+                    let mut parent = links_at(links).parent.get();
+                    while parent != links {
+                        links = parent;
+                        parent = links_at(links).parent.get();
+                    }
+                    let following = entry_at(links - LINKS_OFFSET).next_prefix_tree.get();
+                    if entry_at(following).name_length.get() <= 0 {
+                        return 0;
+                    }
+                    leftmost(following)
+                }
+                successor => successor - LINKS_OFFSET,
+            }
+        }
+    };
+    header.last_next_entry.set(found);
+    found
 }

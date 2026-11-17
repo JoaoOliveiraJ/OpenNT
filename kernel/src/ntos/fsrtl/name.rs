@@ -1,5 +1,6 @@
 //! Nomes do FsRtl — correspondência com curingas DOS, detecção de curingas,
-//! desmontagem de caminhos e o bitmap FsRtlLegalAnsiCharacterArray.
+//! desmontagem de caminhos, a remoção de "." e ".." de um caminho
+//! (FsRtlRemoveDotsFromPath) e o bitmap FsRtlLegalAnsiCharacterArray.
 //!
 //! `IsNameInExpression`/`DoesNameContainWildCards`/`DissectName` reproduzem
 //! o `ntoskrnl` real (desmontagem por RVA). As UNICODE_STRING são endereços
@@ -726,4 +727,115 @@ pub fn is_dbcs_in_expression_strings(expression: &crate::ntos::inc::types::Strin
         if length == 0 { Vec::new() } else { guest::read_bytes(string.buffer.get(), length) }
     };
     is_dbcs_in_expression(&read(expression), &read(name), name.buffer.get())
+}
+
+// ---- FsRtlRemoveDotsFromPath -------------------------------------------------
+//
+// ntoskrnl 10.0.19041, RVA 0x75f7c0 (cauda fria 0x83693c). Trabalha no próprio
+// buffer, com o índice de escrita em 16 bits com sinal e o de leitura em 16
+// bits sem sinal, lendo o que já foi reescrito quando os dois se alcançam.
+// Antes do laço recusa os caminhos "\..", "..\" (no começo de um caminho de
+// três ou mais caracteres) e ".." inteiro. O primeiro caractere fica como
+// está; "\\" vira "\"; "\.\" some; um "\." final some com a barra (menos a
+// raiz); "\..\" e um "\.." final voltam até a barra anterior, e passar da
+// raiz recusa o caminho (com o buffer já reescrito até ali e sem NewLength).
+// No fim NewLength = caracteres escritos * 2 e o resto do buffer é zerado.
+
+/// STATUS_IO_REPARSE_DATA_INVALID: o status com que o NT recusa o caminho.
+pub const STATUS_IO_REPARSE_DATA_INVALID: u32 = 0xC000_0278;
+
+/// FsRtlRemoveDotsFromPath(OriginalString, PathLength, *NewLength) -> NTSTATUS.
+pub fn remove_dots_from_path(path: u64, path_length: u16, new_length: &crate::ntos::inc::field::Field<u16>) -> u32 {
+    let count = (path_length >> 1) as usize;
+    let mut units: Vec<u16> = (0..count).map(|index| guest::read16(path + index as u64 * 2)).collect();
+    let starts_with = |units: &[u16], pattern: &[u16]| units.len() >= pattern.len() && units[..pattern.len()] == *pattern;
+    let rejected = match count {
+        2 => starts_with(&units, &[WC_DOT, WC_DOT]),
+        3 => starts_with(&units, &[WC_BACKSLASH, WC_DOT, WC_DOT]) || starts_with(&units, &[WC_DOT, WC_DOT, WC_BACKSLASH]),
+        n if n > 3 => starts_with(&units, &[WC_DOT, WC_DOT, WC_BACKSLASH]),
+        _ => false,
+    };
+    if rejected {
+        return STATUS_IO_REPARSE_DATA_INVALID;
+    }
+    let result = collapse_dots(&mut units);
+    for (index, &unit) in units.iter().enumerate() {
+        guest::write16(path + index as u64 * 2, unit);
+    }
+    match result {
+        Some(written) => {
+            new_length.set((written as u16).wrapping_mul(2));
+            0
+        }
+        None => STATUS_IO_REPARSE_DATA_INVALID,
+    }
+}
+
+/// O laço do FsRtlRemoveDotsFromPath sobre o buffer: devolve quantos
+/// caracteres ficaram (o resto zerado), ou None quando o caminho sobe acima
+/// da raiz (o buffer fica como estava naquele ponto).
+fn collapse_dots(units: &mut [u16]) -> Option<i16> {
+    let count = units.len();
+    let last = count as i32 - 1;
+    let tail = count as i32 - 2;
+    let (mut read, mut written) = (0usize, 0i16);
+    while read < count {
+        if read == 0 {
+            // O primeiro caractere fica no lugar.
+            written += 1;
+            read += 1;
+            continue;
+        }
+        let unit = units[read];
+        if (read as i32) < last && unit == WC_BACKSLASH && units[read + 1] == WC_BACKSLASH {
+            read += 1;
+            continue;
+        }
+        if unit != WC_DOT {
+            units[written as usize] = unit;
+            written += 1;
+            read += 1;
+            continue;
+        }
+        let after_separator = units[read - 1] == WC_BACKSLASH;
+        if read as i32 == last {
+            // "\." final: a barra já escrita sai, menos a da raiz.
+            if after_separator {
+                if written > 1 {
+                    written -= 1;
+                }
+                read += 1;
+                continue;
+            }
+        } else {
+            let next = units[read + 1];
+            if next == WC_BACKSLASH && after_separator {
+                // "\.\": o ponto e a barra seguinte somem.
+                read += 2;
+                continue;
+            }
+            if next == WC_DOT && after_separator && (read as i32 == tail || units[read + 2] == WC_BACKSLASH) {
+                // "\..\" ou "\.." final: volta até a barra anterior.
+                written -= 2;
+                while written > 0 && units[written as usize] != WC_BACKSLASH {
+                    written -= 1;
+                }
+                if written < 0 || units[written as usize] != WC_BACKSLASH {
+                    return None;
+                }
+                if written == 0 && read as i32 == tail {
+                    written = 1;
+                }
+                read += 2;
+                continue;
+            }
+        }
+        units[written as usize] = WC_DOT;
+        written += 1;
+        read += 1;
+    }
+    for unit in units.iter_mut().skip(written.max(0) as usize) {
+        *unit = 0;
+    }
+    Some(written)
 }

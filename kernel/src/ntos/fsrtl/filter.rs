@@ -1,5 +1,6 @@
 //! Registro de filtros de sistema de arquivos no FsRtl — a tabela do Filter
-//! Manager (FsRtlRegisterFltMgrCalls) e os callbacks de filtro por driver
+//! Manager (FsRtlRegisterFltMgrCalls), a consulta de recursos do volume por
+//! ela (FsRtlGetSupportedFeatures) e os callbacks de filtro por driver
 //! (FsRtlRegisterFileSystemFilterCallbacks).
 //!
 //! `RegisterFltMgrCalls` publica a tabela do FltMgr (o `xchg` de uma
@@ -44,4 +45,13 @@ pub fn register_file_system_filter_callbacks(driver_object: u64, callbacks: u64)
     guest::write_bytes(pool, &guest::read_bytes(callbacks, size as usize));
     extension.fs_filter_callbacks.set(pool);
     0
+}
+
+/// FsRtlGetSupportedFeatures(DeviceObject, SupportedFeatures*) -> NTSTATUS
+/// (RVA 0x2f7d60): `*SupportedFeatures = 0` e, com o Filter Manager
+/// registrado, o slot 0x10 da tabela dele com os mesmos dois argumentos; sem
+/// ele, STATUS_SUCCESS.
+pub fn get_supported_features(device: u64, features: &crate::ntos::inc::field::Field<u32>) -> u32 {
+    features.set(0);
+    filter_callbacks::get_supported_features(device, features.address())
 }

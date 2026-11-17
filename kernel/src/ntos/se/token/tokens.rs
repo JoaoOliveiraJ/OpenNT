@@ -53,9 +53,13 @@ pub fn in_use(pointer: u64) -> bool {
 }
 
 /// SepStopReferencingLogonSession: o token larga a referência à sessão de
-/// logon (TOKEN_SESSION_NOT_REFERENCED). Devolve se ainda a segurava.
+/// logon (TOKEN_SESSION_NOT_REFERENCED) e o SepDeReferenceLogonSessionDirect
+/// solta a contagem dela. Devolve se ainda a segurava.
 pub fn stop_referencing_logon_session(pointer: u64) -> bool {
     let flags = body(pointer).token_flags.atomic().fetch_or(TOKEN_SESSION_NOT_REFERENCED, core::sync::atomic::Ordering::SeqCst);
+    if let Some(Some((logon_id, server_silo))) = update(pointer, |token| token.logon_reference.take()) {
+        crate::ntos::se::logon_session::dereference_direct(logon_id, server_silo);
+    }
     flags & TOKEN_SESSION_NOT_REFERENCED == 0
 }
 
@@ -152,6 +156,10 @@ pub struct Token {
     /// TOKEN_AUDIT_POLICY gravado.
     pub audit_policy_status: u8,
     pub audit_policy: [u8; TOKEN_AUDIT_POLICY_SIZE],
+    /// A sessão de logon (LogonId, silo) que o token referencia
+    /// (`se/logon_session.rs`): a do AuthenticationId na criação; `None` sem
+    /// sessão ou depois do SepStopReferencingLogonSession.
+    pub logon_reference: Option<(u64, u64)>,
 }
 
 /// O TOKEN_AUDIT_POLICY (o PerUserPolicy das subcategorias de auditoria).
@@ -374,6 +382,7 @@ pub fn create(parent: Option<u64>, initialize: Option<&dyn Fn(&mut Token)>) -> R
         originating_logon_session: parent.as_ref().map_or(0, |parent| parent.originating_logon_session),
         audit_policy_status: parent.as_ref().map_or(0, |parent| parent.audit_policy_status),
         audit_policy: parent.as_ref().map_or([0; TOKEN_AUDIT_POLICY_SIZE], |parent| parent.audit_policy),
+        logon_reference: None,
     };
     // Identidades especiais definem seus campos antes do armazenamento dinâmico.
     if let Some(initialize) = initialize {
@@ -385,8 +394,14 @@ pub fn create(parent: Option<u64>, initialize: Option<&dyn Fn(&mut Token)>) -> R
         return Err(error);
     }
     publish_body(&token);
+    let logon_session = (token.authentication_id, token.server_silo);
     tokens.records.insert(pointer, token);
     drop(tokens);
+    // SepReferenceLogonSessionSilo: o token referencia a sessão do
+    // AuthenticationId (fora do lock dos tokens: o banco de sessões o toma).
+    if crate::ntos::se::logon_session::reference_for_token(logon_session.0, logon_session.1) {
+        update(pointer, |token| token.logon_reference = Some(logon_session));
+    }
     object_types::account(&object_type.name, 1, 0)?;
     Ok(pointer)
 }
@@ -414,13 +429,19 @@ pub fn release(pointer: u64) -> Result<u64, KernelError> {
         let token = tokens.records.get_mut(&pointer).unwrap();
         token.refs -= 1;
         let remaining = token.refs;
+        let mut logon_reference = None;
         if remaining == 0 {
-            tokens.records.remove(&pointer);
+            logon_reference = tokens.records.remove(&pointer).and_then(|token| token.logon_reference);
             release_storage(&mut tokens, pointer);
         }
-        remaining
+        (remaining, logon_reference)
     };
+    let (remaining, logon_reference) = remaining;
     if remaining == 0 {
+        // SepTokenDeleteMethod: a referência à sessão de logon sai com o token.
+        if let Some((logon_id, server_silo)) = logon_reference {
+            crate::ntos::se::logon_session::dereference_for_token(logon_id, server_silo);
+        }
         object_types::account("Token", -1, 0)?;
         guest::free_bytes(pointer);
     }

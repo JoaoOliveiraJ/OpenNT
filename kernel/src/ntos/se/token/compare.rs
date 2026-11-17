@@ -202,3 +202,31 @@ fn nt_compare_tokens(first: u64, second: u64, equal: u64, _a4: u64, _rsp: u64) -
 pub fn register_user_services() {
     state::register_handler("NtCompareTokens", nt_compare_tokens);
 }
+
+/// ZwCompareTokens(FirstTokenHandle, SecondTokenHandle, Equal*): o mesmo
+/// NtCompareTokens com PreviousMode `access_mode` (KernelMode para o Zw: os
+/// handles saem da tabela do processo ou de kernel e a saída não é
+/// sondada). Devolve o NTSTATUS e o BOOLEAN que vai para *Equal (FALSE
+/// quando uma referência falha).
+pub fn compare_tokens(first_handle: u64, second_handle: u64, access_mode: u8) -> Result<(u32, bool), KernelError> {
+    use crate::ntos::se::token::reference as token_reference;
+    let mut first = match token_reference::reference(first_handle, TOKEN_QUERY, access_mode, false)? {
+        Ok(reference) => reference,
+        Err(status) => return Ok((status, false)),
+    };
+    if first_handle == second_handle {
+        first.release()?;
+        return Ok((0, true));
+    }
+    let mut second = match token_reference::reference(second_handle, TOKEN_QUERY, access_mode, false)? {
+        Ok(reference) => reference,
+        Err(status) => {
+            first.release()?;
+            return Ok((status, false));
+        }
+    };
+    let equal = first.token == second.token || matches!((tokens::get(first.token), tokens::get(second.token)), (Some(left), Some(right)) if equivalent(&left, &right));
+    second.release()?;
+    first.release()?;
+    Ok((0, equal))
+}

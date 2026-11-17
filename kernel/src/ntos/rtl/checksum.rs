@@ -1,4 +1,4 @@
-//! Somas de verificação do Rtl — RtlComputeCrc32.
+//! Somas de verificação do Rtl — RtlComputeCrc32, RtlCrc32 e RtlCrc64.
 //!
 //! RtlCrc32Table do ntoskrnl é a tabela refletida padrão do polinômio
 //! 0xEDB88320 (conferida entrada a entrada contra a imagem com pefile);
@@ -69,6 +69,47 @@ pub fn crc64(buffer: u64, size: u64, initial: u64) -> u64 {
         let chunk = remaining.min(0x1000);
         for byte in guest::read_bytes(cursor, chunk as usize) {
             crc = CRC64_TABLE[((crc ^ byte as u64) & 0xFF) as usize] ^ (crc >> 8);
+        }
+        cursor += chunk;
+        remaining -= chunk;
+    }
+    !crc
+}
+
+// ---- RtlCrc32 (ntoskrnl 19041, 0x588a50 -> RtlpComputeCrcInternal, Crc32Ctrl) ----
+//
+// Crc32Ctrl: polinômio refletido 0x82F63B78 (CRC-32C, Castagnoli) e valor de
+// inversão 0xFFFFFFFF; o estado começa em InitialCrc ^ ~0 e o resultado é
+// invertido de novo. Não é o CRC do RtlComputeCrc32 (IEEE).
+
+const fn crc32c_table() -> [u32; 256] {
+    let mut table = [0u32; 256];
+    let mut index = 0;
+    while index < 256 {
+        let mut value = index as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            value = if value & 1 != 0 { (value >> 1) ^ 0x82F6_3B78 } else { value >> 1 };
+            bit += 1;
+        }
+        table[index] = value;
+        index += 1;
+    }
+    table
+}
+
+static CRC32C_TABLE: [u32; 256] = crc32c_table();
+
+/// RtlCrc32(Buffer, Size, InitialCrc) -> ULONG: CRC-32C encadeável; Size 0
+/// devolve InitialCrc.
+pub fn crc32(buffer: u64, size: u64, initial: u32) -> u32 {
+    let mut crc = !initial;
+    let mut cursor = buffer;
+    let mut remaining = size;
+    while remaining != 0 {
+        let chunk = remaining.min(0x1000);
+        for byte in guest::read_bytes(cursor, chunk as usize) {
+            crc = CRC32C_TABLE[((crc ^ byte as u32) & 0xFF) as usize] ^ (crc >> 8);
         }
         cursor += chunk;
         remaining -= chunk;

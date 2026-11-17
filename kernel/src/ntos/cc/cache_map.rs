@@ -27,6 +27,7 @@ use super::status::{CcResult, Failure};
 use super::{flush, vacb};
 use crate::ntos::inc::field::NtStruct;
 use crate::ntos::inc::types::extra_cc::{CacheUninitializeEvent, CcFileSizes, PrivateCacheMap, SharedCacheMap};
+use crate::ntos::inc::types::extra_fsrtl::FsrtlCommonFcbHeader;
 use crate::ntos::inc::types::{FileObject, ListEntry, SectionObjectPointers};
 use crate::ntos::ex::list_entry;
 use crate::ntos::ke::dispatcher;
@@ -631,6 +632,29 @@ pub fn set_read_ahead_granularity(file: u64, granularity: u32) {
     if private != 0 {
         // SAFETY: o PRIVATE_CACHE_MAP que o CcInitializeCacheMap deu ao FILE_OBJECT.
         unsafe { PrivateCacheMap::at(private) }.read_ahead_mask.set(granularity.wrapping_sub(1));
+    }
+}
+
+/// FSRTL_COMMON_FCB_HEADER.Flags: FSRTL_FLAG_LIMIT_MODIFIED_PAGES.
+const FSRTL_FLAG_LIMIT_MODIFIED_PAGES: u8 = 0x04;
+
+/// CcSetDirtyPageThreshold(FileObject, DirtyPageThreshold) (RVA 0x4e9a40):
+/// grava o limite em SharedCacheMap->DirtyPageThreshold, quando o arquivo já
+/// tem cache map (o SectionObjectPointer é lido sem teste, como no NT), e
+/// liga FSRTL_FLAG_LIMIT_MODIFIED_PAGES no cabeçalho do FCB
+/// (FileObject->FsContext).
+pub fn set_dirty_page_threshold(file: u64, threshold: u32) {
+    let object = file_object(file);
+    let map = pointers_at(object.section_object_pointer.get()).shared_cache_map.get();
+    if map != 0 {
+        // SAFETY: o SHARED_CACHE_MAP que o CcInitializeCacheMap pendurou no arquivo.
+        unsafe { SharedCacheMap::at(map) }.dirty_page_threshold.set(threshold);
+    }
+    // SAFETY: o FsContext de um arquivo de file system começa pelo cabeçalho comum do FCB.
+    let header = unsafe { FsrtlCommonFcbHeader::at(object.fs_context.get()) };
+    let flags = header.flags.get();
+    if flags & FSRTL_FLAG_LIMIT_MODIFIED_PAGES == 0 {
+        header.flags.set(flags | FSRTL_FLAG_LIMIT_MODIFIED_PAGES);
     }
 }
 

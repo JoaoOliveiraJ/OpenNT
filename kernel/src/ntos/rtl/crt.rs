@@ -425,6 +425,28 @@ pub fn wcscpy_s(destination: u64, capacity: u64, source: u64) -> u64 {
     0
 }
 
+/// wcsncpy(Dest, Source, Count) (ntoskrnl 19041 0x3d3980): copia WCHARs até
+/// o NUL (inclusive) ou até Count; sobrando espaço depois do NUL, completa
+/// com zeros até Count WCHARs no total. Sem NUL nos Count primeiros, Dest
+/// fica sem terminador. Devolve Dest.
+pub fn wcsncpy(destination: u64, source: u64, count: u64) -> u64 {
+    let mut remaining = count;
+    let mut cursor = 0u64;
+    while remaining != 0 {
+        let unit = guest::read16(source + cursor * 2);
+        guest::write16(destination + cursor * 2, unit);
+        cursor += 1;
+        remaining -= 1;
+        if unit == 0 {
+            break;
+        }
+    }
+    if remaining != 0 {
+        guest::write_bytes(destination + cursor * 2, &alloc::vec![0u8; remaining as usize * 2]);
+    }
+    destination
+}
+
 /// wcsncpy_s(wchar_t* d, size_t n, const wchar_t* s, size_t count): cópia
 /// limitada; _TRUNCATE((size_t)-1) trunca com STRUNCATE, senão ERANGE.
 pub fn wcsncpy_s(destination: u64, capacity: u64, source: u64, count: u64) -> u64 {
@@ -697,13 +719,26 @@ pub fn wcstoul(text: u64, end: u64, requested: u32) -> u32 {
 /// do [`wcstoul`] com 64 bits; estouro satura em _UI64_MAX (negado se houve
 /// '-').
 pub fn wcstoui64(text: u64, end: u64, requested: u32) -> u64 {
+    wcstoxq(text, end, requested, true).0
+}
+
+/// wcstoxq (ntoskrnl 19041 0x3d3fcc), o conversor de 64 bits da CRT larga:
+/// brancos de `pwctype`, sinal, prefixo 0x (Base 0/16), octal com 0 inicial
+/// em Base 0, dígitos de `wchartodigit` ou letras. Base fora de 0 e 2..36 ou
+/// String NULL é parâmetro inválido (o tratador do kernel volta) e devolve
+/// 0 com *EndPtr = String. Sem dígitos, *EndPtr = String e 0. Devolve o
+/// valor e se houve erro de faixa (o ERANGE que vai ao errno do chamador):
+/// sem sinal, estouro de 64 bits satura em _UI64_MAX; com sinal (FL_UNSIGNED
+/// desligado), também passar de LLONG_MAX (ou de -LLONG_MIN com '-'), que
+/// satura em LLONG_MAX ou LLONG_MIN. O '-' nega o valor final.
+pub fn wcstoxq(text: u64, end: u64, requested: u32, unsigned: bool) -> (u64, bool) {
     // SAFETY: wchar_t** EndPtr do chamador (opcional).
     let end_pointer = (end != 0).then(|| unsafe { Field::<u64>::at(end) });
     if let Some(end_pointer) = end_pointer {
         end_pointer.set(text);
     }
     if text == 0 || (requested != 0 && requested.wrapping_sub(2) > 34) {
-        return 0;
+        return (0, false);
     }
     let mut cursor = text + 2;
     let mut unit = guest::read16(text);
@@ -747,21 +782,32 @@ pub fn wcstoui64(text: u64, end: u64, requested: u32) -> u64 {
             number = number * base + digit;
         } else {
             overflow = true;
+            if end == 0 {
+                break;
+            }
         }
         unit = guest::read16(cursor);
         cursor += 2;
     }
     let mut stop = cursor - 2;
+    let mut range_error = false;
     if !read_digit {
         stop = text;
         number = 0;
-    } else if overflow {
-        number = u64::MAX;
+    } else if overflow || (!unsigned && number > if negative { 1 << 63 } else { i64::MAX as u64 }) {
+        range_error = true;
+        number = if unsigned {
+            u64::MAX
+        } else if negative {
+            1 << 63
+        } else {
+            i64::MAX as u64
+        };
     }
     if let Some(end_pointer) = end_pointer {
         end_pointer.set(stop);
     }
-    if negative { number.wrapping_neg() } else { number }
+    (if negative { number.wrapping_neg() } else { number }, range_error)
 }
 
 /// Classes de letra do `pctype` (_UPPER | _LOWER | _ALPHA).

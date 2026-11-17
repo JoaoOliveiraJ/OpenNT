@@ -187,6 +187,66 @@ pub fn initialize_irp(packet: u64, size: u16, count: u8) {
     initialize_header(unsafe { Irp::at(packet) }, size, count);
 }
 
+// ---- IoSizeOfIrpEx, IoInitializeIrpEx e IoCleanupIrp (ntoskrnl 19041) ----------
+//
+// - IoSizeOfIrpEx(DeviceObject, StackSize) 0x505fe0: um dispositivo -1 ou com
+//   DO_DEVICE_IRP_REQUIRES_EXTENSION ganha duas stack locations a mais (a
+//   área da _IOP_IRP_EXTENSION); o tamanho é USHORT, sizeof(IRP) + StackSize
+//   (com sinal) * sizeof(IO_STACK_LOCATION).
+// - IoInitializeIrpEx(Irp, DeviceObject, PacketSize, StackSize) 0x391bc0: o
+//   IoInitializeIrp e, na mesma condição, IrpExtension = CurrentStackLocation
+//   (a área das duas locations extras, logo acima das StackSize); o bit de
+//   extensão alocada (AllocationFlags 0x40) não é ligado.
+// - IoCleanupIrp(Irp) 0x391c10: Type diferente de IO_TYPE_IRP é
+//   MULTIPLE_IRP_COMPLETE_REQUESTS (0x44, Irp, 0x2636); senão Type = 0 e, com
+//   a extensão alocada no pool, o IopFreeIrpExtension(Irp, -1, TRUE). O
+//   chamador é dono da memória do IRP.
+
+/// DO_DEVICE_IRP_REQUIRES_EXTENSION.
+const DO_DEVICE_IRP_REQUIRES_EXTENSION: u32 = 0x0800_0000;
+/// IRP.AllocationFlags: extensão alocada do pool.
+const IRP_EXTENSION_ALLOCATED: u8 = 0x40;
+const MULTIPLE_IRP_COMPLETE_REQUESTS: u32 = 0x44;
+
+/// O dispositivo pede a extensão de IRP (o -1 do chamador ou o flag).
+fn device_requires_extension(device: u64) -> bool {
+    // SAFETY: DEVICE_OBJECT vivo do chamador quando não é nulo nem -1.
+    device == u64::MAX || (device != 0 && unsafe { crate::ntos::inc::types::DeviceObject::at(device) }.flags.get() & DO_DEVICE_IRP_REQUIRES_EXTENSION != 0)
+}
+
+/// IoSizeOfIrpEx(DeviceObject, StackSize).
+pub fn size_of_irp_ex(device: u64, stack_size: u8) -> u16 {
+    let count = if device_requires_extension(device) { stack_size.wrapping_add(2) } else { stack_size } as i8 as i16 as u16;
+    count.wrapping_mul(IoStackLocation::SIZE as u16).wrapping_add(Irp::SIZE as u16)
+}
+
+/// IoInitializeIrpEx(Irp, DeviceObject, PacketSize, StackSize).
+pub fn initialize_irp_ex(packet: u64, device: u64, size: u16, count: u8) {
+    use crate::ntos::inc::types::extra_io::IrpExtensionField;
+    initialize_irp(packet, size, count);
+    if device_requires_extension(device) {
+        // SAFETY: `packet` aponta para `size` bytes do chamador, recém-iniciados.
+        let irp = unsafe { Irp::at(packet) };
+        irp.irp_extension().set(irp.tail.overlay.current_stack_location.get());
+    }
+}
+
+/// IoCleanupIrp(Irp).
+pub fn cleanup_irp(packet: u64) -> Result<(), crate::rtl::KernelError> {
+    // SAFETY: `packet` é o IRP do chamador.
+    let irp = unsafe { Irp::at(packet) };
+    if irp.type_.get() != IO_TYPE_IRP {
+        crate::ntos::ke::bugcheck::bug_check_ex(MULTIPLE_IRP_COMPLETE_REQUESTS, packet, 0x2636, 0, 0);
+    }
+    irp.type_.set(0);
+    if irp.allocation_flags.get() & IRP_EXTENSION_ALLOCATED != 0 {
+        crate::ntos::io::extensions::free_irp_extension(packet)?;
+    }
+    // A genérica e o ActivityId do OpenNT ficam na tabela de `irp_extension`.
+    irp_extension::release(packet);
+    Ok(())
+}
+
 /// IoSetMasterIrpStatus: grava o status no IRP mestre e o devolve.
 pub fn set_master_irp_status(packet: u64, status: u64) -> u64 {
     // SAFETY: `packet` é o IRP mestre vivo do chamador.

@@ -1094,3 +1094,43 @@ pub mod pf_file_info_notify {
 
     pub static GROUP: Group = Group { name: "pf-file-info-notify", names: &["PfFileInfoNotify"], handlers: &[file_info_notify], data_exports: &[] };
 }
+
+pub mod mm_mdl_pages_cached {
+    //! MmAreMdlPagesCached; a lógica mora em `mm/mdl.rs`.
+
+    use crate::ntos::inc::field::NtStruct;
+    use crate::ntos::inc::types::Mdl;
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::mm::mdl;
+    use crate::rtl::KernelError;
+
+    /// MmAreMdlPagesCached(Mdl) -> BOOLEAN.
+    fn are_mdl_pages_cached(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: o PMDL do chamador.
+        Ok(mdl::are_pages_cached(unsafe { Mdl::at(call.arg(1)) }) as u64)
+    }
+
+    pub static GROUP: Group = Group { name: "mm-mdl-pages-cached", names: &["MmAreMdlPagesCached"], handlers: &[are_mdl_pages_cached], data_exports: &[] };
+}
+
+pub mod mm_copy_memory {
+    //! MmCopyMemory; a lógica mora em `mm/copy_virtual.rs`.
+
+    use crate::ntos::inc::field::{Field, NtStruct};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::mm::copy_virtual;
+    use crate::rtl::KernelError;
+
+    /// MmCopyMemory(TargetAddress, SourceAddress, NumberOfBytes, Flags,
+    /// NumberOfBytesTransferred) -> NTSTATUS.
+    fn copy_memory(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: o PSIZE_T NumberOfBytesTransferred do chamador.
+        let transferred = unsafe { Field::<u64>::at(call.arg(5)) };
+        transferred.set(0);
+        let (status, copied) = copy_virtual::copy_memory(call.arg(1), call.arg(2), call.arg(3), call.arg(4) as u32)?;
+        transferred.set(copied);
+        Ok(signed_status(status))
+    }
+
+    pub static GROUP: Group = Group { name: "mm-copy-memory", names: &["MmCopyMemory"], handlers: &[copy_memory], data_exports: &[] };
+}

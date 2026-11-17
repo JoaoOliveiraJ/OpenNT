@@ -495,3 +495,132 @@ pub fn decode_internal(address: u64) -> Result<Vec<SecurityAttribute>, u32> {
     }
     Ok(attributes)
 }
+
+// ---- AuthzBasepSetSecurityAttributesToken e a comparação de atributos -------
+
+const STATUS_OBJECT_NAME_COLLISION: u32 = 0xC000_0035;
+const STATUS_NOT_FOUND: u32 = 0xC000_0225;
+/// TOKEN_SECURITY_ATTRIBUTE_OPERATION_*.
+const OPERATION_NONE: u32 = 0;
+const OPERATION_REPLACE_ALL: u32 = 1;
+const OPERATION_ADD: u32 = 2;
+const OPERATION_DELETE: u32 = 3;
+const OPERATION_REPLACE: u32 = 4;
+/// TOKEN_SECURITY_ATTRIBUTE_VALUE_CASE_SENSITIVE e
+/// TOKEN_SECURITY_ATTRIBUTE_COMPARE_IGNORE.
+const VALUE_CASE_SENSITIVE: u32 = 0x2;
+const COMPARE_IGNORE: u32 = 0x40;
+
+fn position(set: &[SecurityAttribute], name: &str) -> Option<usize> {
+    set.iter().position(|attribute| attribute.name.eq_ignore_ascii_case(name))
+}
+
+/// AuthzBasepSetSecurityAttributesToken (ntoskrnl 19041 rva 0x2506cc) sobre
+/// o conjunto do token: com Operations[0] = REPLACE_ALL todos saem e cada
+/// atributo entra como REPLACE (a operação dos outros não conta); senão, por
+/// atributo, NONE não faz nada, ADD recusa nome repetido
+/// (STATUS_OBJECT_NAME_COLLISION), DELETE recusa nome ausente
+/// (STATUS_NOT_FOUND), REPLACE troca ou acrescenta e qualquer outra é
+/// STATUS_INVALID_PARAMETER. Tudo ou nada (o
+/// AuthzBasepFinaliseSecurityAttributesList desfaz na falha): devolve o
+/// conjunto novo.
+pub fn apply_operations(current: &[SecurityAttribute], attributes: Vec<SecurityAttribute>, operations: &[u32]) -> Result<Vec<SecurityAttribute>, u32> {
+    let replace_all = operations.first() == Some(&OPERATION_REPLACE_ALL);
+    let mut result = if replace_all { Vec::new() } else { current.to_vec() };
+    for (attribute, &operation) in attributes.into_iter().zip(operations) {
+        match if replace_all { OPERATION_REPLACE } else { operation } {
+            OPERATION_NONE => {}
+            OPERATION_ADD => {
+                if position(&result, &attribute.name).is_some() {
+                    return Err(STATUS_OBJECT_NAME_COLLISION);
+                }
+                result.push(attribute);
+            }
+            OPERATION_DELETE => match position(&result, &attribute.name) {
+                Some(index) => {
+                    result.remove(index);
+                }
+                None => return Err(STATUS_NOT_FOUND),
+            },
+            OPERATION_REPLACE => match position(&result, &attribute.name) {
+                Some(index) => result[index] = attribute,
+                None => result.push(attribute),
+            },
+            _ => return Err(STATUS_INVALID_PARAMETER),
+        }
+    }
+    Ok(result)
+}
+
+/// SepShouldSetDelinkFlags (rva 0x6ee9ac): REPLACE_ALL, ou algum atributo
+/// com o prefixo de atributo global (SepPotentialGlobalTableAttribute, a
+/// tabela PotentialGlobalAttributePrefixes: "EDP://", sem caixa).
+pub fn should_set_delink_flags(operations: &[u32], attributes: &[SecurityAttribute]) -> bool {
+    operations.first() == Some(&OPERATION_REPLACE_ALL) || attributes.iter().any(|attribute| attribute.name.len() >= 6 && attribute.name[..6].eq_ignore_ascii_case("EDP://"))
+}
+
+/// AuthzBasepIsCompareRelevantAttribute (rva 0x70e8a0): sem
+/// TOKEN_SECURITY_ATTRIBUTE_COMPARE_IGNORE e fora do prefixo "APPID://".
+fn compare_relevant(attribute: &SecurityAttribute) -> bool {
+    attribute.flags & COMPARE_IGNORE == 0 && !(attribute.name.len() >= 8 && attribute.name[..8].eq_ignore_ascii_case("APPID://"))
+}
+
+/// AuthzBasepFindSecurityAttributeValue: o valor existe no outro atributo
+/// (texto sem caixa, salvo TOKEN_SECURITY_ATTRIBUTE_VALUE_CASE_SENSITIVE).
+fn value_present(value: &AttributeValue, other: &SecurityAttribute) -> bool {
+    let case_sensitive = other.flags & VALUE_CASE_SENSITIVE != 0;
+    let same_text = |left: &str, right: &str| if case_sensitive { left == right } else { left.to_uppercase() == right.to_uppercase() };
+    other.values.iter().any(|candidate| match (value, candidate) {
+        (AttributeValue::Text(left), AttributeValue::Text(right)) => same_text(left, right),
+        (AttributeValue::Fqbn { version: left_version, name: left }, AttributeValue::Fqbn { version: right_version, name: right }) => left_version == right_version && same_text(left, right),
+        _ => value == candidate,
+    })
+}
+
+/// AuthzBasepCompareSecurityAttribute (rva 0x70e8d4): mesmo número de
+/// valores, tipo e flags, e cada valor do primeiro presente no segundo.
+fn equal_attribute(first: &SecurityAttribute, second: &SecurityAttribute) -> bool {
+    first.values.len() == second.values.len() && first.kind == second.kind && first.flags == second.flags && first.values.iter().all(|value| value_present(value, second))
+}
+
+/// AuthzBasepCompareLegacySecurityAttributesInformation (rva 0x70e7d4): os
+/// dois conjuntos vazios são iguais; senão cada atributo relevante do
+/// primeiro precisa de um de mesmo nome e igual no segundo, e os dois
+/// precisam do mesmo número de atributos relevantes.
+pub fn equal_sets(first: &[SecurityAttribute], second: &[SecurityAttribute]) -> bool {
+    if first.is_empty() && second.is_empty() {
+        return true;
+    }
+    for attribute in first.iter().filter(|attribute| compare_relevant(attribute)) {
+        match position(second, &attribute.name) {
+            Some(index) if equal_attribute(attribute, &second[index]) => {}
+            _ => return false,
+        }
+    }
+    first.iter().filter(|attribute| compare_relevant(attribute)).count() == second.iter().filter(|attribute| compare_relevant(attribute)).count()
+}
+
+/// AuthzBasepValidateSecurityAttributes (rva 0x2507b0) e a captura: Version
+/// 1 e Reserved 0; fora de REPLACE_ALL, pelo menos um atributo; cada nome
+/// com Length, MaximumLength e Buffer, o Reserved do atributo zero e as
+/// flags sem bits em 0xFF00; o resto como em [`capture_information`].
+pub fn capture_for_set(address: u64, replace_all: bool) -> Result<Vec<SecurityAttribute>, u32> {
+    let read16 = |at: u64| guest::try_read::<u16>(at).map_err(|_| 0xC000_0005u32);
+    let read32 = |at: u64| guest::try_read::<u32>(at).map_err(|_| 0xC000_0005u32);
+    let read64 = |at: u64| guest::try_read::<u64>(at).map_err(|_| 0xC000_0005u32);
+    if read16(address)? != 1 || read16(address + 2)? != 0 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let count = read32(address + 4)? as u64;
+    let array = read64(address + 8)?;
+    if !replace_all && (count == 0 || array == 0) {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    for index in 0..count {
+        let entry = array + index * 40;
+        if read16(entry)? == 0 || read16(entry + 2)? == 0 || read64(entry + 8)? == 0 || read16(entry + 18)? != 0 || read32(entry + 20)? & 0xFF00 != 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+    }
+    capture_information(address)
+}

@@ -395,3 +395,43 @@ pub fn subscribe_captured(name: &DecodedName, change_stamp: u32, event_mask: u32
     namespace::release_scope(scope)?;
     result
 }
+
+/// ExQueryWnfStateData(Subscription, ChangeStamp, Buffer, BufferSize)
+/// (ntoskrnl 19041 0x69e4c0), numa região crítica: o
+/// ExpWnfAcquireSubscriptionNameInstance lê o NameInstance da inscrição sob
+/// o ProcessSubscriptionListLock (compartilhado) do contexto WNF do System e
+/// toma o rundown do nome; sem nome (ou com o nome em remoção),
+/// STATUS_OBJECT_NAME_NOT_FOUND. Com o nome, o ExpWnfReadStateData grava o
+/// ChangeStamp e o tamanho e copia os dados se `*BufferSize` couber; um
+/// status de sucesso vira STATUS_SUCCESS.
+pub fn query_subscription(subscription: u64, change_stamp: u64, buffer: u64, buffer_size: u64) -> Result<u32, KernelError> {
+    use crate::ntos::ex::wnf::data_block::{self, NameState};
+    use crate::ntos::inc::field::Field;
+    use crate::ntos::ke::critical_region;
+
+    critical_region::enter_critical()?;
+    let result = (|| -> Result<u32, KernelError> {
+        let context = process_at(process::get_system_process()).wnf_context.get();
+        let name = if context == 0 {
+            0
+        } else {
+            locked(process_context_at(context).process_subscription_list_lock.address(), false, || {
+                let instance = subscription_at(subscription).name_instance.get();
+                Ok(if instance != 0 && rundown::acquire(name_at(instance).run_ref.address())? { instance } else { 0 })
+            })?
+        };
+        if name == 0 {
+            return Ok(STATUS_NOT_FOUND);
+        }
+        // SAFETY: o PULONG BufferSize de um chamador de modo kernel.
+        let capacity = unsafe { Field::<u32>::at(buffer_size) }.get();
+        let read = data_block::read(&NameState { pointer: name }, change_stamp, buffer, capacity, buffer_size);
+        rundown::release(name_at(name).run_ref.address())?;
+        let status = read?;
+        Ok(if status & 0x8000_0000 != 0 { status } else { 0 })
+    })();
+    let left = critical_region::leave_critical();
+    let result = result?;
+    left?;
+    Ok(result)
+}

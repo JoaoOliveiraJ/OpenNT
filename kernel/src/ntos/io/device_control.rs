@@ -1,8 +1,12 @@
-//! ZwDeviceIoControlFile.
+//! ZwDeviceIoControlFile e NtFsControlFile — o IopXxxControlFile do NT.
 //!
 //! Posse real do arquivo, Fast I/O ou IRP_MJ_DEVICE_CONTROL nativo, os
 //! quatro métodos de buffer e conclusão no contexto da thread que pediu
-//! (`file_request`).
+//! (`file_request`). O NtFsControlFile (RVA 0x677860) é o mesmo
+//! IopXxxControlFile (RVA 0x64b730) com DeviceIoControl = FALSE: sem Fast
+//! I/O, IRP_MJ_FILE_SYSTEM_CONTROL com IRP_MN_USER_FS_REQUEST (o
+//! FsControlCode ocupa o lugar do IoControlCode) e IRP_DEFER_IO_COMPLETION
+//! nos flags do IRP.
 
 use alloc::boxed::Box;
 
@@ -20,6 +24,11 @@ use crate::ntos::inc::types::{DeviceObject, DriverObject, FastIoDispatch, FileOb
 use crate::ntos::io::irp_builder::{self, BuildOptions, DeviceControl};
 
 const TAG: u32 = 0x7443_6F49;
+/// IRP_MJ_FILE_SYSTEM_CONTROL e IRP_MJ_DEVICE_CONTROL.
+pub const IRP_MJ_FILE_SYSTEM_CONTROL: u8 = 0x0D;
+pub const IRP_MJ_DEVICE_CONTROL: u8 = 0x0E;
+/// IRP.Flags: IRP_DEFER_IO_COMPLETION (só no FSCTL).
+const IRP_DEFER_IO_COMPLETION: u32 = 0x800;
 /// IO_STATUS_BLOCK no bloco de argumentos (88 bytes) do FastIoDeviceControl.
 const FAST_IO_STATUS: u64 = 72;
 /// FAST_IO_DISPATCH até FastIoDeviceControl inclusive.
@@ -73,12 +82,15 @@ pub fn fast_device_control(file: u64, device: u64, input: u64, input_length: u32
     result
 }
 
-fn dispatch(request: &Shared, device: u64, input: u64, input_length: u32, code: u32, access: u32) -> Result<u32, KernelError> {
+#[allow(clippy::too_many_arguments)]
+fn dispatch(request: &Shared, device: u64, input: u64, input_length: u32, code: u32, access: u32, major: u8) -> Result<u32, KernelError> {
     let (file, output, output_length, method) = {
         let r = request.lock();
         (r.file, r.output, r.output_length, r.method)
     };
-    match fast_device_control(file, device, input, input_length, output, output_length, code) {
+    // O Fast I/O só é tentado no IOCTL (DeviceIoControl = TRUE).
+    let fast = if major == IRP_MJ_DEVICE_CONTROL { fast_device_control(file, device, input, input_length, output, output_length, code) } else { FastControl::NotHandled };
+    match fast {
         FastControl::NoMemory => return Ok(0xC000_009A),
         FastControl::Handled { status, information } => {
             {
@@ -130,7 +142,7 @@ fn dispatch(request: &Shared, device: u64, input: u64, input_length: u32, code: 
         (r.system, r.thread, r.io_status, r.event.as_ref().map_or(0, |event| event.pointer), r.mdl, r.apc_routine, r.apc_context)
     };
     irp_builder::build(packet, &BuildOptions {
-        major: 14,
+        major,
         minor: 0,
         buffer: system,
         buffer_length: output_length,
@@ -151,7 +163,8 @@ fn dispatch(request: &Shared, device: u64, input: u64, input_length: u32, code: 
     irp.mdl_address.set(mdl_address);
     irp.overlay.asynchronous_parameters.user_apc_routine.set(apc_routine);
     irp.overlay.asynchronous_parameters.user_apc_context.set(apc_context);
-    irp.flags.set(if system != 0 { if method == 0 && output_length != 0 { 0x70 } else { 0x30 } } else { 0 });
+    let buffer_flags = if system != 0 { if method == 0 && output_length != 0 { 0x70 } else { 0x30 } } else { 0 };
+    irp.flags.set(buffer_flags | if major == IRP_MJ_FILE_SYSTEM_CONTROL { IRP_DEFER_IO_COMPLETION } else { 0 });
     let completed = request.clone();
     io_manager::manage_completion(packet, Box::new(move |status, information| {
         {
@@ -166,7 +179,7 @@ fn dispatch(request: &Shared, device: u64, input: u64, input_length: u32, code: 
     let status = io_manager::iof_call_driver(device, packet) as u32;
     if !request.lock().done && status != 0x103 {
         if status >> 30 != 3 {
-            return Err(KernelError::new("driver returned without completing its IOCTL IRP"));
+            return Err(KernelError::new("driver returned without completing its control IRP"));
         }
         // Sem conclusão do driver: a falha real, sem IOSB inventado.
         {
@@ -180,15 +193,31 @@ fn dispatch(request: &Shared, device: u64, input: u64, input_length: u32, code: 
     Ok(status)
 }
 
+/// ZwDeviceIoControlFile(FileHandle, Event, ApcRoutine, ApcContext,
+/// IoStatusBlock, IoControlCode, InputBuffer, InputBufferLength,
+/// OutputBuffer, OutputBufferLength).
 #[allow(clippy::too_many_arguments)]
 pub fn control(handle: u64, event: u64, apc_routine: u64, apc_context: u64, io_status: u64, code: u32, input: u64, input_length: u32, output: u64, output_length: u32) -> Result<u32, KernelError> {
+    control_file(IRP_MJ_DEVICE_CONTROL, handle, event, apc_routine, apc_context, io_status, code, input, input_length, output, output_length)
+}
+
+/// NtFsControlFile com PreviousMode = KernelMode (o ZwFsControlFile do NT):
+/// os mesmos argumentos, com FsControlCode.
+#[allow(clippy::too_many_arguments)]
+pub fn fs_control(handle: u64, event: u64, apc_routine: u64, apc_context: u64, io_status: u64, code: u32, input: u64, input_length: u32, output: u64, output_length: u32) -> Result<u32, KernelError> {
+    control_file(IRP_MJ_FILE_SYSTEM_CONTROL, handle, event, apc_routine, apc_context, io_status, code, input, input_length, output, output_length)
+}
+
+/// O IopXxxControlFile de modo kernel: `major` escolhe IOCTL ou FSCTL.
+#[allow(clippy::too_many_arguments)]
+fn control_file(major: u8, handle: u64, event: u64, apc_routine: u64, apc_context: u64, io_status: u64, code: u32, input: u64, input_length: u32, output: u64, output_length: u32) -> Result<u32, KernelError> {
     if irql::get_irql() != 0 {
-        return Err(KernelError::new("ZwDeviceIoControlFile requires PASSIVE_LEVEL"));
+        return Err(KernelError::new("IopXxxControlFile requires PASSIVE_LEVEL"));
     }
     let thread = process::get_current_thread();
     // SAFETY: a thread corrente.
     if unsafe { Kthread::at(thread) }.special_apc_disable.get() != 0 {
-        return Err(KernelError::new("ZwDeviceIoControlFile requires special APCs enabled"));
+        return Err(KernelError::new("IopXxxControlFile requires special APCs enabled"));
     }
     let selected = match query_file::resolve(handle & !3, false) {
         Ok(selected) => selected,
@@ -240,7 +269,7 @@ pub fn control(handle: u64, event: u64, apc_routine: u64, apc_context: u64, io_s
             apc::initialize(packet, thread, 0, routine, routine, apc_routine, 0, apc_context);
             request.lock().apc = packet;
         }
-        let status = dispatch(&request, device, input, input_length, code, selected.access)?;
+        let status = dispatch(&request, device, input, input_length, code, selected.access, major)?;
         let (finished, done) = {
             let r = request.lock();
             (r.finished, r.done)
@@ -249,7 +278,7 @@ pub fn control(handle: u64, event: u64, apc_routine: u64, apc_context: u64, io_s
             return Ok(status);
         }
         if status == 0x103 && synchronous {
-            // ZwDeviceIoControlFile: a espera síncrona de KernelMode.
+            // A espera síncrona de KernelMode.
             file_request::wait_finished(&request, thread, file_at(file).flags.get() & file_request::FO_ALERTABLE_IO != 0, 0);
             return Ok(request.lock().status);
         }
@@ -294,3 +323,24 @@ pub fn nt_control(previous_mode: u8, handle: u64, event: u64, apc_routine: u64, 
     result
 }
 
+/// NtFsControlFile chamado por código de kernel: com PreviousMode
+/// KernelMode é o [`fs_control`]; com UserMode é o serviço do sistema sobre
+/// os argumentos de quem chama, pelo mesmo bloco de argumentos de pilha que a
+/// entrada de syscall entrega ao serviço (como o [`nt_control`]).
+#[allow(clippy::too_many_arguments)]
+pub fn nt_fs_control(previous_mode: u8, handle: u64, event: u64, apc_routine: u64, apc_context: u64, io_status: u64, code: u32, input: u64, input_length: u32, output: u64, output_length: u32) -> Result<u32, KernelError> {
+    if previous_mode == 0 {
+        return fs_control(handle, event, apc_routine, apc_context, io_status, code, input, input_length, output, output_length);
+    }
+    let Some(service) = crate::ntos::ps::user::state::handler("NtFsControlFile") else { return Ok(0xC000_0002) };
+    let block = guest::alloc_bytes(SERVICE_STACK_ARGUMENTS + 6 * 8);
+    if block == 0 {
+        return Ok(0xC000_009A);
+    }
+    for (index, value) in [io_status, code as u64, input, input_length as u64, output, output_length as u64].into_iter().enumerate() {
+        guest::write64(block + SERVICE_STACK_ARGUMENTS + index as u64 * 8, value);
+    }
+    let result = service(handle, event, apc_routine, apc_context, block);
+    guest::free_bytes(block);
+    result
+}

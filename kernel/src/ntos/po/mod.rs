@@ -17,3 +17,5 @@ pub mod thermal;
 pub mod power_action;
 pub mod time_change;
 pub mod umpo_channel;
+pub mod power_request;
+pub mod processor_power;

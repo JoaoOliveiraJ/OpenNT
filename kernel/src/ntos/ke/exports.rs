@@ -1380,3 +1380,34 @@ pub mod ke_xstate_support {
         data_exports: &[],
     };
 }
+
+pub mod ke_thread_tag {
+    //! KeUpdateThreadTag; a lógica mora em `ke/thread_dispatch.rs`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::ke::thread_dispatch;
+    use crate::rtl::KernelError;
+
+    /// KeUpdateThreadTag(Thread, Tag).
+    fn update_thread_tag(call: &Call) -> Result<u64, KernelError> {
+        thread_dispatch::update_thread_tag(call.arg(1), call.arg(2) as u8);
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group { name: "ke-thread-tag", names: &["KeUpdateThreadTag"], handlers: &[update_thread_tag], data_exports: &[] };
+}
+
+pub mod ke_raise_user_exception {
+    //! KeRaiseUserException; a lógica mora em `ke/kernel_exception.rs`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::ke::kernel_exception;
+    use crate::rtl::KernelError;
+
+    /// KeRaiseUserException(ExceptionStatus) -> NTSTATUS.
+    fn raise_user_exception(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(kernel_exception::raise_user_exception(call.arg(1) as u32)))
+    }
+
+    pub static GROUP: Group = Group { name: "ke-raise-user-exception", names: &["KeRaiseUserException"], handlers: &[raise_user_exception], data_exports: &[] };
+}

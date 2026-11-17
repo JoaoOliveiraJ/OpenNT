@@ -2346,3 +2346,160 @@ pub mod io_silo_parameters {
 
     pub static GROUP: Group = Group { name: "io-silo-parameters", names: &["IoGetSiloParameters"], handlers: &[silo_parameters], data_exports: &[] };
 }
+
+pub mod io_irp_file_parameters {
+    //! IoSetIrpExtraCreateParameter (no ntoskrnl a mesma rotina do
+    //! FsRtlSetEcpListIntoIrp, RVA 0x66f890; lógica em `fsrtl/ecp`) e
+    //! IoGetFsTrackOffsetState (`io/extensions`).
+
+    use crate::ntos::fsrtl::ecp;
+    use crate::ntos::inc::types::extra_fsrtl::EcpList;
+    use crate::ntos::inc::types::{Field, Irp, NtStruct};
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::io::extensions;
+    use crate::rtl::KernelError;
+
+    /// IoSetIrpExtraCreateParameter(Irp, ExtraCreateParameter) -> NTSTATUS.
+    fn set_irp_extra_create_parameter(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: IRP de create vivo e a ECP_LIST do chamador.
+        let (irp, list) = unsafe { (Irp::at(call.arg(1)), EcpList::at(call.arg(2))) };
+        Ok(signed_status(ecp::set_list_into_irp(irp, list)))
+    }
+
+    /// IoGetFsTrackOffsetState(Irp, *RetFsTrackOffsetBlob, *RetTrackedOffset) -> NTSTATUS.
+    fn get_fs_track_offset_state(call: &Call) -> Result<u64, KernelError> {
+        // SAFETY: IRP vivo e as duas saídas do chamador de modo kernel.
+        let (irp, blob, offset) = unsafe { (Irp::at(call.arg(1)), Field::<u64>::at(call.arg(2)), Field::<i64>::at(call.arg(3))) };
+        Ok(signed_status(extensions::fs_track_offset_state(irp, blob, offset)))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "io-irp-file-parameters",
+        names: &["IoSetIrpExtraCreateParameter", "IoGetFsTrackOffsetState"],
+        handlers: &[set_irp_extra_create_parameter, get_fs_track_offset_state],
+        data_exports: &[],
+    };
+}
+
+pub mod io_file_services {
+    //! ZwSetEaFile (`io/file/ea`), ZwNotifyChangeDirectoryFile
+    //! (`io/file/directory_notify`), NtSetInformationFile (`io/file/zw`) e
+    //! NtFsControlFile (`io/device_control`). Os dois Nt* seguem o modo
+    //! anterior da thread.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::io::device_control;
+    use crate::ntos::io::file::directory_notify::{self, NotifyChange};
+    use crate::ntos::io::file::{ea, zw};
+    use crate::ntos::ps::previous_mode;
+    use crate::rtl::KernelError;
+
+    /// ZwSetEaFile(FileHandle, IoStatusBlock, Buffer, Length) -> NTSTATUS.
+    fn set_ea_file(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(previous_mode::with_kernel(|| ea::set_ea_file(call.arg(1), call.arg(2), call.arg(3), call.arg(4) as u32))??))
+    }
+
+    /// ZwNotifyChangeDirectoryFile(FileHandle, Event, ApcRoutine, ApcContext,
+    /// IoStatusBlock, Buffer, Length, CompletionFilter, WatchTree) -> NTSTATUS.
+    fn notify_change_directory_file(call: &Call) -> Result<u64, KernelError> {
+        let arguments = NotifyChange { handle: call.arg(1), event: call.arg(2), apc_routine: call.arg(3), apc_context: call.arg(4), io_status: call.arg(5), buffer: call.arg(6), length: call.arg(7) as u32, completion_filter: call.arg(8) as u32, watch_tree: call.arg(9) & 0xFF != 0 };
+        Ok(signed_status(previous_mode::with_kernel(|| directory_notify::notify_change_directory(&arguments))??))
+    }
+
+    /// NtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass) -> NTSTATUS.
+    fn nt_set_information_file(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(zw::nt_set_information_file(previous_mode::get()?, call.arg(1), call.arg(2), call.arg(3), call.arg(4) as u32, call.arg(5) as u32)?))
+    }
+
+    /// NtFsControlFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
+    /// FsControlCode, InputBuffer, InputBufferLength, OutputBuffer, OutputBufferLength) -> NTSTATUS.
+    fn nt_fs_control_file(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(device_control::nt_fs_control(previous_mode::get()?, call.arg(1), call.arg(2), call.arg(3), call.arg(4), call.arg(5), call.arg(6) as u32, call.arg(7), call.arg(8) as u32, call.arg(9), call.arg(10) as u32)?))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "io-file-services",
+        names: &["ZwSetEaFile", "ZwNotifyChangeDirectoryFile", "NtSetInformationFile", "NtFsControlFile"],
+        handlers: &[set_ea_file, notify_change_directory_file, nt_set_information_file, nt_fs_control_file],
+        data_exports: &[],
+    };
+}
+
+pub mod io_irp_ex {
+    //! IoSizeOfIrpEx, IoInitializeIrpEx e IoCleanupIrp; a lógica mora em
+    //! `io/irp_builder.rs`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::io::irp_builder;
+    use crate::rtl::KernelError;
+
+    /// IoSizeOfIrpEx(DeviceObject, StackSize) -> USHORT.
+    fn size_of_irp_ex(call: &Call) -> Result<u64, KernelError> {
+        Ok(irp_builder::size_of_irp_ex(call.arg(1), call.arg(2) as u8) as u64)
+    }
+
+    /// IoInitializeIrpEx(Irp, DeviceObject, PacketSize, StackSize).
+    fn initialize_irp_ex(call: &Call) -> Result<u64, KernelError> {
+        irp_builder::initialize_irp_ex(call.arg(1), call.arg(2), call.arg(3) as u16, call.arg(4) as u8);
+        Ok(0)
+    }
+
+    /// IoCleanupIrp(Irp).
+    fn cleanup_irp(call: &Call) -> Result<u64, KernelError> {
+        irp_builder::cleanup_irp(call.arg(1))?;
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group { name: "io-irp-ex", names: &["IoSizeOfIrpEx", "IoInitializeIrpEx", "IoCleanupIrp"], handlers: &[size_of_irp_ex, initialize_irp_ex, cleanup_irp], data_exports: &[] };
+}
+
+pub mod io_enqueue_irp {
+    //! IoEnqueueIrp; a lógica mora em `io/threads` (thread_requests).
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::io::threads::thread_requests;
+    use crate::rtl::KernelError;
+
+    /// IoEnqueueIrp(Irp).
+    fn enqueue_irp(call: &Call) -> Result<u64, KernelError> {
+        thread_requests::enqueue(call.arg(1))?;
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group { name: "io-enqueue-irp", names: &["IoEnqueueIrp"], handlers: &[enqueue_irp], data_exports: &[] };
+}
+
+pub mod io_attribution_irp {
+    //! IoSetIoAttributionIrp; a lógica mora em `io/extensions.rs`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::io::extensions;
+    use crate::rtl::KernelError;
+
+    /// IoSetIoAttributionIrp(Irp, AttributionSource, Flags) -> NTSTATUS.
+    fn set_io_attribution_irp(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(extensions::set_io_attribution_irp(call.arg(1), call.arg(2), call.arg(3) as u32)?))
+    }
+
+    pub static GROUP: Group = Group { name: "io-attribution-irp", names: &["IoSetIoAttributionIrp"], handlers: &[set_io_attribution_irp], data_exports: &[] };
+}
+
+pub mod io_report_resource_detection {
+    //! IoReportResourceForDetection; a lógica mora em `io/legacy_resources.rs`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::inc::field::{Field, NtStruct};
+    use crate::ntos::io::legacy_resources;
+    use crate::rtl::KernelError;
+
+    /// IoReportResourceForDetection(DriverObject, DriverList, DriverListSize,
+    /// DeviceObject, DeviceList, DeviceListSize, ConflictDetected) -> NTSTATUS.
+    fn report_resource_for_detection(call: &Call) -> Result<u64, KernelError> {
+        let request = legacy_resources::ReportRequest { driver_object: call.arg(1), driver_list: call.arg(2), device_object: call.arg(4), device_list: call.arg(5) };
+        // SAFETY: o PBOOLEAN ConflictDetected do chamador.
+        let conflict = (call.arg(7) != 0).then(|| unsafe { Field::<u8>::at(call.arg(7)) });
+        Ok(signed_status(legacy_resources::report_for_detection(&request, conflict)))
+    }
+
+    pub static GROUP: Group = Group { name: "io-report-resource-detection", names: &["IoReportResourceForDetection"], handlers: &[report_resource_for_detection], data_exports: &[] };
+}

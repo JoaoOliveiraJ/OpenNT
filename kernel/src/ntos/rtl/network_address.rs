@@ -3,7 +3,9 @@
 //! RtlIpv4AddressToStringW 0x381600, RtlIpv4AddressToStringExW 0x381560,
 //! RtlIpv6AddressToStringW 0x37dda0, RtlIpv6AddressToStringExW 0x37dcc0,
 //! os parsers ANSI (RtlIpv4/6StringToAddressA, o mesmo autômato sobre
-//! `char`s) e as variantes ANSI dos formatadores (no fim do arquivo).
+//! `char`s), as variantes ANSI dos formatadores e os parsers com porta e
+//! escopo RtlIpv4StringToAddressExW (0x31e3b0) e RtlIpv6StringToAddressExW
+//! (0x31c5d0), no fim do arquivo.
 //!
 //! As classes de caractere são as do `pwctype` do ntoskrnl para c < 0x80
 //! (os dois parsers testam `c < 0x80` antes do iswctype): dígitos '0'..'9',
@@ -15,7 +17,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::ntos::inc::types::Field;
+use crate::ntos::inc::types::{Field, NtStruct};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::rtl::guest_strings;
 
@@ -635,4 +637,143 @@ pub fn ipv4_address_to_string_ex_ansi(address: u64, port: u16, buffer: u64, leng
 pub fn ipv6_address_to_string_ex_ansi(address: u64, scope_id: u32, port: u16, buffer: u64, length: Option<&Field<u32>>) -> u32 {
     let Some(length) = ex_arguments(address, buffer, length) else { return STATUS_INVALID_PARAMETER };
     deliver_ex_ansi(&ipv6_ex_text(address, scope_id, port), buffer, length)
+}
+
+// ---- RtlIpv4/6StringToAddressExW ----------------------------------------------
+
+/// Porta do sufixo ":porta" dos parsers Ex: decimal, octal com 0 inicial ou
+/// hexadecimal com 0x/0X; cada dígito ASCII da base (c < 0x80), sem passar
+/// de 0xFFFF. `text` começa logo depois do ':'. O IPv4 recusa porta vazia
+/// (inclusive ":0", que fica vazio depois do prefixo octal); o IPv6 a aceita
+/// como 0. Devolve a porta em ordem de host.
+fn parse_port(text: &[u16], empty_is_zero: bool) -> Option<u16> {
+    let mut index = 0;
+    let mut base = 10u32;
+    if text.first() == Some(&u16::from(b'0')) {
+        index = 1;
+        base = 8;
+        if text.get(1).is_some_and(|&c| c.wrapping_sub(0x58) & 0xFFDF == 0) {
+            index = 2;
+            base = 16;
+        }
+    }
+    if index >= text.len() && !empty_is_zero {
+        return None;
+    }
+    let mut port = 0u32;
+    for &c in &text[index..] {
+        let digit = if c < 0x80 && is_digit(c) && ((c - 0x30) as u32) < base {
+            (c - 0x30) as u32
+        } else if base == 16 && c < 0x80 && is_xdigit(c) {
+            hex_value(c)
+        } else {
+            return None;
+        };
+        port = port * base + digit;
+        if port > 0xFFFF {
+            return None;
+        }
+    }
+    Some(port as u16)
+}
+
+/// As unidades a partir do *Terminator do parser base, até o NUL.
+fn rest_after(terminator: u64) -> Vec<u16> {
+    guest_strings::read_wide_units(terminator)
+}
+
+/// RtlIpv4StringToAddressExW(AddressString, Strict, Address, Port): NULL em
+/// qualquer ponteiro ou erro do RtlIpv4StringToAddressW (que grava Address
+/// no sucesso) = STATUS_INVALID_PARAMETER; depois do endereço só pode vir o
+/// fim ou ":porta". *Port (ordem de rede) só é gravada no sucesso.
+pub fn ipv4_string_to_address_ex(string: u64, strict: bool, address: u64, port: u64) -> u32 {
+    if string == 0 || address == 0 || port == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let cell = guest::alloc_bytes(8);
+    // SAFETY: célula de 8 bytes recém-alocada (o terminador local) e o
+    // ULONG/USHORT de saída do chamador.
+    let (terminator, address_out, port_out) = unsafe { (Field::<u64>::at(cell), Field::<u32>::at(address), Field::<u16>::at(port)) };
+    let status = ipv4_string_to_address(string, strict, terminator, address_out);
+    let rest = if status == 0 { rest_after(terminator.get()) } else { Vec::new() };
+    guest::free_bytes(cell);
+    if status != 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let value = match rest.split_first() {
+        None => 0,
+        Some((&c, tail)) if c == u16::from(b':') => match parse_port(tail, false) {
+            Some(value) => value,
+            None => return STATUS_INVALID_PARAMETER,
+        },
+        Some(_) => return STATUS_INVALID_PARAMETER,
+    };
+    port_out.set(value.swap_bytes());
+    0
+}
+
+/// RtlIpv6StringToAddressExW(AddressString, Address, ScopeId, Port): NULL em
+/// qualquer ponteiro = STATUS_INVALID_PARAMETER. Um '[' inicial é pulado e
+/// exige o ']'; o endereço é o do RtlIpv6StringToAddressW (gravado no
+/// lugar). Depois dele, "%escopo" decimal de 32 bits (pelo menos um dígito,
+/// até o fim ou o ']'), "]" e ":porta" (vazia = 0), e nada mais. *ScopeId e
+/// *Port (ordem de rede) só são gravados no sucesso.
+pub fn ipv6_string_to_address_ex(string: u64, address: u64, scope_id: u64, port: u64) -> u32 {
+    if string == 0 || address == 0 || scope_id == 0 || port == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let mut bracket = guest::read16(string) == u16::from(b'[');
+    let start = if bracket { string + 2 } else { string };
+    let cell = guest::alloc_bytes(8);
+    // SAFETY: célula de 8 bytes recém-alocada (o terminador local) e o
+    // ULONG/USHORT de saída do chamador.
+    let (terminator, scope_out, port_out) = unsafe { (Field::<u64>::at(cell), Field::<u32>::at(scope_id), Field::<u16>::at(port)) };
+    let status = ipv6_string_to_address(start, terminator, address);
+    let rest = if status == 0 { rest_after(terminator.get()) } else { Vec::new() };
+    guest::free_bytes(cell);
+    if status != 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let mut index = 0;
+    let at = |index: usize| rest.get(index).copied().unwrap_or(0);
+    let mut scope = 0u64;
+    if at(0) == u16::from(b'%') {
+        index = 1;
+        if !(at(index) < 0x80 && is_digit(at(index))) {
+            return STATUS_INVALID_PARAMETER;
+        }
+        while at(index) != 0 && at(index) != u16::from(b']') {
+            let c = at(index);
+            if !(c < 0x80 && is_digit(c)) {
+                return STATUS_INVALID_PARAMETER;
+            }
+            scope = scope * 10 + (c - 0x30) as u64;
+            if scope > u32::MAX as u64 {
+                return STATUS_INVALID_PARAMETER;
+            }
+            index += 1;
+        }
+    }
+    let mut value = 0u16;
+    if at(index) == u16::from(b']') {
+        if !bracket {
+            return STATUS_INVALID_PARAMETER;
+        }
+        bracket = false;
+        index += 1;
+        if at(index) == u16::from(b':') {
+            let digits: Vec<u16> = rest[index + 1..].to_vec();
+            match parse_port(&digits, true) {
+                Some(parsed) => value = parsed,
+                None => return STATUS_INVALID_PARAMETER,
+            }
+            index = rest.len();
+        }
+    }
+    if at(index) != 0 || bracket {
+        return STATUS_INVALID_PARAMETER;
+    }
+    port_out.set(value.swap_bytes());
+    scope_out.set(scope as u32);
+    0
 }

@@ -1,8 +1,8 @@
 //! IOCTLs do FsRtl — FsRtlIssueDeviceIoControl (RVA 0x6954f0) e os
 //! seus clientes FsRtlVolumeDeviceToCorrelationId (RVA 0x695060) e
-//! FsRtlGetSectorSizeInformation (RVA 0x6950f0), e o FsRtlBalanceReads (RVA
-//! 0x6a5700), do ntoskrnl
-//! 10.0.19045.
+//! FsRtlGetSectorSizeInformation (RVA 0x6950f0), o FsRtlBalanceReads (RVA
+//! 0x6a5700) e o FSCTL_QUERY_FILE_REGIONS do FsRtlQueryCachedVdl (RVA
+//! 0x6a0fd0, seção no fim do arquivo), do ntoskrnl 10.0.19045.
 //!
 //! FsRtlIssueDeviceIoControl(DeviceObject, IoCtl, Flags, InputBuffer,
 //! InputBufferLength, OutputBuffer, OutputBufferLength, IosbInformation):
@@ -19,10 +19,13 @@
 //! manager, então devolve o status do IOCTL.
 
 use crate::ntos::inc::field::{Field, NtStruct, Reserved};
+use crate::ntos::inc::types::extra_fsrtl::{FileRegionInfo, FileRegionInput, FileRegionOutput};
 use crate::ntos::inc::types::{DeviceObject, Guid, IoStackLocation, IoStatusBlock, Irp, Kevent};
+use crate::ntos::io::file::information as file_information;
 use crate::ntos::io::io_manager;
 use crate::ntos::ke::dispatcher;
 use crate::ntos::mm::guest_memory as guest;
+use crate::rtl::KernelError;
 
 pub const STATUS_PENDING: u32 = 0x0000_0103;
 pub const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
@@ -275,4 +278,86 @@ pub fn volume_device_to_correlation_id(device: &DeviceObject, guid: &Guid) -> u3
     }
     guest::free_bytes(output);
     status
+}
+
+// ---- FsRtlQueryCachedVdl --------------------------------------------------------------
+//
+// ntoskrnl 10.0.19041, RVA 0x6a0fd0 (cauda fria 0x80d6e0): KEVENT de
+// notificação na pilha e IoBuildDeviceIoControlRequest(FSCTL_QUERY_FILE_REGIONS,
+// IoGetRelatedDeviceObject(FileObject), sem buffers, não interno) — sem IRP,
+// STATUS_INSUFFICIENT_RESOURCES. Sem buffers o IRP sai com SystemBuffer nulo e
+// Flags 0; o NT põe no lugar um buffer local de 0x40 bytes com o
+// FILE_REGION_INPUT {0, MAXLONGLONG, FILE_REGION_USAGE_VALID_CACHED_DATA} e
+// monta o próximo slot como IRP_MJ_FILE_SYSTEM_CONTROL (IRP_MN_USER_FS_REQUEST)
+// com o FileObject, OutputBufferLength 0x40 e InputBufferLength 0x18 (o
+// FsControlCode é o IoControlCode do pedido). IofCallDriver e, pendente, a
+// espera e o Iosb.Status. Com status que não é erro, *Vdl = 0 e, para cada
+// região do FILE_REGION_OUTPUT (RegionEntryCount) com o bit
+// FILE_REGION_USAGE_VALID_CACHED_DATA, *Vdl = FileOffset + Length: vale a
+// última. O NT confia no RegionEntryCount; aqui ele é limitado às duas
+// regiões que cabem no buffer de 0x40 bytes. Arquivo de volume do próprio
+// kernel (sem pilha de dispositivos): STATUS_INVALID_DEVICE_REQUEST, a
+// resposta de um file system que não atende o FSCTL.
+
+/// FSCTL_QUERY_FILE_REGIONS.
+pub const FSCTL_QUERY_FILE_REGIONS: u32 = 0x0009_0284;
+/// FILE_REGION_USAGE_VALID_CACHED_DATA.
+pub const FILE_REGION_USAGE_VALID_CACHED_DATA: u32 = 1;
+/// O buffer local do NT: FILE_REGION_OUTPUT com duas regiões.
+pub const QUERY_FILE_REGIONS_BUFFER: u32 = 0x40;
+const STATUS_INVALID_DEVICE_REQUEST: u32 = 0xC000_0010;
+const IRP_MJ_FILE_SYSTEM_CONTROL: u8 = 0x0D;
+
+/// FsRtlQueryCachedVdl(FileObject, Vdl*) -> NTSTATUS.
+pub fn query_cached_vdl(file: u64, vdl: &Field<i64>) -> Result<u32, KernelError> {
+    let device = file_information::related_device(file)?;
+    if device == 0 {
+        return Ok(STATUS_INVALID_DEVICE_REQUEST);
+    }
+    // KEVENT, IO_STATUS_BLOCK e o buffer das regiões (variáveis locais no NT).
+    let block = guest::alloc_bytes(Kevent::SIZE + IoStatusBlock::SIZE + QUERY_FILE_REGIONS_BUFFER as u64);
+    let buffer = block + Kevent::SIZE + IoStatusBlock::SIZE;
+    // SAFETY: bloco recém-alocado: o KEVENT, o IO_STATUS_BLOCK e o buffer.
+    let (event, iosb, input) = unsafe { (Kevent::at(block), IoStatusBlock::at(block + Kevent::SIZE), FileRegionInput::at(buffer)) };
+    dispatcher::initialize_event(event.address(), NOTIFICATION_EVENT, false);
+    let irp = io_manager::build_device_io_control_request(FSCTL_QUERY_FILE_REGIONS, device, 0, 0, 0, 0, 0, event.address(), iosb.address(), None);
+    if irp == 0 {
+        guest::free_bytes(block);
+        return Ok(STATUS_INSUFFICIENT_RESOURCES);
+    }
+    // SAFETY: IRP recém-montado; o próximo slot fica logo abaixo do corrente.
+    let (packet, next_stack) = unsafe { (Irp::at(irp), IoStackLocation::at(Irp::at(irp).tail.overlay.current_stack_location.get() - IoStackLocation::SIZE)) };
+    let built = packet.associated_irp.system_buffer.get();
+    if built != 0 {
+        guest::free_bytes(built);
+    }
+    packet.flags.set(0);
+    input.file_offset.set(0);
+    input.length.set(i64::MAX);
+    input.desired_usage.set(FILE_REGION_USAGE_VALID_CACHED_DATA);
+    packet.associated_irp.system_buffer.set(buffer);
+    next_stack.major_function.set(IRP_MJ_FILE_SYSTEM_CONTROL);
+    next_stack.file_object.set(file);
+    next_stack.parameters.file_system_control.output_buffer_length.set(QUERY_FILE_REGIONS_BUFFER);
+    next_stack.parameters.file_system_control.input_buffer_length.set(FileRegionInput::SIZE as u32);
+    let mut status = io_manager::iof_call_driver(device, irp) as u32;
+    if status == STATUS_PENDING {
+        dispatcher::wait_for_single_object(event.address(), 0, 0, false);
+        status = iosb.status.get() as u32;
+    }
+    if status & 0xC000_0000 != 0xC000_0000 {
+        vdl.set(0);
+        // SAFETY: o mesmo buffer, agora com o FILE_REGION_OUTPUT do file system.
+        let output = unsafe { FileRegionOutput::at(buffer) };
+        let capacity = (QUERY_FILE_REGIONS_BUFFER as u64 - core::mem::offset_of!(FileRegionOutput, region) as u64) / FileRegionInfo::SIZE;
+        for index in 0..(output.region_entry_count.get() as u64).min(capacity) {
+            // SAFETY: Region[index] dentro do buffer de 0x40 bytes.
+            let region = unsafe { FileRegionInfo::at(output.region[0].address() + index * FileRegionInfo::SIZE) };
+            if region.usage.get() & FILE_REGION_USAGE_VALID_CACHED_DATA != 0 {
+                vdl.set(region.file_offset.get().wrapping_add(region.length.get()));
+            }
+        }
+    }
+    guest::free_bytes(block);
+    Ok(status)
 }

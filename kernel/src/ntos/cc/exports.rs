@@ -344,3 +344,25 @@ pub mod cc_log {
         data_exports: &[],
     };
 }
+
+pub mod cc_volume_dirty_data {
+    //! CcIsThereDirtyDataEx (`cc/log.rs`) e CcSetDirtyPageThreshold
+    //! (`cc/cache_map.rs`).
+
+    use crate::ntos::cc::{cache_map, log};
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::rtl::KernelError;
+
+    /// CcIsThereDirtyDataEx(Vpb, NumberOfDirtyPages*) -> BOOLEAN.
+    fn is_there_dirty_data_ex(call: &Call) -> Result<u64, KernelError> {
+        Ok(log::is_there_dirty_data_ex(call.arg(1), call.arg(2)) as u64)
+    }
+
+    /// CcSetDirtyPageThreshold(FileObject, DirtyPageThreshold).
+    fn set_dirty_page_threshold(call: &Call) -> Result<u64, KernelError> {
+        cache_map::set_dirty_page_threshold(call.arg(1), call.arg(2) as u32);
+        Ok(0)
+    }
+
+    pub static GROUP: Group = Group { name: "cc-volume-dirty-data", names: &["CcIsThereDirtyDataEx", "CcSetDirtyPageThreshold"], handlers: &[is_there_dirty_data_ex, set_dirty_page_threshold], data_exports: &[] };
+}
