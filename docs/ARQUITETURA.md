@@ -3085,10 +3085,22 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   usuário (NtCreateTimer) e a porta ALPC
   `\UMDFCommunicationPorts\ProcessManagement`, no diretório que o kernel
   cria no IopCreateRootDirectories (`io/root_directories.rs`). O
-  ScAutoStartServices roda até o fim e a thread principal sai pelo
-  ExitThread do SvcctrlMain, mas nenhum serviço da cadeia do LSM é
-  iniciado: o conjunto de início das duas fases fica vazio e nenhum
-  svchost é criado. O smss da
+  ScAutoStartServices acha no banco do SCM o DcomLaunch, o RpcEptMapper,
+  o RpcSs e o LSM (início automático, com as chaves de serviço do Power,
+  do BrokerInfrastructure e do SystemEventsBroker, que dividem o svchost
+  do DcomLaunch, e o `Control\Power` copiados desta máquina) e passa pelo
+  logon de serviço: o ScLogonService pede ao lsass o LogonUserExExW da
+  conta do serviço, e o LsapCreateTokenObject cria o token
+  (NtCreateTokenEx) e grava nele a TokenMandatoryPolicy, a
+  TokenAuditPolicy e a TokenOrigin (NtSetInformationToken 27, 16 e 17,
+  `se/token/set_information.rs`). Ali para: o CreateProcessAsUserW do
+  CWin32ServiceRecord::LogonAndStartImage, com o token no
+  PS_ATTRIBUTE_TOKEN, volta STATUS_PRIVILEGE_NOT_HELD. O PspAllocateProcess
+  aceita o token com o SeAssignPrimaryTokenPrivilege habilitado (o token do
+  SYSTEM o tem desabilitado, como no SeMakeSystemToken) ou com o
+  SeIsTokenAssignableToProcess (integridade dominada e token filho ou irmão
+  do primário de quem chama); o `ps/create_context.rs` só confere o
+  privilégio. Nenhum svchost é criado ainda. O smss da
   sessão 1 cria o csrss e o winlogon.exe (o NtOpenSection relativo ao
   `\KnownDlls`, aberto pela tabela do Object Manager, e o powrprof.dll e o
   imm32.dll no volume); o NtUserInitialize do csrss da sessão 1 volta com
