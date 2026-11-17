@@ -442,6 +442,11 @@ const SMSS_PROGRAMS: &[&str] = &[
     "DABAPI.dll",
     "rsaenh.dll",
     "KDCPW.DLL",
+    // O gpapi.dll que o umpoext.dll do serviço Power carrega pelo nome, e o
+    // policymanager.dll (com o msvcp110_win.dll), carga adiada do umpo.dll.
+    "gpapi.dll",
+    "policymanager.dll",
+    "msvcp110_win.dll",
 ];
 
 /// Os outros serviços do grupo DcomLaunch do svchost (o mesmo processo do
