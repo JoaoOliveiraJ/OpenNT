@@ -3634,12 +3634,83 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   ZwQueryInformationTransaction dá STATUS_NOT_SUPPORTED; sem mup.sys, os
   FsRtlMupGet* também; o MmRemovePhysicalMemory valida e devolve
   STATUS_INSUFFICIENT_RESOURCES, porque o banco de PFN não encolhe.
+- **O terceiro lote de exports que eram os últimos imports de drivers**
+  (70 exports de função em 42 grupos e o export de dado SePublicDefaultDacl,
+  conferidos contra o ntoskrnl 19041; autoteste em
+  `test/rtl_strings_sids_exports.rs`, `test/security_session_exports.rs`,
+  `test/fsrtl_cc_file_exports.rs` e `test/ke_ex_po_io_exports.rs`):
+  - Rtl e CRT: o RtlNextUnicodePrefix anda as árvores da tabela de prefixos
+    pelo cursor LastNextEntry (as raízes isoladas têm Parent nos próprios
+    links, como o RtlInitializeSplayLinks); RtlAreBitsSetEx, swprintf,
+    wcsncpy, os parsers com porta e escopo RtlIpv4/Ipv6StringToAddressExW,
+    RtlUnicodeStringToInt64 e RtlValidateUnicodeString; os vetores de
+    SID_AND_ATTRIBUTES/LUID_AND_ATTRIBUTES e o RtlSidHashInitialize
+    (`rtl/security.rs`, o mesmo hash do access check); os vetores de
+    correlação (`rtl/correlation_vector.rs`); o RtlCrc32 (CRC-32C, não o
+    IEEE do RtlComputeCrc32); o RtlOpenCurrentUser, que cai no
+    `\Registry\User\.Default` sem a chave do usuário, e o
+    RtlFormatCurrentUserKeyPath com o usuário do token efetivo;
+  - Se: as rotinas de término de sessão de logon (`se/logon_session.rs`):
+    a sessão conta referências como no SepReferenceLogonSession (a primeira
+    referência de token assume a da criação) e sai do banco com o último
+    token; uma sessão marcada pelo SeMarkLogonSessionForTerminationNotificationEx
+    chama cada rotina registrada pelo DelayedWorkQueue com (LogonId, Silo,
+    Context). SeGetLogonSessionToken, SeQueryServerSiloToken,
+    SeSetSecurityAttributesToken[Ex] (as operações ADD/DELETE/REPLACE/
+    REPLACE_ALL, compartilhadas com o NtSetInformationToken),
+    ZwCompareTokens (`se/token/compare.rs`), SeExamineSacl (as ACEs de
+    auditoria simples; as condicionais são puladas), SeGetCachedSigningLevel
+    pela tabela da CI e o SePublicDefaultDacl (a ACL de 0x54 bytes do
+    SepInitSystemDacls, na `.kdata`). KseRegisterShimEx/KseUnregisterShim
+    respondem como o motor de shims não inicializado e PsChargePoolQuota
+    levanta a exceção do PsChargeProcessPoolQuota;
+  - FsRtl, Cc, Io e Ob: o MCB de 32 bits sobre o MCB grande e o
+    FsRtlLookupLastLargeMcbEntry; FsRtlRegisterMupCalls troca a tabela do
+    MUP que os FsRtlMupGet* usam; FsRtlNotifyCleanupAll,
+    FsRtlRemoveDotsFromPath, FsRtlGetSupportedFeatures (slot 0x10 da tabela
+    do Filter Manager) e FsRtlQueryCachedVdl (FSCTL_QUERY_FILE_REGIONS);
+    CcIsThereDirtyDataEx e CcSetDirtyPageThreshold; IoSetIrpExtraCreateParameter
+    e IoGetFsTrackOffsetState; ZwSetEaFile, ZwNotifyChangeDirectoryFile
+    (`io/file/directory_notify.rs`), NtSetInformationFile, NtFsControlFile e
+    ZwCreateSymbolicLinkObject;
+  - Ke, Ex, Po, Mm e Io: IoSizeOfIrpEx/IoInitializeIrpEx/IoCleanupIrp,
+    IoEnqueueIrp, IoSetIoAttributionIrp e IoReportResourceForDetection; os
+    releases Exf de push lock, a espera por endereço sobre push lock
+    (ExBlockOnAddressPushLock/ExUnblockOnAddressPushLockEx) e o
+    ExEnterCriticalRegionAndAcquireSharedWaitForExclusive;
+    ExGetSystemFirmwareTable (`ex/firmware_table.rs`, provedores 'RSMB' e
+    'FIRM'); MmAreMdlPagesCached (o CacheAttribute de cada PFN) e
+    MmCopyMemory; KeUpdateThreadTag e KeRaiseUserException; os pedidos de
+    energia (`po/power_request.rs`, o tipo de objeto PowerRequest com os
+    contadores por tipo) e PoNotifyMediaBuffering/
+    PoCpuIdledSinceLastCallImprecise (`po/processor_power.rs`).
+  Exports e objetos antigos mudaram para o comportamento do 19041: o
+  ExQueryWnfStateData recebe (Subscription, ChangeStamp, Buffer,
+  BufferSize) e lê pelo NameInstance da inscrição
+  (`ex/wnf/subscriptions.rs`); o RtlAppendUnicodeStringToString
+  (`rtl/strings_counted.rs`) copia os bytes, aceita o destino exato sem
+  lugar para o NUL e recusa com STATUS_BUFFER_TOO_SMALL (o luafv.sys monta
+  os caminhos assim); e o \SystemRoot passou a apontar para
+  `\Device\BootDevice\Windows`, com o `\Device\BootDevice` ligado ao volume
+  de boot, como no CreateSystemRootLink. Com o lote, 400 dos 419 drivers de
+  `System32\drivers` desta máquina têm todos os imports do ntoskrnl (eram
+  383); o mup.sys, o dfsc.sys, o udfs.sys e o cldflt.sys sobem pelo
+  `--start-driver` (teste `drivers-arquivos-rede`). Ficam de fora o mmcss.sys,
+  que precisa do host de extensão do MMCSS (id 9, o
+  PspInitializeMMCSSCallouts, com a tabela PspGetFreezeState,
+  PsGetNextProcessEx, PsGetNextProcessThread e PsQuitNextProcess), o
+  appid.sys, que carrega a pilha de rede (fwpkclnt.sys, netio.sys), e o
+  luafv.sys, que já passa pelas chaves e pela tradução do \SystemRoot mas
+  para no ZwQueryDirectoryFile da raiz do volume com a classe 37
+  (FileIdBothDirectoryInformation), que o caminho Zw dos arquivos de volume
+  (`io/file/zw.rs`) ainda não atende (STATUS_INVALID_PARAMETER).
 - O `xtask` lê fontes do kernel por `#[path]`:
   `ntos/mm/kernel_data_layout.rs` (`.kdata`/`.edata` do PE e páginas de status),
   `ntos/init/export_names.rs` e `ntos/init/native_export_layout.rs` (a EAT do
   PE) e as tabelas das hives de máquina (`ntos/cm/seed.rs`,
   `ntos/cm/session_manager.rs`, `ntos/cm/ini_file_mapping.rs`,
-  `ntos/cm/crypto_defaults.rs`, `ntos/cm/service/boot_services.rs` e
+  `ntos/cm/crypto_defaults.rs`, `ntos/cm/current_version.rs` (as pastas
+  de programas que o luafv.sys lê), `ntos/cm/service/boot_services.rs` e
   `ntos/cm/service/inbox_drivers.rs`, na mesma árvore `cm`/`cm::service`
   de módulos), com que `xtask/src/hive_image.rs` grava os arquivos SYSTEM,
   SOFTWARE, SAM, SECURITY e DEFAULT de `\SystemRoot\System32\config`.
