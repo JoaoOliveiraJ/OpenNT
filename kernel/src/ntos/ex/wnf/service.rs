@@ -291,6 +291,193 @@ pub fn query_name_information(state_name: u64, class: u32, explicit_scope: u64, 
     wnf_query::query_name_information(state_name, class, explicit_scope, buffer, length)
 }
 
+/// O acesso DELETE que o NtDeleteWnfStateName pede ao descritor do nome.
+const WNF_DELETE_ACCESS: u32 = 0x1_0000;
+/// WNF_DELIVERY_FLAG de nome destruído, entregue aos assinantes.
+const WNF_NAME_DESTROYED: u32 = 0x10;
+
+/// NtDeleteWnfStateName(StateName) de modo usuário (19041, rva 0x60d820),
+/// para os nomes temporários: o nome sondado e decodificado (o tempo de vida
+/// WnfWellKnownStateName dá STATUS_INVALID_PARAMETER), o escopo resolvido
+/// pelo processo corrente, a instância achada (senão
+/// STATUS_OBJECT_NAME_NOT_FOUND), o ExpWnfCheckCallerAccess com DELETE, o
+/// processo criador igual ao corrente (senão STATUS_ACCESS_DENIED), o aviso
+/// de nome destruído aos assinantes e o ExpWnfDeleteNameInstance. Os nomes
+/// permanentes e persistentes (a definição no Registro, o
+/// ExpWnfDeletePermanentName) ainda não são apagados pelo OpenNT e devolvem
+/// STATUS_NOT_IMPLEMENTED.
+pub fn delete_state_name_user(state_name: u64) -> Result<u32, KernelError> {
+    use crate::ntos::ps::user::state as user_state;
+    critical_region::enter_critical()?;
+    let result = (|| -> Result<u32, KernelError> {
+        if !user_state::probe_user_read(state_name, 8) {
+            return Ok(STATUS_ACCESS_VIOLATION);
+        }
+        let Ok(encoded) = crate::ntos::mm::guest_memory::try_read::<u64>(state_name) else { return Ok(STATUS_ACCESS_VIOLATION) };
+        let name = wnf_name::decode(encoded);
+        if name.status != 0 {
+            return Ok(name.status);
+        }
+        if name.lifetime == 0 {
+            return Ok(0xC000_000D);
+        }
+        if name.lifetime != 3 {
+            return Ok(0xC000_0002);
+        }
+        if !ensure_service()? {
+            return Ok(0xC000_009A);
+        }
+        let current = process::get_current_process();
+        let scope = match namespace::resolve_creator_scope(current, name.scope)? {
+            Ok(scope) => scope,
+            Err(status) => return Ok(status),
+        };
+        let outcome = (|| -> Result<u32, KernelError> {
+            let found = match namespace::lookup_name(scope, name.decoded_name)? {
+                Ok(found) => found,
+                Err(status) => return Ok(status),
+            };
+            let access = crate::ntos::ex::wnf::security::check(found.security_descriptor(), WNF_DELETE_ACCESS).unwrap_or(0xC000_0022);
+            if access & 0x8000_0000 != 0 {
+                namespace::release_name(&found)?;
+                return Ok(access);
+            }
+            if found.creator_process() != current {
+                namespace::release_name(&found)?;
+                return Ok(0xC000_0022);
+            }
+            notifications::notify_name(found.pointer, WNF_NAME_DESTROYED, true, true)?;
+            // O ExpWnfDeleteNameInstance consome a referência da busca: ela
+            // sai antes da espera do rundown.
+            let pointer = found.pointer;
+            namespace::release_name(&found)?;
+            namespace::delete_name(pointer)?;
+            Ok(0)
+        })();
+        namespace::release_scope(scope)?;
+        outcome
+    })();
+    let left = critical_region::leave_critical();
+    let result = result?;
+    left?;
+    Ok(result)
+}
+
+/// NtDeleteWnfStateData(StateName, ExplicitScope) de modo usuário (19041,
+/// ExpNtDeleteWnfStateData, rva 0x7cd64c): o nome sondado e decodificado, o
+/// escopo explícito capturado (com o ExpWnfCheckCrossScopeAccess), o escopo
+/// resolvido pelo processo e pela thread correntes e a instância achada; o
+/// ExpWnfCheckCallerAccess pede WNF_STATE_DATA de escrita e, num nome
+/// temporário, o criador precisa ser o processo corrente
+/// (STATUS_ACCESS_DENIED). O ExpWnfDeleteStateData solta o bloco de dados,
+/// sem aviso aos assinantes. Sem instância: um nome temporário dá
+/// STATUS_OBJECT_NAME_NOT_FOUND e um nome com definição permanente só passa
+/// pelo acesso à definição. A remoção dos dados persistidos no Registro (o
+/// ExpWnfDeletePermanentStateData dos nomes com PermanentData) ainda não
+/// existe no OpenNT e devolve STATUS_NOT_IMPLEMENTED.
+pub fn delete_state_data_user(state_name: u64, explicit_scope: u64) -> Result<u32, KernelError> {
+    use crate::ntos::ps::user::state as user_state;
+    critical_region::enter_critical()?;
+    let mut captured = None;
+    let result = (|| -> Result<u32, KernelError> {
+        if !user_state::probe_user_read(state_name, 8) {
+            return Ok(STATUS_ACCESS_VIOLATION);
+        }
+        let Ok(encoded) = crate::ntos::mm::guest_memory::try_read::<u64>(state_name) else { return Ok(STATUS_ACCESS_VIOLATION) };
+        let name = wnf_name::decode(encoded);
+        if name.status != 0 {
+            return Ok(name.status);
+        }
+        let capture = match scope_capture::capture_user(name.scope, explicit_scope)? {
+            Ok(capture) => captured.insert(capture),
+            Err(status) => return Ok(status),
+        };
+        if explicit_scope != 0 {
+            let status = crate::ntos::ex::wnf::security::check_cross_scope(&name, namespace::lookup_definition)?;
+            if status & 0x8000_0000 != 0 {
+                return Ok(status);
+            }
+        }
+        if !ensure_service()? {
+            return Ok(0xC000_009A);
+        }
+        let current = process::get_current_process();
+        let scope = match namespace::resolve_user_scope(current, name.scope, capture.identity)? {
+            Ok(scope) => scope,
+            Err(status) => return Ok(status),
+        };
+        let access = |descriptor: u64| crate::ntos::ex::wnf::security::check(descriptor, WNF_STATE_DATA_WRITE).unwrap_or(0xC000_0022);
+        let outcome = (|| -> Result<u32, KernelError> {
+            match namespace::lookup_name(scope, name.decoded_name)? {
+                Ok(found) => {
+                    let status = access(found.security_descriptor());
+                    let status = if status & 0x8000_0000 != 0 {
+                        status
+                    } else if name.lifetime == 3 && found.creator_process() != current {
+                        0xC000_0022
+                    } else if name.permanent_data {
+                        0xC000_0002
+                    } else {
+                        state_data::delete(&found)?;
+                        0
+                    };
+                    namespace::release_name(&found)?;
+                    Ok(status)
+                }
+                Err(0xC000_0034) if name.lifetime != 3 => match namespace::lookup_definition(name.decoded_name)? {
+                    Ok(definition) => {
+                        let status = access(definition.security_descriptor);
+                        definition.release();
+                        Ok(if status & 0x8000_0000 != 0 { status } else if name.permanent_data { 0xC000_0002 } else { 0 })
+                    }
+                    Err(status) => Ok(status),
+                },
+                Err(status) => Ok(status),
+            }
+        })();
+        namespace::release_scope(scope)?;
+        outcome
+    })();
+    let left = critical_region::leave_critical();
+    if let Some(captured) = captured {
+        captured.release()?;
+    }
+    let result = result?;
+    left?;
+    Ok(result)
+}
+
+/// NtUnsubscribeWnfStateChange(StateName) de modo usuário: o nome sondado e
+/// decodificado e a inscrição do processo corrente removida
+/// (`notifications::delete_subscription_by_name`).
+pub fn unsubscribe_user(state_name: u64) -> Result<u32, KernelError> {
+    use crate::ntos::ps::user::state as user_state;
+    critical_region::enter_critical()?;
+    let result = (|| -> Result<u32, KernelError> {
+        if !user_state::probe_user_read(state_name, 8) {
+            return Ok(STATUS_ACCESS_VIOLATION);
+        }
+        let Ok(encoded) = crate::ntos::mm::guest_memory::try_read::<u64>(state_name) else { return Ok(STATUS_ACCESS_VIOLATION) };
+        let name = wnf_name::decode(encoded);
+        if name.status != 0 {
+            return Ok(name.status);
+        }
+        notifications::delete_subscription_by_name(process::get_current_process(), name.decoded_name)
+    })();
+    let left = critical_region::leave_critical();
+    let result = result?;
+    left?;
+    Ok(result)
+}
+
+/// NtQueryWnfStateNameInformation de modo usuário.
+pub fn query_name_information_user(state_name: u64, class: u32, explicit_scope: u64, buffer: u64, length: u32) -> Result<u32, KernelError> {
+    if !ensure_service()? {
+        return Ok(0xC000_009A);
+    }
+    wnf_query::query_name_information_user(state_name, class, explicit_scope, buffer, length)
+}
+
 /// NtQueryWnfStateData: a captura de usuário com o mesmo fluxo da consulta Zw.
 pub fn query_user(state_name: u64, type_identifier: u64, explicit_scope: u64, change_stamp: u64, buffer: u64, returned_length: u64) -> Result<u32, KernelError> {
     if !ensure_service()? {

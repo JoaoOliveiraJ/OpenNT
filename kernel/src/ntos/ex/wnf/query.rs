@@ -145,15 +145,22 @@ pub fn query(state_name: u64, type_identifier: u64, explicit_scope: u64, change_
     if user.is_some() { execute() } else { previous_mode::with_kernel(execute)? }
 }
 
-// ---- ZwQueryWnfStateNameInformation ---------------------------------------
+// ---- Nt/ZwQueryWnfStateNameInformation -------------------------------------
 //
-// NtQueryWnfStateNameInformation do 19041 em KernelMode: o nome é capturado
-// e decodificado, o escopo explícito capturado, e só então a classe (acima
-// de WnfInfoIsQuiescent = STATUS_INVALID_INFO_CLASS) e o tamanho (menos de
-// um ULONG = STATUS_INVALID_PARAMETER) são conferidos. O escopo resolve
-// pelo System; a instância do nome é procurada na árvore do escopo e, se não
-// há instância de um nome não temporário, a definição permanente responde
-// por ele. KernelMode dispensa o ExpWnfCheckCallerAccess. O ULONG de saída:
+// NtQueryWnfStateNameInformation do 19041 (rva 0x6893c0): o nome é
+// capturado (sondado em UserMode) e decodificado, o escopo explícito
+// capturado, e só então a classe (acima de WnfInfoIsQuiescent =
+// STATUS_INVALID_INFO_CLASS) e o tamanho (menos de um ULONG =
+// STATUS_INVALID_PARAMETER) são conferidos; em UserMode o InfoBuffer passa
+// pelo ProbeForWrite de alinhamento 4. A classe WnfInfoStateNameExist não
+// aceita escopo explícito (STATUS_INVALID_PARAMETER). Em UserMode, nas
+// classes 1 e 2, um escopo explícito passa pelo ExpWnfCheckCrossScopeAccess
+// e o ExpWnfCheckCallerAccess pede o acesso 2 ao descritor da instância
+// (ou da definição permanente). O escopo resolve pelo processo corrente em
+// UserMode (com a thread nas classes 1 e 2) e pelo System em KernelMode; a
+// instância do nome é procurada na árvore do escopo e, se não há instância
+// de um nome não temporário, a definição permanente responde por ele. O
+// ULONG de saída:
 // - WnfInfoStateNameExist (0): 1 com instância ou definição; um nome sem
 //   nenhuma das duas dá 0 com STATUS_SUCCESS;
 // - WnfInfoSubscribersPresent (1): DataSubscribersCount != 0 (0 sem
@@ -166,6 +173,9 @@ pub fn query(state_name: u64, type_identifier: u64, explicit_scope: u64, change_
 const WNF_INFO_STATE_NAME_EXIST: u32 = 0;
 const WNF_INFO_SUBSCRIBERS_PRESENT: u32 = 1;
 const WNF_INFO_IS_QUIESCENT: u32 = 2;
+/// O acesso que o ExpWnfCheckCallerAccess pede nas classes 1 e 2.
+const NAME_INFORMATION_ACCESS: u32 = 2;
+const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
 
 /// A resposta de uma classe para a instância (ou só a definição) achada.
 fn name_information(class: u32, instance: Option<&state_data::NameState>) -> u32 {
@@ -177,22 +187,38 @@ fn name_information(class: u32, instance: Option<&state_data::NameState>) -> u32
     }
 }
 
-fn query_name_information_captured(name: &DecodedName, class: u32, captured: &Captured) -> Result<Result<u32, u32>, KernelError> {
-    let scope = match namespace::resolve_kernel_scope(process::get_system_process(), name.scope, captured.identity)? {
+/// `check_access`: o ExpWnfCheckCallerAccess de UserMode nas classes 1 e 2.
+fn query_name_information_captured(name: &DecodedName, class: u32, captured: &Captured, user: bool, check_access: bool) -> Result<Result<u32, u32>, KernelError> {
+    let resolved = if !user {
+        namespace::resolve_kernel_scope(process::get_system_process(), name.scope, captured.identity)?
+    } else if class == WNF_INFO_STATE_NAME_EXIST {
+        namespace::resolve_creator_scope(process::get_current_process(), name.scope)?
+    } else {
+        namespace::resolve_user_scope(process::get_current_process(), name.scope, captured.identity)?
+    };
+    let scope = match resolved {
         Ok(scope) => scope,
         Err(status) => return Ok(Err(status)),
+    };
+    let access = |descriptor: u64| -> Result<u32, KernelError> {
+        if !check_access {
+            return Ok(0);
+        }
+        Ok(crate::ntos::ex::wnf::security::check(descriptor, NAME_INFORMATION_ACCESS).unwrap_or(0xC000_0022))
     };
     let result = (|| -> Result<Result<u32, u32>, KernelError> {
         match namespace::lookup_name(scope, name.decoded_name)? {
             Ok(found) => {
+                let status = access(found.description().security_descriptor)?;
                 let value = name_information(class, Some(&found));
                 namespace::release_name(&found)?;
-                Ok(Ok(value))
+                Ok(if status & 0x8000_0000 != 0 { Err(status) } else { Ok(value) })
             }
             Err(0xC000_0034) if name.lifetime != 3 => match namespace::lookup_definition(name.decoded_name)? {
                 Ok(definition) => {
+                    let status = access(definition.description().security_descriptor)?;
                     definition.release();
-                    Ok(Ok(name_information(class, None)))
+                    Ok(if status & 0x8000_0000 != 0 { Err(status) } else { Ok(name_information(class, None)) })
                 }
                 Err(status) => Ok(Err(status)),
             },
@@ -203,19 +229,25 @@ fn query_name_information_captured(name: &DecodedName, class: u32, captured: &Ca
     result
 }
 
-/// ZwQueryWnfStateNameInformation(StateName, NameInfoClass, ExplicitScope,
-/// InfoBuffer, InfoBufferLength). Devolve o NTSTATUS.
-pub fn query_name_information(state_name: u64, class: u32, explicit_scope: u64, buffer: u64, length: u32) -> Result<u32, KernelError> {
+/// Nt/ZwQueryWnfStateNameInformation(StateName, NameInfoClass,
+/// ExplicitScope, InfoBuffer, InfoBufferLength) no modo `user`. Devolve o
+/// NTSTATUS.
+fn query_name_information_mode(state_name: u64, class: u32, explicit_scope: u64, buffer: u64, length: u32, user: bool) -> Result<u32, KernelError> {
+    use crate::ntos::ps::user::state as user_state;
     let execute = || -> Result<u32, KernelError> {
         critical_region::enter_critical()?;
         let mut captured = None;
         let result = (|| -> Result<u32, KernelError> {
-            // SAFETY: PCWNF_STATE_NAME de um chamador de modo kernel.
-            let name = wnf_name::decode(unsafe { Field::<u64>::at(state_name) }.get());
+            if user && !user_state::probe_user_read(state_name, 8) {
+                return Ok(STATUS_ACCESS_VIOLATION);
+            }
+            let Ok(encoded) = guest::try_read::<u64>(state_name) else { return Ok(STATUS_ACCESS_VIOLATION) };
+            let name = wnf_name::decode(encoded);
             if name.status != 0 {
                 return Ok(name.status);
             }
-            let capture = match scope_capture::capture_kernel(name.scope, explicit_scope)? {
+            let capture = if user { scope_capture::capture_user(name.scope, explicit_scope)? } else { scope_capture::capture_kernel(name.scope, explicit_scope)? };
+            let capture = match capture {
                 Ok(capture) => captured.insert(capture),
                 Err(status) => return Ok(status),
             };
@@ -225,13 +257,34 @@ pub fn query_name_information(state_name: u64, class: u32, explicit_scope: u64, 
             if length < 4 {
                 return Ok(0xC000_000D);
             }
-            let value = match query_name_information_captured(&name, class, capture)? {
+            if user {
+                if buffer & 3 != 0 {
+                    return Ok(STATUS_DATATYPE_MISALIGNMENT);
+                }
+                if !user_state::probe_user_write(buffer, length as u64) {
+                    return Ok(STATUS_ACCESS_VIOLATION);
+                }
+            }
+            if class == WNF_INFO_STATE_NAME_EXIST && explicit_scope != 0 {
+                return Ok(0xC000_000D);
+            }
+            let check_access = user && class != WNF_INFO_STATE_NAME_EXIST;
+            if check_access && explicit_scope != 0 {
+                let status = crate::ntos::ex::wnf::security::check_cross_scope(&name, namespace::lookup_definition)?;
+                if status & 0x8000_0000 != 0 {
+                    return Ok(status);
+                }
+            }
+            let value = match query_name_information_captured(&name, class, capture, user, check_access)? {
                 Ok(value) => value,
                 Err(0xC000_0034) if class == WNF_INFO_STATE_NAME_EXIST => 0,
                 Err(status) => return Ok(status),
             };
-            // SAFETY: o PULONG InfoBuffer de um chamador de modo kernel.
-            unsafe { Field::<u32>::at(buffer) }.set(value);
+            // O InfoBuffer de modo usuário já foi sondado; a escrita sondada
+            // cobre a perda do mapeamento entre a sonda e aqui.
+            if guest::try_write::<u32>(buffer, value).is_err() {
+                return Ok(STATUS_ACCESS_VIOLATION);
+            }
             Ok(0)
         })();
         let left = critical_region::leave_critical();
@@ -242,5 +295,15 @@ pub fn query_name_information(state_name: u64, class: u32, explicit_scope: u64, 
         left?;
         Ok(result)
     };
-    previous_mode::with_kernel(execute)?
+    if user { execute() } else { previous_mode::with_kernel(execute)? }
+}
+
+/// ZwQueryWnfStateNameInformation: o serviço em KernelMode.
+pub fn query_name_information(state_name: u64, class: u32, explicit_scope: u64, buffer: u64, length: u32) -> Result<u32, KernelError> {
+    query_name_information_mode(state_name, class, explicit_scope, buffer, length, false)
+}
+
+/// NtQueryWnfStateNameInformation de modo usuário.
+pub fn query_name_information_user(state_name: u64, class: u32, explicit_scope: u64, buffer: u64, length: u32) -> Result<u32, KernelError> {
+    query_name_information_mode(state_name, class, explicit_scope, buffer, length, true)
 }

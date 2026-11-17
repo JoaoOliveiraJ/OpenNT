@@ -215,6 +215,21 @@ pub fn load_local(state: &NameState) -> Result<u32, KernelError> {
     result
 }
 
+/// ExpWnfDeleteStateData: sob o lock exclusivo dos dados, o StateData sai
+/// da instância (os valores 0 e 1 são marcadores, não blocos) e o bloco
+/// volta ao pool; o carimbo e os assinantes ficam como estão.
+pub fn delete(state: &NameState) -> Result<(), KernelError> {
+    let lock = state.lock_pointer();
+    push_lock::acquire_exclusive(lock, 0)?;
+    let discarded = state.data_pointer();
+    state.set_data_pointer(0);
+    push_lock::release_exclusive(lock, 0)?;
+    if discarded >= 2 {
+        let _ = kernel_pool::free(discarded, Some(DATA_TAG));
+    }
+    Ok(())
+}
+
 /// Leitura sob lock compartilhado; as saídas são gravadas antes da
 /// comparação de capacidade e o tamanho é relido do bloco depois delas.
 /// As saídas podem ser ponteiros de modo usuário (NtQueryWnfStateData, já

@@ -50,7 +50,35 @@ fn nt_create_wnf_state_name(output: u64, lifetime: u64, scope: u64, persist: u64
     wnf_service::create_state_name_user(&request)
 }
 
+/// NtQueryWnfStateNameInformation(StateName, NameInfoClass, ExplicitScope,
+/// InfoBuffer, InfoBufferLength): o último na pilha.
+fn nt_query_wnf_state_name_information(state_name: u64, class: u64, explicit_scope: u64, buffer: u64, rsp: u64) -> Result<u32, KernelError> {
+    if !state::probe_syscall_stack(rsp, 8) {
+        return Ok(0xC000_0005);
+    }
+    wnf_service::query_name_information_user(state_name, class as u32, explicit_scope, buffer, state::stack_arg32(rsp, 5))
+}
+
+/// NtDeleteWnfStateName(StateName).
+fn nt_delete_wnf_state_name(state_name: u64, _: u64, _: u64, _: u64, _rsp: u64) -> Result<u32, KernelError> {
+    wnf_service::delete_state_name_user(state_name)
+}
+
+/// NtUnsubscribeWnfStateChange(StateName).
+fn nt_unsubscribe_wnf_state_change(state_name: u64, _: u64, _: u64, _: u64, _rsp: u64) -> Result<u32, KernelError> {
+    wnf_service::unsubscribe_user(state_name)
+}
+
+/// NtDeleteWnfStateData(StateName, ExplicitScope).
+fn nt_delete_wnf_state_data(state_name: u64, explicit_scope: u64, _: u64, _: u64, _rsp: u64) -> Result<u32, KernelError> {
+    wnf_service::delete_state_data_user(state_name, explicit_scope)
+}
+
 pub fn init() {
+    state::register_handler("NtDeleteWnfStateData", nt_delete_wnf_state_data);
+    state::register_handler("NtUnsubscribeWnfStateChange", nt_unsubscribe_wnf_state_change);
+    state::register_handler("NtDeleteWnfStateName", nt_delete_wnf_state_name);
+    state::register_handler("NtQueryWnfStateNameInformation", nt_query_wnf_state_name_information);
     state::register_handler("NtUpdateWnfStateData", nt_update_wnf_state_data);
     state::register_handler("NtCreateWnfStateName", nt_create_wnf_state_name);
     state::register_handler("NtQueryWnfStateData", nt_query_wnf_state_data);

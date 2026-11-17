@@ -4267,6 +4267,42 @@ fn user_wnf(assert: Assert) {
         created == Some(0) && new_name != 0 && (new_name ^ 0x41C6_4E6D_A3BC_0074) & 0xF == 1 && first_write == Some(0) && first_read == Some(0) && first_value == (1, 0x1357_9BDF) && stale == Some(0xC000_0001) && null_descriptor == Some(0xC000_0005) && bad_lifetime == Some(0xC000_000D) && bad_output == Some(0xC000_0005) && too_large == Some(0xC000_000D),
         "userwnf: NtCreateWnfStateName de modo usuario e a escrita do nome temporario novo",
     );
+    // NtQueryWnfStateNameInformation de modo usuário sobre o nome temporário
+    // (o descritor dele dá o acesso 2 a Everyone).
+    let info = block + 0x180;
+    let name_info = |class: u64, scope: u64, buffer: u64, size: u64| {
+        guest::write32(info, 0xFFFF_FFFF);
+        stack(&[size]);
+        call("NtQueryWnfStateNameInformation", created_name, class, scope, buffer)
+    };
+    let exists = (name_info(0, 0, info, 4), guest::read32(info));
+    let subscribers = (name_info(1, 0, info, 4), guest::read32(info));
+    let quiescent = (name_info(2, 0, info, 4), guest::read32(info));
+    let scoped_exist = name_info(0, 1, info, 4);
+    let bad_class = name_info(3, 0, info, 4);
+    let short_info = name_info(0, 0, info, 2);
+    let misaligned = name_info(0, 0, info + 1, 4);
+    let kernel_info = name_info(0, 0, 0xFFFF_8000_0000_0000, 4);
+    assert(
+        exists == (Some(0), 1) && subscribers == (Some(0), 0) && quiescent == (Some(0), 1) && scoped_exist == Some(0xC000_000D) && bad_class == Some(0xC000_0003) && short_info == Some(0xC000_000D) && misaligned == Some(0x8000_0002) && kernel_info == Some(0xC000_0005),
+        "userwnf: NtQueryWnfStateNameInformation de modo usuario (classes, escopo, tamanho e sondagem)",
+    );
+    // NtDeleteWnfStateData solta os dados do nome temporário (a leitura volta
+    // vazia, com carimbo 0) e NtDeleteWnfStateName apaga o nome; o nome bem
+    // conhecido é recusado.
+    let data_deleted = call("NtDeleteWnfStateData", created_name, 0, 0, 0);
+    guest::write32(length, 8);
+    stack(&[output, length]);
+    let after_delete = (call("NtQueryWnfStateData", created_name, 0, 0, stamp), guest::read32(length), guest::read32(stamp));
+    let name_deleted = call("NtDeleteWnfStateName", created_name, 0, 0, 0);
+    let gone = name_info(0, 0, info, 4).map(|status| (status, guest::read32(info)));
+    let deleted_again = call("NtDeleteWnfStateName", created_name, 0, 0, 0);
+    let data_gone = call("NtDeleteWnfStateData", created_name, 0, 0, 0);
+    let well_known = call("NtDeleteWnfStateName", name, 0, 0, 0);
+    assert(
+        data_deleted == Some(0) && after_delete == (Some(0), 0, 0) && name_deleted == Some(0) && gone == Some((0, 0)) && deleted_again == Some(0xC000_0034) && data_gone == Some(0xC000_0034) && well_known == Some(0xC000_000D),
+        "userwnf: NtDeleteWnfStateData e NtDeleteWnfStateName do nome temporario",
+    );
     // Inscrição e evento pertencem a um processo de usuário: um assinante do
     // System seria despachado como inscrição de kernel (callback em +0x50).
     let ran = with_test_process("wnf.exe", None, |_| {
@@ -4302,6 +4338,11 @@ fn user_wnf(assert: Assert) {
         let again = call("NtSetWnfProcessNotificationEvent", event, 0, 0, 0);
         let invalid = call("NtSetWnfProcessNotificationEvent", 0x7FFF_0000, 0, 0, 0);
         assert(created == Some(0) && registered == Some(0) && again == Some(0xC000_0718) && invalid.is_some_and(|status| status & 0x8000_0000 != 0), "userwnf: evento de notificacao do processo registrado uma vez");
+        // NtUnsubscribeWnfStateChange: a inscrição do processo sai uma vez.
+        let unsubscribed = call("NtUnsubscribeWnfStateChange", name, 0, 0, 0);
+        let unsubscribed_again = call("NtUnsubscribeWnfStateChange", name, 0, 0, 0);
+        let unsubscribe_pointer = call("NtUnsubscribeWnfStateChange", 0x10, 0, 0, 0);
+        assert(unsubscribed == Some(0) && unsubscribed_again == Some(0xC000_0034) && unsubscribe_pointer == Some(0xC000_0005), "userwnf: NtUnsubscribeWnfStateChange remove a inscricao do processo");
         // O encerramento devolve inscrições, contexto e a referência do evento.
         let _ = call("NtClose", event, 0, 0, 0);
     });

@@ -475,6 +475,39 @@ pub fn delete_kernel_subscription(subscription: u64) -> Result<(), KernelError> 
     }
 }
 
+/// NtUnsubscribeWnfStateChange (19041, rva 0x611a40): o
+/// ExpWnfAcquireSubscriptionByName procura, na lista de inscrições do
+/// contexto WNF do processo, a inscrição do nome decodificado
+/// (WNF_SUBSCRIPTION.StateName), e o ExpWnfDeleteSubscription a remove. Sem
+/// contexto ou sem inscrição: STATUS_OBJECT_NAME_NOT_FOUND.
+pub fn delete_subscription_by_name(process: u64, decoded_name: u64) -> Result<u32, KernelError> {
+    let context = process_at(process).wnf_context.get();
+    if context == 0 {
+        return Ok(0xC000_0034);
+    }
+    let mut removed = None;
+    let subscription = locked(process_context_at(context).process_subscription_list_lock.address(), true, || {
+        let head = process_context_at(context).process_subscription_list_head.address();
+        let mut entry = list_entry::at(head).flink.get();
+        while entry != head {
+            let pointer = entry - offset_of!(WnfSubscription, process_subscription_list_entry) as u64;
+            if subscription_at(pointer).state_name.bitfield_0.get() == decoded_name {
+                removed = Some(unlink_subscription(pointer, process, context)?);
+                return Ok(pointer);
+            }
+            entry = list_entry::at(entry).flink.get();
+        }
+        Ok(0)
+    })?;
+    match removed {
+        Some(removed) if subscription != 0 => {
+            finish_removal(subscription, process, removed)?;
+            Ok(0)
+        }
+        _ => Ok(0xC000_0034),
+    }
+}
+
 /// Versões para o ciclo de vida do namespace (`fn` sem resultado).
 pub fn detach_name_hook(name: u64) {
     if let Err(error) = detach_name(name) {
