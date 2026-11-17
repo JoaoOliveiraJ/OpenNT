@@ -105,6 +105,9 @@ opennt_resume_thread:
     fxsave64 [rsp]
     mov gs:[{dispatcher_rsp}], rsp
     mov rsp, rdi
+    # O estado estendido que o bloqueio salvou na área da thread.
+    mov rcx, gs:[{xstate_area}]
+    call opennt_xstate_restore
     fldcw [rsp + 0xA4]
     ldmxcsr [rsp + 0xA0]
     movups xmm6, [rsp + 0x00]
@@ -194,6 +197,7 @@ opennt_kernel_thread_start:
 "#,
     exit_kind = const gs_offset(offset_of!(UserExecutionBlock, exit_kind)),
     dispatcher_rsp = const gs_offset(offset_of!(UserExecutionBlock, dispatcher_rsp)),
+    xstate_area = const gs_offset(offset_of!(UserExecutionBlock, xstate_area)),
     blocked = const EXIT_BLOCKED,
 );
 

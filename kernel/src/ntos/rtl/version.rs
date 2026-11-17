@@ -6,7 +6,7 @@
 //! (RtlIsNtDdiVersionAvailable).
 //!
 //! Windows 10.0.26100, Win32 NT, estação de trabalho Professional, sem
-//! multissessão; recursos estendidos x87 e SSE.
+//! multissessão; os recursos estendidos são os da XState (`ke::xsave`).
 
 use alloc::vec::Vec;
 
@@ -26,9 +26,6 @@ const NT_PRODUCT_WIN_NT: u32 = 1;
 
 /// PRODUCT_PROFESSIONAL.
 const PRODUCT_PROFESSIONAL: u32 = 0x0000_0030;
-
-/// XSTATE_MASK das features habilitadas: x87 e SSE.
-const ENABLED_EXTENDED_FEATURES: u64 = 3;
 
 /// VER_PLATFORM_WIN32_NT.
 const VER_PLATFORM_WIN32_NT: u32 = 2;
@@ -144,9 +141,16 @@ pub fn nt_system_root() -> u64 {
     NT_SYSTEM_ROOT
 }
 
-/// RtlGetEnabledExtendedFeatures: as features habilitadas, filtradas pela
-/// máscara pedida (zero = todas).
+/// RtlGetEnabledExtendedFeatures(FeatureMask): (XState.EnabledFeatures |
+/// XState.EnabledUserVisibleSupervisorFeatures) & FeatureMask.
 pub fn enabled_extended_features(feature_mask: u64) -> u64 {
-    let enabled = ENABLED_EXTENDED_FEATURES;
-    if feature_mask != 0 { enabled & feature_mask } else { enabled }
+    use crate::ntos::ke::xsave;
+    (xsave::enabled_features() | xsave::enabled_user_visible_supervisor_features()) & feature_mask
+}
+
+/// RtlGetEnabledExtendedAndSupervisorFeatures(FeatureMask):
+/// (XState.EnabledFeatures | XState.EnabledSupervisorFeatures) & FeatureMask.
+pub fn enabled_extended_and_supervisor_features(feature_mask: u64) -> u64 {
+    use crate::ntos::ke::xsave;
+    (xsave::enabled_features() | xsave::enabled_supervisor_features()) & feature_mask
 }

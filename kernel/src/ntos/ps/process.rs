@@ -428,17 +428,20 @@ pub fn create_process(process_id: u64, image_name: &str, image_base: u64, execut
     Ok(process)
 }
 
-/// Os campos de pilha da KTHREAD (os do KeInitThread): StackBase,
-/// StackLimit, InitialStack (o KERNEL_STACK_CONTROL) e KernelStack (o RSP
-/// salvo, que numa thread nova é o próprio InitialStack). Sem pilha própria,
-/// a thread descreve a pilha de boot, onde rodam o kmain, o System e os
-/// contextos de kernel do escalonador.
+/// Os campos de pilha da KTHREAD (os do KeInitThread e do
+/// KiInitializeContextThread): StackBase, StackLimit, InitialStack (o
+/// KERNEL_STACK_CONTROL), KernelStack (o RSP salvo, que numa thread nova é o
+/// próprio InitialStack), StateSaveArea e NpxState. Sem pilha própria, a
+/// thread descreve a pilha de boot, onde rodam o kmain, o System e os
+/// contextos de kernel do escalonador, e usa a área de XSAVE do despachante
+/// da CPU 0.
 fn publish_kernel_stack(tcb: &Kthread, stack: Option<KernelStack>) {
     let (base, initial, limit) = stack.map_or((memory_map::BOOT_STACK_TOP, memory_map::BOOT_STACK_TOP, memory_map::BOOT_STACK_LIMIT), |stack| (stack.base, stack.initial, stack.limit));
     tcb.stack_base.set(base);
     tcb.stack_limit.set(limit);
     tcb.initial_stack.set(initial);
     tcb.kernel_stack.set(initial);
+    crate::ntos::ke::xstate::initialize_thread(tcb, stack.map_or(0, |stack| stack.state_save_area));
 }
 
 /// Devolve a pilha de kernel própria da thread (adiada se a CPU ainda está

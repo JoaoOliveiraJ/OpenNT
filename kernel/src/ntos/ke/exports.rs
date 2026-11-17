@@ -300,11 +300,12 @@ fn ipi_generic_call(call: &Call) -> Result<u64, KernelError> {
     Ok(callout::ipi_generic_call(call.arg(1), call.arg(2)))
 }
 fn save_extended_processor_state(call: &Call) -> Result<u64, KernelError> {
-    xstate::save(call.arg(1), call.arg(2));
-    Ok(0)
+    Ok(signed_status(xstate::save(call.arg(1), call.arg(2))))
 }
+/// KeRestoreExtendedProcessorState(XStateSave) -> VOID.
 fn restore_extended_processor_state(call: &Call) -> Result<u64, KernelError> {
-    Ok(signed_status(xstate::restore(call.arg(1))))
+    xstate::restore(call.arg(1));
+    Ok(0)
 }
 /// KeSetActualBasePriorityThread(Thread, Priority): a base anterior
 /// (`ke/thread_priority.rs`).
@@ -1338,4 +1339,44 @@ pub mod ke_processor_profile {
     }
 
     pub static GROUP: Group = Group { name: "ke-processor-profile", names: &["KeAllocateProcessorProfileStructures"], handlers: &[allocate_processor_profile_structures], data_exports: &[] };
+}
+
+pub mod ke_xstate_support {
+    //! KeSaveFloatingPointState, KeRestoreFloatingPointState,
+    //! KeGetXSaveFeatureFlags e RtlGetEnabledExtendedAndSupervisorFeatures —
+    //! `ke::xsave` e `rtl::version`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::ke::xsave;
+    use crate::rtl::KernelError;
+
+    /// KeSaveFloatingPointState(FloatSave) -> NTSTATUS: no x64 só devolve
+    /// STATUS_SUCCESS (o x87/SSE do código de kernel é volátil e o estado
+    /// estendido é do KeSaveExtendedProcessorState); o mesmo corpo do
+    /// KeRestoreFloatingPointState.
+    fn save_floating_point_state(_: &Call) -> Result<u64, KernelError> {
+        Ok(0)
+    }
+
+    /// KeRestoreFloatingPointState(FloatSave) -> NTSTATUS: STATUS_SUCCESS.
+    fn restore_floating_point_state(_: &Call) -> Result<u64, KernelError> {
+        Ok(0)
+    }
+
+    /// KeGetXSaveFeatureFlags() -> ULONG.
+    fn get_xsave_feature_flags(_: &Call) -> Result<u64, KernelError> {
+        Ok(xsave::feature_flags() as u64)
+    }
+
+    /// RtlGetEnabledExtendedAndSupervisorFeatures(FeatureMask) -> ULONG64.
+    fn get_enabled_extended_and_supervisor_features(call: &Call) -> Result<u64, KernelError> {
+        Ok(crate::ntos::rtl::version::enabled_extended_and_supervisor_features(call.arg(1)))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "ke-xstate-support",
+        names: &["KeSaveFloatingPointState", "KeRestoreFloatingPointState", "KeGetXSaveFeatureFlags", "RtlGetEnabledExtendedAndSupervisorFeatures"],
+        handlers: &[save_floating_point_state, restore_floating_point_state, get_xsave_feature_flags, get_enabled_extended_and_supervisor_features],
+        data_exports: &[],
+    };
 }

@@ -66,7 +66,7 @@ pub struct Group {
 }
 
 /// Grupos implementados (qualquer ordem: a posição vem de `GROUP_LAYOUT`).
-fn groups() -> [&'static Group; 508] {
+fn groups() -> [&'static Group; 509] {
     [
         &crate::ntos::ps::exports::ps_jobs::GROUP,
         &crate::ntos::alpc::exports::zw_alpc_server::GROUP,
@@ -577,6 +577,7 @@ fn groups() -> [&'static Group; 508] {
         &crate::ntos::ke::exports::nt_build_number::GROUP,
         &crate::ntos::ex::exports::time_keeping::GROUP,
         &crate::ntos::ke::exports::ke_processor_profile::GROUP,
+        &crate::ntos::ke::exports::ke_xstate_support::GROUP,
     ]
 }
 

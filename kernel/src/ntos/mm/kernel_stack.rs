@@ -15,12 +15,16 @@
 //!
 //! ```text
 //!   StackBase      topo exclusivo da pilha
-//!   InitialStack   StackBase - sizeof(KERNEL_STACK_CONTROL): o controle da
-//!                  pilha (CurrentStackBase, ActualLimit, Previous zerado) e
-//!                  o valor que o despacho grava em KPRCB.RspBase e TSS.RSP0
+//!   StateSaveArea  (StackBase - KiXSaveAreaLength) & ~0x3F: a área de XSAVE
+//!                  da thread (KTHREAD.StateSaveArea, `ke::xstate`)
+//!   InitialStack   StateSaveArea - sizeof(KERNEL_STACK_CONTROL): o controle
+//!                  da pilha (CurrentStackBase, ActualLimit, Previous zerado)
+//!                  e o valor que o despacho grava em KPRCB.RspBase e TSS.RSP0
 //!   StackLimit     a página mais baixa da pilha
 //!   guarda         StackLimit - 0x1000, sem PTE
 //! ```
+//!
+//! A área e o InitialStack são os do KiInitializeContextThread.
 //!
 //! O ceifador da thread devolve a pilha ([`delete`]); se a CPU ainda está
 //! nela (a liberação partiu da própria pilha), ela fica para o próximo
@@ -63,6 +67,8 @@ pub struct KernelStack {
     pub base: u64,
     /// InitialStack: o KERNEL_STACK_CONTROL fica aqui.
     pub initial: u64,
+    /// A área de XSAVE da thread, logo acima do KERNEL_STACK_CONTROL.
+    pub state_save_area: u64,
     /// StackLimit: a página mais baixa.
     pub limit: u64,
 }
@@ -120,8 +126,8 @@ fn in_use(stack: &KernelStack) -> bool {
     rsp >= stack.limit - KERNEL_STACK_GUARD && rsp <= stack.base
 }
 
-/// MmCreateKernelStack: uma pilha nova, zerada, com a guarda e o
-/// KERNEL_STACK_CONTROL no InitialStack.
+/// MmCreateKernelStack: uma pilha nova, zerada, com a guarda, a área de
+/// XSAVE no topo e o KERNEL_STACK_CONTROL no InitialStack.
 pub fn create(large: bool) -> Result<KernelStack, KernelError> {
     create_sized(if large { KERNEL_LARGE_STACK_SIZE } else { KERNEL_STACK_SIZE })
 }
@@ -169,12 +175,13 @@ fn create_sized(size: u64) -> Result<KernelStack, KernelError> {
         }
         frames.push(frame);
     }
-    let initial = base - KernelStackControl::SIZE;
+    let state_save_area = crate::ntos::ke::xstate::stack_area(base);
+    let initial = state_save_area - KernelStackControl::SIZE;
     // SAFETY: as páginas do topo acabaram de ser mapeadas e zeradas.
     let control = unsafe { KernelStackControl::at(initial) };
     control.current_stack_base.set(base);
     control.actual_limit.set(limit);
-    let stack = KernelStack { base, initial, limit };
+    let stack = KernelStack { base, initial, state_save_area, limit };
     STATE.lock().live.insert(base, Allocation { stack, frames });
     Ok(stack)
 }

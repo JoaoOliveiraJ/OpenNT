@@ -367,7 +367,7 @@ fn ntoskrnl_exports(assert: Assert) {
     use crate::{ntos::init::export_names as abi_names, ntos::init::exports};
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions, ResolvedImport};
     exports::init();
-    assert(abi_names::EXPORT_NAMES.len() == 2074 && abi_names::GROUP_LAYOUT.len() == 508 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 2059 exports em 506 grupos");
+    assert(abi_names::EXPORT_NAMES.len() == 2078 && abi_names::GROUP_LAYOUT.len() == 509 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 2059 exports em 506 grupos");
     // Ordinais públicos: os slots de função seguidos dos dados sem nome repetido.
     let public_count = abi_names::EXPORT_NAMES.len() + crate::ntos::mm::kernel_data_layout::DEFINITIONS.iter().filter(|entry| !abi_names::EXPORT_NAMES.contains(&entry.name)).count();
     assert(matches!(exports::lookup_ordinal("ntoskrnl.exe", 547), Some(ResolvedImport::Thunk(578))) && exports::lookup("ntoskrnl.exe", "LdrResSearchResource").is_some() && exports::lookup("ntoskrnl.exe", "NaoExisteNoKernel").is_none() && exports::lookup_ordinal("ntoskrnl.exe", 0).is_none() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32).is_some() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32 + 1).is_none(), "ntoskrnl: ordinais, todos os exports com provedor e nome desconhecido");
@@ -2113,12 +2113,15 @@ fn ntoskrnl_ke_group(assert: Assert) {
     let mutex = block + 0x200;
     call_export("KeInitializeGuardedMutex", &[mutex]);
     assert(call_export("KeTryToAcquireGuardedMutex", &[mutex]) == Some(1) && call_export("KeReleaseGuardedMutex", &[mutex]) == Some(0) && at::<nt::FastMutex>(mutex).count.get() == 1, "ke: guarded mutex");
-    // O XSTATE_SAVE é do chamador: o kernel preenche o XSTATE_CONTEXT.
+    // O XSTATE_SAVE é do chamador: o kernel preenche o XSTATE_CONTEXT, com
+    // todos os recursos habilitados menos o x87 e o SSE (a máscara pedida só
+    // é conferida), e a restauração libera a área.
     let state = block + 0x240;
     let saved = call_export("KeSaveExtendedProcessorState", &[3, state]);
     let context = &at::<nt::XstateSave>(state).x_state_context;
-    let area_saved = context.mask.get() == 3 && context.area.get() != 0;
-    assert(saved == Some(0) && area_saved && call_export("KeRestoreExtendedProcessorState", &[state]) == Some(0) && context.area.get() == 0 && call_export("KeRestoreExtendedProcessorState", &[0]) == Some(0xFFFF_FFFF_C000_000D), "ke: estado estendido salvo e restaurado");
+    let features = (crate::ntos::ke::xsave::enabled_features() | 3) & !3;
+    let area_saved = context.mask.get() == features && (features == 0) == (context.area.get() == 0);
+    assert(saved == Some(0) && area_saved && call_export("KeRestoreExtendedProcessorState", &[state]) == Some(0) && context.area.get() == 0 && context.buffer.get() == 0, "ke: estado estendido salvo e restaurado");
     assert(call_export("KeDeregisterBugCheckCallback", &[0x1234]) == Some(0), "ke: registro de bugcheck desconhecido");
     // Dados KiBugCheckData/KeNumberProcessors e anexação pelo export.
     let data = |name: &str| match exports::lookup("ntoskrnl.exe", name) {
@@ -2141,7 +2144,7 @@ fn ntoskrnl_mm_group(assert: Assert) {
     use crate::ntos::mm::{image_paging, paging};
     use crate::ntos::init::exports;
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions};
-    assert(exports::implemented() == 2074 && exports::export_names().len() == 2074, "ntoskrnl: 508 grupos com os 2074 exports implementados");
+    assert(exports::implemented() == 2078 && exports::export_names().len() == 2078, "ntoskrnl: 509 grupos com os 2078 exports implementados");
     let block = guest::alloc_bytes(0x200);
     // MmGetSystemRoutineAddress: trampolim chamável e nome desconhecido.
     let name: alloc::vec::Vec<u16> = "KeGetCurrentIrql".encode_utf16().collect();
@@ -15810,6 +15813,7 @@ pub fn run(assert: Assert) {
     zw_write_file(assert);
     kernel_system_threads(assert);
     super::kernel_waits::run(assert);
+    super::extended_state::run(assert);
     super::irql_cr8::run(assert);
     zw_group_exports(assert);
     pnp_and_boot_services(assert);

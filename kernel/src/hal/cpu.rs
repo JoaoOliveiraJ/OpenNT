@@ -1,7 +1,7 @@
 //! Instruções privilegiadas e de identificação da CPU: CPUID, RDTSC (também
 //! na ordem das instruções anteriores, a do contador de desempenho), MSRs,
-//! registradores de controle, IDT, interrupções, caches, FXSAVE, HLT e
-//! RDRAND.
+//! registradores de controle e estendidos (XCR), IDT, interrupções, caches,
+//! FXSAVE, HLT e RDRAND.
 
 use core::arch::asm;
 
@@ -110,6 +110,24 @@ pub fn read_cr4() -> u64 {
     let value: u64;
     unsafe { asm!("mov {}, cr4", out(reg) value, options(nomem, nostack)) }
     value
+}
+
+/// Grava CR4.
+pub fn write_cr4(value: u64) {
+    unsafe { asm!("mov cr4, {}", in(reg) value, options(nostack)) }
+}
+
+/// XGETBV: o registrador de controle estendido `index` (XCR0 = 0). Exige o
+/// CR4.OSXSAVE.
+pub fn read_xcr(index: u32) -> u64 {
+    let (low, high): (u32, u32);
+    unsafe { asm!("xgetbv", in("ecx") index, out("eax") low, out("edx") high, options(nomem, nostack, preserves_flags)) }
+    (high as u64) << 32 | low as u64
+}
+
+/// XSETBV: grava o registrador de controle estendido `index`.
+pub fn write_xcr(index: u32, value: u64) {
+    unsafe { asm!("xsetbv", in("ecx") index, in("eax") value as u32, in("edx") (value >> 32) as u32, options(nostack)) }
 }
 
 /// CR8: a prioridade de tarefa (TPR[7:4] do LAPIC), o IRQL do x64.

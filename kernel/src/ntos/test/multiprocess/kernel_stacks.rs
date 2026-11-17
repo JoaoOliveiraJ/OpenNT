@@ -2,8 +2,11 @@
 //! `hal/amd64/usermode.rs`):
 //!
 //! - uma KTHREAD com pilha própria publica StackBase, StackLimit,
-//!   InitialStack (o KERNEL_STACK_CONTROL) e KernelStack, com a pilha na
-//!   janela de sistema, em PTEs de supervisor NX, e a guarda sem PTE;
+//!   InitialStack (o KERNEL_STACK_CONTROL), KernelStack e StateSaveArea (a
+//!   área de XSAVE no topo, (StackBase - KiXSaveAreaLength) & ~0x3F, com o
+//!   KERNEL_STACK_CONTROL logo abaixo, como no KiInitializeContextThread),
+//!   com a pilha na janela de sistema, em PTEs de supervisor NX, e a guarda
+//!   sem PTE;
 //! - uma syscall de teste (tabela 1 do Shadow, thread GUI, o caminho inteiro
 //!   do KiSystemCall64) devolve o próprio RSP: ele fica entre o StackLimit e o
 //!   InitialStack da thread que a fez, difere entre duas threads, e durante a
@@ -107,7 +110,11 @@ fn thread_fields(assert: Assert) {
         return;
     };
     let (base, initial, limit, saved) = stack_fields(thread);
-    assert(map::is_kernel_stack(limit) && map::is_kernel_stack(base - 1) && base - limit == KERNEL_STACK_SIZE && initial == base - KernelStackControl::SIZE && saved == initial, "pilhas: StackBase, StackLimit, InitialStack e KernelStack publicados na janela de sistema");
+    let area = (base - crate::ntos::ke::xsave::xsave_area_length() as u64) & !0x3F;
+    assert(map::is_kernel_stack(limit) && map::is_kernel_stack(base - 1) && base - limit == KERNEL_STACK_SIZE && initial == area - KernelStackControl::SIZE && saved == initial, "pilhas: StackBase, StackLimit, InitialStack e KernelStack publicados na janela de sistema");
+    // SAFETY: KTHREAD viva retida pelo teste.
+    let tcb = unsafe { crate::ntos::inc::types::Kthread::at(thread) };
+    assert(tcb.state_save_area.get() == area && area % 64 == 0 && tcb.npx_state.get() == crate::ntos::ke::xstate::switching_npx_state(false), "pilhas: StateSaveArea no topo da pilha, alinhada a 64, e o NpxState de uma thread sem contexto de usuario (os recursos habilitados sem x87 e SSE)");
     // SAFETY: o InitialStack de uma pilha viva aponta o controle.
     let control = unsafe { KernelStackControl::at(initial) };
     assert(control.current_stack_base.get() == base && control.actual_limit.get() == limit && control.previous.stack_base.get() == 0, "pilhas: KERNEL_STACK_CONTROL no InitialStack");
@@ -275,7 +282,8 @@ fn native_thread_limits(assert: Assert) {
     let _ = object_manager::close(handle as u32);
     let finished = pump(&|| guest::read32(block + 0x18) == 0x77 && kernel_stack::find(base).is_none());
     let (low, high, rsp) = (guest::read64(block), guest::read64(block + 8), guest::read64(block + 0x10));
-    assert(map::is_kernel_stack(limit) && base - limit == KERNEL_THREAD_STACK_SIZE && initial == base - KernelStackControl::SIZE, "pilhas: a thread nativa tem pilha de kernel propria na janela de sistema, do tamanho da de uma thread de kernel");
+    let area = (base - crate::ntos::ke::xsave::xsave_area_length() as u64) & !0x3F;
+    assert(map::is_kernel_stack(limit) && base - limit == KERNEL_THREAD_STACK_SIZE && initial == area - KernelStackControl::SIZE, "pilhas: a thread nativa tem pilha de kernel propria na janela de sistema, do tamanho da de uma thread de kernel");
     assert(guest::read32(block + 0x18) == 0x77 && low == limit && high == base && rsp > low && rsp < initial, "pilhas: IoGetStackLimits de uma thread nativa devolve a faixa real, que contem o RSP do codigo nativo");
     assert(finished, "pilhas: o ceifador da thread nativa devolve a pilha");
     guest::free_bytes(block);

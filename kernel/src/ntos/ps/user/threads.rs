@@ -144,9 +144,11 @@ pub struct UserThread {
 impl UserThread {
     /// Thread publicada pelo processo (a principal) ou pela criação.
     pub fn new(thread_id: u64, thread_pointer: u64, teb_va: u64, start: u64) -> Arc<Self> {
-        // KTHREAD.Teb acompanha a TEB da thread (PsGetThreadTeb).
+        // KTHREAD.Teb acompanha a TEB da thread (PsGetThreadTeb); a área de
+        // XSAVE e o NpxState passam aos de uma thread de usuário.
         if thread_pointer != 0 {
             kernel_thread(thread_pointer).teb.set(teb_va);
+            crate::ntos::ke::xstate::initialize_user_thread(thread_pointer);
         }
         Arc::new(Self {
             thread_id,

@@ -4210,7 +4210,7 @@ fn user_alpc_zw_group(assert: Assert) {
     let _ = open_pointer::close(handle);
     let _ = open_pointer::close(second);
     transport::unregister(&listener);
-    assert(disconnected == Some(0) && again == Some(0xC000_0037) && port_objects::port_of(pointer).is_none() && exports::implemented() == 2074, "zwalpc: desconexao e grupo com 15 exports");
+    assert(disconnected == Some(0) && again == Some(0xC000_0037) && port_objects::port_of(pointer).is_none() && exports::implemented() == 2078, "zwalpc: desconexao e grupo com 15 exports");
     if let Some(region) = memory::find_region(block) {
         memory::release_private_region(&region);
     }
@@ -4620,7 +4620,7 @@ fn user_thread_context(assert: Assert) {
     let user_frame = { guest::write64(frame + 136, 0x33); kernel_context_frame::with_interrupt(frame, fx, cpu, workspace, || 7, 0).ok() };
     assert(matches!(applied, Ok(Ok(0))) && guest::read64(frame + 112) == 0x1234 && restored && user_frame == Some(7) && kernel_context_frame::with_interrupt(frame, fx, cpu, workspace, || 0, 4).is_err(), "userctx: CONTEXT de KernelMode aplicado ao frame de interrupcao");
     // Faixas retidas só no frame vivo da syscall.
-    assert(!context_frame::retain(source, 0x10_0002) && !context_frame::retain(source, 0x2) && crate::ntos::ps::user::set_thread_context::apply(thread + 8, source).is_err(), "userctx: faixas retidas so no frame vivo e aplicacao na thread errada recusada");
+    assert(!context_frame::retain(source, 0x10_0002) && !context_frame::retain(source, 0x2) && crate::ntos::ps::user::set_thread_context::apply(thread + 8, source, None).is_err(), "userctx: faixas retidas so no frame vivo e aplicacao na thread errada recusada");
     for pointer in [source, frame, fx, cpu, workspace] {
         guest::free_bytes(pointer);
     }
@@ -4690,10 +4690,21 @@ fn user_exceptions(assert: Assert) {
     let delivered = exceptions::hardware(&thread, 0x8000_0003);
     crate::hal::amd64::usermode::block().fault_vector.set(saved_vector);
     let stack = live_context.rsp.get();
+    // O frame do KiDispatchException: com KF_XSTATE, o pedaço XSTATE (do
+    // tamanho do RtlGetExtendedContextLength2) alinhado a 64 logo abaixo do
+    // RSP; o machine frame alinhado a 16 abaixo dele e o CONTEXT a 0x590.
+    let expected_stack = |rsp: u64| {
+        use crate::ntos::ke::{processor_identity, xsave};
+        let xstate = processor_identity::feature_bits() & processor_identity::kf::XSTATE != 0;
+        let mask = if xsave::compaction() { (xsave::enabled_features() | xsave::enabled_user_visible_supervisor_features()) & !0x800 } else { 0 };
+        let chunk = if xstate { crate::ntos::rtl::extended_context::entire_xstate_area_length(mask) as u64 - 0x200 } else { 0 };
+        let start = if xstate { (rsp - chunk) & !0x3F } else { rsp };
+        ((start - 0x28) & !0xF) - machine_offset
+    };
     let (dispatch_context, dispatch_context_ex, dispatch_record, machine_frame) = unsafe { (nt::Context::at(stack), nt::ContextEx::at(stack + nt::Context::SIZE), nt::ExceptionRecord::at(stack + record_offset), nt::MachineFrame::at(stack + machine_offset)) };
-    let frame_ok = stack == (block + 0x3F00 - 0x5C0) & !15 && live_context.rip.get() == dispatcher && live_context.rcx.get() == stack + record_offset && live_context.rdx.get() == stack;
+    let frame_ok = stack == expected_stack(block + 0x3F00) && live_context.rip.get() == dispatcher && live_context.rcx.get() == stack + record_offset && live_context.rdx.get() == stack;
     let record_ok = dispatch_record.exception_code.get() as u32 == 0x8000_0003 && dispatch_record.exception_address.get() == block + 0x900 && machine_frame.rip.get() == block + 0x900 && dispatch_context.rip.get() == block + 0x900 && dispatch_context.context_flags.get() & 0x10_0010 == 0x10_0010;
-    let flags_ok = live_context.e_flags.get() & 0x1_0500 == 0 && dispatch_context.e_flags.get() & 0x1A_7000 == 0 && dispatch_context_ex.all.length.get() as u64 == record_offset;
+    let flags_ok = live_context.e_flags.get() & 0x1_0500 == 0 && dispatch_context.e_flags.get() & 0x1A_7000 == 0 && dispatch_context_ex.all.length.get() as u64 == block + 0x3F00 - stack && machine_frame.rsp.get() == block + 0x3F00;
     assert(missing == 0xC000_0139 && delivered == 0 && frame_ok && record_ok && flags_ok, "userexc: breakpoint de hardware entregue ao KiUserExceptionDispatcher");
     // Primeira chance pelo NtRaiseException: pendente até a saída da syscall.
     let previous = threads::current();
@@ -4710,7 +4721,7 @@ fn user_exceptions(assert: Assert) {
     let applied = exceptions::pending(&thread);
     let integer_kept = live_context.rax.get() == 0xBBBB && live_context.dr0.get() == 0x1111;
     let stack = live_context.rsp.get();
-    let pending_ok = applied == 0 && live_context.rip.get() == dispatcher && stack == (block + 0x3F00 - 0x5C0) & !15 && unsafe { nt::ExceptionRecord::at(stack + record_offset) }.exception_code.get() as u32 == 0xC000_0005 && !thread.with(|state| state.pending_exception);
+    let pending_ok = applied == 0 && live_context.rip.get() == dispatcher && stack == expected_stack(block + 0x3F00) && unsafe { nt::ExceptionRecord::at(stack + record_offset) }.exception_code.get() as u32 == 0xC000_0005 && !thread.with(|state| state.pending_exception);
     threads::set_running(false, previous);
     state::with(|state| state.ntdll_exports = saved_exports);
     guest::free_bytes(live);
@@ -5511,7 +5522,10 @@ fn usermode_syscalls_exports(assert: Assert) {
         // getbuf+8 lê ContextFlags em getbuf+0x38 (SegCs/SegDs...): válido, para chegar ao alinhamento.
         unsafe { nt::Field::<u32>::at(getbuf + 0x38) }.set(0x10_0001);
         buffer.context_flags.set(0x10_0040);
-        let refusals = call("NtGetContextThread", current, getbuf, 0, 0) == 0xC000_00BB && call("NtGetContextThread", current, getbuf + 8, 0, 0) == 0x8000_0002 && call("NtGetContextThread", limited, getbuf, 0, 0) == 0xC000_0022;
+        // CONTEXT_XSTATE: sem recursos habilitados, STATUS_NOT_SUPPORTED; com
+        // eles, o CONTEXT_EX zerado (Legacy fora do lugar) é recusado.
+        let xstate_refusal = if crate::ntos::ke::xsave::enabled_features() != 0 { 0xC000_000D } else { 0xC000_00BB };
+        let refusals = call("NtGetContextThread", current, getbuf, 0, 0) == xstate_refusal && call("NtGetContextThread", current, getbuf + 8, 0, 0) == 0x8000_0002 && call("NtGetContextThread", limited, getbuf, 0, 0) == 0xC000_0022;
         assert(segments && debug && reporting && refusals, "userctx2: segmentos fixos, banco de depuracao ativo, REPORTING|SERVICE_ACTIVE e recusas");
         buffer.context_flags.set(0x10_0002);
         buffer.rax.set(0xCAFE);
@@ -5691,6 +5705,7 @@ pub fn run(assert: Assert) {
     crate::ntos::test::multiprocess::cross_memory::run(assert);
     crate::ntos::test::rtl_atom_heap_nls::run_phase7(assert);
     crate::ntos::test::multiprocess::user_callback::run(assert);
+    crate::ntos::test::multiprocess::extended_state::run(assert);
     crate::ntos::test::multiprocess::time_services::run(assert);
     crate::ntos::test::executive_support::run_user(assert);
     crate::ntos::test::multiprocess::process_queries::run(assert);

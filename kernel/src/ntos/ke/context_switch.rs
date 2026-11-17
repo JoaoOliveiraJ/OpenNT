@@ -67,7 +67,7 @@ use alloc::boxed::Box;
 use core::panic::Location;
 use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
-use super::{irql, pcr, thread_dispatch};
+use super::{irql, pcr, thread_dispatch, xstate};
 use crate::hal::amd64::{context_switch as switch, native_call, usermode};
 use crate::hal::cpu;
 use crate::ntos::inc::types::{Kpcr, Kprocess, Kthread, NtStruct};
@@ -428,19 +428,25 @@ static SWITCH: [CpuSwitch; map::MAX_CPUS] = [const { CpuSwitch { resumer: Atomic
 /// O estado da CPU que cada lado de uma troca leva consigo e recoloca ao
 /// voltar a executar: o IRQL (o CR8), as chamadas nativas em curso (o
 /// contexto nativo agendado e a posse de execução nativa síncrona), as
-/// posses de SharedLock e a thread corrente (com a raiz do processo dela).
+/// posses de SharedLock, a thread corrente (com a raiz do processo dela) e o
+/// estado estendido do processador, salvo na área de XSAVE do lado que sai
+/// (KTHREAD.StateSaveArea da thread, ou a do despachante da CPU) e
+/// recarregado dela na volta, como no SwapContext.
 struct CarriedState {
     irql: u8,
     native: native_call::NativeState,
     shared: u32,
     thread: u64,
+    xstate: u64,
 }
 
-fn carry_out() -> CarriedState {
-    CarriedState { irql: irql::get_irql(), native: native_call::state(), shared: sync::swap_shared_locks_held(0), thread: process::get_current_thread() }
+fn carry_out(xstate_area: u64) -> CarriedState {
+    xstate::save_current(xstate_area);
+    CarriedState { irql: irql::get_irql(), native: native_call::state(), shared: sync::swap_shared_locks_held(0), thread: process::get_current_thread(), xstate: xstate_area }
 }
 
 fn carry_in(state: CarriedState) {
+    xstate::restore_current(state.xstate);
     irql::swap_irql(state.irql);
     native_call::restore_state(state.native);
     sync::swap_shared_locks_held(state.shared);
@@ -499,6 +505,8 @@ pub fn initialize_kernel_thread(thread: u64, entry: extern "C" fn(u64) -> !, arg
 /// PASSIVE_LEVEL, sem posse nativa nem de SharedLock, com a thread corrente
 /// que o despachante publicou.
 pub fn begin_kernel_thread() {
+    // O estado estendido inicial da área nova (KiInitializeContextThread).
+    xstate::restore_current(xstate::thread_area(process::get_current_thread()));
     irql::swap_irql(irql::PASSIVE_LEVEL);
     native_call::restore_state(native_call::NativeState::default());
     sync::swap_shared_locks_held(0);
@@ -516,7 +524,7 @@ pub fn resume(thread: u64) -> SwitchReason {
     let kthread = unsafe { Kthread::at(thread) };
     let saved = kthread.kernel_stack.get();
     assert!(saved > kthread.stack_limit.get() && saved < kthread.stack_base.get(), "KernelStack fora da pilha da thread de kernel");
-    let carried = carry_out();
+    let carried = carry_out(xstate::dispatcher_area(processor()));
     slot.running.store(thread, Ordering::Release);
     // SAFETY: `saved` é o quadro de troca que a thread gravou ao sair (ou o
     // inicial); a célula do despachante vive na reserva estática da CPU.
@@ -536,7 +544,7 @@ pub fn switch_out(reason: SwitchReason) {
     let slot = &SWITCH[processor()];
     // SAFETY: a KTHREAD da thread em execução está viva.
     let kthread = unsafe { Kthread::at(thread) };
-    let carried = carry_out();
+    let carried = carry_out(kthread.state_save_area.get());
     kthread.wait_irql.set(carried.irql);
     slot.reason.store(reason.encode(), Ordering::Release);
     // SAFETY: a célula é o KernelStack da própria thread; o quadro do

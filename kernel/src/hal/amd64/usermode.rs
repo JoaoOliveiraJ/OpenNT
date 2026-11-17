@@ -84,12 +84,16 @@ pub struct UserExecutionBlock {
     pub debug_hardware: [Field<u64>; 6],
     /// O banco do usuário está na CPU (byte baixo).
     pub debug_active: Field<u64>,
+    /// A área de XSAVE da thread do intervalo (KTHREAD.StateSaveArea; 0 no
+    /// anel 3 cru): o fim do intervalo salva nela o estado estendido e a
+    /// entrada o recarrega dela (`hal::amd64::extended_state`).
+    pub xstate_area: Field<u64>,
 }
 
 // SAFETY: #[repr(C)] só de células.
 unsafe impl NtStruct for UserExecutionBlock {}
 
-const _: () = assert!(size_of::<UserExecutionBlock>() == 0x148);
+const _: () = assert!(size_of::<UserExecutionBlock>() == 0x150);
 
 /// Deslocamento de um campo do bloco a partir da KPCR (o operando `gs:` dos stubs).
 pub const fn gs_offset(field: usize) -> u64 {
@@ -373,6 +377,9 @@ user_exec_context:
     fxsave64 [rsp]
     mov gs:[{dispatcher_rsp}], rsp
     mov rsp, rsi
+    # O estado estendido da thread antes do x87/SSE do CONTEXT.
+    mov rcx, gs:[{xstate_area}]
+    call opennt_xstate_restore
     fxrstor64 [rdi + 0x100]
     push {user_ds}
     push qword ptr [rdi + 0x98]
@@ -528,6 +535,10 @@ opennt_uer_have_rflags:
 .global user_terminate_current
 user_terminate_current:
     call user_debug_leave
+    # O estado estendido da thread do intervalo sai da CPU (o salvamento
+    # ansioso do SwapContext).
+    mov rcx, gs:[{xstate_area}]
+    call opennt_xstate_save
     mov rsp, gs:[{dispatcher_rsp}]
     fxrstor64 [rsp]
     add rsp, 0x208
@@ -568,6 +579,7 @@ user_tss_storage:    .zero 136
     debug_user = const gs_offset(offset_of!(UserExecutionBlock, debug_user)),
     debug_hardware = const gs_offset(offset_of!(UserExecutionBlock, debug_hardware)),
     debug_active = const gs_offset(offset_of!(UserExecutionBlock, debug_active)),
+    xstate_area = const gs_offset(offset_of!(UserExecutionBlock, xstate_area)),
     user_ds = const SEL_USER_DATA | 3,
     user_cs = const SEL_USER_CODE | 3,
 );
@@ -701,6 +713,11 @@ fn dispatch_stack(fallback: u64) -> u64 {
     if crate::ntos::mm::memory_map::is_kernel_stack(initial) { initial } else { fallback }
 }
 
+/// A área de XSAVE da KTHREAD corrente (KTHREAD.StateSaveArea).
+fn current_xstate_area() -> u64 {
+    crate::ntos::ke::xstate::thread_area(pcr::current().prcb.current_thread.get())
+}
+
 /// O KiSwapContext do despacho: a pilha de kernel da thread vira a da
 /// entrada de syscall (KPRCB.RspBase) e a das IRQs e exceções do anel 3
 /// (TSS.RSP0). No fim do intervalo as duas voltam à pilha reserva da CPU:
@@ -746,6 +763,7 @@ pub fn exec_user_mode(entry: u64, user_rsp: u64, teb: u64, argument1: u64, rflag
     load_kernel_stack(stack);
     let previous_swap = cpu::read_msr(MSR_KERNEL_GS_BASE);
     reset_fault_state();
+    block().xstate_area.set(0);
     cpu::write_msr(MSR_KERNEL_GS_BASE, teb);
     let exit_code = unsafe { user_exec_ring3(entry, user_rsp, stack, argument1, rflags, argument2) };
     load_kernel_stack(fallback);
@@ -780,10 +798,12 @@ pub fn exec_user_context(context: u64, teb: u64) -> u32 {
     block.context.set(context);
     block.exit_kind.set(0);
     block.continue_flag.set(0);
+    block.xstate_area.set(current_xstate_area());
     cpu::write_msr(MSR_KERNEL_GS_BASE, teb);
     let result = unsafe { user_exec_context(context, stack) };
     load_kernel_stack(fallback);
     block.context.set(0);
+    block.xstate_area.set(0);
     cpu::write_msr(MSR_KERNEL_GS_BASE, swap_gs);
     native_call::restore_state(native);
     let mut state = STATE.lock();
@@ -877,12 +897,14 @@ pub fn resume_kernel_context(saved_rsp: u64, teb: u64) -> u32 {
     let swap_gs = cpu::read_msr(MSR_KERNEL_GS_BASE);
     let native = native_call::state();
     block.exit_kind.set(0);
+    block.xstate_area.set(current_xstate_area());
     cpu::write_msr(MSR_KERNEL_GS_BASE, teb);
     // SAFETY: `saved_rsp` é o KernelStack que `block_in_service` gravou na
     // pilha viva da thread corrente, ainda não retomado.
     let result = unsafe { context_switch::resume(saved_rsp) };
     load_kernel_stack(fallback);
     block.context.set(0);
+    block.xstate_area.set(0);
     cpu::write_msr(MSR_KERNEL_GS_BASE, swap_gs);
     native_call::restore_state(native);
     let mut state = STATE.lock();
@@ -933,9 +955,15 @@ pub fn exec_user_callback(context: u64, teb: u64) -> (u32, u32) {
     let stack = dispatch_stack(fallback);
     load_kernel_stack(stack);
     let swap_gs = cpu::read_msr(MSR_KERNEL_GS_BASE);
+    let outer_area = block.xstate_area.get();
+    let area = current_xstate_area();
     block.context.set(context);
     block.exit_kind.set(0);
     block.continue_flag.set(0);
+    block.xstate_area.set(area);
+    // O estado estendido vivo é o do usuário de fora (o kernel não o toca):
+    // o callback parte dele, como no KiCallUserMode.
+    crate::ntos::ke::xstate::save_current(area);
     cpu::write_msr(MSR_KERNEL_GS_BASE, teb);
     // SAFETY: dentro de um serviço despachado nesta CPU, com a pilha de
     // kernel do intervalo aninhado carregada; o fim dele volta a este quadro
@@ -948,6 +976,7 @@ pub fn exec_user_callback(context: u64, teb: u64) -> (u32, u32) {
     cpu::write_msr(MSR_KERNEL_GS_BASE, swap_gs);
     block.dispatcher_rsp.set(dispatcher_rsp);
     block.exit_kind.set(exit_kind);
+    block.xstate_area.set(outer_area);
     block.context.set(saved.context);
     block.continue_flag.set(saved.continue_flag);
     block.continue_rcx.set(saved.continue_rcx);

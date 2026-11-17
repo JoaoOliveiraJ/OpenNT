@@ -164,7 +164,9 @@ fn nt_query_performance_counter(counter: u64, frequency: u64, _a3: u64, _a4: u64
 
 /// NtContinue(context, alertable): reescreve o frame do syscall com o
 /// CONTEXT; o retorno da HAL retoma o contexto. GPRs são copiados como
-/// padrões de bits opacos.
+/// padrões de bits opacos. Com CONTEXT_XSTATE, o pedaço XSTATE do
+/// CONTEXT_EX vai ao estado estendido da thread, que volta à CPU (o
+/// KxContextToKframes do KiContinue).
 fn nt_continue(context: u64, _alertable: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
     if context == 0 || !probe_user_read(context, 0x300) {
         return Ok(0xC000_0005);
@@ -172,8 +174,13 @@ fn nt_continue(context: u64, _alertable: u64, _a3: u64, _a4: u64, _rsp: u64) -> 
     state::guarded(|| {
         let user = state::user_struct::<Context>(context)?;
         let flags = user.context_flags.probe_get()?;
-        if flags & 3 != 3 || flags & 0x40 != 0 {
+        if flags & 3 != 3 {
             return Ok(STATUS_INVALID_PARAMETER);
+        }
+        if flags & 0x40 != 0 {
+            if let Err(status) = crate::ntos::rtl::extended_context::validate_context_flags(flags) {
+                return Ok(status);
+            }
         }
         // Bits reservados fariam o FXRSTOR falhar no kernel.
         if flags & 8 != 0 && user.flt_save.mx_csr.probe_get()? & !0xFFFF != 0 {
@@ -191,6 +198,14 @@ fn nt_continue(context: u64, _alertable: u64, _a3: u64, _a4: u64, _rsp: u64) -> 
         let (rax, rcx, rdx, rbx, rbp, rsi, rdi, r8, r9, r10, r11, r12, r13, r14, r15) = (rax?, rcx?, rdx?, rbx?, rbp?, rsi?, rdi?, r8?, r9?, r10?, r11?, r12?, r13?, r14?, r15?);
         let eflags = user.e_flags.probe_get()?;
         let float_image = if flags & 8 != 0 { Some(guest::try_read_bytes(user.flt_save.address(), XsaveFormat::SIZE as usize)?) } else { None };
+        let xstate = if crate::ntos::ps::context::xstate::requested(flags) {
+            match crate::ntos::ps::context::xstate::capture_user(context, flags)? {
+                Ok(extended) => Some(extended),
+                Err(status) => return Ok(status),
+            }
+        } else {
+            None
+        };
         // Os registradores de depuração são preparados antes de mudar o frame.
         let mut debug_bank = 0u64;
         if let Some(values) = debug {
@@ -233,6 +248,9 @@ fn nt_continue(context: u64, _alertable: u64, _a3: u64, _a4: u64, _rsp: u64) -> 
                 setter(debug_bank);
             }
             guest::free_bytes(debug_bank);
+        }
+        if let Some(extended) = xstate.as_ref() {
+            crate::ntos::ps::context::xstate::apply_to_thread(extended, crate::ntos::ps::process::get_current_thread());
         }
         block.continue_flag.set(1);
         crate::debug_print!("[usermode] NtContinue -> rip {:#x} rsp {:#x}", rip, rsp);

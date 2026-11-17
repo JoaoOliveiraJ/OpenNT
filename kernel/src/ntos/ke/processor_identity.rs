@@ -27,6 +27,9 @@
 //!   CacheProcessorMask (os processadores com o mesmo InitialApicId sob as
 //!   máscaras), KeFeatureBits (com NX e XSTATE), KeProcessorLevel/Revision e
 //!   os ProcessorFeatures (PF_*) da KUSER_SHARED_DATA.
+//! - KiInitializeXSave, os bits do XSAVE e o KiEnableXSave de cada CPU
+//!   (`ke::xsave`), com a área do despachante e a KPRCB.ExtendedState
+//!   (`ke::xstate`).
 //! - HalpTimerSaveProcessorFrequency: MHz e StallScaleFactor = a frequência
 //!   do TSC arredondada a MHz.
 //!
@@ -76,6 +79,7 @@ pub mod kf {
     pub const RDRAND: u64 = 1 << 32;
     pub const SMAP: u64 = 1 << 33;
     pub const RDTSCP: u64 = 1 << 34;
+    pub const XSAVES: u64 = 1 << 38;
     pub const SGX: u64 = 1 << 40;
     pub const SGX_LAUNCH_CONTROL: u64 = 1 << 43;
     pub const RDT_ALLOCATION: u64 = 1 << 44;
@@ -651,6 +655,9 @@ fn set_feature_bits(prcb: &Kprcb, boot: bool, signature: u32) {
             }
         }
     }
+    // O KiInitializeKernel: KF_XSTATE, KF_XSAVEOPT e KF_XSAVES com o XSAVE
+    // configurado.
+    bits = super::xsave::kernel_feature_bits(bits);
     prcb.feature_bits.set(bits);
 }
 
@@ -720,6 +727,8 @@ fn initialize_current(boot: bool) {
     if boot {
         set_processor_signature(prcb, signature.value, true);
     }
+    // O KiInitializeXSave do KiSystemStartup, antes do KiInitializeKernel.
+    super::xsave::initialize_processor(boot, prcb);
     set_feature_bits(prcb, boot, signature.value);
     set_cache_information(kpcr);
     // HalpTimerSaveProcessorFrequency: o TSC arredondado a MHz.
@@ -728,9 +737,9 @@ fn initialize_current(boot: bool) {
     kpcr.stall_scale_factor.set(megahertz);
 }
 
-/// O KiInitializeKernel do BSP: KeProcessorLevel/Revision e KeFeatureBits
+/// O KiInitializeKernel do BSP: KeProcessorLevel/Revision, KeFeatureBits
 /// (o FeatureBits com o NX — ligado pelo EFER.NXE com o recurso presente — e
-/// o XSTATE, que o OpenNT não habilita: só FXSAVE).
+/// os bits do XSAVE) e o KiEnableXSave.
 pub fn initialize_boot_processor() -> Result<(), KernelError> {
     if pcr::get_pcr_address() == 0 {
         return Err(KernelError::new("identidade do processador antes da KPCR"));
@@ -747,6 +756,8 @@ pub fn initialize_boot_processor() -> Result<(), KernelError> {
     PROCESSOR_REVISION.store(prcb.cpu_step.get(), Ordering::Release);
     FEATURE_BITS.store(bits, Ordering::Release);
     BOOT_READY.store(1, Ordering::Release);
+    super::xsave::enable_processor();
+    super::xstate::initialize_processor();
     debug_print!(
         "[ke] CPU 0: {} familia {:#x} modelo {:#x} stepping {} ({} MHz), FeatureBits {:#x}",
         vendor_text(prcb),
@@ -774,6 +785,8 @@ pub fn vendor_text(prcb: &Kprcb) -> alloc::string::String {
 /// A passagem de um AP, como job no próprio AP.
 extern "win64" fn initialize_on_application_processor(_: u64, _: u64, _: u64, _: u64) -> u64 {
     initialize_current(false);
+    super::xsave::enable_processor();
+    super::xstate::initialize_processor();
     0
 }
 

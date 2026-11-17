@@ -164,7 +164,9 @@ pub fn init() -> bool {
     data.native_processor_architecture.set(9); // PROCESSOR_ARCHITECTURE_AMD64
     // Nível e revisão do processador não fazem parte desta página no 19041
     // (vêm de SystemProcessorInformation); os recursos (PF_*) saem de
-    // KeFeatureBits, como no KiInitializeKernel.
+    // KeFeatureBits, como no KiInitializeKernel. A XState (o fim do
+    // KiInitializeXSave do BSP) vem antes: os PF_* do AVX dependem dela.
+    crate::ntos::ke::xsave::publish(data);
     processor_identity::publish_processor_features(data);
     data.suite_mask.set(0x110);
     data.number_of_physical_pages.set((kmalloc::ram_top() / 0x1000) as u32);

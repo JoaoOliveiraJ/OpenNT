@@ -11,6 +11,8 @@ use crate::rtl::KernelError;
 use crate::ntos::inc::field::NtStruct;
 use crate::ntos::inc::types::{Context, XsaveFormat};
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::ke::xsave;
+use crate::ntos::ps::context::xstate::{self as context_xstate, Extended};
 
 const AV: u32 = 0xC000_0005;
 const MISALIGNED: u32 = 0x8000_0002;
@@ -70,10 +72,12 @@ fn ranges(flags: u32) -> alloc::vec::Vec<(u64, u64)> {
     selected
 }
 
-/// CONTEXT capturado: a fonte (buffer do chamador ou cópia própria).
+/// CONTEXT capturado: a fonte (buffer do chamador ou cópia própria) e, com
+/// CONTEXT_XSTATE, o pedaço XSTATE num CONTEXT estendido do kernel.
 pub struct Captured {
     pub source: u64,
     pub flags: u32,
+    pub xstate: Option<Extended>,
     owned: bool,
 }
 
@@ -105,12 +109,13 @@ pub fn capture(pointer: u64, mode: u8) -> Result<Result<Captured, u32>, KernelEr
         // alinhamento, como no NT).
         guest::read::<u32>(flag_address)
     };
-    let (status, flags) = registers::validate(flags, mode, false);
+    // CONTEXT_XSTATE só de um buffer de UserMode e com recursos habilitados.
+    let (status, flags) = registers::validate(flags, mode, mode != 0 && xsave::enabled_features() != 0);
     if status != 0 {
         return Ok(Err(status));
     }
     if mode == 0 {
-        return Ok(Ok(Captured { source: pointer, flags, owned: false }));
+        return Ok(Ok(Captured { source: pointer, flags, xstate: None, owned: false }));
     }
     if pointer & 15 != 0 {
         return Ok(Err(MISALIGNED));
@@ -123,12 +128,21 @@ pub fn capture(pointer: u64, mode: u8) -> Result<Result<Captured, u32>, KernelEr
             return Ok(Err(AV));
         }
     }
+    let xstate = if context_xstate::requested(flags) {
+        match context_xstate::capture_user(pointer, flags)? {
+            Ok(extended) => Some(extended),
+            Err(status) => return Ok(Err(status)),
+        }
+    } else {
+        None
+    };
     let storage = guest::alloc_aligned(SIZE, 16, false);
     if storage == 0 {
         return Ok(Err(NO_MEMORY));
     }
-    let mut captured = Captured { source: storage, flags, owned: true };
-    if let Err(error) = registers::capture_registers(storage, pointer, flags) {
+    let mut captured = Captured { source: storage, flags, xstate, owned: true };
+    // O CONTEXT legado sem o bit do XSTATE (o pedaço já foi capturado).
+    if let Err(error) = registers::capture_registers(storage, pointer, flags & !0x40) {
         captured.release();
         // Página de usuário que sumiu durante a cópia: STATUS_ACCESS_VIOLATION.
         if error.status == AV {

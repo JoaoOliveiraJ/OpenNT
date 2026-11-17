@@ -28,6 +28,7 @@ pub mod minifilters;
 pub mod minifilter_support;
 pub mod console_driver;
 pub mod kernel_waits;
+pub mod extended_state;
 pub mod irql_cr8;
 pub mod import_cycle;
 pub mod session_driver_support;

@@ -9,6 +9,7 @@ pub mod avl;
 pub mod bitmap;
 pub mod crt;
 pub mod image;
+pub mod extended_context;
 pub mod native_context;
 pub mod nls_configuration;
 pub mod sha256;

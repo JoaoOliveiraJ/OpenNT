@@ -12,8 +12,10 @@ use crate::ntos::ps::context::{set as set_thread_context, registers as registers
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::inc::types::{Context, Kthread, NtStruct, XsaveFormat};
+use crate::ntos::ke::xsave;
+use crate::ntos::ps::context::xstate::{self as context_xstate, Extended};
 
-pub fn apply(thread: u64, source: u64) -> Result<u32, KernelError> {
+pub fn apply(thread: u64, source: u64, xstate: Option<&Extended>) -> Result<u32, KernelError> {
     if irql::get_irql() > 1 {
         return Err(KernelError::new("context operation requires IRQL <= APC_LEVEL"));
     }
@@ -54,6 +56,10 @@ pub fn apply(thread: u64, source: u64) -> Result<u32, KernelError> {
         if prepared.retain() && debug {
             usermode::set_user_debug_registers(context + 0x48);
         }
+        // CONTEXT_XSTATE: o pedaço vai ao estado estendido da thread.
+        if let Some(extended) = xstate {
+            context_xstate::apply_to_thread(extended, thread);
+        }
         Ok(0)
     })();
     guest::free_bytes(fx);
@@ -86,7 +92,8 @@ pub fn execute(thread: u64, input: u64, probe_mode: u8, flags: u32) -> Result<u3
 //   -> STATUS_SET_CONTEXT_DENIED; thread de sistema ou Pico ->
 //   STATUS_INVALID_HANDLE; PspSetContextThreadInternal(thread, context,
 //   UserMode, UserMode, 1) (`execute`).
-// CONTEXT_XSTATE devolve STATUS_NOT_SUPPORTED nos dois lados (sem XSAVE).
+// CONTEXT_XSTATE: o pedaço XSTATE do CONTEXT_EX que segue o CONTEXT
+// (`ps::context::xstate`); sem recursos habilitados, STATUS_NOT_SUPPORTED.
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -238,7 +245,7 @@ pub fn get(thread: u64, buffer: u64) -> Result<u32, KernelError> {
         Ok(flags) => flags,
         Err(error) => return Ok(error.status),
     };
-    let (status, flags) = registers::validate(requested, 1, false);
+    let (status, flags) = registers::validate(requested, 1, xsave::enabled_features() != 0);
     if status != 0 {
         return Ok(status);
     }
@@ -247,6 +254,13 @@ pub fn get(thread: u64, buffer: u64) -> Result<u32, KernelError> {
     }
     if !state::probe_user_read(buffer, Context::SIZE) {
         return Ok(STATUS_ACCESS_VIOLATION);
+    }
+    // O CONTEXT_EX do CONTEXT_XSTATE é conferido antes de qualquer escrita.
+    if context_xstate::requested(flags) {
+        let status = state::guarded(|| Ok(context_xstate::user_chunk(buffer)?.err().unwrap_or(0)))?;
+        if status != 0 {
+            return Ok(status);
+        }
     }
     let image = match guest::try_read_bytes(buffer, Context::SIZE as usize) {
         Ok(image) => image,
@@ -263,7 +277,13 @@ pub fn get(thread: u64, buffer: u64) -> Result<u32, KernelError> {
     let result = match context_apc::execute(thread, Box::new(move || read_saved(thread, storage))) {
         Ok(status) if status & 0x8000_0000 != 0 => Ok(status),
         Ok(_) if !state::probe_user_write(buffer, Context::SIZE) => Ok(STATUS_ACCESS_VIOLATION),
-        Ok(_) => state::guarded(|| write_back(copy, state::user_struct::<Context>(buffer)?)),
+        Ok(_) => state::guarded(|| {
+            let status = write_back(copy, state::user_struct::<Context>(buffer)?)?;
+            if status != 0 || !context_xstate::requested(flags) {
+                return Ok(status);
+            }
+            context_xstate::write_user(thread, buffer)
+        }),
         Err(error) => Err(error),
     };
     guest::free_bytes(storage);

@@ -1,10 +1,14 @@
 //! Entrega de primeira chance à NTDLL instalada.
 //!
 //! O despacho VEH/SEH e as rotinas de desenrolamento da própria NTDLL rodam
-//! no anel 3; nenhum tratador específico de aplicação aqui. Layout do frame
-//! verificado no KiUserExceptionDispatcher e no seu .pdata (19041): CONTEXT
-//! em 0, CONTEXT_EX em 0x4D0, EXCEPTION_RECORD em 0x4F0 e machine frame em
-//! 0x590.
+//! no anel 3; nenhum tratador específico de aplicação aqui. O frame é o do
+//! KiDispatchException do ntoskrnl 19041 (e do .pdata do
+//! KiUserExceptionDispatcher): a partir do RSP novo, CONTEXT em 0, CONTEXT_EX
+//! em 0x4D0, EXCEPTION_RECORD em 0x4F0 e machine frame em 0x590. Com
+//! KF_XSTATE o CONTEXT leva CONTEXT_XSTATE (0x10005F) e o pedaço XSTATE fica
+//! acima do machine frame, logo abaixo do RSP interrompido, alinhado a 64:
+//! XState.Offset aponta para ele e XState.Length vai até o RSP original;
+//! All cobre do CONTEXT ao RSP original.
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
@@ -14,10 +18,13 @@ use core::mem::offset_of;
 use super::threads::{self, UserThread};
 use super::{index, state, syscalls_core};
 use crate::hal::amd64::usermode;
-use crate::ntos::inc::types::{Context, ContextEx, ExceptionRecord, MachineFrame, NtStruct, XsaveFormat};
+use crate::ntos::inc::types::{Context, ContextEx, Eprocess, ExceptionRecord, MachineFrame, NtStruct, XsaveFormat};
 use crate::ntos::kd::debug_service;
+use crate::ntos::ke::{processor_identity, xsave};
 use crate::ntos::mm::page_residency;
 use crate::ntos::ps::context::registers::{self, INTEGER};
+use crate::ntos::ps::context::xstate::{self as context_xstate, Extended};
+use crate::ntos::rtl::extended_context;
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
 
@@ -28,16 +35,33 @@ const RECORD_SIZE: u64 = ExceptionRecord::SIZE;
 const CONTEXT_EX_OFFSET: u64 = CONTEXT_SIZE;
 const RECORD_OFFSET: u64 = 0x4F0;
 const MACHINE_OFFSET: u64 = 0x590;
-const FRAME_SIZE: u64 = 0x5C0;
+/// O machine frame (0x28 bytes) e o registro (0x98, numa faixa de 0xA0).
+const MACHINE_SIZE: u64 = 0x28;
+const RECORD_SLOT: u64 = 0xA0;
+/// ContextFlags do frame: CONTEXT_CONTROL, INTEGER, SEGMENTS,
+/// FLOATING_POINT e DEBUG_REGISTERS; com KF_XSTATE, CONTEXT_XSTATE também.
+const FRAME_FLAGS: u32 = 0x10_001F;
+const FRAME_FLAGS_XSTATE: u32 = 0x10_005F;
+/// O CET_U, que só vai à máscara de compactação num processo com pilhas de
+/// sombra de usuário.
+const CET_USER: u64 = 1 << 11;
 /// O serviço de depuração (`int 0x2D`), que o anel 3 chama pelo portão de
 /// DPL 3 da IDT.
 const DEBUG_SERVICE_VECTOR: u32 = 0x2D;
 
-const _: () = assert!(CONTEXT_EX_OFFSET + ContextEx::SIZE <= RECORD_OFFSET && RECORD_OFFSET + RECORD_SIZE <= MACHINE_OFFSET && MACHINE_OFFSET + MachineFrame::SIZE <= FRAME_SIZE);
+const _: () = assert!(CONTEXT_EX_OFFSET + ContextEx::SIZE <= RECORD_OFFSET && RECORD_OFFSET + RECORD_SIZE <= MACHINE_OFFSET && MachineFrame::SIZE <= MACHINE_SIZE);
+const _: () = assert!(RECORD_OFFSET + RECORD_SLOT == MACHINE_OFFSET && CONTEXT_EX_OFFSET + 0x20 == RECORD_OFFSET);
 
 /// Exceção levantada pelo NtRaiseException, aplicada depois que a HAL salva
-/// o retorno da syscall (por thread).
-static PENDING: SpinLock<BTreeMap<u64, (Vec<u8>, Vec<u8>)>> = SpinLock::new(BTreeMap::new());
+/// o retorno da syscall (por thread): o CONTEXT, o registro e, com
+/// CONTEXT_XSTATE, o pedaço XSTATE capturado.
+static PENDING: SpinLock<BTreeMap<u64, Pending>> = SpinLock::new(BTreeMap::new());
+
+struct Pending {
+    context: Vec<u8>,
+    record: Vec<u8>,
+    xstate: Option<Extended>,
+}
 
 fn u32_at(bytes: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes([bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]])
@@ -60,8 +84,15 @@ pub fn validate_context(pointer: u64) -> u32 {
     let checked = (|| -> Result<u32, KernelError> {
         let context = state::user_struct::<Context>(pointer)?;
         let flags = context.context_flags.probe_get()?;
-        if flags & 0x10_0003 != 0x10_0003 || flags & 0x40 != 0 {
+        if flags & 0x10_0003 != 0x10_0003 {
             return Ok(0xC000_000D);
+        }
+        // CONTEXT_XSTATE: os flags do RtlpValidateContextFlags (sem recursos
+        // habilitados, STATUS_NOT_SUPPORTED).
+        if flags & 0x40 != 0 {
+            if let Err(status) = extended_context::validate_context_flags(flags) {
+                return Ok(status);
+            }
         }
         if flags & 8 != 0 && context.flt_save.mx_csr.probe_get()? & !0xFFFF != 0 {
             return Ok(0xC000_000D);
@@ -76,41 +107,103 @@ pub fn validate_context(pointer: u64) -> u32 {
     checked.unwrap_or_else(|error| error.status)
 }
 
+/// A máscara de compactação do CONTEXT do despacho: com a compactação,
+/// EnabledFeatures | supervisor visível, sem o CET_U fora de um processo com
+/// pilhas de sombra; sem ela, zero (o tamanho é o XState.Size).
+fn dispatch_compaction_mask(thread: &UserThread) -> u64 {
+    if !xsave::compaction() {
+        return 0;
+    }
+    let mut mask = xsave::enabled_features() | xsave::enabled_user_visible_supervisor_features();
+    if mask & CET_USER != 0 {
+        let process = thread.with(|thread| thread.process_pointer);
+        // SAFETY: o EPROCESS dono da thread viva.
+        let shadow = process != 0 && unsafe { Eprocess::at(process) }.mitigation_flags2_values.cet_user_shadow_stacks() != 0;
+        if !shadow {
+            mask &= !CET_USER;
+        }
+    }
+    mask
+}
+
 /// Monta o frame do KiUserExceptionDispatcher na pilha de usuário e desvia
 /// o CONTEXT salvo para ele.
 pub fn deliver(thread: &UserThread, record: &[u8]) -> u32 {
     let dispatcher = state::with(|state| state.ntdll_exports.as_ref().and_then(|exports| exports.get("KiUserExceptionDispatcher").copied()));
     let Some(dispatcher) = dispatcher.filter(|&dispatcher| state::probe_user_read(dispatcher, 1)) else { return 0xC000_0139 };
     let live = live_context(thread);
-    let stack = (live.rsp.get().wrapping_sub(FRAME_SIZE)) & !15;
+    let with_xstate = processor_identity::feature_bits() & processor_identity::kf::XSTATE != 0;
+    let flags = if with_xstate { FRAME_FLAGS_XSTATE } else { FRAME_FLAGS };
+    // O CONTEXT do kernel (RtlGetExtendedContextLength2 e
+    // RtlInitializeExtendedContext2) com o estado da thread
+    // (KeContextFromKframes).
+    let mask = if with_xstate { dispatch_compaction_mask(thread) } else { 0 };
+    let length = match extended_context::extended_context_length2(flags, mask) {
+        Ok(length) => length,
+        Err(status) => return status,
+    };
+    let buffer = guest::alloc_aligned(length as u64, 16, true);
+    if buffer == 0 {
+        return 0xC000_0017;
+    }
+    let kernel = (buffer + 0xF) & !0xF;
+    guest::write_bytes(kernel, &guest::read_bytes(live.address(), CONTEXT_SIZE as usize));
+    let kernel_ex = match extended_context::initialize_extended_context2(buffer, flags, mask) {
+        Ok(context_ex) => context_ex,
+        Err(status) => {
+            guest::free_bytes(buffer);
+            return status;
+        }
+    };
+    let (kernel_chunk, chunk_length) = extended_context::xstate_chunk(kernel_ex);
+    if with_xstate {
+        let area = crate::ntos::ke::xstate::user_state_area(thread.pointer());
+        crate::ntos::ke::xstate::copy_area(kernel_chunk - xsave::LEGACY_SIZE as u64, xsave::enabled_features() & !xsave::feature::LEGACY, area);
+    }
+    let user_rsp = live.rsp.get();
+    let xstate_start = if with_xstate { user_rsp.wrapping_sub(chunk_length as u64) & !0x3F } else { user_rsp };
+    let machine = xstate_start.wrapping_sub(MACHINE_SIZE) & !0xF;
+    let stack = machine.wrapping_sub(MACHINE_OFFSET);
+    let total = user_rsp.wrapping_sub(stack);
     // Falha sem escrever nada quando o usuário não pode receber o frame; o
     // crescimento da pilha/guard page exige o suporte separado do Mm.
-    if !state::probe_user_write(stack, FRAME_SIZE) {
+    if stack > user_rsp || !state::probe_user_write(stack, total) {
+        guest::free_bytes(buffer);
         return 0xC000_00FD;
     }
     // Um tratador nunca restaura IOPL/NT/VM/VIF/VIP pelo RtlRestoreContext.
     let eflags = (live.e_flags.get() & !0x1A_7000) | 0x202;
-    let written = (|| -> Result<(), KernelError> {
-        guest::try_write_bytes(stack, &alloc::vec![0; FRAME_SIZE as usize])?;
-        guest::try_write_bytes(stack, &guest::read_bytes(live.address(), CONTEXT_SIZE as usize))?;
-        let saved = state::user_struct::<Context>(stack)?;
-        saved.e_flags.probe_set(eflags)?;
-        // Faixas relativas do CONTEXT_EX: bloco inteiro e CONTEXT legado, sem XSTATE.
-        let extension = state::user_struct::<ContextEx>(stack + CONTEXT_EX_OFFSET)?;
-        extension.all.offset.probe_set(-(CONTEXT_SIZE as i32))?;
-        extension.all.length.probe_set(RECORD_OFFSET as u32)?;
-        extension.legacy.offset.probe_set(-(CONTEXT_SIZE as i32))?;
-        extension.legacy.length.probe_set(CONTEXT_SIZE as u32)?;
-        guest::try_write_bytes(stack + RECORD_OFFSET, record)?;
-        let machine = state::user_struct::<MachineFrame>(stack + MACHINE_OFFSET)?;
-        machine.rip.probe_set(live.rip.get())?;
-        machine.seg_cs.probe_set(live.seg_cs.get())?;
-        machine.e_flags.probe_set(eflags)?;
-        machine.rsp.probe_set(live.rsp.get())?;
-        machine.seg_ss.probe_set(live.seg_ss.get())
-    })();
-    if written.is_err() {
-        return 0xC000_00FD;
+    // O frame inteiro num espelho do kernel, escrito de uma vez.
+    let image = guest::alloc_bytes(total);
+    if image == 0 {
+        guest::free_bytes(buffer);
+        return 0xC000_0017;
+    }
+    let at = |address: u64| image + (address - stack);
+    guest::write_bytes(at(stack), &guest::read_bytes(kernel, CONTEXT_SIZE as usize));
+    // SAFETY: o CONTEXT, o CONTEXT_EX e o machine frame do espelho.
+    let (saved, extension, machine_frame) = unsafe { (Context::at(at(stack)), ContextEx::at(at(stack + CONTEXT_EX_OFFSET)), MachineFrame::at(at(machine))) };
+    saved.e_flags.set(eflags);
+    let context_ex = stack + CONTEXT_EX_OFFSET;
+    extension.all.offset.set(-(CONTEXT_SIZE as i32));
+    extension.all.length.set(total as u32);
+    extension.legacy.offset.set(-(CONTEXT_SIZE as i32));
+    extension.legacy.length.set(CONTEXT_SIZE as u32);
+    extension.x_state.offset.set(xstate_start.wrapping_sub(context_ex) as i32);
+    extension.x_state.length.set((user_rsp - xstate_start) as u32);
+    guest::write_bytes(at(stack + RECORD_OFFSET), record);
+    machine_frame.rip.set(live.rip.get());
+    machine_frame.seg_cs.set(live.seg_cs.get());
+    machine_frame.e_flags.set(eflags);
+    machine_frame.rsp.set(user_rsp);
+    machine_frame.seg_ss.set(live.seg_ss.get());
+    // RtlpCopyExtendedContext(1, ...): o pedaço XSTATE do kernel no do frame.
+    let copied = if with_xstate { extended_context::copy_xstate_chunk(at(context_ex), at(context_ex), kernel_ex, kernel_ex).err().unwrap_or(0) } else { 0 };
+    let written = copied == 0 && guest::try_write_bytes(stack, &guest::read_bytes(image, total as usize)).is_ok();
+    guest::free_bytes(image);
+    guest::free_bytes(buffer);
+    if !written {
+        return if copied != 0 { copied } else { 0xC000_00FD };
     }
     live.rsp.set(stack);
     live.rip.set(dispatcher);
@@ -209,7 +302,16 @@ pub fn raise(record: u64, context: u64, first_chance: u64) -> Result<u32, Kernel
         }
         let Some(thread) = threads::current() else { return Ok(0xC000_00BB) };
         let saved = guest::try_read_bytes(context, CONTEXT_SIZE as usize)?;
-        PENDING.lock().insert(thread.thread_id, (saved, captured));
+        let flags = u32_at(&saved, offset_of!(Context, context_flags));
+        let xstate = if context_xstate::requested(flags) {
+            match context_xstate::capture_user(context, flags)? {
+                Ok(extended) => Some(extended),
+                Err(status) => return Ok(status),
+            }
+        } else {
+            None
+        };
+        PENDING.lock().insert(thread.thread_id, Pending { context: saved, record: captured, xstate });
         thread.with(|thread| thread.pending_exception = true);
         Ok(0)
     })
@@ -218,8 +320,13 @@ pub fn raise(record: u64, context: u64, first_chance: u64) -> Result<u32, Kernel
 /// Aplica a exceção pendente ao CONTEXT vivo e a entrega.
 pub fn pending(thread: &UserThread) -> u32 {
     thread.with(|thread| thread.pending_exception = false);
-    let Some((saved, record)) = PENDING.lock().remove(&thread.thread_id) else { return 0 };
+    let Some(Pending { context: saved, record, xstate }) = PENDING.lock().remove(&thread.thread_id) else { return 0 };
     let live = live_context(thread);
+    // O pedaço XSTATE vai à área da thread (KxContextToKframes; o intervalo
+    // já terminou, então o estado não está na CPU).
+    if let Some(extended) = xstate.as_ref() {
+        context_xstate::apply_to_thread(extended, thread.pointer());
+    }
     // RtlCaptureContext não inicializa todos os grupos (notavelmente
     // DR0..DR7): os campos não selecionados da thread viva são preservados.
     let flags = u32_at(&saved, offset_of!(Context, context_flags));

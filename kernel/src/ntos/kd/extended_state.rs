@@ -7,11 +7,13 @@
 //! | 79    | dr6                    | 8     |
 //! | 80    | dr7                    | 8     |
 //!
-//! A metade alta dos YMM sai de um XSAVE do componente AVX no próprio
-//! processador da parada, quando o sistema ligou o XSAVE (CR4.OSXSAVE) e o
-//! AVX no XCR0; senão, e nos processadores congelados, fica indisponível.
-//! O código do kernel não usa SSE nem AVX, então os registradores da CPU
-//! ainda são os do código interrompido.
+//! A metade alta dos YMM: numa parada do kernel, de um XSAVE do componente
+//! AVX no próprio processador da parada (o código do kernel não usa AVX,
+//! então os registradores ainda são os do código interrompido); numa parada
+//! de usuário, da área de XSAVE com o estado de usuário da thread
+//! (`ke::xstate::user_state_area`), onde o fim do intervalo o deixou. Sem o
+//! XSAVE ligado (CR4.OSXSAVE) e o AVX no XCR0, e nos processadores
+//! congelados, fica indisponível.
 //!
 //! Os registradores de depuração: numa parada de usuário, os do CONTEXT da
 //! thread (o banco que ela carrega no anel 3); numa parada do kernel, o
@@ -91,6 +93,14 @@ pub fn read(number: usize, owner: bool, context: Option<u64>, output: &mut [u8])
                 return false;
             }
             let Some(offset) = avx_offset() else { return false };
+            if context.is_some() {
+                let area = crate::ntos::ke::xstate::user_state_area(crate::ntos::ps::process::get_current_thread());
+                let Some(bytes) = crate::ntos::ke::xstate::feature_bytes(area, 2) else { return false };
+                let start = (number - YMM_HIGH_FIRST) * 16;
+                let Some(half) = bytes.get(start..start + 16) else { return false };
+                output[..16].copy_from_slice(half);
+                return true;
+            }
             let area = AREA.0.get() as u64;
             // SAFETY: XSAVE64 só do componente AVX (EDX:EAX = 4) na área
             // alinhada, com o OSXSAVE ligado; escrito como bytes porque o

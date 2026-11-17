@@ -5,6 +5,7 @@
 pub mod irqstubs;
 pub mod usermode;
 pub mod context_switch;
+pub mod extended_state;
 pub mod aptrampoline;
 pub mod win32_thunk;
 pub mod native_call;

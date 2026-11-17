@@ -514,9 +514,10 @@ pub static GROUP_LAYOUT: &[(&str, usize, usize)] = &[
     ("nt-build-number", 2059, 0),
     ("time-keeping", 2059, 14),
     ("ke-processor-profile", 2073, 1),
+    ("ke-xstate-support", 2074, 4),
 ];
 
-/// Os 2074 exports de função, na ordem da ABI.
+/// Os 2078 exports de função, na ordem da ABI.
 pub static EXPORT_NAMES: &[&str] = &[
     "DbgPrint",
     "DbgPrintEx",
@@ -2592,4 +2593,8 @@ pub static EXPORT_NAMES: &[&str] = &[
     "ZwSetTimerResolution",
     "ZwSetSystemTime",
     "KeAllocateProcessorProfileStructures",
+    "KeSaveFloatingPointState",
+    "KeRestoreFloatingPointState",
+    "KeGetXSaveFeatureFlags",
+    "RtlGetEnabledExtendedAndSupervisorFeatures",
 ];

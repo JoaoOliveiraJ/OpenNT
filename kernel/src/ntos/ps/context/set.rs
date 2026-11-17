@@ -69,8 +69,9 @@ pub fn begin(thread: u64, input: u64, probe_mode: u8, context_mode: u8, flags: u
         guest::write::<u16>(captured.source + core::mem::offset_of!(Context, seg_cs) as u64, 0x33);
     }
     let source = captured.source;
+    let xstate = captured.xstate.take();
     let captured = alloc::sync::Arc::new(SpinLock::new(captured));
-    let operation: context_apc::Operation = Box::new(move || if context_mode != 0 { crate::ntos::ps::user::set_thread_context::apply(thread, source) } else { kernel_context_frame::apply_kernel(source) });
+    let operation: context_apc::Operation = Box::new(move || if context_mode != 0 { crate::ntos::ps::user::set_thread_context::apply(thread, source, xstate.as_ref()) } else { kernel_context_frame::apply_kernel(source) });
     match context_apc::begin(thread, operation) {
         Ok(request) => Ok(Operation::Pending { request, captured }),
         Err(error) => {
