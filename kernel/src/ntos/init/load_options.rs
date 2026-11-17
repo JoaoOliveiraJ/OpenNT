@@ -60,6 +60,9 @@ pub const NET: &str = "NET";
 /// O teste de pressão de memória sobre o arquivo de paginação, no boot do
 /// smss (`test/memory_pressure.rs`).
 pub const MEMORY_PRESSURE: &str = "MEMORYPRESSURE";
+/// A máquina tem um TPM 2.0 (tpm-crb do QEMU): o tpm.sys real sobe pelo PnP
+/// e o kernel manda comandos a ele pelo tbs.sys.
+pub const TPM: &str = "TPM";
 
 /// O valor de `NOME=valor`.
 pub fn value<'a>(text: &'a str, name: &str) -> Option<&'a str> {

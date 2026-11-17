@@ -23,6 +23,8 @@
 //! depurador do kernel na COM2), `--shutdown-test=poweroff|reboot` (o teste do desligamento),
 //! `--usb` (também opção de máquina: a controladora xHCI com teclado e tablet USB),
 //! `--net` (também opção de máquina: a placa de rede e1000 com a rede de modo usuário do QEMU),
+//! `--tpm` (também opção de máquina: um TPM 2.0 tpm-crb sobre o simulador de TPM, em
+//! `run` e `test-boot`),
 //! `--memory-pressure` (o teste de pressão de memória sobre o arquivo de paginação do boot do
 //! smss).
 //! O kernel dos builds comuns leva só as tabelas de linha do DWARF; o `debug` compila o perfil
@@ -91,6 +93,7 @@ opcoes de build:   --release --build-dir=DIR --user-program=shell
                    --pnp-root=acpi|internal (raiz da arvore de dispositivos; padrao acpi)
                    --usb (controladora xHCI com teclado e tablet USB)
                    --net (placa de rede e1000 com a rede de modo usuario do QEMU)
+                   --tpm (TPM 2.0 tpm-crb sobre o simulador de TPM; run e test-boot)
                    --kd=com2 (depurador do kernel na COM2)
                    --shutdown-test=poweroff|reboot (com --start-driver=ntfs: grava e desliga)
                    --memory-pressure (com --initial-process=smss: teste de pressao de memoria
@@ -176,6 +179,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             usb: false,
             net: false,
             memory_pressure: false,
+            tpm: false,
         },
         // O test-boot roda no WHPX quando a máquina o tem (`auto`); o `run`
         // e o `debug` ficam no TCG, que o rastro de instruções do depurador
@@ -187,6 +191,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             kd_port: None,
             usb: false,
             net: false,
+            tpm: false,
             monitor_port: None,
         },
         positional: Vec::new(),
@@ -245,6 +250,10 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             "--net" => {
                 parsed.build.net = true;
                 parsed.machine.net = true;
+            }
+            "--tpm" => {
+                parsed.build.tpm = true;
+                parsed.machine.tpm = true;
             }
             "--kd-port" => parsed.machine.kd_port = Some(required()?.parse().map_err(|_| "--kd-port invalido")?),
             "--monitor-port" => parsed.machine.monitor_port = Some(required()?.parse().map_err(|_| "--monitor-port invalido")?),

@@ -165,6 +165,13 @@ pub fn network() -> bool {
     flag(name::NET)
 }
 
+/// `TPM` (`--tpm`): a máquina tem um TPM 2.0 com interface CRB; o tpm.sys
+/// real sobe pelo PnP no ACPI\MSFT0101 e o kernel confere uma ida e volta de
+/// comandos pelo tbs.sys (`drivers/security/tpm_stack.rs`).
+pub fn tpm() -> bool {
+    flag(name::TPM)
+}
+
 /// `MEMORYPRESSURE` (`--memory-pressure`): depois que o smss cria o arquivo
 /// de paginação, um programa de usuário comita mais memória que a RAM e a
 /// relê (`test/memory_pressure.rs`).

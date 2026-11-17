@@ -36,6 +36,9 @@ pub struct MachineOptions {
     /// 8086:100E) com a rede de modo usuário (slirp: a rede 10.0.2.0/24, o
     /// gateway 10.0.2.2 e o DHCP do QEMU).
     pub net: bool,
+    /// `--tpm`: um TPM 2.0 com interface CRB (tpm-crb, ACPI MSFT0101 e a
+    /// tabela TPM2) sobre o simulador de TPM ([`TpmSimulator`]).
+    pub tpm: bool,
     /// Porta TCP do monitor HMP (o rastro rápido do depurador gráfico liga
     /// o log de execução do QEMU por ele), se houver.
     pub monitor_port: Option<u16>,
@@ -280,9 +283,101 @@ fn whpx_machine(machine: &MachineOptions) -> String {
     if machine.accelerator == "whpx" { "pc,kernel-irqchip=off" } else { "pc" }.to_string()
 }
 
+/// O simulador de TPM 2.0 do `--tpm`: o `tpm_server.exe` (variável
+/// `TPM_SIMULATOR`, ou ao lado do QEMU), que atende o protocolo TCP do
+/// simulador de referência numa porta de comandos e na seguinte, de
+/// plataforma (energia e NV). O backend `mssim` do QEMU fala com ele e o
+/// `tpm-crb` o expõe ao convidado. O estado NV (o arquivo `NVChip`) e o log
+/// do simulador ficam na pasta temporária do QEMU ([`QEMU_TEMP_DIR`]), que
+/// sai com a execução; o `-rm` começa de um TPM recém-fabricado. O processo
+/// morre no `drop`, antes da pasta.
+pub struct TpmSimulator {
+    process: Child,
+    pub port: u16,
+}
+
+/// Localiza o simulador de TPM 2.0.
+pub fn find_tpm_simulator() -> Result<PathBuf, String> {
+    if let Ok(path) = std::env::var("TPM_SIMULATOR") {
+        return Ok(PathBuf::from(path));
+    }
+    let beside = find_qemu()?.with_file_name("tpm_server.exe");
+    if beside.exists() {
+        return Ok(beside);
+    }
+    Err(format!("simulador de TPM nao encontrado: {} ausente (defina TPM_SIMULATOR)", beside.display()))
+}
+
+/// Uma porta local livre cuja seguinte também está livre (comandos e
+/// plataforma do simulador).
+fn free_port_pair() -> Result<u16, String> {
+    for _ in 0..64 {
+        let port = free_port()?;
+        if port < u16::MAX && TcpListener::bind(("127.0.0.1", port)).is_ok() && TcpListener::bind(("127.0.0.1", port + 1)).is_ok() {
+            return Ok(port);
+        }
+    }
+    Err("sem duas portas TCP seguidas livres para o simulador de TPM".into())
+}
+
+impl TpmSimulator {
+    /// Sobe o simulador com o estado em `directory` e espera as duas portas.
+    pub fn start(directory: &Path) -> Result<TpmSimulator, String> {
+        let program = find_tpm_simulator()?;
+        let port = free_port_pair()?;
+        let log = std::fs::File::create(directory.join("tpm_server.log")).map_err(|error| format!("{}: {error}", directory.display()))?;
+        let errors = log.try_clone().map_err(|error| error.to_string())?;
+        let process = Command::new(&program)
+            .args(["-port", &port.to_string(), "-rm"])
+            .current_dir(directory)
+            .stdin(Stdio::null())
+            .stdout(log)
+            .stderr(errors)
+            .spawn()
+            .map_err(|error| format!("{}: {error}", program.display()))?;
+        let mut simulator = TpmSimulator { process, port };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        for listening in [port + 1, port] {
+            loop {
+                if TcpStream::connect(("127.0.0.1", listening)).is_ok() {
+                    break;
+                }
+                if let Ok(Some(status)) = simulator.process.try_wait() {
+                    return Err(format!("o simulador de TPM saiu ({status}); log em {}", directory.join("tpm_server.log").display()));
+                }
+                if Instant::now() > deadline {
+                    return Err(format!("o simulador de TPM nao abriu a porta {listening}"));
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+        println!("simulador de TPM 2.0 nas portas {port} e {}", port + 1);
+        Ok(simulator)
+    }
+}
+
+impl Drop for TpmSimulator {
+    fn drop(&mut self) {
+        let _ = self.process.kill();
+        let _ = self.process.wait();
+    }
+}
+
+/// O backend e o dispositivo do TPM: o `mssim` ligado ao simulador e o
+/// `tpm-crb` (start method 7 na tabela TPM2, o dispositivo MSFT0101 no
+/// \_SB da DSDT).
+fn tpm_arguments(port: u16) -> Vec<String> {
+    vec![
+        "-tpmdev".to_string(),
+        format!("mssim,id=tpm0,host=127.0.0.1,port={port}"),
+        "-device".to_string(),
+        "tpm-crb,tpmdev=tpm0".to_string(),
+    ]
+}
+
 /// Os argumentos da máquina; `no_reboot` faz o reinício do convidado
-/// encerrar o QEMU.
-fn machine_arguments(disks: &Disks, machine: &MachineOptions, no_reboot: bool) -> Vec<String> {
+/// encerrar o QEMU; `tpm` é a porta do simulador de TPM (`--tpm`).
+fn machine_arguments(disks: &Disks, machine: &MachineOptions, no_reboot: bool, tpm: Option<u16>) -> Vec<String> {
     let mut arguments = vec![
         "-accel".to_string(),
         // No WHPX, um RDMSR/WRMSR de MSR não suportado precisa gerar #GP (como
@@ -337,6 +432,9 @@ fn machine_arguments(disks: &Disks, machine: &MachineOptions, no_reboot: bool) -
     if machine.net {
         arguments.extend(["-netdev", "user,id=net0", "-device", "e1000,netdev=net0,mac=52:54:00:12:34:56"].map(String::from));
     }
+    if let Some(port) = tpm {
+        arguments.extend(tpm_arguments(port));
+    }
     arguments
 }
 
@@ -351,9 +449,12 @@ pub fn spawn(disks: &Disks, machine: &MachineOptions, log: &Path, window: bool) 
 /// O `spawn` com os argumentos da máquina ajustados por `adjust` (os
 /// discos e o relógio do `debug --vm-snapshots | --record | --replay`).
 pub fn spawn_adjusted(disks: &Disks, machine: &MachineOptions, log: &Path, window: bool, adjust: impl FnOnce(Vec<String>) -> Result<Vec<String>, String>) -> Result<Child, String> {
+    if machine.tpm {
+        return Err("--tpm vale no run e no test-boot".into());
+    }
     let qemu = find_qemu()?;
     let temp = QemuTemp::beside(log)?;
-    let mut arguments = adjust(machine_arguments(disks, machine, true))?;
+    let mut arguments = adjust(machine_arguments(disks, machine, true, None))?;
     if !window {
         arguments.extend(["-display".to_string(), "none".to_string()]);
     }
@@ -373,7 +474,8 @@ pub fn spawn_adjusted(disks: &Disks, machine: &MachineOptions, log: &Path, windo
 pub fn run(disks: &Disks, machine: &MachineOptions) -> Result<(), String> {
     let qemu = find_qemu()?;
     let temp = QemuTemp::beside(&disks.boot)?;
-    let mut arguments = machine_arguments(disks, machine, true);
+    let simulator = if machine.tpm { Some(TpmSimulator::start(temp.path())?) } else { None };
+    let mut arguments = machine_arguments(disks, machine, true, simulator.as_ref().map(|simulator| simulator.port));
     arguments.extend(["-serial".to_string(), "stdio".to_string()]);
     arguments.extend(kd_serial(machine));
     if let Some(port) = machine.kd_port {
@@ -958,7 +1060,13 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
         Some(copy) => Disks { boot: disks.boot.clone(), data: Some(copy.clone()), data_snapshot: false, nvme: disks.nvme.clone(), nvme_snapshot: disks.nvme_snapshot },
         None => Disks { boot: disks.boot.clone(), data: disks.data.clone(), data_snapshot: disks.data_snapshot, nvme: disks.nvme.clone(), nvme_snapshot: disks.nvme_snapshot },
     };
-    let mut arguments = machine_arguments(&disks, machine, !test.allow_reboot);
+    // A pasta temporária sai depois do QEMU e do simulador de TPM: declarada
+    // antes dos dois, ela é solta depois deles também nos retornos de erro.
+    let temp = QemuTemp::beside(log)?;
+    // O simulador de TPM dura o teste inteiro: um religamento do QEMU o
+    // encontra com o estado NV que o boot anterior deixou.
+    let simulator = if machine.tpm { Some(TpmSimulator::start(temp.path())?) } else { None };
+    let mut arguments = machine_arguments(&disks, machine, !test.allow_reboot, simulator.as_ref().map(|simulator| simulator.port));
     arguments.extend([
         "-display".to_string(),
         "none".to_string(),
@@ -985,9 +1093,6 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
         None
     };
     arguments.extend(kd_serial(machine));
-    // A pasta temporária sai depois do QEMU: declarada antes da máquina, ela
-    // é solta depois dela também nos retornos de erro.
-    let temp = QemuTemp::beside(log)?;
     let output = Arc::new(Mutex::new(String::new()));
     let current = std::cell::RefCell::new(launch(&qemu, temp.path(), &arguments, &output, events_port)?);
     let cycles_left = std::cell::Cell::new(test.power_cycles);
@@ -1172,6 +1277,7 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
     }
     drop(machine.process);
     machine.reader.take();
+    drop(simulator);
     drop(temp);
     if let Some(copy) = &data_copy {
         let _ = std::fs::remove_file(copy);
@@ -1226,6 +1332,23 @@ mod tests {
         drop(temp);
         assert!(!directory.exists());
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Com `--tpm` a máquina ganha o backend `mssim` na porta do simulador e
+    /// o `tpm-crb`; sem ele, nenhum dos dois. As duas portas do simulador
+    /// (comandos e a seguinte, de plataforma) estão livres.
+    #[test]
+    fn tpm_machine_has_the_simulator_backend_and_the_crb_device() {
+        let disks = Disks { boot: PathBuf::from("os.img"), data: None, data_snapshot: false, nvme: None, nvme_snapshot: false };
+        let machine = MachineOptions { accelerator: "tcg".into(), memory_mb: 512, smp: 1, kd_port: None, usb: false, net: false, tpm: true, monitor_port: None };
+        let arguments = machine_arguments(&disks, &machine, true, Some(40_000));
+        let at = arguments.iter().position(|argument| argument == "-tpmdev").expect("-tpmdev");
+        assert_eq!(arguments[at + 1], "mssim,id=tpm0,host=127.0.0.1,port=40000");
+        assert_eq!(arguments[at + 2..at + 4], ["-device".to_string(), "tpm-crb,tpmdev=tpm0".to_string()]);
+        let plain = machine_arguments(&disks, &MachineOptions { tpm: false, ..machine }, true, None);
+        assert!(!plain.iter().any(|argument| argument.contains("tpm")));
+        let port = free_port_pair().unwrap();
+        assert!(TcpListener::bind(("127.0.0.1", port)).is_ok() && TcpListener::bind(("127.0.0.1", port + 1)).is_ok());
     }
 
     fn screen(width: usize, height: usize, fill: [u8; 3]) -> Image {

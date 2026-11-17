@@ -687,6 +687,14 @@ fn display_and_bridge_rows(assert: Assert) {
     assert(render.is_some_and(|driver| driver.inf == "basicrender.inf" && driver.section == "BasicRender" && driver.class.name == "System" && driver.service.is_some_and(|service| service.name == "BasicRender" && service.start == 1 && install::service_image_path(service) == basic_render)), "pnp-storage: ROOT\\BasicRender instala o BasicRender.sys do repositorio de drivers (basicrender.inf)");
     let monitor = |hardware: &[&str], section: &str| install::select_driver(&ids(hardware), &ids(&["*PNP09FF"])).is_some_and(|driver| driver.inf == "monitor.inf" && driver.section == section && driver.class.name == "Monitor" && driver.service.is_some_and(|service| service.name == "monitor" && install::service_image_path(service) == "\\SystemRoot\\System32\\drivers\\monitor.sys"));
     assert(monitor(&["MONITOR\\Default_Monitor"], "NonPnPMonitor.Install") && monitor(&["MONITOR\\MSI3DC9"], "PnPMonitor.Install"), "pnp-storage: MONITOR\\Default_Monitor e *PNP09FF instalam o monitor.sys (monitor.inf)");
+    // O TPM 2.0 que o acpi.sys relata (ids do MSFT0101), com a raiz ACPI: o
+    // tpm.inf com o serviço TPM sob demanda no grupo Boot Bus Extender, a
+    // classe SecurityDevices e o HardwareType 20 do TPM 2.0.
+    if crate::drivers::bus::acpi_stack::enabled() {
+        let tpm = install::select_driver(&ids(&["ACPI\\VEN_MSFT&DEV_0101", "ACPI\\MSFT0101", "*MSFT0101"]), &[]);
+        let hardware_type = tpm.is_some_and(|driver| driver.device_values.iter().any(|value| value.name == "HardwareType" && matches!(value.data, install::RegData::Dword(20))));
+        assert(tpm.is_some_and(|driver| driver.inf == "tpm.inf" && driver.section == "Tpm2BaseInstall" && driver.class.name == "SecurityDevices" && driver.service.is_some_and(|service| service.name == "TPM" && service.start == 3 && service.group == Some("Boot Bus Extender") && install::service_image_path(service) == "System32\\drivers\\tpm.sys")) && hardware_type, "pnp-storage: ACPI\\MSFT0101 instala o tpm.sys (tpm.inf, Tpm2BaseInstall, HardwareType 20)");
+    }
     let Some(adapter) = pci::devices().into_iter().find(|function| function.class_code == 0x03 && function.sub_class == 0x00) else {
         assert(false, "pnp-storage: adaptador VGA enumerado");
         return;

@@ -98,6 +98,9 @@ pub struct BuildOptions {
     /// `--memory-pressure`: o teste de pressão de memória sobre o arquivo de
     /// paginação do boot do smss.
     pub memory_pressure: bool,
+    /// `--tpm`: a máquina ganha um TPM 2.0 (tpm-crb sobre o simulador) e o
+    /// PnP sobe o tpm.sys real nele.
+    pub tpm: bool,
 }
 
 impl BuildOptions {
@@ -145,6 +148,9 @@ impl BuildOptions {
         if self.memory_pressure {
             words.push(String::from(name::MEMORY_PRESSURE));
         }
+        if self.tpm {
+            words.push(String::from(name::TPM));
+        }
         Ok(words.join(" "))
     }
 
@@ -189,6 +195,7 @@ impl BuildOptions {
             usb: false,
             net: false,
             memory_pressure: false,
+            tpm: false,
             ..self.clone()
         }
     }
@@ -423,6 +430,7 @@ mod tests {
             usb: false,
             net: false,
             memory_pressure: false,
+            tpm: false,
         }
     }
 
@@ -443,11 +451,12 @@ mod tests {
         options.shutdown_test = "reboot".into();
         options.usb = true;
         options.net = true;
+        options.tpm = true;
         let block = options.load_options_block().unwrap();
         assert_eq!(block.len(), load_options::BLOCK_SIZE);
         let text = load_options::text_of(&block).unwrap();
-        assert_eq!(text, "DEBUG DEBUGPORT=COM2 KERNELTESTSCOPE=all STARTDRIVER=NDIS,AFD INITIALPROCESS=smss DISPLAY=basic SHUTDOWNTEST=reboot TRACEDRIVERAPI CONSOLEMIRROR USB NET");
-        assert!(load_options::flag(text, load_options::DEBUG) && load_options::flag(text, "consolemirror") && load_options::flag(text, load_options::USB) && load_options::flag(text, load_options::NET));
+        assert_eq!(text, "DEBUG DEBUGPORT=COM2 KERNELTESTSCOPE=all STARTDRIVER=NDIS,AFD INITIALPROCESS=smss DISPLAY=basic SHUTDOWNTEST=reboot TRACEDRIVERAPI CONSOLEMIRROR USB NET TPM");
+        assert!(load_options::flag(text, load_options::DEBUG) && load_options::flag(text, "consolemirror") && load_options::flag(text, load_options::USB) && load_options::flag(text, load_options::NET) && load_options::flag(text, load_options::TPM));
         assert_eq!(load_options::value(text, load_options::START_DRIVER), Some("NDIS,AFD"));
         assert_eq!(load_options::value(text, load_options::STORAGE), None);
         assert!(!load_options::flag(text, load_options::DEBUG_PORT));
@@ -477,6 +486,7 @@ mod tests {
         driver.kd = "com2".into();
         driver.usb = true;
         driver.net = true;
+        driver.tpm = true;
         driver.build_dir = PathBuf::from("build/kd");
         assert_eq!(base.image_key(), driver.image_key());
         let mut smss = options();

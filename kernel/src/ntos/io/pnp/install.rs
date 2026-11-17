@@ -319,6 +319,29 @@ const ATAPI_HARDWARE: &[RegValue] = &[
     RegValue { subkey: "", name: "UseBusDeviceDesc", data: RegData::Dword(1) },
 ];
 
+/// tpm.inf `[Version]` (a classe SecurityDevices do c_securitydevices.inf,
+/// sem filtros).
+pub const CLASS_SECURITY_DEVICES: ClassSpec = ClassSpec { guid: "{d94ee5d8-d189-4994-83d2-f68d7d41b0e6}", name: "SecurityDevices", upper_filters: &[], lower_filters: &[] };
+/// tpm.inf `[TpmInstall.AddService]` com o `[TpmInstall.AddService.AddReg]`:
+/// SERVICE_DEMAND_START, SERVICE_ERROR_NORMAL, Group "Boot Bus Extender" e
+/// BootFlags = CM_SERVICE_MEASURED_BOOT_LOAD (0x20).
+const SERVICE_TPM: ServiceSpec = ServiceSpec {
+    name: "TPM",
+    display_name: Some("TPM"),
+    start: 3,
+    error_control: 1,
+    binary: "tpm.sys",
+    group: Some("Boot Bus Extender"),
+    owner: "tpm.inf",
+    values: &[RegValue { subkey: "", name: "BootFlags", data: RegData::Dword(0x20) }],
+};
+/// tpm.inf `[Tpm2BaseInstall.AddReg]` (`[Tpm2BaseInstall.HW]`, HKR = Device
+/// Parameters): HardwareType 20, o TPM 2.0 da tabela TPM2. O `Security` do
+/// `[TpmInstall.AddReg]` (a SDDL do dispositivo) não é um valor de Device
+/// Parameters: o instalador o grava como a propriedade de segurança do
+/// dispositivo, que o PnP ainda não aplica.
+const TPM2_HARDWARE: &[RegValue] = &[RegValue { subkey: "", name: "HardwareType", data: RegData::Dword(20) }];
+
 /// machine.inf `[NO_DRV_X_REG]` e `[NO_DRV_X_PNP_REG]` (HKR = chave do driver).
 const NO_DRV_X_VALUES: &[RegValue] = &[
     RegValue { subkey: "", name: "ResourcePickerExceptions", data: RegData::Text("IO@0-0xFF:*;IO:HAL,MBRES;IRQ:HAL,*") },
@@ -621,7 +644,8 @@ pub const DRIVERS: &[InfDriver] = &[
 
 /// As linhas de modelo do acpi.inf (`*pnp0c08` e `pnp0c08`, seção ACPI_Inst),
 /// do pci.inf (`*PNP0A03` e `*PNP0A08`, seção PCI_ROOT), do keyboard.inf
-/// (`*PNP0303`) e do msmouse.inf (`*PNP0F13`), que só a árvore
+/// (`*PNP0303`), do msmouse.inf (`*PNP0F13`) e do tpm.inf (`ACPI\MSFT0101`
+/// e `*MSFT0101`, seção Tpm2BaseInstall, o TPM 2.0), que só a árvore
 /// com a raiz ACPI (`--pnp-root=acpi`) usa: o acpi.sys no dispositivo ACPI da
 /// HAL e o pci.sys no barramento PCI que ele enumera.
 pub const ACPI_ROOT_DRIVERS: &[InfDriver] = &[
@@ -730,6 +754,41 @@ pub const ACPI_ROOT_DRIVERS: &[InfDriver] = &[
         class: &CLASS_MOUSE,
         driver_values: MOUSE_DRIVER,
         device_values: MOUSE_HARDWARE,
+        exclude_ids: &[],
+    },
+    // O TPM 2.0 que o acpi.sys relata no \_SB (o MSFT0101 da DSDT, com a
+    // tabela TPM2): tpm.inf `[Tpm2Base.NTamd64]`, as duas linhas na ordem do
+    // INF.
+    InfDriver {
+        inf: "tpm.inf",
+        section: "Tpm2BaseInstall",
+        id: "ACPI\\MSFT0101",
+        description_key: "TPM2_DESC",
+        description: "Trusted Platform Module 2.0",
+        manufacturer_key: "STD",
+        manufacturer: "(Standard)",
+        provider: "Microsoft",
+        driver_version: "10.0.19041.5794",
+        service: Some(&SERVICE_TPM),
+        class: &CLASS_SECURITY_DEVICES,
+        driver_values: &[],
+        device_values: TPM2_HARDWARE,
+        exclude_ids: &[],
+    },
+    InfDriver {
+        inf: "tpm.inf",
+        section: "Tpm2BaseInstall",
+        id: "*MSFT0101",
+        description_key: "TPM2_DESC",
+        description: "Trusted Platform Module 2.0",
+        manufacturer_key: "STD",
+        manufacturer: "(Standard)",
+        provider: "Microsoft",
+        driver_version: "10.0.19041.5794",
+        service: Some(&SERVICE_TPM),
+        class: &CLASS_SECURITY_DEVICES,
+        driver_values: &[],
+        device_values: TPM2_HARDWARE,
         exclude_ids: &[],
     },
 ];

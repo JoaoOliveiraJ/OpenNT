@@ -18,7 +18,7 @@
 //! e o monitor.inf), a pilha USB 3 e HID (usbxhci.sys, ucx01000.sys,
 //! usbhub3.sys, usbd.sys, hidusb.sys, hidclass.sys, hidparse.sys, kbdhid.sys
 //! e mouhid.sys), o miniport da placa e1000 (E1G6032E.sys, do repositório de
-//! drivers), os
+//! drivers), o TPM 2.0 (tpm.sys e tbs.sys), os
 //! arquivos que o vgk.sys abre pelo caminho
 //! completo, o PE do kernel e o próprio vgk.sys quando houver um: um
 //! `vgk.sys` na raiz do repositório ou o caminho em `OPENNT_VGK_SYS`.
@@ -238,6 +238,11 @@ const NTFS_FILES: &[(&str, &str)] = &[
     // System32\drivers (%12%), o ImagePath do serviço E1G60; nesta máquina
     // ele só está no repositório de drivers. O catálogo 0110 acima o cobre.
     ("E1G6032E.SYS", "System32/DriverStore/FileRepository/nete1g3e.inf_amd64_af58b4e19562a3f9/E1G6032E.sys"),
+    // O TPM 2.0 do `--tpm`: o tpm.sys, que o PnP instala no ACPI\MSFT0101
+    // pelo tpm.inf, e o tbs.sys, a API de TPM de kernel que manda comandos a
+    // ele.
+    ("TPM.SYS", "System32/drivers/tpm.sys"),
+    ("TBS.SYS", "System32/drivers/tbs.sys"),
     // O fastfat.sys real (`--start-driver=fastfat`) e o catálogo que o cobre.
     ("FASTFAT.SYS", "System32/drivers/fastfat.sys"),
     (

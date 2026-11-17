@@ -123,6 +123,9 @@ pub fn build() {
     if display_stack::enabled() {
         display_stack::check();
     }
+    if crate::drivers::security::tpm_stack::enabled() {
+        crate::drivers::security::tpm_stack::check();
+    }
 }
 
 /// `device` está na pilha acima de `pdo` (pela cadeia AttachedDevice). Com
