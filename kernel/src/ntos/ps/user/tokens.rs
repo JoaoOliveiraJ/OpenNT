@@ -293,6 +293,25 @@ fn nt_adjust_privileges_token(handle: u64, disable_all: u64, new_state: u64, buf
     crate::ntos::se::token::adjust::adjust_privileges(token, disable_all as u8 != 0, new_state, buffer_length as u32, previous_state, return_length)
 }
 
+/// NtAdjustGroupsToken(TokenHandle, ResetToDefault, NewState, BufferLength,
+/// PreviousState, ReturnLength): o handle com TOKEN_ADJUST_GROUPS (e
+/// TOKEN_QUERY quando há PreviousState); o resto em `se/token/adjust_groups`.
+fn nt_adjust_groups_token(handle: u64, reset: u64, new_state: u64, buffer_length: u64, rsp: u64) -> Result<u32, KernelError> {
+    if !state::probe_syscall_stack(rsp, 16) {
+        return Ok(0xC000_0005);
+    }
+    let (previous_state, return_length) = (stack_arg(rsp, 5), stack_arg(rsp, 6));
+    if reset as u8 == 0 && new_state == 0 {
+        return Ok(0xC000_000D);
+    }
+    let access = 0x40 | if previous_state != 0 { 8 } else { 0 };
+    let token = match lookup(token_argument(1, handle), access) {
+        Ok(token) => token,
+        Err(status) => return Ok(status),
+    };
+    crate::ntos::se::token::adjust_groups::adjust_groups(token, reset as u8 != 0, new_state, buffer_length as u32, previous_state, return_length)
+}
+
 /// NtCreateToken(TokenHandle, DesiredAccess, ObjectAttributes, TokenType,
 /// AuthenticationId, ExpirationTime, User, Groups, Privileges, Owner,
 /// PrimaryGroup, DefaultDacl, TokenSource): o NtCreateTokenEx sem atributos
@@ -519,6 +538,7 @@ pub fn init() {
     state::register_handler("NtSetInformationToken", nt_set_information_token);
     state::register_handler("NtCreateTokenEx", nt_create_token_ex);
     state::register_handler("NtAdjustPrivilegesToken", nt_adjust_privileges_token);
+    state::register_handler("NtAdjustGroupsToken", nt_adjust_groups_token);
     state::register_handler("NtOpenProcessToken", nt_open_process_token);
     state::register_handler("NtOpenProcessTokenEx", nt_open_process_token_ex);
     state::register_handler("NtImpersonateAnonymousToken", nt_impersonate_anonymous_token);

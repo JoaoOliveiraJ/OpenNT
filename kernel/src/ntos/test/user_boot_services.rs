@@ -7,7 +7,8 @@
 //! tamanho fixo do NtQuerySystemInformation (`ex/system_information`) e os
 //! vizinhos NtPulseEvent, NtSetEventBoostPriority e NtQueryDirectoryObject,
 //! e o objeto Timer do Executive de modo usuário (NtCreateTimer, NtSetTimer
-//! e NtCancelTimer, que o WUDFPlatform.dll do services.exe pede).
+//! e NtCancelTimer, que o WUDFPlatform.dll do services.exe pede) e o
+//! NtAdjustGroupsToken.
 
 use crate::ntos::inc::field::NtStruct;
 use crate::ntos::inc::types::{Eprocess, Ethread, HandleTable, ObjectAttributes};
@@ -44,6 +45,7 @@ pub fn run(assert: Assert) {
     events(assert, block, rsp, &call);
     directory_query(assert, block, rsp, &call);
     executive_timer(assert, block, rsp, &call);
+    adjust_groups(assert, block, rsp, &call);
     if let Some(region) = memory::find_region(block) {
         memory::release_private_region(&region);
     }
@@ -261,6 +263,64 @@ fn system_classes(assert: Assert, block: u64, call: Call) {
 /// O ETIMER de modo usuário: o TimerType acima de SynchronizationTimer e o
 /// período negativo recusados, o estado anterior e o corrente pelos
 /// BOOLEANs de saída e o handle fechado.
+/// NtAdjustGroupsToken de modo usuário num token com um grupo opcional
+/// (S-1-5-32-545, habilitado por padrão), um só de negação (S-1-5-4) e o
+/// Everyone obrigatório: o PreviousState curto, a mudança com o estado de
+/// antes, o SID ausente, as recusas de negação e de obrigatório e o
+/// ResetToDefault.
+fn adjust_groups(assert: Assert, block: u64, rsp: u64, call: Call) {
+    use crate::ntos::se::model::{sid, Group};
+    use crate::ntos::se::token::{handles, tokens};
+    let Some(primary) = process::get_primary_token(process::get_current_process()) else { return };
+    let users = sid(5, &[32, 545]);
+    let initialize = |token: &mut tokens::Token| {
+        token.groups = alloc::vec![Group { sid: sid(1, &[0]), attributes: 7 }, Group { sid: sid(5, &[32, 545]), attributes: 6 }, Group { sid: sid(5, &[4]), attributes: 0x10 }];
+    };
+    let Ok(token) = tokens::create(Some(primary), Some(&initialize)) else { return };
+    let handle = handles::create(token, 0xF01FF, 0, true).unwrap_or(0);
+    let _ = tokens::release(token);
+    let (state, sids, previous, returned) = (block + 0xA00, block + 0xA80, block + 0xB00, block + 0xBF8);
+    let request = |entries: &[(&[u8], u32)]| {
+        guest::write32(state, entries.len() as u32);
+        let mut cursor = sids;
+        for (index, (identifier, attributes)) in entries.iter().enumerate() {
+            guest::write_bytes(cursor, identifier);
+            guest::write64(state + 8 + index as u64 * 16, cursor);
+            guest::write32(state + 16 + index as u64 * 16, *attributes);
+            cursor += identifier.len() as u64;
+        }
+    };
+    let adjust = |reset: u64, length: u64, previous_state: u64| {
+        guest::write64(rsp + 0x28, previous_state);
+        guest::write64(rsp + 0x30, returned);
+        call("NtAdjustGroupsToken", handle, reset, state, length)
+    };
+    let attributes_of = |identifier: &[u8]| tokens::with(token, |record| record.groups.iter().find(|group| group.sid == identifier).map(|group| group.attributes)).flatten();
+    request(&[(&users, 0)]);
+    let short = adjust(0, 8, previous);
+    let needed = guest::read32(returned);
+    let unchanged = attributes_of(&users) == Some(6);
+    let changed = adjust(0, 0x100, previous);
+    let previous_ok = guest::read32(previous) == 1 && guest::read32(previous + 16) == 6 && guest::read_bytes(guest::read64(previous + 8), users.len()) == users;
+    let disabled = attributes_of(&users) == Some(2);
+    let unknown_sid = sid(5, &[32, 999]);
+    request(&[(&users, 0), (&unknown_sid, 4)]);
+    let not_all = adjust(0, 0, 0);
+    let deny_sid = sid(5, &[4]);
+    request(&[(&deny_sid, 4)]);
+    let deny_only = adjust(0, 0, 0);
+    let world = sid(1, &[0]);
+    request(&[(&world, 0)]);
+    let mandatory = adjust(0, 0, 0);
+    let reset = adjust(1, 0x100, previous);
+    let restored = attributes_of(&users) == Some(6) && guest::read32(previous) == 1;
+    let closed = call("NtClose", handle, 0, 0, 0);
+    assert(
+        handle != 0 && short == 0xC000_0023 && needed == 40 && unchanged && changed == 0 && previous_ok && disabled && not_all == 0x106 && deny_only == 0xC000_02B3 && mandatory == 0xC000_005D && reset == 0 && restored && closed == 0,
+        "userboot: NtAdjustGroupsToken com PreviousState, SID ausente, recusas de negacao e de obrigatorio e ResetToDefault",
+    );
+}
+
 fn executive_timer(assert: Assert, block: u64, rsp: u64, call: Call) {
     let (handle_cell, due, previous, current) = (block + 0x600, block + 0x608, block + 0x610, block + 0x611);
     let invalid_type = call("NtCreateTimer", handle_cell, 0x1F_0003, 0, 2);
