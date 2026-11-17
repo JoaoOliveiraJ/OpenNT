@@ -477,6 +477,33 @@ fn power_information(assert: Assert, block: u64, rsp: u64, call: Call) {
         name == 0 && again == 0 && same_name && global == 0 && global_name != 0 && global_name != first_name && name_short_input == 0xC000_0023 && name_short_output == 0xC000_0023 && name_no_output == STATUS_INVALID_PARAMETER && get == 0 && records == (0x24, 4, 0, 0, 0) && same_stamps && get_short == 0xC000_0023 && get_input == 0xC000_0023 && unknown_name == STATUS_NOT_FOUND && unknown_value == STATUS_INVALID_PARAMETER,
         "userboot: NtPowerInformation 58 e 59 (nome WNF e valor AC de GUID_ACDC_POWER_SOURCE)",
     );
+    // PowerInformationInternal 0x1F/0x20 (o RtlGet/SetSystemBootStatus do
+    // lsass): entrada de 0x18 bytes, Count diferente de zero e itens
+    // alinhados a 8; o pedido válido chega ao arquivo bootstat.dat (sem ele,
+    // o status da abertura).
+    let (request, items, data) = (block + 0x980, block + 0x9A0, block + 0x9C0);
+    let boot_status = |internal: u32, count: u32, items_address: u64, length: u64| {
+        guest::write32(request, internal);
+        guest::write32(request + 4, 0);
+        guest::write32(request + 8, count);
+        guest::write32(request + 0xC, 0);
+        guest::write64(request + 0x10, items_address);
+        power(87, request, length, 0, 0)
+    };
+    guest::write32(items, 4);
+    guest::write32(items + 4, 0);
+    guest::write64(items + 8, data);
+    guest::write32(items + 0x10, 4);
+    guest::write32(data, 1);
+    let short = boot_status(0x20, 1, items, 0x10);
+    let empty = boot_status(0x20, 0, items, 0x18);
+    let misaligned = boot_status(0x1F, 1, items + 4, 0x18);
+    let get = boot_status(0x1F, 1, items, 0x18);
+    let set = boot_status(0x20, 1, items, 0x18);
+    assert(
+        short == STATUS_INVALID_PARAMETER && empty == STATUS_INVALID_PARAMETER && misaligned == STATUS_DATATYPE_MISALIGNMENT && ![0xC000_0002, STATUS_INVALID_PARAMETER].contains(&get) && ![0xC000_0002, STATUS_INVALID_PARAMETER].contains(&set),
+        "userboot: NtPowerInformation 87 tipos 0x1F e 0x20 (boot status data)",
+    );
 }
 
 fn events(assert: Assert, block: u64, rsp: u64, call: Call) {

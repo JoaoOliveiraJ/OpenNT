@@ -17,7 +17,7 @@ use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 
 use crate::ntos::inc::types::{NtStruct, SystemPowerCapabilities};
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::po::{black_box, power_setting};
+use crate::ntos::po::{black_box, boot_status, power_setting};
 use crate::rtl::KernelError;
 
 const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
@@ -318,6 +318,12 @@ fn level_answer(level: u32, input: &[u8], output_length: u32) -> Result<Answer, 
                     }
                     Answer::Data(alloc::vec![platform_aoac()])
                 }
+                // BootStatGet e BootStatSet: o boot status data
+                // (`po/boot_status.rs`).
+                boot_status::BOOT_STAT_GET | boot_status::BOOT_STAT_SET => match boot_status::request(internal, input, has_output)? {
+                    Ok(data) => Answer::Data(data),
+                    Err(status) => Answer::Status(status),
+                },
                 _ => {
                     crate::debug_print!("[po] NtPowerInformation de modo usuario: PowerInformationInternal tipo {:#x} sem suporte", internal);
                     Answer::Status(STATUS_NOT_IMPLEMENTED)

@@ -2384,7 +2384,14 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   no primeiro pedido o nome WNF temporário de escopo de máquina da
   configuração (ou o nome global, sem GUID; GUID desconhecido dá
   STATUS_NOT_FOUND) e o 59 serializa os valores AC, DC e Hot com os
-  carimbos de mudança. Os valores ainda não são publicados nos nomes.
+  carimbos de mudança. Os valores ainda não são publicados nos nomes. O
+  PowerInformationInternal 0x1F e 0x20 (o RtlGet/SetSystemBootStatus do
+  ntdll) lê e grava o boot status data (`po/boot_status.rs`): os itens
+  capturados e sondados, o arquivo `\SystemRoot\bootstat.dat` aberto pelo
+  ZwOpenFile (ou o `OsBootstatPath` de `Control`), o acesso do chamador ao
+  descritor dele, os campos do RtlpBootStatusFields pelo cache, o checksum
+  ajustado no Set e o campo gravado no black box. O volume não tem o
+  arquivo, então o pedido devolve o status da abertura.
 - **Desligamento e reinício** (`po/shutdown.rs`, `io/shutdown.rs`,
   `ex/shutdown.rs`, `hal/firmware_return.rs`): NtShutdownSystem e o
   NtSetSystemPowerState das ações de desligamento, de modo kernel e de
