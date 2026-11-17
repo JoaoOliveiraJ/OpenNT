@@ -109,7 +109,7 @@ const STATUS_NO_SUCH_LOGON_SESSION: u32 = 0xC000_005F;
 /// (o outro ramo do mesmo status), e os comandos do LSA ainda não ligam
 /// sessões irmãs (`se/logon_session.rs`): o par de tokens de UAC, que o
 /// NT duplica (SepDuplicateToken) e devolve num handle novo, não existe.
-fn linked_token(token: u64, length: u32, returned: u64, from_user_mode: bool) -> Result<u32, KernelError> {
+pub fn linked_token(token: u64, length: u32, returned: u64, from_user_mode: bool) -> Result<u32, KernelError> {
     use crate::ntos::se::logon_session;
     if !writable(returned, 4, from_user_mode) || guest::try_write::<u32>(returned, 8).is_err() {
         return Ok(STATUS_ACCESS_VIOLATION);

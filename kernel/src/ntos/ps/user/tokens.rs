@@ -234,6 +234,10 @@ fn nt_query_information_token(handle: u64, class: u64, out: u64, length: u64, rs
         Ok(token) => token,
         Err(status) => return Ok(status),
     };
+    // TokenLinkedToken (`se/token/query`).
+    if class == 19 {
+        return query_token::linked_token(token, length as u32, stack_arg(rsp, 5), true);
+    }
     Ok(write_result(query_token::encode(token, class, out), out, length as u32, stack_arg(rsp, 5)))
 }
 
