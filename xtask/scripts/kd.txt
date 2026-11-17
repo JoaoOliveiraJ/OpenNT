@@ -38,6 +38,11 @@ wait-stop 600000
 expect-stop swbreak
 expect-eq %rip kernel::ntos::ke::run_kernel_tasks
 
+# Os registradores além do pacote `g`: a metade alta dos YMM sai do XSAVE na
+# CPU da parada (o kernel liga o AVX no boot).
+rx
+expect ymm15h
+
 # A saída do DbgPrint do ksecdd.sys real chegou durante o boot.
 expect-console SspiInitAsyncInterface
 log

@@ -19,7 +19,7 @@ O OpenNT avança em fases. Cada fase termina com o kernel compilando, iniciando 
 
 **Próximo.** O Local Session Manager registrar o endpoint dele no epmapper (a conexão ALPC confere o RequiredServerSid contra o usuário do token do servidor, a conta NetworkService do svchost do rpcss), sinalizar o TermSrvReadyEvent e conectar a sessão 1 pela \SmSsWinStationApiPort. Depois o winlogon cria o LogonUI e o dwm, que desenham a tela de logon.
 
-Hoje: **49 de 79** binários da Microsoft rodam (28 parciais); o kernel exporta **2.079 dos 3.070** nomes do `ntoskrnl.exe` do Windows 10 22H2 (67,7%). Detalhes em [O que roda](site/o-que-roda.html), [Componentes](site/componentes.html), [Exports](site/ntoskrnl.html) e [Testes](site/testes.html).
+Hoje: **49 de 79** binários da Microsoft rodam (28 parciais); o kernel exporta **2.083 dos 3.070** nomes do `ntoskrnl.exe` do Windows 10 22H2 (67,9%). Detalhes em [O que roda](site/o-que-roda.html), [Componentes](site/componentes.html), [Exports](site/ntoskrnl.html) e [Testes](site/testes.html).
 
 ## Fase 1 — base (concluída)
 
@@ -43,6 +43,7 @@ Banco de páginas físicas, mapeamento recursivo, pool do kernel, variáveis exp
 | --- | --- | --- |
 | Gerência de memória | Funciona | selftest, pagefile |
 | Multiprocessador (SMP) | Funciona | selftest, fase7 |
+| Estado estendido do processador (XSAVE e AVX) | Funciona | xstate, selftest |
 
 ## Fase 3 — objetos e executive (concluída)
 

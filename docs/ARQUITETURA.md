@@ -430,8 +430,9 @@ IA32_TSC_AUX), o KiSetCacheInformation (Cache[], CacheCount, o L2 da KPCR,
 KeLargestCacheLine e KiLargestCacheSize) e a frequência (MHz e
 StallScaleFactor). Com todos online, os conjuntos do KiInitializeKernel:
 PackageProcessorSet, PackageId, CoreProcessorSet e CacheProcessorMask. O
-KeFeatureBits é o FeatureBits do BSP com o NX (EFER.NXE) e o XSTATE (que o
-OpenNT não habilita: só FXSAVE); dele saem os PF_* da KUSER_SHARED_DATA pela
+KeFeatureBits é o FeatureBits do BSP com o NX (EFER.NXE) e os bits do XSAVE
+(KF_XSTATE, KF_XSAVEOPT e KF_XSAVES, de `ke/xsave.rs`, abaixo); dele saem os
+PF_* da KUSER_SHARED_DATA pela
 lista do KiInitializeKernel e do KiPublishProcessorFeatures, o
 SystemProcessorInformation e o SystemProcessorFeaturesInformation. O
 KeQueryLogicalProcessorRelationship, o SystemLogicalProcessorInformation
@@ -450,6 +451,90 @@ binário em `ke/affinity_set.rs`. O autoteste
 `ntos/test/multiprocess/processor_identity.rs` confere cada KPRCB com o
 CPUID do próprio processador, os PF_* com o CPUID (e a visão de usuário que
 o IsProcessorFeaturePresent lê) e as consultas pela chamada de sistema.
+
+O estado estendido do processador (XSAVE) segue o ntoskrnl 19041 em três
+arquivos. `ke/xsave.rs` faz o KiInitializeXSave de cada CPU antes do
+KiSetFeatureBits: no BSP, os recursos do CPUID 0xD (KiGetXSaveSupportedFeatures:
+o x87 e o SSE obrigatórios, OptimizedSave pelo XSAVEOPT, compactação com o
+XSAVEC e o XSAVES, os recursos de supervisor do IA32_XSS só com a
+compactação, AllFeatures e AlignedFeatures), a XsaveAllowedFeatures e os
+XsaveFlags de um carregador sem opções de BCD (todos os recursos, mantendo
+OptimizedSave e compactação), a política do hwpolicy.sys
+(KiIntersectFeaturesWithPolicy: o recurso 0x65, nome 1, do driver de política,
+que entra no bundle do kernel como os drivers de boot do carregador; um
+recurso fica só se a política o lista e a entrada do fabricante aceita a
+assinatura e o microcódigo; sem o driver, nenhum recurso), Size,
+AllFeatureSize e os deslocamentos no formato compactado
+(KiUpdateXSaveSizeAndVolatileFeatures), os voláteis e o supervisor visível;
+KeXStateLength = KiXSaveAreaLength = AllFeatureSize. Num AP, o CPUID dele
+precisa cobrir a configuração do BSP (aviso no lugar do bugcheck). O
+KiInitializeKernel acrescenta KF_XSTATE, KF_XSAVEOPT e KF_XSAVES
+(KeGetXSaveFeatureFlags), e o KiEnableXSave de cada CPU liga o CR4.OSXSAVE,
+grava o XCR0 = EnabledFeatures e o IA32_XSS. A configuração é publicada em
+KUSER_SHARED_DATA.XState antes dos PF_* (PF_XSAVE_ENABLED, PF_AVX, PF_AVX2,
+PF_AVX512F dependem dela). O RtlGetEnabledExtendedFeatures e o
+RtlGetEnabledExtendedAndSupervisorFeatures (`rtl/version.rs`) leem dela.
+
+`ke/xstate.rs` é o estado de cada thread e o dos drivers. A KTHREAD tem a
+área de XSAVE em StateSaveArea, no topo da pilha de kernel (StackBase -
+KiXSaveAreaLength, alinhada a 64, com o KERNEL_STACK_CONTROL e o
+InitialStack logo abaixo, como no KiInitializeContextThread); as threads da
+pilha de boot usam a área do despachante da CPU 0, e cada despachante tem a
+sua. A área nova é zerada; numa thread de usuário (`UserThread::new`) leva a
+palavra de controle x87 0x27F e o x87 no XSTATE_BV; com a compactação,
+XCOMP_BV = bit 63 | x87 | SSE. NpxState é o do KiSetSwitchingNpxState. O
+salvamento é ansioso, como no SwapContext, com as primitivas de
+`hal/amd64/extended_state.rs`: XSAVES com KF_XSAVES, senão XSAVEOPT com
+KF_XSAVEOPT, senão XSAVE; XRSTORS ou XRSTOR na volta; a máscara é a dos
+recursos habilitados sem x87 e SSE (os dois seguem no CONTEXT do intervalo e
+nos quadros de troca); o MXCSR vivo volta intacto. Os pontos de troca: o fim
+de todo intervalo de usuário (`user_terminate_current`: syscall, relógio,
+exceção, bloqueio no kernel, término) salva na área da thread; a entrada
+(`user_exec_context`, antes do FXRSTOR do CONTEXT) e a retomada de uma
+thread bloqueada (`opennt_resume_thread`) recarregam dela; um callback de
+modo usuário parte do estado vivo do serviço de fora; as trocas entre o
+despachante e as threads de kernel salvam e recarregam a área do lado que sai
+(`ke/context_switch.rs`, o `CarriedState`), e a primeira entrada de uma
+thread de kernel carrega a área inicial. O UserExecutionBlock da CPU guarda
+a área da thread do intervalo (`xstate_area`, zero no anel 3 cru).
+KeSaveExtendedProcessorState e KeRestoreExtendedProcessorState seguem o
+KeSaveExtendedAndSupervisorState e o KeRestoreExtendedAndSupervisorState: a
+máscara conferida contra os recursos habilitados
+(INVALID_EXTENDED_PROCESSOR_STATE), todos os recursos habilitados sem x87 e
+SSE salvos, o nível (0 em PASSIVE fora de APC de kernel, senão IRQL + 1), a
+lista KTHREAD.XStateSave, a área do pool (KeAllocateXStateContext, max(0x240,
+Size) + 63) ou, em DISPATCH_LEVEL, a KPRCB.ExtendedState, e o RtlXSave e o
+RtlXRestore (XSAVEC/XSAVES com a compactação; sem ela, o cuidado do MXCSR
+com o AVX sem o SSE). KeSaveFloatingPointState e KeRestoreFloatingPointState
+só devolvem STATUS_SUCCESS, como no x64. Enquanto a lista não está vazia, o
+estado de usuário da thread é o da área mais antiga dela (o que o
+KeContextFromKframes e o KxContextToKframes consultam).
+
+`rtl/extended_context.rs` tem as rotinas internas do CONTEXT estendido
+(RtlpValidateContextFlags, RtlGetExtendedContextLength2,
+RtlInitializeExtendedContext2, RtlpGetEntireXStateAreaLength,
+RtlpCopyXStateChunk; o ntoskrnl 19041 não as exporta, as da ntdll são as que
+o modo usuário usa), e `ps/context/xstate.rs` move o pedaço XSTATE entre a
+thread e o CONTEXT de usuário: o KiCopyXStateArea da área para o CONTEXT
+estendido do kernel (KeContextFromKframes), a cópia sondada para o pedaço do
+usuário e, na volta, a área mais antiga da lista ou a da thread, recarregada
+na CPU quando a thread é a do serviço em curso (o RtlXRestoreS do
+KxContextToKframes). Usam isso: o despacho de exceções
+(`ps/user/exceptions.rs`, o frame do KiDispatchException: ContextFlags
+0x10005F com KF_XSTATE, o pedaço XSTATE alinhado a 64 logo abaixo do RSP
+interrompido, o machine frame alinhado a 16 abaixo dele, o CONTEXT a 0x590
+do machine frame; All cobre do CONTEXT ao RSP, XState.Length vai até o RSP),
+o NtContinue e o NtRaiseException com CONTEXT_XSTATE e o NtGetContextThread
+e o NtSetContextThread de modo usuário (sem recursos habilitados,
+STATUS_NOT_SUPPORTED; de KernelMode o CONTEXT_XSTATE continua recusado). O
+frame das APCs de usuário segue sem o pedaço XSTATE: no 19041 ele só vem
+numa APC especial com o flag do XSTATE ou numa thread com CET. Os
+autotestes são `ntos/test/extended_state.rs` (fase 6, `XSTATE_KERNEL_OK`: a
+configuração contra o CPUID de cada CPU, os exports, os salvamentos dos
+drivers e duas threads de sistema com YMM diferentes) e
+`ntos/test/multiprocess/extended_state.rs` (fase 7, `XSTATE_USER_OK`: duas
+threads de usuário com AVX e a ntdll real, o NtGetContextThread com
+CONTEXT_XSTATE e a volta de uma exceção pelo NtContinue).
 
 **IPIs medidos em tempo.** Toda espera de resposta a um IPI (`ke/smp.rs`:
 o ICR voltar a ocioso depois do envio e as confirmações do shootdown de
@@ -2139,9 +2224,11 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
       `membp:endereço`. Limites: uma leitura do kernel na página falha como
       violação de acesso; a saída do processo desarma as páginas dele.
     - Registradores além do `g` (`kd/extended_state.rs`, só por `p`):
-      `ymm0h`-`ymm15h` (59-74) pelo XSAVE do componente AVX quando o sistema
-      liga o OSXSAVE; DR0-DR3, DR6 e DR7 (75-80), os do CONTEXT numa parada
-      de usuário e o conjunto do depurador numa parada do kernel.
+      `ymm0h`-`ymm15h` (59-74): numa parada do kernel, pelo XSAVE do
+      componente AVX na CPU da parada; numa parada de usuário, da área com o
+      estado de usuário da thread (`ke::xstate::user_state_area`); DR0-DR3,
+      DR6 e DR7 (75-80), os do CONTEXT numa parada de usuário e o conjunto do
+      depurador numa parada do kernel.
     - Eventos (`kd/events.rs`): as notificações do Ps (`ps/notify`) chamam
       `opennt_kd_process_event`, `opennt_kd_thread_event` e
       `opennt_kd_image_event` (sysv64, argumentos nos registradores) antes de
