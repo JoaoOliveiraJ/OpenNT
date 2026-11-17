@@ -367,7 +367,7 @@ fn ntoskrnl_exports(assert: Assert) {
     use crate::{ntos::init::export_names as abi_names, ntos::init::exports};
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions, ResolvedImport};
     exports::init();
-    assert(abi_names::EXPORT_NAMES.len() == 2073 && abi_names::GROUP_LAYOUT.len() == 507 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 2059 exports em 506 grupos");
+    assert(abi_names::EXPORT_NAMES.len() == 2074 && abi_names::GROUP_LAYOUT.len() == 508 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 2059 exports em 506 grupos");
     // Ordinais públicos: os slots de função seguidos dos dados sem nome repetido.
     let public_count = abi_names::EXPORT_NAMES.len() + crate::ntos::mm::kernel_data_layout::DEFINITIONS.iter().filter(|entry| !abi_names::EXPORT_NAMES.contains(&entry.name)).count();
     assert(matches!(exports::lookup_ordinal("ntoskrnl.exe", 547), Some(ResolvedImport::Thunk(578))) && exports::lookup("ntoskrnl.exe", "LdrResSearchResource").is_some() && exports::lookup("ntoskrnl.exe", "NaoExisteNoKernel").is_none() && exports::lookup_ordinal("ntoskrnl.exe", 0).is_none() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32).is_some() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32 + 1).is_none(), "ntoskrnl: ordinais, todos os exports com provedor e nome desconhecido");
@@ -2141,7 +2141,7 @@ fn ntoskrnl_mm_group(assert: Assert) {
     use crate::ntos::mm::{image_paging, paging};
     use crate::ntos::init::exports;
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions};
-    assert(exports::implemented() == 2073 && exports::export_names().len() == 2073, "ntoskrnl: 507 grupos com os 2073 exports implementados");
+    assert(exports::implemented() == 2074 && exports::export_names().len() == 2074, "ntoskrnl: 508 grupos com os 2074 exports implementados");
     let block = guest::alloc_bytes(0x200);
     // MmGetSystemRoutineAddress: trampolim chamável e nome desconhecido.
     let name: alloc::vec::Vec<u16> = "KeGetCurrentIrql".encode_utf16().collect();
@@ -3611,6 +3611,235 @@ fn kd_break_point_and_processor_count(assert: Assert) {
     let count = smp::online_cpu_count() as u64;
     assert(cell != 0 && resolved && eat(b"KeNumberProcessors\0") == cell && kernel_data::read("KeNumberProcessors") == count && guest::read8(cell) as u64 == count, "ke: KeNumberProcessors e a celula ULONG da .kdata publicada no EAT");
     guest::free_bytes(name);
+}
+
+/// As rotinas não exportadas que drivers acham seguindo um CALL conhecido
+/// do ntoskrnl: o teste faz o que o driver faz. O KeAllocateProcessorProfileStructures
+/// sai da EAT do OpenNT e o `33 D2 48 8B CE E8` (xor edx, edx; mov rcx, rsi;
+/// call) leva ao MmAllocateIndependentPages; a PAGE sai da tabela de seções
+/// da imagem achada pela PsLoadedModuleList, e as sequências do MmFreeIsrStack
+/// e do PopUpdateSingleProcessHeteroPolicies (e a chamada do
+/// EtwpProcessEnumCallback) levam ao MmFreeIndependentPages e ao
+/// PsEnumProcessThreads. Cada rotina é chamada pelo endereço achado.
+fn page_section_call_sites(assert: Assert) {
+    use crate::hal::amd64::native_call;
+    use crate::ntos::init::exports::{self, private_routines};
+    use crate::ntos::ke::{pcr, processor_identity, smp};
+    use crate::ntos::mm::pe_loader::ResolvedImport;
+    use crate::ntos::mm::{independent_pages, memory_map, paging};
+    use crate::ntos::ps::process;
+    let name = guest::alloc_bytes(0x40);
+    let eat = |text: &[u8]| {
+        guest::write_bytes(name, text);
+        call_export("RtlFindExportedRoutineByName", &[memory_map::KERNEL_VIRTUAL_BASE, name]).unwrap_or(0)
+    };
+    // Procura `pattern` (None = qualquer byte) em [start, start + length).
+    let scan = |start: u64, length: u64, pattern: &[Option<u8>]| -> Option<u64> {
+        let bytes = guest::read_bytes(start, length as usize);
+        bytes.windows(pattern.len()).position(|window| window.iter().zip(pattern).all(|(byte, wanted)| wanted.is_none_or(|wanted| *byte == wanted))).map(|index| start + index as u64)
+    };
+    let exact = |bytes: &[u8]| bytes.iter().map(|&byte| Some(byte)).collect::<Vec<_>>();
+    // Destino do CALL rel32 cujo opcode E8 está em `call`.
+    let target = |call: u64| (call as i64 + 5 + guest::read32(call + 1) as i32 as i64) as u64;
+    let allocate = private_routines::address("MmAllocateIndependentPages");
+    let free = private_routines::address("MmFreeIndependentPages");
+    let enumerate = private_routines::address("PsEnumProcessThreads");
+
+    // ---- KeAllocateProcessorProfileStructures pela EAT -------------------
+    let profile = eat(b"KeAllocateProcessorProfileStructures\0");
+    let resolved = matches!(exports::lookup("ntoskrnl.exe", "KeAllocateProcessorProfileStructures"), Some(ResolvedImport::Address { address, .. }) if address == profile);
+    let found = if profile != 0 { scan(profile, 0x200, &exact(&[0x33, 0xD2, 0x48, 0x8B, 0xCE, 0xE8])) } else { None };
+    let longer = found.is_some_and(|at| guest::read_bytes(at - 14, 14) == [0x48, 0x81, 0xC6, 0xFF, 0x0F, 0x00, 0x00, 0x48, 0x81, 0xE6, 0x00, 0xF0, 0xFF, 0xFF]);
+    let via_profile = found.map_or(0, |at| target(at + 5));
+    assert(profile != 0 && resolved && found == Some(profile + 0xC1) && longer && allocate != 0 && via_profile == allocate, "page: o CALL de KeAllocateProcessorProfileStructures+0xc6 leva ao MmAllocateIndependentPages");
+
+    // ---- a PAGE na tabela de seções do ntoskrnl ---------------------------
+    let list = eat(b"PsLoadedModuleList\0");
+    let first = if list != 0 { guest::read64(list) } else { 0 };
+    // SAFETY: a primeira KLDR_DATA_TABLE_ENTRY da lista (o ntoskrnl).
+    let base = if first != 0 && first != list { unsafe { nt::KldrDataTableEntry::at(first) }.dll_base.get() } else { 0 };
+    let headers = if base != 0 { call_export("RtlImageNtHeader", &[base]).unwrap_or(0) } else { 0 };
+    let mut page = None;
+    let mut code_sections = Vec::new();
+    if headers != 0 {
+        // SAFETY: os cabeçalhos NT que o RtlImageNtHeader devolveu.
+        let nt_headers = unsafe { nt::ImageNtHeaders64::at(headers) };
+        let table = headers + core::mem::offset_of!(nt::ImageNtHeaders64, optional_header) as u64 + nt_headers.file_header.size_of_optional_header.get() as u64;
+        for index in 0..nt_headers.file_header.number_of_sections.get() as u64 {
+            // SAFETY: entrada da tabela de seções da imagem mapeada.
+            let section = unsafe { nt::ImageSectionHeader::at(table + index * 0x28) };
+            let label: Vec<u8> = section.name.iter().map(|byte| byte.get()).collect();
+            let (rva, size, characteristics) = (section.virtual_address.get() as u64, section.misc.physical_address.get() as u64, section.characteristics.get());
+            if characteristics & 0x2000_0000 != 0 {
+                code_sections.push((label.clone(), characteristics));
+            }
+            if label == *b"PAGE\0\0\0\0" {
+                page = Some((base + rva, size, characteristics));
+            }
+        }
+    }
+    let inside = |address: u64| page.is_some_and(|(start, size, _)| address >= start && address < start + size);
+    assert(base == memory_map::KERNEL_VIRTUAL_BASE && page.is_some_and(|(_, size, characteristics)| size != 0 && characteristics == 0x6800_0020) && code_sections == [(b".text\0\0\0".to_vec(), 0x6800_0020), (b"PAGE\0\0\0\0".to_vec(), 0x6800_0020)], "page: a PsLoadedModuleList leva a imagem com .text e PAGE (codigo, leitura, residente, sem escrita)");
+    assert(inside(allocate) && inside(free) && inside(enumerate) && !inside(profile), "page: as tres rotinas ficam na PAGE e o export na .text");
+    // RtlPcToFileHeader acha o ntoskrnl por um endereço da PAGE.
+    let image_base = guest::alloc_bytes(8);
+    let by_pc = call_export("RtlPcToFileHeader", &[enumerate, image_base]).unwrap_or(0);
+    assert(by_pc == base && guest::read64(image_base) == base, "page: RtlPcToFileHeader acha o ntoskrnl por um endereco da PAGE");
+
+    // ---- MmFreeIsrStack: push rbx; sub rsp,20h; lea rbx,[rcx-6000h]; mov edx,6000h; mov rcx,rbx; call
+    let isr_pattern = exact(&[0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8D, 0x99, 0x00, 0xA0, 0xFF, 0xFF, 0xBA, 0x00, 0x60, 0x00, 0x00, 0x48, 0x8B, 0xCB, 0xE8]);
+    let isr = page.and_then(|(start, size, _)| scan(start, size, &isr_pattern));
+    let via_isr = isr.map_or(0, |at| target(at + 0x15));
+    assert(isr.is_some() && isr == Some(private_entries_address("MmFreeIsrStack")) && free != 0 && via_isr == free, "page: o CALL do MmFreeIsrStack leva ao MmFreeIndependentPages");
+    // ---- PopUpdateSingleProcessHeteroPolicies: sub rsp,28h; xor r8d,r8d; lea rdx,[rip+22h]; call
+    let hetero = page.and_then(|(start, size, _)| scan(start, size, &exact(&[0x48, 0x83, 0xEC, 0x28, 0x45, 0x33, 0xC0, 0x48, 0x8D, 0x15, 0x22, 0x00, 0x00, 0x00, 0xE8])));
+    let via_hetero = hetero.map_or(0, |at| target(at + 0x0E));
+    assert(hetero.is_some() && hetero == Some(private_entries_address("PopUpdateSingleProcessHeteroPolicies")) && enumerate != 0 && via_hetero == enumerate, "page: o CALL do PopUpdateSingleProcessHeteroPolicies leva ao PsEnumProcessThreads");
+    // ---- EtwpProcessEnumCallback: mov r8,rsi; lea rdx,[rip+X]; mov rcx,rbx; call
+    let etw_pattern = [Some(0x4C), Some(0x8B), Some(0xC6), Some(0x48), Some(0x8D), Some(0x15), None, None, None, None, Some(0x48), Some(0x8B), Some(0xCB), Some(0xE8)];
+    let etw = page.and_then(|(start, size, _)| scan(start, size, &etw_pattern));
+    let via_etw = etw.map_or(0, |at| target(at + 13));
+    let etw_callback = etw.map_or(0, |at| (at as i64 + 10 + guest::read32(at + 6) as i32 as i64) as u64);
+    assert(etw.is_some_and(|at| inside(at)) && via_etw == enumerate && etw_callback == private_routines::address("EtwpThreadEnumCallback"), "page: a chamada do EtwpProcessEnumCallback leva ao PsEnumProcessThreads com o EtwpThreadEnumCallback");
+
+    // ---- chamadas pelos endereços achados ---------------------------------
+    // MmAllocateIndependentPages(0x3123, 0) e MmFreeIndependentPages(base, 0x3123).
+    let block = if via_profile != 0 { native_call::call(via_profile, &[0x3123, 0]) } else { 0 };
+    let described = independent_pages::info(block).is_some_and(|info| info.size == 0x4000 && info.bytes == 0x3123 && info.frames.len() == 4);
+    if block != 0 {
+        guest::write64(block + 0x3118, 0x5041_4745_0000_0001);
+    }
+    let kept = block != 0 && guest::read64(block + 0x3118) == 0x5041_4745_0000_0001;
+    if block != 0 && via_isr != 0 {
+        native_call::call(via_isr, &[block, 0x3123]);
+    }
+    assert(block != 0 && described && kept && independent_pages::info(block).is_none(), "page: MmAllocateIndependentPages e MmFreeIndependentPages pelos enderecos achados");
+
+    // PsEnumProcessThreads(System, callback, contexto): o callback grava cada
+    // thread no contexto (contador e até 64 ponteiros) e devolve 0.
+    let record = super::executable_code::place(&[
+        0x49, 0x8B, 0x00, // mov rax, [r8]
+        0x48, 0x83, 0xF8, 0x40, // cmp rax, 64
+        0x73, 0x05, // jae +5
+        0x49, 0x89, 0x54, 0xC0, 0x08, // mov [r8 + rax*8 + 8], rdx
+        0x49, 0xFF, 0x00, // inc qword ptr [r8]
+        0x31, 0xC0, // xor eax, eax
+        0xC3, // ret
+    ]);
+    // Um callback que devolve STATUS_UNSUCCESSFUL encerra na primeira thread.
+    let stop = super::executable_code::place(&[0x49, 0xFF, 0x00, 0xB8, 0x01, 0x00, 0x00, 0xC0, 0xC3]);
+    let context = guest::alloc_bytes(8 + 64 * 8);
+    let system = process::get_system_process();
+    let status = if via_hetero != 0 && record != 0 { native_call::call(via_hetero, &[system, record, context]) as u32 } else { 1 };
+    let count = guest::read64(context);
+    let threads: Vec<u64> = (0..count.min(64)).map(|index| guest::read64(context + 8 + index * 8)).collect();
+    let owned = threads.iter().all(|&thread| process::thread_record(thread).is_some_and(|record| record.process == system));
+    let current = process::get_current_thread();
+    let listed = process::thread_record(current).is_none_or(|record| record.process != system) || count > 64 || threads.contains(&current);
+    assert(status == 0 && count >= 1 && owned && listed, "page: PsEnumProcessThreads pelo endereco achado entrega as threads do System ao callback");
+    guest::write64(context, 0);
+    let stopped = if via_hetero != 0 && stop != 0 { native_call::call(via_hetero, &[system, stop, context]) as u32 } else { 0 };
+    assert(stopped == 0xC000_0001 && guest::read64(context) == 1, "page: um NTSTATUS de erro do callback encerra a enumeracao");
+
+    // As rotinas privadas chamam o PsEnumProcessThreads como o ntoskrnl: a
+    // de política heterogênea devolve STATUS_SUCCESS e leva a política
+    // efetiva das threads com a política padrão a 0 (sistema homogêneo);
+    // a do ETW, com o grupo de threads pedido, marca o DCStart de thread.
+    // Uma thread do System entregue pela enumeração, retida durante o teste.
+    let thread = threads.first().copied().filter(|&thread| process::reference_thread_safe(thread)).unwrap_or(0);
+    let mut explicit_kept = false;
+    let mut recomputed = false;
+    if thread != 0 {
+        // SAFETY: KTHREAD referenciado acima.
+        let kthread = unsafe { nt::Kthread::at(thread) };
+        let (policy, system_policy) = (kthread.bitfield_7e.get(), kthread.system_hetero_cpu_policy.get());
+        kthread.set_user_hetero_cpu_policy(crate::ntos::ke::hetero_policy::POLICY_DEFAULT);
+        kthread.set_explicit_system_hetero_cpu_policy(1);
+        kthread.system_hetero_cpu_policy.set(3);
+        let hetero_routine = private_entries_address("PopUpdateSingleProcessHeteroPolicies");
+        explicit_kept = native_call::call(hetero_routine, &[system]) as u32 == 0 && kthread.system_hetero_cpu_policy.get() == 3;
+        kthread.set_explicit_system_hetero_cpu_policy(0);
+        recomputed = native_call::call(hetero_routine, &[system]) as u32 == 0 && kthread.system_hetero_cpu_policy.get() == 0 && kthread.user_hetero_cpu_policy() == crate::ntos::ke::hetero_policy::POLICY_DEFAULT;
+        kthread.bitfield_7e.set(policy);
+        kthread.system_hetero_cpu_policy.set(system_policy);
+        let _ = process::dereference_thread(thread);
+    }
+    assert(thread != 0 && explicit_kept && recomputed, "page: PopUpdateSingleProcessHeteroPolicies refaz a politica efetiva das threads com a politica padrao");
+    let mask = guest::alloc_bytes(8);
+    guest::write32(mask, 2);
+    let rundown = guest::alloc_bytes(0x48);
+    guest::write64(rundown, mask);
+    let etw_status = native_call::call(private_entries_address("EtwpProcessEnumCallback"), &[system, rundown]) as u32;
+    let marked = guest::read32(rundown + 0x28);
+    guest::write32(mask, 0);
+    guest::write32(rundown + 0x28, 0);
+    let skipped = native_call::call(private_entries_address("EtwpProcessEnumCallback"), &[system, rundown]) as u32 == 0 && guest::read32(rundown + 0x28) == 0;
+    assert(etw_status == 0 && marked == crate::ntos::etw::rundown::THREAD_DC_START && skipped, "page: EtwpProcessEnumCallback passa as threads ao EtwpThreadEnumCallback so com o grupo de threads");
+
+    // ---- MmFreeIsrStack sobre uma pilha de ISR ----------------------------
+    let top = independent_pages::allocate_isr_stack().unwrap_or(0);
+    let guard = top.wrapping_sub(0x7000);
+    let shaped = top != 0 && independent_pages::is_guard_page(guard) && paging::query_page(guard, false).is_none() && independent_pages::info(top - 0x6000).is_some_and(|info| info.size == 0x6000 && info.frames.len() == 6);
+    if top != 0 && isr.is_some() {
+        native_call::call(isr.unwrap_or(0), &[top]);
+    }
+    assert(shaped && !independent_pages::is_guard_page(guard) && independent_pages::info(top - 0x6000).is_none(), "page: MmFreeIsrStack libera a pilha pelo MmFreeIndependentPages e devolve a guarda");
+
+    // ---- KeAllocateProcessorProfileStructures -----------------------------
+    // Allocate = TRUE: com PEBS, áreas apontando os buffers; sem PEBS
+    // (KiIsIntelPebsSupported falso), STATUS_NOT_SUPPORTED e nada fica alocado.
+    let slot = guest::alloc_bytes(8);
+    let prcb = pcr::processor_block(0);
+    let vendor = prcb.map_or(0, |prcb| prcb.cpu_vendor.get());
+    let pebs = vendor == processor_identity::vendor::INTEL && crate::hal::cpu::read_msr(0x1A0) & 0x1080 == 0x80;
+    let installed = prcb.map_or(0, |prcb| prcb.processor_profile_control_area.get());
+    let expected = if !pebs { 0xC000_00BB } else if installed != 0 { 0xC000_020A } else { 0 };
+    guest::write64(slot, 0x1000);
+    let status = if profile != 0 { native_call::call(profile, &[2, 0x1000, slot, 1]) as u32 } else { 1 };
+    let areas = guest::read64(slot);
+    let filled = match status {
+        0 => areas != 0 && guest::read64(areas + 0x20) == areas - 0x2000 && guest::read64(areas + 0xA0 + 0x20) == areas - 0x1000 && guest::read64(areas + 0x28) == 0,
+        0xC000_020A => areas == installed,
+        _ => areas == 0,
+    };
+    if status == 0 && areas != 0 {
+        native_call::call(free, &[areas - 0x2000, 2 * 0x1000 + 2 * 0xA0]);
+    }
+    // A chamada pela tabela de exports entra no mesmo corpo.
+    let index = crate::ntos::init::export_names::EXPORT_NAMES.iter().position(|&name| name == "KeAllocateProcessorProfileStructures").map_or(0, |index| index as u64);
+    let thunk = exports::thunk_address(32 + index).unwrap_or(0);
+    guest::write64(slot, 0x1000);
+    let by_thunk = native_call::call(thunk, &[2, 0x1000, slot, 1]) as u32;
+    if by_thunk == 0 {
+        let areas = guest::read64(slot);
+        native_call::call(free, &[areas - 0x2000, 2 * 0x1000 + 2 * 0xA0]);
+    }
+    assert(status == expected && filled && by_thunk == expected, "page: KeAllocateProcessorProfileStructures aloca pelo MmAllocateIndependentPages e devolve o status do PEBS");
+    // Allocate = FALSE: a PRCB corrente recebe a área e o endereço do PebsIndex.
+    let area = guest::alloc_bytes(0xA0);
+    guest::write64(slot, area);
+    let installed_status = native_call::call(profile, &[0, 0, slot, 0]) as u32;
+    let mut published = false;
+    for number in 0..smp::online_cpu_count() as u32 {
+        if let Some(block) = pcr::processor_block(number) {
+            if block.processor_profile_control_area.get() == area {
+                published = block.profile_event_index_address.get() == area + 0x28;
+                block.processor_profile_control_area.set(0);
+                block.profile_event_index_address.set(0);
+            }
+        }
+    }
+    assert(installed_status == 0 && published, "page: KeAllocateProcessorProfileStructures instala a area na PRCB corrente");
+    super::executable_code::release(record);
+    super::executable_code::release(stop);
+    for pointer in [name, image_base, context, mask, rundown, slot, area] {
+        guest::free_bytes(pointer);
+    }
+}
+
+/// Endereço na imagem de um corpo nativo de `hal/amd64/private_entries.rs`.
+fn private_entries_address(symbol: &str) -> u64 {
+    crate::hal::amd64::private_entries::entry(symbol).and_then(|entry| crate::ntos::mm::kernel_address::image_address(entry).ok()).unwrap_or(0)
 }
 
 fn rtl_support_modules(assert: Assert) {
@@ -15237,6 +15466,7 @@ pub fn run(assert: Assert) {
     rtl_unwind_dynamic_table(assert);
     kernel_seh_raise_and_unwind(assert);
     kd_break_point_and_processor_count(assert);
+    page_section_call_sites(assert);
     rtl_support_modules(assert);
     rtl_group_exports(assert);
     ntoskrnl_spin_lock_family(assert);

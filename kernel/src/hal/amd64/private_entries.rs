@@ -3,7 +3,10 @@
 //! As rotinas privadas têm ids próprios (0x80000000+) e nunca entram na EAT;
 //! cada stub marca o id e cai no trampolim comum. O ObFindHandleForObject
 //! público empresta a tabela viva pelo helper privado real e mantém o
-//! contexto do filtro na pilha nativa durante a enumeração.
+//! contexto do filtro na pilha nativa durante a enumeração. Os corpos que
+//! drivers acham pelos bytes (o KeAllocateProcessorProfileStructures na
+//! `.text` e os chamadores privados na seção PAGE) repetem a sequência do
+//! ntoskrnl 19041 até o CALL que leva à rotina não exportada.
 
 core::arch::global_asm!(
     r#"
@@ -377,7 +380,302 @@ opennt_dbg_command_string:
 "#
 );
 
+// Corpos que drivers acham pelos bytes, como no ntoskrnl 19041: o driver
+// segue um CALL conhecido para chegar a rotinas que o ntoskrnl não exporta
+// (MmAllocateIndependentPages, MmFreeIndependentPages e
+// PsEnumProcessThreads). Cada trecho até o CALL repete byte a byte a
+// sequência do ntoskrnl real, menos os deslocamentos relativos; por isso vai
+// em `.byte`, com o mnemônico ao lado (o montador escolheria outras
+// codificações para os mesmos mnemônicos). Depois do CALL, o corpo é o do
+// OpenNT. As três rotinas e os chamadores privados ficam na seção PAGE, como
+// no ntoskrnl; o KeAllocateProcessorProfileStructures fica na `.text`.
+core::arch::global_asm!(
+    r#"
+.pushsection .rodata.opennt_ke_state, "a", @progbits
+# KiIrqlFlags: o OpenNT não liga o rastreio de IRQL do SchedulerAssist.
+.balign 4
+opennt_ki_irql_flags:
+    .long 0
+# KiKvaShadow: o OpenNT não separa as tabelas de kernel e de usuário.
+opennt_ki_kva_shadow:
+    .byte 0
+.popsection
+
+.pushsection .text.win32_private, "ax", @progbits
+
+# KeAllocateProcessorProfileStructures(ProcessorCount, BufferSize,
+# ProfileStructures, Allocate), ntoskrnl 19041 rva 0x3b5e70.
+# Allocate = FALSE: em DISPATCH_LEVEL, a PRCB corrente recebe
+# *ProfileStructures em ProcessorProfileControlArea (+0x8498) e o endereço
+# do PebsIndex (+0x28) em ProfileEventIndexAddress (+0x84a0).
+# Allocate = TRUE: uma alocação de páginas independentes com
+# ProcessorCount * BufferSize bytes de buffers seguidos de ProcessorCount
+# PROCESSOR_PROFILE_CONTROL_AREA de 0xA0 bytes (sem KVA shadow, o tamanho
+# vai sem arredondar), zerada; com PEBS (KiIsIntelPebsSupported: CPU Intel
+# e IA32_MISC_ENABLE com o monitoramento de desempenho e sem o bit de PEBS
+# indisponível) e sem área já instalada na PRCB, cada PebsBufferBase (+0x20)
+# aponta para o seu buffer e *ProfileStructures recebe a primeira área.
+# Senão a alocação volta: STATUS_NOT_SUPPORTED, ou
+# STATUS_ADDRESS_ALREADY_EXISTS com a área instalada em *ProfileStructures;
+# sem memória, STATUS_NO_MEMORY. O CALL de +0xc6 é o que drivers seguem.
+.balign 16
+.global opennt_ke_allocate_processor_profile_structures
+opennt_ke_allocate_processor_profile_structures:
+    .byte 0x48, 0x89, 0x54, 0x24, 0x10             # +0x00 mov [rsp + 0x10], rdx
+    .byte 0x89, 0x4C, 0x24, 0x08                   # +0x05 mov [rsp + 8], ecx
+    .byte 0x53                                     # +0x09 push rbx
+    .byte 0x56                                     # +0x0a push rsi
+    .byte 0x57                                     # +0x0b push rdi
+    .byte 0x41, 0x54                               # +0x0c push r12
+    .byte 0x41, 0x55                               # +0x0e push r13
+    .byte 0x41, 0x56                               # +0x10 push r14
+    .byte 0x41, 0x57                               # +0x12 push r15
+    .byte 0x48, 0x83, 0xEC, 0x20                   # +0x14 sub rsp, 0x20
+    .byte 0x4D, 0x8B, 0xF0                         # +0x18 mov r14, r8
+    .byte 0x8B, 0xC1                               # +0x1b mov eax, ecx
+    .byte 0x44, 0x0F, 0x20, 0xC7                   # +0x1d mov rdi, cr8
+    .byte 0x45, 0x33, 0xD2                         # +0x21 xor r10d, r10d
+    .byte 0x45, 0x84, 0xC9                         # +0x24 test r9b, r9b
+    .byte 0x75, 0x64                               # +0x27 jne +0x8d
+    .byte 0x41, 0x8D, 0x52, 0x02                   # +0x29 lea edx, [r10 + 2]
+    .byte 0x44, 0x0F, 0x22, 0xC2                   # +0x2d mov cr8, rdx
+    .byte 0x8B, 0x05                               # +0x31 mov eax, [rip + KiIrqlFlags]
+    .long opennt_ki_irql_flags - . - 4
+    .byte 0x49, 0x83, 0xCF, 0xFF                   # +0x37 or r15, -1
+    .byte 0x85, 0xC0                               # +0x3b test eax, eax
+    # +0x3d jne (SchedulerAssist); sem o rastreio, o desvio cai em +0x43.
+    .byte 0x0F, 0x85
+    .long 0
+    .byte 0x65, 0x48, 0x8B, 0x0C, 0x25, 0x20, 0x00, 0x00, 0x00  # +0x43 mov rcx, gs:[0x20]
+    .byte 0x49, 0x8B, 0x06                         # +0x4c mov rax, [r14]
+    .byte 0x48, 0x89, 0x81, 0x98, 0x84, 0x00, 0x00 # +0x4f mov [rcx + 0x8498], rax
+    .byte 0x49, 0x8B, 0x06                         # +0x56 mov rax, [r14]
+    .byte 0x48, 0x83, 0xC0, 0x28                   # +0x59 add rax, 0x28
+    .byte 0x48, 0x89, 0x81, 0xA0, 0x84, 0x00, 0x00 # +0x5d mov [rcx + 0x84a0], rax
+    .byte 0x8B, 0x05                               # +0x64 mov eax, [rip + KiIrqlFlags]
+    .long opennt_ki_irql_flags - . - 4
+    .byte 0x85, 0xC0                               # +0x6a test eax, eax
+    # +0x6c jne (SchedulerAssist); sem o rastreio, o desvio cai em +0x72.
+    .byte 0x0F, 0x85
+    .long 0
+    .byte 0x40, 0x0F, 0xB6, 0xC7                   # +0x72 movzx eax, dil
+    .byte 0x44, 0x0F, 0x22, 0xC0                   # +0x76 mov cr8, rax
+    .byte 0x33, 0xC0                               # +0x7a xor eax, eax
+opennt_ke_profile_epilogue:
+    .byte 0x48, 0x83, 0xC4, 0x20                   # +0x7c add rsp, 0x20
+    .byte 0x41, 0x5F                               # +0x80 pop r15
+    .byte 0x41, 0x5E                               # +0x82 pop r14
+    .byte 0x41, 0x5D                               # +0x84 pop r13
+    .byte 0x41, 0x5C                               # +0x86 pop r12
+    .byte 0x5F                                     # +0x88 pop rdi
+    .byte 0x5E                                     # +0x89 pop rsi
+    .byte 0x5B                                     # +0x8a pop rbx
+    .byte 0xC3                                     # +0x8b ret
+    .byte 0xCC                                     # +0x8c int3
+    .byte 0x4C, 0x8B, 0xE8                         # +0x8d mov r13, rax
+    .byte 0x4D, 0x89, 0x10                         # +0x90 mov [r8], r10
+    .byte 0x4C, 0x0F, 0xAF, 0xEA                   # +0x93 imul r13, rdx
+    .byte 0x48, 0x8D, 0x34, 0x80                   # +0x97 lea rsi, [rax + rax*4]
+    .byte 0x44, 0x88, 0x54, 0x24, 0x78             # +0x9b mov [rsp + 0x78], r10b
+    .byte 0x48, 0xC1, 0xE6, 0x05                   # +0xa0 shl rsi, 5
+    .byte 0x4C, 0x8B, 0xE0                         # +0xa4 mov r12, rax
+    .byte 0x49, 0x03, 0xF5                         # +0xa7 add rsi, r13
+    .byte 0x44, 0x38, 0x15                         # +0xaa cmp [rip + KiKvaShadow], r10b
+    .long opennt_ki_kva_shadow - . - 4
+    .byte 0x74, 0x0E                               # +0xb1 je +0xc1
+    .byte 0x48, 0x81, 0xC6, 0xFF, 0x0F, 0x00, 0x00 # +0xb3 add rsi, 0xfff
+    .byte 0x48, 0x81, 0xE6, 0x00, 0xF0, 0xFF, 0xFF # +0xba and rsi, -0x1000
+    .byte 0x33, 0xD2                               # +0xc1 xor edx, edx
+    .byte 0x48, 0x8B, 0xCE                         # +0xc3 mov rcx, rsi
+    .byte 0xE8                                     # +0xc6 call MmAllocateIndependentPages
+    .long opennt_mm_allocate_independent_pages - . - 4
+    mov rbx, rax
+    test rbx, rbx
+    je 5f
+    # memset(buffer, 0, tamanho).
+    mov rdi, rbx
+    mov rcx, rsi
+    xor eax, eax
+    rep stosb
+    lea r10, [rbx + r13]
+    mov rdi, cr8
+    mov eax, 2
+    mov cr8, rax
+    mov r8, gs:[0x20]
+    # KiIsIntelPebsSupported(Prcb): CpuVendor (+0x8d) CPU_INTEL e, no
+    # IA32_MISC_ENABLE (0x1a0), bit 7 ligado e bit 12 desligado.
+    cmp byte ptr [r8 + 0x8d], 2
+    jne 6f
+    mov ecx, 0x1a0
+    rdmsr
+    shl rdx, 32
+    or rax, rdx
+    and eax, 0x1080
+    cmp rax, 0x80
+    jne 6f
+    mov rax, [r8 + 0x8498]
+    test rax, rax
+    jne 7f
+    cmp dword ptr [rsp + 0x60], eax
+    jbe 3f
+    mov rcx, [rsp + 0x68]
+    lea rax, [r10 + 0x20]
+2:
+    mov [rax], rbx
+    add rbx, rcx
+    lea rax, [rax + 0xa0]
+    sub r12, 1
+    jne 2b
+3:
+    xor ebx, ebx
+    mov [r14], r10
+    xor r14d, r14d
+4:
+    movzx eax, dil
+    mov cr8, rax
+    test rbx, rbx
+    jne 8f
+9:
+    mov eax, r14d
+    jmp opennt_ke_profile_epilogue
+5:
+    mov r14d, 0xC0000017
+    jmp 4b
+6:
+    mov r14d, 0xC00000BB
+    jmp 4b
+7:
+    mov [r14], rax
+    mov r14d, 0xC000020A
+    jmp 4b
+8:
+    mov rdx, rsi
+    mov rcx, rbx
+    call opennt_mm_free_independent_pages
+    jmp 9b
+
+.popsection
+
+.pushsection .text.page, "ax", @progbits
+
+# As três rotinas privadas: o stub marca o id e cai no trampolim comum.
+.balign 16
+.global opennt_mm_allocate_independent_pages
+opennt_mm_allocate_independent_pages:
+    mov eax, 0x80000000
+    jmp opennt_win32_common
+
+.balign 16
+.global opennt_mm_free_independent_pages
+opennt_mm_free_independent_pages:
+    mov eax, 0x80000001
+    jmp opennt_win32_common
+
+.balign 16
+.global opennt_ps_enum_process_threads
+opennt_ps_enum_process_threads:
+    mov eax, 0x80000002
+    jmp opennt_win32_common
+
+# MmFreeIsrStack(StackTop), rva 0x8d11c8: a pilha de ISR são 0x6000 bytes
+# abaixo do topo e uma página de guarda abaixo deles (MmAllocateIsrStack).
+# As páginas da pilha voltam pelo MmFreeIndependentPages; a guarda, pela
+# rotina privada que devolve a sua VA (o MiReleasePtes do PTE da guarda).
+.balign 16
+.global opennt_mm_free_isr_stack
+opennt_mm_free_isr_stack:
+    .byte 0x40, 0x53                               # +0x00 push rbx
+    .byte 0x48, 0x83, 0xEC, 0x20                   # +0x02 sub rsp, 0x20
+    .byte 0x48, 0x8D, 0x99, 0x00, 0xA0, 0xFF, 0xFF # +0x06 lea rbx, [rcx - 0x6000]
+    .byte 0xBA, 0x00, 0x60, 0x00, 0x00             # +0x0d mov edx, 0x6000
+    .byte 0x48, 0x8B, 0xCB                         # +0x12 mov rcx, rbx
+    .byte 0xE8                                     # +0x15 call MmFreeIndependentPages
+    .long opennt_mm_free_independent_pages - . - 4
+    lea rcx, [rbx - 0x1000]
+    call opennt_mi_release_boot_guard_page
+    add rsp, 0x20
+    pop rbx
+    ret
+
+.balign 16
+.global opennt_mi_release_boot_guard_page
+opennt_mi_release_boot_guard_page:
+    mov eax, 0x80000018
+    jmp opennt_win32_common
+
+# PopUpdateSingleProcessHeteroPolicies(Process), rva 0x8f1440: a rotina
+# inteira, com o callback 0x30 bytes adiante (o `lea rdx, [rip + 0x22]`).
+.balign 16
+.global opennt_pop_update_single_process_hetero_policies
+opennt_pop_update_single_process_hetero_policies:
+    .byte 0x48, 0x83, 0xEC, 0x28                   # +0x00 sub rsp, 0x28
+    .byte 0x45, 0x33, 0xC0                         # +0x04 xor r8d, r8d
+    .byte 0x48, 0x8D, 0x15                         # +0x07 lea rdx, [rip + callback]
+    .long opennt_pop_update_single_thread_hetero_policies - . - 4
+    .byte 0xE8                                     # +0x0e call PsEnumProcessThreads
+    .long opennt_ps_enum_process_threads - . - 4
+    .byte 0x33, 0xC0                               # +0x13 xor eax, eax
+    .byte 0x48, 0x83, 0xC4, 0x28                   # +0x15 add rsp, 0x28
+    .byte 0xC3                                     # +0x19 ret
+    .fill 22, 1, 0xCC                              # +0x1a int3 até +0x30
+
+# PopUpdateSingleThreadHeteroPolicies(Process, Thread, Context), +0x30.
+.global opennt_pop_update_single_thread_hetero_policies
+opennt_pop_update_single_thread_hetero_policies:
+    mov eax, 0x80000016
+    jmp opennt_win32_common
+
+# EtwpProcessEnumCallback(Process, Context): com o grupo de threads pedido
+# (bit 2 da máscara apontada por Context), as threads do processo passam
+# pelo EtwpThreadEnumCallback. A chamada repete a do ntoskrnl em +0x12e
+# (mov r8, rsi; lea rdx, [rip + EtwpThreadEnumCallback]; mov rcx, rbx; call).
+.balign 16
+.global opennt_etwp_process_enum_callback
+opennt_etwp_process_enum_callback:
+    push rbx
+    push rsi
+    sub rsp, 0x28
+    mov rbx, rcx
+    mov rsi, rdx
+    mov rax, [rdx]
+    test rax, rax
+    je 2f
+    test byte ptr [rax], 2
+    je 2f
+    .byte 0x4C, 0x8B, 0xC6                         # mov r8, rsi
+    .byte 0x48, 0x8D, 0x15                         # lea rdx, [rip + EtwpThreadEnumCallback]
+    .long opennt_etwp_thread_enum_callback - . - 4
+    .byte 0x48, 0x8B, 0xCB                         # mov rcx, rbx
+    .byte 0xE8                                     # call PsEnumProcessThreads
+    .long opennt_ps_enum_process_threads - . - 4
+2:
+    xor eax, eax
+    add rsp, 0x28
+    pop rsi
+    pop rbx
+    ret
+
+.balign 16
+.global opennt_etwp_thread_enum_callback
+opennt_etwp_thread_enum_callback:
+    mov eax, 0x80000017
+    jmp opennt_win32_common
+
+.popsection
+"#
+);
+
 extern "C" {
+    static opennt_ke_allocate_processor_profile_structures: u8;
+    static opennt_mm_allocate_independent_pages: u8;
+    static opennt_mm_free_independent_pages: u8;
+    static opennt_ps_enum_process_threads: u8;
+    static opennt_mm_free_isr_stack: u8;
+    static opennt_mi_release_boot_guard_page: u8;
+    static opennt_pop_update_single_process_hetero_policies: u8;
+    static opennt_pop_update_single_thread_hetero_policies: u8;
+    static opennt_etwp_process_enum_callback: u8;
+    static opennt_etwp_thread_enum_callback: u8;
     static opennt_psp_context_operation_apc: u8;
     static opennt_psp_context_operation_rundown: u8;
     static opennt_ps_set_context_thread: u8;
@@ -424,6 +722,16 @@ pub const RELEASE_RUNDOWN_ID: u64 = 278;
 pub fn entry(symbol: &str) -> Option<u64> {
     let address = {
         match symbol {
+            "ke_allocate_processor_profile_structures" => core::ptr::addr_of!(opennt_ke_allocate_processor_profile_structures),
+            "MmAllocateIndependentPages" => core::ptr::addr_of!(opennt_mm_allocate_independent_pages),
+            "MmFreeIndependentPages" => core::ptr::addr_of!(opennt_mm_free_independent_pages),
+            "PsEnumProcessThreads" => core::ptr::addr_of!(opennt_ps_enum_process_threads),
+            "MmFreeIsrStack" => core::ptr::addr_of!(opennt_mm_free_isr_stack),
+            "MiReleaseBootGuardPage" => core::ptr::addr_of!(opennt_mi_release_boot_guard_page),
+            "PopUpdateSingleProcessHeteroPolicies" => core::ptr::addr_of!(opennt_pop_update_single_process_hetero_policies),
+            "PopUpdateSingleThreadHeteroPolicies" => core::ptr::addr_of!(opennt_pop_update_single_thread_hetero_policies),
+            "EtwpProcessEnumCallback" => core::ptr::addr_of!(opennt_etwp_process_enum_callback),
+            "EtwpThreadEnumCallback" => core::ptr::addr_of!(opennt_etwp_thread_enum_callback),
             "PspContextOperationApc" => core::ptr::addr_of!(opennt_psp_context_operation_apc),
             "PspContextOperationRundown" => core::ptr::addr_of!(opennt_psp_context_operation_rundown),
             "PspSetContextThreadInternal" => core::ptr::addr_of!(opennt_psp_set_context_thread_internal),

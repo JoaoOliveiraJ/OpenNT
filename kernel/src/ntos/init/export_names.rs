@@ -513,9 +513,10 @@ pub static GROUP_LAYOUT: &[(&str, usize, usize)] = &[
     ("se-query-session-id-token", 2058, 1),
     ("nt-build-number", 2059, 0),
     ("time-keeping", 2059, 14),
+    ("ke-processor-profile", 2073, 1),
 ];
 
-/// Os 2073 exports de função, na ordem da ABI.
+/// Os 2074 exports de função, na ordem da ABI.
 pub static EXPORT_NAMES: &[&str] = &[
     "DbgPrint",
     "DbgPrintEx",
@@ -2590,4 +2591,5 @@ pub static EXPORT_NAMES: &[&str] = &[
     "ZwQueryTimerResolution",
     "ZwSetTimerResolution",
     "ZwSetSystemTime",
+    "KeAllocateProcessorProfileStructures",
 ];

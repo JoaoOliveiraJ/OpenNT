@@ -66,7 +66,7 @@ pub struct Group {
 }
 
 /// Grupos implementados (qualquer ordem: a posição vem de `GROUP_LAYOUT`).
-fn groups() -> [&'static Group; 507] {
+fn groups() -> [&'static Group; 508] {
     [
         &crate::ntos::ps::exports::ps_jobs::GROUP,
         &crate::ntos::alpc::exports::zw_alpc_server::GROUP,
@@ -576,6 +576,7 @@ fn groups() -> [&'static Group; 507] {
         &crate::ntos::se::exports::se_query_session_id_token::GROUP,
         &crate::ntos::ke::exports::nt_build_number::GROUP,
         &crate::ntos::ex::exports::time_keeping::GROUP,
+        &crate::ntos::ke::exports::ke_processor_profile::GROUP,
     ]
 }
 
@@ -1025,6 +1026,9 @@ pub mod private_routines {
     pub const WIN32_CLOSE_ID: u64 = ID + 19;
     pub const WIN32_DELETE_ID: u64 = ID + 20;
     pub const WIN32_PARSE_ID: u64 = ID + 21;
+    pub const THREAD_HETERO_POLICIES_ID: u64 = ID + 22;
+    pub const ETW_THREAD_ENUM_ID: u64 = ID + 23;
+    pub const RELEASE_GUARD_PAGE_ID: u64 = ID + 24;
 
     pub fn name(id: u64) -> Option<&'static str> {
         use crate::hal::private_dispatch;
@@ -1057,6 +1061,9 @@ pub mod private_routines {
             WIN32_CLOSE_ID => "ExpWin32CloseProcedure",
             WIN32_DELETE_ID => "ExpWin32DeleteProcedure",
             WIN32_PARSE_ID => "ExpWin32ParseProcedure",
+            THREAD_HETERO_POLICIES_ID => "PopUpdateSingleThreadHeteroPolicies",
+            ETW_THREAD_ENUM_ID => "EtwpThreadEnumCallback",
+            RELEASE_GUARD_PAGE_ID => "MiReleaseBootGuardPage",
             _ => return None,
         })
     }
@@ -1110,6 +1117,13 @@ pub mod private_routines {
                 Ok(0)
             }
             WIN32_PARSE_ID => Ok(super::signed_status(crate::ntos::ex::win32::parse_procedure(call.arg(1), call.arg(2), call.arg(3), call.arg(4) as u8, call.arg(5) as u32, call.arg(6), call.arg(7), call.arg(8), call.arg(9), call.arg(10)))),
+            // PopUpdateSingleThreadHeteroPolicies(Process, Thread, Context).
+            THREAD_HETERO_POLICIES_ID => {
+                crate::ntos::ke::hetero_policy::update_single_thread(call.arg(2));
+                Ok(0)
+            }
+            ETW_THREAD_ENUM_ID => Ok(crate::ntos::etw::rundown::thread_enum_callback(call.arg(2), call.arg(3)) as u64),
+            RELEASE_GUARD_PAGE_ID => independent_pages::release_guard_page(call.arg(1)).map(|()| 0),
             _ => Err(KernelError::new(alloc::format!("private routine {} enters with its module", name(id).unwrap_or("?")))),
         }
     }

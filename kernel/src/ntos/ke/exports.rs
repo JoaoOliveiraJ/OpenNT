@@ -1321,3 +1321,20 @@ pub mod nt_build_number {
 
     pub static GROUP: Group = Group { name: "nt-build-number", names: &[], handlers: &[], data_exports: &[("NtBuildNumber", version::build_number_cell)] };
 }
+
+pub mod ke_processor_profile {
+    //! KeAllocateProcessorProfileStructures — `ke/processor_profile` (o
+    //! resolvedor e a EAT entregam o corpo nativo; a tabela entra nele).
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::ke::processor_profile;
+    use crate::rtl::KernelError;
+
+    /// KeAllocateProcessorProfileStructures(ProcessorCount, BufferSize,
+    /// ProfileStructures, Allocate) -> NTSTATUS.
+    fn allocate_processor_profile_structures(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(processor_profile::allocate_structures(call.arg(1) as u32, call.arg(2), call.arg(3), call.arg(4) as u8)?))
+    }
+
+    pub static GROUP: Group = Group { name: "ke-processor-profile", names: &["KeAllocateProcessorProfileStructures"], handlers: &[allocate_processor_profile_structures], data_exports: &[] };
+}

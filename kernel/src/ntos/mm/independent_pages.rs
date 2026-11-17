@@ -2,8 +2,13 @@
 //!
 //! VA contínua, PFNs independentes. Diferente do pool ou de faixas
 //! contíguas, todo frame continua possuído por este mapeamento.
+//!
+//! Uma página de guarda (o MiMarkBootGuardPage do NT) é a primeira página de
+//! uma alocação sem mapeamento nem frame: a VA continua reservada até o
+//! release_guard_page. A pilha de ISR (MmAllocateIsrStack/MmFreeIsrStack)
+//! usa uma: 0x7000 bytes com a guarda embaixo e 0x6000 de pilha.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
 use super::paging::{self, MapOptions};
@@ -28,10 +33,15 @@ struct Record {
 struct State {
     records: BTreeMap<u64, Record>,
     ranges: Vec<(u64, u64)>,
+    /// VAs de guarda: reservadas, sem mapeamento nem frame.
+    guards: BTreeSet<u64>,
     initialized: bool,
 }
 
-static STATE: SpinLock<State> = SpinLock::new(State { records: BTreeMap::new(), ranges: Vec::new(), initialized: false });
+static STATE: SpinLock<State> = SpinLock::new(State { records: BTreeMap::new(), ranges: Vec::new(), guards: BTreeSet::new(), initialized: false });
+
+/// Os 0x6000 bytes da pilha de ISR (KERNEL_STACK_SIZE do x64).
+pub const ISR_STACK_SIZE: u64 = 0x6000;
 
 fn level() -> Result<(), KernelError> {
     if irql::get_irql() > 1 {
@@ -64,6 +74,11 @@ fn return_range(state: &mut State, base: u64, size: u64) {
 /// Tabelas destacadas, frames e VA continuam possuídos até todas as CPUs
 /// confirmarem; uma confirmação falha deixa um dono que pode tentar de novo.
 fn release(base: u64) -> Result<(), KernelError> {
+    release_keeping(base, false)
+}
+
+/// `keep_va`: a VA vira guarda em vez de voltar às faixas livres.
+fn release_keeping(base: u64, keep_va: bool) -> Result<(), KernelError> {
     let mut record = STATE.lock().records.get(&base).cloned().ok_or_else(|| KernelError::new("independent pages record missing"))?;
     record.retiring = true;
     while record.unmapped < record.mapped {
@@ -85,7 +100,13 @@ fn release(base: u64) -> Result<(), KernelError> {
     }
     let mut state = STATE.lock();
     state.records.remove(&base);
-    return_range(&mut state, record.base, record.size);
+    if keep_va {
+        for page in (record.base..record.base + record.size).step_by(4096) {
+            state.guards.insert(page);
+        }
+    } else {
+        return_range(&mut state, record.base, record.size);
+    }
     Ok(())
 }
 
@@ -231,6 +252,73 @@ pub fn free_pages(address: u64, bytes: u64) -> Result<(), KernelError> {
         state.records.insert(base, retiring);
     }
     release(base)
+}
+
+/// MiMarkBootGuardPage sobre a primeira página de uma alocação inteira: a
+/// página sai do mapeamento e o frame volta ao PFN; a VA fica reservada como
+/// guarda e o resto da alocação continua com o seu dono.
+pub fn mark_guard_page(address: u64) -> Result<(), KernelError> {
+    level()?;
+    let record = STATE.lock().records.get(&address).cloned();
+    let record = record
+        .filter(|record| !record.retiring && record.size > 4096 && record.mapped == record.frames.len() as u64)
+        .ok_or_else(|| KernelError::new("guard page requires the first page of an owned allocation"))?;
+    if !owns_mapping(&record) {
+        return Err(KernelError::new("independent pages mapping no longer belongs to its owner"));
+    }
+    let rest = Record {
+        base: address + 4096,
+        size: record.size - 4096,
+        bytes: record.bytes - 4096,
+        preferred_node: record.preferred_node,
+        frames: record.frames[1..].to_vec(),
+        mapped: record.mapped - 1,
+        unmapped: 0,
+        tables: Vec::new(),
+        retiring: false,
+    };
+    let guard = Record { base: address, size: 4096, bytes: 4096, preferred_node: record.preferred_node, frames: alloc::vec![record.frames[0]], mapped: 1, unmapped: 0, tables: Vec::new(), retiring: false };
+    {
+        // O registro conferido ainda é o vivo: a troca é atômica sob o lock.
+        let mut state = STATE.lock();
+        if !state.records.get(&address).is_some_and(|current| !current.retiring && current.size == record.size && current.frames == record.frames) {
+            return Err(KernelError::new("independent pages allocation changed while marking its guard page"));
+        }
+        state.records.insert(rest.base, rest);
+        state.records.insert(address, guard);
+    }
+    release_keeping(address, true)
+}
+
+/// Devolve a VA de uma página de guarda às faixas livres (o MiReleasePtes
+/// do PTE da guarda no MmFreeIsrStack).
+pub fn release_guard_page(address: u64) -> Result<(), KernelError> {
+    level()?;
+    let mut state = STATE.lock();
+    if !state.guards.remove(&address) {
+        return Err(KernelError::new("address is not an independent guard page"));
+    }
+    return_range(&mut state, address, 4096);
+    Ok(())
+}
+
+pub fn is_guard_page(address: u64) -> bool {
+    STATE.lock().guards.contains(&address)
+}
+
+/// O caminho de alocação do MmAllocateIsrStack: 0x7000 bytes de páginas
+/// independentes, a primeira como guarda; devolve o topo da pilha (o
+/// IsrStack da PRCB) ou 0 sem memória. MmFreeIsrStack libera pelo topo.
+pub fn allocate_isr_stack() -> Result<u64, KernelError> {
+    let base = allocate(ISR_STACK_SIZE + 4096, 0)?;
+    if base == 0 {
+        return Ok(0);
+    }
+    if let Err(error) = mark_guard_page(base) {
+        let _ = free(base);
+        return Err(error);
+    }
+    Ok(base + 4096 + ISR_STACK_SIZE)
 }
 
 #[derive(Clone, Debug)]

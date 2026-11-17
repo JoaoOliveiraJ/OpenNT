@@ -277,6 +277,31 @@ outra VA de sistema na mesma PD: 383 páginas RW e NX terminando em
 guarda sem mapeamento embaixo (PT em 0x8E000). O stage2 carrega o GDTR pela VA
 do mapa direto e entra no kernel com RSP = BOOT_STACK_TOP - 8.
 
+*Seções de código.* A imagem tem duas: `.text` e, logo depois, `PAGE`, como
+no ntoskrnl. As duas levam CNT_CODE, MEM_EXECUTE, MEM_READ e MEM_NOT_PAGED
+(0x68000020); o OpenNT não pagina o kernel, então a PAGE fica residente. A
+PAGE recebe as seções de entrada `.text.page` (`kernel/link.ld`; o padrão da
+`.text` aceita todo `.text.*` menos esse nome) e guarda os corpos que drivers
+acham pelos bytes. Alguns drivers chegam a rotinas que o ntoskrnl não exporta
+seguindo um CALL conhecido: o MmAllocateIndependentPages pelo CALL de
+KeAllocateProcessorProfileStructures+0xc6 (`33 D2 48 8B CE E8`, depois de
+`add rsi,0FFFh; and rsi,-1000h`), o MmFreeIndependentPages pelo
+MmFreeIsrStack (`40 53 48 83 EC 20 48 8D 99 00 A0 FF FF BA 00 60 00 00 48 8B
+CB E8`) e o PsEnumProcessThreads pelo PopUpdateSingleProcessHeteroPolicies
+(`48 83 EC 28 45 33 C0 48 8D 15 22 00 00 00 E8`) e pelo
+EtwpProcessEnumCallback (`4C 8B C6 48 8D 15 rel32 48 8B CB E8`). Em
+`hal/amd64/private_entries.rs`, cada um desses corpos repete a sequência do
+ntoskrnl 19041 até o CALL (no EtwpProcessEnumCallback, a da chamada), byte a
+byte menos os deslocamentos relativos, e segue com o código do OpenNT. As três rotinas privadas ficam na PAGE (um stub
+que marca o id e cai no trampolim comum), assim como o MmFreeIsrStack
+(a pilha de ISR de `mm/independent_pages.rs`: guarda embaixo e 0x6000 bytes
+de pilha), o PopUpdateSingleProcessHeteroPolicies (com o callback de
+`ke/hetero_policy.rs`) e o EtwpProcessEnumCallback (com o callback de
+`etw/rundown.rs`); o KeAllocateProcessorProfileStructures é um export com
+corpo nativo na `.text` (`ke/processor_profile.rs`). O logger do OpenNT ainda
+não grava o rundown clássico do NT Kernel Logger: o EtwpThreadEnumCallback só
+marca no contexto o tipo do evento (DCStart de thread).
+
 *Modelo de código.* O alvo `x86_64-unknown-none` usa o code model `kernel`,
 cujos endereços absolutos de 32 bits só alcançam os 2 GB do topo; ligar em
 0xFFFFF80x exige outro arranjo. O escolhido é gerar o código independente de

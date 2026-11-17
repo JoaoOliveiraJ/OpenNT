@@ -10,7 +10,13 @@
  * O código é independente de posição (relocation-model=pic) e o executável
  * é estático (--no-pie): o linker resolve toda referência para estes
  * endereços. `.data.rel.ro` (dados constantes com ponteiros) fica em
- * `.rodata`, como ficaria num executável de relocação estática. */
+ * `.rodata`, como ficaria num executável de relocação estática.
+ *
+ * `PAGE` vem logo depois de `.text`, como no ntoskrnl, e recebe as seções de
+ * entrada `.text.page`: os corpos nativos que drivers procuram pelos bytes
+ * na seção PAGE. O linker atribui cada seção de entrada à primeira regra que
+ * a aceita, por isso o padrão de `.text` aceita todo `.text.*` menos o nome
+ * exato `.text.page`. O OpenNT não pagina o kernel: a PAGE fica residente. */
 ENTRY(kernel_main)
 
 SECTIONS
@@ -19,7 +25,12 @@ SECTIONS
 
     .text : ALIGN(4096) {
         *(.text.boot)
-        *(.text .text.*)
+        *(.text .text.[!p]* .text.p[!a]* .text.pa[!g]* .text.pag[!e]* .text.page?* .text.p .text.pa .text.pag)
+    }
+
+    . = ALIGN(4096);
+    PAGE : ALIGN(4096) {
+        *(.text.page)
     }
 
     . = ALIGN(4096);

@@ -13,6 +13,8 @@ pub mod processor_information;
 pub mod smp;
 pub mod thread_dispatch;
 pub mod thread_lock;
+pub mod hetero_policy;
+pub mod processor_profile;
 pub mod apc;
 pub mod critical_region;
 pub mod dispatcher;

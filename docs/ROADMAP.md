@@ -19,7 +19,7 @@ O OpenNT avança em fases. Cada fase termina com o kernel compilando, iniciando 
 
 **Próximo.** O services.exe passar do ScExtInitialize (o scesrv.dll no volume, e o heap do kernel, a janela de 64 MB, com espaço para mapear a imagem) e seguir ao ScEnableRpcInterface e ao início automático: o svchost do DcomLaunch e do Local Session Manager (lsm.dll), que sinaliza o TermSrvReadyEvent e conecta a sessão 1 ao console. O winlogon.exe espera esse evento no WinStationWaitForConnect, e o win32k da sessão 1 só recebe o vídeo físico pelo NtUserRemoteConnect que o csrss faz a pedido do LSM (teste primeiro-pixel).
 
-Hoje: **49 de 79** binários da Microsoft rodam (28 parciais); o kernel exporta **2.078 dos 3.070** nomes do `ntoskrnl.exe` do Windows 10 22H2 (67,7%). Detalhes em [O que roda](site/o-que-roda.html), [Componentes](site/componentes.html), [Exports](site/ntoskrnl.html) e [Testes](site/testes.html).
+Hoje: **49 de 79** binários da Microsoft rodam (28 parciais); o kernel exporta **2.079 dos 3.070** nomes do `ntoskrnl.exe` do Windows 10 22H2 (67,7%). Detalhes em [O que roda](site/o-que-roda.html), [Componentes](site/componentes.html), [Exports](site/ntoskrnl.html) e [Testes](site/testes.html).
 
 ## Fase 1 — base (concluída)
 

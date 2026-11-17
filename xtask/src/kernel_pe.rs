@@ -9,6 +9,11 @@
 //! no `ntoskrnl.lib` dos drivers. A `.rsrc` leva a tabela de mensagens do
 //! ntoskrnl.exe da máquina (os nomes dos códigos de bugcheck), que o kernel
 //! acha pelo próprio diretório de recursos, como o KiBugCodeMessages.
+//!
+//! As seções de código são `.text` e `PAGE`, nesta ordem, como no ntoskrnl.
+//! As duas levam CNT_CODE | MEM_EXECUTE | MEM_READ e MEM_NOT_PAGED
+//! (0x68000020, o valor da `.text` real): o OpenNT não pagina o kernel, então
+//! a PAGE também fica residente.
 
 use crate::elf::{Elf, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHT_NOBITS, SHT_PROGBITS};
 
@@ -117,7 +122,8 @@ pub fn build_kernel_pe(elf_bytes: &[u8], message_table: Option<&[u8]>) -> Result
         check(top <= MAX, "kernel excede a memoria reservada")?;
         let nobits = section.kind == SHT_NOBITS;
         let characteristics = (if section.flags & SHF_EXECINSTR != 0 {
-            0x2000_0020
+            // MEM_EXECUTE | MEM_NOT_PAGED | CNT_CODE.
+            0x2800_0020
         } else if nobits {
             0x80
         } else {
@@ -133,6 +139,9 @@ pub fn build_kernel_pe(elf_bytes: &[u8], message_table: Option<&[u8]>) -> Result
             data: if nobits { &[] } else { linked.range(section.offset, section.size)? },
         });
     }
+    // Código só em `.text` e na PAGE logo depois, sem escrita.
+    let code: Vec<(&str, u32)> = sections.iter().filter(|section| section.characteristics & 0x20 != 0).map(|section| (section.name.as_str(), section.characteristics)).collect();
+    check(code == [(".text", 0x6800_0020), ("PAGE", 0x6800_0020)], "secoes de codigo devem ser .text e PAGE, sem escrita")?;
 
     // ---- .kdata: globais exportadas (ntos/mm/kernel_data_layout.rs) --------
     let data_size = kernel_data_layout::required_byte_length();
