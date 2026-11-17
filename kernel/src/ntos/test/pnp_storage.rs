@@ -681,6 +681,12 @@ fn display_and_bridge_rows(assert: Assert) {
     assert(install::select_driver(&ids(&["PCI\\VEN_1414&DEV_5353&SUBSYS_00000000&REV_00"]), &ids(&["PCI\\VEN_1414&DEV_5353", "PCI\\CC_0300"])).is_none(), "pnp-storage: o ExcludeID da secao MSBDA recusa o adaptador do Hyper-V");
     let bridge = install::select_driver(&ids(&["PCI\\VEN_8086&DEV_7000&SUBSYS_11001AF4&REV_00"]), &ids(&["PCI\\VEN_8086&DEV_7000", "PCI\\CC_060100", "PCI\\CC_0601"]));
     assert(bridge.is_some_and(|driver| driver.inf == "machine.inf" && driver.class.name == "System" && driver.service.is_some_and(|service| service.name == "msisadrv" && install::service_image_path(service) == "System32\\drivers\\msisadrv.sys")), "pnp-storage: PCI\\CC_0601 instala o msisadrv.sys (machine.inf)");
+    // O adaptador de renderização da raiz e os monitores que o dxgkrnl relata.
+    let render = install::select_driver(&ids(&["ROOT\\BasicRender"]), &[]);
+    let basic_render = "\\SystemRoot\\System32\\DriverStore\\FileRepository\\basicrender.inf_amd64_eebb5a8467eb88ec\\BasicRender.sys";
+    assert(render.is_some_and(|driver| driver.inf == "basicrender.inf" && driver.section == "BasicRender" && driver.class.name == "System" && driver.service.is_some_and(|service| service.name == "BasicRender" && service.start == 1 && install::service_image_path(service) == basic_render)), "pnp-storage: ROOT\\BasicRender instala o BasicRender.sys do repositorio de drivers (basicrender.inf)");
+    let monitor = |hardware: &[&str], section: &str| install::select_driver(&ids(hardware), &ids(&["*PNP09FF"])).is_some_and(|driver| driver.inf == "monitor.inf" && driver.section == section && driver.class.name == "Monitor" && driver.service.is_some_and(|service| service.name == "monitor" && install::service_image_path(service) == "\\SystemRoot\\System32\\drivers\\monitor.sys"));
+    assert(monitor(&["MONITOR\\Default_Monitor"], "NonPnPMonitor.Install") && monitor(&["MONITOR\\MSI3DC9"], "PnPMonitor.Install"), "pnp-storage: MONITOR\\Default_Monitor e *PNP09FF instalam o monitor.sys (monitor.inf)");
     let Some(adapter) = pci::devices().into_iter().find(|function| function.class_code == 0x03 && function.sub_class == 0x00) else {
         assert(false, "pnp-storage: adaptador VGA enumerado");
         return;
