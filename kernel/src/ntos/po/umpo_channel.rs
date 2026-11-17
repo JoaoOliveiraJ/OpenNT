@@ -136,6 +136,7 @@ pub fn initialize() -> Result<(), KernelError> {
 
 /// PopUmpoMessageCallback(CallbackContext, Argument1, Argument2).
 extern "win64" fn message_callback(_context: u64, _argument1: u64, _argument2: u64) {
+    crate::debug_print!("[po] \\PowerPort: PopUmpoMessageCallback");
     process_messages();
 }
 
@@ -170,27 +171,29 @@ fn process_message(message: u64) {
     match message_type {
         LPC_CONNECTION_REQUEST => accept_connection(message),
         LPC_PORT_CLOSED | LPC_CLIENT_DIED => {
+            CLIENT_CONNECTED.store(false, Ordering::Release);
             let client = CLIENT_PORT.swap(0, Ordering::AcqRel);
+            crate::debug_print!("[po] \\PowerPort: o cliente saiu (tipo {}), fechando a porta de comunicacao {:#x}", message_type, client);
             if client != 0 {
                 let _ = crate::ntos::ob::close::close(client, Some(0));
             }
-            CLIENT_CONNECTED.store(false, Ordering::Release);
+            crate::debug_print!("[po] \\PowerPort: porta de comunicacao fechada");
         }
         _ => {}
     }
 }
 
-/// ZwAlpcAcceptConnectPort do primeiro cliente (MaxMessageLength 0x1000);
-/// os outros são recusados.
+/// ZwAlpcAcceptConnectPort do primeiro cliente, com a porta de comunicação
+/// num handle de kernel (OBJ_KERNEL_HANDLE, na tabela do System: o callback
+/// roda no contexto do cliente); os outros são recusados.
 fn accept_connection(message: u64) {
     let server_port = SERVER_PORT.load(Ordering::Acquire);
-    let Ok(block) = zeroed(0x100) else { return };
-    let (attributes, port_attributes, handle_cell) = (block, block + 0x40, block + 0x90);
+    let Ok(block) = zeroed(0x80) else { return };
+    let (attributes, handle_cell) = (block, block + 0x40);
     object_attributes(attributes, None, 0);
-    // SAFETY: o bloco zerado reserva os 0x48 bytes do ALPC_PORT_ATTRIBUTES.
-    unsafe { AlpcPortAttributes::at(port_attributes) }.max_message_length.set(MAXIMUM_MESSAGE_LENGTH);
     let accept = !CLIENT_CONNECTED.load(Ordering::Acquire);
-    let status = crate::ntos::ps::previous_mode::with_kernel(|| server::accept_connect_port(handle_cell, server_port, port_attributes, 0, message, accept, 0)).ok().and_then(Result::ok).unwrap_or(0xC000_0001);
+    let status = crate::ntos::ps::previous_mode::with_kernel(|| server::accept_connect_port(handle_cell, server_port, attributes, 0, message, accept, 0)).ok().and_then(Result::ok).unwrap_or(0xC000_0001);
+    crate::debug_print!("[po] \\PowerPort: pedido de conexao {} ({:#x})", if accept { "aceito" } else { "recusado" }, status);
     if accept && status == STATUS_SUCCESS {
         CLIENT_PORT.store(guest::read64(handle_cell), Ordering::Release);
         CLIENT_CONNECTED.store(true, Ordering::Release);
