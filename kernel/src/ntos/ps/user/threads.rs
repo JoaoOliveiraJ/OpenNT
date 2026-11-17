@@ -1145,6 +1145,17 @@ pub fn wait_custom(mut wait: Wait, timeout: u64, timeout_ms: Option<Option<u64>>
     PENDING
 }
 
+/// A espera de um serviço de modo usuário nos objetos capturados por
+/// `ob/wait::reference_objects` (WaitAny devolve o primeiro índice
+/// satisfeito, WaitAll o status conjunto), com o prazo em ms (`None` = sem
+/// prazo): as referências da captura ficam com a espera e saem quando ela
+/// conclui.
+pub fn wait_referenced(set: crate::ntos::ob::wait::WaitObjects, wait_type: u32, timeout_ms: Option<u64>, alertable: bool) -> u32 {
+    let objects = set.objects.clone();
+    let wait = Wait { objects, wait_type, alertable: Some(alertable), cleanup: Some(Box::new(move |_status| set.release())), ..Wait::default() };
+    wait_custom(wait, 0, Some(timeout_ms))
+}
+
 pub fn wait_objects(entries: Vec<Arc<UserHandle>>, objects: Vec<u64>, wait_type: u32, timeout: u64, alertable: bool) -> u32 {
     let ms = dispatcher::timeout_pointer_to_ms(timeout);
     let mut wait = Wait { entries: Some(entries), objects, wait_type, alertable: Some(alertable), deadline: ms.map(|ms| clock::uptime_ms() + ms), ..Wait::default() };

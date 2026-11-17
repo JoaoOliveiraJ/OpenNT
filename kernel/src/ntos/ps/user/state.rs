@@ -563,6 +563,25 @@ pub fn probe_user_read(va: u64, size: u64) -> bool {
     probe_user_access(va, size, false)
 }
 
+/// Um LARGE_INTEGER de entrada de modo usuário (o Interval do
+/// NtDelayExecution), capturado como o ProbeForRead + cópia do NT: um
+/// endereço inválido dá STATUS_ACCESS_VIOLATION.
+pub fn capture_large_integer(va: u64) -> Result<i64, u32> {
+    if !probe_user_read(va, 8) {
+        return Err(STATUS_ACCESS_VIOLATION);
+    }
+    guest::try_read::<i64>(va).map_err(|_| STATUS_ACCESS_VIOLATION)
+}
+
+/// O PLARGE_INTEGER Timeout opcional de uma espera de modo usuário,
+/// capturado antes da espera: `None` sem ponteiro (espera sem prazo).
+pub fn capture_timeout(va: u64) -> Result<Option<i64>, u32> {
+    if va == 0 {
+        return Ok(None);
+    }
+    capture_large_integer(va).map(Some)
+}
+
 // ---- tabela de handles do processo ---------------------------------------
 
 /// Corpo nativo de um objeto.

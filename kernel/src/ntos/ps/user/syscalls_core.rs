@@ -7,17 +7,17 @@
 //! partições) entram pelos ganchos que esses módulos instalam.
 
 use alloc::string::String;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
-use super::state::{self, probe_user_read, probe_user_write, stack_arg, UserHandle, STATUS_INFO_LENGTH_MISMATCH, STATUS_INVALID_HANDLE, STATUS_INVALID_INFO_CLASS, STATUS_INVALID_PARAMETER, STATUS_SUCCESS, TERMINATE_MAGIC};
+use super::state::{self, probe_user_read, probe_user_write, stack_arg, STATUS_INFO_LENGTH_MISMATCH, STATUS_INVALID_HANDLE, STATUS_INVALID_INFO_CLASS, STATUS_INVALID_PARAMETER, STATUS_SUCCESS, TERMINATE_MAGIC};
 use super::threads;
 use crate::hal::{amd64::usermode, cpu, kmalloc, serial};
 use crate::ntos::ex::boot_environment_information;
 use crate::ntos::ke::{clock, dispatcher, pcr, processor_information, smp};
 use crate::ntos::mm::{memory_information, memory_map, pfn};
 use crate::ntos::ob::handles::namespace as namespace_handles;
+use crate::ntos::ob::wait as ob_wait;
 use crate::ntos::ps::{image_information, system_process_information};
 use crate::ntos::ps::context::registers as thread_context_registers;
 use crate::ntos::se::{code_integrity_information, secure_boot_information};
@@ -25,6 +25,9 @@ use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::inc::types::extra_ps_user::SystemMemoryListInformation;
 use crate::ntos::inc::types::{Context, Eprocess, NtStruct, ProcessBasicInformation, ProcessExtendedBasicInformation, ProcessorNumber, SystemBasicInformation, SystemNumaInformation, UnicodeString, XsaveFormat};
+
+/// PreviousMode dos serviços deste módulo.
+const USER_MODE: u8 = 1;
 
 /// Gancho: (userRsp, retLen*) → status.
 pub type StackQuery = fn(u64, u64) -> Result<u32, KernelError>;
@@ -258,75 +261,72 @@ fn nt_continue(context: u64, _alertable: u64, _a3: u64, _a4: u64, _rsp: u64) -> 
     })
 }
 
-/// Objeto esperável do handle com SYNCHRONIZE.
-fn waitable(handle: u64) -> Result<(Arc<UserHandle>, u64), u32> {
-    let Some(entry) = state::get_user_handle(handle) else { return Err(STATUS_INVALID_HANDLE) };
-    let Some(pointer) = entry.object.wait_pointer() else { return Err(STATUS_INVALID_HANDLE) };
-    if entry.access() & 0x10_0000 == 0 {
-        return Err(0xC000_0022);
+/// A espera de um serviço de modo usuário nos objetos capturados: pelo
+/// despachante (PENDING + espera sondada) ou, fora dele, a espera do Ke no
+/// lugar (o prazo vai numa célula do kernel).
+fn wait_captured(set: ob_wait::WaitObjects, wait_type: u32, timeout: Option<i64>, alertable: bool) -> u32 {
+    if threads::active() {
+        return threads::wait_referenced(set, wait_type, dispatcher::timeout_value_to_ms(timeout), alertable);
     }
-    Ok((entry, pointer))
+    let cell = match timeout {
+        Some(value) => {
+            let cell = guest::alloc_bytes(8);
+            if cell == 0 {
+                set.release();
+                return 0xC000_0017;
+            }
+            guest::write64(cell, value as u64);
+            cell
+        }
+        None => 0,
+    };
+    let status = ob_wait::wait_referenced(set, wait_type, 0, false, cell);
+    if cell != 0 {
+        guest::free_bytes(cell);
+    }
+    status
 }
 
-/// NtWaitForSingleObject(handle, alertable, timeout*): espera real.
+/// NtWaitForSingleObject(handle, alertable, timeout*): o prazo capturado e
+/// o ObWaitForSingleObject em UserMode (o handle precisa de SYNCHRONIZE; um
+/// objeto sem objeto de espera próprio conclui de imediato).
 fn nt_wait_for_single_object(handle: u64, alertable: u64, timeout: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
-    if timeout != 0 && !probe_user_read(timeout, 8) {
-        return Ok(0xC000_0005);
-    }
-    let (entry, pointer) = match waitable(handle) {
-        Ok(found) => found,
+    let timeout = match state::capture_timeout(timeout) {
+        Ok(timeout) => timeout,
         Err(status) => return Ok(status),
     };
-    if threads::active() {
-        return Ok(threads::wait_objects(alloc::vec![entry], alloc::vec![pointer], 1, timeout, alertable & 0xFF != 0));
-    }
-    Ok(dispatcher::wait_for_single_object(pointer, timeout, 0, false))
+    Ok(match ob_wait::reference_objects(&[handle], USER_MODE, ob_wait::WAIT_ANY) {
+        Ok(set) => wait_captured(set, ob_wait::WAIT_ANY, timeout, alertable & 0xFF != 0),
+        Err(status) => status,
+    })
 }
 
-/// NtWaitForMultipleObjects(count, handles*, waitType, alertable, timeout*).
+/// NtWaitForMultipleObjects(count, handles*, waitType, alertable,
+/// timeout*), como no 19041: Count e WaitType antes de tudo
+/// (STATUS_INVALID_PARAMETER_1/_3), a captura do prazo e do vetor de
+/// HANDLEs e o ObWaitForMultipleObjects em UserMode (`ob/wait`).
 fn nt_wait_for_multiple_objects(count: u64, handles: u64, wait_type: u64, alertable: u64, rsp: u64) -> Result<u32, KernelError> {
-    let count = count as u32 as u64;
-    if count == 0 || count > 64 || wait_type > 1 {
-        return Ok(STATUS_INVALID_PARAMETER);
+    let (count, wait_type) = (count as u32, wait_type as u32);
+    if let Err(status) = ob_wait::check_multiple_wait(count, wait_type) {
+        return Ok(status);
     }
-    let timeout = stack_arg(rsp, 5);
-    if !probe_user_read(handles, count * 8) || (timeout != 0 && !probe_user_read(timeout, 8)) {
+    let timeout = match state::capture_timeout(stack_arg(rsp, 5)) {
+        Ok(timeout) => timeout,
+        Err(status) => return Ok(status),
+    };
+    if !probe_user_read(handles, count as u64 * 8) {
         return Ok(0xC000_0005);
     }
     // O vetor de HANDLEs é capturado de uma vez (cópia sondada).
-    let captured = match guest::try_read_bytes(handles, (count * 8) as usize) {
+    let captured = match guest::try_read_bytes(handles, count as usize * 8) {
         Ok(bytes) => bytes,
         Err(_) => return Ok(0xC000_0005),
     };
-    let mut pointers = Vec::new();
-    let mut entries = Vec::new();
-    for handle in captured.chunks_exact(8).map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8]))) {
-        match waitable(handle) {
-            Ok((entry, pointer)) => {
-                entries.push(entry);
-                pointers.push(pointer);
-            }
-            Err(status) => return Ok(status),
-        }
-    }
-    let mut unique = pointers.clone();
-    unique.sort_unstable();
-    unique.dedup();
-    if unique.len() as u64 != count {
-        return Ok(STATUS_INVALID_PARAMETER);
-    }
-    if threads::active() {
-        return Ok(threads::wait_objects(entries, pointers, wait_type as u32, timeout, alertable & 0xFF != 0));
-    }
-    let array = guest::alloc_bytes(count * 8);
-    if array == 0 {
-        return Ok(0xC000_0017);
-    }
-    let objects: Vec<u8> = pointers.iter().flat_map(|pointer| pointer.to_le_bytes()).collect();
-    guest::write_bytes(array, &objects);
-    let status = dispatcher::wait_for_multiple_objects(count as u32, array, wait_type as u32, timeout, 0, false);
-    guest::free_bytes(array);
-    Ok(status)
+    let handles: Vec<u64> = captured.chunks_exact(8).map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8]))).collect();
+    Ok(match ob_wait::reference_objects(&handles, USER_MODE, wait_type) {
+        Ok(set) => wait_captured(set, wait_type, timeout, alertable & 0xFF != 0),
+        Err(status) => status,
+    })
 }
 
 /// NtSerializeBoot(): `io/pnp::serialize_boot`, de modo usuário.

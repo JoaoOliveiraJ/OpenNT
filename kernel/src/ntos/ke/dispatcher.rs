@@ -10,7 +10,6 @@
 //! de boot drena timers, DPCs, work items e o escalonador enquanto aguarda o
 //! estado ou o prazo.
 
-use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
@@ -300,19 +299,28 @@ pub fn timeout_to_100ns(timeout_pointer: u64) -> Option<u64> {
         return None;
     }
     // SAFETY: PLARGE_INTEGER Timeout do chamador.
-    let value = unsafe { LargeInteger::at(timeout_pointer) }.quad_part.get();
-    if value == 0 {
-        return Some(0);
+    Some(timeout_value_to_100ns(unsafe { LargeInteger::at(timeout_pointer) }.quad_part.get()))
+}
+
+/// O intervalo até o prazo `value` (o LARGE_INTEGER já capturado), em
+/// unidades de 100 ns: zero = consulta imediata, negativo = relativo,
+/// positivo = absoluto na hora do sistema (zero se já passou).
+pub fn timeout_value_to_100ns(value: i64) -> u64 {
+    if value <= 0 {
+        return value.unsigned_abs();
     }
-    if value < 0 {
-        return Some(value.unsigned_abs());
-    }
-    Some((value as u64).saturating_sub(clock::system_time_100ns()))
+    (value as u64).saturating_sub(clock::system_time_100ns())
 }
 
 /// Prazo apontado por `timeout_pointer`, em ms inteiros.
 pub fn timeout_pointer_to_ms(timeout_pointer: u64) -> Option<u64> {
     timeout_to_100ns(timeout_pointer).map(|value| value / 10_000)
+}
+
+/// O prazo capturado de uma espera de modo usuário (`None` = sem prazo), em
+/// ms inteiros.
+pub fn timeout_value_to_ms(value: Option<i64>) -> Option<u64> {
+    value.map(|value| timeout_value_to_100ns(value) / 10_000)
 }
 
 static LAST_SCHEDULER_TICK: SpinLock<u64> = SpinLock::new(0);
@@ -422,16 +430,16 @@ pub fn try_wait_objects_for(objects: &[u64], wait_type: u32, owner: u64) -> Opti
     None
 }
 
-/// KeWaitForMultipleObjects: até 64 ponteiros distintos.
+/// KeWaitForMultipleObjects: até 64 ponteiros. Como no 19041, um objeto
+/// repetido não é recusado aqui (o ObWaitForMultipleObjects recusa o
+/// repetido só no WaitAll): cada posição tem o seu bloco de espera, e no
+/// WaitAny o primeiro índice satisfeito vence.
 pub fn wait_for_multiple_objects(count: u32, objects_pointer: u64, wait_type: u32, timeout_pointer: u64, wait_mode: u8, alertable: bool) -> u32 {
     if count == 0 || count > 64 || wait_type > 1 {
         return 0xC000_000D;
     }
     // SAFETY: vetor PVOID Object[Count] do chamador.
     let objects: Vec<u64> = unsafe { Field::<u64>::array_at(objects_pointer, count as usize) }.iter().map(Field::get).collect();
-    if objects.iter().collect::<BTreeSet<_>>().len() != objects.len() {
-        return 0xC000_000D;
-    }
     if context_switch::kernel_thread_can_block() {
         return wait::wait_for_objects(&objects, wait_type == 0, wait::Deadline::after(timeout_to_100ns(timeout_pointer)), wait_mode, alertable, wait::reason::EXECUTIVE);
     }

@@ -849,7 +849,17 @@ pilha voltar ao Mm (uma aquisição continua até concluir, como a espera de um
 mutex no NT); o término de um processo espera as threads dele desfazerem os
 serviços. Os serviços Nt* que
 esperam por handle (NtWaitFor*, NtDelayExecution) continuam com o modelo
-PENDING + espera sondada, sem pilha suspensa. O autoteste
+PENDING + espera sondada, sem pilha suspensa. O NtWaitForSingleObject e o
+NtWaitForMultipleObjects de modo usuário capturam o prazo e os handles e
+resolvem os objetos pelo mesmo `ob/wait::reference_objects` do
+ObWaitForMultipleObjects (tabela nativa, tabela de usuário, SYNCHRONIZE em
+UserMode): o objeto de espera é o DefaultObject do tipo (o corpo dos tipos
+com DISPATCHER_HEADER, o FILE_OBJECT.Event, a KQUEUE do IoCompletion, que o
+WaitAll recusa com STATUS_INVALID_HANDLE) e, nos demais tipos, o
+ObpDefaultObject (um evento de notificação sempre sinalizado); Count fora de
+1..64 dá STATUS_INVALID_PARAMETER_1, WaitType além de WaitAny
+STATUS_INVALID_PARAMETER_3, e um objeto repetido só é recusado no WaitAll
+(STATUS_INVALID_PARAMETER_MIX). O autoteste
 `ntos/test/multiprocess/blocking_wait.rs` roda duas threads de um processo
 real no despachante: a 1 espera um KEVENT sem prazo numa syscall de teste e
 a 2, que só fica pronta depois disso, a vê bloqueada (Waiting, KernelStack

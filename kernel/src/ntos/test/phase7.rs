@@ -2192,9 +2192,12 @@ fn user_syscalls_core(assert: Assert) {
     guest::write64(buffer, second);
     guest::write64(buffer + 8, first);
     guest::write64(rsp + 0x28, string);
-    assert(call("NtWaitForMultipleObjects", 2, buffer, 1, 0) == 1 && call("NtWaitForMultipleObjects", 0, buffer, 1, 0) == 0xC000_000D, "usercore: espera multipla devolve o indice sinalizado");
+    assert(call("NtWaitForMultipleObjects", 2, buffer, 1, 0) == 1 && call("NtWaitForMultipleObjects", 0, buffer, 1, 0) == 0xC000_00EF && call("NtWaitForMultipleObjects", 2, buffer, 2, 0) == 0xC000_00F1, "usercore: espera multipla devolve o indice sinalizado; Count e WaitType invalidos");
+    // Como o ObWaitForMultipleObjects 19041: o objeto repetido só é recusado
+    // no WaitAll (STATUS_INVALID_PARAMETER_MIX); no WaitAny a espera segue
+    // (prazo zero, nenhum sinalizado: STATUS_TIMEOUT).
     guest::write64(buffer + 8, second);
-    assert(call("NtWaitForMultipleObjects", 2, buffer, 1, 0) == 0xC000_000D, "usercore: handles repetidos recusados");
+    assert(call("NtWaitForMultipleObjects", 2, buffer, 1, 0) == 0x102 && call("NtWaitForMultipleObjects", 2, buffer, 0, 0) == 0xC000_0030, "usercore: handle repetido aceito no WaitAny e recusado no WaitAll");
     // Segurança do objeto e namespace.
     guest::write64(rsp + 0x28, info);
     // Como o 19041: SecurityInformation sem validação (ATTRIBUTE pede
@@ -2207,6 +2210,20 @@ fn user_syscalls_core(assert: Assert) {
     let opened = call("NtOpenDirectoryObject", out, 1, attributes, 0);
     let directory = guest::read64(out);
     assert(opened == 0 && call("NtCreatePartition", 0, 0, 0, 0) == 0xC000_0008, "usercore: diretorio raiz e particao inexistente");
+    // Um tipo sem objeto de espera próprio (o diretório) espera no
+    // ObpDefaultObject, sempre sinalizado; sem SYNCHRONIZE a espera é
+    // recusada.
+    let denied = call("NtWaitForSingleObject", directory, 0, string, 0) == 0xC000_0022;
+    let synchronized = call("NtOpenDirectoryObject", out, 0x10_0001, attributes, 0) == 0;
+    let waitable = guest::read64(out);
+    guest::write64(buffer, second);
+    guest::write64(buffer + 8, waitable);
+    guest::write64(rsp + 0x28, string);
+    let default_any = call("NtWaitForMultipleObjects", 2, buffer, 1, 0) == 1 && call("NtWaitForSingleObject", waitable, 0, string, 0) == 0;
+    guest::write64(buffer, waitable);
+    let default_all = call("NtWaitForMultipleObjects", 2, buffer, 0, 0) == 0xC000_0030;
+    let _ = call("NtClose", waitable, 0, 0, 0);
+    assert(denied && synchronized && default_any && default_all, "usercore: objeto sem espera propria sinalizado pelo objeto padrao e SYNCHRONIZE exigido");
     // OBJ_KERNEL_HANDLE de UserMode é ignorado (o ObpCaptureObjectCreateInformation
     // tira o bit), como o services.exe abre o \DriverStores.
     set_object_attributes(unsafe { nt::ObjectAttributes::at(attributes) }, nt::ObjectAttributes::SIZE as u32, 0, attributes + 0x40, 0x240);
