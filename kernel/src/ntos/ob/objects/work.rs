@@ -4,7 +4,7 @@
 //! espera ocupa 0x50 bytes: refs +0, handles +8, fechado +0xC, fase +0x10
 //! (1 associado, 2 enfileirado), porta +0x18, alvo +0x20, chave +0x28,
 //! contexto +0x30, status +0x38 e informação +0x40. A fábrica de workers
-//! (0xA0 bytes) entra com `ps/user/worker_factory`.
+//! (0x140 bytes) entra com `ps/user/worker_factory`.
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
@@ -45,10 +45,13 @@ struct WaitPacketBody {
 #[repr(C)]
 struct FactoryBody {
     header: BodyHeader,
+    /// O incremento de prioridade de base dos workers novos (classe 11).
     priority: Field<u32>,
     maximum: Field<u32>,
     minimum: Field<u32>,
-    paused: Field<u32>,
+    /// Bits de estado com os valores do EX_WORKER_FACTORY.Flags do 19041
+    /// ([`FACTORY_CPU_SETS`], [`FACTORY_THREAD_CREATED`]).
+    flags: Field<u32>,
     shutdown: Field<u32>,
     creating: Field<u32>,
     binding_count: Field<u32>,
@@ -74,7 +77,15 @@ struct FactoryBody {
     /// do worker desconta e a classe 9 do NtSetInformationWorkerFactory
     /// ajusta em volta de um callback longo.
     ready_workers: Field<u32>,
+    /// As máscaras de CPU sets por grupo da classe 15 (até 0xA0 bytes).
+    cpu_sets: [Field<u64>; CPU_SET_GROUPS],
 }
+
+/// Grupos de processadores que as máscaras da classe 15 cobrem (0xA0 bytes).
+pub const CPU_SET_GROUPS: usize = 20;
+/// Flags da fábrica: CPU sets definidos (classe 15) e primeiro worker criado.
+pub const FACTORY_CPU_SETS: u32 = 0x4000;
+pub const FACTORY_THREAD_CREATED: u32 = 0x8000;
 
 // SAFETY: #[repr(C)] só de células.
 unsafe impl NtStruct for BodyHeader {}
@@ -87,11 +98,13 @@ const _: () = {
     assert!(core::mem::offset_of!(WaitPacketBody, phase) == 0x10);
     assert!(core::mem::offset_of!(WaitPacketBody, key) == 0x28);
     assert!(core::mem::offset_of!(WaitPacketBody, information) == 0x40);
-    assert!(core::mem::size_of::<FactoryBody>() == 0xA0);
+    assert!(core::mem::size_of::<FactoryBody>() == 0x140);
+    assert!(core::mem::offset_of!(FactoryBody, flags) == 0x1C);
     assert!(core::mem::offset_of!(FactoryBody, workers) == 0x34);
     assert!(core::mem::offset_of!(FactoryBody, port) == 0x38);
     assert!(core::mem::offset_of!(FactoryBody, soft_maximum) == 0x90);
     assert!(core::mem::offset_of!(FactoryBody, loader_worker) == 0x98);
+    assert!(core::mem::offset_of!(FactoryBody, cpu_sets) == 0xA0);
 };
 
 pub const PACKET_SIZE: u64 = WaitPacketBody::SIZE;
@@ -320,13 +333,13 @@ macro_rules! flag {
     };
 }
 
-/// Fábrica de workers: configuração, contadores e prazos no corpo de 0xA0
-/// bytes (prioridade +0x10, máximo +0x14, mínimo +0x18, pausada +0x1C,
-/// encerrada +0x20, criando +0x24, vínculos +0x28, liberações +0x2C, último
-/// status +0x30, workers +0x34, porta +0x38, processo +0x40, PID +0x48,
-/// início +0x50, parâmetro +0x58, reserva +0x60, commit +0x68, timeouts
-/// +0x70/+0x78/+0x80, nova tentativa +0x88, limite flexível +0x90, fase
-/// flexível +0x94 e LoaderWorker +0x98).
+/// Fábrica de workers: configuração, contadores e prazos no corpo de 0x140
+/// bytes (incremento de prioridade +0x10, máximo +0x14, mínimo +0x18, flags
+/// +0x1C, encerrada +0x20, criando +0x24, vínculos +0x28, liberações +0x2C,
+/// último status +0x30, workers +0x34, porta +0x38, processo +0x40, PID
+/// +0x48, início +0x50, parâmetro +0x58, reserva +0x60, commit +0x68,
+/// timeouts +0x70/+0x78/+0x80, nova tentativa +0x88, limite flexível +0x90,
+/// fase flexível +0x94, LoaderWorker +0x98, prontos +0x9C e CPU sets +0xA0).
 pub struct Factory {
     pub pointer: u64,
     pub port_entry: Arc<UserHandle>,
@@ -367,10 +380,25 @@ impl Factory {
     field64!(retry_timeout, set_retry_timeout, retry_timeout, i64);
     field64!(idle_timeout, set_idle_timeout, idle_timeout, i64);
     field64!(retry_at, set_retry_at, retry_at, i64);
-    flag!(paused, set_paused, paused);
     flag!(shutdown, set_shutdown, shutdown);
     flag!(creating, set_creating, creating);
     flag!(loader_worker, set_loader_worker, loader_worker);
+
+    pub fn flags(&self) -> u32 {
+        self.body().flags.get()
+    }
+
+    /// Liga bits de `flags` atomicamente.
+    pub fn add_flags(&self, flags: u32) {
+        self.body().flags.atomic().fetch_or(flags, core::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Troca as máscaras de CPU sets: as de `masks`, o resto zerado.
+    pub fn set_cpu_sets(&self, masks: &[u64]) {
+        for (index, cell) in self.body().cpu_sets.iter().enumerate() {
+            cell.set(masks.get(index).copied().unwrap_or(0));
+        }
+    }
 
     pub fn closed(&self) -> bool {
         self.body().header.closed.get() != 0
@@ -446,7 +474,6 @@ pub fn factory(initial: FactoryInitial, attributes: u64, dispose: fn(&Arc<Factor
     factory.set_maximum(initial.maximum);
     factory.set_reserve(initial.reserve);
     factory.set_commit(initial.commit);
-    factory.set_priority(8);
     factory.set_timeout(-100_000_000);
     factory.set_retry_timeout(-10_000_000);
     factory.set_idle_timeout(-100_000_000);

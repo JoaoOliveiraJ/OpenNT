@@ -127,8 +127,6 @@ pub struct ThreadMut {
     /// NtWorkerFactoryWorkerReady.
     pub worker_factory: u64,
     pub worker_ready: bool,
-    pub priority: u32,
-    pub base_priority: u32,
     /// Instantâneo diagnóstico da pilha de usuário quando esta thread
     /// encerrou o processo (NtTerminateProcess ou exceção sem tratamento).
     pub termination_rsp: u64,
@@ -172,8 +170,6 @@ impl UserThread {
                 pending_exception: false,
                 worker_factory: 0,
                 worker_ready: false,
-                priority: 0,
-                base_priority: 0,
                 termination_rsp: 0,
                 wait: None,
                 waiting: false,
@@ -2036,6 +2032,14 @@ fn set_priority_class(handle: u64, class: u64, input: u64, length: u64) -> Resul
         thread_priority::set_priority(pointer, value as u64)?;
         return Ok(0);
     }
+    set_base_priority_increment(pointer, value)
+}
+
+/// A ThreadBasePriority depois do handle: o incremento `value` sobre a base
+/// do processo na KTHREAD `pointer`, com as checagens de tempo real e de job
+/// descritas em [`set_priority_class`]. A worker factory aplica assim o
+/// incremento da classe 11 a cada worker novo.
+pub fn set_base_priority_increment(pointer: u64, value: i32) -> Result<u32, KernelError> {
     // SAFETY: o EPROCESS dono de uma thread viva.
     let owner = unsafe { crate::ntos::inc::types::Eprocess::at(kernel_thread(pointer).process.get()) };
     let realtime = owner.priority_class.get() == PRIORITY_CLASS_REALTIME;

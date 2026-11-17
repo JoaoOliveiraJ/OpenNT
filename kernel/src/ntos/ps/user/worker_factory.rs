@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 use super::io_completion::{self, RemoveOptions};
 use super::state::{self, UserHandle};
 use super::threads::{self, CreateRequest, UserThread};
-use crate::ntos::ke::clock;
+use crate::ntos::ke::{clock, processor_group, smp};
 use crate::ntos::ob::objects::completion::Packet;
 use crate::ntos::ob::objects::dispatcher::UserDispatcher;
 use crate::ntos::ob::objects::work::{self as work_objects, Factory, FactoryInitial};
@@ -164,24 +164,32 @@ fn create_thread(factory: &Arc<Factory>) -> Result<u32, KernelError> {
         thread.worker_ready = false;
     });
     factory.add_worker(thread);
+    factory.add_flags(work_objects::FACTORY_THREAD_CREATED);
+    // O incremento da classe 11 vai pela ThreadBasePriority antes de a
+    // thread rodar; uma recusa (incremento fora de -2..2 e ±16 fora do tempo
+    // real) deixa a prioridade do processo, como no 19041.
+    let increment = factory.priority() as i32;
+    if increment != 0 {
+        let _ = threads::set_base_priority_increment(pointer, increment);
+    }
     threads::resume_thread(pointer);
     Ok(0)
 }
 
 /// Cria workers um a um enquanto `done` for falso, como a única criação em
 /// andamento da fábrica; devolve a primeira falha.
-fn create_until(factory: &Arc<Factory>, done: impl Fn(&Factory) -> bool) -> Result<u32, KernelError> {
+fn create_until(factory: &Arc<Factory>, mut done: impl FnMut(&Factory) -> bool) -> Result<u32, KernelError> {
     if factory.port.closed() {
         shutdown(factory);
         return Ok(0xC000_010A);
     }
-    if factory.shutdown() || factory.paused() || factory.creating() {
+    if factory.shutdown() || factory.creating() {
         return Ok(0);
     }
     reference(factory);
     factory.set_creating(true);
     let result = (|| -> Result<u32, KernelError> {
-        while !factory.shutdown() && !factory.paused() && !done(factory) {
+        while !factory.shutdown() && !done(factory) {
             let status = create_thread(factory)?;
             if status != 0 {
                 return Ok(status);
@@ -215,9 +223,9 @@ fn request_queued_worker(factory: &Arc<Factory>, from_deferred_timer: bool) -> R
         shutdown(factory);
         return Ok(0xC000_010A);
     }
-    if factory.shutdown() || factory.paused() || factory.creating() {
-        // O timer já retirou a entrada: uma pausa não deixa fase pendente
-        // sem timer, o que bloquearia a expansão depois da retomada.
+    if factory.shutdown() || factory.creating() {
+        // O timer já retirou a entrada: uma criação em andamento não deixa
+        // fase pendente sem timer, o que bloquearia a expansão depois.
         if from_deferred_timer {
             factory.set_soft_creation_phase(0);
         }
@@ -270,119 +278,125 @@ fn process_deferred_creations() {
     }
 }
 
-/// Windows 19045: comprimento e captura antes do handle. Só o bit zero
-/// altera LoaderWorker; os demais são ignorados.
-fn set_worker_flags(handle: u64, input: u64, length: u32) -> u32 {
-    if length != 4 {
-        return 0xC000_0004;
-    }
-    if !state::probe_user_read(input, 4) {
-        return 0xC000_0005;
-    }
-    // ULONG de entrada, sondado acima.
-    let value = match guest::try_read::<u32>(input) {
-        Ok(value) => value,
-        Err(error) => return error.status,
-    };
-    let factory = match resolve(handle, 4) {
-        Ok((_, factory)) => factory,
-        Err(status) => return status,
-    };
-    // Aceita também uma fábrica encerrada; vale para as próximas criações.
-    factory.set_loader_worker(value & 1 != 0);
-    0
+/// Workers criados que ainda não passaram pelo NtWorkerFactoryWorkerReady
+/// (o PendingWorkerCount).
+fn pending(factory: &Factory) -> u32 {
+    live(factory).iter().filter(|thread| !thread.with(|thread| thread.worker_ready)).count() as u32
 }
 
-/// WorkerFactoryStackInformation (10, o NtSetInformationWorkerFactory do
-/// 19041): exatamente 16 bytes (senão STATUS_INFO_LENGTH_MISMATCH),
-/// alinhados em 4 e capturados antes do handle como o
-/// TP_POOL_STACK_INFORMATION {StackReserve, StackCommit}; o handle com
-/// WORKER_FACTORY_SET_INFORMATION. Numa fábrica encerrada volta 0x80
-/// (STATUS_ABANDONED_WAIT_0) sem gravar nada; senão o reserve e o commit das
-/// próximas threads trocam, sem validação. O TppPoolpReferenceGlobalPool da
-/// ntdll trata a falha como fatal, e todo Tp* do pool global falharia.
-fn set_stack_information(handle: u64, input: u64, length: u32) -> u32 {
-    if length != 16 {
-        return 0xC000_0004;
+/// Workers que passaram pelo NtWorkerFactoryWorkerReady e ainda contam na
+/// fábrica (o TotalWorkerCount).
+fn total(factory: &Factory) -> u32 {
+    live(factory).iter().filter(|thread| thread.with(|thread| thread.worker_ready)).count() as u32
+}
+
+/// O pedido de worker das classes 5 e 9: numa fábrica encerrada,
+/// STATUS_ABANDONED; com os workers prontos no máximo,
+/// STATUS_TOO_MANY_THREADS; senão um worker novo, se nenhum está sendo
+/// criado e os prontos mais os pendentes ainda cabem no máximo. Devolve o
+/// status da criação.
+fn request_worker(factory: &Arc<Factory>) -> Result<u32, KernelError> {
+    if factory.shutdown() {
+        return Ok(0x80);
     }
-    if input & 3 != 0 {
-        return 0x8000_0002;
+    let count = factory.ready_workers();
+    if count >= factory.maximum() {
+        return Ok(0xC000_0129);
     }
-    if !state::probe_user_read(input, 16) {
-        return 0xC000_0005;
+    if factory.creating() || count + pending(factory) >= factory.maximum() {
+        return Ok(0);
     }
-    let (reserve, commit) = match (guest::try_read::<u64>(input), guest::try_read::<u64>(input + 8)) {
-        (Ok(reserve), Ok(commit)) => (reserve, commit),
-        (Err(error), _) | (_, Err(error)) => return error.status,
-    };
-    let factory = match resolve(handle, 4) {
-        Ok((_, factory)) => factory,
-        Err(status) => return status,
-    };
+    let mut first = true;
+    create_until(factory, |_| !core::mem::replace(&mut first, false))
+}
+
+/// WorkerFactoryIdleTimeout (2): um LARGE_INTEGER relativo (negativo, senão
+/// STATUS_INVALID_PARAMETER), limitado a [-600 s, -1 s]; vale para as
+/// próximas esperas dos workers.
+fn set_idle_timeout(factory: &Factory, value: i64) -> u32 {
     if factory.shutdown() {
         return 0x80;
     }
-    factory.set_reserve(reserve);
-    factory.set_commit(commit);
+    if value >= 0 {
+        return 0xC000_000D;
+    }
+    factory.set_idle_timeout(value.clamp(-6_000_000_000, -10_000_000));
     0
 }
 
-/// A captura precede a validação do handle; zero desativa o adiamento.
-fn set_thread_soft_maximum(handle: u64, input: u64, length: u32) -> u32 {
-    if length != 4 {
-        return 0xC000_0004;
-    }
-    if !state::probe_user_read(input, 4) {
-        return 0xC000_0005;
-    }
-    // ULONG de entrada, sondado acima.
-    let value = match guest::try_read::<u32>(input) {
-        Ok(value) => value,
-        Err(error) => return error.status,
+/// WorkerFactoryBindingCount (3, o TpAdjustBindingCount): um delta com
+/// sinal, sem falha e sem olhar o encerramento. O positivo satura em
+/// 0xFFFFFFFF (como no 19041, o delta zero também cai na saturação) e o
+/// negativo em zero. A primeira ligação (de zero para não zero) pede um
+/// worker se já há trabalho na fila.
+fn adjust_binding_count(factory: &Arc<Factory>, delta: i32) -> Result<u32, KernelError> {
+    let old = factory.binding_count();
+    let new = if delta >= 0 {
+        let sum = old.wrapping_add(delta as u32);
+        if old < sum { sum } else { u32::MAX }
+    } else {
+        old.saturating_sub(delta.unsigned_abs())
     };
-    let factory = match resolve(handle, 4) {
-        Ok((_, factory)) => factory,
-        Err(status) => return status,
-    };
+    factory.set_binding_count(new);
+    if old == 0 && new != 0 {
+        request_queued_worker(factory, false)?;
+    }
+    Ok(0)
+}
+
+/// WorkerFactoryThreadMinimum (4): o mínimo novo, e o máximo sobe junto se
+/// ficar abaixo dele (sem erro). Se o mínimo cresceu, os workers que faltam
+/// (prontos mais pendentes abaixo do mínimo) são criados agora, um a um; a
+/// primeira falha de criação volta.
+fn set_thread_minimum(factory: &Arc<Factory>, value: u32) -> Result<u32, KernelError> {
     if factory.shutdown() {
-        return 0x80; // STATUS_ABANDONED, medido no Windows.
+        return Ok(0x80);
     }
-    factory.set_soft_maximum(if value != 0 { value.max(factory.minimum()).min(factory.maximum()) } else { 0 });
-    0
+    let grew = value > factory.minimum();
+    factory.set_minimum(value);
+    if factory.maximum() < value {
+        factory.set_maximum(value);
+    }
+    if !grew {
+        return Ok(0);
+    }
+    create_until(factory, |factory| factory.ready_workers() + pending(factory) >= factory.minimum())
 }
 
-/// A classe 9 do NtSetInformationWorkerFactory (ntoskrnl 19041, rva
-/// 0x2dc2c7): um ULONG que a ntdll manda em volta de um callback longo. 1 é
-/// o TpCallbackMayRunLong e 2 o TpCallbackIndependent; 0 desfaz no
-/// TppCallbackEpilog e 3 vem da saída do worker (TppWorkerThread). 0 sobe a
-/// contagem dos workers prontos (STATUS_UNSUCCESSFUL se ela já é o total de
-/// workers); 2 e 3 a descem (STATUS_UNSUCCESSFUL em zero) e, quando ela
-/// zera, pedem um worker como o 1; outro valor é STATUS_INVALID_PARAMETER. O pedido de worker
-/// recusa com STATUS_TOO_MANY_THREADS a contagem no máximo da fábrica e
-/// cria um worker se nenhum está sendo criado e cabe mais um (o servidor
+/// WorkerFactoryThreadMaximum (5): qualquer valor, zero inclusive; o mínimo
+/// desce junto se ficar acima dele. Com máximo não nulo e trabalho na fila
+/// (as liberações pendentes também são pacotes da fila), um worker é
+/// pedido; o resultado do pedido não volta.
+fn set_thread_maximum(factory: &Arc<Factory>, value: u32) -> Result<u32, KernelError> {
+    if factory.shutdown() {
+        return Ok(0x80);
+    }
+    let work = value != 0 && factory.port.with(|state| !state.packets.is_empty());
+    factory.set_maximum(value);
+    if value < factory.minimum() {
+        factory.set_minimum(value);
+    }
+    if work {
+        request_worker(factory)?;
+    }
+    Ok(0)
+}
+
+/// WorkerFactoryCallbackType (9, rva 0x2dc2c7 do 19041): um ULONG que a
+/// ntdll manda em volta de um callback longo. 1 é o TpCallbackMayRunLong e
+/// 2 o TpCallbackIndependent; 0 desfaz no TppCallbackEpilog e 3 vem da
+/// saída do worker (TppWorkerThread). 0 sobe a contagem dos workers prontos
+/// (STATUS_UNSUCCESSFUL se ela já é o total); 2 e 3 a descem
+/// (STATUS_UNSUCCESSFUL em zero) e, quando ela zera, pedem um worker como o
+/// 1; o 3 também tira o worker que chama do total, então a saída da thread
+/// não desconta de novo. Outro valor é STATUS_INVALID_PARAMETER. O servidor
 /// LRPC do rpcrt4 recusa o bind com ERROR_MAX_THRDS_REACHED se o
-/// TpCallbackMayRunLong falha).
-fn set_long_callback(handle: u64, input: u64, length: u32) -> Result<u32, KernelError> {
-    if length != 4 {
-        return Ok(0xC000_0004);
-    }
-    if !state::probe_user_read(input, 4) {
-        return Ok(0xC000_0005);
-    }
-    // ULONG de entrada, sondado acima.
-    let value = match guest::try_read::<u32>(input) {
-        Ok(value) => value,
-        Err(error) => return Ok(error.status),
-    };
-    let factory = match resolve(handle, 4) {
-        Ok((_, factory)) => factory,
-        Err(status) => return Ok(status),
-    };
+/// TpCallbackMayRunLong falha.
+fn set_callback_type(factory: &Arc<Factory>, value: u32) -> Result<u32, KernelError> {
     let count = factory.ready_workers();
-    let total = live(&factory).len() as u32;
     let grow = match value {
         0 => {
-            if count == total {
+            if count == total(factory) {
                 return Ok(0xC000_0001);
             }
             factory.set_ready_workers(count + 1);
@@ -394,6 +408,12 @@ fn set_long_callback(handle: u64, input: u64, length: u32) -> Result<u32, Kernel
                 return Ok(0xC000_0001);
             }
             factory.set_ready_workers(count - 1);
+            if value == 3 {
+                if let Some(thread) = threads::current().filter(|thread| thread.with(|thread| thread.worker_factory) == factory.pointer) {
+                    thread.with(|thread| thread.worker_ready = false);
+                    remove_worker(factory, &thread);
+                }
+            }
             count == 1
         }
         _ => return Ok(0xC000_000D),
@@ -401,18 +421,59 @@ fn set_long_callback(handle: u64, input: u64, length: u32) -> Result<u32, Kernel
     if !grow {
         return Ok(0);
     }
+    request_worker(factory)
+}
+
+/// WorkerFactoryStackInformation (10): o TP_POOL_STACK_INFORMATION
+/// {StackReserve, StackCommit} das próximas threads, sem validação. O
+/// TppPoolpReferenceGlobalPool da ntdll trata a falha como fatal, e todo
+/// Tp* do pool global falharia.
+fn set_stack_information(factory: &Factory, reserve: u64, commit: u64) -> u32 {
     if factory.shutdown() {
-        return Ok(0x80);
+        return 0x80;
     }
-    let count = factory.ready_workers();
-    if count >= factory.maximum() {
-        return Ok(0xC000_0129);
+    factory.set_reserve(reserve);
+    factory.set_commit(commit);
+    0
+}
+
+/// WorkerFactoryThreadSoftMaximum (14): zero desliga o limite flexível;
+/// outro valor fica entre o mínimo e o máximo.
+fn set_thread_soft_maximum(factory: &Factory, value: u32) -> u32 {
+    if factory.shutdown() {
+        return 0x80;
     }
-    // A falha da criação fica no LastThreadCreationStatus da fábrica.
-    if !factory.creating() && total < factory.maximum() {
-        create_workers(&factory, total + 1)?;
+    factory.set_soft_maximum(if value != 0 { value.max(factory.minimum()).min(factory.maximum()) } else { 0 });
+    0
+}
+
+/// O status do KiValidateCpuSetMasks para máscaras fora dos processadores
+/// ativos.
+const STATUS_INVALID_CPU_SET_MASKS: u32 = 0xC000_01AF;
+
+/// WorkerFactoryThreadCpuSets (15): as máscaras de CPU sets por grupo.
+/// Depois do primeiro worker criado, STATUS_INVALID_STATE_TRANSITION. As
+/// máscaras passam pela validação do KiValidateCpuSetMasks (no máximo uma
+/// por grupo, cada uma dentro dos processadores ativos do grupo) e
+/// substituem as anteriores. O kernel ainda não aplica CPU sets a threads:
+/// elas ficam guardadas na fábrica.
+fn set_thread_cpu_sets(factory: &Factory, captured: &[u8]) -> u32 {
+    if factory.shutdown() {
+        return 0x80;
     }
-    Ok(0)
+    if factory.flags() & work_objects::FACTORY_THREAD_CREATED != 0 {
+        return 0xC000_A003;
+    }
+    let masks: Vec<u64> = captured.chunks_exact(8).map(|bytes| u64::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]])).collect();
+    if masks.len() as u64 > processor_group::group_count() {
+        return STATUS_INVALID_CPU_SET_MASKS;
+    }
+    if masks.iter().enumerate().any(|(group, mask)| mask & !processor_group::group_affinity(group as u16) != 0) {
+        return STATUS_INVALID_CPU_SET_MASKS;
+    }
+    factory.set_cpu_sets(&masks);
+    factory.add_flags(work_objects::FACTORY_CPU_SETS);
+    0
 }
 
 fn dispose(factory: &Arc<Factory>) {
@@ -526,99 +587,89 @@ fn nt_worker_factory_worker_ready(handle: u64, _: u64, _: u64, _: u64, _rsp: u64
     Ok(if factory.shutdown() { 0xC000_010A } else { 0 })
 }
 
+/// O maior buffer da classe 15 (as máscaras de todos os grupos).
+const CPU_SETS_SIZE: u32 = (work_objects::CPU_SET_GROUPS * 8) as u32;
+
+/// NtSetInformationWorkerFactory(handle, class, buffer, length) na ordem do
+/// 19041 (rva 0x2dbae0): a classe (2 a 15, senão STATUS_INVALID_INFO_CLASS;
+/// a 7 só de consulta), o tamanho dela (STATUS_INFO_LENGTH_MISMATCH; a 6,
+/// WorkerFactoryPaused, é STATUS_NOT_IMPLEMENTED), a captura do buffer de
+/// usuário (alinhado em 4 nas classes 2, 9, 10 e 15) e só então o handle,
+/// com WORKER_FACTORY_SET_INFORMATION. Numa fábrica encerrada as classes 2,
+/// 4, 5, 10, 11, 14 e 15 voltam 0x80 (STATUS_ABANDONED).
 fn nt_set_information_worker_factory(handle: u64, class: u64, input: u64, length: u64, _rsp: u64) -> Result<u32, KernelError> {
     let (class, length) = (class as u32, length as u32);
-    if class == 13 {
-        return Ok(set_worker_flags(handle, input, length));
+    let size = match class {
+        2 => 8,
+        3 | 4 | 5 | 8 | 9 | 11 | 13 | 14 => 4,
+        6 => return Ok(0xC000_0002),
+        10 => 16,
+        // Um múltiplo de 8 até 0xA0 bytes.
+        15 => {
+            if length >= CPU_SETS_SIZE {
+                CPU_SETS_SIZE
+            } else {
+                length + (length & 7)
+            }
+        }
+        _ => {
+            crate::debug_print!("[workerfactory] information class={} unsupported", class);
+            return Ok(0xC000_0003);
+        }
+    };
+    if length != size {
+        return Ok(0xC000_0004);
     }
-    if class == 14 {
-        return Ok(set_thread_soft_maximum(handle, input, length));
+    if size != 0 && matches!(class, 2 | 9 | 10 | 15) && input & 3 != 0 {
+        return Ok(0x8000_0002);
     }
-    if class == 9 {
-        return set_long_callback(handle, input, length);
+    if size != 0 && !state::probe_user_read(input, size as u64) {
+        return Ok(0xC000_0005);
     }
-    if class == 10 {
-        return Ok(set_stack_information(handle, input, length));
-    }
+    // O buffer de entrada, sondado acima, capturado de uma vez.
+    let captured = if size == 0 {
+        Vec::new()
+    } else {
+        match guest::try_read_bytes(input, size as usize) {
+            Ok(bytes) => bytes,
+            Err(error) => return Ok(error.status),
+        }
+    };
+    let word = |offset: usize| captured.get(offset..offset + 8).map_or(0, |bytes| u64::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]]));
+    let value = captured.get(..4).map_or(0, |bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
     let factory = match resolve(handle, 4) {
         Ok((_, factory)) => factory,
         Err(status) => return Ok(status),
     };
-    if factory.shutdown() {
-        return Ok(0xC000_010A);
-    }
-    if ![2, 3, 4, 5, 6, 8, 11].contains(&class) {
-        crate::debug_print!("[workerfactory] information class={} unsupported", class);
-        return Ok(0xC000_0003);
-    }
-    let size = if class == 2 { 8 } else if class == 6 && length == 1 { 1 } else { 4 };
-    if length != size {
-        return Ok(0xC000_0004);
-    }
-    if !state::probe_user_read(input, size as u64) {
-        return Ok(0xC000_0005);
-    }
-    // BOOLEAN, ULONG ou LARGE_INTEGER de entrada, sondado acima.
-    let value = match if size == 1 { guest::try_read::<u8>(input).map(u32::from) } else { guest::try_read::<u32>(input) } {
-        Ok(value) => value,
-        Err(error) => return Ok(error.status),
-    };
     match class {
-        2 => {
-            let signed = match guest::try_read::<i64>(input) {
-                Ok(signed) => signed,
-                Err(error) => return Ok(error.status),
-            };
-            if signed >= 0 {
-                return Ok(0xC000_000D);
-            }
-            factory.set_idle_timeout(signed);
+        2 => Ok(set_idle_timeout(&factory, word(0) as i64)),
+        3 => adjust_binding_count(&factory, value as i32),
+        4 => set_thread_minimum(&factory, value),
+        5 => set_thread_maximum(&factory, value),
+        // WorkerFactoryAdjustThreadGoal: só a concorrência da IOCP (o
+        // KQUEUE.MaximumCount), o valor ou, com zero, o número de
+        // processadores; sem olhar o encerramento e sem criar workers.
+        8 => {
+            factory.port.set_concurrency(if value != 0 { value } else { smp::online_cpu_count() as u32 });
             Ok(0)
         }
-        3 => {
-            // A contagem de vínculos é um delta com sinal, não absoluta.
-            let count = factory.binding_count() as i64 + value as i32 as i64;
-            if count < 0 {
-                return Ok(0xC000_000D);
-            }
-            factory.set_binding_count(count as u32);
-            Ok(0)
-        }
-        4 => {
-            if value > factory.maximum() {
-                return Ok(0xC000_000D);
-            }
-            factory.set_minimum(value);
-            create_workers(&factory, value)
-        }
-        5 => {
-            if value == 0 || value > 0xFFFF || value < factory.minimum() {
-                return Ok(0xC000_000D);
-            }
-            factory.set_maximum(value);
-            Ok(0)
-        }
-        6 => {
-            if value > 1 {
-                return Ok(0xC000_000D);
-            }
-            factory.set_paused(value != 0);
-            create_workers(&factory, factory.minimum())
-        }
-        8 => create_workers(&factory, value),
-        _ => {
-            if !(1..=31).contains(&value) {
-                return Ok(0xC000_000D);
-            }
+        9 => set_callback_type(&factory, value),
+        10 => Ok(set_stack_information(&factory, word(0), word(8))),
+        // WorkerFactoryThreadBasePriority: o incremento de prioridade de
+        // base (a ntdll manda de -16 a 16) que cada worker novo recebe antes
+        // de rodar; sem validação, gravado mesmo numa fábrica encerrada.
+        11 => {
             factory.set_priority(value);
-            for thread in live(&factory) {
-                thread.with(|thread| {
-                    thread.priority = value;
-                    thread.base_priority = value;
-                });
-            }
+            Ok(if factory.shutdown() { 0x80 } else { 0 })
+        }
+        // WorkerFactoryFlags: só o bit 0 (LoaderWorker) conta, também numa
+        // fábrica encerrada; vale para as próximas criações.
+        13 => {
+            factory.set_loader_worker(value & 1 != 0);
             Ok(0)
         }
+        14 => Ok(set_thread_soft_maximum(&factory, value)),
+        _ => Ok(set_thread_cpu_sets(&factory, &captured)),
     }
 }
 
@@ -650,7 +701,6 @@ fn nt_query_information_worker_factory(handle: u64, class: u64, out: u64, length
         information.timeout.quad_part.probe_set(factory.timeout())?;
         information.retry_timeout.quad_part.probe_set(factory.retry_timeout())?;
         information.idle_timeout.quad_part.probe_set(factory.idle_timeout())?;
-        information.paused.probe_set(factory.paused() as u8)?;
         information.queued_to_ex_worker.probe_set(is_deferred(&factory) as u8)?;
         information.may_create.probe_set((!factory.shutdown() && (workers.len() as u32) < factory.maximum()) as u8)?;
         information.shutdown.probe_set(factory.shutdown() as u8)?;
@@ -806,7 +856,7 @@ pub fn pump() {
                     remove_worker(&factory, &thread);
                 }
             }
-            if factory.shutdown() || factory.paused() || (factory.last_status() != 0 && (clock::uptime_ms() as i64) < factory.retry_at()) {
+            if factory.shutdown() || (factory.last_status() != 0 && (clock::uptime_ms() as i64) < factory.retry_at()) {
                 return Ok(());
             }
             // Mantém o mínimo depois da saída de workers; uma criação falha

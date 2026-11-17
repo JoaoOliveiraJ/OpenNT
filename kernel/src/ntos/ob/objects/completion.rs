@@ -105,6 +105,13 @@ impl Port {
         self.queue().maximum_count.get()
     }
 
+    /// Troca o MaximumCount da KQUEUE (a classe 8 do
+    /// NtSetInformationWorkerFactory); os consumidores esperando veem o
+    /// limite novo na próxima sondagem.
+    pub fn set_concurrency(&self, value: u32) {
+        self.queue().maximum_count.set(value);
+    }
+
     /// Altera as coleções e publica na KQUEUE os pacotes (SignalState) e os
     /// consumidores ativos (CurrentCount). A fila que ganhou pacotes testa
     /// as esperas do cabeçalho (o KiWaitTest), fora do lock da porta.
