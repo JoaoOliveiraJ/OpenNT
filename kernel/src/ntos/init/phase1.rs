@@ -15,6 +15,10 @@ pub fn init() {
     crate::ntos::io::io_manager::init().unwrap_or_else(|error| panic!("I/O Manager: {error}"));
     // Exports do kernel para drivers: resolvedor do loader e trampolins.
     crate::ntos::init::exports::init();
+    // ExInitSystem / ExpWorkerInitialization: as worker threads do sistema,
+    // antes dos drivers. Os work items enfileirados antes delas (a fila só os
+    // guardava) rodam agora, cada um na pilha de uma worker.
+    crate::ntos::io::work_items::initialize_workers().unwrap_or_else(|error| panic!("worker threads: {error}"));
     // Hosts de extensão que os drivers de boot preenchem (ExRegisterHost do
     // SepInitializeAuthorizationCallbacks e do PspInitializeNetRateControl).
     crate::ntos::se::extension_hosts::initialize_authorization_callbacks().unwrap_or_else(|error| panic!("hosts de extensao do Se: {error}"));
@@ -78,6 +82,10 @@ pub fn init() {
     crate::ntos::em::initialize_system(errata.as_deref()).unwrap_or_else(|status| panic!("EmInitSystem: {status:#x}"));
     crate::ntos::em::initialize_dynamic();
     crate::ntos::io::work_items::run_queue();
+    // FsRtlInitSystem / FsRtlInitializeSmssEvent: o evento permanente
+    // \Device\VolumesSafeForWriteAccess, que o smss.exe sinaliza depois dos
+    // comandos BootExecute, e o work item que o espera.
+    crate::ntos::fsrtl::volume_support::initialize_smss_event().unwrap_or_else(|error| panic!("FsRtlInitializeSmssEvent: {error}"));
     // IopInitializePlugPlayServices: o driver embutido \Driver\DeviceApi
     // (PiDaInit), com o \Device\DeviceApi que o cfgmgr32 abre.
     match crate::ntos::io::pnp::device_api::initialize() {

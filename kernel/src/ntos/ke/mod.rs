@@ -62,8 +62,9 @@ pub fn thread_apcs_pending(thread: u64) -> bool {
     apc::has_pending(thread) || crate::ntos::io::file::request::has_completions_for(thread)
 }
 
-/// O kernel drena timers, DPCs, work items e IoTimers no laço ocioso, como o
-/// NT ao cair de DISPATCH_LEVEL.
+/// O kernel drena timers, DPCs e IoTimers no laço ocioso, como o NT ao cair
+/// de DISPATCH_LEVEL, e o gerenciador acorda ou cria worker threads para os
+/// work items.
 pub fn run_kernel_tasks() {
     crate::ntos::mm::kernel_pool::reap();
     crate::ntos::ex::lookaside::maintain();
@@ -71,7 +72,7 @@ pub fn run_kernel_tasks() {
     let _ = crate::ntos::ke::apc::deliver_all_queued();
     crate::ntos::ke::timer::check_timers();
     let _ = crate::ntos::ke::dpc::run_queue();
-    crate::ntos::io::work_items::run_queue();
+    crate::ntos::io::work_items::balance();
     crate::ntos::io::threads::io_timer::check_io_timers();
     crate::ntos::io::file::request::pump();
 }

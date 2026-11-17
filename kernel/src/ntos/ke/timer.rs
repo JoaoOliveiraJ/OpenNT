@@ -148,7 +148,7 @@ fn delay_pump() {
     super::interrupt_object::service_during_wait();
     check_timers();
     let _ = dpc::run_queue();
-    work_items::run_queue();
+    work_items::balance();
     scheduler::tick(-1);
 }
 
@@ -157,8 +157,8 @@ fn throttled_delay_pump() {
     super::interrupt_object::service_during_wait();
     check_timers();
     let _ = dpc::run_queue();
-    // Trabalho pendente pode produzir a condição de outra operação.
-    work_items::run_queue();
+    // As workers acordadas pelo item pendente podem produzir a condição.
+    work_items::balance();
     let now = clock::uptime_ms();
     let tick = {
         let mut last = LAST_DELAY_TICK.lock();

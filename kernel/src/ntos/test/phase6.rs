@@ -2463,46 +2463,71 @@ pub(super) fn object_attributes_for(block: u64, name: &str, flags: u32) -> u64 {
     block
 }
 
-static WORK_ORDER: crate::rtl::SpinLock<Vec<u64>> = crate::rtl::SpinLock::new(Vec::new());
-static WORK_ITEMS: [core::sync::atomic::AtomicU64; 3] = [const { core::sync::atomic::AtomicU64::new(0) }; 3];
-/// A CPU do teste (KPCR): os itens só rodam nela, fora de outro item.
-static WORK_CPU: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// O item que espera: a thread que o roda e o fim da espera.
+static WORK_BLOCKER: [core::sync::atomic::AtomicU64; 2] = [const { core::sync::atomic::AtomicU64::new(0) }; 2];
+/// A thread que rodou o item comum.
+static WORK_OTHER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// A prioridade da worker em cada item da prioridade por tipo de fila.
+static WORK_PRIORITY: [core::sync::atomic::AtomicU64; 3] = [const { core::sync::atomic::AtomicU64::new(0) }; 3];
 
-fn work_order_ready() -> bool {
-    crate::ntos::ke::pcr::current_address() == WORK_CPU.load(core::sync::atomic::Ordering::SeqCst) && !crate::ntos::io::work_items::nested()
-}
-
-/// Item 1: enfileira o item 3 e drena a fila de dentro dele (o pump de uma
-/// espera dentro do item).
-fn work_order_routine(_device: u64, parameter: u64) {
+/// Espera o evento do contexto e marca o fim.
+fn work_blocking_routine(_device: u64, event: u64) {
     use core::sync::atomic::Ordering;
-    WORK_ORDER.lock().push(parameter);
-    if parameter == 1 {
-        crate::ntos::io::work_items::queue_kernel_work_item(WORK_ITEMS[2].load(Ordering::SeqCst), work_order_routine, 3, Some(work_order_ready));
-        crate::ntos::io::work_items::run_queue();
-    }
+    WORK_BLOCKER[0].store(crate::ntos::ps::process::get_current_thread(), Ordering::SeqCst);
+    crate::ntos::ke::dispatcher::wait_for_single_object(event, 0, 0, false);
+    WORK_BLOCKER[1].store(1, Ordering::SeqCst);
 }
 
-/// Como as worker threads do NT: um item não começa dentro de outro na
-/// mesma CPU, e uma drenagem só roda os itens que já estavam na fila (o que
-/// um item enfileira fica para a próxima).
-fn work_items_one_worker_per_item(assert: Assert) {
+fn work_record_routine(_device: u64, _context: u64) {
+    WORK_OTHER.store(crate::ntos::ps::process::get_current_thread(), core::sync::atomic::Ordering::SeqCst);
+}
+
+/// WORKER_THREAD_ROUTINE(Parameter): a prioridade da worker no item.
+extern "win64" fn work_priority_routine(slot: u64) {
+    let priority = crate::ntos::ke::thread_priority::query_priority(crate::ntos::ps::process::get_current_thread());
+    WORK_PRIORITY[slot as usize].store(priority as u64, core::sync::atomic::Ordering::SeqCst);
+}
+
+/// Como no NT, os work items rodam nas worker threads do sistema (no
+/// processo System), nunca no contexto de boot: o item que espera só prende
+/// a própria worker (o seguinte roda noutra), o run_queue volta com ele
+/// parado na espera e o sinal o termina; cada item roda na prioridade do
+/// tipo de fila (ExpTypeToPriority: Critical 13, HyperCritical 15, e
+/// QueueType - 32 acima de 32).
+fn work_items_on_worker_threads(assert: Assert) {
     use crate::ntos::io::work_items;
+    use crate::ntos::ke::{dispatcher, thread_dispatch};
     use core::sync::atomic::Ordering;
-    let items: Vec<u64> = (0..3).map(|_| work_items::allocate_work_item(0)).collect();
-    for (slot, item) in WORK_ITEMS.iter().zip(items.iter()) {
-        slot.store(*item, Ordering::SeqCst);
+    let boot_thread = crate::ntos::ps::process::get_current_thread();
+    let (workers, _) = work_items::worker_counts();
+    let items: Vec<u64> = (0..2).map(|_| work_items::allocate_work_item(0)).collect();
+    let event = guest::alloc_bytes(nt::Kevent::SIZE);
+    dispatcher::initialize_event(event, 0, false);
+    for slot in &WORK_BLOCKER {
+        slot.store(0, Ordering::SeqCst);
     }
-    WORK_CPU.store(crate::ntos::ke::pcr::current_address(), Ordering::SeqCst);
-    WORK_ORDER.lock().clear();
-    let outside = !work_items::nested();
-    work_items::queue_kernel_work_item(items[0], work_order_routine, 1, Some(work_order_ready));
-    work_items::queue_kernel_work_item(items[1], work_order_routine, 2, Some(work_order_ready));
+    WORK_OTHER.store(0, Ordering::SeqCst);
+    work_items::queue_kernel_work_item(items[0], work_blocking_routine, event, None);
+    work_items::queue_kernel_work_item(items[1], work_record_routine, 0, None);
     work_items::run_queue();
-    let first = WORK_ORDER.lock().clone();
+    let (blocker, other) = (WORK_BLOCKER[0].load(Ordering::SeqCst), WORK_OTHER.load(Ordering::SeqCst));
+    let parked = WORK_BLOCKER[1].load(Ordering::SeqCst) == 0 && blocker != 0 && thread_dispatch::thread_state(blocker) == thread_dispatch::state::WAITING;
+    assert(workers >= 4 && work_items::is_worker_thread(blocker) && work_items::is_worker_thread(other) && blocker != other && blocker != boot_thread && other != boot_thread && parked, "workitem: os itens rodam em worker threads do sistema; o que espera so prende a sua worker e o run_queue volta com ele parado");
+    dispatcher::set_event(event);
     work_items::run_queue();
-    let second = WORK_ORDER.lock().clone();
-    assert(outside && first == [1, 2] && second == [1, 2, 3] && !work_items::nested(), "workitem: sem item dentro de outro na mesma CPU; o enfileirado por um item fica para a drenagem seguinte");
+    assert(WORK_BLOCKER[1].load(Ordering::SeqCst) == 1, "workitem: o item parado termina quando o evento sinaliza");
+    let routine = work_priority_routine as extern "win64" fn(u64) as usize as u64;
+    let ex_items = guest::alloc_bytes(0x60);
+    for (slot, queue_type) in [(0u64, 0u64), (1, 2), (2, 0x20 + 10)] {
+        WORK_PRIORITY[slot as usize].store(0, Ordering::SeqCst);
+        let _ = call_export("ExInitializeWorkItem", &[ex_items + slot * 0x20, routine, slot]);
+        let _ = call_export("ExQueueWorkItem", &[ex_items + slot * 0x20, queue_type]);
+    }
+    work_items::run_queue();
+    let priorities: Vec<u64> = WORK_PRIORITY.iter().map(|slot| slot.load(Ordering::SeqCst)).collect();
+    assert(priorities == [13, 15, 10], "workitem: a worker roda o item na prioridade do tipo de fila (Critical 13, HyperCritical 15, 32 + 10 -> 10)");
+    guest::free_bytes(ex_items);
+    guest::free_bytes(event);
     for item in items {
         work_items::free_work_item(item);
     }
@@ -9930,6 +9955,31 @@ fn fsrtl_notify_exports(assert: Assert) {
 }
 
 
+/// FsRtlInitializeSmssEvent: o `\Device\VolumesSafeForWriteAccess` existe
+/// desde a fase 1 como evento de notificação não sinalizado, abre pelo nome
+/// como o mountmgr.sys o abre (ZwOpenEvent, EVENT_ALL_ACCESS) e o
+/// FsRtlWaitForSmssEvent o espera numa worker thread parada; sem smss o
+/// FsRtlAreVolumeStartupApplicationsComplete fica FALSE.
+fn fsrtl_smss_event(assert: Assert) {
+    use crate::ntos::fsrtl::volume_support;
+    use crate::ntos::ke::thread_dispatch;
+    let status = |value: Option<u64>| value.map_or(0xFFFF_FFFF, |value| value as u32);
+    let (event, waiter) = volume_support::smss_event();
+    let header = at::<nt::DispatcherHeader>(event);
+    let named = crate::ntos::ob::object_manager::lookup(volume_support::VOLUMES_SAFE_FOR_WRITE_ACCESS).and_then(crate::ntos::ob::object_manager::node).is_some_and(|node| node.type_name == "Event");
+    assert(event != 0 && named && header.type_.get() == 0 && header.signal_state.get() == 0, "fsrtl-smss-event: \\Device\\VolumesSafeForWriteAccess e um evento de notificacao nao sinalizado");
+    let block = guest::alloc_bytes(0x200);
+    let output = block + 0x1F0;
+    let attributes = object_attributes_for(block, volume_support::VOLUMES_SAFE_FOR_WRITE_ACCESS, 0x240);
+    let opened = status(call_export("ZwOpenEvent", &[output, 0x1F_0003, attributes]));
+    if opened == 0 {
+        let _ = call_export("ZwClose", &[guest::read64(output)]);
+    }
+    let parked = crate::ntos::io::work_items::is_worker_thread(waiter) && thread_dispatch::thread_state(waiter) == thread_dispatch::state::WAITING;
+    assert(opened == 0 && parked && call_export("FsRtlAreVolumeStartupApplicationsComplete", &[]) == Some(0), "fsrtl-smss-event: ZwOpenEvent pelo nome; o FsRtlWaitForSmssEvent espera numa worker parada e o boot sem smss nao completa a fase de volumes");
+    guest::free_bytes(block);
+}
+
 fn fsrtl_volume_support_exports(assert: Assert) {
     let block = guest::alloc_bytes(0x200);
     let unicode = |address: u64, text: &str| {
@@ -15540,7 +15590,7 @@ pub fn run(assert: Assert) {
     io_file_information(assert);
     volume_file_operations(assert);
     kernel_volume_devices(assert);
-    work_items_one_worker_per_item(assert);
+    work_items_on_worker_threads(assert);
     zw_kernel_files(assert);
     zw_query_file(assert);
     zw_read_file(assert);
@@ -15666,6 +15716,7 @@ pub fn run(assert: Assert) {
     fsrtl_file_lock_irp_exports(assert);
     fsrtl_notify_exports(assert);
     fsrtl_volume_support_exports(assert);
+    fsrtl_smss_event(assert);
     ex_auto_expand_push_lock_exports(assert);
     ex_resource_owner_exports(assert);
     ex_resource_owner_and_local_time_exports(assert);

@@ -306,6 +306,9 @@ fn work_item_exports(assert: Assert) {
 static STALLED_WAIT: AtomicU64 = AtomicU64::new(u64::MAX);
 /// As threads que rodaram o item de fora e o de dentro.
 static STALLED_THREADS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// O item que chega com todas as workers paradas: a thread que o rodou, o
+/// instante em que entrou na fila e o instante em que rodou.
+static STARVED: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
 /// O item de dentro: guarda a thread que o roda e sinaliza o evento do
 /// bloco.
@@ -316,9 +319,7 @@ extern "win64" fn stalled_inner(block: u64) {
 
 /// O item de fora: enfileira o de dentro e espera o evento que ele
 /// sinaliza, como o acpi.sys que repassa o START ao pci.sys numa worker e
-/// espera o work item do pci.sys. O prazo (60 s) só pega um travamento: com
-/// o host carregado, o relógio do convidado pode saltar segundos entre dois
-/// passos, e o que importa é quem rodou o item, não quanto demorou.
+/// espera o work item do pci.sys. O prazo (60 s) só pega um travamento.
 extern "win64" fn stalled_outer(block: u64) {
     STALLED_THREADS[0].store(crate::ntos::ps::process::get_current_thread(), Ordering::SeqCst);
     let _ = call_export("ExInitializeWorkItem", &[block + 0x20, stalled_inner as extern "win64" fn(u64) as usize as u64, block]);
@@ -327,12 +328,42 @@ extern "win64" fn stalled_outer(block: u64) {
     STALLED_WAIT.store(call_export("KeWaitForSingleObject", &[block, 0, 0, 0, block + 0x40]).unwrap_or(u64::MAX), Ordering::SeqCst);
 }
 
-/// A worker bloqueada numa espera dentro de um item: o item que ela espera
-/// ganha uma worker dinâmica depois de um intervalo (o balance manager) e a
-/// espera termina com sucesso, sem o item rodar aninhado na pilha dela: o
-/// item de dentro roda numa thread que não é a do de fora, e nunca antes do
-/// intervalo inteiro (os dois instantes pelo mesmo relógio do convidado).
+/// Prende uma worker: espera o evento de notificação do teste (no máximo
+/// 60 s, só contra um travamento).
+extern "win64" fn blocking_item(event: u64) {
+    let timeout = guest::alloc_bytes(8);
+    guest::write64(timeout, (-600_000_000i64) as u64);
+    let _ = call_export("KeWaitForSingleObject", &[event, 0, 0, 0, timeout]);
+    guest::free_bytes(timeout);
+}
+
+/// O item que chega com o pool inteiro parado: guarda a thread e o instante.
+extern "win64" fn starved_item(_parameter: u64) {
+    STARVED[0].store(crate::ntos::ps::process::get_current_thread(), Ordering::SeqCst);
+    STARVED[2].store(clock::uptime_ms(), Ordering::SeqCst);
+}
+
+/// Espera (girando o despachante, de 10 em 10 ms, no máximo 60 s) até
+/// `done` valer.
+fn wait_for(done: impl Fn() -> bool) -> bool {
+    let interval = guest::alloc_bytes(8);
+    guest::write64(interval, (-100_000i64) as u64);
+    let started = clock::uptime_ms();
+    while !done() && clock::uptime_ms() - started < 60_000 {
+        let _ = timer::delay_execution_thread(interval, 0, false);
+    }
+    guest::free_bytes(interval);
+    done()
+}
+
+/// A worker parada esperando um item da fila: o item que ela espera roda
+/// noutra worker, nunca aninhado na pilha dela, e a espera termina com
+/// sucesso. Depois, com todas as workers paradas numa espera, o item novo
+/// não fica sem worker: o gerenciador das filas cria uma depois de o item
+/// esperar um intervalo inteiro (ou, se uma worker parada voltar antes, ele
+/// roda nela); o item nunca roda no contexto de boot.
 fn stalled_worker(assert: Assert) {
+    let boot_thread = crate::ntos::ps::process::get_current_thread();
     let block = guest::alloc_bytes(0x100);
     let _ = call_export("KeInitializeEvent", &[block, 0, 0]);
     let _ = call_export("ExInitializeWorkItem", &[block + 0x60, stalled_outer as extern "win64" fn(u64) as usize as u64, block]);
@@ -340,13 +371,45 @@ fn stalled_worker(assert: Assert) {
     for thread in &STALLED_THREADS {
         thread.store(0, Ordering::SeqCst);
     }
-    let started = clock::uptime_ms();
     let _ = call_export("ExQueueWorkItem", &[block + 0x60, 1]);
-    work_items::run_queue();
-    let elapsed = clock::uptime_ms() - started;
+    let finished = wait_for(|| STALLED_WAIT.load(Ordering::SeqCst) != u64::MAX);
     let (outer, inner) = (STALLED_THREADS[0].load(Ordering::SeqCst), STALLED_THREADS[1].load(Ordering::SeqCst));
-    debug_print!("[work] worker bloqueada: espera {:#x} em {} ms, item de fora na thread {:#x}, de dentro na {:#x}", STALLED_WAIT.load(Ordering::SeqCst), elapsed, outer, inner);
-    assert(STALLED_WAIT.load(Ordering::SeqCst) == 0 && outer != 0 && inner != 0 && inner != outer && elapsed >= 1000, "ex: a worker bloqueada esperando um item da fila ganha uma worker dinamica depois do intervalo do balance manager");
+    debug_print!("[work] worker esperando um item: espera {:#x}, item de fora na thread {:#x}, de dentro na {:#x}", STALLED_WAIT.load(Ordering::SeqCst), outer, inner);
+    assert(finished && STALLED_WAIT.load(Ordering::SeqCst) == 0 && work_items::is_worker_thread(outer) && work_items::is_worker_thread(inner) && inner != outer, "ex: o item que uma worker parada espera roda noutra worker e a espera termina");
+
+    // Todas as workers livres presas num evento de notificação.
+    let release = guest::alloc_bytes(0x18);
+    let _ = call_export("KeInitializeEvent", &[release, 0, 0]);
+    let mut blockers = alloc::vec::Vec::new();
+    while work_items::worker_counts().1 > 0 && blockers.len() < 64 {
+        let item = guest::alloc_bytes(0x20);
+        let _ = call_export("ExInitializeWorkItem", &[item, blocking_item as extern "win64" fn(u64) as usize as u64, release]);
+        let _ = call_export("ExQueueWorkItem", &[item, 1]);
+        blockers.push(item);
+        work_items::run_queue();
+    }
+    let (before, available) = work_items::worker_counts();
+    for slot in &STARVED {
+        slot.store(0, Ordering::SeqCst);
+    }
+    let starved = guest::alloc_bytes(0x20);
+    let _ = call_export("ExInitializeWorkItem", &[starved, starved_item as extern "win64" fn(u64) as usize as u64, 0]);
+    STARVED[1].store(clock::uptime_ms(), Ordering::SeqCst);
+    let _ = call_export("ExQueueWorkItem", &[starved, 1]);
+    let ran = wait_for(|| STARVED[2].load(Ordering::SeqCst) != 0);
+    let after = work_items::worker_counts().0;
+    let _ = call_export("KeSetEvent", &[release, 0, 0]);
+    work_items::run_queue();
+    let thread = STARVED[0].load(Ordering::SeqCst);
+    let waited = STARVED[2].load(Ordering::SeqCst).saturating_sub(STARVED[1].load(Ordering::SeqCst));
+    let grown = after > before;
+    debug_print!("[work] pool parado: {} workers ({} livres) com {} itens presos; o item novo esperou {} ms e rodou na thread {:#x}; pool com {} workers", before, available, blockers.len(), waited, thread, after);
+    assert(available == 0 && ran && thread != boot_thread && work_items::is_worker_thread(thread) && (!grown || waited >= work_items::BALANCE_INTERVAL_MS), "ex: com o pool parado, o item novo roda numa worker; a worker nova so nasce depois do intervalo do gerenciador");
+    for item in blockers {
+        guest::free_bytes(item);
+    }
+    guest::free_bytes(starved);
+    guest::free_bytes(release);
     guest::free_bytes(block);
 }
 

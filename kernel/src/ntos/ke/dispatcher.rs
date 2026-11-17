@@ -331,9 +331,10 @@ fn pump_scheduler() {
     scheduler::tick(-1);
 }
 
-/// Interrupções de dispositivo, timers, DPCs, work items, conclusões
-/// registradas e escalonador: o trabalho do despachante, que só o contexto
-/// de boot gira. Numa thread de kernel o pump não aninha o despachante na
+/// Interrupções de dispositivo, timers, DPCs, o gerenciador das worker
+/// threads, conclusões registradas e escalonador: o trabalho do despachante,
+/// que só o contexto de boot gira (os work items rodam nas workers que o
+/// escalonador entra, nunca aqui). Numa thread de kernel o pump não aninha o despachante na
 /// pilha dela: a thread cede a vez (em DISPATCH_LEVEL ou acima, só os
 /// timers e as DPCs andam).
 pub fn pump_kernel() {
@@ -349,7 +350,7 @@ pub fn pump_kernel() {
     super::interrupt_object::service_during_wait();
     timer::check_timers();
     let _ = dpc::run_queue();
-    work_items::run_queue();
+    work_items::balance();
     let pumps = COMPLETION_PUMPS.lock().clone();
     for pump in pumps {
         pump();

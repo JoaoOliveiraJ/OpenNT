@@ -4,9 +4,10 @@
 //!
 //! ntoskrnl 10.0.19045:
 //!   FsRtlAreVolumeStartupApplicationsComplete 0x62e030: lê o byte
-//!     FsRtlpVolumeStartupApplicationsComplete (0 na imagem; o NT o liga
-//!     quando o smss termina os BootExecute). O OpenNT não roda essa fase,
-//!     então o byte nunca é ligado e a resposta é FALSE.
+//!     FsRtlpVolumeStartupApplicationsComplete (0 na imagem), que o
+//!     FsRtlWaitForSmssEvent liga quando o smss sinaliza o
+//!     `\Device\VolumesSafeForWriteAccess` depois dos BootExecute (seção
+//!     própria abaixo). Sem smss a resposta fica FALSE.
 //!   FsRtlDismountComplete 0x7739a0: DismountStatus >= 0 -> lock inc
 //!     KUSER_SHARED_DATA.DismountCount (+0x2DC).
 //!   FsRtlUpdateDiskCounters 0x30e7c0: lock xadd em KPRCB.FsCounters
@@ -20,11 +21,11 @@
 //!   FsRtlNotifyVolumeEvent(Ex) 0x76d6e0 / 0x71b6f0: o evento de volume
 //!     como notificação PnP de dispositivo alvo (seção própria abaixo).
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::hal::amd64::native_call;
 use crate::ntos::inc::field::{Field, NtStruct, Reserved};
-use crate::ntos::inc::types::{FileObject, Guid, Kpcr, ObjectAttributes};
+use crate::ntos::inc::types::{FileObject, Guid, Kpcr, ObjectAttributes, WorkQueueItem};
 use crate::ntos::ke::pcr;
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::shared_user_data;
@@ -35,6 +36,63 @@ static STARTUP_APPLICATIONS_COMPLETE: AtomicBool = AtomicBool::new(false);
 
 pub fn startup_applications_complete() -> bool {
     STARTUP_APPLICATIONS_COMPLETE.load(Ordering::Acquire)
+}
+
+// ---- FsRtlInitializeSmssEvent / FsRtlWaitForSmssEvent ---------------------------------
+//
+// ntoskrnl 10.0.19041: o FsRtlInitSystem (do Phase1InitializationDiscard,
+// antes do PpInitSystem e dos drivers) chama o FsRtlInitializeSmssEvent (rva
+// 0xa6bb14): NtCreateEvent do `\Device\VolumesSafeForWriteAccess`
+// (EVENT_ALL_ACCESS; OBJ_PERMANENT, OBJ_CASE_INSENSITIVE e OBJ_KERNEL_HANDLE;
+// NotificationEvent, não sinalizado), ObReferenceObjectByHandle(SYNCHRONIZE),
+// NtClose e ExQueueWorkItem(SmssEventWorkItem, DelayedWorkQueue) com o
+// FsRtlWaitForSmssEvent (rva 0x7d51a0) e o objeto do evento: a worker espera
+// o evento sem prazo, liga FsRtlpVolumeStartupApplicationsComplete e solta a
+// referência. O smss.exe abre o evento no SmpInit (NtOpenEvent com
+// EVENT_ALL_ACCESS) e o sinaliza no SmpLoadDataFromRegistry logo depois dos
+// comandos BootExecute (o autochk). O WorkerThread do mountmgr.sys abre o
+// mesmo evento (até 1000 tentativas, uma por segundo) e o espera antes de
+// reconciliar os bancos de pontos de montagem nos volumes. Sem smss ninguém
+// o sinaliza: a worker do FsRtlWaitForSmssEvent e a do mountmgr.sys ficam
+// paradas na espera, como no NT.
+
+/// O nome do evento.
+pub const VOLUMES_SAFE_FOR_WRITE_ACCESS: &str = "\\Device\\VolumesSafeForWriteAccess";
+/// NotificationEvent.
+const NOTIFICATION_EVENT: u32 = 0;
+/// O KEVENT do `\Device\VolumesSafeForWriteAccess` (0 antes do FsRtlInitSystem).
+static SMSS_EVENT: AtomicU64 = AtomicU64::new(0);
+/// A worker parada no FsRtlWaitForSmssEvent (0 antes de ela começar).
+static SMSS_EVENT_WAITER: AtomicU64 = AtomicU64::new(0);
+
+/// FsRtlInitializeSmssEvent: o evento permanente e o work item que o espera.
+pub fn initialize_smss_event() -> Result<(), KernelError> {
+    if SMSS_EVENT.load(Ordering::Acquire) != 0 {
+        return Ok(());
+    }
+    // A referência do evento criado é a do OBJ_PERMANENT: nunca é solta.
+    let event = crate::ntos::ps::user::events::create_kernel_event(VOLUMES_SAFE_FOR_WRITE_ACCESS, NOTIFICATION_EVENT, false)?;
+    let item = guest::alloc_bytes(WorkQueueItem::SIZE);
+    if item == 0 {
+        return Err(KernelError::new("SmssEventWorkItem"));
+    }
+    SMSS_EVENT.store(event.pointer, Ordering::Release);
+    crate::ntos::io::work_items::queue_kernel_ex_work_item(item, wait_for_smss_event, event.pointer);
+    Ok(())
+}
+
+/// FsRtlWaitForSmssEvent(Event): espera o smss e liga
+/// FsRtlpVolumeStartupApplicationsComplete.
+fn wait_for_smss_event(_device: u64, event: u64) {
+    SMSS_EVENT_WAITER.store(crate::ntos::ps::process::get_current_thread(), Ordering::Release);
+    crate::ntos::ke::dispatcher::wait_for_single_object(event, 0, 0, false);
+    STARTUP_APPLICATIONS_COMPLETE.store(true, Ordering::Release);
+}
+
+/// O KEVENT do `\Device\VolumesSafeForWriteAccess` e a thread que o espera
+/// no FsRtlWaitForSmssEvent (autotestes).
+pub fn smss_event() -> (u64, u64) {
+    (SMSS_EVENT.load(Ordering::Acquire), SMSS_EVENT_WAITER.load(Ordering::Acquire))
 }
 
 /// FsRtlDismountComplete(DeviceObject, DismountStatus).
