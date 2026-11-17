@@ -169,6 +169,11 @@ pub fn associate(port: &Arc<Port>, handle: u64, key: u64, access_mode: u8) -> Re
         state.completion = Some(handle.clone());
         state.pending.iter().filter(|message| !message.synchronous && !message.direct).count()
     });
+    // Numa porta de conexão de servidor, as mensagens que já estavam na fila
+    // principal (uma conexão ou um pedido que chegou entre a criação da porta
+    // e a associação) ganham um pacote cada, como no laço do
+    // AlpcpAssociateIoCompletionPort sobre a fila da porta.
+    let waiting = waiting + super::server::queued_messages(port);
     for _ in 0..waiting {
         handle.notify();
     }

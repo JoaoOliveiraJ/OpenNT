@@ -657,6 +657,13 @@ pub fn server_for(port: &Arc<Port>) -> Option<Arc<UserServer>> {
     server_of(port)
 }
 
+/// As mensagens ainda na fila de uma porta de conexão de servidor (zero em
+/// qualquer outra porta): a associação da IOCP avisa cada uma.
+pub fn queued_messages(port: &Arc<Port>) -> usize {
+    let server = SERVERS.lock().get(&port.pointer).cloned();
+    server.map_or(0, |server| server.state.lock().queue.len())
+}
+
 /// O NtReplyWaitReceivePort(Ex) e o NtListenPort numa porta de conexão ou
 /// de comunicação de servidor (AlpcpReceiveLegacyMessage): a resposta
 /// `reply` (o MessageId de um pedido pendente), depois a próxima mensagem da
