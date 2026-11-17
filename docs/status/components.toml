@@ -271,7 +271,14 @@ id = "services-scm"
 titulo = "Gerenciador de serviços do services.exe real"
 marcador = "SERVICES_STARTED"
 comando = "cargo xtask test-boot USER_INITIALIZED 900000 --initial-process=smss --display=basic --build-dir=build/services-scm --smp=1 --expect=LSA_POLICY_READY --expect=SERVICES_STARTED"
-descricao = "O boot do teste lsa-politica até o ScEnableRpcInterface do services.exe. O ScGetAccountDomainInfo consulta o lsass pelo \\RPC Control\\lsapolicylookup e o SvcctrlMain publica o \\RPC Control\\ntsvcs e o \\pipe\\ntsvcs (SERVICES_STARTED); a imitação do gerenciador de serviços do kernel fica desligada no boot com o smss. Em seguida o servidor do SCE do scesrv.dll sobe o \\pipe\\scerpc e o InitWudfDriverManager carrega o WUDFPlatform.dll, lê a configuração do WUDF da SOFTWARE, cria um ETIMER de modo usuário (NtCreateTimer) e a porta ALPC ProcessManagement no \\UMDFCommunicationPorts que o kernel cria no IopCreateRootDirectories. O ScAutoStartServices acha o DcomLaunch, o RpcEptMapper, o RpcSs e o LSM e passa pelo logon de serviço no lsass (o LogonUserExExW; o LsapCreateTokenObject grava no token novo a TokenMandatoryPolicy, a TokenAuditPolicy e a TokenOrigin). O CreateProcessAsUserW do svchost ainda volta STATUS_PRIVILEGE_NOT_HELD."
+descricao = "O boot do teste lsa-politica até o ScEnableRpcInterface do services.exe. O ScGetAccountDomainInfo consulta o lsass pelo \\RPC Control\\lsapolicylookup e o SvcctrlMain publica o \\RPC Control\\ntsvcs e o \\pipe\\ntsvcs (SERVICES_STARTED); a imitação do gerenciador de serviços do kernel fica desligada no boot com o smss. Em seguida o servidor do SCE do scesrv.dll sobe o \\pipe\\scerpc e o InitWudfDriverManager carrega o WUDFPlatform.dll, lê a configuração do WUDF da SOFTWARE, cria um ETIMER de modo usuário (NtCreateTimer) e a porta ALPC ProcessManagement no \\UMDFCommunicationPorts que o kernel cria no IopCreateRootDirectories. O ScAutoStartServices acha o DcomLaunch, o RpcEptMapper, o RpcSs e o LSM e passa pelo logon de serviço no lsass (o LogonUserExExW; o LsapCreateTokenObject grava no token novo a TokenMandatoryPolicy, a TokenAuditPolicy e a TokenOrigin). O CreateProcessAsUserW cria o svchost com esse token (teste svchost-dcomlaunch)."
+
+[[teste]]
+id = "svchost-dcomlaunch"
+titulo = "svchost do DcomLaunch e o canal do serviço Power"
+marcador = "pedido de conexao aceito"
+comando = "cargo xtask test-boot USER_INITIALIZED 900000 --initial-process=smss --display=basic --build-dir=build/svchost-dcomlaunch --smp=1 --expect=SERVICES_STARTED \"--expect=criou svchost.exe\" \"--expect=pedido de conexao aceito\""
+descricao = "O boot do teste services-scm até o svchost do grupo DcomLaunch. O CreateProcessAsUserW do services.exe cria o svchost com o token do logon de serviço: o PspAllocateProcess faz o RtlAcquirePrivilege (o SeAssignPrimaryTokenPrivilege no token primário de quem chama) ou aceita o token pelo SeIsTokenAssignableToProcess. O svchost roda os ServiceDll do grupo no mesmo processo. O umpo.dll do serviço Power conecta ao \\PowerPort, a porta ALPC que o kernel cria no PopUmpoInitializeChannel, com um objeto Callback ligado pelo NtAlpcSetInformation 9; o kernel aceita o primeiro cliente (pedido de conexao aceito). Depois o umpo sobe o endpoint umpo e pede o NtPowerInformation de modo usuário (PlatformInformation e PowerInformationInternal 4)."
 
 [[teste]]
 id = "pagefile"
@@ -1520,9 +1527,9 @@ notas = "Uma suíte planejada conta como pronta quando o arquivo de teste de mes
 # faz (uma linha: o que funciona) e para (opcional: onde para).
 
 [marco]
-atual = "Na sessão 0, o wininit.exe real cria o services.exe e o lsass.exe reais. O lsass instala o banco de política e o banco de contas de um sistema novo, inicializa a auditoria, as sessões de logon, as credenciais e os pacotes de segurança e publica as interfaces RPC do LSA; o services.exe consulta o domínio da conta no lsass e publica a interface RPC do gerenciador de serviços. Na sessão 1, o winlogon.exe real registra o processo de logon pelo RPC de kernel do msrpc.sys, abre as Desktops Winlogon, Disconnect e Default da WinSta0 dele e chama o SwitchDesktop."
-teste = "services-scm"
-proximo = "O CreateProcessAsUserW do services.exe criar o svchost do DcomLaunch com o token do logon de serviço: o PspAllocateProcess aceita esse token pelo SeIsTokenAssignableToProcess (token filho ou irmão do primário de quem chama), que o OpenNT ainda não confere, e hoje a criação volta STATUS_PRIVILEGE_NOT_HELD. Depois vêm o canal de controle de serviço, os ServiceDll do svchost e o Local Session Manager (lsm.dll), que sinaliza o TermSrvReadyEvent e conecta a sessão 1 ao console pela \\SmSsWinStationApiPort: o NtUserRemoteConnect do csrss leva ao DxgkSessionConnected e à carga do cdd.dll (teste primeiro-pixel)."
+atual = "Na sessão 0, o wininit.exe real cria o services.exe e o lsass.exe reais. O lsass instala o banco de política e o banco de contas de um sistema novo, inicializa a auditoria, as sessões de logon, as credenciais e os pacotes de segurança e publica as interfaces RPC do LSA; o services.exe consulta o domínio da conta no lsass, publica a interface RPC do gerenciador de serviços e cria o svchost do grupo DcomLaunch com o token do logon de serviço; o serviço Power desse svchost conecta ao \\PowerPort do kernel. Na sessão 1, o winlogon.exe real registra o processo de logon pelo RPC de kernel do msrpc.sys, abre as Desktops Winlogon, Disconnect e Default da WinSta0 dele e chama o SwitchDesktop."
+teste = "svchost-dcomlaunch"
+proximo = "Os serviços do svchost do DcomLaunch subirem (o Power, o DcomLaunch, o BrokerInfrastructure e o LSM) e o RpcSs e o RpcEptMapper no svchost do rpcss. O Local Session Manager (lsm.dll) sinaliza o TermSrvReadyEvent e conecta a sessão 1 pela \\SmSsWinStationApiPort. Em paralelo, o InitVideo da sessão 1 precisa carregar o cdd.dll (o adaptador de renderização do BasicRender) para o win32k desenhar o primeiro pixel (teste primeiro-pixel)."
 
 [[roda]]
 nome = "O smss.exe cria o csrss.exe"
@@ -1562,14 +1569,21 @@ nome = "O gerenciador de serviços do services.exe"
 grupo = "marco"
 teste = "services-scm"
 faz = "O services.exe real consulta o domínio da conta no lsass, publica a interface RPC do gerenciador de serviços, sobe o servidor do SCE e o gerenciador de drivers de modo usuário e roda o início automático, com o logon de serviço dos serviços da cadeia do LSM no lsass."
-para = "O CreateProcessAsUserW do svchost volta STATUS_PRIVILEGE_NOT_HELD: o kernel ainda não aceita o token do logon de serviço pelo SeIsTokenAssignableToProcess."
+para = "O início automático cria o svchost do DcomLaunch (teste svchost-dcomlaunch)."
+
+[[roda]]
+nome = "O svchost do DcomLaunch"
+grupo = "marco"
+teste = "svchost-dcomlaunch"
+faz = "O services.exe cria o svchost do grupo DcomLaunch com o token do logon de serviço; o serviço Power (umpo.dll) conecta ao \\PowerPort do kernel, sobe o endpoint umpo e lê o NtPowerInformation de modo usuário."
+para = "Os serviços do svchost ainda param antes do LSM: o Power sai depois do umpo e o RpcSs e o RpcEptMapper não sobem."
 
 [[roda]]
 nome = "As Desktops do winlogon.exe"
 grupo = "marco"
 teste = "winlogon"
 faz = "O winlogon.exe real da sessão 1 registra o processo de logon pelo RPC de kernel do msrpc.sys, abre as Desktops Winlogon, Disconnect e Default da WinSta0 da sessão dele e chama o SwitchDesktop."
-para = "Depois do SwitchDesktop o winlogon carrega o winsta.dll e espera no WinStationWaitForConnect o TermSrvReadyEvent, que o Local Session Manager sinaliza quando sobe; o LSM vem do início automático do services.exe, que ainda não cria o svchost dele (teste services-scm)."
+para = "Depois do SwitchDesktop o winlogon carrega o winsta.dll e espera no WinStationWaitForConnect o TermSrvReadyEvent, que o Local Session Manager sinaliza quando sobe; o LSM roda no svchost do DcomLaunch, que ainda não chega a ele (teste svchost-dcomlaunch)."
 
 [[roda]]
 nome = "Primeiro pixel do win32k.sys"

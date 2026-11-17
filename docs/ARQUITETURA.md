@@ -3108,7 +3108,8 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   primário de quem chama). O svchost do DcomLaunch conecta ao `\PowerPort`
   do kernel (`po/umpo_channel.rs`, o PopUmpoInitializeChannel do
   PoInitSystem: um objeto Callback ligado à porta pelo NtAlpcSetInformation
-  9, chamado a cada mensagem posta na fila, aceita o primeiro cliente),
+  9 e chamado a cada mensagem posta na fila; o callback agenda um work item
+  que trata as mensagens no processo System e aceita o primeiro cliente),
   sobe o endpoint `umpo` e pede o NtPowerInformation de modo usuário
   (`po/power_information.rs`: o PlatformInformation, o PlatformRole e o
   PowerInformationInternal 4). As definições WNF desta máquina
