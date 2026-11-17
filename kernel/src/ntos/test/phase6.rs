@@ -14310,6 +14310,13 @@ fn se_token_assignable(assert: Assert) {
             && assignable::is_assignable_to_process(filtered) == Ok(true),
         "se-token-assignable: irmao e filho atribuiveis; outro logon e integridade maior nao; impersonacao de identificacao recusada",
     );
+    // O RtlAcquirePrivilege do PspAllocateProcess: o SeAssignPrimaryTokenPrivilege
+    // desabilitado no primário do System basta; um LUID ausente não.
+    let primary_holds_disabled = tokens::with(primary, |token| token.privileges.iter().any(|privilege| privilege.id == 3 && privilege.attributes & 2 == 0)).unwrap_or(false);
+    assert(
+        !primary_holds_disabled || (crate::ntos::se::privilege::acquired_privilege_check(3, 1) && !crate::ntos::se::privilege::acquired_privilege_check(0x7F, 1)),
+        "se-token-assignable: o privilegio presente e desabilitado no primario passa pelo RtlAcquirePrivilege",
+    );
     for token in [sibling, other_logon, higher, identification, filtered] {
         if token != 0 {
             let _ = tokens::release(token);

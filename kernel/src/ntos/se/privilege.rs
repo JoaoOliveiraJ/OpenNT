@@ -54,6 +54,24 @@ pub fn single_privilege_check(privilege: u64, previous_mode: u32) -> bool {
     tokens::with(token, |token| token.privileges.iter().any(|held| held.id == privilege && held.attributes & SE_PRIVILEGE_ENABLED != 0)).unwrap_or(false)
 }
 
+/// O RtlAcquirePrivilege seguido do SeSinglePrivilegeCheck, como o
+/// PspAllocateProcess do 19041 faz com os privilégios que o pedido exige
+/// (o SeAssignPrimaryTokenPrivilege de um PS_ATTRIBUTE_TOKEN, o SeTcbPrivilege
+/// do FORCE_BREAKAWAY): com PreviousMode UserMode, o RtlAcquirePrivilege
+/// (RTL_ACQUIRE_PRIVILEGE_REVERT) deixa de lado a impersonação da thread,
+/// impersona uma cópia do token primário do processo e habilita nela o
+/// privilégio. Basta então o privilégio estar no token primário, mesmo
+/// desabilitado. Sem ele no primário, o RtlAcquirePrivilege falha, a
+/// impersonação volta e vale o SeSinglePrivilegeCheck do token efetivo.
+pub fn acquired_privilege_check(privilege: u64, previous_mode: u32) -> bool {
+    if previous_mode == 0 {
+        return true;
+    }
+    let primary = crate::ntos::ps::process::get_primary_token(crate::ntos::ps::process::get_current_process());
+    let present = primary.and_then(|token| tokens::with(token, |token| token.privileges.iter().any(|held| held.id == privilege))).unwrap_or(false);
+    present || single_privilege_check(privilege, previous_mode)
+}
+
 /// SeCheckAuditPrivilege: o SeAuditPrivilege (21) habilitado no token
 /// primário do processo corrente (não no de impersonação da thread), como no
 /// NT; KernelMode passa direto. É o que os serviços de alarme de auditoria

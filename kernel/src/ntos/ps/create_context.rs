@@ -23,9 +23,10 @@
 //!   suporte aqui (DebugObject, SecureProcess, UmsThread); Token (o
 //!   CreateProcessAsUser) dá ao processo uma cópia do token primário pedido,
 //!   referenciado com TOKEN_ASSIGN_PRIMARY, e exige de quem chama o
-//!   SeAssignPrimaryTokenPrivilege habilitado no token efetivo ou um token
-//!   filho ou irmão do primário dele (o SeIsTokenAssignableToProcess,
-//!   `se/token/assignable.rs`), como o PspAllocateProcess; aceita sem
+//!   SeAssignPrimaryTokenPrivilege no token primário (o RtlAcquirePrivilege
+//!   do PspAllocateProcess o habilita numa cópia impersonada) ou habilitado
+//!   no efetivo, ou um token filho ou irmão do primário dele (o
+//!   SeIsTokenAssignableToProcess, `se/token/assignable.rs`); aceita sem
 //!   efeito, com registro no log, os demais
 //!   que o kernel32 passa (StdHandleInfo, HandleList, ErrorMode, afinidade,
 //!   mitigações e políticas); um número desconhecido, um atributo repetido,
@@ -49,7 +50,8 @@
 //!   os mesmos valores, os handles OBJ_INHERIT do pai declarado
 //!   (ParentProcess) ou, sem ele, de quem chama;
 //!   THREAD_CREATE_FLAGS_CREATE_SUSPENDED cria a thread principal suspensa;
-//!   PROCESS_CREATE_FLAGS_FORCE_BREAKAWAY pede SeTcbPrivilege (senão
+//!   PROCESS_CREATE_FLAGS_FORCE_BREAKAWAY pede o SeTcbPrivilege no primário
+//!   (pelo mesmo RtlAcquirePrivilege) ou habilitado no efetivo (senão
 //!   STATUS_PRIVILEGE_NOT_HELD, o PspAllocateProcess).
 //! - Os jobs (PspInsertProcess e PspInsertThread), com o processo inteiro e
 //!   ainda parado: o processo herda o job do pai declarado ou de quem chama
@@ -567,7 +569,7 @@ fn capture_and_create(request: &UserCreateRequest) -> Result<u32, u32> {
         crate::debug_print!("[ps] NtCreateUserProcess: flags de processo {:#x} sem suporte", request.process_flags & PROCESS_FLAGS_UNSUPPORTED);
         return Err(STATUS_NOT_SUPPORTED);
     }
-    if request.process_flags & PROCESS_FORCE_BREAKAWAY != 0 && !crate::ntos::se::privilege::single_privilege_check(SE_TCB_PRIVILEGE, 1) {
+    if request.process_flags & PROCESS_FORCE_BREAKAWAY != 0 && !crate::ntos::se::privilege::acquired_privilege_check(SE_TCB_PRIVILEGE, 1) {
         return Err(STATUS_PRIVILEGE_NOT_HELD);
     }
     let process_handle_attributes = capture_object_attributes(request.process_attributes)?;
@@ -580,12 +582,13 @@ fn capture_and_create(request: &UserCreateRequest) -> Result<u32, u32> {
         parameters.image_path_name = dos_path.clone();
     }
     let protection = requested_protection(request.process_flags, attributes.protection, attributes.parent.unwrap_or_else(process::get_current_process))?;
-    // PsAttributeToken: o SeAssignPrimaryTokenPrivilege habilitado no token
-    // efetivo de quem chama ou um token filho ou irmão do primário dele (o
-    // SeIsTokenAssignableToProcess), como no PspAllocateProcess.
+    // PsAttributeToken: o SeAssignPrimaryTokenPrivilege (o RtlAcquirePrivilege
+    // do PspAllocateProcess o habilita numa cópia do primário de quem chama
+    // antes do SeSinglePrivilegeCheck) ou um token filho ou irmão do primário
+    // (o SeIsTokenAssignableToProcess).
     let primary_token = attributes.token.0.as_ref().map(|reference| reference.token);
     if let Some(token) = primary_token {
-        if !crate::ntos::se::privilege::single_privilege_check(SE_ASSIGN_PRIMARY_TOKEN_PRIVILEGE, 1) && !crate::ntos::se::token::assignable::is_assignable_to_process(token)? {
+        if !crate::ntos::se::privilege::acquired_privilege_check(SE_ASSIGN_PRIMARY_TOKEN_PRIVILEGE, 1) && !crate::ntos::se::token::assignable::is_assignable_to_process(token)? {
             let effective = crate::ntos::ob::object_access::subject().unwrap_or(0);
             let describe = |pointer: u64| {
                 crate::ntos::se::token::tokens::with(pointer, |record| {

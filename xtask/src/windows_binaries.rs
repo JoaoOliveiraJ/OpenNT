@@ -411,6 +411,15 @@ const SMSS_PROGRAMS: &[&str] = &[
     // InitWudfDriverManager do services.exe inicializa antes do início
     // automático; sem ele o SvcctrlMain sai.
     "WUDFPlatform.dll",
+    // O umpo.dll do serviço Power carrega o slc.dll (com o sppc.dll) e o
+    // umpoext.dll (com o dxgi.dll e o tdh.dll); o winlogon.exe cria o
+    // fontdrvhost.exe, o anfitrião das fontes de modo usuário.
+    "slc.dll",
+    "sppc.dll",
+    "umpoext.dll",
+    "dxgi.dll",
+    "tdh.dll",
+    "fontdrvhost.exe",
 ];
 
 /// Os outros serviços do grupo DcomLaunch do svchost (o mesmo processo do
