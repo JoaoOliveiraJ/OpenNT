@@ -22,3 +22,4 @@ pub mod attributes;
 pub mod adjust;
 pub mod create;
 pub mod set_information;
+pub mod assignable;

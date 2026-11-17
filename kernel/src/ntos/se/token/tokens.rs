@@ -103,6 +103,11 @@ pub struct Token {
     pub refs: u64,
     pub id: u64,
     pub modified_id: u64,
+    /// ParentTokenId: 0 num token criado (SepCreateTokenEx, o do System e o
+    /// do NtCreateToken), o do token de origem numa cópia (SepDuplicateToken,
+    /// inclusive o token do processo filho) e o TokenId do token de origem
+    /// num token filtrado (SepFilterToken).
+    pub parent_token_id: u64,
     pub authentication_id: u64,
     pub expiration_time: u64,
     pub user: Sid,
@@ -321,6 +326,7 @@ pub fn create(parent: Option<u64>, initialize: Option<&dyn Fn(&mut Token)>) -> R
         permanent: false,
         id,
         modified_id: id,
+        parent_token_id: parent.as_ref().map_or(0, |parent| parent.parent_token_id),
         authentication_id: parent.as_ref().map_or(0x3E7, |parent| parent.authentication_id),
         // O contexto de boot não expira; duplicações conservam a política do pai.
         expiration_time: parent.as_ref().map_or(0x7FFF_FFFF_FFFF_FFFF, |parent| parent.expiration_time),

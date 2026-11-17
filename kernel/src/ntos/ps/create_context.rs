@@ -23,8 +23,9 @@
 //!   suporte aqui (DebugObject, SecureProcess, UmsThread); Token (o
 //!   CreateProcessAsUser) dá ao processo uma cópia do token primário pedido,
 //!   referenciado com TOKEN_ASSIGN_PRIMARY, e exige de quem chama o
-//!   SeAssignPrimaryTokenPrivilege habilitado no token efetivo, como o
-//!   PspAllocateProcess; aceita sem
+//!   SeAssignPrimaryTokenPrivilege habilitado no token efetivo ou um token
+//!   filho ou irmão do primário dele (o SeIsTokenAssignableToProcess,
+//!   `se/token/assignable.rs`), como o PspAllocateProcess; aceita sem
 //!   efeito, com registro no log, os demais
 //!   que o kernel32 passa (StdHandleInfo, HandleList, ErrorMode, afinidade,
 //!   mitigações e políticas); um número desconhecido, um atributo repetido,
@@ -580,11 +581,13 @@ fn capture_and_create(request: &UserCreateRequest) -> Result<u32, u32> {
     }
     let protection = requested_protection(request.process_flags, attributes.protection, attributes.parent.unwrap_or_else(process::get_current_process))?;
     // PsAttributeToken: o SeAssignPrimaryTokenPrivilege habilitado no token
-    // efetivo de quem chama (o OpenNT não rastreia os tokens filhos e irmãos
-    // que o SeIsTokenAssignableToProcess também aceita).
+    // efetivo de quem chama ou um token filho ou irmão do primário dele (o
+    // SeIsTokenAssignableToProcess), como no PspAllocateProcess.
     let primary_token = attributes.token.0.as_ref().map(|reference| reference.token);
-    if primary_token.is_some() && !crate::ntos::se::privilege::single_privilege_check(SE_ASSIGN_PRIMARY_TOKEN_PRIVILEGE, 1) {
-        return Err(STATUS_PRIVILEGE_NOT_HELD);
+    if let Some(token) = primary_token {
+        if !crate::ntos::se::privilege::single_privilege_check(SE_ASSIGN_PRIMARY_TOKEN_PRIVILEGE, 1) && !crate::ntos::se::token::assignable::is_assignable_to_process(token)? {
+            return Err(STATUS_PRIVILEGE_NOT_HELD);
+        }
     }
     let process_access = creator_access(request.process_access, &object_types::process_type())?;
     let thread_access = creator_access(request.thread_access, &object_types::thread_type())?;

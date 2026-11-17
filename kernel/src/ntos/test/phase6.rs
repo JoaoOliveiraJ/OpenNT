@@ -14274,6 +14274,50 @@ fn ps_container_id_exports(assert: Assert) {
     assert(query(0, thread) == zero, "ps-container-id: processo sem job da GUID zerada");
 }
 
+/// SeIsTokenAssignableToProcess contra o token primário do processo
+/// corrente: o irmão (mesmo ParentTokenId e mesmo logon), o filho (o token
+/// filtrado), o de outro logon, o de integridade maior e o de impersonação
+/// abaixo de SecurityImpersonation.
+fn se_token_assignable(assert: Assert) {
+    use crate::ntos::se::model::sid;
+    use crate::ntos::se::token::{assignable, filter, tokens};
+    let Some(primary) = crate::ntos::ps::process::get_primary_token(crate::ntos::ps::process::get_current_process()) else {
+        assert(false, "se-token-assignable: token primario do processo corrente");
+        return;
+    };
+    let primary_id = tokens::with(primary, |token| token.id).unwrap_or(0);
+    let sibling = tokens::duplicate(primary, 2, false, 1).unwrap_or(0);
+    let other_logon = tokens::create(Some(primary), Some(&|token: &mut tokens::Token| token.authentication_id = 0x7_0001)).unwrap_or(0);
+    let other_result = assignable::is_assignable_to_process(other_logon);
+    let _ = tokens::update(other_logon, |token| token.parent_token_id = primary_id);
+    let child_result = assignable::is_assignable_to_process(other_logon);
+    let higher = tokens::create(Some(primary), Some(&|token: &mut tokens::Token| token.integrity = sid(16, &[0x5000]))).unwrap_or(0);
+    let identification = tokens::duplicate(primary, 1, false, 2).unwrap_or(0);
+    let cell = guest::alloc_bytes(8);
+    // SAFETY: célula de 8 bytes alocada acima.
+    let filtered_status = filter::filter_token(primary, 0, 0, 0, 0, unsafe { crate::ntos::inc::field::Field::<u64>::at(cell) }).unwrap_or(u32::MAX);
+    let filtered = guest::read64(cell);
+    let filtered_parent = tokens::with(filtered, |token| token.parent_token_id);
+    assert(
+        sibling != 0
+            && assignable::is_assignable_to_process(sibling) == Ok(true)
+            && other_result == Ok(false)
+            && child_result == Ok(true)
+            && assignable::is_assignable_to_process(higher) == Ok(false)
+            && assignable::is_assignable_to_process(identification) == Err(0xC000_00A5)
+            && filtered_status == 0
+            && filtered_parent == Some(primary_id)
+            && assignable::is_assignable_to_process(filtered) == Ok(true),
+        "se-token-assignable: irmao e filho atribuiveis; outro logon e integridade maior nao; impersonacao de identificacao recusada",
+    );
+    for token in [sibling, other_logon, higher, identification, filtered] {
+        if token != 0 {
+            let _ = tokens::release(token);
+        }
+    }
+    guest::free_bytes(cell);
+}
+
 fn se_logon_session_exports(assert: Assert) {
     use crate::ntos::se::{logon_session, token::tokens};
     assert(logon_session::exists(logon_session::SYSTEM_LUID, 0) && logon_session::exists(logon_session::ANONYMOUS_LUID, 0) && !logon_session::exists(0x3E5, 0), "se-logon-session: sessoes SYSTEM e ANONYMOUS de boot");
@@ -15928,6 +15972,7 @@ pub fn run(assert: Assert) {
     ps_process_notify_ex2_exports(assert);
     ps_container_id_exports(assert);
     se_logon_session_exports(assert);
+    se_token_assignable(assert);
     se_non_ob_audit_exports(assert);
     se_srp_access_check_exports(assert);
     cm_machine_hive_notify_exports(assert);

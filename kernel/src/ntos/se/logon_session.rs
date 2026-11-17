@@ -125,6 +125,12 @@ pub fn exists(logon_id: u64, server_silo: u64) -> bool {
     find(logon_id, server_silo).is_some()
 }
 
+/// O BuddyLogonId da sessão (a sessão ligada de um par de tokens de UAC; 0
+/// sem sessão ligada ou sem a sessão).
+pub fn buddy_logon_id(logon_id: u64, server_silo: u64) -> u64 {
+    find(logon_id, server_silo).map_or(0, |session| session.buddy_logon_id)
+}
+
 /// SeSetSessionIdToken sobre o token da sessão.
 fn set_session_id(token: u64, session_id: u32) {
     let _ = tokens::update(token, |token| token.session_id = session_id);

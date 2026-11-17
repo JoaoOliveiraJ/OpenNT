@@ -151,6 +151,9 @@ pub fn filter_token(existing: u64, flags: u32, sids_to_disable: u64, privileges_
     let privileges_filtered = Cell::new(false);
     let initialize = |token: &mut tokens::Token| {
         token.modified_id = modified;
+        // O token filtrado é filho do de origem (o ParentTokenId do
+        // SepFilterToken é o TokenId dele).
+        token.parent_token_id = source.id;
         token.kind = source.kind;
         token.impersonation_level = source.impersonation_level;
         token.owner = source.owner.clone();
