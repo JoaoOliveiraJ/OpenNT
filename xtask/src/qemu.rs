@@ -710,6 +710,21 @@ impl Drop for QemuProcess {
 /// hospedeiro (`*** RELOGIO`, que o test-boot acrescenta).
 pub const FAILURE_MARKERS: &[&str] = &["*** PANIC", "*** EXCECAO", "SELFTEST FALHOU", "MEMORY_PRESSURE FALHOU", "*** STOP", "*** RELOGIO"];
 
+/// O começo do motivo de um QEMU que saiu com erro sem evento SHUTDOWN do
+/// QMP: morto de fora (o dono da máquina fecha os QEMUs quando o PC fica
+/// lento) ou um erro fatal do próprio QEMU. O convidado nunca causa isso: o
+/// desligamento e o reinício com -no-reboot fazem o QEMU sair com sucesso.
+/// O test-all repete a execução ([`crate::test_all`]).
+pub const QEMU_KILLED: &str = "QEMU encerrado de fora";
+
+/// Como um QEMU terminou: o status e o motivo do evento SHUTDOWN do QMP.
+fn ended(status: std::process::ExitStatus, reason: Option<&str>) -> String {
+    match reason {
+        None if !status.success() => format!("{QEMU_KILLED} ({status})"),
+        _ => format!("{status}, evento SHUTDOWN do QMP: {}", reason.unwrap_or("nenhum")),
+    }
+}
+
 /// O motivo de fim da máquina que o QMP anuncia quando o convidado se
 /// desliga pelo ACPI (S5).
 const GUEST_SHUTDOWN: &str = "guest-shutdown";
@@ -858,7 +873,6 @@ fn private_data_disk(disks: &Disks, log: &Path) -> Result<Option<PathBuf>, Strin
 pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, log: &Path, session: Option<Session>) -> Result<(), String> {
     let qemu = find_qemu()?;
     let port = free_port()?;
-    let watches_end = test.allow_reboot || test.power_cycles > 0 || test.expect_poweroff;
     // O snapshot=on do volume dura um QEMU: o religamento precisa de uma
     // cópia gravável dele.
     let data_copy = if test.power_cycles > 0 { private_data_disk(disks, log)? } else { None };
@@ -941,7 +955,7 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
             *machine = launch(&qemu, temp.path(), &arguments, &output, events_port)?;
             return Ok(None);
         }
-        Ok(Some(format!("{status}, evento SHUTDOWN do QMP: {}", reason.as_deref().unwrap_or("nenhum"))))
+        Ok(Some(ended(status, reason.as_deref())))
     };
     let wait_for = |needle: &str, from: usize| -> Result<usize, String> {
         loop {
@@ -961,15 +975,17 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
                     return Ok(from + position + needle.len());
                 }
             }
-            if watches_end {
-                if let Some(ended) = supervise()? {
-                    // A serial do QEMU que saiu já foi lida inteira.
-                    let text = output.lock().unwrap();
-                    if let Some(position) = text[from.min(text.len())..].find(needle) {
-                        return Ok(from + position + needle.len());
-                    }
-                    return Err(format!("QEMU terminou ({ended}) antes de {needle:?}"));
+            // O QEMU que saiu antes da saída esperada encerra a espera (sem
+            // religamento a fazer); a serial dele já foi lida inteira.
+            if let Some(ended) = supervise()? {
+                let text = output.lock().unwrap();
+                if let Some(failure) = failure_markers.iter().find(|marker| text[from.min(text.len())..].contains(*marker)) {
+                    return Err(format!("falha detectada na serial: {failure}"));
                 }
+                if let Some(position) = text[from.min(text.len())..].find(needle) {
+                    return Ok(from + position + needle.len());
+                }
+                return Err(format!("QEMU terminou ({ended}) antes de {needle:?}"));
             }
             if Instant::now() > deadline {
                 return Err(format!("tempo esgotado esperando {needle:?}"));
@@ -1028,8 +1044,10 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
                 }
             }
             // Um triplo fault com -no-reboot encerra o QEMU sem marcador.
-            if let Ok(Some(status)) = current.borrow_mut().process.0.try_wait() {
-                return Err(format!("QEMU terminou durante os {} ms de espera ({status})", test.hold.as_millis()));
+            let exited = current.borrow_mut().process.0.try_wait();
+            if let Ok(Some(status)) = exited {
+                let reason = current.borrow().shutdown_reason.lock().unwrap().clone();
+                return Err(format!("QEMU terminou durante os {} ms de espera ({})", test.hold.as_millis(), ended(status, reason.as_deref())));
             }
             thread::sleep(Duration::from_millis(50));
         }

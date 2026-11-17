@@ -31,6 +31,13 @@
 //! rodada. `coberto_pela_suite = true` marca um teste cujos marcadores as
 //! suítes já conferem (roda com `--all` ou `--only`).
 //!
+//! Um build ou um QEMU morto de fora (o dono da máquina fecha o rustc e os
+//! QEMUs quando o PC fica lento) não é falha: o build sem diagnóstico e o
+//! QEMU que saiu com erro antes da saída esperada, sem marcador de falha na
+//! serial, rodam de novo depois de 30 s, até 40 vezes
+//! (`report::build_killed`, `report::qemu_killed`). Erros de compilação,
+//! falhas de teste, prazos esgotados e STOPs nunca se repetem.
+//!
 //! O acelerador: cada execução roda no padrão da rodada, o WHPX quando o
 //! QEMU o tem e a partição sobe nesta máquina, senão o TCG (`--accel`
 //! troca). `acelerador = "tcg"` num `[[teste]]` fixa o dele.
@@ -98,6 +105,11 @@ const COMMIT_RESERVE: u64 = 6 << 30;
 /// Tempo para um QEMU recém-criado comprometer a memória do convidado: até
 /// lá, a próxima pista conta a memória dele como já comprometida.
 const SETTLE: Duration = Duration::from_secs(3);
+/// Espera antes de repetir um build ou um QEMU morto de fora.
+const RETRY_DELAY: Duration = Duration::from_secs(30);
+/// Tentativas no máximo de um build ou de uma execução morta de fora: uma
+/// máquina quebrada de verdade não fica repetindo para sempre.
+const MAX_ATTEMPTS: usize = 40;
 
 struct Options {
     jobs: Option<usize>,
@@ -295,7 +307,7 @@ fn builder(context: &Context, ready: Sender<Prepared>) {
         let members: Vec<usize> = (0..context.runs.len()).filter(|&index| context.runs[index].image == image).collect();
         let Some(&first) = members.first() else { continue };
         let started = Instant::now();
-        let build = build_images(context, image, &context.tests[context.runs[first].test]).map(|()| started.elapsed());
+        let build = build_images_retrying(context, image, &context.tests[context.runs[first].test]).map(|()| started.elapsed());
         for (position, &run) in members.iter().enumerate() {
             let build = match &build {
                 Ok(time) => Ok(if position == 0 { *time } else { Duration::ZERO }),
@@ -305,6 +317,23 @@ fn builder(context: &Context, ready: Sender<Prepared>) {
                 return;
             }
         }
+    }
+}
+
+/// O build das imagens, de novo depois de [`RETRY_DELAY`] quando foi morto
+/// de fora (`report::build_killed`).
+fn build_images_retrying(context: &Context, image: usize, test: &Test) -> Result<(), String> {
+    let mut attempt = 1;
+    loop {
+        let result = build_images(context, image, test);
+        let Err(error) = result else { return Ok(()) };
+        let log = report::read_lossy(&context.image_directory(image).join("build.log")).unwrap_or_default();
+        if attempt >= MAX_ATTEMPTS || !report::build_killed(&log) {
+            return Err(error);
+        }
+        context.console.say(&format!("[test-all] build encerrado de fora; nova tentativa em 30 s ({attempt})  {}", Context::image_relative(image)));
+        thread::sleep(RETRY_DELAY);
+        attempt += 1;
     }
 }
 
@@ -420,7 +449,22 @@ fn lane(context: &Context, ready: &Mutex<Receiver<Prepared>>, outcomes: &Mutex<V
             }
             Ok(build) => {
                 let started = Instant::now();
-                let result = execute(context, run, test, build);
+                // Um QEMU morto de fora roda de novo (`report::qemu_killed`).
+                let mut attempt = 1;
+                let result = loop {
+                    let result = execute(context, run, test, build);
+                    let killed = matches!(result, Ok((false, _))) && {
+                        let console = report::read_lossy(&directory.join("test-boot.log")).unwrap_or_default();
+                        let serial = report::read_lossy(&directory.join("serial.log")).unwrap_or_default();
+                        report::qemu_killed(&console, &serial)
+                    };
+                    if !killed || attempt >= MAX_ATTEMPTS {
+                        break result;
+                    }
+                    context.console.say(&format!("[test-all] QEMU encerrado de fora; nova tentativa em 30 s ({attempt})  {}", run.name));
+                    thread::sleep(RETRY_DELAY);
+                    attempt += 1;
+                };
                 let time = match &result {
                     Ok((_, time)) => *time,
                     Err(_) => started.elapsed(),

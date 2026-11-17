@@ -5,7 +5,7 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-use crate::qemu::FAILURE_MARKERS;
+use crate::qemu::{FAILURE_MARKERS, QEMU_KILLED};
 
 /// Linhas mostradas de uma falha.
 const EXCERPT_LINES: usize = 12;
@@ -105,6 +105,25 @@ pub fn serial_excerpt(text: &str) -> Vec<String> {
 /// O trecho de um log de build: do primeiro erro do compilador.
 pub fn build_excerpt(text: &str) -> Vec<String> {
     excerpt(text, |line| line.starts_with("error"))
+}
+
+/// O build das imagens foi morto de fora: o cargo (ou o rustc dele) saiu com
+/// erro sem diagnóstico nenhum. O `comando falhou` é a falha de um comando
+/// do build (`build::run`); um diagnóstico é uma linha `error[...]` ou
+/// `error: ...` que não seja o `could not compile` genérico do cargo (os
+/// avisos negados também saem como `error:`). As conferências do próprio
+/// xtask (o PE, o tamanho do kernel) falham com outra mensagem.
+pub fn build_killed(log: &str) -> bool {
+    let diagnostic = log.lines().map(str::trim_start).any(|line| line.starts_with("error[") || (line.starts_with("error:") && !line.starts_with("error: could not compile")));
+    log.contains("comando falhou (") && !diagnostic
+}
+
+/// O QEMU de uma execução foi morto de fora antes da saída esperada: o
+/// test-boot deu o motivo [`QEMU_KILLED`] e a serial não tem marcador de
+/// falha. Um prazo esgotado, um STOP, um pânico ou um autoteste que falhou
+/// nunca contam.
+pub fn qemu_killed(console: &str, serial: &str) -> bool {
+    failure_reason(console).contains(QEMU_KILLED) && !FAILURE_MARKERS.iter().any(|marker| serial.contains(marker))
 }
 
 /// O motivo que o test-boot deu (a linha `TEST-BOOT FALHOU`, sem o caminho

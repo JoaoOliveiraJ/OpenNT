@@ -72,3 +72,37 @@ fn excerpt_starts_at_the_failure_or_keeps_the_tail() {
     let console = "texto\nTEST-BOOT FALHOU: tempo esgotado esperando \"X\" (serial em s)\n";
     assert_eq!(report::failure_reason(console), "TEST-BOOT FALHOU: tempo esgotado esperando \"X\"");
 }
+
+/// O build morto de fora (o rustc fechado à mão) se repete; um erro de
+/// compilação, um erro de ligação e uma conferência do xtask, não.
+#[test]
+fn a_build_killed_from_outside_is_told_apart_from_a_real_failure() {
+    let killed = "binarios do Windows no bundle: 17 de 17\n   Compiling kernel v0.6.0 (C:\\kernel)\nerror: could not compile `kernel` (bin \"kernel\")\n\nCaused by:\n  process didn't exit successfully: `rustc.exe --crate-name kernel` (exit code: 1)\ncomando falhou (exit code: 101): \"cargo\" \"build\" \"--package\" \"kernel\"\n";
+    assert!(report::build_killed(killed));
+    // O cargo morto antes de dizer qualquer coisa.
+    assert!(report::build_killed("   Compiling kernel v0.6.0\ncomando falhou (exit code: 1): \"cargo\" \"build\"\n"));
+    let compile_error = "error[E0425]: cannot find value `x` in this scope\n  --> kernel/src/main.rs:1:1\nerror: could not compile `kernel` (bin \"kernel\") due to 1 previous error\ncomando falhou (exit code: 101): \"cargo\"\n";
+    assert!(!report::build_killed(compile_error));
+    let denied_warning = "error: unused variable: `y`\nerror: could not compile `kernel`\ncomando falhou (exit code: 101): \"cargo\"\n";
+    assert!(!report::build_killed(denied_warning));
+    let link_error = "error: linking with `rust-lld` failed: exit code: 1\nerror: could not compile `kernel`\ncomando falhou (exit code: 101): \"cargo\"\n";
+    assert!(!report::build_killed(link_error));
+    // Uma conferência do xtask depois do cargo.
+    assert!(!report::build_killed("    Finished `dev` profile\nkernel com 70000 setores nao cabe no campo u16 do stage2\n"));
+}
+
+/// O QEMU morto de fora antes do marcador se repete; um prazo esgotado, um
+/// STOP, um autoteste que falhou e o QEMU que saiu sozinho, não.
+#[test]
+fn a_qemu_killed_from_outside_is_told_apart_from_a_real_failure() {
+    let killed = "[boot] fase 1\nTEST-BOOT FALHOU: QEMU terminou (QEMU encerrado de fora (exit code: 1)) antes de \"KERNEL_RS_OK\" (serial em s)\n";
+    assert!(report::qemu_killed(killed, "[boot] fase 1\n"));
+    assert!(!report::qemu_killed(killed, "[boot] fase 1\n*** STOP (KeBugCheckEx): 0x0000001e\n"));
+    assert!(!report::qemu_killed(killed, "SELFTEST FALHOU: time\n"));
+    let timeout = "TEST-BOOT FALHOU: tempo esgotado esperando \"KERNEL_RS_OK\" (serial em s)\n";
+    assert!(!report::qemu_killed(timeout, ""));
+    let by_itself = "TEST-BOOT FALHOU: QEMU terminou (exit code: 0, evento SHUTDOWN do QMP: nenhum) antes de \"X\" (serial em s)\n";
+    assert!(!report::qemu_killed(by_itself, ""));
+    let failure = "TEST-BOOT FALHOU: falha detectada na serial: *** PANIC (serial em s)\n";
+    assert!(!report::qemu_killed(failure, "*** PANIC\n"));
+}
