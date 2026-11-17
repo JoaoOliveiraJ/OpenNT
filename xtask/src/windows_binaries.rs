@@ -420,6 +420,28 @@ const SMSS_PROGRAMS: &[&str] = &[
     "dxgi.dll",
     "tdh.dll",
     "fontdrvhost.exe",
+    // As DLLs de carga adiada dos serviços do svchost: o psmsrv.dll
+    // (psmserviceexthost.dll, bisrv.dll, resourcepolicyclient.dll,
+    // CSystemEventsBrokerClient.dll e licensemanagerapi.dll), o
+    // SystemEventsBrokerServer.dll (DAB.dll), o rpcss.dll (clbcatq.dll,
+    // windows.staterepositorycore.dll, capauthz.dll, msiltcfg.dll e
+    // version.dll) e o RpcEpMap.dll (rpcrtremote.dll); o DABAPI.dll do
+    // services.exe, o rsaenh.dll (o CSP do lsass) e o KDCPW.DLL do samsrv.
+    "psmserviceexthost.dll",
+    "bisrv.dll",
+    "resourcepolicyclient.dll",
+    "CSystemEventsBrokerClient.dll",
+    "licensemanagerapi.dll",
+    "DAB.dll",
+    "clbcatq.dll",
+    "windows.staterepositorycore.dll",
+    "capauthz.dll",
+    "msiltcfg.dll",
+    "version.dll",
+    "rpcrtremote.dll",
+    "DABAPI.dll",
+    "rsaenh.dll",
+    "KDCPW.DLL",
 ];
 
 /// Os outros serviços do grupo DcomLaunch do svchost (o mesmo processo do
