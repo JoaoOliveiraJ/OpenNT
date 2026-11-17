@@ -1672,9 +1672,10 @@ fn user_threads_in(assert: Assert, test: &TestProcess) {
     assert(refused && impersonated && copied && reverted, "userthreads: NtImpersonateThread com direitos dos handles, copia estatica e retorno ao proprio token");
     // Alertas por id e esperas, com a thread retomada como corrente (laço real).
     let previous_thread = process::get_current_thread();
-    // Da thread do teste (outro processo), o alerta é recusado e não fica
-    // pendente.
-    let foreign = call("NtAlertThreadByThreadId", thread.thread_id, 0, 0, 0) == 0xC000_0022 && !thread.with(|thread| thread.alerted);
+    // A thread do teste é do mesmo processo da thread criada; de uma thread
+    // de outro processo, o alerta é recusado e não fica pendente.
+    let target_id = thread.thread_id;
+    let foreign = with_test_process("alheio.exe", None, |_| call("NtAlertThreadByThreadId", target_id, 0, 0, 0)) == Some(0xC000_0022) && !thread.with(|thread| thread.alerted);
     assert(foreign, "userthreads: alerta por id de outro processo recusado");
     let _ = call("NtResumeThread", handle, 0, 0, 0);
     process::set_current_thread(pointer);
