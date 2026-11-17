@@ -306,9 +306,10 @@ fn save_extended_processor_state(call: &Call) -> Result<u64, KernelError> {
 fn restore_extended_processor_state(call: &Call) -> Result<u64, KernelError> {
     Ok(signed_status(xstate::restore(call.arg(1))))
 }
-/// Aceita e segue (o ajuste de prioridade real é o KeSetBasePriorityThread).
-fn set_actual_base_priority_thread(_: &Call) -> Result<u64, KernelError> {
-    Ok(0)
+/// KeSetActualBasePriorityThread(Thread, Priority): a base anterior
+/// (`ke/thread_priority.rs`).
+fn set_actual_base_priority_thread(call: &Call) -> Result<u64, KernelError> {
+    Ok(crate::ntos::ke::thread_priority::set_actual_base_priority(call.arg(1), call.arg(2))? as i64 as u64)
 }
 fn try_to_acquire_guarded_mutex(call: &Call) -> Result<u64, KernelError> {
     Ok(fast_mutex::try_acquire(call.arg(1))? as u64)

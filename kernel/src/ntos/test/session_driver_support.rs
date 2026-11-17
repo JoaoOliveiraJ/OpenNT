@@ -23,7 +23,11 @@
 //!   desligado; SessionPowerCleanup (63) não aceita buffers; SystemVideoState
 //!   (29) devolve o estado da tela do console;
 //! - ZwCreateSection com OBJ_KERNEL_EXCLUSIVE (0x10000, o atributo das seções
-//!   entre sessões do win32k) cria a seção nomeada e devolve o handle.
+//!   entre sessões do win32k) cria a seção nomeada e devolve o handle;
+//! - SystemThreadPriorityClientIdInformation (82), a classe que a
+//!   RawInputThread do win32kfull pede em KernelMode: tamanho, faixa 1..31,
+//!   CLIENT_ID conferido e a base absoluta pelo KeSetActualBasePriorityThread,
+//!   com STATUS_PENDING de volta.
 
 use alloc::vec::Vec;
 
@@ -162,9 +166,45 @@ fn kernel_exclusive_section(assert: Assert) {
     guest::free_bytes(block);
 }
 
+/// SystemThreadPriorityClientIdInformation em KernelMode (a chamada da
+/// RawInputThread do win32kfull) e o KeSetActualBasePriorityThread.
+fn thread_priority_client_id(assert: Assert) {
+    use crate::ntos::ke::thread_priority;
+    use crate::ntos::ps::process;
+    let target = process::create_process(0x7D50, "opennt-cid-priority.exe", 0, None).unwrap_or(0);
+    let thread = process::create_kernel_thread(target, 0x7D54, false, 0, None).unwrap_or(0);
+    let buffer = guest::alloc_bytes(0x20);
+    let request = |process_id: u64, thread_id: u64, priority: u32, length: u32| {
+        guest::write64(buffer, process_id);
+        guest::write64(buffer + 8, thread_id);
+        guest::write32(buffer + 16, priority);
+        guest::write32(buffer + 20, 0);
+        system_information::set(system_information::SYSTEM_THREAD_PRIORITY_CLIENT_ID_INFORMATION, buffer, length)
+    };
+    let short = request(0x7D50, 0x7D54, 9, 0x10);
+    let (zero, high) = (request(0x7D50, 0x7D54, 0, 0x18), request(0x7D50, 0x7D54, 32, 0x18));
+    let (other_process, missing) = (request(0x7D58, 0x7D54, 9, 0x18), request(0x7D50, 0x7D5C, 9, 0x18));
+    let base_before = thread_priority::query_base_priority(thread);
+    let set = request(0x7D50, 0x7D54, 13, 0x18);
+    let (base, priority) = (thread_priority::query_base_priority(thread), thread_priority::query_priority(thread));
+    let previous = thread_priority::set_actual_base_priority(thread, base_before as i64 as u64);
+    assert(
+        target != 0 && thread != 0 && short == 0xC000_0004 && zero == 0xC000_000D && high == 0xC000_000D && other_process == 0xC000_000B && missing == 0xC000_000B,
+        "priority: SystemThreadPriorityClientIdInformation confere o tamanho, a faixa 1..31 e o CLIENT_ID",
+    );
+    assert(
+        set == 0x103 && base == 13 && priority == 13 && matches!(previous, Ok(13)) && thread_priority::query_base_priority(thread) == base_before,
+        "priority: a classe 82 troca a base absoluta pelo KeSetActualBasePriorityThread e devolve STATUS_PENDING",
+    );
+    guest::free_bytes(buffer);
+    let _ = process::terminate_process(target, 0);
+    let _ = process::release_thread(thread);
+}
+
 pub fn run(assert: Assert) {
     gdi_drivers(assert);
     user_mode_branch(assert);
     session_power(assert);
     kernel_exclusive_section(assert);
+    thread_priority_client_id(assert);
 }

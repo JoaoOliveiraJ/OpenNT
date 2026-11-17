@@ -180,6 +180,37 @@ pub fn set_base_priority(thread: u64, requested_increment: u64) -> Result<i32, K
     Ok(previous)
 }
 
+/// KeSetActualBasePriorityThread (rva 0x22ff20 do 19041): a base absoluta,
+/// sem relação com a base do processo, e a base anterior de volta. Sob o
+/// lock da thread, a saturação zera, a base vira o pedido e o boost
+/// anterior sai (o PriorityDecrement, com o ForegroundLossTime quando havia
+/// boost de primeiro plano). Se o pedido difere da prioridade corrente, o
+/// quantum é renovado e a prioridade passa ao pedido, com o piso ativo
+/// (KiComputePriorityFloor). A thread ociosa não muda e devolve 1. A
+/// fila de autoboost de locks (KiAbQueueAutoBoostDpc, quando a base desce)
+/// não existe no OpenNT.
+pub fn set_actual_base_priority(thread: u64, requested_base: u64) -> Result<i32, KernelError> {
+    let requested = requested_base as i32;
+    if thread_dispatch::is_idle_thread(thread) {
+        return Ok(1);
+    }
+    let mut deferred = Vec::new();
+    let target = kthread(thread);
+    let previous = thread_lock::with_lock(thread, || -> Result<i32, KernelError> {
+        let previous = query_base_priority(thread);
+        target.saturation.set(0);
+        target.base_priority.set(requested as i8);
+        clear_decrement(thread);
+        if requested != query_priority(thread) {
+            reset_quantum(thread);
+            change_priority(thread, requested, &mut deferred)?;
+        }
+        Ok(previous)
+    })?;
+    thread_dispatch::complete_priority_change(&deferred);
+    Ok(previous)
+}
+
 /// KeSetPriorityAndQuantumProcess (sem o quantum, que o OpenNT não tem por
 /// processo): a nova base do processo (zero vira 1) e, em cada thread de
 /// `threads`, a base com o mesmo incremento sobre a base do processo (ou a

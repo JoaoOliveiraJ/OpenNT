@@ -351,8 +351,9 @@ fn query_interrupt_steering(input: u64, input_length: u32, output: u64, length: 
     0
 }
 
-/// ZwSetSystemInformation: 131 registra as rotinas de entropia do chamador;
-/// classes desconhecidas = STATUS_INVALID_INFO_CLASS.
+/// ZwSetSystemInformation: 131 registra as rotinas de entropia do chamador,
+/// 82 troca a base de uma thread pelo CLIENT_ID; classes desconhecidas =
+/// STATUS_INVALID_INFO_CLASS.
 pub fn set(class: u32, buffer: u64, length: u32) -> u32 {
     let status_of = |error: KernelError| if error.status != 0 { error.status } else { 0xC000_0001 };
     match class {
@@ -361,6 +362,7 @@ pub fn set(class: u32, buffer: u64, length: u32) -> u32 {
         SYSTEM_LOAD_GDI_DRIVER_INFORMATION => return load_gdi_driver(buffer, length, true).unwrap_or_else(status_of),
         SYSTEM_LOAD_GDI_DRIVER_IN_SYSTEM_SPACE => return load_gdi_driver(buffer, length, false).unwrap_or_else(status_of),
         SYSTEM_UNLOAD_GDI_DRIVER_INFORMATION => return unload_gdi_driver(buffer, length).unwrap_or_else(status_of),
+        SYSTEM_THREAD_PRIORITY_CLIENT_ID_INFORMATION => return thread_priority_client_id(buffer, length, 0).unwrap_or_else(status_of),
         _ => {}
     }
     if class == 131 {
@@ -507,6 +509,76 @@ pub fn unload_gdi_driver(buffer: u64, length: u32) -> Result<u32, KernelError> {
     Ok(0)
 }
 
+// ---- SystemThreadPriorityClientIdInformation (82) --------------------------
+//
+// NtSetSystemInformation 19041 (rva 0x708638): a entrada é a
+// SYSTEM_THREAD_CID_PRIORITY_INFORMATION (o CLIENT_ID e o KPRIORITY, 0x18
+// bytes; menos é STATUS_INFO_LENGTH_MISMATCH). O SeIncreaseBasePriority
+// Privilege vem antes de tudo (SeSinglePrivilegeCheck no modo anterior,
+// senão STATUS_PRIVILEGE_NOT_HELD); de UserMode a estrutura é copiada. A
+// prioridade fora de 1..31 é STATUS_INVALID_PARAMETER. O
+// PsLookupProcessThreadByCid acha a thread do UniqueThread e exige o
+// UniqueProcess dela igual ao pedido (senão STATUS_INVALID_CID); uma thread
+// já sinalizada dá STATUS_THREAD_IS_TERMINATING. Senão o
+// KeSetActualBasePriorityThread troca a base e o serviço devolve
+// STATUS_PENDING (0x103), o status do 19041. O win32kfull chama a classe em
+// KernelMode na RawInputThread e no SetThreadBasePriority.
+
+pub const SYSTEM_THREAD_PRIORITY_CLIENT_ID_INFORMATION: u32 = 82;
+/// SE_INCREASE_BASE_PRIORITY_PRIVILEGE.
+const SE_INCREASE_BASE_PRIORITY_PRIVILEGE: u64 = 14;
+const PRIORITY_STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+const PRIORITY_STATUS_INVALID_CID: u32 = 0xC000_000B;
+const PRIORITY_STATUS_THREAD_IS_TERMINATING: u32 = 0xC000_004B;
+const PRIORITY_STATUS_PENDING: u32 = 0x103;
+
+/// SystemThreadPriorityClientIdInformation no modo anterior
+/// `previous_mode`: o NTSTATUS.
+pub fn thread_priority_client_id(buffer: u64, length: u32, previous_mode: u32) -> Result<u32, KernelError> {
+    use crate::ntos::inc::types::{ClientId, Ethread};
+    if length < 0x18 {
+        return Ok(EXTEND_STATUS_INFO_LENGTH_MISMATCH);
+    }
+    if !crate::ntos::se::privilege::single_privilege_check(SE_INCREASE_BASE_PRIORITY_PRIVILEGE, previous_mode) {
+        return Ok(STATUS_PRIVILEGE_NOT_HELD);
+    }
+    let (process_id, thread_id, priority) = if previous_mode != 0 {
+        let Ok(bytes) = guest::try_read_bytes(buffer, 0x18) else { return Ok(STATUS_ACCESS_VIOLATION) };
+        let word = |offset: usize| u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap_or([0; 8]));
+        (word(0), word(8), word(16) as u32 as i32)
+    } else {
+        // SAFETY: entrada de modo kernel com 0x18 bytes conferidos.
+        let cid = unsafe { ClientId::at(buffer) };
+        // SAFETY: o KPRIORITY logo depois do CLIENT_ID.
+        (cid.unique_process.get(), cid.unique_thread.get(), unsafe { Field::<i32>::at(buffer + 16) }.get())
+    };
+    if (priority as u32).wrapping_sub(1) > 30 {
+        return Ok(PRIORITY_STATUS_INVALID_PARAMETER);
+    }
+    let cell = guest::alloc_bytes(8);
+    if cell == 0 {
+        return Ok(crate::ntos::inc::status::STATUS_INSUFFICIENT_RESOURCES);
+    }
+    let lookup = crate::ntos::ps::lookup_thread::lookup(thread_id, cell);
+    let thread = guest::read64(cell);
+    guest::free_bytes(cell);
+    let status = lookup?;
+    if status != 0 {
+        return Ok(status);
+    }
+    // SAFETY: ETHREAD referenciada pela consulta.
+    let ethread = unsafe { Ethread::at(thread) };
+    let result = if ethread.cid.unique_process.get() != process_id {
+        Ok(PRIORITY_STATUS_INVALID_CID)
+    } else if ethread.tcb.header.signal_state.get() as u8 != 0 {
+        Ok(PRIORITY_STATUS_THREAD_IS_TERMINATING)
+    } else {
+        crate::ntos::ke::thread_priority::set_actual_base_priority(thread, priority as i64 as u64).map(|_| PRIORITY_STATUS_PENDING)
+    };
+    crate::ntos::ps::lookup_thread::dereference(thread);
+    result
+}
+
 // ---- NtSetSystemInformation de modo usuário --------------------------------
 //
 // ntoskrnl 19041 (NtSetSystemInformation 0x707b70) com PreviousMode =
@@ -547,6 +619,9 @@ pub fn set_from_user_mode(class: u32, buffer: u64, length: u32) -> Result<u32, K
     if matches!(class, SYSTEM_LOAD_GDI_DRIVER_INFORMATION | SYSTEM_UNLOAD_GDI_DRIVER_INFORMATION | SYSTEM_LOAD_GDI_DRIVER_IN_SYSTEM_SPACE) {
         let expected = if class == SYSTEM_UNLOAD_GDI_DRIVER_INFORMATION { 8 } else { crate::ntos::inc::types::extra_ps_user::SystemGdiDriverInformation::SIZE as u32 };
         return Ok(if length != expected { EXTEND_STATUS_INFO_LENGTH_MISMATCH } else { STATUS_PRIVILEGE_NOT_HELD });
+    }
+    if class == SYSTEM_THREAD_PRIORITY_CLIENT_ID_INFORMATION {
+        return thread_priority_client_id(buffer, length, 1);
     }
     if class != SYSTEM_EXTEND_SERVICE_TABLE_INFORMATION {
         debug_print!("[usermode] NtSetSystemInformation classe {} (sem suporte de modo usuario)", class);

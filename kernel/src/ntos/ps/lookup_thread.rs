@@ -16,7 +16,9 @@ fn ethread(thread: u64) -> &'static Ethread {
 
 const INVALID: u32 = 0xC000_000B;
 
-fn dereference(pointer: u64) {
+/// Solta a referência que a consulta deu ao chamador (o
+/// ObfDereferenceObject da thread achada).
+pub fn dereference(pointer: u64) {
     // Threads do kernel passam também pela coleta do escalonador.
     if let Some(item) = open_pointer::describe(pointer) {
         item.dereference();
