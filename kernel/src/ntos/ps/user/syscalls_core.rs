@@ -396,10 +396,15 @@ fn query_system_information(class: u32, buffer: u64, length: u64, returned: u64)
     }
     state::guarded(|| {
         let set_returned = |value: u32| if returned != 0 { guest::try_write::<u32>(returned, value) } else { Ok(()) };
-        // As classes de tamanho fixo (`ex/system_information`): o
-        // ProbeForWrite delas exige alinhamento 4.
-        if crate::ntos::ex::system_information::is_fixed_class(class) && length != 0 && buffer & 3 != 0 {
+        // As classes de tamanho fixo e a SystemCpuQuotaInformation
+        // (`ex/system_information`): o ProbeForWrite delas exige alinhamento 4.
+        use crate::ntos::ex::system_information::SYSTEM_CPU_QUOTA_INFORMATION;
+        if (crate::ntos::ex::system_information::is_fixed_class(class) || class == SYSTEM_CPU_QUOTA_INFORMATION) && length != 0 && buffer & 3 != 0 {
             return Ok(0x8000_0002);
+        }
+        if class == SYSTEM_CPU_QUOTA_INFORMATION {
+            set_returned(0)?;
+            return Ok(crate::ntos::ps::session::query_cpu_quota_information());
         }
         if let Some(result) = crate::ntos::ex::system_information::query_fixed(class, buffer, length as u32) {
             let (status, required) = result?;

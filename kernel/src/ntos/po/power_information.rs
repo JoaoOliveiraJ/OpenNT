@@ -395,3 +395,10 @@ fn nt_power_information(level: u64, input: u64, input_length: u64, output: u64, 
 pub fn register_user_services() {
     crate::ntos::ps::user::state::register_handler("NtPowerInformation", nt_power_information);
 }
+
+/// PoEnergyEstimationEnabled: o estimador de energia (E3) do Po não existe
+/// no OpenNT, então FALSE, o valor do export e o BOOLEAN da
+/// SystemEnergyEstimationConfigInformation (158).
+pub fn energy_estimation_enabled() -> bool {
+    false
+}

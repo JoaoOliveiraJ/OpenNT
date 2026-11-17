@@ -50,8 +50,13 @@ pub const SYSTEM_FLAGS_INFORMATION: u32 = 9;
 pub const SYSTEM_KERNEL_DEBUGGER_INFORMATION: u32 = 35;
 pub const SYSTEM_RECOMMENDED_SHARED_DATA_ALIGNMENT: u32 = 58;
 pub const SYSTEM_OBJECT_SECURITY_MODE: u32 = 70;
+pub const SYSTEM_ENERGY_ESTIMATION_CONFIG_INFORMATION: u32 = 158;
 pub const SYSTEM_ISOLATED_USER_MODE_INFORMATION: u32 = 165;
 pub const SYSTEM_MEMORY_USAGE_INFORMATION: u32 = 182;
+/// SystemCpuQuotaInformation (rva 0x6cc225): o PsQueryCpuQuotaInformation
+/// (`ps/session`), com o ReturnLength da célula local do serviço, que fica
+/// zero quando ele não a toca.
+pub const SYSTEM_CPU_QUOTA_INFORMATION: u32 = 113;
 pub const SYSTEM_PHYSICAL_MEMORY_INFORMATION: u32 = 184;
 pub const SYSTEM_FLUSH_INFORMATION: u32 = 192;
 pub const SYSTEM_WRITE_CONSTRAINT_INFORMATION: u32 = 195;
@@ -124,6 +129,9 @@ pub fn is_fixed_class(class: u32) -> bool {
 ///   bytes; sem o kernel seguro (VslIsSecureKernelRunning) e sem a proteção
 ///   de páginas do firmware (ExpFirmwarePageProtectionSupported, de uma
 ///   tabela do UEFI que o boot do OpenNT não tem), tudo zero.
+/// - SystemEnergyEstimationConfigInformation (158, rva 0x6cc8e6): pelo
+///   menos 1 byte (sondagem de alinhamento 1), o BOOLEAN do
+///   PoEnergyEstimationEnabled (`po/power_information`).
 /// - SystemMemoryUsageInformation (182, rva 0x6ca289): exatamente 0x38
 ///   bytes, o `mm/memory_information::memory_usage_information`.
 /// - SystemFlushInformation (192, rva 0x6cc82d): pelo menos 0x20 bytes, o
@@ -155,6 +163,7 @@ pub fn query_fixed(class: u32, output: u64, length: u32) -> Option<Result<(u32, 
         },
         SYSTEM_OBJECT_SECURITY_MODE => (4, true, object_security_mode().to_le_bytes().to_vec()),
         SYSTEM_ISOLATED_USER_MODE_INFORMATION => (0x10, true, alloc::vec![0u8; 0x10]),
+        SYSTEM_ENERGY_ESTIMATION_CONFIG_INFORMATION => (1, false, alloc::vec![crate::ntos::po::power_information::energy_estimation_enabled() as u8]),
         SYSTEM_MEMORY_USAGE_INFORMATION => match crate::ntos::mm::memory_information::memory_usage_information() {
             Ok(data) => (0x38, true, data),
             Err(error) => return Some(Err(error)),
@@ -219,6 +228,13 @@ pub fn query(class: u32, output: u64, length: u32, returned: u64) -> Result<u32,
         }
         // SystemBootGraphicsInformation: a tela de boot (Bgk).
         126 => return crate::ntos::bgk::graphics_information::query_system_information(output, length, returned),
+        SYSTEM_CPU_QUOTA_INFORMATION => {
+            if returned != 0 {
+                // SAFETY: o PULONG ReturnLength do chamador (modo kernel).
+                unsafe { Field::<u32>::at(returned) }.set(0);
+            }
+            return Ok(crate::ntos::ps::session::query_cpu_quota_information());
+        }
         // SystemBasicInformation e as variantes Emulation/NativeBasic x64.
         0 | 62 | 114 => return Ok(basic_information(output, length, returned)),
         // SystemPerformanceInformation e SystemPageFileInformation(Ex):

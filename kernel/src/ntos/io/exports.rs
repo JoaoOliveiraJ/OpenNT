@@ -740,9 +740,10 @@ pub mod driver_helpers {
         Ok(object_types::file_object_generic_mapping())
     }
 
-    /// Sem estimador de energia, sem soft boot e sem Windows-To-Go aqui.
+    /// Sem estimador de energia (`po/power_information`), sem soft boot e
+    /// sem Windows-To-Go aqui.
     fn energy_estimation_enabled(_: &Call) -> Result<u64, KernelError> {
-        Ok(0)
+        Ok(crate::ntos::po::power_information::energy_estimation_enabled() as u64)
     }
     fn update_component_power(_: &Call) -> Result<u64, KernelError> {
         Ok(0)

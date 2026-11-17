@@ -51,3 +51,16 @@ pub fn thread_session_id(thread: u64) -> u32 {
 pub fn current_process_session_id() -> u32 {
     query(process::get_current_process())
 }
+
+/// O NTSTATUS que o PsQueryCpuQuotaInformation devolve sem o DFSS.
+const STATUS_DFSS_DISABLED: u32 = 0xC000_01A9;
+
+/// PsQueryCpuQuotaInformation (ntoskrnl 19041, rva 0x3cf8b4), a
+/// SystemCpuQuotaInformation (113): sem o Dynamic Fair Share Scheduling
+/// entre sessões (PsCpuFairShareEnabled zero, o caso do OpenNT, que não tem
+/// cotas de CPU por sessão), devolve 0xC00001A9 sem tocar no buffer nem no
+/// tamanho. O psmsrv!PsmpIsDfssActive conclui por esse status que o DFSS
+/// está desligado.
+pub fn query_cpu_quota_information() -> u32 {
+    STATUS_DFSS_DISABLED
+}
