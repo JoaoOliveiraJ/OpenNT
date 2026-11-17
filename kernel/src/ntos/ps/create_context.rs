@@ -586,6 +586,15 @@ fn capture_and_create(request: &UserCreateRequest) -> Result<u32, u32> {
     let primary_token = attributes.token.0.as_ref().map(|reference| reference.token);
     if let Some(token) = primary_token {
         if !crate::ntos::se::privilege::single_privilege_check(SE_ASSIGN_PRIMARY_TOKEN_PRIVILEGE, 1) && !crate::ntos::se::token::assignable::is_assignable_to_process(token)? {
+            let effective = crate::ntos::ob::object_access::subject().unwrap_or(0);
+            let describe = |pointer: u64| {
+                crate::ntos::se::token::tokens::with(pointer, |record| {
+                    let assign = record.privileges.iter().find(|privilege| privilege.id == SE_ASSIGN_PRIMARY_TOKEN_PRIVILEGE).map(|privilege| privilege.attributes);
+                    alloc::format!("logon {:#x}, pai {:#x}, tipo {}, SeAssignPrimaryTokenPrivilege {:?}", record.authentication_id, record.parent_token_id, record.kind, assign)
+                })
+                .unwrap_or_default()
+            };
+            crate::debug_print!("[ps] NtCreateUserProcess: token do PS_ATTRIBUTE_TOKEN nao atribuivel ({}); token efetivo de quem cria: {}", describe(token), describe(effective));
             return Err(STATUS_PRIVILEGE_NOT_HELD);
         }
     }
