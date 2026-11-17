@@ -4,7 +4,7 @@
 //! espera ocupa 0x50 bytes: refs +0, handles +8, fechado +0xC, fase +0x10
 //! (1 associado, 2 enfileirado), porta +0x18, alvo +0x20, chave +0x28,
 //! contexto +0x30, status +0x38 e informação +0x40. A fábrica de workers
-//! (0x140 bytes) entra com `ps/user/worker_factory`.
+//! (0x148 bytes) entra com `ps/user/worker_factory`.
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
@@ -79,6 +79,10 @@ struct FactoryBody {
     ready_workers: Field<u32>,
     /// As máscaras de CPU sets por grupo da classe 15 (até 0xA0 bytes).
     cpu_sets: [Field<u64>; CPU_SET_GROUPS],
+    /// Esperas de trabalho que a classe 12 mandou terminar com
+    /// STATUS_TIMEOUT e que ainda não foram atendidas.
+    timeout_requests: Field<u32>,
+    _reserved_144: Reserved<4>,
 }
 
 /// Grupos de processadores que as máscaras da classe 15 cobrem (0xA0 bytes).
@@ -98,13 +102,14 @@ const _: () = {
     assert!(core::mem::offset_of!(WaitPacketBody, phase) == 0x10);
     assert!(core::mem::offset_of!(WaitPacketBody, key) == 0x28);
     assert!(core::mem::offset_of!(WaitPacketBody, information) == 0x40);
-    assert!(core::mem::size_of::<FactoryBody>() == 0x140);
+    assert!(core::mem::size_of::<FactoryBody>() == 0x148);
     assert!(core::mem::offset_of!(FactoryBody, flags) == 0x1C);
     assert!(core::mem::offset_of!(FactoryBody, workers) == 0x34);
     assert!(core::mem::offset_of!(FactoryBody, port) == 0x38);
     assert!(core::mem::offset_of!(FactoryBody, soft_maximum) == 0x90);
     assert!(core::mem::offset_of!(FactoryBody, loader_worker) == 0x98);
     assert!(core::mem::offset_of!(FactoryBody, cpu_sets) == 0xA0);
+    assert!(core::mem::offset_of!(FactoryBody, timeout_requests) == 0x140);
 };
 
 pub const PACKET_SIZE: u64 = WaitPacketBody::SIZE;
@@ -333,13 +338,14 @@ macro_rules! flag {
     };
 }
 
-/// Fábrica de workers: configuração, contadores e prazos no corpo de 0x140
+/// Fábrica de workers: configuração, contadores e prazos no corpo de 0x148
 /// bytes (incremento de prioridade +0x10, máximo +0x14, mínimo +0x18, flags
 /// +0x1C, encerrada +0x20, criando +0x24, vínculos +0x28, liberações +0x2C,
 /// último status +0x30, workers +0x34, porta +0x38, processo +0x40, PID
 /// +0x48, início +0x50, parâmetro +0x58, reserva +0x60, commit +0x68,
 /// timeouts +0x70/+0x78/+0x80, nova tentativa +0x88, limite flexível +0x90,
-/// fase flexível +0x94, LoaderWorker +0x98, prontos +0x9C e CPU sets +0xA0).
+/// fase flexível +0x94, LoaderWorker +0x98, prontos +0x9C, CPU sets +0xA0
+/// e esperas a encerrar +0x140).
 pub struct Factory {
     pub pointer: u64,
     pub port_entry: Arc<UserHandle>,
@@ -370,6 +376,26 @@ impl Factory {
     field32!(soft_maximum, set_soft_maximum, soft_maximum);
     field32!(soft_creation_phase, set_soft_creation_phase, soft_creation_phase);
     field32!(ready_workers, set_ready_workers, ready_workers);
+
+    /// Troca a contagem dos workers prontos por `update(atual)` numa única
+    /// operação atômica (o WorkerReady e a classe 9 rodam em CPUs
+    /// diferentes); `None` deixa como está. Devolve a contagem anterior, em
+    /// `Err` quando nada mudou.
+    pub fn update_ready_workers(&self, update: impl FnMut(u32) -> Option<u32>) -> Result<u32, u32> {
+        use core::sync::atomic::Ordering;
+        self.body().ready_workers.atomic().try_update(Ordering::SeqCst, Ordering::SeqCst, update)
+    }
+
+    /// Pede que `count` esperas de trabalho terminem com STATUS_TIMEOUT.
+    pub fn add_timeout_requests(&self, count: u32) {
+        self.body().timeout_requests.atomic().fetch_add(count, core::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Atende um pedido de término de espera, se houver.
+    pub fn take_timeout_request(&self) -> bool {
+        use core::sync::atomic::Ordering;
+        self.body().timeout_requests.atomic().try_update(Ordering::SeqCst, Ordering::SeqCst, |count| count.checked_sub(1)).is_ok()
+    }
     field64!(process_pointer, set_process_pointer, process_pointer, u64);
     field64!(process_id, set_process_id, process_id, u64);
     field64!(start, set_start, start, u64);
@@ -476,7 +502,8 @@ pub fn factory(initial: FactoryInitial, attributes: u64, dispose: fn(&Arc<Factor
     factory.set_commit(initial.commit);
     factory.set_timeout(-100_000_000);
     factory.set_retry_timeout(-10_000_000);
-    factory.set_idle_timeout(-100_000_000);
+    // ExpWorkerFactoryThreadIdleTimeoutInSeconds: 67 s.
+    factory.set_idle_timeout(-670_000_000);
     factory.body().port.set(factory.port.pointer);
     FACTORIES.lock().insert(pointer, factory.clone());
     if let Err(error) = dispatcher_objects::create(pointer, "workerfactory", factory_dispose, None, attributes, true, DispatcherHooks { before_handle_open: Some(before_handle_open), on_last_handle_close: Some(factory_last_handle_close) }) {

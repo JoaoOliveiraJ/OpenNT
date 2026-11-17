@@ -3765,7 +3765,9 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   servidor RPC sai pelo envio adiado do NtWaitForWorkViaWorkerFactory (o
   WORKER_FACTORY_DEFERRED_WORK: a mensagem, a porta e as flags altas, sem
   pedido síncrono), que manda a mensagem antes de esperar trabalho
-  (`ps/user/alpc.rs::deferred_send`). O envio só acontece com o bit 0 do
+  (`ps/user/alpc.rs::deferred_send`); quando a espera nem começa (handle
+  inválido, fábrica encerrada, worker em excesso), a resposta sai na volta
+  do serviço, com as flags inteiras. O envio só acontece com o bit 0 do
   Flags do bloco, como no 19041: o rpcrt4 deixa no bloco a mensagem do
   envio anterior e liga o bit só quando há resposta nova. Antes, a mensagem
   velha era reenviada a cada espera (STATUS_INVALID_PARAMETER ou

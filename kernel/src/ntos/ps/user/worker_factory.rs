@@ -19,7 +19,7 @@ use crate::ntos::ps::{process, process_context};
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::inc::types::extra_ps_user::WorkerFactoryDeferredWork;
-use crate::ntos::inc::types::{FileIoCompletionInformation, NtStruct, ObjectAttributes, WorkerFactoryBasicInformation};
+use crate::ntos::inc::types::{Ethread, FileIoCompletionInformation, NtStruct, ObjectAttributes, WorkerFactoryBasicInformation};
 
 static FACTORIES: SpinLock<Vec<Arc<Factory>>> = SpinLock::new(Vec::new());
 
@@ -96,7 +96,7 @@ fn remove_worker(factory: &Factory, thread: &Arc<UserThread>) {
         return;
     }
     if thread.with(|thread| thread.worker_ready) {
-        factory.set_ready_workers(factory.ready_workers().saturating_sub(1));
+        let _ = factory.update_ready_workers(|count| count.checked_sub(1));
     }
     thread.with(|thread| thread.worker_factory = 0);
     dereference(factory);
@@ -393,21 +393,17 @@ fn set_thread_maximum(factory: &Arc<Factory>, value: u32) -> Result<u32, KernelE
 /// LRPC do rpcrt4 recusa o bind com ERROR_MAX_THRDS_REACHED se o
 /// TpCallbackMayRunLong falha.
 fn set_callback_type(factory: &Arc<Factory>, value: u32) -> Result<u32, KernelError> {
-    let count = factory.ready_workers();
     let grow = match value {
         0 => {
-            if count == total(factory) {
+            let total = total(factory);
+            if factory.update_ready_workers(|count| (count != total).then(|| count + 1)).is_err() {
                 return Ok(0xC000_0001);
             }
-            factory.set_ready_workers(count + 1);
             false
         }
         1 => true,
         2 | 3 => {
-            if count == 0 {
-                return Ok(0xC000_0001);
-            }
-            factory.set_ready_workers(count - 1);
+            let Ok(count) = factory.update_ready_workers(|count| count.checked_sub(1)) else { return Ok(0xC000_0001) };
             if value == 3 {
                 if let Some(thread) = threads::current().filter(|thread| thread.with(|thread| thread.worker_factory) == factory.pointer) {
                     thread.with(|thread| thread.worker_ready = false);
@@ -553,6 +549,9 @@ fn nt_create_worker_factory(out: u64, access: u64, attributes: u64, port_handle:
     }
 }
 
+/// NtReleaseWorkerFactoryWorker (19041 rva 0x2424e0): uma conclusão de
+/// chave nula na IOCP e a reavaliação da criação; numa fábrica encerrada,
+/// STATUS_ABANDONED sem enfileirar. O resultado da reavaliação não volta.
 fn nt_release_worker_factory_worker(handle: u64, _: u64, _: u64, _: u64, _rsp: u64) -> Result<u32, KernelError> {
     let factory = match resolve(handle, 1) {
         Ok((_, factory)) => factory,
@@ -562,7 +561,7 @@ fn nt_release_worker_factory_worker(handle: u64, _: u64, _: u64, _: u64, _rsp: u
         shutdown(&factory);
     }
     if factory.shutdown() {
-        return Ok(0xC000_010A);
+        return Ok(0x80);
     }
     // TppProcessIoCompletion da NTDLL reconhece KeyContext nulo como pedido
     // para drenar a fila de trabalho de usuário (19041, RVA 4e2e7/4e412).
@@ -571,20 +570,29 @@ fn nt_release_worker_factory_worker(handle: u64, _: u64, _: u64, _: u64, _rsp: u
     factory.add_release_count();
     let result = request_queued_worker(&factory, false);
     dereference(&factory);
-    result
+    result.map(|_| 0)
 }
 
+/// NtWorkerFactoryWorkerReady (19041 rva 0x3110a0): o worker criado pela
+/// fábrica passa a contar entre os prontos e no total, uma vez; outra
+/// chamada (ou de uma thread que não é worker pendente desta fábrica) é
+/// STATUS_UNSUCCESSFUL, como sem criação em andamento. Depois do
+/// encerramento, que entregou os pendentes ao contador do
+/// NtShutdownWorkerFactory, o worker pendente recebe
+/// STATUS_PROCESS_IS_TERMINATING e a ntdll o encerra.
 fn nt_worker_factory_worker_ready(handle: u64, _: u64, _: u64, _: u64, _rsp: u64) -> Result<u32, KernelError> {
     let factory = match resolve(handle, 0x10) {
         Ok((_, factory)) => factory,
         Err(status) => return Ok(status),
     };
-    let Some(thread) = threads::current().filter(|thread| thread.with(|thread| thread.worker_factory) == factory.pointer) else { return Ok(0xC000_000D) };
-    // O primeiro WorkerReady do worker o conta entre os prontos.
-    if !thread.with(|thread| core::mem::replace(&mut thread.worker_ready, true)) {
-        factory.set_ready_workers(factory.ready_workers() + 1);
+    let Some(thread) = threads::current().filter(|thread| thread.with(|thread| thread.worker_factory == factory.pointer && !thread.worker_ready)) else { return Ok(0xC000_0001) };
+    if factory.shutdown() {
+        return Ok(0xC000_010A);
     }
-    Ok(if factory.shutdown() { 0xC000_010A } else { 0 })
+    if thread.with(|thread| !core::mem::replace(&mut thread.worker_ready, true)) {
+        let _ = factory.update_ready_workers(|count| count.checked_add(1));
+    }
+    Ok(0)
 }
 
 /// O maior buffer da classe 15 (as máscaras de todos os grupos).
@@ -594,14 +602,15 @@ const CPU_SETS_SIZE: u32 = (work_objects::CPU_SET_GROUPS * 8) as u32;
 /// 19041 (rva 0x2dbae0): a classe (2 a 15, senão STATUS_INVALID_INFO_CLASS;
 /// a 7 só de consulta), o tamanho dela (STATUS_INFO_LENGTH_MISMATCH; a 6,
 /// WorkerFactoryPaused, é STATUS_NOT_IMPLEMENTED), a captura do buffer de
-/// usuário (alinhado em 4 nas classes 2, 9, 10 e 15) e só então o handle,
-/// com WORKER_FACTORY_SET_INFORMATION. Numa fábrica encerrada as classes 2,
-/// 4, 5, 10, 11, 14 e 15 voltam 0x80 (STATUS_ABANDONED).
+/// usuário (alinhado em 4 nas classes 2, 9, 10 e 15; a 12 é de entrada e
+/// saída) e só então o handle, com WORKER_FACTORY_SET_INFORMATION. Numa
+/// fábrica encerrada as classes 2, 4, 5, 10, 11, 14 e 15 voltam 0x80
+/// (STATUS_ABANDONED).
 fn nt_set_information_worker_factory(handle: u64, class: u64, input: u64, length: u64, _rsp: u64) -> Result<u32, KernelError> {
     let (class, length) = (class as u32, length as u32);
     let size = match class {
         2 => 8,
-        3 | 4 | 5 | 8 | 9 | 11 | 13 | 14 => 4,
+        3 | 4 | 5 | 8 | 9 | 11 | 12 | 13 | 14 => 4,
         6 => return Ok(0xC000_0002),
         10 => 16,
         // Um múltiplo de 8 até 0xA0 bytes.
@@ -623,7 +632,9 @@ fn nt_set_information_worker_factory(handle: u64, class: u64, input: u64, length
     if size != 0 && matches!(class, 2 | 9 | 10 | 15) && input & 3 != 0 {
         return Ok(0x8000_0002);
     }
-    if size != 0 && !state::probe_user_read(input, size as u64) {
+    // A 12 devolve o resultado no próprio buffer: sondado para gravação.
+    let probed = if class == 12 { state::probe_user_write(input, 4) } else { size == 0 || state::probe_user_read(input, size as u64) };
+    if !probed {
         return Ok(0xC000_0005);
     }
     // O buffer de entrada, sondado acima, capturado de uma vez.
@@ -662,6 +673,7 @@ fn nt_set_information_worker_factory(handle: u64, class: u64, input: u64, length
             factory.set_priority(value);
             Ok(if factory.shutdown() { 0x80 } else { 0 })
         }
+        12 => Ok(timeout_waiters(&factory, input)),
         // WorkerFactoryFlags: só o bit 0 (LoaderWorker) conta, também numa
         // fábrica encerrada; vale para as próximas criações.
         13 => {
@@ -722,52 +734,154 @@ fn nt_query_information_worker_factory(handle: u64, class: u64, out: u64, length
     })
 }
 
+/// WORKER_FACTORY_DEFERRED_WORK.Flags: há resposta a enviar.
+const DEFERRED_SEND: u32 = 1;
+/// ALPC_MSGFLG_SYNC_REQUEST: o envio antes da espera não acontece.
+const ALPC_SYNC_REQUEST: u32 = 0x2_0000;
+
+/// O envio ALPC adiado capturado do WORKER_FACTORY_DEFERRED_WORK.
+#[derive(Clone, Copy)]
+struct DeferredSend {
+    message: u64,
+    port: u64,
+    flags: u32,
+}
+
+impl DeferredSend {
+    /// A mensagem sem atributos nem recepção (`alpc::deferred_send`); a
+    /// falha só fica no log, com o cabeçalho PORT_MESSAGE da mensagem
+    /// recusada (DataLength, TotalLength, Type, DataInfoOffset e MessageId).
+    fn send(self, flags: u32) -> Result<(), KernelError> {
+        let status = crate::ntos::ps::user::alpc::deferred_send(self.port, flags, self.message)?;
+        if status & 0x8000_0000 != 0 {
+            let header = guest::try_read_bytes(self.message, 0x28).unwrap_or_default();
+            let word = |offset: usize| header.get(offset..offset + 2).map_or(0, |bytes| u16::from_le_bytes([bytes[0], bytes[1]]));
+            let id = header.get(0x18..0x1C).map_or(0, |bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
+            crate::debug_print!("[workerfactory] envio adiado na porta {:#x} (flags {:#x}) falhou: {:#x} (DataLength {:#x} TotalLength {:#x} Type {:#x} DataInfoOffset {:#x} MessageId {:#x})", self.port, flags, status, word(0), word(2), word(4), word(6), id);
+        }
+        Ok(())
+    }
+}
+
+/// Workers com a espera de trabalho desta fábrica instalada (o
+/// WaitingWorkerCount).
+fn waiting(factory: &Factory) -> u32 {
+    live(factory).iter().filter(|thread| thread.wait_worker_factory() == factory.pointer).count() as u32
+}
+
+/// O worker `thread` sai da fábrica pela espera (STATUS_TIMEOUT): deixa os
+/// prontos e o total agora, como a retirada do 19041, e a ntdll encerra a
+/// thread sem mandar a classe 9 (3).
+fn retire(factory: &Factory, thread: &Arc<UserThread>) {
+    if thread.with(|thread| thread.worker_factory) == factory.pointer {
+        remove_worker(factory, thread);
+    }
+}
+
+/// Um worker cuja espera terminou por tempo fica na fábrica se há trabalho
+/// na fila (que um worker novo pegaria), se os prontos não passam do
+/// mínimo ou se a thread ainda tem IRPs pendentes (a IrpList do ETHREAD).
+fn should_stay(factory: &Factory, thread: &UserThread) -> bool {
+    if !factory.port.with(|state| state.packets.is_empty()) || factory.ready_workers() <= factory.minimum() {
+        return true;
+    }
+    let pointer = thread.pointer();
+    // SAFETY: o ETHREAD da thread que espera, vivo durante a espera.
+    let irps = &unsafe { Ethread::at(pointer) }.irp_list;
+    pointer != 0 && irps.flink.get() != irps.address()
+}
+
+/// WorkerFactoryTimeoutWaiters (12, o TpTrimPools): sem criação em
+/// andamento e com mais workers prontos que o mínimo, até o excesso dos
+/// workers que esperam trabalho tem a espera terminada com STATUS_TIMEOUT
+/// (o KeTimeOutQueueWaiters); cada um ainda confere se deve ficar. O número
+/// volta no próprio buffer (de entrada e saída). Sem olhar o encerramento.
+fn timeout_waiters(factory: &Factory, buffer: u64) -> u32 {
+    let mut count = 0;
+    let (ready, minimum) = (factory.ready_workers(), factory.minimum());
+    if !factory.creating() && ready > minimum {
+        count = (ready - minimum).min(waiting(factory));
+        factory.add_timeout_requests(count);
+    }
+    match guest::try_write::<u32>(buffer, count) {
+        Ok(()) => 0,
+        Err(error) => error.status,
+    }
+}
+
+/// NtWaitForWorkViaWorkerFactory(handle, MiniPackets, Count,
+/// PacketsReturned, DeferredWork), como o 19041 (rva 0x203110): Count de 1
+/// a 0x7FFFFFF antes de tudo; em modo usuário, a saída dos pacotes
+/// alinhada em 8 e gravável, PacketsReturned gravável e o
+/// WORKER_FACTORY_DEFERRED_WORK alinhado em 8 e sempre capturado. A resposta
+/// adiada (bit 0 de Flags) sai uma vez: antes da espera, ou na saída quando
+/// a espera nem começou (handle inválido, fábrica encerrada, worker em
+/// excesso).
 fn nt_wait_for_work_via_worker_factory(handle: u64, out: u64, count: u64, returned: u64, rsp: u64) -> Result<u32, KernelError> {
+    let count = count as u32;
+    if count.wrapping_sub(1) > 0x7FF_FFFE {
+        return Ok(0xC000_000D);
+    }
+    let deferred = state::stack_arg(rsp, 5);
+    if out & 7 != 0 {
+        return Ok(0x8000_0002);
+    }
+    if !state::probe_user_write(out, count as u64 * FileIoCompletionInformation::SIZE) || !state::probe_user_write(returned, 4) {
+        return Ok(0xC000_0005);
+    }
+    if deferred & 7 != 0 {
+        return Ok(0x8000_0002);
+    }
+    if !state::probe_user_read(deferred, WorkerFactoryDeferredWork::SIZE) {
+        return Ok(0xC000_0005);
+    }
+    let captured = state::user_struct::<WorkerFactoryDeferredWork>(deferred).and_then(|work| Ok((work.alpc_send_message.probe_get()?, work.alpc_send_message_port.probe_get()?, work.alpc_send_message_flags.probe_get()?, work.flags.probe_get()?)));
+    let mut send = match captured {
+        Ok((message, port, flags, work_flags)) => (work_flags & DEFERRED_SEND != 0).then_some(DeferredSend { message, port, flags }),
+        Err(error) => return Ok(error.status),
+    };
+    let status = wait_for_work(handle, out, count, returned, &mut send)?;
+    // A espera não começou: a resposta vai como no NtAlpcSendWaitReceivePort
+    // com as flags capturadas inteiras e sem recepção.
+    if let Some(send) = send {
+        send.send(send.flags)?;
+    }
+    Ok(status)
+}
+
+/// O corpo do NtWaitForWorkViaWorkerFactory depois das capturas: `send` é
+/// consumido quando a resposta sai antes da espera.
+fn wait_for_work(handle: u64, out: u64, count: u32, returned: u64, send: &mut Option<DeferredSend>) -> Result<u32, KernelError> {
     let (entry, factory) = match resolve(handle, 2) {
         Ok(resolved) => resolved,
         Err(status) => return Ok(status),
     };
-    let Some(thread) = threads::current().filter(|thread| thread.with(|thread| thread.worker_factory) == factory.pointer) else { return Ok(0xC000_000D) };
-    let deferred = state::stack_arg(rsp, 5);
-    if deferred != 0 && !state::probe_user_read(deferred, 24) {
-        return Ok(0xC000_0005);
+    if factory.port.closed() {
+        shutdown(&factory);
     }
-    // O envio ALPC adiado (WORKER_FACTORY_DEFERRED_WORK), como o
-    // NtWaitForWorkViaWorkerFactory 19041: só com o bit 0 de Flags (o
-    // rpcrt4 deixa no bloco a mensagem do envio anterior e só liga o bit
-    // quando há resposta nova); só as flags altas; com
-    // ALPC_MSGFLG_SYNC_REQUEST o envio não acontece; a porta pede acesso de
-    // envio e a mensagem vai sem atributos. Uma falha do envio não muda nada:
-    // a espera por trabalho segue.
-    if deferred != 0 {
-        let work = state::user_struct::<WorkerFactoryDeferredWork>(deferred).and_then(|work| Ok((work.alpc_send_message.probe_get()?, work.alpc_send_message_port.probe_get()?, work.alpc_send_message_flags.probe_get()?, work.flags.probe_get()?)));
-        match work.map(|(message, port, flags, work_flags)| (if work_flags & 1 != 0 { message } else { 0 }, port, flags)) {
-            Ok((0, _, _)) => {}
-            Ok((message, port, flags)) => {
-                let flags = flags & 0xFFFF_0000;
-                if flags & 0x2_0000 == 0 {
-                    let status = crate::ntos::ps::user::alpc::deferred_send(port, flags, message)?;
-                    if status & 0x8000_0000 != 0 {
-                        // O cabeçalho PORT_MESSAGE da mensagem recusada
-                        // (DataLength, TotalLength, Type, DataInfoOffset e
-                        // MessageId), para o diagnóstico.
-                        let header = guest::try_read_bytes(message, 0x28).unwrap_or_default();
-                        let word = |offset: usize| header.get(offset..offset + 2).map_or(0, |bytes| u16::from_le_bytes([bytes[0], bytes[1]]));
-                        let id = header.get(0x18..0x1C).map_or(0, |bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
-                        crate::debug_print!("[workerfactory] envio adiado na porta {:#x} (flags {:#x}) falhou: {:#x} (DataLength {:#x} TotalLength {:#x} Type {:#x} DataInfoOffset {:#x} MessageId {:#x})", port, flags, status, word(0), word(2), word(4), word(6), id);
-                    }
-                }
-            }
-            Err(error) => return Ok(error.status),
+    if factory.shutdown() {
+        return Ok(0x80);
+    }
+    let thread = threads::current();
+    // O máximo desceu abaixo dos prontos: o excesso sai sem esperar.
+    if factory.ready_workers() > factory.maximum() {
+        if let Some(thread) = thread.as_ref() {
+            retire(&factory, thread);
+        }
+        return Ok(0x102);
+    }
+    // Só as flags altas; com ALPC_MSGFLG_SYNC_REQUEST o envio não
+    // acontece. Uma falha do envio não muda nada: a espera segue.
+    if let Some(send) = send.take() {
+        let flags = send.flags & 0xFFFF_0000;
+        if flags & ALPC_SYNC_REQUEST == 0 {
+            send.send(flags)?;
         }
     }
-    let count = count as u32;
-    if count == 0 || count > 0x7FFF_FFFF / 32 {
-        return Ok(0xC000_000D);
-    }
-    let validate: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || state::probe_user_write(out, count as u64 * 32) && state::probe_user_write(returned, 4));
+    let validate: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || state::probe_user_write(out, count as u64 * FileIoCompletionInformation::SIZE) && state::probe_user_write(returned, 4));
     // Os pacotes retirados são escritos sob a trava da porta; as
-    // notificações de retirada rodam depois, fora dela.
+    // notificações de retirada rodam depois, fora dela. PacketsReturned só
+    // é gravado quando há pacotes (status 0).
     let deliver = Box::new(move |packets: &mut VecDeque<Packet>| {
         let size = (count as usize).min(packets.len());
         let mut dequeued: Vec<Box<dyn FnOnce() + Send>> = Vec::new();
@@ -798,12 +912,34 @@ fn nt_wait_for_work_via_worker_factory(handle: u64, out: u64, count: u64, return
         };
         Some(Packet { on_dequeue, ..Packet::default() })
     });
-    let idle = live(&factory).len() as u32 > factory.minimum();
-    let timeout_ms = if idle { Some((-factory.idle_timeout() / 10_000) as u64) } else { None };
-    let watched = factory.clone();
-    let options = RemoveOptions { entries: alloc::vec![entry], poll: Some(Box::new(move || watched.shutdown().then_some(0x80))), cleanup: None, timeout_ms: Some(timeout_ms) };
-    let status = io_completion::remove_entry(factory.port_entry.clone(), factory.port.clone(), 0, false, validate, deliver, options);
-    thread.mark_wait_worker_factory(factory.pointer);
+    // A espera em si é infinita e alertável (uma APC de usuário volta com
+    // STATUS_USER_APC). A ociosidade é contada por worker: depois de
+    // IdleTimeout sem trabalho, ou quando a classe 12 pede, a espera termina
+    // com STATUS_TIMEOUT se o worker não deve ficar; senão o prazo recomeça.
+    let idle_ms = ((-factory.idle_timeout()) / 10_000).max(1) as u64;
+    let mut deadline = clock::uptime_ms() + idle_ms;
+    let (watched, waiter) = (factory.clone(), thread.clone());
+    let poll = move || -> Option<u32> {
+        if watched.shutdown() {
+            return Some(0x80);
+        }
+        let now = clock::uptime_ms();
+        if !watched.take_timeout_request() && now < deadline {
+            return None;
+        }
+        deadline = now + idle_ms;
+        let waiter = waiter.as_ref()?;
+        if should_stay(&watched, waiter) {
+            return None;
+        }
+        retire(&watched, waiter);
+        Some(0x102)
+    };
+    let options = RemoveOptions { entries: alloc::vec![entry], poll: Some(Box::new(poll)), cleanup: None, timeout_ms: Some(None) };
+    let status = io_completion::remove_entry(factory.port_entry.clone(), factory.port.clone(), 0, true, validate, deliver, options);
+    if let Some(thread) = thread {
+        thread.mark_wait_worker_factory(factory.pointer);
+    }
     Ok(status)
 }
 
