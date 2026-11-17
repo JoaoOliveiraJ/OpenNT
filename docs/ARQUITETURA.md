@@ -1298,7 +1298,9 @@ A árvore de dispositivos do NT mora em `ntos/io/pnp/`:
 - `install.rs`: as linhas de modelo dos INFs da caixa que atendem o
   hardware emulado (mshdc.inf, disk.inf, volume.inf, volmgr.inf, o
   display.inf com o BasicDisplay.sys para PCI\CC_0300, o basicrender.inf
-  com o BasicRender.sys para ROOT\BASICRENDER e o machine.inf com
+  com o BasicRender.sys para ROOT\BASICRENDER, o monitor.inf com o
+  monitor.sys (KMDF) para os monitores que o dxgkrnl relata
+  (MONITOR\Default_Monitor e *PNP09FF) e o machine.inf com
   o msisadrv.sys para PCI\CC_0601 e o driver nulo das seções NO_DRV), com
   o serviço, a classe, os AddReg e o ExcludeID de cada seção. O posto segue o instalador (HardwareIDs antes
   de CompatibleIDs): PCI\VEN_8086&DEV_7010 instala o intelide.sys antes do

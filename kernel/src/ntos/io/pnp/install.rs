@@ -6,7 +6,9 @@
 //! o stornvme.sys a todo controlador NVMe, PCI\CC_010802, disk.inf,
 //! volume.inf, volmgr.inf, o display.inf, que dá o BasicDisplay.sys a todo adaptador de
 //! classe VGA, PCI\CC_0300, o basicrender.inf, que dá o BasicRender.sys ao
-//! adaptador de renderização da raiz, ROOT\BASICRENDER, e o machine.inf, que dá o msisadrv.sys, um
+//! adaptador de renderização da raiz, ROOT\BASICRENDER, o monitor.inf, que dá
+//! o monitor.sys aos monitores que o dxgkrnl relata (MONITOR\Default_Monitor
+//! e *PNP09FF), e o machine.inf, que dá o msisadrv.sys, um
 //! driver KMDF, às pontes PCI-ISA, PCI\CC_0601, e o driver nulo das seções
 //! NO_DRV às pontes de host, PCI\CC_0600, e, com a raiz ACPI, ao HPET, ao
 //! relógio CMOS, aos barramentos de recursos, ao contêiner dos processadores
@@ -161,6 +163,31 @@ const SERVICE_BASIC_RENDER: ServiceSpec = ServiceSpec {
     owner: "basicrender.inf",
     values: &[RegValue { subkey: "Parameters", name: "SingleDeviceInstall", data: RegData::Dword(1) }],
 };
+
+/// monitor.inf `[Version]` (a classe Monitor do c_monitor.inf).
+pub const CLASS_MONITOR: ClassSpec = ClassSpec { guid: "{4d36e96e-e325-11ce-bfc1-08002be10318}", name: "Monitor", upper_filters: &[], lower_filters: &[] };
+/// monitor.inf `[Monitor_Service.Install]`: o driver de função da classe
+/// Monitor (ServiceBinary `%12%\monitor.sys`), com o ImagePath que esta
+/// instalação grava.
+const SERVICE_MONITOR: ServiceSpec = ServiceSpec {
+    name: "monitor",
+    display_name: Some("@monitor.inf,%Monitor.SVCDESC%;Microsoft Monitor Class Function Driver Service"),
+    start: 3,
+    error_control: 1,
+    binary: "\\SystemRoot\\System32\\drivers\\monitor.sys",
+    group: None,
+    owner: "monitor.inf",
+    values: &[],
+};
+/// monitor.inf `[NonPnPMonitor.AddReg]` (HKR = chave do driver).
+const NON_PNP_MONITOR_DRIVER: &[RegValue] = &[RegValue { subkey: "MODES\\640,480", name: "", data: RegData::KeyOnly }];
+/// monitor.inf `[PnPMonitor.AddReg]`, `[1600]` e `[DPMS]` (HKR = chave do
+/// driver).
+const PNP_MONITOR_DRIVER: &[RegValue] = &[
+    RegValue { subkey: "MODES\\1600,1200", name: "", data: RegData::KeyOnly },
+    RegValue { subkey: "", name: "MaxResolution", data: RegData::Text("1600,1200") },
+    RegValue { subkey: "", name: "DPMS", data: RegData::Text("1") },
+];
 
 /// stornvme.inf `[Stornvme_Service_Inst]` com o `[nvme_registry_values]` e
 /// o `[nvme_registry_device_specific_values]` (HKR = a chave do serviço):
@@ -518,6 +545,42 @@ pub const DRIVERS: &[InfDriver] = &[
         service: Some(&SERVICE_BASIC_RENDER),
         class: &CLASS_SYSTEM,
         driver_values: &[],
+        device_values: &[],
+        exclude_ids: &[],
+    },
+    // monitor.inf `[Generic.NTamd64]`: o monitor sem descritor que o dxgkrnl
+    // relata no adaptador (DISPLAY\Default_Monitor, HardwareID
+    // MONITOR\Default_Monitor) e o de descritor (*PNP09FF), os dois com o
+    // monitor.sys.
+    InfDriver {
+        inf: "monitor.inf",
+        section: "NonPnPMonitor.Install",
+        id: "Monitor\\Default_Monitor",
+        description_key: "NonPnPMonitor.DeviceDesc",
+        description: "Generic Non-PnP Monitor",
+        manufacturer_key: "Generic",
+        manufacturer: "(Standard monitor types)",
+        provider: "Microsoft",
+        driver_version: "10.0.19041.5794",
+        service: Some(&SERVICE_MONITOR),
+        class: &CLASS_MONITOR,
+        driver_values: NON_PNP_MONITOR_DRIVER,
+        device_values: &[],
+        exclude_ids: &[],
+    },
+    InfDriver {
+        inf: "monitor.inf",
+        section: "PnPMonitor.Install",
+        id: "*PNP09FF",
+        description_key: "PnPMonitor.DeviceDesc",
+        description: "Generic PnP Monitor",
+        manufacturer_key: "Generic",
+        manufacturer: "(Standard monitor types)",
+        provider: "Microsoft",
+        driver_version: "10.0.19041.5794",
+        service: Some(&SERVICE_MONITOR),
+        class: &CLASS_MONITOR,
+        driver_values: PNP_MONITOR_DRIVER,
         device_values: &[],
         exclude_ids: &[],
     },

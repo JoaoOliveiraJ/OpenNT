@@ -13,8 +13,9 @@
 //! SleepStudyHelper.sys e msisadrv.sys) e os catálogos que os assinam, a
 //! raiz ACPI da árvore de dispositivos (acpi.sys, pci.sys e a pshed.dll), o
 //! banco de errata (`\SystemRoot\INF\errata.inf`), a
-//! pilha de vídeo (dxgkrnl.sys, dxgmms2.sys e o BasicDisplay.sys e o
-//! BasicRender.sys do repositório de drivers), a pilha USB 3 e HID (usbxhci.sys, ucx01000.sys,
+//! pilha de vídeo (dxgkrnl.sys, dxgmms2.sys, o BasicDisplay.sys e o
+//! BasicRender.sys do repositório de drivers e o monitor.sys com o CEA.sys
+//! e o monitor.inf), a pilha USB 3 e HID (usbxhci.sys, ucx01000.sys,
 //! usbhub3.sys, usbd.sys, hidusb.sys, hidclass.sys, hidparse.sys, kbdhid.sys
 //! e mouhid.sys), os
 //! arquivos que o vgk.sys abre pelo caminho
@@ -83,6 +84,17 @@ const NTFS_FILES: &[(&str, &str)] = &[
     (
         "Windows/System32/DriverStore/FileRepository/basicrender.inf_amd64_eebb5a8467eb88ec/BasicRender.sys",
         "System32/DriverStore/FileRepository/basicrender.inf_amd64_eebb5a8467eb88ec/BasicRender.sys",
+    ),
+    // O driver de função dos monitores que o dxgkrnl relata no adaptador
+    // (monitor.inf), um cliente KMDF, com o CEA.sys que ele importa (sobre o
+    // msrpc.sys) e o INF; o catálogo 01 cobre o monitor.sys, e o 0516 e o
+    // 05110 abaixo, o CEA.sys.
+    ("MONITOR.SYS", "System32/drivers/monitor.sys"),
+    ("CEA.SYS", "System32/drivers/CEA.sys"),
+    ("Windows/INF/monitor.inf", "INF/monitor.inf"),
+    (
+        "Windows/System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package01~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
+        "System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package01~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
     ),
     // A CI original e a sua dependência, carregadas do volume.
     ("CI.DLL", "System32/ci.dll"),
