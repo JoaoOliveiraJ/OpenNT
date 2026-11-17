@@ -3264,8 +3264,10 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   Control\ServiceGroupOrder e os grupos do svchost
   (`xtask/src/user_services.rs`). A tela de logon da sessão 1 leva o fecho
   de imports do dwm.exe e do LogonUI.exe com o XAML e os provedores de
-  credencial (`LOGON_SCREEN_PROGRAMS` em `xtask/src/windows_binaries.rs`) e
-  os `.mun` e os `.pri` de `\Windows\SystemResources` desses programas. A inicialização do LSA (o
+  credencial (`LOGON_SCREEN_PROGRAMS` em `xtask/src/windows_binaries.rs`),
+  os `.mun` e os `.pri` de `\Windows\SystemResources` desses programas e
+  as fontes de `\SystemRoot\Fonts` com o GRE_Initialize, o
+  FontSubstitutes, o FontLink e a chave Fonts (`xtask/src/fonts.rs`). A inicialização do LSA (o
   LsapInitLsa e o LsapStartLsa do lsasrv) pede ainda: o
   NtQueryInformationProcess das classes ProcessWow64Information (0) e
   ProcessProtectionInformation (o PS_PROTECTION do EPROCESS); os alarmes de

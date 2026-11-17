@@ -32,8 +32,8 @@
 //! Leva também a tela de logon da sessão 1 (o dwm.exe e o LogonUI.exe com o
 //! fecho dos imports, o XAML e os provedores de credencial), os `.mui` dos
 //! programas (no idioma de fallback quando o de interface não tem), os
-//! recursos deles em `\Windows\SystemResources` e os assemblies de WinSxS
-//! (`side_by_side`).
+//! recursos deles em `\Windows\SystemResources`, os assemblies de WinSxS
+//! (`side_by_side`) e as fontes (`fonts`).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -885,6 +885,18 @@ pub fn ntfs_files(root: &Path, kernel_pe: &[u8], initial_process: &str) -> Resul
             }
         }
         println!("arquivos de WinSxS no volume NTFS: {assemblies}");
+        // As fontes da sessão (`fonts`), em `\SystemRoot\Fonts`.
+        let mut faces = 0;
+        for (path, source) in crate::fonts::files(&windows) {
+            match fs::read(&source) {
+                Ok(bytes) => {
+                    files.push((path, bytes));
+                    faces += 1;
+                }
+                Err(_) => println!("AVISO: {} ausente no Windows desta maquina", source.display()),
+            }
+        }
+        println!("fontes no volume NTFS: {faces}");
     }
     files.push((String::from("NTOSKRNL.EXE"), kernel_pe.to_vec()));
     files.push((String::from("Windows/System32/ntoskrnl.exe"), kernel_pe.to_vec()));
