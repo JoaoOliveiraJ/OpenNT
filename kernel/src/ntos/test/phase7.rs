@@ -4168,6 +4168,14 @@ fn user_worker_factory(assert: Assert) {
     // de worker, cuja falha de criação fica no último status.
     let long = (set(9, 5, 4), set(9, 2, 4), set(9, 0, 4), set(9, 1, 8), set(9, 1, 4));
     assert(long == (Some(0xC000_000D), Some(0xC000_0001), Some(0xC000_0001), Some(0xC000_0004), Some(0)) && factory.ready_workers() == 0, "userwf: classe 9 recusa valor, contagem zerada e tamanho e aceita o TpCallbackMayRunLong");
+    // A classe 10 (WorkerFactoryStackInformation): 16 bytes alinhados com o
+    // reserve e o commit das próximas threads.
+    guest::write64(input, 0x4_0000);
+    guest::write64(input + 8, 0x2000);
+    let stack_info = call("NtSetInformationWorkerFactory", handle, 10, input, 16);
+    let stack_short = call("NtSetInformationWorkerFactory", handle, 10, input, 8);
+    let stack_misaligned = call("NtSetInformationWorkerFactory", handle, 10, input + 2, 16);
+    assert(stack_info == Some(0) && factory.reserve() == 0x4_0000 && factory.commit() == 0x2000 && stack_short == Some(0xC000_0004) && stack_misaligned == Some(0x8000_0002), "userwf: classe 10 grava o reserve e o commit e confere tamanho e alinhamento");
     // Liberação de worker: pacote de dreno na IOCP.
     let released = call("NtReleaseWorkerFactoryWorker", handle, 0, 0, 0);
     let packets = port.as_ref().map_or(0, |port| port.with(|state| state.packets.len()));
@@ -4183,6 +4191,9 @@ fn user_worker_factory(assert: Assert) {
     stack(&[returned]);
     let _ = call("NtQueryInformationWorkerFactory", handle, 7, out, 0x78);
     let after = (set(5, 4, 4), set(14, 2, 4), call("NtReleaseWorkerFactoryWorker", handle, 0, 0, 0));
+    guest::write64(input + 8, 0x3000);
+    let stack_after = call("NtSetInformationWorkerFactory", handle, 10, input, 16);
+    assert(stack_after == Some(0x80) && factory.commit() == 0x2000, "userwf: classe 10 numa fabrica encerrada volta 0x80 sem gravar");
     assert(shut == Some(0) && guest::read32(block + 0x320) == 3 && factory_info.shutdown.get() == 1 && factory.shutdown() && port.as_ref().is_some_and(|port| port.listeners.lock().len() == listeners_before) && after == (Some(0xC000_010A), Some(0x80), Some(0xC000_010A)), "userwf: encerramento recusa configuracao e liberacao");
     // Fechamento: a última referência libera a fábrica e a IOCP.
     drop(factory);

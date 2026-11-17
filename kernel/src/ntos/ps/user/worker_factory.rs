@@ -268,6 +268,40 @@ fn set_worker_flags(handle: u64, input: u64, length: u32) -> u32 {
     0
 }
 
+/// WorkerFactoryStackInformation (10, o NtSetInformationWorkerFactory do
+/// 19041): exatamente 16 bytes (senão STATUS_INFO_LENGTH_MISMATCH),
+/// alinhados em 4 e capturados antes do handle como o
+/// TP_POOL_STACK_INFORMATION {StackReserve, StackCommit}; o handle com
+/// WORKER_FACTORY_SET_INFORMATION. Numa fábrica encerrada volta 0x80
+/// (STATUS_ABANDONED_WAIT_0) sem gravar nada; senão o reserve e o commit das
+/// próximas threads trocam, sem validação. O TppPoolpReferenceGlobalPool da
+/// ntdll trata a falha como fatal, e todo Tp* do pool global falharia.
+fn set_stack_information(handle: u64, input: u64, length: u32) -> u32 {
+    if length != 16 {
+        return 0xC000_0004;
+    }
+    if input & 3 != 0 {
+        return 0x8000_0002;
+    }
+    if !state::probe_user_read(input, 16) {
+        return 0xC000_0005;
+    }
+    let (reserve, commit) = match (guest::try_read::<u64>(input), guest::try_read::<u64>(input + 8)) {
+        (Ok(reserve), Ok(commit)) => (reserve, commit),
+        (Err(error), _) | (_, Err(error)) => return error.status,
+    };
+    let factory = match resolve(handle, 4) {
+        Ok((_, factory)) => factory,
+        Err(status) => return status,
+    };
+    if factory.shutdown() {
+        return 0x80;
+    }
+    factory.set_reserve(reserve);
+    factory.set_commit(commit);
+    0
+}
+
 /// A captura precede a validação do handle; zero desativa o adiamento.
 fn set_thread_soft_maximum(handle: u64, input: u64, length: u32) -> u32 {
     if length != 4 {
@@ -477,6 +511,9 @@ fn nt_set_information_worker_factory(handle: u64, class: u64, input: u64, length
     }
     if class == 9 {
         return set_long_callback(handle, input, length);
+    }
+    if class == 10 {
+        return Ok(set_stack_information(handle, input, length));
     }
     let factory = match resolve(handle, 4) {
         Ok((_, factory)) => factory,
