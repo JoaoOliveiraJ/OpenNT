@@ -29,6 +29,7 @@ pub mod system_services;
 pub mod timer;
 pub mod timer_object;
 pub mod uuid;
+pub mod global_atom;
 pub mod event;
 pub mod boot_device;
 pub mod extension_host;

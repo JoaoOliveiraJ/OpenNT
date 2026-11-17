@@ -1,7 +1,8 @@
 //! Tabelas de átomos do Rtl (RtlCreateAtomTable[Ex], RtlDestroyAtomTable,
 //! RtlAddAtomToAtomTable[Ex], RtlLookupAtomInAtomTable,
 //! RtlDeleteAtomFromAtomTable, RtlPinAtomInAtomTable,
-//! RtlQueryAtomInAtomTable e RtlGetIntegerAtom), como no ntoskrnl 19041.
+//! RtlQueryAtomInAtomTable, RtlGetIntegerAtom e o RtlQueryAtomsInAtomTable
+//! interno do NtQueryInformationAtom), como no ntoskrnl 19041.
 //!
 //! A tabela é a `_RTL_ATOM_TABLE` real em pool paginado (tag 'AtmT'), com a
 //! assinatura 'Atom', a contagem de referências, o push lock que serializa
@@ -43,6 +44,7 @@ const STATUS_SUCCESS: u32 = 0;
 const STATUS_WAS_LOCKED: u32 = 0x4000_0019;
 const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
 const STATUS_NO_MEMORY: u32 = 0xC000_0017;
 const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
 const STATUS_OBJECT_NAME_INVALID: u32 = 0xC000_0033;
@@ -533,6 +535,44 @@ pub fn query(table: u64, atom: u16, outputs: &QueryOutputs) -> Result<u32, Kerne
         let (Some(length), true) = (outputs.name_length, outputs.name != 0) else { return Ok(STATUS_SUCCESS) };
         Ok(copy_name(&entry_name(entry), outputs.name, length, true))
     })
+}
+
+/// O que o RtlQueryAtomsInAtomTable devolve.
+pub struct AtomList {
+    /// STATUS_SUCCESS, ou STATUS_INFO_LENGTH_MISMATCH quando a tabela tem
+    /// mais átomos que o máximo pedido.
+    pub status: u32,
+    /// Quantos átomos a tabela tem (o *NumberOfAtoms).
+    pub count: u32,
+    /// Os primeiros átomos, até o máximo pedido.
+    pub atoms: Vec<u16>,
+}
+
+/// RtlQueryAtomsInAtomTable(AtomTable, MaximumNumberOfAtoms, NumberOfAtoms,
+/// Atoms): percorre os baldes em ordem e cada cadeia; cada entrada conta
+/// (o RtlpLookupLowBox sem AppContainer acha a referência da própria
+/// entrada) e os átomos além do máximo só contam, com
+/// STATUS_INFO_LENGTH_MISMATCH. Sem o lock da tabela, None (o original
+/// devolve STATUS_INVALID_PARAMETER sem tocar nas saídas).
+pub fn list(table: u64, maximum: u32) -> Result<Option<AtomList>, KernelError> {
+    if !lock(table)? {
+        return Ok(None);
+    }
+    let mut list = AtomList { status: STATUS_SUCCESS, count: 0, atoms: Vec::new() };
+    for index in 0..table_at(table).number_of_buckets.get() {
+        let mut entry = bucket_slot(table, index).get();
+        while entry != 0 {
+            if list.count < maximum {
+                list.atoms.push(entry_at(entry).atom.get());
+            } else {
+                list.status = STATUS_INFO_LENGTH_MISMATCH;
+            }
+            list.count += 1;
+            entry = entry_at(entry).hash_link.get();
+        }
+    }
+    unlock(table)?;
+    Ok(Some(list))
 }
 
 /// RtlDestroyAtomTable(AtomTable): só a última referência destrói; as

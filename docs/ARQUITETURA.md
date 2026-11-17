@@ -2005,7 +2005,11 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   átomos é a `_RTL_ATOM_TABLE` real em pool (assinatura, push lock, baldes,
   entradas com contagem e fixação); só o índice de handle de cada átomo de
   string (0xC000 | índice) mora num registro do OpenNT por tabela, no lugar
-  da tabela de handles. O heap segue os dois caminhos de criação do
+  da tabela de handles. Os serviços de átomos globais (NtAddAtom[Ex],
+  NtFindAtom, NtDeleteAtom e NtQueryInformationAtom, `ex/global_atom.rs`,
+  do GlobalAddAtom e do SetProp com nome) pedem a tabela ao callout 2 do
+  win32k (sem ela, STATUS_ACCESS_DENIED), copiam o nome de modo usuário
+  para o kernel e operam com essas rotinas. O heap segue os dois caminhos de criação do
   RtlCreateHeap: o heap fixo (HEAP_CREATE_SEGMENT_HEAP, o desktop heap do
   win32k) sobre a memória do chamador, com cada página nova confirmada pela
   CommitRoutine de RTL_HEAP_PARAMETERS, e o heap NT (memória do processo
