@@ -94,7 +94,7 @@ fn parameters() -> ProcessParameters {
 
 /// Cria o smss.exe e o põe no despachante; o kernel segue sem esperá-lo.
 pub fn start() -> Result<(), KernelError> {
-    let request = CreateProcessRequest { image: ImageOrigin::NtPath(String::from(INITIAL_PROCESS_PATH)), image_name: "smss.exe", parameters: parameters(), parent: None, thread_flags: 0, on_created: None, inherit_handles_from: None, protection: WINTCB_LIGHT, create_session: false };
+    let request = CreateProcessRequest { image: ImageOrigin::NtPath(String::from(INITIAL_PROCESS_PATH)), image_name: "smss.exe", parameters: parameters(), parent: None, thread_flags: 0, on_created: None, inherit_handles_from: None, protection: WINTCB_LIGHT, create_session: false, primary_token: None };
     let created = create::create_user_process(&request).map_err(|failure| KernelError::with_status(alloc::format!("{INITIAL_PROCESS_PATH}: {failure}"), failure.status()))?;
     // ProcessBreakOnTermination, antes de a thread andar.
     // SAFETY: o EPROCESS recém-criado, retido pela criação.
@@ -323,6 +323,53 @@ pub fn server_port_created(name: &str) {
     if image_name(process::get_current_process()).eq_ignore_ascii_case("services.exe") && !SERVICES_STARTED.swap(true, Ordering::AcqRel) {
         crate::debug_print!("[init] services.exe (pid {}): interface RPC do gerenciador de servicos em {}", process::get_current_process_id(), name);
         crate::debug_print!("SERVICES_STARTED");
+    }
+}
+
+static SVCHOST_LSM_STARTED: AtomicBool = AtomicBool::new(false);
+static TERMSRV_READY: AtomicBool = AtomicBool::new(false);
+static SESSION1_CONNECTED: AtomicBool = AtomicBool::new(false);
+
+/// Uma vista de imagem completa entrou no processo `process`
+/// (`mm/section/image_view.rs`): o `SVCHOST_LSM_STARTED` sai quando um
+/// svchost.exe mapeia o lsm.dll, o ServiceDll do Local Session Manager que
+/// o services.exe pediu.
+pub fn image_mapped(process: u64, dll_name: &str) {
+    if !boot_config::smss_boot() || SVCHOST_LSM_STARTED.load(Ordering::Acquire) || !dll_name.eq_ignore_ascii_case("lsm.dll") {
+        return;
+    }
+    if image_name(process).eq_ignore_ascii_case("svchost.exe") && !SVCHOST_LSM_STARTED.swap(true, Ordering::AcqRel) {
+        // SAFETY: o EPROCESS do processo da vista, retido por ela.
+        let pid = unsafe { Eprocess::at(process) }.unique_process_id.get();
+        crate::debug_print!("[init] svchost.exe (pid {}): lsm.dll mapeado", pid);
+        crate::debug_print!("SVCHOST_LSM_STARTED");
+    }
+}
+
+/// O NtSetEvent de usuário sinalizou o evento `name`: o `TERMSRV_READY` sai
+/// no `\BaseNamedObjects\TermSrvReadyEvent` (o `Global\TermSrvReadyEvent`
+/// que o Local Session Manager sinaliza e que o winlogon espera).
+pub fn event_set(name: &str) {
+    if !boot_config::smss_boot() || TERMSRV_READY.load(Ordering::Acquire) || !name.eq_ignore_ascii_case("\\BaseNamedObjects\\TermSrvReadyEvent") {
+        return;
+    }
+    if !TERMSRV_READY.swap(true, Ordering::AcqRel) {
+        crate::debug_print!("[init] {} (pid {}): TermSrvReadyEvent sinalizado", image_name(process::get_current_process()), process::get_current_process_id());
+        crate::debug_print!("TERMSRV_READY");
+    }
+}
+
+/// Uma sessão carregou a imagem de sessão `name` (`mm/session_image.rs`):
+/// o `SESSION1_CONNECTED` sai quando a sessão 1 carrega o cdd.dll, o que o
+/// win32k dela só faz depois de o dxgkrnl entregar o adaptador à sessão
+/// (DxgkSessionConnected, no NtUserRemoteConnect do csrss).
+pub fn session_image_loaded(session_id: u32, name: &str) {
+    if !boot_config::smss_boot() || session_id != 1 || SESSION1_CONNECTED.load(Ordering::Acquire) || !name.to_ascii_lowercase().ends_with("cdd.dll") {
+        return;
+    }
+    if !SESSION1_CONNECTED.swap(true, Ordering::AcqRel) {
+        crate::debug_print!("[init] sessao 1: cdd.dll carregado");
+        crate::debug_print!("SESSION1_CONNECTED");
     }
 }
 

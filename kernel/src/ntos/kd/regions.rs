@@ -176,10 +176,11 @@ pub fn user_threads(owner: usize, argument: &str, out: &mut Payload) {
 /// `kmap`: as faixas fixas do espaço de sistema do OpenNT (as imagens
 /// carregadas vêm do `lm`).
 pub fn kernel_map(out: &mut Payload) {
-    let ranges: [(&str, u64, u64); 16] = [
+    let ranges: [(&str, u64, u64); 17] = [
         ("metade de usuario", map::LOWEST_USER_ADDRESS, map::USER_PROBE_ADDRESS),
         ("banco de PFN", map::PFN_DATABASE_BASE, map::PFN_DATABASE_TOP),
         ("pool do kernel", map::KERNEL_POOL_BASE, map::KERNEL_POOL_TOP),
+        ("PTEs de sistema dos MDLs", map::SYSTEM_PTE_BASE, map::SYSTEM_PTE_TOP),
         ("despejo", map::KERNEL_DUMP_VIRTUAL_BASE, map::KERNEL_CONTIGUOUS_BASE),
         ("memoria contigua", map::KERNEL_CONTIGUOUS_BASE, map::KERNEL_CONTIGUOUS_TOP),
         ("paginas independentes", map::KERNEL_INDEPENDENT_BASE, map::KERNEL_INDEPENDENT_TOP),

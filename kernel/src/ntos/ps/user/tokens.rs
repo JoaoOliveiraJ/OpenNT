@@ -293,7 +293,113 @@ fn nt_adjust_privileges_token(handle: u64, disable_all: u64, new_state: u64, buf
     crate::ntos::se::token::adjust::adjust_privileges(token, disable_all as u8 != 0, new_state, buffer_length as u32, previous_state, return_length)
 }
 
+/// NtCreateToken(TokenHandle, DesiredAccess, ObjectAttributes, TokenType,
+/// AuthenticationId, ExpirationTime, User, Groups, Privileges, Owner,
+/// PrimaryGroup, DefaultDacl, TokenSource): o NtCreateTokenEx sem atributos
+/// de usuário e de dispositivo, grupos de dispositivo e política
+/// obrigatória (`se/token/create`).
+fn nt_create_token(handle: u64, access: u64, attributes: u64, token_type: u64, rsp: u64) -> Result<u32, KernelError> {
+    if !state::probe_syscall_stack(rsp, 9 * 8) {
+        return Ok(0xC000_0005);
+    }
+    let request = crate::ntos::se::token::create::Request {
+        token_handle: handle,
+        desired_access: access as u32,
+        object_attributes: attributes,
+        token_type: token_type as u32,
+        authentication_id: stack_arg(rsp, 5),
+        expiration_time: stack_arg(rsp, 6),
+        user: stack_arg(rsp, 7),
+        groups: stack_arg(rsp, 8),
+        privileges: stack_arg(rsp, 9),
+        user_attributes: 0,
+        device_attributes: 0,
+        device_groups: 0,
+        mandatory_policy: 0,
+        owner: stack_arg(rsp, 10),
+        primary_group: stack_arg(rsp, 11),
+        default_dacl: stack_arg(rsp, 12),
+        token_source: stack_arg(rsp, 13),
+    };
+    crate::ntos::se::token::create::create(&request, 1)
+}
+
+/// NtCreateTokenEx(TokenHandle, DesiredAccess, ObjectAttributes, TokenType,
+/// AuthenticationId, ExpirationTime, User, Groups, Privileges,
+/// UserAttributes, DeviceAttributes, DeviceGroups, MandatoryPolicy, Owner,
+/// PrimaryGroup, DefaultDacl, TokenSource) (`se/token/create`).
+fn nt_create_token_ex(handle: u64, access: u64, attributes: u64, token_type: u64, rsp: u64) -> Result<u32, KernelError> {
+    if !state::probe_syscall_stack(rsp, 13 * 8) {
+        return Ok(0xC000_0005);
+    }
+    let request = crate::ntos::se::token::create::Request {
+        token_handle: handle,
+        desired_access: access as u32,
+        object_attributes: attributes,
+        token_type: token_type as u32,
+        authentication_id: stack_arg(rsp, 5),
+        expiration_time: stack_arg(rsp, 6),
+        user: stack_arg(rsp, 7),
+        groups: stack_arg(rsp, 8),
+        privileges: stack_arg(rsp, 9),
+        user_attributes: stack_arg(rsp, 10),
+        device_attributes: stack_arg(rsp, 11),
+        device_groups: stack_arg(rsp, 12),
+        mandatory_policy: stack_arg(rsp, 13),
+        owner: stack_arg(rsp, 14),
+        primary_group: stack_arg(rsp, 15),
+        default_dacl: stack_arg(rsp, 16),
+        token_source: stack_arg(rsp, 17),
+    };
+    crate::ntos::se::token::create::create(&request, 1)
+}
+
+/// NtSetInformationToken(TokenHandle, TokenInformationClass,
+/// TokenInformation, TokenInformationLength) (`se/token/set_information`):
+/// a classe é conferida antes do handle, que pede o acesso dela.
+fn nt_set_information_token(handle: u64, class: u64, information: u64, length: u64, _rsp: u64) -> Result<u32, KernelError> {
+    use crate::ntos::se::token::set_information;
+    let class = class as u32;
+    let Some(access) = set_information::required_access(class) else { return Ok(0xC000_0003) };
+    if length != 0 && !probe_user_read(information, length) {
+        return Ok(0xC000_0005);
+    }
+    let token = match lookup(token_argument(1, handle), access) {
+        Ok(token) => token,
+        Err(status) => return Ok(status),
+    };
+    set_information::set(token, class, information, length as u32, 1)
+}
+
+/// NtAccessCheck(SecurityDescriptor, ClientToken, DesiredAccess,
+/// GenericMapping, PrivilegeSet, PrivilegeSetLength, GrantedAccess,
+/// AccessStatus) (`se/access_check`): o token pelo handle com TOKEN_QUERY.
+fn nt_access_check(descriptor: u64, client_token: u64, desired: u64, mapping: u64, rsp: u64) -> Result<u32, KernelError> {
+    if !state::probe_syscall_stack(rsp, 4 * 8) {
+        return Ok(0xC000_0005);
+    }
+    let (privilege_set, privilege_length, granted, status) = (stack_arg(rsp, 5), stack_arg(rsp, 6), stack_arg(rsp, 7), stack_arg(rsp, 8));
+    if !probe_user_read(mapping, 16) || !probe_user_write(privilege_length, 4) || !probe_user_write(granted, 4) || !probe_user_write(status, 4) {
+        return Ok(0xC000_0005);
+    }
+    let available = guest::try_read::<u32>(privilege_length).unwrap_or(0) as u64;
+    if available != 0 && !probe_user_write(privilege_set, available) {
+        return Ok(0xC000_0005);
+    }
+    let handle = token_argument(2, client_token);
+    let token = match lookup(handle, 8) {
+        Ok(token) => token,
+        Err(status) => return Ok(status),
+    };
+    let pseudo = (-6..=-4).contains(&(handle as i64));
+    Ok(crate::ntos::se::access_check::check_by_token(descriptor, token, pseudo, desired as u32, mapping, privilege_set, privilege_length, granted, status))
+}
+
 pub fn init() {
+    state::register_handler("NtCreateToken", nt_create_token);
+    state::register_handler("NtAccessCheck", nt_access_check);
+    state::register_handler("NtSetInformationToken", nt_set_information_token);
+    state::register_handler("NtCreateTokenEx", nt_create_token_ex);
     state::register_handler("NtAdjustPrivilegesToken", nt_adjust_privileges_token);
     state::register_handler("NtOpenProcessToken", nt_open_process_token);
     state::register_handler("NtOpenProcessTokenEx", nt_open_process_token_ex);

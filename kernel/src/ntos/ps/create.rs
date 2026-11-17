@@ -119,6 +119,10 @@ pub struct CreateProcessRequest<'a> {
     /// PROCESS_CREATE_FLAGS_CREATE_SESSION: o processo abre uma sessão nova
     /// (`mm::session::create`); sem ele, entra na sessão do pai.
     pub create_session: bool,
+    /// O token do PS_ATTRIBUTE_TOKEN: o processo recebe uma cópia dele, com
+    /// o SessionId da sessão do processo (o SeSubProcessToken do
+    /// PspInitializeProcessSecurity), em vez da cópia do token de quem cria.
+    pub primary_token: Option<u64>,
 }
 
 /// Por que a criação falhou (os estados de falha do PS_CREATE_INFO).
@@ -445,6 +449,10 @@ pub fn create_user_process(request: &CreateProcessRequest<'_>) -> Result<Created
         crate::ntos::mm::session::create(process_pointer).map_err(fail)?;
     } else {
         crate::ntos::mm::session::join(process_pointer, request.parent.unwrap_or_else(process::get_current_process));
+    }
+    if let Some(token) = request.primary_token {
+        let session_id = crate::ntos::mm::session::session_id(process_pointer);
+        process::replace_primary_token(process_pointer, token, session_id).map_err(fail)?;
     }
     // O espaço do processo novo, anexado: as cópias de sistema, o exe na
     // raiz dele (a ntdll real faz o binding, a relocação e o cookie de

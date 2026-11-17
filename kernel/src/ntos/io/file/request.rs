@@ -22,8 +22,8 @@ use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::inc::field::Field;
 use crate::ntos::inc::types::{Ethread, FileObject, IoStatusBlock, Kthread, Mdl, NtStruct};
 
-/// MDL_PAGES_LOCKED | MDL_MAPPED_TO_SYSTEM_VA.
-const MDL_PAGES_LOCKED_AND_MAPPED: i16 = 0x0002 | 0x0001;
+/// MDL_PAGES_LOCKED.
+const MDL_PAGES_LOCKED: i16 = 0x0002;
 
 /// FILE_OBJECT vivo do pedido (referenciado até o fim).
 fn file_at(file: u64) -> &'static FileObject {
@@ -185,6 +185,11 @@ pub fn cleanup(request: &Shared) -> Result<(), KernelError> {
             guest::free_bytes(r.irp);
             r.irp = 0;
         }
+        // O mapeamento de sistema do MDL sai antes de as páginas soltarem
+        // (o MmUnlockPages do IopCompleteRequest).
+        if r.mdl != 0 {
+            crate::ntos::mm::mdl::unmap_locked_pages(r.mdl);
+        }
         if let Some(mut pin) = r.pin.take() {
             pin.release()?;
         }
@@ -345,7 +350,11 @@ pub fn wait_finished(request: &Shared, thread: u64, alertable: bool, mode: u8) {
     }
 }
 
-/// MDL das páginas fixadas do buffer de saída (METHOD_*_DIRECT).
+/// MDL das páginas fixadas do buffer de saída (METHOD_*_DIRECT), como o
+/// IoAllocateMdl com o MmProbeAndLockPages do NT: MDL_PAGES_LOCKED, o
+/// Process dono e os PFNs, sem VA de sistema. O driver pede a VA pelo
+/// MmGetSystemAddressForMdlSafe, que mapeia as páginas no espaço de sistema
+/// (a VA de usuário só vale no processo que fez o pedido).
 pub fn fill_mdl(request: &Shared, write: bool) -> Result<bool, KernelError> {
     let mut r = request.lock();
     let pin = io_pins::pin(r.output, r.output_length as u64, write)?;
@@ -359,11 +368,11 @@ pub fn fill_mdl(request: &Shared, write: bool) -> Result<bool, KernelError> {
     // SAFETY: alocação zerada do MDL com o vetor de PFNs.
     let (header, pfns) = unsafe { (Mdl::at(descriptor), Field::<u64>::array_at(descriptor + Mdl::SIZE, pin.pages.len())) };
     header.size.set(size as i16);
-    header.mdl_flags.set(MDL_PAGES_LOCKED_AND_MAPPED);
+    header.mdl_flags.set(MDL_PAGES_LOCKED);
+    header.process.set(if r.output < crate::ntos::mm::memory_map::USER_ADDRESS_LIMIT { process::get_current_process() } else { 0 });
     header.start_va.set(r.output & !4095);
     header.byte_offset.set((r.output & 4095) as u32);
     header.byte_count.set(r.output_length);
-    header.mapped_system_va.set(r.output);
     for (pfn, page) in pfns.iter().zip(pin.pages.iter()) {
         pfn.set(page.frame / 4096);
     }

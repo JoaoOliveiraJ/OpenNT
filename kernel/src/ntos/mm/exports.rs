@@ -31,7 +31,7 @@ fn get_system_routine_address(call: &Call) -> Result<u64, KernelError> {
     sysload::system_routine_address(call.arg(1))
 }
 fn map_locked_pages_specify_cache(call: &Call) -> Result<u64, KernelError> {
-    Ok(mdl::map_locked_pages(call.arg(1), call.arg(4)))
+    Ok(mdl::map_locked_pages(call.arg(1), call.arg(2) as u8, call.arg(4)))
 }
 fn unmap_locked_pages(call: &Call) -> Result<u64, KernelError> {
     mdl::unmap_locked_pages(call.arg(2));
@@ -573,7 +573,7 @@ pub mod mm_mdl_ex {
 
     /// MmMapLockedPagesSpecifyCache(Mdl, AccessMode, MmCached, NULL, TRUE, HighPagePriority).
     fn map_locked_pages(call: &Call) -> Result<u64, KernelError> {
-        Ok(mdl::map_locked_pages(call.arg(1), 0))
+        Ok(mdl::map_locked_pages(call.arg(1), call.arg(2) as u8, 0))
     }
 
     fn mdl_page_contents_state(call: &Call) -> Result<u64, KernelError> {

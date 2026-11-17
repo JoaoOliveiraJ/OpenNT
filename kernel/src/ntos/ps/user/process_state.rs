@@ -59,9 +59,6 @@ use crate::ntos::ps::process;
 use crate::ntos::ps::user::state::{self, UserHandleTable};
 use crate::rtl::{KernelError, SpinLock};
 
-/// Exports de uma imagem mapeada (nome → VA de usuário).
-pub type Exports = BTreeMap<String, u64>;
-
 /// O estado de um processo.
 pub struct ProcessState {
     /// O EPROCESS dono (a chave do registro).
@@ -81,9 +78,6 @@ pub struct ProcessState {
     /// A PEB_LDR_DATA montada pelo kernel, onde o loader do kernel insere
     /// as entradas LDR (a PEB.Ldr fica com a da ntdll).
     ldr: AtomicU64,
-    /// Imagens nativas mapeadas no processo por NtMapViewOfSection (nome
-    /// minúsculo → exports), registradas pela vista de imagem.
-    mapped_image_exports: SpinLock<BTreeMap<String, Exports>>,
     /// As threads de usuário do processo, na ordem de criação. O índice
     /// global de `threads.rs` também as tem (despachante e busca por id de
     /// cliente) até cada uma ser liberada.
@@ -119,12 +113,6 @@ impl ProcessState {
 
     pub fn set_ldr(&self, ldr: u64) {
         self.ldr.store(ldr, Ordering::Release);
-    }
-
-    /// Acesso aos exports das imagens mapeadas; a trava não atravessa
-    /// chamadas que voltem ao estado.
-    pub fn with_mapped_image_exports<R>(&self, body: impl FnOnce(&mut BTreeMap<String, Exports>) -> R) -> R {
-        body(&mut self.mapped_image_exports.lock())
     }
 
     /// Acesso aos módulos do loader do kernel; a trava não atravessa
@@ -165,7 +153,6 @@ pub fn create(process: u64, process_id: u64) -> Result<Arc<ProcessState>, Kernel
         directory_table_base: AtomicU64::new(process_address_space::SYSTEM_ROOT),
         image_path: SpinLock::new(String::new()),
         ldr: AtomicU64::new(0),
-        mapped_image_exports: SpinLock::new(BTreeMap::new()),
         threads: SpinLock::new(Vec::new()),
         started: AtomicBool::new(false),
         modules: SpinLock::new(BTreeMap::new()),

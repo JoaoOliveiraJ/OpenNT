@@ -145,6 +145,82 @@ pub fn access_check(descriptor: u64, subject_context: u64, desired: u32, previou
     decide(descriptor, subject_of_token(token), desired, previous, mapping, granted_out, status_out)
 }
 
+/// NtAccessCheck(SecurityDescriptor, ClientToken, DesiredAccess,
+/// GenericMapping, PrivilegeSet, PrivilegeSetLength*, GrantedAccess*,
+/// AccessStatus*) de UserMode, como o SeAccessCheckByType do ntoskrnl 19041
+/// sem lista de tipos: `token` é o token já referenciado pelo handle (com
+/// TOKEN_QUERY). Um handle de verdade precisa ser de um token de
+/// impersonação (STATUS_NO_IMPERSONATION_TOKEN) com nível
+/// SecurityIdentification ou mais (STATUS_BAD_IMPERSONATION_LEVEL); um
+/// pseudo-handle (`pseudo`, o token da thread ou o efetivo) não passa por
+/// essas duas recusas, como no SepReferenceTokenUsingPseudoHandle (o RPC
+/// confere a interface com o -5 depois de impersonar o cliente, cujo token
+/// pode ser o primário dele). O acesso pedido já vem mapeado
+/// (bits genéricos dão STATUS_GENERIC_NOT_MAPPED); o descritor precisa de
+/// dono e de grupo (STATUS_INVALID_SECURITY_DESCR); o PRIVILEGE_SET de saída
+/// precisa de pelo menos 20 bytes (STATUS_BUFFER_TOO_SMALL, com o tamanho
+/// pedido em PrivilegeSetLength) e sai sem privilégios usados. O resultado
+/// vai para GrantedAccess e AccessStatus, e o serviço devolve sucesso.
+#[allow(clippy::too_many_arguments)]
+pub fn check_by_token(descriptor: u64, token: u64, pseudo: bool, desired: u32, mapping: u64, privilege_set: u64, privilege_length: u64, granted_out: u64, status_out: u64) -> u32 {
+    const STATUS_NO_IMPERSONATION_TOKEN: u32 = 0xC000_005C;
+    const STATUS_INVALID_SECURITY_DESCR: u32 = 0xC000_0079;
+    const STATUS_GENERIC_NOT_MAPPED: u32 = 0xC000_0126;
+    const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
+    const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+    /// PRIVILEGE_SET com uma entrada (PrivilegeCount, Control e um
+    /// LUID_AND_ATTRIBUTES).
+    const PRIVILEGE_SET_SIZE: u32 = 20;
+    let Some((kind, level)) = tokens::with(token, |record| (record.kind, record.impersonation_level)) else { return STATUS_NO_IMPERSONATION_TOKEN };
+    if !pseudo && kind != 2 {
+        return STATUS_NO_IMPERSONATION_TOKEN;
+    }
+    if !pseudo && level < 1 {
+        return STATUS_BAD_IMPERSONATION_LEVEL;
+    }
+    if desired & 0xF000_0000 != 0 {
+        return STATUS_GENERIC_NOT_MAPPED;
+    }
+    let Ok(available) = guest::try_read::<u32>(privilege_length) else { return STATUS_ACCESS_VIOLATION };
+    if available < PRIVILEGE_SET_SIZE {
+        return if guest::try_write::<u32>(privilege_length, PRIVILEGE_SET_SIZE).is_ok() { STATUS_BUFFER_TOO_SMALL } else { STATUS_ACCESS_VIOLATION };
+    }
+    // SeCaptureSecurityDescriptor em UserMode: a cópia self-relative do
+    // kernel é validada e lida (o RtlValidSid do kernel recusa SIDs de
+    // usuário).
+    if descriptor == 0 {
+        return STATUS_INVALID_SECURITY_DESCR;
+    }
+    let captured_cell = guest::alloc_bytes(8);
+    let status = descriptor::capture_mode(descriptor, 1, captured_cell);
+    let captured = if status == 0 { guest::read64(captured_cell) } else { 0 };
+    guest::free_bytes(captured_cell);
+    if status != 0 {
+        return status;
+    }
+    let components = query_descriptor::read_descriptor(captured);
+    descriptor::release_captured(captured);
+    let Some(components) = components else { return STATUS_INVALID_SECURITY_DESCR };
+    if components.owner.is_none() || components.group.is_none() {
+        return STATUS_INVALID_SECURITY_DESCR;
+    }
+    let Some(subject) = subject_of_token(token) else { return STATUS_NO_IMPERSONATION_TOKEN };
+    let mut mapped = [0u32; 4];
+    for (index, entry) in mapped.iter_mut().enumerate() {
+        let Ok(value) = guest::try_read::<u32>(mapping + index as u64 * 4) else { return STATUS_ACCESS_VIOLATION };
+        *entry = value;
+    }
+    let (granted, status) = match access_evaluation::access_check(Some(&components), &subject, desired, 0, &mapped) {
+        Ok(granted) => (granted, 0),
+        Err(status) => (0, status),
+    };
+    let written = guest::try_write::<u32>(privilege_set, 0)
+        .and_then(|_| guest::try_write::<u32>(privilege_set + 4, 0))
+        .and_then(|_| guest::try_write::<u32>(granted_out, granted))
+        .and_then(|_| guest::try_write::<u32>(status_out, status));
+    if written.is_err() { STATUS_ACCESS_VIOLATION } else { 0 }
+}
+
 /// Os SIDs de um SID_AND_ATTRIBUTES_HASH (SidAttr com SidCount entradas).
 fn hash_entries(hash: u64) -> Vec<(Sid, u32)> {
     if hash == 0 {

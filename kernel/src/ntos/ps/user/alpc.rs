@@ -1241,6 +1241,39 @@ fn send_receive(handle: u64, flags: u64, input: u64, send_attributes: u64, rsp: 
     result
 }
 
+/// O envio adiado de um WORKER_FACTORY_DEFERRED_WORK (o AlpcpSendMessage do
+/// NtWaitForWorkViaWorkerFactory): a mensagem `input` na porta `handle`, com
+/// as flags dadas e sem atributos nem recepção. O RPC do servidor manda
+/// assim a resposta de um pedido antes de voltar a esperar trabalho.
+pub fn deferred_send(handle: u64, flags: u32, input: u64) -> Result<u32, KernelError> {
+    if crate::ntos::init::boot_config::TRACE_SYSCALLS {
+        if let Ok(bytes) = guest::try_read_bytes(input, 0x80) {
+            let hex: alloc::string::String = bytes.iter().map(|byte| alloc::format!("{byte:02x}")).collect();
+            crate::debug_print!("[alpc] envio adiado {:#x} flags {:#x}: {}", handle, flags, hex);
+        }
+    }
+    let mut reference = match port_reference::reference(handle, 1, 1)? {
+        Ok(reference) => reference,
+        Err(status) => return Ok(status),
+    };
+    let port = reference.port.clone();
+    let receive = ReceiveArguments { output: 0, length: 0, receive_attributes: 0, timeout: 0 };
+    let result = port.run(|| {
+        if port.kind == "alpc" && crate::ntos::alpc::server::owns(&port) {
+            return crate::ntos::alpc::server::exchange(&port, flags, input, receive);
+        }
+        if port.kind == "alpc" {
+            return Ok(match exchange_messages(&port, flags, input, 0, receive, 1)? {
+                Exchange::Status(status) => status,
+                Exchange::Wait(_) => return Err(KernelError::new("ALPC deferred send produced a kernel wait")),
+            });
+        }
+        Ok(0xC000_0008)
+    });
+    let _ = reference.release();
+    result
+}
+
 /// Transporte do export Zw e dos consumidores internos: oito argumentos
 /// exatos, resultado imediato ou continuação.
 fn begin_kernel_exchange(arguments: &[u64; 8]) -> Result<Box<dyn Pending>, KernelError> {

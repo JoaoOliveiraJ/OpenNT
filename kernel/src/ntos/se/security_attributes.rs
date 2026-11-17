@@ -197,6 +197,66 @@ fn layout_attributes(
     Ok(layout.size)
 }
 
+/// Um UNICODE_STRING do chamador (Length, MaximumLength e Buffer em +8),
+/// lido com sonda.
+fn capture_unicode(address: u64) -> Result<String, u32> {
+    let length = guest::try_read::<u16>(address).map_err(|_| 0xC000_0005u32)? as usize;
+    let buffer = guest::try_read::<u64>(address + 8).map_err(|_| 0xC000_0005u32)?;
+    if length % 2 != 0 || (length != 0 && buffer == 0) {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let bytes = guest::try_read_bytes(buffer, length).map_err(|_| 0xC000_0005u32)?;
+    let units: Vec<u16> = bytes.chunks_exact(2).map(|unit| u16::from_le_bytes([unit[0], unit[1]])).collect();
+    Ok(String::from_utf16_lossy(&units))
+}
+
+/// Captura um TOKEN_SECURITY_ATTRIBUTES_INFORMATION (versão 1: Version,
+/// AttributeCount e o vetor TOKEN_SECURITY_ATTRIBUTE_V1 de 40 bytes em +8),
+/// como o SepCaptureTokenSecurityAttributesInformation: nome, tipo, flags e
+/// os valores de cada atributo. Versão diferente de 1, tipo desconhecido ou
+/// atributo sem valores dão STATUS_INVALID_PARAMETER; uma página inacessível,
+/// STATUS_ACCESS_VIOLATION.
+pub fn capture_information(address: u64) -> Result<Vec<SecurityAttribute>, u32> {
+    let read16 = |at: u64| guest::try_read::<u16>(at).map_err(|_| 0xC000_0005u32);
+    let read32 = |at: u64| guest::try_read::<u32>(at).map_err(|_| 0xC000_0005u32);
+    let read64 = |at: u64| guest::try_read::<u64>(at).map_err(|_| 0xC000_0005u32);
+    if read16(address)? != 1 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let count = read32(address + 4)? as u64;
+    let array = read64(address + 8)?;
+    if count != 0 && array == 0 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let mut attributes = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        let entry = array + index * 40;
+        let name = capture_unicode(entry)?;
+        let kind = read16(entry + 16)?;
+        let flags = read32(entry + 20)?;
+        let value_count = read32(entry + 24)? as u64;
+        let values_address = read64(entry + 32)?;
+        if !SUPPORTED_TYPES.contains(&kind) || value_count == 0 || values_address == 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let mut values = Vec::with_capacity(value_count as usize);
+        for value in 0..value_count {
+            values.push(match kind {
+                1 | 2 | 6 => AttributeValue::Integer(read64(values_address + value * 8)?),
+                3 => AttributeValue::Text(capture_unicode(values_address + value * 16)?),
+                4 => AttributeValue::Fqbn { version: read64(values_address + value * 24)?, name: capture_unicode(values_address + value * 24 + 8)? },
+                _ => {
+                    let at = values_address + value * 16;
+                    let (pointer, length) = (read64(at)?, read32(at + 8)? as usize);
+                    AttributeValue::Bytes(if length == 0 { Vec::new() } else { guest::try_read_bytes(pointer, length).map_err(|_| 0xC000_0005u32)? })
+                }
+            });
+        }
+        attributes.push(SecurityAttribute { name, kind, flags, values });
+    }
+    Ok(attributes)
+}
+
 /// Tamanho sem produzir bytes; erros de contrato devolvem o NTSTATUS.
 pub fn measure(attributes: &[SecurityAttribute]) -> Result<u64, u32> {
     layout_attributes(attributes, 0, None, u64::MAX, !attributes.is_empty())

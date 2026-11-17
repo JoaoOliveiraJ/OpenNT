@@ -263,6 +263,12 @@ pub const KERNEL_DATA_POOL_BASE: u64 = 0xFFFF_F800_1000_0000;
 pub const KERNEL_DATA_POOL_TOP: u64 = 0xFFFF_F800_2000_0000;
 pub const KERNEL_POOL_BASE: u64 = 0xFFFF_A000_0000_0000;
 pub const KERNEL_POOL_TOP: u64 = 0xFFFF_A001_0000_0000;
+/// PTEs de sistema (`mm/system_ptes.rs`, o MiReserveSystemPtes): as VAs com
+/// que o MmMapLockedPagesSpecifyCache mostra no espaço de sistema as páginas
+/// travadas de um buffer de usuário. Começa 1 GB depois do pool, longe da
+/// VA do MmBadPointer (a primeira página depois do pool).
+pub const SYSTEM_PTE_BASE: u64 = 0xFFFF_A001_4000_0000;
+pub const SYSTEM_PTE_TOP: u64 = 0xFFFF_A001_8000_0000;
 pub const KERNEL_DUMP_VIRTUAL_BASE: u64 = 0xFFFF_A002_0000_0000;
 pub const KERNEL_CONTIGUOUS_BASE: u64 = 0xFFFF_A003_0000_0000;
 pub const KERNEL_CONTIGUOUS_TOP: u64 = 0xFFFF_A004_0000_0000;
@@ -286,6 +292,7 @@ pub const fn is_kernel_stack(address: u64) -> bool {
 }
 
 const _: () = assert!(KERNEL_VIRTUAL_ALLOC_TOP <= KERNEL_STACK_BASE && (KERNEL_STACK_BASE >> 39) & 511 == (KERNEL_POOL_BASE >> 39) & 511 && (KERNEL_STACK_TOP - 1) >> 39 == KERNEL_STACK_BASE >> 39);
+const _: () = assert!(SYSTEM_PTE_BASE > KERNEL_POOL_TOP + PAGE_SIZE && SYSTEM_PTE_TOP <= KERNEL_DUMP_VIRTUAL_BASE && SYSTEM_PTE_BASE % LARGE_PAGE_SIZE == 0);
 
 /// Primeira janela da metade supervisora: as tabelas reais (mapeamento
 /// recursivo), sem alocações comuns.

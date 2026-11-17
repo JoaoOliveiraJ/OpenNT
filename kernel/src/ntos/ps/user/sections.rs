@@ -135,6 +135,9 @@ pub struct SectionMut {
     pub cache_flags: u32,
     /// Nome publicado (o NtCreateSection publica depois de criar).
     pub name: Option<String>,
+    /// A control area de uma seção de imagem, montada na primeira vista de
+    /// usuário (`mm/section/image_segment.rs`).
+    pub image_segment: Option<Arc<crate::ntos::mm::section::image_segment::ImageSegment>>,
 }
 
 pub struct Section {
@@ -596,6 +599,9 @@ fn destroy_section(section: &Arc<Section>) -> Result<(), KernelError> {
             object_manager::unlink(&name);
         }
     }
+    // A seção solta a control area de imagem; as vistas vivas guardam a delas.
+    let segment = section.state.lock().image_segment.take();
+    drop(segment);
     let release_file = section.state.lock().release_file.take();
     if let Some(release_file) = release_file {
         release_file();
@@ -684,7 +690,7 @@ fn new_section(size: u64, maximum_size: u64, page_protect: u32, attributes: u32,
         no_execute,
         large,
         permanent,
-        state: SpinLock::new(SectionMut { area, area_released: false, views: Vec::new(), destroyed: false, node: None, release_file: None, partition: None, image_file_object: 0, mapped_base: 0, mapped_size: 0, cache_flags: 0, name }),
+        state: SpinLock::new(SectionMut { area, area_released: false, views: Vec::new(), destroyed: false, node: None, release_file: None, partition: None, image_file_object: 0, mapped_base: 0, mapped_size: 0, cache_flags: 0, name, image_segment: None }),
     })
 }
 

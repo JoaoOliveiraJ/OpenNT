@@ -27,7 +27,7 @@ fn captured<T: GuestScalar>(base: u64, offset: usize) -> Result<T, u32> {
 
 /// SECURITY_QUALITY_OF_SERVICE (alinhamento ULONG), capturado antes da
 /// resolução do handle. `Ok(None)` = sem QoS.
-fn capture_quality(attributes: u64, mode: u8) -> Result<Option<u32>, u32> {
+pub(super) fn capture_quality(attributes: u64, mode: u8) -> Result<Option<u32>, u32> {
     if attributes == 0 {
         return Ok(None);
     }
@@ -82,12 +82,12 @@ fn map_creation_acl(policy: &mut SecurityPolicy) {
     }
 }
 
-struct Creation {
-    flags: u32,
-    policy: SecurityPolicy,
+pub(super) struct Creation {
+    pub flags: u32,
+    pub policy: SecurityPolicy,
 }
 
-fn capture_creation(attributes: u64, mode: u8, subject: u64) -> Result<Creation, u32> {
+pub(super) fn capture_creation(attributes: u64, mode: u8, subject: u64) -> Result<Creation, u32> {
     let mut flags = 0;
     let mut security = 0;
     if attributes != 0 {

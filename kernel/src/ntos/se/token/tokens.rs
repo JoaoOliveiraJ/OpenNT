@@ -110,6 +110,9 @@ pub struct Token {
     pub exclusive_process: u64,
     /// OBJ_PERMANENT: referência de posse independente dos handles.
     pub permanent: bool,
+    /// TOKEN_SOURCE (SourceName e SourceIdentifier) de um token criado pelo
+    /// NtCreateToken; `None` nos tokens do contexto de boot.
+    pub source: Option<([u8; 8], u64)>,
 }
 
 struct Storage {
@@ -133,6 +136,12 @@ pub fn allocate_luid() -> u64 {
     let id = tokens.next_identifier;
     tokens.next_identifier += 1;
     id
+}
+
+/// O token mudou: ModifiedId novo, do contador de LUIDs.
+pub fn new_modified_id(pointer: u64) {
+    let modified = allocate_luid();
+    let _ = update(pointer, |record| record.modified_id = modified);
 }
 
 /// ZwAllocateLocallyUniqueId: grava em `output` um LUID novo do contador
@@ -318,6 +327,7 @@ pub fn create(parent: Option<u64>, initialize: Option<&dyn Fn(&mut Token)>) -> R
         // O SeMakeSystemToken fixa TOKEN_MANDATORY_POLICY_NO_WRITE_UP no
         // token do System; as cópias conservam a do pai.
         mandatory_policy: parent.as_ref().map_or(TOKEN_MANDATORY_POLICY_NO_WRITE_UP, |parent| parent.mandatory_policy),
+        source: parent.as_ref().and_then(|parent| parent.source),
     };
     // Identidades especiais definem seus campos antes do armazenamento dinâmico.
     if let Some(initialize) = initialize {

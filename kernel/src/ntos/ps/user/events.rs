@@ -178,7 +178,14 @@ fn modify(handle: u64, previous: u64, operation: fn(u64) -> u32) -> u32 {
 }
 
 fn nt_set_event(handle: u64, previous: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
-    Ok(modify(handle, previous, dispatcher::set_event))
+    let status = modify(handle, previous, dispatcher::set_event);
+    if status == 0 {
+        if let Ok(object) = reference(handle, 0) {
+            crate::ntos::init::initial_process::event_set(&object.name);
+            release(&object);
+        }
+    }
+    Ok(status)
 }
 
 fn nt_reset_event(handle: u64, previous: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {

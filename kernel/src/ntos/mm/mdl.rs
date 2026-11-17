@@ -19,6 +19,8 @@ use crate::rtl::SpinLock;
 const MDL_MAPPED_TO_SYSTEM_VA: i16 = 0x0001;
 const MDL_PAGES_LOCKED: i16 = 0x0002;
 const MDL_SOURCE_IS_NONPAGED_POOL: i16 = 0x0004;
+const MDL_PARTIAL: i16 = 0x0010;
+const MDL_PARTIAL_HAS_BEEN_MAPPED: i16 = 0x0020;
 
 fn mdl(descriptor: u64) -> &'static Mdl {
     // SAFETY: os exports recebem um PMDL válido do driver, como no NT.
@@ -56,19 +58,56 @@ pub fn system_address(descriptor: u64) -> u64 {
     mdl(descriptor).mapped_system_va.get()
 }
 
-/// MmMapLockedPagesSpecifyCache — identidade: StartVa + ByteOffset (ou o
-/// endereço pedido), gravado no MDL.
-pub fn map_locked_pages(descriptor: u64, requested_address: u64) -> u64 {
+/// MmMapLockedPagesSpecifyCache(Mdl, AccessMode, CacheType, RequestedAddress).
+///
+/// Em KernelMode, as páginas travadas de um buffer de usuário ganham VAs de
+/// sistema (`system_ptes`, o MiReserveSystemPtes do NT) sobre os PFNs do
+/// MDL: a VA de usuário só vale no processo dono, e um driver que completa o
+/// pedido no contexto de outro processo grava pela VA de sistema. Um buffer
+/// de kernel (pool, pilha de kernel) já está no espaço de sistema e é
+/// devolvido como está (StartVa + ByteOffset). Em UserMode, a VA de usuário
+/// do buffer (ou a pedida) no processo corrente.
+pub fn map_locked_pages(descriptor: u64, access_mode: u8, requested_address: u64) -> u64 {
     let descriptor = mdl(descriptor);
-    let mapped = if requested_address != 0 { requested_address } else { descriptor.start_va.get() + descriptor.byte_offset.get() as u64 };
-    descriptor.mapped_system_va.set(mapped);
-    set_flags(descriptor, MDL_MAPPED_TO_SYSTEM_VA, 0);
+    let flags = descriptor.mdl_flags.get();
+    if access_mode == 0 && flags & MDL_MAPPED_TO_SYSTEM_VA != 0 && super::system_ptes::contains(descriptor.mapped_system_va.get()) {
+        return descriptor.mapped_system_va.get();
+    }
+    let mapped = if access_mode == 0 && flags & MDL_SOURCE_IS_NONPAGED_POOL == 0 && user_buffer(descriptor) {
+        let (_, pages) = covered_pages(descriptor);
+        let frames: Vec<u64> = pfn_array(descriptor, pages).iter().map(|entry| entry.get() * 0x1000).collect();
+        let base = super::system_ptes::map_frames(&frames, 0);
+        if base == 0 {
+            return 0;
+        }
+        // Um MDL parcial com mapeamento próprio (não o herdado da origem).
+        if flags & MDL_PARTIAL != 0 {
+            set_flags(descriptor, MDL_PARTIAL_HAS_BEEN_MAPPED, 0);
+        }
+        base + descriptor.byte_offset.get() as u64
+    } else if access_mode != 0 && requested_address != 0 {
+        requested_address
+    } else {
+        descriptor.start_va.get() + descriptor.byte_offset.get() as u64
+    };
+    if access_mode == 0 {
+        descriptor.mapped_system_va.set(mapped);
+        set_flags(descriptor, MDL_MAPPED_TO_SYSTEM_VA, 0);
+    }
     mapped
 }
 
-/// MmUnmapLockedPages.
+/// MmUnmapLockedPages: as PTEs de sistema de um mapeamento em KernelMode
+/// voltam à janela. Um MDL parcial que herdou a VA da origem
+/// (IoBuildPartialMdl) não solta as PTEs dela.
 pub fn unmap_locked_pages(descriptor: u64) {
-    set_flags(mdl(descriptor), 0, MDL_MAPPED_TO_SYSTEM_VA);
+    let header = mdl(descriptor);
+    let flags = header.mdl_flags.get();
+    let inherited = flags & MDL_PARTIAL != 0 && flags & MDL_PARTIAL_HAS_BEEN_MAPPED == 0;
+    if flags & MDL_MAPPED_TO_SYSTEM_VA != 0 && !inherited && super::system_ptes::contains(header.mapped_system_va.get()) {
+        super::system_ptes::unmap(header.mapped_system_va.get());
+    }
+    set_flags(header, 0, MDL_MAPPED_TO_SYSTEM_VA | MDL_PARTIAL_HAS_BEEN_MAPPED);
 }
 
 /// As páginas cobertas pelo buffer do MDL: (primeira VA, quantidade).
@@ -105,8 +144,11 @@ pub fn probe_and_lock_pages(descriptor: u64) {
     set_flags(descriptor, MDL_PAGES_LOCKED, 0);
 }
 
-/// MmUnlockPages.
+/// MmUnlockPages: como no NT, um mapeamento de sistema do MDL sai antes.
 pub fn unlock_pages(descriptor: u64) {
+    if mdl(descriptor).mdl_flags.get() & MDL_MAPPED_TO_SYSTEM_VA != 0 && super::system_ptes::contains(mdl(descriptor).mapped_system_va.get()) {
+        unmap_locked_pages(descriptor);
+    }
     let descriptor = mdl(descriptor);
     if descriptor.mdl_flags.get() & MDL_PAGES_LOCKED != 0 && user_buffer(descriptor) {
         let (_, pages) = covered_pages(descriptor);

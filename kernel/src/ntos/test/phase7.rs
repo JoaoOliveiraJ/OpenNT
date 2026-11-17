@@ -2665,6 +2665,163 @@ fn user_tokens(assert: Assert) {
     }
 }
 
+/// NtCreateTokenEx de modo usuário, como o LsapCreateTokenEx do lsasrv: num
+/// processo de teste com o SeCreateTokenPrivilege habilitado, um token
+/// primário da sessão de logon que o Reference Monitor conhece, com usuário,
+/// grupos (um obrigatório e o rótulo de integridade System), um privilégio,
+/// grupo primário e origem; e as recusas do NtCreateTokenEx 19041.
+fn user_create_token(assert: Assert) {
+    use crate::ntos::ps::user::memory;
+    use crate::ntos::se::logon_session;
+    let ran = with_test_process("lsa-teste.exe", None, |_| {
+        let Ok(block) = memory::map_user_region(0x3000) else {
+            assert(false, "usercreatetoken: memoria de usuario");
+            return;
+        };
+        let (out, returned, buffer, data, rsp) = (block, block + 0x10, block + 0x100, block + 0x800, block + 0x2000);
+        let call = |name: &str, a1: u64, a2: u64, a3: u64, a4: u64| state::handler(name).map(|handler| handler(a1, a2, a3, a4, rsp).unwrap_or(1)).unwrap_or(1);
+        let logon = crate::ntos::se::token::tokens::allocate_luid();
+        let session = logon_session::create_track(logon);
+        // Os SIDs: o usuário S-1-5-21-1-2-3-1001, Everyone e o rótulo System.
+        let (user, everyone, label) = (data, data + 0x40, data + 0x60);
+        guest::write_bytes(user, &[1, 5, 0, 0, 0, 0, 0, 5, 21, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 0xE9, 3, 0, 0]);
+        guest::write_bytes(everyone, &[1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0]);
+        guest::write_bytes(label, &[1, 1, 0, 0, 0, 0, 0, 16, 0, 0x40, 0, 0]);
+        let (luid, expiration, token_user, groups, privileges, primary, source) = (data + 0x100, data + 0x108, data + 0x110, data + 0x120, data + 0x160, data + 0x180, data + 0x190);
+        guest::write64(luid, logon);
+        guest::write64(expiration, i64::MAX as u64);
+        guest::write64(token_user, user);
+        guest::write32(token_user + 8, 0);
+        guest::write32(groups, 2);
+        guest::write64(groups + 8, everyone);
+        guest::write32(groups + 16, 1);
+        guest::write64(groups + 24, label);
+        guest::write32(groups + 32, 0x60);
+        guest::write32(privileges, 1);
+        guest::write64(privileges + 4, 23);
+        guest::write32(privileges + 12, 3);
+        guest::write64(primary, user);
+        guest::write_bytes(source, b"User32  ");
+        guest::write64(source + 8, 0x1234);
+        let create = |token_type: u64, luid: u64| {
+            for (index, value) in [luid, expiration, token_user, groups, privileges, 0, 0, 0, 0, 0, primary, 0, source].into_iter().enumerate() {
+                guest::write64(rsp + 0x28 + index as u64 * 8, value);
+            }
+            call("NtCreateTokenEx", out, 0xF_01FF, 0, token_type)
+        };
+        let unprivileged = create(1, luid);
+        // SeCreateTokenPrivilege (2) habilitado no token do processo de teste.
+        let _ = call("NtOpenProcessToken", u64::MAX, 0x28, out + 8, 0);
+        let own = guest::read64(out + 8);
+        guest::write32(buffer, 1);
+        guest::write64(buffer + 4, 2);
+        guest::write32(buffer + 12, 2);
+        for (index, value) in [0u64, 0].into_iter().enumerate() {
+            guest::write64(rsp + 0x28 + index as u64 * 8, value);
+        }
+        let adjusted = call("NtAdjustPrivilegesToken", own, 0, buffer, 16);
+        let created = create(1, luid);
+        let token = guest::read64(out);
+        let query = |class: u64, length: u64| {
+            guest::write64(rsp + 0x28, returned);
+            call("NtQueryInformationToken", token, class, buffer, length)
+        };
+        let source_ok = query(7, 16) == 0 && guest::read_bytes(buffer, 8) == b"User32  " && guest::read64(buffer + 8) == 0x1234;
+        let user_ok = query(1, 0x100) == 0 && guest::read_bytes(guest::read64(buffer), 28) == guest::read_bytes(user, 28);
+        let label_ok = query(25, 0x100) == 0 && guest::read_bytes(guest::read64(buffer), 12) == guest::read_bytes(label, 12);
+        let groups_ok = query(2, 0x200) == 0 && guest::read32(buffer) == 1 && guest::read32(buffer + 16) == 7;
+        let session_ok = query(12, 4) == 0 && guest::read32(buffer) == 0;
+        assert(unprivileged == 0xC000_0061 && adjusted == 0 && created == 0 && state::get_user_handle(token).is_some_and(|entry| entry.kind() == "token"), "usercreatetoken: SeCreateTokenPrivilege exigido e token criado");
+        assert(source_ok && user_ok && label_ok && groups_ok && session_ok, "usercreatetoken: origem, usuario, rotulo de integridade, grupo obrigatorio habilitado e sessao 0");
+        // NtSetInformationToken, como o ScAdjustTokenDefaultDacl e o
+        // ScmSetHostIdInToken do services.exe: DACL padrão nula, dono fora
+        // dos grupos de dono recusado, grupo primário trocado, um atributo de
+        // segurança acrescentado (ADD) e repetido (colisão), classe recusada.
+        let set = |class: u64, information: u64, length: u64| call("NtSetInformationToken", token, class, information, length);
+        guest::write64(data + 0x200, 0);
+        let dacl_cleared = set(6, data + 0x200, 8) == 0 && query(6, 0x40) == 0 && guest::read64(buffer) == 0;
+        guest::write64(data + 0x208, everyone);
+        let owner_refused = set(4, data + 0x208, 8) == 0xC000_005A && set(4, data + 0x208, 4) == 0xC000_0004;
+        let group_changed = set(5, data + 0x208, 8) == 0 && query(5, 0x40) == 0 && guest::read_bytes(guest::read64(buffer), 12) == guest::read_bytes(everyone, 12);
+        // TOKEN_SECURITY_ATTRIBUTES_INFORMATION com um UINT64 "TSA://ProcUnique".
+        let (info, attribute, value, name, operations, pair) = (data + 0x300, data + 0x320, data + 0x350, data + 0x360, data + 0x3A0, data + 0x3B0);
+        state::write_user_wide(name, "TSA://ProcUnique");
+        guest::write16(info, 1);
+        guest::write32(info + 4, 1);
+        guest::write64(info + 8, attribute);
+        state::write_unicode_string(attribute, name, "TSA://ProcUnique");
+        guest::write16(attribute + 16, 2);
+        guest::write32(attribute + 20, 0x21);
+        guest::write32(attribute + 24, 1);
+        guest::write64(attribute + 32, value);
+        guest::write64(value, 0x77);
+        guest::write32(operations, 2);
+        guest::write64(pair, info);
+        guest::write64(pair + 8, operations);
+        let added = set(39, pair, 16) == 0 && crate::ntos::se::token::tokens::any(|record| record.authentication_id == logon && record.security_attributes.iter().any(|attribute| attribute.name == "TSA://ProcUnique" && attribute.kind == 2));
+        let collision = set(39, pair, 16) == 0xC000_0035;
+        let refused = set(99, buffer, 4) == 0xC000_0003 && set(7, buffer, 16) == 0xC000_0003;
+        assert(dacl_cleared && owner_refused && group_changed && added && collision && refused, "usercreatetoken: NtSetInformationToken troca DACL padrao, grupo primario e atributos de seguranca e recusa dono e classe invalidos");
+        // NtAccessCheck, como o EnforceInterfaceSecurityDescriptor do RPC:
+        // um token primário é recusado; o de impersonação (SecurityImpersonation,
+        // pelo QoS) recebe o acesso da DACL de um descritor autorrelativo
+        // (dono e grupo o usuário, Everyone com 0x3; o dono soma READ_CONTROL e
+        // WRITE_DAC).
+        let (descriptor, mapping, privilege_set, privilege_length, granted, status_out) = (data + 0x400, data + 0x500, data + 0x520, data + 0x560, data + 0x568, data + 0x56C);
+        let mut sd = alloc::vec![1u8, 0, 0x04, 0x80, 20, 0, 0, 0, 48, 0, 0, 0, 0, 0, 0, 0, 76, 0, 0, 0];
+        sd.extend_from_slice(&guest::read_bytes(user, 28));
+        sd.extend_from_slice(&guest::read_bytes(user, 28));
+        sd.extend_from_slice(&[2, 0, 28, 0, 1, 0, 0, 0, 0, 0, 20, 0, 3, 0, 0, 0]);
+        sd.extend_from_slice(&guest::read_bytes(everyone, 12));
+        guest::write_bytes(descriptor, &sd);
+        for (index, value) in [0x1u32, 0x2, 0x4, 0x7].into_iter().enumerate() {
+            guest::write32(mapping + index as u64 * 4, value);
+        }
+        let check = |client: u64, desired: u64, length: u32| {
+            guest::write32(privilege_length, length);
+            for (index, value) in [privilege_set, privilege_length, granted, status_out].into_iter().enumerate() {
+                guest::write64(rsp + 0x28 + index as u64 * 8, value);
+            }
+            call("NtAccessCheck", descriptor, client, desired, mapping)
+        };
+        // Um handle de token primário é recusado; o pseudo-handle do token do
+        // processo (-4) não passa por essa recusa (o SYSTEM não é o dono).
+        let primary_refused = check(token, 0x200_0000, 0x40) == 0xC000_005C;
+        let pseudo_accepted = check((-4i64) as u64, 0x200_0000, 0x40) == 0 && guest::read32(granted) == 3 && guest::read32(status_out) == 0;
+        let _ = call("NtClose", token, 0, 0, 0);
+        let (attributes, quality) = (data + 0x600, data + 0x640);
+        guest::write32(quality, 12);
+        guest::write32(quality + 4, 2);
+        guest::write8(quality + 8, 0);
+        guest::write8(quality + 9, 0);
+        set_object_attributes(unsafe { nt::ObjectAttributes::at(attributes) }, nt::ObjectAttributes::SIZE as u32, 0, 0, 0);
+        unsafe { nt::ObjectAttributes::at(attributes) }.security_quality_of_service.set(quality);
+        for (index, value) in [luid, expiration, token_user, groups, privileges, 0, 0, 0, 0, 0, primary, 0, source].into_iter().enumerate() {
+            guest::write64(rsp + 0x28 + index as u64 * 8, value);
+        }
+        let impersonation_created = call("NtCreateTokenEx", out, 0xF_01FF, attributes, 2) == 0;
+        let impersonation = guest::read64(out);
+        let maximum = check(impersonation, 0x200_0000, 0x40) == 0 && guest::read32(granted) == 0x6_0003 && guest::read32(status_out) == 0 && guest::read32(privilege_set) == 0;
+        let denied = check(impersonation, 0x4, 0x40) == 0 && guest::read32(granted) == 0 && guest::read32(status_out) == 0xC000_0022;
+        let small = check(impersonation, 0x1, 4) == 0xC000_0023 && guest::read32(privilege_length) == 20;
+        let generic = check(impersonation, 0x8000_0000, 0x40) == 0xC000_0126;
+        let _ = call("NtClose", impersonation, 0, 0, 0);
+        assert(primary_refused && pseudo_accepted && impersonation_created && maximum && denied && small && generic, "usercreatetoken: NtAccessCheck com token de impersonacao, DACL, PRIVILEGE_SET e recusas");
+        // Recusas: tipo 3, sessão de logon desconhecida e impersonação sem QoS.
+        guest::write64(data + 0x1F0, logon + 0x10_0000);
+        let bad_type = create(3, luid);
+        let no_session = create(1, data + 0x1F0);
+        let no_quality = create(2, luid);
+        assert(bad_type == 0xC000_00A8 && no_session == 0xC000_005F && no_quality == 0xC000_00A5, "usercreatetoken: tipo, sessao de logon e nivel de impersonacao recusados");
+        let _ = call("NtClose", own, 0, 0, 0);
+        assert(session == 0 && logon_session::delete_track(logon) == 0, "usercreatetoken: a sessao de logon sai depois do ultimo token");
+        if let Some(region) = memory::find_region(block) {
+            memory::release_private_region(&region);
+        }
+    });
+    assert(ran.is_some(), "usercreatetoken: processo de teste");
+}
+
 fn user_query_object(assert: Assert) {
     use crate::ntos::ob::query_object;
     use crate::ntos::ps::user::memory;
@@ -4383,16 +4540,25 @@ fn section_image_views(assert: Assert) {
     use crate::ntos::mm::{memory_map, paging};
     use crate::ntos::ps::process;
     use crate::ntos::ps::user::sections;
-    use crate::ntos::ps::user::state::RegionKind;
-    // Base preferida acima de 4 GB, alinhada a 64 KB.
+    use crate::ntos::ps::user::state::{RegionKind, UserRegion};
+    // Base preferida acima de 4 GB, alinhada a 64 KB. Além do código em
+    // 0x1000, uma seção de dados gravável em 0x2000 (IMAGE_SCN_MEM_WRITE).
     let preferred = 0x6_5432_0000u64;
     let mut bytes = minimal_image();
     bytes[0x70..0x78].copy_from_slice(&preferred.to_le_bytes());
+    bytes[0x46..0x48].copy_from_slice(&2u16.to_le_bytes());
+    bytes[0x40 + 80..0x40 + 84].copy_from_slice(&0x3000u32.to_le_bytes());
+    let data = 0x40 + 24 + 0xF0 + 40;
+    bytes[data + 8..data + 12].copy_from_slice(&0x100u32.to_le_bytes());
+    bytes[data + 12..data + 16].copy_from_slice(&0x2000u32.to_le_bytes());
+    bytes[data + 16..data + 20].copy_from_slice(&0x200u32.to_le_bytes());
+    bytes[data + 20..data + 24].copy_from_slice(&0x200u32.to_le_bytes());
+    bytes[data + 36..data + 40].copy_from_slice(&0xC000_0040u32.to_le_bytes());
     let Ok(Ok(section)) = sections::create_image(MemoryFile::new(None, bytes), None, 0x80, false) else {
         assert(false, "imageview: secao de imagem criada");
         return;
     };
-    let request = Request { base: 0, size: 0x2000, offset: 0, upper: memory_map::USER_ADDRESS_LIMIT - 1, alignment: 0x10000, protect: 0x80, allocation: 0, inherit: 2, commit: 0, preferred_node_plus_one: 0 };
+    let request = Request { base: 0, size: 0x3000, offset: 0, upper: memory_map::USER_ADDRESS_LIMIT - 1, alignment: 0x10000, protect: 0x80, allocation: 0, inherit: 2, commit: 0, preferred_node_plus_one: 0 };
     let owner = process::get_current_process();
     let Ok(Ok(first)) = section_image_view::map(&section, &request, owner, RegionKind::ProcessImages) else {
         assert(false, "imageview: primeira vista");
@@ -4401,21 +4567,31 @@ fn section_image_views(assert: Assert) {
     let code = paging::translate(first.view.base + 0x1000);
     let images = || crate::ntos::ps::user::memory::Space::of(owner).images();
     let listed = images().iter().any(|region| region.base() == first.view.base && region.name().as_deref() == Some("\\Device\\HarddiskVolume1\\opennt-secao.bin") && region.allocation_protect() == 0x80);
-    // Os exports da imagem ficam no estado do processo dono da vista.
-    let exports = crate::ntos::ps::user::process_state::get(owner).is_some_and(|identity| identity.with_mapped_image_exports(|mapped| mapped.contains_key("opennt-secao.bin")));
-    assert(first.view.base == preferred && first.status == 0 && code != 0 && physical::read8(code) == 0xC3 && listed && exports, "imageview: imagem inteira na base preferida, listada e com exports publicados");
+    // A página de código é o frame protótipo da control area, somente
+    // leitura e executável; a de dados é uma cópia privada gravável.
+    let segment = first.view.segment.clone();
+    let first_data = paging::translate(first.view.base + 0x2000);
+    let protections = (first.view.page_protect(1), first.view.page_protect(2));
+    assert(first.view.base == preferred && first.status == 0 && code == segment.frames[1] && physical::read8(code) == 0xC3 && listed && first_data != 0 && first_data != segment.frames[2] && physical::read8(first_data) == 0xC3 && protections == (Some(0x20), Some(4)) && paging::access_flags(first.view.base + 0x1000) & paging::PAGE_RW == 0 && paging::access_flags(first.view.base + 0x2000) & paging::PAGE_RW != 0, "imageview: imagem na base preferida e listada, codigo no frame prototipo e dados numa copia privada");
     // A base preferida ocupada: a vista vai para outro endereço e o status
-    // informa STATUS_IMAGE_NOT_AT_BASE.
+    // informa STATUS_IMAGE_NOT_AT_BASE. O código é o mesmo frame protótipo
+    // (a control area é a mesma); os dados, outra cópia privada.
     let Ok(Ok(second)) = section_image_view::map(&section, &request, owner, RegionKind::ProcessImages) else {
         assert(false, "imageview: segunda vista");
         return;
     };
-    let relocated = paging::translate(second.view.base + 0x1000);
-    assert(second.view.base != preferred && second.view.base % 0x10000 == 0 && second.status == 0x4000_0003 && relocated != 0 && physical::read8(relocated) == 0xC3, "imageview: segunda vista realocada com STATUS_IMAGE_NOT_AT_BASE");
+    let shared = paging::translate(second.view.base + 0x1000);
+    let second_data = paging::translate(second.view.base + 0x2000);
+    assert(second.view.base != preferred && second.view.base % 0x10000 == 0 && second.status == 0x4000_0003 && shared == code && second_data != first_data && second_data != 0 && physical::read8(second_data) == 0xC3 && alloc::sync::Arc::ptr_eq(&second.view.segment, &segment), "imageview: segunda vista realocada, com o codigo compartilhado e os dados privados");
+    // A página de código que fica gravável ganha a cópia privada antes (o
+    // PAGE_WRITECOPY resolvido); a segunda vez a página já é da vista.
+    let copied = second.view.write_copy(1);
+    let copy_ok = matches!(copied, Some(Ok(frame)) if frame != code && physical::read8(frame) == 0xC3 && second.view.frame(1) == Some(frame)) && second.view.write_copy(1).is_none() && first.view.frame(1) == Some(code);
+    assert(copy_ok, "imageview: pagina compartilhada tornada gravavel recebe copia privada");
     // Vista parcial (só a página de código), sem lista do processo.
     let partial = section_image_view::map(&section, &Request { offset: 0x1000, size: 0x1000, ..request }, owner, RegionKind::Detached);
     let partial_ok = match &partial {
-        Ok(Ok(view)) => view.offset == 0x1000 && view.view.size == 0x1000 && paging::translate(view.view.base) != 0 && physical::read8(paging::translate(view.view.base)) == 0xC3,
+        Ok(Ok(view)) => view.offset == 0x1000 && view.view.size == 0x1000 && paging::translate(view.view.base) == code,
         _ => false,
     };
     assert(partial_ok, "imageview: vista parcial mapeia so a pagina pedida");
@@ -4424,12 +4600,14 @@ fn section_image_views(assert: Assert) {
     if let Ok(Ok(view)) = partial {
         released &= section_views::unmap(&OwnedView::Image(view.view)).is_ok();
     }
-    if let Some(identity) = crate::ntos::ps::user::process_state::get(owner) {
-        identity.with_mapped_image_exports(|mapped| mapped.remove("opennt-secao.bin"));
-    }
     let unlisted = !images().iter().any(|region| region.base() == first.view.base || region.base() == second.view.base);
+    // As páginas da imagem são frames do PFN, nunca do heap do kernel.
+    let outside_heap = segment.frames.iter().all(|&frame| frame != 0 && !(memory_map::KERNEL_HEAP_PHYS_BASE..memory_map::KERNEL_HEAP_PHYS_TOP).contains(&frame));
+    let weak = alloc::sync::Arc::downgrade(&segment);
+    drop((first, second, segment));
     drop(section);
-    assert(released && unlisted && sections::by_pointer(pointer).is_none(), "imageview: vistas soltas e secao destruida na ultima");
+    // A última referência devolve a control area.
+    assert(released && unlisted && outside_heap && sections::by_pointer(pointer).is_none() && weak.upgrade().is_none(), "imageview: vistas soltas, secao e control area destruidas na ultima referencia");
 }
 
 fn memory_partition(assert: Assert) {
@@ -5166,6 +5344,7 @@ pub fn run(assert: Assert) {
     user_ring3(assert);
     user_address_floor(assert);
     user_tokens(assert);
+    user_create_token(assert);
     user_query_object(assert);
     user_remove_completion(assert);
     user_alpc_foundation(assert);

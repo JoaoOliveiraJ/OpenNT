@@ -294,11 +294,46 @@ pub struct LoadOptions {
     /// Imagem de sessão (MM_LOAD_IMAGE_IN_SESSION): VA de sessão, frames
     /// mestres, mapeada na sessão corrente por `mm::session_image`.
     pub session: bool,
+    /// Com `user_space`: só as páginas protótipo da control area de uma
+    /// seção de imagem (`mm/section/image_segment.rs`), na ImageBase do
+    /// cabeçalho, sem VA, sem mapeamento em raiz alguma e sem a tabela de
+    /// exports; as vistas mapeiam esses frames.
+    pub prototype: bool,
 }
 
 impl Default for LoadOptions {
     fn default() -> Self {
-        Self { user_space: false, skip_imports: false, user_view: None, no_execute: false, skip_relocations: false, skip_security_cookie: false, image_name: None, notify_image: true, session: false }
+        Self { user_space: false, skip_imports: false, user_view: None, no_execute: false, skip_relocations: false, skip_security_cookie: false, image_name: None, notify_image: true, session: false, prototype: false }
+    }
+}
+
+/// A proteção Win32 de cada página de uma imagem de usuário pelas
+/// características das seções que a cobrem (os cabeçalhos são legíveis):
+/// PAGE_NOACCESS fora de toda seção, PAGE_READONLY/READWRITE e as variantes
+/// EXECUTE. Sem execução (SEC_IMAGE_NO_EXECUTE), tudo é PAGE_READONLY.
+fn user_page_protection(page: u64, size_of_headers: u64, sections: &[SectionInfo], no_execute: bool) -> u32 {
+    if no_execute {
+        return 2;
+    }
+    let mut characteristics = if page < size_of_headers { 0x4000_0000u32 } else { 0 };
+    for section in sections {
+        let start = section.va as u64;
+        let length = section.virtual_size.max(section.raw_size) as u64;
+        if page < start + length && page + 4096 > start {
+            characteristics |= section.characteristics;
+        }
+    }
+    let present = characteristics & 0xE000_0000 != 0;
+    let writable = characteristics & 0x8000_0000 != 0;
+    let nx = characteristics & 0x2000_0000 == 0;
+    if !present {
+        1
+    } else if nx {
+        if writable { 4 } else { 2 }
+    } else if writable {
+        0x40
+    } else {
+        0x20
     }
 }
 
@@ -592,7 +627,8 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
     }
     let user_space = options.user_space;
     let session = options.session && !user_space;
-    let user_view = if user_space { options.user_view } else { None };
+    let prototype = options.prototype && user_space;
+    let user_view = if user_space && !prototype { options.user_view } else { None };
     let (view_offset, view_size) = user_view.map_or((0, size_of_image), |view| (view.offset, view.size));
     if let Some(view) = user_view {
         if view.base % memory_map::ALLOCATION_GRANULARITY != 0 || !memory_map::is_user_range(view.base, view_size) || view_offset % 4096 != 0 || view_size % 4096 != 0 || view_offset + view_size > size_of_image {
@@ -602,8 +638,8 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
     // Uma imagem de usuário é do processo corrente, na raiz carregada. A
     // escolha da VA sem vista vê tudo o que já ocupa o espaço dele (lido
     // antes da trava das faixas de imagem).
-    let user_root = if user_space { paging::current_root() } else { 0 };
-    let occupied_user = if user_space && user_view.is_none() { crate::ntos::ps::user::memory::occupied(crate::ntos::ps::user::memory::Space::current()) } else { Vec::new() };
+    let user_root = if user_space && !prototype { paging::current_root() } else { 0 };
+    let occupied_user = if user_space && !prototype && user_view.is_none() { crate::ntos::ps::user::memory::occupied(crate::ntos::ps::user::memory::Space::current()) } else { Vec::new() };
     if size_of_image == 0 || size_of_headers > size_of_image {
         return Err(KernelError::new("PE: SizeOfImage invalido"));
     }
@@ -613,7 +649,12 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
     let mut relocation_delta: i64 = 0;
     let image_name = options.image_name.clone().unwrap_or_else(|| source.name().to_string());
     let result = (|| -> Result<PeImage, KernelError> {
-        if user_space {
+        if prototype {
+            // As páginas protótipo ficam na ImageBase do cabeçalho; a ntdll
+            // de cada processo reloca a própria vista quando ela cai em outra
+            // base (STATUS_IMAGE_NOT_AT_BASE).
+            image_base = preferred_base;
+        } else if user_space {
             let mut arenas = ARENAS.lock();
             let target = match user_view {
                 Some(view) => {
@@ -719,33 +760,26 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
             }
         }
         let mut page_protects = Vec::new();
+        // As páginas protótipo não entram em raiz alguma: só a proteção de
+        // cada página, que as vistas aplicam.
+        if prototype {
+            page_protects = (0..size_of_image.div_ceil(0x1000)).map(|index| user_page_protection(index * 0x1000, size_of_headers, &sections, options.no_execute)).collect();
+        }
         // Mapeia a VA escolhida sobre os frames (PTEs de 4 KB; supervisor na
         // imagem de kernel). A imagem de sessão só entra na sessão depois de
         // pronta (`mm::session_image`).
-        if !session {
+        if !session && !prototype {
             let mut page = view_offset;
             while page < view_offset + view_size {
                 let backing = owned.frames[(page / 0x1000) as usize];
-                let (mut present, mut writable, mut nx) = (true, !options.no_execute, options.no_execute);
-                if user_view.is_some() && !options.no_execute {
-                    let mut characteristics = if page < size_of_headers { 0x4000_0000u32 } else { 0 };
-                    for section in &sections {
-                        let start = section.va as u64;
-                        let length = section.virtual_size.max(section.raw_size) as u64;
-                        if page < start + length && page + 4096 > start {
-                            characteristics |= section.characteristics;
-                        }
-                    }
-                    present = characteristics & 0xE000_0000 != 0;
-                    writable = characteristics & 0x8000_0000 != 0;
-                    nx = characteristics & 0x2000_0000 == 0;
-                }
+                let protect = if user_view.is_some() { user_page_protection(page, size_of_headers, &sections, options.no_execute) } else if options.no_execute { 2 } else { 0x40 };
+                let (present, writable, nx) = (protect != 1, matches!(protect, 4 | 0x40), !matches!(protect, 0x20 | 0x40));
                 let flags = (if present { paging::PAGE_PRESENT } else { 0 }) | (if writable { paging::PAGE_RW } else { 0 }) | (if user_space { paging::PAGE_USER } else { 0 });
                 let index = (page / 4096) as usize;
                 if page_protects.len() <= index {
                     page_protects.resize(index + 1, 0);
                 }
-                page_protects[index] = if !present { 1 } else if nx { if writable { 4 } else { 2 } } else if writable { 0x40 } else { 0x20 };
+                page_protects[index] = protect;
                 let mapped = if user_space { paging::map_page_in(user_root, image_base + page, backing, flags, paging::MapOptions { nx, ..Default::default() }) } else { paging::map_page(image_base + page, backing, flags, paging::MapOptions { nx, ..Default::default() }) };
                 if !mapped {
                     return Err(KernelError::new(alloc::format!("mapPage falhou p/ imagem em {image_base:#x}")));
@@ -853,7 +887,10 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
             }
             Ok(mapping.read_bytes(rva, length as usize))
         };
-        let exports = pe_exports::read_exports(&read_rva, image_base, size_of_image, export_rva, export_size)?;
+        // As páginas protótipo de uma seção de imagem não guardam a tabela de
+        // exports: a ntdll de cada processo resolve os imports pela imagem
+        // mapeada (`image_segment::exports` lê a tabela quando alguém pede).
+        let exports = if prototype { pe_exports::Exports::default() } else { pe_exports::read_exports(&read_rva, image_base, size_of_image, export_rva, export_size)? };
         // O bit consumido por ObRegisterCallbacks é uma decisão da CI, não
         // uma promessa do cabeçalho: contrato integral aceito no modo 2.
         let loader_flags = match code_integrity {

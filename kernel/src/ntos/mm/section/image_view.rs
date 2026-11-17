@@ -1,14 +1,15 @@
-//! Vista de seção de imagem pelo loader.
+//! Vista de seção de imagem (o MiMapViewOfImageSection).
 //!
-//! A imagem é preparada pelo loader de PE com a vista parcial pedida, sem
-//! imports nem relocações (a ntdll real faz o binding), anexado ao processo
-//! alvo: as páginas vão para a raiz dele, como no MiMapViewOfImageSection.
-//! A vista entra nas listas do processo e da seção e dispara a notificação
-//! de imagem.
+//! A vista mapeia, na raiz do processo alvo, as páginas da control area da
+//! imagem (`image_segment`: as páginas protótipo montadas uma vez por
+//! arquivo, sem imports nem relocações; a ntdll real faz o binding e reloca
+//! a vista que cai fora da ImageBase). A vista entra nas listas do processo
+//! e da seção e dispara a notificação de imagem.
 
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::AtomicBool;
 
 use crate::ntos::mm::section::map_view_parameters::View as Request;
 use crate::ntos::mm::memory_map;
@@ -22,8 +23,7 @@ use crate::ntos::ps::process_context;
 use crate::ntos::ps::user::sections::{Section, SectionFile};
 use crate::ntos::ps::user::state::{self, Region, RegionKind};
 use crate::rtl::{KernelError, SpinLock};
-use crate::ntos::mm::sysload::kernel_image_source::ImageSource;
-use crate::ntos::mm::pe_loader::{self, LoadOptions, UserView};
+use crate::ntos::mm::section::image_segment;
 
 /// Vista mapeada, o status (0 ou STATUS_IMAGE_NOT_AT_BASE) e o offset.
 pub struct Mapped {
@@ -32,28 +32,10 @@ pub struct Mapped {
     pub offset: u64,
 }
 
-/// O arquivo da seção como origem do loader e da notificação.
+/// O arquivo da seção como origem da notificação de imagem.
 struct SectionSource {
     name: String,
     file: Arc<dyn SectionFile>,
-}
-
-impl ImageSource for SectionSource {
-    fn name(&self) -> &str {
-        &self.name
-    }
-    fn size(&self) -> u64 {
-        self.file.size()
-    }
-    fn read_bytes(&self, offset: u64, length: u64) -> Result<Vec<u8>, KernelError> {
-        self.file.read_at(offset, length)
-    }
-    fn supports_copy_to_physical(&self) -> bool {
-        self.file.has_copy_to_physical()
-    }
-    fn copy_to_physical(&self, offset: u64, address: u64, length: u64) -> Option<Result<(), KernelError>> {
-        self.file.has_copy_to_physical().then(|| self.file.copy_to_physical(offset, address, length))
-    }
 }
 
 impl FileSource for SectionSource {
@@ -104,35 +86,31 @@ pub fn map(section: &Arc<Section>, request: &Request, process: u64, regions: Reg
     };
     let name = file.nt_path().or_else(|| section.name()).unwrap_or_default();
     let source = Arc::new(SectionSource { name: name.clone(), file: file.clone() });
-    let load = LoadOptions { user_space: true, skip_imports: true, skip_relocations: true, skip_security_cookie: true, notify_image: false, no_execute: section.no_execute, user_view: Some(UserView { base, offset, size }), ..LoadOptions::default() };
-    // O loader mapeia na raiz carregada: anexado ao alvo.
-    let loaded = process_context::with_process(process, || pe_loader::load_from_source(source.clone(), &load)).and_then(|loaded| loaded);
-    let image = match loaded {
-        Ok(image) => image,
-        Err(error) if error.status != crate::ntos::inc::status::STATUS_UNSUCCESSFUL => return Ok(Err(error.status)),
-        Err(error) => {
-            crate::debug_print!("[section-image] {}", error.message);
-            return Ok(Err(if error.message.contains("PFN") || error.message.contains("mapPage") { 0xC000_0017 } else { 0xC000_007B }));
-        }
+    // A control area da imagem (montada uma vez por arquivo) e a vista sobre
+    // ela, na raiz do processo alvo.
+    let segment = match image_segment::of_section(section, &name)? {
+        Ok(segment) => segment,
+        Err(status) => return Ok(Err(status)),
     };
-    let first = (offset / 4096) as usize;
-    let last = ((offset + size) / 4096) as usize;
-    let pages: Vec<u64> = image.pages.get(first..last.min(image.pages.len())).map_or_else(Vec::new, <[u64]>::to_vec);
-    let page_protects = image.page_protects.get(first..last.min(image.page_protects.len())).unwrap_or(&[]).iter().enumerate().map(|(index, &protect)| (index as u64, protect)).collect();
-    let exports = image.exports.exports.clone();
-    let (image_base, preferred_base, size_of_image) = (image.image_base, image.preferred_base, image.size_of_image);
+    if offset % 4096 != 0 || size % 4096 != 0 || offset.checked_add(size).is_none_or(|end| end > segment.size_of_image) {
+        return Ok(Err(0xC000_007B));
+    }
+    let pages = match image_segment::map_view(&segment, root, base, offset, size) {
+        Ok(pages) => pages,
+        Err(status) => return Ok(Err(status)),
+    };
+    let (image_base, preferred_base, size_of_image) = (base - offset, segment.preferred_base, segment.size_of_image);
     let view = Arc::new(ImageView {
         base,
         size,
         section: Some(section.clone()),
-        image: SpinLock::new(Some(image)),
-        pages,
+        segment: segment.clone(),
+        pages: SpinLock::new(pages),
         regions: SpinLock::new(Some(regions)),
-        page_protects: SpinLock::new(page_protects),
-        protected_frames: SpinLock::new(alloc::collections::BTreeMap::new()),
         name: Some(name.clone()),
         allocation_protect: if section.no_execute { 2 } else { request.protect },
         root,
+        unmapped: AtomicBool::new(false),
     });
     let owned = OwnedView::Image(view.clone());
     section.state.lock().views.push(owned.clone());
@@ -144,12 +122,13 @@ pub fn map(section: &Arc<Section>, request: &Request, process: u64, regions: Reg
     let finish = || -> Result<(), KernelError> {
         let dll_name = file.base_name().unwrap_or_else(|| String::from(&name[name.rfind(['\\', '/']).map_or(0, |at| at + 1)..]));
         if offset == 0 && size == section.size && regions == RegionKind::ProcessImages {
-            if let Some(owner) = crate::ntos::ps::user::process_state::get(process) {
-                owner.with_mapped_image_exports(|mapped| mapped.insert(dll_name.to_ascii_lowercase(), exports.clone()));
-            }
-            if state::with(|state| !state.capture_export.is_empty()) {
-                crate::ntos::ps::user::call_capture::arm(&dll_name, &exports);
-            }
+            crate::ntos::init::initial_process::image_mapped(process, &dll_name);
+        }
+        // A captura de chamada de teste (`call_capture`) lê os exports das
+        // páginas protótipo só quando está armada.
+        if offset == 0 && size == section.size && regions == RegionKind::ProcessImages && state::with(|state| !state.capture_export.is_empty()) {
+            let exports = image_segment::exports(&segment, image_base)?;
+            crate::ntos::ps::user::call_capture::arm(&dll_name, &exports.exports);
         }
         if !section.no_execute {
             let file_object = section.state.lock().image_file_object;

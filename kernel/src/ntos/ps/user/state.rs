@@ -120,6 +120,12 @@ pub trait UserRegion: Send + Sync {
     fn record_protect(&self, _index: u64, _protect: u32, _physical: u64) -> bool {
         false
     }
+    /// A cópia privada de uma página compartilhada que vai ficar gravável
+    /// (uma página protótipo de vista de imagem, o PAGE_WRITECOPY do NT):
+    /// `None` = a página já é da região; `Some(Err(status))` = sem memória.
+    fn write_copy(&self, _index: u64) -> Option<Result<u64, u32>> {
+        None
+    }
 }
 
 pub type Region = Arc<dyn UserRegion>;

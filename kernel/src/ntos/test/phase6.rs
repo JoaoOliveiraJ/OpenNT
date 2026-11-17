@@ -2166,6 +2166,35 @@ fn ntoskrnl_mm_group(assert: Assert) {
     assert(call_export("MmBuildMdlForNonPagedPool", &[descriptor]) == Some(0) && mdl_pfn(descriptor, 0) == paging::translate(buffer) >> 12 && mdl_pfn(descriptor, 1) == paging::translate(buffer + 0x1000) >> 12 && mdl_header.mdl_flags.get() & 6 == 4 && mdl_header.mapped_system_va.get() == mdl_header.start_va.get() + mdl_header.byte_offset.get() as u64, "mm: MmBuildMdlForNonPagedPool com PFNs reais, MappedSystemVa do pool e sem MDL_PAGES_LOCKED");
     assert(call_export("MmMapLockedPagesSpecifyCache", &[descriptor, 0, 1, 0, 0, 16]) == Some(buffer + 0x10) && mdl_header.mdl_flags.get() & 1 == 1 && call_export("MmUnmapLockedPages", &[buffer + 0x10, descriptor]) == Some(0) && mdl_header.mdl_flags.get() & 1 == 0, "mm: mapeamento do MDL marcado e desfeito");
     assert(call_export("MmGetPhysicalAddress", &[buffer]) == Some(paging::translate(buffer)) && call_export("MmMapLockedPagesWithReservedMapping", &[buffer, 0, descriptor, 1]) == Some(0), "mm: endereco fisico e VA nao reservada recusada");
+    // MDL de um buffer de usuário travado: em KernelMode o
+    // MmMapLockedPagesSpecifyCache dá VAs de sistema (PTEs de sistema) sobre
+    // os PFNs do MDL, válidas em qualquer processo; o MmUnlockPages desfaz o
+    // mapeamento. Em UserMode, a VA de usuário do buffer.
+    if let Ok(user) = crate::ntos::ps::user::memory::map_user_region(0x2000) {
+        use crate::ntos::mm::memory_map::{SYSTEM_PTE_BASE, SYSTEM_PTE_TOP};
+        guest::write64(user + 0x10, 0x5EC7_10A5_0001_2345);
+        guest::write64(user + 0x1008, 0x5EC7_10A5_0006_7890);
+        let locked = call_export("IoAllocateMdl", &[user + 0x10, 0x1800, 0, 0, 0]).unwrap_or(0);
+        let probed = locked != 0 && call_export("MmProbeAndLockPages", &[locked, 0, 1]) == Some(0);
+        let mapped = if probed { call_export("MmMapLockedPagesSpecifyCache", &[locked, 0, 1, 0, 0, 16]).unwrap_or(0) } else { 0 };
+        let flags = || if locked != 0 { at::<nt::Mdl>(locked).mdl_flags.get() } else { 0 };
+        let system = (SYSTEM_PTE_BASE..SYSTEM_PTE_TOP).contains(&mapped) && mapped & 0xFFF == 0x10 && at::<nt::Mdl>(locked).mapped_system_va.get() == mapped && flags() & 1 == 1;
+        let aliases = system && paging::translate(mapped) == paging::translate(user + 0x10) && paging::translate(mapped - 0x10 + 0x1000) == paging::translate(user + 0x1000) && guest::read64(mapped) == 0x5EC7_10A5_0001_2345 && guest::read64(mapped - 0x10 + 0x1008) == 0x5EC7_10A5_0006_7890;
+        let user_view = probed && call_export("MmMapLockedPagesSpecifyCache", &[locked, 1, 1, 0, 0, 16]) == Some(user + 0x10);
+        if probed {
+            call_export("MmUnlockPages", &[locked]);
+        }
+        let released = system && paging::translate(mapped) == 0 && flags() & 3 == 0;
+        if locked != 0 {
+            call_export("IoFreeMdl", &[locked]);
+        }
+        if let Some(region) = crate::ntos::ps::user::memory::find_region(user) {
+            crate::ntos::ps::user::memory::release_private_region(&region);
+        }
+        assert(aliases && user_view && released, "mm: MDL de buffer de usuario mapeado em PTEs de sistema e desfeito no MmUnlockPages");
+    } else {
+        assert(false, "mm: regiao de usuario para o MDL");
+    }
     let pages = call_export("MmAllocatePagesForMdl", &[0, u64::MAX, 0, 0x2000]).unwrap_or(0);
     assert(pages != 0 && at::<nt::Mdl>(pages).size.get() == 0x40 && mdl_pfn(pages, 0) != 0 && mdl_pfn(pages, 1) != 0 && call_export("MmFreePagesFromMdl", &[pages]) == Some(0), "mm: MmAllocatePagesForMdl com frames reais");
     guest::free_bytes(pages);

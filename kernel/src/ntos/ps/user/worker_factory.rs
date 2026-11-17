@@ -620,12 +620,24 @@ fn nt_wait_for_work_via_worker_factory(handle: u64, out: u64, count: u64, return
     if deferred != 0 && !state::probe_user_read(deferred, 24) {
         return Ok(0xC000_0005);
     }
-    // Envios ALPC adiados exigem a implementação assíncrona do ALPC.
+    // O envio ALPC adiado (WORKER_FACTORY_DEFERRED_WORK), como o
+    // NtWaitForWorkViaWorkerFactory 19041: só as flags altas; com
+    // ALPC_MSGFLG_SYNC_REQUEST o envio não acontece; a porta pede acesso de
+    // envio e a mensagem vai sem atributos. Uma falha do envio não muda nada:
+    // a espera por trabalho segue.
     if deferred != 0 {
-        let work = state::user_struct::<WorkerFactoryDeferredWork>(deferred).and_then(|work| Ok((work.alpc_send_message.probe_get()?, work.alpc_send_message_port.probe_get()?)));
+        let work = state::user_struct::<WorkerFactoryDeferredWork>(deferred).and_then(|work| Ok((work.alpc_send_message.probe_get()?, work.alpc_send_message_port.probe_get()?, work.alpc_send_message_flags.probe_get()?)));
         match work {
-            Ok((0, 0)) => {}
-            Ok(_) => return Ok(0xC000_00BB),
+            Ok((0, _, _)) => {}
+            Ok((message, port, flags)) => {
+                let flags = flags & 0xFFFF_0000;
+                if flags & 0x2_0000 == 0 {
+                    let status = crate::ntos::ps::user::alpc::deferred_send(port, flags, message)?;
+                    if status & 0x8000_0000 != 0 {
+                        crate::debug_print!("[workerfactory] envio adiado na porta {:#x} (flags {:#x}) falhou: {:#x}", port, flags, status);
+                    }
+                }
+            }
             Err(error) => return Ok(error.status),
         }
     }

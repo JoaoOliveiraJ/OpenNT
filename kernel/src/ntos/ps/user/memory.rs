@@ -1066,6 +1066,18 @@ pub fn protect_in(space: Space, base_pointer: u64, size_pointer: u64, new_protec
     }
     let old = memory_query::page_protection(&region, (base - region.base()) / PAGE, &context);
     let writable = protect & (4 | 8 | 0x40 | 0x80) != 0;
+    // Uma página compartilhada de imagem que fica gravável ganha antes a
+    // cópia privada do processo (o PAGE_WRITECOPY resolvido).
+    let mut changes = changes;
+    if writable {
+        for (_, index, physical) in changes.iter_mut() {
+            match region.write_copy(*index) {
+                Some(Ok(copy)) => *physical = copy,
+                Some(Err(status)) => return Ok(status),
+                None => {}
+            }
+        }
+    }
     for (va, index, physical) in changes {
         let flags = paging::PAGE_USER | if protect != 1 { paging::PAGE_PRESENT } else { 0 } | if writable { paging::PAGE_RW } else { 0 };
         paging::map_page_in(root, va, physical, flags, MapOptions { nx: protect & 0xF0 == 0, ..MapOptions::default() });

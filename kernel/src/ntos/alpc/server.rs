@@ -100,6 +100,9 @@ const LPC_CONTINUATION_REQUIRED: u16 = 0x2000;
 const CONTEXT_ATTRIBUTE: u32 = 0x2000_0000;
 /// ALPC_MESSAGE_VIEW_ATTRIBUTE.
 const VIEW_ATTRIBUTE: u32 = 0x4000_0000;
+/// ALPC_MESSAGE_TOKEN_ATTRIBUTE (ALPC_TOKEN_ATTR: TokenId, AuthenticationId
+/// e ModifiedId do token do cliente).
+const TOKEN_ATTRIBUTE: u32 = 0x0800_0000;
 /// O maior PORT_MESSAGE de uma porta ALPC.
 const MAXIMUM_MESSAGE_LENGTH: u64 = 0xFFFF;
 /// OBJ_INHERIT e OBJ_KERNEL_HANDLE não valem para um handle de usuário.
@@ -459,6 +462,21 @@ fn publish_attributes(attributes: u64, delivery: &Delivery, sequence: u32, view:
         let at = crate::ntos::ps::user::alpc::attribute_address(attributes, CONTEXT_ATTRIBUTE);
         context_attribute::try_write(at, delivery.port_context, 0, sequence, delivery.id, 0)?;
     }
+    // O ALPC_TOKEN_ATTR, como o AlpcpExposeTokenAttribute: TokenId,
+    // AuthenticationId e ModifiedId do token efetivo de quem enviou (o RPC
+    // do servidor lê a identidade do cliente por ele, o
+    // I_RpcBindingInqClientTokenAttributes).
+    if allocated & TOKEN_ATTRIBUTE != 0 {
+        if let Some(statistics) = sender_effective_token(delivery.sender.thread_pointer).and_then(|token| crate::ntos::se::token::statistics::encode(token).ok()) {
+            let at = crate::ntos::ps::user::alpc::attribute_address(attributes, TOKEN_ATTRIBUTE);
+            let mut bytes = [0u8; 24];
+            bytes[..8].copy_from_slice(&statistics[..8]);
+            bytes[8..16].copy_from_slice(&statistics[8..16]);
+            bytes[16..].copy_from_slice(&statistics[48..56]);
+            guest::try_write_bytes(at, &bytes).map_err(|_| STATUS_ACCESS_VIOLATION)?;
+            valid |= TOKEN_ATTRIBUTE;
+        }
+    }
     if let Some(view) = view.filter(|_| allocated & VIEW_ATTRIBUTE != 0) {
         let at = crate::ntos::ps::user::alpc::attribute_address(attributes, VIEW_ATTRIBUTE);
         let attribute = state::user_struct::<AlpcDataViewAttr>(at).map_err(|error| error.status)?;
@@ -519,6 +537,9 @@ fn receive_one(server: &UserServer, buffer: &Buffer, attributes: u64, options: R
         }
         let delivery = state.queue.front()?;
         let bytes = message_bytes(delivery, options.legacy);
+        if crate::ntos::init::boot_config::TRACE_SYSCALLS {
+            crate::debug_print!("[alpc] recepcao do servidor: tipo {:#x} id {} {:02x?}", delivery.message_type, delivery.id, &bytes[..bytes.len().min(0x50)]);
+        }
         let status = message_buffer::deliver(buffer, &bytes, true);
         if status != 0 {
             return Some(status);
@@ -691,6 +712,18 @@ pub fn reply_legacy(port: &Arc<Port>, reply: u64) -> u32 {
 /// mensagem `id` ainda pendente no servidor da porta.
 pub fn sender_of(port: &Arc<Port>, id: u32) -> Option<Origin> {
     server_of(port)?.state.lock().senders.get(&id).copied()
+}
+
+/// O token efetivo da thread `thread` de um cliente: o de impersonação dela,
+/// senão o primário do processo dono (o contexto de segurança dinâmico do
+/// AlpcpGetEffectiveTokenMessage).
+pub fn sender_effective_token(thread: u64) -> Option<u64> {
+    if thread == 0 {
+        return None;
+    }
+    // SAFETY: a thread do cliente está retida enquanto a mensagem existe.
+    let owner = unsafe { crate::ntos::inc::types::Ethread::at(thread) }.tcb.process.get();
+    crate::ntos::se::token::thread::get(thread).map(|state| state.token).or_else(|| process::get_primary_token(owner))
 }
 
 /// O REMOTE_PORT_VIEW que o servidor pede no NtAcceptConnectPort e o

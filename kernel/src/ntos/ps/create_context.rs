@@ -20,7 +20,11 @@
 //!   PROCESS_CREATE_FLAGS_PROTECTED_PROCESS) e JobList (os handles de job,
 //!   referenciados com JOB_OBJECT_ASSIGN_PROCESS: Size múltiplo de 8, não
 //!   nulo); recusa com STATUS_NOT_SUPPORTED o que mudaria o processo sem
-//!   suporte aqui (DebugObject, Token, SecureProcess, UmsThread); aceita sem
+//!   suporte aqui (DebugObject, SecureProcess, UmsThread); Token (o
+//!   CreateProcessAsUser) dá ao processo uma cópia do token primário pedido,
+//!   referenciado com TOKEN_ASSIGN_PRIMARY, e exige de quem chama o
+//!   SeAssignPrimaryTokenPrivilege habilitado no token efetivo, como o
+//!   PspAllocateProcess; aceita sem
 //!   efeito, com registro no log, os demais
 //!   que o kernel32 passa (StdHandleInfo, HandleList, ErrorMode, afinidade,
 //!   mitigações e políticas); um número desconhecido, um atributo repetido,
@@ -89,6 +93,11 @@ const STATUS_NO_MEMORY: u32 = 0xC000_0017;
 const STATUS_OBJECT_NAME_INVALID: u32 = 0xC000_0033;
 const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
 const STATUS_PROCESS_IS_TERMINATING: u32 = 0xC000_010A;
+const STATUS_BAD_TOKEN_TYPE: u32 = 0xC000_00A8;
+/// TOKEN_ASSIGN_PRIMARY.
+const TOKEN_ASSIGN_PRIMARY: u32 = 0x1;
+/// SeAssignPrimaryTokenPrivilege.
+const SE_ASSIGN_PRIMARY_TOKEN_PRIVILEGE: u64 = 3;
 
 /// PROCESS_CREATE_PROCESS: o direito que o handle do pai declarado precisa.
 const PROCESS_CREATE_PROCESS: u32 = 0x80;
@@ -182,6 +191,19 @@ struct Output {
     return_length: u64,
 }
 
+/// O token do PS_ATTRIBUTE_TOKEN (CreateProcessAsUser), referenciado com
+/// TOKEN_ASSIGN_PRIMARY até o fim da criação.
+#[derive(Default)]
+struct TokenAttribute(Option<crate::ntos::se::token::reference::TokenReference>);
+
+impl Drop for TokenAttribute {
+    fn drop(&mut self) {
+        if let Some(mut reference) = self.0.take() {
+            let _ = reference.release();
+        }
+    }
+}
+
 /// Os jobs do PS_ATTRIBUTE_JOB_LIST, referenciados até o fim da criação.
 #[derive(Default)]
 struct JobList(Vec<u64>);
@@ -207,6 +229,8 @@ struct Attributes {
     protection: Option<u8>,
     /// PsAttributeJobList.
     jobs: JobList,
+    /// PsAttributeToken.
+    token: TokenAttribute,
 }
 
 /// O NTSTATUS de um erro de sonda ou de criação.
@@ -383,7 +407,25 @@ fn read_attributes(entries: &[PsAttribute]) -> Result<Attributes, u32> {
                     captured.jobs.0.push(job);
                 }
             }
-            attribute::DEBUG_OBJECT | attribute::TOKEN | attribute::UMS_THREAD | attribute::SECURE_PROCESS => {
+            attribute::TOKEN => {
+                expect(attribute::INPUT)?;
+                // HANDLE por valor: o token primário que o processo copia
+                // (TOKEN_ASSIGN_PRIMARY; um de impersonação é
+                // STATUS_BAD_TOKEN_TYPE, como o SeIsTokenAssignableToProcess).
+                if size != 8 {
+                    return Err(STATUS_INVALID_PARAMETER);
+                }
+                let reference = match crate::ntos::se::token::reference::reference(inline, TOKEN_ASSIGN_PRIMARY, 1, false).map_err(|error| status_of(&error))? {
+                    Ok(reference) => reference,
+                    Err(status) => return Err(status),
+                };
+                let kind = crate::ntos::se::token::tokens::with(reference.token, |token| token.kind).unwrap_or(0);
+                captured.token = TokenAttribute(Some(reference));
+                if kind != 1 {
+                    return Err(STATUS_BAD_TOKEN_TYPE);
+                }
+            }
+            attribute::DEBUG_OBJECT | attribute::UMS_THREAD | attribute::SECURE_PROCESS => {
                 crate::debug_print!("[ps] NtCreateUserProcess: atributo {:#x} sem suporte", value);
                 return Err(STATUS_NOT_SUPPORTED);
             }
@@ -537,6 +579,13 @@ fn capture_and_create(request: &UserCreateRequest) -> Result<u32, u32> {
         parameters.image_path_name = dos_path.clone();
     }
     let protection = requested_protection(request.process_flags, attributes.protection, attributes.parent.unwrap_or_else(process::get_current_process))?;
+    // PsAttributeToken: o SeAssignPrimaryTokenPrivilege habilitado no token
+    // efetivo de quem chama (o OpenNT não rastreia os tokens filhos e irmãos
+    // que o SeIsTokenAssignableToProcess também aceita).
+    let primary_token = attributes.token.0.as_ref().map(|reference| reference.token);
+    if primary_token.is_some() && !crate::ntos::se::privilege::single_privilege_check(SE_ASSIGN_PRIMARY_TOKEN_PRIVILEGE, 1) {
+        return Err(STATUS_PRIVILEGE_NOT_HELD);
+    }
     let process_access = creator_access(request.process_access, &object_types::process_type())?;
     let thread_access = creator_access(request.thread_access, &object_types::thread_type())?;
     // INHERIT_HANDLES: os handles herdáveis do pai declarado ou, sem ele, de
@@ -564,7 +613,7 @@ fn capture_and_create(request: &UserCreateRequest) -> Result<u32, u32> {
 
     // A criação: daqui em diante só a memória do kernel e o processo novo.
     let short_name = String::from(dos_path.rsplit('\\').next().unwrap_or(&dos_path));
-    let create_request = CreateProcessRequest { image: ImageOrigin::NtPath(image_name), image_name: &short_name, parameters, parent: attributes.parent, thread_flags: request.thread_flags, on_created: Some(&assign_jobs), inherit_handles_from, protection, create_session: request.process_flags & PROCESS_CREATE_SESSION != 0 };
+    let create_request = CreateProcessRequest { image: ImageOrigin::NtPath(image_name), image_name: &short_name, parameters, parent: attributes.parent, thread_flags: request.thread_flags, on_created: Some(&assign_jobs), inherit_handles_from, protection, create_session: request.process_flags & PROCESS_CREATE_SESSION != 0, primary_token };
     let created = match create::create_user_process(&create_request) {
         Ok(created) => created,
         Err(failure) => {

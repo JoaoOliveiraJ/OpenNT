@@ -230,11 +230,20 @@ pub fn encode(token_pointer: u64, class: u32, base: u64) -> Result<Vec<u8>, u32>
                 }
             }
         },
-        // TOKEN_SOURCE: o contexto de boot do OpenNT.
+        // TOKEN_SOURCE: a do NtCreateToken; nos tokens do contexto de boot,
+        // a do OpenNT.
         7 => {
             layout.reserve(16);
-            layout.bytes[..8].copy_from_slice(b"OpenNTbt");
-            layout.u64(8, token.authentication_id);
+            match token.source {
+                Some((name, identifier)) => {
+                    layout.bytes[..8].copy_from_slice(&name);
+                    layout.u64(8, identifier);
+                }
+                None => {
+                    layout.bytes[..8].copy_from_slice(b"OpenNTbt");
+                    layout.u64(8, token.authentication_id);
+                }
+            }
         }
         8 => layout.scalar(token.kind),
         9 => {
