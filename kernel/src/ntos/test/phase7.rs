@@ -4387,14 +4387,19 @@ fn user_wnf(assert: Assert) {
             let misaligned = complete(0, 0, 0, 0, delivery + 4, 0x1030);
             let bad_status = complete(name, identifier, 1, 0xC000_0001, delivery, 0x1030);
             let empty = complete(0, 0, 0, 0, delivery, 0x1030);
-            let kernel_name = guest::alloc_bytes(0x10);
+            // O nome tem TypeId na definição (o GUID depois do
+            // MaximumStateSize); a escrita passa o mesmo.
+            let type_guid: [u8; 16] = [0x63, 0x64, 0xF9, 0x48, 0xD6, 0x52, 0x85, 0x4E, 0x9C, 0x02, 0xF2, 0xC1, 0x4E, 0x17, 0x26, 0x4E];
+            let kernel_name = guest::alloc_bytes(0x20);
             guest::write64(kernel_name, 0x0280_032E_A3BC_0875);
             guest::write32(kernel_name + 8, 0x0BAD_F00D);
-            let updated = crate::ntos::ex::wnf::service::update(kernel_name, kernel_name + 8, 4, 0, 0, 0, false).ok();
+            guest::write_bytes(kernel_name + 0x10, &type_guid);
+            let updated = crate::ntos::ex::wnf::service::update(kernel_name, kernel_name + 8, 4, kernel_name + 0x10, 0, 0, false).ok();
             guest::free_bytes(kernel_name);
             let delivered = complete(0, 0, 0, 0, delivery, 0x1030);
             let header = (guest::read64(delivery), guest::read64(delivery + 8), guest::read32(delivery + 0x14), guest::read32(delivery + 0x18), guest::read32(delivery + 0x2C), guest::read32(delivery + 0x30));
             let stamp = guest::read32(delivery + 0x10);
+            let delivered_type = guest::read_bytes(delivery + 0x1C, 16);
             let finished = complete(delivery + 8, delivery, header.3 as u64, 0, delivery, 0x1030);
             assert(
                 nothing == Some(0xC000_000D)
@@ -4406,6 +4411,7 @@ fn user_wnf(assert: Assert) {
                     && delivered == Some(0)
                     && header == (subscription, 0x0280_032E_A3BC_0875, 4, 1, 0x30, 0x0BAD_F00D)
                     && stamp != 0
+                    && delivered_type == type_guid
                     && finished == Some(0x8000_001A),
                 "userwnf: NtGetCompleteWnfStateSubscription entrega o descritor da escrita e conclui a entrega",
             );
