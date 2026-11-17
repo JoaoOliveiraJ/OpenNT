@@ -149,7 +149,7 @@ pub fn access_check(descriptor: u64, subject_context: u64, desired: u32, previou
 /// o descritor capturado (self-relative do kernel, com dono e grupo), o
 /// token do cliente e o GENERIC_MAPPING do chamador. Devolve (GrantedAccess,
 /// AccessStatus) ou o NTSTATUS do serviço.
-fn evaluate_user(descriptor: u64, token: u64, desired: u32, mapping: u64) -> Result<(u32, u32), u32> {
+fn evaluate_user(descriptor: u64, token: u64, desired: u32, mapping: u64, principal_self: Option<&[u8]>) -> Result<(u32, u32), u32> {
     const STATUS_NO_IMPERSONATION_TOKEN: u32 = 0xC000_005C;
     const STATUS_INVALID_SECURITY_DESCR: u32 = 0xC000_0079;
     const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
@@ -168,7 +168,10 @@ fn evaluate_user(descriptor: u64, token: u64, desired: u32, mapping: u64) -> Res
     }
     let components = query_descriptor::read_descriptor(captured);
     descriptor::release_captured(captured);
-    let Some(components) = components else { return Err(STATUS_INVALID_SECURITY_DESCR) };
+    let Some(mut components) = components else { return Err(STATUS_INVALID_SECURITY_DESCR) };
+    if let (Some(principal), Some(dacl)) = (principal_self, components.dacl.as_deref()) {
+        components.dacl = Some(substitute_principal_self(dacl, principal));
+    }
     if components.owner.is_none() || components.group.is_none() {
         return Err(STATUS_INVALID_SECURITY_DESCR);
     }
@@ -202,6 +205,12 @@ fn evaluate_user(descriptor: u64, token: u64, desired: u32, mapping: u64) -> Res
 /// vai para GrantedAccess e AccessStatus, e o serviço devolve sucesso.
 #[allow(clippy::too_many_arguments)]
 pub fn check_by_token(descriptor: u64, token: u64, pseudo: bool, desired: u32, mapping: u64, privilege_set: u64, privilege_length: u64, granted_out: u64, status_out: u64) -> u32 {
+    check_by_type_inner(descriptor, None, token, pseudo, desired, mapping, privilege_set, privilege_length, granted_out, status_out)
+}
+
+/// O SeAccessCheckByType de UserMode com o PrincipalSelfSid já capturado.
+#[allow(clippy::too_many_arguments)]
+fn check_by_type_inner(descriptor: u64, principal_self: Option<&[u8]>, token: u64, pseudo: bool, desired: u32, mapping: u64, privilege_set: u64, privilege_length: u64, granted_out: u64, status_out: u64) -> u32 {
     const STATUS_NO_IMPERSONATION_TOKEN: u32 = 0xC000_005C;
     const STATUS_GENERIC_NOT_MAPPED: u32 = 0xC000_0126;
     const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
@@ -223,7 +232,7 @@ pub fn check_by_token(descriptor: u64, token: u64, pseudo: bool, desired: u32, m
     if available < PRIVILEGE_SET_SIZE {
         return if guest::try_write::<u32>(privilege_length, PRIVILEGE_SET_SIZE).is_ok() { STATUS_BUFFER_TOO_SMALL } else { STATUS_ACCESS_VIOLATION };
     }
-    let (granted, status) = match evaluate_user(descriptor, token, desired, mapping) {
+    let (granted, status) = match evaluate_user(descriptor, token, desired, mapping, principal_self) {
         Ok(result) => result,
         Err(status) => return status,
     };
@@ -232,6 +241,91 @@ pub fn check_by_token(descriptor: u64, token: u64, pseudo: bool, desired: u32, m
         .and_then(|_| guest::try_write::<u32>(granted_out, granted))
         .and_then(|_| guest::try_write::<u32>(status_out, status));
     if written.is_err() { STATUS_ACCESS_VIOLATION } else { 0 }
+}
+
+/// O SID PRINCIPAL_SELF (S-1-5-10).
+const PRINCIPAL_SELF_SID: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 5, 10, 0, 0, 0];
+
+/// A DACL com o PrincipalSelfSid no lugar do S-1-5-10 nas ACEs de SID em
+/// +8 (permitida, negada e as de callback, com os dados depois do SID): o
+/// SepSidInTokenSidHash troca o SID da ACE pelo PrincipalSelfSid antes da
+/// comparação com o token. As outras ACEs ficam como estão.
+fn substitute_principal_self(dacl: &[u8], principal: &[u8]) -> Vec<u8> {
+    if dacl.len() < 8 {
+        return dacl.to_vec();
+    }
+    let count = u16::from_le_bytes([dacl[4], dacl[5]]) as usize;
+    let mut out = dacl[..8].to_vec();
+    let mut offset = 8usize;
+    for _ in 0..count {
+        if offset + 4 > dacl.len() {
+            break;
+        }
+        let (kind, size) = (dacl[offset], u16::from_le_bytes([dacl[offset + 2], dacl[offset + 3]]) as usize);
+        if size < 8 || offset + size > dacl.len() {
+            break;
+        }
+        let ace = &dacl[offset..offset + size];
+        let sid_ace = matches!(kind, 0 | 1 | 9 | 10);
+        if sid_ace && size >= 8 + PRINCIPAL_SELF_SID.len() && ace[8..8 + PRINCIPAL_SELF_SID.len()] == PRINCIPAL_SELF_SID {
+            let tail = &ace[8 + PRINCIPAL_SELF_SID.len()..];
+            let new_size = 8 + principal.len() + tail.len();
+            out.extend_from_slice(&ace[..2]);
+            out.extend_from_slice(&(new_size as u16).to_le_bytes());
+            out.extend_from_slice(&ace[4..8]);
+            out.extend_from_slice(principal);
+            out.extend_from_slice(tail);
+        } else {
+            out.extend_from_slice(ace);
+        }
+        offset += size;
+    }
+    let total = out.len() as u16;
+    out[2..4].copy_from_slice(&total.to_le_bytes());
+    out
+}
+
+/// Captura o PrincipalSelfSid de modo usuário (o SeCaptureSid): revisão 1 e
+/// até 15 subautoridades, senão STATUS_INVALID_SID.
+fn capture_user_sid(pointer: u64) -> Result<Vec<u8>, u32> {
+    const STATUS_INVALID_SID: u32 = 0xC000_0078;
+    const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+    if !crate::ntos::ps::user_probe::probe_user_read(pointer, 8) {
+        return Err(STATUS_ACCESS_VIOLATION);
+    }
+    let Ok(header) = guest::try_read_bytes(pointer, 8) else { return Err(STATUS_ACCESS_VIOLATION) };
+    if header[0] != 1 || header[1] > 15 {
+        return Err(STATUS_INVALID_SID);
+    }
+    let length = 8 + header[1] as u64 * 4;
+    if !crate::ntos::ps::user_probe::probe_user_read(pointer, length) {
+        return Err(STATUS_ACCESS_VIOLATION);
+    }
+    guest::try_read_bytes(pointer, length as usize).map_err(|_| STATUS_ACCESS_VIOLATION)
+}
+
+/// NtAccessCheckByType(SecurityDescriptor, PrincipalSelfSid, ClientToken,
+/// DesiredAccess, ObjectTypeList, ObjectTypeListLength, GenericMapping,
+/// PrivilegeSet, PrivilegeSetLength*, GrantedAccess*, AccessStatus*) de
+/// UserMode: o mesmo SeAccessCheckByType do NtAccessCheck (no 19041 os dois
+/// serviços só repassam a ele), com o PrincipalSelfSid capturado no lugar do
+/// S-1-5-10 das ACEs. A avaliação de ACEs de objeto por GUID ainda não
+/// existe no OpenNT: uma lista de tipos não vazia devolve
+/// STATUS_NOT_IMPLEMENTED.
+#[allow(clippy::too_many_arguments)]
+pub fn check_by_type(descriptor: u64, principal_self: u64, token: u64, pseudo: bool, desired: u32, object_type_count: u32, mapping: u64, privilege_set: u64, privilege_length: u64, granted_out: u64, status_out: u64) -> u32 {
+    if object_type_count != 0 {
+        return 0xC000_0002;
+    }
+    let principal = if principal_self != 0 {
+        match capture_user_sid(principal_self) {
+            Ok(sid) => Some(sid),
+            Err(status) => return status,
+        }
+    } else {
+        None
+    };
+    check_by_type_inner(descriptor, principal.as_deref(), token, pseudo, desired, mapping, privilege_set, privilege_length, granted_out, status_out)
 }
 
 /// NtAccessCheckAndAuditAlarm e NtAccessCheckByTypeAndAuditAlarm de UserMode
@@ -263,7 +357,7 @@ pub fn check_and_audit_alarm(descriptor: u64, token: u64, level: u32, desired: u
             mapped |= value;
         }
     }
-    let (granted, status) = match evaluate_user(descriptor, token, mapped, mapping) {
+    let (granted, status) = match evaluate_user(descriptor, token, mapped, mapping, None) {
         Ok(result) => result,
         Err(status) => return status,
     };

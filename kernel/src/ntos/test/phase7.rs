@@ -2805,6 +2805,29 @@ fn user_create_token(assert: Assert) {
         let denied = check(impersonation, 0x4, 0x40) == 0 && guest::read32(granted) == 0 && guest::read32(status_out) == 0xC000_0022;
         let small = check(impersonation, 0x1, 4) == 0xC000_0023 && guest::read32(privilege_length) == 20;
         let generic = check(impersonation, 0x8000_0000, 0x40) == 0xC000_0126;
+        // NtAccessCheckByType: o mesmo descritor com a ACE de Everyone trocada
+        // por PRINCIPAL_SELF (S-1-5-10); o PrincipalSelfSid entra no lugar dele.
+        let self_descriptor = data + 0x700;
+        let mut self_sd = sd.clone();
+        let ace_sid = self_sd.len() - 12;
+        self_sd[ace_sid..].copy_from_slice(&[1, 1, 0, 0, 0, 0, 0, 5, 10, 0, 0, 0]);
+        guest::write_bytes(self_descriptor, &self_sd);
+        let (other_sid, bad_sid) = (data + 0x7C0, data + 0x7E0);
+        guest::write_bytes(other_sid, &[1, 1, 0, 0, 0, 0, 0, 5, 7, 0, 0, 0]);
+        guest::write_bytes(bad_sid, &[2, 1, 0, 0, 0, 0, 0, 5, 7, 0, 0, 0]);
+        let by_type = |principal: u64, desired: u64, types: u64| {
+            guest::write32(privilege_length, 0x40);
+            for (index, value) in [0, types, mapping, privilege_set, privilege_length, granted, status_out].into_iter().enumerate() {
+                guest::write64(rsp + 0x28 + index as u64 * 8, value);
+            }
+            call("NtAccessCheckByType", self_descriptor, principal, impersonation, desired)
+        };
+        let self_granted = by_type(everyone, 0x200_0000, 0) == 0 && guest::read32(granted) == 0x6_0003;
+        let self_absent = by_type(0, 0x200_0000, 0) == 0 && guest::read32(granted) == 0x6_0000;
+        let self_other = by_type(other_sid, 0x200_0000, 0) == 0 && guest::read32(granted) == 0x6_0000;
+        let self_invalid = by_type(bad_sid, 0x200_0000, 0) == 0xC000_0078;
+        let typed = by_type(everyone, 0x200_0000, 1) == 0xC000_0002;
+        assert(self_granted && self_absent && self_other && self_invalid && typed, "usercreatetoken: NtAccessCheckByType troca o PRINCIPAL_SELF pelo PrincipalSelfSid");
         let _ = call("NtClose", impersonation, 0, 0, 0);
         assert(primary_refused && pseudo_accepted && impersonation_created && maximum && denied && small && generic, "usercreatetoken: NtAccessCheck com token de impersonacao, DACL, PRIVILEGE_SET e recusas");
         // Recusas: tipo 3, sessão de logon desconhecida e impersonação sem QoS.

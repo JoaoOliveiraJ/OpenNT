@@ -395,6 +395,31 @@ fn nt_access_check(descriptor: u64, client_token: u64, desired: u64, mapping: u6
     Ok(crate::ntos::se::access_check::check_by_token(descriptor, token, pseudo, desired as u32, mapping, privilege_set, privilege_length, granted, status))
 }
 
+/// NtAccessCheckByType(SecurityDescriptor, PrincipalSelfSid, ClientToken,
+/// DesiredAccess, ObjectTypeList, ObjectTypeListLength, GenericMapping,
+/// PrivilegeSet, PrivilegeSetLength, GrantedAccess, AccessStatus)
+/// (`se/access_check`): as sondagens e o token do NtAccessCheck.
+fn nt_access_check_by_type(descriptor: u64, principal_self: u64, client_token: u64, desired: u64, rsp: u64) -> Result<u32, KernelError> {
+    if !state::probe_syscall_stack(rsp, 7 * 8) {
+        return Ok(0xC000_0005);
+    }
+    let (type_count, mapping, privilege_set, privilege_length, granted, status) = (stack_arg(rsp, 6) as u32, stack_arg(rsp, 7), stack_arg(rsp, 8), stack_arg(rsp, 9), stack_arg(rsp, 10), stack_arg(rsp, 11));
+    if !probe_user_read(mapping, 16) || !probe_user_write(privilege_length, 4) || !probe_user_write(granted, 4) || !probe_user_write(status, 4) {
+        return Ok(0xC000_0005);
+    }
+    let available = guest::try_read::<u32>(privilege_length).unwrap_or(0) as u64;
+    if available != 0 && !probe_user_write(privilege_set, available) {
+        return Ok(0xC000_0005);
+    }
+    let handle = token_argument(3, client_token);
+    let token = match lookup(handle, 8) {
+        Ok(token) => token,
+        Err(status) => return Ok(status),
+    };
+    let pseudo = (-6..=-4).contains(&(handle as i64));
+    Ok(crate::ntos::se::access_check::check_by_type(descriptor, principal_self, token, pseudo, desired as u32, type_count, mapping, privilege_set, privilege_length, granted, status))
+}
+
 /// NtPrivilegedServiceAuditAlarm(SubsystemName, ServiceName, ClientToken,
 /// Privileges, AccessGranted): o SeAuditPrivilege do chamador
 /// (STATUS_PRIVILEGE_NOT_HELD), o token do cliente com TOKEN_QUERY e o
@@ -490,6 +515,7 @@ pub fn init() {
     state::register_handler("NtDeleteObjectAuditAlarm", nt_delete_object_audit_alarm);
     state::register_handler("NtCreateToken", nt_create_token);
     state::register_handler("NtAccessCheck", nt_access_check);
+    state::register_handler("NtAccessCheckByType", nt_access_check_by_type);
     state::register_handler("NtSetInformationToken", nt_set_information_token);
     state::register_handler("NtCreateTokenEx", nt_create_token_ex);
     state::register_handler("NtAdjustPrivilegesToken", nt_adjust_privileges_token);
