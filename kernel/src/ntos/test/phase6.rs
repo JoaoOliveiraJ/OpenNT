@@ -14311,6 +14311,11 @@ fn se_logon_session_exports(assert: Assert) {
     let deleted = logon_session::delete_track(0x7_0000_1234);
     assert(created == 0 && collision == 0xC000_00EE && in_use == 0xC000_0104 && linked == Some(0) && deleted == 0 && logon_session::delete_track(0x7_0000_1234) == 0xC000_005F && !logon_session::exists(0x7_0000_1234, 0), "se-logon-session: sessao criada pelo LSA (colisao), apagada so sem token que a use, depois inexistente");
     assert(set(0x7FFF_FFF8, 3) == Some(0xC000_0008), "se-logon-session: handle invalido");
+    // O comando 4 do LSA (SepUpdateLogonSessionTrack): o AccountName e o
+    // AuthorityName da sessão; sessão inexistente = STATUS_NO_SUCH_LOGON_SESSION.
+    let (account, authority): (Vec<u16>, Vec<u16>) = ("SYSTEM".encode_utf16().collect(), "NT AUTHORITY".encode_utf16().collect());
+    let informed = logon_session::add_info(logon_session::SYSTEM_LUID, &account, &authority);
+    assert(informed == 0 && logon_session::names(logon_session::SYSTEM_LUID) == Some((account.clone(), authority.clone())) && logon_session::add_info(0x7_0000_1234, &account, &authority) == 0xC000_005F, "se-logon-session: comando 4 grava AccountName e AuthorityName; sessao inexistente recusada");
     let _ = call_export("ZwClose", &[copy]);
     let _ = call_export("ZwClose", &[system_token]);
 }
@@ -14337,6 +14342,35 @@ fn se_non_ob_audit_exports(assert: Assert) {
     let pushed = (audit::category_policy(0), audit::category_policy(1), audit::category_policy(2));
     audit::set_policy_from_lsa(&[0; audit::LSA_POLICY_SUBCATEGORIES]);
     assert(pushed == (0x21, 0x42, 0x44) && audit::category_policy(0) == 0x44, "se-audit: politica do RmAuditSetCommand por categoria (todas, algumas, nenhuma)");
+    // O comando 5 do LSA (SepRmGlobalSaclSetWrkr): a SACL global do tipo vem
+    // do valor padrão de SECURITY\Policy\GlobalSaclName<tipo>; sem a chave,
+    // STATUS_OBJECT_NAME_NOT_FOUND; um valor vazio tira a entrada.
+    use crate::ntos::cm::registry;
+    let name: Vec<u16> = "OpenNTTeste".encode_utf16().collect();
+    let missing = audit::set_global_sacl_from_lsa(&name);
+    let policy_path = "\\Registry\\Machine\\SECURITY\\Policy";
+    let policy_existed = registry::node_by_path(policy_path).is_some();
+    let key_path = "\\Registry\\Machine\\SECURITY\\Policy\\GlobalSaclNameOpenNTTeste";
+    let key = registry::open_or_create_options(key_path, None, true).unwrap_or(0);
+    let sacl = alloc::vec![2u8, 0, 8, 0, 0, 0, 0, 0];
+    let stored = key != 0 && registry::set_value(key, "", 3, sacl.clone());
+    let installed = audit::set_global_sacl_from_lsa(&name);
+    let found = audit::global_sacl("OpenNTTeste");
+    let emptied = registry::set_value(key, "", 3, Vec::new()) && audit::set_global_sacl_from_lsa(&name) == 0 && audit::global_sacl("OpenNTTeste").is_none();
+    if key != 0 {
+        registry::delete_key(key);
+        registry::close_handle(key);
+    }
+    if !policy_existed {
+        if let Some(node) = registry::node_by_path(policy_path) {
+            registry::delete_node(node, policy_path);
+        }
+    }
+    assert(missing == 0xC000_0034 && stored && installed == 0 && found == Some(sacl) && emptied && registry::node_by_path(policy_path).is_some() == policy_existed, "se-audit: comando 5 instala a SACL global do registro, tira com valor vazio e da OBJECT_NAME_NOT_FOUND sem a chave");
+    // O comando 7 (SepRmProcessCreationCommandLineAuditSettingsWrkr).
+    let on = audit::set_process_command_line_audit(true) == 0 && audit::audit_process_command_line();
+    let off = audit::set_process_command_line_audit(false) == 0 && !audit::audit_process_command_line();
+    assert(on && off, "se-audit: comando 7 liga e desliga a auditoria da linha de comando");
     call_export("SeReleaseSubjectContext", &[context]);
 }
 

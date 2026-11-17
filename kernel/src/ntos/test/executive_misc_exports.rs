@@ -216,6 +216,21 @@ fn etw_send_trace_buffer(assert: Assert) {
     control(2);
     assert(started == 0 && sent == 0 && prepared && reference == (0x1111_2222, 0x3333_4444, true), "etw-send-trace-buffer: o cabeçalho sai pronto (offsets, ETW_BUFFER_STATE_FLUSH, tipo 5, hora de referência e TimeStamp)");
     assert(kept && queried == 0 && lost == 7 && written >= 2, "etw-send-trace-buffer: BufferFlag 0x20 preserva o Alignment; EventsLost e os buffers entregues contam na sessão");
+    // O código 24 (EtwpRegisterSecurityProvider): sem buffers; o primeiro
+    // processo fica como provedor de segurança, o segundo registro dá
+    // STATUS_ACCESS_DENIED.
+    let register = |length: u32| logger::trace_control(24, if length != 0 { properties } else { 0 }, length, 0, 0, returned, 0).unwrap_or(u32::MAX);
+    let sized = register(8);
+    let before = logger::security_provider_pid();
+    let first = register(0);
+    let second = register(0);
+    let expected_first = if before == 0 { 0 } else { 0xC000_0022 };
+    assert(sized == 0xC000_000D && first == expected_first && second == 0xC000_0022 && logger::security_provider_pid() == if before == 0 { crate::ntos::ps::process::get_current_process_id() } else { before }, "etw-security-provider: codigo 24 registra o primeiro processo; o segundo registro da STATUS_ACCESS_DENIED");
+    // NtTraceEvent 0x500 (EtwWriteUMSecurityEvent): o provedor registrado
+    // escreve (sem sessão de segurança, aceito); outro processo, não.
+    let event = crate::ntos::etw::user_registration::trace_event(0, 0x500, 0x78, properties, 0).unwrap_or(u32::MAX);
+    let provider = logger::security_provider_pid() == crate::ntos::ps::process::get_current_process_id();
+    assert(event == if provider { 0 } else { 0xC000_0022 }, "etw-security-provider: NtTraceEvent 0x500 aceito so do provedor de seguranca");
 }
 
 // ---- InbvCheckDisplayOwnership / InbvEnableBootDriver ------------------------

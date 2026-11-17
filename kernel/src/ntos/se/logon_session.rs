@@ -34,14 +34,22 @@ const TOKEN_QUERY: u32 = 0x8;
 pub const SYSTEM_LUID: u64 = 0x3E7;
 pub const ANONYMOUS_LUID: u64 = 0x3E6;
 
-/// Uma SEP_LOGON_SESSION_REFERENCES: LogonId, o silo, o token da sessão e
-/// a sessão irmã.
-#[derive(Clone, Copy)]
+/// Uma SEP_LOGON_SESSION_REFERENCES: LogonId, o silo, o token da sessão, a
+/// sessão irmã e o AccountName e o AuthorityName que o LSA informa.
+#[derive(Clone)]
 struct LogonSession {
     logon_id: u64,
     server_silo: u64,
     token: u64,
     buddy_logon_id: u64,
+    account_name: Vec<u16>,
+    authority_name: Vec<u16>,
+}
+
+impl LogonSession {
+    fn new(logon_id: u64) -> Self {
+        Self { logon_id, server_silo: 0, token: 0, buddy_logon_id: 0, account_name: Vec::new(), authority_name: Vec::new() }
+    }
 }
 
 /// SepLogonSessions.
@@ -52,7 +60,7 @@ fn with_sessions<T>(body: impl FnOnce(&mut Vec<LogonSession>) -> T) -> T {
     let mut sessions = SESSIONS.lock();
     if sessions.is_empty() {
         for logon_id in [SYSTEM_LUID, ANONYMOUS_LUID] {
-            sessions.push(LogonSession { logon_id, server_silo: 0, token: 0, buddy_logon_id: 0 });
+            sessions.push(LogonSession::new(logon_id));
         }
     }
     body(&mut sessions)
@@ -60,7 +68,7 @@ fn with_sessions<T>(body: impl FnOnce(&mut Vec<LogonSession>) -> T) -> T {
 
 /// SepReferenceLogonSessionSilo: a sessão do LogonId no silo.
 fn find(logon_id: u64, server_silo: u64) -> Option<LogonSession> {
-    with_sessions(|sessions| sessions.iter().copied().find(|session| session.logon_id == logon_id && session.server_silo == server_silo))
+    with_sessions(|sessions| sessions.iter().find(|session| session.logon_id == logon_id && session.server_silo == server_silo).cloned())
 }
 
 /// SepCreateLogonSessionTrack (rva 0x6850ac), o RmCreateLogonSession do LSA
@@ -72,9 +80,27 @@ pub fn create_track(logon_id: u64) -> u32 {
         if sessions.iter().any(|session| session.logon_id == logon_id && session.server_silo == 0) {
             return STATUS_LOGON_SESSION_COLLISION;
         }
-        sessions.push(LogonSession { logon_id, server_silo: 0, token: 0, buddy_logon_id: 0 });
+        sessions.push(LogonSession::new(logon_id));
         0
     })
+}
+
+/// SepUpdateLogonSessionTrack (rva 0x692474), o comando 4 do LSA
+/// (SepRmAddLogonSessionInfoWrkr): o AccountName e o AuthorityName da
+/// sessão do LogonId no silo hospedeiro, que trocam os anteriores;
+/// STATUS_NO_SUCH_LOGON_SESSION se a sessão não existe. Devolve o NTSTATUS.
+pub fn add_info(logon_id: u64, account_name: &[u16], authority_name: &[u16]) -> u32 {
+    with_sessions(|sessions| {
+        let Some(session) = sessions.iter_mut().find(|session| session.logon_id == logon_id && session.server_silo == 0) else { return STATUS_NO_SUCH_LOGON_SESSION };
+        session.account_name = account_name.to_vec();
+        session.authority_name = authority_name.to_vec();
+        0
+    })
+}
+
+/// O AccountName e o AuthorityName que o LSA informou para a sessão.
+pub fn names(logon_id: u64) -> Option<(Vec<u16>, Vec<u16>)> {
+    find(logon_id, 0).map(|session| (session.account_name, session.authority_name))
 }
 
 /// SepDeleteLogonSessionTrack (rva 0x77a490) sem a revogação de handles, o

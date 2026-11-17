@@ -440,8 +440,38 @@ pub fn set_traits(buffer: &[u8], mode: u8) -> Result<u32, (u32, u32)> {
     if status & 0x8000_0000 != 0 { Err((status, 0)) } else { Ok(0) }
 }
 
+/// NtTraceEvent com flags 0x500 (o EtwWriteUMSecurityEvent da ntdll, os
+/// eventos de auditoria do lsasrv), como no NtTraceEvent do 19041: só o
+/// processo registrado pelo código 24 do NtTraceControl
+/// (`logger::security_provider_pid`) escreve, os outros recebem
+/// STATUS_ACCESS_DENIED; o bloco de 0x78 bytes passa pelas mesmas sondas
+/// do 0x300 e vai às sessões de segurança do silo. O OpenNT não tem sessão
+/// de segurança (o logger do Eventlog-Security): o evento é aceito sem
+/// destino, como o EtwpWriteUserEvent com a máscara de loggers vazia.
+fn security_event(fields: u64, mode: u8) -> u32 {
+    if crate::ntos::ps::process::get_current_process_id() != super::logger::security_provider_pid() {
+        return 0xC000_0022;
+    }
+    if mode != 0 {
+        if fields & 3 != 0 {
+            return 0x8000_0002;
+        }
+        let end = fields.wrapping_add(0x78);
+        if end > crate::ntos::mm::memory_map::USER_PROBE_ADDRESS || end < fields {
+            return STATUS_ACCESS_VIOLATION;
+        }
+    }
+    if guest::try_read_bytes(fields, 0x78).is_err() {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    0
+}
+
 /// NtTraceEvent(TraceHandle, Flags, FieldSize, Fields) de modo usuário.
 pub fn trace_event(handle: u64, flags: u32, _field_size: u32, fields: u64, mode: u8) -> Result<u32, KernelError> {
+    if flags & 0xFF00 == 0x500 {
+        return Ok(security_event(fields, mode));
+    }
     if flags & 0xFF00 != 0x300 {
         // EVENT_TRACE_HEADER clássico (0x200) e TraceMessage: as sessões
         // daqui não têm o logger clássico por TRACEHANDLE.

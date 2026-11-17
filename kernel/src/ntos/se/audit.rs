@@ -142,6 +142,82 @@ pub fn set_policy_from_lsa(policy: &[u16; LSA_POLICY_SUBCATEGORIES]) {
     }
 }
 
+/// Uma entrada da SepRmGlobalSaclHead: o nome do tipo de objeto e a SACL
+/// global dele (os bytes do valor padrão da chave).
+struct GlobalSacl {
+    type_name: Vec<u16>,
+    sacl: Vec<u8>,
+}
+
+/// SepRmGlobalSaclHead, sob a SepRmGlobalSaclLock.
+static GLOBAL_SACLS: SpinLock<Vec<GlobalSacl>> = SpinLock::new(Vec::new());
+
+/// GlobalSaclKeyPrefix: a chave da SACL global de um tipo é este prefixo
+/// seguido do nome do tipo.
+const GLOBAL_SACL_KEY_PREFIX: &str = "\\Registry\\Machine\\SECURITY\\Policy\\GlobalSaclName";
+const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
+const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
+/// O maior ResultLength de KEY_VALUE_PARTIAL_INFORMATION aceito (0xC de
+/// cabeçalho mais 0xFFFF bytes de SACL).
+const GLOBAL_SACL_MAXIMUM_RESULT: usize = 0x1_000B;
+
+/// SepRmGlobalSaclSetWrkr (rva 0x7c5390), o comando 5 que o LSA manda pela
+/// `\SeRmCommandPort` (`se/reference_monitor.rs`) para cada tipo com SACL
+/// global ("File" e "Key" no LsapAdtInitialize). O SepRmFetchGlobalSacl abre
+/// a chave do tipo (o ZwOpenKey de kernel) e lê o valor padrão; a falha da
+/// abertura ou da leitura é o ReturnedStatus (sem chave,
+/// STATUS_OBJECT_NAME_NOT_FOUND, que o LsapAdtApplyGlobalSaclUpdate do
+/// lsasrv aceita). Uma SACL lida troca ou cria a entrada do tipo; um valor
+/// sem dados tira a entrada.
+pub fn set_global_sacl_from_lsa(type_name: &[u16]) -> u32 {
+    let name = String::from_utf16_lossy(type_name);
+    let path = format!("{GLOBAL_SACL_KEY_PREFIX}{name}");
+    let Some(node) = crate::ntos::cm::registry::node_by_path(&path) else { return STATUS_OBJECT_NAME_NOT_FOUND };
+    let Some(value) = crate::ntos::cm::registry::with_node(node, |key| key.value("").map(|value| value.data.clone())) else { return STATUS_OBJECT_NAME_NOT_FOUND };
+    let Some(data) = value else { return STATUS_OBJECT_NAME_NOT_FOUND };
+    // O ResultLength da primeira leitura (KEY_VALUE_PARTIAL_INFORMATION):
+    // acima do limite, o STATUS_BUFFER_TOO_SMALL dela volta ao LSA.
+    if 0xC + data.len() > GLOBAL_SACL_MAXIMUM_RESULT {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    let mut list = GLOBAL_SACLS.lock();
+    let position = list.iter().position(|entry| entry.type_name == type_name);
+    match (position, data.is_empty()) {
+        (Some(index), false) => list[index].sacl = data,
+        (Some(index), true) => {
+            list.remove(index);
+        }
+        (None, false) => list.insert(0, GlobalSacl { type_name: type_name.to_vec(), sacl: data }),
+        (None, true) => {}
+    }
+    0
+}
+
+/// A SACL global de um tipo de objeto (os bytes da ACL), se o LSA a
+/// instalou.
+pub fn global_sacl(type_name: &str) -> Option<Vec<u8>> {
+    let wanted: Vec<u16> = type_name.encode_utf16().collect();
+    GLOBAL_SACLS.lock().iter().find(|entry| entry.type_name == wanted).map(|entry| entry.sacl.clone())
+}
+
+/// SepRmAuditProcessCommandLine e SepRmAuditingEnabled.
+static AUDIT_PROCESS_COMMAND_LINE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static AUDITING_ENABLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// SepRmProcessCreationCommandLineAuditSettingsWrkr (rva 0x365650), o
+/// comando 7 do LSA: a auditoria da linha de comando na criação de
+/// processos e o SepRmAuditingEnabled ligado. Sempre STATUS_SUCCESS.
+pub fn set_process_command_line_audit(enabled: bool) -> u32 {
+    AUDIT_PROCESS_COMMAND_LINE.store(enabled, core::sync::atomic::Ordering::Release);
+    AUDITING_ENABLED.store(true, core::sync::atomic::Ordering::Release);
+    0
+}
+
+/// SepRmAuditProcessCommandLine.
+pub fn audit_process_command_line() -> bool {
+    AUDIT_PROCESS_COMMAND_LINE.load(core::sync::atomic::Ordering::Acquire)
+}
+
 /// O SeAuditingStateByCategory da categoria (0 fora da tabela).
 pub fn category_policy(category: usize) -> u32 {
     POLICY.lock().by_category.get(category).copied().unwrap_or(0)

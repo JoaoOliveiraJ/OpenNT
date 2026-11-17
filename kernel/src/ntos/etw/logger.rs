@@ -57,6 +57,7 @@ const BUFFER_HEADER_SIZE: u32 = core::mem::size_of::<WmiBufferHeader>() as u32;
 pub const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
 pub const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 pub const STATUS_INVALID_DEVICE_REQUEST: u32 = 0xC000_0010;
+const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
 pub const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
 pub const STATUS_OBJECT_NAME_COLLISION: u32 = 0xC000_0035;
 pub const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
@@ -549,6 +550,28 @@ fn logger_control(code: u32, buffer: &mut [u8], input_length: u32, output_length
     run().map(|()| INFORMATION_SIZE as u32).map_err(|status| (status, INFORMATION_SIZE as u32))
 }
 
+/// O SecurityProviderPID do ETW_SILODRIVERSTATE do silo hospedeiro: o
+/// processo do provedor de eventos de segurança (o lsass.exe).
+static SECURITY_PROVIDER_PID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// EtwpRegisterSecurityProvider (rva 0x7d50a0), o código 24 do
+/// NtTraceControl (o EtwRegisterSecurityProvider da ntdll, que o
+/// AdtpInitializeAuditingCommon do lsasrv chama): o primeiro processo fica
+/// como provedor de segurança; um segundo registro dá STATUS_ACCESS_DENIED.
+fn register_security_provider() -> u32 {
+    let pid = crate::ntos::ps::process::get_current_process_id();
+    match SECURITY_PROVIDER_PID.compare_exchange(0, pid, core::sync::atomic::Ordering::AcqRel, core::sync::atomic::Ordering::Acquire) {
+        Ok(_) => 0,
+        Err(_) => STATUS_ACCESS_DENIED,
+    }
+}
+
+/// O processo registrado como provedor de eventos de segurança (0 sem
+/// registro).
+pub fn security_provider_pid() -> u64 {
+    SECURITY_PROVIDER_PID.load(core::sync::atomic::Ordering::Acquire)
+}
+
 /// NtTraceControl/ZwTraceControl: `mode` é o modo anterior do chamador.
 pub fn trace_control(code: u32, input: u64, input_length: u32, output: u64, output_length: u32, return_length: u64, mode: u8) -> Result<u32, KernelError> {
     let user = mode != 0;
@@ -607,6 +630,7 @@ pub fn trace_control(code: u32, input: u64, input_length: u32, output: u64, outp
         20 if input_length != 0 || output_length != 0 => invalid,
         22 if input_length != 0x10 => invalid,
         24 if input_length != 0 || output_length != 0 => invalid,
+        24 => status_only(register_security_provider()),
         25 if input_length != 4 || output_length != 0x10 => invalid,
         26 if input_length != 8 => invalid,
         26 => status_only(user_registration::track_provider_binary(u64::from_le_bytes(buffer[0..8].try_into().unwrap()), mode)?),

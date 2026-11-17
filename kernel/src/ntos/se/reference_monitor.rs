@@ -29,10 +29,11 @@
 //!   silos de servidor).
 //!
 //! Os trabalhadores: RmAuditSetCommand (1, a política de auditoria em
-//! `se/audit.rs`), RmCreateLogonSession (2) e RmDeleteLogonSession (3, as
-//! sessões de logon em `se/logon_session.rs`). Os comandos 4 a 12
-//! (informação da sessão, SACL global, políticas de acesso central,
-//! auditoria da linha de comando, logoff interativo, sessões irmãs, LUID
+//! `se/audit.rs`), RmCreateLogonSession (2), RmDeleteLogonSession (3) e a
+//! informação da sessão (4, o AccountName e o AuthorityName, as sessões de
+//! logon em `se/logon_session.rs`), a SACL global de um tipo (5) e a
+//! auditoria da linha de comando (7, em `se/audit.rs`). Os comandos 6 e 8 a
+//! 12 (políticas de acesso central, logoff interativo, sessões irmãs, LUID
 //! único do processo e sessão de usuário compartilhada) respondem
 //! STATUS_NOT_SUPPORTED, com registro.
 //!
@@ -43,6 +44,7 @@
 //! variável de firmware de proteção do LSA, que um boot por BIOS não tem, e
 //! não muda nada.
 
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::ntos::alpc::lpc;
@@ -72,6 +74,9 @@ const LPC_CONNECTION_REQUEST: u16 = 10;
 const RM_AUDIT_SET_COMMAND: u32 = 1;
 const RM_CREATE_LOGON_SESSION: u32 = 2;
 const RM_DELETE_LOGON_SESSION: u32 = 3;
+const RM_ADD_LOGON_SESSION_INFO: u32 = 4;
+const RM_GLOBAL_SACL_SET: u32 = 5;
+const RM_PROCESS_COMMAND_LINE_AUDIT: u32 = 7;
 const RM_LAST_COMMAND: u32 = 12;
 /// O PortContext da conexão do LSA no silo hospedeiro.
 const HOST_SILO_CONTEXT: u64 = (-8i64) as u64;
@@ -220,6 +225,35 @@ fn logon_id(request: &RmCommandMessage) -> u64 {
     tokens::luid_value(unsafe { Luid::at(request.command_params[0].address()) })
 }
 
+/// Os bytes dos CommandParams de `offset` a `offset + length`, cortados no
+/// fim da mensagem.
+fn params(request: &RmCommandMessage, offset: usize, length: usize) -> Vec<u8> {
+    let end = (offset + length).min(request.command_params.len());
+    request.command_params.get(offset..end).map_or(Vec::new(), |cells| cells.iter().map(|cell| cell.get()).collect())
+}
+
+/// Um USHORT dos CommandParams.
+fn params_u16(request: &RmCommandMessage, offset: usize) -> u16 {
+    let bytes = params(request, offset, 2);
+    if bytes.len() == 2 { u16::from_le_bytes([bytes[0], bytes[1]]) } else { 0 }
+}
+
+/// Caracteres UTF-16 dos CommandParams.
+fn params_wide(request: &RmCommandMessage, offset: usize, length: usize) -> Vec<u16> {
+    params(request, offset, length & !1).chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect()
+}
+
+/// SepRmAddLogonSessionInfoWrkr: o LUID, os UNICODE_STRING AccountName
+/// (+8) e AuthorityName (+0x18) e os caracteres em +0x28, o AuthorityName
+/// depois do AccountName alinhado a 8.
+fn add_logon_session_info(request: &RmCommandMessage) -> u32 {
+    let account_length = params_u16(request, 8) as usize;
+    let authority_length = params_u16(request, 0x18) as usize;
+    let account = params_wide(request, 0x28, account_length);
+    let authority = params_wide(request, 0x28 + ((account_length + 7) & !7), authority_length);
+    logon_session::add_info(logon_id(request), &account, &authority)
+}
+
 /// A tabela SepRmCommandDispatch.
 fn dispatch(command: u32, request: &RmCommandMessage, reply: &RmReplyMessage) {
     let status = match command {
@@ -233,6 +267,10 @@ fn dispatch(command: u32, request: &RmCommandMessage, reply: &RmReplyMessage) {
         }
         RM_CREATE_LOGON_SESSION => logon_session::create_track(logon_id(request)),
         RM_DELETE_LOGON_SESSION => logon_session::delete_track(logon_id(request)),
+        RM_ADD_LOGON_SESSION_INFO => add_logon_session_info(request),
+        // O UNICODE_STRING do nome do tipo: o Length em +0 e os caracteres em +2.
+        RM_GLOBAL_SACL_SET => audit::set_global_sacl_from_lsa(&params_wide(request, 2, params_u16(request, 0) as usize)),
+        RM_PROCESS_COMMAND_LINE_AUDIT => audit::set_process_command_line_audit(request.command_params[0].get() != 0),
         _ => {
             crate::debug_print!("[se] Reference Monitor: comando {} sem suporte", command);
             STATUS_NOT_SUPPORTED
