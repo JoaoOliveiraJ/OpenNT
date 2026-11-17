@@ -1363,7 +1363,24 @@ fn user_mutants_and_timers(assert: Assert) {
     unsafe { nt::LargeInteger::at(previous) }.quad_part.set(-5);
     assert(call("NtSetTimer2", timer, due, previous, 0) == 0xC000_000D, "usermutants: periodo negativo recusado");
     guest::write32(rsp + 0x28, 0x1F_0003);
-    assert(call("NtCreateTimer2", out, 0, 0, 0x10) == 0xC000_000D && call("NtCreateTimer2", out, 1, 0, 0) == 0xC000_00BB, "usermutants: atributos invalidos e provedor IR");
+    let identifier = block + 0x60;
+    assert(call("NtCreateTimer2", out, 0, 0, 0x10) == 0xC000_00F2 && call("NtCreateTimer2", out, 0, 0, 0xA) == 0xC000_00F2 && call("NtCreateTimer2", out, identifier, 0, 0) == 0xC000_00F0, "usermutants: atributos invalidos e identificador sem o atributo IR");
+    // NtCreateIRTimer: indice 0 e sub acima do maximo sao invalidos; o
+    // indice 6 (Power) exige o NT SERVICE\Power na identidade.
+    guest::write32(identifier, 0);
+    let index_zero = call("NtCreateIRTimer", out, identifier, 0x1F_0003, 0);
+    guest::write32(identifier, 6 | 3 << 16);
+    let sub_too_large = call("NtCreateIRTimer", out, identifier, 0x1F_0003, 0);
+    guest::write32(identifier, 6);
+    // O PreviousMode de uma syscall de modo usuário (o RtlCheckTokenMembership
+    // em KernelMode concede sempre).
+    // SAFETY: a ETHREAD da thread corrente.
+    let previous = &unsafe { nt::Ethread::at(crate::ntos::ps::process::get_current_thread()) }.tcb.previous_mode;
+    let saved_previous = previous.get();
+    previous.set(1);
+    let power_denied = call("NtCreateIRTimer", out, identifier, 0x1F_0003, 0);
+    previous.set(saved_previous);
+    assert(index_zero == 0xC000_000D && sub_too_large == 0xC000_000D && power_denied == 0xC000_0022, "usermutants: NtCreateIRTimer confere o identificador IR e o SID do servico");
     let _ = call("NtClose", timer, 0, 0, 0);
     if let Some(region) = memory::find_region(block) {
         memory::release_private_region(&region);

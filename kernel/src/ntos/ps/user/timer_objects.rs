@@ -83,20 +83,45 @@ fn resolve(handle: u64, access: u32) -> Result<Arc<TimerObject>, u32> {
     entry.downcast::<UserDispatcher>().and_then(|dispatcher| dispatcher.payload.clone()).and_then(|payload| payload.downcast::<TimerObject>().ok()).ok_or(0xC000_0024)
 }
 
-/// NtCreateTimer2(out, id, oa, attributes, access): provedores IR e prazos
-/// de alta resolução ainda não são expostos pela HAL (0xC00000BB).
+/// NtCreateTimer2(out, id, oa, attributes, access).
 fn nt_create_timer2(out: u64, id: u64, attributes: u64, timer_attributes: u64, rsp: u64) -> Result<u32, KernelError> {
-    if !state::probe_user_write(out, 8) || (attributes != 0 && !state::probe_user_read(attributes, 48)) {
+    create_timer2(out, id, attributes, timer_attributes as u32, state::stack_arg32(rsp, 5))
+}
+
+/// O NtCreateTimer2 com o acesso já lido: atributos fora do
+/// ExpExTimerAttributesAreValid dão STATUS_INVALID_PARAMETER_4, um
+/// identificador sem o atributo IR (2) dá STATUS_INVALID_PARAMETER_2 e o
+/// identificador IR capturado passa pelo ExpCheckIRTimerAccess
+/// (`ex/ir_timer.rs`). Prazos de alta resolução ainda não são expostos pela
+/// HAL (0xC00000BB). Sem hardware de wake IR, o timer IR é um Timer2 comum.
+fn create_timer2(out: u64, id: u64, attributes: u64, timer_attributes: u32, access: u32) -> Result<u32, KernelError> {
+    if !crate::ntos::ex::ir_timer::attributes_are_valid(timer_attributes) {
+        return Ok(0xC000_00F2);
+    }
+    let ir = timer_attributes & 2 != 0;
+    if id != 0 && !ir {
+        return Ok(0xC000_00F0);
+    }
+    if !state::probe_user_write(out, 8) || (attributes != 0 && !state::probe_user_read(attributes, 48)) || (id != 0 && !state::probe_user_read(id, 4)) {
         return Ok(0xC000_0005);
     }
-    let timer_attributes = timer_attributes as u32;
-    if timer_attributes & !0x8000_000E != 0 {
-        return Ok(0xC000_000D);
-    }
-    if id != 0 || timer_attributes & 6 != 0 {
+    if timer_attributes & 4 != 0 {
         return Ok(0xC000_00BB);
     }
-    let access = state::stack_arg32(rsp, 5);
+    if ir {
+        let identifier = if id != 0 {
+            match guest::try_read::<u32>(id) {
+                Ok(identifier) => identifier,
+                Err(error) => return Ok(error.status),
+            }
+        } else {
+            0
+        };
+        let status = crate::ntos::ex::ir_timer::check_user_access(identifier);
+        if status != 0 {
+            return Ok(status);
+        }
+    }
     let name = if attributes != 0 {
         match parse_user_object_attributes(attributes) {
             Some(parsed) => parsed.path,
@@ -271,6 +296,18 @@ fn nt_cancel_timer(handle: u64, current_state: u64, _a3: u64, _a4: u64, _rsp: u6
     timer_object::cancel(handle, current_state, USER_MODE)
 }
 
+/// NtCreateIRTimer(TimerHandle, IrTimerId, DesiredAccess): o NtCreateTimer2
+/// sem OBJECT_ATTRIBUTES e com o atributo IR (2).
+fn nt_create_ir_timer(out: u64, id: u64, access: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
+    create_timer2(out, id, 0, 2, access as u32)
+}
+
+/// NtSetIRTimer(TimerHandle, DueTime): o NtSetTimer2 sem período nem
+/// parâmetros.
+fn nt_set_ir_timer(handle: u64, due: u64, _a3: u64, _a4: u64, rsp: u64) -> Result<u32, KernelError> {
+    nt_set_timer2(handle, due, 0, 0, rsp)
+}
+
 pub fn init() {
     state::register_handler("NtCreateTimer", nt_create_timer);
     state::register_handler("NtSetTimer", nt_set_timer);
@@ -279,4 +316,6 @@ pub fn init() {
     state::register_handler("NtSetTimer2", nt_set_timer2);
     state::register_handler("NtCancelTimer2", nt_cancel_timer2);
     state::register_handler("NtQueryTimer", nt_query_timer);
+    state::register_handler("NtCreateIRTimer", nt_create_ir_timer);
+    state::register_handler("NtSetIRTimer", nt_set_ir_timer);
 }

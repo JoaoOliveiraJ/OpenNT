@@ -2970,7 +2970,12 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   (`ex/system_information.rs::query_fixed`, também no Zw). O NtCreateTimer,
   o NtSetTimer e o NtCancelTimer de modo usuário são adaptadores do ETIMER
   do Executive (`ex/timer_object.rs`, PreviousMode UserMode, em
-  `ps/user/timer_objects.rs`). O services.exe e o lsass pedem ainda as
+  `ps/user/timer_objects.rs`). O NtCreateIRTimer é o NtCreateTimer2 com o
+  atributo IR (2): o identificador IR passa pelo ExpCheckIRTimerAccess
+  (`ex/ir_timer.rs`: índice de 1 a 15, sub até o máximo do ExpIRTimerDescs
+  e o SID do serviço dono do índice na identidade, como o NT SERVICE\Power
+  do índice 6 que o umpo pede); sem hardware de wake IR, o timer é um
+  Timer2 comum e o NtSetIRTimer é o NtSetTimer2 sem período. O services.exe e o lsass pedem ainda as
   classes ProcessTimes (4), ProcessImageFileNameWin32 (43) e
   ProcessMitigationPolicy (52) do NtQueryInformationProcess
   (`ps/query_process.rs`), a ProcessRaiseUMExceptionOnInvalidHandleClose
