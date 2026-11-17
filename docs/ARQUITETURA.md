@@ -1916,6 +1916,68 @@ processador (cpu.inf). O barramento PCI interno do kernel fica fora dessa
 árvore; as funções dos drivers internos são reconhecidas pelos ids de
 classe do pci.sys (`device_tree.rs`).
 
+Com `--tpm` (a opção de carga `TPM`, `drivers/security/tpm_stack.rs`; no
+xtask, também o dispositivo do QEMU) a máquina tem um TPM 2.0 com interface
+CRB. O QEMU expõe o `tpm-crb`: o dispositivo `TPM` no `\_SB` da DSDT, com
+`_HID` MSFT0101 e a janela MMIO em 0xFED40000, e a tabela ACPI TPM2 com
+start method 7 e a área de controle em 0xFED40040. O backend do TPM é o
+`mssim` do QEMU do OpenNT (`tools/qemu/tpm-mssim.patch`), que fala o
+protocolo TCP do simulador de TPM 2.0 de referência: uma porta de comandos e
+a seguinte, de plataforma (energia, NV, cancelamento). O xtask sobe o
+simulador (`tpm_server.exe`, ao lado do QEMU, ou a variável
+`TPM_SIMULATOR`) em duas portas livres, com o estado NV e o log na pasta
+temporária da execução (`qemu-tmp`), e o mata antes de apagar a pasta. O
+reset do dispositivo no QEMU desliga e religa o TPM pelo canal de
+plataforma, como um reset da placa. O SeaBIOS manda o TPM2_Startup e
+estende os PCRs dele antes do boot.
+
+O acpi.sys relata o `ACPI\MSFT0101` sob a raiz ACPI e o instalador o casa
+com o tpm.inf (`[Tpm2BaseInstall]`: serviço TPM sob demanda, grupo Boot Bus
+Extender, BootFlags 0x20, classe SecurityDevices e HardwareType 20 no
+Device Parameters). O tpm.sys real é um driver KMDF. O DriverEntry escolhe
+o transporte pela tabela TPM2 (TpmTransportType::Determine): ele a lê pelo
+HalGetCachedAcpiTable da HalDispatchTable (slot +0xA8), que no ntoskrnl
+19041 é o HalAcpiGetTableDispatch gravado pelo HalpSetupAcpiPhase0 numa
+máquina ACPI (o slot do OpenNT aponta para a mesma rotina da
+HalAcpiDispatchTable). A revisão 3 ou 4 da tabela e o start method 7 dão o
+transporte CRB. O kernel não manda comandos ao TPM no boot: no ntoskrnl
+19041 o único uso é o BapdRegisterSiData, que copia para
+`Control\IntegrityServices` os dados de integridade que o winload deixa
+(TPMActivePCRBanks, TPMActiveLogFormat, TPMDigestAlgID). As medições do boot
+são do carregador com o firmware; sem o winload o OpenNT não as tem e não
+as inventa.
+
+A ida e volta de comandos usa o caminho dos componentes de kernel do
+Windows: o tbs.sys, o export driver da API de TPM de kernel, carregado como
+biblioteca. O Tbsi_Context_Create (TBS_CONTEXT_PARAMS2, versão 2 com
+includeTpm20) abre o `\??\TPM`, que o AddDevice do tpm.sys liga ao nome do
+PDO (IoGetDeviceProperty com DevicePropertyPhysicalDeviceObjectName). O
+KMDF devolve STATUS_PENDING de todo IRP_MJ_CREATE que entrega ao
+EvtDeviceFileCreate, mesmo concluído dentro do despacho; como o
+IopParseDevice, a abertura por nome do I/O Manager espera a conclusão do IRP
+e fica com o status final (`io_manager::open_device_file`), e um create
+recusado devolve ao ZwCreateFile o status do driver. O Tbsip_Submit_Command
+manda cada comando por IOCTL ao tpm.sys, que o leva ao TPM pelo CRB. O
+tpm.sys bloqueia o TPM2_Startup de todo cliente do TBS: o código 0x144 não
+está em nenhuma das três listas de comandos permitidos por tipo de usuário
+do Tpm20Scheduler::IsCommandBlocked, e a resposta é o cabeçalho com
+TPM_E_COMMAND_BLOCKED (0x80280400). O TPM2_GetRandom e o TPM2_GetCapability
+estão nas três listas e vão ao TPM. Os marcadores: `TPM_DEVICE_FOUND` (o
+MSFT0101 relatado e a tabela TPM2 no firmware), `TPM_STARTED` (o nó
+iniciado com o FDO do \Driver\TPM) e `TPM_COMMAND_OK` (o Startup bloqueado
+pelo tpm.sys, 16 bytes do TPM2_GetRandom e o TPM_PT_MANUFACTURER do
+TPM2_GetCapability). O TPM2_PCR_Read do PCR 0 (SHA-256) vai para o log, com
+o valor das medições do firmware.
+
+O QEMU do OpenNT com o TPM: as fontes do QEMU 11.1.0 com o
+`tools/qemu/tpm-mssim.patch` (o backend `tpm_mssim.c`, o tipo `mssim` no
+`qapi/tpm.json` e o TPM liberado no Windows, só com esse backend, porque o
+`emulator` passa o socket de dados por SCM_RIGHTS), configurado com
+`--enable-tpm`. O simulador compila com o MSYS2 UCRT64 (gcc e OpenSSL 3) pelo
+makefile de Windows dele (`-DTPM_WINDOWS`, `-lcrypto -lws2_32`); o
+`tpm_server.exe` precisa do `libcrypto-3-x64.dll` e do `libwinpthread-1.dll`
+na mesma pasta.
+
 ### 3.6 A interface x86 BIOS
 
 Os drivers de vídeo do Windows chamam o BIOS de vídeo da máquina (as
@@ -4053,7 +4115,7 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   `--build-dir`). Cada execução tem a pasta `build/test-all/<id>` (`<id>.<n>`
   com `--repeat`). As opções de boot dos testes (`--kernel-test-scope`,
   `--start-driver`, `--kd`, `--initial-process`, `--storage`, `--display`,
-  `--pnp-root`, `--usb`, `--trace-driver-api`, `--console-mirror`) não entram no
+  `--pnp-root`, `--usb`, `--tpm`, `--trace-driver-api`, `--console-mirror`) não entram no
   build: vão no bloco de opções de carga da imagem de boot (abaixo), então
   a rodada inteira compila um kernel só. Uma thread monta as imagens
   (`test-boot --build-only`) uma vez por chave de imagem

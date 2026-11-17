@@ -1,0 +1,499 @@
+diff -ruN a/backends/tpm/Kconfig b/backends/tpm/Kconfig
+--- a/backends/tpm/Kconfig
++++ b/backends/tpm/Kconfig
+@@ -12,3 +12,8 @@
+     bool
+     default y
+     depends on TPM_BACKEND
++
++config TPM_MSSIM
++    bool
++    default y
++    depends on TPM_BACKEND
+diff -ruN a/backends/tpm/meson.build b/backends/tpm/meson.build
+--- a/backends/tpm/meson.build
++++ b/backends/tpm/meson.build
+@@ -2,5 +2,9 @@
+   system_ss.add(files('tpm_backend.c'))
+   system_ss.add(files('tpm_util.c'))
+   system_ss.add(when: 'CONFIG_TPM_PASSTHROUGH', if_true: files('tpm_passthrough.c'))
+-  system_ss.add(when: 'CONFIG_TPM_EMULATOR', if_true: files('tpm_emulator.c'))
++  if host_os != 'windows'
++    # The emulator backend passes its data socket with SCM_RIGHTS.
++    system_ss.add(when: 'CONFIG_TPM_EMULATOR', if_true: files('tpm_emulator.c'))
++  endif
++  system_ss.add(when: 'CONFIG_TPM_MSSIM', if_true: files('tpm_mssim.c'))
+ endif
+diff -ruN a/backends/tpm/tpm_mssim.c b/backends/tpm/tpm_mssim.c
+--- a/backends/tpm/tpm_mssim.c
++++ b/backends/tpm/tpm_mssim.c
+@@ -0,0 +1,352 @@
++/*
++ * TPM 2.0 simulator backend
++ *
++ * Talks to a TPM 2.0 simulator process over the TCP protocol of the TCG
++ * reference simulator: a command port (TPM_SEND_COMMAND with locality and
++ * the command bytes) and a platform port (power, NV and cancel signals).
++ * It works on every host QEMU supports, Windows included, since it needs
++ * no file descriptor passing.
++ *
++ * Usage:
++ *   -tpmdev mssim,id=tpm0,host=127.0.0.1,port=2321
++ *   -device tpm-tis,tpmdev=tpm0
++ * The platform port is port + 1 unless platform-port is given.
++ *
++ * This work is licensed under the terms of the GNU GPL, version 2 or later.
++ * See the COPYING file in the top-level directory.
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/error-report.h"
++#include "qemu/module.h"
++#include "qemu/sockets.h"
++#include "qemu/thread.h"
++#include "io/channel-socket.h"
++#include "system/tpm_backend.h"
++#include "system/tpm_util.h"
++#include "tpm_int.h"
++#include "qapi/clone-visitor.h"
++#include "qapi/qapi-visit-tpm.h"
++#include "qom/object.h"
++
++#define TYPE_TPM_MSSIM "tpm-mssim"
++OBJECT_DECLARE_SIMPLE_TYPE(TPMMssimState, TPM_MSSIM)
++
++/* Commands of the simulator's TCP protocol (32-bit, big endian). */
++#define MSSIM_SIGNAL_POWER_ON   1
++#define MSSIM_SIGNAL_POWER_OFF  2
++#define MSSIM_SEND_COMMAND      8
++#define MSSIM_SIGNAL_CANCEL_ON  9
++#define MSSIM_SIGNAL_CANCEL_OFF 10
++#define MSSIM_SIGNAL_NV_ON      11
++#define MSSIM_SESSION_END       20
++
++#define MSSIM_DEFAULT_HOST "127.0.0.1"
++#define MSSIM_DEFAULT_PORT 2321
++#define MSSIM_BUFFER_SIZE  4096
++
++struct TPMMssimState {
++    TPMBackend parent;
++
++    TPMMssimOptions *options;
++    QIOChannelSocket *command;
++    QIOChannelSocket *platform;
++    /* Serializes the platform channel (cancel comes from the main loop). */
++    QemuMutex platform_lock;
++    bool executing;
++    bool cancel_sent;
++};
++
++static QIOChannelSocket *tpm_mssim_connect(const char *host, unsigned port,
++                                           Error **errp)
++{
++    QIOChannelSocket *sioc = qio_channel_socket_new();
++    SocketAddress addr = {
++        .type = SOCKET_ADDRESS_TYPE_INET,
++    };
++
++    addr.u.inet.host = (char *)host;
++    addr.u.inet.port = g_strdup_printf("%u", port);
++    if (qio_channel_socket_connect_sync(sioc, &addr, errp) < 0) {
++        g_free(addr.u.inet.port);
++        object_unref(OBJECT(sioc));
++        return NULL;
++    }
++    g_free(addr.u.inet.port);
++    qio_channel_set_delay(QIO_CHANNEL(sioc), false);
++    return sioc;
++}
++
++static int tpm_mssim_write_u32(QIOChannelSocket *sioc, uint32_t value,
++                               Error **errp)
++{
++    uint32_t be = cpu_to_be32(value);
++
++    return qio_channel_write_all(QIO_CHANNEL(sioc), (const char *)&be,
++                                 sizeof(be), errp);
++}
++
++static int tpm_mssim_read_u32(QIOChannelSocket *sioc, uint32_t *value,
++                              Error **errp)
++{
++    uint32_t be;
++
++    if (qio_channel_read_all(QIO_CHANNEL(sioc), (char *)&be, sizeof(be),
++                             errp) < 0) {
++        return -1;
++    }
++    *value = be32_to_cpu(be);
++    return 0;
++}
++
++/* One platform signal and its acknowledgement (0 on success). */
++static int tpm_mssim_signal(TPMMssimState *s, uint32_t signal, Error **errp)
++{
++    uint32_t ack;
++    int ret = -1;
++
++    qemu_mutex_lock(&s->platform_lock);
++    if (tpm_mssim_write_u32(s->platform, signal, errp) == 0 &&
++        tpm_mssim_read_u32(s->platform, &ack, errp) == 0) {
++        if (ack == 0) {
++            ret = 0;
++        } else {
++            error_setg(errp, "tpm-mssim: platform signal %u refused (%u)",
++                       signal, ack);
++        }
++    }
++    qemu_mutex_unlock(&s->platform_lock);
++    return ret;
++}
++
++static void tpm_mssim_handle_request(TPMBackend *tb, TPMBackendCmd *cmd,
++                                     Error **errp)
++{
++    TPMMssimState *s = TPM_MSSIM(tb);
++    QIOChannel *ioc = QIO_CHANNEL(s->command);
++    uint32_t length, ack;
++    uint8_t locality = cmd->locty;
++
++    cmd->selftest_done = false;
++    s->executing = true;
++
++    if (tpm_mssim_write_u32(s->command, MSSIM_SEND_COMMAND, errp) < 0 ||
++        qio_channel_write_all(ioc, (const char *)&locality, 1, errp) < 0 ||
++        tpm_mssim_write_u32(s->command, cmd->in_len, errp) < 0 ||
++        qio_channel_write_all(ioc, (const char *)cmd->in, cmd->in_len,
++                              errp) < 0 ||
++        tpm_mssim_read_u32(s->command, &length, errp) < 0) {
++        goto fail;
++    }
++    if (length < sizeof(struct tpm_resp_hdr) || length > cmd->out_len) {
++        error_setg(errp, "tpm-mssim: response of %u bytes does not fit "
++                   "the %u byte buffer", length, cmd->out_len);
++        goto fail;
++    }
++    if (qio_channel_read_all(ioc, (char *)cmd->out, length, errp) < 0 ||
++        tpm_mssim_read_u32(s->command, &ack, errp) < 0) {
++        goto fail;
++    }
++    if (tpm_cmd_get_size(cmd->out) != length) {
++        error_setg(errp, "tpm-mssim: response size field does not match "
++                   "the %u bytes received", length);
++        goto fail;
++    }
++    if (tpm_util_is_selftest(cmd->in, cmd->in_len)) {
++        cmd->selftest_done = tpm_cmd_get_errcode(cmd->out) == 0;
++    }
++    goto done;
++
++fail:
++    tpm_util_write_fatal_error_response(cmd->out, cmd->out_len);
++done:
++    s->executing = false;
++    if (s->cancel_sent) {
++        s->cancel_sent = false;
++        tpm_mssim_signal(s, MSSIM_SIGNAL_CANCEL_OFF, NULL);
++    }
++}
++
++/*
++ * Device reset: the TPM goes through a power cycle, as on a platform reset;
++ * the firmware sends TPM2_Startup afterwards.
++ */
++static int tpm_mssim_startup_tpm(TPMBackend *tb, size_t buffersize)
++{
++    TPMMssimState *s = TPM_MSSIM(tb);
++    Error *err = NULL;
++
++    if (buffersize && buffersize < MSSIM_BUFFER_SIZE) {
++        error_report("tpm-mssim: buffer of %zu bytes is smaller than the "
++                     "simulator's %u", buffersize, MSSIM_BUFFER_SIZE);
++        return -1;
++    }
++    if (tpm_mssim_signal(s, MSSIM_SIGNAL_POWER_OFF, &err) < 0 ||
++        tpm_mssim_signal(s, MSSIM_SIGNAL_POWER_ON, &err) < 0 ||
++        tpm_mssim_signal(s, MSSIM_SIGNAL_NV_ON, &err) < 0) {
++        error_report_err(err);
++        return -1;
++    }
++    return 0;
++}
++
++static void tpm_mssim_cancel_cmd(TPMBackend *tb)
++{
++    TPMMssimState *s = TPM_MSSIM(tb);
++
++    if (s->executing && !s->cancel_sent) {
++        s->cancel_sent = true;
++        tpm_mssim_signal(s, MSSIM_SIGNAL_CANCEL_ON, NULL);
++    }
++}
++
++static bool tpm_mssim_get_tpm_established_flag(TPMBackend *tb)
++{
++    return false;
++}
++
++static int tpm_mssim_reset_tpm_established_flag(TPMBackend *tb,
++                                                uint8_t locty)
++{
++    return 0;
++}
++
++static TPMVersion tpm_mssim_get_tpm_version(TPMBackend *tb)
++{
++    return TPM_VERSION_2_0;
++}
++
++static size_t tpm_mssim_get_buffer_size(TPMBackend *tb)
++{
++    return MSSIM_BUFFER_SIZE;
++}
++
++static TpmTypeOptions *tpm_mssim_get_tpm_options(TPMBackend *tb)
++{
++    TpmTypeOptions *options = g_new0(TpmTypeOptions, 1);
++
++    options->type = TPM_TYPE_MSSIM;
++    options->u.mssim.data = QAPI_CLONE(TPMMssimOptions, TPM_MSSIM(tb)->options);
++    return options;
++}
++
++static int tpm_mssim_handle_device_opts(TPMMssimState *s, QemuOpts *opts)
++{
++    const char *host = qemu_opt_get(opts, "host");
++    uint64_t port = qemu_opt_get_number(opts, "port", MSSIM_DEFAULT_PORT);
++    uint64_t platform = qemu_opt_get_number(opts, "platform-port", port + 1);
++    Error *err = NULL;
++
++    if (!host) {
++        host = MSSIM_DEFAULT_HOST;
++    }
++    if (port == 0 || port > 65535 || platform == 0 || platform > 65535) {
++        error_report("tpm-mssim: invalid port");
++        return -1;
++    }
++    s->options->host = g_strdup(host);
++    s->options->has_port = true;
++    s->options->port = port;
++    s->options->has_platform_port = true;
++    s->options->platform_port = platform;
++
++    s->platform = tpm_mssim_connect(host, platform, &err);
++    if (s->platform) {
++        s->command = tpm_mssim_connect(host, port, &err);
++    }
++    if (!s->command) {
++        error_prepend(&err, "tpm-mssim: simulator at %s:%u/%u: ", host,
++                      (unsigned)port, (unsigned)platform);
++        error_report_err(err);
++        return -1;
++    }
++    return 0;
++}
++
++static TPMBackend *tpm_mssim_create(QemuOpts *opts)
++{
++    Object *obj = object_new(TYPE_TPM_MSSIM);
++
++    if (tpm_mssim_handle_device_opts(TPM_MSSIM(obj), opts)) {
++        object_unref(obj);
++        return NULL;
++    }
++    return TPM_BACKEND(obj);
++}
++
++static const QemuOptDesc tpm_mssim_cmdline_opts[] = {
++    TPM_STANDARD_CMDLINE_OPTS,
++    {
++        .name = "host",
++        .type = QEMU_OPT_STRING,
++        .help = "Host of the TPM 2.0 simulator (default 127.0.0.1)",
++    },
++    {
++        .name = "port",
++        .type = QEMU_OPT_NUMBER,
++        .help = "TCP command port of the simulator (default 2321)",
++    },
++    {
++        .name = "platform-port",
++        .type = QEMU_OPT_NUMBER,
++        .help = "TCP platform port of the simulator (default port + 1)",
++    },
++    { /* end of list */ },
++};
++
++static void tpm_mssim_inst_init(Object *obj)
++{
++    TPMMssimState *s = TPM_MSSIM(obj);
++
++    s->options = g_new0(TPMMssimOptions, 1);
++    qemu_mutex_init(&s->platform_lock);
++}
++
++static void tpm_mssim_inst_finalize(Object *obj)
++{
++    TPMMssimState *s = TPM_MSSIM(obj);
++
++    if (s->command) {
++        tpm_mssim_write_u32(s->command, MSSIM_SESSION_END, NULL);
++        object_unref(OBJECT(s->command));
++    }
++    if (s->platform) {
++        object_unref(OBJECT(s->platform));
++    }
++    qemu_mutex_destroy(&s->platform_lock);
++    qapi_free_TPMMssimOptions(s->options);
++}
++
++static void tpm_mssim_class_init(ObjectClass *klass, const void *data)
++{
++    TPMBackendClass *tbc = TPM_BACKEND_CLASS(klass);
++
++    tbc->type = TPM_TYPE_MSSIM;
++    tbc->opts = tpm_mssim_cmdline_opts;
++    tbc->desc = "TPM 2.0 simulator over TCP";
++    tbc->create = tpm_mssim_create;
++    tbc->startup_tpm = tpm_mssim_startup_tpm;
++    tbc->cancel_cmd = tpm_mssim_cancel_cmd;
++    tbc->get_tpm_established_flag = tpm_mssim_get_tpm_established_flag;
++    tbc->reset_tpm_established_flag = tpm_mssim_reset_tpm_established_flag;
++    tbc->get_tpm_version = tpm_mssim_get_tpm_version;
++    tbc->get_buffer_size = tpm_mssim_get_buffer_size;
++    tbc->get_tpm_options = tpm_mssim_get_tpm_options;
++    tbc->handle_request = tpm_mssim_handle_request;
++}
++
++static const TypeInfo tpm_mssim_info = {
++    .name = TYPE_TPM_MSSIM,
++    .parent = TYPE_TPM_BACKEND,
++    .instance_size = sizeof(TPMMssimState),
++    .class_init = tpm_mssim_class_init,
++    .instance_init = tpm_mssim_inst_init,
++    .instance_finalize = tpm_mssim_inst_finalize,
++};
++
++static void tpm_mssim_register(void)
++{
++    type_register_static(&tpm_mssim_info);
++}
++
++type_init(tpm_mssim_register)
+diff -ruN a/meson.build b/meson.build
+--- a/meson.build
++++ b/meson.build
+@@ -219,9 +219,8 @@
+   .require(host_os == 'linux', error_message: 'vfio-user server is supported only on Linux') \
+   .allowed()
+ 
+-have_tpm = get_option('tpm') \
+-  .require(host_os != 'windows', error_message: 'TPM emulation only available on POSIX systems') \
+-  .allowed()
++# On Windows only the TCP simulator backend (tpm-mssim) is built.
++have_tpm = get_option('tpm').allowed()
+ 
+ # vhost
+ have_vhost_user = get_option('vhost_user') \
+diff -ruN a/qapi/tpm.json b/qapi/tpm.json
+--- a/qapi/tpm.json
++++ b/qapi/tpm.json
+@@ -48,9 +48,11 @@
+ #
+ # @emulator: Software Emulator TPM type (since 2.11)
+ #
++# @mssim: TPM 2.0 simulator over TCP (since 11.1)
++#
+ # Since: 1.5
+ ##
+-{ 'enum': 'TpmType', 'data': [ 'passthrough', 'emulator' ],
++{ 'enum': 'TpmType', 'data': [ 'passthrough', 'emulator', 'mssim' ],
+   'if': 'CONFIG_TPM' }
+ 
+ ##
+@@ -98,6 +100,25 @@
+   'if': 'CONFIG_TPM' }
+ 
+ ##
++# @TPMMssimOptions:
++#
++# Information about the TPM 2.0 simulator type
++#
++# @host: host of the simulator
++#
++# @port: TCP command port of the simulator
++#
++# @platform-port: TCP platform port of the simulator
++#
++# Since: 11.1
++##
++{ 'struct': 'TPMMssimOptions',
++  'data': { '*host': 'str',
++            '*port': 'uint16',
++            '*platform-port': 'uint16' },
++  'if': 'CONFIG_TPM' }
++
++##
+ # @TPMPassthroughOptionsWrapper:
+ #
+ # @data: Information about the TPM passthrough type
+@@ -120,6 +141,17 @@
+   'if': 'CONFIG_TPM' }
+ 
+ ##
++# @TPMMssimOptionsWrapper:
++#
++# @data: Information about the TPM 2.0 simulator type
++#
++# Since: 11.1
++##
++{ 'struct': 'TPMMssimOptionsWrapper',
++  'data': { 'data': 'TPMMssimOptions' },
++  'if': 'CONFIG_TPM' }
++
++##
+ # @TpmTypeOptions:
+ #
+ # A union referencing different TPM backend types' configuration
+@@ -130,6 +162,8 @@
+ #       passthrough type
+ #     - 'emulator' The configuration options for TPM emulator backend
+ #       type
++#     - 'mssim' The configuration options for the TPM 2.0 simulator
++#       backend type
+ #
+ # Since: 1.5
+ ##
+@@ -137,7 +171,8 @@
+   'base': { 'type': 'TpmType' },
+   'discriminator': 'type',
+   'data': { 'passthrough' : 'TPMPassthroughOptionsWrapper',
+-            'emulator': 'TPMEmulatorOptionsWrapper' },
++            'emulator': 'TPMEmulatorOptionsWrapper',
++            'mssim': 'TPMMssimOptionsWrapper' },
+   'if': 'CONFIG_TPM' }
+ 
+ ##
+diff -ruN a/system/tpm-hmp-cmds.c b/system/tpm-hmp-cmds.c
+--- a/system/tpm-hmp-cmds.c
++++ b/system/tpm-hmp-cmds.c
+@@ -19,6 +19,7 @@
+     unsigned int c = 0;
+     TPMPassthroughOptions *tpo;
+     TPMEmulatorOptions *teo;
++    TPMMssimOptions *tmo;
+ 
+     info_list = qmp_query_tpm(&err);
+     if (err) {
+@@ -52,6 +53,11 @@
+             teo = ti->options->u.emulator.data;
+             monitor_printf(mon, ",chardev=%s", teo->chardev);
+             break;
++        case TPM_TYPE_MSSIM:
++            tmo = ti->options->u.mssim.data;
++            monitor_printf(mon, ",host=%s,port=%u,platform-port=%u",
++                           tmo->host ?: "", tmo->port, tmo->platform_port);
++            break;
+         case TPM_TYPE__MAX:
+             break;
+         }

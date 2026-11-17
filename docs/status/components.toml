@@ -413,6 +413,13 @@ comando = "cargo xtask test-boot NVME_DISK_OK 400000 --storage=nvme --build-dir=
 descricao = "Com --storage=nvme o QEMU ganha um controlador NVMe (PCI\\VEN_1B36&DEV_0010, classe 01.08.02) com o disco particionado que o xtask monta (MBR com uma partição NTFS a partir do LBA 2048). O pci.sys real enumera o controlador sob a raiz ACPI, o PnP instala o stornvme.sys pelo stornvme.inf e o storport.sys, que ele importa, inicia o controlador: o BAR0 pelas AccessRanges, a configuração pela interface do barramento, o adaptador de DMA da versão 3, a extensão não cacheada, a fila de administração e as interrupções MSI-X do IoConnectInterruptEx MESSAGE_BASED (o stornvme.inf pede MSISupported; o árbitro de IRQ do acpi.sys dá duas mensagens com uma CPU, e o storport monta o mapa de processador para mensagem pelo IoGetAffinityInterrupt de cada objeto). A LUN do namespace recebe o disk.sys com o classpnp.sys e o filtro partmgr.sys; o NVME_DISK_OK sai quando o \\Device\\Harddisk0\\DR0 está sobre a LUN do storport e o setor 0 lido pela pilha é o MBR do xtask. Depois o partmgr.sys entrega a partição ao volmgr.sys, que cria o \\Device\\HarddiskVolume1 e relata o devnode STORAGE\\Volume, que o volume.inf instala com o volume.sys. O mountmgr.sys recebe a chegada do volume e lhe dá a letra E: (o link \\GLOBAL??\\E: e o valor \\DosDevices\\E: do MountedDevices com o identificador do volume); o WorkerThread dele espera o \\Device\\VolumesSafeForWriteAccess numa worker thread do sistema, sem prender o boot. O NVME_VOLUME_OK sai quando o ntfs.sys real monta o volume da partição, lê o arquivo que o xtask gravou nele e um arquivo novo é gravado, fechado, reaberto e lido de volta por E:. A máquina tem 3 GB para o BAR0 de 64 bits ficar abaixo de 4 GB."
 
 [[teste]]
+id = "tpm"
+titulo = "TPM 2.0 pelo tpm.sys e pelo tbs.sys reais"
+marcador = "TPM_COMMAND_OK"
+comando = "cargo xtask test-boot TPM_DEVICE_FOUND 400000 --tpm --build-dir=build/tpm --smp=1 --expect=TPM_STARTED --expect=TPM_COMMAND_OK"
+descricao = "Com --tpm o QEMU ganha um TPM 2.0 com interface CRB (tpm-crb: o dispositivo MSFT0101 no \\_SB da DSDT e a tabela TPM2 com start method 7) sobre um simulador de TPM 2.0 que o xtask sobe em portas TCP livres, com o estado na pasta temporária da execução. O acpi.sys real relata o ACPI\\MSFT0101 e a tabela TPM2 está no firmware: TPM_DEVICE_FOUND. O PnP o instala pelo tpm.inf (Tpm2BaseInstall, serviço TPM, HardwareType 20) e o tpm.sys real, um driver KMDF, recebe o AddDevice e o START com a janela MMIO do _CRS; ele lê a tabela TPM2 pelo HalGetCachedAcpiTable da HalDispatchTable: TPM_STARTED. O kernel carrega o tbs.sys, a API de TPM de kernel do Windows: o Tbsi_Context_Create abre o \\??\\TPM (a abertura espera o create que o KMDF devolve com STATUS_PENDING, como o IopParseDevice) e o Tbsip_Submit_Command manda o TPM2_Startup(SU_CLEAR), que o tpm.sys bloqueia para todo cliente do TBS (TPM_E_COMMAND_BLOCKED), o TPM2_GetRandom de 16 bytes e o TPM2_GetCapability do fabricante, que vão ao TPM pelo CRB: TPM_COMMAND_OK com as três respostas conferidas."
+
+[[teste]]
 id = "ndis"
 titulo = "Driver ndis.sys real (com o netio.sys)"
 marcador = "IMPORT_CYCLE_OK"
@@ -1706,6 +1713,12 @@ faz = "O PnP sobe o storport.sys e o stornvme.sys no controlador NVMe do QEMU; o
 para = "Sem smss, o WorkerThread do mountmgr.sys fica à espera do \\Device\\VolumesSafeForWriteAccess, como no NT."
 
 [[roda]]
+nome = "TPM 2.0 pelo tpm.sys e pelo tbs.sys"
+grupo = "marco"
+teste = "tpm"
+faz = "Com --tpm o QEMU expõe um TPM 2.0 CRB sobre um simulador de TPM; o acpi.sys relata o MSFT0101, o PnP sobe o tpm.sys pelo tpm.inf e o kernel manda TPM2_Startup, TPM2_GetRandom e TPM2_GetCapability pelo tbs.sys."
+
+[[roda]]
 nome = "acpi.sys como raiz dos dispositivos"
 grupo = "marco"
 teste = "acpi"
@@ -1913,6 +1926,13 @@ grupo = "driver"
 teste = "nvme"
 faz = "O stornvme.inf liga o miniport ao controlador NVMe; o storport.sys inicia o controlador (DMA v3, fila de administração, MSI-X pelo árbitro do acpi.sys) e relata a LUN do namespace ao disk.sys."
 para = "Só com --storage=nvme."
+
+[[roda]]
+nome = "tpm.sys e tbs.sys"
+grupo = "driver"
+teste = "tpm"
+faz = "O tpm.inf liga o tpm.sys (KMDF) ao ACPI\\MSFT0101; ele lê a tabela TPM2 pelo HalGetCachedAcpiTable, mapeia a área do CRB e publica o \\??\\TPM, que o tbs.sys abre para mandar comandos ao TPM."
+para = "Só com --tpm."
 
 [[roda]]
 nome = "mountmgr.sys"
