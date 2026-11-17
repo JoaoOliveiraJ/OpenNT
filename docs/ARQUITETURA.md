@@ -256,7 +256,7 @@ pertence só aos processos:
 | --- | --- | --- |
 | 0xFFFF8000_00000000 | 256 | tabelas de páginas (mapeamento recursivo) |
 | 0xFFFF8080_00000000 | 257 | banco de PFNs nativo (MmPfnDatabase) |
-| 0xFFFFA000_00000000 | 320 | pool executivo, dump, memória contígua e independente, visões de sistema, VirtualAlloc de kernel, VAs globais das sessões (0xFFFFA006_80000000), pilhas de kernel das threads (0xFFFFA007_00000000..0xFFFFA008_00000000) |
+| 0xFFFFA000_00000000 | 320 | pool executivo, PTEs de sistema dos MDLs (0xFFFFA001_40000000..0xFFFFA001_80000000), dump, memória contígua e independente, visões de sistema, VirtualAlloc de kernel, VAs globais das sessões (0xFFFFA006_80000000), pilhas de kernel das threads (0xFFFFA007_00000000..0xFFFFA008_00000000) |
 | 0xFFFFB000_00000000 | 352 | **mapa direto**: toda a faixa física [0, 4 GB) em `DIRECT_MAP_BASE + PA` |
 | 0xFFFFC000_C0000000 | 384 | **janela do heap**: heap do kernel (kmalloc, o alocador do Rust) e a arena dos convidados (IRPs, DEVICE_OBJECTs, MDLs, ExAllocatePool2...) sobre os frames de 32 MB a 96 MB |
 | 0xFFFFF780_00000000 | 495 | KUSER_SHARED_DATA (visão do kernel) |
@@ -891,9 +891,29 @@ além da KUSER_SHARED_DATA:
   está livre no espaço do processo (um .exe em 0x1_4000_0000) e, se não
   estiver, na primeira faixa livre, relocadas (STATUS_IMAGE_NOT_AT_BASE nas
   vistas de imagem). O `pe_loader` mapeia sempre no processo corrente, na
-  raiz carregada (a vista de imagem anexa ao processo alvo), e desfaz na
-  mesma raiz. A imagem principal é do processo (`ProcessState`) e é desfeita
-  no término dele.
+  raiz carregada, e desfaz na mesma raiz. A imagem principal é do processo
+  (`ProcessState`) e é desfeita no término dele.
+- **Seções de imagem** (`mm/section/image_segment.rs`, o
+  MiCreateImageFileMap): a primeira vista de um arquivo SEC_IMAGE monta as
+  páginas protótipo da control area, frames do PFN com os cabeçalhos e as
+  seções do PE no layout virtual (o `pe_loader` com `prototype`: sem VA,
+  sem relocação, sem imports, sem cookie e sem a tabela de exports). Todas
+  as seções do mesmo arquivo usam a mesma control area (a identidade do
+  arquivo, o papel do ImageSectionObject); a seção e cada vista a retêm, e a
+  última referência devolve os frames. A vista (`image_view.rs`, o
+  MiMapViewOfImageSection) mapeia na raiz do processo as páginas de código
+  e somente leitura sobre os frames protótipo, divididos entre os processos
+  e sem escrita, e as páginas graváveis sobre cópias privadas feitas no
+  mapeamento (o copy-on-write do protótipo já resolvido). Uma página
+  dividida que o NtProtectVirtualMemory torna gravável ganha antes a cópia
+  privada do processo (`UserRegion::write_copy`; no NT, PAGE_READWRITE numa
+  vista de imagem é PAGE_WRITECOPY): a relocação e a IAT que a ntdll de um
+  processo grava não aparecem em outro. O heap do kernel guarda só os
+  vetores de frames e de proteções da vista (12 bytes por página). Antes,
+  cada vista recarregava a imagem inteira em frames novos e guardava duas
+  cópias da tabela de exports no heap (a da carga e a do processo); com
+  uns dez processos e as DLLs deles, o heap de 64 MB acabava no boot do
+  smss real ao mapear o scesrv.dll no services.exe.
 - **Cópias de sistema** (`ps/user/loader.rs`): a ntdll, o apiset e as
   tabelas NLS são mapeados uma vez, na raiz do System (o mapeamento roda
   anexado ao System, venha o pedido de onde vier), e fotografados logo
@@ -1729,8 +1749,19 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   (`mm/mdl.rs`): o MmBuildMdlForNonPagedPool (MDL_SOURCE_IS_NONPAGED_POOL e a
   VA de sistema, sem travar), o MmProbeAndLockPages (MDL_PAGES_LOCKED), o
   IoBuildPartialMdl (os bits herdáveis da origem e a VA deslocada) e o
-  MmMapLockedPagesSpecifyCache (MDL_MAPPED_TO_SYSTEM_VA). Os pedidos com
-  DO_DIRECT_IO do I/O Manager fazem IoAllocateMdl + MmProbeAndLockPages.
+  MmMapLockedPagesSpecifyCache (MDL_MAPPED_TO_SYSTEM_VA). Em KernelMode, o
+  MmMapLockedPagesSpecifyCache de um buffer de usuário mapeia os PFNs do
+  MDL em PTEs de sistema (`mm/system_ptes.rs`, o MiReserveSystemPtes, na
+  janela SYSTEM_PTE_BASE..TOP): a VA de usuário só vale no processo dono, e
+  um driver que completa o pedido no contexto de outro processo (o
+  ksecdd.sys com o pedido pendente do lsass) grava pela VA de sistema. Um
+  buffer de kernel já está no espaço de sistema e volta como está. O
+  MmUnmapLockedPages e o MmUnlockPages devolvem as PTEs; um MDL parcial que
+  herdou a VA da origem não as solta. Os pedidos com DO_DIRECT_IO e
+  METHOD_*_DIRECT do I/O Manager fazem IoAllocateMdl + MmProbeAndLockPages:
+  MDL_PAGES_LOCKED, o Process dono e os PFNs, sem VA de sistema (o driver
+  pede a VA pelo MmGetSystemAddressForMdlSafe), e o fim do pedido desfaz o
+  mapeamento antes de soltar as páginas.
 - **Filas de dispositivo e StartIo**: a KDEVICE_QUEUE é do Ke
   (`ke/device_queue.rs`, os sete KeInsert*/KeRemove*DeviceQueue com o
   layout x64 do NT, inclusive o Hint do KeRemoveByKeyDeviceQueue no qword
@@ -2919,13 +2950,20 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   `\RPC Control\lsasspirpc`. O SendRequestForNextAsyncKsecddCall deixa
   pendente no `\Device\KsecDD` o pedido METHOD_OUT_DIRECT 0x39006a (o
   ksecdd.sys o põe na fila CSQ dele), e o lsass cria o
-  `LSA_RPC_SERVER_ACTIVE`. O services.exe acorda, faz a primeira chamada
-  RPC ao lsass pela ALPC (`\RPC Control\lsapolicylookup`) e chega ao
-  ScExtInitialize. Ali para: o scesrv.dll do ScesrvInitializeServer não está
-  no volume e o services.exe termina com código 0, antes do
+  `LSA_RPC_SERVER_ACTIVE`. O services.exe acorda e chama o lsass pela ALPC
+  (`\RPC Control\lsapolicylookup`, o LsaLookupOpenLocalPolicy e o
+  LsaLookupGetDomainInfo do ScGetAccountDomainInfo). A chamada passa pela
+  identidade do cliente (o ALPC_TOKEN_ATTR) e pelo NtAccessCheck do
+  descritor da interface, e a resposta volta pelo envio adiado do worker
+  factory. Ali para: o encaminhador do lsass.exe (LsaLookuprOpenPolicy2)
+  responde STATUS_NOT_IMPLEMENTED, porque a extensão de consulta do lsasrv
+  (o gLsapLookupExtension, que o LsapLsaExtensionLoad registra pelo
+  LsaRegisterExtension depois do LsapInitLsa) está vazia. O SvcctrlMain do
+  services.exe sai pelo caminho de erro: o ScesrvTerminateServer carrega o
+  scesrv.dll e o processo termina com código 0, antes do
   ScEnableRpcInterface e do início automático; o svchost do LSM não é
-  criado. Com o scesrv.dll no volume, o heap do kernel (a janela de 64 MB)
-  acaba ao mapear a imagem. O smss da
+  criado. O mapeamento do scesrv.dll não esgota mais o heap do kernel (as
+  seções de imagem, acima). O smss da
   sessão 1 cria o csrss e o winlogon.exe (o NtOpenSection relativo ao
   `\KnownDlls`, aberto pela tabela do Object Manager, e o powrprof.dll e o
   imm32.dll no volume); o NtUserInitialize do csrss da sessão 1 volta com
@@ -3042,6 +3080,45 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   services.exe lê as chaves de serviço da cadeia do LSM (DcomLaunch,
   RpcEptMapper, RpcSs e LSM), o Control\ServiceGroupOrder e os grupos do
   svchost (`xtask/src/user_services.rs`).
+- **O RPC local entre o services.exe e o lsass.exe**: um pedido a um
+  servidor ALPC de modo usuário (`alpc/server.rs`) chega com o MessageId do
+  servidor. O NtAlpcQueryInformationMessage das classes de token
+  (AlpcMessageSidInformation e AlpcMessageTokenModifiedIdInformation) acha
+  esse pedido pelo MessageId e responde com o token efetivo da thread do
+  cliente, que espera a resposta (`alpc/query_message.rs`). A recepção do
+  servidor expõe o ALPC_TOKEN_ATTR (TokenId, AuthenticationId e ModifiedId
+  desse token) quando o receptor aloca o ALPC_MESSAGE_TOKEN_ATTRIBUTE: é
+  por ele que o I_RpcBindingInqClientTokenAttributes do rpcrt4 dá ao lsasrv
+  a identidade do cliente. O descritor de segurança de uma interface RPC
+  (RpcServerRegisterIf3) é conferido pelo AccessCheck do kernelbase, que é o
+  NtAccessCheck (`se/access_check.rs::check_by_token`, adaptador em
+  `ps/user/tokens.rs`): o token de impersonação do cliente, a DACL e o
+  PRIVILEGE_SET de saída, como o SeAccessCheckByType do 19041. Sem ele,
+  toda chamada ao `\RPC Control\lsapolicylookup` voltava ERROR_ACCESS_DENIED
+  e o SvcctrlMain do services.exe saía pelo caminho de erro (que carrega o
+  scesrv.dll para o ScesrvTerminateServer), antes do ScEnableRpcInterface.
+  O NtAccessCheck captura o descritor numa cópia self-relative do kernel
+  antes de validá-lo (o RtlValidSid do kernel recusa SIDs de usuário), e um
+  pseudo-handle de token (o da thread ou o efetivo) não passa pela recusa de
+  token primário, como no SepReferenceTokenUsingPseudoHandle. A resposta do
+  servidor RPC sai pelo envio adiado do NtWaitForWorkViaWorkerFactory (o
+  WORKER_FACTORY_DEFERRED_WORK: a mensagem, a porta e as flags altas, sem
+  pedido síncrono), que manda a mensagem antes de esperar trabalho
+  (`ps/user/alpc.rs::deferred_send`).
+- **Os tokens de logon** (`se/token/create.rs`, `se/token/set_information.rs`):
+  o NtCreateToken e o NtCreateTokenEx do LSA (SeCreateTokenPrivilege
+  habilitado, TokenType, o nível pelo QoS num token de impersonação, a sessão
+  de logon criada pelo RmCreateLogonSession, dono e grupo primário entre o
+  usuário e os grupos, os grupos obrigatórios habilitados, o rótulo de
+  integridade, a origem TOKEN_SOURCE e os atributos de segurança de usuário),
+  e o NtSetInformationToken das classes TokenOwner, TokenPrimaryGroup,
+  TokenDefaultDacl, TokenSessionId e TokenSecurityAttributes (as operações
+  ADD, DELETE, REPLACE e REPLACE_ALL), com a máscara de classes e os acessos
+  do 19041. O CreateProcessAsUser passa o token no PS_ATTRIBUTE_TOKEN do
+  NtCreateUserProcess: o processo novo recebe uma cópia dele com o SessionId
+  da sessão do processo (o SeSubProcessToken do
+  PspInitializeProcessSecurity), e quem cria precisa do
+  SeAssignPrimaryTokenPrivilege habilitado no token efetivo.
 - **O servidor de comandos do Reference Monitor** (`se/reference_monitor.rs`
   sobre o lado servidor LPC de modo kernel de `alpc/lpc.rs`): o
   SeRmInitPhase1 cria a porta LPC `\SeRmCommandPort` (ZwCreatePort,
