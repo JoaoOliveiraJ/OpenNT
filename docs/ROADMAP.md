@@ -94,7 +94,7 @@ Carregador de PE, funções exportadas pelo kernel, Code Integrity real (ci.dll)
 | wmilib.sys e WppRecorder.sys | Funciona | teclado, drivers |
 | atapi.sys e ataport.sys | Parcial | drivers |
 | disk.sys e classpnp.sys | Parcial | drivers |
-| mountmgr.sys | Parcial | drivers |
+| mountmgr.sys | Parcial | drivers, nvme |
 | cng.sys | Funciona | drivers |
 | ci.dll (Code Integrity) | Funciona | watchdog |
 | watchdog.sys | Funciona | watchdog |
@@ -131,5 +131,5 @@ Cache Manager e os drivers reais do Windows para a tela gráfica (win32k.sys, dx
 | acpi.sys e pci.sys | Parcial | acpi, usb |
 | Pilha USB 3 e HID (usbxhci.sys, ucx01000.sys, usbhub3.sys, hidusb.sys, hidclass.sys, kbdhid.sys e mouhid.sys) | Parcial | usb |
 | dxgkrnl.sys e BasicDisplay.sys | Parcial | dxgkrnl, basicdisplay, win32k-display, fase6 |
-| ntfs.sys, fastfat.sys e fltmgr.sys | Parcial | ntfs, shutdown, reboot, minifilters |
+| ntfs.sys, fastfat.sys e fltmgr.sys | Parcial | ntfs, shutdown, reboot, minifilters, nvme |
 | ndis.sys, tcpip.sys e E1G6032E.sys | Parcial | ndis, afd, tcpip |

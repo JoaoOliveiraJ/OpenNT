@@ -2724,7 +2724,10 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   FsRtlAreVolumeStartupApplicationsComplete devolve) e solta a referência.
   Quem sinaliza é o smss.exe: o SmpInit abre o evento (NtOpenEvent,
   EVENT_ALL_ACCESS) e o SmpLoadDataFromRegistry o sinaliza logo depois dos
-  comandos BootExecute. O WorkerThread do mountmgr.sys espera o mesmo
+  comandos BootExecute; no boot do smss real (teste smss-csrss) o
+  FsRtlWaitForSmssEvent termina antes de o smss criar o smss da sessão, e a
+  serial leva `[fsrtl] \Device\VolumesSafeForWriteAccess sinalizado`. O
+  WorkerThread do mountmgr.sys espera o mesmo
   evento antes de gravar nos volumes. Sem smss ninguém o sinaliza e as duas
   workers ficam paradas, como no NT. Teste: `fsrtl_smss_event` (fase 6: o
   evento, a abertura pelo nome com ZwOpenEvent, a worker parada nele e o

@@ -87,6 +87,7 @@ fn wait_for_smss_event(_device: u64, event: u64) {
     SMSS_EVENT_WAITER.store(crate::ntos::ps::process::get_current_thread(), Ordering::Release);
     crate::ntos::ke::dispatcher::wait_for_single_object(event, 0, 0, false);
     STARTUP_APPLICATIONS_COMPLETE.store(true, Ordering::Release);
+    debug_print!("[fsrtl] {} sinalizado: os volumes estao seguros para escrita", VOLUMES_SAFE_FOR_WRITE_ACCESS);
 }
 
 /// O KEVENT do `\Device\VolumesSafeForWriteAccess` e a thread que o espera
