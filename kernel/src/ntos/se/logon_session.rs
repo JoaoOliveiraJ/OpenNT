@@ -20,7 +20,7 @@
 
 use alloc::vec::Vec;
 
-use crate::ntos::ps::{previous_mode, process};
+use crate::ntos::ps::previous_mode;
 use crate::ntos::se::token::{reference, tokens};
 use crate::rtl::{KernelError, SpinLock};
 
@@ -125,11 +125,6 @@ pub fn exists(logon_id: u64, server_silo: u64) -> bool {
     find(logon_id, server_silo).is_some()
 }
 
-/// TokenInUse: o token é o primário de algum processo vivo.
-pub fn token_in_use(token: u64) -> bool {
-    process::list_active_processes().iter().any(|entry| process::get_primary_token(entry.address) == Some(token))
-}
-
 /// SeSetSessionIdToken sobre o token da sessão.
 fn set_session_id(token: u64, session_id: u32) {
     let _ = tokens::update(token, |token| token.session_id = session_id);
@@ -144,7 +139,7 @@ pub fn set_session_id_token_with_linked(handle: u64, session_id: u32) -> Result<
     };
     let token = reference.token;
     let result = (|| {
-        if token_in_use(token) {
+        if tokens::in_use(token) {
             return STATUS_TOKEN_ALREADY_IN_USE;
         }
         let Some((logon_id, server_silo)) = tokens::with(token, |token| (token.authentication_id, token.server_silo)) else { return STATUS_NO_SUCH_LOGON_SESSION };

@@ -46,6 +46,12 @@ const TOKEN_LOWBOX: u32 = 0x4000;
 /// sessão de logon dele.
 pub const TOKEN_SESSION_NOT_REFERENCED: u32 = 0x20;
 
+/// TokenInUse: o token é o primário de algum processo vivo.
+pub fn in_use(pointer: u64) -> bool {
+    use crate::ntos::ps::process;
+    process::list_active_processes().iter().any(|entry| process::get_primary_token(entry.address) == Some(pointer))
+}
+
 /// SepStopReferencingLogonSession: o token larga a referência à sessão de
 /// logon (TOKEN_SESSION_NOT_REFERENCED). Devolve se ainda a segurava.
 pub fn stop_referencing_logon_session(pointer: u64) -> bool {

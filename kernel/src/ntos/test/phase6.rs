@@ -14332,24 +14332,25 @@ fn se_logon_session_exports(assert: Assert) {
     let _ = tokens::update(pointer, |token| token.authentication_id = logon_session::SYSTEM_LUID);
     guest::free_bytes(value);
     assert(session_created == 0 && held == 0xC000_0104 && nonzero == 0xC000_000D && short == 0xC000_0004 && released == 0 && deleted_with_token == 0, "se-logon-session: TokenSessionReference 0 solta a sessao (outros valores e tamanhos recusados)");
-    // TokenMandatoryPolicy (27): os bits NO_WRITE_UP e NEW_PROCESS_MIN com o
-    // SeTcbPrivilege; bit fora da máscara, tamanho errado e token primário
-    // de um processo recusados.
-    let policy_cell = guest::alloc_bytes(8);
-    let saved_policy = tokens::with(pointer, |token| token.mandatory_policy).unwrap_or(0);
-    guest::write32(policy_cell, 3);
-    let policy_set = set_information::set(pointer, 27, policy_cell, 4, 0).unwrap_or(u32::MAX);
-    let policy_value = tokens::with(pointer, |token| token.mandatory_policy);
-    guest::write32(policy_cell, 4);
-    let policy_invalid = set_information::set(pointer, 27, policy_cell, 4, 0).unwrap_or(u32::MAX);
-    let policy_short = set_information::set(pointer, 27, policy_cell, 2, 0).unwrap_or(u32::MAX);
-    let system_primary = crate::ntos::ps::process::get_primary_token(crate::ntos::ps::process::get_system_process()).unwrap_or(0);
-    guest::write32(policy_cell, 1);
-    let policy_in_use = set_information::set(system_primary, 27, policy_cell, 4, 0).unwrap_or(u32::MAX);
-    guest::write32(policy_cell, saved_policy);
-    let _ = set_information::set(pointer, 27, policy_cell, 4, 0);
-    guest::free_bytes(policy_cell);
-    assert(policy_set == 0 && policy_value == Some(3) && policy_invalid == 0xC000_000D && policy_short == 0xC000_0004 && policy_in_use == 0xC000_012B, "se-token: TokenMandatoryPolicy grava a politica com SeTcbPrivilege; bit invalido, tamanho e token em uso recusados");
+    // TokenMandatoryPolicy (27): 4 bytes, só os bits NO_WRITE_UP e
+    // NEW_PROCESS_MIN, ModifiedId novo; o token primário de um processo vivo
+    // é recusado (STATUS_TOKEN_ALREADY_IN_USE).
+    let policy = guest::alloc_bytes(8);
+    let modified_before = tokens::with(pointer, |token| token.modified_id).unwrap_or(0);
+    guest::write32(policy, 3);
+    let policy_set = set_information::set(pointer, 27, policy, 4, 0).unwrap_or(u32::MAX);
+    let (policy_value, modified_after) = tokens::with(pointer, |token| (token.mandatory_policy, token.modified_id)).unwrap_or((0, 0));
+    let policy_short = set_information::set(pointer, 27, policy, 8, 0).unwrap_or(u32::MAX);
+    guest::write32(policy, 4);
+    let policy_invalid = set_information::set(pointer, 27, policy, 4, 0).unwrap_or(u32::MAX);
+    guest::write32(policy, 1);
+    let primary = crate::ntos::ps::process::get_primary_token(crate::ntos::ps::process::get_current_process()).unwrap_or(0);
+    let policy_in_use = set_information::set(primary, 27, policy, 4, 0).unwrap_or(u32::MAX);
+    guest::free_bytes(policy);
+    assert(
+        policy_set == 0 && policy_value == 3 && modified_after != modified_before && policy_short == 0xC000_0004 && policy_invalid == 0xC000_000D && primary != 0 && policy_in_use == 0xC000_012B,
+        "se-token: TokenMandatoryPolicy grava a politica (bits invalidos, tamanho e token em uso recusados)",
+    );
     // NtAccessCheckAndAuditAlarm: o nível de impersonação da thread precisa
     // ser SecurityIdentification ou mais.
     let outputs = guest::alloc_bytes(0x20);
