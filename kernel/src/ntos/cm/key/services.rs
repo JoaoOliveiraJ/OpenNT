@@ -629,8 +629,12 @@ fn open_or_create_key(create: bool, output: u64, desired: u32, attributes_pointe
                 // componente vazio: o pai é o do último componente de verdade.
                 let trimmed = resolved.trim_end_matches('\\');
                 let parent_node = registry::node_by_resolved_path(&trimmed[..trimmed.rfind('\\').unwrap_or(0)]);
+                // Um componente intermediário ausente: o CmpDoParseKey do
+                // 19041 só devolve STATUS_OBJECT_NAME_NOT_FOUND (o
+                // BaseRegCreateMultipartKey do kernelbase cria então um
+                // componente de cada vez).
                 if create && !existed && parent_node.is_none() {
-                    return Ok(Outcome::from_status(0xC000_003A));
+                    return Ok(Outcome::from_status(0xC000_0034));
                 }
                 let mut assigned = None;
                 if create && !existed {

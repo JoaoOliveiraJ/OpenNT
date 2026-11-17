@@ -681,9 +681,10 @@ fn wnf_names_definitions_and_stores(assert: Assert) {
     let scope_instance = unsafe { WnfScopeInstance::at(instance) };
     scope_instance.data_scope.set(WnfDataScope::WNF_DATA_SCOPE_MACHINE);
     // Sem a semeadura do registro de usuário, a raiz Windows NT\CurrentVersion
-    // ainda não existe e o CM devolve OBJECT_PATH_NOT_FOUND.
+    // ainda não existe e o CM devolve OBJECT_NAME_NOT_FOUND (o componente
+    // intermediário ausente do CmpDoParseKey).
     let seeded = crate::ntos::cm::registry::node_by_path(r"\Registry\Machine\Software\Microsoft\Windows NT\CurrentVersion").is_some();
-    assert(seeded || (matches!(stores::get_permanent_store(instance, 1, 1, definitions), Ok(Err(0xC000_003A))) && scope_instance.permanent_data_store.get() == 0), "wnfregistry: raiz de definicoes permanentes ausente antes da semeadura");
+    assert(seeded || (matches!(stores::get_permanent_store(instance, 1, 1, definitions), Ok(Err(0xC000_0034))) && scope_instance.permanent_data_store.get() == 0), "wnfregistry: raiz de definicoes permanentes ausente antes da semeadura");
     let parent = crate::ntos::cm::registry::open_or_create(r"\Registry\Machine\Software\Microsoft\Windows NT\CurrentVersion", None).unwrap_or(0);
     crate::ntos::cm::registry::close_handle(parent);
     let opened = stores::get_permanent_store(instance, 1, 1, definitions);
@@ -693,7 +694,7 @@ fn wnf_names_definitions_and_stores(assert: Assert) {
     let system = crate::ntos::mm::kernel_pool::allocate(16, crate::ntos::mm::kernel_pool::AllocateOptions { zero: true, ..Default::default() }).unwrap_or(0);
     guest::write_bytes(system, &[1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0]);
     let user_store = stores::open_permanent_store(2, 0, system, 0, 1, definitions);
-    assert(matches!(user_store, Ok(Err(0xC000_003A))),"wnfregistry: store de usuario exige a hive do usuario carregada");
+    assert(matches!(user_store, Ok(Err(0xC000_0034))), "wnfregistry: store de usuario exige a hive do usuario carregada");
     for handle in [handle, permanent, guest::read64(definitions)] {
         let _ = close::close(handle, Some(0));
     }

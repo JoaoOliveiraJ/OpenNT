@@ -546,6 +546,13 @@ fn key_class(assert: Assert) {
     let _ = call_export("ZwDeleteKey", &[handle]);
     let _ = call_export("ZwClose", &[handle]);
     guest::free_bytes(oa);
+    // Um componente intermediário ausente: STATUS_OBJECT_NAME_NOT_FOUND, como
+    // o CmpDoParseKey, sem criar nada.
+    let deep = alloc::format!("{SOURCE}\\Ausente\\Filho");
+    let deep_oa = attributes(&deep);
+    let missing_parent = status(call_export("ZwCreateKey", &[output, 0xF003F, deep_oa, 0, 0, 0, disposition]));
+    assert(missing_parent == 0xC000_0034 && registry::node_by_path(&alloc::format!("{SOURCE}\\Ausente")).is_none(), "hive: ZwCreateKey com o pai ausente da STATUS_OBJECT_NAME_NOT_FOUND");
+    guest::free_bytes(deep_oa);
     guest::free_bytes(block);
 }
 
