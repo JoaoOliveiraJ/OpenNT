@@ -73,6 +73,8 @@ pub struct KeyNode {
     pub volatile: bool,
     /// Chave de link (REG_OPTION_CREATE_LINK, KEY_SYM_LINK na célula).
     pub link: bool,
+    /// A classe da chave em UTF-16 (vazia sem classe).
+    pub class: Vec<u16>,
 }
 
 impl KeyNode {
@@ -150,7 +152,7 @@ fn with_hive<T>(body: impl FnOnce(&mut Hive) -> T) -> T {
         let mut hive = HIVE.lock();
         let hive = hive.get_or_insert_with(|| {
             let mut nodes = BTreeMap::new();
-            nodes.insert(ROOT, KeyNode { name: String::new(), parent: None, children: Vec::new(), values: Vec::new(), security: key_policy::boot_root(), last_write_time: now(), deleted: false, cell: None, volatile: false, link: false });
+            nodes.insert(ROOT, KeyNode { name: String::new(), parent: None, children: Vec::new(), values: Vec::new(), security: key_policy::boot_root(), last_write_time: now(), deleted: false, cell: None, volatile: false, link: false, class: Vec::new() });
             Hive { nodes, next_node: ROOT + 1, handles: BTreeMap::new(), statistics: ObjectStatistics::default(), storages: BTreeMap::new(), dirtied: false }
         });
         let result = body(hive);
@@ -296,7 +298,7 @@ fn mirror(hive: &mut Hive, node: NodeId, change: impl FnOnce(&mut Storage, u32, 
     note_change(hive, identifier, was_dirty);
 }
 
-fn create_node(hive: &mut Hive, name: &str, parent: NodeId, security: Option<Captured>, volatile: bool, link: bool) -> Result<NodeId, KernelError> {
+fn create_node(hive: &mut Hive, name: &str, parent: NodeId, security: Option<Captured>, volatile: bool, link: bool, class: &[u16]) -> Result<NodeId, KernelError> {
     let security = match security {
         Some(security) => security,
         None => key_policy::boot_child(&hive.nodes[&parent].security)?,
@@ -309,7 +311,7 @@ fn create_node(hive: &mut Hive, name: &str, parent: NodeId, security: Option<Cap
         let mut was_dirty = true;
         if let Some((storage, _)) = hive.storages.get_mut(&identifier).filter(|(storage, _)| !storage.broken) {
             was_dirty = storage.is_dirty();
-            match key_cells::create_key(storage, parent_cell, name, &security, time) {
+            match key_cells::create_key(storage, parent_cell, name, class, &security, time) {
                 Some(created) => {
                     if link {
                         key_cells::set_key_flags(storage, created, key_cells::KEY_SYM_LINK);
@@ -326,18 +328,19 @@ fn create_node(hive: &mut Hive, name: &str, parent: NodeId, security: Option<Cap
     }
     let identifier = hive.next_node;
     hive.next_node += 1;
-    hive.nodes.insert(identifier, KeyNode { name: name.to_string(), parent: Some(parent), children: Vec::new(), values: Vec::new(), security, last_write_time: time, deleted: false, cell, volatile, link });
+    hive.nodes.insert(identifier, KeyNode { name: name.to_string(), parent: Some(parent), children: Vec::new(), values: Vec::new(), security, last_write_time: time, deleted: false, cell, volatile, link, class: class.to_vec() });
     Ok(identifier)
 }
 
 /// Percorre desde a raiz, criando componentes ausentes só quando pedido. Não
 /// segue links: o caminho já vem resolvido ([`resolve`]).
 fn walk(hive: &mut Hive, path: &str, create: bool, security: Option<Captured>, volatile: bool) -> Result<Option<NodeId>, KernelError> {
-    walk_link(hive, path, create, security, volatile, false)
+    walk_link(hive, path, create, security, volatile, false, &[])
 }
 
-/// [`walk`] com o último componente criado como chave de link.
-fn walk_link(hive: &mut Hive, path: &str, create: bool, security: Option<Captured>, volatile: bool, link: bool) -> Result<Option<NodeId>, KernelError> {
+/// [`walk`] com o último componente criado como chave de link e com a
+/// classe `class`.
+fn walk_link(hive: &mut Hive, path: &str, create: bool, security: Option<Captured>, volatile: bool, link: bool, class: &[u16]) -> Result<Option<NodeId>, KernelError> {
     let mut node = ROOT;
     let components = split_path(path);
     let last = components.len().saturating_sub(1);
@@ -349,7 +352,7 @@ fn walk_link(hive: &mut Hive, path: &str, create: bool, security: Option<Capture
             Some(child) => child,
             None if !create => return Ok(None),
             None => {
-                let child = create_node(hive, component, node, if index == last { security.take() } else { None }, volatile && index == last, link && index == last)?;
+                let child = create_node(hive, component, node, if index == last { security.take() } else { None }, volatile && index == last, link && index == last, if index == last { class } else { &[] })?;
                 if let Some(parent) = hive.nodes.get_mut(&node) {
                     parent.children.push((lower, child));
                 }
@@ -419,9 +422,15 @@ pub fn open_or_create_options(path: &str, security: Option<Captured>, volatile: 
 /// volátil e/ou de link quando criada. Devolve o handle (zero se o caminho
 /// não existe nem pode ser criado) e se a chave foi criada.
 pub fn create_resolved(path: &str, security: Option<Captured>, volatile: bool, link: bool) -> Result<(u32, bool), KernelError> {
+    create_resolved_class(path, security, volatile, link, &[])
+}
+
+/// [`create_resolved`] com a classe da chave final quando criada (o Class
+/// do NtCreateKey); uma chave que já existe fica com a classe dela.
+pub fn create_resolved_class(path: &str, security: Option<Captured>, volatile: bool, link: bool, class: &[u16]) -> Result<(u32, bool), KernelError> {
     let (handle, created) = with_hive(|hive| -> Result<(u32, bool), KernelError> {
         let existing = walk(hive, path, false, None, false)?;
-        let Some(node) = walk_link(hive, path, true, security, volatile, link)? else { return Ok((0, false)) };
+        let Some(node) = walk_link(hive, path, true, security, volatile, link, class)? else { return Ok((0, false)) };
         Ok((publish(hive, path, node)?, existing.is_none()))
     })?;
     if created {
@@ -682,7 +691,7 @@ pub fn link_hive(path: &str, identifier: u32, storage: Storage, keys: Vec<FlatKe
             let node = hive.next_node;
             hive.next_node += 1;
             let values = key.record.values.into_iter().map(|value| (value.name.to_lowercase(), value)).collect();
-            hive.nodes.insert(node, KeyNode { name: display.clone(), parent: Some(parent_node), children: Vec::new(), values, security: key.record.security, last_write_time: key.record.last_write_time, deleted: false, cell: Some((identifier, key.cell)), volatile: false, link: key.record.flags & key_cells::KEY_SYM_LINK != 0 });
+            hive.nodes.insert(node, KeyNode { name: display.clone(), parent: Some(parent_node), children: Vec::new(), values, security: key.record.security, last_write_time: key.record.last_write_time, deleted: false, cell: Some((identifier, key.cell)), volatile: false, link: key.record.flags & key_cells::KEY_SYM_LINK != 0, class: key.record.class });
             if let Some(parent_key) = hive.nodes.get_mut(&parent_node) {
                 parent_key.children.push((display.to_lowercase(), node));
             }
@@ -799,7 +808,7 @@ pub fn snapshot(node: NodeId) -> Option<Vec<NewKey>> {
         while let Some((current, parent)) = stack.pop() {
             let Some(key) = hive.nodes.get(&current).filter(|key| !key.deleted && !key.volatile) else { continue };
             let index = keys.len();
-            keys.push(NewKey { name: key.name.clone(), last_write_time: key.last_write_time, security: key.security.clone(), values: key.values.iter().map(|(_, value)| value.clone()).collect(), parent, link: key.link });
+            keys.push(NewKey { name: key.name.clone(), last_write_time: key.last_write_time, security: key.security.clone(), values: key.values.iter().map(|(_, value)| value.clone()).collect(), parent, link: key.link, class: key.class.clone() });
             for &(_, child) in key.children.iter().rev() {
                 stack.push((child, Some(index)));
             }
@@ -854,7 +863,7 @@ pub fn restore_subtree(node: NodeId, keys: Vec<FlatKey>) -> Result<(), KernelErr
                 None => node,
                 Some(index) => {
                     let parent = ids[index];
-                    let child = create_node(hive, &key.record.name, parent, Some(key.record.security.clone()), false, key.record.flags & key_cells::KEY_SYM_LINK != 0)?;
+                    let child = create_node(hive, &key.record.name, parent, Some(key.record.security.clone()), false, key.record.flags & key_cells::KEY_SYM_LINK != 0, &key.record.class)?;
                     if let Some(parent_key) = hive.nodes.get_mut(&parent) {
                         parent_key.children.push((key.record.name.to_lowercase(), child));
                     }
@@ -895,7 +904,7 @@ pub fn create_volatile_hive(path: &str, identifier: u32) -> Result<NodeId, u32> 
     let Some((name, parents)) = components.split_last() else { return Err(STATUS_OBJECT_NAME_NOT_FOUND) };
     let parent_security = with_hive(|hive| find(hive, &parents.join("\\")).map(|parent| hive.nodes[&parent].security.clone())).ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
     let security = key_policy::boot_child(&parent_security).map_err(|_| crate::ntos::cm::hive::storage::STATUS_INSUFFICIENT_RESOURCES)?;
-    let root = NewKey { name: String::from(*name), last_write_time: now(), security, values: Vec::new(), parent: None, link: false };
+    let root = NewKey { name: String::from(*name), last_write_time: now(), security, values: Vec::new(), parent: None, link: false, class: Vec::new() };
     let (storage, _) = crate::ntos::cm::hive::tree::build(&[root], 5, now(), "").ok_or(crate::ntos::cm::hive::storage::STATUS_INSUFFICIENT_RESOURCES)?;
     let keys = crate::ntos::cm::hive::tree::read(&storage)?;
     link_hive(path, identifier, storage, keys).map_err(|(status, _)| status)
@@ -925,7 +934,7 @@ pub fn refresh_hive(identifier: u32, storage: Storage, keys: Vec<FlatKey>) -> Re
                         None => {
                             let child = hive.next_node;
                             hive.next_node += 1;
-                            hive.nodes.insert(child, KeyNode { name: key.record.name.clone(), parent: Some(parent), children: Vec::new(), values: Vec::new(), security: key.record.security.clone(), last_write_time: 0, deleted: false, cell: None, volatile: false, link: false });
+                            hive.nodes.insert(child, KeyNode { name: key.record.name.clone(), parent: Some(parent), children: Vec::new(), values: Vec::new(), security: key.record.security.clone(), last_write_time: 0, deleted: false, cell: None, volatile: false, link: false, class: Vec::new() });
                             if let Some(parent_key) = hive.nodes.get_mut(&parent) {
                                 parent_key.children.push((lower, child));
                             }
@@ -941,6 +950,7 @@ pub fn refresh_hive(identifier: u32, storage: Storage, keys: Vec<FlatKey>) -> Re
                 entry.last_write_time = key.record.last_write_time;
                 entry.cell = Some((identifier, key.cell));
                 entry.link = key.record.flags & key_cells::KEY_SYM_LINK != 0;
+                entry.class = key.record.class;
                 entry.volatile = false;
             }
             ids.push(node);

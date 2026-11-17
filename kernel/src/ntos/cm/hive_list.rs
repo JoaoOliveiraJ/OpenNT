@@ -233,7 +233,7 @@ fn load_hive_files(target: &str, file_name: &str, flags: u32, unload_event: &mut
     // recompõe a hive compacta na carga.
     let reorganize = write && storage.base_block().last_reorganize_time.get() == 1;
     if reorganize {
-        let new_keys: Vec<tree::NewKey> = keys.iter().map(|key| tree::NewKey { name: key.record.name.clone(), last_write_time: key.record.last_write_time, security: key.record.security.clone(), values: key.record.values.clone(), parent: key.parent, link: key.record.flags & crate::ntos::cm::hive::key_cells::KEY_SYM_LINK != 0 }).collect();
+        let new_keys: Vec<tree::NewKey> = keys.iter().map(|key| tree::NewKey { name: key.record.name.clone(), last_write_time: key.record.last_write_time, security: key.record.security.clone(), values: key.record.values.clone(), parent: key.parent, link: key.record.flags & crate::ntos::cm::hive::key_cells::KEY_SYM_LINK != 0, class: key.record.class.clone() }).collect();
         let sequence = storage.base_block().sequence1.get();
         let Some((rebuilt, _)) = tree::build(&new_keys, storage.minor(), now(), file_name) else { return Err(STATUS_INSUFFICIENT_RESOURCES) };
         storage = rebuilt;
@@ -552,7 +552,7 @@ pub fn restore_volatile(node: NodeId, file: &HiveFile) -> u32 {
     let Some(base) = registry::path_of(node) else { return STATUS_INVALID_PARAMETER };
     let mount = alloc::format!("{base}\\{root_name}");
     // CmpCopySyncTree para a hive volátil.
-    let copies: Vec<tree::NewKey> = keys.iter().map(|key| tree::NewKey { name: key.record.name.clone(), last_write_time: key.record.last_write_time, security: key.record.security.clone(), values: key.record.values.clone(), parent: key.parent, link: key.record.flags & crate::ntos::cm::hive::key_cells::KEY_SYM_LINK != 0 }).collect();
+    let copies: Vec<tree::NewKey> = keys.iter().map(|key| tree::NewKey { name: key.record.name.clone(), last_write_time: key.record.last_write_time, security: key.record.security.clone(), values: key.record.values.clone(), parent: key.parent, link: key.record.flags & crate::ntos::cm::hive::key_cells::KEY_SYM_LINK != 0, class: key.record.class.clone() }).collect();
     let Some((storage, _)) = tree::build(&copies, LATEST_MINOR, now(), "") else { return STATUS_INSUFFICIENT_RESOURCES };
     let keys = match tree::read(&storage) {
         Ok(keys) => keys,

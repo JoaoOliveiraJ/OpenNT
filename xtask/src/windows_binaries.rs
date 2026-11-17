@@ -346,6 +346,17 @@ const SMSS_PROGRAMS: &[&str] = &[
     // Packages) que atende o LogonUserExExW dos serviços.
     "msv1_0.dll",
     "ntlmshared.dll",
+    // O wldp.dll (a política de bloqueio do Windows, carga atrasada do
+    // lsasrv no LsapCheckIfMachineIsSecureByDefault), com o oleaut32.dll que
+    // ele importa, e o umpdc.dll, importado pelo powrprof.dll.
+    "wldp.dll",
+    "oleaut32.dll",
+    "umpdc.dll",
+    // Os nomes de exibição dos privilégios, que o LsapDbInitializePrivilegeObject
+    // do lsasrv carrega ao montar o banco de política, e o ole32.dll que o
+    // wldp.dll carrega.
+    "msprivs.dll",
+    "ole32.dll",
 ];
 
 /// As imagens de kernel do caminho do smss (`--initial-process=smss`): o

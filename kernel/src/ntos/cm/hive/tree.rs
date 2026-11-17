@@ -60,6 +60,8 @@ pub struct NewKey {
     pub parent: Option<usize>,
     /// Chave de link (KEY_SYM_LINK).
     pub link: bool,
+    /// A classe da chave em UTF-16 (vazia sem classe).
+    pub class: Vec<u16>,
 }
 
 /// Monta uma hive nova com as chaves (a primeira é a raiz). Devolve a hive
@@ -73,7 +75,7 @@ pub fn build(keys: &[NewKey], minor: u32, time: u64, file_name: &str) -> Option<
             None if cells.is_empty() => HCELL_NIL,
             None => return None,
         };
-        let cell = key_cells::create_key(&mut storage, parent, &key.name, &key.security, time)?;
+        let cell = key_cells::create_key(&mut storage, parent, &key.name, &key.class, &key.security, time)?;
         if key.link {
             key_cells::set_key_flags(&mut storage, cell, key_cells::KEY_SYM_LINK);
         }

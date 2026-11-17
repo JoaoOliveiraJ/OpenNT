@@ -151,15 +151,24 @@ pub fn software_keys(smss_boot: bool) -> Vec<SeedKey> {
     keys
 }
 
-/// A hive SAM: o banco de contas, com os domínios Account e Builtin vazios.
+/// A hive SAM de um sistema novo: só a raiz. O SampInitialize do samsrv.dll
+/// abre `\Registry\Machine\Security\SAM` (o link para `SAM\SAM`) e, com
+/// STATUS_OBJECT_NAME_NOT_FOUND, cria o banco de contas (o
+/// SampInitializeRegistry, com o SID de domínio novo). Domínios vazios ou
+/// um `RXACT` sem o estado do RtlInitializeRXact não são um banco válido.
 pub fn sam_keys() -> Vec<SeedKey> {
-    ["SAM\\Domains\\Account", "SAM\\Domains\\Builtin", "SAM\\RXACT"].iter().map(|path| SeedKey::new(path)).collect()
+    Vec::new()
 }
 
-/// A hive SECURITY: a política da LSA e o `SAM`, um link para a raiz do
-/// banco de contas da hive SAM.
+/// A hive SECURITY de um sistema novo: só o `SAM`, um link para a raiz do
+/// banco de contas da hive SAM. O LsapDbInitializeServer do lsasrv.dll abre
+/// `Policy` e, com STATUS_OBJECT_NAME_NOT_FOUND, instala o banco de
+/// política (o LsapDbInstallPolicyObject, com a chave de sistema nova). O
+/// RtlInitializeRXact cria o `RXACT` com o estado (revisão 1); um `RXACT`
+/// que já existe sem esse valor dá STATUS_UNKNOWN_REVISION, e o lsass fica
+/// sem as extensões.
 pub fn security_keys() -> Vec<SeedKey> {
-    alloc::vec![SeedKey::new("Policy"), SeedKey::new("RXACT"), SeedKey::link("SAM", "\\REGISTRY\\MACHINE\\SAM\\SAM")]
+    alloc::vec![SeedKey::link("SAM", "\\REGISTRY\\MACHINE\\SAM\\SAM")]
 }
 
 /// A hive DEFAULT (`\Registry\User\.DEFAULT`): o perfil do sistema, com as

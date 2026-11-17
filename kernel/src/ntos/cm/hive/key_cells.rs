@@ -4,9 +4,11 @@
 //! ntoskrnl 19041:
 //! - criação (CmpDoCreateChild / CmpCreateHiveRootCell, rva 0x78da10): 'nk'
 //!   com o nome comprimido em bytes quando todos os caracteres cabem em 8
-//!   bits (CmpCopyName, rva 0x657770, flag KEY_COMP_NAME), listas e classe
-//!   nil, a célula de segurança e a entrada na lista de subchaves do pai; a
-//!   raiz leva KEY_HIVE_ENTRY | KEY_NO_DELETE e pai nil;
+//!   bits (CmpCopyName, rva 0x657770, flag KEY_COMP_NAME), listas nil, a
+//!   classe numa célula própria com os bytes do UNICODE_STRING (ClassLength
+//!   em bytes, sem terminador, e o MaxClassLen do pai acompanha; sem classe,
+//!   Class nil), a célula de segurança e a entrada na lista de subchaves do
+//!   pai; a raiz leva KEY_HIVE_ENTRY | KEY_NO_DELETE e pai nil;
 //! - valor novo (CmpAddValueKeyNew, rva 0x657630): 'vk' com o nome
 //!   comprimido (VALUE_COMP_NAME); até 4 bytes de dado ficam no próprio
 //!   campo Data com o bit CM_KEY_VALUE_SPECIAL_SIZE; acima de 16344 bytes,
@@ -124,8 +126,9 @@ pub fn set_key_flags(storage: &mut Storage, cell: u32, flags: u16) {
     }
 }
 
-/// Cria um 'nk'. `parent` nil cria a raiz da hive.
-pub fn create_key(storage: &mut Storage, parent: u32, name: &str, security: &Captured, time: u64) -> Option<u32> {
+/// Cria um 'nk' com a classe `class` (UTF-16, vazia = sem classe). `parent`
+/// nil cria a raiz da hive.
+pub fn create_key(storage: &mut Storage, parent: u32, name: &str, class: &[u16], security: &Captured, time: u64) -> Option<u32> {
     let name_units = units(name);
     let (stored, compressed) = stored_name(&name_units);
     let cell = storage.allocate(0x4c + stored.len() as u32)?;
@@ -146,6 +149,14 @@ pub fn create_key(storage: &mut Storage, parent: u32, name: &str, security: &Cap
     key.security.set(HCELL_NIL);
     key.class.set(HCELL_NIL);
     key.name_length.set(stored.len() as u16);
+    if !class.is_empty() {
+        let bytes: Vec<u8> = class.iter().flat_map(|unit| unit.to_le_bytes()).collect();
+        let class_cell = storage.allocate(bytes.len() as u32)?;
+        storage.write_cell(class_cell, 0, &bytes);
+        let key = node_at(storage.cell(cell, 0x4c)?);
+        key.class.set(class_cell);
+        key.class_length.set(bytes.len() as u16);
+    }
     let anchor = if parent == HCELL_NIL { HCELL_NIL } else { node(storage, parent)?.security.get() };
     let root = if parent == HCELL_NIL { HCELL_NIL } else { root_security(storage) };
     let security_cell = security_cells::assign(storage, anchor, root, security)?;
@@ -160,6 +171,7 @@ pub fn create_key(storage: &mut Storage, parent: u32, name: &str, security: &Cap
         if name_units.len() as u32 * 2 > parent_node.max_name_len() {
             parent_node.set_max_name_len(name_units.len() as u32 * 2);
         }
+        raise(&parent_node.max_class_len, class.len() as u32 * 2);
         parent_node.last_write_time.quad_part.set(time as i64);
         storage.mark_cell_dirty(parent);
     }
@@ -409,6 +421,8 @@ pub struct KeyRecord {
     pub values: Vec<Value>,
     pub children: Vec<u32>,
     pub flags: u16,
+    /// A classe da chave em UTF-16 (vazia sem classe).
+    pub class: Vec<u16>,
 }
 
 /// Lê um 'nk' com os valores, a segurança e as células das subchaves
@@ -427,7 +441,11 @@ pub fn read_key(storage: &Storage, cell: u32) -> Result<KeyRecord, u32> {
         let value_name = value_name(storage, value_cell).ok_or(STATUS_REGISTRY_CORRUPT)?;
         values.push(Value { name: String::from_utf16_lossy(&value_name), value_type: value.type_.get(), data: read_data(storage, value)? });
     }
-    Ok(KeyRecord { name: String::from_utf16_lossy(&name), last_write_time: key.last_write_time.quad_part.get() as u64, security, values, children, flags: key.flags.get() })
+    let class = match (key.class.get(), key.class_length.get() as u32) {
+        (HCELL_NIL, _) | (_, 0) => Vec::new(),
+        (cell, length) => storage.read_cell(cell, length).ok_or(STATUS_REGISTRY_CORRUPT)?.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect(),
+    };
+    Ok(KeyRecord { name: String::from_utf16_lossy(&name), last_write_time: key.last_write_time.quad_part.get() as u64, security, values, children, flags: key.flags.get(), class })
 }
 
 /// A célula de uma subchave pelo nome (para os testes de conferência).

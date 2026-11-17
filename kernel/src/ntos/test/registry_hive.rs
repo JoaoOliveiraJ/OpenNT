@@ -18,7 +18,12 @@
 //!   LastReorganizeTime e a carga seguinte reorganiza), descarga adiada do
 //!   ZwUnloadKeyEx, a notificação de hive de máquina numa carga real;
 //! - privilégios (SeRestorePrivilege/SeBackupPrivilege pelo PreviousMode de
-//!   usuário) e as validações de parâmetros dos serviços.
+//!   usuário) e as validações de parâmetros dos serviços;
+//! - a classe de uma chave (o Class do ZwCreateKey): a célula de classe na
+//!   hive, o ClassOffset e o ClassLength do KeyNodeInformation e do
+//!   KeyFullInformation (o layout do CmpPopulateKeyNodeInformation e do
+//!   CmpPopulateKeyFullInformation do 19041), o MaxClassLen do pai e o
+//!   Length ímpar recusado.
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -500,6 +505,50 @@ fn privileges_and_validation(assert: Assert) {
     assert(outcome == Some(true), "hive: sem SeRestorePrivilege/SeBackupPrivilege os servicos de hive de usuario devolvem STATUS_PRIVILEGE_NOT_HELD");
 }
 
+/// ZwCreateKey com Class: a chave `Classe` sob a origem, com a classe
+/// "4a1b" (o formato das classes que o lsasrv grava nas chaves da chave de
+/// sistema).
+fn key_class(assert: Assert) {
+    let path = alloc::format!("{SOURCE}\\Classe");
+    let class: Vec<u16> = "4a1b".encode_utf16().collect();
+    let block = guest::alloc_bytes(0x400);
+    guest::write_bytes(block, &[0u8; 0x400]);
+    let (output, disposition, class_string, class_buffer, information, returned) = (block, block + 8, block + 0x10, block + 0x20, block + 0x100, block + 0x40);
+    guest::write_bytes(class_buffer, &class.iter().flat_map(|unit| unit.to_le_bytes()).collect::<Vec<u8>>());
+    // SAFETY: bloco próprio recém-alocado.
+    let string = unsafe { UnicodeString::at(class_string) };
+    string.length.set(7);
+    string.maximum_length.set(8);
+    string.buffer.set(class_buffer);
+    let oa = attributes(&path);
+    let odd = status(call_export("ZwCreateKey", &[output, 0xF003F, oa, 0, class_string, 0, disposition]));
+    string.length.set(8);
+    let created = status(call_export("ZwCreateKey", &[output, 0xF003F, oa, 0, class_string, 0, disposition]));
+    let handle = guest::read64(output);
+    assert(odd == STATUS_INVALID_PARAMETER && created == 0 && guest::read32(disposition) == 1, "hive: ZwCreateKey com Class cria a chave; Length impar da STATUS_INVALID_PARAMETER");
+    // KeyNodeInformation: o nome em 0x18 e a classe depois dele, com o
+    // ClassOffset alinhado a 8 (0x18 + 12 bytes de "Classe" = 0x24 -> 0x28).
+    let node = status(call_export("ZwQueryKey", &[handle, 1, information, 0x100, returned]));
+    let class_bytes = |offset: u64| (0..class.len() as u64).map(|index| guest::read16(information + offset + index * 2)).collect::<Vec<u16>>();
+    assert(node == 0 && guest::read32(returned) == 0x30 && guest::read32(information + 0xC) == 0x28 && guest::read32(information + 0x10) == 8 && guest::read32(information + 0x14) == 12 && class_bytes(0x28) == class, "hive: KeyNodeInformation com ClassOffset 0x28, ClassLength 8 e a classe depois do nome");
+    let full = status(call_export("ZwQueryKey", &[handle, 2, information, 0x100, returned]));
+    assert(full == 0 && guest::read32(returned) == 0x34 && guest::read32(information + 0xC) == 0x2C && guest::read32(information + 0x10) == 8 && class_bytes(0x2C) == class, "hive: KeyFullInformation com ClassOffset 0x2C, ClassLength 8 e a classe");
+    let small = status(call_export("ZwQueryKey", &[handle, 2, information, 0x30, returned]));
+    assert(small == 0x8000_0005 && guest::read32(returned) == 0x34, "hive: KeyFullInformation sem espaco para a classe da STATUS_BUFFER_OVERFLOW");
+    let parent = open(SOURCE, false);
+    let parent_full = status(call_export("ZwQueryKey", &[parent, 2, information, 0x100, returned]));
+    assert(parent_full == 0 && guest::read32(information + 0x1C) == 8 && guest::read32(information + 0xC) == 0xFFFF_FFFF, "hive: o MaxClassLen do pai e 8 e a chave sem classe tem ClassOffset 0xFFFFFFFF");
+    registry::close_handle(parent as u32);
+    // A célula 'nk' na hive: ClassLength 8 e os bytes da classe.
+    let cell = registry::node_by_path(&path).and_then(|node| registry::with_node(node, |key| key.cell)).flatten();
+    let stored = cell.and_then(|(identifier, cell)| registry::with_storage(identifier, |storage| key_cells::node(storage, cell).map(|node| node.class_length.get()) == Some(8) && key_cells::read_key(storage, cell).is_ok_and(|record| record.class == class)));
+    assert(stored == Some(true), "hive: a celula nk guarda ClassLength 8 e a celula de classe");
+    let _ = call_export("ZwDeleteKey", &[handle]);
+    let _ = call_export("ZwClose", &[handle]);
+    guest::free_bytes(oa);
+    guest::free_bytes(block);
+}
+
 pub fn run(assert: Assert) {
     format_vectors(assert);
     if ntfs::mounted().is_none() {
@@ -508,6 +557,7 @@ pub fn run(assert: Assert) {
     }
     system_hive_from_file(assert);
     save_load_round_trip(assert);
+    key_class(assert);
     flush_unload_reload(assert);
     restore_compress_and_deferred_unload(assert);
     machine_hive_load_notifies(assert);

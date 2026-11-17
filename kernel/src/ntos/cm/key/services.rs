@@ -165,6 +165,27 @@ fn read_unicode_string(pointer: u64, previous_mode: bool) -> Flow<String> {
     Ok(String::from_utf16_lossy(&units))
 }
 
+/// O Class do NtCreateKey (o CmCreateKey do 19041): o UNICODE_STRING
+/// capturado, com Length ímpar = STATUS_INVALID_PARAMETER; os bytes são a
+/// classe da chave criada, sem terminador.
+fn read_class(pointer: u64, previous_mode: bool) -> Flow<Vec<u16>> {
+    if pointer == 0 {
+        return Ok(Vec::new());
+    }
+    let pointer = probe(pointer, UnicodeString::SIZE, previous_mode, false)?;
+    let length = captured::<u16>(pointer, offset_of!(UnicodeString, length))? as u64;
+    let buffer: u64 = captured(pointer, offset_of!(UnicodeString, buffer))?;
+    if length & 1 != 0 {
+        return status(0xC000_000D);
+    }
+    if length == 0 {
+        return Ok(Vec::new());
+    }
+    probe(buffer, length, previous_mode, false)?;
+    let Ok(bytes) = guest::try_read_bytes(buffer, length as usize) else { return status(0xC000_0005) };
+    Ok(bytes.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect())
+}
+
 /// Campo de uma estrutura do chamador (UNICODE_STRING, OBJECT_ATTRIBUTES,
 /// buffers de informação) pelo offset do layout. Com PreviousMode usuário o
 /// intervalo já passou por `probe`, mas a leitura continua sondada (a página
@@ -480,9 +501,7 @@ fn open_or_create_key(create: bool, output: u64, desired: u32, attributes_pointe
         if options & !(if create { CREATE_OPTIONS } else { OPEN_OPTIONS }) != 0 {
             return Ok(if create { 0xC000_000D } else { 0xC000_00F2 });
         }
-        if class_name != 0 && !read_unicode_string(class_name, previous_mode)?.is_empty() {
-            return Ok(0xC000_00BB);
-        }
+        let class = if create { read_class(class_name, previous_mode)? } else { Vec::new() };
         let output_disposition = if output_disposition != 0 { probe(output_disposition, 4, previous_mode, true)? } else { 0 };
         let mut attribute_flags: u32 = captured(attributes_pointer, offset_of!(ObjectAttributes, attributes))?;
         if previous_mode {
@@ -642,7 +661,7 @@ fn open_or_create_key(create: bool, output: u64, desired: u32, attributes_pointe
                 };
                 // REG_OPTION_VOLATILE: a chave nova não vai para a hive de
                 // arquivo; REG_OPTION_CREATE_LINK: a chave nova é um link.
-                opened = if create { registry::create_resolved(&resolved, assigned, options & REG_OPTION_VOLATILE != 0, create_link)?.0 } else { registry::open_resolved(&resolved)? };
+                opened = if create { registry::create_resolved_class(&resolved, assigned, options & REG_OPTION_VOLATILE != 0, create_link, &class)?.0 } else { registry::open_resolved(&resolved)? };
                 if opened == 0 {
                     return Ok(Outcome::from_status(0xC000_0034));
                 }

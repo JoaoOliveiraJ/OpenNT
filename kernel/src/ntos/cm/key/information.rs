@@ -19,6 +19,7 @@ fn utf16_length(text: &str) -> u32 {
 
 struct Snapshot {
     name: String,
+    class: Vec<u16>,
     last_write_time: u64,
     children: Vec<NodeId>,
     value_names: Vec<u32>,
@@ -27,12 +28,17 @@ struct Snapshot {
 
 /// Basic(0), Node(1), Full(2), Name(3), Cached(4) e HandleTags(7). Buffer
 /// menor que o cabeçalho não recebe dados; nome truncado dá BUFFER_OVERFLOW.
+/// A classe da chave, como no CmpPopulateKeyNodeInformation e no
+/// CmpPopulateKeyFullInformation do 19041: no Node ela vem depois do nome,
+/// com o ClassOffset alinhado a 8; no Full, logo depois do cabeçalho (0x2C).
+/// Sem classe, ClassOffset é 0xFFFFFFFF.
 pub fn write(node: NodeId, absolute_path: &str, class: u32, output: u64, buffer_length: u32, output_length: u64, handle_tags: u32) -> u32 {
     if class > 4 && class != 7 {
         return 0xC000_0003;
     }
     let Some(key) = registry::with_node(node, |key| Snapshot {
         name: key.name.clone(),
+        class: key.class.clone(),
         last_write_time: key.last_write_time,
         children: key.children.iter().map(|&(_, child)| child).collect(),
         value_names: key.values.iter().map(|(_, value)| utf16_length(&value.name)).collect(),
@@ -43,7 +49,14 @@ pub fn write(node: NodeId, absolute_path: &str, class: u32, output: u64, buffer_
     // NameInformation usa o caminho absoluto; Basic e Node usam o nome do nó.
     let name: Vec<u16> = if class == 3 { absolute_path.encode_utf16().collect() } else { key.name.encode_utf16().collect() };
     let header = [16usize, 24, 44, 4, 40].get(class as usize).copied().unwrap_or(4);
-    let required = header + if matches!(class, 0 | 1 | 3) { name.len() * 2 } else { 0 };
+    let class_length = if matches!(class, 1 | 2) { key.class.len() * 2 } else { 0 };
+    // O deslocamento da classe: depois do nome alinhado a 8 (Node) ou do
+    // cabeçalho (Full).
+    let class_offset = match class {
+        1 => (header + name.len() * 2 + 7) & !7,
+        _ => header,
+    };
+    let required = if class_length != 0 { class_offset + class_length } else { header + if matches!(class, 0 | 1 | 3) { name.len() * 2 } else { 0 } };
     // ResultLength e o buffer podem ser de modo usuário (sondados pelo
     // serviço): escritas sondadas, falha = STATUS_ACCESS_VIOLATION.
     if output_length != 0 && guest::try_write::<u32>(output_length, required as u32).is_err() {
@@ -65,8 +78,8 @@ pub fn write(node: NodeId, absolute_path: &str, class: u32, output: u64, buffer_
             put32(&mut bytes, 12, name.len() as u32 * 2);
         }
         if class == 1 {
-            // A hive não armazena string de classe: marcador sem classe.
-            put32(&mut bytes, 12, 0xFFFF_FFFF);
+            put32(&mut bytes, 12, if class_length != 0 { class_offset as u32 } else { 0xFFFF_FFFF });
+            put32(&mut bytes, 16, class_length as u32);
             put32(&mut bytes, 20, name.len() as u32 * 2);
         }
         if class == 2 || class == 4 {
@@ -74,9 +87,12 @@ pub fn write(node: NodeId, absolute_path: &str, class: u32, output: u64, buffer_
             let maximum_value_name = key.value_names.iter().copied().max().unwrap_or(0);
             let maximum_value_data = key.value_data.iter().copied().max().unwrap_or(0);
             if class == 2 {
-                put32(&mut bytes, 12, 0xFFFF_FFFF);
+                let maximum_class = key.children.iter().filter_map(|&child| registry::with_node(child, |child| child.class.len() as u32 * 2)).max().unwrap_or(0);
+                put32(&mut bytes, 12, if class_length != 0 { class_offset as u32 } else { 0xFFFF_FFFF });
+                put32(&mut bytes, 16, class_length as u32);
                 put32(&mut bytes, 20, key.children.len() as u32);
                 put32(&mut bytes, 24, maximum_subkey);
+                put32(&mut bytes, 28, maximum_class);
                 put32(&mut bytes, 32, key.value_names.len() as u32);
                 put32(&mut bytes, 36, maximum_value_name);
                 put32(&mut bytes, 40, maximum_value_data);
@@ -93,6 +109,11 @@ pub fn write(node: NodeId, absolute_path: &str, class: u32, output: u64, buffer_
     if matches!(class, 0 | 1 | 3) {
         for (index, unit) in name.iter().enumerate() {
             bytes[header + index * 2..header + index * 2 + 2].copy_from_slice(&unit.to_le_bytes());
+        }
+    }
+    if class_length != 0 {
+        for (index, unit) in key.class.iter().enumerate() {
+            bytes[class_offset + index * 2..class_offset + index * 2 + 2].copy_from_slice(&unit.to_le_bytes());
         }
     }
     if guest::try_write_bytes(output, &bytes[..required.min(buffer_length as usize)]).is_err() {
