@@ -54,7 +54,7 @@
 //! ainda não existem aqui: STATUS_NOT_SUPPORTED, com registro.
 
 use alloc::boxed::Box;
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -292,6 +292,9 @@ type ReplySlot = Arc<ReplyCell>;
 struct Link {
     server_port: Arc<Port>,
     context: u64,
+    /// O servidor desconectou ou fechou a porta de comunicação: os envios do
+    /// cliente voltam STATUS_PORT_DISCONNECTED.
+    disconnected: bool,
 }
 
 #[derive(Default)]
@@ -310,6 +313,9 @@ struct ServerState {
     /// O contexto de segurança e os handles de cada pedido recebido, até a
     /// resposta.
     received: BTreeMap<u32, Received>,
+    /// Pedidos cuja espera do cliente terminou com a desconexão do servidor
+    /// (a resposta tardia só limpa o que restou deles).
+    abandoned: BTreeSet<u32>,
     closed: bool,
 }
 
@@ -487,7 +493,7 @@ impl Service for UserServer {
         let attributes = SentAttributes { handles, security };
         let (id, context, sequence, link_port) = {
             let mut state = self.state.lock();
-            let Some((context, sequence, link_port)) = state.links.get(&port.pointer).map(|link| (link.context, next_sequence(&link.server_port), link.server_port.clone())) else { return Reply::Now(JobResult { status: STATUS_PORT_DISCONNECTED, ..JobResult::default() }) };
+            let Some((context, sequence, link_port)) = state.links.get(&port.pointer).filter(|link| !link.disconnected).map(|link| (link.context, next_sequence(&link.server_port), link.server_port.clone())) else { return Reply::Now(JobResult { status: STATUS_PORT_DISCONNECTED, ..JobResult::default() }) };
             let id = UserServer::next_id(&mut state);
             if !datagram {
                 state.requests.insert(id, slot.clone());
@@ -794,7 +800,7 @@ fn send_reply(server: &UserServer, port: &Arc<Port>, input: u64, attributes: u64
     let (slot, exposed, _received) = {
         let mut state = server.state.lock();
         let slot = state.requests.remove(&id);
-        let (exposed, received) = if slot.is_some() {
+        let (exposed, received) = if slot.is_some() || state.abandoned.remove(&id) {
             state.senders.remove(&id);
             (state.exposed_views.remove(&id), state.received.remove(&id))
         } else {
@@ -1098,12 +1104,14 @@ fn establish_with(server: &Arc<UserServer>, pending: &Arc<PendingConnection>, ou
     if let Some((local, _)) = &accepted.server_view {
         views.push(local.clone());
     }
-    let initial = PortState { role: Role::Server, port_context, port_flags, duplicate_object_types, views, ..PortState::default() };
+    let initial = PortState { role: Role::Server, port_context, port_flags, duplicate_object_types, views, on_disconnect: Some(communication_disconnected), ..PortState::default() };
     let disconnecting = server.clone();
     let client_pointer = pending.client.pointer;
     // A sequência da porta de comunicação começa em zero: a primeira
     // mensagem do cliente é a 1.
     let communication = match port_objects::create("alpc", initial, server.listener.maximum(), 0, attributes, Box::new(move |port: &Arc<Port>| {
+        // O fim da porta também solta os pedidos que o cliente esperava.
+        communication_disconnected(port, port, true);
         COMMUNICATION.lock().remove(&port.pointer);
         disconnecting.state.lock().links.remove(&client_pointer);
         for view in port.with(|state| core::mem::take(&mut state.views)) {
@@ -1121,7 +1129,7 @@ fn establish_with(server: &Arc<UserServer>, pending: &Arc<PendingConnection>, ou
         }
         communication.set_started(true);
         COMMUNICATION.lock().insert(communication.pointer, (server.clone(), client_pointer));
-        server.state.lock().links.insert(client_pointer, Link { server_port: communication.clone(), context: port_context });
+        server.state.lock().links.insert(client_pointer, Link { server_port: communication.clone(), context: port_context, disconnected: false });
         let server_view = accepted.server_view.as_ref().map(|(_, remote)| remote.clone());
         *pending.decision.lock() = Some(Decision { status: STATUS_SUCCESS, data, server_view });
         kernel_entry::notify_waiters();
@@ -1129,6 +1137,41 @@ fn establish_with(server: &Arc<UserServer>, pending: &Arc<PendingConnection>, ou
     });
     crate::ntos::ob::objects::dispatcher::collect(communication.pointer);
     outcome
+}
+
+/// A porta de comunicação do servidor foi desconectada (NtAlpcDisconnectPort)
+/// ou fechada: como o AlpcpDisconnectPort e o AlpcpFlushMessagesPort, os
+/// pedidos que o cliente dela ainda espera terminam com
+/// STATUS_PORT_DISCONNECTED, e os envios seguintes do cliente também. O
+/// vínculo continua até o cliente fechar a porta dele (o LPC_PORT_CLOSED com
+/// a sequência seguinte da comunicação) ou até a porta de comunicação sair.
+fn communication_disconnected(communication: &Arc<Port>, endpoint: &Arc<Port>, _closing: bool) {
+    if !Arc::ptr_eq(communication, endpoint) {
+        return;
+    }
+    let Some((server, client)) = COMMUNICATION.lock().get(&communication.pointer).cloned() else { return };
+    let slots: Vec<ReplySlot> = {
+        let mut state = server.state.lock();
+        match state.links.get_mut(&client) {
+            Some(link) if Arc::ptr_eq(&link.server_port, communication) => link.disconnected = true,
+            _ => return,
+        }
+        let ids: Vec<u32> = state.requests.keys().copied().filter(|id| state.senders.get(id).is_some_and(|origin| origin.client == client)).collect();
+        let mut slots = Vec::new();
+        for id in ids {
+            if let Some(slot) = state.requests.remove(&id) {
+                state.abandoned.insert(id);
+                slots.push(slot);
+            }
+        }
+        slots
+    };
+    for slot in &slots {
+        *slot.result.lock() = Some(JobResult { status: STATUS_PORT_DISCONNECTED, ..JobResult::default() });
+    }
+    if !slots.is_empty() {
+        kernel_entry::notify_waiters();
+    }
 }
 
 /// Como no ObInsertObject, quem cria a porta recebe o acesso total ao
