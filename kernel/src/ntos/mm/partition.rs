@@ -360,13 +360,23 @@ const NUMBER_OF_NODES: u32 = 1;
 /// Maior uso de páginas já informado (o PeakCommitment da partição).
 static PEAK_COMMITMENT: SpinLock<u64> = SpinLock::new(0);
 
-/// PsReferencePartitionByHandle em KernelMode: -1 (processo corrente) e -2
-/// (sistema) são a partição do sistema; um handle precisa ser de Partition.
-fn reference_partition(handle: u64, access: u32) -> Result<u64, u32> {
+/// PsReferencePartitionByHandle(Handle, DesiredAccess, PreviousMode) do
+/// ntoskrnl 19041 (rva 0x676644): o pseudo-handle -1 é a partição do
+/// processo corrente (EPROCESS.Partition do KTHREAD.ApcState.Process) e o -2
+/// a do sistema (PspSystemPartition), os dois sem conferir acesso nem modo;
+/// outro valor é um handle de Partition referenciado com o acesso e o modo
+/// pedidos. O OpenNT tem só a partição do sistema, que é também a de todo
+/// processo.
+pub fn reference_by_handle(handle: u64, access: u32, mode: u8) -> Result<u64, u32> {
     if handle as i64 == -1 || handle as i64 == -2 {
         return get().ok_or(STATUS_INVALID_HANDLE);
     }
-    resolve(handle, access, 0)
+    resolve(handle, access, mode)
+}
+
+/// O PsReferencePartitionByHandle do ZwManagePartition (KernelMode).
+fn reference_partition(handle: u64, access: u32) -> Result<u64, u32> {
+    reference_by_handle(handle, access, 0)
 }
 
 /// MmManagePartitionMemoryInformation sobre a partição do sistema: Flags 0,

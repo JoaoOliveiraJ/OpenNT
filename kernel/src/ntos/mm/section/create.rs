@@ -250,7 +250,10 @@ pub fn create(output: u64, access: u32, object_attributes: u64, size_pointer: u6
         Decoded::Status(status) => return Ok(status),
         Decoded::Request(request) => request,
         Decoded::Partition { partition_handle, .. } => {
-            match partition::resolve(partition_handle, 2, mode) {
+            // SEC_PARTITION_OWNER_HANDLE: o FileHandle é a partição, pelo
+            // PsReferencePartitionByHandle com MEMORY_PARTITION_MODIFY_ACCESS
+            // (o dxgmms2 passa -1, a partição do processo corrente).
+            match partition::reference_by_handle(partition_handle, 2, mode) {
                 Ok(body) => partition_body = Some(body),
                 Err(status) => return Ok(status),
             }

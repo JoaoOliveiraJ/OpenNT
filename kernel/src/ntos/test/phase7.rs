@@ -4841,6 +4841,14 @@ fn memory_partition(assert: Assert) {
             partitioned
         });
         assert(created == Some(0) && retained && section_resolved, "partition: secao da particao retem o corpo");
+        // SEC_PARTITION_OWNER_HANDLE com os pseudo-handles do
+        // PsReferencePartitionByHandle: -1 (a partição do processo corrente)
+        // e -2 (a do sistema), as duas o alocador real.
+        let pseudo = [u64::MAX, u64::MAX - 1].map(|pseudo| {
+            guest::write64(rsp + 56, pseudo);
+            call("NtCreateSection", result, 7, 0, maximum)
+        });
+        assert(pseudo == [Some(0), Some(0)] && guest::read64(body) == base_refs + 4 && partition::reference_by_handle(u64::MAX, 2, 1) == Ok(body), "partition: secao com os pseudo-handles -1 e -2 da particao");
         // Recusas da captura e do acesso.
         let zero = call("NtOpenPartition", result, 0, attributes, 0);
         set_name("KernelObjects\\MemoryPartition0", 0x40, 0);
