@@ -740,6 +740,7 @@ pub fn init() {
     crate::ntos::ps::user::tokens::init();
     crate::ntos::po::shutdown::register_user_services();
     crate::ntos::po::system_state::register_user_services();
+    crate::ntos::po::power_information::register_user_services();
     crate::ntos::ob::compare_objects::register_user_services();
     crate::ntos::se::token::compare::register_user_services();
     crate::ntos::ex::uuid::register_user_services();

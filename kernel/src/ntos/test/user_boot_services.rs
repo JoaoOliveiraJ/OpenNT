@@ -46,6 +46,7 @@ pub fn run(assert: Assert) {
     directory_query(assert, block, rsp, &call);
     executive_timer(assert, block, rsp, &call);
     adjust_groups(assert, block, rsp, &call);
+    power_information(assert, block, rsp, &call);
     if let Some(region) = memory::find_region(block) {
         memory::release_private_region(&region);
     }
@@ -343,6 +344,41 @@ fn executive_timer(assert: Assert, block: u64, rsp: u64, call: Call) {
     assert(
         invalid_type == 0xC000_00F2 && created == 0 && handle != 0 && negative_period == 0xC000_00F4 && set == 0 && previous_state == 0 && cancelled == 0 && current_state == 0 && closed == 0,
         "userboot: NtCreateTimer, NtSetTimer e NtCancelTimer do ETIMER de modo usuario",
+    );
+}
+
+/// NtPowerInformation de modo usuário: PlatformInformation e PlatformRole
+/// sem entrada, o PowerInformationInternal 4 (o UmpoSmartPresenceInit), os
+/// níveis só de kernel e o tamanho da saída.
+fn power_information(assert: Assert, block: u64, rsp: u64, call: Call) {
+    let (input, output) = (block + 0x700, block + 0x720);
+    let power = |level: u64, input: u64, input_length: u64, output: u64, output_length: u64| {
+        guest::write64(rsp + 0x28, output_length);
+        call("NtPowerInformation", level, input, input_length, output)
+    };
+    guest::write32(output, 0xFFFF_FFFF);
+    let platform = power(66, 0, 0, output, 1);
+    let aoac = guest::read8(output);
+    let platform_input = power(66, input, 4, output, 1);
+    let platform_no_output = power(66, 0, 0, 0, 0);
+    guest::write32(output, 0);
+    let role = power(75, 0, 0, output, 4);
+    let role_value = guest::read32(output);
+    let role_short = power(75, 0, 0, output, 2);
+    guest::write32(input, 4);
+    guest::write32(input + 4, 0);
+    guest::write8(output, 0xFF);
+    let absence = power(87, input, 8, output, 1);
+    let absence_value = guest::read8(output);
+    let absence_short_input = power(87, input, 4, output, 1);
+    let absence_no_output = power(87, input, 8, 0, 0);
+    guest::write32(input, 0x100);
+    let internal_invalid = power(87, input, 8, output, 1);
+    let kernel_only = power(41, 0, 0, output, 0x40);
+    let out_of_range = power(0x60, 0, 0, output, 4);
+    assert(
+        platform == 0 && aoac == 0 && platform_input == STATUS_INVALID_PARAMETER && platform_no_output == STATUS_INVALID_PARAMETER && role == 0 && role_value == 1 && role_short == 0xC000_0023 && absence == 0 && absence_value == 0 && absence_short_input == STATUS_INVALID_PARAMETER && absence_no_output == 0xC000_0023 && internal_invalid == STATUS_INVALID_PARAMETER && kernel_only == STATUS_ACCESS_DENIED && out_of_range == STATUS_INVALID_PARAMETER,
+        "userboot: NtPowerInformation de modo usuario (66, 75, 87 tipo 4, niveis so de kernel)",
     );
 }
 

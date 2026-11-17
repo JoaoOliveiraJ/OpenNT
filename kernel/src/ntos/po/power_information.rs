@@ -135,3 +135,153 @@ pub fn query(level: u32, input: u64, input_length: u32, output: u64, output_leng
     capabilities.ups_present.set(1);
     Ok(0)
 }
+
+// NtPowerInformation de modo usuário (ntoskrnl 19041, rva 0x6f04e0).
+//
+// - Um nível acima de 0x5F dá STATUS_INVALID_PARAMETER.
+// - Um ponteiro NULL zera o comprimento dele, e um comprimento zero anula o
+//   ponteiro.
+// - Os níveis só de kernel dão STATUS_ACCESS_DENIED a um chamador de modo
+//   usuário (as máscaras 0x30200C0 e 0x209E02E385CA1E1F do 19041).
+// - A saída é sondada para escrita com alinhamento 1 e a entrada é capturada.
+// - O nível monta o resultado num buffer do kernel; o fim comum copia esse
+//   resultado para a saída (STATUS_BUFFER_TOO_SMALL se ela for menor). Sem
+//   saída, o resultado é descartado com sucesso.
+
+const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+const STATUS_NOT_IMPLEMENTED: u32 = 0xC000_0002;
+const MAXIMUM_LEVEL: u32 = 0x5F;
+/// Os níveis que o NtPowerInformation recusa ao modo usuário.
+const KERNEL_ONLY_LEVELS: [u32; 33] = [6, 7, 17, 24, 25, 30, 31, 32, 33, 34, 39, 40, 41, 42, 47, 49, 52, 53, 54, 56, 61, 62, 63, 67, 68, 69, 71, 79, 80, 81, 82, 85, 91];
+/// POWER_INFORMATION_LEVEL PlatformRole e PowerInformationInternal.
+const PLATFORM_ROLE: u32 = 75;
+const POWER_INFORMATION_INTERNAL: u32 = 87;
+/// POWER_INFORMATION_LEVEL_INTERNAL PowerInternalUserAbsencePredictionCapability.
+const USER_ABSENCE_PREDICTION_CAPABILITY: u32 = 4;
+/// POWER_PLATFORM_ROLE PlatformRoleDesktop.
+const PLATFORM_ROLE_DESKTOP: u32 = 1;
+/// O maior pedaço de entrada que o OpenNT captura (o maior nível suportado
+/// lê 8 bytes).
+const MAXIMUM_CAPTURE: u32 = 0x1000;
+
+/// PopPlatformAoAc: FALSE numa plataforma sem Modern Standby.
+fn platform_aoac() -> u8 {
+    0
+}
+
+/// PopCapturePlatformRole: o PopPlatformRole, ou, antes de definido,
+/// PlatformRoleMobile com bateria (PopCB.BatteryCount) e PlatformRoleDesktop
+/// sem. O OpenNT não tem bateria.
+fn platform_role() -> u32 {
+    PLATFORM_ROLE_DESKTOP
+}
+
+/// O resultado de um nível: os bytes que o fim comum copia para a saída.
+enum Answer {
+    Data(alloc::vec::Vec<u8>),
+    Status(u32),
+}
+
+/// O corpo de cada nível sobre a entrada capturada (`input` vazio = NULL) e
+/// a presença da saída.
+fn user_level(level: u32, input: &[u8], has_output: bool) -> Answer {
+    match level {
+        // PlatformInformation e PlatformRole: sem entrada, com saída.
+        PLATFORM_INFORMATION | PLATFORM_ROLE => {
+            if !input.is_empty() || !has_output {
+                return Answer::Status(STATUS_INVALID_PARAMETER);
+            }
+            if level == PLATFORM_INFORMATION {
+                Answer::Data(alloc::vec![platform_aoac()])
+            } else {
+                Answer::Data(platform_role().to_le_bytes().to_vec())
+            }
+        }
+        // PowerInformationInternal: o POWER_INFORMATION_INTERNAL_HEADER
+        // {InternalType, Version} de pelo menos 8 bytes; os tipos 0x44 a
+        // 0xFFF e de 0x100B em diante são inválidos.
+        POWER_INFORMATION_INTERNAL => {
+            if input.len() < 8 {
+                return Answer::Status(STATUS_INVALID_PARAMETER);
+            }
+            let internal = u32::from_le_bytes([input[0], input[1], input[2], input[3]]);
+            if (0x44..=0xFFF).contains(&internal) || internal as i32 >= 0x100B {
+                return Answer::Status(STATUS_INVALID_PARAMETER);
+            }
+            match internal {
+                // PopPowerInformationInternal: sem saída é
+                // STATUS_BUFFER_TOO_SMALL; senão um BOOLEAN, FALSE fora de uma
+                // plataforma AoAc.
+                USER_ABSENCE_PREDICTION_CAPABILITY => {
+                    if !has_output {
+                        return Answer::Status(STATUS_BUFFER_TOO_SMALL);
+                    }
+                    Answer::Data(alloc::vec![platform_aoac()])
+                }
+                _ => {
+                    crate::debug_print!("[po] NtPowerInformation de modo usuario: PowerInformationInternal tipo {:#x} sem suporte", internal);
+                    Answer::Status(STATUS_NOT_IMPLEMENTED)
+                }
+            }
+        }
+        _ => {
+            crate::debug_print!("[po] NtPowerInformation de modo usuario: nivel {} sem suporte", level);
+            Answer::Status(STATUS_NOT_IMPLEMENTED)
+        }
+    }
+}
+
+/// NtPowerInformation(InformationLevel, InputBuffer, InputBufferLength,
+/// OutputBuffer, OutputBufferLength) com PreviousMode UserMode.
+pub fn query_user(level: u32, input: u64, input_length: u32, output: u64, output_length: u32) -> u32 {
+    use crate::ntos::mm::guest_memory as guest;
+    use crate::ntos::ps::user_probe;
+    if level > MAXIMUM_LEVEL {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let input_length = if input == 0 { 0 } else { input_length };
+    let input = if input_length == 0 { 0 } else { input };
+    let output_length = if output == 0 { 0 } else { output_length };
+    let output = if output_length == 0 { 0 } else { output };
+    if KERNEL_ONLY_LEVELS.contains(&level) {
+        return STATUS_ACCESS_DENIED;
+    }
+    if output != 0 && !user_probe::probe_user_write(output, output_length as u64) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    let captured = if input != 0 {
+        if !user_probe::probe_user_read(input, input_length as u64) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        match guest::try_read_bytes(input, input_length.min(MAXIMUM_CAPTURE) as usize) {
+            Ok(bytes) => bytes,
+            Err(error) => return error.status,
+        }
+    } else {
+        alloc::vec::Vec::new()
+    };
+    let data = match user_level(level, &captured, output != 0) {
+        Answer::Data(data) => data,
+        Answer::Status(status) => return status,
+    };
+    if output == 0 {
+        return 0;
+    }
+    if (output_length as usize) < data.len() {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    match guest::try_write_bytes(output, &data) {
+        Ok(()) => 0,
+        Err(error) => error.status,
+    }
+}
+
+fn nt_power_information(level: u64, input: u64, input_length: u64, output: u64, rsp: u64) -> Result<u32, KernelError> {
+    Ok(query_user(level as u32, input, input_length as u32, output, crate::ntos::ps::user::state::stack_arg32(rsp, 5)))
+}
+
+/// O handler do serviço NtPowerInformation de modo usuário.
+pub fn register_user_services() {
+    crate::ntos::ps::user::state::register_handler("NtPowerInformation", nt_power_information);
+}
