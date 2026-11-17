@@ -1148,6 +1148,18 @@ pub extern "C" fn opennt_user_syscall(frame: *mut u64) -> u64 {
     let mut result: u64 = 0;
     let mut stack_count = 0u64;
     let number = unsafe { *frame };
+    // O papel do KTHREAD.TrapFrame, que o KiSystemServiceStart grava antes da
+    // busca na tabela: o CONTEXT do intervalo recebe os registradores desta
+    // syscall já aqui. A conversão em thread GUI logo abaixo chama o win32k,
+    // que faz um KeUserModeCallback (o __ClientThreadSetup da user32) de
+    // dentro dela; o quadro do callback sai do RSP e do RIP desse CONTEXT, e
+    // sem a captura eles seriam os da entrada anterior no kernel.
+    capture_syscall_registers(frame, number);
+    STATE.lock().frame_context = block().context.get();
+    {
+        let mut keep = CONTEXT_KEEP.lock();
+        keep.0 = [false; CONTEXT_SIZE];
+    }
     let mut target = service_lookup(number, crate::ntos::ps::win32::is_gui_thread() as u64, &mut stack_count);
     if target == 0 {
         match crate::ntos::ex::service_table::out_of_range(number as u32).unwrap_or(Err(STATUS_INVALID_SYSTEM_SERVICE)) {
@@ -1156,12 +1168,6 @@ pub extern "C" fn opennt_user_syscall(frame: *mut u64) -> u64 {
         }
     }
     system_services::note_user_target(number, target);
-    capture_syscall_registers(frame, number);
-    STATE.lock().frame_context = block().context.get();
-    {
-        let mut keep = CONTEXT_KEEP.lock();
-        keep.0 = [false; CONTEXT_SIZE];
-    }
     if target != 0 {
         let mut packet = [0u64; 19];
         unsafe {

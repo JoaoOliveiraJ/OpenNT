@@ -943,7 +943,10 @@ KTHREAD.CallbackNestingLevel, cria uma pilha de kernel nova com o
 KERNEL_STACK_CONTROL preenchido (o segmento anterior e, em
 Previous.KernelStack, o quadro do callout), monta o UCALLOUT_FRAME e a cópia
 da entrada abaixo do RSP da syscall (o CONTEXT do intervalo faz o papel do
-KTRAP_FRAME) e troca a KTHREAD para a pilha nova. O intervalo do callback é
+KTRAP_FRAME; `opennt_user_syscall` o preenche na entrada do serviço, antes da
+busca na tabela, como o KiSystemServiceStart grava KTHREAD.TrapFrame, porque
+a conversão em thread GUI já chama o win32k, que faz um callback de dentro
+dela) e troca a KTHREAD para a pilha nova. O intervalo do callback é
 aninhado no serviço: `usermode::exec_user_callback` guarda o estado por CPU
 do serviço de fora (o quadro do despachante, o CONTEXT e o quadro da
 syscall, RspBase/RSP0, GS e IF) e entra num CONTEXT próprio em
