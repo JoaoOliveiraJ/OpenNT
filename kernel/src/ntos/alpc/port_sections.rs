@@ -103,6 +103,20 @@ pub fn reference(port: &Arc<Port>, handle: u64) -> Result<Arc<SectionRecord>, u3
     Ok(record)
 }
 
+/// Uma retenção a mais de um registro ainda vivo (a vista que uma mensagem
+/// leva, ou a do receptor); `false` se ele já saiu.
+pub fn retain(record: &Arc<SectionRecord>) -> bool {
+    if !live(record) {
+        return false;
+    }
+    let mut state = record.state.lock();
+    if state.references == 0 {
+        return false;
+    }
+    state.references += 1;
+    true
+}
+
 /// Vistas e operações podem reter o registro depois da retirada do nome.
 pub fn release(record: &Arc<SectionRecord>) -> Result<(), KernelError> {
     if !live(record) {

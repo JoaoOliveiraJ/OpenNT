@@ -48,6 +48,47 @@ pub fn map(port: &Arc<Port>, handle: u64, options: MapOptions) -> Result<Result<
         Ok(record) => record,
         Err(status) => return Ok(Err(status)),
     };
+    if record.creator_process.is_some_and(|creator| creator != process::get_current_process()) {
+        let _ = port_sections::release(&record);
+        return Ok(Err(0xC000_0022));
+    }
+    map_record(port, record, options)
+}
+
+/// A vista de quem recebe uma mensagem com o atributo de vista
+/// (AlpcpExposeViewAttributeInSenderContext): a mesma região da seção
+/// (deslocamento e tamanho da vista de quem enviou), mapeada no processo da
+/// porta que recebe e registrada nela, que a apaga pelo
+/// NtAlpcDeleteSectionView com a própria base. Uma vista dessa região que a
+/// porta ainda tem é reaproveitada (o AlpcpLocateView).
+pub fn expose_region(receiver: &Arc<Port>, record: &Arc<SectionRecord>, offset: u64, size: u64) -> Result<Result<Arc<ViewBinding>, u32>, KernelError> {
+    let existing = receiver.with(|state| {
+        state
+            .owned_section_views
+            .iter()
+            .find(|binding| {
+                let alive = {
+                    let state = binding.state.lock();
+                    !state.deleted && !state.released
+                };
+                alive && Arc::ptr_eq(&binding.section, record) && binding.view.offset == offset && binding.view.size == size
+            })
+            .cloned()
+    });
+    if let Some(binding) = existing {
+        return Ok(Ok(binding));
+    }
+    if !port_sections::retain(record) {
+        return Ok(Err(0xC000_0008));
+    }
+    let system_space = receiver.with(|state| state.port_flags) & 0x10_0000 != 0;
+    let request = MapRequest { offset, size, protect: 4, system_space, supervisor: system_space, ..MapRequest::default() };
+    map_record(receiver, record.clone(), MapOptions { request, owner_process: Some(receiver.process_pointer), region: None })
+}
+
+/// O mapeamento de uma seção já referenciada (a referência passa à vista, ou
+/// sai na falha).
+fn map_record(port: &Arc<Port>, record: Arc<SectionRecord>, options: MapOptions) -> Result<Result<Arc<ViewBinding>, u32>, KernelError> {
     let owner_process = options.owner_process.unwrap_or_else(process::get_current_process);
     let mut storage = 0u64;
     let mut process_retained = false;
@@ -55,9 +96,6 @@ pub fn map(port: &Arc<Port>, handle: u64, options: MapOptions) -> Result<Result<
     let mut mapped: Option<Arc<View>> = None;
     let mut security: Option<Arc<SecuredToken>> = None;
     let outcome = (|| -> Result<Result<Arc<ViewBinding>, u32>, KernelError> {
-        if record.creator_process.is_some_and(|creator| creator != process::get_current_process()) {
-            return Ok(Err(0xC000_0022));
-        }
         if port.closed() {
             return Ok(Err(0xC000_0037));
         }

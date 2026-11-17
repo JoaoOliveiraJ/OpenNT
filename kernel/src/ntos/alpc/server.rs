@@ -29,6 +29,11 @@
 //!   o ALPC_CONTEXT_ATTR (PortContext da comunicação, sequência e
 //!   MessageId), ou a espera até chegar uma (sem prazo, ou o prazo dado;
 //!   prazo zero devolve STATUS_TIMEOUT);
+//! - a vista de dados de uma mensagem grande (o atributo de vista,
+//!   `alpc/message/view.rs`): a região da seção do cliente entra no processo
+//!   do servidor quando ele recebe o pedido, registrada na porta de conexão
+//!   (por onde ele a apaga, ou a resposta com UNMAP_EXISTING), e a região da
+//!   resposta entra no cliente quando ele a recebe;
 //! - o fim de um cliente: LPC_PORT_CLOSED na fila, com o PortContext;
 //! - NtAlpcOpenSenderProcess/NtAlpcOpenSenderThread ([`open_sender`]): o
 //!   processo ou a thread de quem enviou uma mensagem ainda pendente no
@@ -57,6 +62,8 @@ use core::mem::offset_of;
 
 use crate::ntos::alpc::kernel_entry;
 use crate::ntos::alpc::message::buffer::{self as message_buffer, Buffer};
+use crate::ntos::alpc::message::identity::Identity;
+use crate::ntos::alpc::message::view as message_view;
 use crate::ntos::alpc::port_reference;
 use crate::ntos::alpc::small::context_attribute;
 use crate::ntos::alpc::transport::{self, Job, JobResult, Listener, Reply, Request, Sender, Service};
@@ -118,6 +125,7 @@ const LEGACY_TYPE_MASK: u16 = 0xC00F;
 const PAGE_READWRITE: u32 = 4;
 
 /// Uma mensagem na fila do servidor, ainda não recebida.
+#[derive(Default)]
 struct Delivery {
     id: u32,
     message_type: u16,
@@ -126,6 +134,8 @@ struct Delivery {
     port_context: u64,
     /// A seção de transferência de uma conexão LPC (o PORT_VIEW do cliente).
     view: Option<Arc<ClientView>>,
+    /// A vista de dados que o envio levou (o atributo de vista).
+    data_view: Option<Arc<message_view::Carried>>,
 }
 
 /// A seção de transferência de um cliente LPC: o PORT_VIEW do NtConnectPort,
@@ -210,8 +220,20 @@ pub struct Origin {
     pub client: u64,
 }
 
-/// A resposta de um pedido, preenchida quando o servidor responde.
-type ReplySlot = Arc<SpinLock<Option<JobResult>>>;
+/// A resposta de um pedido, preenchida quando o servidor responde, com a
+/// vista de dados que ela leva.
+struct ReplyCell {
+    result: SpinLock<Option<JobResult>>,
+    view: SpinLock<Option<Arc<message_view::Carried>>>,
+}
+
+impl Default for ReplyCell {
+    fn default() -> Self {
+        Self { result: SpinLock::new(None), view: SpinLock::new(None) }
+    }
+}
+
+type ReplySlot = Arc<ReplyCell>;
 
 /// O vínculo de um cliente conectado: a porta de comunicação do servidor e o
 /// PortContext dela.
@@ -232,6 +254,8 @@ struct ServerState {
     senders: BTreeMap<u32, Origin>,
     /// Clientes conectados, pelo ponteiro da porta do cliente.
     links: BTreeMap<u64, Link>,
+    /// A vista que cada pedido recebido trouxe ao servidor, até a resposta.
+    exposed_views: BTreeMap<u32, Arc<crate::ntos::alpc::section_views::ViewBinding>>,
     closed: bool,
 }
 
@@ -272,17 +296,18 @@ impl UserServer {
     /// O servidor fechou a porta de conexão: as conexões pendentes são
     /// recusadas e o nome sai do namespace.
     fn close(&self) {
-        let (connections, requests) = {
+        let (connections, requests, _queue, _views) = {
             let mut state = self.state.lock();
             state.closed = true;
-            state.queue.clear();
-            (core::mem::take(&mut state.connections), core::mem::take(&mut state.requests))
+            // As mensagens e vistas saem fora da trava (a vista de dados solta
+            // a seção que retinha).
+            (core::mem::take(&mut state.connections), core::mem::take(&mut state.requests), core::mem::take(&mut state.queue), core::mem::take(&mut state.exposed_views))
         };
         for connection in connections.values() {
             refuse(connection);
         }
         for slot in requests.values() {
-            *slot.lock() = Some(JobResult { status: STATUS_PORT_DISCONNECTED, ..JobResult::default() });
+            *slot.result.lock() = Some(JobResult { status: STATUS_PORT_DISCONNECTED, ..JobResult::default() });
         }
         if let Some(endpoint) = self.endpoint.lock().take() {
             transport::unregister(&endpoint);
@@ -315,7 +340,7 @@ impl UserServer {
             state.senders.insert(id, Origin { sender, client: port.pointer });
             id
         };
-        self.enqueue(Delivery { id, message_type: LPC_CONNECTION_REQUEST, data: Vec::from(data), sender, port_context: 0, view });
+        self.enqueue(Delivery { id, message_type: LPC_CONNECTION_REQUEST, data: Vec::from(data), sender, port_context: 0, view, ..Delivery::default() });
         let decision = pending.clone();
         let status = kernel_entry::wait_transport(&mut || decision.decision.lock().as_ref().map(|decision| decision.status), crate::ntos::ke::wait::Deadline::Infinite, 0, false);
         let decision = pending.decision.lock().take().unwrap_or(Decision { status, ..Decision::default() });
@@ -345,14 +370,21 @@ fn refuse(connection: &PendingConnection) {
     *connection.decision.lock() = Some(Decision { status: STATUS_PORT_CONNECTION_REFUSED, ..Decision::default() });
 }
 
-/// A continuação do pedido de um cliente: conclui quando o servidor responde.
+/// A continuação do pedido de um cliente: conclui quando o servidor responde;
+/// a vista que a resposta leva fica com a identidade do pedido até o cliente
+/// receber a resposta.
 struct ReplyJob {
     slot: ReplySlot,
+    identity: Arc<Identity>,
 }
 
 impl Job for ReplyJob {
     fn poll(&mut self) -> Option<JobResult> {
-        self.slot.lock().take()
+        let result = self.slot.result.lock().take()?;
+        if let Some(view) = self.slot.view.lock().take() {
+            self.identity.with(|state| state.reply_view = Some(view));
+        }
+        Some(result)
     }
 }
 
@@ -382,7 +414,9 @@ impl Service for UserServer {
         if sender.thread_pointer == 0 {
             sender.thread_pointer = request.identity.with(|state| state.sender_thread);
         }
-        let slot: ReplySlot = Arc::new(SpinLock::new(None));
+        let slot: ReplySlot = Arc::new(ReplyCell::default());
+        // A vista de dados do envio passa à mensagem do servidor.
+        let data_view = request.identity.with(|state| state.view.take());
         let (id, context) = {
             let mut state = self.state.lock();
             let Some(context) = state.links.get(&port.pointer).map(|link| link.context) else { return Reply::Now(JobResult { status: STATUS_PORT_DISCONNECTED, ..JobResult::default() }) };
@@ -394,11 +428,11 @@ impl Service for UserServer {
             (id, context)
         };
         let message_type = if datagram { LPC_DATAGRAM } else if synchronous { LPC_REQUEST | LPC_CONTINUATION_REQUIRED } else { LPC_REQUEST };
-        self.enqueue(Delivery { id, message_type, data: Vec::from(data), sender, port_context: context, view: None });
+        self.enqueue(Delivery { id, message_type, data: Vec::from(data), sender, port_context: context, data_view, ..Delivery::default() });
         if datagram {
             return Reply::Now(JobResult::default());
         }
-        Reply::Later(Box::new(ReplyJob { slot }))
+        Reply::Later(Box::new(ReplyJob { slot, identity: request.identity.clone() }))
     }
 
     /// O cliente saiu: LPC_PORT_CLOSED na fila, com o PortContext dele.
@@ -411,7 +445,7 @@ impl Service for UserServer {
         };
         COMMUNICATION.lock().remove(&link.server_port.pointer);
         let sender = Sender { process: port.process_id(), thread: port.thread_id(), thread_pointer: 0 };
-        self.enqueue(Delivery { id, message_type: LPC_PORT_CLOSED, data: Vec::new(), sender, port_context: link.context, view: None });
+        self.enqueue(Delivery { id, message_type: LPC_PORT_CLOSED, sender, port_context: link.context, ..Delivery::default() });
     }
 }
 
@@ -517,7 +551,7 @@ struct ReceiveOptions {
 /// vista.
 fn receive_one(server: &UserServer, buffer: &Buffer, attributes: u64, options: ReceiveOptions) -> Option<u32> {
     loop {
-        let (id, view) = {
+        let (id, view, data_view) = {
             let mut state = server.state.lock();
             if state.closed {
                 return Some(STATUS_PORT_DISCONNECTED);
@@ -528,13 +562,23 @@ fn receive_one(server: &UserServer, buffer: &Buffer, attributes: u64, options: R
                 state.senders.remove(&discarded.id);
                 continue;
             }
-            (delivery.id, delivery.view.clone())
+            (delivery.id, delivery.view.clone(), delivery.data_view.clone())
         };
         let wants_view = attributes != 0 && state::user_struct::<AlpcMessageAttributes>(attributes).and_then(|header| header.allocated_attributes.probe_get()).is_ok_and(|allocated| allocated & VIEW_ATTRIBUTE != 0);
         let exposed = match view.filter(|_| wants_view) {
             Some(view) => match view.expose() {
                 Ok(exposed) => Some(exposed),
                 Err(status) => return Some(status),
+            },
+            None => None,
+        };
+        // A vista de dados entra no processo do servidor, registrada na porta
+        // de conexão (por onde o servidor a apaga).
+        let data_binding = match data_view.as_ref().filter(|_| wants_view) {
+            Some(carried) => match message_view::expose(&server.listener, carried) {
+                Ok(Ok(binding)) => Some((binding, carried.clone())),
+                Ok(Err(status)) => return Some(status),
+                Err(error) => return Some(if error.status != 0 { error.status } else { 0xC000_0001 }),
             },
             None => None,
         };
@@ -562,12 +606,48 @@ fn receive_one(server: &UserServer, buffer: &Buffer, attributes: u64, options: R
         if options.port_context != 0 && guest::try_write::<u64>(options.port_context, delivery.port_context).is_err() {
             return Some(STATUS_ACCESS_VIOLATION);
         }
-        return Some(publish_attributes(attributes, &delivery, sequence, exposed.as_ref()).err().unwrap_or(STATUS_SUCCESS));
+        let published = publish_attributes(attributes, &delivery, sequence, exposed.as_ref()).and_then(|_| match &data_binding {
+            Some((binding, carried)) => message_view::publish(attributes, binding, carried).map(|_| ()),
+            None => Ok(()),
+        });
+        // Um pedido que espera resposta guarda a vista até ela.
+        if let Some((binding, _)) = data_binding.filter(|_| published.is_ok() && delivery.message_type & 0xFF == LPC_REQUEST) {
+            server.state.lock().exposed_views.insert(delivery.id, binding);
+        }
+        return Some(published.err().unwrap_or(STATUS_SUCCESS));
     }
 }
 
-/// O envio do servidor: a resposta ao pedido do MessageId da mensagem.
-fn send_reply(server: &UserServer, input: u64, mode: u8) -> u32 {
+/// A vista de dados de uma resposta (o atributo de vista válido no
+/// ALPC_MESSAGE_ATTRIBUTES de envio), achada na porta por onde o servidor
+/// responde.
+/// O segundo valor diz se o atributo pede que a vista que o pedido trouxe ao
+/// servidor saia (UNMAP_EXISTING).
+fn capture_reply_view(port: &Arc<Port>, attributes: u64, mode: u8) -> Result<(Option<Arc<message_view::Carried>>, bool), u32> {
+    if attributes == 0 {
+        return Ok((None, false));
+    }
+    let header = state::user_struct::<AlpcMessageAttributes>(attributes).map_err(|error| error.status)?;
+    let (allocated, valid) = (header.allocated_attributes.probe_get().map_err(|error| error.status)?, header.valid_attributes.probe_get().map_err(|error| error.status)?);
+    if valid & !allocated != 0 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    if valid & VIEW_ATTRIBUTE == 0 {
+        return Ok((None, false));
+    }
+    let at = crate::ntos::ps::user::alpc::attribute_address(attributes, VIEW_ATTRIBUTE);
+    let unmap = message_view::unmap_existing(at, mode);
+    match message_view::capture(port, at, mode) {
+        Ok(Ok(message_view::Captured::View(carried))) => Ok((Some(carried), unmap)),
+        Ok(Ok(message_view::Captured::Empty)) => Ok((None, unmap)),
+        Ok(Err(status)) => Err(status),
+        Err(error) => Err(if error.status != 0 { error.status } else { 0xC000_0001 }),
+    }
+}
+
+/// O envio do servidor: a resposta ao pedido do MessageId da mensagem, pela
+/// porta `port`, com a vista de dados do atributo de envio.
+fn send_reply(server: &UserServer, port: &Arc<Port>, input: u64, attributes: u64, mode: u8) -> u32 {
     // A resposta de um servidor LPC pode trazer TotalLength maior (o buffer
     // da mensagem recebida, reaproveitado).
     let captured = match message_buffer::capture_message_with(input, server.listener.maximum().max(PortMessage::SIZE as u32), mode, server.legacy()) {
@@ -580,16 +660,29 @@ fn send_reply(server: &UserServer, input: u64, mode: u8) -> u32 {
         crate::debug_print!("[alpc] servidor de usuario: mensagem sem MessageId (envio do servidor) sem suporte");
         return STATUS_NOT_SUPPORTED;
     }
-    let slot = {
+    let (view, unmap) = match capture_reply_view(port, attributes, mode) {
+        Ok(captured) => captured,
+        Err(status) => return status,
+    };
+    let (slot, exposed) = {
         let mut state = server.state.lock();
         let slot = state.requests.remove(&id);
-        if slot.is_some() {
+        let exposed = if slot.is_some() {
             state.senders.remove(&id);
-        }
-        slot
+            state.exposed_views.remove(&id)
+        } else {
+            None
+        };
+        (slot, exposed)
     };
     let Some(slot) = slot else { return STATUS_REPLY_MESSAGE_MISMATCH };
-    *slot.lock() = Some(JobResult { status: STATUS_SUCCESS, data: captured.data, sender: Some(current_sender()) });
+    // A resposta com UNMAP_EXISTING apaga a vista que o pedido trouxe ao
+    // servidor (o AlpcpCaptureViewAttributeInternal com a vista da mensagem).
+    if let Some(binding) = exposed.filter(|binding| unmap && !binding.state.lock().deleted) {
+        let _ = crate::ntos::alpc::section_views::delete_referenced(&binding);
+    }
+    *slot.view.lock() = view;
+    *slot.result.lock() = Some(JobResult { status: STATUS_SUCCESS, data: captured.data, sender: Some(current_sender()) });
     kernel_entry::notify_waiters();
     STATUS_SUCCESS
 }
@@ -597,21 +690,21 @@ fn send_reply(server: &UserServer, input: u64, mode: u8) -> u32 {
 /// NtAlpcSendWaitReceivePort na porta de conexão ou de comunicação de um
 /// servidor de usuário: a resposta (se houver mensagem de envio) e depois a
 /// recepção (se houver buffer), com a espera pela próxima mensagem.
-pub fn exchange(port: &Arc<Port>, flags: u32, input: u64, receive: crate::ntos::ps::user::alpc::ReceiveArguments) -> Result<u32, KernelError> {
+pub fn exchange(port: &Arc<Port>, flags: u32, input: u64, send_attributes: u64, receive: crate::ntos::ps::user::alpc::ReceiveArguments) -> Result<u32, KernelError> {
     let Some(server) = server_of(port) else { return Ok(STATUS_INVALID_PORT_HANDLE) };
     if flags & 0x2_0000 != 0 {
         crate::debug_print!("[alpc] servidor de usuario: pedido sincrono do servidor sem suporte");
         return Ok(STATUS_NOT_SUPPORTED);
     }
-    reply_and_receive(server, input, receive, ReceiveOptions::default())
+    reply_and_receive(server, port, input, send_attributes, receive, ReceiveOptions::default())
 }
 
 /// A resposta (se houver mensagem de envio) e depois a recepção (se houver
 /// buffer), com a espera pela próxima mensagem: o lado servidor do
 /// NtAlpcSendWaitReceivePort e do NtReplyWaitReceivePort(Ex).
-fn reply_and_receive(server: Arc<UserServer>, input: u64, receive: crate::ntos::ps::user::alpc::ReceiveArguments, options: ReceiveOptions) -> Result<u32, KernelError> {
+fn reply_and_receive(server: Arc<UserServer>, port: &Arc<Port>, input: u64, send_attributes: u64, receive: crate::ntos::ps::user::alpc::ReceiveArguments, options: ReceiveOptions) -> Result<u32, KernelError> {
     if input != 0 {
-        let status = send_reply(&server, input, 1);
+        let status = send_reply(&server, port, input, send_attributes, 1);
         if status != 0 {
             return Ok(status);
         }
@@ -677,7 +770,7 @@ pub fn receive_legacy(port: &Arc<Port>, reply: u64, receive: u64, port_context: 
     }
     let options = ReceiveOptions { legacy: server.legacy(), port_context, connections_only };
     let arguments = crate::ntos::ps::user::alpc::ReceiveArguments { output: receive, length: 0, receive_attributes: 0, timeout };
-    reply_and_receive(server, reply, arguments, options)
+    reply_and_receive(server, port, reply, 0, arguments, options)
 }
 
 /// O LPC_CLIENT_DIED de uma thread que terminou, pela porta de término dela
@@ -711,13 +804,13 @@ pub fn post_datagram(port: &Arc<Port>, message_type: u16, data: &[u8], sender: S
         let context = client.and_then(|client| state.links.get(&client).map(|link| link.context)).unwrap_or(0);
         (UserServer::next_id(&mut state), context)
     };
-    server.enqueue(Delivery { id, message_type, data: data.to_vec(), sender, port_context: context, view: None });
+    server.enqueue(Delivery { id, message_type, data: data.to_vec(), sender, port_context: context, ..Delivery::default() });
 }
 
 /// O NtReplyPort no lado servidor: a resposta ao pedido do MessageId.
 pub fn reply_legacy(port: &Arc<Port>, reply: u64) -> u32 {
     match server_of(port) {
-        Some(server) => send_reply(&server, reply, 1),
+        Some(server) => send_reply(&server, port, reply, 0, 1),
         None => STATUS_INVALID_PORT_HANDLE,
     }
 }
@@ -1181,7 +1274,7 @@ fn connection_request(server: &Arc<UserServer>, input: u64, receive: crate::ntos
         Err(status) => return Box::new(Completed(status)),
     };
     let sender = current_sender();
-    let slot: ReplySlot = Arc::new(SpinLock::new(None));
+    let slot: ReplySlot = Arc::new(ReplyCell::default());
     let id = {
         let mut state = server.state.lock();
         if state.closed {
@@ -1193,7 +1286,7 @@ fn connection_request(server: &Arc<UserServer>, input: u64, receive: crate::ntos
         id
     };
     let message_type = if server.legacy() { LPC_REQUEST } else { LPC_REQUEST | LPC_CONTINUATION_REQUIRED };
-    server.enqueue(Delivery { id, message_type, data: captured.data, sender, port_context: 0, view: None });
+    server.enqueue(Delivery { id, message_type, data: captured.data, sender, ..Delivery::default() });
     Box::new(ConnectionRequest { server: server.clone(), id, slot, output: receive.output, length: receive.length, done: false })
 }
 
@@ -1215,7 +1308,7 @@ impl crate::ntos::alpc::kernel_entry::Pending for ConnectionRequest {
         if self.done {
             return Some(STATUS_SUCCESS);
         }
-        let result = self.slot.lock().take()?;
+        let result = self.slot.result.lock().take()?;
         self.done = true;
         if result.status != STATUS_SUCCESS || self.output == 0 {
             return Some(result.status);
@@ -1264,7 +1357,7 @@ pub fn begin_kernel_legacy_receive(port: &Arc<Port>, reply: u64, receive: u64, p
     use crate::ntos::alpc::kernel_wait;
     let Some(server) = server_of(port) else { return Ok(Box::new(Completed(STATUS_INVALID_PORT_HANDLE))) };
     if reply != 0 {
-        let status = send_reply(&server, reply, 0);
+        let status = send_reply(&server, port, reply, 0, 0);
         if status != 0 {
             return Ok(Box::new(Completed(status)));
         }
@@ -1308,7 +1401,7 @@ pub fn begin_kernel_exchange(port: &Arc<Port>, flags: u32, input: u64, receive: 
         return Ok(Box::new(Completed(STATUS_NOT_SUPPORTED)));
     }
     if input != 0 {
-        let status = send_reply(&server, input, 0);
+        let status = send_reply(&server, port, input, 0, 0);
         if status != 0 {
             return Ok(Box::new(Completed(status)));
         }

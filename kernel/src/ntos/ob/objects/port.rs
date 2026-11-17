@@ -133,6 +133,9 @@ pub struct PortState {
     pub on_disconnect: Option<fn(&Arc<Port>, &Arc<Port>, bool)>,
     pub owned_sections: Vec<Arc<SectionRecord>>,
     pub owned_section_views: Vec<Arc<ViewBinding>>,
+    /// As vistas que respostas recebidas trouxeram a esta porta, pelo
+    /// MessageId da resposta (o reenvio com UNMAP_EXISTING as apaga).
+    pub received_views: BTreeMap<u32, Arc<ViewBinding>>,
     pub owned_security_contexts: Vec<Arc<ContextRecord>>,
     pub pending: Vec<Message>,
     pub jobs: Vec<Arc<Request>>,

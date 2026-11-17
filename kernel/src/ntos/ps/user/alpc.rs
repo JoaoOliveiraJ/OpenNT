@@ -19,7 +19,7 @@ use crate::ntos::alpc::message::identity::{self as message_identity, Identity};
 use crate::ntos::alpc::small::{context_attribute, direct_event, wake_policy};
 use crate::ntos::alpc::transport::{JobResult, Message, Reply, Request, RequestState, Sender};
 use crate::ntos::alpc::{kernel_wait, legacy_service, port_reference};
-use crate::ntos::alpc::message::{handles as message_handles, security as message_security};
+use crate::ntos::alpc::message::{handles as message_handles, security as message_security, view as message_view};
 use crate::ntos::alpc::resource::{reserves as resource_reserves, services as services};
 use crate::ntos::ke::dispatcher;
 use crate::ntos::ob::objects::port::{self as port_objects, Port, PortState, Role};
@@ -385,6 +385,7 @@ pub fn cleanup_transport(connection: &Arc<Port>) {
         let _ = release_request(connection, &request, false);
     }
     let _ = resource_reserves::close_owner(connection);
+    connection.with(|state| state.received_views.clear());
 }
 
 fn pump_port(port: &Arc<Port>) -> Result<(), KernelError> {
@@ -489,7 +490,7 @@ pub fn attributes(pointer: u64, input: bool, mode: u8) -> u32 {
     if input && valid & !allocated != 0 {
         return INVALID;
     }
-    if input && valid & !0xB600_0000 != 0 {
+    if input && valid & !0xF600_0000 != 0 {
         crate::debug_print!("[alpc] send attributes=0x{:x}", valid);
         return 0xC000_00BB;
     }
@@ -504,6 +505,9 @@ pub fn attributes(pointer: u64, input: bool, mode: u8) -> u32 {
         }
     }
     if input && valid & 0x0400_0000 != 0 && !message_buffer::accessible(attribute_address(pointer, 0x0400_0000), 8, mode, false) {
+        return AV;
+    }
+    if input && valid & message_view::VIEW_ATTRIBUTE != 0 && !message_buffer::accessible(attribute_address(pointer, message_view::VIEW_ATTRIBUTE), 32, mode, false) {
         return AV;
     }
     if (if input { valid } else { allocated }) & 0x2000_0000 != 0 {
@@ -825,8 +829,15 @@ fn send(port: &Arc<Port>, flags: u32, input: u64, send_attributes: u64, mode: u8
     let lpc_request = lpc_port && header[4] == 0;
     let reserve_id = if lpc_request { 0 } else { u32::from_le_bytes([header[24], header[25], header[26], header[27]]) };
     // IDs positivos designam associações de mensagem: esta ponta de cliente
-    // não tem pedido de servidor correspondente. Reservas têm o bit alto.
+    // não tem pedido de servidor correspondente. Reservas têm o bit alto. O
+    // reenvio de uma resposta recebida com o atributo de vista UNMAP_EXISTING
+    // solta a vista que ela trouxe (o DropMsgAttributes do RPC).
     if reserve_id != 0 && reserve_id & 0x8000_0000 == 0 {
+        if valid & message_view::VIEW_ATTRIBUTE != 0 && flags & 0x3_0000 == 0 {
+            if let Some(status) = message_view::release_received(port, reserve_id, attribute_address(send_attributes, message_view::VIEW_ATTRIBUTE), mode)? {
+                return Ok(if status == 0 { Ok(None) } else { Err(status) });
+            }
+        }
         return Ok(Err(0xC000_0702));
     }
     let cid_present = header[8..24].iter().any(|&byte| byte != 0);
@@ -888,6 +899,13 @@ fn send(port: &Arc<Port>, flags: u32, input: u64, send_attributes: u64, mode: u8
             match message_handles::capture(attribute_address(send_attributes, 0x1000_0000), mode)? {
                 Err(status) => return Ok(Err(status)),
                 Ok(handles) => identity.with(|state| state.handles = Some(handles)),
+            }
+        }
+        if valid & message_view::VIEW_ATTRIBUTE != 0 {
+            match message_view::capture(port, attribute_address(send_attributes, message_view::VIEW_ATTRIBUTE), mode)? {
+                Err(status) => return Ok(Err(status)),
+                Ok(message_view::Captured::Empty) => {}
+                Ok(message_view::Captured::View(carried)) => identity.with(|state| state.view = Some(carried)),
             }
         }
         if context_address != 0 {
@@ -1044,7 +1062,16 @@ impl Receiver {
         if delivery != 0 {
             return Ok(Some(delivery));
         }
-        let published = try_publish_attributes(self.receive_attributes, port, context, sequence, &identity);
+        let mut published = try_publish_attributes(self.receive_attributes, port, context, sequence, &identity);
+        // A vista que a resposta de um servidor de modo usuário trouxe entra
+        // no processo desta porta.
+        if let Some(carried) = identity.with(|state| state.reply_view.take()).filter(|_| published.is_ok()) {
+            match message_view::deliver(port, self.receive_attributes, &carried)? {
+                Ok(Some(binding)) => message_view::remember_received(port, identity.identifier, &binding),
+                Ok(None) => {}
+                Err(status) => published = Err(status),
+            }
+        }
         take(port);
         message_identity::release(&identity)?;
         Ok(Some(published.err().unwrap_or(0)))
@@ -1226,7 +1253,7 @@ fn send_receive(handle: u64, flags: u64, input: u64, send_attributes: u64, rsp: 
             // O lado servidor de uma conexão de usuário (porta de conexão ou
             // de comunicação) tem a fila e as respostas próprias.
             if port.kind == "alpc" && crate::ntos::alpc::server::owns(&port) {
-                return crate::ntos::alpc::server::exchange(&port, flags as u32, input, receive);
+                return crate::ntos::alpc::server::exchange(&port, flags as u32, input, send_attributes, receive);
             }
             if port.kind == "alpc" {
                 return Ok(match exchange_messages(&port, flags as u32, input, send_attributes, receive, 1)? {
@@ -1263,7 +1290,7 @@ pub fn deferred_send(handle: u64, flags: u32, input: u64) -> Result<u32, KernelE
     let receive = ReceiveArguments { output: 0, length: 0, receive_attributes: 0, timeout: 0 };
     let result = port.run(|| {
         if port.kind == "alpc" && crate::ntos::alpc::server::owns(&port) {
-            return crate::ntos::alpc::server::exchange(&port, flags, input, receive);
+            return crate::ntos::alpc::server::exchange(&port, flags, input, 0, receive);
         }
         if port.kind == "alpc" {
             return Ok(match exchange_messages(&port, flags, input, 0, receive, 1)? {
@@ -1433,6 +1460,16 @@ fn nt_alpc_create_section_view(handle: u64, flags: u64, attributes: u64, _: u64,
     services::create_section_view(handle, flags as u32, attributes, 1)
 }
 
+/// NtAlpcDeleteSectionView(PortHandle, Flags, ViewBase).
+fn nt_alpc_delete_section_view(handle: u64, flags: u64, base: u64, _: u64, _rsp: u64) -> Result<u32, KernelError> {
+    services::delete_section_view(handle, flags as u32, base, 1)
+}
+
+/// NtAlpcDeletePortSection(PortHandle, Flags, SectionHandle).
+fn nt_alpc_delete_port_section(handle: u64, flags: u64, section: u64, _: u64, _rsp: u64) -> Result<u32, KernelError> {
+    services::delete_port_section(handle, flags as u32, section, 1)
+}
+
 pub fn init() {
     // O fallback LPC registra antes desta camada; os handles do tipo LPC
     // continuam no seu emissor.
@@ -1455,6 +1492,8 @@ pub fn init() {
     state::register_handler("NtAlpcQueryInformationMessage", nt_alpc_query_information_message);
     state::register_handler("NtAlpcCreatePortSection", nt_alpc_create_port_section);
     state::register_handler("NtAlpcCreateSectionView", nt_alpc_create_section_view);
+    state::register_handler("NtAlpcDeleteSectionView", nt_alpc_delete_section_view);
+    state::register_handler("NtAlpcDeletePortSection", nt_alpc_delete_port_section);
     let installed = kernel_entry::install(begin_kernel_exchange).and_then(|_| kernel_entry::install_connection(begin_connection)).and_then(|_| kernel_entry::install_connection_ex(begin_connection_ex));
     if let Err(error) = installed {
         crate::debug_print!("[alpc] {}", error);

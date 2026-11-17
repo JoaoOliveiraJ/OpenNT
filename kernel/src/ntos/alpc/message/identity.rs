@@ -49,6 +49,11 @@ pub struct IdentityState {
     pub references: u32,
     pub security: Option<Arc<crate::ntos::alpc::security_contexts::Borrowed>>,
     pub handles: Option<Arc<crate::ntos::alpc::message::handles::HandleData>>,
+    /// A vista que o envio leva (o atributo de vista).
+    pub view: Option<Arc<crate::ntos::alpc::message::view::Carried>>,
+    /// A vista que a resposta de um servidor de modo usuário trouxe, até o
+    /// cliente receber a resposta.
+    pub reply_view: Option<Arc<crate::ntos::alpc::message::view::Carried>>,
     pub release_sender: Option<Box<dyn FnOnce() + Send>>,
     pub sender_thread: u64,
     pub replied: bool,
@@ -232,7 +237,9 @@ pub fn reference(identity: &Arc<Identity>) -> Result<Arc<Identity>, KernelError>
 }
 
 pub fn clear_attributes(identity: &Identity) {
-    let (security, handles, release_sender) = identity.with(|state| (state.security.take(), state.handles.take(), state.release_sender.take()));
+    let (security, handles, release_sender, view) = identity.with(|state| (state.security.take(), state.handles.take(), state.release_sender.take(), state.view.take()));
+    // A seção que a vista retinha sai fora da trava da identidade.
+    drop(view);
     if let Some(security) = security {
         security.release();
     }
@@ -255,6 +262,8 @@ pub fn dereference(identity: &Arc<Identity>, borrowed: bool) -> Result<(), Kerne
     let Some(remaining) = remaining else { return Err(KernelError::new("ALPC message reference underflow")) };
     if remaining == 0 {
         clear_attributes(identity);
+        // A vista de uma resposta nunca recebida.
+        drop(identity.with(|state| state.reply_view.take()));
     }
     if borrowed {
         let _ = crate::ntos::ob::objects::dispatcher::dereference(identity.port.pointer);
