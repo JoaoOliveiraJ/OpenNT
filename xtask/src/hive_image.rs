@@ -40,6 +40,8 @@ mod cm {
     pub mod session_manager;
     #[path = "../../../../kernel/src/ntos/cm/crypto_defaults.rs"]
     pub mod crypto_defaults;
+    #[path = "../../../../kernel/src/ntos/cm/current_version.rs"]
+    pub mod current_version;
     #[path = "../../../../kernel/src/ntos/cm/ini_file_mapping.rs"]
     pub mod ini_file_mapping;
     #[path = "../../../../kernel/src/ntos/cm/arbiters.rs"]

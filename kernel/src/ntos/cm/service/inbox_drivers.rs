@@ -83,7 +83,11 @@
 //! (ahcache, Start 1 e sem Group na instalação: a chave fica sem Group), o
 //! IFS do Winsock 2 (ws2ifsl, Start 4), o navegador de rede (bowser, Type 2,
 //! Group Network, Tag 5) e os sockets AF_UNIX (afunix, Start 1). A subchave
-//! Parameters\Winsock do afunix (do modo usuário) não é copiada.
+//! Parameters\Winsock do afunix (do modo usuário) não é copiada. Entram do
+//! mesmo jeito o redirecionador UNC (Mup, Type 2, Start 0, Group Network),
+//! o cliente DFS que depende dele (DfsC, Start 1, DependOnService Mup e o
+//! Parameters\UseDCLocatorSiteName) e o file system UDF (udfs, Start 4,
+//! Group "Boot File System").
 //!
 //! Dados puros da hive SYSTEM (veja `cm/seed.rs`): cada driver com os
 //! valores que o banco de serviços grava numa instalação seguidos de Group,
@@ -181,7 +185,13 @@ const DRIVERS: &[InboxDriver] = &[
     InboxDriver { name: "ws2ifsl", display_name: Some("@%systemroot%\\System32\\drivers\\ws2ifsl.sys,-1000"), service_type: SERVICE_KERNEL_DRIVER, image_path: Some("\\SystemRoot\\system32\\drivers\\ws2ifsl.sys"), start: SERVICE_DEMAND_START, smss_start: None, error_control: 1, group: "PNP_TDI", tag: None, dwords: &[] },
     InboxDriver { name: "bowser", display_name: Some("@%systemroot%\\system32\\wkssvc.dll,-2001"), service_type: SERVICE_FILE_SYSTEM_DRIVER, image_path: Some("system32\\DRIVERS\\bowser.sys"), start: SERVICE_DEMAND_START, smss_start: None, error_control: 1, group: "Network", tag: Some(5), dwords: &[] },
     InboxDriver { name: "afunix", display_name: Some("afunix"), service_type: SERVICE_KERNEL_DRIVER, image_path: Some("\\SystemRoot\\system32\\drivers\\afunix.sys"), start: SERVICE_DEMAND_START, smss_start: None, error_control: 1, group: "PNP_TDI", tag: None, dwords: &[] },
+    InboxDriver { name: "Mup", display_name: Some("@%systemroot%\\system32\\drivers\\mup.sys,-101"), service_type: SERVICE_FILE_SYSTEM_DRIVER, image_path: Some("System32\\Drivers\\mup.sys"), start: SERVICE_DEMAND_START, smss_start: None, error_control: 1, group: "Network", tag: None, dwords: &[] },
+    InboxDriver { name: "DfsC", display_name: Some("@%systemroot%\\system32\\wkssvc.dll,-1008"), service_type: SERVICE_FILE_SYSTEM_DRIVER, image_path: Some("System32\\Drivers\\dfsc.sys"), start: SERVICE_DEMAND_START, smss_start: None, error_control: 1, group: "Network", tag: None, dwords: &[] },
+    InboxDriver { name: "udfs", display_name: Some("udfs"), service_type: SERVICE_FILE_SYSTEM_DRIVER, image_path: Some("system32\\DRIVERS\\udfs.sys"), start: SERVICE_DEMAND_START, smss_start: None, error_control: 1, group: "Boot File System", tag: None, dwords: &[] },
 ];
+
+/// DependOnService da instalação (o `service_key` grava a lista vazia).
+const DEPEND_ON: &[(&str, &[&str])] = &[("DfsC", &["Mup"])];
 
 /// Dado de um valor que a instalação grava fora da chave do serviço.
 enum Installed {
@@ -207,6 +217,7 @@ const INSTALLED_VALUES: &[(&str, &str, Installed)] = &[
     ("Services\\BasicRender\\Parameters", "SingleDeviceInstall", Installed::Dword(1)),
     ("Services\\TSDDD\\Device0", "InstalledDisplayDrivers", Installed::Strings(&["TSDDD"])),
     ("Services\\TSDDD\\Device0", "VgaCompatible", Installed::Dword(0)),
+    ("Services\\DfsC\\Parameters", "UseDCLocatorSiteName", Installed::Dword(0)),
 ];
 
 /// As chaves dos drivers inbox, dos file systems e os valores do KMDF.
@@ -237,6 +248,10 @@ pub fn seed_keys(smss_boot: bool) -> Vec<SeedKey> {
         }
         for &(name, value) in driver.dwords {
             key.dword(name, value);
+        }
+        if let Some(&(_, services)) = DEPEND_ON.iter().find(|entry| entry.0 == driver.name) {
+            key.values.retain(|value| value.0 != "DependOnService");
+            key.strings("DependOnService", services);
         }
         keys.push(key);
     }

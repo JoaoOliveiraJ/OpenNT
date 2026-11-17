@@ -163,7 +163,11 @@ fn system_hive_from_file(assert: Assert) {
     for key in seed::system_keys(crate::ntos::init::boot_config::smss_boot()) {
         let path = alloc::format!("\\Registry\\Machine\\System\\{}", key.path);
         for (name, value_type, data) in key.values {
-            complete &= registry::read_value_by_path(&path, &name).is_some_and(|value| value.value_type == value_type && value.data == data);
+            let matches = registry::read_value_by_path(&path, &name).is_some_and(|value| value.value_type == value_type && value.data == data);
+            if !matches {
+                debug_print!("[hive] valor da semente ausente ou diferente: {}\\{}", path, name);
+            }
+            complete &= matches;
         }
     }
     assert(complete, "hive: cada valor das tabelas de semente esta na hive SYSTEM do arquivo");

@@ -128,8 +128,14 @@ fn namespace() -> Result<(), crate::rtl::KernelError> {
         object_manager::create_directory("\\KnownDlls")?;
         object_manager::create_symlink("\\KnownDlls\\KnownDllPath", "C:\\Windows\\System32")?;
     }
-    // Destino NT até o diretório instalado no volume de boot (montado na fase 1).
-    object_manager::create_symlink("\\SystemRoot", &alloc::format!("{}\\Windows", volume_device::device_path(crate::drivers::fs::ntfs::DEVICE_INDEX)))?;
+    // CreateSystemRootLink: \Device\BootDevice aponta para o volume de boot
+    // (no NT, pelo \ArcName do dispositivo de boot; o OpenNT não tem nome
+    // ARC para ele e aponta direto para o volume, montado na fase 1) e o
+    // \SystemRoot é "\Device\BootDevice" + o diretório instalado. Quem
+    // traduz o \SystemRoot componente a componente (o luafv.sys) acha o
+    // volume ao abrir \Device\BootDevice como link.
+    object_manager::create_symlink("\\Device\\BootDevice", &volume_device::device_path(crate::drivers::fs::ntfs::DEVICE_INDEX))?;
+    object_manager::create_symlink("\\SystemRoot", "\\Device\\BootDevice\\Windows")?;
     // CmpInitializeDriverStores: o diretório e o alias do sistema.
     object_manager::create_directory("\\DriverStores")?;
     object_manager::create_symlink("\\DriverStores\\SYSTEM", "\\SystemRoot")?;

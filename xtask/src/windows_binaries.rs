@@ -263,6 +263,17 @@ const NTFS_FILES: &[(&str, &str)] = &[
         "Windows/System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package04~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
         "System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package04~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
     ),
+    // Mais drivers de software sem hardware (`--start-driver`): o
+    // redirecionador UNC (mup) com o cliente DFS (dfsc, que importa o
+    // mup.sys) e o file system UDF (udfs). O catálogo 0516 cobre o mup.sys
+    // e o dfsc.sys, e o Client-Features 0317, o udfs.sys.
+    ("MUP.SYS", "System32/drivers/mup.sys"),
+    ("DFSC.SYS", "System32/drivers/dfsc.sys"),
+    ("UDFS.SYS", "System32/drivers/udfs.sys"),
+    (
+        "Windows/System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Features-Package0317~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
+        "System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Features-Package0317~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
+    ),
     // Abertos pelo vgk.sys pelo caminho SystemRoot.
     ("Windows/System32/ntdll.dll", "System32/ntdll.dll"),
     ("Windows/System32/win32k.sys", "System32/win32k.sys"),

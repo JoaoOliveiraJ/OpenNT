@@ -133,12 +133,14 @@ pub fn system_keys(smss_boot: bool) -> Vec<SeedKey> {
 }
 
 /// A hive SOFTWARE: os CSPs que o advapi32/crypt32 leem, as Image File
-/// Execution Options que o loader da ntdll consulta a cada processo e, no
+/// Execution Options que o loader da ntdll consulta a cada processo, as
+/// pastas de programas que o luafv.sys lê no DriverEntry e, no
 /// boot do processo inicial real, o `IniFileMapping` que o basesrv.dll lê e
 /// a chave SideBySide do sxssrv.dll.
 pub fn software_keys(smss_boot: bool) -> Vec<SeedKey> {
     let mut keys = super::crypto_defaults::seed_keys();
     keys.push(SeedKey::new("Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options"));
+    keys.extend(super::current_version::seed_keys());
     if smss_boot {
         keys.extend(super::ini_file_mapping::seed_keys());
         // O sxssrv.dll do csrss abre Microsoft\Windows\CurrentVersion\SideBySide
