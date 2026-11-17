@@ -12,7 +12,8 @@
 //!   uma vez.
 //! - A cada mensagem posta na fila da porta, o ALPC chama o callback no
 //!   contexto de quem enviou; o PopUmpoMessageCallback chama o
-//!   PopUmpoProcessMessages, que recebe da porta pelo
+//!   PopUmpoProcessMessages (no OpenNT, por um work item no processo
+//!   System, ver `message_callback`), que recebe da porta pelo
 //!   ZwAlpcSendWaitReceivePort com prazo zero até a fila esvaziar
 //!   (STATUS_TIMEOUT) e trata cada mensagem pelo tipo do PORT_MESSAGE: o
 //!   pedido de conexão (LPC_CONNECTION_REQUEST) é aceito pelo
@@ -94,7 +95,13 @@ pub fn initialize() -> Result<(), KernelError> {
     if SERVER_PORT.load(Ordering::Acquire) != 0 {
         return Ok(());
     }
-    let policy = SecurityPolicy { dacl: Some(vec![Ace::allow(sid(5, &[18]), GENERIC_ALL)]), ..SecurityPolicy::default() };
+    let item = guest::alloc_bytes(crate::ntos::io::work_items::work_item_size());
+    if item == 0 {
+        return Err(KernelError::new("canal do umpo: sem memoria para o work item"));
+    }
+    crate::ntos::io::work_items::create_work_item(0, item);
+    WORK_ITEM.store(item, Ordering::Release);
+    let policy =SecurityPolicy { dacl: Some(vec![Ace::allow(sid(5, &[18]), GENERIC_ALL)]), ..SecurityPolicy::default() };
     let descriptor_bytes = crate::ntos::se::object_security::encode(&policy, 4);
     let block = zeroed(0x200 + descriptor_bytes.len() as u64)?;
     let (attributes, port_attributes, handle_cell, information, descriptor) = (block, block + 0x80, block + 0xD0, block + 0xE0, block + 0x100);
@@ -134,10 +141,47 @@ pub fn initialize() -> Result<(), KernelError> {
     Ok(())
 }
 
-/// PopUmpoMessageCallback(CallbackContext, Argument1, Argument2).
+/// PopUmpoMessageCallback(CallbackContext, Argument1, Argument2). O 19041
+/// chama o PopUmpoProcessMessages ali mesmo, no contexto de quem enviou. No
+/// OpenNT o callback agenda o work item do canal: o LPC_PORT_CLOSED chega
+/// de dentro do fechamento da porta do cliente, e fechar ali a porta de
+/// comunicação reentraria nas travas do ALPC. As mensagens são tratadas na
+/// mesma ordem, no processo System.
 extern "win64" fn message_callback(_context: u64, _argument1: u64, _argument2: u64) {
-    crate::debug_print!("[po] \\PowerPort: PopUmpoMessageCallback");
-    process_messages();
+    schedule();
+}
+
+/// O work item do canal e os pedidos acumulados enquanto ele está agendado.
+static WORK_ITEM: AtomicU64 = AtomicU64::new(0);
+static SCHEDULED: AtomicBool = AtomicBool::new(false);
+static REQUESTED: AtomicBool = AtomicBool::new(false);
+
+fn schedule() {
+    let item = WORK_ITEM.load(Ordering::Acquire);
+    if item == 0 {
+        return;
+    }
+    REQUESTED.store(true, Ordering::Release);
+    if SCHEDULED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    crate::ntos::io::work_items::queue_kernel_work_item(item, worker, 0, None);
+}
+
+fn worker(_item: u64, _context: u64) {
+    loop {
+        while REQUESTED.swap(false, Ordering::AcqRel) {
+            let system = crate::ntos::ps::process::get_system_process();
+            if let Err(error) = crate::ntos::ps::process_context::with_process(system, process_messages) {
+                crate::debug_print!("[po] \\PowerPort: {}", error);
+            }
+        }
+        SCHEDULED.store(false, Ordering::Release);
+        // Um pedido chegado entre o fim do laço e a liberação do agendamento.
+        if !REQUESTED.load(Ordering::Acquire) || SCHEDULED.swap(true, Ordering::AcqRel) {
+            return;
+        }
+    }
 }
 
 /// PopUmpoProcessMessages: recebe da porta com prazo zero até a fila
