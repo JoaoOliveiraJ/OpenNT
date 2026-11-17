@@ -47,11 +47,19 @@ expect SspiInitAsyncInterface
 ps
 expect System
 threads
-# Uma thread de kernel bloqueada (a primeira da lista é uma thread de
+# As quatro primeiras threads de sistema depois da do boot são as worker
+# threads do ExpWorkerInitialization, paradas à espera de itens (uma delas
+# no FsRtlWaitForSmssEvent, à espera do smss): a pilha pelo quadro de troca
+# chega à rotina da worker.
+save-word worker Waiting 2
+btt $worker
+expect kernel::ntos::io::work_items::worker_thread
+# Uma thread de kernel bloqueada (a quinta parada da lista é uma thread de
 # sistema do acpi.sys real, criada na árvore de dispositivos, esperando os
 # eventos dela): registradores e pilha pelo quadro de troca da pilha de
 # kernel dela, até o código do driver.
-save-word esperando Waiting 2
+threads
+save-word esperando Waiting 2 5
 context $esperando
 expect quadro de troca
 btt $esperando

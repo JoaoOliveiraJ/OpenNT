@@ -56,7 +56,7 @@
 //! conferências `expect <texto>` (a saída do comando anterior contém o
 //! texto), `expect-stop <texto>` (a última parada), `expect-console
 //! <texto>` (a saída do DbgPrint recebida), `expect-eq <expr> <expr>`,
-//! `save <nome> <expr>` (vira `$nome`), `save-word <nome> <texto> <coluna>`
+//! `save <nome> <expr>` (vira `$nome`), `save-word <nome> <texto> <coluna> [ocorrência]`
 //! (um número da saída anterior), `wait-serial <texto>` (o texto no log da
 //! COM1), `echo <texto>` e `sleep <ms>`.
 
@@ -1029,13 +1029,18 @@ impl Client {
                     println!("[kd-script]   ${name} = {value:#x}");
                 }
                 "save-word" => {
-                    // save-word <nome> <texto da linha> <coluna>: um número da
-                    // primeira linha da saída anterior que contém o texto.
+                    // save-word <nome> <texto da linha> <coluna> [ocorrência]:
+                    // um número da linha da saída anterior que contém o texto
+                    // (a primeira, ou a N-ésima delas).
                     let mut parts = rest.split_whitespace();
                     let (Some(name), Some(needle), Some(column)) = (parts.next(), parts.next(), parts.next().and_then(|text| text.parse::<usize>().ok())) else {
-                        return Err(fail("uso: save-word <nome> <texto> <coluna>".into()));
+                        return Err(fail("uso: save-word <nome> <texto> <coluna> [ocorrencia]".into()));
                     };
-                    let value = last_output.lines().find(|line| line.contains(needle)).and_then(|line| line.split_whitespace().nth(column)).and_then(parse_number).ok_or_else(|| fail(format!("nenhuma linha com {needle:?} e numero na coluna {column}")))?;
+                    let occurrence = match parts.next() {
+                        Some(text) => text.parse::<usize>().ok().filter(|&value| value >= 1).ok_or_else(|| fail("uso: save-word <nome> <texto> <coluna> [ocorrencia]".into()))?,
+                        None => 1,
+                    };
+                    let value = last_output.lines().filter(|line| line.contains(needle)).nth(occurrence - 1).and_then(|line| line.split_whitespace().nth(column)).and_then(parse_number).ok_or_else(|| fail(format!("nenhuma linha {occurrence} com {needle:?} e numero na coluna {column}")))?;
                     self.variables.insert(name.to_string(), value);
                     println!("[kd-script]   ${name} = {value:#x}");
                 }
