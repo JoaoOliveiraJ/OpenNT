@@ -93,15 +93,19 @@ pub struct Message {
 /// (`place`, com o token como Vector) em `translated` (mesma posição) com
 /// vetores da HAL e grava os dados de conexão do PDO. Uma mensagem que o
 /// árbitro de IRQ de um driver atribuiu (o do acpi.sys, que grava ele mesmo
-/// os dados de conexão) fica como o árbitro e o tradutor dele a deixaram.
-/// Devolve as mensagens na ordem da lista (o MSI de n mensagens dá n
-/// entradas).
+/// os dados de conexão) fica como o árbitro e o tradutor dele a deixaram:
+/// o recurso bruto dela também leva um token no Vector (o espaço de IRQ do
+/// árbitro), mas o traduzido já tem o vetor do IDT que o tradutor do driver
+/// deu. Só a mensagem que ninguém traduziu (o Vector traduzido ainda é o
+/// token) recebe vetores da HAL. Devolve as mensagens na ordem da lista (o
+/// MSI de n mensagens dá n entradas).
 pub fn translate(owner: u64, raw: &CmList, translated: &mut CmList) -> Vec<Message> {
     release(owner);
     let mut messages = Vec::new();
     let (processor, apic_id) = hal::target_processor();
     for (index, resource) in raw.resources.iter().enumerate() {
-        if !is_message(resource) || resource.length != MESSAGE_TOKEN {
+        let untranslated = translated.resources.get(index).is_some_and(|system| system.length == MESSAGE_TOKEN);
+        if !is_message(resource) || resource.length != MESSAGE_TOKEN || !untranslated {
             continue;
         }
         let count = resource.extra[2].max(1);

@@ -39,7 +39,8 @@ pub struct InterruptObject {
     pub synchronize_irql: Field<u8>,
     pub floating_save: Field<u8>,
     pub connected: Field<u8>,
-    /// Processador do objeto (lido por `io::interrupt`).
+    /// Processador (índice do NT) que recebe as interrupções do objeto
+    /// (o IoGetAffinityInterrupt de `io::interrupt` o lê).
     pub number: Field<u16>,
     pub share_vector: Field<u8>,
     _pad_4b: Reserved<1>,
@@ -262,6 +263,9 @@ fn connect(
     body.share_vector.set(share_vector as u8);
     body.message_based.set(message.is_some() as u8);
     body.message_id.set(message.unwrap_or(0));
+    // As linhas do 8259 e as mensagens (`hal::message_interrupts`) chegam
+    // ao mesmo processador, o BSP.
+    body.number.set(crate::hal::message_interrupts::target_processor().0 as u16);
 
     // Insere na cabeça da cadeia antes de habilitar a linha do controlador.
     let previous_head = CHAINS.lock().insert(vector, object).unwrap_or(0);
@@ -286,6 +290,11 @@ fn connect(
     // SAFETY: parâmetro de saída do driver.
     unsafe { Field::<u64>::at(output) }.set(object);
     Ok(0)
+}
+
+/// O processador (índice do NT) que recebe as interrupções do objeto.
+pub fn processor(object: u64) -> u32 {
+    interrupt_object(object).number.get() as u32
 }
 
 /// IoDisconnectInterrupt. O lock interno alocado separadamente não é

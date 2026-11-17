@@ -16,15 +16,15 @@
 //!
 //! O MESSAGE_BASED é o do IoConnectInterruptEx do NT: o
 //! IopConnectMessageBasedInterrupt falha quando o dispositivo não recebeu
-//! interrupções por mensagem (o barramento PCI do OpenNT só atribui a linha),
-//! e então, com um FallBackServiceRoutine, a interrupção de linha do PDO é
+//! interrupções por mensagem (o INF não pediu MSI, ou o dispositivo não tem
+//! a capacidade), e então, com um FallBackServiceRoutine, a interrupção de linha do PDO é
 //! conectada com essa rotina (IopConnectLineBasedInterrupt, com o
 //! ConnectionContext como *InterruptObject) e o Version de entrada vira
 //! CONNECT_LINE_BASED, que o driver lê para saber o que recebeu (o
 //! storport.sys pede assim e cai na linha INTx).
 
 use crate::ntos::init::exports::signed_status;
-use crate::ntos::inc::types::{GroupAffinity, InterruptConnectionType, InterruptVectorData, IoConnectInterruptParameters, IoDisconnectInterruptParameters, Kinterrupt, NtStruct};
+use crate::ntos::inc::types::{GroupAffinity, InterruptConnectionType, InterruptVectorData, IoConnectInterruptParameters, IoDisconnectInterruptParameters, NtStruct};
 use crate::ntos::io::device_resources;
 use crate::ntos::ke::interrupt_object;
 use crate::rtl::KernelError;
@@ -171,16 +171,24 @@ pub fn disconnect_interrupt_ex(parameters: u64) -> u32 {
     0
 }
 
-/// IoGetAffinityInterrupt: o processador que recebe a interrupção (o
-/// KINTERRUPT.Number), no grupo 0.
+/// IoGetAffinityInterrupt: como o do ntoskrnl 19041, o grupo do
+/// processador do objeto (o KeGetProcessorNumberFromIndex do Number) e a
+/// afinidade da conexão. O objeto é o de `ke::interrupt_object` (o layout
+/// dele é do OpenNT, não o do KINTERRUPT do NT), e cada conexão entrega no
+/// processador do objeto: a afinidade é só ele.
 pub fn affinity_interrupt(object: u64, affinity: u64) -> u32 {
     if object == 0 || affinity == 0 {
         return 0xC000_000D;
     }
-    // SAFETY: KINTERRUPT conectado e o GROUP_AFFINITY de saída do driver.
-    let (interrupt, output) = unsafe { (Kinterrupt::at(object), GroupAffinity::at(affinity)) };
-    let processor = interrupt.number.get() & 63;
+    let processor = interrupt_object::processor(object);
+    // KeGetProcessorNumberFromIndex: um grupo só (o 0) nesta plataforma.
+    let status = crate::ntos::ke::processor_group::processor_number_from_index(processor as u64, 0);
+    if status != 0 {
+        return status;
+    }
+    // SAFETY: o GROUP_AFFINITY de saída do driver.
+    let output = unsafe { GroupAffinity::at(affinity) };
     crate::ntos::mm::guest_memory::write_bytes(affinity, &[0; GroupAffinity::SIZE as usize]);
-    output.mask.set(1u64 << processor);
+    output.mask.set(1u64 << (processor & 63));
     0
 }

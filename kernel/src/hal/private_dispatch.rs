@@ -561,8 +561,9 @@ fn routine(name: &str, call: &Call) -> Result<u64, KernelError> {
         "HalpAllocateGsivForSecondaryInterrupt" => STATUS_INSUFFICIENT_RESOURCES,
         "HalpMaskInterrupt" => mask_pic_line(call.arg(1) as u32, true),
         "HalpUnmaskInterrupt" => mask_pic_line(call.arg(1) as u32, false),
-        // Sem remapeamento de interrupções (não há IOMMU).
-        "HaliAddInterruptRemapping" => STATUS_SUCCESS,
+        // Sem IOMMU: o HalpInterruptRemap só compõe o endereço e o dado das
+        // mensagens (HalpPopulateMsiMessages).
+        "HaliAddInterruptRemapping" => crate::hal::message_interrupts::add_interrupt_remapping(call.arg(5), call.arg(6) as u32) as u32 as u64,
         "HaliRemoveInterruptRemapping" => 0,
         "HalpInterruptGetIdentifiers" => {
             let apic_ids = crate::ntos::ke::smp::discovered_apic_ids();

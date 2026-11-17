@@ -8,8 +8,9 @@
 //! no Windows: o stornvme.inf dá o serviço stornvme a todo PCI\CC_010802
 //! (classe SCSIAdapter). O stornvme.sys importa o storport.sys, que é o
 //! driver de porta: o AddDevice e o START do controlador vão a ele, que
-//! chama o HwFindAdapter e o HwInitialize do miniport, conecta a interrupção
-//! de linha e enumera as LUNs pelo próprio barramento (INQUIRY e REPORT LUNS
+//! chama o HwFindAdapter e o HwInitialize do miniport, conecta as mensagens
+//! MSI-X que o árbitro de IRQ do acpi.sys deu (a linha INTx sem mensagens) e
+//! enumera as LUNs pelo próprio barramento (INQUIRY e REPORT LUNS
 //! que o stornvme traduz em comandos NVMe). A LUN do namespace recebe o
 //! disk.sys com o classpnp.sys e o filtro partmgr.sys (GenDisk), que lê a
 //! tabela de partições e entrega a partição ao volmgr.sys, que cria o

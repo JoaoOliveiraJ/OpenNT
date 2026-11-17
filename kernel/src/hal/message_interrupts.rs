@@ -13,17 +13,28 @@
 //!   o IRQL de um vetor é a classe de prioridade dele (vetor >> 4, o
 //!   HalConvertDeviceIdtToIrql), e o CR8 do processador segura a entrega
 //!   enquanto o IRQL corrente for igual ou maior;
-//! - o endereço é o do modo de destino físico do xAPIC, o mesmo dos APICs
-//!   que a HAL programa (`interrupt_targets`): 0xFEE00000 com o APIC ID do
-//!   destino nos bits 19:12, sem redirecionamento (RH = 0, DM = 0);
-//! - o dado é o vetor com entrega fixa e disparo por borda (bits 10:8 = 0,
-//!   bit 15 = 0).
+//! - o endereço e o dado são os do HalpApicGenerateMessage do ntoskrnl
+//!   19041 para um destino físico do xAPIC (o tipo 4 do
+//!   HalpInterruptTargets, o modo que a HAL programa, `interrupt_targets`):
+//!   o endereço é 0xFEE00000 com o APIC ID do destino nos bits 19:12, sem
+//!   redirecionamento nem destino lógico (RH = 0, DM = 0); o dado é o
+//!   vetor com entrega de menor prioridade (bits 10:8 = 001, do bit 1 do
+//!   pedido 0x12 que o HalpInterruptGenerateMessage monta), Level = 1
+//!   (bit 14) e disparo por borda (bit 15 = 0). Com um destino físico só, a
+//!   menor prioridade entrega no próprio destino.
 //! As mensagens vão ao processador 0 (o BSP), que despacha os vetores de
 //! dispositivo; o EOI vai ao APIC local (os trampolins mandam o EOI dos
-//! vetores 0x40 em diante a ele).
+//! vetores 0x30 em diante a ele; só 0x20-0x2F são do 8259).
+//!
+//! Quando o árbitro de IRQ do acpi.sys atribui as mensagens (a raiz ACPI),
+//! ele mesmo grava os dados de conexão do PDO (InterruptTypeMessageRequest)
+//! e pede à HAL, pelo HalAddInterruptRemapping da HalPrivateDispatchTable
+//! (o IrtRemapNewMsiAssignments), o endereço e o dado de cada mensagem:
+//! [`add_interrupt_remapping`].
 
 use alloc::vec::Vec;
 
+use crate::ntos::inc::types::{InterruptConnectionType, InterruptVectorData, NtStruct};
 use crate::ntos::ke::processor_topology;
 use crate::rtl::SpinLock;
 
@@ -86,7 +97,68 @@ pub fn message_address(apic_id: u32) -> u64 {
     MESSAGE_ADDRESS_BASE | ((apic_id as u64 & 0xFF) << DESTINATION_SHIFT)
 }
 
-/// Dado da mensagem: o vetor, entrega fixa, borda.
+/// Dado da mensagem: entrega de menor prioridade (bits 10:8 = 001).
+const DATA_LOWEST_PRIORITY: u32 = 1 << 8;
+/// Dado da mensagem: Level = 1 (bit 14).
+const DATA_LEVEL_ASSERT: u32 = 1 << 14;
+
+/// Dado da mensagem: o vetor, menor prioridade, Level = 1, borda.
 pub fn message_data(vector: u32) -> u32 {
-    vector & 0xFF
+    (vector & 0xFF) | DATA_LOWEST_PRIORITY | DATA_LEVEL_ASSERT
+}
+
+const STATUS_SUCCESS: i32 = 0;
+const STATUS_UNSUCCESSFUL: i32 = 0xC000_0001_u32 as i32;
+const STATUS_INVALID_PARAMETER: i32 = 0xC000_000D_u32 as i32;
+
+/// HalpInterruptDestinationToTarget no modo físico: o destino de um
+/// GROUP_AFFINITY é o APIC ID do processador do bit mais alto da máscara
+/// (cada processador da máscara sobrescreve o destino anterior); None se a
+/// máscara não tem processador iniciado.
+fn physical_destination(mask: u64, group: u16) -> Option<u32> {
+    if group != 0 {
+        return None;
+    }
+    let apic_ids = processor_topology::processor_apic_ids();
+    (0..64u32).rev().filter(|&index| mask & (1u64 << index) != 0).find_map(|index| apic_ids.get(index as usize).copied().filter(|&id| id != u32::MAX))
+}
+
+/// HaliAddInterruptRemapping(Bus, Slot, Descriptor, Flags, VectorData,
+/// Count) do ntoskrnl 19041, nesta HAL sem IOMMU nem hipervisor: limpa o
+/// FlagHalInternal do IntRemapInfo de cada entrada e segue o
+/// HalpInterruptRemap pelo tipo da primeira:
+/// - InterruptTypeMessageRequest: o HalpPopulateMsiMessages, que dá a cada
+///   entrada o endereço e o dado do HalpInterruptGenerateMessage (o destino
+///   é o da afinidade da primeira entrada, o vetor é o de cada uma) no
+///   IntRemapInfo.u.Msi;
+/// - InterruptTypeControllerInput: sem tabela de remapeamento, nada a
+///   gravar;
+/// - os demais tipos: STATUS_UNSUCCESSFUL.
+pub fn add_interrupt_remapping(vector_data: u64, count: u32) -> i32 {
+    if count == 0 || vector_data == 0 {
+        return STATUS_SUCCESS;
+    }
+    // SAFETY: o chamador passa `count` INTERRUPT_VECTOR_DATA contíguos.
+    let entry = |index: u32| unsafe { InterruptVectorData::at(vector_data + index as u64 * InterruptVectorData::SIZE) };
+    for index in 0..count {
+        entry(index).int_remap_info.set_flag_hal_internal(0);
+    }
+    let first = entry(0);
+    match first.type_.get() {
+        InterruptConnectionType::INTERRUPT_TYPE_CONTROLLER_INPUT => STATUS_SUCCESS,
+        InterruptConnectionType::INTERRUPT_TYPE_MESSAGE_REQUEST => {
+            let Some(apic_id) = physical_destination(first.target_processors.mask.get(), first.target_processors.group.get()) else { return STATUS_INVALID_PARAMETER };
+            let address = message_address(apic_id);
+            for index in 0..count {
+                let current = entry(index);
+                let msi = &current.int_remap_info.u.msi;
+                msi.message_address_high.set((address >> 32) as u32);
+                msi.message_address_low.set(address as u32);
+                msi.message_data.set(message_data(current.vector.get()) as u16);
+                msi.reserved.set(0);
+            }
+            STATUS_SUCCESS
+        }
+        _ => STATUS_UNSUCCESSFUL,
+    }
 }

@@ -33,17 +33,29 @@ pub fn query_rule_state(rule_id: u64, state: Option<&Field<u32>>) -> u32 {
         return STATUS_INVALID_PARAMETER;
     }
     state.set(STATE_UNKNOWN);
+    match rule_state(&database::guid_at(rule_id)) {
+        Ok(value) => {
+            state.set(value);
+            STATUS_SUCCESS
+        }
+        Err(status) => status,
+    }
+}
+
+/// O corpo do EmClientQueryRuleState com o GUID da regra já lido: o estado
+/// atualizado da regra, ou o status de falha (STATUS_IN_PAGE_ERROR antes do
+/// EmInitSystem, STATUS_NOT_FOUND sem a regra ou a regra-alvo). É também a
+/// consulta dos clientes dentro do kernel (a HAL, pelo DisableMSI).
+pub fn rule_state(guid: &[u8; 16]) -> Result<u32, u32> {
     if !crate::ntos::em::initialized() {
-        return STATUS_IN_PAGE_ERROR;
+        return Err(STATUS_IN_PAGE_ERROR);
     }
     let mut database = database::lock();
-    let guid = database::guid_at(rule_id);
-    let Some((rule, target)) = database.search_rule(&guid).and_then(|rule| database.search_target(rule).map(|target| (rule, target))) else { return STATUS_NOT_FOUND };
+    let Some((rule, target)) = database.search_rule(guid).and_then(|rule| database.search_target(rule).map(|target| (rule, target))) else { return Err(STATUS_NOT_FOUND) };
     database.targets[target].references += 1;
     evaluate::update_rule_state(&mut database, rule);
     database.targets[target].references -= 1;
-    state.set(database.rules[rule].state);
-    STATUS_SUCCESS
+    Ok(database.rules[rule].state)
 }
 
 /// EmClientRuleEvaluate.

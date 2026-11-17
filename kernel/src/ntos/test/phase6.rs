@@ -12778,7 +12778,20 @@ fn io_message_interrupt_exports(assert: Assert) {
     );
     let apic = crate::hal::message_interrupts::target_processor().1;
     let routed = message_interrupts::connection_messages(pdo);
-    assert(routed.len() == 6 && routed.iter().zip(&messages).all(|(routed, expected)| routed == expected && routed.address == 0xFEE0_0000 | (apic as u64) << 12 && routed.data == routed.vector), "io-message-interrupt: dados de conexao pelo HalGetMessageRoutingInfo (endereco do APIC e o vetor no dado)");
+    assert(routed.len() == 6 && routed.iter().zip(&messages).all(|(routed, expected)| routed == expected && routed.address == 0xFEE0_0000 | (apic as u64) << 12 && routed.data == routed.vector | 0x4100), "io-message-interrupt: dados de conexao pelo HalGetMessageRoutingInfo (endereco do APIC; no dado o vetor, menor prioridade e Level como o HalpApicGenerateMessage)");
+    // Uma mensagem que o tradutor de um driver já traduziu (o do acpi.sys:
+    // o bruto com o token, o traduzido com o vetor do IDT dele) fica como
+    // está, sem vetor da HAL nem dados de conexão do PnP.
+    let arbitrated = guest::alloc_bytes(nt::DeviceObject::SIZE);
+    devnode::insert(devnode::DeviceNode::new(arbitrated, 0, 1));
+    let driver_raw = resources::CmList { interface_type: 5, bus_number: 0, resources: alloc::vec![message_interrupts::place(1, flags, token, token, 0)] };
+    let driver_vector = resources::Resource { start: 7, length: 0x70, ..driver_raw.resources[0] };
+    let mut driver_translated = resources::CmList { resources: alloc::vec![driver_vector], ..driver_raw.clone() };
+    let untouched = message_interrupts::translate(arbitrated, &driver_raw, &mut driver_translated);
+    let no_data = crate::ntos::io::device_property::device_property_value(arbitrated, message_interrupts::INTERRUPT_CONNECTION_DATA_PKEY, message_interrupts::INTERRUPT_CONNECTION_DATA_PID).is_none();
+    assert(untouched.is_empty() && driver_translated.resources[0] == driver_vector && no_data, "io-message-interrupt: mensagem traduzida pelo driver fica com o vetor dele, sem vetor da HAL");
+    devnode::remove(arbitrated);
+    guest::free_bytes(arbitrated);
     // A MessageServiceRoutine grava o objeto e o MessageID e conta.
     let routine = super::executable_code::place(&[0x48, 0x89, 0x0A, 0x4C, 0x89, 0x42, 0x08, 0x48, 0xFF, 0x42, 0x10, 0xB0, 0x01, 0xC3]);
     let record = guest::alloc_bytes(0x18);
@@ -12810,6 +12823,18 @@ fn io_message_interrupt_exports(assert: Assert) {
     };
     let described = entries.len() == 6 && entries.iter().zip(&messages).all(|(entry, message)| entry.vector.get() == message.vector && entry.irql.get() == message.irql && entry.message_address.get() as u64 == message.address && entry.message_data.get() == message.data && entry.mode.get() == 1 && entry.polarity.get() == 1 && entry.interrupt_object.get() != 0);
     assert(connected == Some(0) && unified == 0 && described && parameters.version.get() == 3, "io-message-interrupt: IoConnectInterruptEx MESSAGE_BASED monta a IO_INTERRUPT_MESSAGE_INFO");
+    // IoGetAffinityInterrupt de cada objeto de mensagem: o grupo 0 e o
+    // processador que recebe as mensagens (o storport monta por ela o mapa
+    // de processador para mensagem).
+    let affinity = guest::alloc_bytes(nt::GroupAffinity::SIZE);
+    let target = 1u64 << crate::hal::message_interrupts::target_processor().0;
+    let affinities_ok = !entries.is_empty() && entries.iter().all(|entry| {
+        guest::write_bytes(affinity, &[0xAA; nt::GroupAffinity::SIZE as usize]);
+        let status = call_export("IoGetAffinityInterrupt", &[entry.interrupt_object.get(), affinity]);
+        status == Some(0) && at::<nt::GroupAffinity>(affinity).mask.get() == target && at::<nt::GroupAffinity>(affinity).group.get() == 0
+    });
+    guest::free_bytes(affinity);
+    assert(affinities_ok, "io-message-interrupt: IoGetAffinityInterrupt da o processador das mensagens no grupo 0");
     // Um IPI fixo para este processador no vetor da mensagem 1.
     if let Some(second) = entries.get(1) {
         crate::hal::lapic::write(0x300, 0x4_0000 | 0x4000 | second.vector.get());
@@ -13659,18 +13684,22 @@ fn cm_network_defaults(assert: Assert) {
 /// HalTranslateBusAddress: no Isa (1) e no PCIBus (5) o endereço traduzido
 /// é o de barramento, o resultado é TRUE e o AddressSpace não muda (o
 /// HalTranslateBusAddress e o HalpTranslateBusAddress do ntoskrnl 19041).
-/// Os destinos de interrupção da HAL (modo físico, sem MSI), como as rotinas
+/// Os destinos de interrupção da HAL (modo físico), como as rotinas
 /// do ntoskrnl 19041: HalConvertDeviceIdtToIrql (vetor >> 4 limitado a
 /// [3, 12]; 0x100 em diante dá 3), HalGetProcessorIdByNtNumber (o APIC ID;
 /// índice além dos processadores = STATUS_INVALID_PARAMETER),
 /// HalGetInterruptTargetInformation (tipo 0 com o PROCESSOR_NUMBER do APIC
-/// ID, modo físico; tipo 1 recusado; APIC ID ausente = STATUS_NOT_FOUND),
+/// ID, modo físico e a flag de MSI do HalpInterruptIsMsiSupported, também no
+/// tipo 2; tipo 1 recusado; APIC ID ausente = STATUS_NOT_FOUND),
 /// HalGetMessageRoutingInfo (modo físico com os campos do pedido; modo
-/// lógico recusado) e HalGetMemoryCachingRequirements (boot por BIOS sem
+/// lógico recusado), o HalAddInterruptRemapping da HalPrivateDispatchTable
+/// (o endereço e o dado das mensagens no IntRemapInfo) e
+/// HalGetMemoryCachingRequirements (boot por BIOS sem
 /// exigências: STATUS_UNSUCCESSFUL com CacheType 0). KdComPortInUse e
 /// KdHvComPortInUse resolvem para células nulas.
 fn hal_interrupt_targets_exports(assert: Assert) {
-    let irql = |vector: u64| call_export("HalConvertDeviceIdtToIrql", &[vector]).map(|value| value as u8);
+    use crate::hal::amd64::native_call;
+    let irql =|vector: u64| call_export("HalConvertDeviceIdtToIrql", &[vector]).map(|value| value as u8);
     assert(irql(0x21) == Some(3) && irql(0x51) == Some(5) && irql(0xC1) == Some(12) && irql(0xD1) == Some(12) && irql(0x100) == Some(3), "hal-interrupt-targets: HalConvertDeviceIdtToIrql");
     let block = guest::alloc_bytes(0x100);
     let bsp = crate::ntos::ke::processor_topology::processor_apic_ids()[0];
@@ -13681,12 +13710,25 @@ fn hal_interrupt_targets_exports(assert: Assert) {
     let id = guest::read32(block);
     let beyond = status(call_export("HalGetProcessorIdByNtNumber", &[count, block + 8]));
     assert(found == Some(0) && id == bsp && beyond == Some(0xC000_000D), "hal-interrupt-targets: HalGetProcessorIdByNtNumber devolve o APIC ID do BSP e recusa indice alem dos processadores");
+    // A flag de MSI (+8) do HalpInterruptIsMsiSupported: a regra DisableMSI
+    // do Errata Manager responde e não é TRUE, e o CpuVendor da KPRCB é
+    // Intel ou AMD (o QEMU, sem o MSI_NOT_SUPPORTED na FADT).
+    guest::write_bytes(block, &[0xF0, 0x47, 0xC7, 0xCB, 0xD8, 0xF1, 0x8A, 0x4C, 0xAA, 0xA7, 0x0C, 0xAE, 0x4F, 0x4A, 0xE2, 0x46]);
+    let rule = status(call_export("EmClientQueryRuleState", &[block, block + 0x10]));
+    let rule_state = guest::read32(block + 0x10);
+    // SAFETY: a KPRCB embutida na KPCR da CPU corrente.
+    let prcb = unsafe { crate::ntos::inc::types::Kprcb::at(crate::ntos::ke::pcr::current().current_prcb.get()) };
+    let messages = rule == Some(0) && rule_state != 2 && prcb.cpu_id.get() != 0 && matches!(prcb.cpu_vendor.get(), 1 | 2);
+    assert(messages, "hal-interrupt-targets: a regra DisableMSI responde FALSE e o processador do QEMU entrega mensagens");
     guest::write_bytes(block, &[0xAA; 0x18]);
     let target = status(call_export("HalGetInterruptTargetInformation", &[0, bsp as u64, block]));
-    let filled = guest::read32(block) == 0 && guest::read32(block + 4) == 0 && guest::read32(block + 8) == 0 && guest::read32(block + 0xC) == 0 && guest::read32(block + 0x14) == 1;
+    let filled = guest::read32(block) == 0 && guest::read32(block + 4) == 0 && guest::read32(block + 8) == messages as u32 && guest::read32(block + 0xC) == 0 && guest::read32(block + 0x14) == 1;
+    guest::write_bytes(block, &[0xAA; 0x18]);
+    let mode_only = status(call_export("HalGetInterruptTargetInformation", &[2, 0, block]));
+    let mode_filled = guest::read32(block) == 2 && guest::read32(block + 8) == messages as u32 && guest::read32(block + 0x14) == 1;
     let wrong_type = status(call_export("HalGetInterruptTargetInformation", &[1, bsp as u64, block]));
     let absent = status(call_export("HalGetInterruptTargetInformation", &[0, 0xFE, block]));
-    assert(target == Some(0) && filled && wrong_type == Some(0xC000_000D) && absent == Some(0xC000_0225), "hal-interrupt-targets: HalGetInterruptTargetInformation em modo fisico com o PROCESSOR_NUMBER do BSP");
+    assert(target == Some(0) && filled && mode_only == Some(0) && mode_filled && wrong_type == Some(0xC000_000D) && absent == Some(0xC000_0225), "hal-interrupt-targets: HalGetInterruptTargetInformation em modo fisico com o PROCESSOR_NUMBER do BSP e a flag de MSI");
     let (request, output) = (block, block + 0x40);
     guest::write_bytes(block, &[0; 0xC0]);
     guest::write64(request + 0x10, 1);
@@ -13699,6 +13741,31 @@ fn hal_interrupt_targets_exports(assert: Assert) {
     guest::write32(request + 0x20, 2);
     let logical = status(call_export("HalGetMessageRoutingInfo", &[request, output]));
     assert(routed == Some(0) && routed_ok && logical == Some(0xC000_000D), "hal-interrupt-targets: HalGetMessageRoutingInfo em modo fisico e o modo logico recusado");
+    // HalAddInterruptRemapping (HaliAddInterruptRemapping, sem IOMMU): duas
+    // InterruptTypeMessageRequest com o BSP na afinidade recebem no
+    // IntRemapInfo o endereço e o dado do HalpApicGenerateMessage físico
+    // (0xFEE00000 | APIC ID << 12; vetor | 0x100 menor prioridade | 0x4000
+    // Level), sem o FlagHalInternal; um tipo sem remapeamento (5) é recusado.
+    let remap = at::<nt::HalPrivateDispatch>(crate::hal::private_dispatch::table_address()).hal_add_interrupt_remapping.get();
+    let entries = guest::alloc_bytes(2 * nt::InterruptVectorData::SIZE);
+    let entry = |index: u64| at::<nt::InterruptVectorData>(entries + index * nt::InterruptVectorData::SIZE);
+    for (index, vector) in [(0u64, 0x61u32), (1, 0x62)] {
+        entry(index).type_.set(nt::InterruptConnectionType::INTERRUPT_TYPE_MESSAGE_REQUEST);
+        entry(index).vector.set(vector);
+        entry(index).target_processors.mask.set(1);
+        entry(index).int_remap_info.bitfield_0.set(0x4000_0000);
+    }
+    let remapped = native_call::call(remap, &[0, 0x20, 0, 0, entries, 2]) as u32;
+    let message = |index: u64| {
+        let msi = &entry(index).int_remap_info.u.msi;
+        (entry(index).int_remap_info.bitfield_0.get(), msi.message_address_high.get(), msi.message_address_low.get(), msi.message_data.get())
+    };
+    let address = 0xFEE0_0000 | (bsp & 0xFF) << 12;
+    let populated = message(0) == (0, 0, address, 0x4161) && message(1) == (0, 0, address, 0x4162);
+    entry(0).type_.set(nt::InterruptConnectionType(5));
+    let other = native_call::call(remap, &[0, 0x20, 0, 0, entries, 2]) as u32;
+    assert(remap != 0 && remapped == 0 && populated && other == 0xC000_0001, "hal-interrupt-targets: HalAddInterruptRemapping compoe o endereco e o dado das mensagens como o HalpPopulateMsiMessages");
+    guest::free_bytes(entries);
     guest::write32(block, 0xFFFF_FFFF);
     let caching = status(call_export("HalGetMemoryCachingRequirements", &[0x10_0000, 0x1000, block]));
     let no_output = status(call_export("HalGetMemoryCachingRequirements", &[0x10_0000, 0x1000, 0]));

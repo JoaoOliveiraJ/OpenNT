@@ -4,12 +4,17 @@
 //! PROCESSOR_NUMBER (`HalpInterruptProcessorState`) e o destino que ela
 //! programa nos controladores (`HalpInterruptTargets`). O OpenNT programa os
 //! APICs em modo de destino físico (o destino é o APIC ID), sem modo lógico
-//! nem cluster, e não oferece interrupções por mensagem (MSI) às pilhas
-//! PnP. As rotinas seguem as do ntoskrnl 19041 com esse estado:
-//! HalGetProcessorIdByNtNumber, HalGetInterruptTargetInformation,
-//! HalGetMessageRoutingInfo e HalConvertDeviceIdtToIrql.
+//! nem cluster. As rotinas seguem as do ntoskrnl 19041 com esse estado:
+//! HalGetProcessorIdByNtNumber, HalGetInterruptTargetInformation (com a
+//! flag de MSI do HalpInterruptIsMsiSupported, que o árbitro de IRQ do
+//! acpi.sys guarda por processador e exige para as interrupções por
+//! mensagem), HalGetMessageRoutingInfo e HalConvertDeviceIdtToIrql.
 
-use crate::ntos::ke::{processor_group, processor_topology};
+use core::sync::atomic::{AtomicU8, Ordering};
+
+use crate::ntos::inc::types::{Kprcb, NtStruct};
+use crate::ntos::ke::processor_identity::vendor;
+use crate::ntos::ke::{pcr, processor_group, processor_topology};
 use crate::ntos::mm::guest_memory as guest;
 
 const STATUS_INVALID_PARAMETER: i32 = 0xC000_000D_u32 as i32;
@@ -17,6 +22,64 @@ const STATUS_NOT_FOUND: i32 = 0xC000_0225_u32 as i32;
 
 /// Modo de destino da HAL (INTERRUPT_TARGET_INFORMATION.Mode): 1 = físico.
 const TARGET_MODE_PHYSICAL: u32 = 1;
+/// INTERRUPT_TARGET_INFORMATION.Flags: o controlador entrega mensagens (MSI).
+pub const TARGET_FLAG_MSI_SUPPORTED: u32 = 1;
+
+/// A regra DisableMSI do errata.inf ({CBC747F0-F1D8-4C8A-AAA7-0CAE4F4AE246},
+/// o GUID_EM_DISABLE_MSI_RULE): TRUE com o bit MSI_NOT_SUPPORTED do
+/// IAPC_BOOT_ARCH da FADT (o callback AcpiFADTBootArch da HAL).
+const GUID_EM_DISABLE_MSI_RULE: [u8; 16] = [0xF0, 0x47, 0xC7, 0xCB, 0xD8, 0xF1, 0x8A, 0x4C, 0xAA, 0xA7, 0x0C, 0xAE, 0x4F, 0x4A, 0xE2, 0x46];
+/// Estado TRUE de uma regra do Errata Manager.
+const EM_RULE_STATE_TRUE: u32 = 2;
+
+/// HalpInterruptMsiSupportDetermined/HalpInterruptMsiSupported: 0 = ainda
+/// não decidido, 1 = sem MSI, 2 = com MSI.
+static MSI_SUPPORT: AtomicU8 = AtomicU8::new(0);
+
+/// HalpGetCpuInfo(NULL, NULL, NULL, &Vendor): o CpuVendor da KPRCB corrente,
+/// ou nenhum enquanto a KPRCB não tem identidade (CpuID = 0).
+fn current_cpu_vendor() -> Option<(u8, u8, u8)> {
+    // SAFETY: a KPCR da CPU corrente aponta para a KPRCB embutida nela.
+    let prcb = unsafe { Kprcb::at(pcr::current().current_prcb.get()) };
+    if prcb.cpu_id.get() == 0 {
+        return None;
+    }
+    // CpuType (família) e CpuModel (o byte alto do CpuStep).
+    Some((prcb.cpu_vendor.get(), prcb.cpu_type.get() as u8, (prcb.cpu_step.get() >> 8) as u8))
+}
+
+/// O critério de processador do HalpInterruptIsMsiSupported: Intel e AMD
+/// entregam mensagens; Centaur a partir da família 6 modelo 0xA; os demais
+/// (e uma KPRCB sem identidade), não.
+fn processor_delivers_messages(identity: Option<(u8, u8, u8)>) -> bool {
+    match identity {
+        Some((vendor::INTEL | vendor::AMD, _, _)) => true,
+        Some((vendor::CENTAUR, family, model)) => family > 6 || (family == 6 && model >= 0xA),
+        _ => false,
+    }
+}
+
+/// HalpInterruptIsMsiSupported(FALSE) do ntoskrnl 19041: decidido uma vez e
+/// guardado. O controlador precisa gerar mensagens (o GenerateMessage do
+/// HalpInterruptController: o APIC local, o único controlador desta HAL,
+/// gera); a regra DisableMSI do Errata Manager precisa responder e não ser
+/// TRUE (uma consulta que falha também desliga as mensagens); e o
+/// processador precisa ser um dos que entregam mensagens. O
+/// HalpInterruptMsiOverrideFlags que forçaria a resposta vem das opções
+/// MSIPOLICY=FORCEDISABLE e FORCEMSI do carregador e do chipset VIA antigo
+/// do HalpPiix4Detect; nenhum deles existe neste boot, e a resposta fica a
+/// das regras acima.
+pub fn msi_supported() -> bool {
+    match MSI_SUPPORT.load(Ordering::Acquire) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    let rule_allows = matches!(crate::ntos::em::rule::rule_state(&GUID_EM_DISABLE_MSI_RULE), Ok(state) if state != EM_RULE_STATE_TRUE);
+    let supported = rule_allows && processor_delivers_messages(current_cpu_vendor());
+    MSI_SUPPORT.store(if supported { 2 } else { 1 }, Ordering::Release);
+    supported
+}
 
 /// HalpInterruptProcessorCount.
 fn processor_count() -> u32 {
@@ -50,10 +113,14 @@ pub fn get_processor_id_by_nt_number(index: u32, processor_id: u64) -> i32 {
 }
 
 /// HalGetInterruptTargetInformation(Type, ApicId, Information): Type 0
-/// (processador) ou 2 (só o modo); zera a estrutura, grava o tipo e o modo
-/// (físico) e, para o tipo 0, o PROCESSOR_NUMBER (+4) do processador
-/// iniciado com aquele APIC ID; o destino lógico (+0xC) fica 0 no modo
-/// físico. Sem MSI, as flags (+8) ficam 0.
+/// (processador) ou 2 (só o modo); zera a estrutura, grava o tipo, o modo
+/// (físico) e as flags (+8: TARGET_FLAG_MSI_SUPPORTED com o
+/// HalpInterruptIsMsiSupported; o bit 3, do bit 7 do HalpFeatureBits, nunca
+/// vem do HalpProcGetFeatureBits) e, para o tipo 0, o PROCESSOR_NUMBER (+4)
+/// do processador iniciado com aquele APIC ID; o destino lógico (+0xC) fica
+/// 0 no modo físico. O ProcessorAddInstance do acpi.sys guarda a estrutura
+/// no objeto do processador, e o IrqArbpFindSuitableRangeMsi só dá vetores
+/// de mensagem nos processadores com a flag de MSI.
 pub fn target_information(target_type: u32, apic: u32, information: u64) -> i32 {
     if target_type != 0 && target_type != 2 {
         return STATUS_INVALID_PARAMETER;
@@ -62,6 +129,9 @@ pub fn target_information(target_type: u32, apic: u32, information: u64) -> i32 
     guest::write64(information + 4, 0);
     guest::write64(information + 0xC, 0);
     guest::write32(information + 0x14, TARGET_MODE_PHYSICAL);
+    if msi_supported() {
+        guest::write32(information + 8, TARGET_FLAG_MSI_SUPPORTED);
+    }
     if target_type == 2 {
         return 0;
     }

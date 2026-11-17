@@ -242,8 +242,10 @@ irq_context_saved:
     mov byte ptr [r9 + rcx + {kbd_data}], al
     mov dword ptr [r9 + {kbd_head}], edx
 irq_no_key:
-    # EOI: vetores >= 0x40 sao do LAPIC (timer etc.)
-    cmp edi, 0x40
+    # EOI: o 8259 so entrega 0x20-0x2F; os vetores >= 0x30 sao do LAPIC
+    # (o timer, as mensagens MSI e os vetores que o arbitro do acpi.sys da,
+    # a partir de 0x37)
+    cmp edi, 0x30
     jb irq_pic_level
     movabs rax, {lapic_eoi}
     mov dword ptr [rax], 0
