@@ -13,7 +13,8 @@
 //! em memória quando um arquivo não existe (`cm/hive_init.rs`). Por isso
 //! este arquivo e as tabelas que ele reúne (`cm/session_manager.rs`,
 //! `cm/ini_file_mapping.rs`, `cm/crypto_defaults.rs`, `cm/arbiters.rs`,
-//! `cm/time_zone_information.rs`, `cm/service/boot_services.rs`,
+//! `cm/time_zone_information.rs`, `cm/network_setup.rs`,
+//! `cm/service/boot_services.rs`,
 //! `cm/service/inbox_drivers.rs` e `cm/service/file_system_filters.rs`) são
 //! dados puros: não usam nada do kernel e o `xtask` os inclui por `#[path]`
 //! na mesma árvore de módulos (`cm`, `cm::service`).
@@ -31,6 +32,7 @@ use alloc::vec::Vec;
 
 pub const REG_SZ: u32 = 1;
 pub const REG_EXPAND_SZ: u32 = 2;
+pub const REG_BINARY: u32 = 3;
 pub const REG_DWORD: u32 = 4;
 pub const REG_LINK: u32 = 6;
 pub const REG_MULTI_SZ: u32 = 7;
@@ -117,6 +119,7 @@ pub fn system_keys(smss_boot: bool) -> Vec<SeedKey> {
     keys.extend(super::pnp_control::seed_keys());
     keys.extend(super::crash_control::seed_keys());
     keys.extend(super::time_zone_information::seed_keys());
+    keys.extend(super::network_setup::seed_keys());
     if smss_boot {
         keys.extend(super::session_manager::seed_keys());
     }

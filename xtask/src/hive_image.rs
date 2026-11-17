@@ -52,6 +52,8 @@ mod cm {
     pub mod crash_control;
     #[path = "../../../../kernel/src/ntos/cm/time_zone_information.rs"]
     pub mod time_zone_information;
+    #[path = "../../../../kernel/src/ntos/cm/network_setup.rs"]
+    pub mod network_setup;
     pub mod service {
         #[path = "../../../../../kernel/src/ntos/cm/service/boot_services.rs"]
         pub mod boot_services;
