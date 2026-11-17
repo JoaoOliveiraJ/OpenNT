@@ -98,11 +98,17 @@ escopo = "Cache Manager e os drivers reais do Windows para a tela gráfica (win3
 # `comando` é um `cargo xtask test-boot` completo; o `cargo xtask test-all` lê
 # daqui a lista e roda cada um na própria pasta (build/test-all/<id>). Campos
 # opcionais que o test-all lê:
-#   espera_falha = true        falha conhecida: sai à parte e não reprova a
-#                              rodada (tire quando o teste passar)
+#   espera_falha = true        falha conhecida: fica fora da rodada padrão
+#                              (roda com --espera-falha, --all ou --only),
+#                              sai à parte e não reprova a rodada (tire
+#                              quando o teste passar)
 #   coberto_pela_suite = true  os marcadores já são conferidos pelas suítes
 #                              completas do test-all (suite-smp4, suite-smp1);
-#                              só roda à parte com --only
+#                              só roda à parte com --only ou --all
+#   acelerador = "tcg"         roda sempre neste acelerador; sem a chave, o
+#                              teste roda no padrão da rodada (o WHPX quando
+#                              a máquina o tem, senão o TCG). O `comando` não
+#                              leva --accel
 
 [[teste]]
 id = "entrada"

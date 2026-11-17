@@ -268,7 +268,14 @@ pertence só aos processos:
 a ImageBase do PE é `KERNEL_VIRTUAL_BASE` = 0xFFFFF800_40000000 (cabeçalhos
 na primeira página, `.text` em +0x1000), e é essa base que a lista de módulos
 carregados, o KDDEBUGGER_DATA64 e o `RtlPcToFileHeader` veem. O stage2 lê o
-arquivo do disco para os frames a partir de 1 MB (offsets do arquivo == RVAs),
+arquivo do disco para os frames a partir de 1 MB (offsets do arquivo == RVAs)
+por DMA de barramento: acha no barramento PCI 0 o controlador IDE com o canal
+primário em 0x1F0 e bus master (classe 01.01, BAR4), liga o bus master no
+comando PCI e lê até 256 setores por READ DMA, com uma tabela PRD de duas
+entradas de 64 KB. Sem esse controlador, ou com erro num comando, o resto
+sai por ATA PIO, um setor por comando. Cada porta de I/O é uma saída da
+máquina virtual no WHPX e uma chamada ao emulador no TCG: os 16 MB do kernel
+por PIO levavam 10 s no TCG e 22 s no WHPX. O stage2 então
 confere o cabeçalho (ImageBase, SizeOfImage, entrada) e mapeia exatamente
 SizeOfImage páginas de 4 KB de supervisor, RW e executáveis na ImageBase, com
 tabelas fixas em 0x83000-0x8DFFF (PDPT, PD e nove PTs). A pilha de boot é
@@ -276,7 +283,8 @@ outra VA de sistema na mesma PD: 383 páginas RW e NX terminando em
 `BOOT_STACK_TOP`, sobre os frames logo abaixo de 20 MB (a imagem pode ir até
 17,5 MB, nos frames de 1 MB a 18,5 MB), com uma página de
 guarda sem mapeamento embaixo (PT em 0x8E000). O stage2 carrega o GDTR pela VA
-do mapa direto e entra no kernel com RSP = BOOT_STACK_TOP - 8.
+do mapa direto e entra no kernel com RSP = BOOT_STACK_TOP - 8 e RBP zero (o
+fim da cadeia de quadros).
 
 *Seções de código.* A imagem tem duas: `.text` e, logo depois, `PAGE`, como
 no ntoskrnl. As duas levam CNT_CODE, MEM_EXECUTE, MEM_READ e MEM_NOT_PAGED
@@ -486,7 +494,15 @@ por tempo ficavam 18 vezes mais longos.
 TSC como contador (`ke/clock.rs`): KeQueryPerformanceCounter = alto(TSC ×
 TscScale) + QpcBias, TscScale = 10^7 × 2^64 / frequência, 10 MHz, e o
 QpcBias zera o contador no boot, então o QPC é o tempo de interrupção em
-100 ns. A página de referência (TscSequence 'HalT', TscScale, TscOffset 0,
+100 ns. O TSC é lido na ordem das instruções anteriores
+(`cpu::rdtsc_ordered`): RDTSCP quando a CPU tem, como o
+HalpTscQueryCounterOrdered, senão LFENCE (Intel) ou MFENCE (AMD) antes do
+RDTSC, como o HalpTscQueryCounter com o HalpTscFenceRequired; o modo de
+usuário recebe o mesmo modo nos bits de leitura do QpcBypassEnabled. Um
+RDTSC sem ordem executa antes de uma leitura de memória anterior numa CPU
+fora de ordem: um QPC que outra CPU publicou ficava maior que o lido
+depois dele (o autoteste de monotonicidade entre o BSP e um AP falhava no
+WHPX, onde o código roda no processador real; o TCG executa em ordem). A página de referência (TscSequence 'HalT', TscScale, TscOffset 0,
 `mm/shared_user_data.rs`) é mapeada somente leitura em todo espaço de
 endereçamento numa VA sorteada logo acima da KUSER_SHARED_DATA
 ((0x7FFE0 + n) << 12), que a classe 197 do NtQuerySystemInformation devolve;
@@ -1344,7 +1360,10 @@ A árvore de dispositivos do NT mora em `ntos/io/pnp/`:
   para o barramento legado do tipo de interface da lista
   (IopFindLegacyBusDeviceNode) ainda não existe.
 - `root.rs`: o barramento raiz; o barramento PCI interno
-  (`drivers/bus/pci.rs`, PCI_HAL\PNP0A03\0) é filho dele. Um
+  (`drivers/bus/pci.rs`, PCI_HAL\PNP0A03\0) é filho dele. Ele mede cada
+  BAR com a decodificação de I/O e de memória e o bus master desligados no
+  comando, como o PciPreScanDisconnectDevice do pci.sys: com 1s, o BAR
+  responderia no topo dos 4 GB, por cima da ROM do BIOS. Um
   IoReportDetectedDevice com a árvore montada vira um devnode
   `ROOT\<serviço>\NNNN` já iniciado.
 - `device_api.rs`: o driver embutido `\Driver\DeviceApi` que o
@@ -3642,7 +3661,10 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   pasta da execução recebe a cópia do `os.img` com as opções de carga dela,
   a saída em `test-boot.log` e a serial em `serial.log`, e o volume NTFS da
   pasta de imagens entra com `snapshot=on` (as escritas do convidado ficam
-  num arquivo temporário do QEMU), então as pistas o dividem e cada execução
+  num arquivo `vl.XXXXXX` na pasta temporária do QEMU, que o xtask aponta,
+  por TMP/TEMP/TMPDIR, para `qemu-tmp` dentro da pasta da execução e apaga
+  quando o QEMU termina, também quando o test-all mata um test-boot pelo
+  prazo: o QEMU morto não apaga o arquivo), então as pistas o dividem e cada execução
   começa dele intacto, como o `test-boot` sempre faz (o reinício do
   convidado com `--allow-reboot` fica no mesmo QEMU e no mesmo snapshot; o
   `--power-cycles`, que sobe outro QEMU depois do desligamento ACPI, usa uma
@@ -3662,7 +3684,34 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   resultado, build, tempo, log) e, por falha, o motivo dado pelo test-boot, o
   trecho da serial a partir do primeiro marcador de falha (ou as últimas
   linhas, num prazo esgotado) e o comando que repete o QEMU na mesma imagem
-  (`--no-build --image-dir=build/test-all/imagem-<n>`).
+  (`--no-build --image-dir=build/test-all/imagem-<n> --accel=<acelerador>`).
+  O `test-boot.log` de cada execução diz quando cada saída esperada chegou,
+  contado da subida do QEMU (`[xtask] "PHASE4_SELFTEST_OK" aos 12.3 s`).
+- **Acelerador**: o `test-boot` usa `--accel=auto` por padrão: o WHPX (a
+  virtualização do processador pelo Windows Hypervisor Platform) quando o
+  QEMU o lista no `-accel help` e a partição sobe nesta máquina, senão o
+  TCG. A sondagem (`qemu::detect_accelerator`) sobe o QEMU com o WHPX e um
+  dispositivo inexistente: o QEMU cria a partição antes dos dispositivos,
+  então o erro do dispositivo prova que o WHPX iniciou (uns 100 ms). O
+  test-all sonda uma vez e passa o `--accel` a cada execução; `--accel=tcg`
+  troca o padrão da rodada, e `acelerador = "tcg"` num `[[teste]]` fixa o
+  dele (o `comando` não leva `--accel`). O `run` e o `debug` ficam no TCG,
+  que o rastro de instruções do depurador gráfico exige. No WHPX o QEMU
+  recebe `-cpu host`, `ignore-unknown-msr=off` (um MSR que o hipervisor não
+  conhece dá #GP, como no hardware) e `kernel-irqchip=off`: o LAPIC fica no
+  QEMU, como o IOAPIC e o 8259 (`qemu::whpx_machine`). O OpenNT recebe as
+  interrupções de dispositivo pelo 8259, e com o LAPIC no hipervisor
+  (`kernel-irqchip=on`, o modo x2APIC do WHPX) o QEMU só entrega uma
+  interrupção do 8259 numa saída posterior da CPU virtual. Medido com ele:
+  o `win32k` levou 66 s até o `WIN32K_LOADED` (19 s com o LAPIC no QEMU, 33 s
+  só na criação do arquivo de paginação, E/S de disco). O que o LAPIC no
+  hipervisor ganharia são os IPIs: o `suite-smp4` chega ao `KBDTEST_OK` em
+  40 s com ele, 59 s sem ele e 62 s no TCG.
+  Uma saída para o QEMU no WHPX custa bem mais que uma chamada ao emulador no
+  TCG: um byte na COM1 por OUT custava 21 µs (28 µs com o LAPIC no
+  hipervisor) contra 3,3 µs no TCG; por isso a serial manda cada lote da
+  FIFO num `rep outsb` (7,8 µs por byte; o resto é a escrita de cada byte
+  no chardev do QEMU) e o stage2 lê o kernel por DMA.
 - **Opções de carga**: como o LoadOptions que o winload monta das opções do
   BCD, o kernel recebe as opções de boot num texto (`DEBUG DEBUGPORT=COM2
   KERNELTESTSCOPE=all STARTDRIVER=NDIS,AFD ...`, `init/load_options.rs`)
@@ -3679,9 +3728,12 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   sempre no bundle, mas só os boots com autoteste a enxergam
   (`hal/bundle.rs`); `OPENNT_TRACE_SYSCALLS`, um diagnóstico sem opção no
   xtask, continua lido no build.
-  `espera_falha = true` no `[[teste]]` conta a falha à parte, sem reprovar a
-  rodada (e avisa quando o teste passa); `coberto_pela_suite = true` tira do
-  padrão um teste cujos marcadores as suítes conferem (roda com `--only`).
+  `espera_falha = true` no `[[teste]]` tira o teste da rodada padrão (o
+  prazo inteiro dele, gasto em toda validação, não prova nada novo): ele
+  roda com `--espera-falha`, `--all` ou `--only`, conta a falha à parte, sem
+  reprovar a rodada, e avisa quando passa; `coberto_pela_suite = true` tira
+  do padrão um teste cujos marcadores as suítes conferem (roda com `--only`
+  ou `--all`).
   `--cpu-friendly` baixa a prioridade do test-all para BELOW_NORMAL e tira as
   4 CPUs lógicas de número mais baixo da afinidade dele (kernel32, sem
   crate); o cargo, o rustc e o QEMU herdam as duas.
@@ -3871,7 +3923,11 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     (expressões com valor e tipo; um valor tipado abre a struct campo a
     campo, e campos de struct e ponteiros abrem de novo); Variáveis locais
     (parâmetros e variáveis do quadro de cima pelo DWARF do `kernel.elf`:
-    frame base, registradores e listas de posições, pelo `gimli`); Memória
+    frame base, registradores e listas de posições, pelo `gimli`; o
+    `cargo xtask debug`, que o depurador roda, compila o perfil `depuracao`,
+    com o DWARF completo; os builds comuns levam só as tabelas de linha, que
+    bastam para o arquivo:linha e os nomes de função, mas não para as
+    variáveis); Memória
     (bytes, words, dwords, qwords, ASCII, UTF-16; procura de bytes, texto ou
     UTF-16; clique duplo num qword segue o ponteiro); Pilha de chamadas (RSP
     de cada quadro e o método do desenrolar); Breakpoints (condição,
