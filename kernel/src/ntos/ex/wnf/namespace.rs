@@ -536,6 +536,12 @@ pub fn resolve_user_scope(process: u64, scope: u32, explicit_identity: u64) -> O
     resolve_scope(process, scope, explicit_identity, process::get_current_thread(), true)
 }
 
+/// O ExpWnfResolveScopeInstance do NtCreateWnfStateName de modo usuário:
+/// o processo corrente, sem thread nem escopo explícito, no silo corrente.
+pub fn resolve_creator_scope(process: u64, scope: u32) -> Outcome<u64> {
+    resolve_scope(process, scope, 0, 0, true)
+}
+
 /// Cópia do descritor no cache compartilhado por nomes distintos; o
 /// contador nativo impede liberar um descritor em uso.
 fn retain_descriptor(source: u64) -> Result<u64, KernelError> {

@@ -4215,6 +4215,58 @@ fn user_wnf(assert: Assert) {
     guest::write32(length, 8);
     let bad_stamp = call("NtQueryWnfStateData", name, guid, 0, 0x10);
     assert(updated == Some(0) && queried == Some(0) && read == (1, 4, 0xFEED_BEEF) && untyped == Some(0xC000_000D) && short == Some(0xC000_0023) && short_length == 4 && bad_stamp == Some(0xC000_0005), "userwnf: NtQueryWnfStateData pela captura de usuario");
+    // NtUpdateWnfStateData pela captura de usuário: o descritor do
+    // WNF_FEATURE_CONFIGURATION_CHANGED só dá leitura (GENERIC_READ) ao
+    // SYSTEM, então a escrita de modo usuário é recusada antes do TypeId e
+    // sem mudar o dado; a faixa do buffer é conferida antes de tudo.
+    guest::write32(data, 0x0BAD_F00D);
+    stack(&[0, 0, 0]);
+    let denied = call("NtUpdateWnfStateData", name, data, 4, guid);
+    let untyped_denied = call("NtUpdateWnfStateData", name, data, 4, 0);
+    let kernel_buffer = call("NtUpdateWnfStateData", name, 0xFFFF_8000_0000_0000, 4, guid);
+    guest::write32(length, 8);
+    stack(&[output, length]);
+    let requery = call("NtQueryWnfStateData", name, guid, 0, stamp);
+    let reread = (guest::read32(stamp), guest::read32(output));
+    assert(
+        denied == Some(0xC000_0022) && untyped_denied == Some(0xC000_0022) && kernel_buffer == Some(0xC000_0005) && requery == Some(0) && reread == (1, 0xFEED_BEEF),
+        "userwnf: NtUpdateWnfStateData recusa a escrita sem acesso pelo descritor e confere a faixa do buffer",
+    );
+    // NtCreateWnfStateName de modo usuário: um nome temporário de escopo de
+    // sistema com o descritor (Everyone com GENERIC_ALL) copiado do usuário.
+    let (created_name, descriptor) = (block + 0x100, block + 0x140);
+    let everyone_all: [u8; 48] = [
+        1, 0, 0x04, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 20, 0, 0, 0, // SECURITY_DESCRIPTOR_RELATIVE com DACL em 20
+        2, 0, 28, 0, 1, 0, 0, 0, // ACL: revisão 2, 28 bytes, uma ACE
+        0, 0, 20, 0, 0, 0, 0, 0x10, // ACCESS_ALLOWED_ACE de 20 bytes, GENERIC_ALL
+        1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, // S-1-1-0
+    ];
+    guest::write_bytes(descriptor, &everyone_all);
+    guest::write64(created_name, 0);
+    stack(&[0, 0x40, descriptor]);
+    let created = call("NtCreateWnfStateName", created_name, 3, 0, 0);
+    let new_name = guest::read64(created_name);
+    guest::write32(data, 0x1357_9BDF);
+    stack(&[0, 0, 0]);
+    let first_write = call("NtUpdateWnfStateData", created_name, data, 4, 0);
+    guest::write32(length, 8);
+    stack(&[output, length]);
+    let first_read = call("NtQueryWnfStateData", created_name, 0, 0, stamp);
+    let first_value = (guest::read32(stamp), guest::read32(output));
+    // O carimbo conferido (CheckStamp com o MatchingChangeStamp errado).
+    stack(&[0, 5, 1]);
+    let stale = call("NtUpdateWnfStateData", created_name, data, 4, 0);
+    stack(&[0, 0x40, 0]);
+    let null_descriptor = call("NtCreateWnfStateName", created_name, 3, 0, 0);
+    stack(&[0, 0x40, descriptor]);
+    let bad_lifetime = call("NtCreateWnfStateName", created_name, 0, 0, 0);
+    let bad_output = call("NtCreateWnfStateName", 0x10, 3, 0, 0);
+    stack(&[0, 0x2000, descriptor]);
+    let too_large = call("NtCreateWnfStateName", created_name, 3, 0, 0);
+    assert(
+        created == Some(0) && new_name != 0 && (new_name ^ 0x41C6_4E6D_A3BC_0074) & 0xF == 1 && first_write == Some(0) && first_read == Some(0) && first_value == (1, 0x1357_9BDF) && stale == Some(0xC000_0001) && null_descriptor == Some(0xC000_0005) && bad_lifetime == Some(0xC000_000D) && bad_output == Some(0xC000_0005) && too_large == Some(0xC000_000D),
+        "userwnf: NtCreateWnfStateName de modo usuario e a escrita do nome temporario novo",
+    );
     // Inscrição e evento pertencem a um processo de usuário: um assinante do
     // System seria despachado como inscrição de kernel (callback em +0x50).
     let ran = with_test_process("wnf.exe", None, |_| {

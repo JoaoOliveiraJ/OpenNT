@@ -22,7 +22,37 @@ fn nt_subscribe_wnf_state_change(state_name: u64, change_stamp: u64, event_mask:
     wnf_service::subscribe_user(state_name, change_stamp as u32, event_mask as u32, identifier)
 }
 
+/// NtUpdateWnfStateData(StateName, Buffer, Length, TypeId, ExplicitScope,
+/// MatchingChangeStamp, CheckStamp): os três últimos na pilha.
+fn nt_update_wnf_state_data(state_name: u64, buffer: u64, length: u64, type_identifier: u64, rsp: u64) -> Result<u32, KernelError> {
+    if !state::probe_syscall_stack(rsp, 24) {
+        return Ok(0xC000_0005);
+    }
+    let check_stamp = state::stack_arg32(rsp, 7) != 0;
+    wnf_service::update_user(state_name, buffer, length as u32, type_identifier, state::stack_arg(rsp, 5), state::stack_arg32(rsp, 6), check_stamp)
+}
+
+/// NtCreateWnfStateName(StateName, NameLifetime, DataScope, PersistData,
+/// TypeId, MaximumStateSize, SecurityDescriptor): os três últimos na pilha.
+fn nt_create_wnf_state_name(output: u64, lifetime: u64, scope: u64, persist: u64, rsp: u64) -> Result<u32, KernelError> {
+    if !state::probe_syscall_stack(rsp, 24) {
+        return Ok(0xC000_0005);
+    }
+    let request = wnf_service::CreateName {
+        output,
+        lifetime: lifetime as u32,
+        scope: scope as u32,
+        persist: persist as u8 != 0,
+        type_identifier: state::stack_arg(rsp, 5),
+        maximum_size: state::stack_arg32(rsp, 6),
+        security_descriptor: state::stack_arg(rsp, 7),
+    };
+    wnf_service::create_state_name_user(&request)
+}
+
 pub fn init() {
+    state::register_handler("NtUpdateWnfStateData", nt_update_wnf_state_data);
+    state::register_handler("NtCreateWnfStateName", nt_create_wnf_state_name);
     state::register_handler("NtQueryWnfStateData", nt_query_wnf_state_data);
     state::register_handler("NtSetWnfProcessNotificationEvent", nt_set_wnf_process_notification_event);
     state::register_handler("NtSubscribeWnfStateChange", nt_subscribe_wnf_state_change);

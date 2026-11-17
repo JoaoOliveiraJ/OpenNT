@@ -42,23 +42,66 @@ pub fn exists() -> bool {
     *SERVICE.lock()
 }
 
+/// Quem atualiza: o Zw (KernelMode, o buffer de kernel e o System) ou o Nt
+/// de modo usuário (o processo corrente, o ExpWnfCheckCallerAccess com
+/// WNF_STATE_DATA de escrita, o buffer de usuário copiado sob sondagem só na
+/// escrita e a entrega inline às inscrições de kernel).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Caller {
+    Kernel,
+    User,
+}
+
+const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+const WNF_STATE_DATA_WRITE: u32 = 2;
+
+/// A cópia de kernel do buffer de usuário (o memcpy do ExpWnfWriteStateData
+/// sob try): `Err(STATUS_ACCESS_VIOLATION)` sem mapeamento.
+fn capture_user_buffer(buffer: u64, length: u32) -> Result<u64, u32> {
+    let Ok(bytes) = crate::ntos::mm::guest_memory::try_read_bytes(buffer, length as usize) else { return Err(STATUS_ACCESS_VIOLATION) };
+    let copy = crate::ntos::mm::guest_memory::alloc_bytes(u64::from(length.max(1)));
+    if copy == 0 {
+        return Err(0xC000_009A);
+    }
+    crate::ntos::mm::guest_memory::write_bytes(copy, &bytes);
+    Ok(copy)
+}
+
+fn user_access(descriptor: u64, desired: u32) -> u32 {
+    crate::ntos::ex::wnf::security::check(descriptor, desired).unwrap_or(0xC000_0022)
+}
+
 #[allow(clippy::too_many_arguments)]
-fn update_captured(name: &DecodedName, buffer: u64, length: u32, type_identifier: u64, captured: &Captured, matching_stamp: u32, check_stamp: bool) -> Result<u32, KernelError> {
+fn update_captured(name: &DecodedName, buffer: u64, length: u32, supplied: SuppliedType, captured: &Captured, matching_stamp: u32, check_stamp: bool, caller: Caller) -> Result<u32, KernelError> {
+    let user = caller == Caller::User;
     if name.scope == 5 {
         if check_stamp {
             return Ok(0xC000_000D);
         }
-        let remote = wnf_physical::push(1, name.decoded_name ^ wnf_name::NAME_MASK, 0xFFFF_FFFF, buffer, length);
+        let source = if user {
+            match capture_user_buffer(buffer, length) {
+                Ok(copy) => copy,
+                Err(status) => return Ok(status),
+            }
+        } else {
+            buffer
+        };
+        let remote = wnf_physical::push(1, name.decoded_name ^ wnf_name::NAME_MASK, 0xFFFF_FFFF, source, length);
+        if user {
+            crate::ntos::mm::guest_memory::free_bytes(source);
+        }
         if remote != 0xC000_0002 {
             return Ok(remote);
         }
     }
-    let system = process::get_system_process();
-    let scope = match namespace::resolve_kernel_scope(system, name.scope, captured.identity)? {
+    let owner = if user { process::get_current_process() } else { process::get_system_process() };
+    let resolved = if user { namespace::resolve_user_scope(owner, name.scope, captured.identity)? } else { namespace::resolve_kernel_scope(owner, name.scope, captured.identity)? };
+    let scope = match resolved {
         Ok(scope) => scope,
         Err(status) => return Ok(status),
     };
-    let supplied = if type_identifier != 0 { SuppliedType::Pointer(type_identifier) } else { SuppliedType::None };
+    let checker = |descriptor: u64, desired: u32| user_access(descriptor, desired);
+    let check: Option<&dyn Fn(u64, u32) -> u32> = if user { Some(&checker) } else { None };
     let mut state = None;
     let result = (|| -> Result<u32, KernelError> {
         let current = match namespace::lookup_name(scope, name.decoded_name)? {
@@ -70,11 +113,11 @@ fn update_captured(name: &DecodedName, buffer: u64, length: u32, type_identifier
                     Ok(definition) => definition,
                     Err(status) => return Ok(status),
                 };
-                let status = wnf_name::validate(&definition.description(), length, supplied, true, None, 2);
+                let status = wnf_name::validate(&definition.description(), length, supplied, !user, check, WNF_STATE_DATA_WRITE);
                 if status & 0x8000_0000 != 0 {
                     return Ok(status);
                 }
-                let created = namespace::create_name(scope, name.decoded_name, NameDefinition::from(&definition), system)?;
+                let created = namespace::create_name(scope, name.decoded_name, NameDefinition::from(&definition), owner)?;
                 definition.release();
                 match created {
                     Ok(created) => created,
@@ -84,7 +127,7 @@ fn update_captured(name: &DecodedName, buffer: u64, length: u32, type_identifier
             Err(status) => return Ok(status),
             Ok(found) => {
                 state = Some(found);
-                let status = wnf_name::validate(&found.description(), length, supplied, true, None, 2);
+                let status = wnf_name::validate(&found.description(), length, supplied, !user, check, WNF_STATE_DATA_WRITE);
                 if status & 0x8000_0000 != 0 {
                     return Ok(status);
                 }
@@ -92,7 +135,19 @@ fn update_captured(name: &DecodedName, buffer: u64, length: u32, type_identifier
             }
         };
         state = Some(current);
-        let status = state_data::write(&current, buffer, length, matching_stamp, check_stamp)?;
+        let source = if user {
+            match capture_user_buffer(buffer, length) {
+                Ok(copy) => copy,
+                Err(status) => return Ok(status),
+            }
+        } else {
+            buffer
+        };
+        let written = state_data::write(&current, source, length, matching_stamp, check_stamp);
+        if user {
+            crate::ntos::mm::guest_memory::free_bytes(source);
+        }
+        let status = written?;
         if status & 0x8000_0000 != 0 {
             return Ok(status);
         }
@@ -103,7 +158,10 @@ fn update_captured(name: &DecodedName, buffer: u64, length: u32, type_identifier
             wnf_physical::push(0, name.decoded_name ^ wnf_name::NAME_MASK, current.change_stamp(), if data != 0 { data + WnfStateData::SIZE } else { 0 }, if data != 0 { state_data_at(data).data_size.get() } else { 0 });
             push_lock::release_shared(current.lock_pointer(), 0)?;
         }
-        notifications::notify_name(current.pointer, 1, true, false)?;
+        // O ExpWnfNotifyNameSubscribers do Nt de modo usuário entrega as
+        // inscrições de kernel inline (o ExpWnfStartKernelDispatcher com o
+        // quarto argumento ligado); o Zw agenda o work item.
+        notifications::notify_name(current.pointer, 1, true, user)?;
         Ok(0)
     })();
     if let Some(state) = state {
@@ -131,7 +189,8 @@ pub fn update(state_name: u64, buffer: u64, length: u32, type_identifier: u64, e
                 Ok(capture) => captured.insert(capture),
                 Err(status) => return Ok(status),
             };
-            update_captured(&name, buffer, length, type_identifier, capture, matching_stamp, check_stamp)
+            let supplied = if type_identifier != 0 { SuppliedType::Pointer(type_identifier) } else { SuppliedType::None };
+            update_captured(&name, buffer, length, supplied, capture, matching_stamp, check_stamp, Caller::Kernel)
         })();
         let left = critical_region::leave_critical();
         if let Some(captured) = captured {
@@ -141,6 +200,78 @@ pub fn update(state_name: u64, buffer: u64, length: u32, type_identifier: u64, e
         left?;
         Ok(result)
     })?
+}
+
+/// NtUpdateWnfStateData de modo usuário (o ExpNtUpdateWnfStateData do 19041
+/// com PreviousMode UserMode): o nome lido do usuário e decodificado (versão
+/// 1, escopo até 5); o buffer conferido só pela faixa (Buffer + Length acima
+/// de MmUserProbeAddress ou com volta = STATUS_ACCESS_VIOLATION, sem tocar
+/// as páginas); o TypeId copiado; o ExplicitScope capturado e, quando dado,
+/// o ExpWnfCheckCrossScopeAccess. Um nome de escopo de processo pede o
+/// ExplicitScope de outro processo (sem ele, ou com o próprio processo,
+/// STATUS_INVALID_PARAMETER). Depois, o fluxo do Zw com o processo corrente,
+/// a checagem de escrita do descritor do nome e a cópia do buffer na escrita.
+#[allow(clippy::too_many_arguments)]
+pub fn update_user(state_name: u64, buffer: u64, length: u32, type_identifier: u64, explicit_scope: u64, matching_stamp: u32, check_stamp: bool) -> Result<u32, KernelError> {
+    use crate::ntos::mm::guest_memory as guest;
+    use crate::ntos::mm::memory_map::USER_PROBE_ADDRESS;
+    use crate::ntos::ps::user_probe;
+    if !ensure_service()? {
+        return Ok(0xC000_009A);
+    }
+    critical_region::enter_critical()?;
+    let mut captured = None;
+    let result = (|| -> Result<u32, KernelError> {
+        if !user_probe::probe_user_read(state_name, 8) {
+            return Ok(STATUS_ACCESS_VIOLATION);
+        }
+        let Ok(encoded) = guest::try_read::<u64>(state_name) else { return Ok(STATUS_ACCESS_VIOLATION) };
+        let name = wnf_name::decode(encoded);
+        if name.status != 0 {
+            return Ok(name.status);
+        }
+        if length != 0 {
+            let end = buffer.wrapping_add(u64::from(length));
+            if end > USER_PROBE_ADDRESS || end < buffer {
+                return Ok(STATUS_ACCESS_VIOLATION);
+            }
+        }
+        let supplied = if type_identifier != 0 {
+            if !user_probe::probe_user_read(type_identifier, 16) {
+                return Ok(STATUS_ACCESS_VIOLATION);
+            }
+            let Ok(copy) = guest::try_read_bytes(type_identifier, 16) else { return Ok(STATUS_ACCESS_VIOLATION) };
+            let mut bytes = [0u8; 16];
+            bytes.copy_from_slice(&copy);
+            SuppliedType::Captured(bytes)
+        } else {
+            SuppliedType::None
+        };
+        let capture = match scope_capture::capture_user(name.scope, explicit_scope)? {
+            Ok(capture) => captured.insert(capture),
+            Err(status) => return Ok(status),
+        };
+        if explicit_scope != 0 {
+            let status = crate::ntos::ex::wnf::security::check_cross_scope(&name, namespace::lookup_definition)?;
+            if status & 0x8000_0000 != 0 {
+                return Ok(status);
+            }
+        }
+        if name.scope == 3 {
+            // A identidade do escopo de processo aponta o EPROCESS capturado.
+            if capture.identity == 0 || guest::read64(capture.identity) == process::get_current_process() {
+                return Ok(0xC000_000D);
+            }
+        }
+        update_captured(&name, buffer, length, supplied, capture, matching_stamp, check_stamp, Caller::User)
+    })();
+    let left = critical_region::leave_critical();
+    if let Some(captured) = captured {
+        captured.release()?;
+    }
+    let result = result?;
+    left?;
+    Ok(result)
 }
 
 /// ZwQueryWnfStateData: a leitura reutiliza o dono do namespace da escrita.
@@ -249,6 +380,8 @@ pub fn unsubscribe_kernel(subscription: u64) -> Result<(), KernelError> {
 const CREATE_STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
 const CREATE_STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
 const CREATE_STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+const CREATE_STATUS_PRIVILEGE_NOT_HELD: u32 = 0xC000_0061;
+const SE_CREATE_PERMANENT_PRIVILEGE: u64 = 16;
 const LIFETIME_PERMANENT: u32 = 1;
 const LIFETIME_TEMPORARY: u32 = 3;
 
@@ -279,16 +412,84 @@ pub fn create_state_name(request: &CreateName) -> Result<u32, KernelError> {
         return Ok(status);
     }
     crate::ntos::ex::wnf::definition::specialize(captured);
-    let result = create_captured(request, captured);
+    let result = create_captured(request, captured, false);
     crate::ntos::mm::guest_memory::free_bytes(captured);
     result
 }
 
-fn create_captured(request: &CreateName, descriptor: u64) -> Result<u32, KernelError> {
+/// NtCreateWnfStateName de modo usuário (o mesmo NtCreateWnfStateName do
+/// 19041 com PreviousMode UserMode): o *StateName sondado para escrita, o
+/// TypeId copiado, o descritor NULL = STATUS_ACCESS_VIOLATION, o
+/// SeCaptureSecurityDescriptor de modo usuário (cópia forçada) e o
+/// especializado; as mesmas validações do Zw; um nome permanente ou
+/// persistente pede o SeCreatePermanentPrivilege do chamador
+/// (STATUS_PRIVILEGE_NOT_HELD); o nome temporário é criado no escopo
+/// resolvido para o processo corrente.
+pub fn create_state_name_user(request: &CreateName) -> Result<u32, KernelError> {
+    use crate::ntos::mm::guest_memory as guest;
+    use crate::ntos::ps::user_probe;
+    if !ensure_service()? {
+        return Ok(0xC000_009A);
+    }
+    critical_region::enter_critical()?;
+    let result = (|| -> Result<u32, KernelError> {
+        if !user_probe::probe_user_write(request.output, 8) {
+            return Ok(CREATE_STATUS_ACCESS_VIOLATION);
+        }
+        let mut type_copy = 0u64;
+        if request.type_identifier != 0 {
+            if !user_probe::probe_user_read(request.type_identifier, 16) {
+                return Ok(CREATE_STATUS_ACCESS_VIOLATION);
+            }
+            let Ok(bytes) = guest::try_read_bytes(request.type_identifier, 16) else { return Ok(CREATE_STATUS_ACCESS_VIOLATION) };
+            type_copy = guest::alloc_bytes(16);
+            if type_copy == 0 {
+                return Ok(0xC000_009A);
+            }
+            guest::write_bytes(type_copy, &bytes);
+        }
+        let outcome = (|| -> Result<u32, KernelError> {
+            if request.security_descriptor == 0 {
+                return Ok(CREATE_STATUS_ACCESS_VIOLATION);
+            }
+            let cell = guest::alloc_bytes(8);
+            if cell == 0 {
+                return Ok(0xC000_009A);
+            }
+            guest::write64(cell, 0);
+            let status = crate::ntos::init::exports::invoke_handler("SeCaptureSecurityDescriptor", &[request.security_descriptor, 1, 1, 1, cell]).map_or(0xC000_0079, |status| status as u32);
+            let captured = guest::read64(cell);
+            guest::free_bytes(cell);
+            if status != 0 {
+                return Ok(status);
+            }
+            crate::ntos::ex::wnf::definition::specialize(captured);
+            let kernel_request = CreateName { type_identifier: type_copy, ..*request };
+            let result = create_captured(&kernel_request, captured, true);
+            guest::free_bytes(captured);
+            result
+        })();
+        if type_copy != 0 {
+            guest::free_bytes(type_copy);
+        }
+        outcome
+    })();
+    let left = critical_region::leave_critical();
+    let result = result?;
+    left?;
+    Ok(result)
+}
+
+fn create_captured(request: &CreateName, descriptor: u64, user: bool) -> Result<u32, KernelError> {
     let (lifetime, scope) = (request.lifetime, request.scope);
     let persist_invalid = request.persist && (scope & !4 != 0 || lifetime != LIFETIME_PERMANENT);
     if !(1..=3).contains(&lifetime) || scope > 5 || persist_invalid || request.maximum_size > 0x1000 || (scope == 3 && lifetime == LIFETIME_TEMPORARY) || scope == 5 {
         return Ok(CREATE_STATUS_INVALID_PARAMETER);
+    }
+    // SeSinglePrivilegeCheck(SeCreatePermanentPrivilege) para os nomes que
+    // não são temporários; em KernelMode sempre concedido.
+    if user && lifetime != LIFETIME_TEMPORARY && !crate::ntos::se::privilege::single_privilege_check(SE_CREATE_PERMANENT_PRIVILEGE, 1) {
+        return Ok(CREATE_STATUS_PRIVILEGE_NOT_HELD);
     }
     let sequence = if lifetime == LIFETIME_PERMANENT {
         match permanent_sequence()? {
@@ -302,18 +503,26 @@ fn create_captured(request: &CreateName, descriptor: u64) -> Result<u32, KernelE
         return Ok(CREATE_STATUS_UNSUCCESSFUL);
     }
     let decoded = 1 | (lifetime as u64 & 3) << 4 | ((scope as u64 & 0xF) << 6 | if request.persist { 0x400 } else { 0 }) & 0x7FE | sequence << 11;
-    // SAFETY: PWNF_STATE_NAME de saída do chamador de modo kernel.
-    unsafe { Field::<u64>::at(request.output) }.set(decoded ^ wnf_name::NAME_MASK);
+    if user {
+        // O *StateName de usuário já sondado; a página pode ter sumido.
+        if crate::ntos::mm::guest_memory::try_write::<u64>(request.output, decoded ^ wnf_name::NAME_MASK).is_err() {
+            return Ok(CREATE_STATUS_ACCESS_VIOLATION);
+        }
+    } else {
+        // SAFETY: PWNF_STATE_NAME de saída do chamador de modo kernel.
+        unsafe { Field::<u64>::at(request.output) }.set(decoded ^ wnf_name::NAME_MASK);
+    }
     let definition = NameDefinition { maximum_size: request.maximum_size, type_identifier: request.type_identifier, security_descriptor: descriptor };
     if lifetime != LIFETIME_TEMPORARY {
         return register_permanent_name(decoded, &definition);
     }
-    let system = process::get_system_process();
-    let scope_instance = match namespace::resolve_kernel_scope(system, scope, 0)? {
+    let owner = if user { process::get_current_process() } else { process::get_system_process() };
+    let resolved = if user { namespace::resolve_creator_scope(owner, scope)? } else { namespace::resolve_kernel_scope(owner, scope, 0)? };
+    let scope_instance = match resolved {
         Ok(instance) => instance,
         Err(status) => return Ok(status),
     };
-    let created = namespace::create_name(scope_instance, decoded, definition, system);
+    let created = namespace::create_name(scope_instance, decoded, definition, owner);
     let status = match created {
         Ok(Ok(state)) => {
             namespace::release_name(&state)?;
