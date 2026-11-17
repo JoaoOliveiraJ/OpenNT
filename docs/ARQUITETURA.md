@@ -1415,9 +1415,15 @@ HwFindAdapter acha o BAR0 nas AccessRanges e lê a configuração pela
 interface do barramento, o storport cria o adaptador de DMA da versão 3 (o
 miniport prefere o DMA v3) e a extensão não cacheada (MmAllocateContiguousNodeMemory),
 o miniport habilita o controlador e faz os Identify pela fila de
-administração (por varredura), e a interrupção vem do IoConnectInterruptEx
-MESSAGE_BASED com recuo para a linha INTx (a GSIV e o vetor que os árbitros
-atribuíram, pelos dados de conexão do PDO). Um relatório de dispositivo
+administração (por varredura), e as interrupções vêm do IoConnectInterruptEx
+MESSAGE_BASED: como o stornvme.inf pede MSISupported, o pci.sys pede
+mensagens MSI-X e o árbitro de IRQ do acpi.sys as atribui (duas com uma
+CPU: a da fila de administração e a da fila de E/S). O storport monta o
+mapa de processador para mensagem pelo IoGetAffinityInterrupt de cada
+objeto de mensagem (o processador do objeto, que recebe as mensagens), e o
+stornvme põe cada pedido de E/S na fila da mensagem que o storport dá ao
+processador corrente; sem mensagens, o recuo é a linha INTx (a GSIV e o
+vetor que os árbitros atribuíram, pelos dados de conexão do PDO). Um relatório de dispositivo
 falho que o storport faz ao WHEA (WheaReportHwErrorDeviceDriverEx com
 severidade fatal) é registrado, sem parar a máquina, como no NT. O teste
 lê o setor 0 pela pilha do disco (`NVME_DISK_OK`). O partmgr.sys entrega a
@@ -1464,13 +1470,11 @@ travas da máquina de estados PnP do KMDF. Os demais boots seguem no
 contexto de boot: as leituras do Code Integrity (`--start-driver`) pelo
 driver ATA interno ainda param numa thread de sistema. A controladora entra nessa
 árvore; a pilha USB só espera a enumeração das portas e confere os marcos.
-Com a raiz ACPI (o padrão) a controladora é enumerada pelo pci.sys real e
-instalada pelo usbxhci.inf, mas o árbitro de IRQ do acpi.sys, que no NT
-arbitra também as mensagens (IrqArbpFindSuitableRangeMsi, com os vetores
-do IDT por processador, e grava ele mesmo os dados de conexão pelo
-IoSetDevicePropertyData), recusa as duas listas do pci.sys: a do MSI-X com
-STATUS_UNSUCCESSFUL e a da linha com STATUS_INVALID_PARAMETER, e o nó fica
-com CM_PROB_NORMAL_CONFLICT; o teste `usb` usa `--pnp-root=internal`.
+Com a raiz ACPI (o padrão, a do teste `usb`) a controladora é enumerada
+pelo pci.sys real e instalada pelo usbxhci.inf, e as mensagens dela são
+arbitradas pelo árbitro de IRQ do acpi.sys, como no NT (veja as
+interrupções por mensagem abaixo); com `--pnp-root=internal` o barramento
+PCI interno pede as mensagens e o PnP manager as atribui.
 O KMDF do usbxhci.sys troca a lista no IRP_MN_FILTER_RESOURCE_REQUIREMENTS
 (libera a recebida e devolve outra em Information), que por isso começa com
 STATUS_SUCCESS, como no IopFilterResourceRequirementsCall. As portas são
@@ -1524,7 +1528,8 @@ como agrupamento e os vetores de buffers comuns).
   contra as linhas: o recurso bruto leva o token e o MessageCount, e a
   tradução pede à HAL um bloco de vetores (`hal/message_interrupts.rs`:
   0x50-0xCF, IRQL = vetor >> 4, destino físico no processador 0, endereço
-  0xFEE00000 | APIC ID << 12 e o vetor no dado) e grava os dados de conexão
+  0xFEE00000 | APIC ID << 12 e o dado do HalpApicGenerateMessage) e grava
+  os dados de conexão
   do PDO (INTERRUPT_CONNECTION_DATA_PKEY) com uma entrada
   InterruptTypeMessageRequest por mensagem, o endereço e o dado no
   IntRemapInfo.u.Msi;
@@ -1537,7 +1542,33 @@ como agrupamento e os vetores de buffers comuns).
   com o MessageID, e a linha pela FallBackServiceRoutine quando não há
   mensagens); o KMDF conecta cada mensagem com FULLY_SPECIFIED pelo vetor
   traduzido. Os vetores de mensagem são de borda e do APIC local (os
-  trampolins mandam o EOI dos vetores 0x40 em diante a ele).
+  trampolins mandam o EOI dos vetores 0x30 em diante a ele; o 8259 só
+  entrega 0x20-0x2F). O IoGetAffinityInterrupt de um objeto (linha ou
+  mensagem) dá o grupo 0 e o processador que recebe as interrupções dele,
+  guardado no objeto de `ke/interrupt_object.rs` (o layout desse objeto é
+  do OpenNT, não o do KINTERRUPT).
+- com a raiz ACPI, o pci.sys real pede as mensagens e o árbitro de IRQ do
+  acpi.sys as arbitra, como no NT: o ProcessorAddInstance guarda por
+  processador a INTERRUPT_TARGET_INFORMATION do
+  HalGetInterruptTargetInformation, e o IrqArbpFindSuitableRangeMsi só dá
+  vetores de mensagem (do conjunto da raiz, pelo ProcessorFindIdtEntries)
+  quando a flag de MSI (+8, bit 0) dela está ligada. A HAL
+  (`hal/interrupt_targets.rs`) liga a flag pelo HalpInterruptIsMsiSupported:
+  o APIC local gera mensagens, a regra DisableMSI do Errata Manager
+  responde e não é TRUE e o processador é Intel, AMD ou um Centaur recente;
+  a decisão fica guardada. O bruto da mensagem leva o token no Vector e o
+  traduzido o vetor e o IRQL que o tradutor do acpi.sys deu; o PnP manager
+  não toca nessas mensagens (só traduz as que ninguém traduziu). O acpi.sys
+  grava os dados de conexão do PDO (InterruptTypeMessageRequest) e pede o
+  endereço e o dado ao HalAddInterruptRemapping da HalPrivateDispatchTable
+  (o IrtRemapNewMsiAssignments): sem IOMMU, o HaliAddInterruptRemapping
+  (`hal/message_interrupts.rs`) faz o HalpPopulateMsiMessages, com o
+  endereço e o dado do HalpApicGenerateMessage físico (0xFEE00000 | APIC
+  ID << 12; vetor | 0x100, entrega de menor prioridade, | 0x4000, Level)
+  no IntRemapInfo.u.Msi; o mesmo dado vale para as mensagens do barramento
+  interno. O pci.sys lê essas entradas (PciGetInterruptConnectionData),
+  pede o endereço e o dado ao HalGetMessageRoutingInfo e programa a tabela
+  MSI-X.
 
 A raiz da árvore (`drivers/bus/acpi_stack.rs`; `--pnp-root=internal` volta
 ao barramento PCI interno) é a de um PC ACPI do Windows:
@@ -1581,7 +1612,8 @@ ao barramento PCI interno) é a de um PC ACPI do Windows:
   conexão) e o KINTERRUPT conectado num vetor atribuído fica na cadeia
   dele, que as linhas desse vetor despacham.
 - **Destinos de interrupção** (`hal/interrupt_targets.rs`): HalGetProcessorIdByNtNumber,
-  HalGetInterruptTargetInformation (modo físico), HalGetMessageRoutingInfo,
+  HalGetInterruptTargetInformation (modo físico, com a flag de MSI do
+  HalpInterruptIsMsiSupported), HalGetMessageRoutingInfo,
   HalConvertDeviceIdtToIrql e HalGetMemoryCachingRequirements, que o acpi.sys
   importa pela hal.dll.
 
