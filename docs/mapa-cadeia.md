@@ -85,23 +85,23 @@ bloqueiam a tela de logon. Os de terceiros desta máquina ficam fora.
 
 | Item | Usado por | Tipo |
 |---|---|---|
-| NtCompareTokens | rpcss.dll, usermgr.dll | simples (a fazer neste branch) |
-| NtSetUuidSeed | RpcEpMap.dll | simples (a fazer neste branch) |
+| NtCompareTokens | rpcss.dll, usermgr.dll | feito |
+| NtSetUuidSeed | RpcEpMap.dll | feito |
 | NtAccessCheckByType | psmsrv.dll | simples sobre o `se/access_check.rs` do PIXEL3 |
 | NtCreateIRTimer, NtSetIRTimer | umpo.dll | simples sobre o ETIMER do PIXEL3 |
 | NtDeleteWnfStateName, NtDeleteWnfStateData, NtQueryWnfStateNameInformation, NtUnsubscribeWnfStateChange | psmsrv, services, RpcEpMap, schedsvc e quase toda DLL de serviço | simples (WNF, com o pixel3-gaps) |
 | NtPowerInformation de modo usuário | services, umpo, psmsrv, schedsvc... | simples (pixel3-gaps) |
-| `SOFTWARE\Microsoft\OLE`, `COM3`, `Rpc`, `Rpc\Extensions` | rpcss, RpcEpMap | simples (a fazer neste branch) |
-| `SOFTWARE\Microsoft\WindowsRuntime\AllowedCOMCLSIDs`, `Windows NT\CurrentVersion\Containers`, `NetworkServiceTriggers` | rpcss, RpcEpMap | simples (a fazer neste branch) |
+| `SOFTWARE\Microsoft\OLE`, `COM3`, `Rpc`, `Rpc\Extensions` | rpcss, RpcEpMap | feito |
+| `SOFTWARE\Microsoft\WindowsRuntime\AllowedCOMCLSIDs`, `Windows NT\CurrentVersion\Containers`, `NetworkServiceTriggers` | rpcss, RpcEpMap | feito |
 | `SYSTEM\CurrentControlSet\Control\Power` (1065 chaves) | umpo.dll | simples, só quando o serviço Power entrar |
 | `Services\SystemEventsBroker\Parameters`, `BackgroundModel\Brokers` | SystemEventsBrokerServer, brokerlib | simples, junto com o serviço |
-| umpo.dll, psmsrv.dll, SystemEventsBrokerServer.dll, brokerlib.dll | Power, BrokerInfrastructure, SystemEventsBroker | simples (a fazer neste branch) |
+| umpo.dll, psmsrv.dll, SystemEventsBrokerServer.dll, brokerlib.dll | Power, BrokerInfrastructure, SystemEventsBroker | feito |
 | chaves de serviço Power, BrokerInfrastructure e SystemEventsBroker | services.exe | simples, mas muda o que o início automático sobe no svchost do LSM: decisão do pixel3-scm |
 
 ### 3.2 Resto do estágio 1 (prioridade A)
 
-- **Syscalls simples:** NtCompareObjects (a fazer neste branch),
-  NtIsSystemResumeAutomatic (a fazer neste branch), NtFilterToken,
+- **Syscalls simples:** NtCompareObjects (feito),
+  NtIsSystemResumeAutomatic (feito), NtFilterToken,
   NtQueryOpenSubKeysEx, NtSetVolumeInformationFile, NtLoadDriver e
   NtUnloadDriver de modo usuário (o export existe), NtSetIoCompletionEx,
   NtAllocateReserveObject (export existe), NtDeleteFile (export existe).
@@ -138,10 +138,10 @@ A 2, B 22; drivers fora do volume: 4.
 | NtOpenSession, NtNotifyChangeSession | lsm.dll | em andamento no pixel3-lsm |
 | NtPowerInformation, NtQueryWnfStateNameInformation | winsrvext.dll | pixel3-gaps |
 | `Control\Terminal Server` e subchaves | lsm.dll, winlogon | em andamento no pixel3-lsm |
-| `SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon` (valores) | lsm.dll, winlogon | simples (a fazer neste branch, sem os valores do usuário desta máquina) |
-| `SYSTEM\Setup` e `Setup\Status` | lsm.dll | simples (a fazer neste branch) |
-| `SOFTWARE\Microsoft\Windows\CurrentVersion\SharedPC` | lsm.dll | simples (a fazer neste branch) |
-| `Control\PriorityControl` | winsrvext.dll | simples (a fazer neste branch) |
+| `SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon` (valores) | lsm.dll, winlogon | simples (feito: `service_chain.rs`, sem os valores do usuário desta máquina) |
+| `SYSTEM\Setup` e `Setup\Status` | lsm.dll | feito |
+| `SOFTWARE\Microsoft\Windows\CurrentVersion\SharedPC` | lsm.dll | feito |
+| `Control\PriorityControl` | winsrvext.dll | feito |
 | `\KernelObjects\SystemErrorPortReady` | winsrvext.dll | médio: evento de notificação do DbgkpInitializePhase1SiloState, com descritor próprio (World, LocalSystem, Local, AllAppPackages e um SID de capacidade) |
 | `\SmSsWinStationApiPort` | lsm.dll, winsrvext.dll | criado pelo smss.exe real; verificar no boot |
 | BasicRender.sys, monitor.sys, cea.sys | dxgkrnl (adaptador de renderização e monitor) | arquivos simples; o dispositivo ROOT\BasicRender e o filho de monitor precisam do PnP: complexo |
@@ -150,6 +150,10 @@ A 2, B 22; drivers fora do volume: 4.
 Os imports de kernel do win32k.sys, win32kbase.sys, win32kfull.sys,
 cdd.dll, dxgkrnl.sys, dxgmms2.sys, BasicDisplay.sys, BasicRender.sys e
 monitor.sys estão todos atendidos (0 sem export).
+
+Quem chama o NtUserRemoteConnect (com o NtUserRemoteRedrawScreen, o
+NtUserRemoteStopScreenUpdates e o NtUserCtxDisplayIOCtl) é o
+winsrvext.dll do csrss, pelo win32u.dll.
 
 As chamadas gráficas de modo usuário (NtUser*, NtGdi*, NtDxgk* e
 NtGdiDdDDI*) vão para o win32k real pela tabela de serviço 1. O
@@ -233,3 +237,18 @@ As hives do OpenNT para a comparação saem de
 `hive_image::machine_hives(true)`. A leitura de algumas chaves desta
 máquina exige administrador (por exemplo `Services\nsi\Parameters`); o
 xtask copia só o que a conta de build consegue ler.
+
+## 9. Itens simples já feitos
+
+- Syscalls de modo usuário com a semântica do 19041 e autoteste
+  (`test/user_service_chain.rs`): NtCompareObjects
+  (`ob/compare_objects.rs`), NtCompareTokens (`se/token/compare.rs`),
+  NtSetUuidSeed (`ex/uuid.rs`) e NtIsSystemResumeAutomatic
+  (`po/system_state.rs`).
+- Chaves copiadas desta máquina (`xtask/src/service_chain.rs`): OLE, COM3,
+  Rpc, WindowsRuntime\AllowedCOMCLSIDs, CurrentVersion\Containers,
+  NetworkServiceTriggers, SharedPC, os valores do Winlogon (sem os do
+  usuário desta máquina), SYSTEM\Setup (só o estado do setup),
+  Setup\Status e Control\PriorityControl.
+- Arquivos no volume: umpo.dll, psmsrv.dll, SystemEventsBrokerServer.dll e
+  brokerlib.dll.

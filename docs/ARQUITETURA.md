@@ -3716,6 +3716,23 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   destruição do corpo ou na remoção do filtro) e a identidade da chave: o
   CM_KEY_BODY leva 'ky02' e, no KeyControlBlock, um bloco de identidade por
   nó (`key/objects.rs`) com o nome em cache do CmCallbackGetKeyObjectID.
+- **Serviços do início automático** (mapa em `docs/mapa-cadeia.md`): os
+  serviços de modo usuário que o rpcss.dll, o RpcEpMap.dll, o schedsvc.dll e
+  o psmsrv.dll pedem e que não tinham provedor. NtCompareObjects (`ob/compare_objects.rs`:
+  os dois corpos pelo ObReferenceObjectByHandle sem tipo e sem acesso,
+  STATUS_NOT_SAME_OBJECT quando diferem); NtCompareTokens
+  (`se/token/compare.rs`: a ordem de comparação do 19041, com o
+  SepCompareSidAndAttributeArrays e os atributos de segurança relevantes;
+  o rótulo de integridade, guardado fora dos grupos no OpenNT, entra como
+  mais um grupo); NtSetUuidSeed (`ex/uuid.rs`: SeAccessCheck em UserMode
+  contra a DACL com o SID de serviço do RpcEptMapper, depois o NodeId e o
+  ExpUuidCacheValid); NtIsSystemResumeAutomatic (`po/system_state.rs`: o
+  PopFullWake, 1 desde o PoInitSystem). O xtask copia desta máquina as
+  chaves que esses serviços e o LSM leem (`xtask/src/service_chain.rs`:
+  OLE, COM3, Rpc, AllowedCOMCLSIDs, NetworkServiceTriggers, os valores do
+  Winlogon sem os do usuário daqui, Setup e PriorityControl) e põe no volume
+  os ServiceDll dos outros serviços do grupo DcomLaunch. O autoteste é o
+  `test/user_service_chain.rs`.
 
 ## 5. Testes
 
@@ -4282,6 +4299,7 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
 | `docs/status/*.svg`, `docs/site/*.html` | gerados por `cargo xtask status`; não editar |
 | `docs/site/capturas/<id>.png` | a tela do QEMU no fim de cada `[[teste]]`, gravada por `cargo xtask capturas` |
 | `kernel/src/ntos/inc/types/nt_types.toml` | estruturas do NT que o `cargo xtask nt-types` gera do PDB do ntoskrnl |
+| `docs/mapa-cadeia.md` | o que falta, por estágio, para a cadeia de modo usuário ir do services.exe à tela de logon, pela análise estática dos binários |
 
 O site tem cinco páginas autocontidas (sem scripts, fontes nem imagens de
 fora): Início, O que roda, Componentes, Exports e Testes. Na página O que roda,
