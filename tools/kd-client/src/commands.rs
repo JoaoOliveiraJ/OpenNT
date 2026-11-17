@@ -917,7 +917,10 @@ impl Client {
                 if rest.is_empty() {
                     return self.monitor(".process");
                 }
-                match self.set_process(Some(rest))? {
+                // O processo pode vir de uma expressão ($nome, @reg), como em
+                // `handles`: um roteiro guarda o PID com `save-word` depois do `ps`.
+                let rest = if rest.starts_with(['$', '@']) { format!("{:#x}", self.evaluate(rest)?) } else { rest.to_string() };
+                match self.set_process(Some(&rest))? {
                     Some(context) => {
                         let modules = self.symbols.user_modules().count();
                         Ok(format!("processo {} (PID {}) EPROCESS {:#x} CR3 {:#x} PEB {:#x}; {modules} modulos de usuario", context.name, context.pid, context.eprocess, context.cr3, context.peb))
