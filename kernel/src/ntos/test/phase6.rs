@@ -1781,6 +1781,18 @@ fn ntoskrnl_thread_information(assert: Assert) {
     guest::write32(buffer, 0);
     assert(call_export("NtSetInformationThread", &[current_handle, 24, buffer, 4]) == Some(0xC000_000D) && call_export("ZwSetInformationThread", &[current_handle, 0, buffer, 4]) == Some(0xC000_0003), "threadinfo: prioridade invalida e classe rejeitada");
     ethread.set_thread_page_priority((saved >> 12) & 7);
+    // ThreadIoPriority (22): os bits 9..11 do CrossThreadFlags, 4 ou 8 bytes
+    // na mudança, IoPriorityCritical recusado, como o sechost a usa em volta
+    // de cada ServiceMain (0 = VeryLow, 2 = Normal).
+    guest::write32(buffer, 0);
+    let lowered = call_export("ZwSetInformationThread", &[current_handle, 22, buffer, 4]) == Some(0) && (ethread.cross_thread_flags.get() >> 9) & 7 == 0;
+    let read_back = call_export("ZwQueryInformationThread", &[current_handle, 22, buffer + 4, 4, buffer + 8]) == Some(0) && guest::read32(buffer + 4) == 0 && guest::read32(buffer + 8) == 4;
+    guest::write64(buffer, 2);
+    let normal = call_export("ZwSetInformationThread", &[current_handle, 22, buffer, 8]) == Some(0) && (ethread.cross_thread_flags.get() >> 9) & 7 == 2 && ethread.cross_thread_flags.get() & !0xE00 == saved & !0xE00;
+    guest::write32(buffer, 4);
+    let refused = call_export("ZwSetInformationThread", &[current_handle, 22, buffer, 4]) == Some(0xC000_000D) && call_export("ZwSetInformationThread", &[current_handle, 22, buffer, 6]) == Some(0xC000_0004) && call_export("ZwQueryInformationThread", &[current_handle, 22, buffer, 8, 0]) == Some(0xC000_0004);
+    ethread.set_thread_io_priority((saved >> 9) & 7);
+    assert(lowered && read_back && normal && refused, "threadinfo: ThreadIoPriority consultada e trocada nos tres bits, critica e tamanhos recusados");
     guest::free_bytes(buffer);
     zw_thread_impersonation_token(assert);
 }

@@ -2244,6 +2244,19 @@ fn user_syscalls_core(assert: Assert) {
     assert(mapped && extended && refused, "usercore: ProcessDeviceMap da o C: no DriveMap com o tipo da unidade, aceita o _EX com Flags e confere Flags, comprimento e alinhamento");
     guest::write64(buffer, u64::MAX);
     assert(call("NtQuerySystemInformation", 192, buffer, 8, info) == 0xC000_0004 && guest::read32(info) == 0x20 && guest::read64(buffer) == u64::MAX && call("NtQuerySystemInformation", 80, buffer, 22 * 8, 0) == 0 && unsafe { nt::extra_test_p7::SystemMemoryListInformation::at(buffer) }.free_page_count.get() == crate::ntos::mm::pfn::free_count() && call("NtQuerySystemInformation", 999, buffer, 8, 0) == 0xC000_0003, "usercore: SystemFlushInformation curto recusado com 0x20, lista de memoria e classe invalida");
+    // SystemCpuQuotaInformation sem DFSS (o psmsrv), o BOOLEAN do estimador
+    // de energia, a SystemMemoryUsageInformation do GlobalMemoryStatusEx, a
+    // topologia de memória e as flags de CET.
+    guest::write32(info, 0xAAAA_AAAA);
+    let dfss = call("NtQuerySystemInformation", 113, buffer, 12, info) == 0xC000_01A9 && guest::read32(info) == 0;
+    guest::write8(buffer + 1, 0x55);
+    let energy = call("NtQuerySystemInformation", 158, buffer + 1, 1, info) == 0 && guest::read8(buffer + 1) == 0 && guest::read32(info) == 1 && call("NtQuerySystemInformation", 158, buffer, 0, info) == 0xC000_0004 && guest::read32(info) == 1;
+    let usage = call("NtQuerySystemInformation", 182, buffer, 0x38, info) == 0 && guest::read32(info) == 0x38 && guest::read64(buffer) == crate::ntos::mm::pfn::total_count() << 12 && guest::read64(buffer + 0x28) >= guest::read64(buffer + 0x18) && call("NtQuerySystemInformation", 182, buffer, 0x30, info) == 0xC000_0004 && guest::read32(info) == 0x38 && call("NtQuerySystemInformation", 182, buffer + 2, 0x38, info) == 0x8000_0002;
+    let runs = crate::ntos::mm::physical_layout::ranges();
+    let topology_size = 0x10 + runs.len() as u32 * 0x20;
+    let memory_topology = call("NtQuerySystemInformation", 138, buffer, 0x10, info) == 0xC000_0023 && guest::read32(info) == topology_size && call("NtQuerySystemInformation", 138, buffer, topology_size as u64, info) == 0 && guest::read64(buffer) == runs.len() as u64 && guest::read64(buffer + 0x18) == runs.first().map_or(0, |run| run.0 >> 12);
+    let shadow_stack = call("NtQuerySystemInformation", 221, buffer, 4, info) == 0 && guest::read32(buffer) == 0 && guest::read32(info) == 4 && call("NtQuerySystemInformation", 221, buffer, 8, info) == 0xC000_0004;
+    assert(dfss && energy && usage && memory_topology && shadow_stack, "usercore: DFSS desligado, estimador de energia, uso de memoria, topologia de memoria e CET");
     guest::write32(rsp + 0x28, 80);
     guest::write64(rsp + 0x30, info);
     guest::write32(string, 4);
@@ -2254,6 +2267,19 @@ fn user_syscalls_core(assert: Assert) {
     // KeQueryLogicalProcessorRelationship, que sem registros devolve
     // STATUS_UNSUCCESSFUL.
     assert(call("NtQuerySystemInformationEx", 107, string, 4, buffer) == 0xC000_0001, "usercore: relacao de topologia desconhecida sem registros");
+    // A configuração de features do armazém vazio (o wil do rpcrt4):
+    // STATUS_NOT_FOUND com o carimbo zero na 210, nenhuma seção nova na 211.
+    guest::write64(string, 0x1234_5678);
+    guest::write32(rsp + 0x28, 0x18);
+    guest::write_bytes(buffer, &[0xAA; 0x50]);
+    let single = call("NtQuerySystemInformationEx", 210, string, 8, buffer) == 0xC000_0225 && guest::read32(info) == 0x18 && guest::read_bytes(buffer, 0x18) == [0u8; 0x18] && call("NtQuerySystemInformationEx", 210, string, 4, buffer) == 0xC000_0004 && guest::read32(info) == 0;
+    guest::write32(rsp + 0x28, 0x10);
+    let short = call("NtQuerySystemInformationEx", 210, string, 8, buffer) == 0xC000_0004 && guest::read32(info) == 0x18 && call("NtQuerySystemInformationEx", 210, 0, 8, buffer) == 0xC000_000D;
+    guest::write32(rsp + 0x28, 0x50);
+    guest::write_bytes(string, &[0; 0x18]);
+    guest::write_bytes(buffer, &[0xAA; 0x50]);
+    let sections = call("NtQuerySystemInformationEx", 211, string, 0x18, buffer) == 0 && guest::read32(info) == 0x50 && guest::read_bytes(buffer, 0x50) == [0u8; 0x50] && call("NtQuerySystemInformationEx", 211, string + 4, 0x18, buffer) == 0x8000_0002;
+    assert(single && short && sections, "usercore: configuracao de features sem armazem (210 NOT_FOUND, 211 sem secao nova)");
     // Erro fatal e informações do processo.
     guest::write64(rsp + 0x30, info);
     guest::write64(string, 0x1234);
@@ -2267,6 +2293,15 @@ fn user_syscalls_core(assert: Assert) {
     // 0x40 dá STATUS_INFO_LENGTH_MISMATCH sem tocar o ReturnLength.
     let expected_flags = crate::ntos::ps::query_process::basic_information(crate::ntos::ps::process::get_current_process()).flags;
     assert(call("NtQueryInformationProcess", u64::MAX, 0, buffer, 0x40) == 0 && { let extended = unsafe { nt::ProcessExtendedBasicInformation::at(buffer) }; extended.size.get() == 0x40 && extended.basic_info.exit_status.get() == 0x103 && extended.flags.get() == expected_flags && expected_flags & 0x106 == 0 } && guest::read32(info) == 0x40 && call("NtQueryInformationProcess", u64::MAX, 0, buffer, 0x20) == 0xC000_0004 && call("NtQueryInformationProcess", u64::MAX, 0, buffer, 0x48) == 0xC000_0004 && guest::read32(info) == 0x40, "usercore: informacao basica estendida e tamanho invalido");
+    // ProcessQuotaLimits e ProcessVmCounters, as duas consultas de processo
+    // do GlobalMemoryStatusEx: os tamanhos aceitos, TimeLimit -1 e as flags
+    // HARDWS desligadas no EX, e o commit privado em bytes.
+    guest::write_bytes(buffer, &[0xAA; 0x70]);
+    let quota = call("NtQueryInformationProcess", u64::MAX, 1, buffer, 0x30) == 0 && guest::read32(info) == 0x30 && guest::read64(buffer + 0x28) == u64::MAX && guest::read64(buffer + 0x20) == u64::MAX && guest::read64(buffer + 0x10) != 0 && guest::read8(buffer + 0x30) == 0xAA;
+    let quota_ex = call("NtQueryInformationProcess", u64::MAX, 1, buffer, 0x58) == 0 && guest::read32(info) == 0x58 && guest::read32(buffer + 0x50) == 0xA && call("NtQueryInformationProcess", u64::MAX, 1, buffer, 0x40) == 0xC000_0004;
+    let vm_counters = call("NtQueryInformationProcess", u64::MAX, 3, buffer, 0x70) == 0 && guest::read32(info) == 0x70 && guest::read64(buffer) >= guest::read64(buffer + 8) && guest::read64(buffer + 0x48) == current.commit_charge.get() << 12 && guest::read64(buffer + 0x58) == guest::read64(buffer + 0x48);
+    let vm_sizes = call("NtQueryInformationProcess", u64::MAX, 3, buffer, 0x58) == 0 && call("NtQueryInformationProcess", u64::MAX, 3, buffer, 0x60) == 0 && call("NtQueryInformationProcess", u64::MAX, 3, buffer, 0x68) == 0xC000_0004 && call("NtQueryInformationProcess", u64::MAX, 3, buffer, 0x50) == 0xC000_0004;
+    assert(quota && quota_ex && vm_counters && vm_sizes, "usercore: ProcessQuotaLimits e ProcessVmCounters nos tamanhos do 19041");
     let cookie = (call("NtQueryInformationProcess", u64::MAX, 36, buffer, 4) == 0).then(|| guest::read32(buffer)).unwrap_or(0);
     assert(cookie != 0 && call("NtQueryInformationProcess", u64::MAX, 36, buffer, 4) == 0 && guest::read32(buffer) == cookie && call("NtQueryInformationProcess", u64::MAX, 31, buffer, 4) == 0 && guest::read32(buffer) == 1, "usercore: cookie estavel e sem depurador");
     assert(call("NtQueryInformationProcess", u64::MAX, 27, buffer, 0x100) == 0 && { let image_name = unsafe { nt::UnicodeString::at(buffer) }; image_name.length.get() > 0 && image_name.buffer.get() == buffer + nt::UnicodeString::SIZE } && call("NtQueryInformationProcess", u64::MAX, 99, buffer, 8) == 0xC000_0003 && call("NtSetInformationProcess", u64::MAX, 99, buffer, 8) == 0xC000_0003, "usercore: nome da imagem e classes invalidas");
@@ -2875,7 +2910,12 @@ fn user_tokens(assert: Assert) {
     let user = query(token, 1, 0x100);
     let sid = unsafe { nt::TokenUser::at(buffer) }.user.sid.get();
     assert(user == 0 && sid >= buffer && sid < buffer + guest::read32(returned) as u64 && unsafe { nt::Sid::at(sid) }.revision.get() == 1, "usertokens: TOKEN_USER com o SID dentro do buffer");
-    assert(query(token, 8, 4) == 0 && guest::read32(buffer) == 1 && query(token, 9, 4) == 0xC000_0003 && query(token, 18, 4) == 0 && guest::read32(buffer) == 1 && query(token, 19, 4) == 0xC000_000D && query(token, 99, 4) == 0xC000_0003, "usertokens: tipo primario, nivel recusado, elevacao e classes invalidas");
+    assert(query(token, 8, 4) == 0 && guest::read32(buffer) == 1 && query(token, 9, 4) == 0xC000_0003 && query(token, 18, 4) == 0 && guest::read32(buffer) == 1 && query(token, 99, 4) == 0xC000_0003, "usertokens: tipo primario, nivel recusado, elevacao e classes invalidas");
+    // TokenLinkedToken: o ReturnLength 8 antes do tamanho; sem sessão irmã,
+    // STATUS_NO_SUCH_LOGON_SESSION.
+    guest::write32(returned, 0);
+    let linked_short = query(token, 19, 4) == 0xC000_0004 && guest::read32(returned) == 8;
+    assert(linked_short && query(token, 19, 8) == 0xC000_005F, "usertokens: TokenLinkedToken sem sessao irma");
     assert(query(token, 7, 16) == 0 && guest::read_bytes(unsafe { nt::TokenSource::at(buffer) }.source_name[0].address(), 8) == b"OpenNTbt" && query(token, 1, 4) == 0xC000_0023 && guest::read32(returned) >= 16, "usertokens: TOKEN_SOURCE e buffer curto com o tamanho devolvido");
     assert(query(token, 2, 0x400) == 0 && unsafe { nt::TokenGroups::at(buffer) }.group_count.get() as u64 * nt::SidAndAttributes::SIZE + core::mem::offset_of!(nt::TokenGroups, groups) as u64 <= guest::read32(returned) as u64 && query(token, 25, 0x100) == 0 && unsafe { nt::SidAndAttributes::at(buffer) }.attributes.get() == 0x60, "usertokens: grupos e rotulo de integridade");
     // Pseudo-handles: -4 consulta o primário; -5 sem impersonação não tem token.
