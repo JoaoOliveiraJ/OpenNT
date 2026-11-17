@@ -6,6 +6,8 @@
 //! cargo run -p kd-re --release -- --connect=127.0.0.1:1234  a um `cargo xtask run --kd=com2`
 //! cargo run -p kd-re --release -- --launch --screenshot-dir=docs/screenshots --scenario=kernel
 //! cargo run -p kd-re --release -- --launch --screenshot-dir=docs/screenshots --scenario=usuario
+//! cargo run -p kd-re --release -- --launch --screenshot-dir=docs/screenshots --scenario=ferramentas
+//! cargo run -p kd-re --release -- --launch --screenshot-dir=docs/screenshots --scenario=voltar
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -15,7 +17,7 @@ use std::time::Duration;
 
 use eframe::egui;
 use kd_re::app::{DebuggerApp, Tab};
-use kd_re::backend::{Backend, Config, Request, SearchKind, SearchScope, Status, Target};
+use kd_re::backend::{Backend, Config, ExtraRequest, Request, SearchKind, SearchScope, Status, Target};
 use kd_re::launcher::LaunchOptions;
 use kd_re::{offscreen, scenario};
 
@@ -27,7 +29,8 @@ const USAGE: &str = "uso: opennt-re [opcoes] [opcoes do xtask]
   --root=DIR             raiz do repositorio (padrao: a deste checkout)
   --script=ARQ           roteiro para rodar depois do attach (a linguagem da aba Script)
   --screenshot-dir=DIR   sem janela: roda o cenario e grava as capturas kd-re-*.png em DIR
-  --scenario=NOME        com --screenshot-dir: kernel (cpu, registradores, breakpoint, observacao, grafo, referencias) ou usuario (usuario, memoria)
+  --scenario=NOME        com --screenshot-dir: kernel (cpu, registradores, breakpoint, observacao, grafo, referencias), usuario (usuario, memoria),
+                         ferramentas (api, irp, tipos, registro; com --start-driver=ntfs) ou voltar (snapshots; com --vm-snapshots)
   --size=LxA             tamanho da captura (padrao 1600x1000)
   outras --opcoes vao para o xtask (--accel=whpx, --smp=1, --initial-process=smss...)";
 
@@ -78,12 +81,20 @@ fn parse(arguments: impl Iterator<Item = String>) -> Result<Options, String> {
     if options.screenshot_dir.is_some() && !options.launch && options.connect.is_none() {
         return Err("--screenshot-dir precisa de --launch ou --connect".into());
     }
-    if !["kernel", "usuario"].contains(&options.scenario.as_str()) {
+    if !["kernel", "usuario", "ferramentas", "voltar"].contains(&options.scenario.as_str()) {
         return Err(format!("--scenario desconhecido: {}\n{USAGE}", options.scenario));
     }
     // O cenário de usuário precisa do csrss.exe real.
     if options.scenario == "usuario" && options.screenshot_dir.is_some() && !options.extra.iter().any(|argument| argument.starts_with("--initial-process")) {
         options.extra.push("--initial-process=smss".into());
+    }
+    // As ferramentas mostram o ntfs.sys real montando o volume.
+    if options.scenario == "ferramentas" && options.screenshot_dir.is_some() && !options.extra.iter().any(|argument| argument.starts_with("--start-driver")) {
+        options.extra.push("--start-driver=ntfs".into());
+    }
+    // Os snapshots precisam dos discos em qcow2.
+    if options.scenario == "voltar" && options.screenshot_dir.is_some() && !options.extra.iter().any(|argument| argument == "--vm-snapshots" || argument.starts_with("--replay=") || argument.starts_with("--record=")) {
+        options.extra.push("--vm-snapshots".into());
     }
     Ok(options)
 }
@@ -163,6 +174,8 @@ fn screenshots(config: Config, target: Option<Target>, options: &Options, direct
     let log = |text: &str| eprintln!("[opennt-re] {text}");
     scenario::wait(&backend, "a primeira parada (attach)", Duration::from_secs(1800), &log, |shared| shared.status == Status::Stopped && shared.activity.is_empty())?;
     match options.scenario.as_str() {
+        "ferramentas" => tools_screenshots(backend, options, directory, &log)?,
+        "voltar" => time_screenshots(backend, options, directory, &log)?,
         "usuario" => {
             scenario::stop_in_csrss(&backend, &log)?;
             backend.send(Request::ShowDump(0, "@rsp".into()));
@@ -265,5 +278,97 @@ fn screenshots(config: Config, target: Option<Target>, options: &Options, direct
             })?;
         }
     }
+    Ok(())
+}
+
+/// As capturas das abas APIs, IRPs, Tipos e Registro: os monitores ligados
+/// no começo do boot, a máquina até o ntfs.sys real abrir um arquivo e a
+/// parada pedida.
+fn tools_screenshots(backend: Backend, options: &Options, directory: &Path, log: &dyn Fn(&str)) -> Result<(), String> {
+    // Na carga do ntfs.sys: o monitor só para os chamadores dele.
+    let before = backend.shared().snapshot.generation;
+    backend.send(Request::AddBreakpointWith(kd_client::client::BreakpointRequest::new(kd_client::BreakpointKind::Module, "ntfs.sys")));
+    scenario::wait(&backend, "a parada por carga armada", Duration::from_secs(60), log, |shared| shared.snapshot.generation > before)?;
+    let before = backend.shared().snapshot.generation;
+    backend.send(Request::Go);
+    scenario::wait(&backend, "a carga do ntfs.sys", Duration::from_secs(1800), log, |shared| shared.status == Status::Stopped && shared.snapshot.generation > before && shared.snapshot.stop.contains("modulo carregado") && shared.activity.is_empty())?;
+    backend.send(Request::Extra(ExtraRequest::ApiMonitor { enable: true, modules: vec!["ntfs".into()] }));
+    backend.send(Request::Extra(ExtraRequest::IrpTrace(true)));
+    scenario::wait(&backend, "os monitores ligados", Duration::from_secs(300), log, |_| backend.store.lock().map(|store| store.api_enabled && store.irp_enabled).unwrap_or(false))?;
+    backend.send(Request::Go);
+    scenario::wait(&backend, "a maquina rodando", Duration::from_secs(60), log, |shared| shared.status == Status::Running)?;
+    scenario::wait(&backend, "o arquivo aberto pelo ntfs.sys", Duration::from_secs(1800), log, |shared| shared.serial.contains("FILE_SYSTEM_MOUNT_OK"))?;
+    let before = backend.shared().snapshot.generation;
+    backend.send(Request::Break);
+    scenario::wait(&backend, "a parada pedida", Duration::from_secs(300), log, |shared| shared.status == Status::Stopped && shared.snapshot.generation > before && shared.activity.is_empty())?;
+    let (api_row, irp) = {
+        let store = backend.store.lock().map_err(|_| "deposito travado")?;
+        let row = store.api_rows.iter().position(|row| row.module.eq_ignore_ascii_case("ntfs") && row.name.as_ref() == "IoCreateDevice");
+        let ntfs: Vec<u64> = store.driver_names.iter().filter(|(_, name)| name.to_ascii_lowercase().contains("ntfs")).map(|(&driver, _)| driver).collect();
+        let irp = store.irps.iter().position(|life| life.major == 0 && life.completed && life.hops().count() >= 1 && life.drivers().iter().any(|driver| ntfs.contains(driver)));
+        (row, irp)
+    };
+    let mut backend = capture(backend, options, &directory.join("kd-re-api.png"), |app| {
+        app.set_api_filter("ntfs", "");
+        if let Some(index) = api_row {
+            app.select_api_row(index);
+        }
+        app.focus(Tab::ApiMonitor);
+    })?;
+    backend = capture(backend, options, &directory.join("kd-re-irp.png"), |app| {
+        if let Some(index) = irp {
+            app.select_irp(index);
+        }
+        app.focus(Tab::Irps);
+    })?;
+    let system = backend.shared().snapshot.processes.iter().find(|process| process.pid == 4).map(|process| process.eprocess).ok_or("sem o processo System")?;
+    let expanded = ["ThreadListHead", "ThreadListHead/#0"];
+    backend.send(Request::Extra(ExtraRequest::StructView { type_name: "_EPROCESS".into(), address: format!("{system:#x}"), expanded: expanded.iter().map(|key| key.to_string()).collect(), lists: Vec::new() }));
+    scenario::wait(&backend, "a vista _EPROCESS", Duration::from_secs(300), log, |shared| shared.extras.struct_tree.is_some() && shared.activity.is_empty())?;
+    backend = capture(backend, options, &directory.join("kd-re-tipos.png"), |app| {
+        app.view_type("_EPROCESS", system, &expanded);
+        app.focus(Tab::Types);
+    })?;
+    let path = "\\Registry\\Machine\\SYSTEM\\Select";
+    let mut current = String::new();
+    let mut paths = Vec::new();
+    for part in path.trim_start_matches('\\').split('\\') {
+        current.push('\\');
+        current.push_str(part);
+        paths.push(current.clone());
+    }
+    for path in &paths {
+        backend.send(Request::Extra(ExtraRequest::RegistryKey(path.clone())));
+    }
+    scenario::wait(&backend, "as chaves do Registro", Duration::from_secs(300), log, |shared| paths.iter().all(|path| shared.extras.registry.contains_key(path)) && shared.activity.is_empty())?;
+    backend.send(Request::Extra(ExtraRequest::RegistryValue(path.into(), "Current".into())));
+    scenario::wait(&backend, "o valor Current", Duration::from_secs(120), log, |shared| shared.extras.registry_value.is_some())?;
+    capture(backend, options, &directory.join("kd-re-registro.png"), |app| {
+        app.set_registry_path(path);
+        app.focus(Tab::Registry);
+    })?;
+    Ok(())
+}
+
+/// A captura da aba Snapshots: dois snapshots gravados na parada (antes e
+/// depois de uns passos) e a volta ao primeiro.
+fn time_screenshots(backend: Backend, options: &Options, directory: &Path, log: &dyn Fn(&str)) -> Result<(), String> {
+    let snapshot = |backend: &Backend, name: &str| -> Result<(), String> {
+        backend.send(Request::Extra(ExtraRequest::SnapshotSave(name.into())));
+        scenario::wait(backend, &format!("o snapshot {name}"), Duration::from_secs(600), log, |shared| shared.extras.snapshots.as_ref().is_some_and(|list| list.as_ref().as_ref().is_ok_and(|list| list.iter().any(|item| item.tag == name))) && shared.activity.is_empty())
+    };
+    snapshot(&backend, "inicio-do-boot")?;
+    for _ in 0..3 {
+        let before = backend.shared().snapshot.generation;
+        backend.send(Request::StepInto);
+        scenario::wait_stop(&backend, "um passo", before, Duration::from_secs(120), log)?;
+    }
+    snapshot(&backend, "tres-passos-depois")?;
+    let before = backend.shared().snapshot.generation;
+    backend.send(Request::Extra(ExtraRequest::SnapshotLoad("inicio-do-boot".into())));
+    scenario::wait_stop(&backend, "a volta ao snapshot", before, Duration::from_secs(600), log)?;
+    backend.send(Request::Extra(ExtraRequest::SnapshotList));
+    scenario::wait(&backend, "a lista de snapshots", Duration::from_secs(120), log, |shared| shared.activity.is_empty())?;
+    capture(backend, options, &directory.join("kd-re-voltar.png"), |app| app.focus(Tab::Snapshots))?;
     Ok(())
 }

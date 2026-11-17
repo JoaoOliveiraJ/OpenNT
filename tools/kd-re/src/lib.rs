@@ -21,7 +21,12 @@
 //! - `source`: as linhas de código e as variáveis locais pelo DWARF do
 //!   `kernel.elf`;
 //! - `scenario`: roteiros sem janela (o teste de fumaça e as capturas);
-//! - `offscreen`: a janela desenhada sem GPU (a captura de tela).
+//! - `offscreen`: a janela desenhada sem GPU (a captura de tela);
+//! - `monitors`: as abas APIs (o monitor de APIs) e IRPs (o rastreador);
+//! - `explorers`: as abas Tipos (ver como tipo), Registro, Objetos,
+//!   Arquivos e Snapshots (com os passos para trás da reprodução);
+//! - `preferences`: as preferências (aparência, atalhos, eventos) e o
+//!   banco por módulo.
 
 pub mod app;
 pub mod asm;
@@ -30,11 +35,14 @@ pub mod cpu;
 pub mod disasm;
 pub mod dump;
 pub mod editor;
+pub mod explorers;
 pub mod graph;
 pub mod highlight;
 pub mod launcher;
+pub mod monitors;
 pub mod offscreen;
 pub mod panels;
+pub mod preferences;
 pub mod scan;
 pub mod scenario;
 pub mod source;

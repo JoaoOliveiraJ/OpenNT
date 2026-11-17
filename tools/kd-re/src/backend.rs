@@ -36,10 +36,13 @@ use crate::disasm::{self, Line};
 use crate::launcher::{Launch, LaunchOptions};
 use crate::source::{Local, LineTable};
 
+#[path = "backend/extras.rs"]
+mod extras;
 #[path = "backend/mcp.rs"]
 mod mcp;
 #[path = "backend/views.rs"]
 mod views;
+pub use extras::{ExtraRequest, ExtrasView, FilePreview, MonitorStore, RegistryKeyView, SharedStore, StructTree, TimeMode};
 pub use views::{GraphBlock, GraphView, MapRow, MemoryMapView, ReferenceRow, ReferenceView, SearchKind, SearchQuery, SearchScope, SehRow, StackRow, SymbolView, XrefRow, XrefView};
 use kd_client::analysis::notes::Patch;
 use kd_client::user::{Handle, ProcessContext, UserThread};
@@ -215,6 +218,9 @@ pub enum Request {
     Mcp { message: String, reply: Sender<Option<String>> },
     /// Liga (na porta) ou desliga o servidor MCP da janela.
     SetMcp(Option<u16>),
+    /// As abas do monitor de APIs, dos IRPs, dos tipos, dos exploradores,
+    /// dos snapshots e da reprodução (`backend/extras.rs`).
+    Extra(ExtraRequest),
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -470,11 +476,15 @@ pub struct Shared {
     pub clipboard: Option<String>,
     /// O servidor MCP hospedado (`127.0.0.1:porta`), quando ligado.
     pub mcp: Option<String>,
+    /// O estado das abas novas (tipos, exploradores, snapshots, modo).
+    pub extras: ExtrasView,
 }
 
 pub struct Backend {
     requests: Sender<Request>,
     pub shared: Arc<Mutex<Shared>>,
+    /// O monitor de APIs e os IRPs (a janela lê sob a trava).
+    pub store: SharedStore,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -485,13 +495,15 @@ impl Backend {
     pub fn start(config: Config, target: Option<Target>, notify: Notify) -> Backend {
         let (requests, receiver) = mpsc::channel();
         let shared = Arc::new(Mutex::new(Shared::default()));
+        let store: SharedStore = Arc::new(Mutex::new(MonitorStore::default()));
         let mut worker = Worker::new(config, Arc::clone(&shared), notify);
+        worker.store = Arc::clone(&store);
         worker.requests = Some(requests.clone());
         let thread = thread::Builder::new()
             .name("kd-backend".into())
             .spawn(move || worker.run(receiver, target))
             .expect("thread do backend");
-        Backend { requests, shared, thread: Some(thread) }
+        Backend { requests, shared, store, thread: Some(thread) }
     }
 
     pub fn send(&self, request: Request) {
@@ -562,6 +574,7 @@ struct Worker {
     mcp_server: kd_mcp::Server,
     mcp_cache: kd_mcp::ImageCache,
     mcp_stop: Option<Arc<std::sync::atomic::AtomicBool>>,
+    store: SharedStore,
 }
 
 impl Worker {
@@ -595,6 +608,7 @@ impl Worker {
             mcp_server: kd_mcp::Server::new(),
             mcp_cache: kd_mcp::ImageCache::default(),
             mcp_stop: None,
+            store: SharedStore::default(),
         }
     }
 
@@ -632,6 +646,7 @@ impl Worker {
             }
             if self.client.as_ref().is_some_and(|client| !client.is_stopped()) {
                 self.poll_target();
+                self.sync_monitors();
             }
             // Um PDB que chegou: os nomes trocam sem esperar outra parada.
             if self.client.as_ref().is_some_and(|client| client.is_stopped() && client.symbols.pending() && !client.symbols.store.as_ref().is_some_and(|store| store.busy())) {
@@ -721,6 +736,7 @@ impl Worker {
             }
         };
         let mut client = Client::new(connection, self.config.root.clone(), self.config.elf.clone());
+        self.prepare_client(&mut client);
         self.set_activity("anexando (a maquina para no proximo tique)");
         match client.attach(Duration::from_secs(180)) {
             Ok(text) => {
@@ -735,6 +751,7 @@ impl Worker {
                     }
                 }
                 self.client = Some(client);
+                self.after_attach();
                 self.lines = None;
                 self.re = views::ReState::default();
                 if let Some(path) = self.config.script.clone() {
@@ -1104,6 +1121,13 @@ impl Worker {
                 Ok(true)
             }
             Request::CopyFileOffset(address) => self.copy_file_offset(address),
+            Request::Extra(request) => {
+                let result = self.extra(request);
+                if let Err(error) = &result {
+                    self.extras_message(error.clone());
+                }
+                result
+            }
             Request::Start(_) | Request::Restart | Request::Disconnect | Request::Shutdown | Request::SetWatches(_) | Request::SetExpanded(_) | Request::Mcp { .. } | Request::SetMcp(_) | Request::SetArgumentCount(_) => Ok(false),
         };
         if breakpoints_changed && result.is_ok() {
@@ -1203,6 +1227,7 @@ impl Worker {
 
     /// Monta e publica o snapshot da parada.
     fn refresh(&mut self) {
+        self.extras_after_stop();
         self.set_activity("lendo o estado da maquina");
         let snapshot = self.build_snapshot();
         self.set_activity("");

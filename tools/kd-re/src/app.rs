@@ -24,9 +24,10 @@ use kd_client::analysis::notes::{Location, Notes};
 use kd_client::{BreakpointKind, Client};
 use serde::{Deserialize, Serialize};
 
-use crate::backend::{Backend, Entry, ModuleRow, QueryKind, Request, SearchKind, SearchQuery, SearchScope, Snapshot, Status, Target, TraceView, View};
+use crate::backend::{Backend, Entry, ExtraRequest, ExtrasView, ModuleRow, QueryKind, Request, SearchKind, SearchQuery, SearchScope, SharedStore, Snapshot, Status, Target, TimeMode, TraceView, View};
 use crate::launcher::LaunchOptions;
-use crate::{cpu, graph, panels, views};
+use crate::preferences::{Action, ModuleDb, Preferences, PreferencesUi};
+use crate::{cpu, explorers, graph, monitors, panels, views};
 
 /// As abas.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -53,10 +54,17 @@ pub enum Tab {
     Watch,
     NtObjects,
     Bugcheck,
+    ApiMonitor,
+    Irps,
+    Types,
+    Registry,
+    Objects,
+    Files,
+    Snapshots,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 22] = [
+    pub const ALL: [Tab; 29] = [
         Tab::Cpu,
         Tab::Graph,
         Tab::Log,
@@ -79,6 +87,13 @@ impl Tab {
         Tab::Watch,
         Tab::NtObjects,
         Tab::Bugcheck,
+        Tab::ApiMonitor,
+        Tab::Irps,
+        Tab::Types,
+        Tab::Registry,
+        Tab::Objects,
+        Tab::Files,
+        Tab::Snapshots,
     ];
 
     pub fn title(self) -> &'static str {
@@ -105,6 +120,13 @@ impl Tab {
             Tab::Watch => "Observação",
             Tab::NtObjects => "Objetos do NT",
             Tab::Bugcheck => "Bugcheck",
+            Tab::ApiMonitor => "APIs",
+            Tab::Irps => "IRPs",
+            Tab::Types => "Tipos",
+            Tab::Registry => "Registro",
+            Tab::Objects => "Objetos",
+            Tab::Files => "Arquivos",
+            Tab::Snapshots => "Snapshots",
         }
     }
 }
@@ -353,6 +375,20 @@ pub struct UiState {
     pub(crate) mcp_port: String,
     pub(crate) mcp_address: Option<String>,
     pub(crate) dump_path: String,
+    // ---- monitor de APIs, IRPs, tipos, exploradores, snapshots ----
+    pub(crate) monitor: monitors::MonitorUi,
+    pub(crate) explorer: explorers::ExplorerUi,
+    /// O depósito do monitor de APIs e dos IRPs (o backend escreve).
+    pub(crate) store: SharedStore,
+    pub(crate) extras: ExtrasView,
+    pub(crate) prefs: Preferences,
+    pub(crate) prefs_ui: PreferencesUi,
+    /// O banco por módulo: a pasta, o último gravado e os breakpoints dele
+    /// já armados nesta sessão.
+    pub(crate) db_dir: Option<PathBuf>,
+    pub(crate) db_saved: ModuleDb,
+    pub(crate) db_loaded: ModuleDb,
+    pub(crate) db_armed: HashSet<(String, u64)>,
 }
 
 impl UiState {
@@ -449,6 +485,29 @@ pub(crate) struct Palette {
 }
 
 pub(crate) fn palette(ui: &Ui) -> Palette {
+    let mut colors = theme_palette(ui);
+    let swap = |slot: &mut Color32, name: &str| {
+        if let Some(color) = crate::preferences::color_override(ui, name) {
+            *slot = color;
+        }
+    };
+    swap(&mut colors.red, "red");
+    swap(&mut colors.yellow, "yellow");
+    swap(&mut colors.green, "green");
+    swap(&mut colors.blue, "blue");
+    swap(&mut colors.dim, "dim");
+    swap(&mut colors.focus, "focus");
+    swap(&mut colors.current, "current");
+    swap(&mut colors.executed, "executed");
+    swap(&mut colors.breakpoint, "breakpoint");
+    swap(&mut colors.comment, "comment");
+    swap(&mut colors.label, "label");
+    swap(&mut colors.selection, "selection");
+    colors
+}
+
+/// As cores do tema (claro ou escuro).
+fn theme_palette(ui: &Ui) -> Palette {
     if ui.visuals().dark_mode {
         Palette {
             red: Color32::from_rgb(0xE8, 0x5C, 0x5C),
@@ -504,6 +563,7 @@ pub fn state_path() -> Option<PathBuf> {
 
 impl DebuggerApp {
     pub fn new(backend: Backend, launch: Option<LaunchOptions>, connect_address: String) -> DebuggerApp {
+        let store = Arc::clone(&backend.store);
         DebuggerApp {
             backend,
             dock: default_layout(),
@@ -621,6 +681,16 @@ impl DebuggerApp {
                 mcp_port: "7357".into(),
                 mcp_address: None,
                 dump_path: "build/opennt-re/regiao.bin".into(),
+                monitor: monitors::MonitorUi::new(),
+                explorer: explorers::ExplorerUi::new(),
+                store,
+                extras: ExtrasView::default(),
+                prefs: Preferences::default(),
+                prefs_ui: PreferencesUi::default(),
+                db_dir: None,
+                db_saved: ModuleDb::default(),
+                db_loaded: ModuleDb::default(),
+                db_armed: HashSet::new(),
             },
             persist: None,
             last_saved: String::new(),
@@ -644,6 +714,10 @@ impl DebuggerApp {
             }
         }
         self.persist = Some(path);
+        if let Some(path) = crate::preferences::preferences_path() {
+            self.state.prefs = Preferences::load(&path);
+            self.state.prefs_ui.saved = self.state.prefs.to_text();
+        }
         self
     }
 
@@ -658,6 +732,20 @@ impl DebuggerApp {
         self.state.session_notes = std::fs::read_to_string(&free).unwrap_or_default();
         self.state.session_notes_saved = self.state.session_notes.clone();
         self.state.session_notes_path = Some(free);
+        // O banco por módulo: as notas dele entram nas da sessão.
+        let db_dir = directory.join("db");
+        let db = ModuleDb::load(&db_dir);
+        let stored = db.notes();
+        for (location, text) in stored.comments {
+            self.state.notes.comments.entry(location).or_insert(text);
+        }
+        for (location, text) in stored.labels {
+            self.state.notes.labels.entry(location).or_insert(text);
+        }
+        self.state.notes.bookmarks.extend(stored.bookmarks);
+        self.state.db_saved = db.clone();
+        self.state.db_loaded = db;
+        self.state.db_dir = Some(db_dir);
         self
     }
 
@@ -703,6 +791,45 @@ impl DebuggerApp {
     /// Abre o editor de breakpoints com o formulário (a captura de tela).
     pub fn open_breakpoint_editor(&mut self, form: crate::editor::BreakpointForm) {
         self.state.breakpoint_form = Some(form);
+    }
+
+    /// O filtro de driver do monitor de APIs (a captura de tela).
+    pub fn set_api_filter(&mut self, driver: &str, export: &str) {
+        self.state.monitor.filter.driver = driver.to_string();
+        self.state.monitor.filter.export = export.to_string();
+        self.state.monitor.follow = false;
+    }
+
+    /// Escolhe uma chamada do monitor de APIs (a captura de tela).
+    pub fn select_api_row(&mut self, index: usize) {
+        self.state.monitor.selected = Some(index);
+    }
+
+    /// Escolhe um IRP do rastreador (a captura de tela).
+    pub fn select_irp(&mut self, index: usize) {
+        self.state.monitor.irp_selected = Some(index);
+    }
+
+    /// A aba Tipos num tipo e num endereço, com as chaves abertas (a
+    /// captura de tela).
+    pub fn view_type(&mut self, type_name: &str, address: u64, expanded: &[&str]) {
+        self.state.explorer.type_name = type_name.to_string();
+        self.state.explorer.type_address = format!("{address:#x}");
+        self.state.explorer.type_expanded = expanded.iter().map(|key| key.to_string()).collect();
+        self.state.explorer.type_sent = None;
+    }
+
+    /// A aba Registro numa chave, com os ancestrais abertos e já pedidos
+    /// (a captura de tela).
+    pub fn set_registry_path(&mut self, path: &str) {
+        self.state.explorer.registry_path = path.to_string();
+        let mut current = String::new();
+        for part in path.trim_start_matches('\\').split('\\') {
+            current.push('\\');
+            current.push_str(part);
+            self.state.explorer.registry_open.insert(current.clone());
+            self.state.explorer.registry_requested.insert(current.clone());
+        }
     }
 
     /// Liga o modo de destaque com a chave de um pedaço (a captura de tela).
@@ -755,6 +882,18 @@ impl DebuggerApp {
                 }
             }
         }
+        self.save_module_db(force);
+        if let Some(path) = crate::preferences::preferences_path().filter(|_| self.persist.is_some()) {
+            let text = self.state.prefs.to_text();
+            if text != self.state.prefs_ui.saved {
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if std::fs::write(&path, &text).is_ok() {
+                    self.state.prefs_ui.saved = text;
+                }
+            }
+        }
         let Some(path) = &self.persist else { return };
         if !force && self.last_save.elapsed() < Duration::from_secs(3) {
             return;
@@ -770,6 +909,71 @@ impl DebuggerApp {
         }
         if std::fs::write(path, &text).is_ok() {
             self.last_saved = text;
+        }
+    }
+
+    /// Grava o banco por módulo quando as notas ou os breakpoints mudam, e
+    /// arma os breakpoints guardados dos módulos que já carregaram.
+    fn save_module_db(&mut self, force: bool) {
+        let Some(directory) = self.state.db_dir.clone() else { return };
+        if !force && self.last_save.elapsed() < Duration::from_secs(2) {
+            return;
+        }
+        let state = &self.state;
+        let mut db = ModuleDb::from_session(&state.notes, &state.snapshot.breakpoints, &|address| state.location(address));
+        // Os breakpoints guardados de módulos que ainda não carregaram ficam.
+        let loaded: HashSet<String> = state.snapshot.modules.iter().map(|module| if module.source == "ELF do kernel" { "kernel".to_string() } else { module.name.to_ascii_lowercase() }).collect();
+        let mut pending = ModuleDb::default();
+        for (module, record) in &state.db_loaded.modules {
+            if !loaded.contains(module) {
+                pending.modules.insert(module.clone(), crate::preferences::ModuleRecord { breakpoints: record.breakpoints.clone(), ..Default::default() });
+            }
+        }
+        db.merge_breakpoints_from(&pending);
+        if db != self.state.db_saved && db.save(&directory, &self.state.db_saved).is_ok() {
+            self.state.db_saved = db;
+        }
+    }
+
+    /// Os breakpoints do banco por módulo dos módulos que já estão na
+    /// lista (uma vez por sessão), e as paradas em eventos das
+    /// preferências (na primeira parada e quando mudam).
+    fn apply_session_settings(&mut self) {
+        let state = &mut self.state;
+        if matches!(state.status, Status::Launching(_) | Status::Connecting(_) | Status::Disconnected(_)) {
+            // Uma sessão nova recebe tudo de novo.
+            state.prefs_ui.events_sent = None;
+            state.db_armed.clear();
+            return;
+        }
+        if state.status != Status::Stopped || state.snapshot.modules.is_empty() {
+            return;
+        }
+        let generation = state.snapshot.generation;
+        let events = state.prefs.events.clone();
+        let changed = state.prefs_ui.events_sent.as_ref().is_none_or(|(sent, _)| *sent != events);
+        if changed && !matches!(state.extras.mode, TimeMode::Replay(..)) {
+            let previous = state.prefs_ui.events_sent.as_ref().map(|(sent, _)| sent.clone()).unwrap_or_default();
+            for command in events.changes(&previous) {
+                state.requests.push(Request::Command(command));
+            }
+            state.prefs_ui.events_sent = Some((events, generation));
+        }
+        let mut wanted = Vec::new();
+        for module in &state.snapshot.modules {
+            let name = if module.source == "ELF do kernel" { "kernel".to_string() } else { module.name.to_ascii_lowercase() };
+            let Some(record) = state.db_loaded.modules.get(&name) else { continue };
+            for stored in &record.breakpoints {
+                let address = module.base + stored.rva;
+                if state.db_armed.insert((name.clone(), stored.rva)) && !state.snapshot.breakpoints.iter().any(|breakpoint| breakpoint.address == address) {
+                    if let Some(request) = stored.request(address) {
+                        wanted.push(request);
+                    }
+                }
+            }
+        }
+        for request in wanted {
+            state.requests.push(Request::AddBreakpointWith(request));
         }
     }
 
@@ -795,6 +999,7 @@ impl DebuggerApp {
         }
         state.status = shared.status.clone();
         state.activity = shared.activity.clone();
+        state.extras = shared.extras.clone();
         state.mcp_address = shared.mcp.clone();
         state.can_restart = shared.can_restart;
         if shared.transcript.len() < state.transcript.len() {
@@ -851,7 +1056,13 @@ impl DebuggerApp {
         if self.state.theme_applied != Some(self.state.light) {
             crate::apply_theme(ui.ctx(), !self.state.light);
             self.state.theme_applied = Some(self.state.light);
+            self.state.prefs_ui.applied = None;
         }
+        if self.state.prefs_ui.applied.as_ref() != Some(&self.state.prefs) {
+            self.state.prefs.apply(ui.ctx(), self.state.prefs_ui.applied.as_ref());
+            self.state.prefs_ui.applied = Some(self.state.prefs.clone());
+        }
+        self.apply_session_settings();
         self.shortcuts(ui);
         let state = &mut self.state;
         let dock = &self.dock;
@@ -867,6 +1078,7 @@ impl DebuggerApp {
             DockArea::new(&mut self.dock).style(style).show_close_buttons(false).show_leaf_close_all_buttons(false).show_leaf_collapse_buttons(false).show_inside(ui, &mut Viewer { state: &mut self.state });
         });
         dialogs(ui, &mut self.state);
+        crate::preferences::preferences_window(ui.ctx(), &mut self.state.prefs, &mut self.state.prefs_ui);
         crate::cpu::breakpoint_editor(ui, &mut self.state);
         crate::cpu::xrefs_window(ui, &mut self.state);
         if self.state.argument_count != self.state.sent_argument_count {
@@ -917,60 +1129,84 @@ impl DebuggerApp {
         let stopped = self.state.status == Status::Stopped;
         let running = self.state.status == Status::Running;
         let pressed = |modifiers: Modifiers, key: Key| ui.input_mut(|input| input.consume_key(modifiers, key));
+        if self.state.prefs_ui.capturing.is_some() {
+            // O editor de atalhos espera a tecla nova.
+            return;
+        }
         let state = &mut self.state;
-        if stopped && pressed(Modifiers::CTRL, Key::F9) {
-            state.requests.push(Request::StepOut);
+        // As teclas vêm das preferências (o editor de atalhos); as com mais
+        // modificadores são conferidas antes.
+        let prefs = state.prefs.clone();
+        let mut order: Vec<Action> = Action::ALL.to_vec();
+        order.sort_by_key(|action| {
+            let binding = prefs.binding(*action);
+            std::cmp::Reverse(binding.ctrl as u8 + binding.shift as u8 + binding.alt as u8)
+        });
+        let replay = matches!(state.extras.mode, TimeMode::Replay(_, true));
+        let target = state.selected_code.or_else(|| current_rip(&state.snapshot));
+        for action in order {
+            let wanted = match action {
+                Action::Break => running,
+                Action::Restart => state.can_restart,
+                Action::ReverseStep | Action::ReverseContinue => stopped && replay,
+                _ => stopped && state.dialog.is_none(),
+            };
+            if !wanted || !prefs.pressed(ui, action) {
+                continue;
+            }
+            match action {
+                Action::Go => state.requests.push(Request::Go),
+                Action::StepInto => state.requests.push(Request::StepInto),
+                Action::StepOver => state.requests.push(Request::StepOver),
+                Action::StepOut => state.requests.push(Request::StepOut),
+                Action::RunToUserCode => state.requests.push(Request::RunToUserCode),
+                Action::Break => state.requests.push(Request::Break),
+                Action::Restart => state.requests.push(Request::Restart),
+                Action::ToggleBreakpoint => {
+                    if let Some(address) = target {
+                        state.requests.push(Request::ToggleBreakpoint(address));
+                    }
+                }
+                Action::RunToCursor => {
+                    if let Some(address) = state.selected_code {
+                        state.requests.push(Request::RunToCursor(address));
+                    }
+                }
+                Action::GoTo => state.dialog = Some(Dialog::GoTo(String::new())),
+                Action::Pattern => state.dialog = Some(Dialog::Pattern(String::new(), false)),
+                Action::Xrefs => {
+                    if let Some(address) = target {
+                        state.requests.push(Request::Xrefs(address));
+                        state.xrefs_open = true;
+                    }
+                }
+                Action::NewOrigin => {
+                    if let Some(address) = state.selected_code {
+                        state.requests.push(Request::WriteRegister("rip".into(), address));
+                    }
+                }
+                Action::ReverseStep => state.requests.push(Request::Extra(ExtraRequest::ReverseStep)),
+                Action::ReverseContinue => state.requests.push(Request::Extra(ExtraRequest::ReverseContinue)),
+                Action::SaveSnapshot => {
+                    let name = state.explorer.snapshot_name.trim().to_string();
+                    state.requests.push(Request::Extra(ExtraRequest::SnapshotSave(name)));
+                    state.focus_tab.push(Tab::Snapshots);
+                }
+                Action::ViewAsType => {
+                    let index = state.dump_tab.min(4);
+                    if let Some(dump) = state.snapshot.dumps.get(index) {
+                        let address = dump.address;
+                        explorers::view_as_type(state, "", address);
+                    }
+                }
+            }
         }
-        if stopped && pressed(Modifiers::ALT, Key::F9) {
-            state.requests.push(Request::RunToUserCode);
-        }
-        if stopped && pressed(Modifiers::NONE, Key::F9) {
-            state.requests.push(Request::Go);
-        }
-        if stopped && pressed(Modifiers::NONE, Key::F8) {
-            state.requests.push(Request::StepOver);
-        }
-        if stopped && pressed(Modifiers::NONE, Key::F7) {
-            state.requests.push(Request::StepInto);
-        }
-        if running && (pressed(Modifiers::NONE, Key::F12) || pressed(Modifiers::CTRL, Key::B)) {
+        // Ctrl+B com a máquina rodando também pausa.
+        if running && pressed(Modifiers::CTRL, Key::B) {
             state.requests.push(Request::Break);
-        }
-        if state.can_restart && pressed(Modifiers::CTRL, Key::F2) {
-            state.requests.push(Request::Restart);
         }
         if !stopped || state.dialog.is_some() {
             return;
-        }
-        let target = state.selected_code.or_else(|| current_rip(&state.snapshot));
-        if pressed(Modifiers::NONE, Key::F2) {
-            if let Some(address) = target {
-                state.requests.push(Request::ToggleBreakpoint(address));
-            }
-        }
-        if pressed(Modifiers::NONE, Key::F4) {
-            if let Some(address) = state.selected_code {
-                state.requests.push(Request::RunToCursor(address));
-            }
-        }
-        if pressed(Modifiers::CTRL, Key::G) {
-            state.dialog = Some(Dialog::GoTo(String::new()));
-        }
-        if pressed(Modifiers::CTRL, Key::B) {
-            state.dialog = Some(Dialog::Pattern(String::new(), false));
-        }
-        // Ctrl+R: referências ao endereço (a janela Xrefs).
-        if pressed(Modifiers::CTRL, Key::R) {
-            if let Some(address) = target {
-                state.requests.push(Request::Xrefs(address));
-                state.xrefs_open = true;
-            }
-        }
-        // Ctrl+* (Ctrl+Shift+8): nova origem (o RIP vai para a linha).
-        if pressed(Modifiers::CTRL | Modifiers::SHIFT, Key::Num8) || pressed(Modifiers::CTRL, Key::Num8) {
-            if let Some(address) = state.selected_code {
-                state.requests.push(Request::WriteRegister("rip".into(), address));
-            }
         }
         // As teclas de uma letra só valem fora dos campos de texto.
         if ui.ctx().egui_wants_keyboard_input() {
@@ -1051,6 +1287,35 @@ fn menu_bar(ui: &mut Ui, state: &mut UiState, open: &[Tab]) {
             if ui.button("Desconectar").clicked() {
                 state.requests.push(Request::Disconnect);
             }
+            if let Some(options) = state.launch.clone() {
+                ui.separator();
+                let with = |extra: &str| {
+                    let mut options = options.clone();
+                    options.extra.retain(|argument| argument != "--vm-snapshots" && !argument.starts_with("--record=") && !argument.starts_with("--replay="));
+                    if !extra.is_empty() {
+                        options.extra.push(extra.to_string());
+                    }
+                    options
+                };
+                let recording = format!("--record={}", options.build_dir.join("gravacao.bin").display());
+                let replay = format!("--replay={}", options.build_dir.join("gravacao.bin").display());
+                if ui.button("Abrir com snapshots (discos em qcow2)").on_hover_text("--vm-snapshots: savevm/loadvm na aba Snapshots").clicked() {
+                    state.requests.push(Request::Start(Target::Launch(with("--vm-snapshots"))));
+                    state.launch = Some(with("--vm-snapshots"));
+                }
+                if ui.button("Gravar a execução (TCG)").on_hover_text(&recording).clicked() {
+                    state.requests.push(Request::Start(Target::Launch(with(&recording))));
+                    state.launch = Some(with(&recording));
+                }
+                if ui.button("Reproduzir a gravação (voltar no tempo)").on_hover_text(&replay).clicked() {
+                    state.requests.push(Request::Start(Target::Launch(with(&replay))));
+                    state.launch = Some(with(&replay));
+                }
+                if ui.button("Abrir sem snapshots nem gravação").clicked() {
+                    state.requests.push(Request::Start(Target::Launch(with(""))));
+                    state.launch = Some(with(""));
+                }
+            }
             ui.separator();
             if ui.add_enabled(stopped, egui::Button::new("Exportar patches")).clicked() {
                 state.requests.push(Request::ExportPatches(PathBuf::from(&state.patch_path)));
@@ -1110,6 +1375,14 @@ fn menu_bar(ui: &mut Ui, state: &mut UiState, open: &[Tab]) {
                 state.user_exceptions = exceptions;
                 state.requests.push(Request::SetUserExceptions(exceptions));
             }
+            let replay = matches!(state.extras.mode, TimeMode::Replay(_, true));
+            if ui.add_enabled(stopped && replay, egui::Button::new("Voltar um passo").shortcut_text(state.prefs.binding(Action::ReverseStep).text())).clicked() {
+                state.requests.push(Request::Extra(ExtraRequest::ReverseStep));
+            }
+            if ui.add_enabled(stopped && replay, egui::Button::new("Voltar até o breakpoint").shortcut_text(state.prefs.binding(Action::ReverseContinue).text())).clicked() {
+                state.requests.push(Request::Extra(ExtraRequest::ReverseContinue));
+            }
+            ui.separator();
             if ui.add_enabled(stopped, egui::Button::new("Analisar bugcheck (!analyze)")).clicked() {
                 state.query_kind = QueryKind::Analyze;
                 state.requests.push(Request::Query(QueryKind::Analyze, String::new()));
@@ -1151,6 +1424,10 @@ fn menu_bar(ui: &mut Ui, state: &mut UiState, open: &[Tab]) {
             }
             if ui.radio(!state.light, "Tema escuro").clicked() {
                 state.light = false;
+            }
+            ui.separator();
+            if ui.button("Preferências...").clicked() {
+                state.prefs_ui.open = true;
             }
         });
     });
@@ -1318,6 +1595,16 @@ fn toolbar(ui: &mut Ui, state: &mut UiState) {
         if icon_button(ui, Icon::UserCode, stopped, "Executar até o código de usuário (Alt+F9)") {
             state.requests.push(Request::RunToUserCode);
         }
+        if matches!(state.extras.mode, TimeMode::Replay(..)) {
+            let reverse = stopped && matches!(state.extras.mode, TimeMode::Replay(_, true));
+            ui.separator();
+            if ui.add_enabled(reverse, egui::Button::new("⟲").small()).on_hover_text(format!("Voltar um passo ({})", state.prefs.binding(Action::ReverseStep).text())).clicked() {
+                state.requests.push(Request::Extra(ExtraRequest::ReverseStep));
+            }
+            if ui.add_enabled(reverse, egui::Button::new("⏪").small()).on_hover_text(format!("Voltar até o breakpoint ({})", state.prefs.binding(Action::ReverseContinue).text())).clicked() {
+                state.requests.push(Request::Extra(ExtraRequest::ReverseContinue));
+            }
+        }
         ui.separator();
         if icon_button(ui, Icon::Comments, true, "Comentários") {
             state.focus_tab.push(Tab::Comments);
@@ -1391,6 +1678,21 @@ fn status_bar(ui: &mut Ui, state: &mut UiState) {
         if state.status == Status::Stopped {
             if let Some(processor) = shown_processor(&state.snapshot) {
                 ui.label(mono(format!("CPU {} IRQL {} {}", processor.number, processor.irql, processor.process)).color(colors.blue));
+                ui.separator();
+            }
+        }
+        match &state.extras.mode {
+            TimeMode::Normal => {}
+            TimeMode::Snapshots => {
+                ui.label(mono("snapshots").color(colors.green)).on_hover_text("discos em qcow2: savevm/loadvm na aba Snapshots");
+                ui.separator();
+            }
+            mode @ TimeMode::Recording(_) => {
+                ui.label(mono(format!("● {}", mode.label())).color(colors.red)).on_hover_text("gravação do QEMU (icount): Arquivo > Reproduzir a gravação");
+                ui.separator();
+            }
+            mode @ TimeMode::Replay(..) => {
+                ui.label(mono(format!("⟲ {}", mode.label())).color(colors.yellow)).on_hover_text("reprodução: o gdbstub do QEMU, com os passos para trás");
                 ui.separator();
             }
         }
@@ -1686,6 +1988,13 @@ impl TabViewer for Viewer<'_> {
                 panels::modules_panel(ui, state);
             }
             Tab::Bugcheck => panels::bugcheck_panel(ui, state),
+            Tab::ApiMonitor => monitors::api_tab(ui, state),
+            Tab::Irps => monitors::irp_tab(ui, state),
+            Tab::Types => explorers::types_tab(ui, state),
+            Tab::Registry => explorers::registry_tab(ui, state),
+            Tab::Objects => explorers::objects_tab(ui, state),
+            Tab::Files => explorers::files_tab(ui, state),
+            Tab::Snapshots => explorers::snapshots_tab(ui, state),
         }
     }
 
