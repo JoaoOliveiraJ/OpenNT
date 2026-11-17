@@ -6,6 +6,7 @@
 pub mod bus;
 pub mod console;
 pub mod input;
+pub mod net;
 pub mod video;
 pub mod storage;
 pub mod fs;

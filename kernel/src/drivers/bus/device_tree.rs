@@ -79,6 +79,7 @@ pub fn prepare() -> Result<(), KernelError> {
 pub fn build() {
     let storage = if storage_stack::enabled() { storage_stack::before_tree() } else { None };
     let nvme = crate::drivers::storage::nvme_stack::enabled() && crate::drivers::storage::nvme_stack::before_tree();
+    let network = crate::drivers::net::net_stack::enabled() && crate::drivers::net::net_stack::before_tree();
     if display_stack::enabled() {
         display_stack::before_tree();
     }
@@ -97,7 +98,9 @@ pub fn build() {
     // durante a espera. Os demais boots seguem no contexto de boot: as
     // leituras do Code Integrity pelo driver ATA interno (`--start-driver`)
     // ainda param numa thread de sistema.
-    let processed = if crate::drivers::bus::usb_stack::enabled() { pnp::tree::process_on_system_thread() } else { pnp::tree::process() };
+    // Com a pilha de rede também: o NDIS inicia o miniport no START e espera
+    // o trabalho que ele põe na fila.
+    let processed = if crate::drivers::bus::usb_stack::enabled() || network { pnp::tree::process_on_system_thread() } else { pnp::tree::process() };
     crate::ntos::init::exports::set_api_trace(false);
     if let Err(error) = processed {
         debug_print!("[pnp] arvore do PnP: {}", error);
@@ -113,6 +116,9 @@ pub fn build() {
     }
     if nvme {
         crate::drivers::storage::nvme_stack::check();
+    }
+    if network {
+        crate::drivers::net::net_stack::check();
     }
     if display_stack::enabled() {
         display_stack::check();

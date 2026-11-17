@@ -148,7 +148,13 @@ pub fn init() {
     // NVMe) e `--display=basic` (o BasicDisplay.sys real no adaptador VGA,
     // sobre o dxgkrnl.sys real); com `--usb`, a controladora xHCI recebe o
     // usbxhci.sys.
-    if crate::drivers::bus::acpi_stack::enabled() || crate::drivers::storage::storage_stack::enabled() || crate::drivers::storage::nvme_stack::enabled() || crate::drivers::video::display_stack::enabled() || crate::drivers::bus::usb_stack::enabled() {
+    if crate::drivers::bus::acpi_stack::enabled()
+        || crate::drivers::storage::storage_stack::enabled()
+        || crate::drivers::storage::nvme_stack::enabled()
+        || crate::drivers::video::display_stack::enabled()
+        || crate::drivers::bus::usb_stack::enabled()
+        || crate::drivers::net::net_stack::enabled()
+    {
         // `--start-driver` liga o Code Integrity: como no NT, ele já valida
         // os drivers que a árvore carrega (acpi.sys, pci.sys, i8042prt.sys...).
         if !crate::ntos::init::boot_config::start_driver().is_empty() {
