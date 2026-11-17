@@ -1349,8 +1349,13 @@ A árvore de dispositivos do NT mora em `ntos/io/pnp/`:
   ValidateDeviceInstance (CM_Locate_DevNode), GetDeviceDepth e
   GetRelatedDeviceInstance sobre a árvore de `devnode.rs`; os demais
   códigos conhecidos ainda respondem STATUS_NOT_IMPLEMENTED.
-- `cm_notify.rs`: o `\CMNotify` (PiUEventDispatch), que abre e fecha; os
-  IOCTLs de registro de notificações ainda não têm suporte.
+- `cm_notify.rs`: o `\CMNotify` (PiUEventDispatch e PiUEventHandleIoctl),
+  por onde o CM_Register_Notification do cfgmgr32 registra o interesse em
+  interfaces e dispositivos. O registro (0x470800) cria um nome WNF
+  temporário de escopo de máquina, devolve o nome e guarda o contexto no
+  FsContext2; o fim do registro e o CLOSE o desfazem (o CLOSE apaga o nome
+  pelo ZwDeleteWnfStateName de kernel). A entrega de eventos (GetEvent e
+  Veto) e o filtro por handle de dispositivo ainda não têm suporte.
 
 Os PDOs do barramento PCI respondem como o pci.sys (`drivers/bus/pci_pnp.rs`
 e `pci_interface.rs`): ids, capacidades, requisitos dos BARs (sem os do canal
@@ -3093,14 +3098,25 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   conta do serviço, e o LsapCreateTokenObject cria o token
   (NtCreateTokenEx) e grava nele a TokenMandatoryPolicy, a
   TokenAuditPolicy e a TokenOrigin (NtSetInformationToken 27, 16 e 17,
-  `se/token/set_information.rs`). Ali para: o CreateProcessAsUserW do
-  CWin32ServiceRecord::LogonAndStartImage, com o token no
-  PS_ATTRIBUTE_TOKEN, volta STATUS_PRIVILEGE_NOT_HELD. O PspAllocateProcess
-  aceita o token com o SeAssignPrimaryTokenPrivilege habilitado (o token do
-  SYSTEM o tem desabilitado, como no SeMakeSystemToken) ou com o
-  SeIsTokenAssignableToProcess (integridade dominada e token filho ou irmão
-  do primário de quem chama); o `ps/create_context.rs` só confere o
-  privilégio. Nenhum svchost é criado ainda. O smss da
+  `se/token/set_information.rs`). O CreateProcessAsUserW do
+  CWin32ServiceRecord::LogonAndStartImage cria o svchost com o token no
+  PS_ATTRIBUTE_TOKEN. O PspAllocateProcess (`ps/create_context.rs`) faz o
+  RtlAcquirePrivilege, que basta com o SeAssignPrimaryTokenPrivilege no
+  token primário de quem chama, mesmo desabilitado (o do SYSTEM, como no
+  SeMakeSystemToken), ou aceita o token pelo SeIsTokenAssignableToProcess
+  (`se/token/assignable.rs`: integridade dominada e token filho ou irmão do
+  primário de quem chama). O svchost do DcomLaunch conecta ao `\PowerPort`
+  do kernel (`po/umpo_channel.rs`, o PopUmpoInitializeChannel do
+  PoInitSystem: um objeto Callback ligado à porta pelo NtAlpcSetInformation
+  9, chamado a cada mensagem posta na fila, aceita o primeiro cliente),
+  sobe o endpoint `umpo` e pede o NtPowerInformation de modo usuário
+  (`po/power_information.rs`: o PlatformInformation, o PlatformRole e o
+  PowerInformationInternal 4). As definições WNF desta máquina
+  (`Control\Notifications`), a ProductOptions e a ProfileList vêm do
+  xtask, e o NtGetCompleteWnfStateSubscription entrega ao modo usuário os
+  callbacks WNF (`ex/wnf/notifications.rs`). Ali para: o serviço Power
+  para e desconecta do `\PowerPort` (NtAlpcDisconnectPort), e o kernel trava
+  logo depois. O smss da
   sessão 1 cria o csrss e o winlogon.exe (o NtOpenSection relativo ao
   `\KnownDlls`, aberto pela tabela do Object Manager, e o powrprof.dll e o
   imm32.dll no volume); o NtUserInitialize do csrss da sessão 1 volta com
@@ -3121,17 +3137,18 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   Session Manager (lsm.dll, num svchost criado pelo services.exe) sinaliza
   quando sobe; depois o winsta chama o LSM pelo RPC `ncalrpc:[LSMApi]`. A
   outra thread (LaunchUmfdHostWithVirtualAccountThreadProc) espera o LSA
-  (WaitForLsa) antes de criar o fontdrvhost.exe. O vídeo físico da sessão 1
-  também vem do LSM: o dxgkrnl só tem sessão de console
-  (DXGSESSIONMGR::SetConsoleSession) depois do DxgkSessionConnected, que o
-  win32k chama só no xxxRemoteConnect, o NtUserRemoteConnect que o
-  W32WinStationDoConnect do csrss faz a pedido do LSM pela
-  `\SmSsWinStationApiPort` (a TerminalServerRequestThread do csrss espera o
-  TermSrvReadyEvent antes de conectar). Até lá o InitVideo da sessão 1 (com
-  o gProtocolType de console, 0) monta a configuração de exibição só com o
-  dispositivo desconectado (`\Device\Disc`, TSDDD, o stub sem imagem do
-  ldevLoadDriver): o cdd.dll não é carregado e o xxxSwitchDesktop pinta a
-  superfície desconectada. O lsm.dll cria a porta ALPC
+  (WaitForLsa) antes de criar o fontdrvhost.exe. O vídeo da sessão 1 não
+  espera o LSM: no 19041 o UserInitialize do win32kbase roda o InitVideo
+  da primeira sessão interativa dentro do NtUserInitialize. O InitVideo
+  abre o `\Device\Video0` do dxgkrnl, marca o dispositivo como WDDM (a
+  lista de drivers dele vira "cdd") e o DrvSetDisplayConfig pede ao dxgkrnl
+  os caminhos ativos (DxgkGetPathsModality) antes do hCreateHDEV, que
+  carrega o cdd.dll pelo ZwSetSystemInformation(26) (a linha `[gdi]` do
+  log). Nesse boot o cdd.dll ainda não é carregado: a sessão 1 fica só com
+  o dispositivo desconectado (`\Device\Disc`, TSDDD, o stub sem imagem do
+  ldevLoadDriver) e o xxxSwitchDesktop pinta a superfície desconectada. O
+  cdd.dll pede ao dxgkrnl um adaptador de renderização, que só o
+  BasicRender registra. O lsm.dll cria a porta ALPC
   `\SmSsWinStationApiPort` (o CCsrMgr, mensagens de 0x4070 bytes); o csrss
   de cada sessão cria o `Global\TermSrvReadyEvent`, o lsm o sinaliza, e o
   winsrvext.dll conecta à porta e manda um pedido síncrono cuja resposta é
@@ -3139,10 +3156,9 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   o NtUserRemoteConnect do win32kfull chama o xxxRemoteConnect do
   win32kbase, que no console só chama o GreDxgkSessionConnected (o
   InitVideo da sessão já rodou); o DxgkSessionConnected do dxgkrnl chama o
-  DXGSESSIONMGR::SetConsoleSession, avisa o TTM e enfileira o callout de
-  troca de tela, que volta ao win32k pelo SMgrGdiCallout do watchdog.sys
-  num work item; o win32k carrega então o cdd.dll pelo
-  ZwSetSystemInformation(26). O lsm exige o `Control\Terminal Server` e o
+  DXGSESSIONMGR::SetConsoleSession e avisa o TTM, sem carregar nada (o
+  callout de troca de tela só sai depois de uma mudança da política de
+  energia HDR). O lsm exige o `Control\Terminal Server` e o
   `WinStations` (copiados desta máquina pelo xtask), carrega o sysntfy.dll,
   o WMsgAPI.dll e o usermgrcli.dll, abre o `\KernelObjects\Session<id>` de
   cada sessão pelo NtOpenSession (`mm/session_object.rs`) e avisa as
