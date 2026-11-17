@@ -3720,6 +3720,16 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     `<link>\<referência>` chega ao PDO com a referência no FileName do
     IRP_MJ_CREATE, como no NT; o IoGetDeviceInterfaceAlias monta a irmã de
     outra classe pela instância, pelo GUID e pela referência;
+  - as notificações PnP (`io/pnp_notify.rs`): um registro de
+    EventCategoryTargetDeviceChange fica ligado ao PDO por trás do
+    FILE_OBJECT (IoGetRelatedTargetDevice, PDO retido até o
+    IoUnregisterPlugPlayNotification) e só recebe os eventos desse PDO, com
+    o FileObject dele na estrutura; um callback em espaço de sessão (o RIT
+    do win32k registra mouse, teclado e HID; o win32kfull, o CD-ROM) guarda
+    a sessão de quem registrou e o objeto Session dela, e cada entrega fora
+    dessa sessão (o work item do System, outra sessão) anexa a um processo
+    dela (MmGetSessionById, MmAttachSession) antes de chamar, como o
+    PnpNotifyDriverCallback;
   - as notificações de thread (`ps/notify/thread.rs`) têm os três pontos do
     PsSetCreateThreadNotifyRoutineEx: a criação no contexto de quem cria, a
     de rotinas não de sistema no contexto da thread de usuário nova e a saída;

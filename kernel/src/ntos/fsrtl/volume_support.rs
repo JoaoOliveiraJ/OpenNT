@@ -215,9 +215,9 @@ pub fn notify_volume_event_ex(file_object: &FileObject, code: u32, event: u64) -
             // SAFETY: a estrutura de notificação do file system (modo kernel).
             guest::write_bytes(unsafe { TargetDeviceCustomNotification::at(event) }.event.address(), guid);
             if synchronous {
-                crate::ntos::io::pnp_notify::report_target_device_change(event);
+                crate::ntos::io::pnp_notify::report_target_device_change(pdo, event);
             } else {
-                crate::ntos::io::pnp_notify::report_target_device_change_asynchronous(event, 0, 0);
+                crate::ntos::io::pnp_notify::report_target_device_change_asynchronous(pdo, event, 0, 0);
             }
             status
         }

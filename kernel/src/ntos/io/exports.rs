@@ -359,7 +359,7 @@ fn io_unregister_shutdown_notification(call: &Call) -> Result<u64, KernelError> 
 /// IoReportTargetDeviceChangeAsynchronous(PhysicalDeviceObject,
 /// NotificationStructure, Callback, Context).
 fn io_report_target_device_change_asynchronous(call: &Call) -> Result<u64, KernelError> {
-    pnp_notify::report_target_device_change_asynchronous(call.arg(2), call.arg(3), call.arg(4));
+    pnp_notify::report_target_device_change_asynchronous(call.arg(1), call.arg(2), call.arg(3), call.arg(4));
     Ok(0)
 }
 fn io_register_priority_callback(call: &Call) -> Result<u64, KernelError> {
