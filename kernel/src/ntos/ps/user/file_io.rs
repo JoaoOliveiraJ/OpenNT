@@ -946,24 +946,25 @@ fn nt_query_directory_file_ex(handle: u64, event: u64, apc: u64, _context: u64, 
     query_directory(handle, event, apc, rsp, true)
 }
 
-/// NtQueryVolumeInformationFile: arquivos pelo volume do arquivo. Handles
-/// de dispositivo (classe FileFsDevice) entram com `ps/user/files`.
+/// NtQueryVolumeInformationFile: arquivos pelo volume do arquivo; handles
+/// de dispositivo pelo I/O Manager (`io/file/irp_service`), que responde a
+/// FileFsDeviceInformation e manda as outras classes ao driver.
 fn nt_query_volume_information_file(handle: u64, iosb: u64, out: u64, length: u64, rsp: u64) -> Result<u32, KernelError> {
+    // Um arquivo de driver: o I/O Manager (`io/file/irp_service`).
+    if driver_file(handle) {
+        return Ok(irp_service::query_volume_information(handle, iosb, out, length as u32, state::stack_arg32(rsp, 5)));
+    }
     run(iosb, || {
-        let Some(entry) = state::get_user_handle(handle).filter(|entry| entry.kind() == "file" || entry.kind() == "device") else { return fail(HANDLE) };
+        if state::get_user_handle(handle).filter(|entry| entry.kind() == "file").is_none() {
+            return fail(HANDLE);
+        }
         let class = state::stack_arg32(rsp, 5);
         let Some(need) = crate::drivers::fs::volume_information::minimum(class) else { return fail(0xC000_0003) };
-        if entry.kind() == "device" && class != 4 {
-            return fail(0xC000_0010);
-        }
         if length < need as u64 {
             return fail(0xC000_0004);
         }
         if !state::probe_user_write(out, length) {
             return fail(AV);
-        }
-        if entry.kind() == "device" {
-            return fail(0xC000_0010);
         }
         let (_, user_file) = object(handle)?;
         let volume = user_file.file.volume().clone();

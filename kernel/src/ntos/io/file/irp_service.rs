@@ -1,7 +1,8 @@
 //! Os serviços de arquivo de modo usuário sobre um FILE_OBJECT aberto num
 //! driver: NtReadFile, NtWriteFile, NtFsControlFile e NtDeviceIoControlFile
-//! (o IopXxxControlFile), NtQueryInformationFile e NtSetInformationFile,
-//! montados como o I/O Manager do ntoskrnl 19041 os monta.
+//! (o IopXxxControlFile), NtQueryInformationFile, NtSetInformationFile e
+//! NtQueryVolumeInformationFile, montados como o I/O Manager do ntoskrnl
+//! 19041 os monta.
 //!
 //! - O handle de usuário dá o FILE_OBJECT e o acesso concedido (conferido
 //!   contra o que a operação exige). O IRP sai do StackSize do dispositivo
@@ -39,7 +40,8 @@
 //!   num arquivo síncrono, FilePositionInformation (consulta e mudança) e
 //!   FileModeInformation (mudança); a FileCompletionInformation e a
 //!   FileIoCompletionNotificationInformation (a porta de conclusão do
-//!   arquivo e os modos FO_SKIP_*, `io/completion/file_port.rs`).
+//!   arquivo e os modos FO_SKIP_*, `io/completion/file_port.rs`); de volume,
+//!   a FileFsDeviceInformation e a FileFsDriverPathInformation.
 //! - A conclusão de um arquivo com porta e com ApcContext (o
 //!   UserApcContext do IRP) põe o pacote na IOCP; sem UserEvent, o
 //!   FO_SKIP_SET_EVENT deixa o evento do arquivo como está.
@@ -894,6 +896,194 @@ pub fn query_information(handle: u64, io_status: u64, buffer: u64, length: u32, 
     let parameters = &top_location(packet).parameters.query_file;
     parameters.length.set(length);
     parameters.file_information_class.set(crate::ntos::inc::types::FileInformationClass(class as i32));
+    track(packet, &target, None, local, 0);
+    information_tail(&target, packet, local, io_status)
+}
+
+/// IopQueryFsOperationLength, o alinhamento do ProbeForWrite e
+/// IopQueryFsOperationAccess do ntoskrnl 19041, por FS_INFORMATION_CLASS
+/// (0 = classe que não se consulta).
+const FS_QUERY_MINIMUM: [u8; 15] = [0, 24, 0, 24, 8, 16, 48, 32, 64, 12, 4, 28, 4, 16, 96];
+const FS_QUERY_ALIGNMENT: [u8; 15] = [0, 8, 4, 8, 4, 4, 8, 8, 8, 8, 4, 4, 4, 8, 8];
+const FS_QUERY_ACCESS: [u32; 15] = [0, 0, 0, 0, 0, 0, 0x1, 0, 0, 0, 0x80, 0, 0, 0, 0];
+/// FileFsDeviceInformation e FileFsDriverPathInformation.
+const FILE_FS_DEVICE_INFORMATION: u32 = 4;
+const FILE_FS_DRIVER_PATH_INFORMATION: u32 = 9;
+/// FO_DIRECT_DEVICE_OPEN, FILE_DEVICE_NETWORK_FILE_SYSTEM,
+/// FILE_DEVICE_IS_MOUNTED e VPB_MOUNTED.
+const FO_DIRECT_DEVICE_OPEN: u32 = 0x800;
+const FILE_DEVICE_NETWORK_FILE_SYSTEM: u32 = 0x14;
+const FILE_DEVICE_IS_MOUNTED: u32 = 0x20;
+const VPB_MOUNTED: u16 = 0x1;
+const IRP_MJ_QUERY_VOLUME_INFORMATION: u8 = 0x0A;
+
+/// IopGetMountFlag: o VPB do dispositivo está montado (lido sob a trava
+/// dos VPBs).
+fn mount_flag(device: &DeviceObject) -> bool {
+    crate::ntos::io::volume_parameters::with_lock(|| {
+        let vpb = device.vpb.get();
+        // SAFETY: o VPB do dispositivo, estável sob a trava dos VPBs.
+        Ok(vpb != 0 && unsafe { crate::ntos::inc::types::Vpb::at(vpb) }.flags.get() & VPB_MOUNTED != 0)
+    })
+    .unwrap_or(false)
+}
+
+/// IopVerifyDriverObjectOnStack: o driver está na pilha do dispositivo,
+/// da base (IopGetDeviceAttachmentBase, pelo AttachedTo das extensões) ao
+/// topo (AttachedDevice).
+fn driver_on_stack(device: u64, driver: u64) -> bool {
+    let mut base = device;
+    loop {
+        let extension = device_at(base).device_object_extension.get();
+        // SAFETY: a DEVOBJ_EXTENSION de um dispositivo vivo da pilha.
+        let below = if extension != 0 { unsafe { crate::ntos::inc::types::DevobjExtension::at(extension) }.attached_to.get() } else { 0 };
+        if below == 0 {
+            break;
+        }
+        base = below;
+    }
+    let mut current = base;
+    while current != 0 {
+        if device_at(current).driver_object.get() == driver {
+            return true;
+        }
+        current = device_at(current).attached_device.get();
+    }
+    false
+}
+
+/// FileFsDriverPathInformation (o IopGetDriverPathInformation): o buffer
+/// capturado traz o DriverNameLength (+4) e o nome (+8), que precisa caber
+/// nele (senão STATUS_INVALID_PARAMETER); o DRIVER_OBJECT vem pelo nome
+/// (ObReferenceObjectByName com OBJ_CASE_INSENSITIVE e IoDriverObjectType,
+/// em KernelMode) e o DriverInPath diz se ele está na pilha do volume
+/// montado (Vpb->DeviceObject) ou, senão, na do dispositivo do arquivo.
+fn driver_path_information(file: u64, captured: &[u8]) -> Result<bool, u32> {
+    let name_length = u32::from_le_bytes(captured[4..8].try_into().unwrap_or([0; 4]));
+    if (captured.len() as u32).wrapping_sub(8) < name_length {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    // Moldura própria: a UNICODE_STRING, a célula do objeto e o nome.
+    let frame = guest::alloc_bytes(crate::ntos::inc::types::UnicodeString::SIZE + 8 + name_length as u64);
+    if frame == 0 {
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    }
+    let output = frame + crate::ntos::inc::types::UnicodeString::SIZE;
+    let text = output + 8;
+    guest::write_bytes(text, &captured[8..8 + name_length as usize]);
+    crate::ntos::rtl::guest_strings::write_string_fields(frame, name_length as u16, name_length as u16, text);
+    guest::write64(output, 0);
+    let status = crate::ntos::ob::object_reference::reference_by_name(frame, 0x40, 0, crate::ntos::ob::object_types::driver_type().pointer, KERNEL_MODE, output).map(|status| status as u32).unwrap_or(STATUS_INSUFFICIENT_RESOURCES);
+    let driver = guest::read64(output);
+    guest::free_bytes(frame);
+    if status & 0x8000_0000 != 0 {
+        return Err(status);
+    }
+    let object = file_at(file);
+    let vpb = object.vpb.get();
+    // SAFETY: o VPB de um arquivo aberto, retido pelo arquivo.
+    let volume = if vpb != 0 { unsafe { crate::ntos::inc::types::Vpb::at(vpb) }.device_object.get() } else { 0 };
+    let found = (volume != 0 && driver_on_stack(volume, driver)) || driver_on_stack(object.device_object.get(), driver);
+    let _ = crate::ntos::ob::object_reference::dereference_with_tag(driver, crate::ntos::ob::reference_trace::DEFAULT_TAG, false);
+    Ok(found)
+}
+
+/// NtQueryVolumeInformationFile de modo usuário num arquivo de driver
+/// (ntoskrnl 19041, rva 0x6c9680): a classe e o tamanho mínimo pelas
+/// tabelas do I/O Manager, o IO_STATUS_BLOCK e o buffer sondados para
+/// escrita (alinhamento da classe), o arquivo referenciado com o acesso que
+/// a classe pede. Num FILE_OBJECT aberto direto no dispositivo
+/// (FO_DIRECT_DEVICE_OPEN) só a FileFsDeviceInformation vale, as outras
+/// dão STATUS_INVALID_DEVICE_REQUEST. O próprio I/O Manager responde a
+/// FileFsDeviceInformation (menos num arquivo de redirecionador de rede
+/// aberto pelo file system): o DeviceType e o Characteristics do
+/// FileObject->DeviceObject, com FILE_DEVICE_IS_MOUNTED quando o VPB dele
+/// está montado, e IoStatus {0, 8}; e a FileFsDriverPathInformation. As
+/// demais vão ao driver em IRP_MJ_QUERY_VOLUME_INFORMATION (buffered, com o
+/// SystemBuffer zerado), pela mesma cauda do NtQueryInformationFile.
+pub fn query_volume_information(handle: u64, io_status: u64, buffer: u64, length: u32, class: u32) -> u32 {
+    let index = class as usize;
+    let minimum = FS_QUERY_MINIMUM.get(index).copied().unwrap_or(0) as u32;
+    if minimum == 0 {
+        return STATUS_INVALID_INFO_CLASS;
+    }
+    if length < minimum {
+        return STATUS_INFO_LENGTH_MISMATCH;
+    }
+    if !probe(io_status, 4, true) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    if buffer & (FS_QUERY_ALIGNMENT[index] as u64 - 1) != 0 {
+        return STATUS_DATATYPE_MISALIGNMENT;
+    }
+    if !probe(buffer, length as u64, true) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    let target = match reference(handle) {
+        Ok(target) => target,
+        Err(status) => return status,
+    };
+    let required = FS_QUERY_ACCESS[index];
+    if required != 0 && target.access & required != required {
+        return conclude(&target, false, None, STATUS_ACCESS_DENIED);
+    }
+    let file = file_at(target.file);
+    let direct = target.flags & FO_DIRECT_DEVICE_OPEN != 0;
+    if direct && class != FILE_FS_DEVICE_INFORMATION {
+        return conclude(&target, false, None, STATUS_INVALID_DEVICE_REQUEST);
+    }
+    let device = device_at(file.device_object.get());
+    if class == FILE_FS_DEVICE_INFORMATION && (direct || device.device_type.get() != FILE_DEVICE_NETWORK_FILE_SYSTEM) {
+        let characteristics = device.characteristics.get() | if mount_flag(device) { FILE_DEVICE_IS_MOUNTED } else { 0 };
+        let written = guest::try_write::<u32>(buffer, device.device_type.get()).and_then(|()| guest::try_write::<u32>(buffer + 4, characteristics));
+        let status = if written.is_err() || write_user_iosb(io_status, STATUS_SUCCESS, 8).is_err() { STATUS_ACCESS_VIOLATION } else { STATUS_SUCCESS };
+        return conclude(&target, false, None, status);
+    }
+    let synchronous = target.synchronous();
+    if synchronous && information::acquire_file(target.file).is_err() {
+        return conclude(&target, false, None, STATUS_INSUFFICIENT_RESOURCES);
+    }
+    if class == FILE_FS_DRIVER_PATH_INFORMATION {
+        let status = match guest::try_read_bytes(buffer, length as usize) {
+            Err(_) => STATUS_ACCESS_VIOLATION,
+            Ok(captured) => match driver_path_information(target.file, &captured) {
+                Err(status) => status,
+                Ok(found) => {
+                    if guest::try_write::<u8>(buffer, found as u8).is_err() || write_user_iosb(io_status, STATUS_SUCCESS, 0xC).is_err() {
+                        STATUS_ACCESS_VIOLATION
+                    } else {
+                        STATUS_SUCCESS
+                    }
+                }
+            },
+        };
+        return conclude(&target, synchronous, None, status);
+    }
+    let local = if synchronous { 0 } else { allocate_local() };
+    let system = guest::alloc_bytes(length as u64);
+    if system == 0 || (!synchronous && local == 0) {
+        for block in [system, local] {
+            if block != 0 {
+                guest::free_bytes(block);
+            }
+        }
+        return conclude(&target, synchronous, None, STATUS_INSUFFICIENT_RESOURCES);
+    }
+    guest::write_bytes(system, &alloc::vec![0u8; length as usize]);
+    dispatcher::clear_event(file.event.address());
+    let flags = IRP_BUFFERED_IO | IRP_DEALLOCATE_BUFFER | IRP_INPUT_OPERATION | IRP_DEFER_IO_COMPLETION | if local != 0 { IRP_SYNCHRONOUS_API } else { 0 };
+    let (user_event, user_iosb) = if local != 0 { (local, local_iosb(local).address()) } else { (0, io_status) };
+    let packet = allocate(&target, BuildOptions { major: IRP_MJ_QUERY_VOLUME_INFORMATION, buffer: system, user_event, user_iosb, user_buffer: buffer, ..BuildOptions::default() }, flags);
+    if packet == 0 {
+        let _ = pool_allocation::free(system, 0);
+        if local != 0 {
+            guest::free_bytes(local);
+        }
+        return conclude(&target, synchronous, None, STATUS_INSUFFICIENT_RESOURCES);
+    }
+    let parameters = &top_location(packet).parameters.query_volume;
+    parameters.length.set(length);
+    parameters.fs_information_class.set(crate::ntos::inc::types::Fsinfoclass(class as i32));
     track(packet, &target, None, local, 0);
     information_tail(&target, packet, local, io_status)
 }
