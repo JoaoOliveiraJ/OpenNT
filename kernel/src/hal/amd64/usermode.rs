@@ -1201,6 +1201,9 @@ pub extern "C" fn opennt_user_syscall(frame: *mut u64) -> u64 {
     }
     system_services::note_user_target(number, target);
     if target != 0 {
+        // O lote GDI da TEB antes de um serviço da tabela 1, como o
+        // KiSystemServiceGdiTebAccess.
+        crate::ntos::ps::win32::flush_gdi_batch_for_service(number);
         let mut packet = [0u64; 19];
         unsafe {
             packet[0] = *frame.add(7);

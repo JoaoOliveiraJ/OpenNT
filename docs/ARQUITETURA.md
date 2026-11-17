@@ -976,7 +976,11 @@ roda callbacks simples, aninhados, a volta pelo NtCallbackReturn do
 KiUserCallbackDispatcher real, a entrada que não cabe na pilha, o
 NtCallbackReturn fora de um callback e um callback que espera no kernel e
 numa espera adiada, conferindo que o despachante sonda as duas com a thread
-fora da CPU.
+fora da CPU. O lote GDI da TEB (TEB.GdiBatchCount) vai ao win32k pelo
+callout 7 (`ps/win32.rs::flush_gdi_batch`) na volta de cada callback e,
+como no KiSystemServiceGdiTebAccess, antes de todo serviço da tabela 1:
+`opennt_user_syscall` o esvazia depois da busca na tabela (e da conversão em
+thread GUI) e antes de copiar os argumentos.
 
 O espaço de usuário segue o Windows 10 19041 x64, sem nenhuma janela fixa
 além da KUSER_SHARED_DATA:

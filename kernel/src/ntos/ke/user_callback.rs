@@ -49,7 +49,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use crate::hal::amd64::usermode;
 use crate::ntos::inc::field::{Field, NtStruct, Reserved};
 use crate::ntos::inc::types::extra_fs_fat::KernelStackControl;
-use crate::ntos::inc::types::{Context, Kthread, Teb};
+use crate::ntos::inc::types::{Context, Kthread};
 use crate::ntos::ke::{bugcheck, context_switch, irql};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::{kernel_stack, memory_map};
@@ -71,8 +71,6 @@ const INVALID_CALLBACK_STACK_ADDRESS: u32 = 0x1CD;
 const CALLOUT_ACTIVE: u32 = 0x1000;
 /// Aninhamento máximo de callbacks (o `cmp al, 1Fh` do NT).
 const MAXIMUM_NESTING: u8 = 0x1F;
-/// O callout do win32k que esvazia o lote GDI da TEB.
-const GDI_BATCH_FLUSH_CALLOUT: i32 = 7;
 /// O que o flush do lote desce do RSP do usuário enquanto roda.
 const GDI_BATCH_STACK: u64 = 0x100;
 /// Seletores e RFLAGS do anel 3.
@@ -315,7 +313,7 @@ pub fn user_mode_callback(api_number: u32, input: u64, input_length: u32, output
     // A volta do NtCallbackReturn: a pilha anterior.
     stacks.install(stacks.outer);
     let status = if exit == 0 { frame_cells.status.get() } else { exit };
-    flush_gdi_batch(pointer, syscall);
+    flush_gdi_batch(syscall);
     guest::free_bytes(callout);
     guest::free_bytes(callback_context);
     Ok(release(thread, Some(stack), status))
@@ -323,20 +321,13 @@ pub fn user_mode_callback(api_number: u32, input: u64, input_length: u32, output
 
 /// O lote GDI que o callback deixou na TEB: o callout do win32k o esvazia,
 /// com o RSP do usuário 0x100 abaixo enquanto roda.
-fn flush_gdi_batch(pointer: u64, syscall: &Context) {
-    // SAFETY: a KTHREAD corrente está viva enquanto executa.
-    let teb = unsafe { Kthread::at(pointer) }.teb.get();
-    if teb == 0 {
-        return;
-    }
-    // SAFETY: a TEB da thread corrente; a leitura é sondada.
-    let pending = unsafe { Teb::at(teb) }.gdi_batch_count.probe_get().unwrap_or(0);
-    if pending == 0 {
+fn flush_gdi_batch(syscall: &Context) {
+    if !win32::gdi_batch_pending() {
         return;
     }
     let rsp = syscall.rsp.get();
     syscall.rsp.set(rsp - GDI_BATCH_STACK);
-    let _ = win32::invoke_callout(GDI_BATCH_FLUSH_CALLOUT, 0);
+    win32::flush_gdi_batch();
     syscall.rsp.set(rsp);
 }
 

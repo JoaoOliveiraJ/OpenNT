@@ -108,6 +108,40 @@ pub fn invoke_callout(callout_type: i32, parameter: u64) -> u32 {
     }
 }
 
+/// O callout do win32k que esvazia o lote GDI da TEB.
+const GDI_BATCH_FLUSH_CALLOUT: i32 = 7;
+
+/// A TEB da thread corrente (KTHREAD.Teb) tem lote GDI pendente
+/// (TEB.GdiBatchCount). A leitura é sondada: uma TEB inacessível conta como
+/// vazia, como o handler de exceção do KiSystemServiceGdiTebAccess.
+pub fn gdi_batch_pending() -> bool {
+    let Some(thread) = current_thread() else { return false };
+    let teb = thread.tcb.teb.get();
+    // SAFETY: a TEB da thread corrente; a leitura é sondada.
+    teb != 0 && unsafe { crate::ntos::inc::types::Teb::at(teb) }.gdi_batch_count.probe_get().unwrap_or(0) != 0
+}
+
+/// O lote GDI pendente da thread corrente vai ao win32k:
+/// PsInvokeWin32Callout(7, NULL). O status é ignorado, como no NT.
+pub fn flush_gdi_batch() {
+    if gdi_batch_pending() {
+        let _ = invoke_callout(GDI_BATCH_FLUSH_CALLOUT, 0);
+    }
+}
+
+/// O KiSystemServiceGdiTebAccess do KiSystemServiceRepeat (ntoskrnl 19041
+/// 0x4113cb): depois da busca na tabela e antes de copiar os argumentos,
+/// todo serviço da tabela 1 (o do win32k, número com o bit 0x1000) esvazia
+/// antes o lote GDI da TEB, para que as operações em lote (PatBlt,
+/// ExtTextOut, SelectObject...) rodem antes do serviço que vem depois delas
+/// (um EndPaint, um ReleaseDC). Vale para qualquer thread que chegou a um
+/// serviço da tabela 1, já convertida em GUI ou recém-convertida.
+pub fn flush_gdi_batch_for_service(service_number: u64) {
+    if service_number & 0x1000 != 0 {
+        flush_gdi_batch();
+    }
+}
+
 /// PsInvokeWin32Callout(CalloutType, Parameter, 1, &SessionId), o modo das
 /// rotinas dos tipos Win32 (ExpWin32*Procedure): no processo corrente quando
 /// ele está numa sessão (Flags.ProcessInSession) de mesmo id; senão o
