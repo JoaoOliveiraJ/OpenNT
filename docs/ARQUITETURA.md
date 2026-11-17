@@ -3687,6 +3687,13 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   (`--no-build --image-dir=build/test-all/imagem-<n> --accel=<acelerador>`).
   O `test-boot.log` de cada execução diz quando cada saída esperada chegou,
   contado da subida do QEMU (`[xtask] "PHASE4_SELFTEST_OK" aos 12.3 s`).
+  Um build ou um QEMU morto de fora (o rustc e os QEMUs fechados à mão
+  quando o PC fica lento) roda de novo depois de 30 s, até 40 vezes: o
+  build que falhou no cargo sem diagnóstico (`report::build_killed`) e a
+  execução cujo QEMU saiu com erro, sem evento SHUTDOWN, antes da saída
+  esperada e sem marcador de falha na serial (`report::qemu_killed`; o
+  test-boot dá o motivo "QEMU encerrado de fora"). Erros de compilação,
+  falhas de teste, prazos esgotados e STOPs nunca se repetem.
 - **Acelerador**: o `test-boot` usa `--accel=auto` por padrão: o WHPX (a
   virtualização do processador pelo Windows Hypervisor Platform) quando o
   QEMU o lista no `-accel help` e a partição sobe nesta máquina, senão o
