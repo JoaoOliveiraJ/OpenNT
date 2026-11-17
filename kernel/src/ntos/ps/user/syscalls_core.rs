@@ -661,11 +661,12 @@ fn nt_query_information_process(handle: u64, class: u64, buffer: u64, length: u6
             })
         });
     }
-    // ProcessTimes, ProcessImageFileNameWin32 e ProcessMitigationPolicy
+    // ProcessQuotaLimits, ProcessVmCounters, ProcessTimes,
+    // ProcessImageFileNameWin32 e ProcessMitigationPolicy
     // (`ps/query_process`): o ProbeForWrite de alinhamento 4 só pela faixa e
     // o ReturnLength sondado antes da classe.
     use crate::ntos::ps::query_process;
-    if matches!(class, query_process::PROCESS_TIMES | query_process::PROCESS_IMAGE_FILE_NAME_WIN32 | query_process::PROCESS_MITIGATION_POLICY) {
+    if matches!(class, query_process::PROCESS_QUOTA_LIMITS | query_process::PROCESS_VM_COUNTERS | query_process::PROCESS_TIMES | query_process::PROCESS_IMAGE_FILE_NAME_WIN32 | query_process::PROCESS_MITIGATION_POLICY) {
         if length != 0 {
             if buffer & 3 != 0 {
                 return Ok(0x8000_0002);
@@ -686,6 +687,8 @@ fn nt_query_information_process(handle: u64, class: u64, buffer: u64, length: u6
             }
         };
         return state::guarded(|| match class {
+            query_process::PROCESS_QUOTA_LIMITS => query_process::query_quota_limits(buffer, length as u32, returned, process_of),
+            query_process::PROCESS_VM_COUNTERS => query_process::query_vm_counters(buffer, length as u32, returned, process_of),
             query_process::PROCESS_TIMES => query_process::query_times(buffer, length as u32, returned, process_of),
             query_process::PROCESS_IMAGE_FILE_NAME_WIN32 => query_process::query_image_file_name_win32(buffer, length as u32, returned, process_of),
             _ => query_process::query_mitigation_policy(buffer, length as u32, process_of),

@@ -51,6 +51,7 @@ pub const SYSTEM_KERNEL_DEBUGGER_INFORMATION: u32 = 35;
 pub const SYSTEM_RECOMMENDED_SHARED_DATA_ALIGNMENT: u32 = 58;
 pub const SYSTEM_OBJECT_SECURITY_MODE: u32 = 70;
 pub const SYSTEM_ISOLATED_USER_MODE_INFORMATION: u32 = 165;
+pub const SYSTEM_MEMORY_USAGE_INFORMATION: u32 = 182;
 pub const SYSTEM_PHYSICAL_MEMORY_INFORMATION: u32 = 184;
 pub const SYSTEM_FLUSH_INFORMATION: u32 = 192;
 pub const SYSTEM_WRITE_CONSTRAINT_INFORMATION: u32 = 195;
@@ -96,7 +97,7 @@ pub fn flush_information() -> Vec<u8> {
 /// A classe é uma das de `query_fixed` com o buffer sondado com alinhamento
 /// 4 (a SystemKernelDebuggerInformation sonda com alinhamento 1).
 pub fn is_fixed_class(class: u32) -> bool {
-    matches!(class, SYSTEM_FLAGS_INFORMATION | SYSTEM_RECOMMENDED_SHARED_DATA_ALIGNMENT | SYSTEM_OBJECT_SECURITY_MODE | SYSTEM_ISOLATED_USER_MODE_INFORMATION | SYSTEM_PHYSICAL_MEMORY_INFORMATION | SYSTEM_FLUSH_INFORMATION | SYSTEM_WRITE_CONSTRAINT_INFORMATION | SYSTEM_HYPERVISOR_SHARED_PAGE_INFORMATION)
+    matches!(class, SYSTEM_FLAGS_INFORMATION | SYSTEM_RECOMMENDED_SHARED_DATA_ALIGNMENT | SYSTEM_OBJECT_SECURITY_MODE | SYSTEM_ISOLATED_USER_MODE_INFORMATION | SYSTEM_MEMORY_USAGE_INFORMATION | SYSTEM_PHYSICAL_MEMORY_INFORMATION | SYSTEM_FLUSH_INFORMATION | SYSTEM_WRITE_CONSTRAINT_INFORMATION | SYSTEM_HYPERVISOR_SHARED_PAGE_INFORMATION)
 }
 
 /// Classes de tamanho fixo do ExpQuerySystemInformation 19041, com o buffer
@@ -123,6 +124,8 @@ pub fn is_fixed_class(class: u32) -> bool {
 ///   bytes; sem o kernel seguro (VslIsSecureKernelRunning) e sem a proteção
 ///   de páginas do firmware (ExpFirmwarePageProtectionSupported, de uma
 ///   tabela do UEFI que o boot do OpenNT não tem), tudo zero.
+/// - SystemMemoryUsageInformation (182, rva 0x6ca289): exatamente 0x38
+///   bytes, o `mm/memory_information::memory_usage_information`.
 /// - SystemFlushInformation (192, rva 0x6cc82d): pelo menos 0x20 bytes, o
 ///   [`flush_information`].
 /// - SystemWriteConstraintInformation (195, rva 0x6ccdc6): pelo menos 8
@@ -152,6 +155,10 @@ pub fn query_fixed(class: u32, output: u64, length: u32) -> Option<Result<(u32, 
         },
         SYSTEM_OBJECT_SECURITY_MODE => (4, true, object_security_mode().to_le_bytes().to_vec()),
         SYSTEM_ISOLATED_USER_MODE_INFORMATION => (0x10, true, alloc::vec![0u8; 0x10]),
+        SYSTEM_MEMORY_USAGE_INFORMATION => match crate::ntos::mm::memory_information::memory_usage_information() {
+            Ok(data) => (0x38, true, data),
+            Err(error) => return Some(Err(error)),
+        },
         SYSTEM_FLUSH_INFORMATION => (0x20, false, flush_information()),
         SYSTEM_WRITE_CONSTRAINT_INFORMATION => (8, false, alloc::vec![0u8; 8]),
         SYSTEM_HYPERVISOR_SHARED_PAGE_INFORMATION => (8, false, crate::ntos::mm::shared_user_data::hypervisor_shared_user_va().to_le_bytes().to_vec()),

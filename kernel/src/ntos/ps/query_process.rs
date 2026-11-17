@@ -392,13 +392,15 @@ pub fn query_command_line(process: &Eprocess, output: u64, buffer_length: u32, a
 
 // ---- Classes de modo usuário do NtQueryInformationProcess -----------------
 //
-// As três abaixo recebem o buffer e o ReturnLength já sondados pelo
+// As classes abaixo recebem o buffer e o ReturnLength já sondados pelo
 // adaptador de modo usuário (o ProbeForWrite de alinhamento 4 e a faixa) e
 // gravam com escrita sondada; `process_of` resolve o handle com o acesso
 // pedido para o EPROCESS, retido enquanto dura a chamada.
 
-/// ProcessTimes (4), ProcessImageFileNameWin32 (43) e
-/// ProcessMitigationPolicy (52).
+/// ProcessQuotaLimits (1), ProcessVmCounters (3), ProcessTimes (4),
+/// ProcessImageFileNameWin32 (43) e ProcessMitigationPolicy (52).
+pub const PROCESS_QUOTA_LIMITS: u32 = 1;
+pub const PROCESS_VM_COUNTERS: u32 = 3;
 pub const PROCESS_TIMES: u32 = 4;
 pub const PROCESS_IMAGE_FILE_NAME_WIN32: u32 = 43;
 pub const PROCESS_MITIGATION_POLICY: u32 = 52;
@@ -428,6 +430,128 @@ pub fn query_times(output: u64, length: u32, returned: u64, process_of: impl FnO
     }
     if returned != 0 {
         guest::try_write::<u32>(returned, 0x20)?;
+    }
+    Ok(0)
+}
+
+/// Monta `T` numa moldura própria zerada (a estrutura local do serviço) e
+/// copia os primeiros `length` bytes para a saída do chamador (o memmove do
+/// NT, dentro do __try).
+fn copy_out<T: NtStruct + 'static>(output: u64, length: u32, fill: impl FnOnce(&T)) -> Result<Result<(), u32>, KernelError> {
+    let scratch = guest::alloc_bytes(T::SIZE);
+    if scratch == 0 {
+        return Ok(Err(STATUS_INSUFFICIENT_RESOURCES));
+    }
+    guest::write_bytes(scratch, &alloc::vec![0u8; T::SIZE as usize]);
+    // SAFETY: a moldura própria recém-alocada, com o tamanho de `T`.
+    fill(unsafe { T::at(scratch) });
+    let bytes = guest::read_bytes(scratch, (length as u64).min(T::SIZE) as usize);
+    guest::free_bytes(scratch);
+    guest::try_write_bytes(output, &bytes)?;
+    Ok(Ok(()))
+}
+
+/// QUOTA_LIMITS_HARDWS_MIN_ENABLE/MIN_DISABLE/MAX_ENABLE/MAX_DISABLE.
+const QUOTA_LIMITS_HARDWS_MIN_ENABLE: u32 = 1;
+const QUOTA_LIMITS_HARDWS_MIN_DISABLE: u32 = 2;
+const QUOTA_LIMITS_HARDWS_MAX_ENABLE: u32 = 4;
+const QUOTA_LIMITS_HARDWS_MAX_DISABLE: u32 = 8;
+
+/// ProcessQuotaLimits (o PspQueryQuotaLimits do ntoskrnl 19041, rva
+/// 0x62069c): exatamente os 0x30 bytes do QUOTA_LIMITS ou os 0x58 do
+/// QUOTA_LIMITS_EX (outro tamanho dá STATUS_INFO_LENGTH_MISMATCH antes do
+/// handle), o handle com PROCESS_QUERY_LIMITED_INFORMATION. Os limites de
+/// pool são os do processo (`ps/pool_quota`, SIZE_T máximo sem limite
+/// configurado); o OpenNT não impõe cota de arquivo de paginação nem de
+/// working set (o bloco de cotas padrão do NT, ilimitado: SIZE_T máximo);
+/// TimeLimit é -1; o mínimo e o máximo do working set vêm do
+/// MmQueryWorkingSetInformation (`mm/process_usage`), e no EX as flags
+/// HARDWS deles (MIN_ENABLE com o mínimo rígido, senão MIN_DISABLE;
+/// MAX_ENABLE com o máximo rígido, senão MAX_DISABLE) e CpuRateLimit 0.
+/// Copia `length` bytes e o ReturnLength recebe `length`.
+pub fn query_quota_limits(output: u64, length: u32, returned: u64, process_of: impl FnOnce(u32) -> Result<u64, u32>) -> Result<u32, KernelError> {
+    use crate::ntos::inc::types::extra_ps_user::QuotaLimitsEx;
+    use crate::ntos::mm::process_usage;
+    if length != 0x30 && length as u64 != QuotaLimitsEx::SIZE {
+        return Ok(STATUS_INFO_LENGTH_MISMATCH);
+    }
+    let process = match process_of(PROCESS_QUERY_LIMITED_INFORMATION) {
+        Ok(process) => process,
+        Err(status) => return Ok(status),
+    };
+    let pools = super::pool_quota::snapshot(process).map(|[non_paged, paged]| (non_paged.limit, paged.limit)).unwrap_or((u64::MAX, u64::MAX));
+    let working_set = process_usage::query_working_set(process);
+    let minimum = if working_set.flags & process_usage::WORKING_SET_MINIMUM_HARD != 0 { QUOTA_LIMITS_HARDWS_MIN_ENABLE } else { QUOTA_LIMITS_HARDWS_MIN_DISABLE };
+    let maximum = if working_set.flags & process_usage::WORKING_SET_MAXIMUM_HARD != 0 { QUOTA_LIMITS_HARDWS_MAX_ENABLE } else { QUOTA_LIMITS_HARDWS_MAX_DISABLE };
+    let copied = copy_out::<QuotaLimitsEx>(output, length, |limits| {
+        limits.paged_pool_limit.set(pools.1);
+        limits.non_paged_pool_limit.set(pools.0);
+        limits.minimum_working_set_size.set(working_set.minimum);
+        limits.maximum_working_set_size.set(working_set.maximum);
+        limits.pagefile_limit.set(u64::MAX);
+        limits.time_limit.set(-1);
+        limits.working_set_limit.set(u64::MAX);
+        limits.flags.set(minimum | maximum);
+        limits.cpu_rate_limit.set(0);
+    })?;
+    if let Err(status) = copied {
+        return Ok(status);
+    }
+    if returned != 0 {
+        guest::try_write::<u32>(returned, length)?;
+    }
+    Ok(0)
+}
+
+/// ProcessVmCounters (o ramo da classe 3 do NtQueryInformationProcess
+/// 19041, rva 0x622077): os 0x58 bytes do VM_COUNTERS, os 0x60 do
+/// VM_COUNTERS_EX ou os 0x70 do VM_COUNTERS_EX2 (outro tamanho dá
+/// STATUS_INFO_LENGTH_MISMATCH antes do handle), o handle com
+/// PROCESS_QUERY_LIMITED_INFORMATION. PeakVirtualSize e VirtualSize do VAD
+/// e PageFaultCount do Vm (`mm/process_usage`); o working set (pico, atual e
+/// privado) do MmQueryWorkingSetInformation; as cotas de pool paginável e
+/// não paginável do PsQueryProcessQuotaCounters (`ps/pool_quota`);
+/// PagefileUsage e PrivateUsage o CommitCharge, PeakPagefileUsage o
+/// CommitChargePeak e SharedCommitUsage o SharedCommitCharge, em bytes.
+/// Copia `length` bytes e o ReturnLength recebe `length`.
+pub fn query_vm_counters(output: u64, length: u32, returned: u64, process_of: impl FnOnce(u32) -> Result<u64, u32>) -> Result<u32, KernelError> {
+    use crate::ntos::inc::types::extra_ps_user::VmCountersEx2;
+    use crate::ntos::mm::process_usage;
+    if length.wrapping_sub(0x58) & !0x18 != 0 || length == 0x68 {
+        return Ok(STATUS_INFO_LENGTH_MISMATCH);
+    }
+    let process = match process_of(PROCESS_QUERY_LIMITED_INFORMATION) {
+        Ok(process) => process,
+        Err(status) => return Ok(status),
+    };
+    // SAFETY: EPROCESS retido pelo handle que o nomeou (ou o corrente).
+    let eprocess = unsafe { Eprocess::at(process) };
+    let (peak_virtual, virtual_size) = process_usage::virtual_size(process);
+    let working_set = process_usage::query_working_set(process);
+    let pools = super::pool_quota::snapshot(process).ok();
+    let copied = copy_out::<VmCountersEx2>(output, length, |counters| {
+        counters.peak_virtual_size.set(peak_virtual);
+        counters.virtual_size.set(virtual_size);
+        counters.page_fault_count.set(eprocess.vm.instance.page_fault_count.get());
+        counters.peak_working_set_size.set(working_set.peak);
+        counters.working_set_size.set(working_set.current);
+        if let Some([non_paged, paged]) = pools {
+            counters.quota_peak_paged_pool_usage.set(paged.peak);
+            counters.quota_paged_pool_usage.set(paged.usage);
+            counters.quota_peak_non_paged_pool_usage.set(non_paged.peak);
+            counters.quota_non_paged_pool_usage.set(non_paged.usage);
+        }
+        counters.pagefile_usage.set(eprocess.commit_charge.get() << 12);
+        counters.peak_pagefile_usage.set(eprocess.commit_charge_peak.get() << 12);
+        counters.private_usage.set(eprocess.commit_charge.get() << 12);
+        counters.private_working_set_size.set(working_set.private);
+        counters.shared_commit_usage.set(eprocess.shared_commit_charge.get() << 12);
+    })?;
+    if let Err(status) = copied {
+        return Ok(status);
+    }
+    if returned != 0 {
+        guest::try_write::<u32>(returned, length)?;
     }
     Ok(0)
 }

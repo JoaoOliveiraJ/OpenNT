@@ -32,6 +32,7 @@ pub mod physical_layout;
 pub mod pool_lock;
 pub mod process_address_space;
 pub mod process_commit;
+pub mod process_usage;
 pub mod commit;
 pub mod paging_file;
 pub mod working_set;

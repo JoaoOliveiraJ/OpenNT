@@ -245,3 +245,107 @@ const _: () = {
     assert!(core::mem::offset_of!(SystemBatteryState, default_alert1) == 0x18);
     assert!(core::mem::offset_of!(SystemBatteryState, default_alert2) == 0x1C);
 };
+
+/// `_QUOTA_LIMITS_EX` (NtQueryInformationProcess (ProcessQuotaLimits, classe
+/// 1); 0x58 bytes; o `_QUOTA_LIMITS` são os primeiros 0x30).
+#[repr(C)]
+pub struct QuotaLimitsEx {
+    pub paged_pool_limit: Field<u64>,
+    pub non_paged_pool_limit: Field<u64>,
+    pub minimum_working_set_size: Field<u64>,
+    pub maximum_working_set_size: Field<u64>,
+    pub pagefile_limit: Field<u64>,
+    pub time_limit: Field<i64>,
+    pub working_set_limit: Field<u64>,
+    pub reserved2: Field<u64>,
+    pub reserved3: Field<u64>,
+    pub reserved4: Field<u64>,
+    pub flags: Field<u32>,
+    pub cpu_rate_limit: Field<u32>,
+}
+
+unsafe impl NtStruct for QuotaLimitsEx {}
+
+const _: () = {
+    assert!(core::mem::size_of::<QuotaLimitsEx>() == 0x58);
+    assert!(core::mem::offset_of!(QuotaLimitsEx, paged_pool_limit) == 0x0);
+    assert!(core::mem::offset_of!(QuotaLimitsEx, non_paged_pool_limit) == 0x8);
+    assert!(core::mem::offset_of!(QuotaLimitsEx, minimum_working_set_size) == 0x10);
+    assert!(core::mem::offset_of!(QuotaLimitsEx, maximum_working_set_size) == 0x18);
+    assert!(core::mem::offset_of!(QuotaLimitsEx, pagefile_limit) == 0x20);
+    assert!(core::mem::offset_of!(QuotaLimitsEx, time_limit) == 0x28);
+    assert!(core::mem::offset_of!(QuotaLimitsEx, working_set_limit) == 0x30);
+    assert!(core::mem::offset_of!(QuotaLimitsEx, reserved2) == 0x38);
+    assert!(core::mem::offset_of!(QuotaLimitsEx, reserved3) == 0x40);
+    assert!(core::mem::offset_of!(QuotaLimitsEx, reserved4) == 0x48);
+    assert!(core::mem::offset_of!(QuotaLimitsEx, flags) == 0x50);
+    assert!(core::mem::offset_of!(QuotaLimitsEx, cpu_rate_limit) == 0x54);
+};
+
+/// `_VM_COUNTERS_EX2` (NtQueryInformationProcess (ProcessVmCounters, classe
+/// 3); 0x70 bytes; o `_VM_COUNTERS` são os primeiros 0x58 e o
+/// `_VM_COUNTERS_EX` os primeiros 0x60).
+#[repr(C)]
+pub struct VmCountersEx2 {
+    pub peak_virtual_size: Field<u64>,
+    pub virtual_size: Field<u64>,
+    pub page_fault_count: Field<u32>,
+    pub _pad_14: Field<u32>,
+    pub peak_working_set_size: Field<u64>,
+    pub working_set_size: Field<u64>,
+    pub quota_peak_paged_pool_usage: Field<u64>,
+    pub quota_paged_pool_usage: Field<u64>,
+    pub quota_peak_non_paged_pool_usage: Field<u64>,
+    pub quota_non_paged_pool_usage: Field<u64>,
+    pub pagefile_usage: Field<u64>,
+    pub peak_pagefile_usage: Field<u64>,
+    pub private_usage: Field<u64>,
+    pub private_working_set_size: Field<u64>,
+    pub shared_commit_usage: Field<u64>,
+}
+
+unsafe impl NtStruct for VmCountersEx2 {}
+
+const _: () = {
+    assert!(core::mem::size_of::<VmCountersEx2>() == 0x70);
+    assert!(core::mem::offset_of!(VmCountersEx2, peak_virtual_size) == 0x0);
+    assert!(core::mem::offset_of!(VmCountersEx2, virtual_size) == 0x8);
+    assert!(core::mem::offset_of!(VmCountersEx2, page_fault_count) == 0x10);
+    assert!(core::mem::offset_of!(VmCountersEx2, peak_working_set_size) == 0x18);
+    assert!(core::mem::offset_of!(VmCountersEx2, working_set_size) == 0x20);
+    assert!(core::mem::offset_of!(VmCountersEx2, quota_peak_paged_pool_usage) == 0x28);
+    assert!(core::mem::offset_of!(VmCountersEx2, quota_paged_pool_usage) == 0x30);
+    assert!(core::mem::offset_of!(VmCountersEx2, quota_peak_non_paged_pool_usage) == 0x38);
+    assert!(core::mem::offset_of!(VmCountersEx2, quota_non_paged_pool_usage) == 0x40);
+    assert!(core::mem::offset_of!(VmCountersEx2, pagefile_usage) == 0x48);
+    assert!(core::mem::offset_of!(VmCountersEx2, peak_pagefile_usage) == 0x50);
+    assert!(core::mem::offset_of!(VmCountersEx2, private_usage) == 0x58);
+    assert!(core::mem::offset_of!(VmCountersEx2, private_working_set_size) == 0x60);
+    assert!(core::mem::offset_of!(VmCountersEx2, shared_commit_usage) == 0x68);
+};
+
+/// `_SYSTEM_MEMORY_USAGE_INFORMATION` (NtQuerySystemInformation
+/// (SystemMemoryUsageInformation, classe 182); 0x38 bytes).
+#[repr(C)]
+pub struct SystemMemoryUsageInformation {
+    pub total_physical_bytes: Field<u64>,
+    pub available_bytes: Field<u64>,
+    pub resident_available_bytes: Field<u64>,
+    pub committed_bytes: Field<u64>,
+    pub shared_committed_bytes: Field<u64>,
+    pub commit_limit_bytes: Field<u64>,
+    pub peak_commitment_bytes: Field<u64>,
+}
+
+unsafe impl NtStruct for SystemMemoryUsageInformation {}
+
+const _: () = {
+    assert!(core::mem::size_of::<SystemMemoryUsageInformation>() == 0x38);
+    assert!(core::mem::offset_of!(SystemMemoryUsageInformation, total_physical_bytes) == 0x0);
+    assert!(core::mem::offset_of!(SystemMemoryUsageInformation, available_bytes) == 0x8);
+    assert!(core::mem::offset_of!(SystemMemoryUsageInformation, resident_available_bytes) == 0x10);
+    assert!(core::mem::offset_of!(SystemMemoryUsageInformation, committed_bytes) == 0x18);
+    assert!(core::mem::offset_of!(SystemMemoryUsageInformation, shared_committed_bytes) == 0x20);
+    assert!(core::mem::offset_of!(SystemMemoryUsageInformation, commit_limit_bytes) == 0x28);
+    assert!(core::mem::offset_of!(SystemMemoryUsageInformation, peak_commitment_bytes) == 0x30);
+};

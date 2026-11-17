@@ -21,6 +21,9 @@
 //!   onde ia e o status é STATUS_INFO_LENGTH_MISMATCH. Sem arquivos, a
 //!   primeira entrada fica com NextEntryOffset e TotalSize zero e
 //!   ReturnLength 0.
+//! - SystemMemoryUsageInformation (182): a memória física e o commit em
+//!   bytes ([`memory_usage_information`]); é a primeira consulta do
+//!   GlobalMemoryStatusEx.
 
 use core::sync::atomic::Ordering;
 
@@ -76,6 +79,43 @@ pub fn performance_information(buffer: u64, length: u32) -> Result<(u32, u32), K
     let copied = length.min(PERFORMANCE_INFORMATION_SIZE);
     guest::try_write_bytes(buffer, &image[..copied as usize])?;
     Ok((0, copied))
+}
+
+/// SystemMemoryUsageInformation (182, o ramo da classe no
+/// ExpQuerySystemInformation 19041, rva 0x6ca289): os contadores da
+/// partição do processo corrente em bytes, na ordem do
+/// SYSTEM_MEMORY_USAGE_INFORMATION. TotalPhysicalBytes é o
+/// MmGetNumberOfPhysicalPages (o banco de frames, nunca abaixo das páginas
+/// disponíveis); AvailableBytes o MmGetAvailablePages; ResidentAvailableBytes
+/// o MmGetResidentAvailablePages (no OpenNT, as mesmas páginas livres); o
+/// commit (MmGetTotalCommittedPages, MmGetTotalCommitLimit e
+/// MmGetPeakCommitment, os dois últimos nunca abaixo do commit) vem de
+/// `mm/commit`; SharedCommittedBytes é o MmGetSharedCommit, o commit das
+/// seções de paginação, que o OpenNT ainda não cobra (zero). O tamanho é
+/// exatamente 0x38 bytes (o chamador confere).
+pub fn memory_usage_information() -> Result<alloc::vec::Vec<u8>, KernelError> {
+    use crate::ntos::inc::field::NtStruct;
+    use crate::ntos::inc::types::extra_ps_user::SystemMemoryUsageInformation;
+    let size = SystemMemoryUsageInformation::SIZE;
+    let scratch = guest::alloc_bytes(size);
+    if scratch == 0 {
+        return Err(KernelError::with_status("SystemMemoryUsageInformation", 0xC000_009A));
+    }
+    guest::write_bytes(scratch, &[0u8; SystemMemoryUsageInformation::SIZE as usize]);
+    // SAFETY: a moldura própria recém-alocada, com o tamanho da estrutura.
+    let usage = unsafe { SystemMemoryUsageInformation::at(scratch) };
+    let available = pfn::free_count();
+    let commitment = commit::snapshot();
+    usage.total_physical_bytes.set(pfn::total_count().max(available) << 12);
+    usage.available_bytes.set(available << 12);
+    usage.resident_available_bytes.set(available << 12);
+    usage.committed_bytes.set(commitment.committed << 12);
+    usage.shared_committed_bytes.set(0);
+    usage.commit_limit_bytes.set(commitment.limit.max(commitment.committed) << 12);
+    usage.peak_commitment_bytes.set(commitment.peak.max(commitment.committed) << 12);
+    let bytes = guest::read_bytes(scratch, size as usize);
+    guest::free_bytes(scratch);
+    Ok(bytes)
 }
 
 /// O tamanho mínimo do buffer da SystemPageFileInformation(Ex).
