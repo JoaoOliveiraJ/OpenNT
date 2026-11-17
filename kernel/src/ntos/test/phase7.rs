@@ -4386,7 +4386,16 @@ fn user_wnf(assert: Assert) {
             let small = complete(0, 0, 0, 0, delivery, 0x100);
             let misaligned = complete(0, 0, 0, 0, delivery + 4, 0x1030);
             let bad_status = complete(name, identifier, 1, 0xC000_0001, delivery, 0x1030);
-            let empty = complete(0, 0, 0, 0, delivery, 0x1030);
+            // O nome pode já ter dados: a inscrição feita com o carimbo 0
+            // recebe a notificação inicial, entregue e concluída aqui até a
+            // fila esvaziar.
+            let mut empty = complete(0, 0, 0, 0, delivery, 0x1030);
+            let mut rounds = 0;
+            while empty == Some(0) && rounds < 4 {
+                let mask = guest::read32(delivery + 0x18);
+                empty = complete(delivery + 8, delivery, mask as u64, 0, delivery, 0x1030);
+                rounds += 1;
+            }
             // O nome tem TypeId na definição (o GUID depois do
             // MaximumStateSize); a escrita passa o mesmo.
             let type_guid: [u8; 16] = [0x63, 0x64, 0xF9, 0x48, 0xD6, 0x52, 0x85, 0x4E, 0x9C, 0x02, 0xF2, 0xC1, 0x4E, 0x17, 0x26, 0x4E];
