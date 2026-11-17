@@ -3611,7 +3611,33 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   NtQuerySystemEnvironmentValueEx (o privilégio antes do
   STATUS_NOT_IMPLEMENTED do firmware BIOS) e o NtUpdateWnfStateData e o
   NtCreateWnfStateName de modo usuário (`ex/wnf/service.rs`), todos como
-  no 19041. Um NtCreateKey com componente intermediário ausente devolve
+  no 19041. O GlobalMemoryStatusEx do kernelbase faz três consultas: a
+  SystemMemoryUsageInformation (182, a memória do banco de frames e o
+  commit do sistema, `mm/memory_information.rs`), a ProcessQuotaLimits (1)
+  e a ProcessVmCounters (3) (`ps/query_process.rs`, com o working set e o
+  tamanho virtual tirados do VAD em `mm/process_usage.rs`); o total físico
+  é o que o PFN enxerga, então o services.exe só separa os svchost quando
+  isso passa do SvcHostSplitThresholdInKB. Também respondem como no 19041,
+  cada uma no componente dono: a SystemCpuQuotaInformation (113,
+  0xC00001A9 sem DFSS, `ps/session.rs`), a
+  SystemEnergyEstimationConfigInformation (158, um BOOLEAN FALSE), a
+  SystemPlatformBinaryInformation (133, STATUS_NOT_SUPPORTED sem tabela
+  WPBT), a SystemMemoryTopologyInformation (138), a
+  SystemCodeIntegrityPolicyInformation (164, pelo callback de política da
+  CI, `se/code_integrity.rs`), a SystemShadowStackInformation (221, sem
+  CET), as classes 210 e 211 do NtQuerySystemInformationEx sobre o
+  armazém de features vazio (`cm/feature_configuration.rs`), a
+  ThreadIoPriority (22) do NtQuery/SetInformationThread e o
+  TokenLinkedToken (19), que sem sessão irmã devolve
+  STATUS_NO_SUCH_LOGON_SESSION. Num handle de dispositivo, o
+  NtQueryVolumeInformationFile passa pelo I/O Manager
+  (`io/file/irp_service.rs`): ele mesmo responde a FileFsDeviceInformation
+  (o GetFileType de um pipe) e a FileFsDriverPathInformation, e manda as
+  outras classes ao driver em IRP_MJ_QUERY_VOLUME_INFORMATION. O
+  ProductPolicy do licenciamento é capturado quando a hive SYSTEM é ligada
+  (o CmGetSystemControlValues, `cm/hive_init.rs`) e publicado logo depois,
+  antes do primeiro driver (`init/phase1.rs`). Um NtCreateKey com
+  componente intermediário ausente devolve
   STATUS_OBJECT_NAME_NOT_FOUND, como o CmpDoParseKey: é o status que faz o
   kernelbase criar o caminho um componente de cada vez. Um serviço sem
   provedor nenhum (nem handler de usuário nem export) cai na falha comum da
