@@ -154,8 +154,12 @@ pub fn software_keys(smss_boot: bool) -> Vec<SeedKey> {
 /// A hive SAM de um sistema novo: só a raiz. O SampInitialize do samsrv.dll
 /// abre `\Registry\Machine\Security\SAM` (o link para `SAM\SAM`) e, com
 /// STATUS_OBJECT_NAME_NOT_FOUND, cria o banco de contas (o
-/// SampInitializeRegistry, com o SID de domínio novo). Domínios vazios ou
-/// um `RXACT` sem o estado do RtlInitializeRXact não são um banco válido.
+/// SampInitializeRegistry, com o SID de domínio novo). Fora da instalação
+/// do Windows, ele só cria o banco com o `Control\Lsa`
+/// `CreatePolicyDatabaseOnFirstBoot` diferente de zero (o
+/// SampSKUAllowsHiveCreation), que o xtask grava na SYSTEM; sem ele volta
+/// STATUS_UNSUCCESSFUL. Domínios vazios ou um `RXACT` sem o estado do
+/// RtlInitializeRXact não são um banco válido.
 pub fn sam_keys() -> Vec<SeedKey> {
     Vec::new()
 }

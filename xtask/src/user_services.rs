@@ -13,7 +13,9 @@
 //! valores daqui: as chaves de serviço desses quatro (com Parameters e
 //! Security), a ordem dos grupos de serviço (`Control\ServiceGroupOrder`) e,
 //! na SOFTWARE, os grupos do svchost (`Microsoft\Windows NT\CurrentVersion\
-//! Svchost`, os valores com a lista de serviços de cada grupo). E a
+//! Svchost`, os valores com a lista de serviços de cada grupo, e
+//! `Microsoft\Rpc\SecurityService`, os provedores de autenticação do RPC).
+//! E a
 //! configuração das extensões do LSA (`Control\LsaExtensionConfig`: o
 //! lsasrv.dll, o efslsaext.dll e a interface do dpapisrv.dll), que o
 //! LsapLoadRequiredExtensions do lsass.exe lê depois de conectar ao
@@ -46,6 +48,19 @@ pub fn system_keys(control_set: &str) -> Vec<HostKey> {
         // convidado gera a dele no primeiro boot (o WxSaveSysKey). As chaves
         // que esta conta não lê ficam de fora.
         registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\Control\\Lsa"), &format!("{control_set}\\Control\\Lsa"), false, &mut keys);
+        // O convidado não tem as hives SECURITY e SAM desta instalação (as
+        // contas e os segredos daqui ficam fora do volume): o kernel as
+        // monta vazias e o lsass cria as dele. O lsasrv e o samsrv só criam
+        // os bancos fora da instalação do Windows com o
+        // CreatePolicyDatabaseOnFirstBoot diferente de zero (o
+        // SampSKUAllowsHiveCreation do SampInitialize e o LsapExpectDomainId
+        // do lsasrv leem o valor), o valor das imagens que geram os bancos
+        // no primeiro boot.
+        let lsa = format!("{control_set}\\Control\\Lsa");
+        if let Some(key) = keys.iter_mut().find(|key| key.path == lsa) {
+            key.values.retain(|(name, _, _)| !name.eq_ignore_ascii_case("CreatePolicyDatabaseOnFirstBoot"));
+            key.values.push((String::from("CreatePolicyDatabaseOnFirstBoot"), 4, 1u32.to_le_bytes().to_vec()));
+        }
         for name in registry::list(registry::LOCAL_MACHINE, &format!("{host}\\Control\\Lsa")) {
             if ["JD", "Skew1", "GBG", "Data"].iter().any(|boot_key| boot_key.eq_ignore_ascii_case(&name)) {
                 continue;
@@ -58,13 +73,20 @@ pub fn system_keys(control_set: &str) -> Vec<HostKey> {
     keys
 }
 
-/// As chaves da hive SOFTWARE: os grupos do svchost.
+/// As chaves da hive SOFTWARE: os grupos do svchost e os provedores de
+/// autenticação do RPC.
 pub fn software_keys() -> Vec<HostKey> {
     let mut keys = Vec::new();
     #[cfg(windows)]
     {
         use crate::host_language::registry;
         registry::copy(registry::LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Svchost", "Microsoft\\Windows NT\\CurrentVersion\\Svchost", false, &mut keys);
+        // Os provedores de autenticação do RPC (o número do serviço de
+        // autenticação e o DLL dele: 9, 10 e 16 no sspicli.dll, 14 no
+        // schannel.dll, 68 no netlogon.dll), que o RpcGetSecurityProviderInfo
+        // do rpcrt4.dll lê. Sem a chave, o RpcServerRegisterAuthInfo do lsass
+        // volta RPC_S_UNKNOWN_AUTHN_SERVICE.
+        registry::copy(registry::LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Rpc\\SecurityService", "Microsoft\\Rpc\\SecurityService", false, &mut keys);
     }
     keys
 }
