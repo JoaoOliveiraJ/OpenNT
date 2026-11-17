@@ -17,7 +17,8 @@
 //! configuração das extensões do LSA (`Control\LsaExtensionConfig`: o
 //! lsasrv.dll, o efslsaext.dll e a interface do dpapisrv.dll), que o
 //! LsapLoadRequiredExtensions do lsass.exe lê depois de conectar ao
-//! Reference Monitor. Fora do Windows nada é copiado.
+//! Reference Monitor, e o `Control\Lsa` com as subchaves, menos as da chave
+//! de boot. Fora do Windows nada é copiado.
 
 use crate::host_language::HostKey;
 
@@ -38,10 +39,19 @@ pub fn system_keys(control_set: &str) -> Vec<HostKey> {
         registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\Control\\ServiceGroupOrder"), &format!("{control_set}\\Control\\ServiceGroupOrder"), false, &mut keys);
         registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\Control\\LsaExtensionConfig"), &format!("{control_set}\\Control\\LsaExtensionConfig"), true, &mut keys);
         // Os valores do LSA (os pacotes de autenticação e de notificação que
-        // o lsass carrega, o tipo de produto) e os do MSV1_0, sem as
-        // subchaves com a chave de boot da instalação (JD, Skew1, GBG, Data).
+        // o lsass carrega, o tipo de produto) e as subchaves dele (o MSV1_0,
+        // as políticas de acesso central que o LsapOpenCapDb abre, a
+        // auditoria, o Kerberos), sem as que guardam a chave de boot da
+        // instalação nas classes (JD, Skew1, GBG, Data): o lsasrv do
+        // convidado gera a dele no primeiro boot (o WxSaveSysKey). As chaves
+        // que esta conta não lê ficam de fora.
         registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\Control\\Lsa"), &format!("{control_set}\\Control\\Lsa"), false, &mut keys);
-        registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\Control\\Lsa\\MSV1_0"), &format!("{control_set}\\Control\\Lsa\\MSV1_0"), false, &mut keys);
+        for name in registry::list(registry::LOCAL_MACHINE, &format!("{host}\\Control\\Lsa")) {
+            if ["JD", "Skew1", "GBG", "Data"].iter().any(|boot_key| boot_key.eq_ignore_ascii_case(&name)) {
+                continue;
+            }
+            registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\Control\\Lsa\\{name}"), &format!("{control_set}\\Control\\Lsa\\{name}"), true, &mut keys);
+        }
     }
     #[cfg(not(windows))]
     let _ = control_set;

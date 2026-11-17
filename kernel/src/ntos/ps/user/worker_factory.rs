@@ -621,20 +621,28 @@ fn nt_wait_for_work_via_worker_factory(handle: u64, out: u64, count: u64, return
         return Ok(0xC000_0005);
     }
     // O envio ALPC adiado (WORKER_FACTORY_DEFERRED_WORK), como o
-    // NtWaitForWorkViaWorkerFactory 19041: só as flags altas; com
+    // NtWaitForWorkViaWorkerFactory 19041: só com o bit 0 de Flags (o
+    // rpcrt4 deixa no bloco a mensagem do envio anterior e só liga o bit
+    // quando há resposta nova); só as flags altas; com
     // ALPC_MSGFLG_SYNC_REQUEST o envio não acontece; a porta pede acesso de
     // envio e a mensagem vai sem atributos. Uma falha do envio não muda nada:
     // a espera por trabalho segue.
     if deferred != 0 {
-        let work = state::user_struct::<WorkerFactoryDeferredWork>(deferred).and_then(|work| Ok((work.alpc_send_message.probe_get()?, work.alpc_send_message_port.probe_get()?, work.alpc_send_message_flags.probe_get()?)));
-        match work {
+        let work = state::user_struct::<WorkerFactoryDeferredWork>(deferred).and_then(|work| Ok((work.alpc_send_message.probe_get()?, work.alpc_send_message_port.probe_get()?, work.alpc_send_message_flags.probe_get()?, work.flags.probe_get()?)));
+        match work.map(|(message, port, flags, work_flags)| (if work_flags & 1 != 0 { message } else { 0 }, port, flags)) {
             Ok((0, _, _)) => {}
             Ok((message, port, flags)) => {
                 let flags = flags & 0xFFFF_0000;
                 if flags & 0x2_0000 == 0 {
                     let status = crate::ntos::ps::user::alpc::deferred_send(port, flags, message)?;
                     if status & 0x8000_0000 != 0 {
-                        crate::debug_print!("[workerfactory] envio adiado na porta {:#x} (flags {:#x}) falhou: {:#x}", port, flags, status);
+                        // O cabeçalho PORT_MESSAGE da mensagem recusada
+                        // (DataLength, TotalLength, Type, DataInfoOffset e
+                        // MessageId), para o diagnóstico.
+                        let header = guest::try_read_bytes(message, 0x28).unwrap_or_default();
+                        let word = |offset: usize| header.get(offset..offset + 2).map_or(0, |bytes| u16::from_le_bytes([bytes[0], bytes[1]]));
+                        let id = header.get(0x18..0x1C).map_or(0, |bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
+                        crate::debug_print!("[workerfactory] envio adiado na porta {:#x} (flags {:#x}) falhou: {:#x} (DataLength {:#x} TotalLength {:#x} Type {:#x} DataInfoOffset {:#x} MessageId {:#x})", port, flags, status, word(0), word(2), word(4), word(6), id);
                     }
                 }
             }
