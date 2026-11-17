@@ -51,6 +51,16 @@ pub fn system_keys(control_set: &str) -> Vec<HostKey> {
         // subchaves que esta conta lê).
         registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\Control\\Power"), &format!("{control_set}\\Control\\Power"), true, &mut keys);
         registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\Control\\LsaExtensionConfig"), &format!("{control_set}\\Control\\LsaExtensionConfig"), true, &mut keys);
+        // As definições dos nomes WNF permanentes e persistentes desta
+        // instalação (`Control\Notifications`: um REG_BINARY por nome, com o
+        // descritor, o limite de dados e o tipo, sem dados publicados). O
+        // ExpWnfLookupNameDefinition do kernel lê a definição para cada
+        // NtQueryWnfStateData e NtSubscribeWnfStateChange de um nome bem
+        // conhecido ou permanente; sem ela o rpcss (o
+        // WNF_UMGR_SESSIONUSER_TOKEN_CHANGE), o CPolicyMonitor do lsm (o
+        // WNF_GPOL_SYSTEM_CHANGES), o psmsrv e o brokerlib recebem
+        // STATUS_OBJECT_NAME_NOT_FOUND e param.
+        registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\Control\\Notifications"), &format!("{control_set}\\Control\\Notifications"), false, &mut keys);
         // A configuração dos Serviços de Terminal com as subchaves
         // (WinStations, AddIns, TerminalTypes, RCM e as outras): o
         // CPolicyMonitor do CService::Start do lsm.dll abre `Terminal Server`
