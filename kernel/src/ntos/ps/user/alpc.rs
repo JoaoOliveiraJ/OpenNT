@@ -28,7 +28,7 @@ use crate::ntos::ob::object_manager;
 use crate::ntos::ps::process;
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::types::{AlpcDirectAttr, AlpcMessageAttributes, AlpcPortAttributes, AlpcSecurityAttr, AlpcWorkOnBehalfTicket, NtStruct, ObjectAttributes, PortMessage, Sid, UnicodeString};
+use crate::ntos::inc::types::{AlpcDirectAttr, AlpcMessageAttributes, AlpcPortAttributes, AlpcSecurityAttr, AlpcWorkOnBehalfTicket, NtStruct, ObjectAttributes, PortMessage, UnicodeString};
 
 pub use crate::ntos::alpc::transport::register;
 
@@ -570,23 +570,27 @@ fn capture(address: u64, maximum: u32) -> Result<Vec<u8>, u32> {
     guest::try_read_bytes(address + PortMessage::SIZE, data_size as usize).map_err(|error| error.status)
 }
 
-/// Os endpoints deste módulo são hospedados pelo processo System real.
-fn server_sid(pointer: u64) -> u32 {
+/// O AlpcpCheckConnectionSecurity da conexão de modo usuário: o
+/// RequiredServerSid do NtAlpcConnectPort (capturado como no SeCaptureSid) ou
+/// o ServerSecurityRequirements do NtAlpcConnectPortEx (capturado como no
+/// SeCaptureSecurityDescriptor), conferidos com o token primário do processo
+/// dono da porta de conexão (o System, nos serviços hospedados no kernel).
+fn check_server_security(pointer: u64, required_sid: bool, server_process: u64) -> u32 {
     if pointer == 0 {
         return 0;
     }
-    if !state::probe_user_read(pointer, 8) {
-        return AV;
-    }
-    let Ok(count) = state::user_struct::<Sid>(pointer).and_then(|sid| sid.sub_authority_count.probe_get()) else { return AV };
-    let size = 8 + count as u64 * 4;
-    if count > 15 || !state::probe_user_read(pointer, size) {
-        return AV;
-    }
-    // S-1-5-18 (LocalSystem), comparado na cópia sondada.
-    let sid = [1u8, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0];
-    let Ok(captured) = guest::try_read_bytes(pointer, size as usize) else { return AV };
-    if captured == sid { 0 } else { 0xC000_0257 }
+    let checked = if required_sid {
+        crate::ntos::alpc::connect::capture::identifier(pointer, 1).and_then(|sid| match sid {
+            Some(sid) => crate::ntos::alpc::connect::capture::check_server_sid(server_process, &sid),
+            None => Ok(()),
+        })
+    } else {
+        crate::ntos::ob::object_security::capture_descriptor(pointer, true).and_then(|descriptor| match descriptor {
+            Some(descriptor) => crate::ntos::alpc::connect::capture::check_server_descriptor(server_process, &descriptor),
+            None => Ok(()),
+        })
+    };
+    checked.err().unwrap_or(0)
 }
 
 fn nt_alpc_connect_port(out: u64, name: u64, oa: u64, port_attributes: u64, rsp: u64) -> Result<u32, KernelError> {
@@ -599,8 +603,7 @@ fn nt_alpc_connect_port(out: u64, name: u64, oa: u64, port_attributes: u64, rsp:
 /// OutMessageAttributes, InMessageAttributes, Timeout): a mesma conexão do
 /// NtAlpcConnectPort, com o nome da porta no OBJECT_ATTRIBUTES (sem
 /// RootDirectory) e, no lugar do SID exigido, o SECURITY_DESCRIPTOR que o
-/// servidor deve satisfazer, que os endpoints daqui (o System ou o processo
-/// dono da porta) não conferem.
+/// token do processo dono da porta deve satisfazer.
 fn nt_alpc_connect_port_ex(out: u64, connection: u64, oa: u64, port_attributes: u64, rsp: u64) -> Result<u32, KernelError> {
     state::guarded(|| {
         if !state::probe_user_read(connection, ObjectAttributes::SIZE) {
@@ -645,7 +648,7 @@ fn connect_port(out: u64, name: u64, oa: u64, port_attributes: u64, rsp: u64, re
     if flags & !0x2_0000 != 0 {
         return Ok(0xC000_00BB);
     }
-    let mut status = if required_sid { server_sid(state::stack_arg(rsp, 6)) } else { 0 };
+    let mut status = check_server_security(state::stack_arg(rsp, 6), required_sid, listener.process);
     if status == 0 {
         status = attributes(send_attributes, true, 1);
     }

@@ -94,13 +94,37 @@ pub fn resolve_listener(node: Option<NodeId>, path: &str, required: Option<&[u8]
     let object_type = object_types::user_type("alpc").ok_or(0xC000_0024u32)?;
     object_access::check(&server.security, object_access::subject(), 1, &object_type, mode == 0 && !force_access_check)?;
     if let Some(required) = required {
-        let token = process::get_primary_token(server.process).and_then(tokens::get);
-        let matches = token.is_some_and(|token| token.app_container.is_none() && token.user.as_slice() == required);
-        if !matches {
-            return Err(0xC000_02A0);
-        }
+        check_server_sid(server.process, required)?;
     }
     Ok(Target { node, server, path: String::from(path) })
+}
+
+/// STATUS_SERVER_SID_MISMATCH.
+const STATUS_SERVER_SID_MISMATCH: u32 = 0xC000_02A0;
+/// MAXIMUM_ALLOWED.
+const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
+
+/// A forma SID do AlpcpCheckConnectionSecurity (o RequiredServerSid do
+/// NtAlpcConnectPort): o token primário do processo dono da porta de conexão
+/// não é AppContainer e o usuário dele é o SID pedido; senão
+/// STATUS_SERVER_SID_MISMATCH.
+pub fn check_server_sid(server_process: u64, required: &[u8]) -> Result<(), u32> {
+    let token = process::get_primary_token(server_process).and_then(tokens::get);
+    let matches = token.is_some_and(|token| token.app_container.is_none() && token.user.as_slice() == required);
+    if matches { Ok(()) } else { Err(STATUS_SERVER_SID_MISMATCH) }
+}
+
+/// A forma descritor (o ServerSecurityRequirements do NtAlpcConnectPortEx):
+/// o SeAccessCheck do token primário do servidor contra o descritor, com
+/// MAXIMUM_ALLOWED; a recusa é STATUS_SERVER_SID_MISMATCH.
+pub fn check_server_descriptor(server_process: u64, descriptor: &crate::ntos::se::policy_descriptor::OwnedDescriptor) -> Result<(), u32> {
+    let object_type = object_types::user_type("alpc").ok_or(0xC000_0024u32)?;
+    let Some(token) = process::get_primary_token(server_process).and_then(tokens::get) else { return Err(STATUS_SERVER_SID_MISMATCH) };
+    let policy = crate::ntos::se::policy_descriptor::policy_of(descriptor);
+    match object_access::check_token(&policy, &token, MAXIMUM_ALLOWED, &object_type) {
+        Ok(granted) if granted != 0 => Ok(()),
+        _ => Err(STATUS_SERVER_SID_MISMATCH),
+    }
 }
 
 /// OBJECT_ATTRIBUTES capturado para a nova porta cliente.

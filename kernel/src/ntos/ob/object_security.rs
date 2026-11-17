@@ -271,7 +271,7 @@ pub fn check_create_in_path(directory: &str, subdirectory: bool) -> Result<(), u
 /// O SeCaptureSecurityDescriptor do descritor dos OBJECT_ATTRIBUTES: a
 /// cópia self-relative no kernel (sondada em UserMode), validada antes de os
 /// componentes serem lidos dela. `None` sem descritor.
-fn capture_descriptor(descriptor: u64, from_user_mode: bool) -> Result<Option<crate::ntos::se::policy_descriptor::OwnedDescriptor>, u32> {
+pub fn capture_descriptor(descriptor: u64, from_user_mode: bool) -> Result<Option<crate::ntos::se::policy_descriptor::OwnedDescriptor>, u32> {
     if descriptor == 0 {
         return Ok(None);
     }
