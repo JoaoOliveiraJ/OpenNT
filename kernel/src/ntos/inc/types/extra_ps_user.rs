@@ -209,3 +209,39 @@ const _: () = {
     assert!(core::mem::offset_of!(PowerSessionInit, setting_11c) == 0x34);
     assert!(core::mem::offset_of!(PowerSessionInit, ttm_enabled) == 0x38);
 };
+
+/// `SYSTEM_BATTERY_STATE` (NtPowerInformation(SystemBatteryState, nível
+/// 5); 0x20 bytes).
+#[repr(C)]
+pub struct SystemBatteryState {
+    pub ac_on_line: Field<u8>,
+    pub battery_present: Field<u8>,
+    pub charging: Field<u8>,
+    pub discharging: Field<u8>,
+    pub spare1: [Field<u8>; 3],
+    pub tag: Field<u8>,
+    pub max_capacity: Field<u32>,
+    pub remaining_capacity: Field<u32>,
+    pub rate: Field<u32>,
+    pub estimated_time: Field<u32>,
+    pub default_alert1: Field<u32>,
+    pub default_alert2: Field<u32>,
+}
+
+unsafe impl NtStruct for SystemBatteryState {}
+
+const _: () = {
+    assert!(core::mem::size_of::<SystemBatteryState>() == 0x20);
+    assert!(core::mem::offset_of!(SystemBatteryState, ac_on_line) == 0x0);
+    assert!(core::mem::offset_of!(SystemBatteryState, battery_present) == 0x1);
+    assert!(core::mem::offset_of!(SystemBatteryState, charging) == 0x2);
+    assert!(core::mem::offset_of!(SystemBatteryState, discharging) == 0x3);
+    assert!(core::mem::offset_of!(SystemBatteryState, spare1) == 0x4);
+    assert!(core::mem::offset_of!(SystemBatteryState, tag) == 0x7);
+    assert!(core::mem::offset_of!(SystemBatteryState, max_capacity) == 0x8);
+    assert!(core::mem::offset_of!(SystemBatteryState, remaining_capacity) == 0xC);
+    assert!(core::mem::offset_of!(SystemBatteryState, rate) == 0x10);
+    assert!(core::mem::offset_of!(SystemBatteryState, estimated_time) == 0x14);
+    assert!(core::mem::offset_of!(SystemBatteryState, default_alert1) == 0x18);
+    assert!(core::mem::offset_of!(SystemBatteryState, default_alert2) == 0x1C);
+};

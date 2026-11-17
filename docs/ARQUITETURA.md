@@ -2150,6 +2150,20 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   (PopExecutePowerAction) as ações reais devolvem STATUS_NOT_SUPPORTED, e
   o PoShutdownBugCheck cai no bugcheck pedido. PoSetHiberRange só aceita
   um mapa fechado: o OpenNT não hiberna.
+- **Informações de energia** (`po/power_information.rs`,
+  `po/power_setting.rs`): o NtPowerInformation de modo usuário segue o
+  19041 (níveis só de kernel recusados, privilégio para entrada fora da
+  lista sem privilégio, entrada capturada, saída sondada e o fim comum de
+  cópia); os níveis 4, 5, 58, 59, 66 e 75 têm o mesmo corpo de modo kernel
+  e de usuário. O nível 4 é o PopCapabilities de um desktop S0/S5 (0x4c
+  bytes, só o botão de energia, o S5, o FullWake e o DiskSpinDown) e o 5 é
+  o estado composto sem bateria (AcOnLine). As configurações de power
+  setting nascem do PopSetPowerSettingValue (no boot, o
+  PopInitilizeAcDcSettings grava GUID_ACDC_POWER_SOURCE): o nível 58 cria
+  no primeiro pedido o nome WNF temporário de escopo de máquina da
+  configuração (ou o nome global, sem GUID; GUID desconhecido dá
+  STATUS_NOT_FOUND) e o 59 serializa os valores AC, DC e Hot com os
+  carimbos de mudança. Os valores ainda não são publicados nos nomes.
 - **Desligamento e reinício** (`po/shutdown.rs`, `io/shutdown.rs`,
   `ex/shutdown.rs`, `hal/firmware_return.rs`): NtShutdownSystem e o
   NtSetSystemPowerState das ações de desligamento, de modo kernel e de

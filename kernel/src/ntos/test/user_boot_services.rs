@@ -380,6 +380,47 @@ fn power_information(assert: Assert, block: u64, rsp: u64, call: Call) {
         platform == 0 && aoac == 0 && platform_input == STATUS_INVALID_PARAMETER && platform_no_output == STATUS_INVALID_PARAMETER && role == 0 && role_value == 1 && role_short == 0xC000_0023 && absence == 0 && absence_value == 0 && absence_short_input == STATUS_INVALID_PARAMETER && absence_no_output == 0xC000_0023 && internal_invalid == STATUS_INVALID_PARAMETER && kernel_only == STATUS_ACCESS_DENIED && out_of_range == STATUS_INVALID_PARAMETER,
         "userboot: NtPowerInformation de modo usuario (66, 75, 87 tipo 4, niveis so de kernel)",
     );
+    // SystemPowerCapabilities (0x4c bytes) e SystemBatteryState (0x20).
+    let capabilities_output = block + 0x800;
+    guest::write_bytes(capabilities_output, &[0xEE; 0x80]);
+    let capabilities = power(4, 0, 0, capabilities_output, 0x4C);
+    let (sleep_button, s1, s5, ups) = (guest::read8(capabilities_output + 1), guest::read8(capabilities_output + 3), guest::read8(capabilities_output + 7), guest::read8(capabilities_output + 0xC));
+    let capabilities_short = power(4, 0, 0, capabilities_output, 0x40);
+    let battery = power(5, 0, 0, capabilities_output + 0x60, 0x20);
+    let (ac_on_line, battery_present) = (guest::read8(capabilities_output + 0x60), guest::read8(capabilities_output + 0x61));
+    let battery_short = power(5, 0, 0, capabilities_output + 0x60, 0x1F);
+    assert(
+        capabilities == 0 && sleep_button == 0 && s1 == 0 && s5 == 1 && ups == 0 && capabilities_short == 0xC000_0023 && battery == 0 && ac_on_line == 1 && battery_present == 0 && battery_short == 0xC000_0023,
+        "userboot: NtPowerInformation 4 e 5 (desktop S0/S5 com AC e sem bateria)",
+    );
+    // PowerSettingNotificationName e GetPowerSettingValue sobre
+    // GUID_ACDC_POWER_SOURCE (o powrprof do RpcSs e do psmsrv).
+    let acdc: [u8; 16] = [0x59, 0x9A, 0x3E, 0x5D, 0xD5, 0xE9, 0x00, 0x4B, 0xA6, 0xBD, 0xFF, 0x34, 0xFF, 0x51, 0x65, 0x48];
+    let (setting, value) = (block + 0x900, block + 0x940);
+    guest::write_bytes(setting, &acdc);
+    guest::write32(setting + 0x10, 0xFFFF_FFFF);
+    let name = power(58, setting, 0x14, value, 8);
+    let first_name = guest::read64(value);
+    let again = power(58, setting, 0x14, value, 8);
+    let same_name = guest::read64(value) == first_name && first_name != 0;
+    let global = power(58, 0, 0, value, 8);
+    let global_name = guest::read64(value);
+    let name_short_input = power(58, setting, 0x10, value, 8);
+    let name_short_output = power(58, setting, 0x14, value, 4);
+    let name_no_output = power(58, setting, 0x14, 0, 0);
+    guest::write_bytes(value, &[0xEE; 0x30]);
+    let get = power(59, setting, 0x10, value, 0x34);
+    let records = (guest::read32(value), guest::read32(value + 8), guest::read32(value + 0xC), guest::read32(value + 0x18), guest::read32(value + 0x24));
+    let same_stamps = guest::read32(value + 4) == guest::read32(value + 0x10) && guest::read32(value + 4) == guest::read32(value + 0x1C) && guest::read32(value + 4) != 0;
+    let get_short = power(59, setting, 0x10, value, 0x27);
+    let get_input = power(59, setting, 0x14, value, 0x34);
+    guest::write_bytes(setting, &[0x11; 16]);
+    let unknown_name = power(58, setting, 0x14, value, 8);
+    let unknown_value = power(59, setting, 0x10, value, 0x34);
+    assert(
+        name == 0 && again == 0 && same_name && global == 0 && global_name != 0 && global_name != first_name && name_short_input == 0xC000_0023 && name_short_output == 0xC000_0023 && name_no_output == STATUS_INVALID_PARAMETER && get == 0 && records == (0x24, 4, 0, 0, 0) && same_stamps && get_short == 0xC000_0023 && get_input == 0xC000_0023 && unknown_name == STATUS_NOT_FOUND && unknown_value == STATUS_INVALID_PARAMETER,
+        "userboot: NtPowerInformation 58 e 59 (nome WNF e valor AC de GUID_ACDC_POWER_SOURCE)",
+    );
 }
 
 fn events(assert: Assert, block: u64, rsp: u64, call: Call) {

@@ -175,6 +175,9 @@ pub fn kmain() -> ! {
     if let Err(error) = crate::ntos::ps::user::index::init() {
         debug_print!("[usermode] anel 3 nao armado: {}", error);
     }
+    // Os valores iniciais de GUID_ACDC_POWER_SOURCE (o
+    // PopInitilizeAcDcSettings do PoInitSystem).
+    crate::ntos::po::power_setting::initialize_ac_dc_settings();
     // O canal ALPC do Power Manager com o serviço Power de modo usuário
     // (o PopUmpoInitializeChannel do PoInitSystem): o \PowerPort.
     if let Err(error) = crate::ntos::po::umpo_channel::initialize() {

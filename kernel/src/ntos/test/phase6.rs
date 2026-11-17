@@ -2917,7 +2917,9 @@ fn zw_group_exports(assert: Assert) {
     guest::write32(block + 0x2F0, 0);
     let short = status(call_export("ZwQuerySystemInformation", &[126, buffer, 0x10, block + 0x2F0]));
     assert(boot_graphics == 0xC000_0001 && returned == 0x20 && guest::read64(buffer) == 0xAAAA_AAAA_AAAA_AAAA && short == 0xC000_0004 && guest::read32(block + 0x2F0) == 0x20, "zw: classe 126 (SystemBootGraphicsInformation) sem tela grafica de boot");
-    assert(status(call_export("ZwPowerInformation", &[4, 0, 0, buffer, 0x40])) == 0 && at::<nt::SystemPowerCapabilities>(buffer).power_button_present.get() == 1 && at::<nt::SystemPowerCapabilities>(buffer).lid_present.get() == 0 && status(call_export("ZwPowerInformation", &[4, 0, 0, buffer, 8])) == 0xC000_0023, "zw: ZwPowerInformation (SystemPowerCapabilities)");
+    let capabilities = status(call_export("ZwPowerInformation", &[4, 0, 0, buffer, 0x4C]));
+    let caps = at::<nt::SystemPowerCapabilities>(buffer);
+    assert(capabilities == 0 && caps.power_button_present.get() == 1 && caps.sleep_button_present.get() == 0 && caps.lid_present.get() == 0 && caps.system_s1.get() == 0 && caps.system_s5.get() == 1 && caps.ups_present.get() == 0 && status(call_export("ZwPowerInformation", &[4, 0, 0, buffer, 0x40])) == 0xC000_0023 && status(call_export("ZwPowerInformation", &[4, buffer, 0x4C, buffer, 0x4C])) == 0xC000_000D, "zw: ZwPowerInformation (SystemPowerCapabilities de 0x4c bytes, S0/S5 sem botao de sono nem UPS)");
     let before = system_information::entropy_registrations().len();
     guest::write64(buffer, 0x1111);
     guest::write64(buffer + 8, 0x2222);
