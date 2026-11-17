@@ -1295,6 +1295,27 @@ const _: () = {
     assert!(core::mem::offset_of!(KeyHandleTagsInformation, handle_tags) == 0x0);
 };
 
+/// `_KEY_VALUE_ENTRY` (wdm.h, NtQueryMultipleValueKey; 0x18 bytes).
+#[repr(C)]
+pub struct KeyValueEntry {
+    /// -> `_UNICODE_STRING`
+    pub value_name: Field<u64>,
+    pub data_length: Field<u32>,
+    pub data_offset: Field<u32>,
+    pub type_: Field<u32>,
+    _pad_14: Reserved<0x4>,
+}
+
+unsafe impl NtStruct for KeyValueEntry {}
+
+const _: () = {
+    assert!(core::mem::size_of::<KeyValueEntry>() == 0x18);
+    assert!(core::mem::offset_of!(KeyValueEntry, value_name) == 0x0);
+    assert!(core::mem::offset_of!(KeyValueEntry, data_length) == 0x8);
+    assert!(core::mem::offset_of!(KeyValueEntry, data_offset) == 0xc);
+    assert!(core::mem::offset_of!(KeyValueEntry, type_) == 0x10);
+};
+
 /// `_FILE_INTERNAL_INFORMATION` (ntddk.h; 0x8 bytes).
 #[repr(C)]
 pub struct FileInternalInformation {

@@ -33,10 +33,10 @@ use crate::ntos::mm::guest_memory::GuestScalar;
 use crate::ntos::cm::out;
 use crate::ntos::inc::types::extra_se_cm::{
     RegCreateKeyInformationV1, RegDeleteKeyInformation, RegDeleteValueKeyInformation, RegEnumerateKeyInformation,
-    RegQueryKeyInformation, RegQueryKeySecurityInformation, RegQueryValueKeyInformation, RegSetInformationKeyInformation,
-    RegSetValueKeyInformation,
+    RegQueryKeyInformation, RegQueryKeySecurityInformation, RegQueryMultipleValueKeyInformation, RegQueryValueKeyInformation,
+    RegSetInformationKeyInformation, RegSetValueKeyInformation,
 };
-use crate::ntos::inc::types::{KeyHandleTagsInformation, KeyValuePartialInformation, NtStruct, ObjectAttributes, UnicodeString};
+use crate::ntos::inc::types::{KeyHandleTagsInformation, KeyValueEntry, KeyValuePartialInformation, NtStruct, ObjectAttributes, UnicodeString};
 use core::mem::offset_of;
 
 /// Campos nomeados de uma estrutura REG_* (ou argumentos de uma operação).
@@ -985,6 +985,172 @@ pub fn key_operation(kind: Kind, handle: u64, arguments: &Fields, previous_mode:
             None,
         )?;
         Ok(result.status)
+    })
+}
+
+/// REG_QUERY_MULTIPLE_VALUE_KEY_INFORMATION (RegNtPreQueryMultipleValueKey,
+/// 9, e o pós, 24).
+const QUERY_MULTIPLE_LAYOUT: Layout = &[
+    ("object", at!(RegQueryMultipleValueKeyInformation, object), 64),
+    ("entries", at!(RegQueryMultipleValueKeyInformation, value_entries), 64),
+    ("count", at!(RegQueryMultipleValueKeyInformation, entry_count), 32),
+    ("buffer", at!(RegQueryMultipleValueKeyInformation, value_buffer), 64),
+    ("length", at!(RegQueryMultipleValueKeyInformation, buffer_length), 64),
+    ("required", at!(RegQueryMultipleValueKeyInformation, required_buffer_length), 64),
+];
+
+/// O nome de um KEY_VALUE_ENTRY (CmpCaptureKeyValueArray): Buffer ímpar é
+/// STATUS_DATATYPE_MISALIGNMENT, Length ímpar STATUS_INVALID_PARAMETER.
+fn capture_value_name(pointer: u64, previous_mode: bool) -> Flow<Vec<u16>> {
+    let pointer = probe(pointer, UnicodeString::SIZE, previous_mode, false)?;
+    let length = captured::<u16>(pointer, offset_of!(UnicodeString, length))? as u64;
+    let buffer: u64 = captured(pointer, offset_of!(UnicodeString, buffer))?;
+    if length == 0 {
+        return Ok(Vec::new());
+    }
+    if previous_mode && buffer & 1 != 0 {
+        return status(0x8000_0002);
+    }
+    probe(buffer, length, previous_mode, false)?;
+    if length & 1 != 0 {
+        return status(0xC000_000D);
+    }
+    let Ok(bytes) = guest::try_read_bytes(buffer, length as usize) else { return status(0xC000_0005) };
+    Ok(bytes.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect())
+}
+
+/// CmQueryMultipleValueKey sobre o vetor capturado `entries`: os dados de
+/// cada valor no buffer em offsets alinhados a 4 e, no KEY_VALUE_ENTRY,
+/// DataLength, DataOffset e Type. Um valor ausente é
+/// STATUS_OBJECT_NAME_NOT_FOUND (sem tamanhos devolvidos); a partir do
+/// primeiro que não cabe, nada mais é copiado e o resultado é
+/// STATUS_BUFFER_OVERFLOW. `*length` recebe os bytes usados e `*required`
+/// o total necessário.
+fn query_multiple(node: NodeId, entries: u64, count: u32, buffer: u64, length: u64, required: u64) -> Flow<u32> {
+    let capacity = out::<u32>(length).get();
+    let (mut offset, mut needed, mut overflow) = (0u32, 0u32, false);
+    for index in 0..count as u64 {
+        // SAFETY: o vetor capturado desta chamada (ou o de um filtro).
+        let entry = unsafe { KeyValueEntry::at(entries + index * KeyValueEntry::SIZE) };
+        let mut name = capture_value_name(entry.value_name.get(), false)?;
+        // Os NULs do fim do nome não contam.
+        while name.last() == Some(&0) {
+            name.pop();
+        }
+        let lower = String::from_utf16_lossy(&name).to_lowercase();
+        let Some(value) = registry::with_node(node, |key| key.value(&lower).cloned()).flatten() else { return Ok(0xC000_0034) };
+        let data_length = value.data.len() as u32 & 0x7FFF_FFFF;
+        offset = (offset + 3) & !3;
+        needed = (needed + 3) & !3;
+        let end = offset.checked_add(data_length);
+        if !overflow && end.is_some_and(|end| end <= capacity) {
+            if guest::try_write_bytes(buffer + offset as u64, &value.data[..data_length as usize]).is_err() {
+                return status(0xC000_0005);
+            }
+            entry.type_.set(value.value_type);
+            entry.data_length.set(data_length);
+            entry.data_offset.set(offset);
+            offset += data_length;
+        } else {
+            overflow = true;
+        }
+        needed = needed.wrapping_add(data_length);
+    }
+    out::<u32>(length).set(offset);
+    if required != 0 {
+        out::<u32>(required).set(needed);
+    }
+    Ok(if overflow { 0x8000_0005 } else { 0 })
+}
+
+/// NtQueryMultipleValueKey(KeyHandle, ValueEntries, EntryCount, ValueBuffer,
+/// BufferLength, RequiredBufferLength) como no 19041 (rva 0x686ba0): o
+/// handle com KEY_QUERY_VALUE; de modo usuário, EntryCount acima de 0x10000
+/// é STATUS_INSUFFICIENT_RESOURCES e as entradas, o buffer (no tamanho de
+/// *BufferLength) e RequiredBufferLength são sondados para escrita. Os
+/// nomes são capturados; os filtros recebem o vetor capturado e o
+/// BufferLength de kernel, e editar a notificação não redireciona a
+/// consulta (o serviço passa as próprias cópias ao
+/// CmQueryMultipleValueKey). Depois da consulta, *RequiredBufferLength
+/// (opcional) e *BufferLength são gravados e, com sucesso ou
+/// STATUS_BUFFER_OVERFLOW, os tamanhos e offsets voltam às entradas do
+/// chamador.
+pub fn query_multiple_values(handle: u64, entries: u64, count: u32, buffer: u64, buffer_length: u64, required_length: u64, previous_mode: bool) -> Result<u32, KernelError> {
+    install_hooks();
+    with_request(|request| {
+        let resolved = resolve_key_handle(handle, previous_mode, 1)?;
+        let buffer_length = probe(buffer_length, 4, previous_mode, true)?;
+        let length: u32 = captured(buffer_length, 0)?;
+        if previous_mode {
+            if count > 0x1_0000 {
+                return Ok(0xC000_009A);
+            }
+            probe(entries, count as u64 * KeyValueEntry::SIZE, true, true)?;
+            if required_length != 0 {
+                probe(required_length, 4, true, true)?;
+            }
+            if length != 0 {
+                probe(buffer, length as u64, true, true)?;
+            }
+        }
+        // CmpCaptureKeyValueArray: o vetor e os nomes numa cópia própria.
+        let captured_entries = if count != 0 { request.allocate(count as u64 * KeyValueEntry::SIZE)? } else { 0 };
+        for index in 0..count as u64 {
+            let name_pointer: u64 = captured(entries + index * KeyValueEntry::SIZE, offset_of!(KeyValueEntry, value_name))?;
+            let name = capture_value_name(name_pointer, previous_mode)?;
+            let copy = request.create_unicode_string(&String::from_utf16_lossy(&name))?;
+            // SAFETY: entrada do vetor próprio recém-alocado.
+            unsafe { KeyValueEntry::at(captured_entries + index * KeyValueEntry::SIZE) }.value_name.set(copy);
+        }
+        let length_cell = request.allocate(8)?;
+        let required_cell = length_cell + 4;
+        out::<u32>(length_cell).set(length);
+        let body = if callbacks::has() { request.retain_key_body(key_objects::for_handle(resolved.khandle))? } else { 0 };
+        let initial = fields(&[("object", body), ("entries", captured_entries), ("count", count as u64), ("buffer", buffer), ("length", length_cell), ("required", required_length)]);
+        type Query = RegQueryMultipleValueKeyInformation;
+        let result = notify_and_perform(
+            request,
+            9,
+            24,
+            Query::SIZE,
+            at!(Query, call_context),
+            &initial,
+            QUERY_MULTIPLE_LAYOUT,
+            |_| -> Flow<Outcome> {
+                if registry::is_deleted(resolved.node) {
+                    return Ok(Outcome::from_status(0xC000_017C));
+                }
+                let status = query_multiple(resolved.node, captured_entries, count, buffer, length_cell, required_cell)?;
+                Ok(Outcome { status, object: body, ..Default::default() })
+            },
+            false,
+            None,
+        )?;
+        let status = result.status;
+        // O pré que falhou não chega aqui com tamanhos; o resto grava
+        // *RequiredBufferLength (zero sem consulta) e *BufferLength.
+        if required_length != 0 && guest::try_write::<u32>(required_length, out::<u32>(required_cell).get()).is_err() {
+            return Ok(0xC000_0005);
+        }
+        if count != 0 {
+            if guest::try_write::<u32>(buffer_length, out::<u32>(length_cell).get()).is_err() {
+                return Ok(0xC000_0005);
+            }
+            if status == 0 || status == 0x8000_0005 {
+                for index in 0..count as u64 {
+                    // SAFETY: entrada do vetor próprio.
+                    let source = unsafe { KeyValueEntry::at(captured_entries + index * KeyValueEntry::SIZE) };
+                    let target = entries + index * KeyValueEntry::SIZE;
+                    let written = guest::try_write::<u32>(target + offset_of!(KeyValueEntry, data_length) as u64, source.data_length.get())
+                        .and_then(|_| guest::try_write::<u32>(target + offset_of!(KeyValueEntry, data_offset) as u64, source.data_offset.get()))
+                        .and_then(|_| guest::try_write::<u32>(target + offset_of!(KeyValueEntry, type_) as u64, source.type_.get()));
+                    if written.is_err() {
+                        return Ok(0xC000_0005);
+                    }
+                }
+            }
+        }
+        Ok(status)
     })
 }
 

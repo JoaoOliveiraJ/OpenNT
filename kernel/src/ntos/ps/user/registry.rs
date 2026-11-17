@@ -223,6 +223,12 @@ fn nt_query_value_key(handle: u64, name: u64, klass: u64, out: u64, rsp: u64) ->
     key_services::key_operation(Kind::QueryValue, handle, &arguments(&[("name", name), ("klass", klass), ("out", out), ("length", state::stack_arg32(rsp, 5) as u64), ("returned", state::stack_arg(rsp, 6))]), true)
 }
 
+/// NtQueryMultipleValueKey(KeyHandle, ValueEntries, EntryCount, ValueBuffer,
+/// BufferLength, RequiredBufferLength).
+fn nt_query_multiple_value_key(handle: u64, entries: u64, count: u64, buffer: u64, rsp: u64) -> Result<u32, KernelError> {
+    key_services::query_multiple_values(handle, entries, count as u32, buffer, state::stack_arg(rsp, 5), state::stack_arg(rsp, 6), true)
+}
+
 fn nt_enumerate_key(handle: u64, index: u64, klass: u64, out: u64, rsp: u64) -> Result<u32, KernelError> {
     key_services::key_operation(Kind::EnumerateKey, handle, &arguments(&[("index", index), ("klass", klass), ("out", out), ("length", state::stack_arg32(rsp, 5) as u64), ("returned", state::stack_arg(rsp, 6))]), true)
 }
@@ -351,6 +357,7 @@ pub fn init() {
     state::register_handler("NtDeleteValueKey", nt_delete_value_key);
     state::register_handler("NtDeleteKey", nt_delete_key);
     state::register_handler("NtQueryValueKey", nt_query_value_key);
+    state::register_handler("NtQueryMultipleValueKey", nt_query_multiple_value_key);
     state::register_handler("NtEnumerateKey", nt_enumerate_key);
     state::register_handler("NtEnumerateValueKey", nt_enumerate_value_key);
     state::register_handler("NtNotifyChangeKey", nt_notify_change_key);

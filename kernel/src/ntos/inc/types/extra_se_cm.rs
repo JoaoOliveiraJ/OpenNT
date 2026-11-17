@@ -227,6 +227,45 @@ const _: () = {
     assert!(core::mem::offset_of!(RegQueryKeyInformation, reserved) == 0x38);
 };
 
+/// `_REG_QUERY_MULTIPLE_VALUE_KEY_INFORMATION` (wdm.h,
+/// RegNtPreQueryMultipleValueKey).
+#[repr(C)]
+pub struct RegQueryMultipleValueKeyInformation {
+    /// -> `void`
+    pub object: Field<u64>,
+    /// -> `_KEY_VALUE_ENTRY`
+    pub value_entries: Field<u64>,
+    pub entry_count: Field<u32>,
+    _pad_14: Reserved<0x4>,
+    /// -> `void`
+    pub value_buffer: Field<u64>,
+    /// -> `u32`
+    pub buffer_length: Field<u64>,
+    /// -> `u32`
+    pub required_buffer_length: Field<u64>,
+    /// -> `void`
+    pub call_context: Field<u64>,
+    /// -> `void`
+    pub object_context: Field<u64>,
+    /// -> `void`
+    pub reserved: Field<u64>,
+}
+
+unsafe impl NtStruct for RegQueryMultipleValueKeyInformation {}
+
+const _: () = {
+    assert!(core::mem::size_of::<RegQueryMultipleValueKeyInformation>() == 0x48);
+    assert!(core::mem::offset_of!(RegQueryMultipleValueKeyInformation, object) == 0x0);
+    assert!(core::mem::offset_of!(RegQueryMultipleValueKeyInformation, value_entries) == 0x8);
+    assert!(core::mem::offset_of!(RegQueryMultipleValueKeyInformation, entry_count) == 0x10);
+    assert!(core::mem::offset_of!(RegQueryMultipleValueKeyInformation, value_buffer) == 0x18);
+    assert!(core::mem::offset_of!(RegQueryMultipleValueKeyInformation, buffer_length) == 0x20);
+    assert!(core::mem::offset_of!(RegQueryMultipleValueKeyInformation, required_buffer_length) == 0x28);
+    assert!(core::mem::offset_of!(RegQueryMultipleValueKeyInformation, call_context) == 0x30);
+    assert!(core::mem::offset_of!(RegQueryMultipleValueKeyInformation, object_context) == 0x38);
+    assert!(core::mem::offset_of!(RegQueryMultipleValueKeyInformation, reserved) == 0x40);
+};
+
 /// `_REG_QUERY_VALUE_KEY_INFORMATION` (wdm.h, RegNtPreQueryValueKey).
 #[repr(C)]
 pub struct RegQueryValueKeyInformation {

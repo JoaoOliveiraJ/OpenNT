@@ -281,6 +281,45 @@ fn object_attributes(pointer: u64, root: u64, name: &str, attributes: u32) {
     license_unicode(name_address, name);
 }
 
+/// NtQueryMultipleValueKey (CmQueryMultipleValueKey): dados em offsets
+/// alinhados a 4, NUL do fim do nome ignorado, BUFFER_OVERFLOW a partir do
+/// primeiro valor que não cabe e valor ausente.
+fn query_multiple_values(assert: Assert, key: u64) {
+    use crate::ntos::cm::key::services::{self as keys, Kind};
+    use crate::ntos::inc::types::KeyValueEntry;
+    let _ = keys::named_value(Kind::Set, key, "Nome", 1, &[b'a', 0, b'b', 0, 0, 0]);
+    let block = guest::alloc_bytes(0x200);
+    let (entries, buffer, length, required) = (block, block + 0x100, block + 0x180, block + 0x184);
+    let entry = |index: u64| unsafe { KeyValueEntry::at(entries + index * KeyValueEntry::SIZE) };
+    let name = |index: u64, text: &str, nul: bool| {
+        let string = block + 0x40 + index * 0x10;
+        let units: alloc::vec::Vec<u16> = text.encode_utf16().chain(nul.then_some(0)).collect();
+        guest::write_bytes(block + 0x80 + index * 0x20, &units.iter().flat_map(|unit| unit.to_le_bytes()).collect::<alloc::vec::Vec<u8>>());
+        let descriptor = unsafe { UnicodeString::at(string) };
+        descriptor.length.set(units.len() as u16 * 2);
+        descriptor.maximum_length.set(units.len() as u16 * 2);
+        descriptor.buffer.set(block + 0x80 + index * 0x20);
+        entry(index).value_name.set(string);
+    };
+    name(0, "VERSAO", false);
+    name(1, "Nome", true);
+    let query = |capacity: u32| {
+        guest::write32(length, capacity);
+        guest::write32(required, 0xFFFF_FFFF);
+        keys::query_multiple_values(key, entries, 2, buffer, length, required, false).unwrap_or(u32::MAX)
+    };
+    let full = query(0x40);
+    let laid_out = entry(0).data_length.get() == 4 && entry(0).data_offset.get() == 0 && entry(0).type_.get() == 4 && entry(1).data_length.get() == 6 && entry(1).data_offset.get() == 4 && entry(1).type_.get() == 1;
+    assert(full == 0 && laid_out && guest::read32(buffer) == 7 && guest::read_bytes(buffer + 4, 6) == [b'a', 0, b'b', 0, 0, 0] && guest::read32(length) == 10 && guest::read32(required) == 10, "keyservices: NtQueryMultipleValueKey com os dois valores");
+    let short = query(6);
+    assert(short == 0x8000_0005 && guest::read32(length) == 4 && guest::read32(required) == 10, "keyservices: NtQueryMultipleValueKey curto da BUFFER_OVERFLOW com os bytes usados e o total");
+    name(1, "Ausente", false);
+    let missing = query(0x40);
+    assert(missing == 0xC000_0034 && guest::read32(required) == 0 && guest::read32(length) == 0x40, "keyservices: NtQueryMultipleValueKey com valor ausente");
+    let _ = keys::named_value(Kind::DeleteValue, key, "Nome", 0, &[]);
+    guest::free_bytes(block);
+}
+
 fn key_services_kernel_mode(assert: Assert) {
     use crate::ntos::cm::key::services::{self as keys, fields, Kind};
     use crate::ntos::cm::{callbacks, registry};
@@ -290,6 +329,7 @@ fn key_services_kernel_mode(assert: Assert) {
     let queried = keys::named_value(Kind::QueryValue, parent, "VERSAO", 0, &[]);
     assert(matches!(queried, Ok((0, Some(ref value))) if value.value_type == 4 && value.data == [7, 0, 0, 0]), "keyservices: NtQueryValueKey em duas etapas");
     assert(matches!(keys::named_value(Kind::QueryValue, parent, "Ausente", 0, &[]), Ok((0xC000_0034, None))), "keyservices: valor ausente");
+    query_multiple_values(assert, parent);
     // NtCreateKey relativo à raiz, com disposição.
     let storage = guest::alloc_bytes(0x400);
     let attributes = storage;
