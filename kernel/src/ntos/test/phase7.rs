@@ -2278,7 +2278,11 @@ fn user_syscalls_core(assert: Assert) {
     // ObpDefaultObject, sempre sinalizado; sem SYNCHRONIZE a espera é
     // recusada.
     let denied = call("NtWaitForSingleObject", directory, 0, string, 0) == 0xC000_0022;
-    let synchronized = call("NtOpenDirectoryObject", out, 0x10_0001, attributes, 0) == 0;
+    // A DACL da raiz não concede SYNCHRONIZE (o DIRECTORY_ALL_ACCESS não o
+    // inclui): o diretório com SYNCHRONIZE é um novo, sem nome, que o
+    // criador recebe com o acesso pedido.
+    set_object_attributes(unsafe { nt::ObjectAttributes::at(attributes) }, nt::ObjectAttributes::SIZE as u32, 0, 0, 0);
+    let synchronized = call("NtCreateDirectoryObject", out, 0x10_0001, attributes, 0) == 0;
     let waitable = guest::read64(out);
     guest::write64(buffer, second);
     guest::write64(buffer + 8, waitable);
