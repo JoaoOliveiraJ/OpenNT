@@ -434,6 +434,13 @@ comando = "cargo xtask test-boot DRIVER_START_COMPLETED 600000 --start-driver=ND
 descricao = "O gerenciador de serviços inicia o NDIS e depois o tcpip.sys da Microsoft, na ordem dos grupos de boot do Windows: o loader resolve os imports no ntoskrnl, no NETIO.SYS e no NDIS.SYS já carregados, no cng.sys, no FLTMGR.SYS (carregado pelo import) e no fwpkclnt.sys (biblioteca de export, com o DllInitialize); o DriverEntry consulta a TokenAccessInformation do token do System pelo ZwQueryInformationToken, monta dela o TOKEN da WFP (SeTokenFromAccessInformation), registra o NSI e a WFP e retorna sucesso, com o serviço em execução (state=4). O tcpip lê o IRQL inline (mov rax, cr8) entre KfRaiseIrql e KeLowerIrql, e o IRQL do kernel é o próprio CR8, como no x64 do NT: o nível que ele vê e o que o kernel vê são o mesmo."
 
 [[teste]]
+id = "rede"
+titulo = "Placa de rede e1000 com o miniport e o NDIS reais"
+marcador = "NIC_STARTED"
+comando = "cargo xtask test-boot NIC_STARTED 600000 --net --build-dir=build/rede --smp=1 --expect=NIC_LINK_UP"
+descricao = "Com --net, o QEMU ganha a placa Intel PRO/1000 MT (e1000, PCI 8086:100E) com a rede de modo usuário, e o ndis.sys, o tcpip.sys e o afd.sys sobem antes da árvore do PnP, como os drivers de boot do Windows. O pci.sys real relata a placa sob a raiz ACPI e o PnP a instala pela linha genérica do nete1g3e.inf (PCI\\VEN_8086&DEV_100E, seção E100E) com o E1G6032E.sys, o miniport Intel da caixa, validado pelo catálogo, com o que o instalador da classe Net grava (NetCfgInstanceId, NetLuidIndex, as diretivas de rede e a Linkage). O NDIS acha o objeto da interface e as ligações no banco da configuração de rede da instalação (Control\\NetworkSetup2), o AddDevice do miniport é o dele e o START chama o MiniportInitializeEx: o miniport mapeia o BAR0, registra as portas, a interrupção de linha e o DMA de dispersão, aloca os anéis e liga a recepção e a transmissão (NIC_STARTED). O enlace sai conectado pelo OID_GEN_MEDIA_CONNECT_STATUS, consultado pelo IOCTL_NDIS_QUERY_GLOBAL_STATS no \\Device\\{NetCfgInstanceId}, com o endereço 52:54:00:12:34:56 (NIC_LINK_UP). Ainda não: a ligação do tcpip.sys ao adaptador (TCPIP_BOUND) e o eco ICMP ao gateway pelo WSK (PING_OK)."
+
+[[teste]]
 id = "basicdisplay"
 titulo = "BasicDisplay.sys real pelo PnP, sobre o dxgkrnl.sys"
 marcador = "BASICDISPLAY_OK"
@@ -1059,9 +1066,9 @@ categoria = "Drivers do Windows"
 icone = "plug"
 descricao = "A pilha de rede do Windows (NDIS e TCP/IP) com o miniport Intel PRO/1000 da Microsoft, que atende a placa e1000 emulada pelo QEMU (PCI 8086:100E)."
 estado = "em desenvolvimento"
-testes = ["ndis", "afd", "tcpip"]
+testes = ["ndis", "afd", "tcpip", "rede"]
 fase = "8"
-notas = "O ndis.sys e o afd.sys reais carregam e o DriverEntry deles tem sucesso (testes ndis e afd), iniciados na ordem dos grupos de boot do Windows (NDIS, depois AFD; `--start-driver` aceita a lista). O netio.sys, que não tem serviço, entra como DLL dependente do ndis.sys: os dois importam um do outro e o carregador resolve o ciclo pela entrada já listada, como o MmLoadSystemImage; o DllInitialize dele chama o NdisDllInitialize e sobe o NMR, o NSI (com o repositório Control\\Nsi da instalação) e a WFP. No caminho o kernel passou a dar o que esses DriverEntry usam como no ntoskrnl: o RtlQueryRegistryValues do RtlpQueryRegistryValues, o descritor de segurança padrão dos dispositivos e dos DRIVER_OBJECTs (ObGetObjectSecurity e ObSetSecurityObjectByPointer sobre eles), o ServiceKeyName, o ObReferenceObjectByHandle de handles de chave, os eventos de memória de \\KernelObjects, o FullDllName de \\SystemRoot que o NMR confere, os encaminhamentos de export sem extensão, o NtCreateFile e o HalTranslateBusAddress. O tcpip.sys carrega (com o fltmgr.sys, que ele importa) e o DriverEntry dele passa pelo NSI e pela WFP: o ZwQueryInformationToken com TokenAccessInformation (classe 22) devolve o bloco do SepCopyTokenAccessInformation (os hashes de SIDs, os atributos de segurança no formato interno do token e os privilégios), que o SeTokenFromAccessInformation e o SeQuerySecurityAttributesTokenAccessInformation consomem, e o SeQueryInformationToken responde a TokenSessionId e a TokenIsAppContainer que o tcpip e o ndis pedem. O tcpip lê o IRQL direto no registrador (mov rax, cr8) entre o KfRaiseIrql e o KeLowerIrql, e o IRQL do kernel é o próprio CR8, como no Windows x64: o DriverEntry do tcpip termina com sucesso (state=4, teste tcpip). Com o NDIS e o AFD iniciados, a pilha PS/2 e o teclado seguem normais (as threads de sistema dos drivers de rede esperam fora da lista de prontas). O NtQuerySystemInformationEx de modo kernel responde a distância entre nós NUMA que o ndis.sys pergunta, e o PsChargeProcessPoolQuota/PsReturnPoolQuota cobram a cota de pool do processo para o afd.sys. O kernel já registra o host de extensão do controle de taxa de rede que o tcpip.sys usa (id 4). Sem miniport: a placa e1000 do QEMU (PCI 8086:100E) ainda não tem o E1G6032E.sys ligado pelo PnP."
+notas = "O ndis.sys e o afd.sys reais carregam e o DriverEntry deles tem sucesso (testes ndis e afd), iniciados na ordem dos grupos de boot do Windows (NDIS, depois AFD; `--start-driver` aceita a lista). O netio.sys, que não tem serviço, entra como DLL dependente do ndis.sys: os dois importam um do outro e o carregador resolve o ciclo pela entrada já listada, como o MmLoadSystemImage; o DllInitialize dele chama o NdisDllInitialize e sobe o NMR, o NSI (com o repositório Control\\Nsi da instalação) e a WFP. No caminho o kernel passou a dar o que esses DriverEntry usam como no ntoskrnl: o RtlQueryRegistryValues do RtlpQueryRegistryValues, o descritor de segurança padrão dos dispositivos e dos DRIVER_OBJECTs (ObGetObjectSecurity e ObSetSecurityObjectByPointer sobre eles), o ServiceKeyName, o ObReferenceObjectByHandle de handles de chave, os eventos de memória de \\KernelObjects, o FullDllName de \\SystemRoot que o NMR confere, os encaminhamentos de export sem extensão, o NtCreateFile e o HalTranslateBusAddress. O tcpip.sys carrega (com o fltmgr.sys, que ele importa) e o DriverEntry dele passa pelo NSI e pela WFP: o ZwQueryInformationToken com TokenAccessInformation (classe 22) devolve o bloco do SepCopyTokenAccessInformation (os hashes de SIDs, os atributos de segurança no formato interno do token e os privilégios), que o SeTokenFromAccessInformation e o SeQuerySecurityAttributesTokenAccessInformation consomem, e o SeQueryInformationToken responde a TokenSessionId e a TokenIsAppContainer que o tcpip e o ndis pedem. O tcpip lê o IRQL direto no registrador (mov rax, cr8) entre o KfRaiseIrql e o KeLowerIrql, e o IRQL do kernel é o próprio CR8, como no Windows x64: o DriverEntry do tcpip termina com sucesso (state=4, teste tcpip). Com o NDIS e o AFD iniciados, a pilha PS/2 e o teclado seguem normais (as threads de sistema dos drivers de rede esperam fora da lista de prontas). O NtQuerySystemInformationEx de modo kernel responde a distância entre nós NUMA que o ndis.sys pergunta, e o PsChargeProcessPoolQuota/PsReturnPoolQuota cobram a cota de pool do processo para o afd.sys. O kernel já registra o host de extensão do controle de taxa de rede que o tcpip.sys usa (id 4). Com --net (teste rede) a placa e1000 do QEMU (PCI 8086:100E) recebe o E1G6032E.sys pelo PnP (nete1g3e.inf, seção E100E, com o que o instalador da classe Net grava), o NDIS acha o objeto da interface, as ligações (ProtocolList) e os objetos dos protocolos no banco da configuração de rede da instalação (Control\\NetworkSetup2), o MiniportInitializeEx sobe a placa (NIC_STARTED) e o enlace sai conectado (NIC_LINK_UP). No caminho: o swprintf_s e os outros printf variádicos leem os argumentos da pilha do chamador sem limite (o NDIS monta o caminho do NetworkSetup2 com 13 argumentos) e o RtlUpcaseUnicodeString/RtlDowncaseUnicodeString seguem o 19041 (destino com MaximumLength igual ao Source.Length, sem NUL, tabela NLS de um para um; o NDIS sobe o nome do protocolo assim, e sem isso as ligações do adaptador não achavam os protocolos registrados pelo tcpip.sys). Falta a ligação do TCP/IP: o NDIS só liga protocolos quando o estado de ligação do miniport está limpo, e o bit 0x80000 que o ndisMInitializeAdapter liga só sai na chegada da interface GUID_DEVINTERFACE_NET ao callback do NDIS, que no NT vem pela fila de eventos do PnP depois do START e no OpenNT ainda vem dentro do IoSetDeviceInterfaceState, antes de o bit ser ligado."
 
 [[componente]]
 nome = "Arquivos em memória"
@@ -1719,8 +1726,9 @@ para = "O shell ainda não executa .exe e não há sessão de usuário."
 [[roda]]
 nome = "Rede pela placa e1000"
 grupo = "marco"
-faz = "O NDIS, o TCP/IP e o AFD sobem, mas nenhum pacote sai pela placa do QEMU."
-para = "Falta ligar o miniport E1G6032E.sys à placa e1000."
+teste = "rede"
+faz = "Com --net, o E1G6032E.sys sobe na placa e1000 pelo PnP e o NDIS relata o enlace conectado."
+para = "O tcpip.sys ainda não se liga ao adaptador: a chegada da interface de rede ao NDIS precisa vir depois do START."
 
 [[roda]]
 nome = "hal.dll"
@@ -1988,7 +1996,7 @@ grupo = "driver"
 teste = "ndis"
 estado = "roda"
 faz = "Importam um do outro e carregam juntos; o NetIO sobe o NMR, o NSI e a WFP, e o DriverEntry do NDIS tem sucesso."
-para = "Nenhuma placa de rede ligada: o miniport da e1000 ainda não carrega."
+para = "Com --net a placa e1000 sobe, mas o TCP/IP ainda não se liga a ela."
 
 [[roda]]
 nome = "afd.sys e tdi.sys"
@@ -2003,13 +2011,15 @@ grupo = "driver"
 teste = "tcpip"
 estado = "roda"
 faz = "Sobe depois do NDIS, com o fltmgr.sys e a fwpkclnt.sys; o DriverEntry registra o NSI e a WFP e termina com sucesso (state=4)."
-para = "Nenhuma placa de rede ligada: o miniport da e1000 ainda não carrega."
+para = "Com --net a placa e1000 sobe, mas o TCP/IP ainda não se liga a ela."
 
 [[roda]]
 nome = "E1G6032E.sys"
 grupo = "driver"
-faz = "O miniport Intel PRO/1000 da placa e1000 do QEMU."
-para = "Ainda não é ligado pelo PnP."
+teste = "rede"
+estado = "roda"
+faz = "O miniport Intel PRO/1000 da placa e1000 do QEMU: instalado pelo nete1g3e.inf, iniciado pelo NDIS, com o enlace conectado."
+para = "Nenhum pacote ainda: o TCP/IP não está ligado à placa."
 
 [[roda]]
 nome = "smss.exe"

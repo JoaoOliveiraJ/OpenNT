@@ -1708,6 +1708,63 @@ kbdhid até a coleção do hidclass, que pede a sessão de quem abre
 abertura por nome leva a thread que abre em Irp->Tail.Overlay.Thread
 (`io_manager::open_file_object`; teste `io_create_thread` na fase 6).
 
+Com `--net` (a opção de carga `NET`, `drivers/net/net_stack.rs`; no xtask,
+também `-netdev user -device e1000`, a placa Intel PRO/1000 MT, PCI
+8086:100E, com a rede de modo usuário do QEMU) a pilha de rede do Windows
+sobe sobre a placa. Antes da árvore do boot sobem o ndis.sys, o tcpip.sys e
+o afd.sys, drivers de boot e de sistema no Windows (grupos NDIS e PNP_TDI);
+o tcpip.sys registra os protocolos TCPIP e TCPIP6 no NDIS
+(NdisRegisterProtocolDriver pelo FlAttachClient do NMR). Na árvore, o
+pci.sys relata a placa e a linha do nete1g3e.inf (`pnp/install_net.rs`,
+seção E100E, a genérica PCI\VEN_8086&DEV_100E que casa com o subsistema
+1AF4:1100 do QEMU) a instala com o serviço E1G60 (o E1G6032E.sys, que no
+Windows o `[e1000.CopyFiles]` copia para o System32\drivers; nesta máquina
+ele só está no repositório de drivers, e o xtask o copia de lá, coberto
+pelo catálogo 0110), o AddReg da seção e o que o instalador da classe Net
+grava na chave do driver: as diretivas `*IfType`, `*MediaType`,
+`*PhysicalMediaType`, `Characteristics` e `BusType`, o NetCfgInstanceId, o
+NetLuidIndex, o ComponentId, o DeviceInstanceID e a `Linkage`. O ndis.sys
+do Windows 10 lê o adaptador e as ligações do banco da configuração de rede
+(`Control\NetworkSetup2`), que o serviço de configuração mantém e que aqui
+vem da instalação (`cm/network_setup.rs`, na hive SYSTEM): o objeto da
+interface em `Interfaces\{NetCfgInstanceId}\Properties` (cada propriedade é
+a subchave `{a111f1xx-5923-47c0-9a68-d0bafb577901}\PPPP` com o valor padrão
+do tipo 0xFFFF0000 | DEVPROP_TYPE: NetLuid, IfAlias, IfDescr, IfType, os
+tipos de mídia e as Characteristics do INF), de onde o NDIS cria o bloco da
+interface na partida (sem ele o AddDevice falha com 0xC00002F0); as
+ligações em `Interfaces\{guid}\Kernel` (o ProtocolList, TCPIP e TCPIP6); e
+os objetos dos protocolos (`Protocols\Lookup` com o GUID de cada nome e
+`Protocols\{GUID}\Properties`). O NetLuidIndex 0x8000 fica na faixa que o
+serviço de configuração reserva (0x7F00 a 0xC000, que o NDIS não confere no
+bitmap). O AddDevice do miniport é o do NDIS (ndisPnPAddDevice: o FDO
+`\Device\NDMP1` com o link `\Device\{NetCfgInstanceId}` e a interface
+GUID_DEVINTERFACE_NET); no START o NDIS chama o MiniportInitializeEx, e o
+E1G6032E.sys mapeia o BAR0 (NdisMMapIoSpace), registra as portas, a
+interrupção de linha (NdisMRegisterInterruptEx, IRQ 11 pelo _PRT e pelo
+árbitro do acpi.sys) e o DMA de dispersão (NdisMRegisterScatterGatherDma,
+pelo adaptador de DMA da HAL), aloca os anéis de recepção e transmissão
+(NdisMAllocateSharedMemory) e liga a recepção e a transmissão; o NDIS
+responde o enlace conectado (OID_GEN_MEDIA_CONNECT_STATUS pelo
+IOCTL_NDIS_QUERY_GLOBAL_STATS no `\Device\{NetCfgInstanceId}`) com o
+endereço 52:54:00:12:34:56 (`NIC_STARTED`, `NIC_LINK_UP`). A configuração
+IPv4 estática (10.0.2.15/24 com o gateway 10.0.2.2) também vem da
+instalação, onde o netio.sys guarda o estado persistente do NSI e o
+tcpip.sys a lê quando a interface sobe (`Control\Nsi\{ModuleId do
+IPv4}\10` e `\16`: o nome do valor é a chave em hexadecimal e o dado os
+parâmetros graváveis seguidos da máscara, no formato que o iphlpapi.dll
+monta das estruturas públicas MIB_UNICASTIPADDRESS_ROW e
+MIB_IPFORWARD_ROW2). O eco ICMP do teste (`drivers/net/echo.rs`) é um
+cliente do Winsock Kernel (WskRegister e WskCaptureProviderNPI do NETIO.SYS,
+o provedor é o afd.sys, um socket IPv4 bruto do ICMP). A ligação do TCP/IP
+ao adaptador ainda não acontece: o NDIS só liga os protocolos de um
+miniport cujo estado de ligação está limpo, e o bit 0x80000 que o
+ndisMInitializeAdapter liga só sai na chegada da interface
+GUID_DEVINTERFACE_NET ao callback do próprio NDIS
+(ndisMiniportDeviceReadyNotification, registrado pelo
+IoRegisterPlugPlayNotification); no NT essa chegada vai pela fila de
+eventos do PnP e chega depois do START. O OpenNT ainda a entrega dentro do
+IoSetDeviceInterfaceState, no meio do START e antes de o bit ser ligado.
+
 O KMDF registra os dispositivos no power framework com o PO_FX_DEVICE_V2
 (e o V3 do Directed Power Management): o PoFxRegisterDevice (`po/fx.rs`)
 aceita as três versões com o layout de cada uma, e o KMDF guarda a tabela
@@ -1851,9 +1908,9 @@ Os recursos de todos esses nós passam pelos árbitros e tradutores dos
 drivers de barramento (`io/pnp/arbiter.rs`): o teclado recebe as portas
 0x60/0x64 do árbitro do pci.sys e a IRQ 1 do árbitro do acpi.sys, com o
 vetor que o tradutor dele dá. Os dispositivos sem driver na caixa ficam
-sem instalação (CM_PROB_FAILED_INSTALL): a placa de rede e1000 (o driver
-dela vem do repositório de drivers, nete1g3e.inf), a controladora de
-disquete (fdc.inf), as portas serial e paralela (msports.inf; o serial.sys
+sem instalação (CM_PROB_FAILED_INSTALL): a placa de rede e1000 sem `--net`
+(com a opção ela recebe o E1G6032E.sys, veja a pilha de rede abaixo), a
+controladora de disquete (fdc.inf), as portas serial e paralela (msports.inf; o serial.sys
 tomaria a COM1, que é a saída do log do kernel), o fw_cfg do QEMU e o
 processador (cpu.inf). O barramento PCI interno do kernel fica fora dessa
 árvore; as funções dos drivers internos são reconhecidas pelos ids de
