@@ -18,10 +18,14 @@
 //!   STATUS_INVALID_PARAMETER_2; só então o handle de saída e o ULONG de
 //!   Reserved (o identificador IR) são sondados. HIGH_RESOLUTION é aceito (o
 //!   KTIMER2 de alta resolução). Com IR, o identificador passa pelo
-//!   ExpCheckIRTimerAccess (rva 0x7724c8); sem hardware de wake IR, o timer
-//!   IR é um Timer2 com o TypeFlags IdleResilient. O NtCreateIRTimer
+//!   ExpCheckIRTimerAccess (rva 0x7724c8) e o KeInitializeIRTimer grava o
+//!   índice e o sub nos bytes 2 e 3 do Header (um sub que não fica abaixo
+//!   do máximo é FAST_FAIL_INVALID_ARG); sem hardware de wake IR, o timer IR
+//!   é um Timer2 com o TypeFlags IdleResilient. O NtCreateIRTimer
 //!   (TimerHandle, IrTimerId, DesiredAccess) é o NtCreateTimer2 sem
-//!   OBJECT_ATTRIBUTES e com o atributo IR.
+//!   OBJECT_ATTRIBUTES e com o atributo IR, e o NtSetIRTimer(TimerHandle,
+//!   DueTime) é o ExpSetTimer2 sem período nem parâmetros (DueTime NULL
+//!   cancela).
 //! - O identificador IR é `índice | sub << 16`: índice de 1 a 15 e sub até o
 //!   máximo do ExpIRTimerDescs (senão STATUS_INVALID_PARAMETER). De modo
 //!   usuário, um índice com SID exige o SID na identidade do chamador
@@ -74,6 +78,8 @@ const VALID_ATTRIBUTES: u32 = 0x8000_000E;
 const TYPE_IDLE_RESILIENT: u8 = 2;
 /// O tipo do handle de usuário deste objeto.
 pub const KIND: &str = "timer";
+/// FAST_FAIL_INVALID_ARG.
+const FAST_FAIL_INVALID_ARG: u64 = 5;
 
 /// Uma entrada do ExpIRTimerDescs: o nome, as subautoridades do SID de
 /// serviço (S-1-5-80-...) e o maior sub.
@@ -223,6 +229,17 @@ pub fn create_from_user(handle_out: u64, reserved: u64, object_attributes: u64, 
     guest::write_bytes(pointer, &[0u8; IrTimer::SIZE as usize]);
     let timer = body(pointer);
     timer2::initialize(&timer.ke_timer, 0, 0, attributes);
+    if ir {
+        // KeInitializeIRTimer (rva 0x380d20): o byte baixo do índice e o do
+        // sub nos bytes 2 e 3 do Header (Timer2ComponentId e
+        // Timer2RelativeId); o ExCheckValidIRTimerId exige o sub abaixo do
+        // máximo, senão FAST_FAIL_INVALID_ARG.
+        let (index, sub) = (identifier as u8, (identifier >> 16) as u8);
+        timer.ke_timer.header.lock.atomic().fetch_or(((sub as i32) << 24) | ((index as i32) << 16), core::sync::atomic::Ordering::SeqCst);
+        if DESCRIPTORS.get(index as usize).is_none_or(|descriptor| sub as u16 >= descriptor.maximum) {
+            crate::ntos::ke::bugcheck::bug_check_ex(0x139, FAST_FAIL_INVALID_ARG, 0, 0, 0);
+        }
+    }
     timer.attributes.set(attributes);
     if let Err(error) = dispatcher_objects::create(pointer, KIND, dispose, None, 0, true, DispatcherHooks::default()) {
         guest::free_bytes(pointer);

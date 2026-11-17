@@ -1442,8 +1442,9 @@ fn user_mutants_and_timers(assert: Assert) {
     // NtCreateIRTimer: índice 0 e sub acima do máximo são inválidos; o
     // índice 6 (Power) exige o NT SERVICE\Power na identidade de uma syscall
     // de modo usuário (o RtlCheckTokenMembership em KernelMode concede
-    // sempre). O timer IR é um IRTimer com o TypeFlags IdleResilient, que
-    // recusa período; o NtSetIRTimer é o NtSetTimer2 sem período.
+    // sempre). O timer IR é um IRTimer com o TypeFlags IdleResilient e o
+    // índice e o sub nos bytes 2 e 3 do Header, que recusa período; o
+    // NtSetIRTimer é o ExpSetTimer2 sem período (DueTime NULL cancela).
     let identifier = block + 0x60;
     guest::write32(rsp + 0x28, 0x1F_0003);
     guest::write32(identifier, 0);
@@ -1460,11 +1461,11 @@ fn user_mutants_and_timers(assert: Assert) {
     let power_allowed = call("NtCreateIRTimer", out, identifier, 0x1F_0003, 0);
     previous_mode.set(saved_previous_mode);
     let ir_timer = guest::read64(out);
-    let idle_resilient = power_allowed == 0 && ktimer2(ir_timer).is_some_and(|body| body.type_flags.get() == 2);
+    let idle_resilient = power_allowed == 0 && ktimer2(ir_timer).is_some_and(|body| body.type_flags.get() == 2 && (body.header.lock.get() as u32) >> 16 == 6);
     unsafe { nt::LargeInteger::at(info) }.quad_part.set(10_000);
     due_time.quad_part.set(-10_000_000);
     let period_refused = call("NtSetTimer2", ir_timer, due, info, 0) == 0xC000_000D;
-    let ir_set = call("NtSetIRTimer", ir_timer, due, 0, 0) == 0 && call("NtCancelTimer2", ir_timer, 0, 0, 0) == 0;
+    let ir_set = call("NtSetIRTimer", ir_timer, due, 0, 0) == 0 && call("NtSetIRTimer", ir_timer, 0, 0, 0) == 0 && ktimer2(ir_timer).is_some_and(|body| body.header.lock.get() & 0x100 == 0) && call("NtCancelTimer2", ir_timer, 0, 0, 0) == 0;
     if power_allowed == 0 {
         let _ = call("NtClose", ir_timer, 0, 0, 0);
     }

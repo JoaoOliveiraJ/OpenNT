@@ -65,10 +65,17 @@ fn nt_create_ir_timer(out: u64, id: u64, access: u64, _a4: u64, _rsp: u64) -> Re
     ir_timer::create_from_user(out, id, 0, ir_timer::ATTRIBUTE_IR, access as u32)
 }
 
-/// NtSetIRTimer(TimerHandle, DueTime): o NtSetTimer2 sem período nem
-/// parâmetros.
-fn nt_set_ir_timer(handle: u64, due: u64, _a3: u64, _a4: u64, rsp: u64) -> Result<u32, KernelError> {
-    nt_set_timer2(handle, due, 0, 0, rsp)
+/// NtSetIRTimer(TimerHandle, DueTime): o ExpSetTimer2 sem período nem
+/// parâmetros; sem o teste de DueTime NULL do NtSetTimer2, um DueTime NULL
+/// cancela o timer.
+fn nt_set_ir_timer(handle: u64, due: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
+    if due == 0 {
+        return Ok(ir_timer::set(handle, None, 0, None));
+    }
+    Ok(match state::capture_large_integer(due) {
+        Ok(due) => ir_timer::set(handle, Some(due), 0, None),
+        Err(status) => status,
+    })
 }
 
 /// NtCancelTimer2(TimerHandle, Parameters): o Parameters não é lido.

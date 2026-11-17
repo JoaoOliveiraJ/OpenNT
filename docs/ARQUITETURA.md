@@ -3202,8 +3202,11 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   atributo IR (2): o identificador IR passa pelo ExpCheckIRTimerAccess
   (`ex/ir_timer.rs`: índice de 1 a 15, sub até o máximo do ExpIRTimerDescs
   e o SID do serviço dono do índice na identidade, como o NT SERVICE\Power
-  do índice 6 que o umpo pede); sem hardware de wake IR, o timer é um
-  Timer2 comum e o NtSetIRTimer é o NtSetTimer2 sem período. O services.exe e o lsass pedem ainda as
+  do índice 6 que o umpo pede) e o KeInitializeIRTimer grava o índice e o
+  sub nos bytes 2 e 3 do Header do KTIMER2 (um sub que não fica abaixo do
+  máximo é FAST_FAIL_INVALID_ARG); sem hardware de wake IR, o timer é um
+  Timer2 comum e o NtSetIRTimer é o ExpSetTimer2 sem período (DueTime NULL
+  cancela). O services.exe e o lsass pedem ainda as
   classes ProcessTimes (4), ProcessImageFileNameWin32 (43) e
   ProcessMitigationPolicy (52) do NtQueryInformationProcess
   (`ps/query_process.rs`), a ProcessRaiseUMExceptionOnInvalidHandleClose
