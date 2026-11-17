@@ -4,7 +4,7 @@
 //! O hal.dll, as pilhas de teclado/mouse e de armazenamento e as bibliotecas
 //! de export que elas importam (wmilib.sys e WppRecorder.sys) entram no
 //! bundle do kernel (a fase 0 os copia para o sistema de arquivos em
-//! memória), com o MUI da biblioteca de recursos de boot (bootres.dll.mui,
+//! memória), com o hwpolicy.sys (a política do XSAVE, lida no boot), o MUI da biblioteca de recursos de boot (bootres.dll.mui,
 //! os textos da tela de bugcheck no idioma de boot da instalação). A tabela
 //! de mensagens do ntoskrnl.exe (os nomes dos códigos de bugcheck) vai para
 //! a seção de recursos do PE do kernel. O volume NTFS leva o cng.sys, a cadeia da CI (ci.dll, msrpc.sys
@@ -53,6 +53,9 @@ const BUNDLED: &[&str] = &[
     "System32/drivers/wmilib.sys",
     "System32/drivers/WppRecorder.sys",
     "System32/drivers/watchdog.sys",
+    // O driver de política de hardware: a política do XSAVE (o recurso 0x65)
+    // que o KiInitializeXSave consulta.
+    "System32/drivers/hwpolicy.sys",
     // A pilha IDE e de volumes que o PnP sobe com `--storage=real`, e o
     // volume.sys, o driver de função do devnode STORAGE\Volume que o
     // volmgr.sys relata (volume.inf).
