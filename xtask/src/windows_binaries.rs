@@ -492,8 +492,9 @@ const SMSS_PROGRAMS: &[&str] = &[
 /// LSM), pelo mapa da cadeia (`docs/mapa-cadeia.md`): o umpo.dll do serviço
 /// Power, o psmsrv.dll do BrokerInfrastructure e o
 /// SystemEventsBrokerServer.dll do SystemEventsBroker, com o brokerlib.dll
-/// que ele importa. Os imports estáticos deles já estão no volume.
-const SERVICE_CHAIN_PROGRAMS: &[&str] = &["umpo.dll", "psmsrv.dll", "SystemEventsBrokerServer.dll", "brokerlib.dll"];
+/// que ele importa, e o umpnpmgr.dll do PlugPlay. Os imports estáticos deles
+/// já estão no volume.
+const SERVICE_CHAIN_PROGRAMS: &[&str] = &["umpo.dll", "psmsrv.dll", "SystemEventsBrokerServer.dll", "brokerlib.dll", "umpnpmgr.dll"];
 
 /// A tela de logon da sessão 1: o dwm.exe que o dwminit.dll do winlogon
 /// cria e o LogonUI.exe do StartLogonUI, com o fecho dos imports estáticos

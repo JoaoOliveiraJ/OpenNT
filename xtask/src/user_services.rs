@@ -10,9 +10,13 @@
 //! `svchost.exe -k rpcss -p`).
 //!
 //! Como os binários de System32, as chaves vêm desta máquina no build, com os
-//! valores daqui: as chaves de serviço desses quatro e as do Power, do
-//! BrokerInfrastructure e do SystemEventsBroker (com Parameters e
+//! valores daqui: as chaves de serviço desses quatro e as do PlugPlay, do
+//! Power, do BrokerInfrastructure e do SystemEventsBroker (com Parameters e
 //! Security), a ordem dos grupos de serviço (`Control\ServiceGroupOrder`),
+//! os dois valores de `Control` que o services.exe lê no início automático
+//! (o `EarlyStartServices`, a lista do conjunto inicial, e o
+//! `SvcHostSplitThresholdInKB`, o limite de memória para separar os
+//! serviços de um svchost em processos próprios),
 //! a configuração de energia (`Control\Power`), as definições WNF
 //! (`Control\Notifications`), as opções do produto (`Control\ProductOptions`)
 //! e,
@@ -32,10 +36,18 @@
 use crate::host_language::HostKey;
 
 /// Os serviços da cadeia do LSM e os do mesmo svchost do DcomLaunch que o
-/// início automático sobe com ele: o Power (o umpo.dll, que o
-/// ScAutoStartServices inicia pelo nome antes dos outros), o
-/// BrokerInfrastructure e o SystemEventsBroker.
-const SERVICES: &[&str] = &["DcomLaunch", "RpcEptMapper", "RpcSs", "LSM", "Power", "BrokerInfrastructure", "SystemEventsBroker"];
+/// início automático sobe com ele: o PlugPlay (o umpnpmgr.dll) e o Power (o
+/// umpo.dll), que o ScAutoStartServices inicia pelo nome, nessa ordem, antes
+/// dos outros, o BrokerInfrastructure e o SystemEventsBroker.
+const SERVICES: &[&str] = &["DcomLaunch", "RpcEptMapper", "RpcSs", "LSM", "PlugPlay", "Power", "BrokerInfrastructure", "SystemEventsBroker"];
+
+/// Os valores de `Control` que o services.exe lê: o EarlyStartServices (o
+/// ScStartEarlySetOfServices; sem ele todo serviço automático entra no
+/// conjunto inicial) e o SvcHostSplitThresholdInKB (o
+/// ScReadSCMConfiguration separa os serviços de um svchost quando a memória
+/// física chega ao limite; sem ele não separa).
+#[cfg(windows)]
+const CONTROL_VALUES: &[&str] = &["EarlyStartServices", "SvcHostSplitThresholdInKB"];
 
 /// As chaves da hive SYSTEM, já no conjunto de controle que a hive guarda
 /// (`control_set`, como `ControlSet001`).
@@ -49,6 +61,12 @@ pub fn system_keys(control_set: &str) -> Vec<HostKey> {
             registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\Services\\{service}"), &format!("{control_set}\\Services\\{service}"), true, &mut keys);
         }
         registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\Control\\ServiceGroupOrder"), &format!("{control_set}\\Control\\ServiceGroupOrder"), false, &mut keys);
+        // Só os valores de CONTROL_VALUES da chave Control.
+        let first = keys.len();
+        registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\Control"), &format!("{control_set}\\Control"), false, &mut keys);
+        if let Some(control) = keys.get_mut(first) {
+            control.values.retain(|(name, _, _)| CONTROL_VALUES.iter().any(|kept| kept.eq_ignore_ascii_case(name)));
+        }
         // As opções do produto: o tipo, a suíte e a política de licença
         // (ProductPolicy) que o NtQueryLicenseValue lê; sem ela toda
         // consulta de licença volta STATUS_DATA_ERROR e o GetProductInfo dá
