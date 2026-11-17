@@ -139,7 +139,7 @@ do kernel, no QEMU.
 | `kernel/src/drivers/` | VGA, console, teclado PS/2, barramentos, disco ATA e sistemas de arquivos (`drivers/fs/`: RAMFS e NTFS) |
 | `kernel/src/shell/`, `kernel/src/apps/` | Shell e programas de exemplo |
 | `xtask/` | Build, PE32+ do kernel, `os.img`, QEMU, `test-boot`, `test-all`, `capturas`, `status`, `debug` |
-| `tools/` | Ferramentas de desenvolvimento: `kd-client` (o cliente do depurador do kernel), `kd-gui` (o depurador gráfico `opennt-dbg`) e `kd-re` (o depurador de engenharia reversa `opennt-re`) |
+| `tools/` | Ferramentas de desenvolvimento: `kd-client` (o cliente do depurador do kernel), `kd-gui` (o depurador gráfico `opennt-dbg`), `kd-re` (o depurador de engenharia reversa `opennt-re`) e `kd-mcp` (o servidor MCP `opennt-mcp`, para agentes de IA) |
 | `docs/` | Roadmap, arquitetura e o site de status |
 
 A árvore completa, as regras de dependência de cada componente e as convenções
@@ -217,6 +217,11 @@ cargo test -p kd-gui --release -- --ignored --nocapture
 # Com --initial-process=smss o csrss.exe real roda e pode ser depurado.
 cargo run -p kd-re --release -- --launch --initial-process=smss --smp=1
 cargo test -p kd-re --release -- --ignored --nocapture
+
+# O servidor MCP (opennt-mcp) para agentes de IA: stdio ou HTTP local.
+cargo build -p kd-mcp --release
+cargo test -p kd-mcp
+cargo test -p kd-mcp --release -- --ignored --nocapture
 
 # O site de status (docs/site), os selos e o roadmap; as capturas de tela
 # do fim de cada [[teste]] (docs/site/capturas/<id>.png).
@@ -358,12 +363,57 @@ rodam no OpenNT (csrss.exe, smss.exe, wininit.exe).
   exceção dos quadros (SEH), símbolos, exports e imports por módulo.
 - Script: comandos do depurador com variáveis, `if`, `while`, `for` e
   `log`; `--script=arquivo` roda um roteiro depois do attach.
+- Análise automática na aba CPU: colchetes das funções (pela `.pdata`,
+  pelos símbolos ou pelo fluxo de código) e dos laços na margem;
+  comentários nas chamadas a APIs conhecidas com os argumentos
+  decodificados (`IoCreateDevice(DriverObject=..., DeviceName=L"\Device\X",
+  ...)`, pelos protótipos e pelo preparo de RCX, RDX, R8, R9 e da pilha);
+  as strings referenciadas em comentário. X (ou Ctrl+R) abre as
+  referências cruzadas do endereço, pelo índice do módulo feito uma vez. H
+  liga o destaque: um clique num registrador ou operando marca as
+  ocorrências na janela (`eax` também marca `rax`).
+- Registradores: além dos gerais, XMM0-XMM15 (hexadecimal, floats ou
+  doubles), MXCSR, a metade alta dos YMM quando o sistema liga o AVX, x87 e
+  MMX, DR0-DR7, LastError e LastStatus numa parada de usuário e a caixa dos
+  argumentos da convenção x64 (RCX, RDX, R8, R9 e a pilha, quantidade
+  ajustável).
+- Menu de contexto da desmontagem: Breakpoint (software, hardware, memória
+  por página, editar, ligar, remover), executar até a seleção (F4), nova
+  origem (Ctrl+*), Seguir (desmontagem, dump, mapa de memória, grafo),
+  Copiar (endereço, RVA, deslocamento no arquivo, seleção, bytes),
+  Binário (editar, preencher, NOP, montar), comentário, rótulo, marcador,
+  referências (Ctrl+R) e Procurar. Shift+clique seleciona várias linhas.
+- Editor de breakpoints: condição de parada, texto e condição de log,
+  comandos e condição de comando, nome, contagem de acertos, uma vez só,
+  silencioso e retorno rápido. Breakpoints de hardware em endereço de
+  usuário valem só no processo escolhido (DR0-DR3 no CONTEXT das threads
+  dele); breakpoints de memória por página (acesso, escrita, execução),
+  sem mudar a proteção que o processo consulta.
+- Observação com o valor que mudou desde a parada anterior em vermelho.
+- Dump: inteiros com e sem sinal de 1, 2, 4 e 8 bytes, float, double,
+  ponteiro com símbolo e desmontagem; "sincronizar" segue a expressão a
+  cada parada. Pilha com "retorno para X de Y", presa ao RSP ou numa
+  expressão.
+- Colunas: Pilha de chamadas (Endereço, Para, De, Tamanho, Comentário,
+  Parte), Threads (número, ID, entrada, TEB, RIP, suspensão, prioridade,
+  espera, LastError, tempos, ciclos) e Mapa de memória (Endereço, Tamanho,
+  Parte, Informação, Conteúdo, Tipo, Proteção, Proteção inicial; as regiões
+  executáveis em vermelho; gravar a região num arquivo).
+- O menu Arquivo liga o servidor MCP na própria janela (127.0.0.1): um
+  agente de IA e você usam a mesma sessão.
 - Teclas: F2 breakpoint, F7 entra, F8 passa por cima, F9 executa, Ctrl+F9
   até o retorno, Alt+F9 até o código de usuário, F4 até o cursor, F12
   pausa, Ctrl+G vai para, `;` comentário, `:` rótulo, Espaço monta, Ctrl+B
-  padrão, G grafo, `*` volta ao RIP. Tema claro e escuro.
+  padrão, G grafo, X e Ctrl+R referências, H destaque, Ctrl+* nova origem,
+  `*` volta ao RIP. Tema claro e escuro.
 
-![opennt-re parado dentro do dxgkrnl.sys real (a volta do IoCreateDevice), na aba CPU](docs/screenshots/kd-re-cpu.png)
+![opennt-re parado dentro de um driver real, na aba CPU: colchetes das funções e dos laços, a chamada ao IoCreateDevice com os argumentos e o destaque do rcx](docs/screenshots/kd-re-cpu.png)
+
+![Os registradores com SSE (XMM0-XMM15, MXCSR) e a caixa dos argumentos x64](docs/screenshots/kd-re-registradores.png)
+
+![O editor de breakpoints](docs/screenshots/kd-re-breakpoint.png)
+
+![A observação: os valores que mudaram depois de um passo em vermelho](docs/screenshots/kd-re-observacao.png)
 
 ![O csrss.exe real parado no ntdll!LdrLoadDll por um breakpoint de usuário](docs/screenshots/kd-re-usuario.png)
 
@@ -372,6 +422,57 @@ rodam no OpenNT (csrss.exe, smss.exe, wininit.exe).
 ![Referências a strings do driver, com o filtro por expressão regular](docs/screenshots/kd-re-referencias.png)
 
 ![O mapa de memória do csrss.exe: regiões do VAD e as seções das imagens](docs/screenshots/kd-re-memoria.png)
+
+### Servidor MCP (opennt-mcp)
+
+O `opennt-mcp` (`tools/kd-mcp`) deixa um agente de IA dirigir o depurador
+pelo Model Context Protocol (JSON-RPC 2.0). Usa o mesmo cliente do
+`cargo xtask debug` e do opennt-re.
+
+- Transportes: stdio (uma mensagem por linha) ou HTTP local
+  (`--http=PORTA`, só em 127.0.0.1, `POST /mcp`).
+- Ferramentas: `launch` (compila e abre o QEMU), `connect`, `detach`,
+  `status`, `break`, `go`, `wait_for_stop`, `step_into`, `step_over`,
+  `step_out`, `run_to`, `registers_get`, `register_set`, `memory_read`,
+  `memory_write`, `disassemble` (com a análise automática),
+  `symbol_lookup`, `symbol_resolve`, `modules`, `processes`, `threads`,
+  `set_process`, `breakpoint_set` (condição, log, comandos e as opções),
+  `breakpoint_clear`, `breakpoint_enable`, `breakpoint_list`, `backtrace`,
+  `search_strings`, `search_pattern`, `xrefs`, `nt_view` (`!process`,
+  `!thread`, `!irp`, `!devobj`, `!analyze`...), `trace_start`,
+  `trace_fetch`, `trace_stop`, `wait_for_serial` (um texto no log da
+  COM1), `read_serial_log`, `run_script`, `command` e `screenshot` (a tela
+  do convidado em PNG).
+- Recursos: o log da COM1, o DbgPrint, os breakpoints e os módulos.
+
+Para registrar num cliente MCP, use o binário compilado
+(`target/release/opennt-mcp`, ou `opennt-mcp.exe` no Windows) com a raiz do
+repositório:
+
+```text
+opennt-mcp --root=C:/caminho/do/OpenNT
+```
+
+Exemplo de configuração (o formato `mcpServers` aceito pela maioria dos
+clientes):
+
+```json
+{
+  "mcpServers": {
+    "opennt": {
+      "command": "C:/caminho/do/OpenNT/target/release/opennt-mcp.exe",
+      "args": ["--root=C:/caminho/do/OpenNT"],
+      "env": {
+        "QEMU": "C:/caminho/do/qemu/qemu-system-x86_64.exe"
+      }
+    }
+  }
+}
+```
+
+O `launch` roda `cargo xtask debug --launch --no-client`, então o `cargo`
+precisa estar no PATH do cliente. Por HTTP, o endereço é
+`http://127.0.0.1:PORTA/mcp`.
 
 ## Fora do escopo
 

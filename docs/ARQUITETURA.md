@@ -15,6 +15,7 @@ exporta; a HAL, os drivers e a inicialização ficam separados, como no NT.
 | `tools/kd-client` | o cliente do depurador do kernel, só com a biblioteca padrão: protocolo remoto do GDB, símbolos (`kernel.elf`, exports dos PEs, PDBs públicos com cache e download), pilha pela `.pdata` e pelos frame pointers, tipos do PDB do ntoskrnl, expressões, breakpoints, rastro de instruções e os comandos de texto; usado pelo `xtask` e pelo `kd-gui` |
 | `tools/kd-gui` | `opennt-dbg`, o depurador gráfico (egui/eframe, painéis do `egui_dock`, desmontagem do iced-x86, linhas e variáveis do DWARF pelo `addr2line`/`gimli`); as dependências dele não entram no build do kernel nem do `xtask` |
 | `tools/kd-re` | `opennt-re`, o depurador de engenharia reversa (layout no estilo dos depuradores de engenharia reversa) para o kernel e os processos de usuário, sobre o mesmo cliente; as dependências dele também ficam fora do kernel e do `xtask` |
+| `tools/kd-mcp` | `opennt-mcp`, o servidor do Model Context Protocol para agentes de IA (JSON-RPC 2.0 por stdio ou HTTP local), sobre o mesmo cliente; também a desmontagem e a análise automática que o `opennt-re` usa |
 
 ## 2. Árvore do kernel
 
@@ -1960,6 +1961,27 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
       endereço de usuário, o byte atual é conferido. Os comparadores de
       hardware do depurador valem só no anel 0: na entrada do anel 3 a HAL
       troca o banco de depuração pelo da thread (o CONTEXT dela).
+    - Breakpoints de hardware de usuário (`kd/user_hardware.rs`): um
+      `Z1`/`Z2`/`Z4` num endereço de usuário com processo escolhido arma o
+      comparador no CONTEXT de cada thread do processo (DR0-DR3 e DR7, o
+      mesmo índice em todas). O #DB do anel 3 que cita esse comparador, na
+      thread de um processo com a mesma raiz, para a máquina. Continuar de
+      um comparador de execução desliga o comparador por um passo da thread.
+      Os comparadores voltam às threads a cada continuação (as criadas
+      depois os recebem na parada seguinte); `monitor uhw` lista.
+    - Breakpoints de memória por página (`kd/page_breakpoints.rs`,
+      `monitor membp set <início> <tamanho> <a|w|x>`): o bit reservado 51 na
+      PTE de cada página (CPUs com MAXPHYADDR menor que 52). O #PF com RSVD
+      não é atendido pelos provedores do Mm e chega ao depurador antes da
+      entrega ao processo. A página volta ao normal, o tipo pedido é
+      conferido pelo código de erro e a instrução executa num passo antes de
+      o bit voltar. A proteção da região (VAD) não muda. A parada leva
+      `membp:endereço`. Limites: uma leitura do kernel na página falha como
+      violação de acesso; a saída do processo desarma as páginas dele.
+    - Registradores além do `g` (`kd/extended_state.rs`, só por `p`):
+      `ymm0h`-`ymm15h` (59-74) pelo XSAVE do componente AVX quando o sistema
+      liga o OSXSAVE; DR0-DR3, DR6 e DR7 (75-80), os do CONTEXT numa parada
+      de usuário e o conjunto do depurador numa parada do kernel.
     - Eventos (`kd/events.rs`): as notificações do Ps (`ps/notify`) chamam
       `opennt_kd_process_event`, `opennt_kd_thread_event` e
       `opennt_kd_image_event` (sysv64, argumentos nos registradores) antes de
@@ -1970,7 +1992,8 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
       ou pelo ImageFileName, e o tipo da tabela de usuário quando a linha
       nativa não o dá), `vad` (as regiões do `ProcessState`: base, tamanho,
       tipo, proteção, nome), `uthreads` (TEB, início, CONTEXT salvo,
-      RIP/RSP, estado, motivo da espera, LastError) e `kmap` (as faixas
+      RIP/RSP, estado, motivo da espera, LastError, prioridade, suspensão,
+      tempos de kernel e de usuário e ciclos do KTHREAD) e `kmap` (as faixas
       fixas do espaço de sistema). As listas são paginadas (`mais: N`);
       `vad` e `uthreads` só rodam com as travas livres.
   - Os APs ainda usam a própria IDT de três vetores: só o BSP trata
@@ -3350,6 +3373,31 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     strings ASCII e UTF-16, constantes, chamadas entre módulos e xrefs, os
     padrões com curingas, as strings soltas, a linguagem de roteiros e as
     notas (comentários, rótulos, marcadores) e patches por módulo + RVA.
+    Também:
+    - `functions`: limites de função pela `.pdata`, pelo tamanho do símbolo
+      ou por uma passada no fluxo de código (os blocos contíguos a partir da
+      entrada, sem seguir `call`); laços pelos desvios para trás dentro da
+      função; as marcas dos colchetes da desmontagem;
+    - `args`: as escritas simples que preparam RCX, RDX, R8, R9 e
+      `[rsp+0x20...]` antes de um `call` (`mov r, imm`, `lea r, [rip+x]`,
+      `xor r, r`, `mov r, r2`, `mov r, [rip+x]`, `mov [rsp+x], r/imm`) e o
+      valor de cada argumento;
+    - `prototypes`: os protótipos das APIs comuns do kernel, da ntdll e do
+      Win32 e o comentário da chamada (texto apontado, UNICODE_STRING,
+      OBJECT_ATTRIBUTES, tag de pool, símbolo; os deslocamentos das
+      estruturas saem do PDB do ntoskrnl quando os tipos estão carregados);
+    - `refs::xref_index`: o índice de referências cruzadas de um módulo.
+  - Imagens e o `--launch` (`image.rs`, `launcher.rs`): a imagem de um
+    módulo para as análises e o `cargo xtask debug --launch --no-client`,
+    usados pelo `opennt-re` e pelo `opennt-mcp`.
+  - Registradores além dos gerais (`registers.rs`,
+    `Client::extended_registers`): x87, MMX, XMM, MXCSR (do `g`), a metade
+    alta dos YMM e DR0-DR7 (as extensões do alvo por `p`).
+  - Opções de breakpoint (`BreakpointOptions`, `Client::edit_breakpoint`):
+    nome, condição de log, condição de comando, uma vez só, silencioso e
+    retorno rápido; voltam pelo arquivo de sessão. Breakpoints de memória
+    por página (`bpm <a|w|x> <expr> [bytes]`, `bpmc`), pelo `monitor membp`
+    do alvo, com o processo escolhido.
   - Bugcheck (`bugcheck.rs`): `!analyze` dá o nome do código, o sentido de
     cada parâmetro (os códigos comuns da referência pública), o driver
     culpado (o módulo da instrução que falhou, o primeiro quadro fora do
@@ -3371,9 +3419,14 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     registradores, PE e `.pdata`, UNWIND_INFO e o desenrolar misto sobre uma
     pilha montada, públicos de PDB, tipos sobre um TPI montado, expressões,
     bugcheck, o formato do rastro, a árvore de chamadas e a comparação. Contra
-    um alvo de mentira num socket local (`tests/fake_target.rs`): a sessão
-    inteira com breakpoints, passo por cima numa recursão, breakpoint
-    condicional com contagem e a parada por carga de módulo.
+    um alvo de mentira num socket local (`tests/fake_target.rs`, o stub em
+    `tests/support/fake_stub.rs`, também usado pelos testes do `kd-mcp`): a
+    sessão inteira com breakpoints, passo por cima numa recursão,
+    breakpoint condicional com contagem, a parada por carga de módulo, os
+    registradores estendidos, as opções de breakpoint (condição de log, uma
+    vez só, silencioso, o arquivo de sessão) e o breakpoint de memória por
+    página. Também os limites de função, os laços, os argumentos, os
+    protótipos e o índice de referências cruzadas.
 - **Depurador gráfico** (`tools/kd-gui`, binário `opennt-dbg`).
   - Uso: `cargo run -p kd-gui --release -- --launch` roda o mesmo build e
     QEMU do `cargo xtask debug --launch` e abre a janela; `--connect=HOST:PORTA`
@@ -3468,6 +3521,53 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     segmentos, Dump 1-5 (hexadecimal com ASCII ou UTF-16, word, dword,
     qword, endereço, float, double; um byte editado vira patch) e pilha com
     os endereços de retorno nomeados.
+  - Análise automática (`kd_mcp::annotate`, a mesma da ferramenta
+    `disassemble` do servidor MCP): os colchetes das funções na margem
+    (`.pdata`, símbolo com tamanho ou o fluxo de código) e dos laços (até
+    três níveis), do cache por função; os comentários automáticos das
+    chamadas a APIs conhecidas, com os argumentos pelo preparo antes do
+    `call` ou, na linha do RIP, pelos registradores e pela pilha de
+    verdade; o nome vem do destino ou da entrada da IAT (`__imp_`); as
+    strings referenciadas por operandos relativos ao RIP.
+  - Referências cruzadas (X ou Ctrl+R): o índice do módulo
+    (`refs::xref_index` sobre a imagem), feito na primeira vez e guardado
+    até um patch; a janela lista origem, local, tipo e instrução.
+  - Destaque (H, `highlight.rs`): o texto da instrução em pedaços; um clique
+    num registrador ou operando marca as ocorrências na janela, com as
+    partes do registrador (`eax` marca `rax`) e o número em qualquer
+    grafia.
+  - Registradores: XMM0-XMM15 (hexadecimal, floats, doubles), MXCSR, a
+    metade alta dos YMM (indisponível quando o sistema não liga o AVX), x87
+    e MMX, DR0-DR7, LastError e LastStatus da TEB e a caixa da convenção x64
+    (`annotate::calling_convention_arguments`: RCX, RDX, R8, R9 e a pilha a
+    partir de `[rsp+0x28]`, quantidade ajustável).
+  - Menu de contexto da desmontagem: Breakpoint, executar até a seleção,
+    nova origem (Ctrl+*), Seguir (desmontagem, dump, mapa de memória,
+    grafo), Copiar (endereço, RVA, deslocamento no arquivo pela seção do
+    PE, seleção, bytes, módulo+RVA), Binário (editar, preencher, NOP,
+    montar), comentário, rótulo, marcador, referências e Procurar. Shift+
+    clique seleciona várias linhas.
+  - Editor de breakpoints (`editor.rs`, o modelo do formulário com a
+    conferência): tipo, endereço, tamanho, nome, condição de parada, texto
+    e condição de log, comandos e condição de comando, contagem de acertos,
+    grupo, ligado, uma vez só, silencioso, retorno rápido e adiado. Sem
+    condição de parada, um breakpoint com log só registra.
+  - Observação: o valor que mudou desde a parada anterior em vermelho.
+  - Dump (`dump.rs`): inteiros com e sem sinal de 1, 2, 4 e 8 bytes,
+    float, double, ponteiro com símbolo e desmontagem; "sincronizar"
+    desligado guarda o endereço de agora no lugar da expressão. Pilha: o
+    comentário "retorno para X de Y" (Y é a função do quadro de baixo),
+    presa ao RSP ou numa expressão.
+  - Listas: Pilha de chamadas (Endereço, Para, De, Tamanho, Comentário,
+    Parte), Threads de usuário (número, ID, entrada, TEB, RIP, RSP,
+    suspensão, prioridade, estado, espera, LastError, tempos de usuário e
+    de kernel, ciclos) e Mapa de memória (Endereço, Tamanho, Parte,
+    Informação, Conteúdo, Tipo, Proteção, Proteção inicial; executável em
+    vermelho; gravar a região num arquivo, página a página).
+  - Servidor MCP na janela (menu Arquivo, `backend/mcp.rs`): uma thread
+    atende HTTP em 127.0.0.1 e manda cada mensagem ao backend
+    (`Request::Mcp`); o `kd_mcp::Server` roda com a sessão da janela como
+    `Engine`, e a janela relê a parada depois de cada ferramenta.
   - Backend (`backend.rs`, `backend/views.rs`): além do snapshot do
     `opennt-dbg`, monta o processo escolhido, os Dumps, a pilha, a caixa de
     informação, os argumentos dos quadros (o espaço de home e os primeiros
@@ -3475,7 +3575,7 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     `__C_specific_handler`), o grafo, as buscas, o mapa de memória, os
     handles, as threads de usuário, os símbolos e imports de um módulo, os
     patches e os roteiros.
-  - Imagens para as buscas (`scan.rs`): o PE desta máquina (cabeçalhos e
+  - Imagens para as buscas (`kd_client::image`, reexportado em `scan.rs`): o PE desta máquina (cabeçalhos e
     seções nas RVAs) ou o `kernel.elf`; só o que não tem arquivo é lido do
     alvo. Os patches da sessão são aplicados por cima, e o cache de
     resultados por módulo vale até o próximo patch.
@@ -3495,10 +3595,64 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     função do kernel e de uma da ntdll, acha referências conhecidas no
     ACPI.sys real (`PNP0A03` em ASCII e uma UTF-16) e no CSRSRV.dll, roda um
     roteiro e desenha a janela fora da tela.
+  - Testes de unidade (`cargo test -p kd-re --release`): o destaque, os
+    formatos do Dump, o modelo do editor de breakpoints, as colunas dos
+    operandos e os formatos dos XMM.
   - Capturas: `opennt-re --launch --screenshot-dir=docs/screenshots
-    --scenario=kernel` grava `kd-re-cpu.png`, `kd-re-grafo.png` e
+    --scenario=kernel` grava `kd-re-cpu.png`, `kd-re-registradores.png`,
+    `kd-re-breakpoint.png`, `kd-re-observacao.png`, `kd-re-grafo.png` e
     `kd-re-referencias.png`; `--scenario=usuario` grava `kd-re-usuario.png`,
     `kd-re-memoria.png` e `kd-re-referencias-usuario.png`.
+- **Servidor MCP** (`tools/kd-mcp`, binário `opennt-mcp`).
+  - Uso: `opennt-mcp` (stdio: uma mensagem JSON-RPC por linha na entrada,
+    as respostas na saída, o log na saída de erro) ou
+    `opennt-mcp --http=PORTA` (`POST http://127.0.0.1:PORTA/mcp`);
+    `--root=DIR` troca a raiz do repositório.
+  - Protocolo (`server.rs`, implementado no crate sobre o `serde_json`):
+    `initialize` (versões 2025-06-18, 2025-03-26 e 2024-11-05; a pedida, se
+    aceita), `ping`, `tools/list`, `tools/call`, `resources/list`,
+    `resources/read`, lotes e notificações. Erros: JSON inválido -32700,
+    pedido inválido -32600, método desconhecido -32601, ferramenta
+    desconhecida ou argumentos fora do esquema -32602 (`tools::validate`
+    confere tipos, obrigatórios, opções e limites); a falha de uma
+    ferramenta volta no resultado com `isError` e o texto.
+  - Transporte HTTP (`transport.rs`): só escuta em 127.0.0.1, recusa
+    conexões de fora e um `Origin` que não seja local; `POST` devolve a
+    resposta em `application/json` (ou 202 para notificações) com o
+    `Mcp-Session-Id`; `GET` devolve 405 (sem fluxo SSE).
+  - Ferramentas (`tools.rs`): `launch`, `connect`, `detach`, `status`,
+    `break`, `go`, `wait_for_stop`, `step_into`, `step_over`, `step_out`,
+    `run_to`, `registers_get`, `register_set`, `memory_read`,
+    `memory_write`, `disassemble`, `symbol_lookup`, `symbol_resolve`,
+    `modules`, `processes`, `threads`, `set_process`, `breakpoint_set`,
+    `breakpoint_clear`, `breakpoint_enable`, `breakpoint_list`,
+    `backtrace`, `search_strings`, `search_pattern`, `xrefs`, `nt_view`,
+    `trace_start`, `trace_fetch`, `trace_stop`, `wait_for_serial`,
+    `read_serial_log`, `run_script`, `command` e `screenshot`. Endereços
+    são expressões em texto e os endereços dos resultados vão em texto
+    (`0x...`). Cada resultado é um objeto (`structuredContent`) e o mesmo
+    JSON em `content`.
+  - Recursos: `opennt://serial-log`, `opennt://dbgprint`,
+    `opennt://breakpoints` e `opennt://modules`.
+  - Sessão (`engine.rs`): o trait `Engine` dá o cliente, o `launch`
+    (`kd_client::launcher`), o `connect`, o log da COM1, o monitor do QEMU e
+    o cache das imagens com os índices de referências cruzadas.
+    `Standalone` é o do binário; a janela do opennt-re implementa o mesmo
+    trait.
+  - `screenshot` (`screenshot.rs`): `screendump` do monitor HMP do QEMU
+    aberto pelo `launch`, em PNG; sem PNG no QEMU, PPM convertido para PNG
+    no crate.
+  - Testes (`cargo test -p kd-mcp`): o protocolo (negociação, a lista de
+    ferramentas com esquemas válidos, os erros, lotes), as ferramentas
+    contra o alvo de mentira do `kd-client` (registradores estendidos,
+    memória, desmontagem com o comentário da chamada ao IoCreateDevice,
+    breakpoint de uma vez só, parada, pilha, símbolos, recursos) e o
+    binário em stdio. Ponta a ponta (`cargo test -p kd-mcp --release --
+    --ignored`, `tests/e2e.rs`): o binário em stdio abre o OpenNT pelo
+    `launch`, para, lê os registradores, arma um breakpoint em
+    `kernel::ntos::ke::run_kernel_tasks`, continua até ele, confere a
+    desmontagem e a pilha, tira o breakpoint, continua e espera
+    `[shell] pronto` na COM1 (`OPENNT_MCP_BUILD_DIR` troca o build).
 - **Teste do depurador**: o teste `kd` é um `test-boot` com
   `--kd=com2 --script=xtask/scripts/kd.txt`. O roteiro roda contra a COM2
   em paralelo ao boot e a falha dele derruba o teste. Passos:
