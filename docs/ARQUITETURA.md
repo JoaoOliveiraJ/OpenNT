@@ -877,7 +877,7 @@ interrompe com STATUS_ALERTED; nos três a vaga da fila volta.
 de usuário de todos os processos vivos (`ps/user/threads.rs`):
 `dispatch_one` sonda as esperas de todas as threads dos processos que
 entraram nele (`ProcessState.started`), roda o `pump_kernel` e os pumps de
-ALPC, `device_io`, fábricas, timers e pacotes de espera, retoma as threads
+ALPC, `device_io`, fábricas e pacotes de espera, retoma as threads
 terminadas que precisam desfazer um serviço bloqueado, conclui os términos
 adiados e dá um intervalo à thread de usuário pronta mais prioritária da
 fila do `thread_dispatch`, de qualquer processo; a troca de thread corrente
@@ -3620,7 +3620,21 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     o período refeito pelo DPC interno, a DeleteProcedure ExpDeleteTimer e o
     ExTimerRundown na saída da thread (a ActiveTimerListHead do ETHREAD);
     ExpTimerApcRoutine, ExpDeleteTimer e PspIoMiniPacketCallbackRoutine são
-    rotinas privadas (`init/exports.rs::private_routines`);
+    rotinas privadas (`init/exports.rs::private_routines`); o NtQueryTimer
+    (só ETIMER: RemainingTime = KeQueryTimerDueTime menos o tempo de
+    interrupção, TimerState = o SignalState);
+  - o objeto IRTimer do NtCreateTimer2 em `ex/ir_timer.rs`: tipo "IRTimer"
+    próprio (o ETIMER e o IRTimer não se confundem no
+    ObReferenceObjectByHandle), corpo de 0xA8 bytes com o KTIMER2 de
+    `ke/timer2.rs` no início (o objeto de espera), sem nome
+    (ObjectAttributes dá STATUS_INVALID_PARAMETER_3), as recusas do
+    ExpExTimerAttributesAreValid (STATUS_INVALID_PARAMETER_4) e de Reserved
+    sem IR (STATUS_INVALID_PARAMETER_2), HIGH_RESOLUTION aceito e IR pelo
+    ExpCheckIRTimerAccess (o NtCreateIRTimer, acima; o timer IR leva o
+    TypeFlags IdleResilient e recusa período); o NtSetTimer2/NtCancelTimer2 pelo
+    ExpSetTimerObject2 (KeSetTimer2: prazo relativo sobre o tempo de
+    interrupção, não sobre a hora do sistema; T2_SET_PARAMETERS inválido dá
+    STATUS_INVALID_PARAMETER_3) e o vencimento pelo pump dos timers do Ke;
   - os objetos de reserva em `ps/memory_reserve.rs` (UserApcReserve e
     IoCompletionReserve, NtAllocateReserveObject), com o pacote embutido que
     o ZwSetIoCompletionEx publica (`io/completion/set.rs`) e a retirada

@@ -1334,7 +1334,7 @@ fn user_events_and_semaphores(assert: Assert) {
 }
 
 fn user_mutants_and_timers(assert: Assert) {
-    use crate::ntos::ps::user::{memory, mutants, timer_objects};
+    use crate::ntos::ps::user::{memory, mutants};
     let Ok(block) = memory::map_user_region(0x2000) else {
         assert(false, "usermutants: memoria de usuario");
         return;
@@ -1348,7 +1348,7 @@ fn user_mutants_and_timers(assert: Assert) {
         set_object_attributes(unsafe { nt::ObjectAttributes::at(attributes) }, nt::ObjectAttributes::SIZE as u32, 0, attributes + 0x40, flags);
         attributes
     };
-    let (mutant_info, owner, timer_info, due_time) = unsafe { (nt::MutantBasicInformation::at(info), nt::ClientId::at(info), nt::TimerBasicInformation::at(info), nt::LargeInteger::at(due)) };
+    let (mutant_info, owner, due_time) = unsafe { (nt::MutantBasicInformation::at(info), nt::ClientId::at(info), nt::LargeInteger::at(due)) };
     guest::write64(rsp + 0x28, 0);
     // Mutante com dono inicial: consulta, liberação e não dono.
     let owned = call("NtCreateMutant", out, 0x1F_0001, 0, 1);
@@ -1374,50 +1374,85 @@ fn user_mutants_and_timers(assert: Assert) {
         let _ = call("NtClose", handle, 0, 0, 0);
     }
     assert(crate::ntos::ob::object_manager::lookup("\\OpenNtMutanteTeste").is_none(), "usermutants: nome removido no ultimo handle");
-    // Timer: prazo relativo, vencido, cancelamento e recusas.
+    // Timer2 (IRTimer): o KTIMER2 do corpo, prazo relativo no tempo de
+    // interrupção, vencimento pelo pump dos timers do Ke, cancelamento e as
+    // recusas do 19041.
+    let ktimer2 = |handle: u64| state::get_user_handle(handle).and_then(|entry| entry.downcast::<crate::ntos::ob::objects::dispatcher::UserDispatcher>().map(|dispatcher| dispatcher.pointer)).map(|pointer| unsafe { nt::Ktimer2::at(pointer) });
     guest::write32(rsp + 0x28, 0x1F_0003);
     let created = call("NtCreateTimer2", out, 0, 0, 0);
     let timer = guest::read64(out);
-    assert(created == 0 && state::get_user_handle(timer).is_some_and(|entry| entry.kind() == "timer"), "usermutants: NtCreateTimer2");
+    let synchronization = ktimer2(timer).is_some_and(|body| body.header.type_.get() == 0x19 && body.type_flags.get() == 0);
+    assert(created == 0 && state::get_user_handle(timer).is_some_and(|entry| entry.kind() == "timer") && synchronization, "usermutants: NtCreateTimer2 com o KTIMER2 de sincronizacao");
+    let high_resolution = call("NtCreateTimer2", out, 0, 0, 0x8000_0004);
+    let precise = guest::read64(out);
+    let notification = ktimer2(precise).is_some_and(|body| body.header.type_.get() == 0x18 && body.type_flags.get() == 4);
+    let _ = call("NtClose", precise, 0, 0, 0);
+    assert(high_resolution == 0 && notification, "usermutants: NtCreateTimer2 de notificacao com HIGH_RESOLUTION");
+    let refused = call("NtCreateTimer2", out, 0, 0, 0x10) == 0xC000_00F2 && call("NtCreateTimer2", out, 0, 0, 0xC) == 0xC000_00F2 && call("NtCreateTimer2", out, 0, attributes, 0) == 0xC000_00F1 && call("NtCreateTimer2", out, previous, 0, 0) == 0xC000_00F0 && call("NtCreateTimer2", out, 0, 0, 0xA) == 0xC000_00F2;
+    assert(refused, "usermutants: atributos invalidos, OBJECT_ATTRIBUTES e Reserved sem IR");
+    // Prazo relativo de 100 ms: DueTime[0] = tempo de interrupção + 100 ms.
     guest::write64(rsp + 0x28, 0);
-    // O tempo restante é o prazo menos o tempo que passou entre o set e a
-    // consulta, medido no mesmo relógio (um host carregado pode parar a CPU
-    // virtual por mais que o prazo inteiro): sem pump, o timer só sinaliza
-    // depois de vencer.
     due_time.quad_part.set(-1_000_000);
-    let before = crate::ntos::ke::clock::now_ms() as i64 * 10_000;
-    let relative_set = call("NtSetTimer2", timer, due, 0, 0) == 0 && call("NtQueryTimer", timer, 0, info, 16) == 0;
-    let elapsed = crate::ntos::ke::clock::now_ms() as i64 * 10_000 - before;
-    let remaining = timer_info.remaining_time.quad_part.get();
-    let relative_ok = relative_set && remaining <= 1_000_000 && remaining >= (1_000_000 - elapsed).max(0) && (remaining == 0 || timer_info.timer_state.get() == 0) && (elapsed >= 1_000_000 || remaining > 0);
-    if !relative_ok {
-        debug_print!("[usermutants] restante={} decorrido={} estado={}", remaining, elapsed, timer_info.timer_state.get());
-    }
-    assert(relative_ok, "usermutants: prazo relativo e tempo restante");
+    let before = crate::ntos::ke::clock::uptime_100ns();
+    let relative_set = call("NtSetTimer2", timer, due, 0, 0) == 0;
+    let after = crate::ntos::ke::clock::uptime_100ns();
+    let relative_ok = relative_set && ktimer2(timer).is_some_and(|body| body.due_time[0].get() >= before + 1_000_000 && body.due_time[0].get() <= after + 1_000_000 && body.header.signal_state.get() == 0);
+    assert(relative_ok, "usermutants: prazo relativo no tempo de interrupcao");
+    // Prazo absoluto já passado: o pump dos timers sinaliza; o timer de
+    // sincronização entrega o sinal a uma espera só.
     due_time.quad_part.set(116_444_736_000_000_000);
-    assert(call("NtSetTimer2", timer, due, 0, 0) == 0 && { timer_objects::pump(); call("NtQueryTimer", timer, 0, info, 16) == 0 } && timer_info.timer_state.get() == 1 && timer_info.remaining_time.quad_part.get() == 0, "usermutants: prazo absoluto vencido sinaliza pelo pump");
-    assert(call("NtCancelTimer2", timer, 0, 0, 0) == 0 && call("NtCancelTimer2", timer, due, 0, 0) == 0xC000_000D && call("NtQueryTimer", timer, 0, info, 8) == 0xC000_0004, "usermutants: cancelamento e recusas de parametros e tamanho");
-    unsafe { nt::LargeInteger::at(previous) }.quad_part.set(-5);
-    assert(call("NtSetTimer2", timer, due, previous, 0) == 0xC000_000D, "usermutants: periodo negativo recusado");
-    guest::write32(rsp + 0x28, 0x1F_0003);
+    let zero = previous;
+    unsafe { nt::LargeInteger::at(zero) }.quad_part.set(0);
+    let absolute_set = call("NtSetTimer2", timer, due, 0, 0) == 0;
+    crate::ntos::ke::timer::check_timers();
+    let fired = ktimer2(timer).is_some_and(|body| body.header.signal_state.get() == 1);
+    let consumed = call("NtWaitForSingleObject", timer, 0, zero, 0) == 0 && call("NtWaitForSingleObject", timer, 0, zero, 0) == 0x102;
+    assert(absolute_set && fired && consumed, "usermutants: prazo absoluto vencido sinaliza pelo pump dos timers");
+    // NtCancelTimer2 ignora o Parameters; o NtQueryTimer é só do ETIMER.
+    due_time.quad_part.set(-10_000_000);
+    let cancelled = call("NtSetTimer2", timer, due, 0, 0) == 0 && call("NtCancelTimer2", timer, due, 0, 0) == 0 && ktimer2(timer).is_some_and(|body| body.header.lock.get() & 0x100 == 0);
+    assert(cancelled && call("NtQueryTimer", timer, 0, info, 16) == 0xC000_0024 && call("NtQueryTimer", timer, 0, info, 8) == 0xC000_0004, "usermutants: cancelamento e NtQueryTimer recusado no IRTimer");
+    // T2_SET_PARAMETERS: Version 0 e NoWakeTolerance >= -1; DueTime NULL.
+    let parameters = info;
+    guest::write32(parameters, 1);
+    guest::write64(parameters + 8, 0);
+    let version = call("NtSetTimer2", timer, due, 0, parameters) == 0xC000_00F1;
+    guest::write32(parameters, 0);
+    guest::write64(parameters + 8, (-2i64) as u64);
+    let tolerance = call("NtSetTimer2", timer, due, 0, parameters) == 0xC000_00F1;
+    guest::write64(parameters + 8, (-1i64) as u64);
+    let unlimited = call("NtSetTimer2", timer, due, 0, parameters) == 0 && call("NtCancelTimer2", timer, 0, 0, 0) == 0;
+    assert(version && tolerance && unlimited && call("NtSetTimer2", timer, 0, 0, 0) == 0xC000_00F0, "usermutants: T2_SET_PARAMETERS e DueTime nulo");
+    // NtCreateIRTimer: índice 0 e sub acima do máximo são inválidos; o
+    // índice 6 (Power) exige o NT SERVICE\Power na identidade de uma syscall
+    // de modo usuário (o RtlCheckTokenMembership em KernelMode concede
+    // sempre). O timer IR é um IRTimer com o TypeFlags IdleResilient, que
+    // recusa período; o NtSetIRTimer é o NtSetTimer2 sem período.
     let identifier = block + 0x60;
-    assert(call("NtCreateTimer2", out, 0, 0, 0x10) == 0xC000_00F2 && call("NtCreateTimer2", out, 0, 0, 0xA) == 0xC000_00F2 && call("NtCreateTimer2", out, identifier, 0, 0) == 0xC000_00F0, "usermutants: atributos invalidos e identificador sem o atributo IR");
-    // NtCreateIRTimer: indice 0 e sub acima do maximo sao invalidos; o
-    // indice 6 (Power) exige o NT SERVICE\Power na identidade.
+    guest::write32(rsp + 0x28, 0x1F_0003);
     guest::write32(identifier, 0);
     let index_zero = call("NtCreateIRTimer", out, identifier, 0x1F_0003, 0);
     guest::write32(identifier, 6 | 3 << 16);
     let sub_too_large = call("NtCreateIRTimer", out, identifier, 0x1F_0003, 0);
     guest::write32(identifier, 6);
-    // O PreviousMode de uma syscall de modo usuário (o RtlCheckTokenMembership
-    // em KernelMode concede sempre).
     // SAFETY: a ETHREAD da thread corrente.
-    let previous = &unsafe { nt::Ethread::at(crate::ntos::ps::process::get_current_thread()) }.tcb.previous_mode;
-    let saved_previous = previous.get();
-    previous.set(1);
+    let previous_mode = &unsafe { nt::Ethread::at(crate::ntos::ps::process::get_current_thread()) }.tcb.previous_mode;
+    let saved_previous_mode = previous_mode.get();
+    previous_mode.set(1);
     let power_denied = call("NtCreateIRTimer", out, identifier, 0x1F_0003, 0);
-    previous.set(saved_previous);
-    assert(index_zero == 0xC000_000D && sub_too_large == 0xC000_000D && power_denied == 0xC000_0022, "usermutants: NtCreateIRTimer confere o identificador IR e o SID do servico");
+    previous_mode.set(0);
+    let power_allowed = call("NtCreateIRTimer", out, identifier, 0x1F_0003, 0);
+    previous_mode.set(saved_previous_mode);
+    let ir_timer = guest::read64(out);
+    let idle_resilient = power_allowed == 0 && ktimer2(ir_timer).is_some_and(|body| body.type_flags.get() == 2);
+    unsafe { nt::LargeInteger::at(info) }.quad_part.set(10_000);
+    due_time.quad_part.set(-10_000_000);
+    let period_refused = call("NtSetTimer2", ir_timer, due, info, 0) == 0xC000_000D;
+    let ir_set = call("NtSetIRTimer", ir_timer, due, 0, 0) == 0 && call("NtCancelTimer2", ir_timer, 0, 0, 0) == 0;
+    if power_allowed == 0 {
+        let _ = call("NtClose", ir_timer, 0, 0, 0);
+    }
+    assert(index_zero == 0xC000_000D && sub_too_large == 0xC000_000D && power_denied == 0xC000_0022 && idle_resilient && period_refused && ir_set, "usermutants: NtCreateIRTimer confere o identificador IR e o SID do servico; o timer IR recusa periodo");
     let _ = call("NtClose", timer, 0, 0, 0);
     if let Some(region) = memory::find_region(block) {
         memory::release_private_region(&region);

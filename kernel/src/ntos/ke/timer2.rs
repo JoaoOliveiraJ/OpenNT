@@ -118,6 +118,14 @@ fn absolute_due(now: u64, interval: u64) -> u64 {
 /// KeSetTimer2(Timer, DueTime, Period, Parameters): TRUE se o timer já
 /// estava inserido.
 pub fn set(timer: &Ktimer2, due_time: i64, period: i64, parameters: u64) -> bool {
+    // SAFETY: o EXT_SET_PARAMETERS do chamador (NoWakeTolerance em +8).
+    let tolerance = (parameters != 0).then(|| unsafe { crate::ntos::inc::field::Field::<u64>::at(parameters + 8) }.get());
+    set_with_tolerance(timer, due_time, period, tolerance)
+}
+
+/// O KeSetTimer2 com o NoWakeTolerance já capturado (`None` = sem
+/// EXT_SET_PARAMETERS), como o ExpSetTimerObject2 o entrega.
+pub fn set_with_tolerance(timer: &Ktimer2, due_time: i64, period: i64, tolerance: Option<u64>) -> bool {
     // Um período abaixo de KeMinimumIncrement sobe a ele.
     let period = if period != 0 && period < clock::MINIMUM_INCREMENT as i64 { clock::MINIMUM_INCREMENT as i64 } else { period };
     let absolute = due_time > 0;
@@ -130,9 +138,7 @@ pub fn set(timer: &Ktimer2, due_time: i64, period: i64, parameters: u64) -> bool
     };
     let due = absolute_due(clock::uptime_100ns(), interval);
     let mut latest = due;
-    if parameters != 0 && timer.collection_index[0].get() != COLLECTION_WITHOUT_TOLERANCE {
-        // SAFETY: o EXT_SET_PARAMETERS do chamador (NoWakeTolerance em +8).
-        let tolerance = unsafe { crate::ntos::inc::field::Field::<u64>::at(parameters + 8) }.get();
+    if let Some(tolerance) = tolerance.filter(|_| timer.collection_index[0].get() != COLLECTION_WITHOUT_TOLERANCE) {
         latest = if tolerance == UNLIMITED_TOLERANCE { UNLIMITED_TOLERANCE } else { absolute_due(due, tolerance) };
     }
     let mut inserted = INSERTED.lock();

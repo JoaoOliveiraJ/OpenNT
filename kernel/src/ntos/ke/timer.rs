@@ -84,6 +84,19 @@ pub fn set_timer(timer: u64, due_value: i64, dpc_pointer: u64, period_ms: u32) -
     was_queued
 }
 
+/// KeQueryTimerDueTime: o prazo do timer na fila em tempo de interrupção
+/// (um prazo absoluto convertido pela hora do sistema corrente); 0 fora da
+/// fila.
+pub fn query_due_time(timer: u64) -> u64 {
+    let timers = TIMERS.lock();
+    let Some(entry) = timers.iter().find(|entry| entry.timer == timer) else { return 0 };
+    if entry.relative {
+        return entry.due;
+    }
+    let (system_now, uptime_now) = (clock::system_time_100ns(), clock::uptime_100ns());
+    if entry.due >= system_now { uptime_now.saturating_add(entry.due - system_now) } else { uptime_now.saturating_sub(system_now - entry.due) }
+}
+
 /// KeCancelTimer: o corpo continua pertencendo ao chamador.
 pub fn cancel_timer(timer: u64) -> bool {
     let mut timers = TIMERS.lock();

@@ -337,14 +337,24 @@ fn executive_timer(assert: Assert, block: u64, rsp: u64, call: Call) {
     guest::write8(previous, 0xFF);
     let set = call("NtSetTimer", handle, due, 0, 0);
     let previous_state = guest::read8(previous);
+    // NtQueryTimer: o tempo restante até o prazo (no máximo 1 s) e o estado.
+    let (information, returned) = (block + 0x620, block + 0x630);
+    guest::write64(rsp + 0x28, returned);
+    let queried = call("NtQueryTimer", handle, 0, information, 0x10);
+    let remaining = guest::read64(information) as i64;
+    let query_ok = queried == 0 && remaining > 0 && remaining <= 10_000_000 && guest::read8(information + 8) == 0 && guest::read32(returned) == 0x10;
+    let query_refused = call("NtQueryTimer", handle, 1, information, 0x10) == 0xC000_0003 && call("NtQueryTimer", handle, 0, information, 8) == 0xC000_0004 && call("NtQueryTimer", handle, 0, information + 1, 0x10) == 0x8000_0002;
     guest::write8(current, 0xFF);
     let cancelled = call("NtCancelTimer", handle, current, 0, 0);
     let current_state = guest::read8(current);
+    // Fora da fila, o KeQueryTimerDueTime dá 0: o restante fica negativo.
+    let idle = call("NtQueryTimer", handle, 0, information, 0x10) == 0 && (guest::read64(information) as i64) < 0;
     let closed = call("NtClose", handle, 0, 0, 0);
     assert(
         invalid_type == 0xC000_00F2 && created == 0 && handle != 0 && negative_period == 0xC000_00F4 && set == 0 && previous_state == 0 && cancelled == 0 && current_state == 0 && closed == 0,
         "userboot: NtCreateTimer, NtSetTimer e NtCancelTimer do ETIMER de modo usuario",
     );
+    assert(query_ok && query_refused && idle, "userboot: NtQueryTimer do ETIMER (restante, estado, recusas e timer fora da fila)");
 }
 
 /// NtPowerInformation de modo usuário: PlatformInformation e PlatformRole

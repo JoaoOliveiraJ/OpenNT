@@ -73,8 +73,8 @@ pub const MAXIMUM_WAIT_OBJECTS: u32 = 64;
 pub const WAIT_ALL: u32 = 0;
 pub const WAIT_ANY: u32 = 1;
 /// Tipos cujo corpo começa no DISPATCHER_HEADER (DefaultObject = deslocamento
-/// 0); o EJOB começa no KEVENT do fim do prazo do job.
-const DISPATCHER_TYPES: [&str; 7] = ["Event", "Semaphore", "Mutant", "Timer", "Process", "Thread", "Job"];
+/// 0); o IRTimer começa no KTIMER2 e o EJOB no KEVENT do fim do prazo do job.
+const DISPATCHER_TYPES: [&str; 8] = ["Event", "Semaphore", "Mutant", "Timer", "IRTimer", "Process", "Thread", "Job"];
 
 /// ObpDefaultObject: o KEVENT de notificação sinalizado em que esperam os
 /// tipos sem objeto de espera próprio (criado na primeira espera).

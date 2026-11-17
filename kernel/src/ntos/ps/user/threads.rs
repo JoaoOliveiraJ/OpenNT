@@ -9,7 +9,7 @@
 //! processo dela. O fim de um processo libera as threads dele, e só as dele
 //! ([`release_process`]). A execução do contexto (`exec_user_context`) é
 //! instalada pela HAL de modo usuário; os pumps de ALPC, `device_io`, worker
-//! factories, timers e pacotes de espera ocupam slots fixos do despachante.
+//! factories e pacotes de espera ocupam slots fixos do despachante.
 //!
 //! Um despachante só serve as threads de todos os processos vivos
 //! ([`dispatch_one`]): cada chamada sonda as esperas de todas, roda os pumps
@@ -69,6 +69,8 @@ pub mod pump {
     pub const ALPC: usize = 0;
     pub const DEVICE_IO: usize = 1;
     pub const WORKER_FACTORY: usize = 2;
+    /// Livre: os timers do NtCreateTimer2 vencem no pump dos timers do Ke
+    /// (`ke/timer2.rs`), antes destes.
     pub const TIMERS: usize = 3;
     pub const WAIT_PACKETS: usize = 4;
 }
@@ -2075,7 +2077,6 @@ fn eligible(pointer: u64) -> bool {
 
 pub fn init() {
     completion_objects::set_thread_eligibility(eligible);
-    set_pump(pump::TIMERS, super::timer_objects::pump);
     state::register_handler("NtCreateThreadEx", nt_create_thread_ex);
     state::register_handler("NtSuspendThread", nt_suspend_thread);
     state::register_handler("NtResumeThread", nt_resume_thread);

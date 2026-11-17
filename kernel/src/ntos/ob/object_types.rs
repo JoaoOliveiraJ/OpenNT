@@ -415,6 +415,9 @@ pub fn key_type() -> ObjectType {
 pub fn user_type(kind: &str) -> Option<ObjectType> {
     let name = match kind {
         "completion" => String::from("IoCompletion"),
+        // O timer do NtCreateTimer2 (ExpIRTimerObjectType), distinto do
+        // ETIMER do NtCreateTimer.
+        "timer" => String::from("IRTimer"),
         "waitpacket" => String::from("WaitCompletionPacket"),
         "workerfactory" => String::from("TpWorkerFactory"),
         "alpc" | "port" => String::from("ALPC Port"),
@@ -433,7 +436,7 @@ pub fn user_type(kind: &str) -> Option<ObjectType> {
     }
     let (mapping, valid, flags) = match name.as_str() {
         "Mutant" => ([0x20001, 0x20000, 0x120000, 0x1F0001], 0x1F0001, 0),
-        "Semaphore" | "Timer" | "IoCompletion" => ([0x20001, 0x20002, 0x120000, 0x1F0003], 0x1F0003, 0),
+        "Semaphore" | "Timer" | "IRTimer" | "IoCompletion" => ([0x20001, 0x20002, 0x120000, 0x1F0003], 0x1F0003, 0),
         "Partition" => ([0x20001, 0x20002, 0x120001, 0x1F0003], 0x1F0003, 8),
         "WaitCompletionPacket" => ([0x20001, 0x20001, 0x20001, 0xF0001], 0x1F0001, 0),
         "TpWorkerFactory" => ([0x20008, 0x20004, 0x20003, 0xF00FF], 0xF00FF, 0),

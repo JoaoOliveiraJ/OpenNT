@@ -45,7 +45,7 @@ use alloc::vec::Vec;
 
 use crate::ntos::ex::timer as executive_timers;
 use crate::ntos::inc::field::{Field, NtStruct, Reserved};
-use crate::ntos::inc::types::{Ethread, Kapc, Kdpc, Ktimer, ListEntry};
+use crate::ntos::inc::types::{Ethread, Kapc, Kdpc, Ktimer, ListEntry, TimerBasicInformation};
 use crate::ntos::init::exports::private_routines;
 use crate::ntos::ke::{apc, clock, dpc, spin_lock, timer};
 use crate::ntos::mm::guest_memory as guest;
@@ -53,11 +53,15 @@ use crate::ntos::ob::{object_create, object_reference, object_types, reference_t
 use crate::ntos::ps::{previous_mode, process, user_probe};
 use crate::rtl::KernelError;
 
+const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
+const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
+const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
 const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 const STATUS_INVALID_PARAMETER_4: u32 = 0xC000_00F2;
 const STATUS_INVALID_PARAMETER_6: u32 = 0xC000_00F4;
-/// TIMER_MODIFY_STATE.
+/// TIMER_QUERY_STATE e TIMER_MODIFY_STATE.
+const TIMER_QUERY_STATE: u32 = 1;
 const TIMER_MODIFY_STATE: u32 = 2;
 /// SynchronizationTimer, o maior TIMER_TYPE.
 const SYNCHRONIZATION_TIMER: u32 = 1;
@@ -186,13 +190,13 @@ fn cancel_locked(timer: &Etimer) -> Result<u32, KernelError> {
     Ok(released)
 }
 
-/// Referencia o handle como um ETIMER com TIMER_MODIFY_STATE no modo dado.
-fn reference_timer(handle: u64, mode: u8) -> Result<Result<u64, u32>, KernelError> {
+/// Referencia o handle como um ETIMER com `access` no modo dado.
+fn reference_timer(handle: u64, access: u32, mode: u8) -> Result<Result<u64, u32>, KernelError> {
     let slot = guest::alloc_bytes(8);
     if slot == 0 {
         return Ok(Err(STATUS_INSUFFICIENT_RESOURCES));
     }
-    let status = object_reference::reference_by_handle(handle, TIMER_MODIFY_STATE, timer_type(), mode, slot, 0)?;
+    let status = object_reference::reference_by_handle(handle, access, timer_type(), mode, slot, 0)?;
     // SAFETY: célula PVOID recém-alocada.
     let pointer = unsafe { Field::<u64>::at(slot) }.get();
     guest::free_bytes(slot);
@@ -259,7 +263,7 @@ pub fn set(handle: u64, due_time: u64, apc_routine: u64, apc_context: u64, resum
     if period < 0 {
         return Ok(STATUS_INVALID_PARAMETER_6);
     }
-    let pointer = match reference_timer(handle, mode)? {
+    let pointer = match reference_timer(handle, TIMER_MODIFY_STATE, mode)? {
         Ok(pointer) => pointer,
         Err(status) => return Ok(status),
     };
@@ -300,7 +304,7 @@ pub fn cancel(handle: u64, current_state: u64, mode: u8) -> Result<u32, KernelEr
     if mode != 0 && current_state != 0 && !user_probe::probe_user_write(current_state, 1) {
         return Ok(STATUS_ACCESS_VIOLATION);
     }
-    let pointer = match reference_timer(handle, mode)? {
+    let pointer = match reference_timer(handle, TIMER_MODIFY_STATE, mode)? {
         Ok(pointer) => pointer,
         Err(status) => return Ok(status),
     };
@@ -311,6 +315,45 @@ pub fn cancel(handle: u64, current_state: u64, mode: u8) -> Result<u32, KernelEr
     let state = body.ke_timer.header.signal_state.get();
     dereference(pointer, released? + 1)?;
     if current_state != 0 && !write_output::<u8>(mode, current_state, (state != 0) as u8)? {
+        return Ok(STATUS_ACCESS_VIOLATION);
+    }
+    Ok(0)
+}
+
+/// NtQueryTimer(TimerHandle, TimerInformationClass, TimerInformation,
+/// TimerInformationLength, ReturnLength) no modo `mode`, como no 19041: só
+/// TimerBasicInformation (0, senão STATUS_INVALID_INFO_CLASS) de 0x10 bytes
+/// (senão STATUS_INFO_LENGTH_MISMATCH); em UserMode a saída é sondada com
+/// alinhamento 4 e o ReturnLength opcional também; o handle é um ETIMER com
+/// TIMER_QUERY_STATE (o IRTimer do NtCreateTimer2 dá
+/// STATUS_OBJECT_TYPE_MISMATCH). RemainingTime = KeQueryTimerDueTime menos o
+/// tempo de interrupção (negativo num timer fora da fila), TimerState = o
+/// SignalState do KTIMER.
+pub fn query(handle: u64, class: u32, information: u64, length: u32, return_length: u64, mode: u8) -> Result<u32, KernelError> {
+    if class != 0 {
+        return Ok(STATUS_INVALID_INFO_CLASS);
+    }
+    if length != TimerBasicInformation::SIZE as u32 {
+        return Ok(STATUS_INFO_LENGTH_MISMATCH);
+    }
+    if mode != 0 {
+        if information & 3 != 0 {
+            return Ok(STATUS_DATATYPE_MISALIGNMENT);
+        }
+        if !user_probe::probe_user_write(information, TimerBasicInformation::SIZE) || (return_length != 0 && !user_probe::probe_user_write(return_length, 4)) {
+            return Ok(STATUS_ACCESS_VIOLATION);
+        }
+    }
+    let pointer = match reference_timer(handle, TIMER_QUERY_STATE, mode)? {
+        Ok(pointer) => pointer,
+        Err(status) => return Ok(status),
+    };
+    let body = etimer(pointer);
+    let state = body.ke_timer.header.signal_state.get() as u8;
+    let remaining = timer::query_due_time(body.ke_timer.address()).wrapping_sub(clock::uptime_100ns()) as i64;
+    dereference(pointer, 1)?;
+    let output = information + core::mem::offset_of!(TimerBasicInformation, timer_state) as u64;
+    if !write_output::<i64>(mode, information, remaining)? || !write_output::<u8>(mode, output, state)? || (return_length != 0 && !write_output::<u32>(mode, return_length, TimerBasicInformation::SIZE as u32)?) {
         return Ok(STATUS_ACCESS_VIOLATION);
     }
     Ok(0)
