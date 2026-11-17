@@ -7,10 +7,9 @@
 //! (SeTokenIsAdmin do token de impersonação, senão do primário) e 1 para o
 //! resto. A checagem só age quando o token tem os bits de política
 //! TOKEN_ENFORCE_REDIRECTION_TRUST (TokenFlags bit 23) / AUDIT (bit 24), que
-//! o NT liga pela mitigação de processo RedirectionTrust. Os tokens do OpenNT
-//! (`se::token::tokens::Token`) não carregam TokenFlags nem essa mitigação:
-//! a política é sempre (não impor, não auditar), exatamente o caso de um
-//! processo Windows sem a mitigação — a checagem devolve STATUS_SUCCESS.
+//! a mitigação de processo RedirectionTrust liga no token primário
+//! (`ps/mitigation_policy.rs`; o svchost pede a auditoria por padrão). Sem a
+//! mitigação, ou só auditando, a checagem devolve STATUS_SUCCESS.
 //! O SECURITY_SUBJECT_CONTEXT do chamador, quando ausente, é capturado e
 //! liberado por `se::subject_context` (SeCapture/SeReleaseSubjectContext).
 
@@ -58,9 +57,15 @@ fn release(subject: Subject) -> Result<(), KernelError> {
 }
 
 /// SeTokenGetRedirectionTrustPolicy(Token, *Enforce, *Audit): TokenFlags
-/// bits 23/24. Sem TokenFlags/mitigação no OpenNT: (false, false).
-fn token_redirection_policy(_token: u64) -> (bool, bool) {
-    (false, false)
+/// bits 23/24, ligados pela ProcessRedirectionTrustPolicy
+/// (`ps/mitigation_policy.rs`).
+fn token_redirection_policy(token: u64) -> (bool, bool) {
+    use crate::ntos::se::token::tokens;
+    if token == 0 {
+        return (false, false);
+    }
+    let flags = tokens::token_flags(token);
+    (flags & tokens::TOKEN_ENFORCE_REDIRECTION_TRUST != 0, flags & tokens::TOKEN_AUDIT_REDIRECTION_TRUST != 0)
 }
 
 /// IoComputeRedirectionTrustLevel(Reserved, UserMode, SubjectContext, *TrustLevel).

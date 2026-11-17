@@ -193,29 +193,32 @@ fn set_default_hard_error_mode(process: u64, mode: u32) -> Result<(), KernelErro
     })
 }
 
-/// ExEnableHandleExceptions(HandleTable, Enable) pelo
-/// ObReferenceProcessHandleTable: `false` quando o processo não tem mais a
-/// tabela.
-fn enable_handle_exceptions(process: u64, enable: bool) -> Result<bool, KernelError> {
+/// ExEnableHandleExceptions(HandleTable, Enable) (ntoskrnl 19041, rva
+/// 0x69cb2c) pelo ObReferenceProcessHandleTable: `None` quando o processo
+/// não tem mais a tabela; senão o resultado da rotina, que é `false` só para
+/// desligar um bit já ligado (ligado uma vez, fica ligado).
+pub(crate) fn enable_handle_exceptions(process: u64, enable: bool) -> Result<Option<bool>, KernelError> {
     let table = process_handles::reference(process)?;
     if table == 0 {
-        return Ok(false);
+        return Ok(None);
     }
     // SAFETY: HANDLE_TABLE do EPROCESS.ObjectTable, retida pelo rundown.
     let handle_table = unsafe { HandleTable::at(table) };
     let lock = handle_table.handle_table_lock.address();
     // Sob o HandleTableLock; o OpenNT não tem o DebugInfo do rastreio de
-    // handles, onde o NT guarda o mesmo bit quando ele existe. Ligado uma
-    // vez, fica ligado.
+    // handles, onde o NT guarda o mesmo bit quando ele existe.
     let result = critical_region::with_critical(|| {
         push_lock::acquire_exclusive(lock, 0)?;
-        if enable && handle_table.enable_handle_exceptions() == 0 {
-            handle_table.set_enable_handle_exceptions(1);
-        }
-        push_lock::release_exclusive(lock, 0)
+        let accepted = if handle_table.enable_handle_exceptions() != 0 {
+            enable
+        } else {
+            handle_table.set_enable_handle_exceptions(enable as u8);
+            true
+        };
+        push_lock::release_exclusive(lock, 0).map(|()| accepted)
     });
     process_handles::release(process)?;
-    result.map(|()| true)
+    result.map(Some)
 }
 
 /// ExEnableRaiseUMExceptionOnInvalidHandleClose (ntoskrnl 19041, rva
@@ -324,7 +327,8 @@ pub fn set_information(mode: u8, class: u32, buffer: u64, length: u32, process_o
                 Ok(process) => process,
                 Err(status) => return Ok(status),
             };
-            Ok(if enable_handle_exceptions(process, value & 1 != 0)? { 0 } else { STATUS_PROCESS_IS_TERMINATING })
+            // O resultado do ExEnableHandleExceptions não é conferido.
+            Ok(if enable_handle_exceptions(process, value & 1 != 0)?.is_some() { 0 } else { STATUS_PROCESS_IS_TERMINATING })
         }
         PROCESS_BREAK_ON_TERMINATION => {
             if length != 4 {

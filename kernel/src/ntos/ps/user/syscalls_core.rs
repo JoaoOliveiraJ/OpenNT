@@ -995,7 +995,7 @@ fn nt_set_information_process(handle: u64, class: u64, buffer: u64, length: u64,
             return Ok(0xC000_0005);
         }
         let (Ok(policy), Ok(flags)) = (guest::try_read::<u32>(buffer), guest::try_read::<u32>(buffer + 4)) else { return Ok(0xC000_0005) };
-        return Ok(crate::ntos::ps::mitigation_policy::set(handle as u32 == u32::MAX, policy, flags));
+        return crate::ntos::ps::mitigation_policy::set(handle as u32 == u32::MAX, policy, flags);
     }
     // As classes que mudam o EPROCESS (`ps/set_process_information`).
     use crate::ntos::ps::set_process_information as set_process;

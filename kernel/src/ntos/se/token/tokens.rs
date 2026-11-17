@@ -48,9 +48,6 @@ pub const TOKEN_SESSION_NOT_REFERENCED: u32 = 0x20;
 /// O TokenFlags que uma cópia herda (SepDuplicateToken): todos menos
 /// SESSION_NOT_REFERENCED e VIRTUALIZE_ENABLED.
 const DUPLICATED_FLAGS: u32 = 0xFFFF_FBDF;
-/// TOKEN_AUDIT_NO_CHILD_PROCESS em TokenFlags: o token primário de um
-/// processo novo nasce sem ele.
-const TOKEN_AUDIT_NO_CHILD_PROCESS: u32 = 0x20_0000;
 
 /// TokenInUse: o token é o primário de algum processo vivo.
 pub fn in_use(pointer: u64) -> bool {
@@ -72,6 +69,50 @@ pub fn stop_referencing_logon_session(pointer: u64) -> bool {
 /// O TokenFlags do corpo do token (o ULONG em TOKEN+0xC8).
 pub fn token_flags(pointer: u64) -> u32 {
     body(pointer).token_flags.get()
+}
+
+/// Os bits de TokenFlags da mitigação de processos filhos:
+/// TOKEN_NO_CHILD_PROCESS, TOKEN_NO_CHILD_PROCESS_UNLESS_SECURE e
+/// TOKEN_AUDIT_NO_CHILD_PROCESS (o token primário de um processo novo nasce
+/// sem este último).
+pub const TOKEN_NO_CHILD_PROCESS: u32 = 1 << 19;
+pub const TOKEN_NO_CHILD_PROCESS_UNLESS_SECURE: u32 = 1 << 20;
+pub const TOKEN_AUDIT_NO_CHILD_PROCESS: u32 = 1 << 21;
+/// Os da confiança de redirecionamento: TOKEN_ENFORCE_REDIRECTION_TRUST e
+/// TOKEN_AUDIT_REDIRECTION_TRUST.
+pub const TOKEN_ENFORCE_REDIRECTION_TRUST: u32 = 1 << 23;
+pub const TOKEN_AUDIT_REDIRECTION_TRUST: u32 = 1 << 24;
+
+/// Troca bits de TokenFlags sob a trava do token, com ModifiedId novo, como
+/// os setters SeTokenSet* do 19041 (o ModifiedId muda mesmo quando os bits
+/// ficam iguais).
+fn change_flags(pointer: u64, change: impl Fn(u32) -> u32) {
+    let modified = allocate_luid();
+    let _ = update(pointer, |record| {
+        let _ = body(pointer).token_flags.atomic().try_update(core::sync::atomic::Ordering::SeqCst, core::sync::atomic::Ordering::SeqCst, |flags| Some(change(flags)));
+        record.modified_id = modified;
+    });
+}
+
+/// SeTokenSetNoChildProcessRestricted(Token, UnlessSecure, AuditOnly)
+/// (ntoskrnl 19041, rva 0x32abc0): a restrição liga TOKEN_NO_CHILD_PROCESS,
+/// liga ou desliga TOKEN_NO_CHILD_PROCESS_UNLESS_SECURE e desliga a
+/// auditoria; a auditoria só entra num token ainda sem a restrição.
+pub fn set_no_child_process_restricted(pointer: u64, unless_secure: bool, audit_only: bool) {
+    change_flags(pointer, |flags| {
+        if audit_only {
+            if flags & TOKEN_NO_CHILD_PROCESS != 0 { flags } else { flags | TOKEN_AUDIT_NO_CHILD_PROCESS }
+        } else {
+            let secure = if unless_secure { TOKEN_NO_CHILD_PROCESS_UNLESS_SECURE } else { 0 };
+            (flags | TOKEN_NO_CHILD_PROCESS) & !(TOKEN_NO_CHILD_PROCESS_UNLESS_SECURE | TOKEN_AUDIT_NO_CHILD_PROCESS) | secure
+        }
+    });
+}
+
+/// SeTokenSetRedirectionTrustPolicy(Token, Audit) (ntoskrnl 19041, rva
+/// 0x3f86d4): impor e auditar se excluem.
+pub fn set_redirection_trust_policy(pointer: u64, audit: bool) {
+    change_flags(pointer, |flags| if audit { flags & !TOKEN_ENFORCE_REDIRECTION_TRUST | TOKEN_AUDIT_REDIRECTION_TRUST } else { flags & !TOKEN_AUDIT_REDIRECTION_TRUST | TOKEN_ENFORCE_REDIRECTION_TRUST });
 }
 
 /// O token ainda segura a sessão de logon dele.

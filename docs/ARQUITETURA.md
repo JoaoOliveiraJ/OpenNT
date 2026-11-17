@@ -3842,8 +3842,13 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   `se/token/duplicate.rs`; o RtlAcquirePrivilege da ntdll duplica o próprio
   token para ligar um privilégio, e o ScGetPrivilege do services.exe sai sem
   ele); a ProcessMitigationPolicy do processo corrente
-  (`ps/mitigation_policy.rs`: código dinâmico, pontos de extensão,
-  assinatura e fontes, com as recusas do 19041); a ProcessBasePriority
+  (`ps/mitigation_policy.rs`: ASLR, código dinâmico, verificação estrita
+  de handles, chamadas de sistema, pontos de extensão, CFG, assinatura,
+  fontes, carga de imagens, processos filhos, isolamento de canal lateral e
+  confiança de redirecionamento, com as recusas do 19041; as de processos
+  filhos e de redirecionamento ficam no TokenFlags do token primário, e o
+  CFG, ausente em todo processo, recusa tudo como num processo sem CFG); a
+  ProcessBasePriority
   (`ps/set_process_information.rs`); o pacote de espera sobre um processo
   (`ps/user/wait_packets.rs`: o pool de threads do wininit espera assim o
   fim do services.exe), que aceita qualquer objeto com objeto de espera de

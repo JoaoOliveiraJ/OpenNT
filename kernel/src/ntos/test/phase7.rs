@@ -2286,6 +2286,57 @@ fn user_syscalls_core(assert: Assert) {
     let refused = mitigation(6, 2, 8, u64::MAX) == 0xC000_000D && mitigation(6, 1, 4, u64::MAX) == 0xC000_0004 && mitigation(5, 0, 8, u64::MAX) == 0xC000_00BB && mitigation(6, 1, 8, 0x10) == 0xC000_000D;
     current.mitigation_flags.set(saved);
     assert(extension && fonts && refused, "usercore: ProcessMitigationPolicy liga as protecoes e recusa desliga-las");
+    // As outras políticas do 19041: carga de imagens (o fontdrvhost pede 3),
+    // ASLR, CFG ausente, chamadas de sistema, canal lateral, processos filhos
+    // e confiança de redirecionamento no TokenFlags (o fontdrvhost pede a
+    // restrição, o svchost a auditoria) e a verificação estrita de handles.
+    // Tudo volta ao fim.
+    {
+        use crate::ntos::se::token::tokens;
+        let saved_process = (current.mitigation_flags.get(), current.mitigation_flags2.get(), current.mitigation_flags3.get(), current.flags3.get(), current.security_domain.get(), current.parent_security_domain.get());
+        let token = crate::ntos::ps::process::get_primary_token(crate::ntos::ps::process::get_current_process()).unwrap_or(0);
+        let saved_token = if token != 0 { tokens::token_flags(token) } else { 0 };
+        let table = current.object_table.get();
+        // SAFETY: a HANDLE_TABLE do processo corrente.
+        let handle_table = (table != 0).then(|| unsafe { nt::HandleTable::at(table) });
+        let saved_strict = handle_table.map_or(0, |table| table.enable_handle_exceptions());
+        let token_flags = || if token != 0 { tokens::token_flags(token) } else { 0 };
+        if token != 0 {
+            tokens::body(token).token_flags.set(saved_token & !(0x7 << 19 | 0x3 << 23));
+        }
+        current.mitigation_flags.set(0);
+        current.mitigation_flags2.set(0);
+        current.mitigation_flags3.set(0);
+        let set = |policy: u32, flags: u32| mitigation(policy, flags, 8, u64::MAX);
+        let image = set(10, 0x20) == 0xC000_000D && set(10, 3) == 0 && current.mitigation_flags.get() & 0x7C_0000 == 0x28_0000 && set(10, 0) == 0xC000_0022;
+        let aslr = set(1, 9) == 0xC000_0030 && set(1, 0xB) == 0 && current.mitigation_flags.get() & 0x58 == 0x18 && set(1, 1) == 0xC000_0022;
+        let cfg = set(7, 4) == 0xC000_0022 && set(7, 8) == 0xC000_000D;
+        // A auditoria do win32k numa thread GUI chega tarde (STATUS_TOO_LATE).
+        let gui = crate::ntos::ps::win32::is_gui_thread();
+        let fsctl = set(4, 0x10) == 0xC000_000D && set(4, 4) == 0 && current.mitigation_flags3.get() & 6 == 6 && set(4, 0) == 0xC000_0022;
+        let win32k = if gui { set(4, 6) == 0xC000_0189 && current.mitigation_flags.get() & 0x3000 == 0 } else { set(4, 6) == 0 && current.mitigation_flags.get() & 0x3000 == 0x2000 && set(4, 4) == 0xC000_0022 };
+        let syscalls = fsctl && win32k;
+        let side = set(14, 0xF) == 0 && current.mitigation_flags.get() & 0xC000_0000 == 0xC000_0000 && current.mitigation_flags2.get() & 0x3000 == 0x3000 && current.security_domain.get() > 0x1_0000_0000 && current.parent_security_domain.get() == current.security_domain.get() && current.flags3.get() & 0x20_0000 != 0 && set(14, 0) == 0xC000_0022;
+        let child = set(13, 4) == 0xC000_000D && set(13, 1) == 0 && token_flags() & 0x7 << 19 == 1 << 19 && set(13, 2) == 0xC000_0022 && set(13, 5) == 0xC000_0022;
+        let redirection = set(16, 4) == 0xC000_000D && set(16, 2) == 0 && token_flags() & 0x3 << 23 == 1 << 24 && set(16, 0) == 0xC000_0022 && set(16, 1) == 0 && token_flags() & 0x3 << 23 == 1 << 23 && set(16, 2) == 0xC000_0022;
+        if let Some(table) = handle_table {
+            table.set_enable_handle_exceptions(0);
+        }
+        let strict = set(3, 1) == 0xC000_000D && set(3, 3) == 0 && handle_table.is_some_and(|table| table.enable_handle_exceptions() == 1) && set(3, 0) == 0xC000_0022;
+        current.mitigation_flags.set(saved_process.0);
+        current.mitigation_flags2.set(saved_process.1);
+        current.mitigation_flags3.set(saved_process.2);
+        current.flags3.set(saved_process.3);
+        current.security_domain.set(saved_process.4);
+        current.parent_security_domain.set(saved_process.5);
+        if token != 0 {
+            tokens::body(token).token_flags.set(saved_token);
+        }
+        if let Some(table) = handle_table {
+            table.set_enable_handle_exceptions(saved_strict);
+        }
+        assert(token != 0 && image && aslr && cfg && syscalls && side && child && redirection && strict, "usercore: ProcessMitigationPolicy de imagens, ASLR, CFG, chamadas de sistema, canal lateral, filhos, redirecionamento e handles como o 19041");
+    }
     // ProcessBasePriority (5), como o lsass.exe ao iniciar: a base corrente
     // aceita sem mudar nada; base fora de 1..31 e tamanho errado recusados.
     let base = current.pcb.base_priority.get() as u32;
