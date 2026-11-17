@@ -1364,11 +1364,24 @@ dentro dele) que não é compartilhado entre as raízes:
   de TLB em todas as CPUs. Nenhuma imagem de kernel fica na metade de
   usuário; o ntoskrnl não passa pelo loader (o stage2 já o mapeia na sua
   ImageBase) e é listado ali.
+- **NtLoadDriver e NtUnloadDriver** (`io/driver_load.rs`, adaptadores em
+  `ps/user/device_io.rs` e nos exports Zw*): o IopLoadDriverImage e o
+  IopUnloadDriver do 19041. Em modo usuário, o SeLoadDriverPrivilege do
+  token efetivo (o services.exe impersona uma cópia do próprio token com o
+  privilégio habilitado) e a captura do nome; o LOAD_PACKET vai a uma worker
+  do sistema e quem chama espera o evento (direto quando quem chama já é o
+  processo System). A carga abre a chave pelo nome completo (uma chave
+  ausente dá STATUS_OBJECT_NAME_NOT_FOUND), monta o caminho da imagem como
+  o IopBuildFullDriverPath, dá STATUS_IMAGE_ALREADY_LOADED com o objeto já
+  publicado, devolve o status do DriverEntry quando ele falha e roda as
+  rotinas de reinicialização; o kernel não inicia o DependOnService. A
+  descarga recusa com STATUS_INVALID_DEVICE_REQUEST um driver sem
+  DriverUnload, sem imagem ou PnP (com AddDevice).
 - **Drivers carregados por outro driver** (o KMDF): a WdfLdr.sys é um driver
   de export, carregado pelo `mm/sysload.rs` como biblioteca de import do
   cliente KMDF; o WdfVersionBind do cliente pede o ZwLoadDriver do serviço
-  do runtime (Wdf01000), que sobe pelo mesmo ciclo de vida do SCM
-  (`cm/service/driver.rs` → `io/lifecycle.rs`) aninhado no DriverEntry do
+  do runtime (Wdf01000), que sobe pelo NtLoadDriver em KernelMode
+  (`io/driver_load.rs` → `io/lifecycle.rs`) aninhado no DriverEntry do
   cliente: `lifecycle::load_driver` guarda e devolve o driver corrente. O
   ImagePath de um serviço pode ser relativo, e então é relativo ao
   \SystemRoot (`system32\drivers\Wdf01000.sys`); System32\Drivers fica na

@@ -2,17 +2,17 @@
 //!
 //! Usa a mesma base de configuração dos serviços de usuário. RUNNING exige um
 //! DRIVER_OBJECT inicializado: lançar a carga não equivale a concluir o
-//! DriverEntry. Também atende ZwLoadDriver/ZwUnloadDriver pelo caminho
-//! completo da chave do serviço.
+//! DriverEntry. O NtLoadDriver e o ZwLoadDriver não passam por aqui: eles
+//! seguem o I/O Manager (`io/driver_load.rs`), sem iniciar dependências.
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::String;
-use alloc::vec::Vec;
 
 use crate::ntos::cm::service::database::{self as service_database, Configuration, ServiceError, ServiceStatus};
 use crate::rtl::SpinLock;
 use crate::ntos::inc::types::{DriverObject, NtStruct};
+use crate::ntos::io::driver_load;
 use crate::ntos::io::lifecycle::{self, DriverOptions};
 
 /// Falha com o código Win32 preservado (e o NTSTATUS já produzido, se houver).
@@ -46,56 +46,10 @@ struct Operation {
 
 static OPERATIONS: SpinLock<BTreeMap<String, Operation>> = SpinLock::new(BTreeMap::new());
 
-fn strip_prefix_ci<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
-    if text.len() >= prefix.len() && text.is_char_boundary(prefix.len()) && text[..prefix.len()].eq_ignore_ascii_case(prefix) {
-        Some(&text[prefix.len()..])
-    } else {
-        None
-    }
-}
-
-/// Normaliza o caminho instalado para o volume de boot; recusa unidades
-/// indisponíveis, componentes vazios, travessia e caracteres não admitidos.
+/// Normaliza o caminho instalado para o volume de boot
+/// (`driver_load::image_volume_path`).
 pub fn image_path(configuration: &Configuration) -> Result<String, DriverServiceError> {
-    let mut path = configuration.image_path.as_str();
-    if path.len() >= 2 && path.starts_with('"') && path.ends_with('"') {
-        path = &path[1..path.len() - 1];
-    }
-    let mut path = path.replace('/', "\\");
-    for prefix in ["\\??\\", "\\\\?\\"] {
-        if let Some(rest) = path.strip_prefix(prefix) {
-            path = String::from(rest);
-            break;
-        }
-    }
-    if let Some(rest) = strip_prefix_ci(&path, "%SystemRoot%\\") {
-        path = format!("\\SystemRoot\\{rest}");
-    }
-    // ImagePath relativo é relativo a \SystemRoot, como no IopLoadDriver.
-    if strip_prefix_ci(&path, "System32\\").is_some() {
-        path = format!("\\SystemRoot\\{path}");
-    }
-    // Drivers de System32\Drivers ficam na raiz do volume do convidado.
-    let relative = if let Some(rest) = strip_prefix_ci(&path, "\\SystemRoot\\System32\\Drivers\\") {
-        String::from(rest)
-    } else if let Some(rest) = strip_prefix_ci(&path, "C:\\Windows\\System32\\Drivers\\") {
-        String::from(rest)
-    } else if let Some(rest) = strip_prefix_ci(&path, "\\SystemRoot\\") {
-        // O resto da instalação (o repositório de drivers em
-        // System32\DriverStore) fica onde o \SystemRoot aponta: \Device\KernelVolume1\Windows.
-        format!("Windows\\{rest}")
-    } else if let Some(rest) = strip_prefix_ci(&path, "C:\\") {
-        String::from(rest)
-    } else if (path.len() >= 2 && path.as_bytes()[0].is_ascii_alphabetic() && path.as_bytes()[1] == b':') || path.starts_with('\\') {
-        return fail(3, "driver volume/path unavailable");
-    } else {
-        path
-    };
-    let components: Vec<&str> = relative.split('\\').collect();
-    if components.iter().any(|component| component.is_empty() || *component == "." || *component == ".." || component.contains([':', '"', '\0'])) {
-        return fail(123, "invalid driver path");
-    }
-    Ok(format!("/{}", components.join("/")))
+    driver_load::image_volume_path(&configuration.image_path).map_err(|(code, message)| DriverServiceError { win32: code, ntstatus: None, message: String::from(message) })
 }
 
 /// Só um DRIVER_OBJECT cuja inicialização terminou.
@@ -233,34 +187,4 @@ pub fn stop(name: &str) -> Result<u32, DriverServiceError> {
 /// Integra a consulta real de drivers à base de serviços.
 pub fn init() {
     service_database::set_driver_status_provider(Some(status));
-}
-
-/// NtLoadDriver/NtUnloadDriver pelo caminho completo da chave; preserva um
-/// NTSTATUS já produzido e converte as falhas Win32 conhecidas.
-pub fn nt_request(driver_path: &str, unload: bool) -> u32 {
-    let prefix = format!("{}\\", service_database::ROOT);
-    let Some(service) = strip_prefix_ci(driver_path, &prefix) else { return 0xC000_003A };
-    if service.is_empty() || service.contains(['\\', '/', '\0']) {
-        return 0xC000_0033;
-    }
-    let result = if unload { stop(service) } else { start(service) };
-    match result {
-        Ok(status) => status,
-        Err(error) => error.ntstatus.unwrap_or(match error.win32 {
-            2 => 0xC000_0034,
-            3 => 0xC000_003A,
-            5 => 0xC000_0022,
-            50 => 0xC000_000D,
-            123 => 0xC000_0033,
-            1051 => 0xC000_009E,
-            1052 => 0xC000_036B,
-            1056 => 0xC000_010E,
-            1058 => 0xC000_036C,
-            1060 => 0xC000_0034,
-            1062 => 0xC000_0034,
-            1068 => 0xC000_0365,
-            1075 => 0xC000_0034,
-            _ => 0xC000_0001,
-        }),
-    }
 }

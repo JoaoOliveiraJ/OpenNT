@@ -375,8 +375,14 @@ pub fn dispose_driver(driver: u64) {
 /// driver de serviço.
 pub fn unload_driver(driver_name: &str) -> bool {
     let Some(node) = driver_node(driver_name) else { return false };
-    let found = DRIVERS.lock().iter().find(|(_, entry)| entry.node == node).map(|(&driver, entry)| (driver, entry.import_references, entry.kernel_library_pinned));
-    let Some((driver, import_references, pinned)) = found else { return false };
+    let found = DRIVERS.lock().iter().find(|(_, entry)| entry.node == node).map(|(&driver, _)| driver);
+    found.is_some_and(unload_driver_object)
+}
+
+/// [`unload_driver`] de um DRIVER_OBJECT nativo carregado.
+pub fn unload_driver_object(driver: u64) -> bool {
+    let found = DRIVERS.lock().get(&driver).map(|entry| (entry.node, entry.name.clone(), entry.import_references, entry.kernel_library_pinned));
+    let Some((node, driver_name, import_references, pinned)) = found else { return false };
     if import_references != 0 || pinned {
         return false;
     }
@@ -429,13 +435,20 @@ pub fn call_add_device(driver_name: &str, physical_device: u64) -> u64 {
     status as i32 as i64 as u64
 }
 
-/// DRIVER_OBJECT de `\Driver\<nome>` cuja inicialização terminou.
+/// O DRIVER_OBJECT é de um `.sys` carregado com imagem (não um driver que o
+/// próprio kernel criou pelo IoCreateDriver, sem DriverSection no NT).
+pub fn has_image(driver: u64) -> bool {
+    DRIVERS.lock().get(&driver).is_some_and(|entry| entry.image.is_some())
+}
+
 /// Exports do driver carregado (diretório de exports real), para os
 /// importadores de `mm::sysload`.
 pub fn driver_exports(driver_name: &str) -> Option<BTreeMap<String, u64>> {
     DRIVERS.lock().values().find(|entry| entry.name.eq_ignore_ascii_case(driver_name)).map(|entry| entry.exports.clone())
 }
 
+/// DRIVER_OBJECT do driver do serviço `driver_name` cuja inicialização
+/// terminou.
 pub fn initialized_driver(driver_name: &str) -> Option<u64> {
     let node = driver_node(driver_name)?;
     DRIVERS.lock().iter().find(|(_, entry)| entry.node == node && entry.initialized).map(|(&driver, _)| driver)

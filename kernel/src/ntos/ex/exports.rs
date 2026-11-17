@@ -654,7 +654,7 @@ pub mod zw {
 
     use crate::ntos::init::exports::{signed_status, Call, Group};
     use crate::ntos::io::file::zw as zw_files;
-    use crate::ntos::cm::service::driver as driver_services;
+    use crate::ntos::io::driver_load;
     use crate::ntos::cm::key::native as native_keys;
     use crate::ntos::ex::{boot_display, event, system_information};
     use crate::ntos::io::file::{query as query_file, read as read_file, write as write_file};
@@ -663,7 +663,6 @@ pub mod zw {
     use crate::ntos::po::power_information;
     use crate::ntos::ps::{query_process, scheduler};
     use crate::rtl::KernelError;
-    use crate::ntos::rtl::guest_strings;
 
     fn create_key(call: &Call) -> Result<u64, KernelError> {
         Ok(native_keys::create(call.arg(1), call.arg(2) as u32, call.arg(3), call.arg(4) as u32, call.arg(5), call.arg(6) as u32, call.arg(7))? as u64)
@@ -711,12 +710,13 @@ pub mod zw {
     fn set_information_file(call: &Call) -> Result<u64, KernelError> {
         Ok(signed_status(zw_files::set_information_file(call.arg(1), call.arg(2), call.arg(3), call.arg(5) as u32)?))
     }
-    /// ZwLoadDriver/ZwUnloadDriver: o mesmo registro de serviços do SCM.
+    /// ZwLoadDriver/ZwUnloadDriver: o NtLoadDriver/NtUnloadDriver em
+    /// KernelMode (`io/driver_load`).
     fn load_driver(call: &Call) -> Result<u64, KernelError> {
-        Ok(signed_status(driver_services::nt_request(&guest_strings::read_unicode_string(call.arg(1)), false)))
+        Ok(signed_status(driver_load::load_driver_image(call.arg(1), 0)))
     }
     fn unload_driver(call: &Call) -> Result<u64, KernelError> {
-        Ok(signed_status(driver_services::nt_request(&guest_strings::read_unicode_string(call.arg(1)), true)))
+        Ok(signed_status(driver_load::unload_driver_image(call.arg(1), 0)))
     }
     fn query_system_information_handler(call: &Call) -> Result<u64, KernelError> {
         Ok(system_information::query(call.arg(1) as u32, call.arg(2), call.arg(3) as u32, call.arg(4))? as u64)

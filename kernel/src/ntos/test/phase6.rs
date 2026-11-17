@@ -2371,9 +2371,20 @@ fn process_information_and_driver_services(assert: Assert) {
     let installed = service_database::install(&ConfigurationInput { name: alloc::string::String::from("OpenNtSvcTest"), image_path: Some(alloc::string::String::from("\\SystemRoot\\System32\\Drivers\\opennt-svc.sys")), service_type: Some(1), start: Some(3), ..Default::default() }, false);
     assert(installed.is_ok() && driver_services::start("OpenNtSvcTest").is_ok_and(|status| status == 0) && service_database::status("OpenNtSvcTest").is_ok_and(|status| status.current_state == 4 && status.controls_accepted == 1), "drvsvc: start carrega o driver e o estado vem do DRIVER_OBJECT");
     assert(driver_services::start("OpenNtSvcTest").is_err_and(|error| error.win32 == 1056) && driver_services::stop("OpenNtSvcTest").is_ok() && guest::read32(counter) == 1 && service_database::status("OpenNtSvcTest").is_ok_and(|status| status.current_state == 1), "drvsvc: stop chama o DriverUnload e o servico para");
-    let key = alloc::format!("{}\\OpenNtSvcTest", service_database::ROOT);
-    assert(driver_services::nt_request(&key, false) == 0 && driver_services::nt_request(&key, false) == 0xC000_010E && driver_services::nt_request(&key, true) == 0 && guest::read32(counter) == 2, "drvsvc: ZwLoadDriver/ZwUnloadDriver pelo caminho da chave");
-    assert(driver_services::nt_request("\\Registry\\Machine\\Software\\X", false) == 0xC000_003A && driver_services::nt_request(&alloc::format!("{}\\NaoExiste", service_database::ROOT), false) == 0xC000_0034, "drvsvc: chave fora de Services e servico inexistente");
+    // ZwLoadDriver/ZwUnloadDriver (o IopLoadDriverImage e o IopUnloadDriver
+    // em KernelMode): a chave aberta pelo nome, STATUS_IMAGE_ALREADY_LOADED
+    // com o objeto já publicado, a falha da abertura como está e o objeto
+    // ausente na descarga.
+    {
+        use crate::ntos::io::driver_load;
+        let names = guest::alloc_bytes(0x400);
+        let key = unicode_at(names, &alloc::format!("{}\\OpenNtSvcTest", service_database::ROOT));
+        let other_root = unicode_at(names + 0x100, "\\Registry\\Machine\\Software\\OpenNtSemServico");
+        let missing = unicode_at(names + 0x200, &alloc::format!("{}\\NaoExiste", service_database::ROOT));
+        assert(driver_load::load_driver_image(key, 0) == 0 && driver_load::load_driver_image(key, 0) == 0xC000_010E && driver_load::unload_driver_image(key, 0) == 0 && guest::read32(counter) == 2 && driver_load::unload_driver_image(key, 0) == 0xC000_0034, "drvsvc: ZwLoadDriver/ZwUnloadDriver pelo caminho da chave");
+        assert(driver_load::load_driver_image(other_root, 0) == 0xC000_0034 && driver_load::load_driver_image(missing, 0) == 0xC000_0034 && driver_load::load_driver_image(0, 0) == 0xC000_000D, "drvsvc: chave ausente e nome nulo no ZwLoadDriver");
+        guest::free_bytes(names);
+    }
     // O nome do DRIVER_OBJECT pela chave (IopGetDriverNameFromKeyNode): Type 2
     // em \FileSystem com o nome da chave como está na hive; o ObjectName
     // REG_SZ no lugar dele; outro tipo de ObjectName é malformado.

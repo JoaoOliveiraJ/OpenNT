@@ -335,8 +335,20 @@ fn nt_cancel_io_file_ex(handle: u64, target: u64, out: u64, _: u64, _rsp: u64) -
     Ok(cancel_io(handle, target, out, false))
 }
 
+/// NtLoadDriver(DriverServiceName) (`io/driver_load.rs`).
+fn nt_load_driver(name: u64, _: u64, _: u64, _: u64, _rsp: u64) -> Result<u32, KernelError> {
+    Ok(crate::ntos::io::driver_load::load_driver_image(name, 1))
+}
+
+/// NtUnloadDriver(DriverServiceName) (`io/driver_load.rs`).
+fn nt_unload_driver(name: u64, _: u64, _: u64, _: u64, _rsp: u64) -> Result<u32, KernelError> {
+    Ok(crate::ntos::io::driver_load::unload_driver_image(name, 1))
+}
+
 pub fn init() {
     state::register_handler("NtCancelIoFile", nt_cancel_io_file);
     state::register_handler("NtCancelIoFileEx", nt_cancel_io_file_ex);
+    state::register_handler("NtLoadDriver", nt_load_driver);
+    state::register_handler("NtUnloadDriver", nt_unload_driver);
     threads::set_pump(threads::pump::DEVICE_IO, pump);
 }
