@@ -147,9 +147,21 @@ fn symbolic_links(assert: Assert) {
         assert(matches!(deleted, Ok(0)), "cmmodel: o link aberto com OBJ_OPENLINK e excluido");
         close(handle);
     }
-    // SECURITY\SAM do volume aponta para SAM\SAM.
-    let security_sam = registry::node_by_path("\\Registry\\Machine\\SECURITY\\SAM\\Domains\\Account");
-    assert(security_sam.is_some() && security_sam == registry::node_by_path("\\Registry\\Machine\\SAM\\SAM\\Domains\\Account"), "cmmodel: SECURITY\\SAM, link da hive do volume, resolve para SAM\\SAM");
+    // SECURITY\SAM do volume é o link para SAM\SAM, que a hive SAM de um
+    // sistema novo ainda não tem (o samsrv cria o banco no primeiro boot):
+    // criado o destino, o link resolve para ele.
+    let through_link = "\\Registry\\Machine\\SECURITY\\SAM\\OpenNTTeste";
+    let missing = registry::node_by_path(through_link).is_none() && registry::node_by_path("\\Registry\\Machine\\SAM\\SAM").is_none();
+    let (created_root, sam_root) = open_with("\\Registry\\Machine\\SAM\\SAM", 0, 0x240, true, 0);
+    let (created_child, child) = open_with("\\Registry\\Machine\\SAM\\SAM\\OpenNTTeste", 0, 0x240, true, 0);
+    let resolved = registry::node_by_path(through_link);
+    let same = resolved.is_some() && resolved == registry::node_by_path("\\Registry\\Machine\\SAM\\SAM\\OpenNTTeste");
+    let mut deleted = true;
+    for handle in [child, sam_root] {
+        deleted &= matches!(key_services::key_operation(Kind::DeleteKey, handle, &fields(&[]), false), Ok(0));
+        close(handle);
+    }
+    assert(missing && created_root == 0 && created_child == 0 && same && deleted && registry::node_by_path("\\Registry\\Machine\\SAM\\SAM").is_none(), "cmmodel: SECURITY\\SAM, link da hive do volume, resolve para SAM\\SAM quando o destino existe");
 }
 
 fn machine_hives(assert: Assert) {
