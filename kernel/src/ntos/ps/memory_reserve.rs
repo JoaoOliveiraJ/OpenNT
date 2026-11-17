@@ -32,6 +32,7 @@ use crate::ntos::ob::object_types::{self, TypeTemplate};
 use crate::ntos::ob::{object_create, object_reference, reference_trace};
 use crate::rtl::KernelError;
 
+const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 /// STATUS_INVALID_PARAMETER_2: a reserva já está com um pacote na fila.
@@ -83,8 +84,9 @@ pub fn completion_reserve_type() -> u64 {
 }
 
 /// NtAllocateReserveObject(MemoryReserveHandle, ObjectAttributes, Type) no
-/// modo `mode` (o handle é gravado direto: em UserMode o chamador já sondou
-/// a saída). Devolve o NTSTATUS.
+/// modo `mode` (em UserMode o chamador já sondou a saída, e a gravação do
+/// handle volta STATUS_ACCESS_VIOLATION se a página sumiu nesse meio tempo).
+/// Devolve o NTSTATUS.
 pub fn allocate(handle_out: u64, attributes: u64, reserve_type: u32, mode: u8) -> Result<u32, KernelError> {
     if reserve_type > MEMORY_RESERVE_IO_COMPLETION {
         return Ok(STATUS_INVALID_PARAMETER);
@@ -118,8 +120,15 @@ pub fn allocate(handle_out: u64, attributes: u64, reserve_type: u32, mode: u8) -
         }
         let status = object_create::insert(object, RESERVE_ALL_ACCESS, 0, 0, handle_cell.address())?;
         if status & 0x8000_0000 == 0 {
-            // SAFETY: o PHANDLE de saída do chamador.
-            unsafe { Field::<u64>::at(handle_out) }.set(handle_cell.get());
+            if mode != 0 {
+                // O PHANDLE de usuário, sondado pelo chamador.
+                if guest::try_write::<u64>(handle_out, handle_cell.get()).is_err() {
+                    return Ok(STATUS_ACCESS_VIOLATION);
+                }
+            } else {
+                // SAFETY: o PHANDLE de saída do chamador de modo kernel.
+                unsafe { Field::<u64>::at(handle_out) }.set(handle_cell.get());
+            }
         }
         Ok(status)
     })();

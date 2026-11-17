@@ -92,6 +92,28 @@ fn nt_set_io_completion(handle: u64, _key: u64, _context: u64, status: u64, rsp:
     Ok(0)
 }
 
+/// NtSetIoCompletionEx(handle, reserve, key, context, status, information):
+/// os dois últimos na pilha; o pacote embutido na reserva de conclusão
+/// (`io/completion/set.rs`), com a reserva referenciada em UserMode. O
+/// rpcrt4 posta assim a notificação IOC de uma chamada RPC assíncrona.
+fn nt_set_io_completion_ex(handle: u64, reserve: u64, _key: u64, _context: u64, rsp: u64) -> Result<u32, KernelError> {
+    if !state::probe_syscall_stack(rsp, 16) {
+        return Ok(0xC000_0005);
+    }
+    let (key, context, information) = (words(state::syscall_arg_words(rsp, 3)), words(state::syscall_arg_words(rsp, 4)), words(state::syscall_arg_words(rsp, 6)));
+    Ok(crate::ntos::io::completion::set::set_io_completion_ex(handle, reserve, key, context, state::stack_arg32(rsp, 5), information, 1))
+}
+
+/// NtAllocateReserveObject(MemoryReserveHandle, ObjectAttributes, Type): a
+/// saída sondada antes do tipo, como no 19041; o objeto e o handle em
+/// UserMode (`ps/memory_reserve.rs`).
+fn nt_allocate_reserve_object(out: u64, attributes: u64, reserve_type: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
+    if !probe_user_write(out, 8) {
+        return Ok(0xC000_0005);
+    }
+    crate::ntos::ps::memory_reserve::allocate(out, attributes, reserve_type as u32, 1)
+}
+
 /// NtQueryIoCompletion: só a classe básica (Depth de 4 bytes).
 fn nt_query_io_completion(handle: u64, class: u64, out: u64, length: u64, rsp: u64) -> Result<u32, KernelError> {
     let port = match resolve(handle, 1) {
@@ -231,5 +253,7 @@ pub fn init() {
     state::register_handler("NtCreateIoCompletion", nt_create_io_completion);
     state::register_handler("NtOpenIoCompletion", nt_open_io_completion);
     state::register_handler("NtSetIoCompletion", nt_set_io_completion);
+    state::register_handler("NtSetIoCompletionEx", nt_set_io_completion_ex);
+    state::register_handler("NtAllocateReserveObject", nt_allocate_reserve_object);
     state::register_handler("NtQueryIoCompletion", nt_query_io_completion);
 }

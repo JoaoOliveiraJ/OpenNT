@@ -1888,7 +1888,7 @@ pub mod zw_wait_completion_packets {
     /// ZwSetIoCompletionEx(IoCompletion, Reserve, Key, ApcContext, IoStatus,
     /// IoStatusInformation).
     fn set_io_completion_ex(call: &Call) -> Result<u64, KernelError> {
-        Ok(signed_status(set::set_io_completion_ex(call.arg(1), call.arg(2), call.arg(3), call.arg(4), call.arg(5) as u32, call.arg(6))))
+        Ok(signed_status(set::set_io_completion_ex(call.arg(1), call.arg(2), call.arg(3), call.arg(4), call.arg(5) as u32, call.arg(6), 0)))
     }
 
     pub static GROUP: Group = Group {

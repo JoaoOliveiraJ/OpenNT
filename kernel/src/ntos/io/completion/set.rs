@@ -70,25 +70,27 @@ pub fn pending_count() -> usize {
     IN_FLIGHT.lock().len()
 }
 
-/// ZwSetIoCompletionEx(IoCompletionHandle, IoCompletionPacketHandle,
-/// KeyContext, ApcContext, IoStatus, IoStatusInformation): o pacote vai para
-/// a IOCP do handle, como o NtSetIoCompletionEx — um handle da tabela do
-/// processo corrente (com IO_COMPLETION_MODIFY_STATE) ou da tabela nativa
-/// (a IOCP criada em modo kernel). Com IoCompletionPacketHandle, o pacote é
-/// o embutido no IoCompletionReserve do NtAllocateReserveObject: a reserva
-/// é tomada (InUse) depois da IOCP e o pacote vai pelo IoSetIoCompletionEx;
-/// uma falha devolve a reserva.
-pub fn set_io_completion_ex(handle: u64, reserve: u64, key: u64, context: u64, status: u32, information: u64) -> u32 {
-    let port = match resolve_port(handle) {
+/// NtSetIoCompletionEx(IoCompletionHandle, IoCompletionPacketHandle,
+/// KeyContext, ApcContext, IoStatus, IoStatusInformation) no modo `mode`
+/// (0 para o ZwSetIoCompletionEx): o pacote vai para a IOCP do handle — um
+/// handle da tabela do processo corrente (com IO_COMPLETION_MODIFY_STATE)
+/// ou da tabela nativa (a IOCP criada em modo kernel; um handle de kernel
+/// só em KernelMode). O pacote é o embutido no IoCompletionReserve do
+/// NtAllocateReserveObject: a reserva, referenciada no mesmo modo, é tomada
+/// (InUse) depois da IOCP e o pacote vai pelo IoSetIoCompletionEx; uma
+/// falha devolve a reserva. Em UserMode o handle da reserva é obrigatório
+/// (nulo é STATUS_INVALID_HANDLE, como no 19041); o Zw sem reserva publica
+/// um pacote comum.
+pub fn set_io_completion_ex(handle: u64, reserve: u64, key: u64, context: u64, status: u32, information: u64, mode: u8) -> u32 {
+    let port = match resolve_port_with(handle, 2, mode != 0) {
         Ok(port) => port,
         Err(status) => return status,
     };
-    if reserve == 0 {
+    if reserve == 0 && mode == 0 {
         completion_objects::enqueue(&port, Packet { key, context, status, information, ..Packet::default() });
         return 0;
     }
-    // ZwSetIoCompletionEx: o handle da reserva é referenciado em KernelMode.
-    let packet = match crate::ntos::ps::memory_reserve::take_completion_reserve(reserve, 0) {
+    let packet = match crate::ntos::ps::memory_reserve::take_completion_reserve(reserve, mode) {
         Ok(Ok(packet)) => packet,
         Ok(Err(status)) => return status,
         Err(_) => return 0xC000_0001,
@@ -106,21 +108,17 @@ pub fn set_io_completion_ex(handle: u64, reserve: u64, key: u64, context: u64, s
 /// corpo da IOCP com uma referência (solta com
 /// `dispatcher::dereference`), da tabela do processo corrente ou da nativa.
 pub fn reference_port(handle: u64, access: u32) -> Result<u64, u32> {
-    let port = resolve_port_with(handle, access)?;
+    let port = resolve_port_with(handle, access, false)?;
     dispatcher_objects::reference(port.pointer).map_err(|_| 0xC000_0008u32)?;
     Ok(port.pointer)
 }
 
-/// A IOCP do handle (IO_COMPLETION_MODIFY_STATE): a tabela do processo
-/// corrente ou a nativa.
-fn resolve_port(handle: u64) -> Result<alloc::sync::Arc<completion_objects::Port>, u32> {
-    resolve_port_with(handle, 2)
-}
-
-fn resolve_port_with(handle: u64, access: u32) -> Result<alloc::sync::Arc<completion_objects::Port>, u32> {
+/// A IOCP do handle com `access`: a tabela do processo corrente ou a
+/// nativa (sem handles de kernel quando `from_user_mode`).
+fn resolve_port_with(handle: u64, access: u32, from_user_mode: bool) -> Result<alloc::sync::Arc<completion_objects::Port>, u32> {
     match crate::ntos::ps::user::io_completion::resolve(handle, access) {
         Ok((_, port)) => Ok(port),
-        Err(0xC000_0008) => match crate::ntos::ob::open_pointer::resolve(handle, false) {
+        Err(0xC000_0008) => match crate::ntos::ob::open_pointer::resolve(handle, from_user_mode) {
             Some(Ok(opened)) if opened.item.object_type.name == "IoCompletion" => match completion_objects::port_of(opened.item.pointer) {
                 Some(port) if opened.access & access == access => Ok(port),
                 Some(_) => Err(0xC000_0022),
