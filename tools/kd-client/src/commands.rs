@@ -63,12 +63,13 @@
 use std::time::{Duration, Instant};
 
 use super::client::{BreakpointKind, BreakpointRequest, Client, Resumed, RUN_TO_WAIT};
+use super::registers;
 use super::rsp::unhex;
 use super::trace::{self, Source, Trace};
 use super::types::{self, Kind};
 use super::parse_number;
 
-const HELP: &str = "attach | break | c/g | wait-stop [ms] | s/t [n] | p [n] | gu | regs | r [<reg>[=<expr>]]
+const HELP: &str = "attach | break | c/g | wait-stop [ms] | s/t [n] | p [n] | gu | regs | r [<reg>[=<expr>]] | rx (x87, SSE, YMM, DR)
 x <expr> [bytes] | db/dw/dd/dq <expr> [L<n>] | da/du <expr> | write <expr> <hex> | poke <1|2|4|8> <expr> <valor>
 bp <expr> [N] [/w \"cond\"] | bu <expr> | bc <expr|#n|all> | bd/be <n> | bl | hbp/hbc <expr>
 ba <e|w|r><1|2|4|8> <expr> | watch/unwatch <expr> <bytes> [w|a] | sxe/sxd ld:<modulo> | .bpsave/.bpload <arq>
@@ -634,6 +635,37 @@ impl Client {
                 Resumed::Running => self.wait_stop(RUN_TO_WAIT),
             },
             "regs" => self.format_registers(),
+            "rx" => {
+                // x87, SSE, a metade alta dos YMM e os registradores de
+                // depuração.
+                let state = self.extended_registers()?;
+                let hex_bytes = |bytes: &[u8]| bytes.iter().rev().map(|byte| format!("{byte:02x}")).collect::<String>();
+                let mut output = String::new();
+                for (index, value) in state.xmm.iter().enumerate() {
+                    output.push_str(&format!("xmm{index:<2} {}\n", value.map_or("indisponivel".into(), |bytes| hex_bytes(&bytes))));
+                }
+                if let Some(mxcsr) = state.mxcsr {
+                    output.push_str(&format!("mxcsr {mxcsr:08x} {}\n", registers::mxcsr_text(mxcsr)));
+                }
+                for (index, value) in state.st.iter().enumerate() {
+                    if let Some(bytes) = value {
+                        output.push_str(&format!("st{index} {} ({})\n", hex_bytes(bytes), registers::extended_to_f64(bytes)));
+                    }
+                }
+                let ymm: Vec<String> = state.ymm_high.iter().enumerate().filter_map(|(index, value)| value.map(|bytes| format!("ymm{index}h {}", hex_bytes(&bytes)))).collect();
+                if ymm.is_empty() {
+                    output.push_str("ymm: indisponivel (o sistema nao liga o AVX)\n");
+                } else {
+                    output.push_str(&(ymm.join("\n") + "\n"));
+                }
+                for (name, value) in ["dr0", "dr1", "dr2", "dr3", "dr6", "dr7"].iter().zip(state.debug.iter()) {
+                    output.push_str(&format!("{name} {}\n", value.map_or("indisponivel".into(), |value| format!("{value:#x}"))));
+                }
+                if let Some(control) = state.debug[5] {
+                    output.push_str(&format!("dr7: {}\n", registers::dr7_text(control)));
+                }
+                Ok(output)
+            }
             "r" if rest.contains('=') && !rest.contains("==") => {
                 let (name, expression) = rest.split_once('=').unwrap_or_default();
                 let value = self.evaluate(expression)?;
@@ -948,7 +980,7 @@ impl Client {
     /// Os comandos e aliases conhecidos (o autocompletar).
     pub fn command_names() -> &'static [&'static str] {
         &[
-            "attach", "break", "c", "g", "continue", "wait-stop", "s", "t", "step", "p", "gu", "regs", "r", "x", "db", "dw", "dd", "dq", "da", "du", "write", "poke", "bp", "bu", "bc", "hbp", "hbc", "ba", "bpm", "bpmc", "watch", "unwatch", "sxe", "sxd", "bd", "be", "bl", ".bpsave", ".bpload", "bt", "k", "context", "btt", "?", "sym", "ln", "addr", "dt", "thread", "cpulist", "ps",
+            "attach", "break", "c", "g", "continue", "wait-stop", "s", "t", "step", "p", "gu", "regs", "r", "rx", "x", "db", "dw", "dd", "dq", "da", "du", "write", "poke", "bp", "bu", "bc", "hbp", "hbc", "ba", "bpm", "bpmc", "watch", "unwatch", "sxe", "sxd", "bd", "be", "bl", ".bpsave", ".bpload", "bt", "k", "context", "btt", "?", "sym", "ln", "addr", "dt", "thread", "cpulist", "ps",
             "threads", "lm", "lmv", "cpus", "irql", "obj", "log", "bugcheck", "kd", ".reload", "!process", "!thread", "!irp", "!devobj", "!drvobj", "!object", "!handle", "!analyze", "trace", "monitor", "modules", "detach", "help",
             ".process", "lmu", "handles", "vad", "uthreads", "ustack", "kmap", "events", "uex", "bgd", "bge", "bar",
         ]

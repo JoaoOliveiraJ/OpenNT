@@ -122,9 +122,16 @@ pub fn auto_comments(client: &mut Client, lines: &[Line], live: Option<&Live>) -
     for (index, line) in lines.iter().enumerate() {
         let mnemonic = line.text.split_whitespace().next().unwrap_or("");
         if mnemonic == "call" {
-            let Some(target) = call_target(client, line) else { continue };
-            let name = client.symbols.describe(target);
-            let Some(prototype) = prototypes::find(&name) else { continue };
+            // O nome pelo destino ou, num `call [rip+x]`, pela entrada da
+            // IAT (`__imp_IoCreateDevice`, quando o destino é um trampolim).
+            let mut names = Vec::new();
+            if let Some(target) = call_target(client, line) {
+                names.push(client.symbols.describe(target));
+            }
+            if let Some(name) = line.memory.and_then(|slot| client.symbols.name_at(slot)) {
+                names.push(name);
+            }
+            let Some(prototype) = names.iter().find_map(|name| prototypes::find(name)) else { continue };
             let count = prototype.arguments.len();
             let values: Vec<Value> = match live.filter(|live| live.rip == line.address) {
                 Some(live) => live_arguments(client, live, count),

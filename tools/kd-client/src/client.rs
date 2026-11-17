@@ -202,9 +202,10 @@ pub struct BreakpointRequest {
 
 impl BreakpointRequest {
     pub fn new(kind: BreakpointKind, expression: &str) -> Self {
+        // Um breakpoint de memória cobre as páginas de [endereço, endereço +
+        // tamanho): com 1, a página do endereço.
         let length = match kind {
             BreakpointKind::Write | BreakpointKind::Access => 8,
-            kind if kind.is_memory() => 0x1000,
             _ => 1,
         };
         Self { kind, expression: expression.trim().to_string(), length, condition: String::new(), pass_count: 0, deferred: false, enabled: true, log: String::new(), command: String::new(), group: String::new(), process: 0, options: BreakpointOptions::default() }

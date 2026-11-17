@@ -147,6 +147,10 @@ fn extended_registers_and_debug_registers() {
     assert_eq!(state.debug[0], Some(0xD0));
     assert_eq!(state.debug[5], Some(0x401));
     assert_eq!(client.evaluate("@dr7").unwrap(), 0x401);
+    // O comando de texto do cargo xtask debug.
+    let text = client.execute("rx").unwrap();
+    assert!(text.contains("xmm0  0f0e0d0c0b0a09080706050403020100"), "{text}");
+    assert!(text.contains("ymm3h a3a3") && text.contains("dr7: DR0:L x/1"), "{text}");
 }
 
 #[test]
