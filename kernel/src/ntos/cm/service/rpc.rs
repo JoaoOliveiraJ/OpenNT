@@ -545,7 +545,7 @@ pub fn call(context: &RpcContext, operation: u32, bytes: &[u8]) -> Result<Body, 
                     return Err(Fail::Win32(5));
                 }
                 let dependencies: Vec<String> = text.trim_end_matches('\0').split('\0').filter(|part| !part.is_empty()).map(String::from).collect();
-                service_database::install(&ConfigurationInput { name: name.clone(), display_name: Some(display.clone().filter(|display| !display.is_empty()).unwrap_or_else(|| name.clone())), image_path: Some(image_path.clone()), service_type: Some(service_type), start: Some(start), error_control: Some(error_control), object_name: Some(object_name.clone().filter(|object| !object.is_empty()).unwrap_or_else(|| String::from("LocalSystem"))), dependencies: Some(dependencies) }, false)?;
+                service_database::install(&ConfigurationInput { name: name.clone(), display_name: Some(display.clone().filter(|display| !display.is_empty()).unwrap_or_else(|| name.clone())), image_path: Some(image_path.clone()), service_type: Some(service_type), start: Some(start), error_control: Some(error_control), object_name: object_name.clone().filter(|object| !object.is_empty()), dependencies: Some(dependencies) }, false)?;
                 Ok(allocate(context, Kind::Service, &name, granted))
             })())?;
             let handle = handle.map_err(|code| error = code).ok();

@@ -149,8 +149,20 @@ fn decode_integer_value(value: Option<&Value>) -> ServiceResult<u32> {
     Ok(u32::from_le_bytes([value.data[0], value.data[1], value.data[2], value.data[3]]))
 }
 
-/// Tipo, início, controle de erro, caminho, nome e dependências; só a conta
-/// LocalSystem é admitida.
+/// O ObjectName de um driver é o nome do DRIVER_OBJECT (o
+/// IopGetDriverNameFromKeyNode o usa quando presente); o de um serviço Win32
+/// é a conta. Sem o valor, um driver fica com o nome vazio e um serviço Win32
+/// com LocalSystem.
+fn default_object_name(service_type: u32) -> String {
+    if DRIVER_TYPES.contains(&service_type) {
+        String::new()
+    } else {
+        String::from("LocalSystem")
+    }
+}
+
+/// Tipo, início, controle de erro, caminho, nome e dependências; num
+/// serviço Win32 só a conta LocalSystem é admitida.
 fn validate(configuration: Configuration) -> ServiceResult<Configuration> {
     service_key_path(&configuration.name)?;
     if !(DRIVER_TYPES.contains(&configuration.service_type) || [16, 32].contains(&configuration.service_type)) || configuration.start > 4 || configuration.error_control > 3 || (configuration.service_type >= 16 && configuration.start < 2) {
@@ -160,7 +172,7 @@ fn validate(configuration: Configuration) -> ServiceResult<Configuration> {
         return fail(87, "invalid image path/display name");
     }
     // Sem autenticação fictícia para contas de serviço não implementadas.
-    if configuration.object_name != "LocalSystem" {
+    if !DRIVER_TYPES.contains(&configuration.service_type) && configuration.object_name != "LocalSystem" {
         return fail(50, "service account logon is not implemented");
     }
     for dependency in &configuration.dependencies {
@@ -208,7 +220,7 @@ pub fn read(name: &str) -> ServiceResult<Option<Configuration>> {
             service_type,
             start: decode_integer_value(value("Start").as_ref())?,
             error_control: decode_integer_value(value("ErrorControl").as_ref())?,
-            object_name: if object.is_some() { decode_string_value(object.as_ref())? } else { String::from("LocalSystem") },
+            object_name: if object.is_some() { decode_string_value(object.as_ref())? } else { default_object_name(service_type) },
             dependencies: if dependency_text.is_empty() { Vec::new() } else { dependency_text.split('\0').map(String::from).collect() },
         })
     })();
@@ -218,14 +230,15 @@ pub fn read(name: &str) -> ServiceResult<Option<Configuration>> {
 
 /// Completa os padrões do gerenciador e valida antes de armazenar.
 fn normalize(input: &ConfigurationInput) -> ServiceResult<Configuration> {
+    let service_type = input.service_type.unwrap_or(16);
     validate(Configuration {
         name: input.name.clone(),
         display_name: input.display_name.clone().filter(|name| !name.is_empty()).unwrap_or_else(|| input.name.clone()),
         image_path: input.image_path.clone().unwrap_or_default(),
-        service_type: input.service_type.unwrap_or(16),
+        service_type,
         start: input.start.unwrap_or(3),
         error_control: input.error_control.unwrap_or(1),
-        object_name: input.object_name.clone().filter(|name| !name.is_empty()).unwrap_or_else(|| String::from("LocalSystem")),
+        object_name: input.object_name.clone().filter(|name| !name.is_empty()).unwrap_or_else(|| default_object_name(service_type)),
         dependencies: input.dependencies.clone().unwrap_or_default(),
     })
 }
@@ -238,7 +251,13 @@ fn write_configuration(configuration: &Configuration) -> ServiceResult<()> {
     }
     registry::set_value(handle, "ImagePath", 2, encode_wide_string(&configuration.image_path, false));
     registry::set_value(handle, "DisplayName", 1, encode_wide_string(&configuration.display_name, false));
-    registry::set_value(handle, "ObjectName", 1, encode_wide_string(&configuration.object_name, false));
+    // Um driver sem nome de objeto fica sem o valor (o I/O Manager dá o nome
+    // pelo tipo).
+    if !configuration.object_name.is_empty() {
+        registry::set_value(handle, "ObjectName", 1, encode_wide_string(&configuration.object_name, false));
+    } else {
+        registry::delete_value(handle, "ObjectName");
+    }
     registry::set_value(handle, "DependOnService", 7, encode_wide_string(&configuration.dependencies.join("\0"), true));
     registry::close_handle(handle);
     Ok(())

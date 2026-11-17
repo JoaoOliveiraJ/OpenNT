@@ -9,8 +9,11 @@
 //! Dados puros da hive SYSTEM (veja `cm/seed.rs`): cada serviço com os
 //! valores que o banco de serviços grava numa instalação (Type, Start,
 //! ErrorControl, ImagePath em `\SystemRoot\System32\Drivers`, DisplayName =
-//! o nome, ObjectName = LocalSystem e DependOnService vazio). Os drivers de
-//! integração da suíte de testes, compilados em C, ficam fora.
+//! o nome e DependOnService vazio). Nenhuma leva ObjectName: num driver ele é
+//! o nome do DRIVER_OBJECT (o IopGetDriverNameFromKeyNode o usa no lugar de
+//! `\Driver\<serviço>` ou `\FileSystem\<serviço>`), e as chaves de driver da
+//! instalação não o têm. Os drivers de integração da suíte de testes,
+//! compilados em C, ficam fora.
 
 use alloc::format;
 use alloc::vec::Vec;
@@ -67,10 +70,11 @@ const KBDCLASS_DEVICE_BASE_NAME: &str = "KeyboardClass";
 /// Classes de dispositivo com os UpperFilters que o PnP anexa sobre o FDO.
 const DEVICE_CLASSES: &[(&str, &[&str])] = &[("{4D36E96B-E325-11CE-BFC1-08002BE10318}", &["kbdclass"]), ("{4D36E96F-E325-11CE-BFC1-08002BE10318}", &["mouclass"])];
 
-/// A chave de um serviço como o banco de serviços a instala.
+/// A chave de um serviço de driver como o banco de serviços a instala (sem
+/// ObjectName).
 pub fn service_key(name: &str, service_type: u32, start: u32, error_control: u32, image_path: &str, display_name: &str) -> SeedKey {
     let mut key = SeedKey::new(&format!("{SERVICES}\\{name}"));
-    key.dword("Type", service_type).dword("Start", start).dword("ErrorControl", error_control).text("ImagePath", REG_EXPAND_SZ, image_path).text("DisplayName", REG_SZ, display_name).text("ObjectName", REG_SZ, "LocalSystem").value("DependOnService", REG_MULTI_SZ, alloc::vec![0, 0, 0, 0]);
+    key.dword("Type", service_type).dword("Start", start).dword("ErrorControl", error_control).text("ImagePath", REG_EXPAND_SZ, image_path).text("DisplayName", REG_SZ, display_name).value("DependOnService", REG_MULTI_SZ, alloc::vec![0, 0, 0, 0]);
     key
 }
 
