@@ -97,10 +97,12 @@ impl UserObject for UserProcess {
     }
 }
 
-/// Um handle do Object Manager herdado pelo processo novo (o ObInitProcess
-/// copia as linhas OBJ_INHERIT da tabela do pai com os mesmos valores): na
-/// tabela de usuário do filho, sobre o mesmo corpo nativo (seção, evento,
-/// diretório...), retido e contado por handle.
+/// Um handle de usuário sobre um corpo nativo do Object Manager (seção,
+/// evento, diretório...), retido e contado por handle: o herdado pelo
+/// processo novo (o ObInitProcess copia as linhas OBJ_INHERIT da tabela do
+/// pai com os mesmos valores) e o da seção de imagem que o
+/// NtCreateUserProcess entrega a quem cria (o SectionHandle do
+/// PsCreateSuccess).
 pub struct InheritedObject {
     pointer: u64,
     type_name: alloc::string::String,

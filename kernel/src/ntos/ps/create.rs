@@ -7,8 +7,11 @@
 //! (`ps/user/process.rs`) e os dos autotestes. A ordem:
 //!
 //! 1. imagem: o arquivo (caminho NT de um arquivo do volume, um arquivo do
-//!    volume já aberto ou bytes do bundle) e o layout do cabeçalho; uma falha
-//!    aqui não cria nada;
+//!    volume já aberto ou bytes do bundle), a abertura de um arquivo do
+//!    volume (SYNCHRONIZE | FILE_EXECUTE mais o AdditionalFileAccess do
+//!    pedido, com FILE_SHARE_READ | FILE_SHARE_DELETE, contra as aberturas
+//!    existentes), o layout do cabeçalho e as características que o pedido
+//!    proíbe (PsCreateFailExeFormat); uma falha aqui não cria nada;
 //! 2. PspAllocateProcess: `process::create_process` dá o EPROCESS, o PID da
 //!    tabela de ids de cliente, a raiz própria, o `ProcessState` e a seção de
 //!    imagem; o estado guarda o caminho da imagem; com
@@ -17,7 +20,10 @@
 //! 3. anexado ao processo novo (MmInitializeProcessAddressSpace e
 //!    MmCreatePeb): as cópias de sistema (ntdll, apiset e NLS), o executável
 //!    na raiz dele, a pilha da primeira thread, a PEB (`mm/peb_teb.rs`), a
-//!    PEB_LDR_DATA do loader do kernel, os parâmetros
+//!    PEB_LDR_DATA do loader do kernel, o manifesto embutido do executável
+//!    quando o pedido manda procurá-lo (o PspLocateInPEManifest: RT_MANIFEST
+//!    1 pela pesquisa de recursos da Rtl; achado, o bloco de parâmetros leva
+//!    RTL_USER_PROC_APP_MANIFEST_PRESENT), os parâmetros
 //!    (`ps/process_parameters.rs`), a TEB e o CONTEXT inicial do
 //!    LdrInitializeThunk (RtlUserThreadStart(entry, PEB) na pilha nova);
 //! 4. PspAllocateThread: a KTHREAD com pilha de kernel própria e o TID
@@ -54,6 +60,7 @@ use alloc::vec::Vec;
 use crate::drivers::fs::volume_files::{self, VolumeFile};
 use crate::ntos::inc::field::NtStruct;
 use crate::ntos::inc::types::{Eprocess, Peb};
+use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::pe_loader::{self, LoadOptions};
 use crate::ntos::mm::peb_teb::{self, TebDescription};
 use crate::ntos::mm::sysload::kernel_image_source::{ImageSource, MemorySource};
@@ -63,6 +70,7 @@ use crate::ntos::ob::objects::section as section_objects;
 use crate::ntos::ps::notify::image::{self as image_notify, Image, NotifyOptions};
 use crate::ntos::ps::process::{self, Executable};
 use crate::ntos::ps::process_parameters::ProcessParameters;
+use crate::ntos::ps::user::file_io;
 use crate::ntos::ps::user::loader::{self, BytesSource, ImageRegion, Module};
 use crate::ntos::ps::user::memory::{self, Space};
 use crate::ntos::ps::user::process_state;
@@ -70,12 +78,32 @@ use crate::ntos::ps::user::state::{self, RegionKind};
 use crate::ntos::ps::user::threads::{self, UserThread};
 use crate::ntos::ps::{cid, process_context};
 use crate::ntos::rtl::image::pe_image_information::INFORMATION_SIZE;
+use crate::ntos::rtl::resource::find as resource_find;
 use crate::rtl::KernelError;
 
 const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
 const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
 const STATUS_INVALID_IMAGE_FORMAT: u32 = 0xC000_007B;
 const STATUS_FILE_IS_A_DIRECTORY: u32 = 0xC000_00BA;
+const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
+const STATUS_RESOURCE_DATA_NOT_FOUND: u32 = 0xC000_0089;
+const STATUS_RESOURCE_TYPE_NOT_FOUND: u32 = 0xC000_008A;
+const STATUS_RESOURCE_NAME_NOT_FOUND: u32 = 0xC000_008B;
+const STATUS_RESOURCE_LANG_NOT_FOUND: u32 = 0xC000_0204;
+/// SYNCHRONIZE | FILE_EXECUTE: o acesso mínimo da abertura do executável.
+const IMAGE_FILE_ACCESS: u32 = 0x10_0020;
+/// FILE_SHARE_READ | FILE_SHARE_DELETE.
+pub const IMAGE_FILE_SHARE: u32 = 5;
+/// FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE.
+pub const IMAGE_FILE_OPTIONS: u32 = 0x60;
+/// RT_MANIFEST e CREATEPROCESS_MANIFEST_RESOURCE_ID.
+const RT_MANIFEST: u64 = 24;
+const CREATEPROCESS_MANIFEST_RESOURCE_ID: u64 = 1;
+/// As flags do LdrResSearchResource do PspLocateInPEManifest: só o módulo
+/// principal (0x10) e o primeiro idioma achado (0x20).
+const MANIFEST_SEARCH_FLAGS: u64 = 0x30;
+/// RTL_USER_PROC_APP_MANIFEST_PRESENT, no Flags do bloco de parâmetros.
+pub const APP_MANIFEST_PRESENT: u32 = 0x2000;
 /// Um processo criado que é descartado sem rodar.
 const STATUS_CANCELLED: u32 = 0xC000_0120;
 /// THREAD_CREATE_FLAGS_CREATE_SUSPENDED e THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER.
@@ -123,6 +151,34 @@ pub struct CreateProcessRequest<'a> {
     /// o SessionId da sessão do processo (o SeSubProcessToken do
     /// PspInitializeProcessSecurity), em vez da cópia do token de quem cria.
     pub primary_token: Option<u64>,
+    /// O que o InitState do PS_CREATE_INFO pede sobre o arquivo e a imagem.
+    pub image_request: ImageRequest,
+}
+
+/// O InitState do PS_CREATE_INFO (o PspCaptureCreateInfo): o que quem cria
+/// pede sobre o arquivo e a imagem principal. O padrão é o de quem não pede
+/// nada.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ImageRequest {
+    /// AdditionalFileAccess: direitos somados ao SYNCHRONIZE | FILE_EXECUTE
+    /// da abertura do arquivo (o kernel32 passa FILE_READ_DATA |
+    /// FILE_READ_ATTRIBUTES).
+    pub additional_file_access: u32,
+    /// ProhibitedImageCharacteristics: bits de FileHeader.Characteristics que
+    /// recusam a imagem com PsCreateFailExeFormat (o kernel32 passa
+    /// IMAGE_FILE_DLL).
+    pub prohibited_characteristics: u16,
+    /// DetectManifest: procurar o manifesto embutido do executável (o
+    /// PspLocateInPEManifest).
+    pub detect_manifest: bool,
+}
+
+/// O manifesto embutido do executável (RT_MANIFEST 1): a VA no processo
+/// novo e o tamanho.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Manifest {
+    pub address: u64,
+    pub size: u32,
 }
 
 /// Por que a criação falhou (os estados de falha do PS_CREATE_INFO).
@@ -130,8 +186,9 @@ pub struct CreateProcessRequest<'a> {
 pub enum CreateFailure {
     /// O arquivo da imagem não abriu (PsCreateFailOnFileOpen).
     FileOpen(u32),
-    /// O arquivo não é um executável aceito (PsCreateFailExeFormat).
-    ExeFormat(KernelError),
+    /// O arquivo não é um executável aceito (PsCreateFailExeFormat), com o
+    /// DllCharacteristics da imagem (0 quando o cabeçalho não foi lido).
+    ExeFormat(KernelError, u16),
     /// O processo chegou a existir e já terminou com este status.
     Terminated(u32),
     /// O processo não chegou a existir.
@@ -143,7 +200,7 @@ impl CreateFailure {
     pub fn status(&self) -> u32 {
         match self {
             Self::FileOpen(status) | Self::Terminated(status) => *status,
-            Self::ExeFormat(_) => STATUS_INVALID_IMAGE_FORMAT,
+            Self::ExeFormat(..) => STATUS_INVALID_IMAGE_FORMAT,
             Self::Other(error) => failure_status(error),
         }
     }
@@ -153,7 +210,7 @@ impl core::fmt::Display for CreateFailure {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::FileOpen(status) => write!(formatter, "imagem nao abriu ({status:#x})"),
-            Self::ExeFormat(error) => write!(formatter, "imagem invalida: {error}"),
+            Self::ExeFormat(error, _) => write!(formatter, "imagem invalida: {error}"),
             Self::Terminated(status) => write!(formatter, "processo terminou na criacao ({status:#x})"),
             Self::Other(error) => write!(formatter, "{error}"),
         }
@@ -184,6 +241,14 @@ pub struct CreatedProcess {
     /// O SECTION_IMAGE_INFORMATION da imagem principal, na base real (o
     /// PS_ATTRIBUTE_IMAGE_INFO do NtCreateUserProcess).
     pub image_information: [u8; INFORMATION_SIZE],
+    /// O manifesto embutido achado com DetectManifest.
+    pub manifest: Option<Manifest>,
+    /// O Flags do bloco de parâmetros entregue (o CurrentParameterFlags do
+    /// PsCreateSuccess).
+    pub parameter_flags: u32,
+    /// O arquivo do executável, quando veio do volume, com o acesso da
+    /// abertura da criação (o FileHandle do PsCreateSuccess).
+    pub image_file: Option<ImageFile>,
     /// O CONTEXT inicial que o LdrInitializeThunk recebe: o
     /// RtlUserThreadStart(entry, PEB) da primeira thread, numa região do
     /// processo.
@@ -311,13 +376,43 @@ impl ImageSource for VolumeImage {
     }
 }
 
-/// A imagem principal: a fonte do carregador de PE e a da seção de imagem
-/// do processo (e das notificações).
-fn open_image(image: &ImageOrigin, image_name: &str) -> Result<(Arc<dyn ImageSource>, Arc<dyn FileSource>), CreateFailure> {
+/// O arquivo do executável aberto pela criação: o volume e o acesso
+/// concedido.
+#[derive(Clone)]
+pub struct ImageFile {
+    pub file: Arc<VolumeFile>,
+    pub access: u32,
+}
+
+/// O acesso da abertura do executável (o IoCreateFileEx do
+/// NtCreateUserProcess, com FILE_SHARE_READ | FILE_SHARE_DELETE):
+/// SYNCHRONIZE | FILE_EXECUTE | AdditionalFileAccess; recusada com o acesso
+/// adicional, de novo só com SYNCHRONIZE | FILE_EXECUTE. A recusa final é
+/// PsCreateFailOnFileOpen com o status dela.
+fn image_file_access(file: &VolumeFile, additional: u32) -> Result<u32, CreateFailure> {
+    let sharing = |access: u32| file_io::sharing_status(file, access, IMAGE_FILE_SHARE).map_err(CreateFailure::Other);
+    let requested = IMAGE_FILE_ACCESS | additional;
+    let status = sharing(requested)?;
+    if status == 0 {
+        return Ok(requested);
+    }
+    if additional == 0 {
+        return Err(CreateFailure::FileOpen(status));
+    }
+    match sharing(IMAGE_FILE_ACCESS)? {
+        0 => Ok(IMAGE_FILE_ACCESS),
+        status => Err(CreateFailure::FileOpen(status)),
+    }
+}
+
+/// A imagem principal: a fonte do carregador de PE, a da seção de imagem do
+/// processo (e das notificações) e, para um arquivo do volume, a abertura
+/// dele com `additional_access` somado ao mínimo.
+fn open_image(image: &ImageOrigin, image_name: &str, additional_access: u32) -> Result<(Arc<dyn ImageSource>, Arc<dyn FileSource>, Option<ImageFile>), CreateFailure> {
     let file = match image {
         ImageOrigin::Bytes(bytes) => {
             let source: Arc<dyn FileSource> = Arc::new(BytesSource { name: format!("\\BootBundle\\apps\\{image_name}"), bytes: Arc::new(bytes.clone()) });
-            return Ok((Arc::new(MemorySource { name: String::new(), bytes: bytes.clone() }), source));
+            return Ok((Arc::new(MemorySource { name: String::new(), bytes: bytes.clone() }), source, None));
         }
         ImageOrigin::Volume(file) => file.clone(),
         ImageOrigin::NtPath(path) => {
@@ -328,8 +423,36 @@ fn open_image(image: &ImageOrigin, image_name: &str) -> Result<(Arc<dyn ImageSou
             file
         }
     };
+    let access = image_file_access(&file, additional_access)?;
     let name = crate::drivers::fs::ntfs::nt_path(&file.volume_path());
-    Ok((Arc::new(VolumeImage { name: name.clone(), file: file.clone() }), Arc::new(VolumeSource { name, file })))
+    Ok((Arc::new(VolumeImage { name: name.clone(), file: file.clone() }), Arc::new(VolumeSource { name, file: file.clone() }), Some(ImageFile { file, access })))
+}
+
+/// O PspLocateInPEManifest: o LdrResSearchResource(SectionBaseAddress,
+/// {RT_MANIFEST, CREATEPROCESS_MANIFEST_RESOURCE_ID, 0}, 3, Flags 0x30: só o
+/// módulo principal, o primeiro idioma) na imagem principal, mapeada no
+/// processo corrente (o novo, anexado). Diretório, tipo, nome ou idioma
+/// ausentes são "sem manifesto"; um tamanho acima de 32 bits é
+/// STATUS_INVALID_IMAGE_FORMAT; outra falha da pesquisa é o status da
+/// criação.
+fn locate_manifest(image_base: u64) -> Result<Option<Manifest>, KernelError> {
+    // O IdPath de três chaves, a VA e o SIZE_T de saída.
+    let scratch = guest::alloc_bytes(0x28);
+    if scratch == 0 {
+        return Err(KernelError::with_status("PspLocateInPEManifest sem memoria", STATUS_INSUFFICIENT_RESOURCES));
+    }
+    guest::write64(scratch, RT_MANIFEST);
+    guest::write64(scratch + 8, CREATEPROCESS_MANIFEST_RESOURCE_ID);
+    guest::write64(scratch + 0x10, 0);
+    let status = resource_find::search(image_base, scratch, 3, MANIFEST_SEARCH_FLAGS, scratch + 0x18, scratch + 0x20, 0, 0);
+    let (address, size) = (guest::read64(scratch + 0x18), guest::read64(scratch + 0x20));
+    guest::free_bytes(scratch);
+    match status? {
+        0 if size > u32::MAX as u64 => Err(KernelError::with_status("manifesto embutido maior que 4 GB", STATUS_INVALID_IMAGE_FORMAT)),
+        0 => Ok(Some(Manifest { address, size: size as u32 })),
+        STATUS_RESOURCE_DATA_NOT_FOUND | STATUS_RESOURCE_TYPE_NOT_FOUND | STATUS_RESOURCE_NAME_NOT_FOUND | STATUS_RESOURCE_LANG_NOT_FOUND => Ok(None),
+        status => Err(KernelError::with_status(format!("manifesto embutido: pesquisa falhou com {status:#x}"), status)),
+    }
 }
 
 /// A imagem no VAD do processo corrente (o processo em montagem, anexado).
@@ -381,6 +504,8 @@ struct Built {
     image_base: u64,
     size_of_image: u64,
     image_information: [u8; INFORMATION_SIZE],
+    manifest: Option<Manifest>,
+    parameter_flags: u32,
 }
 
 /// A ntdll de sistema (o PspSystemDll), o apiset e o NLS prontos, e as
@@ -407,10 +532,19 @@ fn system_dll() -> Result<(Arc<Module>, u64, u64), KernelError> {
 /// inicial; o loader nativo carrega as dependências pelas syscalls de
 /// arquivo e seção quando ele rodar.
 pub fn create_user_process(request: &CreateProcessRequest<'_>) -> Result<CreatedProcess, CreateFailure> {
-    let (image_source, source) = open_image(&request.image, request.image_name)?;
+    let image_request = request.image_request;
+    let (image_source, source, image_file) = open_image(&request.image, request.image_name, image_request.additional_file_access)?;
     // O processo (e o espaço dele) nasce antes de a imagem ser mapeada nele:
     // o cabeçalho dá a base preferida e o tamanho.
-    let (preferred_base, size_of_image) = pe_loader::image_layout(image_source.as_ref()).map_err(CreateFailure::ExeFormat)?;
+    let layout = pe_loader::image_layout(image_source.as_ref()).map_err(|error| CreateFailure::ExeFormat(error, 0))?;
+    // O PspAllocateProcess recusa, antes de o processo existir, a imagem com
+    // uma característica que o pedido proíbe (o kernel32 proíbe
+    // IMAGE_FILE_DLL).
+    let prohibited = layout.characteristics & image_request.prohibited_characteristics;
+    if prohibited != 0 {
+        return Err(CreateFailure::ExeFormat(KernelError::with_status(format!("caracteristicas {prohibited:#x} proibidas pelo pedido"), STATUS_INVALID_IMAGE_FORMAT), layout.dll_characteristics));
+    }
+    let (preferred_base, size_of_image) = (layout.preferred_base, layout.size_of_image);
     let (ntdll, start, initialize) = system_dll().map_err(CreateFailure::Other)?;
     let parameters = &request.parameters;
     let executable = Executable { source: source.clone(), image_size: size_of_image, image_information: None, command_line: Some(parameters.command_line.clone()) };
@@ -483,13 +617,18 @@ pub fn create_user_process(request: &CreateProcessRequest<'_>) -> Result<Created
             let stack_top = stack_base - 8;
             let peb = peb_teb::create_peb(process_pointer, image_base)?;
             loader::create_kernel_ldr()?;
-            let block = parameters.write()?;
+            // O PspLocateInPEManifest do PspSetupUserProcessAddressSpace,
+            // antes da cópia dos parâmetros: o manifesto achado liga
+            // RTL_USER_PROC_APP_MANIFEST_PRESENT no bloco.
+            let manifest = if image_request.detect_manifest { locate_manifest(image_base)? } else { None };
+            let parameter_flags = if manifest.is_some() { APP_MANIFEST_PRESENT } else { 0 };
+            let block = parameters.write(parameter_flags)?;
             // SAFETY: a PEB recém-criada no processo corrente.
             unsafe { Peb::at(peb) }.process_parameters.set(block);
             let teb = peb_teb::create_teb(&TebDescription { process_id, thread_id, peb, stack_base, stack_limit })?;
             let context = memory::map_user_region(threads::CONTEXT_SIZE)?;
             threads::initialize_context(context, start, stack_top, entry_point, peb);
-            Ok(Built { thread_id, peb, parameters: block, teb, stack_top, context, entry_point, image_base, size_of_image, image_information })
+            Ok(Built { thread_id, peb, parameters: block, teb, stack_top, context, entry_point, image_base, size_of_image, image_information, manifest, parameter_flags })
         })
         .and_then(|built| built)
         .inspect_err(|_| cid::release(thread_id, 0))
@@ -540,6 +679,9 @@ pub fn create_user_process(request: &CreateProcessRequest<'_>) -> Result<Created
         entry_point: built.entry_point,
         size_of_image: built.size_of_image,
         image_information: built.image_information,
+        manifest: built.manifest,
+        parameter_flags: built.parameter_flags,
+        image_file,
         context: built.context,
         initialize,
         ntdll_base: ntdll.image_base,

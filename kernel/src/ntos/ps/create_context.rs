@@ -5,12 +5,21 @@
 //! sondado e capturado da memória de usuário dele antes de agir (a criação
 //! anexa ao processo novo e deixa de enxergar o chamador):
 //!
-//! - o PS_CREATE_INFO (`PsCreateInfo`, entrada e saída): Size 0x58 na
-//!   entrada (InitFlags e AdditionalFileAccess não mudam nada aqui); na
-//!   saída, PsCreateSuccess com a PEB e o bloco de parâmetros no processo
-//!   novo, ou o estado da falha: PsCreateFailOnFileOpen (o status do open),
-//!   PsCreateFailExeFormat (imagem que não é um PE aceito); outras falhas
-//!   deixam o estado como veio;
+//! - o PS_CREATE_INFO (`PsCreateInfo`, entrada e saída), como o
+//!   PspCaptureCreateInfo: Size 0x58 e PsCreateInitialState na entrada
+//!   (senão STATUS_INVALID_PARAMETER); o InitState vira o `ImageRequest` do
+//!   pedido (AdditionalFileAccess na abertura do executável,
+//!   ProhibitedImageCharacteristics, DetectManifest) e WriteOutputOnExit
+//!   decide a saída. Na saída, o PspUpdateCreateInfo: o estado
+//!   (PsCreateSuccess; PsCreateFailOnFileOpen, o status do open;
+//!   PsCreateFailExeFormat, imagem que não é um PE aceito ou com uma
+//!   característica proibida; outras falhas deixam o estado como veio) e,
+//!   só com WriteOutputOnExit, os campos dele: no PsCreateSuccess o
+//!   OutputFlags (ProtectedProcess e ProtectedProcessLight do
+//!   EPROCESS.Protection, AddressSpaceOverride do EPROCESS.Flags,
+//!   ManifestDetected), o manifesto embutido (VA no processo novo e
+//!   tamanho), FileHandle e SectionHandle, o bloco de parâmetros, o Flags
+//!   dele e a PEB; no PsCreateFailExeFormat, o DllCharacteristics;
 //! - a PS_ATTRIBUTE_LIST (`PsAttributeList`): honra ImageName (o caminho NT
 //!   da imagem, obrigatório), ParentProcess (handle com
 //!   PROCESS_CREATE_PROCESS; o pai declarado vai para as notificações e para
@@ -66,10 +75,14 @@
 //! QUEM CHAMOU com o acesso pedido (os direitos genéricos mapeados e
 //! MAXIMUM_ALLOWED como o acesso total do tipo, o que o criador recebe), e as
 //! saídas (handles, CLIENT_ID, TEB, SECTION_IMAGE_INFORMATION e o
-//! PS_CREATE_INFO) vão para as VAs já sondadas. Uma falha antes da criação
-//! não cria nada; uma falha ao abrir os handles termina o processo novo.
-//! FileHandle e SectionHandle do PsCreateSuccess ficam NULL (o chamador só
-//! os fecha quando vêm preenchidos).
+//! PS_CREATE_INFO) vão para as VAs já sondadas. Com WriteOutputOnExit, o
+//! arquivo do executável (com o acesso da abertura da criação,
+//! SYNCHRONIZE | FILE_EXECUTE | AdditionalFileAccess) e a seção de imagem
+//! do processo (SECTION_ALL_ACCESS) também entram na tabela de quem chamou,
+//! o PspPropagateHandle; o kernel32 os usa na mensagem de SxS ao csrss e os
+//! fecha. Sem WriteOutputOnExit (o RtlCreateUserProcess da ntdll), nenhum
+//! dos dois é aberto. Uma falha antes da criação não cria nada; uma falha ao
+//! abrir os handles termina o processo novo.
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -79,10 +92,11 @@ use crate::ntos::inc::field::NtStruct;
 use crate::ntos::inc::types::{ClientId, Eprocess, ObjectAttributes, PsAttribute, PsAttributeList, PsCreateInfo, SectionImageInformation};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::ob::{object_access, object_types};
-use crate::ntos::ps::create::{self, CreateFailure, CreateProcessRequest, ImageOrigin};
+use crate::ntos::ps::create::{self, CreateFailure, CreateProcessRequest, ImageFile, ImageOrigin, ImageRequest, Manifest};
 use crate::ntos::ps::process;
 use crate::ntos::ps::process_parameters::{self, ProcessParameters};
-use crate::ntos::ps::user::handles::{self, UserProcess};
+use crate::ntos::ps::user::file_io;
+use crate::ntos::ps::user::handles::{self, InheritedObject, UserProcess};
 use crate::ntos::ps::user::process as user_process;
 use crate::ntos::ps::user::{state, threads};
 use crate::ntos::se::model::SecurityPolicy;
@@ -146,6 +160,20 @@ const THREAD_FLAGS_KNOWN: u32 = 0x77;
 const MAXIMUM_ATTRIBUTES: u64 = 64;
 /// O maior PROCESS_PRIORITY_CLASS_* (ABOVE_NORMAL).
 const MAXIMUM_PRIORITY_CLASS: u64 = 6;
+/// InitState.InitFlags: WriteOutputOnExit e DetectManifest; o
+/// ProhibitedImageCharacteristics nos 16 bits altos.
+const INIT_WRITE_OUTPUT_ON_EXIT: u32 = 0x1;
+const INIT_DETECT_MANIFEST: u32 = 0x2;
+/// SuccessState.OutputFlags: ProtectedProcess, AddressSpaceOverride,
+/// ManifestDetected e ProtectedProcessLight.
+const OUTPUT_PROTECTED_PROCESS: u32 = 0x1;
+const OUTPUT_ADDRESS_SPACE_OVERRIDE: u32 = 0x2;
+const OUTPUT_MANIFEST_DETECTED: u32 = 0x8;
+const OUTPUT_PROTECTED_PROCESS_LIGHT: u32 = 0x10;
+/// PsProtectedTypeProtectedLight, no Type (bits 0..=2) do PS_PROTECTION.
+const PROTECTION_TYPE_LIGHT: u8 = 1;
+/// SECTION_ALL_ACCESS: o acesso do handle da seção de imagem da criação.
+const SECTION_ALL_ACCESS: u32 = 0xF_001F;
 
 /// `PsAttributeValue(número, thread, entrada, aditivo)`: o número nos 16
 /// bits baixos e as três marcas acima.
@@ -241,19 +269,37 @@ fn status_of(error: &KernelError) -> u32 {
     if error.status != 0 { error.status } else { STATUS_ACCESS_VIOLATION }
 }
 
-/// O PS_CREATE_INFO de entrada: gravável inteiro e com o Size do tipo.
-fn capture_create_info(address: u64) -> Result<(), u32> {
+/// O PS_CREATE_INFO de entrada, capturado.
+#[derive(Clone, Copy, Debug, Default)]
+struct CreateInfoInput {
+    /// WriteOutputOnExit: sem ele, a saída é só o estado.
+    write_output_on_exit: bool,
+    /// O resto do InitState: o pedido sobre o arquivo e a imagem.
+    image: ImageRequest,
+}
+
+/// O PS_CREATE_INFO de entrada (o PspCaptureCreateInfo): gravável inteiro,
+/// com PsCreateInitialState e o Size do tipo; o InitState decodificado.
+fn capture_create_info(address: u64) -> Result<CreateInfoInput, u32> {
     if address == 0 {
         return Err(STATUS_INVALID_PARAMETER);
     }
     if !state::probe_user_write(address, PsCreateInfo::SIZE) {
         return Err(STATUS_ACCESS_VIOLATION);
     }
-    let info = state::user_struct::<PsCreateInfo>(address).map_err(|error| status_of(&error))?;
-    if info.size.probe_get().map_err(|error| status_of(&error))? != PsCreateInfo::SIZE {
+    let read = || -> Result<(u32, u64, u32, u32), KernelError> {
+        let info = state::user_struct::<PsCreateInfo>(address)?;
+        let initial = info.init_state();
+        Ok((info.state.probe_get()?, info.size.probe_get()?, initial.init_flags.probe_get()?, initial.additional_file_access.probe_get()?))
+    };
+    let (create_state, size, init_flags, additional_file_access) = read().map_err(|error| status_of(&error))?;
+    if create_state != PsCreateInfo::INITIAL_STATE || size != PsCreateInfo::SIZE {
         return Err(STATUS_INVALID_PARAMETER);
     }
-    Ok(())
+    Ok(CreateInfoInput {
+        write_output_on_exit: init_flags & INIT_WRITE_OUTPUT_ON_EXIT != 0,
+        image: ImageRequest { additional_file_access, prohibited_characteristics: (init_flags >> 16) as u16, detect_manifest: init_flags & INIT_DETECT_MANIFEST != 0 },
+    })
 }
 
 /// Os OBJECT_ATTRIBUTES de processo ou de thread (opcionais): sem nome; o
@@ -471,15 +517,19 @@ fn creator_access(requested: u32, object_type: &object_types::ObjectType) -> Res
     object_access::check(&SecurityPolicy::default(), None, requested, object_type, true)
 }
 
-/// O estado de falha no PS_CREATE_INFO (já sondado): PsCreateFailOnFileOpen
-/// e PsCreateFailExeFormat; as outras falhas deixam o estado como veio.
-fn write_failure(address: u64, failure: &CreateFailure) -> Result<(), KernelError> {
+/// O estado de falha no PS_CREATE_INFO (já sondado), o PspUpdateCreateInfo:
+/// PsCreateFailOnFileOpen e PsCreateFailExeFormat (com o DllCharacteristics
+/// da imagem só com WriteOutputOnExit); as outras falhas deixam o estado como
+/// veio.
+fn write_failure(address: u64, failure: &CreateFailure, input: &CreateInfoInput) -> Result<(), KernelError> {
     let info = state::user_struct::<PsCreateInfo>(address)?;
     match failure {
         CreateFailure::FileOpen(_) => info.state.probe_set(PsCreateInfo::FAIL_ON_FILE_OPEN),
-        CreateFailure::ExeFormat(_) => {
-            info.state.probe_set(PsCreateInfo::FAIL_EXE_FORMAT)?;
-            info.exe_format().dll_characteristics.probe_set(0)
+        CreateFailure::ExeFormat(_, dll_characteristics) => {
+            if input.write_output_on_exit {
+                info.exe_format().dll_characteristics.probe_set(*dll_characteristics)?;
+            }
+            info.state.probe_set(PsCreateInfo::FAIL_EXE_FORMAT)
         }
         CreateFailure::Terminated(_) | CreateFailure::Other(_) => Ok(()),
     }
@@ -494,11 +544,57 @@ struct Created {
     peb: u64,
     parameters: u64,
     image_information: Vec<u8>,
+    manifest: Option<Manifest>,
+    parameter_flags: u32,
+    image_file: Option<ImageFile>,
+}
+
+/// O OutputFlags do PsCreateSuccess (o PspUpdateCreateInfo):
+/// ProtectedProcess com qualquer tipo de PS_PROTECTION,
+/// ProtectedProcessLight com PsProtectedTypeProtectedLight,
+/// AddressSpaceOverride do EPROCESS.Flags e ManifestDetected.
+/// DevOverrideEnabled (o PspGlobalFlags) fica desligado.
+fn output_flags(created: &Created) -> u32 {
+    // SAFETY: o EPROCESS recém-criado, retido pelo processo criado.
+    let process = unsafe { Eprocess::at(created.process_pointer) };
+    let protection_type = process.protection.level.get() & 7;
+    let mut flags = 0;
+    if protection_type != 0 {
+        flags |= OUTPUT_PROTECTED_PROCESS;
+    }
+    if protection_type == PROTECTION_TYPE_LIGHT {
+        flags |= OUTPUT_PROTECTED_PROCESS_LIGHT;
+    }
+    if process.flags.get() & Eprocess::OVERRIDE_ADDRESS_SPACE_MASK != 0 {
+        flags |= OUTPUT_ADDRESS_SPACE_OVERRIDE;
+    }
+    if created.manifest.is_some() {
+        flags |= OUTPUT_MANIFEST_DETECTED;
+    }
+    flags
+}
+
+/// O PspPropagateHandle do PsCreateSuccess: o arquivo do executável, com o
+/// acesso da abertura da criação, e a seção de imagem do processo, com
+/// SECTION_ALL_ACCESS, na tabela de quem chamou (o processo corrente).
+/// Devolve (FileHandle, SectionHandle); uma falha fecha o que já abriu.
+fn propagate_image_handles(image_name: &str, created: &Created) -> Result<(u64, u64), KernelError> {
+    let Some(image) = &created.image_file else { return Ok((0, 0)) };
+    let file = file_io::open_resolved(&image.file, image_name, image.access, create::IMAGE_FILE_SHARE, create::IMAGE_FILE_OPTIONS, 0)? as u64;
+    let section = process::image_section(created.process_pointer).and_then(InheritedObject::new).ok_or_else(|| KernelError::with_status("processo novo sem secao de imagem", STATUS_INVALID_PARAMETER));
+    match section.and_then(|section| state::alloc_user_handle(Arc::new(section), SECTION_ALL_ACCESS, 0)) {
+        Ok(section) => Ok((file, section as u64)),
+        Err(error) => {
+            let _ = state::close_user_handle(file, true, true);
+            Err(error)
+        }
+    }
 }
 
 /// As saídas, nas VAs sondadas na captura: os handles, os atributos de saída
-/// e o PsCreateSuccess.
-fn write_outputs(request: &UserCreateRequest, attributes: &Attributes, created: &Created, handles: (u64, u64)) -> Result<(), KernelError> {
+/// e o PsCreateSuccess (os campos dele só com WriteOutputOnExit, na ordem
+/// do PspUpdateCreateInfo; o estado sempre).
+fn write_outputs(request: &UserCreateRequest, attributes: &Attributes, input: &CreateInfoInput, created: &Created, handles: (u64, u64), image_handles: (u64, u64)) -> Result<(), KernelError> {
     guest::try_write::<u64>(request.process_handle, handles.0)?;
     guest::try_write::<u64>(request.thread_handle, handles.1)?;
     let returned = |output: &Output, size: u64| if output.return_length != 0 { guest::try_write::<u64>(output.return_length, size) } else { Ok(()) };
@@ -516,14 +612,25 @@ fn write_outputs(request: &UserCreateRequest, attributes: &Attributes, created: 
         guest::try_write_bytes(output.value, &created.image_information)?;
         returned(output, SectionImageInformation::SIZE)?;
     }
-    // A união inteira volta zerada antes do estado de sucesso.
     let info = state::user_struct::<PsCreateInfo>(request.create_info)?;
-    guest::try_write_bytes(info.address() + 0x10, &[0u8; (PsCreateInfo::SIZE - 0x10) as usize])?;
-    let success = info.success_state();
-    success.user_process_parameters_native.probe_set(created.parameters)?;
-    // O bloco entregue é auto-relativo (Flags 0): a ntdll o normaliza.
-    success.current_parameter_flags.probe_set(0)?;
-    success.peb_address_native.probe_set(created.peb)?;
+    if input.write_output_on_exit {
+        let success = info.success_state();
+        // O OutputFlags inteiro, por cima do InitFlags que veio.
+        let flags = output_flags(created);
+        success.output_flags.probe_set(flags)?;
+        if let Some(manifest) = created.manifest {
+            success.manifest_address.probe_set(manifest.address)?;
+            success.manifest_size.probe_set(manifest.size)?;
+        }
+        success.file_handle.probe_set(image_handles.0)?;
+        success.section_handle.probe_set(image_handles.1)?;
+        success.user_process_parameters_native.probe_set(created.parameters)?;
+        success.user_process_parameters_wow64.probe_set(0)?;
+        // O Flags do bloco entregue (auto-relativo: a ntdll o normaliza).
+        success.current_parameter_flags.probe_set(created.parameter_flags)?;
+        success.peb_address_native.probe_set(created.peb)?;
+        success.peb_address_wow64.probe_set(0)?;
+    }
     info.state.probe_set(PsCreateInfo::SUCCESS)
 }
 
@@ -561,7 +668,7 @@ fn capture_and_create(request: &UserCreateRequest) -> Result<u32, u32> {
     if !state::probe_user_write(request.process_handle, 8) || !state::probe_user_write(request.thread_handle, 8) {
         return Err(STATUS_ACCESS_VIOLATION);
     }
-    capture_create_info(request.create_info)?;
+    let create_info = capture_create_info(request.create_info)?;
     if request.process_flags & !PROCESS_FLAGS_KNOWN != 0 || request.thread_flags & !THREAD_FLAGS_KNOWN != 0 {
         return Err(STATUS_INVALID_PARAMETER);
     }
@@ -644,12 +751,24 @@ fn capture_and_create(request: &UserCreateRequest) -> Result<u32, u32> {
 
     // A criação: daqui em diante só a memória do kernel e o processo novo.
     let short_name = String::from(dos_path.rsplit('\\').next().unwrap_or(&dos_path));
-    let create_request = CreateProcessRequest { image: ImageOrigin::NtPath(image_name), image_name: &short_name, parameters, parent: attributes.parent, thread_flags: request.thread_flags, on_created: Some(&assign_jobs), inherit_handles_from, protection, create_session: request.process_flags & PROCESS_CREATE_SESSION != 0, primary_token };
+    let create_request = CreateProcessRequest {
+        image: ImageOrigin::NtPath(image_name.clone()),
+        image_name: &short_name,
+        parameters,
+        parent: attributes.parent,
+        thread_flags: request.thread_flags,
+        on_created: Some(&assign_jobs),
+        inherit_handles_from,
+        protection,
+        create_session: request.process_flags & PROCESS_CREATE_SESSION != 0,
+        primary_token,
+        image_request: create_info.image,
+    };
     let created = match create::create_user_process(&create_request) {
         Ok(created) => created,
         Err(failure) => {
             crate::debug_print!("[ps] NtCreateUserProcess de {}: {}", short_name, failure);
-            write_failure(request.create_info, &failure).map_err(|error| status_of(&error))?;
+            write_failure(request.create_info, &failure, &create_info).map_err(|error| status_of(&error))?;
             return Err(failure.status());
         }
     };
@@ -672,6 +791,9 @@ fn capture_and_create(request: &UserCreateRequest) -> Result<u32, u32> {
         peb: created.peb,
         parameters: created.parameters,
         image_information: created.image_information.to_vec(),
+        manifest: created.manifest,
+        parameter_flags: created.parameter_flags,
+        image_file: created.image_file.clone(),
     };
     let main = created.thread.clone();
     // O processo entra no despachante; a thread suspensa espera o
@@ -696,10 +818,38 @@ fn capture_and_create(request: &UserCreateRequest) -> Result<u32, u32> {
             return Err(status);
         }
     };
-    crate::debug_print!("[ps] NtCreateUserProcess: {} pid={:#x} tid={:#x} handles {:#x}/{:#x}{}", short_name, summary.process_id, summary.thread_id, process_handle, thread_handle, if request.thread_flags & create::THREAD_CREATE_SUSPENDED != 0 { " (suspensa)" } else { "" });
+    // O PspUpdateCreateInfo com WriteOutputOnExit: o arquivo e a seção da
+    // imagem na tabela de quem chamou; uma falha fecha os handles e termina
+    // o processo novo, como a dos handles do processo e da thread.
+    let image_handles = if create_info.write_output_on_exit {
+        match propagate_image_handles(&image_name, &summary) {
+            Ok(handles) => handles,
+            Err(error) => {
+                let status = create::failure_status(&error);
+                let _ = state::close_user_handle(thread_handle, true, true);
+                let _ = state::close_user_handle(process_handle, true, true);
+                create::exit_process(process, status);
+                return Err(status);
+            }
+        }
+    } else {
+        (0, 0)
+    };
+    crate::debug_print!(
+        "[ps] NtCreateUserProcess: {} pid={:#x} tid={:#x} handles {:#x}/{:#x} arquivo/secao {:#x}/{:#x}{}{}",
+        short_name,
+        summary.process_id,
+        summary.thread_id,
+        process_handle,
+        thread_handle,
+        image_handles.0,
+        image_handles.1,
+        summary.manifest.map(|manifest| alloc::format!(" manifesto {:#x}+{:#x}", manifest.address, manifest.size)).unwrap_or_default(),
+        if request.thread_flags & create::THREAD_CREATE_SUSPENDED != 0 { " (suspensa)" } else { "" }
+    );
     crate::ntos::init::initial_process::record_creation(process::get_current_process(), process);
     // As VAs foram sondadas; uma falha tardia devolve o status com o
     // processo e os handles já criados, como no NT.
-    write_outputs(request, &attributes, &summary, (process_handle, thread_handle)).map_err(|error| status_of(&error))?;
+    write_outputs(request, &attributes, &create_info, &summary, (process_handle, thread_handle), image_handles).map_err(|error| status_of(&error))?;
     Ok(STATUS_SUCCESS)
 }

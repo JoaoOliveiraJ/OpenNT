@@ -1965,7 +1965,7 @@ fn user_system_services(assert: Assert) {
         let ldr = loader::create_kernel_ldr();
         let mut request = ProcessParameters::for_image("C:\\teste.exe");
         request.standard_output = 0x44;
-        let rupp = request.write();
+        let rupp = request.write(0);
         let teb = peb.as_ref().ok().and_then(|&peb| peb_teb::create_teb(&peb_teb::TebDescription { process_id: test.process_id, thread_id: test.thread_id, peb, stack_base: 0x30_0000, stack_limit: 0x20_0000 }).ok());
         if let (Ok(peb), Ok(ldr), Ok(rupp), Some(teb)) = (peb, ldr, rupp, teb) {
             let (teb_view, peb_view, ldr_data, parameters) = unsafe { (nt::Teb::at(teb), nt::Peb::at(peb), nt::PebLdrData::at(ldr), nt::RtlUserProcessParameters::at(rupp)) };

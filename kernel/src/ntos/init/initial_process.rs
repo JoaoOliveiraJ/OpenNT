@@ -94,7 +94,7 @@ fn parameters() -> ProcessParameters {
 
 /// Cria o smss.exe e o põe no despachante; o kernel segue sem esperá-lo.
 pub fn start() -> Result<(), KernelError> {
-    let request = CreateProcessRequest { image: ImageOrigin::NtPath(String::from(INITIAL_PROCESS_PATH)), image_name: "smss.exe", parameters: parameters(), parent: None, thread_flags: 0, on_created: None, inherit_handles_from: None, protection: WINTCB_LIGHT, create_session: false, primary_token: None };
+    let request = CreateProcessRequest { image: ImageOrigin::NtPath(String::from(INITIAL_PROCESS_PATH)), image_name: "smss.exe", parameters: parameters(), parent: None, thread_flags: 0, on_created: None, inherit_handles_from: None, protection: WINTCB_LIGHT, create_session: false, primary_token: None, image_request: Default::default() };
     let created = create::create_user_process(&request).map_err(|failure| KernelError::with_status(alloc::format!("{INITIAL_PROCESS_PATH}: {failure}"), failure.status()))?;
     // ProcessBreakOnTermination, antes de a thread andar.
     // SAFETY: o EPROCESS recém-criado, retido pela criação.

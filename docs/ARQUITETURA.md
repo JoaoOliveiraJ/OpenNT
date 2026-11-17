@@ -2911,8 +2911,14 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   criado, `run_created` = `start_created` + `wait_started`) e os
   autotestes. O pedido traz a imagem (caminho
   NT de um arquivo do volume, arquivo do volume ou bytes), o nome curto e
-  os parâmetros, e opcionalmente o pai de quem herdar os handles. A ordem:
-  abrir a imagem e ler o layout (uma falha não cria
+  os parâmetros, opcionalmente o pai de quem herdar os handles, e o
+  `ImageRequest` (o InitState do PS_CREATE_INFO). A ordem:
+  abrir a imagem (um arquivo do volume é aberto como o IoCreateFileEx do
+  NtCreateUserProcess: SYNCHRONIZE | FILE_EXECUTE mais o
+  AdditionalFileAccess, FILE_SHARE_READ | FILE_SHARE_DELETE, conferido
+  contra as aberturas existentes e, recusado, de novo sem o acesso
+  adicional) e ler o layout, recusando as características que o pedido
+  proíbe (uma falha não cria
   nada: `CreateFailure::FileOpen`/`ExeFormat`); `create_process` (EPROCESS,
   PID, raiz própria, `ProcessState`, seção de imagem); a herança de handles
   do pai, se pedida; anexado ao processo
@@ -2923,7 +2929,11 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   `CriticalSectionTimeout` do Session Manager vezes -10.000.000, 30 dias
   por padrão; com mais de uma hora a ntdll espera sem prazo numa seção
   crítica), a PEB_LDR_DATA
-  do loader do kernel (`loader::create_kernel_ldr`), os parâmetros
+  do loader do kernel (`loader::create_kernel_ldr`), o manifesto embutido
+  com DetectManifest (o PspLocateInPEManifest: o RT_MANIFEST 1, primeiro
+  idioma, pela pesquisa de recursos da Rtl em SectionBaseAddress; achado,
+  a VA no processo novo e o tamanho voltam no `CreatedProcess` e o bloco de
+  parâmetros leva RTL_USER_PROC_APP_MANIFEST_PRESENT), os parâmetros
   (`ps/process_parameters.rs`, o RtlCreateProcessParametersEx: bloco
   auto-relativo com ImagePathName, CommandLine, diretório corrente, DLLs,
   título, desktop, shell, runtime, ambiente com EnvironmentSize, console e
@@ -2943,7 +2953,9 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   corpo fica em `ps/create_context.rs` (o papel do
   PspBuildCreateProcessContext). Tudo é sondado e capturado da memória do
   chamador antes de agir: o PS_CREATE_INFO (`inc/types/wdk.rs::PsCreateInfo`,
-  0x58 bytes do 19041, com as vistas por estado), a PS_ATTRIBUTE_LIST copiada
+  0x58 bytes do 19041, com as vistas por estado; o PspCaptureCreateInfo
+  exige PsCreateInitialState e decodifica o InitState: WriteOutputOnExit,
+  DetectManifest, ProhibitedImageCharacteristics, AdditionalFileAccess), a PS_ATTRIBUTE_LIST copiada
   uma vez (honra ImageName, ParentProcess com PROCESS_CREATE_PROCESS,
   PriorityClass, ProtectionLevel (o processo novo recebe o PS_PROTECTION
   pedido se quem cria for protegido e o dominar) e as saídas ClientId,
@@ -2966,9 +2978,21 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   caminho único cria o processo, `start_created` o põe no despachante, os
   handles do processo e da thread entram na tabela de quem chamou com o
   acesso pedido (genéricos mapeados, MAXIMUM_ALLOWED como o total do tipo) e
-  as saídas vão para as VAs sondadas: PsCreateSuccess com a PEB e o bloco de
-  parâmetros do filho (FileHandle e SectionHandle NULL), ou
-  PsCreateFailOnFileOpen/PsCreateFailExeFormat. O KPROCESS é sinalizado no
+  as saídas vão para as VAs sondadas, como o PspUpdateCreateInfo: o estado
+  sempre (PsCreateSuccess, PsCreateFailOnFileOpen, PsCreateFailExeFormat) e
+  os campos dele só com WriteOutputOnExit (o kernel32 o liga; o
+  RtlCreateUserProcess da ntdll não). No PsCreateSuccess: OutputFlags
+  (ProtectedProcess e ProtectedProcessLight do EPROCESS.Protection,
+  AddressSpaceOverride do EPROCESS.Flags, ManifestDetected),
+  ManifestAddress/ManifestSize, FileHandle (o exe, aberto na tabela de quem
+  chamou com o acesso da abertura da criação, `file_io::open_resolved`) e
+  SectionHandle (a seção de imagem do processo, SECTION_ALL_ACCESS, um
+  `InheritedObject`), o bloco de parâmetros, o Flags dele
+  (CurrentParameterFlags) e a PEB; no PsCreateFailExeFormat, o
+  DllCharacteristics. Com o FileHandle válido o kernel32 toma o caminho de
+  disco fixo da mensagem de SxS ao csrss, e com
+  RTL_USER_PROC_APP_MANIFEST_PRESENT o sxssrv gera o contexto de ativação
+  do processo a partir do manifesto embutido. O KPROCESS é sinalizado no
   término (`terminate_process`), então a espera no handle do processo
   acorda. Teste: `ntos/test/multiprocess/create_user_process.rs`, um pai
   real no anel 3 que chama o handler com tudo na memória dele, imprime

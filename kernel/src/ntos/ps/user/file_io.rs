@@ -232,44 +232,68 @@ pub fn open(out: u64, name: &str, iosb: u64, disposition: u32, request: &OpenReq
             }
         }
         let Some(file) = file else { return fail(0xC000_0034) };
-        let entry = UserFile::new(file.clone(), granted, share, options, name);
-        let aborted = Arc::new(AtomicBool::new(false));
-        let destroy = {
-            let (entry, file, aborted, volume) = (entry.clone(), file.clone(), aborted.clone(), volume.clone());
-            Arc::new(move || {
-                file.opens.lock().retain(|&id| id != entry.id);
-                if !aborted.load(Ordering::Acquire) && (entry.delete_requested.load(Ordering::Acquire) || entry.delete_on_close.load(Ordering::Acquire)) {
-                    file.set_pending_delete(true);
-                }
-                file_objects::update_delete_state(&file);
-                if !file.deleted() && file.opens.lock().is_empty() && file.pending_delete() {
-                    let _ = volume.remove(&file.volume_path());
-                    volume_files::forget(&file.volume_path());
-                    file.set_deleted(true);
-                }
-                file_objects::forget(entry.id);
-            }) as Arc<dyn Fn() + Send + Sync>
-        };
-        let pointer = file_objects::bind(&entry, destroy)?;
-        file.opens.lock().push(entry.id);
-        match state::alloc_user_handle(entry.clone(), granted, request.handle_attributes & 2) {
-            Ok(handle) => {
-                // PHANDLE de saída (sondado acima); sem ele o handle não fica.
-                if let Err(error) = guest::try_write::<u64>(out, handle as u64) {
-                    crate::ntos::ob::close::close_user(handle as u64, true);
-                    return Err(error);
-                }
-                let status = complete(iosb, 0, information);
-                debug_print!("[usermode] arquivo {}{} ({} bytes)", if information == 2 { "criado: " } else { "aberto: " }, name, file.size());
-                Ok(status)
-            }
-            Err(error) => {
-                aborted.store(true, Ordering::Release);
-                let _ = crate::ntos::ob::objects::file::dereference(pointer);
-                Err(error)
-            }
+        let handle = insert_open(&file, &volume, name, granted, share, options, request.handle_attributes & 2)?;
+        // PHANDLE de saída (sondado acima); sem ele o handle não fica.
+        if let Err(error) = guest::try_write::<u64>(out, handle as u64) {
+            crate::ntos::ob::close::close_user(handle as u64, true);
+            return Err(error);
         }
+        let status = complete(iosb, 0, information);
+        debug_print!("[usermode] arquivo {}{} ({} bytes)", if information == 2 { "criado: " } else { "aberto: " }, name, file.size());
+        Ok(status)
     })
+}
+
+/// A descrição aberta de `file` (a `UserFile` com o FILE_OBJECT ligado, na
+/// lista de aberturas do arquivo) e o handle dela na tabela do processo
+/// corrente, com o acesso concedido; `name` é o caminho NT da abertura. Uma
+/// falha ao publicar o handle desfaz a descrição.
+fn insert_open(file: &Arc<VolumeFile>, volume: &Arc<crate::drivers::fs::ntfs::Ntfs>, name: &str, granted: u32, share: u32, options: u32, handle_attributes: u32) -> Result<u32, KernelError> {
+    let entry = UserFile::new(file.clone(), granted, share, options, name);
+    let aborted = Arc::new(AtomicBool::new(false));
+    let destroy = {
+        let (entry, file, aborted, volume) = (entry.clone(), file.clone(), aborted.clone(), volume.clone());
+        Arc::new(move || {
+            file.opens.lock().retain(|&id| id != entry.id);
+            if !aborted.load(Ordering::Acquire) && (entry.delete_requested.load(Ordering::Acquire) || entry.delete_on_close.load(Ordering::Acquire)) {
+                file.set_pending_delete(true);
+            }
+            file_objects::update_delete_state(&file);
+            if !file.deleted() && file.opens.lock().is_empty() && file.pending_delete() {
+                let _ = volume.remove(&file.volume_path());
+                volume_files::forget(&file.volume_path());
+                file.set_deleted(true);
+            }
+            file_objects::forget(entry.id);
+        }) as Arc<dyn Fn() + Send + Sync>
+    };
+    let pointer = file_objects::bind(&entry, destroy)?;
+    file.opens.lock().push(entry.id);
+    state::alloc_user_handle(entry, granted, handle_attributes).inspect_err(|_| {
+        aborted.store(true, Ordering::Release);
+        let _ = crate::ntos::ob::objects::file::dereference(pointer);
+    })
+}
+
+/// O compartilhamento de uma abertura nova de `file` com `granted` e
+/// `share` contra as aberturas existentes: 0 ou STATUS_SHARING_VIOLATION.
+pub fn sharing_status(file: &VolumeFile, granted: u32, share: u32) -> Result<u32, KernelError> {
+    let fixed = volume_files::fixed_volume().ok_or_else(|| KernelError::new("volume de boot ausente"))?;
+    Ok(file_lifetime::validate_open(&file_lifetime::lifetime_volume(fixed), &file.volume_path(), granted, share))
+}
+
+/// Abre um arquivo do volume já resolvido (que existe e não é diretório) na
+/// tabela do processo corrente, sem nome a resolver nem IO_STATUS_BLOCK: o
+/// compartilhamento contra as aberturas existentes e a descrição aberta com
+/// `granted` (direitos específicos), `share` e `options`. Devolve o handle;
+/// uma recusa de compartilhamento volta como erro com o status.
+pub fn open_resolved(file: &Arc<VolumeFile>, name: &str, granted: u32, share: u32, options: u32, handle_attributes: u32) -> Result<u32, KernelError> {
+    let sharing = sharing_status(file, granted, share)?;
+    if sharing != 0 {
+        return fail(sharing);
+    }
+    let volume = volume_files::volume().ok_or_else(|| KernelError::with_status("volume de boot ausente", 0xC000_000E))?;
+    insert_open(file, &volume, name, granted, share, options, handle_attributes)
 }
 
 /// Um tempo do volume: `stat.times` guarda criação, escrita, mudança e

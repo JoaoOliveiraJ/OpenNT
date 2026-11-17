@@ -63,7 +63,7 @@ pub fn windows_process_request<'a>(image: ImageOrigin, image_name: &'a str, dos_
     }
     parameters.standard_output = options.standard_output;
     parameters.standard_error = options.standard_output;
-    CreateProcessRequest { image, image_name, parameters, parent: None, thread_flags: 0, inherit_handles_from: None, on_created: options.on_process_created, protection: 0, create_session: false, primary_token: None }
+    CreateProcessRequest { image, image_name, parameters, parent: None, thread_flags: 0, inherit_handles_from: None, on_created: options.on_process_created, protection: 0, create_session: false, primary_token: None, image_request: Default::default() }
 }
 
 /// Um processo posto no despachante por [`start_created`]: anda com os
@@ -162,7 +162,7 @@ pub fn run_windows_process(bytes: Option<Vec<u8>>, image_name: &str, dos_path: &
     match create::create_user_process(&windows_process_request(image, image_name, dos_path, &options)) {
         Ok(created) => run_created(created),
         Err(CreateFailure::Terminated(status)) => Ok(status),
-        Err(CreateFailure::ExeFormat(error) | CreateFailure::Other(error)) => Err(error),
+        Err(CreateFailure::ExeFormat(error, _) | CreateFailure::Other(error)) => Err(error),
         Err(failure @ CreateFailure::FileOpen(_)) => Err(KernelError::with_status(format!("{failure}"), failure.status())),
     }
 }

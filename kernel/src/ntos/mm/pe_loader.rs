@@ -135,9 +135,21 @@ fn preferred_range_is_free(ranges: &[(u64, u64, u64)], root: u64, base: u64, siz
     ranges.iter().filter(|&&(owner, _, _)| owner == root).all(|&(_, used_base, used_top)| !(base < used_top && base + size > used_base))
 }
 
-/// ImageBase preferida e SizeOfImage do cabeçalho, sem mapear nada (o Ps
-/// cria o processo, e o espaço dele, antes de a imagem ser mapeada nele).
-pub fn image_layout(source: &dyn ImageSource) -> Result<(u64, u64), KernelError> {
+/// O que o Ps lê do cabeçalho antes de mapear a imagem.
+#[derive(Clone, Copy, Debug)]
+pub struct ImageLayout {
+    pub preferred_base: u64,
+    pub size_of_image: u64,
+    /// FileHeader.Characteristics (IMAGE_FILE_*).
+    pub characteristics: u16,
+    /// OptionalHeader.DllCharacteristics.
+    pub dll_characteristics: u16,
+}
+
+/// ImageBase preferida, SizeOfImage e as características do cabeçalho, sem
+/// mapear nada (o Ps cria o processo, e o espaço dele, antes de a imagem ser
+/// mapeada nele).
+pub fn image_layout(source: &dyn ImageSource) -> Result<ImageLayout, KernelError> {
     let metadata = MetadataReader::new(source);
     if metadata.read_u16(0)? != 0x5A4D {
         return Err(KernelError::new("MZ ausente (nao e PE)"));
@@ -151,7 +163,7 @@ pub fn image_layout(source: &dyn ImageSource) -> Result<(u64, u64), KernelError>
         return Err(KernelError::new("nao e PE32+"));
     }
     let preferred_base = metadata.read_u32(optional + 24)? as u64 | (metadata.read_u32(optional + 28)? as u64) << 32;
-    Ok((preferred_base, metadata.read_u32(optional + 56)? as u64))
+    Ok(ImageLayout { preferred_base, size_of_image: metadata.read_u32(optional + 56)? as u64, characteristics: metadata.read_u16(pe_header + 22)? as u16, dll_characteristics: metadata.read_u16(optional + 70)? as u16 })
 }
 
 /// Dependência retida por um import nativo (outro módulo carregado).

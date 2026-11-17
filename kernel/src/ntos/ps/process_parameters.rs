@@ -11,7 +11,9 @@
 //! novo.
 //!
 //! Formato entregue ao processo: auto-relativo, sem
-//! RTL_USER_PROC_PARAMS_NORMALIZED (Flags 0), com o Buffer de cada
+//! RTL_USER_PROC_PARAMS_NORMALIZED (o Flags é só o que a criação passa:
+//! RTL_USER_PROC_APP_MANIFEST_PRESENT quando achou o manifesto embutido do
+//! executável, senão 0), com o Buffer de cada
 //! UNICODE_STRING sendo o deslocamento desde a base do bloco; o loader da
 //! ntdll normaliza na inicialização. O Environment é absoluto (a
 //! normalização só converte os Buffers). Os textos ficam bem depois da
@@ -148,8 +150,10 @@ impl ProcessParameters {
 
     /// Grava o bloco no processo corrente (o processo em montagem, anexado)
     /// e devolve a VA dele, para PEB.ProcessParameters. Length cobre a
-    /// estrutura, os textos e o ambiente; MaximumLength, o bloco inteiro.
-    pub fn write(&self) -> Result<u64, KernelError> {
+    /// estrutura, os textos e o ambiente; MaximumLength, o bloco inteiro;
+    /// Flags é `flags` (sem RTL_USER_PROC_PARAMS_NORMALIZED: o bloco é
+    /// auto-relativo).
+    pub fn write(&self, flags: u32) -> Result<u64, KernelError> {
         let capacities = &self.capacities;
         // Um texto vazio dos obrigatórios fica NULL, como um ausente.
         let required = |text: &str| (!text.is_empty()).then(|| wide(text));
@@ -198,7 +202,7 @@ impl ProcessParameters {
         parameters.environment_size.set(environment.len() as u64);
         parameters.maximum_length.set(size as u32);
         parameters.length.set(length as u32);
-        parameters.flags.set(0);
+        parameters.flags.set(flags & !NORMALIZED);
         parameters.console_handle.set(self.console_handle);
         parameters.standard_input.set(self.standard_input);
         parameters.standard_output.set(self.standard_output);

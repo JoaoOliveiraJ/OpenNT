@@ -7,12 +7,20 @@
 //!   diretório corrente, RuntimeData binário de tamanho ímpar e campos do
 //!   STARTUPINFO), o PS_CREATE_INFO e a PS_ATTRIBUTE_LIST na memória de
 //!   usuário DELE (a seção gravável da própria imagem). O ImageName aponta
-//!   para um exe mínimo gravado no volume, que sai com 0x42; a thread é
+//!   para um exe mínimo gravado no volume, que sai com 0x42 e tem um
+//!   RT_MANIFEST 1 embutido; o InitState é o do kernel32 (WriteOutputOnExit,
+//!   DetectManifest, IMAGE_FILE_DLL proibido, FILE_READ_DATA |
+//!   FILE_READ_ATTRIBUTES a mais na abertura); a thread é
 //!   criada suspensa; o ParentProcess é um handle do pai para o System
 //!   (PROCESS_CREATE_PROCESS), com PROCESS_CREATE_FLAGS_INHERIT_HANDLES, e
 //!   ErrorMode entra como atributo aceito sem efeito.
 //! - Com o pai parado depois da criação, o teste confere: PsCreateSuccess com
-//!   a PEB e o bloco de parâmetros do filho; o CLIENT_ID (e o ReturnLength),
+//!   a PEB e o bloco de parâmetros do filho, ManifestDetected, o
+//!   ManifestAddress/ManifestSize do RT_MANIFEST na VA do filho, o Flags
+//!   RTL_USER_PROC_APP_MANIFEST_PRESENT (no PS_CREATE_INFO e no bloco), e o
+//!   FileHandle (o exe, com o acesso da abertura) e o SectionHandle (a seção
+//!   de imagem do filho, SECTION_ALL_ACCESS) na tabela do pai; o CLIENT_ID
+//!   (e o ReturnLength),
 //!   a TEB e o SECTION_IMAGE_INFORMATION (entry na base real, subsistema,
 //!   máquina) nas saídas; os dois handles válidos na tabela do pai (processo
 //!   e thread do filho, com o acesso pedido) e não na do System; o pai
@@ -27,10 +35,15 @@
 //!   saiu com 0x42. Uma imagem inexistente dá STATUS_OBJECT_NAME_NOT_FOUND
 //!   com PsCreateFailOnFileOpen, sem handles. O pai sai com o código dele.
 //! - Direto no handler, do System: um número de atributo desconhecido, a
-//!   ausência do ImageName e um Size errado no PS_CREATE_INFO dão
-//!   STATUS_INVALID_PARAMETER; DebugObject e PROCESS_CREATE_FLAGS_MINIMAL_PROCESS,
-//!   STATUS_NOT_SUPPORTED; nenhum cria processo. Com INHERIT_HANDLES e sem
-//!   ParentProcess, a criação direta herda os handles de quem chama.
+//!   ausência do ImageName e um Size errado ou um estado diferente de
+//!   PsCreateInitialState no PS_CREATE_INFO dão STATUS_INVALID_PARAMETER;
+//!   DebugObject e PROCESS_CREATE_FLAGS_MINIMAL_PROCESS,
+//!   STATUS_NOT_SUPPORTED; um exe com IMAGE_FILE_DLL, STATUS_INVALID_IMAGE_FORMAT
+//!   com PsCreateFailExeFormat e o DllCharacteristics dele; nenhum cria
+//!   processo. Com INHERIT_HANDLES e sem ParentProcess, a criação direta
+//!   herda os handles de quem chama; sem WriteOutputOnExit, o PS_CREATE_INFO
+//!   só recebe o estado. Os FileHandle/SectionHandle das criações diretas são
+//!   fechados como o kernel32 faz.
 //! - `process_parameters::capture` de um bloco normalizado (Buffers
 //!   absolutos) devolve os textos, as capacidades, o RuntimeData, os
 //!   escalares e o ambiente; Length > MaximumLength num texto dá
@@ -53,6 +66,7 @@ use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::ps::create::{self, CreatedProcess, ImageOrigin};
 use crate::ntos::ps::process_parameters;
 use crate::ntos::ps::user::file_io::{self, OpenRequest};
+use crate::ntos::ps::user::file_objects::UserFile;
 use crate::ntos::ps::user::handles::UserProcess;
 use crate::ntos::ps::user::process::{self as user_process, RunOptions};
 use crate::ntos::ps::user::threads::ThreadHandleObject;
@@ -106,6 +120,25 @@ const UNSET: u32 = 0xFFFF_FFFF;
 const STAGE_DEADLINE_MS: u64 = 20_000;
 /// Voltas extras do despachante com o filho suspenso.
 const SUSPENDED_ROUNDS: usize = 64;
+/// O manifesto embutido do filho (RT_MANIFEST 1, idioma 0x409): o diretório
+/// de recursos fica em RESOURCE_OFFSET da seção (VA 0x1000), depois do
+/// código, e os bytes em MANIFEST_DATA dentro dele.
+const MANIFEST_TEXT: &[u8] = b"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><assembly xmlns=\"urn:schemas-microsoft-com:asm.v1\" manifestVersion=\"1.0\"></assembly>";
+const RESOURCE_OFFSET: usize = 0x800;
+const MANIFEST_DATA: usize = 0x58;
+/// O acesso do FileHandle (SYNCHRONIZE | FILE_EXECUTE mais o
+/// AdditionalFileAccess FILE_READ_DATA | FILE_READ_ATTRIBUTES) e o do
+/// SectionHandle (SECTION_ALL_ACCESS).
+const IMAGE_FILE_ACCESS: u32 = 0x10_00A1;
+const SECTION_ALL_ACCESS: u32 = 0xF_001F;
+/// RTL_USER_PROC_APP_MANIFEST_PRESENT e o ManifestDetected do OutputFlags.
+const APP_MANIFEST_PRESENT: u32 = 0x2000;
+const MANIFEST_DETECTED: u32 = 0x8;
+/// Um exe com IMAGE_FILE_DLL, recusado pelo ProhibitedImageCharacteristics,
+/// e o DllCharacteristics dele.
+const DLL_NT_PATH: &str = "\\??\\D:\\FILHODLL.EXE";
+const DLL_CHARACTERISTICS: u16 = 0x8160;
+const STATUS_INVALID_IMAGE_FORMAT: u32 = 0xC000_007B;
 
 // O conteúdo da seção da imagem do pai: o código e, depois, os dados (as
 // estruturas que ele passa ao serviço e as células que o teste lê).
@@ -447,20 +480,60 @@ pub(super) fn attribute_list(entries: &[(u64, u64, u64, u64)]) -> Vec<u8> {
 }
 
 /// Um PS_CREATE_INFO de entrada: Size, PsCreateInitialState e o InitState
-/// que o kernel32 passa (WriteOutputOnExit; DLL proibida; leitura extra).
+/// que o kernel32 passa (WriteOutputOnExit e DetectManifest; DLL proibida;
+/// leitura extra).
 pub(super) fn create_info(size: u64) -> Vec<u8> {
     let mut bytes = alloc::vec![0u8; PsCreateInfo::SIZE as usize];
     bytes[offset_of!(PsCreateInfo, size)..][..8].copy_from_slice(&size.to_le_bytes());
-    bytes[0x10..0x14].copy_from_slice(&0x2000_0001u32.to_le_bytes());
+    bytes[0x10..0x14].copy_from_slice(&0x2000_0003u32.to_le_bytes());
     bytes[0x14..0x18].copy_from_slice(&0x81u32.to_le_bytes());
     bytes
 }
 
-/// O exe mínimo do filho: NtTerminateProcess(-1, 0x42).
+/// O diretório de recursos com só o RT_MANIFEST 1 (idioma 0x409), na RVA
+/// `rva`: a raiz, o diretório do tipo, o do nome (cada um com uma entrada
+/// de identificador), a IMAGE_RESOURCE_DATA_ENTRY e os bytes.
+fn manifest_resources(rva: u32) -> Vec<u8> {
+    let mut bytes = alloc::vec![0u8; MANIFEST_DATA];
+    let put32 = |bytes: &mut [u8], at: usize, value: u32| bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    // IMAGE_RESOURCE_DIRECTORY (16 bytes, NumberOfIdEntries em +14) e a
+    // entrada logo depois; o bit alto aponta outro diretório.
+    for (directory, name, target) in [(0x00, 24, 0x8000_0018), (0x18, 1, 0x8000_0030), (0x30, 0x409, 0x48)] {
+        bytes[directory + 14] = 1;
+        put32(&mut bytes, directory + 16, name);
+        put32(&mut bytes, directory + 20, target);
+    }
+    put32(&mut bytes, 0x48, rva + MANIFEST_DATA as u32);
+    put32(&mut bytes, 0x4C, MANIFEST_TEXT.len() as u32);
+    bytes.extend_from_slice(MANIFEST_TEXT);
+    bytes
+}
+
+/// O exe mínimo do filho: NtTerminateProcess(-1, 0x42), com o manifesto
+/// embutido depois do código (o DataDirectory de recursos no cabeçalho
+/// opcional, em 0x58).
 fn child_image(services: &Services) -> Vec<u8> {
     let mut code = Code::new();
     code.exit(services, CHILD_CODE);
-    crate::ntos::test::phase7::single_section_image(IMAGE_BASE, 0x0022, b".text", 0x6000_0020, 0x1000, &code.bytes)
+    assert!(code.bytes.len() <= RESOURCE_OFFSET, "codigo do filho maior que a area antes dos recursos");
+    let mut content = code.bytes;
+    content.resize(RESOURCE_OFFSET, 0);
+    let resources = 0x1000 + RESOURCE_OFFSET as u32;
+    content.extend_from_slice(&manifest_resources(resources));
+    let mut image = crate::ntos::test::phase7::single_section_image(IMAGE_BASE, 0x0022, b".text", 0x6000_0020, 0x1000, &content);
+    image[0xD8..0xDC].copy_from_slice(&resources.to_le_bytes());
+    image[0xDC..0xE0].copy_from_slice(&((MANIFEST_DATA + MANIFEST_TEXT.len()) as u32).to_le_bytes());
+    image
+}
+
+/// Um exe com IMAGE_FILE_DLL (e DllCharacteristics), que o
+/// ProhibitedImageCharacteristics do kernel32 recusa.
+fn dll_image(services: &Services) -> Vec<u8> {
+    let mut code = Code::new();
+    code.exit(services, CHILD_CODE);
+    let mut image = crate::ntos::test::phase7::single_section_image(IMAGE_BASE, 0x2022, b".text", 0x6000_0020, 0x1000, &code.bytes);
+    image[0x58 + 70..0x58 + 72].copy_from_slice(&DLL_CHARACTERISTICS.to_le_bytes());
+    image
 }
 
 /// O pai: cria o filho suspenso, espera a etapa 1, retoma a thread dele,
@@ -676,7 +749,7 @@ pub fn run(assert: Assert) {
     };
     parent_creates_child(assert, &services, system, system_inheritable);
     restore_services(saved);
-    rejections(assert);
+    rejections(assert, &services);
     creator_inheritance(assert, system, system_inheritable);
     let _ = state::close_user_handle(system_inheritable, true, false);
     capture_normalized(assert);
@@ -775,7 +848,25 @@ fn parent_creates_child(assert: Assert, services: &Services, system: u64, system
         (info.size.get(), info.state.get(), success.peb_address_native.get(), success.user_process_parameters_native.get(), success.current_parameter_flags.get(), success.output_flags.get())
     })
     .ok();
-    assert(info.is_some_and(|(size, state, peb, block, flags, output)| size == PsCreateInfo::SIZE && state == PsCreateInfo::SUCCESS && peb == child_peb && peb != 0 && parameters.as_ref().is_some_and(|parameters| parameters.block == block) && flags == 0 && output == 0), "ntcreateuserprocess: PS_CREATE_INFO volta PsCreateSuccess com a PEB e o bloco de parametros do filho");
+    assert(info.is_some_and(|(size, state, peb, block, flags, output)| size == PsCreateInfo::SIZE && state == PsCreateInfo::SUCCESS && peb == child_peb && peb != 0 && parameters.as_ref().is_some_and(|parameters| parameters.block == block) && flags == APP_MANIFEST_PRESENT && output == MANIFEST_DETECTED), "ntcreateuserprocess: PS_CREATE_INFO volta PsCreateSuccess com a PEB, o bloco de parametros do filho, ManifestDetected e o Flags RTL_USER_PROC_APP_MANIFEST_PRESENT");
+    // O manifesto embutido (a VA no filho) e os handles do arquivo e da
+    // seção de imagem, na tabela do pai.
+    let (manifest, image_handles) = process_context::with_process(parent, || {
+        // SAFETY: o PS_CREATE_INFO do pai, anexado.
+        let success = unsafe { PsCreateInfo::at(absolute(CREATE_INFO)) }.success_state();
+        ((success.manifest_address.get(), success.manifest_size.get()), (success.file_handle.get(), success.section_handle.get()))
+    })
+    .unwrap_or_default();
+    let manifest_bytes = process_context::with_process(child, || guest::try_read_bytes(manifest.0, manifest.1 as usize).unwrap_or_default()).unwrap_or_default();
+    assert(manifest == (IMAGE_BASE + 0x1000 + (RESOURCE_OFFSET + MANIFEST_DATA) as u64, MANIFEST_TEXT.len() as u32) && manifest_bytes == MANIFEST_TEXT, "ntcreateuserprocess: ManifestAddress e ManifestSize apontam o RT_MANIFEST 1 da imagem do filho, na VA do filho");
+    let image_section = process::image_section(child);
+    let handles_in_parent = process_context::with_process(parent, || {
+        let file = state::get_user_handle(image_handles.0).is_some_and(|entry| entry.kind() == "file" && entry.access() == IMAGE_FILE_ACCESS && entry.downcast::<UserFile>().is_some_and(|file| file.nt_path.lock().as_str() == CHILD_NT_PATH));
+        let section = state::get_user_handle(image_handles.1).is_some_and(|entry| entry.kind() == "section" && entry.access() == SECTION_ALL_ACCESS && image_section.is_some() && entry.object.native_body().map(|body| body.pointer) == image_section);
+        file && section
+    })
+    .unwrap_or(false);
+    assert(handles_in_parent && state::get_user_handle(image_handles.0).is_none() && state::get_user_handle(image_handles.1).is_none(), "ntcreateuserprocess: FileHandle (o exe do filho, SYNCHRONIZE|FILE_EXECUTE|AdditionalFileAccess) e SectionHandle (a secao de imagem do filho, SECTION_ALL_ACCESS) na tabela do pai, e nao na do System");
     // CLIENT_ID, TEB e SECTION_IMAGE_INFORMATION.
     let image = process_context::with_process(parent, || {
         // SAFETY: o SECTION_IMAGE_INFORMATION do pai, anexado.
@@ -808,7 +899,7 @@ fn parent_creates_child(assert: Assert, services: &Services, system: u64, system
     assert(from_declared == Some(true) && from_caller.is_none(), "ntcreateuserprocess: com INHERIT_HANDLES e ParentProcess, o filho herda o handle do pai declarado com o mesmo valor, e nao o de quem chamou");
     // Os parâmetros do pai, entregues ao filho.
     let delivered = parameters.as_ref().is_some_and(|parameters| {
-        parameters.flags == 0
+        parameters.flags == APP_MANIFEST_PRESENT
             && parameters.image_path_name == CHILD_DOS_PATH
             && parameters.command_line == COMMAND_LINE
             && parameters.current_directory == CURRENT_DIRECTORY
@@ -825,7 +916,7 @@ fn parent_creates_child(assert: Assert, services: &Services, system: u64, system
     if !delivered {
         crate::debug_print!("[ntcreateuserprocess] parametros do filho: {:?}", parameters.as_ref().map(|parameters| (parameters.image_path_name.clone(), parameters.command_line.clone(), parameters.current_directory.clone(), parameters.directory_capacity, parameters.runtime_data.clone(), parameters.environment.clone(), parameters.scalars)));
     }
-    assert(delivered, "ntcreateuserprocess: os parametros auto-relativos do pai chegam ao filho (textos, capacidade do diretorio, RuntimeData binario, ambiente, console e STARTUPINFO)");
+    assert(delivered, "ntcreateuserprocess: os parametros auto-relativos do pai chegam ao filho (textos, capacidade do diretorio, RuntimeData binario, ambiente, console e STARTUPINFO), com o Flags RTL_USER_PROC_APP_MANIFEST_PRESENT");
     assert(started_child && suspended.is_some_and(|(count, dead, _)| count == 1 && !dead) && exit_status(child) == STATUS_PENDING && process_state::get(child).is_some(), "ntcreateuserprocess: o filho entra no despachante com a thread principal suspensa e nao roda");
 
     // Etapa 2: retomada, espera no handle do processo e a imagem inexistente.
@@ -866,11 +957,23 @@ pub(super) fn call_create(scratch: &Scratch, process_flags: u32, info: &[u8], at
         guest::write64(rsp + 0x28 + index as u64 * 8, value);
     }
     let status = state::handler("NtCreateUserProcess").map_or(1, |handler| handler(out, out + 8, ALL_ACCESS as u64, ALL_ACCESS as u64, rsp).unwrap_or(1));
+    // O FileHandle e o SectionHandle do PsCreateSuccess, fechados como o
+    // kernel32 faz.
+    // SAFETY: o PS_CREATE_INFO no bloco do System, escrito pelo handler.
+    let info = unsafe { PsCreateInfo::at(info_at) };
+    if status == 0 && info.state.get() == PsCreateInfo::SUCCESS {
+        let success = info.success_state();
+        for handle in [success.file_handle.get(), success.section_handle.get()] {
+            if handle != 0 {
+                let _ = state::close_user_handle(handle, true, false);
+            }
+        }
+    }
     (status, guest::read64(out))
 }
 
 /// Recusas do handler sem criar processo.
-fn rejections(assert: Assert) {
+fn rejections(assert: Assert, services: &Services) {
     let Some(scratch) = Scratch::new(0x2000) else {
         assert(false, "ntcreateuserprocess: memoria para as recusas");
         return;
@@ -885,15 +988,32 @@ fn rejections(assert: Assert) {
     let debug = call_create(&scratch, 0, &valid, &attribute_list(&[image_name, (ATTRIBUTE_DEBUG_OBJECT, 8, 0, 0)]));
     let nameless = call_create(&scratch, 0, &valid, &attribute_list(&[(ATTRIBUTE_ERROR_MODE, 4, 0, 0)]));
     let short_info = call_create(&scratch, 0, &create_info(0x50), &attribute_list(&[image_name]));
+    // Um PS_CREATE_INFO fora do PsCreateInitialState.
+    let mut stale = valid.clone();
+    stale[offset_of!(PsCreateInfo, state)..][..4].copy_from_slice(&PsCreateInfo::SUCCESS.to_le_bytes());
+    let stale_info = call_create(&scratch, 0, &stale, &attribute_list(&[image_name]));
     let minimal_process = call_create(&scratch, 0x800, &valid, &attribute_list(&[image_name]));
-    crate::debug_print!("[ntcreateuserprocess] recusas: {:x?} {:x?} {:x?} {:x?} {:x?}", unknown, debug, nameless, short_info, minimal_process);
-    assert(unknown == (STATUS_INVALID_PARAMETER, 0) && nameless == (STATUS_INVALID_PARAMETER, 0) && short_info == (STATUS_INVALID_PARAMETER, 0), "ntcreateuserprocess: atributo desconhecido, ImageName ausente e PS_CREATE_INFO de tamanho errado dao STATUS_INVALID_PARAMETER");
+    // ProhibitedImageCharacteristics (IMAGE_FILE_DLL): um exe que é DLL.
+    let dll_written = write_volume_file(DLL_NT_PATH, &dll_image(services));
+    let dll_text = wide(DLL_NT_PATH);
+    let dll_name = scratch.block + 0x680;
+    guest::write_bytes(dll_name, &dll_text);
+    let prohibited = call_create(&scratch, 0, &valid, &attribute_list(&[(ATTRIBUTE_IMAGE_NAME, dll_text.len() as u64, dll_name, 0)]));
+    // SAFETY: o PS_CREATE_INFO no bloco do System, escrito pelo handler.
+    let dll_info = unsafe { PsCreateInfo::at(scratch.block + 0x100) };
+    let dll_state = (dll_info.state.get(), dll_info.exe_format().dll_characteristics.get());
+    remove_volume_file(DLL_NT_PATH);
+    crate::debug_print!("[ntcreateuserprocess] recusas: {:x?} {:x?} {:x?} {:x?} {:x?} {:x?} {:x?} {:x?}", unknown, debug, nameless, short_info, stale_info, minimal_process, prohibited, dll_state);
+    assert(unknown == (STATUS_INVALID_PARAMETER, 0) && nameless == (STATUS_INVALID_PARAMETER, 0) && short_info == (STATUS_INVALID_PARAMETER, 0) && stale_info == (STATUS_INVALID_PARAMETER, 0), "ntcreateuserprocess: atributo desconhecido, ImageName ausente e PS_CREATE_INFO de tamanho errado ou fora do PsCreateInitialState dao STATUS_INVALID_PARAMETER");
     assert(debug == (STATUS_NOT_SUPPORTED, 0) && minimal_process == (STATUS_NOT_SUPPORTED, 0), "ntcreateuserprocess: DebugObject e PROCESS_CREATE_FLAGS_MINIMAL_PROCESS dao STATUS_NOT_SUPPORTED");
+    assert(dll_written && prohibited == (STATUS_INVALID_IMAGE_FORMAT, 0) && dll_state == (PsCreateInfo::FAIL_EXE_FORMAT, DLL_CHARACTERISTICS), "ntcreateuserprocess: um exe com IMAGE_FILE_DLL (o ProhibitedImageCharacteristics do kernel32) da STATUS_INVALID_IMAGE_FORMAT com PsCreateFailExeFormat e o DllCharacteristics dele");
     assert(process::list_active_processes().len() == before, "ntcreateuserprocess: nenhuma recusa cria processo");
 }
 
 /// INHERIT_HANDLES sem ParentProcess, direto no handler: quem chama (o
-/// System) é a fonte da herança. O filho, suspenso, é terminado pelo teste.
+/// System) é a fonte da herança. O PS_CREATE_INFO vai sem WriteOutputOnExit
+/// (como o do RtlCreateUserProcess da ntdll): a saída é só o estado, sem os
+/// handles do arquivo e da seção. O filho, suspenso, é terminado pelo teste.
 fn creator_inheritance(assert: Assert, system: u64, system_inheritable: u64) {
     let Some(scratch) = Scratch::new(0x2000) else {
         assert(false, "ntcreateuserprocess: memoria para a heranca de quem chama");
@@ -902,8 +1022,15 @@ fn creator_inheritance(assert: Assert, system: u64, system_inheritable: u64) {
     let name = scratch.block + 0x600;
     let text = wide(CHILD_NT_PATH);
     guest::write_bytes(name, &text);
-    let (status, process_handle) = call_create(&scratch, INHERIT_HANDLES, &create_info(PsCreateInfo::SIZE), &attribute_list(&[(ATTRIBUTE_IMAGE_NAME, text.len() as u64, name, 0)]));
+    let mut quiet = create_info(PsCreateInfo::SIZE);
+    quiet[0x10..0x14].copy_from_slice(&0x2000_0002u32.to_le_bytes());
+    let (status, process_handle) = call_create(&scratch, INHERIT_HANDLES, &quiet, &attribute_list(&[(ATTRIBUTE_IMAGE_NAME, text.len() as u64, name, 0)]));
     let thread_handle = guest::read64(scratch.block + 8);
+    // SAFETY: o PS_CREATE_INFO no bloco do System, escrito pelo handler.
+    let info = unsafe { PsCreateInfo::at(scratch.block + 0x100) };
+    let success = info.success_state();
+    let quiet_output = (info.state.get(), success.output_flags.get(), success.file_handle.get(), success.section_handle.get(), success.peb_address_native.get(), success.current_parameter_flags.get());
+    assert(status == 0 && quiet_output == (PsCreateInfo::SUCCESS, 0x2000_0002, 0, 0, 0, 0), "ntcreateuserprocess: sem WriteOutputOnExit o PS_CREATE_INFO so recebe PsCreateSuccess, sem FileHandle/SectionHandle nem os outros campos");
     let child = state::get_user_handle(process_handle).and_then(|entry| entry.downcast::<UserProcess>().map(|object| object.pointer)).unwrap_or(0);
     let from_creator = if child != 0 { inherited(child, system_inheritable, system) } else { None };
     crate::debug_print!("[ntcreateuserprocess] criacao direta: {:#x}, handles {:#x}/{:#x}, heranca {:?}", status, process_handle, thread_handle, from_creator);
