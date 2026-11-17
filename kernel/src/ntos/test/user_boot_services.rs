@@ -7,8 +7,10 @@
 //! tamanho fixo do NtQuerySystemInformation (`ex/system_information`) e os
 //! vizinhos NtPulseEvent, NtSetEventBoostPriority e NtQueryDirectoryObject,
 //! e o objeto Timer do Executive de modo usuário (NtCreateTimer, NtSetTimer
-//! e NtCancelTimer, que o WUDFPlatform.dll do services.exe pede) e o
-//! NtAdjustGroupsToken.
+//! e NtCancelTimer, que o WUDFPlatform.dll do services.exe pede), o
+//! NtAdjustGroupsToken e os objetos de reserva de modo usuário
+//! (NtAllocateReserveObject e NtSetIoCompletionEx, do RPC assíncrono do
+//! rpcrt4).
 
 use crate::ntos::inc::field::NtStruct;
 use crate::ntos::inc::types::{Eprocess, Ethread, HandleTable, ObjectAttributes};
@@ -48,6 +50,7 @@ pub fn run(assert: Assert) {
     coalescable_timer(assert, block, rsp, &call);
     adjust_groups(assert, block, rsp, &call);
     power_information(assert, block, rsp, &call);
+    reserve_objects(assert, block, rsp, &call);
     if let Some(region) = memory::find_region(block) {
         memory::release_private_region(&region);
     }
@@ -407,6 +410,46 @@ fn coalescable_timer(assert: Assert, block: u64, rsp: u64, call: Call) {
     assert(
         created == 0 && refused && period_refused && set && pending && expired && closed && event && mismatch,
         "userboot: NtSetTimerEx no ETIMER (recusas, TolerableDelay, PreviousState, espera no handle nativo e outro tipo)",
+    );
+}
+
+/// NtAllocateReserveObject e NtSetIoCompletionEx de modo usuário, como no
+/// 19041: tipo inválido; a reserva de conclusão tomada pelo envio, recusada
+/// em uso (STATUS_INVALID_PARAMETER_2) e devolvida pela retirada; o handle
+/// de reserva nulo é inválido no Nt.
+fn reserve_objects(assert: Assert, block: u64, rsp: u64, call: Call) {
+    let (reserve_cell, port_cell, key, context, iosb, raw) = (block + 0x800, block + 0x808, block + 0x810, block + 0x818, block + 0x820, block + 0x840);
+    let invalid = call("NtAllocateReserveObject", reserve_cell, 0, 2, 0);
+    let allocated = call("NtAllocateReserveObject", reserve_cell, 0, 1, 0);
+    let reserve = guest::read64(reserve_cell);
+    guest::write64(rsp + 0x28, 0);
+    let created = call("NtCreateIoCompletion", port_cell, 0x1F_0003, 0, 1);
+    let port = guest::read64(port_cell);
+    // KeyContext e ApcContext pelo frame bruto; IoStatus e
+    // IoStatusInformation na pilha.
+    let post = |reserve: u64, key: u64, context: u64| {
+        for (index, value) in [port, reserve, key, context].into_iter().enumerate() {
+            guest::write64(raw + 8 + index as u64 * 8, value);
+        }
+        guest::write64(rsp + 0x28, 0x77);
+        guest::write64(rsp + 0x30, 0x99);
+        state::with_syscall_record(state::SyscallRecord::raw(raw), || call("NtSetIoCompletionEx", port, reserve, key, context))
+    };
+    let posted = post(reserve, 0x11, 0x22);
+    let again = post(reserve, 0x33, 0x44);
+    let null_reserve = post(0, 0x33, 0x44);
+    let remove = || {
+        guest::write64(rsp + 0x28, 0);
+        call("NtRemoveIoCompletion", port, key, context, iosb)
+    };
+    let removed = remove();
+    let values = (guest::read64(key), guest::read64(context), guest::read32(iosb), guest::read64(iosb + 8));
+    let reposted = post(reserve, 0x55, 0x66);
+    let removed_again = remove();
+    let closed = [reserve, port].map(|handle| call("NtClose", handle, 0, 0, 0));
+    assert(
+        invalid == STATUS_INVALID_PARAMETER && allocated == 0 && reserve != 0 && created == 0 && posted == 0 && again == 0xC000_00F0 && null_reserve == 0xC000_0008 && removed == 0 && values == (0x11, 0x22, 0x77, 0x99) && reposted == 0 && removed_again == 0 && guest::read64(key) == 0x55 && closed == [0, 0],
+        "userboot: NtAllocateReserveObject e NtSetIoCompletionEx com a reserva de conclusao (em uso recusada, devolvida pela retirada; nula invalida)",
     );
 }
 
