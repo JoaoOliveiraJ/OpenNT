@@ -2632,7 +2632,10 @@ fn kernel_volume_devices(assert: Assert) {
     use crate::ntos::io::file::{information, zw as zw_files};
     use crate::ntos::ob::{close, object_manager as om};
     let device_node = om::lookup("\\Device\\KernelVolume0");
-    assert(device_node.is_some() && om::lookup("\\FS") == device_node && om::lookup("\\??\\C:") == device_node && device_node.and_then(om::node).is_some_and(|node| node.type_name == "Device"), "kvol: disco em memoria no dispositivo \\Device\\KernelVolume0 (\\FS e C:)");
+    // O C: é o disco em memória, menos no boot do smss, em que ele é o
+    // volume do sistema (o NTFS do \SystemRoot, o mesmo do D:).
+    let system_drive = if crate::ntos::init::boot_config::smss_boot() { om::lookup("\\??\\D:") } else { device_node };
+    assert(device_node.is_some() && om::lookup("\\FS") == device_node && system_drive.is_some() && om::lookup("\\??\\C:") == system_drive && device_node.and_then(om::node).is_some_and(|node| node.type_name == "Device"), "kvol: disco em memoria no dispositivo \\Device\\KernelVolume0 (\\FS e C:)");
     let real = volume_device::real_device(&memory_file_system::VOLUME).unwrap_or(0);
     if real == 0 {
         assert(false, "kvol: dispositivo real do disco em memoria");

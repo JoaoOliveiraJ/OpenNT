@@ -187,10 +187,14 @@ fn namespace() -> Result<(), crate::rtl::KernelError> {
         crate::ntos::ps::user::events::create_kernel_event(&alloc::format!("\\KernelObjects\\{name}"), 0, signaled)?;
     }
     // O disco em memória no seu dispositivo (\Device\KernelVolume0), o C:;
-    // \FS é o nome curto que os componentes do boot usam para ele.
+    // \FS é o nome curto que os componentes do boot usam para ele. No boot
+    // do smss o C: é o volume do sistema, o NTFS que tem o \Windows do
+    // \SystemRoot, e a fase 1 cria o link quando o monta.
     let memory = volume_device::mount(0, &memory_file_system::VOLUME)?;
     object_manager::create_symlink("\\FS", &memory)?;
-    object_manager::create_symlink("\\DosDevices\\C:", &memory)?;
+    if !crate::ntos::init::boot_config::smss_boot() {
+        object_manager::create_symlink("\\DosDevices\\C:", &memory)?;
+    }
     Ok(())
 }
 

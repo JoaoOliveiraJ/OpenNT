@@ -41,12 +41,23 @@ pub fn init() {
     }
     // NTFS no segundo disco IDE (ata-pio): o carregador de imagens e o
     // ZwCreateFile resolvem o mesmo volume, montado no dispositivo
-    // \Device\KernelVolume1 (o D:).
+    // \Device\KernelVolume1 (o D:). No boot do smss ele é também o C:, o
+    // volume do sistema (o \Windows do \SystemRoot): os caminhos C:\ que o
+    // modo usuário passa ao kernel (o \??\C:\WINDOWS\FONTS\X.TTF do
+    // AddFontResource que o win32k abre) chegam ao mesmo volume que o modo
+    // usuário abre por C:.
     if matches!(crate::drivers::storage::ata_pio::present(1), Ok(true)) {
         match crate::drivers::fs::ntfs::mount(1) {
             Ok(volume) => {
                 crate::drivers::fs::ntfs::set_mounted(Some(volume));
-                let mounted = crate::drivers::fs::ntfs::fixed().ok_or_else(|| crate::rtl::KernelError::new("NTFS sem volume")).and_then(|file_system| crate::drivers::fs::volume_device::mount(crate::drivers::fs::ntfs::DEVICE_INDEX, file_system)).and_then(|device| crate::ntos::ob::object_manager::create_symlink("\\DosDevices\\D:", &device));
+                let link_drives = |device: alloc::string::String| -> Result<(), crate::rtl::KernelError> {
+                    crate::ntos::ob::object_manager::create_symlink("\\DosDevices\\D:", &device)?;
+                    if crate::ntos::init::boot_config::smss_boot() {
+                        crate::ntos::ob::object_manager::create_symlink("\\DosDevices\\C:", &device)?;
+                    }
+                    Ok(())
+                };
+                let mounted = crate::drivers::fs::ntfs::fixed().ok_or_else(|| crate::rtl::KernelError::new("NTFS sem volume")).and_then(|file_system| crate::drivers::fs::volume_device::mount(crate::drivers::fs::ntfs::DEVICE_INDEX, file_system)).and_then(link_drives);
                 match mounted {
                     Ok(_) => debug_print!("[boot] NTFS montado em D:"),
                     Err(error) => {

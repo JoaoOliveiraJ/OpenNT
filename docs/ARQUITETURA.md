@@ -2980,7 +2980,10 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   file system embutido do kernel: o VPB aponta um dispositivo de volume
   FILE_DEVICE_DISK_FILE_SYSTEM (DRIVER_OBJECT `\FileSystem\KernelVolume`) e o
   IopMountInitializeVpb o marca montado. `\FS` e `\??\C:` levam ao
-  primeiro, `\??\D:` e `\SystemRoot` (`...\Windows`) ao segundo; o nó do
+  primeiro, `\??\D:` e `\SystemRoot` (`...\Windows`) ao segundo; no boot do
+  smss o `\??\C:` também leva ao segundo, o volume do sistema, que é o C:
+  dos caminhos do modo usuário (o win32k abre o `\??\C:\WINDOWS\FONTS\X.TTF`
+  que o AddFontResource lhe passa); o nó do
   dispositivo entrega o resto do nome ao volume (`object_manager::mount_device`),
   e os nomes das fontes de imagem saem do dispositivo (`ntfs::nt_path`).
   Todo FILE_OBJECT aberto num desses volumes (ZwCreateFile do kernel, as
