@@ -1703,7 +1703,11 @@ fn port_name(attributes: u64) -> Result<Option<String>, u32> {
     if parsed.path.is_empty() {
         return Ok(None);
     }
-    if !parsed.path.starts_with('\\') {
+    // Sem RootDirectory o nome precisa ser absoluto; com ele, o caminho vem
+    // do diretório raiz, inclusive o de um namespace privado (o caminho
+    // ancorado no diretório sem nome, que as buscas do namespace resolvem),
+    // como no ObpLookupObjectName do ObInsertObject.
+    if parsed.root_directory == 0 && !parsed.path.starts_with('\\') {
         return Err(STATUS_OBJECT_NAME_INVALID);
     }
     Ok(Some(parsed.path))

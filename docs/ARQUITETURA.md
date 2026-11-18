@@ -3838,7 +3838,9 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     NtAlpcConnectPortEx com o mesmo token (MAXIMUM_ALLOWED); a recusa é
     STATUS_SERVER_SID_MISMATCH;
   - a segurança da porta segue o ObInsertObject: uma porta com nome exige
-    DIRECTORY_CREATE_OBJECT no diretório pai; sem descritor no
+    DIRECTORY_CREATE_OBJECT no diretório pai (o nome relativo a um
+    RootDirectory vale, inclusive o diretório de um namespace privado, pelo
+    caminho ancorado nele, como nos outros tipos); sem descritor no
     OBJECT_ATTRIBUTES, recebe as ACEs herdáveis do pai (num `\RPC Control`,
     Everyone e RESTRICTED com PORT_CONNECT); a conexão de modo usuário passa
     pelo SeAccessCheck de PORT_CONNECT contra o descritor atual da porta
