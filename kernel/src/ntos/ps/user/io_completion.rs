@@ -207,7 +207,7 @@ pub fn remove_entry(entry: Arc<UserHandle>, port: Arc<Port>, timeout: u64, alert
             cleanup();
         }
     };
-    threads::wait_custom(Wait { entries: Some(entries), alertable: Some(alertable), poll: Some(Box::new(poll)), cleanup: Some(Box::new(cleanup)), ..Wait::default() }, timeout, timeout_ms)
+    threads::wait_custom(Wait { entries: Some(entries), alertable: Some(alertable), poll: Some(Box::new(poll)), cleanup: Some(Box::new(cleanup)), reason: Some(crate::ntos::ke::wait::reason::WR_QUEUE), ..Wait::default() }, timeout, timeout_ms)
 }
 
 /// NtRemoveIoCompletion(handle, key*, context*, iosb*, timeout*).
@@ -244,7 +244,7 @@ fn nt_remove_io_completion_ex(handle: u64, out: u64, count: u64, removed: u64, r
     let request = crate::ntos::io::completion::remove::begin(handle, out, count, removed, state::stack_arg(rsp, 5), state::stack_arg32(rsp, 6) as u8 != 0, 1, false, consumer)?;
     let request = Arc::new(crate::rtl::SpinLock::new(request));
     let (polled, cancelled) = (request.clone(), request);
-    Ok(threads::wait_custom(Wait { poll: Some(Box::new(move || polled.lock().poll())), cleanup: Some(Box::new(move |_status| cancelled.lock().cancel())), ..Wait::default() }, 0, Some(None)))
+    Ok(threads::wait_custom(Wait { poll: Some(Box::new(move || polled.lock().poll())), cleanup: Some(Box::new(move |_status| cancelled.lock().cancel())), reason: Some(crate::ntos::ke::wait::reason::WR_QUEUE), ..Wait::default() }, 0, Some(None)))
 }
 
 pub fn init() {

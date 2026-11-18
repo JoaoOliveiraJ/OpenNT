@@ -100,6 +100,22 @@ fn align(value: u64) -> u64 {
     value.div_ceil(8) * 8
 }
 
+/// O ThreadState de um registro: Running para quem consulta, o
+/// KTHREAD.State das threads do despacho, e Waiting/Ready pelo agendador de
+/// processos nas demais.
+fn thread_state(pointer: u64, current: u64, waiting: bool) -> u32 {
+    use crate::ntos::ke::thread_dispatch;
+    if pointer == current {
+        2
+    } else if thread_dispatch::owner(pointer).is_some() {
+        thread_dispatch::thread_state(pointer) as u32
+    } else if waiting {
+        5
+    } else {
+        1
+    }
+}
+
 pub fn snapshot() -> Result<Vec<ProcessRecord>, KernelError> {
     let user = sample_memory();
     let current = process::get_current_thread();
@@ -122,8 +138,13 @@ pub fn snapshot() -> Result<Vec<ProcessRecord>, KernelError> {
                 // SAFETY: idem.
                 base_priority: unsafe { Ethread::at(pointer) }.tcb.base_priority.get() as u8 as u32,
                 context_switches: record.context_switches,
-                state: if pointer == current { 2 } else if waiting { 5 } else { 1 },
-                wait_reason: 0,
+                // O ExpCopyThreadInfo: ThreadState e WaitReason da KTHREAD
+                // (o despacho mantém o State; as esperas gravam o motivo). A
+                // thread que consulta está rodando; uma thread sem registro
+                // no despacho cai no estado do agendador de processos.
+                state: thread_state(pointer, current, waiting),
+                // SAFETY: ETHREAD vivo da lista do processo.
+                wait_reason: unsafe { Ethread::at(pointer) }.tcb.wait_reason.get() as u32,
             });
         }
         let (parent_id, create_time, user_time, kernel_time, peak_threads) = process::with_record(active.address, |record| (record.parent_id, record.create_time, record.user_time, record.kernel_time, record.peak_threads)).unwrap_or_default();

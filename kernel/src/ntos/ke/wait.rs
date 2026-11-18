@@ -84,6 +84,7 @@ pub mod reason {
     pub const WR_FAST_MUTEX: u8 = 34;
     pub const WR_GUARDED_MUTEX: u8 = 35;
     pub const WR_RUNDOWN: u8 = 36;
+    pub const WR_ALERT_BY_THREAD_ID: u8 = 37;
 }
 
 /// KWAIT_BLOCK_STATE.
@@ -708,6 +709,23 @@ pub fn apc_queued(thread: u64, user_mode: bool, special: bool) {
     if wait.kernel_apcs && enabled {
         lock.unwait(thread, STATUS_KERNEL_APC as u64);
     }
+}
+
+/// Os campos de espera da KTHREAD numa espera de UserMode do despacho de
+/// usuário (o que o KiCommitThreadWait grava): WaitStatus zerado, WaitMode
+/// UserMode, Alertable, WaitReason e WaitTime. O State Waiting vem do
+/// despacho quando a thread deixa a CPU. O SystemProcessInformation e o kd
+/// leem o motivo daqui.
+pub fn publish_user_wait(thread: u64, reason: u8, alertable: bool) {
+    if thread == 0 {
+        return;
+    }
+    let target = kthread(thread);
+    target.wait_status.set(0);
+    target.wait_mode.set(1);
+    target.set_alertable(alertable as u32);
+    target.wait_reason.set(reason);
+    target.wait_time.set(thread_dispatch::tick_count());
 }
 
 /// `thread` tem uma espera registrada (diagnóstico e autotestes).

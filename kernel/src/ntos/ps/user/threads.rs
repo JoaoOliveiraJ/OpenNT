@@ -109,6 +109,31 @@ pub struct Wait {
     /// KernelMode alertável pelo alerta, a não alertável de KernelMode
     /// continua). As demais são esperas adiadas de serviços de UserMode.
     pub kernel: bool,
+    /// O KWAIT_REASON publicado na KTHREAD; `None` deriva da forma da
+    /// espera ([`wait_reason`]).
+    pub reason: Option<u8>,
+}
+
+/// O KWAIT_REASON de uma espera de usuário, como o 19041 passa ao
+/// KeWait*: WrAlertByThreadId no NtWaitForAlertByThreadId, DelayExecution
+/// no NtDelayExecution, WrQueue na espera de trabalho da worker factory,
+/// UserRequest nas esperas de objeto (ObWaitForMultipleObjects,
+/// NtWaitForSingleObject) e Executive nas demais.
+fn wait_reason(wait: &Wait) -> u8 {
+    use crate::ntos::ke::wait::reason;
+    if let Some(reason) = wait.reason {
+        reason
+    } else if wait.alert.is_some() {
+        reason::WR_ALERT_BY_THREAD_ID
+    } else if wait.delay {
+        reason::DELAY_EXECUTION
+    } else if wait.worker_factory != 0 {
+        reason::WR_QUEUE
+    } else if wait.entries.is_some() {
+        reason::USER_REQUEST
+    } else {
+        reason::EXECUTIVE
+    }
 }
 
 /// Onde está o fluxo de kernel da thread.
@@ -1112,6 +1137,11 @@ fn block_current(mut wait: Wait) {
     }
     let Some(current) = current() else { return };
     completion_objects::deactivate(current.pointer());
+    // A espera de kernel dentro de um serviço (`block_in_kernel`) já gravou
+    // os campos dela no KeWait*.
+    if !current.blocked_in_kernel() {
+        crate::ntos::ke::wait::publish_user_wait(current.pointer(), wait_reason(&wait), wait.alertable.unwrap_or(false));
+    }
     current.with(|thread| {
         thread.wait = Some(wait);
         thread.waiting = true;
