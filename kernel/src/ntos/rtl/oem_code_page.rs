@@ -5,9 +5,11 @@
 //! RtlxUnicodeStringToOemSize) e os dados NlsMbOemCodePageTag /
 //! NlsOemLeadByteInfo.
 //!
-//! A tabela é a c_437.nls real do volume (a página OEM de en-US, a mesma que o
-//! carregador NLS instala), decodificada por `ansi_code_page::parse` e pelas
-//! direções Unicode<->MB do `CodePage`. ntoskrnl 10.0.19045:
+//! A tabela é a da página OEM configurada (`Control\Nls\CodePage\OEMCP`, por
+//! `nls_configuration`; c_850.nls numa instalação pt-BR, c_437.nls sem a
+//! chave), a mesma que o carregador NLS instala, decodificada por
+//! `ansi_code_page::parse` e pelas direções Unicode<->MB do `CodePage`.
+//! ntoskrnl 10.0.19045:
 //!   RtlOemToUnicodeN 0x760380 (SBCS: min(Max/2, OemBytes) WCHARs, Bytes = 2*n,
 //!     STATUS_BUFFER_OVERFLOW se truncou)
 //!   RtlUnicodeStringToCountedOemString 0x678c40 (tamanho sem NUL; >0xFFFF ->
@@ -28,10 +30,9 @@ use crate::ntos::inc::types::{String as AnsiString, UnicodeString};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::{kernel_data, kernel_pool};
 use crate::ntos::rtl::ansi_code_page::{self, CodePage};
-use crate::ntos::rtl::unicode_case;
+use crate::ntos::rtl::{nls_configuration, unicode_case};
 use crate::rtl::{KernelError, SpinLock};
 
-pub const OEM_CODE_PAGE: u32 = 437;
 const STATUS_SUCCESS: u32 = 0;
 const STATUS_BUFFER_OVERFLOW: u32 = 0x8000_0005;
 const STATUS_NO_MEMORY: u32 = 0xC000_0017;
@@ -41,19 +42,40 @@ const STRING_POOL_TAG: u32 = 0x6772_7453; // 'Strg'
 
 static INSTALLED: SpinLock<Option<Arc<CodePage>>> = SpinLock::new(None);
 
-/// A página OEM instalada (C:\Windows\System32\c_437.nls); ausência é erro real.
+/// A página OEM instalada (o arquivo da página configurada em
+/// C:\Windows\System32, `nls_configuration::table_file`); ausência é erro
+/// real.
 pub fn oem() -> Result<Arc<CodePage>, KernelError> {
     if let Some(table) = INSTALLED.lock().clone() {
         return Ok(table);
     }
-    let path = alloc::format!("C:\\Windows\\System32\\c_{}.nls", OEM_CODE_PAGE);
+    let path = alloc::format!("C:\\Windows\\System32\\{}", nls_configuration::table_file(true));
     let file = crate::drivers::fs::volume_files::lookup_volume_file(&path).filter(|file| !file.directory()).ok_or_else(|| KernelError::new("NLS: installed OEM code page missing"))?;
     let table = Arc::new(ansi_code_page::parse(file.read_at(0, file.size())?)?);
-    if table.code_page != OEM_CODE_PAGE {
+    if table.code_page != nls_configuration::oem_code_page() {
         return Err(KernelError::new("NLS: installed OEM code page mismatch"));
     }
     *INSTALLED.lock() = Some(table.clone());
     Ok(table)
+}
+
+/// A página OEM configurada mudou: a tabela recarrega agora, e
+/// NlsOemCodePage e NlsMbOemCodePageTag passam a descrevê-la. Uma página
+/// OEM DBCS pediria o NlsOemLeadByteInfo apontando para a informação de
+/// iniciais da tabela; a célula continua na tabela zerada das páginas SBCS
+/// (a 437 e a 850 da instalação pt-BR), e a página DBCS fica registrada no
+/// log.
+pub fn reinstall() -> Result<(), KernelError> {
+    *INSTALLED.lock() = None;
+    let table = oem()?;
+    // SAFETY: as células USHORT e BOOLEAN da região de dados do kernel.
+    let (code_page, tag) = unsafe { (Field::<u16>::at(ansi_code_page::oem_code_page_address()), Field::<u8>::at(mb_oem_code_page_tag_address())) };
+    code_page.set(table.code_page as u16);
+    tag.set(table.double_byte as u8);
+    if table.double_byte {
+        crate::debug_print!("[nls] pagina OEM {} e DBCS: o NlsOemLeadByteInfo continua na tabela SBCS", table.code_page);
+    }
+    Ok(())
 }
 
 fn units_from_bytes(bytes: &[u8]) -> Vec<u16> {
@@ -349,7 +371,8 @@ pub fn upper_string(destination: &AnsiString, source: &AnsiString) -> Result<(),
     Ok(())
 }
 
-/// Célula de NlsMbOemCodePageTag (BOOLEAN; a página 437 é SBCS).
+/// Célula de NlsMbOemCodePageTag (BOOLEAN; FALSE numa página SBCS como a
+/// 437 ou a 850, gravado pelo [`reinstall`]).
 pub fn mb_oem_code_page_tag_address() -> u64 {
     kernel_data::address("NlsMbOemCodePageTag").unwrap_or_else(|error| panic!("NlsMbOemCodePageTag: {error}"))
 }

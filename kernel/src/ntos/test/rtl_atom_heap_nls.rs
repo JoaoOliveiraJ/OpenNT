@@ -379,7 +379,8 @@ fn code_pages(assert: Assert) {
         _ => None,
     };
     let (ansi, oem, tag) = (data("NlsAnsiCodePage"), data("NlsOemCodePage"), data("NlsMbCodePageTag"));
-    assert(ansi.is_some_and(|cell| guest::read16(cell) as u32 == nls_configuration::ANSI_CODE_PAGE) && oem.is_some_and(|cell| guest::read16(cell) as u32 == crate::ntos::rtl::oem_code_page::OEM_CODE_PAGE) && tag.is_some_and(|cell| guest::read8(cell) == 0), "nls: NlsAnsiCodePage = 1252, NlsOemCodePage = 437 e NlsMbCodePageTag = FALSE");
+    // A hive dos autotestes não tem `Control\Nls\CodePage`: 1252 e 437.
+    assert(ansi.is_some_and(|cell| guest::read16(cell) as u32 == nls_configuration::ansi_code_page()) && oem.is_some_and(|cell| guest::read16(cell) as u32 == nls_configuration::oem_code_page()) && tag.is_some_and(|cell| guest::read8(cell) == 0), "nls: NlsAnsiCodePage = 1252, NlsOemCodePage = 437 e NlsMbCodePageTag = FALSE");
     // O idioma da instalação como o `Control\Nls\Language` o guarda.
     {
         use crate::ntos::ps::locale::parse_language_id;
@@ -412,6 +413,51 @@ fn code_pages(assert: Assert) {
     let binary = status("RtlIntegerToChar", &[255, 2, 9, text]);
     assert(decimal == 0 && decimal_text == *b"123\0" && padded == 0 && padded_text == *b"00BEEF\x77" && base == STATUS_INVALID_PARAMETER && overflow == STATUS_BUFFER_OVERFLOW && binary == 0 && guest::read_bytes(text, 9) == *b"11111111\0", "nls: RtlIntegerToChar com base, preenchimento negativo, terminador e estouro");
     guest::free_bytes(scratch);
+}
+
+/// As páginas de `Control\Nls\CodePage` (o CmpFindNLSData do winload): com
+/// OEMCP 850, a tabela OEM instalada é a c_850.nls real (0xC7 -> U+00C3; na
+/// c_437 é U+255F, valores das duas tabelas reais) e NlsOemCodePage
+/// acompanha; sem a chave, as páginas voltam a 1252/437.
+fn registry_code_pages(assert: Assert) {
+    use crate::ntos::cm::registry;
+    use crate::ntos::rtl::{ansi_code_page, nls_configuration};
+    const CODE_PAGE: &str = "\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Nls\\CodePage";
+    let existing = registry::open(CODE_PAGE).unwrap_or(0);
+    if existing != 0 {
+        // Uma hive com a configuração da instalação: o teste não a troca.
+        registry::close_handle(existing);
+        crate::debug_print!("[nls] Control\\Nls\\CodePage presente: teste das paginas do Registro pulado");
+        return;
+    }
+    let key = registry::open_or_create(CODE_PAGE, None).unwrap_or(0);
+    let text = |value: &str| -> Vec<u8> { value.encode_utf16().chain([0]).flat_map(|unit| unit.to_le_bytes()).collect() };
+    for (name, value) in [("ACP", "1252"), ("OEMCP", "850"), ("1252", "c_1252.nls"), ("850", "c_850.nls")] {
+        registry::set_value(key, name, 1, text(value));
+    }
+    let scratch = guest::alloc_bytes(0x40);
+    let (source, output, written) = (scratch, scratch + 0x10, scratch + 0x20);
+    let oem_to_unicode = || {
+        guest::write_bytes(source, &[0xC7]);
+        guest::write_bytes(output, &[0, 0]);
+        let converted = status("RtlOemToUnicodeN", &[output, 2, written, source, 1]);
+        (converted, guest::read16(output))
+    };
+    nls_configuration::initialize_code_pages_from_registry();
+    let configured = (nls_configuration::ansi_code_page(), nls_configuration::oem_code_page(), nls_configuration::table_file(true));
+    let cells = (guest::read16(ansi_code_page::ansi_code_page_address()), guest::read16(ansi_code_page::oem_code_page_address()));
+    let (converted, unit) = oem_to_unicode();
+    // Sem a chave, de volta a 1252/437 e às tabelas de antes.
+    registry::delete_key(key);
+    registry::close_handle(key);
+    nls_configuration::initialize_code_pages_from_registry();
+    let restored = (nls_configuration::ansi_code_page(), nls_configuration::oem_code_page(), nls_configuration::table_file(true));
+    let restored_cell = guest::read16(ansi_code_page::oem_code_page_address());
+    let (back, back_unit) = oem_to_unicode();
+    guest::free_bytes(scratch);
+    assert(key != 0 && configured.0 == 1252 && configured.1 == 850 && configured.2 == "c_850.nls" && cells == (1252, 850), "nls: ACP/OEMCP de Control\\Nls\\CodePage e NlsOemCodePage = 850");
+    assert(converted == STATUS_SUCCESS && unit == 0x00C3, "nls: RtlOemToUnicodeN pela c_850.nls (0xC7 -> U+00C3)");
+    assert(restored.0 == 1252 && restored.1 == 437 && restored.2 == "c_437.nls" && restored_cell == 437 && back == STATUS_SUCCESS && back_unit == 0x255F, "nls: sem a chave, de volta a 1252/437 (0xC7 -> U+255F)");
 }
 
 /// Tabela DBCS sintética no formato c_<página>.nls: página 9999, inicial
@@ -627,6 +673,7 @@ pub fn run(assert: Assert) {
     nt_heap(assert);
     raised_exceptions(assert);
     code_pages(assert);
+    registry_code_pages(assert);
     custom_code_pages(assert);
     system_state(assert);
     crt_sqrtf(assert);

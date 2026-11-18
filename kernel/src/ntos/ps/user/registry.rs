@@ -85,8 +85,10 @@ fn utf16_bytes(text: &str) -> Vec<u8> {
     text.encode_utf16().chain([0]).flat_map(|unit| unit.to_le_bytes()).collect()
 }
 
-/// Seed dos valores reais que o loader lê; as páginas de código batem com
-/// os NLS mapeados (1252/437).
+/// Seed dos valores reais que o loader lê. As páginas de código não entram:
+/// `Control\Nls\CodePage` é dado da instalação (a hive SYSTEM do boot do
+/// smss o traz do xtask), e o kernel segue o que estiver lá
+/// (`rtl/nls_configuration`).
 pub fn seed_registry_for_user_mode() -> Result<(), KernelError> {
     let set_sz = |handle: u32, name: &str, text: &str| registry::set_value(handle, name, 1, utf16_bytes(text));
     let set_dword = |handle: u32, name: &str, value: u32| registry::set_value(handle, name, 4, value.to_le_bytes().to_vec());
@@ -95,11 +97,6 @@ pub fn seed_registry_for_user_mode() -> Result<(), KernelError> {
         data.extend_from_slice(&[0, 0]);
         registry::set_value(handle, name, 7, data)
     };
-    let code_page = registry::open_or_create("\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Nls\\CodePage", None)?;
-    set_sz(code_page, "ACP", "1252");
-    set_sz(code_page, "OEMCP", "437");
-    set_sz(code_page, "MACCP", "10000");
-    set_sz(code_page, "OEMHAL", "vgaoem.fon");
     let session_manager = registry::open_or_create("\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Session Manager", None)?;
     set_dword(session_manager, "SafeMode", 0);
     // No boot do processo inicial real, o smss lê a configuração do Session
@@ -127,7 +124,7 @@ pub fn seed_registry_for_user_mode() -> Result<(), KernelError> {
     computer_name::initialize()?;
     // Image File Execution Options existe, vazia.
     registry::open_or_create("\\Registry\\Machine\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options", None)?;
-    debug_print!("[usermode] registry seedada (NLS/SessionManager/KnownDlls/SegmentHeap/ProductOptions/IFEO)");
+    debug_print!("[usermode] registry seedada (SessionManager/KnownDlls/SegmentHeap/ProductOptions/IFEO)");
     Ok(())
 }
 

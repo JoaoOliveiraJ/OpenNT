@@ -990,10 +990,13 @@ fn user_registry(assert: Assert) {
     use crate::ntos::cm::key::services as key_services;
     use crate::ntos::cm::registry;
     use crate::ntos::ps::user::{memory, registry as user_registry};
+    // `Control\Nls\CodePage` é dado da instalação: o seed não o cria nem o
+    // troca (ausente na hive dos autotestes).
+    let acp_before = registry::read_value_by_path("\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Nls\\CodePage", "ACP");
     assert(user_registry::seed_registry_for_user_mode().is_ok(), "userregistry: seed dos valores lidos pelo loader");
     let acp = registry::read_value_by_path("\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Nls\\CodePage", "ACP");
     let known = registry::read_value_by_path("\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Session Manager\\KnownDlls", "KnownDlls");
-    assert(acp.is_some_and(|value| value.value_type == 1 && value.data == [b'1', 0, b'2', 0, b'5', 0, b'2', 0, 0, 0]) && known.is_some_and(|value| value.value_type == 7 && value.data.ends_with(&[0, 0, 0, 0])), "userregistry: ACP REG_SZ e KnownDlls REG_MULTI_SZ");
+    assert(acp == acp_before && known.is_some_and(|value| value.value_type == 7 && value.data.ends_with(&[0, 0, 0, 0])), "userregistry: CodePage intocado pelo seed e KnownDlls REG_MULTI_SZ");
     // OBJECT_ATTRIBUTES e UNICODE_STRING em memória de usuário.
     let Ok(block) = memory::map_user_region(0x1000) else {
         assert(false, "userregistry: memoria de usuario para os parametros");

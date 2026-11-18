@@ -122,19 +122,33 @@ impl CodePage {
 
 static INSTALLED: SpinLock<Option<Arc<CodePage>>> = SpinLock::new(None);
 
-/// A tabela instalada (C:\Windows\System32\c_<página>.nls no volume do sistema).
+/// A tabela instalada: o arquivo da página ANSI configurada
+/// (`nls_configuration::table_file`, c_<página>.nls) em
+/// C:\Windows\System32 no volume do sistema.
 pub fn current() -> Result<Arc<CodePage>, KernelError> {
     if let Some(table) = INSTALLED.lock().clone() {
         return Ok(table);
     }
-    let path = alloc::format!("C:\\Windows\\System32\\c_{}.nls", nls_configuration::ANSI_CODE_PAGE);
+    let path = alloc::format!("C:\\Windows\\System32\\{}", nls_configuration::table_file(false));
     let file = crate::drivers::fs::volume_files::lookup_volume_file(&path).filter(|file| !file.directory()).ok_or_else(|| KernelError::new("NLS: installed ANSI code page missing"))?;
     let table = Arc::new(parse(file.read_at(0, file.size())?)?);
-    if table.code_page != nls_configuration::ANSI_CODE_PAGE {
+    if table.code_page != nls_configuration::ansi_code_page() {
         return Err(KernelError::new("NLS: installed ANSI code page mismatch"));
     }
     *INSTALLED.lock() = Some(table.clone());
     Ok(table)
+}
+
+/// A página ANSI configurada mudou: a tabela recarrega agora, e
+/// NlsAnsiCodePage e NlsMbCodePageTag passam a descrevê-la.
+pub fn reinstall() -> Result<(), KernelError> {
+    *INSTALLED.lock() = None;
+    let table = current()?;
+    // SAFETY: as células USHORT e BOOLEAN da região de dados do kernel.
+    let (code_page, tag) = unsafe { (crate::ntos::inc::field::Field::<u16>::at(ansi_code_page_address()), crate::ntos::inc::field::Field::<u8>::at(mb_code_page_tag_address())) };
+    code_page.set(table.code_page as u16);
+    tag.set(table.double_byte as u8);
+    Ok(())
 }
 
 /// RtlAnsiStringToUnicodeString pela página instalada.
@@ -215,10 +229,12 @@ impl CodePage {
 
 // ---- NlsAnsiCodePage / NlsOemCodePage / NlsMbCodePageTag ------------------
 //
-// Os dados exportados que descrevem as páginas instaladas: USHORT 1252
-// (nls_configuration::ANSI_CODE_PAGE), USHORT 437 (oem_code_page::
-// OEM_CODE_PAGE) e o BOOLEAN NlsMbCodePageTag (FALSE: a 1252 é SBCS). Os
-// valores iniciais moram em `mm/kernel_data_layout`.
+// Os dados exportados que descrevem as páginas instaladas: o USHORT da
+// página ANSI, o USHORT da página OEM e o BOOLEAN NlsMbCodePageTag (FALSE
+// numa página SBCS como a 1252). Os valores iniciais (1252, 437, FALSE)
+// moram em `mm/kernel_data_layout`; `Control\Nls\CodePage` os troca no boot
+// (`nls_configuration::initialize_code_pages_from_registry`, pelo
+// [`reinstall`] daqui e o do `oem_code_page`).
 
 fn data_cell(name: &str) -> u64 {
     crate::ntos::mm::kernel_data::address(name).unwrap_or_else(|error| panic!("{name}: {error}"))

@@ -5,12 +5,17 @@
 //! não tem `.mui` nele, os do idioma de fallback, como o en-US).
 //!
 //! As chaves vêm inteiras, com os valores e os tipos como estão aqui:
-//! - na SYSTEM, `Control\Nls\Language` (o `Default`, que o kernel lê como
-//!   PsDefaultSystemLocaleId, e o `InstallLanguage`, o
-//!   PsInstallUILanguageId), `Control\MUI\UILanguages` (os idiomas de
-//!   interface instalados, que a ntdll consulta ao procurar um `.mui`),
-//!   `Control\Keyboard Layouts` (os layouts de teclado instalados, com o
-//!   `Layout File` de cada um) e `Control\Keyboard Layout`;
+//! - na SYSTEM, `Control\Nls` inteira, como a instalação a deixa
+//!   ([`clean_install_nls`] desfaz o que se troca depois dela): `Language`
+//!   (o `Default`, que o kernel lê como PsDefaultSystemLocaleId, e o
+//!   `InstallLanguage`, o PsInstallUILanguageId), `CodePage` (ACP, OEMCP,
+//!   MACCP, OEMHAL e o arquivo de cada página, de onde o kernel tira as
+//!   tabelas ANSI e OEM), `Locale`, `Language Groups`, `Sorting` (`Ids` e
+//!   `Versions`), `Normalization` (o arquivo de cada forma, que o
+//!   NtGetNlsSectionPtr lê) e `Calendars`; `Control\MUI\UILanguages` (os
+//!   idiomas de interface instalados, que a ntdll consulta ao procurar um
+//!   `.mui`), `Control\Keyboard Layouts` (os layouts de teclado instalados,
+//!   com o `Layout File` de cada um) e `Control\Keyboard Layout`;
 //! - na DEFAULT (`\Registry\User\.DEFAULT`), `Control Panel\International`,
 //!   `Control Panel\Desktop\MuiCached` (a localidade e os idiomas de
 //!   interface preferidos do perfil do sistema) e `Keyboard Layout` (o
@@ -270,6 +275,102 @@ pub(crate) mod region {
     }
 }
 
+/// As páginas padrão de um idioma que a instalação grava em `CodePage`: o
+/// valor e o LCTYPE do GetLocaleInfoW (LOCALE_IDEFAULTANSICODEPAGE,
+/// LOCALE_IDEFAULTCODEPAGE, que é a OEM, e LOCALE_IDEFAULTMACCODEPAGE).
+#[cfg(windows)]
+const DEFAULT_CODE_PAGES: [(&str, u32); 3] = [("ACP", 0x1004), ("OEMCP", 0x000B), ("MACCP", 0x1011)];
+
+/// O dado `lc_type` da localidade `lcid` (GetLocaleInfoW com
+/// LOCALE_NOUSEROVERRIDE: o padrão da localidade, sem as personalizações do
+/// usuário desta máquina), sem o NUL.
+#[cfg(windows)]
+fn locale_info(lcid: u32, lc_type: u32) -> Option<String> {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetLocaleInfoW(locale: u32, lc_type: u32, data: *mut u16, length: i32) -> i32;
+    }
+    const LOCALE_NOUSEROVERRIDE: u32 = 0x8000_0000;
+    let mut buffer = [0u16; 32];
+    // SAFETY: buffer com o comprimento passado, em caracteres.
+    let written = unsafe { GetLocaleInfoW(lcid, lc_type | LOCALE_NOUSEROVERRIDE, buffer.as_mut_ptr(), buffer.len() as i32) };
+    (written > 1).then(|| String::from_utf16_lossy(&buffer[..written as usize - 1]))
+}
+
+/// O texto de um valor REG_SZ ou REG_EXPAND_SZ de `key`, até o primeiro NUL.
+#[cfg(windows)]
+fn text_value(key: &HostKey, name: &str) -> Option<String> {
+    key.values.iter().find(|(value, kind, _)| value.eq_ignore_ascii_case(name) && matches!(kind, 1 | 2)).map(|(_, _, data)| {
+        let units: Vec<u16> = data.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).take_while(|&unit| unit != 0).collect();
+        String::from_utf16_lossy(&units)
+    })
+}
+
+/// Grava o valor REG_SZ `name` de `key` (UTF-16 com o NUL).
+#[cfg(windows)]
+fn set_text(key: &mut HostKey, name: &str, text: &str) {
+    let data: Vec<u8> = text.encode_utf16().chain([0]).flat_map(|unit| unit.to_le_bytes()).collect();
+    match key.values.iter_mut().find(|(value, _, _)| value.eq_ignore_ascii_case(name)) {
+        Some(slot) => {
+            slot.1 = 1;
+            slot.2 = data;
+        }
+        None => key.values.push((String::from(name), 1, data)),
+    }
+}
+
+/// `Control\Nls` como uma instalação nova a deixa, sobre a cópia desta
+/// máquina (`keys`, as chaves de `nls` para baixo). O que se troca depois
+/// da instalação volta ao padrão dela:
+/// - `CustomLocale` e `ExtendedLocale` ficam sem valores (são as
+///   localidades que o usuário instala; vazias numa instalação nova);
+/// - a localidade do sistema (`Language\Default` e o valor padrão de
+///   `Locale`) é o idioma da instalação (`Language\InstallLanguage`), e
+///   ACP, OEMCP e MACCP de `CodePage` são as páginas padrão desse idioma,
+///   quando `CodePage` tem o arquivo delas: o "idioma para programas não
+///   Unicode" e a opção beta de UTF-8 (65001) do intl.cpl trocam esses
+///   valores. Numa instalação pt-BR: 0416, ACP 1252, OEMCP 850, MACCP 10000.
+#[cfg(windows)]
+fn clean_install_nls(keys: &mut [HostKey], nls: &str) {
+    let path = |leaf: &str| format!("{nls}\\{leaf}");
+    let (custom, extended) = (path("CustomLocale"), path("ExtendedLocale"));
+    for key in keys.iter_mut().filter(|key| key.path.eq_ignore_ascii_case(&custom) || key.path.eq_ignore_ascii_case(&extended)) {
+        key.values.clear();
+    }
+    let language_path = path("Language");
+    let Some(install) = keys.iter().find(|key| key.path.eq_ignore_ascii_case(&language_path)).and_then(|key| text_value(key, "InstallLanguage")) else { return };
+    let install = install.trim().to_string();
+    let Ok(lcid) = u32::from_str_radix(&install, 16) else { return };
+    let is_install = |text: Option<String>| text.and_then(|text| u32::from_str_radix(text.trim(), 16).ok()) == Some(lcid);
+    if let Some(language) = keys.iter_mut().find(|key| key.path.eq_ignore_ascii_case(&language_path)) {
+        if !is_install(text_value(language, "Default")) {
+            println!("Control\\Nls\\Language: Default de volta ao idioma da instalacao ({install})");
+            set_text(language, "Default", &install);
+        }
+    }
+    let locale_path = path("Locale");
+    if let Some(locale) = keys.iter_mut().find(|key| key.path.eq_ignore_ascii_case(&locale_path)) {
+        if !is_install(text_value(locale, "")) {
+            println!("Control\\Nls\\Locale: padrao de volta ao idioma da instalacao ({lcid:08x})");
+            set_text(locale, "", &format!("{lcid:08x}"));
+        }
+    }
+    let code_page_path = path("CodePage");
+    if let Some(code_page) = keys.iter_mut().find(|key| key.path.eq_ignore_ascii_case(&code_page_path)) {
+        for (name, lc_type) in DEFAULT_CODE_PAGES {
+            let Some(default) = locale_info(lcid, lc_type).filter(|page| page.as_str() != "0") else { continue };
+            if text_value(code_page, &default).is_none() {
+                continue;
+            }
+            let current = text_value(code_page, name);
+            if current.as_deref().map(str::trim) != Some(default.as_str()) {
+                println!("Control\\Nls\\CodePage: {name} {} -> {default} (o padrao do idioma da instalacao {install})", current.unwrap_or_default());
+                set_text(code_page, name, &default);
+            }
+        }
+    }
+}
+
 /// As chaves de idioma da SYSTEM, já no conjunto de controle que a hive
 /// guarda (`control_set`, como `ControlSet001`).
 pub fn system_keys(control_set: &str) -> Vec<HostKey> {
@@ -277,7 +378,12 @@ pub fn system_keys(control_set: &str) -> Vec<HostKey> {
     #[cfg(windows)]
     {
         let control = "SYSTEM\\CurrentControlSet\\Control";
-        registry::copy(registry::LOCAL_MACHINE, &format!("{control}\\Nls\\Language"), &format!("{control_set}\\Control\\Nls\\Language"), false, &mut keys);
+        // `Control\Nls` inteira, com o que se troca depois da instalação de
+        // volta ao padrão dela ([`clean_install_nls`]).
+        let nls = format!("{control_set}\\Control\\Nls");
+        let first = keys.len();
+        registry::copy(registry::LOCAL_MACHINE, &format!("{control}\\Nls"), &nls, true, &mut keys);
+        clean_install_nls(&mut keys[first..], &nls);
         registry::copy(registry::LOCAL_MACHINE, &format!("{control}\\MUI\\UILanguages"), &format!("{control_set}\\Control\\MUI\\UILanguages"), true, &mut keys);
         registry::copy(registry::LOCAL_MACHINE, &format!("{control}\\Keyboard Layouts"), &format!("{control_set}\\Control\\Keyboard Layouts"), true, &mut keys);
         registry::copy(registry::LOCAL_MACHINE, &format!("{control}\\Keyboard Layout"), &format!("{control_set}\\Control\\Keyboard Layout"), true, &mut keys);
@@ -409,7 +515,40 @@ pub fn mui_files(directory: &Path, name: &str, languages: &[String], fallbacks: 
 
 #[cfg(all(test, windows))]
 mod tests {
-    use super::{default_keys, keyboard_layout_files, registry, system_keys};
+    use super::{default_keys, keyboard_layout_files, registry, system_keys, text_value, HostKey};
+
+    /// A chave `Control\Nls\<leaf>` copiada para o ControlSet001.
+    fn nls_key<'a>(keys: &'a [HostKey], leaf: &str) -> Option<&'a HostKey> {
+        let path = format!("ControlSet001\\Control\\Nls\\{leaf}");
+        keys.iter().find(|key| key.path.eq_ignore_ascii_case(&path))
+    }
+
+    /// `Control\Nls` vai inteira: ACP e OEMCP de `CodePage` nomeiam valores
+    /// `CodePage\<página>` cujos arquivos estão em System32, com
+    /// `Sorting\Versions` e `Normalization`; CustomLocale e ExtendedLocale vão
+    /// sem valores, e a localidade do sistema é o idioma da instalação.
+    #[test]
+    fn nls_tree_is_copied_as_a_clean_install() {
+        let keys = system_keys("ControlSet001");
+        let Some(code_page) = nls_key(&keys, "CodePage") else {
+            assert!(registry::list(registry::LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Control\\Nls").is_empty(), "Control\\Nls\\CodePage nao copiada");
+            return;
+        };
+        let system32 = crate::windows_binaries::windows_directory().join("System32");
+        for selector in ["ACP", "OEMCP"] {
+            let page = text_value(code_page, selector).unwrap_or_else(|| panic!("CodePage sem {selector}"));
+            let file = text_value(code_page, page.trim()).unwrap_or_else(|| panic!("CodePage sem o arquivo da pagina {page}"));
+            assert!(system32.join(&file).is_file(), "{file} (pagina {page}) ausente em System32");
+        }
+        assert!(nls_key(&keys, "Sorting\\Versions").is_some_and(|key| text_value(key, "").is_some()), "Sorting\\Versions nao copiada");
+        assert!(nls_key(&keys, "Normalization").is_some_and(|key| !key.values.is_empty()), "Normalization nao copiada");
+        for leaf in ["CustomLocale", "ExtendedLocale"] {
+            assert!(nls_key(&keys, leaf).is_none_or(|key| key.values.is_empty()), "{leaf} com valores");
+        }
+        let language = nls_key(&keys, "Language").expect("Nls\\Language nao copiada");
+        let lcid = |text: Option<String>| text.and_then(|text| u32::from_str_radix(text.trim(), 16).ok());
+        assert_eq!(lcid(text_value(language, "Default")), lcid(text_value(language, "InstallLanguage")), "Language\\Default diferente do idioma da instalacao");
+    }
 
     /// Os layouts pré-carregados desta máquina resolvem para arquivos de
     /// System32, e as chaves copiadas levam o Preload e o layout dele.

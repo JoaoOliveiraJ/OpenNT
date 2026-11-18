@@ -232,6 +232,10 @@ pub fn initialize_hives() -> Result<(), KernelError> {
     // (a entrada do CmControlVector que enche o buffer primário do
     // licenciamento, o ExpHostBootLicensingData).
     crate::ntos::ps::locale::initialize_from_registry();
+    // As páginas ANSI e OEM de `Control\Nls\CodePage`, como o CmpFindNLSData
+    // do winload as escolhe, antes do primeiro processo de usuário (o PEB as
+    // recebe do `ps/user/loader::ensure_nls_data`).
+    crate::ntos::rtl::nls_configuration::initialize_code_pages_from_registry();
     crate::ntos::ex::system_information::initialize_control_values();
     crate::ntos::ex::license::values::init();
     // A lista de hives existe a partir daqui (CmpHiveFileListHandle): as

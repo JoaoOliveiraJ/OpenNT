@@ -349,9 +349,11 @@ fn map_system_api_set_schema() -> Result<(), KernelError> {
     Ok(())
 }
 
-/// Dados NLS reais (C_1252/C_437/l_intl.nls), nas mesmas VAs em todo
-/// processo: o RtlInitNlsTables da ntdll os lê pelo PEB. Mapeados na raiz
-/// do System e fotografados para as cópias de cada processo.
+/// Dados NLS reais (as tabelas das páginas ANSI e OEM configuradas, como
+/// C_1252/C_850, e l_intl.nls), nas mesmas VAs em todo processo: o
+/// RtlInitNlsTables da ntdll os lê pelo PEB. Mapeados na raiz do System e
+/// fotografados para as cópias de cada processo. O xtask põe cada c_*.nls
+/// na raiz do volume com o nome em maiúsculas.
 pub fn ensure_nls_data() -> Result<state::NlsVas, KernelError> {
     if let Some(vas) = state::with(|state| state.nls_vas) {
         return Ok(vas);
@@ -362,7 +364,9 @@ pub fn ensure_nls_data() -> Result<state::NlsVas, KernelError> {
 fn map_system_nls_data() -> Result<state::NlsVas, KernelError> {
     let volume = require_volume("dados NLS")?;
     state::with(|state| state.nls_vas = Some(state::NlsVas::default()));
-    for (path, key, name) in [("/C_1252.NLS", 0, "nls-ansi"), ("/C_437.NLS", 1, "nls-oem"), ("/L_INTL.NLS", 2, "nls-unicode")] {
+    let table = |oem: bool| alloc::format!("/{}", crate::ntos::rtl::nls_configuration::table_file(oem).to_uppercase());
+    for (path, key, name) in [(table(false), 0, "nls-ansi"), (table(true), 1, "nls-oem"), (String::from("/L_INTL.NLS"), 2, "nls-unicode")] {
+        let path = path.as_str();
         let bytes = volume.read_bytes(path)?.ok_or_else(|| KernelError::new(alloc::format!("{path} ausente no volume")))?;
         let size = (bytes.len() as u64).div_ceil(0x1000) * 0x1000;
         let va = memory::map_shared_user_region(size)?;

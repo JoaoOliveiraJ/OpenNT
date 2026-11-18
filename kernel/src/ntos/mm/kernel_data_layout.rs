@@ -105,11 +105,14 @@ pub const DEFINITIONS: &[KernelDataEntry] = &[
     pointer("TmTransactionObjectType"),
     pointer("TmResourceManagerObjectType"),
     pointer("TmEnlistmentObjectType"),
-    // Página OEM 437 (SBCS): NlsMbOemCodePageTag = FALSE e NlsOemLeadByteInfo
-    // aponta para os 512 bytes zerados guardados logo depois da célula.
+    // Os valores iniciais, antes da leitura da hive SYSTEM: página OEM 437
+    // (SBCS), NlsMbOemCodePageTag = FALSE e NlsOemLeadByteInfo aponta para
+    // os 512 bytes zerados guardados logo depois da célula. O
+    // `Control\Nls\CodePage` da instalação troca as páginas e as tags no boot
+    // (`rtl/nls_configuration::initialize_code_pages_from_registry`).
     KernelDataEntry { name: "NlsMbOemCodePageTag", size: 1, storage_size: 1, alignment: 1, initial: &[0] },
     KernelDataEntry { name: "NlsOemLeadByteInfo", size: 8, storage_size: 8 + 512, alignment: 8, initial: ZERO8 },
-    // As páginas instaladas: USHORT NlsAnsiCodePage = 1252, USHORT
+    // As páginas iniciais: USHORT NlsAnsiCodePage = 1252, USHORT
     // NlsOemCodePage = 437 e BOOLEAN NlsMbCodePageTag = FALSE (1252 é SBCS).
     KernelDataEntry { name: "NlsAnsiCodePage", size: 2, storage_size: 2, alignment: 2, initial: &[0xE4, 0x04] },
     KernelDataEntry { name: "NlsOemCodePage", size: 2, storage_size: 2, alignment: 2, initial: &[0xB5, 0x01] },
