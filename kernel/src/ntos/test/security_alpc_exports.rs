@@ -517,6 +517,75 @@ fn alpc_kernel_new_messages(assert: Assert) {
     guest::free_bytes(block);
 }
 
+/// A recepção comum que acha a fila vazia, como o AlpcpReceiveMessagePort do
+/// 19041: a porta esperável fora do modo LPC (o WAITABLE_PORT do
+/// ZwAlpcCreatePort, como as do CoreMessaging) volta STATUS_UNSUCCESSFUL
+/// sem esperar, com prazo zero e sem prazo; a esperável do modo LPC (a do
+/// NtCreateWaitablePort) espera no semáforo, e o prazo zero dá
+/// STATUS_TIMEOUT; uma porta comum com objeto Callback (o
+/// NtAlpcSetInformation 9) volta STATUS_TIMEOUT sem esperar.
+fn alpc_kernel_empty_receive(assert: Assert) {
+    let block = guest::alloc_bytes(0x800);
+    guest::write_bytes(block, &[0; 0x800]);
+    let (handles, port_attributes, timeout, length, receive, information) = (block + 0x300, block + 0x340, block + 0x3A0, block + 0x3A8, block + 0x400, block + 0x700);
+    let receive_on = |port: u64, timeout: u64| {
+        guest::write64(length, 0x200);
+        status("ZwAlpcSendWaitReceivePort", &[port, 0, 0, 0, receive, length, 0, timeout])
+    };
+    let empty_rule = |handle: u64| match crate::ntos::alpc::port_reference::reference(handle, 0, 0) {
+        Ok(Ok(mut reference)) => {
+            let rule = reference.port.empty_receive_status();
+            let _ = reference.release();
+            rule
+        }
+        _ => Some(u32::MAX),
+    };
+    let requested = at::<nt::AlpcPortAttributes>(port_attributes);
+    requested.flags.set(0x4_0000);
+    requested.max_message_length.set(0x200);
+    let attributes = super::phase6::object_attributes_for(block, "\\OpenNtAlpcEmptyWaitable", 0x200);
+    let waitable_created = status("ZwAlpcCreatePort", &[handles, attributes, port_attributes]);
+    let waitable = guest::read64(handles);
+    let waitable_zero = receive_on(waitable, timeout);
+    // Sem prazo só depois de o prazo zero mostrar que a recepção não espera.
+    let waitable_infinite = if waitable_zero == 0xC000_0001 { receive_on(waitable, 0) } else { u32::MAX };
+    assert(
+        waitable_created == 0 && waitable != 0 && waitable_zero == 0xC000_0001 && waitable_infinite == 0xC000_0001,
+        "alpc-vazia: a porta esperavel fora do modo LPC volta STATUS_UNSUCCESSFUL sem esperar",
+    );
+    let attributes = super::phase6::object_attributes_for(block, "\\OpenNtAlpcEmptyLpc", 0x200);
+    let lpc_created = crate::ntos::alpc::server::create_legacy_port(handles, attributes, 0x100, true, 0).unwrap_or(u32::MAX);
+    let lpc = guest::read64(handles);
+    let lpc_rule = empty_rule(lpc);
+    let lpc_zero = receive_on(lpc, timeout);
+    assert(lpc_created == 0 && lpc != 0 && lpc_rule.is_none() && lpc_zero == 0x102, "alpc-vazia: a porta esperavel do modo LPC espera no semaforo (prazo zero = STATUS_TIMEOUT)");
+    requested.flags.set(0);
+    let attributes = super::phase6::object_attributes_for(block, "\\OpenNtAlpcEmptyCallback", 0x200);
+    let callback_created = status("ZwAlpcCreatePort", &[handles, attributes, port_attributes]);
+    let callback_port = guest::read64(handles);
+    let common_rule = empty_rule(callback_port);
+    let registered = match crate::ntos::ex::callbacks::create_internal(false) {
+        Ok(object) => {
+            guest::write64(information, object);
+            guest::write64(information + 8, 0);
+            let registered = status("ZwAlpcSetInformation", &[callback_port, 9, information, 16]);
+            let _ = crate::ntos::ex::callbacks::dereference(object);
+            registered
+        }
+        Err(_) => u32::MAX,
+    };
+    let callback_rule = empty_rule(callback_port);
+    let callback_infinite = if callback_rule == Some(0x102) { receive_on(callback_port, 0) } else { u32::MAX };
+    assert(
+        callback_created == 0 && common_rule.is_none() && registered == 0 && callback_rule == Some(0x102) && callback_infinite == 0x102,
+        "alpc-vazia: a porta com objeto Callback volta STATUS_TIMEOUT sem esperar",
+    );
+    for handle in [waitable, lpc, callback_port] {
+        let _ = call("ZwClose", &[handle]);
+    }
+    guest::free_bytes(block);
+}
+
 // ---- Rastro LRPC (--trace-rpc) ---------------------------------------------------
 
 /// O rastro do `--trace-rpc` decodifica as mensagens LRPC como o rpcrt4 19041
@@ -605,5 +674,6 @@ pub fn run(assert: Assert) {
     nt_set_security_object(assert);
     alpc_kernel_security(assert);
     alpc_kernel_new_messages(assert);
+    alpc_kernel_empty_receive(assert);
     lrpc_trace_decoding(assert);
 }

@@ -259,6 +259,34 @@ impl Port {
             let _ = crate::ntos::ke::dispatcher::release_semaphore(semaphore, 1);
         }
     }
+    /// A recepção comum (sem resposta síncrona nem mensagem direta) que acha
+    /// as filas desta porta vazias, como no AlpcpReceiveMessagePort do 19041
+    /// (0x5e8cd4..0x5e8d0e): `Some` com o status que volta sem esperar,
+    /// `None` quando a thread espera a próxima mensagem.
+    ///
+    /// - Com uma IOCP associada (ALPC_PORT.CompletionPort):
+    ///   STATUS_UNSUCCESSFUL.
+    /// - Numa porta esperável (u1.State.Waitable): no modo LPC
+    ///   (ALPC_PORFLG_LPC_MODE, a NtCreateWaitablePort) a espera é no
+    ///   semáforo da porta; sem ele (o WAITABLE_PORT do NtAlpcCreatePort e do
+    ///   NtAlpcConnectPort), STATUS_UNSUCCESSFUL. O CoreMessaging espera pelo
+    ///   handle da porta e depois recebe até esse status, sem prazo.
+    /// - Com um objeto Callback registrado (ALPC_PORT.CallbackObject, o
+    ///   NtAlpcSetInformation 9): STATUS_TIMEOUT.
+    /// - Nas outras, a thread espera no semáforo dela.
+    pub fn empty_receive_status(&self) -> Option<u32> {
+        const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
+        const STATUS_TIMEOUT: u32 = 0x102;
+        let (completion, flags, callback) = self.with(|state| (state.completion.is_some(), state.port_flags, state.callback.is_some()));
+        if completion {
+            return Some(STATUS_UNSUCCESSFUL);
+        }
+        if self.wait_object() != 0 {
+            return (flags & crate::ntos::alpc::server::LPC_MODE == 0).then_some(STATUS_UNSUCCESSFUL);
+        }
+        callback.then_some(STATUS_TIMEOUT)
+    }
+
     /// O objeto de espera da porta (o ObpGetWaitObject com o DefaultObject
     /// indireto 0xF9 do tipo ALPC Port): o semáforo de uma porta esperável,
     /// senão o AlpcpDummyEvent (sinalizado: a espera conclui de imediato).

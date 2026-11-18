@@ -4395,6 +4395,39 @@ fn user_alpc_transport(assert: Assert) {
     let unsupported = call("NtAlpcSendWaitReceivePort", handle, 0x4000_0000, input, 0);
     let empty = call("NtAlpcSendWaitReceivePort", handle, 0, 0, 0);
     assert(cid == Some(0xC000_0702) && no_input == Some(0xC000_00F0) && unsupported == Some(0xC000_00BB) && empty == Some(0), "useralpctrn: recusas da troca");
+    // A recepção comum com a fila vazia (AlpcpReceiveMessagePort): na porta
+    // do cliente esperável fora do modo LPC (os atributos 0x70000 do
+    // CoreMessaging) ela volta STATUS_UNSUCCESSFUL sem esperar, com prazo
+    // zero e sem prazo, antes e depois de drenar a resposta; na porta comum
+    // o prazo zero dá STATUS_TIMEOUT.
+    attributes_of(0x200);
+    unsafe { nt::AlpcPortAttributes::at(port_attributes) }.flags.set(0x7_0000);
+    stack(&[0, 0, 0, 0, 0, 0]);
+    let waitable_connected = call("NtAlpcConnectPort", block + 0x28, name, 0, port_attributes);
+    let waitable = guest::read64(block + 0x28);
+    let zero = block + 0x5F8;
+    guest::write64(zero, 0);
+    guest::write64(length, 0x100);
+    stack(&[output, length, 0, zero]);
+    let waitable_zero = call("NtAlpcSendWaitReceivePort", waitable, 0, 0, 0);
+    stack(&[output, length, 0, 0]);
+    let waitable_infinite = if waitable_zero == Some(0xC000_0001) { call("NtAlpcSendWaitReceivePort", waitable, 0, 0, 0) } else { None };
+    message(input, &[7, 9]);
+    stack(&[0, 0, 0, 0]);
+    let waitable_sent = call("NtAlpcSendWaitReceivePort", waitable, 0, input, 0);
+    guest::write64(length, 0x100);
+    stack(&[output, length, 0, 0]);
+    let waitable_received = call("NtAlpcSendWaitReceivePort", waitable, 0, 0, 0);
+    let waitable_reply = read(output + nt::PortMessage::SIZE, 2);
+    let waitable_drained = if waitable_infinite == Some(0xC000_0001) { call("NtAlpcSendWaitReceivePort", waitable, 0, 0, 0) } else { None };
+    let _ = call("NtClose", waitable, 0, 0, 0);
+    guest::write64(length, 0x100);
+    stack(&[output, length, 0, zero]);
+    let common_zero = call("NtAlpcSendWaitReceivePort", handle, 0, 0, 0);
+    assert(
+        waitable_connected == Some(0) && waitable_zero == Some(0xC000_0001) && waitable_infinite == Some(0xC000_0001) && waitable_sent == Some(0) && waitable_received == Some(0) && waitable_reply == [9, 7] && waitable_drained == Some(0xC000_0001) && common_zero == Some(0x102),
+        "useralpctrn: a recepcao com a fila vazia volta STATUS_UNSUCCESSFUL na porta esperavel fora do modo LPC",
+    );
     // Troca de kernel pela entrada instalada.
     message(input, &[0xA, 0xB]);
     let kernel = kernel_entry::begin(&[handle, 0x2_0000, input, 0, output, length, 0, 0]).ok().and_then(|mut pending| pending.poll());

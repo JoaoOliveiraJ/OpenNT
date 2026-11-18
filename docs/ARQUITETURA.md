@@ -4275,6 +4275,15 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     e o registrador do CoreMessaging e os clientes dele (portas 0x70000)
     esperam por pacotes de espera; nas outras portas o objeto de espera é o
     AlpcpDummyEvent, sinalizado, e a espera conclui de imediato;
+  - a recepção comum (sem resposta síncrona nem mensagem direta) que acha a
+    fila vazia segue o AlpcpReceiveMessagePort (`Port::empty_receive_status`
+    em `ob/objects/port.rs`, nos caminhos do cliente e do servidor, de modo
+    usuário e de kernel): com IOCP associada volta STATUS_UNSUCCESSFUL; na
+    porta esperável, só o modo LPC espera (no semáforo) e as outras voltam
+    STATUS_UNSUCCESSFUL; com objeto Callback volta STATUS_TIMEOUT; senão a
+    thread espera. A recepção legada numa porta de comunicação do servidor
+    segue as regras da porta de conexão. O CoreMessaging recebe sem prazo
+    depois de cada espera pelo handle e para nesse STATUS_UNSUCCESSFUL;
   - a lista de conclusão (NtAlpcSetInformation classe 6) não existe: a
     classe recusa com STATUS_NOT_SUPPORTED numa porta de conexão (o rpcrt4
     solta o buffer e continua com a IOCP), e as classes 7, 8 e 10 respondem

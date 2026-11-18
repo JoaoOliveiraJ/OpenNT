@@ -1322,6 +1322,14 @@ pub fn exchange_messages(port: &Arc<Port>, flags: u32, input: u64, send_attribut
     if let Some(immediate) = receiver.receive()? {
         return Ok(Status(immediate));
     }
+    // AlpcpReceiveMessagePort: a recepção comum com a fila vazia volta sem
+    // esperar numa porta com IOCP, numa esperável fora do modo LPC e numa
+    // com objeto Callback. A resposta síncrona e a mensagem direta esperam.
+    if receiver.synchronous.is_none() && !direct_selection {
+        if let Some(status) = port.empty_receive_status() {
+            return Ok(Status(status));
+        }
+    }
     // A espera possui o corpo, independente da tabela ou do último handle;
     // cancelamento, timeout e término liberam a referência uma única vez.
     let _ = dispatcher_objects::reference(port.pointer);

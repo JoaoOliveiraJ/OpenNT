@@ -774,6 +774,18 @@ struct ReceiveOptions {
     port_context: u64,
     /// O NtListenPort: só mensagens de conexão; as outras são descartadas.
     connections_only: bool,
+    /// A recepção legada (AlpcpReceiveLegacyMessage): numa porta de
+    /// comunicação do servidor ela é a da porta de conexão
+    /// (CommunicationInfo->ConnectionPort), cujas regras de fila vazia
+    /// valem.
+    on_connection_port: bool,
+}
+
+/// A porta cujas regras de fila vazia valem para uma recepção do servidor
+/// `server` pelo handle de `port`: a própria porta, ou a de conexão na
+/// recepção legada.
+fn receiving_port<'a>(server: &'a UserServer, port: &'a Arc<Port>, options: ReceiveOptions) -> &'a Arc<Port> {
+    if options.on_connection_port { &server.listener } else { port }
 }
 
 /// Entrega a próxima mensagem da fila no buffer do servidor; `None` com a
@@ -1362,6 +1374,10 @@ fn reply_and_receive(server: Arc<UserServer>, port: &Arc<Port>, input: u64, send
     if let Some(status) = receive_one(&server, &buffer, receive.receive_attributes, options) {
         return Ok(status);
     }
+    // AlpcpReceiveMessagePort com a fila vazia (`Port::empty_receive_status`).
+    if let Some(status) = receiving_port(&server, port, options).empty_receive_status() {
+        return Ok(status);
+    }
     if receive.timeout != 0 && guest::try_read::<i64>(receive.timeout)? == 0 {
         return Ok(STATUS_TIMEOUT);
     }
@@ -1418,7 +1434,7 @@ pub fn receive_legacy(port: &Arc<Port>, reply: u64, receive: u64, port_context: 
     if port_context != 0 && !state::probe_user_write(port_context, 8) {
         return Ok(STATUS_ACCESS_VIOLATION);
     }
-    let options = ReceiveOptions { legacy: server.legacy(), port_context, connections_only };
+    let options = ReceiveOptions { legacy: server.legacy(), port_context, connections_only, on_connection_port: true };
     let arguments = crate::ntos::ps::user::alpc::ReceiveArguments { output: receive, length: 0, receive_attributes: 0, timeout };
     reply_and_receive(server, port, reply, 0, true, arguments, options)
 }
@@ -2089,8 +2105,11 @@ pub fn begin_kernel_legacy_receive(port: &Arc<Port>, reply: u64, receive: u64, p
         Ok(timeout) => timeout,
         Err(status) => return Ok(Box::new(Completed(status))),
     };
-    let options = ReceiveOptions { legacy: server.legacy(), port_context, connections_only: false };
+    let options = ReceiveOptions { legacy: server.legacy(), port_context, connections_only: false, on_connection_port: true };
     if let Some(status) = receive_one(&server, &buffer, 0, options) {
+        return Ok(Box::new(Completed(status)));
+    }
+    if let Some(status) = receiving_port(&server, port, options).empty_receive_status() {
         return Ok(Box::new(Completed(status)));
     }
     let waiting = server.clone();
@@ -2176,6 +2195,9 @@ pub fn begin_kernel_exchange(port: &Arc<Port>, flags: u32, input: u64, receive: 
         Err(status) => return Ok(Box::new(Completed(status))),
     };
     if let Some(status) = receive_one(&server, &buffer, receive.receive_attributes, ReceiveOptions::default()) {
+        return Ok(Box::new(Completed(status)));
+    }
+    if let Some(status) = port.empty_receive_status() {
         return Ok(Box::new(Completed(status)));
     }
     let attributes = receive.receive_attributes;
