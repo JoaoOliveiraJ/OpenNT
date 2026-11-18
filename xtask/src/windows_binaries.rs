@@ -583,6 +583,24 @@ const LOGON_SCREEN_PROGRAMS: &[&str] = &[
     "NetworkIcon.dll",
     "Windows.UI.Core.TextInput.dll",
     "uiautomationcore.dll",
+    // O indicador de idioma de entrada que o Windows.UI.Logon.dll cria
+    // (InputSwitch.dll, CLSID {B9BC2A50-43C3-41AA-A086-5DB14E184BAE}, com o
+    // wininet.dll que ele importa); as classes WinRT que o XAML ativa para
+    // a escala da tela (Windows.Graphics.dll, DisplayInformation) e o pool
+    // de threads (threadpoolwinrt.dll); a manipulação direta do ScrollViewer
+    // (directmanipulation.dll, com o NInput.dll que ele e o XAML carregam);
+    // e os proxies das interfaces da experiência de logon
+    // (Windows.Internal.UI.Logon.ProxyStub.dll) e do ActXPrxy.dll
+    // (IXAMLHostWindow) para as chamadas entre os apartamentos do XAML e as
+    // threads do servidor RPC do logoncontroller.dll.
+    "InputSwitch.dll",
+    "wininet.dll",
+    "Windows.Graphics.dll",
+    "threadpoolwinrt.dll",
+    "directmanipulation.dll",
+    "NInput.dll",
+    "Windows.Internal.UI.Logon.ProxyStub.dll",
+    "ActXPrxy.dll",
     // O XAML da experiência de logon: as classes WinRT Windows.UI.Xaml.*, o
     // XAMLHostWindow, o Windows.UI.dll, o Windows.Globalization.dll e o
     // modelo de dados dos provedores de credencial (CredProvDataModel.dll),
