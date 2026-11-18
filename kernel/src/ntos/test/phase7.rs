@@ -2278,22 +2278,18 @@ fn user_syscalls_core(assert: Assert) {
     // ObpDefaultObject, sempre sinalizado; sem SYNCHRONIZE a espera é
     // recusada.
     let denied = call("NtWaitForSingleObject", directory, 0, string, 0) == 0xC000_0022;
-    // A DACL da raiz não concede SYNCHRONIZE (o DIRECTORY_ALL_ACCESS não o
-    // inclui): o diretório com SYNCHRONIZE é um novo, temporário, que o
-    // criador recebe com o acesso pedido.
-    state::write_user_wide(attributes + 0xC0, "\\OpenNtEsperaPadrao");
-    state::write_unicode_string(attributes + 0xA0, attributes + 0xC0, "\\OpenNtEsperaPadrao");
-    set_object_attributes(unsafe { nt::ObjectAttributes::at(attributes) }, nt::ObjectAttributes::SIZE as u32, 0, attributes + 0xA0, 0x40);
-    let synchronized = call("NtCreateDirectoryObject", out, 0x10_0001, attributes, 0) == 0;
-    let waitable = guest::read64(out);
-    guest::write64(buffer, second);
-    guest::write64(buffer + 8, waitable);
-    guest::write64(rsp + 0x28, string);
-    let default_any = call("NtWaitForMultipleObjects", 2, buffer, 1, 0) == 1 && call("NtWaitForSingleObject", waitable, 0, string, 0) == 0;
-    guest::write64(buffer, waitable);
-    let default_all = call("NtWaitForMultipleObjects", 2, buffer, 0, 0) == 0xC000_0030;
-    let _ = call("NtClose", waitable, 0, 0, 0);
-    assert(denied && synchronized && default_any && default_all, "usercore: objeto sem espera propria sinalizado pelo objeto padrao e SYNCHRONIZE exigido");
+    // A máscara de acesso válido do tipo Directory não tem SYNCHRONIZE, então
+    // um handle de diretório nunca o recebe; a resolução do objeto padrão é
+    // conferida em KernelMode (o ObWaitForMultipleObjects sem a exigência de
+    // SYNCHRONIZE): o diretório espera no ObpDefaultObject, e no WaitAll o
+    // mesmo objeto duas vezes dá STATUS_INVALID_PARAMETER_MIX.
+    let default_any = crate::ntos::ob::wait::reference_objects(&[directory], 0, crate::ntos::ob::wait::WAIT_ANY).map(|set| {
+        let object = set.objects[0];
+        set.release();
+        object
+    }) == Ok(crate::ntos::ob::wait::default_object());
+    let default_all = crate::ntos::ob::wait::reference_objects(&[directory, directory], 0, crate::ntos::ob::wait::WAIT_ALL).err() == Some(0xC000_0030);
+    assert(denied && default_any && default_all, "usercore: objeto sem espera propria sinalizado pelo objeto padrao e SYNCHRONIZE exigido");
     // NtSignalAndWaitForSingleObject: o sinal pelo tipo e a espera no outro.
     // `first` (sincronização) e `second` (notificação) estão sem sinal.
     let signal_wait = |signal: u64, wait: u64| call("NtSignalAndWaitForSingleObject", signal, wait, 0, string);
