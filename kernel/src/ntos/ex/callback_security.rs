@@ -18,7 +18,36 @@ const VALID_CALLBACK_ACCESS: u32 = 0x1F_0001;
 
 /// Valida e captura o descritor. Ponteiro zero seleciona dono, grupo e DACL
 /// padrão do token. `Err(NTSTATUS)` nas falhas.
+///
+/// Um descritor em endereço de usuário (o dos OBJECT_ATTRIBUTES de um
+/// serviço chamado de UserMode) passa antes pelo SeCaptureSecurityDescriptor
+/// em UserMode, como o ObpCaptureObjectCreateInformation do 19041: a cópia
+/// self-relative do kernel é a validada e lida. Validado no lugar, um
+/// descritor absoluto com dono ou grupo (ponteiros de usuário, que o
+/// RtlValidSid do kernel recusa) dava STATUS_INVALID_SECURITY_DESCR, como a
+/// seção Global\RotHintTable que o InitKernelRot do rpcss.dll cria no
+/// DcomLaunch com dono e grupo do SID do serviço.
 pub fn capture(pointer: u64) -> Result<SecurityPolicy, u32> {
+    if pointer != 0 && pointer < crate::ntos::mm::memory_map::USER_PROBE_ADDRESS {
+        let cell = guest::alloc_bytes(8);
+        if cell == 0 {
+            return Err(0xC000_009A);
+        }
+        let status = descriptor::capture_mode(pointer, 1, cell);
+        let captured = if status == 0 { guest::read64(cell) } else { 0 };
+        guest::free_bytes(cell);
+        if status != 0 {
+            return Err(status);
+        }
+        let result = capture_kernel(captured);
+        descriptor::release_captured(captured);
+        return result;
+    }
+    capture_kernel(pointer)
+}
+
+/// [`capture`] de um descritor do kernel (ou nenhum).
+fn capture_kernel(pointer: u64) -> Result<SecurityPolicy, u32> {
     let Some(token) = object_access::subject() else { return Err(0xC000_007C) };
     let Some(mut policy) = tokens::with(token, |token| SecurityPolicy {
         owner: token.owner.clone(),

@@ -1337,6 +1337,28 @@ fn user_file_syscalls(assert: Assert) {
     let section_handle = guest::read64(handle_pointer);
     assert(section == 0 && section_handle != 0, "usersyscalls: NtCreateSection de usuario");
     let _ = crate::ntos::ob::open_pointer::close(section_handle);
+    // Descritor absoluto de usuário com dono e grupo (S-1-5-18) e DACL,
+    // como o do InitKernelRot do rpcss.dll: o SeCaptureSecurityDescriptor de
+    // UserMode o copia antes da validação, e os ponteiros de usuário do dono
+    // e do grupo não fazem a criação falhar com STATUS_INVALID_SECURITY_DESCR.
+    let (descriptor, system, dacl, secured) = (block + 0x900, block + 0x940, block + 0x960, block + 0x9C0);
+    guest::write_bytes(system, &[1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0]);
+    // ACL revisão 2 com uma ACE ACCESS_ALLOWED (0xF001F) para S-1-5-18.
+    guest::write_bytes(dacl, &[2, 0, 28, 0, 1, 0, 0, 0, 0, 0, 20, 0, 0x1F, 0, 0x0F, 0, 1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0]);
+    guest::write_bytes(descriptor, &[0u8; 40]);
+    guest::write8(descriptor, 1);
+    guest::write16(descriptor + 2, 4);
+    guest::write64(descriptor + 8, system);
+    guest::write64(descriptor + 16, system);
+    guest::write64(descriptor + 32, dacl);
+    guest::write_bytes(secured, &[0u8; 48]);
+    guest::write32(secured, 48);
+    guest::write64(secured + 40, 0);
+    guest::write64(secured + 32, descriptor);
+    let secured_section = call("NtCreateSection", handle_pointer, 0xF_001F, secured, size);
+    let secured_handle = guest::read64(handle_pointer);
+    assert(secured_section == 0 && secured_handle != 0, "usersyscalls: NtCreateSection de usuario com descritor absoluto com dono e grupo");
+    let _ = crate::ntos::ob::open_pointer::close(secured_handle);
     if let Some(region) = memory::find_region(block) {
         memory::release_private_region(&region);
     }
