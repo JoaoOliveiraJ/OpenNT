@@ -1029,6 +1029,15 @@ fn executive_callbacks(assert: Assert) {
     assert(callbacks::counts(object) == Some((2, 1, 0)) && callbacks::resolve_handle(handle, false).is_some() && callbacks::resolve_handle(handle, true).is_none(), "excb: handle retem o objeto");
     assert(matches!(close::close(handle, Some(0)), Ok(0)) && callbacks::counts(object) == Some((1, 0, 0)), "excb: NtClose pelo dono de callbacks");
     assert(matches!(callbacks::dereference(object), Ok(Some(0))) && !callbacks::exists(object), "excb: objeto temporario recolhido");
+    // Sem ObjectName: STATUS_UNSUCCESSFUL sem Create; com Create, um objeto
+    // sem nome (o CoreMessagingK do win32kbase).
+    object_attributes(scratch, 0, "", 0x200);
+    unsafe { ObjectAttributes::at(scratch) }.object_name.set(0);
+    assert(matches!(callbacks::create(output, scratch, false, false), Ok(0xC000_0001)), "excb: sem nome e sem criacao");
+    assert(matches!(callbacks::create(output, scratch, true, false), Ok(0)), "excb: criacao sem nome");
+    let unnamed = guest::read64(output);
+    assert(callbacks::name(unnamed).is_none() && callbacks::counts(unnamed) == Some((1, 0, 0)), "excb: objeto sem nome com a referencia da saida");
+    assert(matches!(callbacks::dereference(unnamed), Ok(Some(0))) && !callbacks::exists(unnamed), "excb: objeto sem nome recolhido");
     guest::free_bytes(scratch);
 }
 

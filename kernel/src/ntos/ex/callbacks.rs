@@ -28,6 +28,7 @@ use crate::ntos::inc::field::{Field, NtStruct, Reserved};
 use crate::ntos::inc::types::{ListEntry, ObjectAttributes, UnicodeString};
 use crate::ntos::rtl::guest_strings;
 
+const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
 const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
@@ -239,7 +240,7 @@ pub fn attributes(pointer: u64) -> Result<Captured, u32> {
     let name_pointer = object_attributes.object_name.get();
     let flags = object_attributes.attributes.get();
     if name_pointer == 0 {
-        return Err(0xC000_0001);
+        return Err(STATUS_UNSUCCESSFUL);
     }
     // SAFETY: ObjectName é o PUNICODE_STRING do mesmo chamador.
     let object_name = unsafe { UnicodeString::at(name_pointer) };
@@ -330,6 +331,11 @@ pub fn create(output: u64, object_attributes: u64, create_new: bool, multiple: b
     require_irql(1)?;
     let captured = match attributes(object_attributes) {
         Ok(captured) => captured,
+        // Sem ObjectName o 19041 (0x6a00ba) não tenta o ObOpenObjectByName:
+        // o status fica STATUS_UNSUCCESSFUL e, com Create, o objeto nasce
+        // sem nome (o EnsureAlpcCallbackRegistered do CoreMessagingK no
+        // win32kbase, que liga o callback às portas do MIT).
+        Err(STATUS_UNSUCCESSFUL) if create_new => return create_unnamed(output, object_attributes, multiple),
         Err(status) => return Ok(status),
     };
     if let Some(node) = captured.node {
@@ -358,6 +364,25 @@ pub fn create(output: u64, object_attributes: u64, create_new: bool, multiple: b
     // ExCreateCallback fecha o handle interno; o nome temporário some aí.
     if !permanent {
         remove_object_name(pointer);
+    }
+    write_output(output, pointer);
+    Ok(0)
+}
+
+/// O ramo de criação do ExCreateCallback sem ObjectName (ObCreateObjectEx e
+/// ObInsertObjectEx com o OBJECT_ATTRIBUTES sem nome): a segurança e o
+/// OBJ_PERMANENT vêm dos atributos, e a saída fica com a única referência.
+fn create_unnamed(output: u64, object_attributes: u64, multiple: bool) -> Result<u32, KernelError> {
+    // SAFETY: `attributes` já conferiu o ponteiro e o Length.
+    let object_attributes = unsafe { ObjectAttributes::at(object_attributes) };
+    let security = match callback_security::capture(object_attributes.security_descriptor.get()) {
+        Ok(policy) => policy,
+        Err(status) => return Ok(status),
+    };
+    let permanent = object_attributes.attributes.get() & OBJECT_PERMANENT != 0;
+    let pointer = allocate_named(None, multiple, permanent, security)?;
+    if pointer == 0 {
+        return Ok(STATUS_INSUFFICIENT_RESOURCES);
     }
     write_output(output, pointer);
     Ok(0)
