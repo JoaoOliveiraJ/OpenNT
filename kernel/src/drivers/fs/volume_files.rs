@@ -3,8 +3,11 @@
 //! Compartilha a tradução de caminhos e os objetos de arquivo do volume
 //! entre o loader de usuário, o leitor NLS e as seções. Importar não monta o
 //! disco: a montagem do boot é reutilizada sob demanda. O cache de leitura
-//! guarda blocos de 64 KiB (oito por arquivo, 4 MiB no total, LRU global);
-//! descartar um bloco não altera o arquivo nem as páginas de uma seção.
+//! guarda blocos de 64 KiB (oito por arquivo, 4 MiB no total, LRU global)
+//! em frames do PFN, lidos do disco direto para eles, como as páginas do
+//! cache de sistema do NT (nada do cache fica no heap do kernel); descartar
+//! um bloco devolve os frames e não altera o arquivo nem as páginas de uma
+//! seção.
 
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
@@ -14,18 +17,68 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::native_file_name;
 use super::ntfs::{self, Ntfs, Stat};
+use crate::hal::physical;
 use crate::ntos::io::file::lifetime::FileMarks;
+use crate::ntos::mm::pfn;
 use crate::ntos::ps::user::sections::SectionFile;
 use crate::rtl::{KernelError, SpinLock};
 
 const READ_CACHE_BLOCK_BYTES: u64 = 64 * 1024;
 const READ_CACHE_BLOCKS_PER_FILE: usize = 8;
 const READ_CACHE_BYTE_LIMIT: u64 = 4 * 1024 * 1024;
+const PAGE: u64 = 0x1000;
+
+/// Um bloco do cache: `length` bytes do arquivo em frames do PFN, uma página
+/// por frame. O último `Arc` devolve os frames.
+struct CacheBlock {
+    frames: Vec<u64>,
+    length: u64,
+}
+
+impl CacheBlock {
+    /// Lê `[offset, offset + length)` do arquivo direto para frames novos.
+    fn read(volume: &Ntfs, path: &str, offset: u64, length: u64) -> Result<CacheBlock, KernelError> {
+        let mut block = CacheBlock { frames: Vec::with_capacity(length.div_ceil(PAGE) as usize), length };
+        let mut done = 0;
+        while done < length {
+            let frame = pfn::alloc_page();
+            if frame == 0 {
+                return Err(KernelError::with_status("volume read cache: PFN esgotado", 0xC000_009A));
+            }
+            block.frames.push(frame);
+            let take = PAGE.min(length - done);
+            volume.copy_range_to_physical(path, offset + done, frame, take)?;
+            done += take;
+        }
+        Ok(block)
+    }
+
+    /// Acrescenta `[start, start + count)` do bloco a `out`.
+    fn copy_out(&self, start: u64, count: u64, out: &mut Vec<u8>) {
+        let mut at = start;
+        while at < start + count {
+            let take = (PAGE - at % PAGE).min(start + count - at);
+            let address = physical::range_to_virtual(self.frames[(at / PAGE) as usize] + at % PAGE, take);
+            // SAFETY: frames do bloco (só ele os escreve, na leitura), pelo
+            // mapa direto.
+            out.extend_from_slice(unsafe { core::slice::from_raw_parts(address as *const u8, take as usize) });
+            at += take;
+        }
+    }
+}
+
+impl Drop for CacheBlock {
+    fn drop(&mut self) {
+        for &frame in &self.frames {
+            pfn::free_page(frame);
+        }
+    }
+}
 
 /// Cache de blocos: (arquivo, offset) → bytes, ordem LRU global e ordem de
 /// inserção por arquivo.
 struct ReadCache {
-    blocks: BTreeMap<(u64, u64), Arc<Vec<u8>>>,
+    blocks: BTreeMap<(u64, u64), Arc<CacheBlock>>,
     lru: VecDeque<(u64, u64)>,
     per_file: BTreeMap<u64, VecDeque<u64>>,
     bytes: u64,
@@ -38,8 +91,8 @@ static NEXT_FILE: AtomicU64 = AtomicU64::new(1);
 
 impl ReadCache {
     fn evict(&mut self, key: (u64, u64)) {
-        if let Some(bytes) = self.blocks.remove(&key) {
-            self.bytes -= bytes.len() as u64;
+        if let Some(block) = self.blocks.remove(&key) {
+            self.bytes -= block.length;
         }
         self.lru.retain(|entry| *entry != key);
         if let Some(order) = self.per_file.get_mut(&key.0) {
@@ -284,7 +337,7 @@ impl VolumeFile {
     /// serve só a esta leitura. Conferir e inserir sob o lock do cache fecha
     /// a corrida com o `refresh`, que troca a geração antes de limpar os
     /// blocos.
-    fn publish_block(&self, key: (u64, u64), generation: u64, block: Arc<Vec<u8>>) -> Result<Arc<Vec<u8>>, KernelError> {
+    fn publish_block(&self, key: (u64, u64), generation: u64, block: Arc<CacheBlock>) -> Result<Arc<CacheBlock>, KernelError> {
         let mut cache = CACHE.lock();
         if let Some(existing) = cache.blocks.get(&key).cloned() {
             cache.touch(key)?;
@@ -293,11 +346,11 @@ impl VolumeFile {
         if self.state.lock().generation != generation {
             return Ok(block);
         }
-        cache.reserve(self.id, block.len() as u64)?;
+        cache.reserve(self.id, block.length)?;
         cache.blocks.insert(key, block.clone());
         cache.lru.push_back(key);
         cache.per_file.entry(self.id).or_default().push_back(key.1);
-        cache.bytes += block.len() as u64;
+        cache.bytes += block.length;
         Ok(block)
     }
 
@@ -333,14 +386,13 @@ impl VolumeFile {
                 Some(block) => block,
                 None => {
                     let block_length = READ_CACHE_BLOCK_BYTES.min(size - block_offset);
-                    let fetched = self.volume.read_range(&self.volume_path(), block_offset, block_length)?;
-                    let Some(fetched) = fetched.filter(|bytes| bytes.len() as u64 == block_length) else { return Err(KernelError::new(alloc::format!("NTFS: leitura falhou: {}", self.volume_path()))) };
+                    let fetched = CacheBlock::read(&self.volume, &self.volume_path(), block_offset, block_length)?;
                     self.publish_block(key, generation, Arc::new(fetched))?
                 }
             };
-            let start = (current - block_offset) as usize;
-            let count = ((length - result.len() as u64) as usize).min(block.len() - start);
-            result.extend_from_slice(&block[start..start + count]);
+            let start = current - block_offset;
+            let count = (length - result.len() as u64).min(block.length - start);
+            block.copy_out(start, count, &mut result);
         }
         Ok(result)
     }
