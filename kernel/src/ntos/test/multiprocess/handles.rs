@@ -122,22 +122,34 @@ pub fn run(assert: Assert) {
     let baseline = references(target);
     let (a_id, target_id) = (process_id(a), process_id(target));
 
-    // O mesmo objeto aberto em A e em B, com acessos distintos.
+    // O mesmo objeto aberto em A e em B, com acessos distintos. Cada tabela
+    // numera os próprios handles, como a ObjectTable do NT: os dois processos
+    // novos dão o mesmo valor ao primeiro handle, e cada um vê o seu. O
+    // segundo handle de A tem um valor que B não deu.
     let in_a = attached(a, || open_process(target, target_id, LIMITED)).flatten().unwrap_or(0);
     let in_b = attached(b, || open_process(target, target_id, ALL_ACCESS)).flatten().unwrap_or(0);
-    assert(in_a != 0 && in_b != 0 && in_a != in_b, "handles: o mesmo processo aberto em A e em B");
-    let seen_by_a = attached(a, || (state::get_user_handle(in_a).map(|entry| entry.access()), state::get_user_handle(in_b).is_none()));
-    let seen_by_b = attached(b, || (state::get_user_handle(in_b).map(|entry| entry.access()), state::get_user_handle(in_a).is_none()));
-    assert(seen_by_a == Some((Some(LIMITED), true)) && seen_by_b == Some((Some(ALL_ACCESS), true)), "handles: cada processo ve so o seu handle, com o seu acesso");
-    assert(state::get_user_handle(in_a).is_none() && state::get_user_handle(in_b).is_none(), "handles: o System nao ve os handles de A e de B");
+    let only_a = attached(a, || open_process(target, target_id, LIMITED)).flatten().unwrap_or(0);
+    assert(in_a != 0 && in_a == in_b && only_a != 0 && only_a != in_a && only_a & 3 == 0, "handles: o mesmo processo aberto em A e em B, com a numeracao de cada tabela");
+    let seen_by_a = attached(a, || (state::get_user_handle(in_a).map(|entry| entry.access()), state::get_user_handle(only_a).map(|entry| entry.access())));
+    let seen_by_b = attached(b, || (state::get_user_handle(in_b).map(|entry| entry.access()), state::get_user_handle(only_a).is_none()));
+    assert(seen_by_a == Some((Some(LIMITED), Some(LIMITED))) && seen_by_b == Some((Some(ALL_ACCESS), true)), "handles: cada processo ve so o seu handle, com o seu acesso");
+    let foreign = |process: u64, handle: u64| row(process, handle).is_none_or(|row| row.pointer != target);
+    assert(foreign(system, in_a) && foreign(system, only_a), "handles: o System nao ve os handles de A e de B");
     let rows = row(a, in_a).is_some_and(|row| row.pointer == target && row.access == LIMITED) && row(b, in_b).is_some_and(|row| row.pointer == target && row.access == ALL_ACCESS);
-    assert(rows && row(a, in_b).is_none() && row(b, in_a).is_none() && row(system, in_a).is_none(), "handles: cada linha na ObjectTable do seu processo");
-    assert(references(target) == baseline + 2, "handles: cada handle retem o corpo");
+    assert(rows && row(b, only_a).is_none(), "handles: cada linha na ObjectTable do seu processo");
+    assert(references(target) == baseline + 3, "handles: cada handle retem o corpo");
 
-    // O handle de A é inválido em B, pelo NtClose, pelos atributos e pelo
-    // ObReferenceObjectByHandle.
-    let from_b = attached(b, || (close::handle_attributes(in_a, true), reference(in_a, LIMITED, 1).0, close::close(in_a, Some(1)).ok()));
+    // O handle só de A é inválido em B, pelo NtClose, pelos atributos e pelo
+    // ObReferenceObjectByHandle; fechado em A, o valor volta à tabela de A.
+    let from_b = attached(b, || (close::handle_attributes(only_a, true), reference(only_a, LIMITED, 1).0, close::close(only_a, Some(1)).ok()));
     assert(from_b == Some((None, INVALID_HANDLE, Some(INVALID_HANDLE))), "handles: handle de A invalido em B");
+    let reused = attached(a, || {
+        let closed = close::close(only_a, Some(1)).ok();
+        let again = open_process(target, target_id, LIMITED).unwrap_or(0);
+        let _ = close::close(again, Some(1));
+        (closed, again)
+    });
+    assert(reused == Some((Some(0), only_a)) && references(target) == baseline + 2, "handles: o valor fechado em A e o proximo que A da");
     let from_a = attached(a, || (close::handle_attributes(in_a, true), reference(in_a, LIMITED, 1), reference(in_a, ALL_ACCESS, 1).0));
     assert(from_a == Some((Some(0), (0, target), ACCESS_DENIED)), "handles: em A o handle resolve com o acesso de A");
     assert(attached(b, || reference(in_b, ALL_ACCESS, 1)) == Some((0, target)), "handles: em B o mesmo objeto resolve com o acesso de B");
@@ -151,7 +163,7 @@ pub fn run(assert: Assert) {
         let _ = close::close(own, Some(1));
         checks
     });
-    assert(process_checks == Some((Ok(a), Ok(target), Err(ACCESS_DENIED))) && attached(b, || user_handles::process_pointer(in_a, 0)) == Some(Err(INVALID_HANDLE)), "handles: o processo do handle sai da tabela do processo anexado, com o acesso do handle");
+    assert(process_checks == Some((Ok(a), Ok(target), Err(ACCESS_DENIED))) && attached(b, || user_handles::process_pointer(only_a, 0)) == Some(Err(INVALID_HANDLE)), "handles: o processo do handle sai da tabela do processo anexado, com o acesso do handle");
 
     // Fechar em A não afeta B.
     let closed = attached(a, || (close::close(in_a, Some(1)).ok(), state::get_user_handle(in_a).is_none(), close::close(in_a, Some(1)).ok()));

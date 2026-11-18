@@ -706,20 +706,30 @@ impl UserHandle {
 
 /// A tabela de handles de usuário de um processo (`ProcessState.handles`),
 /// o papel da ObjectTable do NT para os objetos do runtime: o handle, o
-/// vínculo com a linha publicada na HANDLE_TABLE nativa do mesmo processo e o
-/// piso dos valores novos. Os valores novos vêm do espaço global de
-/// `handle_ids`, então um handle aberto ou duplicado nunca repete um valor de
-/// outra tabela; só a herança ([`inherit_user_handles`]) põe o mesmo valor
-/// na tabela do filho, como o NT.
+/// vínculo com a linha publicada na HANDLE_TABLE nativa do mesmo processo e a
+/// numeração da tabela (`handle_ids::Numbers`, a lista livre do
+/// ExpAllocateHandleTableEntry): o primeiro handle é 4, um valor fechado é o
+/// próximo a voltar, e dois processos repetem os mesmos valores, como no NT.
+/// A herança ([`inherit_user_handles`]) põe no filho o valor do pai.
 pub struct UserHandleTable {
     entries: BTreeMap<u32, Arc<UserHandle>>,
     bindings: BTreeMap<u32, Binding>,
-    floor: u32,
+    numbers: handle_ids::Numbers,
 }
 
 impl UserHandleTable {
     pub const fn new() -> Self {
-        Self { entries: BTreeMap::new(), bindings: BTreeMap::new(), floor: 0x100 }
+        Self { entries: BTreeMap::new(), bindings: BTreeMap::new(), numbers: handle_ids::Numbers::new() }
+    }
+
+    /// Tira o handle da tabela e devolve o valor à lista livre dela.
+    fn remove(&mut self, handle: u32) -> Option<Arc<UserHandle>> {
+        self.bindings.remove(&handle);
+        let removed = self.entries.remove(&handle);
+        if removed.is_some() {
+            handle_ids::release_user(&mut self.numbers, handle);
+        }
+        removed
     }
 }
 
@@ -792,25 +802,27 @@ fn close_from_table(process: u64, handle: u32) {
 /// Provedores de kernel e de usuário podem habitar a mesma tabela do
 /// EPROCESS: os ids são únicos ali, incluindo o slot reservado de cada folha.
 /// A linha nativa vai para a HANDLE_TABLE do processo dono da tabela. Sem
-/// `value`, o valor sai do espaço global; com ele (a herança), é o do pai.
+/// `value`, o valor sai da numeração da tabela; com ele (a herança), é o do
+/// pai. Uma falha devolve o valor à tabela.
 fn insert_user_handle(table: &ProcessState, entry: &Arc<UserHandle>, value: Option<u32>) -> Result<u32, KernelError> {
-    let handle = match value {
-        Some(value) => {
-            if table.handles.lock().entries.contains_key(&value) {
-                return Err(KernelError::new(format!("handle {value:#x} ja existe na tabela do processo")));
+    let handle = {
+        let mut handles = table.handles.lock();
+        match value {
+            Some(value) => {
+                if handles.entries.contains_key(&value) || !handle_ids::reserve_user(&mut handles.numbers, value)? {
+                    return Err(KernelError::new(format!("handle {value:#x} ja existe na tabela do processo")));
+                }
+                value
             }
-            value
-        }
-        None => {
-            let minimum = table.handles.lock().floor;
-            let handle = handle_ids::allocate(minimum)?;
-            table.handles.lock().floor = handle + 4;
-            handle
+            None => handle_ids::allocate_user(&mut handles.numbers)?,
         }
     };
     let retained = match entry.object.on_each_handle_open() {
         Ok(retained) => retained,
-        Err(error) => return Err(error),
+        Err(error) => {
+            handle_ids::release_user(&mut table.handles.lock().numbers, handle);
+            return Err(error);
+        }
     };
     let published = match entry.object.native_body() {
         Some(body) => {
@@ -837,8 +849,9 @@ fn insert_user_handle(table: &ProcessState, entry: &Arc<UserHandle>, value: Opti
     if let Err(error) = published {
         {
             let mut handles = table.handles.lock();
-            handles.bindings.remove(&handle);
-            handles.entries.remove(&handle);
+            if handles.remove(handle).is_none() {
+                handle_ids::release_user(&mut handles.numbers, handle);
+            }
         }
         if retained {
             entry.object.on_each_handle_close();
@@ -881,7 +894,7 @@ pub fn sweep_user_handles(table: &ProcessState) {
         let next = table.handles.lock().entries.keys().next().copied();
         let Some(handle) = next else { break };
         if !matches!(close_user_handle_in(table, handle as u64, true, true), Ok(0)) {
-            table.handles.lock().entries.remove(&handle);
+            table.handles.lock().remove(handle);
         }
     }
 }
@@ -1002,11 +1015,7 @@ pub fn close_user_handle_in(table: &ProcessState, value: u64, release: bool, for
     let binding = table.handles.lock().bindings.get(&handle).copied();
     let last = Cell::new(false);
     let mut detach = || {
-        {
-            let mut handles = table.handles.lock();
-            handles.entries.remove(&handle);
-            handles.bindings.remove(&handle);
-        }
+        table.handles.lock().remove(handle);
         let mut group = entry.group.lock();
         group.handles -= 1;
         last.set(group.handles == 0);

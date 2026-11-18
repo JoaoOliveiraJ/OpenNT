@@ -3037,11 +3037,21 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   ObReferenceObjectByHandle e do NtQueryObject agem sobre a tabela do
   processo corrente, `KTHREAD.ApcState.Process`, que segue o attach como no
   NT. Handles de kernel (OBJ_KERNEL_HANDLE, prefixo 0xFFFFFFFF8...) ficam na
-  tabela do System e valem em qualquer processo, só em KernelMode. Os valores
-  novos vêm do espaço global de `ob/handle_ids.rs`, então um handle aberto ou
-  duplicado nunca repete o valor de outra tabela; só a herança põe o mesmo
-  valor no filho, como no NT. No término, a drenagem da HANDLE_TABLE nativa
-  fecha cada handle pela tabela do processo dono, e `process_state::destroy`
+  tabela do System e valem em qualquer processo, só em KernelMode. Cada
+  tabela numera os próprios handles (`ob/handle_ids.rs`, `Numbers`), como o
+  ExpAllocateHandleTableEntry de uma tabela sem StrictFIFO: o primeiro
+  handle é 4, os valores são múltiplos de 4 fora da entrada 0 de cada folha,
+  o valor fechado é o próximo a sair (LIFO), e dois processos repetem os
+  mesmos valores; a herança põe no filho o valor do pai. Os provedores que
+  acham os registros só pelo valor (o Object Manager, os arquivos do zw e o
+  registro, com os handles de kernel deles) tiram valores de um espaço
+  global a partir de 0x1004, reaproveitados do mais antigo ao mais novo.
+  Diferença declarada: um valor vivo num desses provedores não sai para
+  nenhuma tabela de usuário, e um vivo numa tabela de usuário não sai para
+  eles, então um valor nunca aponta dois donos no processo corrente. No NT
+  todo handle de um processo mora na tabela dele, sem essa disjunção. No
+  término, a drenagem da HANDLE_TABLE nativa fecha cada handle pela tabela
+  do processo dono, e `process_state::destroy`
   fecha o que sobrou (handles sem linha nativa). Teste:
   `ntos/test/multiprocess/handles.rs`.
 - **OBJECT_HEADER e rotinas de tipo** (`ob/object_header.rs`,

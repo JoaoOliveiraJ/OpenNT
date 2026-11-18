@@ -633,6 +633,7 @@ pub fn close_raw(handle: u32) -> bool {
             let removed = hive.handles.remove(&handle).is_some();
             if removed {
                 update_statistics(hive);
+                handle_ids::release(handle);
             }
             removed
         });

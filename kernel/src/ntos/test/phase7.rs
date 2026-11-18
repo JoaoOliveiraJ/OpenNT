@@ -170,7 +170,7 @@ fn user_handle_table(assert: Assert) {
         return;
     };
     let entry = state::get_user_handle(handle as u64);
-    assert(handle >= 0x100 && handle & 3 == 0 && count(&object.opens) == 1 && entry.as_ref().is_some_and(|entry| entry.access() == 0x1F_0003 && entry.kind() == "event" && entry.downcast::<TestObject>().is_some()), "user: handle baixo com acesso, tipo e gancho de abertura");
+    assert(handle >= 4 && handle & 3 == 0 && handle & 0x3FF != 0 && count(&object.opens) == 1 && entry.as_ref().is_some_and(|entry| entry.access() == 0x1F_0003 && entry.kind() == "event" && entry.downcast::<TestObject>().is_some()), "user: handle baixo com acesso, tipo e gancho de abertura");
     let Some(entry) = entry else { return };
     let Ok(duplicate) = state::duplicate_user_handle(&entry, 1, 0) else {
         assert(false, "user: duplicata alocada");

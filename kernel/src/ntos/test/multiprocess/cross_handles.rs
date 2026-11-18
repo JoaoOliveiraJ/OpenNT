@@ -586,7 +586,10 @@ fn scenario(assert: Assert, services: &Services) {
     assert(same, "entre-processos: o handle inherit esta no filho com o mesmo valor, acesso, atributos e objeto");
     let native = in_child.is_some_and(|(_, body, _, _)| row(child_pointer, inheritable) == Some((body, EVENT_ALL_ACCESS, OBJ_INHERIT)));
     assert(native, "entre-processos: a linha do handle herdado na ObjectTable do filho, no mesmo valor");
-    assert(seen(child_pointer, event).is_none() && row(child_pointer, event).is_none(), "entre-processos: o handle sem OBJ_INHERIT nao e herdado");
+    // O valor do handle sem OBJ_INHERIT pode ser de outro handle no filho
+    // (cada tabela numera os seus); o evento comum é que não passa.
+    let event_body = seen(parent_pointer, event).map_or(0, |(_, body, _, _)| body);
+    assert(event_body != 0 && seen(child_pointer, event).is_none_or(|(_, body, _, _)| body != event_body) && row(child_pointer, event).is_none_or(|(body, _, _)| body != event_body), "entre-processos: o handle sem OBJ_INHERIT nao e herdado");
     // SAFETY: EPROCESS retido pelo teste.
     let inherited_from = unsafe { Eprocess::at(child_pointer) }.inherited_from_unique_process_id.get();
     assert(inherited_from == parent_id, "entre-processos: o InheritedFromUniqueProcessId do filho e o PID do pai");

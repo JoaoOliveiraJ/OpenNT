@@ -585,6 +585,7 @@ fn insert_handle(id: NodeId, options: Option<OpenOptions>) -> Result<u32, Kernel
             }
             options.as_ref().and_then(|options| options.on_close.clone())
         });
+        handle_ids::release(handle);
         if let Some(on_close) = on_close {
             on_close(handle);
         }
@@ -682,6 +683,7 @@ pub fn close(handle: u32) -> Result<bool, KernelError> {
                 node.refs -= 1;
             }
         });
+        handle_ids::release(handle);
         if let Some(on_close) = options.as_ref().and_then(|options| options.on_close.clone()) {
             on_close(handle);
         }

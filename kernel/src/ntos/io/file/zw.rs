@@ -188,7 +188,9 @@ pub fn close_file_entry(handle: u32) -> u32 {
         if let Some(entry) = FILE_HANDLES.lock().get_mut(&(handle & !3)) {
             entry.closed = true;
         }
-        FILE_HANDLES.lock().remove(&(handle & !3));
+        if FILE_HANDLES.lock().remove(&(handle & !3)).is_some() {
+            handle_ids::release(handle & !3);
+        }
     };
     if !matches!(process_handles::remove(&binding, Some(&mut commit)), Ok(true)) {
         return STATUS_INVALID_HANDLE;
@@ -230,6 +232,7 @@ fn publish_file_handle(mut entry: FileEntry, output: u64, io_status: u64, inform
             if stored {
                 close_file_entry(handle);
             } else {
+                handle_ids::release(handle);
                 release_entry(&entry);
             }
             if error.status != status_unsuccessful() {

@@ -894,10 +894,16 @@ fn parent_creates_child(assert: Assert, services: &Services, system: u64, system
     let recorded = process::with_record(child, |record| record.parent_id);
     assert(inherited_from == SYSTEM_PROCESS_ID && recorded == Some(SYSTEM_PROCESS_ID) && parent_id != SYSTEM_PROCESS_ID, "ntcreateuserprocess: o ParentProcess declarado vira o pai do filho (InheritedFromUniqueProcessId e o registro)");
     // INHERIT_HANDLES com o ParentProcess: o filho recebe o handle herdável
-    // do pai declarado, com o mesmo valor, e não o de quem chamou.
-    let from_declared = inherited(child, system_inheritable, system);
-    let from_caller = inherited(child, parent_inheritable, system);
-    assert(from_declared == Some(true) && from_caller.is_none(), "ntcreateuserprocess: com INHERIT_HANDLES e ParentProcess, o filho herda o handle do pai declarado com o mesmo valor, e nao o de quem chamou");
+    // do pai declarado, com o mesmo valor, e não o de quem chamou. Cada tabela
+    // numera os seus handles, então o valor do handle de quem chamou pode
+    // existir no filho; a herança é reconhecida pela descrição aberta que a
+    // cópia herdada divide com o handle de origem.
+    let entry_of = |process: u64, handle: u64| process_context::with_process(process, || state::get_user_handle(handle)).ok().flatten();
+    let child_entries: alloc::vec::Vec<alloc::sync::Arc<state::UserHandle>> = process_context::with_process(child, || state::user_handle_values().into_iter().filter_map(|value| state::get_user_handle(value as u64)).collect()).unwrap_or_default();
+    let declared_entry = entry_of(system, system_inheritable);
+    let from_declared = inherited(child, system_inheritable, system) == Some(true) && declared_entry.as_ref().zip(entry_of(child, system_inheritable)).is_some_and(|(source, copy)| state::same_object(&source, &copy));
+    let from_caller = entry_of(parent, parent_inheritable).is_some_and(|source| child_entries.iter().any(|entry| state::same_object(entry, &source)));
+    assert(from_declared && !from_caller, "ntcreateuserprocess: com INHERIT_HANDLES e ParentProcess, o filho herda o handle do pai declarado com o mesmo valor, e nao o de quem chamou");
     // Os parâmetros do pai, entregues ao filho.
     let delivered = parameters.as_ref().is_some_and(|parameters| {
         parameters.flags == APP_MANIFEST_PRESENT
