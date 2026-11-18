@@ -247,7 +247,10 @@ do caminho de escrita do disco, com leitores em outras CPUs, e imprime
 integridade de código ativa, e imprime `DRIVER_START_COMPLETED`),
 `--trace-driver-api` (mostra cada chamada de API do driver enquanto ele inicia:
 objetos abertos, rotinas pedidas ao `MmGetSystemRoutineAddress`, valores do
-Registro e texto formatado), `--initial-process=smss` (o primeiro processo de
+Registro e texto formatado), `--trace-rpc` (uma linha `[rpc]` na serial por
+mensagem ALPC das portas de servidor, com os pids, o tipo e os atributos; nos
+endpoints LRPC do `\RPC Control`, a interface e o opnum de cada chamada e o
+status ou o código de falha da resposta), `--initial-process=smss` (o primeiro processo de
 usuário passa a ser o smss.exe real, que monta a sessão e cria o csrss.exe; o
 build põe no volume os binários dessa cadeia e o kernel deixa de montar o
 `\KnownDlls` e de imitar o csrss).
@@ -269,7 +272,7 @@ começa do volume que o build montou.
 
 As opções de boot (`--kernel-test-scope`, `--start-driver`, `--kd`,
 `--initial-process`, `--storage`, `--display`, `--pnp-root`,
-`--trace-driver-api`, `--console-mirror`, `--user-program`) não recompilam o
+`--trace-driver-api`, `--trace-rpc`, `--console-mirror`, `--user-program`) não recompilam o
 kernel: vão no bloco de opções de carga da imagem de boot (como as opções de
 boot do Windows no LoadOptions do loader), que o kernel lê ao entrar e mostra
 na serial (`[boot] opcoes de carga: ...`). Só o `--initial-process=smss` muda

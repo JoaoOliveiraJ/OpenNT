@@ -63,6 +63,9 @@ pub struct BuildOptions {
     pub start_driver: String,
     /// `--trace-driver-api`: rastreia as APIs chamadas durante esse início.
     pub trace_driver_api: bool,
+    /// `--trace-rpc`: uma linha na serial por mensagem ALPC das portas de
+    /// servidor, com a interface e o opnum dos pedidos LRPC.
+    pub trace_rpc: bool,
     /// `--initial-process=smss`: o kernel inicia o smss.exe real como o
     /// primeiro processo de usuário (vazio = o boot comum).
     pub initial_process: String,
@@ -136,6 +139,9 @@ impl BuildOptions {
         if self.trace_driver_api {
             words.push(String::from(name::TRACE_DRIVER_API));
         }
+        if self.trace_rpc {
+            words.push(String::from(name::TRACE_RPC));
+        }
         if self.console_mirror {
             words.push(String::from(name::CONSOLE_MIRROR));
         }
@@ -187,6 +193,7 @@ impl BuildOptions {
             console_mirror: false,
             start_driver: String::new(),
             trace_driver_api: false,
+            trace_rpc: false,
             storage: String::new(),
             display: String::new(),
             pnp_root: String::new(),
@@ -420,6 +427,7 @@ mod tests {
             console_mirror: false,
             start_driver: String::new(),
             trace_driver_api: false,
+            trace_rpc: false,
             initial_process: String::new(),
             storage: String::new(),
             display: String::new(),
@@ -447,6 +455,7 @@ mod tests {
         options.initial_process = "smss".into();
         options.display = "basic".into();
         options.trace_driver_api = true;
+        options.trace_rpc = true;
         options.console_mirror = true;
         options.shutdown_test = "reboot".into();
         options.usb = true;
@@ -455,8 +464,9 @@ mod tests {
         let block = options.load_options_block().unwrap();
         assert_eq!(block.len(), load_options::BLOCK_SIZE);
         let text = load_options::text_of(&block).unwrap();
-        assert_eq!(text, "DEBUG DEBUGPORT=COM2 KERNELTESTSCOPE=all STARTDRIVER=NDIS,AFD INITIALPROCESS=smss DISPLAY=basic SHUTDOWNTEST=reboot TRACEDRIVERAPI CONSOLEMIRROR USB NET TPM");
+        assert_eq!(text, "DEBUG DEBUGPORT=COM2 KERNELTESTSCOPE=all STARTDRIVER=NDIS,AFD INITIALPROCESS=smss DISPLAY=basic SHUTDOWNTEST=reboot TRACEDRIVERAPI TRACERPC CONSOLEMIRROR USB NET TPM");
         assert!(load_options::flag(text, load_options::DEBUG) && load_options::flag(text, "consolemirror") && load_options::flag(text, load_options::USB) && load_options::flag(text, load_options::NET) && load_options::flag(text, load_options::TPM));
+        assert!(load_options::flag(text, load_options::TRACE_RPC) && load_options::flag(text, "tracerpc"));
         assert_eq!(load_options::value(text, load_options::START_DRIVER), Some("NDIS,AFD"));
         assert_eq!(load_options::value(text, load_options::STORAGE), None);
         assert!(!load_options::flag(text, load_options::DEBUG_PORT));
@@ -487,6 +497,7 @@ mod tests {
         driver.usb = true;
         driver.net = true;
         driver.tpm = true;
+        driver.trace_rpc = true;
         driver.build_dir = PathBuf::from("build/kd");
         assert_eq!(base.image_key(), driver.image_key());
         let mut smss = options();

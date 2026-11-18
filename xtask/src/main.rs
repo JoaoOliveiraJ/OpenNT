@@ -17,7 +17,9 @@
 //!
 //! Opções de build: `--release`, `--build-dir=DIR` (padrão `build`),
 //! `--user-program=shell`, `--kernel-test-scope=none|all|disk-stress`, `--console-mirror`,
-//! `--start-driver=NOME[,NOME...]`, `--trace-driver-api`, `--initial-process=smss`, `--storage=real|nvme`,
+//! `--start-driver=NOME[,NOME...]`, `--trace-driver-api`, `--trace-rpc` (cada mensagem ALPC das
+//! portas de servidor na serial, com a interface e o opnum dos pedidos LRPC),
+//! `--initial-process=smss`, `--storage=real|nvme`,
 //! `--display=basic`, `--windows-dir=DIR`, `--pnp-root=acpi|internal` (a raiz da árvore de
 //! dispositivos: o acpi.sys real, o padrão, ou o barramento PCI interno), `--kd=com2` (o
 //! depurador do kernel na COM2), `--shutdown-test=poweroff|reboot` (o teste do desligamento),
@@ -91,6 +93,8 @@ const USAGE: &str = "uso: cargo xtask <build|run|test-boot|test-all|capturas|deb
 opcoes de build:   --release --build-dir=DIR --user-program=shell
                    --kernel-test-scope=none|all|disk-stress --console-mirror --start-driver=NOME[,NOME...]
                    --trace-driver-api --initial-process=smss --storage=real|nvme --display=basic
+                   --trace-rpc (cada mensagem ALPC das portas de servidor na serial, com a
+                   interface e o opnum dos pedidos LRPC e o status das respostas)
                    --windows-dir=DIR (binarios do Windows do bundle; padrao build/windows)
                    --pnp-root=acpi|internal (raiz da arvore de dispositivos; padrao acpi)
                    --usb (controladora xHCI com teclado e tablet USB)
@@ -176,6 +180,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             console_mirror: false,
             start_driver: String::new(),
             trace_driver_api: false,
+            trace_rpc: false,
             initial_process: String::new(),
             storage: String::new(),
             display: String::new(),
@@ -240,6 +245,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             "--kernel-test-scope" => parsed.build.kernel_test_scope = required()?,
             "--start-driver" => parsed.build.start_driver = required()?,
             "--trace-driver-api" => parsed.build.trace_driver_api = true,
+            "--trace-rpc" => parsed.build.trace_rpc = true,
             "--memory-pressure" => parsed.build.memory_pressure = true,
             "--initial-process" => parsed.build.initial_process = required()?,
             "--storage" => parsed.build.storage = required()?,
