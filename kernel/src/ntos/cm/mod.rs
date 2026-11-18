@@ -47,6 +47,7 @@ pub mod crash_control;
 pub mod time_zone_information;
 pub mod seed;
 pub mod session_manager;
+pub mod setup_state;
 pub mod ini_file_mapping;
 pub mod state_separation;
 pub mod value_information;

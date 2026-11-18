@@ -4802,7 +4802,8 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   PE) e as tabelas das hives de máquina (`ntos/cm/seed.rs`,
   `ntos/cm/session_manager.rs`, `ntos/cm/ini_file_mapping.rs`,
   `ntos/cm/crypto_defaults.rs`, `ntos/cm/current_version.rs` (as pastas
-  de programas que o luafv.sys lê), `ntos/cm/service/boot_services.rs` e
+  de programas que o luafv.sys lê), `ntos/cm/setup_state.rs` (o estado de
+  setup de uma instalação concluída), `ntos/cm/service/boot_services.rs` e
   `ntos/cm/service/inbox_drivers.rs`, na mesma árvore `cm`/`cm::service`
   de módulos), com que `xtask/src/hive_image.rs` grava os arquivos SYSTEM,
   SOFTWARE, SAM, SECURITY e DEFAULT de `\SystemRoot\System32\config`.
@@ -4896,9 +4897,22 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   PopFullWake, 1 desde o PoInitSystem). O xtask copia desta máquina as
   chaves que esses serviços e o LSM leem (`xtask/src/service_chain.rs`:
   OLE, COM3, Rpc, AllowedCOMCLSIDs, NetworkServiceTriggers, os valores do
-  Winlogon sem os do usuário daqui, Setup e PriorityControl) e põe no volume
-  os ServiceDll dos outros serviços do grupo DcomLaunch. O autoteste é o
+  Winlogon sem os do usuário daqui e PriorityControl) e põe no volume os
+  ServiceDll dos outros serviços do grupo DcomLaunch. O autoteste é o
   `test/user_service_chain.rs`.
+- **Estado de setup** (`cm/setup_state.rs`, só no boot do processo inicial
+  real): o convidado é uma instalação concluída. `SYSTEM\Setup` com
+  `SetupType` 0 e `CmdLine` vazio (o WinMain do winlogon só roda o setup
+  com os dois), `SystemSetupInProgress` e `OOBEInProgress` 0 e
+  `SetupSupported` 1, sem `AuditBoot`; na SOFTWARE, `Setup\State`
+  `IMAGE_STATE_COMPLETE`, `OOBE\Stats\OOBEUserSignedIn` 1 (o
+  IsFirstLogonAfterOOBE do logoncontroller) e os dados persistidos do
+  WNF_DEP_OOBE_COMPLETE e do WNF_SHEL_OOBE_USER_LOGON_COMPLETE em
+  `Windows NT\CurrentVersion\Notifications\Data` (carimbo 1, ULONG 1), que
+  o kernel carrega ao criar a instância do nome. Com eles o OOBEComplete do
+  kernel32 dá completo, e o CPolicyMonitor do LSM não espera o fim do OOBE.
+  Nenhum nome é publicado pelo kernel: o 19041 só assina o
+  WNF_DEP_OOBE_COMPLETE no PnP quando `OOBEInProgress` é 1.
 
 ## 5. Testes
 

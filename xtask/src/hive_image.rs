@@ -54,6 +54,8 @@ mod cm {
     pub mod time_zone_information;
     #[path = "../../../../kernel/src/ntos/cm/network_setup.rs"]
     pub mod network_setup;
+    #[path = "../../../../kernel/src/ntos/cm/setup_state.rs"]
+    pub mod setup_state;
     pub mod service {
         #[path = "../../../../../kernel/src/ntos/cm/service/boot_services.rs"]
         pub mod boot_services;
@@ -506,5 +508,39 @@ mod tests {
         }
         let expected: Vec<String> = (0..total).map(|number| format!("Key{number:05}")).collect();
         assert_eq!(names, expected);
+    }
+
+    /// O valor `name` de `path` como a hive fica: a última semente vence.
+    fn seeded<'a>(keys: &'a [cm::seed::SeedKey], path: &str, name: &str) -> Option<(u32, &'a [u8])> {
+        keys.iter().rev().filter(|key| key.path.eq_ignore_ascii_case(path)).find_map(|key| key.values.iter().find(|(value, _, _)| value.eq_ignore_ascii_case(name)).map(|(_, kind, data)| (*kind, data.as_slice())))
+    }
+
+    /// O boot do processo inicial real é uma instalação concluída: o
+    /// winlogon não roda o setup (SetupType 0 e CmdLine vazio), nada está em
+    /// setup, OOBE ou auditoria, o OOBEComplete do kernel32 lê o estado pelo
+    /// WNF e acha os dados persistidos dos dois nomes do fim do OOBE
+    /// (carimbo 1, ULONG 1), e o LogonUI vê o primeiro logon já feito.
+    #[test]
+    fn smss_boot_hives_are_a_finished_install() {
+        let system = cm::seed::system_keys(true);
+        let dword = |value: u32| (cm::seed::REG_DWORD, value.to_le_bytes().to_vec());
+        for (name, expected) in [("SetupType", 0), ("SystemSetupInProgress", 0), ("OOBEInProgress", 0), ("SetupPhase", 0), ("RestartSetup", 0), ("SetupSupported", 1)] {
+            assert_eq!(seeded(&system, "Setup", name).map(|(kind, data)| (kind, data.to_vec())), Some(dword(expected)), "Setup\\{name}");
+        }
+        assert_eq!(seeded(&system, "Setup", "CmdLine"), Some((cm::seed::REG_SZ, &[0u8, 0][..])));
+        assert!(!system.iter().any(|key| key.path.to_lowercase().starts_with("setup\\status") && (key.path.eq_ignore_ascii_case("Setup\\Status\\AuditBootVolatile") || key.values.iter().any(|(name, _, _)| name.eq_ignore_ascii_case("AuditBoot")))));
+        let software = cm::seed::software_keys(true);
+        let complete = [1u8, 0, 0, 0, 1, 0, 0, 0];
+        for name in ["41960B29A3BC0C75", "0D83063EA3BC2475"] {
+            assert_eq!(seeded(&software, "Microsoft\\Windows NT\\CurrentVersion\\Notifications\\Data", name), Some((cm::seed::REG_BINARY, &complete[..])), "Notifications\\Data\\{name}");
+        }
+        assert_eq!(seeded(&software, "Microsoft\\Windows\\CurrentVersion\\OOBE\\Stats", "OOBEUserSignedIn").map(|(kind, data)| (kind, data.to_vec())), Some(dword(1)));
+        let image_state: Vec<u8> = "IMAGE_STATE_COMPLETE".encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect();
+        assert_eq!(seeded(&software, "Microsoft\\Windows\\CurrentVersion\\Setup\\State", "ImageState"), Some((cm::seed::REG_SZ, image_state.as_slice())));
+        // Os outros boots não levam o estado de setup.
+        assert!(seeded(&cm::seed::system_keys(false), "Setup", "SetupType").is_none());
+        assert!(seeded(&cm::seed::software_keys(false), "Microsoft\\Windows NT\\CurrentVersion\\Notifications\\Data", "41960B29A3BC0C75").is_none());
+        let hive = hive_from_seeds(software, "SOFTWARE");
+        assert_eq!(&hive[..4], b"regf");
     }
 }

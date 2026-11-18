@@ -9,14 +9,15 @@
 //!   `Microsoft\COM3`, `Microsoft\Rpc`, `WindowsRuntime\AllowedCOMCLSIDs` e
 //!   `Windows NT\CurrentVersion\Containers`; o RpcEpMap.dll do RpcEptMapper,
 //!   `Rpc\Extensions` e `CurrentVersion\NetworkServiceTriggers`;
-//! - o lsm.dll lê os valores de `Windows NT\CurrentVersion\Winlogon`,
-//!   `CurrentVersion\SharedPC`, `SYSTEM\Setup` e `SYSTEM\Setup\Status`; o
-//!   winsrvext.dll do csrss lê `Control\PriorityControl`.
+//! - o lsm.dll lê os valores de `Windows NT\CurrentVersion\Winlogon` e
+//!   `CurrentVersion\SharedPC`; o winsrvext.dll do csrss lê
+//!   `Control\PriorityControl`.
 //!
-//! Os valores que dizem respeito ao usuário desta máquina (o último logon,
-//! o logon automático) e os que apontam para o disco dela (a partição do
-//! sistema, a pasta de trabalho do setup) ficam de fora. Fora do Windows
-//! nada é copiado.
+//! O `SYSTEM\Setup` que o lsm.dll também lê não vem daqui: o estado de setup
+//! de uma instalação concluída é o mesmo em toda máquina e sai da tabela
+//! `cm/setup_state.rs`. Os valores que dizem respeito ao usuário desta
+//! máquina (o último logon, o logon automático) ficam de fora. Fora do
+//! Windows nada é copiado.
 
 use crate::host_language::HostKey;
 
@@ -36,11 +37,6 @@ const WINLOGON_LOCAL_VALUES: &[&str] = &[
     "AutoAdminLogon",
 ];
 
-/// Os valores de estado do setup em `SYSTEM\Setup`: uma instalação já
-/// concluída, sem setup nem OOBE em andamento.
-#[cfg(windows)]
-const SETUP_STATE_VALUES: &[&str] = &["CmdLine", "OOBEInProgress", "RestartSetup", "SetupPhase", "SetupSupported", "SetupType", "SystemSetupInProgress"];
-
 /// As chaves da hive SYSTEM, já no conjunto de controle que a hive guarda
 /// (`control_set`, como `ControlSet001`).
 pub fn system_keys(control_set: &str) -> Vec<HostKey> {
@@ -50,12 +46,6 @@ pub fn system_keys(control_set: &str) -> Vec<HostKey> {
         use crate::host_language::registry;
         let host = "SYSTEM\\CurrentControlSet";
         registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\Control\\PriorityControl"), &format!("{control_set}\\Control\\PriorityControl"), false, &mut keys);
-        let first = keys.len();
-        registry::copy(registry::LOCAL_MACHINE, "SYSTEM\\Setup", "Setup", false, &mut keys);
-        if let Some(setup) = keys.get_mut(first) {
-            setup.values.retain(|(name, _, _)| SETUP_STATE_VALUES.iter().any(|kept| kept.eq_ignore_ascii_case(name)));
-        }
-        registry::copy(registry::LOCAL_MACHINE, "SYSTEM\\Setup\\Status", "Setup\\Status", true, &mut keys);
     }
     #[cfg(not(windows))]
     let _ = control_set;

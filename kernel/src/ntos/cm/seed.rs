@@ -1,11 +1,12 @@
 //! O conteúdo estático das hives de máquina: as chaves e valores que vêm de
 //! tabelas fixas. Na SYSTEM, as chaves de serviço dos drivers que o boot
 //! instala, os parâmetros e as classes de dispositivo, a configuração do
-//! Session Manager no boot do processo inicial real e o `Select` do
-//! conjunto de controle; na SOFTWARE, o que o kernel e os programas reais
-//! leem (os CSPs, as Image File Execution Options e, no boot do processo
-//! inicial real, o `IniFileMapping` do basesrv); na SAM, na SECURITY e na
-//! DEFAULT (`\Registry\User\.DEFAULT`), a estrutura mínima de chaves.
+//! Session Manager e o estado de setup no boot do processo inicial real e o
+//! `Select` do conjunto de controle; na SOFTWARE, o que o kernel e os
+//! programas reais leem (os CSPs, as Image File Execution Options e, no
+//! boot do processo inicial real, o `IniFileMapping` do basesrv e o OOBE
+//! concluído); na SAM, na SECURITY e na DEFAULT (`\Registry\User\.DEFAULT`),
+//! a estrutura mínima de chaves.
 //!
 //! É uma fonte só para dois consumidores: o `xtask`, que grava com estas
 //! chaves os arquivos de `\SystemRoot\System32\config` do volume, e o
@@ -14,7 +15,7 @@
 //! este arquivo e as tabelas que ele reúne (`cm/session_manager.rs`,
 //! `cm/ini_file_mapping.rs`, `cm/crypto_defaults.rs`, `cm/arbiters.rs`,
 //! `cm/time_zone_information.rs`, `cm/network_setup.rs`,
-//! `cm/service/boot_services.rs`,
+//! `cm/setup_state.rs`, `cm/service/boot_services.rs`,
 //! `cm/service/inbox_drivers.rs` e `cm/service/file_system_filters.rs`) são
 //! dados puros: não usam nada do kernel e o `xtask` os inclui por `#[path]`
 //! na mesma árvore de módulos (`cm`, `cm::service`).
@@ -122,6 +123,9 @@ pub fn system_keys(smss_boot: bool) -> Vec<SeedKey> {
     keys.extend(super::network_setup::seed_keys());
     if smss_boot {
         keys.extend(super::session_manager::seed_keys());
+        // O estado de setup de uma instalação concluída (`SYSTEM\Setup`),
+        // que o winlogon lê para escolher entre o setup e o logon normal.
+        keys.extend(super::setup_state::system_keys());
     }
     // Control\Windows: onde o ExpRecordShutdownTime grava o ShutdownTime de
     // cada desligamento.
@@ -138,8 +142,8 @@ pub fn system_keys(smss_boot: bool) -> Vec<SeedKey> {
 /// A hive SOFTWARE: os CSPs que o advapi32/crypt32 leem, as Image File
 /// Execution Options que o loader da ntdll consulta a cada processo, as
 /// pastas de programas que o luafv.sys lê no DriverEntry e, no
-/// boot do processo inicial real, o `IniFileMapping` que o basesrv.dll lê e
-/// a chave SideBySide do sxssrv.dll.
+/// boot do processo inicial real, o `IniFileMapping` que o basesrv.dll lê,
+/// a chave SideBySide do sxssrv.dll e o OOBE concluído (`setup_state`).
 pub fn software_keys(smss_boot: bool) -> Vec<SeedKey> {
     let mut keys = super::crypto_defaults::seed_keys();
     keys.push(SeedKey::new("Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options"));
@@ -152,6 +156,9 @@ pub fn software_keys(smss_boot: bool) -> Vec<SeedKey> {
         let mut side_by_side = SeedKey::new("Microsoft\\Windows\\CurrentVersion\\SideBySide");
         side_by_side.value("PublisherPolicyChangeTime", REG_QWORD, 0x01DD_6663_5F9A_F0F7u64.to_le_bytes().to_vec());
         keys.push(side_by_side);
+        // O OOBE concluído: o estado da imagem, o primeiro logon do usuário
+        // e os dados persistidos dos nomes WNF do fim do OOBE.
+        keys.extend(super::setup_state::software_keys());
     }
     keys
 }
