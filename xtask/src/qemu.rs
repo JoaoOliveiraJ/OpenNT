@@ -960,6 +960,17 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
     let wait_for = |needle: &str, from: usize| -> Result<usize, String> {
         loop {
             if let Some(error) = session_failure.lock().unwrap().clone() {
+                // A conexão do depurador cai quando o QEMU morre: o motivo
+                // é o fim do QEMU (um instante para o processo sair).
+                for _ in 0..20 {
+                    if let Some(ended) = supervise()? {
+                        if ended.starts_with(QEMU_KILLED) {
+                            return Err(format!("QEMU terminou ({ended}) antes de {needle:?}"));
+                        }
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
                 return Err(format!("sessao do depurador: {error}"));
             }
             {
