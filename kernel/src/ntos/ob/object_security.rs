@@ -89,6 +89,20 @@ pub fn described_policy(described: &open_pointer::Described) -> SecurityPolicy {
     object_policy(described.pointer).unwrap_or_else(|| described.owner.security(described.pointer))
 }
 
+/// O objeto tem descritor (o ObpCreateHandle do 19041, rva 0x644028..0x6442a6,
+/// pula o SeAccessCheck quando o SeDefaultObjectMethod acha o
+/// OBJECT_HEADER.SecurityDescriptor nulo): com cabeçalho, o descritor do
+/// cabeçalho, salvo um SecurityProcedure próprio do tipo (que sempre consulta
+/// um descritor); a tabela lateral; senão o que o dono do corpo diz.
+pub fn has_descriptor(described: &open_pointer::Described) -> bool {
+    let object = described.pointer;
+    if object_header::is_object(object) {
+        let procedure = object_types::type_object(described.object_type.pointer).map_or(0, |native| native.type_info.security_procedure.get());
+        return (procedure != 0 && procedure != default_object_method_address()) || header_descriptor(object) != 0;
+    }
+    SECURITY_DESCRIPTORS.lock().contains_key(&object) || described.owner.has_descriptor(object)
+}
+
 /// O SetSecurityDescriptor do SecurityProcedure de `object` (o
 /// ObSetSecurityObjectByPointer do NtSetSecurityObject): as partes de
 /// `information` do descritor capturado `captured` trocam as do descritor

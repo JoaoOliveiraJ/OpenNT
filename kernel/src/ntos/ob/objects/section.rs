@@ -32,8 +32,12 @@ pub struct SectionState {
     pub image_file_object: u64,
     /// OBJ_EXCLUSIVE: único processo que pode abrir handles.
     pub exclusive_process: u64,
-    /// Atributos capturados pelo MmCreateSection para o ObInsertObject.
+    /// Atributos capturados pelo MmCreateSection para o ObInsertObject; a
+    /// seção continua um objeto novo (OB_FLAG_NEW_OBJECT) até a inserção.
     pub creation_attributes: Option<CreationAttributes>,
+    /// O SecurityDescriptor nulo do NT: seção sem nome criada sem descritor
+    /// (o tipo Section não exige um), aberta por ponteiro sem SeAccessCheck.
+    pub no_descriptor: bool,
     /// O SECTION_IMAGE_INFORMATION de uma seção de imagem (o da imagem
     /// principal de um processo, capturado ao mapeá-la).
     pub image_information: Option<alloc::vec::Vec<u8>>,
@@ -93,7 +97,17 @@ impl ObjectOwner for SectionOwner {
         SECTIONS.lock().get(&pointer).map(|record| record.security.clone()).unwrap_or_default()
     }
     fn set_security(&self, pointer: u64, security: SecurityPolicy) -> bool {
-        SECTIONS.lock().get_mut(&pointer).map(|record| record.security = security).is_some()
+        SECTIONS
+            .lock()
+            .get_mut(&pointer)
+            .map(|record| {
+                record.security = security;
+                record.state.no_descriptor = false;
+            })
+            .is_some()
+    }
+    fn has_descriptor(&self, pointer: u64) -> bool {
+        SECTIONS.lock().get(&pointer).is_none_or(|record| !record.state.no_descriptor)
     }
     /// O processo que criou a seção com OBJ_EXCLUSIVE (0 = compartilhada),
     /// como o OBJECT_HEADER_PROCESS_INFO do NT.

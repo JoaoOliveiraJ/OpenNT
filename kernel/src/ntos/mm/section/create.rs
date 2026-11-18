@@ -150,14 +150,23 @@ pub fn attributes(pointer: u64, mode: u8, capture_only: bool) -> Result<Attribut
         return Err(0xC000_0005);
     }
     let units = caller_units(buffer, length, mode)?;
-    let mut name = String::from_utf16_lossy(&units);
+    let name = String::from_utf16_lossy(&units);
     if name.contains('\0') || name.ends_with('\\') || name.contains("\\\\") {
         return Err(0xC000_0033);
     }
-    let insensitive = flags & 0x40 != 0;
+    let captured = Attributes { flags, security_descriptor, name: Some(name), root, insensitive: flags & 0x40 != 0, ..Attributes::default() };
     if capture_only {
-        return Ok(Attributes { flags, security_descriptor, name: Some(name), root, insensitive, ..Attributes::default() });
+        return Ok(captured);
     }
+    resolve(captured)
+}
+
+/// Resolve o nome capturado: raiz por handle de diretório (de kernel ou do
+/// processo corrente), pai existente e não montado e o nó homônimo. Sem
+/// nome, os atributos voltam como estão.
+pub fn resolve(captured: Attributes) -> Result<Attributes, u32> {
+    let Some(mut name) = captured.name.clone() else { return Ok(captured) };
+    let (root, insensitive) = (captured.root, captured.insensitive);
     if root != 0 {
         if name.starts_with('\\') {
             return Err(0xC000_003B);
@@ -196,7 +205,7 @@ pub fn attributes(pointer: u64, mode: u8, capture_only: bool) -> Result<Attribut
     }
     let node = object_manager::resolve_from(&name, 0, insensitive, false, ROOT).0;
     let leaf = String::from(&name[at + 1..]);
-    Ok(Attributes { flags, security_descriptor, name: Some(name), root, insensitive, parent: Some(parent), leaf, node })
+    Ok(Attributes { name: Some(name), parent: Some(parent), leaf, node, ..captured })
 }
 
 /// Privilégio habilitado no token do sujeito (modo kernel dispensa).
@@ -207,9 +216,62 @@ fn privilege(id: u64, mode: u8) -> bool {
     object_access::subject().and_then(|token| tokens::with(token, |token| token.privileges.iter().any(|privilege| privilege.id == id && privilege.attributes & 2 != 0))).unwrap_or(false)
 }
 
+/// O nome já existe: outro tipo é OBJECT_TYPE_MISMATCH, sem OBJ_OPENIF é
+/// NAME_COLLISION; com ele, a seção existente abre (com a checagem de
+/// acesso do modo) e o status é STATUS_OBJECT_NAME_EXISTS. Devolve também o
+/// corpo existente.
+pub(crate) fn open_existing(node: NodeId, info: &Attributes, access: u32, mode: u8, output: u64) -> Result<(u32, u64), KernelError> {
+    let Some(existing) = object_manager::node(node) else { return Ok((0xC000_0024, 0)) };
+    if existing.type_name != "Section" {
+        return Ok((0xC000_0024, 0));
+    }
+    if info.flags & 0x80 == 0 {
+        return Ok((0xC000_0035, 0));
+    }
+    let pointer = existing.data.map_or(0, |data| data.native_pointer);
+    let status = open_and_publish(pointer, info.flags, access, mode, output)?;
+    Ok((if status != 0 { status } else { 0x4000_0000 }, pointer))
+}
+
+/// Antes de publicar um nome novo: OBJ_PERMANENT exige
+/// SeCreatePermanentPrivilege e o diretório pai, DIRECTORY_CREATE_OBJECT
+/// (em UserMode ou com OBJ_FORCE_ACCESS_CHECK).
+pub(crate) fn check_publish(info: &Attributes, mode: u8) -> Option<u32> {
+    if info.flags & 0x10 != 0 && !privilege(16, mode) {
+        return Some(0xC000_0061);
+    }
+    if let Some(parent) = info.parent.filter(|_| mode != 0 || info.flags & 0x400 != 0) {
+        let Some(subject) = object_access::subject() else { return Some(0xC000_007C) };
+        if let Err(status) = object_security::access(&object_security::directory(parent), subject, 4) {
+            return Some(status);
+        }
+    }
+    None
+}
+
+/// Publica a seção: permanência, o nome no namespace (quando há) e o handle
+/// de quem cria, que recebe o acesso pedido sem a checagem pela DACL do
+/// descritor que ele mesmo deu (como o ObInsertObject; o handle continua na
+/// tabela do processo de quem chama).
+pub(crate) fn publish(section: &Arc<sections::Section>, info: &Attributes, access: u32, output: u64) -> Result<u32, KernelError> {
+    let pointer = section.pointer();
+    section_objects::update(pointer, |state| state.permanent = info.flags & 0x10 != 0);
+    if let (Some(_), Some(parent)) = (&info.name, info.parent) {
+        let Some(node) = object_manager::insert_named(parent, &info.leaf, "Section", Some(ObjectData::pointer(pointer)), info.insensitive) else { return Ok(0xC000_0035) };
+        let path = object_manager::path_of(node);
+        {
+            let mut owner = section.state.lock();
+            owner.node = Some(node);
+            owner.name = path.clone();
+        }
+        section_objects::update(pointer, |state| state.name = path.unwrap_or_default());
+    }
+    open_and_publish(pointer, info.flags, access, 0, output)
+}
+
 /// Abre o corpo e entrega o handle; uma falha ao gravar a saída fecha o
 /// handle recém-aberto.
-fn open_and_publish(pointer: u64, flags: u32, access: u32, mode: u8, output: u64) -> Result<u32, KernelError> {
+pub(crate) fn open_and_publish(pointer: u64, flags: u32, access: u32, mode: u8, output: u64) -> Result<u32, KernelError> {
     let scratch = guest::alloc_bytes(8);
     if scratch == 0 {
         return Ok(0xC000_009A);
@@ -271,25 +333,10 @@ pub fn create(output: u64, access: u32, object_attributes: u64, size_pointer: u6
         Err(status) => return Ok(status),
     };
     if let Some(node) = info.node {
-        let Some(existing) = object_manager::node(node) else { return Ok(0xC000_0024) };
-        if existing.type_name != "Section" {
-            return Ok(0xC000_0024);
-        }
-        if info.flags & 0x80 == 0 {
-            return Ok(0xC000_0035);
-        }
-        let pointer = existing.data.map_or(0, |data| data.native_pointer);
-        let status = open_and_publish(pointer, info.flags, access, mode, output)?;
-        return Ok(if status != 0 { status } else { 0x4000_0000 });
+        return Ok(open_existing(node, &info, access, mode, output)?.0);
     }
-    if info.flags & 0x10 != 0 && !privilege(16, mode) {
-        return Ok(0xC000_0061);
-    }
-    if let Some(parent) = info.parent.filter(|_| mode != 0 || info.flags & 0x400 != 0) {
-        let Some(subject) = object_access::subject() else { return Ok(0xC000_007C) };
-        if let Err(status) = object_security::access(&object_security::directory(parent), subject, 4) {
-            return Ok(status);
-        }
+    if let Some(status) = check_publish(&info, mode) {
+        return Ok(status);
     }
     let security = if info.security_descriptor != 0 {
         match callback_security::capture(info.security_descriptor) {
@@ -391,6 +438,10 @@ pub fn create(output: u64, access: u32, object_attributes: u64, size_pointer: u6
             section_objects::update(pointer, |state| state.image_file_object = captured.pointer());
         }
         section_objects::set_security(pointer, security.clone());
+        // Sem nome nem descritor no OBJECT_ATTRIBUTES, o SECTION do NT fica
+        // sem descritor (o tipo não exige um e só o nome leva à herança).
+        let no_descriptor = info.security_descriptor == 0 && info.name.is_none();
+        section_objects::update(pointer, |state| state.no_descriptor = no_descriptor);
         if info.flags & 0x20 != 0 {
             let current = process::get_current_process();
             section_objects::update(pointer, |state| state.exclusive_process = current);
@@ -408,21 +459,7 @@ pub fn create(output: u64, access: u32, object_attributes: u64, size_pointer: u6
             created = None;
             return Ok(0);
         }
-        section_objects::update(pointer, |state| state.permanent = info.flags & 0x10 != 0);
-        if let (Some(_), Some(parent)) = (&info.name, info.parent) {
-            let Some(node) = object_manager::insert_named(parent, &info.leaf, "Section", Some(ObjectData::pointer(pointer)), info.insensitive) else { return Ok(0xC000_0035) };
-            let path = object_manager::path_of(node);
-            {
-                let mut owner = section.state.lock();
-                owner.node = Some(node);
-                owner.name = path.clone();
-            }
-            section_objects::update(pointer, |state| state.name = path.unwrap_or_default());
-        }
-        // Como no ObInsertObject, quem cria a seção recebe o acesso pedido
-        // sem a checagem pela DACL do descritor que ele mesmo deu (o handle
-        // continua na tabela do processo de quem chama).
-        let status = open_and_publish(pointer, info.flags, access, 0, output)?;
+        let status = publish(&section, &info, access, output)?;
         if status != 0 {
             return Ok(status);
         }

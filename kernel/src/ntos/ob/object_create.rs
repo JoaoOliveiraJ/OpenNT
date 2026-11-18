@@ -470,7 +470,14 @@ fn create_handle(object: u64, desired: u32, attributes: u32, mode: u8, root: u64
 // o objeto (o existente, com OBJ_OPENIF e STATUS_OBJECT_NAME_EXISTS). A
 // informação de criação e o descritor capturado voltam ao pool.
 pub fn insert(object: u64, desired: u32, bias: u32, new_object_out: u64, handle_out: u64) -> Result<u32, KernelError> {
-    let Some(header) = object_header::header(object) else { return Ok(STATUS_INVALID_PARAMETER) };
+    // O SECTION do MmCreateSection não tem OBJECT_HEADER no OpenNT: a
+    // inserção é a do Mm (`mm/section/insert`).
+    let Some(header) = object_header::header(object) else {
+        if crate::ntos::ob::objects::section::is_section(object) {
+            return crate::ntos::mm::section::insert::insert(object, desired, bias, new_object_out, handle_out);
+        }
+        return Ok(STATUS_INVALID_PARAMETER);
+    };
     let create_info = header.object_create_info.get();
     if header.flags.get() & object_header::FLAG_NEW_OBJECT == 0 || create_info == 0 {
         return Ok(STATUS_INVALID_PARAMETER);

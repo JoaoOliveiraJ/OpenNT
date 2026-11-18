@@ -123,7 +123,7 @@ pub mod open_pointer_exports {
     use crate::ntos::ob::open_pointer;
 
     fn open_object_by_pointer(call: &Call) -> Result<u64, KernelError> {
-        Ok(open_pointer::open(call.arg(1), call.arg(2) as u32, call.arg(3), call.arg(4) as u32, call.arg(5), call.arg(6) as u8, call.arg(7))? as u64)
+        Ok(open_pointer::open_by_pointer(call.arg(1), call.arg(2) as u32, call.arg(3), call.arg(4) as u32, call.arg(5), call.arg(6) as u8, call.arg(7))? as u64)
     }
 
     pub static GROUP: Group = Group {

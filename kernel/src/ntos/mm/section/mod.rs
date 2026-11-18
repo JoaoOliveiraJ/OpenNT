@@ -10,6 +10,7 @@ pub mod image_view;
 pub mod views;
 pub mod file;
 pub mod create;
+pub mod insert;
 pub mod open;
 pub mod map_view;
 pub mod map_view_parameters;

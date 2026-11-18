@@ -97,6 +97,12 @@ pub trait ObjectOwner: Send + Sync {
     fn set_security(&self, _pointer: u64, _security: SecurityPolicy) -> bool {
         false
     }
+    /// O corpo tem descritor de segurança; `false` é o SecurityDescriptor
+    /// nulo do NT (objeto sem nome criado sem descritor, num tipo que não o
+    /// exige), e a abertura por ponteiro não passa pelo SeAccessCheck.
+    fn has_descriptor(&self, _pointer: u64) -> bool {
+        true
+    }
     /// Processo dono de um objeto exclusivo (0 = compartilhado).
     fn exclusive_process(&self, _pointer: u64) -> u64 {
         0
@@ -383,11 +389,33 @@ impl ObjectHooks for HandleBodies {
     }
 }
 
-/// ObOpenObjectByPointer: valida tipo, atributos, exclusividade e acesso e
-/// publica o handle no processo correto. A saída é zerada antes da
-/// validação (RVA 653F8E na referência 19041).
+/// OBJ_VALID_KERNEL_ATTRIBUTES (com o OBJ_KERNEL_EXCLUSIVE 0x10000 das
+/// seções que o win32k cria): os bits que chegam ao handle.
+const VALID_KERNEL_ATTRIBUTES: u32 = 0x11FF2;
+
+/// Abertura por ponteiro dos serviços do OpenNT: os atributos já vieram de
+/// um OBJECT_ATTRIBUTES capturado e seguem o OBJ_VALID_KERNEL_ATTRIBUTES.
 #[allow(clippy::too_many_arguments)]
 pub fn open(pointer: u64, attributes: u32, access_state: u64, desired_access: u32, object_type: u64, access_mode: u8, output_handle: u64) -> Result<u32, KernelError> {
+    open_object(pointer, attributes, access_state, desired_access, object_type, access_mode, output_handle, false)
+}
+
+/// O ObOpenObjectByPointer exportado (rva 0x653F10): os HandleAttributes só
+/// passam pelo TypeInfo.InvalidAttributes do tipo (0x653FB4), sem a captura
+/// de OBJECT_ATTRIBUTES; o win32k abre as seções compartilhadas do
+/// DirectComposition com 0xC0000000 nesse argumento. Os bits sem significado
+/// para o handle não seguem adiante.
+#[allow(clippy::too_many_arguments)]
+pub fn open_by_pointer(pointer: u64, attributes: u32, access_state: u64, desired_access: u32, object_type: u64, access_mode: u8, output_handle: u64) -> Result<u32, KernelError> {
+    open_object(pointer, attributes, access_state, desired_access, object_type, access_mode, output_handle, true)
+}
+
+/// ObOpenObjectByPointer: valida tipo, atributos, exclusividade e acesso e
+/// publica o handle no processo correto. A saída é zerada antes da
+/// validação (RVA 653F8E na referência 19041). Um objeto sem descritor não
+/// passa pelo SeAccessCheck (`object_security::has_descriptor`).
+#[allow(clippy::too_many_arguments)]
+fn open_object(pointer: u64, attributes: u32, access_state: u64, desired_access: u32, object_type: u64, access_mode: u8, output_handle: u64, by_pointer: bool) -> Result<u32, KernelError> {
     if irql::get_irql() > 1 {
         return Err(KernelError::new("ObOpenObjectByPointer above APC_LEVEL"));
     }
@@ -400,11 +428,11 @@ pub fn open(pointer: u64, attributes: u32, access_state: u64, desired_access: u3
     }
     // OBJ_EXCLUSIVE não transforma uma instância compartilhada já criada.
     let exclusive = item.owner.exclusive_process(pointer);
-    // OBJ_VALID_KERNEL_ATTRIBUTES: o OBJ_KERNEL_EXCLUSIVE (0x10000) das
-    // seções que o win32k cria também chega ao handle.
-    if attributes & !0x11FF2 != 0 || (attributes & 0x20 != 0 && exclusive == 0) {
+    let invalid = if by_pointer { object_types::invalid_attributes(&item.object_type) } else { !VALID_KERNEL_ATTRIBUTES };
+    if attributes & invalid != 0 || (attributes & 0x20 != 0 && exclusive == 0) {
         return Ok(0xC000_000D);
     }
+    let attributes = attributes & VALID_KERNEL_ATTRIBUTES;
     if exclusive != 0 && exclusive != process::get_current_process() {
         return Ok(0xC000_0022);
     }
@@ -434,7 +462,9 @@ pub fn open(pointer: u64, attributes: u32, access_state: u64, desired_access: u3
     } else if enforce && thread_tokens::get(process::get_current_thread()).is_some_and(|impersonation| impersonation.level < 2) {
         return Ok(0xC000_00A5);
     }
-    let rights = match object_access::check(&super::object_security::described_policy(&item), subject, remaining, &item.object_type, !enforce) {
+    // Sem descritor, o pedido mapeado é concedido como em KernelMode.
+    let checked = enforce && super::object_security::has_descriptor(&item);
+    let rights = match object_access::check(&super::object_security::described_policy(&item), subject, remaining, &item.object_type, !checked) {
         Ok(access) => access,
         Err(status) => return Ok(status),
     };

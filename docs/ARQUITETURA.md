@@ -1087,6 +1087,20 @@ além da KUSER_SHARED_DATA:
   que `ob/objects/section.rs` aplica às seções marcadas. Vistas dela (o
   MiMapViewOfPhysicalSection) ainda não existem: o NtMapViewOfSection
   recusa com uma linha `[section]` na serial.
+- **Seções do VidMm e do DirectComposition** (`mm/section/create.rs`,
+  `insert.rs`, `ps/user/sections.rs`): uma seção de pagefile com SEC_COMMIT
+  tem os frames confirmados na criação, e toda vista (a de sistema, a de
+  sessão, as dos processos e as PTEs de sistema de um MDL travado) é alias
+  dos mesmos frames. O MmCreateSection devolve o SECTION ainda como objeto
+  novo; o ObInsertObject dele (`insert.rs`, chamado pelo
+  `ob/object_create.rs` para um corpo de seção) abre o handle de criação,
+  publica um nome capturado e solta a referência de criação, e um segundo
+  ObInsertObject dá STATUS_INVALID_PARAMETER. O dxgmms2 insere assim o
+  backing store de cada alocação e depois o abre por ponteiro em UserMode
+  com acesso 0 (seção sem descritor). SEC_NO_CHANGE na criação marca a seção
+  e toda vista dela recusa trocar a proteção, como no MiMapViewOfDataSection.
+  O NtUnmapViewOfSection de usuário ainda não recusa uma vista SEC_NO_CHANGE
+  (o MiCheckSecuredVad do NT).
 - **Cópias de sistema** (`ps/user/loader.rs`): a ntdll, o apiset e as
   tabelas NLS são mapeados uma vez, na raiz do System (o mapeamento roda
   anexado ao System, venha o pedido de onde vier), e fotografados logo
@@ -2128,6 +2142,14 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   ZwQueryObject e o Nt/ZwQuerySecurityObject (que passa pelo
   SecurityProcedure de cada tipo: IRP_MJ_QUERY_SECURITY nos arquivos, o
   DEVICE_OBJECT, o nó da chave, o SeQuerySecurityDescriptorInfo nos demais).
+  Um objeto pode não ter descritor (o SecurityDescriptor nulo do NT: sem
+  nome, criado sem descritor, num tipo sem SecurityRequired; as seções assim
+  marcam `no_descriptor`): a abertura por ponteiro concede o acesso pedido
+  sem SeAccessCheck, como o ObpCreateHandle (`has_descriptor`). O export
+  ObOpenObjectByPointer (`open_pointer::open_by_pointer`) só confere os
+  HandleAttributes contra o TypeInfo.InvalidAttributes do tipo, sem a
+  captura de OBJECT_ATTRIBUTES; o win32k passa 0xC0000000 ali ao abrir as
+  seções compartilhadas do DirectComposition.
   O SecurityInformation não é validado: só dá o acesso que o handle precisa
   (o SeQuerySecurityAccessMask e o SeSetSecurityAccessMask,
   `se/query_descriptor.rs::query_access_mask` e
