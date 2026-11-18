@@ -1929,7 +1929,11 @@ simulador (`tpm_server.exe`, ao lado do QEMU, ou a variável
 temporária da execução (`qemu-tmp`), e o mata antes de apagar a pasta. O
 reset do dispositivo no QEMU desliga e religa o TPM pelo canal de
 plataforma, como um reset da placa. O SeaBIOS manda o TPM2_Startup e
-estende os PCRs dele antes do boot.
+estende os PCRs dele antes do boot. A máquina com `--tpm` roda no TCG
+(`qemu::machine_accelerator`, e `acelerador = "tcg"` no teste): o WHPX do
+QEMU não mapeia as regiões de memória do tpm-crb (o buffer de comando de
+0xF80 bytes e o PPI de 0x400), e o QEMU para no realize do dispositivo com
+"WHPX: failed to unmap GPA range".
 
 O acpi.sys relata o `ACPI\MSFT0101` sob a raiz ACPI e o instalador o casa
 com o tpm.inf (`[Tpm2BaseInstall]`: serviço TPM sob demanda, grupo Boot Bus

@@ -365,7 +365,7 @@ fn execute(arguments: Arguments) -> Result<(), String> {
         "run" => {
             let output = build::build(&arguments.build)?;
             let mut machine = arguments.machine.clone();
-            machine.accelerator = qemu::resolve_accelerator(&machine.accelerator)?;
+            machine.accelerator = qemu::machine_accelerator(&machine)?;
             if !arguments.build.kd.is_empty() && machine.kd_port.is_none() {
                 machine.kd_port = Some(1234);
             }
@@ -403,7 +403,7 @@ fn execute(arguments: Arguments) -> Result<(), String> {
             }
             let log = build_dir.join("serial.log");
             let mut machine = arguments.machine.clone();
-            machine.accelerator = qemu::resolve_accelerator(&machine.accelerator)?;
+            machine.accelerator = qemu::machine_accelerator(&machine)?;
             if !options.kd.is_empty() && machine.kd_port.is_none() {
                 machine.kd_port = Some(qemu::free_port()?);
             }

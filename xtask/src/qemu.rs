@@ -197,6 +197,18 @@ pub fn resolve_accelerator(requested: &str) -> Result<String, String> {
     }
 }
 
+/// O acelerador de uma máquina. Com `--tpm` é o TCG: o WHPX do QEMU não
+/// mapeia as regiões de memória do tpm-crb (o buffer de comando de 0xF80
+/// bytes e a página do PPI de 0x400, menores que uma página), e o QEMU para
+/// no realize do dispositivo ("WHPX: failed to unmap GPA range").
+pub fn machine_accelerator(machine: &MachineOptions) -> Result<String, String> {
+    match (machine.tpm, machine.accelerator.as_str()) {
+        (true, "whpx") => Err("--tpm roda no TCG: o WHPX do QEMU nao mapeia as regioes do tpm-crb (use --accel=tcg)".into()),
+        (true, _) => Ok("tcg".into()),
+        (false, requested) => resolve_accelerator(requested),
+    }
+}
+
 /// Os discos da máquina: o de boot (`os.img`), o volume NTFS de dados e o
 /// disco do controlador NVMe (`--storage=nvme`).
 pub struct Disks {
@@ -1345,10 +1357,14 @@ mod tests {
         let at = arguments.iter().position(|argument| argument == "-tpmdev").expect("-tpmdev");
         assert_eq!(arguments[at + 1], "mssim,id=tpm0,host=127.0.0.1,port=40000");
         assert_eq!(arguments[at + 2..at + 4], ["-device".to_string(), "tpm-crb,tpmdev=tpm0".to_string()]);
-        let plain = machine_arguments(&disks, &MachineOptions { tpm: false, ..machine }, true, None);
+        let plain = machine_arguments(&disks, &MachineOptions { tpm: false, ..machine.clone() }, true, None);
         assert!(!plain.iter().any(|argument| argument.contains("tpm")));
         let port = free_port_pair().unwrap();
         assert!(TcpListener::bind(("127.0.0.1", port)).is_ok() && TcpListener::bind(("127.0.0.1", port + 1)).is_ok());
+        // Com o TPM a máquina fica no TCG: o `auto` vira TCG e o WHPX é recusado.
+        assert_eq!(machine_accelerator(&MachineOptions { accelerator: "auto".into(), ..machine.clone() }), Ok("tcg".to_string()));
+        assert!(machine_accelerator(&MachineOptions { accelerator: "whpx".into(), ..machine.clone() }).is_err());
+        assert_eq!(machine_accelerator(&MachineOptions { accelerator: "whpx".into(), tpm: false, ..machine }), Ok("whpx".to_string()));
     }
 
     fn screen(width: usize, height: usize, fill: [u8; 3]) -> Image {
