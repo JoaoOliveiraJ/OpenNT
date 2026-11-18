@@ -2560,6 +2560,21 @@ fn user_syscalls_core(assert: Assert) {
     let continued = call("NtContinue", context, 0, 0, 0);
     let frame = frame_block + 0x1000 - 0x78;
     assert(continued == 0x5566_7788 && guest::read64(frame) == 0x1122_3344_5566_7788 && guest::read64(frame + 8) == 0x1_4000_1000 && guest::read64(frame + 0x40) == 0x21_0DD5 | 0x200 && crate::ntos::ke::pcr::current().user_rsp.get() == 0x7FF0_0000, "usercore: NtContinue reescreve o frame com RFLAGS filtrado");
+    // CONTEXT_FLOATING_POINT como o KxContextToKframes: o MXCSR é o
+    // Context.MxCsr com a máscara do FXSAVE da entrada do serviço (zero vale
+    // 0xFFBF), sem recusar bits inválidos, e a palavra de controle x87 perde
+    // os bits reservados.
+    // SAFETY: a área FXSAVE abaixo do frame, no bloco do teste.
+    let float_image = unsafe { nt::XsaveFormat::at(frame - 0x208) };
+    context_record.context_flags.set(0x10_000B);
+    context_record.mx_csr.set(0xDEAD_9FC0);
+    context_record.flt_save.mx_csr.set(0xFFFF_0000);
+    context_record.flt_save.control_word.set(0xFFFF);
+    float_image.mx_csr_mask.set(0xFFFF);
+    let masked = call("NtContinue", context, 0, 0, 0) == 0x5566_7788 && float_image.mx_csr.get() == 0x9FC0 && float_image.control_word.get() == 0x1F3F;
+    float_image.mx_csr_mask.set(0);
+    let default_mask = call("NtContinue", context, 0, 0, 0) == 0x5566_7788 && float_image.mx_csr.get() == 0x9F80;
+    assert(masked && default_mask, "usercore: NtContinue mascara o MXCSR pelo MXCSR_MASK em vez de recusar e limpa os bits reservados do x87");
     crate::ntos::ke::pcr::current().user_rsp.set(saved_rsp);
     rsp_base.set(saved);
     guest::free_bytes(frame_block);

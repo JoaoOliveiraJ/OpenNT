@@ -171,9 +171,12 @@ fn nt_query_performance_counter(counter: u64, frequency: u64, _a3: u64, _a4: u64
 
 /// NtContinue(context, alertable): reescreve o frame do syscall com o
 /// CONTEXT; o retorno da HAL retoma o contexto. GPRs são copiados como
-/// padrões de bits opacos. Com CONTEXT_XSTATE, o pedaço XSTATE do
-/// CONTEXT_EX vai ao estado estendido da thread, que volta à CPU (o
-/// KxContextToKframes do KiContinue).
+/// padrões de bits opacos. Com CONTEXT_FLOATING_POINT, como o
+/// KxContextToKframes de UserMode: o MXCSR que vale é Context.MxCsr &
+/// KiMxCsrMask (bits inválidos são mascarados, não recusados) e a palavra de
+/// controle x87 do FltSave perde os bits reservados (& 0x1F3F). Com
+/// CONTEXT_XSTATE, o pedaço XSTATE do CONTEXT_EX vai ao estado estendido da
+/// thread, que volta à CPU.
 fn nt_continue(context: u64, _alertable: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
     if context == 0 || !probe_user_read(context, 0x300) {
         return Ok(0xC000_0005);
@@ -189,10 +192,6 @@ fn nt_continue(context: u64, _alertable: u64, _a3: u64, _a4: u64, _rsp: u64) -> 
                 return Ok(status);
             }
         }
-        // Bits reservados fariam o FXRSTOR falhar no kernel.
-        if flags & 8 != 0 && user.flt_save.mx_csr.probe_get()? & !0xFFFF != 0 {
-            return Ok(STATUS_INVALID_PARAMETER);
-        }
         let canonical = |value: u64| value > 0 && value < 0x8000_0000_0000;
         let (rip, rsp) = (user.rip.probe_get()?, user.rsp.probe_get()?);
         if !canonical(rip) || !canonical(rsp) || user.seg_cs.probe_get()? != 0x33 || user.seg_ss.probe_get()? != 0x2B {
@@ -204,7 +203,7 @@ fn nt_continue(context: u64, _alertable: u64, _a3: u64, _a4: u64, _rsp: u64) -> 
         let [rax, rcx, rdx, rbx, rbp, rsi, rdi, r8, r9, r10, r11, r12, r13, r14, r15] = [&user.rax, &user.rcx, &user.rdx, &user.rbx, &user.rbp, &user.rsi, &user.rdi, &user.r8, &user.r9, &user.r10, &user.r11, &user.r12, &user.r13, &user.r14, &user.r15].map(|register| register.probe_get());
         let (rax, rcx, rdx, rbx, rbp, rsi, rdi, r8, r9, r10, r11, r12, r13, r14, r15) = (rax?, rcx?, rdx?, rbx?, rbp?, rsi?, rdi?, r8?, r9?, r10?, r11?, r12?, r13?, r14?, r15?);
         let eflags = user.e_flags.probe_get()?;
-        let float_image = if flags & 8 != 0 { Some(guest::try_read_bytes(user.flt_save.address(), XsaveFormat::SIZE as usize)?) } else { None };
+        let float_state = if flags & 8 != 0 { Some((guest::try_read_bytes(user.flt_save.address(), XsaveFormat::SIZE as usize)?, user.mx_csr.probe_get()?)) } else { None };
         let xstate = if crate::ntos::ps::context::xstate::requested(flags) {
             match crate::ntos::ps::context::xstate::capture_user(context, flags)? {
                 Ok(extended) => Some(extended),
@@ -246,9 +245,20 @@ fn nt_continue(context: u64, _alertable: u64, _a3: u64, _a4: u64, _rsp: u64) -> 
         let block = usermode::block();
         block.continue_rcx.set(rcx); // RCX independente do RIP
         block.continue_r11.set(r11); // R11 independente do RFLAGS
-        if let Some(image) = float_image {
-            // Imagem FXSAVE que o retorno da HAL restaura, logo abaixo do frame.
-            guest::write_bytes(frame.address() - 0x208, &image);
+        if let Some((image, mxcsr)) = float_state {
+            // Imagem FXSAVE que o retorno da HAL restaura, logo abaixo do
+            // frame, no lugar da que a entrada do serviço gravou: o
+            // MXCSR_MASK dela é a máscara do processador (zero vale 0xFFBF).
+            // SAFETY: a área FXSAVE alinhada abaixo do frame do syscall, na
+            // pilha de kernel da thread.
+            let saved = unsafe { XsaveFormat::at(frame.address() - 0x208) };
+            let mask = match saved.mx_csr_mask.get() {
+                0 => 0xFFBF,
+                mask => mask,
+            };
+            guest::write_bytes(saved.address(), &image);
+            saved.mx_csr.set(mxcsr & mask);
+            saved.control_word.set(saved.control_word.get() & 0x1F3F);
         }
         if debug_bank != 0 {
             if let Some(setter) = *SET_USER_DEBUG_REGISTERS.lock() {
