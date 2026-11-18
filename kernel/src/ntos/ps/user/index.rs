@@ -110,6 +110,33 @@ fn traced_object_name(name: &str, arguments: &[u64; 4]) -> Option<alloc::string:
     registry::parse_user_object_attributes(attributes).map(|parsed| parsed.path).filter(|path| !path.is_empty())
 }
 
+/// O nome da porta dos serviços de conexão, lido (sondado) antes da chamada:
+/// a UNICODE_STRING PortName no segundo argumento do NtAlpcConnectPort, do
+/// NtConnectPort e do NtSecureConnectPort, o OBJECT_ATTRIBUTES do
+/// NtAlpcConnectPortEx. Uma falha de conexão aparece com o nome, inclusive
+/// STATUS_OBJECT_NAME_NOT_FOUND (a porta que ainda não existe).
+fn connect_port_name(name: &str, arguments: &[u64; 4]) -> Option<alloc::string::String> {
+    use crate::ntos::inc::field::NtStruct as _;
+    match name {
+        "NtAlpcConnectPort" | "NtConnectPort" | "NtSecureConnectPort" => {
+            let string = crate::ntos::inc::types::UnicodeString::try_at(arguments[1]).ok()?;
+            let (length, buffer) = (string.length.probe_get().ok()?, string.buffer.probe_get().ok()?);
+            state::try_read_user_wide_string(buffer, (length / 2).min(256) as u64).ok()
+        }
+        "NtAlpcConnectPortEx" => traced_object_name(name, arguments),
+        _ => None,
+    }
+}
+
+/// O retorno do chamador do stub da ntdll (`[rsp]` na entrada do syscall):
+/// o `rip` da linha é sempre o `ret` do próprio stub.
+fn stub_caller(user_rsp: u64) -> u64 {
+    if user_rsp == 0 || !state::probe_user_read(user_rsp, 8) {
+        return 0;
+    }
+    guest::try_read::<u64>(user_rsp).unwrap_or(0)
+}
+
 /// Despacha ao handler por nome; NOT_FOUND, TIMEOUT, BUFFER_TOO_SMALL e
 /// PORT_NOT_SET são respostas legítimas e não aparecem como falha.
 pub fn handle_service(name: Option<&str>, arguments: [u64; 4], rip: u64, user_rsp: u64, number: u32) -> Result<u32, KernelError> {
@@ -127,12 +154,23 @@ pub fn handle_service(name: Option<&str>, arguments: [u64; 4], rip: u64, user_rs
         crate::debug_print!("[usermode] primeiro: {}", name);
     }
     let traced_name = if crate::ntos::init::boot_config::TRACE_SYSCALLS { traced_object_name(name, &arguments) } else { None };
+    let port_name = connect_port_name(name, &arguments);
+    // O IoControlCode/FsControlCode (sexto argumento) antes da chamada.
+    let control_code = if matches!(name, "NtDeviceIoControlFile" | "NtFsControlFile") { Some(state::stack_arg32(user_rsp, 6)) } else { None };
     let result = handler(arguments[0], arguments[1], arguments[2], arguments[3], user_rsp)?;
     if crate::ntos::init::boot_config::TRACE_SYSCALLS {
         crate::debug_print!("[sys] {}:{} {}({:#x}, {:#x}, {:#x}, {:#x}) = {:#x} (rip {:#x}){}", crate::ntos::ps::process::get_current_process_id(), crate::ntos::ps::process::get_current_thread_id(), name, arguments[0], arguments[1], arguments[2], arguments[3], result, rip, traced_name.map_or_else(alloc::string::String::new, |path| alloc::format!(" \"{path}\"")));
     }
-    if result & 0x8000_0000 != 0 && ![0xC000_0034, 0xC000_0225, 0x102, 0xC000_0023, 0xC000_0353].contains(&result) {
-        crate::debug_print!("[usermode] {} FALHOU com {:#x} (rip {:#x})", name, result, rip);
+    let failed = result & 0x8000_0000 != 0;
+    if failed && (![0xC000_0034, 0xC000_0225, 0x102, 0xC000_0023, 0xC000_0353].contains(&result) || port_name.is_some()) {
+        let mut detail = alloc::string::String::new();
+        if let Some(port) = &port_name {
+            detail = alloc::format!(" porta \"{port}\"");
+        }
+        if let Some(code) = control_code {
+            detail = alloc::format!(" codigo {code:#x}");
+        }
+        crate::debug_print!("[usermode] {}:{} {} FALHOU com {:#x} (rip {:#x}, chamador {:#x}){}", crate::ntos::ps::process::get_current_process_id(), crate::ntos::ps::process::get_current_thread_id(), name, result, rip, stub_caller(user_rsp), detail);
     }
     Ok(result)
 }
