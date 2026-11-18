@@ -652,6 +652,14 @@ const LOGON_SCREEN_PROGRAMS: &[&str] = &[
     "Windows.UI.XamlHost.dll",
     "Windows.UI.Xaml.Resources.Common.dll",
     "Windows.UI.Xaml.Resources.19h1.dll",
+    // O FontGlyphAnimator.dll, servidor em processo da classe WinRT
+    // Windows.Internal.UI.FontGlyphAnimator.Data.AnimationDataProvider que o
+    // FontGlyphAnimatorModel do Windows.UI.Logon.dll cria (ref new) no
+    // DataTemplate do bloco do usuário: sem a classe registrada a ativação
+    // dá REGDB_E_CLASSNOTREG, o XAML relata erro de análise
+    // (E_XAMLPARSEFAILED) e o LogonUI termina com 0xC000027B. Só importa
+    // msvcrt e API sets.
+    "FontGlyphAnimator.dll",
     "Windows.UI.dll",
     "Windows.Globalization.dll",
     "Windows.Globalization.Fontgroups.dll",
