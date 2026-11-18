@@ -467,11 +467,67 @@ pub fn drawn_pixels(image: &crate::png::Image) -> Option<String> {
     ))
 }
 
+/// O marcador da tela de logon do `--watch-screen`.
+pub const LOGON_SCREEN_MARKER: &str = "LOGON_SCREEN_OK";
+/// A tela de logon cobre pelo menos um quarto da tela com pixels não pretos.
+const LOGON_AREA_DIVISOR: usize = 4;
+/// E tem pelo menos tantas cores, cada uma com pelo menos tantos pixels: uma
+/// imagem ou um fundo com texto, não um retângulo de cor única nem o ponteiro.
+const LOGON_COLORS: usize = 8;
+const LOGON_COLOR_PIXELS: usize = 500;
+
+/// A tela de logon numa tela do QEMU, ou None: uma tela gráfica de pelo
+/// menos 800x600 que não é a de bugcheck, com um quarto ou mais dela fora do
+/// preto e [`LOGON_COLORS`] cores de pelo menos [`LOGON_COLOR_PIXELS`]
+/// pixels cada. O primeiro pixel (o ponteiro do mouse, [`drawn_pixels`])
+/// não basta.
+pub fn logon_screen(image: &crate::png::Image) -> Option<String> {
+    if image.height < 600 || image.width < 800 {
+        return None;
+    }
+    let total = image.width * image.height;
+    let mut drawn = 0usize;
+    let mut bugcheck = 0usize;
+    let mut colors: std::collections::HashMap<[u8; 3], usize> = std::collections::HashMap::new();
+    for pixel in image.rgb.chunks_exact(3) {
+        let rgb = [pixel[0], pixel[1], pixel[2]];
+        if rgb == BUGCHECK_BACKGROUND {
+            bugcheck += 1;
+        }
+        if rgb.iter().all(|&channel| channel <= BLACK_LEVEL) {
+            continue;
+        }
+        drawn += 1;
+        *colors.entry(rgb).or_default() += 1;
+    }
+    if bugcheck * 2 > total || drawn * LOGON_AREA_DIVISOR < total {
+        return None;
+    }
+    let mut common: Vec<([u8; 3], usize)> = colors.into_iter().filter(|(_, count)| *count >= LOGON_COLOR_PIXELS).collect();
+    if common.len() < LOGON_COLORS {
+        return None;
+    }
+    common.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let palette: Vec<String> = common.iter().take(4).map(|(rgb, count)| format!("#{:02x}{:02x}{:02x} x{count}", rgb[0], rgb[1], rgb[2])).collect();
+    Some(format!("{drawn} de {total} pixels desenhados, {} cores com {LOGON_COLOR_PIXELS} pixels ou mais; cores: {}", common.len(), palette.join(", ")))
+}
+
+/// Grava uma captura da tela em `target`, com a descrição nos metadados.
+fn save_capture(image: &crate::png::Image, target: &std::path::Path, result: &str, description: &str) {
+    let png = crate::png::encode_capture(image, &[("opennt-data", crate::png::today().as_str()), ("opennt-resultado", result), ("opennt-serial", description)], CAPTURE_LIMIT);
+    if std::fs::write(target, &png).is_ok() {
+        println!("[xtask] {result}: {}", target.display());
+    }
+}
+
 /// A vigia da tela (`--watch-screen`): a cada [`SCREEN_POLL`] lê a tela
-/// pelo QMP e, na primeira com pixels desenhados, escreve a descrição e o
-/// marcador no log da serial e grava o PNG em `first` (se houver).
+/// pelo QMP. Na primeira com pixels desenhados escreve a descrição e o
+/// `FIRST_PIXEL_OK` no log da serial e grava o PNG em `first` (se houver);
+/// depois segue lendo até a tela de logon ([`logon_screen`]), que sai com o
+/// `LOGON_SCREEN_OK` e vai para `tela-de-logon.png`, ao lado.
 fn watch_screen(port: u16, scratch: PathBuf, first: Option<PathBuf>, output: Arc<Mutex<String>>, stop: Arc<std::sync::atomic::AtomicBool>) {
     use std::sync::atomic::Ordering;
+    let mut first_seen = false;
     while !stop.load(Ordering::Acquire) {
         thread::sleep(SCREEN_POLL);
         if stop.load(Ordering::Acquire) || qmp_screendump(port, &scratch).is_err() {
@@ -479,15 +535,22 @@ fn watch_screen(port: u16, scratch: PathBuf, first: Option<PathBuf>, output: Arc
         }
         let Ok(bytes) = std::fs::read(&scratch) else { continue };
         let Ok(image) = crate::png::read_ppm(&bytes) else { continue };
-        let Some(description) = drawn_pixels(&image) else { continue };
-        let line = format!("\n[xtask] tela: {description}\n{FIRST_PIXEL_MARKER}\n");
+        if !first_seen {
+            let Some(description) = drawn_pixels(&image) else { continue };
+            first_seen = true;
+            let line = format!("\n[xtask] tela: {description}\n{FIRST_PIXEL_MARKER}\n");
+            print!("{line}");
+            output.lock().unwrap().push_str(&line);
+            if let Some(target) = &first {
+                save_capture(&image, target, "primeira tela desenhada", &description);
+            }
+        }
+        let Some(description) = logon_screen(&image) else { continue };
+        let line = format!("\n[xtask] tela de logon: {description}\n{LOGON_SCREEN_MARKER}\n");
         print!("{line}");
         output.lock().unwrap().push_str(&line);
-        if let Some(target) = first {
-            let png = crate::png::encode_capture(&image, &[("opennt-data", crate::png::today().as_str()), ("opennt-resultado", "primeira tela desenhada"), ("opennt-serial", description.as_str())], CAPTURE_LIMIT);
-            if std::fs::write(&target, &png).is_ok() {
-                println!("[xtask] primeira tela desenhada: {}", target.display());
-            }
+        if let Some(target) = &first {
+            save_capture(&image, &target.with_file_name("tela-de-logon.png"), "tela de logon", &description);
         }
         break;
     }
@@ -1185,5 +1248,30 @@ mod tests {
         let mut few = screen(1024, 768, [0, 0, 0]);
         few.rgb[0..3].copy_from_slice(&[0xFF, 0, 0]);
         assert!(drawn_pixels(&few).is_none());
+    }
+
+    #[test]
+    fn logon_screen_needs_a_large_area_with_several_colors() {
+        // O ponteiro sobre o preto e uma tela de cor única não são a tela de
+        // logon; a de bugcheck também não.
+        let mut pointer = screen(1024, 768, [0, 0, 0]);
+        pointer.rgb[0..3 * 73].fill(0xFF);
+        assert!(logon_screen(&pointer).is_none());
+        assert!(logon_screen(&screen(1024, 768, [0x10, 0x60, 0xA0])).is_none());
+        assert!(logon_screen(&screen(1024, 768, BUGCHECK_BACKGROUND)).is_none());
+        // Faixas de 16 cores cobrindo a tela inteira contam.
+        let mut bands = screen(1024, 768, [0, 0, 0]);
+        for (index, pixel) in bands.rgb.chunks_exact_mut(3).enumerate() {
+            let band = ((index % 1024) / 64) as u8;
+            pixel.copy_from_slice(&[0x40 + band * 8, 0x80, 0xC0 - band * 4]);
+        }
+        let description = logon_screen(&bands).expect("faixas coloridas");
+        assert!(description.starts_with("786432 de 786432 pixels desenhados, 16 cores"), "{description}");
+        // Metade da tela de cores, mas com só 4 cores: não basta.
+        let mut four = screen(1024, 768, [0, 0, 0]);
+        for (index, pixel) in four.rgb.chunks_exact_mut(3).enumerate().filter(|(index, _)| index % 1024 < 512) {
+            pixel.copy_from_slice(&[0x80, (index % 4) as u8 * 0x30 + 0x40, 0x80]);
+        }
+        assert!(logon_screen(&four).is_none());
     }
 }

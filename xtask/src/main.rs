@@ -103,7 +103,8 @@ test-boot:         --keys=TEXTO (\\n = Enter) --expect=TEXTO (repetivel)
                    --script=ARQ (com --kd: roteiro do cliente do depurador em paralelo)
                    --capture=ARQ.png (no fim do teste, a tela do QEMU pelo screendump do QMP)
                    --watch-screen (le a tela durante o teste; FIRST_PIXEL_OK na serial quando
-                   a tela grafica mostra pixels desenhados)
+                   a tela grafica mostra pixels desenhados e LOGON_SCREEN_OK quando um quarto
+                   ou mais dela esta desenhado com 8 cores ou mais)
                    --expect-poweroff (no fim o QEMU sai sozinho pelo desligamento ACPI)
                    --power-cycles=N (religa ate N vezes o QEMU que o convidado desligou)
                    --allow-reboot (o reinicio do convidado reinicia a maquina)

@@ -258,6 +258,14 @@ comando = "cargo xtask test-boot FIRST_PIXEL_OK 600000 --initial-process=smss --
 descricao = "O boot do teste winlogon com o xtask lendo a tela do QEMU a cada 2 s (--watch-screen). O vídeo de boot (o modo VBE 1024x768 do BasicDisplay.sys) é todo preto. O marcador FIRST_PIXEL_OK sai quando uma tela gráfica de pelo menos 800x600 mostra 64 pixels ou mais fora do preto, sem ser a tela de bugcheck, e a tela vai para build/primeiro-pixel/primeira-tela.png. O PnP instala o BasicRender.sys em ROOT\\BASICRENDER (o adaptador de renderização WARP do dxgkrnl, com o dxgmms2.sys e o \\Device\\PhysicalMemory) e o monitor.sys no monitor que o BasicDisplay relata. Dentro do NtUserInitialize da sessão 1, o InitVideo do win32kbase abre o \\Device\\Video0, marca o dispositivo como WDDM e carrega o cdd.dll pelo ZwSetSystemInformation(26); o cdd acha o adaptador de renderização no dxgkrnl. O win32k põe o ponteiro do mouse no centro da tela e o BasicDisplay.sys o desenha direto no framebuffer: 73 pixels brancos. A Desktop do Winlogon é preta."
 
 [[teste]]
+id = "tela-de-logon"
+titulo = "Tela de logon do LogonUI.exe pelo dwm.exe"
+marcador = "LOGON_SCREEN_OK"
+comando = "cargo xtask test-boot LOGON_SCREEN_OK 1500000 --initial-process=smss --display=basic --build-dir=build/tela-de-logon --smp=1 --watch-screen"
+espera_falha = true
+descricao = "O boot do teste primeiro-pixel até a tela de logon. O xtask lê a tela do QEMU a cada 2 s (--watch-screen); depois do FIRST_PIXEL_OK, o marcador LOGON_SCREEN_OK sai quando um quarto ou mais da tela está fora do preto, com 8 cores ou mais de 500 pixels cada (a imagem da tela de bloqueio ou o fundo do LogonUI com o texto), e a tela vai para build/tela-de-logon/tela-de-logon.png. O ponteiro do mouse sozinho não basta. Ainda falha: o Local Session Manager para no registro do endpoint RPC dele e não sinaliza o TermSrvReadyEvent; o winlogon espera o LSM antes de conectar a sessão, criar o dwm.exe e o LogonUI.exe e mostrar a interface XAML do LogonUI composta pelo dwm sobre o adaptador WARP do BasicRender."
+
+[[teste]]
 id = "services"
 titulo = "services.exe e lsass.exe reais na sessão 0"
 marcador = "LSASS_STARTED"
@@ -1632,7 +1640,14 @@ nome = "Primeiro pixel do win32k.sys"
 grupo = "marco"
 teste = "primeiro-pixel"
 faz = "O InitVideo da sessão 1 carrega o cdd.dll sobre o adaptador de renderização do BasicRender.sys, e o win32k desenha o ponteiro do mouse pelo BasicDisplay.sys: o primeiro pixel na tela."
-para = "A Desktop do Winlogon fica preta: a tela de logon (o LogonUI sobre o dwm) vem depois do Local Session Manager, que para no registro do endpoint RPC (a conferência do RequiredServerSid na conexão ALPC ao epmapper)."
+para = "A Desktop do Winlogon fica preta: a tela de logon (o LogonUI sobre o dwm, teste tela-de-logon) vem depois do Local Session Manager, que ainda não sinaliza o TermSrvReadyEvent."
+
+[[roda]]
+nome = "Tela de logon"
+grupo = "marco"
+teste = "tela-de-logon"
+faz = "O xtask lê a tela do QEMU e espera a tela de logon: um quarto ou mais da tela desenhado com 8 cores ou mais, depois do primeiro pixel."
+para = "O Local Session Manager ainda não conecta a sessão 1; o winlogon não cria o dwm.exe nem o LogonUI.exe."
 
 [[roda]]
 nome = "Tela de bugcheck do Windows 10"
