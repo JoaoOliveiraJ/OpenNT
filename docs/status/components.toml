@@ -261,9 +261,9 @@ descricao = "O boot do teste winlogon com o xtask lendo a tela do QEMU a cada 2 
 id = "tela-de-logon"
 titulo = "Tela de logon do LogonUI.exe pelo dwm.exe"
 marcador = "LOGON_SCREEN_OK"
-comando = "cargo xtask test-boot LOGON_SCREEN_OK 1500000 --initial-process=smss --display=basic --build-dir=build/tela-de-logon --smp=1 --watch-screen"
+comando = "cargo xtask test-boot LOGON_SCREEN_OK 900000 --initial-process=smss --display=basic --build-dir=build/tela-de-logon --smp=1 --watch-screen --capture-every=30"
 espera_falha = true
-descricao = "O boot do teste primeiro-pixel até a tela de logon. O xtask lê a tela do QEMU a cada 2 s (--watch-screen); depois do FIRST_PIXEL_OK, o marcador LOGON_SCREEN_OK sai quando um quarto ou mais da tela está fora do preto, com 8 cores ou mais de 500 pixels cada (a imagem da tela de bloqueio ou o fundo do LogonUI com o texto), e a tela vai para build/tela-de-logon/tela-de-logon.png. O ponteiro do mouse sozinho não basta. Ainda falha: o Local Session Manager para no registro do endpoint RPC dele e não sinaliza o TermSrvReadyEvent; o winlogon espera o LSM antes de conectar a sessão, criar o dwm.exe e o LogonUI.exe e mostrar a interface XAML do LogonUI composta pelo dwm sobre o adaptador WARP do BasicRender."
+descricao = "O boot do teste primeiro-pixel até a tela de logon. O xtask lê a tela do QEMU a cada 2 s (--watch-screen); depois do FIRST_PIXEL_OK, o marcador LOGON_SCREEN_OK sai quando duas leituras seguidas mostram a mesma tela de logon: um quarto ou mais da tela fora do preto, a maior parte dos pixels vizinhos parecidos (uma imagem, não bytes quaisquer lidos como cor), 8 cores ou mais com 1/1536 da tela cada (512 pixels) e desenho em 3/5 das linhas e 3/5 das colunas. A tela de bloqueio de uma instalação nova (o Web\\Screen\\img100.jpg cobrindo a tela, com o relógio e a data) passa, também sem o texto; o ponteiro do mouse, uma cor lisa com texto (o LogonUI sem a imagem), memória lida como cor e um quadro pela metade não passam. A tela vai para build/tela-de-logon/tela-de-logon.png e, no cargo xtask capturas, para a captura do site. Com o --capture-every=30, as telas que mudaram durante o teste ficam em build/tela-de-logon/tela-NNNN.png e a do fim em tela-final.png; no test-all, a pasta de uma falha fica com elas. Ainda falha: depois da conexão da sessão 1, o winlogon cria o dwm.exe e o LogonUI.exe, mas a interface XAML do LogonUI composta pelo dwm sobre o adaptador WARP do BasicRender ainda não aparece."
 
 [[teste]]
 id = "services"
@@ -1661,8 +1661,8 @@ para = "A Desktop do Winlogon fica preta: a tela de logon (o LogonUI sobre o dwm
 nome = "Tela de logon"
 grupo = "marco"
 teste = "tela-de-logon"
-faz = "O xtask lê a tela do QEMU e espera a tela de logon: um quarto ou mais da tela desenhado com 8 cores ou mais, depois do primeiro pixel."
-para = "O Local Session Manager ainda não conecta a sessão 1; o winlogon não cria o dwm.exe nem o LogonUI.exe."
+faz = "O xtask lê a tela do QEMU e espera a tela de logon depois do primeiro pixel: uma imagem cobrindo a tela, com 8 cores ou mais, igual em duas leituras seguidas."
+para = "O winlogon cria o dwm.exe e o LogonUI.exe, mas a primeira tela composta pelo dwm ainda não aparece."
 
 [[roda]]
 nome = "Tela de bugcheck do Windows 10"
