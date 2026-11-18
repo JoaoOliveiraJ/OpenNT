@@ -57,6 +57,7 @@ mod service_chain;
 mod side_by_side;
 mod theme;
 mod user_services;
+mod window_manager;
 mod windows_binaries;
 mod status;
 mod test_all;

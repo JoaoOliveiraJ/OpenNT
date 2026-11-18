@@ -444,6 +444,8 @@ pub fn machine_hives(smss_boot: bool) -> Vec<(&'static str, Vec<u8>)> {
         // O tema visual que o uxinit do winlogon carrega (`theme`).
         software.extend(crate::theme::software_keys().into_iter().map(seed_of));
         default.extend(crate::theme::default_keys().into_iter().map(seed_of));
+        // As preferências do DWM (`window_manager`).
+        software.extend(crate::window_manager::software_keys().into_iter().map(seed_of));
     }
     let hives: [(&'static str, Vec<cm::seed::SeedKey>); 5] = [
         ("SYSTEM", system),

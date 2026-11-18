@@ -3806,7 +3806,7 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   de `Hardware Profiles` (o `LogPixels` do DPI, `xtask/src/fonts.rs`), o
   tema que o uxinit do winlogon carrega sem o serviço Themes (o
   `aero.msstyles` com o `.mui` e as chaves `ThemeManager` da SOFTWARE e da
-  DEFAULT, `xtask/src/theme.rs`), e as
+  DEFAULT, `xtask/src/theme.rs`), as
   classes COM em processo (`Classes\CLSID`: o LogonUIController, os
   provedores de credencial, a fábrica e os codecs do WIC) e WinRT
   (`WindowsRuntime\ActivatableClassId`) das DLLs do volume, as interfaces
@@ -3814,7 +3814,10 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   oleaut32 empacota pela biblioteca de tipos), com os
   provedores de `Authentication\Credential Providers` e o
   `Authentication\LogonUI` sem o último logon nem os SIDs de usuário desta
-  máquina (`xtask/src/logon_screen.rs`); a
+  máquina (`xtask/src/logon_screen.rs`), e a chave `Microsoft\Windows\DWM`
+  que o dwm.exe, o dwmcore e o dcomp leem e em que o dwminit grava a
+  atividade de cada sessão (sem os `DwmInitSessionActivityId_*` desta
+  máquina, `xtask/src/window_manager.rs`); a
   hive gerada põe uma chave com mais de 1012 subchaves em folhas sob uma
   raiz 'ri' (`xtask/src/hive_image.rs`). A inicialização do LSA (o
   LsapInitLsa e o LsapStartLsa do lsasrv) pede ainda: o
