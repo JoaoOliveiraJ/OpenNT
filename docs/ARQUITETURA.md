@@ -3806,8 +3806,9 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     pedidos que o cliente espera e os envios seguintes dele;
   - a resposta que o servidor manda sem RELEASE_MESSAGE numa porta que não
     é LPC é também um pedido: o cliente a recebe como LPC_REQUEST com
-    LPC_CONTINUATION_REQUIRED e pode respondê-la uma vez pelo MessageId dela,
-    mesmo com o CLIENT_ID do servidor no buffer reaproveitado; a resposta
+    LPC_CONTINUATION_REQUIRED e pode respondê-la uma vez pelo MessageId dela
+    (e o CallbackId, quando o cabeçalho traz um), com qualquer CLIENT_ID no
+    buffer reaproveitado; a resposta
     segue ao servidor como pedido novo (LPC_REPLY se vier com
     RELEASE_MESSAGE). É o protocolo da `\SmSsWinStationApiPort`: o lsm.dll
     responde sem RELEASE_MESSAGE ao pedido do winsrvext do csrss com o

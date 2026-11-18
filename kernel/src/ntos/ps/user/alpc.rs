@@ -137,9 +137,13 @@ fn queue_reply(port: &Arc<Port>, request: &Arc<Request>, result: &JobResult) -> 
         state.queued = true;
         state.direct = message.direct;
     });
+    // Um MessageId reaproveitado por outra mensagem deixa de nomear a resposta
+    // antiga.
     port.with(|state| {
         if continuation {
-            state.answerable.insert(identity.identifier);
+            state.answerable.insert(identity.identifier, identity.callback);
+        } else {
+            state.answerable.remove(&identity.identifier);
         }
         state.pending.push(message)
     });
@@ -845,10 +849,19 @@ fn send(port: &Arc<Port>, flags: u32, input: u64, send_attributes: u64, mode: u8
     let reserve_id = if lpc_request { 0 } else { u32::from_le_bytes([header[24], header[25], header[26], header[27]]) };
     // O MessageId de uma resposta que o servidor mandou sem RELEASE_MESSAGE
     // responde a ela (o AlpcpLookupMessage acha a mensagem pendente no
-    // cliente): o envio segue ao servidor como um pedido novo, LPC_REPLY com
-    // RELEASE_MESSAGE, e o CLIENT_ID que o buffer reaproveitado traz não
-    // conta (o winsrvext do csrss reenvia assim a resposta do lsm.dll).
-    let answer = !lpc_port && !legacy && reserve_id != 0 && reserve_id & 0x8000_0000 == 0 && port.with(|state| state.answerable.remove(&reserve_id));
+    // cliente, com o CallbackId dela quando o cabeçalho traz um): o envio
+    // segue ao servidor como um pedido novo, LPC_REPLY com RELEASE_MESSAGE, e
+    // o CLIENT_ID que o buffer reaproveitado traz não conta (o winsrvext do
+    // csrss reenvia assim a resposta do lsm.dll, com o próprio CLIENT_ID).
+    let callback = u32::from_le_bytes([header[32], header[33], header[34], header[35]]);
+    let answer = !lpc_port
+        && !legacy
+        && reserve_id != 0
+        && reserve_id & 0x8000_0000 == 0
+        && port.with(|state| match state.answerable.get(&reserve_id) {
+            Some(&held) if callback == 0 || callback == held => state.answerable.remove(&reserve_id).is_some(),
+            _ => false,
+        });
     let reserve_id = if answer { 0 } else { reserve_id };
     // IDs positivos designam associações de mensagem: esta ponta de cliente
     // não tem pedido de servidor correspondente. Reservas têm o bit alto. O

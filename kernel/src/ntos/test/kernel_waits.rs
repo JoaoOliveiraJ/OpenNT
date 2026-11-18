@@ -553,9 +553,12 @@ extern "win64" fn alpc_answer_client(block: u64) {
     record(block, 8, send());
     record(block, 9, type_and_word(exchange));
     // O buffer da resposta reaproveitado, como o gApiMsg do winsrvext: os
-    // comprimentos e o Type 0 de novo, o CLIENT_ID e o MessageId recebidos.
+    // comprimentos e o Type 0 de novo, o MessageId e o CallbackId recebidos e
+    // o CLIENT_ID da própria thread.
     let reuse = |data: &[u8; 4]| {
         guest::write64(exchange, 0x002C_0004);
+        guest::write64(exchange + 8, process::get_current_process_id());
+        guest::write64(exchange + 0x10, process::get_current_thread_id());
         guest::write_bytes(exchange + 0x28, data);
     };
     reuse(b"ACK1");

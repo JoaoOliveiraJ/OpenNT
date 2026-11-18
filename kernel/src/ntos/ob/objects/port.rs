@@ -137,9 +137,10 @@ pub struct PortState {
     /// MessageId da resposta (o reenvio com UNMAP_EXISTING as apaga).
     pub received_views: BTreeMap<u32, Arc<ViewBinding>>,
     /// As respostas que o servidor mandou sem ALPC_MSGFLG_RELEASE_MESSAGE,
-    /// pelo MessageId que o cliente recebeu: cada uma é também um pedido, que
-    /// o cliente responde uma vez pelo mesmo MessageId.
-    pub answerable: alloc::collections::BTreeSet<u32>,
+    /// pelo MessageId que o cliente recebeu, com o CallbackId delas: cada uma
+    /// é também um pedido, que o cliente responde uma vez pelo mesmo
+    /// MessageId.
+    pub answerable: BTreeMap<u32, u32>,
     pub owned_security_contexts: Vec<Arc<ContextRecord>>,
     pub pending: Vec<Message>,
     pub jobs: Vec<Arc<Request>>,
