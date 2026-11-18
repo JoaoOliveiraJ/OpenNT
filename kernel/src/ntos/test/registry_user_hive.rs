@@ -20,8 +20,17 @@
 //!   carga de novo com os dados;
 //! - a descarga de uma hive do boot (STATUS_ACCESS_DENIED), o primário vazio
 //!   como hive nova e a hive de aplicativo REG_PROCESS_PRIVATE, que não se
-//!   compartilha.
+//!   compartilha;
+//! - NtQueryOpenSubKeys(Ex) numa hive com chaves abertas (a contagem com o
+//!   corpo da própria referência, o PID e o nome de cada corpo, o buffer
+//!   curto e os erros de parâmetro) e o logoff do serviço de perfis
+//!   (NtUnloadKey recusado com chaves abertas, NtUnloadKey2 com
+//!   REG_FORCE_UNLOAD, STATUS_KEY_DELETED no handle que sobrou);
+//! - as regras da segunda tentativa do CmpCmdHiveOpen e a impersonação do
+//!   próprio processo só durante a abertura;
+//! - um `.LOG` antigo ao lado da hive não é aberto sem REG_HIVE_SINGLE_LOG.
 
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use super::phase6::call_export;
@@ -30,11 +39,12 @@ use crate::drivers::fs::{ntfs, volume::FileSystem};
 use crate::ntos::cm::hive::base_block;
 use crate::ntos::cm::key::services::{self as key_services, Kind};
 use crate::ntos::cm::registry::{self, NodeId};
-use crate::ntos::cm::{hive_init, hive_list, hive_services};
-use crate::ntos::inc::types::{NtStruct, ObjectAttributes};
+use crate::ntos::cm::{hive_file, hive_init, hive_list, hive_services};
+use crate::ntos::inc::types::{KeyPidArray, NtStruct, ObjectAttributes};
 use crate::ntos::io::file::zw as zw_files;
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::ps::process;
+use crate::ntos::rtl::guest_strings;
 use crate::ntos::se::token::thread as thread_tokens;
 
 type Assert = fn(bool, &str);
@@ -335,6 +345,116 @@ fn boot_empty_and_private(assert: Assert) {
     assert(saved && private == 0 && refused == STATUS_SHARING_VIOLATION && gone && shared == 0 && private_again == STATUS_SHARING_VIOLATION && registry::node_by_path(SHARED).is_none(), "userhive: hive de aplicativo REG_PROCESS_PRIVATE nao e compartilhada nem compartilha o arquivo de outra");
 }
 
+/// As entradas do KEY_OPEN_SUBKEYS_INFORMATION: (PID, nome, Length ==
+/// MaximumLength, o nome dentro da área de nomes do buffer).
+fn open_sub_key_entries(buffer: u64, length: u64) -> Vec<(u64, String, bool, bool)> {
+    let count = guest::read32(buffer) as u64;
+    (0..count)
+        .map(|index| {
+            // SAFETY: entrada escrita pelo serviço no buffer próprio.
+            let entry = unsafe { KeyPidArray::at(buffer + 8 + index * 0x18) };
+            let (name_length, maximum, pointer) = (entry.key_name.length.get(), entry.key_name.maximum_length.get(), entry.key_name.buffer.get());
+            let inside = pointer >= buffer + 8 + count * 0x18 && pointer + name_length as u64 <= buffer + length;
+            (entry.process_id.get(), guest_strings::read_unicode_string(entry.key_name.address()), name_length == maximum, inside)
+        })
+        .collect()
+}
+
+/// NtQueryOpenSubKeys(Ex) numa hive de usuário com chaves abertas, e o
+/// logoff do serviço de perfis: NtUnloadKey recusado com chaves abertas,
+/// NtUnloadKey2(REG_FORCE_UNLOAD), e o handle que sobrou dando
+/// STATUS_KEY_DELETED.
+fn open_sub_keys_and_logoff(assert: Assert) {
+    const HIVE: &str = "\\Registry\\User\\S-1-5-21-1000-2000-3000-1002";
+    const FILE: &str = "\\??\\D:\\opennt-chaves-abertas.dat";
+    for path in ["/opennt-chaves-abertas.dat", "/opennt-chaves-abertas.dat.LOG1", "/opennt-chaves-abertas.dat.LOG2"] {
+        remove(path);
+    }
+    let saved = save_source(FILE);
+    let (loaded, root) = load_ex(HIVE, FILE, REG_LOAD_HIVE_OPEN_HANDLE, 0, true);
+    let child = open(&alloc::format!("{HIVE}\\Aberta"), true);
+    let grandchild = open(&alloc::format!("{HIVE}\\Aberta\\Funda"), true);
+    let target = attributes(HIVE);
+    let block = guest::alloc_bytes(0x410);
+    let (buffer, required) = (block, block + 0x400);
+    // NtQueryOpenSubKeys: os três corpos e o da própria referência por nome.
+    let counted = hive_services::query_open_sub_keys(target, required, false);
+    assert(saved && loaded == 0 && root != 0 && child != 0 && grandchild != 0 && counted == 0 && guest::read32(required) == 4, "hiverest: NtQueryOpenSubKeys conta os corpos de chave abertos na hive mais o da propria referencia");
+    // NtQueryOpenSubKeysEx: PID e nome de cada corpo.
+    let listed = hive_services::query_open_sub_keys_ex(target, 0x400, buffer, required, false);
+    let entries = open_sub_key_entries(buffer, 0x400);
+    let pid = process::get_current_process_id();
+    let expected = [HIVE.to_string(), alloc::format!("{HIVE}\\Aberta"), alloc::format!("{HIVE}\\Aberta\\Funda")];
+    let names = expected.iter().all(|name| entries.iter().any(|entry| entry.1.eq_ignore_ascii_case(name)));
+    let size = 8 + entries.iter().map(|entry| 0x18 + entry.1.encode_utf16().count() as u32 * 2).sum::<u32>();
+    assert(listed == 0 && entries.len() == 3 && names && entries.iter().all(|entry| entry.0 == pid && entry.2 && entry.3) && guest::read32(required) == size, "hiverest: NtQueryOpenSubKeysEx lista o PID e o nome de cada chave aberta, com o RequiredSize");
+    // Buffer curto: STATUS_BUFFER_OVERFLOW, Count e RequiredSize completos,
+    // nenhuma entrada escrita.
+    guest::write_bytes(buffer, &[0xAA; 0x20]);
+    let short = hive_services::query_open_sub_keys_ex(target, 0x20, buffer, required, false);
+    assert(short == 0x8000_0005 && guest::read32(buffer) == 3 && guest::read32(required) == size && guest::read32(buffer + 8) == 0xAAAA_AAAA, "hiverest: NtQueryOpenSubKeysEx com buffer curto = STATUS_BUFFER_OVERFLOW, Count e RequiredSize completos");
+    // Os erros de parâmetro.
+    let small = hive_services::query_open_sub_keys_ex(target, 6, buffer, required, false);
+    let odd = hive_services::query_open_sub_keys_ex(target, 0x41, buffer, required, false);
+    let inner = attributes(&alloc::format!("{HIVE}\\Aberta"));
+    let not_root = hive_services::query_open_sub_keys_ex(inner, 0x400, buffer, required, false);
+    let not_root_count = hive_services::query_open_sub_keys(inner, required, false);
+    guest::free_bytes(inner);
+    assert(small == 0xC000_0023 && odd == STATUS_INVALID_PARAMETER && not_root == STATUS_INVALID_PARAMETER && not_root_count == STATUS_INVALID_PARAMETER, "hiverest: BufferLength < 8 = STATUS_BUFFER_TOO_SMALL, impar = STATUS_INVALID_PARAMETER, chave que nao e raiz de hive = STATUS_INVALID_PARAMETER");
+    // O logoff: a raiz fechada (o UnmountRegHiveFromPath fecha o handle da
+    // carga), NtUnloadKey recusado pelos handles que sobraram,
+    // NtUnloadKey2(REG_FORCE_UNLOAD) descarrega e grava.
+    close(root);
+    let refused = unload_with("ZwUnloadKey", HIVE, &[]);
+    let forced = unload_with("ZwUnloadKey2", HIVE, &[1]);
+    let gone = registry::node_by_path(HIVE).is_none();
+    let stale = status(call_export("ZwFlushKey", &[child]));
+    close(grandchild);
+    close(child);
+    guest::free_bytes(block);
+    guest::free_bytes(target);
+    let (reloaded, _) = load_ex(HIVE, FILE, 0, 0, false);
+    let kept = registry::node_by_path(&alloc::format!("{HIVE}\\Aberta\\Funda")).is_some();
+    assert(refused == 0xC000_0121 && forced == 0 && gone && stale == 0xC000_017C && reloaded == 0 && kept && unload_with("ZwUnloadKey", HIVE, &[]) == 0, "hiverest: logoff do perfil: NtUnloadKey com chaves abertas = STATUS_CANNOT_DELETE, NtUnloadKey2(REG_FORCE_UNLOAD) descarrega e grava, o handle que sobrou da STATUS_KEY_DELETED");
+}
+
+/// O CmpCmdHiveOpen: quais status e cargas repetem a abertura como o
+/// próprio processo, e a impersonação da thread de volta depois.
+fn hive_open_fallbacks(assert: Assert) {
+    let retried = [0xC000_0022, 0xC000_0064, 0xC000_006A, 0xC000_006E, 0xC000_0072, 0xC000_0193].iter().all(|&status| hive_list::impersonation_fallback_status(status));
+    let kept = [STATUS_SHARING_VIOLATION, 0xC000_0034, 0xC000_014D].iter().all(|&status| !hive_list::impersonation_fallback_status(status));
+    assert(retried && kept, "hiverest: o CmpCmdHiveOpen repete so por acesso negado ou falha de conta");
+    let allowed = hive_list::impersonation_fallback_allowed(0x800, false) && hive_list::impersonation_fallback_allowed(0x8800, false) && hive_list::impersonation_fallback_allowed(0x10, false);
+    let refused = !hive_list::impersonation_fallback_allowed(0x8800, true) && !hive_list::impersonation_fallback_allowed(0x8010, false);
+    assert(allowed && refused, "hiverest: a segunda tentativa so sem token; REG_NO_IMPERSONATION_FALLBACK so vale na hive de aplicativo");
+    // RtlImpersonateSelfEx: dentro, uma cópia de impersonação do primário;
+    // depois, o estado anterior da thread.
+    let thread = process::get_current_thread();
+    let before = thread_tokens::get(thread).map(|state| state.token);
+    let inside = hive_file::impersonating_self(|| Ok(thread_tokens::get(thread).map(|state| (state.token, state.level))));
+    let after = thread_tokens::get(thread).map(|state| state.token);
+    assert(matches!(inside, Ok(Some((token, 2))) if Some(token) != before) && after == before, "hiverest: a impersonacao do proprio processo vale so durante a abertura");
+}
+
+/// Um `.LOG` antigo ao lado do primário: sem REG_HIVE_SINGLE_LOG a carga
+/// usa o `.LOG1`/`.LOG2` e não abre nem muda o `.LOG` (o comportamento de
+/// hoje, guardado contra regressão).
+fn legacy_log_ignored(assert: Assert) {
+    const HIVE: &str = "\\Registry\\User\\OpenNTLogLegado";
+    const FILE: &str = "\\??\\D:\\opennt-log-legado.dat";
+    for path in ["/opennt-log-legado.dat", "/opennt-log-legado.dat.LOG", "/opennt-log-legado.dat.LOG1", "/opennt-log-legado.dat.LOG2"] {
+        remove(path);
+    }
+    let saved = save_source(FILE);
+    let legacy = create_file("\\??\\D:\\opennt-log-legado.dat.LOG");
+    zw_files::close_file_entry(legacy as u32);
+    let wrote = volume().is_some_and(|volume| matches!(volume.write_at("/opennt-log-legado.dat.LOG", 0, b"DIRTlixo"), Ok(8)));
+    let (loaded, _) = load_ex(HIVE, FILE, 0, 0, false);
+    let untouched = read_volume("/opennt-log-legado.dat.LOG") == b"DIRTlixo";
+    let dual = file_attributes("/opennt-log-legado.dat.LOG1").is_some() && file_attributes("/opennt-log-legado.dat.LOG2").is_some();
+    assert(saved && legacy != 0 && wrote && loaded == 0 && untouched && dual && unload_with("ZwUnloadKey", HIVE, &[]) == 0, "hiverest: sem REG_HIVE_SINGLE_LOG a carga usa .LOG1/.LOG2 e nao abre o .LOG antigo");
+}
+
 pub fn run(assert: Assert) {
     if ntfs::mounted().is_none() {
         assert(false, "userhive: volume NTFS montado para os arquivos de hive");
@@ -344,4 +464,9 @@ pub fn run(assert: Assert) {
     trust_class_links(assert);
     write_flush_unload_reload(assert, root, classes_root);
     boot_empty_and_private(assert);
+    open_sub_keys_and_logoff(assert);
+    hive_open_fallbacks(assert);
+    legacy_log_ignored(assert);
+    // read_only_primary (Q-HIVEREST §6.3) só entra com o P1 de io/file/zw.rs
+    // e o CmpOpenFileWithExtremePrejudice.
 }
