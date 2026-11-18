@@ -132,8 +132,6 @@ const APP_HIVE_REFUSED: u32 = 0x444;
 /// REG_BOOT_HIVE.
 const REG_FLUSH_HIVE_FILE_GROWTH: u32 = 0x1000;
 const SINGLE_LOG_BOOT_HIVE: u32 = 0x600;
-/// REG_NO_IMPERSONATION_FALLBACK, que o NtLoadKey3 sempre liga.
-const REG_NO_IMPERSONATION_FALLBACK: u32 = 0x8000;
 /// Os tipos de CM_EXTENDED_PARAMETER: CmExtendedParameterTrustClassKey,
 /// CmExtendedParameterEvent e CmExtendedParameterFileAccessToken.
 const EXTENDED_TRUST_CLASS_KEY: u8 = 1;
@@ -347,7 +345,7 @@ pub fn load_key(target: u64, source: u64, flags: u32, trust_class_key: u64, even
 /// REG_NO_IMPERSONATION_FALLBACK.
 #[allow(clippy::too_many_arguments)]
 pub fn load_key3(target: u64, source: u64, flags: u32, extended: u64, count: u32, desired_access: u32, root_handle: u64, previous_mode: bool) -> u32 {
-    let mut parameters = LoadParameters { target, source, flags: flags | REG_NO_IMPERSONATION_FALLBACK, trust_class_key: 0, event: 0, desired_access, root_handle, file_access_token: 0 };
+    let mut parameters = LoadParameters { target, source, flags: flags | hive_list::REG_NO_IMPERSONATION_FALLBACK, trust_class_key: 0, event: 0, desired_access, root_handle, file_access_token: 0 };
     let mut seen = 0u32;
     for index in 0..count as u64 {
         let entry = extended.wrapping_add(index * 16);

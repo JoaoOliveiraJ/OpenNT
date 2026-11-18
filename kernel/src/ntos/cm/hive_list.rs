@@ -22,6 +22,11 @@
 //!   ler a hive (CmpInitHiveFromFile, rva 0x6e9cb8): um log que falta é
 //!   criado nessa hora, oculto e de sistema; numa carga só de leitura, só os
 //!   existentes. Um primário existente e vazio é uma hive nova;
+//! - a carga do NtLoadKey(2/3/Ex) passa pelo CmpCmdHiveOpen (rva 0x603588):
+//!   sem o token de acesso ao arquivo, uma falha de acesso ou de conta do
+//!   CmpInitHiveFromFile repete a abertura impersonando o próprio processo
+//!   (RtlImpersonateSelfEx), salvo numa hive de aplicativo com
+//!   REG_NO_IMPERSONATION_FALLBACK; as hives do boot não repetem;
 //! - as hives do CmLoadKey e do CmLoadAppKey são não confiáveis (o bit 0
 //!   que o CmpLoadKeyCommon liga em CMHIVE.Flags), cada uma na própria
 //!   classe de confiança; com o TrustClassKey (CmpJoinClassOfTrust, rva
@@ -70,7 +75,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::ntos::cm::hive::storage::{Storage, HBLOCK_SIZE, STATUS_INSUFFICIENT_RESOURCES, STATUS_REGISTRY_CORRUPT};
 use crate::ntos::cm::hive::{base_block, log, sync, tree};
-use crate::ntos::cm::hive_file::{HiveFile, OpenMode, FILE_CREATED, FILE_OPEN, STATUS_REGISTRY_IO_FAILED};
+use crate::ntos::cm::hive_file::{self, HiveFile, OpenMode, FILE_CREATED, FILE_OPEN, STATUS_REGISTRY_IO_FAILED};
 use crate::ntos::cm::key::{policy as key_policy, security as key_security};
 use crate::ntos::cm::registry::{self, NodeId};
 use crate::ntos::cm::{hive_init, machine_hive};
@@ -96,6 +101,8 @@ pub const REG_FORCE_RESTORE: u32 = 8;
 pub const REG_APP_HIVE: u32 = 0x10;
 pub const REG_PROCESS_PRIVATE: u32 = 0x20;
 pub const REG_OPEN_READ_ONLY: u32 = 0x2000;
+/// REG_NO_IMPERSONATION_FALLBACK, que o NtLoadKey3 sempre liga.
+pub const REG_NO_IMPERSONATION_FALLBACK: u32 = 0x8000;
 
 /// Uma carga do NtLoadKey(2/3/Ex) já validada (CmLoadKey e CmLoadAppKey).
 #[derive(Default)]
@@ -318,16 +325,21 @@ fn new_hive_image(target: &str, file_name: &str) -> Result<Vec<u8>, u32> {
     Ok(storage.image())
 }
 
-fn load_hive_files(target: &str, file_name: &str, request: &mut LoadRequest, allocate: bool, boot: bool) -> Result<u32, u32> {
-    let flags = request.flags;
-    if registry::node_by_path(target).is_some() {
-        return Err(STATUS_OBJECT_NAME_COLLISION);
-    }
-    if registry::node_by_path(&parent_path(target)).is_none() {
-        return Err(STATUS_OBJECT_NAME_NOT_FOUND);
-    }
-    let write = flags & REG_OPEN_READ_ONLY == 0;
-    let mode = OpenMode { read_only: !write, token: request.token };
+/// O que o CmpInitHiveFromFile deixa pronto: o primário e os logs abertos,
+/// as células lidas (com os logs aplicados a um primário invalidado) e as
+/// chaves.
+struct HiveFromFile {
+    primary: HiveFile,
+    logs: [Option<HiveFile>; 2],
+    storage: Storage,
+    recovered: bool,
+    keys: Vec<tree::FlatKey>,
+}
+
+/// CmpInitHiveFromFile (rva 0x6e9cb8): o primário (FILE_OPEN_IF quando a
+/// carga pode alocar), os logs e a leitura; um arquivo criado agora (ou
+/// vazio) recebe a hive nova.
+fn init_hive_from_file(target: &str, file_name: &str, allocate: bool, mode: OpenMode) -> Result<HiveFromFile, u32> {
     // CmpOpenHiveFile: FILE_OPEN_IF quando a carga pode alocar a hive e não
     // é só de leitura ((Flags & 0x21) == 1), senão FILE_OPEN; depois os
     // logs.
@@ -341,8 +353,56 @@ fn load_hive_files(target: &str, file_name: &str, request: &mut LoadRequest, all
             return Err(STATUS_REGISTRY_IO_FAILED);
         }
     }
-    let (mut storage, recovered) = read_primary(&primary, &logs, file_name)?;
-    let mut keys = tree::read(&storage)?;
+    let (storage, recovered) = read_primary(&primary, &logs, file_name)?;
+    let keys = tree::read(&storage)?;
+    Ok(HiveFromFile { primary, logs, storage, recovered, keys })
+}
+
+/// Os status do primeiro CmpInitHiveFromFile que levam o CmpCmdHiveOpen
+/// (rva 0x603684-0x6036a5) à segunda tentativa: STATUS_ACCESS_DENIED,
+/// STATUS_NO_SUCH_USER, STATUS_WRONG_PASSWORD, STATUS_ACCOUNT_RESTRICTION,
+/// STATUS_ACCOUNT_DISABLED e STATUS_ACCOUNT_EXPIRED (as falhas de conta vêm
+/// de um arquivo remoto aberto com as credenciais da impersonação).
+pub fn impersonation_fallback_status(status: u32) -> bool {
+    matches!(status, 0xC000_0022 | 0xC000_0064 | 0xC000_006A | 0xC000_006E | 0xC000_0072 | 0xC000_0193)
+}
+
+/// A segunda tentativa é permitida: sem o token de acesso ao arquivo do
+/// NtLoadKey3 e, numa hive de aplicativo, sem REG_NO_IMPERSONATION_FALLBACK
+/// (o CmLoadAppKey o passa como o bit 0x20 das OpenFlags, rva 0x6e8deb; o
+/// CmLoadKey nunca: numa hive comum o bit não muda nada).
+pub fn impersonation_fallback_allowed(flags: u32, token: bool) -> bool {
+    !token && !(flags & REG_APP_HIVE != 0 && flags & REG_NO_IMPERSONATION_FALLBACK != 0)
+}
+
+/// CmpCmdHiveOpen (rva 0x603588): o CmpInitHiveFromFile no contexto da
+/// thread (ou impersonando o token do NtLoadKey3); se falhar por acesso ou
+/// conta e a segunda tentativa for permitida, de novo impersonando o
+/// próprio processo (RtlImpersonateSelfEx(SecurityImpersonation)), sem
+/// OBJ_FORCE_ACCESS_CHECK, e a impersonação anterior da thread volta.
+fn cmd_hive_open(target: &str, file_name: &str, allocate: bool, mode: OpenMode, flags: u32) -> Result<HiveFromFile, u32> {
+    match init_hive_from_file(target, file_name, allocate, mode) {
+        Err(status) if impersonation_fallback_status(status) && impersonation_fallback_allowed(flags, mode.token.is_some()) => {
+            hive_file::impersonating_self(|| init_hive_from_file(target, file_name, allocate, OpenMode { token: None, ..mode }))
+        }
+        other => other,
+    }
+}
+
+fn load_hive_files(target: &str, file_name: &str, request: &mut LoadRequest, allocate: bool, boot: bool) -> Result<u32, u32> {
+    let flags = request.flags;
+    if registry::node_by_path(target).is_some() {
+        return Err(STATUS_OBJECT_NAME_COLLISION);
+    }
+    if registry::node_by_path(&parent_path(target)).is_none() {
+        return Err(STATUS_OBJECT_NAME_NOT_FOUND);
+    }
+    let write = flags & REG_OPEN_READ_ONLY == 0;
+    let mode = OpenMode { read_only: !write, token: request.token };
+    // As hives do boot vêm do CmpLoadHiveThread, sem o CmpCmdHiveOpen: não
+    // repetem a abertura.
+    let opened = if boot { init_hive_from_file(target, file_name, allocate, mode) } else { cmd_hive_open(target, file_name, allocate, mode, flags) };
+    let HiveFromFile { primary, logs, mut storage, recovered, mut keys } = opened?;
     // CmpReorganizeHive: o pedido do NtCompressKey (LastReorganizeTime = 1)
     // recompõe a hive compacta na carga.
     let reorganize = write && storage.base_block().last_reorganize_time.get() == 1;

@@ -18,7 +18,10 @@
 //!   FILE_SHARE_READ e FILE_OPEN, para o primário e para os logs;
 //! - com o token de acesso ao arquivo do NtLoadKey3, a abertura acontece
 //!   impersonando o token (PsImpersonateClient no nível dele) e com
-//!   OBJ_FORCE_ACCESS_CHECK; a impersonação anterior da thread volta depois.
+//!   OBJ_FORCE_ACCESS_CHECK; a impersonação anterior da thread volta depois;
+//! - a segunda tentativa do CmpCmdHiveOpen abre impersonando uma cópia do
+//!   token primário do próprio processo (RtlImpersonateSelfEx), sem
+//!   OBJ_FORCE_ACCESS_CHECK.
 //!
 //! As leituras e escritas vão ao volume do FILE_OBJECT do handle. O
 //! NtSaveKey e o NtRestoreKey recebem o handle de arquivo do chamador, que é
@@ -107,6 +110,27 @@ fn impersonating<T>(token: Option<(u64, u32)>, open: impl FnOnce() -> Result<T, 
     if let Some(previous) = previous {
         let _ = tokens::release(previous.token);
     }
+    result
+}
+
+/// SecurityImpersonation e TokenImpersonation.
+const SECURITY_IMPERSONATION: u32 = 2;
+const TOKEN_TYPE_IMPERSONATION: u32 = 2;
+
+/// RtlImpersonateSelfEx(SecurityImpersonation, 0, NULL) em volta de `open`
+/// (a segunda tentativa do CmpCmdHiveOpen, rva 0x6036ed): a thread
+/// impersona uma cópia de impersonação do token primário do processo, e a
+/// impersonação anterior volta depois.
+pub fn impersonating_self<T>(open: impl FnOnce() -> Result<T, u32>) -> Result<T, u32> {
+    use crate::ntos::ps::{process, security};
+    use crate::ntos::se::token::tokens;
+    let status_of = |error: crate::rtl::KernelError| if error.status != 0 { error.status } else { STATUS_INSUFFICIENT_RESOURCES };
+    let primary = security::reference_primary_token(process::get_current_process()).map_err(status_of)?;
+    let copy = tokens::duplicate(primary, SECURITY_IMPERSONATION, false, TOKEN_TYPE_IMPERSONATION);
+    let _ = security::dereference_primary_token(primary);
+    let copy = copy.map_err(status_of)?;
+    let result = impersonating(Some((copy, SECURITY_IMPERSONATION)), open);
+    let _ = tokens::release(copy);
     result
 }
 
