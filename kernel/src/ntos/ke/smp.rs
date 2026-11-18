@@ -623,31 +623,49 @@ pub fn send_nmi_to_application_processors() -> u32 {
 /// em [`shootdown_timeout_ms`] (ou um ICR que não fica ocioso) para o sistema
 /// com o diagnóstico de IPI sem resposta, como o IPI_WATCHDOG_TIMEOUT do NT.
 pub fn flush_remote_tlb(flush_caches: bool) -> Result<(), KernelError> {
-    let slots = {
+    shootdown(u64::MAX, flush_caches, false)
+}
+
+/// O bit do processador de número N é o do AP da N-ésima posição entre os
+/// online (o BSP é o 0 e não tem slot).
+fn processor_bit(online_index: usize) -> u64 {
+    1u64.checked_shl(online_index as u32 + 1).unwrap_or(0)
+}
+
+/// A NMI de shootdown aos APs online cujo bit (pelo número do processador)
+/// está em `targets`, e a espera das confirmações deles. Outro shootdown em
+/// curso é um erro, ou, com `wait_busy`, espera a vez: a confirmação vem pela
+/// NMI, que nem o IF nem o IRQL retêm, então quem está em curso termina.
+fn shootdown(targets: u64, flush_caches: bool, wait_busy: bool) -> Result<(), KernelError> {
+    let selected: Vec<(usize, usize)> = loop {
         let mut state = STATE.lock();
-        if state.online_slots.is_empty() {
+        let selected: Vec<(usize, usize)> = state.online_slots.iter().copied().enumerate().filter(|&(index, _)| targets & processor_bit(index) != 0).collect();
+        if selected.is_empty() {
             return Ok(());
         }
-        if state.invalidation_active {
+        if !state.invalidation_active {
+            state.invalidation_active = true;
+            break selected;
+        }
+        if !wait_busy {
             return Err(KernelError::new("nested TLB shootdown"));
         }
-        state.invalidation_active = true;
-        state.online_slots.clone()
+        drop(state);
+        cpu::pause();
     };
     let flags = cpu::save_and_disable_interrupts();
     let result = (|| {
         let generation = physical::read32(MAILBOX + 0x30).wrapping_add(1);
         physical::write32(MAILBOX + 0x34, flush_caches as u32);
         physical::write32(MAILBOX + 0x30, generation);
-        for &slot in &slots {
+        for &(_, slot) in &selected {
             match send_processor_interrupt(physical::read32(slot_address(slot) + SLOT_CONTROLLER_IDENTIFIER), 0x4400) {
                 Ok(true) => {}
                 Ok(false) => return Err(KernelError::new("TLB shootdown delivery failed")),
                 Err(stall) => ipi_stall_bug_check(&stall, "entrega do shootdown de TLB"),
             }
         }
-        // O processador de número N é o AP da N-ésima posição entre os online.
-        let pending = || slots.iter().enumerate().filter(|&(_, &slot)| physical::read32(slot_address(slot) + 0x3C) != generation).fold(0u64, |mask, (index, _)| mask | 1 << (index + 1));
+        let pending = || selected.iter().filter(|&&(_, slot)| physical::read32(slot_address(slot) + 0x3C) != generation).fold(0u64, |mask, &(index, _)| mask | processor_bit(index));
         if let Err(stall) = stall_on_targets(shootdown_timeout_ms(), pending) {
             ipi_stall_bug_check(&stall, "confirmacao do shootdown de TLB");
         }
@@ -655,5 +673,55 @@ pub fn flush_remote_tlb(flush_caches: bool) -> Result<(), KernelError> {
     })();
     cpu::restore_interrupts(flags);
     STATE.lock().invalidation_active = false;
+    result
+}
+
+/// Interrompe os APs online de `targets` (pelo número do processador) e
+/// espera as confirmações; outro shootdown em curso espera a vez.
+pub fn interrupt_processors(targets: u64) -> Result<(), KernelError> {
+    shootdown(targets, false, true)
+}
+
+/// A geração de invalidação corrente e a última que o AP da posição
+/// `online_index` confirmou (o autoteste confere quem a NMI alcançou).
+pub fn shootdown_generations(online_index: usize) -> Option<(u32, u32)> {
+    let slot = STATE.lock().online_slots.get(online_index).copied()?;
+    Some((physical::read32(MAILBOX + 0x30), physical::read32(slot_address(slot) + 0x3C)))
+}
+
+/// Os processadores (pelo número) que o KeFlushProcessWriteBuffers
+/// interrompe: os de `active` (KPROCESS.ActiveProcessors, ou todos os
+/// online com AllProcessors) menos o corrente (`own`).
+pub fn write_buffer_targets(active: u64, own: u64) -> u64 {
+    active & !own
+}
+
+/// KeFlushProcessWriteBuffers(AllProcessors) do ntoskrnl 19041 (rva
+/// 0x343d14): em SYNCH_LEVEL, copia o KPROCESS.ActiveProcessors do processo
+/// corrente da thread (ApcState.Process; com AllProcessors, todos os
+/// processadores), tira o processador corrente e, sobrando algum, manda a
+/// eles um IPI com alvo vazio (KiIpiSendPacket) e espera todos confirmarem.
+/// Interromper a CPU serializa o que ela já escreveu: depois da volta, toda
+/// escrita que uma thread do processo fez em outro processador já é visível
+/// aqui (a trava assimétrica do CDDISync::CFreeThreadedLock do d3d11 depende
+/// disso). No OpenNT o IPI é a NMI de shootdown dos APs (o alvo também
+/// recarrega o CR3, o que não muda o efeito). O BSP não tem essa NMI; no M0
+/// só o BSP executa o anel 3, então o chamador do serviço é ele mesmo.
+pub fn flush_process_write_buffers(all_processors: bool) -> Result<(), KernelError> {
+    use crate::ntos::inc::types::{Kprocess, Kthread, NtStruct};
+    use crate::ntos::ke::irql;
+    let previous = irql::raise_at_least(irql::SYNCH_LEVEL);
+    let active = if all_processors {
+        u64::MAX
+    } else {
+        let thread = crate::ntos::ps::process::get_current_thread();
+        // SAFETY: a KTHREAD corrente e o processo corrente dela, vivos
+        // enquanto a thread roda.
+        let process = if thread != 0 { unsafe { Kthread::at(thread) }.apc_state.process.get() } else { 0 };
+        if process != 0 { unsafe { Kprocess::at(process) }.active_processors.bitmap[0].atomic().load(core::sync::atomic::Ordering::SeqCst) } else { 0 }
+    };
+    let targets = write_buffer_targets(active, own_processor_bit());
+    let result = if targets != 0 { interrupt_processors(targets) } else { Ok(()) };
+    irql::lower_irql(previous as u64);
     result
 }

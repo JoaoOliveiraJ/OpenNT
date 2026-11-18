@@ -596,6 +596,13 @@ hipervisor; num emulador (o TCG do QEMU, "TCGTCGTCGTCG" na leaf 0x40000000,
 uma thread comum do hospedeiro, a entrega da NMI e o tratador dela passam
 pela trava global do emulador, e com o hospedeiro carregado a thread de um
 alvo fica segundos sem rodar, o que nada no convidado evita.
+O NtFlushProcessWriteBuffers (a trava assimétrica do d3d11) é o
+KeFlushProcessWriteBuffers do 19041 (`smp::flush_process_write_buffers`):
+em SYNCH_LEVEL, a mesma NMI vai só aos processadores do
+KPROCESS.ActiveProcessors do processo corrente, menos o corrente, e a volta
+espera todos confirmarem (`smp::interrupt_processors`; com AllProcessors,
+todos os APs). Interromper o alvo serializa o que ele já escreveu. O mesmo
+autoteste confere que, com dois APs, só o alvo confirma.
 
 **Frequência do TSC.** O relógio do kernel (`ke/clock.rs`) é o TSC. A
 frequência vem da folha CPUID 0x15 quando ela traz o cristal e a razão;

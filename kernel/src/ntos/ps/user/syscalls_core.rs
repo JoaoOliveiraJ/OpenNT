@@ -635,6 +635,16 @@ fn nt_flush_instruction_cache(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _rsp: u64)
     Ok(STATUS_SUCCESS)
 }
 
+/// NtFlushProcessWriteBuffers do ntoskrnl 19041 (rva 0x3439a0):
+/// KeFlushProcessWriteBuffers(FALSE), que interrompe os outros processadores
+/// em que o processo está e espera por eles, e STATUS_SUCCESS sempre.
+fn nt_flush_process_write_buffers(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
+    if let Err(error) = crate::ntos::ke::smp::flush_process_write_buffers(false) {
+        crate::debug_print!("[ke] NtFlushProcessWriteBuffers: {}", error);
+    }
+    Ok(STATUS_SUCCESS)
+}
+
 /// PROCESS_QUERY_LIMITED_INFORMATION, o que ProcessBasicInformation e
 /// ProcessImageFileName pedem do handle.
 const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
@@ -1152,7 +1162,7 @@ fn nt_apphelp_cache_control(service: u64, data: u64, _a3: u64, _a4: u64, _rsp: u
 }
 
 pub fn init() {
-    let handlers: [(&'static str, state::SyscallHandler); 36] = [
+    let handlers: [(&'static str, state::SyscallHandler); 37] = [
         ("NtQueryDirectoryObject", nt_query_directory_object),
         ("NtApphelpCacheControl", nt_apphelp_cache_control),
         ("NtQueryLicenseValue", nt_query_license_value),
@@ -1173,6 +1183,7 @@ pub fn init() {
         ("NtSerializeBoot", nt_serialize_boot),
         ("NtRaiseHardError", nt_raise_hard_error),
         ("NtFlushInstructionCache", nt_flush_instruction_cache),
+        ("NtFlushProcessWriteBuffers", nt_flush_process_write_buffers),
         ("NtQueryInformationProcess", nt_query_information_process),
         ("NtSetInformationProcess", nt_set_information_process),
         ("NtRaiseException", nt_raise_exception),

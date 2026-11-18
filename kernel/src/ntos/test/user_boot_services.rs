@@ -8,9 +8,9 @@
 //! vizinhos NtPulseEvent, NtSetEventBoostPriority e NtQueryDirectoryObject,
 //! e o objeto Timer do Executive de modo usuário (NtCreateTimer, NtSetTimer
 //! e NtCancelTimer, que o WUDFPlatform.dll do services.exe pede), o
-//! NtAdjustGroupsToken e os objetos de reserva de modo usuário
+//! NtAdjustGroupsToken, os objetos de reserva de modo usuário
 //! (NtAllocateReserveObject e NtSetIoCompletionEx, do RPC assíncrono do
-//! rpcrt4).
+//! rpcrt4) e o NtFlushProcessWriteBuffers (do d3d11).
 
 use crate::ntos::inc::field::NtStruct;
 use crate::ntos::inc::types::{Eprocess, Ethread, HandleTable, ObjectAttributes};
@@ -41,6 +41,9 @@ pub fn run(assert: Assert) {
     let rsp = block + 0x2000;
     let call = |name: &str, a1: u64, a2: u64, a3: u64, a4: u64| state::handler(name).map_or(u32::MAX, |handler| handler(a1, a2, a3, a4, rsp).unwrap_or(u32::MAX));
     initialize_registry(assert, &call);
+    // O KeFlushProcessWriteBuffers do serviço (a trava do d3d11) não tem
+    // status: o NtFlushProcessWriteBuffers do 19041 sempre devolve sucesso.
+    assert(call("NtFlushProcessWriteBuffers", 0, 0, 0, 0) == 0, "userboot: NtFlushProcessWriteBuffers tem provedor e devolve STATUS_SUCCESS");
     ui_language_and_apphelp(assert, &call);
     process_classes(assert, block, &call);
     system_classes(assert, block, &call);

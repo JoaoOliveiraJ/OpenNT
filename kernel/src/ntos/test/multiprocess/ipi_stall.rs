@@ -25,7 +25,11 @@
 //!   segundos sem rodar com o hospedeiro carregado;
 //! - um AP girando com as interrupções desligadas em HIGH_LEVEL (CR8 = 15)
 //!   confirma 64 shootdowns seguidos: a confirmação vem pela NMI, que nem o
-//!   IF nem o IRQL do alvo retêm.
+//!   IF nem o IRQL do alvo retêm;
+//! - o KeFlushProcessWriteBuffers interrompe o KPROCESS.ActiveProcessors
+//!   menos o processador corrente: a NMI alcança só os alvos (com dois APs,
+//!   o primeiro confirma e o segundo não), e com AllProcessors todos
+//!   confirmam.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -78,6 +82,29 @@ pub fn run(assert: Assert) {
     if smp::ap_slot_count() > 0 {
         masked_target_acknowledges(assert);
     }
+    process_write_buffers(assert);
+}
+
+/// KeFlushProcessWriteBuffers: os alvos são o KPROCESS.ActiveProcessors
+/// menos o processador corrente; a NMI alcança só os alvos e cada um
+/// confirma; com AllProcessors, todos os APs confirmam.
+fn process_write_buffers(assert: Assert) {
+    assert(smp::write_buffer_targets(0b1011, 0b1) == 0b1010 && smp::write_buffer_targets(0b1, 0b1) == 0 && smp::write_buffer_targets(0b110, 0b100) == 0b10, "ipi: KeFlushProcessWriteBuffers interrompe o ActiveProcessors menos o processador corrente");
+    if smp::ap_slot_count() < 2 {
+        return;
+    }
+    // Só o processador 1 (o AP da posição 0). As interrupções desligadas no
+    // BSP: nenhum outro shootdown começa entre o envio e as leituras.
+    let flags = cpu::save_and_disable_interrupts();
+    let targeted = smp::interrupt_processors(0b10).is_ok();
+    let first = smp::shootdown_generations(0);
+    let second = smp::shootdown_generations(1);
+    cpu::restore_interrupts(flags);
+    let reached = matches!((first, second), (Some((generation, first)), Some((_, second))) if first == generation && second != generation);
+    assert(targeted && reached, "ipi: o IPI do KeFlushProcessWriteBuffers alcanca so os processadores alvo, que confirmam");
+    let all = smp::flush_process_write_buffers(true).is_ok();
+    let confirmed = (0..smp::ap_slot_count()).all(|index| smp::shootdown_generations(index).is_some_and(|(generation, acknowledged)| acknowledged == generation));
+    assert(all && confirmed, "ipi: KeFlushProcessWriteBuffers(AllProcessors) espera a confirmacao de todos os APs");
 }
 
 /// [0] o AP está girando mascarado, [1] pedido de parada.
