@@ -8,11 +8,10 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::Ordering;
 
 use super::state::{self, probe_user_read, probe_user_write, stack_arg, STATUS_INFO_LENGTH_MISMATCH, STATUS_INVALID_HANDLE, STATUS_INVALID_INFO_CLASS, STATUS_INVALID_PARAMETER, STATUS_SUCCESS, TERMINATE_MAGIC};
 use super::threads;
-use crate::hal::{amd64::usermode, cpu, kmalloc, serial};
+use crate::hal::{amd64::usermode, kmalloc, serial};
 use crate::ntos::ex::boot_environment_information;
 use crate::ntos::ke::{clock, dispatcher, pcr, processor_information, smp};
 use crate::ntos::mm::{memory_information, memory_map, pfn};
@@ -883,32 +882,18 @@ fn nt_query_information_process(handle: u64, class: u64, buffer: u64, length: u6
             set_returned(4)?;
             Ok(STATUS_SUCCESS)
         }
-        // ProcessCookie (ULONG): o cookie de RtlEncodePointer, por processo e
-        // nunca zero.
+        // ProcessCookie (ULONG): o EPROCESS.Cookie do RtlEncodePointer, por
+        // processo e nunca zero (`ps/query_process::query_cookie`); um handle
+        // que não é o pseudo-handle precisa de PROCESS_VM_WRITE.
         36 => {
-            if length < 4 {
-                return Ok(STATUS_INFO_LENGTH_MISMATCH);
+            if length != 0 && buffer & 3 != 0 {
+                return Ok(0x8000_0002);
             }
-            if !probe_user_write(buffer, 4) {
+            if length != 0 && !probe_user_write(buffer, length) {
                 return Ok(0xC000_0005);
             }
-            // EPROCESS.Cookie, gerado na primeira consulta e trocado uma vez
-            // só (InterlockedCompareExchange).
-            // SAFETY: o EPROCESS do processo corrente.
-            let cell = unsafe { Eprocess::at(process::get_current_process()) }.cookie.atomic();
-            let mut cookie = cell.load(Ordering::Acquire);
-            if cookie == 0 {
-                let tsc = cpu::rdtsc();
-                let mixed = (tsc as u32) ^ (((tsc >> 32) as u32) << 16) ^ (state::current_process_id() as u32).wrapping_mul(0x9E37);
-                let fresh = if mixed == 0 { 0x5A17_C0DE } else { mixed };
-                cookie = match cell.compare_exchange(0, fresh, Ordering::AcqRel, Ordering::Acquire) {
-                    Ok(_) => fresh,
-                    Err(existing) => existing,
-                };
-            }
-            guest::try_write::<u32>(buffer, cookie)?;
-            set_returned(4)?;
-            Ok(STATUS_SUCCESS)
+            let handle = if handle as u32 == u32::MAX { u64::MAX } else { handle };
+            crate::ntos::ps::query_process::query_cookie(handle, buffer, length as u32, returned, |access| super::handles::process_pointer(handle, access))
         }
         // ProcessConsoleHostProcess (ULONG_PTR): o EPROCESS.OwnerProcessId
         // que o PspAllocateProcess grava (o processo que criou, com o bit 2

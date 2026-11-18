@@ -6,8 +6,11 @@
 //! 0x40 (com Size e Flags), é lido do EPROCESS do handle; ProcessDebugFlags
 //! (31) é o PROCESS_DEBUG_INHERIT do NoDebugInherit, com o handle
 //! referenciado com PROCESS_QUERY_INFORMATION; ProcessBreakOnTermination
-//! (29) é o Flags.BreakOnTermination do processo crítico. As demais classes
+//! (29) é o Flags.BreakOnTermination do processo crítico; ProcessCookie (36)
+//! é o EPROCESS.Cookie, gerado na primeira consulta. As demais classes
 //! devolvem STATUS_INVALID_PARAMETER.
+
+use core::sync::atomic::Ordering;
 
 use super::{image_information, process};
 use crate::ntos::inc::field::{Field, NtStruct};
@@ -138,12 +141,85 @@ pub fn query_break_on_termination(output: u64, length: u32, returned: u64, proce
     Ok(0)
 }
 
+/// PROCESSINFOCLASS ProcessCookie.
+pub const PROCESS_COOKIE: u32 = 36;
+/// PROCESS_VM_WRITE: o acesso que o ProcessCookie pede de um handle que não
+/// é o pseudo-handle do processo corrente.
+pub const PROCESS_VM_WRITE: u32 = 0x20;
+
+/// EPROCESS.Cookie de `process`, como o ProcessCookie do
+/// NtQueryInformationProcess 19041 (rva 0x622d60..0x622e22): o valor
+/// guardado, ou um novo misturado da hora precisa, do contador de
+/// desempenho, de um número aleatório, do TSC e do processo, publicado por
+/// compare-and-swap sobre o zero. Um valor zero não vale: a volta lê de novo
+/// e gera outro. O cookie é o do RtlEncodePointer da ntdll e o que o cng.sys
+/// mistura na chave do CRYPTPROTECTMEMORY_SAME_PROCESS.
+pub fn process_cookie(process: u64) -> u32 {
+    // SAFETY: EPROCESS retido por quem consulta.
+    let cell = unsafe { Eprocess::at(process) }.cookie.atomic();
+    loop {
+        let cookie = cell.load(Ordering::Acquire);
+        if cookie != 0 {
+            return cookie;
+        }
+        let time = crate::ntos::ke::clock::system_time_precise();
+        let counter = crate::ntos::ke::clock::query_performance_counter_value();
+        let random = crate::hal::cpu::hardware_random_u64().unwrap_or(0);
+        let tsc = crate::hal::cpu::rdtsc();
+        // SAFETY: idem.
+        let id = unsafe { Eprocess::at(process) }.unique_process_id.get();
+        let fresh = (time as u32) ^ ((time >> 32) as u32) ^ (counter as u32) ^ (random as u32) ^ ((random >> 32) as u32) ^ (tsc as u32) ^ (id as u32).wrapping_mul(0x9E37_79B9);
+        let _ = cell.compare_exchange(0, fresh, Ordering::AcqRel, Ordering::Acquire);
+    }
+}
+
+/// ProcessCookie (36) com o buffer e o ReturnLength já sondados em
+/// UserMode: um ULONG (outro tamanho dá STATUS_INFO_LENGTH_MISMATCH), o
+/// processo corrente pelo pseudo-handle ou o do handle com PROCESS_VM_WRITE,
+/// o cookie e ReturnLength 4.
+pub fn query_cookie(handle: u64, output: u64, length: u32, returned: u64, process_of: impl FnOnce(u32) -> Result<u64, u32>) -> Result<u32, KernelError> {
+    if length != 4 {
+        return Ok(STATUS_INFO_LENGTH_MISMATCH);
+    }
+    let process = if handle == u64::MAX { process::get_current_process() } else {
+        match process_of(PROCESS_VM_WRITE) {
+            Ok(process) => process,
+            Err(status) => return Ok(status),
+        }
+    };
+    guest::try_write::<u32>(output, process_cookie(process))?;
+    if returned != 0 {
+        guest::try_write::<u32>(returned, 4)?;
+    }
+    Ok(0)
+}
+
 /// ZwQueryInformationProcess: ProcessImageInformation (37),
-/// ProcessDebugFlags (31), ProcessBreakOnTermination (29) e
-/// ProcessBasicInformation (0). Devolve o NTSTATUS.
+/// ProcessCookie (36), ProcessDebugFlags (31), ProcessBreakOnTermination
+/// (29) e ProcessBasicInformation (0). Devolve o NTSTATUS.
 pub fn query_information(handle: u64, class: u32, output: u64, length: u32, returned: u64) -> Result<u32, KernelError> {
     if class == 37 {
         return image_information::query(handle, output, length, returned, 0, None);
+    }
+    if class == PROCESS_COOKIE {
+        let mut referenced = 0u64;
+        let mut failure: Result<(), KernelError> = Ok(());
+        let status = query_cookie(handle, output, length, returned, |access| match reference_process(handle, access) {
+            Ok(Ok(process)) => {
+                referenced = process;
+                Ok(process)
+            }
+            Ok(Err(status)) => Err(status),
+            Err(error) => {
+                failure = Err(error);
+                Err(STATUS_INSUFFICIENT_RESOURCES)
+            }
+        });
+        if referenced != 0 {
+            release_process(referenced)?;
+        }
+        failure?;
+        return status;
     }
     if class == 31 {
         return query_debug_flags(handle, output, length, returned);
@@ -329,7 +405,7 @@ pub fn nt_query_information(handle: u64, class: u32, output: u64, length: u32, r
         }
         // As classes atendidas referenciam o handle: um handle de kernel
         // (bit 63, fora os pseudo-handles) não vale em UserMode.
-        if matches!(class, 0 | 29 | 31 | 37) && (handle as i64) < -8 {
+        if matches!(class, 0 | 29 | 31 | 36 | 37) && (handle as i64) < -8 {
             return Ok(STATUS_INVALID_HANDLE);
         }
     }
