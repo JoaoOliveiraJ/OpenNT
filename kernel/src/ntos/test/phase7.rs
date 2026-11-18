@@ -3448,16 +3448,17 @@ fn user_create_token(assert: Assert) {
         let service_token = guest::read64(out);
         let service_groups = carried
             && query_new(service_token, 2) == 0
-            && guest::read32(buffer) == 3
+            && guest::read32(buffer) == 4
             && group_at(1) == (guest::read_bytes(service, 32), 0xE)
-            && group_at(2) == (guest::read_bytes(other_service, 32), 0xA);
+            && group_at(2) == (guest::read_bytes(other_service, 32), 0xA)
+            && guest::read32(buffer + 16 + 3 * 16) == 0x60;
         let service_owner = carried && query_new(service_token, 4) == 0 && guest::read_bytes(guest::read64(buffer), 32) == guest::read_bytes(service, 32);
         if carried {
             let _ = call("NtClose", service_token, 0, 0, 0);
         }
         let deduplicated = create_with(&[(everyone, 1), (everyone, 7), (label, 0x60)], &[(23, 3)], 0) == 0;
         let deduplicated_token = guest::read64(out);
-        let single = deduplicated && query_new(deduplicated_token, 2) == 0 && guest::read32(buffer) == 1 && guest::read32(buffer + 16) == 7;
+        let single = deduplicated && query_new(deduplicated_token, 2) == 0 && guest::read32(buffer) == 2 && guest::read32(buffer + 16) == 7 && guest::read32(buffer + 32) == 0x60;
         if deduplicated {
             let _ = call("NtClose", deduplicated_token, 0, 0, 0);
         }
@@ -3575,7 +3576,7 @@ fn user_create_token(assert: Assert) {
             guest::write64(rsp + 0x28, returned);
             call("NtQueryInformationToken", new_token, class, buffer, length)
         };
-        let deny_only = query_new(2, 0x200) == 0 && guest::read32(buffer) == 1 && guest::read32(buffer + 16) == 0x10;
+        let deny_only = query_new(2, 0x200) == 0 && guest::read32(buffer) == 2 && guest::read32(buffer + 16) == 0x10 && guest::read32(buffer + 32) == 0x60;
         let no_privileges = query_new(3, 0x40) == 0 && guest::read32(buffer) == 0;
         let restricted_refused = filter(restricted) == 0xC000_000D;
         let _ = call("NtClose", new_token, 0, 0, 0);
