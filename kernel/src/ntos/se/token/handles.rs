@@ -190,8 +190,16 @@ pub fn open_thread_from_kernel(handle: u64, desired_access: u32, use_primary_ide
     open_thread(handle, desired_access, use_primary_identity, attributes, output, false)
 }
 
-/// NtOpenThreadTokenEx: `use_primary_identity` escolhe a identidade que
-/// autoriza; CopyOnOpen pode exigir um token privado novo.
+/// NtOpenThreadTokenEx como o ntoskrnl 19041 (rva 0x653590):
+/// `use_primary_identity` (OpenAsSelf) tira a impersonação do sujeito.
+/// Sem CopyOnOpen, o token da thread abre pelo ObOpenObjectByPointer, com o
+/// SeAccessCheck do sujeito (um cliente abaixo de SecurityImpersonation dá
+/// STATUS_BAD_IMPERSONATION_LEVEL). Com CopyOnOpen (a impersonação do
+/// ALPC/LPC), o token vira uma cópia privada (SepDuplicateToken) cujo
+/// handle sai do ObInsertObjectEx sem SeAccessCheck, e a thread passa a
+/// impersonar a cópia (PsSwapImpersonationToken): um servidor que
+/// impersona um cliente em SecurityIdentification abre o próprio token
+/// assim, como o ept_insert_ex do RpcEpMap.dll.
 pub fn open_thread(handle: u64, desired_access: u32, use_primary_identity: bool, attributes: u32, output: u64, from_user_mode: bool) -> Result<u32, KernelError> {
     if from_user_mode && !crate::ntos::ps::user_probe::probe_user_write(output, 8) {
         return Ok(0xC000_0005);
@@ -210,12 +218,27 @@ pub fn open_thread(handle: u64, desired_access: u32, use_primary_identity: bool,
     let attributes = attributes & if from_user_mode { 0x1DF2 } else { 0x11FF2 };
     let subject_impersonation = if use_primary_identity { None } else { thread_tokens::get(process::get_current_thread()) };
     let requires_check = from_user_mode || attributes & 0x400 != 0;
-    if requires_check && subject_impersonation.is_some_and(|impersonation| impersonation.level < 2) {
+    if !state.copy_on_open && requires_check && subject_impersonation.is_some_and(|impersonation| impersonation.level < 2) {
         return Ok(0xC000_00A5);
     }
     let mut token = state.token;
     let mut private_token = None;
     let result = (|| -> Result<u32, KernelError> {
+        let rights = if state.copy_on_open {
+            let subject = match subject_impersonation {
+                Some(impersonation) => Some((impersonation.token, Some(impersonation.level))),
+                None => process::get_primary_token(process::get_current_process()).map(|primary| (primary, None)),
+            };
+            match token_access::creator_access(desired_access, subject, !from_user_mode) {
+                Ok(rights) => rights,
+                Err(status) => return Ok(status),
+            }
+        } else {
+            match token_access::check(token, thread_tokens::effective(process::get_current_thread(), use_primary_identity), desired_access, !requires_check) {
+                Ok(rights) => rights,
+                Err(status) => return Ok(status),
+            }
+        };
         if state.copy_on_open {
             let duplicate = tokens::duplicate(token, state.level, state.effective_only, 2)?;
             private_token = Some(duplicate);
@@ -232,10 +255,6 @@ pub fn open_thread(handle: u64, desired_access: u32, use_primary_identity: bool,
                 }
             });
         }
-        let rights = match token_access::check(token, thread_tokens::effective(process::get_current_thread(), use_primary_identity), desired_access, !requires_check) {
-            Ok(rights) => rights,
-            Err(status) => return Ok(status),
-        };
         let new_handle = create(token, rights, attributes, from_user_mode)?;
         let finish = (|| -> Result<(), KernelError> {
             if let Some(private) = private_token {

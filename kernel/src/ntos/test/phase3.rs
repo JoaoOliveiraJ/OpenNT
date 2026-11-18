@@ -1070,7 +1070,21 @@ fn token_handles(assert: Assert) {
     assert(th::resolve_native(opened).is_some_and(|data| data.native_pointer == duplicate), "token: handle do token de impersonacao");
     assert(matches!(close::close(opened, Some(0)), Ok(0)), "token: fecha o handle de impersonacao");
     assert(thread_tokens::assign(thread, Some(duplicate), 0, false, false).is_ok() && matches!(th::open_thread((-2i64) as u64, 0x8, false, 0x200, output, false), Ok(0xC000_00A6)), "token: nivel Anonymous");
+    // Um cliente em SecurityIdentification abrindo o próprio token com
+    // OBJ_FORCE_ACCESS_CHECK: sem CopyOnOpen, o SeAccessCheck recusa o
+    // sujeito (STATUS_BAD_IMPERSONATION_LEVEL); com CopyOnOpen (a
+    // impersonação do ALPC), sai uma cópia privada sem SeAccessCheck e a
+    // thread passa a impersoná-la.
+    let identification = tokens::duplicate(system, 1, false, 2).unwrap_or(0);
+    assert(thread_tokens::assign(thread, Some(identification), 1, false, false).is_ok() && matches!(th::open_thread((-2i64) as u64, 0x8, false, 0x600, output, false), Ok(0xC000_00A5)), "token: Identification sem CopyOnOpen");
+    assert(thread_tokens::assign(thread, Some(identification), 1, true, false).is_ok() && matches!(th::open_thread((-2i64) as u64, 0x8, false, 0x600, output, false), Ok(0)), "token: Identification com CopyOnOpen");
+    let copied = guest::read64(output);
+    let private = th::resolve_native(copied).map_or(0, |data| data.native_pointer);
+    let swapped = thread_tokens::get(thread).is_some_and(|state| state.token == private && state.level == 1 && !state.copy_on_open);
+    assert(private != 0 && private != identification && swapped && tokens::with(private, |token| token.kind == 2 && token.impersonation_level == 1).unwrap_or(false), "token: copia privada impersonada");
+    assert(matches!(close::close(copied, Some(0)), Ok(0)), "token: fecha o handle da copia");
     assert(thread_tokens::release(thread).is_ok() && thread_tokens::get(thread).is_none(), "token: impersonacao encerrada");
+    let _ = tokens::release(identification);
     let _ = tokens::release(duplicate);
     guest::free_bytes(output);
 }
