@@ -89,6 +89,9 @@ pub fn init() {
     // O fuso do Registro: a hora do relógio da CMOS (local) com o
     // ActiveTimeBias e o ExpRefreshTimeZoneInformation.
     crate::ntos::ex::time_zone::initialize();
+    // InitSkuSessionParameters: o DbgMultiSessionSku do KUSER_SHARED_DATA
+    // pelo NumberOfInitialSessions da hive SYSTEM.
+    crate::ntos::ex::session_sku::initialize();
     // Definições WNF da hive (Control\Notifications), que NTDLL e KERNELBASE
     // consultam; os dados só existem depois de publicação real.
     crate::ntos::cm::wnf_defaults::initialize().unwrap_or_else(|error| panic!("{error}"));

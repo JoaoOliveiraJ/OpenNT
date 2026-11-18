@@ -113,9 +113,10 @@ pub fn suite_mask() -> u32 {
     0
 }
 
-/// RtlIsMultiSessionSku(): bit 8 de SharedDataFlags — FALSE.
+/// RtlIsMultiSessionSku() (0x6816a0): o bit 8 de SharedDataFlags fora de
+/// server silos, o byte do silo dentro de um.
 pub fn is_multi_session_sku() -> bool {
-    false
+    crate::ntos::se::capability::policy::is_multi_session() != 0
 }
 
 /// RtlGetProductInfo(OSMajor, OSMinor, SpMajor, SpMinor, PULONG ProductType):

@@ -5556,7 +5556,9 @@ fn rtl_crt_extended_exports(assert: Assert) {
     // ---- informação de sistema / produto ----------------------------------
     let product_type = guest::alloc_bytes(4);
     assert(call_export("RtlGetNtProductType", &[product_type]) == Some(1) && guest::read32(product_type) == 1, "rtl: RtlGetNtProductType = WinNt, TRUE");
-    assert(call_export("RtlGetSuiteMask", &[]) == Some(0) && call_export("RtlIsMultiSessionSku", &[]) == Some(0), "rtl: SuiteMask 0 e MultiSession FALSE");
+    assert(call_export("RtlGetSuiteMask", &[]) == Some(0) && call_export("RtlIsMultiSessionSku", &[]) == Some(1), "rtl: SuiteMask 0 e MultiSession TRUE (NumberOfInitialSessions 2)");
+    let flags = crate::ntos::mm::shared_user_data::data().map_or(0, |data| data.shared_data_flags.get());
+    assert(crate::ntos::ex::session_sku::is_multi_session_sku() == Ok(true) && flags & 0x100 != 0, "sku: InitSkuSessionParameters liga o DbgMultiSessionSku com NumberOfInitialSessions 2");
     let edition = guest::alloc_bytes(4);
     assert(call_export("RtlGetProductInfo", &[10, 0, 0, 0, edition]) == Some(1) && guest::read32(edition) == 0x30, "rtl: RtlGetProductInfo = PROFESSIONAL, TRUE");
 
