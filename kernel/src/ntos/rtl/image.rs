@@ -362,7 +362,9 @@ pub mod pe_image_information {
 
     pub const INFORMATION_SIZE: usize = 64;
 
-    pub fn capture(metadata: &MetadataReader, source_size: u64, coff: u64, optional: u64, mapped_base: u64) -> Result<[u8; INFORMATION_SIZE], KernelError> {
+    /// `flat`: a imagem mapeada plana (SectionAlignment menor que a página),
+    /// com ImageMappedFlat e ImageContainsCode.
+    pub fn capture(metadata: &MetadataReader, source_size: u64, coff: u64, optional: u64, mapped_base: u64, flat: bool) -> Result<[u8; INFORMATION_SIZE], KernelError> {
         let mut information = [0u8; INFORMATION_SIZE];
         let put16 = |information: &mut [u8; INFORMATION_SIZE], offset: usize, value: u32| information[offset..offset + 2].copy_from_slice(&(value as u16).to_le_bytes());
         let put32 = |information: &mut [u8; INFORMATION_SIZE], offset: usize, value: u32| information[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
@@ -395,6 +397,12 @@ pub mod pe_image_information {
         }
         // DYNAMIC_BASE sozinho não prova relocação: o bit descreve o mapeamento.
         information[51] = if mapped_base != preferred && dll_characteristics & 0x40 != 0 { 4 } else { 0 };
+        // A imagem plana tem código e ImageMappedFlat, como o
+        // MiBuildImageControlArea marca a subseção única.
+        if flat {
+            information[50] = 1;
+            information[51] |= 8;
+        }
         put32(&mut information, 52, metadata.read_u32(optional + 104)?);
         put32(&mut information, 56, source_size as u32);
         put32(&mut information, 60, metadata.read_u32(optional + 64)?);

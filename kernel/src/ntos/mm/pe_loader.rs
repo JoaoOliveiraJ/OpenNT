@@ -36,7 +36,7 @@ use crate::ntos::rtl::image::pe_image_information;
 use crate::ntos::rtl::image::pe_metadata_reader::MetadataReader;
 use crate::hal::{cpu, physical};
 use crate::ntos::ke::smp;
-use crate::ntos::mm::section::address as section_address;
+use crate::ntos::mm::section::{address as section_address, image_header};
 use crate::ntos::mm::{kernel_address, loaded_images, memory_map, paging, pfn, process_address_space};
 use crate::ntos::ob::objects::file::FileSource;
 use crate::ntos::ps::notify::image as image_notify;
@@ -322,10 +322,15 @@ impl Default for LoadOptions {
 /// A proteção Win32 de cada página de uma imagem de usuário pelas
 /// características das seções que a cobrem (os cabeçalhos são legíveis):
 /// PAGE_NOACCESS fora de toda seção, PAGE_READONLY/READWRITE e as variantes
-/// EXECUTE. Sem execução (SEC_IMAGE_NO_EXECUTE), tudo é PAGE_READONLY.
-fn user_page_protection(page: u64, size_of_headers: u64, sections: &[SectionInfo], no_execute: bool) -> u32 {
+/// EXECUTE. Sem execução (SEC_IMAGE_NO_EXECUTE), tudo é PAGE_READONLY. A
+/// imagem plana é toda MM_EXECUTE_WRITECOPY: PAGE_EXECUTE_READWRITE sobre a
+/// cópia privada de cada vista.
+fn user_page_protection(page: u64, size_of_headers: u64, sections: &[SectionInfo], no_execute: bool, flat: bool) -> u32 {
     if no_execute {
         return 2;
+    }
+    if flat {
+        return 0x40;
     }
     let mut characteristics = if page < size_of_headers { 0x4000_0000u32 } else { 0 };
     for section in sections {
@@ -645,13 +650,23 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
         }
         sections.push(SectionInfo { name, virtual_size: metadata.read_u32(header + 8)?, va: metadata.read_u32(header + 12)?, raw_size: metadata.read_u32(header + 16)?, characteristics: metadata.read_u32(header + 36)? });
     }
+    // SectionAlignment menor que a página num cabeçalho válido: o arquivo
+    // mapeado plano, todo MM_EXECUTE_WRITECOPY (`mm/section/image_header.rs`).
+    // Lido pelas páginas de metadados já em cache.
+    let read_metadata = |offset: u64, length: u64| -> Result<Option<Vec<u8>>, KernelError> {
+        if offset.checked_add(length).is_none_or(|end| end > source.size()) {
+            return Ok(None);
+        }
+        (0..length).map(|index| metadata.read_u8(offset + index).map(|byte| byte as u8)).collect::<Result<Vec<u8>, KernelError>>().map(Some)
+    };
+    let flat = image_header::parse(source.size(), &read_metadata).ok().and_then(Result::ok).is_some_and(|header| header.flat);
     let user_space = options.user_space;
     let session = options.session && !user_space;
     let prototype = options.prototype && user_space;
     let user_view = if user_space && !prototype { options.user_view } else { None };
     let (view_offset, view_size) = user_view.map_or((0, size_of_image), |view| (view.offset, view.size));
     if let Some(view) = user_view {
-        if view.base % memory_map::ALLOCATION_GRANULARITY != 0 || !memory_map::is_user_range(view.base, view_size) || view_offset % 4096 != 0 || view_size % 4096 != 0 || view_offset + view_size > size_of_image {
+        if view.base % memory_map::ALLOCATION_GRANULARITY != 0 || !memory_map::is_user_range(view.base, view_size) || view_offset % 4096 != 0 || view_size % 4096 != 0 || view_offset + view_size > size_of_image.div_ceil(0x1000) * 0x1000 {
             return Err(KernelError::new("PE: invalid partial view"));
         }
     }
@@ -729,22 +744,32 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
         let mapping = Mapping { frames: owned.frames.clone() };
         let rva_to_file_offset = |rva: u64| section_file_offset(&metadata, section_table, section_count, size_of_headers, rva);
         debug_print!("[pe] base={:#x} (fisico {:#x}) imagem={} bytes, {} secoes", image_base, physical_base, size_of_image, section_count);
-        // Zera a imagem (BSS) e copia cabeçalhos e seções.
+        // Zera a imagem (BSS) e copia cabeçalhos e seções. A imagem plana é
+        // o arquivo inteiro a partir do offset zero, até o fim da última
+        // página (os bytes fora das seções também).
         for &frame in &owned.frames {
             physical::zero(frame, 0x1000);
         }
-        mapping.write(0, &source.read_bytes(0, size_of_headers)?);
-        for index in 0..section_count {
-            let header = section_table + index * 40;
-            let virtual_address = metadata.read_u32(header + 12)? as u64;
-            let raw_size = metadata.read_u32(header + 16)? as u64;
-            let raw_pointer = metadata.read_u32(header + 20)? as u64;
-            if raw_size == 0 {
-                continue;
+        let mut copies = Vec::new();
+        if flat {
+            copies.push((String::from("imagem plana"), 0u64, 0u64, source.size().min(owned.frames.len() as u64 * 0x1000)));
+        } else {
+            mapping.write(0, &source.read_bytes(0, size_of_headers)?);
+            for index in 0..section_count {
+                let header = section_table + index * 40;
+                let virtual_address = metadata.read_u32(header + 12)? as u64;
+                let raw_size = metadata.read_u32(header + 16)? as u64;
+                let raw_pointer = metadata.read_u32(header + 20)? as u64;
+                if raw_size == 0 {
+                    continue;
+                }
+                if virtual_address + raw_size > size_of_image || raw_pointer + raw_size > source.size() {
+                    return Err(KernelError::new("PE: secao fora da imagem ou do arquivo"));
+                }
+                copies.push((alloc::format!("secao {index}"), virtual_address, raw_pointer, raw_size));
             }
-            if virtual_address + raw_size > size_of_image || raw_pointer + raw_size > source.size() {
-                return Err(KernelError::new("PE: secao fora da imagem ou do arquivo"));
-            }
+        }
+        for (label, virtual_address, raw_pointer, raw_size) in copies {
             if source.supports_copy_to_physical() && raw_size >= 0x1000 {
                 // Agrupa frames fisicamente contíguos; nunca cruza um salto.
                 let mut copied = 0u64;
@@ -767,7 +792,7 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
                     let expected = u32::from_le_bytes([expected_bytes[0], expected_bytes[1], expected_bytes[2], expected_bytes[3]]);
                     let actual = (0..4u64).fold(0u32, |value, byte| value | (physical::read8(mapping.to_phys(virtual_address + sample + byte)) as u32) << (8 * byte));
                     if actual != expected {
-                        return Err(KernelError::new(alloc::format!("DMA diverge em secao {index} +{sample:#x}: lido {actual:#x} esperado {expected:#x}")));
+                        return Err(KernelError::new(alloc::format!("DMA diverge em {label} +{sample:#x}: lido {actual:#x} esperado {expected:#x}")));
                     }
                 }
                 continue;
@@ -786,7 +811,7 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
         // As páginas protótipo não entram em raiz alguma: só a proteção de
         // cada página, que as vistas aplicam.
         if prototype {
-            page_protects = (0..size_of_image.div_ceil(0x1000)).map(|index| user_page_protection(index * 0x1000, size_of_headers, &sections, options.no_execute)).collect();
+            page_protects = (0..size_of_image.div_ceil(0x1000)).map(|index| user_page_protection(index * 0x1000, size_of_headers, &sections, options.no_execute, flat)).collect();
         }
         // Mapeia a VA escolhida sobre os frames (PTEs de 4 KB; supervisor na
         // imagem de kernel). A imagem de sessão só entra na sessão depois de
@@ -795,7 +820,7 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
             let mut page = view_offset;
             while page < view_offset + view_size {
                 let backing = owned.frames[(page / 0x1000) as usize];
-                let protect = if user_view.is_some() { user_page_protection(page, size_of_headers, &sections, options.no_execute) } else if options.no_execute { 2 } else { 0x40 };
+                let protect = if user_view.is_some() { user_page_protection(page, size_of_headers, &sections, options.no_execute, flat) } else if options.no_execute { 2 } else { 0x40 };
                 let (present, writable, nx) = (protect != 1, matches!(protect, 4 | 0x40), !matches!(protect, 0x20 | 0x40));
                 let flags = (if present { paging::PAGE_PRESENT } else { 0 }) | (if writable { paging::PAGE_RW } else { 0 }) | (if user_space { paging::PAGE_USER } else { 0 });
                 let index = (page / 4096) as usize;
@@ -944,7 +969,7 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
         });
         let resolved_imports = resolved?;
         debug_print!("[pe] entry point = {:#x}", entry_point);
-        let image_information = pe_image_information::capture(&metadata, source.size(), coff, optional, image_base)?;
+        let image_information = pe_image_information::capture(&metadata, source.size(), coff, optional, image_base, flat)?;
         Ok(PeImage {
             entry_point,
             image_base,

@@ -1335,6 +1335,17 @@ além da KUSER_SHARED_DATA:
   cópias da tabela de exports no heap (a da carga e a do processo); com
   uns dez processos e as DLLs deles, o heap de 64 MB acabava no boot do
   smss real ao mapear o scesrv.dll no services.exe.
+  O cabeçalho passa antes pelas regras do MiVerifyImageHeader e do
+  MiCreateImageFileMap (`mm/section/image_header.rs`), as mesmas para o
+  NtCreateSection de usuário, o KnownDlls e a seção da CI: os alinhamentos
+  (um FileAlignment fora de múltiplo de 512 só igual ao SectionAlignment),
+  o SizeOfImage arredondado à página (o tamanho da seção) e a tabela de
+  seções dentro dele. Um SectionAlignment menor que a página (o 0x80 do
+  E1G6032E.sys) é a imagem plana: cada seção com PointerToRawData igual ao
+  VirtualAddress, o arquivo inteiro a partir do offset zero numa faixa só,
+  zero depois do fim do arquivo, toda MM_EXECUTE_WRITECOPY (PAGE_EXECUTE_WRITECOPY
+  no backing de sistema, cópias privadas PAGE_EXECUTE_READWRITE nas vistas de
+  processo) e ImageMappedFlat na SECTION_IMAGE_INFORMATION.
 - **`\Device\PhysicalMemory`** (`mm/section/physical_memory.rs`, o
   MiSectionInitialization): criada no boot com o namespace, permanente e
   com OBJ_KERNEL_EXCLUSIVE. O corpo SECTION aponta para uma CONTROL_AREA

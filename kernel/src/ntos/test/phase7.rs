@@ -301,6 +301,9 @@ fn minimal_image() -> alloc::vec::Vec<u8> {
     bytes[0x46..0x48].copy_from_slice(&1u16.to_le_bytes());
     bytes[0x54..0x56].copy_from_slice(&0xF0u16.to_le_bytes());
     bytes[0x58..0x5A].copy_from_slice(&0x20Bu16.to_le_bytes());
+    // SectionAlignment 0x1000 e FileAlignment 0x200.
+    bytes[0x78..0x7C].copy_from_slice(&0x1000u32.to_le_bytes());
+    bytes[0x7C..0x80].copy_from_slice(&0x200u32.to_le_bytes());
     bytes[0x40 + 80..0x40 + 84].copy_from_slice(&0x2000u32.to_le_bytes());
     bytes[0x40 + 84..0x40 + 88].copy_from_slice(&0x200u32.to_le_bytes());
     let table = 0x40 + 24 + 0xF0;
@@ -450,6 +453,108 @@ fn image_sections(assert: Assert) {
     assert(code != 0 && physical::read8(code) == 0xC3 && physical::read8(paging::translate(view.base)) == b'M' && paging::access_flags(view.base) & paging::PAGE_RW == 0, "sections: vista de imagem com o layout virtual do PE");
     let pointer = image.pointer();
     assert(sections::unmap(&view, None).is_ok() && sections::by_pointer(pointer).is_none(), "sections: imagem destruida na ultima vista");
+}
+
+/// PE32+ plano: SectionAlignment = FileAlignment = 0x80, o offset no arquivo
+/// é o RVA. `.text` em 0x200 (um RET), `.data` gravável de 0x280 a 0x1200
+/// (0xD7 em 0x1100); depois dela, 0x5A em 0x1240, fora de toda seção, e o
+/// arquivo acaba em 0x1280. SizeOfImage 0x1300: duas páginas.
+fn flat_image() -> alloc::vec::Vec<u8> {
+    let mut bytes = alloc::vec![0u8; 0x1280];
+    let put16 = |bytes: &mut alloc::vec::Vec<u8>, at: usize, value: u16| bytes[at..at + 2].copy_from_slice(&value.to_le_bytes());
+    let put32 = |bytes: &mut alloc::vec::Vec<u8>, at: usize, value: u32| bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    put16(&mut bytes, 0, 0x5A4D);
+    put32(&mut bytes, 0x3C, 0x40);
+    put32(&mut bytes, 0x40, 0x4550);
+    put16(&mut bytes, 0x44, 0x8664);
+    put16(&mut bytes, 0x46, 2);
+    put16(&mut bytes, 0x54, 0xF0);
+    put16(&mut bytes, 0x56, 0x22);
+    let optional = 0x58;
+    put16(&mut bytes, optional, 0x20B);
+    put32(&mut bytes, optional + 16, 0x200);
+    bytes[optional + 24..optional + 32].copy_from_slice(&0x6_5452_0000u64.to_le_bytes());
+    put32(&mut bytes, optional + 32, 0x80);
+    put32(&mut bytes, optional + 36, 0x80);
+    put32(&mut bytes, optional + 56, 0x1300);
+    put32(&mut bytes, optional + 60, 0x200);
+    put16(&mut bytes, optional + 68, 1);
+    let table = optional + 0xF0;
+    for (index, (virtual_size, address, raw_size, characteristics)) in [(0x10u32, 0x200u32, 0x80u32, 0x6000_0020u32), (0xF80, 0x280, 0xF80, 0xC000_0040)].into_iter().enumerate() {
+        let header = table + index * 40;
+        put32(&mut bytes, header + 8, virtual_size);
+        put32(&mut bytes, header + 12, address);
+        put32(&mut bytes, header + 16, raw_size);
+        put32(&mut bytes, header + 20, address);
+        put32(&mut bytes, header + 36, characteristics);
+    }
+    bytes[0x200] = 0xC3;
+    bytes[0x1100] = 0xD7;
+    bytes[0x1240] = 0x5A;
+    bytes
+}
+
+/// Imagem com SectionAlignment menor que a página (o MiCreateImageFileMap
+/// plano): o arquivo inteiro a partir do offset zero numa faixa só, toda
+/// MM_EXECUTE_WRITECOPY, e o SizeOfImage arredondado à página.
+fn flat_image_sections(assert: Assert) {
+    use crate::hal::physical;
+    use crate::ntos::mm::section::image_view as section_image_view;
+    use crate::ntos::mm::section::map_view_parameters::View as Request;
+    use crate::ntos::mm::section::views::{self as section_views, OwnedView};
+    use crate::ntos::mm::{memory_map, paging, system_image_pages};
+    use crate::ntos::ps::process;
+    use crate::ntos::ps::user::sections::{self, MapRequest};
+    use crate::ntos::ps::user::state::{RegionKind, UserRegion};
+    let rejected = |bytes: alloc::vec::Vec<u8>| sections::create_image(MemoryFile::new(None, bytes), None, 0x80, false).is_ok_and(|created| created.is_err_and(|status| status == 0xC000_007B));
+    let edited = |at: usize, value: u32| {
+        let mut bytes = flat_image();
+        bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        bytes
+    };
+    // MiVerifyImageHeader: FileAlignment fora de 512 só igual ao
+    // SectionAlignment. MiParseImageSectionHeaders plano: PointerToRawData
+    // igual ao VirtualAddress e VirtualSize dentro do SizeOfRawData.
+    let data = 0x58 + 0xF0 + 40;
+    assert(rejected(edited(0x78, 0x100)) && rejected(edited(data + 20, 0x300)) && rejected(edited(data + 8, 0x1000)) && rejected(edited(0x94, 0x1300)), "flatimage: alinhamentos diferentes, offset diferente do RVA, VirtualSize maior que os dados e cabecalho do tamanho da imagem recusados");
+    // Uma imagem alinhada à página com SizeOfImage fora de múltiplo de
+    // página também é aceita, arredondada.
+    let mut rounded = minimal_image();
+    rounded[0x40 + 80..0x40 + 84].copy_from_slice(&0x1800u32.to_le_bytes());
+    assert(sections::create_image(MemoryFile::new(None, rounded), None, 0x80, false).is_ok_and(|created| created.is_ok_and(|image| image.size == 0x2000 && crate::ntos::ob::objects::section::collect(image.pointer()).is_ok())), "flatimage: SizeOfImage arredondado a pagina");
+    // A vista pelo backing compartilhado (o caminho do MmMapViewInSystemSpace).
+    let Ok(Ok(image)) = sections::create_image(MemoryFile::new(None, flat_image()), None, 0x80, false) else {
+        assert(false, "flatimage: secao de imagem plana criada");
+        return;
+    };
+    assert(image.size == 0x2000 && image.attributes == 0x0100_0000 && system_image_pages::prepare(&image).is_ok() && system_image_pages::protection(&image, 0) == 0x80 && system_image_pages::protection(&image, 1) == 0x80, "flatimage: secao de duas paginas, toda PAGE_EXECUTE_WRITECOPY");
+    let Ok(Ok(view)) = sections::map(&image, &MapRequest { protect: 0x80, commit_size: 0x2000, ..MapRequest::default() }) else {
+        assert(false, "flatimage: vista do backing compartilhado");
+        return;
+    };
+    let byte = |va: u64| physical::read8(paging::translate(va & !0xFFF) + (va & 0xFFF));
+    assert(byte(view.base + 0x200) == 0xC3 && byte(view.base + 0x1100) == 0xD7 && byte(view.base + 0x1240) == 0x5A && byte(view.base + 0x1280) == 0, "flatimage: o arquivo inteiro no offset igual ao RVA, zero depois do fim");
+    let pointer = image.pointer();
+    assert(sections::unmap(&view, None).is_ok() && sections::by_pointer(pointer).is_none(), "flatimage: secao destruida na ultima vista");
+    // A vista de processo sobre a control area (o MiMapViewOfImageSection).
+    let Ok(Ok(section)) = sections::create_image(MemoryFile::new(None, flat_image()), None, 0x80, false) else {
+        assert(false, "flatimage: segunda secao de imagem plana");
+        return;
+    };
+    let request = Request { base: 0, size: 0x2000, offset: 0, upper: memory_map::USER_ADDRESS_LIMIT - 1, alignment: 0x10000, protect: 0x80, allocation: 0, inherit: 2, commit: 0, preferred_node_plus_one: 0 };
+    let Ok(Ok(mapped)) = section_image_view::map(&section, &request, process::get_current_process(), RegionKind::Detached) else {
+        assert(false, "flatimage: vista de processo da imagem plana");
+        return;
+    };
+    let base = mapped.view.base;
+    let segment = mapped.view.segment.clone();
+    let private = paging::translate(base) != segment.frames[0] && paging::translate(base + 0x1000) != segment.frames[1];
+    assert(mapped.view.page_protect(0) == Some(0x40) && mapped.view.page_protect(1) == Some(0x40) && private && byte(base + 0x200) == 0xC3 && byte(base + 0x1100) == 0xD7 && byte(base + 0x1240) == 0x5A && byte(base + 0x1280) == 0 && paging::access_flags(base + 0x200) & paging::PAGE_RW != 0, "flatimage: vista de processo com o arquivo plano, toda gravavel sobre copias privadas");
+    let pointer = section.pointer();
+    let released = section_views::unmap(&OwnedView::Image(mapped.view.clone())).is_ok();
+    drop((mapped, segment));
+    drop(section);
+    assert(released && sections::by_pointer(pointer).is_none(), "flatimage: vista solta e secao destruida");
 }
 
 /// Fonte de arquivo de imagem/dados para FILE_OBJECTs de teste.
@@ -6666,6 +6771,7 @@ pub fn run(assert: Assert) {
     data_sections(assert);
     file_and_named_sections(assert);
     image_sections(assert);
+    flat_image_sections(assert);
     section_image_views(assert);
     section_creation(assert);
     section_open_and_map(assert);

@@ -92,7 +92,8 @@ pub fn map(section: &Arc<Section>, request: &Request, process: u64, regions: Reg
         Ok(segment) => segment,
         Err(status) => return Ok(Err(status)),
     };
-    if offset % 4096 != 0 || size % 4096 != 0 || offset.checked_add(size).is_none_or(|end| end > segment.size_of_image) {
+    // A vista cabe nas páginas da control area (o SizeOfImage arredondado).
+    if offset % 4096 != 0 || size % 4096 != 0 || offset.checked_add(size).is_none_or(|end| end > segment.frames.len() as u64 * 4096) {
         return Ok(Err(0xC000_007B));
     }
     let pages = match image_segment::map_view(&segment, root, base, offset, size) {

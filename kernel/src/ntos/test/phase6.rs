@@ -181,10 +181,12 @@ fn pe_primitives(assert: Assert) {
     assert(matches!(metadata.read_u16(0), Ok(0x5A4D)) && matches!(metadata.read_u32(0x40), Ok(0x4550)) && matches!(metadata.read_u8(0x2040), Ok(0x41)), "pemetadata: leituras escalares");
     assert(matches!(metadata.read_u32(0xFFE), Ok(value) if value == u32::from_le_bytes([image[0xFFE], image[0xFFF], image[0x1000], image[0x1001]])) && metadata.read_u32(0x3FFE).is_err() && metadata.read_u8(0x4000).is_err(), "pemetadata: campo entre paginas e faixa do arquivo");
     // SECTION_IMAGE_INFORMATION.
-    let information = pe_image_information::capture(&metadata, image.len() as u64, 0x44, 0x58, IMAGE_BASE);
+    let information = pe_image_information::capture(&metadata, image.len() as u64, 0x44, 0x58, IMAGE_BASE, false);
     assert(information.as_ref().is_ok_and(|bytes| u64::from_le_bytes(bytes[0..8].try_into().unwrap_or([0; 8])) == IMAGE_BASE + 0x1000 && u16::from_le_bytes([bytes[36], bytes[37]]) == 1 && u16::from_le_bytes([bytes[38], bytes[39]]) == 6 && bytes[50] == 1 && bytes[51] == 0 && u16::from_le_bytes([bytes[48], bytes[49]]) == 0x8664 && u32::from_le_bytes(bytes[60..64].try_into().unwrap_or([0; 4])) == 0xC0DE), "peinfo: transferencia, versoes, codigo e checksum");
-    let relocated = pe_image_information::capture(&metadata, image.len() as u64, 0x44, 0x58, IMAGE_BASE + 0x1000_0000);
+    let relocated = pe_image_information::capture(&metadata, image.len() as u64, 0x44, 0x58, IMAGE_BASE + 0x1000_0000, false);
     assert(relocated.is_ok_and(|bytes| bytes[51] == 4 && u64::from_le_bytes(bytes[0..8].try_into().unwrap_or([0; 8])) == IMAGE_BASE + 0x1000_1000), "peinfo: imagem relocada com DYNAMIC_BASE");
+    let flat = pe_image_information::capture(&metadata, image.len() as u64, 0x44, 0x58, IMAGE_BASE + 0x1000_0000, true);
+    assert(flat.is_ok_and(|bytes| bytes[50] == 1 && bytes[51] == 4 | 8), "peinfo: imagem plana com ImageMappedFlat e ImageContainsCode");
     // EAT: nomes, ordinal sem nome e encaminhamento.
     let read_rva = |rva: u64, length: u64| source.read_bytes(rva, length);
     let exports = pe_exports::read_exports(&read_rva, IMAGE_BASE, 0x4000, 0x2000, 0x70).unwrap_or_default();

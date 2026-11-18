@@ -10,6 +10,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::hal::physical;
+use crate::ntos::mm::section::image_header;
 use crate::ntos::ps::user::sections::{Area, AreaKey, AreaRef, Section, SectionFile};
 use crate::rtl::{KernelError, SpinLock};
 
@@ -40,10 +41,19 @@ fn invalid(message: &str) -> KernelError {
     KernelError::with_status(message, 0xC000_007B)
 }
 
-/// Cabeçalhos (legíveis) e as seções do PE, validadas contra o
-/// SizeOfImage da seção e o tamanho do arquivo.
+/// Cabeçalhos (legíveis) e as seções do PE, validadas contra o tamanho da
+/// seção (o SizeOfImage arredondado à página) e o do arquivo. A imagem
+/// plana (`image_header`) é uma faixa só: o arquivo inteiro a partir do
+/// offset zero, toda MM_EXECUTE_WRITECOPY.
 pub fn layout(section: &Section) -> Result<Vec<ImageRange>, KernelError> {
     let file = section.file.as_ref().ok_or_else(|| invalid("image section without file"))?;
+    let image = match image_header::parse_with(file.size(), &|offset, length| file.read_at(offset, length))? {
+        Ok(image) if image.segment_size == section.size => image,
+        _ => return Err(invalid("invalid system image section")),
+    };
+    if image.flat {
+        return Ok(vec![ImageRange { base: 0, length: section.size, file_offset: 0, raw_size: file.size().min(section.size), flags: 0xE000_0000 }]);
+    }
     let dos = read(file, 0, 64)?;
     let word = |bytes: &[u8], offset: usize| u16::from_le_bytes([bytes[offset], bytes[offset + 1]]);
     let dword = |bytes: &[u8], offset: usize| u32::from_le_bytes([bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]]);
@@ -51,8 +61,8 @@ pub fn layout(section: &Section) -> Result<Vec<ImageRange>, KernelError> {
     let header = read(file, portable_offset, 88)?;
     let count = word(&header, 6) as u64;
     let optional_size = word(&header, 20) as u64;
-    let headers_size = dword(&header, 84) as u64;
-    if word(&dos, 0) != 0x5A4D || dword(&header, 0) != 0x4550 || word(&header, 4) != 0x8664 || word(&header, 24) != 0x20B || optional_size < 64 || dword(&header, 80) as u64 != section.size || headers_size > section.size || headers_size > file.size() {
+    let headers_size = image.size_of_headers;
+    if headers_size > file.size() {
         return Err(invalid("invalid system image section"));
     }
     let table = read(file, portable_offset + 24 + optional_size, count * 40)?;

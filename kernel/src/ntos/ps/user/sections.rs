@@ -30,7 +30,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use super::state::{self, Region, RegionKind, UserRegion};
 use crate::hal::{cpu, physical};
 use crate::ntos::ke::smp;
-use crate::ntos::mm::section::map_view_parameters;
+use crate::ntos::mm::section::{image_header, map_view_parameters};
 use crate::ntos::mm::page_residency::{self, FaultResult, Provider};
 use crate::ntos::mm::paging::{self, MapOptions};
 use crate::ntos::mm::section::secured_views;
@@ -814,40 +814,16 @@ pub fn open(name: &str) -> Created {
     node.data.and_then(|data| by_pointer(data.native_pointer)).ok_or(0xC000_0024)
 }
 
-fn read_exact(file: &Arc<dyn SectionFile>, offset: u64, length: u64) -> Result<Option<Vec<u8>>, KernelError> {
-    let bytes = file.read_at(offset, length)?;
-    Ok(if bytes.len() as u64 == length { Some(bytes) } else { None })
-}
-
-/// SEC_IMAGE: valida o PE32+ AMD64 e o SizeOfImage; o layout virtual é
-/// preparado na primeira vista.
+/// SEC_IMAGE: o cabeçalho pelas regras do MiCreateImageFileMap
+/// (`mm/section/image_header.rs`); a seção tem o SizeOfImage arredondado à
+/// página e o layout virtual é preparado na primeira vista.
 pub fn create_image(file: Arc<dyn SectionFile>, name: Option<String>, page_protect: u32, no_execute: bool) -> Result<Created, KernelError> {
     if no_execute && page_protect != 2 {
         return Ok(Err(0xC000_0045));
     }
-    let header = (|| -> Result<Result<u64, u32>, KernelError> {
-        let Some(dos) = read_exact(&file, 0, 64)? else { return Ok(Err(0xC000_007B)) };
-        if dos[0] != 0x4D || dos[1] != 0x5A {
-            return Ok(Err(0xC000_007B));
-        }
-        let portable = u32::from_le_bytes([dos[0x3C], dos[0x3D], dos[0x3E], dos[0x3F]]) as u64;
-        if file.size() < 88 || portable > file.size() - 88 {
-            return Ok(Err(0xC000_007B));
-        }
-        let Some(bytes) = read_exact(&file, portable, 88)? else { return Ok(Err(0xC000_007B)) };
-        let word = |offset: usize| u16::from_le_bytes([bytes[offset], bytes[offset + 1]]);
-        let dword = |offset: usize| u32::from_le_bytes([bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]]);
-        if dword(0) != 0x4550 || word(4) != 0x8664 || word(20) < 64 || word(24) != 0x20B {
-            return Ok(Err(0xC000_007B));
-        }
-        let size = dword(80) as u64;
-        if size == 0 || size % PAGE != 0 {
-            return Ok(Err(0xC000_007B));
-        }
-        Ok(Ok(size))
-    })();
+    let header = image_header::parse_with(file.size(), &|offset, length| file.read_at(offset, length));
     let size = match header {
-        Ok(Ok(size)) => size,
+        Ok(Ok(header)) => header.segment_size,
         Ok(Err(status)) => return Ok(Err(status)),
         Err(_) => return Ok(Err(0xC000_0185)),
     };

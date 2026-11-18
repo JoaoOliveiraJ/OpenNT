@@ -8,7 +8,9 @@
 //! area, como o ImageSectionObject dos SECTION_OBJECT_POINTERS: a chave é a
 //! identidade do arquivo (`SectionFile::identity`) e, sem ela, o próprio
 //! objeto seção. A seção retém a control area enquanto existe, e cada vista
-//! também; a última referência devolve os frames ao PFN.
+//! também; a última referência devolve os frames ao PFN. A imagem plana
+//! (SectionAlignment menor que a página, `image_header`) é o arquivo inteiro
+//! a partir do offset zero, com todas as páginas graváveis por cópia.
 //!
 //! Uma vista ([`map_view`]) mapeia as páginas de código e somente leitura
 //! sobre os frames protótipo, compartilhados entre os processos e sem

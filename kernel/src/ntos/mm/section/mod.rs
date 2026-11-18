@@ -5,6 +5,7 @@ pub mod cache;
 pub mod address;
 pub mod handles;
 pub mod parameters;
+pub mod image_header;
 pub mod image_segment;
 pub mod image_view;
 pub mod views;
