@@ -26,6 +26,16 @@ pub struct VolumeStat {
     pub times: Vec<u8>,
 }
 
+/// A extensão de disco de um volume (o DISK_EXTENT do
+/// IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS): o número do disco, o início e o
+/// tamanho em bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DiskExtent {
+    pub disk_number: u32,
+    pub starting_offset: u64,
+    pub length: u64,
+}
+
 /// Sistema de arquivos montado sob um diretório do namespace.
 pub trait FileSystem: Sync {
     /// Nome de diagnóstico do volume.
@@ -97,6 +107,11 @@ pub trait FileSystem: Sync {
     }
     /// Identidade e capacidade do volume (FileFs*Information).
     fn volume_query(&self) -> Option<&dyn crate::drivers::fs::volume_information::VolumeQuery> {
+        None
+    }
+    /// A extensão do volume no disco que o guarda; `None` = volume sem disco
+    /// (o disco em memória).
+    fn disk_extent(&self) -> Option<DiskExtent> {
         None
     }
     /// FSCTL do próprio sistema de arquivos; `None` = sem suporte.

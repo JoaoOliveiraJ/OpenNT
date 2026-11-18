@@ -35,6 +35,9 @@ use crate::ntos::inc::types::{Eprocess, IoStatusBlock, NtStruct, SectionBasicInf
 pub struct UserDevice {
     pub device_path: String,
     pub options: u32,
+    /// O handle do I/O manager; 0 numa abertura do IopParseDevice
+    /// (`io/parse.rs`, o volume inteiro), cuja descrição retém só a
+    /// referência do CREATE no FILE_OBJECT.
     pub device_handle: u64,
     pub file_object: u64,
     /// Posição do I/O síncrono (FILE_SYNCHRONOUS_IO_*).
@@ -70,9 +73,14 @@ impl UserObject for UserDevice {
     fn on_handle_closed(&self) {
         super::device_io::cancel_entry(self, 0, false);
     }
-    /// Liberação do objeto: fecha o handle do I/O manager.
+    /// Liberação do objeto: fecha o handle do I/O manager, ou solta a
+    /// referência do CREATE de uma abertura do IopParseDevice.
     fn release(&self) {
-        let _ = io_manager::close_device(self.device_handle);
+        if self.device_handle == 0 {
+            let _ = file_objects::dereference(self.file_object);
+        } else {
+            let _ = io_manager::close_device(self.device_handle);
+        }
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -183,6 +191,17 @@ pub fn open_by_name(handle_pointer: u64, name: &str, object_flags: u32, iosb: u6
     let mut options = request.options;
     loop {
         let request = &OpenRequest { options, ..*request };
+        // Um volume do kernel pelo nome do volume, sem nome restante
+        // (`\??\C:`, o `\\.\C:` do Win32): o IopParseDevice abre o volume
+        // inteiro (`io/parse.rs`), não a raiz (`\??\C:\`).
+        if special.is_none() {
+            if let Some(device) = crate::ntos::io::parse::kernel_volume_device(&name) {
+                if let Err(status) = walk.arrive(crate::ntos::io::reparse::FILE_DEVICE_DISK) {
+                    return Ok(fail_iosb(iosb, status));
+                }
+                return open_volume(handle_pointer, iosb, device, disposition, request, object_flags);
+            }
+        }
         let device_path = if on_boot_volume_device(&name) { None } else { device_path_of(&name) };
         if let Some((device_path, _)) = device_path.as_deref().and_then(io_manager::split_device_path) {
             if let Err(status) = walk.arrive(device_type_of(&device_path)) {
@@ -271,6 +290,66 @@ fn open_device_name(handle_pointer: u64, device_path: Option<String>, object_fla
     // Pipe ou mailslot fora de um file system de dispositivo: o
     // IRP_MJ_CREATE_NAMED_PIPE/CREATE_MAILSLOT não tem quem o atenda.
     Ok(fail_iosb(iosb, 0xC000_0010))
+}
+
+/// A abertura de modo usuário do volume inteiro de um volume do kernel
+/// (`io/parse.rs::open_volume`): as recusas de parâmetros do IopCreateFile
+/// (opções fora de FILE_VALID_OPTION_FLAGS também), o IopParseDevice e o
+/// handle `device` com o FILE_OBJECT aberto (FO_DIRECT_DEVICE_OPEN ou
+/// FO_VOLUME_OPEN) e o acesso concedido pelo SeAccessCheck do dispositivo.
+/// Os IOCTLs, FSCTLs e consultas de volume do handle vão por IRP ao
+/// dispositivo relacionado (`io/file/irp_service.rs`).
+fn open_volume(handle_pointer: u64, iosb: u64, device: u64, disposition: u32, request: &OpenRequest, object_flags: u32) -> Result<u32, KernelError> {
+    if request.options & !0x00FF_FFFF != 0 {
+        return Ok(fail_iosb(iosb, STATUS_INVALID_PARAMETER));
+    }
+    if let Err(status) = file_io::validate_create(disposition, request) {
+        return Ok(fail_iosb(iosb, status));
+    }
+    let volume_request = crate::ntos::io::parse::OpenRequest {
+        desired_access: request.access,
+        file_attributes: request.attributes,
+        share_access: request.share,
+        disposition,
+        create_options: request.options,
+        case_insensitive: object_flags & 0x40 != 0,
+        driver_context: crate::ntos::io::parse::DriverCreateContext::default(),
+    };
+    let (opened, granted) = match crate::ntos::io::parse::open_volume(device, &volume_request) {
+        Ok(result) => result,
+        Err(error) if error.status != 0 => return Ok(fail_iosb(iosb, error.status)),
+        Err(error) => return Err(error),
+    };
+    if opened.status & 0x8000_0000 != 0 || opened.file_object == 0 {
+        return Ok(fail_iosb(iosb, if opened.status & 0x8000_0000 != 0 { opened.status } else { 0xC000_0001 }));
+    }
+    // O provedor de usuário é dono de cada handle publicado; a descrição
+    // retém só a referência do CREATE (solta no `release`).
+    if let Err(error) = file_objects::mark_opened(opened.file_object) {
+        let _ = file_objects::dereference(opened.file_object);
+        return Err(error);
+    }
+    let device_path = crate::drivers::fs::volume_device::real_device_path(device).unwrap_or_default();
+    debug_print!("[usermode] abre volume: {} (acesso 0x{:x}, {})", device_path, granted, if crate::ntos::io::parse::is_volume_open(granted) { "pelo file system" } else { "direto no dispositivo" });
+    let object = Arc::new(UserDevice { device_path, options: request.options, device_handle: 0, file_object: opened.file_object, position: crate::rtl::SpinLock::new(0) });
+    match state::alloc_user_handle(object, granted, object_flags & 2) {
+        Ok(handle) => {
+            if guest::try_write::<u64>(handle_pointer, handle as u64).is_err() {
+                close::close_user(handle as u64, true);
+                return Ok(0xC000_0005);
+            }
+            let information = if opened.information != 0 { opened.information } else { 1 };
+            Ok(if state::set_user_iosb(iosb, 0, information).is_err() { 0xC000_0005 } else { 0 })
+        }
+        Err(error) => {
+            let _ = file_objects::dereference(opened.file_object);
+            if error.status != 0 {
+                Ok(fail_iosb(iosb, error.status))
+            } else {
+                Err(error)
+            }
+        }
+    }
 }
 
 /// NtOpenFile(handle*, access, oa, ioStatus*, share, options).
@@ -363,6 +442,13 @@ fn nt_device_io_control_file(handle: u64, event: u64, apc: u64, context: u64, rs
     let input_length = state::stack_arg32(rsp, 8);
     let output = state::stack_arg(rsp, 9);
     let output_length = state::stack_arg32(rsp, 10);
+    // Uma abertura do IopParseDevice (o volume inteiro, sem handle do I/O
+    // manager): o IopXxxControlFile completo, com o acesso que o código
+    // pede (FILE_READ_ACCESS/FILE_WRITE_ACCESS contra o do handle) e o
+    // dispositivo relacionado do FILE_OBJECT.
+    if device.device_handle == 0 {
+        return Ok(irp_service::device_control(&irp_service::Control { handle, event, apc_routine: apc, apc_context: context, io_status: iosb, code, input, input_length, output, output_length }));
+    }
     if apc != 0 {
         return Ok(0xC000_00BB);
     }

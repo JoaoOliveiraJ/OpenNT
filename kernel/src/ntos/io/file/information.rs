@@ -23,6 +23,7 @@ const RESOURCE: u32 = 0xC000_009A;
 /// FILE_OBJECT.Flags.
 const FO_SYNCHRONOUS_IO: u32 = 0x02;
 const FO_DIRECT_DEVICE_OPEN: u32 = 0x800;
+const FO_VOLUME_OPEN: u32 = 0x40_0000;
 /// Slot do IopGetFileObjectExtension com a dica de dispositivo do topo
 /// (TopDeviceObjectHint em +0 do bloco; layout privado do kernel).
 const DEVICE_HINT_EXTENSION_SLOT: usize = 1;
@@ -51,13 +52,15 @@ pub fn set_object_query(query: ObjectQuery) {
 }
 
 /// O dispositivo a que o I/O Manager manda os IRPs do arquivo: o do
-/// IoGetRelatedDeviceObject, salvo nos volumes do próprio kernel, cujo file
-/// system embutido não tem pilha de IRP (`drivers/fs/volume_device.rs`): o
-/// I/O Manager responde no lugar as operações desses arquivos, e aqui o
-/// resultado é 0.
+/// IoGetRelatedDeviceObject, salvo nos arquivos dos volumes do próprio
+/// kernel, cujo file system embutido não tem pilha de IRP para eles
+/// (`drivers/fs/volume_device.rs`): o I/O Manager responde no lugar as
+/// operações desses arquivos, e aqui o resultado é 0. A abertura do volume
+/// inteiro (FO_VOLUME_OPEN) é atendida por IRP no dispositivo de volume.
 pub fn related_device(file: u64) -> Result<u64, KernelError> {
     let device = related_device_object(file)?;
-    Ok(if crate::drivers::fs::volume_device::is_volume_device(device) { 0 } else { device })
+    let volume_open = file_at(file).flags.get() & FO_VOLUME_OPEN != 0;
+    Ok(if !volume_open && crate::drivers::fs::volume_device::is_volume_device(device) { 0 } else { device })
 }
 
 /// IoGetRelatedDeviceObject: o dispositivo do VPB (ou o do arquivo, ou o do

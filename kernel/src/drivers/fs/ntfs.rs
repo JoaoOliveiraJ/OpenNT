@@ -278,6 +278,13 @@ impl super::volume::FileSystem for Ntfs {
         Some(Ntfs::set_ea(self, path, bytes, kernel_call))
     }
 
+    /// O NTFS que o xtask grava ocupa o disco ATA inteiro desde o setor 0
+    /// (as mesmas respostas que `storage/ata_volume.rs` dá para esse disco).
+    fn disk_extent(&self) -> Option<super::volume::DiskExtent> {
+        let sectors = crate::drivers::storage::ata_pio::capacity_sectors(self.drive).ok()?;
+        Some(super::volume::DiskExtent { disk_number: self.drive as u32, starting_offset: 0, length: sectors * self.geometry.sector_size })
+    }
+
     fn exists(&self, path: &str) -> bool {
         Ntfs::exists(self, path).unwrap_or(false)
     }

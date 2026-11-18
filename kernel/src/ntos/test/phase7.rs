@@ -6802,6 +6802,7 @@ pub fn run(assert: Assert) {
     disk_write_stress(assert, 12, 3);
     user_file_syscalls(assert);
     super::reparse_points::run(assert);
+    super::volume_open::run(assert);
     user_handle_operations(assert);
     user_events_and_semaphores(assert);
     super::keyed_events::run(assert);

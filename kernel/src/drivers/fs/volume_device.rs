@@ -17,22 +17,51 @@
 //! referência até a destruição) e FileName = o caminho no volume. O
 //! IoGetBaseFileSystemDeviceObject e o IoGetRelatedDeviceObject desses
 //! arquivos dão o dispositivo de volume. O file system embutido não tem
-//! pilha de IRP: o I/O Manager responde no lugar as operações dos arquivos
-//! dele (`io/file/information.rs::related_device` não acha dispositivo de
-//! despacho), e um IRP que um driver mande ao dispositivo de volume termina
-//! com STATUS_INVALID_DEVICE_REQUEST. A exceção é a E/S de paginação dos
+//! pilha de IRP para os arquivos: o I/O Manager responde no lugar as
+//! operações deles (`io/file/information.rs::related_device` não acha
+//! dispositivo de despacho). A exceção é a E/S de paginação dos
 //! arquivos de paginação (MmIsFileObjectAPagingFile): o IoPageRead e o
 //! IoSynchronousPageWrite do Mm chegam aqui como IRP_MJ_READ/WRITE com
 //! IRP_PAGING_IO e um MDL de páginas inteiras, e vão direto às runs do
 //! arquivo (`FileSystem::paging_read`/`paging_write`).
+//!
+//! O volume inteiro, aberto pelo nome do volume sem nome restante (`\??\C:`,
+//! o `\\.\C:` do Win32), chega por IRP, como no NT (`io/parse.rs`):
+//! - a abertura direta (só FILE_READ_ATTRIBUTES, READ_CONTROL, WRITE_DAC,
+//!   WRITE_OWNER, SYNCHRONIZE e ACCESS_SYSTEM_SECURITY; FO_DIRECT_DEVICE_OPEN)
+//!   vai ao dispositivo real, que faz o papel do dispositivo de volume do
+//!   gerenciador de volumes: aceita o IRP_MJ_CREATE sem nome, o
+//!   CLEANUP/CLOSE, e responde os IOCTLs de volume e de armazenamento do
+//!   disco que guarda o volume ([`volume_control`]); o resto é
+//!   STATUS_INVALID_DEVICE_REQUEST;
+//! - a abertura do volume pelo file system (mais acesso que o da direta;
+//!   FO_VOLUME_OPEN, com o VPB) vai ao dispositivo de volume do file system,
+//!   que a trata como a abertura de volume de um file system do NT:
+//!   FILE_DIRECTORY_FILE dá STATUS_NOT_A_DIRECTORY, disposição diferente de
+//!   FILE_OPEN/FILE_OPEN_IF dá STATUS_ACCESS_DENIED, FILE_DELETE_ON_CLOSE dá
+//!   STATUS_CANNOT_DELETE, um compartilhamento sem FILE_SHARE_WRITE e sem
+//!   FILE_SHARE_DELETE pede a trava do volume, que um volume do kernel nunca
+//!   concede (o sistema mantém arquivos abertos nele) e dá
+//!   STATUS_SHARING_VIOLATION, e o compartilhamento entre as aberturas do
+//!   volume é o do IoCheckShareAccess sobre o SHARE_ACCESS do volume. Num
+//!   handle desses o IRP_MJ_QUERY_VOLUME_INFORMATION responde pelo volume,
+//!   os IOCTLs seguem ao dispositivo real (o file system os passa ao
+//!   dispositivo alvo) e os FSCTLs de usuário vão ao file system
+//!   (`FileSystem::control` na raiz: FSCTL_IS_VOLUME_MOUNTED,
+//!   FSCTL_GET_NTFS_VOLUME_DATA...); FSCTL_LOCK_VOLUME e
+//!   FSCTL_DISMOUNT_VOLUME dão STATUS_ACCESS_DENIED (volume de boot e de
+//!   paginação, com arquivos abertos) e FSCTL_UNLOCK_VOLUME dá
+//!   STATUS_NOT_LOCKED.
 
+use alloc::collections::BTreeSet;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use super::volume::{self, FileSystem};
+use super::volume::{self, DiskExtent, FileSystem};
 use crate::ntos::inc::field::NtStruct;
-use crate::ntos::inc::types::{DeviceObject, DriverExtension, DriverObject, FileObject, IoStackLocation, Irp, Mdl, Vpb};
-use crate::ntos::io::{file_system, io_manager};
+use crate::ntos::inc::types::extra_fs_ntfs::ShareAccess;
+use crate::ntos::inc::types::{DeviceObject, DriverExtension, DriverObject, FileObject, IoSecurityContext, IoStackLocation, Irp, Mdl, Vpb};
+use crate::ntos::io::{file_system, io_manager, share_access};
 use crate::ntos::ke::dispatcher;
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::ob::object_manager;
@@ -47,10 +76,54 @@ const STATUS_SUCCESS: u32 = 0;
 const STATUS_INVALID_DEVICE_REQUEST: u32 = 0xC000_0010;
 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 const STATUS_UNEXPECTED_IO_ERROR: u32 = 0xC000_00E9;
+const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
+const STATUS_NOT_LOCKED: u32 = 0xC000_002A;
+const STATUS_SHARING_VIOLATION: u32 = 0xC000_0043;
+const STATUS_MEDIA_WRITE_PROTECTED: u32 = 0xC000_00A2;
+const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
+const STATUS_NOT_A_DIRECTORY: u32 = 0xC000_0103;
+const STATUS_CANNOT_DELETE: u32 = 0xC000_0121;
+const IRP_MJ_CREATE: u8 = 0x00;
+const IRP_MJ_CLOSE: u8 = 0x02;
 const IRP_MJ_READ: u8 = 3;
 const IRP_MJ_WRITE: u8 = 4;
+const IRP_MJ_QUERY_VOLUME_INFORMATION: u8 = 0x0A;
+const IRP_MJ_FILE_SYSTEM_CONTROL: u8 = 0x0D;
+const IRP_MJ_DEVICE_CONTROL: u8 = 0x0E;
+const IRP_MJ_CLEANUP: u8 = 0x12;
+/// IRP_MN_USER_FS_REQUEST e IRP_MN_KERNEL_CALL do IRP_MJ_FILE_SYSTEM_CONTROL.
+const IRP_MN_USER_FS_REQUEST: u8 = 0x00;
+const IRP_MN_KERNEL_CALL: u8 = 0x04;
 /// IRP.Flags: IRP_PAGING_IO.
 const IRP_PAGING_IO: u32 = 0x02;
+/// FILE_OBJECT.Flags: FO_VOLUME_OPEN.
+const FO_VOLUME_OPEN: u32 = 0x40_0000;
+/// Opções e disposições de criação (wdm.h) e o Information FILE_OPENED.
+const FILE_DIRECTORY_FILE: u32 = 0x01;
+const FILE_DELETE_ON_CLOSE: u32 = 0x1000;
+const FILE_OPEN: u32 = 1;
+const FILE_OPEN_IF: u32 = 3;
+const FILE_OPENED: u64 = 1;
+const FILE_SHARE_WRITE: u32 = 2;
+const FILE_SHARE_DELETE: u32 = 4;
+const METHOD_BUFFERED: u32 = 0;
+/// FSCTLs que o file system trata pelo estado do volume.
+const FSCTL_LOCK_VOLUME: u32 = 0x0009_0018;
+const FSCTL_UNLOCK_VOLUME: u32 = 0x0009_001C;
+const FSCTL_DISMOUNT_VOLUME: u32 = 0x0009_0020;
+/// IOCTLs de volume e de armazenamento que o dispositivo real responde.
+const IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS: u32 = 0x0056_0000;
+const IOCTL_DISK_GET_LENGTH_INFO: u32 = 0x0007_405C;
+const IOCTL_DISK_IS_WRITABLE: u32 = 0x0007_0024;
+const IOCTL_STORAGE_GET_DEVICE_NUMBER: u32 = 0x002D_1080;
+const IOCTL_STORAGE_QUERY_PROPERTY: u32 = 0x002D_1400;
+/// STORAGE_PROPERTY_ID e STORAGE_QUERY_TYPE (ntddstor.h).
+const STORAGE_ACCESS_ALIGNMENT_PROPERTY: u32 = 6;
+const STORAGE_DEVICE_SEEK_PENALTY_PROPERTY: u32 = 7;
+const STORAGE_DEVICE_TRIM_PROPERTY: u32 = 8;
+const PROPERTY_EXISTS_QUERY: u32 = 1;
+const SECTOR: u32 = 512;
 const PAGE: u64 = 0x1000;
 /// Nome do DRIVER_OBJECT do file system embutido.
 const DRIVER_NAME: &str = "\\FileSystem\\KernelVolume";
@@ -59,11 +132,14 @@ const DRIVER_NAME: &str = "\\FileSystem\\KernelVolume";
 #[derive(Clone, Copy)]
 struct KernelVolume {
     file_system: &'static dyn FileSystem,
+    index: u32,
     /// O DEVICE_OBJECT real (`\Device\KernelVolumeN`).
     real: u64,
     /// O dispositivo de volume do file system embutido.
     volume: u64,
     vpb: u64,
+    /// O SHARE_ACCESS das aberturas do volume pelo file system.
+    share: u64,
 }
 
 // SAFETY: os volumes são estáticos e os endereços são de objetos permanentes.
@@ -71,6 +147,10 @@ unsafe impl Send for KernelVolume {}
 
 static VOLUMES: SpinLock<Vec<KernelVolume>> = SpinLock::new(Vec::new());
 static DRIVER: SpinLock<u64> = SpinLock::new(0);
+/// O lock do SHARE_ACCESS dos volumes (o do VCB no file system do NT).
+static SHARE_LOCK: SpinLock<()> = SpinLock::new(());
+/// IOCTLs sem resposta já registrados na serial.
+static UNKNOWN_CONTROLS: SpinLock<BTreeSet<u32>> = SpinLock::new(BTreeSet::new());
 
 fn device_at(address: u64) -> &'static DeviceObject {
     // SAFETY: DEVICE_OBJECTs permanentes criados por este módulo.
@@ -163,11 +243,26 @@ pub fn mount(index: u32, file_system: &'static dyn FileSystem) -> Result<String,
     // DEVOBJ_EXTENSION e a referência da montagem).
     vpb.device_object.set(volume_device);
     file_system::mount_initialize_vpb(device_at(real), device_at(real), false, false)?;
+    // O SHARE_ACCESS das aberturas do volume (zerado: nenhuma aberta).
+    let share = guest::alloc_bytes(ShareAccess::SIZE);
+    if share == 0 {
+        return Err(KernelError::new("volume do kernel: SHARE_ACCESS sem memoria"));
+    }
     let name = alloc::format!("KernelVolume{index}");
     let node = object_manager::create_object("\\Device", &name, "Device", Some(object_manager::ObjectData::pointer(real)))?;
     object_manager::mount_device(node, file_system);
-    VOLUMES.lock().push(KernelVolume { file_system, real, volume: volume_device, vpb: vpb_address });
+    VOLUMES.lock().push(KernelVolume { file_system, index, real, volume: volume_device, vpb: vpb_address, share });
     Ok(device_path(index))
+}
+
+/// O dispositivo é o real de um volume do kernel (`\Device\KernelVolumeN`).
+pub fn is_real_device(device: u64) -> bool {
+    device != 0 && VOLUMES.lock().iter().any(|entry| entry.real == device)
+}
+
+/// O caminho NT do dispositivo real de um volume do kernel.
+pub fn real_device_path(device: u64) -> Option<String> {
+    VOLUMES.lock().iter().find(|entry| entry.real == device).map(|entry| device_path(entry.index))
 }
 
 fn find(file_system: &'static dyn FileSystem) -> Option<KernelVolume> {
@@ -264,15 +359,272 @@ fn paging_io(device: u64, irp: &Irp) -> Option<(u32, u64)> {
     }
 }
 
-/// A rotina de despacho do file system embutido: os arquivos dele são
-/// respondidos no lugar pelo I/O Manager, então todo IRP é recusado, salvo
-/// a E/S de paginação dos arquivos de paginação.
+/// A rotina de despacho do file system embutido: a E/S de paginação dos
+/// arquivos de paginação e as aberturas do volume inteiro ([`answer`]); os
+/// arquivos do volume são respondidos no lugar pelo I/O Manager.
 extern "win64" fn dispatch(device: u64, packet: u64) -> i32 {
-    // SAFETY: IRP vivo entregue ao dispositivo de volume.
+    // SAFETY: IRP vivo entregue a um dispositivo deste driver.
     let irp = unsafe { Irp::at(packet) };
-    let (status, information) = paging_io(device, irp).unwrap_or((STATUS_INVALID_DEVICE_REQUEST, 0));
+    let (status, information) = paging_io(device, irp).unwrap_or_else(|| answer(device, irp));
     irp.io_status.status.set(status as i32);
     irp.io_status.information.set(information);
     io_manager::iof_complete_request(packet);
     status as i32
+}
+
+fn file_at(file: u64) -> &'static FileObject {
+    // SAFETY: o FILE_OBJECT da stack location de um IRP vivo.
+    unsafe { FileObject::at(file) }
+}
+
+fn share_record(entry: &KernelVolume) -> &'static ShareAccess {
+    // SAFETY: o SHARE_ACCESS permanente alocado na montagem.
+    unsafe { ShareAccess::at(entry.share) }
+}
+
+/// Um IRP que não é de paginação: o dispositivo real atende a abertura
+/// direta e o de volume do file system, a abertura do volume.
+fn answer(device: u64, irp: &Irp) -> (u32, u64) {
+    let Some(entry) = VOLUMES.lock().iter().copied().find(|entry| entry.real == device || entry.volume == device) else { return (STATUS_INVALID_DEVICE_REQUEST, 0) };
+    // SAFETY: a stack location corrente do IRP entregue a este dispositivo.
+    let stack = unsafe { IoStackLocation::at(irp.tail.overlay.current_stack_location.get()) };
+    let file = stack.file_object.get();
+    if device == entry.real {
+        real_request(&entry, irp, stack, file)
+    } else {
+        volume_request(&entry, irp, stack, file)
+    }
+}
+
+/// O dispositivo real no papel do dispositivo de volume do gerenciador de
+/// volumes: só a abertura sem nome (a direta do IopParseDevice) chega a
+/// ele.
+fn real_request(entry: &KernelVolume, irp: &Irp, stack: &IoStackLocation, file: u64) -> (u32, u64) {
+    match stack.major_function.get() {
+        IRP_MJ_CREATE => {
+            if file == 0 || file_at(file).file_name.length.get() != 0 || file_at(file).related_file_object.get() != 0 {
+                return (STATUS_INVALID_DEVICE_REQUEST, 0);
+            }
+            (STATUS_SUCCESS, FILE_OPENED)
+        }
+        IRP_MJ_CLEANUP | IRP_MJ_CLOSE => (STATUS_SUCCESS, 0),
+        IRP_MJ_DEVICE_CONTROL => volume_control(entry, irp, stack),
+        _ => (STATUS_INVALID_DEVICE_REQUEST, 0),
+    }
+}
+
+/// O dispositivo de volume do file system: a abertura do volume (FileName
+/// vazio, sem arquivo relacionado) e os IRPs dos FILE_OBJECTs com
+/// FO_VOLUME_OPEN.
+fn volume_request(entry: &KernelVolume, irp: &Irp, stack: &IoStackLocation, file: u64) -> (u32, u64) {
+    if file == 0 {
+        return (STATUS_INVALID_DEVICE_REQUEST, 0);
+    }
+    let object = file_at(file);
+    let major = stack.major_function.get();
+    if major == IRP_MJ_CREATE {
+        return volume_create(entry, stack, object);
+    }
+    if object.flags.get() & FO_VOLUME_OPEN == 0 {
+        return (STATUS_INVALID_DEVICE_REQUEST, 0);
+    }
+    match major {
+        IRP_MJ_CLEANUP => {
+            let _lock = SHARE_LOCK.lock();
+            share_access::remove(object, share_record(entry));
+            (STATUS_SUCCESS, 0)
+        }
+        IRP_MJ_CLOSE => (STATUS_SUCCESS, 0),
+        IRP_MJ_QUERY_VOLUME_INFORMATION => query_volume(entry, irp, stack),
+        IRP_MJ_FILE_SYSTEM_CONTROL => volume_fs_control(entry, irp, stack),
+        // O file system passa os IOCTLs do volume ao dispositivo alvo.
+        IRP_MJ_DEVICE_CONTROL => volume_control(entry, irp, stack),
+        _ => (STATUS_INVALID_DEVICE_REQUEST, 0),
+    }
+}
+
+/// A abertura do volume pelo file system: as regras da abertura de volume
+/// de um file system do NT e o IoCheckShareAccess no SHARE_ACCESS do
+/// volume.
+fn volume_create(entry: &KernelVolume, stack: &IoStackLocation, object: &FileObject) -> (u32, u64) {
+    if object.file_name.length.get() != 0 || object.related_file_object.get() != 0 {
+        return (STATUS_INVALID_DEVICE_REQUEST, 0);
+    }
+    let create = &stack.parameters.create;
+    let options = create.options.get();
+    let disposition = options >> 24;
+    let share = create.share_access.get() as u32;
+    let context = create.security_context.get();
+    // SAFETY: o IO_SECURITY_CONTEXT do IRP_MJ_CREATE montado pelo I/O Manager.
+    let desired = if context != 0 { unsafe { IoSecurityContext::at(context) }.desired_access.get() } else { 0 };
+    if options & FILE_DIRECTORY_FILE != 0 {
+        return (STATUS_NOT_A_DIRECTORY, 0);
+    }
+    if disposition != FILE_OPEN && disposition != FILE_OPEN_IF {
+        return (STATUS_ACCESS_DENIED, 0);
+    }
+    if options & FILE_DELETE_ON_CLOSE != 0 {
+        return (STATUS_CANNOT_DELETE, 0);
+    }
+    // Sem FILE_SHARE_WRITE nem FILE_SHARE_DELETE a abertura trava o volume,
+    // o que exige nenhum arquivo aberto nele; um volume do kernel sempre os
+    // tem (imagens, hives, o arquivo de paginação).
+    if share & (FILE_SHARE_WRITE | FILE_SHARE_DELETE) == 0 {
+        return (STATUS_SHARING_VIOLATION, 0);
+    }
+    let _lock = SHARE_LOCK.lock();
+    let status = share_access::check(desired, share, object, share_record(entry), true);
+    if status != STATUS_SUCCESS {
+        return (status, 0);
+    }
+    (STATUS_SUCCESS, FILE_OPENED)
+}
+
+/// IRP_MJ_QUERY_VOLUME_INFORMATION numa abertura do volume: a identidade e
+/// a capacidade do volume montado (`volume_information`).
+fn query_volume(entry: &KernelVolume, irp: &Irp, stack: &IoStackLocation) -> (u32, u64) {
+    let parameters = &stack.parameters.query_volume;
+    let class = parameters.fs_information_class.get().0 as u32;
+    let length = parameters.length.get();
+    match super::volume_information::query(entry.file_system.volume_query(), class, length) {
+        Ok(result) => {
+            if result.status >> 30 != 3 {
+                super::volume_information::write(&result, irp.associated_irp.system_buffer.get());
+            }
+            (result.status, result.information as u64)
+        }
+        Err(error) => (if error.status != 0 { error.status } else { STATUS_UNEXPECTED_IO_ERROR }, 0),
+    }
+}
+
+/// IRP_MJ_FILE_SYSTEM_CONTROL numa abertura do volume.
+fn volume_fs_control(entry: &KernelVolume, irp: &Irp, stack: &IoStackLocation) -> (u32, u64) {
+    let minor = stack.minor_function.get();
+    if minor != IRP_MN_USER_FS_REQUEST && minor != IRP_MN_KERNEL_CALL {
+        return (STATUS_INVALID_DEVICE_REQUEST, 0);
+    }
+    let parameters = &stack.parameters.file_system_control;
+    let code = parameters.fs_control_code.get();
+    match code {
+        // A trava pede o volume sem outros arquivos abertos, e a desmontagem
+        // é recusada no volume de boot e de paginação.
+        FSCTL_LOCK_VOLUME | FSCTL_DISMOUNT_VOLUME => return (STATUS_ACCESS_DENIED, 0),
+        FSCTL_UNLOCK_VOLUME => return (STATUS_NOT_LOCKED, 0),
+        _ => {}
+    }
+    if code & 3 != METHOD_BUFFERED {
+        return (STATUS_INVALID_DEVICE_REQUEST, 0);
+    }
+    let output_length = parameters.output_buffer_length.get();
+    let input_length = parameters.input_buffer_length.get();
+    let system_buffer = irp.associated_irp.system_buffer.get();
+    let input = if input_length != 0 && system_buffer != 0 { guest::read_bytes(system_buffer, input_length as usize) } else { Vec::new() };
+    // Quem pede: o acesso da abertura (o WriteAccess do FILE_OBJECT, como o
+    // FsRtlKernelFsControlFile) e o modo do IRP.
+    let file = stack.file_object.get();
+    let write = file != 0 && file_at(file).write_access.get() != 0;
+    let caller = super::ntfs_control::ControlCaller { access: if write { 0x0012_0196 } else { 0x0012_0089 }, user_mode: irp.requestor_mode.get() == 1 && minor != IRP_MN_KERNEL_CALL };
+    let Some(result) = entry.file_system.control("/", code, &input, output_length, &caller) else { return (STATUS_INVALID_DEVICE_REQUEST, 0) };
+    match result {
+        Ok(result) => {
+            let count = result.bytes.len().min(output_length as usize);
+            if count != 0 && system_buffer != 0 {
+                guest::write_bytes(system_buffer, &result.bytes[..count]);
+            }
+            (result.status, (result.information as u64).min(output_length as u64))
+        }
+        Err(error) => (if error.status != 0 { error.status } else { STATUS_UNEXPECTED_IO_ERROR }, 0),
+    }
+}
+
+/// Grava a resposta no SystemBuffer se couber: (status, Information).
+fn reply(irp: &Irp, output_length: u64, bytes: &[u8]) -> (u32, u64) {
+    if output_length < bytes.len() as u64 {
+        return (STATUS_BUFFER_TOO_SMALL, 0);
+    }
+    guest::write_bytes(irp.associated_irp.system_buffer.get(), bytes);
+    (STATUS_SUCCESS, bytes.len() as u64)
+}
+
+/// VOLUME_DISK_EXTENTS com uma extensão: NumberOfDiskExtents, o
+/// alinhamento e o DISK_EXTENT { DiskNumber, StartingOffset, ExtentLength }.
+fn disk_extents(extent: &DiskExtent) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(0x20);
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&extent.disk_number.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&extent.starting_offset.to_le_bytes());
+    bytes.extend_from_slice(&extent.length.to_le_bytes());
+    bytes
+}
+
+/// IRP_MJ_DEVICE_CONTROL (METHOD_BUFFERED) no volume: os IOCTLs que o
+/// gerenciador de volumes responde por um volume simples, com a extensão
+/// do volume no disco (IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
+/// IOCTL_DISK_GET_LENGTH_INFO), e os de armazenamento que ele repassa ao
+/// disco, com as respostas que `storage/ata_volume.rs` dá para o mesmo
+/// disco. O psmsrv.dll (PsmpInitializeDiskHandleCache 0x14d38) e o
+/// PsmServiceExtHost.dll (CrmStateMonitorSystemDiskUsageIndexGet 0x43090)
+/// pedem o VOLUME_DISK_EXTENTS de `\\.\C:`; o RtlQueryVolumeDiskSpeedPolicy
+/// (0x4293c) pede o StorageDeviceSeekPenaltyProperty. Os demais, como o
+/// 0x22096c do RtlpQueryDiskWriteConstraintPolicyByHandle (0x867f0), dão
+/// STATUS_INVALID_DEVICE_REQUEST, que esses chamadores tratam como "sem
+/// resposta" e usam o padrão. Um volume sem disco (o disco em memória) não
+/// tem extensão.
+fn volume_control(entry: &KernelVolume, irp: &Irp, stack: &IoStackLocation) -> (u32, u64) {
+    let parameters = &stack.parameters.device_io_control;
+    let code = parameters.io_control_code.get();
+    let output_length = parameters.output_buffer_length.get() as u64;
+    let input_length = parameters.input_buffer_length.get() as u64;
+    let system_buffer = irp.associated_irp.system_buffer.get();
+    let extent = entry.file_system.disk_extent();
+    match (code, extent) {
+        (IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, Some(extent)) => reply(irp, output_length, &disk_extents(&extent)),
+        (IOCTL_DISK_GET_LENGTH_INFO, Some(extent)) => reply(irp, output_length, &extent.length.to_le_bytes()),
+        (IOCTL_DISK_IS_WRITABLE, _) => (if entry.file_system.writable() { STATUS_SUCCESS } else { STATUS_MEDIA_WRITE_PROTECTED }, 0),
+        (IOCTL_STORAGE_GET_DEVICE_NUMBER, Some(extent)) => {
+            // STORAGE_DEVICE_NUMBER: FILE_DEVICE_DISK, o disco e a partição 0
+            // (o disco inteiro), como o ata_volume.rs.
+            let mut bytes = Vec::with_capacity(12);
+            bytes.extend_from_slice(&FILE_DEVICE_DISK.to_le_bytes());
+            bytes.extend_from_slice(&extent.disk_number.to_le_bytes());
+            bytes.extend_from_slice(&0u32.to_le_bytes());
+            reply(irp, output_length, &bytes)
+        }
+        (IOCTL_STORAGE_QUERY_PROPERTY, Some(_)) => {
+            if input_length < 8 || system_buffer == 0 {
+                return (STATUS_INVALID_PARAMETER, 0);
+            }
+            let property = guest::read32(system_buffer);
+            let query = guest::read32(system_buffer + 4);
+            let descriptor: Option<Vec<u8>> = match property {
+                STORAGE_ACCESS_ALIGNMENT_PROPERTY => Some([0x1C, 0x1C, 64, 0, SECTOR, SECTOR, 0].iter().flat_map(|value: &u32| value.to_le_bytes()).collect()),
+                STORAGE_DEVICE_SEEK_PENALTY_PROPERTY | STORAGE_DEVICE_TRIM_PROPERTY => {
+                    // Disco rotativo emulado: há penalidade de busca e não há TRIM.
+                    let mut bytes = Vec::with_capacity(12);
+                    bytes.extend_from_slice(&12u32.to_le_bytes());
+                    bytes.extend_from_slice(&12u32.to_le_bytes());
+                    bytes.extend_from_slice(&[(property == STORAGE_DEVICE_SEEK_PENALTY_PROPERTY) as u8, 0, 0, 0]);
+                    Some(bytes)
+                }
+                _ => None,
+            };
+            match descriptor {
+                None => (STATUS_NOT_SUPPORTED, 0),
+                Some(_) if query == PROPERTY_EXISTS_QUERY => (STATUS_SUCCESS, 0),
+                Some(bytes) => {
+                    let count = bytes.len().min(output_length as usize);
+                    guest::write_bytes(system_buffer, &bytes[..count]);
+                    (STATUS_SUCCESS, count as u64)
+                }
+            }
+        }
+        _ => {
+            if UNKNOWN_CONTROLS.lock().insert(code) {
+                debug_print!("[kvol] IOCTL {:#x} no volume sem resposta -> STATUS_INVALID_DEVICE_REQUEST", code);
+            }
+            (STATUS_INVALID_DEVICE_REQUEST, 0)
+        }
+    }
 }

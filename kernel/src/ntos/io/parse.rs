@@ -27,22 +27,29 @@
 //!
 //! Sem nome restante, a abertura é do volume (o file system abre o volume
 //! inteiro) quando o acesso pede mais que uma abertura direta do dispositivo
-//! ([`is_volume_open`]); a abertura direta, sem montagem, segue por
-//! `io_manager::open_device`. STATUS_REPARSE, EAs e arquivo relacionado ainda
-//! não são tratados.
+//! ([`is_volume_open`]): o FILE_OBJECT que o file system aceitou fica com
+//! FO_VOLUME_OPEN (rva 0x650234). A abertura direta, sem montagem, segue
+//! por `io_manager::open_device` no ZwCreateFile; a de modo usuário de um
+//! volume do kernel ([`open_volume`], o `\??\C:` do `\\.\C:` do Win32) faz
+//! o caminho inteiro do IopParseDevice: o IopCheckDeviceAndDriver, o
+//! SeAccessCheck do descritor do dispositivo com o acesso pedido e, sem
+//! montagem, o IRP_MJ_CREATE ao topo da pilha do próprio dispositivo com
+//! FO_DIRECT_DEVICE_OPEN ([`open_direct`]). STATUS_REPARSE, EAs e arquivo
+//! relacionado ainda não são tratados.
 
 use alloc::string::String;
 use alloc::sync::Arc;
 use core::sync::atomic::Ordering;
 
 use crate::ntos::inc::field::NtStruct;
-use crate::ntos::inc::types::{AccessState, AuxAccessData, DeviceObject, FileObject, GenericMapping, IoStackLocation, IoStatusBlock, Irp};
+use crate::ntos::inc::types::{AccessState, AuxAccessData, DeviceObject, DevobjExtension, FileObject, GenericMapping, IoStackLocation, IoStatusBlock, Irp};
 use crate::ntos::io::irp_builder::{self, BuildOptions};
 use crate::ntos::io::threads::thread_requests;
 use crate::ntos::io::{file::information, file_system, io_manager};
 use crate::ntos::ke::dispatcher;
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::ob::object_manager;
+use crate::ntos::ob::object_types::{self, ObjectType};
+use crate::ntos::ob::{object_access, object_manager, object_security};
 use crate::ntos::ob::objects::device as device_objects;
 use crate::ntos::ob::objects::file::{self as file_objects, FileCallbacks};
 use crate::ntos::ps::process;
@@ -76,7 +83,17 @@ const FO_RANDOM_ACCESS: u32 = 0x10_0000;
 const FILE_GENERIC_MAPPING: [u32; 4] = [0x0012_0089, 0x0012_0116, 0x0012_00A0, 0x001F_01FF];
 
 const STATUS_INVALID_DEVICE_OBJECT_PARAMETER: u32 = 0xC000_0369;
+const STATUS_NO_SUCH_DEVICE: u32 = 0xC000_000E;
 const VPB_MOUNTED: u16 = 0x01;
+/// FILE_OBJECT.Flags: FO_DIRECT_DEVICE_OPEN e FO_VOLUME_OPEN.
+const FO_DIRECT_DEVICE_OPEN: u32 = 0x800;
+const FO_VOLUME_OPEN: u32 = 0x40_0000;
+/// DEVICE_OBJECT.Flags: DO_DEVICE_INITIALIZING.
+const DO_DEVICE_INITIALIZING: u32 = 0x80;
+/// DEVOBJ_EXTENSION.ExtensionFlags: DOE_UNLOAD_PENDING, DOE_DELETE_PENDING,
+/// DOE_REMOVE_PENDING, DOE_REMOVE_PROCESSED e DOE_START_PENDING.
+const DOE_PENDING: u32 = 0x1F;
+const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
 /// O acesso de uma abertura direta do dispositivo (IopParseDevice, ntoskrnl
 /// 19041): FILE_READ_ATTRIBUTES, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
 /// SYNCHRONIZE e ACCESS_SYSTEM_SECURITY. Pedir qualquer outro bit sem nome
@@ -294,6 +311,42 @@ fn release_access_state(block: u64) {
     guest::free_bytes(block);
 }
 
+/// O IRP_MJ_CREATE de `file` a `target`: o ACCESS_STATE, o
+/// IO_SECURITY_CONTEXT, Options = (Disposition << 24) | CreateOptions, os
+/// atributos, o compartilhamento e a lista de ECPs. Devolve (status,
+/// Information).
+fn send_create(target: u64, file: u64, request: &OpenRequest) -> Result<(u32, u64), KernelError> {
+    let access = create_access_state(request.desired_access)?;
+    let context = guest::alloc_bytes(IoSecurityContext::SIZE);
+    if context == 0 {
+        release_access_state(access);
+        return Ok((STATUS_INSUFFICIENT_RESOURCES, 0));
+    }
+    // SAFETY: bloco recém-alocado do tamanho do IO_SECURITY_CONTEXT.
+    let security = unsafe { IoSecurityContext::at(context) };
+    security.access_state.set(access);
+    security.desired_access.set(request.desired_access);
+    security.full_create_options.set(request.create_options);
+    let ecp_list = request.driver_context.extra_create_parameter;
+    let result = call_file_irp(target, file, IRP_MJ_CREATE, IRP_CREATE_OPERATION | IRP_SYNCHRONOUS_API, |irp, stack| {
+        if ecp_list != 0 {
+            // SAFETY: a _ECP_LIST do IO_DRIVER_CREATE_CONTEXT do chamador.
+            crate::ntos::fsrtl::ecp::set_list_into_irp(irp, unsafe { crate::ntos::inc::types::extra_fsrtl::EcpList::at(ecp_list) });
+        }
+        stack.major_function.set(IRP_MJ_CREATE);
+        stack.flags.set(if request.case_insensitive { 0 } else { SL_CASE_SENSITIVE });
+        let create = &stack.parameters.create;
+        create.security_context.set(context);
+        create.options.set((request.disposition << 24) | (request.create_options & 0x00FF_FFFF));
+        create.file_attributes.set(request.file_attributes as u16);
+        create.share_access.set(request.share_access as u16);
+        create.ea_length.set(0);
+    });
+    guest::free_bytes(context);
+    release_access_state(access);
+    result
+}
+
 /// Abre `remaining` no volume montado em `device` (montando-o se preciso).
 pub fn open_file(device: u64, remaining: &str, request: &OpenRequest) -> Result<Opened, KernelError> {
     let real = device_at(device);
@@ -335,8 +388,8 @@ pub fn open_file(device: u64, remaining: &str, request: &OpenRequest) -> Result<
     let object = unsafe { FileObject::at(file) };
     object.vpb.set(vpb);
     object.flags.set(file_object_flags(request.create_options));
-    let access = match create_access_state(request.desired_access) {
-        Ok(access) => access,
+    let (status, information) = match send_create(target, file, request) {
+        Ok(result) => result,
         Err(error) => {
             let _ = file_objects::dereference(file);
             let _ = file_system::dereference_vpb(vpb);
@@ -344,35 +397,19 @@ pub fn open_file(device: u64, remaining: &str, request: &OpenRequest) -> Result<
             return Err(error);
         }
     };
-    let context = guest::alloc_bytes(IoSecurityContext::SIZE);
-    // SAFETY: bloco recém-alocado do tamanho do IO_SECURITY_CONTEXT.
-    let security = unsafe { IoSecurityContext::at(context) };
-    security.access_state.set(access);
-    security.desired_access.set(request.desired_access);
-    security.full_create_options.set(request.create_options);
-    let ecp_list = request.driver_context.extra_create_parameter;
-    let (status, information) = call_file_irp(target, file, IRP_MJ_CREATE, IRP_CREATE_OPERATION | IRP_SYNCHRONOUS_API, |irp, stack| {
-        if ecp_list != 0 {
-            // SAFETY: a _ECP_LIST do IO_DRIVER_CREATE_CONTEXT do chamador.
-            crate::ntos::fsrtl::ecp::set_list_into_irp(irp, unsafe { crate::ntos::inc::types::extra_fsrtl::EcpList::at(ecp_list) });
-        }
-        stack.major_function.set(IRP_MJ_CREATE);
-        stack.flags.set(if request.case_insensitive { 0 } else { SL_CASE_SENSITIVE });
-        let create = &stack.parameters.create;
-        create.security_context.set(context);
-        create.options.set((request.disposition << 24) | (request.create_options & 0x00FF_FFFF));
-        create.file_attributes.set(request.file_attributes as u16);
-        create.share_access.set(request.share_access as u16);
-        create.ea_length.set(0);
-    })?;
-    guest::free_bytes(context);
-    release_access_state(access);
     if (status as i32) < 0 || status == STATUS_PENDING {
         // A falha não chega ao file system como CLOSE: só as referências voltam.
         let _ = file_objects::dereference(file);
         let _ = file_system::dereference_vpb(vpb);
         release_device();
         return Ok(Opened { status, information: 0, file_object: 0 });
+    }
+    // Sem nome e sem arquivo relacionado, a abertura que um file system
+    // atendeu (FILE_DEVICE_CD_ROM_FILE_SYSTEM, DISK_FILE_SYSTEM, FILE_SYSTEM
+    // ou TAPE_FILE_SYSTEM no dispositivo que recebeu o IRP) é a do volume
+    // (IopParseDevice, rva 0x650214..0x650234).
+    if remaining.is_empty() && matches!(device_at(target).device_type.get(), 3 | 8 | 9 | 0x20) {
+        object.flags.atomic().fetch_or(FO_VOLUME_OPEN, Ordering::SeqCst);
     }
     if hint != 0 {
         // A dica fica no FILE_OBJECT: os IRPs seguintes param nela.
@@ -390,4 +427,112 @@ pub fn open_file(device: u64, remaining: &str, request: &OpenRequest) -> Result<
         destroy: None,
     })?;
     Ok(Opened { status, information, file_object: file })
+}
+
+/// A abertura direta do IopParseDevice (sem nome restante, sem arquivo
+/// relacionado e só com os direitos de DIRECT_DEVICE_OPEN_ACCESS): sem
+/// montagem, o FILE_OBJECT fica com DeviceObject = o dispositivo do nome,
+/// sem VPB e com FO_DIRECT_DEVICE_OPEN (rva 0x64f548), e o IRP_MJ_CREATE
+/// vai ao topo da pilha do próprio dispositivo (IoGetAttachedDevice,
+/// 0x64f010). Os IRPs seguintes do arquivo vão ao mesmo topo
+/// (IopXxxControlFile 0x64bd0e).
+pub fn open_direct(device: u64, request: &OpenRequest) -> Result<Opened, KernelError> {
+    // IopIncrementDeviceObjectRefCount: a abertura retém o dispositivo.
+    device_at(device).reference_count.atomic().fetch_add(1, Ordering::SeqCst);
+    let release_device = move || {
+        device_at(device).reference_count.atomic().fetch_sub(1, Ordering::SeqCst);
+        device_objects::changed(device);
+    };
+    let target = device_objects::top(device);
+    let file = match file_objects::create(device, "") {
+        Ok(file) => file,
+        Err(error) => {
+            release_device();
+            return Err(error);
+        }
+    };
+    // SAFETY: o FILE_OBJECT recém-criado.
+    let object = unsafe { FileObject::at(file) };
+    object.flags.set(file_object_flags(request.create_options) | FO_DIRECT_DEVICE_OPEN);
+    let (status, information) = match send_create(target, file, request) {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = file_objects::dereference(file);
+            release_device();
+            return Err(error);
+        }
+    };
+    if (status as i32) < 0 || status == STATUS_PENDING {
+        let _ = file_objects::dereference(file);
+        release_device();
+        return Ok(Opened { status, information: 0, file_object: 0 });
+    }
+    file_objects::set_callbacks(file, FileCallbacks {
+        cleanup: Some(Arc::new(move || send_close(file, IRP_MJ_CLEANUP))),
+        close: Some(Arc::new(move || {
+            send_close(file, IRP_MJ_CLOSE);
+            release_device();
+        })),
+        destroy: None,
+    })?;
+    Ok(Opened { status, information, file_object: file })
+}
+
+/// O SeAccessCheck do IopParseDevice para um chamador de modo usuário sem
+/// nome restante (rva 0x64eb07): o descritor do dispositivo, o sujeito da
+/// thread (com a impersonação), o acesso pedido e o mapeamento genérico do
+/// IoFileObjectType. Sem descritor, o pedido é concedido.
+fn device_access(device: u64, desired: u32, file_type: &ObjectType) -> Result<u32, u32> {
+    match object_security::object_policy(device) {
+        Some(policy) => object_access::check(&policy, object_access::subject(), desired, file_type, false),
+        None => Ok((desired & !MAXIMUM_ALLOWED) | if desired & MAXIMUM_ALLOWED != 0 { file_type.valid_access } else { 0 }),
+    }
+}
+
+/// O IopParseDevice de uma abertura de modo usuário sem nome restante num
+/// volume do kernel: o IopCheckDeviceAndDriver (0x2d3af0: o dispositivo
+/// com remoção, descarga ou início pendente, ou ainda inicializando, dá
+/// STATUS_NO_SUCH_DEVICE), o acesso pedido com o mapeamento genérico de
+/// arquivo (RtlMapGenericMask, 0x64e90b), o SeAccessCheck do descritor do
+/// dispositivo ([`device_access`]) e a escolha (0x64eda1..0x64edc0): só os
+/// direitos da abertura direta (o pedido antes da checagem, com
+/// MAXIMUM_ALLOWED contando como mais) abrem o dispositivo direto
+/// ([`open_direct`]); senão o volume é aberto pelo file system
+/// ([`open_file`] sem nome, com FO_VOLUME_OPEN). O file system recebe no
+/// IO_SECURITY_CONTEXT o acesso concedido. Devolve a abertura e o acesso
+/// concedido, que é o do handle.
+pub fn open_volume(device: u64, request: &OpenRequest) -> Result<(Opened, u32), KernelError> {
+    let failed = |status: u32| -> Result<(Opened, u32), KernelError> { Ok((Opened { status, information: 0, file_object: 0 }, 0)) };
+    let object = device_at(device);
+    let extension = object.device_object_extension.get();
+    // SAFETY: a DEVOBJ_EXTENSION de um dispositivo vivo.
+    let pending = extension != 0 && unsafe { DevobjExtension::at(extension) }.extension_flags.get() & DOE_PENDING != 0;
+    if pending || object.flags.get() & DO_DEVICE_INITIALIZING != 0 {
+        return failed(STATUS_NO_SUCH_DEVICE);
+    }
+    let file_type = object_types::file_type();
+    let desired = object_access::map_generic_access(request.desired_access, &file_type);
+    let granted = match device_access(device, desired, &file_type) {
+        Ok(granted) => granted,
+        Err(status) => return failed(status),
+    };
+    let request = OpenRequest { desired_access: granted, ..*request };
+    let opened = if is_volume_open(desired) { open_file(device, "", &request)? } else { open_direct(device, &request)? };
+    Ok((opened, granted))
+}
+
+/// O dispositivo real do volume do kernel em que `path` termina, sem nome
+/// restante: `\??\C:` (o `\\.\C:` do Win32), `\GLOBAL??\D:`,
+/// `\Device\KernelVolume1`. `\??\C:\` (com a barra) é a raiz do volume, um
+/// diretório do file system, e não entra aqui.
+pub fn kernel_volume_device(path: &str) -> Option<u64> {
+    if path.is_empty() || path.ends_with(['\\', '/']) {
+        return None;
+    }
+    let (Some(node), Some(rest)) = object_manager::resolve(path) else { return None };
+    if !rest.is_empty() {
+        return None;
+    }
+    let device = object_manager::node(node)?.data?.native_pointer;
+    crate::drivers::fs::volume_device::is_real_device(device).then_some(device)
 }

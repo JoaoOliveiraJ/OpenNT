@@ -177,6 +177,30 @@ pub enum Created {
     Reparse(VolumeReparse),
 }
 
+/// As recusas de parâmetros do IopCreateFile antes do parse, comuns a toda
+/// abertura de modo usuário: disposição, compartilhamento, diretório e
+/// não-diretório juntos, E/S síncrona sem SYNCHRONIZE ou nos dois modos,
+/// diretório com disposição de arquivo, DELETE_ON_CLOSE sem DELETE e as
+/// combinações de oplock (FILE_RESERVE_OPFILTER ou FILE_OPEN_REQUIRING_OPLOCK
+/// com FILE_COMPLETE_IF_OPLOCKED, e FILE_OPEN_REQUIRING_OPLOCK com
+/// FILE_RESERVE_OPFILTER): STATUS_INVALID_PARAMETER.
+pub fn validate_create(disposition: u32, request: &OpenRequest) -> Result<(), u32> {
+    let granted = access(request.access);
+    let (share, options) = (request.share, request.options);
+    let directory = options & 1 != 0;
+    let non_directory = options & 0x40 != 0;
+    if disposition > 5 || share & !7 != 0 || (directory && non_directory) || options & 0x30 == 0x30 || (options & 0x30 != 0 && granted & 0x10_0000 == 0) || (directory && ![1, 2, 3].contains(&disposition)) {
+        return Err(INVALID);
+    }
+    if options & 0x1000 != 0 && granted & 0x1_0000 == 0 {
+        return Err(INVALID);
+    }
+    if [0x10_0100, 0x1_0100, 0x11_0000].iter().any(|&pair| options & pair == pair) {
+        return Err(INVALID);
+    }
+    Ok(())
+}
+
 /// Abre ou cria `name` e publica o handle, seguindo os reparse points do
 /// caminho como o NtCreateFile (`files::open_by_name`).
 pub fn open(out: u64, name: &str, iosb: u64, disposition: u32, request: &OpenRequest) -> Result<u32, KernelError> {
@@ -195,18 +219,8 @@ pub fn create(out: u64, name: &str, iosb: u64, disposition: u32, request: &OpenR
         let (share, options) = (request.share, request.options);
         let directory = options & 1 != 0;
         let non_directory = options & 0x40 != 0;
-        if disposition > 5 || share & !7 != 0 || (directory && non_directory) || options & 0x30 == 0x30 || (options & 0x30 != 0 && granted & 0x10_0000 == 0) || (directory && ![1, 2, 3].contains(&disposition)) {
-            return fail(INVALID);
-        }
-        if options & 0x1000 != 0 && granted & 0x1_0000 == 0 {
-            return fail(INVALID);
-        }
-        // As combinações de oplock que o IopCreateFile recusa antes do file
-        // system: FILE_RESERVE_OPFILTER ou FILE_OPEN_REQUIRING_OPLOCK com
-        // FILE_COMPLETE_IF_OPLOCKED, e FILE_OPEN_REQUIRING_OPLOCK com
-        // FILE_RESERVE_OPFILTER.
-        if [0x10_0100, 0x1_0100, 0x11_0000].iter().any(|&pair| options & pair == pair) {
-            return fail(INVALID);
+        if let Err(status) = validate_create(disposition, request) {
+            return fail(status);
         }
         // EA, abertura por id, os demais pedidos de oplock e contextos
         // estendidos exigem contratos próprios: pedidos sem suporte nunca
