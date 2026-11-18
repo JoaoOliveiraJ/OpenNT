@@ -142,12 +142,27 @@ pub fn open(out: u64, name: &str, iosb: u64, disposition: u32, request: &OpenReq
         if options & 0x1000 != 0 && granted & 0x1_0000 == 0 {
             return fail(INVALID);
         }
-        // EA, oplocks, abertura por id e contextos estendidos exigem
-        // contratos próprios: pedidos sem suporte nunca têm sucesso.
+        // As combinações de oplock que o IopCreateFile recusa antes do file
+        // system: FILE_RESERVE_OPFILTER ou FILE_OPEN_REQUIRING_OPLOCK com
+        // FILE_COMPLETE_IF_OPLOCKED, e FILE_OPEN_REQUIRING_OPLOCK com
+        // FILE_RESERVE_OPFILTER.
+        if [0x10_0100, 0x1_0100, 0x11_0000].iter().any(|&pair| options & pair == pair) {
+            return fail(INVALID);
+        }
+        // EA, abertura por id, os demais pedidos de oplock e contextos
+        // estendidos exigem contratos próprios: pedidos sem suporte nunca
+        // têm sucesso.
         // FILE_OPEN_FOR_FREE_SPACE_QUERY (0x80_0000) só tira a cota do
         // usuário das consultas de espaço livre do handle (o volume não tem
         // cotas): o GetDiskFreeSpaceExW abre o diretório com ela.
-        let supported = 1 | 2 | 4 | 8 | 0x10 | 0x20 | 0x40 | 0x800 | 0x1000 | 0x4000 | 0x8000 | 0x2_0000 | 0x20_0000 | 0x40_0000 | 0x80_0000;
+        // FILE_OPEN_REQUIRING_OPLOCK (0x1_0000) só faz a abertura falhar com
+        // STATUS_CANNOT_BREAK_OPLOCK quando ela quebraria o oplock de outra
+        // abertura. O volume não concede oplocks (o FSCTL_REQUEST_OPLOCK de
+        // um arquivo dele é STATUS_INVALID_DEVICE_REQUEST), então não há o
+        // que quebrar e a abertura segue como as demais. O shcore abre assim
+        // os arquivos dos seus streams (COplockFileHandle) e aceita a recusa
+        // do FSCTL como "sem oplock".
+        let supported = 1 | 2 | 4 | 8 | 0x10 | 0x20 | 0x40 | 0x800 | 0x1000 | 0x4000 | 0x8000 | 0x1_0000 | 0x2_0000 | 0x20_0000 | 0x40_0000 | 0x80_0000;
         if options & !supported != 0 || request.ea_length != 0 || granted & 0x0200_0000 != 0 {
             debug_print!("[file-io] create unsupported name={} access=0x{:x} options=0x{:x} eaLength={}", name, granted, options, request.ea_length);
             return fail(0xC000_00BB);

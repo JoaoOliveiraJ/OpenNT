@@ -978,6 +978,23 @@ fn user_file_io(assert: Assert) {
     }
     assert(missing_parent == 0xC000_003A, "userfiles: pasta intermediaria ausente");
     assert(open("\\??\\D:\\HELLO.TXT", 6, 0x8010_0000, 1, 0x20) == 0xC000_000D && open("\\??\\D:\\HELLO.TXT", 1, 1, 1, 0x20) == 0xC000_000D, "userfiles: disposicao invalida e E/S sincrona sem SYNCHRONIZE");
+    // FILE_OPEN_REQUIRING_OPLOCK: a abertura assíncrona do shcore segue (o
+    // volume não concede oplocks) e o FSCTL_REQUEST_OPLOCK do handle é
+    // STATUS_INVALID_DEVICE_REQUEST; as combinações com
+    // FILE_COMPLETE_IF_OPLOCKED e FILE_RESERVE_OPFILTER são recusadas como
+    // no IopCreateFile.
+    let requiring = open("\\??\\D:\\HELLO.TXT", 1, 0x8010_0000, 7, 0x1_0040);
+    let oplocked = guest::read64(out);
+    guest::write64(rsp + 0x28, iosb);
+    guest::write32(rsp + 0x30, 0x9_0240);
+    guest::write64(rsp + 0x38, buffer);
+    guest::write32(rsp + 0x40, 12);
+    guest::write64(rsp + 0x48, buffer + 0x40);
+    guest::write32(rsp + 0x50, 0x18);
+    let request_oplock = state::handler("NtFsControlFile").map(|handler| handler(oplocked, 0, 0, 0, rsp).unwrap_or(1)).unwrap_or(1);
+    let closed = requiring == 0 && state::close_user_handle(oplocked, true, false).is_ok_and(|status| status == 0);
+    assert(closed && request_oplock == 0xC000_0010, "userfiles: FILE_OPEN_REQUIRING_OPLOCK abre e o FSCTL_REQUEST_OPLOCK fica sem suporte");
+    assert([0x1_0140, 0x11_0040, 0x10_0140].iter().all(|&options| open("\\??\\D:\\HELLO.TXT", 1, 0x8010_0000, 7, options) == 0xC000_000D), "userfiles: combinacoes de oplock recusadas como no IopCreateFile");
     if let Some(region) = memory::find_region(block) {
         memory::release_private_region(&region);
     }
