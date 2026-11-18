@@ -285,8 +285,10 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
     if parsed.capture.is_some() && (parsed.command != "test-boot" || parsed.build_only) {
         return Err("--capture e opcao do test-boot que roda o QEMU".into());
     }
-    if parsed.watch_screen && (parsed.command != "test-boot" || parsed.build_only) {
-        return Err("--watch-screen e opcao do test-boot que roda o QEMU".into());
+    // Com `--build-only` a vigia não tem efeito: o test-all monta as imagens
+    // com o comando inteiro do teste, e o `--watch-screen` só vale na execução.
+    if parsed.watch_screen && parsed.command != "test-boot" {
+        return Err("--watch-screen e opcao do test-boot".into());
     }
     if parsed.build_only && parsed.no_build {
         return Err("--build-only e --no-build se excluem".into());
