@@ -114,9 +114,10 @@ pub fn shootdown_timeout_ms() -> u64 {
 }
 
 /// Uma espera de IPI que venceu o prazo. Leva os parâmetros do
-/// IPI_WATCHDOG_TIMEOUT do KiIpiGenericCallTarget do 19041 (a frequência do
-/// contador de desempenho, o valor corrente e o do início da espera) e a
-/// máscara dos processadores (pelo número) que não responderam.
+/// IPI_WATCHDOG_TIMEOUT do KiIpiGenericCallTarget do 19041 — a frequência
+/// que o KeQueryPerformanceCounter devolve (10 MHz), o valor corrente do
+/// contador e o do início da espera — e a máscara dos processadores (pelo
+/// número) que não responderam.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IpiStall {
     pub frequency: u64,
@@ -132,23 +133,36 @@ impl IpiStall {
     }
 }
 
-/// Espera, pelo tempo do contador de desempenho (o TSC, o mesmo do
-/// KeQueryPerformanceCounter), até `pending` devolver 0: a máscara dos
-/// processadores que ainda não responderam. Vencido `timeout_ms`, devolve o
-/// atraso com o que ainda faltava, como a detecção de IPI parado do NT, que
-/// compara o contador com a frequência vezes o prazo em vez de contar
-/// voltas: o prazo é o mesmo em qualquer CPU, hipervisor ou emulador.
+/// O prazo de `timeout_ms` venceu depois de `elapsed` unidades de um
+/// contador de `frequency` Hz: o contador passou do início mais a frequência
+/// vezes o prazo, a comparação estrita do KiIpiGenericCallTarget do 19041
+/// (`ja` do contador contra o BaselineInterruptTimeQpc mais Frequency ×
+/// 300). A conta é exata, em 128 bits:
+/// um prazo que não é um número inteiro de unidades do contador (o TSC a
+/// 3 393 623 006 Hz dá 101 808 690,18 unidades em 30 ms) não vence na
+/// unidade de baixo, um pedaço de unidade antes da hora, com 29 ms
+/// transcorridos.
+pub fn deadline_passed(elapsed: u64, frequency: u64, timeout_ms: u64) -> bool {
+    elapsed as u128 * 1000 > frequency as u128 * timeout_ms as u128
+}
+
+/// Espera, pelo contador de desempenho (o KeQueryPerformanceCounter, a
+/// 10 MHz, que o KiIpiGenericCallTarget do 19041 lê), até `pending` devolver
+/// 0: a máscara dos processadores que ainda não responderam. Vencido
+/// `timeout_ms` ([`deadline_passed`]), devolve o atraso com o que ainda
+/// faltava. A espera compara o contador com a frequência vezes o prazo em
+/// vez de contar voltas: o prazo é o mesmo em qualquer CPU, hipervisor ou
+/// emulador.
 pub fn stall_on_targets(timeout_ms: u64, mut pending: impl FnMut() -> u64) -> Result<(), IpiStall> {
-    let frequency = clock::tsc_frequency_hz().max(1);
-    let limit = (frequency as u128 * timeout_ms as u128 / 1000) as u64;
-    let start = cpu::rdtsc();
+    let frequency = clock::QPC_FREQUENCY;
+    let start = clock::query_performance_counter_value();
     loop {
         let waiting = pending();
         if waiting == 0 {
             return Ok(());
         }
-        let current = cpu::rdtsc();
-        if current.wrapping_sub(start) >= limit {
+        let current = clock::query_performance_counter_value();
+        if deadline_passed(current.wrapping_sub(start), frequency, timeout_ms) {
             return Err(IpiStall { frequency, current, start, pending: waiting });
         }
         cpu::pause();

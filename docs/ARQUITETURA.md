@@ -538,18 +538,25 @@ CONTEXT_XSTATE e a volta de uma exceção pelo NtContinue).
 
 **IPIs medidos em tempo.** Toda espera de resposta a um IPI (`ke/smp.rs`:
 o ICR voltar a ocioso depois do envio e as confirmações do shootdown de
-TLB) passa por `smp::stall_on_targets`, que compara o TSC (o contador do
-KeQueryPerformanceCounter) com a frequência vezes o prazo, como a detecção
-de IPI parado do NT, em vez de contar voltas: o prazo é o mesmo em qualquer
-CPU, hipervisor ou emulador. Um processador que não confirma o shootdown em
-5 s, ou um ICR que não fica ocioso em 100 ms, para o sistema com o
-diagnóstico (os processadores pendentes, pelo número, e o tempo) e o
-IPI_WATCHDOG_TIMEOUT (0x1DB) com os parâmetros do KiIpiGenericCallTarget do
-19041: a frequência, o contador corrente e o do início da espera. A partida
-dos APs (INIT/SIPI) usa o mesmo envio e devolve erro ao boot. O autoteste
-`ntos/test/multiprocess/ipi_stall.rs` confere que uma resposta que chega
-em 50 ms num prazo de 200 ms é aceita, que um alvo mudo é detectado depois
-dos 30 ms do prazo, não antes, com contadores coerentes, e o shootdown real.
+TLB) passa por `smp::stall_on_targets`, que lê o contador de desempenho (o
+KeQueryPerformanceCounter, 10 MHz, o mesmo que o KiIpiGenericCallTarget do
+19041 lê) e compara o decorrido com a frequência vezes o prazo, em vez de
+contar voltas: o prazo é o mesmo em qualquer CPU, hipervisor ou emulador. A
+comparação (`smp::deadline_passed`) é a estrita do 19041 (`ja`) e exata, em
+128 bits: um prazo que não cai numa unidade inteira do contador não vence
+na unidade de baixo, uma fração de unidade antes da hora. Com o TSC e o
+prazo pela unidade de baixo, uma leitura que caía exatamente nela (cerca de
+1 espera em 100 no QEMU sob WHPX) era detectada com 29 ms num prazo de 30.
+Um processador que não confirma o shootdown em 5 s, ou um ICR que não fica
+ocioso em 100 ms, para o sistema com o diagnóstico (os processadores
+pendentes, pelo número, e o tempo) e o IPI_WATCHDOG_TIMEOUT (0x1DB) com os
+parâmetros do KiIpiGenericCallTarget do 19041: a frequência do contador de
+desempenho, o contador corrente e o do início da espera. A partida dos APs
+(INIT/SIPI) usa o mesmo envio e devolve erro ao boot. O autoteste
+`ntos/test/multiprocess/ipi_stall.rs` confere a fronteira exata do prazo,
+que uma resposta que chega em 50 ms num prazo de 200 ms é aceita, que um
+alvo mudo é detectado depois dos 30 ms do prazo, não antes, com contadores
+coerentes, e o shootdown real.
 A confirmação do shootdown vem pela NMI, que nem o IF nem o IRQL (o CR8) do
 alvo retêm: o mesmo autoteste faz um AP girar com as interrupções
 desligadas em HIGH_LEVEL e confirma 64 shootdowns seguidos (na casa das

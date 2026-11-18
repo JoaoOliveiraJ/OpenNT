@@ -8,13 +8,21 @@
 //! - uma resposta que chega 50 ms depois, num prazo de 200 ms, é aceita: uma
 //!   espera por voltas (100 000 leituras) desiste antes, porque cada volta
 //!   custa só o que a CPU (ou o hipervisor) gasta nela;
+//! - o prazo vence só depois da hora, pela comparação exata e estrita do
+//!   KiIpiGenericCallTarget: na unidade de baixo de um prazo que não cai
+//!   numa unidade inteira do contador (o TSC a 3 393 626 637 Hz dá
+//!   101 808 799,11 unidades em 30 ms) ainda não venceu, e na de cima o
+//!   atraso já soma os 30 ms; com o prazo pela unidade de baixo do TSC, a
+//!   leitura que caía exatamente nela (cerca de 1 espera em 100 no QEMU sob
+//!   WHPX, voltas de ~90 ciclos) dava um alvo detectado com 29 ms;
 //! - um alvo que nunca responde é detectado depois de 30 ms, não antes, com a
-//!   máscara dos pendentes, a frequência do TSC e os dois contadores
-//!   coerentes com o tempo medido;
+//!   máscara dos pendentes, a frequência do contador de desempenho (a do
+//!   KeQueryPerformanceCounter, 10 MHz) e os dois contadores coerentes com o
+//!   tempo medido;
 //! - o shootdown real, com todos os APs respondendo, conclui;
-//! - os prazos são os do NT em hardware e sob hipervisor (100 ms para o ICR,
-//!   5 s para as confirmações) e maiores num emulador, em que uma CPU
-//!   virtual fica segundos sem rodar com o hospedeiro carregado;
+//! - os prazos são 100 ms para o ICR e 5 s para as confirmações em hardware
+//!   e sob hipervisor, e maiores num emulador, em que uma CPU virtual fica
+//!   segundos sem rodar com o hospedeiro carregado;
 //! - um AP girando com as interrupções desligadas em HIGH_LEVEL (CR8 = 15)
 //!   confirma 64 shootdowns seguidos: a confirmação vem pela NMI, que nem o
 //!   IF nem o IRQL do alvo retêm.
@@ -36,17 +44,29 @@ pub fn run(assert: Assert) {
     let waited = clock::uptime_ms() - start;
     assert(late.is_ok() && waited >= 50, "ipi: resposta que chega em 50 ms, no prazo de 200 ms, e aceita (a espera e medida em tempo)");
 
+    // (frequência do contador, prazo): o TSC calibrado de uma máquina do
+    // QEMU sob WHPX em que um alvo foi detectado com 29 ms, outro TSC
+    // calibrado e o contador de desempenho de 10 MHz, em que o prazo cai
+    // numa unidade inteira e só vence na seguinte (`ja`).
+    let boundaries = [(3_393_626_637u64, 30u64), (3_393_623_006, 30), (3_393_626_637, 5_000), (clock::QPC_FREQUENCY, 30), (clock::QPC_FREQUENCY, 100), (clock::QPC_FREQUENCY, 5_000)];
+    let exact = boundaries.iter().all(|&(frequency, timeout)| {
+        let below = (frequency as u128 * timeout as u128 / 1000) as u64;
+        let detected = smp::IpiStall { frequency, current: below + 1, start: 0, pending: 1 };
+        !smp::deadline_passed(below, frequency, timeout) && smp::deadline_passed(below + 1, frequency, timeout) && detected.elapsed_ms() >= timeout
+    });
+    assert(exact, "ipi: o prazo vence so depois da hora (comparacao exata e estrita): o contador na unidade de baixo de um prazo fracionario ainda nao venceu e o atraso detectado soma o prazo inteiro");
+
     let start = clock::uptime_ms();
     let stalled = smp::stall_on_targets(30, || 0b100);
     let waited = clock::uptime_ms() - start;
     assert(waited >= 30 && waited < 30 + HOST_SLACK_MS, "ipi: alvo sem resposta detectado depois do prazo de 30 ms, nao antes");
     let coherent = stalled.is_err_and(|stall| {
         stall.pending == 0b100
-            && stall.frequency == clock::tsc_frequency_hz()
-            && stall.current.wrapping_sub(stall.start) >= stall.frequency / 1000 * 30
+            && stall.frequency == clock::QPC_FREQUENCY
+            && smp::deadline_passed(stall.current.wrapping_sub(stall.start), stall.frequency, 30)
             && (30..30 + HOST_SLACK_MS).contains(&stall.elapsed_ms())
     });
-    assert(coherent, "ipi: o atraso traz os pendentes, a frequencia do TSC e os contadores do inicio e da deteccao (parametros do IPI_WATCHDOG_TIMEOUT)");
+    assert(coherent, "ipi: o atraso traz os pendentes, a frequencia do contador de desempenho e os contadores do inicio e da deteccao (parametros do IPI_WATCHDOG_TIMEOUT)");
 
     if smp::ap_slot_count() > 0 {
         assert(smp::flush_remote_tlb(false).is_ok(), "ipi: shootdown de TLB com todos os APs respondendo");
