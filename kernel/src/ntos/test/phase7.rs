@@ -2279,9 +2279,11 @@ fn user_syscalls_core(assert: Assert) {
     // recusada.
     let denied = call("NtWaitForSingleObject", directory, 0, string, 0) == 0xC000_0022;
     // A DACL da raiz não concede SYNCHRONIZE (o DIRECTORY_ALL_ACCESS não o
-    // inclui): o diretório com SYNCHRONIZE é um novo, sem nome, que o
+    // inclui): o diretório com SYNCHRONIZE é um novo, temporário, que o
     // criador recebe com o acesso pedido.
-    set_object_attributes(unsafe { nt::ObjectAttributes::at(attributes) }, nt::ObjectAttributes::SIZE as u32, 0, 0, 0);
+    state::write_user_wide(attributes + 0xC0, "\\OpenNtEsperaPadrao");
+    state::write_unicode_string(attributes + 0xA0, attributes + 0xC0, "\\OpenNtEsperaPadrao");
+    set_object_attributes(unsafe { nt::ObjectAttributes::at(attributes) }, nt::ObjectAttributes::SIZE as u32, 0, attributes + 0xA0, 0x40);
     let synchronized = call("NtCreateDirectoryObject", out, 0x10_0001, attributes, 0) == 0;
     let waitable = guest::read64(out);
     guest::write64(buffer, second);
