@@ -4,6 +4,7 @@
 //! ThreadImpersonationToken impersona um token (ou encerra a impersonação).
 //! ThreadIoPriority troca a prioridade de E/S da thread (o
 //! PsSetIoPriorityThread).
+//! ThreadNameInformation troca o nome da thread (ETHREAD.ThreadName).
 //! ThreadPagePriority altera só os três bits medidos na ETHREAD original. A
 //! ordem medida é sondagem, tamanho, captura/valor, referência, alteração
 //! atômica e liberação. A variante de syscall de usuário (`set_user`) entra
@@ -24,6 +25,9 @@ pub const THREAD_BREAK_ON_TERMINATION: u32 = 18;
 /// ThreadIoPriority, IoPriorityHigh, IoPriorityCritical e
 /// SeIncreaseBasePriorityPrivilege.
 const THREAD_IO_PRIORITY: u32 = 22;
+/// ThreadNameInformation e THREAD_SET_LIMITED_INFORMATION.
+const THREAD_NAME_INFORMATION: u32 = 38;
+const THREAD_SET_LIMITED_INFORMATION: u32 = 0x400;
 const IO_PRIORITY_HIGH: u32 = 3;
 const IO_PRIORITY_CRITICAL: u32 = 4;
 const SE_INCREASE_BASE_PRIORITY_PRIVILEGE: u64 = 14;
@@ -67,8 +71,15 @@ pub fn set(thread_handle: u64, information_class: u32, input: u64, input_length:
     }
     let from_user_mode = access_mode != 0;
     if from_user_mode && input_length != 0 {
-        // Qualquer comprimento não nulo exige alinhamento de quatro bytes.
-        if input & 3 != 0 {
+        // O alinhamento da classe (o prólogo do NtSetInformationThread 19041):
+        // oito nas classes de ponteiro (4, 30, 31, 34, 38 e 48), um nas 7 e
+        // 32, quatro nas demais.
+        let alignment_mask: u64 = match information_class {
+            4 | 30 | 31 | 34 | THREAD_NAME_INFORMATION | 48 => 7,
+            7 | 32 => 0,
+            _ => 3,
+        };
+        if input & alignment_mask != 0 {
             return Ok(0x8000_0002);
         }
         if input.wrapping_add(input_length as u64) > USER_PROBE_LIMIT {
@@ -86,6 +97,9 @@ pub fn set(thread_handle: u64, information_class: u32, input: u64, input_length:
     }
     if information_class == THREAD_IO_PRIORITY {
         return set_io_priority(thread_handle, input, input_length, access_mode);
+    }
+    if information_class == THREAD_NAME_INFORMATION {
+        return set_name(thread_handle, input, input_length, access_mode);
     }
     if information_class != THREAD_PAGE_PRIORITY {
         return Ok(0xC000_0002);
@@ -220,6 +234,106 @@ fn set_io_priority(thread_handle: u64, input: u64, input_length: u32, access_mod
     unsafe { Ethread::at(reference.pointer) }.set_thread_io_priority(priority);
     reference.release()?;
     Ok(0)
+}
+
+/// A trava do nome das threads (o PspLockThreadSecurity em volta do
+/// ETHREAD.ThreadName): a troca e a leitura do ponteiro e do texto.
+static THREAD_NAME_LOCK: crate::rtl::SpinLock<()> = crate::rtl::SpinLock::new(());
+
+/// ThreadNameInformation (o ramo da classe 38 do NtSetInformationThread
+/// 19041, rva 0x64ab07): exatamente os 0x10 bytes de um UNICODE_STRING
+/// (outro tamanho dá STATUS_INFO_LENGTH_MISMATCH antes do handle), o handle
+/// com THREAD_SET_LIMITED_INFORMATION. O UNICODE_STRING é capturado e, num
+/// texto não vazio de UserMode, o Buffer precisa de alinhamento 2
+/// (STATUS_DATATYPE_MISALIGNMENT) e da faixa abaixo de MmUserProbeAddress
+/// (STATUS_ACCESS_VIOLATION). Length ímpar ou acima de MaximumLength é
+/// STATUS_INVALID_PARAMETER. O nome novo vai num bloco de pool com o
+/// UNICODE_STRING e o texto copiado (Length = MaximumLength), trocado no
+/// ETHREAD.ThreadName sob a trava; o antigo é liberado. O
+/// SetThreadDescription do kernelbase chega aqui (o dwmcore nomeia as
+/// threads de composição, de entrada e de tokens).
+fn set_name(thread_handle: u64, input: u64, input_length: u32, access_mode: u8) -> Result<u32, KernelError> {
+    use crate::ntos::inc::types::UnicodeString;
+    if input_length != 0x10 {
+        return Ok(0xC000_0004);
+    }
+    let mut reference = match thread_handles::reference(thread_handle, THREAD_SET_LIMITED_INFORMATION, access_mode)? {
+        Ok(reference) => reference,
+        Err(status) => return Ok(status),
+    };
+    let result = (|| -> Result<u32, KernelError> {
+        // A captura do UNICODE_STRING (de min(Buffer, MmUserProbeAddress) em
+        // UserMode).
+        let source = if access_mode != 0 { input.min(USER_PROBE_LIMIT) } else { input };
+        let Ok(string) = UnicodeString::try_at(source) else { return Ok(STATUS_ACCESS_VIOLATION) };
+        let (Ok(length), Ok(maximum), Ok(buffer)) = (string.length.probe_get(), string.maximum_length.probe_get(), string.buffer.probe_get()) else { return Ok(STATUS_ACCESS_VIOLATION) };
+        if access_mode != 0 && length != 0 {
+            if buffer & 1 != 0 {
+                return Ok(0x8000_0002);
+            }
+            if buffer.checked_add(length as u64).is_none_or(|end| end > USER_PROBE_LIMIT) {
+                return Ok(STATUS_ACCESS_VIOLATION);
+            }
+        }
+        if length & 1 != 0 || length > maximum {
+            return Ok(0xC000_000D);
+        }
+        let block = guest::alloc_bytes(UnicodeString::SIZE + length as u64);
+        if block == 0 {
+            return Ok(0xC000_009A);
+        }
+        let text = match guest::try_read_bytes(buffer, length as usize) {
+            Ok(text) => text,
+            Err(error) => {
+                guest::free_bytes(block);
+                return Ok(error.status);
+            }
+        };
+        guest::write_bytes(block + UnicodeString::SIZE, &text);
+        // SAFETY: o bloco recém-alocado, do tamanho do UNICODE_STRING e do texto.
+        let name = unsafe { UnicodeString::at(block) };
+        name.length.set(length);
+        name.maximum_length.set(length);
+        name.buffer.set(block + UnicodeString::SIZE);
+        let previous = {
+            let _guard = THREAD_NAME_LOCK.lock();
+            // SAFETY: ETHREAD referenciado pelo handle.
+            unsafe { Ethread::at(reference.pointer) }.thread_name.atomic().swap(block, core::sync::atomic::Ordering::AcqRel)
+        };
+        if previous != 0 {
+            guest::free_bytes(previous);
+        }
+        Ok(0)
+    })();
+    reference.release()?;
+    result
+}
+
+/// O texto (UTF-16LE) do ETHREAD.ThreadName, vazio sem nome, lido sob a
+/// trava.
+pub fn thread_name(thread: u64) -> alloc::vec::Vec<u8> {
+    use crate::ntos::inc::types::UnicodeString;
+    let _guard = THREAD_NAME_LOCK.lock();
+    // SAFETY: ETHREAD retido pelo chamador.
+    let block = unsafe { Ethread::at(thread) }.thread_name.get();
+    if block == 0 {
+        return alloc::vec::Vec::new();
+    }
+    // SAFETY: o bloco de pool do nome, dono do ETHREAD enquanto a trava vale.
+    let name = unsafe { UnicodeString::at(block) };
+    guest::read_bytes(name.buffer.get(), name.length.get() as usize)
+}
+
+/// Libera o nome na destruição do ETHREAD (o PspThreadDelete).
+pub fn delete_name(thread: u64) {
+    let block = {
+        let _guard = THREAD_NAME_LOCK.lock();
+        // SAFETY: o ETHREAD sendo recolhido, sem outras referências.
+        unsafe { Ethread::at(thread) }.thread_name.atomic().swap(0, core::sync::atomic::Ordering::AcqRel)
+    };
+    if block != 0 {
+        guest::free_bytes(block);
+    }
 }
 
 /// Variante de syscall: recupera os argumentos originais, inclusive o lixo

@@ -2121,8 +2121,9 @@ fn requested_class(class: u64) -> u32 {
 }
 
 fn nt_query_information_thread(handle: u64, class: u64, out: u64, length: u64, rsp: u64) -> Result<u32, KernelError> {
-    // ThreadIoPriority e ThreadPagePriority (`ps/query_thread`).
-    if matches!(requested_class(class), 22 | 24) {
+    // ThreadIoPriority, ThreadCycleTime, ThreadPagePriority e
+    // ThreadNameInformation (`ps/query_thread`).
+    if matches!(requested_class(class), 22 | 23 | 24 | 38) {
         return query_thread::query_user(rsp);
     }
     let thread = match resolve(handle, 0x40) {
@@ -2391,9 +2392,9 @@ fn set_impersonation_token(handle: u64, input: u64, length: u64) -> Result<u32, 
 }
 
 fn nt_set_information_thread(handle: u64, class: u64, input: u64, length: u64, rsp: u64) -> Result<u32, KernelError> {
-    // As classes 18, 22 e 24 têm ordem própria (`ps/set_thread_information`)
-    // e aceitam alterar uma ETHREAD retida.
-    if matches!(requested_class(class), 18 | 22 | 24) {
+    // As classes 18, 22, 24 e 38 têm ordem própria
+    // (`ps/set_thread_information`) e aceitam alterar uma ETHREAD retida.
+    if matches!(requested_class(class), 18 | 22 | 24 | 38) {
         return set_thread_information::set_user(rsp);
     }
     if matches!(class, THREAD_PRIORITY | THREAD_BASE_PRIORITY) {

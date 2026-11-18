@@ -1,7 +1,8 @@
 //! Zw/NtQueryInformationThread.
 //!
 //! Contrato ThreadPagePriority medido nos bytes originais e em chamadas do
-//! Windows; a ThreadIoPriority segue o mesmo caminho. `access_mode` separa Nt (chamador usuário) de Zw (parâmetros de
+//! Windows; a ThreadIoPriority segue o mesmo caminho; ThreadCycleTime e
+//! ThreadNameInformation têm ramos próprios. `access_mode` separa Nt (chamador usuário) de Zw (parâmetros de
 //! kernel). A variante de syscall de usuário (`query_user`) entra com o
 //! estado de modo usuário (fase 7).
 
@@ -20,6 +21,9 @@ const THREAD_PAGE_PRIORITY: u32 = 24;
 /// ThreadPagePriority: um ULONG, THREAD_QUERY_LIMITED_INFORMATION, o valor e
 /// depois o ReturnLength 4.
 const THREAD_IO_PRIORITY: u32 = 22;
+/// ThreadCycleTime e ThreadNameInformation.
+const THREAD_CYCLE_TIME: u32 = 23;
+const THREAD_NAME_INFORMATION: u32 = 38;
 const THREAD_QUERY_LIMITED_INFORMATION: u32 = 0x800;
 const PAGE_PRIORITY_SIZE: u64 = 4;
 /// MmUserProbeAddress.
@@ -80,6 +84,12 @@ pub fn query(thread_handle: u64, information_class: u32, output: u64, output_len
     if information_class > 45 || REJECTED_QUERY_CLASSES.contains(&information_class) {
         return Ok(0xC000_0003);
     }
+    if information_class == THREAD_CYCLE_TIME {
+        return query_cycle_time(thread_handle, output, output_length, returned_length, access_mode);
+    }
+    if information_class == THREAD_NAME_INFORMATION {
+        return query_name(thread_handle, output, output_length, returned_length, access_mode);
+    }
     // Classes válidas ainda sem provedor falham explicitamente.
     if information_class != THREAD_PAGE_PRIORITY && information_class != THREAD_IO_PRIORITY {
         return Ok(0xC000_0002);
@@ -117,6 +127,68 @@ pub fn query(thread_handle: u64, information_class: u32, output: u64, output_len
     Ok(result)
 }
 
+
+/// ThreadCycleTime (o ramo da classe 23 do NtQueryInformationThread 19041,
+/// rva 0x5fbb5f): exatamente os 0x10 bytes do THREAD_CYCLE_TIME_INFORMATION
+/// (outro tamanho dá STATUS_INFO_LENGTH_MISMATCH antes do handle); a thread
+/// corrente pelo pseudo-handle, outra pelo handle com
+/// THREAD_QUERY_LIMITED_INFORMATION; AccumulatedCycles e CurrentCycleCount
+/// do KeQueryTotalCycleTimeThread (o KTHREAD.CycleTime e o TSC da amostra).
+/// ReturnLength 0x10. O QueryThreadCycleTime do kernelbase lê a classe (o
+/// agendador de quadros do dwmcore mede o próprio custo por ela).
+fn query_cycle_time(thread_handle: u64, output: u64, output_length: u32, returned_length: u64, access_mode: u8) -> Result<u32, KernelError> {
+    if output_length != 0x10 {
+        return Ok(0xC000_0004);
+    }
+    let mut reference = match thread_handles::reference(thread_handle, THREAD_QUERY_LIMITED_INFORMATION, access_mode)? {
+        Ok(reference) => reference,
+        Err(status) => return Ok(status),
+    };
+    let accumulated = crate::ntos::ke::thread_dispatch::query_total_cycle_time(reference.pointer, None);
+    let current = crate::hal::cpu::rdtsc();
+    let written = guest::try_write::<u64>(output, accumulated).and_then(|()| guest::try_write::<u64>(output + 8, current)).and_then(|()| if returned_length != 0 { guest::try_write::<u32>(returned_length, 0x10) } else { Ok(()) });
+    reference.release()?;
+    Ok(match written {
+        Ok(()) => 0,
+        Err(error) => error.status,
+    })
+}
+
+/// ThreadNameInformation (o ramo da classe 38, rva 0x7f1536): o handle com
+/// THREAD_QUERY_LIMITED_INFORMATION; sob a trava da thread, o nome do
+/// ETHREAD.ThreadName (vazio sem nome) pede o UNICODE_STRING e o texto logo
+/// depois (Length + 0x10 bytes, o valor do ReturnLength também na recusa):
+/// menor dá STATUS_BUFFER_TOO_SMALL; senão o texto vai a +0x10 e o
+/// UNICODE_STRING sai com Length = MaximumLength e o Buffer apontando para
+/// ele.
+fn query_name(thread_handle: u64, output: u64, output_length: u32, returned_length: u64, access_mode: u8) -> Result<u32, KernelError> {
+    let mut reference = match thread_handles::reference(thread_handle, THREAD_QUERY_LIMITED_INFORMATION, access_mode)? {
+        Ok(reference) => reference,
+        Err(status) => return Ok(status),
+    };
+    let text = super::set_thread_information::thread_name(reference.pointer);
+    let required = text.len() as u32 + 0x10;
+    let written = (|| -> Result<u32, KernelError> {
+        let status = if required > output_length {
+            0xC000_0023
+        } else {
+            guest::try_write_bytes(output + 0x10, &text)?;
+            guest::try_write::<u16>(output, text.len() as u16)?;
+            guest::try_write::<u16>(output + 2, text.len() as u16)?;
+            guest::try_write::<u64>(output + 8, output + 0x10)?;
+            0
+        };
+        if returned_length != 0 {
+            guest::try_write::<u32>(returned_length, required)?;
+        }
+        Ok(status)
+    })();
+    reference.release()?;
+    Ok(match written {
+        Ok(status) => status,
+        Err(error) => error.status,
+    })
+}
 
 /// Variante de syscall: recupera os bits originais dos argumentos (ULONG
 /// com lixo nos bits altos incluso) do frame bruto ou da pilha de usuário.

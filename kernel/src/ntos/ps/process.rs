@@ -944,6 +944,7 @@ fn collect_thread(thread: u64) -> Result<(), KernelError> {
     }
     crate::ntos::ps::property_set::clear(thread);
     forget_thread(thread)?;
+    crate::ntos::ps::set_thread_information::delete_name(thread);
     guest::free_bytes(thread);
     Ok(())
 }
