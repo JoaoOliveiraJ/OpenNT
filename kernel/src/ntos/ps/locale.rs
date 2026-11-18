@@ -71,6 +71,32 @@ pub fn default_ui_language() -> u32 {
     UI_LANGUAGE.load(Ordering::Acquire)
 }
 
+/// MmGetSessionLocaleId (0x620660) para o processo dado: o LocaleId da
+/// sessão de um processo com sessão que não seja de sistema; senão o
+/// PsDefaultThreadLocaleId.
+pub fn session_locale_of(process: u64) -> u32 {
+    // SAFETY: EPROCESS vivo de quem cria a thread.
+    let object = unsafe { crate::ntos::inc::types::Eprocess::at(process) };
+    let session = object.session.get();
+    if session != 0 && object.system_process() == 0 {
+        crate::ntos::mm::session::locale_of(session)
+    } else {
+        USER_LOCALE.load(Ordering::Acquire)
+    }
+}
+
+/// O TEB.CurrentLocale de uma thread de usuário nova, como o
+/// PspUserThreadStartup (+0x8e): o MmGetSessionLocaleId, salvo num processo
+/// Minimal, que fica com 0. O GetThreadLocale do kernelbase devolve esse
+/// campo.
+pub fn thread_locale_of(process: u64) -> u32 {
+    // SAFETY: EPROCESS vivo de quem cria a thread.
+    if unsafe { crate::ntos::inc::types::Eprocess::at(process) }.minimal() != 0 {
+        return 0;
+    }
+    session_locale_of(process)
+}
+
 /// O LCID padrão do usuário (`true`) ou do sistema.
 pub fn default_locale(user_profile: bool) -> u32 {
     locale_cell(user_profile).load(Ordering::Acquire)

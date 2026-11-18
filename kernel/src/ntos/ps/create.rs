@@ -722,7 +722,7 @@ pub fn create_user_process(request: &CreateProcessRequest<'_>) -> Result<Created
             let block = parameters.write(parameter_flags)?;
             // SAFETY: a PEB recém-criada no processo corrente.
             unsafe { Peb::at(peb) }.process_parameters.set(block);
-            let teb = peb_teb::create_teb(&TebDescription { process_id, thread_id, peb, stack_base, stack_limit, deallocation_stack })?;
+            let teb = peb_teb::create_teb(&TebDescription { process_id, thread_id, peb, stack_base, stack_limit, deallocation_stack, current_locale: crate::ntos::ps::locale::thread_locale_of(process_pointer) })?;
             let context = memory::map_user_region(threads::CONTEXT_SIZE)?;
             threads::initialize_context(context, start, stack_top, entry_point, peb);
             Ok(Built { thread_id, peb, parameters: block, teb, stack_top, context, entry_point, image_base, size_of_image, image_information, manifest, parameter_flags })

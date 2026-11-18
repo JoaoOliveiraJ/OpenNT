@@ -72,6 +72,8 @@ pub struct TebDescription {
     /// Base da reserva da pilha (DeallocationStack, o StackAllocationBase do
     /// INITIAL_TEB).
     pub deallocation_stack: u64,
+    /// TEB.CurrentLocale (`ps::locale::thread_locale_of`).
+    pub current_locale: u32,
 }
 
 /// Subsistema e versão do subsistema da imagem mapeada em `image_base`, lidos
@@ -148,6 +150,7 @@ pub fn initialize_teb(teb: u64, thread: &TebDescription) {
     block.client_id.unique_thread.set(thread.thread_id);
     block.process_environment_block.set(thread.peb);
     block.deallocation_stack.set(thread.deallocation_stack);
+    block.current_locale.set(thread.current_locale);
 }
 
 /// MmCreateTeb: a TEB de uma thread do processo corrente, na própria região

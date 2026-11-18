@@ -169,6 +169,11 @@ pub fn of_process(process: u64) -> u64 {
     eprocess(process).session.get()
 }
 
+/// O LocaleId (MM_SESSION_SPACE+0x60) de uma sessão.
+pub fn locale_of(session: u64) -> u32 {
+    space(session).locale_id.get()
+}
+
 /// O id de uma sessão viva.
 pub fn id_of(session: u64) -> Option<u32> {
     SESSIONS.lock().get(&session).map(|state| state.id)

@@ -1785,7 +1785,7 @@ pub fn create_user_thread(request: &CreateRequest) -> Result<Arc<UserThread>, u3
             thread.hidden = request.flags & 4 != 0;
         });
         // O MmCreateTeb sobre a TEB recém-comprometida.
-        peb_teb::initialize_teb(teb, &peb_teb::TebDescription { process_id, thread_id: id, peb, stack_base: stack.base, stack_limit: stack.limit, deallocation_stack: stack.allocation_base });
+        peb_teb::initialize_teb(teb, &peb_teb::TebDescription { process_id, thread_id: id, peb, stack_base: stack.base, stack_limit: stack.limit, deallocation_stack: stack.allocation_base, current_locale: crate::ntos::ps::locale::thread_locale_of(process_pointer) });
         // SAFETY: TEB recém-comprometida; a thread ainda não roda.
         let block = unsafe { Teb::at(teb) };
         // SameTebFlags: SkipThreadAttach, LoaderWorker e SkipLoaderInit.

@@ -2246,7 +2246,7 @@ fn user_system_services(assert: Assert) {
         let mut request = ProcessParameters::for_image("C:\\teste.exe");
         request.standard_output = 0x44;
         let rupp = request.write(0);
-        let teb = peb.as_ref().ok().and_then(|&peb| peb_teb::create_teb(&peb_teb::TebDescription { process_id: test.process_id, thread_id: test.thread_id, peb, stack_base: 0x30_0000, stack_limit: 0x20_0000, deallocation_stack: 0x20_0000 }).ok());
+        let teb = peb.as_ref().ok().and_then(|&peb| peb_teb::create_teb(&peb_teb::TebDescription { process_id: test.process_id, thread_id: test.thread_id, peb, stack_base: 0x30_0000, stack_limit: 0x20_0000, deallocation_stack: 0x20_0000, current_locale: 0 }).ok());
         if let (Ok(peb), Ok(ldr), Ok(rupp), Some(teb)) = (peb, ldr, rupp, teb) {
             let (teb_view, peb_view, ldr_data, parameters) = unsafe { (nt::Teb::at(teb), nt::Peb::at(peb), nt::PebLdrData::at(ldr), nt::RtlUserProcessParameters::at(rupp)) };
             let separate = teb + 0x2000 <= peb || peb + 0x1000 <= teb;
@@ -2389,6 +2389,10 @@ fn user_nls(assert: Assert) {
     let (out, size, iosb, buffer, rsp) = (block, block + 0x10, block + 0x20, block + 0x100, block + 0x1000);
     let call = |name: &str, a1: u64, a2: u64, a3: u64, a4: u64| state::handler(name).map(|handler| handler(a1, a2, a3, a4, rsp).unwrap_or(1)).unwrap_or(1);
     assert(call("NtQueryDefaultLocale", 0, out, 0, 0) == 0 && guest::read32(out) == 0x409 && call("NtQueryDefaultUILanguage", out, 0, 0, 0) == 0 && guest::read16(out) == 0x409 && call("NtQueryInstallUILanguage", 0x10, 0, 0, 0) == 0xC000_0005, "usernls: locale e idioma padrao");
+    // O TEB.CurrentLocale de uma thread nova do processo (PspUserThreadStartup):
+    // o LocaleId da sessão, ou o LCID padrão do usuário fora de sessão.
+    let process = crate::ntos::ps::process::get_current_process();
+    assert(crate::ntos::ps::locale::thread_locale_of(process) == 0x409 && crate::ntos::ps::locale::session_locale_of(process) == 0x409, "usernls: TEB.CurrentLocale da thread nova com o locale da sessao");
     guest::write64(rsp + 0x28, size);
     assert(call("NtGetNlsSectionPtr", 13, 0, 0, out) == 0xC000_000D && call("NtGetNlsSectionPtr", 12, 3, 0, out) == 0xC000_000D && call("NtGetNlsSectionPtr", 11, 0x10000, 0, out) == 0xC000_000D && call("NtGetNlsSectionPtr", 9, 0, 1, out) == 0xC000_00BB, "usernls: tipo, dado e contexto invalidos");
     assert(call("NtGetNlsSectionPtr", 11, 4243, 0, out) == 0xC000_0034 && call("NtGetNlsSectionPtr", 11, 4242, 0, 0x10) == 0xC000_0005, "usernls: tabela ausente e saida invalida");
