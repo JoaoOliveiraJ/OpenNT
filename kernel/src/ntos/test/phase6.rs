@@ -5053,6 +5053,26 @@ fn se_token_info_exports(assert: Assert) {
     let ui = call_export("SeQueryInformationToken", &[primary, 26, out]) == Some(0) && guest::read32(out) == flags >> 12 & 1;
     let lowbox = call_export("SeQueryInformationToken", &[primary, 29, out]) == Some(0) && guest::read32(out) == flags >> 14 & 1;
     assert(ui && lowbox, "se-token-info: TokenUIAccess e TokenIsAppContainer leem os bits de TokenFlags");
+    // NtQueryInformationToken das classes de TokenFlags (o 19041 em
+    // 0x6d21ae e 0x6d2310): 21 é um BOOLEAN de um byte (IS_FILTERED 0x800 ou
+    // IS_RESTRICTED 0x10); 23, 24, 26 e 42 são os bits 9, 10, 12 e 16; 40 é
+    // IS_RESTRICTED ou WRITE_RESTRICTED (0x8).
+    let flagged = tokens::create(None, None).unwrap_or(0);
+    if flagged != 0 {
+        let query = |flags: u32| {
+            tokens::body(flagged).token_flags.set(flags);
+            [21u32, 23, 24, 26, 40, 42].map(|class| crate::ntos::se::token::query::encode(flagged, class, 0).unwrap_or_default())
+        };
+        let (byte, word) = (|value: u8| alloc::vec![value], |value: u32| value.to_le_bytes().to_vec());
+        let clear = query(0) == [byte(0), word(0), word(0), word(0), word(0), word(0)];
+        let filtered = query(0x800 | 0x200 | 0x1000) == [byte(1), word(1), word(0), word(1), word(0), word(0)];
+        let write_restricted = query(0x8 | 0x400 | 0x1_0000) == [byte(0), word(0), word(1), word(0), word(1), word(1)];
+        let restricted = query(0x10) == [byte(1), word(0), word(0), word(0), word(1), word(0)];
+        let _ = tokens::release(flagged);
+        assert(clear && filtered && write_restricted && restricted, "se-token-info: as classes 21, 23, 24, 26, 40 e 42 do NtQueryInformationToken saem do TokenFlags (21 com um byte)");
+    } else {
+        assert(false, "se-token-info: token para as classes de TokenFlags");
+    }
     // TokenAppContainerSid (31): aloca o TOKEN_APPCONTAINER_INFORMATION, com
     // o ponteiro nulo sem AppContainer.
     let no_container = tokens::with(primary, |token| token.app_container.is_none()).unwrap_or(false);

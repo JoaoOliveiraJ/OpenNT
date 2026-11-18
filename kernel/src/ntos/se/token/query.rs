@@ -32,6 +32,15 @@ const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 /// TokenAccessInformation.
 const TOKEN_ACCESS_INFORMATION_CLASS: u32 = 22;
+/// TokenFlags: TOKEN_WRITE_RESTRICTED, TOKEN_IS_RESTRICTED e TOKEN_IS_FILTERED.
+const TOKEN_WRITE_RESTRICTED: u32 = 0x8;
+const TOKEN_IS_RESTRICTED: u32 = 0x10;
+const TOKEN_IS_FILTERED: u32 = 0x800;
+
+/// O TokenFlags do corpo do token.
+fn token_flags(token: &Token) -> u32 {
+    tokens::body(token.pointer).token_flags.get()
+}
 /// SE_GROUP_INTEGRITY | SE_GROUP_INTEGRITY_ENABLED.
 const SE_GROUP_INTEGRITY: u32 = 0x60;
 
@@ -332,7 +341,19 @@ pub fn encode(token_pointer: u64, class: u32, base: u64) -> Result<Vec<u8>, u32>
         44 => {
             layout.reserve(16);
         }
-        15 | 21 | 23 | 24 | 26 | 32 | 40 | 42 | 47 | 48 => layout.scalar(0),
+        // As classes de TokenFlags do NtQueryInformationToken do 19041
+        // (0x6d21ae e 0x6d2310..0x6d2372): TokenHasRestrictions é um
+        // BOOLEAN de um byte, IS_FILTERED ou IS_RESTRICTED; as demais, um
+        // ULONG com um bit (VirtualizationAllowed, VirtualizationEnabled,
+        // UIAccess e PrivateNameSpace) ou, na TokenIsRestricted,
+        // IS_RESTRICTED ou WRITE_RESTRICTED.
+        21 => layout.bytes.push((token_flags(&token) & (TOKEN_IS_FILTERED | TOKEN_IS_RESTRICTED) != 0) as u8),
+        23 => layout.scalar(token_flags(&token) >> 9 & 1),
+        24 => layout.scalar(token_flags(&token) >> 10 & 1),
+        26 => layout.scalar(token_flags(&token) >> 12 & 1),
+        40 => layout.scalar((token_flags(&token) & (TOKEN_IS_RESTRICTED | TOKEN_WRITE_RESTRICTED) != 0) as u32),
+        42 => layout.scalar(token_flags(&token) >> 16 & 1),
+        15 | 32 | 47 | 48 => layout.scalar(0),
         _ => return Err(STATUS_INVALID_INFO_CLASS),
     }
     Ok(layout.bytes)

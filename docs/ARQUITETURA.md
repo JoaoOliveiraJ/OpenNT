@@ -2313,7 +2313,13 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   `se/security_attributes.rs`) e o TOKEN_PRIVILEGES na ordem do LUID. O
   SeTokenFromAccessInformation e o SeQuerySecurityAttributesTokenAccessInformation
   consomem esse bloco. O SeQueryInformationToken grava a TokenSessionId e a
-  TokenIsAppContainer direto no ULONG de saída, sem alocar.
+  TokenIsAppContainer direto no ULONG de saída, sem alocar. As classes
+  TokenHasRestrictions (21, um BOOLEAN de um byte: IS_FILTERED ou
+  IS_RESTRICTED), TokenVirtualizationAllowed (23), TokenVirtualizationEnabled
+  (24), TokenUIAccess (26), TokenIsRestricted (40: IS_RESTRICTED ou
+  WRITE_RESTRICTED) e TokenPrivateNameSpace (42) saem do TokenFlags do token,
+  como no NtQueryInformationToken do 19041: o token filtrado do dwm.exe
+  responde TRUE na 21.
 - **Controle de acesso** (`se/access_evaluation.rs`): uma avaliação só, a do
   SeAccessCheckWithHint/SepAccessCheck do ntoskrnl 19041, sobre os
   componentes de um descritor (`OwnedDescriptor`) e a identidade do token
