@@ -37,7 +37,7 @@
 //! recursos deles em `\Windows\SystemResources`, os assemblies de WinSxS
 //! (`side_by_side`), as fontes (`fonts`), o tema visual (`theme`) e as
 //! pastas de dados que a tela de logon lê (os metadados WinRT, as imagens da tela de bloqueio e as do
-//! bloco do usuário).
+//! bloco do usuário, e os dados do ICU e dos fusos de `\Windows\Globalization`).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -542,6 +542,31 @@ const LOGON_SCREEN_PROGRAMS: &[&str] = &[
     "TextShaping.dll",
     "WindowsCodecs.dll",
     "rometadata.dll",
+    // O que a thread de eventos do DWM cria no
+    // CDesktopManager::InitializeComObjects do uDWM.dll, cuja falha encerra
+    // a thread antes de sinalizar a partida: o gerenciador de animações e as
+    // bibliotecas de transições (CLSID_UIAnimationManager,
+    // CLSID_UIAnimationTransitionLibrary e as versões 2 do
+    // CAnimationEngine::Initialize, no UIAnimation.dll) e o agente de vídeo
+    // da sessão (a classe WinRT DispBrokerDesktop.SessionBrokerInstance do
+    // DispBroker.Desktop.dll, com o mscms.dll e o ColorAdapterClient.dll que
+    // ele importa, e o DisplayManager do DispBroker.dll que ela ativa antes
+    // da instância global do serviço DispBrokerDesktopSvc); as descrições de
+    // vídeo do ddisplay.dll que o uDWM.dll e o dwmcore.dll ativam; o
+    // anfitrião de entrada do sistema que o CGlobalMit::Run do dwmcore.dll
+    // cria antes do NtMITActivateInputProcessing (CreateSystemInputHost do
+    // ism.dll, com o hid.dll); e o compilador dos efeitos que o dcomp.dll
+    // serializa e o dwmcore.dll compila para os pincéis de efeito
+    // (wuceffects.dll).
+    "UIAnimation.dll",
+    "DispBroker.Desktop.dll",
+    "DispBroker.dll",
+    "mscms.dll",
+    "ColorAdapterClient.dll",
+    "ddisplay.dll",
+    "ISM.dll",
+    "hid.dll",
+    "wuceffects.dll",
     // O LogonUI.exe, o controlador logoncontroller.dll (CLSID
     // {0bdc6fc7-83e3-46a4-bfa0-1bc14dbf8b38}) e a experiência de logon
     // Windows.UI.Logon.dll que ele ativa, o authui.dll e os imports deles,
@@ -623,6 +648,20 @@ const LOGON_SCREEN_PROGRAMS: &[&str] = &[
     "twinapi.appcore.dll",
     "MrmCoreR.dll",
     "XmlLite.dll",
+    // O ICU que o Windows.Globalization.dll carrega na primeira Calendar (a
+    // do relógio da tela de bloqueio, no
+    // SecureLockScreenViewModel::_InitializeTimer do Windows.UI.Logon.dll: o
+    // TimeZoneCache lista os fusos pelo ucal_openTimeZones), com os dados de
+    // `\Windows\Globalization` (`LOGON_SCREEN_FOLDERS`), e o tzres.dll dos
+    // nomes dos fusos; o painel de entrada que o XAML registra quando o foco
+    // muda (CLSID_FrameworkInputPane do twinapi.dll, no
+    // RegisterInputPaneHandler); e o repositório de contas conectadas que o
+    // shacct.dll e o credprovslegacy.dll consultam ao enumerar os usuários
+    // (IDStore.dll).
+    "icu.dll",
+    "tzres.dll",
+    "twinapi.dll",
+    "IDStore.dll",
     // Os provedores de credencial registrados
     // (`Authentication\Credential Providers`) e os imports deles (o
     // msvcp110_win.dll já está em `SMSS_PROGRAMS`).
@@ -654,9 +693,18 @@ const LOGON_SCREEN_PROGRAMS: &[&str] = &[
 /// RoGetMetaDataFile do XAML abre para resolver os tipos) e as imagens
 /// padrão da tela de bloqueio de `\Windows\Web\Screen` (o img100.jpg e as
 /// outras que o Windows.UI.Immersive.dll lista quando o sistema não tem
-/// imagem própria em `SystemData`). (pasta no volume, pasta de origem
-/// relativa ao diretório do Windows).
-const LOGON_SCREEN_FOLDERS: &[(&str, &str)] = &[("WinMetadata", "System32/WinMetadata"), ("Web/Screen", "Web/Screen")];
+/// imagem própria em `SystemData`) e os dados de globalização da Calendar do
+/// relógio da tela de bloqueio: o `icudtl.dat` e os `.res` de fusos de
+/// `\Windows\Globalization\ICU`, que o icu.dll abre pelo diretório do
+/// Windows, e o `timezones.xml` de `\Windows\Globalization\Time Zone`, que o
+/// TimeZoneCache do Windows.Globalization.dll lê. (pasta no volume, pasta de
+/// origem relativa ao diretório do Windows).
+const LOGON_SCREEN_FOLDERS: &[(&str, &str)] = &[
+    ("WinMetadata", "System32/WinMetadata"),
+    ("Web/Screen", "Web/Screen"),
+    ("Globalization/ICU", "Globalization/ICU"),
+    ("Globalization/Time Zone", "Globalization/Time Zone"),
+];
 
 /// As imagens padrão do bloco do usuário de `%ProgramData%\Microsoft\User
 /// Account Pictures`, que o repositório de blocos do Windows.UI.Immersive.dll

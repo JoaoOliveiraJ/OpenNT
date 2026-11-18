@@ -11,17 +11,19 @@
 //!
 //! Como os binários de System32, as chaves vêm desta máquina no build, com os
 //! valores daqui: as chaves de serviço desses quatro e as do PlugPlay, do
-//! Power, do BrokerInfrastructure, do SystemEventsBroker e do registrador
-//! do CoreMessaging (com Parameters e Security), a ordem dos grupos de
-//! serviço (`Control\ServiceGroupOrder`), os dois valores de `Control` que
+//! Power, do BrokerInfrastructure, do SystemEventsBroker, do registrador
+//! do CoreMessaging e da política de vídeo (com Parameters e Security), a
+//! ordem dos grupos de serviço (`Control\ServiceGroupOrder`), os dois
+//! valores de `Control` que
 //! o services.exe lê no início automático (o `EarlyStartServices`, a lista
 //! do conjunto inicial, e o `SvcHostSplitThresholdInKB`, o limite de
 //! memória para separar os serviços de um svchost em processos próprios),
 //! a configuração de energia (`Control\Power`), as definições WNF
 //! (`Control\Notifications`), as opções do produto (`Control\ProductOptions`)
 //! e, na SOFTWARE, os grupos do svchost (`Microsoft\Windows NT\CurrentVersion\
-//! Svchost`, os valores com a lista de serviços de cada grupo e a subchave do
-//! `LocalServiceNoNetwork`), os descritores das portas de nome transitório
+//! Svchost`, os valores com a lista de serviços de cada grupo e as subchaves
+//! do `LocalServiceNoNetwork` e do `LocalService`), os descritores das
+//! portas de nome transitório
 //! (`Microsoft\SecurityManager\TransientObjects`),
 //! `Microsoft\Rpc\SecurityService`, os provedores de autenticação do RPC, e
 //! os valores de `Microsoft\Windows NT\CurrentVersion\WUDF` e da
@@ -45,8 +47,14 @@ use crate::host_language::HostKey;
 /// início automático depois do rpcss): toda sessão CoreUI do dwm.exe e do
 /// LogonUI conecta por ALPC à porta `\BaseNamedObjects\CoreMessagingRegistrar`
 /// dele e, sem a porta, abre o serviço pelo SCM para iniciá-lo; um serviço
-/// que não existe é um FailFast.
-const SERVICES: &[&str] = &["DcomLaunch", "RpcEptMapper", "RpcSs", "LSM", "PlugPlay", "Power", "BrokerInfrastructure", "SystemEventsBroker", "CoreMessagingRegistrar"];
+/// que não existe é um FailFast. E o serviço de política de vídeo
+/// (DispBrokerDesktopSvc, o DispBroker.Desktop.dll no
+/// `svchost.exe -k LocalService -p` com a conta LocalService, início
+/// automático atrasado): o servidor da classe WinRT fora de processo
+/// DispBrokerDesktop.GlobalBrokerInstance, que a SessionBrokerInstance do
+/// dwm.exe ativa pelo RPCSS na partida (`logon_screen`), o que inicia o
+/// serviço antes do atraso.
+const SERVICES: &[&str] = &["DcomLaunch", "RpcEptMapper", "RpcSs", "LSM", "PlugPlay", "Power", "BrokerInfrastructure", "SystemEventsBroker", "CoreMessagingRegistrar", "DispBrokerDesktopSvc"];
 
 /// Os valores de `Control` que o services.exe lê: o EarlyStartServices (o
 /// ScStartEarlySetOfServices; sem ele todo serviço automático entra no
@@ -148,6 +156,11 @@ pub fn software_keys() -> Vec<HostKey> {
         // ALPC do registrador (WM_RegistrarServer e WM_SystemWindowIDManager),
         // da API do compositor e da entrada.
         registry::copy(registry::LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Svchost\\LocalServiceNoNetwork", "Microsoft\\Windows NT\\CurrentVersion\\Svchost\\LocalServiceNoNetwork", true, &mut keys);
+        // A mesma configuração do grupo do serviço de política de vídeo
+        // (`LocalService`: a segurança do COM e a política de
+        // desempacotamento do svchost que registra a fábrica da
+        // GlobalBrokerInstance).
+        registry::copy(registry::LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Svchost\\LocalService", "Microsoft\\Windows NT\\CurrentVersion\\Svchost\\LocalService", true, &mut keys);
         registry::copy(registry::LOCAL_MACHINE, "SOFTWARE\\Microsoft\\SecurityManager\\TransientObjects", "Microsoft\\SecurityManager\\TransientObjects", true, &mut keys);
         // Os provedores de autenticação do RPC (o número do serviço de
         // autenticação e o DLL dele: 9, 10 e 16 no sspicli.dll, 14 no

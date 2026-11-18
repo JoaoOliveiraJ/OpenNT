@@ -4055,16 +4055,27 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   do Power, que ele inicia pelo nome antes dos outros, e a do registrador
   do CoreMessaging (CoreMessagingRegistrar, que toda sessão CoreUI do
   dwm.exe e do LogonUI exige, com os `SecurityManager\TransientObjects` das
-  portas dele), o Control\ServiceGroupOrder, os valores EarlyStartServices
+  portas dele) e a do serviço de política de vídeo (DispBrokerDesktopSvc,
+  o servidor da classe WinRT DispBrokerDesktop.GlobalBrokerInstance que o
+  uDWM do dwm.exe ativa na partida, com o grupo `LocalService` do
+  svchost), o Control\ServiceGroupOrder, os valores EarlyStartServices
   e SvcHostSplitThresholdInKB de Control (o conjunto inicial e a separação
   dos serviços de um svchost) e os grupos do svchost
   (`xtask/src/user_services.rs`). A tela de logon da sessão 1 leva o fecho
   de imports do dwm.exe e do LogonUI.exe com o XAML e os provedores de
-  credencial (`LOGON_SCREEN_PROGRAMS` em `xtask/src/windows_binaries.rs`),
+  credencial (`LOGON_SCREEN_PROGRAMS` em `xtask/src/windows_binaries.rs`:
+  com o que a thread de eventos do DWM cria no
+  CDesktopManager::InitializeComObjects do uDWM, sem o que o dwm.exe não
+  sobe, o UIAnimation.dll e o DispBroker.Desktop.dll; o ism.dll do
+  anfitrião de entrada do CGlobalMit do dwmcore; o wuceffects.dll dos
+  pincéis de efeito; e o icu.dll da Calendar do relógio da tela de
+  bloqueio),
   os `.mun` e os `.pri` de `\Windows\SystemResources` desses programas (o
   imageres.dll.mun do bloco do usuário e dos ícones), os metadados WinRT de
   `System32\WinMetadata`, as imagens padrão da tela de bloqueio de
-  `\Windows\Web\Screen` (`LOGON_SCREEN_FOLDERS`) e as do bloco do usuário
+  `\Windows\Web\Screen`, os dados do ICU de `\Windows\Globalization\ICU` e
+  o `timezones.xml` de `\Windows\Globalization\Time Zone`
+  (`LOGON_SCREEN_FOLDERS`) e as do bloco do usuário
   de `%ProgramData%\Microsoft\User Account Pictures`, sem os `.dat` das
   contas desta máquina (`USER_ACCOUNT_PICTURES`), as
   fontes de `\SystemRoot\Fonts` com o GRE_Initialize, o FontSubstitutes, o
@@ -4075,12 +4086,15 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   DEFAULT, `xtask/src/theme.rs`), as
   classes COM em processo (`Classes\CLSID`: o LogonUIController, os
   provedores de credencial, a fábrica e os codecs do WIC) e WinRT
-  (`WindowsRuntime\ActivatableClassId`) das DLLs do volume, as interfaces
+  (`WindowsRuntime\ActivatableClassId`) das DLLs do volume, as classes
+  WinRT fora de processo do DispBrokerDesktopSvc com o
+  `WindowsRuntime\Server` dele, as interfaces
   com o proxy numa dessas classes (`Classes\Interface`, menos as que o
   oleaut32 empacota pela biblioteca de tipos), com os
   provedores de `Authentication\Credential Providers` e o
-  `Authentication\LogonUI` sem o último logon nem os SIDs de usuário desta
-  máquina (`xtask/src/logon_screen.rs`), e a chave `Microsoft\Windows\DWM`
+  `Authentication\LogonUI` sem o último logon, o estado do boot nem os SIDs
+  de usuário desta máquina, e os `Time Zones` que a Calendar lê
+  (`xtask/src/logon_screen.rs`), e a chave `Microsoft\Windows\DWM`
   que o dwm.exe, o dwmcore e o dcomp leem e em que o dwminit grava a
   atividade de cada sessão (sem os `DwmInitSessionActivityId_*` desta
   máquina, `xtask/src/window_manager.rs`); a

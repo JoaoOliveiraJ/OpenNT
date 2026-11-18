@@ -29,14 +29,23 @@
 //! - uma chamada entre apartamentos (o STA do XAML e as threads do servidor
 //!   RPC do logoncontroller.dll) acha o proxy da interface por
 //!   `Classes\Interface\{iid}\ProxyStubClsid32`, a classe PSFactoryBuffer da
-//!   DLL de proxies.
+//!   DLL de proxies;
+//! - a SessionBrokerInstance que o uDWM.dll do dwm.exe ativa na partida
+//!   ativa a classe fora de processo DispBrokerDesktop.GlobalBrokerInstance
+//!   (ActivationType 1, `Server` DispBrokerDesktopSvc): o RPCSS lê
+//!   `WindowsRuntime\Server\DispBrokerDesktopSvc` (o serviço, a identidade e
+//!   as permissões de ativação) e inicia o serviço;
+//! - a Calendar do relógio da tela de bloqueio lê as regras do fuso em
+//!   `Windows NT\CurrentVersion\Time Zones`.
 //!
 //! As classes COM e WinRT copiadas são as de DLLs de System32 que o volume
-//! leva (`windows_binaries::user_programs`), e as interfaces, as que têm o
+//! leva (`windows_binaries::user_programs`) e as dos servidores WinRT de
+//! `WINRT_SERVERS`, e as interfaces, as que têm o
 //! proxy numa dessas classes: o convidado é uma instalação com esses
 //! componentes. Do `Authentication\LogonUI` e dos provedores
 //! ficam de fora o último logon (o usuário, o provedor e o tempo ocioso
-//! dele), o usuário selecionado, os dados de sessão e as subchaves e os
+//! dele), o usuário selecionado, os dados de sessão, o estado deste boot e
+//! as subchaves e os
 //! valores com o SID de um usuário desta máquina: uma instalação nova não
 //! os tem, e o convidado não tem as contas daqui (o
 //! `SystemProtectedUserData`, também por usuário, não é copiado). Como os
@@ -50,10 +59,19 @@ use crate::host_language::HostKey;
 #[cfg(windows)]
 const LOGON_UI_LOCAL_VALUES: &[&str] = &["LastLoggedOnUser", "LastLoggedOnSAMUser", "LastLoggedOnDisplayName", "LastLoggedOnUserSID", "LastLoggedOnProvider", "SelectedUserSID", "IdleTime"];
 
-/// As subchaves de `Authentication\LogonUI` com o estado das sessões e o
-/// conteúdo por usuário desta máquina.
+/// As subchaves de `Authentication\LogonUI` com o estado das sessões, o
+/// conteúdo por usuário desta máquina e o estado deste boot (a chave volátil
+/// `LogonSoundPlayed`, que o LogonUI cria a cada partida).
 #[cfg(windows)]
-const LOGON_UI_LOCAL_KEYS: &[&str] = &["SessionData", "Creative"];
+const LOGON_UI_LOCAL_KEYS: &[&str] = &["SessionData", "Creative", "LogonSoundPlayed"];
+
+/// Os servidores WinRT fora de processo (`WindowsRuntime\Server\<nome>`, um
+/// serviço de `user_services`) cujas classes o caminho da tela de logon
+/// ativa: o DispBrokerDesktopSvc da DispBrokerDesktop.GlobalBrokerInstance
+/// que a SessionBrokerInstance do dwm.exe cria. O RPCSS acha o servidor
+/// pelo `Server` da classe e inicia o serviço do `ServiceName`.
+#[cfg(windows)]
+const WINRT_SERVERS: &[&str] = &["DispBrokerDesktopSvc"];
 
 /// Os proxies do oleaut32.dll que empacotam pela biblioteca de tipos
 /// registrada da interface (PSOAInterface e PSDispatch), em minúsculas.
@@ -130,14 +148,16 @@ pub fn software_keys() -> Vec<HostKey> {
                 registry::copy(registry::LOCAL_MACHINE, &format!("SOFTWARE\\{interfaces}\\{interface}"), &format!("{interfaces}\\{interface}"), true, &mut keys);
             }
         }
-        // As classes WinRT das DLLs do volume.
+        // As classes WinRT das DLLs do volume e as dos servidores fora de
+        // processo de WINRT_SERVERS, com as chaves desses servidores.
         let classes = "Microsoft\\WindowsRuntime\\ActivatableClassId";
+        let served = |server: Option<String>| server.is_some_and(|server| WINRT_SERVERS.iter().any(|known| known.eq_ignore_ascii_case(&server)));
         let mut identifiers = Vec::new();
         for class in registry::list(registry::LOCAL_MACHINE, &format!("SOFTWARE\\{classes}")) {
             let mut found = Vec::new();
             registry::copy(registry::LOCAL_MACHINE, &format!("SOFTWARE\\{classes}\\{class}"), &format!("{classes}\\{class}"), true, &mut found);
             let Some(values) = found.first().map(|key| &key.values) else { continue };
-            if !staged(text(values, "DllPath")) {
+            if !staged(text(values, "DllPath")) && !served(text(values, "Server")) {
                 continue;
             }
             identifiers.extend(text(values, "CLSID"));
@@ -147,6 +167,18 @@ pub fn software_keys() -> Vec<HostKey> {
             let path = format!("Microsoft\\WindowsRuntime\\CLSID\\{identifier}");
             registry::copy(registry::LOCAL_MACHINE, &format!("SOFTWARE\\{path}"), &path, true, &mut keys);
         }
+        for server in WINRT_SERVERS {
+            let path = format!("Microsoft\\WindowsRuntime\\Server\\{server}");
+            registry::copy(registry::LOCAL_MACHINE, &format!("SOFTWARE\\{path}"), &path, true, &mut keys);
+        }
+        // Os fusos horários da instalação: o TimeZoneCache e a
+        // LegacyWindowsTimeZone do Windows.Globalization.dll (a Calendar do
+        // relógio da tela de bloqueio) leem as regras do fuso pelo
+        // GetTimeZoneInformationForYear e pelo
+        // GetDynamicTimeZoneInformationEffectiveYears, que abrem
+        // `Time Zones\<TimeZoneKeyName>` (o TZI e o `Dynamic DST`).
+        let zones = "Microsoft\\Windows NT\\CurrentVersion\\Time Zones";
+        registry::copy(registry::LOCAL_MACHINE, &format!("SOFTWARE\\{zones}"), zones, true, &mut keys);
         // Os provedores de credencial, os filtros e o estado da tela de
         // logon, sem o que é desta máquina.
         let authentication = "Microsoft\\Windows\\CurrentVersion\\Authentication";
