@@ -10,8 +10,9 @@
 //! de boot drena timers, DPCs, work items e o escalonador enquanto aguarda o
 //! estado ou o prazo.
 
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::{clock, context_switch, dpc, thread_alert, timer, wait};
 use crate::ntos::inc::types::{DispatcherHeader, Field, Kevent, Kmutant, Ksemaphore, LargeInteger, ListEntry, NtStruct};
@@ -81,12 +82,107 @@ pub fn read_state(object: u64) -> u32 {
     header_at(object).signal_state.get() as u32
 }
 
-/// KePulseEvent: sinaliza (libera os waiters) e volta a não sinalizado num
-/// único passo, devolvendo o estado anterior — KeSetEvent + KeResetEvent.
+/// KePulseEvent (ntoskrnl 19041, 0x33AAD0): com o evento não sinalizado,
+/// SignalState = 1 e o KiTryUnwaitThread das esperas WaitAny da
+/// WaitListHead (no evento de sincronização, até uma consumir o sinal);
+/// depois SignalState = 0, devolvendo o estado anterior. Aqui o KeSetEvent
+/// satisfaz as esperas registradas (os blocos das threads de kernel, em
+/// `wait::signal`). As esperas sondadas não têm bloco na WaitListHead e
+/// veriam o evento já não sinalizado: o pulso fica anotado para elas
+/// ([`PolledObjects`]).
 pub fn pulse_event(event: u64) -> u32 {
     let previous = set_event(event);
-    reset_event(event);
+    // Ainda sinalizado: nenhuma espera consumiu o sinal (o de sincronização).
+    let unclaimed = reset_event(event) != 0;
+    if previous == 0 {
+        note_pulse(event, unclaimed);
+    }
     previous
+}
+
+/// O último pulso de um evento, na contagem global de pulsos, e, no evento
+/// de sincronização, os pulsos cujo sinal nenhuma espera consumiu (0 =
+/// vazio).
+struct PulseRecord {
+    last: u64,
+    unclaimed: [u64; 4],
+}
+
+/// A contagem de pulsos anotados (o relógio das esperas sondadas).
+static PULSE_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Os eventos pulsados, pelo endereço do KEVENT.
+static PULSES: SpinLock<BTreeMap<u64, PulseRecord>> = SpinLock::new(BTreeMap::new());
+/// Eventos lembrados: além disso sai o de pulso mais antigo.
+const PULSED_EVENTS: usize = 256;
+
+/// Anota um pulso que achou o evento não sinalizado.
+fn note_pulse(event: u64, unclaimed: bool) {
+    let mut pulses = PULSES.lock();
+    let pulse = PULSE_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
+    if !pulses.contains_key(&event) && pulses.len() >= PULSED_EVENTS {
+        if let Some(oldest) = pulses.iter().min_by_key(|(_, record)| record.last).map(|(&address, _)| address) {
+            pulses.remove(&oldest);
+        }
+    }
+    let record = pulses.entry(event).or_insert(PulseRecord { last: 0, unclaimed: [0; 4] });
+    record.last = pulse;
+    if unclaimed && header_at(event).type_.get() == object_type::EVENT_SYNCHRONIZATION {
+        // Sem lugar, o pulso mais antigo cede o dele.
+        let slot = record.unclaimed.iter().position(|&value| value == 0).unwrap_or_else(|| record.unclaimed.iter().enumerate().min_by_key(|(_, &value)| value).map_or(0, |(index, _)| index));
+        record.unclaimed[slot] = pulse;
+    }
+}
+
+/// Os objetos de uma espera sondada (a thread de usuário parada numa
+/// syscall, o contexto de boot) e a contagem de pulsos no começo dela. Como
+/// as esperas registradas que o KePulseEvent satisfaz, a espera WaitAny que
+/// já esperava quando o pulso veio é satisfeita por ele: num evento de
+/// notificação, toda espera; num de sincronização, uma só por pulso. O
+/// WaitAll não conta pulsos.
+pub struct PolledObjects {
+    objects: Vec<u64>,
+    wait_type: u32,
+    since: u64,
+}
+
+impl PolledObjects {
+    /// A espera começa aqui (antes da primeira tentativa, para nenhum pulso
+    /// escapar entre ela e o bloqueio).
+    pub fn new(objects: Vec<u64>, wait_type: u32) -> Self {
+        Self { objects, wait_type, since: PULSE_COUNT.load(Ordering::SeqCst) }
+    }
+
+    /// A tentativa pela thread `owner`: o estado dos objetos e, sem ele, o
+    /// primeiro evento pulsado desde o começo da espera.
+    pub fn try_for(&self, owner: u64) -> Option<u32> {
+        try_wait_objects_for(&self.objects, self.wait_type, owner).or_else(|| self.pulsed())
+    }
+
+    /// [`PolledObjects::try_for`] pela thread corrente.
+    pub fn try_now(&self) -> Option<u32> {
+        self.try_for(process::get_current_thread())
+    }
+
+    fn pulsed(&self) -> Option<u32> {
+        if self.wait_type != 1 || PULSE_COUNT.load(Ordering::SeqCst) == self.since {
+            return None;
+        }
+        let mut pulses = PULSES.lock();
+        for (index, object) in self.objects.iter().enumerate() {
+            let Some(record) = pulses.get_mut(object) else { continue };
+            match header_at(*object).type_.get() {
+                object_type::EVENT_NOTIFICATION if record.last > self.since => return Some(index as u32),
+                object_type::EVENT_SYNCHRONIZATION => {
+                    if let Some(slot) = record.unclaimed.iter_mut().filter(|value| **value > self.since).min_by_key(|value| **value) {
+                        *slot = 0;
+                        return Some(index as u32);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
 }
 
 fn semaphore_at(semaphore: u64) -> &'static Ksemaphore {
@@ -389,21 +485,23 @@ fn expired(timeout: Option<u64>, deadline: Option<u64>) -> bool {
 
 /// KeWaitForSingleObject. Uma thread de kernel registra o bloco e deixa a
 /// CPU até o sinal ou o prazo (`ke::wait`); numa syscall a thread bloqueia
-/// até o objeto ser sinalizado ou o prazo vencer (`context_switch::wait_until`);
-/// no contexto de boot a espera gira o `pump_kernel`.
+/// até o objeto ser sinalizado (ou pulsado, [`PolledObjects`]) ou o prazo
+/// vencer (`context_switch::wait_until`); no contexto de boot a espera gira
+/// o `pump_kernel`.
 pub fn wait_for_single_object(object: u64, timeout_pointer: u64, wait_mode: u8, alertable: bool) -> u32 {
     if context_switch::kernel_thread_can_block() {
         return wait::wait_for_objects(&[object], false, wait::Deadline::after(timeout_to_100ns(timeout_pointer)), wait_mode, alertable, wait::reason::EXECUTIVE);
     }
     let (timeout, deadline) = deadline(timeout_pointer);
+    let polled = PolledObjects::new(alloc::vec![object], 1);
     if alertable {
-        let mut poll = || acquire_status(object, true).or_else(|| expired(timeout, deadline).then_some(STATUS_TIMEOUT));
+        let mut poll = || polled.try_now().or_else(|| expired(timeout, deadline).then_some(STATUS_TIMEOUT));
         return thread_alert::cooperate(process::get_current_thread(), wait_mode, true, &mut poll, pump_kernel);
     }
     // Não alertável: uma espera de UserMode ainda sai com UserApcPending (o
     // KiCheckAlertability), como a da thread de kernel em `ke::wait`.
     let thread = process::get_current_thread();
-    let mut poll = || thread_alert::consume(thread, wait_mode, false).or_else(|| acquire_status(object, true)).or_else(|| expired(timeout, deadline).then_some(STATUS_TIMEOUT));
+    let mut poll = || thread_alert::consume(thread, wait_mode, false).or_else(|| polled.try_now()).or_else(|| expired(timeout, deadline).then_some(STATUS_TIMEOUT));
     context_switch::wait_until(&mut poll, pump_kernel)
 }
 
@@ -451,11 +549,12 @@ pub fn wait_for_multiple_objects(count: u32, objects_pointer: u64, wait_type: u3
         return wait::wait_for_objects(&objects, wait_type == 0, wait::Deadline::after(timeout_to_100ns(timeout_pointer)), wait_mode, alertable, wait::reason::EXECUTIVE);
     }
     let (timeout, deadline) = deadline(timeout_pointer);
+    let polled = PolledObjects::new(objects, wait_type);
     if alertable {
-        let mut poll = || try_wait_objects(&objects, wait_type).or_else(|| expired(timeout, deadline).then_some(STATUS_TIMEOUT));
+        let mut poll = || polled.try_now().or_else(|| expired(timeout, deadline).then_some(STATUS_TIMEOUT));
         return thread_alert::cooperate(process::get_current_thread(), wait_mode, true, &mut poll, pump_kernel);
     }
     let thread = process::get_current_thread();
-    let mut poll = || thread_alert::consume(thread, wait_mode, false).or_else(|| try_wait_objects(&objects, wait_type)).or_else(|| expired(timeout, deadline).then_some(STATUS_TIMEOUT));
+    let mut poll = || thread_alert::consume(thread, wait_mode, false).or_else(|| polled.try_now()).or_else(|| expired(timeout, deadline).then_some(STATUS_TIMEOUT));
     context_switch::wait_until(&mut poll, pump_kernel)
 }

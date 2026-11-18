@@ -42,7 +42,12 @@
 //!   terceira publica dois pacotes por rodada e espera as duas confirmações.
 //!   Cada pacote chega a uma consumidora já parada (Waiting, WrQueue, fora da
 //!   CPU): ela sai da espera Ready, nunca Running, e nenhuma se perde nas 64
-//!   rodadas.
+//!   rodadas;
+//! - o KePulseEvent e as esperas sondadas: o pulso satisfaz as esperas
+//!   WaitAny que já esperavam no evento (todas no de notificação, uma no de
+//!   sincronização), não as que começam depois nem o WaitAll, e o
+//!   KeWaitForSingleObject sondado vê o pulso de uma thread de sistema em
+//!   vez de vencer pelo prazo.
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -850,7 +855,74 @@ fn shared_queue_waiters(assert: Assert, completion: bool) {
     guest::free_bytes(block);
 }
 
+// ---- KePulseEvent e as esperas sondadas -----------------------------------
+
+/// [0] o evento, [0x40] o pedido de parada, [0x48] os pulsos dados,
+/// [0x50] o intervalo de 1 ms do KeDelayExecutionThread.
+extern "win64" fn event_pulser(block: u64) {
+    guest::write64(block + 0x50, (-10_000i64) as u64);
+    for _ in 0..4000 {
+        if guest::read64(block + 0x40) != 0 {
+            return;
+        }
+        call_export("KePulseEvent", &[block, 0, 0]);
+        guest::write64(block + 0x48, guest::read64(block + 0x48) + 1);
+        call_export("KeDelayExecutionThread", &[0, 0, block + 0x50]);
+    }
+}
+
+/// O KePulseEvent satisfaz as esperas WaitAny que já esperavam no evento
+/// (o KiTryUnwaitThread das esperas da WaitListHead), também as sondadas,
+/// que não têm bloco na lista: todas num evento de notificação, uma por
+/// pulso num de sincronização; quem começa a esperar depois do pulso e o
+/// WaitAll não contam o pulso. E o KeWaitForSingleObject do contexto de
+/// boot (o caminho sondado de uma thread de usuário num serviço) vê o pulso
+/// de uma thread de sistema em vez de vencer pelo prazo.
+fn pulse_polled_waits(assert: Assert) {
+    let block = guest::alloc_bytes(0x100);
+    guest::write_bytes(block, &[0; 0x100]);
+    let (notification, other, synchronization) = (block + 0x60, block + 0x80, block + 0xA0);
+    dispatcher::initialize_event(notification, 0, false);
+    dispatcher::initialize_event(other, 0, false);
+    dispatcher::initialize_event(synchronization, 1, false);
+    let any = |objects: &[u64]| dispatcher::PolledObjects::new(objects.to_vec(), 1);
+    let (first, second) = (any(&[other, notification]), any(&[notification]));
+    let all = dispatcher::PolledObjects::new(alloc::vec![notification, other], 0);
+    let quiet = first.try_now().is_none() && second.try_now().is_none();
+    let previous = dispatcher::pulse_event(notification);
+    let late = any(&[notification]);
+    assert(
+        quiet && previous == 0 && dispatcher::read_state(notification) == 0 && first.try_now() == Some(1) && second.try_now() == Some(0) && late.try_now().is_none() && all.try_now().is_none(),
+        "kwait: KePulseEvent num evento de notificacao satisfaz as esperas sondadas WaitAny que ja esperavam (o indice do evento) e deixa o evento nao sinalizado; a que comeca depois e o WaitAll nao o contam",
+    );
+    let (one, two) = (any(&[synchronization]), any(&[synchronization]));
+    let previous = dispatcher::pulse_event(synchronization);
+    let (got_one, got_two) = (one.try_now(), two.try_now());
+    let after = any(&[synchronization]);
+    assert(
+        previous == 0 && dispatcher::read_state(synchronization) == 0 && got_one == Some(0) && got_two.is_none() && after.try_now().is_none(),
+        "kwait: KePulseEvent num evento de sincronizacao entrega o sinal a uma so espera sondada",
+    );
+    // Uma thread de sistema pulsa o evento a cada 1 ms; o contexto de boot
+    // espera nele com prazo de 2 s pelo caminho sondado do KeWaitForSingleObject.
+    dispatcher::initialize_event(block, 0, false);
+    let (handle, pulser) = start(event_pulser, block);
+    let timeout = block + 0x58;
+    guest::write64(timeout, (-20_000_000i64) as u64);
+    let status = if pulser != 0 { dispatcher::wait_for_single_object(block, timeout, 0, false) } else { u32::MAX };
+    let pulses = guest::read64(block + 0x48);
+    guest::write64(block + 0x40, 1);
+    let finished = pulser != 0 && pump(5000, &|| kernel_threads::is_terminated(pulser));
+    assert(
+        status == 0 && pulses >= 1 && dispatcher::read_state(block) == 0 && finished,
+        "kwait: o KeWaitForSingleObject sondado ve o KePulseEvent de uma thread de sistema e volta com STATUS_SUCCESS, sem vencer pelo prazo",
+    );
+    let _ = object_manager::close(handle as u32);
+    guest::free_bytes(block);
+}
+
 pub fn run(assert: Assert) {
+    pulse_polled_waits(assert);
     event_ping_pong(assert);
     queue_ping_pong(assert);
     nested_tick(assert);

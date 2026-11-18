@@ -938,7 +938,18 @@ ObpDefaultObject (um evento de notificação sempre sinalizado); Count fora de
 STATUS_INVALID_PARAMETER_3, e um objeto repetido só é recusado no WaitAll
 (STATUS_INVALID_PARAMETER_MIX). Os prazos dessas esperas sondadas contam em
 ms arredondados para cima (um prazo não nulo abaixo de 1 ms espera o
-próximo ms, nunca vence de imediato). O NtDelayExecution com intervalo zero,
+próximo ms, nunca vence de imediato). Uma espera sondada não tem bloco na
+WaitListHead, e o KePulseEvent sinaliza e limpa o evento antes de qualquer
+sondagem: o pulso que acha o evento não sinalizado fica anotado
+(`dispatcher::PolledObjects`, na contagem global de pulsos), e a espera
+WaitAny que começou antes dele (os KeWaitFor* de uma thread de usuário num
+serviço, como a espera do vblank do dxgkrnl no
+D3DKMTWaitForVerticalBlankEvent2 do dwm e o MsgWaitForMultipleObjectsEx do
+win32k no WinSta0_DesktopSwitch do logoncontroller, e o NtWaitFor* de modo
+usuário) é satisfeita por ele como o KiTryUnwaitThread do KePulseEvent
+satisfaz a registrada: todas num evento de notificação, uma por pulso num de
+sincronização cujo sinal nenhuma espera consumiu. O WaitAll não conta
+pulsos. O NtDelayExecution com intervalo zero,
 sem Alertable e sem UserApcPending, é a troca do NtYieldExecution
 (STATUS_SUCCESS ou STATUS_NO_YIELD_PERFORMED), como no
 KeDelayExecutionThread. Os dois e o ZwYieldExecution escolhem como o

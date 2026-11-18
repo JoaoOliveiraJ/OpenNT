@@ -1384,10 +1384,12 @@ pub fn wait_custom(mut wait: Wait, timeout: u64, timeout_ms: Option<Option<u64>>
 /// `ob/wait::reference_objects` (WaitAny devolve o primeiro índice
 /// satisfeito, WaitAll o status conjunto), com o prazo em ms (`None` = sem
 /// prazo): as referências da captura ficam com a espera e saem quando ela
-/// conclui.
+/// conclui. Um KePulseEvent num evento esperado também a satisfaz
+/// (`dispatcher::PolledObjects`), como satisfaz a espera registrada.
 pub fn wait_referenced(set: crate::ntos::ob::wait::WaitObjects, wait_type: u32, timeout_ms: Option<u64>, alertable: bool) -> u32 {
     let objects = set.objects.clone();
-    let wait = Wait { objects, wait_type, alertable: Some(alertable), cleanup: Some(Box::new(move |_status| set.release())), ..Wait::default() };
+    let polled = dispatcher::PolledObjects::new(objects.clone(), wait_type);
+    let wait = Wait { objects, wait_type, alertable: Some(alertable), poll: Some(Box::new(move || polled.try_now())), cleanup: Some(Box::new(move |_status| set.release())), ..Wait::default() };
     wait_custom(wait, 0, Some(timeout_ms))
 }
 
