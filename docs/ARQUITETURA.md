@@ -835,7 +835,14 @@ KeWaitForSingleObject/Multiple sem consumir (`dispatcher::acquire_status`);
 a fila que ganha pacotes, e o KeInsertQueue que deixa a entrada na lista,
 testam as esperas do cabeçalho. O win32k espera assim a porta da fila de
 mensagens de cada thread GUI (o pacote de espera do evento da fila a
-alimenta). As demais esperas genéricas de
+alimenta). Como o bloco de notificação do KeRegisterObjectNotification, o
+pacote de espera sobre um evento ou um semáforo vai para a fila dentro do
+próprio sinal (`wait::signal` chama o observador de
+`ps/user/wait_packets.rs`): depois do KeSetEvent do SetWakeBit, ou de um
+KePulseEvent, a consulta da porta com prazo zero (o atalho do
+NtUserPeekMessage, o NtUserMsgWaitForMultipleObjectsEx com dwTimeout 0) já
+vê o pacote; os demais alvos, e o sinal em DISPATCH_LEVEL ou com um
+SpinLock retido, ficam com o pump do despachante. As demais esperas genéricas de
 uma condição sem objeto a sinalizar (`context_switch::wait_until`, como a
 remoção de um callback à espera do fim das chamadas em curso) tiram a thread
 das prontas com a condição sondada pelo despachante a cada tick

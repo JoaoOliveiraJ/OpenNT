@@ -601,6 +601,38 @@ pub fn run_user(assert: Assert) {
         guest::free_bytes(unnamed);
         let packets = packets && protected && kernel_target;
         crate::debug_print!("[suporte-zw] handles do Ob: atributos={} alvo de kernel={}", protected, kernel_target);
+        // O sinal entrega o pacote na hora (o KiWaitTest do bloco de
+        // notificação do KeRegisterObjectNotification), sem passar pelo pump:
+        // o ZwSetEvent de um evento de sincronização põe o pacote na fila e
+        // consome o sinal, e o KePulseEvent de um de notificação também o
+        // entrega, com o evento de volta a não sinalizado.
+        let slots = guest::alloc_bytes(0x30);
+        let events_made = status(call_export("ZwCreateEvent", &[slots, 0x1F_0003, 0, 1, 0])) == 0 && status(call_export("ZwCreateEvent", &[slots + 8, 0x1F_0003, 0, 0, 0])) == 0;
+        let (sync_event, pulsed_event) = (guest::read64(slots), guest::read64(slots + 8));
+        let body_of = |handle: u64| crate::ntos::ob::open_pointer::resolve(handle, false).and_then(|opened| opened.ok()).map_or(0, |opened| opened.item.pointer);
+        let (sync_body, pulsed_body) = (body_of(sync_event), body_of(pulsed_event));
+        let packets_made = status(call_export("ZwCreateWaitCompletionPacket", &[slots + 0x10, 1, 0])) == 0 && status(call_export("ZwCreateWaitCompletionPacket", &[slots + 0x18, 1, 0])) == 0;
+        guest::write8(slots + 0x20, 0xFF);
+        guest::write8(slots + 0x21, 0xFF);
+        let armed = events_made
+            && sync_body != 0
+            && pulsed_body != 0
+            && packets_made
+            && status(call_export("ZwAssociateWaitCompletionPacket", &[guest::read64(slots + 0x10), port, sync_event, 5, 6, 7, 8, slots + 0x20])) == 0
+            && status(call_export("ZwAssociateWaitCompletionPacket", &[guest::read64(slots + 0x18), port, pulsed_event, 9, 10, 11, 12, slots + 0x21])) == 0
+            && guest::read8(slots + 0x20) == 0
+            && guest::read8(slots + 0x21) == 0;
+        let before = depth(port);
+        let set_now = armed && status(call_export("ZwSetEvent", &[sync_event, 0])) == 0 && depth(port) == before + 1 && crate::ntos::ke::dispatcher::read_state(sync_body) == 0;
+        let pulse_now = set_now && call_export("KePulseEvent", &[pulsed_body, 0, 0]).is_some() && depth(port) == before + 2 && crate::ntos::ke::dispatcher::read_state(pulsed_body) == 0;
+        crate::debug_print!("[suporte-zw] pacote entregue no sinal: set={} pulse={}", set_now, pulse_now);
+        for handle in [sync_event, pulsed_event] {
+            let _ = call_export("ZwClose", &[handle]);
+        }
+        for slot in [slots + 0x10, slots + 0x18] {
+            let _ = state::close_user_handle(guest::read64(slot), true, false);
+        }
+        guest::free_bytes(slots);
         for handle in [signaled, waiting, port, packet] {
             let _ = state::close_user_handle(handle, true, false);
         }
@@ -611,14 +643,15 @@ pub fn run_user(assert: Assert) {
         if let Some(region) = memory::find_region(page) {
             memory::release_private_region(&region);
         }
-        Some((created, attributes, refused, single, any, all, invalid, packets))
+        Some((created, attributes, refused, single, any, all, invalid, packets, pulse_now))
     })
     .flatten();
-    let Some((created, attributes, refused, single, any, all, invalid, packets)) = outcome else {
+    let Some((created, attributes, refused, single, any, all, invalid, packets, in_signal)) = outcome else {
         assert(false, "ob: processo de teste com eventos de usuario");
         return;
     };
     assert(created && attributes && refused, "ob: ObSetHandleAttributes e ZwSetInformationObject trocam Inherit e ProtectFromClose do handle e recusam handle ausente, de kernel em UserMode, classe e tamanho errados, e a ObjectSessionInformation grava a sessao no diretorio");
     assert(single && any == 1 && all == 0x102 && invalid == 0xC000_000D, "ob: ObWaitForSingleObject e ObWaitForMultipleObjects (WaitAny no indice sinalizado, WaitAll com prazo zero) sobre handles de usuario");
     assert(packets, "zw: ZwCreateWaitCompletionPacket, ZwAssociateWaitCompletionPacket (ja sinalizado, tambem com alvo de handle de kernel), ZwSetIoCompletionEx (reserva recusada), ZwCancelWaitCompletionPacket tirando o pacote da fila e ObSetHandleAttributes num handle da tabela do Ob");
+    assert(in_signal, "zw: o ZwSetEvent e o KePulseEvent poem o pacote de espera associado ao evento na fila da IOCP dentro do proprio sinal (o de sincronizacao consumido, o pulsado de volta a nao sinalizado), sem esperar o pump");
 }

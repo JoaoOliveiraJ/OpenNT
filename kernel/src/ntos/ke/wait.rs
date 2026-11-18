@@ -25,7 +25,11 @@
 //! de sincronização, a permissão do semáforo, a posse do mutant) e, num
 //! WaitAll, só quando todos os objetos da thread estão disponíveis; um bloco
 //! de notificação (as esperas dos locks do Ex, que conferem a própria palavra
-//! ao voltar) só acorda. O KeInsertQueue entrega a entrada direto à thread
+//! ao voltar) só acorda. Depois das threads, já fora do lock, o sinal passa
+//! pelo observador instalado ([`set_signal_observer`]): os pacotes de espera
+//! associados ao objeto, os blocos de notificação com fila do
+//! KeRegisterObjectNotification, vão para a porta deles (`ps/user/wait_packets`).
+//! O KeInsertQueue entrega a entrada direto à thread
 //! parada na fila (`ke::queue`, o KiInsertQueue). A saída da espera (o
 //! KiUnwaitThread, [`DispatcherLock::unwait`]) desliga todos os blocos da
 //! thread, cancela o timer, grava KTHREAD.WaitStatus e põe a thread na fila
@@ -402,10 +406,26 @@ impl DispatcherLock {
     }
 }
 
+/// O observador do sinal: os blocos de notificação com fila do
+/// KeRegisterObjectNotification (os pacotes de espera,
+/// `ps/user/wait_packets`), que o KiWaitTest do 19041 satisfaz dentro do
+/// próprio sinal, pondo o pacote na fila da porta.
+static SIGNAL_OBSERVER: SpinLock<Option<fn(u64)>> = SpinLock::new(None);
+
+/// Instala o observador do sinal ([`signal`]).
+pub fn set_signal_observer(observer: fn(u64)) {
+    *SIGNAL_OBSERVER.lock() = Some(observer);
+}
+
 /// O KiWaitTest de fora: depois de mudar o estado de `object`, satisfaz quem
-/// espera nele.
+/// espera nele: as threads de kernel registradas e, já fora do lock do
+/// despachante, os pacotes de espera associados ao objeto.
 pub fn signal(object: u64) {
     lock().wait_test(object);
+    let observer = *SIGNAL_OBSERVER.lock();
+    if let Some(observer) = observer {
+        observer(object);
+    }
 }
 
 /// O despachante confirma que a thread deixou a CPU numa espera

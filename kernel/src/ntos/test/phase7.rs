@@ -1858,7 +1858,10 @@ fn user_wait_packets(assert: Assert) {
     // O alvo é conferido antes da fase do pacote: a IOCP (uma fila) dá
     // STATUS_INVALID_PARAMETER_3 mesmo com o pacote associado.
     assert(associate(event) == 0xC000_00EF && associate(port_handle) == 0xC000_00F1, "userwaitpackets: pacote ja associado");
-    assert(call("NtSetEvent", event, 0, 0, 0) == 0 && { wait_packets::pump(); depth() == 1 } && phase() == 2, "userwaitpackets: sinal publicado na porta pelo pump");
+    // O pacote entra na fila dentro do próprio NtSetEvent (o KiWaitTest do
+    // bloco de notificação), antes de qualquer pump.
+    assert(call("NtSetEvent", event, 0, 0, 0) == 0 && depth() == 1 && phase() == 2, "userwaitpackets: sinal publicado na porta dentro do NtSetEvent");
+    wait_packets::pump();
     guest::write64(rsp + 0x28, 0);
     assert(call("NtQueryEvent", event, 0, info, 8) == 0 && unsafe { nt::EventBasicInformation::at(info) }.event_state.get() == 0, "userwaitpackets: evento de sincronizacao consumido");
     let removed = call("NtRemoveIoCompletion", port_handle, info, info + 8, info + 16);

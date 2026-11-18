@@ -3,6 +3,16 @@
 //! Uma associação de uso único consome um objeto esperável e publica os
 //! contextos do chamador numa IOCP. As referências sobrevivem ao fechamento
 //! dos handles originais.
+//!
+//! Como o bloco de notificação do KeRegisterObjectNotification do 19041 (um
+//! KWAIT_BLOCK WaitNotification com a fila, na WaitListHead do objeto), o
+//! pacote sobre um evento ou um semáforo vai para a fila dentro do próprio
+//! sinal: o KeSetEvent, o KePulseEvent e a liberação do semáforo satisfazem
+//! a associação no contexto de quem sinaliza (`ke::wait::signal` chama
+//! [`object_signaled`]), então quem consulta a porta logo depois (com prazo
+//! zero) já vê o pacote. Os demais objetos, e um sinal em DISPATCH_LEVEL ou
+//! com um SpinLock retido, ficam com o pump do despachante, que também
+//! sonda as associações pendentes a cada volta.
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -11,20 +21,24 @@ use alloc::vec::Vec;
 use super::io_completion;
 use super::state::{self, probe_user_read, probe_user_write};
 use super::threads::{self, pump};
-use crate::ntos::ke::dispatcher;
+use crate::ntos::ke::{dispatcher, irql};
 use crate::ntos::ob::objects::completion::{self as completion_objects, Packet};
 use crate::ntos::ob::objects::dispatcher as dispatcher_objects;
 use crate::ntos::ob::objects::work::{self as work_objects, Association, Held, Queued, WaitPacket};
 use crate::ntos::ob::{object_reference, open_pointer, reference_trace, wait as ob_wait};
-use crate::rtl::{KernelError, SpinLock};
+use crate::rtl::{sync, KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::inc::types::{DispatcherHeader, NtStruct, ObjectAttributes};
 
-/// Associações pendentes, na ordem de inserção.
-static PENDING: SpinLock<Vec<Arc<WaitPacket>>> = SpinLock::new(Vec::new());
+/// Associações pendentes, na ordem de inserção, com o objeto de espera de
+/// cada uma (o que o sinal procura).
+static PENDING: SpinLock<Vec<(u64, Arc<WaitPacket>)>> = SpinLock::new(Vec::new());
+/// Serializa a tomada do sinal de uma associação: o sinal, no contexto de
+/// quem sinaliza, e o pump do despachante nunca entregam a mesma duas vezes.
+static CLAIM: SpinLock<()> = SpinLock::new(());
 
 fn forget(packet: &Arc<WaitPacket>) {
-    PENDING.lock().retain(|candidate| !Arc::ptr_eq(candidate, packet));
+    PENDING.lock().retain(|(_, candidate)| !Arc::ptr_eq(candidate, packet));
 }
 
 fn resolve(handle: u64) -> Result<Arc<WaitPacket>, u32> {
@@ -86,19 +100,29 @@ pub fn create(out: u64, access: u32, attributes: u64) -> Result<u32, KernelError
     }
 }
 
+/// Entrega a associação se o objeto dela está sinalizado (consumindo o
+/// sinal, como a espera de uma thread): o pacote vai para a fila da porta.
 fn poll(packet: &Arc<WaitPacket>) -> bool {
-    let Some(association) = packet.association() else { return false };
-    if association.port.closed() {
-        detach(packet, true);
-        return false;
-    }
-    if dispatcher::try_wait_objects(&[association.target_pointer], 1).is_none() {
-        return false;
-    }
+    let association = {
+        let claim = CLAIM.lock();
+        let Some(association) = packet.association() else { return false };
+        if association.port.closed() {
+            drop(claim);
+            detach(packet, true);
+            return false;
+        }
+        if dispatcher::try_wait_objects(&[association.target_pointer], 1).is_none() {
+            return false;
+        }
+        // A associação sai do pacote sob o lock: só quem tomou o sinal o
+        // entrega.
+        packet.set_association(None);
+        packet.set_queued(Some(Queued { port: association.port.clone() }));
+        association
+    };
     let pointer = packet.pointer;
     let _ = dispatcher_objects::reference(pointer);
     forget(packet);
-    packet.set_association(None);
     let port = association.port.clone();
     let (owner, port_entry) = (packet.clone(), association.port_entry.clone());
     let item = Packet {
@@ -117,7 +141,6 @@ fn poll(packet: &Arc<WaitPacket>) -> bool {
         })),
         ..Packet::default()
     };
-    packet.set_queued(Some(Queued { port: port.clone() }));
     completion_objects::enqueue(&port, item);
     release(&association.target);
     let _ = dispatcher_objects::dereference(pointer);
@@ -203,7 +226,7 @@ pub fn associate(handle: u64, port_handle: u64, target_handle: u64, completion: 
     }
     let _ = dispatcher_objects::reference(packet.pointer);
     packet.set_association(Some(Association { port_entry, port, target, target_pointer }));
-    PENDING.lock().push(packet.clone());
+    PENDING.lock().push((target_pointer, packet.clone()));
     Ok(poll(&packet))
 }
 
@@ -215,6 +238,11 @@ const STATUS_INVALID_PARAMETER_3: u32 = 0xC000_00F1;
 /// QueueObject.
 const MUTANT_OBJECT: u8 = 2;
 const QUEUE_OBJECT: u8 = 4;
+/// DISPATCHER_HEADER.Type entregue dentro do sinal ([`object_signaled`]):
+/// EventNotificationObject, EventSynchronizationObject e SemaphoreObject.
+const EVENT_NOTIFICATION_OBJECT: u8 = 0;
+const EVENT_SYNCHRONIZATION_OBJECT: u8 = 1;
+const SEMAPHORE_OBJECT: u8 = 5;
 
 /// O DISPATCHER_HEADER.Type (sem o bit alto) do objeto de espera.
 fn header_type(wait: u64) -> u8 {
@@ -267,13 +295,39 @@ fn nt_cancel_wait_completion_packet(handle: u64, remove: u64, _a3: u64, _a4: u64
 }
 
 pub fn pump() {
-    let pending = PENDING.lock().clone();
+    let pending: Vec<Arc<WaitPacket>> = PENDING.lock().iter().map(|(_, packet)| packet.clone()).collect();
     for packet in pending {
         poll(&packet);
     }
 }
 
+/// O sinal de `object` (o KiWaitTest dos blocos de notificação do
+/// KeRegisterObjectNotification): as associações com esse objeto de espera
+/// vão para a fila agora, na ordem em que foram feitas; um evento de
+/// sincronização satisfaz só a primeira. Entram na hora os eventos e os
+/// semáforos (o evento da fila de mensagens do win32k, o semáforo de uma
+/// porta ALPC esperável), cujo sinal pode ser consumido ou desfeito logo
+/// depois (KePulseEvent, KeClearEvent); timers, processos e threads ficam
+/// sinalizados e seguem com o pump, fora do caminho do vencimento e do
+/// término. Em DISPATCH_LEVEL ou acima, ou com um SpinLock retido, a
+/// entrega também fica para o pump.
+fn object_signaled(object: u64) {
+    // SAFETY: o objeto de despacho que o chamador acabou de sinalizar.
+    let kind = unsafe { DispatcherHeader::at(object) }.type_.get() & 0x7F;
+    if !matches!(kind, EVENT_NOTIFICATION_OBJECT | EVENT_SYNCHRONIZATION_OBJECT | SEMAPHORE_OBJECT) {
+        return;
+    }
+    if irql::get_irql() >= irql::DISPATCH_LEVEL || sync::spin_locks_held() != 0 {
+        return;
+    }
+    let targets: Vec<Arc<WaitPacket>> = PENDING.lock().iter().filter(|(target, _)| *target == object).map(|(_, packet)| packet.clone()).collect();
+    for packet in targets {
+        poll(&packet);
+    }
+}
+
 pub fn init() {
+    crate::ntos::ke::wait::set_signal_observer(object_signaled);
     threads::set_pump(pump::WAIT_PACKETS, pump);
     state::register_handler("NtCreateWaitCompletionPacket", nt_create_wait_completion_packet);
     state::register_handler("NtAssociateWaitCompletionPacket", nt_associate_wait_completion_packet);
