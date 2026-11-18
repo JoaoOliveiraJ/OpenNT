@@ -3155,7 +3155,8 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   exige PsCreateInitialState e decodifica o InitState: WriteOutputOnExit,
   DetectManifest, ProhibitedImageCharacteristics, AdditionalFileAccess), a PS_ATTRIBUTE_LIST copiada
   uma vez (honra ImageName, ParentProcess com PROCESS_CREATE_PROCESS,
-  PriorityClass, ProtectionLevel (o processo novo recebe o PS_PROTECTION
+  PriorityClass (um UCHAR lido pelo ponteiro do Value, com Size 1, como o
+  CreateProcessInternalW o passa), ProtectionLevel (o processo novo recebe o PS_PROTECTION
   pedido se quem cria for protegido e o dominar) e as saídas ClientId,
   TebAddress e ImageInfo, e JobList (os handles de job referenciados com
   JOB_OBJECT_ASSIGN_PROCESS); recusa com STATUS_NOT_SUPPORTED DebugObject,
@@ -4108,7 +4109,8 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   das DLLs da tela de logon com manifesto próprio pede o
   Microsoft.Windows.Common-Controls 6.0 (as chaves, os manifestos e os
   arquivos que eles listam, como o comctl32.dll da versão 6,
-  `xtask/src/side_by_side.rs`); o services.exe lê as chaves de serviço da
+  `xtask/src/side_by_side.rs`) e, pelo <windowsSettings> (o dpiAware), os
+  esquemas de configuração de SMI\WinSxs Settings; o services.exe lê as chaves de serviço da
   cadeia do LSM (DcomLaunch, RpcEptMapper, RpcSs e LSM), as do PlugPlay e
   do Power, que ele inicia pelo nome antes dos outros, e a do registrador
   do CoreMessaging (CoreMessagingRegistrar, que toda sessão CoreUI do

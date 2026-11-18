@@ -51,7 +51,7 @@ Object Manager (tipos, handles, namespace, callbacks), biblioteca de runtime, Ex
 
 | Componente | Estado | Teste automático |
 | --- | --- | --- |
-| Processos e threads | Funciona | selftest, fase3, fase7 |
+| Processos e threads | Funciona | selftest, fase3, fase6, fase7 |
 | Sincronização e despacho | Funciona | fase3, fase7, selftest |
 | Gerenciador de objetos e namespace | Parcial | fase3 |
 | Segurança e tokens | Parcial | fase3, fase6, fase7 |
