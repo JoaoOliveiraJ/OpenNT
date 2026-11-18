@@ -2315,6 +2315,14 @@ fn user_syscalls_core(assert: Assert) {
     guest::write32(buffer, 0xAAAA_AAAA);
     let priority_class = call("NtQueryInformationProcess", u64::MAX, 18, buffer, 2) == 0 && guest::read32(info) == 2 && guest::read8(buffer) == 0 && guest::read8(buffer + 1) == current.priority_class.get() && guest::read16(buffer + 2) == 0xAAAA && call("NtQueryInformationProcess", u64::MAX, 18, buffer, 4) == 0xC000_0004;
     assert(priority_class, "usercore: ProcessPriorityClass consultada");
+    // ProcessEnergyTrackingState sem o estimador de energia e
+    // ProcessSubsystemProcess só pelo processo mestre da sessão.
+    let energy = call("NtSetInformationProcess", u64::MAX, 82, buffer, 4) == 0xC000_0004 && call("NtSetInformationProcess", u64::MAX, 82, buffer, 0x90) == 0xC000_00BB;
+    let (master, saved_flags3) = (current.vm.instance.flags.session_master() != 0, current.flags3.get());
+    let subsystem = call("NtSetInformationProcess", u64::MAX, 68, 0, 0);
+    let subsystem_ok = if master { subsystem == 0 && current.flags3.get() & 0x40 != 0 } else { subsystem == 0xC000_0061 && current.flags3.get() == saved_flags3 };
+    current.flags3.set(saved_flags3);
+    assert(energy && subsystem_ok, "usercore: ProcessEnergyTrackingState sem estimador e ProcessSubsystemProcess so do mestre da sessao");
     let cookie = (call("NtQueryInformationProcess", u64::MAX, 36, buffer, 4) == 0).then(|| guest::read32(buffer)).unwrap_or(0);
     assert(cookie != 0 && call("NtQueryInformationProcess", u64::MAX, 36, buffer, 4) == 0 && guest::read32(buffer) == cookie && call("NtQueryInformationProcess", u64::MAX, 31, buffer, 4) == 0 && guest::read32(buffer) == 1, "usercore: cookie estavel e sem depurador");
     assert(call("NtQueryInformationProcess", u64::MAX, 27, buffer, 0x100) == 0 && { let image_name = unsafe { nt::UnicodeString::at(buffer) }; image_name.length.get() > 0 && image_name.buffer.get() == buffer + nt::UnicodeString::SIZE } && call("NtQueryInformationProcess", u64::MAX, 99, buffer, 8) == 0xC000_0003 && call("NtSetInformationProcess", u64::MAX, 99, buffer, 8) == 0xC000_0003, "usercore: nome da imagem e classes invalidas");
