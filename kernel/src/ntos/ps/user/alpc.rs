@@ -711,7 +711,23 @@ fn connect_port(out: u64, name: u64, oa: u64, port_attributes: u64, rsp: u64, re
         return Ok(AV);
     }
     let service = listener.service.clone();
-    let maximum = service.max_message_length().min(0x1000);
+    // AlpcpValidateAndSetPortAttributes de uma porta de cliente: o
+    // MaxMessageLength pedido (de 0x28 a 0xFFFF, senão
+    // STATUS_INVALID_PARAMETER) limitado ao da porta de conexão; sem
+    // ALPC_PORT_ATTRIBUTES, 0x200, também limitado. É o máximo das
+    // mensagens da porta, a de conexão inclusive (o TerminalServerRequestThread
+    // do csrss pede 0x4070 à \SmSsWinStationApiPort do lsm.dll, que tem
+    // 0x4070).
+    let listener_maximum = service.max_message_length();
+    let maximum = if port_attributes != 0 {
+        let requested = state::user_struct::<AlpcPortAttributes>(port_attributes)?.max_message_length.probe_get()?;
+        if !(0x28..=0xFFFF).contains(&requested) {
+            return Ok(INVALID);
+        }
+        (requested as u32).min(listener_maximum)
+    } else {
+        listener_maximum.min(0x200)
+    };
     let data = if message != 0 {
         match capture(message, maximum) {
             Ok(data) => data,

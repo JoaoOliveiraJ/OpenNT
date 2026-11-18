@@ -4073,7 +4073,7 @@ struct AlpcTransportService;
 
 impl crate::ntos::alpc::transport::Service for AlpcTransportService {
     fn max_message_length(&self) -> u32 {
-        0x200
+        0x4070
     }
     fn connect(&self, _port: &alloc::sync::Arc<crate::ntos::ob::objects::port::Port>, _data: &[u8], _request: Option<&[u8]>) -> crate::ntos::alpc::transport::Reply {
         crate::ntos::alpc::transport::Reply::Now(crate::ntos::alpc::transport::JobResult { status: 0, data: alloc::vec![0xC0, 0x01], sender: None })
@@ -4095,7 +4095,7 @@ fn user_alpc_transport(assert: Assert) {
     use crate::ntos::ob::objects::port as port_objects;
     use crate::ntos::ps::user::{alpc, memory};
     use core::sync::atomic::Ordering;
-    let Ok(block) = memory::map_user_region(0x2000) else {
+    let Ok(block) = memory::map_user_region(0xA000) else {
         assert(false, "useralpctrn: memoria de usuario");
         return;
     };
@@ -4137,6 +4137,34 @@ fn user_alpc_transport(assert: Assert) {
     let port = port_objects::resolve(handle, "alpc").map(|(_, port)| port);
     assert(connected == Some(0) && port.is_some() && unsafe { nt::PortMessage::at(connection) }.u2.s2.type_.get() == 10 && read(connection + nt::PortMessage::SIZE, 2) == [0xC0, 0x01] && guest::read64(block + 0x1F0) == 42 && receive_attributes.valid_attributes.get() == 0x2000_0000 && unsafe { nt::AlpcContextAttr::at(receive + nt::AlpcMessageAttributes::SIZE) }.port_context.get() == handle, "useralpctrn: conexao com resposta e contexto da porta");
     let Some(port) = port else { return };
+    // O MaxMessageLength da porta do cliente (AlpcpValidateAndSetPortAttributes):
+    // sem atributos, 0x200; com eles, o pedido (de 0x28 a 0xFFFF) limitado ao
+    // da porta de conexão, sem teto de 0x1000. Uma troca síncrona de 0x4070
+    // bytes, como a do csrss com a \SmSsWinStationApiPort do lsm.dll.
+    let port_attributes = block + 0x600;
+    let attributes_of = |maximum: u64| {
+        guest::write_bytes(port_attributes, &[0u8; nt::AlpcPortAttributes::SIZE as usize]);
+        unsafe { nt::AlpcPortAttributes::at(port_attributes) }.max_message_length.set(maximum);
+    };
+    attributes_of(0x4070);
+    stack(&[0, 0, 0, 0, 0, 0]);
+    let large = call("NtAlpcConnectPort", block + 0x20, name, 0, port_attributes);
+    let large_handle = guest::read64(block + 0x20);
+    let large_maximum = port_objects::resolve(large_handle, "alpc").map(|(_, port)| port.maximum());
+    let (big_input, big_output, big_length) = (block + 0x1000, block + 0x5400, block + 0x9F00);
+    let payload: alloc::vec::Vec<u8> = (0..0x4048u32).map(|index| index as u8).collect();
+    message(big_input, &payload);
+    guest::write64(big_length, 0x4070);
+    stack(&[big_output, big_length, 0, 0]);
+    let big_exchange = call("NtAlpcSendWaitReceivePort", large_handle, 0x2_0000, big_input, 0);
+    let big_reply = (unsafe { nt::PortMessage::at(big_output) }.u1.s1.total_length.get(), guest::read8(big_output + nt::PortMessage::SIZE), guest::read8(big_output + nt::PortMessage::SIZE + 0x4047));
+    let _ = call("NtClose", large_handle, 0, 0, 0);
+    stack(&[0, 0, 0, 0, 0, 0]);
+    attributes_of(0x20);
+    let too_small = call("NtAlpcConnectPort", block + 0x20, name, 0, port_attributes);
+    attributes_of(0x1_0000);
+    let too_large = call("NtAlpcConnectPort", block + 0x20, name, 0, port_attributes);
+    assert(port.maximum() == 0x200 && large == Some(0) && large_maximum == Some(0x4070) && big_exchange == Some(0) && big_reply == (0x4070, 0x47, 0) && too_small == Some(0xC000_000D) && too_large == Some(0xC000_000D), "useralpctrn: MaxMessageLength da porta do cliente pelos atributos, limitado ao da porta de conexao, e troca de 0x4070 bytes");
     unicode(name, block + 0x40, "\\RPC Control\\NaoExiste");
     let missing = call("NtAlpcConnectPort", block + 0x18, name, 0, 0);
     unicode(name, block + 0x40, path);
