@@ -28,6 +28,13 @@
 //! [rpc] \RPC Control\exemplo pid 612 <- 640 LPC_REPLY(0x2) id 4 atrib 0x0 lrpc falha 0x5 (01234567-89ab-cdef-0123-456789abcdef v1.0 opnum 7)
 //! ```
 //!
+//! Cada mensagem que uma thread do servidor tira da fila também sai numa
+//! linha com o `pid:tid` de quem a recebeu ([`received`]):
+//!
+//! ```text
+//! [rpc] \RPC Control\exemplo id 4 recebido por 640:652
+//! ```
+//!
 //! O rastro só observa: não muda mensagem, status nem estado do ALPC. Sem a
 //! opção, cada ponto de envio só lê [`enabled`]; o estado daqui (os nomes das
 //! portas, os binds e os pedidos à espera de resposta) só existe com ela.
@@ -192,6 +199,15 @@ pub fn connection_decided(listener: u64, client: u64, server: u64, id: u32, stat
     let name = STATE.lock().names.get(&listener).cloned().unwrap_or_else(|| String::from("(sem nome)"));
     let verdict = if status == 0 { "aceita" } else { "recusada" };
     crate::debug_print!("[rpc] {} pid {} <- {} conexao {} id {} status {:#x}", name, client, server, verdict, id, status);
+}
+
+/// O servidor tirou da fila da porta de conexão `listener` a mensagem `id`:
+/// o `pid:tid` da thread do servidor que a recebeu. Separa a mensagem que
+/// nunca chegou ao servidor da que chegou a uma thread dele e ficou sem
+/// resposta.
+pub fn received(listener: u64, id: u32, pid: u64, tid: u64) {
+    let name = STATE.lock().names.get(&listener).cloned().unwrap_or_else(|| String::from("(sem nome)"));
+    crate::debug_print!("[rpc] {} id {} recebido por {}:{}", name, id, pid, tid);
 }
 
 /// O nome do Type de um PORT_MESSAGE (o byte baixo).

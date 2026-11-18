@@ -866,6 +866,12 @@ fn receive_one(server: &UserServer, buffer: &Buffer, attributes: u64, options: R
             origin.received = true;
         }
         drop(state);
+        // Quem recebeu a mensagem (a sondagem da espera roda no contexto da
+        // thread que espera, então a thread corrente é a receptora).
+        if rpc_trace::enabled() {
+            let receiver = current_sender();
+            rpc_trace::received(server.listener.pointer, delivery.id, receiver.process, receiver.thread);
+        }
         if options.port_context != 0 && guest::try_write::<u64>(options.port_context, delivery.port_context).is_err() {
             return Some(STATUS_ACCESS_VIOLATION);
         }
