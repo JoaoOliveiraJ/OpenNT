@@ -373,6 +373,17 @@ fn process_started(process: u64) -> bool {
     process_state::get(process).is_some_and(|state| state.started.load(Ordering::Acquire))
 }
 
+/// PspInsertThread 0x6c1f1d..0x6c2043: com ProcessDelete (PspTerminateProcess
+/// 0x707544) ou ProcessSelfDelete (NtTerminateProcess 0x707473) uma thread de
+/// usuário nova não entra no processo: STATUS_PROCESS_IS_TERMINATING. Aqui:
+/// o fim pedido (EXITING) ou o registro já saindo ou terminado.
+fn process_terminating(process: u64) -> bool {
+    use crate::ntos::inc::types::Eprocess;
+    // SAFETY: o EPROCESS do processo corrente, vivo durante a criação.
+    let flags = unsafe { Eprocess::at(process) }.flags.get();
+    flags & (Eprocess::PROCESS_DELETE_MASK | Eprocess::PROCESS_SELF_DELETE_MASK) != 0 || exit_pending(process) || process::with_record(process, |record| record.exiting || record.terminated) == Some(true)
+}
+
 pub fn find_by_id(id: u64) -> Option<Arc<UserThread>> {
     THREADS.lock().iter().find(|thread| thread.thread_id == id).cloned()
 }
@@ -1714,6 +1725,9 @@ pub fn create_user_thread(request: &CreateRequest) -> Result<Arc<UserThread>, u3
     if !current_process_started() || !probe_user_read(request.start, 1) {
         return Err(0xC000_0005);
     }
+    if process_terminating(process::get_current_process()) {
+        return Err(0xC000_010A);
+    }
     // A PEB e o PID são do processo corrente (o EPROCESS).
     let (peb, process_id) = (state::current_peb(), state::current_process_id());
     let (exports, ntdll_base) = state::with(|state| {
@@ -1799,11 +1813,15 @@ pub fn create_user_thread(request: &CreateRequest) -> Result<Arc<UserThread>, u3
         process::describe_thread(thread_pointer, None, false);
         process::set_thread_start(thread_pointer, request.start);
         push(thread.clone());
-        if attach_scheduling(&thread).is_err() {
+        // O begin_exit registra o EXITING antes de percorrer as threads: um
+        // pedido de fim que chega entre a primeira checagem e o push aparece
+        // aqui (o lugar da trava do processo do PspInsertThread, para SMP).
+        let terminating = process_terminating(process_pointer);
+        if terminating || attach_scheduling(&thread).is_err() {
             remove(&thread);
             process::remove_thread(process_pointer);
             regions = thread.with(|thread| thread.regions.take().unwrap_or_default());
-            return Err(0xC000_0017);
+            return Err(if terminating { 0xC000_010A } else { 0xC000_0017 });
         }
         let _ = process::notify_thread_created(thread_pointer);
         crate::debug_print!("[thread] created tid={} start={:#x} flags={:#x} teb={:#x}", id, request.start, request.flags, teb);

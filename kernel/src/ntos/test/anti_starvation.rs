@@ -145,6 +145,20 @@ fn run_in(assert: Assert, test: &TestProcess) {
         let _ = call("NtClose", handle, 0, 0, 0);
         threads::release_execution_resources(thread);
     }
+
+    // PspInsertThread (0x6c1f1d..0x6c2043): um processo com o fim pedido não
+    // aceita threads novas (STATUS_PROCESS_IS_TERMINATING); sem o pedido,
+    // aceita.
+    let requested = threads::begin_exit(test.process, 0x1234);
+    let refused = call("NtCreateThreadEx", out, 0x1F_FFFF, 0, u64::MAX) == 0xC000_010A;
+    threads::end_exit(test.process);
+    let accepted = create();
+    if let Some((handle, thread)) = &accepted {
+        let _ = call("NtTerminateThread", *handle, 0, 0, 0);
+        let _ = call("NtClose", *handle, 0, 0, 0);
+        threads::release_execution_resources(thread);
+    }
+    assert(requested && refused && accepted.is_some(), "criacao: com o fim do processo pedido o NtCreateThreadEx da STATUS_PROCESS_IS_TERMINATING");
     threads::set_running(false, None);
     if baseline == 0 {
         process::remove_thread(process_pointer);

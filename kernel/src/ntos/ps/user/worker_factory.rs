@@ -102,8 +102,11 @@ fn remove_worker(factory: &Factory, thread: &Arc<UserThread>) {
     dereference(factory);
 }
 
+/// A fábrica só cria threads num processo sem fim pedido: senão o
+/// PspInsertThread recusa (STATUS_PROCESS_IS_TERMINATING) e a fábrica para
+/// com esse LastThreadCreationStatus.
 fn usable(process_pointer: u64) -> bool {
-    process::with_record(process_pointer, |record| !record.exiting && !record.terminated).unwrap_or(false)
+    process::with_record(process_pointer, |record| !record.exiting && !record.terminated).unwrap_or(false) && !threads::exit_pending(process_pointer)
 }
 
 /// CREATE_SUSPENDED e LoaderWorker do RtlpCreateUserThreadEx.
