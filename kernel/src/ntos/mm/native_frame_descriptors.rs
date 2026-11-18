@@ -33,6 +33,39 @@ pub struct Reference {
     pub cache_attribute: u8,
 }
 
+/// As referências de um frame com aliases, em ordem de endereço físico da
+/// entrada (um vetor compacto: a maioria dos frames tem poucas).
+#[derive(Default)]
+struct References(Vec<Reference>);
+
+impl References {
+    fn position(&self, physical_address: u64) -> Result<usize, usize> {
+        self.0.binary_search_by_key(&physical_address, |reference| reference.physical_address)
+    }
+
+    fn contains(&self, physical_address: u64) -> bool {
+        self.position(physical_address).is_ok()
+    }
+
+    /// Insere ou troca a referência da mesma entrada.
+    fn insert(&mut self, reference: Reference) {
+        match self.position(reference.physical_address) {
+            Ok(index) => self.0[index] = reference,
+            Err(index) => self.0.insert(index, reference),
+        }
+    }
+
+    fn remove(&mut self, physical_address: u64) -> bool {
+        match self.position(physical_address) {
+            Ok(index) => {
+                self.0.remove(index);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
 struct Descriptors {
     physical_base: u64,
     virtual_base: u64,
@@ -41,7 +74,7 @@ struct Descriptors {
     last_free_frame: u64,
     free_frame_count: u64,
     /// Só frames com aliases adicionais guardam referências fora do descritor.
-    additional_references: BTreeMap<u64, BTreeMap<u64, Reference>>,
+    additional_references: BTreeMap<u64, References>,
     primary_table_frames: BTreeSet<u64>,
 }
 
@@ -163,8 +196,8 @@ impl Descriptors {
         }
         let primary = self.primary_reference(frame_number, address);
         if let Some(references) = self.additional_references.get_mut(&frame_number) {
-            if references.contains_key(&reference.physical_address) {
-                references.insert(reference.physical_address, *reference);
+            if references.contains(reference.physical_address) {
+                references.insert(*reference);
             }
         }
         if primary.physical_address == reference.physical_address {
@@ -341,12 +374,12 @@ pub fn add_reference(frame_number: u64, reference: Reference) {
         let references = state
             .additional_references
             .entry(frame_number)
-            .or_insert_with(|| BTreeMap::from([(primary.physical_address, primary)]));
-        if references.contains_key(&reference.physical_address) {
+            .or_insert_with(|| References(alloc::vec![primary]));
+        if references.contains(reference.physical_address) {
             state.refresh_reference(frame_number, &reference);
             return;
         }
-        references.insert(reference.physical_address, reference);
+        references.insert(reference);
         if reference.table_page && !primary.table_page {
             state.publish_primary(frame_number, address, &reference);
         }
@@ -371,13 +404,13 @@ pub fn remove_reference(frame_number: u64, entry_physical_address: u64) {
         state.primary_table_frames.remove(&frame_number);
     } else {
         let references = state.additional_references.get_mut(&frame_number).expect("PFN alias missing");
-        assert!(references.remove(&entry_physical_address).is_some(), "PFN alias missing");
+        assert!(references.remove(entry_physical_address), "PFN alias missing");
         let replacement = if primary.physical_address == entry_physical_address {
-            references.values().find(|item| item.table_page).or_else(|| references.values().next()).copied()
+            references.0.iter().find(|item| item.table_page).or_else(|| references.0.first()).copied()
         } else {
             None
         };
-        let last = references.len() == 1;
+        let last = references.0.len() == 1;
         if let Some(replacement) = replacement {
             state.publish_primary(frame_number, address, &replacement);
         }
