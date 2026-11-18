@@ -1411,6 +1411,30 @@ truncado para 32 bits falta. O teste
 o pool, IRPs, MDLs e os DRIVER_OBJECTs/DEVICE_OBJECTs vivos, inclusive os dos
 drivers reais.
 
+**Censo do heap.** Cada bloco ocupado do `kmalloc` guarda no cabeçalho o
+índice do local que o pediu (`hal/heap_census.rs`): a cadeia de até oito
+endereços de retorno, lida pelos frame pointers só dentro da pilha de kernel
+corrente (StackLimit..StackBase da KTHREAD ou a pilha de boot). A tabela dos
+locais fica em frames fixos fora do heap (`KERNEL_HEAP_CENSUS_PHYS`, 2 MB,
+pelo mapa direto) e soma, por local, os bytes e blocos vivos e as alocações
+feitas; só é tocada com o lock do heap. O censo vai para a serial
+(`[heap-census]`) na falha do heap e, com `--heap-census` (a opção de carga
+HEAPCENSUS), a cada 4 MB a mais de uso; `cargo xtask heap-census` dá os nomes
+pelos símbolos do kernel.elf do build e soma os locais por função, e o
+test-boot que falha com um censo na serial imprime esse resumo.
+
+O que é grande não passa pelo heap, como no NT nada do tamanho de um arquivo
+passa pelo pool: a seção de imagem lê as seções do PE do disco direto para
+os frames protótipo da control area (também quando o arquivo vem de um
+FILE_OBJECT de usuário; sem cópia direta, uma página por vez), o cache de
+leitura dos arquivos do volume guarda os blocos em frames do PFN, os bins das
+hives ficam em páginas do VirtualAlloc de kernel (o papel do pool paginado),
+a ntdll de sistema vai do volume para os frames e as notificações a leem do
+arquivo, e os arquivos embutidos ficam no RAMFS por referência. Os nós do
+Registro compartilham o descritor de segurança entre as chaves com o mesmo
+descritor e não guardam cópias dos nomes em minúsculas (um hash por
+subchave).
+
 **Raízes e metade de sistema congelada.** Como no NT, a metade de sistema é
 a mesma em todo espaço de endereçamento, e é compartilhada pelas entradas da
 PML4:
@@ -4822,7 +4846,7 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   `--build-dir`). Cada execução tem a pasta `build/test-all/<id>` (`<id>.<n>`
   com `--repeat`). As opções de boot dos testes (`--kernel-test-scope`,
   `--start-driver`, `--kd`, `--initial-process`, `--storage`, `--display`,
-  `--pnp-root`, `--usb`, `--tpm`, `--trace-driver-api`, `--trace-rpc`, `--console-mirror`) não entram no
+  `--pnp-root`, `--usb`, `--tpm`, `--trace-driver-api`, `--trace-rpc`, `--heap-census`, `--console-mirror`) não entram no
   build: vão no bloco de opções de carga da imagem de boot (abaixo), então
   a rodada inteira compila um kernel só. Uma thread monta as imagens
   (`test-boot --build-only`) uma vez por chave de imagem
