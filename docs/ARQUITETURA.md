@@ -914,7 +914,14 @@ STATUS_OBJECT_TYPE_MISMATCH) e só então espera; a CPU de usuário é do
 serviço até a espera ser instalada, então o par é atômico. O
 NtAlertThreadByThreadId recusa a thread de outro processo (o KTHREAD.Process
 dela contra o da corrente) com STATUS_ACCESS_DENIED, sem deixar o alerta
-pendente. O autoteste
+pendente. As esperas de modo usuário gravam na KTHREAD o que o
+KiCommitThreadWait grava (WaitMode UserMode, Alertable, WaitReason e
+WaitTime; o State Waiting vem do despacho): WrAlertByThreadId,
+DelayExecution, WrQueue (portas de conclusão e worker factory),
+UserRequest (esperas de objeto) ou Executive; o SystemProcessInformation
+dá o ThreadState e o WaitReason da KTHREAD. A APC especial de usuário
+entra no começo da lista de usuário (o KiInsertQueueApc): sai antes das
+normais e, entre as especiais, a mais nova primeiro. O autoteste
 `ntos/test/multiprocess/blocking_wait.rs` roda duas threads de um processo
 real no despachante: a 1 espera um KEVENT sem prazo numa syscall de teste e
 a 2, que só fica pronta depois disso, a vê bloqueada (Waiting, KernelStack
@@ -3633,7 +3640,21 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   NtQueryVolumeInformationFile passa pelo I/O Manager
   (`io/file/irp_service.rs`): ele mesmo responde a FileFsDeviceInformation
   (o GetFileType de um pipe) e a FileFsDriverPathInformation, e manda as
-  outras classes ao driver em IRP_MJ_QUERY_VOLUME_INFORMATION. O
+  outras classes ao driver em IRP_MJ_QUERY_VOLUME_INFORMATION. Para a
+  etapa da tela de logon também respondem como no 19041: a
+  SystemRecommendedSharedDataAlignment (58, o KeLargestCacheLine; o
+  CoreMessaging.dll encerra o processo por FailFast sem ela), a
+  SystemSecureBootInformation (145, os dois BOOLEAN FALSE no boot BIOS), a
+  ProcessPriorityClass de consulta (18, o GetPriorityClass do XAML), a
+  ThreadCycleTime (23, o agendador de quadros do dwmcore), a
+  ThreadNameInformation (38, o SetThreadDescription das threads do dwm,
+  num bloco próprio no ETHREAD.ThreadName), a ProcessSubsystemProcess (68,
+  só do processo mestre da sessão) e a ProcessEnergyTrackingState (82,
+  STATUS_NOT_SUPPORTED sem o estimador de energia). A linha
+  `[usermode] pid:tid X FALHOU` traz o chamador do stub da ntdll, o nome da
+  porta nas falhas de conexão ALPC/LPC (inclusive
+  STATUS_OBJECT_NAME_NOT_FOUND) e o código das falhas de
+  NtDeviceIoControlFile/NtFsControlFile. O
   ProductPolicy do licenciamento é capturado quando a hive SYSTEM é ligada
   (o CmGetSystemControlValues, `cm/hive_init.rs`) e publicado logo depois,
   antes do primeiro driver (`init/phase1.rs`). Um NtCreateKey com
