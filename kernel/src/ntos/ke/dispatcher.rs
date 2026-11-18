@@ -396,10 +396,14 @@ pub fn wait_for_single_object(object: u64, timeout_pointer: u64, wait_mode: u8, 
         return wait::wait_for_objects(&[object], false, wait::Deadline::after(timeout_to_100ns(timeout_pointer)), wait_mode, alertable, wait::reason::EXECUTIVE);
     }
     let (timeout, deadline) = deadline(timeout_pointer);
-    let mut poll = || acquire_status(object, true).or_else(|| expired(timeout, deadline).then_some(STATUS_TIMEOUT));
     if alertable {
+        let mut poll = || acquire_status(object, true).or_else(|| expired(timeout, deadline).then_some(STATUS_TIMEOUT));
         return thread_alert::cooperate(process::get_current_thread(), wait_mode, true, &mut poll, pump_kernel);
     }
+    // Não alertável: uma espera de UserMode ainda sai com UserApcPending (o
+    // KiCheckAlertability), como a da thread de kernel em `ke::wait`.
+    let thread = process::get_current_thread();
+    let mut poll = || thread_alert::consume(thread, wait_mode, false).or_else(|| acquire_status(object, true)).or_else(|| expired(timeout, deadline).then_some(STATUS_TIMEOUT));
     context_switch::wait_until(&mut poll, pump_kernel)
 }
 
@@ -447,9 +451,11 @@ pub fn wait_for_multiple_objects(count: u32, objects_pointer: u64, wait_type: u3
         return wait::wait_for_objects(&objects, wait_type == 0, wait::Deadline::after(timeout_to_100ns(timeout_pointer)), wait_mode, alertable, wait::reason::EXECUTIVE);
     }
     let (timeout, deadline) = deadline(timeout_pointer);
-    let mut poll = || try_wait_objects(&objects, wait_type).or_else(|| expired(timeout, deadline).then_some(STATUS_TIMEOUT));
     if alertable {
+        let mut poll = || try_wait_objects(&objects, wait_type).or_else(|| expired(timeout, deadline).then_some(STATUS_TIMEOUT));
         return thread_alert::cooperate(process::get_current_thread(), wait_mode, true, &mut poll, pump_kernel);
     }
+    let thread = process::get_current_thread();
+    let mut poll = || thread_alert::consume(thread, wait_mode, false).or_else(|| try_wait_objects(&objects, wait_type)).or_else(|| expired(timeout, deadline).then_some(STATUS_TIMEOUT));
     context_switch::wait_until(&mut poll, pump_kernel)
 }

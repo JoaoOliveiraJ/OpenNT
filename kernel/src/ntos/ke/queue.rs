@@ -285,10 +285,13 @@ pub fn remove_entries(queue: &Kqueue, timeout_pointer: u64, count: u32, wait_mod
     let status = match attempt(false) {
         Some(status) => status,
         None => {
-            let mut poll = || attempt(true);
             if alertable {
+                let mut poll = || attempt(true);
                 thread_alert::cooperate(address, wait_mode, true, &mut poll, dispatcher::pump_kernel)
             } else {
+                // Não alertável de UserMode: sai com UserApcPending (o
+                // KiCheckAlertability).
+                let mut poll = || thread_alert::consume(address, wait_mode, false).or_else(|| attempt(true));
                 context_switch::wait_until(&mut poll, dispatcher::pump_kernel)
             }
         }

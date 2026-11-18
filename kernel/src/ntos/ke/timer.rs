@@ -209,7 +209,10 @@ pub fn delay_execution_thread(interval_pointer: u64, wait_mode: u8, alertable: b
     // Uma volta do pump antes da primeira consulta: um atraso nulo ainda
     // entrega o trabalho pendente.
     throttled_delay_pump();
-    Ok(super::context_switch::wait_until(&mut || expired().then_some(0), throttled_delay_pump))
+    // Não alertável de UserMode: sai com UserApcPending (o
+    // KiCheckAlertability).
+    let thread = process::get_current_thread();
+    Ok(super::context_switch::wait_until(&mut || thread_alert::consume(thread, wait_mode, false).or_else(|| expired().then_some(0)), throttled_delay_pump))
 }
 
 pub fn pending_count() -> usize {

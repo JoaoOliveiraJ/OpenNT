@@ -94,7 +94,8 @@ pub fn alert(thread: u64, mode: u8) -> Result<u8, KernelError> {
 /// A ordem de KeWaitForSingleObject: alerta do modo pedido, APC de
 /// usuário enfileirada (publica UserApcPending) e alerta de kernel;
 /// sem Alertable, só a pendência já publicada interrompe uma espera
-/// de UserMode.
+/// de UserMode (o TestForAlertPending do KiCheckAlertability: é assim que
+/// a APC de término tira uma thread de qualquer espera de UserMode).
 pub fn consume(thread: u64, wait_mode: u8, alertable: bool) -> Option<u32> {
     if !alertable && wait_mode == 0 {
         return None;
@@ -110,9 +111,13 @@ pub fn consume(thread: u64, wait_mode: u8, alertable: bool) -> Option<u32> {
             selected.set(0);
             return Some(STATUS_ALERTED);
         }
-        // ApcListHead[UserMode] não vazia: UserApcPending por CAS no byte.
+        // ApcListHead[UserMode] não vazia: UserApcPending por CAS no byte. A
+        // APC de término do 19041 é uma APC de usuário na cabeça dessa fila,
+        // posta pelo KiInsertQueueApc já com UserApcPending; aqui ela é só a
+        // pendência publicada (`ps::user::threads::request_termination`), que
+        // a entrega limpa.
         let user_queue = &apc_state.apc_list_head[1];
-        if wait_mode != 0 && user_queue.flink.get() != user_queue.address() {
+        if wait_mode != 0 && (user_queue.flink.get() != user_queue.address() || apc_state.user_apc_pending() != 0) {
             apc_state.set_user_apc_pending(1);
             return Some(STATUS_USER_APC);
         }
