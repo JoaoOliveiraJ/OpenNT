@@ -80,12 +80,18 @@ const DISPATCHER_TYPES: [&str; 8] = ["Event", "Semaphore", "Mutant", "Timer", "I
 /// ObpGetWaitObject: o objeto de despacho de uma espera no corpo `pointer`
 /// do tipo `type_name` (o pacote de espera de um IoCompletion espera nele):
 /// o FILE_OBJECT.Event de um arquivo, o próprio corpo dos
-/// [`DISPATCHER_TYPES`] e a KQUEUE do IoCompletion, ou `None` para os tipos
-/// que esperam no ObpDefaultObject.
+/// [`DISPATCHER_TYPES`], a KQUEUE do IoCompletion e, numa porta ALPC, o
+/// objeto do DefaultObject indireto (o semáforo de uma porta esperável, que
+/// cada mensagem na fila libera, ou o AlpcpDummyEvent sinalizado: o
+/// registrador do CoreMessaging e os clientes dele esperam as portas assim),
+/// ou `None` para os tipos que esperam no ObpDefaultObject.
 pub fn wait_object_of(pointer: u64, type_name: &str) -> Option<u64> {
     if type_name == "File" {
         // SAFETY: FILE_OBJECT vivo, retido pelo chamador.
         return Some(unsafe { FileObject::at(pointer) }.event.address());
+    }
+    if type_name == "ALPC Port" {
+        return crate::ntos::ob::objects::port::port_of(pointer).map(|port| port.wait_target()).filter(|&target| target != 0);
     }
     (DISPATCHER_TYPES.contains(&type_name) || type_name == "IoCompletion").then_some(pointer)
 }
@@ -129,6 +135,13 @@ fn target_of(type_name: &str, pointer: u64) -> WaitTarget {
         // SAFETY: FILE_OBJECT vivo, retido por quem resolveu o handle.
         "File" => WaitTarget::Header(unsafe { FileObject::at(pointer) }.event.address()),
         "IoCompletion" => WaitTarget::Queue(pointer),
+        // DefaultObject indireto (0xF9): o KSEMAPHORE de uma porta esperável
+        // (NtCreateWaitablePort, WAITABLE_PORT); nas outras portas o
+        // AlpcpDummyEvent, sinalizado.
+        "ALPC Port" => match crate::ntos::ob::objects::port::port_of(pointer).map(|port| port.wait_target()) {
+            Some(target) if target != 0 => WaitTarget::Header(target),
+            _ => WaitTarget::Default,
+        },
         name if DISPATCHER_TYPES.contains(&name) => WaitTarget::Header(pointer),
         _ => WaitTarget::Default,
     }

@@ -438,6 +438,11 @@ fn connect(shared: &Shared, transferred: &mut bool, pointers: [u64; 10], flags: 
         connection.port = Some(port.clone());
         connection.body_held = true;
     }
+    // AlpcpCreateClientPort: ALPC_PORFLG_WAITABLE_PORT dá à porta do cliente
+    // o semáforo em que a espera pelo handle dela fica.
+    if parameters.port_flags & 0x4_0000 != 0 && !port.make_waitable() {
+        return completed(0xC000_009A);
+    }
     if process::thread_record(server.thread).is_none() {
         return completed(0xC000_0037);
     }

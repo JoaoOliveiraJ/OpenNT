@@ -4346,7 +4346,7 @@ fn user_alpc_zw_group(assert: Assert) {
     let unsupported = zw("ZwAlpcSetInformation", &[handle, 1, input, 8]);
     unsafe { nt::PortMessage::at(input) }.message_id.set(0);
     let no_message = zw("ZwAlpcQueryInformationMessage", &[handle, input, 0, output, 64, 0]);
-    assert(basic == Some(0) && unsafe { nt::AlpcBasicInformation::at(output) }.sequence_no.get() == port.sequence() && guest::read32(block + 0x480) == 16 && unsupported == Some(0xC000_00BB) && no_message == Some(0xC000_000D), "zwalpc: consultas e set-information");
+    assert(basic == Some(0) && unsafe { nt::AlpcBasicInformation::at(output) }.sequence_no.get() == port.sequence() && guest::read32(block + 0x480) == 16 && unsupported == Some(0xC000_0004) && no_message == Some(0xC000_000D), "zwalpc: consultas e set-information");
     // Recursos: contexto, reserva, seção e vista.
     let attribute = block + 0x500;
     let security_attribute = unsafe { nt::AlpcSecurityAttr::at(attribute) };

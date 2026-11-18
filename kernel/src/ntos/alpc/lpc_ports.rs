@@ -31,7 +31,8 @@
 //! - NtRequestPort e NtRequestWaitReplyPort ([`request`],
 //!   [`request_wait_reply`]): o envio do cliente pelo transporte ALPC (o
 //!   AlpcpSendMessage com 0x10000, o AlpcpProcessSynchronousRequest com
-//!   0x20000), com os status internos do ALPC trocados pelos do LPC;
+//!   0x20000), com os status internos do ALPC trocados pelos do LPC; do lado
+//!   servidor, a mensagem nova do servidor (`alpc/server.rs`);
 //! - NtImpersonateClientOfPort e NtAlpcImpersonateClientOfPort
 //!   ([`impersonate_client`]): o nível pedido nas Flags, a mensagem já
 //!   recebida e sem LPC_NO_IMPERSONATE, o contexto de segurança que ela
@@ -470,10 +471,14 @@ pub fn reply_wait_receive(handle: u64, port_context: u64, reply: u64, receive: u
             if server::owns(port) {
                 return server::receive_legacy(port, reply, receive, port_context, timeout, false);
             }
-            // A porta de um cliente: a fila dele (as mensagens que o servidor
-            // manda por iniciativa própria); responder daqui não existe.
+            // A porta de um cliente: a resposta a uma mensagem que o servidor
+            // mandou a ele, depois a fila dele (as mensagens novas do
+            // servidor).
             if reply != 0 {
-                return Ok(STATUS_REPLY_MESSAGE_MISMATCH);
+                let status = client_reply(port, reply)?;
+                if status != STATUS_SUCCESS {
+                    return Ok(status);
+                }
             }
             if port_context != 0 {
                 if !state::probe_user_write(port_context, 8) {
@@ -503,16 +508,29 @@ pub fn listen(handle: u64, message: u64) -> Result<u32, KernelError> {
     })
 }
 
-/// NtReplyPort(PortHandle, ReplyMessage).
+/// NtReplyPort(PortHandle, ReplyMessage). Na porta de um cliente, a
+/// resposta a uma mensagem que o servidor mandou a ele ([`client_reply`]).
 pub fn reply(handle: u64, message: u64) -> Result<u32, KernelError> {
     state::guarded(|| {
         with_port(handle, PORT_CONNECT, |port| {
             if !server::owns(port) {
-                return Ok(STATUS_REPLY_MESSAGE_MISMATCH);
+                return client_reply(port, message);
             }
             Ok(server::reply_legacy(port, message))
         })
     })
+}
+
+/// A resposta do cliente, pelo MessageId, a uma mensagem nova do servidor
+/// (o callback LPC); sem essa mensagem, STATUS_REPLY_MESSAGE_MISMATCH.
+fn client_reply(port: &Arc<Port>, message: u64) -> Result<u32, KernelError> {
+    let captured = match crate::ntos::alpc::message::buffer::capture_message_with(message, port.maximum().max(PortMessage::SIZE as u32), 1, true) {
+        Ok(captured) => captured,
+        Err(status) => return Ok(status),
+    };
+    let at = core::mem::offset_of!(PortMessage, message_id);
+    let id = u32::from_le_bytes([captured.header[at], captured.header[at + 1], captured.header[at + 2], captured.header[at + 3]]);
+    Ok(server::reply_from_client(port, id, captured.data).unwrap_or(STATUS_REPLY_MESSAGE_MISMATCH))
 }
 
 /// NtAcceptConnectPort(PortHandle*, PortContext, ConnectionRequest,
@@ -617,21 +635,24 @@ fn exchange(port: &Arc<Port>, flags: u32, input: u64, receive: ReceiveArguments)
     })
 }
 
-/// NtRequestPort(PortHandle, RequestMessage): o datagrama (LPC_DATAGRAM).
+/// NtRequestPort(PortHandle, RequestMessage): o datagrama (LPC_DATAGRAM). Do
+/// lado servidor é a mensagem nova do servidor (na própria porta de conexão,
+/// ou ao cliente de uma porta de comunicação).
 pub fn request(handle: u64, message: u64) -> Result<u32, KernelError> {
+    let none = ReceiveArguments { output: 0, length: 0, receive_attributes: 0, timeout: 0 };
     state::guarded(|| {
         with_port(handle, PORT_CONNECT, |port| {
             if server::owns(port) {
-                crate::debug_print!("[lpc] NtRequestPort do lado servidor sem suporte");
-                return Ok(STATUS_NOT_SUPPORTED);
+                return server::exchange(port, RELEASE_MESSAGE, message, 0, none);
             }
-            exchange(port, RELEASE_MESSAGE, message, ReceiveArguments { output: 0, length: 0, receive_attributes: 0, timeout: 0 })
+            exchange(port, RELEASE_MESSAGE, message, none)
         })
     })
 }
 
 /// NtRequestWaitReplyPort(PortHandle, RequestMessage, ReplyMessage): o
-/// pedido síncrono (LPC_REQUEST) e a resposta no mesmo serviço.
+/// pedido síncrono (LPC_REQUEST) e a resposta no mesmo serviço. Do lado
+/// servidor é a mensagem nova síncrona do servidor.
 pub fn request_wait_reply(handle: u64, request: u64, reply: u64) -> Result<u32, KernelError> {
     state::guarded(|| {
         with_port(handle, PORT_CONNECT, |port| {
@@ -639,11 +660,11 @@ pub fn request_wait_reply(handle: u64, request: u64, reply: u64) -> Result<u32, 
             if status != 0 {
                 return Ok(status);
             }
+            let receive = ReceiveArguments { output: reply, length: 0, receive_attributes: 0, timeout: 0 };
             if server::owns(port) {
-                crate::debug_print!("[lpc] NtRequestWaitReplyPort do lado servidor sem suporte");
-                return Ok(STATUS_NOT_SUPPORTED);
+                return server::exchange(port, SYNC_REQUEST, request, 0, receive).map(legacy_status);
             }
-            exchange(port, SYNC_REQUEST, request, ReceiveArguments { output: reply, length: 0, receive_attributes: 0, timeout: 0 }).map(legacy_status)
+            exchange(port, SYNC_REQUEST, request, receive).map(legacy_status)
         })
     })
 }

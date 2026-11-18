@@ -4,9 +4,9 @@
 //! handles +8, fechada +0xC, processo +0x10, PID +0x18, TID +0x20, máximo
 //! +0x28, sequência +0x2C, pendentes +0x30, jobs +0x34, bytes reservados
 //! +0x38, reservas +0x3C, vistas +0x40, operações +0x44, conclusão +0x48,
-//! token +0x50, duas bases de vista +0x58/+0x60, iniciada +0x68, limpa +0x6C
-//! e chave de conclusão +0x70). A desconexão conserva filas e recursos; a
-//! limpeza final exige fechamento e o fim das operações.
+//! token +0x50, duas bases de vista +0x58/+0x60, iniciada +0x68, limpa +0x6C,
+//! chave de conclusão +0x70 e objeto de espera +0x78). A desconexão conserva
+//! filas e recursos; a limpeza final exige fechamento e o fim das operações.
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -27,7 +27,7 @@ use crate::ntos::ps::process;
 use crate::ntos::ps::user::state;
 use crate::ntos::se::token::tokens;
 use crate::rtl::{KernelError, SpinLock};
-use crate::ntos::inc::field::{Field, NtStruct, Reserved};
+use crate::ntos::inc::field::{Field, NtStruct};
 use crate::ntos::inc::types::Eprocess;
 use crate::ntos::mm::guest_memory as guest;
 
@@ -55,7 +55,9 @@ struct PortBody {
     started: Field<u32>,
     cleaned: Field<u32>,
     completion_key: Field<u64>,
-    _reserved: Reserved<8>,
+    /// O KSEMAPHORE de uma porta esperável (ALPC_PORT.Semaphore, o
+    /// DefaultObject indireto do tipo ALPC Port); zero nas demais.
+    wait_object: Field<u64>,
 }
 
 // SAFETY: #[repr(C)] só de células.
@@ -68,6 +70,7 @@ const _: () = {
     assert!(core::mem::offset_of!(PortBody, operations) == 0x44);
     assert!(core::mem::offset_of!(PortBody, view_bases) == 0x58);
     assert!(core::mem::offset_of!(PortBody, completion_key) == 0x70);
+    assert!(core::mem::offset_of!(PortBody, wait_object) == 0x78);
 };
 
 pub const SIZE: u64 = PortBody::SIZE;
@@ -225,6 +228,47 @@ impl Port {
     pub fn set_completion_key(&self, key: u64) {
         self.body().completion_key.set(key);
     }
+    /// O KSEMAPHORE de uma porta esperável (zero se não é esperável): a
+    /// espera pelo handle da porta é nele, como no ObpGetWaitObject com o
+    /// DefaultObject indireto (ALPC_PORT+0xF8) do tipo ALPC Port.
+    pub fn wait_object(&self) -> u64 {
+        self.body().wait_object.get()
+    }
+    /// Instala o KSEMAPHORE, que sai junto com o corpo.
+    pub fn set_wait_object(&self, semaphore: u64) {
+        self.body().wait_object.set(semaphore);
+    }
+    /// AlpcpInitializePort de uma porta esperável (ALPC_PORFLG_WAITABLE_PORT
+    /// na criação da porta de conexão ou do cliente): o KSEMAPHORE com
+    /// contagem zero e limite 0x7FFFFFFF. `false` sem memória.
+    pub fn make_waitable(&self) -> bool {
+        let semaphore = guest::alloc_bytes(crate::ntos::inc::types::Ksemaphore::SIZE);
+        if semaphore == 0 {
+            return false;
+        }
+        crate::ntos::ke::dispatcher::initialize_semaphore(semaphore, 0, 0x7FFF_FFFF);
+        self.set_wait_object(semaphore);
+        true
+    }
+    /// Uma mensagem entrou na fila da porta sem IOCP associada: a porta
+    /// esperável libera o semáforo uma vez (o AlpcpCompleteDispatchMessage e
+    /// o AlpcpSignal); nas outras, nada.
+    pub fn signal_waitable(&self) {
+        let semaphore = self.wait_object();
+        if semaphore != 0 {
+            let _ = crate::ntos::ke::dispatcher::release_semaphore(semaphore, 1);
+        }
+    }
+    /// O objeto de espera da porta (o ObpGetWaitObject com o DefaultObject
+    /// indireto 0xF9 do tipo ALPC Port): o semáforo de uma porta esperável,
+    /// senão o AlpcpDummyEvent (sinalizado: a espera conclui de imediato).
+    /// Zero sem memória para o evento.
+    pub fn wait_target(&self) -> u64 {
+        match self.wait_object() {
+            0 => dummy_event(),
+            semaphore => semaphore,
+        }
+    }
     pub fn token(&self) -> u64 {
         *self.token.lock()
     }
@@ -285,6 +329,30 @@ impl Port {
 /// Conexões vivas, para desconectar donos em saída.
 static PORTS: SpinLock<BTreeMap<u64, Arc<Port>>> = SpinLock::new(BTreeMap::new());
 
+/// AlpcpDummyEvent: o KEVENT de notificação, sinalizado desde a criação, que
+/// o AlpcpInitializePort põe no lugar do semáforo das portas não esperáveis
+/// (criado no primeiro uso, nunca liberado).
+static DUMMY_EVENT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn dummy_event() -> u64 {
+    let current = DUMMY_EVENT.load(Ordering::Acquire);
+    if current != 0 {
+        return current;
+    }
+    let event = guest::alloc_bytes(crate::ntos::inc::types::Kevent::SIZE);
+    if event == 0 {
+        return 0;
+    }
+    crate::ntos::ke::dispatcher::initialize_event(event, 0, true);
+    match DUMMY_EVENT.compare_exchange(0, event, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => event,
+        Err(winner) => {
+            guest::free_bytes(event);
+            winner
+        }
+    }
+}
+
 pub fn port_of(pointer: u64) -> Option<Arc<Port>> {
     PORTS.lock().get(&pointer).cloned()
 }
@@ -334,6 +402,13 @@ fn dispose(pointer: u64) {
         port_body(pointer).token.set(0);
     }
     let _ = process::dereference(port.process_pointer);
+    // O semáforo de uma porta esperável vive enquanto o corpo: as esperas
+    // pelo handle retêm o corpo, não o servidor.
+    let semaphore = port.wait_object();
+    if semaphore != 0 {
+        port.set_wait_object(0);
+        guest::free_bytes(semaphore);
+    }
     guest::free_bytes(pointer);
 }
 

@@ -51,8 +51,29 @@
 //! quando ele recebe a conexão com o ALPC_MESSAGE_VIEW_ATTRIBUTE ou a aceita
 //! pedindo o REMOTE_PORT_VIEW).
 //!
-//! As mensagens que o servidor manda por iniciativa própria (MessageId zero)
-//! ainda não existem aqui: STATUS_NOT_SUPPORTED, com registro.
+//! As mensagens que o lado servidor manda por iniciativa própria
+//! ([`classify`], como o AlpcpSendMessage: numa porta LPC o Type zero, nas
+//! outras o MessageId zero) seguem o AlpcpDispatchNewMessage:
+//!
+//! - na porta de conexão, a mensagem vai para a própria fila (o dwm.exe manda
+//!   à DwmApiPort pelo handle duplicado dela; o win32k, pelo LpcRequestPort e
+//!   pelo LpcSendWaitReceivePort), com o PortContext e a sequência da porta
+//!   de conexão;
+//! - numa porta de comunicação, a mensagem vai para a porta do cliente (o
+//!   callback do RPC), que precisa de ALPC_PORFLG_ALLOW_LPC_REQUESTS
+//!   (STATUS_LPC_REQUESTS_NOT_ALLOWED sem ela); o cliente a recebe na fila
+//!   dele e responde pelo MessageId.
+//!
+//! Com ALPC_MSGFLG_RELEASE_MESSAGE é um datagrama; com
+//! ALPC_MSGFLG_SYNC_REQUEST quem envia espera a resposta (o LPC_REPLY no
+//! buffer de recepção); sem as duas, a resposta volta como LPC_REPLY na fila
+//! da porta de conexão. O Type conserva os bits altos que o remetente deu
+//! (o LPC_KERNELMODE_MESSAGE só de modo kernel).
+//!
+//! A porta de conexão esperável (NtCreateWaitablePort, ou WAITABLE_PORT nos
+//! atributos) tem o KSEMAPHORE do AlpcpInitializePort: cada mensagem posta na
+//! fila sem IOCP associada o libera uma vez, e a espera pelo handle da porta
+//! é nele (o DefaultObject indireto do tipo ALPC Port).
 
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -98,9 +119,23 @@ const STATUS_INVALID_CID: u32 = 0xC000_000B;
 const STATUS_REPLY_MESSAGE_MISMATCH: u32 = 0xC000_021F;
 /// O AlpcpLookupMessage sem mensagem com o MessageId pedido.
 const STATUS_INVALID_MESSAGE: u32 = 0xC000_0702;
+const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
+const STATUS_INVALID_PARAMETER_2: u32 = 0xC000_00F0;
+/// STATUS_LPC_RECEIVE_BUFFER_EXPECTED: envio síncrono sem buffer de recepção.
+const STATUS_LPC_RECEIVE_BUFFER_EXPECTED: u32 = 0xC000_0705;
+/// STATUS_LPC_REQUESTS_NOT_ALLOWED: a porta de destino não aceita mensagens
+/// novas (sem ALPC_PORFLG_ALLOW_LPC_REQUESTS).
+const STATUS_LPC_REQUESTS_NOT_ALLOWED: u32 = 0xC000_0707;
+/// ALPC_MSGFLG_RELEASE_MESSAGE e ALPC_MSGFLG_SYNC_REQUEST.
+const RELEASE_MESSAGE: u32 = 0x1_0000;
+const SYNC_REQUEST: u32 = 0x2_0000;
+/// O bit 1 das flags de envio de kernel: o contrato LPC (LpcRequestPort,
+/// LpcSendWaitReceivePort), que admite os tipos de sistema.
+const KERNEL_LPC_SEND: u32 = 2;
 
 /// Tipos de PORT_MESSAGE (o byte baixo de Type).
 const LPC_REQUEST: u16 = 1;
+const LPC_REPLY: u16 = 2;
 const LPC_DATAGRAM: u16 = 3;
 const LPC_PORT_CLOSED: u16 = 5;
 const LPC_CLIENT_DIED: u16 = 6;
@@ -283,6 +318,14 @@ pub struct Origin {
     pub received: bool,
 }
 
+/// A resposta que volta à fila do servidor como LPC_REPLY (a mensagem nova
+/// sem SYNC_REQUEST nem RELEASE_MESSAGE, o AlpcpDispatchReplyToPort): o
+/// PortContext e a porta cuja sequência ela avança.
+struct Requeue {
+    port_context: u64,
+    owner: Arc<Port>,
+}
+
 /// A resposta de um pedido, preenchida quando o servidor responde, com a
 /// vista de dados que ela leva.
 struct ReplyCell {
@@ -290,11 +333,12 @@ struct ReplyCell {
     view: SpinLock<Option<Arc<message_view::Carried>>>,
     /// O servidor respondeu sem ALPC_MSGFLG_RELEASE_MESSAGE.
     continuation: core::sync::atomic::AtomicBool,
+    requeue: Option<Requeue>,
 }
 
 impl Default for ReplyCell {
     fn default() -> Self {
-        Self { result: SpinLock::new(None), view: SpinLock::new(None), continuation: core::sync::atomic::AtomicBool::new(false) }
+        Self { result: SpinLock::new(None), view: SpinLock::new(None), continuation: core::sync::atomic::AtomicBool::new(false), requeue: None }
     }
 }
 
@@ -329,6 +373,9 @@ struct ServerState {
     /// Pedidos cuja espera do cliente terminou com a desconexão do servidor
     /// (a resposta tardia só limpa o que restou deles).
     abandoned: BTreeSet<u32>,
+    /// As mensagens que o servidor mandou a um cliente e que esperam a
+    /// resposta dele, por (porta do cliente, MessageId na porta do cliente).
+    callbacks: BTreeMap<(u64, u32), ReplySlot>,
     closed: bool,
 }
 
@@ -369,8 +416,11 @@ impl UserServer {
     fn enqueue(&self, delivery: Delivery) {
         let id = delivery.id;
         self.state.lock().queue.push_back(delivery);
-        if let Some(completion) = self.listener.with(|state| state.completion.clone()) {
-            completion.notify();
+        match self.listener.with(|state| state.completion.clone()) {
+            Some(completion) => completion.notify(),
+            // AlpcpCompleteDispatchMessage: sem IOCP, a porta esperável
+            // libera o semáforo uma vez por mensagem na fila principal.
+            None => self.listener.signal_waitable(),
         }
         kernel_entry::notify_waiters();
         if let Some((object, context)) = self.listener.with(|state| state.callback) {
@@ -381,17 +431,17 @@ impl UserServer {
     /// O servidor fechou a porta de conexão: as conexões pendentes são
     /// recusadas e o nome sai do namespace.
     fn close(&self) {
-        let (connections, requests, _queue, _views, _received) = {
+        let (connections, requests, _queue, _views, _received, callbacks) = {
             let mut state = self.state.lock();
             state.closed = true;
             // As mensagens, vistas e atributos saem fora da trava (a vista de
             // dados solta a seção que retinha; os atributos, os objetos).
-            (core::mem::take(&mut state.connections), core::mem::take(&mut state.requests), core::mem::take(&mut state.queue), core::mem::take(&mut state.exposed_views), core::mem::take(&mut state.received))
+            (core::mem::take(&mut state.connections), core::mem::take(&mut state.requests), core::mem::take(&mut state.queue), core::mem::take(&mut state.exposed_views), core::mem::take(&mut state.received), core::mem::take(&mut state.callbacks))
         };
         for connection in connections.values() {
             refuse(connection);
         }
-        for slot in requests.values() {
+        for slot in requests.values().chain(callbacks.values()) {
             *slot.result.lock() = Some(JobResult { status: STATUS_PORT_DISCONNECTED, ..JobResult::default() });
         }
         if let Some(endpoint) = self.endpoint.lock().take() {
@@ -531,15 +581,18 @@ impl Service for UserServer {
         Reply::Later(Box::new(ReplyJob { slot, identity: request.identity.clone() }))
     }
 
-    /// O cliente saiu: LPC_PORT_CLOSED na fila, com o PortContext dele.
+    /// O cliente saiu: LPC_PORT_CLOSED na fila, com o PortContext dele; as
+    /// mensagens que o servidor mandou a ele e ainda esperam resposta
+    /// terminam com STATUS_PORT_DISCONNECTED.
     fn disconnect(&self, port: &Arc<Port>) {
-        let (link, id, sequence) = {
+        let (link, id, sequence, abandoned) = {
             let mut state = self.state.lock();
             let Some(link) = state.links.remove(&port.pointer) else { return };
             let id = UserServer::next_id(&mut state);
             let sequence = next_sequence(&link.server_port);
-            (link, id, sequence)
+            (link, id, sequence, take_callbacks(&mut state, port.pointer))
         };
+        fail_slots(&abandoned);
         COMMUNICATION.lock().remove(&link.server_port.pointer);
         let sender = Sender { process: port.process_id(), thread: port.thread_id(), thread_pointer: 0 };
         self.enqueue(Delivery { id, message_type: LPC_PORT_CLOSED, sender, port_context: link.context, sequence, ..Delivery::default() });
@@ -548,6 +601,23 @@ impl Service for UserServer {
 
 fn current_sender() -> Sender {
     Sender { process: process::get_current_process_id(), thread: process::get_current_thread_id(), thread_pointer: process::get_current_thread() }
+}
+
+/// Tira do servidor as mensagens mandadas ao cliente `client` que ainda
+/// esperam resposta (chamada sob a trava do servidor).
+fn take_callbacks(state: &mut ServerState, client: u64) -> Vec<ReplySlot> {
+    let keys: Vec<(u64, u32)> = state.callbacks.keys().copied().filter(|(port, _)| *port == client).collect();
+    keys.iter().filter_map(|key| state.callbacks.remove(key)).collect()
+}
+
+/// As respostas que não virão: STATUS_PORT_DISCONNECTED para quem espera.
+fn fail_slots(slots: &[ReplySlot]) {
+    for slot in slots {
+        *slot.result.lock() = Some(JobResult { status: STATUS_PORT_DISCONNECTED, ..JobResult::default() });
+    }
+    if !slots.is_empty() {
+        kernel_entry::notify_waiters();
+    }
 }
 
 /// O servidor de uma porta de conexão ou de comunicação.
@@ -852,23 +922,360 @@ fn send_reply(server: &UserServer, port: &Arc<Port>, input: u64, attributes: u64
     if let Some(binding) = exposed.filter(|binding| unmap && !binding.state.lock().deleted) {
         let _ = crate::ntos::alpc::section_views::delete_referenced(&binding);
     }
-    *slot.view.lock() = view;
     slot.continuation.store(!release && !server.legacy(), core::sync::atomic::Ordering::Release);
-    *slot.result.lock() = Some(JobResult { status: STATUS_SUCCESS, data: captured.data, sender: Some(current_sender()) });
-    kernel_entry::notify_waiters();
+    complete(server, &slot, id, captured.data, view);
     STATUS_SUCCESS
 }
 
+/// Conclui a resposta ao pedido `id`: a continuação (ou a espera síncrona)
+/// de quem enviou, ou, numa mensagem nova do lado servidor sem
+/// SYNC_REQUEST, o LPC_REPLY na fila da porta de conexão (o
+/// AlpcpDispatchReplyToPort, com o PortContext e a sequência da porta que
+/// enviou).
+fn complete(server: &UserServer, slot: &ReplySlot, id: u32, data: Vec<u8>, view: Option<Arc<message_view::Carried>>) {
+    let replier = current_sender();
+    if let Some(requeue) = &slot.requeue {
+        let sequence = {
+            let _state = server.state.lock();
+            next_sequence(&requeue.owner)
+        };
+        server.enqueue(Delivery { id, message_type: LPC_REPLY, data, sender: replier, port_context: requeue.port_context, data_view: view, sequence, ..Delivery::default() });
+        return;
+    }
+    *slot.view.lock() = view;
+    *slot.result.lock() = Some(JobResult { status: STATUS_SUCCESS, data, sender: Some(replier) });
+    kernel_entry::notify_waiters();
+}
+
+/// O envio do lado servidor: a resposta a um pedido (pelo MessageId) ou uma
+/// mensagem nova, com o Type dela.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SendKind {
+    New(u16),
+    Reply,
+}
+
+/// AlpcpSendMessage. Numa porta LPC (ou no contrato LPC de kernel, o bit 1
+/// das flags) o Type decide: zero é uma mensagem nova (LPC_DATAGRAM com
+/// RELEASE_MESSAGE, LPC_REQUEST sem), LPC_REQUEST com MessageId é a
+/// resposta, os tipos de sistema (3 a 6 e 13 com RELEASE_MESSAGE, 7 a 9 sem)
+/// só vêm do contrato LPC de kernel e o resto é STATUS_INVALID_PARAMETER; o
+/// bit 0 das flags (só de kernel) é sempre uma resposta. Nas outras portas o
+/// MessageId zero (ou o de uma reserva) é a mensagem nova, que não pode
+/// trazer CLIENT_ID (STATUS_INVALID_MESSAGE). A mensagem nova conserva os
+/// bits altos do Type do remetente: Type & 0xEF00 em KernelMode, & 0x6F00 em
+/// UserMode (sem o LPC_KERNELMODE_MESSAGE).
+fn classify(header: &[u8; 40], lpc: bool, flags: u32, mode: u8) -> Result<SendKind, u32> {
+    let word = |offset: usize| u16::from_le_bytes([header[offset], header[offset + 1]]);
+    let message_type = word(offset_of!(PortMessage, u2.s2.type_));
+    let id_offset = offset_of!(PortMessage, message_id);
+    let id = u32::from_le_bytes([header[id_offset], header[id_offset + 1], header[id_offset + 2], header[id_offset + 3]]);
+    let high = message_type & if mode == 0 { 0xEF00 } else { 0x6F00 };
+    let low = message_type & 0xFF;
+    let release = flags & RELEASE_MESSAGE != 0;
+    if lpc || flags & KERNEL_LPC_SEND != 0 {
+        if flags & 1 != 0 {
+            return if id != 0 { Ok(SendKind::Reply) } else { Err(STATUS_INVALID_PARAMETER) };
+        }
+        let system = flags & KERNEL_LPC_SEND != 0;
+        return match (release, low) {
+            (true, 0) => Ok(SendKind::New(high | LPC_DATAGRAM)),
+            (true, 3..=6 | 0xD) if system => Ok(SendKind::New(high | low)),
+            (false, 0) => Ok(SendKind::New(high | LPC_REQUEST)),
+            (false, 1) if id != 0 => Ok(SendKind::Reply),
+            (false, 7..=9) if system => Ok(SendKind::New(high | low)),
+            _ => Err(STATUS_INVALID_PARAMETER),
+        };
+    }
+    if id != 0 && id & 0x8000_0000 == 0 {
+        return Ok(SendKind::Reply);
+    }
+    let client_id = offset_of!(PortMessage, client_id);
+    if header[client_id..client_id + 16].iter().any(|&byte| byte != 0) {
+        return Err(STATUS_INVALID_MESSAGE);
+    }
+    Ok(SendKind::New(high | if release { LPC_DATAGRAM } else { LPC_REQUEST }))
+}
+
+/// O cabeçalho da mensagem de envio (sondado em UserMode) classificado pela
+/// porta que envia.
+fn classify_input(port: &Arc<Port>, input: u64, flags: u32, mode: u8) -> Result<SendKind, u32> {
+    if !message_buffer::accessible(input, PortMessage::SIZE, mode, false) {
+        return Err(STATUS_ACCESS_VIOLATION);
+    }
+    let mut header = [0u8; 40];
+    header.copy_from_slice(&message_buffer::read_block(input, PortMessage::SIZE)?);
+    classify(&header, port.with(|state| state.port_flags) & LPC_MODE != 0, flags, mode)
+}
+
+/// Onde fica a resposta que uma mensagem nova síncrona espera: um pedido na
+/// própria fila (pelo id no servidor) ou uma mensagem ao cliente (pela porta
+/// dele e pelo MessageId nela).
+#[derive(Clone, Copy)]
+enum ReplyKey {
+    Request(u32),
+    Callback(u64, u32),
+}
+
+/// A mensagem nova postada: nada a esperar, ou a resposta síncrona.
+enum Posted {
+    Sent,
+    Waiting { key: ReplyKey, slot: ReplySlot, port_context: u64 },
+}
+
+/// A mensagem nova do lado servidor (AlpcpDispatchNewMessage): na porta de
+/// conexão, a própria fila, com o PortContext e a sequência dela; numa porta
+/// de comunicação, a porta do cliente ([`post_to_client`]). O datagrama
+/// (RELEASE_MESSAGE) não espera resposta; o envio síncrono a espera em
+/// [`SyncReply`]; o resto a recebe como LPC_REPLY na fila do servidor.
+fn post_new(server: &Arc<UserServer>, port: &Arc<Port>, flags: u32, captured: message_buffer::Captured, message_type: u16) -> Result<Result<Posted, u32>, KernelError> {
+    let datagram = flags & RELEASE_MESSAGE != 0;
+    let synchronous = flags & SYNC_REQUEST != 0;
+    let message_type = if datagram { message_type & !LPC_CONTINUATION_REQUIRED } else { message_type | LPC_CONTINUATION_REQUIRED };
+    let sender = current_sender();
+    if !Arc::ptr_eq(&server.listener, port) {
+        return post_to_client(server, port, sender, captured, message_type, datagram, synchronous);
+    }
+    let port_context = port.with(|state| state.port_context);
+    let slot: ReplySlot = Arc::new(ReplyCell { requeue: (!synchronous).then(|| Requeue { port_context, owner: port.clone() }), ..ReplyCell::default() });
+    let (id, sequence) = {
+        let mut state = server.state.lock();
+        if state.closed {
+            return Ok(Err(STATUS_PORT_DISCONNECTED));
+        }
+        let id = UserServer::next_id(&mut state);
+        if !datagram {
+            state.requests.insert(id, slot.clone());
+            state.senders.insert(id, Origin { sender, client: 0, waiting: synchronous, message_type, received: false });
+        }
+        (id, next_sequence(port))
+    };
+    if crate::ntos::init::boot_config::TRACE_SYSCALLS {
+        crate::debug_print!("[alpc] mensagem nova na propria porta de conexao: tipo {:#x} id {} pid {}", message_type, id, sender.process);
+    }
+    server.enqueue(Delivery { id, message_type, data: captured.data, sender, port_context, sequence, ..Delivery::default() });
+    Ok(Ok(if synchronous { Posted::Waiting { key: ReplyKey::Request(id), slot, port_context } } else { Posted::Sent }))
+}
+
+/// A mensagem nova numa porta de comunicação do servidor (o callback): vai à
+/// porta do cliente ligado a ela, que precisa de ALLOW_LPC_REQUESTS
+/// (STATUS_LPC_REQUESTS_NOT_ALLOWED) e de espaço para ela
+/// (STATUS_BUFFER_TOO_SMALL), como no AlpcpDispatchNewMessage com a porta do
+/// cliente como destino. O cliente a recebe na fila dele (o MessageId é o da
+/// mensagem na porta dele) e responde por ele ([`reply_from_client`]).
+fn post_to_client(server: &Arc<UserServer>, port: &Arc<Port>, sender: Sender, captured: message_buffer::Captured, message_type: u16, datagram: bool, synchronous: bool) -> Result<Result<Posted, u32>, KernelError> {
+    let Some((_, client_pointer)) = COMMUNICATION.lock().get(&port.pointer).cloned() else { return Ok(Err(STATUS_PORT_DISCONNECTED)) };
+    let port_context = {
+        let state = server.state.lock();
+        match state.links.get(&client_pointer) {
+            Some(link) if !link.disconnected && Arc::ptr_eq(&link.server_port, port) => link.context,
+            _ => return Ok(Err(STATUS_PORT_DISCONNECTED)),
+        }
+    };
+    let Some(client) = port_objects::port_of(client_pointer).filter(|client| !client.closed()) else { return Ok(Err(STATUS_PORT_DISCONNECTED)) };
+    if client.with(|state| state.port_flags) & ALLOW_LPC_REQUESTS == 0 {
+        return Ok(Err(STATUS_LPC_REQUESTS_NOT_ALLOWED));
+    }
+    if PortMessage::SIZE + captured.data.len() as u64 > client.maximum() as u64 {
+        return Ok(Err(STATUS_BUFFER_TOO_SMALL));
+    }
+    let slot: ReplySlot = Arc::new(ReplyCell { requeue: (!synchronous).then(|| Requeue { port_context, owner: port.clone() }), ..ReplyCell::default() });
+    // A resposta pode chegar antes da volta desta chamada: o registro vem
+    // antes de a mensagem entrar na fila do cliente.
+    let register = |identifier: u32| {
+        if !datagram {
+            server.state.lock().callbacks.insert((client_pointer, identifier), slot.clone());
+        }
+    };
+    let identifier = match crate::ntos::ps::user::alpc::post_server_message(&client, message_type, &captured.data, sender, register)? {
+        Ok(identifier) => identifier,
+        Err(status) => return Ok(Err(status)),
+    };
+    if crate::ntos::init::boot_config::TRACE_SYSCALLS {
+        crate::debug_print!("[alpc] mensagem do servidor ao cliente pid {}: tipo {:#x} id {}", client.process_id(), message_type, identifier);
+    }
+    Ok(Ok(if synchronous { Posted::Waiting { key: ReplyKey::Callback(client_pointer, identifier), slot, port_context } } else { Posted::Sent }))
+}
+
+/// A resposta do cliente a uma mensagem que o servidor mandou a ele (o
+/// envio com o MessageId dela na porta do cliente, AlpcpSendMessage com a
+/// mensagem recebida): conclui a espera do servidor, ou vira o LPC_REPLY na
+/// fila dele. `None` se a porta não tem mensagem do servidor com esse id.
+pub fn reply_from_client(client: &Arc<Port>, id: u32, data: Vec<u8>) -> Option<u32> {
+    let service = client.with(|state| state.service.clone())?;
+    let server = SERVERS.lock().values().find(|candidate| Arc::as_ptr(candidate).cast::<u8>() == Arc::as_ptr(&service).cast::<u8>()).cloned()?;
+    let slot = server.state.lock().callbacks.remove(&(client.pointer, id))?;
+    complete(&server, &slot, id, data, None);
+    Some(STATUS_SUCCESS)
+}
+
+/// A espera de uma mensagem nova síncrona do lado servidor: a resposta vira
+/// o LPC_REPLY no buffer de recepção, com o CLIENT_ID de quem respondeu e o
+/// MessageId da mensagem, e o ALPC_CONTEXT_ATTR, quando alocado, com o
+/// PortContext da porta que enviou. Sem resposta (prazo, alerta, saída), a
+/// mensagem sai do registro e da fila, e uma resposta tardia não acha mais o
+/// pedido.
+struct SyncReply {
+    server: Arc<UserServer>,
+    key: ReplyKey,
+    slot: ReplySlot,
+    port_context: u64,
+    buffer: Buffer,
+    attributes: u64,
+    done: bool,
+}
+
+impl SyncReply {
+    fn take_reply(&mut self) -> Option<u32> {
+        if self.done {
+            return Some(STATUS_SUCCESS);
+        }
+        let result = self.slot.result.lock().take()?;
+        self.done = true;
+        if result.status != STATUS_SUCCESS {
+            return Some(result.status);
+        }
+        let id = match self.key {
+            ReplyKey::Request(id) | ReplyKey::Callback(_, id) => id,
+        };
+        let total = PortMessage::SIZE as usize + result.data.len();
+        let mut bytes = alloc::vec![0u8; total];
+        let put = |bytes: &mut Vec<u8>, offset: usize, value: &[u8]| bytes[offset..offset + value.len()].copy_from_slice(value);
+        put(&mut bytes, offset_of!(PortMessage, u1.s1.data_length), &(result.data.len() as u16).to_le_bytes());
+        put(&mut bytes, offset_of!(PortMessage, u1.s1.total_length), &(total as u16).to_le_bytes());
+        put(&mut bytes, offset_of!(PortMessage, u2.s2.type_), &LPC_REPLY.to_le_bytes());
+        let replier = result.sender.unwrap_or_default();
+        put(&mut bytes, offset_of!(PortMessage, client_id.unique_process), &replier.process.to_le_bytes());
+        put(&mut bytes, offset_of!(PortMessage, client_id.unique_thread), &replier.thread.to_le_bytes());
+        put(&mut bytes, offset_of!(PortMessage, message_id), &id.to_le_bytes());
+        bytes[PortMessage::SIZE as usize..].copy_from_slice(&result.data);
+        let status = message_buffer::deliver(&self.buffer, &bytes, true);
+        if status != STATUS_SUCCESS {
+            return Some(status);
+        }
+        Some(publish_reply_attributes(self.attributes, self.port_context, id).err().unwrap_or(STATUS_SUCCESS))
+    }
+
+    fn abandon(&mut self) {
+        if self.done {
+            return;
+        }
+        let mut state = self.server.state.lock();
+        match self.key {
+            ReplyKey::Request(id) => {
+                state.requests.remove(&id);
+                state.senders.remove(&id);
+                state.queue.retain(|delivery| delivery.id != id || delivery.message_type & 0xFF != LPC_REQUEST);
+            }
+            ReplyKey::Callback(client, id) => {
+                state.callbacks.remove(&(client, id));
+            }
+        }
+    }
+}
+
+impl crate::ntos::alpc::kernel_entry::Pending for SyncReply {
+    fn poll(&mut self) -> Option<u32> {
+        self.take_reply()
+    }
+
+    fn cancel(&mut self) {
+        self.abandon();
+    }
+}
+
+/// Os atributos de recepção da resposta síncrona: só o ALPC_CONTEXT_ATTR,
+/// quando alocado.
+fn publish_reply_attributes(attributes: u64, port_context: u64, id: u32) -> Result<(), u32> {
+    if attributes == 0 {
+        return Ok(());
+    }
+    let header = state::user_struct::<AlpcMessageAttributes>(attributes).map_err(|error| error.status)?;
+    let valid = header.allocated_attributes.probe_get().map_err(|error| error.status)? & CONTEXT_ATTRIBUTE;
+    if valid != 0 {
+        let at = crate::ntos::ps::user::alpc::attribute_address(attributes, CONTEXT_ATTRIBUTE);
+        context_attribute::try_write(at, port_context, 0, 0, id, 0)?;
+    }
+    header.valid_attributes.probe_set(valid).map_err(|error| error.status)
+}
+
 /// NtAlpcSendWaitReceivePort na porta de conexão ou de comunicação de um
-/// servidor de usuário: a resposta (se houver mensagem de envio) e depois a
-/// recepção (se houver buffer), com a espera pela próxima mensagem.
+/// servidor de usuário: o envio (a resposta pelo MessageId ou a mensagem
+/// nova, [`classify`]) e depois a recepção (se houver buffer), com a espera
+/// pela próxima mensagem; o envio síncrono espera a resposta dele no buffer
+/// de recepção.
 pub fn exchange(port: &Arc<Port>, flags: u32, input: u64, send_attributes: u64, receive: crate::ntos::ps::user::alpc::ReceiveArguments) -> Result<u32, KernelError> {
     let Some(server) = server_of(port) else { return Ok(STATUS_INVALID_PORT_HANDLE) };
-    if flags & 0x2_0000 != 0 {
-        crate::debug_print!("[alpc] servidor de usuario: pedido sincrono do servidor sem suporte");
-        return Ok(STATUS_NOT_SUPPORTED);
+    // O despacho NT ignora os bits baixos e recusa estas combinações antes
+    // do envio.
+    let flags = flags & 0xFFFF_0000;
+    if flags & SYNC_REQUEST != 0 {
+        if input == 0 || flags & 0x101_0000 != 0 {
+            return Ok(STATUS_INVALID_PARAMETER_2);
+        }
+        if receive.output == 0 {
+            return Ok(STATUS_LPC_RECEIVE_BUFFER_EXPECTED);
+        }
+    } else if input != 0 && flags & 0x100_0000 != 0 {
+        return Ok(STATUS_INVALID_PARAMETER_2);
+    }
+    if input != 0 {
+        match classify_input(port, input, flags, 1) {
+            Err(status) => return Ok(status),
+            Ok(SendKind::New(message_type)) => return send_new(&server, port, flags, input, message_type, receive),
+            Ok(SendKind::Reply) if flags & SYNC_REQUEST != 0 => {
+                crate::debug_print!("[alpc] servidor de usuario: resposta que espera outra resposta sem suporte");
+                return Ok(STATUS_NOT_SUPPORTED);
+            }
+            Ok(SendKind::Reply) => {}
+        }
     }
     reply_and_receive(server, port, input, send_attributes, flags & 0x1_0000 != 0, receive, ReceiveOptions::default())
+}
+
+/// A mensagem nova de modo usuário do lado servidor: o envio síncrono sonda
+/// o buffer de recepção antes de postar e espera a resposta nele; os outros
+/// seguem para a recepção, se houver buffer.
+fn send_new(server: &Arc<UserServer>, port: &Arc<Port>, flags: u32, input: u64, message_type: u16, receive: crate::ntos::ps::user::alpc::ReceiveArguments) -> Result<u32, KernelError> {
+    let synchronous = flags & SYNC_REQUEST != 0;
+    let buffer = if synchronous {
+        let header = message_buffer::probe_header(receive.output, 1);
+        if header != 0 {
+            return Ok(header);
+        }
+        let status = crate::ntos::ps::user::alpc::attributes(receive.receive_attributes, false, 1);
+        if status != 0 {
+            return Ok(status);
+        }
+        if receive.timeout != 0 && !state::probe_user_read(receive.timeout, 8) {
+            return Ok(STATUS_ACCESS_VIOLATION);
+        }
+        match message_buffer::capture_length(receive.output, receive.length, 1) {
+            Ok(buffer) => Some(buffer),
+            Err(status) => return Ok(status),
+        }
+    } else {
+        None
+    };
+    let captured = match message_buffer::capture_message_with(input, port.maximum().max(PortMessage::SIZE as u32), 1, server.legacy()) {
+        Ok(captured) => captured,
+        Err(status) => return Ok(status),
+    };
+    let (key, slot, port_context) = match post_new(server, port, flags, captured, message_type)? {
+        Err(status) => return Ok(status),
+        Ok(Posted::Waiting { key, slot, port_context }) => (key, slot, port_context),
+        Ok(Posted::Sent) => {
+            if receive.output == 0 {
+                return Ok(STATUS_SUCCESS);
+            }
+            return reply_and_receive(server.clone(), port, 0, 0, true, receive, ReceiveOptions::default());
+        }
+    };
+    let Some(buffer) = buffer else { return Err(KernelError::new("ALPC synchronous send without receive buffer")) };
+    let pending = Arc::new(SpinLock::new(SyncReply { server: server.clone(), key, slot, port_context, buffer, attributes: receive.receive_attributes, done: false }));
+    let (polled, abandoned) = (pending.clone(), pending);
+    let wait = Wait { poll: Some(Box::new(move || polled.lock().take_reply())), cleanup: Some(Box::new(move |_| abandoned.lock().abandon())), ..Wait::default() };
+    Ok(threads::wait_custom(wait, receive.timeout, None))
 }
 
 /// A resposta (se houver mensagem de envio; `release` é o
@@ -1161,7 +1568,10 @@ fn establish(server: &Arc<UserServer>, pending: &Arc<PendingConnection>, out: u6
 fn establish_with(server: &Arc<UserServer>, pending: &Arc<PendingConnection>, out: u64, port_context: u64, attributes: u64, port_attributes: Option<(u32, u32)>, mode: u8, data: Vec<u8>, accepted: &LegacyAccepted) -> Result<u32, KernelError> {
     let object_flags = object_flags(attributes)?;
     let (accepted_flags, duplicate_object_types) = port_attributes.unwrap_or((0, 0));
-    let port_flags = (server.listener.with(|state| state.port_flags) & LPC_MODE) | (accepted_flags & !LPC_MODE);
+    // AlpcpValidateAndSetPortAttributes de uma porta de comunicação do
+    // servidor: o Flags reduzido a 0x3FF0000, sem ALLOW_LPC_REQUESTS (as
+    // mensagens novas a ela não existem: o cliente manda à porta de conexão).
+    let port_flags = (server.listener.with(|state| state.port_flags) & LPC_MODE) | (accepted_flags & 0x03FF_0000 & !ALLOW_LPC_REQUESTS);
     let mut views = Vec::new();
     if let Some(view) = pending.view.as_ref().and_then(|view| view.server()) {
         views.push(view);
@@ -1229,6 +1639,9 @@ fn communication_disconnected(communication: &Arc<Port>, endpoint: &Arc<Port>, _
                 slots.push(slot);
             }
         }
+        // As mensagens que o servidor mandou ao cliente por esta porta
+        // também não terão resposta.
+        slots.extend(take_callbacks(&mut state, client));
         slots
     };
     for slot in &slots {
@@ -1315,6 +1728,13 @@ pub fn create_port(out: u64, attributes: u64, port_attributes: u64, mode: u8) ->
     if maximum < PortMessage::SIZE || maximum > MAXIMUM_MESSAGE_LENGTH {
         return Ok(STATUS_INVALID_PARAMETER);
     }
+    // AlpcpValidateAndSetPortAttributes: ALPC_PORFLG_SYSTEM_PROCESS só de
+    // modo kernel, o Flags reduzido a 0x3FF0000 e, numa porta de conexão,
+    // ALLOW_LPC_REQUESTS sempre (ela recebe as mensagens novas).
+    if mode != 0 && port_flags & 0x10_0000 != 0 {
+        return Ok(STATUS_INVALID_PARAMETER);
+    }
+    let port_flags = (port_flags & 0x03FF_0000) | ALLOW_LPC_REQUESTS;
     create_listener(out, attributes, name, PortState { role: Role::Listener, port_flags, maximum_view_size, duplicate_object_types, ..PortState::default() }, maximum as u32, mode)
 }
 
@@ -1380,6 +1800,7 @@ fn create_listener(out: u64, attributes: u64, name: Option<String>, initial: Por
         }
     }
     let explicit = if mode != 0 && attributes != 0 { state::user_struct::<ObjectAttributes>(attributes)?.security_descriptor.probe_get()? } else { 0 };
+    let waitable = initial.port_flags & WAITABLE_PORT != 0;
     let port = match port_objects::create("alpc", initial, maximum, 0, attributes, Box::new(|listener: &Arc<Port>| {
         if let Some(server) = SERVERS.lock().remove(&listener.pointer) {
             server.close();
@@ -1389,6 +1810,12 @@ fn create_listener(out: u64, attributes: u64, name: Option<String>, initial: Por
         Err(error) if error.status != 0 => return Ok(error.status),
         Err(error) => return Err(error),
     };
+    // AlpcpInitializePort de uma porta esperável: o KSEMAPHORE em que a
+    // espera pelo handle da porta fica.
+    if waitable && !port.make_waitable() {
+        crate::ntos::ob::objects::dispatcher::collect(port.pointer);
+        return Ok(0xC000_009A);
+    }
     let server = Arc::new(UserServer { listener: port.clone(), endpoint: SpinLock::new(None), state: SpinLock::new(ServerState::default()) });
     SERVERS.lock().insert(port.pointer, server.clone());
     let result = port.run(|| -> Result<u32, KernelError> {
@@ -1569,90 +1996,6 @@ pub fn open_sender_process_kernel(out: u64, port_handle: u64, message: u64, acce
     result
 }
 
-/// Um pedido síncrono de kernel na própria porta de conexão de um servidor
-/// de usuário: como no AlpcpProcessSynchronousRequest com a porta de
-/// conexão como destino, a mensagem entra na fila da porta de conexão (um
-/// LPC_REQUEST sem porta de comunicação, PortContext zero) e quem pediu
-/// espera a resposta pelo MessageId; a resposta volta no buffer de recepção
-/// como LPC_REPLY, com o CLIENT_ID de quem respondeu.
-fn connection_request(server: &Arc<UserServer>, input: u64, receive: crate::ntos::ps::user::alpc::ReceiveArguments) -> Box<dyn crate::ntos::alpc::kernel_entry::Pending> {
-    use crate::ntos::alpc::kernel_entry::Completed;
-    let captured = match message_buffer::capture_message_with(input, server.listener.maximum().max(PortMessage::SIZE as u32), 0, server.legacy()) {
-        Ok(captured) => captured,
-        Err(status) => return Box::new(Completed(status)),
-    };
-    let sender = current_sender();
-    let slot: ReplySlot = Arc::new(ReplyCell::default());
-    let (id, sequence) = {
-        let mut state = server.state.lock();
-        if state.closed {
-            return Box::new(Completed(STATUS_PORT_DISCONNECTED));
-        }
-        let id = UserServer::next_id(&mut state);
-        state.requests.insert(id, slot.clone());
-        state.senders.insert(id, Origin { sender, client: 0, waiting: true, ..Origin::default() });
-        (id, next_sequence(&server.listener))
-    };
-    let message_type = if server.legacy() { LPC_REQUEST } else { LPC_REQUEST | LPC_CONTINUATION_REQUIRED };
-    server.enqueue(Delivery { id, message_type, data: captured.data, sender, sequence, ..Delivery::default() });
-    Box::new(ConnectionRequest { server: server.clone(), id, slot, output: receive.output, length: receive.length, done: false })
-}
-
-/// A espera do pedido de kernel na porta de conexão.
-struct ConnectionRequest {
-    server: Arc<UserServer>,
-    id: u32,
-    slot: ReplySlot,
-    output: u64,
-    length: u64,
-    done: bool,
-}
-
-/// LPC_REPLY.
-const LPC_REPLY: u16 = 2;
-
-impl crate::ntos::alpc::kernel_entry::Pending for ConnectionRequest {
-    fn poll(&mut self) -> Option<u32> {
-        if self.done {
-            return Some(STATUS_SUCCESS);
-        }
-        let result = self.slot.result.lock().take()?;
-        self.done = true;
-        if result.status != STATUS_SUCCESS || self.output == 0 {
-            return Some(result.status);
-        }
-        let total = PortMessage::SIZE as usize + result.data.len();
-        if self.length != 0 && total as u64 > self.length {
-            return Some(0xC000_0023);
-        }
-        let mut bytes = alloc::vec![0u8; total];
-        let put = |bytes: &mut Vec<u8>, offset: usize, value: &[u8]| bytes[offset..offset + value.len()].copy_from_slice(value);
-        put(&mut bytes, offset_of!(PortMessage, u1.s1.data_length), &(result.data.len() as u16).to_le_bytes());
-        put(&mut bytes, offset_of!(PortMessage, u1.s1.total_length), &(total as u16).to_le_bytes());
-        put(&mut bytes, offset_of!(PortMessage, u2.s2.type_), &LPC_REPLY.to_le_bytes());
-        let replier = result.sender.unwrap_or_default();
-        put(&mut bytes, offset_of!(PortMessage, client_id.unique_process), &replier.process.to_le_bytes());
-        put(&mut bytes, offset_of!(PortMessage, client_id.unique_thread), &replier.thread.to_le_bytes());
-        put(&mut bytes, offset_of!(PortMessage, message_id), &self.id.to_le_bytes());
-        bytes[PortMessage::SIZE as usize..].copy_from_slice(&result.data);
-        Some(match guest::try_write_bytes(self.output, &bytes) {
-            Ok(()) => STATUS_SUCCESS,
-            Err(_) => STATUS_ACCESS_VIOLATION,
-        })
-    }
-
-    /// Sem resposta (prazo, alerta, saída): o pedido sai da fila de
-    /// respostas, e uma resposta tardia dá STATUS_REPLY_MESSAGE_MISMATCH.
-    fn cancel(&mut self) {
-        if self.done {
-            return;
-        }
-        let mut state = self.server.state.lock();
-        state.requests.remove(&self.id);
-        state.senders.remove(&self.id);
-    }
-}
-
 /// ZwReplyWaitReceivePort(PortHandle, PortContext*, ReplyMessage,
 /// ReceiveMessage) numa porta de servidor LPC de kernel (o
 /// AlpcpReceiveLegacyMessage em KernelMode): a resposta `reply` ao pedido do
@@ -1691,28 +2034,66 @@ pub fn begin_kernel_legacy_receive(port: &Arc<Port>, reply: u64, receive: u64, p
     Ok(Box::new(request))
 }
 
+/// O envio de modo kernel do lado servidor ([`begin_kernel_exchange`]): a
+/// mensagem nova de kernel (o win32k manda pelo LpcSendWaitReceivePort à
+/// \Windows\ApiPort do csrss e pelo LpcRequestPort e pelo
+/// LpcSendWaitReceivePort à DwmApiPort do dwm.exe) ou a resposta. `Some`
+/// com a operação que já decide a chamada; `None` para seguir à recepção.
+fn kernel_send(server: &Arc<UserServer>, port: &Arc<Port>, flags: u32, input: u64, receive: &crate::ntos::ps::user::alpc::ReceiveArguments) -> Result<Option<Box<dyn crate::ntos::alpc::kernel_entry::Pending>>, KernelError> {
+    use crate::ntos::alpc::kernel_entry::Completed;
+    let completed = |status: u32| -> Result<Option<Box<dyn crate::ntos::alpc::kernel_entry::Pending>>, KernelError> { Ok(Some(Box::new(Completed(status)))) };
+    let synchronous = flags & SYNC_REQUEST != 0;
+    if synchronous && input == 0 {
+        return completed(STATUS_INVALID_PARAMETER_2);
+    }
+    if input == 0 {
+        return Ok(None);
+    }
+    let message_type = match classify_input(port, input, flags, 0) {
+        Err(status) => return completed(status),
+        Ok(SendKind::Reply) if synchronous => {
+            crate::debug_print!("[alpc] servidor de kernel: resposta que espera outra resposta sem suporte");
+            return completed(STATUS_NOT_SUPPORTED);
+        }
+        Ok(SendKind::Reply) => {
+            let status = send_reply(server, port, input, 0, 0, flags & RELEASE_MESSAGE != 0);
+            return if status != 0 { completed(status) } else { Ok(None) };
+        }
+        Ok(SendKind::New(message_type)) => message_type,
+    };
+    let buffer = if synchronous {
+        if receive.output == 0 {
+            return completed(STATUS_LPC_RECEIVE_BUFFER_EXPECTED);
+        }
+        match message_buffer::capture_length(receive.output, receive.length, 0) {
+            Ok(buffer) => Some(buffer),
+            Err(status) => return completed(status),
+        }
+    } else {
+        None
+    };
+    let captured = match message_buffer::capture_message_with(input, port.maximum().max(PortMessage::SIZE as u32), 0, server.legacy() || flags & KERNEL_LPC_SEND != 0) {
+        Ok(captured) => captured,
+        Err(status) => return completed(status),
+    };
+    match (post_new(server, port, flags, captured, message_type)?, buffer) {
+        (Err(status), _) => completed(status),
+        (Ok(Posted::Waiting { key, slot, port_context }), Some(buffer)) => Ok(Some(Box::new(SyncReply { server: server.clone(), key, slot, port_context, buffer, attributes: receive.receive_attributes, done: false }))),
+        (Ok(Posted::Waiting { .. }), None) => Err(KernelError::new("ALPC synchronous kernel send without receive buffer")),
+        (Ok(Posted::Sent), _) => Ok(None),
+    }
+}
+
 /// ZwAlpcSendWaitReceivePort na porta de conexão ou de comunicação de um
-/// servidor de kernel: a resposta e a recepção como em [`exchange`], com os
+/// servidor de kernel: o envio e a recepção como em [`exchange`], com os
 /// buffers do chamador sem sonda e a espera pela continuação de kernel (o
 /// prazo e o modo de espera do ZwAlpcSendWaitReceivePort).
 pub fn begin_kernel_exchange(port: &Arc<Port>, flags: u32, input: u64, receive: crate::ntos::ps::user::alpc::ReceiveArguments) -> Result<Box<dyn crate::ntos::alpc::kernel_entry::Pending>, KernelError> {
     use crate::ntos::alpc::kernel_entry::Completed;
     use crate::ntos::alpc::kernel_wait;
     let Some(server) = server_of(port) else { return Ok(Box::new(Completed(STATUS_INVALID_PORT_HANDLE))) };
-    if flags & 0x2_0000 != 0 {
-        // O pedido síncrono de kernel direto à porta de conexão (o win32k
-        // manda o LpcSendWaitReceivePort à \Windows\ApiPort do csrss).
-        if input != 0 && SERVERS.lock().get(&port.pointer).is_some_and(|owner| Arc::ptr_eq(owner, &server)) {
-            return Ok(connection_request(&server, input, receive));
-        }
-        crate::debug_print!("[alpc] servidor de kernel: pedido sincrono do servidor sem suporte");
-        return Ok(Box::new(Completed(STATUS_NOT_SUPPORTED)));
-    }
-    if input != 0 {
-        let status = send_reply(&server, port, input, 0, 0, flags & 0x1_0000 != 0);
-        if status != 0 {
-            return Ok(Box::new(Completed(status)));
-        }
+    if let Some(decided) = kernel_send(&server, port, flags, input, &receive)? {
+        return Ok(decided);
     }
     if receive.output == 0 {
         return Ok(Box::new(Completed(STATUS_SUCCESS)));

@@ -19,17 +19,19 @@ use crate::ntos::alpc::resource::reserves as resource_reserves;
 use crate::ntos::ke::critical_region;
 use crate::ntos::mm::section::handles::{self as section_handles, Kind};
 use crate::ntos::mm::section::parameters::{self as section_parameters, Decoded};
-use crate::ntos::ob::objects::port::Port;
+use crate::ntos::ob::objects::port::{Port, Role};
 use crate::ntos::ob::objects::section as section_objects;
 use crate::ntos::ps::process;
 use crate::ntos::ps::user::sections::{self, MapRequest, Section};
 use crate::rtl::KernelError;
 use crate::ntos::alpc::message::buffer::{read_block, read_field, write_field};
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::types::{AlpcDataViewAttr, AlpcPortAssociateCompletionPort, AlpcSecurityAttr, NtStruct};
+use crate::ntos::inc::types::{AlpcDataViewAttr, AlpcPortAssociateCompletionPort, AlpcPortAttributes, AlpcSecurityAttr, NtStruct};
 use core::mem::offset_of;
 
 const INVALID_PARAMETER: u32 = 0xC000_000D;
+/// ALPC_PORFLG_ALLOW_LPC_REQUESTS.
+const ALLOW_LPC_REQUESTS: u32 = 0x2_0000;
 const ACCESS_VIOLATION: u32 = 0xC000_0005;
 const SECURE: u32 = 0x4_0000;
 
@@ -486,10 +488,53 @@ pub fn set_information(handle: u64, class: u32, input: u64, length: u32, mode: u
                     }
                     return Ok(0);
                 }
-                if [1, 5, 6, 7, 8, 10].contains(&class) {
-                    return Ok(0xC000_00BB);
+                let dword = |offset: usize| -> Result<u32, u32> {
+                    match &captured {
+                        Some(bytes) => Ok(bytes.get(offset..offset + 4).map_or(0, |value| u32::from_le_bytes([value[0], value[1], value[2], value[3]]))),
+                        None => read_field::<u32>(input, offset),
+                    }
+                };
+                match class {
+                    // AlpcPortInformation numa porta já criada: só o
+                    // ALLOW_LPC_REQUESTS do Flags muda (o EnableCallbacks do
+                    // RPC liga as mensagens do servidor ao cliente); Flags
+                    // fora de 0x3FF0000 é STATUS_INVALID_PARAMETER.
+                    1 => {
+                        if length != AlpcPortAttributes::SIZE as u32 {
+                            return Ok(0xC000_0004);
+                        }
+                        let flags = match dword(offset_of!(AlpcPortAttributes, flags)) {
+                            Ok(flags) => flags,
+                            Err(status) => return Ok(status),
+                        };
+                        if flags & 0xFC00_FFFF != 0 {
+                            return Ok(INVALID_PARAMETER);
+                        }
+                        port.with(|state| state.port_flags = (state.port_flags & !ALLOW_LPC_REQUESTS) | (flags & ALLOW_LPC_REQUESTS));
+                        Ok(0)
+                    }
+                    // AlpcMessageZoneInformation: aceita só o tamanho, sem efeito.
+                    5 => Ok(if length == 0x10 { 0 } else { INVALID_PARAMETER }),
+                    // AlpcRegisterCompletionListInformation: só numa porta de
+                    // conexão, com 0x18 bytes (0x10 no layout de 32 bits). O
+                    // anel da lista de conclusão não existe aqui: a recusa
+                    // (o RPC volta à IOCP e libera o buffer).
+                    6 => {
+                        if port.with(|state| state.role) != Role::Listener || (length != 0x10 && length != 0x18) {
+                            return Ok(INVALID_PARAMETER);
+                        }
+                        crate::debug_print!("[alpc] lista de conclusao (NtAlpcSetInformation 6) sem suporte");
+                        Ok(0xC000_00BB)
+                    }
+                    // AlpcUnregisterCompletionListInformation: sem lista, nada
+                    // a soltar.
+                    7 => Ok(if length == 0 { 0 } else { INVALID_PARAMETER }),
+                    // AlpcAdjustCompletionListConcurrencyCountInformation e
+                    // AlpcCompletionListRundownInformation: sem lista
+                    // registrada, STATUS_INVALID_PARAMETER.
+                    8 | 10 => Ok(INVALID_PARAMETER),
+                    _ => Ok(INVALID_PARAMETER),
                 }
-                Ok(INVALID_PARAMETER)
             })
         })
     })

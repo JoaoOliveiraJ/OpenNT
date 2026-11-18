@@ -422,6 +422,100 @@ fn alpc_kernel_security(assert: Assert) {
     guest::free_bytes(block);
 }
 
+// ---- ALPC: mensagens novas do lado servidor e a porta esperável ----------------
+
+/// Um PORT_MESSAGE x64 de 4 bytes de dados com o Type e o MessageId dados.
+fn short_message(at: u64, message_type: u16, id: u32, data: &[u8; 4]) {
+    guest::write_bytes(at, &[0; 0x28]);
+    guest::write16(at, 4);
+    guest::write16(at + 2, 0x2C);
+    guest::write16(at + 4, message_type);
+    guest::write32(at + 0x18, id);
+    guest::write_bytes(at + 0x28, data);
+}
+
+/// As mensagens novas na própria porta de conexão (o caminho do dwm.exe e do
+/// win32k com a DwmApiPort), como o AlpcpSendMessage e o
+/// AlpcpDispatchNewMessage do 19041: o LpcRequestPort chega como
+/// LPC_DATAGRAM com o LPC_KERNELMODE_MESSAGE que o remetente pôs no Type
+/// (0x8003); o envio sem RELEASE_MESSAGE nem SYNC_REQUEST é um LPC_REQUEST
+/// com LPC_CONTINUATION_REQUIRED (0x2001) cuja resposta volta à mesma fila
+/// como LPC_REPLY. Na porta esperável (WAITABLE_PORT) cada mensagem posta
+/// libera o semáforo uma vez e a espera pelo handle consome uma liberação.
+/// E o NtAlpcSetInformation das classes 1, 5, 7, 8 e 10.
+fn alpc_kernel_new_messages(assert: Assert) {
+    let block = guest::alloc_bytes(0x800);
+    guest::write_bytes(block, &[0; 0x800]);
+    let (server_out, port_attributes, timeout, length, message, receive) = (block + 0x300, block + 0x340, block + 0x3A0, block + 0x3A8, block + 0x400, block + 0x600);
+    let attributes = super::phase6::object_attributes_for(block, "\\OpenNtAlpcWaitable", 0x200);
+    let requested = at::<nt::AlpcPortAttributes>(port_attributes);
+    requested.flags.set(0x4_0000);
+    requested.max_message_length.set(0x200);
+    let created = status("ZwAlpcCreatePort", &[server_out, attributes, port_attributes]);
+    let port = guest::read64(server_out);
+    assert(created == 0 && port != 0, "alpc-novas: porta de conexao esperavel de kernel");
+    if created != 0 || port == 0 {
+        guest::free_bytes(block);
+        return;
+    }
+    let wait = || crate::ntos::ob::wait::ob_wait_for_single_object(port, 0, 0, false, timeout);
+    let empty = wait();
+    let object = match crate::ntos::alpc::port_reference::reference(port, 0, 0) {
+        Ok(Ok(mut reference)) => {
+            let pointer = reference.port.pointer;
+            let _ = reference.release();
+            pointer
+        }
+        _ => 0,
+    };
+    short_message(message, 0x8000, 0, b"DWMQ");
+    let posted = status("LpcRequestPort", &[object, message]);
+    let signaled = wait();
+    let drained = wait();
+    guest::write64(length, 0x200);
+    let received = status("ZwAlpcSendWaitReceivePort", &[port, 0, 0, 0, receive, length, 0, timeout]);
+    let datagram = (guest::read16(receive + 4), guest::read32(receive + 0x28), guest::read64(receive + 0x10));
+    assert(
+        empty == 0x102 && object != 0 && posted == 0 && signaled == 0 && drained == 0x102 && received == 0 && datagram == (0x8003, u32::from_le_bytes(*b"DWMQ"), crate::ntos::ps::process::get_current_thread_id()),
+        "alpc-novas: LpcRequestPort na porta de conexao vira LPC_DATAGRAM com o bit de modo kernel, e a porta esperavel sinaliza uma vez por mensagem",
+    );
+    short_message(message, 0, 0, b"ASK?");
+    let asked = status("ZwAlpcSendWaitReceivePort", &[port, 0, message, 0, 0, 0, 0, 0]);
+    guest::write64(length, 0x200);
+    let request = status("ZwAlpcSendWaitReceivePort", &[port, 0, 0, 0, receive, length, 0, timeout]);
+    let (request_type, request_id) = (guest::read16(receive + 4), guest::read32(receive + 0x18));
+    short_message(message, 0, request_id, b"ACK!");
+    let replied = status("ZwAlpcSendWaitReceivePort", &[port, 0, message, 0, 0, 0, 0, 0]);
+    guest::write64(length, 0x200);
+    let reply = status("ZwAlpcSendWaitReceivePort", &[port, 0, 0, 0, receive, length, 0, timeout]);
+    let answer = (guest::read16(receive + 4), guest::read32(receive + 0x18), guest::read32(receive + 0x28));
+    let releases = (wait(), wait(), wait());
+    assert(
+        asked == 0 && request == 0 && request_type == 0x2001 && request_id != 0 && replied == 0 && reply == 0 && answer == (2, request_id, u32::from_le_bytes(*b"ACK!")) && releases == (0, 0, 0x102),
+        "alpc-novas: o pedido do servidor a propria porta de conexao recebe a resposta como LPC_REPLY na mesma fila",
+    );
+    // NtAlpcSetInformation: a classe 1 muda só o ALLOW_LPC_REQUESTS (e exige
+    // os 0x48 bytes e o Flags dentro de 0x3FF0000); a 5 aceita 16 bytes; a 7
+    // sem lista não faz nada; a 8 e a 10 sem lista recusam.
+    let information = block + 0x700;
+    guest::write32(information, 0x2_0000);
+    let class1 = status("ZwAlpcSetInformation", &[port, 1, information, 0x48]);
+    let class1_size = status("ZwAlpcSetInformation", &[port, 1, information, 0x40]);
+    guest::write32(information, 0x1);
+    let class1_flags = status("ZwAlpcSetInformation", &[port, 1, information, 0x48]);
+    let zone = status("ZwAlpcSetInformation", &[port, 5, information, 0x10]);
+    let unregister = status("ZwAlpcSetInformation", &[port, 7, 0, 0]);
+    guest::write32(information, 2);
+    let adjust = status("ZwAlpcSetInformation", &[port, 8, information, 4]);
+    let rundown = status("ZwAlpcSetInformation", &[port, 10, 0, 0]);
+    assert(
+        class1 == 0 && class1_size == 0xC000_0004 && class1_flags == 0xC000_000D && zone == 0 && unregister == 0 && adjust == 0xC000_000D && rundown == 0xC000_000D,
+        "alpc-novas: NtAlpcSetInformation das classes 1, 5, 7, 8 e 10 como o 19041",
+    );
+    let _ = call("ZwClose", &[port]);
+    guest::free_bytes(block);
+}
+
 pub fn run(assert: Assert) {
     sddl_sid_strings(assert);
     sddl_descriptor_strings(assert);
@@ -430,4 +524,5 @@ pub fn run(assert: Assert) {
     lsa_return_buffer(assert);
     nt_set_security_object(assert);
     alpc_kernel_security(assert);
+    alpc_kernel_new_messages(assert);
 }

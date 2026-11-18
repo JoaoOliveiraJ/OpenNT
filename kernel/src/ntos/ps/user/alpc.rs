@@ -34,6 +34,8 @@ pub use crate::ntos::alpc::transport::register;
 
 const AV: u32 = 0xC000_0005;
 const INVALID: u32 = 0xC000_000D;
+/// ALPC_PORFLG_WAITABLE_PORT.
+const WAITABLE_PORT: u32 = 0x4_0000;
 
 /// Conexões com trabalho de transporte.
 static PORTS: SpinLock<Vec<Arc<Port>>> = SpinLock::new(Vec::new());
@@ -59,9 +61,13 @@ pub(crate) fn current_sender() -> Sender {
     Sender { process: process::get_current_process_id(), thread: process::get_current_thread_id(), thread_pointer: 0 }
 }
 
+/// Uma mensagem entrou na fila da porta: o pacote da IOCP associada ou, sem
+/// ela, a liberação do semáforo de uma porta esperável (como no
+/// AlpcpCompleteDispatchMessage).
 fn notify_completion(port: &Arc<Port>) {
-    if let Some(completion) = port.with(|state| state.completion.clone()) {
-        completion.notify();
+    match port.with(|state| state.completion.clone()) {
+        Some(completion) => completion.notify(),
+        None => port.signal_waitable(),
     }
 }
 
@@ -552,6 +558,26 @@ fn next_port_sequence(port: &Port) -> u32 {
     })
 }
 
+/// A mensagem nova que um servidor de modo usuário manda à porta de um
+/// cliente (o callback, `alpc/server.rs`): uma identidade na porta do
+/// cliente dá o MessageId e o CallbackId, `register` recebe o MessageId
+/// antes de a mensagem entrar na fila (a resposta do cliente pode vir logo),
+/// e a mensagem fica entre as pendentes, com a sequência da porta do cliente,
+/// a IOCP dele avisada. Devolve o MessageId, ou
+/// STATUS_INSUFFICIENT_RESOURCES sem identidade.
+pub(crate) fn post_server_message(port: &Arc<Port>, message_type: u16, data: &[u8], sender: Sender, register: impl FnOnce(u32)) -> Result<Result<u32, u32>, KernelError> {
+    let Some(identity) = message_identity::activate(port, None)? else { return Ok(Err(0xC000_009A)) };
+    let identifier = identity.identifier;
+    register(identifier);
+    let sequence = next_port_sequence(port);
+    let message = Message { bytes: Some(reply(data, message_type, &identity, Some(sender))), context: 0, reserve: None, id: identifier, identity: identity.clone(), sequence, status: 0, sender: Some(sender), synchronous: false, direct: false };
+    identity.with(|state| state.queued = true);
+    port.with(|state| state.pending.push(message));
+    crate::ntos::alpc::kernel_entry::notify_waiters();
+    notify_completion(port);
+    Ok(Ok(identifier))
+}
+
 /// Publica o ALPC_CONTEXT_ATTR e o ValidAttributes da recepção; uma falha
 /// de sonda devolve ACCESS_VIOLATION.
 pub fn try_publish_attributes(pointer: u64, port: &Port, context: u64, sequence: u32, identity: &Identity) -> Result<(), u32> {
@@ -774,6 +800,13 @@ fn connect_port(out: u64, name: u64, oa: u64, port_attributes: u64, rsp: u64, re
             return if error.status != 0 { Ok(error.status) } else { Err(error) };
         }
     };
+    // AlpcpCreateClientPort: com ALPC_PORFLG_WAITABLE_PORT a porta do cliente
+    // tem o semáforo em que a espera pelo handle dela fica (o CoreMessaging
+    // espera assim as mensagens do registrador).
+    if port_flags & WAITABLE_PORT != 0 && !port.make_waitable() {
+        dispatcher_objects::collect(port.pointer);
+        return Ok(0xC000_009A);
+    }
     let result = port.run(|| -> Result<u32, KernelError> {
         port.set_started(true);
         let result = match service.connect(&port, &data, None) {
@@ -898,6 +931,13 @@ fn send(port: &Arc<Port>, flags: u32, input: u64, send_attributes: u64, mode: u8
     if reserve_id != 0 && reserve_id & 0x8000_0000 == 0 {
         if valid & message_view::VIEW_ATTRIBUTE != 0 && flags & 0x3_0000 == 0 {
             if let Some(status) = message_view::release_received(port, reserve_id, attribute_address(send_attributes, message_view::VIEW_ATTRIBUTE), mode)? {
+                return Ok(if status == 0 { Ok(None) } else { Err(status) });
+            }
+        }
+        // A resposta a uma mensagem que o servidor mandou a esta porta (o
+        // callback): volta a quem a mandou.
+        if flags & 0x2_0000 == 0 {
+            if let Some(status) = crate::ntos::alpc::server::reply_from_client(port, reserve_id, captured.data.clone()) {
                 return Ok(if status == 0 { Ok(None) } else { Err(status) });
             }
         }
@@ -1382,7 +1422,9 @@ fn begin_kernel_exchange(arguments: &[u64; 8]) -> Result<Box<dyn Pending>, Kerne
     // O lado servidor de uma conexão (porta de conexão ou de comunicação de
     // um servidor de kernel) tem a fila e as respostas próprias.
     if port.kind == "alpc" && crate::ntos::alpc::server::owns(&port) {
-        let pending = port.run(|| crate::ntos::alpc::server::begin_kernel_exchange(&port, arguments[1] as u32, arguments[2], receive));
+        // O despacho NT ignora os bits baixos das flags (o contrato LPC de
+        // kernel só vem do LpcRequestPort e do LpcSendWaitReceivePort).
+        let pending = port.run(|| crate::ntos::alpc::server::begin_kernel_exchange(&port, arguments[1] as u32 & 0xFFFF_0000, arguments[2], receive));
         let _ = reference.release();
         return pending;
     }
