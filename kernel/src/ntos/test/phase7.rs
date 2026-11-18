@@ -2200,12 +2200,9 @@ fn user_syscalls_core(assert: Assert) {
     assert(call("NtDisplayString", string, 0, 0, 0) == 0, "usercore: NtDisplayString");
     assert(call("NtQueryPerformanceCounter", out, out + 8, 0, 0) == 0 && counter.quad_part.get() != 0 && frequency.quad_part.get() as u64 == crate::ntos::ke::clock::QPC_FREQUENCY && call("NtQueryPerformanceCounter", 0, 0, 0, 0) == 0xC000_0005, "usercore: contador e frequencia de 10 MHz");
     let exit_cell = crate::hal::amd64::usermode::block().exit_code.get();
-    // O processo corrente aqui é o System: o NtTerminateProcess dele mesmo
-    // liga o ProcessDelete (o começo do fim do processo), que o teste desfaz.
     let terminating = unsafe { nt::Eprocess::at(crate::ntos::ps::process::get_current_process()) };
-    let delete_before = terminating.flags.get() & nt::Eprocess::PROCESS_DELETE_MASK;
     assert(call("NtTerminateProcess", u64::MAX, 0x42, 0, 0) == state::TERMINATE_MAGIC && crate::hal::amd64::usermode::block().exit_code.get() == 0x42 && terminating.flags.get() & nt::Eprocess::PROCESS_DELETE_MASK != 0, "usercore: NtTerminateProcess publica o codigo para a HAL e liga o ProcessDelete");
-    terminating.flags.atomic().fetch_and(!nt::Eprocess::PROCESS_DELETE_MASK | delete_before, core::sync::atomic::Ordering::SeqCst);
+    undo_system_self_termination();
     crate::hal::amd64::usermode::block().exit_code.set(exit_cell);
     // Informações do sistema.
     assert(call("NtQuerySystemInformation", 0, buffer, 0x40, info) == 0 && { let system = unsafe { nt::SystemBasicInformation::at(buffer) }; system.page_size.get() == 0x1000 && system.allocation_granularity.get() == 0x10000 && system.minimum_user_mode_address.get() == 0x1_0000 && system.maximum_user_mode_address.get() == 0x7FFF_FFFE_FFFF } && guest::read32(info) == 0x40, "usercore: SYSTEM_BASIC_INFORMATION (usuario de 64 KB a MmHighestUserAddress)");
@@ -2545,6 +2542,7 @@ fn user_index(assert: Assert) {
     assert(index::invoke_service("NtDisplayString", [string, 0, 0, 0], 0x1_4000_1000, block + 0x800).ok() == Some(0) && state::with(|state| state.seen_syscalls.contains("NtDisplayString")), "userindex: invokeService chega ao handler por nome");
     if state::with(|state| state.name_by_number.get(&0x2C).is_some()) {
         assert(index::handle(0x2C, [u64::MAX, 0x31, 0, 0], 0, block + 0x800).ok() == Some(state::TERMINATE_MAGIC) && crate::hal::amd64::usermode::block().exit_code.get() == 0x31 && index::handle(0x28, [0; 4], 0, 0).ok() == Some(0xC000_0002), "userindex: entrada por numero de servico");
+        undo_system_self_termination();
         // Caminho completo em UserMode: gateway, trampolim, despacho e ponte.
         let gateways = kernel_address::image_address(crate::hal::amd64::service_table::entries()[5]).unwrap_or(0);
         let previous = process::get_current_thread();
@@ -2552,6 +2550,7 @@ fn user_index(assert: Assert) {
             process::set_current_thread(thread);
             let displayed = native_call::call(gateways + 0x27 * 10, &[string]);
             let terminated = native_call::call(gateways + 0x2C * 10, &[u64::MAX, 0x55]);
+            undo_system_self_termination();
             let restored = state::syscall_record() == state::SyscallRecord::default();
             process::set_current_thread(previous);
             let _ = process::release_thread(thread);
@@ -3600,6 +3599,18 @@ fn user_remove_completion(assert: Assert) {
     }
     if let Some(region) = memory::find_region(block) {
         memory::release_private_region(&region);
+    }
+}
+
+/// Os autotestes chamam os serviços de usuário com o System como processo
+/// corrente: o NtTerminateProcess do próprio processo (e a segunda chance de
+/// uma exceção) liga o ProcessDelete dele, o começo do fim do processo, que
+/// o teste desfaz para não deixar o System como processo em exclusão.
+fn undo_system_self_termination() {
+    let current = crate::ntos::ps::process::get_current_process();
+    if current == crate::ntos::ps::process::get_system_process() {
+        // SAFETY: o EPROCESS do System, que nunca sai.
+        unsafe { nt::Eprocess::at(current) }.flags.atomic().fetch_and(!nt::Eprocess::PROCESS_DELETE_MASK, core::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -5284,6 +5295,7 @@ fn user_exceptions(assert: Assert) {
     exception.exception_address.set(block + 0x900);
     let saved_exit = crate::hal::amd64::usermode::block().exit_code.get();
     let second = exceptions::raise(record, context, 0).ok();
+    undo_system_self_termination();
     let exit_code = crate::hal::amd64::usermode::block().exit_code.get();
     crate::hal::amd64::usermode::block().exit_code.set(saved_exit);
     exception.number_parameters.set(16);
