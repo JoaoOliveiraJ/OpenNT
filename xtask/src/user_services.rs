@@ -18,6 +18,8 @@
 //! o services.exe lê no início automático (o `EarlyStartServices`, a lista
 //! do conjunto inicial, e o `SvcHostSplitThresholdInKB`, o limite de
 //! memória para separar os serviços de um svchost em processos próprios),
+//! o `FullProcessInformationSID` de `Control\Windows`, que o
+//! BrokerInfrastructure lê ao subir,
 //! a configuração de energia (`Control\Power`), as definições WNF
 //! (`Control\Notifications`), as opções do produto (`Control\ProductOptions`)
 //! e, na SOFTWARE, os grupos do svchost (`Microsoft\Windows NT\CurrentVersion\
@@ -81,6 +83,18 @@ pub fn system_keys(control_set: &str) -> Vec<HostKey> {
         registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\Control"), &format!("{control_set}\\Control"), false, &mut keys);
         if let Some(control) = keys.get_mut(first) {
             control.values.retain(|(name, _, _)| CONTROL_VALUES.iter().any(|kept| kept.eq_ignore_ascii_case(name)));
+        }
+        // Só o FullProcessInformationSID da chave Control\Windows (um SID de
+        // serviço, S-1-5-80-...): o PsmpInitializeQueryDescriptor do
+        // psmsrv.dll o acrescenta ao descritor de consulta do
+        // BrokerInfrastructure e, sem o valor, o NtQueryValueKey volta
+        // STATUS_OBJECT_NAME_NOT_FOUND, o PsmpStartServer falha e o serviço
+        // para logo depois de iniciar. O ShutdownTime da chave fica com o
+        // kernel.
+        let first = keys.len();
+        registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\Control\\Windows"), &format!("{control_set}\\Control\\Windows"), false, &mut keys);
+        if let Some(windows) = keys.get_mut(first) {
+            windows.values.retain(|(name, _, _)| name.eq_ignore_ascii_case("FullProcessInformationSID"));
         }
         // As opções do produto: o tipo, a suíte e a política de licença
         // (ProductPolicy) que o NtQueryLicenseValue lê; sem ela toda
