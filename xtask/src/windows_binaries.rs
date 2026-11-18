@@ -35,8 +35,8 @@
 //! fecho dos imports, o XAML e os provedores de credencial), os `.mui` dos
 //! programas (no idioma de fallback quando o de interface não tem), os
 //! recursos deles em `\Windows\SystemResources`, os assemblies de WinSxS
-//! (`side_by_side`), as fontes (`fonts`) e as pastas de dados que a tela de
-//! logon lê (os metadados WinRT, as imagens da tela de bloqueio e as do
+//! (`side_by_side`), as fontes (`fonts`), o tema visual (`theme`) e as
+//! pastas de dados que a tela de logon lê (os metadados WinRT, as imagens da tela de bloqueio e as do
 //! bloco do usuário).
 
 use std::fs;
@@ -999,6 +999,19 @@ pub fn ntfs_files(root: &Path, kernel_pe: &[u8], initial_process: &str) -> Resul
             }
         }
         println!("fontes no volume NTFS: {faces}");
+        // O tema visual da sessão (`theme`), em
+        // `\Windows\Resources\Themes\aero`.
+        let mut styles = 0;
+        for (path, source) in crate::theme::files(&windows, &languages, &fallbacks) {
+            match fs::read(&source) {
+                Ok(bytes) => {
+                    files.push((path, bytes));
+                    styles += 1;
+                }
+                Err(_) => println!("AVISO: {} ausente no Windows desta maquina", source.display()),
+            }
+        }
+        println!("arquivos do tema no volume NTFS: {styles}");
         // As pastas de dados da tela de logon (`LOGON_SCREEN_FOLDERS`) e as
         // imagens padrão do bloco do usuário (`USER_ACCOUNT_PICTURES`).
         let mut data = 0;

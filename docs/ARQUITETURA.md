@@ -3775,7 +3775,10 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   contas desta máquina (`USER_ACCOUNT_PICTURES`), as
   fontes de `\SystemRoot\Fonts` com o GRE_Initialize, o FontSubstitutes, o
   FontLink e a chave Fonts, e na SYSTEM o `Control\IDConfigDB` e os perfis
-  de `Hardware Profiles` (o `LogPixels` do DPI, `xtask/src/fonts.rs`), e as
+  de `Hardware Profiles` (o `LogPixels` do DPI, `xtask/src/fonts.rs`), o
+  tema que o uxinit do winlogon carrega sem o serviço Themes (o
+  `aero.msstyles` com o `.mui` e as chaves `ThemeManager` da SOFTWARE e da
+  DEFAULT, `xtask/src/theme.rs`), e as
   classes COM em processo (`Classes\CLSID`: o LogonUIController, os
   provedores de credencial, a fábrica e os codecs do WIC) e WinRT
   (`WindowsRuntime\ActivatableClassId`) das DLLs do volume, as interfaces

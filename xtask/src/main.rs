@@ -55,6 +55,7 @@ mod qcow2;
 mod qemu;
 mod service_chain;
 mod side_by_side;
+mod theme;
 mod user_services;
 mod windows_binaries;
 mod status;
