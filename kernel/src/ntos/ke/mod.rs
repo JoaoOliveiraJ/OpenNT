@@ -2,6 +2,7 @@
 
 pub mod bugcheck;
 pub mod bugcheck_reason;
+pub mod bugcheck_trace;
 pub mod clock;
 pub mod dpc;
 pub mod dump_memory;

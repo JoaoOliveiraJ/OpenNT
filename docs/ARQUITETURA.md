@@ -1060,7 +1060,7 @@ do `finish_exit`). O bloco traz processo, pid:tid, código e endereço da
 exceção, módulo + deslocamento (lista InLoadOrder do PEB_LDR_DATA ou, fora
 dela, uma região nomeada do VAD do processo ou do System), o export mais
 próximo e até dez quadros da pilha de usuário desenrolados pela .pdata de
-cada módulo. Cada exceção entregue fica anotada na thread (código,
+cada módulo (`rtl/frame_walk.rs`). Cada exceção entregue fica anotada na thread (código,
 endereço, registradores e o frame do CONTEXT), então o bloco de um ponto
 posterior desenrola a pilha da própria falha; sem anotação, a pilha sai da
 chamada de sistema, sem os quadros do despacho em modo usuário. Cada
@@ -2756,7 +2756,24 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   imagem carregada que contém um dos parâmetros (KiDumpParameterImages). O
   i8042prt.sys tem o CrashOnCtrlScroll ligado: Ctrl direito com Scroll Lock
   duas vezes faz o próprio driver chamar KeBugCheckEx(0xE2), o teste
-  `bugcheck`.
+  `bugcheck`. Logo depois da linha `*** STOP`, antes da parada do depurador,
+  o diagnóstico do OpenNT (`ke/bugcheck_trace.rs`, só serial, sem mudar o
+  bugcheck) imprime um bloco `[kcrash]`: a origem (a exceção de kernel sem
+  tratamento do KMODE_EXCEPTION_NOT_HANDLED, anotada pelo despacho de
+  exceções, com o tipo de acesso e o endereço que faltou; senão a chamada
+  nativa ao kernel em curso, com a rotina chamada quando a instrução é a de
+  um import pela IAT; senão a cadeia de RBP do próprio kernel), os
+  registradores inteiros do CONTEXT e até 16 quadros desenrolados pela
+  .pdata de cada imagem (`rtl/frame_walk.rs`, o mesmo desenrolamento do
+  `[crash]` de modo usuário) e, nas funções do kernel, pelos frame pointers.
+  Cada endereço sai como módulo+deslocamento pela PsLoadedModuleList (que
+  também traz as imagens de sessão) e com o export mais próximo. O bloco não
+  aloca, não espera trava e só lê páginas presentes da metade de sistema
+  mapeadas com cache, então serve em qualquer IRQL; a exceção de kernel que
+  não chega ao despacho (`*** EXCECAO DE KERNEL`) ganha os mesmos quadros.
+  O autoteste `ntos/test/kernel_crash_trace.rs` (fase 6) confere a descrição
+  de um trampolim de export, a decodificação das chamadas, a cadeia de RBP e
+  as recusas do leitor.
 - **Pedidos térmicos** (`po/thermal.rs`, `po/reason_context.rs`): a
   extensão de resfriamento de cada alvo recebe a
   GUID_THERMAL_COOLING_INTERFACE por um IRP_MN_QUERY_INTERFACE síncrono ao

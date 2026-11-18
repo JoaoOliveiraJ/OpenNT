@@ -205,6 +205,15 @@ pub fn current() -> Result<u64, KernelError> {
     }
 }
 
+/// [`current`] sem esperar a trava das invocações (o diagnóstico de uma
+/// parada, que pode ter vindo de dentro dela): `None` sem invocação com
+/// CONTEXT ou com a trava tomada.
+pub fn try_current() -> Option<u64> {
+    let stack = current_stack();
+    let invocations = INVOCATIONS.try_lock()?;
+    invocations.iter().rev().find(|invocation| invocation.stack == stack).map(|invocation| invocation.context).filter(|&context| context != 0)
+}
+
 /// Copia o contexto desejado para o frame ativo, marca a ação e devolve o
 /// sinal a propagar; o gateway observa a ação depois da limpeza das camadas.
 pub fn transfer(context: u64) -> KernelError {

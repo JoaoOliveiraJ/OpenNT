@@ -871,6 +871,9 @@ extern "C" fn rs_kernel_exception(frame: &TrapFrame) -> ! {
         "    R12={:#018x} R13={:#018x} R14={:#018x} R15={:#018x}\n",
         frame.r12, frame.r13, frame.r14, frame.r15
     ));
+    // O módulo do RIP e a pilha (também sem alocar nem esperar trava).
+    let integer = [frame.rax, frame.rcx, frame.rdx, frame.rbx, rsp, frame.rbp, frame.rsi, frame.rdi, frame.r8, frame.r9, frame.r10, frame.r11, frame.r12, frame.r13, frame.r14, frame.r15];
+    crate::ntos::ke::bugcheck_trace::trap(crate::ntos::rtl::frame_walk::Registers { integer, rip });
     serial::puts("*** sistema parado ***\n");
     cpu::halt_forever()
 }

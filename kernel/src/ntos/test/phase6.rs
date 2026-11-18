@@ -16194,6 +16194,7 @@ pub fn run(assert: Assert) {
     system_information_ex_exports(assert);
     zw_set_information_process_exports(assert);
     super::critical_process::run(assert);
+    super::kernel_crash_trace::run(assert);
     zw_timer_exports(assert);
     zw_reserve_object_exports(assert);
     zw_wnf_name_information_exports(assert);

@@ -6,7 +6,9 @@
 //!    segundo processador que entra fica girando até ser congelado, e um
 //!    bugcheck aninhado no mesmo processador soma 4 e para a máquina;
 //! 2. KiBugCheckData recebe o código e os quatro parâmetros, e a linha
-//!    `*** STOP (KeBugCheckEx)` vai para a serial;
+//!    `*** STOP (KeBugCheckEx)` vai para a serial, seguida do bloco de
+//!    diagnóstico `[kcrash]` do OpenNT (`bugcheck_trace`: a exceção ou a
+//!    chamada que levou à parada, os registradores e a pilha);
 //! 3. com o depurador do kernel ligado, a máquina para nele antes de tudo
 //!    (DBG_STATUS_BUGCHECK_FIRST), menos no MANUALLY_INITIATED_CRASH (0xE2),
 //!    que o KeBugCheck2 pula;
@@ -43,7 +45,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use super::{bugcheck_reason, irql};
+use super::{bugcheck_reason, bugcheck_trace, irql};
 use crate::hal::amd64::native_call;
 use crate::hal::{cpu, firmware_return};
 use crate::ntos::bgk::bugcheck_screen::{self, Text, FLAG_NO_AUTO_REBOOT, FLAG_NO_DUMP};
@@ -137,6 +139,7 @@ pub fn bug_check_ex(code: u32, first: u64, second: u64, third: u64, fourth: u64)
     if !READY.load(Ordering::Acquire) {
         crate::ntos::kd::stop::bug_check(code, parameters);
         debug_print!("*** STOP: {:#010x} ({:#018x}, {:#018x}, {:#018x}, {:#018x})", code, first, second, third, fourth);
+        bugcheck_trace::report();
         cpu::halt_forever()
     }
     bug_check2(code, parameters)
@@ -173,6 +176,8 @@ fn bug_check2(code: u32, parameters: [u64; 4]) -> ! {
     }
     debug_print!("");
     debug_print!("*** STOP (KeBugCheckEx): {:#010x} ({:#x}, {:#x}, {:#x}, {:#x})", code, parameters[0], parameters[1], parameters[2], parameters[3]);
+    // Diagnóstico do OpenNT, só serial: a pilha de quem parou.
+    bugcheck_trace::report();
     // O depurador do kernel para a máquina antes da tela (o KeBugCheck2 pula
     // essa parada no despejo manual).
     if code != MANUALLY_INITIATED_CRASH {

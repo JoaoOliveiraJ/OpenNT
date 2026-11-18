@@ -97,10 +97,13 @@ fn with_workspace<T>(length: u64, operation: impl FnOnce(u64) -> Result<T, Kerne
 }
 
 /// Exceção não tratada: KMODE_EXCEPTION_NOT_HANDLED pelo KeBugCheckEx real.
+/// O registro e o CONTEXT ficam anotados para o bloco de diagnóstico da
+/// parada (`ke::bugcheck_trace`).
 fn stop_for_unhandled_exception(record: u64, context: u64, message: &str) -> ! {
     let (exception, frame) = (record_at(record), context_at(context));
     let code = exception.exception_code.get() as u32;
     debug_print!("[kernel-seh] {} code=0x{:x} pc=0x{:x}", message, code, frame.rip.get());
+    crate::ntos::ke::bugcheck_trace::note_exception(record, context);
     ke::raise_bug_check(0x1E, code as u64, exception.exception_address.get(), 0, 0)
 }
 
@@ -249,11 +252,15 @@ fn search_exception_handlers(record: u64, context: u64, maximum_irql: u8) -> Res
 }
 
 /// Sinais de transferência e pedidos de unwind propagam; qualquer outra
-/// falha para o sistema (a API não tem retorno comum).
-fn run_nonreturning_operation(operation: impl FnOnce() -> Result<u64, KernelError>, status: u32) -> Result<u64, KernelError> {
+/// falha para o sistema (a API não tem retorno comum). `exception`: o
+/// registro e o CONTEXT do chamador, anotados para o diagnóstico da parada.
+fn run_nonreturning_operation(operation: impl FnOnce() -> Result<u64, KernelError>, status: u32, exception: Option<(u64, u64)>) -> Result<u64, KernelError> {
     match operation() {
         Err(error) if !native_context::is_transfer(&error) && !is_unwind(&error) => {
             debug_print!("[kernel-seh] fatal dispatcher failure: {}", error);
+            if let Some((record, context)) = exception {
+                crate::ntos::ke::bugcheck_trace::note_exception(record, context);
+            }
             ke::raise_bug_check(0x1E, status as u64, 0, 0, 0)
         }
         other => other,
@@ -262,7 +269,7 @@ fn run_nonreturning_operation(operation: impl FnOnce() -> Result<u64, KernelErro
 
 /// ExRaiseStatus/RtlRaiseStatus.
 pub fn raise_status(status: u32, linked: u64, source: u64, maximum_irql: u8) -> Result<u64, KernelError> {
-    run_nonreturning_operation(|| raise_status_core(status, linked, source, maximum_irql), status)
+    run_nonreturning_operation(|| raise_status_core(status, linked, source, maximum_irql), status, None)
 }
 
 /// EXCEPTION_RECORD não continuável, CONTEXT de origem, IRQL e limite de
@@ -311,6 +318,7 @@ pub fn raise_exception(record: u64, return_value: u64) -> Result<u64, KernelErro
             })
         },
         record_at(record).exception_code.get() as u32,
+        None,
     )
 }
 
@@ -332,7 +340,7 @@ pub fn raise_software_exception(code: u32, parameters: &[u64], return_value: u64
 
 /// RtlUnwindEx (a tabela de histórico não é usada).
 pub fn unwind_ex(frame: u64, target: u64, record: u64, value: u64, context: u64, _history: u64) -> Result<u64, KernelError> {
-    run_nonreturning_operation(|| unwind_ex_core(frame, target, record, value, context), STATUS_UNWIND)
+    run_nonreturning_operation(|| unwind_ex_core(frame, target, record, value, context), STATUS_UNWIND, None)
 }
 
 /// De dentro do handler corrente o pedido sobe ao despachante; fora dele o
@@ -435,5 +443,6 @@ pub fn dispatch_exception(record: u64, context: u64) -> Result<u64, KernelError>
             result
         },
         record_at(record).exception_code.get() as u32,
+        Some((record, context)),
     )
 }
