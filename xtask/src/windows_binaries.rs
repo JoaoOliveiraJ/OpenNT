@@ -994,6 +994,28 @@ pub fn ntfs_files(root: &Path, kernel_pe: &[u8], initial_process: &str) -> Resul
             }
         }
         println!("imagens de kernel do smss no volume NTFS: {images} de {}", SMSS_KERNEL_IMAGES.len());
+        // Os arquivos dos layouts de teclado que o perfil do sistema desta
+        // máquina pré-carrega (`host_language`, que também copia as chaves
+        // `Keyboard Layout(s)`): o user32 abre o do primeiro no
+        // CreateWindowStationW do wininit e no LoadKeyboardLayout do
+        // winlogon. O kbdus.dll já está em `SMSS_PROGRAMS`.
+        let mut layouts = Vec::new();
+        for name in crate::host_language::keyboard_layout_files() {
+            let staged_name = name.to_uppercase();
+            if files.iter().any(|(staged, _)| *staged == staged_name) {
+                layouts.push(staged_name);
+                continue;
+            }
+            let source = system32.join(&name);
+            match fs::read(&source) {
+                Ok(bytes) => {
+                    files.push((staged_name.clone(), bytes));
+                    layouts.push(staged_name);
+                }
+                Err(_) => println!("AVISO: {} ausente no Windows desta maquina", source.display()),
+            }
+        }
+        println!("layouts de teclado do perfil do sistema no volume NTFS: {}", if layouts.is_empty() { String::from("nenhum (o user32 cai no kbdus.dll)") } else { layouts.join(", ") });
         // Os recursos dos programas e das imagens de System32 nos idiomas de
         // interface desta máquina (`System32\<idioma>\<nome>.mui`), que o
         // carregador de recursos procura pelo idioma do convidado (o mesmo

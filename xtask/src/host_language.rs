@@ -7,14 +7,19 @@
 //! As chaves vêm inteiras, com os valores e os tipos como estão aqui:
 //! - na SYSTEM, `Control\Nls\Language` (o `Default`, que o kernel lê como
 //!   PsDefaultSystemLocaleId, e o `InstallLanguage`, o
-//!   PsInstallUILanguageId) e `Control\MUI\UILanguages` (os idiomas de
-//!   interface instalados, que a ntdll consulta ao procurar um `.mui`);
-//! - na DEFAULT (`\Registry\User\.DEFAULT`), `Control Panel\International`
-//!   e `Control Panel\Desktop\MuiCached` (a localidade e os idiomas de
-//!   interface preferidos do perfil do sistema).
+//!   PsInstallUILanguageId), `Control\MUI\UILanguages` (os idiomas de
+//!   interface instalados, que a ntdll consulta ao procurar um `.mui`),
+//!   `Control\Keyboard Layouts` (os layouts de teclado instalados, com o
+//!   `Layout File` de cada um) e `Control\Keyboard Layout`;
+//! - na DEFAULT (`\Registry\User\.DEFAULT`), `Control Panel\International`,
+//!   `Control Panel\Desktop\MuiCached` (a localidade e os idiomas de
+//!   interface preferidos do perfil do sistema) e `Keyboard Layout` (o
+//!   `Preload`, os `Substitutes` e o `Toggle` do perfil do sistema: o
+//!   user32 do wininit e do winlogon abre o arquivo do primeiro layout do
+//!   `Preload`, e o volume leva esse arquivo, [`keyboard_layout_files`]).
 //!
 //! Fora do Windows (ou sem as chaves) nada é copiado e o convidado fica com
-//! o padrão do kernel.
+//! o padrão do kernel (sem `Preload`, o user32 cai no kbdus.dll).
 
 use std::path::Path;
 
@@ -134,6 +139,20 @@ pub(crate) mod registry {
         let units: Vec<u16> = data.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect();
         units.split(|&unit| unit == 0).filter(|text| !text.is_empty()).map(String::from_utf16_lossy).collect()
     }
+
+    /// Os valores de cadeia de `path` (REG_SZ ou REG_EXPAND_SZ) com o nome,
+    /// na ordem do Registro: (nome, cadeia até o primeiro NUL).
+    pub fn named_strings(root: Hkey, path: &str) -> Vec<(String, String)> {
+        let Some(key) = open(root, path) else { return Vec::new() };
+        values(&key)
+            .into_iter()
+            .filter(|(_, kind, _)| matches!(kind, 1 | 2))
+            .map(|(name, _, data)| {
+                let units: Vec<u16> = data.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).take_while(|&unit| unit != 0).collect();
+                (name, String::from_utf16_lossy(&units))
+            })
+            .collect()
+    }
 }
 
 /// As chaves de idioma da SYSTEM, já no conjunto de controle que a hive
@@ -145,6 +164,8 @@ pub fn system_keys(control_set: &str) -> Vec<HostKey> {
         let control = "SYSTEM\\CurrentControlSet\\Control";
         registry::copy(registry::LOCAL_MACHINE, &format!("{control}\\Nls\\Language"), &format!("{control_set}\\Control\\Nls\\Language"), false, &mut keys);
         registry::copy(registry::LOCAL_MACHINE, &format!("{control}\\MUI\\UILanguages"), &format!("{control_set}\\Control\\MUI\\UILanguages"), true, &mut keys);
+        registry::copy(registry::LOCAL_MACHINE, &format!("{control}\\Keyboard Layouts"), &format!("{control_set}\\Control\\Keyboard Layouts"), true, &mut keys);
+        registry::copy(registry::LOCAL_MACHINE, &format!("{control}\\Keyboard Layout"), &format!("{control_set}\\Control\\Keyboard Layout"), true, &mut keys);
     }
     #[cfg(not(windows))]
     let _ = control_set;
@@ -158,8 +179,44 @@ pub fn default_keys() -> Vec<HostKey> {
     {
         registry::copy(registry::USERS, ".DEFAULT\\Control Panel\\International", "Control Panel\\International", true, &mut keys);
         registry::copy(registry::USERS, ".DEFAULT\\Control Panel\\Desktop\\MuiCached", "Control Panel\\Desktop\\MuiCached", false, &mut keys);
+        registry::copy(registry::USERS, ".DEFAULT\\Keyboard Layout", "Keyboard Layout", true, &mut keys);
     }
     keys
+}
+
+/// Os arquivos de layout de teclado (o `Layout File` de
+/// `Control\Keyboard Layouts\<KLID>`, como `KBDBR.DLL`) dos layouts que o
+/// perfil do sistema desta máquina pré-carrega (`Keyboard Layout\Preload`
+/// da DEFAULT, na ordem dos valores, com o `Substitutes` aplicado), sem
+/// repetição. O user32 abre o do primeiro no CreateWindowStationW (o
+/// NtUserCreateWindowStation recebe o handle) e no LoadKeyboardLayout do
+/// winlogon; sem o arquivo no volume a WinSta0 falha com
+/// ERROR_MOD_NOT_FOUND.
+pub fn keyboard_layout_files() -> Vec<String> {
+    #[cfg(windows)]
+    {
+        let profile = ".DEFAULT\\Keyboard Layout";
+        let substitutes = registry::named_strings(registry::USERS, &format!("{profile}\\Substitutes"));
+        let mut files: Vec<String> = Vec::new();
+        // Os valores do Preload são numerados ("1", "2", ...): o user32 os
+        // lê nessa ordem.
+        let mut preload = registry::named_strings(registry::USERS, &format!("{profile}\\Preload"));
+        preload.sort_by_key(|(name, _)| name.parse::<u32>().unwrap_or(u32::MAX));
+        for (_, layout) in preload {
+            let layout = substitutes.iter().find(|(name, _)| name.eq_ignore_ascii_case(&layout)).map_or(layout.clone(), |(_, substitute)| substitute.clone());
+            let path = format!("SYSTEM\\CurrentControlSet\\Control\\Keyboard Layouts\\{layout}");
+            for file in registry::strings(registry::LOCAL_MACHINE, &path, "Layout File") {
+                if !files.iter().any(|known| known.eq_ignore_ascii_case(&file)) {
+                    files.push(file);
+                }
+            }
+        }
+        files
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
 }
 
 /// Os idiomas de interface instalados nesta máquina (os nomes das pastas
@@ -215,4 +272,30 @@ pub fn mui_files(directory: &Path, name: &str, languages: &[String], fallbacks: 
         return found;
     }
     fallbacks.iter().map(candidate).find(|(_, source)| source.is_file()).into_iter().collect()
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::{default_keys, keyboard_layout_files, registry, system_keys};
+
+    /// Os layouts pré-carregados desta máquina resolvem para arquivos de
+    /// System32, e as chaves copiadas levam o Preload e o layout dele.
+    #[test]
+    fn preloaded_keyboard_layouts_resolve_to_system32_files() {
+        let preload = registry::named_strings(registry::USERS, ".DEFAULT\\Keyboard Layout\\Preload");
+        let files = keyboard_layout_files();
+        if preload.is_empty() {
+            assert!(files.is_empty());
+            return;
+        }
+        assert!(!files.is_empty(), "Preload {preload:?} sem Layout File");
+        let system32 = crate::windows_binaries::windows_directory().join("System32");
+        for file in &files {
+            assert!(system32.join(file).is_file(), "{file} ausente em System32");
+        }
+        assert!(default_keys().iter().any(|key| key.path == "Keyboard Layout\\Preload"));
+        let first = &preload.iter().min_by_key(|(name, _)| name.parse::<u32>().unwrap_or(u32::MAX)).unwrap().1;
+        let layout = format!("ControlSet001\\Control\\Keyboard Layouts\\{first}");
+        assert!(system_keys("ControlSet001").iter().any(|key| key.path.eq_ignore_ascii_case(&layout)), "{layout} nao copiada");
+    }
 }

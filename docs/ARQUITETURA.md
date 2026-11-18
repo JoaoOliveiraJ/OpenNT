@@ -4005,12 +4005,17 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   ThreadImpersonationToken da entrada Zw), e o servidor do rpcrt4 aceita o
   bind quando o TpCallbackMayRunLong (a classe 9 do
   NtSetInformationWorkerFactory) responde que a fábrica ainda cresce. No
-  CreateWindowStationW, o user32 abre o kbdus.dll e o NtUserCreateWindowStation
+  CreateWindowStationW, o user32 abre o arquivo do primeiro layout de
+  teclado do `Keyboard Layout\Preload` do perfil do sistema (o kbdus.dll
+  quando não há Preload) e o NtUserCreateWindowStation
   manda ao csrss um pedido síncrono de kernel direto à porta de conexão
   `\Windows\ApiPort` (`server::connection_request`). O idioma do convidado
   é o desta instalação (o xtask copia o `Control\Nls\Language`, o
-  `Control\MUI\UILanguages` e o perfil de idioma da DEFAULT do Registro
-  desta máquina, e põe no volume os `.mui` dos programas nos idiomas de
+  `Control\MUI\UILanguages`, o `Control\Keyboard Layouts`, o
+  `Control\Keyboard Layout` e o perfil de idioma e de teclado da DEFAULT do
+  Registro desta máquina, põe no volume o `Layout File` dos layouts
+  pré-carregados, como o KBDBR.DLL de uma instalação pt-BR, e os `.mui`
+  dos programas nos idiomas de
   interface daqui, ou no idioma de fallback (o `DefaultFallback` do idioma
   e o `InstallLanguageFallback`, como o en-US) para um programa sem `.mui`
   neles; o kernel lê o `Control\Nls\Language` no boot,
