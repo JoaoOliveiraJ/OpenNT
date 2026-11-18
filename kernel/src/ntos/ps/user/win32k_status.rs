@@ -19,6 +19,11 @@
 //! Cada par (serviço, status) imprime as quatro primeiras vezes e depois uma
 //! a cada 256, com a contagem. Só diagnóstico: o resultado volta ao modo
 //! usuário como veio.
+//!
+//! Os serviços do redirecionamento que devolvem BOOL (`BOOL_SERVICES`) não
+//! têm o bit 31 numa falha: um FALSE deles sai como `FALHOU com FALSE`. Para
+//! isso, todo serviço da tabela do win32k que volta zero consulta a tabela de
+//! nomes (uma busca no BTreeMap, sem cópia do nome).
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -34,19 +39,31 @@ use crate::rtl::SpinLock;
 /// dxgkrnl ou à composição do win32k.
 const PREFIXES: [&str; 5] = ["NtGdiDdDDI", "NtDxgk", "NtDComposition", "NtTokenManager", "NtFlipObject"];
 
-/// Número do serviço -> nome; `None` até a primeira falha de um serviço da
-/// tabela do win32k.
+/// Os serviços do redirecionamento do DWM que devolvem BOOL (win32kfull
+/// 19041): o NtUserDwmKernelStartup (0x135da0, TRUE só quando o
+/// zzzDwmStartRedirection dá certo), o NtUserSignalRedirectionStartComplete
+/// (0x135a50, o NT_SUCCESS do ZwSetEvent dele), o NtGdiHLSurfGetInformation
+/// (0xbc5c0) e o NtGdiHLSurfSetInformation (0x14d90). Um FALSE é a falha.
+const BOOL_SERVICES: [&str; 4] = ["NtUserDwmKernelStartup", "NtUserSignalRedirectionStartComplete", "NtGdiHLSurfGetInformation", "NtGdiHLSurfSetInformation"];
+
+/// Número do serviço -> nome; `None` até a primeira falha (ou o primeiro
+/// zero) de um serviço da tabela do win32k num processo com o win32u.dll.
 static NAMES: SpinLock<Option<BTreeMap<u32, String>>> = SpinLock::new(None);
 /// (número, status) -> quantas vezes falhou.
 static FAILURES: SpinLock<BTreeMap<(u32, u32), u32>> = SpinLock::new(BTreeMap::new());
 
 /// O nome entra na lista dos serviços acompanhados: os prefixos, as
-/// superfícies de composição e os serviços da configuração de vídeo
+/// superfícies de composição, os serviços da configuração de vídeo
 /// (NtUser*DisplayConfig*, o QueryDisplayConfig/DisplayConfigGetDeviceInfo
 /// do dxgi, do dwmcore e do uDWM; a user32 converte o NTSTATUS deles com o
-/// RtlNtStatusToDosError).
+/// RtlNtStatusToDosError) e os serviços BOOL do redirecionamento.
 pub fn watched(name: &str) -> bool {
-    PREFIXES.iter().any(|prefix| name.starts_with(prefix)) || name.contains("CompositionSurface") || (name.starts_with("NtUser") && name.contains("DisplayConfig"))
+    PREFIXES.iter().any(|prefix| name.starts_with(prefix)) || name.contains("CompositionSurface") || (name.starts_with("NtUser") && name.contains("DisplayConfig")) || returns_bool(name)
+}
+
+/// O serviço devolve BOOL (um dos `BOOL_SERVICES`).
+pub fn returns_bool(name: &str) -> bool {
+    BOOL_SERVICES.contains(&name)
 }
 
 /// A ocorrência `count` (a partir de 1) de um par (serviço, status) sai no
@@ -56,10 +73,18 @@ pub fn printed(count: u32) -> bool {
 }
 
 /// Um serviço da tabela do win32k (número com o bit 0x1000) voltou com
-/// `result`; `entry_rsp` é o RSP de usuário na entrada do syscall.
+/// `result`; `entry_rsp` é o RSP de usuário na entrada do syscall. Falha é
+/// o bit 31 do NTSTATUS, ou o zero (FALSE) de um serviço BOOL.
 pub fn returned(number: u32, result: u64, entry_rsp: u64) {
     let status = result as u32;
-    if status & 0x8000_0000 == 0 {
+    let failed = if status & 0x8000_0000 != 0 {
+        true
+    } else if status == 0 {
+        with_name(number, returns_bool).unwrap_or(false)
+    } else {
+        false
+    };
+    if !failed {
         return;
     }
     let Some(name) = name_of(number) else { return };
@@ -75,24 +100,31 @@ pub fn returned(number: u32, result: u64, entry_rsp: u64) {
     let caller = return_address(entry_rsp);
     let place = describe(caller);
     let repeated = if count > 4 { alloc::format!(" ({count} vezes)") } else { String::new() };
-    crate::debug_print!("[win32k] {}:{} {} FALHOU com {:#x} (chamador {}){}", process::get_current_process_id(), process::get_current_thread_id(), name, status, place, repeated);
+    let outcome = if status == 0 { String::from("FALSE") } else { alloc::format!("{status:#x}") };
+    crate::debug_print!("[win32k] {}:{} {} FALHOU com {} (chamador {}){}", process::get_current_process_id(), process::get_current_thread_id(), name, outcome, place, repeated);
 }
 
 /// O nome de um serviço acompanhado; monta a tabela na primeira consulta.
 fn name_of(number: u32) -> Option<String> {
+    with_name(number, |name| String::from(name))
+}
+
+/// `inspect` sobre o nome de um serviço acompanhado, sem copiá-lo; monta a
+/// tabela na primeira consulta.
+fn with_name<R>(number: u32, inspect: impl FnOnce(&str) -> R) -> Option<R> {
     {
         let names = NAMES.lock();
         if let Some(names) = names.as_ref() {
-            return names.get(&number).cloned();
+            return names.get(&number).map(|name| inspect(name.as_str()));
         }
     }
     let built = build_names()?;
-    let name = built.get(&number).cloned();
+    let result = built.get(&number).map(|name| inspect(name.as_str()));
     let mut names = NAMES.lock();
     if names.is_none() {
         *names = Some(built);
     }
-    name
+    result
 }
 
 /// Os serviços acompanhados do win32u.dll do processo corrente, pelo número
