@@ -20,6 +20,9 @@
 //!   seguido da cópia do buffer de entrada, alinhado a 16, sondando a faixa;
 //!   uma falha na sonda ou na cópia é a exceção que o __except do NT
 //!   converte no status devolvido (STATUS_ACCESS_VIOLATION), sem callback;
+//!   cada recusa do próprio KeUserModeCallback (o callback não roda) sai
+//!   numa linha `[callback]` da serial, com a rotina da tabela, o status, o
+//!   aninhamento e o RSP do usuário, para o diagnóstico;
 //! - troca a KTHREAD para a pilha nova (InitialStack, StackBase e
 //!   StackLimit, que o despacho põe em KPRCB.RspBase e TSS.RSP0) e entra no
 //!   anel 3 em ntdll!KiUserCallbackDispatcher (o KeUserCallbackDispatcher,
@@ -50,7 +53,7 @@
 //! não muda.
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::hal::amd64::usermode;
 use crate::ntos::inc::field::{Field, NtStruct, Reserved};
@@ -244,6 +247,30 @@ fn release(thread: &Kthread, stack: Option<kernel_stack::KernelStack>, status: u
     status
 }
 
+/// Quantas recusas do próprio KeUserModeCallback (sem o callback rodar) a
+/// serial ainda mostra.
+static REFUSALS_SHOWN: AtomicU32 = AtomicU32::new(0);
+const REFUSALS_LIMIT: u32 = 32;
+
+/// Diagnóstico: o KeUserModeCallback devolve `status` sem entrar no anel 3
+/// (fora de um serviço, aninhamento esgotado, sem memória, sonda ou cópia da
+/// pilha do usuário recusada, sem despachante). O chamador do win32k só vê o
+/// status; a linha mostra a rotina da tabela e onde estava a pilha.
+fn refusal(api_number: u32, status: u32, user_rsp: u64, nesting: u8) -> u32 {
+    if REFUSALS_SHOWN.fetch_add(1, Ordering::Relaxed) < REFUSALS_LIMIT {
+        crate::debug_print!(
+            "[callback] {}:{} KeUserModeCallback(api {:#x}) recusado com {:#x} (aninhamento {}, rsp do usuario {:#x})",
+            process::get_current_process_id(),
+            process::get_current_thread_id(),
+            api_number,
+            status,
+            nesting,
+            user_rsp
+        );
+    }
+    status
+}
+
 /// Sonda de escrita da faixa do usuário (o ProbeForWrite do NT, que lê e
 /// regrava um byte de cada página).
 fn probe_for_write(start: u64, length: u64) -> bool {
@@ -311,13 +338,15 @@ pub fn user_mode_callback(api_number: u32, input: u64, input_length: u32, output
     }
     let user = threads::current().filter(|user| user.pointer() == pointer);
     let syscall_context = usermode::block().context.get();
-    let Some(user) = user.filter(|_| usermode::in_service() && syscall_context != 0) else { return Ok(STATUS_NOT_SUPPORTED) };
+    let Some(user) = user.filter(|_| usermode::in_service() && syscall_context != 0) else {
+        return Ok(refusal(api_number, STATUS_NOT_SUPPORTED, 0, thread.callback_nesting_level.get()));
+    };
     let nesting = thread.callback_nesting_level.get().wrapping_add(1);
     thread.callback_nesting_level.set(nesting);
     if nesting > MAXIMUM_NESTING {
-        return Ok(release(thread, None, STATUS_STACK_OVERFLOW));
+        return Ok(refusal(api_number, release(thread, None, STATUS_STACK_OVERFLOW), 0, nesting));
     }
-    let Ok(stack) = kernel_stack::create(false) else { return Ok(release(thread, None, STATUS_NO_MEMORY)) };
+    let Ok(stack) = kernel_stack::create(false) else { return Ok(refusal(api_number, release(thread, None, STATUS_NO_MEMORY), 0, nesting)) };
     // SAFETY: o KERNEL_STACK_CONTROL da pilha recém-criada.
     let control = unsafe { KernelStackControl::at(stack.initial) };
     control.current_stack_base.set(stack.base);
@@ -333,7 +362,7 @@ pub fn user_mode_callback(api_number: u32, input: u64, input_length: u32, output
     let size = ((input_length as u64 + 15) & !15) + UcalloutFrame::SIZE;
     let frame = user_rsp.wrapping_sub(size) & !15;
     if !probe_for_write(frame, size) {
-        return Ok(release(thread, Some(stack), STATUS_ACCESS_VIOLATION));
+        return Ok(refusal(api_number, release(thread, Some(stack), STATUS_ACCESS_VIOLATION), user_rsp, nesting));
     }
     let copied = guest::try_write_bytes(frame + UcalloutFrame::SIZE, &guest::read_bytes(input, input_length as usize));
     // SAFETY: faixa do usuário sondada para escrita acima.
@@ -345,7 +374,7 @@ pub fn user_mode_callback(api_number: u32, input: u64, input_length: u32, output
         && ucallout.machine_rsp.probe_set(user_rsp).is_ok()
         && ucallout.machine_rip.probe_set(syscall.rip.get()).is_ok();
     if !written {
-        return Ok(release(thread, Some(stack), STATUS_ACCESS_VIOLATION));
+        return Ok(refusal(api_number, release(thread, Some(stack), STATUS_ACCESS_VIOLATION), user_rsp, nesting));
     }
     let dispatcher = DISPATCHER.load(Ordering::Acquire);
     let callout = guest::alloc_bytes(CalloutFrame::SIZE);
@@ -356,7 +385,7 @@ pub fn user_mode_callback(api_number: u32, input: u64, input_length: u32, output
                 guest::free_bytes(block);
             }
         }
-        return Ok(release(thread, Some(stack), if dispatcher == 0 { STATUS_NOT_SUPPORTED } else { STATUS_NO_MEMORY }));
+        return Ok(refusal(api_number, release(thread, Some(stack), if dispatcher == 0 { STATUS_NOT_SUPPORTED } else { STATUS_NO_MEMORY }), user_rsp, nesting));
     }
     // SAFETY: bloco recém-alocado do tamanho do quadro.
     let frame_cells = unsafe { CalloutFrame::at(callout) };
