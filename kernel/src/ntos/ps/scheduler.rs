@@ -565,9 +565,14 @@ pub fn init() -> Result<(), KernelError> {
 }
 
 /// A volta de quem espera um SharedLock com dono: a thread de kernel cede a
-/// vez; o contexto de boot roda um tick.
+/// vez; o contexto de boot roda um tick. Só no processador de boot, o único
+/// em que o escalonador despacha threads: um AP roda trabalhos sem thread
+/// corrente, sem nada a esperar nem a despachar, como o código do NT que não
+/// tem thread que possa esperar (a ociosa, uma DPC) e por isso gira; o tick
+/// num AP venceria timers, aprontaria threads e despacharia processos lá, ao
+/// mesmo tempo que o BSP, numa pilha que não é a deles.
 fn contention_yield() {
-    if crate::ntos::ke::irql::get_irql() >= crate::ntos::ke::irql::DISPATCH_LEVEL || crate::rtl::sync::spin_locks_held() != 0 {
+    if crate::ntos::ke::irql::get_irql() >= crate::ntos::ke::irql::DISPATCH_LEVEL || crate::rtl::sync::spin_locks_held() != 0 || crate::ntos::ke::context_switch::processor() != 0 {
         core::hint::spin_loop();
         return;
     }

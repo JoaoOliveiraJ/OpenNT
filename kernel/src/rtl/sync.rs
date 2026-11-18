@@ -82,8 +82,8 @@ pub fn swap_shared_locks_held(value: u32) -> u32 {
 
 /// Quem espera um SharedLock com dono cede a CPU por aqui a cada volta (o Ke
 /// registra: uma thread de kernel deixa a CPU, o contexto de boot roda o
-/// despacho), em vez de girar enquanto o dono, que pode ter deixado a CPU
-/// numa espera, não anda.
+/// despacho, um AP gira), em vez de girar enquanto o dono, que pode ter
+/// deixado a CPU numa espera, não anda.
 static CONTENTION_YIELD: AtomicU64 = AtomicU64::new(0);
 
 /// Registra a rotina de cessão da espera por um SharedLock.

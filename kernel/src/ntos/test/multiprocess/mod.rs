@@ -26,6 +26,7 @@ pub mod time_services;
 
 pub mod process_queries;
 pub mod ipi_stall;
+pub mod contention;
 pub mod current_thread;
 pub mod queue_wait;
 pub mod process_tables;

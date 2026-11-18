@@ -712,7 +712,11 @@ espaço próprio e confere que ela lê a página do espaço dele pela VA de
 usuário.
 Pedido de dentro de uma thread de kernel (o pump de uma espera genérica, o
 ZwYieldExecution com outra pronta, um SharedLock disputado), o tick não
-aninha: a thread cede a vez. Uma thread em execução dada como pronta
+aninha: a thread cede a vez. Um SharedLock disputado num AP não roda o tick:
+o AP executa trabalhos sem thread corrente, como o código do NT sem thread
+que possa esperar (a ociosa, uma DPC), e gira até o dono soltar; o tick lá
+venceria timers e despacharia processos ao mesmo tempo que o BSP
+(`ntos/test/multiprocess/contention.rs`). Uma thread em execução dada como pronta
 (`thread_dispatch::make_ready`) continua fora da fila, e o despachante a
 recoloca no fim do passo. A espera de uma thread de kernel (`ke/wait.rs`, o
 KiCommitThreadWait do 19041) tira a thread das prontas e troca de contexto;
