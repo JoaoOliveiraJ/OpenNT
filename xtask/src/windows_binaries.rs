@@ -36,7 +36,8 @@
 //! programas (no idioma de fallback quando o de interface não tem), os
 //! recursos deles em `\Windows\SystemResources`, os assemblies de WinSxS
 //! (`side_by_side`), as fontes (`fonts`) e as pastas de dados que a tela de
-//! logon lê (os metadados WinRT e as imagens da tela de bloqueio).
+//! logon lê (os metadados WinRT, as imagens da tela de bloqueio e as do
+//! bloco do usuário).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -565,6 +566,23 @@ const LOGON_SCREEN_PROGRAMS: &[&str] = &[
     // ícones da tela): um módulo só de recursos, que ficam no
     // imageres.dll.mun de SystemResources.
     "imageres.dll",
+    // O anfitrião dos provedores de credencial que o CredProvDataModel.dll
+    // cria pelo CLSID {7a872d34-bc6b-4f83-b199-22e9c0a91ddc}
+    // (credprovhost.dll), o shacct.dll das contas de usuário que ele
+    // enumera (CLSID_UserAccounts) e o Windows.UI.Immersive.dll da imagem da
+    // tela de bloqueio (ILogonUILockScreenImage, a classe WinRT
+    // Windows.System.UserProfile.LockScreen) e do repositório de blocos de
+    // usuário que o Windows.UI.Logon.dll cria.
+    "credprovhost.dll",
+    "shacct.dll",
+    "Windows.UI.Immersive.dll",
+    // As classes dos controles da tela que o Windows.UI.Logon.dll ativa: o
+    // ícone e o painel de rede, a entrada de texto e a acessibilidade (o
+    // uiautomationcore.dll).
+    "Windows.UI.NetworkUXController.dll",
+    "NetworkIcon.dll",
+    "Windows.UI.Core.TextInput.dll",
+    "uiautomationcore.dll",
     // O XAML da experiência de logon: as classes WinRT Windows.UI.Xaml.*, o
     // XAMLHostWindow, o Windows.UI.dll, o Windows.Globalization.dll e o
     // modelo de dados dos provedores de credencial (CredProvDataModel.dll),
@@ -621,6 +639,12 @@ const LOGON_SCREEN_PROGRAMS: &[&str] = &[
 /// imagem própria em `SystemData`). (pasta no volume, pasta de origem
 /// relativa ao diretório do Windows).
 const LOGON_SCREEN_FOLDERS: &[(&str, &str)] = &[("WinMetadata", "System32/WinMetadata"), ("Web/Screen", "Web/Screen")];
+
+/// As imagens padrão do bloco do usuário de `%ProgramData%\Microsoft\User
+/// Account Pictures`, que o repositório de blocos do Windows.UI.Immersive.dll
+/// usa para o "Outro usuário" e as contas sem imagem própria; os
+/// `<conta>.dat` das contas desta máquina ficam de fora.
+const USER_ACCOUNT_PICTURES: &[&str] = &["user.png", "user-32.png", "user-40.png", "user-48.png", "user-192.png", "user.bmp", "guest.png", "guest.bmp"];
 
 /// As imagens de kernel do caminho do smss (`--initial-process=smss`): o
 /// win32k.sys que o smss da sessão carrega pela classe 38, o win32kbase.sys
@@ -957,7 +981,8 @@ pub fn ntfs_files(root: &Path, kernel_pe: &[u8], initial_process: &str) -> Resul
             }
         }
         println!("fontes no volume NTFS: {faces}");
-        // As pastas de dados da tela de logon (`LOGON_SCREEN_FOLDERS`).
+        // As pastas de dados da tela de logon (`LOGON_SCREEN_FOLDERS`) e as
+        // imagens padrão do bloco do usuário (`USER_ACCOUNT_PICTURES`).
         let mut data = 0;
         for (folder, relative) in LOGON_SCREEN_FOLDERS {
             let directory = windows.join(relative);
@@ -972,6 +997,13 @@ pub fn ntfs_files(root: &Path, kernel_pe: &[u8], initial_process: &str) -> Resul
                     files.push((format!("{folder}/{name}"), bytes));
                     data += 1;
                 }
+            }
+        }
+        let pictures = std::env::var("ProgramData").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("C:/ProgramData")).join("Microsoft/User Account Pictures");
+        for name in USER_ACCOUNT_PICTURES {
+            if let Ok(bytes) = fs::read(pictures.join(name)) {
+                files.push((format!("ProgramData/Microsoft/User Account Pictures/{name}"), bytes));
+                data += 1;
             }
         }
         println!("arquivos das pastas de dados da tela de logon no volume NTFS: {data}");

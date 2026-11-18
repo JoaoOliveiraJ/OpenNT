@@ -3769,8 +3769,10 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   credencial (`LOGON_SCREEN_PROGRAMS` em `xtask/src/windows_binaries.rs`),
   os `.mun` e os `.pri` de `\Windows\SystemResources` desses programas (o
   imageres.dll.mun do bloco do usuário e dos ícones), os metadados WinRT de
-  `System32\WinMetadata` e as imagens padrão da tela de bloqueio de
-  `\Windows\Web\Screen` (`LOGON_SCREEN_FOLDERS`), as
+  `System32\WinMetadata`, as imagens padrão da tela de bloqueio de
+  `\Windows\Web\Screen` (`LOGON_SCREEN_FOLDERS`) e as do bloco do usuário
+  de `%ProgramData%\Microsoft\User Account Pictures`, sem os `.dat` das
+  contas desta máquina (`USER_ACCOUNT_PICTURES`), as
   fontes de `\SystemRoot\Fonts` com o GRE_Initialize, o FontSubstitutes, o
   FontLink e a chave Fonts, e na SYSTEM o `Control\IDConfigDB` e os perfis
   de `Hardware Profiles` (o `LogPixels` do DPI, `xtask/src/fonts.rs`), e as

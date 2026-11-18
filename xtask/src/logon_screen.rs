@@ -13,10 +13,13 @@
 //!   `Microsoft\WindowsRuntime\ActivatableClassId\<classe>` (DllPath,
 //!   ActivationType, Threading, TrustLevel); a classe que tem um CLSID
 //!   aparece também em `Microsoft\WindowsRuntime\CLSID\{...}`;
-//! - o logoncontroller.dll enumera os provedores de credencial de
+//! - o CredProvDataModel.dll cria o anfitrião dos provedores (o
+//!   credprovhost.dll, CLSID {7a872d34-bc6b-4f83-b199-22e9c0a91ddc}), que
+//!   cria sempre o GenericFilter do credprovs.dll
+//!   ({DDC0EED2-ADBE-40b6-A217-EDE16A79A0DE}), enumera os provedores de
 //!   `Microsoft\Windows\CurrentVersion\Authentication\Credential Providers`
-//!   (e os filtros de `Credential Provider Filters`) e cria cada um pelo
-//!   CLSID, e lê o estado da tela em `Authentication\LogonUI`;
+//!   e cria cada um pelo CLSID; o logoncontroller.dll e o LogonUI leem e
+//!   gravam o estado da tela em `Authentication\LogonUI`;
 //! - as outras classes COM em processo dessas DLLs são criadas pelo CLSID do
 //!   mesmo jeito: a fábrica e os codecs do WIC (o WindowsCodecs.dll, que
 //!   decodifica a imagem da tela de bloqueio), o propsys.dll, o MSCTF.dll...
@@ -24,17 +27,20 @@
 //! As classes COM e WinRT copiadas são as de DLLs de System32 que o volume
 //! leva (`windows_binaries::user_programs`): o convidado é uma instalação
 //! com esses componentes. Do `Authentication\LogonUI` e dos provedores
-//! ficam de fora o último logon, o usuário selecionado, os dados de sessão
-//! e as subchaves e os valores com o SID de um usuário desta máquina (o
-//! convidado não tem as contas daqui). Como os binários, as chaves vêm desta
-//! máquina no build, com os valores daqui. Fora do Windows nada é copiado.
+//! ficam de fora o último logon (o usuário, o provedor e o tempo ocioso
+//! dele), o usuário selecionado, os dados de sessão e as subchaves e os
+//! valores com o SID de um usuário desta máquina: uma instalação nova não
+//! os tem, e o convidado não tem as contas daqui (o
+//! `SystemProtectedUserData`, também por usuário, não é copiado). Como os
+//! binários, as chaves vêm desta máquina no build, com os valores daqui.
+//! Fora do Windows nada é copiado.
 
 use crate::host_language::HostKey;
 
 /// Os valores de `Authentication\LogonUI` que descrevem o último logon ou o
 /// usuário selecionado desta máquina.
 #[cfg(windows)]
-const LOGON_UI_LOCAL_VALUES: &[&str] = &["LastLoggedOnUser", "LastLoggedOnSAMUser", "LastLoggedOnDisplayName", "LastLoggedOnUserSID", "SelectedUserSID"];
+const LOGON_UI_LOCAL_VALUES: &[&str] = &["LastLoggedOnUser", "LastLoggedOnSAMUser", "LastLoggedOnDisplayName", "LastLoggedOnUserSID", "LastLoggedOnProvider", "SelectedUserSID", "IdleTime"];
 
 /// As subchaves de `Authentication\LogonUI` com o estado das sessões e o
 /// conteúdo por usuário desta máquina.
