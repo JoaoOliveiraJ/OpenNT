@@ -614,6 +614,16 @@ const LOGON_SCREEN_PROGRAMS: &[&str] = &[
     "NetworkIcon.dll",
     "Windows.UI.Core.TextInput.dll",
     "uiautomationcore.dll",
+    // O motor de texto da caixa de senha e das caixas de texto do XAML: o
+    // CTextBoxBase::InitializeTextServices do Windows.UI.Xaml.dll carrega o
+    // msftedit.dll (LoadLibraryExW com LOAD_LIBRARY_SEARCH_SYSTEM32) e cria
+    // o ITextServices2 pelo CreateTextServices; sem um CoreWindow (o
+    // LogonUI hospeda o XAML numa janela Win32), o OnCharacterReceived
+    // entrega o WM_CHAR do TranslateMessage a esse ITextServices. O
+    // elscore.dll é a carga atrasada de detecção de idioma do msftedit.dll
+    // e do XAML.
+    "msftedit.dll",
+    "elscore.dll",
     // O indicador de idioma de entrada que o Windows.UI.Logon.dll cria
     // (InputSwitch.dll, CLSID {B9BC2A50-43C3-41AA-A086-5DB14E184BAE}, com o
     // wininet.dll que ele importa); as classes WinRT que o XAML ativa para

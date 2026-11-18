@@ -36,7 +36,9 @@
 //!   `WindowsRuntime\Server\DispBrokerDesktopSvc` (o serviço, a identidade e
 //!   as permissões de ativação) e inicia o serviço;
 //! - a Calendar do relógio da tela de bloqueio lê as regras do fuso em
-//!   `Windows NT\CurrentVersion\Time Zones`.
+//!   `Windows NT\CurrentVersion\Time Zones`;
+//! - a caixa de senha do XAML ativa o TSF em processo (o MSCTF.dll), que
+//!   lê os serviços de texto registrados em `Microsoft\CTF`.
 //!
 //! As classes COM e WinRT copiadas são as de DLLs de System32 que o volume
 //! leva (`windows_binaries::user_programs`) e as dos servidores WinRT de
@@ -179,6 +181,14 @@ pub fn software_keys() -> Vec<HostKey> {
         // `Time Zones\<TimeZoneKeyName>` (o TZI e o `Dynamic DST`).
         let zones = "Microsoft\\Windows NT\\CurrentVersion\\Time Zones";
         registry::copy(registry::LOCAL_MACHINE, &format!("SOFTWARE\\{zones}"), zones, true, &mut keys);
+        // Os serviços de texto registrados na instalação (`Microsoft\CTF`:
+        // os processadores de entrada de `TIP` com as categorias e os perfis
+        // de cada idioma, `SystemShared` e `Modern`), que o MSCTF.dll lê
+        // quando o CImeEventHelper do Windows.UI.Xaml.dll ativa o
+        // gerenciador de threads do TSF na caixa de senha, e o
+        // Windows.UI.Core.TextInput.dll ao listar os perfis de teclado.
+        let text_services = "Microsoft\\CTF";
+        registry::copy(registry::LOCAL_MACHINE, &format!("SOFTWARE\\{text_services}"), text_services, true, &mut keys);
         // Os provedores de credencial, os filtros e o estado da tela de
         // logon, sem o que é desta máquina.
         let authentication = "Microsoft\\Windows\\CurrentVersion\\Authentication";

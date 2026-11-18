@@ -4034,7 +4034,8 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   é o desta instalação (o xtask copia o `Control\Nls\Language`, o
   `Control\MUI\UILanguages`, o `Control\Keyboard Layouts`, o
   `Control\Keyboard Layout` e o perfil de idioma e de teclado da DEFAULT do
-  Registro desta máquina, põe no volume o `Layout File` dos layouts
+  Registro desta máquina, com o `Control Panel\Input Method` e os perfis
+  de entrada do TSF de `Software\Microsoft\CTF`, põe no volume o `Layout File` dos layouts
   pré-carregados, como o KBDBR.DLL de uma instalação pt-BR, e os `.mui`
   dos programas nos idiomas de
   interface daqui, ou no idioma de fallback (o `DefaultFallback` do idioma
@@ -4046,7 +4047,12 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   FILE_OBJECT (a QueryNameProcedure do tipo File, `io/file/information.rs`,
   com o FileName do caminho da abertura) contra o `\SystemRoot\System32\`
   e o reabre pelo dispositivo (o alias de System32 do volume de boot vale
-  também nessa abertura), e o NtUserCreateWindowStation devolve a WinSta0.
+  também nessa abertura); o LoadFileContent lê o arquivo inteiro para o
+  pool (o FileStandardInformation, até 256 KB, e um ZwReadFile do
+  deslocamento 0), sem seção nem vista no espaço de sessão, e o
+  ReadLayoutFile copia e reloca a seção `.data` do layout. O
+  NtUserLoadKeyboardLayoutEx do LoadKeyboardLayoutW passa pelo mesmo
+  caminho, e o NtUserCreateWindowStation devolve a WinSta0.
   O SetDefaultWinstaSecurity põe a DACL com o GenericMapping e o
   ValidAccessMask que o win32k gravou no TypeInfo do tipo WindowStation (o
   Ob lê o TypeInfo corrente, `ob/object_types.rs`), e o CreateDesktopW abre a
@@ -4330,8 +4336,11 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   CDesktopManager::InitializeComObjects do uDWM, sem o que o dwm.exe não
   sobe, o UIAnimation.dll e o DispBroker.Desktop.dll; o ism.dll do
   anfitrião de entrada do CGlobalMit do dwmcore; o wuceffects.dll dos
-  pincéis de efeito; e o icu.dll da Calendar do relógio da tela de
-  bloqueio),
+  pincéis de efeito; o icu.dll da Calendar do relógio da tela de
+  bloqueio; e o msftedit.dll da caixa de senha: o
+  CTextBoxBase::InitializeTextServices do XAML cria nele o ITextServices2,
+  e sem CoreWindow o WM_CHAR do TranslateMessage vai a esse
+  ITextServices, sem o ctfmon nem o TextInputHost),
   os `.mun` e os `.pri` de `\Windows\SystemResources` desses programas (o
   imageres.dll.mun do bloco do usuário e dos ícones), os metadados WinRT de
   `System32\WinMetadata`, as imagens padrão da tela de bloqueio de
@@ -4355,8 +4364,9 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   oleaut32 empacota pela biblioteca de tipos), com os
   provedores de `Authentication\Credential Providers` e o
   `Authentication\LogonUI` sem o último logon, o estado do boot nem os SIDs
-  de usuário desta máquina, e os `Time Zones` que a Calendar lê
-  (`xtask/src/logon_screen.rs`), e a chave `Microsoft\Windows\DWM`
+  de usuário desta máquina, os `Time Zones` que a Calendar lê e os
+  serviços de texto de `Microsoft\CTF` que o TSF em processo da caixa de
+  senha lê (`xtask/src/logon_screen.rs`), e a chave `Microsoft\Windows\DWM`
   que o dwm.exe, o dwmcore e o dcomp leem e em que o dwminit grava a
   atividade de cada sessão (sem os `DwmInitSessionActivityId_*` desta
   máquina, `xtask/src/window_manager.rs`); a

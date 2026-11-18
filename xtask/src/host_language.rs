@@ -16,7 +16,9 @@
 //!   interface preferidos do perfil do sistema) e `Keyboard Layout` (o
 //!   `Preload`, os `Substitutes` e o `Toggle` do perfil do sistema: o
 //!   user32 do wininit e do winlogon abre o arquivo do primeiro layout do
-//!   `Preload`, e o volume leva esse arquivo, [`keyboard_layout_files`]).
+//!   `Preload`, e o volume leva esse arquivo, [`keyboard_layout_files`]),
+//!   `Control Panel\Input Method` (as teclas de atalho dos editores de
+//!   entrada) e `Software\Microsoft\CTF` (os perfis de entrada do TSF).
 //!
 //! Fora do Windows (ou sem as chaves) nada é copiado e o convidado fica com
 //! o padrão do kernel (sem `Preload`, o user32 cai no kbdus.dll).
@@ -180,6 +182,14 @@ pub fn default_keys() -> Vec<HostKey> {
         registry::copy(registry::USERS, ".DEFAULT\\Control Panel\\International", "Control Panel\\International", true, &mut keys);
         registry::copy(registry::USERS, ".DEFAULT\\Control Panel\\Desktop\\MuiCached", "Control Panel\\Desktop\\MuiCached", false, &mut keys);
         registry::copy(registry::USERS, ".DEFAULT\\Keyboard Layout", "Keyboard Layout", true, &mut keys);
+        // As teclas de atalho dos editores de entrada (`Hot Keys`), que o
+        // user32 do wininit e do winlogon lê ao carregar os layouts, e os
+        // perfis de entrada do TSF do perfil do sistema
+        // (`Software\Microsoft\CTF`: `Assemblies` e `SortOrder` com o layout
+        // de cada idioma), que o MSCTF.dll lê ao ativar o gerenciador de
+        // threads do TSF para uma caixa de texto.
+        registry::copy(registry::USERS, ".DEFAULT\\Control Panel\\Input Method", "Control Panel\\Input Method", true, &mut keys);
+        registry::copy(registry::USERS, ".DEFAULT\\Software\\Microsoft\\CTF", "Software\\Microsoft\\CTF", true, &mut keys);
     }
     keys
 }
@@ -297,5 +307,14 @@ mod tests {
         let first = &preload.iter().min_by_key(|(name, _)| name.parse::<u32>().unwrap_or(u32::MAX)).unwrap().1;
         let layout = format!("ControlSet001\\Control\\Keyboard Layouts\\{first}");
         assert!(system_keys("ControlSet001").iter().any(|key| key.path.eq_ignore_ascii_case(&layout)), "{layout} nao copiada");
+        // O perfil de entrada do TSF do idioma do primeiro layout, quando
+        // esta máquina o tem: o KLID tem o idioma nos quatro dígitos finais
+        // (00000416 -> 0x00000416).
+        let first_language = format!("0x{:0>8}", first.get(4..).unwrap_or_default());
+        let assembly = format!(".DEFAULT\\Software\\Microsoft\\CTF\\Assemblies\\{first_language}");
+        if !registry::list(registry::USERS, &assembly).is_empty() {
+            let copied = format!("Software\\Microsoft\\CTF\\Assemblies\\{first_language}");
+            assert!(default_keys().iter().any(|key| key.path.eq_ignore_ascii_case(&copied)), "{copied} nao copiada");
+        }
     }
 }
