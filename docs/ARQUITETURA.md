@@ -3818,7 +3818,18 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   NtDeviceIoControlFile/NtFsControlFile. O
   ProductPolicy do licenciamento é capturado quando a hive SYSTEM é ligada
   (o CmGetSystemControlValues, `cm/hive_init.rs`) e publicado logo depois,
-  antes do primeiro driver (`init/phase1.rs`). Um NtCreateKey com
+  antes do primeiro driver (`init/phase1.rs`). Os bits que o ProcessHandleCheckingMode e a ProcessRaiseUMExceptionOnInvalidHandleClose ligam valem como no 19041
+  (`ob/handle_table.rs`): com EnableHandleExceptions, um handle não nulo
+  que o ObReferenceObjectByHandle não resolve (o ExHandleLogBadReference)
+  levanta STATUS_INVALID_HANDLE no anel 3 pelo KeRaiseUserException quando
+  o PreviousMode da thread é UserMode, sem anexação e na tabela do processo
+  dela; o NtClose de modo usuário de um handle desconhecido (fora de -6..0)
+  só levanta com RaiseUMExceptionOnInvalidHandleClose também, ou com
+  FLG_ENABLE_CLOSE_EXCEPTIONS ou a DebugPort do processo. A serial mostra
+  `[ob] handle ... invalido ... levantado no anel 3`. Os serviços de usuário
+  que procuram o handle na própria tabela (sem o ObReferenceObjectByHandle)
+  ainda só devolvem o status. Autoteste em
+  `ntos/test/multiprocess/handles.rs`. Um NtCreateKey com
   componente intermediário ausente devolve
   STATUS_OBJECT_NAME_NOT_FOUND, como o CmpDoParseKey: é o status que faz o
   kernelbase criar o caminho um componente de cada vez. Um serviço sem

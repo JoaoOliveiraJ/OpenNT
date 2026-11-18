@@ -310,8 +310,22 @@ pub fn reference_by_name(name: u64, attributes: u32, access: u32, object_type: u
     Ok(0)
 }
 
-/// ObReferenceObjectByHandle(handle, access, type, mode, out, info).
+/// ObReferenceObjectByHandle(handle, access, type, mode, out, info). Um
+/// handle não nulo que não resolve passa pelo ExHandleLogBadReference
+/// (`handle_table::bad_reference`), como no ObpReferenceObjectByHandleWithTag
+/// do 19041: com a verificação estrita do processo, STATUS_INVALID_HANDLE é
+/// levantado no anel 3.
 pub fn reference_by_handle(handle: u64, access: u32, object_type: u64, mode: u8, output: u64, information: u64) -> Result<u64, KernelError> {
+    let status = reference_resolved(handle, access, object_type, mode, output, information)?;
+    if status as u32 == INVALID_HANDLE {
+        super::handle_table::bad_reference(handle, mode);
+    }
+    Ok(status)
+}
+
+/// O núcleo do ObReferenceObjectByHandle: o dono do handle, o tipo, o
+/// acesso e a referência.
+fn reference_resolved(handle: u64, access: u32, object_type: u64, mode: u8, output: u64, information: u64) -> Result<u64, KernelError> {
     if let Some(status) = reference_key_handle(handle, access, object_type, mode, output, information)? {
         return Ok(status);
     }

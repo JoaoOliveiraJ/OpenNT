@@ -188,4 +188,70 @@ pub fn run(assert: Assert) {
     let _ = process::terminate_process(a, 0);
     assert(references(target) == baseline, "handles: o termino de A solta o corpo");
     let _ = process::terminate_process(target, 0);
+    strict_handle_checking(assert);
+}
+
+/// Verificação estrita de handles (ntoskrnl 19041): com EnableHandleExceptions
+/// (ProcessHandleCheckingMode), o ObReferenceObjectByHandle de um handle que
+/// não existe levanta STATUS_INVALID_HANDLE no anel 3 quando o PreviousMode
+/// da thread é UserMode (o AccessMode não conta); o NtClose de modo usuário
+/// só levanta com RaiseUMExceptionOnInvalidHandleClose também, e nunca para
+/// o handle 0 nem para os pseudo-handles. O levantamento é o
+/// KeRaiseUserException num KTRAP_FRAME de usuário sintético: o código vai
+/// para TEB.ExceptionCode.
+fn strict_handle_checking(assert: Assert) {
+    use crate::ntos::inc::types::{HandleTable, Kthread, KtrapFrame, Teb};
+    let ran = crate::ntos::test::multiprocess::identity::with_test_process("handles-estrito.exe", None, |test| {
+        // SAFETY: EPROCESS e KTHREAD do processo de teste, vivos durante o corpo.
+        let (table, own) = unsafe { (Eprocess::at(test.process).object_table.get(), Kthread::at(test.thread)) };
+        let (frame, teb, slot) = (guest::alloc_bytes(KtrapFrame::SIZE), guest::alloc_bytes(Teb::SIZE), guest::alloc_bytes(8));
+        if table == 0 || frame == 0 || teb == 0 || slot == 0 {
+            return None;
+        }
+        guest::write_bytes(frame, &[0u8; KtrapFrame::SIZE as usize]);
+        guest::write_bytes(teb, &[0u8; Teb::SIZE as usize]);
+        // SAFETY: a HANDLE_TABLE do processo de teste e o quadro e a TEB
+        // sintéticos recém-zerados.
+        let (handle_table, trap, environment) = unsafe { (HandleTable::at(table), KtrapFrame::at(frame), Teb::at(teb)) };
+        let saved = (own.trap_frame.get(), own.teb.get(), own.previous_mode.get());
+        own.trap_frame.set(frame);
+        own.teb.set(teb);
+        own.previous_mode.set(1);
+        // (status, levantou): o quadro volta ao anel 3 antes de cada tentativa.
+        let attempt = |operation: &dyn Fn() -> u32| {
+            trap.seg_cs.set(0x33);
+            trap.rip.set(0x1234);
+            environment.exception_code.set(0);
+            let status = operation();
+            (status, environment.exception_code.get() as u32 == INVALID_HANDLE)
+        };
+        let bad = 0x7FFF_FFF0u64;
+        let close_handle = |handle: u64| close::close(handle, Some(1)).unwrap_or(1);
+        let reference_bad = |mode: u8| object_reference::reference_by_handle(bad, 0, 0, mode, slot, 0).map_or(1, |status| status as u32);
+        let relaxed = (attempt(&|| close_handle(bad)), attempt(&|| reference_bad(1)));
+        handle_table.set_enable_handle_exceptions(1);
+        let checking = (attempt(&|| close_handle(bad)), attempt(&|| reference_bad(1)), attempt(&|| reference_bad(0)));
+        own.previous_mode.set(0);
+        let kernel_caller = attempt(&|| reference_bad(1));
+        own.previous_mode.set(1);
+        handle_table.set_raise_um_exception_on_invalid_handle_close(1);
+        let closing = (attempt(&|| close_handle(bad)), attempt(&|| close_handle(0)), attempt(&|| close_handle(u64::MAX)));
+        own.trap_frame.set(saved.0);
+        own.teb.set(saved.1);
+        own.previous_mode.set(saved.2);
+        for block in [frame, teb, slot] {
+            guest::free_bytes(block);
+        }
+        Some((relaxed, checking, kernel_caller, closing))
+    });
+    let Some(Some((relaxed, checking, kernel_caller, closing))) = ran else {
+        assert(false, "handles: processo de teste da verificacao estrita");
+        return;
+    };
+    let invalid = (INVALID_HANDLE, false);
+    let raised = (INVALID_HANDLE, true);
+    assert(relaxed == (invalid, invalid), "handles: sem verificacao estrita, handle invalido so devolve STATUS_INVALID_HANDLE");
+    assert(checking == (invalid, raised, raised), "handles: com EnableHandleExceptions, o ObReferenceObjectByHandle de modo usuario levanta STATUS_INVALID_HANDLE e o NtClose nao");
+    assert(kernel_caller == invalid, "handles: PreviousMode KernelMode nao levanta");
+    assert(closing == (raised, invalid, (0, false)), "handles: com RaiseUMExceptionOnInvalidHandleClose, o NtClose levanta; o handle 0 e o pseudo-handle nao");
 }

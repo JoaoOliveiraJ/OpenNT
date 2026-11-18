@@ -105,7 +105,10 @@ pub fn close_user(handle: u64, force: bool) -> u32 {
 /// de validar propriedade e proteção. `None` usa o PreviousMode da thread.
 /// Um handle sem o prefixo de kernel é procurado na tabela do processo
 /// corrente (o anexado); os de kernel ficam na tabela do System e valem em
-/// qualquer processo.
+/// qualquer processo. Em UserMode, um handle que não está em nenhum dono
+/// segue o caminho de handle inválido do NtClose do 19041
+/// (`handle_table::bad_user_close`: a verificação estrita levanta
+/// STATUS_INVALID_HANDLE no anel 3).
 pub fn close(handle: u64, previous_mode: Option<u8>) -> Result<u32, KernelError> {
     if irql::get_irql() != 0 {
         return Err(KernelError::new("NtClose requires PASSIVE_LEVEL"));
@@ -114,6 +117,16 @@ pub fn close(handle: u64, previous_mode: Option<u8>) -> Result<u32, KernelError>
         Some(mode) => mode != 0,
         None => previous_mode::get()? != 0,
     };
+    let status = close_owned(handle, from_user_mode)?;
+    if status == STATUS_INVALID_HANDLE && from_user_mode {
+        return Ok(super::handle_table::bad_user_close(handle));
+    }
+    Ok(status)
+}
+
+/// O fechamento pelo dono do handle; STATUS_INVALID_HANDLE quando nenhum
+/// dono o tem.
+fn close_owned(handle: u64, from_user_mode: bool) -> Result<u32, KernelError> {
     let signed = handle as i64;
     // -1/-2 ficam fora dos handles de kernel; em modo usuário, de -1 a -6.
     if signed <= -1 && signed >= if from_user_mode { -6 } else { -2 } {

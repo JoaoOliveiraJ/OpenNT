@@ -523,3 +523,131 @@ pub fn list_head() -> u64 {
 pub fn storage(table: u64) -> Option<(usize, u32, usize)> {
     REGISTRY.lock().tables.get(&table).map(|owner| (owner.leaves.len(), owner.free_count, owner.free_links.len()))
 }
+
+// ---- Handles inválidos de modo usuário (verificação estrita) -----------------
+//
+// No ntoskrnl 19041, um handle que não está na tabela passa por aqui:
+// - o ObpReferenceObjectByHandleWithTag (handle não nulo) chama
+//   ExHandleLogBadReference(tabela, handle, KTHREAD.PreviousMode);
+// - o NtClose (handle fora de -6..0) consulta o ExQueryHandleExceptionsPermanency
+//   e, com RaiseUMExceptionOnInvalidHandleClose e as exceções permanentes,
+//   chama o mesmo ExHandleLogBadReference; depois, em UserMode, levanta
+//   STATUS_INVALID_HANDLE por conta própria com FLG_ENABLE_CLOSE_EXCEPTIONS,
+//   EPROCESS.DebugPort ou HANDLE_TABLE.DebugInfo.
+// O ExHandleLogBadReference só levanta com EnableHandleExceptions (o
+// ProcessHandleCheckingMode, a verificação estrita do dwm.exe), PreviousMode
+// UserMode, a thread sem anexação e a tabela do processo corrente dela. O
+// KeRaiseUserException desvia o retorno do serviço para o
+// KiRaiseUserExceptionDispatcher da NTDLL, que levanta o código no anel 3. O
+// OpenNT não tem o rastreio de handles (DebugInfo fica 0, mas é lido).
+
+const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+/// NtGlobalFlag: FLG_APPLICATION_VERIFIER (a linha "AVRF:" do log).
+const FLG_APPLICATION_VERIFIER: u32 = 0x100;
+/// NtGlobalFlag: FLG_ENABLE_CLOSE_EXCEPTIONS.
+const FLG_ENABLE_CLOSE_EXCEPTIONS: u32 = 0x40_0000;
+
+/// ExQueryHandleExceptionsPermanency (rva 0x380800), sob o HandleTableLock:
+/// (ligadas, permanentes). Com DebugInfo, ligadas e o bit 3 dos flags dele;
+/// senão EnableHandleExceptions liga as duas.
+pub fn handle_exceptions_permanency(table: u64) -> Result<(bool, bool), KernelError> {
+    let handle_table = table_at(table);
+    let lock = handle_table.handle_table_lock.address();
+    critical_region::with_critical(|| {
+        push_lock::acquire_exclusive(lock, 0)?;
+        let debug_info = handle_table.debug_info.get();
+        let result = if debug_info != 0 {
+            (true, guest::read::<u32>(debug_info + 8) >> 3 & 1 != 0)
+        } else {
+            let enabled = handle_table.enable_handle_exceptions() != 0;
+            (enabled, enabled)
+        };
+        push_lock::release_exclusive(lock, 0)?;
+        Ok(result)
+    })
+}
+
+/// A thread corrente e o processo corrente dela (ApcState.Process), com a
+/// anexação (KTHREAD.ApcStateIndex 1).
+fn current_context() -> Option<(u64, u64, bool)> {
+    use crate::ntos::inc::types::Kthread;
+    let thread = crate::ntos::ps::process::get_current_thread();
+    if thread == 0 {
+        return None;
+    }
+    // SAFETY: a KTHREAD corrente.
+    let kthread = unsafe { Kthread::at(thread) };
+    Some((thread, kthread.apc_state.process.get(), kthread.apc_state_index.get() == 1))
+}
+
+/// EPROCESS.ObjectTable de `process`.
+fn object_table_of(process: u64) -> u64 {
+    // SAFETY: o processo corrente da thread corrente, vivo enquanto ela roda.
+    (process != 0).then(|| unsafe { crate::ntos::inc::types::Eprocess::at(process) }.object_table.get()).unwrap_or(0)
+}
+
+/// KeRaiseUserException(STATUS_INVALID_HANDLE), com a linha na serial.
+fn raise_invalid_handle(handle: u64, process: u64) -> u32 {
+    debug_print!("[ob] handle {:#x} invalido no processo {:#x}: STATUS_INVALID_HANDLE levantado no anel 3", handle, process);
+    crate::ntos::ke::kernel_exception::raise_user_exception(STATUS_INVALID_HANDLE)
+}
+
+/// ExHandleLogBadReference(HandleTable, Handle, PreviousMode) do ntoskrnl
+/// 19041 (rva 0x2011c8, corpo frio 0x41f1fa).
+pub fn log_bad_reference(table: u64, handle: u64, previous_mode: u8) {
+    if table == 0 || table_at(table).enable_handle_exceptions() == 0 || previous_mode != 1 {
+        return;
+    }
+    let Some((_, process, attached)) = current_context() else { return };
+    if attached || object_table_of(process) != table {
+        return;
+    }
+    if crate::ntos::rtl::shared_data::nt_global_flag() & FLG_APPLICATION_VERIFIER != 0 {
+        debug_print!("AVRF: Invalid handle {:#x} in process {:#x}", handle, process);
+    }
+    raise_invalid_handle(handle, process);
+}
+
+/// O ObpReferenceObjectByHandleWithTag de um handle que não resolveu: um
+/// handle de kernel em KernelMode é da tabela de kernel (nunca levanta); os
+/// demais, da tabela do processo corrente, com o PreviousMode da thread.
+pub fn bad_reference(handle: u64, access_mode: u8) {
+    if handle == 0 || (access_mode == 0 && handle & 0xFFFF_FFFF_8000_0000 == 0xFFFF_FFFF_8000_0000) {
+        return;
+    }
+    let Some((thread, process, _)) = current_context() else { return };
+    // SAFETY: a KTHREAD corrente.
+    let previous_mode = unsafe { crate::ntos::inc::types::Kthread::at(thread) }.previous_mode.get() as u8;
+    log_bad_reference(object_table_of(process), handle, previous_mode);
+}
+
+/// O NtClose de modo usuário de um handle que não está na tabela do
+/// processo corrente (ntoskrnl 19041, NtClose 0x63e1cf..0x63e26d): o handle
+/// 0 só devolve STATUS_INVALID_HANDLE; os demais passam pelo
+/// ExHandleLogBadReference quando a tabela tem
+/// RaiseUMExceptionOnInvalidHandleClose e as exceções permanentes, e
+/// levantam STATUS_INVALID_HANDLE fora de uma anexação com
+/// FLG_ENABLE_CLOSE_EXCEPTIONS, EPROCESS.DebugPort ou HANDLE_TABLE.DebugInfo.
+pub fn bad_user_close(handle: u64) -> u32 {
+    // -6..-1 já fecharam com sucesso.
+    if handle.wrapping_add(6) <= 6 {
+        return STATUS_INVALID_HANDLE;
+    }
+    let Some((_, process, attached)) = current_context() else { return STATUS_INVALID_HANDLE };
+    let table = object_table_of(process);
+    if table == 0 {
+        return STATUS_INVALID_HANDLE;
+    }
+    let handle_table = table_at(table);
+    let permanent = handle_exceptions_permanency(table).is_ok_and(|(_, permanent)| permanent);
+    if handle_table.raise_um_exception_on_invalid_handle_close() != 0 && permanent {
+        log_bad_reference(table, handle, 1);
+    }
+    // SAFETY: o processo corrente da thread corrente.
+    let debugged = unsafe { crate::ntos::inc::types::Eprocess::at(process) }.debug_port.get() != 0;
+    let close_exceptions = crate::ntos::rtl::shared_data::nt_global_flag() & FLG_ENABLE_CLOSE_EXCEPTIONS != 0;
+    if (close_exceptions || debugged || handle_table.debug_info.get() != 0) && !attached {
+        return raise_invalid_handle(handle, process);
+    }
+    STATUS_INVALID_HANDLE
+}
