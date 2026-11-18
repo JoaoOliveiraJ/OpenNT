@@ -687,15 +687,19 @@ pub fn exit_thread(thread: u64, exit_status: u32) -> Result<(), KernelError> {
     object.cross_thread_flags.atomic().fetch_or(Ethread::TERMINATED_MASK, Ordering::SeqCst);
     object.exit_status.set(exit_status as i32);
     // Donos de I/O cancelam/drenam requisições antes da notificação, do
-    // rundown de APCs e da liberação dos recursos de execução.
+    // rundown de APCs e da liberação dos recursos de execução. Antes deles,
+    // na ordem do PspExitThread: o LPC_CLIENT_DIED às portas de término e o
+    // callout de saída de thread do win32k (+0x48f, antes do IoCancelThreadIo,
+    // do ExTimerRundown, do CmNotifyRunDown e do KiRundownMutants), com a
+    // thread corrente e o Win32Thread ainda publicado.
     let routines = STATE.lock().thread_exit_routines.clone();
-    if !routines.is_empty() {
-        as_current(thread, || {
-            for routine in routines {
-                routine(thread);
-            }
-        });
-    }
+    as_current(thread, || {
+        super::termination_ports::thread_exit(thread);
+        super::win32::thread_exit_callout(thread);
+        for routine in routines {
+            routine(thread);
+        }
+    });
     // O rundown fechado impede consultas novas de relatar uma thread viva.
     rundown::wait(object.rundown_protect.count.address())?;
     // Uma thread Initialized pode terminar antes de entrar num escalonador; a
@@ -730,6 +734,11 @@ pub fn terminate_process(process: u64, exit_status: u32) -> Result<(), KernelErr
     for thread in threads {
         exit_thread(thread, exit_status)?;
     }
+    // O callout de saída de processo do win32k (PsW32ProcessCallout com
+    // Initialize = FALSE), como o PspExitThread da última thread (+0x567):
+    // depois do callout de thread e antes do PspExitProcess, que chama as
+    // notificações de processo.
+    super::win32::process_exit_callout(process);
     let process_id = object.unique_process_id.get();
     if STATE.lock().processes.get(&process).is_some_and(|record| record.notified) {
         notify_process(process, process_id, false)?;

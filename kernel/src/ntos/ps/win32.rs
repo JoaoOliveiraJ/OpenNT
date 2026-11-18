@@ -23,9 +23,14 @@
 //! O despachante é o único bloco EX_CALLBACK de PsWin32CallBack, criado por
 //! ExAllocateCallBack(Dispatch, NULL): cada callout chama
 //! `Dispatch(NULL, CalloutType, Parameter)`. A saída de thread e de processo
-//! chega aqui pelas rotinas de saída de `ps::process` (registradas em
-//! [`init`]), na ordem do PspExitThread: o callout de thread, com a thread que
-//! sai como corrente, e depois o de processo.
+//! chega aqui por `ps::process::exit_thread` e `terminate_process`, na ordem
+//! do PspExitThread: o callout de thread, com a thread que sai como corrente
+//! e antes das outras rotinas de saída dela, e depois o de processo, antes
+//! das notificações de processo. Uma thread com Win32Thread roda o próprio
+//! PspExitThread no contexto dela, na volta ao modo usuário depois do pedido
+//! de término (`ps::user::threads`): o callout de thread vê a thread
+//! corrente, na pilha dela, com o Win32Thread ainda publicado, e a última
+//! thread do processo faz também o de processo.
 //!
 //! O bloco vale por sessão, como no MmSessionGetWin32Callouts: só um processo
 //! cuja sessão já tem o driver de sessão iniciado (MM_SESSION_SPACE.
@@ -283,13 +288,6 @@ pub fn convert_to_gui_thread() -> u32 {
         thread.tcb.thread_flags.atomic().fetch_and(!(flags as i32), Ordering::SeqCst);
     }
     status
-}
-
-/// Liga os callouts de saída às rotinas de saída de `ps::process` (thread,
-/// com a thread que sai como corrente; depois processo).
-pub fn init() {
-    process::register_thread_exit_routine(thread_exit_callout);
-    process::register_process_exit_routine(process_exit_callout);
 }
 
 /// PsSetProcessWin32Process(Process, Win32Process, PrevWin32Process): sob o

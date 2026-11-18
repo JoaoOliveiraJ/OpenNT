@@ -49,7 +49,8 @@ pub struct UserExecutionBlock {
     pub context: Field<u64>,
     /// ProcessInstrumentationCallback dos retornos de syscall.
     pub instrumentation: Field<u64>,
-    /// Tipo da saída: 0 término, 1 syscall, 2 timer, 3 exceção.
+    /// Tipo da saída: 0 término, 1 syscall, 2 timer, 3 exceção, 4 bloqueio no
+    /// kernel, 5 a thread saiu de vez.
     pub exit_kind: Field<u32>,
     /// Código de saída publicado pelo NtTerminateProcess.
     pub exit_code: Field<u32>,
@@ -914,6 +915,68 @@ pub fn resume_kernel_context(saved_rsp: u64, teb: u64) -> u32 {
     result as u32
 }
 
+/// Um intervalo da thread corrente que, em vez de entrar no anel 3 pelo
+/// CONTEXT, roda `routine(argument)` na pilha de kernel dela (InitialStack,
+/// também em KPRCB.RspBase e TSS.RSP0), como um serviço: o CONTEXT do
+/// intervalo é `context`, as interrupções ficam desligadas como depois da
+/// entrada de syscall e a rotina pode bloquear (`block_in_service`; a
+/// retomada é a de qualquer serviço suspenso, [`resume_kernel_context`]). É
+/// o lugar da entrega de uma APC de usuário cuja rotina de kernel nunca volta
+/// ao anel 3 (o KiSchedulerApcTerminate do término de uma thread que estava
+/// no anel 3). A rotina não retorna: termina o intervalo
+/// ([`end_thread_interval`]). Devolve o resultado do intervalo, como
+/// [`exec_user_context`]; o tipo de saída fica no bloco da CPU.
+pub fn exec_kernel_routine(context: u64, teb: u64, routine: extern "C" fn(u64) -> !, argument: u64) -> u32 {
+    let fallback = {
+        let mut state = STATE.lock();
+        assert!(state.ready && !state.running, "execKernelRoutine: invalid execution state");
+        state.running = true;
+        state.frame_context = 0;
+        state.service_frame = 0;
+        state.fallback_stack
+    };
+    assert_boot_processor();
+    let stack = dispatch_stack(fallback);
+    assert!(stack != fallback, "execKernelRoutine: thread sem pilha de kernel propria");
+    load_kernel_stack(stack);
+    let block = block();
+    let swap_gs = cpu::read_msr(MSR_KERNEL_GS_BASE);
+    let native = native_call::state();
+    block.context.set(context);
+    block.exit_kind.set(0);
+    block.continue_flag.set(0);
+    cpu::write_msr(MSR_KERNEL_GS_BASE, teb);
+    // SAFETY: a pilha de kernel da thread corrente está viva e sem quadro (a
+    // thread não tem serviço suspenso); a rotina sai pelo fim do intervalo,
+    // que volta ao quadro de despachante que a retomada grava.
+    let result = unsafe {
+        let frame = context_switch::build_service_frame(stack, routine, argument);
+        context_switch::resume(frame)
+    };
+    load_kernel_stack(fallback);
+    block.context.set(0);
+    cpu::write_msr(MSR_KERNEL_GS_BASE, swap_gs);
+    native_call::restore_state(native);
+    let mut state = STATE.lock();
+    state.frame_context = 0;
+    state.service_frame = 0;
+    state.running = false;
+    result as u32
+}
+
+/// O fim do intervalo da thread corrente, que saiu de vez (o PspExitThread
+/// dela terminou dentro de um serviço ou de [`exec_kernel_routine`]): a pilha
+/// de kernel é abandonada e o despachante do intervalo recebe o tipo de saída
+/// [`context_switch::EXIT_THREAD_EXITED`] com `code`.
+pub fn end_thread_interval(code: u32) -> ! {
+    assert!(in_service(), "fim de thread fora de um intervalo de servico");
+    STATE.lock().frame_context = 0;
+    block().exit_kind.set(context_switch::EXIT_THREAD_EXITED);
+    // SAFETY: dentro de um intervalo despachado (`dispatcher_rsp` válido);
+    // nada desta pilha é usado depois.
+    unsafe { user_terminate_current(code as u64) }
+}
+
 /// O lado do anel 3 do KiCallUserMode: um intervalo aninhado dentro do
 /// serviço em curso da thread corrente (um KeUserModeCallback, que continua
 /// esperando na pilha dele). O estado por CPU do serviço de fora — o quadro
@@ -1231,6 +1294,10 @@ pub extern "C" fn opennt_user_syscall(frame: *mut u64) -> u64 {
     if result & 0xFFFF_FFFF == TERMINATE_MAGIC {
         unsafe { user_terminate_current(block().exit_code.get() as u64) }
     }
+    // A volta ao modo usuário entrega a APC de término pedida para a thread
+    // (o KiServiceExit com UserApcPending): o PspExitThread roda aqui, na
+    // pilha dela, e o intervalo acaba sem voltar ao anel 3.
+    crate::ntos::ps::user::threads::service_exit_termination();
     save_syscall_context(frame, result);
     result
 }

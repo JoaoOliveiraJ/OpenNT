@@ -305,8 +305,10 @@ pub fn exit_process(process_pointer: u64, status: u32) -> bool {
 /// (`files::release_user_resources`: threads, E/S pendente, fábricas,
 /// mutantes, instrumentação e canais RPC do processo), handles, VAD e
 /// imagens — e a liberação das threads. As notificações rodam no contexto do
-/// processo, como as da última thread no NT; o KTHREAD que era o corrente só
-/// é recolhido depois da troca de volta para a thread de quem chama.
+/// processo, como as da última thread no NT: quando quem chama é a última
+/// thread dele (a que saiu no próprio contexto), ela mesma; senão uma thread
+/// do processo como corrente. O KTHREAD que era o corrente só é recolhido
+/// depois da troca de volta para a thread de quem chama.
 pub fn finish_exit(process_pointer: u64) {
     let Some(status) = threads::claim_exit(process_pointer) else { return };
     let ran = process_state::get(process_pointer).is_some_and(|state| state.started.load(core::sync::atomic::Ordering::Acquire));
@@ -314,8 +316,11 @@ pub fn finish_exit(process_pointer: u64) {
         let _ = process_context::with_process(process_pointer, || crate::ntos::ps::user::process::post_mortem(process_pointer));
     }
     let previous = process::get_current_thread();
-    if let Some(own) = threads::of_process(process_pointer).iter().map(|thread| thread.pointer()).find(|&pointer| pointer != 0) {
-        process::set_current_thread(own);
+    let own_threads: alloc::vec::Vec<u64> = threads::of_process(process_pointer).iter().map(|thread| thread.pointer()).filter(|&pointer| pointer != 0).collect();
+    if !own_threads.contains(&previous) {
+        if let Some(&own) = own_threads.first() {
+            process::set_current_thread(own);
+        }
     }
     let _ = process::terminate_process(process_pointer, status);
     process::set_current_thread(previous);

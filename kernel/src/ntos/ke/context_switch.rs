@@ -239,8 +239,12 @@ pub fn swap_process(_previous: u64, next: u64) -> Result<(), KernelError> {
 
 // ---- KiSwapContext: esperas que bloqueiam --------------------------------
 
-/// O status com que termina a espera de uma thread terminada enquanto
-/// bloqueada no kernel (o papel da APC de término do NT).
+/// O status com que termina a espera de uma thread sem estado do win32k
+/// terminada enquanto bloqueada no kernel. A thread com estado do win32k
+/// segue o 19041: a espera dela só sai pela APC de término (STATUS_USER_APC
+/// numa espera de UserMode) ou pelo alerta de modo kernel (STATUS_ALERTED
+/// numa alertável), e a não alertável de KernelMode continua
+/// (`ps::user::threads::request_termination`).
 pub const STATUS_THREAD_IS_TERMINATING: u32 = 0xC000_004B;
 
 /// O RSP de quem chama.
@@ -322,8 +326,8 @@ impl BorrowedPoll {
 /// quando conclui, a retoma aqui. A IRQL da espera fica em KTHREAD.WaitIrql:
 /// a CPU volta ao despachante em PASSIVE_LEVEL e a thread a recupera ao
 /// retomar. Devolve o status da sondagem, ou
-/// [`STATUS_THREAD_IS_TERMINATING`] se a thread foi terminada enquanto
-/// esperava.
+/// [`STATUS_THREAD_IS_TERMINATING`] se a thread (sem estado do win32k) foi
+/// terminada enquanto esperava.
 pub fn block_current(poll: &mut dyn FnMut() -> Option<u32>) -> u32 {
     let thread = threads::current().expect("bloqueio sem thread de usuario corrente");
     let pointer = thread.pointer();
@@ -334,7 +338,7 @@ pub fn block_current(poll: &mut dyn FnMut() -> Option<u32>) -> u32 {
     // ponteiro é concluída e descartada antes de este quadro voltar a rodar.
     let raw: *mut (dyn FnMut() -> Option<u32> + 'static) = unsafe { core::mem::transmute(raw) };
     let mut borrowed = BorrowedPoll(raw);
-    threads::block_in_kernel(&thread, Wait { poll: Some(Box::new(move || borrowed.call())), ..Wait::default() });
+    threads::block_in_kernel(&thread, Wait { poll: Some(Box::new(move || borrowed.call())), kernel: true, ..Wait::default() });
     let wait_irql = irql::get_irql();
     kthread.wait_irql.set(wait_irql);
     if wait_irql != irql::PASSIVE_LEVEL {

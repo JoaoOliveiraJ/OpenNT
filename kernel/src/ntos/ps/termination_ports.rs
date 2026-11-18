@@ -43,8 +43,9 @@ pub fn register(handle: u64) -> Result<u32, KernelError> {
     Ok(0)
 }
 
-/// O PspExitThread: LPC_CLIENT_DIED a cada porta registrada pela thread.
-fn thread_exit(thread: u64) {
+/// O PspExitThread: LPC_CLIENT_DIED a cada porta registrada pela thread,
+/// antes do callout de saída de thread do win32k (`ps::process::exit_thread`).
+pub fn thread_exit(thread: u64) {
     let Some(ports) = PORTS.lock().remove(&thread) else { return };
     // SAFETY: a ETHREAD que termina, viva durante as rotinas de término.
     let object = unsafe { Ethread::at(thread) };
@@ -56,8 +57,4 @@ fn thread_exit(thread: u64) {
         }
         let _ = dispatcher_objects::dereference(pointer);
     }
-}
-
-pub fn init() {
-    process::register_thread_exit_routine(thread_exit);
 }

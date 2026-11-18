@@ -860,11 +860,36 @@ volta; as threads de kernel esperam como descrito acima, e só o contexto de
 boot (com as APCs e conclusões drenadas por ele) continua girando o pump.
 Como no NT, esperar de fato com prazo não nulo em
 DISPATCH_LEVEL ou acima, ou com um SpinLock retido, para o sistema (assert).
-Uma thread terminada enquanto bloqueada tem a espera concluída com
-STATUS_THREAD_IS_TERMINATING e é retomada para desfazer o serviço antes de a
-pilha voltar ao Mm (uma aquisição continua até concluir, como a espera de um
-mutex no NT); o término de um processo espera as threads dele desfazerem os
-serviços. Os serviços Nt* que
+Uma thread sem estado do win32k terminada enquanto bloqueada tem a espera
+concluída com STATUS_THREAD_IS_TERMINATING e é retomada para desfazer o
+serviço antes de a pilha voltar ao Mm (uma aquisição continua até concluir,
+como a espera de um mutex no NT); o término de um processo espera as threads
+dele desfazerem os serviços. Uma thread com estado do win32k
+(KTHREAD.Win32Thread) termina como no 19041 (o PspTerminateThreadByPointer e
+o KeRequestTerminationThread, `threads::request_termination`): o pedido marca
+CrossThreadFlags.Terminated, ETHREAD.ExitStatus do primeiro pedido,
+KTHREAD.ThreadFlags.TerminationApcRequest e UserApcPending (no NT a
+SchedulerApc vira a APC de usuário do KiSchedulerApcTerminate, que o
+KiInsertQueueApc põe na cabeça da fila com UserApcPending), alerta a thread
+em KernelMode e zera a suspensão. Nenhuma espera é concluída de fora: a de
+UserMode, alertável ou não, sai com STATUS_USER_APC (o KiCheckAlertability,
+que o caminho sondado dos KeWaitFor*, do KeDelayExecutionThread e do
+KeRemoveQueueEx agora segue também nas não alertáveis), a alertável de
+KernelMode sai com STATUS_ALERTED, a não alertável de KernelMode continua até
+concluir, e as esperas de E/S que conferem o Terminated cancelam o pedido. O
+serviço se desfaz e, na volta ao modo usuário, a thread roda o próprio
+PspExitThread (`threads::exit_current`), na pilha dela, num intervalo de
+serviço (pode bloquear), com o Win32Thread ainda publicado: no fim da syscall
+(`threads::service_exit_termination`, o KiServiceExit), na volta ao anel 3 de
+um callback, ou, se ela estava no anel 3, num intervalo que roda a rotina de
+kernel em vez de entrar no anel 3 (`usermode::exec_kernel_routine`, o
+KiSchedulerApcTerminate; a saída do intervalo é EXIT_THREAD_EXITED). Ali saem,
+na ordem do PspExitThread, as notificações e o callout de saída de thread do
+win32k (antes das rotinas de E/S, timers, notificações do Cm e mutantes), o
+rundown das APCs, o token, a contagem no EPROCESS e o objeto thread
+sinalizado; a última thread viva do processo conclui o fim dele ali mesmo,
+com o callout de saída de processo antes das notificações de processo. Os
+serviços Nt* que
 esperam por handle (NtWaitFor*, NtDelayExecution) continuam com o modelo
 PENDING + espera sondada, sem pilha suspensa. O NtWaitForSingleObject e o
 NtWaitForMultipleObjects de modo usuário capturam o prazo e os handles e
@@ -928,13 +953,18 @@ entre eles. O fim de um processo tem um caminho só,
 descarte, o NtTerminateProcess dele mesmo (o intervalo termina de vez e o
 despachante pede o fim), uma exceção fatal, uma falha de despacho e o
 NtTerminateProcess por handle de outro processo (PROCESS_TERMINATE), que
-termina o alvo sem tocar em quem chamou. As threads do processo morrem na
-hora (`threads::begin_exit`: esperas com THREAD_IS_TERMINATING, fora da fila
-de prontas); o término (`finish_exit`: o post-mortem de um processo que
-rodou, o `terminate_process` com as notificações no contexto de uma thread
-dele e as rotinas de saída, e a liberação das threads) roda já ou, se uma
-thread dele tem serviço suspenso no kernel ou o intervalo em curso é dele,
-fica com o despachante, que o conclui depois de desfazer os serviços. O
+termina o alvo sem tocar em quem chamou. As threads sem estado do win32k
+morrem na hora (`threads::begin_exit`: esperas com THREAD_IS_TERMINATING,
+fora da fila de prontas); as com Win32Thread recebem o pedido de término do
+19041 e saem sozinhas, no contexto delas (veja as esperas que bloqueiam), e
+a última a sair conclui o término ali. O término (`finish_exit`: o
+post-mortem de um processo que rodou, o `terminate_process` com o callout de
+saída de processo do win32k, as notificações no contexto de uma thread dele
+e as rotinas de saída, e a liberação das threads) roda já ou, se uma thread
+dele tem serviço suspenso no kernel, o próprio término por rodar ou o
+intervalo em curso é dele, fica com o despachante, que o conclui depois. Um
+fim que espera mais de 64 voltas do despachante roda mesmo assim, com aviso;
+com uma thread ainda por rodar o próprio término, a espera vai até 10 s. O
 NtTerminateProcess(NULL) termina as outras threads do processo corrente e
 quem chamou segue, como o primeiro passo do RtlExitUserProcess. A troca de
 thread corrente move a CPU em KPROCESS.ActiveProcessors do processo
@@ -974,7 +1004,15 @@ fora. `threads::run_callback` despacha esses intervalos até o
 NtCallbackReturn, que acha o quadro do callout pelo KERNEL_STACK_CONTROL da
 InitialStack corrente e grava a saída e o status: syscalls seguem, APCs e
 exceções são entregues no CONTEXT do callback e uma thread terminada encerra
-o laço. Dentro do callback a thread continua escalonável, como no NT: os
+o laço. Uma thread com o término pedido (as com Win32Thread) recebe a APC de
+término na volta ao anel 3 do callback, como no KiCallUserMode: o
+PspExitThread roda no laço, na pilha de fora (que volta à KTHREAD), e ela não
+volta ao serviço que chamou o KeUserModeCallback (o win32k, no
+ClientDeliverUserApc depois do STATUS_USER_APC); cada nível de fora acaba no
+fim do intervalo aninhado dele. A pilha, o quadro do callout e o CONTEXT de
+cada KeUserModeCallback abandonado ficam num registro por thread e voltam pelo
+ceifador (`user_callback::release_abandoned`). Dentro do callback a thread
+continua escalonável, como no NT: os
 intervalos aninhados terminam no laço do callback, não no despachante, então
 é o laço que repassa a troca. Um serviço aninhado que bloqueia no kernel sai
 do intervalo aninhado com EXIT_BLOCKED e deixa o quadro de troca em

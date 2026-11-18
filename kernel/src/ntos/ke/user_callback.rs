@@ -38,12 +38,18 @@
 //!   callback ativo, STATUS_NO_CALLBACK_ACTIVE;
 //! - na volta, a KTHREAD retoma a pilha anterior, o aninhamento cai, a pilha
 //!   do callback volta ao Mm e, com TEB.GdiBatchCount pendente, o callout 7
-//!   do win32k (o flush do lote GDI) roda com o RSP do usuário 0x100 abaixo.
+//!   do win32k (o flush do lote GDI) roda com o RSP do usuário 0x100 abaixo;
+//! - uma thread com o término pedido recebe a APC de término na volta ao
+//!   anel 3 do callback e sai ali, sem voltar a este KeUserModeCallback
+//!   (`threads::run_callback`): a pilha, o quadro e o CONTEXT do callback
+//!   ficam num registro por thread e voltam pelo ceifador
+//!   ([`release_abandoned`]).
 //!
 //! O RSP e o RIP da syscall vêm do CONTEXT do intervalo (o papel do
 //! KTRAP_FRAME); o callback roda num CONTEXT próprio, então o da syscall
 //! não muda.
 
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::hal::amd64::usermode;
@@ -55,7 +61,7 @@ use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::{kernel_stack, memory_map};
 use crate::ntos::ps::user::{state, threads};
 use crate::ntos::ps::{process, win32};
-use crate::rtl::KernelError;
+use crate::rtl::{KernelError, SpinLock};
 
 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
 const STATUS_NO_MEMORY: u32 = 0xC000_0017;
@@ -171,6 +177,61 @@ impl CalloutStacks {
         self.install(self.callback);
         blocked
     }
+
+    /// A thread sai de vez dentro deste nível de callback (o término dela):
+    /// a KTHREAD volta ao segmento de fora, o deste quadro, onde a saída roda
+    /// (e pode bloquear) e de onde o fim do intervalo segue para o nível de
+    /// fora. O segmento do callback fica para o ceifador
+    /// ([`release_abandoned`]).
+    pub fn abandon_callback(&self) {
+        self.install(self.outer);
+    }
+}
+
+/// O que um KeUserModeCallback em curso alocou: a pilha do callback, o
+/// quadro do callout e o CONTEXT do callback.
+struct ActiveCallout {
+    thread: u64,
+    stack: kernel_stack::KernelStack,
+    callout: u64,
+    context: u64,
+}
+
+/// Os KeUserModeCallback em curso de todas as threads. Uma thread terminada
+/// sai dentro do callback (a APC de término é entregue na volta ao anel 3
+/// dele, como no KiCallUserMode do NT) e nunca volta ao KeUserModeCallback
+/// que alocou: o ceifador devolve o que ficou ([`release_abandoned`]).
+static ACTIVE: SpinLock<Vec<ActiveCallout>> = SpinLock::new(Vec::new());
+
+/// Tira do registro o callback mais interno de `thread` com a pilha `base`.
+fn retire(thread: u64, base: u64) {
+    let mut active = ACTIVE.lock();
+    if let Some(index) = active.iter().rposition(|entry| entry.thread == thread && entry.stack.base == base) {
+        active.remove(index);
+    }
+}
+
+/// O ceifador de uma thread que saiu dentro de callbacks de modo usuário:
+/// devolve as pilhas, os quadros e os CONTEXTs dos KeUserModeCallback que
+/// nunca voltaram e zera o aninhamento. Chamado depois que a thread deixou a
+/// CPU (uma pilha em uso fica para o `kernel_stack::reap`).
+pub fn release_abandoned(thread: u64) {
+    let abandoned: Vec<ActiveCallout> = {
+        let mut active = ACTIVE.lock();
+        let (mine, others): (Vec<ActiveCallout>, Vec<ActiveCallout>) = active.drain(..).partition(|entry| entry.thread == thread);
+        *active = others;
+        mine
+    };
+    if abandoned.is_empty() {
+        return;
+    }
+    for entry in abandoned {
+        kernel_stack::delete(entry.stack);
+        guest::free_bytes(entry.callout);
+        guest::free_bytes(entry.context);
+    }
+    // SAFETY: a KTHREAD ainda está viva (o ceifador roda antes do fim dela).
+    unsafe { Kthread::at(thread) }.callback_nesting_level.set(0);
 }
 
 /// O fim de um KeUserModeCallback: desfaz o aninhamento e devolve a pilha
@@ -308,10 +369,12 @@ pub fn user_mode_callback(api_number: u32, input: u64, input_length: u32, output
     // KiCallUserMode: a thread passa para a pilha do callback.
     control.previous.kernel_stack.set(callout);
     let stacks = CalloutStacks { thread: pointer, outer: (thread.initial_stack.get(), thread.stack_base.get(), thread.stack_limit.get()), callback: (stack.initial, stack.base, stack.limit) };
+    ACTIVE.lock().push(ActiveCallout { thread: pointer, stack, callout, context: callback_context });
     stacks.install(stacks.callback);
     let exit = threads::run_callback(&user, callback_context, &|| frame_cells.returned.get() != 0, &stacks);
     // A volta do NtCallbackReturn: a pilha anterior.
     stacks.install(stacks.outer);
+    retire(pointer, stack.base);
     let status = if exit == 0 { frame_cells.status.get() } else { exit };
     flush_gdi_batch(syscall);
     guest::free_bytes(callout);

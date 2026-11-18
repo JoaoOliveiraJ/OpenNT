@@ -42,6 +42,9 @@ use super::usermode::{gs_offset, UserExecutionBlock};
 /// Tipo de saída de um intervalo que terminou porque a thread bloqueou no
 /// kernel (os outros: 0 término, 1 syscall, 2 timer, 3 exceção).
 pub const EXIT_BLOCKED: u32 = 4;
+/// Tipo de saída do intervalo em que a thread saiu de vez (o PspExitThread
+/// dela terminou, na volta ao modo usuário): nada a retomar.
+pub const EXIT_THREAD_EXITED: u32 = 5;
 
 /// Bytes do quadro de troca, do RSP salvo ao endereço de retorno inclusive.
 pub const SWITCH_FRAME_SIZE: u64 = 0x100;
@@ -240,6 +243,20 @@ pub unsafe fn build_initial_frame(stack_top: u64, entry: extern "C" fn(u64) -> !
     write64(FRAME_R12, entry as usize as u64);
     write64(FRAME_R13, argument);
     write64(FRAME_RETURN, core::ptr::addr_of!(opennt_kernel_thread_start) as u64);
+    frame
+}
+
+/// Como [`build_initial_frame`], mas com as interrupções desligadas na
+/// entrada, como num serviço (a entrada de syscall limpa IF): o quadro de uma
+/// rotina de kernel que roda na pilha de uma thread de usuário no lugar de um
+/// serviço (a saída da thread na volta ao modo usuário).
+///
+/// # Safety
+///
+/// As mesmas de [`build_initial_frame`].
+pub unsafe fn build_service_frame(stack_top: u64, entry: extern "C" fn(u64) -> !, argument: u64) -> u64 {
+    let frame = build_initial_frame(stack_top, entry, argument);
+    core::ptr::write_volatile((frame + FRAME_RFLAGS) as *mut u64, 0x002);
     frame
 }
 
