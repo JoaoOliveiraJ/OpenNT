@@ -280,11 +280,14 @@ máquina virtual no WHPX e uma chamada ao emulador no TCG: os 16 MB do kernel
 por PIO levavam 10 s no TCG e 22 s no WHPX. O stage2 então
 confere o cabeçalho (ImageBase, SizeOfImage, entrada) e mapeia exatamente
 SizeOfImage páginas de 4 KB de supervisor, RW e executáveis na ImageBase, com
-tabelas fixas em 0x83000-0x8DFFF (PDPT, PD e nove PTs). A pilha de boot é
+tabelas fixas em 0x83000-0x92FFF (PDPT, PD e catorze PTs). A pilha de boot é
 outra VA de sistema na mesma PD: 383 páginas RW e NX terminando em
-`BOOT_STACK_TOP`, sobre os frames logo abaixo de 20 MB (a imagem pode ir até
-17,5 MB, nos frames de 1 MB a 18,5 MB), com uma página de
-guarda sem mapeamento embaixo (PT em 0x8E000). O stage2 carrega o GDTR pela VA
+`BOOT_STACK_TOP`, sobre os frames logo abaixo de 30 MB (a imagem pode ir até
+27,5 MB, nos frames de 1 MB a 28,5 MB; a tabela do censo do heap ocupa os
+2 MB entre a pilha e o heap), com uma página de
+guarda sem mapeamento embaixo (PT em 0x93000). As tabelas ficam abaixo da
+EBDA (0x9F000), e o campo de 16 bits com os setores do kernel no stage2
+limita o arquivo a 32 MB. O stage2 carrega o GDTR pela VA
 do mapa direto e entra no kernel com RSP = BOOT_STACK_TOP - 8 e RBP zero (o
 fim da cadeia de quadros).
 

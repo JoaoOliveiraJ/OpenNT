@@ -13,11 +13,10 @@
 //!   0x07B000-0x07CFFF    tabelas da janela do heap (PDPT, PD)
 //!   0x081000-0x081FFF    contagem de IRQs, ring do teclado, células de IRQL
 //!   0x082000-0x082FFF    IDT (carregada pela VA do mapa direto)
-//!   0x083000-0x08DFFF    tabelas da imagem do kernel e da pilha de boot
-//!   0x100000-0x127FFFF   frames da imagem do kernel (cap de build: 17,5MB)
-//!   0x1281000-0x13FFFFF  frames da pilha de boot
-//!   0x1400000-0x15FFFFF  tabela do censo do heap do kernel
-//!   0x1600000-0x1FFFFFF  sem uso
+//!   0x083000-0x093FFF    tabelas da imagem do kernel e da pilha de boot
+//!   0x100000-0x1C7FFFF   frames da imagem do kernel (cap de build: 27,5MB)
+//!   0x1C81000-0x1DFFFFF  frames da pilha de boot
+//!   0x1E00000-0x1FFFFFF  tabela do censo do heap do kernel
 //!   0x2000000-0x5FFFFFF  frames do heap do kernel (kmalloc) e da arena de 16MB
 //!   0x6000000-0xFFFFFFF  primeira arena PFN (160MB)
 //!   0x20000000-0x2FFFFFFF segunda arena PFN (256MB)
@@ -59,7 +58,7 @@
 //!   0xFFFFF780_00000000  (495) KUSER_SHARED_DATA (visão do kernel)
 //!   0xFFFFF800_00000000  (496) KPCRs (0xC000 bytes por CPU) e pool de dados
 //!   0xFFFFF800_40000000  (496) imagem do kernel (ImageBase do ntoskrnl)
-//!   0xFFFFF800_41081000  (496) pilha de boot (até 0xFFFFF800_41200000)
+//!   0xFFFFF800_41C81000  (496) pilha de boot (até 0xFFFFF800_41E00000)
 //!   0xFFFFF801_00000000  (496) janela de imagens de sistema (drivers, hal.dll...)
 //!   0xFFFFF900_00000000  (498) espaço de sessão: tabela de topo própria de
 //!                              cada sessão, vazio fora delas
@@ -104,7 +103,7 @@ pub const fn is_user_range(base: u64, size: u64) -> bool {
 // arquivo linearmente em `KERNEL_IMAGE_PHYS` (offsets do arquivo == RVAs) e
 // mapeia exatamente SizeOfImage páginas de 4 KB de supervisor, RW e
 // executáveis, de `KERNEL_VIRTUAL_BASE` para `KERNEL_IMAGE_PHYS`, com tabelas
-// fixas abaixo de 1 MB (uma PDPT, uma PD e nove PTs contíguas). O endereço
+// fixas abaixo de 1 MB (uma PDPT, uma PD e catorze PTs contíguas). O endereço
 // de link fica fora dos 2 GB do topo, então o código do kernel é gerado
 // independente de posição (`relocation-model=pic` em `.cargo/config.toml`)
 // e ligado como executável estático (`--no-pie`): toda referência do código
@@ -113,14 +112,16 @@ pub const fn is_user_range(base: u64, size: u64) -> bool {
 //
 // A pilha de boot (a do BSP até o escalonador assumir) também é uma VA de
 // sistema, na mesma PD da imagem: 383 páginas de RW e NX que terminam em
-// `BOOT_STACK_TOP`, sobre os frames físicos logo abaixo de 20 MB (logo
-// acima dos da imagem), com uma página de guarda sem mapeamento embaixo. O stage2 entra no kernel com
+// `BOOT_STACK_TOP`, sobre os frames físicos logo abaixo de 30 MB (logo
+// acima dos da imagem e abaixo da tabela do censo do heap), com uma página
+// de guarda sem mapeamento embaixo. O stage2 entra no kernel com
 // RSP = BOOT_STACK_TOP - 8 (alinhamento de quem acabou de receber um CALL).
 
 /// Endereço físico onde o stage2 carrega o PE do kernel.
 pub const KERNEL_IMAGE_PHYS: u64 = 0x10_0000;
-/// Teto do SizeOfImage do kernel (frames físicos 1 MB a 18,5 MB).
-pub const KERNEL_IMAGE_MAX: u64 = 17 * 1024 * 1024 + 512 * 1024;
+/// Teto do SizeOfImage do kernel (frames físicos 1 MB a 28,5 MB, até a
+/// guarda da pilha de boot).
+pub const KERNEL_IMAGE_MAX: u64 = 27 * 1024 * 1024 + 512 * 1024;
 /// ImageBase do kernel: o endereço em que ele é ligado e executa.
 pub const KERNEL_VIRTUAL_BASE: u64 = 0xFFFF_F800_4000_0000;
 /// Slot da PML4 da imagem (o mesmo da KPCR e da janela de imagens de sistema).
@@ -134,12 +135,12 @@ pub const KERNEL_PT_COUNT: u64 = KERNEL_IMAGE_MAX.div_ceil(LARGE_PAGE_SIZE);
 pub const BOOT_STACK_PT_PHYS: u64 = KERNEL_PT_PHYS + KERNEL_PT_COUNT * PAGE_SIZE;
 
 /// Topo (exclusivo) da pilha de boot e InitialStack da thread do boot.
-pub const BOOT_STACK_TOP: u64 = KERNEL_VIRTUAL_BASE + 0x140_0000;
+pub const BOOT_STACK_TOP: u64 = KERNEL_VIRTUAL_BASE + 0x1E0_0000;
 pub const BOOT_STACK_SIZE: u64 = 0x17_F000;
 /// Página mais baixa da pilha; a de baixo dela é a guarda.
 pub const BOOT_STACK_LIMIT: u64 = BOOT_STACK_TOP - BOOT_STACK_SIZE;
 /// Frames físicos da pilha: [BOOT_STACK_PHYS_TOP - BOOT_STACK_SIZE, BOOT_STACK_PHYS_TOP).
-pub const BOOT_STACK_PHYS_TOP: u64 = 0x140_0000;
+pub const BOOT_STACK_PHYS_TOP: u64 = 0x1E0_0000;
 pub const BOOT_STACK_PHYS_BASE: u64 = BOOT_STACK_PHYS_TOP - BOOT_STACK_SIZE;
 
 /// A VA pertence à faixa reservada da imagem do kernel.
@@ -155,7 +156,12 @@ const _: () = assert!(KERNEL_IMAGE_PHYS + KERNEL_IMAGE_MAX <= BOOT_STACK_PHYS_BA
 const _: () = assert!(KERNEL_IMAGE_MAX % PAGE_SIZE == 0 && BOOT_STACK_SIZE % PAGE_SIZE == 0 && BOOT_STACK_TOP % LARGE_PAGE_SIZE == 0);
 const _: () = assert!((BOOT_STACK_LIMIT - PAGE_SIZE) / LARGE_PAGE_SIZE == (BOOT_STACK_TOP - 1) / LARGE_PAGE_SIZE);
 const _: () = assert!((BOOT_STACK_TOP - 1 - KERNEL_VIRTUAL_BASE) / LARGE_PAGE_SIZE >= KERNEL_PT_COUNT && BOOT_STACK_TOP - KERNEL_VIRTUAL_BASE <= 0x4000_0000);
-const _: () = assert!(KERNEL_PDPT_PHYS >= 0x8_3000 && BOOT_STACK_PT_PHYS + PAGE_SIZE <= 0x8_F000 && KERNEL_PD_PHYS == KERNEL_PDPT_PHYS + PAGE_SIZE && KERNEL_PT_PHYS == KERNEL_PD_PHYS + PAGE_SIZE);
+// As tabelas ficam na memória convencional abaixo da EBDA (que começa em
+// 0x9F000 ou acima; no BIOS do QEMU, em 0x9FC00).
+const _: () = assert!(KERNEL_PDPT_PHYS >= 0x8_3000 && BOOT_STACK_PT_PHYS + PAGE_SIZE <= 0x9_F000 && KERNEL_PD_PHYS == KERNEL_PDPT_PHYS + PAGE_SIZE && KERNEL_PT_PHYS == KERNEL_PD_PHYS + PAGE_SIZE);
+// O stage2 lê o arquivo por DMA para um destino alinhado a 64 KB e conta os
+// setores do kernel num campo de 16 bits (`kernel_sectors`).
+const _: () = assert!(KERNEL_IMAGE_PHYS % 0x1_0000 == 0 && KERNEL_IMAGE_MAX <= 0xFFFF * 512);
 
 /// Candidatas, não declaração de RAM: o PFN intersecta estas faixas com a
 /// RAM utilizável do E820 e subtrai entradas reservadas.
@@ -412,9 +418,10 @@ const _: () = assert!(KERNEL_HEAP_PHYS_TOP - KERNEL_HEAP_PHYS_BASE <= 0x4000_000
 const _: () = assert!(KERNEL_HEAP_PDPT_PHYS == DIRECT_MAP_PD_PHYS + 4 * PAGE_SIZE && KERNEL_HEAP_PD_PHYS == KERNEL_HEAP_PDPT_PHYS + PAGE_SIZE && KERNEL_HEAP_PD_PHYS + PAGE_SIZE <= 0x8_1000);
 
 /// Tabela do censo do heap do kernel (`hal::heap_census`: bytes vivos por
-/// local de alocação): frames fixos entre a pilha de boot e o heap,
-/// alcançados só pelo mapa direto, fora do heap, do PFN e da imagem.
-pub const KERNEL_HEAP_CENSUS_PHYS: u64 = 0x140_0000;
+/// local de alocação): frames fixos entre a pilha de boot e o heap (os 2 MB
+/// logo abaixo dele), alcançados só pelo mapa direto, fora do heap, do PFN e
+/// da imagem.
+pub const KERNEL_HEAP_CENSUS_PHYS: u64 = 0x1E0_0000;
 pub const KERNEL_HEAP_CENSUS_SIZE: u64 = 0x20_0000;
 
 const _: () = assert!(KERNEL_HEAP_CENSUS_PHYS >= BOOT_STACK_PHYS_TOP && KERNEL_HEAP_CENSUS_PHYS + KERNEL_HEAP_CENSUS_SIZE <= KERNEL_HEAP_PHYS_BASE && KERNEL_HEAP_CENSUS_PHYS % PAGE_SIZE == 0);

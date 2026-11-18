@@ -4,7 +4,8 @@
  * kernel/src/ntos/mm/memory_map.rs): a primeira página é o cabeçalho PE32+
  * gerado pelo xtask a partir destas seções, e `.text` começa em +0x1000. Os
  * offsets do arquivo são iguais às RVAs; o stage2 carrega a imagem
- * linearmente nos frames de 1 MB a 14 MB, mapeia SizeOfImage páginas na
+ * linearmente nos frames a partir de 1 MB (até o KERNEL_IMAGE_MAX do
+ * memory_map.rs, que inclui a `.bss`), mapeia SizeOfImage páginas na
  * ImageBase e entra pelo AddressOfEntryPoint.
  *
  * O código é independente de posição (relocation-model=pic) e o executável

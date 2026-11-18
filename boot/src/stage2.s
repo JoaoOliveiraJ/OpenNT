@@ -21,8 +21,9 @@
 #
 # Rsp % 16 == 8 na entrada do kernel (como se viesse de um call). Os
 # enderecos vem de kernel/src/ntos/mm/memory_map.rs: o kernel ocupa os frames
-# [1MB, 16.5MB) e a pilha de boot os frames logo abaixo de 18MB. O kernel
-# desfaz a identidade transitoria na entrada.
+# a partir de 1MB (ate KERNEL_IMAGE_MAX) e a pilha de boot os frames logo
+# acima, abaixo de BOOT_STACK_PHYS_TOP. O kernel desfaz a identidade
+# transitoria na entrada.
 # ---------------------------------------------------------------------------
 .pushsection .boot, "awx", @progbits
 .code16
