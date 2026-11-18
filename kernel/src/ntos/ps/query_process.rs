@@ -398,12 +398,38 @@ pub fn query_command_line(process: &Eprocess, output: u64, buffer_length: u32, a
 // pedido para o EPROCESS, retido enquanto dura a chamada.
 
 /// ProcessQuotaLimits (1), ProcessVmCounters (3), ProcessTimes (4),
-/// ProcessImageFileNameWin32 (43) e ProcessMitigationPolicy (52).
+/// ProcessPriorityClass (18), ProcessImageFileNameWin32 (43) e
+/// ProcessMitigationPolicy (52).
 pub const PROCESS_QUOTA_LIMITS: u32 = 1;
 pub const PROCESS_VM_COUNTERS: u32 = 3;
 pub const PROCESS_TIMES: u32 = 4;
+pub const PROCESS_PRIORITY_CLASS: u32 = 18;
 pub const PROCESS_IMAGE_FILE_NAME_WIN32: u32 = 43;
 pub const PROCESS_MITIGATION_POLICY: u32 = 52;
+
+/// ProcessPriorityClass (o ramo da classe 18 do NtQueryInformationProcess
+/// 19041, rva 0x6227d4): exatamente os 2 bytes do PROCESS_PRIORITY_CLASS
+/// (outro tamanho dá STATUS_INFO_LENGTH_MISMATCH antes do handle), o handle
+/// com PROCESS_QUERY_LIMITED_INFORMATION; Foreground sai sempre FALSE (a
+/// consulta não lê o estado de primeiro plano) e PriorityClass é o
+/// EPROCESS.PriorityClass. ReturnLength 2. O GetPriorityClass do kernelbase
+/// lê a classe por aqui.
+pub fn query_priority_class(output: u64, length: u32, returned: u64, process_of: impl FnOnce(u32) -> Result<u64, u32>) -> Result<u32, KernelError> {
+    if length != 2 {
+        return Ok(STATUS_INFO_LENGTH_MISMATCH);
+    }
+    let process = match process_of(PROCESS_QUERY_LIMITED_INFORMATION) {
+        Ok(process) => process,
+        Err(status) => return Ok(status),
+    };
+    // SAFETY: EPROCESS retido pelo handle que o nomeou (ou o corrente).
+    let class = unsafe { Eprocess::at(process) }.priority_class.get();
+    guest::try_write::<u16>(output, u16::from(class) << 8)?;
+    if returned != 0 {
+        guest::try_write::<u32>(returned, 2)?;
+    }
+    Ok(0)
+}
 
 /// ProcessTimes (o ramo da classe 4, rva 0x62221e): exatamente os 0x20
 /// bytes do KERNEL_USER_TIMES, o handle com
