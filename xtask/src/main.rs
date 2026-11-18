@@ -58,6 +58,7 @@ mod ntfs_image;
 mod png;
 mod qcow2;
 mod qemu;
+mod screen_check;
 mod service_chain;
 mod side_by_side;
 mod theme;

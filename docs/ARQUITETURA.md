@@ -5615,7 +5615,10 @@ build por configuração, pistas em paralelo) e passa a cada `test-boot
 QMP e, no fim do teste (passando ou não), o `screendump` grava a tela em PPM (o
 QEMU desta máquina não tem a libpng), que o `xtask/src/png.rs` converte em PNG
 sem moldura, com paleta e deflate próprio, abaixo de 60 KB, com a data e o
-resultado nos textos do PNG; o `cargo xtask status` os lê de lá.
+resultado nos textos do PNG; o `cargo xtask status` os lê de lá. Um teste
+que passa com a tela de logon confirmada pela vigia do `--watch-screen`
+(abaixo) grava como captura essa tela, a que o provou, mesmo se o QEMU já
+terminou; uma tela de foto não cabe em 60 KB e vai pela metade (512x384).
 
 O `test-boot --watch-screen` lê a tela durante o teste, pelo mesmo QMP, a
 cada 2 s (`qemu::watch_screen`). Uma tela gráfica de pelo menos 800x600 com
@@ -5626,6 +5629,26 @@ grava a tela em `<build>/primeira-tela.png`. A tela de texto da VGA (720x400)
 e o aviso do QEMU antes da VGA iniciar (640x480) não contam. O vídeo de boot
 do OpenNT (o modo VBE 1024x768) é todo preto, e o kernel só desenha nele a
 tela de bugcheck: o que aparece ali vem de quem desenha depois do boot.
+
+Depois do primeiro pixel, a mesma vigia procura a tela de logon
+(`screen_check::logon_screen`): um quarto ou mais da tela fora do preto,
+pelo menos metade dos pares de pixels vizinhos desenhados com cada canal
+mudando até 16 de um para o outro, 8 cores ou mais com 1/1536 da tela cada e
+desenho (1% dos pixels) em 3/5 das linhas e 3/5 das colunas. Quando duas
+leituras seguidas passam e diferem em até 1/32 dos pixels
+(`screen_check::same_screen`), a segunda põe no log a linha `[xtask] tela de
+logon` e o `LOGON_SCREEN_OK` e vai para `<build>/tela-de-logon.png`. Os
+limites vêm da tela de bloqueio do 19041 numa instalação nova, o
+`Web\Screen\img100.jpg` esticado para cobrir a tela de 1024x768, medida com a
+imagem decodificada pelo WIC e por outros escalonamentos, com e sem o relógio
+e a data: 35% a 51% fora do preto (a caverna da foto é escura), 84% a 94% dos
+vizinhos suaves, 17 ou 18 cores, desenho em 84% das linhas e em 69% a 100%
+das colunas. Não passam: a memória lida como cor (7% a 13% dos vizinhos
+suaves), a cor de destaque com o relógio, que o LogonUI mostra sem a imagem
+(2 cores), e um quadro rasgado ou uma faixa da imagem (menos de 3/5 das
+linhas ou das colunas); um quadro rasgado mais perto do fim e a imagem
+surgindo do preto não ficam iguais na leitura seguinte. O teste da tela de
+logon que falha escreve no log o que faltou na última tela lida.
 
 O `test-boot --capture-every=SEGUNDOS` grava a tela durante o teste em
 `<build>/tela-NNNN.png` (`qemu::FrameSeries`): a NNNN é a dos NNNN×SEGUNDOS

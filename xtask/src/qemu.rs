@@ -7,7 +7,9 @@
 //! socket TCP em 127.0.0.1 (`kd_port`), onde o cliente (`cargo xtask
 //! debug`) ou o GDB se conectam; uma sessão de roteiro roda em paralelo ao
 //! `test-boot` e a falha dela derruba o teste. Com `--capture=ARQ.png`, o
-//! QEMU ganha um socket QMP e, no fim do teste, a tela vai para o PNG; com
+//! QEMU ganha um socket QMP e, no fim do teste, a tela vai para o PNG (a
+//! tela de logon que a vigia do `--watch-screen` confirmou, quando o teste
+//! passou com ela); com
 //! `--capture-every=SEGUNDOS`, a tela vai para `tela-NNNN.png` durante o
 //! teste e para `tela-final.png` no fim ([`FrameSeries`]). Os testes do
 //! desligamento (`--expect-poweroff`, `--power-cycles=N`, `--allow-reboot`)
@@ -23,6 +25,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use crate::screen_check::{self, FIRST_PIXEL_MARKER, LOGON_SCREEN_MARKER};
 
 #[derive(Clone, Debug)]
 pub struct MachineOptions {
@@ -530,9 +534,11 @@ pub struct TestOptions {
     /// `--expect-poweroff`: depois das saídas esperadas, o QEMU precisa sair
     /// sozinho pelo desligamento ACPI.
     pub expect_poweroff: bool,
-    /// `--watch-screen`: o xtask lê a tela do QEMU durante o teste e põe o
-    /// marcador `FIRST_PIXEL_OK` no log da serial quando a tela gráfica
-    /// mostra pixels desenhados ([`drawn_pixels`]).
+    /// `--watch-screen`: o xtask lê a tela do QEMU durante o teste e põe no
+    /// log da serial o marcador `FIRST_PIXEL_OK` quando a tela gráfica
+    /// mostra pixels desenhados ([`screen_check::drawn_pixels`]) e o
+    /// `LOGON_SCREEN_OK` quando mostra a tela de logon em duas leituras
+    /// seguidas iguais ([`screen_check::logon_screen`]).
     pub watch_screen: bool,
     /// `--capture-every=SEGUNDOS`: a tela do QEMU vai para `tela-NNNN.png`
     /// na pasta do log a cada intervalo (só quando mudou) e, no fim do teste
@@ -540,106 +546,8 @@ pub struct TestOptions {
     pub capture_every: Option<Duration>,
 }
 
-/// O marcador do `--watch-screen`.
-pub const FIRST_PIXEL_MARKER: &str = "FIRST_PIXEL_OK";
 /// Intervalo entre duas leituras da tela.
 const SCREEN_POLL: Duration = Duration::from_secs(2);
-/// Pixels não pretos que uma tela gráfica precisa ter.
-const DRAWN_MINIMUM: usize = 64;
-/// Um canal acima disto não é preto.
-const BLACK_LEVEL: u8 = 0x20;
-/// O fundo da tela de bugcheck (`bgk/bugcheck_screen.rs`).
-const BUGCHECK_BACKGROUND: [u8; 3] = [0x00, 0x77, 0xD6];
-
-/// Os pixels desenhados numa tela do QEMU, ou None. Só conta uma tela
-/// gráfica de pelo menos 800x600, como o vídeo de boot (1024x768): a de
-/// texto da VGA (720x400) mostra o console do carregador, e o aviso do
-/// QEMU antes da VGA iniciar ocupa 640x480. O vídeo de boot do OpenNT é
-/// todo preto e o kernel só desenha nele a tela de bugcheck, então pixels
-/// não pretos que não são o fundo azul dela vêm de quem desenha na tela
-/// depois do boot.
-pub fn drawn_pixels(image: &crate::png::Image) -> Option<String> {
-    if image.height < 600 || image.width < 800 {
-        return None;
-    }
-    let mut drawn = 0usize;
-    let mut bugcheck = 0usize;
-    let mut colors: std::collections::HashMap<[u8; 3], usize> = std::collections::HashMap::new();
-    let (mut left, mut top, mut right, mut bottom) = (usize::MAX, usize::MAX, 0usize, 0usize);
-    for (index, pixel) in image.rgb.chunks_exact(3).enumerate() {
-        let rgb = [pixel[0], pixel[1], pixel[2]];
-        if rgb == BUGCHECK_BACKGROUND {
-            bugcheck += 1;
-        }
-        if rgb.iter().all(|&channel| channel <= BLACK_LEVEL) {
-            continue;
-        }
-        drawn += 1;
-        *colors.entry(rgb).or_default() += 1;
-        let (x, y) = (index % image.width, index / image.width);
-        left = left.min(x);
-        right = right.max(x);
-        top = top.min(y);
-        bottom = bottom.max(y);
-    }
-    if drawn < DRAWN_MINIMUM || bugcheck * 2 > image.width * image.height {
-        return None;
-    }
-    let mut common: Vec<([u8; 3], usize)> = colors.into_iter().collect();
-    common.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    let palette: Vec<String> = common.iter().take(4).map(|(rgb, count)| format!("#{:02x}{:02x}{:02x} x{count}", rgb[0], rgb[1], rgb[2])).collect();
-    Some(format!(
-        "{drawn} pixels desenhados na tela {}x{}, de ({left},{top}) a ({right},{bottom}); cores: {}",
-        image.width,
-        image.height,
-        palette.join(", ")
-    ))
-}
-
-/// O marcador da tela de logon do `--watch-screen`.
-pub const LOGON_SCREEN_MARKER: &str = "LOGON_SCREEN_OK";
-/// A tela de logon cobre pelo menos um quarto da tela com pixels não pretos.
-const LOGON_AREA_DIVISOR: usize = 4;
-/// E tem pelo menos tantas cores, cada uma com pelo menos tantos pixels: uma
-/// imagem ou um fundo com texto, não um retângulo de cor única nem o ponteiro.
-const LOGON_COLORS: usize = 8;
-const LOGON_COLOR_PIXELS: usize = 500;
-
-/// A tela de logon numa tela do QEMU, ou None: uma tela gráfica de pelo
-/// menos 800x600 que não é a de bugcheck, com um quarto ou mais dela fora do
-/// preto e [`LOGON_COLORS`] cores de pelo menos [`LOGON_COLOR_PIXELS`]
-/// pixels cada. O primeiro pixel (o ponteiro do mouse, [`drawn_pixels`])
-/// não basta.
-pub fn logon_screen(image: &crate::png::Image) -> Option<String> {
-    if image.height < 600 || image.width < 800 {
-        return None;
-    }
-    let total = image.width * image.height;
-    let mut drawn = 0usize;
-    let mut bugcheck = 0usize;
-    let mut colors: std::collections::HashMap<[u8; 3], usize> = std::collections::HashMap::new();
-    for pixel in image.rgb.chunks_exact(3) {
-        let rgb = [pixel[0], pixel[1], pixel[2]];
-        if rgb == BUGCHECK_BACKGROUND {
-            bugcheck += 1;
-        }
-        if rgb.iter().all(|&channel| channel <= BLACK_LEVEL) {
-            continue;
-        }
-        drawn += 1;
-        *colors.entry(rgb).or_default() += 1;
-    }
-    if bugcheck * 2 > total || drawn * LOGON_AREA_DIVISOR < total {
-        return None;
-    }
-    let mut common: Vec<([u8; 3], usize)> = colors.into_iter().filter(|(_, count)| *count >= LOGON_COLOR_PIXELS).collect();
-    if common.len() < LOGON_COLORS {
-        return None;
-    }
-    common.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    let palette: Vec<String> = common.iter().take(4).map(|(rgb, count)| format!("#{:02x}{:02x}{:02x} x{count}", rgb[0], rgb[1], rgb[2])).collect();
-    Some(format!("{drawn} de {total} pixels desenhados, {} cores com {LOGON_COLOR_PIXELS} pixels ou mais; cores: {}", common.len(), palette.join(", ")))
-}
 
 /// Grava uma captura da tela em `target`, com a descrição nos metadados.
 fn save_capture(image: &crate::png::Image, target: &std::path::Path, result: &str, description: &str) {
@@ -649,27 +557,61 @@ fn save_capture(image: &crate::png::Image, target: &std::path::Path, result: &st
     }
 }
 
+/// O estado da vigia da tela (`--watch-screen`).
+#[derive(Default)]
+struct Watch {
+    /// A primeira tela desenhada já apareceu (`FIRST_PIXEL_OK`).
+    first_seen: bool,
+    /// A leitura anterior, quando ela passou na conferência da tela de
+    /// logon: a tela de logon só conta em duas leituras seguidas iguais
+    /// ([`screen_check::same_screen`]).
+    candidate: Option<crate::png::Image>,
+    /// A tela de logon confirmada (`LOGON_SCREEN_OK`).
+    logon: Option<crate::png::Image>,
+}
+
 /// Um passo da vigia da tela (`--watch-screen`) sobre `image`. Na primeira
 /// tela com pixels desenhados escreve a descrição e o `FIRST_PIXEL_OK` no
 /// log da serial e grava o PNG em `first`; depois procura a tela de logon
-/// ([`logon_screen`]), que sai com o `LOGON_SCREEN_OK` e vai para
-/// `tela-de-logon.png`, ao lado. Devolve true quando a vigia acabou (a tela
-/// de logon apareceu).
-fn watch_step(image: &crate::png::Image, first: &Path, first_seen: &mut bool, output: &Mutex<String>) -> bool {
-    if !*first_seen {
-        let Some(description) = drawn_pixels(image) else { return false };
-        *first_seen = true;
+/// ([`screen_check::logon_screen`]). Quando duas leituras seguidas passam e
+/// são a mesma tela, a segunda sai com o `LOGON_SCREEN_OK`, vai para
+/// `tela-de-logon.png`, ao lado, e fica em `watch.logon`. Devolve true
+/// quando a vigia acabou (a tela de logon apareceu).
+fn watch_step(image: &crate::png::Image, first: &Path, watch: &mut Watch, output: &Mutex<String>) -> bool {
+    if !watch.first_seen {
+        let Some(description) = screen_check::drawn_pixels(image) else { return false };
+        watch.first_seen = true;
         let line = format!("\n[xtask] tela: {description}\n{FIRST_PIXEL_MARKER}\n");
         print!("{line}");
         output.lock().unwrap().push_str(&line);
         save_capture(image, first, "primeira tela desenhada", &description);
     }
-    let Some(description) = logon_screen(image) else { return false };
-    let line = format!("\n[xtask] tela de logon: {description}\n{LOGON_SCREEN_MARKER}\n");
+    let Ok(description) = screen_check::logon_screen(image) else {
+        watch.candidate = None;
+        return false;
+    };
+    if !watch.candidate.as_ref().is_some_and(|previous| screen_check::same_screen(previous, image)) {
+        watch.candidate = Some(image.clone());
+        return false;
+    }
+    let line = format!("\n[xtask] tela de logon (igual em duas leituras seguidas): {description}\n{LOGON_SCREEN_MARKER}\n");
     print!("{line}");
     output.lock().unwrap().push_str(&line);
     save_capture(image, &first.with_file_name("tela-de-logon.png"), "tela de logon", &description);
+    watch.candidate = None;
+    watch.logon = Some(image.clone());
     true
+}
+
+/// O que a thread da tela devolve no fim.
+#[derive(Default)]
+struct ScreenOutcome {
+    /// A última tela lida.
+    last: Option<crate::png::Image>,
+    /// A série do `--capture-every`.
+    frames: Option<FrameSeries>,
+    /// A tela de logon que a vigia confirmou.
+    logon: Option<crate::png::Image>,
 }
 
 /// O passo da espera da thread da tela: o fim do teste a encontra em até
@@ -681,7 +623,7 @@ const SCREEN_STEP: Duration = Duration::from_millis(100);
 /// tela desenhada, a cada [`SCREEN_POLL`]) e a série do `--capture-every`
 /// (`frames`); quando as duas vencem juntas, uma leitura serve às duas. Os
 /// prazos contam de `launched` (a subida do QEMU). Devolve a última tela
-/// lida e a série.
+/// lida, a série e a tela de logon confirmada.
 fn screen_thread(
     port: u16,
     scratch: PathBuf,
@@ -690,9 +632,9 @@ fn screen_thread(
     mut frames: Option<FrameSeries>,
     output: Arc<Mutex<String>>,
     stop: Arc<std::sync::atomic::AtomicBool>,
-) -> (Option<crate::png::Image>, Option<FrameSeries>) {
+) -> ScreenOutcome {
     use std::sync::atomic::Ordering;
-    let mut first_seen = false;
+    let mut state = Watch::default();
     let mut watch_at = watch.is_some().then_some(SCREEN_POLL);
     let mut frame = frames.as_ref().map(|series| series.next_index(Duration::ZERO));
     let mut last = None;
@@ -714,7 +656,7 @@ fn screen_thread(
         if watch_at.is_some_and(|at| at <= elapsed) {
             watch_at = Some(elapsed + SCREEN_POLL);
             if let (Ok(image), Some(first)) = (&screen, &watch) {
-                if watch_step(image, first, &mut first_seen, &output) {
+                if watch_step(image, first, &mut state, &output) {
                     watch_at = None;
                 }
             }
@@ -735,7 +677,7 @@ fn screen_thread(
             last = Some(image);
         }
     }
-    (last, frames)
+    ScreenOutcome { last, frames, logon: state.logon }
 }
 
 /// Limite de tamanho de uma captura (a tela gráfica é reduzida até caber).
@@ -964,18 +906,26 @@ fn serial_proof(serial: &str, needles: &[&str]) -> String {
     text
 }
 
-/// A captura do fim do teste: PPM do QEMU -> PNG pequeno, com a data, o
-/// resultado e as linhas da serial que provam o teste nos textos do PNG (o
-/// `cargo xtask status` os mostra).
+/// A captura do fim do teste: PPM do QEMU -> PNG pequeno ([`write_capture`]).
 fn capture_screen(port: u16, target: &Path, result: &Result<(), String>, serial: &str) -> Result<(), String> {
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
     }
     let image = read_screen(port, &target.with_extension("ppm"))?;
+    write_capture(&image, target, result, serial)
+}
+
+/// A captura de um teste em `target`: PNG pequeno, com a data, o resultado
+/// e as linhas da serial que provam o teste nos textos do PNG (o `cargo
+/// xtask status` os mostra).
+fn write_capture(image: &crate::png::Image, target: &Path, result: &Result<(), String>, serial: &str) -> Result<(), String> {
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
+    }
     let outcome = outcome(result);
     let date = crate::png::today();
     let texts = [("opennt-data", date.as_str()), ("opennt-resultado", outcome.as_str()), ("opennt-serial", serial)];
-    let png = crate::png::encode_capture(&image, &texts, CAPTURE_LIMIT);
+    let png = crate::png::encode_capture(image, &texts, CAPTURE_LIMIT);
     std::fs::write(target, &png).map_err(|error| format!("{}: {error}", target.display()))?;
     let info = crate::png::read_info(&png).ok_or("PNG gerado ilegivel")?;
     println!(
@@ -1472,7 +1422,19 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
         (result, _) => result,
     };
     screen_stop.store(true, std::sync::atomic::Ordering::Release);
-    let (last_screen, frames) = screen_watcher.and_then(|watcher| watcher.join().ok()).unwrap_or((None, None));
+    let ScreenOutcome { last: last_screen, frames, logon } = screen_watcher.and_then(|watcher| watcher.join().ok()).unwrap_or_default();
+    // O teste da tela de logon que falhou diz no log o que faltou na última
+    // tela lida.
+    let logon_test = test.marker == LOGON_SCREEN_MARKER || test.expect.iter().any(|expected| expected == LOGON_SCREEN_MARKER);
+    if let (true, Err(_), None, Some(last)) = (logon_test, &result, &logon, &last_screen) {
+        let verdict = match screen_check::logon_screen(last) {
+            Ok(description) => format!("passou numa leitura, mas nao em duas seguidas iguais: {description}"),
+            Err(missing) => missing,
+        };
+        let line = format!("\n[xtask] a ultima tela lida nao e a tela de logon: {verdict}\n");
+        print!("{line}");
+        output.lock().unwrap().push_str(&line);
+    }
     let mut machine = current.into_inner();
     // As capturas do fim saem com o QEMU ainda vivo, passe o teste ou não
     // (prazo esgotado, STOP); se elas falharem, o resultado do teste não
@@ -1490,7 +1452,14 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
             println!("[xtask] {}", series.summary());
         }
         if let Some(target) = &test.capture {
-            let captured = if alive { capture_screen(qmp, target, &result, &serial) } else { Err("o QEMU ja tinha terminado".into()) };
+            // O teste que passou com a tela de logon confirmada pela vigia
+            // grava a tela que o provou, mesmo com o QEMU já terminado; os
+            // outros, a tela do fim.
+            let captured = match (&result, &logon) {
+                (Ok(()), Some(image)) => write_capture(image, target, &result, &serial),
+                _ if alive => capture_screen(qmp, target, &result, &serial),
+                _ => Err("o QEMU ja tinha terminado".into()),
+            };
             if let Err(error) = captured {
                 eprintln!("aviso: sem captura de tela ({}): {error}", target.display());
             }
@@ -1581,58 +1550,6 @@ mod tests {
 
     fn screen(width: usize, height: usize, fill: [u8; 3]) -> Image {
         Image { width, height, rgb: fill.iter().copied().cycle().take(width * height * 3).collect() }
-    }
-
-    #[test]
-    fn drawn_pixels_needs_a_graphics_screen_with_drawing() {
-        // Preto: o vídeo de boot.
-        assert!(drawn_pixels(&screen(1024, 768, [0, 0, 0])).is_none());
-        // A tela de texto da VGA (720x400) e o aviso do QEMU (640x480) não
-        // contam.
-        assert!(drawn_pixels(&screen(720, 400, [0xAA, 0xAA, 0xAA])).is_none());
-        assert!(drawn_pixels(&screen(640, 480, [0xFF, 0xFF, 0xFF])).is_none());
-        // A tela de bugcheck não conta.
-        assert!(drawn_pixels(&screen(1024, 768, BUGCHECK_BACKGROUND)).is_none());
-        // Um retângulo branco de 16x16 conta, com a caixa e a cor.
-        let mut image = screen(1024, 768, [0, 0, 0]);
-        for y in 100..116 {
-            for x in 200..216 {
-                let at = (y * 1024 + x) * 3;
-                image.rgb[at..at + 3].copy_from_slice(&[0xFF, 0xFF, 0xFF]);
-            }
-        }
-        let description = drawn_pixels(&image).expect("16x16 desenhados");
-        assert!(description.starts_with("256 pixels desenhados na tela 1024x768, de (200,100) a (215,115)"), "{description}");
-        assert!(description.contains("#ffffff x256"), "{description}");
-        // Menos que o mínimo: ruído, não desenho.
-        let mut few = screen(1024, 768, [0, 0, 0]);
-        few.rgb[0..3].copy_from_slice(&[0xFF, 0, 0]);
-        assert!(drawn_pixels(&few).is_none());
-    }
-
-    #[test]
-    fn logon_screen_needs_a_large_area_with_several_colors() {
-        // O ponteiro sobre o preto e uma tela de cor única não são a tela de
-        // logon; a de bugcheck também não.
-        let mut pointer = screen(1024, 768, [0, 0, 0]);
-        pointer.rgb[0..3 * 73].fill(0xFF);
-        assert!(logon_screen(&pointer).is_none());
-        assert!(logon_screen(&screen(1024, 768, [0x10, 0x60, 0xA0])).is_none());
-        assert!(logon_screen(&screen(1024, 768, BUGCHECK_BACKGROUND)).is_none());
-        // Faixas de 16 cores cobrindo a tela inteira contam.
-        let mut bands = screen(1024, 768, [0, 0, 0]);
-        for (index, pixel) in bands.rgb.chunks_exact_mut(3).enumerate() {
-            let band = ((index % 1024) / 64) as u8;
-            pixel.copy_from_slice(&[0x40 + band * 8, 0x80, 0xC0 - band * 4]);
-        }
-        let description = logon_screen(&bands).expect("faixas coloridas");
-        assert!(description.starts_with("786432 de 786432 pixels desenhados, 16 cores"), "{description}");
-        // Metade da tela de cores, mas com só 4 cores: não basta.
-        let mut four = screen(1024, 768, [0, 0, 0]);
-        for (index, pixel) in four.rgb.chunks_exact_mut(3).enumerate().filter(|(index, _)| index % 1024 < 512) {
-            pixel.copy_from_slice(&[0x80, (index % 4) as u8 * 0x30 + 0x40, 0x80]);
-        }
-        assert!(logon_screen(&four).is_none());
     }
 
     /// Uma pasta vazia só do teste.
@@ -1764,7 +1681,8 @@ mod tests {
         let (port, server) = fake_qmp(vec![a.clone(), a.clone(), b.clone(), b.clone(), b, a.clone()], Arc::clone(&stop));
         let output = Arc::new(Mutex::new("primeira linha\nultima linha\n".to_string()));
         let frames = FrameSeries::new(&directory, Duration::from_millis(30));
-        let (last, frames) = screen_thread(port, directory.join("tela.ppm"), Instant::now(), None, Some(frames), output, stop);
+        let ScreenOutcome { last, frames, logon } = screen_thread(port, directory.join("tela.ppm"), Instant::now(), None, Some(frames), output, stop);
+        assert!(logon.is_none(), "sem a vigia, nada de tela de logon");
         assert_eq!(server.join().unwrap(), 6);
         let frames = frames.unwrap();
         assert_eq!((frames.saved, frames.repeated), (3, 3));
@@ -1775,6 +1693,64 @@ mod tests {
         assert!(names.iter().all(|name| is_frame(name) && name != FINAL_FRAME), "{names:?}");
         let info = crate::png::read_info(&std::fs::read(directory.join(&names[0])).unwrap()).unwrap();
         assert_eq!(info.text("opennt-serial"), Some("primeira linha\nultima linha\n"));
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A vigia: o ponteiro dá o primeiro pixel; a tela de logon só sai na
+    /// segunda leitura seguida igual. O quadro rasgado (que passa sozinho na
+    /// conferência) e a imagem surgindo do preto antes dela não contam, e o
+    /// relógio que muda de minuto entre as duas leituras não atrapalha.
+    #[test]
+    fn watch_confirms_the_logon_screen_on_two_equal_reads() {
+        use crate::screen_check::samples::*;
+        let directory = scratch_dir("watch");
+        let first = directory.join("primeira-tela.png");
+        let output = Mutex::new(String::new());
+        let mut watch = Watch::default();
+        let mut pointer = filled(WIDTH, HEIGHT, [0, 0, 0]);
+        paint(&mut pointer, 512..522, 386..404, |_, _| [0xFF, 0xFF, 0xFF]);
+        let lock = lock_screen(true);
+        let torn = only_rows(&lock, 0..HEIGHT * 3 / 4);
+        assert!(screen_check::logon_screen(&torn).is_ok(), "o quadro rasgado em 3/4 passa sozinho");
+        let mut faded = lock.clone();
+        faded.rgb.iter_mut().for_each(|channel| *channel /= 2);
+        let mut next_minute = lock_screen(false);
+        clock(&mut next_minute, 1);
+
+        assert!(!watch_step(&pointer, &first, &mut watch, &output));
+        assert!(watch.first_seen && first.is_file());
+        for image in [&torn, &faded, &lock] {
+            assert!(!watch_step(image, &first, &mut watch, &output));
+        }
+        assert!(!output.lock().unwrap().contains(LOGON_SCREEN_MARKER));
+        assert!(watch_step(&next_minute, &first, &mut watch, &output));
+        assert!(watch.logon.as_ref() == Some(&next_minute), "a segunda leitura e a tela de logon");
+        let text = output.lock().unwrap().clone();
+        assert_eq!((text.matches(FIRST_PIXEL_MARKER).count(), text.matches(LOGON_SCREEN_MARKER).count()), (1, 1), "{text}");
+        let saved = crate::png::read_info(&std::fs::read(directory.join("tela-de-logon.png")).unwrap()).unwrap();
+        assert_eq!(saved.text("opennt-resultado"), Some("tela de logon"));
+
+        // Uma leitura que não é a tela de logon entre duas que são recomeça
+        // a contagem.
+        let mut watch = Watch::default();
+        for image in [&lock, &pointer, &lock] {
+            assert!(!watch_step(image, &first, &mut watch, &output));
+        }
+        assert!(watch_step(&lock, &first, &mut watch, &output));
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A captura do `capturas` de uma tela já lida (a tela de logon
+    /// confirmada) leva o resultado e a serial nos textos, como a do fim.
+    #[test]
+    fn write_capture_keeps_the_result_and_the_serial() {
+        let directory = scratch_dir("write-capture");
+        let target = directory.join("capturas").join("tela-de-logon.png");
+        let image = crate::screen_check::samples::lock_screen(true);
+        write_capture(&image, &target, &Ok(()), "LOGON_SCREEN_OK\n").unwrap();
+        let info = crate::png::read_info(&std::fs::read(&target).unwrap()).unwrap();
+        assert_eq!(info.text("opennt-resultado"), Some("passou"));
+        assert_eq!(info.text("opennt-serial"), Some("LOGON_SCREEN_OK\n"));
         std::fs::remove_dir_all(&directory).unwrap();
     }
 }
