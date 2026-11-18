@@ -2237,7 +2237,23 @@ fn user_syscalls_core(assert: Assert) {
     crate::hal::amd64::usermode::block().exit_code.set(exit_cell);
     // Informações do sistema.
     assert(call("NtQuerySystemInformation", 0, buffer, 0x40, info) == 0 && { let system = unsafe { nt::SystemBasicInformation::at(buffer) }; system.page_size.get() == 0x1000 && system.allocation_granularity.get() == 0x10000 && system.minimum_user_mode_address.get() == 0x1_0000 && system.maximum_user_mode_address.get() == 0x7FFF_FFFE_FFFF } && guest::read32(info) == 0x40, "usercore: SYSTEM_BASIC_INFORMATION (usuario de 64 KB a MmHighestUserAddress)");
-    assert(call("NtQuerySystemInformation", 0, buffer, 0x20, info) == 0xC000_0004 && guest::read32(info) == 0x40 && call("NtQuerySystemInformation", 50, buffer, 8, 0) == 0 && guest::read64(buffer) == 0xFFFF_8000_0000_0000 && call("NtQuerySystemInformation", 55, buffer, 24, 0) == 0 && { let numa = unsafe { nt::SystemNumaInformation::at(buffer) }; numa.highest_node_number.get() == 0 && numa.reserved.get() == 0 }, "usercore: tamanho curto, inicio do sistema e NUMA");
+    assert(call("NtQuerySystemInformation", 0, buffer, 0x20, info) == 0xC000_0004 && guest::read32(info) == 0x40 && call("NtQuerySystemInformation", 50, buffer, 8, 0) == 0 && guest::read64(buffer) == 0xFFFF_8000_0000_0000, "usercore: tamanho curto e inicio do sistema");
+    // SystemNumaProcessorMap como o ExpQueryNumaProcessorMap: o
+    // HighestNodeNumber a partir de 4 bytes (o Reserved fica como está), os
+    // GROUP_AFFINITY dos nós que cabem a partir de 8 + 16, ReturnLength 4
+    // sem nó (o GetNumaHighestNodeNumber pede 8) e recusa abaixo de 4.
+    let numa = unsafe { nt::SystemNumaInformation::at(buffer) };
+    let numa_query = |length: u64| {
+        guest::write_bytes(buffer, &[0xAA; 0x40]);
+        guest::write32(info, 0);
+        call("NtQuerySystemInformation", 55, buffer, length, info)
+    };
+    let node = &numa.active_processors_group_affinity[0];
+    let full = numa_query(24) == 0 && guest::read32(info) == 24 && numa.highest_node_number.get() == 0 && numa.reserved.get() == 0xAAAA_AAAA && node.mask.get() == crate::ntos::ke::processor_group::active_mask() && node.group.get() == 0 && node.reserved.iter().all(|reserved| reserved.get() == 0) && guest::read8(buffer + 24) == 0xAA;
+    let large = numa_query(0x408) == 0 && guest::read32(info) == 24 && guest::read8(buffer + 24) == 0xAA;
+    let highest_only = numa_query(8) == 0 && guest::read32(info) == 4 && numa.highest_node_number.get() == 0 && guest::read8(buffer + 8) == 0xAA && numa_query(23) == 0 && guest::read32(info) == 4 && guest::read8(buffer + 8) == 0xAA && numa_query(4) == 0 && guest::read32(info) == 4 && numa.highest_node_number.get() == 0;
+    let short = numa_query(3) == 0xC000_0004 && guest::read32(info) == 4 && guest::read8(buffer) == 0xAA;
+    assert(full && large && highest_only && short, "usercore: SystemNumaProcessorMap com os tamanhos do ExpQueryNumaProcessorMap");
     // SystemTimeOfDayInformation: a estrutura inteira, um prefixo e o
     // comprimento acima de 0x30.
     guest::write_bytes(buffer, &[0xAA; 0x40]);

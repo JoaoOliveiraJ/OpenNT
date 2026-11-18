@@ -184,10 +184,15 @@ pub fn node_distance(from: u16, to: u16) -> Result<u32, u32> {
     if from == 0 && to == 0 { Ok(0) } else { Err(0xC000_0225) }
 }
 
+/// A máscara de processadores ativos do nó: todos no 0, nenhum nos outros.
+fn node_active_mask(node: u16) -> u64 {
+    if node == 0 { active_mask() } else { 0 }
+}
+
 /// KeQueryNodeActiveAffinity: nó 0 com todos os processadores ativos; outro
 /// nó volta vazio. As duas saídas são opcionais.
 pub fn query_node_active_affinity(node: u16, affinity: u64, count: u64) {
-    let (mask, processors) = if node == 0 { (active_mask(), smp::online_cpu_count() as u16) } else { (0, 0) };
+    let (mask, processors) = (node_active_mask(node), if node == 0 { smp::online_cpu_count() as u16 } else { 0 });
     if affinity != 0 {
         write_group_affinity(affinity, mask);
     }
@@ -195,6 +200,42 @@ pub fn query_node_active_affinity(node: u16, affinity: u64, count: u64) {
         // SAFETY: PUSHORT Count opcional do chamador.
         unsafe { Field::<u16>::at(count) }.set(processors);
     }
+}
+
+/// ExpQueryNumaProcessorMap (rva 0x6fdc10 do 19041), a SystemNumaProcessorMap
+/// (55) do NtQuerySystemInformation sobre o SYSTEM_NUMA_INFORMATION: abaixo
+/// de 4 bytes, STATUS_INFO_LENGTH_MISMATCH com ReturnLength 4. Senão o
+/// HighestNodeNumber (KeQueryHighestNodeNumber) vai ao ULONG 0, o Reserved
+/// de +4 fica como está e, a partir de +8, os GROUP_AFFINITY zerados com a
+/// máscara de cada nó (KeQueryNodeActiveAffinity) dos min(nós, (Length - 8)
+/// / 16) primeiros, com ReturnLength 8 + 16 por nó. Abaixo de 8 bytes ou sem
+/// espaço para um nó, só o HighestNodeNumber, com ReturnLength 4 e sucesso:
+/// o GetNumaHighestNodeNumber do kernelbase pede 8 bytes. `write` grava no
+/// buffer do chamador; uma falha dá STATUS_ACCESS_VIOLATION. Devolve o
+/// status e o ReturnLength.
+pub fn query_numa_processor_map(buffer: u64, length: u32, write: &mut dyn FnMut(u64, &[u8]) -> bool) -> (u32, u32) {
+    const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
+    const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+    if length < 4 {
+        return (STATUS_INFO_LENGTH_MISMATCH, 4);
+    }
+    let highest = u32::from(number_nodes()) - 1;
+    if !write(buffer, &highest.to_le_bytes()) {
+        return (STATUS_ACCESS_VIOLATION, 4);
+    }
+    let count = (highest + 1).min(length.wrapping_sub(8) >> 4);
+    if length < 8 || count == 0 {
+        return (STATUS_SUCCESS, 4);
+    }
+    let affinity_size = GroupAffinity::SIZE;
+    for node in 0..count {
+        let mut affinity = [0u8; 16];
+        affinity[..8].copy_from_slice(&node_active_mask(node as u16).to_le_bytes());
+        if !write(buffer + 8 + u64::from(node) * affinity_size, &affinity[..affinity_size as usize]) {
+            return (STATUS_ACCESS_VIOLATION, 4);
+        }
+    }
+    (STATUS_SUCCESS, 8 + count * affinity_size as u32)
 }
 
 /// KeQueryNodeMaximumProcessorCount: CPUs da MADT no nó 0; outro nó, 0.

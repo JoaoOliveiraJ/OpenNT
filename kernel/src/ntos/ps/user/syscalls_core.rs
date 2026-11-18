@@ -24,7 +24,7 @@ use crate::ntos::se::{code_integrity_information, secure_boot_information};
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::inc::types::extra_ps_user::SystemMemoryListInformation;
-use crate::ntos::inc::types::{Context, Eprocess, NtStruct, ProcessBasicInformation, ProcessExtendedBasicInformation, ProcessorNumber, SystemBasicInformation, SystemNumaInformation, UnicodeString, XsaveFormat};
+use crate::ntos::inc::types::{Context, Eprocess, NtStruct, ProcessBasicInformation, ProcessExtendedBasicInformation, ProcessorNumber, SystemBasicInformation, UnicodeString, XsaveFormat};
 
 /// PreviousMode dos serviços deste módulo.
 const USER_MODE: u8 = 1;
@@ -477,22 +477,12 @@ fn query_system_information(class: u32, buffer: u64, length: u64, returned: u64)
                 guest::try_write::<u64>(buffer, 0xFFFF_8000_0000_0000)?;
                 Ok(STATUS_SUCCESS)
             }
-            // SYSTEM_NUMA_INFORMATION com um único nó (o prefixo de 24 bytes).
+            // SystemNumaProcessorMap: o ExpQueryNumaProcessorMap
+            // (`ke/processor_group`), com as regras de tamanho do 19041.
             55 => {
-                set_returned(24)?;
-                if length < 24 {
-                    return Ok(STATUS_INFO_LENGTH_MISMATCH);
-                }
-                let numa = state::user_struct::<SystemNumaInformation>(buffer)?;
-                numa.highest_node_number.probe_set(0)?;
-                numa.reserved.probe_set(0)?;
-                let node = &numa.active_processors_group_affinity[0];
-                node.mask.probe_set(online_mask())?;
-                node.group.probe_set(0)?;
-                for reserved in &node.reserved {
-                    reserved.probe_set(0)?;
-                }
-                Ok(STATUS_SUCCESS)
+                let (status, required) = crate::ntos::ke::processor_group::query_numa_processor_map(buffer, length as u32, &mut |address, bytes| guest::try_write_bytes(address, bytes).is_ok());
+                set_returned(required)?;
+                Ok(status)
             }
             _ => {
                 crate::debug_print!("[usermode] NtQuerySystemInformation classe {} (nao coberta ainda)", class);
