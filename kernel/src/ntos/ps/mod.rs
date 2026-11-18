@@ -45,4 +45,5 @@ pub mod net_rate_control;
 pub mod suspend_resume;
 pub mod apphelp_cache;
 pub mod termination_ports;
+pub mod critical;
 pub mod quantum;

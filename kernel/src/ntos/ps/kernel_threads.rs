@@ -171,8 +171,16 @@ fn finish_thread(thread: &Shared) {
     signal_object(pointer);
 }
 
-/// A thread sai de vez: o encerramento e a última troca de contexto.
+/// A thread sai de vez: o encerramento e a última troca de contexto. Pelo
+/// PsTerminateSystemThread ou pela volta da rotina inicial, como o
+/// PspTerminateThreadByPointer, uma thread crítica para a máquina antes
+/// (`ps/critical.rs`).
 fn exit(thread: &Shared) -> ! {
+    let (pointer, exit_status) = {
+        let thread = thread.lock();
+        (thread.pointer, thread.exit_status)
+    };
+    super::critical::terminating_thread(pointer, exit_status);
     finish_thread(thread);
     let status = thread.lock().exit_status;
     // As chamadas em curso na pilha desta thread não voltam mais.

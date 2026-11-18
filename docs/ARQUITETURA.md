@@ -1009,7 +1009,29 @@ intervalo em curso é dele, fica com o despachante, que o conclui depois. Um
 fim que espera mais de 64 voltas do despachante roda mesmo assim, com aviso;
 com uma thread ainda por rodar o próprio término, a espera vai até 10 s. O
 NtTerminateProcess(NULL) termina as outras threads do processo corrente e
-quem chamou segue, como o primeiro passo do RtlExitUserProcess. A troca de
+quem chamou segue, como o primeiro passo do RtlExitUserProcess. Processos e
+threads críticos (`ps/critical.rs`) seguem o 19041: o
+EPROCESS.Flags.BreakOnTermination e o
+ETHREAD.CrossThreadFlags.BreakOnTermination vêm das
+classes ProcessBreakOnTermination e ThreadBreakOnTermination do
+NtSet/NtQueryInformation* (o RtlSetProcessIsCritical e o
+RtlSetThreadIsCritical da ntdll; marcam-se o smss.exe inicial e a thread
+principal dele, o csrss.exe de cada sessão, o wininit.exe e a thread
+principal dele e o services.exe). O começo de todo fim de processo
+(`create::begin_termination`, no `exit_process` e, na thread que chamou, no
+NtTerminateProcess do próprio processo) liga ProcessDelete e passa pela
+verificação do PspTerminateAllThreads; o NtTerminateProcess(NULL) liga
+ProcessSelfDelete e passa pela mesma verificação; o término de uma thread
+confere a thread crítica de um processo sem ProcessDelete nem
+ProcessSelfDelete (o PspTerminateThreadByPointer) e a saída da última
+thread de um processo crítico (o PspExitThread). O PspCatchCriticalBreak
+leva a mensagem do 19041 (com o post-mortem do processo) à serial e ao
+depurador e para a máquina com KeBugCheckEx(CRITICAL_PROCESS_DIED, objeto,
+1 numa thread e 0 num processo, 0, 0); o CRITICAL_OBJECT_TERMINATION (0xF4)
+não sai desse caminho no 19041. O transporte do depurador não atende o
+"Break, or Ignore (bi)?" do DbgPrompt: com o host presente, a parada é a do
+bugcheck. O autoteste `ntos/test/critical_process.rs` (fase 6) confere as
+classes, as condições e os parâmetros sem parar a máquina. A troca de
 thread corrente move a CPU em KPROCESS.ActiveProcessors do processo
 registrado para o da nova thread (veja a troca de CR3). O autoteste
 `ntos/test/multiprocess/all_processes.rs` (fase 7) põe dois processos no
@@ -3550,7 +3572,9 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   NtCreateUserProcess numa sessão nova, herda as seções do pai pelos
   mesmos valores, conecta-se ao `\SmApiPort` e cria o csrss.exe
   (protegido e crítico, ProcessBreakOnTermination em
-  `ps/set_process_information.rs`). Serviços que essa cadeia pede e que
+  `ps/set_process_information.rs`; o fim de um processo crítico para a
+  máquina com CRITICAL_PROCESS_DIED, `ps/critical.rs`). Serviços que essa
+  cadeia pede e que
   moram no componente de cada um: NtAdjustPrivilegesToken
   (`se/token/adjust.rs`), NtSerializeBoot (`io/pnp.rs`), a
   ProcessSessionInformation, a SystemManufacturingInformation e a
@@ -3649,7 +3673,9 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   NtSet/NtQueryInformationProcess (`ps/set_process_information.rs`,
   `ps/query_process.rs`, com o ProbeForRead do alinhamento de cada classe),
   a ThreadBreakOnTermination do NtSetInformationThread
-  (`ps/set_thread_information.rs`) e as classes de tamanho fixo
+  (`ps/set_thread_information.rs`; a consulta dela e a da
+  ProcessBreakOnTermination em `ps/query_thread.rs` e
+  `ps/query_process.rs`) e as classes de tamanho fixo
   SystemFlagsInformation, SystemPhysicalMemoryInformation,
   SystemKernelDebuggerInformation (o KdDebuggerEnabled e o
   KdDebuggerNotPresent, sondagem de alinhamento 1) e

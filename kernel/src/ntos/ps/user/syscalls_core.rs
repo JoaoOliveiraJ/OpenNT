@@ -124,8 +124,11 @@ const STATUS_PROCESS_IS_TERMINATING: u32 = 0xC000_010A;
 /// RtlExitUserProcess, antes do LdrShutdownProcess). Com um handle de outro
 /// processo (PROCESS_TERMINATE), o fim dele (`ps::create::exit_process`), sem
 /// tocar em quem chamou. Com o do próprio processo (o pseudo-handle ou um
-/// handle real para ele), o código vai para a HAL, que encerra o intervalo
-/// de vez (longjmp), e o despachante pede o fim do processo.
+/// handle real para ele), o começo do PspTerminateProcess roda aqui, na
+/// thread que chamou (`ps::create::begin_termination`: um processo crítico
+/// para a máquina antes de o intervalo acabar), o código vai para a HAL, que
+/// encerra o intervalo de vez (longjmp), e o despachante pede o fim do
+/// processo.
 fn nt_terminate_process(handle: u64, exit_code: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
     let status = exit_code as u32;
     if handle == 0 {
@@ -145,6 +148,7 @@ fn nt_terminate_process(handle: u64, exit_code: u64, _a3: u64, _a4: u64, _rsp: u
         thread.with(|thread| thread.termination_rsp = rsp);
     }
     crate::debug_print!("[usermode] NtTerminateProcess(exit={:#x})", exit_code as u32);
+    crate::ntos::ps::create::begin_termination(target, status);
     usermode::block().exit_code.set(exit_code as u32);
     Ok(TERMINATE_MAGIC)
 }

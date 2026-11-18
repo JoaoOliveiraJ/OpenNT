@@ -289,6 +289,7 @@ impl Drop for CreatedProcess {
 /// desfazer os serviços. Só o processo `process_pointer` perde alguma coisa.
 /// Devolve `false` se o fim já tinha sido pedido ou o processo já terminou.
 pub fn exit_process(process_pointer: u64, status: u32) -> bool {
+    begin_termination(process_pointer, status);
     if !threads::begin_exit(process_pointer, status) {
         return false;
     }
@@ -297,6 +298,22 @@ pub fn exit_process(process_pointer: u64, status: u32) -> bool {
         finish_exit(process_pointer);
     }
     true
+}
+
+/// O começo do PspTerminateProcess: EPROCESS.Flags.ProcessDelete ligado (o
+/// fim do processo inteiro; a partir daqui o fim das threads dele não é o
+/// de uma thread crítica) e a verificação de entrada do
+/// PspTerminateAllThreads, que para a máquina com CRITICAL_PROCESS_DIED no
+/// fim de um processo crítico (`ps/critical.rs`). O NtTerminateProcess do
+/// próprio processo passa por aqui na thread que chamou, antes de o
+/// intervalo acabar; o [`exit_process`] também, para todo fim pedido.
+pub fn begin_termination(process_pointer: u64, status: u32) {
+    if !process::is_process(process_pointer) {
+        return;
+    }
+    // SAFETY: o EPROCESS registrado, retido por quem pede o fim.
+    unsafe { Eprocess::at(process_pointer) }.flags.atomic().fetch_or(Eprocess::PROCESS_DELETE_MASK, core::sync::atomic::Ordering::SeqCst);
+    crate::ntos::ps::critical::terminating_process(process_pointer, status);
 }
 
 /// O término de um processo com o fim pedido ([`exit_process`]): o

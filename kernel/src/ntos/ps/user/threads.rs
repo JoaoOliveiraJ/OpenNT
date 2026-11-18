@@ -1903,13 +1903,20 @@ fn nt_terminate_thread(handle: u64, status: u64, _a3: u64, _a4: u64, _rsp: u64) 
 }
 
 /// NtTerminateProcess(NULL, status), o primeiro passo do RtlExitUserProcess:
-/// as outras threads do processo corrente terminam com `status` (as
-/// bloqueadas no kernel desfazem o serviço quando o despachante as retoma) e
-/// quem chamou segue. Devolve o NTSTATUS.
+/// como no 19041, EPROCESS.Flags.ProcessSelfDelete é ligado e o
+/// PspTerminateAllThreads confere o processo crítico (`ps/critical.rs`:
+/// CRITICAL_PROCESS_DIED); depois as outras threads do processo corrente
+/// terminam com `status` (as bloqueadas no kernel desfazem o serviço quando
+/// o despachante as retoma; com ProcessSelfDelete, uma thread crítica não
+/// para a máquina) e quem chamou segue. Devolve o NTSTATUS.
 pub fn terminate_other_threads(status: u32) -> Result<u32, KernelError> {
     let caller = process::get_current_thread();
     let current = current();
-    for thread in of_process(process::get_current_process()) {
+    let process_pointer = process::get_current_process();
+    // SAFETY: o EPROCESS do processo corrente.
+    unsafe { Eprocess::at(process_pointer) }.flags.atomic().fetch_or(Eprocess::PROCESS_SELF_DELETE_MASK, Ordering::SeqCst);
+    crate::ntos::ps::critical::terminating_process(process_pointer, status);
+    for thread in of_process(process_pointer) {
         let caller_thread = thread.pointer() == caller || current.as_ref().is_some_and(|current| Arc::ptr_eq(current, &thread));
         if caller_thread || thread.dead() {
             continue;
@@ -1919,15 +1926,18 @@ pub fn terminate_other_threads(status: u32) -> Result<u32, KernelError> {
     Ok(0)
 }
 
-/// O término de uma thread viva (PspTerminateThreadByPointer). Uma thread com
-/// estado do win32k recebe o pedido de término do 19041
-/// ([`request_termination`]) e sai sozinha, no contexto dela — a corrente,
-/// no fim deste mesmo serviço. As demais: a espera conclui com
-/// THREAD_IS_TERMINATING, a thread morre com `status`, sai do escalonador,
-/// passa pela saída nativa (notificações, APCs, token, conclusões,
-/// mutantes) e deixa de contar no EPROCESS; a última thread encerra o
-/// processo.
+/// O término de uma thread viva (PspTerminateThreadByPointer): uma thread
+/// crítica de um processo sem fim pedido para a máquina antes de tudo
+/// (`ps/critical.rs`). Uma thread com estado do win32k recebe o pedido de
+/// término do 19041 ([`request_termination`]) e sai sozinha, no contexto
+/// dela — a corrente, no fim deste mesmo serviço. As demais: a espera
+/// conclui com THREAD_IS_TERMINATING, a thread morre com `status`, sai do
+/// escalonador, passa pela saída nativa (notificações, APCs, token,
+/// conclusões, mutantes) e deixa de contar no EPROCESS; a última thread
+/// encerra o processo, e a de um processo crítico para a máquina antes (o
+/// PspExitThread).
 fn terminate_thread(thread: &Arc<UserThread>, status: u32) -> Result<(), KernelError> {
+    crate::ntos::ps::critical::terminating_thread(thread.pointer(), status);
     if exits_in_own_context(thread) {
         request_termination(thread, status);
         return Ok(());
@@ -1951,9 +1961,11 @@ fn terminate_thread(thread: &Arc<UserThread>, status: u32) -> Result<(), KernelE
     dispatcher::set_event(pointer);
     super::mutants::release_thread(pointer);
     process::remove_thread(process_pointer);
-    // Notifica antes que a última ETHREAD possa ser recolhida.
     // SAFETY: o EPROCESS da thread, referenciado por ela.
-    if unsafe { Eprocess::at(process_pointer) }.active_threads.get() == 0 {
+    let last_thread = unsafe { Eprocess::at(process_pointer) }.active_threads.get() == 0;
+    crate::ntos::ps::critical::exiting_thread(pointer, last_thread, status);
+    // Notifica antes que a última ETHREAD possa ser recolhida.
+    if last_thread {
         let previous = process::get_current_thread();
         process::set_current_thread(pointer);
         let terminated = process::terminate_process(process_pointer, status);
@@ -2078,6 +2090,11 @@ fn exit_current(thread: &Arc<UserThread>) -> ! {
     completion_objects::dissociate(pointer);
     super::mutants::release_thread(pointer);
     process::remove_thread(process_pointer);
+    // A verificação do PspExitThread: a última thread de um processo
+    // crítico para a máquina.
+    // SAFETY: o EPROCESS da thread, referenciado por ela.
+    let last_thread = unsafe { Eprocess::at(process_pointer) }.active_threads.get() == 0;
+    crate::ntos::ps::critical::exiting_thread(pointer, last_thread, status);
     thread.with(|thread| thread.dead = true);
     dispatcher::set_event(pointer);
     crate::debug_print!("[thread] exit tid={} status={:#x} (no proprio contexto)", thread.thread_id, status);
