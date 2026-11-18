@@ -2217,7 +2217,9 @@ fn nt_query_information_thread(handle: u64, class: u64, out: u64, length: u64, r
                 information.client_id.unique_thread.probe_set(thread.thread_id)?;
                 information.affinity_mask.probe_set((1u64 << smp::online_cpu_count()) - 1)?;
                 information.priority.probe_set(thread_priority::query_priority(pointer) as i32)?;
-                information.base_priority.probe_set(thread_priority::query_base_priority(pointer) as i32)?;
+                // O incremento do KeQueryBasePriorityThread, não a base
+                // absoluta (o NtQueryInformationThread do 19041).
+                information.base_priority.probe_set(thread_priority::query_base_priority_increment(pointer))?;
             }
             // ThreadTimes: CreateTime e ExitTime da ETHREAD (ExitTime zero
             // enquanto a thread vive) e os tempos de kernel e de usuário em

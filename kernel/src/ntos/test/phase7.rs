@@ -1694,6 +1694,9 @@ fn user_threads_in(assert: Assert, test: &TestProcess) {
     guest::write64(rsp + 0x28, info + 0x38);
     let basic = unsafe { nt::ThreadBasicInformation::at(info) };
     assert(call("NtQueryInformationThread", handle, 0, info, 48) == 0 && basic.exit_status.get() == 0x103 && basic.teb_base_address.get() == teb && basic.client_id.unique_thread.get() == thread.thread_id && guest::read32(info + 0x38) == 48, "userthreads: ThreadBasicInformation");
+    // BasePriority é o incremento do KeQueryBasePriorityThread (o que o
+    // GetThreadPriority devolve): 0 numa thread normal, não a base absoluta.
+    assert(basic.base_priority.get() == 0 && basic.priority.get() == thread_priority::query_priority(pointer), "userthreads: ThreadBasicInformation publica o incremento da base, 0 numa thread normal");
     assert(call("NtQueryInformationThread", handle, 9, info, 8) == 0 && guest::read64(info) == block + 0x800 && call("NtQueryInformationThread", handle, 17, info, 1) == 0 && guest::read8(info) == 1, "userthreads: endereco inicial e oculta do depurador");
     assert(call("NtQueryInformationThread", handle, 0, info, 40) == 0xC000_0004 && call("NtQueryInformationThread", handle, 5, info, 8) == 0xC000_0003, "userthreads: tamanho e classe invalidos");
     // Suspensão, retomada e prioridades.
@@ -1705,6 +1708,12 @@ fn user_threads_in(assert: Assert, test: &TestProcess) {
     let priority = call("NtSetInformationThread", handle, 2, info, 4) == 0 && thread_priority::query_priority(pointer) == 10;
     guest::write32(info, 2);
     let base = call("NtSetInformationThread", handle, 3, info, 4) == 0 && thread_priority::query_base_priority(pointer) == 10;
+    // O incremento volta na consulta; saturada (KeSetBasePriorityThread com
+    // +16), Saturation * 16.
+    let increment = call("NtQueryInformationThread", handle, 0, info + 0x40, 48) == 0 && unsafe { nt::ThreadBasicInformation::at(info + 0x40) }.base_priority.get() == 2;
+    let saturated = thread_priority::set_base_priority(pointer, 16).is_ok() && call("NtQueryInformationThread", handle, 0, info + 0x40, 48) == 0 && unsafe { nt::ThreadBasicInformation::at(info + 0x40) }.base_priority.get() == 16;
+    let restored = thread_priority::set_base_priority(pointer, 2).is_ok() && thread_priority::query_base_priority(pointer) == 10 && thread_priority::query_base_priority_increment(pointer) == 2;
+    assert(increment && saturated && restored, "userthreads: BasePriority consultada e o incremento do ThreadBasePriority, +16 saturado");
     guest::write32(info, 5);
     let increment_refused = call("NtSetInformationThread", handle, 3, info, 4) == 0xC000_000D && thread_priority::query_base_priority(pointer) == 10;
     let times_refused = call("NtSetInformationThread", handle, 1, info, 4) == 0xC000_0003;

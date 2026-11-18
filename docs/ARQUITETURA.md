@@ -3825,7 +3825,11 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   e o ObDuplicateObject com OBJ_KERNEL_HANDLE em KernelMode para a tabela
   do System. O NtUserInitialize do csrss volta com sucesso
   (`USER_INITIALIZED`); o winsrv pede ThreadBasePriority 2 para as threads
-  dele (NtSetInformationThread, classes 2 e 3 como no NT), o csrss assina
+  dele (NtSetInformationThread, classes 2 e 3 como no NT; a
+  ThreadBasicInformation devolve em BasePriority o mesmo incremento, o do
+  KeQueryBasePriorityThread em `ke/thread_priority.rs`: 0 numa thread
+  normal, Saturation * 16 numa saturada, que é o que o GetThreadPriority
+  lê), o csrss assina
   os nomes WNF da instalação (`cm/wnf_defaults.rs`) e o sxssrv.dll lê a
   chave SideBySide (`cm/seed.rs`). Depois o CsrSbApiPortInitialize cria a
   porta LPC `\Windows\SbApiPort` (as portas LPC de modo usuário, no item

@@ -23,6 +23,25 @@ pub fn query_base_priority(thread: u64) -> i32 {
     kthread(thread).base_priority.get() as i32
 }
 
+/// KeQueryBasePriorityThread (rva 0x2ffde0 do 19041): sob a trava da
+/// thread, o incremento da base da thread sobre a base do processo dono ou,
+/// numa thread saturada, Saturation * 16 (+16 ou -16). É o que o
+/// THREAD_BASIC_INFORMATION.BasePriority publica: o GetThreadPriority do
+/// kernelbase lê ali (e leva ±16 a ±15), então uma thread normal dá 0, e o
+/// ThreadBasePriority do NtSetInformationThread recebe o mesmo incremento.
+pub fn query_base_priority_increment(thread: u64) -> i32 {
+    thread_lock::with_lock(thread, || {
+        let target = kthread(thread);
+        let saturation = target.saturation.get() as i32;
+        if saturation != 0 {
+            return saturation * 16;
+        }
+        // SAFETY: o processo dono de uma thread viva.
+        let process = unsafe { Kprocess::at(target.process.get()) };
+        query_base_priority(thread) - process.base_priority.get() as i32
+    })
+}
+
 /// Usa o maior piso ativo (inclusive o bit 31); não troca o resumo por uma
 /// política fixa.
 pub fn effective_priority(thread: u64, requested: i32) -> i32 {
