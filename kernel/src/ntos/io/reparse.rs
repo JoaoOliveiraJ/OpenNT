@@ -292,7 +292,9 @@ impl VolumeReparse {
 /// boot) encontra: um intermediário, ou o último sem
 /// FILE_OPEN_REPARSE_POINT (`Ntfs::find_reparse`).
 pub fn boot_volume_reparse(volume: &crate::drivers::fs::ntfs::Ntfs, name: &str, path: &str, open_reparse_point: bool) -> Result<Option<VolumeReparse>, crate::rtl::KernelError> {
-    let Some(hit) = volume.find_reparse(path, open_reparse_point)? else { return Ok(None) };
+    // Um diretório que o volume não consegue ler não tem reparse point a
+    // devolver: a abertura segue e dá o erro do próprio volume.
+    let Ok(Some(hit)) = volume.find_reparse(path, open_reparse_point) else { return Ok(None) };
     let file_name = crate::drivers::fs::volume_files::nt_path_to_device_name(name).unwrap_or_else(|| path.replace('/', "\\"));
     Ok(Some(VolumeReparse { buffer: hit.buffer, tail_components: hit.tail_components, file_name }))
 }
