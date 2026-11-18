@@ -3797,15 +3797,19 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   STATUS_INVALID_PARAMETER, e os bits 2-3 pedem um nível que não pode passar
   do nível do contexto; a mensagem precisa já ter sido recebida e não trazer
   LPC_NO_IMPERSONATE (0x4000); com o contexto de segurança que o cliente
-  mandou, o token dele; senão a porta do cliente precisa de
+  mandou, o token dele (um contexto de rastreamento dinâmico, como o que o
+  rpcrt4 manda nos pedidos assíncronos, retém o token efetivo da thread que
+  o criou; um estático, uma cópia); senão a porta do cliente precisa de
   ALLOW_IMPERSONATION, e o rastreamento estático usa o contexto capturado na
   conexão (o NtConnectPort e o NtAlpcConnectPort de modo usuário capturam
   agora, como o AlpcpCreateClientPort), o dinâmico a thread que mandou e
   espera a resposta (SeCreateClientSecurity com o QOS da porta do cliente e
   SeImpersonateClientEx; uma mensagem assíncrona dá STATUS_ACCESS_DENIED);
   sem mensagem, o contexto estático da conexão. O NtAlpcConnectPort sem
-  ALPC_PORT_ATTRIBUTES usa os atributos padrão do 19041 (ALLOW_IMPERSONATION
-  e o QOS anônimo, dinâmico e só efetivo). O NtQueryInformationPort só
+  ALPC_PORT_ATTRIBUTES usa os atributos padrão do 19041 (ALLOW_IMPERSONATION,
+  o QOS anônimo, dinâmico e só efetivo e MaxMessageLength 0x200); com eles,
+  o MaxMessageLength da porta do cliente é o pedido (de 0x28 a 0xFFFF, senão
+  STATUS_INVALID_PARAMETER) limitado ao da porta de conexão. O NtQueryInformationPort só
   confere o handle e zera o ReturnLength.
   NtReplyWaitReplyPort e as mensagens com PORT_DATA_INFORMATION
   (NtReadRequestData/NtWriteRequestData) não existem no transporte:
