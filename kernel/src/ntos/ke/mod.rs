@@ -35,6 +35,7 @@ pub mod affinity;
 pub mod affinity_set;
 pub mod callout;
 pub mod user_callback;
+pub mod user_slist;
 pub mod debug_print;
 pub mod xsave;
 pub mod xstate;

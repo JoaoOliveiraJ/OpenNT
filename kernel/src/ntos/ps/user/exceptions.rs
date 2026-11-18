@@ -20,7 +20,7 @@ use super::{crash_report, index, state, syscalls_core};
 use crate::hal::amd64::usermode;
 use crate::ntos::inc::types::{Context, ContextEx, Eprocess, ExceptionRecord, MachineFrame, NtStruct, XsaveFormat};
 use crate::ntos::kd::debug_service;
-use crate::ntos::ke::{processor_identity, xsave};
+use crate::ntos::ke::{processor_identity, user_slist, xsave};
 use crate::ntos::mm::{guard_page, page_residency};
 use crate::ntos::ps::context::registers::{self, INTEGER};
 use crate::ntos::ps::context::xstate::{self as context_xstate, Extended};
@@ -45,6 +45,11 @@ const FRAME_FLAGS_XSTATE: u32 = 0x10_005F;
 /// O CET_U, que só vai à máscara de compactação num processo com pilhas de
 /// sombra de usuário.
 const CET_USER: u64 = 1 << 11;
+/// STATUS_ACCESS_VIOLATION.
+const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+/// A saída do intervalo de usuário pelo relógio (a HAL grava 2 no
+/// UserExecutionBlock.ExitKind).
+const EXIT_INTERVAL: u32 = 2;
 /// O serviço de depuração (`int 0x2D`), que o anel 3 chama pelo portão de
 /// DPL 3 da IDT.
 const DEBUG_SERVICE_VECTOR: u32 = 0x2D;
@@ -294,6 +299,11 @@ pub fn hardware(thread: &UserThread, status: u32) -> u32 {
         let access: u64 = if error & 16 != 0 { 8 } else if error & 2 != 0 { 1 } else { 0 };
         put(information, &access.to_le_bytes());
         put(information + 8, &block.fault_cr2.get().to_le_bytes());
+        // O ramo de SList do KiPreprocessFault: a falta de acesso no
+        // ExpInterlockedPopEntrySListFault recomeça o pop, sem exceção.
+        if u32_at(&record, offset_of!(ExceptionRecord, exception_code)) == STATUS_ACCESS_VIOLATION && user_slist::preprocess_access_violation(thread.pointer(), live, block.fault_cr2.get()) {
+            return 0;
+        }
     }
     // O depurador do kernel antes da entrega (breakpoints de usuário, passo).
     if crate::ntos::kd::user_debug::exception(live, vector, thread.with(|thread| thread.teb_va)) {
@@ -427,6 +437,11 @@ pub fn pending(thread: &UserThread) -> u32 {
 /// exceção real (de hardware ou pendente) é despachada.
 fn exit_handler(thread: &Arc<UserThread>, kind: u32, status: u32) -> u32 {
     index::consume_capture();
+    // O relógio encerrou o intervalo (a troca do KiDispatchInterrupt): um
+    // pop de SList interrompido recomeça (KiCheckForSListAddress).
+    if kind == EXIT_INTERVAL {
+        user_slist::check_for_slist_address(live_context(thread));
+    }
     if kind == 3 {
         return hardware(thread, status);
     }

@@ -6378,6 +6378,7 @@ pub fn run(assert: Assert) {
     user_virtual_memory(assert);
     super::user_jit_memory::run(assert);
     super::dynamic_function_tables::run(assert);
+    super::user_slist::run(assert);
     volume_file_lookup(assert);
     user_registry(assert);
     super::user_cm_services::run(assert);

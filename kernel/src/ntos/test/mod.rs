@@ -65,3 +65,4 @@ pub mod keyed_events;
 pub mod critical_process;
 pub mod dynamic_function_tables;
 pub mod kernel_crash_trace;
+pub mod user_slist;

@@ -283,6 +283,9 @@ fn map_system_ntdll(bytes: Vec<u8>, origin: &str) -> Result<(), KernelError> {
     });
     *NTDLL_IMAGE.lock() = (image.image_base, image.size_of_image);
     crate::ntos::ke::user_callback::set_dispatcher(exports.get("KiUserCallbackDispatcher").copied().unwrap_or(0));
+    // KeUserPopEntrySListResume/Fault/End: a retomada do pop de SList.
+    let export = |name: &str| exports.get(name).copied().unwrap_or(0);
+    crate::ntos::ke::user_slist::set_user_entry_points(export("ExpInterlockedPopEntrySListResume"), export("ExpInterlockedPopEntrySListFault"), export("ExpInterlockedPopEntrySListEnd"));
     push_image(Space::system(), image.image_base, image.size_of_image, source_name.clone(), None);
     let module = Arc::new(Module {
         name: String::from("ntdll.dll"),

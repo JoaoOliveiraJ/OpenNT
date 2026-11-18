@@ -1251,6 +1251,9 @@ pub fn run_callback(thread: &Arc<UserThread>, context: u64, returned: &dyn Fn() 
             0 => Some(status),
             1 => None,
             2 => {
+                // O pop de SList interrompido recomeça (KiCheckForSListAddress).
+                // SAFETY: o CONTEXT do callback (memória do kernel).
+                crate::ntos::ke::user_slist::check_for_slist_address(unsafe { Context::at(context) });
                 yield_in_callback(thread, stacks);
                 None
             }

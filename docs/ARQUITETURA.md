@@ -1067,6 +1067,17 @@ chamada de sistema, sem os quadros do despacho em modo usuário. Cada
 processo imprime um bloco por código, e toda leitura de memória de usuário
 confere antes a página presente e a posse (`memory::check_user_access`).
 
+**Retomada do pop de SList de usuário.** `ke/user_slist.rs` guarda os
+exports ExpInterlockedPopEntrySListResume, ...Fault e ...End da ntdll
+quando ela é mapeada (`ps/user/loader.rs`). Como no KiPreprocessFault do
+19041, a falta de página de usuário com o RIP no ...Fault não vira exceção
+(`ps/user/exceptions.rs::hardware`): o RIP volta ao ...Resume, com o
+endereço e a contagem de faltas seguidas na KTHREAD (SListFaultAddress e
+SListFaultCount; passada de 0x400, a falta é entregue). Como no
+KiCheckForSListAddress, o fim do intervalo de usuário pelo relógio (a troca
+do KiDispatchInterrupt; também dentro de um callback) leva um RIP em
+(...Resume, ...End] ao ...Resume. Teste: `ntos/test/user_slist.rs`.
+
 **Callbacks de modo usuário.** Um serviço do kernel (o win32k, dentro de
 uma syscall da thread) chama uma rotina de usuário pelo KeUserModeCallback
 (`ke/user_callback.rs`), como o KiCallUserMode do NT: confere o contexto
