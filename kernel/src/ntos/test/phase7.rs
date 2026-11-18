@@ -3403,7 +3403,9 @@ fn user_create_token(assert: Assert) {
         let source_ok = query(7, 16) == 0 && guest::read_bytes(buffer, 8) == b"User32  " && guest::read64(buffer + 8) == 0x1234;
         let user_ok = query(1, 0x100) == 0 && guest::read_bytes(guest::read64(buffer), 28) == guest::read_bytes(user, 28);
         let label_ok = query(25, 0x100) == 0 && guest::read_bytes(guest::read64(buffer), 12) == guest::read_bytes(label, 12);
-        let groups_ok = query(2, 0x200) == 0 && guest::read32(buffer) == 1 && guest::read32(buffer + 16) == 7;
+        // O TokenGroups do 19041 lista também o rótulo de integridade, com
+        // SE_GROUP_INTEGRITY | SE_GROUP_INTEGRITY_ENABLED (0x60).
+        let groups_ok = query(2, 0x200) == 0 && guest::read32(buffer) == 2 && guest::read32(buffer + 16) == 7 && guest::read32(buffer + 32) == 0x60 && guest::read_bytes(guest::read64(buffer + 24), 12) == guest::read_bytes(label, 12);
         let session_ok = query(12, 4) == 0 && guest::read32(buffer) == 0;
         assert(unprivileged == 0xC000_0061 && adjusted == 0 && created == 0 && state::get_user_handle(token).is_some_and(|entry| entry.kind() == "token"), "usercreatetoken: SeCreateTokenPrivilege exigido e token criado");
         assert(source_ok && user_ok && label_ok && groups_ok && session_ok, "usercreatetoken: origem, usuario, rotulo de integridade, grupo obrigatorio habilitado e sessao 0");
