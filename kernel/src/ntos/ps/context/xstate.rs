@@ -1,7 +1,8 @@
 //! O pedaço XSTATE (CONTEXT_XSTATE) dos CONTEXT de usuário: a parte do
 //! KeContextFromKframes e do KxContextToKframes que move o estado estendido
-//! entre a thread e um CONTEXT estendido do kernel, e a cópia sondada entre
-//! esse CONTEXT e o do usuário (RtlpCopyXStateChunk).
+//! entre a thread e um CONTEXT estendido do kernel, a cópia sondada entre
+//! esse CONTEXT e o do usuário (RtlpCopyXStateChunk) e a cópia direta do
+//! buffer de um chamador de KernelMode.
 //!
 //! O estado de usuário de uma thread é o da área de `ke::xstate::user_state_area`
 //! (KTHREAD.StateSaveArea, ou a do XSTATE_SAVE mais antigo de um driver);
@@ -90,6 +91,13 @@ pub fn live(thread: u64) -> bool {
 /// O lado de leitura do KeContextFromKframes: o estado de usuário da thread
 /// (KiCopyXStateArea com EnabledFeatures sem x87 e SSE) no pedaço.
 pub fn fill_from_thread(extended: &Extended, thread: u64) {
+    fill_base_from_thread(extended.base(), thread);
+}
+
+/// [`fill_from_thread`] num pedaço montado por quem chama (o frame das APCs
+/// especiais): `base` é o cabeçalho do pedaço menos a área legada, que não
+/// é escrita (o x87 e o SSE seguem no CONTEXT.FltSave).
+pub fn fill_base_from_thread(base: u64, thread: u64) {
     let area = xstate::user_state_area(thread);
     if area == 0 {
         return;
@@ -97,7 +105,18 @@ pub fn fill_from_thread(extended: &Extended, thread: u64) {
     if live(thread) && area == xstate::thread_area(thread) {
         xstate::save_current(area);
     }
-    xstate::copy_area(extended.base(), xsave::enabled_features() & !feature::LEGACY, area);
+    xstate::copy_area(base, xsave::enabled_features() & !feature::LEGACY, area);
+}
+
+/// O pedaço XSTATE de um CONTEXT de KernelMode com CONTEXT_XSTATE, num
+/// CONTEXT estendido do kernel: o buffer é o do próprio chamador, sem sonda,
+/// e o pedaço é o que o XState do CONTEXT_EX logo depois do CONTEXT aponta
+/// (o PspSetContext o lê assim para uma thread de UserMode).
+pub fn capture_kernel(context: u64, flags: u32) -> Result<Extended, u32> {
+    let extended = Extended::new(flags)?;
+    let chunks = context + CONTEXT_LENGTH as u64;
+    extended_context::copy_xstate_chunk(extended.context_ex(), extended.context_ex(), chunks, chunks)?;
+    Ok(extended)
 }
 
 /// O lado de escrita do KxContextToKframes: com um XSTATE_SAVE de driver na

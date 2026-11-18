@@ -10,6 +10,7 @@ use alloc::boxed::Box;
 use crate::ntos::ps::context::apc::{self as context_apc, Request};
 use crate::ntos::ps::context::input::{self as thread_context_input, Captured};
 use crate::ntos::ps::context::kernel_frame as kernel_context_frame;
+use crate::ntos::ps::context::xstate as context_xstate;
 use crate::ntos::ps::process;
 use crate::ntos::ke::{dispatcher, irql};
 use crate::rtl::{KernelError, SpinLock};
@@ -67,6 +68,18 @@ pub fn begin(thread: u64, input: u64, probe_mode: u8, context_mode: u8, flags: u
         // CONTEXT.SegCs da entrada capturada (a cópia própria ou o buffer de
         // KernelMode, sem exigência de alinhamento).
         guest::write::<u16>(captured.source + core::mem::offset_of!(Context, seg_cs) as u64, 0x33);
+    }
+    // CONTEXT_XSTATE de KernelMode: o PspSetContext restaura o pedaço do
+    // CONTEXT_EX do próprio buffer só num contexto de UserMode (o de
+    // KernelMode não tem estado estendido de usuário e o ignora).
+    if probe_mode == 0 && context_mode != 0 && context_xstate::requested(captured.flags) {
+        match context_xstate::capture_kernel(captured.source, captured.flags) {
+            Ok(extended) => captured.xstate = Some(extended),
+            Err(status) => {
+                captured.release();
+                return Ok(Operation::Completed(status));
+            }
+        }
     }
     let source = captured.source;
     let xstate = captured.xstate.take();

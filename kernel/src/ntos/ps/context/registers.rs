@@ -144,13 +144,12 @@ pub fn capture_registers(target: u64, source: u64, flags: u32) -> Result<(), Ker
 
 /// Projeta o CONTEXT de entrada no CONTEXT salvo (trap frame real e não
 /// voláteis). SEGMENTS sozinho não altera segmentos; CONTROL é dono de CS/SS.
+/// O CONTEXT_XSTATE (o buffer de um chamador de KernelMode ainda o tem) não
+/// é registrador daqui: o pedaço vai à thread por `ps::context::xstate`.
 pub fn write_registers(target: u64, source: u64, mode: u8, mxcsr_mask: u32, current_mxcsr: u32) -> Result<(), KernelError> {
     let (target, source) = (context(target), context(source));
     let flags = source.context_flags.get();
     let selected = |mask: u32| flags & (AMD64 | mask) == AMD64 | mask;
-    if selected(0x40) {
-        return Err(KernelError::new("thread context: XSTATE must be validated before register writes"));
-    }
     if selected(1) {
         let mut rip = source.rip.get();
         let cs: u16 = if mode == 1 { if source.seg_cs.get() == 0x33 { 0x33 } else { 0x23 } } else { 0x10 };

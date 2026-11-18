@@ -109,11 +109,14 @@ pub fn capture(pointer: u64, mode: u8) -> Result<Result<Captured, u32>, KernelEr
         // alinhamento, como no NT).
         guest::read::<u32>(flag_address)
     };
-    // CONTEXT_XSTATE só de um buffer de UserMode e com recursos habilitados.
-    let (status, flags) = registers::validate(flags, mode, mode != 0 && xsave::enabled_features() != 0);
+    // CONTEXT_XSTATE com recursos habilitados, nos dois modos (o
+    // RtlpSanitizeContextFlags do PspSetContextThreadInternal).
+    let (status, flags) = registers::validate(flags, mode, xsave::enabled_features() != 0);
     if status != 0 {
         return Ok(Err(status));
     }
+    // KernelMode: o pedaço XSTATE do buffer do chamador só é lido quando o
+    // contexto de destino é o de UserMode (`set::begin`).
     if mode == 0 {
         return Ok(Ok(Captured { source: pointer, flags, xstate: None, owned: false }));
     }

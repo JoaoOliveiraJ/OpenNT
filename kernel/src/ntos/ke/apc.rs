@@ -528,7 +528,7 @@ pub fn current_attachment_state(thread: u64) -> Option<u64> {
 use core::mem::offset_of;
 
 /// UserApcPendingAll: SpecialUserApcPending (bit 0) e UserApcPending (bit 1).
-const SPECIAL_USER_APC_PENDING: u8 = 1;
+pub const SPECIAL_USER_APC_PENDING: u8 = 1;
 const USER_APC_PENDING: u8 = 2;
 /// Flags do 7º argumento do KiInitializeUserApc.
 pub const USER_APC_TEST_ALERT: u32 = 1;

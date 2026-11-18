@@ -12,6 +12,14 @@
 //! NtContinueEx(CONTEXT, CONTEXT+0x4F0): com TEST_ALERT|DELIVER_APC e outra
 //! APC pendente, ela entra no mesmo CONTEXT ([`deliver_in_place`]) e o
 //! serviço devolve 0, que o despachante trata como "repetir".
+//!
+//! O estado estendido (KiInitializeUserApc do ntoskrnl 19041): com KF_XSTATE
+//! o frame de uma APC especial leva CONTEXT_XSTATE e o pedaço XSTATE logo
+//! abaixo do RSP interrompido ([`FrameLayout`]), e o NtContinueEx devolve
+//! dele a metade alta dos YMM; a APC especial interrompe o código em
+//! qualquer instrução. A APC normal sai só no retorno de uma chamada de
+//! sistema (espera alertável, NtTestAlert), onde a ABI x64 já trata a
+//! metade alta dos YMM como volátil, e o frame dela não tem o pedaço.
 
 use alloc::sync::Arc;
 use core::mem::offset_of;
@@ -22,8 +30,9 @@ use crate::ntos::inc::field::{Field, NtStruct, Reserved};
 use crate::ntos::inc::types::extra_usermode::{ApcCallbackData, KcontinueArgument, KCONTINUE_FLAG_DELIVER_APC, KCONTINUE_RESUME};
 use crate::ntos::inc::types::{Context, ContextEx, Kapc, Kthread, MachineFrame, XsaveFormat};
 use crate::ntos::io::file::request as file_request;
-use crate::ntos::ke::apc::{self, UserApc, USER_APC_CALLBACK_DATA, USER_APC_TEST_ALERT};
-use crate::ntos::ke::test_alert;
+use crate::ntos::ke::apc::{self, UserApc, SPECIAL_USER_APC_PENDING, USER_APC_CALLBACK_DATA, USER_APC_SPECIAL, USER_APC_TEST_ALERT};
+use crate::ntos::ke::xsave::{self, feature};
+use crate::ntos::ke::{processor_identity, test_alert};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::kernel_pool::{self, AllocateOptions};
 use crate::ntos::ps::context::registers;
@@ -45,8 +54,13 @@ const SPECIAL_USER_APC: u32 = 1;
 const CALLBACK_DATA_CONTEXT: u32 = 0x1_0000;
 /// THREAD_SET_CONTEXT.
 const THREAD_SET_CONTEXT: u32 = 0x10;
-/// CONTEXT_CONTROL|INTEGER|FLOATING_POINT|DEBUG_REGISTERS do KiInitializeUserApc.
+/// CONTEXT_CONTROL|INTEGER|FLOATING_POINT|DEBUG_REGISTERS do KiInitializeUserApc;
+/// com o pedaço XSTATE, CONTEXT_XSTATE também.
 const APC_CONTEXT_FLAGS: u32 = 0x10_001B;
+const APC_CONTEXT_FLAGS_XSTATE: u32 = 0x10_005B;
+/// O CET_U, que só entra na máscara numa thread com pilha de sombra de
+/// usuário (KTHREAD.MiscFlags.CetUserShadowStack); este kernel não a liga.
+const CET_USER: u64 = 1 << 11;
 /// Dr7 com algum comparador habilitado (L0-L3/G0-G3, LE/GE): DebugActive.
 const DR7_ACTIVE: u64 = 0x355;
 
@@ -242,20 +256,68 @@ fn write_homes(context: &Context, callback: &ApcCallbackData, context_address: u
     put(&context.p5_home, apc.flags as u64)
 }
 
+/// O frame de uma APC usa o pedaço XSTATE: APC especial (bit 1 das flags do
+/// KiInitializeUserApc) com KF_XSTATE.
+fn frame_has_xstate(apc_flags: u32) -> bool {
+    apc_flags & USER_APC_SPECIAL != 0 && processor_identity::feature_bits() & processor_identity::kf::XSTATE != 0
+}
+
+/// A máscara do pedaço XSTATE do frame: (EnabledFeatures | supervisor
+/// visível) sem x87 e SSE e, numa thread sem pilha de sombra, sem o CET_U.
+fn frame_xstate_mask() -> u64 {
+    (xsave::enabled_features() | xsave::enabled_user_visible_supervisor_features()) & !feature::LEGACY & !CET_USER
+}
+
+/// Onde o KiInitializeUserApc põe o frame abaixo do RSP interrompido: com o
+/// XSTATE, o pedaço de RtlpGetNonLegacyXStateAreaLength(máscara) bytes,
+/// alinhado a 64, logo abaixo do RSP; o MACHINE_FRAME alinhado a 16 abaixo
+/// dele (ou do RSP) e o CONTEXT 0x530 bytes antes.
+struct FrameLayout {
+    /// O CONTEXT (o RSP novo).
+    frame: u64,
+    /// O cabeçalho do pedaço XSTATE (o RSP original quando não há pedaço).
+    xstate: u64,
+    /// A máscara do pedaço; zero sem ele.
+    mask: u64,
+}
+
+impl FrameLayout {
+    fn new(rsp: u64, with_xstate: bool) -> Self {
+        let (xstate, mask) = if with_xstate {
+            let mask = frame_xstate_mask();
+            (rsp.wrapping_sub(crate::ntos::rtl::extended_context::non_legacy_xstate_area_length(mask) as u64) & !0x3F, mask)
+        } else {
+            (rsp, 0)
+        };
+        let machine = xstate.wrapping_sub(MachineFrame::SIZE) & !15;
+        Self { frame: machine.wrapping_sub(offset_of!(UserApcFrame, machine) as u64), xstate, mask }
+    }
+
+    /// O frame inteiro (até o RSP original) cabe na pilha de usuário.
+    fn fits(&self, rsp: u64) -> bool {
+        self.frame < rsp && state::probe_user_write(self.frame, rsp - self.frame)
+    }
+}
+
 /// KiInitializeUserApc (ExceptionFrame presente): a imagem do frame é
 /// montada no kernel — o CONTEXT do KeContextFromKframes com
-/// CONTROL|INTEGER|FLOATING_POINT|DEBUG_REGISTERS, MACHINE_FRAME e
-/// KCONTINUE_ARGUMENT — e copiada em bloco para a pilha de usuário; o
-/// CONTEXT salvo passa a retomar no despachante.
-fn build_frame(live: &Context, frame: u64, apc: &UserApc, dispatcher: u64) -> Result<(), KernelError> {
-    let scratch = guest::alloc_aligned(UserApcFrame::SIZE, 16, true);
+/// CONTROL|INTEGER|FLOATING_POINT|DEBUG_REGISTERS (e, numa APC especial com
+/// KF_XSTATE, XSTATE: o CONTEXT_EX com All, Legacy e XState e o pedaço com o
+/// estado de usuário da thread), MACHINE_FRAME e KCONTINUE_ARGUMENT — e
+/// copiada em bloco para a pilha de usuário; o CONTEXT salvo passa a
+/// retomar no despachante.
+fn build_frame(live: &Context, layout: &FrameLayout, apc: &UserApc, dispatcher: u64, thread: u64) -> Result<(), KernelError> {
+    let (frame, rsp) = (layout.frame, live.rsp.get());
+    let total = rsp - frame;
+    let scratch = guest::alloc_aligned(total, 16, true);
     if scratch == 0 {
         return Err(KernelError::with_status("user APC frame", STATUS_NO_MEMORY));
     }
-    // SAFETY: bloco do kernel recém-alocado e zerado do tamanho do frame.
+    // SAFETY: bloco do kernel recém-alocado e zerado, do tamanho do frame
+    // até o RSP original (pelo menos o de UserApcFrame).
     let image = unsafe { UserApcFrame::at(scratch) };
     let context = &image.context;
-    context.context_flags.set(APC_CONTEXT_FLAGS);
+    context.context_flags.set(if layout.mask != 0 { APC_CONTEXT_FLAGS_XSTATE } else { APC_CONTEXT_FLAGS });
     context.rip.set(live.rip.get());
     context.seg_cs.set(live.seg_cs.get());
     context.seg_ss.set(live.seg_ss.get());
@@ -273,12 +335,32 @@ fn build_frame(live: &Context, frame: u64, apc: &UserApc, dispatcher: u64) -> Re
             target.set(source.get());
         }
     }
+    if layout.mask != 0 {
+        // CONTEXT_EX: All do CONTEXT ao RSP original, Legacy o CONTEXT,
+        // XState o pedaço até o RSP original; o pedaço zerado e, com a
+        // compactação, XCOMP_BV = máscara | bit 63.
+        let chunks = &image.context_ex;
+        let context_ex = frame + offset_of!(UserApcFrame, context_ex) as u64;
+        chunks.all.offset.set(-(Context::SIZE as i32));
+        chunks.all.length.set(total as u32);
+        chunks.legacy.offset.set(-(Context::SIZE as i32));
+        chunks.legacy.length.set(Context::SIZE as u32);
+        chunks.x_state.offset.set(layout.xstate.wrapping_sub(context_ex) as i32);
+        chunks.x_state.length.set((rsp - layout.xstate) as u32);
+        let header = scratch + (layout.xstate - frame);
+        if xsave::compaction() {
+            guest::write64(header + 8, layout.mask | feature::COMPACTED_FORMAT);
+        }
+        // KeContextFromKframes com CONTEXT_XSTATE: o estado de usuário da
+        // thread no pedaço.
+        crate::ntos::ps::context::xstate::fill_base_from_thread(header - xsave::LEGACY_SIZE as u64, thread);
+    }
     image.machine.rip.set(live.rip.get());
-    image.machine.rsp.set(live.rsp.get());
+    image.machine.rsp.set(rsp);
     image.continue_argument.continue_type.set(KCONTINUE_RESUME);
     image.continue_argument.continue_flags.set(KCONTINUE_FLAG_DELIVER_APC | (apc.flags & USER_APC_TEST_ALERT));
     write_homes(context, &image.callback_data, frame, apc, false)?;
-    let written = guest::try_write_bytes(frame, &guest::read_bytes(scratch, UserApcFrame::SIZE as usize));
+    let written = guest::try_write_bytes(frame, &guest::read_bytes(scratch, total as usize));
     guest::free_bytes(scratch);
     written?;
     live.rsp.set(frame);
@@ -301,11 +383,13 @@ pub fn deliver(thread: &UserThread) -> u32 {
     // SAFETY: o CONTEXT salvo pelo runtime da thread (memória do kernel).
     let live = unsafe { Context::at(context) };
     let rsp = live.rsp.get();
-    let machine = rsp.wrapping_sub(MachineFrame::SIZE) & !15;
-    let frame = machine.wrapping_sub(offset_of!(UserApcFrame, machine) as u64);
     // A sonda precede a retirada: a pilha cheia não consome a APC (o
-    // crescimento da pilha/guard page exige o suporte separado do Mm).
-    if frame >= rsp || !state::probe_user_write(frame, rsp - frame) {
+    // crescimento da pilha/guard page exige o suporte separado do Mm). Com
+    // SpecialUserApcPending a APC que sai é a especial (o KiDeliverApc a
+    // escolhe antes das normais), e o frame dela pode levar o pedaço XSTATE.
+    let special_pending = apc::user_apc_pending_all(pointer) & SPECIAL_USER_APC_PENDING != 0;
+    let predicted = FrameLayout::new(rsp, frame_has_xstate(if special_pending { USER_APC_SPECIAL } else { 0 }));
+    if !predicted.fits(rsp) {
         return STATUS_STACK_OVERFLOW;
     }
     let selected = match apc::deliver_user(pointer) {
@@ -313,9 +397,15 @@ pub fn deliver(thread: &UserThread) -> u32 {
         Ok(None) => return 0,
         Err(error) => return if error.status != 0 { error.status } else { STATUS_UNSUCCESSFUL },
     };
-    match build_frame(live, frame, &selected, dispatcher) {
+    let layout = FrameLayout::new(rsp, frame_has_xstate(selected.flags));
+    // Um frame maior que o previsto (a APC já saiu da fila, como no
+    // KiDeliverApc antes da sonda do KiInitializeUserApc).
+    if layout.frame < predicted.frame && !layout.fits(rsp) {
+        return STATUS_STACK_OVERFLOW;
+    }
+    match build_frame(live, &layout, &selected, dispatcher, pointer) {
         Ok(()) => {
-            crate::debug_print!("[apc] user APC {:#x} -> KiUserApcDispatcher, frame={:#x}", selected.normal_routine, frame);
+            crate::debug_print!("[apc] user APC {:#x} -> KiUserApcDispatcher, frame={:#x} xstate={:#x}", selected.normal_routine, layout.frame, layout.mask);
             0
         }
         Err(error) => if error.status != 0 { error.status } else { STATUS_UNSUCCESSFUL },

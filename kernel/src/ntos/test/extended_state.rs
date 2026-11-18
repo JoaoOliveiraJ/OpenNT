@@ -112,7 +112,7 @@ pub fn upper_halves(pattern: &[u8]) -> alloc::vec::Vec<u8> {
 /// Os 16 YMM com a metade baixa (o XMM) de `lower` e a alta de `upper`: o
 /// que uma restauração do estado estendido sem o SSE deixa (o salvamento dos
 /// drivers e o da troca levam só os recursos além do x87 e do SSE).
-fn mixed(lower: &[u8], upper: &[u8]) -> alloc::vec::Vec<u8> {
+pub fn mixed(lower: &[u8], upper: &[u8]) -> alloc::vec::Vec<u8> {
     (0..16).flat_map(|register| lower[register * 32..register * 32 + 16].iter().chain(&upper[register * 32 + 16..register * 32 + 32]).copied()).collect()
 }
 

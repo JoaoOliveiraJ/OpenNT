@@ -1,11 +1,12 @@
 //! O CONTEXT estendido (CONTEXT_EX com o XSTATE) do lado do kernel, como as
 //! rotinas internas do ntoskrnl 19041 o montam e copiam:
 //! RtlpValidateContextFlags, RtlpGetLegacyContextLength,
-//! RtlpGetEntireXStateAreaLength, RtlGetExtendedContextLength2,
-//! RtlInitializeExtendedContext2 e RtlpCopyXStateChunk. O ntoskrnl 19041 não
-//! as exporta (as versões exportadas são as da ntdll, que o modo usuário usa
-//! sobre o que o kernel monta); o kernel as usa no despacho de exceções, no
-//! NtContinue e no NtGet/SetContextThread.
+//! RtlpGetEntireXStateAreaLength, RtlpGetNonLegacyXStateAreaLength,
+//! RtlGetExtendedContextLength2, RtlInitializeExtendedContext2 e
+//! RtlpCopyXStateChunk. O ntoskrnl 19041 não as exporta (as versões
+//! exportadas são as da ntdll, que o modo usuário usa sobre o que o kernel
+//! monta); o kernel as usa no despacho de exceções, no frame das APCs de
+//! usuário especiais, no NtContinue e no NtGet/SetContextThread.
 //!
 //! Layout de um CONTEXT estendido x64: o CONTEXT (0x4D0 bytes, alinhado a
 //! 16), o CONTEXT_EX logo depois (três CONTEXT_CHUNK de deslocamentos
@@ -96,6 +97,13 @@ fn compaction_mask(mask: u64) -> u64 {
     }
 }
 
+/// RtlpGetNonLegacyXStateAreaLength(Mask): o tamanho do pedaço XSTATE de
+/// `mask` sem a área legada (que fica no CONTEXT.FltSave); com a
+/// compactação, a máscara restrita como em [`compaction_mask`].
+pub fn non_legacy_xstate_area_length(mask: u64) -> u32 {
+    entire_xstate_area_length(compaction_mask(mask)) - LEGACY_SIZE
+}
+
 /// RtlGetExtendedContextLength2(ContextFlags, XStateCompactionMask): o
 /// tamanho a reservar para um CONTEXT estendido (com a folga do
 /// alinhamento).
@@ -137,7 +145,7 @@ pub fn initialize_extended_context2(context: u64, flags: u32, mask: u64) -> Resu
     }
     let header = (context_ex + CONTEXT_EX_LENGTH as u64 + 0x3F) & !0x3F;
     let mask = compaction_mask(mask);
-    let length = entire_xstate_area_length(mask) - LEGACY_SIZE;
+    let length = non_legacy_xstate_area_length(mask);
     guest::write_bytes(header, &alloc::vec![0; length as usize]);
     if xsave::compaction() {
         guest::write64(header + 8, mask | feature::COMPACTED_FORMAT);

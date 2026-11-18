@@ -5967,7 +5967,8 @@ fn boot_services_hive(assert: Assert) {
 fn usermode_syscalls_exports(assert: Assert) {
     use core::mem::offset_of;
     use crate::ntos::inc::types::extra_usermode::{ApcCallbackData, KcontinueArgument};
-    use crate::ntos::ke::{apc, thread_alert};
+    use crate::ntos::ke::{apc, processor_identity, thread_alert, xsave};
+    use crate::ntos::rtl::extended_context;
     use crate::ntos::mm::kernel_pool;
     use crate::ntos::ps::process;
     use crate::ntos::ps::user::handles::UserProcess;
@@ -6046,7 +6047,33 @@ fn usermode_syscalls_exports(assert: Assert) {
         let special = call("NtQueueApcThreadEx", handle, 1, routine2, 0x44);
         let marked = pending() & 1 != 0;
         let delivered = user_apc::deliver(&thread);
-        assert(special == 0 && marked && delivered == 0 && homes(apc_frame, [0x44, 0x55, 0x66, routine2, 2]) && continuation.continue_flags.get() == 2 && pending() == 0, "userapc: APC especial com SpecialUserApcPending e continuacao sem TEST_ALERT");
+        // Com KF_XSTATE o frame da especial leva CONTEXT_XSTATE e o pedaço
+        // XSTATE (RtlpGetNonLegacyXStateAreaLength da máscara visível sem x87,
+        // SSE e CET_U), alinhado a 64 logo abaixo da pilha; o MACHINE_FRAME
+        // fica alinhado a 16 abaixo dele e o CONTEXT 0x530 bytes antes.
+        let with_xstate = processor_identity::feature_bits() & processor_identity::kf::XSTATE != 0;
+        let mask = (xsave::enabled_features() | xsave::enabled_user_visible_supervisor_features()) & !3 & !(1 << 11);
+        let stack_top = block + 0x3000;
+        let xstate_start = if with_xstate { (stack_top - extended_context::non_legacy_xstate_area_length(mask) as u64) & !0x3F } else { stack_top };
+        let special_machine = (xstate_start - nt::MachineFrame::SIZE) & !15;
+        let special_frame = special_machine - (nt::Context::SIZE + 0x60);
+        let (special_context, special_ex, special_continuation, special_machine_frame) = unsafe { (nt::Context::at(special_frame), nt::ContextEx::at(special_frame + 0x4D0), KcontinueArgument::at(special_frame + 0x4F0), nt::MachineFrame::at(special_machine)) };
+        let special_layout = if with_xstate {
+            let chunk = (special_frame + 0x4D0).wrapping_add(special_ex.x_state.offset.get() as i64 as u64);
+            special_context.context_flags.get() == 0x10_005B
+                && special_ex.all.offset.get() == -0x4D0
+                && special_ex.all.length.get() as u64 == stack_top - special_frame
+                && special_ex.legacy.offset.get() == -0x4D0
+                && special_ex.legacy.length.get() == 0x4D0
+                && chunk == xstate_start
+                && special_ex.x_state.length.get() as u64 == stack_top - xstate_start
+                && guest::read64(chunk) & !mask == 0
+        } else {
+            special_context.context_flags.get() == 0x10_001B
+        };
+        let special_redirected = live_context.rsp.get() == special_frame && live_context.rip.get() == dispatcher && special_machine_frame.rsp.get() == stack_top && special_machine_frame.rip.get() == block + 0x200;
+        assert(special == 0 && marked && delivered == 0 && homes(special_context, [0x44, 0x55, 0x66, routine2, 2]) && special_continuation.continue_flags.get() == 2 && pending() == 0, "userapc: APC especial com SpecialUserApcPending e continuacao sem TEST_ALERT");
+        assert(special_layout && special_redirected, "userapc: o frame da APC especial leva CONTEXT_XSTATE e o pedaco XSTATE abaixo da pilha (CONTEXT_EX All, Legacy e XState) com KF_XSTATE");
         // Uma normal e duas especiais: as especiais vão para o começo da
         // fila (o KiInsertQueueApc), a mais nova primeiro; a normal espera a
         // UserApcPending.
@@ -6056,9 +6083,9 @@ fn usermode_syscalls_exports(assert: Assert) {
         let normal = call("NtQueueApcThread", handle, routine, 0xC1, 0);
         let older = call("NtQueueApcThreadEx", handle, 1, routine2, 0xB1);
         let newer = call("NtQueueApcThreadEx", handle, 1, routine2, 0xB2);
-        let newest_first = user_apc::deliver(&thread) == 0 && apc_frame.p1_home.get() == 0xB2;
+        let newest_first = user_apc::deliver(&thread) == 0 && special_context.p1_home.get() == 0xB2;
         reset();
-        let older_next = user_apc::deliver(&thread) == 0 && apc_frame.p1_home.get() == 0xB1 && pending() == 0;
+        let older_next = user_apc::deliver(&thread) == 0 && special_context.p1_home.get() == 0xB1 && pending() == 0;
         reset();
         let normal_last = head.flink.get() != head.address() && call("NtTestAlert", 0, 0, 0, 0) == 0 && user_apc::deliver(&thread) == 0 && apc_frame.p1_home.get() == 0xC1 && head.flink.get() == head.address();
         assert(normal == 0 && older == 0 && newer == 0 && newest_first && older_next && normal_last, "userapc: especiais na frente da fila, a mais nova primeiro");
