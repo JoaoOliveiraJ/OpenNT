@@ -2901,7 +2901,6 @@ fn user_create_token(assert: Assert) {
         let restricted_refused = filter(restricted) == 0xC000_000D;
         let _ = call("NtClose", new_token, 0, 0, 0);
         assert(filtered && zeroed && same_access && deny_only && no_privileges && restricted_refused, "usercreatetoken: NtFilterToken desabilita o grupo, tira o privilegio, herda o acesso do handle e recusa SID restrito com atributos");
-        let _ = call("NtClose", token, 0, 0, 0);
         let (attributes, quality) = (data + 0x600, data + 0x640);
         guest::write32(quality, 12);
         guest::write32(quality + 4, 2);
@@ -2949,9 +2948,12 @@ fn user_create_token(assert: Assert) {
         let no_session = create(1, data + 0x1F0);
         let no_quality = create(2, luid);
         assert(bad_type == 0xC000_00A8 && no_session == 0xC000_005F && no_quality == 0xC000_00A5, "usercreatetoken: tipo, sessao de logon e nivel de impersonacao recusados");
-        let _ = call("NtClose", own, 0, 0, 0);
-        // A sessão sai do banco quando o último token dela é destruído; o
+        // O primeiro token segura a sessão de logon até aqui (como o token
+        // que o LSA mantém): os tokens criados depois a acham. A sessão sai do
+        // banco quando o último token dela é destruído, e o
         // RmDeleteLogonSession posterior do LSA já não a acha.
+        let _ = call("NtClose", token, 0, 0, 0);
+        let _ = call("NtClose", own, 0, 0, 0);
         assert(session == 0 && !logon_session::exists(logon, 0) && logon_session::delete_track(logon) == 0xC000_005F, "usercreatetoken: a sessao de logon sai com o ultimo token");
         if let Some(region) = memory::find_region(block) {
             memory::release_private_region(&region);

@@ -19,7 +19,7 @@ O OpenNT avança em fases. Cada fase termina com o kernel compilando, iniciando 
 
 **Próximo.** O Local Session Manager registrar o endpoint dele no epmapper (a conexão ALPC confere o RequiredServerSid contra o usuário do token do servidor, a conta NetworkService do svchost do rpcss), sinalizar o TermSrvReadyEvent e conectar a sessão 1 pela \SmSsWinStationApiPort. Depois o winlogon cria o LogonUI e o dwm, que desenham a tela de logon.
 
-Hoje: **49 de 79** binários da Microsoft rodam (28 parciais); o kernel exporta **2.083 dos 3.070** nomes do `ntoskrnl.exe` do Windows 10 22H2 (67,9%). Detalhes em [O que roda](site/o-que-roda.html), [Componentes](site/componentes.html), [Exports](site/ntoskrnl.html) e [Testes](site/testes.html).
+Hoje: **53 de 83** binários da Microsoft rodam (28 parciais); o kernel exporta **2.154 dos 3.070** nomes do `ntoskrnl.exe` do Windows 10 22H2 (70,2%). Detalhes em [O que roda](site/o-que-roda.html), [Componentes](site/componentes.html), [Exports](site/ntoskrnl.html) e [Testes](site/testes.html).
 
 ## Fase 1 — base (concluída)
 
@@ -106,6 +106,7 @@ Carregador de PE, funções exportadas pelo kernel, Code Integrity real (ci.dll)
 | fs_rec.sys | Funciona | fs_rec |
 | ksecpkg.sys | Funciona | ksecpkg |
 | ahcache.sys, ws2ifsl.sys, bowser.sys e afunix.sys | Funciona | drivers-software |
+| mup.sys, dfsc.sys, udfs.sys e cldflt.sys | Funciona | drivers-arquivos-rede |
 
 ## Fase 7 — modo usuário (em andamento)
 
