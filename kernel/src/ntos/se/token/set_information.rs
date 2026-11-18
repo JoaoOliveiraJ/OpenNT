@@ -5,7 +5,8 @@
 //! 42 e 45); qualquer outra é STATUS_INVALID_INFO_CLASS antes do handle. O
 //! handle pede TOKEN_ADJUST_DEFAULT (TokenSessionId soma
 //! TOKEN_ADJUST_SESSIONID, TokenLinkedToken soma TOKEN_DUPLICATE). Cada
-//! troca dá um ModifiedId novo ao token.
+//! troca dá um ModifiedId novo ao token, menos TokenSessionId e
+//! TokenSessionReference.
 //!
 //! - TokenOwner (4) e TokenPrimaryGroup (5): um TOKEN_OWNER ou
 //!   TOKEN_PRIMARY_GROUP de 8 bytes (STATUS_INFO_LENGTH_MISMATCH fora disso);
@@ -14,7 +15,8 @@
 //!   (STATUS_INVALID_PRIMARY_GROUP).
 //! - TokenDefaultDacl (6): o TOKEN_DEFAULT_DACL (pelo menos 8 bytes); uma ACL
 //!   nula tira a DACL padrão.
-//! - TokenSessionId (12): o ULONG (4 bytes), com o SeTcbPrivilege.
+//! - TokenSessionId (12): o ULONG (4 bytes), com o SeTcbPrivilege, num
+//!   token que não é o primário de um processo vivo; o ModifiedId fica.
 //! - TokenSessionReference (14): o ULONG 0 (outro valor é
 //!   STATUS_INVALID_PARAMETER), com o SeTcbPrivilege: o token larga a
 //!   referência à sessão de logon (TOKEN_SESSION_NOT_REFERENCED em
@@ -268,6 +270,11 @@ pub fn set(token: u64, class: u32, information: u64, length: u32, mode: u8) -> R
             };
             tokens::update(token, |record| record.default_dacl = entries).map_or(STATUS_INVALID_PARAMETER, |_| 0)
         }
+        // TokenSessionId: o SeSetSessionIdToken (0x69d5a0), com o
+        // SeTcbPrivilege; o primário de um processo vivo (TokenInUse) é
+        // STATUS_TOKEN_ALREADY_IN_USE. Não muda o ModifiedId. O LSA grava
+        // assim a sessão do cliente do LsaLogonUser (o winlogon da sessão 1
+        // para as contas DWM-n e UMFD-n) no token que acabou de criar.
         12 => {
             if length != 4 {
                 return Ok(STATUS_INFO_LENGTH_MISMATCH);
@@ -276,7 +283,10 @@ pub fn set(token: u64, class: u32, information: u64, length: u32, mode: u8) -> R
             if !tcb() {
                 return Ok(STATUS_PRIVILEGE_NOT_HELD);
             }
-            tokens::update(token, |record| record.session_id = session_id).map_or(STATUS_INVALID_PARAMETER, |_| 0)
+            if tokens::in_use(token) {
+                return Ok(STATUS_TOKEN_ALREADY_IN_USE);
+            }
+            return Ok(tokens::update(token, |record| record.session_id = session_id).map_or(STATUS_INVALID_PARAMETER, |_| 0));
         }
         // TokenSessionReference: só o 0 (o token larga a sessão de logon,
         // o SepStopReferencingLogonSession), com o SeTcbPrivilege. Não muda

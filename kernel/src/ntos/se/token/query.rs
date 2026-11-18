@@ -269,10 +269,13 @@ pub fn encode(token_pointer: u64, class: u32, base: u64) -> Result<Vec<u8>, u32>
         19 => return Err(STATUS_INVALID_PARAMETER),
         // Contexto LocalSystem de boot.
         20 => layout.scalar(1),
+        // TOKEN_MANDATORY_LABEL: sem grupo de integridade (IntegrityLevelIndex
+        // -1), o SepCopyTokenIntegrity devolve o SeUntrustedMandatorySid.
         25 => {
             layout.reserve(16);
             layout.u32(8, SE_GROUP_INTEGRITY);
-            layout.append_sid(0, &token.integrity);
+            let untrusted = crate::ntos::se::model::sid(16, &[0]);
+            layout.append_sid(0, if token.integrity.is_empty() { &untrusted } else { &token.integrity });
         }
         27 => layout.scalar(token.mandatory_policy),
         31 => {
@@ -386,10 +389,13 @@ impl Image {
 /// TOKEN_ACCESS_INFORMATION com o bloco que o segue, montado para `base`.
 fn access_information(token: &Token, base: u64) -> Result<Vec<u8>, u32> {
     // UserAndGroups: o usuário, os grupos e o rótulo de integridade, que no
-    // token do NT é um grupo SE_GROUP_INTEGRITY.
+    // token do NT é um grupo SE_GROUP_INTEGRITY (ausente num token criado
+    // sem ele).
     let mut groups: Vec<(&Sid, u32)> = alloc::vec![(&token.user, token.user_attributes)];
     groups.extend(token.groups.iter().map(|group| (&group.sid, group.attributes)));
-    groups.push((&token.integrity, SE_GROUP_INTEGRITY));
+    if !token.integrity.is_empty() {
+        groups.push((&token.integrity, SE_GROUP_INTEGRITY));
+    }
     let restricted: Vec<(&Sid, u32)> = token.restricted_sids.iter().map(|group| (&group.sid, group.attributes)).collect();
     let capabilities: Vec<(&Sid, u32)> = token.capabilities.iter().map(|group| (&group.sid, group.attributes)).collect();
     let mut privileges: Vec<(u64, u32)> = token.privileges.iter().filter(|privilege| privilege.id < PRIVILEGE_BITS).map(|privilege| (privilege.id, privilege.attributes & 3)).collect();
