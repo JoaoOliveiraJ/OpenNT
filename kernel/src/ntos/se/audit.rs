@@ -572,6 +572,29 @@ pub fn privileged_service_audit_alarm(service: &str, token_kind: u32, impersonat
     0
 }
 
+/// O maior PrivilegeCount que o NtPrivilegeObjectAuditAlarm captura (0x43 ou
+/// mais é STATUS_INVALID_PARAMETER).
+pub const MAX_ALARM_PRIVILEGES: u32 = 0x42;
+
+/// NtPrivilegeObjectAuditAlarm(SubsystemName, HandleId, ClientToken,
+/// DesiredAccess, Privileges, AccessGranted) depois das verificações e
+/// capturas do adaptador, como no ntoskrnl 19041 (rva 0x78b840): o
+/// SeCheckAuditPrivilege de quem chama (STATUS_PRIVILEGE_NOT_HELD), o token
+/// do cliente com TOKEN_QUERY (um token de impersonação abaixo de
+/// SecurityIdentification é STATUS_BAD_IMPERSONATION_LEVEL), o
+/// SubsystemName e o PRIVILEGE_SET (alinhado a ULONG, até
+/// [`MAX_ALARM_PRIVILEGES`] entradas). O SepAdtPrivilegeObjectAuditAlarm
+/// (rva 0x627d4c) gera o evento 4674 quando a auditoria de uso de
+/// privilégio, sensível ou não (SepAdtAuditPrivilegeUseWithContext), está
+/// ligada para o resultado. Devolve STATUS_SUCCESS mesmo sem evento; o
+/// lsass (LsapAdtCheckPrivilege) ignora o status.
+pub fn privilege_object_audit_alarm_service(subsystem: &str, handle_id: u64, desired_access: u32, privilege_count: u32, granted: bool) -> u32 {
+    if audit_privilege_use(granted, !granted) {
+        record_audit_event("PrivilegeObject", format!("event=4674 subsystem={subsystem} handle={handle_id:#x} desired={desired_access:#x} privileges={privilege_count} granted={granted}"));
+    }
+    0
+}
+
 /// NtCloseObjectAuditAlarm e NtDeleteObjectAuditAlarm(SubsystemName,
 /// HandleId, GenerateOnClose), como no ntoskrnl 19041 (NtCloseObjectAuditAlarm
 /// 0x684fd0): sem GenerateOnClose, STATUS_SUCCESS sem mais nada; com ele, o

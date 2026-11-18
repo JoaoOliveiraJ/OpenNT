@@ -39,6 +39,7 @@ pub mod memory_reserve;
 pub mod mitigation_policy;
 pub mod wake_counter;
 pub mod locale;
+pub mod boot_phase;
 pub mod fault_information;
 pub mod io_boost;
 pub mod net_rate_control;

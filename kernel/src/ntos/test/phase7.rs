@@ -3162,6 +3162,41 @@ fn user_tokens(assert: Assert) {
     let (any_status, any, used, unknown_used) = check(0);
     let (all_status, all, _, _) = check(1);
     assert(any_status == 0 && all_status == 0 && any == used as u8 && all == 0 && !unknown_used && call("NtPrivilegeCheck", token, set + 2, out, 0) == 0x8000_0002, "usertokens: NtPrivilegeCheck marca os privilegios habilitados e respeita PRIVILEGE_SET_ALL_NECESSARY");
+    // NtPrivilegeObjectAuditAlarm: o SubsystemName e o PRIVILEGE_SET do
+    // chamador (alinhado a ULONG, até 0x42 entradas); com a política de
+    // auditoria zerada, sucesso sem evento.
+    let subsystem = buffer + 0x380;
+    let name: Vec<u16> = "Security".encode_utf16().collect();
+    guest::write16(subsystem, 16);
+    guest::write16(subsystem + 2, 16);
+    guest::write64(subsystem + 8, subsystem + 0x10);
+    for (index, unit) in name.iter().enumerate() {
+        guest::write16(subsystem + 0x10 + index as u64 * 2, *unit);
+    }
+    guest::write32(set, 1);
+    guest::write32(set + 4, 1);
+    guest::write64(set + 8, 23);
+    guest::write32(set + 16, 0x8000_0000);
+    let alarm = |privileges: u64| {
+        guest::write64(rsp + 0x28, privileges);
+        guest::write64(rsp + 0x30, 1);
+        call("NtPrivilegeObjectAuditAlarm", subsystem, 0x44, token, 0x1F_0001)
+    };
+    let events = crate::ntos::se::audit::events().len();
+    let audited = alarm(set) == 0 && crate::ntos::se::audit::events().len() == events;
+    let misaligned = alarm(set + 2) == 0x8000_0002;
+    guest::write32(set, 0x43);
+    let too_many = alarm(set) == 0xC000_000D;
+    let bad_handle = {
+        guest::write32(set, 1);
+        guest::write64(rsp + 0x28, set);
+        call("NtPrivilegeObjectAuditAlarm", subsystem, 0x44, 0x7FF0, 0) == 0xC000_0008
+    };
+    assert(audited && misaligned && too_many && bad_handle, "usertokens: NtPrivilegeObjectAuditAlarm captura o subsistema e o PRIVILEGE_SET e nao gera evento com a politica zerada");
+    // TokenElevation confere o tamanho antes do handle, com o ReturnLength
+    // já gravado.
+    guest::write32(returned, 0);
+    assert(query(0x7FF0, 20, 8) == 0xC000_0004 && guest::read32(returned) == 4 && query(token, 20, 4) == 0 && guest::read32(buffer) == 1, "usertokens: TokenElevation de 4 bytes antes do handle; o token do System e elevado");
     // TokenStatistics pela variante de syscall (frame bruto).
     for (index, value) in [token, 10, buffer, 56, returned].into_iter().enumerate() {
         guest::write64(raw + (index as u64 + 1) * 8, value);
@@ -3569,7 +3604,8 @@ fn user_virtual_account_token(assert: Assert) {
         guest::write64(rsp + 0x30, 0);
         let _ = call("NtAdjustPrivilegesToken", own, 0, buffer, 16);
         // Everyone repetido e o próprio usuário como grupo saem (a última
-        // entrada ocupa o lugar); o rótulo Medium fica de fora dos grupos.
+        // entrada ocupa o lugar); o rótulo Medium fica onde as trocas o
+        // deixam (o último grupo), com os atributos 0x60.
         let medium_groups = [(everyone, 1), (window_manager, 7), (everyone, 7), (user, 7), (authenticated, 0x10), (medium, 0x60)];
         let dwm_privileges = [(23, 3), (20, 3), (34, 0), (14, 0), (33, 0)];
         write_groups(&medium_groups);
@@ -3595,12 +3631,12 @@ fn user_virtual_account_token(assert: Assert) {
         };
         let label = |handle: u64| if query_handle(handle, 25, 0x100) == 0 { guest::read_bytes(guest::read64(buffer), 12) } else { alloc::vec::Vec::new() };
         let window_manager_kept = query_handle(token, 2, 0x200) == 0 && guest::read_bytes(guest::read64(buffer + 24), 16) == guest::read_bytes(window_manager, 16);
-        let groups_ok = group_attributes(token) == [7, 7, 0x10] && window_manager_kept;
+        let groups_ok = group_attributes(token) == [7, 7, 0x10, 0x60] && window_manager_kept;
         let label_ok = label(token) == guest::read_bytes(medium, 12);
         let flags_ok = token_records::token_flags(pointer) == 0x2800;
         let privileges_ok = privilege_list(token) == [(14, 0), (20, 0), (23, 3), (33, 0), (34, 0)];
         let policy_ok = query_handle(token, 27, 4) == 0 && guest::read32(buffer) == 0;
-        assert(created && pointer != 0 && groups_ok && label_ok && flags_ok && privileges_ok && policy_ok, "virtualaccount: NtCreateTokenEx tira duplicatas, guarda o rotulo Medium a parte, liga TOKEN_NOT_LOW e TOKEN_IS_FILTERED e desliga os privilegios fora da mascara do LUA");
+        assert(created && pointer != 0 && groups_ok && label_ok && flags_ok && privileges_ok && policy_ok, "virtualaccount: NtCreateTokenEx tira duplicatas, mantem o rotulo Medium entre os grupos, liga TOKEN_NOT_LOW e TOKEN_IS_FILTERED e desliga os privilegios fora da mascara do LUA");
         // TokenSessionId, como o LsapAuApiDispatchLogonUser com a sessão do
         // winlogon: com o SeTcbPrivilege, sem ModifiedId novo; no token
         // primário de um processo vivo, STATUS_TOKEN_ALREADY_IN_USE.

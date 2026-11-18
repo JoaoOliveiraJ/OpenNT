@@ -50,8 +50,29 @@
 //!   SeSetMandatoryPolicyToken). O LsapCreateTokenObject do lsass grava a
 //!   política no token de cada logon de serviço.
 //!
-//! As outras classes aceitas ainda não mudam nada no OpenNT
-//! (STATUS_NOT_IMPLEMENTED, com registro).
+//! As classes do par de tokens do UAC, que o LsapBuildAndCreateToken do
+//! lsass usa quando divide um logon interativo elevado:
+//! - TokenLinkedToken (19): o HANDLE do token filtrado (8 bytes; o handle do
+//!   token completo pede também TOKEN_DUPLICATE), o SepLinkLogonSessions
+//!   (`se/token/elevation.rs`); não muda o ModifiedId;
+//! - TokenVirtualizationAllowed (23): o ULONG, com o SeCreateTokenPrivilege,
+//!   liga ou desliga TOKEN_VIRTUALIZE_ALLOWED (o LsapVirtualizeToken o liga
+//!   no token filtrado);
+//! - TokenVirtualizationEnabled (24): o ULONG, sem privilégio
+//!   (SeSetVirtualizationToken): ligar TOKEN_VIRTUALIZE_ENABLED só num token
+//!   com TOKEN_VIRTUALIZE_ALLOWED, desligar sempre;
+//! - TokenUIAccess (26): o ULONG; ligar TOKEN_UIACCESS pede o
+//!   SeTcbPrivilege, desligar não.
+//! Todas pedem exatamente o tamanho do dado (STATUS_INFO_LENGTH_MISMATCH),
+//! e 23, 24 e 26 dão ModifiedId novo mesmo sem mudar os bits.
+//!
+//! - TokenPrivateNameSpace (42): o ULONG, com o SeTcbPrivilege, liga ou
+//!   desliga TOKEN_PRIVATE_NAMESPACE (o SeSetPrivateNameSpaceToken; o token
+//!   primário de um processo vivo é STATUS_TOKEN_ALREADY_IN_USE). O usermgr
+//!   o liga no token de cada logon de usuário.
+//!
+//! A outra classe aceita (TokenChildProcessFlags, 45) ainda não muda nada
+//! no OpenNT (STATUS_NOT_IMPLEMENTED, com registro).
 
 use alloc::vec::Vec;
 
@@ -61,7 +82,7 @@ use crate::ntos::se::model::{equal_sids, Sid};
 use crate::ntos::se::policy_descriptor;
 use crate::ntos::se::privilege;
 use crate::ntos::se::security_attributes::{self, SecurityAttribute};
-use crate::ntos::se::token::tokens;
+use crate::ntos::se::token::{elevation, tokens};
 use crate::rtl::KernelError;
 
 const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
@@ -79,16 +100,18 @@ const STATUS_INVALID_SID: u32 = 0xC000_0078;
 const STATUS_INVALID_LABEL: u32 = 0xC000_0446;
 /// As classes do NtSetInformationToken 19041 (bit = classe).
 const VALID_CLASSES: u64 = 0x2480_0F8B_5070;
-/// SeTcbPrivilege.
+/// SeTcbPrivilege e SeCreateTokenPrivilege.
 const SE_TCB_PRIVILEGE: u64 = 7;
+const SE_CREATE_TOKEN_PRIVILEGE: u64 = 2;
 /// A IdentifierAuthority do SeUntrustedMandatorySid (S-1-16).
 const MANDATORY_LABEL_AUTHORITY: [u8; 6] = [0, 0, 0, 0, 0, 16];
 const SECURITY_MANDATORY_MEDIUM_RID: u32 = 0x2000;
 const SECURITY_MANDATORY_HIGH_RID: u32 = 0x3000;
 const SECURITY_MANDATORY_SYSTEM_RID: u32 = 0x4000;
-/// TokenFlags: TOKEN_UIACCESS e TOKEN_NOT_LOW.
-const TOKEN_UIACCESS: u32 = 0x1000;
+/// TokenFlags: TOKEN_UIACCESS, TOKEN_NOT_LOW e TOKEN_PRIVATE_NAMESPACE.
+const TOKEN_UIACCESS: u32 = tokens::TOKEN_UIACCESS;
 const TOKEN_NOT_LOW: u32 = 0x2000;
+const TOKEN_PRIVATE_NAMESPACE: u32 = 1 << 16;
 /// Os privilégios que podem ficar ligados abaixo de High (a máscara do LUA:
 /// sem SeCreateToken, SeTcb, SeTakeOwnership, SeLoadDriver, SeBackup,
 /// SeRestore, SeDebug, SeImpersonate, SeRelabel e
@@ -374,6 +397,78 @@ pub fn set(token: u64, class: u32, information: u64, length: u32, mode: u8) -> R
                 return Ok(STATUS_INVALID_PARAMETER);
             }
             tokens::update(token, |record| record.mandatory_policy = policy).map_or(STATUS_INVALID_PARAMETER, |_| 0)
+        }
+        // TokenLinkedToken: o HANDLE do token filtrado (8 bytes) vai ao
+        // SepLinkLogonSessions (`se/token/elevation.rs`); o ModifiedId fica.
+        19 => {
+            if length != 8 {
+                return Ok(STATUS_INFO_LENGTH_MISMATCH);
+            }
+            let Ok(linked) = guest::try_read::<u64>(information) else { return Ok(STATUS_ACCESS_VIOLATION) };
+            return elevation::link(token, linked, mode);
+        }
+        // TokenVirtualizationAllowed (0x6ee126): o ULONG, com o
+        // SeCreateTokenPrivilege, liga ou desliga TOKEN_VIRTUALIZE_ALLOWED.
+        23 => {
+            if length != 4 {
+                return Ok(STATUS_INFO_LENGTH_MISMATCH);
+            }
+            let Ok(value) = guest::try_read::<u32>(information) else { return Ok(STATUS_ACCESS_VIOLATION) };
+            if !privilege::single_privilege_check(SE_CREATE_TOKEN_PRIVILEGE, mode as u32) {
+                return Ok(STATUS_PRIVILEGE_NOT_HELD);
+            }
+            tokens::change_flags(token, |flags| if value != 0 { flags | tokens::TOKEN_VIRTUALIZE_ALLOWED } else { flags & !tokens::TOKEN_VIRTUALIZE_ALLOWED });
+            return Ok(0);
+        }
+        // TokenVirtualizationEnabled: o SeSetVirtualizationToken (0x6a1878),
+        // sem privilégio; ligar só vale num token com
+        // TOKEN_VIRTUALIZE_ALLOWED, desligar sempre.
+        24 => {
+            if length != 4 {
+                return Ok(STATUS_INFO_LENGTH_MISMATCH);
+            }
+            let Ok(value) = guest::try_read::<u32>(information) else { return Ok(STATUS_ACCESS_VIOLATION) };
+            tokens::change_flags(token, |flags| {
+                if value == 0 {
+                    flags & !tokens::TOKEN_VIRTUALIZE_ENABLED
+                } else if flags & tokens::TOKEN_VIRTUALIZE_ALLOWED != 0 {
+                    flags | tokens::TOKEN_VIRTUALIZE_ENABLED
+                } else {
+                    flags
+                }
+            });
+            return Ok(0);
+        }
+        // TokenUIAccess (0x6ee487): ligar TOKEN_UIACCESS pede o
+        // SeTcbPrivilege; desligar, não.
+        26 => {
+            if length != 4 {
+                return Ok(STATUS_INFO_LENGTH_MISMATCH);
+            }
+            let Ok(value) = guest::try_read::<u32>(information) else { return Ok(STATUS_ACCESS_VIOLATION) };
+            if value != 0 && !tcb() {
+                return Ok(STATUS_PRIVILEGE_NOT_HELD);
+            }
+            tokens::change_flags(token, |flags| if value != 0 { flags | TOKEN_UIACCESS } else { flags & !TOKEN_UIACCESS });
+            return Ok(0);
+        }
+        // TokenPrivateNameSpace (0x6ee2a1): o ULONG, com o SeTcbPrivilege
+        // para ligar ou desligar; o SeSetPrivateNameSpaceToken (0x91c7d8)
+        // recusa o primário de um processo vivo
+        // (STATUS_TOKEN_ALREADY_IN_USE), mas dá ModifiedId novo mesmo
+        // assim. O usermgr liga o bit no token de cada usuário
+        // (CreateSeparateNameSpaceForToken).
+        42 => {
+            if length != 4 {
+                return Ok(STATUS_INFO_LENGTH_MISMATCH);
+            }
+            let Ok(value) = guest::try_read::<u32>(information) else { return Ok(STATUS_ACCESS_VIOLATION) };
+            if !tcb() {
+                return Ok(STATUS_PRIVILEGE_NOT_HELD);
+            }
+            let in_use = tokens::in_use(token);
+            tokens::change_flags(token, |flags| if in_use { flags } else if value != 0 { flags | TOKEN_PRIVATE_NAMESPACE } else { flags & !TOKEN_PRIVATE_NAMESPACE });
+            return Ok(if in_use { STATUS_TOKEN_ALREADY_IN_USE } else { 0 });
         }
         25 => {
             if length < 16 {

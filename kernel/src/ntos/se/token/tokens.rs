@@ -83,10 +83,16 @@ pub const TOKEN_AUDIT_NO_CHILD_PROCESS: u32 = 1 << 21;
 pub const TOKEN_ENFORCE_REDIRECTION_TRUST: u32 = 1 << 23;
 pub const TOKEN_AUDIT_REDIRECTION_TRUST: u32 = 1 << 24;
 
+/// Os bits de TokenFlags do UAC: TOKEN_VIRTUALIZE_ALLOWED,
+/// TOKEN_VIRTUALIZE_ENABLED e TOKEN_UIACCESS.
+pub const TOKEN_VIRTUALIZE_ALLOWED: u32 = 1 << 9;
+pub const TOKEN_VIRTUALIZE_ENABLED: u32 = 1 << 10;
+pub const TOKEN_UIACCESS: u32 = 1 << 12;
+
 /// Troca bits de TokenFlags sob a trava do token, com ModifiedId novo, como
 /// os setters SeTokenSet* do 19041 (o ModifiedId muda mesmo quando os bits
 /// ficam iguais).
-fn change_flags(pointer: u64, change: impl Fn(u32) -> u32) {
+pub fn change_flags(pointer: u64, change: impl Fn(u32) -> u32) {
     let modified = allocate_luid();
     let _ = update(pointer, |record| {
         let _ = body(pointer).token_flags.atomic().try_update(core::sync::atomic::Ordering::SeqCst, core::sync::atomic::Ordering::SeqCst, |flags| Some(change(flags)));
@@ -169,6 +175,13 @@ pub struct Token {
     pub kind: u32,
     pub session_id: u32,
     pub integrity: Sid,
+    /// O lugar do rótulo de integridade entre os grupos (o IntegrityLevelIndex
+    /// do NT menos a entrada do usuário; `usize::MAX` = depois do último
+    /// grupo, como o SeMakeSystemToken e o lsass o põem) e os atributos dele.
+    /// O rótulo vive em `integrity`; [`Token::groups_with_label`] o devolve
+    /// ao seu lugar nas listas de grupos que o NT serializa.
+    pub label_index: usize,
+    pub label_attributes: u32,
     pub groups: Vec<Group>,
     pub privileges: Vec<Privilege>,
     pub restricted_sids: Vec<Group>,
@@ -211,6 +224,23 @@ pub struct Token {
 
 /// O TOKEN_AUDIT_POLICY (o PerUserPolicy das subcategorias de auditoria).
 pub const TOKEN_AUDIT_POLICY_SIZE: usize = 0x1F;
+
+/// SE_GROUP_INTEGRITY | SE_GROUP_INTEGRITY_ENABLED: os atributos do rótulo
+/// de integridade do SeMakeSystemToken e do lsass.
+pub const LABEL_ATTRIBUTES: u32 = 0x60;
+
+impl Token {
+    /// Os grupos como o UserAndGroups do NT os guarda, sem o usuário: o
+    /// rótulo de integridade (quando o token tem um) entra no seu lugar,
+    /// com os seus atributos.
+    pub fn groups_with_label(&self) -> Vec<Group> {
+        let mut groups = self.groups.clone();
+        if !self.integrity.is_empty() {
+            groups.insert(self.label_index.min(groups.len()), Group { sid: self.integrity.clone(), attributes: self.label_attributes });
+        }
+        groups
+    }
+}
 
 struct Storage {
     pointer: u64,
@@ -405,6 +435,8 @@ pub fn create(parent: Option<u64>, initialize: Option<&dyn Fn(&mut Token)>) -> R
         kind: 1,
         session_id: parent.as_ref().map_or(0, |parent| parent.session_id),
         integrity: parent.as_ref().map_or_else(|| sid(16, &[0x4000]), |parent| parent.integrity.clone()),
+        label_index: parent.as_ref().map_or(usize::MAX, |parent| parent.label_index),
+        label_attributes: parent.as_ref().map_or(LABEL_ATTRIBUTES, |parent| parent.label_attributes),
         groups: parent.as_ref().map_or_else(
             || {
                 alloc::vec![
@@ -620,20 +652,31 @@ pub fn duplicate(source: u64, level: u32, effective_only: bool, token_type: u32)
         if effective_only {
             // SepMakeTokenEffectiveOnly conserva enabled, deny-only e integrity;
             // compacta trocando a entrada removida pela última, sem ordenar.
+            // O rótulo de integridade é uma dessas entradas no NT: anda com
+            // as trocas, e o lugar dele é o que sobra no fim.
+            let mut entries: Vec<(Group, bool)> = token.groups.drain(..).map(|group| (group, false)).collect();
+            if !token.integrity.is_empty() {
+                let at = token.label_index.min(entries.len());
+                entries.insert(at, (Group { sid: token.integrity.clone(), attributes: token.label_attributes }, true));
+            }
             let mut index = 0;
-            while index < token.groups.len() {
-                if token.groups[index].attributes & 0x34 != 0 {
+            while index < entries.len() {
+                if entries[index].0.attributes & 0x34 != 0 || entries[index].1 {
                     index += 1;
                     continue;
                 }
-                if token.groups[index].sid == token.owner {
+                if entries[index].0.sid == token.owner {
                     token.owner = token.user.clone();
                 }
-                let last = token.groups.pop().unwrap();
-                if index < token.groups.len() {
-                    token.groups[index] = last;
+                let last = entries.pop().unwrap();
+                if index < entries.len() {
+                    entries[index] = last;
                 }
             }
+            if let Some(at) = entries.iter().position(|(_, label)| *label) {
+                token.label_index = at;
+            }
+            token.groups = entries.into_iter().filter(|(_, label)| !label).map(|(group, _)| group).collect();
             token.privileges.retain(|privilege| privilege.attributes & 2 != 0);
         }
     });

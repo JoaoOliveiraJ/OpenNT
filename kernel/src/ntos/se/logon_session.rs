@@ -1,13 +1,14 @@
 //! Sessões de logon do Security Reference Monitor (SEP_LOGON_SESSION_
-//! REFERENCES): as referências dos tokens, o token de sessão, a notificação
-//! de término aos file systems e o SeSetSessionIdTokenWithLinked.
+//! REFERENCES): as referências dos tokens, o token de sessão, o par de
+//! sessões do UAC, a notificação de término aos file systems e o
+//! SeSetSessionIdTokenWithLinked.
 //!
 //! Como no NT, o banco de sessões nasce no SepRmDbInitialization (ntoskrnl
 //! 19041 rva 0xa6e540) com as duas sessões de boot, SYSTEM
 //! (SeSystemAuthenticationId, 0x3E7) e ANONYMOUS (SeAnonymousAuthenticationId,
 //! 0x3E6), ambas no silo hospedeiro, sem token de sessão e sem sessão irmã
-//! (BuddyLogonId, que o LSA liga pelo SepLinkLogonSessions e o OpenNT ainda
-//! não liga). No NT elas ficam presas pelos tokens permanentes do boot
+//! (BuddyLogonId, que o LSA liga pelo SepLinkLogonSessions, [`link_sessions`],
+//! quando divide um logon do UAC). No NT elas ficam presas pelos tokens permanentes do boot
 //! (SeSystemToken e SeAnonymousLogonToken); aqui a referência desses tokens
 //! entra já contada (ReferenceCount 1 com o bit de referência de token), e
 //! nenhuma das duas chega a zero. O LSA cria e apaga sessões pelos comandos
@@ -53,6 +54,15 @@
 //! de sessão (STATUS_NO_TOKEN) e devolve um handle (TOKEN_ALL_ACCESS) para
 //! uma cópia primária dele, de kernel quando o modo é KernelMode.
 //!
+//! O par do UAC: o SepLinkLogonSessions (rva 0x32c264; o TokenLinkedToken
+//! do NtSetInformationToken, `se/token/elevation.rs`) guarda em cada sessão
+//! uma cópia primária do seu token (o token de sessão, que deixa de
+//! referenciar a sessão) e o LogonId da outra; a do token completo ganha o
+//! Flags 2, a do filtrado o Flags 4, e a completa ganha uma referência a
+//! mais (SepReferenceLogonSession), que a filtrada solta quando sai
+//! (SepDeReferenceLogonSession do BuddyLogonId). Ligar um token à própria
+//! sessão só marca o Flags 4. O TokenElevationType sai desses Flags.
+//!
 //! SeSetSessionIdTokenWithLinked (rva 0x91c8b0): referencia o token pelo
 //! handle (TOKEN_QUERY, no modo anterior), recusa um token já em uso como
 //! primário de um processo (STATUS_TOKEN_ALREADY_IN_USE), procura a sessão
@@ -90,6 +100,10 @@ const TOKEN_IS_RESTRICTED: u32 = 0x10;
 /// um token.
 const SESSION_TERMINATION_NOTIFY: u32 = 0x1;
 const SESSION_TOKEN_REFERENCED: u32 = 0x8;
+/// Flags da sessão ligada pelo SepLinkLogonSessions: a do token completo e
+/// a do token filtrado.
+pub const SESSION_FULL_LINK: u32 = 0x2;
+pub const SESSION_LIMITED_LINK: u32 = 0x4;
 /// NonPagedPoolNx e 'SeFS'.
 const NON_PAGED_POOL_NX: u32 = 0x200;
 const NOTIFY_TAG: u32 = u32::from_le_bytes(*b"SeFS");
@@ -182,6 +196,138 @@ pub fn buddy_logon_id(logon_id: u64, server_silo: u64) -> u64 {
     find(logon_id, server_silo).map_or(0, |session| session.buddy_logon_id)
 }
 
+/// Os Flags de vínculo do UAC da sessão (SESSION_FULL_LINK e
+/// SESSION_LIMITED_LINK; 0 sem a sessão).
+pub fn link_flags(logon_id: u64, server_silo: u64) -> u32 {
+    find(logon_id, server_silo).map_or(0, |session| session.flags & (SESSION_FULL_LINK | SESSION_LIMITED_LINK))
+}
+
+/// A sessão já guarda um token de sessão.
+pub fn holds_session_token(logon_id: u64, server_silo: u64) -> bool {
+    find(logon_id, server_silo).is_some_and(|session| session.token != 0)
+}
+
+/// SepReferenceLogonSessionSilo sobre a entrada: o primeiro token herda a
+/// referência do LSA (liga o bit 8), os seguintes somam 1.
+fn reference_entry(session: &mut LogonSession) {
+    let referenced = session.flags & SESSION_TOKEN_REFERENCED != 0;
+    session.flags |= SESSION_TOKEN_REFERENCED;
+    if referenced {
+        session.reference_count += 1;
+    }
+}
+
+/// O SepReferenceLogonSessionSilo do BuddyLogonId da sessão (LogonId,
+/// silo), como o TokenLinkedToken faz: a sessão irmã referenciada e o token
+/// de sessão dela, com uma referência de objeto; devolve (LogonId da irmã,
+/// token). Sem a irmã, STATUS_NO_SUCH_LOGON_SESSION. A referência à sessão
+/// sai pelo [`dereference_direct`]. Uma irmã sem token de sessão não existe
+/// no NT (o SepLinkLogonSessions liga as duas com os tokens); aqui ela dá
+/// STATUS_NO_TOKEN.
+pub fn reference_linked_token(logon_id: u64, server_silo: u64) -> Result<(u64, u64), u32> {
+    let buddy = buddy_logon_id(logon_id, server_silo);
+    let token = with_sessions(|sessions| {
+        let Some(session) = sessions.iter_mut().find(|session| session.logon_id == buddy && session.server_silo == server_silo) else { return Err(STATUS_NO_SUCH_LOGON_SESSION) };
+        reference_entry(session);
+        // A referência de objeto é tomada sob a trava das sessões, que
+        // seguram o token de sessão (a trava dos tokens vem depois dela).
+        if session.token == 0 || tokens::retain(session.token).is_err() {
+            return Ok(None);
+        }
+        Ok(Some(session.token))
+    })?;
+    match token {
+        Some(token) => Ok((buddy, token)),
+        None => {
+            dereference_direct(buddy, server_silo);
+            Err(STATUS_NO_TOKEN)
+        }
+    }
+}
+
+/// O corpo do SepLinkLogonSessions (ntoskrnl 19041, rva 0x32c264) depois do
+/// privilégio, da sessão do token sem token de sessão e da referência ao
+/// token ligado (`se/token/elevation.rs`): `full` é o token completo (o do
+/// NtSetInformationToken) e `limited` o filtrado (o do handle).
+/// - a sessão do token ligado já com token de sessão é
+///   STATUS_INVALID_PARAMETER;
+/// - os dois tokens na mesma sessão: a sessão ganha o Flags 4 e o vínculo
+///   termina com sucesso;
+/// - algum dos dois que não é primário é STATUS_INVALID_PARAMETER;
+/// - uma cópia primária de cada um (SepDuplicateToken em KernelMode, sem
+///   descritor); a sessão do completo ganha uma referência no silo de
+///   servidor de quem chama (SepReferenceLogonSession), que a do filtrado
+///   segura;
+/// - cada sessão guarda a cópia do seu token e o LogonId da outra; a do
+///   completo ganha o Flags 2 e a do filtrado o Flags 4;
+/// - as duas cópias deixam de referenciar a sessão
+///   (SepStopReferencingLogonSession), que as segura.
+/// Uma falha solta as cópias já feitas. Devolve o NTSTATUS.
+pub fn link_sessions(full: u64, limited: u64) -> u32 {
+    let identity = |token: u64| tokens::with(token, |record| (record.authentication_id, record.server_silo, record.kind));
+    let (Some((full_id, full_silo, full_kind)), Some((limited_id, limited_silo, limited_kind))) = (identity(full), identity(limited)) else { return STATUS_INVALID_PARAMETER };
+    match find(limited_id, limited_silo) {
+        None => return STATUS_NO_SUCH_LOGON_SESSION,
+        Some(session) if session.token != 0 => return STATUS_INVALID_PARAMETER,
+        Some(_) => {}
+    }
+    if (full_id, full_silo) == (limited_id, limited_silo) {
+        with_sessions(|sessions| {
+            if let Some(session) = sessions.iter_mut().find(|session| session.logon_id == limited_id && session.server_silo == limited_silo) {
+                session.flags |= SESSION_LIMITED_LINK;
+            }
+        });
+        return 0;
+    }
+    if full_kind != 1 || limited_kind != 1 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let status_of = |error: KernelError| if error.status != 0 { error.status } else { STATUS_INSUFFICIENT_RESOURCES };
+    let full_copy = match tokens::duplicate(full, 0, false, 1) {
+        Ok(copy) => copy,
+        Err(error) => return status_of(error),
+    };
+    let limited_copy = match tokens::duplicate(limited, 0, false, 1) {
+        Ok(copy) => copy,
+        Err(error) => {
+            let _ = tokens::release(full_copy);
+            return status_of(error);
+        }
+    };
+    if !reference_for_token(full_id, crate::ntos::ps::silo::query::current_server_silo()) {
+        let _ = tokens::release(limited_copy);
+        let _ = tokens::release(full_copy);
+        return STATUS_NO_SUCH_LOGON_SESSION;
+    }
+    let (full_stored, limited_stored) = with_sessions(|sessions| {
+        let (mut full_stored, mut limited_stored) = (false, false);
+        for session in sessions.iter_mut() {
+            if session.logon_id == full_id && session.server_silo == full_silo {
+                session.token = full_copy;
+                session.buddy_logon_id = limited_id;
+                session.flags |= SESSION_FULL_LINK;
+                full_stored = true;
+            } else if session.logon_id == limited_id && session.server_silo == limited_silo {
+                session.token = limited_copy;
+                session.buddy_logon_id = full_id;
+                session.flags |= SESSION_LIMITED_LINK;
+                limited_stored = true;
+            }
+        }
+        (full_stored, limited_stored)
+    });
+    tokens::stop_referencing_logon_session(limited_copy);
+    tokens::stop_referencing_logon_session(full_copy);
+    // As cópias referenciam as sessões até aqui, então as duas existiam;
+    // uma cópia sem sessão que a guarde não fica viva.
+    for (stored, copy) in [(full_stored, full_copy), (limited_stored, limited_copy)] {
+        if !stored {
+            let _ = tokens::release(copy);
+        }
+    }
+    0
+}
+
 /// SepDeleteLogonSessionTrack (rva 0x77a490) sem a revogação de handles, o
 /// RmDeleteLogonSession do LSA: STATUS_NO_SUCH_LOGON_SESSION se a sessão não
 /// existe no silo; STATUS_BAD_LOGON_SESSION_STATE enquanto um token a
@@ -222,11 +368,7 @@ pub fn exists(logon_id: u64, server_silo: u64) -> bool {
 pub fn reference_for_token(logon_id: u64, server_silo: u64) -> bool {
     with_sessions(|sessions| {
         let Some(session) = sessions.iter_mut().find(|session| session.logon_id == logon_id && session.server_silo == server_silo) else { return false };
-        let referenced = session.flags & SESSION_TOKEN_REFERENCED != 0;
-        session.flags |= SESSION_TOKEN_REFERENCED;
-        if referenced {
-            session.reference_count += 1;
-        }
+        reference_entry(session);
         true
     })
 }
@@ -244,10 +386,12 @@ pub fn dereference_direct(logon_id: u64, server_silo: u64) {
 }
 
 /// SepDeReferenceLogonSession na destruição de um token: no zero a sessão
-/// sai do banco, o token de sessão é solto e, com a marca de término, os
-/// file systems são avisados. O aviso ao LSA que o 19041 dá em seguida (o
-/// SepInformLsaOfDeletedLogon) ainda não existe; o que ele precisa está em
-/// `se/reference_monitor.rs`.
+/// sai do banco; a do token filtrado de um par do UAC (Flags 4) solta a
+/// referência que segura na sessão irmã (o SepDeReferenceLogonSession do
+/// BuddyLogonId, quando não é zero); o token de sessão é solto e, com a
+/// marca de término, os file systems são avisados. O aviso ao LSA que o
+/// 19041 dá em seguida (o SepInformLsaOfDeletedLogon) ainda não existe; o
+/// que ele precisa está em `se/reference_monitor.rs`.
 pub fn dereference_for_token(logon_id: u64, server_silo: u64) {
     let removed = with_sessions(|sessions| {
         let position = sessions.iter().position(|session| session.logon_id == logon_id && session.server_silo == server_silo)?;
@@ -259,6 +403,9 @@ pub fn dereference_for_token(logon_id: u64, server_silo: u64) {
         Some(sessions.remove(position))
     });
     let Some(session) = removed else { return };
+    if session.flags & SESSION_LIMITED_LINK != 0 && session.buddy_logon_id != 0 {
+        dereference_for_token(session.buddy_logon_id, session.server_silo);
+    }
     if session.token != 0 {
         let _ = tokens::release(session.token);
     }

@@ -4597,7 +4597,15 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   TokenIntegrityLevel troca o nível do SID de integridade do token (subir
   pede o SeTcbPrivilege e um token sem uso; abaixo de High e de Medium os
   privilégios fora das máscaras do 19041 ficam desligados, mas presentes):
-  o dwminit do winlogon sobe assim o token da conta DWM-n para System. O CreateProcessAsUser passa o token no PS_ATTRIBUTE_TOKEN do
+  o dwminit do winlogon sobe assim o token da conta DWM-n para System. O
+  TokenPrivateNameSpace (o usermgr, com o SeTcbPrivilege) liga
+  TOKEN_PRIVATE_NAMESPACE. O rótulo de integridade fica à parte no
+  registro do token (`integrity`), mas com o lugar e os atributos que tinha
+  entre os grupos (`label_index`, `label_attributes`): o TokenGroups, o
+  TokenAccessInformation, o GroupCount do TOKEN_STATISTICS e o
+  TokenIntegrityLevel o mostram como o UserAndGroups do NT, e o
+  SepMakeTokenEffectiveOnly o move com os outros grupos. O TokenLogonSid
+  devolve o grupo SE_GROUP_LOGON_ID (ou STATUS_NOT_FOUND). O CreateProcessAsUser passa o token no PS_ATTRIBUTE_TOKEN do
   NtCreateUserProcess. Todo processo novo recebe como token primário o
   SeSubProcessToken (`tokens::sub_process_token`) do token pedido ou, sem
   ele, do primário do pai declarado (ou de quem cria): uma cópia com o
@@ -4623,6 +4631,32 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   do handle de origem. O dwminit do winlogon tira assim os privilégios do
   token da conta DWM-n, e o services.exe faz o token WRITE_RESTRICTED dos
   serviços de SID restrito.
+- **O par de tokens do UAC** (`se/token/elevation.rs`, `se/logon_session.rs`,
+  `ps/boot_phase.rs`): o TokenElevation é o do ntoskrnl 19041 (algum dos
+  privilégios de 0x11_2016_0684 presente, ou o usuário ou um grupo com RID
+  elevado pelo RtlIsElevatedRid), e o TokenElevationType sai dos Flags da
+  sessão de logon do token (4 Limited, 2 Full, senão Default). Com o UAC
+  ligado, o LsapBuildAndCreateToken do lsass divide um logon interativo
+  elevado: cria uma segunda sessão e um segundo token, filtra-o
+  (NtFilterToken com LUA_TOKEN), liga TokenVirtualizationAllowed (23, com o
+  SeCreateTokenPrivilege) nele e chama o TokenLinkedToken (19) do
+  NtSetInformationToken no token completo. Esse é o SepLinkLogonSessions:
+  cada sessão guarda uma cópia primária do seu token (que deixa de
+  referenciar a sessão) e o LogonId da outra, a completa ganha o Flags 2 e
+  uma referência a mais, que a filtrada (Flags 4) solta quando sai. O
+  TokenLinkedToken do NtQueryInformationToken devolve um handle para uma
+  cópia do token da sessão irmã: primária com o SeTcbPrivilege de quem
+  consulta, senão de impersonação em SecurityIdentification. O
+  TokenVirtualizationEnabled (24) só liga num token com
+  VIRTUALIZE_ALLOWED; o TokenUIAccess (26) pede o SeTcbPrivilege para
+  ligar. Os bits de UAC da KUSER_SHARED_DATA (DbgElevationEnabled,
+  DbgVirtEnabled, DbgInstallerDetectEnabled) vêm do PsBootPhaseComplete, no
+  fim do NtInitializeRegistry do smss: só com
+  `Control\LsaInformation\UACInstalled`, e cada um ligado a não ser que o
+  valor de `Policies\System` seja um REG_DWORD 0. As hives do xtask não têm o
+  UACInstalled, então o UAC fica desligado (o lsass também lê o
+  UACInstalled); a virtualização de Registro e de arquivos dos tokens com
+  VIRTUALIZE_ENABLED não existe.
 - **O servidor de comandos do Reference Monitor** (`se/reference_monitor.rs`
   sobre o lado servidor LPC de modo kernel de `alpc/lpc.rs`): o
   SeRmInitPhase1 cria a porta LPC `\SeRmCommandPort` (ZwCreatePort,

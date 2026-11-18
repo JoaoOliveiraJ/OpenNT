@@ -16276,6 +16276,7 @@ pub fn run(assert: Assert) {
     super::rtl_decompression::run(assert);
     super::rtl_strings_sids_exports::run(assert);
     super::security_session_exports::run(assert);
+    super::security_uac_tokens::run(assert);
     super::fsrtl_cc_file_exports::run(assert);
     super::ke_ex_po_io_exports::run(assert);
     debug_print!("PHASE6_SELFTEST_OK");

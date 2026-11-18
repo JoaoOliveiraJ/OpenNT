@@ -50,12 +50,13 @@ fn encode_token_user(record: &Token, base: u64) -> Vec<u8> {
 /// TOKEN_GROUPS = GroupCount@0 (+pad) e o array SID_AND_ATTRIBUTES@8; os
 /// corpos dos SIDs ficam depois do array, com ponteiros absolutos.
 fn encode_token_groups(record: &Token, base: u64) -> Vec<u8> {
-    let count = record.groups.len();
+    let groups = record.groups_with_label();
+    let count = groups.len();
     let mut sids_at = 8 + count * 16;
-    let total = sids_at + record.groups.iter().map(|group| group.sid.len()).sum::<usize>();
+    let total = sids_at + groups.iter().map(|group| group.sid.len()).sum::<usize>();
     let mut bytes = vec![0u8; total];
     bytes[0..4].copy_from_slice(&(count as u32).to_le_bytes());
-    for (index, group) in record.groups.iter().enumerate() {
+    for (index, group) in groups.iter().enumerate() {
         let entry = 8 + index * 16;
         bytes[entry..entry + 8].copy_from_slice(&(base + sids_at as u64).to_le_bytes());
         bytes[entry + 8..entry + 12].copy_from_slice(&group.attributes.to_le_bytes());
@@ -169,7 +170,10 @@ pub fn query_information(token: u64, class: u32, output: u64) -> Result<u32, Ker
     // Comprimento primeiro: a alocação precede os ponteiros absolutos.
     let length = match class {
         1 => 16 + record.user.len(),
-        2 => 8 + record.groups.len() * 16 + record.groups.iter().map(|group| group.sid.len()).sum::<usize>(),
+        2 => {
+            let groups = record.groups_with_label();
+            8 + groups.len() * 16 + groups.iter().map(|group| group.sid.len()).sum::<usize>()
+        }
         3 => 4 + record.privileges.len() * 12,
         4 => 8 + record.owner.len(),
         5 => 8 + record.primary_group.len(),

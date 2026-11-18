@@ -1101,7 +1101,7 @@ fn token_services(assert: Assert) {
     assert(matches!(query_token::query(handle, 10, output, 56, returned, 0), Ok(0)) && guest::read32(returned) == 56, "token: TokenStatistics");
     let record = tokens::get(system).unwrap();
     let statistics = unsafe { TokenStatistics::at(output) };
-    assert(luid(&statistics.token_id) == record.id && statistics.token_type.get() == 1 && statistics.group_count.get() == record.groups.len() as u32 && luid(&statistics.modified_id) == record.modified_id, "token: campos de TOKEN_STATISTICS");
+    assert(luid(&statistics.token_id) == record.id && statistics.token_type.get() == 1 && statistics.group_count.get() == record.groups_with_label().len() as u32 && luid(&statistics.modified_id) == record.modified_id, "token: campos de TOKEN_STATISTICS");
     let (charged, available) = tokens::accounting(system).unwrap_or((0, 0));
     assert(statistics.dynamic_charged.get() as u64 == charged && statistics.dynamic_available.get() as u64 == available, "token: memoria dinamica do token");
     assert(matches!(query_token::query(handle, 10, output, 8, returned, 0), Ok(0xC000_0023)) && guest::read32(returned) == 56, "token: buffer pequeno informa o tamanho");

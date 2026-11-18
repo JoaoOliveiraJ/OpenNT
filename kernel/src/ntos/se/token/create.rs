@@ -199,6 +199,9 @@ pub struct Shaped {
     pub groups: Vec<Group>,
     /// O SID do grupo de integridade; `None` é o IntegrityLevelIndex -1.
     pub integrity: Option<Sid>,
+    /// O lugar do grupo de integridade entre os grupos (o índice que ele
+    /// tinha) e os atributos dele.
+    pub label: Option<(usize, u32)>,
     /// Em ordem de LUID (o bitmap do NT), com ENABLED e ENABLED_BY_DEFAULT
     /// já mascarados pelo nível.
     pub privileges: Vec<Privilege>,
@@ -334,8 +337,10 @@ pub fn shape(user: &Sid, user_attributes: u32, mut groups: Vec<Group>, privilege
     if level.is_some_and(|level| level < SECURITY_MANDATORY_MEDIUM_RID) {
         keep_enabled(BELOW_MEDIUM_PRIVILEGES);
     }
-    let integrity_sid = integrity.map(|(index, _)| groups.remove(index).sid);
-    Ok(Shaped { groups, integrity: integrity_sid, privileges: shaped_privileges, owner: owner.cloned().unwrap_or_else(|| user.clone()), token_flags })
+    let removed = integrity.map(|(index, _)| (index, groups.remove(index)));
+    let label = removed.as_ref().map(|(index, group)| (*index, group.attributes));
+    let integrity_sid = removed.map(|(_, group)| group.sid);
+    Ok(Shaped { groups, integrity: integrity_sid, label, privileges: shaped_privileges, owner: owner.cloned().unwrap_or_else(|| user.clone()), token_flags })
 }
 
 /// NtCreateTokenEx de `mode` (0 KernelMode, 1 UserMode); devolve o NTSTATUS.
@@ -413,6 +418,10 @@ pub fn create(request: &Request, mode: u8) -> Result<u32, KernelError> {
         // Sem grupo de integridade, o rótulo fica vazio: as consultas e a
         // verificação de acesso o tratam como Untrusted (S-1-16-0).
         token.integrity = shaped.integrity.clone().unwrap_or_default();
+        if let Some((index, attributes)) = shaped.label {
+            token.label_index = index;
+            token.label_attributes = attributes;
+        }
         token.groups = shaped.groups.clone();
         token.privileges = shaped.privileges.clone();
         token.restricted_sids = Vec::new();

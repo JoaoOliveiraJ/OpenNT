@@ -30,6 +30,9 @@ const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
 const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
 const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+const STATUS_NOT_FOUND: u32 = 0xC000_0225;
+/// SE_GROUP_LOGON_ID.
+const SE_GROUP_LOGON_ID: u32 = 0xC000_0000;
 /// TokenAccessInformation.
 const TOKEN_ACCESS_INFORMATION_CLASS: u32 = 22;
 /// TokenFlags: TOKEN_WRITE_RESTRICTED, TOKEN_IS_RESTRICTED e TOKEN_IS_FILTERED.
@@ -86,6 +89,11 @@ pub fn query(handle: u64, information_class: u32, output: u64, length: u32, retu
     if information_class > 48 || REJECTED_CLASSES.contains(&information_class) {
         return Ok(STATUS_INVALID_INFO_CLASS);
     }
+    if information_class == TOKEN_ELEVATION_CLASS {
+        if let Some(status) = elevation_length(length, returned, from_user_mode) {
+            return Ok(status);
+        }
+    }
     // TokenSource pede TOKEN_QUERY_SOURCE; as demais classes, TOKEN_QUERY.
     let desired = if information_class == 7 { 0x10 } else { 8 };
     let mut reference = match token_reference::reference(handle, desired, access_mode, true)? {
@@ -95,7 +103,7 @@ pub fn query(handle: u64, information_class: u32, output: u64, length: u32, retu
     let result = if information_class == 10 {
         statistics(reference.token, output, length, returned, from_user_mode)
     } else if information_class == TOKEN_LINKED_TOKEN_CLASS {
-        linked_token(reference.token, length, returned, from_user_mode)
+        linked_token(reference.token, output, length, returned, from_user_mode)
     } else {
         Ok(write_encoded(encode(reference.token, information_class, output), output, length, returned, from_user_mode))
     };
@@ -103,36 +111,68 @@ pub fn query(handle: u64, information_class: u32, output: u64, length: u32, retu
     result
 }
 
-/// TokenLinkedToken.
+/// TokenLinkedToken e TokenElevation.
 const TOKEN_LINKED_TOKEN_CLASS: u32 = 19;
+pub const TOKEN_ELEVATION_CLASS: u32 = 20;
 const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
-const STATUS_NO_SUCH_LOGON_SESSION: u32 = 0xC000_005F;
+/// SeTcbPrivilege.
+const SE_TCB_PRIVILEGE: u64 = 7;
+/// TOKEN_ALL_ACCESS e OBJ_KERNEL_HANDLE: o handle do token ligado.
+const TOKEN_ALL_ACCESS: u32 = 0xF_01FF;
+const OBJ_KERNEL_HANDLE: u32 = 0x200;
+
+/// TokenElevation (o ramo da classe 20 do NtQueryInformationToken 19041,
+/// rva 0x6d21ee): o ReturnLength recebe 4 e outro Length dá
+/// STATUS_INFO_LENGTH_MISMATCH antes da referência ao token. `None` segue
+/// para a consulta.
+pub fn elevation_length(length: u32, returned: u64, from_user_mode: bool) -> Option<u32> {
+    if !writable(returned, 4, from_user_mode) || guest::try_write::<u32>(returned, 4).is_err() {
+        return Some(STATUS_ACCESS_VIOLATION);
+    }
+    (length != 4).then_some(STATUS_INFO_LENGTH_MISMATCH)
+}
 
 /// TokenLinkedToken (o ramo da classe 19 do NtQueryInformationToken 19041,
 /// rva 0x6d1f0b), depois da referência com TOKEN_QUERY: o ReturnLength
 /// recebe 8 antes de tudo; outro Length dá STATUS_INFO_LENGTH_MISMATCH. O
-/// token ligado é o da sessão irmã da sessão de logon do token (o
-/// SepReferenceLogonSessionSilo do BuddyLogonId); sem ela,
-/// STATUS_NO_SUCH_LOGON_SESSION, o status que o winlogon e o lsm esperam de
-/// um token sem par de UAC. O OpenNT não tem o modo S sem administrador
-/// (o outro ramo do mesmo status), e os comandos do LSA ainda não ligam
-/// sessões irmãs (`se/logon_session.rs`): o par de tokens de UAC, que o
-/// NT duplica (SepDuplicateToken) e devolve num handle novo, não existe.
-pub fn linked_token(token: u64, length: u32, returned: u64, from_user_mode: bool) -> Result<u32, KernelError> {
-    use crate::ntos::se::logon_session;
+/// SeTcbPrivilege de quem consulta, no modo anterior, escolhe o tipo da
+/// cópia do token ligado (`elevation::linked_token_copy`: sem sessão irmã,
+/// STATUS_NO_SUCH_LOGON_SESSION). A cópia ganha um handle
+/// (ObInsertObject com TOKEN_ALL_ACCESS, de kernel em KernelMode), gravado
+/// no TOKEN_LINKED_TOKEN; se a gravação falha, o handle é fechado. O OpenNT
+/// não tem o modo S sem administrador (o outro ramo de
+/// STATUS_NO_SUCH_LOGON_SESSION).
+pub fn linked_token(token: u64, output: u64, length: u32, returned: u64, from_user_mode: bool) -> Result<u32, KernelError> {
+    use crate::ntos::se::privilege;
+    use crate::ntos::se::token::{elevation, handles};
     if !writable(returned, 4, from_user_mode) || guest::try_write::<u32>(returned, 8).is_err() {
         return Ok(STATUS_ACCESS_VIOLATION);
     }
     if length != 8 {
         return Ok(STATUS_INFO_LENGTH_MISMATCH);
     }
-    let Some((logon_id, server_silo)) = tokens::with(token, |record| (record.authentication_id, record.server_silo)) else { return Ok(STATUS_INVALID_HANDLE) };
-    let buddy = logon_session::buddy_logon_id(logon_id, server_silo);
-    if buddy == 0 || !logon_session::exists(buddy, server_silo) {
-        return Ok(STATUS_NO_SUCH_LOGON_SESSION);
+    let tcb = privilege::single_privilege_check(SE_TCB_PRIVILEGE, from_user_mode as u32);
+    let copy = match elevation::linked_token_copy(token, tcb) {
+        Ok(copy) => copy,
+        Err(status) => return Ok(status),
+    };
+    let attributes = if from_user_mode { 0 } else { OBJ_KERNEL_HANDLE };
+    let created = handles::create(copy, TOKEN_ALL_ACCESS, attributes, from_user_mode);
+    tokens::release(copy)?;
+    let handle = match created {
+        Ok(handle) => handle,
+        Err(error) if error.status != 0 => return Ok(error.status),
+        Err(error) => return Err(error),
+    };
+    if !writable(output, 8, from_user_mode) || guest::try_write::<u64>(output, handle).is_err() {
+        if from_user_mode {
+            let _ = crate::ntos::ps::user::state::close_user_handle(handle, true, true);
+        } else {
+            let _ = handles::close_native(handle);
+        }
+        return Ok(STATUS_ACCESS_VIOLATION);
     }
-    crate::debug_print!("[token] TokenLinkedToken com sessao irma {:#x}: duplicacao do token ligado sem suporte", buddy);
-    Ok(crate::ntos::inc::status::STATUS_NOT_IMPLEMENTED)
+    Ok(0)
 }
 
 /// TOKEN_STATISTICS na saída do chamador, sondada campo a campo.
@@ -237,7 +277,9 @@ pub fn encode(token_pointer: u64, class: u32, base: u64) -> Result<Vec<u8>, u32>
             layout.append_sid(0, &token.user);
             layout.u32(8, token.user_attributes);
         }
-        2 => layout.groups(&token.groups),
+        // TokenGroups: os grupos com o rótulo de integridade no seu lugar
+        // (o UserAndGroups do NT sem o usuário).
+        2 => layout.groups(&token.groups_with_label()),
         3 => {
             layout.reserve(4 + token.privileges.len() * 12);
             layout.u32(0, token.privileges.len() as u32);
@@ -298,7 +340,16 @@ pub fn encode(token_pointer: u64, class: u32, base: u64) -> Result<Vec<u8>, u32>
         10 => return token_statistics::encode(token_pointer).map(|bytes| bytes.to_vec()).map_err(|error| if error.status != 0 { error.status } else { 0xC000_0001 }),
         11 => layout.groups(&token.restricted_sids),
         TOKEN_ACCESS_INFORMATION_CLASS => return access_information(&token, base),
-        28 | 37 | 38 => layout.groups(&[]),
+        // TokenLogonSid (0x6d28d1): a primeira entrada do UserAndGroups (o
+        // usuário primeiro) com SE_GROUP_LOGON_ID, num TOKEN_GROUPS de uma
+        // entrada; sem ela, STATUS_NOT_FOUND sem ReturnLength.
+        28 => {
+            let user = Group { sid: token.user.clone(), attributes: token.user_attributes };
+            let all = token.groups_with_label();
+            let Some(logon) = core::iter::once(&user).chain(all.iter()).find(|group| group.attributes & SE_GROUP_LOGON_ID == SE_GROUP_LOGON_ID) else { return Err(STATUS_NOT_FOUND) };
+            layout.groups(core::slice::from_ref(logon));
+        }
+        37 | 38 => layout.groups(&[]),
         30 => layout.groups(&token.capabilities),
         29 => layout.scalar(token.app_container.is_some() as u32),
         12 => layout.scalar(token.session_id),
@@ -307,16 +358,16 @@ pub fn encode(token_pointer: u64, class: u32, base: u64) -> Result<Vec<u8>, u32>
             layout.reserve(8);
             layout.u64(0, token.originating_logon_session);
         }
-        // TokenElevationTypeDefault: sem token vinculado ou filtrado.
-        18 => layout.scalar(1),
+        // TokenElevationType e TokenElevation (`se/token/elevation.rs`).
+        18 => layout.scalar(crate::ntos::se::token::elevation::elevation_type(&token)),
         19 => return Err(STATUS_INVALID_PARAMETER),
-        // Contexto LocalSystem de boot.
-        20 => layout.scalar(1),
-        // TOKEN_MANDATORY_LABEL: sem grupo de integridade (IntegrityLevelIndex
-        // -1), o SepCopyTokenIntegrity devolve o SeUntrustedMandatorySid.
+        TOKEN_ELEVATION_CLASS => layout.scalar(crate::ntos::se::token::elevation::is_elevated(&token) as u32),
+        // TOKEN_MANDATORY_LABEL: o SepCopyTokenIntegrity copia o SID e os
+        // atributos do grupo de integridade; sem ele (IntegrityLevelIndex
+        // -1), o SeUntrustedMandatorySid.
         25 => {
             layout.reserve(16);
-            layout.u32(8, SE_GROUP_INTEGRITY);
+            layout.u32(8, if token.integrity.is_empty() { SE_GROUP_INTEGRITY } else { token.label_attributes });
             let untrusted = crate::ntos::se::model::sid(16, &[0]);
             layout.append_sid(0, if token.integrity.is_empty() { &untrusted } else { &token.integrity });
         }
@@ -443,14 +494,11 @@ impl Image {
 
 /// TOKEN_ACCESS_INFORMATION com o bloco que o segue, montado para `base`.
 fn access_information(token: &Token, base: u64) -> Result<Vec<u8>, u32> {
-    // UserAndGroups: o usuário, os grupos e o rótulo de integridade, que no
-    // token do NT é um grupo SE_GROUP_INTEGRITY (ausente num token criado
-    // sem ele).
+    // UserAndGroups: o usuário e os grupos com o rótulo de integridade no
+    // seu lugar (ausente num token criado sem ele).
+    let labeled = token.groups_with_label();
     let mut groups: Vec<(&Sid, u32)> = alloc::vec![(&token.user, token.user_attributes)];
-    groups.extend(token.groups.iter().map(|group| (&group.sid, group.attributes)));
-    if !token.integrity.is_empty() {
-        groups.push((&token.integrity, SE_GROUP_INTEGRITY));
-    }
+    groups.extend(labeled.iter().map(|group| (&group.sid, group.attributes)));
     let restricted: Vec<(&Sid, u32)> = token.restricted_sids.iter().map(|group| (&group.sid, group.attributes)).collect();
     let capabilities: Vec<(&Sid, u32)> = token.capabilities.iter().map(|group| (&group.sid, group.attributes)).collect();
     let mut privileges: Vec<(u64, u32)> = token.privileges.iter().filter(|privilege| privilege.id < PRIVILEGE_BITS).map(|privilege| (privilege.id, privilege.attributes & 3)).collect();

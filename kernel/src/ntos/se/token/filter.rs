@@ -47,7 +47,7 @@ use crate::ntos::se::capture;
 use crate::ntos::se::model::{sid, Group, Sid};
 use crate::ntos::se::security_attributes;
 use crate::ntos::se::sid as sids;
-use crate::ntos::se::token::{capability_access, duplicate, handles as token_handles, reference as token_reference, thread as thread_tokens, tokens};
+use crate::ntos::se::token::{capability_access, duplicate, elevation, handles as token_handles, reference as token_reference, thread as thread_tokens, tokens};
 use crate::rtl::KernelError;
 
 pub const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
@@ -81,11 +81,10 @@ const DENY_ONLY: u32 = 0x10;
 const SKIPPED_GROUPS: u32 = 0x30;
 /// SeChangeNotifyPrivilege.
 const CHANGE_NOTIFY: u64 = 23;
-/// Máscaras de privilégios do LUA (com e sem grupo de RID elevado).
+/// Máscaras de privilégios do LUA (com e sem grupo de RID elevado): sem
+/// grupo elevado, todos menos os que tornam o token elevado.
 const LUA_ELEVATED_MASK: u64 = 0x6_0288_0000;
-const LUA_MASK: u64 = 0xFFFF_FFEE_DFE9_F97B;
-/// RIDs elevados do RtlIsElevatedRid (tabela 0x18530).
-const ELEVATED_RIDS: [u32; 19] = [512, 516, 521, 498, 517, 518, 519, 520, 544, 547, 548, 549, 550, 551, 553, 554, 556, 569, 114];
+const LUA_MASK: u64 = !elevation::ELEVATED_PRIVILEGES;
 
 /// SID_AND_ATTRIBUTES[] de um TOKEN_GROUPS (ou vazio).
 fn groups(pointer: u64) -> Vec<(Sid, u32)> {
@@ -109,17 +108,6 @@ fn privileges(pointer: u64) -> Vec<u32> {
 /// revisão 1, autoridade 15 e pelo menos duas subautoridades.
 fn is_app_package_identifier(identifier: &[u8], first: u32) -> bool {
     identifier.len() >= 12 && identifier[0] == 1 && identifier[1] >= 2 && identifier[2..8] == [0, 0, 0, 0, 0, 15] && u32::from_le_bytes([identifier[8], identifier[9], identifier[10], identifier[11]]) == first
-}
-
-/// RtlIsElevatedRid: grupo normal, primeira subautoridade fora de 80..=111
-/// (SIDs de serviço) e o último RID na tabela.
-fn is_elevated(identifier: &[u8], attributes: u32) -> bool {
-    let count = identifier.get(1).copied().unwrap_or(0) as usize;
-    if attributes & SKIPPED_GROUPS != 0 || count == 0 || identifier.len() < 8 + count * 4 {
-        return false;
-    }
-    let sub = |index: usize| u32::from_le_bytes([identifier[8 + index * 4], identifier[9 + index * 4], identifier[10 + index * 4], identifier[11 + index * 4]]);
-    !(80..=111).contains(&sub(0)) && ELEVATED_RIDS.contains(&sub(count - 1))
 }
 
 /// SeIsSystemContext do token primário de quem chama: o acesso 1 do
@@ -190,7 +178,7 @@ fn filter(existing: u64, flags: u32, disable: &[(Sid, u32)], delete: &[u32], res
         let mut elevated = false;
         let mut deny = |identifier: &Sid, attributes: &mut u32| -> bool {
             let listed = *attributes & SKIPPED_GROUPS == 0 && disable.iter().any(|(entry, _)| entry == identifier);
-            let lua = !listed && flags & LUA_TOKEN != 0 && is_elevated(identifier, *attributes);
+            let lua = !listed && flags & LUA_TOKEN != 0 && elevation::is_elevated_rid(identifier, *attributes);
             elevated |= lua;
             if listed || lua {
                 *attributes = (*attributes & !0xF) | DENY_ONLY;

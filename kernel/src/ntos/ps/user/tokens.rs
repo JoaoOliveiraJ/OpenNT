@@ -230,13 +230,19 @@ fn nt_query_information_token(handle: u64, class: u64, out: u64, length: u64, rs
     if class == 10 {
         return query_token::query_user(rsp);
     }
+    // TokenElevation confere o tamanho antes do handle.
+    if class == query_token::TOKEN_ELEVATION_CLASS {
+        if let Some(status) = query_token::elevation_length(length as u32, stack_arg(rsp, 5), true) {
+            return Ok(status);
+        }
+    }
     let token = match lookup(handle, if class == 7 { 0x10 } else { 8 }) {
         Ok(token) => token,
         Err(status) => return Ok(status),
     };
     // TokenLinkedToken (`se/token/query`).
     if class == 19 {
-        return query_token::linked_token(token, length as u32, stack_arg(rsp, 5), true);
+        return query_token::linked_token(token, out, length as u32, stack_arg(rsp, 5), true);
     }
     Ok(write_result(query_token::encode(token, class, out), out, length as u32, stack_arg(rsp, 5)))
 }
@@ -502,6 +508,54 @@ fn nt_privileged_service_audit_alarm(_subsystem: u64, service: u64, client_token
 }
 
 
+/// NtPrivilegeObjectAuditAlarm(SubsystemName, HandleId, ClientToken,
+/// DesiredAccess, Privileges, AccessGranted), na ordem do 19041: o
+/// SeAuditPrivilege de quem chama, o token do cliente pelo handle com
+/// TOKEN_QUERY (sem os pseudo-handles), o nível de impersonação dele, o
+/// SubsystemName e o PRIVILEGE_SET; o alarme é `se::audit`.
+fn nt_privilege_object_audit_alarm(subsystem: u64, handle_id: u64, client_token: u64, desired: u64, rsp: u64) -> Result<u32, KernelError> {
+    use crate::ntos::se::audit;
+    let privileges = stack_arg(rsp, 5);
+    let granted = stack_arg(rsp, 6) as u8 != 0;
+    if !crate::ntos::se::privilege::audit_privilege_check(1) {
+        return Ok(0xC000_0061);
+    }
+    // O ObReferenceObjectByHandle não conhece os pseudo-handles de token.
+    let handle = token_argument(3, client_token);
+    if (-6..=-4).contains(&(handle as i64)) {
+        return Ok(0xC000_0008);
+    }
+    let token = match lookup(handle, 8) {
+        Ok(token) => token,
+        Err(status) => return Ok(status),
+    };
+    let status = (|| {
+        let Some((kind, level)) = tokens::with(token, |token| (token.kind, token.impersonation_level)) else { return 0xC000_0008 };
+        if kind == 2 && level < 1 {
+            return 0xC000_00A5;
+        }
+        if subsystem == 0 || !probe_user_read(subsystem, UnicodeString::SIZE) {
+            return 0xC000_0005;
+        }
+        let subsystem_name = crate::ntos::rtl::guest_strings::read_unicode_string(subsystem);
+        if privileges & 3 != 0 {
+            return 0x8000_0002;
+        }
+        if !probe_user_read(privileges, 4) {
+            return 0xC000_0005;
+        }
+        let count = guest::try_read::<u32>(privileges).unwrap_or(0);
+        if count > audit::MAX_ALARM_PRIVILEGES {
+            return 0xC000_000D;
+        }
+        if !probe_user_read(privileges, 8 + count as u64 * 12) {
+            return 0xC000_0005;
+        }
+        audit::privilege_object_audit_alarm_service(&subsystem_name, handle_id, desired as u32, count, granted)
+    })();
+    Ok(status)
+}
+
 /// NtCloseObjectAuditAlarm e NtDeleteObjectAuditAlarm(SubsystemName,
 /// HandleId, GenerateOnClose): o SubsystemName sondado só com
 /// GenerateOnClose; o alarme é `se::audit`.
@@ -561,6 +615,7 @@ fn nt_delete_object_audit_alarm(subsystem: u64, handle_id: u64, generate_on_clos
 
 pub fn init() {
     state::register_handler("NtPrivilegedServiceAuditAlarm", nt_privileged_service_audit_alarm);
+    state::register_handler("NtPrivilegeObjectAuditAlarm", nt_privilege_object_audit_alarm);
     state::register_handler("NtCloseObjectAuditAlarm", nt_close_object_audit_alarm);
     state::register_handler("NtAccessCheckAndAuditAlarm", nt_access_check_and_audit_alarm);
     state::register_handler("NtAccessCheckByTypeAndAuditAlarm", nt_access_check_by_type_and_audit_alarm);

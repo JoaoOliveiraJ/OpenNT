@@ -287,7 +287,8 @@ const BOOT_FLAG_SYNC_BACKUP: u16 = 0x13E8;
 ///   CmCompleteRegistryInitialization: uma vez só (depois
 ///   STATUS_ACCESS_DENIED). No NT ele liga a SOFTWARE, a SAM, a SECURITY e
 ///   a DEFAULT e inicia os escritores preguiçosos (CmpCmdInit); no OpenNT a
-///   fase 1 já fez isso (`initialize_hives`);
+///   fase 1 já fez isso (`initialize_hives`). Ele termina no
+///   PsBootPhaseComplete (`ps/boot_phase.rs`, os bits do UAC);
 /// - o resto é STATUS_INVALID_PARAMETER.
 pub fn initialize_registry(boot_condition: u16, previous_mode: u8) -> u32 {
     if previous_mode != 0 && boot_condition == BOOT_FLAG_SYNC_BACKUP {
@@ -314,6 +315,9 @@ pub fn initialize_registry(boot_condition: u16, previous_mode: u8) -> u32 {
         }
         0 | 1 => {
             if FIRST_TIME.swap(false, Ordering::AcqRel) {
+                // O CmCompleteRegistryInitialization termina no
+                // PsBootPhaseComplete (os bits do UAC).
+                crate::ntos::ps::boot_phase::complete();
                 0
             } else {
                 STATUS_ACCESS_DENIED

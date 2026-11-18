@@ -26,7 +26,9 @@ pub fn fields(token: u64) -> Result<Vec<(u64, u8, u64)>, KernelError> {
         (at(offset_of!(TokenStatistics, impersonation_level)), 4, record.impersonation_level as u64),
         (at(offset_of!(TokenStatistics, dynamic_charged)), 4, charged),
         (at(offset_of!(TokenStatistics, dynamic_available)), 4, available),
-        (at(offset_of!(TokenStatistics, group_count)), 4, record.groups.len() as u64),
+        // GroupCount: o UserAndGroupCount menos o usuário (o rótulo de
+        // integridade conta).
+        (at(offset_of!(TokenStatistics, group_count)), 4, record.groups_with_label().len() as u64),
         (at(offset_of!(TokenStatistics, privilege_count)), 4, record.privileges.len() as u64),
         (at(offset_of!(TokenStatistics, modified_id)), 8, record.modified_id),
     ])
