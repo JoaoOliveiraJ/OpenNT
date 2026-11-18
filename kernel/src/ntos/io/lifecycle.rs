@@ -292,7 +292,7 @@ fn load_driver_inner(file_path: &str, name: &str, object_name: &str, options: &D
     if load.image_name.is_none() {
         load.image_name = Some(system_driver_path(file_path));
     }
-    let image = pe_loader::load_from_source(source, &load)?;
+    let image = pe_loader::load_from_source(source, &load)?.drop_import_report();
     let (image_base, size_of_image, entry_point) = (image.image_base, image.size_of_image, image.entry_point);
     let exports = image.exports.exports.clone();
     let driver = match begin_driver(name, object_name, image_base, size_of_image, entry_point) {

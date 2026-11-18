@@ -21,6 +21,8 @@ use crate::hal::physical;
 use crate::rtl::{KernelError, SharedLock, SpinLock};
 
 const STATUS_NOT_A_DIRECTORY: u32 = 0xC000_0103;
+/// Maior leitura de setores de um `read_range` por vez (múltiplo de 512).
+const READ_RANGE_CHUNK: u64 = 64 * 1024;
 /// Primeiro registro de arquivo de usuário (os anteriores são do sistema).
 const FIRST_USER_RECORD: u64 = 16;
 
@@ -738,13 +740,19 @@ impl Ntfs {
                 file_sector_base += run.sectors;
                 continue;
             }
-            let from = want.max(run_start);
+            // Em pedaços de até 64 KiB: o buffer de saída é o único do
+            // tamanho do pedido.
+            let mut from = want.max(run_start);
             let to = (offset + length).min(run_end);
-            let lba = run.lba + (from - run_start) / 512;
-            let skip = ((from - run_start) % 512) as usize;
-            let sectors = (skip as u64 + (to - from)).div_ceil(512);
-            let chunk = self.read_sectors(lba, sectors)?;
-            out.extend_from_slice(&chunk[skip..skip + (to - from) as usize]);
+            while from < to {
+                let lba = run.lba + (from - run_start) / 512;
+                let skip = ((from - run_start) % 512) as usize;
+                let take = (to - from).min(READ_RANGE_CHUNK - skip as u64);
+                let sectors = (skip as u64 + take).div_ceil(512);
+                let chunk = self.read_sectors(lba, sectors)?;
+                out.extend_from_slice(&chunk[skip..skip + take as usize]);
+                from += take;
+            }
             if out.len() as u64 >= length {
                 break;
             }

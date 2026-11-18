@@ -137,7 +137,7 @@ pub fn of_section(section: &Arc<Section>, name: &str) -> Result<Result<Arc<Image
         None => {
             let source: Arc<dyn ImageSource> = Arc::new(SegmentSource { name: String::from(name), file });
             let options = LoadOptions { user_space: true, prototype: true, skip_imports: true, skip_relocations: true, skip_security_cookie: true, notify_image: false, no_execute: section.no_execute, ..LoadOptions::default() };
-            let image = match pe_loader::load_from_source(source, &options) {
+            let mut image = match pe_loader::load_from_source(source, &options) {
                 Ok(image) => image,
                 Err(error) if error.status != crate::ntos::inc::status::STATUS_UNSUCCESSFUL => return Ok(Err(error.status)),
                 Err(error) => {
@@ -145,7 +145,10 @@ pub fn of_section(section: &Arc<Section>, name: &str) -> Result<Result<Arc<Image
                     return Ok(Err(if error.message.contains("PFN") { STATUS_INSUFFICIENT_RESOURCES } else { 0xC000_007B }));
                 }
             };
-            let created = Arc::new(ImageSegment { key: key.clone(), frames: image.pages.clone(), protections: image.page_protects.clone(), preferred_base: image.preferred_base, size_of_image: image.size_of_image, image: SpinLock::new(Some(image)) });
+            // Os vetores passam para a control area (a carga guardada só
+            // devolve os frames, pela lista própria dela).
+            let (frames, protections) = (core::mem::take(&mut image.pages), core::mem::take(&mut image.page_protects));
+            let created = Arc::new(ImageSegment { key: key.clone(), frames, protections, preferred_base: image.preferred_base, size_of_image: image.size_of_image, image: SpinLock::new(Some(image)) });
             // Outra seção do mesmo arquivo pode ter montado a dela enquanto
             // esta lia o arquivo: fica a primeira, e esta volta ao PFN.
             let mut segments = SEGMENTS.lock();

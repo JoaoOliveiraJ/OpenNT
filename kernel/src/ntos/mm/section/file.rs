@@ -150,23 +150,34 @@ impl SectionFile for CapturedFile {
         true
     }
 
+    /// Direto do volume para os frames (o arquivo aberto pelo kernel ou o de
+    /// um FILE_OBJECT de usuário sobre o volume); só bytes desligados ou uma
+    /// fonte sem volume passam por buffer, uma página por vez, nunca a faixa
+    /// inteira no heap.
     fn copy_to_physical(&self, offset: u64, address: u64, length: u64) -> Result<(), KernelError> {
-        let detached = file_lifetime::read_detached(self.backing_reference.load(Ordering::Acquire), offset as usize, length as usize);
-        if detached.is_none() {
-            if let Some((volume, path)) = &self.backing {
-                if let Some(result) = volume.copy_range_to_physical(path, offset, address, length) {
-                    return result;
-                }
+        if file_lifetime::read_detached(self.backing_reference.load(Ordering::Acquire), 0, 0).is_none() {
+            let direct = match (&self.backing, &self.source) {
+                (Some((volume, path)), _) => volume.copy_range_to_physical(path, offset, address, length),
+                (None, Some(source)) => match (source.volume(), source.volume_path()) {
+                    (Some(volume), Some(path)) => volume.copy_range_to_physical(&path, offset, address, length),
+                    _ => None,
+                },
+                (None, None) => None,
+            };
+            if let Some(result) = direct {
+                return result;
             }
         }
-        let data = match detached {
-            Some(data) => data,
-            None => self.read_at(offset, length)?,
-        };
-        if data.len() as u64 != length {
-            return Err(KernelError::with_status("short section read", 0xC000_0185));
+        let mut done = 0u64;
+        while done < length {
+            let take = (0x1000 - (address + done) % 0x1000).min(length - done);
+            let data = self.read_at(offset + done, take)?;
+            if data.len() as u64 != take {
+                return Err(KernelError::with_status("short section read", 0xC000_0185));
+            }
+            physical::write_bytes(address + done, &data);
+            done += take;
         }
-        physical::write_bytes(address, &data);
         Ok(())
     }
 

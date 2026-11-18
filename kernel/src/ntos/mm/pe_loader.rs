@@ -473,6 +473,14 @@ impl PeImage {
     pub fn release(&mut self) -> Result<(), KernelError> {
         self.owned.release()
     }
+
+    /// A imagem que fica carregada não guarda o relatório dos imports
+    /// resolvidos (a IAT já tem os endereços): só quem carrega e confere na
+    /// hora o lê.
+    pub fn drop_import_report(mut self) -> PeImage {
+        self.resolved_imports = Vec::new();
+        self
+    }
 }
 
 /// Fonte do arquivo entregue às notificações de imagem.
@@ -764,10 +772,13 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
                 }
                 continue;
             }
+            // Sem cópia direta: uma página por leitura, direto no frame dela
+            // (nenhum buffer do tamanho da seção no heap).
             let mut copied = 0u64;
             while copied < raw_size {
-                let chunk = (raw_size - copied).min(0x40_0000);
-                mapping.write(virtual_address + copied, &source.read_bytes(raw_pointer + copied, chunk)?);
+                let rva = virtual_address + copied;
+                let chunk = (raw_size - copied).min(0x1000 - rva % 0x1000);
+                mapping.write(rva, &source.read_bytes(raw_pointer + copied, chunk)?);
                 copied += chunk;
             }
         }

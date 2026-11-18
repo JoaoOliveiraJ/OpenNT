@@ -300,7 +300,7 @@ fn get(name: &str, dependent: bool) -> Result<Shared, KernelError> {
         // junta o diretório do importador e o nome): os drivers e as suas
         // bibliotecas ficam em System32\drivers, as DLLs de kernel em System32.
         let full_name = if name.ends_with(".sys") { lifecycle::system_driver_path(&name) } else { alloc::format!("\\SystemRoot\\System32\\{name}") };
-        let image = pe_loader::load_from_source(source.clone(), &LoadOptions { image_name: Some(full_name), ..LoadOptions::default() })?;
+        let image = pe_loader::load_from_source(source.clone(), &LoadOptions { image_name: Some(full_name), ..LoadOptions::default() })?.drop_import_report();
         if dependent {
             if let Some(loaded) = image.loaded_image.as_ref() {
                 loaded_images::update_flags(loaded.id, loaded_images::DRIVER_DEPENDENT_DLL, 0);
@@ -866,7 +866,7 @@ pub fn load_system_image(file_name: u64, prefix: u64, loaded_base_name: u64, fla
 
     let Ok(source) = kernel_image_source::source_for(&file) else { return Ok(SYSTEM_IMAGE_NAME_NOT_FOUND) };
     let mut image = match pe_loader::load_from_source(source, &LoadOptions { image_name: Some(full_name), session, ..LoadOptions::default() }) {
-        Ok(image) => image,
+        Ok(image) => image.drop_import_report(),
         Err(error) => {
             debug_print!("[mm] MmLoadSystemImage {}: {}", path, error);
             return Ok(if error.status & 0x8000_0000 != 0 { error.status } else { SYSTEM_IMAGE_INVALID_FORMAT });
