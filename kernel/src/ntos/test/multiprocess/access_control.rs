@@ -541,7 +541,25 @@ fn kernel_events_without_descriptor(assert: Assert) {
     }
 }
 
+/// O ServerSecurityRequirements do NtAlpcConnectPortEx (o
+/// AlpcpCheckConnectionSecurity do 19041): o token do servidor (o System)
+/// tem de receber PORT_CONNECT do descritor, não um direito qualquer.
+fn server_security_requirements(assert: Assert) {
+    let check = |entries: &[Entry]| {
+        let bytes = relative_descriptor(Some(&system()), Some(entries));
+        let block = guest::alloc_bytes(bytes.len() as u64);
+        guest::write_bytes(block, &bytes);
+        let owned = crate::ntos::se::query_descriptor::read_descriptor(block);
+        guest::free_bytes(block);
+        owned.map(|descriptor| crate::ntos::alpc::connect::capture::check_server_descriptor(process::get_system_process(), &descriptor))
+    };
+    let delete_only = check(&[allow(0x1_0000, system())]);
+    let connect = check(&[allow(1, system())]);
+    assert(delete_only == Some(Err(0xC000_02A0)) && connect == Some(Ok(())), "acl: o descritor exigido do servidor ALPC precisa conceder PORT_CONNECT (DELETE sozinho da STATUS_SERVER_SID_MISMATCH)");
+}
+
 pub fn run(assert: Assert) {
+    server_security_requirements(assert);
     // O diretório dos testes, em que Everyone pode criar (a raiz só deixa o
     // SYSTEM criar), aberto pelo processo do SYSTEM durante os testes.
     let ran = as_identity("acl-raiz.exe", &system(), 0x4000, &[], |root, _| {

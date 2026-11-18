@@ -4341,16 +4341,18 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     responde sem RELEASE_MESSAGE ao pedido do winsrvext do csrss com o
     próximo comando, e o csrss devolve o resultado respondendo a essa
     resposta com outro pedido síncrono;
-  - o RequiredServerSid do NtAlpcConnectPort é comparado com o usuário do
-    token primário do dono da porta de conexão, e o descritor do
-    NtAlpcConnectPortEx com o mesmo token (MAXIMUM_ALLOWED); a recusa é
-    STATUS_SERVER_SID_MISMATCH;
+  - o RequiredServerSid do NtAlpcConnectPort e do NtSecureConnectPort é
+    comparado com o usuário do token primário do dono da porta de conexão,
+    que não pode ser AppContainer, e o descritor do NtAlpcConnectPortEx com
+    o mesmo token (MAXIMUM_ALLOWED, e o concedido precisa incluir
+    PORT_CONNECT); a recusa é STATUS_SERVER_SID_MISMATCH;
   - a segurança da porta segue o ObInsertObject: uma porta com nome exige
     DIRECTORY_CREATE_OBJECT no diretório pai (o nome relativo a um
     RootDirectory vale, inclusive o diretório de um namespace privado, pelo
     caminho ancorado nele, como nos outros tipos); sem descritor no
     OBJECT_ATTRIBUTES, recebe as ACEs herdáveis do pai (num `\RPC Control`,
-    Everyone e RESTRICTED com PORT_CONNECT); a conexão de modo usuário passa
+    Everyone e RESTRICTED com PORT_CONNECT); a conexão de modo usuário (a
+    do ALPC e a do NtConnectPort/NtSecureConnectPort legado) passa
     pelo SeAccessCheck de PORT_CONNECT contra o descritor atual da porta
     (STATUS_ACCESS_DENIED, com uma linha `[alpc] PORT_CONNECT ... recusado`
     no log);

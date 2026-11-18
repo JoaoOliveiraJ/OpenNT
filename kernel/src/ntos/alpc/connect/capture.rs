@@ -114,18 +114,23 @@ pub fn check_server_sid(server_process: u64, required: &[u8]) -> Result<(), u32>
     if matches { Ok(()) } else { Err(STATUS_SERVER_SID_MISMATCH) }
 }
 
-/// A forma descritor (o ServerSecurityRequirements do NtAlpcConnectPortEx):
-/// o SeAccessCheck do token primário do servidor contra o descritor, com
-/// MAXIMUM_ALLOWED; a recusa é STATUS_SERVER_SID_MISMATCH.
+/// A forma descritor (o ServerSecurityRequirements do NtAlpcConnectPortEx,
+/// o AlpcpCheckConnectionSecurity do 19041 em 0x5debd0..0x5debf4): o
+/// SeAccessCheck do token primário do servidor contra o descritor, com
+/// MAXIMUM_ALLOWED e o mapeamento do tipo ALPC Port, e o acesso concedido
+/// tem de incluir PORT_CONNECT; a recusa é STATUS_SERVER_SID_MISMATCH.
 pub fn check_server_descriptor(server_process: u64, descriptor: &crate::ntos::se::policy_descriptor::OwnedDescriptor) -> Result<(), u32> {
     let object_type = object_types::user_type("alpc").ok_or(0xC000_0024u32)?;
     let Some(token) = process::get_primary_token(server_process).and_then(tokens::get) else { return Err(STATUS_SERVER_SID_MISMATCH) };
     let policy = crate::ntos::se::policy_descriptor::policy_of(descriptor);
     match object_access::check_token(&policy, &token, MAXIMUM_ALLOWED, &object_type) {
-        Ok(granted) if granted != 0 => Ok(()),
+        Ok(granted) if granted & PORT_CONNECT != 0 => Ok(()),
         _ => Err(STATUS_SERVER_SID_MISMATCH),
     }
 }
+
+/// PORT_CONNECT.
+const PORT_CONNECT: u32 = 1;
 
 /// OBJECT_ATTRIBUTES capturado para a nova porta cliente.
 #[derive(Clone, Default)]

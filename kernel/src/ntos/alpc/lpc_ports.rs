@@ -87,7 +87,6 @@ const STATUS_PORT_DISCONNECTED: u32 = 0xC000_0037;
 const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
 const STATUS_REPLY_MESSAGE_MISMATCH: u32 = 0xC000_021F;
 const STATUS_LPC_REPLY_LOST: u32 = 0xC000_0253;
-const STATUS_SERVER_SID_MISMATCH: u32 = 0xC000_02A0;
 /// Os status internos do ALPC que as entradas LPC trocam.
 const STATUS_ALPC_PORT_DISCONNECTED: u32 = 0xC000_0703;
 const STATUS_ALPC_REPLY_LOST: u32 = 0xC000_0701;
@@ -275,6 +274,12 @@ fn connect_captured(out: u64, name: u64, qos: u64, client_view: u64, required_si
     if type_name != "AlpcPort" {
         return Ok(STATUS_OBJECT_TYPE_MISMATCH);
     }
+    // O ObReferenceObjectByName(PORT_CONNECT, AlpcPortObjectType,
+    // PreviousMode) do AlpcpCreateClientPort: o SeAccessCheck do chamador
+    // contra o descritor da porta de conexão.
+    if let Err(status) = server::check_connect_access(node, &object_manager::path_of(node).unwrap_or_default()) {
+        return Ok(status);
+    }
     if quality.level > 3 || quality.tracking > 1 {
         return Ok(STATUS_INVALID_PARAMETER);
     }
@@ -282,12 +287,10 @@ fn connect_captured(out: u64, name: u64, qos: u64, client_view: u64, required_si
     let user_server = server::server_of_node(node);
     let server_process = user_server.as_ref().map_or(process::get_system_process(), |server| server.listener().process_pointer);
     if let Some(sid) = &sid {
-        // AlpcpCheckConnectionSecurity: o usuário do token do dono da porta
-        // de conexão é o SID exigido.
-        let token = process::get_primary_token(server_process);
-        let owner = token.and_then(|token| crate::ntos::se::token::tokens::with(token, |record| record.user.clone()));
-        if owner.as_ref() != Some(sid) {
-            return Ok(STATUS_SERVER_SID_MISMATCH);
+        // AlpcpCheckConnectionSecurity: o token do dono da porta de conexão
+        // não é AppContainer e o usuário dele é o SID exigido.
+        if let Err(status) = crate::ntos::alpc::connect::capture::check_server_sid(server_process, sid) {
+            return Ok(status);
         }
     }
     let maximum = listener.service.max_message_length();
