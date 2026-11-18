@@ -3770,9 +3770,13 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   os `.mun` e os `.pri` de `\Windows\SystemResources` desses programas, as
   fontes de `\SystemRoot\Fonts` com o GRE_Initialize, o FontSubstitutes, o
   FontLink e a chave Fonts, e na SYSTEM o `Control\IDConfigDB` e os perfis
-  de `Hardware Profiles` (o `LogPixels` do DPI, `xtask/src/fonts.rs`), e o
-  CLSID do LogonUIController com as classes WinRT das DLLs do volume
-  (`WindowsRuntime\ActivatableClassId`, `xtask/src/logon_screen.rs`); a
+  de `Hardware Profiles` (o `LogPixels` do DPI, `xtask/src/fonts.rs`), e as
+  classes COM em processo (`Classes\CLSID`: o LogonUIController, os
+  provedores de credencial, a fábrica e os codecs do WIC) e WinRT
+  (`WindowsRuntime\ActivatableClassId`) das DLLs do volume, com os
+  provedores de `Authentication\Credential Providers` e o
+  `Authentication\LogonUI` sem o último logon nem os SIDs de usuário desta
+  máquina (`xtask/src/logon_screen.rs`); a
   hive gerada põe uma chave com mais de 1012 subchaves em folhas sob uma
   raiz 'ri' (`xtask/src/hive_image.rs`). A inicialização do LSA (o
   LsapInitLsa e o LsapStartLsa do lsasrv) pede ainda: o
