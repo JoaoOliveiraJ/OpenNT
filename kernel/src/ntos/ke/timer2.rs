@@ -271,10 +271,15 @@ pub fn expire_due() {
         return;
     }
     let now = clock::uptime_100ns();
-    EXPIRATIONS.fetch_add(1, Ordering::SeqCst);
     let expired: Vec<u64> = {
         let mut inserted = INSERTED.lock();
         let due: Vec<u64> = inserted.iter().copied().filter(|&address| timer_at(address).due_time[0].get() <= now).collect();
+        if due.is_empty() {
+            return;
+        }
+        // Contada sob a trava da fila: um KeDisableTimer2 que já não acha o
+        // timer na fila vê a passada.
+        EXPIRATIONS.fetch_add(1, Ordering::SeqCst);
         for &address in &due {
             let timer = timer_at(address);
             remove_locked(&mut inserted, timer);
