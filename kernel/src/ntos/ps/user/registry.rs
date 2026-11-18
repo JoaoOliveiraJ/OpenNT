@@ -332,6 +332,16 @@ fn nt_compress_key(key: u64, _a2: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<
     Ok(hive_services::compress_key(key, true))
 }
 
+/// NtQueryOpenSubKeys(TargetKey, HandleCount).
+fn nt_query_open_sub_keys(target: u64, handle_count: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
+    Ok(hive_services::query_open_sub_keys(target, handle_count, true))
+}
+
+/// NtQueryOpenSubKeysEx(TargetKey, BufferLength, Buffer, RequiredSize).
+fn nt_query_open_sub_keys_ex(target: u64, length: u64, buffer: u64, required: u64, _rsp: u64) -> Result<u32, KernelError> {
+    Ok(hive_services::query_open_sub_keys_ex(target, length as u32, buffer, required, true))
+}
+
 /// NtInitializeRegistry(BootCondition), de modo usuário (`cm/hive_init`).
 fn nt_initialize_registry(boot_condition: u64, _a2: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
     Ok(crate::ntos::cm::hive_init::initialize_registry(boot_condition as u16, 1))
@@ -353,6 +363,8 @@ pub fn init() {
     state::register_handler("NtFlushKey", nt_flush_key);
     state::register_handler("NtCompactKeys", nt_compact_keys);
     state::register_handler("NtCompressKey", nt_compress_key);
+    state::register_handler("NtQueryOpenSubKeys", nt_query_open_sub_keys);
+    state::register_handler("NtQueryOpenSubKeysEx", nt_query_open_sub_keys_ex);
     key_services::set_user_handles(Some(UserHandles { get: user_key, allocate: allocate_user_key, close: close_user_key }));
     state::register_handler("NtOpenKey", nt_open_key);
     state::register_handler("NtOpenKeyEx", nt_open_key_ex);

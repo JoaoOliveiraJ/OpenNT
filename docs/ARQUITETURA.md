@@ -5084,7 +5084,11 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   ler a hive. O NtUnloadKeyEx com handles abertos congela a hive
   (STATUS_PENDING, com ou sem evento) até o último handle; uma hive
   congelada recusa outra descarga com STATUS_TOO_LATE, e as hives do boot
-  com STATUS_ACCESS_DENIED.
+  com STATUS_ACCESS_DENIED. O NtQueryOpenSubKeys(Ex) parte da raiz de uma
+  hive e lista os corpos de chave abertos nela e nas chaves abaixo na
+  mesma hive (`registry::open_handles_in_hive`, o PID de cada corpo em
+  `key/objects.rs`); a contagem do NtQueryOpenSubKeys inclui o corpo da
+  própria referência pelo nome, que o Ex pula.
 - **Hives de aplicativo e restaurações especiais** (`cm/hive_list.rs`):
   REG_APP_HIVE liga a hive em `\REGISTRY\A\{...}`, devolve o handle da
   raiz, reaproveita a hive de aplicativo já carregada do mesmo arquivo

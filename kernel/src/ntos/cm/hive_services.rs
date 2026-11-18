@@ -1,7 +1,8 @@
 //! Os serviços de hive: NtLoadKey/NtLoadKey2/NtLoadKeyEx/NtLoadKey3,
 //! NtUnloadKey/NtUnloadKey2/NtUnloadKeyEx, NtSaveKey/NtSaveKeyEx,
-//! NtRestoreKey, NtFlushKey, NtCompressKey e NtCompactKeys (e os Zw*
-//! exportados, com PreviousMode de kernel).
+//! NtRestoreKey, NtFlushKey, NtCompressKey, NtCompactKeys e
+//! NtQueryOpenSubKeys/NtQueryOpenSubKeysEx (e os Zw* exportados, com
+//! PreviousMode de kernel; o 19041 não exporta ZwQueryOpenSubKeys(Ex)).
 //!
 //! Captura dos parâmetros, privilégios e códigos como no ntoskrnl 19041:
 //! - NtLoadKeyEx (CmLoadDifferencingKey, rva 0x6e729c): Flags com algum bit
@@ -57,7 +58,19 @@
 //! - NtCompactKeys (rva 0x867f70): SeBackupPrivilege; Count 0 é sucesso,
 //!   Count >= 0x1FFFFFFF é STATUS_INVALID_PARAMETER; KEY_WRITE em cada
 //!   handle; as chaves precisam estar na mesma hive e nenhuma pode ser raiz
-//!   de hive; o NT valida e devolve sucesso sem mudar a hive.
+//!   de hive; o NT valida e devolve sucesso sem mudar a hive;
+//! - NtQueryOpenSubKeys (rva 0x868640) e NtQueryOpenSubKeysEx (rva
+//!   0x868860): a chave pelo nome com KEY_READ (ObReferenceObjectByNameEx
+//!   pelo PreviousMode), excluída é STATUS_KEY_DELETED e fora da raiz de
+//!   uma hive é STATUS_INVALID_PARAMETER; os corpos de chave abertos na
+//!   chave e nas chaves abaixo dela na mesma hive (CmpSearchForOpenSubKeys).
+//!   O NtQueryOpenSubKeys não checa privilégio e conta também o corpo que a
+//!   própria referência pelo nome criou. O Ex exige SeRestorePrivilege,
+//!   BufferLength >= 8 (senão STATUS_BUFFER_TOO_SMALL) e par (senão
+//!   STATUS_INVALID_PARAMETER), pula o próprio corpo e preenche o
+//!   KEY_OPEN_SUBKEYS_INFORMATION (PID e nome de cada corpo, nomes do fim
+//!   do buffer para trás); sem espaço, STATUS_BUFFER_OVERFLOW com Count e
+//!   RequiredSize completos e nenhuma entrada copiada.
 //!
 //! Os filtros de registro recebem RegNtPre/PostFlushKey (30/31),
 //! LoadKey (32/33), UnLoadKey (34/35), RestoreKey (41/42) e SaveKey
@@ -73,13 +86,14 @@ use alloc::vec::Vec;
 use crate::ntos::cm::callbacks::{self, Operation, Outcome};
 use crate::ntos::cm::hive_file::HiveFile;
 use crate::ntos::cm::hive_list::{self, LATEST_MINOR, STANDARD_MINOR};
-use crate::ntos::cm::key::{objects as key_objects, services as key_services};
+use crate::ntos::cm::key::{objects as key_objects, security as key_security, services as key_services};
 use crate::ntos::cm::registry::{self, NodeId};
 use crate::ntos::inc::types::extra_se_cm::{RegDeleteKeyInformation, RegLoadKeyInformation, RegSaveKeyInformation, RegUnloadKeyInformation};
-use crate::ntos::inc::types::{NtStruct, ObjectAttributes, UnicodeString};
+use crate::ntos::inc::types::{KeyOpenSubkeysInformation, KeyPidArray, NtStruct, ObjectAttributes, UnicodeString};
 use crate::ntos::io::file::request::EventReference;
 use crate::ntos::io::file::{request as file_request, zw as zw_files};
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::ps::process;
 use crate::ntos::ps::user::{registry as user_registry, state as user_state};
 use crate::ntos::rtl::guest_strings;
 use crate::ntos::se::privilege;
@@ -98,6 +112,12 @@ const STATUS_INVALID_PARAMETER_3: u32 = 0xC000_00F1;
 const STATUS_INVALID_PARAMETER_4: u32 = 0xC000_00F2;
 const STATUS_INVALID_PARAMETER_5: u32 = 0xC000_00F3;
 const STATUS_INVALID_PARAMETER_7: u32 = 0xC000_00F5;
+const STATUS_BUFFER_OVERFLOW: u32 = 0x8000_0005;
+const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
+const STATUS_KEY_DELETED: u32 = 0xC000_017C;
+/// KEY_READ, o acesso do ObReferenceObjectByNameEx do
+/// NtQueryOpenSubKeys(Ex).
+const KEY_READ: u32 = 0x2_0019;
 
 /// SeBackupPrivilege e SeRestorePrivilege (LUIDs 17 e 18).
 const SE_BACKUP_PRIVILEGE: u64 = 17;
@@ -687,4 +707,146 @@ pub fn compact_keys(count: u32, array: u64, previous_mode: bool) -> u32 {
         }
     }
     if hive_list::same_hive(&nodes) { 0 } else { STATUS_INVALID_PARAMETER }
+}
+
+/// Uma chave aberta da hive (um CM_KEY_BODY): o processo e o nome do KCB.
+struct OpenSubKey {
+    process_id: u64,
+    name: String,
+}
+
+/// A chave pedida ao NtQueryOpenSubKeys(Ex): o ObReferenceObjectByNameEx
+/// com KEY_READ pelo PreviousMode, o CmpPerformKeyBodyDeletionCheck e o
+/// KEY_HIVE_ENTRY do KCB (o bit 0x40000 de KCB+0xb8, rva 0x868791/0x868a53;
+/// a raiz do registro, criada pelo CmpCreateRegistryRoot, também o tem),
+/// senão STATUS_INVALID_PARAMETER.
+fn open_sub_keys_root(target: u64, previous_mode: bool) -> Result<NodeId, u32> {
+    let path = key_path(target, previous_mode)?;
+    let node = registry::node_by_path(&path).ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
+    let security = registry::with_node(node, |key| key.security.clone()).ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
+    let _granted = key_security::access(&security, KEY_READ, previous_mode)?;
+    if registry::is_deleted(node) {
+        return Err(STATUS_KEY_DELETED);
+    }
+    if node != registry::ROOT && registry::hive_of(node).is_none_or(|(_, root)| !root) {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    Ok(node)
+}
+
+/// CmpSearchForOpenSubKeys(Kcb, SearchIfExist, Context) (rva 0x66c648):
+/// os corpos de chave da raiz e dos KCBs abaixo dela na mesma hive, um por
+/// CM_KEY_BODY (um handle duplicado conta uma vez). Um handle interno sem
+/// corpo (aberto pelo próprio kernel, sem objeto Key) conta como do
+/// processo System.
+fn open_sub_keys(root: NodeId) -> Vec<OpenSubKey> {
+    let mut bodies: Vec<u64> = Vec::new();
+    let mut keys = Vec::new();
+    for (handle, name) in registry::open_handles_in_hive(root) {
+        let process_id = match key_objects::body_process(handle) {
+            Some((body, _)) if bodies.contains(&body) => continue,
+            Some((body, process_id)) => {
+                bodies.push(body);
+                process_id
+            }
+            None => process::SYSTEM_PROCESS_ID,
+        };
+        keys.push(OpenSubKey { process_id, name });
+    }
+    keys
+}
+
+/// NtQueryOpenSubKeys(TargetKey, HandleCount) (rva 0x868640): sem checagem
+/// de privilégio.
+pub fn query_open_sub_keys(target: u64, handle_count: u64, previous_mode: bool) -> u32 {
+    // ProbeForWriteUlong do HandleCount antes da referência pelo nome.
+    if previous_mode && !user_state::probe_user_write(handle_count, 4) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    let root = match open_sub_keys_root(target, previous_mode) {
+        Ok(root) => root,
+        Err(status) => return status,
+    };
+    // O corpo que o próprio ObReferenceObjectByNameEx criou no KCB da raiz
+    // entra na contagem: o CmpDumpKeyBodyList sem contexto conta todos os
+    // corpos da lista; só o Ex o pula (KeyBodyToIgnore).
+    let count = open_sub_keys(root).len() as u32 + 1;
+    match guest::try_write::<u32>(handle_count, count) {
+        Ok(()) => 0,
+        Err(_) => STATUS_ACCESS_VIOLATION,
+    }
+}
+
+/// NtQueryOpenSubKeysEx(TargetKey, BufferLength, Buffer, RequiredSize)
+/// (rva 0x868860).
+pub fn query_open_sub_keys_ex(target: u64, length: u32, buffer: u64, required_size: u64, previous_mode: bool) -> u32 {
+    if !privileged(SE_RESTORE_PRIVILEGE, previous_mode) {
+        return STATUS_PRIVILEGE_NOT_HELD;
+    }
+    if length < KeyOpenSubkeysInformation::SIZE as u32 {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    if length & 1 != 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if previous_mode {
+        // ProbeForWriteUlong(RequiredSize) e ProbeForWrite(Buffer, BufferLength, 4).
+        if !user_state::probe_user_write(required_size, 4) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        if buffer & 3 != 0 {
+            return STATUS_DATATYPE_MISALIGNMENT;
+        }
+        if !user_state::probe_user_write(buffer, length as u64) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+    }
+    let root = match open_sub_keys_root(target, previous_mode) {
+        Ok(root) => root,
+        Err(status) => return status,
+    };
+    // O buffer de kernel do tamanho pedido, zerado ('CM81').
+    let kernel = guest::alloc_bytes(length as u64);
+    if kernel == 0 {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    // O contexto do CmpDumpOneKeyBody: entradas a partir de 0x8, nomes do
+    // fim do buffer para trás, RequiredSize = 8 + (0x18 + Length do nome)
+    // de cada corpo e Count contando todos, também depois do estouro.
+    let (mut count, mut required, mut used, mut end, mut status) = (0u32, 8u32, 8u32, length, 0u32);
+    for key in open_sub_keys(root) {
+        let units: Vec<u16> = key.name.encode_utf16().collect();
+        let name_length = (units.len() * 2) as u32;
+        let size = name_length + KeyPidArray::SIZE as u32;
+        required = required.wrapping_add(size);
+        if status == 0 {
+            if used + size > length {
+                status = STATUS_BUFFER_OVERFLOW;
+            } else {
+                end -= name_length;
+                guest::write_bytes(kernel + end as u64, &units.iter().flat_map(|unit| unit.to_le_bytes()).collect::<Vec<u8>>());
+                // SAFETY: entrada dentro do buffer próprio (used + size <= length).
+                let entry = unsafe { KeyPidArray::at(kernel + KeyOpenSubkeysInformation::SIZE + count as u64 * KeyPidArray::SIZE) };
+                entry.process_id.set(key.process_id);
+                entry.key_name.length.set(name_length as u16);
+                entry.key_name.maximum_length.set(name_length as u16);
+                // O ponteiro já no buffer do chamador (o serviço subtrai
+                // KernelBuffer - Buffer de cada KeyName.Buffer antes da cópia).
+                entry.key_name.buffer.set(buffer + end as u64);
+                used += size;
+            }
+        }
+        count += 1;
+    }
+    // SAFETY: cabeçalho do buffer próprio.
+    unsafe { KeyOpenSubkeysInformation::at(kernel) }.count.set(count);
+    // *RequiredSize e Buffer->Count sempre; o resto só no sucesso.
+    let copied = guest::try_write::<u32>(required_size, required)
+        .and_then(|_| guest::try_write::<u32>(buffer, count))
+        .and_then(|_| if status & 0x8000_0000 == 0 { guest::try_read_bytes(kernel, length as usize).and_then(|bytes| guest::try_write_bytes(buffer, &bytes)) } else { Ok(()) });
+    guest::free_bytes(kernel);
+    match copied {
+        Ok(()) => status,
+        Err(_) => STATUS_ACCESS_VIOLATION,
+    }
 }

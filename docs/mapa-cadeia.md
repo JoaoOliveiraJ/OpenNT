@@ -102,7 +102,7 @@ bloqueiam a tela de logon. Os de terceiros desta máquina ficam fora.
 
 - **Syscalls simples:** NtCompareObjects (feito),
   NtIsSystemResumeAutomatic (feito), NtFilterToken,
-  NtQueryOpenSubKeysEx, NtSetVolumeInformationFile, NtLoadDriver e
+  NtQueryOpenSubKeysEx (feito), NtSetVolumeInformationFile, NtLoadDriver e
   NtUnloadDriver de modo usuário (o export existe), NtSetIoCompletionEx,
   NtAllocateReserveObject (export existe), NtDeleteFile (export existe).
 - **Syscalls complexas:** NtSetThreadExecutionState (pedido de energia

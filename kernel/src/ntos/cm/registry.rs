@@ -987,6 +987,32 @@ pub fn subtree_has_open_handles(node: NodeId, include_self: bool) -> bool {
     })
 }
 
+/// Os handles internos abertos em chaves da subárvore de `node` (o próprio
+/// nó incluído) guardadas pela mesma hive, com o caminho de cada chave (o
+/// nome que o CmpConstructNameWithStatus monta para o KCB): primeiro os do
+/// próprio nó (o CmpDumpKeyBodyList do KCB pedido), depois os dos
+/// descendentes (o CmpEnumerateAllOpenSubKeys, rva 0x66d0e4, que percorre
+/// só a tabela de KCBs da hive do KCB: as hives montadas abaixo ficam fora).
+pub fn open_handles_in_hive(node: NodeId) -> Vec<(u32, String)> {
+    with_hive(|hive| {
+        let owner = owning_hive_of(hive, node);
+        let mut by_node: BTreeMap<NodeId, Vec<u32>> = BTreeMap::new();
+        for (&handle, entry) in &hive.handles {
+            by_node.entry(entry.node).or_default().push(handle);
+        }
+        let mut opened = Vec::new();
+        for candidate in subtree(hive, node) {
+            let Some(handles) = by_node.get(&candidate) else { continue };
+            if owning_hive_of(hive, candidate) != owner {
+                continue;
+            }
+            let path = node_path(hive, candidate);
+            opened.extend(handles.iter().map(|&handle| (handle, path.clone())));
+        }
+        opened
+    })
+}
+
 /// CmRestoreKey: troca as subchaves e os valores do nó pelos da árvore lida
 /// (a primeira chave é a raiz da hive de origem), pelas mesmas operações de
 /// célula das chaves comuns. O descritor do próprio nó fica.

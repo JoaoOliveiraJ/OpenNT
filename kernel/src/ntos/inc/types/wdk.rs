@@ -1295,6 +1295,38 @@ const _: () = {
     assert!(core::mem::offset_of!(KeyHandleTagsInformation, handle_tags) == 0x0);
 };
 
+/// `_KEY_PID_ARRAY` (o buffer do NtQueryOpenSubKeysEx; 0x18 bytes,
+/// CmpDumpOneKeyBody rva 0x86ecf0).
+#[repr(C)]
+pub struct KeyPidArray {
+    /// -> `void` (o ProcessID do CM_KEY_BODY)
+    pub process_id: Field<u64>,
+    pub key_name: UnicodeString,
+}
+
+unsafe impl NtStruct for KeyPidArray {}
+
+const _: () = {
+    assert!(core::mem::size_of::<KeyPidArray>() == 0x18);
+    assert!(core::mem::offset_of!(KeyPidArray, process_id) == 0x0);
+    assert!(core::mem::offset_of!(KeyPidArray, key_name) == 0x8);
+};
+
+/// `_KEY_OPEN_SUBKEYS_INFORMATION` (o cabeçalho do buffer do
+/// NtQueryOpenSubKeysEx; o vetor de KEY_PID_ARRAY começa em 0x8).
+#[repr(C)]
+pub struct KeyOpenSubkeysInformation {
+    pub count: Field<u32>,
+    _pad_4: Reserved<0x4>,
+}
+
+unsafe impl NtStruct for KeyOpenSubkeysInformation {}
+
+const _: () = {
+    assert!(core::mem::size_of::<KeyOpenSubkeysInformation>() == 0x8);
+    assert!(core::mem::offset_of!(KeyOpenSubkeysInformation, count) == 0x0);
+};
+
 /// `_KEY_VALUE_ENTRY` (wdm.h, NtQueryMultipleValueKey; 0x18 bytes).
 #[repr(C)]
 pub struct KeyValueEntry {

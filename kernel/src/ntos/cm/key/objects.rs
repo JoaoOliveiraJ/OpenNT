@@ -218,3 +218,11 @@ pub fn set_handle_tags(pointer: u64, tags: u32) {
 pub fn by_handle(handle: u32) -> Option<u64> {
     with(|bodies| bodies.by_handle.get(&handle).copied())
 }
+
+/// O CM_KEY_BODY de um handle interno e o ProcessID dele (o processo que
+/// abriu a chave, que o CmpDumpOneKeyBody copia para o KEY_PID_ARRAY). Um
+/// handle duplicado devolve o mesmo corpo.
+pub fn body_process(handle: u32) -> Option<(u64, u64)> {
+    let pointer = by_handle(handle)?;
+    key_body(pointer).map(|body| (pointer, body.process_id.get()))
+}
