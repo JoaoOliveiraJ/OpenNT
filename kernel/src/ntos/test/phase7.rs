@@ -3492,6 +3492,17 @@ fn user_alpc_foundation(assert: Assert) {
     }
     assert(context.as_ref().is_some_and(|context| context.client.token != 0 && context.client.level == 2) && referenced.is_some() && context.as_ref().is_some_and(|context| security_contexts::delete_referenced(context).ok() == Some(0)), "useralpc: contexto de seguranca criado, referenciado e excluido");
     assert(security_contexts::create(&port, &security_contexts::Quality { level: 4, tracking: 0, effective_only: false }, true).ok().and_then(|result| result.err()) == Some(0xC000_00A5), "useralpc: nivel de impersonacao invalido");
+    // Rastreamento dinâmico (o atributo de segurança que o rpcrt4 cria com o
+    // QoS da ligação): o contexto guarda o token efetivo da thread, retido.
+    let thread = crate::ntos::ps::process::get_current_thread();
+    let effective = crate::ntos::se::token::thread::get(thread).map(|state| state.token).or_else(|| crate::ntos::ps::process::thread_record(thread).and_then(|record| crate::ntos::ps::process::get_primary_token(record.process)));
+    let dynamic = security_contexts::create(&port, &security_contexts::Quality { level: 2, tracking: 1, effective_only: false }, true).ok().and_then(|result| result.ok());
+    let dynamic_ok = effective.is_some() && dynamic.as_ref().is_some_and(|context| Some(context.client.token) == effective && crate::ntos::se::token::tokens::retain(context.client.token).is_ok_and(|_| crate::ntos::se::token::tokens::release(context.client.token).is_ok()));
+    if let Some(context) = &dynamic {
+        let _ = security_contexts::release(context);
+        let _ = security_contexts::delete_referenced(context);
+    }
+    assert(dynamic_ok, "useralpc: contexto de seguranca dinamico guarda o token efetivo da thread");
     // Seção da porta e regiões de 64 KiB.
     let section = sections::create(sections::CreateOptions { size: 0x4_0000, page_protect: 4, attributes: 0x800_0000, committed: Some(true), ..sections::CreateOptions::default() }).ok().and_then(|created| created.ok());
     let attached = section.as_ref().and_then(|section| port_sections::attach(&port, section, port_sections::Creation::default()).ok().and_then(|result| result.ok()));

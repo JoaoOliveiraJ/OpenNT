@@ -99,8 +99,10 @@ pub fn capture(thread: u64, quality: &Quality) -> Result<Result<Arc<ClientIdenti
     }
     let Some(source) = impersonation.as_ref().map(|impersonation| impersonation.token).or_else(|| process::get_primary_token(record.process)) else { return Ok(Err(0xC000_0022)) };
     let effective_only = quality.effective_only || impersonation.as_ref().is_some_and(|impersonation| impersonation.effective_only);
+    // Rastreamento dinâmico: o próprio token efetivo, com uma referência a
+    // mais (o SeCreateClientSecurity não copia); estático: uma cópia.
     let token = if quality.tracking != 0 {
-        tokens::retain(source)
+        tokens::retain(source).map(|_| source)
     } else {
         tokens::duplicate(source, quality.level, effective_only, 2).inspect(|&token| {
             let modified = tokens::with(source, |source| source.modified_id).unwrap_or(0);
