@@ -3,7 +3,7 @@
 //! O serviço Nt de UserMode ainda exige a política de redução de direitos de
 //! RtlIsSandboxedToken antes de ser exposto.
 
-use crate::ntos::se::model::{sid, Ace, SecurityPolicy};
+use crate::ntos::se::model::{sid, Ace, SecurityPolicy, Sid};
 use crate::ntos::se::descriptor;
 use crate::ntos::se::token::{thread as thread_tokens, access as token_access, handles as token_handles, reference as token_reference, tokens};
 use crate::ntos::alpc::message::buffer as message_buffer;
@@ -88,6 +88,16 @@ pub(super) struct Creation {
 }
 
 pub(super) fn capture_creation(attributes: u64, mode: u8, subject: u64) -> Result<Creation, u32> {
+    let (mut creation, explicit) = capture_creation_policy(attributes, mode, subject)?;
+    if !explicit {
+        finalize_token_acls(&mut creation.policy);
+    }
+    Ok(creation)
+}
+
+/// [`capture_creation`] sem o SepFinalizeTokenAcls: a política capturada e
+/// se o OBJECT_ATTRIBUTES trouxe um descritor explícito.
+pub(super) fn capture_creation_policy(attributes: u64, mode: u8, subject: u64) -> Result<(Creation, bool), u32> {
     let mut flags = 0;
     let mut security = 0;
     if attributes != 0 {
@@ -145,23 +155,43 @@ pub(super) fn capture_creation(attributes: u64, mode: u8, subject: u64) -> Resul
         return Err(0xC000_0061);
     }
     map_creation_acl(&mut policy);
-    if security == 0 {
-        finalize_token_acls(&mut policy);
-    }
-    Ok(Creation { flags, policy })
+    Ok((Creation { flags, policy }, security != 0))
 }
 
-/// SepFinalizeTokenAcls (ntoskrnl 19041, 0x5d00a0) num token sem descritor
-/// explícito: o SepAppendAceToTokenObjectAcl acrescenta TOKEN_QUERY para
-/// BUILTIN\Administrators ao fim da DACL quando nenhuma ACE dela é desse
-/// SID; uma DACL NULL continua NULL.
-fn finalize_token_acls(policy: &mut SecurityPolicy) {
-    if let Some(dacl) = policy.dacl.as_mut() {
-        let administrators = sid(5, &[32, 544]);
-        if !dacl.iter().any(|entry| entry.sid.as_ref() == Some(&administrators)) {
-            dacl.push(Ace { sid: Some(administrators), mask: 8, deny: false, flags: 0, raw: None });
-        }
+/// SepAppendAceToTokenObjectAcl (ntoskrnl 19041, 0x6d8120) sobre a política
+/// do objeto token: com a DACL presente e nenhuma ACE de `identifier`
+/// (RtlFindAceBySid), uma ACE ACCESS_ALLOWED de `mask` sem flags no fim; a
+/// DACL NULL continua NULL. A lista passa a ser montada das ACEs.
+pub(super) fn append_object_ace(policy: &mut SecurityPolicy, identifier: &Sid, mask: u32) {
+    let Some(dacl) = policy.dacl.as_mut() else { return };
+    if dacl.iter().any(|entry| entry.sid.as_ref() == Some(identifier)) {
+        return;
     }
+    dacl.push(Ace { sid: Some(identifier.clone()), mask, deny: false, flags: 0, raw: None });
+    policy.dacl_bytes = None;
+}
+
+/// SepFinalizeTokenAcls (ntoskrnl 19041, 0x5d00a0): o
+/// SepAppendAceToTokenObjectAcl de TOKEN_QUERY para BUILTIN\Administrators.
+pub(super) fn finalize_token_acls(policy: &mut SecurityPolicy) {
+    append_object_ace(policy, &sid(5, &[32, 544]), 8);
+}
+
+/// O acesso concedido ao handle de um token novo (o ObInsertObject): os
+/// bits GENERIC_* mapeados pelo GENERIC_MAPPING de Token, os bits fora da
+/// máscara válida retirados, MAXIMUM_ALLOWED como TOKEN_ALL_ACCESS e
+/// ACCESS_SYSTEM_SECURITY só com SeSecurityPrivilege
+/// (STATUS_PRIVILEGE_NOT_HELD).
+pub(super) fn creation_access(requested: u32, subject: u64, mode: u8) -> Result<u32, u32> {
+    let mapped = token_access::map_generic_access(requested);
+    let mut granted = (mapped & 0x1F_01FF) | if mapped & 0x0200_0000 != 0 { 0xF_01FF } else { 0 };
+    if mapped & 0x0100_0000 != 0 {
+        if !privilege(subject, 8, mode) {
+            return Err(0xC000_0061);
+        }
+        granted |= 0x0100_0000;
+    }
+    Ok(granted)
 }
 
 /// O descritor de um token inserido sem descritor explícito nem pai (o
@@ -219,14 +249,10 @@ pub fn duplicate(existing: u64, access: u32, attributes: u64, effective_only: bo
         // DesiredAccess zero herda a máscara do handle de origem; bits fora da
         // máscara válida são retirados na criação.
         let requested = if access != 0 { access } else { reference.granted_access };
-        let mapped = token_access::map_generic_access(requested);
-        let mut granted = (mapped & 0x1F_01FF) | if mapped & 0x0200_0000 != 0 { 0xF_01FF } else { 0 };
-        if mapped & 0x0100_0000 != 0 {
-            if !privilege(subject, 8, mode) {
-                return Ok(0xC000_0061);
-            }
-            granted |= 0x0100_0000;
-        }
+        let granted = match creation_access(requested, subject, mode) {
+            Ok(granted) => granted,
+            Err(status) => return Ok(status),
+        };
         created = tokens::duplicate(source, level, effective_only, token_type)?;
         let current = process::get_current_process();
         tokens::update(created, |token| {

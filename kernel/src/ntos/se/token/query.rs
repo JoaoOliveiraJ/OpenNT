@@ -404,7 +404,10 @@ pub fn encode(token_pointer: u64, class: u32, base: u64) -> Result<Vec<u8>, u32>
         26 => layout.scalar(token_flags(&token) >> 12 & 1),
         40 => layout.scalar((token_flags(&token) & (TOKEN_IS_RESTRICTED | TOKEN_WRITE_RESTRICTED) != 0) as u32),
         42 => layout.scalar(token_flags(&token) >> 16 & 1),
-        15 | 32 | 47 | 48 => layout.scalar(0),
+        // TokenAppContainerNumber (0x6d243e): o LowboxNumber da entrada do
+        // token, 0 sem ela.
+        32 => layout.scalar(token.lowbox_number.map_or(0, |(_, number)| number)),
+        15 | 47 | 48 => layout.scalar(0),
         _ => return Err(STATUS_INVALID_INFO_CLASS),
     }
     Ok(layout.bytes)
@@ -424,8 +427,8 @@ pub fn encode(token_pointer: u64, class: u32, base: u64) -> Result<Vec<u8>, u32>
 // byte baixo da última subautoridade (RtlSidHashInitialize). Os privilégios
 // saem na ordem do LUID (o bitmap Present do token, LUIDs 0 a 36), com
 // SE_PRIVILEGE_ENABLED e SE_PRIVILEGE_ENABLED_BY_DEFAULT. O OpenNT não tem
-// processos protegidos nem números de lowbox: TrustLevelSid nulo e
-// AppContainerNumber zero.
+// processos protegidos: TrustLevelSid nulo. O AppContainerNumber é o número
+// LowBox do token (0 sem ele).
 
 const TAI_SIZE: usize = TokenAccessInformation::SIZE as usize;
 const HASH_SIZE: usize = SidAndAttributesHash::SIZE as usize;
@@ -550,7 +553,7 @@ fn access_information(token: &Token, base: u64) -> Result<Vec<u8>, u32> {
     image.put32(offset_of!(TokenAccessInformation, impersonation_level), token.impersonation_level);
     image.put32(offset_of!(TokenAccessInformation, mandatory_policy) + offset_of!(TokenMandatoryPolicy, policy), token.mandatory_policy);
     image.put32(offset_of!(TokenAccessInformation, flags), flags);
-    image.put32(offset_of!(TokenAccessInformation, app_container_number), 0);
+    image.put32(offset_of!(TokenAccessInformation, app_container_number), token.lowbox_number.map_or(0, |(_, number)| number));
     image.put64(offset_of!(TokenAccessInformation, package_sid), package_sid);
     image.put64(offset_of!(TokenAccessInformation, capabilities_hash), image.address(capabilities_hash));
     image.put64(offset_of!(TokenAccessInformation, trust_level_sid), 0);

@@ -41,7 +41,7 @@ fn permits_allowed_identifiers(token: &Token, allowed: &[Sid], checks_write_acce
     if contains(allowed, &all_restricted_application_packages()) {
         return true;
     }
-    if !token.less_privileged_app_container && contains(allowed, &all_application_packages()) {
+    if !tokens::less_privileged(token) && contains(allowed, &all_application_packages()) {
         return true;
     }
     if contains(allowed, app_container) {

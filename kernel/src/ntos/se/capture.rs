@@ -1,6 +1,7 @@
-//! Captura dos vetores SID_AND_ATTRIBUTES e LUID_AND_ATTRIBUTES que os
-//! serviços de token recebem (ntoskrnl 19041: SeCaptureSidAndAttributesArray
-//! 0x5dd560 e SeCaptureLuidAndAttributesArray 0x6089bc).
+//! Captura dos SIDs e dos vetores SID_AND_ATTRIBUTES e LUID_AND_ATTRIBUTES
+//! que os serviços de token recebem (ntoskrnl 19041: SeCaptureSid 0x5de46c,
+//! SeCaptureSidAndAttributesArray 0x5dd560 e SeCaptureLuidAndAttributesArray
+//! 0x6089bc).
 //!
 //! - SeCaptureSidAndAttributesArray: zero entradas é um vetor vazio; mais
 //!   de 0x1000 é STATUS_INVALID_PARAMETER. De UserMode o vetor é alinhado a 4
@@ -22,7 +23,7 @@ use alloc::vec::Vec;
 
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::ps::user_probe;
-use crate::ntos::se::model::{Group, Privilege};
+use crate::ntos::se::model::{Group, Privilege, Sid};
 
 const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
@@ -129,4 +130,34 @@ pub fn luid_and_attributes_array(array: u64, count: u32, mode: u8) -> Result<Vec
             Ok(Privilege { id: low as u64 | (high as u64) << 32, attributes: read::<u32>(entry + 8)? })
         })
         .collect()
+}
+
+/// SeCaptureSid(InputSid, RequestorMode, ...) (ntoskrnl 19041, 0x5de46c):
+/// de UserMode o SubAuthorityCount é lido uma vez (um endereço fora do
+/// espaço de usuário é STATUS_ACCESS_VIOLATION), o SID alinhado a 4
+/// (STATUS_DATATYPE_MISALIGNMENT) e sondado no tamanho dessa leitura; a
+/// cópia recebe de novo o SubAuthorityCount lido e o RtlValidSid sobre ela
+/// (revisão 1, até 15 subautoridades) recusa com STATUS_INVALID_SID. De
+/// KernelMode a cópia também passa pelo RtlValidSid.
+pub fn sid(pointer: u64, mode: u8) -> Result<Sid, u32> {
+    let user = mode != 0;
+    if user && !user_probe::probe_user_read(pointer + 1, 1) {
+        return Err(STATUS_ACCESS_VIOLATION);
+    }
+    let sub_authorities = read::<u8>(pointer + 1)?;
+    let length = 8 + sub_authorities as usize * 4;
+    if user {
+        if pointer & 3 != 0 {
+            return Err(STATUS_DATATYPE_MISALIGNMENT);
+        }
+        if !user_probe::probe_user_read(pointer, length as u64) {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+    }
+    let mut bytes = guest::try_read_bytes(pointer, length).map_err(|_| STATUS_ACCESS_VIOLATION)?;
+    bytes[1] = sub_authorities;
+    if bytes[0] != 1 || sub_authorities > SID_MAX_SUB_AUTHORITIES {
+        return Err(STATUS_INVALID_SID);
+    }
+    Ok(bytes)
 }

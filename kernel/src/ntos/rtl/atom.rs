@@ -26,8 +26,9 @@
 //! Uma entrada fixada não sai com Delete (STATUS_WAS_LOCKED).
 //!
 //! LowBox: o NT guarda referências por AppContainer quando o token efetivo
-//! tem número LowBox; o OpenNT não atribui números LowBox (não há
-//! NtCreateLowBoxToken), então a referência é sempre a da própria entrada.
+//! tem número LowBox (RtlpLookupOrCreateLowBox); o OpenNT ainda não guarda
+//! essas referências, então mesmo um token LowBox (com o número do
+//! NtCreateLowBoxToken) usa a referência da própria entrada.
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;

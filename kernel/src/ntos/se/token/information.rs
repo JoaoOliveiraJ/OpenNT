@@ -95,8 +95,12 @@ const TOKEN_VIRTUALIZATION_ENABLED: u32 = 24;
 const TOKEN_INTEGRITY_LEVEL: u32 = 25;
 const TOKEN_UI_ACCESS: u32 = 26;
 const TOKEN_IS_APP_CONTAINER: u32 = 29;
+const TOKEN_CAPABILITIES: u32 = 30;
 const TOKEN_APP_CONTAINER_SID: u32 = 31;
 const TOKEN_APP_CONTAINER_NUMBER: u32 = 32;
+const TOKEN_IS_LESS_PRIVILEGED_APP_CONTAINER: u32 = 46;
+/// TOKEN_LOWBOX em TokenFlags.
+const TOKEN_LOWBOX: u32 = 0x4000;
 
 /// O bit de TokenFlags de cada classe booleana (TOKEN_VIRTUALIZATION_ALLOWED
 /// 0x200, TOKEN_VIRTUALIZATION_ENABLED 0x400, TOKEN_UIACCESS 0x1000,
@@ -127,12 +131,13 @@ fn last_sub_authority(sid: &[u8]) -> u32 {
 /// ntoskrnl 19041, as classes escalares não alocam e gravam o ULONG direto
 /// em `*output`: a TokenSessionId (12, o SeQuerySessionIdToken que o ndis.sys
 /// pede), as booleanas de TokenFlags (23, 24, 26, 29), a
-/// TokenIntegrityLevel (25, o RID do SID de integridade) e a
-/// TokenAppContainerNumber (32, o número do LowboxNumberEntry; o OpenNT não
-/// atribui números LowBox, então é 0). A TokenAppContainerSid (31) aloca um
-/// TOKEN_APPCONTAINER_INFORMATION com o SID do pacote logo depois (só o
-/// ponteiro nulo sem AppContainer). O win32k consulta 25, 26, 31 e 32 no
-/// callout de processo de todo processo GUI.
+/// TokenIntegrityLevel (25, o RID do SID de integridade), a
+/// TokenAppContainerNumber (32, o número do LowboxNumberEntry, 0 sem ele) e
+/// a TokenIsLessPrivilegedAppContainer (46, um LowBox com WIN://NOALLAPPPKG).
+/// A TokenAppContainerSid (31) aloca um TOKEN_APPCONTAINER_INFORMATION com o
+/// SID do pacote logo depois (só o ponteiro nulo sem AppContainer) e a
+/// TokenCapabilities (30) um TOKEN_GROUPS. O win32k consulta 25, 26, 31 e 32
+/// no callout de processo de todo processo GUI.
 pub fn query_information(token: u64, class: u32, output: u64) -> Result<u32, KernelError> {
     let Some(record) = tokens::get(token).filter(|record| record.refs > 0) else {
         return Ok(STATUS_INVALID_PARAMETER);
@@ -151,7 +156,39 @@ pub fn query_information(token: u64, class: u32, output: u64) -> Result<u32, Ker
             return Ok(0);
         }
         TOKEN_APP_CONTAINER_NUMBER => {
-            out::<u32>(output).set(0);
+            out::<u32>(output).set(record.lowbox_number.map_or(0, |(_, number)| number));
+            return Ok(0);
+        }
+        // TokenIsLessPrivilegedAppContainer (0x6d08a3): um LowBox que o
+        // SepCanTokenMatchAllPackageSid recusa.
+        TOKEN_IS_LESS_PRIVILEGED_APP_CONTAINER => {
+            let lowbox = tokens::body(token).token_flags.get() & TOKEN_LOWBOX != 0;
+            out::<u32>(output).set((lowbox && tokens::less_privileged(&record)) as u32);
+            return Ok(0);
+        }
+        // TokenCapabilities (0x6d04e3): um TOKEN_GROUPS alocado com o vetor
+        // em +8 e os SIDs depois de sizeof(TOKEN_GROUPS) + Count * 16 (o
+        // RtlCopySidAndAttributesArray).
+        TOKEN_CAPABILITIES => {
+            let count = record.capabilities.len();
+            let sids_at = 0x18 + count * 16;
+            let length = sids_at + record.capabilities.iter().map(|group| group.sid.len()).sum::<usize>();
+            let base = guest::alloc_bytes(length as u64);
+            if base == 0 {
+                return Ok(STATUS_INSUFFICIENT_RESOURCES);
+            }
+            let mut bytes = alloc::vec![0u8; length];
+            bytes[..4].copy_from_slice(&(count as u32).to_le_bytes());
+            let mut sid_at = sids_at;
+            for (index, group) in record.capabilities.iter().enumerate() {
+                let entry = 8 + index * 16;
+                bytes[entry..entry + 8].copy_from_slice(&(base + sid_at as u64).to_le_bytes());
+                bytes[entry + 8..entry + 12].copy_from_slice(&group.attributes.to_le_bytes());
+                bytes[sid_at..sid_at + group.sid.len()].copy_from_slice(&group.sid);
+                sid_at += group.sid.len();
+            }
+            guest::write_bytes(base, &bytes);
+            out::<u64>(output).set(base);
             return Ok(0);
         }
         TOKEN_APP_CONTAINER_SID => {

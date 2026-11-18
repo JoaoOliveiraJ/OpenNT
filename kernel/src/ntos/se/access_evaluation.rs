@@ -40,10 +40,14 @@
 //!    MAXIMUM_ALLOWED as permitidas acumulam o que nenhuma negada anterior
 //!    tirou e as negadas o que nenhuma permitida anterior deu. Um token
 //!    restrito repete a passagem com os SIDs restritos (só os direitos de
-//!    escrita num WRITE_RESTRICTED) e o resultado é a interseção; um token
-//!    LowBox repete com o pacote, ALL APPLICATION PACKAGES (fora do LPAC) e
-//!    as capacidades. O resultado é o já concedido mais o obtido; zero é
-//!    negado.
+//!    escrita num WRITE_RESTRICTED) e o resultado é a interseção; num token
+//!    LowBox cada direito pedido também precisa vir de uma ACE de permissão
+//!    de pacote ou de capacidade (o SepMatchPackage 0x24deb8 e o
+//!    SepMatchCapability 0x31070c: o pacote do token, ALL RESTRICTED
+//!    APPLICATION PACKAGES, ALL APPLICATION PACKAGES fora do LPAC e as
+//!    capacidades habilitadas), sem que ACEs de negação desses SIDs contem;
+//!    com MAXIMUM_ALLOWED o concedido é cortado pelo que essas ACEs dão. O
+//!    resultado é o já concedido mais o obtido; zero é negado.
 //!
 //! As máscaras das ACEs entram como estão (o NT não as mapeia aqui: o
 //! SeAssignSecurity e o SeSetSecurityDescriptorInfo já gravam as ACEs
@@ -144,7 +148,7 @@ impl Subject {
             mandatory_policy: token.mandatory_policy,
             package: token.app_container.clone(),
             capabilities: token.capabilities.iter().map(|group| (group.sid.clone(), group.attributes)).collect(),
-            less_privileged_app_container: token.less_privileged_app_container,
+            less_privileged_app_container: crate::ntos::se::token::tokens::less_privileged(token),
         }
     }
 
@@ -256,25 +260,39 @@ pub fn sid_in_token(subject: &Subject, ace_sid: &[u8], deny: bool) -> bool {
     sid_in_subject(subject, ace_sid, deny, false, false)
 }
 
-/// As identidades de pacote de um token LowBox: o pacote, ALL RESTRICTED
-/// APPLICATION PACKAGES, ALL APPLICATION PACKAGES (fora do LPAC) e as
-/// capacidades habilitadas.
-fn package_identities(subject: &Subject) -> Vec<(Sid, u32)> {
-    let mut identities = Vec::new();
-    if let Some(package) = &subject.package {
-        identities.push((package.clone(), SE_GROUP_ENABLED));
-        identities.push((sid(15, &[2, 2]), SE_GROUP_ENABLED));
-        if !subject.less_privileged_app_container {
-            identities.push((sid(15, &[2, 1]), SE_GROUP_ENABLED));
+/// O SepMatchPackage e o SepMatchCapability de uma ACE de permissão para um
+/// token LowBox. Um SID de pacote (S-1-15-2-...) de duas subautoridades é um
+/// dos grupos de todos os pacotes: ALL APPLICATION PACKAGES (S-1-15-2-1)
+/// casa fora do LPAC (sem WIN://NOALLAPPPKG), ALL RESTRICTED APPLICATION
+/// PACKAGES (S-1-15-2-2) sempre e outro valor nunca; os demais casam com o
+/// pacote do token. Um SID de capacidade (S-1-15-3-...) casa com uma
+/// capacidade habilitada do token (o SepSidInTokenSidHash do
+/// CapabilitiesHash).
+fn package_ace_matches(subject: &Subject, ace_sid: &[u8]) -> bool {
+    use crate::ntos::se::token::lowbox::{is_capability_sid, is_package_sid};
+    if is_package_sid(ace_sid) {
+        if ace_sid[1] == 2 {
+            return match u32_at(ace_sid, 12) {
+                1 => !subject.less_privileged_app_container,
+                2 => true,
+                _ => false,
+            };
         }
-        identities.extend(subject.capabilities.iter().filter(|(_, attributes)| attributes & SE_GROUP_ENABLED != 0).cloned());
+        return subject.package.as_deref() == Some(ace_sid);
     }
-    identities
+    is_capability_sid(ace_sid) && subject.capabilities.iter().any(|(entry, attributes)| entry.as_slice() == ace_sid && attributes & SE_GROUP_ENABLED != 0)
 }
 
-/// A passagem de pacote: os SIDs de pacote no lugar dos restritos.
-fn package_subject(subject: &Subject) -> Subject {
-    Subject { restricted_sids: package_identities(subject), ..Subject::default() }
+/// O acesso que a DACL dá ao token LowBox pelas ACEs de permissão de pacote
+/// e de capacidade (o que o SepMatchPackage e o SepMatchCapability acumulam
+/// durante o SepNormalAccessCheck e o SepMaximumAccessCheck). As ACEs de
+/// negação não entram: o SepSidInToken das negadas só olha o usuário e os
+/// grupos.
+fn package_granted(dacl: &[u8], subject: &Subject) -> u32 {
+    entries(dacl)
+        .iter()
+        .filter(|entry| effective(entry) && is_allow(entry.kind) && package_ace_matches(subject, entry.sid.unwrap_or_default()))
+        .fold(0, |granted, entry| granted | entry.mask)
 }
 
 /// A ACE vale para a avaliação (não é inherit-only, tem SID e não é uma ACE
@@ -459,6 +477,9 @@ fn finish(granted: u32) -> Result<u32, u32> {
 
 /// SepAccessCheck: privilégios, DACL, segunda passagem restrita e de pacote.
 fn sep_access_check(descriptor: &OwnedDescriptor, subject: &Subject, desired: u32, previous: u32, mapping: &[u32; 4], is_owner: bool) -> Result<u32, u32> {
+    // O LowBox confere o pedido de entrada inteiro contra as ACEs de pacote
+    // (o DesiredAccess original do SepAccessCheck, 0x2d0032).
+    let requested = desired;
     let (mut desired, mut previous) = (desired, previous);
     if desired & ACCESS_SYSTEM_SECURITY != 0 {
         if !subject.privileged(SE_SECURITY_PRIVILEGE) {
@@ -496,7 +517,7 @@ fn sep_access_check(descriptor: &OwnedDescriptor, subject: &Subject, desired: u3
         if subject.restricted() && desired & restriction != 0 && normal_access_check(dacl, subject, desired & restriction, true, is_owner) != 0 {
             return Err(STATUS_ACCESS_DENIED);
         }
-        if subject.lowbox() && normal_access_check(dacl, &package_subject(subject), desired, true, false) != 0 {
+        if subject.lowbox() && requested & !package_granted(dacl, subject) != 0 {
             return Err(STATUS_ACCESS_DENIED);
         }
         return finish(previous | desired);
@@ -506,7 +527,7 @@ fn sep_access_check(descriptor: &OwnedDescriptor, subject: &Subject, desired: u3
         granted &= maximum_access_check(dacl, subject, true, is_owner) | !restriction;
     }
     if subject.lowbox() {
-        granted &= maximum_access_check(dacl, &package_subject(subject), true, false);
+        granted &= package_granted(dacl, subject);
     }
     if desired & !MAXIMUM_ALLOWED & !granted != 0 {
         return Err(STATUS_ACCESS_DENIED);

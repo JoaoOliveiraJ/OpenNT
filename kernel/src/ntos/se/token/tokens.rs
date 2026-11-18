@@ -42,6 +42,27 @@ const _: () = {
 
 /// TOKEN_LOWBOX em TokenFlags: token de AppContainer.
 const TOKEN_LOWBOX: u32 = 0x4000;
+/// TOKEN_NOT_LOW em TokenFlags: integridade Medium ou acima.
+const TOKEN_NOT_LOW: u32 = 0x2000;
+const SECURITY_MANDATORY_MEDIUM_RID: u32 = 0x2000;
+
+/// O nível de um SID de integridade (a última subautoridade; 0 sem nenhuma
+/// ou sem SID).
+pub fn integrity_level(integrity: &[u8]) -> u32 {
+    let count = integrity.get(1).copied().unwrap_or(0) as usize;
+    let at = 8 + 4 * count;
+    if count == 0 || integrity.len() < at {
+        return 0;
+    }
+    u32::from_le_bytes([integrity[at - 4], integrity[at - 3], integrity[at - 2], integrity[at - 1]])
+}
+
+/// O AppContainer de privilégio menor (LPAC): o token não casa com ALL
+/// APPLICATION PACKAGES (o SepCanTokenMatchAllPackageSid sobre o atributo
+/// WIN://NOALLAPPPKG).
+pub fn less_privileged(token: &Token) -> bool {
+    !super::lowbox::can_match_all_packages(&token.security_attributes)
+}
 /// TOKEN_SESSION_NOT_REFERENCED em TokenFlags: o token não segura mais a
 /// sessão de logon dele.
 pub const TOKEN_SESSION_NOT_REFERENCED: u32 = 0x20;
@@ -190,7 +211,12 @@ pub struct Token {
     pub bno_prefix: String,
     pub app_container: Option<Sid>,
     pub capabilities: Vec<Group>,
-    pub less_privileged_app_container: bool,
+    /// O LowboxNumberEntry (TOKEN+0x438) que o token referencia: a sessão da
+    /// tabela e o número LowBox (`se/token/lowbox.rs`).
+    pub lowbox_number: Option<(u32, u32)>,
+    /// O LowboxHandlesEntry (TOKEN+0x440): a entrada de handles guardados da
+    /// sessão de logon e do pacote que o token referencia.
+    pub lowbox_handles: Option<super::lowbox::HandlesKey>,
     pub server_silo: u64,
     pub network_access_flags: u32,
     /// DACL do objeto token (controla a abertura deste token).
@@ -458,7 +484,10 @@ pub fn create(parent: Option<u64>, initialize: Option<&dyn Fn(&mut Token)>) -> R
         bno_prefix: String::new(),
         app_container: parent.as_ref().and_then(|parent| parent.app_container.clone()),
         capabilities: parent.as_ref().map_or_else(Vec::new, |parent| parent.capabilities.clone()),
-        less_privileged_app_container: parent.as_ref().is_some_and(|parent| parent.less_privileged_app_container),
+        // A cópia referencia o número LowBox e a entrada de handles da
+        // origem (o SepDuplicateToken incrementa as duas entradas).
+        lowbox_number: parent.as_ref().and_then(|parent| parent.lowbox_number),
+        lowbox_handles: parent.as_ref().and_then(|parent| parent.lowbox_handles.clone()),
         server_silo: parent.as_ref().map_or(0, |parent| parent.server_silo),
         network_access_flags: parent.as_ref().map_or(0, |parent| parent.network_access_flags),
         security: SecurityPolicy { owner: user.clone(), dacl: Some(alloc::vec![Ace::allow(user.clone(), 0x1F01FF)]), ..Default::default() },
@@ -485,8 +514,17 @@ pub fn create(parent: Option<u64>, initialize: Option<&dyn Fn(&mut Token)>) -> R
         guest::free_bytes(pointer);
         return Err(error);
     }
-    if let Some(flags) = inherited_flags {
-        body(pointer).token_flags.set(flags);
+    if let Some((session, number)) = token.lowbox_number {
+        super::lowbox::retain_number(session, number);
+    }
+    if let Some(key) = &token.lowbox_handles {
+        super::lowbox::retain_handles(key);
+    }
+    match inherited_flags {
+        Some(flags) => body(pointer).token_flags.set(flags),
+        // O SepCreateTokenEx do SeMakeSystemToken: o grupo de integridade
+        // Medium ou acima dá TOKEN_NOT_LOW.
+        None => body(pointer).token_flags.set(if integrity_level(&token.integrity) >= SECURITY_MANDATORY_MEDIUM_RID { TOKEN_NOT_LOW } else { 0 }),
     }
     publish_body(&token);
     let logon_session = (token.authentication_id, token.server_silo);
@@ -525,15 +563,24 @@ pub fn release(pointer: u64) -> Result<u64, KernelError> {
         token.refs -= 1;
         let remaining = token.refs;
         let mut logon_reference = None;
+        let mut lowbox = (None, None);
         if remaining == 0 {
-            logon_reference = tokens.records.remove(&pointer).and_then(|token| token.logon_reference);
+            if let Some(token) = tokens.records.remove(&pointer) {
+                logon_reference = token.logon_reference;
+                lowbox = (token.lowbox_number, token.lowbox_handles);
+            }
             release_storage(&mut tokens, pointer);
         }
-        (remaining, logon_reference)
+        (remaining, logon_reference, lowbox)
     };
-    let (remaining, logon_reference) = remaining;
+    let (remaining, logon_reference, (lowbox_number, lowbox_handles)) = remaining;
     if remaining == 0 {
-        // SepTokenDeleteMethod: a referência à sessão de logon sai com o token.
+        // SepTokenDeleteMethod: um token que ainda segura a sessão de logon
+        // solta o número LowBox e a entrada de handles guardados; a
+        // referência à sessão de logon sai com o token.
+        if body(pointer).token_flags.get() & TOKEN_SESSION_NOT_REFERENCED == 0 {
+            super::lowbox::release_state(lowbox_number, lowbox_handles);
+        }
         if let Some((logon_id, server_silo)) = logon_reference {
             crate::ntos::se::logon_session::dereference_for_token(logon_id, server_silo);
         }
@@ -618,6 +665,12 @@ pub fn sub_process_token(source: u64, session_id: u32, explicit: bool) -> Result
         }),
     )?;
     body(copy).token_flags.atomic().fetch_and(!TOKEN_AUDIT_NO_CHILD_PROCESS, core::sync::atomic::Ordering::SeqCst);
+    // Um token LowBox levado a outra sessão troca de tabela de números
+    // LowBox (o SepSetTokenLowboxNumber na sessão nova).
+    if let Err(status) = super::lowbox::move_to_session(copy, session_id) {
+        let _ = release(copy);
+        return Err(KernelError::with_status("SeSubProcessToken: número LowBox na sessão nova", status));
+    }
     let creator = if explicit { None } else { crate::ntos::ob::object_access::subject().filter(|&subject| exists(subject)) };
     if let Some(policy) = super::duplicate::default_policy(creator.unwrap_or(copy)) {
         update(copy, |token| token.security = policy);

@@ -424,8 +424,15 @@ fn subject_from_access_information(information: u64) -> Option<Subject> {
         mandatory_policy: information.mandatory_policy.policy.get(),
         package: (package != 0).then(|| read_sid(package)),
         capabilities: hash_entries(information.capabilities_hash.get()),
-        less_privileged_app_container: false,
+        less_privileged_app_container: less_privileged(information.security_attributes.get()),
     })
+}
+
+/// O LPAC de um conjunto de atributos no formato interno (o
+/// SepCanTokenMatchAllPackageSid sobre o WIN://NOALLAPPPKG); sem conjunto
+/// legível, um AppContainer comum.
+fn less_privileged(attributes: u64) -> bool {
+    attributes != 0 && crate::ntos::se::security_attributes::decode_internal(attributes).is_ok_and(|list| !crate::ntos::se::token::lowbox::can_match_all_packages(&list))
 }
 
 /// SeAccessCheckFromState(Sd, PrimaryTokenInfo, ClientTokenInfo, Desired,
@@ -592,6 +599,8 @@ fn subject_from_token(token: u64) -> Option<Subject> {
         mandatory_policy: native.mandatory_policy.get(),
         package: (package != 0).then(|| read_sid(package)),
         capabilities: read_array(native.capabilities.get(), native.capability_count.get()),
+        // O SeTokenFromAccessInformation do OpenNT não publica os atributos
+        // de segurança no `_TOKEN` montado: um AppContainer comum.
         less_privileged_app_container: false,
     })
 }

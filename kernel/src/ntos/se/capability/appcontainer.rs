@@ -85,15 +85,16 @@ pub fn check(token_or_handle: u64, output: u64) -> Result<u32, KernelError> {
 /// duas entradas no mapa de números LowBox da sessão (g_SessionLowboxArray /
 /// SepGetTokenSessionMapEntry + SepFindMatchingLowBoxNumberEntries) e compara
 /// os SIDs de pacote com RtlIsParentOfChildAppContainer
-/// (`rtl::security::is_parent_of_child_app_container`).
-///
-/// Stub honesto: o OpenNT não atribui números LowBox (NtCreateLowBoxToken
-/// não existe), então o mapa da sessão é vazio, a busca falha e o resultado é
-/// FALSE — o mesmo que o NT devolve para números sem entrada.
-pub fn is_parent_of_child_lowbox(_session_id: u32, parent_lowbox_number: u32, child_lowbox_number: u32) -> bool {
+/// (`rtl::security::is_parent_of_child_app_container`). Os números são os
+/// que o NtCreateLowBoxToken atribui (`se/token/lowbox.rs`); um número sem
+/// entrada na sessão dá FALSE.
+pub fn is_parent_of_child_lowbox(session_id: u32, parent_lowbox_number: u32, child_lowbox_number: u32) -> bool {
+    use crate::ntos::se::token::lowbox;
     if parent_lowbox_number == 0 || child_lowbox_number == 0 {
         return false;
     }
-    // Mapa LowBox da sessão vazio: nenhuma das duas entradas é encontrada.
-    false
+    match (lowbox::package_of_number(session_id, parent_lowbox_number), lowbox::package_of_number(session_id, child_lowbox_number)) {
+        (Some(parent), Some(child)) => crate::ntos::rtl::security::is_parent_of_child_app_container(&parent, &child),
+        _ => false,
+    }
 }

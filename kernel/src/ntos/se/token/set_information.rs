@@ -204,7 +204,8 @@ fn set_integrity_level(token: u64, label: &Sid, mode: u8) -> u32 {
     if level < current {
         clear_flags(TOKEN_UIACCESS);
     }
-    tokens::update(token, |record| {
+    let mut lowbox_state = (None, None);
+    let status = tokens::update(token, |record| {
         let count = record.integrity.get(1).copied().unwrap_or(0) as usize;
         if count == 0 || record.integrity.len() < 8 + count * 4 {
             return STATUS_INVALID_PARAMETER;
@@ -226,7 +227,8 @@ fn set_integrity_level(token: u64, label: &Sid, mode: u8) -> u32 {
             clear_flags(TOKEN_NOT_LOW);
         } else {
             // SepRemoveAceFromTokenDefaultDacl: a primeira ACE do SID de
-            // pacote; depois o pacote e as capacidades.
+            // pacote; depois o pacote, as capacidades, o LowboxNumberEntry
+            // e o LowboxHandlesEntry (0x6ee71b..0x6ee7c3).
             if let Some(package) = record.app_container.take() {
                 if let Some(dacl) = record.default_dacl.as_mut() {
                     if let Some(index) = dacl.iter().position(|ace| ace.sid.as_ref() == Some(&package)) {
@@ -234,12 +236,17 @@ fn set_integrity_level(token: u64, label: &Sid, mode: u8) -> u32 {
                     }
                 }
                 record.capabilities.clear();
+                lowbox_state = (record.lowbox_number.take(), record.lowbox_handles.take());
             }
             flags.atomic().fetch_or(TOKEN_NOT_LOW, core::sync::atomic::Ordering::SeqCst);
         }
         0
     })
-    .unwrap_or(STATUS_INVALID_PARAMETER)
+    .unwrap_or(STATUS_INVALID_PARAMETER);
+    // As entradas largadas fora da trava dos tokens (a última referência
+    // fecha os handles guardados).
+    super::lowbox::release_state(lowbox_state.0, lowbox_state.1);
+    status
 }
 
 /// O corpo do NtSetInformationToken sobre o token já referenciado (o

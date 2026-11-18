@@ -126,7 +126,7 @@ pub fn check(descriptor: u64, desired: u32) -> Result<u32, KernelError> {
         // A autorização do usuário não remove o isolamento do AppContainer.
         let mut identifiers = alloc::vec![Group { sid: app_container, attributes: 4 }, Group { sid: ALL_RESTRICTED_APPLICATION_PACKAGES.to_vec(), attributes: 4 }];
         identifiers.extend(token.capabilities.iter().cloned());
-        if !token.less_privileged_app_container {
+        if !tokens::less_privileged(&token) {
             identifiers.push(Group { sid: ALL_APPLICATION_PACKAGES.to_vec(), attributes: 4 });
         }
         restricted_pass(&policy, &token, identifiers, desired)

@@ -1,7 +1,7 @@
 //! Tokens de acesso: o objeto token, duplicação, consulta (por handle e pelo
 //! kernel), abertura, referência, associação, estatísticas, handles, tokens
-//! de thread e anônimos, o ajuste de privilégios, a comparação de tokens e
-//! a elevação e o par de tokens do UAC.
+//! de thread e anônimos, o ajuste de privilégios, a comparação de tokens, a
+//! elevação e o par de tokens do UAC e os tokens LowBox (AppContainer).
 
 pub mod tokens;
 pub mod statistics;
@@ -27,3 +27,4 @@ pub mod assignable;
 pub mod adjust_groups;
 pub mod compare;
 pub mod elevation;
+pub mod lowbox;

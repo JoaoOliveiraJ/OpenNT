@@ -412,6 +412,29 @@ fn nt_create_token_ex(handle: u64, access: u64, attributes: u64, token_type: u64
     crate::ntos::se::token::create::create(&request, 1)
 }
 
+/// NtCreateLowBoxToken(TokenHandle, ExistingTokenHandle, DesiredAccess,
+/// ObjectAttributes, PackageSid, CapabilityCount, Capabilities, HandleCount,
+/// Handles) (`se/token/lowbox`): o token de AppContainer que o
+/// BasepCreateLowBox do kernelbase pede para o CreateProcess com
+/// SECURITY_CAPABILITIES, com os handles dos diretórios do AppContainer.
+fn nt_create_low_box_token(handle: u64, existing: u64, access: u64, attributes: u64, rsp: u64) -> Result<u32, KernelError> {
+    if !state::probe_syscall_stack(rsp, 5 * 8) {
+        return Ok(0xC000_0005);
+    }
+    let request = crate::ntos::se::token::lowbox::Request {
+        token_handle: token_argument(1, handle),
+        existing_token: token_argument(2, existing),
+        desired_access: access as u32,
+        object_attributes: token_argument(4, attributes),
+        package_sid: stack_arg(rsp, 5),
+        capability_count: state::stack_arg32(rsp, 6),
+        capabilities: stack_arg(rsp, 7),
+        handle_count: state::stack_arg32(rsp, 8),
+        handles: stack_arg(rsp, 9),
+    };
+    crate::ntos::se::token::lowbox::create(&request, 1)
+}
+
 /// NtSetInformationToken(TokenHandle, TokenInformationClass,
 /// TokenInformation, TokenInformationLength) (`se/token/set_information`):
 /// a classe é conferida antes do handle, que pede o acesso dela.
@@ -625,6 +648,7 @@ pub fn init() {
     state::register_handler("NtAccessCheckByType", nt_access_check_by_type);
     state::register_handler("NtSetInformationToken", nt_set_information_token);
     state::register_handler("NtCreateTokenEx", nt_create_token_ex);
+    state::register_handler("NtCreateLowBoxToken", nt_create_low_box_token);
     state::register_handler("NtAdjustPrivilegesToken", nt_adjust_privileges_token);
     state::register_handler("NtAdjustGroupsToken", nt_adjust_groups_token);
     state::register_handler("NtOpenProcessToken", nt_open_process_token);
