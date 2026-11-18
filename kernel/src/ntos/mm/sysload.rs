@@ -850,10 +850,7 @@ pub fn load_system_image(file_name: u64, prefix: u64, loaded_base_name: u64, fla
         }
         if session && crate::ntos::mm::session_image::is_session_image(image_base) {
             return Ok(match crate::ntos::mm::session_image::load_into_current(image_base) {
-                Ok(_) => {
-                    crate::ntos::init::initial_process::session_image_loaded(crate::ntos::mm::session::session_id(crate::ntos::ps::process::get_current_process()), &base_name);
-                    0
-                }
+                Ok(_) => 0,
                 Err(error) => {
                     debug_print!("[mm] MmLoadSystemImage {} na sessao: {}", path, error);
                     base_out.set(0);
@@ -887,7 +884,6 @@ pub fn load_system_image(file_name: u64, prefix: u64, loaded_base_name: u64, fla
     base_out.set(image.image_base);
     if session {
         crate::ntos::mm::session_image::register(entry, image);
-        crate::ntos::init::initial_process::session_image_loaded(crate::ntos::mm::session::session_id(crate::ntos::ps::process::get_current_process()), &base_name);
     } else {
         SYSTEM_IMAGES.lock().insert(entry, image);
     }

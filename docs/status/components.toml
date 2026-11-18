@@ -263,7 +263,7 @@ titulo = "Tela de logon do LogonUI.exe pelo dwm.exe"
 marcador = "LOGON_SCREEN_OK"
 comando = "cargo xtask test-boot LOGON_SCREEN_OK 900000 --initial-process=smss --display=basic --build-dir=build/tela-de-logon --smp=1 --watch-screen --capture-every=30"
 espera_falha = true
-descricao = "O boot do teste primeiro-pixel até a tela de logon. O xtask lê a tela do QEMU a cada 2 s (--watch-screen); depois do FIRST_PIXEL_OK, o marcador LOGON_SCREEN_OK sai quando duas leituras seguidas mostram a mesma tela de logon: um quarto ou mais da tela fora do preto, a maior parte dos pixels vizinhos parecidos (uma imagem, não bytes quaisquer lidos como cor), 8 cores ou mais com 1/1536 da tela cada (512 pixels) e desenho em 3/5 das linhas e 3/5 das colunas. A tela de bloqueio de uma instalação nova (o Web\\Screen\\img100.jpg cobrindo a tela, com o relógio e a data) passa, também sem o texto; o ponteiro do mouse, uma cor lisa com texto (o LogonUI sem a imagem), memória lida como cor e um quadro pela metade não passam. A tela vai para build/tela-de-logon/tela-de-logon.png e, no cargo xtask capturas, para a captura do site. Com o --capture-every=30, as telas que mudaram durante o teste ficam em build/tela-de-logon/tela-NNNN.png e a do fim em tela-final.png; no test-all, a pasta de uma falha fica com elas. Ainda falha: depois da conexão da sessão 1, o winlogon cria o dwm.exe e o LogonUI.exe, mas a interface XAML do LogonUI composta pelo dwm sobre o adaptador WARP do BasicRender ainda não aparece."
+descricao = "O boot do teste primeiro-pixel até a tela de logon. O xtask lê a tela do QEMU a cada 2 s (--watch-screen); depois do FIRST_PIXEL_OK, o marcador LOGON_SCREEN_OK sai quando duas leituras seguidas mostram a mesma tela de logon: um quarto ou mais da tela fora do preto, a maior parte dos pixels vizinhos parecidos (uma imagem, não bytes quaisquer lidos como cor), 8 cores ou mais com 1/1536 da tela cada (512 pixels) e desenho em 3/5 das linhas e 3/5 das colunas. A tela de bloqueio de uma instalação nova (o Web\\Screen\\img100.jpg cobrindo a tela, com o relógio e a data) passa, também sem o texto; o ponteiro do mouse, uma cor lisa com texto (o LogonUI sem a imagem), memória lida como cor e um quadro pela metade não passam. A tela vai para build/tela-de-logon/tela-de-logon.png e, no cargo xtask capturas, para a captura do site. Com o --capture-every=30, as telas que mudaram durante o teste ficam em build/tela-de-logon/tela-NNNN.png e a do fim em tela-final.png; no test-all, a pasta de uma falha fica com elas. Ainda falha: o winlogon cria o dwm.exe e o LogonUI.exe (testes dwm e logonui), mas os dois terminam antes de a interface XAML do LogonUI ser composta pelo dwm sobre o adaptador WARP do BasicRender."
 
 [[teste]]
 id = "services"
@@ -292,6 +292,34 @@ titulo = "svchost do DcomLaunch e o canal do serviço Power"
 marcador = "pedido de conexao aceito"
 comando = "cargo xtask test-boot USER_INITIALIZED 900000 --initial-process=smss --display=basic --build-dir=build/svchost-dcomlaunch --smp=1 --expect=SERVICES_STARTED \"--expect=criou svchost.exe\" \"--expect=pedido de conexao aceito\""
 descricao = "O boot do teste services-scm até o svchost do grupo DcomLaunch. O CreateProcessAsUserW do services.exe cria o svchost com o token do logon de serviço: o PspAllocateProcess faz o RtlAcquirePrivilege (o SeAssignPrimaryTokenPrivilege no token primário de quem chama) ou aceita o token pelo SeIsTokenAssignableToProcess. O svchost roda os ServiceDll do grupo no mesmo processo. O umpo.dll do serviço Power conecta ao \\PowerPort, a porta ALPC que o kernel cria no PopUmpoInitializeChannel, com um objeto Callback ligado pelo NtAlpcSetInformation 9; o kernel aceita o primeiro cliente (pedido de conexao aceito). Depois o umpo sobe o endpoint umpo e pede o NtPowerInformation de modo usuário (PlatformInformation e PowerInformationInternal 4)."
+
+[[teste]]
+id = "lsm"
+titulo = "Local Session Manager no svchost do DcomLaunch"
+marcador = "TERMSRV_READY"
+comando = "cargo xtask test-boot USER_INITIALIZED 900000 --initial-process=smss --display=basic --build-dir=build/lsm --smp=1 --expect=SERVICES_STARTED --expect=SVCHOST_LSM_STARTED --expect=TERMSRV_READY"
+descricao = "O boot do teste svchost-dcomlaunch até o Local Session Manager. O svchost do grupo DcomLaunch carrega o lsm.dll, o ServiceDll do LSM (SVCHOST_LSM_STARTED). O LSM conecta ao \\SmApiPort do smss, cria a \\SmSsWinStationApiPort e pede ao smss os processos das sessões 0 e 1. Depois conecta ao \\RPC Control\\epmapper do svchost do rpcss, sobe o \\RPC Control\\LSMApi e sinaliza o \\BaseNamedObjects\\TermSrvReadyEvent (TERMSRV_READY), que o winlogon e o csrss de cada sessão esperam (teste conexao-console)."
+
+[[teste]]
+id = "conexao-console"
+titulo = "Conexão da sessão 1 ao console pelo Local Session Manager"
+marcador = "SESSION1_CONNECTED"
+comando = "cargo xtask test-boot USER_INITIALIZED 900000 --initial-process=smss --display=basic --build-dir=build/conexao-console --smp=1 --expect=TERMSRV_READY --expect=SESSION1_CONNECTED"
+descricao = "O boot do teste lsm até a conexão da sessão 1 ao console. Com o TermSrvReadyEvent sinalizado, o csrss das sessões 0 e 1 conecta à \\SmSsWinStationApiPort do LSM e o winlogon da sessão 1 chama o LSM pelo \\RPC Control\\LSMApi. O LSM manda ao csrss da sessão 1 o comando DoConnect do console. O W32WinStationDoConnect do winsrvext.dll chama o NtUserRemoteConnect (o xxxRemoteConnect do win32k, com a tela da sessão já inicializada), o CsrConnectToUser e o CtxInitUser32, que carrega no csrss os cursores e os ícones do sistema, e cria a \\RPC Control\\AutoRotationApiPort (SESSION1_CONNECTED). O csrss devolve o resultado ao LSM pela mesma conexão ALPC e o winlogon segue (testes dwm e logonui)."
+
+[[teste]]
+id = "dwm"
+titulo = "dwm.exe real da sessão 1"
+marcador = "DWM_STARTED"
+comando = "cargo xtask test-boot USER_INITIALIZED 900000 --initial-process=smss --display=basic --build-dir=build/dwm --smp=1 --expect=SESSION1_CONNECTED --expect=DWM_STARTED"
+descricao = "O boot do teste conexao-console até o dwm.exe. Depois da conexão, o winlogon da sessão 1 carrega o uxinit.dll, que abre o tema Aero (o Aero.msstyles), e o dwminit.dll, que cria o dwm.exe da sessão 1 (DWM_STARTED). O dwm compõe a tela sobre o adaptador WARP do BasicRender (teste tela-de-logon)."
+
+[[teste]]
+id = "logonui"
+titulo = "LogonUI.exe real da sessão 1"
+marcador = "LOGONUI_STARTED"
+comando = "cargo xtask test-boot USER_INITIALIZED 900000 --initial-process=smss --display=basic --build-dir=build/logonui --smp=1 --expect=SESSION1_CONNECTED --expect=LOGONUI_STARTED"
+descricao = "O boot do teste conexao-console até o LogonUI.exe. Depois da conexão, o winlogon da sessão 1 carrega o tema, reabre as Desktops Default, Disconnect e Winlogon da WinSta0 e cria o LogonUI.exe pelo NtCreateUserProcess (LOGONUI_STARTED). O LogonUI mostra a interface XAML da tela de logon, que o dwm compõe (teste tela-de-logon)."
 
 [[teste]]
 id = "pagefile"
@@ -1592,9 +1620,9 @@ notas = "Uma suíte planejada conta como pronta quando o arquivo de teste de mes
 # faz (uma linha: o que funciona) e para (opcional: onde para).
 
 [marco]
-atual = "Na sessão 0, o wininit.exe real cria o services.exe e o lsass.exe reais. O lsass instala o banco de política e o banco de contas de um sistema novo, inicializa a auditoria, as sessões de logon, as credenciais e os pacotes de segurança e publica as interfaces RPC do LSA; o services.exe consulta o domínio da conta no lsass, publica a interface RPC do gerenciador de serviços e cria os svchost dos grupos DcomLaunch e rpcss com o token do logon de serviço; sobem o Power, o DcomLaunch, o RpcEptMapper e o RpcSs, e o lsm.dll do Local Session Manager é carregado. Na sessão 1, o winlogon.exe real registra o processo de logon pelo RPC de kernel do msrpc.sys, abre as Desktops Winlogon, Disconnect e Default da WinSta0 dele e chama o SwitchDesktop; o InitVideo da sessão carrega o cdd.dll sobre o adaptador de renderização do BasicRender.sys e o win32k desenha o ponteiro do mouse na tela pelo BasicDisplay.sys (o primeiro pixel)."
-teste = "primeiro-pixel"
-proximo = "O Local Session Manager registrar o endpoint dele no epmapper (a conexão ALPC confere o RequiredServerSid contra o usuário do token do servidor, a conta NetworkService do svchost do rpcss), sinalizar o TermSrvReadyEvent e conectar a sessão 1 pela \\SmSsWinStationApiPort. Depois o winlogon cria o LogonUI e o dwm, que desenham a tela de logon."
+atual = "Na sessão 0, o wininit.exe real cria o services.exe e o lsass.exe reais. O lsass instala o banco de política e o banco de contas de um sistema novo, inicializa a auditoria, as sessões de logon, as credenciais e os pacotes de segurança e publica as interfaces RPC do LSA; o services.exe consulta o domínio da conta no lsass, publica a interface RPC do gerenciador de serviços e cria os svchost dos grupos DcomLaunch e rpcss com o token do logon de serviço; sobem o Power, o DcomLaunch, o RpcEptMapper e o RpcSs, e o Local Session Manager sobe no svchost do DcomLaunch e sinaliza o TermSrvReadyEvent. Na sessão 1, o winlogon.exe real registra o processo de logon pelo RPC de kernel do msrpc.sys, abre as Desktops Winlogon, Disconnect e Default da WinSta0 dele e chama o SwitchDesktop; o InitVideo da sessão carrega o cdd.dll sobre o adaptador de renderização do BasicRender.sys e o win32k desenha o ponteiro do mouse na tela pelo BasicDisplay.sys (o primeiro pixel). O LSM conecta a sessão 1 ao console pelo csrss dela, e o winlogon carrega o tema e cria o dwm.exe e o LogonUI.exe reais."
+teste = "logonui"
+proximo = "O dwm.exe e o LogonUI.exe seguirem até a tela de logon: o dwm compõe sobre o adaptador WARP do BasicRender a interface XAML que o LogonUI mostra."
 
 [[roda]]
 nome = "O smss.exe cria o csrss.exe"
@@ -1641,28 +1669,56 @@ nome = "O svchost do DcomLaunch"
 grupo = "marco"
 teste = "svchost-dcomlaunch"
 faz = "O services.exe cria o svchost do grupo DcomLaunch com o token do logon de serviço; o serviço Power (umpo.dll) conecta ao \\PowerPort do kernel, sobe o endpoint umpo e lê o NtPowerInformation de modo usuário."
-para = "O RpcSs e o RpcEptMapper sobem no svchost do rpcss e o lsm.dll é carregado; o LSM para no registro do endpoint RPC dele no epmapper (a conferência do RequiredServerSid na conexão ALPC)."
+para = "O RpcSs e o RpcEptMapper sobem no svchost do rpcss e o Local Session Manager sobe no svchost do DcomLaunch (teste lsm)."
+
+[[roda]]
+nome = "O Local Session Manager"
+grupo = "marco"
+teste = "lsm"
+faz = "O svchost do DcomLaunch carrega o lsm.dll; o LSM conecta ao smss pelo \\SmApiPort, cria a \\SmSsWinStationApiPort, sobe o \\RPC Control\\LSMApi e sinaliza o TermSrvReadyEvent."
+para = "O csrss e o winlogon da sessão 1 conectam ao LSM e o LSM conecta a sessão 1 ao console (teste conexao-console)."
+
+[[roda]]
+nome = "A sessão 1 conectada ao console"
+grupo = "marco"
+teste = "conexao-console"
+faz = "O LSM manda ao csrss da sessão 1 o DoConnect do console: o winsrvext.dll passa pelo NtUserRemoteConnect do win32k, conecta a thread dele ao user32, carrega os cursores e os ícones do sistema e cria a \\RPC Control\\AutoRotationApiPort."
+para = "O winlogon da sessão 1 carrega o tema e cria o dwm.exe e o LogonUI.exe (testes dwm e logonui)."
+
+[[roda]]
+nome = "O winlogon.exe cria o dwm.exe"
+grupo = "marco"
+teste = "dwm"
+faz = "Depois da conexão ao console, o winlogon.exe da sessão 1 carrega o uxinit.dll e o tema Aero e o dwminit.dll cria o dwm.exe real da sessão."
+para = "O dwm.exe ainda termina antes de compor o primeiro quadro (teste tela-de-logon)."
+
+[[roda]]
+nome = "O winlogon.exe cria o LogonUI.exe"
+grupo = "marco"
+teste = "logonui"
+faz = "Depois da conexão ao console, o winlogon.exe da sessão 1 reabre as Desktops da WinSta0 e cria o LogonUI.exe real da sessão."
+para = "O LogonUI.exe ainda termina antes de mostrar a interface XAML da tela de logon (teste tela-de-logon)."
 
 [[roda]]
 nome = "As Desktops do winlogon.exe"
 grupo = "marco"
 teste = "winlogon"
 faz = "O winlogon.exe real da sessão 1 registra o processo de logon pelo RPC de kernel do msrpc.sys, abre as Desktops Winlogon, Disconnect e Default da WinSta0 da sessão dele e chama o SwitchDesktop."
-para = "Depois do SwitchDesktop o winlogon carrega o winsta.dll e espera no WinStationWaitForConnect o TermSrvReadyEvent, que o Local Session Manager sinaliza quando sobe; o LSM roda no svchost do DcomLaunch e ainda para antes de sinalizar o evento (teste svchost-dcomlaunch)."
+para = "Depois do SwitchDesktop o winlogon carrega o winsta.dll e espera no WinStationWaitForConnect o TermSrvReadyEvent, que o Local Session Manager sinaliza quando sobe no svchost do DcomLaunch (teste lsm); depois o LSM conecta a sessão 1 ao console (teste conexao-console)."
 
 [[roda]]
 nome = "Primeiro pixel do win32k.sys"
 grupo = "marco"
 teste = "primeiro-pixel"
 faz = "O InitVideo da sessão 1 carrega o cdd.dll sobre o adaptador de renderização do BasicRender.sys, e o win32k desenha o ponteiro do mouse pelo BasicDisplay.sys: o primeiro pixel na tela."
-para = "A Desktop do Winlogon fica preta: a tela de logon (o LogonUI sobre o dwm, teste tela-de-logon) vem depois do Local Session Manager, que ainda não sinaliza o TermSrvReadyEvent."
+para = "A Desktop do Winlogon fica preta até a tela de logon (o LogonUI sobre o dwm, teste tela-de-logon)."
 
 [[roda]]
 nome = "Tela de logon"
 grupo = "marco"
 teste = "tela-de-logon"
 faz = "O xtask lê a tela do QEMU e espera a tela de logon depois do primeiro pixel: uma imagem cobrindo a tela, com 8 cores ou mais, igual em duas leituras seguidas."
-para = "O winlogon cria o dwm.exe e o LogonUI.exe, mas a primeira tela composta pelo dwm ainda não aparece."
+para = "O winlogon cria o dwm.exe e o LogonUI.exe (testes dwm e logonui), mas os dois terminam antes de desenhar a tela de logon."
 
 [[roda]]
 nome = "Tela de bugcheck do Windows 10"

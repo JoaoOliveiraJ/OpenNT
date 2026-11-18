@@ -114,7 +114,26 @@ pub fn record_creation(creator_pointer: u64, child_pointer: u64) {
     let (creator_id, child_id) = unsafe { (Eprocess::at(creator_pointer).unique_process_id.get(), Eprocess::at(child_pointer).unique_process_id.get()) };
     let creation = Creation { creator_id, creator_name: image_name(creator_pointer), child_pointer, child_id, child_name: image_name(child_pointer) };
     crate::debug_print!("[init] {} (pid {}) criou {} (pid {}) por NtCreateUserProcess", creation.creator_name, creation.creator_id, creation.child_name, creation.child_id);
+    logon_process_created(&creation, child_pointer);
     CREATIONS.lock().push(creation);
+}
+
+static DWM_STARTED: AtomicBool = AtomicBool::new(false);
+static LOGONUI_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// O winlogon.exe da sessão 1 criou um processo: o `DWM_STARTED` sai no
+/// primeiro dwm.exe (o que o dwminit.dll cria) e o `LOGONUI_STARTED` no
+/// primeiro LogonUI.exe (o do StartLogonUI), os dois depois da conexão do
+/// console (`SESSION1_CONNECTED`).
+fn logon_process_created(creation: &Creation, child_pointer: u64) {
+    if !creation.creator_name.eq_ignore_ascii_case("winlogon.exe") || crate::ntos::mm::session::session_id(child_pointer) != 1 {
+        return;
+    }
+    if creation.child_name.eq_ignore_ascii_case("dwm.exe") && !DWM_STARTED.swap(true, Ordering::AcqRel) {
+        crate::debug_print!("DWM_STARTED");
+    } else if creation.child_name.eq_ignore_ascii_case("LogonUI.exe") && !LOGONUI_STARTED.swap(true, Ordering::AcqRel) {
+        crate::debug_print!("LOGONUI_STARTED");
+    }
 }
 
 /// O driver de sessão da classe 38 voltou do DriverEntry com `status`.
@@ -318,6 +337,7 @@ static LSASS_STARTED: AtomicBool = AtomicBool::new(false);
 /// depois do ScInitDatabase).
 pub fn server_port_created(name: &str) {
     lsa_endpoint_created(name);
+    console_connected(name);
     if !boot_config::smss_boot() || SERVICES_STARTED.load(Ordering::Acquire) || !name.eq_ignore_ascii_case("\\RPC Control\\ntsvcs") {
         return;
     }
@@ -376,16 +396,22 @@ pub fn event_set(name: &str) {
     }
 }
 
-/// Uma sessão carregou a imagem de sessão `name` (`mm/session_image.rs`):
-/// o `SESSION1_CONNECTED` sai quando a sessão 1 carrega o cdd.dll, o que o
-/// win32k dela só faz depois de o dxgkrnl entregar o adaptador à sessão
-/// (DxgkSessionConnected, no NtUserRemoteConnect do csrss).
-pub fn session_image_loaded(session_id: u32, name: &str) {
-    if !boot_config::smss_boot() || session_id != 1 || SESSION1_CONNECTED.load(Ordering::Acquire) || !name.to_ascii_lowercase().ends_with("cdd.dll") {
+/// O `SESSION1_CONNECTED` sai quando o csrss.exe da sessão 1 cria a
+/// `\RPC Control\AutoRotationApiPort`. O W32WinStationDoConnect do
+/// winsrvext.dll (o comando DoConnect do console que o Local Session Manager
+/// manda pela `\SmSsWinStationApiPort`) só chega ao AutoRotationAPIInit
+/// (0xd87e) depois de o NtUserRemoteConnect, o CsrConnectToUser e o
+/// CtxInitUser32 voltarem com sucesso.
+fn console_connected(name: &str) {
+    if !boot_config::smss_boot() || SESSION1_CONNECTED.load(Ordering::Acquire) || !name.eq_ignore_ascii_case("\\RPC Control\\AutoRotationApiPort") {
+        return;
+    }
+    let current = process::get_current_process();
+    if !image_name(current).eq_ignore_ascii_case("csrss.exe") || crate::ntos::mm::session::session_id(current) != 1 {
         return;
     }
     if !SESSION1_CONNECTED.swap(true, Ordering::AcqRel) {
-        crate::debug_print!("[init] sessao 1: cdd.dll carregado");
+        crate::debug_print!("[init] csrss.exe (pid {}) da sessao 1: DoConnect do console concluido ({})", process::get_current_process_id(), name);
         crate::debug_print!("SESSION1_CONNECTED");
     }
 }
