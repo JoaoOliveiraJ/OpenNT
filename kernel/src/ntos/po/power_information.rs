@@ -402,3 +402,12 @@ pub fn register_user_services() {
 pub fn energy_estimation_enabled() -> bool {
     false
 }
+
+/// PoSetProcessEnergyTrackingState (ntoskrnl 19041, rva 0x69b020) sobre o
+/// PROCESS_ENERGY_TRACKING_STATE capturado: sem o contexto de energia do
+/// processo (EPROCESS.EnergyContext) é STATUS_NOT_SUPPORTED antes de olhar o
+/// estado. Só o estimador de energia cria esse contexto, e o OpenNT não tem
+/// o estimador: todo processo fica sem ele.
+pub fn set_process_energy_tracking_state(_process: u64, _state: &[u8]) -> u32 {
+    0xC000_00BB
+}

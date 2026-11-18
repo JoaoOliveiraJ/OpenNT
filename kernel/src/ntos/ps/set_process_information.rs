@@ -63,6 +63,12 @@
 //!   prioridade de memória 2; subir acima da base do processo exige
 //!   SeIncreaseBasePriorityPrivilege; depois a base vai ao processo e às
 //!   threads (o lsass.exe pede a base 9 ao iniciar e sai sem ela).
+//! - ProcessSubsystemProcess (68): sem buffer; só o processo mestre da
+//!   sessão marca outro processo como de subsistema
+//!   (EPROCESS.Flags3.SubsystemProcess; o smss marca o csrss).
+//! - ProcessEnergyTrackingState (82): pelo menos 8 bytes, o estado vai ao
+//!   PoSetProcessEnergyTrackingState (`po/power_information`), que sem o
+//!   estimador de energia responde STATUS_NOT_SUPPORTED.
 //!
 //! Em UserMode, antes da classe, o buffer passa pelo ProbeForRead com o
 //! alinhamento da classe (STATUS_DATATYPE_MISALIGNMENT,
@@ -114,8 +120,16 @@ pub const PROCESS_DEBUG_FLAGS: u32 = 31;
 pub const PROCESS_HANDLE_CHECKING_MODE: u32 = 54;
 /// ProcessRaiseUMExceptionOnInvalidHandleClose (ULONG).
 pub const PROCESS_RAISE_UM_EXCEPTION_ON_INVALID_HANDLE_CLOSE: u32 = 71;
+/// ProcessSubsystemProcess (sem buffer) e ProcessEnergyTrackingState.
+pub const PROCESS_SUBSYSTEM_PROCESS: u32 = 68;
+pub const PROCESS_ENERGY_TRACKING_STATE: u32 = 82;
 /// As classes desta área.
-pub const CLASSES: [u32; 9] = [PROCESS_BASE_PRIORITY, PROCESS_EXCEPTION_PORT, PROCESS_DEFAULT_HARD_ERROR_MODE, PROCESS_PRIORITY_CLASS, PROCESS_FOREGROUND_INFORMATION, PROCESS_BREAK_ON_TERMINATION, PROCESS_DEBUG_FLAGS, PROCESS_HANDLE_CHECKING_MODE, PROCESS_RAISE_UM_EXCEPTION_ON_INVALID_HANDLE_CLOSE];
+pub const CLASSES: [u32; 11] = [PROCESS_BASE_PRIORITY, PROCESS_EXCEPTION_PORT, PROCESS_DEFAULT_HARD_ERROR_MODE, PROCESS_PRIORITY_CLASS, PROCESS_FOREGROUND_INFORMATION, PROCESS_BREAK_ON_TERMINATION, PROCESS_DEBUG_FLAGS, PROCESS_HANDLE_CHECKING_MODE, PROCESS_RAISE_UM_EXCEPTION_ON_INVALID_HANDLE_CLOSE, PROCESS_SUBSYSTEM_PROCESS, PROCESS_ENERGY_TRACKING_STATE];
+/// EPROCESS.Flags3.SubsystemProcess.
+const SUBSYSTEM_PROCESS_FLAG: u32 = 1 << 6;
+/// O PROCESS_ENERGY_TRACKING_STATE capturado (o resto da cópia local fica
+/// zerado).
+const ENERGY_TRACKING_STATE_SIZE: u32 = 0x90;
 /// PROCESS_DEBUG_INHERIT, o único bit de ProcessDebugFlags.
 const PROCESS_DEBUG_INHERIT: u32 = 1;
 /// SEM_NOALIGNMENTFAULTEXCEPT do modo de erro.
@@ -412,6 +426,51 @@ pub fn set_information(mode: u8, class: u32, buffer: u64, length: u32, process_o
             };
             crate::ntos::ps::process_accessors::set_priority_by_class(process, (foreground != 0) as u32);
             Ok(0)
+        }
+        // O ramo da classe 68 do NtSetInformationProcess 19041 (rva
+        // 0x65b1fe): sem buffer nem tamanho; quem chama precisa ser o
+        // processo mestre da sessão (MMSUPPORT_FLAGS.SessionMaster do
+        // processo corrente, senão STATUS_PRIVILEGE_NOT_HELD), o handle com
+        // PROCESS_SET_INFORMATION e EPROCESS.Flags3.SubsystemProcess ligado
+        // por OR atômico. O smss marca assim o csrss que inicia.
+        PROCESS_SUBSYSTEM_PROCESS => {
+            // SAFETY: o EPROCESS corrente (PsGetCurrentProcess).
+            let current = unsafe { Eprocess::at(crate::ntos::ps::process::get_current_process()) };
+            if current.vm.instance.flags.session_master() == 0 {
+                return Ok(STATUS_PRIVILEGE_NOT_HELD);
+            }
+            let process = match process_of(PROCESS_SET_INFORMATION) {
+                Ok(process) => process,
+                Err(status) => return Ok(status),
+            };
+            // SAFETY: EPROCESS retido pelo handle que o nomeou.
+            unsafe { Eprocess::at(process) }.flags3.atomic().fetch_or(SUBSYSTEM_PROCESS_FLAG, core::sync::atomic::Ordering::AcqRel);
+            Ok(0)
+        }
+        // O ramo da classe 82 (rva 0x65b4da): pelo menos 8 bytes, os
+        // primeiros 0x90 copiados numa estrutura local zerada, o handle com
+        // PROCESS_SET_INFORMATION e o PoSetProcessEnergyTrackingState (o
+        // svchost põe o "[grupo] [instância]" do processo).
+        PROCESS_ENERGY_TRACKING_STATE => {
+            if length < 8 {
+                return Ok(STATUS_INFO_LENGTH_MISMATCH);
+            }
+            let copied = length.min(ENERGY_TRACKING_STATE_SIZE) as usize;
+            let captured = if mode != 0 {
+                match guest::try_read_bytes(buffer, copied) {
+                    Ok(bytes) => bytes,
+                    Err(error) => return Ok(error.status),
+                }
+            } else {
+                guest::read_bytes(buffer, copied)
+            };
+            let mut state = alloc::vec![0u8; ENERGY_TRACKING_STATE_SIZE as usize];
+            state[..copied].copy_from_slice(&captured);
+            let process = match process_of(PROCESS_SET_INFORMATION) {
+                Ok(process) => process,
+                Err(status) => return Ok(status),
+            };
+            Ok(crate::ntos::po::power_information::set_process_energy_tracking_state(process, &state))
         }
         _ => {
             crate::debug_print!("[ps] NtSetInformationProcess classe {} (sem suporte)", class);
