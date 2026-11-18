@@ -3072,6 +3072,30 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   FileObject->SectionObjectPointer->ImageSectionObject sem conferir, como a
   ci.dll ao registrar uma validação recusada, encontra memória válida.
   Teste: `zw_kernel_files` na fase 6.
+- **Reparse points do volume de boot** (`drivers/fs/ntfs_reparse.rs`,
+  `io/reparse.rs`): o NTFS do kernel guarda o reparse point como o
+  ntfs.sys, no formato do disco: o atributo $REPARSE_POINT com o buffer do
+  FSCTL, a FILE_ATTRIBUTE_REPARSE_POINT no $STANDARD_INFORMATION e nas
+  informações duplicadas da entrada do diretório pai (com a tag no lugar
+  do tamanho de EA) e a entrada (tag, referência) no índice $R do
+  `$Extend\$Reparse` (`ntfs_write::store_reparse`; a remoção do arquivo
+  tira a entrada). Os FSCTL_SET/GET/DELETE_REPARSE_POINT chegam ao volume
+  pelo NtFsControlFile de usuário num arquivo do volume, pelo
+  ZwFsControlFile/NtFsControlFile de kernel e pelo FsRtlKernelFsControlFile,
+  com as checagens do NtfsSetReparsePoint/NtfsGetReparsePoint/
+  NtfsDeleteReparsePoint (acesso, buffer, tag, diretório vazio, o
+  SeCreateSymbolicLinkPrivilege do SYMLINK). Na abertura, o volume devolve
+  o reparse point do caminho (intermediário, ou o último sem
+  FILE_OPEN_REPARSE_POINT) e o I/O Manager faz o IopGraftName (junção,
+  link absoluto e link relativo resolvido no nome aberto através das
+  junções), a conferência do dispositivo alvo e a política SymlinkEvaluation
+  do `Control\FileSystem` (semeada com os valores de uma instalação nova);
+  a busca recomeça na raiz (`ps/user/files.rs::open_by_name` no modo
+  usuário, `io/file/zw.rs` no kernel) até as 0x40 voltas do
+  ObpLookupObjectName, que também limitam os links do namespace. O
+  NtQueryAttributesFile segue os intermediários e não o último; a
+  FileAttributeTagInformation e as listagens dão a tag. O volume informa
+  FILE_SUPPORTS_REPARSE_POINTS. Teste: `reparse_points` na fase 7.
 - **Estado por processo**: o que no NT mora no EPROCESS e o OpenNT ainda não
   guarda numa estrutura do NT fica em `ps/user/process_state.rs`, um
   `ProcessState` por EPROCESS (o System inclusive), criado por
