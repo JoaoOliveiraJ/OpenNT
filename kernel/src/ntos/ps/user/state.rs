@@ -544,6 +544,11 @@ fn probe_user_access(va: u64, size: u64, write: bool) -> bool {
     let required = paging::PAGE_PRESENT | paging::PAGE_USER | if write { paging::PAGE_RW } else { 0 };
     let mut page = first;
     while page <= last {
+        // Uma página que o corte tirou do working set (PTE de transição ou
+        // de arquivo de paginação) volta antes, como a falta do acesso do NT.
+        if paging::access_flags(page) & required != required && !crate::ntos::mm::guest_memory::resolve_pageable(page) {
+            return false;
+        }
         if paging::access_flags(page) & required != required {
             // O toque do kernel numa página de guarda tira a guarda; na
             // pilha da thread a pilha cresce e a sonda segue.

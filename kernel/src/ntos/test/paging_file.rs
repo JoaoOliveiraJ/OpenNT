@@ -286,6 +286,10 @@ fn paging(assert: Assert) {
     modified_writer::repurpose(u64::MAX / 2);
     let same = (0..PAGES).all(|page| page_file(pte(root, base + page * PAGE)) == offsets[page as usize]);
     assert(same && working_set::COUNTERS.dirty_pages_written.load(Ordering::Relaxed) == written_before, "pagefile: paginas limpas voltam a reserva sem escrita, com a mesma copia no arquivo");
+    // As sondas de um serviço (ProbeForRead/ProbeForWrite) sobre um buffer
+    // fora do working set trazem as páginas de volta antes de olhar as PTEs.
+    let probed = process_context::with_process(process, || crate::ntos::ps::user::state::probe_user_read(base + PAGE, PAGE) && crate::ntos::ps::user::state::probe_user_write(base + 2 * PAGE, PAGE)).unwrap_or(false);
+    assert(probed && pte(root, base + PAGE) & 1 != 0 && pte(root, base + 2 * PAGE) & 1 != 0, "pagefile: as sondas de servico trazem as paginas do arquivo de paginacao");
     // Uma página escrita de novo perde a cópia.
     let dirtied = process_context::with_process(process, || guest::try_write::<u64>(base, 7).is_ok()).unwrap_or(false) && pte(root, base) & 0x41 == 0x41;
     working_set::empty_working_set(process);

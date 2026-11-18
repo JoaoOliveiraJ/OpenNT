@@ -142,6 +142,16 @@ pub fn set_pageable_resolver(resolver: Option<PageableResolver>) {
     *PAGEABLE_RESOLVER.lock() = resolver;
 }
 
+/// Traz de volta a página de `address` que um provedor de residência tirou
+/// da memória (o corte do working set, uma vista de sistema paginada), como
+/// a falta que o acesso daria, antes de uma sonda que só olha as PTEs.
+/// `false` se o provedor falhou (a leitura do arquivo de paginação, sem
+/// frame livre); sem provedor, ou com a página residente, `true`.
+pub fn resolve_pageable(address: u64) -> bool {
+    let resolver = *PAGEABLE_RESOLVER.lock();
+    resolver.is_none_or(|resolver| resolver(address).is_ok())
+}
+
 pub fn set_pool_lock(lock: Option<(fn() -> u64, fn(u64))>) {
     *POOL_LOCK.lock() = lock;
 }
