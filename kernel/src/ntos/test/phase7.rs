@@ -3870,7 +3870,7 @@ fn user_alpc_transport(assert: Assert) {
     guest::write_bytes(sid, &[1u8, 1, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0]);
     stack(&[0, sid]);
     let bad_sid = call("NtAlpcConnectPort", block + 0x18, name, 0, 0);
-    assert(missing == Some(0xC000_0034) && bad_flags == Some(0xC000_00BB) && bad_sid == Some(0xC000_0257), "useralpctrn: recusas da conexao");
+    assert(missing == Some(0xC000_0034) && bad_flags == Some(0xC000_00BB) && bad_sid == Some(0xC000_02A0), "useralpctrn: recusas da conexao (o SID exigido diferente do usuario do token do servidor da STATUS_SERVER_SID_MISMATCH)");
     // Troca síncrona.
     let (input, output, length) = (block + 0x300, block + 0x400, block + 0x3F0);
     message(input, &[1, 2, 3]);
