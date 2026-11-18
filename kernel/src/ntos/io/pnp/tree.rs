@@ -448,6 +448,10 @@ fn process_new_device_node(pdo: u64) -> Result<(), KernelError> {
             irp::free_pool(previous);
         }
     }
+    // PiProcessNewDeviceNode: o IRP_MN_DEVICE_ENUMERATED ao nó novo, com o
+    // resultado ignorado.
+    let enumerated = irp::device_enumerated(pdo);
+    crate::debug_print!("[pnp] DEVICE_ENUMERATED {:#x} -> {:#x}", pdo, enumerated.unwrap_or(0xFFFF_FFFF));
     Ok(())
 }
 

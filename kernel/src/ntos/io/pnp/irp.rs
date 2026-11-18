@@ -194,6 +194,15 @@ pub fn query_resources(device: u64) -> Result<u64, KernelError> {
 }
 
 /// IRP_MN_QUERY_RESOURCE_REQUIREMENTS: IO_RESOURCE_REQUIREMENTS_LIST em pool.
+/// IRP_MN_DEVICE_ENUMERATED (0x19): o PnpIrpDeviceEnumerated (0x37f04c) que
+/// o PiProcessNewDeviceNode (0x741298) manda ao nó novo depois da instalação,
+/// antes dos drivers. O dxgkrnl marca nele o monitor pronto
+/// (_OnMonitorDeviceNodeReady); o resultado não conta.
+pub fn device_enumerated(device: u64) -> Result<u32, KernelError> {
+    const IRP_MN_DEVICE_ENUMERATED: u8 = 0x19;
+    Ok(synchronous_call(device, IRP_MN_DEVICE_ENUMERATED, 0, |_| {})?.status as u32)
+}
+
 pub fn query_resource_requirements(device: u64) -> Result<u64, KernelError> {
     let outcome = synchronous_call(device, irp_mn::QUERY_RESOURCE_REQUIREMENTS, 0, |_| {})?;
     Ok(if outcome.succeeded() { outcome.information } else { 0 })
