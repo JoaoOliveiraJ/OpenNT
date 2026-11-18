@@ -479,8 +479,14 @@ const SMSS_PROGRAMS: &[&str] = &[
     // windows.staterepositorycore.dll, capauthz.dll, msiltcfg.dll e
     // version.dll) e o RpcEpMap.dll (rpcrtremote.dll); o DABAPI.dll do
     // services.exe, o rsaenh.dll (o CSP do lsass) e o KDCPW.DLL do samsrv.
+    // O psmserviceexthost.dll importa o RMCLIENT.dll e o wer.dll, e o
+    // bisrv.dll o RMCLIENT.dll: sem eles a carga falha, o PsmCrmStart do
+    // PsmpInitialize do psmsrv.dll (sem teste de presença) falha e o
+    // BrokerInfrastructure para logo depois de iniciar.
     "psmserviceexthost.dll",
     "bisrv.dll",
+    "RMCLIENT.dll",
+    "wer.dll",
     "resourcepolicyclient.dll",
     "CSystemEventsBrokerClient.dll",
     "licensemanagerapi.dll",
