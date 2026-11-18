@@ -1449,5 +1449,6 @@ pub fn run(assert: Assert) {
     capability_policy_and_check(assert);
     super::registry_hive::run(assert);
     super::registry_model::run(assert);
+    super::registry_user_hive::run(assert);
     debug_print!("PHASE5_SELFTEST_OK");
 }

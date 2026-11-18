@@ -44,6 +44,7 @@ pub mod user_boot_services;
 pub mod user_service_chain;
 pub mod x86_bios;
 pub mod registry_model;
+pub mod registry_user_hive;
 pub mod support_exports;
 pub mod shutdown;
 pub mod kernel_debugger;
