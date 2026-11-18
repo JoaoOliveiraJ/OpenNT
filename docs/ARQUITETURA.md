@@ -1012,7 +1012,21 @@ entre eles. O fim de um processo tem um caminho só,
 descarte, o NtTerminateProcess dele mesmo (o intervalo termina de vez e o
 despachante pede o fim), uma exceção fatal, uma falha de despacho e o
 NtTerminateProcess por handle de outro processo (PROCESS_TERMINATE), que
-termina o alvo sem tocar em quem chamou. As threads sem estado do win32k
+termina o alvo sem tocar em quem chamou. O ZwTerminateProcess de um driver
+é o NtTerminateProcess de KernelMode (`create::terminate_by_handle`): o
+handle (de kernel ou da tabela do processo corrente) passa pelo
+ObReferenceObjectByHandle com PROCESS_TERMINATE, um processo de usuário
+termina pelo mesmo `exit_process` (um fim já pedido dá
+STATUS_PROCESS_IS_TERMINATING), o NULL fora de um processo seguro é
+STATUS_NOT_SUPPORTED e as threads de sistema não terminam de fora
+(STATUS_ACCESS_DENIED). O KPROCESS só fica sinalizado no fim do término,
+depois da última thread e do callout de saída de processo, e o
+ZwWaitForSingleObject espera nele: o TerminateUmfdHost do win32kfull, que
+o winlogon pede ao sair, termina o fontdrvhost da sessão assim e só depois
+esquece o hospedeiro (UmfdHostLifeTimeManager::s_UmfdHostProcess); as
+threads dele, inicializadas pelo caminho do hospedeiro de fontes, saem pelo
+mesmo caminho (UmfdUninitializeThread), sem o vUMPDThreadCleanup de uma
+lista que esse caminho nunca inicializou. As threads sem estado do win32k
 morrem na hora (`threads::begin_exit`: esperas com THREAD_IS_TERMINATING,
 fora da fila de prontas); as com Win32Thread recebem o pedido de término do
 19041 e saem sozinhas, no contexto delas (veja as esperas que bloqueiam), e

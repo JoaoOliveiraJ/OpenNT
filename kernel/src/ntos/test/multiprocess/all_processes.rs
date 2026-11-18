@@ -37,6 +37,19 @@
 //!   0x5E), recebe STATUS_SUCCESS e sai depois com 0x64; a segunda morreu com
 //!   0x5E. No código anterior o NULL encerrava o processo inteiro com 0x5E.
 //!
+//! - O ZwTerminateProcess de KernelMode, como o TerminateUmfdHost do
+//!   win32kfull faz com o fontdrvhost: o teste abre a vítima por ponteiro
+//!   (ObOpenObjectByPointer com OBJ_KERNEL_HANDLE, PROCESS_TERMINATE |
+//!   SYNCHRONIZE); o ZwWaitForSingleObject com prazo zero no handle dá
+//!   STATUS_TIMEOUT enquanto ela vive; o ZwTerminateProcess(NULL) de
+//!   KernelMode é STATUS_NOT_SUPPORTED; pelo handle de kernel ele a termina
+//!   (STATUS_SUCCESS) e um segundo pedido dá STATUS_PROCESS_IS_TERMINATING; ela
+//!   sai com o código pedido e a mesma espera no handle passa a concluir com
+//!   STATUS_SUCCESS (o processo sinalizado no fim do término). No código
+//!   anterior o ZwTerminateProcess tomava o handle por um PID do escalonador
+//!   de kernel (STATUS_INVALID_HANDLE, a vítima seguia viva) e a espera num
+//!   handle de processo falhava com STATUS_INVALID_HANDLE.
+//!
 //! Os programas fazem syscalls de verdade: o NtTerminateProcess pelo número
 //! nativo da ntdll de bring-up, e NtOpenSection, NtMapViewOfSection,
 //! NtYieldExecution e NtOpenProcess (que ela não publica) pela tabela 1 do
@@ -609,6 +622,7 @@ pub fn run(assert: Assert) {
     alternation(assert, &services, &shared);
     termination(assert, &services, &shared);
     null_handle(assert, &services);
+    kernel_handle(assert, &services, &shared);
     restore_services(saved);
     drop(shared);
     kernel_stack::reap();
@@ -727,4 +741,58 @@ fn null_handle(assert: Assert, services: &Services) {
     assert(gone, "despacho: nada do processo fica no estado nem no indice de threads");
     drop(helper);
     let _ = process::dereference(pointer);
+}
+
+/// O código com que o ZwTerminateProcess de KernelMode termina a vítima.
+const ZW_KILL_CODE: u32 = 0x7A;
+const OBJ_KERNEL_HANDLE: u64 = 0x200;
+/// PROCESS_TERMINATE | SYNCHRONIZE.
+const TERMINATE_AND_SYNCHRONIZE: u64 = 0x10_0001;
+const STATUS_TIMEOUT: u32 = 0x102;
+const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
+const STATUS_PROCESS_IS_TERMINATING: u32 = 0xC000_010A;
+
+/// O ZwTerminateProcess de KernelMode por um handle de kernel da vítima, e a
+/// espera no mesmo handle até o fim dela.
+fn kernel_handle(assert: Assert, services: &Services, shared: &Shared) {
+    use crate::ntos::test::phase6::call_export;
+    shared.clear();
+    let Some((victim, started)) = launch("zw-vitima.exe", victim_program(services)) else {
+        assert(false, "zw-termino: vitima criada e posta no despachante");
+        return;
+    };
+    // O handle de saída em block, o prazo zero (LARGE_INTEGER) em block + 8.
+    let block = guest::alloc_bytes(0x10);
+    if block == 0 {
+        let _ = create::exit_process(victim, 0xC000_0001);
+        let _ = user_process::wait_started(started);
+        let _ = process::dereference(victim);
+        assert(false, "zw-termino: memoria do teste");
+        return;
+    }
+    guest::write64(block + 8, 0);
+    let status = |value: Option<u64>| value.map(|value| value as u32);
+    let process_type = crate::ntos::ob::object_types::process_type().pointer;
+    let opened = status(call_export("ObOpenObjectByPointer", &[victim, OBJ_KERNEL_HANDLE, 0, TERMINATE_AND_SYNCHRONIZE, process_type, 0, block]));
+    let handle = guest::read64(block);
+    let alive = status(call_export("ZwWaitForSingleObject", &[handle, 0, block + 8]));
+    let null = status(call_export("ZwTerminateProcess", &[0, ZW_KILL_CODE as u64]));
+    let killed = status(call_export("ZwTerminateProcess", &[handle, ZW_KILL_CODE as u64]));
+    let again = status(call_export("ZwTerminateProcess", &[handle, 0x99]));
+    if killed != Some(0) {
+        // Encerra a vítima, para a espera abaixo acabar.
+        let _ = create::exit_process(victim, 0xC000_0001);
+    }
+    let exit = user_process::wait_started(started);
+    let ended = status(call_export("ZwWaitForSingleObject", &[handle, 0, block + 8]));
+    let closed = if opened == Some(0) { status(call_export("ZwClose", &[handle])) } else { None };
+    guest::free_bytes(block);
+    crate::debug_print!("[despacho] zw: abertura={:?} viva={:?} nulo={:?} termino={:?} de novo={:?} saida {:?} fim={:?} fechado={:?}", opened, alive, null, killed, again, exit.as_ref().map_err(|error| format!("{error}")), ended, closed);
+    assert(opened == Some(0) && handle & 0xFFFF_FFFF_8000_0000 != 0 && alive == Some(STATUS_TIMEOUT), "zw-termino: o handle de kernel da vitima (ObOpenObjectByPointer) espera com prazo zero e da STATUS_TIMEOUT enquanto ela vive");
+    assert(null == Some(STATUS_NOT_SUPPORTED), "zw-termino: o ZwTerminateProcess(NULL) de KernelMode fora de um processo seguro e STATUS_NOT_SUPPORTED");
+    assert(killed == Some(0) && again == Some(STATUS_PROCESS_IS_TERMINATING) && matches!(exit, Ok(ZW_KILL_CODE)) && exit_status(victim) == ZW_KILL_CODE, "zw-termino: o ZwTerminateProcess pelo handle de kernel termina a vitima com o codigo pedido, e o segundo pedido da STATUS_PROCESS_IS_TERMINATING");
+    assert(ended == Some(0) && closed == Some(0), "zw-termino: depois do fim a espera no handle do processo conclui com STATUS_SUCCESS (o processo sinalizado) e o handle fecha");
+    let gone = process_state::get(victim).is_none() && no_threads(victim);
+    assert(gone, "zw-termino: nada da vitima fica no estado nem no indice de threads");
+    let _ = process::dereference(victim);
 }

@@ -106,6 +106,13 @@ const MANIFEST_SEARCH_FLAGS: u64 = 0x30;
 pub const APP_MANIFEST_PRESENT: u32 = 0x2000;
 /// Um processo criado que é descartado sem rodar.
 const STATUS_CANCELLED: u32 = 0xC000_0120;
+/// O ZwTerminateProcess de KernelMode: sem handle, o fim já pedido e as
+/// threads de sistema.
+const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
+const STATUS_PROCESS_IS_TERMINATING: u32 = 0xC000_010A;
+const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+/// O direito que o NtTerminateProcess pede ao referenciar o handle.
+const PROCESS_TERMINATE: u32 = 0x1;
 /// THREAD_CREATE_FLAGS_CREATE_SUSPENDED e THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER.
 pub const THREAD_CREATE_SUSPENDED: u32 = 0x1;
 pub const THREAD_HIDE_FROM_DEBUGGER: u32 = 0x4;
@@ -298,6 +305,54 @@ pub fn exit_process(process_pointer: u64, status: u32) -> bool {
         finish_exit(process_pointer);
     }
     true
+}
+
+/// ZwTerminateProcess(ProcessHandle, ExitStatus): o NtTerminateProcess do
+/// 19041 (0x707350) com PreviousMode KernelMode.
+///
+/// - Sem handle (NULL), só um processo seguro (KPROCESS.SecureState) termina
+///   as próprias threads; nos outros é STATUS_NOT_SUPPORTED, e o OpenNT não
+///   tem processos seguros.
+/// - O handle passa pelo ObReferenceObjectByHandle(PROCESS_TERMINATE,
+///   PsProcessType, KernelMode): um handle de kernel (OBJ_KERNEL_HANDLE, como
+///   o do ObOpenObjectByPointer do win32kfull) ou um da tabela do processo
+///   corrente; a falha da referência é o status.
+/// - Um processo de usuário termina pelo [`exit_process`] (o
+///   PspTerminateProcess): as threads dele recebem o término e quem chama
+///   segue; um fim já pedido, ou um processo que já terminou, dá
+///   STATUS_PROCESS_IS_TERMINATING. O objeto processo só fica sinalizado
+///   quando a última thread saiu, com os callouts de saída do win32k, então
+///   o ZwWaitForSingleObject no mesmo handle espera o fim inteiro (o
+///   TerminateUmfdHost do win32kfull espera assim o fontdrvhost antes de
+///   esquecer o hospedeiro de fontes da sessão).
+/// - As threads dos demais processos são threads de sistema, que ninguém
+///   termina de fora (o PspTerminateThreadByPointer devolve
+///   STATUS_ACCESS_DENIED).
+pub fn terminate_by_handle(handle: u64, exit_status: u32) -> u32 {
+    if handle == 0 {
+        return STATUS_NOT_SUPPORTED;
+    }
+    let slot = guest::alloc_bytes(8);
+    if slot == 0 {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    let referenced = crate::ntos::ob::object_reference::reference_by_handle(handle, PROCESS_TERMINATE, crate::ntos::ob::object_types::process_type().pointer, 0, slot, 0);
+    let target = guest::read64(slot);
+    guest::free_bytes(slot);
+    match referenced {
+        Ok(status) if status as u32 == 0 => {}
+        Ok(status) => return status as u32,
+        Err(error) => return if error.status != 0 { error.status } else { STATUS_UNSUCCESSFUL },
+    }
+    let status = if process_state::get(target).is_some() {
+        if exit_process(target, exit_status) { 0 } else { STATUS_PROCESS_IS_TERMINATING }
+    } else if process::with_record(target, |record| record.terminated || record.exiting) == Some(true) {
+        STATUS_PROCESS_IS_TERMINATING
+    } else {
+        STATUS_ACCESS_DENIED
+    };
+    let _ = process::dereference(target);
+    status
 }
 
 /// O começo do PspTerminateProcess: EPROCESS.Flags.ProcessDelete ligado (o

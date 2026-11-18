@@ -32,15 +32,16 @@ use crate::rtl::KernelError;
 
 const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
 
-/// ZwWaitForSingleObject: eventos, timers, semáforos e mutants da tabela
-/// nativa (os corpos que começam no DISPATCHER_HEADER), threads de sistema e
-/// os eventos abertos pelo zw. Devolve o valor nativo do export: a falha da
-/// resolução e a espera numa thread de sistema saem estendidas com zeros; os
-/// demais NTSTATUS, com sinal.
+/// ZwWaitForSingleObject: eventos, timers, semáforos, mutants e processos da
+/// tabela nativa (os corpos que começam no DISPATCHER_HEADER; o KPROCESS só
+/// fica sinalizado no fim do término, depois da saída da última thread),
+/// threads de sistema e os eventos abertos pelo zw. Devolve o valor nativo
+/// do export: a falha da resolução e a espera numa thread de sistema saem
+/// estendidas com zeros; os demais NTSTATUS, com sinal.
 pub fn wait_for_single_object(handle: u64, alertable: bool, timeout: u64) -> u64 {
     match open_pointer::resolve(handle, false) {
         Some(Err(status)) => return status as u64,
-        Some(Ok(opened)) if matches!(opened.item.object_type.name.as_str(), "Event" | "Timer" | "Semaphore" | "Mutant") => {
+        Some(Ok(opened)) if matches!(opened.item.object_type.name.as_str(), "Event" | "Timer" | "Semaphore" | "Mutant" | "Process") => {
             // O último fechamento durante a espera não libera o corpo em uso.
             opened.item.reference();
             let status = dispatcher::wait_for_single_object(opened.item.pointer, timeout, 0, alertable);

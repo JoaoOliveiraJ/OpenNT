@@ -649,7 +649,7 @@ pub mod zw {
     //! namespace em `ob`, drivers em `cm/service/driver`, informações do
     //! sistema em `ex/system_information`, ZwOpenEvent em `ex/event`,
     //! ZwPowerInformation em `po/power_information`, processos em
-    //! `ps/query_process` e `ps/scheduler`, ZwDisplayString em
+    //! `ps/query_process` e `ps/create`, ZwDisplayString em
     //! `ex/boot_display`.
 
     use crate::ntos::init::exports::{signed_status, Call, Group};
@@ -661,7 +661,7 @@ pub mod zw {
     use crate::ntos::ob::{close, wait};
     use crate::ntos::ob::handles::namespace as namespace_handles;
     use crate::ntos::po::power_information;
-    use crate::ntos::ps::{query_process, scheduler};
+    use crate::ntos::ps::{create, query_process};
     use crate::rtl::KernelError;
 
     fn create_key(call: &Call) -> Result<u64, KernelError> {
@@ -764,7 +764,7 @@ pub mod zw {
         Ok(signed_status(query_process::query_information(call.arg(1), call.arg(2) as u32, call.arg(3), call.arg(4) as u32, call.arg(5))?))
     }
     fn terminate_process(call: &Call) -> Result<u64, KernelError> {
-        Ok(signed_status(scheduler::terminate_by_handle(call.arg(1), call.arg(2) as u32)))
+        Ok(signed_status(create::terminate_by_handle(call.arg(1), call.arg(2) as u32)))
     }
     fn flush_buffers_file(call: &Call) -> Result<u64, KernelError> {
         Ok(signed_status(zw_files::flush_buffers_file(call.arg(1), call.arg(2))))
