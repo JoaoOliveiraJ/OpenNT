@@ -2393,11 +2393,41 @@ fn user_nls(assert: Assert) {
     // o LocaleId da sessão, ou o LCID padrão do usuário fora de sessão.
     let process = crate::ntos::ps::process::get_current_process();
     assert(crate::ntos::ps::locale::thread_locale_of(process) == 0x409 && crate::ntos::ps::locale::session_locale_of(process) == 0x409, "usernls: TEB.CurrentLocale da thread nova com o locale da sessao");
-    guest::write64(rsp + 0x28, size);
-    assert(call("NtGetNlsSectionPtr", 13, 0, 0, out) == 0xC000_000D && call("NtGetNlsSectionPtr", 12, 3, 0, out) == 0xC000_000D && call("NtGetNlsSectionPtr", 11, 0x10000, 0, out) == 0xC000_000D && call("NtGetNlsSectionPtr", 9, 0, 1, out) == 0xC000_00BB, "usernls: tipo, dado e contexto invalidos");
-    assert(call("NtGetNlsSectionPtr", 11, 4243, 0, out) == 0xC000_0034 && call("NtGetNlsSectionPtr", 11, 4242, 0, 0x10) == 0xC000_0005, "usernls: tabela ausente e saida invalida");
+    // As vistas mapeadas pelo teste, desfeitas no fim.
+    let mut views: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+    let is_section = |name: &str| crate::ntos::ob::object_manager::lookup(name).and_then(crate::ntos::ob::object_manager::node).is_some_and(|node| node.type_name == "Section");
+    // NtInitializeNlsFiles (19041 0x612f00): só BaseAddress e
+    // DefaultLocaleId; o terceiro e o quarto registradores são lixo do
+    // chamador, e o kernel não grava `Nls\Sorting\Versions`.
+    const SORTING_VERSIONS: &str = "\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Nls\\Sorting\\Versions";
+    let versions_before = crate::ntos::cm::registry::read_value_by_path(SORTING_VERSIONS, "");
     assert(call("NtInitializeNlsFiles", out, 0x10, 0, 0) == 0xC000_0005, "usernls: NtInitializeNlsFiles sonda as saidas");
-    // Tabela do volume mapeada como seção permanente, uma vista por processo.
+    guest::write64(out, 0);
+    guest::write32(out + 8, 0);
+    let first = call("NtInitializeNlsFiles", out, out + 8, 0xFFFF_FFFF_FFFF_0000, 0x10);
+    let (first_base, first_locale) = (guest::read64(out), guest::read32(out + 8));
+    let second = call("NtInitializeNlsFiles", out, out + 8, 0, 0);
+    let second_base = guest::read64(out);
+    views.extend([first_base, second_base].into_iter().filter(|&base| base != 0));
+    assert(first == 0 && first_base != 0 && first_locale == crate::ntos::ps::locale::default_system_locale(), "usernls: NtInitializeNlsFiles ignora o terceiro e o quarto registradores");
+    assert(second == 0 && second_base != 0 && second_base != first_base, "usernls: NtInitializeNlsFiles mapeia uma vista nova por chamada");
+    assert(crate::ntos::cm::registry::read_value_by_path(SORTING_VERSIONS, "") == versions_before, "usernls: o kernel nao grava Nls\\Sorting\\Versions");
+    // NtGetNlsSectionPtr (19041 0x69cec0): o \NLS do ExInitializeNls (o
+    // autoteste roda antes do resto da Phase1), os tipos 11 e 12, as saídas
+    // NULL, o ContextData sondado e a forma sem valor no Registro.
+    assert(crate::ntos::ps::user::nls::initialize_directory().is_ok(), "usernls: diretorio \\NLS");
+    guest::write64(rsp + 0x28, size);
+    assert([(13u64, 0u64), (9, 0), (10, 0)].into_iter().all(|(kind, data)| call("NtGetNlsSectionPtr", kind, data, 0, out) == 0xC000_00EF), "usernls: so os tipos 11 e 12 (STATUS_INVALID_PARAMETER_1)");
+    assert(call("NtGetNlsSectionPtr", 11, 4242, 0, 0) == 0xC000_00F2, "usernls: SectionPointer NULL (STATUS_INVALID_PARAMETER_4)");
+    guest::write64(rsp + 0x28, 0);
+    let no_size = call("NtGetNlsSectionPtr", 11, 4242, 0, out);
+    guest::write64(rsp + 0x28, size);
+    assert(no_size == 0xC000_00F3, "usernls: SectionSize NULL (STATUS_INVALID_PARAMETER_5)");
+    assert(call("NtGetNlsSectionPtr", 11, 4242, 1, out) == 0x8000_0002 && call("NtGetNlsSectionPtr", 11, 4242, 0xFFFF_FFFF_FFFF_FFFC, out) == 0xC000_0005, "usernls: ContextData desalinhado e fora do espaco de usuario");
+    assert(call("NtGetNlsSectionPtr", 12, 3, 0, out) == 0xC000_0034, "usernls: forma de normalizacao sem valor no Registro");
+    assert(call("NtGetNlsSectionPtr", 11, 4243, 0, out) == 0xC000_0034 && call("NtGetNlsSectionPtr", 11, 4242, 0, 0x10) == 0xC000_0005, "usernls: tabela ausente e saida invalida");
+    // Tabela do volume mapeada da seção permanente `\NLS\NlsSectionCP4242`
+    // (c_%.3d de 4242 é c_4242.nls).
     guest::write64(out, 0);
     let created = file_io::open(out, "\\??\\D:\\C_4242.NLS", iosb, 2, &OpenRequest { access: 0x4010_0000, share: 0, options: 0x20, ..OpenRequest::default() }).unwrap_or(1);
     let writer = guest::read64(out);
@@ -2409,14 +2439,76 @@ fn user_nls(assert: Assert) {
     let written = call("NtWriteFile", writer, 0, 0, 0);
     let _ = state::close_user_handle(writer, true, false);
     guest::write64(rsp + 0x28, size);
+    // SectionSize é SIZE_T: a metade alta também é gravada.
+    guest::write64(size, 0xAAAA_AAAA_AAAA_AAAA);
     let mapped = call("NtGetNlsSectionPtr", 11, 4242, 0, out);
     let base = guest::read64(out);
-    let table_ok = created == 0 && written == 0 && mapped == 0 && base != 0 && guest::read32(size) >= 10 && guest::read_bytes(base, 10) == b"NLS-OpenNT";
-    if !table_ok {
-        crate::debug_print!("[usernls] created={:#x} written={:#x} mapped={:#x} base={:#x} size={:#x}", created, written, mapped, base, guest::read32(size));
+    let view_size = guest::read64(size);
+    if base != 0 {
+        views.push(base);
     }
-    assert(table_ok, "usernls: tabela do volume mapeada com o conteudo");
-    assert(call("NtGetNlsSectionPtr", 11, 4242, 0, out) == 0 && guest::read64(out) == base && memory::Space::current().regions().iter().filter(|region| region.section().is_some() && region.base() == base).count() == 1, "usernls: a vista existente do processo e reaproveitada");
+    let table_ok = created == 0 && written == 0 && mapped == 0 && base != 0 && view_size >= 10 && view_size >> 32 == 0 && guest::read_bytes(base, 10) == b"NLS-OpenNT";
+    if !table_ok {
+        crate::debug_print!("[usernls] created={:#x} written={:#x} mapped={:#x} base={:#x} size={:#x}", created, written, mapped, base, view_size);
+    }
+    assert(table_ok, "usernls: tabela do volume mapeada com o conteudo e o SIZE_T inteiro");
+    assert(is_section("\\NLS\\NlsSectionCP4242"), "usernls: secao nomeada \\NLS\\NlsSectionCP4242");
+    // Um ContextData alinhado e legível é aceito (e não usado); cada chamada
+    // mapeia uma vista nova.
+    let again = call("NtGetNlsSectionPtr", 11, 4242, block + 0x40, out);
+    let again_base = guest::read64(out);
+    if again == 0 && again_base != 0 {
+        views.push(again_base);
+    }
+    assert(again == 0 && again_base != 0 && again_base != base && guest::read_bytes(again_base, 10) == b"NLS-OpenNT", "usernls: contexto aceito e uma vista nova por chamada");
+    // Página de código real: c_037.nls (CPTABLEINFO com cabeçalho 13 e
+    // página 37) e `\NLS\NlsSectionCP37`.
+    let ebcdic = call("NtGetNlsSectionPtr", 11, 37, 0, out);
+    let ebcdic_base = guest::read64(out);
+    if ebcdic == 0 && ebcdic_base != 0 {
+        views.push(ebcdic_base);
+    }
+    assert(ebcdic == 0 && ebcdic_base != 0 && guest::read16(ebcdic_base) == 13 && guest::read16(ebcdic_base + 2) == 37 && is_section("\\NLS\\NlsSectionCP37"), "usernls: c_037.nls do volume pela pagina 37");
+    // Forma de normalização pelo `Control\Nls\Normalization` (o nome da forma
+    // em hexadecimal): "D" = normidna.nls; um REG_DWORD é STATUS_UNSUCCESSFUL.
+    {
+        use crate::ntos::cm::registry;
+        const NORMALIZATION: &str = "\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Nls\\Normalization";
+        let existed = registry::open(NORMALIZATION).unwrap_or(0);
+        if existed != 0 {
+            registry::close_handle(existed);
+        }
+        let key = registry::open_or_create(NORMALIZATION, None).unwrap_or(0);
+        let saved: alloc::vec::Vec<(&str, Option<registry::Value>)> = ["D", "7"].into_iter().map(|name| (name, registry::get_value(key, name))).collect();
+        let text: alloc::vec::Vec<u8> = "normidna.nls".encode_utf16().chain([0]).flat_map(|unit| unit.to_le_bytes()).collect();
+        registry::set_value(key, "D", 1, text);
+        registry::set_value(key, "7", 4, 7u32.to_le_bytes().to_vec());
+        let normalized = call("NtGetNlsSectionPtr", 12, 0xD, 0, out);
+        let normalized_base = guest::read64(out);
+        if normalized == 0 && normalized_base != 0 {
+            views.push(normalized_base);
+        }
+        let dword = call("NtGetNlsSectionPtr", 12, 7, 0, out);
+        for (name, value) in saved {
+            match value {
+                Some(value) => {
+                    registry::set_value(key, name, value.value_type, value.data);
+                }
+                None => {
+                    registry::delete_value(key, name);
+                }
+            }
+        }
+        if existed == 0 {
+            registry::delete_key(key);
+        }
+        registry::close_handle(key);
+        assert(key != 0 && normalized == 0 && normalized_base != 0 && guest::read16(normalized_base) != 0 && is_section("\\NLS\\NlsSectionNORM0000000d"), "usernls: forma 0xD pelo Registro (normidna.nls) em \\NLS\\NlsSectionNORM0000000d");
+        assert(dword == 0xC000_0001, "usernls: forma com valor REG_DWORD (STATUS_UNSUCCESSFUL)");
+    }
+    for view in views {
+        let _ = call("NtUnmapViewOfSection", u64::MAX, view, 0, 0);
+    }
     if let Some(region) = memory::find_region(block) {
         memory::release_private_region(&region);
     }
