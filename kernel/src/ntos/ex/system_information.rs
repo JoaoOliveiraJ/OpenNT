@@ -48,6 +48,7 @@ pub fn entropy_registrations() -> Vec<EntropyRegistration> {
 /// SYSTEM_INFORMATION_CLASS das classes de tamanho fixo de `query_fixed`.
 pub const SYSTEM_FLAGS_INFORMATION: u32 = 9;
 pub const SYSTEM_KERNEL_DEBUGGER_INFORMATION: u32 = 35;
+pub const SYSTEM_RECOMMENDED_SHARED_DATA_ALIGNMENT: u32 = 58;
 pub const SYSTEM_OBJECT_SECURITY_MODE: u32 = 70;
 pub const SYSTEM_ISOLATED_USER_MODE_INFORMATION: u32 = 165;
 pub const SYSTEM_PHYSICAL_MEMORY_INFORMATION: u32 = 184;
@@ -95,7 +96,7 @@ pub fn flush_information() -> Vec<u8> {
 /// A classe é uma das de `query_fixed` com o buffer sondado com alinhamento
 /// 4 (a SystemKernelDebuggerInformation sonda com alinhamento 1).
 pub fn is_fixed_class(class: u32) -> bool {
-    matches!(class, SYSTEM_FLAGS_INFORMATION | SYSTEM_OBJECT_SECURITY_MODE | SYSTEM_ISOLATED_USER_MODE_INFORMATION | SYSTEM_PHYSICAL_MEMORY_INFORMATION | SYSTEM_FLUSH_INFORMATION | SYSTEM_WRITE_CONSTRAINT_INFORMATION | SYSTEM_HYPERVISOR_SHARED_PAGE_INFORMATION)
+    matches!(class, SYSTEM_FLAGS_INFORMATION | SYSTEM_RECOMMENDED_SHARED_DATA_ALIGNMENT | SYSTEM_OBJECT_SECURITY_MODE | SYSTEM_ISOLATED_USER_MODE_INFORMATION | SYSTEM_PHYSICAL_MEMORY_INFORMATION | SYSTEM_FLUSH_INFORMATION | SYSTEM_WRITE_CONSTRAINT_INFORMATION | SYSTEM_HYPERVISOR_SHARED_PAGE_INFORMATION)
 }
 
 /// Classes de tamanho fixo do ExpQuerySystemInformation 19041, com o buffer
@@ -112,6 +113,10 @@ pub fn is_fixed_class(class: u32) -> bool {
 /// - SystemKernelDebuggerInformation (35, rva 0x6cb336): pelo menos 2
 ///   bytes, o KdDebuggerEnabled e o KdDebuggerNotPresent
 ///   (SYSTEM_KERNEL_DEBUGGER_INFORMATION).
+/// - SystemRecommendedSharedDataAlignment (58, rva 0x6cbab3): pelo menos 4
+///   bytes, o ULONG do KeGetRecommendedSharedDataAlignment (o
+///   KeLargestCacheLine). O Memory::InitClass do CoreMessaging.dll pede a
+///   classe e encerra o processo (FailFast) se ela falhar.
 /// - SystemObjectSecurityMode (70, rva 0x6cbb93): exatamente 4 bytes, o
 ///   ObpObjectSecurityMode.
 /// - SystemIsolatedUserModeInformation (165, rva 0x6cc9b0): exatamente 0x10
@@ -141,6 +146,10 @@ pub fn query_fixed(class: u32, output: u64, length: u32) -> Option<Result<(u32, 
             (0x18, true, data)
         }
         SYSTEM_KERNEL_DEBUGGER_INFORMATION => (2, false, alloc::vec![crate::ntos::kd::debugger::enabled() as u8, crate::ntos::kd::debugger::debugger_not_present() as u8]),
+        SYSTEM_RECOMMENDED_SHARED_DATA_ALIGNMENT => match crate::ntos::ke::processor_topology::recommended_shared_data_alignment() {
+            Ok(alignment) => (4, false, alignment.to_le_bytes().to_vec()),
+            Err(error) => return Some(Err(error)),
+        },
         SYSTEM_OBJECT_SECURITY_MODE => (4, true, object_security_mode().to_le_bytes().to_vec()),
         SYSTEM_ISOLATED_USER_MODE_INFORMATION => (0x10, true, alloc::vec![0u8; 0x10]),
         SYSTEM_FLUSH_INFORMATION => (0x20, false, flush_information()),
