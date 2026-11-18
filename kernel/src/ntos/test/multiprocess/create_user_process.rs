@@ -176,6 +176,7 @@ const ATTRIBUTE_CLIENT_ID: u64 = 0x1_0003;
 const ATTRIBUTE_TEB_ADDRESS: u64 = 0x1_0004;
 const ATTRIBUTE_IMAGE_NAME: u64 = 0x2_0005;
 const ATTRIBUTE_IMAGE_INFO: u64 = 0x6;
+const ATTRIBUTE_PRIORITY_CLASS: u64 = 0x2_0008;
 const ATTRIBUTE_ERROR_MODE: u64 = 0x2_0009;
 const ATTRIBUTE_UNKNOWN: u64 = 0x2_003F;
 
@@ -993,6 +994,13 @@ fn rejections(assert: Assert, services: &Services) {
     stale[offset_of!(PsCreateInfo, state)..][..4].copy_from_slice(&PsCreateInfo::SUCCESS.to_le_bytes());
     let stale_info = call_create(&scratch, 0, &stale, &attribute_list(&[image_name]));
     let minimal_process = call_create(&scratch, 0x800, &valid, &attribute_list(&[image_name]));
+    // PriorityClass: o UCHAR lido do ponteiro (aqui um endereço com o byte
+    // baixo zero e a classe 7, fora do PROCESS_PRIORITY_CLASS_ABOVE_NORMAL),
+    // com Size 1.
+    let class_at = scratch.block + 0x700;
+    guest::write8(class_at, 7);
+    let bad_class = call_create(&scratch, 0, &valid, &attribute_list(&[image_name, (ATTRIBUTE_PRIORITY_CLASS, 1, class_at, 0)]));
+    let class_size = call_create(&scratch, 0, &valid, &attribute_list(&[image_name, (ATTRIBUTE_PRIORITY_CLASS, 4, class_at, 0)]));
     // ProhibitedImageCharacteristics (IMAGE_FILE_DLL): um exe que é DLL.
     let dll_written = write_volume_file(DLL_NT_PATH, &dll_image(services));
     let dll_text = wide(DLL_NT_PATH);
@@ -1005,6 +1013,7 @@ fn rejections(assert: Assert, services: &Services) {
     remove_volume_file(DLL_NT_PATH);
     crate::debug_print!("[ntcreateuserprocess] recusas: {:x?} {:x?} {:x?} {:x?} {:x?} {:x?} {:x?} {:x?}", unknown, debug, nameless, short_info, stale_info, minimal_process, prohibited, dll_state);
     assert(unknown == (STATUS_INVALID_PARAMETER, 0) && nameless == (STATUS_INVALID_PARAMETER, 0) && short_info == (STATUS_INVALID_PARAMETER, 0) && stale_info == (STATUS_INVALID_PARAMETER, 0), "ntcreateuserprocess: atributo desconhecido, ImageName ausente e PS_CREATE_INFO de tamanho errado ou fora do PsCreateInitialState dao STATUS_INVALID_PARAMETER");
+    assert(bad_class == (STATUS_INVALID_PARAMETER, 0) && class_size == (STATUS_INVALID_PARAMETER, 0), "ntcreateuserprocess: a PriorityClass e um UCHAR lido pelo ponteiro, com Size 1");
     assert(debug == (STATUS_NOT_SUPPORTED, 0) && minimal_process == (STATUS_NOT_SUPPORTED, 0), "ntcreateuserprocess: DebugObject e PROCESS_CREATE_FLAGS_MINIMAL_PROCESS dao STATUS_NOT_SUPPORTED");
     assert(dll_written && prohibited == (STATUS_INVALID_IMAGE_FORMAT, 0) && dll_state == (PsCreateInfo::FAIL_EXE_FORMAT, DLL_CHARACTERISTICS), "ntcreateuserprocess: um exe com IMAGE_FILE_DLL (o ProhibitedImageCharacteristics do kernel32) da STATUS_INVALID_IMAGE_FORMAT com PsCreateFailExeFormat e o DllCharacteristics dele");
     assert(process::list_active_processes().len() == before, "ntcreateuserprocess: nenhuma recusa cria processo");

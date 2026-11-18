@@ -405,10 +405,20 @@ fn read_attributes(entries: &[PsAttribute]) -> Result<Attributes, u32> {
             }
             attribute::PRIORITY_CLASS => {
                 expect(attribute::INPUT)?;
-                if size != 1 || inline & 0xFF > MAXIMUM_PRIORITY_CLASS {
+                // Um UCHAR por ponteiro: o CreateProcessInternalW passa o
+                // endereço do PROCESS_PRIORITY_CLASS pedido (o
+                // NORMAL_PRIORITY_CLASS do dwm.exe que o dwminit cria).
+                if size != 1 {
                     return Err(STATUS_INVALID_PARAMETER);
                 }
-                captured.priority_class = Some(inline as u8);
+                if !state::probe_user_read(inline, 1) {
+                    return Err(STATUS_ACCESS_VIOLATION);
+                }
+                let class = guest::try_read::<u8>(inline).map_err(|error| status_of(&error))?;
+                if class as u64 > MAXIMUM_PRIORITY_CLASS {
+                    return Err(STATUS_INVALID_PARAMETER);
+                }
+                captured.priority_class = Some(class);
             }
             attribute::CLIENT_ID => {
                 expect(attribute::THREAD)?;
