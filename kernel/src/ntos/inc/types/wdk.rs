@@ -1438,6 +1438,29 @@ const _: () = {
     assert!(core::mem::offset_of!(FileFsSizeInformation, bytes_per_sector) == 0x14);
 };
 
+/// `_FILE_END_OF_FILE_INFORMATION_EX` (ntifs.h; 0x20 bytes): a forma de
+/// FileEndOfFileInformation com que o Mm pede ao file system a extensão de
+/// um arquivo de paginação (o novo fim, o tamanho e o máximo que o Mm
+/// conhece, e os flags).
+#[repr(C)]
+pub struct FileEndOfFileInformationEx {
+    pub end_of_file: LargeInteger,
+    pub paging_file_size_in_mm: LargeInteger,
+    pub paging_file_max_size: LargeInteger,
+    pub flags: Field<u32>,
+    _pad_1c: Reserved<0x4>,
+}
+
+unsafe impl NtStruct for FileEndOfFileInformationEx {}
+
+const _: () = {
+    assert!(core::mem::size_of::<FileEndOfFileInformationEx>() == 0x20);
+    assert!(core::mem::offset_of!(FileEndOfFileInformationEx, end_of_file) == 0x0);
+    assert!(core::mem::offset_of!(FileEndOfFileInformationEx, paging_file_size_in_mm) == 0x8);
+    assert!(core::mem::offset_of!(FileEndOfFileInformationEx, paging_file_max_size) == 0x10);
+    assert!(core::mem::offset_of!(FileEndOfFileInformationEx, flags) == 0x18);
+};
+
 /// `_FILE_DIRECTORY_INFORMATION` (ntifs.h; 0x48 bytes).
 #[repr(C)]
 pub struct FileDirectoryInformation {

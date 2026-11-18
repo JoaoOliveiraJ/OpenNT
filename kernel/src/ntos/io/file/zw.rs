@@ -706,6 +706,27 @@ pub fn set_information_file(handle: u64, io_status: u64, input: u64, class: u32)
     Ok(0)
 }
 
+/// IoSetInformation por FILE_OBJECT num arquivo de volume, que o file system
+/// embutido atende sem pilha de IRP: o FileEndOfFileInformation (o
+/// LARGE_INTEGER do começo, também na forma estendida de 0x20 bytes com que
+/// o Mm estende um arquivo de paginação) muda o tamanho no volume. `None` =
+/// o FILE_OBJECT não é de arquivo de volume ou a classe é outra.
+pub fn set_volume_file_information(file: u64, class: u32, length: u32, buffer: u64) -> Option<Result<u32, KernelError>> {
+    if class != FILE_END_OF_FILE_INFORMATION {
+        return None;
+    }
+    let (volume, path) = file_backing(file)?;
+    if length < 8 {
+        return Some(Ok(STATUS_INFO_LENGTH_MISMATCH));
+    }
+    // SAFETY: o buffer do chamador de modo kernel, com pelo menos 8 bytes.
+    let size = unsafe { Field::<u64>::at(buffer) }.get();
+    Some(match volume.resize(&path, size) {
+        None => Ok(STATUS_MEDIA_WRITE_PROTECTED),
+        Some(result) => result.map(|_| 0),
+    })
+}
+
 /// ZwQueryDirectoryFile: FileDirectoryInformation (1) do diretório aberto,
 /// com posição de listagem por handle e filtro de nome exato.
 #[allow(clippy::too_many_arguments)]

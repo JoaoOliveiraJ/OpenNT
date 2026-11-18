@@ -5267,3 +5267,202 @@ const _: () = {
     assert!(core::mem::align_of::<MmpagingFileView1>() == core::mem::align_of::<MmpagingFile>());
     assert!(core::mem::offset_of!(MmpagingFileView1, hybrid_priority) == 0xc8);
 };
+
+/// `_MMPAGE_FILE_EXPANSION` (0x58 bytes).
+#[repr(C)]
+pub struct MmpageFileExpansion {
+    /// -> `_SEGMENT`
+    pub segment: Field<u64>,
+    pub dereference_list: ListEntry,
+    /// -> `_MI_PARTITION`
+    pub partition: Field<u64>,
+    pub requested_expansion_size: Field<u64>,
+    pub actual_expansion: Field<u64>,
+    pub event: Kevent,
+    pub in_progress: Field<i32>,
+    pub u1: MmpageFileExpansionU1,
+    /// -> `void*`
+    pub active_entry: Field<u64>,
+}
+
+unsafe impl NtStruct for MmpageFileExpansion {}
+
+const _: () = {
+    assert!(core::mem::size_of::<MmpageFileExpansion>() == 0x58);
+    assert!(core::mem::offset_of!(MmpageFileExpansion, segment) == 0x0);
+    assert!(core::mem::offset_of!(MmpageFileExpansion, dereference_list) == 0x8);
+    assert!(core::mem::offset_of!(MmpageFileExpansion, partition) == 0x18);
+    assert!(core::mem::offset_of!(MmpageFileExpansion, requested_expansion_size) == 0x20);
+    assert!(core::mem::offset_of!(MmpageFileExpansion, actual_expansion) == 0x28);
+    assert!(core::mem::offset_of!(MmpageFileExpansion, event) == 0x30);
+    assert!(core::mem::offset_of!(MmpageFileExpansion, in_progress) == 0x48);
+    assert!(core::mem::offset_of!(MmpageFileExpansion, u1) == 0x4c);
+    assert!(core::mem::offset_of!(MmpageFileExpansion, active_entry) == 0x50);
+};
+
+/// `_MMPAGE_FILE_EXPANSION::u1` (0x4 bytes).
+///
+/// Membros sobrepostos (uniões anônimas do C) ficam nas vistas
+/// `MmpageFileExpansionU1View1`, alcançada por `Deref`.
+#[repr(C)]
+pub struct MmpageFileExpansionU1 {
+    pub long_flags: Field<u32>,
+}
+
+/// Vista 1 de `_MMPAGE_FILE_EXPANSION::u1` (membros sobrepostos à vista anterior).
+#[repr(C)]
+pub struct MmpageFileExpansionU1View1 {
+    _align: [u32; 0],
+    pub flags: MmpageFileExpansionFlags,
+}
+
+impl core::ops::Deref for MmpageFileExpansionU1 {
+    type Target = MmpageFileExpansionU1View1;
+    #[inline(always)]
+    fn deref(&self) -> &MmpageFileExpansionU1View1 {
+        // SAFETY: vistas do mesmo objeto, mesmo tamanho e alinhamento, só de células.
+        unsafe { &*(self as *const Self).cast::<MmpageFileExpansionU1View1>() }
+    }
+}
+
+unsafe impl NtStruct for MmpageFileExpansionU1 {}
+
+const _: () = {
+    assert!(core::mem::size_of::<MmpageFileExpansionU1>() == 0x4);
+    assert!(core::mem::offset_of!(MmpageFileExpansionU1, long_flags) == 0x0);
+    assert!(core::mem::size_of::<MmpageFileExpansionU1View1>() == 0x4);
+    assert!(core::mem::align_of::<MmpageFileExpansionU1View1>() == core::mem::align_of::<MmpageFileExpansionU1>());
+    assert!(core::mem::offset_of!(MmpageFileExpansionU1View1, flags) == 0x0);
+};
+
+/// `_MMPAGE_FILE_EXPANSION_FLAGS` (0x4 bytes).
+#[repr(C)]
+pub struct MmpageFileExpansionFlags {
+    pub bitfield_0: Field<u8>,
+    pub bitfield_1: Field<u8>,
+    pub bitfield_2: Field<u8>,
+    pub bitfield_3: Field<u8>,
+}
+
+unsafe impl NtStruct for MmpageFileExpansionFlags {}
+
+impl MmpageFileExpansionFlags {
+    /// `PageFileNumber`: bits 0..=7 de `bitfield_0`.
+    pub const PAGE_FILE_NUMBER_SHIFT: u32 = 0;
+    pub const PAGE_FILE_NUMBER_MASK: u8 = 0xff;
+    #[inline(always)]
+    pub fn page_file_number(&self) -> u8 {
+        self.bitfield_0.bits(0, 8) as u8
+    }
+    #[inline(always)]
+    pub fn set_page_file_number(&self, value: u8) {
+        self.bitfield_0.set_bits(0, 8, value as u64)
+    }
+    /// `Spare1`: bits 0..=7 de `bitfield_1`.
+    pub const SPARE1_SHIFT: u32 = 0;
+    pub const SPARE1_MASK: u8 = 0xff;
+    #[inline(always)]
+    pub fn spare1(&self) -> u8 {
+        self.bitfield_1.bits(0, 8) as u8
+    }
+    #[inline(always)]
+    pub fn set_spare1(&self, value: u8) {
+        self.bitfield_1.set_bits(0, 8, value as u64)
+    }
+    /// `Spare2`: bits 0..=7 de `bitfield_2`.
+    pub const SPARE2_SHIFT: u32 = 0;
+    pub const SPARE2_MASK: u8 = 0xff;
+    #[inline(always)]
+    pub fn spare2(&self) -> u8 {
+        self.bitfield_2.bits(0, 8) as u8
+    }
+    #[inline(always)]
+    pub fn set_spare2(&self, value: u8) {
+        self.bitfield_2.set_bits(0, 8, value as u64)
+    }
+    /// `IgnoreCurrentCommit`: bits 0..=0 de `bitfield_3`.
+    pub const IGNORE_CURRENT_COMMIT_SHIFT: u32 = 0;
+    pub const IGNORE_CURRENT_COMMIT_MASK: u8 = 0x1;
+    #[inline(always)]
+    pub fn ignore_current_commit(&self) -> u8 {
+        self.bitfield_3.bits(0, 1) as u8
+    }
+    #[inline(always)]
+    pub fn set_ignore_current_commit(&self, value: u8) {
+        self.bitfield_3.set_bits(0, 1, value as u64)
+    }
+    /// `IncreaseMinimumSize`: bits 1..=1 de `bitfield_3`.
+    pub const INCREASE_MINIMUM_SIZE_SHIFT: u32 = 1;
+    pub const INCREASE_MINIMUM_SIZE_MASK: u8 = 0x2;
+    #[inline(always)]
+    pub fn increase_minimum_size(&self) -> u8 {
+        self.bitfield_3.bits(1, 1) as u8
+    }
+    #[inline(always)]
+    pub fn set_increase_minimum_size(&self, value: u8) {
+        self.bitfield_3.set_bits(1, 1, value as u64)
+    }
+    /// `AttemptForCantExtend`: bits 2..=2 de `bitfield_3`.
+    pub const ATTEMPT_FOR_CANT_EXTEND_SHIFT: u32 = 2;
+    pub const ATTEMPT_FOR_CANT_EXTEND_MASK: u8 = 0x4;
+    #[inline(always)]
+    pub fn attempt_for_cant_extend(&self) -> u8 {
+        self.bitfield_3.bits(2, 1) as u8
+    }
+    #[inline(always)]
+    pub fn set_attempt_for_cant_extend(&self, value: u8) {
+        self.bitfield_3.set_bits(2, 1, value as u64)
+    }
+    /// `UnusedSegmentDeletion`: bits 3..=3 de `bitfield_3`.
+    pub const UNUSED_SEGMENT_DELETION_SHIFT: u32 = 3;
+    pub const UNUSED_SEGMENT_DELETION_MASK: u8 = 0x8;
+    #[inline(always)]
+    pub fn unused_segment_deletion(&self) -> u8 {
+        self.bitfield_3.bits(3, 1) as u8
+    }
+    #[inline(always)]
+    pub fn set_unused_segment_deletion(&self, value: u8) {
+        self.bitfield_3.set_bits(3, 1, value as u64)
+    }
+    /// `PageFileContract`: bits 4..=4 de `bitfield_3`.
+    pub const PAGE_FILE_CONTRACT_SHIFT: u32 = 4;
+    pub const PAGE_FILE_CONTRACT_MASK: u8 = 0x10;
+    #[inline(always)]
+    pub fn page_file_contract(&self) -> u8 {
+        self.bitfield_3.bits(4, 1) as u8
+    }
+    #[inline(always)]
+    pub fn set_page_file_contract(&self, value: u8) {
+        self.bitfield_3.set_bits(4, 1, value as u64)
+    }
+    /// `NoWait`: bits 5..=5 de `bitfield_3`.
+    pub const NO_WAIT_SHIFT: u32 = 5;
+    pub const NO_WAIT_MASK: u8 = 0x20;
+    #[inline(always)]
+    pub fn no_wait(&self) -> u8 {
+        self.bitfield_3.bits(5, 1) as u8
+    }
+    #[inline(always)]
+    pub fn set_no_wait(&self, value: u8) {
+        self.bitfield_3.set_bits(5, 1, value as u64)
+    }
+    /// `Spare3`: bits 6..=7 de `bitfield_3`.
+    pub const SPARE3_SHIFT: u32 = 6;
+    pub const SPARE3_MASK: u8 = 0xc0;
+    #[inline(always)]
+    pub fn spare3(&self) -> u8 {
+        self.bitfield_3.bits(6, 2) as u8
+    }
+    #[inline(always)]
+    pub fn set_spare3(&self, value: u8) {
+        self.bitfield_3.set_bits(6, 2, value as u64)
+    }
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<MmpageFileExpansionFlags>() == 0x4);
+    assert!(core::mem::offset_of!(MmpageFileExpansionFlags, bitfield_0) == 0x0);
+    assert!(core::mem::offset_of!(MmpageFileExpansionFlags, bitfield_1) == 0x1);
+    assert!(core::mem::offset_of!(MmpageFileExpansionFlags, bitfield_2) == 0x2);
+    assert!(core::mem::offset_of!(MmpageFileExpansionFlags, bitfield_3) == 0x3);
+};

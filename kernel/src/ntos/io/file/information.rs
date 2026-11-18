@@ -377,10 +377,12 @@ fn set_prepare(file: &FileObject, class: u32, buffer: u64, stack: &IoStackLocati
 }
 
 /// IoSetInformation(FileObject, FileInformationClass, Length, FileInformation).
+/// Os arquivos do file system embutido (sem dispositivo de despacho) mudam
+/// de tamanho pelo volume (`zw::set_volume_file_information`).
 pub fn set_native(file: u64, class: u32, length: u32, buffer: u64) -> Result<u32, KernelError> {
     let device = related_device(file)?;
     if device == 0 {
-        return Ok(SET_STATUS_INVALID_DEVICE_REQUEST);
+        return super::zw::set_volume_file_information(file, class, length, buffer).unwrap_or(Ok(SET_STATUS_INVALID_DEVICE_REQUEST));
     }
     let scratch = guest::alloc_bytes(48);
     if scratch == 0 {
