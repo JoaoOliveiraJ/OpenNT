@@ -1,5 +1,5 @@
-//! LIST_ENTRY duplamente encadeada: InitializeListHead, InsertTailList e
-//! RemoveEntryList sobre a memória do próprio objeto. Valem para as listas de
+//! LIST_ENTRY duplamente encadeada: InitializeListHead, InsertTailList,
+//! InsertHeadList e RemoveEntryList sobre a memória do próprio objeto. Valem para as listas de
 //! estruturas do kernel e para as que o kernel monta na memória de usuário de
 //! um processo (a PEB_LDR_DATA do loader do kernel), escritas no processo
 //! corrente.
@@ -31,6 +31,15 @@ pub fn insert_tail(head: &ListEntry, entry: &ListEntry) {
     entry.blink.set(last.address());
     last.flink.set(entry.address());
     head.blink.set(entry.address());
+}
+
+/// InsertHeadList (sem checagem).
+pub fn insert_head(head: &ListEntry, entry: &ListEntry) {
+    let first = at(head.flink.get());
+    entry.flink.set(first.address());
+    entry.blink.set(head.address());
+    first.blink.set(entry.address());
+    head.flink.set(entry.address());
 }
 
 /// RemoveEntryList com a checagem dos vizinhos: devolve o Flink antigo, ou

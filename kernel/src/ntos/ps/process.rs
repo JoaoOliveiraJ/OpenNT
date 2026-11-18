@@ -532,10 +532,13 @@ pub fn create_kernel_thread(process: u64, thread_id: u64, defer_notify: bool, pr
     tcb.misc_flags.set(if previous_mode == 0 { Kthread::SYSTEM_THREAD_MASK as i32 } else { 0 });
     // O cabeçalho de objeto de espera da thread e o do timer do prazo das
     // esperas dela (KTHREAD.Timer) começam com a lista de espera vazia.
-    for head in [&tcb.header.wait_list_head, &tcb.timer.header.wait_list_head, &tcb.apc_state.apc_list_head[0], &tcb.apc_state.apc_list_head[1], &object.irp_list, &object.active_timer_list_head] {
+    for head in [&tcb.header.wait_list_head, &tcb.timer.header.wait_list_head, &tcb.apc_state.apc_list_head[0], &tcb.apc_state.apc_list_head[1], &object.irp_list, &object.active_timer_list_head, &object.keyed_wait_chain] {
         head.flink.set(head.address());
         head.blink.set(head.address());
     }
+    // PspAllocateThread: o KeyedWaitSemaphore (contagem 0, limite 1) em que a
+    // thread espera a parceira de um keyed event (`ex/keyed_event.rs`).
+    crate::ntos::ke::dispatcher::initialize_semaphore(object.keyed_wait_semaphore.address(), 0, 1);
     tcb.apc_state.process.set(process);
     tcb.process.set(process);
     tcb.previous_mode.set(previous_mode as i8);
@@ -672,6 +675,18 @@ fn as_current<T>(thread: u64, body: impl FnOnce() -> T) -> T {
     result
 }
 
+/// O KeQuerySystemTimePrecise(&Thread->ExitTime) do PspExitThread, numa
+/// thread com Terminated. O ExitTime divide a memória com a KeyedWaitChain:
+/// enquanto um serviço de keyed event está suspenso na thread
+/// (KeyedEventInUse) a cadeia pode estar na lista de um balde, e a hora fica
+/// para o fim do serviço, que chama esta rotina de novo.
+pub fn record_exit_time(thread: u64) {
+    let object = ethread(thread);
+    if object.cross_thread_flags.get() & Ethread::TERMINATED_MASK != 0 && object.keyed_event_in_use() == 0 {
+        write_time(&object.exit_time, timestamp());
+    }
+}
+
 pub fn exit_thread(thread: u64, exit_status: u32) -> Result<(), KernelError> {
     let process = {
         let mut state = STATE.lock();
@@ -686,6 +701,7 @@ pub fn exit_thread(thread: u64, exit_status: u32) -> Result<(), KernelError> {
     // PspSetCrossThreadFlag: OR atômico de Terminated.
     object.cross_thread_flags.atomic().fetch_or(Ethread::TERMINATED_MASK, Ordering::SeqCst);
     object.exit_status.set(exit_status as i32);
+    record_exit_time(thread);
     // Donos de I/O cancelam/drenam requisições antes da notificação, do
     // rundown de APCs e da liberação dos recursos de execução. Antes deles,
     // na ordem do PspExitThread: o LPC_CLIENT_DIED às portas de término e o

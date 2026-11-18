@@ -61,3 +61,4 @@ pub mod security_session_exports;
 pub mod fsrtl_cc_file_exports;
 pub mod ke_ex_po_io_exports;
 pub mod user_jit_memory;
+pub mod keyed_events;

@@ -786,6 +786,7 @@ pub fn init() {
     crate::ntos::se::token::compare::register_user_services();
     crate::ntos::ex::uuid::register_user_services();
     crate::ntos::ex::global_atom::register_user_services();
+    crate::ntos::ex::keyed_event::register_user_services();
     crate::ntos::ps::user::index::register();
     crate::ntos::ps::process_image::init();
     crate::ntos::ps::user::index::set_user_mode_init(crate::hal::amd64::usermode::user_mode_init);

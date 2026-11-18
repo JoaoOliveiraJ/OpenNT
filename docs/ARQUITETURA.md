@@ -2882,7 +2882,11 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     objetos permanentes de `\Callback` do ExpInitializeCallbacks, `\ArcName`
     (vazio: sem ARC_DISK_INFORMATION de um loader, o IopCreateArcNames não
     cria links) e, na fase 1, o tipo KeyedEvent com o
-    `\KernelObjects\CritSecOutOfMemoryEvent` (`ex/keyed_event.rs`), o
+    `\KernelObjects\CritSecOutOfMemoryEvent` (`ex/keyed_event.rs`, que também
+    tem os serviços NtCreateKeyedEvent, NtOpenKeyedEvent,
+    NtWaitForKeyedEvent e NtReleaseKeyedEvent: os 64 baldes do corpo com a
+    KeyedWaitChain, o KeyedWaitValue e o KeyedWaitSemaphore da ETHREAD,
+    teste em `ntos/test/keyed_events.rs`), o
     `\KernelObjects\BcdSyncMutant` com o BiBcdMutantDescriptor
     (`bcd/mod.rs`), os eventos do PfInitializeSuperfetch (`pf/mod.rs`) e o
     `\NLS`.
