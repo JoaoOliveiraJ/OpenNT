@@ -1918,6 +1918,18 @@ acpi.sys sobre o PDO dela relata os dispositivos ISA do namespace
 mouse PS/2 são instalados pelas linhas do keyboard.inf e do msmouse.inf
 (`io/pnp/install.rs`) com o i8042prt.sys e os filtros de classe, e a
 pilha do teclado do boot é a desse nó (`drivers/input/keyboard_stack.rs`).
+As chaves das classes Keyboard e Mouse ficam no conjunto de controle
+(`CurrentControlSet\Control\Class\{4D36E96B-...}` e `{4D36E96F-...}`,
+com os valores da instalação do Windows: Class, ClassDesc, UpperFilters =
+kbdclass/mouclass, IconPath, NoInstallClass e, na Mouse, o Default
+Service), onde o PnP lê os UpperFilters. No boot do shell o kernel abre a
+porta do teclado e o serviço de teclado mantém um READ no
+`\Device\KeyboardClass0`; no boot do processo inicial real
+(`--initial-process=smss`) nenhum dos dois existe: o RIT do win32k de
+cada sessão acha o teclado e o mouse pelas interfaces de dispositivo que o
+kbdclass e o mouclass registram, abre cada uma (o CREATE no kbdclass
+desce ao i8042prt e habilita a porta, no KbdEnableDisablePort) e lê com o
+próprio READ assíncrono.
 Os recursos de todos esses nós passam pelos árbitros e tradutores dos
 drivers de barramento (`io/pnp/arbiter.rs`): o teclado recebe as portas
 0x60/0x64 do árbitro do pci.sys e a IRQ 1 do árbitro do acpi.sys, com o

@@ -1,8 +1,9 @@
 //! Ponto de entrada do kernel (o KiSystemStartup do OpenNT).
 //!
 //! Boot em fases, estilo NT: fase 0 (núcleo mínimo) -> fase 1 (I/O, drivers,
-//! serviços do Registry, PnP) -> processos (serviço de teclado + shell) ->
-//! laço principal que despacha IRQs e o escalonador.
+//! serviços do Registry, PnP) -> processos (serviço de teclado + shell, ou o
+//! smss.exe no boot do processo inicial real) -> laço principal que despacha
+//! IRQs e o escalonador.
 
 use alloc::format;
 
@@ -41,8 +42,8 @@ fn pump_keyboard_data(records: &[u8]) {
     }
 }
 
-/// Serviço de teclado: processo que lê as teclas e publica os caracteres no
-/// canal `kbd` (fluxo nanokernel: driver -> IPC -> shell).
+/// Serviço de teclado do boot do shell: processo que lê as teclas e publica
+/// os caracteres no canal `kbd` (fluxo nanokernel: driver -> IPC -> shell).
 ///
 /// Mantém um READ pendente em `\Device\KeyboardClass0` (i8042prt.sys +
 /// kbdclass.sys reais; com `--usb`, o kbdclass sobre o kbdhid.sys, o
@@ -200,9 +201,12 @@ pub fn kmain() -> ! {
     }
 
     // O boot comum inicializa a pilha PS/2 real antes de despachar os
-    // processos; a suíte de testes já a inicializa.
+    // processos; a suíte de testes já a inicializa. No boot do processo
+    // inicial real a pilha só é montada: a porta e os dispositivos de classe
+    // são abertos pelo RIT do win32k.
     if boot_config::kernel_test_scope() == "none" && crate::drivers::input::keyboard_stack::binaries_present() {
-        if let Err(error) = crate::drivers::input::keyboard_stack::initialize() {
+        let started = if boot_config::smss_boot() { crate::drivers::input::keyboard_stack::start() } else { crate::drivers::input::keyboard_stack::initialize() };
+        if let Err(error) = started {
             debug_print!("[kbd] pilha PS/2 real nao inicializou: {}", error);
         }
     }
@@ -240,10 +244,11 @@ pub fn kmain() -> ! {
         debug_print!("[ex] \\NLS nao criado: {}", error);
     }
 
-    // processos: serviço de teclado (IPC) + shell; no boot do processo
-    // inicial real, o smss.exe no lugar do shell
-    message_channels::create_channel("kbd");
-    scheduler::spawn("kbd-service", keyboard_service());
+    // processos: no boot do processo inicial real, o smss.exe; senão, o
+    // serviço de teclado (IPC) e o shell. No boot do smss nenhum leitor do
+    // kernel fica no \Device\KeyboardClass0: o kbdclass completa o READ que
+    // estiver primeiro na fila, e as teclas são do RIT do win32k de cada
+    // sessão (o RIMStartDeviceRead), como no Windows.
     if boot_config::smss_boot() {
         if let Err(error) = crate::ntos::init::initial_process::start() {
             debug_print!("[init] processo inicial nao criado: {}", error);
@@ -251,10 +256,14 @@ pub fn kmain() -> ! {
         if boot_config::memory_pressure_test() {
             crate::ntos::test::memory_pressure::start();
         }
-    } else if boot_config::user_program() == "shell" {
-        scheduler::spawn("shell", crate::shell::main());
     } else {
-        debug_print!("[boot] programa de usuario desconhecido: {}", boot_config::user_program());
+        message_channels::create_channel("kbd");
+        scheduler::spawn("kbd-service", keyboard_service());
+        if boot_config::user_program() == "shell" {
+            scheduler::spawn("shell", crate::shell::main());
+        } else {
+            debug_print!("[boot] programa de usuario desconhecido: {}", boot_config::user_program());
+        }
     }
 
     // Se a plataforma não entregar IRQs, cai no modo cooperativo com log claro.

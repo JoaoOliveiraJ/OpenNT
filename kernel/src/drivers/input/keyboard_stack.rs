@@ -2,11 +2,19 @@
 //!
 //! Carrega o kbdclass.sys e o i8042prt.sys reais, monta pelo PnP as pilhas
 //! dos PDOs da placa-mãe (PNP0303 e PNP0F13, com os filtros de classe
-//! kbdclass/mouclass) e abre a porta do teclado: o CREATE do i8042prt
-//! habilita a entrega dos scancodes. O handle fica aberto enquanto o serviço
-//! de teclado estiver em uso (o close dispararia o disable da porta).
+//! kbdclass/mouclass) e, para o shell e o teste, abre a porta do teclado: o
+//! CREATE do i8042prt habilita a entrega dos scancodes. O handle fica aberto
+//! enquanto o serviço de teclado estiver em uso (o close dispararia o
+//! disable da porta).
+//!
+//! No boot do processo inicial real (`--initial-process=smss`) a pilha só é
+//! montada ([`start`]): ninguém no kernel abre a porta nem a classe. Como no
+//! Windows, quem habilita a porta é o kbdclass, quando o RIT do win32k abre o
+//! dispositivo de classe (o KeyboardClassCreate repassa o CREATE ao port
+//! driver no KbdEnableDisablePort).
 
 use alloc::format;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::drivers::bus::motherboard;
 use crate::ntos::io::{io_manager, pnp};
@@ -14,28 +22,46 @@ use crate::ntos::ob::object_manager::{self, NodeId};
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::io::lifecycle::{self, DriverOptions};
 
-/// `None` = ainda não inicializada; `Some(pilha)` = resultado guardado.
+/// `None` = ainda não montada; `Some(pilha)` = resultado guardado.
 static KEYBOARD_STACK: SpinLock<Option<Option<NodeId>>> = SpinLock::new(None);
+/// A porta do teclado já foi aberta pelo kernel ([`initialize`]).
+static PORT_OPENED: AtomicBool = AtomicBool::new(false);
 
 /// Os binários do teclado vieram no bundle do build?
 pub fn binaries_present() -> bool {
     crate::hal::bundle::read("apps/kbdclass.sys").is_some() && crate::hal::bundle::read("apps/i8042prt.sys").is_some()
 }
 
-/// Devolve o FDO da pilha do teclado iniciada (`None` se o PnP não a
-/// iniciou). Idempotente.
-pub fn initialize() -> Result<Option<NodeId>, KernelError> {
+/// Monta as pilhas do teclado e do mouse PS/2 e devolve o FDO da pilha do
+/// teclado iniciada (`None` se o PnP não a iniciou), sem abrir a porta.
+/// Idempotente.
+pub fn start() -> Result<Option<NodeId>, KernelError> {
     if let Some(stack) = *KEYBOARD_STACK.lock() {
         return Ok(stack);
     }
-    if crate::drivers::bus::acpi_stack::enabled() {
-        let stack = acpi_keyboard_stack();
-        if let Some(fdo) = stack {
-            open_port(fdo)?;
+    let stack = if crate::drivers::bus::acpi_stack::enabled() { acpi_keyboard_stack() } else { motherboard_keyboard_stack()? };
+    *KEYBOARD_STACK.lock() = Some(stack);
+    Ok(stack)
+}
+
+/// [`start`] e a abertura da porta do teclado (o shell e o teste de
+/// teclado). Idempotente.
+pub fn initialize() -> Result<Option<NodeId>, KernelError> {
+    let stack = start()?;
+    if let Some(fdo) = stack {
+        if !PORT_OPENED.swap(true, Ordering::AcqRel) {
+            if let Err(error) = open_port(fdo) {
+                PORT_OPENED.store(false, Ordering::Release);
+                return Err(error);
+            }
         }
-        *KEYBOARD_STACK.lock() = Some(stack);
-        return Ok(stack);
     }
+    Ok(stack)
+}
+
+/// Sem a raiz ACPI: carrega os drivers e monta as pilhas dos PDOs da
+/// placa-mãe pelo orquestrador do PnP.
+fn motherboard_keyboard_stack() -> Result<Option<NodeId>, KernelError> {
     let _ = lifecycle::load_driver("/kbdclass.sys", &DriverOptions::default());
     let _ = lifecycle::load_driver("/i8042prt.sys", &DriverOptions::default());
     if object_manager::lookup("\\Driver\\kbdclass").is_none() || object_manager::lookup("\\Driver\\i8042prt").is_none() {
@@ -55,10 +81,6 @@ pub fn initialize() -> Result<Option<NodeId>, KernelError> {
             }
         }
     }
-    if let Some(fdo) = keyboard_stack {
-        open_port(fdo)?;
-    }
-    *KEYBOARD_STACK.lock() = Some(keyboard_stack);
     Ok(keyboard_stack)
 }
 
