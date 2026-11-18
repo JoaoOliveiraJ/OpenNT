@@ -241,22 +241,37 @@ fn nt_query_information_token(handle: u64, class: u64, out: u64, length: u64, rs
     Ok(write_result(query_token::encode(token, class, out), out, length as u32, stack_arg(rsp, 5)))
 }
 
-/// Seis parâmetros, com o buffer em R9: a API exige saída não nula mesmo na
-/// consulta de tamanho.
+/// NtQuerySecurityAttributesToken(TokenHandle, Attributes, NumberOfAttributes,
+/// Buffer, Length, ReturnLength), seis parâmetros com o buffer em R9, como o
+/// 19041 (0x6011c0): Length zero exige Buffer nulo (a consulta de tamanho
+/// que o GetTokenSecurityAttributeInformation do combase faz antes de cada
+/// leitura) e Length não nulo exige Buffer; o Buffer (alinhado a ULONG) e o
+/// ReturnLength, obrigatório e alinhado, são sondados para escrita; o vetor
+/// de nomes é capturado (Attributes e NumberOfAttributes nulos juntos, o
+/// SepCaptureUnicodeStringArray) antes de o token ser referenciado com
+/// TOKEN_QUERY.
 fn nt_query_security_attributes_token(handle: u64, attributes: u64, count: u64, out: u64, rsp: u64) -> Result<u32, KernelError> {
     let count = count as u32 as u64;
     let length = state::stack_arg32(rsp, 5);
     let returned = stack_arg(rsp, 6);
-    if out == 0 || length == 0 || returned == 0 || (attributes != 0) != (count != 0) {
+    if (length == 0) != (out == 0) {
         return Ok(0xC000_000D);
     }
-    if !probe_user_write(returned, 4) || !probe_user_write(out, length as u64) {
+    if length != 0 && out & 3 != 0 {
+        return Ok(0x8000_0002);
+    }
+    if length != 0 && !probe_user_write(out, length as u64) {
         return Ok(0xC000_0005);
     }
-    let token = match lookup(handle, 8) {
-        Ok(token) => token,
-        Err(status) => return Ok(status),
-    };
+    if returned & 3 != 0 {
+        return Ok(0x8000_0002);
+    }
+    if !probe_user_write(returned, 4) {
+        return Ok(0xC000_0005);
+    }
+    if (attributes != 0) != (count != 0) {
+        return Ok(0xC000_000D);
+    }
     if count != 0 && !probe_user_read(attributes, count * 16) {
         return Ok(0xC000_0005);
     }
@@ -281,6 +296,10 @@ fn nt_query_security_attributes_token(handle: u64, attributes: u64, count: u64, 
             Err(error) => return Ok(error.status),
         }
     }
+    let token = match lookup(handle, 8) {
+        Ok(token) => token,
+        Err(status) => return Ok(status),
+    };
     let attributes_of_token = tokens::with(token, |record| record.security_attributes.clone()).unwrap_or_default();
     let selected = security_attributes::select(&attributes_of_token, if count != 0 { Some(&names) } else { None })?;
     let Some(selected) = selected else {

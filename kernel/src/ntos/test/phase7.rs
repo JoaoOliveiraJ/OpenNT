@@ -3132,6 +3132,26 @@ fn user_tokens(assert: Assert) {
     guest::write32(rsp + 0x28, 0);
     guest::write64(rsp + 0x30, returned);
     assert(call("NtQuerySecurityAttributesToken", token, 0, 0, buffer) == 0xC000_000D && call("NtQuerySecurityAttributesToken", 0x7FF0, 0, 0, buffer) == 0xC000_000D, "usertokens: atributos de seguranca exigem saida");
+    // A consulta de tamanho (Buffer nulo e Length zero) de um nome que o
+    // token não tem, como a do GetTokenSecurityAttributeInformation do
+    // combase: STATUS_NOT_FOUND com ReturnLength zero; sem ReturnLength,
+    // STATUS_ACCESS_VIOLATION; Buffer nulo com Length, parâmetro inválido.
+    let (name, text) = (buffer + 0x500, buffer + 0x520);
+    for (index, unit) in "WIN://SYSAPPID".encode_utf16().enumerate() {
+        guest::write16(text + index as u64 * 2, unit);
+    }
+    guest::write16(name, 28);
+    guest::write16(name + 2, 28);
+    guest::write64(name + 8, text);
+    guest::write32(returned, 0x5A5A);
+    let size_query = call("NtQuerySecurityAttributesToken", token, name, 1, 0);
+    let size_returned = guest::read32(returned);
+    guest::write64(rsp + 0x30, 0);
+    let no_return_length = call("NtQuerySecurityAttributesToken", token, name, 1, 0);
+    guest::write32(rsp + 0x28, 0x40);
+    guest::write64(rsp + 0x30, returned);
+    let null_buffer = call("NtQuerySecurityAttributesToken", token, name, 1, 0);
+    assert(size_query == 0xC000_0225 && size_returned == 0 && no_return_length == 0xC000_0005 && null_buffer == 0xC000_000D, "usertokens: consulta de tamanho dos atributos de seguranca com Buffer nulo e Length zero");
     let _ = call("NtClose", token, 0, 0, 0);
     if let Some(region) = memory::find_region(block) {
         memory::release_private_region(&region);
