@@ -79,6 +79,8 @@ kernel/src/
 │   │                  próprio depurador do OpenNT (protocolo remoto do GDB,
 │   │                  consultas de objetos do NT, rastro de instruções)
 │   ├── po/ etw/ dbgk/ fsrtl/
+│   ├── pf/            prefetcher: os eventos \KernelObjects do Superfetch
+│   ├── bcd/           biblioteca BCD do kernel: o BcdSyncMutant
 │   ├── bgk/           console do vídeo de boot (Bgk*), fonte e tela de bugcheck
 │   ├── inbv/          vídeo de boot: posse do vídeo entre kernel e driver
 │   ├── ttm/           Terminal Topology Manager (notificações de dispositivo)
@@ -2698,6 +2700,43 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     `objects/device.rs` e `objects/driver.rs`.
   - Teste: `ntos/test/object_header.rs` (fase 6 e um processo de teste na
     fase 7).
+- **Namespace de objetos do boot, sombras e namespaces privados**
+  (`ob/object_manager.rs`, `ob/objects/namespace.rs`,
+  `ob/handles/namespace.rs`, `ob/private_namespace.rs`):
+  - O kernel publica o que o ntoskrnl 19041 publica antes do primeiro
+    processo: `\ObjectTypes` com um objeto do tipo Type por tipo (o
+    OBJECT_TYPE como corpo; os tipos criados depois entram pelo
+    ObCreateObjectTypeEx), `\GLOBAL??\Global` → `\GLOBAL??`, os sete
+    objetos permanentes de `\Callback` do ExpInitializeCallbacks, `\ArcName`
+    (vazio: sem ARC_DISK_INFORMATION de um loader, o IopCreateArcNames não
+    cria links) e, na fase 1, o tipo KeyedEvent com o
+    `\KernelObjects\CritSecOutOfMemoryEvent` (`ex/keyed_event.rs`), o
+    `\KernelObjects\BcdSyncMutant` com o BiBcdMutantDescriptor
+    (`bcd/mod.rs`), os eventos do PfInitializeSuperfetch (`pf/mod.rs`) e o
+    `\NLS`.
+  - O corpo de diretório guarda os campos do OBJECT_DIRECTORY que o OpenNT
+    usa: SessionId, Flags, SessionObject, ShadowDirectory e NamespaceEntry.
+    O NtCreateDirectoryObjectEx guarda o diretório sombra (Flags 4, e 0x10
+    quando quem cria é sandbox) e os bits 8 e 0x20 dos Flags do serviço; a
+    busca de abertura (`object_manager::resolve_open_from`/`lookup_open`,
+    usada pelo NtOpenDirectoryObject, NtOpenSymbolicLinkObject, NtOpenEvent,
+    NtOpenMutant, NtOpenSemaphore e NtOpenIoCompletion) procura na sombra o
+    nome que falta, como o ObpGetShadowDirectory; a busca de quem cria não.
+  - Os namespaces privados são diretórios sem pai na árvore, achados pela
+    fronteira na OBJECT_NAMESPACE_LOOKUPTABLE do silo (37 baldes de
+    OBJECT_NAMESPACE_ENTRY, a captura do ObpCaptureBoundaryDescriptor no
+    formato da entrada); a criação passa pelo ObpVerifyCreatorAccessCheck,
+    a tabela guarda uma referência ao diretório e o último handle ou o
+    NtDeletePrivateNamespace o tiram dela. Os serviços que transformam o
+    RootDirectory num caminho (`ps/user/registry.rs`, seções, portas de
+    conclusão e ALPC) usam `object_manager::anchored_path_of`: dentro de um
+    namespace privado, o caminho começa por um componente com o nó e um
+    segredo do kernel, que a busca resolve de volta ao diretório; o
+    NtQueryObject continua sem nome para esses objetos.
+  - Fora do modelo: o `\??` é um link real sem DEVICE_MAP por LUID, o
+    SessionId do diretório não restringe criações e o bit 8 não muda a
+    herança dos descritores. Teste: `namespace`, `private_namespaces` e
+    `shadow_directories` na fase 3.
 - **Handles e informações entre processos** (`ps/user/handles.rs`):
   - NtDuplicateObject é o ObDuplicateObject: os handles do processo de
     origem e do de destino saem da tabela de quem chama e pedem

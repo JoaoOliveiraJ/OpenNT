@@ -30,3 +30,4 @@ pub mod exports;
 pub mod audit;
 pub mod device_map;
 pub mod compare_objects;
+pub mod private_namespace;

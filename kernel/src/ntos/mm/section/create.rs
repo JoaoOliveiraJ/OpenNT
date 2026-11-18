@@ -183,7 +183,7 @@ pub fn attributes(pointer: u64, mode: u8, capture_only: bool) -> Result<Attribut
         if object_manager::node(directory).is_none_or(|node| node.type_name != "Directory") {
             return Err(0xC000_0024);
         }
-        let Some(path) = object_manager::path_of(directory) else { return Err(0xC000_003A) };
+        let Some(path) = object_manager::anchored_path_of(directory) else { return Err(0xC000_003A) };
         name = alloc::format!("{}\\{}", if path == "\\" { "" } else { &path }, name);
     } else if !name.starts_with('\\') {
         return Err(0xC000_003B);

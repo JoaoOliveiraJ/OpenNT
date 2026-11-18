@@ -1,18 +1,20 @@
 //! Corpos nativos de diretório e link simbólico.
 //!
 //! O nó do namespace é o dono compartilhado por aberturas por nome e por
-//! ponteiro. O corpo privado (64 bytes) guarda referências (+0), handles
+//! ponteiro. O corpo privado (0x48 bytes) guarda referências (+0), handles
 //! (+8), permanência (+12), o UNICODE_STRING do destino do link (+0x10), o
-//! número de filhos (+0x20) e, num diretório, o SessionId (+0x28) e o
-//! SessionObject (+0x30) do OBJECT_DIRECTORY. As contagens vivem só na
-//! memória do corpo e mudam por operações atômicas, como o
-//! PointerCount/HandleCount do NT.
+//! número de filhos (+0x20) e, num diretório, os campos do OBJECT_DIRECTORY
+//! que o OpenNT usa: SessionId (+0x28), Flags (+0x2C), SessionObject
+//! (+0x30), ShadowDirectory (+0x38, o corpo do diretório sombra, retido) e
+//! NamespaceEntry (+0x40, o OBJECT_NAMESPACE_ENTRY de um namespace
+//! privado). As contagens vivem só na memória do corpo e mudam por operações
+//! atômicas, como o PointerCount/HandleCount do NT.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use crate::ntos::inc::field::{Field, NtStruct, Reserved};
+use crate::ntos::inc::field::{Field, NtStruct};
 use crate::ntos::inc::types::UnicodeString;
 
 use crate::ntos::ob::object_manager::{self, NodeId};
@@ -36,26 +38,53 @@ struct NamespaceBody {
     /// ObpCreateDirectoryObject; o NtSetInformationObject
     /// (ObjectSessionInformation) grava a sessão de quem chama.
     session_id: Field<u32>,
-    _pad_2c: Reserved<4>,
+    /// OBJECT_DIRECTORY.Flags (os DIRECTORY_* abaixo).
+    flags: Field<u32>,
     /// OBJECT_DIRECTORY.SessionObject: o objeto Session ligado pelo
     /// NtSetInformationObject (ObjectSessionObjectInformation), retido.
     session_object: Field<u64>,
-    _reserved: Reserved<0x8>,
+    /// OBJECT_DIRECTORY.ShadowDirectory: o corpo do diretório sombra do
+    /// NtCreateDirectoryObjectEx, com a referência que o diretório guarda.
+    shadow_directory: Field<u64>,
+    /// OBJECT_DIRECTORY.NamespaceEntry: o OBJECT_NAMESPACE_ENTRY de um
+    /// namespace privado registrado (0 fora da tabela).
+    namespace_entry: Field<u64>,
 }
 
 // SAFETY: #[repr(C)] só de células.
 unsafe impl NtStruct for NamespaceBody {}
 
 const _: () = {
-    assert!(core::mem::size_of::<NamespaceBody>() == 0x40);
+    assert!(core::mem::size_of::<NamespaceBody>() == 0x48);
     assert!(core::mem::offset_of!(NamespaceBody, link_target) == 0x10);
     assert!(core::mem::offset_of!(NamespaceBody, children) == 0x20);
     assert!(core::mem::offset_of!(NamespaceBody, session_id) == 0x28);
+    assert!(core::mem::offset_of!(NamespaceBody, flags) == 0x2C);
     assert!(core::mem::offset_of!(NamespaceBody, session_object) == 0x30);
+    assert!(core::mem::offset_of!(NamespaceBody, shadow_directory) == 0x38);
+    assert!(core::mem::offset_of!(NamespaceBody, namespace_entry) == 0x40);
 };
 
 /// SessionId de diretório sem sessão.
 pub const NO_SESSION: u32 = u32::MAX;
+
+/// OBJECT_DIRECTORY.Flags (ntoskrnl 19041): diretório de um namespace
+/// privado (NtCreatePrivateNamespace).
+pub const DIRECTORY_PRIVATE_NAMESPACE: u32 = 0x1;
+/// O namespace privado saiu da tabela (ObpRemoveNamespaceFromTable).
+pub const DIRECTORY_NAMESPACE_REMOVED: u32 = 0x2;
+/// ShadowDirectory válido (NtCreateDirectoryObjectEx com sombra).
+pub const DIRECTORY_SHADOW: u32 = 0x4;
+/// O bit 0 dos Flags do NtCreateDirectoryObjectEx: os objetos criados no
+/// diretório recebem o descritor com SEF_DACL_AUTO_INHERIT |
+/// SEF_SACL_AUTO_INHERIT (ObpInsertOrLocateNamedObject).
+pub const DIRECTORY_AUTO_INHERIT: u32 = 0x8;
+/// Criado por um token sandbox: a sombra só vale para quem também é
+/// (ObpGetShadowDirectory).
+pub const DIRECTORY_SANDBOXED_SHADOW: u32 = 0x10;
+/// O bit 1 dos Flags (só de modo kernel): o ObQueryNameString para de
+/// subir neste diretório.
+pub const DIRECTORY_NAME_ROOT: u32 = 0x20;
 
 pub const SIZE: u64 = NamespaceBody::SIZE;
 
@@ -159,6 +188,12 @@ fn collect(pointer: u64) {
     if session_object != 0 {
         crate::ntos::ob::object_header::dereference(session_object, true);
     }
+    // ObpDeleteDirectoryObject: a referência do diretório sombra sai junto.
+    let shadow = self::body(pointer).shadow_directory.atomic().swap(0, Ordering::SeqCst);
+    // O OBJECT_NAMESPACE_ENTRY de um namespace privado vive com o diretório.
+    if self::body(pointer).flags.get() & DIRECTORY_PRIVATE_NAMESPACE != 0 {
+        crate::ntos::ob::private_namespace::release_directory(pointer);
+    }
     object_manager::set_native_namespace(body.node, 0);
     object_types::unbind_native(pointer);
     object_manager::track_namespace(body.node, false);
@@ -167,6 +202,9 @@ fn collect(pointer: u64) {
         guest::free_bytes(body.target_buffer);
     }
     guest::free_bytes(pointer);
+    if shadow != 0 {
+        let _ = dereference(shadow);
+    }
 }
 
 pub fn refs(pointer: u64) -> u64 {
@@ -196,6 +234,43 @@ pub fn session_id(pointer: u64) -> Result<u32, KernelError> {
 pub fn set_session_id(pointer: u64, session_id: u32) -> Result<(), KernelError> {
     assert_live(pointer)?;
     body(pointer).session_id.set(session_id);
+    Ok(())
+}
+
+/// OBJECT_DIRECTORY.Flags de um diretório vivo (0 para outro corpo).
+pub fn directory_flags(pointer: u64) -> u32 {
+    if BODIES.lock().get(&pointer).is_some_and(|body| body.directory) { body(pointer).flags.get() } else { 0 }
+}
+
+/// Liga bits em OBJECT_DIRECTORY.Flags (o `lock or` do NT); devolve o valor
+/// anterior.
+pub fn set_directory_flags(pointer: u64, bits: u32) -> Result<u32, KernelError> {
+    assert_live(pointer)?;
+    Ok(body(pointer).flags.atomic().fetch_or(bits, Ordering::SeqCst))
+}
+
+/// OBJECT_DIRECTORY.ShadowDirectory (o corpo do diretório sombra, 0 sem).
+pub fn shadow_directory(pointer: u64) -> u64 {
+    if BODIES.lock().get(&pointer).is_some_and(|body| body.directory) { body(pointer).shadow_directory.get() } else { 0 }
+}
+
+/// Grava o ShadowDirectory de um diretório novo; a referência do `shadow`
+/// passa a ser do diretório (solta no ObpDeleteDirectoryObject).
+pub fn set_shadow_directory(pointer: u64, shadow: u64) -> Result<(), KernelError> {
+    assert_live(pointer)?;
+    body(pointer).shadow_directory.set(shadow);
+    Ok(())
+}
+
+/// OBJECT_DIRECTORY.NamespaceEntry (0 fora da tabela de namespaces).
+pub fn namespace_entry(pointer: u64) -> u64 {
+    if BODIES.lock().get(&pointer).is_some_and(|body| body.directory) { body(pointer).namespace_entry.get() } else { 0 }
+}
+
+/// Grava o NamespaceEntry (o chamador serializa pela trava da tabela).
+pub fn set_namespace_entry(pointer: u64, entry: u64) -> Result<(), KernelError> {
+    assert_live(pointer)?;
+    body(pointer).namespace_entry.set(entry);
     Ok(())
 }
 
@@ -240,6 +315,11 @@ pub fn close(pointer: u64) -> Result<(), KernelError> {
     let attached = BODIES.lock().get(&pointer).is_some_and(|body| body.attached);
     if open_handles == 1 && !permanent(pointer) && attached {
         object_manager::remove_named(node);
+    }
+    // ObpCloseDirectoryObject: o último handle de um namespace privado o
+    // tira da tabela.
+    if open_handles == 1 && directory_flags(pointer) & DIRECTORY_PRIVATE_NAMESPACE != 0 {
+        let _ = crate::ntos::ob::private_namespace::remove_from_table(pointer);
     }
     if BODIES.lock().contains_key(&pointer) {
         update_counts(node);

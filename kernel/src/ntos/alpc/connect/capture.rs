@@ -208,7 +208,7 @@ pub fn object_attributes(pointer: u64, mode: u8) -> Result<Creation, u32> {
         if object_manager::node(directory).is_none_or(|record| record.type_name != "Directory") {
             return Err(0xC000_0024);
         }
-        let Some(parent_path) = object_manager::path_of(directory) else { return Err(0xC000_003A) };
+        let Some(parent_path) = object_manager::anchored_path_of(directory) else { return Err(0xC000_003A) };
         name = alloc::format!("{}\\{}", if parent_path == "\\" { "" } else { parent_path.as_str() }, name);
     } else if !name.starts_with('\\') {
         return Err(0xC000_003B);

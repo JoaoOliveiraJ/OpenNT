@@ -159,7 +159,7 @@ fn capture_attributes(attributes: u64, mode: u8) -> Result<Captured, u32> {
     }
     let (parent, parent_rest) = object_manager::resolve_from(if parent_name.is_empty() { "\\" } else { &parent_name }, 0, true, false, start);
     let Some(parent) = parent.filter(|&parent| parent_rest.is_none() && object_manager::node(parent).is_some_and(|node| node.type_name == "Directory")) else { return Err(0xC000_003A) };
-    let Some(path) = object_manager::path_of(parent) else { return Err(0xC000_003A) };
+    let Some(path) = object_manager::anchored_path_of(parent) else { return Err(0xC000_003A) };
     captured.name = alloc::format!("{}\\{}", if path == "\\" { "" } else { &path }, leaf);
     captured.parent = Some(parent);
     captured.leaf = leaf;

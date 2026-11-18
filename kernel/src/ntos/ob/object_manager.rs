@@ -270,39 +270,90 @@ fn update_namespace_statistics() {
     });
 }
 
-/// Percorre a árvore a partir de `start` e segue links até a profundidade 8.
-/// Devolve o nó encontrado e o trecho delegado a um volume montado.
-pub fn resolve_from(path: &str, link_depth: u32, case_insensitive: bool, open_symbolic_link: bool, start: NodeId) -> (Option<NodeId>, Option<String>) {
+/// Um passo da busca: o filho achado (com o que a busca precisa dele), o
+/// trecho delegado a um volume montado, ou nada.
+enum Step {
+    Missing,
+    Mount(String),
+    Found { next: NodeId, is_link: bool, body: u64, target: Option<String> },
+}
+
+/// O componente `part` em `directory`, pela regra de caixa pedida.
+fn child_step(state: &State, directory: NodeId, parts: &[&str], index: usize, case_insensitive: bool) -> Step {
+    let Some(node) = state.nodes.get(&directory) else { return Step::Missing };
+    if node.mount.is_some() {
+        return Step::Mount(parts[index..].join("/"));
+    }
+    let Some(children) = node.children.as_ref() else { return Step::Missing };
+    let part = parts[index];
+    let lower = part.to_lowercase();
+    let next = if case_insensitive {
+        children.get(&lower).copied().or_else(|| children.values().copied().find(|child| state.nodes.get(child).is_some_and(|child| child.name.to_lowercase() == lower)))
+    } else {
+        children.values().copied().find(|child| state.nodes.get(child).is_some_and(|child| child.name == part))
+    };
+    let Some((next, next_node)) = next.and_then(|next| state.nodes.get(&next).map(|node| (next, node))) else { return Step::Missing };
+    Step::Found { next, is_link: next_node.type_name == "SymbolicLink", body: next_node.native_namespace, target: next_node.data.as_ref().and_then(|data| data.symlink_target.clone()) }
+}
+
+/// ObpGetShadowDirectory na busca de abertura (ObpLookupObjectName sem
+/// objeto a inserir): o componente que falta num diretório com sombra
+/// (Flags & 4) é procurado no ShadowDirectory, e na sombra dele em seguida.
+/// Um diretório criado por token sandbox (Flags & 0x10) só usa a sombra
+/// para quem também é sandbox (o RtlIsSandboxedToken de quem chama;
+/// KernelMode nunca é). O diretório sem sombra com DeviceMap (o \?? por
+/// LUID) não existe no OpenNT.
+fn shadow_step(directory: NodeId, parts: &[&str], index: usize, case_insensitive: bool, from_user_mode: bool) -> Step {
+    let mut current = directory;
+    let mut sandboxed: Option<bool> = None;
+    for _ in 0..32 {
+        let body = with_state(|state| state.nodes.get(&current).map_or(0, |node| node.native_namespace));
+        let flags = namespace_objects::directory_flags(body);
+        if flags & namespace_objects::DIRECTORY_SHADOW == 0 {
+            return Step::Missing;
+        }
+        if flags & namespace_objects::DIRECTORY_SANDBOXED_SHADOW != 0 && !*sandboxed.get_or_insert_with(|| from_user_mode && crate::ntos::rtl::security::is_sandboxed_token(0, 1).unwrap_or(false)) {
+            return Step::Missing;
+        }
+        let Some((shadow, true)) = namespace_objects::get(namespace_objects::shadow_directory(body)) else { return Step::Missing };
+        match with_state(|state| child_step(state, shadow, parts, index, case_insensitive)) {
+            Step::Missing => current = shadow,
+            found => return found,
+        }
+    }
+    Step::Missing
+}
+
+/// Percorre a árvore a partir de `start` e segue links até a profundidade
+/// 8; `shadow` liga a sombra dos diretórios (busca de abertura, com o modo
+/// de quem chama). Um caminho que começa pelo componente de
+/// `private_namespace::anchor_name` parte do diretório do namespace privado.
+fn resolve_inner(path: &str, link_depth: u32, case_insensitive: bool, open_symbolic_link: bool, start: NodeId, shadow: Option<bool>) -> (Option<NodeId>, Option<String>) {
     if link_depth > 8 {
         return (None, None); // laço de links
     }
-    let parts = split_path(path);
+    let mut parts = split_path(path);
     let mut current = start;
-    for (index, part) in parts.iter().enumerate() {
-        let step = with_state(|state| {
-            let node = state.nodes.get(&current)?;
-            if node.mount.is_some() {
-                return Some(Err(parts[index..].join("/")));
-            }
-            let children = node.children.as_ref()?;
-            let lower = part.to_lowercase();
-            let next = if case_insensitive {
-                children.get(&lower).copied().or_else(|| children.values().copied().find(|child| state.nodes.get(child).is_some_and(|child| child.name.to_lowercase() == lower)))
-            } else {
-                children.values().copied().find(|child| state.nodes.get(child).is_some_and(|child| child.name == *part))
-            }?;
-            let next_node = state.nodes.get(&next)?;
-            Some(Ok((next, next_node.type_name == "SymbolicLink", next_node.native_namespace, next_node.data.as_ref().and_then(|data| data.symlink_target.clone()))))
-        });
+    if start == ROOT && !path.starts_with('\\') {
+        if let Some(anchor) = parts.first().and_then(|first| crate::ntos::ob::private_namespace::anchor_node(first)) {
+            current = anchor;
+            parts.remove(0);
+        }
+    }
+    for index in 0..parts.len() {
+        let step = match with_state(|state| child_step(state, current, &parts, index, case_insensitive)) {
+            Step::Missing if shadow.is_some() => shadow_step(current, &parts, index, case_insensitive, shadow == Some(true)),
+            step => step,
+        };
         match step {
-            None => return (None, None),
-            Some(Err(rest)) => return (Some(current), Some(rest)),
-            Some(Ok((next, is_link, body, target))) => {
+            Step::Missing => return (None, None),
+            Step::Mount(rest) => return (Some(current), Some(rest)),
+            Step::Found { next, is_link, body, target } => {
                 if is_link && !(open_symbolic_link && index == parts.len() - 1) {
                     let rest = parts[index + 1..].join("\\");
                     let target = if body != 0 { namespace_objects::target(body).unwrap_or_default() } else { target.unwrap_or_default() };
                     let full = if rest.is_empty() { target } else { alloc::format!("{}\\{}", target, rest) };
-                    return resolve_from(&full, link_depth + 1, case_insensitive, open_symbolic_link, ROOT);
+                    return resolve_inner(&full, link_depth + 1, case_insensitive, open_symbolic_link, ROOT, shadow);
                 }
                 current = next;
             }
@@ -310,6 +361,19 @@ pub fn resolve_from(path: &str, link_depth: u32, case_insensitive: bool, open_sy
     }
     let mounted = with_state(|state| state.nodes.get(&current).is_some_and(|node| node.mount.is_some()));
     (Some(current), mounted.then(String::new))
+}
+
+/// Percorre a árvore a partir de `start` e segue links até a profundidade 8.
+/// Devolve o nó encontrado e o trecho delegado a um volume montado. Sem a
+/// sombra dos diretórios: a busca de quem insere um nome.
+pub fn resolve_from(path: &str, link_depth: u32, case_insensitive: bool, open_symbolic_link: bool, start: NodeId) -> (Option<NodeId>, Option<String>) {
+    resolve_inner(path, link_depth, case_insensitive, open_symbolic_link, start, None)
+}
+
+/// [`resolve_from`] de uma abertura: o nome que falta num diretório com
+/// sombra é procurado nela.
+pub fn resolve_open_from(path: &str, case_insensitive: bool, open_symbolic_link: bool, start: NodeId, from_user_mode: bool) -> (Option<NodeId>, Option<String>) {
+    resolve_inner(path, 0, case_insensitive, open_symbolic_link, start, Some(from_user_mode))
 }
 
 pub fn resolve(path: &str) -> (Option<NodeId>, Option<String>) {
@@ -721,6 +785,11 @@ pub fn lookup(path: &str) -> Option<NodeId> {
     resolve(path).0
 }
 
+/// [`lookup`] de uma abertura, com a sombra dos diretórios.
+pub fn lookup_open(path: &str, from_user_mode: bool) -> Option<NodeId> {
+    resolve_open_from(path, true, false, ROOT, from_user_mode).0
+}
+
 /// Remove o filho da árvore, sem descartar referências de handles.
 pub fn unlink(path: &str) -> bool {
     let parts = split_path(path);
@@ -786,6 +855,36 @@ pub fn remove_named(id: NodeId) -> bool {
 /// Caminho atual de um nó pela identidade; `None` se saiu da árvore.
 pub fn path_of(target: NodeId) -> Option<String> {
     namespace_entries().into_iter().find(|(id, _)| *id == target).map(|(_, path)| path)
+}
+
+/// O caminho de um diretório usado como RootDirectory: o [`path_of`] na
+/// árvore, ou, dentro de um namespace privado (um diretório sem pai), o
+/// caminho ancorado nele, que as buscas resolvem de volta ao mesmo nó. Só
+/// para buscas do kernel: não é um nome do NT.
+pub fn anchored_path_of(target: NodeId) -> Option<String> {
+    if let Some(path) = path_of(target) {
+        return Some(path);
+    }
+    let (top, components) = with_state(|state| {
+        let mut components = Vec::new();
+        let mut current = target;
+        loop {
+            let node = state.nodes.get(&current)?;
+            let Some(parent) = node.parent else { break };
+            if !attached(state, current) {
+                return None;
+            }
+            components.push(node.name.clone());
+            current = parent;
+        }
+        Some((current, components))
+    })?;
+    let mut path = crate::ntos::ob::private_namespace::anchor_name(top)?;
+    for component in components.iter().rev() {
+        path.push('\\');
+        path.push_str(component);
+    }
+    Some(path)
 }
 
 pub fn handle_entries() -> Vec<(u32, NodeId)> {

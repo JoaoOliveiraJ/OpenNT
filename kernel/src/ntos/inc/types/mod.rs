@@ -76,6 +76,7 @@ pub mod extra_ke_misc;
 pub mod extra_keex;
 pub mod extra_ob_alpc;
 pub mod extra_ob_header;
+pub mod extra_ob_namespace;
 pub mod extra_obpsse;
 pub mod extra_pipes;
 pub mod extra_ps_user;

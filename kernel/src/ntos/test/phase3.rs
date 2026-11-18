@@ -749,6 +749,120 @@ fn namespace_handles(assert: Assert) {
     guest::free_bytes(scratch);
 }
 
+/// Fronteira de teste em `address`: o nome e os SIDs dados, cada entrada
+/// alinhada a 8 (o formato do RtlCreateBoundaryDescriptor); devolve o
+/// TotalSize.
+fn boundary_descriptor(address: u64, name: Option<&str>, sids: &[alloc::vec::Vec<u8>], items: Option<u32>) -> u32 {
+    let mut bytes = alloc::vec![0u8; 0x10];
+    let mut count = 0u32;
+    let mut push = |bytes: &mut alloc::vec::Vec<u8>, kind: u32, data: &[u8]| {
+        while bytes.len() % 8 != 0 {
+            bytes.push(0);
+        }
+        bytes.extend_from_slice(&kind.to_le_bytes());
+        bytes.extend_from_slice(&(8 + data.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(data);
+        count += 1;
+    };
+    if let Some(name) = name {
+        let text: alloc::vec::Vec<u8> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        push(&mut bytes, 1, &text);
+    }
+    for sid in sids {
+        push(&mut bytes, 2, sid);
+    }
+    let total = bytes.len() as u32;
+    bytes[0..4].copy_from_slice(&1u32.to_le_bytes());
+    bytes[4..8].copy_from_slice(&items.unwrap_or(count).to_le_bytes());
+    bytes[8..12].copy_from_slice(&total.to_le_bytes());
+    guest::write_bytes(address, &bytes);
+    total
+}
+
+/// NtCreate/Open/DeletePrivateNamespace em KernelMode (o access check da
+/// fronteira concede) e o caminho ancorado dos objetos dentro do diretório.
+fn private_namespaces(assert: Assert) {
+    use crate::ntos::ob::handles::namespace as nh;
+    use crate::ntos::ob::objects::namespace as namespace_objects;
+    use crate::ntos::ob::{close, object_manager as om, private_namespace as pn};
+    use crate::ntos::se::model::sid;
+    let scratch = guest::alloc_bytes(0x600);
+    let boundary = scratch;
+    let other = scratch + 0x100;
+    let attributes = scratch + 0x200;
+    let output = scratch + 0x400;
+    let system = sid(5, &[18]);
+    boundary_descriptor(boundary, Some("Phase3Pn"), &[system.clone()], None);
+    assert(pn::create(output, 0xF000F, 0, boundary, 0) == 0, "pn: NtCreatePrivateNamespace");
+    let namespace = guest::read64(output);
+    let opened = nh::resolve(namespace, false);
+    assert(opened.as_ref().is_ok_and(|opened| opened.directory && om::path_of(opened.node).is_none() && namespace_objects::directory_flags(opened.body) & namespace_objects::DIRECTORY_PRIVATE_NAMESPACE != 0 && namespace_objects::namespace_entry(opened.body) != 0), "pn: diretorio sem nome com Flags 1 e NamespaceEntry");
+    assert(pn::create(output + 8, 0xF000F, 0, boundary, 0) == 0xC000_0035, "pn: fronteira repetida e STATUS_OBJECT_NAME_COLLISION");
+    assert(pn::open(output + 8, 0xF000F, 0, boundary, 0) == 0, "pn: NtOpenPrivateNamespace");
+    let second = guest::read64(output + 8);
+    assert(nh::resolve(second, false).ok().map(|opened| opened.body) == opened.as_ref().ok().map(|opened| opened.body), "pn: a abertura chega ao mesmo diretorio");
+    boundary_descriptor(other, Some("Phase3Px"), &[system.clone()], None);
+    assert(pn::open(output + 8, 0xF000F, 0, other, 0) == 0xC000_003A, "pn: fronteira desconhecida e STATUS_OBJECT_PATH_NOT_FOUND");
+    // Validação da fronteira.
+    boundary_descriptor(other, Some("Phase3Pn"), &[system.clone(), system.clone()], None);
+    assert(pn::create(output + 8, 0xF000F, 0, other, 0) == 0xC000_000D, "pn: entrada repetida");
+    boundary_descriptor(other, Some("Phase3Pn"), &[system.clone()], Some(3));
+    assert(pn::create(output + 8, 0xF000F, 0, other, 0) == 0xC000_000D, "pn: Items diferente das entradas");
+    guest::write32(other + 8, 0xF);
+    assert(pn::create(output + 8, 0xF000F, 0, other, 0) == 0xC000_000D, "pn: TotalSize menor que o cabecalho");
+    // Um diretório criado pelo handle do namespace: o caminho ancorado
+    // resolve de volta ao nó, sem nome no NT.
+    object_attributes(attributes, namespace, "Inner", 0x40);
+    assert(nh::open(output + 0x10, 0xF000F, attributes, "Directory", false, true) == 0, "pn: diretorio dentro do namespace");
+    let inner = guest::read64(output + 0x10);
+    let inner_node = nh::resolve(inner, false).ok().map(|opened| opened.node);
+    let anchored = opened.as_ref().ok().and_then(|opened| om::anchored_path_of(opened.node));
+    assert(anchored.as_ref().is_some_and(|anchor| om::lookup(&alloc::format!("{anchor}\\inner")) == inner_node) && inner_node.and_then(om::path_of).is_none(), "pn: caminho ancorado do namespace");
+    // NtDeletePrivateNamespace: sai da tabela, os handles continuam.
+    assert(pn::delete(namespace, 0) == 0, "pn: NtDeletePrivateNamespace");
+    assert(pn::open(output + 8, 0xF000F, 0, boundary, 0) == 0xC000_003A && pn::delete(namespace, 0) == 0xC000_0008, "pn: namespace removido");
+    assert(nh::resolve(inner, false).is_ok() && anchored.as_ref().is_some_and(|anchor| om::lookup(&alloc::format!("{anchor}\\Inner")).is_some()), "pn: diretorio removido ainda usavel pelos handles");
+    for handle in [inner, second, namespace] {
+        let _ = close::close(handle, Some(0));
+    }
+    // O último handle tira o namespace da tabela (ObpCloseDirectoryObject).
+    assert(pn::create(output, 0xF000F, 0, boundary, 0) == 0, "pn: recriado depois da remocao");
+    let recreated = guest::read64(output);
+    assert(matches!(close::close(recreated, Some(0)), Ok(0)) && pn::open(output, 0xF000F, 0, boundary, 0) == 0xC000_003A, "pn: ultimo handle remove da tabela");
+    guest::free_bytes(scratch);
+}
+
+/// NtCreateDirectoryObjectEx com diretório sombra: a abertura procura na
+/// sombra o nome que falta; a criação não.
+fn shadow_directories(assert: Assert) {
+    use crate::ntos::ob::handles::namespace as nh;
+    use crate::ntos::ob::objects::namespace as namespace_objects;
+    use crate::ntos::ob::{close, object_manager as om};
+    let scratch = guest::alloc_bytes(0x300);
+    let attributes = scratch;
+    let output = scratch + 0x200;
+    assert(nh::create_directory_ex(output, 0xF000F, 0, 0, 2, true) == 0xC000_00F3 && nh::create_directory_ex(output, 0xF000F, 0, 0, 4, false) == 0xC000_00F3, "shadow: Flags invalidos sao STATUS_INVALID_PARAMETER_5");
+    object_attributes(attributes, 0, "\\Phase3Global", 0x40);
+    assert(nh::open(output, 0xF000F, attributes, "Directory", false, true) == 0, "shadow: diretorio global");
+    let global = guest::read64(output);
+    assert(om::create_symlink("\\Phase3Global\\Only", "\\Device").is_ok(), "shadow: nome so no global");
+    object_attributes(attributes, 0, "\\Phase3Local", 0x40);
+    assert(nh::create_directory_ex(output, 0xF000F, attributes, global, 1, false) == 0, "shadow: NtCreateDirectoryObjectEx com sombra");
+    let local = guest::read64(output);
+    let body = nh::resolve(local, false).map_or(0, |opened| opened.body);
+    let global_body = nh::resolve(global, false).map_or(0, |opened| opened.body);
+    assert(namespace_objects::directory_flags(body) == namespace_objects::DIRECTORY_SHADOW | namespace_objects::DIRECTORY_AUTO_INHERIT && namespace_objects::shadow_directory(body) == global_body, "shadow: Flags 4 | 8 e ShadowDirectory");
+    object_attributes(attributes, 0, "\\Phase3Local\\Only", 0x40);
+    assert(nh::open(output, 1, attributes, "SymbolicLink", false, false) == 0, "shadow: abertura acha o nome na sombra");
+    let link = guest::read64(output);
+    assert(om::lookup("\\Phase3Local\\Only").is_none() && om::lookup_open("\\Phase3Local\\Only", false).is_some(), "shadow: so a busca de abertura usa a sombra");
+    for handle in [link, local, global] {
+        let _ = close::close(handle, Some(0));
+    }
+    let _ = om::unlink("\\Phase3Global\\Only");
+    guest::free_bytes(scratch);
+}
+
 static LOOKASIDE_FREES: AtomicU64 = AtomicU64::new(0);
 
 extern "win64" fn lookaside_allocate(_pool_type: u64, size: u64, _tag: u64) -> u64 {
@@ -2313,6 +2427,8 @@ pub fn run(assert: Assert) {
     security_descriptors(assert);
     dispatcher_bodies_and_close(assert);
     namespace_handles(assert);
+    private_namespaces(assert);
+    shadow_directories(assert);
     executive_primitives(assert);
     executive_resources(assert);
     executive_callbacks(assert);

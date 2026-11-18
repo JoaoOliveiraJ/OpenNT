@@ -60,7 +60,7 @@ fn nt_open_io_completion(out: u64, access: u64, attributes: u64, _a4: u64, _rsp:
         return Ok(0xC000_0005);
     }
     let Some(parsed) = parse_user_object_attributes(attributes) else { return Ok(0xC000_000D) };
-    let Some(node) = object_manager::lookup(&parsed.path) else { return Ok(0xC000_0034) };
+    let Some(node) = object_manager::lookup_open(&parsed.path, true) else { return Ok(0xC000_0034) };
     let Some(snapshot) = object_manager::node(node).filter(|node| node.type_name == "IoCompletion") else { return Ok(0xC000_0024) };
     let Some(port) = snapshot.data.and_then(|data| completion_objects::port_of(data.native_pointer)) else { return Ok(0xC000_0024) };
     let flags = match user_object_attributes(attributes) {

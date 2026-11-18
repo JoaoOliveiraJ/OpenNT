@@ -62,8 +62,9 @@ pub fn parse_user_object_attributes(attributes: u64) -> Option<Parsed> {
         let root_path = match state::get_user_handle(root_directory) {
             Some(root) => root.object.object_path()?,
             None => {
+                // Um namespace privado (diretório sem nome) dá o caminho ancorado.
                 let opened = crate::ntos::ob::handles::namespace::resolve(root_directory, true).ok().filter(|opened| opened.directory)?;
-                crate::ntos::ob::object_manager::path_of(opened.node)?
+                crate::ntos::ob::object_manager::anchored_path_of(opened.node)?
             }
         };
         path = alloc::format!("{}{}{}", root_path, if root_path.ends_with('\\') { "" } else { "\\" }, name);

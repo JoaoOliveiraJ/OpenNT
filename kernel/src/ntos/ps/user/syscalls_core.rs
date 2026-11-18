@@ -1038,15 +1038,26 @@ fn nt_create_directory_object(out: u64, access: u64, attributes: u64, _a4: u64, 
 }
 
 /// NtCreateDirectoryObjectEx(DirectoryHandle*, DesiredAccess,
-/// ObjectAttributes, ShadowDirectoryHandle, Flags): sem diretório sombra
-/// nem flags, é o NtCreateDirectoryObject.
+/// ObjectAttributes, ShadowDirectoryHandle, Flags) (`ob/handles/namespace`).
 fn nt_create_directory_object_ex(out: u64, access: u64, attributes: u64, shadow: u64, rsp: u64) -> Result<u32, KernelError> {
-    let flags = state::stack_arg32(rsp, 5);
-    if shadow != 0 || flags != 0 {
-        crate::debug_print!("[usermode] NtCreateDirectoryObjectEx com sombra {:#x} e flags {:#x} sem suporte", shadow, flags);
-        return Ok(0xC000_00BB);
-    }
-    Ok(namespace_handles::open(out, access as u32, attributes, "Directory", true, true))
+    Ok(namespace_handles::create_directory_ex(out, access as u32, attributes, shadow, state::stack_arg32(rsp, 5), true))
+}
+
+/// NtCreatePrivateNamespace(NamespaceHandle*, DesiredAccess,
+/// ObjectAttributes, BoundaryDescriptor) (`ob/private_namespace`).
+fn nt_create_private_namespace(out: u64, access: u64, attributes: u64, boundary: u64, _rsp: u64) -> Result<u32, KernelError> {
+    Ok(crate::ntos::ob::private_namespace::create(out, access as u32, attributes, boundary, 1))
+}
+
+/// NtOpenPrivateNamespace(NamespaceHandle*, DesiredAccess,
+/// ObjectAttributes, BoundaryDescriptor) (`ob/private_namespace`).
+fn nt_open_private_namespace(out: u64, access: u64, attributes: u64, boundary: u64, _rsp: u64) -> Result<u32, KernelError> {
+    Ok(crate::ntos::ob::private_namespace::open(out, access as u32, attributes, boundary, 1))
+}
+
+/// NtDeletePrivateNamespace(NamespaceHandle) (`ob/private_namespace`).
+fn nt_delete_private_namespace(handle: u64, _a2: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
+    Ok(crate::ntos::ob::private_namespace::delete(handle, 1))
 }
 
 /// NtCreateSymbolicLinkObject(LinkHandle*, DesiredAccess, ObjectAttributes,
@@ -1106,7 +1117,7 @@ fn nt_apphelp_cache_control(service: u64, data: u64, _a3: u64, _a4: u64, _rsp: u
 }
 
 pub fn init() {
-    let handlers: [(&'static str, state::SyscallHandler); 33] = [
+    let handlers: [(&'static str, state::SyscallHandler); 36] = [
         ("NtQueryDirectoryObject", nt_query_directory_object),
         ("NtApphelpCacheControl", nt_apphelp_cache_control),
         ("NtQueryLicenseValue", nt_query_license_value),
@@ -1135,6 +1146,9 @@ pub fn init() {
         ("NtOpenDirectoryObject", nt_open_directory_object),
         ("NtCreateDirectoryObject", nt_create_directory_object),
         ("NtCreateDirectoryObjectEx", nt_create_directory_object_ex),
+        ("NtCreatePrivateNamespace", nt_create_private_namespace),
+        ("NtOpenPrivateNamespace", nt_open_private_namespace),
+        ("NtDeletePrivateNamespace", nt_delete_private_namespace),
         ("NtCreateSymbolicLinkObject", nt_create_symbolic_link_object),
         ("NtQuerySecurityObject", nt_query_security_object),
         ("NtSetSecurityObject", nt_set_security_object),

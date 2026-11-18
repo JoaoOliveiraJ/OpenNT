@@ -1,7 +1,7 @@
 //! Handles de diretórios e links do namespace.
 //!
-//! NtOpen/NtCreateDirectoryObject, NtOpen/NtCreateSymbolicLinkObject (e o
-//! ZwCreateSymbolicLinkObject de modo kernel), NtQuerySymbolicLinkObject,
+//! NtOpen/NtCreateDirectoryObject(Ex), NtOpen/NtCreateSymbolicLinkObject (e
+//! o ZwCreateSymbolicLinkObject de modo kernel), NtQuerySymbolicLinkObject,
 //! NtQueryDirectoryObject e NtMakeTemporaryObject.
 //! Os handles de usuário do processo corrente entram com a fase 7.
 
@@ -24,6 +24,7 @@ const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
 const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
 const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+const STATUS_INVALID_PARAMETER_5: u32 = 0xC000_00F3;
 
 /// Campo de uma estrutura do chamador (de modo usuário ou não): sonda e um
 /// acesso da largura do campo, o `__try` do NT. Sem exigir o alinhamento da
@@ -138,7 +139,7 @@ pub fn open(output_handle: u64, access: u32, attributes: u64, kind: &str, from_u
         return STATUS_ACCESS_VIOLATION;
     }
     let mut created: Option<NodeId> = None;
-    let status = open_inner(output_handle, access, attributes, kind, from_user_mode, create, None, &mut created);
+    let status = open_inner(output_handle, access, attributes, kind, from_user_mode, create, None, None, &mut created);
     if let Some(node) = created {
         object_manager::remove_named(node);
     }
@@ -152,7 +153,78 @@ pub fn create_link(output_handle: u64, access: u32, attributes: u64, target: &st
         return STATUS_ACCESS_VIOLATION;
     }
     let mut created: Option<NodeId> = None;
-    let status = open_inner(output_handle, access, attributes, "SymbolicLink", from_user_mode, true, Some(target), &mut created);
+    let status = open_inner(output_handle, access, attributes, "SymbolicLink", from_user_mode, true, Some(target), None, &mut created);
+    if let Some(node) = created {
+        object_manager::remove_named(node);
+    }
+    status
+}
+
+/// O diretório sombra e os OBJECT_DIRECTORY.Flags de um diretório que o
+/// NtCreateDirectoryObjectEx cria.
+#[derive(Clone, Copy)]
+struct DirectorySetup {
+    /// O corpo do ShadowDirectory, com a referência que o diretório novo
+    /// herda (0 sem sombra).
+    shadow: u64,
+    flags: u32,
+}
+
+/// NtCreateDirectoryObjectEx(DirectoryHandle*, DesiredAccess,
+/// ObjectAttributes, ShadowDirectoryHandle, Flags) — o
+/// ObpCreateDirectoryObject (ntoskrnl 19041 rva 0x6868e0):
+/// - Flags além dos bits 0 e 1, ou o bit 1 vindo de UserMode, é
+///   STATUS_INVALID_PARAMETER_5;
+/// - o ShadowDirectoryHandle passa pelo ObReferenceObjectByHandle com
+///   DIRECTORY_QUERY | DIRECTORY_TRAVERSE no tipo Directory;
+/// - o diretório novo guarda a sombra (Flags |= 4, e 0x10 quando quem cria é
+///   sandbox pelo RtlIsSandboxedToken), o bit 0 vira Flags 8 (herança
+///   automática dos descritores) e o bit 1 Flags 0x20 (o ObQueryNameString
+///   para nele). Um nome que já existe (OBJ_OPENIF) abre o diretório antigo e
+///   a referência da sombra volta.
+pub fn create_directory_ex(output_handle: u64, access: u32, attributes: u64, shadow_handle: u64, flags: u32, from_user_mode: bool) -> u32 {
+    if flags & !3 != 0 || (from_user_mode && flags & 2 != 0) {
+        return STATUS_INVALID_PARAMETER_5;
+    }
+    if from_user_mode && !user_probe::probe_user_write(output_handle, 8) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    let mut setup = DirectorySetup { shadow: 0, flags: 0 };
+    if shadow_handle != 0 {
+        let shadow = match resolve(shadow_handle, from_user_mode) {
+            Ok(shadow) => shadow,
+            Err(status) => return status,
+        };
+        if !shadow.directory {
+            return STATUS_OBJECT_TYPE_MISMATCH;
+        }
+        if from_user_mode && shadow.access & 3 != 3 {
+            return STATUS_ACCESS_DENIED;
+        }
+        if namespace_objects::reference(shadow.body).is_err() {
+            return STATUS_INVALID_HANDLE;
+        }
+        setup.shadow = shadow.body;
+        setup.flags |= namespace_objects::DIRECTORY_SHADOW;
+        if crate::ntos::rtl::security::is_sandboxed_token(0, from_user_mode as u8).unwrap_or(false) {
+            setup.flags |= namespace_objects::DIRECTORY_SANDBOXED_SHADOW;
+        }
+    }
+    if flags & 1 != 0 {
+        setup.flags |= namespace_objects::DIRECTORY_AUTO_INHERIT;
+    }
+    if flags & 2 != 0 {
+        setup.flags |= namespace_objects::DIRECTORY_NAME_ROOT;
+    }
+    let mut created: Option<NodeId> = None;
+    let mut setup_slot = Some(setup);
+    let status = open_inner(output_handle, access, attributes, "Directory", from_user_mode, true, None, Some(&mut setup_slot), &mut created);
+    // A sombra que nenhum diretório novo herdou volta.
+    if let Some(unused) = setup_slot {
+        if unused.shadow != 0 {
+            let _ = namespace_objects::dereference(unused.shadow);
+        }
+    }
     if let Some(node) = created {
         object_manager::remove_named(node);
     }
@@ -176,12 +248,17 @@ pub fn create_link_from_kernel(output_handle: u64, access: u32, attributes: u64,
 }
 
 #[allow(clippy::too_many_arguments)]
-fn open_inner(output_handle: u64, access: u32, attributes: u64, kind: &str, from_user_mode: bool, create: bool, link_target: Option<&str>, created: &mut Option<NodeId>) -> u32 {
+fn open_inner(output_handle: u64, access: u32, attributes: u64, kind: &str, from_user_mode: bool, create: bool, link_target: Option<&str>, setup: Option<&mut Option<DirectorySetup>>, created: &mut Option<NodeId>) -> u32 {
     let input = match capture(attributes, from_user_mode) {
         Ok(input) => input,
         Err(status) => return status,
     };
-    let (found, rest) = object_manager::resolve_from(&input.name, 0, input.case_insensitive, kind == "SymbolicLink", input.start);
+    // A abertura procura também nos diretórios sombra; a criação não.
+    let (found, rest) = if create {
+        object_manager::resolve_from(&input.name, 0, input.case_insensitive, kind == "SymbolicLink", input.start)
+    } else {
+        object_manager::resolve_open_from(&input.name, input.case_insensitive, kind == "SymbolicLink", input.start, from_user_mode)
+    };
     if rest.is_some_and(|rest| !rest.is_empty()) {
         return 0xC000_003A;
     }
@@ -221,6 +298,16 @@ fn open_inner(output_handle: u64, access: u32, attributes: u64, kind: &str, from
         Ok(None) => return STATUS_OBJECT_TYPE_MISMATCH,
         Err(error) => return if error.status != 0 { error.status } else { 0xC000_0001 },
     };
+    // O diretório novo do NtCreateDirectoryObjectEx herda a sombra e os
+    // Flags (uma falha depois disto o coleta e a sombra sai com ele).
+    if created.is_some() {
+        if let Some(DirectorySetup { shadow, flags }) = setup.and_then(Option::take) {
+            if shadow != 0 {
+                let _ = namespace_objects::set_shadow_directory(body, shadow);
+            }
+            let _ = namespace_objects::set_directory_flags(body, flags);
+        }
+    }
     if created.is_some() {
         // O descritor do objeto novo: o explícito, a herança do diretório
         // pai e o token de quem cria (SeAssignSecurity).

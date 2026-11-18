@@ -153,7 +153,7 @@ fn nt_open_event(out: u64, access: u64, attributes: u64, _a4: u64, _rsp: u64) ->
         return Ok(0xC000_0005);
     }
     let Some(parsed) = parse_user_object_attributes(attributes) else { return Ok(0xC000_000D) };
-    let Some(node) = object_manager::lookup(&parsed.path) else { return Ok(0xC000_0034) };
+    let Some(node) = object_manager::lookup_open(&parsed.path, true) else { return Ok(0xC000_0034) };
     if object_manager::node(node).is_none_or(|node| node.type_name != "Event") {
         return Ok(0xC000_0024);
     }
