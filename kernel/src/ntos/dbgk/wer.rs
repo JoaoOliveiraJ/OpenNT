@@ -20,12 +20,19 @@
 //! O DbgkpWerInitialized do Windows é ligado incondicionalmente na fase 1 do
 //! Dbgk, então o caminho "antes da inicialização" (STATUS_DEVICE_NOT_READY)
 //! não existe depois do boot.
+//!
+//! Diagnóstico do OpenNT (sem efeito no resultado): cada pedido sai antes na
+//! serial como uma linha `[dbgk]` com o componente, o código de bugcheck, os
+//! quatro parâmetros e o ponto de chamada (módulo+deslocamento), porque sem o
+//! relatório do WER é a única pista de qual condição o driver detectou.
 
+use alloc::string::String;
+use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::ntos::cm::registry;
 use crate::ntos::inc::field::{Field, NtStruct};
-use crate::ntos::ke::{critical_region, irql};
+use crate::ntos::ke::{bugcheck_trace, critical_region, irql};
 use crate::rtl::KernelError;
 
 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
@@ -64,8 +71,40 @@ fn create_report(component_name: u64) -> u32 {
     STATUS_NOT_SUPPORTED
 }
 
+/// O pedido de captura como o driver o fez: componente, código e
+/// parâmetros do bugcheck e o endereço de retorno da chamada.
+pub struct Request {
+    pub component_name: u64,
+    pub bug_check_code: u32,
+    pub parameters: [u64; 4],
+    pub return_address: u64,
+}
+
+/// A linha `[dbgk]` do pedido. O nome é lido como o RtlStringCchLengthW o
+/// mede (até 16 caracteres) e só se a página puder ser lida.
+fn trace_request(request: &Request) {
+    let mut line = String::from("[dbgk] dump ao vivo pedido: componente \"");
+    let name = request.component_name;
+    if name != 0 && bugcheck_trace::readable(name, COMPONENT_NAME_CHARACTERS * 2) {
+        for index in 0..COMPONENT_NAME_CHARACTERS {
+            // SAFETY: os 16 caracteres do nome estão em páginas legíveis.
+            let unit = unsafe { Field::<u16>::at(name + index * 2) }.get();
+            if unit == 0 {
+                break;
+            }
+            line.push(char::from_u32(unit as u32).filter(char::is_ascii).unwrap_or('?'));
+        }
+    }
+    let [first, second, third, fourth] = request.parameters;
+    let _ = write!(line, "\" codigo {:#x} ({first:#x}, {second:#x}, {third:#x}, {fourth:#x}), chamado de ", request.bug_check_code);
+    bugcheck_trace::describe(&mut line, request.return_address, 0x1000);
+    debug_print!("{}", line);
+}
+
 /// DbgkWerCaptureLiveKernelDump: o NTSTATUS da captura.
-pub fn capture_live_kernel_dump(component_name: u64) -> Result<u32, KernelError> {
+pub fn capture_live_kernel_dump(request: &Request) -> Result<u32, KernelError> {
+    trace_request(request);
+    let component_name = request.component_name;
     if irql::get_irql() != 0 {
         debug_print!("DBGK: DbgkWerCaptureLiveKernelDump: called at IRQL > PASSIVE_LEVEL");
         return Ok(STATUS_INVALID_LEVEL);

@@ -7,7 +7,8 @@ use crate::ntos::init::exports::{signed_status, Call, Group};
 use crate::rtl::KernelError;
 
 fn wer_capture_live_kernel_dump(call: &Call) -> Result<u64, KernelError> {
-    Ok(signed_status(wer::capture_live_kernel_dump(call.arg(1))?))
+    let request = wer::Request { component_name: call.arg(1), bug_check_code: call.arg(2) as u32, parameters: [call.arg(3), call.arg(4), call.arg(5), call.arg(6)], return_address: call.return_address };
+    Ok(signed_status(wer::capture_live_kernel_dump(&request)?))
 }
 
 pub static GROUP: Group = Group {
