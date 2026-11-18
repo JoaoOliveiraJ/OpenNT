@@ -85,6 +85,9 @@ pub struct RequestState {
     pub server: Sender,
     /// Conexão: o PORT_MESSAGE montado entregue ao serviço.
     pub connect_bytes: Vec<u8>,
+    /// O envio responde, pelo MessageId, a uma resposta que o servidor
+    /// mandou sem ALPC_MSGFLG_RELEASE_MESSAGE (`PortState::answerable`).
+    pub answer: bool,
 }
 
 /// Pedido entregue ao servidor: o job pertence ao servidor até concluir.

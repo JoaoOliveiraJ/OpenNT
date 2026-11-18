@@ -111,10 +111,17 @@ fn queue_reply(port: &Arc<Port>, request: &Arc<Request>, result: &JobResult) -> 
     // não são herdados.
     let identity = &request.identity;
     message_identity::clear_attributes(identity);
-    identity.with(|state| state.replied = true);
+    // Uma resposta sem RELEASE_MESSAGE é também um pedido: chega como
+    // LPC_REQUEST com LPC_CONTINUATION_REQUIRED e o cliente pode respondê-la
+    // pelo MessageId dela.
+    let continuation = identity.with(|state| {
+        state.replied = true;
+        core::mem::take(&mut state.continuation)
+    }) && result.status == 0;
+    let reply_type = if continuation { 0x2001 } else { 2 };
     // O CLIENT_ID da resposta é o de quem respondeu (o servidor), quando o
     // serviço o informa.
-    let buffer = if result.status != 0 { None } else { Some(reply(&result.data, 2, identity, result.sender)) };
+    let buffer = if result.status != 0 { None } else { Some(reply(&result.data, reply_type, identity, result.sender)) };
     if let (Some(reserve), Some(buffer)) = (&reserve, &buffer) {
         if buffer.len() as u64 <= resource_reserves::storage_length(reserve) {
             resource_reserves::write(reserve, buffer, 0)?;
@@ -130,7 +137,12 @@ fn queue_reply(port: &Arc<Port>, request: &Arc<Request>, result: &JobResult) -> 
         state.queued = true;
         state.direct = message.direct;
     });
-    port.with(|state| state.pending.push(message));
+    port.with(|state| {
+        if continuation {
+            state.answerable.insert(identity.identifier);
+        }
+        state.pending.push(message)
+    });
     crate::ntos::alpc::kernel_entry::notify_waiters();
     if let Some(event) = direct {
         dispatcher::set_event(event);
@@ -831,6 +843,13 @@ fn send(port: &Arc<Port>, flags: u32, input: u64, send_attributes: u64, mode: u8
     // buffer reaproveitado pelo CsrClientCallServer) não contam.
     let lpc_request = lpc_port && header[4] == 0;
     let reserve_id = if lpc_request { 0 } else { u32::from_le_bytes([header[24], header[25], header[26], header[27]]) };
+    // O MessageId de uma resposta que o servidor mandou sem RELEASE_MESSAGE
+    // responde a ela (o AlpcpLookupMessage acha a mensagem pendente no
+    // cliente): o envio segue ao servidor como um pedido novo, LPC_REPLY com
+    // RELEASE_MESSAGE, e o CLIENT_ID que o buffer reaproveitado traz não
+    // conta (o winsrvext do csrss reenvia assim a resposta do lsm.dll).
+    let answer = !lpc_port && !legacy && reserve_id != 0 && reserve_id & 0x8000_0000 == 0 && port.with(|state| state.answerable.remove(&reserve_id));
+    let reserve_id = if answer { 0 } else { reserve_id };
     // IDs positivos designam associações de mensagem: esta ponta de cliente
     // não tem pedido de servidor correspondente. Reservas têm o bit alto. O
     // reenvio de uma resposta recebida com o atributo de vista UNMAP_EXISTING
@@ -844,7 +863,7 @@ fn send(port: &Arc<Port>, flags: u32, input: u64, send_attributes: u64, mode: u8
         return Ok(Err(0xC000_0702));
     }
     let cid_present = header[8..24].iter().any(|&byte| byte != 0);
-    if !legacy_synchronous && !lpc_request && reserve_id == 0 && cid_present {
+    if !legacy_synchronous && !lpc_request && !answer && reserve_id == 0 && cid_present {
         return Ok(Err(0xC000_0702));
     }
     let reserve = if reserve_id != 0 { resource_reserves::find(port, reserve_id) } else { None };
@@ -876,7 +895,7 @@ fn send(port: &Arc<Port>, flags: u32, input: u64, send_attributes: u64, mode: u8
     }
     let Some(identity) = message_identity::activate(port, reserve.as_ref().map(|reserve| reserve.slot.clone()))? else { return Ok(Err(0xC000_009A)) };
     let synchronous = flags & 0x2_0000 != 0;
-    let request = Arc::new(Request { id: identity.identifier, identity: identity.clone(), state: SpinLock::new(RequestState { reserve: reserve.clone(), datagram, synchronous, legacy, legacy_synchronous, sender: current_sender(), ..RequestState::default() }) });
+    let request = Arc::new(Request { id: identity.identifier, identity: identity.clone(), state: SpinLock::new(RequestState { reserve: reserve.clone(), datagram, synchronous, legacy, legacy_synchronous, sender: current_sender(), answer, ..RequestState::default() }) });
     install_cancellation(port, &request);
     let mut stored = false;
     let mut deferred = false;

@@ -3804,6 +3804,15 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     (os assíncronos também), e a desconexão ou o fechamento da porta de
     comunicação pelo servidor termina com STATUS_PORT_DISCONNECTED os
     pedidos que o cliente espera e os envios seguintes dele;
+  - a resposta que o servidor manda sem RELEASE_MESSAGE numa porta que não
+    é LPC é também um pedido: o cliente a recebe como LPC_REQUEST com
+    LPC_CONTINUATION_REQUIRED e pode respondê-la uma vez pelo MessageId dela,
+    mesmo com o CLIENT_ID do servidor no buffer reaproveitado; a resposta
+    segue ao servidor como pedido novo (LPC_REPLY se vier com
+    RELEASE_MESSAGE). É o protocolo da `\SmSsWinStationApiPort`: o lsm.dll
+    responde sem RELEASE_MESSAGE ao pedido do winsrvext do csrss com o
+    próximo comando, e o csrss devolve o resultado respondendo a essa
+    resposta com outro pedido síncrono;
   - o RequiredServerSid do NtAlpcConnectPort é comparado com o usuário do
     token primário do dono da porta de conexão, e o descritor do
     NtAlpcConnectPortEx com o mesmo token (MAXIMUM_ALLOWED); a recusa é

@@ -24,6 +24,13 @@
 //!   com um PortContext, recebe o pedido com esse PortContext e responde na
 //!   chamada seguinte; o cliente conecta pelo ZwSecureConnectPort (o
 //!   MaxMessageLength 0x200 da porta) e manda o pedido síncrono;
+//! - a resposta que é também um pedido (o protocolo do lsm.dll com o
+//!   winsrvext do csrss): o servidor ALPC responde sem RELEASE_MESSAGE, o
+//!   cliente a recebe como LPC_REQUEST com LPC_CONTINUATION_REQUIRED e a
+//!   responde pelo MessageId dela, no buffer reaproveitado (Type 0 e o
+//!   CLIENT_ID do servidor), com um pedido síncrono; o servidor recebe esse
+//!   pedido e responde com RELEASE_MESSAGE, que chega como LPC_REPLY e não se
+//!   responde mais;
 //! - o tick que não aninha: um processo de kernel em execução que é dado como
 //!   pronto continua em execução (não entra na fila), e a espera dele deixa a
 //!   CPU sem girar o escalonador na pilha dele; ela vence pelo prazo com
@@ -471,6 +478,125 @@ fn lpc_kernel_pair(assert: Assert) {
     guest::free_bytes(block);
 }
 
+// ---- a resposta ALPC que é também um pedido --------------------------------
+
+/// A porta do par; o bloco usa os mesmos campos do par ALPC. Resultados: [0]
+/// criação, [1] conexão recebida, [2] aceitação, [3] o pedido recebido
+/// (Type << 32 | dados), [4] a resposta sem RELEASE, [5] a resposta do
+/// cliente recebida, [6] a resposta com RELEASE, [7] conexão do cliente,
+/// [8] o primeiro pedido, [9] a primeira resposta (Type << 32 | dados), [10]
+/// o pedido que responde, [11] a segunda resposta, [12] o reenvio do MessageId
+/// da resposta com RELEASE.
+const ALPC_ANSWER_NAME: &str = "\\OpenNtAlpcAnswer";
+
+/// O Type (com os bits altos) e os quatro bytes de dados de um PORT_MESSAGE.
+fn type_and_word(message: u64) -> u64 {
+    (guest::read16(message + 4) as u64) << 32 | guest::read32(message + 0x28) as u64
+}
+
+extern "win64" fn alpc_answer_server(block: u64) {
+    let (server_out, communication_out, length, attributes, receive, reply) = (block, block + 8, block + 0x10, block + 0x40, block + 0x100, block + 0x300);
+    let object_attributes = object_attributes_for(block + 0x700, ALPC_ANSWER_NAME, 0x200);
+    let created = call_export("ZwAlpcCreatePort", &[server_out, object_attributes, attributes]).unwrap_or(u64::MAX);
+    record(block, 0, created);
+    call_export("KeSetEvent", &[block + 0x28, 0, 0]);
+    if created != 0 {
+        return;
+    }
+    let server = guest::read64(server_out);
+    let next = || {
+        guest::write64(length, 0x200);
+        call_export("ZwAlpcSendWaitReceivePort", &[server, 0, 0, 0, receive, length, 0, 0]).unwrap_or(u64::MAX)
+    };
+    // SAFETY: PORT_MESSAGE recebido.
+    let message = unsafe { PortMessage::at(receive) };
+    record(block, 1, next());
+    let unnamed = kernel_handle_attributes();
+    record(block, 2, call_export("ZwAlpcAcceptConnectPort", &[communication_out, server, 0, unnamed, 0, 0xC0DE, receive, 0, 1]).unwrap_or(u64::MAX));
+    guest::free_bytes(unnamed);
+    let communication = guest::read64(communication_out);
+    let answer = |data: &[u8; 4], flags: u64| {
+        port_message_with(reply, data);
+        // SAFETY: PORT_MESSAGE montado acima.
+        unsafe { PortMessage::at(reply) }.message_id.set(message.message_id.get());
+        call_export("ZwAlpcSendWaitReceivePort", &[communication, flags, reply, 0, 0, 0, 0, 0]).unwrap_or(u64::MAX)
+    };
+    let request = next();
+    record(block, 3, if request == 0 { type_and_word(receive) } else { request });
+    record(block, 4, answer(b"PONG", 0));
+    let answered = next();
+    record(block, 5, if answered == 0 { type_and_word(receive) } else { answered });
+    record(block, 6, answer(b"DONE", 0x1_0000));
+}
+
+extern "win64" fn alpc_answer_client(block: u64) {
+    let (client_out, length, attributes, connect, exchange) = (block + 0x20, block + 0x18, block + 0x40, block + 0x400, block + 0x500);
+    let ready = call_export("KeWaitForSingleObject", &[block + 0x28, 0, 0, 0, 0]).unwrap_or(u64::MAX);
+    if ready != 0 || guest::read64(block + RESULTS) != 0 {
+        record(block, 7, ready | 0x1_0000_0000);
+        return;
+    }
+    let name = guest::read64(block + 0x800);
+    port_message_with(connect, b"HELO");
+    guest::write64(length, 0x100);
+    let connected = call_export("ZwAlpcConnectPort", &[client_out, name, 0, attributes, 0x2_0000, 0, connect, length, 0, 0, 0]).unwrap_or(u64::MAX);
+    record(block, 7, connected);
+    if connected != 0 {
+        return;
+    }
+    let client = guest::read64(client_out);
+    let send = || {
+        guest::write64(length, 0x200);
+        call_export("ZwAlpcSendWaitReceivePort", &[client, 0x2_0000, exchange, 0, exchange, length, 0, 0]).unwrap_or(u64::MAX)
+    };
+    port_message_with(exchange, b"PING");
+    record(block, 8, send());
+    record(block, 9, type_and_word(exchange));
+    // O buffer da resposta reaproveitado, como o gApiMsg do winsrvext: os
+    // comprimentos e o Type 0 de novo, o CLIENT_ID e o MessageId recebidos.
+    let reuse = |data: &[u8; 4]| {
+        guest::write64(exchange, 0x002C_0004);
+        guest::write_bytes(exchange + 0x28, data);
+    };
+    reuse(b"ACK1");
+    record(block, 10, send());
+    record(block, 11, type_and_word(exchange));
+    reuse(b"ACK2");
+    record(block, 12, send());
+    call_export("ZwClose", &[client]);
+}
+
+fn alpc_answer_pair(assert: Assert) {
+    let block = guest::alloc_bytes(0xA00);
+    guest::write_bytes(block, &alloc::vec![0; 0xA00]);
+    for index in 0..13 {
+        record(block, index, PENDING_RESULT);
+    }
+    dispatcher::initialize_event(block + 0x28, 0, false);
+    // SAFETY: ALPC_PORT_ATTRIBUTES do teste.
+    unsafe { crate::ntos::inc::types::AlpcPortAttributes::at(block + 0x40) }.max_message_length.set(0x200);
+    let name = unicode_string_for(ALPC_ANSWER_NAME);
+    guest::write64(block + 0x800, name);
+    let (server_handle, server) = start(alpc_answer_server, block);
+    let (client_handle, client) = start(alpc_answer_client, block);
+    let finished = server != 0 && client != 0 && pump(20_000, &|| kernel_threads::is_terminated(server) && kernel_threads::is_terminated(client));
+    let results: Vec<u64> = (0..13).map(|index| guest::read64(block + RESULTS + index * 8)).collect();
+    debug_print!("[kwait] resposta ALPC que e pedido: {:x?}", results);
+    let word = |bytes: &[u8; 4]| u32::from_le_bytes(*bytes) as u64;
+    let request = 0x2001 << 32;
+    assert(
+        finished && results[..3] == [0, 0, 0] && results[3] == request | word(b"PING") && results[4] == 0 && results[5] == request | word(b"ACK1") && results[6] == 0 && results[7] == 0 && results[8] == 0 && results[9] == request | word(b"PONG") && results[10] == 0 && results[11] == 2 << 32 | word(b"DONE") && results[12] == 0xC000_0702,
+        "kwait: resposta ALPC sem RELEASE_MESSAGE chega como LPC_REQUEST com LPC_CONTINUATION_REQUIRED e o cliente a responde pelo MessageId, no buffer reaproveitado; a resposta com RELEASE_MESSAGE e LPC_REPLY e nao se responde",
+    );
+    let _ = call_export("ZwClose", &[guest::read64(block + 8)]);
+    let _ = call_export("ZwClose", &[guest::read64(block)]);
+    for handle in [server_handle, client_handle] {
+        let _ = object_manager::close(handle as u32);
+    }
+    guest::free_bytes(name);
+    guest::free_bytes(block);
+}
+
 // ---- o tick que não aninha ------------------------------------------------
 
 /// [0] status da espera, [1] estado da thread depois de ser dada como
@@ -727,6 +853,7 @@ pub fn run(assert: Assert) {
     nested_tick(assert);
     alpc_kernel_pair(assert);
     lpc_kernel_pair(assert);
+    alpc_answer_pair(assert);
     shared_queue_waiters(assert, true);
     shared_queue_waiters(assert, false);
 }

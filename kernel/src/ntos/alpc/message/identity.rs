@@ -54,6 +54,9 @@ pub struct IdentityState {
     /// A vista que a resposta de um servidor de modo usuário trouxe, até o
     /// cliente receber a resposta.
     pub reply_view: Option<Arc<crate::ntos::alpc::message::view::Carried>>,
+    /// A resposta de um servidor de modo usuário veio sem
+    /// ALPC_MSGFLG_RELEASE_MESSAGE, até o cliente recebê-la.
+    pub continuation: bool,
     pub release_sender: Option<Box<dyn FnOnce() + Send>>,
     pub sender_thread: u64,
     pub replied: bool,

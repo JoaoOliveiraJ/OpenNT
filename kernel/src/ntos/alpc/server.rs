@@ -279,11 +279,13 @@ pub struct Origin {
 struct ReplyCell {
     result: SpinLock<Option<JobResult>>,
     view: SpinLock<Option<Arc<message_view::Carried>>>,
+    /// O servidor respondeu sem ALPC_MSGFLG_RELEASE_MESSAGE.
+    continuation: core::sync::atomic::AtomicBool,
 }
 
 impl Default for ReplyCell {
     fn default() -> Self {
-        Self { result: SpinLock::new(None), view: SpinLock::new(None) }
+        Self { result: SpinLock::new(None), view: SpinLock::new(None), continuation: core::sync::atomic::AtomicBool::new(false) }
     }
 }
 
@@ -458,6 +460,9 @@ impl Job for ReplyJob {
         if let Some(view) = self.slot.view.lock().take() {
             self.identity.with(|state| state.reply_view = Some(view));
         }
+        if self.slot.continuation.load(core::sync::atomic::Ordering::Acquire) {
+            self.identity.with(|state| state.continuation = true);
+        }
         Some(result)
     }
 }
@@ -480,9 +485,9 @@ impl Service for UserServer {
 
     /// LPC_REQUEST ou LPC_DATAGRAM na fila; a resposta conclui o job.
     fn exchange(&self, port: &Arc<Port>, data: &[u8], request: &Arc<Request>) -> Reply {
-        let (datagram, mut sender) = {
+        let (datagram, answer, mut sender) = {
             let state = request.state.lock();
-            (state.datagram, state.sender)
+            (state.datagram, state.answer, state.sender)
         };
         // A thread que enviou (para a impersonação do cliente).
         if sender.thread_pointer == 0 {
@@ -506,8 +511,9 @@ impl Service for UserServer {
         // AlpcpSendMessage: um envio com RELEASE_MESSAGE é LPC_DATAGRAM, os
         // outros LPC_REQUEST; o AlpcpDispatchNewMessage liga o 0x2000 em todo
         // envio sem RELEASE_MESSAGE (um pedido assíncrono ou de reserva também
-        // espera a resposta).
-        let message_type = if datagram { LPC_DATAGRAM } else { LPC_REQUEST | LPC_CONTINUATION_REQUIRED };
+        // espera a resposta). A resposta do cliente a uma mensagem do servidor
+        // (MessageId dela) com RELEASE_MESSAGE é LPC_REPLY.
+        let message_type = if datagram && answer { LPC_REPLY } else if datagram { LPC_DATAGRAM } else { LPC_REQUEST | LPC_CONTINUATION_REQUIRED };
         self.enqueue(Delivery { id, message_type, data: Vec::from(data), sender, port_context: context, data_view, sequence, attributes, link_port: Some(link_port), ..Delivery::default() });
         if datagram {
             return Reply::Now(JobResult::default());
@@ -792,8 +798,15 @@ fn capture_reply_view(port: &Arc<Port>, attributes: u64, mode: u8) -> Result<(Op
 }
 
 /// O envio do servidor: a resposta ao pedido do MessageId da mensagem, pela
-/// porta `port`, com a vista de dados do atributo de envio.
-fn send_reply(server: &UserServer, port: &Arc<Port>, input: u64, attributes: u64, mode: u8) -> u32 {
+/// porta `port`, com a vista de dados do atributo de envio. Sem
+/// ALPC_MSGFLG_RELEASE_MESSAGE (`release` falso) numa porta que não é LPC, a
+/// resposta é também um pedido, como no AlpcpSendMessage e no
+/// AlpcpDispatchReplyToWaitingThread: o cliente a recebe como LPC_REQUEST
+/// com LPC_CONTINUATION_REQUIRED (o bit 9 da mensagem desligado) e o
+/// AlpcpReceiveSynchronousReply a deixa pendente nele, que a responde pelo
+/// MessageId (o lsm.dll responde assim aos pedidos do winsrvext do csrss na
+/// `\SmSsWinStationApiPort`).
+fn send_reply(server: &UserServer, port: &Arc<Port>, input: u64, attributes: u64, mode: u8, release: bool) -> u32 {
     // A resposta de um servidor LPC pode trazer TotalLength maior (o buffer
     // da mensagem recebida, reaproveitado).
     let captured = match message_buffer::capture_message_with(input, server.listener.maximum().max(PortMessage::SIZE as u32), mode, server.legacy()) {
@@ -828,6 +841,7 @@ fn send_reply(server: &UserServer, port: &Arc<Port>, input: u64, attributes: u64
         let _ = crate::ntos::alpc::section_views::delete_referenced(&binding);
     }
     *slot.view.lock() = view;
+    slot.continuation.store(!release && !server.legacy(), core::sync::atomic::Ordering::Release);
     *slot.result.lock() = Some(JobResult { status: STATUS_SUCCESS, data: captured.data, sender: Some(current_sender()) });
     kernel_entry::notify_waiters();
     STATUS_SUCCESS
@@ -842,15 +856,16 @@ pub fn exchange(port: &Arc<Port>, flags: u32, input: u64, send_attributes: u64, 
         crate::debug_print!("[alpc] servidor de usuario: pedido sincrono do servidor sem suporte");
         return Ok(STATUS_NOT_SUPPORTED);
     }
-    reply_and_receive(server, port, input, send_attributes, receive, ReceiveOptions::default())
+    reply_and_receive(server, port, input, send_attributes, flags & 0x1_0000 != 0, receive, ReceiveOptions::default())
 }
 
-/// A resposta (se houver mensagem de envio) e depois a recepção (se houver
-/// buffer), com a espera pela próxima mensagem: o lado servidor do
+/// A resposta (se houver mensagem de envio; `release` é o
+/// ALPC_MSGFLG_RELEASE_MESSAGE dela) e depois a recepção (se houver buffer),
+/// com a espera pela próxima mensagem: o lado servidor do
 /// NtAlpcSendWaitReceivePort e do NtReplyWaitReceivePort(Ex).
-fn reply_and_receive(server: Arc<UserServer>, port: &Arc<Port>, input: u64, send_attributes: u64, receive: crate::ntos::ps::user::alpc::ReceiveArguments, options: ReceiveOptions) -> Result<u32, KernelError> {
+fn reply_and_receive(server: Arc<UserServer>, port: &Arc<Port>, input: u64, send_attributes: u64, release: bool, receive: crate::ntos::ps::user::alpc::ReceiveArguments, options: ReceiveOptions) -> Result<u32, KernelError> {
     if input != 0 {
-        let status = send_reply(&server, port, input, send_attributes, 1);
+        let status = send_reply(&server, port, input, send_attributes, 1, release);
         if status != 0 {
             return Ok(status);
         }
@@ -934,7 +949,7 @@ pub fn receive_legacy(port: &Arc<Port>, reply: u64, receive: u64, port_context: 
     }
     let options = ReceiveOptions { legacy: server.legacy(), port_context, connections_only };
     let arguments = crate::ntos::ps::user::alpc::ReceiveArguments { output: receive, length: 0, receive_attributes: 0, timeout };
-    reply_and_receive(server, port, reply, 0, arguments, options)
+    reply_and_receive(server, port, reply, 0, true, arguments, options)
 }
 
 /// O LPC_CLIENT_DIED de uma thread que terminou, pela porta de término dela
@@ -977,7 +992,7 @@ pub fn post_datagram(port: &Arc<Port>, message_type: u16, data: &[u8], sender: S
 /// O NtReplyPort no lado servidor: a resposta ao pedido do MessageId.
 pub fn reply_legacy(port: &Arc<Port>, reply: u64) -> u32 {
     match server_of(port) {
-        Some(server) => send_reply(&server, port, reply, 0, 1),
+        Some(server) => send_reply(&server, port, reply, 0, 1, true),
         None => STATUS_INVALID_PORT_HANDLE,
     }
 }
@@ -1631,7 +1646,7 @@ pub fn begin_kernel_legacy_receive(port: &Arc<Port>, reply: u64, receive: u64, p
     use crate::ntos::alpc::kernel_wait;
     let Some(server) = server_of(port) else { return Ok(Box::new(Completed(STATUS_INVALID_PORT_HANDLE))) };
     if reply != 0 {
-        let status = send_reply(&server, port, reply, 0, 0);
+        let status = send_reply(&server, port, reply, 0, 0, true);
         if status != 0 {
             return Ok(Box::new(Completed(status)));
         }
@@ -1675,7 +1690,7 @@ pub fn begin_kernel_exchange(port: &Arc<Port>, flags: u32, input: u64, receive: 
         return Ok(Box::new(Completed(STATUS_NOT_SUPPORTED)));
     }
     if input != 0 {
-        let status = send_reply(&server, port, input, 0, 0);
+        let status = send_reply(&server, port, input, 0, 0, flags & 0x1_0000 != 0);
         if status != 0 {
             return Ok(Box::new(Completed(status)));
         }
