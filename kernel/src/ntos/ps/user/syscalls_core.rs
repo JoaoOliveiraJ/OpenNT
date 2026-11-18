@@ -380,6 +380,7 @@ fn query_system_information(class: u32, buffer: u64, length: u64, returned: u64)
         90 => return boot_environment_information::query(buffer, length, returned, true),
         103 => return code_integrity_information::query(buffer, length, returned, true),
         143 => return secure_boot_information::query(buffer, length, returned, true),
+        145 => return secure_boot_information::query_state(buffer, length, returned, true),
         157 => return crate::ntos::ex::manufacturing_information::query(buffer, length, returned, true),
         3 => return crate::ntos::ex::time_of_day_information::query(buffer, length, returned, true),
         44 | 102 => return Ok(crate::ntos::ex::time_zone::query(class, buffer, length, returned, true)),

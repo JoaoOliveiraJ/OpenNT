@@ -45,3 +45,39 @@ pub fn query(output: u64, buffer_length: u64, output_length: u64, from_user_mode
     }
     Ok(status)
 }
+
+/// O tamanho do SYSTEM_SECUREBOOT_INFORMATION (SecureBootEnabled e
+/// SecureBootCapable).
+const STATE_BYTE_LENGTH: u32 = 2;
+
+/// SystemSecureBootInformation (145; o SeSecureBootQueryInformation do
+/// ntoskrnl 19041, rva 0x69f214): com a mesma sondagem da classe 143, o
+/// ReturnLength é 2 também na recusa; menos de 2 bytes dá
+/// STATUS_INFO_LENGTH_MISMATCH; senão SecureBootEnabled e SecureBootCapable
+/// são os bits 0 e 3 das flags do cabeçalho do blob de Secure Boot que o
+/// loader entrega (g_SecureBootPolicyBlobHeader+4). O boot do OpenNT é
+/// BIOS, sem esse blob: os dois FALSE. O wldp.dll (CheckSecureBootCapability)
+/// lê a classe.
+pub fn query_state(output: u64, buffer_length: u64, output_length: u64, from_user_mode: bool) -> Result<u32, KernelError> {
+    let capacity = buffer_length as u32;
+    if from_user_mode {
+        if capacity != 0 && output & 3 != 0 {
+            return Ok(STATUS_DATATYPE_MISALIGNMENT);
+        }
+        if !user_probe::probe_user_write(output, capacity as u64) || (output_length != 0 && !user_probe::probe_user_write(output_length, 4)) {
+            return Ok(STATUS_ACCESS_VIOLATION);
+        }
+    }
+    let flags = 0u32;
+    let mut status = if capacity < STATE_BYTE_LENGTH {
+        STATUS_INFO_LENGTH_MISMATCH
+    } else if guest::try_write_bytes(output, &[(flags & 1) as u8, ((flags >> 3) & 1) as u8]).is_err() {
+        STATUS_ACCESS_VIOLATION
+    } else {
+        0
+    };
+    if output_length != 0 && guest::try_write::<u32>(output_length, STATE_BYTE_LENGTH).is_err() {
+        status = STATUS_ACCESS_VIOLATION;
+    }
+    Ok(status)
+}

@@ -2265,6 +2265,12 @@ fn user_syscalls_core(assert: Assert) {
     let line = crate::ntos::ke::processor_identity::largest_cache_line();
     let alignment = call("NtQuerySystemInformation", 58, buffer, 4, info) == 0 && guest::read32(buffer) == line && guest::read32(info) == 4 && call("NtQuerySystemInformation", 58, buffer, 2, info) == 0xC000_0004 && guest::read32(info) == 4 && call("NtQuerySystemInformation", 58, buffer + 2, 4, info) == 0x8000_0002;
     assert(alignment, "usercore: SystemRecommendedSharedDataAlignment devolve a maior linha de cache");
+    // SystemSecureBootInformation num boot BIOS: os dois BOOLEAN FALSE e o
+    // ReturnLength 2 também na recusa.
+    guest::write_bytes(buffer, &[0xFF, 0xFF]);
+    guest::write32(info, 0);
+    let secure_boot = call("NtQuerySystemInformation", 145, buffer, 2, info) == 0 && guest::read16(buffer) == 0 && guest::read32(info) == 2 && call("NtQuerySystemInformation", 145, buffer, 1, info) == 0xC000_0004 && guest::read32(info) == 2;
+    assert(secure_boot, "usercore: SystemSecureBootInformation sem Secure Boot");
     guest::write32(rsp + 0x28, 80);
     guest::write64(rsp + 0x30, info);
     guest::write32(string, 4);
