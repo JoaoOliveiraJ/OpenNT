@@ -3659,10 +3659,24 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   LPC, Type 0 é sempre um pedido novo, como no AlpcpSendMessage, então o
   MessageId e o CLIENT_ID que um buffer reaproveitado traz (o
   CsrClientCallServer manda a mensagem no buffer da resposta anterior) não
-  contam. NtImpersonateClientOfPort e NtAlpcImpersonateClientOfPort
-  impersonam a thread que mandou a mensagem pendente (SeCreateClientSecurity
-  com o QOS da porta do cliente e SeImpersonateClientEx); o
-  NtQueryInformationPort só confere o handle e zera o ReturnLength.
+  contam. Do lado servidor, NtRequestPort e NtRequestWaitReplyPort são a
+  mensagem nova do servidor (abaixo), e o NtReplyPort na porta de um
+  cliente responde a uma mensagem que o servidor mandou a ele.
+  NtImpersonateClientOfPort e NtAlpcImpersonateClientOfPort seguem o
+  AlpcpImpersonateMessage: Flags acima de 15 ou MessageId zero dão
+  STATUS_INVALID_PARAMETER, e os bits 2-3 pedem um nível que não pode passar
+  do nível do contexto; a mensagem precisa já ter sido recebida e não trazer
+  LPC_NO_IMPERSONATE (0x4000); com o contexto de segurança que o cliente
+  mandou, o token dele; senão a porta do cliente precisa de
+  ALLOW_IMPERSONATION, e o rastreamento estático usa o contexto capturado na
+  conexão (o NtConnectPort e o NtAlpcConnectPort de modo usuário capturam
+  agora, como o AlpcpCreateClientPort), o dinâmico a thread que mandou e
+  espera a resposta (SeCreateClientSecurity com o QOS da porta do cliente e
+  SeImpersonateClientEx; uma mensagem assíncrona dá STATUS_ACCESS_DENIED);
+  sem mensagem, o contexto estático da conexão. O NtAlpcConnectPort sem
+  ALPC_PORT_ATTRIBUTES usa os atributos padrão do 19041 (ALLOW_IMPERSONATION
+  e o QOS anônimo, dinâmico e só efetivo). O NtQueryInformationPort só
+  confere o handle e zera o ReturnLength.
   NtReplyWaitReplyPort e as mensagens com PORT_DATA_INFORMATION
   (NtReadRequestData/NtWriteRequestData) não existem no transporte:
   STATUS_NOT_SUPPORTED, com registro. Em volta: NtRegisterThreadTerminatePort
@@ -3829,7 +3843,48 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     Everyone e RESTRICTED com PORT_CONNECT); a conexão de modo usuário passa
     pelo SeAccessCheck de PORT_CONNECT contra o descritor atual da porta
     (STATUS_ACCESS_DENIED, com uma linha `[alpc] PORT_CONNECT ... recusado`
-    no log).
+    no log);
+  - as mensagens novas do lado servidor (`server::classify`, como o
+    AlpcpSendMessage: numa porta LPC, ou no contrato LPC de kernel do
+    LpcRequestPort e do LpcSendWaitReceivePort, o Type zero é uma mensagem
+    nova e LPC_REQUEST com MessageId a resposta; nas outras portas o
+    MessageId zero) seguem o AlpcpDispatchNewMessage. Na porta de conexão a
+    mensagem vai à própria fila, com o PortContext e a sequência dela: é o
+    que o dwm.exe faz com a DwmApiPort (o datagrama do SendSimpleAsyncRequest
+    e o pedido síncrono do SendComplexSyncRequest, respondido pelo NtReplyPort
+    da thread da porta) e o que o win32k faz pelo LpcRequestPort e pelo
+    LpcSendWaitReceivePort. Numa porta de comunicação ela vai à porta do
+    cliente (o callback do RPC), que precisa de ALLOW_LPC_REQUESTS
+    (STATUS_LPC_REQUESTS_NOT_ALLOWED; o NtAlpcSetInformation classe 1 muda
+    só esse bit, como o EnableCallbacksIfNecessary do rpcrt4 pede); o cliente
+    a recebe entre as mensagens da porta dele, a IOCP dele avisada, e
+    responde pelo MessageId. O datagrama (RELEASE_MESSAGE) não espera
+    resposta; o envio síncrono espera o LPC_REPLY no buffer de recepção (o
+    ALPC_CONTEXT_ATTR com o PortContext de quem enviou); sem as duas flags a
+    resposta volta como LPC_REPLY na fila da porta de conexão. O Type
+    conserva os bits altos do remetente (Type & 0xEF00 de modo kernel, &
+    0x6F00 de modo usuário): o dwm.exe separa os comandos do win32k pelo
+    LPC_KERNELMODE_MESSAGE (0x8000), e um pedido de modo usuário não o traz.
+    A porta de conexão sempre tem ALLOW_LPC_REQUESTS, e a de comunicação do
+    servidor nunca;
+  - a porta esperável (NtCreateWaitablePort, ou WAITABLE_PORT nos atributos
+    do NtAlpcCreatePort e do NtAlpcConnectPort(Ex) e do ZwAlpcConnectPort)
+    tem o KSEMAPHORE do AlpcpInitializePort (contagem zero, limite
+    0x7FFFFFFF, no corpo da porta): cada mensagem posta na fila dela sem IOCP
+    associada (na porta de conexão, os pedidos, conexões e avisos; na do
+    cliente, as respostas assíncronas, os cancelamentos e as mensagens do
+    servidor) o libera uma vez, e a espera pelo handle da porta (o
+    DefaultObject indireto 0xF9 do tipo ALPC Port: `ob/wait.rs` e o
+    NtAssociateWaitCompletionPacket de `ps/user/wait_packets.rs`) fica nele.
+    A thread da DwmApiPort espera assim antes de cada NtReplyWaitReceivePort,
+    e o registrador do CoreMessaging e os clientes dele (portas 0x70000)
+    esperam por pacotes de espera; nas outras portas o objeto de espera é o
+    AlpcpDummyEvent, sinalizado, e a espera conclui de imediato;
+  - a lista de conclusão (NtAlpcSetInformation classe 6) não existe: a
+    classe recusa com STATUS_NOT_SUPPORTED numa porta de conexão (o rpcrt4
+    solta o buffer e continua com a IOCP), e as classes 7, 8 e 10 respondem
+    como sem lista registrada (sucesso, STATUS_INVALID_PARAMETER e
+    STATUS_INVALID_PARAMETER); a classe 5 só confere o tamanho.
 - **Os tokens de logon** (`se/token/create.rs`, `se/token/set_information.rs`):
   o NtCreateToken e o NtCreateTokenEx do LSA (SeCreateTokenPrivilege
   habilitado, TokenType, o nível pelo QoS num token de impersonação, a sessão
