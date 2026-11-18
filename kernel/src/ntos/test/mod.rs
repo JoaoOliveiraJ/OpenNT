@@ -33,6 +33,7 @@ pub mod extended_state;
 pub mod irql_cr8;
 pub mod import_cycle;
 pub mod session_driver_support;
+pub mod power_setting_notify;
 pub mod fsrtl_fs_support;
 pub mod boot_drivers;
 pub mod fs_driver_imports;
