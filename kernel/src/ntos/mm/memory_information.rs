@@ -163,6 +163,31 @@ pub fn memory_topology_information(output: u64, length: u32, reported: &mut u32)
     Ok(0)
 }
 
+/// Linha de diagnóstico da memória do sistema na serial (`[mm] memoria`):
+/// frames livres do banco, commit do sistema (cobrado, limite, limite
+/// máximo e pico), páginas privadas fora do working set e o heap do
+/// kernel. Sai a cada processo criado e terminado, para a pressão de
+/// memória aparecer no log da cadeia de boot sem depurador.
+pub fn print_status(event: &str, process_id: u64) {
+    let partition = pfn::partition();
+    let commitment = commit::snapshot();
+    let (heap_total, heap_used) = crate::hal::kmalloc::info();
+    crate::debug_print!(
+        "[mm] memoria ({} {}): PFN livres {}/{} paginas, commit {}/{} paginas (maximo {}, pico {}), nao residentes {}, heap {}/{} KB",
+        event,
+        process_id,
+        partition.available,
+        partition.total,
+        commitment.committed,
+        commitment.limit,
+        commitment.limit_maximum,
+        commitment.peak,
+        working_set::nonresident_pages(),
+        heap_used / 1024,
+        heap_total / 1024
+    );
+}
+
 /// O tamanho mínimo do buffer da SystemPageFileInformation(Ex).
 pub fn page_file_entry_size(extended: bool) -> u32 {
     if extended {

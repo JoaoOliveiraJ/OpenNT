@@ -857,6 +857,7 @@ fn capture_and_create(request: &UserCreateRequest) -> Result<u32, u32> {
         summary.manifest.map(|manifest| alloc::format!(" manifesto {:#x}+{:#x}", manifest.address, manifest.size)).unwrap_or_default(),
         if request.thread_flags & create::THREAD_CREATE_SUSPENDED != 0 { " (suspensa)" } else { "" }
     );
+    crate::ntos::mm::memory_information::print_status("criado", summary.process_id);
     crate::ntos::init::initial_process::record_creation(process::get_current_process(), process);
     // As VAs foram sondadas; uma falha tardia devolve o status com o
     // processo e os handles já criados, como no NT.

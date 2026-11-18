@@ -400,10 +400,13 @@ pub fn finish_exit(process_pointer: u64) {
             process::set_current_thread(own);
         }
     }
+    // SAFETY: o EPROCESS retido até o fim do término.
+    let process_id = unsafe { Eprocess::at(process_pointer) }.unique_process_id.get();
     let _ = process::terminate_process(process_pointer, status);
     process::set_current_thread(previous);
     threads::release_process(process_pointer);
     threads::end_exit(process_pointer);
+    crate::ntos::mm::memory_information::print_status("terminado", process_id);
 }
 
 /// O status de saída de um processo que falhou depois de criado.
