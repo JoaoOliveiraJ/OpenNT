@@ -159,6 +159,31 @@ fn query_connected_sid(port: Option<&Arc<Port>>, input: u64, returned: u64, mode
     result
 }
 
+/// Classe 12 (AlpcServerSessionInformation, o AlpcpPortQueryServerSessionInfo
+/// do 19041, 0x66154c): a sessão (MmGetSessionIdEx) e o PID do dono da porta
+/// ligada (o AlpcpReferenceConnectedPort: a porta de conexão é ela mesma, a
+/// de comunicação é a outra ponta); sem dono, STATUS_INVALID_PARAMETER. O
+/// ReturnLength recebe 8 mesmo com Length curto. O MSCTF do LogonUI
+/// (CAlpcPort::Open) compara a sessão com a do próprio processo e fecha a
+/// porta se a consulta falhar.
+fn query_server_session(port: Option<&Arc<Port>>, output: u64, length: u32, returned: u64, mode: u8) -> Result<u32, KernelError> {
+    let Some(port) = port else { return Ok(INVALID_PARAMETER) };
+    let Some(connected) = port_objects::reference_connected_process(port)? else { return Ok(INVALID_PARAMETER) };
+    let session = crate::ntos::mm::session::session_id_ex(connected.process);
+    // SAFETY: o processo está referenciado por `connected`.
+    let process_id = unsafe { crate::ntos::inc::types::Eprocess::at(connected.process) }.unique_process_id.get() as u32;
+    connected.release()?;
+    let mut status = 0xC000_0004;
+    if length >= 8 {
+        status = match write_field::<u32>(output, 0, session).and_then(|_| write_field::<u32>(output, 4, process_id)) {
+            Ok(()) => 0,
+            Err(status) => return Ok(status),
+        };
+    }
+    let written = write_length(returned, 8, mode);
+    Ok(if written != 0 { written } else { status })
+}
+
 pub fn query(handle: u64, class: u32, output: u64, length: u32, returned: u64, mode: u8) -> Result<u32, KernelError> {
     critical_region::enter_critical()?;
     let mut reference: Option<PortReference> = None;
@@ -189,8 +214,9 @@ pub fn query(handle: u64, class: u32, output: u64, length: u32, returned: u64, m
         match class {
             0 => Ok(query_basic(port.as_ref(), output, length, returned, mode)),
             3 => query_connected_sid(port.as_ref(), output, returned, mode),
-            // Servidor, espera de referências e sessão exigem operações próprias.
-            4 | 11 | 12 => Ok(0xC000_00BB),
+            12 => query_server_session(port.as_ref(), output, length, returned, mode),
+            // Servidor e espera de referências exigem operações próprias.
+            4 | 11 => Ok(0xC000_00BB),
             _ => Ok(INVALID_PARAMETER),
         }
     })();

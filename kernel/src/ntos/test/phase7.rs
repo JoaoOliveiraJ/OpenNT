@@ -4348,6 +4348,15 @@ fn user_alpc_connect_capture(assert: Assert) {
     guest::write8(sid + user.len() as u64 - 1, user[user.len() - 1] ^ 0xFF);
     let other = query_information::query(handle, 3, sid, 0, returned, 1).ok();
     assert(own == Some(0) && other == Some(0xC000_02A0) && query_information::query(handle, 4, output, 16, 0, 1).ok() == Some(0xC000_00BB) && query_information::query(handle, 9, output, 16, 0, 1).ok() == Some(0xC000_000D) && query_information::query(handle, 0, 0, 16, 0, 1).ok() == Some(0xC000_000D) && query_information::query(handle, 0, output + 1, 16, 0, 1).ok() == Some(0x8000_0002), "useralpcconn: SID do processo conectado e classes recusadas");
+    // AlpcServerSessionInformation (12): a sessão e o PID do dono da porta
+    // ligada; Length curto dá STATUS_INFO_LENGTH_MISMATCH com ReturnLength 8;
+    // sem porta, STATUS_INVALID_PARAMETER.
+    let current = crate::ntos::ps::process::get_current_process();
+    let session_info = query_information::query(handle, 12, output, 8, returned, 1).ok() == Some(0) && guest::read32(output) == crate::ntos::mm::session::session_id_ex(current) && guest::read32(output + 4) == crate::ntos::ps::process::get_current_process_id() as u32 && guest::read32(returned) == 8;
+    guest::write32(returned, 0);
+    let session_short = query_information::query(handle, 12, output, 4, returned, 1).ok() == Some(0xC000_0004) && guest::read32(returned) == 8;
+    let session_none = query_information::query(0, 12, output, 8, 0, 1).ok() == Some(0xC000_000D);
+    assert(session_info && session_short && session_none, "useralpcconn: AlpcServerSessionInformation com a sessao e o PID do dono");
     let query_handler = state::handler("NtAlpcQueryInformation").is_some();
     // Segurança por mensagem: CREATE publicado, seleção explícita e RELEASE.
     let security = block + 0x700;
