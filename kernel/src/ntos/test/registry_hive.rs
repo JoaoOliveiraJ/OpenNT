@@ -116,7 +116,11 @@ fn wide(text: &str) -> Vec<u8> {
 fn same_tree(left: NodeId, right: NodeId, check_root_name: bool) -> bool {
     let mut pending = alloc::vec![(left, right, check_root_name)];
     while let Some((left, right, check_name)) = pending.pop() {
-        let snapshot = |node| registry::with_node(node, |key| (key.name.to_lowercase(), key.values.iter().map(|(name, value)| (name.clone(), (value.value_type, value.data.clone()))).collect::<BTreeMap<_, _>>(), key.security.clone(), key.last_write_time, key.children.iter().map(|(name, child)| (name.clone(), *child)).collect::<BTreeMap<_, _>>()));
+        let snapshot = |node| {
+            let (name, values, security, time, children) = registry::with_node(node, |key| (key.name.to_lowercase(), key.values.iter().map(|value| (value.name.to_lowercase(), (value.value_type, value.data.clone()))).collect::<BTreeMap<_, _>>(), Captured::clone(&key.security), key.last_write_time, key.children.iter().map(|&(_, child)| child).collect::<Vec<_>>()))?;
+            let children = children.into_iter().filter_map(|child| registry::with_node(child, |key| (key.name.to_lowercase(), child))).collect::<BTreeMap<_, _>>();
+            Some((name, values, security, time, children))
+        };
         let (Some(a), Some(b)) = (snapshot(left), snapshot(right)) else { return false };
         if (check_name && a.0 != b.0) || a.1 != b.1 || a.2 != b.2 || a.3 != b.3 || a.4.len() != b.4.len() {
             return false;
@@ -173,7 +177,7 @@ fn system_hive_from_file(assert: Assert) {
     assert(complete, "hive: cada valor das tabelas de semente esta na hive SYSTEM do arquivo");
     let expected = policy::boot_child(&policy::boot_root()).ok();
     let disk = registry::node_by_path("\\Registry\\Machine\\System\\CurrentControlSet\\Services\\disk");
-    let descriptors = [root, disk].iter().all(|node| node.and_then(|node| registry::with_node(node, |key| key.security.clone())) == expected);
+    let descriptors = [root, disk].iter().all(|node| node.and_then(|node| registry::with_node(node, |key| Captured::clone(&key.security))) == expected);
     assert(descriptors, "hive: descritores da hive SYSTEM iguais aos da politica do kernel");
     let layout = registry::with_storage(identifier, |storage| {
         let root_cell = storage.root_cell();
@@ -288,7 +292,7 @@ fn save_load_round_trip(assert: Assert) {
     let mut descriptors: Vec<(Captured, u32)> = Vec::new();
     let mut stack = copy_node.map_or(Vec::new(), |node| alloc::vec![node]);
     while let Some(node) = stack.pop() {
-        if let Some((security, children)) = registry::with_node(node, |key| (key.security.clone(), key.children.iter().map(|&(_, child)| child).collect::<Vec<_>>())) {
+        if let Some((security, children)) = registry::with_node(node, |key| (Captured::clone(&key.security), key.children.iter().map(|&(_, child)| child).collect::<Vec<_>>())) {
             match descriptors.iter_mut().find(|(known, _)| *known == security) {
                 Some(entry) => entry.1 += 1,
                 None => descriptors.push((security, 1)),
@@ -296,7 +300,7 @@ fn save_load_round_trip(assert: Assert) {
             stack.extend(children);
         }
     }
-    let expected = |name: &str| registry::node_by_path(name).and_then(|node| registry::with_node(node, |key| key.security.clone())).and_then(|security| descriptors.iter().find(|(known, _)| *known == security).map(|&(_, count)| count));
+    let expected = |name: &str| registry::node_by_path(name).and_then(|node| registry::with_node(node, |key| Captured::clone(&key.security))).and_then(|security| descriptors.iter().find(|(known, _)| *known == security).map(|&(_, count)| count));
     assert(layout.is_some_and(|layout| layout.6.is_some() && layout.6 == expected(COPY) && layout.7 == expected(&alloc::format!("{COPY}\\Filho"))), "hive: celulas sk compartilhadas com a contagem de referencias das chaves");
     // REG_STANDARD_FORMAT: versão 1.3, 'lf' e o dado grande numa célula só.
     let standard = create_file("\\??\\D:\\opennt-hive-std.dat");

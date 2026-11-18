@@ -110,7 +110,7 @@ pub fn registry(line: &str, out: &mut Payload) {
                     let _ = writeln!(out, "mais: {}", index);
                     return;
                 }
-                let Some(value) = registry::with_node(node, |key| key.values.get(index).map(|(_, value)| value.clone())).flatten() else { continue };
+                let Some(value) = registry::with_node(node, |key| key.values.get(index).cloned()).flatten() else { continue };
                 out.push_str("v\t");
                 push_clean(out, &value.name);
                 let _ = write!(out, "\t{}\t{}\t", value.value_type, value.data.len());

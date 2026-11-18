@@ -57,15 +57,18 @@ pub struct Value {
     pub data: Vec<u8>,
 }
 
-/// Nó da hive: subchaves e valores em ordem de inserção (chave = nome em
-/// minúsculas) e LastWriteTime em 100 ns desde 1601.
+/// Nó da hive: subchaves e valores em ordem de inserção e LastWriteTime em
+/// 100 ns desde 1601. Cada subchave vem com o hash do nome sem diferença de
+/// caixa ([`name_hash`]): a busca compara o hash e confirma pelo nome do filho,
+/// sem guardar outra cópia do nome. O descritor é compartilhado entre as
+/// chaves com o mesmo descritor, como a célula 'sk' de uma hive.
 #[derive(Clone, Debug)]
 pub struct KeyNode {
     pub name: String,
     pub parent: Option<NodeId>,
-    pub children: Vec<(String, NodeId)>,
-    pub values: Vec<(String, Value)>,
-    pub security: Captured,
+    pub children: Vec<(u32, NodeId)>,
+    pub values: Vec<Value>,
+    pub security: Arc<Captured>,
     pub last_write_time: u64,
     pub deleted: bool,
     /// (hive, célula 'nk') de um nó guardado numa hive de arquivo.
@@ -79,12 +82,49 @@ pub struct KeyNode {
 }
 
 impl KeyNode {
-    pub fn child(&self, lower: &str) -> Option<NodeId> {
-        self.children.iter().find(|(name, _)| name == lower).map(|&(_, id)| id)
+    /// O valor de nome `lower` (já em minúsculas), sem diferença de caixa.
+    pub fn value(&self, lower: &str) -> Option<&Value> {
+        self.values.iter().find(|value| same_name(&value.name, lower))
     }
 
-    pub fn value(&self, lower: &str) -> Option<&Value> {
-        self.values.iter().find(|(name, _)| name == lower).map(|(_, value)| value)
+    fn value_mut(&mut self, lower: &str) -> Option<&mut Value> {
+        self.values.iter_mut().find(|value| same_name(&value.name, lower))
+    }
+}
+
+/// Os dois nomes são iguais sem diferença de caixa (comparados em
+/// maiúsculas, como o NT compara nomes de chave), sem alocar cópias.
+pub fn same_name(name: &str, other: &str) -> bool {
+    name.chars().flat_map(char::to_uppercase).eq(other.chars().flat_map(char::to_uppercase))
+}
+
+/// Hash do nome sem diferença de caixa (FNV-1a sobre os caracteres em
+/// maiúsculas): nomes iguais por [`same_name`] têm o mesmo hash.
+pub fn name_hash(name: &str) -> u32 {
+    name.chars().flat_map(char::to_uppercase).fold(0x811C_9DC5u32, |hash, character| (hash ^ character as u32).wrapping_mul(0x0100_0193))
+}
+
+/// A subchave de `node` com o nome `lower` (já em minúsculas).
+fn child_of(hive: &Hive, node: NodeId, lower: &str) -> Option<NodeId> {
+    let hash = name_hash(lower);
+    hive.nodes[&node].children.iter().filter(|&&(candidate, _)| candidate == hash).map(|&(_, child)| child).find(|child| hive.nodes.get(child).is_some_and(|key| same_name(&key.name, lower)))
+}
+
+/// Os descritores já vistos numa carga de hive: chaves com o mesmo
+/// descritor compartilham a cópia.
+#[derive(Default)]
+struct SecurityCache {
+    known: Vec<Arc<Captured>>,
+}
+
+impl SecurityCache {
+    fn share(&mut self, security: Captured) -> Arc<Captured> {
+        if let Some(found) = self.known.iter().find(|known| ***known == security) {
+            return found.clone();
+        }
+        let shared = Arc::new(security);
+        self.known.push(shared.clone());
+        shared
     }
 }
 
@@ -153,7 +193,7 @@ fn with_hive<T>(body: impl FnOnce(&mut Hive) -> T) -> T {
         let mut hive = HIVE.lock();
         let hive = hive.get_or_insert_with(|| {
             let mut nodes = BTreeMap::new();
-            nodes.insert(ROOT, KeyNode { name: String::new(), parent: None, children: Vec::new(), values: Vec::new(), security: key_policy::boot_root(), last_write_time: now(), deleted: false, cell: None, volatile: false, link: false, class: Vec::new() });
+            nodes.insert(ROOT, KeyNode { name: String::new(), parent: None, children: Vec::new(), values: Vec::new(), security: Arc::new(key_policy::boot_root()), last_write_time: now(), deleted: false, cell: None, volatile: false, link: false, class: Vec::new() });
             Hive { nodes, next_node: ROOT + 1, handles: BTreeMap::new(), statistics: ObjectStatistics::default(), storages: BTreeMap::new(), dirtied: false }
         });
         let result = body(hive);
@@ -205,7 +245,7 @@ fn resolve(hive: &Hive, path: &str, open_link: bool) -> Result<String, u32> {
         let components = split_path(&current);
         let mut node = ROOT;
         for (index, component) in components.iter().enumerate() {
-            let Some(child) = hive.nodes[&node].child(&component.to_lowercase()) else { break };
+            let Some(child) = child_of(hive, node, &component.to_lowercase()) else { break };
             let key = &hive.nodes[&child];
             let last = index + 1 == components.len();
             if key.link && !(last && open_link) {
@@ -301,7 +341,7 @@ fn report_change(chain: &[NodeId], filter: u32) {
 fn deepest_existing(hive: &Hive, path: &str) -> NodeId {
     let mut node = ROOT;
     for component in split_path(path) {
-        match hive.nodes[&node].child(&component.to_lowercase()) {
+        match child_of(hive, node, &component.to_lowercase()) {
             Some(child) => node = child,
             None => break,
         }
@@ -367,7 +407,7 @@ fn create_node(hive: &mut Hive, name: &str, parent: NodeId, security: Option<Cap
     }
     let identifier = hive.next_node;
     hive.next_node += 1;
-    hive.nodes.insert(identifier, KeyNode { name: name.to_string(), parent: Some(parent), children: Vec::new(), values: Vec::new(), security, last_write_time: time, deleted: false, cell, volatile, link, class: class.to_vec() });
+    hive.nodes.insert(identifier, KeyNode { name: name.to_string(), parent: Some(parent), children: Vec::new(), values: Vec::new(), security: Arc::new(security), last_write_time: time, deleted: false, cell, volatile, link, class: class.to_vec() });
     Ok(identifier)
 }
 
@@ -386,14 +426,14 @@ fn walk_link(hive: &mut Hive, path: &str, create: bool, security: Option<Capture
     let mut security = security;
     for (index, component) in components.iter().enumerate() {
         let lower = component.to_lowercase();
-        let existing = hive.nodes[&node].child(&lower);
+        let existing = child_of(hive, node, &lower);
         node = match existing {
             Some(child) => child,
             None if !create => return Ok(None),
             None => {
                 let child = create_node(hive, component, node, if index == last { security.take() } else { None }, volatile && index == last, link && index == last, if index == last { class } else { &[] })?;
                 if let Some(parent) = hive.nodes.get_mut(&node) {
-                    parent.children.push((lower, child));
+                    parent.children.push((name_hash(&lower), child));
                 }
                 child
             }
@@ -532,12 +572,12 @@ pub fn delete_node(node: NodeId, path: &str) -> bool {
         }
         // O pai é o do próprio nó: um handle aberto por um link guarda o
         // caminho resolvido, e a árvore é a fonte de verdade.
-        let (parent, lower) = (key.parent?, key.name.to_lowercase());
+        let parent = key.parent?;
         let real = node_path(hive, node);
         let parent_chain = ancestry(hive, parent);
         let parent = hive.nodes.get_mut(&parent)?;
         let before = parent.children.len();
-        parent.children.retain(|(name, child)| !(*name == lower && *child == node));
+        parent.children.retain(|&(_, child)| child != node);
         if parent.children.len() == before {
             return None;
         }
@@ -626,9 +666,9 @@ pub fn set_node_value(node: NodeId, path: &str, name: &str, value_type: u32, dat
         let lower = name.to_lowercase();
         let value = Value { name: name.to_string(), value_type, data };
         let stored = value.clone();
-        match key.values.iter_mut().find(|(candidate, _)| *candidate == lower) {
-            Some(slot) => slot.1 = value,
-            None => key.values.push((lower, value)),
+        match key.value_mut(&lower) {
+            Some(slot) => *slot = value,
+            None => key.values.push(value),
         }
         key.last_write_time = now();
         mirror(hive, node, |storage, cell, time| key_cells::set_value(storage, cell, &stored.name, stored.value_type, &stored.data, time));
@@ -661,7 +701,7 @@ pub fn delete_node_value(node: NodeId, path: &str, name: &str) -> bool {
         let Some(key) = hive.nodes.get_mut(&node).filter(|key| !key.deleted) else { return None };
         let lower = name.to_lowercase();
         let before = key.values.len();
-        key.values.retain(|(candidate, _)| *candidate != lower);
+        key.values.retain(|value| !same_name(&value.name, &lower));
         if key.values.len() == before {
             return None;
         }
@@ -738,21 +778,24 @@ pub fn link_hive(path: &str, identifier: u32, storage: Storage, keys: Vec<FlatKe
     let parent_path = parents.join("\\");
     let linked = with_hive(|hive| {
         let Some(parent) = find(hive, &parent_path) else { return Err((STATUS_OBJECT_NAME_NOT_FOUND, storage)) };
-        if hive.nodes[&parent].child(&name.to_lowercase()).is_some() {
+        if child_of(hive, parent, &name.to_lowercase()).is_some() {
             return Err((STATUS_OBJECT_NAME_COLLISION, storage));
         }
         let mut ids: Vec<NodeId> = Vec::with_capacity(keys.len());
+        let mut descriptors = SecurityCache::default();
         for key in keys {
             let (parent_node, display) = match key.parent {
-                Some(index) => (ids[index], key.record.name.clone()),
+                Some(index) => (ids[index], key.record.name),
                 None => (parent, String::from(*name)),
             };
             let node = hive.next_node;
             hive.next_node += 1;
-            let values = key.record.values.into_iter().map(|value| (value.name.to_lowercase(), value)).collect();
-            hive.nodes.insert(node, KeyNode { name: display.clone(), parent: Some(parent_node), children: Vec::new(), values, security: key.record.security, last_write_time: key.record.last_write_time, deleted: false, cell: Some((identifier, key.cell)), volatile: false, link: key.record.flags & key_cells::KEY_SYM_LINK != 0, class: key.record.class });
+            let hash = name_hash(&display);
+            let mut values = key.record.values;
+            values.shrink_to_fit();
+            hive.nodes.insert(node, KeyNode { name: display, parent: Some(parent_node), children: Vec::new(), values, security: descriptors.share(key.record.security), last_write_time: key.record.last_write_time, deleted: false, cell: Some((identifier, key.cell)), volatile: false, link: key.record.flags & key_cells::KEY_SYM_LINK != 0, class: key.record.class });
             if let Some(parent_key) = hive.nodes.get_mut(&parent_node) {
-                parent_key.children.push((display.to_lowercase(), node));
+                parent_key.children.push((hash, node));
             }
             ids.push(node);
         }
@@ -811,10 +854,9 @@ pub fn unlink_hive(identifier: u32, force: bool) -> Result<Storage, u32> {
             return Err(STATUS_CANNOT_DELETE);
         }
         let path = node_path(hive, root);
-        let lower = hive.nodes[&root].name.to_lowercase();
         let parent_chain = hive.nodes[&root].parent.map(|parent| ancestry(hive, parent)).unwrap_or_default();
         if let Some(parent) = hive.nodes[&root].parent.and_then(|parent| hive.nodes.get_mut(&parent)) {
-            parent.children.retain(|(name, _)| *name != lower);
+            parent.children.retain(|&(_, child)| child != root);
         }
         for node in &nodes {
             if let Some(key) = hive.nodes.get_mut(node) {
@@ -870,7 +912,7 @@ pub fn snapshot(node: NodeId) -> Option<Vec<NewKey>> {
         while let Some((current, parent)) = stack.pop() {
             let Some(key) = hive.nodes.get(&current).filter(|key| !key.deleted && !key.volatile) else { continue };
             let index = keys.len();
-            keys.push(NewKey { name: key.name.clone(), last_write_time: key.last_write_time, security: key.security.clone(), values: key.values.iter().map(|(_, value)| value.clone()).collect(), parent, link: key.link, class: key.class.clone() });
+            keys.push(NewKey { name: key.name.clone(), last_write_time: key.last_write_time, security: Captured::clone(&key.security), values: key.values.clone(), parent, link: key.link, class: key.class.clone() });
             for &(_, child) in key.children.iter().rev() {
                 stack.push((child, Some(index)));
             }
@@ -900,9 +942,8 @@ pub fn restore_subtree(node: NodeId, keys: Vec<FlatKey>) -> Result<(), KernelErr
         nodes.retain(|&candidate| candidate != node);
         for &child in nodes.iter().rev() {
             let parent = hive.nodes.get(&child).and_then(|key| key.parent);
-            let lower = hive.nodes.get(&child).map(|key| key.name.to_lowercase()).unwrap_or_default();
             if let Some(parent) = parent.and_then(|parent| hive.nodes.get_mut(&parent)) {
-                parent.children.retain(|(name, _)| *name != lower);
+                parent.children.retain(|&(_, candidate)| candidate != child);
             }
             if let Some(key) = hive.nodes.get_mut(&child) {
                 key.deleted = true;
@@ -912,10 +953,10 @@ pub fn restore_subtree(node: NodeId, keys: Vec<FlatKey>) -> Result<(), KernelErr
                 key.cell = None;
             }
         }
-        let names: Vec<String> = hive.nodes[&node].values.iter().map(|(_, value)| value.name.clone()).collect();
+        let names: Vec<String> = hive.nodes[&node].values.iter().map(|value| value.name.clone()).collect();
         for name in names {
             if let Some(key) = hive.nodes.get_mut(&node) {
-                key.values.retain(|(_, value)| value.name != name);
+                key.values.retain(|value| value.name != name);
             }
             mirror(hive, node, |storage, cell, _| key_cells::delete_value(storage, cell, &name, now()));
         }
@@ -927,7 +968,7 @@ pub fn restore_subtree(node: NodeId, keys: Vec<FlatKey>) -> Result<(), KernelErr
                     let parent = ids[index];
                     let child = create_node(hive, &key.record.name, parent, Some(key.record.security.clone()), false, key.record.flags & key_cells::KEY_SYM_LINK != 0, &key.record.class)?;
                     if let Some(parent_key) = hive.nodes.get_mut(&parent) {
-                        parent_key.children.push((key.record.name.to_lowercase(), child));
+                        parent_key.children.push((name_hash(&key.record.name), child));
                     }
                     child
                 }
@@ -936,9 +977,9 @@ pub fn restore_subtree(node: NodeId, keys: Vec<FlatKey>) -> Result<(), KernelErr
                 let lower = value.name.to_lowercase();
                 let stored = value.clone();
                 if let Some(entry) = hive.nodes.get_mut(&target) {
-                    match entry.values.iter_mut().find(|(candidate, _)| *candidate == lower) {
-                        Some(slot) => slot.1 = value,
-                        None => entry.values.push((lower, value)),
+                    match entry.value_mut(&lower) {
+                        Some(slot) => *slot = value,
+                        None => entry.values.push(value),
                     }
                 }
                 mirror(hive, target, |storage, cell, _| key_cells::set_value(storage, cell, &stored.name, stored.value_type, &stored.data, now()));
@@ -984,21 +1025,23 @@ pub fn refresh_hive(identifier: u32, storage: Storage, keys: Vec<FlatKey>) -> Re
         let old: Vec<NodeId> = subtree(hive, root);
         let mut kept: alloc::collections::BTreeSet<NodeId> = alloc::collections::BTreeSet::new();
         let mut ids: Vec<NodeId> = Vec::with_capacity(keys.len());
+        let mut descriptors = SecurityCache::default();
         for key in keys {
             let node = match key.parent {
                 None => root,
                 Some(index) => {
                     let parent = ids[index];
                     let lower = key.record.name.to_lowercase();
-                    let existing = hive.nodes[&parent].children.iter().find(|(name, child)| *name == lower && !kept.contains(child)).map(|&(_, child)| child);
+                    let hash = name_hash(&lower);
+                    let existing = hive.nodes[&parent].children.iter().filter(|&&(candidate, child)| candidate == hash && !kept.contains(&child)).map(|&(_, child)| child).find(|child| hive.nodes.get(child).is_some_and(|key| same_name(&key.name, &lower)));
                     match existing {
                         Some(child) => child,
                         None => {
                             let child = hive.next_node;
                             hive.next_node += 1;
-                            hive.nodes.insert(child, KeyNode { name: key.record.name.clone(), parent: Some(parent), children: Vec::new(), values: Vec::new(), security: key.record.security.clone(), last_write_time: 0, deleted: false, cell: None, volatile: false, link: false, class: Vec::new() });
+                            hive.nodes.insert(child, KeyNode { name: key.record.name.clone(), parent: Some(parent), children: Vec::new(), values: Vec::new(), security: Arc::new(key.record.security.clone()), last_write_time: 0, deleted: false, cell: None, volatile: false, link: false, class: Vec::new() });
                             if let Some(parent_key) = hive.nodes.get_mut(&parent) {
-                                parent_key.children.push((lower, child));
+                                parent_key.children.push((hash, child));
                             }
                             child
                         }
@@ -1007,8 +1050,8 @@ pub fn refresh_hive(identifier: u32, storage: Storage, keys: Vec<FlatKey>) -> Re
             };
             kept.insert(node);
             if let Some(entry) = hive.nodes.get_mut(&node) {
-                entry.values = key.record.values.into_iter().map(|value| (value.name.to_lowercase(), value)).collect();
-                entry.security = key.record.security;
+                entry.values = key.record.values;
+                entry.security = descriptors.share(key.record.security);
                 entry.last_write_time = key.record.last_write_time;
                 entry.cell = Some((identifier, key.cell));
                 entry.link = key.record.flags & key_cells::KEY_SYM_LINK != 0;

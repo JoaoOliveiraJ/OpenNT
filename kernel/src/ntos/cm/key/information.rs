@@ -46,8 +46,8 @@ pub fn write(node: NodeId, absolute_path: &str, class: u32, output: u64, buffer_
         class: key.class.clone(),
         last_write_time: key.last_write_time,
         children: key.children.iter().map(|&(_, child)| child).collect(),
-        value_names: key.values.iter().map(|(_, value)| utf16_length(&value.name)).collect(),
-        value_data: key.values.iter().map(|(_, value)| value.data.len() as u32).collect(),
+        value_names: key.values.iter().map(|value| utf16_length(&value.name)).collect(),
+        value_data: key.values.iter().map(|value| value.data.len() as u32).collect(),
     }) else {
         return 0xC000_017C;
     };

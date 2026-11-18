@@ -15,7 +15,10 @@
 //!
 //! Os bins são blocos próprios do kernel que não mudam de endereço quando a
 //! hive cresce (cada bin novo é outro bloco, como as vistas do NT), então o
-//! endereço de uma célula vale enquanto ela não é liberada.
+//! endereço de uma célula vale enquanto ela não é liberada. Cada bin ocupa
+//! páginas do VirtualAlloc de kernel (frames do PFN numa faixa de VA
+//! própria, `mm/virtual_memory`), o papel do pool paginado em que o NT
+//! guarda as hives: as células não ficam no heap do kernel.
 
 use alloc::collections::BTreeMap;
 use alloc::vec;
@@ -23,6 +26,7 @@ use alloc::vec::Vec;
 
 use crate::ntos::inc::types::{HbaseBlock, Hbin};
 use crate::ntos::inc::types::NtStruct;
+use crate::ntos::mm::virtual_memory;
 
 pub const HBLOCK_SIZE: u32 = 0x1000;
 pub const HSECTOR_SIZE: u32 = 0x200;
@@ -36,29 +40,55 @@ pub const HBIN_SIGNATURE: u32 = 0x6e69_6268;
 pub const STATUS_REGISTRY_CORRUPT: u32 = 0xC000_014C;
 pub const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 
-/// Um bin: o offset a partir do primeiro bin e os bytes (cabeçalho + células).
+/// Um bin: o offset a partir do primeiro bin e as páginas dele (cabeçalho +
+/// células), do VirtualAlloc de kernel.
 struct Bin {
     offset: u32,
-    data: Vec<u64>,
+    address: u64,
+    size: u32,
 }
 
 impl Bin {
+    /// Um bin zerado de `size` bytes (múltiplo de HBLOCK_SIZE); `None` sem
+    /// memória.
+    fn new(offset: u32, size: u32) -> Option<Bin> {
+        let address = virtual_memory::alloc(size as u64);
+        if address == 0 {
+            return None;
+        }
+        let bin = Bin { offset, address, size };
+        // SAFETY: páginas recém-mapeadas de `size` bytes, só deste bin.
+        unsafe { core::ptr::write_bytes(address as *mut u8, 0, size as usize) };
+        Some(bin)
+    }
+
     fn size(&self) -> u32 {
-        (self.data.len() * 8) as u32
+        self.size
     }
 
     fn address(&self) -> u64 {
-        self.data.as_ptr() as u64
+        self.address
     }
 
     fn bytes(&self) -> &[u8] {
-        // SAFETY: o vetor de u64 tem `size()` bytes inicializados.
-        unsafe { core::slice::from_raw_parts(self.data.as_ptr() as *const u8, self.data.len() * 8) }
+        // SAFETY: `size` bytes mapeados e inicializados em `new`.
+        unsafe { core::slice::from_raw_parts(self.address as *const u8, self.size as usize) }
     }
 
     fn bytes_mut(&mut self) -> &mut [u8] {
         // SAFETY: idem, com acesso exclusivo.
-        unsafe { core::slice::from_raw_parts_mut(self.data.as_mut_ptr() as *mut u8, self.data.len() * 8) }
+        unsafe { core::slice::from_raw_parts_mut(self.address as *mut u8, self.size as usize) }
+    }
+}
+
+impl Drop for Bin {
+    fn drop(&mut self) {
+        virtual_memory::free(self.address, self.size as u64);
+        // Outra CPU pode guardar a tradução das páginas: a faixa só volta a
+        // ser usada depois da invalidação em todas.
+        if let Err(error) = crate::ntos::ke::smp::flush_remote_tlb(false) {
+            crate::debug_print!("[cm] bin da hive em {:#x}: {}", self.address, error);
+        }
     }
 }
 
@@ -226,11 +256,11 @@ impl Storage {
     }
 
     /// HvpAddBin: um bin novo no fim, com espaço para `needed` bytes de
-    /// célula; o que sobra vira uma célula livre.
+    /// célula; o que sobra vira uma célula livre. HCELL_NIL sem memória.
     fn add_bin(&mut self, needed: u32) -> u32 {
         let size = round_up(needed + HBIN_HEADER, HBLOCK_SIZE);
         let offset = self.length();
-        let mut bin = Bin { offset, data: vec![0u64; (size / 8) as usize] };
+        let Some(mut bin) = Bin::new(offset, size) else { return HCELL_NIL };
         {
             let bytes = bin.bytes_mut();
             bytes[0..4].copy_from_slice(&HBIN_SIGNATURE.to_le_bytes());
@@ -261,6 +291,9 @@ impl Storage {
             Some(found) => found,
             None => {
                 let cell = self.add_bin(needed);
+                if cell == HCELL_NIL {
+                    return None;
+                }
                 (cell, self.free[&cell])
             }
         };
@@ -349,7 +382,7 @@ impl Storage {
             if read32(at) != HBIN_SIGNATURE || read32(at + 4) != offset || size < HBLOCK_SIZE || size % HBLOCK_SIZE != 0 || offset as u64 + size as u64 > length as u64 {
                 return Err(STATUS_REGISTRY_CORRUPT);
             }
-            let mut bin = Bin { offset, data: vec![0u64; (size / 8) as usize] };
+            let mut bin = Bin::new(offset, size).ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
             bin.bytes_mut().copy_from_slice(&data[at..at + size as usize]);
             let mut cursor = HBIN_HEADER;
             while cursor < size {

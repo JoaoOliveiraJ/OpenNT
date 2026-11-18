@@ -51,7 +51,7 @@ fn registry_hive(assert: Assert) {
     let before = registry::with_node(registry::get_node(child).unwrap_or(0), |key| key.last_write_time).unwrap_or(0);
     assert(registry::set_value(child, "Primeiro", 4, alloc::vec![1, 0, 0, 0]) && registry::set_value(child, "Segundo", 1, alloc::vec![b'a', 0]) && registry::set_value(reopened, "PRIMEIRO", 4, alloc::vec![2, 0, 0, 0]), "registry: valores gravados");
     let value = registry::get_value(child, "primeiro");
-    let order = registry::with_node(registry::get_node(child).unwrap_or(0), |key| key.values.iter().map(|(_, value)| value.name.clone()).collect::<alloc::vec::Vec<_>>()).unwrap_or_default();
+    let order = registry::with_node(registry::get_node(child).unwrap_or(0), |key| key.values.iter().map(|value| value.name.clone()).collect::<alloc::vec::Vec<_>>()).unwrap_or_default();
     assert(value.is_some_and(|value| value.name == "PRIMEIRO" && value.data == [2, 0, 0, 0]) && order.len() == 2 && order[0] == "PRIMEIRO", "registry: regravar substitui no lugar");
     assert(registry::read_value_by_path("\\registry\\machine\\software\\openntselftest\\opennttest", "segundo").is_none() && registry::read_value_by_path(&(alloc::string::String::from(base) + "\\Filho"), "segundo").is_some_and(|value| value.value_type == 1), "registry: consulta interna por caminho");
     let after = registry::with_node(registry::get_node(child).unwrap_or(0), |key| key.last_write_time).unwrap_or(0);

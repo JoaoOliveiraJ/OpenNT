@@ -663,7 +663,7 @@ fn open_or_create_key(create: bool, output: u64, desired: u32, attributes_pointe
                 }
                 let Some(existing_or_assigned) = (match (&assigned, existing) {
                     (Some(descriptor), _) => Some(descriptor.clone()),
-                    (None, Some(node)) => registry::with_node(node, |key| key.security.clone()),
+                    (None, Some(node)) => registry::with_node(node, |key| crate::ntos::se::inherit_descriptor::Captured::clone(&key.security)),
                     (None, None) => None,
                 }) else {
                     return Ok(Outcome::from_status(0xC000_0034));
@@ -956,7 +956,7 @@ pub fn key_operation(kind: Kind, handle: u64, arguments: &Fields, previous_mode:
                             registry::with_node(node, |key| key.value(&name).cloned()).flatten()
                         } else {
                             let index = field("index") as u32 as usize;
-                            registry::with_node(node, |key| key.values.get(index).map(|(_, value)| value.clone())).flatten()
+                            registry::with_node(node, |key| key.values.get(index).cloned()).flatten()
                         };
                         match value {
                             Some(value) => value_information::write(&value, field("klass") as u32, field("out"), field("length") as u32, field("returned")),
