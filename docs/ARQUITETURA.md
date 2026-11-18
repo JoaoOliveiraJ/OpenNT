@@ -1388,8 +1388,8 @@ além da KUSER_SHARED_DATA:
   MEM_PRESERVE_PLACEHOLDER (base de página, senão
   STATUS_INVALID_PARAMETER_2; como nenhuma vista do OpenNT vem de um
   placeholder, STATUS_CONFLICTING_ADDRESSES depois da checagem de
-  segurança); outras flags dão STATUS_INVALID_PARAMETER_3. Teste:
-  `ntos/test/shared_section_views.rs`.
+  segurança); outras flags dão STATUS_INVALID_PARAMETER_3. Testes:
+  `ntos/test/shared_section_views.rs` e `ntos/test/secure_virtual_memory.rs`.
 - **Faixas protegidas** (`mm/secure_memory.rs`): o MmSecureVirtualMemory(Ex)
   põe uma entrada de segurança no VAD que contém a faixa (a região
   privada, a vista ou a imagem), com as flags do MiAddSecureEntry do 19041
@@ -1403,7 +1403,7 @@ além da KUSER_SHARED_DATA:
   desmapeamento; a recusa é STATUS_INVALID_PAGE_PROTECTION. A entrada guarda
   a identidade da região, então uma região que sai do VAD por outro caminho
   leva as entradas dela, e o fim do processo leva todas. Teste:
-  `ntos/test/phase6.rs` (`mm_secure_memory_exports`).
+  `ntos/test/secure_virtual_memory.rs`.
 - **Cópias de sistema** (`ps/user/loader.rs`): a ntdll, o apiset e as
   tabelas NLS são mapeados uma vez, na raiz do System (o mapeamento roda
   anexado ao System, venha o pedido de onde vier), e fotografados logo

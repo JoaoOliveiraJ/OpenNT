@@ -12,6 +12,7 @@ pub mod executive_support;
 pub mod object_header;
 pub mod phase7;
 pub mod shared_section_views;
+pub mod secure_virtual_memory;
 pub mod multiprocess;
 pub mod executable_code;
 pub mod system_allocations;

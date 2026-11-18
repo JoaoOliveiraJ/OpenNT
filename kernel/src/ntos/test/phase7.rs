@@ -6778,6 +6778,7 @@ pub fn run(assert: Assert) {
     physical_memory_section(assert);
     system_space_views(assert);
     super::shared_section_views::run(assert);
+    super::secure_virtual_memory::run(assert);
     virtual_memory_queries(assert);
     user_virtual_memory(assert);
     super::user_jit_memory::run(assert);
