@@ -8,16 +8,17 @@
 //! (SystemVideoState, o estado da tela do console), 58
 //! (PowerSettingNotificationName), 59 (GetPowerSettingValue), 66
 //! (PlatformInformation) e 75 (PlatformRole) têm o mesmo corpo nos dois
-//! modos (`level_answer`); o 87 (PowerInformationInternal) só é atendido de
-//! modo usuário. Os demais níveis de modo kernel devolvem
-//! STATUS_INVALID_PARAMETER.
+//! modos (`level_answer`), como o 42 (SessionDisplayState, o aviso de tela
+//! do win32k), que o modo usuário não alcança; o 87
+//! (PowerInformationInternal) só é atendido de modo usuário. Os demais
+//! níveis de modo kernel devolvem STATUS_INVALID_PARAMETER.
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use core::sync::atomic::AtomicU8;
 
 use crate::ntos::inc::types::{NtStruct, SystemPowerCapabilities};
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::po::{black_box, boot_status, power_setting};
+use crate::ntos::po::{black_box, boot_status, display_state, power_setting};
 use crate::rtl::KernelError;
 
 const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
@@ -69,19 +70,10 @@ fn session_power_init(input: u64, output: u64, output_length: u32) -> u32 {
     0
 }
 
-/// POWER_INFORMATION_LEVEL SystemVideoState.
+/// POWER_INFORMATION_LEVEL SystemVideoState e SessionDisplayState (o estado
+/// da tela, `po/display_state.rs`).
 const SYSTEM_VIDEO_STATE: u32 = 29;
-
-/// PopConsoleDisplayState (MONITOR_DISPLAY_STATE): só o
-/// PopUpdateConsoleDisplayState o grava, quando a sessão informa o estado da
-/// tela (SessionDisplayState); até lá fica no zero do boot
-/// (PowerMonitorOff), o .data sem inicializador do ntoskrnl.
-static CONSOLE_DISPLAY_STATE: AtomicU32 = AtomicU32::new(0);
-
-/// O PopConsoleDisplayState corrente (o que o SystemVideoState devolve).
-pub fn console_display_state() -> u32 {
-    CONSOLE_DISPLAY_STATE.load(Ordering::Acquire)
-}
+const SESSION_DISPLAY_STATE: u32 = 42;
 
 /// SessionPowerCleanup (0x6f17c4): sem entrada nem saída; o
 /// PopFreeSessionState da sessão corrente. O OpenNT não guarda estado de
@@ -106,7 +98,7 @@ pub fn query(level: u32, input: u64, input_length: u32, output: u64, output_leng
     if level == SESSION_POWER_CLEANUP {
         return Ok(session_power_cleanup(input, output));
     }
-    if !matches!(level, SYSTEM_POWER_CAPABILITIES | SYSTEM_BATTERY_STATE | SYSTEM_VIDEO_STATE | POWER_SETTING_NOTIFICATION_NAME | GET_POWER_SETTING_VALUE | PLATFORM_INFORMATION | PLATFORM_ROLE) {
+    if !matches!(level, SYSTEM_POWER_CAPABILITIES | SYSTEM_BATTERY_STATE | SYSTEM_VIDEO_STATE | SESSION_DISPLAY_STATE | POWER_SETTING_NOTIFICATION_NAME | GET_POWER_SETTING_VALUE | PLATFORM_INFORMATION | PLATFORM_ROLE) {
         return Ok(STATUS_INVALID_PARAMETER);
     }
     let input_length = if input == 0 { 0 } else { input_length };
@@ -253,10 +245,19 @@ fn level_answer(level: u32, input: &[u8], output_length: u32) -> Result<Answer, 
             Answer::Data(match level {
                 SYSTEM_POWER_CAPABILITIES => capabilities(),
                 SYSTEM_BATTERY_STATE => battery_state(),
-                SYSTEM_VIDEO_STATE => console_display_state().to_le_bytes().to_vec(),
+                SYSTEM_VIDEO_STATE => display_state::console_display_state().to_le_bytes().to_vec(),
                 PLATFORM_INFORMATION => alloc::vec![platform_aoac()],
                 _ => platform_role().to_le_bytes().to_vec(),
             })
+        }
+        // SessionDisplayState (0x6f0fb9; o modo usuário é recusado antes):
+        // entrada de exatamente 0x10 bytes e nenhuma saída.
+        SESSION_DISPLAY_STATE => {
+            if input.len() != display_state::SESSION_DISPLAY_STATE_INPUT || has_output {
+                return Ok(Answer::Status(STATUS_INVALID_PARAMETER));
+            }
+            display_state::session_display_state(input)?;
+            Answer::Data(Vec::new())
         }
         // PowerSettingNotificationName (0x6f0bed): com saída de exatamente 8
         // bytes (o WNF_STATE_NAME) e entrada, se houver, de exatamente 0x14

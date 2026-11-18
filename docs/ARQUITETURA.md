@@ -2761,9 +2761,15 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   (0x4c bytes, só o botão de energia, o S5, o FullWake e o DiskSpinDown), o
   5 é o estado composto sem bateria (AcOnLine) e o 29 (SystemVideoState,
   que o CProcessStateManager do LogonUI pede antes de subir o servidor RPC)
-  são os 4 bytes do PopConsoleDisplayState. As configurações de power
-  setting nascem do PopSetPowerSettingValue (no boot, o
-  PopInitilizeAcDcSettings grava GUID_ACDC_POWER_SOURCE): o nível 58 cria
+  são os 4 bytes do PopConsoleDisplayState (`po/display_state.rs`). Esse
+  estado nasce ligado no PoInitSystem e muda pelo 42 (SessionDisplayState,
+  só de modo kernel), o aviso de tela do win32kbase: entrada de 0x10 bytes
+  sem saída; com os BOOLEANs de +0xC e +0xD, o GUID_SESSION_DISPLAY_STATUS
+  da sessão e o PopUpdateConsoleDisplayState (GUID_CONSOLE_DISPLAY_STATE,
+  GUID_MONITOR_POWER_ON e WNF_UBPM_CONSOLE_MONITOR, só quando o estado
+  muda); com +0xC e +0xE, WNF_PO_PRIMARY_DISPLAY_VISIBLE_STATE. As
+  configurações de power setting nascem do PopSetPowerSettingValue (no
+  boot, o PopInitilizeAcDcSettings grava GUID_ACDC_POWER_SOURCE): o nível 58 cria
   no primeiro pedido o nome WNF temporário de escopo de máquina da
   configuração (ou o nome global, sem GUID; GUID desconhecido dá
   STATUS_NOT_FOUND) e o 59 serializa os valores AC, DC e Hot com os

@@ -179,6 +179,11 @@ pub fn kmain() -> ! {
     // Os valores iniciais de GUID_ACDC_POWER_SOURCE (o
     // PopInitilizeAcDcSettings do PoInitSystem).
     crate::ntos::po::power_setting::initialize_ac_dc_settings();
+    // A tela do console ligada (o PopUpdateConsoleDisplayState logo depois,
+    // no PoInitSystem).
+    if let Err(error) = crate::ntos::po::display_state::initialize() {
+        debug_print!("[po] estado da tela do console: {}", error);
+    }
     // O canal ALPC do Power Manager com o serviço Power de modo usuário
     // (o PopUmpoInitializeChannel do PoInitSystem): o \PowerPort.
     if let Err(error) = crate::ntos::po::umpo_channel::initialize() {

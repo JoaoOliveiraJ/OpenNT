@@ -150,8 +150,50 @@ fn session_power(assert: Assert) {
     // Como no 19041, um comprimento zero anula o ponteiro (a entrada sem
     // comprimento conta como NULL; a saída sem comprimento, como ausente).
     let with_input = call_export("ZwPowerInformation", &[29, buffer + 0x40, 4, buffer, 4]).map(|status| status & 0xFFFF_FFFF);
-    assert(with_input == Some(STATUS_INVALID_PARAMETER) && power(29, 0, buffer, 0) == Some(STATUS_INVALID_PARAMETER) && power(29, 0, buffer, 3) == Some(0xC000_0023) && power(29, buffer + 0x40, buffer, 4) == Some(0) && guest::read32(buffer) == crate::ntos::po::power_information::console_display_state(), "power: SystemVideoState sem entrada devolve os 4 bytes do PopConsoleDisplayState");
+    assert(with_input == Some(STATUS_INVALID_PARAMETER) && power(29, 0, buffer, 0) == Some(STATUS_INVALID_PARAMETER) && power(29, 0, buffer, 3) == Some(0xC000_0023) && power(29, buffer + 0x40, buffer, 4) == Some(0) && guest::read32(buffer) == crate::ntos::po::display_state::console_display_state(), "power: SystemVideoState sem entrada devolve os 4 bytes do PopConsoleDisplayState");
+    session_display_state(assert, buffer);
     guest::free_bytes(buffer);
+}
+
+/// SessionDisplayState (42), o aviso de tela do UpdateDisplayState do
+/// win32kbase: entrada de exatamente 0x10 bytes e nenhuma saída; sem o
+/// BOOLEAN de +0xD nada muda; com +0xC e +0xD, o PopConsoleDisplayState (o
+/// SystemVideoState o devolve), GUID_CONSOLE_DISPLAY_STATE, GUID_MONITOR_POWER_ON
+/// e o GUID_SESSION_DISPLAY_STATUS da sessão de quem chama. A tela começa
+/// ligada (o PoInitSystem) e volta ao estado de antes no fim.
+fn session_display_state(assert: Assert, buffer: u64) {
+    use crate::ntos::po::{display_state, power_setting};
+    let input = buffer + 0x40;
+    let display = |state: u32, flags: [u8; 4], length: u64, output: u64| {
+        guest::write32(input, 1);
+        guest::write32(input + 4, state);
+        guest::write32(input + 8, 0);
+        guest::write_bytes(input + 0xC, &flags);
+        call_export("ZwPowerInformation", &[42, input, length, output, if output != 0 { 4 } else { 0 }]).map(|status| status & 0xFFFF_FFFF)
+    };
+    // O valor AC de um setting (o primeiro registro do PopGetSettingValue).
+    let ac_value = |setting: &[u8; 16]| power_setting::setting_value(setting, 0x40).ok().filter(|bytes| bytes.len() >= 16).map(|bytes| u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]));
+    let video = || {
+        guest::write32(buffer, 0xEEEE_EEEE);
+        (call_export("ZwPowerInformation", &[29, 0, 0, buffer, 4]).map(|status| status & 0xFFFF_FFFF), guest::read32(buffer))
+    };
+    let previous = display_state::console_display_state();
+    let boot_settings = (ac_value(&power_setting::GUID_CONSOLE_DISPLAY_STATE), ac_value(&power_setting::GUID_MONITOR_POWER_ON));
+    assert(previous == 1 && boot_settings == (Some(1), Some(1)), "power: a tela do console comeca ligada (PopUpdateConsoleDisplayState do PoInitSystem)");
+    let target = if previous == 1 { 2 } else { 1 };
+    let short = display(target, [1, 1, 0, 0], 0xC, 0);
+    let with_output = display(target, [1, 1, 0, 0], 0x10, buffer);
+    let without_d = display(target, [1, 0, 1, 0], 0x10, 0);
+    let unchanged = display_state::console_display_state() == previous;
+    let applied = display(target, [1, 1, 0, 0], 0x10, 0);
+    let settings = (ac_value(&power_setting::GUID_CONSOLE_DISPLAY_STATE), ac_value(&power_setting::GUID_MONITOR_POWER_ON), ac_value(&power_setting::GUID_SESSION_DISPLAY_STATUS));
+    let read_back = video();
+    let restored = display(previous, [1, 1, 1, 0], 0x10, 0);
+    let monitor_restored = ac_value(&power_setting::GUID_MONITOR_POWER_ON);
+    assert(
+        short == Some(STATUS_INVALID_PARAMETER) && with_output == Some(STATUS_INVALID_PARAMETER) && without_d == Some(0) && unchanged && applied == Some(0) && settings == (Some(target), Some(1), Some(target)) && read_back == (Some(0), target) && restored == Some(0) && display_state::console_display_state() == previous && monitor_restored == Some((previous != 0) as u32),
+        "power: SessionDisplayState grava o estado da tela do console, GUID_CONSOLE_DISPLAY_STATE, GUID_MONITOR_POWER_ON e o estado da sessao",
+    );
 }
 
 fn kernel_exclusive_section(assert: Assert) {

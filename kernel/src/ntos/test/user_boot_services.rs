@@ -517,7 +517,7 @@ fn power_information(assert: Assert, block: u64, rsp: u64, call: Call) {
     let video_no_output = power(29, 0, 0, 0, 0);
     let video_empty_output = power(29, 0, 0, output, 0);
     assert(
-        video == 0 && video_value == crate::ntos::po::power_information::console_display_state() && video_short == 0xC000_0023 && video_no_output == STATUS_INVALID_PARAMETER && video_empty_output == STATUS_INVALID_PARAMETER,
+        video == 0 && video_value == crate::ntos::po::display_state::console_display_state() && video_short == 0xC000_0023 && video_no_output == STATUS_INVALID_PARAMETER && video_empty_output == STATUS_INVALID_PARAMETER,
         "userboot: NtPowerInformation 29 (SystemVideoState) de modo usuario",
     );
     // SystemPowerCapabilities (0x4c bytes) e SystemBatteryState (0x20).

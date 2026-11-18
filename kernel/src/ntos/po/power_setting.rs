@@ -3,9 +3,9 @@
 //! setting que o NtPowerInformation 58 (PowerSettingNotificationName) e 59
 //! (GetPowerSettingValue) consultam.
 //!
-//! Os callbacks registrados ficam guardados para quando um setting mudar;
-//! hoje nenhum muda, então nenhum é disparado. O handle devolvido ao driver
-//! é o endereço do próprio callback.
+//! Os callbacks registrados ficam guardados; a mudança de um setting ainda
+//! não os dispara (o PopSetNotificationWork não existe). O handle devolvido
+//! ao driver é o endereço do próprio callback.
 //!
 //! Configurações (PopPowerSettings e PopSessionSpecificLists, sob o
 //! PopSettingLock):
@@ -17,7 +17,9 @@
 //!   Hot) e o nome WNF de notificação.
 //! - Só o PopSetPowerSettingValue cria configurações. No boot, o
 //!   PopInitilizeAcDcSettings do PoInitSystem grava GUID_ACDC_POWER_SOURCE
-//!   com AC = PoAc (0) e DC = PoDc (1). Os valores vêm em blocos
+//!   com AC = PoAc (0) e DC = PoDc (1); o SessionDisplayState do win32k
+//!   grava GUID_SESSION_DISPLAY_STATUS da sessão, GUID_CONSOLE_DISPLAY_STATE
+//!   e GUID_MONITOR_POWER_ON (`po/display_state.rs`). Os valores vêm em blocos
 //!   {ChangeStamp, dados}: um valor igual ao de outro slot da mesma
 //!   configuração reaproveita o bloco; senão o bloco novo recebe o próximo
 //!   PopPowerSettingChangeStamp (que pula o zero).
@@ -90,10 +92,16 @@ const fn guid(data1: u32, data2: u16, data3: u16, data4: [u8; 8]) -> [u8; 16] {
 
 /// GUID_ACDC_POWER_SOURCE {5d3e9a59-e9d5-4b00-a6bd-ff34ff516548}.
 pub const GUID_ACDC_POWER_SOURCE: [u8; 16] = guid(0x5d3e_9a59, 0xe9d5, 0x4b00, [0xa6, 0xbd, 0xff, 0x34, 0xff, 0x51, 0x65, 0x48]);
-/// PopSessionSpecificGuids: GUID_SESSION_DISPLAY_STATUS
-/// {2b84c20e-ad23-4ddf-93db-05ffbd7efca5} e GUID_SESSION_USER_PRESENCE
-/// {3c0f4548-c03f-4c4d-b9f2-237ede686376}.
-const SESSION_SPECIFIC_GUIDS: [[u8; 16]; 2] = [guid(0x2b84_c20e, 0xad23, 0x4ddf, [0x93, 0xdb, 0x05, 0xff, 0xbd, 0x7e, 0xfc, 0xa5]), guid(0x3c0f_4548, 0xc03f, 0x4c4d, [0xb9, 0xf2, 0x23, 0x7e, 0xde, 0x68, 0x63, 0x76])];
+/// GUID_SESSION_DISPLAY_STATUS {2b84c20e-ad23-4ddf-93db-05ffbd7efca5}.
+pub const GUID_SESSION_DISPLAY_STATUS: [u8; 16] = guid(0x2b84_c20e, 0xad23, 0x4ddf, [0x93, 0xdb, 0x05, 0xff, 0xbd, 0x7e, 0xfc, 0xa5]);
+/// GUID_SESSION_USER_PRESENCE {3c0f4548-c03f-4c4d-b9f2-237ede686376}.
+const GUID_SESSION_USER_PRESENCE: [u8; 16] = guid(0x3c0f_4548, 0xc03f, 0x4c4d, [0xb9, 0xf2, 0x23, 0x7e, 0xde, 0x68, 0x63, 0x76]);
+/// PopSessionSpecificGuids.
+const SESSION_SPECIFIC_GUIDS: [[u8; 16]; 2] = [GUID_SESSION_DISPLAY_STATUS, GUID_SESSION_USER_PRESENCE];
+/// GUID_CONSOLE_DISPLAY_STATE {6fe69556-704a-47a0-8f24-c28d936fda47}.
+pub const GUID_CONSOLE_DISPLAY_STATE: [u8; 16] = guid(0x6fe6_9556, 0x704a, 0x47a0, [0x8f, 0x24, 0xc2, 0x8d, 0x93, 0x6f, 0xda, 0x47]);
+/// GUID_MONITOR_POWER_ON {02731015-4510-4526-99e6-e5a17ebd1aea}.
+pub const GUID_MONITOR_POWER_ON: [u8; 16] = guid(0x0273_1015, 0x4510, 0x4526, [0x99, 0xe6, 0xe5, 0xa1, 0x7e, 0xbd, 0x1a, 0xea]);
 
 /// Flags da configuração.
 const FLAG_NOTIFICATION_NAME: u32 = 1;
@@ -192,6 +200,21 @@ fn set_value(setting: &[u8; 16], session: u32, slot: usize, data: &[u8]) {
 pub fn initialize_ac_dc_settings() {
     set_value(&GUID_ACDC_POWER_SOURCE, ANY_SESSION, SLOT_AC, &0u32.to_le_bytes());
     set_value(&GUID_ACDC_POWER_SOURCE, ANY_SESSION, SLOT_DC, &1u32.to_le_bytes());
+}
+
+/// PopSetPowerSettingValueAcDc(Guid, DataLength, Data): o mesmo valor nos
+/// slots AC e DC da configuração de máquina (sessão -1).
+pub fn set_value_ac_dc(setting: &[u8; 16], data: &[u8]) {
+    set_value(setting, ANY_SESSION, SLOT_AC, data);
+    set_value(setting, ANY_SESSION, SLOT_DC, data);
+}
+
+/// PopSetSessionDisplayStatus(Session, State): o estado da tela da sessão
+/// em GUID_SESSION_DISPLAY_STATUS, AC e DC.
+pub fn set_session_display_status(session: u32, state: u32) {
+    let data = state.to_le_bytes();
+    set_value(&GUID_SESSION_DISPLAY_STATUS, session, SLOT_AC, &data);
+    set_value(&GUID_SESSION_DISPLAY_STATUS, session, SLOT_DC, &data);
 }
 
 /// O descritor absoluto do PopCreateNotificationName, num bloco de kernel:
