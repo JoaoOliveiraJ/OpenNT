@@ -144,6 +144,8 @@ const LPC_CONNECTION_REQUEST: u16 = 10;
 /// A mensagem espera resposta: todo envio novo sem
 /// ALPC_MSGFLG_RELEASE_MESSAGE, como no AlpcpDispatchNewMessage.
 const LPC_CONTINUATION_REQUIRED: u16 = 0x2000;
+/// LPC_KERNELMODE_MESSAGE: a mensagem veio de um chamador em KernelMode.
+const LPC_KERNELMODE_MESSAGE: u16 = 0x8000;
 /// ALPC_MESSAGE_CONTEXT_ATTRIBUTE.
 const CONTEXT_ATTRIBUTE: u32 = 0x2000_0000;
 /// ALPC_MESSAGE_VIEW_ATTRIBUTE.
@@ -462,8 +464,14 @@ impl UserServer {
     }
 
     /// LPC_CONNECTION_REQUEST na fila, com a vista do cliente; a thread do
-    /// cliente espera a decisão do servidor.
-    pub fn request_connection(&self, port: &Arc<Port>, data: &[u8], view: Option<Arc<ClientView>>) -> Decision {
+    /// cliente espera a decisão do servidor. O Type é o do
+    /// AlpcpFormatConnectionRequest (o LPC_KERNELMODE_MESSAGE que um
+    /// chamador em KernelMode pôs na mensagem de conexão) com o
+    /// LPC_CONTINUATION_REQUIRED do AlpcpDispatchConnectionRequest: o
+    /// servidor distingue por ele o cliente de kernel (o CoreMessagingK do
+    /// win32kbase no registrar do CoreMessaging).
+    pub fn request_connection(&self, port: &Arc<Port>, data: &[u8], view: Option<Arc<ClientView>>, kernel_mode: bool) -> Decision {
+        let message_type = LPC_CONTINUATION_REQUIRED | LPC_CONNECTION_REQUEST | if kernel_mode { LPC_KERNELMODE_MESSAGE } else { 0 };
         let sender = current_sender();
         let pending = Arc::new(PendingConnection { client: port.clone(), sender, view: view.clone(), decision: SpinLock::new(None) });
         let (id, sequence) = {
@@ -473,13 +481,13 @@ impl UserServer {
             }
             let id = UserServer::next_id(&mut state);
             state.connections.insert(id, pending.clone());
-            state.senders.insert(id, Origin { sender, client: port.pointer, waiting: true, message_type: LPC_CONNECTION_REQUEST, received: false });
+            state.senders.insert(id, Origin { sender, client: port.pointer, waiting: true, message_type, received: false });
             (id, next_sequence(&self.listener))
         };
         if rpc_trace::enabled() {
-            rpc_trace::message(&Record { listener: self.listener.pointer, client_port: port.pointer, client: sender.process, server: self.listener.process_id(), message_type: LPC_CONNECTION_REQUEST, id, data, ..Record::default() });
+            rpc_trace::message(&Record { listener: self.listener.pointer, client_port: port.pointer, client: sender.process, server: self.listener.process_id(), message_type, id, data, ..Record::default() });
         }
-        self.enqueue(Delivery { id, message_type: LPC_CONNECTION_REQUEST, data: Vec::from(data), sender, port_context: 0, view, sequence, ..Delivery::default() });
+        self.enqueue(Delivery { id, message_type, data: Vec::from(data), sender, port_context: 0, view, sequence, ..Delivery::default() });
         let decision = pending.clone();
         let status = kernel_entry::wait_transport(&mut || decision.decision.lock().as_ref().map(|decision| decision.status), crate::ntos::ke::wait::Deadline::Infinite, 0, false);
         let decision = pending.decision.lock().take().unwrap_or(Decision { status, ..Decision::default() });
@@ -492,7 +500,7 @@ impl UserServer {
             state.senders.remove(&id);
             // Uma espera interrompida antes da decisão tira a mensagem que o
             // servidor ainda não recebeu.
-            state.queue.retain(|delivery| delivery.id != id || delivery.message_type != LPC_CONNECTION_REQUEST);
+            state.queue.retain(|delivery| delivery.id != id || delivery.message_type & 0xFF != LPC_CONNECTION_REQUEST);
         }
         if decision.status != STATUS_SUCCESS {
             if let Some(view) = &pending.view {
@@ -543,8 +551,12 @@ impl Service for UserServer {
     }
 
     /// LPC_CONNECTION_REQUEST na fila; a thread do cliente espera a decisão.
-    fn connect(&self, port: &Arc<Port>, data: &[u8], _request: Option<&[u8]>) -> Reply {
-        let decision = self.request_connection(port, data, None);
+    /// `request` é o PORT_MESSAGE de conexão já formatado, com o Type que o
+    /// chamador de kernel deu.
+    fn connect(&self, port: &Arc<Port>, data: &[u8], request: Option<&[u8]>) -> Reply {
+        let type_offset = offset_of!(PortMessage, u2.s2.type_);
+        let kernel_mode = request.and_then(|bytes| bytes.get(type_offset..type_offset + 2)).is_some_and(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]) & LPC_KERNELMODE_MESSAGE != 0);
+        let decision = self.request_connection(port, data, None, kernel_mode);
         let server = Sender { process: self.listener.process_id(), thread: self.listener.thread_id(), thread_pointer: 0 };
         Reply::Now(JobResult { status: decision.status, data: decision.data, sender: Some(server) })
     }
@@ -801,7 +813,7 @@ fn receive_one(server: &UserServer, buffer: &Buffer, attributes: u64, options: R
                 return Some(STATUS_PORT_DISCONNECTED);
             }
             let delivery = state.queue.front()?;
-            if options.connections_only && delivery.message_type != LPC_CONNECTION_REQUEST {
+            if options.connections_only && delivery.message_type & 0xFF != LPC_CONNECTION_REQUEST {
                 let discarded = state.queue.pop_front()?;
                 state.senders.remove(&discarded.id);
                 continue;

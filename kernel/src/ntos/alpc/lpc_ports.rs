@@ -362,7 +362,7 @@ fn connect_captured(out: u64, name: u64, qos: u64, client_view: u64, required_si
         };
         port.set_started(true);
         let decision = match &user_server {
-            Some(server) => server.request_connection(&port, &data, view.clone()),
+            Some(server) => server.request_connection(&port, &data, view.clone(), false),
             None => match service.connect(&port, &data, None) {
                 Reply::Now(result) => server::Decision { status: result.status, data: result.data, server_view: None },
                 Reply::Later(_) => return Err(KernelError::new("LPC connection to a kernel service was deferred")),
