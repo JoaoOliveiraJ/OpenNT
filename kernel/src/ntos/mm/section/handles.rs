@@ -58,6 +58,15 @@ impl Reference {
     pub fn process_terminating(&self) -> bool {
         process::with_record(self.pointer, |record| record.terminated || record.exiting).unwrap_or(false)
     }
+
+    /// EPROCESS.Flags.VmDeleted: o único estado em que o MiMapViewOfDataSection
+    /// (0x639ce8), o MiMapViewOfImageSection (0x61d60e) e o
+    /// MiObtainReferencedVadEx (0x21b31d) do 19041 recusam a vista com
+    /// STATUS_PROCESS_IS_TERMINATING; um processo saindo (callout de saída do
+    /// win32k, rotinas de saída) ainda mapeia e desmapeia.
+    pub fn process_vm_deleted(&self) -> bool {
+        crate::ntos::mm::secure_memory::vm_deleted(self.pointer)
+    }
 }
 
 fn process_reference(pointer: u64) -> Result<Reference, u32> {

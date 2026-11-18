@@ -12,6 +12,12 @@
 //! o mesmo efeito: handles de kernel temporários abertos pelo
 //! ObOpenObjectByPointer em KernelMode, a mesma validação e o mesmo
 //! mapeamento do Nt, e os handles fechados no fim.
+//!
+//! Um processo saindo só recusa vistas depois do EPROCESS.Flags.VmDeleted,
+//! que o MmCleanProcessAddressSpace liga depois do callout de saída do
+//! win32k: até lá o MiMapViewOfDataSection (0x639ce8) e o
+//! MiMapViewOfImageSection (0x61d60e) do 19041 mapeiam; depois dão
+//! STATUS_PROCESS_IS_TERMINATING.
 
 use crate::ntos::mm::section::map_view_parameters::{self, Decoded, MapInput, SectionTraits};
 use crate::ntos::mm::section::handles::{self as section_handles, Kind, Reference};
@@ -70,7 +76,10 @@ pub fn map(section_handle: u64, process_handle: u64, base_pointer: u64, zero_bit
             Decoded::Boundary(reason) => Err(reason),
             Decoded::View(view) => Ok(view),
         };
-        if process.process_terminating() {
+        // Só o VmDeleted recusa (MiMapViewOfDataSection 0x639ce8,
+        // MiMapViewOfImageSection 0x61d60e): no callout de saída do win32k o
+        // processo que sai ainda recebe vistas.
+        if process.process_vm_deleted() {
             return Ok(0xC000_010A);
         }
         let boundary = match &request {

@@ -25,6 +25,12 @@
 //!   VAD inteiro, num processo sem VmDeleted), em qualquer modo; uma vista
 //!   SEC_NO_CHANGE sem faixa protegida desmapeia normalmente, também de modo
 //!   usuário (`mm/secure_memory.rs`).
+//! - Um processo saindo só recusa com STATUS_PROCESS_IS_TERMINATING depois do
+//!   EPROCESS.Flags.VmDeleted (o MiObtainReferencedVadEx, 0x21b31d), que o
+//!   MmCleanProcessAddressSpace liga depois do callout de saída do win32k:
+//!   no callout e nas rotinas de saída as vistas do processo que sai ainda
+//!   desmapeiam (CddBitmapSw::OnCloseProcess e Release do cdd). O
+//!   MiUnmapViewOfSection anexa sozinho a um alvo que não é o corrente.
 
 use alloc::sync::Arc;
 
@@ -83,7 +89,9 @@ pub fn unmap_ex(handle: u64, base: u64, mode: u8, flags: u32) -> Result<u32, Ker
         if preserve_placeholder && base & 0xFFF != 0 {
             return Ok(STATUS_INVALID_PARAMETER_2);
         }
-        if process.process_terminating() {
+        // Só o VmDeleted recusa (MiObtainReferencedVadEx 0x21b31d): no callout
+        // de saída do win32k o processo que sai ainda desmapeia.
+        if process.process_vm_deleted() {
             return Ok(0xC000_010A);
         }
         let contains = |region_base: u64, size: u64| base >= region_base && base < region_base + size;

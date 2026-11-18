@@ -25,6 +25,17 @@
 //! - Objetos de um tipo de driver duplicados entre processos e resolvidos
 //!   pelo tipo no destino (os objetos compartilhados do dxgkrnl movidos pelo
 //!   NtDCompositionDuplicateHandleToProcess).
+//! - Superfície de redirecionamento GDI (Win32CreateSection 0x6c854 do
+//!   win32kbase, SURFACE::Map 0x7ab20, CddBitmapSw::GetSysMemBits 0x27f94 do
+//!   cdd, GetSoSurfaceData 0x173a8 do win32kfull e MapSection 0x4510e do
+//!   dwmcore): a vista desmapeada de outro processo sem anexar, a vista nova
+//!   do processo corrente e o handle de usuário do DWM pelo
+//!   ObOpenObjectByPointer de modo kernel.
+//! - Vistas na saída do processo: só o EPROCESS.Flags.VmDeleted recusa o
+//!   mapeamento; nas rotinas de saída (depois do callout de saída do win32k)
+//!   o processo que sai ainda desmapeia (CddBitmapSw::OnCloseProcess 0x23f0c).
+
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::ntos::inc::types::{self as nt, NtStruct};
 use crate::ntos::mm::{guest_memory as guest, paging};
@@ -361,9 +372,131 @@ fn cross_process_objects(assert: Assert) {
     guest::free_bytes(block);
 }
 
+/// MmMapViewOfSection(Section, Process, &Base(0), 0, CommitSize, &Offset(0),
+/// &ViewSize, ViewShare, 0, PAGE_READWRITE): o mapeamento do
+/// MapKernelSectionForUserMapping (win32kbase 0x7ae1c) e do
+/// CddBitmapSw::GetSysMemBits (cdd 0x2803c).
+fn map_view_share(block: u64, section: u64, target: u64, size: u64) -> (u32, u64) {
+    let (base, offset, view_size) = (block, block + 8, block + 0x10);
+    guest::write64(base, 0);
+    guest::write64(offset, 0);
+    guest::write64(view_size, size);
+    let mapped = status(call_export("MmMapViewOfSection", &[section, target, base, 0, size, offset, view_size, 1, 0, 4]));
+    (mapped, guest::read64(base))
+}
+
+/// Superfície de redirecionamento GDI (a seção SEC_COMMIT|SEC_NO_CHANGE do
+/// Win32CreateSection, win32kbase 0x6c854 + ObDeleteCapturedInsertInfo
+/// 0x6c869): o processo que desenha a mapeia e o kernel escreve na vista de
+/// usuário (EngBitBlt); outro processo desmapeia a vista do primeiro sem
+/// anexar e mapeia a sua (CddBitmapSw::GetSysMemBits 0x27f94, SURFACE::Map
+/// 0x7ab20); o DWM recebe um handle de usuário pelo ObOpenObjectByPointer(
+/// seção, 0, NULL, 6, NULL, KernelMode) (GetSoSurfaceData 0x173a8) e mapeia
+/// por ele (CSectionBitmapRealization::MapSection 0x4510e).
+fn gdi_redirection_views(assert: Assert) {
+    const PIXEL: u32 = 0x00FF_8000;
+    let block = guest::alloc_bytes(0x200);
+    let (output, size) = (block, block + 8);
+    guest::write64(size, 0x3000);
+    let created = status(call_export("MmCreateSection", &[output, 6, 0, size, 4, SEC_COMMIT | SEC_NO_CHANGE, 0, 0]));
+    let body = guest::read64(output);
+    if created == 0 {
+        let _ = call_export("ObDeleteCapturedInsertInfo", &[body]);
+    }
+    let section = sections::by_pointer(body).filter(|_| created == 0);
+    let outcome = with_test_process("redir-desenha.exe", None, |drawer| {
+        let (first, uva_a) = map_view_share(block + 0x40, body, drawer.process, 0x3000);
+        if first == 0 {
+            guest::write32(uva_a + 0x2010, PIXEL);
+        }
+        with_test_process("redir-dwm.exe", None, |dwm| {
+            let unmapped = first == 0 && status(call_export("MmUnmapViewOfSection", &[drawer.process, uva_a])) == 0 && view_at(body, uva_a).is_none();
+            let (second, uva_b) = map_view_share(block + 0x60, body, dwm.process, 0x3000);
+            let pixel = second == 0 && guest::read32(uva_b + 0x2010) == PIXEL;
+            let opened = status(call_export("ObOpenObjectByPointer", &[body, 0, 0, 6, 0, 0, block + 0x80])) == 0;
+            let handle = guest::read64(block + 0x80);
+            let user_handle = opened && handle & 0xFFFF_FFFF_8000_0000 != 0xFFFF_FFFF_8000_0000;
+            guest::write64(block + 0x90, 0);
+            guest::write64(block + 0x98, 0);
+            let mapped = user_handle && status(call_export("ZwMapViewOfSection", &[handle, u64::MAX, block + 0x90, 0, 0, 0, block + 0x98, 2, 0, 4])) == 0;
+            let uva_c = guest::read64(block + 0x90);
+            let aliased = mapped && guest::read32(uva_c + 0x2010) == PIXEL && section.as_ref().is_some_and(|section| paging::translate(uva_c + 0x2000) == section.frame(2).unwrap_or(1) && paging::translate(uva_b + 0x2000) == section.frame(2).unwrap_or(2));
+            if mapped {
+                let _ = call_export("MmUnmapViewOfSection", &[dwm.process, uva_c]);
+            }
+            if second == 0 {
+                let _ = call_export("MmUnmapViewOfSection", &[dwm.process, uva_b]);
+            }
+            if opened {
+                let _ = open_pointer::close(handle);
+            }
+            (unmapped, pixel, user_handle, aliased)
+        })
+    })
+    .flatten();
+    assert(created == 0 && section.is_some(), "gdiredir: MmCreateSection SEC_COMMIT|SEC_NO_CHANGE + ObDeleteCapturedInsertInfo (Win32CreateSection)");
+    assert(outcome.is_some_and(|(unmapped, ..)| unmapped), "gdiredir: MmUnmapViewOfSection da vista de outro processo sem anexar (GetSysMemBits)");
+    assert(outcome.is_some_and(|(_, pixel, ..)| pixel), "gdiredir: a vista nova do processo corrente ve o que o kernel escreveu na vista do anterior");
+    assert(outcome.is_some_and(|(_, _, user_handle, _)| user_handle), "gdiredir: ObOpenObjectByPointer(secao, 0, NULL, 6, NULL, KernelMode) da handle de usuario (GetSoSurfaceData)");
+    assert(outcome.is_some_and(|(.., aliased)| aliased), "gdiredir: o mapeamento do DWM pelo handle e alias dos mesmos PFNs (MapSection)");
+    drop(section);
+    let _ = section_objects::dereference(body);
+    guest::free_bytes(block);
+}
+
+static EXIT_TARGET: AtomicU64 = AtomicU64::new(0);
+static EXIT_VIEW: AtomicU64 = AtomicU64::new(0);
+static EXIT_UNMAP: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// Rotina de saída de processo (depois do callout de saída do win32k, antes
+/// do VmDeleted): desmapeia a vista do processo que sai, como o
+/// CddBitmapSw::OnCloseProcess (cdd 0x23f0c) e o Release (0x289e9).
+fn unmap_on_exit(process: u64) {
+    if process == 0 || EXIT_TARGET.compare_exchange(process, 0, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        return;
+    }
+    let base = EXIT_VIEW.swap(0, Ordering::SeqCst);
+    EXIT_UNMAP.store(status(call_export("MmUnmapViewOfSection", &[process, base])), Ordering::SeqCst);
+}
+
+/// MiObtainReferencedVadEx (0x21b31d) e MiMapViewOfDataSection (0x639ce8):
+/// só o VmDeleted recusa; um processo saindo ainda desmapeia. O
+/// `with_test_process` termina o processo pelo `process::terminate_process`,
+/// que roda as rotinas de saída no contexto do teste, depois do
+/// `process_exit_callout` e antes do VmDeleted.
+fn exit_callout_views(assert: Assert) {
+    let block = guest::alloc_bytes(0x100);
+    guest::write64(block + 8, 0x2000);
+    let created = status(call_export("MmCreateSection", &[block, 0, 0, block + 8, 4, SEC_COMMIT, 0, 0]));
+    let body = guest::read64(block);
+    EXIT_UNMAP.store(u32::MAX, Ordering::SeqCst);
+    process::register_process_exit_routine(unmap_on_exit);
+    let refused = with_test_process("redir-saida.exe", None, |exiting| {
+        let (mapped, uva) = map_view_share(block + 0x40, body, exiting.process, 0x2000);
+        if mapped == 0 {
+            EXIT_VIEW.store(uva, Ordering::SeqCst);
+            EXIT_TARGET.store(exiting.process, Ordering::SeqCst);
+        }
+        // SAFETY: o EPROCESS do processo de teste, vivo durante o corpo.
+        let eprocess = unsafe { nt::Eprocess::at(exiting.process) };
+        eprocess.set_vm_deleted(1);
+        let refused = map_view_share(block + 0x60, body, exiting.process, 0x1000).0 == 0xC000_010A;
+        eprocess.set_vm_deleted(0);
+        mapped == 0 && refused
+    });
+    process::unregister_process_exit_routine(unmap_on_exit);
+    EXIT_TARGET.store(0, Ordering::SeqCst);
+    assert(created == 0 && refused == Some(true), "gdiredir: VmDeleted recusa o MmMapViewOfSection com STATUS_PROCESS_IS_TERMINATING");
+    assert(EXIT_UNMAP.load(Ordering::SeqCst) == 0, "gdiredir: MmUnmapViewOfSection num processo saindo, antes do VmDeleted, desmapeia (callout de saida do win32k)");
+    let _ = section_objects::dereference(body);
+    guest::free_bytes(block);
+}
+
 pub fn run(assert: Assert) {
     backing_store(assert);
     fence_page(assert);
     composition_sections(assert);
     cross_process_objects(assert);
+    gdi_redirection_views(assert);
+    exit_callout_views(assert);
 }

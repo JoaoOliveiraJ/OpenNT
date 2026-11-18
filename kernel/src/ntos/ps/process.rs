@@ -770,6 +770,14 @@ pub fn terminate_process(process: u64, exit_status: u32) -> Result<(), KernelErr
     rundown::wait(object.rundown_protect.count.address())?;
     process_handles::destroy(process)?;
     object_manager::close_process_native_handles(process);
+    // O MmCleanProcessAddressSpace do PspRundownSingleProcess (0x6c3be9, depois
+    // do callout de saída do win32k em 0x6c3b8b e do PspExitProcess em 0x6c3ba5)
+    // liga EPROCESS.Flags.VmDeleted (0x7fbffd) antes de soltar os VADs; daí em
+    // diante o MiMapViewOfDataSection (0x639ce8), o MiMapViewOfImageSection
+    // (0x61d60e) e o MiObtainReferencedVadEx (0x21b31d) recusam com
+    // STATUS_PROCESS_IS_TERMINATING. Antes disso (o callout de saída do win32k,
+    // as rotinas de saída) o processo que sai ainda mapeia e desmapeia.
+    object.flags.atomic().fetch_or(Eprocess::VM_DELETED_MASK, Ordering::SeqCst);
     if let Some(release) = hooks.release_section_views {
         release(process);
     }
