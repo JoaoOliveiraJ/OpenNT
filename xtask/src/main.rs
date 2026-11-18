@@ -12,13 +12,15 @@
 //! cargo xtask debug      [opções] [--launch [--no-client [--headless]]] [--connect=HOST:PORTA]
 //!                        [--vm-snapshots | --record=ARQ | --replay=ARQ [--gdb-port=N]]
 //! cargo xtask status     [--reference=NTOSKRNL.EXE]
+//! cargo xtask heap-census [--build-dir=DIR] [--all] [SERIAL.LOG]
 //! cargo xtask nt-types   [--check] [--pdb=ARQ]
 //! ```
 //!
 //! Opções de build: `--release`, `--build-dir=DIR` (padrão `build`),
 //! `--user-program=shell`, `--kernel-test-scope=none|all|disk-stress`, `--console-mirror`,
 //! `--start-driver=NOME[,NOME...]`, `--trace-driver-api`, `--trace-rpc` (cada mensagem ALPC das
-//! portas de servidor na serial, com a interface e o opnum dos pedidos LRPC),
+//! portas de servidor na serial, com a interface e o opnum dos pedidos LRPC), `--heap-census`
+//! (o censo do heap do kernel na serial a cada 4 MB a mais de uso),
 //! `--initial-process=smss`, `--storage=real|nvme`,
 //! `--display=basic`, `--windows-dir=DIR`, `--pnp-root=acpi|internal` (a raiz da árvore de
 //! dispositivos: o acpi.sys real, o padrão, ou o barramento PCI interno), `--kd=com2` (o
@@ -46,6 +48,7 @@ extern crate alloc;
 mod build;
 mod debug;
 mod fonts;
+mod heap_census;
 mod hive_image;
 mod host_language;
 mod kernel_pe;
@@ -75,7 +78,7 @@ use std::time::Duration;
 use build::BuildOptions;
 use qemu::{MachineOptions, TestOptions};
 
-const USAGE: &str = "uso: cargo xtask <build|run|test-boot|test-all|capturas|debug|status|nt-types> [opcoes]
+const USAGE: &str = "uso: cargo xtask <build|run|test-boot|test-all|capturas|debug|status|nt-types|heap-census> [opcoes]
   build      compila boot + kernel e monta build/os.img
   run        build + QEMU com janela (serial neste terminal)
   test-boot  build + QEMU sem tela; espera MARCADOR [TIMEOUT_MS]
@@ -90,11 +93,13 @@ const USAGE: &str = "uso: cargo xtask <build|run|test-boot|test-all|capturas|deb
              gdbstub do QEMU (--gdb-port=N) e os passos para tras)
   status     gera docs/site/*.html e docs/status/*.svg (cargo xtask status --help)
   nt-types   gera kernel/src/ntos/inc/types do PDB do ntoskrnl (cargo xtask nt-types --help)
+  heap-census  da nomes ao censo do heap do kernel de uma serial (cargo xtask heap-census --help)
 opcoes de build:   --release --build-dir=DIR --user-program=shell
                    --kernel-test-scope=none|all|disk-stress --console-mirror --start-driver=NOME[,NOME...]
                    --trace-driver-api --initial-process=smss --storage=real|nvme --display=basic
                    --trace-rpc (cada mensagem ALPC das portas de servidor na serial, com a
                    interface e o opnum dos pedidos LRPC e o status das respostas)
+                   --heap-census (censo do heap do kernel na serial a cada 4 MB a mais de uso)
                    --windows-dir=DIR (binarios do Windows do bundle; padrao build/windows)
                    --pnp-root=acpi|internal (raiz da arvore de dispositivos; padrao acpi)
                    --usb (controladora xHCI com teclado e tablet USB)
@@ -181,6 +186,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             start_driver: String::new(),
             trace_driver_api: false,
             trace_rpc: false,
+            heap_census: false,
             initial_process: String::new(),
             storage: String::new(),
             display: String::new(),
@@ -246,6 +252,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             "--start-driver" => parsed.build.start_driver = required()?,
             "--trace-driver-api" => parsed.build.trace_driver_api = true,
             "--trace-rpc" => parsed.build.trace_rpc = true,
+            "--heap-census" => parsed.build.heap_census = true,
             "--memory-pressure" => parsed.build.memory_pressure = true,
             "--initial-process" => parsed.build.initial_process = required()?,
             "--storage" => parsed.build.storage = required()?,
@@ -573,6 +580,7 @@ fn main() -> ExitCode {
     let result = match arguments.first().map(String::as_str) {
         Some("status") => status::run(&arguments[1..]),
         Some("nt-types") => nt_types::run(&arguments[1..]),
+        Some("heap-census") => heap_census::run(&arguments[1..]),
         Some("test-all") => test_all::run(&arguments[1..]),
         Some("capturas") => test_all::capture(&arguments[1..]),
         _ => parse(arguments).and_then(execute),

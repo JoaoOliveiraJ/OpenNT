@@ -4,6 +4,10 @@
 //! Heap exclusivo nos frames de 32 MB até 96 MB, conforme `ntos/mm/memory_map`;
 //! os frames do PFN começam em 96 MB. Também é o `#[global_allocator]` do Rust.
 //!
+//! Cada bloco ocupado guarda o local que o pediu (`heap_census`): o censo
+//! dos bytes vivos por local vai para a serial na falha e, com a opção
+//! HEAPCENSUS, a cada 4 MB a mais de uso.
+//!
 //! Os frames do heap são endereçados só pela janela do heap na metade de
 //! sistema (`KERNEL_HEAP_BASE + PA - KERNEL_HEAP_PHYS_BASE`), montada por
 //! `init` antes do primeiro bloco: cabeçalhos, listas livres e os ponteiros
@@ -12,6 +16,7 @@
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::{self, null_mut};
 
+use super::heap_census::{self, Chain};
 use super::physical;
 use crate::ntos::mm::memory_map as map;
 use crate::ntos::mm::paging;
@@ -43,8 +48,9 @@ fn e820_entry(index: usize) -> E820Entry {
 struct Block {
     size: usize,            // bytes de dados (sem o header)
     next: *mut Block,       // vizinho físico; a busca não percorre blocos ocupados
-    free: i32,
-    bin: i32,               // classe em que o bloco livre está inserido
+    free: u16,
+    bin: u16,               // classe em que o bloco livre está inserido
+    site: u32,              // local do bloco ocupado no censo (`heap_census`)
     previous: *mut Block,
 }
 
@@ -68,6 +74,8 @@ struct Heap {
     total: usize,
     used: usize,
     ram_top: u64,
+    /// Próximo uso que imprime o censo (opção HEAPCENSUS); 0 sem a opção.
+    next_census: usize,
 }
 
 // Os ponteiros só são tocados com o lock do heap adquirido.
@@ -79,6 +87,7 @@ static HEAP: SpinLock<Heap> = SpinLock::new(Heap {
     total: 0,
     used: 0,
     ram_top: 0,
+    next_census: 0,
 });
 
 fn bin_index(size: usize) -> usize {
@@ -96,7 +105,7 @@ impl Heap {
     unsafe fn insert_free(&mut self, block: *mut Block) {
         let index = bin_index((*block).size);
         let links = free_links(block);
-        (*block).bin = index as i32;
+        (*block).bin = index as u16;
         (*links).previous = null_mut();
         (*links).next = self.free_bins[index];
         if !(*links).next.is_null() {
@@ -135,8 +144,31 @@ impl Heap {
         }
     }
 
+    /// A faixa física [base, top) está inteira num descritor utilizável do
+    /// E820 e nenhum descritor reservado a toca.
+    fn usable_range(base: u64, top: u64) -> bool {
+        let count = e820_count().min(map::E820_MAX_ENTRIES as usize);
+        let mut inside = false;
+        for index in 0..count {
+            let entry = e820_entry(index);
+            let (start, length, kind, acpi) = (entry.base, entry.length, entry.kind, entry.acpi);
+            let end = start.wrapping_add(length);
+            if acpi & 1 == 0 || length == 0 || end < start {
+                continue;
+            }
+            if kind == 1 {
+                inside |= start <= base && end >= top;
+            } else if start < top && end > base {
+                return false;
+            }
+        }
+        inside
+    }
+
     unsafe fn init(&mut self) {
         self.detect_ram();
+        heap_census::init(Self::usable_range(map::KERNEL_HEAP_CENSUS_PHYS, map::KERNEL_HEAP_CENSUS_PHYS + map::KERNEL_HEAP_CENSUS_SIZE));
+        self.next_census = if crate::ntos::init::boot_config::heap_census() { heap_census::WATERMARK_STEP } else { 0 };
         let count = e820_count();
         let mut heap_end = HEAP_START;
         // Somente o descritor utilizável que contém HEAP_START pode sustentar o heap.
@@ -176,13 +208,14 @@ impl Heap {
         (*first).next = null_mut();
         (*first).previous = null_mut();
         (*first).free = 1;
+        (*first).site = 0;
         self.free_list = first;
         self.insert_free(first);
         self.total = (*first).size;
         self.used = 0;
     }
 
-    unsafe fn allocate(&mut self, size: usize) -> *mut u8 {
+    unsafe fn allocate(&mut self, size: usize, chain: &Chain) -> *mut u8 {
         if size > usize::MAX - 15 {
             return null_mut();
         }
@@ -208,12 +241,18 @@ impl Heap {
                     (*(*split).next).previous = split;
                 }
                 (*split).free = 1;
+                (*split).site = 0;
                 (*block).size = size;
                 (*block).next = split;
                 self.insert_free(split);
             }
             (*block).free = 0;
+            (*block).site = heap_census::record(chain, (*block).size);
             self.used += (*block).size;
+            if self.next_census != 0 && self.used >= self.next_census {
+                self.next_census = (self.used / heap_census::WATERMARK_STEP + 1) * heap_census::WATERMARK_STEP;
+                heap_census::print("marca de uso", self.used, self.total, 25, 0x1_0000);
+            }
             return (block as *mut u8).add(HDR_SIZE);
         }
         null_mut()
@@ -225,6 +264,8 @@ impl Heap {
         }
         let mut block = pointer.sub(HDR_SIZE) as *mut Block;
         self.used -= (*block).size;
+        heap_census::forget((*block).site, (*block).size);
+        (*block).site = 0;
         (*block).free = 1;
         // Os dois vizinhos são conhecidos. Coalescer ao liberar evita a
         // fragmentação dependente da ordem e não move dados vivos.
@@ -284,7 +325,8 @@ pub fn init() {
 
 /// `kmalloc`: bloco alinhado a 16 bytes (VA da janela do heap) ou nulo.
 pub fn kmalloc(size: usize) -> *mut u8 {
-    unsafe { HEAP.lock().allocate(size) }
+    let chain = heap_census::capture();
+    unsafe { HEAP.lock().allocate(size, &chain) }
 }
 
 /// `kfree`.
@@ -303,6 +345,27 @@ pub fn ram_top() -> u64 {
     HEAP.lock().ram_top
 }
 
+/// O local do censo do bloco vivo `pointer` (um ponteiro devolvido por este
+/// heap com alinhamento de até 16 bytes).
+pub fn census_of(pointer: *const u8) -> Option<heap_census::Entry> {
+    let _heap = HEAP.lock();
+    // SAFETY: o cabeçalho fica logo antes do bloco vivo; lido com o lock.
+    let site = unsafe { (*(pointer.sub(HDR_SIZE) as *const Block)).site };
+    heap_census::entry(site)
+}
+
+/// O local `index` do censo, lido com o lock do heap.
+pub fn census_entry(index: u32) -> Option<heap_census::Entry> {
+    let _heap = HEAP.lock();
+    heap_census::entry(index)
+}
+
+/// O censo do heap na serial agora (os maiores locais vivos), com o motivo.
+pub fn print_census(reason: &str) {
+    let heap = HEAP.lock();
+    heap_census::print(reason, heap.used, heap.total, 60, 0x4000);
+}
+
 fn report_failure(requested: usize) {
     let heap = HEAP.lock();
     let (available, largest, coalescible) = unsafe { heap.free_info() };
@@ -310,6 +373,7 @@ fn report_failure(requested: usize) {
         "[kernel-heap-failure] requested={:#x} used={:#x} total={:#x} free={:#x} largest={:#x} coalescible={:#x}",
         requested, heap.used, heap.total, available, largest, coalescible
     ));
+    heap_census::print("falha do heap", heap.used, heap.total, 200, 0x4000);
 }
 
 /// Alocador global do Rust sobre o kmalloc. Alinhamentos maiores que 16
@@ -318,10 +382,11 @@ pub struct KernelAllocator;
 
 unsafe impl GlobalAlloc for KernelAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let chain = heap_census::capture();
         let pointer = if layout.align() <= 16 {
-            kmalloc(layout.size())
+            HEAP.lock().allocate(layout.size(), &chain)
         } else {
-            let raw = kmalloc(layout.size() + layout.align() + 16);
+            let raw = HEAP.lock().allocate(layout.size() + layout.align() + 16, &chain);
             if raw.is_null() {
                 null_mut()
             } else {

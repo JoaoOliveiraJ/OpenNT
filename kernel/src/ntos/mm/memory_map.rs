@@ -14,9 +14,10 @@
 //!   0x081000-0x081FFF    contagem de IRQs, ring do teclado, células de IRQL
 //!   0x082000-0x082FFF    IDT (carregada pela VA do mapa direto)
 //!   0x083000-0x08DFFF    tabelas da imagem do kernel e da pilha de boot
-//!   0x100000-0x107FFFF   frames da imagem do kernel (cap de build: 15,5MB)
-//!   0x1081000-0x11FFFFF  frames da pilha de boot
-//!   0x1200000-0x1FFFFFF  sem uso
+//!   0x100000-0x127FFFF   frames da imagem do kernel (cap de build: 17,5MB)
+//!   0x1281000-0x13FFFFF  frames da pilha de boot
+//!   0x1400000-0x15FFFFF  tabela do censo do heap do kernel
+//!   0x1600000-0x1FFFFFF  sem uso
 //!   0x2000000-0x5FFFFFF  frames do heap do kernel (kmalloc) e da arena de 16MB
 //!   0x6000000-0xFFFFFFF  primeira arena PFN (160MB)
 //!   0x20000000-0x2FFFFFFF segunda arena PFN (256MB)
@@ -409,3 +410,11 @@ const _: () = assert!(KERNEL_HEAP_PML4_INDEX != (KERNEL_POOL_BASE >> 39) & 511 &
 const _: () = assert!(KERNEL_HEAP_PHYS_BASE % LARGE_PAGE_SIZE == 0 && KERNEL_HEAP_PHYS_TOP % LARGE_PAGE_SIZE == 0);
 const _: () = assert!(KERNEL_HEAP_PHYS_TOP - KERNEL_HEAP_PHYS_BASE <= 0x4000_0000 && KERNEL_HEAP_PHYS_TOP <= PFN_RANGES[0].0);
 const _: () = assert!(KERNEL_HEAP_PDPT_PHYS == DIRECT_MAP_PD_PHYS + 4 * PAGE_SIZE && KERNEL_HEAP_PD_PHYS == KERNEL_HEAP_PDPT_PHYS + PAGE_SIZE && KERNEL_HEAP_PD_PHYS + PAGE_SIZE <= 0x8_1000);
+
+/// Tabela do censo do heap do kernel (`hal::heap_census`: bytes vivos por
+/// local de alocação): frames fixos entre a pilha de boot e o heap,
+/// alcançados só pelo mapa direto, fora do heap, do PFN e da imagem.
+pub const KERNEL_HEAP_CENSUS_PHYS: u64 = 0x140_0000;
+pub const KERNEL_HEAP_CENSUS_SIZE: u64 = 0x20_0000;
+
+const _: () = assert!(KERNEL_HEAP_CENSUS_PHYS >= BOOT_STACK_PHYS_TOP && KERNEL_HEAP_CENSUS_PHYS + KERNEL_HEAP_CENSUS_SIZE <= KERNEL_HEAP_PHYS_BASE && KERNEL_HEAP_CENSUS_PHYS % PAGE_SIZE == 0);

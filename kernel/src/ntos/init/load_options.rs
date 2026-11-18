@@ -40,6 +40,9 @@ pub const TRACE_DRIVER_API: &str = "TRACEDRIVERAPI";
 /// Cada mensagem ALPC das portas de servidor vai para a serial, com a
 /// interface e o opnum dos pedidos LRPC (`alpc/rpc_trace`).
 pub const TRACE_RPC: &str = "TRACERPC";
+/// O censo do heap do kernel (`hal::heap_census`) vai para a serial cada
+/// vez que o uso passa um múltiplo novo de 4 MB.
+pub const HEAP_CENSUS: &str = "HEAPCENSUS";
 /// O texto do console também vai para a serial.
 pub const CONSOLE_MIRROR: &str = "CONSOLEMIRROR";
 /// `smss`: o primeiro processo de usuário é o smss.exe real.

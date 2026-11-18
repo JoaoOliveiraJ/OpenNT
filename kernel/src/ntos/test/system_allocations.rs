@@ -11,7 +11,9 @@
 //! drivers reais carregados na janela de imagens de sistema. Confere também
 //! o próprio kernel: uma rotina, uma variável estática e a pilha corrente
 //! ficam na metade de sistema, e o ntoskrnl registrado começa na ImageBase
-//! em que ele foi ligado.
+//! em que ele foi ligado. E o censo do heap: um bloco conta no local de quem
+//! o pediu (a cadeia passa pela função que alocou) e sai dele ao ser
+//! liberado.
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -143,4 +145,26 @@ pub fn run(assert: Assert, call_export: CallExport) {
         call_export("IoFreeIrp", &[flush]);
     }
     guest::free_bytes(buffer);
+    heap_census(assert);
+}
+
+/// Aloca o bloco que o censo tem de atribuir a esta função.
+#[inline(never)]
+fn census_probe() -> Vec<u8> {
+    Vec::with_capacity(0x3000)
+}
+
+fn heap_census(assert: Assert) {
+    use crate::hal::heap_census::FOREIGN;
+    use crate::hal::kmalloc;
+    let probe = census_probe();
+    let start = census_probe as fn() -> Vec<u8> as usize as u64;
+    let entry = kmalloc::census_of(probe.as_ptr());
+    let inside = entry.is_some_and(|entry| entry.chain.iter().any(|&word| word != 0 && word != FOREIGN && (start..start + 0x400).contains(&(map::KERNEL_VIRTUAL_BASE + word as u64))));
+    assert(entry.is_some_and(|entry| entry.index != 0 && entry.bytes >= 0x3000 && entry.blocks >= 1) && inside, "heapcensus: o bloco conta no local de quem o alocou, com a cadeia passando pela funcao");
+    let before = entry.map_or(0, |entry| entry.bytes);
+    let index = entry.map_or(0, |entry| entry.index);
+    drop(probe);
+    let after = kmalloc::census_entry(index).map_or(u64::MAX, |entry| entry.bytes);
+    assert(after.saturating_add(0x3000) <= before, "heapcensus: o bloco liberado sai do local");
 }

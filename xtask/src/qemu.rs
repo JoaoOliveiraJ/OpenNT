@@ -1511,7 +1511,10 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
             println!("TEST-BOOT OK: {:?} encontrado (serial em {})", test.marker, log.display());
             Ok(())
         }
-        Err(error) => Err(format!("TEST-BOOT FALHOU: {error} (serial em {})", log.display())),
+        Err(error) => {
+            crate::heap_census::summarize_failure(log, &text);
+            Err(format!("TEST-BOOT FALHOU: {error} (serial em {})", log.display()))
+        }
     }
 }
 

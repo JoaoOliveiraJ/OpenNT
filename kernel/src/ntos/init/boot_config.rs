@@ -95,6 +95,12 @@ pub fn trace_rpc() -> bool {
     TRACE_RPC.load(Ordering::Relaxed)
 }
 
+/// `HEAPCENSUS` (`--heap-census`): o censo do heap do kernel
+/// (`hal::heap_census`) vai para a serial a cada 4 MB a mais de uso.
+pub fn heap_census() -> bool {
+    flag(name::HEAP_CENSUS)
+}
+
 /// `OPENNT_TRACE_SYSCALLS` no ambiente do build: imprime cada serviço de
 /// modo usuário despachado, com os argumentos e o resultado (diagnóstico).
 pub const TRACE_SYSCALLS: bool = option_env!("OPENNT_TRACE_SYSCALLS").is_some();
