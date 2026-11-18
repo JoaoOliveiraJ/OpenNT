@@ -37,6 +37,9 @@ pub const KERNEL_TEST_SCOPE: &str = "KERNELTESTSCOPE";
 pub const START_DRIVER: &str = "STARTDRIVER";
 /// Cada chamada de API dos drivers iniciados no boot vai para a serial.
 pub const TRACE_DRIVER_API: &str = "TRACEDRIVERAPI";
+/// Cada mensagem ALPC das portas de servidor vai para a serial, com a
+/// interface e o opnum dos pedidos LRPC (`alpc/rpc_trace`).
+pub const TRACE_RPC: &str = "TRACERPC";
 /// O texto do console também vai para a serial.
 pub const CONSOLE_MIRROR: &str = "CONSOLEMIRROR";
 /// `smss`: o primeiro processo de usuário é o smss.exe real.

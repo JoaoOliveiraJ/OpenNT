@@ -87,6 +87,7 @@ use crate::ntos::alpc::message::buffer::{self as message_buffer, Buffer};
 use crate::ntos::alpc::message::identity::Identity;
 use crate::ntos::alpc::message::view as message_view;
 use crate::ntos::alpc::port_reference;
+use crate::ntos::alpc::rpc_trace::{self, Direction, Record};
 use crate::ntos::alpc::small::context_attribute;
 use crate::ntos::alpc::transport::{self, Job, JobResult, Listener, Reply, Request, Sender, Service};
 use crate::ntos::inc::field::NtStruct;
@@ -475,10 +476,16 @@ impl UserServer {
             state.senders.insert(id, Origin { sender, client: port.pointer, waiting: true, message_type: LPC_CONNECTION_REQUEST, received: false });
             (id, next_sequence(&self.listener))
         };
+        if rpc_trace::enabled() {
+            rpc_trace::message(&Record { listener: self.listener.pointer, client_port: port.pointer, client: sender.process, server: self.listener.process_id(), message_type: LPC_CONNECTION_REQUEST, id, data, ..Record::default() });
+        }
         self.enqueue(Delivery { id, message_type: LPC_CONNECTION_REQUEST, data: Vec::from(data), sender, port_context: 0, view, sequence, ..Delivery::default() });
         let decision = pending.clone();
         let status = kernel_entry::wait_transport(&mut || decision.decision.lock().as_ref().map(|decision| decision.status), crate::ntos::ke::wait::Deadline::Infinite, 0, false);
         let decision = pending.decision.lock().take().unwrap_or(Decision { status, ..Decision::default() });
+        if rpc_trace::enabled() {
+            rpc_trace::connection_decided(self.listener.pointer, sender.process, self.listener.process_id(), id, decision.status);
+        }
         {
             let mut state = self.state.lock();
             state.connections.remove(&id);
@@ -544,9 +551,9 @@ impl Service for UserServer {
 
     /// LPC_REQUEST ou LPC_DATAGRAM na fila; a resposta conclui o job.
     fn exchange(&self, port: &Arc<Port>, data: &[u8], request: &Arc<Request>) -> Reply {
-        let (datagram, answer, synchronous, type_bits, mut sender) = {
+        let (datagram, answer, synchronous, type_bits, mut sender, sent_attributes) = {
             let state = request.state.lock();
-            (state.datagram, state.answer, state.synchronous, state.type_bits, state.sender)
+            (state.datagram, state.answer, state.synchronous, state.type_bits, state.sender, state.attributes)
         };
         // A thread que enviou (para a impersonação do cliente).
         if sender.thread_pointer == 0 {
@@ -574,6 +581,10 @@ impl Service for UserServer {
             state.senders.insert(id, Origin { sender, client: port.pointer, waiting: synchronous, message_type, received: false });
             (id, context, sequence, link_port)
         };
+        if rpc_trace::enabled() {
+            let carried = if attributes.security.is_some() { rpc_trace::CARRIED_SECURITY } else { 0 } | if data_view.is_some() { rpc_trace::CARRIED_VIEW } else { 0 } | if attributes.handles.is_some() { rpc_trace::CARRIED_HANDLES } else { 0 };
+            rpc_trace::message(&Record { listener: self.listener.pointer, client_port: port.pointer, client: sender.process, server: self.listener.process_id(), message_type, id, attributes: sent_attributes, carried, data, ..Record::default() });
+        }
         self.enqueue(Delivery { id, message_type, data: Vec::from(data), sender, port_context: context, data_view, sequence, attributes, link_port: Some(link_port), ..Delivery::default() });
         if datagram {
             return Reply::Now(JobResult::default());
@@ -595,6 +606,10 @@ impl Service for UserServer {
         fail_slots(&abandoned);
         COMMUNICATION.lock().remove(&link.server_port.pointer);
         let sender = Sender { process: port.process_id(), thread: port.thread_id(), thread_pointer: 0 };
+        if rpc_trace::enabled() {
+            rpc_trace::message(&Record { listener: self.listener.pointer, client_port: port.pointer, client: sender.process, server: self.listener.process_id(), message_type: LPC_PORT_CLOSED, id, ..Record::default() });
+            rpc_trace::client_closed(port.pointer);
+        }
         self.enqueue(Delivery { id, message_type: LPC_PORT_CLOSED, sender, port_context: link.context, sequence, ..Delivery::default() });
     }
 }
@@ -905,17 +920,20 @@ fn send_reply(server: &UserServer, port: &Arc<Port>, input: u64, attributes: u64
         Ok(captured) => captured,
         Err(status) => return status,
     };
-    let (slot, exposed, _received) = {
+    let (slot, exposed, _received, origin) = {
         let mut state = server.state.lock();
         let slot = state.requests.remove(&id);
-        let (exposed, received) = if slot.is_some() || state.abandoned.remove(&id) {
-            state.senders.remove(&id);
-            (state.exposed_views.remove(&id), state.received.remove(&id))
+        let (exposed, received, origin) = if slot.is_some() || state.abandoned.remove(&id) {
+            let origin = state.senders.remove(&id);
+            (state.exposed_views.remove(&id), state.received.remove(&id), origin)
         } else {
-            (None, None)
+            (None, None, None)
         };
-        (slot, exposed, received)
+        (slot, exposed, received, origin)
     };
+    if rpc_trace::enabled() {
+        trace_reply(server, slot.as_ref(), origin, id, attributes, release, view.is_some(), &captured.data);
+    }
     let Some(slot) = slot else { return STATUS_REPLY_MESSAGE_MISMATCH };
     // A resposta com UNMAP_EXISTING apaga a vista que o pedido trouxe ao
     // servidor (o AlpcpCaptureViewAttributeInternal com a vista da mensagem).
@@ -925,6 +943,31 @@ fn send_reply(server: &UserServer, port: &Arc<Port>, input: u64, attributes: u64
     slot.continuation.store(!release && !server.legacy(), core::sync::atomic::Ordering::Release);
     complete(server, &slot, id, captured.data, view);
     STATUS_SUCCESS
+}
+
+/// A linha do `--trace-rpc` da resposta do servidor ao pedido `id`: o Type
+/// que o cliente recebe (LPC_REQUEST com LPC_CONTINUATION_REQUIRED quando a
+/// resposta sai sem RELEASE_MESSAGE e ele pode respondê-la, como em
+/// `ps/user/alpc.rs`), o ValidAttributes do envio e, sem pedido pendente com
+/// esse id, a recusa STATUS_REPLY_MESSAGE_MISMATCH.
+#[allow(clippy::too_many_arguments)]
+fn trace_reply(server: &UserServer, slot: Option<&ReplySlot>, origin: Option<Origin>, id: u32, attributes: u64, release: bool, view: bool, data: &[u8]) {
+    let continuation = slot.is_some_and(|slot| slot.requeue.is_none()) && !release && !server.legacy();
+    let message_type = if continuation { LPC_REQUEST | LPC_CONTINUATION_REQUIRED } else { LPC_REPLY };
+    let sent_attributes = if attributes != 0 { state::user_struct::<AlpcMessageAttributes>(attributes).and_then(|header| header.valid_attributes.probe_get()).unwrap_or(0) } else { 0 };
+    rpc_trace::message(&Record {
+        listener: server.listener.pointer,
+        client_port: origin.map_or(0, |origin| origin.client),
+        client: origin.map_or(0, |origin| origin.sender.process),
+        server: server.listener.process_id(),
+        direction: Direction::ToClient,
+        message_type,
+        id,
+        attributes: sent_attributes,
+        carried: if view { rpc_trace::CARRIED_VIEW } else { 0 },
+        data,
+        status: slot.is_none().then_some(STATUS_REPLY_MESSAGE_MISMATCH),
+    });
 }
 
 /// Conclui a resposta ao pedido `id`: a continuação (ou a espera síncrona)
@@ -1053,6 +1096,9 @@ fn post_new(server: &Arc<UserServer>, port: &Arc<Port>, flags: u32, captured: me
     if crate::ntos::init::boot_config::TRACE_SYSCALLS {
         crate::debug_print!("[alpc] mensagem nova na propria porta de conexao: tipo {:#x} id {} pid {}", message_type, id, sender.process);
     }
+    if rpc_trace::enabled() {
+        rpc_trace::message(&Record { listener: server.listener.pointer, client: sender.process, server: server.listener.process_id(), message_type, id, data: &captured.data, ..Record::default() });
+    }
     server.enqueue(Delivery { id, message_type, data: captured.data, sender, port_context, sequence, ..Delivery::default() });
     Ok(Ok(if synchronous { Posted::Waiting { key: ReplyKey::Request(id), slot, port_context } } else { Posted::Sent }))
 }
@@ -1086,6 +1132,9 @@ fn post_to_client(server: &Arc<UserServer>, port: &Arc<Port>, sender: Sender, ca
         if !datagram {
             server.state.lock().callbacks.insert((client_pointer, identifier), slot.clone());
         }
+        if rpc_trace::enabled() {
+            rpc_trace::message(&Record { listener: server.listener.pointer, client_port: client_pointer, client: client.process_id(), server: sender.process, direction: Direction::ToClient, message_type, id: identifier, data: &captured.data, ..Record::default() });
+        }
     };
     let identifier = match crate::ntos::ps::user::alpc::post_server_message(&client, message_type, &captured.data, sender, register)? {
         Ok(identifier) => identifier,
@@ -1105,6 +1154,9 @@ pub fn reply_from_client(client: &Arc<Port>, id: u32, data: Vec<u8>) -> Option<u
     let service = client.with(|state| state.service.clone())?;
     let server = SERVERS.lock().values().find(|candidate| Arc::as_ptr(candidate).cast::<u8>() == Arc::as_ptr(&service).cast::<u8>()).cloned()?;
     let slot = server.state.lock().callbacks.remove(&(client.pointer, id))?;
+    if rpc_trace::enabled() {
+        rpc_trace::message(&Record { listener: server.listener.pointer, client_port: client.pointer, client: client.process_id(), server: server.listener.process_id(), message_type: LPC_REPLY, id, data: &data, ..Record::default() });
+    }
     complete(&server, &slot, id, data, None);
     Some(STATUS_SUCCESS)
 }
@@ -1405,6 +1457,9 @@ pub fn post_datagram(port: &Arc<Port>, message_type: u16, data: &[u8], sender: S
         };
         (UserServer::next_id(&mut state), context, sequence)
     };
+    if rpc_trace::enabled() {
+        rpc_trace::message(&Record { listener: server.listener.pointer, client_port: client.unwrap_or(0), client: sender.process, server: server.listener.process_id(), message_type, id, data, ..Record::default() });
+    }
     server.enqueue(Delivery { id, message_type, data: data.to_vec(), sender, port_context: context, sequence, ..Delivery::default() });
 }
 
@@ -1809,6 +1864,9 @@ fn create_listener(out: u64, attributes: u64, name: Option<String>, initial: Por
         if let Some(server) = SERVERS.lock().remove(&listener.pointer) {
             server.close();
         }
+        if rpc_trace::enabled() {
+            rpc_trace::port_closed(listener.pointer);
+        }
     }), creator_options(mode, object_flags)) {
         Ok(port) => port,
         Err(error) if error.status != 0 => return Ok(error.status),
@@ -1822,6 +1880,9 @@ fn create_listener(out: u64, attributes: u64, name: Option<String>, initial: Por
     }
     let server = Arc::new(UserServer { listener: port.clone(), endpoint: SpinLock::new(None), state: SpinLock::new(ServerState::default()) });
     SERVERS.lock().insert(port.pointer, server.clone());
+    if rpc_trace::enabled() {
+        rpc_trace::port_created(port.pointer, name.as_deref());
+    }
     let result = port.run(|| -> Result<u32, KernelError> {
         if let Some(parent_node) = parent_node.filter(|_| explicit == 0) {
             let Some(alpc_type) = crate::ntos::ob::object_types::user_type("alpc") else { return Err(KernelError::new("ALPC Port type missing")) };

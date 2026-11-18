@@ -92,6 +92,9 @@ pub struct RequestState {
     /// O envio responde, pelo MessageId, a uma resposta que o servidor
     /// mandou sem ALPC_MSGFLG_RELEASE_MESSAGE (`PortState::answerable`).
     pub answer: bool,
+    /// O ValidAttributes do ALPC_MESSAGE_ATTRIBUTES de envio (só o rastro do
+    /// `--trace-rpc` o lê).
+    pub attributes: u32,
 }
 
 /// Pedido entregue ao servidor: o job pertence ao servidor até concluir.

@@ -4,7 +4,7 @@
 //! loader, o boot segue sem opções (o boot comum, com o shell).
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use super::load_options::{self as name, BLOCK_SIZE, TEXT_MAX};
 use crate::ntos::mm::memory_map;
@@ -21,6 +21,9 @@ unsafe impl Sync for Text {}
 static TEXT: Text = Text(UnsafeCell::new([0; TEXT_MAX]));
 /// Tamanho do texto válido em [`TEXT`], publicado depois da cópia.
 static LENGTH: AtomicUsize = AtomicUsize::new(0);
+/// `TRACERPC`, decidido no [`capture`]: o ALPC consulta a opção a cada
+/// mensagem, e o boot sem ela paga só a leitura desta célula.
+static TRACE_RPC: AtomicBool = AtomicBool::new(false);
 
 /// Copia as opções do bloco que o setor de boot deixou em
 /// `BOOT_LOAD_OPTIONS_PHYS` (a memória baixa ainda é a do loader). Chamada
@@ -35,6 +38,7 @@ pub fn capture() {
     // única escrita (ver `Text`).
     unsafe { (&mut *TEXT.0.get())[..text.len()].copy_from_slice(text.as_bytes()) };
     LENGTH.store(text.len(), Ordering::Release);
+    TRACE_RPC.store(flag(name::TRACE_RPC), Ordering::Relaxed);
 }
 
 /// O texto das opções de carga deste boot (vazio sem o bloco).
@@ -82,6 +86,13 @@ pub fn start_driver() -> &'static str {
 /// driver de `--start-driver` enquanto ele inicia.
 pub fn trace_driver_api() -> bool {
     flag(name::TRACE_DRIVER_API)
+}
+
+/// `TRACERPC` (`--trace-rpc`): cada mensagem ALPC das portas de servidor vai
+/// para a serial, com a interface e o opnum dos pedidos LRPC e o status das
+/// respostas (`alpc/rpc_trace`).
+pub fn trace_rpc() -> bool {
+    TRACE_RPC.load(Ordering::Relaxed)
 }
 
 /// `OPENNT_TRACE_SYSCALLS` no ambiente do build: imprime cada serviço de

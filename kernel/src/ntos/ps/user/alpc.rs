@@ -995,7 +995,7 @@ fn send(port: &Arc<Port>, flags: u32, input: u64, send_attributes: u64, mode: u8
     // Os bits altos do Type que a mensagem conserva (AlpcpSendMessage): o
     // LPC_KERNELMODE_MESSAGE só de quem envia em KernelMode.
     let type_bits = u16::from_le_bytes([header[4], header[5]]) & if mode == 0 { 0xEF00 } else { 0x6F00 };
-    let request = Arc::new(Request { id: identity.identifier, identity: identity.clone(), state: SpinLock::new(RequestState { reserve: reserve.clone(), datagram, synchronous, legacy, legacy_synchronous, sender: current_sender(), answer, type_bits, ..RequestState::default() }) });
+    let request = Arc::new(Request { id: identity.identifier, identity: identity.clone(), state: SpinLock::new(RequestState { reserve: reserve.clone(), datagram, synchronous, legacy, legacy_synchronous, sender: current_sender(), answer, type_bits, attributes: valid, ..RequestState::default() }) });
     install_cancellation(port, &request);
     let mut stored = false;
     let mut deferred = false;

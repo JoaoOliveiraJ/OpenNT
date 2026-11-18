@@ -4182,6 +4182,24 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     solta o buffer e continua com a IOCP), e as classes 7, 8 e 10 respondem
     como sem lista registrada (sucesso, STATUS_INVALID_PARAMETER e
     STATUS_INVALID_PARAMETER); a classe 5 só confere o tamanho.
+- **O rastro do LRPC** (`alpc/rpc_trace/`, `--trace-rpc`, a opção de carga
+  TRACERPC): uma linha `[rpc]` na serial por mensagem que passa por uma
+  porta de servidor (`alpc/server.rs`: a conexão e a decisão sobre ela, os
+  envios do cliente, as respostas e as mensagens do servidor, o
+  LPC_PORT_CLOSED e os datagramas de kernel), com o nome da porta de
+  conexão, o pid do cliente e o do servidor, o Type, o MessageId, o
+  ValidAttributes do envio e quais atributos chegaram com conteúdo
+  (contexto de segurança, vista, handles). Nas portas do `\RPC Control` os
+  dados seguem o formato LRPC do rpcrt4 19041 (`rpc_trace/lrpc.rs`, com os
+  offsets lidos do LRPC_ADDRESS::ProcessIO, do
+  LRPC_BASE_CCALL::InitializeRequestAndAttributes, do
+  LRPC_SCALL::HandleRequest, do LRPC_CASSOCIATION::Bind e do
+  LRPC_BASE_CCALL::UnpackResponse): o bind mostra a interface e a versão e
+  guarda os contextos de apresentação da porta do cliente; o pedido mostra
+  a interface do contexto que leva e o opnum; a resposta, a falha (o código
+  de falha do RPC) e a resposta do bind mostram o pedido a que respondem,
+  pelo MessageId. O rastro só observa; sem a opção, cada ponto de envio só
+  lê a célula que o `boot_config::capture` preencheu.
 - **Os tokens de logon** (`se/token/create.rs`, `se/token/set_information.rs`):
   o NtCreateToken e o NtCreateTokenEx do LSA (SeCreateTokenPrivilege
   habilitado, TokenType, o nível pelo QoS num token de impersonação, a sessão
@@ -4561,7 +4579,7 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   `--build-dir`). Cada execução tem a pasta `build/test-all/<id>` (`<id>.<n>`
   com `--repeat`). As opções de boot dos testes (`--kernel-test-scope`,
   `--start-driver`, `--kd`, `--initial-process`, `--storage`, `--display`,
-  `--pnp-root`, `--usb`, `--tpm`, `--trace-driver-api`, `--console-mirror`) não entram no
+  `--pnp-root`, `--usb`, `--tpm`, `--trace-driver-api`, `--trace-rpc`, `--console-mirror`) não entram no
   build: vão no bloco de opções de carga da imagem de boot (abaixo), então
   a rodada inteira compila um kernel só. Uma thread monta as imagens
   (`test-boot --build-only`) uma vez por chave de imagem

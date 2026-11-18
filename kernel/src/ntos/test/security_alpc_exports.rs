@@ -1,7 +1,8 @@
 //! Autoteste dos exports de Se, Ob, Lsa e ALPC que eram os últimos imports de
 //! drivers reais: o SDDL dos SIDs e dos descritores, os níveis de assinatura
 //! em cache, as verificações de token do Rtl, o ZwOpenProcessToken, o
-//! LsaFreeReturnBuffer, o NtSetSecurityObject e o ALPC de modo kernel.
+//! LsaFreeReturnBuffer, o NtSetSecurityObject e o ALPC de modo kernel; e a
+//! decodificação das mensagens LRPC do rastro `--trace-rpc`.
 //!
 //! Os vetores do SDDL (descritores, strings de SID e o tamanho reservado que
 //! o conversor devolve) foram calculados executando as rotinas do ntoskrnl
@@ -516,6 +517,85 @@ fn alpc_kernel_new_messages(assert: Assert) {
     guest::free_bytes(block);
 }
 
+// ---- Rastro LRPC (--trace-rpc) ---------------------------------------------------
+
+/// O rastro do `--trace-rpc` decodifica as mensagens LRPC como o rpcrt4 19041
+/// as monta (`alpc/rpc_trace/lrpc.rs`): o bind da interface do SCM (svcctl,
+/// 367abb81-9844-35f1-ad32-98f038001003 v2.0) com os contextos 5 (NDR) e 6
+/// (NDR64), o pedido do opnum 15 com o contexto 5 e o UUID de objeto, a
+/// falha RPC_S_UNKNOWN_IF, a resposta e os tipos sem decodificação; e a linha
+/// do pedido mostra a interface do bind, e a da falha o pedido a que ela
+/// responde.
+fn lrpc_trace_decoding(assert: Assert) {
+    use crate::ntos::alpc::rpc_trace::{self, lrpc, Direction, Record};
+    let put32 = |data: &mut Vec<u8>, offset: usize, value: u32| data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    let svcctl = [0x81, 0xBB, 0x7A, 0x36, 0x44, 0x98, 0xF1, 0x35, 0xAD, 0x32, 0x98, 0xF0, 0x38, 0x00, 0x10, 0x03];
+    let object = [0x11u8; 16];
+    let mut bind = alloc::vec![0u8; 0x48];
+    put32(&mut bind, 0, 1);
+    bind[0x0C..0x1C].copy_from_slice(&svcctl);
+    bind[0x1C..0x1E].copy_from_slice(&2u16.to_le_bytes());
+    put32(&mut bind, 0x20, 3);
+    bind[0x24..0x26].copy_from_slice(&5u16.to_le_bytes());
+    bind[0x26..0x28].copy_from_slice(&6u16.to_le_bytes());
+    let mut request = alloc::vec![0u8; 0x48];
+    put32(&mut request, 0x08, lrpc::FLAG_OBJECT);
+    put32(&mut request, 0x0C, 0x21);
+    put32(&mut request, 0x10, 5);
+    put32(&mut request, 0x14, 15);
+    request[0x30..0x40].copy_from_slice(&object);
+    let mut fault = alloc::vec![0u8; 0x14];
+    put32(&mut fault, 0, 2);
+    put32(&mut fault, 0x08, 0x6B5);
+    let mut response = alloc::vec![0u8; 0x20];
+    put32(&mut response, 0, 3);
+    put32(&mut response, 0x0C, 0x21);
+    let mut callback = alloc::vec![0u8; 0x40];
+    put32(&mut callback, 0, 9);
+    let interface = lrpc::Interface { uuid: lrpc::Uuid(svcctl), major: 2, minor: 0 };
+    let decoded = (lrpc::decode(&bind), lrpc::decode(&request), lrpc::decode(&fault), lrpc::decode(&response), lrpc::decode(&callback));
+    assert(
+        decoded
+            == (
+                Some(lrpc::Message::Bind { interface, syntaxes: 3, contexts: [Some(5), Some(6), None], status: 0 }),
+                Some(lrpc::Message::Request { context: 5, opnum: 15, call: 0x21, flags: lrpc::FLAG_OBJECT, object: Some(lrpc::Uuid(object)) }),
+                Some(lrpc::Message::Fault { status: 0x6B5 }),
+                Some(lrpc::Message::Response { call: 0x21, flags: 0 }),
+                Some(lrpc::Message::Other(9)),
+            )
+            && alloc::format!("{}", interface) == "367abb81-9844-35f1-ad32-98f038001003 v2.0"
+            && lrpc::kind_name(9) == "callback",
+        "rpc-trace: bind, pedido, falha, resposta e callback do LRPC decodificados",
+    );
+    assert(
+        lrpc::decode(&request[..0x3F]).is_none() && lrpc::decode(&bind[..0x47]).is_none() && lrpc::decode(&[0u8; 7]).is_none(),
+        "rpc-trace: pedido e bind menores que o minimo do servidor nao sao decodificados",
+    );
+    // A conversa por uma porta do \RPC Control (ponteiros fora de qualquer
+    // porta real, soltos no fim).
+    let (listener, client_port) = (0xFFFF_DEAD_0000_1000u64, 0xFFFF_DEAD_0000_2000u64);
+    rpc_trace::port_created(listener, Some("\\RPC Control\\teste-rpc"));
+    let to_server = |id: u32, data: &[u8], attributes: u32| rpc_trace::line(&Record { listener, client_port, client: 0x30, server: 0x40, message_type: 0x2001, id, attributes, data, ..Record::default() });
+    let bound = to_server(7, &bind, 0x2000_0000);
+    let called = to_server(8, &request, 0xA200_0000);
+    let failed = rpc_trace::line(&Record { listener, client_port, client: 0x30, server: 0x40, direction: Direction::ToClient, message_type: 2, id: 8, data: &fault, ..Record::default() });
+    let again = rpc_trace::line(&Record { listener, client_port, client: 0x30, server: 0x40, direction: Direction::ToClient, message_type: 2, id: 8, data: &fault, ..Record::default() });
+    rpc_trace::client_closed(client_port);
+    let unbound = to_server(9, &request, 0);
+    rpc_trace::port_closed(listener);
+    let unnamed = to_server(10, &request, 0);
+    let message = alloc::format!("rpc-trace: linhas da conversa: {bound} | {called} | {failed} | {again} | {unbound} | {unnamed}");
+    assert(
+        bound == "[rpc] \\RPC Control\\teste-rpc pid 48 -> 64 LPC_REQUEST(0x2001) id 7 atrib 0x20000000 lrpc bind 367abb81-9844-35f1-ad32-98f038001003 v2.0 sintaxes 0x3 ctx 5,6"
+            && called == "[rpc] \\RPC Control\\teste-rpc pid 48 -> 64 LPC_REQUEST(0x2001) id 8 atrib 0xa2000000 lrpc pedido 367abb81-9844-35f1-ad32-98f038001003 v2.0 opnum 15 objeto 11111111-1111-1111-1111-111111111111"
+            && failed == "[rpc] \\RPC Control\\teste-rpc pid 48 <- 64 LPC_REPLY(0x2) id 8 atrib 0x0 lrpc falha 0x6b5 (367abb81-9844-35f1-ad32-98f038001003 v2.0 opnum 15)"
+            && again == "[rpc] \\RPC Control\\teste-rpc pid 48 <- 64 LPC_REPLY(0x2) id 8 atrib 0x0 lrpc falha 0x6b5"
+            && unbound.ends_with("id 9 atrib 0x0 lrpc pedido ctx 5 opnum 15 objeto 11111111-1111-1111-1111-111111111111")
+            && unnamed == "[rpc] (sem nome) pid 48 -> 64 LPC_REQUEST(0x2001) id 10 atrib 0x0",
+        &message,
+    );
+}
+
 pub fn run(assert: Assert) {
     sddl_sid_strings(assert);
     sddl_descriptor_strings(assert);
@@ -525,4 +605,5 @@ pub fn run(assert: Assert) {
     nt_set_security_object(assert);
     alpc_kernel_security(assert);
     alpc_kernel_new_messages(assert);
+    lrpc_trace_decoding(assert);
 }

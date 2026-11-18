@@ -5,7 +5,8 @@
 //! espera retomável, os tipos do transporte e o lado servidor das portas de
 //! modo usuário (`server`), com as portas LPC de modo usuário sobre ele
 //! (`lpc_ports`). O serviço de portas de usuário entra com `ps/user/alpc` e
-//! `ps/user/lpc`.
+//! `ps/user/lpc`. O `rpc_trace` é o rastro das mensagens dos servidores na
+//! serial (`--trace-rpc`).
 
 pub mod cancel_message;
 pub mod completion_association;
@@ -22,6 +23,7 @@ pub mod port_reference;
 pub mod port_sections;
 pub mod query_information;
 pub mod query_message;
+pub mod rpc_trace;
 pub mod section_views;
 pub mod security_contexts;
 pub mod server;
