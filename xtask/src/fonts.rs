@@ -88,6 +88,11 @@ pub fn system_keys(control_set: &str) -> Vec<HostKey> {
         for profile in registry::list(registry::LOCAL_MACHINE, &format!("{host}\\{profiles}")).into_iter().filter(|name| !name.eq_ignore_ascii_case("Current")) {
             registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\{profiles}\\{profile}"), &format!("{control_set}\\{profiles}\\{profile}"), true, &mut keys);
         }
+        // O HwProfileGuid é gerado na instalação e identifica a máquina (o
+        // GetCurrentHwProfile o devolve): fica de fora.
+        for key in keys.iter_mut() {
+            key.values.retain(|(name, _, _)| !name.eq_ignore_ascii_case("HwProfileGuid"));
+        }
     }
     #[cfg(not(windows))]
     let _ = control_set;

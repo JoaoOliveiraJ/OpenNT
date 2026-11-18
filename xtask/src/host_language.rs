@@ -157,6 +157,119 @@ pub(crate) mod registry {
     }
 }
 
+/// O formato regional padrão de uma localidade, como uma instalação nova o
+/// grava em `Control Panel\International` do perfil do sistema.
+#[cfg(windows)]
+pub(crate) mod region {
+    use super::HostKey;
+
+    /// LOCALE_NOUSEROVERRIDE: os dados da localidade, não os do usuário.
+    const LOCALE_NOUSEROVERRIDE: u32 = 0x8000_0000;
+    const REG_SZ: u32 = 1;
+    const REG_MULTI_SZ: u32 = 7;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetLocaleInfoEx(locale: *const u16, kind: u32, data: *mut u16, length: i32) -> i32;
+        fn LocaleNameToLCID(name: *const u16, flags: u32) -> u32;
+    }
+
+    /// Os valores de `International`, na ordem em que a instalação os grava,
+    /// com o LCTYPE de cada um.
+    const VALUES: &[(&str, u32)] = &[
+        ("s1159", 0x28),
+        ("s2359", 0x29),
+        ("sCurrency", 0x14),
+        ("sDate", 0x1D),
+        ("sDecimal", 0x0E),
+        ("sGrouping", 0x10),
+        ("sLanguage", 0x03),
+        ("sList", 0x0C),
+        ("sLongDate", 0x20),
+        ("sMonDecimalSep", 0x16),
+        ("sMonGrouping", 0x18),
+        ("sMonThousandSep", 0x17),
+        ("sNativeDigits", 0x13),
+        ("sNegativeSign", 0x51),
+        ("sPositiveSign", 0x50),
+        ("sShortDate", 0x1F),
+        ("sThousand", 0x0F),
+        ("sTime", 0x1E),
+        ("sTimeFormat", 0x1003),
+        ("sShortTime", 0x79),
+        ("sYearMonth", 0x1006),
+        ("iCalendarType", 0x1009),
+        ("iCountry", 0x05),
+        ("iCurrDigits", 0x19),
+        ("iCurrency", 0x1B),
+        ("iDate", 0x21),
+        ("iDigits", 0x11),
+        ("NumShape", 0x1014),
+        ("iFirstDayOfWeek", 0x100C),
+        ("iFirstWeekOfYear", 0x100D),
+        ("iLZero", 0x12),
+        ("iMeasure", 0x0D),
+        ("iNegCurr", 0x1C),
+        ("iNegNumber", 0x1010),
+        ("iPaperSize", 0x100A),
+        ("iTime", 0x23),
+        ("iTimePrefix", 0x1005),
+        ("iTLZero", 0x25),
+    ];
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain([0]).collect()
+    }
+
+    fn info(locale: &[u16], kind: u32) -> Option<String> {
+        let mut data = vec![0u16; 256];
+        // SAFETY: nome terminado em NUL e buffer com o comprimento passado.
+        let length = unsafe { GetLocaleInfoEx(locale.as_ptr(), kind | LOCALE_NOUSEROVERRIDE, data.as_mut_ptr(), data.len() as i32) };
+        (length > 0).then(|| String::from_utf16_lossy(&data[..length as usize - 1]))
+    }
+
+    fn text(value: &str) -> Vec<u8> {
+        value.encode_utf16().chain([0]).flat_map(|unit| unit.to_le_bytes()).collect()
+    }
+
+    /// `International` (Locale, LocaleName e os formatos), `Geo` (Nation e
+    /// Name do país da localidade) e `User Profile` (Languages só com o
+    /// idioma principal).
+    pub fn international_keys(locale_name: &str) -> Vec<HostKey> {
+        let locale = wide(locale_name);
+        // SAFETY: nome terminado em NUL.
+        let lcid = unsafe { LocaleNameToLCID(locale.as_ptr(), 0) };
+        let mut values = vec![(String::from("Locale"), REG_SZ, text(&format!("{lcid:08X}"))), (String::from("LocaleName"), REG_SZ, text(locale_name))];
+        for &(name, kind) in VALUES {
+            if let Some(value) = info(&locale, kind) {
+                values.push((String::from(name), REG_SZ, text(&value)));
+            }
+        }
+        let mut keys = vec![HostKey { path: String::from("Control Panel\\International"), values }];
+        // LOCALE_IGEOID e LOCALE_SISO3166CTRYNAME.
+        if let (Some(nation), Some(name)) = (info(&locale, 0x5B), info(&locale, 0x5A)) {
+            keys.push(HostKey { path: String::from("Control Panel\\International\\Geo"), values: vec![(String::from("Nation"), REG_SZ, text(&nation)), (String::from("Name"), REG_SZ, text(&name))] });
+        }
+        let languages: Vec<u8> = locale_name.encode_utf16().chain([0, 0]).flat_map(|unit| unit.to_le_bytes()).collect();
+        keys.push(HostKey { path: String::from("Control Panel\\International\\User Profile"), values: vec![(String::from("Languages"), REG_MULTI_SZ, languages)] });
+        keys
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn portuguese_brazil_defaults() {
+            let keys = super::international_keys("pt-BR");
+            let value = |name: &str| keys[0].values.iter().find(|(key, _, _)| key == name).map(|(_, _, data)| String::from_utf16_lossy(&data.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).take_while(|&unit| unit != 0).collect::<Vec<u16>>()));
+            assert_eq!(value("Locale").as_deref(), Some("00000416"));
+            assert_eq!(value("sShortDate").as_deref(), Some("dd/MM/yyyy"));
+            assert_eq!(value("iCountry").as_deref(), Some("55"));
+            assert_eq!(value("sLanguage").as_deref(), Some("PTB"));
+            assert!(keys.iter().any(|key| key.path.ends_with("Geo")));
+        }
+    }
+}
+
 /// As chaves de idioma da SYSTEM, já no conjunto de controle que a hive
 /// guarda (`control_set`, como `ControlSet001`).
 pub fn system_keys(control_set: &str) -> Vec<HostKey> {
@@ -179,7 +292,17 @@ pub fn default_keys() -> Vec<HostKey> {
     let mut keys = Vec::new();
     #[cfg(windows)]
     {
-        registry::copy(registry::USERS, ".DEFAULT\\Control Panel\\International", "Control Panel\\International", true, &mut keys);
+        // O formato regional de uma instalação nova no idioma desta máquina:
+        // os valores padrão da localidade (o GetLocaleInfoEx com
+        // LOCALE_NOUSEROVERRIDE), o país dela em Geo e só o idioma principal
+        // em User Profile, sem as personalizações daqui.
+        let international = ".DEFAULT\\Control Panel\\International";
+        let locale_name = registry::named_strings(registry::USERS, international).into_iter().find(|(name, _)| name.eq_ignore_ascii_case("LocaleName")).map(|(_, value)| value);
+        if let Some(locale_name) = locale_name {
+            keys.extend(region::international_keys(&locale_name));
+            let profile = format!("{international}\\User Profile\\{locale_name}");
+            registry::copy(registry::USERS, &profile, &format!("Control Panel\\International\\User Profile\\{locale_name}"), false, &mut keys);
+        }
         registry::copy(registry::USERS, ".DEFAULT\\Control Panel\\Desktop\\MuiCached", "Control Panel\\Desktop\\MuiCached", false, &mut keys);
         registry::copy(registry::USERS, ".DEFAULT\\Keyboard Layout", "Keyboard Layout", true, &mut keys);
         // As teclas de atalho dos editores de entrada (`Hot Keys`), que o
