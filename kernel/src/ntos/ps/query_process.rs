@@ -5,8 +5,9 @@
 //! ProcessBasicInformation (0), na forma de 0x30 bytes ou na estendida de
 //! 0x40 (com Size e Flags), é lido do EPROCESS do handle; ProcessDebugFlags
 //! (31) é o PROCESS_DEBUG_INHERIT do NoDebugInherit, com o handle
-//! referenciado com PROCESS_QUERY_INFORMATION. As demais classes devolvem
-//! STATUS_INVALID_PARAMETER.
+//! referenciado com PROCESS_QUERY_INFORMATION; ProcessBreakOnTermination
+//! (29) é o Flags.BreakOnTermination do processo crítico. As demais classes
+//! devolvem STATUS_INVALID_PARAMETER.
 
 use super::{image_information, process};
 use crate::ntos::inc::field::{Field, NtStruct};
@@ -111,14 +112,61 @@ fn query_debug_flags(handle: u64, output: u64, length: u32, returned: u64) -> Re
     Ok(0)
 }
 
+/// PROCESSINFOCLASS ProcessBreakOnTermination.
+pub const PROCESS_BREAK_ON_TERMINATION: u32 = 29;
+
+/// ProcessBreakOnTermination (29) do NtQueryInformationProcess 19041 (rva
+/// 0x6228e6), com o buffer e o ReturnLength já sondados em UserMode: um
+/// ULONG (outro tamanho dá STATUS_INFO_LENGTH_MISMATCH), o handle com
+/// PROCESS_QUERY_LIMITED_INFORMATION, 1 com EPROCESS.Flags.BreakOnTermination
+/// e 0 sem, e ReturnLength 4. O RtlSetProcessIsCritical da ntdll lê assim o
+/// valor antigo.
+pub fn query_break_on_termination(output: u64, length: u32, returned: u64, process_of: impl FnOnce(u32) -> Result<u64, u32>) -> Result<u32, KernelError> {
+    if length != 4 {
+        return Ok(STATUS_INFO_LENGTH_MISMATCH);
+    }
+    let process = match process_of(PROCESS_QUERY_LIMITED_INFORMATION) {
+        Ok(process) => process,
+        Err(status) => return Ok(status),
+    };
+    // SAFETY: EPROCESS retido pelo handle que o nomeou (ou o corrente).
+    let critical = unsafe { Eprocess::at(process) }.break_on_termination();
+    guest::try_write::<u32>(output, critical)?;
+    if returned != 0 {
+        guest::try_write::<u32>(returned, 4)?;
+    }
+    Ok(0)
+}
+
 /// ZwQueryInformationProcess: ProcessImageInformation (37),
-/// ProcessDebugFlags (31) e ProcessBasicInformation (0). Devolve o NTSTATUS.
+/// ProcessDebugFlags (31), ProcessBreakOnTermination (29) e
+/// ProcessBasicInformation (0). Devolve o NTSTATUS.
 pub fn query_information(handle: u64, class: u32, output: u64, length: u32, returned: u64) -> Result<u32, KernelError> {
     if class == 37 {
         return image_information::query(handle, output, length, returned, 0, None);
     }
     if class == 31 {
         return query_debug_flags(handle, output, length, returned);
+    }
+    if class == PROCESS_BREAK_ON_TERMINATION {
+        let mut referenced = 0u64;
+        let mut failure: Result<(), KernelError> = Ok(());
+        let status = query_break_on_termination(output, length, returned, |access| match reference_process(handle, access) {
+            Ok(Ok(process)) => {
+                referenced = process;
+                Ok(process)
+            }
+            Ok(Err(status)) => Err(status),
+            Err(error) => {
+                failure = Err(error);
+                Err(STATUS_INSUFFICIENT_RESOURCES)
+            }
+        });
+        if referenced != 0 {
+            release_process(referenced)?;
+        }
+        failure?;
+        return status;
     }
     if class != 0 {
         return Ok(0xC000_000D);
@@ -281,7 +329,7 @@ pub fn nt_query_information(handle: u64, class: u32, output: u64, length: u32, r
         }
         // As classes atendidas referenciam o handle: um handle de kernel
         // (bit 63, fora os pseudo-handles) não vale em UserMode.
-        if matches!(class, 0 | 31 | 37) && (handle as i64) < -8 {
+        if matches!(class, 0 | 29 | 31 | 37) && (handle as i64) < -8 {
             return Ok(STATUS_INVALID_HANDLE);
         }
     }

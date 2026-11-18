@@ -196,13 +196,35 @@ fn process_classes(assert: Assert, block: u64, call: Call) {
         }
         state::with_syscall_record(state::SyscallRecord::raw(raw), || call("NtSetInformationThread", arguments[0], arguments[1], arguments[2], arguments[3]))
     };
+    // A consulta da mesma classe (o valor antigo do RtlSetThreadIsCritical):
+    // ULONG, ReturnLength 4 (o quinto argumento, na pilha de usuário).
+    let (thread_output, thread_returned) = (block + 0x1A0, block + 0x1A8);
+    let query_thread = |length: u64| {
+        guest::write32(thread_output, 0xFFFF_FFFF);
+        guest::write32(thread_returned, 0);
+        guest::write64(rsp + 0x28, thread_returned);
+        let arguments = [(-2i64) as u64, 18, thread_output, length];
+        for (index, argument) in arguments.into_iter().enumerate() {
+            guest::write64(raw + (index as u64 + 1) * 8, argument);
+        }
+        let status = state::with_syscall_record(state::SyscallRecord::raw(raw), || call("NtQueryInformationThread", arguments[0], arguments[1], arguments[2], arguments[3]));
+        (status, guest::read32(thread_output), guest::read32(thread_returned))
+    };
     let length = set_thread(1, 8);
     let critical = set_thread(1, 4);
     let marked = ethread.break_on_termination() == 1;
+    let queried = query_thread(4);
     let normal = set_thread(0, 4);
     let held = crate::ntos::se::privilege::single_privilege_check(20, 1);
     let expected = if held { critical == 0 && marked && normal == 0 } else { critical == STATUS_PRIVILEGE_NOT_HELD && !marked };
     assert(length == STATUS_INFO_LENGTH_MISMATCH && expected && ethread.break_on_termination() == 0, "userboot: ThreadBreakOnTermination liga e desliga a thread critica com SeDebugPrivilege");
+    assert(queried == (0, marked as u32, 4) && query_thread(4) == (0, 0, 4) && query_thread(8).0 == STATUS_INFO_LENGTH_MISMATCH, "userboot: NtQueryInformationThread(ThreadBreakOnTermination) devolve a marca da thread");
+    // ProcessBreakOnTermination: a consulta devolve a marca do processo
+    // (o processo de teste não é crítico).
+    let critical_process = query(29, 4);
+    let process_value = guest::read32(output);
+    let process_returned = guest::read32(returned);
+    assert(critical_process == 0 && process_value == eprocess.break_on_termination() && process_returned == 4 && query(29, 8) == STATUS_INFO_LENGTH_MISMATCH, "userboot: NtQueryInformationProcess(ProcessBreakOnTermination) devolve a marca do processo");
 }
 
 fn system_classes(assert: Assert, block: u64, call: Call) {

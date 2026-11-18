@@ -1,10 +1,11 @@
 //! Zw/NtQueryInformationThread.
 //!
 //! Contrato ThreadPagePriority medido nos bytes originais e em chamadas do
-//! Windows; a ThreadIoPriority segue o mesmo caminho; ThreadCycleTime e
-//! ThreadNameInformation têm ramos próprios. `access_mode` separa Nt (chamador usuário) de Zw (parâmetros de
-//! kernel). A variante de syscall de usuário (`query_user`) entra com o
-//! estado de modo usuário (fase 7).
+//! Windows; a ThreadIoPriority e a ThreadBreakOnTermination (a thread
+//! crítica) seguem o mesmo caminho; ThreadCycleTime e ThreadNameInformation
+//! têm ramos próprios. `access_mode` separa Nt (chamador usuário) de Zw
+//! (parâmetros de kernel). A variante de syscall de usuário (`query_user`)
+//! entra com o estado de modo usuário (fase 7).
 
 use super::user_probe;
 use crate::ntos::ke::irql;
@@ -24,7 +25,10 @@ const THREAD_IO_PRIORITY: u32 = 22;
 /// ThreadCycleTime e ThreadNameInformation.
 const THREAD_CYCLE_TIME: u32 = 23;
 const THREAD_NAME_INFORMATION: u32 = 38;
+/// ThreadBreakOnTermination.
+pub const THREAD_BREAK_ON_TERMINATION: u32 = 18;
 const THREAD_QUERY_LIMITED_INFORMATION: u32 = 0x800;
+const THREAD_QUERY_INFORMATION: u32 = 0x40;
 const PAGE_PRIORITY_SIZE: u64 = 4;
 /// MmUserProbeAddress.
 pub(crate) const USER_PROBE_LIMIT: u64 = crate::ntos::mm::memory_map::USER_PROBE_ADDRESS;
@@ -91,25 +95,33 @@ pub fn query(thread_handle: u64, information_class: u32, output: u64, output_len
         return query_name(thread_handle, output, output_length, returned_length, access_mode);
     }
     // Classes válidas ainda sem provedor falham explicitamente.
-    if information_class != THREAD_PAGE_PRIORITY && information_class != THREAD_IO_PRIORITY {
+    if information_class != THREAD_PAGE_PRIORITY && information_class != THREAD_IO_PRIORITY && information_class != THREAD_BREAK_ON_TERMINATION {
         return Ok(0xC000_0002);
     }
     if output_length as u64 != PAGE_PRIORITY_SIZE {
         return Ok(0xC000_0004);
     }
-    let mut reference = match thread_handles::reference(thread_handle, THREAD_QUERY_LIMITED_INFORMATION, access_mode)? {
+    // ThreadBreakOnTermination (ntoskrnl 19041, rva 0x7f0c77; o
+    // RtlSetThreadIsCritical lê assim o valor antigo): o mesmo ULONG, com
+    // THREAD_QUERY_INFORMATION, 1 com CrossThreadFlags.BreakOnTermination.
+    let access = if information_class == THREAD_BREAK_ON_TERMINATION { THREAD_QUERY_INFORMATION } else { THREAD_QUERY_LIMITED_INFORMATION };
+    let mut reference = match thread_handles::reference(thread_handle, access, access_mode)? {
         Ok(reference) => reference,
         Err(status) => return Ok(status),
     };
     let result = (|| {
         // SAFETY: ETHREAD referenciado pelo handle.
-        let thread = unsafe { Ethread::at(reference.pointer) };
-        let page_priority = if information_class == THREAD_IO_PRIORITY { thread.thread_io_priority() } else { thread.thread_page_priority() };
+        let ethread = unsafe { Ethread::at(reference.pointer) };
+        let value = match information_class {
+            THREAD_BREAK_ON_TERMINATION => ethread.break_on_termination(),
+            THREAD_IO_PRIORITY => ethread.thread_io_priority(),
+            _ => ethread.thread_page_priority(),
+        };
         // A escrita vem depois da referência; erros anteriores preservam os buffers.
         if !can_write_priority_output(output, from_user_mode) {
             return STATUS_ACCESS_VIOLATION;
         }
-        if guest::try_write::<u32>(output, page_priority).is_err() {
+        if guest::try_write::<u32>(output, value).is_err() {
             return STATUS_ACCESS_VIOLATION;
         }
         if returned_length != 0 {

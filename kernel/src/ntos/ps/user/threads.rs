@@ -2144,7 +2144,7 @@ pub fn owner_process_id(thread: &UserThread) -> u64 {
     }
 }
 
-/// A classe 24 tem validação nativa própria sobre a mesma ETHREAD.
+/// As classes 24 e 18 têm validação nativa própria sobre a mesma ETHREAD.
 fn requested_class(class: u64) -> u32 {
     let raw = state::service_raw_arguments();
     if raw != 0 {
@@ -2155,9 +2155,9 @@ fn requested_class(class: u64) -> u32 {
 }
 
 fn nt_query_information_thread(handle: u64, class: u64, out: u64, length: u64, rsp: u64) -> Result<u32, KernelError> {
-    // ThreadIoPriority, ThreadCycleTime, ThreadPagePriority e
-    // ThreadNameInformation (`ps/query_thread`).
-    if matches!(requested_class(class), 22 | 23 | 24 | 38) {
+    // ThreadBreakOnTermination, ThreadIoPriority, ThreadCycleTime,
+    // ThreadPagePriority e ThreadNameInformation (`ps/query_thread`).
+    if matches!(requested_class(class), query_thread::THREAD_BREAK_ON_TERMINATION | 22 | 23 | 24 | 38) {
         return query_thread::query_user(rsp);
     }
     let thread = match resolve(handle, 0x40) {

@@ -660,24 +660,28 @@ fn nt_query_information_process(handle: u64, class: u64, buffer: u64, length: u6
         }
         return Ok(0xC000_0005);
     }
-    // ProcessDefaultHardErrorMode e ProcessHandleCheckingMode
-    // (`ps/query_process`): o ProbeForWrite com alinhamento 4 e a sonda do
-    // ReturnLength antes da classe.
-    if matches!(class, 12 | 54) {
+    // ProcessDefaultHardErrorMode, ProcessHandleCheckingMode e
+    // ProcessBreakOnTermination (`ps/query_process`): o ProbeForWrite com
+    // alinhamento 4 e a sonda do ReturnLength antes da classe.
+    if matches!(class, 12 | 29 | 54) {
         if length != 0 && buffer & 3 != 0 {
             return Ok(0x8000_0002);
         }
         if (length != 0 && !probe_user_write(buffer, length)) || (returned != 0 && !probe_user_write(returned, 4)) {
             return Ok(0xC000_0005);
         }
+        let process_of = |access: u32| {
+            if handle as u32 == u32::MAX {
+                Ok(crate::ntos::ps::process::get_current_process())
+            } else {
+                super::handles::process_pointer(handle, access)
+            }
+        };
         return state::guarded(|| {
-            crate::ntos::ps::query_process::query_mode(class, buffer, length as u32, returned, |access| {
-                if handle as u32 == u32::MAX {
-                    Ok(crate::ntos::ps::process::get_current_process())
-                } else {
-                    super::handles::process_pointer(handle, access)
-                }
-            })
+            if class == crate::ntos::ps::query_process::PROCESS_BREAK_ON_TERMINATION {
+                return crate::ntos::ps::query_process::query_break_on_termination(buffer, length as u32, returned, process_of);
+            }
+            crate::ntos::ps::query_process::query_mode(class, buffer, length as u32, returned, process_of)
         });
     }
     // ProcessQuotaLimits, ProcessVmCounters, ProcessTimes,
