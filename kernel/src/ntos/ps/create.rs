@@ -435,6 +435,12 @@ impl FileSource for VolumeSource {
     }
 }
 
+/// As duas fontes de um arquivo do volume: a de streaming do carregador de
+/// PE (cópia direta para os frames) e a das notificações de imagem.
+pub fn volume_image_sources(name: String, file: Arc<VolumeFile>) -> (Arc<dyn ImageSource>, Arc<dyn FileSource>) {
+    (Arc::new(VolumeImage { name: name.clone(), file: file.clone() }), Arc::new(VolumeSource { name, file }))
+}
+
 /// O mesmo arquivo como fonte de streaming do carregador de PE.
 struct VolumeImage {
     name: String,

@@ -1,6 +1,8 @@
 //! Sistema de arquivos em memória com namespace plano.
 //! Guarda texto ou binário
-//! (por exemplo, um .exe).
+//! (por exemplo, um .exe). Os arquivos embutidos na imagem do kernel
+//! (`hal::bundle`) entram por referência, sem cópia no heap, até a primeira
+//! escrita.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -40,7 +42,36 @@ impl FileData {
     }
 }
 
-static FILES: SpinLock<BTreeMap<String, FileData>> = SpinLock::new(BTreeMap::new());
+/// O conteúdo guardado: dados no heap ou os bytes de um arquivo embutido.
+enum Stored {
+    Data(FileData),
+    Embedded(&'static [u8]),
+}
+
+impl Stored {
+    fn len(&self) -> usize {
+        match self {
+            Stored::Data(data) => data.len(),
+            Stored::Embedded(bytes) => bytes.len(),
+        }
+    }
+
+    fn data(&self) -> FileData {
+        match self {
+            Stored::Data(data) => data.clone(),
+            Stored::Embedded(bytes) => FileData::Binary(bytes.to_vec()),
+        }
+    }
+
+    fn to_bytes(&self) -> Vec<u8> {
+        match self {
+            Stored::Data(data) => data.to_bytes(),
+            Stored::Embedded(bytes) => bytes.to_vec(),
+        }
+    }
+}
+
+static FILES: SpinLock<BTreeMap<String, Stored>> = SpinLock::new(BTreeMap::new());
 static CREATION_TIME: AtomicU64 = AtomicU64::new(0);
 
 /// Registra o instante de criação do volume (o relógio de parede na
@@ -114,12 +145,18 @@ pub fn space() -> Space {
 }
 
 pub fn write(path: &str, data: &str) -> Result<bool, KernelError> {
-    FILES.lock().insert(norm(path)?, FileData::Text(String::from(data)));
+    FILES.lock().insert(norm(path)?, Stored::Data(FileData::Text(String::from(data))));
     Ok(true)
 }
 
 pub fn write_bytes(path: &str, bytes: Vec<u8>) -> Result<bool, KernelError> {
-    FILES.lock().insert(norm(path)?, FileData::Binary(bytes));
+    FILES.lock().insert(norm(path)?, Stored::Data(FileData::Binary(bytes)));
+    Ok(true)
+}
+
+/// Um arquivo binário embutido na imagem do kernel, por referência.
+pub fn write_embedded(path: &str, bytes: &'static [u8]) -> Result<bool, KernelError> {
+    FILES.lock().insert(norm(path)?, Stored::Embedded(bytes));
     Ok(true)
 }
 
@@ -133,7 +170,7 @@ pub fn resize(path: &str, size: usize) -> Result<bool, KernelError> {
     let mut next = vec![0u8; size];
     let keep = size.min(old.len());
     next[..keep].copy_from_slice(&old[..keep]);
-    files.insert(path, FileData::Binary(next));
+    files.insert(path, Stored::Data(FileData::Binary(next)));
     Ok(true)
 }
 
@@ -154,24 +191,27 @@ pub fn write_at(path: &str, offset: usize, bytes: &[u8]) -> Result<usize, Kernel
         next.resize(end, 0);
     }
     next[offset..end].copy_from_slice(bytes);
-    files.insert(path, FileData::Binary(next));
+    files.insert(path, Stored::Data(FileData::Binary(next)));
     Ok(bytes.len())
 }
 
 pub fn read(path: &str) -> Option<FileData> {
     let path = norm(path).ok()?;
-    FILES.lock().get(&path).cloned()
+    FILES.lock().get(&path).map(Stored::data)
 }
 
 pub fn read_bytes(path: &str) -> Option<Vec<u8>> {
-    match read(path)? {
-        FileData::Binary(bytes) => Some(bytes),
-        FileData::Text(_) => None,
+    let path = norm(path).ok()?;
+    match FILES.lock().get(&path)? {
+        Stored::Data(FileData::Binary(bytes)) => Some(bytes.clone()),
+        Stored::Embedded(bytes) => Some(bytes.to_vec()),
+        Stored::Data(FileData::Text(_)) => None,
     }
 }
 
 pub fn is_binary(path: &str) -> bool {
-    matches!(read(path), Some(FileData::Binary(_)))
+    let Ok(path) = norm(path) else { return false };
+    matches!(FILES.lock().get(&path), Some(Stored::Data(FileData::Binary(_)) | Stored::Embedded(_)))
 }
 
 pub fn exists(path: &str) -> bool {
@@ -195,7 +235,8 @@ pub fn list() -> Vec<String> {
 
 /// Tamanho em bytes, ou `None` se o arquivo não existe.
 pub fn size(path: &str) -> Option<usize> {
-    read(path).map(|data| data.len())
+    let path = norm(path).ok()?;
+    FILES.lock().get(&path).map(Stored::len)
 }
 
 /// O MemoryFileSystem como volume montável (`object_manager::mount` em `\FS`).

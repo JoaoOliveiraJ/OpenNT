@@ -99,7 +99,7 @@ pub fn init() {
         let Some(data) = bundle::read(name) else { continue };
         let binary = [".exe", ".sys", ".dll"].iter().any(|extension| name.ends_with(extension));
         let stored = if binary {
-            memory_file_system::write_bytes(&destination, data.to_vec())
+            memory_file_system::write_embedded(&destination, data)
         } else {
             memory_file_system::write(&destination, &latin1_to_string(data))
         };

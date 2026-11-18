@@ -44,7 +44,7 @@ use crate::ntos::inc::types::{ImageDosHeader, ImageImportByName, ImageImportDesc
 /// Índice do diretório de imports no DataDirectory do cabeçalho opcional.
 const IMAGE_DIRECTORY_ENTRY_IMPORT: usize = 1;
 use crate::ntos::ob::objects::file::FileSource;
-use crate::ntos::mm::sysload::kernel_image_source::ImageSource;
+use crate::ntos::mm::sysload::kernel_image_source::{ImageSource, MemorySource};
 use crate::ntos::rtl::image::pe_exports::Exports;
 use crate::ntos::mm::pe_loader::{self, ImportSymbol, LoadOptions, PeImage, ResolvedImport};
 use crate::ntos::mm::sysload::pe_resolver::{self, ExportedModule, Symbol};
@@ -246,6 +246,13 @@ pub fn ensure_ntdll() -> Result<(), KernelError> {
     if state::with(|state| state.ntdll_exports.is_some()) {
         return Ok(());
     }
+    // A real do volume vai do disco direto para os frames da imagem, e as
+    // notificações a leem do arquivo: nenhuma cópia dela fica no heap.
+    if let Some(file) = volume_files::lookup_volume_file("\\SystemRoot\\System32\\ntdll.dll").filter(|file| !file.directory()) {
+        let name = ntfs::nt_path(&file.volume_path());
+        let (image, notification) = crate::ntos::ps::create::volume_image_sources(name, file);
+        return in_system(|| map_system_ntdll(image, notification, "real (NTFS)"));
+    }
     let (bytes, origin) = read_ntdll_input()?;
     map_ntdll(bytes, origin)
 }
@@ -269,12 +276,15 @@ fn ntdll_resolver(_dll: &str, symbol: &ImportSymbol) -> Option<ResolvedImport> {
 /// Mapeia a ntdll na raiz do System (anexado a ele) e a fotografa para as
 /// cópias de cada processo.
 pub fn map_ntdll(bytes: Vec<u8>, origin: &str) -> Result<(), KernelError> {
-    in_system(|| map_system_ntdll(bytes, origin))
+    let source_name = if origin == "real (NTFS)" { crate::drivers::fs::ntfs::nt_path("/NTDLL.DLL") } else { String::from("\\BootBundle\\apps\\ntdll.dll") };
+    let image: Arc<dyn ImageSource> = Arc::new(MemorySource { name: source_name.clone(), bytes: bytes.clone() });
+    let notification: Arc<dyn FileSource> = Arc::new(BytesSource { name: source_name, bytes: Arc::new(bytes) });
+    in_system(|| map_system_ntdll(image, notification, origin))
 }
 
-fn map_system_ntdll(bytes: Vec<u8>, origin: &str) -> Result<(), KernelError> {
-    let source_name = if origin == "real (NTFS)" { crate::drivers::fs::ntfs::nt_path("/NTDLL.DLL") } else { String::from("\\BootBundle\\apps\\ntdll.dll") };
-    let image = pe_loader::load_user(bytes.clone(), &LoadOptions { notify_image: false, ..LoadOptions::default() })?;
+fn map_system_ntdll(source: Arc<dyn ImageSource>, notification: Arc<dyn FileSource>, origin: &str) -> Result<(), KernelError> {
+    let source_name = String::from(notification.name());
+    let image = pe_loader::load_from_source(source, &LoadOptions { user_space: true, notify_image: false, ..LoadOptions::default() })?;
     record_template("ntdll", image.image_base, image.size_of_image)?;
     let exports = image.exports.exports.clone();
     state::with(|state| {
@@ -295,7 +305,7 @@ fn map_system_ntdll(bytes: Vec<u8>, origin: &str) -> Result<(), KernelError> {
         entry_point: image.entry_point,
         exports: image.exports.clone(),
         is_exe: false,
-        notification_source: Some(Arc::new(BytesSource { name: source_name, bytes: Arc::new(bytes) })),
+        notification_source: Some(notification),
     });
     *NTDLL_MODULE.lock() = Some(module);
     system_services::register(&syscall_scan::scan_syscall_stubs(&exports))?;
