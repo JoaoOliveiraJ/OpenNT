@@ -3586,7 +3586,9 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   NtQueryDirectoryObject que o smss importa (`ob/handles/namespace.rs`,
   com as sondas de modo usuário, DIRECTORY_QUERY e as respostas do 19041
   para o fim da lista e a entrada que não cabe), o
-  NtIsUILanguageComitted do csrss (`ps/locale.rs`), as classes
+  NtIsUILanguageComitted do csrss (`ps/locale.rs`; ele só passa a dar
+  STATUS_SUCCESS depois do NtFlushInstallUILanguage com SetComittedFlag,
+  que o winlogon faz depois de subir o dwm, com SeTcbPrivilege), as classes
   ProcessDefaultHardErrorMode e ProcessHandleCheckingMode do
   NtSet/NtQueryInformationProcess (`ps/set_process_information.rs`,
   `ps/query_process.rs`, com o ProbeForRead do alinhamento de cada classe),
