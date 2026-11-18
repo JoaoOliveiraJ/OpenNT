@@ -1756,6 +1756,8 @@ fn user_threads_in(assert: Assert, test: &TestProcess) {
     assert(removed == 0 && guest::read64(info) == 0xABCD && guest::read64(info + 8) == 0x1234 && unsafe { nt::IoStatusBlock::at(info + 16) }.status.get() == 0x55 && unsafe { nt::IoStatusBlock::at(info + 16) }.information.get() == 0x10 && port.as_ref().is_some_and(|port| port.with(|state| state.active.contains(&pointer) && state.associated.contains(&pointer) && state.waiters.is_empty())), "userthreads: NtRemoveIoCompletion entrega o pacote e ativa a thread");
     let blocked = call("NtRemoveIoCompletion", port_handle, info, info + 8, info + 16);
     assert(blocked == 0x103 && thread.waiting() && port.as_ref().is_some_and(|port| port.with(|state| state.waiters.len() == 1 && !state.active.contains(&pointer))), "userthreads: fila vazia bloqueia o consumidor");
+    let waiting_thread = unsafe { nt::Kthread::at(pointer) };
+    assert(waiting_thread.wait_reason.get() == crate::ntos::ke::wait::reason::WR_QUEUE && waiting_thread.wait_mode.get() == 1, "userthreads: a espera da IOCP publica WrQueue e UserMode na KTHREAD");
     // Término: a espera acaba com THREAD_IS_TERMINATING e a porta é solta.
     assert(call("NtTerminateThread", handle, 0x1234, 0, 0) == 0 && thread.dead() && !thread.waiting() && port.as_ref().is_some_and(|port| port.with(|state| state.waiters.is_empty() && state.associated.is_empty())), "userthreads: NtTerminateThread encerra a espera e dissocia");
     guest::write64(rsp + 0x28, 0);
@@ -6031,6 +6033,21 @@ fn usermode_syscalls_exports(assert: Assert) {
         let marked = pending() & 1 != 0;
         let delivered = user_apc::deliver(&thread);
         assert(special == 0 && marked && delivered == 0 && homes(apc_frame, [0x44, 0x55, 0x66, routine2, 2]) && continuation.continue_flags.get() == 2 && pending() == 0, "userapc: APC especial com SpecialUserApcPending e continuacao sem TEST_ALERT");
+        // Uma normal e duas especiais: as especiais vão para o começo da
+        // fila (o KiInsertQueueApc), a mais nova primeiro; a normal espera a
+        // UserApcPending.
+        reset();
+        stack(5, 0);
+        stack(6, 0);
+        let normal = call("NtQueueApcThread", handle, routine, 0xC1, 0);
+        let older = call("NtQueueApcThreadEx", handle, 1, routine2, 0xB1);
+        let newer = call("NtQueueApcThreadEx", handle, 1, routine2, 0xB2);
+        let newest_first = user_apc::deliver(&thread) == 0 && apc_frame.p1_home.get() == 0xB2;
+        reset();
+        let older_next = user_apc::deliver(&thread) == 0 && apc_frame.p1_home.get() == 0xB1 && pending() == 0;
+        reset();
+        let normal_last = head.flink.get() != head.address() && call("NtTestAlert", 0, 0, 0, 0) == 0 && user_apc::deliver(&thread) == 0 && apc_frame.p1_home.get() == 0xC1 && head.flink.get() == head.address();
+        assert(normal == 0 && older == 0 && newer == 0 && newest_first && older_next && normal_last, "userapc: especiais na frente da fila, a mais nova primeiro");
         // APC_CALLBACK_DATA (Ex2 com 0x10000) e NtTestAlert publicando a pendência.
         reset();
         stack(5, 0x77);
