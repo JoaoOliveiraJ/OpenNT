@@ -66,3 +66,6 @@ pub mod system_ptes;
 pub mod protection;
 pub mod dangling_extent;
 pub mod modified_pages;
+pub mod guard_page;
+pub mod write_watch;
+pub mod control_flow_guard;

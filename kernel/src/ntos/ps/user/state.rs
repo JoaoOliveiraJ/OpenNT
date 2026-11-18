@@ -30,7 +30,7 @@ use core::cell::Cell;
 
 use crate::hal::physical;
 use crate::ntos::mm::memory_map::USER_ADDRESS_LIMIT;
-use crate::ntos::mm::paging;
+use crate::ntos::mm::{guard_page, paging};
 use crate::ntos::ob::close;
 use crate::ntos::ob::handle_table::HandleDescription;
 use crate::ntos::ob::object_manager::ObjectData;
@@ -544,6 +544,14 @@ fn probe_user_access(va: u64, size: u64, write: bool) -> bool {
     let required = paging::PAGE_PRESENT | paging::PAGE_USER | if write { paging::PAGE_RW } else { 0 };
     let mut page = first;
     while page <= last {
+        if paging::access_flags(page) & required != required {
+            // O toque do kernel numa página de guarda tira a guarda; na
+            // pilha da thread a pilha cresce e a sonda segue.
+            let access = if write { guard_page::Access::Write } else { guard_page::Access::Read };
+            if guard_page::touch(page, access).is_some_and(|status| status != guard_page::STATUS_PAGE_FAULT_GUARD_PAGE) {
+                return false;
+            }
+        }
         if paging::access_flags(page) & required != required {
             let fault = *SECTION_FAULT.lock();
             if !write || !fault.is_some_and(|fault| fault(page, 7)) || paging::access_flags(page) & required != required {

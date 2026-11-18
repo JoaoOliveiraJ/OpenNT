@@ -450,6 +450,9 @@ fn trim_region(root: u64, region: &Region, owner: &PrivateRegion, first_index: u
             continue;
         }
         let protection = page_protection(owner, &state, index);
+        // O bit Dirty de uma alocação MEM_WRITE_WATCH vai ao bitmap dela
+        // (o MiCaptureWriteWatchDirtyBit do MiWsleFlush).
+        super::write_watch::capture(owner, &mut state, index, pte);
         let mut slot = state.clean.remove(&index);
         if pte & PTE_DIRTY != 0 {
             // A cópia no arquivo deixou de valer (MiCaptureDirtyBitToPfn).

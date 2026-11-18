@@ -21,7 +21,7 @@ use crate::hal::amd64::usermode;
 use crate::ntos::inc::types::{Context, ContextEx, Eprocess, ExceptionRecord, MachineFrame, NtStruct, XsaveFormat};
 use crate::ntos::kd::debug_service;
 use crate::ntos::ke::{processor_identity, xsave};
-use crate::ntos::mm::page_residency;
+use crate::ntos::mm::{guard_page, page_residency};
 use crate::ntos::ps::context::registers::{self, INTEGER};
 use crate::ntos::ps::context::xstate::{self as context_xstate, Extended};
 use crate::ntos::rtl::extended_context;
@@ -165,8 +165,8 @@ pub fn deliver(thread: &UserThread, record: &[u8]) -> u32 {
     let machine = xstate_start.wrapping_sub(MACHINE_SIZE) & !0xF;
     let stack = machine.wrapping_sub(MACHINE_OFFSET);
     let total = user_rsp.wrapping_sub(stack);
-    // Falha sem escrever nada quando o usuário não pode receber o frame; o
-    // crescimento da pilha/guard page exige o suporte separado do Mm.
+    // Falha sem escrever nada quando o usuário não pode receber o frame. A
+    // sonda toca a página de guarda da pilha, que cresce (`mm/guard_page`).
     if stack > user_rsp || !state::probe_user_write(stack, total) {
         guest::free_bytes(buffer);
         return 0xC000_00FD;
@@ -260,6 +260,16 @@ pub fn hardware(thread: &UserThread, status: u32) -> u32 {
         let error = block.error_code.get() as u32;
         if page_residency::fault(block.fault_cr2.get(), error) {
             return 0;
+        }
+        // Página de guarda ausente (o MiUserFault): a pilha que cresceu
+        // repete a instrução; senão a exceção leva o status da guarda.
+        if error & 1 == 0 {
+            let access = if error & 16 != 0 { guard_page::Access::Execute } else if error & 2 != 0 { guard_page::Access::Write } else { guard_page::Access::Read };
+            match guard_page::touch(block.fault_cr2.get(), access) {
+                Some(guard_page::STATUS_PAGE_FAULT_GUARD_PAGE) => return 0,
+                Some(code) => put(offset_of!(ExceptionRecord, exception_code), &code.to_le_bytes()),
+                None => {}
+            }
         }
         let information = offset_of!(ExceptionRecord, exception_information);
         put(offset_of!(ExceptionRecord, number_parameters), &2u32.to_le_bytes());

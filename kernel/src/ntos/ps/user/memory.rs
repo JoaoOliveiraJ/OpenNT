@@ -69,6 +69,7 @@ use crate::ntos::mm::copy_virtual;
 use crate::ntos::mm::process_address_space::SYSTEM_ROOT;
 use crate::ntos::mm::process_commit;
 use crate::ntos::mm::paging_file::Slot as PageFileSlot;
+use crate::ntos::mm::{control_flow_guard, protection, write_watch};
 use crate::ntos::mm::working_set;
 use crate::ntos::mm::virtual_lock;
 use crate::ntos::mm::section::handles::{self as section_handles, Kind};
@@ -84,6 +85,11 @@ const MAX_SAFE: u64 = (1 << 53) - 1;
 const MEM_COMMIT: u32 = 0x1000;
 const MEM_RESERVE: u32 = 0x2000;
 const MEM_TOP_DOWN: u32 = 0x10_0000;
+/// PAGE_GUARD: a página fica comitada com a PTE ausente (`mm/guard_page`).
+pub const PAGE_GUARD: u32 = 0x100;
+/// PAGE_TARGETS_INVALID (alocação) e PAGE_TARGETS_NO_UPDATE (proteção):
+/// alvos de CFG, sem efeito com o CFG ausente (`mm/control_flow_guard`).
+const PAGE_TARGETS: u32 = 0x4000_0000;
 /// O processo do espaço já passou pelo término (sem VAD).
 const STATUS_PROCESS_IS_TERMINATING: u32 = 0xC000_010A;
 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
@@ -120,6 +126,9 @@ pub struct PrivateMut {
     /// As páginas travadas pelo NtLockVirtualMemory (`mm/virtual_lock`):
     /// MAP_PROCESS e MAP_SYSTEM em bits; o corte do working set não as leva.
     pub locked: BTreeMap<u64, u8>,
+    /// O bitmap de write watch de uma alocação MEM_WRITE_WATCH
+    /// (`mm/write_watch`): as páginas escritas cujo bit Dirty saiu da PTE.
+    pub written: BTreeSet<u64>,
 }
 
 /// Uma página fora do working set (o estado que a PTE de transição ou de
@@ -153,7 +162,7 @@ pub struct PrivateRegion {
 
 impl PrivateRegion {
     fn new(base: u64, size: u64, protect: u32, allocation_type: u32, pageable: bool) -> Arc<Self> {
-        let state = PrivateMut { frames: BTreeMap::new(), committed_pages: BTreeSet::new(), page_protects: BTreeMap::new(), protected_frames: BTreeMap::new(), paging: BTreeMap::new(), clean: BTreeMap::new(), busy: 0, locked: BTreeMap::new() };
+        let state = PrivateMut { frames: BTreeMap::new(), committed_pages: BTreeSet::new(), page_protects: BTreeMap::new(), protected_frames: BTreeMap::new(), paging: BTreeMap::new(), clean: BTreeMap::new(), busy: 0, locked: BTreeMap::new(), written: BTreeSet::new() };
         Arc::new(Self { base, size, protect, allocation_protect: protect, allocation_type, pageable, state: SpinLock::new(state) })
     }
 
@@ -444,6 +453,17 @@ fn view_of(region: &Region) -> Option<Arc<View>> {
     })
 }
 
+/// Os bits da PTE de uma página privada com a proteção do Win32: U/S, R/W
+/// nas proteções com escrita e P menos em PAGE_NOACCESS e PAGE_GUARD (a PTE
+/// ausente guarda o frame). PAGE_NOCACHE e PAGE_WRITECOMBINE ficam só na
+/// proteção registrada: a página privada segue em cache, como o mapa direto
+/// que zera e copia o frame.
+pub fn private_pte(protect: u32) -> u64 {
+    let present = protect & 0xFF != 1 && protect & PAGE_GUARD == 0;
+    let writable = protect & (4 | 8 | 0x40 | 0x80) != 0;
+    paging::PAGE_USER | if present { paging::PAGE_PRESENT } else { 0 } | if writable { paging::PAGE_RW } else { 0 }
+}
+
 /// Mapeia uma faixa com frames do PFN na raiz `root` (commit inicial e
 /// commit sobre reserva); qualquer falha desfaz as páginas desta chamada.
 pub fn map_user_page_range(root: u64, base: u64, size: u64, region: Option<&PrivateRegion>, protect: u32) -> bool {
@@ -478,9 +498,7 @@ pub fn map_user_page_range(root: u64, base: u64, size: u64, region: Option<&Priv
             return rollback(&added);
         }
         physical::zero(frame, PAGE as usize);
-        let writable = protect & (4 | 8 | 0x40 | 0x80) != 0;
-        let flags = paging::PAGE_USER | if protect != 1 { paging::PAGE_PRESENT } else { 0 } | if writable { paging::PAGE_RW } else { 0 };
-        if !paging::map_page_in(root, base + offset, frame, flags, MapOptions::default()) {
+        if !paging::map_page_in(root, base + offset, frame, private_pte(protect), MapOptions::default()) {
             pfn::free_page(frame);
             return rollback(&added);
         }
@@ -521,6 +539,9 @@ pub fn allocate_in(space: Space, base_pointer: u64, size_pointer: u64, allocatio
     if space.state().is_none() {
         return Ok(STATUS_PROCESS_IS_TERMINATING);
     }
+    if !write_watch::valid_allocation_type(allocation_type) {
+        return Ok(STATUS_INVALID_PARAMETER);
+    }
     let highest = if highest == 0 { USER_ALLOCATION_TOP } else { highest.min(USER_ALLOCATION_TOP) };
     let lowest = lowest.max(map::LOWEST_USER_ADDRESS);
     // PVOID *BaseAddress e SIZE_T *RegionSize: de usuário (sondados pelo
@@ -533,12 +554,10 @@ pub fn allocate_in(space: Space, base_pointer: u64, size_pointer: u64, allocatio
         debug_print!("[usermode] alloc invalida: base=0x{:x} size=0x{:x} type=0x{:x}", requested_base, requested, allocation_type);
         return Ok(STATUS_INVALID_PARAMETER);
     }
-    if ![1, 2, 4, 8, 0x10, 0x20, 0x40, 0x80].contains(&(protect & 0xFF)) {
-        return Ok(0xC000_0045);
-    }
-    if protect & !0xFF != 0 {
-        return Ok(0xC000_00BB);
-    }
+    let protect = match allocation_protection(protect) {
+        Ok(protect) => protect,
+        Err(status) => return Ok(status),
+    };
     let fixed = requested_base != 0;
     let reserve = allocation_type & MEM_RESERVE != 0;
     // Uma reserva com base desce à granularidade de alocação (64 KB); o
@@ -567,6 +586,7 @@ pub fn allocate_in(space: Space, base_pointer: u64, size_pointer: u64, allocatio
                     }
                 } else if let Some(owner) = private(&existing) {
                     let pages = uncommitted_pages(owner, base, size);
+                    let reprotect = protection_differs(owner, base, size, protect);
                     let charged = process_commit::charge(space.process(), pages);
                     if charged != 0 {
                         return Ok(charged);
@@ -574,6 +594,9 @@ pub fn allocate_in(space: Space, base_pointer: u64, size_pointer: u64, allocatio
                     if !map_user_page_range(space.root(), base, size, Some(owner), protect) {
                         process_commit::release(space.process(), pages);
                         return Ok(0xC000_0017);
+                    }
+                    if reprotect {
+                        reprotect_committed(space, base, size, protect)?;
                     }
                 }
                 guest::try_write::<u64>(base_pointer, base)?;
@@ -624,6 +647,50 @@ pub fn allocate_in(space: Space, base_pointer: u64, size_pointer: u64, allocatio
     guest::try_write::<u64>(base_pointer, base)?;
     guest::try_write::<u64>(size_pointer, size)?;
     Ok(0)
+}
+
+/// A proteção de uma alocação privada, como o MiAllocateVirtualMemory do
+/// 19041: PAGE_TARGETS_INVALID só com uma proteção executável (senão
+/// STATUS_INVALID_PAGE_PROTECTION) e sai da proteção, sem efeito com o CFG
+/// ausente; o resto passa pelo MiMakeProtectionMask, que aceita PAGE_GUARD,
+/// PAGE_NOCACHE e PAGE_WRITECOMBINE nas combinações válidas.
+fn allocation_protection(protect: u32) -> Result<u32, u32> {
+    let mut protect = protect;
+    if protect & PAGE_TARGETS != 0 {
+        if protect & 0xF0 == 0 {
+            return Err(0xC000_0045);
+        }
+        protect &= !PAGE_TARGETS;
+    }
+    if protection::make_mask(protect).is_none() {
+        return Err(0xC000_0045);
+    }
+    Ok(protect)
+}
+
+/// Alguma página já comitada de `[base, base + size)` tem outra proteção (o
+/// MiCommitExistingVad compara cada uma com a pedida).
+fn protection_differs(owner: &PrivateRegion, base: u64, size: u64, protect: u32) -> bool {
+    let state = owner.state.lock();
+    let (first, end) = ((base - owner.base) / PAGE, (base + size - owner.base) / PAGE);
+    state.committed_pages.range(first..end).any(|index| state.page_protects.get(index).copied().filter(|&value| value != 0).unwrap_or(owner.protect) != protect)
+}
+
+/// O commit sobre páginas já comitadas com outra proteção troca a proteção
+/// da faixa inteira depois do commit, como o MiAllocateVirtualMemory chama o
+/// MmProtectVirtualMemory (o resultado não muda o do commit). É o RW→RX de um
+/// JIT por VirtualAlloc(MEM_COMMIT): o d3d10warp exige a faixa em
+/// PAGE_READWRITE e a recomita PAGE_EXECUTE_READ.
+fn reprotect_committed(space: Space, base: u64, size: u64, protect: u32) -> Result<(), KernelError> {
+    let cells = guest::alloc_bytes(0x18);
+    if cells == 0 {
+        return Err(KernelError::with_status("sem pool para a troca de protecao do commit", 0xC000_009A));
+    }
+    guest::write64(cells, base);
+    guest::write64(cells + 8, size);
+    let result = protect_in(space, cells, cells + 8, protect, cells + 0x10, false);
+    guest::free_bytes(cells);
+    result.map(|_| ())
 }
 
 /// Região privada comitada que o kernel monta para o processo do espaço, na
@@ -863,7 +930,8 @@ pub fn nt_free_virtual_memory(process: u64, base_pointer: u64, size_pointer: u64
 /// o processo do handle com PROCESS_VM_OPERATION, as faixas capturadas e
 /// conferidas (STATUS_INVALID_PARAMETER_4) e a pré-busca da
 /// VmPrefetchInformation (flags diferentes de zero são
-/// STATUS_INVALID_PARAMETER_5). Prioridade de página, alvos de CFG e as
+/// STATUS_INVALID_PARAMETER_5). Os alvos de CFG (classe 2) seguem o
+/// processo sem CFG (`mm/control_flow_guard`). Prioridade de página e as
 /// classes de estado de página ainda não existem no OpenNT
 /// (STATUS_NOT_SUPPORTED). A ntdll pede VmImageHotPatchInformation a cada
 /// DLL inicializada e ignora o resultado.
@@ -882,6 +950,14 @@ pub fn nt_set_information_virtual_memory(process: u64, class: u64, count: u64, e
     if !state::probe_user_read(entries, bytes) || (class != 2 && !state::probe_user_read(information, 4)) {
         return Ok(0xC000_0005);
     }
+    let targets = if class == control_flow_guard::VM_CFG_CALL_TARGET_INFORMATION {
+        match control_flow_guard::capture_list(information) {
+            Ok(list) => Some(list),
+            Err(status) => return Ok(status),
+        }
+    } else {
+        None
+    };
     let flags = if class != 2 {
         match guest::try_read::<u32>(information) {
             Ok(flags) => flags,
@@ -896,6 +972,9 @@ pub fn nt_set_information_virtual_memory(process: u64, class: u64, count: u64, e
     };
     let ranges: Vec<(u64, u64)> = captured.chunks_exact(16).map(|entry| (u64::from_le_bytes(entry[..8].try_into().unwrap_or([0; 8])), u64::from_le_bytes(entry[8..].try_into().unwrap_or([0; 8])))).collect();
     with_process_handle(process, PROCESS_VM_OPERATION, |target| {
+        if let Some(list) = &targets {
+            return state::guarded(|| control_flow_guard::set_call_targets(target, &ranges, list, USER_MODE));
+        }
         if !prefetch::valid_user_ranges(&ranges) {
             return Ok(prefetch::STATUS_INVALID_PARAMETER_4);
         }
@@ -1121,8 +1200,8 @@ fn take_indices(set: &mut BTreeSet<u64>, from: u64, to: u64) -> BTreeSet<u64> {
 /// O MiFreeVadRange de uma faixa interna (já sem páginas): a parte da região
 /// antes de [first, end) e a parte depois viram regiões novas no VAD, no
 /// lugar da original e com a mesma proteção, cada uma com as páginas dela
-/// reindexadas (frames, commit, proteções, cópias no arquivo de paginação e
-/// travas). As páginas em transição voltam às listas de modificadas e de
+/// reindexadas (frames, commit, proteções, cópias no arquivo de paginação,
+/// travas e o bitmap de write watch). As páginas em transição voltam às listas de modificadas e de
 /// reserva pela região nova; as entradas pela região antiga deixam de valer
 /// (o frame já não é dela).
 fn split_private_region(space: Space, region: &Region, owner: &PrivateRegion, first: u64, end: u64) {
@@ -1148,6 +1227,7 @@ fn split_private_region(space: Space, region: &Region, owner: &PrivateRegion, fi
                 moved.paging = take_pages(&mut old.paging, from, to);
                 moved.clean = take_pages(&mut old.clean, from, to);
                 moved.locked = take_pages(&mut old.locked, from, to);
+                moved.written = take_indices(&mut old.written, from, to);
                 for (&index, paged) in moved.paging.iter().filter(|(_, paged)| paged.transition) {
                     if let Some(&frame) = moved.frames.get(&index) {
                         relisted.push((working_set::ListedPage { region: entry.clone(), root, index, frame }, paged.slot.is_none()));
@@ -1176,6 +1256,26 @@ pub fn nt_protect_virtual_memory(process: u64, base_pointer: u64, size_pointer: 
     with_process_handle(process, PROCESS_VM_OPERATION, |target| state::guarded(|| protect_in(Space::of(target), base_pointer, size_pointer, new_protect as u32, old_pointer, true)))
 }
 
+/// A proteção nova do NtProtectVirtualMemory 19041: o MiMakeProtectionMask
+/// sobre os bits que ele confere (0x0FF807FF; inválida dá
+/// STATUS_INVALID_PAGE_PROTECTION) e o PAGE_TARGETS_NO_UPDATE, que o
+/// MmProtectVirtualMemory tira e só aceita com uma proteção executável sem
+/// modificadores (senão STATUS_INVALID_PARAMETER_4); com o CFG ausente ele
+/// não tem outro efeito.
+fn protection_change(protect: u32) -> Result<u32, u32> {
+    if protection::make_mask(protect & 0x0FF8_07FF).is_none() {
+        return Err(0xC000_0045);
+    }
+    if protect & PAGE_TARGETS == 0 {
+        return Ok(protect);
+    }
+    let protect = protect & !PAGE_TARGETS;
+    if protect & 0xFFFF_FF0F != 0 {
+        return Err(0xC000_00F2);
+    }
+    Ok(protect)
+}
+
 /// Troca a proteção no espaço dado; ponteiros de modo usuário são sondados.
 pub fn protect_in(space: Space, base_pointer: u64, size_pointer: u64, new_protect: u32, old_pointer: u64, from_user: bool) -> Result<u32, KernelError> {
     let new_protect = new_protect as u64;
@@ -1191,10 +1291,10 @@ pub fn protect_in(space: Space, base_pointer: u64, size_pointer: u64, new_protec
     let end = (requested_base + requested_size).div_ceil(PAGE) * PAGE;
     let size = end - base;
     let region = space.find(base);
-    let protect = new_protect as u32;
-    if ![1, 2, 4, 8, 0x10, 0x20, 0x40, 0x80].contains(&(protect & 0xFF)) {
-        return Ok(0xC000_0045);
-    }
+    let protect = match protection_change(new_protect as u32) {
+        Ok(protect) => protect,
+        Err(status) => return Ok(status),
+    };
     let Some(region) = region.filter(|region| end <= region.base() + region.size()) else { return Ok(0xC000_0018) };
     // ULONG *OldProtect = PAGE_NOACCESS até a troca dar certo.
     guest::try_write::<u32>(old_pointer, 1)?;
@@ -1206,7 +1306,9 @@ pub fn protect_in(space: Space, base_pointer: u64, size_pointer: u64, new_protec
             return Ok(status);
         }
     }
-    if protect & !0xFF != 0 {
+    // PAGE_GUARD, PAGE_NOCACHE e PAGE_WRITECOMBINE valem nas alocações
+    // privadas; vistas e imagens ainda não têm guarda nem cache próprio.
+    if protect & !0x7FF != 0 || (protect & 0x700 != 0 && private(&region).is_none()) {
         return Ok(0xC000_00BB);
     }
     if let Some(section) = &section {
@@ -1266,8 +1368,14 @@ pub fn protect_in(space: Space, base_pointer: u64, size_pointer: u64, new_protec
         }
     }
     for (va, index, physical) in changes {
-        let flags = paging::PAGE_USER | if protect != 1 { paging::PAGE_PRESENT } else { 0 } | if writable { paging::PAGE_RW } else { 0 };
-        paging::map_page_in(root, va, physical, flags, MapOptions { nx: protect & 0xF0 == 0, ..MapOptions::default() });
+        // A PTE reescrita perde o bit Dirty: numa alocação MEM_WRITE_WATCH
+        // ele passa antes ao bitmap da região.
+        if let Some(owner) = owner.filter(|owner| write_watch::watched(owner)) {
+            if let Some(pte) = paging::read_leaf_in(root, va) {
+                write_watch::capture(owner, &mut owner.state.lock(), index, pte);
+            }
+        }
+        paging::map_page_in(root, va, physical, private_pte(protect), MapOptions { nx: protect & 0xF0 == 0, ..MapOptions::default() });
         region.record_protect(index, protect, physical);
     }
     guest::try_write::<u32>(old_pointer, old)?;
@@ -1440,6 +1548,16 @@ fn nt_unlock_virtual_memory(process: u64, base_pointer: u64, size_pointer: u64, 
     lock_or_unlock(process, base_pointer, size_pointer, map_type, false)
 }
 
+/// NtGetWriteWatch: `mm/write_watch`.
+fn nt_get_write_watch(process: u64, flags: u64, base: u64, size: u64, user_rsp: u64) -> Result<u32, KernelError> {
+    write_watch::nt_get_write_watch(process, flags, base, size, user_rsp)
+}
+
+/// NtResetWriteWatch: `mm/write_watch`.
+fn nt_reset_write_watch(process: u64, base: u64, size: u64, _unused: u64, _user_rsp: u64) -> Result<u32, KernelError> {
+    write_watch::nt_reset_write_watch(process, base, size)
+}
+
 /// Registra os handlers Nt*VirtualMemory e o NtCreatePagingFile.
 pub fn init() {
     state::register_handler("NtLockVirtualMemory", nt_lock_virtual_memory);
@@ -1453,4 +1571,6 @@ pub fn init() {
     state::register_handler("NtQueryVirtualMemory", query);
     state::register_handler("NtReadVirtualMemory", nt_read_virtual_memory);
     state::register_handler("NtWriteVirtualMemory", nt_write_virtual_memory);
+    state::register_handler("NtGetWriteWatch", nt_get_write_watch);
+    state::register_handler("NtResetWriteWatch", nt_reset_write_watch);
 }

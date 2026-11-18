@@ -216,11 +216,13 @@ pub fn valid_user_ranges(ranges: &[(u64, u64)]) -> bool {
 /// ZwSetInformationVirtualMemory(Process, VmInformationClass,
 /// NumberOfEntries, VirtualAddresses, VmInformation, VmInformationLength):
 /// VmPrefetchInformation (o ULONG de flags, que precisa ser 0) pré-busca as
-/// faixas no processo, como o MmPrefetchVirtualAddresses; as classes de
-/// prioridade de página e de alvos de CFG ainda não existem no OpenNT
-/// (STATUS_NOT_SUPPORTED); classe desconhecida, STATUS_INVALID_PARAMETER_2.
-/// O processo é o NtCurrentProcess ou um handle de processo da tabela
-/// nativa; outro handle dá STATUS_INVALID_HANDLE.
+/// faixas no processo, como o MmPrefetchVirtualAddresses; os alvos de CFG
+/// (o CFG_CALL_TARGET_LIST_INFORMATION de 0x28 bytes, senão
+/// STATUS_INVALID_PARAMETER_6) seguem o processo sem CFG
+/// (`mm/control_flow_guard`); as classes de prioridade de página ainda não
+/// existem no OpenNT (STATUS_NOT_SUPPORTED); classe desconhecida,
+/// STATUS_INVALID_PARAMETER_2. O processo é o NtCurrentProcess ou um handle
+/// de processo da tabela nativa; outro handle dá STATUS_INVALID_HANDLE.
 pub fn set_information_virtual_memory(process_handle: u64, class: u32, count: u64, entries: u64, information: u64, length: u32) -> Result<u32, KernelError> {
     let process = if process_handle == u64::MAX {
         crate::ntos::ps::process::get_current_process()
@@ -241,18 +243,31 @@ pub fn set_information_virtual_memory(process_handle: u64, class: u32, count: u6
             }
             // As faixas vão ao processo já referenciado (o pedido do
             // MmPrefetchVirtualAddresses leva um handle, não o EPROCESS).
-            let ranges: alloc::vec::Vec<(u64, u64)> = (0..count)
-                .map(|index| {
-                    // SAFETY: o vetor de faixas do chamador de kernel.
-                    let entry = unsafe { MemoryRangeEntry::at(entries + index * MemoryRangeEntry::SIZE) };
-                    (entry.virtual_address.get(), entry.number_of_bytes.get())
-                })
-                .collect();
-            prefetch_ranges(process, &ranges).map(|_| 0)
+            prefetch_ranges(process, &kernel_ranges(entries, count)).map(|_| 0)
+        }
+        VM_CFG_CALL_TARGET_INFORMATION => {
+            if length != 0x28 {
+                return Ok(STATUS_INVALID_PARAMETER_6);
+            }
+            match crate::ntos::mm::control_flow_guard::capture_kernel_list(information) {
+                Ok(list) => crate::ntos::mm::control_flow_guard::set_call_targets(process, &kernel_ranges(entries, count), &list, 0),
+                Err(status) => Ok(status),
+            }
         }
         1..=4 => Ok(STATUS_NOT_SUPPORTED),
         _ => Ok(STATUS_INVALID_PARAMETER_2),
     }
+}
+
+/// O vetor de MEMORY_RANGE_ENTRY de um chamador de kernel.
+fn kernel_ranges(entries: u64, count: u64) -> alloc::vec::Vec<(u64, u64)> {
+    (0..count)
+        .map(|index| {
+            // SAFETY: o vetor de faixas do chamador de kernel.
+            let entry = unsafe { MemoryRangeEntry::at(entries + index * MemoryRangeEntry::SIZE) };
+            (entry.virtual_address.get(), entry.number_of_bytes.get())
+        })
+        .collect()
 }
 
 // ---- MmPrefetchPages ---------------------------------------------------------

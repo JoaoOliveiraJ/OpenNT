@@ -743,7 +743,7 @@ fn user_virtual_memory(assert: Assert) {
     // STATUS_CONFLICTING_ADDRESSES, sem região nem página nova.
     let unreserved = reserved + 0x8000;
     assert(allocate(unreserved, 0x1000, 0x1000, 4) == 0xC000_0018 && memory::find_region(unreserved).is_none() && paging::translate(unreserved) == 0 && allocate(reserved + 0x3000, 0x2000, 0x1000, 4) == 0xC000_0018 && paging::translate(reserved + 0x4000) == 0, "usermemory: MEM_COMMIT sem reserva na base recusado com STATUS_CONFLICTING_ADDRESSES");
-    assert(allocate(reserved, 0x1000, 0x2000, 4) == 0xC000_0018 && allocate(0, 0x1000, 0x3000, 3) == 0xC000_0045 && allocate(0, 0x1000, 0x3000, 0x104) == 0xC000_00BB && allocate(0, 0, 0x3000, 4) == 0xC000_000D, "usermemory: conflito, protecao invalida, modificador e tamanho zero");
+    assert(allocate(reserved, 0x1000, 0x2000, 4) == 0xC000_0018 && allocate(0, 0x1000, 0x3000, 3) == 0xC000_0045 && allocate(0, 0x1000, 0x3000, 0x304) == 0xC000_0045 && allocate(0, 0, 0x3000, 4) == 0xC000_000D, "usermemory: conflito, protecao invalida, modificadores incompativeis e tamanho zero");
     let context = Context::current();
     assert(memory_query::describe(reserved, &context).state == 0x2000 && memory_query::describe(reserved + 0x1000, &context).state == 0x1000 && memory_query::describe(data, &context).size == 0x3000, "usermemory: regioes privadas descritas com reserva e commit");
     // NtProtectVirtualMemory com os parâmetros na memória de usuário.
@@ -6150,6 +6150,7 @@ pub fn run(assert: Assert) {
     super::shared_section_views::run(assert);
     virtual_memory_queries(assert);
     user_virtual_memory(assert);
+    super::user_jit_memory::run(assert);
     volume_file_lookup(assert);
     user_registry(assert);
     super::user_cm_services::run(assert);

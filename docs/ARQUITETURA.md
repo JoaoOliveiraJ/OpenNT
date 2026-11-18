@@ -1022,6 +1022,39 @@ além da KUSER_SHARED_DATA:
   está reservado: com base fora de uma reserva (ou passando do fim dela),
   STATUS_CONFLICTING_ADDRESSES, como o MiAllocateVirtualMemory do 19041;
   sem base, reserva uma faixa nova. Vistas de seção usam a mesma escolha.
+- **Proteções, guarda e write watch** (`ps/user/memory.rs`,
+  `mm/guard_page.rs`, `mm/write_watch.rs`, `mm/control_flow_guard.rs`):
+  - A proteção de uma alocação privada passa pelo MiMakeProtectionMask
+    (`mm/protection.rs`): PAGE_GUARD, PAGE_NOCACHE e PAGE_WRITECOMBINE valem
+    nas combinações do 19041. Os dois de cache ficam só na proteção
+    registrada; a página segue em cache. Em vistas de seção e imagens os
+    modificadores ainda dão STATUS_NOT_SUPPORTED.
+  - Nenhum processo tem CFG (um estado válido do 19041):
+    PAGE_TARGETS_INVALID na alocação (só com proteção executável, senão
+    STATUS_INVALID_PAGE_PROTECTION) e PAGE_TARGETS_NO_UPDATE na proteção (só
+    com uma proteção executável simples, senão STATUS_INVALID_PARAMETER_4)
+    são conferidos e retirados. A classe 2 do NtSetInformationVirtualMemory
+    (SetProcessValidCallTargets) confere a lista e responde
+    STATUS_INVALID_PAGE_PROTECTION com NumberOfEntriesProcessed 0.
+  - MEM_COMMIT sobre páginas já comitadas com outra proteção troca a
+    proteção da faixa depois do commit, como o MiAllocateVirtualMemory chama
+    o MmProtectVirtualMemory: é o RW→RX do JIT do d3d10warp. O
+    NtFlushInstructionCache devolve sucesso sem conferir nada, como o do
+    19041 (`xor eax, eax; ret`).
+  - Uma página de guarda fica comitada com a PTE ausente. O primeiro acesso
+    que a proteção base admite tira a guarda (o MiAccessCheck) e dá
+    STATUS_GUARD_PAGE_VIOLATION; na pilha da thread (DeallocationStack e
+    StackBase da TEB) a pilha cresce como no MiCheckForUserStackOverflow:
+    guarda nova abaixo da página, StackLimit na página e o acesso repete, ou
+    STATUS_STACK_OVERFLOW sem espaço. A falta de usuário e as sondas do
+    kernel (`probe_user_access`) passam por aí; uma falta de código nativo
+    do kernel numa guarda de usuário ainda é STATUS_ACCESS_VIOLATION.
+  - MEM_WRITE_WATCH (só com MEM_RESERVE) marca a alocação. NtGetWriteWatch e
+    NtResetWriteWatch leem e limpam o bit Dirty das PTEs e o bitmap da
+    região, que recebe o bit Dirty quando a PTE é reescrita ou sai do
+    working set. Uma escrita do kernel pelo mapa direto (a cópia do
+    NtWriteVirtualMemory para outro processo) não aparece.
+  - Teste: `ntos/test/user_jit_memory.rs`.
 - **O que o kernel monta para o processo** também sai do alocador: a pilha da
   primeira thread é uma alocação de baixo para cima (fica abaixo de 4 GB
   num processo novo); PEB, TEB, parâmetros, entradas do Ldr e as regiões

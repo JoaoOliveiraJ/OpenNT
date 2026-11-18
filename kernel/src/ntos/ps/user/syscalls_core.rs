@@ -605,7 +605,9 @@ fn nt_raise_hard_error(status: u64, count: u64, unicode_mask: u64, parameters: u
     })
 }
 
-/// x64 unificado: a coerência de instruções é garantida pelo hardware.
+/// x64 unificado: a coerência de instruções é garantida pelo hardware. O
+/// NtFlushInstructionCache do 19041 é só `xor eax, eax; ret` (nem o handle
+/// nem a faixa são conferidos), e o JIT do d3d10warp exige o sucesso.
 fn nt_flush_instruction_cache(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
     Ok(STATUS_SUCCESS)
 }

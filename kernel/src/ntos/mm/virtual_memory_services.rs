@@ -66,8 +66,9 @@ fn highest_from_zero_bits(zero_bits: u64) -> Result<u64, u32> {
     }
 }
 
-/// Tipos de alocação: COMMIT/RESERVE/TOP_DOWN vão ao alocador; RESET só
-/// valida (o conteúdo pode ser preservado); os demais não existem aqui.
+/// Tipos de alocação: COMMIT/RESERVE/TOP_DOWN/WRITE_WATCH vão ao alocador
+/// (que confere o WRITE_WATCH, `mm/write_watch`); RESET só valida (o
+/// conteúdo pode ser preservado); os demais não existem aqui.
 fn checked_type(allocation_type: u32) -> Result<u32, u32> {
     let known = MEM_COMMIT | MEM_RESERVE | MEM_RESET | MEM_TOP_DOWN | MEM_WRITE_WATCH | MEM_PHYSICAL | MEM_RESET_UNDO | MEM_LARGE_PAGES;
     if allocation_type & !known != 0 || allocation_type & (MEM_COMMIT | MEM_RESERVE | MEM_RESET | MEM_RESET_UNDO) == 0 {
@@ -76,11 +77,14 @@ fn checked_type(allocation_type: u32) -> Result<u32, u32> {
     if allocation_type & MEM_LARGE_PAGES != 0 {
         return Err(STATUS_PRIVILEGE_NOT_HELD);
     }
-    if allocation_type & (MEM_WRITE_WATCH | MEM_PHYSICAL | MEM_RESET_UNDO) != 0 {
+    if allocation_type & (MEM_PHYSICAL | MEM_RESET_UNDO) != 0 {
         return Err(STATUS_NOT_SUPPORTED);
     }
     Ok(allocation_type)
 }
+
+/// Os bits do tipo que o alocador de `ps/user/memory` recebe.
+const ALLOCATOR_TYPES: u32 = MEM_COMMIT | MEM_RESERVE | MEM_TOP_DOWN | MEM_WRITE_WATCH;
 
 /// MEM_RESET: a faixa precisa estar inteira numa região comitada.
 fn reset(space: Space, base_pointer: u64, size_pointer: u64) -> Result<u32, KernelError> {
@@ -101,7 +105,7 @@ pub fn allocate(process_handle: u64, base_pointer: u64, zero_bits: u64, size_poi
         if allocation_type & MEM_RESET != 0 {
             return reset(space, base_pointer, size_pointer);
         }
-        memory::allocate_in(space, base_pointer, size_pointer, allocation_type & (MEM_COMMIT | MEM_RESERVE | MEM_TOP_DOWN), protect, 0, highest, 0x1_0000)
+        memory::allocate_in(space, base_pointer, size_pointer, allocation_type & ALLOCATOR_TYPES, protect, 0, highest, 0x1_0000)
     })
 }
 
@@ -115,7 +119,7 @@ pub fn allocate_ex(process_handle: u64, base_pointer: u64, size_pointer: u64, al
         if allocation_type & MEM_RESET != 0 {
             return reset(space, base_pointer, size_pointer);
         }
-        memory::allocate_ex_in(space, base_pointer, size_pointer, allocation_type & (MEM_COMMIT | MEM_RESERVE | MEM_TOP_DOWN), protect, parameters, count as u64)
+        memory::allocate_ex_in(space, base_pointer, size_pointer, allocation_type & ALLOCATOR_TYPES, protect, parameters, count as u64)
     })
 }
 
