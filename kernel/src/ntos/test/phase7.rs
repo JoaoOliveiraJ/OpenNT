@@ -5247,6 +5247,124 @@ fn user_wnf(assert: Assert) {
     }
 }
 
+/// O protocolo de prontidão do LogonUI (o StartLogonUI do winlogon 19041):
+/// um nome WNF persistente (tempo de vida 2) de escopo de sistema, com o
+/// descritor "D:(A;;GA;;;SY)(A;;1;;;AU)", entre dois processos de usuário.
+/// A (o winlogon) cria o nome, assina e publica 1; B (o LogonUI) lê 1,
+/// assina a partir do carimbo lido e publica 2; a entrega de A traz o 2; A
+/// publica 0 e a entrega de B traz o 0. No fim A apaga o nome: o
+/// NtDeleteWnfStateName de um nome persistente apaga a definição e as
+/// instâncias, e um segundo NtDeleteWnfStateName não acha a definição.
+fn user_wnf_persistent(assert: Assert) {
+    use crate::ntos::ex::wnf::{name::NAME_MASK, service};
+    use crate::ntos::ps::process;
+    use crate::ntos::ps::user::memory;
+    const DESCRIPTOR: [u8; 68] = [
+        1, 0, 0x04, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 20, 0, 0, 0, // SECURITY_DESCRIPTOR_RELATIVE com a DACL em 20
+        2, 0, 48, 0, 2, 0, 0, 0, // ACL: revisão 2, 48 bytes, duas ACEs
+        0, 0, 20, 0, 0, 0, 0, 0x10, 1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0, // (A;;GA;;;SY)
+        0, 0, 20, 0, 1, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 5, 11, 0, 0, 0, // (A;;1;;;AU)
+    ];
+    // O bloco de usuário de cada processo.
+    const NAME: u64 = 0x000;
+    const DATA: u64 = 0x010;
+    const STAMP: u64 = 0x018;
+    const LENGTH: u64 = 0x01C;
+    const OUTPUT: u64 = 0x020;
+    const IDENTIFIER: u64 = 0x028;
+    const EVENT: u64 = 0x030;
+    const SD: u64 = 0x040;
+    const STACK: u64 = 0x800;
+    const DELIVERY: u64 = 0x1000;
+    const NO_MORE_ENTRIES: u32 = 0x8000_001A;
+    // Um serviço de modo usuário do processo corrente, com os argumentos da
+    // pilha a partir do quinto.
+    let call = |block: u64, name: &str, arguments: [u64; 4], stack: &[u64]| -> u32 {
+        for (index, value) in stack.iter().enumerate() {
+            guest::write64(block + STACK + 0x28 + index as u64 * 8, *value);
+        }
+        state::handler(name).map_or(1, |handler| handler(arguments[0], arguments[1], arguments[2], arguments[3], block + STACK).unwrap_or(1))
+    };
+    // O evento de notificação WNF do processo (o do
+    // RtlSubscribeWnfStateChangeNotification da ntdll).
+    let notification_event = |block: u64| call(block, "NtCreateEvent", [block + EVENT, 0x1F_0003, 0, 0], &[0]) == 0 && call(block, "NtSetWnfProcessNotificationEvent", [guest::read64(block + EVENT), 0, 0, 0], &[]) == 0;
+    let publish = |block: u64, value: u32| {
+        guest::write32(block + DATA, value);
+        call(block, "NtUpdateWnfStateData", [block + NAME, block + DATA, 4, 0], &[0, 0, 0])
+    };
+    // As entregas pendentes do processo, concluídas uma a uma até a fila
+    // esvaziar: (quantas, o nome e o dado da última, o status final).
+    let drain = |block: u64| {
+        let descriptor = block + DELIVERY;
+        let mut status = call(block, "NtGetCompleteWnfStateSubscription", [0, 0, 0, 0], &[descriptor, 0x1030]);
+        let (mut count, mut name, mut last) = (0u32, 0u64, u32::MAX);
+        while status == 0 && count < 8 {
+            count += 1;
+            name = guest::read64(descriptor + 8);
+            last = guest::read32(descriptor + guest::read32(descriptor + 0x2C) as u64);
+            let mask = guest::read32(descriptor + 0x18) as u64;
+            status = call(block, "NtGetCompleteWnfStateSubscription", [descriptor + 8, descriptor, mask, 0], &[descriptor, 0x1030]);
+        }
+        (count, name, last, status)
+    };
+    let ran = with_test_process("wnf-winlogon.exe", None, |winlogon| {
+        let a = memory::map_user_region(0x2000).ok()?;
+        guest::write_bytes(a + SD, &DESCRIPTOR);
+        guest::write64(a + NAME, 0);
+        let created = call(a, "NtCreateWnfStateName", [a + NAME, 2, 0, 0], &[0, 4, a + SD]);
+        let name = guest::read64(a + NAME);
+        let subscribed = notification_event(a) && call(a, "NtSubscribeWnfStateChange", [a + NAME, 0, 1, a + IDENTIFIER], &[]) == 0;
+        let first = publish(a, 1);
+        // A entrega da escrita do próprio A.
+        let own = drain(a);
+        let logonui = with_test_process("wnf-logonui.exe", None, |_| {
+            let b = memory::map_user_region(0x2000).ok()?;
+            guest::write64(b + NAME, name);
+            guest::write32(b + LENGTH, 4);
+            let queried = call(b, "NtQueryWnfStateData", [b + NAME, 0, 0, b + STAMP], &[b + OUTPUT, b + LENGTH]);
+            let seen = (guest::read32(b + OUTPUT), guest::read32(b + STAMP));
+            let b_subscribed = notification_event(b) && call(b, "NtSubscribeWnfStateChange", [b + NAME, seen.1 as u64, 1, b + IDENTIFIER], &[]) == 0;
+            let ready = publish(b, 2);
+            // A volta a correr: recebe o 2 e publica 0.
+            let logonui_thread = process::get_current_thread();
+            process::set_current_thread(winlogon.thread);
+            let a_delivery = drain(a);
+            let released = publish(a, 0);
+            process::set_current_thread(logonui_thread);
+            let b_delivery = drain(b);
+            let _ = call(b, "NtClose", [guest::read64(b + EVENT), 0, 0, 0], &[]);
+            if let Some(region) = memory::find_region(b) {
+                memory::release_private_region(&region);
+            }
+            Some((queried, seen, b_subscribed, ready, a_delivery, released, b_delivery))
+        })
+        .flatten();
+        let deleted = call(a, "NtDeleteWnfStateName", [a + NAME, 0, 0, 0], &[]);
+        let deleted_again = call(a, "NtDeleteWnfStateName", [a + NAME, 0, 0, 0], &[]);
+        let _ = call(a, "NtClose", [guest::read64(a + EVENT), 0, 0, 0], &[]);
+        if let Some(region) = memory::find_region(a) {
+            memory::release_private_region(&region);
+        }
+        Some((created, name, subscribed, first, own, logonui, deleted, deleted_again))
+    })
+    .flatten();
+    let Some((created, name, subscribed, first, own, logonui, deleted, deleted_again)) = ran else {
+        assert(false, "userwnf-persistente: processos de usuario do winlogon e do LogonUI");
+        return;
+    };
+    let persistent = name != 0 && (name ^ NAME_MASK) & 0xF == 1 && (name ^ NAME_MASK) >> 4 & 3 == 2 && (name ^ NAME_MASK) >> 6 & 0xF == 0;
+    assert(created == 0 && persistent && subscribed && first == 0 && own.0 >= 1 && own.2 == 1, "userwnf-persistente: A cria o nome persistente de escopo de sistema com o descritor, assina e publica 1");
+    let Some((queried, seen, b_subscribed, ready, a_delivery, released, b_delivery)) = logonui else {
+        assert(false, "userwnf-persistente: processo do LogonUI");
+        return;
+    };
+    assert(queried == 0 && seen.0 == 1 && seen.1 != 0 && b_subscribed && ready == 0, "userwnf-persistente: B le o 1 no outro processo, assina a partir do carimbo lido e publica 2");
+    assert(a_delivery.0 >= 1 && a_delivery.1 == name && a_delivery.2 == 2 && a_delivery.3 == NO_MORE_ENTRIES, "userwnf-persistente: a entrega de A traz o 2 publicado por B");
+    assert(released == 0 && b_delivery.0 >= 1 && b_delivery.1 == name && b_delivery.2 == 0 && b_delivery.3 == NO_MORE_ENTRIES, "userwnf-persistente: A publica 0 e a entrega de B traz o 0");
+    assert(deleted == 0 && deleted_again == 0xC000_0034, "userwnf-persistente: NtDeleteWnfStateName apaga o nome persistente (a definicao some)");
+    assert(service::shutdown().is_ok() && !service::exists(), "userwnf-persistente: encerramento do servico");
+}
+
 fn user_thread_context(assert: Assert) {
     use crate::hal::amd64::{native_call, win32_thunk};
     use crate::ntos::ps::context::{kernel_frame as kernel_context_frame, set as set_thread_context, input as thread_context_input, registers as registers};
@@ -6419,6 +6537,7 @@ pub fn run(assert: Assert) {
     user_alpc_zw_group(assert);
     user_worker_factory(assert);
     user_wnf(assert);
+    user_wnf_persistent(assert);
     user_thread_context(assert);
     user_exceptions(assert);
     super::user_debug_service::run(assert);

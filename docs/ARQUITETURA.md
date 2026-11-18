@@ -3824,7 +3824,16 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   NtDeviceIoControlFile/NtFsControlFile. O
   ProductPolicy do licenciamento é capturado quando a hive SYSTEM é ligada
   (o CmGetSystemControlValues, `cm/hive_init.rs`) e publicado logo depois,
-  antes do primeiro driver (`init/phase1.rs`). Os bits que o ProcessHandleCheckingMode e a ProcessRaiseUMExceptionOnInvalidHandleClose ligam valem como no 19041
+  antes do primeiro driver (`init/phase1.rs`). O NtDeleteWnfStateName de um nome permanente ou persistente
+  confere DELETE no descritor da definição (de modo usuário), apaga o valor
+  dela na raiz do tempo de vida (ExpWnfDeletePermanentName) e a instância
+  do nome em cada escopo do tipo dele (ExpWnfEnumerateScopeInstances,
+  `ex/wnf/namespace.rs::next_scope_instance`), com o aviso de nome destruído
+  aos assinantes: é o que o winlogon faz com o nome de prontidão do LogonUI
+  a cada reinício dele. O autoteste `user_wnf_persistent` (fase 7) faz esse
+  protocolo entre dois processos de usuário: criação do nome persistente
+  com o descritor do winlogon, publicação, leitura e assinatura no outro
+  processo, as duas entregas e a remoção. Os bits que o ProcessHandleCheckingMode e a ProcessRaiseUMExceptionOnInvalidHandleClose ligam valem como no 19041
   (`ob/handle_table.rs`): com EnableHandleExceptions, um handle não nulo
   que o ObReferenceObjectByHandle não resolve (o ExHandleLogBadReference)
   levanta STATUS_INVALID_HANDLE no anel 3 pelo KeRaiseUserException quando
