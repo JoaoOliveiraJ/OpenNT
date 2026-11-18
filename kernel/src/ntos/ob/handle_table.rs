@@ -50,6 +50,100 @@ pub struct HandleDescription {
     pub access: u32,
 }
 
+/// O índice da lista livre (predecessor e sucessor de cada slot, dois ULONGs
+/// por slot, posição `handle / 2`) em frames do PFN, fora do heap: os
+/// identificadores de handle são globais e crescentes, então toda tabela
+/// cobre até o maior em uso no sistema.
+#[derive(Default)]
+struct FreeLinks {
+    frames: Vec<u64>,
+    /// ULONGs em uso (os frames cobrem pelo menos isso).
+    length: usize,
+}
+
+const LINKS_PER_FRAME: usize = 1024;
+
+impl FreeLinks {
+    fn len(&self) -> usize {
+        self.length
+    }
+
+    /// Cresce até `length` ULONGs zerados.
+    fn reserve(&mut self, length: usize) -> Result<(), KernelError> {
+        while self.frames.len() * LINKS_PER_FRAME < length {
+            let frame = crate::ntos::mm::pfn::alloc_page();
+            if frame == 0 {
+                return Err(KernelError::with_status("handle table free index: PFN esgotado", STATUS_INSUFFICIENT_RESOURCES));
+            }
+            crate::hal::physical::zero(frame, 4096);
+            self.frames.push(frame);
+        }
+        self.length = self.length.max(length);
+        Ok(())
+    }
+
+    fn cell(&self, index: usize) -> u64 {
+        self.frames[index / LINKS_PER_FRAME] + (index % LINKS_PER_FRAME) as u64 * 4
+    }
+
+    fn get(&self, index: usize) -> u32 {
+        crate::hal::physical::read32(self.cell(index))
+    }
+
+    fn set(&self, index: usize, value: u32) {
+        crate::hal::physical::write32(self.cell(index), value);
+    }
+}
+
+impl Drop for FreeLinks {
+    fn drop(&mut self) {
+        for &frame in &self.frames {
+            crate::ntos::mm::pfn::free_page(frame);
+        }
+    }
+}
+
+/// As páginas da tabela (folhas, diretórios e a de topo): VirtualAlloc de
+/// kernel (frames do PFN numa VA de sistema), como o pool paginado de que o
+/// NT tira as tabelas de handles, fora da arena dos convidados. O `Drop`
+/// devolve as páginas.
+#[derive(Default)]
+struct TablePages {
+    pages: Vec<u64>,
+}
+
+impl TablePages {
+    /// Uma página zerada.
+    fn allocate() -> Result<u64, KernelError> {
+        let page = crate::ntos::mm::virtual_memory::alloc(4096);
+        if page == 0 {
+            return Err(KernelError::with_status("native handle table allocation failed", STATUS_INSUFFICIENT_RESOURCES));
+        }
+        // SAFETY: página recém-mapeada, só desta tabela.
+        unsafe { core::ptr::write_bytes(page as *mut u8, 0, 4096) };
+        Ok(page)
+    }
+
+    fn release(pages: &[u64]) {
+        for &page in pages.iter().rev() {
+            crate::ntos::mm::virtual_memory::free(page, 4096);
+        }
+        // Outra CPU pode guardar a tradução: a VA só volta a ser usada
+        // depois da invalidação em todas.
+        if !pages.is_empty() {
+            if let Err(error) = crate::ntos::ke::smp::flush_remote_tlb(false) {
+                crate::debug_print!("[ob] paginas de tabela de handles: {}", error);
+            }
+        }
+    }
+}
+
+impl Drop for TablePages {
+    fn drop(&mut self) {
+        TablePages::release(&self.pages);
+    }
+}
+
 struct Table {
     pointer: u64,
     process: u64,
@@ -57,8 +151,9 @@ struct Table {
     directories: Vec<u64>,
     top: u64,
     allocations: Vec<u64>,
+    pages: TablePages,
     rows: BTreeMap<u32, Row>,
-    free_links: Vec<u32>,
+    free_links: FreeLinks,
     free_count: u32,
     first_free: u32,
     last_free: u32,
@@ -103,8 +198,9 @@ fn cas_entry_word(entry: &HandleTableEntry, expected: u64, replacement: u64) -> 
     }
 }
 
-fn allocate_storage(size: u64, page_aligned: bool) -> Result<u64, KernelError> {
-    let address = if page_aligned { guest::alloc_page() } else { guest::alloc_bytes(size) };
+/// A HANDLE_TABLE e a cabeça da lista global, na arena dos convidados.
+fn allocate_storage(size: u64) -> Result<u64, KernelError> {
+    let address = guest::alloc_bytes(size);
     if address == 0 {
         return Err(KernelError::with_status("native handle table allocation failed", STATUS_INSUFFICIENT_RESOURCES));
     }
@@ -127,11 +223,11 @@ impl Table {
     /// Acrescenta à lista livre nativa e ao índice de predecessores.
     fn append_free(&mut self, handle: u32, entry: u64) {
         let index = (handle / 2) as usize;
-        self.free_links[index] = self.last_free;
-        self.free_links[index + 1] = 0;
+        self.free_links.set(index, self.last_free);
+        self.free_links.set(index + 1, 0);
         let free_list = &table_at(self.pointer).free_lists[0];
         if self.last_free != 0 {
-            self.free_links[(self.last_free / 2 + 1) as usize] = handle;
+            self.free_links.set((self.last_free / 2 + 1) as usize, handle);
             entry_at(self.slot_entry(self.last_free)).next_free_handle_entry.set(entry);
         } else {
             self.first_free = handle;
@@ -146,30 +242,33 @@ impl Table {
     /// Retira um slot da lista livre, validando os dois vizinhos.
     fn take_free(&mut self, handle: u32) -> Result<u64, KernelError> {
         let index = (handle / 2) as usize;
-        let previous = self.free_links[index];
-        let next = self.free_links[index + 1];
-        let linked = if previous != 0 { self.free_links[(previous / 2 + 1) as usize] == handle } else { self.first_free == handle };
-        let linked_next = if next != 0 { self.free_links[(next / 2) as usize] == handle } else { self.last_free == handle };
+        if index + 1 >= self.free_links.len() {
+            return Err(KernelError::new("handle slot is not free"));
+        }
+        let previous = self.free_links.get(index);
+        let next = self.free_links.get(index + 1);
+        let linked = if previous != 0 { self.free_links.get((previous / 2 + 1) as usize) == handle } else { self.first_free == handle };
+        let linked_next = if next != 0 { self.free_links.get((next / 2) as usize) == handle } else { self.last_free == handle };
         if self.free_count == 0 || !linked || !linked_next {
             return Err(KernelError::new("handle slot is not free"));
         }
         let free_list = &table_at(self.pointer).free_lists[0];
         let next_entry = if next != 0 { self.slot_entry(next) } else { 0 };
         if previous != 0 {
-            self.free_links[(previous / 2 + 1) as usize] = next;
+            self.free_links.set((previous / 2 + 1) as usize, next);
             entry_at(self.slot_entry(previous)).next_free_handle_entry.set(next_entry);
         } else {
             self.first_free = next;
             free_list.first_free_handle_entry.set(next_entry);
         }
         if next != 0 {
-            self.free_links[(next / 2) as usize] = previous;
+            self.free_links.set((next / 2) as usize, previous);
         } else {
             self.last_free = previous;
             free_list.last_free_handle_entry.set(if previous != 0 { self.slot_entry(previous) } else { 0 });
         }
-        self.free_links[index] = 0;
-        self.free_links[index + 1] = 0;
+        self.free_links.set(index, 0);
+        self.free_links.set(index + 1, 0);
         self.free_count -= 1;
         Ok(self.slot_entry(handle))
     }
@@ -185,32 +284,31 @@ impl Table {
         let mut top = self.top;
         let result = (|| -> Result<(), KernelError> {
             while leaves.len() < needed {
-                let page = allocate_storage(4096, true)?;
+                let page = TablePages::allocate()?;
                 allocated.push(page);
                 leaves.push(page);
             }
             if needed > 1 {
                 while directories.len() < needed.div_ceil(512) {
-                    let page = allocate_storage(4096, true)?;
+                    let page = TablePages::allocate()?;
                     allocated.push(page);
                     directories.push(page);
                 }
             }
             if needed > 512 && top == 0 {
-                let page = allocate_storage(4096, true)?;
+                let page = TablePages::allocate()?;
                 allocated.push(page);
                 top = page;
             }
-            Ok(())
+            // O índice livre cresce antes de qualquer página ser ligada.
+            self.free_links.reserve(needed * 512)
         })();
         if let Err(error) = result {
-            for &page in allocated.iter().rev() {
-                guest::free_bytes(page);
-            }
+            TablePages::release(&allocated);
             return Err(error);
         }
         // Páginas intermediária e de topo: vetores de 512 ponteiros.
-        // SAFETY: páginas recém-alocadas por `allocate_storage` (4 KiB cada).
+        // SAFETY: páginas recém-alocadas por `TablePages::allocate` (4 KiB cada).
         let pointers = |page: u64| unsafe { Field::<u64>::array_at(page, 512) };
         if needed > 1 {
             for index in self.leaves.len()..needed {
@@ -226,13 +324,10 @@ impl Table {
             }
         }
         let old_count = self.leaves.len();
-        if self.free_links.len() < needed * 512 {
-            self.free_links.resize((needed * 512).max(self.free_links.len() * 2), 0);
-        }
         self.leaves = leaves;
         self.directories = directories;
         self.top = top;
-        self.allocations.extend(allocated);
+        self.pages.pages.extend(allocated);
         for page in old_count..needed {
             for slot in 1..256u32 {
                 let handle = page as u32 * 1024 + slot * 4;
@@ -249,7 +344,7 @@ impl Table {
 
 /// Cria a tabela vazia de um processo e a insere na lista global.
 pub fn create(process: u64, process_id: u64) -> Result<u64, KernelError> {
-    let pointer = allocate_storage(HandleTable::SIZE, false)?;
+    let pointer = allocate_storage(HandleTable::SIZE)?;
     let mut table = Table {
         pointer,
         process,
@@ -257,8 +352,9 @@ pub fn create(process: u64, process_id: u64) -> Result<u64, KernelError> {
         directories: Vec::new(),
         top: 0,
         allocations: vec![pointer],
+        pages: TablePages::default(),
         rows: BTreeMap::new(),
-        free_links: Vec::new(),
+        free_links: FreeLinks::default(),
         free_count: 0,
         first_free: 0,
         last_free: 0,
@@ -267,7 +363,7 @@ pub fn create(process: u64, process_id: u64) -> Result<u64, KernelError> {
     let mut new_head = 0;
     let result = table.grow(1).and_then(|_| {
         if registry.list_head == 0 {
-            new_head = allocate_storage(ListEntry::SIZE, false)?;
+            new_head = allocate_storage(ListEntry::SIZE)?;
             // SAFETY: alocação nova do tamanho de um LIST_ENTRY.
             let head = unsafe { ListEntry::at(new_head) };
             head.flink.set(new_head);
