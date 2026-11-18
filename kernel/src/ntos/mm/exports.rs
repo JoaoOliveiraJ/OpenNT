@@ -616,6 +616,20 @@ pub mod mm_secure_memory {
     };
 }
 
+pub mod mm_secure_memory_ex {
+    //! MmSecureVirtualMemoryEx; a lógica mora em `mm/secure_memory`.
+
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::ntos::mm::secure_memory;
+    use crate::rtl::KernelError;
+
+    fn secure_ex(call: &Call) -> Result<u64, KernelError> {
+        Ok(secure_memory::secure_ex(call.arg(1), call.arg(2), call.arg(3) as u32, call.arg(4) as u32))
+    }
+
+    pub static GROUP: Group = Group { name: "mm-secure-memory-ex", names: &["MmSecureVirtualMemoryEx"], handlers: &[secure_ex], data_exports: &[] };
+}
+
 pub mod mm_physical_memory {
     use crate::ntos::init::exports::{Call, Group};
     use crate::ntos::mm::{contiguous_memory, native_pfn_database, physical_layout};

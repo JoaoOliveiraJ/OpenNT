@@ -369,7 +369,7 @@ fn ntoskrnl_exports(assert: Assert) {
     use crate::{ntos::init::export_names as abi_names, ntos::init::exports};
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions, ResolvedImport};
     exports::init();
-    assert(abi_names::EXPORT_NAMES.len() == 2148 && abi_names::GROUP_LAYOUT.len() == 551 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 2059 exports em 506 grupos");
+    assert(abi_names::EXPORT_NAMES.len() == 2149 && abi_names::GROUP_LAYOUT.len() == 552 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 2059 exports em 506 grupos");
     // Ordinais públicos: os slots de função seguidos dos dados sem nome repetido.
     let public_count = abi_names::EXPORT_NAMES.len() + crate::ntos::mm::kernel_data_layout::DEFINITIONS.iter().filter(|entry| !abi_names::EXPORT_NAMES.contains(&entry.name)).count();
     assert(matches!(exports::lookup_ordinal("ntoskrnl.exe", 547), Some(ResolvedImport::Thunk(578))) && exports::lookup("ntoskrnl.exe", "LdrResSearchResource").is_some() && exports::lookup("ntoskrnl.exe", "NaoExisteNoKernel").is_none() && exports::lookup_ordinal("ntoskrnl.exe", 0).is_none() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32).is_some() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32 + 1).is_none(), "ntoskrnl: ordinais, todos os exports com provedor e nome desconhecido");
@@ -2186,7 +2186,7 @@ fn ntoskrnl_mm_group(assert: Assert) {
     use crate::ntos::mm::{image_paging, paging};
     use crate::ntos::init::exports;
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions};
-    assert(exports::implemented() == 2148 && exports::export_names().len() == 2148, "ntoskrnl: 551 grupos com os 2148 exports implementados");
+    assert(exports::implemented() == 2149 && exports::export_names().len() == 2149, "ntoskrnl: 552 grupos com os 2149 exports implementados");
     let block = guest::alloc_bytes(0x200);
     // MmGetSystemRoutineAddress: trampolim chamável e nome desconhecido.
     let name: alloc::vec::Vec<u16> = "KeGetCurrentIrql".encode_utf16().collect();
@@ -6356,6 +6356,12 @@ fn mm_secure_memory_exports(assert: Assert) {
     // Faixas inválidas: tamanho nulo, além da região, além de MmUserProbeAddress.
     assert(call_export("MmSecureVirtualMemory", &[address, 0, 4]) == Some(0) && call_export("MmSecureVirtualMemory", &[address, 0x3001, 2]) == Some(0) && call_export("MmSecureVirtualMemory", &[0x7FFF_FFFF_F000, 0x2000, 2]) == Some(0), "mm-secure-memory: faixas invalidas devolvem NULL");
 
+    // As faixas protegidas recusam trocar a proteção e descomitar
+    // (MiCheckSecuredVad); soltas, as sondas abaixo valem sozinhas.
+    for handle in [write, read] {
+        assert(call_export("MmUnsecureVirtualMemory", &[handle]) == Some(0), "mm-secure-memory: MmUnsecureVirtualMemory solta a entrada");
+    }
+
     // Página 3 somente leitura: sonda de escrita falha, de leitura passa.
     guest::write64(base, address + 0x2000);
     guest::write64(size, 0x1000);
@@ -6369,9 +6375,7 @@ fn mm_secure_memory_exports(assert: Assert) {
     let decommitted = call_export("ZwFreeVirtualMemory", &[current, base, size, 0x4000]);
     assert(decommitted == Some(0) && call_export("MmSecureVirtualMemory", &[address, 0x3000, 2]) == Some(0), "mm-secure-memory: pagina descomitada recusada");
 
-    for handle in [write, read, read_only] {
-        assert(call_export("MmUnsecureVirtualMemory", &[handle]) == Some(0), "mm-secure-memory: MmUnsecureVirtualMemory solta a entrada");
-    }
+    assert(call_export("MmUnsecureVirtualMemory", &[read_only]) == Some(0), "mm-secure-memory: MmUnsecureVirtualMemory solta a entrada da pagina somente leitura");
     assert(call_export("MmUnsecureVirtualMemory", &[write]) == Some(0), "mm-secure-memory: handle ja solto ignorado");
     guest::write64(base, address);
     guest::write64(size, 0);

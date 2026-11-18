@@ -69,7 +69,7 @@ use crate::ntos::mm::copy_virtual;
 use crate::ntos::mm::process_address_space::SYSTEM_ROOT;
 use crate::ntos::mm::process_commit;
 use crate::ntos::mm::paging_file::Slot as PageFileSlot;
-use crate::ntos::mm::{control_flow_guard, protection, write_watch};
+use crate::ntos::mm::{control_flow_guard, protection, secure_memory, write_watch};
 use crate::ntos::mm::working_set;
 use crate::ntos::mm::virtual_lock;
 use crate::ntos::mm::section::handles::{self as section_handles, Kind};
@@ -587,6 +587,13 @@ fn allocate_region(space: Space, base_pointer: u64, size_pointer: u64, allocatio
             let view = view_of(&existing);
             let ours = private(&existing).is_some() || view.is_some();
             if commit_only && ours && base >= existing.base() && base + size <= existing.base() + existing.size() {
+                // O MiCheckSecuredVad do MiAllocateVirtualMemory num VAD com
+                // entradas de segurança: a faixa em páginas com a máscara da
+                // proteção pedida.
+                let secured = secure_memory::check_vad(space.process(), &existing, base, size, protection::make_mask(protect).unwrap_or(0));
+                if secured != 0 {
+                    return Ok(secured);
+                }
                 if let Some(view) = view {
                     let status = sections::commit_view(&view, base, size, protect)?;
                     if status != 0 {
@@ -1213,6 +1220,20 @@ pub fn free_in(space: Space, base_pointer: u64, size_pointer: u64, free_type: u3
     if kind == FreeKind::PreservePlaceholder {
         return Ok(STATUS_CONFLICTING_ADDRESSES);
     }
+    // O MiCheckSecuredVad da remoção num VAD com entradas de segurança: o
+    // MEM_RELEASE confere o VAD inteiro (sem VmDeleted no processo), seja qual
+    // for a faixa; o MEM_DECOMMIT, da base pedida, sem arredondar, pelo
+    // número de páginas da faixa.
+    let secured = if !release {
+        secure_memory::check_vad(space.process(), &region, base, end - first, secure_memory::PROBE_DELETE)
+    } else if secure_memory::vm_deleted(space.process()) {
+        0
+    } else {
+        secure_memory::check_vad(space.process(), &region, region_start, region_end - region_start, secure_memory::PROBE_DELETE)
+    };
+    if secured != 0 {
+        return Ok(secured);
+    }
     if !release && size == 0 && start != region_start {
         return Ok(STATUS_FREE_VM_NOT_AT_BASE);
     }
@@ -1383,6 +1404,12 @@ pub fn protect_in(space: Space, base_pointer: u64, size_pointer: u64, new_protec
     let Some(region) = region.filter(|region| end <= region.base() + region.size()) else { return Ok(0xC000_0018) };
     // ULONG *OldProtect = PAGE_NOACCESS até a troca dar certo.
     guest::try_write::<u32>(old_pointer, 1)?;
+    // O MiCheckSecuredVad do MmProtectVirtualMemory num VAD com entradas de
+    // segurança: a base e o tamanho pedidos com a máscara da proteção nova.
+    let secured = secure_memory::check_vad(space.process(), &region, requested_base, requested_size, protection::make_mask(protect).unwrap_or(0));
+    if secured != 0 {
+        return Ok(secured);
+    }
     let section = region.section();
     let view = view_of(&region);
     if let Some(view) = &view {

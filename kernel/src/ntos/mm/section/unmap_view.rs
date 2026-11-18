@@ -62,11 +62,14 @@ pub fn unmap(handle: u64, base: u64, mode: u8) -> Result<u32, KernelError> {
             }
         }
         let Some(view) = view else { return Ok(0xC000_0019) };
-        // MiCheckSecuredVad(0x55) do VAD inteiro: uma faixa do
-        // MmSecureVirtualMemory na vista recusa a remoção.
-        let secured = secure_memory::check_unmap(process.pointer, view.base(), view.size());
-        if secured != 0 {
-            return Ok(secured);
+        // MiCheckSecuredVad(0x55) do VAD inteiro, num processo sem
+        // VmDeleted: uma faixa do MmSecureVirtualMemory na vista recusa a
+        // remoção.
+        if !secure_memory::vm_deleted(process.pointer) {
+            let secured = secure_memory::check_vad(process.pointer, &view.region(), view.base(), view.size(), secure_memory::PROBE_DELETE);
+            if secured != 0 {
+                return Ok(secured);
+            }
         }
         match section_views::unmap(&view) {
             Ok(()) => Ok(0),

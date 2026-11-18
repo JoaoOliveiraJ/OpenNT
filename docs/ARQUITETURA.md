@@ -1383,6 +1383,20 @@ além da KUSER_SHARED_DATA:
   protegida por MmSecureVirtualMemory (`mm/secure_memory.rs`); a vista
   SEC_NO_CHANGE sem faixa protegida desmapeia normalmente, inclusive pelo
   NtUnmapViewOfSection de usuário. Teste: `ntos/test/shared_section_views.rs`.
+- **Faixas protegidas** (`mm/secure_memory.rs`): o MmSecureVirtualMemory(Ex)
+  põe uma entrada de segurança no VAD que contém a faixa (a região
+  privada, a vista ou a imagem), com as flags do MiAddSecureEntry do 19041
+  (leitura, escrita, proteção exata com Flags 2, exclusiva com Flags 1, só
+  modo usuário com Flags 4), e o VAD fica NoChange enquanto tiver entradas
+  (uma vista SEC_NO_CHANGE já nasce NoChange e recusa a entrada exclusiva).
+  O MiCheckSecuredVad roda sobre as entradas do VAD no NtFreeVirtualMemory
+  (o MEM_RELEASE confere o VAD inteiro; o MEM_DECOMMIT, da base pedida sem
+  arredondar pelo número de páginas), no NtProtectVirtualMemory e no
+  MEM_COMMIT sobre o VAD (com a máscara da proteção nova) e no
+  desmapeamento; a recusa é STATUS_INVALID_PAGE_PROTECTION. A entrada guarda
+  a identidade da região, então uma região que sai do VAD por outro caminho
+  leva as entradas dela, e o fim do processo leva todas. Teste:
+  `ntos/test/phase6.rs` (`mm_secure_memory_exports`).
 - **Cópias de sistema** (`ps/user/loader.rs`): a ntdll, o apiset e as
   tabelas NLS são mapeados uma vez, na raiz do System (o mapeamento roda
   anexado ao System, venha o pedido de onde vier), e fotografados logo
