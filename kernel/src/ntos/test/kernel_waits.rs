@@ -588,7 +588,7 @@ fn alpc_answer_pair(assert: Assert) {
     let word = |bytes: &[u8; 4]| u32::from_le_bytes(*bytes) as u64;
     let request = 0x2001 << 32;
     assert(
-        finished && results[..3] == [0, 0, 0] && results[3] == request | word(b"PING") && results[4] == 0 && results[5] == request | word(b"ACK1") && results[6] == 0 && results[7] == 0 && results[8] == 0 && results[9] == request | word(b"PONG") && results[10] == 0 && results[11] == 2 << 32 | word(b"DONE") && results[12] == 0xC000_0702,
+        finished && results[..3] == [0, 0, 0] && results[3] == request | word(b"PING") && results[4] == 0 && results[5] == request | word(b"ACK1") && results[6] == 0 && results[7] == 0 && results[8] == 0 && results[9] == request | word(b"PONG") && results[10] == 0 && results[11] == 2 << 32 | word(b"DONE") && results[12] as u32 == 0xC000_0702,
         "kwait: resposta ALPC sem RELEASE_MESSAGE chega como LPC_REQUEST com LPC_CONTINUATION_REQUIRED e o cliente a responde pelo MessageId, no buffer reaproveitado; a resposta com RELEASE_MESSAGE e LPC_REPLY e nao se responde",
     );
     let _ = call_export("ZwClose", &[guest::read64(block + 8)]);

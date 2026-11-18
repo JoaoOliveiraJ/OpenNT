@@ -3290,15 +3290,20 @@ fn user_virtual_account_token(assert: Assert) {
         }
         assert(duplicate_ok && sub_process_ok, "virtualaccount: copias levam o TokenFlags e o token de processo novo fica na sessao do processo");
         let _ = call("NtClose", restricted, 0, 0, 0);
-        let _ = call("NtClose", token, 0, 0, 0);
+        // O primeiro token continua aberto: ele segura a sessão de logon,
+        // que sai com o último token (o SepDeReferenceLogonSession), e sem
+        // ela o NtCreateTokenEx dá STATUS_NO_SUCH_LOGON_SESSION.
+        let first = token;
         // Sem rótulo: Untrusted (S-1-16-0) e sem TOKEN_NOT_LOW, com a
         // máscara do LUA nos privilégios.
         write_groups(&[(everyone, 7)]);
         let unlabeled = create(0) == 0;
         let token = guest::read64(out);
         let pointer = state::get_user_handle(token).and_then(|entry| entry.downcast::<UserToken>().map(|object| object.token)).unwrap_or(0);
-        let unlabeled_ok = unlabeled && label(token) == [1, 1, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0] && token_records::token_flags(pointer) == 0 && privilege_list(token) == [(14, 0), (20, 0), (23, 3), (33, 0), (34, 0)];
-        let _ = call("NtClose", token, 0, 0, 0);
+        let unlabeled_ok = unlabeled && pointer != 0 && label(token) == [1, 1, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0] && token_records::token_flags(pointer) == 0 && privilege_list(token) == [(14, 0), (20, 0), (23, 3), (33, 0), (34, 0)];
+        if unlabeled {
+            let _ = call("NtClose", token, 0, 0, 0);
+        }
         assert(unlabeled_ok, "virtualaccount: token sem rotulo vale Untrusted e fica sem TOKEN_NOT_LOW");
         // Recusas do SepCreateTokenEx.
         let with = |entries: &[(u64, u32)], privilege_entries: &[(u64, u32)], mandatory_policy: u64| {
@@ -3320,7 +3325,9 @@ fn user_virtual_account_token(assert: Assert) {
         let bad_policy = with(&[(everyone, 7)], &dwm_privileges, policy) == 0xC000_000D;
         assert(second_label && beyond && enabled_deny_only && duplicate_privilege && unknown_privilege && bad_attributes && bad_policy, "virtualaccount: NtCreateTokenEx recusa segundo rotulo, nivel acima de System, deny-only habilitado, privilegio repetido ou desconhecido, atributo invalido e politica invalida");
         let _ = call("NtClose", own, 0, 0, 0);
-        assert(session == 0 && logon_session::delete_track(logon) == 0, "virtualaccount: a sessao de logon sai depois do ultimo token");
+        let held = logon_session::exists(logon, 0) && logon_session::delete_track(logon) == 0xC000_0104;
+        let _ = call("NtClose", first, 0, 0, 0);
+        assert(session == 0 && held && !logon_session::exists(logon, 0), "virtualaccount: a sessao de logon sai com o ultimo token");
         if let Some(region) = memory::find_region(block) {
             memory::release_private_region(&region);
         }
@@ -3620,7 +3627,7 @@ fn user_alpc_services(assert: Assert) {
     association.completion_key.set(0x55);
     association.completion_port.set(queue_handle.unwrap_or(0));
     let associated = services::set_information(handle, 2, input, 16, 1).ok();
-    assert(associated == Some(0) && port.completion_key() == 0x55 && services::set_information(handle, 2, input, 16, 1).ok() == Some(0xC000_0048) && services::set_information(handle, 2, input, 8, 1).ok() == Some(0xC000_0004) && services::set_information(handle, 1, input, 8, 1).ok() == Some(0xC000_00BB) && services::set_information(handle, 3, input, 8, 1).ok() == Some(0xC000_000D) && services::set_information(0, 2, input, 16, 1).ok() == Some(0xC000_000D) && services::set_information(handle, 2, input, 80, 1).ok() == Some(0xC000_0004), "useralpcsvc: associacao da IOCP por set-information");
+    assert(associated == Some(0) && port.completion_key() == 0x55 && services::set_information(handle, 2, input, 16, 1).ok() == Some(0xC000_0048) && services::set_information(handle, 2, input, 8, 1).ok() == Some(0xC000_0004) && services::set_information(handle, 1, input, 8, 1).ok() == Some(0xC000_0004) && services::set_information(handle, 3, input, 8, 1).ok() == Some(0xC000_000D) && services::set_information(0, 2, input, 16, 1).ok() == Some(0xC000_000D) && services::set_information(handle, 2, input, 80, 1).ok() == Some(0xC000_0004), "useralpcsvc: associacao da IOCP por set-information");
     if let (Ok(queue), Some(completion)) = (&queue, port.with(|state| state.completion.clone())) {
         let limit = queue.concurrency().min(4) as usize;
         for _ in 0..limit + 2 {
@@ -4671,14 +4678,18 @@ fn user_worker_factory(assert: Assert) {
     let short = call("NtQueryInformationWorkerFactory", handle, 7, out, 0x70);
     let class = call("NtQueryInformationWorkerFactory", handle, 1, out, 0x78);
     assert(short == Some(0xC000_0004) && class == Some(0xC000_0003), "userwf: recusas da consulta");
-    // Set-information: cada classe com as recusas.
+    // Set-information: cada classe com as recusas, como no 19041: o máximo
+    // aceita zero, o delta das ligações satura em zero, o IdleTimeout recusa
+    // valor positivo e a prioridade de base não é validada.
     let input = block + 0x300;
     let set = |class: u64, value: u64, length: u64| {
         guest::write64(input, value);
         call("NtSetInformationWorkerFactory", handle, class, input, length)
     };
-    let classes = (set(5, 8, 4), set(5, 0, 4), set(3, 2, 4), set(3, (-5i32) as u32 as u64, 4), set(2, 5, 8), set(2, (-50_000_000i64) as u64, 8), set(11, 40, 4), set(11, 12, 4), set(13, 1, 4), set(14, 100, 4), set(1, 0, 4), set(5, 8, 2));
-    assert(classes == (Some(0), Some(0xC000_000D), Some(0), Some(0xC000_000D), Some(0xC000_000D), Some(0), Some(0xC000_000D), Some(0), Some(0), Some(0), Some(0xC000_0003), Some(0xC000_0004)), "userwf: classes do set-information");
+    let maximum_zero = (set(5, 0, 4), factory.as_ref().map(|factory| factory.maximum()));
+    let saturated = (set(3, 2, 4), set(3, (-5i32) as u32 as u64, 4), factory.as_ref().map(|factory| factory.binding_count()));
+    let classes = (set(5, 8, 4), set(3, 2, 4), set(2, 5, 8), set(2, (-50_000_000i64) as u64, 8), set(11, 40, 4), set(11, 12, 4), set(13, 1, 4), set(14, 100, 4), set(1, 0, 4), set(5, 8, 2));
+    assert(maximum_zero == (Some(0), Some(0)) && saturated == (Some(0), Some(0), Some(0)) && classes == (Some(0), Some(0), Some(0xC000_000D), Some(0), Some(0), Some(0), Some(0), Some(0), Some(0xC000_0003), Some(0xC000_0004)), "userwf: classes do set-information");
     let factory = factory.expect("fabrica");
     assert(factory.maximum() == 8 && factory.binding_count() == 2 && factory.idle_timeout() == -50_000_000 && factory.priority() == 12 && factory.loader_worker() && factory.soft_maximum() == 8, "userwf: configuracao gravada no corpo da fabrica");
     // Mínimo: a criação de workers falha fora do runtime e registra o status.
@@ -4689,7 +4700,7 @@ fn user_worker_factory(assert: Assert) {
     // A classe 9 (o callback longo da ntdll): valores, contagem e o pedido
     // de worker, cuja falha de criação fica no último status.
     let long = (set(9, 5, 4), set(9, 2, 4), set(9, 0, 4), set(9, 1, 8), set(9, 1, 4));
-    assert(long == (Some(0xC000_000D), Some(0xC000_0001), Some(0xC000_0001), Some(0xC000_0004), Some(0)) && factory.ready_workers() == 0, "userwf: classe 9 recusa valor, contagem zerada e tamanho e aceita o TpCallbackMayRunLong");
+    assert((long.0, long.1, long.2, long.3) == (Some(0xC000_000D), Some(0xC000_0001), Some(0xC000_0001), Some(0xC000_0004)) && long.4.is_some_and(|status| status != 0 && status == factory.last_status()) && factory.ready_workers() == 0, "userwf: classe 9 recusa valor, contagem zerada e tamanho, e o TpCallbackMayRunLong devolve a falha de criacao do worker");
     // A classe 10 (WorkerFactoryStackInformation): 16 bytes alinhados com o
     // reserve e o commit das próximas threads.
     guest::write64(input, 0x4_0000);
@@ -4706,7 +4717,7 @@ fn user_worker_factory(assert: Assert) {
     let ready = call("NtWorkerFactoryWorkerReady", handle, 0, 0, 0);
     stack(&[0]);
     let wait = call("NtWaitForWorkViaWorkerFactory", handle, out, 1, returned);
-    assert(ready == Some(0xC000_000D) && wait == Some(0xC000_000D), "userwf: chamadas de worker recusadas fora de uma thread worker");
+    assert(ready == Some(0xC000_0001) && wait == Some(0xC000_0005), "userwf: WorkerReady fora de uma thread worker e espera sem DeferredWork recusados");
     // Encerramento.
     guest::write32(block + 0x320, 3);
     let shut = call("NtShutdownWorkerFactory", handle, block + 0x320, 0, 0);
@@ -4716,7 +4727,7 @@ fn user_worker_factory(assert: Assert) {
     guest::write64(input + 8, 0x3000);
     let stack_after = call("NtSetInformationWorkerFactory", handle, 10, input, 16);
     assert(stack_after == Some(0x80) && factory.commit() == 0x2000, "userwf: classe 10 numa fabrica encerrada volta 0x80 sem gravar");
-    assert(shut == Some(0) && guest::read32(block + 0x320) == 3 && factory_info.shutdown.get() == 1 && factory.shutdown() && port.as_ref().is_some_and(|port| port.listeners.lock().len() == listeners_before) && after == (Some(0xC000_010A), Some(0x80), Some(0xC000_010A)), "userwf: encerramento recusa configuracao e liberacao");
+    assert(shut == Some(0) && guest::read32(block + 0x320) == 3 && factory_info.shutdown.get() == 1 && factory.shutdown() && port.as_ref().is_some_and(|port| port.listeners.lock().len() == listeners_before) && after == (Some(0x80), Some(0x80), Some(0x80)), "userwf: encerramento recusa configuracao e liberacao com STATUS_ABANDONED");
     // Fechamento: a última referência libera a fábrica e a IOCP.
     drop(factory);
     let _ = call("NtClose", handle, 0, 0, 0);
