@@ -4696,15 +4696,41 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   lsasrv aceita. O comando 7 liga a auditoria da linha de comando. Os
   comandos 6 e 8 a 12 respondem STATUS_NOT_SUPPORTED, com registro (o 6, as
   políticas de acesso central, é o LsapApplyCAPsUpdate, cuja falha o lsasrv
-  só registra). A
-  conexão de volta ainda não leva o PORT_VIEW de 4 KB do NT (o
-  ZwSecureConnectPort de kernel não monta vistas), e o SepRmCallLsa (os
-  comandos do Reference Monitor ao LSA) ainda não existe. O lado servidor
-  LPC de modo kernel são o ZwCreatePort, o ZwReplyWaitReceivePort (a
-  recepção legada com o PortContext, `server::begin_kernel_legacy_receive`),
-  o ZwAcceptConnectPort (o `server::accept_legacy` em KernelMode) e o
-  ZwCompleteConnectPort; o autoteste `test/kernel_waits.rs` põe um servidor e
-  um cliente LPC de kernel em threads de sistema.
+  só registra). O RmAuditSetCommand e o comando 7 ligam o
+  SepRmAuditingEnabled; o SeRmInitPhase1 registra a auditoria no ETW (o
+  SepAdtInitializeAuditingOptions: o AdtpRegisteredWithEtw e o evento
+  `\ADT_ETW_CHANNEL_INIT` sinalizado). Quando a conexão do lsass fecha, o
+  Reference Monitor zera o SepRmAuditingEnabled, esvazia a fila do aviso de
+  sessão apagada, fecha a `\SeRmCommandPort` e encerra a thread, como no
+  silo hospedeiro do NT. A conexão de volta ainda não leva o PORT_VIEW de
+  4 KB do NT (o ZwSecureConnectPort de kernel não monta vistas). O lado
+  servidor LPC de modo kernel são o ZwCreatePort, o ZwReplyWaitReceivePort
+  (a recepção legada com o PortContext,
+  `server::begin_kernel_legacy_receive`), o ZwAcceptConnectPort (o
+  `server::accept_legacy` em KernelMode) e o ZwCompleteConnectPort; o
+  autoteste `test/kernel_waits.rs` põe um servidor e um cliente LPC de kernel
+  em threads de sistema.
+- **O aviso de sessão de logon apagada ao LSA** (`se/lsa_call.rs`, o
+  SepRmCallLsa): quando o último token de uma sessão de logon sai, o
+  SepDeReferenceLogonSession (`se/logon_session.rs`) põe um SEP_WORK_ITEM
+  (`inc/types/extra_obpsse.rs`) com o comando 3 e o LUID na fila
+  SepLsaDeletedLogonQueueInfo (o SepInformLsaOfDeletedLogon); a sessão que o
+  LSA apaga pelo RmDeleteLogonSession não volta a ele. A fila numera os
+  itens e, quando passa de vazia a um item, põe o trabalhador SepRmCallLsa
+  na DelayedWorkQueue. O trabalhador espera o `\ADT_ETW_CHANNEL_INIT`
+  enquanto a auditoria não está registrada no ETW e só manda os itens com o
+  SepRmAuditingEnabled; o SepRmDispatchDataToLsa monta a LSA_COMMAND_MESSAGE
+  (TotalLength 0x38, DataLength 0x10, CommandNumber 3, parâmetros imediatos,
+  o LUID em +0x30) e a manda como datagrama pelo ZwRequestPort
+  (`alpc/lpc.rs::request_port_by_handle`) na conexão de volta à
+  `\SeLsaCommandPort`. O lsass entrega o comando 3 ao lsasrv, que apaga a
+  sessão da tabela de sessões de logon do LSA; os pacotes de segurança, o
+  cofre de credenciais e o DPAPI recebem o fim da sessão. Sem o aviso, as
+  sessões de cada logoff de usuário e das contas virtuais DWM-n e UMFD-n
+  ficariam vivas no LSA. Os outros tipos de memória e os comandos com
+  resposta (os registros de auditoria do NT) não existem; o autoteste
+  `test/lsa_logon_notice.rs` cobre o datagrama num par LPC de kernel, o
+  portão do ETW, o esvaziamento e o gancho da sessão de logon.
 - **Os últimos exports da família win32k e dos drivers de console, PCI,
   ACPI e rede**, cada um no componente dono:
   - o objeto Timer (ETIMER) em `ex/timer_object.rs`: NtCreateTimer,

@@ -28,11 +28,13 @@
 //!   SepInformFileSystemsOfDeletedLogon (rva 0x923864): um bloco de 0x30
 //!   bytes de NonPagedPoolNx ('SeFS') com o WORK_QUEUE_ITEM, o LogonId e o
 //!   silo (referenciado), na DelayedWorkQueue; o SepNotifyFileSystems (rva
-//!   0x923a80) chama cada rotina registrada com (&LogonId, Silo, Context);
+//!   0x923a80) chama cada rotina registrada com (&LogonId, Silo, Context).
+//!   Por último vem o aviso ao LSA, o SepInformLsaOfDeletedLogon (rva
+//!   0x6f7da0, `se/lsa_call.rs`), para toda sessão que sai assim;
 //! - SepDeleteLogonSessionTrack (rva 0x77a490): só apaga a sessão sem
 //!   referência, ou com a referência única do LSA (bit 8 desligado); senão
 //!   STATUS_BAD_LOGON_SESSION_STATE. Apagar pelo LSA não avisa os file
-//!   systems.
+//!   systems nem o próprio LSA.
 //!
 //! As rotinas de término: SeRegisterLogonSessionTerminatedRoutineEx (rva
 //! 0x7d0dd0) põe (Routine, Context) na cabeça da lista
@@ -388,10 +390,9 @@ pub fn dereference_direct(logon_id: u64, server_silo: u64) {
 /// SepDeReferenceLogonSession na destruição de um token: no zero a sessão
 /// sai do banco; a do token filtrado de um par do UAC (Flags 4) solta a
 /// referência que segura na sessão irmã (o SepDeReferenceLogonSession do
-/// BuddyLogonId, quando não é zero); o token de sessão é solto e, com a
-/// marca de término, os file systems são avisados. O aviso ao LSA que o
-/// 19041 dá em seguida (o SepInformLsaOfDeletedLogon) ainda não existe; o
-/// que ele precisa está em `se/reference_monitor.rs`.
+/// BuddyLogonId, quando não é zero); o token de sessão é solto, com a
+/// marca de término os file systems são avisados e, por fim, o LSA (o
+/// SepInformLsaOfDeletedLogon, `se/lsa_call.rs`).
 pub fn dereference_for_token(logon_id: u64, server_silo: u64) {
     let removed = with_sessions(|sessions| {
         let position = sessions.iter().position(|session| session.logon_id == logon_id && session.server_silo == server_silo)?;
@@ -412,6 +413,7 @@ pub fn dereference_for_token(logon_id: u64, server_silo: u64) {
     if session.flags & SESSION_TERMINATION_NOTIFY != 0 {
         inform_file_systems(session.logon_id, session.server_silo);
     }
+    crate::ntos::se::lsa_call::inform_lsa_of_deleted_logon(session.logon_id, session.server_silo);
 }
 
 /// SeRegisterLogonSessionTerminatedRoutineEx(Routine, Context) -> NTSTATUS.

@@ -1,7 +1,9 @@
-//! Os parâmetros dos callouts do Win32k e os registros internos dos
-//! atributos de segurança do token, que os símbolos do ntoskrnl não têm
-//! (layouts lidos de PspExitThread/PsConvertToGuiThread e de
-//! AuthzBasepCopyoutInternalSecurityAttributes do ntoskrnl 19041).
+//! Os parâmetros dos callouts do Win32k, os registros internos dos
+//! atributos de segurança do token e as mensagens e itens entre o Reference
+//! Monitor e o LSA, que os símbolos do ntoskrnl não têm (layouts lidos de
+//! PspExitThread/PsConvertToGuiThread, de
+//! AuthzBasepCopyoutInternalSecurityAttributes e das rotinas SepRm* do
+//! ntoskrnl 19041).
 //!
 //! Mantido à mão, no estilo de `types`: `#[repr(C)]`, folhas `Field<T>`,
 //! `size_of`/`offset_of!` conferidos em compilação. O contexto de segurança
@@ -126,4 +128,65 @@ const _: () = {
     assert!(core::mem::size_of::<RmReplyMessage>() == 0x200);
     assert!(core::mem::offset_of!(RmReplyMessage, returned_status) == 0x28);
     assert!(core::mem::offset_of!(RmReplyMessage, reply_buffer) == 0x2C);
+};
+
+/// `LSA_COMMAND_MESSAGE`: o comando que o Reference Monitor manda ao LSA pela
+/// `\SeLsaCommandPort` (o layout que o SepRmDispatchDataToLsa do ntoskrnl
+/// 19041, rva 0x34d558, monta e o LsapRmServerThread do lsass.exe recebe): o
+/// PORT_MESSAGE, o CommandNumber, o tipo de memória dos parâmetros (1 =
+/// imediatos, na própria mensagem; 2 = na vista de 4 KB da conexão; 3 = na
+/// memória alocada no processo do LSA) e os parâmetros imediatos (até 0x1D0
+/// bytes). 0x200 bytes.
+#[repr(C)]
+pub struct LsaCommandMessage {
+    pub message_header: PortMessage,
+    pub command_number: Field<u32>,
+    pub command_params_memory_type: Field<u32>,
+    pub command_params: [Field<u8>; 0x1D0],
+}
+
+unsafe impl NtStruct for LsaCommandMessage {}
+
+/// `SEP_WORK_ITEM`: um item das filas do SepRmCallLsa (layout lido do
+/// SepInformLsaOfDeletedLogon, do SepQueueWorkItem, do SepRmCallLsa e do
+/// SepRmDispatchDataToLsa do ntoskrnl 19041): o elo da lista, o tipo de
+/// memória dos parâmetros (1 = imediatos em CommandParams; 4 e 5 = um bloco
+/// de pool apontado por CommandParams, liberado depois do envio), o
+/// CommandNumber, o comprimento dos parâmetros, o buffer e o comprimento da
+/// resposta (sem buffer, o comando 3 vai como datagrama), o número de
+/// sequência que o SepQueueWorkItem dá e o silo de servidor. 0x40 bytes.
+#[repr(C)]
+pub struct SepWorkItem {
+    pub list: ListEntry,
+    pub command_params_memory_type: Field<u32>,
+    /// Zerado pelo SepInformLsaOfDeletedLogon; nenhuma rotina da fila o lê.
+    pub reserved: Field<u32>,
+    /// Os 8 bytes dos parâmetros imediatos (o LUID da sessão apagada) ou o
+    /// ponteiro para eles.
+    pub command_params: Field<u64>,
+    pub command_number: Field<u32>,
+    pub command_params_length: Field<u32>,
+    pub reply_buffer: Field<u64>,
+    pub reply_buffer_length: Field<u32>,
+    pub sequence_number: Field<u32>,
+    /// -> `_EJOB`
+    pub server_silo: Field<u64>,
+}
+
+unsafe impl NtStruct for SepWorkItem {}
+
+const _: () = {
+    assert!(core::mem::size_of::<LsaCommandMessage>() == 0x200);
+    assert!(core::mem::offset_of!(LsaCommandMessage, command_number) == 0x28);
+    assert!(core::mem::offset_of!(LsaCommandMessage, command_params_memory_type) == 0x2C);
+    assert!(core::mem::offset_of!(LsaCommandMessage, command_params) == 0x30);
+    assert!(core::mem::size_of::<SepWorkItem>() == 0x40);
+    assert!(core::mem::offset_of!(SepWorkItem, command_params_memory_type) == 0x10);
+    assert!(core::mem::offset_of!(SepWorkItem, command_params) == 0x18);
+    assert!(core::mem::offset_of!(SepWorkItem, command_number) == 0x20);
+    assert!(core::mem::offset_of!(SepWorkItem, command_params_length) == 0x24);
+    assert!(core::mem::offset_of!(SepWorkItem, reply_buffer) == 0x28);
+    assert!(core::mem::offset_of!(SepWorkItem, reply_buffer_length) == 0x30);
+    assert!(core::mem::offset_of!(SepWorkItem, sequence_number) == 0x34);
+    assert!(core::mem::offset_of!(SepWorkItem, server_silo) == 0x38);
 };

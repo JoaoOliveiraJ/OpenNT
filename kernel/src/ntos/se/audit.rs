@@ -10,14 +10,14 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::mem::offset_of;
 
-use crate::ntos::inc::types::{AccessAllowedAce, AccessState, AceHeader, Acl, AuxAccessData, Guid, NtStruct, PrivilegeSet, SecuritySubjectContext};
+use crate::ntos::inc::types::{AccessAllowedAce, AccessState, AceHeader, Acl, AuxAccessData, Guid, NtStruct, ObjectAttributes, PrivilegeSet, SecuritySubjectContext};
 use crate::ntos::ke::clock;
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::ob::{get_object_type, object_types};
 use crate::ntos::rtl::guest_strings;
 use crate::ntos::se::token::tokens;
 use crate::ntos::se::{descriptor, out, sid};
-use crate::rtl::SpinLock;
+use crate::rtl::{KernelError, SpinLock};
 
 /// Evento de auditoria gravado no anel.
 #[derive(Clone, Debug)]
@@ -124,7 +124,8 @@ pub const LSA_POLICY_SUBCATEGORIES: usize = 60;
 /// pela `\SeRmCommandPort` (`se/reference_monitor.rs`): cada palavra liga o
 /// sucesso (bit 0) e a falha (bit 1) da subcategoria; cada categoria recebe
 /// o código de sucesso (1 todas, 2 algumas, 4 nenhuma) no nibble baixo e o de
-/// falha no alto.
+/// falha no alto. No fim liga o SepRmAuditingEnabled (rva 0x7c5319), que
+/// abre o envio das filas do SepRmCallLsa ao LSA (`se/lsa_call.rs`).
 pub fn set_policy_from_lsa(policy: &[u16; LSA_POLICY_SUBCATEGORIES]) {
     let code = |count: usize, total: usize| if count == 0 { 4 } else if count == total { 1 } else { 2 };
     let mut state = POLICY.lock();
@@ -140,6 +141,8 @@ pub fn set_policy_from_lsa(policy: &[u16; LSA_POLICY_SUBCATEGORIES]) {
         }
         state.by_category[category] = code(successes, total) | code(failures, total) << 4;
     }
+    drop(state);
+    AUDITING_ENABLED.store(true, core::sync::atomic::Ordering::Release);
 }
 
 /// Uma entrada da SepRmGlobalSaclHead: o nome do tipo de objeto e a SACL
@@ -200,7 +203,8 @@ pub fn global_sacl(type_name: &str) -> Option<Vec<u8>> {
     GLOBAL_SACLS.lock().iter().find(|entry| entry.type_name == wanted).map(|entry| entry.sacl.clone())
 }
 
-/// SepRmAuditProcessCommandLine e SepRmAuditingEnabled.
+/// SepRmAuditProcessCommandLine e SepRmAuditingEnabled (rva 0xc1d534; o
+/// SepRmDbInitialization o zera no boot).
 static AUDIT_PROCESS_COMMAND_LINE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static AUDITING_ENABLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
@@ -211,6 +215,93 @@ pub fn set_process_command_line_audit(enabled: bool) -> u32 {
     AUDIT_PROCESS_COMMAND_LINE.store(enabled, core::sync::atomic::Ordering::Release);
     AUDITING_ENABLED.store(true, core::sync::atomic::Ordering::Release);
     0
+}
+
+/// SepRmAuditingEnabled: o LSA já mandou a política (RmAuditSetCommand) ou a
+/// auditoria da linha de comando. Sem ele, o SepRmCallLsa
+/// (`se/lsa_call.rs`) esvazia as filas sem mandar nada ao LSA.
+pub fn auditing_enabled() -> bool {
+    AUDITING_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// O SepRmAuditingEnabled zerado quando a conexão do LSA fecha no silo
+/// hospedeiro (o LPC_PORT_CLOSED do SepRmCommandServerThread).
+pub fn disable_auditing() {
+    AUDITING_ENABLED.store(false, core::sync::atomic::Ordering::Release);
+}
+
+// ---- O registro da auditoria no ETW -----------------------------------------
+//
+// O SeRmInitPhase1 do 19041 chama o SepAdtInitializeAuditingOptions (rva
+// 0xa4bb0c) logo depois de criar a `\SeRmCommandPort`: o
+// AdtpInitializeAuditingCommon (rva 0x79e7d0) liga o AdtpRegisteredWithEtw e,
+// com ele pronto, o evento `\ADT_ETW_CHANNEL_INIT` é criado ou aberto
+// (SepAdtOpenEtwReadyEvent), sinalizado (NtSetEvent) e fechado. O SepRmCallLsa
+// que roda antes disso espera esse evento. O resto do
+// SepAdtInitializeAuditingOptions (as letras de unidade e os objetos do
+// AdtpInitializeAuditingCommon, a notificação do Registro das opções de
+// auditoria, o CrashOnAuditFail, a auditoria de privilégios e os limites)
+// não existe no OpenNT.
+
+/// AdtpRegisteredWithEtw.
+static REGISTERED_WITH_ETW: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// O evento que sinaliza o registro da auditoria no ETW.
+pub const ETW_READY_EVENT_NAME: &str = "\\ADT_ETW_CHANNEL_INIT";
+/// SYNCHRONIZE | EVENT_QUERY_STATE | EVENT_MODIFY_STATE.
+const ETW_READY_EVENT_ACCESS: u32 = 0x10_0003;
+/// OBJ_OPENIF | OBJ_KERNEL_HANDLE.
+const ETW_READY_EVENT_ATTRIBUTES: u32 = 0x280;
+const STATUS_OBJECT_NAME_EXISTS: u32 = 0x4000_0000;
+const STATUS_OBJECT_NAME_COLLISION: u32 = 0xC000_0035;
+const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
+
+/// AdtpRegisteredWithEtw: o SepAdtInitializeAuditingOptions já rodou.
+pub fn registered_with_etw() -> bool {
+    REGISTERED_WITH_ETW.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// SepAdtOpenEtwReadyEvent (rva 0x79e744): o NtCreateEvent do
+/// `\ADT_ETW_CHANNEL_INIT` (SYNCHRONIZE | EVENT_QUERY_STATE |
+/// EVENT_MODIFY_STATE, OBJ_OPENIF | OBJ_KERNEL_HANDLE, evento de notificação
+/// não sinalizado). STATUS_OBJECT_NAME_EXISTS e STATUS_OBJECT_NAME_COLLISION
+/// viram STATUS_SUCCESS. Devolve (NTSTATUS, handle; 0 sem handle).
+pub fn open_etw_ready_event() -> Result<(u32, u64), KernelError> {
+    let units = ETW_READY_EVENT_NAME.encode_utf16().count() as u64;
+    let block = guest::alloc_bytes(ObjectAttributes::SIZE + 8 + 16 + units * 2 + 2);
+    if block == 0 {
+        return Ok((STATUS_INSUFFICIENT_RESOURCES, 0));
+    }
+    let (attributes_address, handle_cell, name) = (block, block + ObjectAttributes::SIZE, block + ObjectAttributes::SIZE + 8);
+    guest::write_bytes(block, &alloc::vec![0u8; (ObjectAttributes::SIZE + 8) as usize]);
+    guest_strings::write_wide_string(name + 16, ETW_READY_EVENT_NAME);
+    guest_strings::write_string_fields(name, (units * 2) as u16, (units * 2 + 2) as u16, name + 16);
+    // SAFETY: bloco recém-alocado com o tamanho do OBJECT_ATTRIBUTES.
+    let attributes = unsafe { ObjectAttributes::at(attributes_address) };
+    attributes.length.set(ObjectAttributes::SIZE as u32);
+    attributes.object_name.set(name);
+    attributes.attributes.set(ETW_READY_EVENT_ATTRIBUTES);
+    let created = crate::ntos::ex::event::create(handle_cell, ETW_READY_EVENT_ACCESS, attributes_address, 0, false);
+    let handle = guest::read64(handle_cell);
+    guest::free_bytes(block);
+    Ok(match created? {
+        STATUS_OBJECT_NAME_EXISTS | STATUS_OBJECT_NAME_COLLISION => (0, handle),
+        status => (status, handle),
+    })
+}
+
+/// SepAdtInitializeAuditingOptions, a parte do registro no ETW: o
+/// AdtpRegisteredWithEtw ligado e o `\ADT_ETW_CHANNEL_INIT` sinalizado e
+/// fechado. Devolve o NTSTATUS.
+pub fn initialize_auditing_options() -> Result<u32, KernelError> {
+    REGISTERED_WITH_ETW.store(true, core::sync::atomic::Ordering::Release);
+    let (status, handle) = open_etw_ready_event()?;
+    if status & 0x8000_0000 != 0 {
+        return Ok(status);
+    }
+    let set = crate::ntos::ex::event::set(handle, 0)?;
+    let _ = crate::ntos::ob::close::close(handle, Some(0));
+    Ok(set)
 }
 
 /// SepRmAuditProcessCommandLine.

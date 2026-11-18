@@ -8,6 +8,10 @@
 //!   porta (o ponteiro, não um handle) com ALPC_MSGFLG_RELEASE_MESSAGE e o
 //!   modo LPC (0x10002), sem atributos, em KernelMode e numa região crítica:
 //!   um datagrama, sem resposta;
+//! - ZwRequestPort(PortHandle, RequestMessage) ([`request_port_by_handle`],
+//!   o datagrama do Reference Monitor ao LSA): o mesmo envio pelo handle,
+//!   com ALPC_MSGFLG_RELEASE_MESSAGE só (0x10000), como o NtRequestPort em
+//!   KernelMode;
 //! - LpcSendWaitReceivePort(PortAddress, Flags, SendMessage, ReceiveMessage,
 //!   BufferLength, Timeout): o AlpcpProcessSynchronousRequest com Flags | 2
 //!   (o envio síncrono e a espera da resposta na mesma chamada), sem
@@ -59,6 +63,10 @@ const STATUS_PORT_DISCONNECTED: u32 = 0xC000_0037;
 const STATUS_LPC_REPLY_LOST: u32 = 0xC000_0253;
 /// ALPC_MSGFLG_RELEASE_MESSAGE e o bit de modo LPC do LpcRequestPort.
 const LPC_REQUEST_FLAGS: u32 = 0x1_0002;
+/// ALPC_MSGFLG_RELEASE_MESSAGE (o datagrama do NtRequestPort).
+const RELEASE_MESSAGE: u32 = 0x1_0000;
+/// PORT_CONNECT, o acesso que o NtRequestPort pede ao handle.
+const PORT_CONNECT: u32 = 1;
 /// ALPC_MSGFLG_SYNC_REQUEST.
 const SYNC_REQUEST: u64 = 0x2_0000;
 /// O maior PORT_MESSAGE de uma porta LPC x64 (PORT_MAXIMUM_MESSAGE_LENGTH).
@@ -91,6 +99,27 @@ pub fn request_port(port_object: u64, message: u64) -> Result<u32, KernelError> 
     critical_region::enter_critical()?;
     let status = exchange(&port, LPC_REQUEST_FLAGS, message, ReceiveArguments { output: 0, length: 0, receive_attributes: 0, timeout: 0 });
     critical_region::leave_critical()?;
+    status
+}
+
+/// ZwRequestPort(PortHandle, RequestMessage): o NtRequestPort (rva
+/// 0x694c30) em KernelMode. O handle é referenciado com PORT_CONNECT no modo
+/// anterior (KernelMode, sem conferência de acesso) e a mensagem vai pelo
+/// AlpcpSendMessage com ALPC_MSGFLG_RELEASE_MESSAGE (sem o bit do contrato
+/// LPC de kernel do LpcRequestPort), numa região crítica: um datagrama, sem
+/// resposta. Devolve o NTSTATUS.
+pub fn request_port_by_handle(handle: u64, message: u64) -> Result<u32, KernelError> {
+    let mut reference = match port_reference::reference(handle, PORT_CONNECT, 0)? {
+        Ok(reference) => reference,
+        Err(status) => return Ok(status),
+    };
+    let port = reference.port.clone();
+    let status = critical_region::enter_critical().and_then(|()| {
+        let status = exchange(&port, RELEASE_MESSAGE, message, ReceiveArguments { output: 0, length: 0, receive_attributes: 0, timeout: 0 });
+        critical_region::leave_critical()?;
+        status
+    });
+    let _ = reference.release();
     status
 }
 

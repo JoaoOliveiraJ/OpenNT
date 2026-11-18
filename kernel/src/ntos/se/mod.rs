@@ -46,6 +46,7 @@ pub mod extension_hosts;
 pub mod logon_session;
 pub mod initialization;
 pub mod reference_monitor;
+pub mod lsa_call;
 pub mod sddl;
 pub mod system_dacls;
 pub mod signing_level;

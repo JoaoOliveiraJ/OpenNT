@@ -3,11 +3,14 @@
 //!
 //! - SeRmInitPhase1 (rva 0xa4ba3c, [`initialize_phase1`]): o ZwCreatePort da
 //!   `\SeRmCommandPort` (MaxConnectionInfoLength 4, MaxMessageLength 0x200,
-//!   MaxPoolUsage 0x4000) e o PsCreateSystemThread do servidor; o handle da
-//!   thread é fechado em seguida.
-//! - SepRmCommandServerThread (rva 0x7ad590, [`command_server_thread`]): o
-//!   laço do ZwReplyWaitReceivePort, que leva a resposta do comando anterior
-//!   e recebe o próximo PORT_MESSAGE (Type sem o bit 15). Um LPC_REQUEST com
+//!   MaxPoolUsage 0x4000), o SepAdtInitializeAuditingOptions (o registro da
+//!   auditoria no ETW, `audit::initialize_auditing_options`, que libera o
+//!   SepRmCallLsa) e o PsCreateSystemThread do servidor; o handle da thread é
+//!   fechado em seguida.
+//! - SepRmCommandServerThread (rva 0x7ad590, [`command_server_thread`]): guarda
+//!   o próprio processo (referenciado) como o SepRmLsaCallProcess e repete o
+//!   ZwReplyWaitReceivePort, que leva a resposta do comando anterior e recebe
+//!   o próximo PORT_MESSAGE (Type sem o bit 15). Um LPC_REQUEST com
 //!   CommandNumber de 1 a 12 vai para o trabalhador da SepRmCommandDispatch,
 //!   que grava o ReturnedStatus na resposta; a resposta leva o CLIENT_ID e o
 //!   MessageId do pedido, com DataLength 0x1D8 e TotalLength 0x200. Um
@@ -15,6 +18,11 @@
 //!   é a conexão do LSA e o LPC_PORT_CLOSED o fim dela; os outros tipos são
 //!   ignorados. As falhas 0xC0000001, 0xC000000B e 0xC000021F da recepção
 //!   repetem a espera sem resposta.
+//! - O LPC_PORT_CLOSED do silo hospedeiro ([`lsa_closed`]): o
+//!   SepRmAuditingEnabled zerado, a fila do aviso de sessão apagada
+//!   esvaziada (`se/lsa_call.rs`, que passa a recusar itens), a
+//!   `\SeRmCommandPort` fechada, o estado limpo (SepRmCleanupRmLsaState) e o
+//!   fim da thread do servidor.
 //! - SepRmLsaConnectRequest (rva 0x7ad710, [`lsa_connect_request`]): o
 //!   ZwOpenProcess do cliente (PROCESS_VM_OPERATION | PROCESS_VM_WRITE) pelo
 //!   CLIENT_ID da mensagem; um segundo LSA, ou a falha da abertura, recebe a
@@ -37,36 +45,16 @@
 //! único do processo e sessão de usuário compartilhada) respondem
 //! STATUS_NOT_SUPPORTED, com registro.
 //!
+//! Os comandos do Reference Monitor ao LSA (o SepRmCallLsa, com a fila do
+//! aviso de sessão de logon apagada que o SepDeReferenceLogonSession enche)
+//! moram em `se/lsa_call.rs`; o datagrama vai pelo LsaCommandPortHandle da
+//! conexão de volta.
+//!
 //! Lacunas: a conexão de volta não leva o PORT_VIEW de 4 KB (a seção que o
 //! SepRmCallLsa usa para dados grandes; o ZwSecureConnectPort de kernel do
-//! OpenNT não monta vistas), e o SepRmCallLsa (os comandos do Reference
-//! Monitor ao LSA) ainda não existe. O SepRmVerifyLsaProtectionLevel lê a
-//! variável de firmware de proteção do LSA, que um boot por BIOS não tem, e
-//! não muda nada.
-//!
-//! O que falta para o aviso de sessão de logon apagada (o
-//! SepInformLsaOfDeletedLogon do 19041, rva 0x6f7da0, que o
-//! SepDeReferenceLogonSession chama no zero, depois da limpeza da sessão):
-//! - a fila: um SEP_WORK_ITEM com o comando 3 (LsapLogonSessionDeleted), 8
-//!   bytes de parâmetros (o LUID em +0x18), o tipo 1 em +0x10 e o silo em
-//!   +0x38, posto pelo SepQueueWorkItem na SepLsaDeletedLogonQueueInfo, cujo
-//!   trabalhador é o SepRmCallLsa (rva 0x34d310);
-//! - o SepRmCallLsa só despacha depois do registro da auditoria no ETW:
-//!   sem o AdtpRegisteredWithEtw ele cria ou abre o evento
-//!   `\ADT_ETW_CHANNEL_INIT` (SepAdtOpenEtwReadyEvent) e espera nele; e só
-//!   com o SepRmAuditingEnabled (que o RmAuditSetCommand liga, o
-//!   SepRmSetAuditEventWrkr em 0x7c5319), anexado ao SepRmLsaCallProcess;
-//! - o SepRmDispatchDataToLsa (rva 0x34d558) manda o comando 3 como
-//!   datagrama, ZwRequestPort no LsaCommandPortHandle da conexão de volta:
-//!   TotalLength 0x38, DataLength 0x10, CommandNumber em +0x28, o tipo 1 em
-//!   +0x2C e o LUID em +0x30 (parâmetros acima de 0x1D0 bytes iriam pela
-//!   vista de 4 KB).
-//! O OpenNT precisaria do estado SepRmAuditingEnabled em `se/audit.rs`, do
-//! portão do ETW de auditoria, da fila com o trabalhador que espera e de um
-//! ZwRequestPort por handle na conexão de volta. Sem isso o lsass não fica
-//! sabendo do fim de uma sessão de logon cujo último token saiu: a sessão
-//! do LSA (a do DWM-1 e a do UMFD-1, uma por reinício do dwm) fica para
-//! trás; a do kernel sai do banco normalmente.
+//! OpenNT não monta vistas). O SepRmVerifyLsaProtectionLevel lê a variável
+//! de firmware de proteção do LSA, que um boot por BIOS não tem, e não muda
+//! nada. O PoRequestShutdownEvent do começo da thread não existe.
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -76,10 +64,10 @@ use crate::ntos::inc::field::NtStruct;
 use crate::ntos::inc::types::extra_obpsse::{RmCommandMessage, RmReplyMessage};
 use crate::ntos::inc::types::{Luid, ObjectAttributes, PortMessage, SecurityImpersonationLevel, SecurityQualityOfService, SepRmLsaConnectionState};
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::ob::{object_manager, open_pointer};
-use crate::ntos::ps::{kernel_threads, open as ps_open};
+use crate::ntos::ob::{close, object_manager, object_reference, open_pointer, reference_trace};
+use crate::ntos::ps::{kernel_threads, open as ps_open, process};
 use crate::ntos::rtl::guest_strings;
-use crate::ntos::se::{audit, logon_session};
+use crate::ntos::se::{audit, logon_session, lsa_call};
 use crate::ntos::se::token::tokens;
 use crate::rtl::KernelError;
 
@@ -118,6 +106,9 @@ const STATUS_REPLY_MESSAGE_MISMATCH: u32 = 0xC000_021F;
 static COMMAND_PORT: AtomicU64 = AtomicU64::new(0);
 /// A SEP_RM_LSA_CONNECTION_STATE do silo hospedeiro.
 static CONNECTION_STATE: AtomicU64 = AtomicU64::new(0);
+/// SepRmLsaCallProcess: o processo da thread do servidor de comandos (o
+/// System), referenciado, a que o SepRmCallLsa se anexa.
+static LSA_CALL_PROCESS: AtomicU64 = AtomicU64::new(0);
 
 /// UNICODE_STRING de kernel com o texto (o buffer logo depois dela).
 fn kernel_unicode_string(text: &str) -> u64 {
@@ -140,10 +131,17 @@ fn zeroed(size: u64) -> Result<u64, KernelError> {
     Ok(block)
 }
 
-fn connection_state() -> Option<&'static SepRmLsaConnectionState> {
+/// A SEP_RM_LSA_CONNECTION_STATE do silo hospedeiro (None antes do
+/// SeRmInitPhase1).
+pub fn connection_state() -> Option<&'static SepRmLsaConnectionState> {
     let address = CONNECTION_STATE.load(Ordering::Acquire);
     // SAFETY: o bloco zerado de initialize_phase1, que vive enquanto o sistema roda.
     (address != 0).then(|| unsafe { SepRmLsaConnectionState::at(address) })
+}
+
+/// O SepRmLsaCallProcess (0 antes da thread do servidor de comandos).
+pub fn lsa_call_process() -> u64 {
+    LSA_CALL_PROCESS.load(Ordering::Acquire)
 }
 
 /// O handle de kernel da `\SeRmCommandPort` (0 antes do SeRmInitPhase1).
@@ -183,6 +181,12 @@ pub fn initialize_phase1() -> Result<(), KernelError> {
     }
     CONNECTION_STATE.store(state, Ordering::Release);
     COMMAND_PORT.store(handle, Ordering::Release);
+    // SepAdtInitializeAuditingOptions: o status não muda o SeRmInitPhase1.
+    match audit::initialize_auditing_options() {
+        Ok(0) => {}
+        Ok(status) => crate::debug_print!("[se] Reference Monitor: {} -> {:#x}", audit::ETW_READY_EVENT_NAME, status),
+        Err(error) => crate::debug_print!("[se] Reference Monitor: {}: {}", audit::ETW_READY_EVENT_NAME, error),
+    }
     let entry: extern "win64" fn(u64) = command_server_thread;
     let start = crate::ntos::mm::kernel_address::image_address(entry as usize as u64)?;
     let thread = kernel_threads::create_system_thread(0, start, 0, THREAD_ALL_ACCESS, 0, None)?;
@@ -193,8 +197,13 @@ pub fn initialize_phase1() -> Result<(), KernelError> {
 
 /// SepRmCommandServerThread.
 extern "win64" fn command_server_thread(_context: u64) {
-    if let Err(error) = serve() {
-        crate::debug_print!("[se] servidor de comandos do Reference Monitor parou: {}", error);
+    let process = process::get_current_process();
+    if process != 0 && object_reference::reference_with_tag(process, reference_trace::DEFAULT_TAG, false).is_ok() {
+        LSA_CALL_PROCESS.store(process, Ordering::Release);
+    }
+    match serve() {
+        Ok(()) => crate::debug_print!("[se] servidor de comandos do Reference Monitor terminou (o LSA saiu)"),
+        Err(error) => crate::debug_print!("[se] servidor de comandos do Reference Monitor parou: {}", error),
     }
 }
 
@@ -231,7 +240,10 @@ fn serve() -> Result<(), KernelError> {
                 reply.message_header.message_id.set(header.message_id.get());
                 pending_reply = reply_address;
             }
-            LPC_PORT_CLOSED => lsa_closed(),
+            LPC_PORT_CLOSED => {
+                lsa_closed();
+                return Ok(());
+            }
             LPC_CONNECTION_REQUEST => {
                 if let Err(error) = lsa_connect_request(request_address) {
                     crate::debug_print!("[se] Reference Monitor: conexao do LSA: {}", error);
@@ -383,10 +395,19 @@ fn cleanup_lsa_state(state: &SepRmLsaConnectionState) {
     state.lsa_command_port_memory_delta.set(0);
 }
 
-/// O LPC_PORT_CLOSED da conexão do LSA: o estado limpo. (O NT também zera o
-/// SepRmAuditingEnabled, que nenhum portão de auditoria do OpenNT consulta.)
+/// O LPC_PORT_CLOSED da conexão do LSA no silo hospedeiro: o
+/// SepRmAuditingEnabled zerado, a fila do aviso de sessão apagada esvaziada
+/// (o evento de esvaziamento posto e a espera enquanto ela tem itens), a
+/// `\SeRmCommandPort` fechada e o estado limpo. A thread do servidor termina
+/// em seguida.
 fn lsa_closed() {
     crate::debug_print!("[se] Reference Monitor: a conexao do LSA fechou");
+    audit::disable_auditing();
+    lsa_call::deleted_logon_queue().drain();
+    let port = COMMAND_PORT.swap(0, Ordering::AcqRel);
+    if port != 0 {
+        let _ = close::close(port, Some(0));
+    }
     if let Some(state) = connection_state() {
         cleanup_lsa_state(state);
     }
