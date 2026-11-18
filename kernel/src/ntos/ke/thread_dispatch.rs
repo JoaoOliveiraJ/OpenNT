@@ -219,7 +219,7 @@ static STARVATION_NEXT_SCAN: AtomicU32 = AtomicU32::new(0);
 static STARVATION_LEVEL: AtomicU32 = AtomicU32::new(1);
 const STARVATION_SCAN_PERIOD_MS: u32 = 1172;
 /// TickCount - 0x12c (0x257b16).
-const STARVATION_READY_MS: u32 = 4688;
+pub(crate) const STARVATION_READY_MS: u32 = 4688;
 /// Threads olhadas por varredura (r12d, 0x2575bf).
 const STARVATION_SCAN_LIMIT: u32 = 16;
 /// Threads impulsionadas por varredura (esi, 0x25760b).
@@ -268,7 +268,9 @@ fn boost_starved_threads_locked() -> Vec<(u64, u8, u32)> {
             }
         }
     }
-    STARVATION_LEVEL.store(if cut { level } else { 1 }, Ordering::Relaxed);
+    // Cortada por um limite, a próxima varredura recomeça no nível seguinte
+    // (0x257d1a); senão, no 1.
+    STARVATION_LEVEL.store(if cut && level < 14 { level + 1 } else { 1 }, Ordering::Relaxed);
     let mut boosted = Vec::new();
     for thread in starved {
         let kthread = kthread(thread);
@@ -281,6 +283,9 @@ fn boost_starved_threads_locked() -> Vec<(u64, u8, u32)> {
         let delta = STARVATION_PRIORITY.wrapping_sub(priority).wrapping_shl(4);
         kthread.priority_decrement.set((kthread.priority_decrement.get() as u8).wrapping_add(delta) as i8);
         kthread.priority.set(STARVATION_PRIORITY as i8);
+        // KiSetPriorityBoost -> KiSetLockOwnershipQuantum (0x315df0): o
+        // impulso leva ao menos um tique de quantum.
+        ensure_minimum_quantum(thread);
         enqueue_ready_locked(thread, false, false);
         boosted.push((thread, priority, waited));
     }
@@ -395,7 +400,9 @@ pub fn ensure_minimum_quantum(thread: u64) {
     let kthread = kthread(thread);
     let cycles = kthread.cycle_time.get();
     let target = kthread.quantum_target.get();
-    let minimum = cycles_per_quantum() as u64;
+    // KiLockQuantumTarget: três unidades de quantum, um tique (KeInitSystem
+    // 0xa4c603).
+    let minimum = 3 * cycles_per_quantum() as u64;
     if cycles > target || target - cycles < minimum {
         kthread.quantum_target.set(cycles.wrapping_add(minimum));
     }
@@ -648,11 +655,18 @@ pub fn end_execution(thread: u64, new_state: u8) -> Result<(), KernelError> {
     let cycles = kthread.cycle_time.get();
     let quantum_disabled = kthread.disable_quantum() != 0;
     let expired = !quantum_disabled && cycles >= kthread.quantum_target.get();
-    // O KeYieldExecution recalcula a prioridade de quem cede como o fim do
-    // quantum (KiComputeNewPriority com ajuste 1), mesmo com quantum
-    // restante.
-    if (expired || yield_execution) && new_state == state::READY {
+    // O KiQuantumEnd (0x25769d..0x25779c) roda no tique em que o quantum
+    // acaba, também dentro de um serviço: quem sai bloqueada com o quantum
+    // gasto perde o impulso como quem volta à fila, e o quantum renova ali
+    // mesmo (CycleTime + QuantumReset * KiCyclesPerClockQuantum, 0x257783).
+    // O KeYieldExecution recalcula como o fim do quantum (ajuste 1), mesmo
+    // com quantum restante.
+    if (expired && new_state != state::TERMINATED) || (yield_execution && new_state == state::READY) {
         kthread.priority.set(compute_quantum_end_priority(thread) as i8);
+    }
+    if expired {
+        let reset = kthread.quantum_reset.get() as u8 as u32;
+        kthread.quantum_target.set(cycles.wrapping_add(reset.wrapping_mul(cycles_per_quantum()) as u64));
     }
     // Yield explícito entrega a vez mesmo com quantum restante.
     if voluntary_yield {
@@ -673,9 +687,16 @@ pub fn end_execution(thread: u64, new_state: u8) -> Result<(), KernelError> {
         }
     } else {
         suspend(thread, new_state)?;
+        // O KiQuantumEnd varre as prontas famintas em todo fim de quantum.
+        if expired && new_state != state::TERMINATED {
+            initialize_queues();
+            let _queues = QUEUES.lock();
+            boosted = boost_starved_threads_locked();
+        }
     }
     for (starved, priority, waited) in boosted {
-        crate::debug_print!("[sched] anti-inanicao: thread {:#x} prioridade {} pronta ha {} ms -> 15", starved, priority, waited);
+        let cid = &ethread(starved).cid;
+        crate::debug_print!("[sched] anti-inanicao: thread {}:{} prioridade {} pronta ha {} ms -> 15", cid.unique_process.get(), cid.unique_thread.get(), priority, waited);
     }
     let mut dispatch = STATE.lock();
     let execution = &mut dispatch.cpus[cpu];

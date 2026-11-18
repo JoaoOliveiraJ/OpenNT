@@ -89,10 +89,11 @@ fn change_priority(thread: u64, requested: i32, deferred: &mut Vec<u64>) -> Resu
     }
     target.priority.set(priority as i8);
     if state == thread_dispatch::state::READY {
-        // A comparação unsigned reproduz KiPrepareReadyThreadForRescheduling,
-        // inclusive o wrap do tick.
+        // A comparação unsigned reproduz KiPrepareReadyThreadForRescheduling
+        // (0x35ba58), inclusive o wrap do tick: 300 ticks do 19041, em ms do
+        // tick do OpenNT.
         let wait_time = target.wait_time.get();
-        if (1..=14).contains(&priority) && thread_dispatch::tick_count().wrapping_sub(300) >= wait_time {
+        if (1..=14).contains(&priority) && thread_dispatch::tick_count().wrapping_sub(thread_dispatch::STARVATION_READY_MS) >= wait_time {
             target.priority_decrement.set((((15 - priority) << 4) & 255) as u8 as i8);
             target.priority.set(15);
             thread_dispatch::ensure_minimum_quantum(thread);

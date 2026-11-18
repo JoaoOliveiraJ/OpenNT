@@ -37,17 +37,23 @@ fn kthread(thread: u64) -> &'static Kthread {
     unsafe { Kthread::at(thread) }
 }
 
-/// Uma fatia de execução de `thread` com o quantum gasto.
-fn expire(thread: u64, owner: &Arc<UserThread>) -> bool {
+/// Uma fatia de execução de `thread` com o quantum gasto, que termina no
+/// estado `new_state`.
+fn slice(thread: u64, owner: &Arc<UserThread>, new_state: u8) -> bool {
     let previous_thread = process::get_current_thread();
     let began = thread_dispatch::begin_execution(thread).is_ok();
     process::set_current_thread(thread);
     threads::set_running(true, Some(owner.clone()));
     kthread(thread).quantum_target.set(kthread(thread).cycle_time.get());
-    let ended = began && thread_dispatch::end_execution(thread, thread_dispatch::state::READY).is_ok();
+    let ended = began && thread_dispatch::end_execution(thread, new_state).is_ok();
     process::set_current_thread(previous_thread);
     threads::set_running(true, None);
     ended
+}
+
+/// Uma fatia com o quantum gasto que volta à fila.
+fn expire(thread: u64, owner: &Arc<UserThread>) -> bool {
+    slice(thread, owner, thread_dispatch::state::READY)
 }
 
 fn run_in(assert: Assert, test: &TestProcess) {
@@ -115,6 +121,21 @@ fn run_in(assert: Assert, test: &TestProcess) {
     kthread(b).wait_time.set(thread_dispatch::tick_count().wrapping_sub(5000));
     let expired_again = expire(a, &thread_a);
     assert(expired_again && thread_priority::query_priority(b) == 6, "anti-inanicao: sem nova varredura antes de 75 ticks");
+
+    // O impulso leva ao menos um tique de quantum (KiSetLockOwnershipQuantum)
+    // e cai quando a thread bloqueia com o quantum gasto (KiQuantumEnd no
+    // tique dentro do serviço).
+    let minimum = 3 * thread_dispatch::cycles_per_quantum() as u64;
+    kthread(b).quantum_target.set(kthread(b).cycle_time.get() + 1);
+    kthread(b).wait_time.set(thread_dispatch::tick_count().wrapping_sub(5000));
+    thread_dispatch::force_starvation_scan();
+    let expired_a = expire(a, &thread_a);
+    let remaining = kthread(b).quantum_target.get().wrapping_sub(kthread(b).cycle_time.get());
+    let boosted = thread_priority::query_priority(b) == 15 && remaining == minimum;
+    let blocked = slice(b, &thread_b, thread_dispatch::state::WAITING);
+    let decayed = thread_priority::query_priority(b) == 6 && kthread(b).priority_decrement.get() == 0;
+    let requeued = thread_dispatch::make_ready(b).is_ok();
+    assert(expired_a && boosted && blocked && decayed && requeued, "anti-inanicao: o impulso tem um tique de quantum e cai quando a thread bloqueia com o quantum gasto");
 
     // As duas voltam a ficar suspensas e terminam.
     let suspended = call("NtSuspendThread", handle_a, 0, 0, 0) == STATUS_SUCCESS && call("NtSuspendThread", handle_b, 0, 0, 0) == STATUS_SUCCESS && thread_dispatch::next_thread() != b && thread_dispatch::next_thread() != a;
