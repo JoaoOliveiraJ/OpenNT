@@ -45,6 +45,16 @@ pub fn set_handle_reference(provider: Option<HandleReference>) {
     *HANDLE_REFERENCE.lock() = provider;
 }
 
+/// ObReferenceObjectByHandle do Object Manager como [`HandleReference`]: o
+/// NTSTATUS da referência (uma falha interna vira STATUS_UNSUCCESSFUL).
+fn object_reference_by_handle(handle: u64, access: u32, object_type: u64, mode: u8, output: u64, information: u64) -> u32 {
+    match crate::ntos::ob::object_reference::reference_by_handle(handle, access, object_type, mode, output, information) {
+        Ok(status) => status as u32,
+        Err(error) if error.status != 0 => error.status,
+        Err(_) => 0xC000_0001,
+    }
+}
+
 /// Escopo capturado; [`Captured::release`] devolve a referência e a cópia.
 #[derive(Debug, Default)]
 pub struct Captured {
@@ -165,9 +175,9 @@ fn capture(scope: u32, explicit_scope: u64, access_mode: u8) -> Result<Result<Ca
             let process = reference_session_process(identifier);
             return Ok(if process != 0 { Ok(process) } else { Err(0xC000_000D) });
         }
-        let Some(reference) = *HANDLE_REFERENCE.lock() else {
-            return Err(KernelError::new("ObReferenceObjectByHandle is not available yet"));
-        };
+        // O provedor instalado por um teste, senão o ObReferenceObjectByHandle
+        // do Object Manager.
+        let reference = (*HANDLE_REFERENCE.lock()).unwrap_or(object_reference_by_handle);
         let status = reference(explicit_scope, 0, object_types::process_type().pointer, access_mode, capture_frame.object.address(), 0);
         if status & 0x8000_0000 != 0 {
             return Ok(Err(status));
