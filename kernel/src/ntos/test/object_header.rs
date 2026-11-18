@@ -509,6 +509,68 @@ fn primary_flip_event(assert: Assert, block: u64) {
     assert(checks[3], "ob: fechado o handle e solta a ultima referencia, o evento sai");
 }
 
+/// Um evento de driver aberto pelo nome em modo usuário. O driver faz
+/// ObCreateObject(KernelMode, *ExEventObjectType, OA{nome,
+/// OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE}), KeInitializeEvent e
+/// ObInsertObject (o handle na tabela do System). O NtOpenEvent do processo
+/// (ObOpenObjectByName com ExEventObjectType no 19041, rva 0x67daa0) acha o
+/// objeto no namespace, o handle de usuário age no mesmo KEVENT com o acesso
+/// concedido, e o OBJ_OPENIF do NtCreateEvent devolve
+/// STATUS_OBJECT_NAME_EXISTS com o mesmo objeto. No código anterior o
+/// NtOpenEvent só achava os eventos do NtCreateEvent/ZwCreateEvent e
+/// devolvia STATUS_OBJECT_TYPE_MISMATCH.
+fn named_driver_event(assert: Assert, block: u64) {
+    use crate::ntos::ke::dispatcher;
+    use crate::ntos::ob::open_pointer;
+    use crate::ntos::ps::user::{memory, state};
+    use crate::ntos::test::multiprocess::identity::with_test_process;
+    const NAME: &str = "\\OpenNtEventoDeDriver";
+    let event_type = guest::read64(crate::ntos::ex::event::event_object_type());
+    let outcome = with_test_process("evento-nomeado.exe", None, |_| {
+        let (object_out, handle_out) = (block + 0x380, block + 0x388);
+        let created = status(call_export("ObCreateObject", &[0, event_type, attributes(block + 0x400, Some(NAME), 0x240), 0, 0, 0x18, 0, 0, object_out])) == 0;
+        let event = guest::read64(object_out);
+        if !created || event == 0 {
+            return None;
+        }
+        let _ = call_export("KeInitializeEvent", &[event, 0, 0]);
+        let inserted = status(call_export("ObInsertObject", &[event, 0, 0x1F_0003, 0, 0, handle_out])) == 0;
+        let kernel_handle = guest::read64(handle_out);
+        let user = memory::map_user_region(0x1000).ok()?;
+        let (out, info, rsp) = (user, user + 0x10, user + 0x800);
+        let call = |name: &str, a1: u64, a2: u64, a3: u64, a4: u64| state::handler(name).map(|handler| handler(a1, a2, a3, a4, rsp).unwrap_or(1)).unwrap_or(1);
+        let resolves = |handle: u64, access: u32| open_pointer::resolve(handle, true).is_some_and(|resolved| resolved.is_ok_and(|resolved| resolved.item.pointer == event && resolved.access == access));
+        // NtOpenEvent(SYNCHRONIZE | EVENT_MODIFY_STATE).
+        let opened = call("NtOpenEvent", out, 0x10_0002, attributes(user + 0x100, Some(NAME), 0x40), 0) == 0;
+        let handle = guest::read64(out);
+        let same_object = opened && resolves(handle, 0x10_0002);
+        let set = call("NtSetEvent", handle, 0, 0, 0) == 0 && dispatcher::read_state(event) == 1;
+        let query_denied = call("NtQueryEvent", handle, 0, info, 8) == 0xC000_0022;
+        // NtCreateEvent com OBJ_OPENIF e sem ele (InitialState na pilha).
+        guest::write32(rsp + 0x28, 0);
+        let reopened = call("NtCreateEvent", out, 0x1F_0003, attributes(user + 0x100, Some(NAME), 0xC0), 0) == 0x4000_0000;
+        let second = guest::read64(out);
+        let openif = reopened && resolves(second, 0x1F_0003);
+        let collision = call("NtCreateEvent", out, 0x1F_0003, attributes(user + 0x100, Some(NAME), 0x40), 0) == 0xC000_0035;
+        let closed = call("NtClose", handle, 0, 0, 0) == 0 && call("NtClose", second, 0, 0, 0) == 0;
+        let _ = call_export("ZwClose", &[kernel_handle]);
+        let freed = !object_header::is_object(event) && object_manager::lookup(NAME).is_none();
+        if let Some(region) = memory::find_region(user) {
+            memory::release_private_region(&region);
+        }
+        Some([inserted && same_object, set && query_denied, openif && collision, closed && freed])
+    })
+    .flatten();
+    let Some(checks) = outcome else {
+        assert(false, "ob: evento nomeado de driver num processo de teste");
+        return;
+    };
+    assert(checks[0], "ob: NtOpenEvent abre pelo nome o evento que um driver criou com ObCreateObject(ExEventObjectType) e inseriu com nome");
+    assert(checks[1], "ob: o handle do NtOpenEvent age no KEVENT do driver e confere o acesso concedido");
+    assert(checks[2], "ob: OBJ_OPENIF do NtCreateEvent abre o evento do driver (STATUS_OBJECT_NAME_EXISTS) e sem ele da colisao");
+    assert(checks[3], "ob: fechados os handles de usuario e o do System, o evento e o nome saem");
+}
+
 pub fn run(assert: Assert) {
     let block = guest::alloc_bytes(0x1000);
     let object_type = object_type_ex(assert, block);
@@ -567,5 +629,6 @@ pub fn run_user(assert: Assert) {
     let block = guest::alloc_bytes(0x1000);
     user_procedures(assert, block);
     primary_flip_event(assert, block);
+    named_driver_event(assert, block);
     guest::free_bytes(block);
 }

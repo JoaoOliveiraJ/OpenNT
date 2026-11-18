@@ -9,7 +9,10 @@
 //! eventos do NtCreateEvent, valem os que um driver pôs na tabela do
 //! processo (o ObInsertObject de um evento do ObCreateObject, o
 //! ObOpenObjectByPointer, o ZwCreateEvent sem OBJ_KERNEL_HANDLE), e a
-//! operação age no mesmo KEVENT que o driver sinaliza.
+//! operação age no mesmo KEVENT que o driver sinaliza. Pelo nome vale o
+//! mesmo: o NtOpenEvent e o OBJ_OPENIF do NtCreateEvent abrem o evento que
+//! um driver criou com ObCreateObject(ExEventObjectType) e inseriu com nome
+//! no namespace (o handle vai para a tabela nativa do processo).
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -20,7 +23,7 @@ use super::state;
 use crate::ntos::ke::dispatcher;
 use crate::ntos::ob::objects::dispatcher::{self as dispatcher_objects, DispatcherHooks, UserDispatcher};
 use crate::ntos::ob::object_manager::{self, NodeId};
-use crate::ntos::ob::{object_types, open_pointer};
+use crate::ntos::ob::{object_header, object_types, open_pointer};
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::inc::types::{EventBasicInformation, Kevent, NtStruct};
@@ -141,6 +144,39 @@ fn event_of_node(node: NodeId) -> Option<Arc<EventObject>> {
     EVENTS.lock().get(&pointer).cloned()
 }
 
+/// O evento com OBJECT_HEADER publicado no nó (o ObCreateObject com
+/// ExEventObjectType e o ObInsertObject com nome de um driver), ou 0.
+fn native_event_of_node(node: NodeId) -> u64 {
+    let pointer = object_manager::node(node).and_then(|node| node.data).map_or(0, |data| data.native_pointer);
+    if pointer != 0 && object_header::is_object(pointer) && object_header::object_type(pointer) == Some(object_types::event_type().pointer) { pointer } else { 0 }
+}
+
+/// O ObOpenObjectByName de um evento nativo achado pelo nome: o
+/// ObOpenObjectByPointer(ExEventObjectType, UserMode) com os atributos do
+/// chamador (a DACL do objeto é conferida) e o handle na tabela do
+/// processo, gravado na saída de usuário.
+fn open_native(pointer: u64, out: u64, access: u32, attributes: u64, success: u32) -> Result<u32, KernelError> {
+    state::guarded(|| {
+        let flags = user_object_attributes(attributes)?;
+        let cell = guest::alloc_bytes(8);
+        if cell == 0 {
+            return Ok(0xC000_009A);
+        }
+        let status = open_pointer::open(pointer, flags, 0, access, object_types::event_type().pointer, 1, cell);
+        let handle = guest::read64(cell);
+        guest::free_bytes(cell);
+        let status = status?;
+        if status != 0 {
+            return Ok(status);
+        }
+        if guest::try_write::<u64>(out, handle).is_err() {
+            let _ = crate::ntos::ob::close::close(handle, Some(1));
+            return Ok(0xC000_0005);
+        }
+        Ok(success)
+    })
+}
+
 /// NtCreateEvent(out, access, oa, type, initialState).
 fn nt_create_event(out: u64, access: u64, attributes: u64, event_type: u64, rsp: u64) -> Result<u32, KernelError> {
     let event_type = event_type as u32;
@@ -169,7 +205,10 @@ fn nt_create_event(out: u64, access: u64, attributes: u64, event_type: u64, rsp:
                 Ok(_) => return Ok(0xC000_0035),
                 Err(error) => return Ok(error.status),
             }
-            let Some(object) = event_of_node(existing) else { return Ok(0xC000_0024) };
+            let Some(object) = event_of_node(existing) else {
+                let native = native_event_of_node(existing);
+                return if native != 0 { open_native(native, out, access as u32, attributes, 0x4000_0000) } else { Ok(0xC000_0024) };
+            };
             return publish(&object, out, access as u32, attributes, 0x4000_0000, false);
         }
         let (parent, _) = split_name(&name);
@@ -193,7 +232,10 @@ fn nt_create_event(out: u64, access: u64, attributes: u64, event_type: u64, rsp:
     }
 }
 
-/// NtOpenEvent(out, access, oa).
+/// NtOpenEvent(out, access, oa): o ObOpenObjectByName(ExEventObjectType,
+/// PreviousMode) do 19041 (rva 0x67daa0). Qualquer evento publicado no
+/// namespace abre: os do NtCreateEvent/ZwCreateEvent e os que um driver
+/// criou com ObCreateObject(ExEventObjectType) e inseriu com nome.
 fn nt_open_event(out: u64, access: u64, attributes: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
     if !state::probe_user_write(out, 8) {
         return Ok(0xC000_0005);
@@ -203,7 +245,10 @@ fn nt_open_event(out: u64, access: u64, attributes: u64, _a4: u64, _rsp: u64) ->
     if object_manager::node(node).is_none_or(|node| node.type_name != "Event") {
         return Ok(0xC000_0024);
     }
-    let Some(object) = event_of_node(node) else { return Ok(0xC000_0024) };
+    let Some(object) = event_of_node(node) else {
+        let native = native_event_of_node(node);
+        return if native != 0 { open_native(native, out, access as u32, attributes, 0) } else { Ok(0xC000_0024) };
+    };
     publish(&object, out, access as u32, attributes, 0, false)
 }
 
