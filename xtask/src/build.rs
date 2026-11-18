@@ -30,10 +30,11 @@ const STAGE2_MAX: usize = 64 * 512; // reserva do stage2 na imagem (LBA 1..64)
 /// Posição do bloco de opções de carga na imagem de boot.
 const LOAD_OPTIONS_OFFSET: u64 = load_options::SECTOR as u64 * 512;
 /// Espaço livre do volume NTFS do boot do smss, em MiB: o máximo do arquivo
-/// de paginação (`cm/session_manager.rs`), os 256 MB que a extensão do
+/// de paginação (`cm/session_manager.rs`), os 256 MB do `C:\swapfile.sys`
+/// que o smss cria no volume do sistema, os 256 MB que a extensão do
 /// arquivo de paginação sempre deixa livres no volume
 /// (`mm/paging_file/extend.rs`) e folga para o resto do boot.
-const SMSS_FREE_SPACE_MIB: usize = 544;
+const SMSS_FREE_SPACE_MIB: usize = 800;
 /// Os binários do Windows do bundle, para todo build (`--windows-dir` troca):
 /// o caminho entra no build do kernel, então uma pasta só faz builds com
 /// `--build-dir` diferentes reaproveitarem o mesmo kernel compilado.

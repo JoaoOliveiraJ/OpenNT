@@ -3409,8 +3409,10 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     gravando no espaço novo. No D: (file system embutido), o
     IoSetInformation de FileEndOfFileInformation num FILE_OBJECT muda o
     tamanho do arquivo no volume (`io/file/zw.rs`). O volume do boot do
-    smss tem 544 MB livres: o máximo do arquivo, os 256 MB que a extensão
-    deixa e folga.
+    smss tem 800 MB livres: o máximo do arquivo, os 256 MB do
+    `C:\swapfile.sys` (o arquivo de troca de working sets que o smss cria
+    no volume do sistema, fora do commit), os 256 MB que a extensão deixa e
+    folga.
   - E/S: IoPageRead e IoSynchronousPageWrite (IRP_PAGING_IO,
     `io/paging_io.rs`), enviados ao dispositivo do IoGetRelatedDeviceObject.
     No D: (file system embutido) o volume atende esses IRPs direto nas runs
