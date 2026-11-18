@@ -866,6 +866,27 @@ fn connect_port(out: u64, name: u64, oa: u64, port_attributes: u64, rsp: u64, re
             }
         }
         add_port(&port);
+        // NtAlpcConnectPortEx sem ALPC_MSGFLG_SYNC_REQUEST: o
+        // AlpcpProcessConnectionRequest do 19041 (0x5dee92) volta sem o
+        // AlpcpReceiveSynchronousReply, e o accept (AlpcpAcceptConnectPort,
+        // Type 0xb em 0x5e17d0; AlpcpDispatchMessage em 0x5e1a62 ->
+        // AlpcpDispatchReplyToPort -> AlpcpCompleteDispatchMessage,
+        // KeReleaseSemaphoreEx em 0x5e58f4) enfileira o LPC_CONNECTION_REPLY
+        // na porta do cliente. O servidor pode já ter postado nesta porta
+        // enquanto esta thread esperava a decisão (post_server_message): a
+        // resposta vai à frente dessas mensagens, com sequência 1. O
+        // CoreMessaging (AlpcClientSender::Connect com sync=0;
+        // Callback_HandleReceivedBuffer) exige que ela venha primeiro.
+        if flags & 0x2_0000 == 0 {
+            let Some(identity) = message_identity::activate(&port, None)? else { return Ok(0xC000_009A) };
+            let sender = result.sender.unwrap_or(Sender { process: listener.process_id, thread: listener.thread_id, thread_pointer: listener.thread });
+            let bytes = reply(&result.data, 11, &identity, Some(sender));
+            identity.with(|state| state.queued = true);
+            let message = Message { bytes: Some(bytes), context: 0, reserve: None, id: identity.identifier, identity: identity.clone(), sequence: 1, status: 0, sender: Some(sender), synchronous: false, direct: false };
+            port.with(|state| state.pending.insert(0, message));
+            crate::ntos::alpc::kernel_entry::notify_waiters();
+            notify_completion(&port);
+        }
         crate::debug_print!("[alpc] conectado {} pid={}", path, port.process_id());
         Ok(0)
     });

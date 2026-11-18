@@ -4665,7 +4665,8 @@ fn user_alpc_transport(assert: Assert) {
     };
     let read = |at: u64, length: u64| -> alloc::vec::Vec<u8> { guest::read_bytes(at, length as usize) };
     let call = |name: &str, a: u64, b: u64, c: u64, d: u64| state::handler(name).map(|handler| handler(a, b, c, d, rsp)).and_then(|result| result.ok());
-    // Conexão com mensagem e atributos de recepção.
+    // Conexão síncrona (ALPC_MSGFLG_SYNC_REQUEST) com mensagem e atributos
+    // de recepção: a resposta chega no buffer da mensagem.
     let name = block + 0x10;
     unicode(name, block + 0x40, path);
     let connection = block + 0x100;
@@ -4675,7 +4676,7 @@ fn user_alpc_transport(assert: Assert) {
     let receive_attributes = unsafe { nt::AlpcMessageAttributes::at(receive) };
     receive_attributes.allocated_attributes.set(0x2000_0000);
     receive_attributes.valid_attributes.set(0);
-    stack(&[0, 0, connection, block + 0x1F0, 0, receive]);
+    stack(&[0x2_0000, 0, connection, block + 0x1F0, 0, receive]);
     let connected = call("NtAlpcConnectPort", block + 8, name, 0, 0);
     let handle = guest::read64(block + 8);
     let port = port_objects::resolve(handle, "alpc").map(|(_, port)| port);
@@ -4691,7 +4692,7 @@ fn user_alpc_transport(assert: Assert) {
         unsafe { nt::AlpcPortAttributes::at(port_attributes) }.max_message_length.set(maximum);
     };
     attributes_of(0x4070);
-    stack(&[0, 0, 0, 0, 0, 0]);
+    stack(&[0x2_0000, 0, 0, 0, 0, 0]);
     let large = call("NtAlpcConnectPort", block + 0x20, name, 0, port_attributes);
     let large_handle = guest::read64(block + 0x20);
     let large_maximum = port_objects::resolve(large_handle, "alpc").map(|(_, port)| port.maximum());
@@ -4784,6 +4785,12 @@ fn user_alpc_transport(assert: Assert) {
     stack(&[0, 0, 0, 0, 0, 0]);
     let waitable_connected = call("NtAlpcConnectPort", block + 0x28, name, 0, port_attributes);
     let waitable = guest::read64(block + 0x28);
+    // A conexão assíncrona deixa o LPC_CONNECTION_REPLY na fila (o
+    // AlpcpAcceptConnectPort do 19041): a primeira recepção o tira.
+    guest::write64(length, 0x100);
+    stack(&[output, length, 0, 0]);
+    let connection_reply = call("NtAlpcSendWaitReceivePort", waitable, 0, 0, 0);
+    let connection_reply_type = unsafe { nt::PortMessage::at(output) }.u2.s2.type_.get();
     let zero = block + 0x5F8;
     guest::write64(zero, 0);
     guest::write64(length, 0x100);
@@ -4804,7 +4811,7 @@ fn user_alpc_transport(assert: Assert) {
     stack(&[output, length, 0, zero]);
     let common_zero = call("NtAlpcSendWaitReceivePort", handle, 0, 0, 0);
     assert(
-        waitable_connected == Some(0) && waitable_zero == Some(0xC000_0001) && waitable_infinite == Some(0xC000_0001) && waitable_sent == Some(0) && waitable_received == Some(0) && waitable_reply == [9, 7] && waitable_drained == Some(0xC000_0001) && common_zero == Some(0x102),
+        waitable_connected == Some(0) && connection_reply == Some(0) && connection_reply_type == 11 && waitable_zero == Some(0xC000_0001) && waitable_infinite == Some(0xC000_0001) && waitable_sent == Some(0) && waitable_received == Some(0) && waitable_reply == [9, 7] && waitable_drained == Some(0xC000_0001) && common_zero == Some(0x102),
         "useralpctrn: a recepcao com a fila vazia volta STATUS_UNSUCCESSFUL na porta esperavel fora do modo LPC",
     );
     // Troca de kernel pela entrada instalada.
@@ -4862,6 +4869,71 @@ impl crate::ntos::alpc::transport::Service for AlpcConnectService {
     }
     fn disconnect(&self, _port: &alloc::sync::Arc<crate::ntos::ob::objects::port::Port>) {
         ALPC_CONNECT_DISCONNECTS.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Serviço que posta um datagrama na porta do cliente antes de decidir a
+/// conexão, como o dwm faz enquanto a thread do LogonUI espera o accept.
+struct AlpcPostingService;
+
+impl crate::ntos::alpc::transport::Service for AlpcPostingService {
+    fn max_message_length(&self) -> u32 {
+        0x200
+    }
+    fn connect(&self, port: &alloc::sync::Arc<crate::ntos::ob::objects::port::Port>, _data: &[u8], _request: Option<&[u8]>) -> crate::ntos::alpc::transport::Reply {
+        let _ = crate::ntos::ps::user::alpc::post_server_message(port, 3, &[0x33], crate::ntos::alpc::transport::Sender::default(), |_| {});
+        crate::ntos::alpc::transport::Reply::Now(crate::ntos::alpc::transport::JobResult { status: 0, data: alloc::vec![0x11, 0x22], sender: None })
+    }
+}
+
+/// NtAlpcConnectPort de modo usuário sem ALPC_MSGFLG_SYNC_REQUEST numa
+/// porta esperável: o LPC_CONNECTION_REPLY fica na fila à frente do
+/// datagrama que o servidor postou durante a conexão, e cada mensagem
+/// libera o semáforo da porta (AlpcpAcceptConnectPort 0x5e17d0/0x5e1a62,
+/// AlpcpCompleteDispatchMessage 0x5e58f4).
+fn user_alpc_connect_async_order(assert: Assert) {
+    use crate::ntos::alpc::transport;
+    use crate::ntos::ps::user::memory;
+    let Ok(block) = memory::map_user_region(0x2000) else {
+        assert(false, "useralpcasync: memoria de usuario");
+        return;
+    };
+    let path = "\\RPC Control\\OpenNtTesteConexaoAssincrona";
+    let Ok(listener) = transport::register(path, alloc::sync::Arc::new(AlpcPostingService)) else {
+        assert(false, "useralpcasync: endpoint registrado");
+        return;
+    };
+    let (out, name, text, attributes, zero, length, output, rsp) = (block, block + 0x10, block + 0x40, block + 0x200, block + 0x300, block + 0x308, block + 0x400, block + 0x1000);
+    let size = write_wide(text, path);
+    set_unicode(unsafe { nt::UnicodeString::at(name) }, size, size, text);
+    guest::write_bytes(attributes, &[0u8; nt::AlpcPortAttributes::SIZE as usize]);
+    let port_attributes = unsafe { nt::AlpcPortAttributes::at(attributes) };
+    port_attributes.flags.set(0x7_0000);
+    port_attributes.max_message_length.set(0x200);
+    guest::write64(zero, 0);
+    let call = |name: &str, a1: u64, a2: u64, a3: u64, a4: u64| state::handler(name).map(|handler| handler(a1, a2, a3, a4, rsp).unwrap_or(1)).unwrap_or(1);
+    let stack = |args: &[u64]| {
+        for (index, value) in args.iter().enumerate() {
+            guest::write64(rsp + 0x28 + index as u64 * 8, *value);
+        }
+    };
+    stack(&[0, 0, 0, 0, 0, 0, 0]);
+    let connected = call("NtAlpcConnectPort", out, name, 0, attributes);
+    let handle = guest::read64(out);
+    let waits = [0; 3].map(|_| call("NtWaitForSingleObject", handle, 0, zero, 0));
+    let receive = || {
+        guest::write64(length, 0x100);
+        stack(&[output, length, 0, 0]);
+        let status = call("NtAlpcSendWaitReceivePort", handle, 0, 0, 0);
+        (status, unsafe { nt::PortMessage::at(output) }.u2.s2.type_.get())
+    };
+    let first = receive();
+    let second = receive();
+    let _ = call("NtClose", handle, 0, 0, 0);
+    transport::unregister(&listener);
+    assert(connected == 0 && waits == [0, 0, 0x102] && first == (0, 11) && second == (0, 3), "useralpcasync: conexao assincrona de modo usuario entrega o LPC_CONNECTION_REPLY antes do datagrama do servidor e libera a porta esperavel");
+    if let Some(region) = memory::find_region(block) {
+        memory::release_private_region(&region);
     }
 }
 
@@ -6889,6 +6961,7 @@ pub fn run(assert: Assert) {
     user_alpc_message_handles(assert);
     user_alpc_transport(assert);
     user_alpc_connect_port(assert);
+    user_alpc_connect_async_order(assert);
     user_lpc_csr(assert);
     user_alpc_zw_group(assert);
     user_worker_factory(assert);
