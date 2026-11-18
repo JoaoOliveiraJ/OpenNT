@@ -114,6 +114,16 @@ pub fn create_arc_name(device: u64) -> Result<u32, KernelError> {
     Ok(status)
 }
 
+/// O `\ArcName` do CreateSystemRootLink (ntoskrnl 19041 rva 0xa6f6ac):
+/// NtCreateDirectoryObject com DIRECTORY_ALL_ACCESS, OBJ_PERMANENT |
+/// OBJ_CASE_INSENSITIVE e o SePublicDefaultUnrestrictedSd. Os links
+/// `multi(..)disk(..)rdisk(..)partition(..)` dentro dele vêm do
+/// IopCreateArcNames, que casa as assinaturas do ARC_DISK_INFORMATION do
+/// loader com os discos: sem loader block do NT, o diretório fica vazio.
+pub fn create_directory() -> Result<(), KernelError> {
+    crate::ntos::ob::object_manager::create_directory("\\ArcName").map(|_| ())
+}
+
 /// IoGetBootDiskInformationLite(BootDiskInformation*): bloco alocado com as
 /// entradas dos discos do loader (nenhuma no OpenNT).
 pub fn get_boot_disk_information_lite(output: u64) -> u32 {

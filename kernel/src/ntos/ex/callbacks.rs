@@ -777,11 +777,17 @@ fn register_owners() {
     });
 }
 
-/// Diretório \Callback e os objetos permanentes de hora, energia e
-/// processadores.
+/// Os objetos permanentes do ExpInitializeCallbacks, na ordem da tabela
+/// ExpInitializeCallback (ntoskrnl 19041 rva 0x9851e0): cada um criado pelo
+/// ExCreateCallback com Create e AllowMultipleCallbacks e os atributos
+/// OBJ_PERMANENT | OBJ_CASE_INSENSITIVE, sem descritor.
+const SYSTEM_CALLBACKS: [&str; 7] = ["EnlightenmentState", "SetSystemTime", "SetSystemState", "PowerState", "ProcessorAdd", "Phase1InitComplete", "SeImageVerificationDriverInfo"];
+
+/// Diretório \Callback e os objetos permanentes do sistema
+/// (ExpInitializeCallbacks, rva 0xa6e368).
 pub fn init() -> Result<(), KernelError> {
     let directory = object_manager::create_directory("\\Callback")?;
-    for name in ["SetSystemTime", "PowerState", "ProcessorAdd"] {
+    for name in SYSTEM_CALLBACKS {
         if object_manager::lookup(&alloc::format!("\\Callback\\{name}")).is_some() {
             continue;
         }

@@ -344,6 +344,22 @@ fn namespace(assert: Assert) {
     let fs = om::lookup("\\FS");
     assert(fs.is_some() && om::lookup("\\??\\C:") == fs && om::lookup("\\DosDevices\\C:") == fs && om::lookup("\\GLOBAL??\\GLOBALROOT\\FS") == fs, "ob: links DOS e GLOBALROOT");
     assert(om::lookup("\\device") == om::lookup("\\Device") && om::lookup("\\Device").is_some(), "ob: resolucao sem caixa");
+    // ObpCreateDosDevicesDirectory: \GLOBAL??\Global volta ao \GLOBAL??.
+    assert(om::lookup("\\GLOBAL??\\Global\\GLOBALROOT\\FS") == fs && om::lookup("\\GLOBAL??\\Global") == om::lookup("\\GLOBAL??"), "ob: link Global do \\GLOBAL??");
+    // ObpInitializeRootNamespace: um objeto Type por tipo em \ObjectTypes,
+    // com o OBJECT_TYPE como corpo, inclusive os criados depois dele.
+    {
+        use crate::ntos::ob::object_types;
+        let published = object_types::all().iter().all(|info| {
+            om::lookup(&alloc::format!("\\ObjectTypes\\{}", info.name)).and_then(om::node).is_some_and(|node| node.type_name == "Type" && node.data.as_ref().is_some_and(|data| data.native_pointer == info.pointer))
+        });
+        assert(published && om::lookup("\\ObjectTypes\\Directory").is_some() && om::lookup("\\ObjectTypes\\Type").is_some(), "ob: \\ObjectTypes com os tipos");
+    }
+    // ExpInitializeCallbacks: os sete objetos permanentes; CreateSystemRootLink: \ArcName.
+    let callbacks_ok = ["EnlightenmentState", "SetSystemTime", "SetSystemState", "PowerState", "ProcessorAdd", "Phase1InitComplete", "SeImageVerificationDriverInfo"]
+        .iter()
+        .all(|name| om::lookup(&alloc::format!("\\Callback\\{name}")).and_then(om::node).is_some_and(|node| node.type_name == "Callback"));
+    assert(callbacks_ok && om::lookup("\\ArcName").and_then(om::node).is_some_and(|node| node.type_name == "Directory"), "ob: \\Callback do sistema e \\ArcName");
     // IopCreateUmdfDirectory: diretório permanente com a DACL do SYSTEM e do
     // serviço WudfSvc, o GENERIC_ALL mapeado pelo tipo Directory.
     {

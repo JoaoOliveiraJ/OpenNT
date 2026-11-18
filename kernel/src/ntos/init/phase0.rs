@@ -128,25 +128,30 @@ fn namespace() -> Result<(), crate::rtl::KernelError> {
         object_manager::create_directory("\\KnownDlls")?;
         object_manager::create_symlink("\\KnownDlls\\KnownDllPath", "C:\\Windows\\System32")?;
     }
-    // CreateSystemRootLink: \Device\BootDevice aponta para o volume de boot
-    // (no NT, pelo \ArcName do dispositivo de boot; o OpenNT não tem nome
-    // ARC para ele e aponta direto para o volume, montado na fase 1) e o
-    // \SystemRoot é "\Device\BootDevice" + o diretório instalado. Quem
-    // traduz o \SystemRoot componente a componente (o luafv.sys) acha o
-    // volume ao abrir \Device\BootDevice como link.
+    // CreateSystemRootLink: o \ArcName, \Device\BootDevice apontando para o
+    // volume de boot (no NT, pelo \ArcName do dispositivo de boot; o OpenNT
+    // não tem nome ARC para ele e aponta direto para o volume, montado na
+    // fase 1) e o \SystemRoot, que é "\Device\BootDevice" + o diretório
+    // instalado. Quem traduz o \SystemRoot componente a componente (o
+    // luafv.sys) acha o volume ao abrir \Device\BootDevice como link.
+    crate::ntos::io::arc_name::create_directory()?;
     object_manager::create_symlink("\\Device\\BootDevice", &volume_device::device_path(crate::drivers::fs::ntfs::DEVICE_INDEX))?;
     object_manager::create_symlink("\\SystemRoot", "\\Device\\BootDevice\\Windows")?;
     // CmpInitializeDriverStores: o diretório e o alias do sistema.
     object_manager::create_directory("\\DriverStores")?;
     object_manager::create_symlink("\\DriverStores\\SYSTEM", "\\SystemRoot")?;
-    // \Callback com SetSystemTime, PowerState e ProcessorAdd permanentes.
+    // \Callback com os sete objetos permanentes do ExpInitializeCallbacks.
     crate::ntos::ex::callbacks::init()?;
+    // ObpInitializeRootNamespace: o \ObjectTypes com um objeto Type por tipo.
+    crate::ntos::ob::object_types::initialize_type_directory()?;
     // \GLOBAL??: o diretório global de devices DOS; todas as grafias resolvem
-    // aos mesmos objetos, inclusive o GLOBALROOT para a raiz NT.
+    // aos mesmos objetos, inclusive o GLOBALROOT para a raiz NT e o Global
+    // de volta ao próprio \GLOBAL?? (ObpCreateDosDevicesDirectory).
     object_manager::create_directory("\\GLOBAL??")?;
     object_manager::create_symlink("\\DosDevices", "\\GLOBAL??")?;
     object_manager::create_symlink("\\??", "\\GLOBAL??")?;
     object_manager::create_symlink("\\GLOBAL??\\GLOBALROOT", "\\")?;
+    object_manager::create_symlink("\\GLOBAL??\\Global", "\\GLOBAL??")?;
     // Os dispositivos DOS dos file systems de pipes e mailslots, com os
     // nomes e destinos do `DOS Devices` do Session Manager. No boot do
     // processo inicial real quem os cria é o smss, a partir do Registro.

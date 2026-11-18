@@ -46,6 +46,16 @@ fn initialize_sorting() -> Result<(), KernelError> {
     Ok(())
 }
 
+/// ExInitializeNls (ntoskrnl 19041 rva 0xa73ec4, do
+/// Phase1InitializationDiscard): o diretório `\NLS` (ZwCreateDirectoryObject
+/// com DIRECTORY_ALL_ACCESS, OBJ_PERMANENT | OBJ_KERNEL_HANDLE |
+/// OBJ_CASE_INSENSITIVE e sem descritor). No NT o NtGetNlsSectionPtr cria
+/// nele, sob demanda, as seções `NlsSectionCP%d` e `NlsSectionNORM%.8x`; aqui
+/// as tabelas são as seções permanentes sem nome de [`map_table`].
+pub fn initialize_directory() -> Result<(), KernelError> {
+    crate::ntos::ob::object_manager::create_directory("\\NLS").map(|_| ())
+}
+
 /// Seção permanente da tabela (uma por nome) e a vista do processo.
 pub fn map_table(name: &str) -> Result<Result<(u64, u64), u32>, KernelError> {
     let cached = TABLES.lock().get(name).cloned();

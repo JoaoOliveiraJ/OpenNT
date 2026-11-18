@@ -223,6 +223,36 @@ fn nt_query_mutant(handle: u64, class: u64, out: u64, length: u64, rsp: u64) -> 
     })
 }
 
+/// Mutante nomeado do kernel (`\KernelObjects\...`, o ZwCreateMutant de
+/// modo kernel com OBJ_PERMANENT), sem dono e retido pelo chamador.
+pub fn create_kernel_mutant(name: &str) -> Result<Arc<MutantObject>, KernelError> {
+    if object_manager::lookup(name).is_some() {
+        return Err(KernelError::with_status(alloc::format!("Mutant already exists: {name}"), 0xC000_0035));
+    }
+    let cut = name.rfind('\\').unwrap_or(0);
+    let parent = if cut == 0 { String::from("\\") } else { String::from(&name[..cut]) };
+    let pointer = guest::alloc_bytes(0x38);
+    if pointer == 0 {
+        return Err(KernelError::with_status("Cannot allocate kernel mutant", 0xC000_009A));
+    }
+    dispatcher::initialize_mutant(pointer, false);
+    let object = Arc::new(MutantObject { pointer, name: String::from(name), node: SpinLock::new(None) });
+    if let Err(error) = dispatcher_objects::create(pointer, "mutant", dispose, Some(busy), 0, false, DispatcherHooks::default()) {
+        guest::free_bytes(pointer);
+        return Err(error);
+    }
+    MUTANTS.lock().insert(pointer, object.clone());
+    match object_manager::create_object(&parent, &name[cut + 1..], "Mutant", Some(dispatcher_objects::data(pointer))) {
+        Ok(node) => *object.node.lock() = Some(node),
+        Err(error) => {
+            dispatcher_objects::collect(pointer);
+            return Err(error);
+        }
+    }
+    let _ = dispatcher_objects::reference(pointer);
+    Ok(object)
+}
+
 /// Saída de thread: abandona os mutantes que ela possui e coleta os sem uso.
 pub fn release_thread(thread: u64) {
     let owned: Vec<u64> = MUTANTS.lock().keys().copied().filter(|&pointer| mutant(pointer).owner_thread.get() == thread).collect();

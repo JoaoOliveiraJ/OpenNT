@@ -193,7 +193,41 @@ fn create(name: &str, mapping: [u32; 4], valid_access: u32, flags: u16) -> Resul
     if let Some(meta) = types.by_name.get_mut("Type") {
         apply(meta, if name == "Type" { size } else { 1 }, 0)?;
     }
+    drop(types);
+    publish_type_name(&info);
     Ok(info)
+}
+
+/// ObpTypeDirectoryObject: o `\ObjectTypes` depois do
+/// ObpInitializeRootNamespace (0 antes dele).
+static TYPE_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+/// O nome do tipo em `\ObjectTypes`, como objeto do tipo Type com o
+/// OBJECT_TYPE como corpo (o ObCreateObjectTypeEx insere o tipo novo no
+/// ObpTypeDirectoryObject quando ele já existe).
+fn publish_type_name(info: &ObjectType) {
+    if TYPE_DIRECTORY.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let data = crate::ntos::ob::object_manager::ObjectData::pointer(info.pointer);
+    let _ = crate::ntos::ob::object_manager::create_object(TYPE_DIRECTORY_NAME, &info.name, "Type", Some(data));
+}
+
+const TYPE_DIRECTORY_NAME: &str = "\\ObjectTypes";
+
+/// ObpInitializeRootNamespace (ntoskrnl 19041 rva 0x7a0df2): o diretório
+/// `\ObjectTypes` (ZwCreateDirectoryObject com DIRECTORY_ALL_ACCESS,
+/// OBJ_PERMANENT | OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE e sem descritor)
+/// guardado em ObpTypeDirectoryObject. Os tipos que já existem entram nele
+/// na ordem de criação, como os do ObInitSystem; os seguintes entram pelo
+/// ObCreateObjectTypeEx.
+pub fn initialize_type_directory() -> Result<(), KernelError> {
+    let directory = crate::ntos::ob::object_manager::create_directory(TYPE_DIRECTORY_NAME)?;
+    TYPE_DIRECTORY.store(directory, Ordering::Release);
+    for info in all() {
+        publish_type_name(&info);
+    }
+    Ok(())
 }
 
 fn get_or_create(name: &str, mapping: [u32; 4], valid_access: u32, flags: u16) -> ObjectType {

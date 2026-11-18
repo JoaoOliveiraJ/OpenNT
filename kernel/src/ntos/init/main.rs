@@ -207,6 +207,11 @@ pub fn kmain() -> ! {
         }
     }
 
+    // ExpKeyedEventInitialization (ExInitSystem): o tipo KeyedEvent e o
+    // \KernelObjects\CritSecOutOfMemoryEvent.
+    if let Err(error) = crate::ntos::ex::keyed_event::initialize() {
+        debug_print!("[ex] CritSecOutOfMemoryEvent nao criado: {}", error);
+    }
     // SepInitializationPhase1 e SeRmInitPhase1, antes do primeiro processo de
     // usuário: o \Security\LSA_AUTHENTICATION_INITIALIZED que o lsass.exe abre
     // e a \SeRmCommandPort, com a thread do servidor de comandos do Reference
@@ -221,6 +226,18 @@ pub fn kmain() -> ! {
     // winsrvext.dll do csrss abre.
     if let Err(error) = crate::ntos::dbgk::silo_state::initialize_phase1() {
         debug_print!("[dbgk] SystemErrorPortReady nao criado: {}", error);
+    }
+    // O resto do Phase1InitializationDiscard que publica objetos no
+    // namespace: o BcdInitializeBcdSyncMutant, os eventos do
+    // PfInitializeSuperfetch e o \NLS do ExInitializeNls.
+    if let Err(error) = crate::ntos::bcd::initialize_sync_mutant() {
+        debug_print!("[bcd] BcdSyncMutant nao criado: {}", error);
+    }
+    if let Err(error) = crate::ntos::pf::initialize() {
+        debug_print!("[pf] eventos do Superfetch nao criados: {}", error);
+    }
+    if let Err(error) = crate::ntos::ps::user::nls::initialize_directory() {
+        debug_print!("[ex] \\NLS nao criado: {}", error);
     }
 
     // processos: serviço de teclado (IPC) + shell; no boot do processo
