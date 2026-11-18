@@ -109,6 +109,12 @@ pub fn invalid_attributes(object_type: &ObjectType) -> u32 {
     native(object_type.pointer).type_info.invalid_attributes.get()
 }
 
+/// TypeInfo.ObjectTypeFlags.SecurityRequired (0x8): todo objeto do tipo
+/// recebe descritor, mesmo sem nome e sem descritor explícito.
+pub fn security_required(object_type: &ObjectType) -> bool {
+    native(object_type.pointer).type_info.object_type_flags.get() & 0x8 != 0
+}
+
 /// Espelha as contagens (a fonte é o registro, sob TYPES) no OBJECT_TYPE.
 fn publish_counts(record: &TypeRecord) {
     let body = native(record.info.pointer);

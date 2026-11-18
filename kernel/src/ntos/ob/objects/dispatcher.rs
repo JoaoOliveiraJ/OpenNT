@@ -50,6 +50,10 @@ struct Body {
     kind: String,
     object_type: ObjectType,
     security: SecurityPolicy,
+    /// O SecurityDescriptor nulo do NT: objeto sem nome, criado sem
+    /// descritor, num tipo sem SecurityRequired. A abertura por ponteiro e o
+    /// ObCheckObjectAccess concedem o pedido sem SeAccessCheck.
+    no_descriptor: bool,
     refs: u32,
     handles: u32,
     /// Contagens espelhadas no próprio corpo (+0 referências, +8 handles).
@@ -89,7 +93,17 @@ impl ObjectOwner for DispatcherOwner {
         security(pointer).unwrap_or_default()
     }
     fn set_security(&self, pointer: u64, security: SecurityPolicy) -> bool {
-        BODIES.lock().get_mut(&pointer).map(|body| body.security = security).is_some()
+        BODIES
+            .lock()
+            .get_mut(&pointer)
+            .map(|body| {
+                body.security = security;
+                body.no_descriptor = false;
+            })
+            .is_some()
+    }
+    fn has_descriptor(&self, pointer: u64) -> bool {
+        has_descriptor(pointer)
     }
     fn data(&self, pointer: u64) -> ObjectData {
         data(pointer)
@@ -100,21 +114,36 @@ impl ObjectOwner for DispatcherOwner {
     }
 }
 
+/// Um campo do OBJECT_ATTRIBUTES (ou do UNICODE_STRING do nome) do
+/// chamador: de modo usuário vem sondado.
+fn caller_read<T: guest::GuestScalar>(address: u64, from_user_mode: bool) -> Result<T, KernelError> {
+    if from_user_mode { guest::try_read::<T>(address).map_err(|_| status(0xC000_0005)) } else { Ok(guest::read::<T>(address)) }
+}
+
 /// Captura a política de segurança e registra o corpo. `attributes` é o
 /// OBJECT_ATTRIBUTES (SecurityDescriptor em +32; zero = política do sujeito).
+///
+/// Como o ObInsertObjectEx do 19041, um objeto sem nome (ObjectName ausente
+/// ou vazio), sem descritor explícito e de um tipo sem SecurityRequired fica
+/// sem descritor (`no_descriptor`); a política do sujeito ainda é guardada
+/// para quando o objeto ganhar um nome ([`mark_named`]) ou um descritor
+/// (NtSetSecurityObject).
 pub fn create(pointer: u64, kind: &str, dispose: fn(u64), busy: Option<fn(u64) -> bool>, attributes: u64, from_user_mode: bool, hooks: DispatcherHooks) -> Result<u64, KernelError> {
     let object_type = if kind == "event" { Some(object_types::event_type()) } else { object_types::user_type(kind) };
     let Some(object_type) = object_type.filter(|_| !BODIES.lock().contains_key(&pointer)) else {
         return Err(KernelError::new("invalid dispatcher object registration"));
     };
     let subject = object_access::subject();
-    let descriptor = if attributes != 0 {
-        // OBJECT_ATTRIBUTES do chamador: de modo usuário vem sondado.
-        let address = attributes + core::mem::offset_of!(ObjectAttributes, security_descriptor) as u64;
-        if from_user_mode { guest::try_read::<u64>(address).map_err(|_| status(0xC000_0005))? } else { guest::read::<u64>(address) }
+    let (descriptor, named) = if attributes != 0 {
+        let descriptor = caller_read::<u64>(attributes + core::mem::offset_of!(ObjectAttributes, security_descriptor) as u64, from_user_mode)?;
+        let name = caller_read::<u64>(attributes + core::mem::offset_of!(ObjectAttributes, object_name) as u64, from_user_mode)?;
+        // UNICODE_STRING.Length em +0.
+        let named = name != 0 && caller_read::<u16>(name, from_user_mode)? != 0;
+        (descriptor, named)
     } else {
-        0
+        (0, false)
     };
+    let no_descriptor = descriptor == 0 && !named && !object_types::security_required(&object_type);
     if descriptor != 0 && from_user_mode && !create_section::descriptor_probe(descriptor) {
         return Err(status(0xC000_0005));
     }
@@ -129,9 +158,25 @@ pub fn create(pointer: u64, kind: &str, dispose: fn(u64), busy: Option<fn(u64) -
         }
     }
     object_types::bind_native(pointer, &object_type.name)?;
-    BODIES.lock().insert(pointer, Body { kind: String::from(kind), object_type, security: policy, refs: 0, handles: 0, mirror: false, dispose, busy, hooks });
+    BODIES.lock().insert(pointer, Body { kind: String::from(kind), object_type, security: policy, no_descriptor, refs: 0, handles: 0, mirror: false, dispose, busy, hooks });
     open_pointer::register_owner(Slot::Dispatcher, |pointer| BODIES.lock().contains_key(&pointer), &OWNER);
     Ok(pointer)
+}
+
+/// O objeto vai ganhar um nome que não veio no OBJECT_ATTRIBUTES (os
+/// objetos nomeados do próprio kernel): como no ObInsertObjectEx de um
+/// objeto nomeado, ele passa a ter o descritor (a política do sujeito
+/// capturada na criação; a herança do diretório entra com o nome).
+pub fn mark_named(pointer: u64) {
+    if let Some(body) = BODIES.lock().get_mut(&pointer) {
+        body.no_descriptor = false;
+    }
+}
+
+/// O corpo tem descritor de segurança (falso para o SecurityDescriptor nulo
+/// do NT).
+pub fn has_descriptor(pointer: u64) -> bool {
+    BODIES.lock().get(&pointer).is_none_or(|body| !body.no_descriptor)
 }
 
 fn assert_live(pointer: u64) -> Result<(), KernelError> {
@@ -261,10 +306,11 @@ pub fn data(pointer: u64) -> ObjectData {
     ObjectData { native_pointer: pointer, hooks: Some(Arc::new(DispatcherHandle { pointer })), ..ObjectData::default() }
 }
 
-/// Política definida pelo criador.
+/// Política definida pelo criador (o objeto passa a ter descritor).
 pub fn set_security(pointer: u64, policy: SecurityPolicy) {
     if let Some(body) = BODIES.lock().get_mut(&pointer) {
         body.security = policy;
+        body.no_descriptor = false;
     }
 }
 
@@ -343,8 +389,9 @@ fn static_kind(kind: &str) -> &'static str {
 /// Verifica os direitos e publica um handle de usuário com os ganchos do
 /// corpo; recusa coleta o corpo e uma falha ao gravar a saída desfaz o handle.
 pub fn publish(pointer: u64, output: u64, desired: u32, attributes: u32, success: u32, creating: bool, payload: Option<Arc<dyn core::any::Any + Send + Sync>>) -> Result<u32, KernelError> {
-    let Some((kind, object_type, policy)) = BODIES.lock().get(&pointer).map(|body| (body.kind.clone(), body.object_type.clone(), body.security.clone())) else { return Err(KernelError::new("dispatcher object has been released")) };
-    let access = match object_access::check(&policy, object_access::subject(), desired, &object_type, creating) {
+    let Some((kind, object_type, policy, no_descriptor)) = BODIES.lock().get(&pointer).map(|body| (body.kind.clone(), body.object_type.clone(), body.security.clone(), body.no_descriptor)) else { return Err(KernelError::new("dispatcher object has been released")) };
+    // Sem descritor, o ObpCreateHandle não passa pelo SeAccessCheck.
+    let access = match object_access::check(&policy, object_access::subject(), desired, &object_type, creating || no_descriptor) {
         Ok(access) => access,
         Err(status) => {
             collect(pointer);

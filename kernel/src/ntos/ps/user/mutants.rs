@@ -242,6 +242,7 @@ pub fn create_kernel_mutant(name: &str) -> Result<Arc<MutantObject>, KernelError
         return Err(error);
     }
     MUTANTS.lock().insert(pointer, object.clone());
+    dispatcher_objects::mark_named(pointer);
     match object_manager::create_object(&parent, &name[cut + 1..], "Mutant", Some(dispatcher_objects::data(pointer))) {
         Ok(node) => *object.node.lock() = Some(node),
         Err(error) => {

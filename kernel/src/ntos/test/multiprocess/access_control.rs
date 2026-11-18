@@ -462,6 +462,85 @@ fn process_and_thread(assert: Assert) {
     assert(ran.is_some(), "acl: processo de A para o descritor do processo");
 }
 
+/// Um evento do ZwCreateEvent de modo kernel (OBJ_KERNEL_HANDLE, com o
+/// nome e o descritor pedidos) e o KEVENT retido; `None` na falha.
+fn kernel_event(name: &str, descriptor: Option<&[u8]>) -> Option<(u64, u64)> {
+    use crate::ntos::inc::types::UnicodeString;
+    let block = guest::alloc_bytes(0x400);
+    if block == 0 {
+        return None;
+    }
+    guest::write_bytes(block, &[0u8; 0x400]);
+    // SAFETY: OBJECT_ATTRIBUTES e UNICODE_STRING no bloco de kernel recém-alocado.
+    let (object, text) = unsafe { (ObjectAttributes::at(block), UnicodeString::at(block + 0x40)) };
+    object.length.set(ObjectAttributes::SIZE as u32);
+    object.attributes.set(0x240);
+    if !name.is_empty() {
+        let units: Vec<u8> = name.encode_utf16().flat_map(|unit| unit.to_le_bytes()).collect();
+        guest::write_bytes(block + 0x100, &units);
+        text.length.set(units.len() as u16);
+        text.maximum_length.set(units.len() as u16);
+        text.buffer.set(block + 0x100);
+        object.object_name.set(text.address());
+    }
+    if let Some(descriptor) = descriptor {
+        guest::write_bytes(block + 0x200, descriptor);
+        object.security_descriptor.set(block + 0x200);
+    }
+    let created = crate::ntos::ex::event::create(block + 0x380, EVENT_ALL_ACCESS, block, 0, false).ok() == Some(0);
+    let handle = guest::read64(block + 0x380);
+    let event_type = crate::ntos::ob::object_types::event_type().pointer;
+    let referenced = created && crate::ntos::ob::object_reference::reference_by_handle(handle, 0, event_type, 0, block + 0x388, 0).ok() == Some(0);
+    let pointer = guest::read64(block + 0x388);
+    guest::free_bytes(block);
+    if !referenced {
+        if created {
+            let _ = crate::ntos::ob::close::close(handle, Some(0));
+        }
+        return None;
+    }
+    Some((handle, pointer))
+}
+
+/// ObOpenObjectByPointer(evento, 0, NULL, SYNCHRONIZE | EVENT_MODIFY_STATE,
+/// ExEventObjectType, UserMode) no processo corrente (o
+/// DxgkGetDWMVerticalBlankEvent do dxgkrnl): o status, fechando o handle.
+fn open_for_user(calls: &Calls, pointer: u64) -> u32 {
+    let output = guest::alloc_bytes(8);
+    let event_type = crate::ntos::ob::object_types::event_type().pointer;
+    let status = crate::ntos::ob::open_pointer::open(pointer, 0, 0, SYNCHRONIZE | EVENT_MODIFY_STATE, event_type, 1, output).unwrap_or(1);
+    if status == 0 {
+        calls.close(guest::read64(output));
+    }
+    guest::free_bytes(output);
+    status
+}
+
+/// Objetos sem descritor (o ObInsertObjectEx do 19041): o evento sem nome
+/// e sem descritor que o SYSTEM cria com o ZwCreateEvent (o da vertical
+/// blank do dxgkrnl) abre por ponteiro em UserMode para A sem SeAccessCheck;
+/// com descritor explícito (que o ZwCreateEvent passa adiante) ou com nome
+/// (a DACL padrão do criador), a abertura é checada e A é recusado.
+fn kernel_events_without_descriptor(assert: Assert) {
+    let only_system = relative_descriptor(Some(&system()), Some(&[allow(EVENT_ALL_ACCESS, system())]));
+    let events = [kernel_event("", None), kernel_event("", Some(only_system.as_slice())), kernel_event("\\OpenNtAcl\\KernelNamed", None)];
+    assert(events.iter().all(Option::is_some), "acl: o SYSTEM cria os eventos de kernel (sem nome, com descritor explicito e nomeado)");
+    let pointers = events.map(|event| event.map_or(0, |(_, pointer)| pointer));
+    let unnamed = crate::ntos::ob::objects::dispatcher::has_descriptor(pointers[0]);
+    let explicit = crate::ntos::ob::objects::dispatcher::has_descriptor(pointers[1]);
+    let named = crate::ntos::ob::objects::dispatcher::has_descriptor(pointers[2]);
+    assert(!unnamed && explicit && named, "acl: so o evento sem nome e sem descritor fica sem descritor");
+    let opened = as_identity("acl-vblank.exe", &user_a(), MEDIUM_INTEGRITY, &[], |a, _| pointers.map(|pointer| if pointer != 0 { open_for_user(a, pointer) } else { 1 }));
+    assert(
+        opened == Some([0, STATUS_ACCESS_DENIED, STATUS_ACCESS_DENIED]),
+        "acl: ObOpenObjectByPointer UserMode de A abre o evento sem descritor e e recusado no de descritor explicito e no nomeado",
+    );
+    for (handle, pointer) in events.into_iter().flatten() {
+        let _ = crate::ntos::ob::close::close(handle, Some(0));
+        let _ = crate::ntos::ob::object_reference::dereference_with_tag(pointer, 0, false);
+    }
+}
+
 pub fn run(assert: Assert) {
     // O diretório dos testes, em que Everyone pode criar (a raiz só deixa o
     // SYSTEM criar), aberto pelo processo do SYSTEM durante os testes.
@@ -475,6 +554,7 @@ pub fn run(assert: Assert) {
         directory_inheritance(assert);
         take_ownership(assert);
         process_and_thread(assert);
+        kernel_events_without_descriptor(assert);
         if let Ok(directory) = directory {
             root.close(directory);
         }

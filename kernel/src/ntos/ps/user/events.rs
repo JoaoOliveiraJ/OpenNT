@@ -69,6 +69,7 @@ pub fn create(pointer: u64, name: &str, event_type: u32, signaled: bool, attribu
     }
     EVENTS.lock().insert(pointer, object.clone());
     if !name.is_empty() {
+        dispatcher_objects::mark_named(pointer);
         let (parent, leaf) = split_name(name);
         match object_manager::create_object(&parent, &leaf, "Event", Some(dispatcher_objects::data(pointer))) {
             Ok(node) => *object.node.lock() = Some(node),

@@ -351,7 +351,10 @@ pub fn check_object_access(object: u64, access_state: u64, mode: u8, status_out:
     let state = unsafe { AccessState::at(access_state) };
     let remaining = state.remaining_desired_access.get();
     let previous = state.previously_granted_access.get();
-    let policy = if object_header::is_object(object) && header_descriptor(object) == 0 { None } else { object_policy(object) };
+    // Sem descritor: o do cabeçalho nulo, ou um corpo do OpenNT sem
+    // descritor (`has_descriptor`, o objeto sem nome criado sem descritor).
+    let without_descriptor = if object_header::is_object(object) { header_descriptor(object) == 0 } else { open_pointer::describe(object).is_some_and(|described| !has_descriptor(&described)) };
+    let policy = if without_descriptor { None } else { object_policy(object) };
     let Some(policy) = policy else {
         state.previously_granted_access.set(previous | remaining);
         state.remaining_desired_access.set(0);

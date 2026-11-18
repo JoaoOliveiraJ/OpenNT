@@ -2303,9 +2303,16 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   SecurityProcedure de cada tipo: IRP_MJ_QUERY_SECURITY nos arquivos, o
   DEVICE_OBJECT, o nó da chave, o SeQuerySecurityDescriptorInfo nos demais).
   Um objeto pode não ter descritor (o SecurityDescriptor nulo do NT: sem
-  nome, criado sem descritor, num tipo sem SecurityRequired; as seções assim
-  marcam `no_descriptor`): a abertura por ponteiro concede o acesso pedido
-  sem SeAccessCheck, como o ObpCreateHandle (`has_descriptor`). O export
+  nome, criado sem descritor, num tipo sem SecurityRequired; as seções e os
+  corpos de `ob/objects/dispatcher.rs` — eventos, mutantes, semáforos,
+  portas, timers — assim marcam `no_descriptor`, e um nome dado depois pelo
+  próprio kernel ou o NtSetSecurityObject dão o descritor): a abertura por
+  ponteiro, o handle de usuário e o ObCheckObjectAccess concedem o acesso
+  pedido sem SeAccessCheck, como o ObpCreateHandle (`has_descriptor`). O
+  ZwCreateEvent passa o OBJECT_ATTRIBUTES adiante (o descritor explícito de
+  um chamador de kernel vale); o evento da vertical blank que o dxgkrnl cria
+  como SYSTEM, sem nome nem descritor, abre por ponteiro em UserMode no
+  dwm.exe (autoteste `ntos/test/multiprocess/access_control.rs`). O export
   ObOpenObjectByPointer (`open_pointer::open_by_pointer`) só confere os
   HandleAttributes contra o TypeInfo.InvalidAttributes do tipo, sem a
   captura de OBJECT_ATTRIBUTES; o win32k passa 0xC0000000 ali ao abrir as

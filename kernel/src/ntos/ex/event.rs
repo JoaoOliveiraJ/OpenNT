@@ -114,8 +114,11 @@ pub fn create(handle_output: u64, access: u32, attributes: u64, event_type: u32,
     if pointer == 0 {
         return Ok(STATUS_NO_MEMORY);
     }
-    // `create` devolve o corpo ao pool nas próprias falhas.
-    if let Err(error) = events::create(pointer, &name, event_type, initial_state, 0, false) {
+    // `create` devolve o corpo ao pool nas próprias falhas. O
+    // OBJECT_ATTRIBUTES vai junto: o descritor explícito é o do evento (o
+    // ObCreateObject captura e o ObInsertObject atribui), e um evento sem
+    // nome nem descritor fica sem descritor, como no NT.
+    if let Err(error) = events::create(pointer, &name, event_type, initial_state, attributes, false) {
         return if error.status != 0 { Ok(error.status) } else { Err(error) };
     }
     let status = publish_handle(pointer, flags, access, handle_output)?;
