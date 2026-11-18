@@ -561,7 +561,20 @@ pub fn account_handle(pointer: u64, change: i64) -> Result<(), KernelError> {
 /// primário do pai) pelo SepDuplicateToken, com o dono padrão dela, o
 /// SessionId da sessão do processo (o MmGetSessionId que o
 /// PspInitializeProcessSecurity passa) e sem TOKEN_AUDIT_NO_CHILD_PROCESS.
-pub fn sub_process_token(source: u64, session_id: u32) -> Result<u64, KernelError> {
+///
+/// O descritor do objeto é o do ObInsertObjectEx sem descritor explícito,
+/// seguido do SepFinalizeTokenAcls. O contexto do SeAssignSecurity depende
+/// de onde o token veio: com o token do PS_ATTRIBUTE_TOKEN (`explicit`; o
+/// PspInitializeProcessSecurity passa as flags 1) é o do próprio token novo
+/// (SepCreateAccessStateFromSubjectContext com ele como primário), e a DACL
+/// padrão dele passa a proteger o token (a que o services.exe põe no token
+/// de um svchost, com o SYSTEM, ou a que o lsass dá ao token de uma conta);
+/// com o primário do pai (flags 3) é o de quem cria (SeCreateAccessState).
+/// Com as flags 3 o 19041 também usa o contexto do token novo quando o
+/// SepMandatorySubProcessToken baixa o nível pelo rótulo do executável ou o
+/// SepSetTrustLevelForProcessToken põe um nível de confiança, o que o
+/// OpenNT não faz na criação.
+pub fn sub_process_token(source: u64, session_id: u32, explicit: bool) -> Result<u64, KernelError> {
     let owner = with(source, |record| record.owner.clone());
     let copy = create(
         Some(source),
@@ -573,6 +586,10 @@ pub fn sub_process_token(source: u64, session_id: u32) -> Result<u64, KernelErro
         }),
     )?;
     body(copy).token_flags.atomic().fetch_and(!TOKEN_AUDIT_NO_CHILD_PROCESS, core::sync::atomic::Ordering::SeqCst);
+    let creator = if explicit { None } else { crate::ntos::ob::object_access::subject().filter(|&subject| exists(subject)) };
+    if let Some(policy) = super::duplicate::default_policy(creator.unwrap_or(copy)) {
+        update(copy, |token| token.security = policy);
+    }
     Ok(copy)
 }
 

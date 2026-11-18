@@ -1126,9 +1126,10 @@ pub fn get_primary_token(process: u64) -> Option<u64> {
 
 /// O processo novo, ainda sem threads, troca o token primário pela cópia de
 /// `source` com o SessionId dado (o SeSubProcessToken do token do
-/// PS_ATTRIBUTE_TOKEN ou do primário do pai); o token anterior volta.
-pub fn replace_primary_token(process: u64, source: u64, session_id: u32) -> Result<(), KernelError> {
-    let copy = tokens::sub_process_token(source, session_id)?;
+/// PS_ATTRIBUTE_TOKEN, `explicit`, ou do primário do pai); o token anterior
+/// volta.
+pub fn replace_primary_token(process: u64, source: u64, session_id: u32, explicit: bool) -> Result<(), KernelError> {
+    let copy = tokens::sub_process_token(source, session_id, explicit)?;
     let previous = STATE.lock().primary_tokens.insert(process, copy);
     eprocess(process).token.object.set(copy);
     if let Some(previous) = previous {

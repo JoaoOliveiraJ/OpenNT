@@ -4535,7 +4535,13 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   SeSubProcessToken (`tokens::sub_process_token`) do token pedido ou, sem
   ele, do primário do pai declarado (ou de quem cria): uma cópia com o
   TokenFlags da origem (o SepDuplicateToken, que toda cópia de token segue),
-  o dono padrão, o ModifiedId e o SessionId da sessão do processo. Quem
+  o dono padrão, o ModifiedId e o SessionId da sessão do processo. O
+  descritor dessa cópia é o do ObInsertObjectEx sem descritor explícito,
+  com o TOKEN_QUERY de BUILTIN\Administrators do SepFinalizeTokenAcls: com
+  o token pedido, o dono e a DACL padrão do próprio token (a que o
+  services.exe põe no token de um svchost dá ao SYSTEM do DcomLaunch o
+  token de NetworkService do svchost do RPCSS); com o do pai, os de quem
+  cria. Quem
   cria precisa do SeAssignPrimaryTokenPrivilege habilitado no token efetivo
   ou de um token atribuível; um token de outra sessão que a de quem cria
   exige o privilégio e leva o processo à sessão do token (o

@@ -145,17 +145,39 @@ pub(super) fn capture_creation(attributes: u64, mode: u8, subject: u64) -> Resul
         return Err(0xC000_0061);
     }
     map_creation_acl(&mut policy);
-    // Sem descritor explícito, SepFinalizeTokenAcls acrescenta TOKEN_QUERY
-    // para BUILTIN\Administrators; uma DACL NULL continua NULL.
     if security == 0 {
-        if let Some(dacl) = policy.dacl.as_mut() {
-            let administrators = sid(5, &[32, 544]);
-            if !dacl.iter().any(|entry| entry.sid.as_ref() == Some(&administrators)) {
-                dacl.push(Ace { sid: Some(administrators), mask: 8, deny: false, flags: 0, raw: None });
-            }
-        }
+        finalize_token_acls(&mut policy);
     }
     Ok(Creation { flags, policy })
+}
+
+/// SepFinalizeTokenAcls (ntoskrnl 19041, 0x5d00a0) num token sem descritor
+/// explícito: o SepAppendAceToTokenObjectAcl acrescenta TOKEN_QUERY para
+/// BUILTIN\Administrators ao fim da DACL quando nenhuma ACE dela é desse
+/// SID; uma DACL NULL continua NULL.
+fn finalize_token_acls(policy: &mut SecurityPolicy) {
+    if let Some(dacl) = policy.dacl.as_mut() {
+        let administrators = sid(5, &[32, 544]);
+        if !dacl.iter().any(|entry| entry.sid.as_ref() == Some(&administrators)) {
+            dacl.push(Ace { sid: Some(administrators), mask: 8, deny: false, flags: 0, raw: None });
+        }
+    }
+}
+
+/// O descritor de um token inserido sem descritor explícito nem pai (o
+/// SeAssignSecurity do ObInsertObjectEx) com `subject` como token efetivo do
+/// contexto: o dono e o grupo primário padrão e a DACL padrão dele, com o
+/// mapeamento genérico de Token, e o SepFinalizeTokenAcls. `None` sem token.
+pub(super) fn default_policy(subject: u64) -> Option<SecurityPolicy> {
+    let mut policy = tokens::with(subject, |token| SecurityPolicy {
+        owner: token.owner.clone(),
+        group: Some(token.primary_group.clone()),
+        dacl: token.default_dacl.clone(),
+        ..SecurityPolicy::default()
+    })?;
+    map_creation_acl(&mut policy);
+    finalize_token_acls(&mut policy);
+    Some(policy)
 }
 
 /// ZwDuplicateToken(ExistingToken, DesiredAccess, ObjectAttributes,

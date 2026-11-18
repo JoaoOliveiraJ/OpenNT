@@ -3533,12 +3533,25 @@ fn user_virtual_account_token(assert: Assert) {
         token_records::body(restricted_pointer).token_flags.atomic().fetch_or(0x20_0420, core::sync::atomic::Ordering::SeqCst);
         let duplicate = token_records::duplicate(restricted_pointer, 2, false, 2).ok();
         let duplicate_ok = duplicate.is_some_and(|copy| token_records::token_flags(copy) == 0x20_2800 && token_records::with(copy, |record| record.session_id) == Some(1));
-        let sub_process = token_records::sub_process_token(restricted_pointer, 3).ok();
+        let sub_process = token_records::sub_process_token(restricted_pointer, 3, false).ok();
         let sub_process_ok = sub_process.is_some_and(|copy| token_records::token_flags(copy) == 0x2800 && token_records::with(copy, |record| (record.session_id, record.kind)) == Some((3, 1)));
-        for copy in [duplicate, sub_process].into_iter().flatten() {
+        // O descritor do token de processo novo (o SeAssignSecurity do
+        // ObInsertObjectEx no SeSubProcessToken): com o token do
+        // PS_ATTRIBUTE_TOKEN, o dono e a DACL padrão do próprio token (NULL
+        // neste token do DWM-1); com o primário do pai, a DACL padrão de
+        // quem cria, e o SYSTEM do processo de teste abre a cópia com
+        // TOKEN_READ (a DACL fabricada só com o usuário do token o recusava).
+        let explicit = token_records::sub_process_token(restricted_pointer, 3, true).ok();
+        let explicit_ok = explicit.and_then(|copy| token_records::with(copy, |record| record.security.dacl.is_none() && record.security.owner == record.owner)).unwrap_or(false);
+        let token_type = crate::ntos::ob::object_types::token_type();
+        let inherited_ok = sub_process.and_then(|copy| token_records::with(copy, |record| record.security.clone())).is_some_and(|security| {
+            crate::ntos::ob::object_access::check(&security, crate::ntos::ob::object_access::subject(), 0x2_0008, &token_type, false) == Ok(0x2_0008)
+        });
+        for copy in [duplicate, sub_process, explicit].into_iter().flatten() {
             let _ = token_records::release(copy);
         }
         assert(duplicate_ok && sub_process_ok, "virtualaccount: copias levam o TokenFlags e o token de processo novo fica na sessao do processo");
+        assert(inherited_ok && explicit_ok, "virtualaccount: o token de processo novo leva a DACL padrao dele (PS_ATTRIBUTE_TOKEN) ou a de quem cria (token do pai)");
         let _ = call("NtClose", restricted, 0, 0, 0);
         // O primeiro token continua aberto: ele segura a sessão de logon,
         // que sai com o último token (o SepDeReferenceLogonSession), e sem

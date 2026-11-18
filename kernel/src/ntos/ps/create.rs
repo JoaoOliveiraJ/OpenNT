@@ -685,7 +685,7 @@ pub fn create_user_process(request: &CreateProcessRequest<'_>) -> Result<Created
     let token_source = request.primary_token.or_else(|| process::get_primary_token(request.parent.unwrap_or_else(process::get_current_process)));
     if let Some(token) = token_source {
         let session_id = crate::ntos::mm::session::session_id(process_pointer);
-        process::replace_primary_token(process_pointer, token, session_id).map_err(fail)?;
+        process::replace_primary_token(process_pointer, token, session_id, request.primary_token.is_some()).map_err(fail)?;
     }
     // O espaço do processo novo, anexado: as cópias de sistema, o exe na
     // raiz dele (a ntdll real faz o binding, a relocação e o cookie de
