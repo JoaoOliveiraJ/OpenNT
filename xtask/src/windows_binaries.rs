@@ -583,7 +583,8 @@ const LOGON_SCREEN_PROGRAMS: &[&str] = &[
     "MrmCoreR.dll",
     "XmlLite.dll",
     // Os provedores de credencial registrados
-    // (`Authentication\Credential Providers`) e os imports deles.
+    // (`Authentication\Credential Providers`) e os imports deles (o
+    // msvcp110_win.dll já está em `SMSS_PROGRAMS`).
     "credprovs.dll",
     "credprovslegacy.dll",
     "BioCredProv.dll",
@@ -604,7 +605,6 @@ const LOGON_SCREEN_PROGRAMS: &[&str] = &[
     "cryptngc.dll",
     "ngckeyenum.dll",
     "dsreg.dll",
-    "msvcp110_win.dll",
     "wkscli.dll",
 ];
 
@@ -947,4 +947,20 @@ pub fn ntfs_files(root: &Path, kernel_pe: &[u8], initial_process: &str) -> Resul
     files.push((String::from("NTOSKRNL.EXE"), kernel_pe.to_vec()));
     files.push((String::from("Windows/System32/ntoskrnl.exe"), kernel_pe.to_vec()));
     Ok(files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::user_programs;
+
+    /// Cada programa entra uma vez na raiz do volume: um nome repetido em
+    /// duas listas daria duas entradas iguais no índice do diretório (e dois
+    /// `.mui` e dois recursos de SystemResources).
+    #[test]
+    fn each_program_is_staged_once() {
+        let names: Vec<String> = user_programs().map(str::to_ascii_lowercase).collect();
+        for (index, name) in names.iter().enumerate() {
+            assert!(!names[..index].contains(name), "{name} aparece em mais de uma lista de programas");
+        }
+    }
 }
