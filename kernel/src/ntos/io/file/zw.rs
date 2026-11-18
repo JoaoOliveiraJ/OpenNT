@@ -478,10 +478,13 @@ pub fn nt_create_file(handle: u64, desired_access: u32, attributes: u64, io_stat
     crate::ntos::ps::user::files::open_nt_file(handle, attributes, io_status, disposition, &request)
 }
 
-/// ZwOpenFile = ZwCreateFile com FILE_OPEN (compartilhamento e opções não
-/// são repassados).
-pub fn open_kernel_file(output: u64, desired_access: u32, attributes_pointer: u64, io_status: u64) -> Result<u32, KernelError> {
-    create_kernel_file(output, desired_access, attributes_pointer, io_status, 0, FILE_OPEN, 0)
+/// ZwOpenFile = ZwCreateFile com FILE_OPEN: o NtOpenFile do 19041 chama o
+/// IoCreateFileEx com o ShareAccess e as OpenOptions de quem chama. O
+/// win32kfull (EngQueryFileTimeStamp: FILE_SHARE_READ | WRITE | DELETE) e o
+/// dxgkrnl (DxgkpGetFileVersion: FILE_SHARE_READ | DELETE) abrem assim
+/// arquivos que outros processos mantêm abertos.
+pub fn open_kernel_file(output: u64, desired_access: u32, attributes_pointer: u64, io_status: u64, share_access: u32, open_options: u32) -> Result<u32, KernelError> {
+    create_kernel_file(output, desired_access, attributes_pointer, io_status, share_access, FILE_OPEN, open_options)
 }
 
 /// FILE_OBJECT, acesso e opções de um handle de arquivo do kernel; recusa

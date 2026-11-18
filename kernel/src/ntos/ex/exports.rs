@@ -702,7 +702,7 @@ pub mod zw {
         Ok(signed_status(zw_files::query_full_attributes_file(call.arg(1), call.arg(2))))
     }
     fn open_file(call: &Call) -> Result<u64, KernelError> {
-        Ok(zw_files::open_kernel_file(call.arg(1), call.arg(2) as u32, call.arg(3), call.arg(4))? as u64)
+        Ok(zw_files::open_kernel_file(call.arg(1), call.arg(2) as u32, call.arg(3), call.arg(4), call.arg(5) as u32, call.arg(6) as u32)? as u64)
     }
     fn query_information_file(call: &Call) -> Result<u64, KernelError> {
         Ok(query_file::query(call.arg(1), call.arg(2), call.arg(3), call.arg(4) as u32, call.arg(5) as u32)? as u64)

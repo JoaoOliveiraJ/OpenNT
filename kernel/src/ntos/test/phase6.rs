@@ -3002,6 +3002,17 @@ fn zw_group_exports(assert: Assert) {
     let volume = call_export("ZwQueryVolumeInformationFile", &[file, io_status, buffer, 0x100, 1]);
     assert(status(volume) == 0 && at::<nt::FileFsVolumeInformation>(buffer).volume_label_length.get() == 12 && at::<nt::FileFsVolumeInformation>(buffer).volume_label[0].get() == b'O' as u16 && at::<nt::IoStatusBlock>(io_status).information.get() == 30, "zw: ZwQueryVolumeInformationFile (rotulo do volume)");
     assert(status(call_export("ZwFlushBuffersFile", &[file, io_status])) == 0 && status(call_export("ZwFlushBuffersFile", &[0x7FF0, io_status])) == 0xC000_0008, "zw: ZwFlushBuffersFile valida o handle");
+    // ZwOpenFile repassa ShareAccess e OpenOptions, como o NtOpenFile: com o
+    // arquivo aberto acima (leitura e escrita, compartilhando as duas), a
+    // abertura que compartilha leitura e escrita entra com o FILE_OBJECT
+    // síncrono (FO_SYNCHRONOUS_IO) e a que não compartilha nada é
+    // STATUS_SHARING_VIOLATION.
+    let shared = status(call_export("ZwOpenFile", &[output, 0x12_0089, file_attributes, io_status, 3, 0x20]));
+    let second = guest::read64(output);
+    let synchronous = shared == 0 && at::<nt::FileObject>(crate::ntos::io::file::zw::file_object_of_handle(second)).flags.get() & 2 != 0;
+    let second_closed = shared == 0 && status(call_export("ZwClose", &[second])) == 0;
+    let exclusive = status(call_export("ZwOpenFile", &[output, 0x12_0089, file_attributes, io_status, 0, 0x20]));
+    assert(synchronous && second_closed && exclusive == 0xC000_0043, "zw: ZwOpenFile repassa o compartilhamento e as opcoes de abertura");
     at::<nt::FileDispositionInformation>(block + 0x2F0).delete_file.set(1);
     let deleted = call_export("ZwSetInformationFile", &[file, io_status, block + 0x2F0, 1, 13]);
     assert(status(deleted) == 0 && !memory_file_system::exists("/opennt-zw.txt") && status(call_export("ZwClose", &[file])) == 0, "zw: ZwSetInformationFile apaga o arquivo e ZwClose fecha");
