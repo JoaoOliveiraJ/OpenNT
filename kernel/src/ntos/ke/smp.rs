@@ -6,7 +6,10 @@
 //! compartilhada, que o BSP lê e grava pelo mapa direto (`hal::physical`).
 //! Cada AP recebe antes do SIPI uma KPCR própria (`pcr::init_processor`),
 //! com o número de processador que vai ocupar (1 + sua posição entre os
-//! online), e a publica no próprio GS.
+//! online), e a publica no próprio GS; e uma pilha de kernel do
+//! MmCreateKernelStack (`mm::kernel_stack`, com a página de guarda), a pilha
+//! da thread ociosa que o KeStartAllProcessors do 19041 cria para cada
+//! processador, onde o AP roda o laço e os trabalhos.
 //! A página do trampolim só fica mapeada em identidade enquanto os APs
 //! partem; depois a metade de usuário volta a não ter nada do kernel. Os
 //! offsets devem coincidir com `hal::amd64::aptrampoline`.
@@ -17,6 +20,7 @@ use crate::hal::amd64::aptrampoline;
 use crate::hal::{cpu, lapic, physical};
 use crate::hal::acpi;
 use crate::ntos::ke::{bugcheck, clock, pcr};
+use crate::ntos::mm::kernel_stack::{self, KernelStack};
 use crate::ntos::mm::memory_map as map;
 use crate::ntos::mm::paging::{self, MapOptions};
 use crate::ntos::mm::pfn;
@@ -58,6 +62,8 @@ struct Smp {
     initialized: bool,
     prepare_job: Option<fn()>,
     invalidation_active: bool,
+    /// A pilha de boot (a da thread ociosa) de cada slot que recebeu SIPI.
+    boot_stacks: Vec<(usize, KernelStack)>,
 }
 
 static STATE: SpinLock<Smp> = SpinLock::new(Smp {
@@ -67,6 +73,7 @@ static STATE: SpinLock<Smp> = SpinLock::new(Smp {
     initialized: false,
     prepare_job: None,
     invalidation_active: false,
+    boot_stacks: Vec::new(),
 });
 
 /// IPI_WATCHDOG_TIMEOUT: um processador esperou tempo demais pela resposta
@@ -293,9 +300,10 @@ fn slot_address(slot: usize) -> u64 {
     MAILBOX + MAILBOX_SLOTS + slot as u64 * SLOT_SIZE
 }
 
-/// Publica slot, identidade e pilha antes de INIT-SIPI-SIPI. Só aceita a
-/// confirmação consistente do modo 64 bits; reinicia o alvo num timeout.
-fn start_application_processor(slot: usize, identifier: u32) -> Result<bool, KernelError> {
+/// Publica slot, identidade e pilha (`stack`, o InitialStack da pilha de
+/// kernel do AP) antes de INIT-SIPI-SIPI. Só aceita a confirmação
+/// consistente do modo 64 bits; reinicia o alvo num timeout.
+fn start_application_processor(slot: usize, identifier: u32, stack: u64) -> Result<bool, KernelError> {
     if identifier > 255 {
         return Ok(false);
     }
@@ -309,9 +317,9 @@ fn start_application_processor(slot: usize, identifier: u32) -> Result<bool, Ker
     for offset in [0x20, 0x24, 0x28] {
         physical::write32(MAILBOX + offset, 0);
     }
-    // Topo da pilha de boot do AP pela VA do mapa direto (o AP já está em
-    // 64 bits quando a carrega).
-    physical::write64(MAILBOX + MAILBOX_BOOT_STACK, map::direct_map(map::AP_STACK_BASE + (slot as u64 + 1) * map::AP_STACK_SIZE));
+    // A pilha de boot do AP (o AP já está em 64 bits, com o CR3 do BSP,
+    // quando a carrega).
+    physical::write64(MAILBOX + MAILBOX_BOOT_STACK, stack);
 
     if !send_startup_interrupt(identifier, INIT_ASSERT) {
         return Err(KernelError::new("AP INIT delivery failed"));
@@ -399,7 +407,24 @@ pub fn init() -> Result<(), KernelError> {
             }
         }
     }
+    // As pilhas de boot também: o KeStartAllProcessors cria, para cada
+    // processador, a pilha de kernel da thread ociosa pelo
+    // MmCreateKernelStack (e a do DPC e as das ISRs, que os APs daqui não
+    // usam). Com a guarda, um estouro falta em vez de escrever na pilha
+    // vizinha.
+    let mut boot_stacks = Vec::new();
+    for _ in 0..identifiers.len() {
+        match kernel_stack::create(false) {
+            Ok(stack) => boot_stacks.push(stack),
+            Err(error) => {
+                boot_stacks.into_iter().for_each(kernel_stack::delete);
+                (1..=identifiers.len() as u32).for_each(pcr::release_processor);
+                return Err(error);
+            }
+        }
+    }
     if let Err(error) = install_trampoline() {
+        boot_stacks.into_iter().for_each(kernel_stack::delete);
         (1..=identifiers.len() as u32).for_each(pcr::release_processor);
         return Err(error);
     }
@@ -408,9 +433,11 @@ pub fn init() -> Result<(), KernelError> {
     let flags = cpu::save_and_disable_interrupts();
     let mut online = Vec::new();
     let mut failure = None;
+    let mut started = 0;
     for (slot, &identifier) in identifiers.iter().enumerate() {
         physical::write64(MAILBOX + MAILBOX_BOOT_PCR, processor_blocks[online.len()]);
-        match start_application_processor(slot, identifier) {
+        started = slot + 1;
+        match start_application_processor(slot, identifier, boot_stacks[slot].initial) {
             Ok(true) => {
                 let reported = physical::read32(slot_address(slot) + SLOT_CONTROLLER_IDENTIFIER);
                 debug_print!("[smp] CPU {} online (apicId={})", slot + 1, reported);
@@ -434,9 +461,15 @@ pub fn init() -> Result<(), KernelError> {
     for number in online.len() as u32 + 1..=identifiers.len() as u32 {
         pcr::release_processor(number);
     }
+    // A pilha de um AP que recebeu SIPI fica com ele, mesmo sem resposta (um
+    // AP atrasado ainda pode carregá-la); as dos slots que nem partiram
+    // voltam ao Mm.
+    let unused = boot_stacks.split_off(started);
+    unused.into_iter().for_each(kernel_stack::delete);
     {
         let mut state = STATE.lock();
         state.online_slots = online;
+        state.boot_stacks = boot_stacks.into_iter().enumerate().collect();
         state.initialized = true;
     }
     let removed = remove_trampoline();
@@ -540,6 +573,16 @@ pub fn system_fully_coherent() -> bool {
 
 pub fn ap_slot(index: usize) -> Option<usize> {
     STATE.lock().online_slots.get(index).copied()
+}
+
+/// A pilha de kernel em que o AP do `slot` online roda o laço e os
+/// trabalhos.
+pub fn ap_boot_stack(slot: usize) -> Option<KernelStack> {
+    let state = STATE.lock();
+    if !state.online_slots.contains(&slot) {
+        return None;
+    }
+    state.boot_stacks.iter().find(|&&(owner, _)| owner == slot).map(|&(_, stack)| stack)
 }
 
 pub fn bsp_apic_id() -> u32 {

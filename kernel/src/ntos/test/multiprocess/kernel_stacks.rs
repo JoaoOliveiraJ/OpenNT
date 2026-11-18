@@ -22,7 +22,14 @@
 //!   ceifador devolve a pilha;
 //! - criar e destruir 8 threads deixa o PFN como estava (as pilhas vêm dele);
 //! - a falta dupla usa a IST1, numa pilha de kernel própria;
-//! - os contextos de KeAllocateCalloutStackEx têm pilhas reais.
+//! - os contextos de KeAllocateCalloutStackEx têm pilhas reais;
+//! - cada AP roda o laço e os trabalhos numa pilha de kernel própria do
+//!   MmCreateKernelStack (a da thread ociosa que o KeStartAllProcessors cria
+//!   para cada processador), do tamanho de uma pilha comum e com a guarda
+//!   sem PTE. Com as pilhas de 4 KB contíguas da memória baixa de antes, o
+//!   leitor do volume NTFS da estressa de disco passava do fim da sua e
+//!   escrevia nos quadros do AP vizinho (um retorno para a pilha alheia, ou
+//!   um ponteiro liberado no heap, e a falta tripla).
 
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 
@@ -33,7 +40,7 @@ use crate::ntos::ex::service_table;
 use crate::ntos::inc::types::extra_fs_fat::KernelStackControl;
 use crate::ntos::inc::types::{Context, Ethread, Kthread, NtStruct};
 use crate::ntos::init::exports;
-use crate::ntos::ke::{callout, clock, pcr};
+use crate::ntos::ke::{callout, clock, pcr, smp};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::kernel_stack::{self, KERNEL_LARGE_STACK_SIZE, KERNEL_STACK_GUARD, KERNEL_STACK_SIZE, KERNEL_THREAD_STACK_SIZE};
 use crate::ntos::mm::pe_loader::ResolvedImport;
@@ -101,6 +108,38 @@ pub fn run(assert: Assert) {
     pfn_stable(assert);
     double_fault_stack(assert);
     callout_stacks(assert);
+    application_processor_stacks(assert);
+}
+
+/// Job de AP: o próprio RSP.
+extern "win64" fn ap_stack_pointer(_: u64, _: u64, _: u64, _: u64) -> u64 {
+    let rsp: u64;
+    // SAFETY: só lê o registrador.
+    unsafe { core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags)) };
+    rsp
+}
+
+/// Cada AP online roda os trabalhos na pilha de kernel que recebeu na
+/// partida: o RSP de um trabalho fica entre o StackLimit e o InitialStack
+/// dela, a pilha é uma pilha comum viva no Mm, com a guarda sem PTE, e duas
+/// CPUs nunca dividem pilha.
+fn application_processor_stacks(assert: Assert) {
+    let routine = ap_stack_pointer as extern "win64" fn(u64, u64, u64, u64) -> u64 as usize as u64;
+    let mut bases = alloc::vec::Vec::new();
+    for index in 0..smp::ap_slot_count() {
+        let Some(slot) = smp::ap_slot(index) else { break };
+        let stack = smp::ap_boot_stack(slot);
+        let rsp = smp::run_on_ap(slot, routine, [0; 4]).unwrap_or(0);
+        let own = stack.is_some_and(|stack| {
+            map::is_kernel_stack(stack.limit) && stack.size() == KERNEL_STACK_SIZE && rsp > stack.limit && rsp < stack.initial && kernel_stack::find(stack.base) == Some(stack) && paging::translate(stack.limit - KERNEL_STACK_GUARD) == 0
+        });
+        assert(own, "pilhas: cada AP roda os trabalhos numa pilha de kernel propria (a da thread ociosa do KeStartAllProcessors), do tamanho de uma pilha comum e com a guarda sem PTE");
+        bases.push(stack.map_or(0, |stack| stack.base));
+    }
+    let count = bases.len();
+    bases.sort_unstable();
+    bases.dedup();
+    assert(bases.len() == count, "pilhas: dois APs nunca dividem a pilha de kernel");
 }
 
 /// Os campos de pilha da KTHREAD e a geometria da pilha.

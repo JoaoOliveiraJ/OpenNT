@@ -19,7 +19,8 @@
 //!
 //! Antes da paginação (modos real e protegido) o AP lê a mailbox pelo
 //! endereço físico, como exige a CPU. Em 64 bits, os dados (mailbox, slots,
-//! LAPIC, pilha) são acessados pelo mapa direto da metade de sistema.
+//! LAPIC) são acessados pelo mapa direto da metade de sistema; a pilha é a
+//! pilha de kernel do AP (`mm::kernel_stack`), na janela das pilhas.
 
 use core::arch::global_asm;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -148,7 +149,7 @@ ap_kernel_entry:
     mov ebx, dword ptr [rsi + 0x0C]
     cmp ebx, 15
     jae ap_park
-    mov rsp, qword ptr [rsi + 0x10]                 # pilha (VA do mapa direto)
+    mov rsp, qword ptr [rsi + 0x10]                 # pilha (InitialStack da pilha de kernel)
     mov r8d, eax                                    # APIC id
     mov eax, dword ptr [rsi + 0x38]                 # KPCR deste AP
     mov edx, dword ptr [rsi + 0x3C]

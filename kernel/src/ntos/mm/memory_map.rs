@@ -8,7 +8,6 @@
 //!   0x000000-0x005FFF    IVT/BDA, handoff do stage2 (0x4FD0-0x4FFF), E820 (0x5000)
 //!   0x009000-0x009FFF    trampolim de AP (SMP, SIPI vetor 0x09)
 //!   0x00A000-0x00AFFF    mailbox SMP (handshake + fila de jobs por CPU)
-//!   0x060000-0x06FFFF    pilhas dos APs (4KB por CPU, até 16 CPUs)
 //!   0x070000-0x072FFF    PML4 e tabelas da identidade transitória do stage2
 //!   0x076000-0x07AFFF    tabelas do mapa direto (PDPT, 4 PDs)
 //!   0x07B000-0x07CFFF    tabelas da janela do heap (PDPT, PD)
@@ -314,8 +313,6 @@ pub const USER_PML4_ENTRIES: u64 = 256;
 pub const AP_TRAMPOLINE_PHYS: u64 = 0x9000;
 pub const SMP_MAILBOX_PHYS: u64 = 0xA000;
 const _: () = assert!(BOOT_LOAD_OPTIONS_PHYS >= SMP_MAILBOX_PHYS + PAGE_SIZE && BOOT_LOAD_OPTIONS_PHYS + 512 <= 0x7E00 + 64 * 512);
-pub const AP_STACK_BASE: u64 = 0x60000;
-pub const AP_STACK_SIZE: u64 = 0x1000;
 pub const MAX_CPUS: usize = 16;
 pub const LAPIC_PHYS: u64 = 0xFEE0_0000;
 

@@ -1097,8 +1097,9 @@ em 0x76000-0x7AFFF) antes de entrar no kernel. A regra:
   descritores de PFN, frames do PFN, MMIO (LAPIC, texto VGA), tabelas ACPI,
   o handoff do stage2 (E820, flags, firmware), as células fixas de baixo
   nível (0x81000 e a IDT em 0x82000) e os dados do trampolim dos APs. A
-  IDT, a GDT do boot e as pilhas dos APs são carregadas
-  pela VA do mapa direto; MmMapIoSpace e os mapeamentos físicos da HAL
+  IDT e a GDT do boot são carregadas pela VA do mapa direto (as pilhas dos
+  APs são pilhas de kernel do MmCreateKernelStack, como a da thread ociosa
+  que o KeStartAllProcessors cria para cada processador); MmMapIoSpace e os mapeamentos físicos da HAL
   devolvem VAs dele. Como o MiReferenceIoPages do NT, MmMapIoSpace(Ex)
   conta uma referência em cada página de I/O (não RAM) mapeada e o
   MmUnmapIoSpace a tira (`mm/io_space.rs`); o MmIsIoSpaceActive consulta
