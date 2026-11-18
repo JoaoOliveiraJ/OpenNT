@@ -96,6 +96,9 @@ pub struct ProcessState {
     /// As cópias privadas das faixas de sistema (ntdll, apiset, NLS) na raiz
     /// própria do processo, (VA, frame); vazio na raiz do System.
     system_pages: SpinLock<Vec<(u64, u64)>>,
+    /// O bloco do diagnóstico de falhas já impresso (`crash_report`): 0, ou
+    /// o bit 32 com o código da falha.
+    pub crash_reported: AtomicU64,
 }
 
 impl ProcessState {
@@ -158,6 +161,7 @@ pub fn create(process: u64, process_id: u64) -> Result<Arc<ProcessState>, Kernel
         modules: SpinLock::new(BTreeMap::new()),
         images: SpinLock::new(Vec::new()),
         system_pages: SpinLock::new(Vec::new()),
+        crash_reported: AtomicU64::new(0),
     });
     let mut processes = PROCESSES.lock();
     if processes.contains_key(&process) {

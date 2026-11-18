@@ -367,6 +367,7 @@ fn nt_serialize_boot(_: u64, _: u64, _: u64, _: u64, _rsp: u64) -> Result<u32, K
 
 /// NtSetSystemInformation(class, buffer, length): `ex/system_information`.
 fn nt_set_system_information(class: u64, buffer: u64, length: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
+    super::crash_report::set_system_information(class as u32);
     crate::ntos::ex::system_information::set_from_user_mode(class as u32, buffer, length as u32)
 }
 
@@ -594,9 +595,11 @@ fn nt_raise_hard_error(status: u64, count: u64, unicode_mask: u64, parameters: u
     }
     state::guarded(|| {
         let mut texts: Vec<String> = Vec::new();
+        let mut values: Vec<u64> = Vec::new();
         for index in 0..count {
             // ULONG_PTR Parameters[index].
             let value = guest::try_read::<u64>(parameters + index * 8)?;
+            values.push(value);
             if unicode_mask & (1 << index) != 0 {
                 if !probe_user_read(value, 16) {
                     return Ok(0xC000_0005);
@@ -613,6 +616,7 @@ fn nt_raise_hard_error(status: u64, count: u64, unicode_mask: u64, parameters: u
             }
         }
         crate::debug_print!("[usermode] HARDERROR: status={:#x} params={} (pid {}, retorno {:#x})", status as u32, texts.join(" | "), crate::ntos::ps::process::get_current_process_id(), guest::try_read::<u64>(rsp).unwrap_or(0));
+        super::crash_report::hard_error(status as u32, &values);
         if response != 0 {
             guest::try_write::<u32>(response, 2)?; // ResponseAbort
         }

@@ -997,6 +997,26 @@ fim, com uma segunda thread viva, a principal chama
 NtTerminateProcess(NULL), recebe sucesso e sai depois com o próprio código;
 a segunda morreu com o status pedido.
 
+**Diagnóstico de falhas de usuário.** `ps/user/crash_report.rs` só escreve
+na serial; não muda despacho, serviços nem término. Uma falha de processo
+de usuário imprime um bloco `[crash]` a partir de um destes pontos: a
+segunda chance do NtRaiseException, a exceção que não chega ao
+KiUserExceptionDispatcher, o NtRaiseHardError de uma exceção (o
+STATUS_UNHANDLED_EXCEPTION do UnhandledExceptionFilter, com código e
+endereço nos parâmetros), o NtSetSystemInformation(177,
+SystemWin32WerStartCallout) do relatório de falha da kernel32 e o fim do
+processo com status de exceção (ali o bloco substitui o post-mortem comum
+do `finish_exit`). O bloco traz processo, pid:tid, código e endereço da
+exceção, módulo + deslocamento (lista InLoadOrder do PEB_LDR_DATA ou, fora
+dela, uma região nomeada do VAD do processo ou do System), o export mais
+próximo e até dez quadros da pilha de usuário desenrolados pela .pdata de
+cada módulo. Cada exceção entregue fica anotada na thread (código,
+endereço, registradores e o frame do CONTEXT), então o bloco de um ponto
+posterior desenrola a pilha da própria falha; sem anotação, a pilha sai da
+chamada de sistema, sem os quadros do despacho em modo usuário. Cada
+processo imprime um bloco por código, e toda leitura de memória de usuário
+confere antes a página presente e a posse (`memory::check_user_access`).
+
 **Callbacks de modo usuário.** Um serviço do kernel (o win32k, dentro de
 uma syscall da thread) chama uma rotina de usuário pelo KeUserModeCallback
 (`ke/user_callback.rs`), como o KiCallUserMode do NT: confere o contexto

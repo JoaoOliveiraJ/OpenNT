@@ -16,7 +16,7 @@ use alloc::vec::Vec;
 use core::mem::offset_of;
 
 use super::threads::{self, UserThread};
-use super::{index, state, syscalls_core};
+use super::{crash_report, index, state, syscalls_core};
 use crate::hal::amd64::usermode;
 use crate::ntos::inc::types::{Context, ContextEx, Eprocess, ExceptionRecord, MachineFrame, NtStruct, XsaveFormat};
 use crate::ntos::kd::debug_service;
@@ -127,10 +127,28 @@ fn dispatch_compaction_mask(thread: &UserThread) -> u64 {
 }
 
 /// Monta o frame do KiUserExceptionDispatcher na pilha de usuário e desvia
-/// o CONTEXT salvo para ele.
+/// o CONTEXT salvo para ele. A exceção entregue fica anotada na thread; a
+/// que não pôde ser entregue (o processo termina com o status) sai no
+/// diagnóstico de falhas (`crash_report`).
 pub fn deliver(thread: &UserThread, record: &[u8]) -> u32 {
+    let fault = crash_report::Fault::capture(record, thread.with(|thread| thread.context));
+    match deliver_frame(thread, record) {
+        Ok(frame) => {
+            crash_report::noted(thread, fault, frame);
+            0
+        }
+        Err(status) => {
+            crash_report::undeliverable(thread, &fault, status);
+            status
+        }
+    }
+}
+
+/// O corpo de [`deliver`]: o endereço do CONTEXT do frame, ou o status da
+/// recusa (nada escrito na pilha).
+fn deliver_frame(thread: &UserThread, record: &[u8]) -> Result<u64, u32> {
     let dispatcher = state::with(|state| state.ntdll_exports.as_ref().and_then(|exports| exports.get("KiUserExceptionDispatcher").copied()));
-    let Some(dispatcher) = dispatcher.filter(|&dispatcher| state::probe_user_read(dispatcher, 1)) else { return 0xC000_0139 };
+    let Some(dispatcher) = dispatcher.filter(|&dispatcher| state::probe_user_read(dispatcher, 1)) else { return Err(0xC000_0139) };
     let live = live_context(thread);
     let with_xstate = processor_identity::feature_bits() & processor_identity::kf::XSTATE != 0;
     let flags = if with_xstate { FRAME_FLAGS_XSTATE } else { FRAME_FLAGS };
@@ -140,11 +158,11 @@ pub fn deliver(thread: &UserThread, record: &[u8]) -> u32 {
     let mask = if with_xstate { dispatch_compaction_mask(thread) } else { 0 };
     let length = match extended_context::extended_context_length2(flags, mask) {
         Ok(length) => length,
-        Err(status) => return status,
+        Err(status) => return Err(status),
     };
     let buffer = guest::alloc_aligned(length as u64, 16, true);
     if buffer == 0 {
-        return 0xC000_0017;
+        return Err(0xC000_0017);
     }
     let kernel = (buffer + 0xF) & !0xF;
     guest::write_bytes(kernel, &guest::read_bytes(live.address(), CONTEXT_SIZE as usize));
@@ -152,7 +170,7 @@ pub fn deliver(thread: &UserThread, record: &[u8]) -> u32 {
         Ok(context_ex) => context_ex,
         Err(status) => {
             guest::free_bytes(buffer);
-            return status;
+            return Err(status);
         }
     };
     let (kernel_chunk, chunk_length) = extended_context::xstate_chunk(kernel_ex);
@@ -169,7 +187,7 @@ pub fn deliver(thread: &UserThread, record: &[u8]) -> u32 {
     // sonda toca a página de guarda da pilha, que cresce (`mm/guard_page`).
     if stack > user_rsp || !state::probe_user_write(stack, total) {
         guest::free_bytes(buffer);
-        return 0xC000_00FD;
+        return Err(0xC000_00FD);
     }
     // Um tratador nunca restaura IOPL/NT/VM/VIF/VIP pelo RtlRestoreContext.
     let eflags = (live.e_flags.get() & !0x1A_7000) | 0x202;
@@ -177,7 +195,7 @@ pub fn deliver(thread: &UserThread, record: &[u8]) -> u32 {
     let image = guest::alloc_bytes(total);
     if image == 0 {
         guest::free_bytes(buffer);
-        return 0xC000_0017;
+        return Err(0xC000_0017);
     }
     let at = |address: u64| image + (address - stack);
     guest::write_bytes(at(stack), &guest::read_bytes(kernel, CONTEXT_SIZE as usize));
@@ -203,7 +221,7 @@ pub fn deliver(thread: &UserThread, record: &[u8]) -> u32 {
     guest::free_bytes(image);
     guest::free_bytes(buffer);
     if !written {
-        return if copied != 0 { copied } else { 0xC000_00FD };
+        return Err(if copied != 0 { copied } else { 0xC000_00FD });
     }
     live.rsp.set(stack);
     live.rip.set(dispatcher);
@@ -221,7 +239,7 @@ pub fn deliver(thread: &UserThread, record: &[u8]) -> u32 {
         u64_at(record, information + 8),
         stack
     );
-    0
+    Ok(stack)
 }
 
 /// Exceção de hardware salva pela HAL nesta transição.
@@ -306,7 +324,7 @@ pub fn raise(record: u64, context: u64, first_chance: u64) -> Result<u32, Kernel
             if let Some(thread) = threads::current() {
                 thread.with(|thread| thread.termination_rsp = rsp);
             }
-            crate::debug_print!("[exception] unhandled 0x{:x} @0x{:x}", code, u64_at(&captured, offset_of!(ExceptionRecord, exception_address)));
+            crash_report::second_chance(&captured, context);
             usermode::block().exit_code.set(code);
             return Ok(state::TERMINATE_MAGIC);
         }

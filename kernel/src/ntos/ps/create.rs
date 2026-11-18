@@ -313,7 +313,13 @@ pub fn finish_exit(process_pointer: u64) {
     let Some(status) = threads::claim_exit(process_pointer) else { return };
     let ran = process_state::get(process_pointer).is_some_and(|state| state.started.load(core::sync::atomic::Ordering::Acquire));
     if ran && status != 0x42 && status != 0 {
-        let _ = process_context::with_process(process_pointer, || crate::ntos::ps::user::process::post_mortem(process_pointer));
+        // Um status de exceção sai no bloco do diagnóstico de falhas; os
+        // outros, no post-mortem comum.
+        let _ = process_context::with_process(process_pointer, || {
+            if !crate::ntos::ps::user::crash_report::process_exit(process_pointer, status) {
+                crate::ntos::ps::user::process::post_mortem(process_pointer);
+            }
+        });
     }
     let previous = process::get_current_thread();
     let own_threads: alloc::vec::Vec<u64> = threads::of_process(process_pointer).iter().map(|thread| thread.pointer()).filter(|&pointer| pointer != 0).collect();

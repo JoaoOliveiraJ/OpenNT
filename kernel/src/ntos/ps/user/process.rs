@@ -197,6 +197,7 @@ pub fn init() {
 
 /// Candidatos de retorno na pilha da saída (não é um unwind), a falha
 /// publicada pela HAL e o Ldr real do processo, que é o corrente (anexado).
+/// Um status de exceção sai no bloco de `crash_report` em vez deste.
 pub(crate) fn post_mortem(process_pointer: u64) {
     // A pilha da thread que encerrou o processo.
     let termination = threads::of_process(process_pointer).iter().map(|thread| thread.with(|thread| thread.termination_rsp)).find(|&rsp| rsp != 0).unwrap_or(0);

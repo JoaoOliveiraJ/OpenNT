@@ -177,6 +177,9 @@ pub struct ThreadMut {
     /// Instantâneo diagnóstico da pilha de usuário quando esta thread
     /// encerrou o processo (NtTerminateProcess ou exceção sem tratamento).
     pub termination_rsp: u64,
+    /// A última exceção entregue ao KiUserExceptionDispatcher, para o
+    /// diagnóstico de falhas (`crash_report`).
+    pub last_exception: Option<super::crash_report::Fault>,
     wait: Option<Wait>,
     /// Há uma espera instalada (mesmo enquanto é sondada fora da trava).
     waiting: bool,
@@ -220,6 +223,7 @@ impl UserThread {
                 worker_factory: 0,
                 worker_ready: false,
                 termination_rsp: 0,
+                last_exception: None,
                 wait: None,
                 waiting: false,
                 kernel: KernelState::User,
