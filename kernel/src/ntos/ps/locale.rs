@@ -87,6 +87,37 @@ pub fn is_ui_language_committed() -> u32 {
     if UI_LANGUAGE_COMMITTED.load(Ordering::Acquire) { 0 } else { 0xC000_0034 }
 }
 
+/// A serialização do MUIRefreshCachedUILock em volta da confirmação.
+static UI_LANGUAGE_LOCK: crate::rtl::SpinLock<()> = crate::rtl::SpinLock::new(());
+
+/// NtFlushInstallUILanguage(InstallUILanguage, SetComittedFlag) (ntoskrnl
+/// 19041, rva 0x7cf8d0) depois do PreviousMode e do SeTcbPrivilege, que o
+/// serviço confere: com o idioma já confirmado (PsUILanguageComitted),
+/// STATUS_SUCCESS para o mesmo PsInstallUILanguageId e STATUS_UNSUCCESSFUL
+/// para outro; senão, sob a trava, SetComittedFlag liga a confirmação e um
+/// idioma diferente passa a ser o PsInstallUILanguageId e o
+/// PsMachineUILanguageId (o idioma de interface padrão). No 19041 a troca
+/// ainda chama o MigrateOOBELanguageToInstallationLanguage, e o status dele
+/// volta; o OpenNT não tem estado de idioma do OOBE a migrar, então a troca
+/// devolve STATUS_SUCCESS. O RtlpVerifyAndCommitUILanguageSettings do
+/// winlogon termina aqui (com o idioma da instalação e a confirmação), e
+/// um status negativo encerra o winlogon antes do LogonUI.
+pub fn flush_install_ui_language(language: u16, set_committed: bool) -> u32 {
+    let current = INSTALL_LANGUAGE.load(Ordering::Acquire) as u16;
+    if UI_LANGUAGE_COMMITTED.load(Ordering::Acquire) {
+        return if language == current { 0 } else { 0xC000_0001 };
+    }
+    let _guard = UI_LANGUAGE_LOCK.lock();
+    if set_committed {
+        UI_LANGUAGE_COMMITTED.store(true, Ordering::Release);
+    }
+    if language != INSTALL_LANGUAGE.load(Ordering::Acquire) as u16 {
+        INSTALL_LANGUAGE.store(language as u32, Ordering::Release);
+        UI_LANGUAGE.store(language as u32, Ordering::Release);
+    }
+    0
+}
+
 fn locale_cell(user_profile: bool) -> &'static AtomicU32 {
     if user_profile { &USER_LOCALE } else { &SYSTEM_LOCALE }
 }

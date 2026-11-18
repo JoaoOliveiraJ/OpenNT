@@ -75,6 +75,13 @@ fn initialize_registry(assert: Assert, call: Call) {
 
 fn ui_language_and_apphelp(assert: Assert, call: Call) {
     assert(call("NtIsUILanguageComitted", 0, 0, 0, 0) == STATUS_OBJECT_NAME_NOT_FOUND, "userboot: NtIsUILanguageComitted antes da confirmacao do idioma");
+    // NtFlushInstallUILanguage sem SetComittedFlag e com o idioma da
+    // instalação: sucesso com SeTcbPrivilege, e a confirmação (que só o
+    // winlogon liga) continua desligada.
+    let install = crate::ntos::ps::locale::install_ui_language() as u64;
+    let tcb = crate::ntos::se::privilege::single_privilege_check(7, 1);
+    let flushed = call("NtFlushInstallUILanguage", install, 0, 0, 0);
+    assert(flushed == if tcb { 0 } else { 0xC000_0022 } && call("NtIsUILanguageComitted", 0, 0, 0, 0) == STATUS_OBJECT_NAME_NOT_FOUND && crate::ntos::ps::locale::install_ui_language() as u64 == install, "userboot: NtFlushInstallUILanguage sem confirmar mantem o idioma e a confirmacao desligada");
     // Sem o \Device\ahcache: o status pré-definido de cada serviço.
     let statuses = [12u64, u64::MAX, 0, 6, 1, 7, 10, 4, 11].map(|service| call("NtApphelpCacheControl", service, 0, 0, 0));
     assert(

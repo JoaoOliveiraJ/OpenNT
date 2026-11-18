@@ -167,8 +167,23 @@ fn nt_is_ui_language_comitted(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _rsp: u64)
     Ok(crate::ntos::ps::locale::is_ui_language_committed())
 }
 
+/// NtFlushInstallUILanguage(InstallUILanguage, SetComittedFlag) de modo
+/// usuário: sem SeTcbPrivilege no modo anterior, STATUS_ACCESS_DENIED; o
+/// resto em `ps/locale`. (O 19041 recusa o chamador de modo kernel com
+/// STATUS_UNSUCCESSFUL: só a entrada de usuário existe.)
+fn nt_flush_install_ui_language(language: u64, set_committed: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
+    if !crate::ntos::se::privilege::single_privilege_check(SE_TCB_PRIVILEGE, 1) {
+        return Ok(0xC000_0022);
+    }
+    Ok(crate::ntos::ps::locale::flush_install_ui_language(language as u16, set_committed as u32 != 0))
+}
+
+/// SeTcbPrivilege.
+const SE_TCB_PRIVILEGE: u64 = 7;
+
 pub fn init() {
     state::register_handler("NtIsUILanguageComitted", nt_is_ui_language_comitted);
+    state::register_handler("NtFlushInstallUILanguage", nt_flush_install_ui_language);
     state::register_handler("NtInitializeNlsFiles", nt_initialize_nls_files);
     state::register_handler("NtGetNlsSectionPtr", nt_get_nls_section_ptr);
     state::register_handler("NtQueryDefaultLocale", nt_query_default_locale);
