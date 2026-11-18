@@ -292,16 +292,20 @@ fn nt_load_key_ex(target: u64, source: u64, flags: u64, trust_class_key: u64, rs
     Ok(hive_services::load_key(target, source, flags as u32, trust_class_key, state::stack_arg(rsp, 5), state::stack_arg32(rsp, 6), state::stack_arg(rsp, 7), true))
 }
 
+fn nt_load_key3(target: u64, source: u64, flags: u64, extended: u64, rsp: u64) -> Result<u32, KernelError> {
+    Ok(hive_services::load_key3(target, source, flags as u32, extended, state::stack_arg32(rsp, 5), state::stack_arg32(rsp, 6), state::stack_arg(rsp, 7), true))
+}
+
 fn nt_unload_key(target: u64, _a2: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
-    Ok(hive_services::unload_key(target, 0, 0, true))
+    Ok(hive_services::unload_key(target, 0, false, 0, true))
 }
 
 fn nt_unload_key2(target: u64, flags: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
-    Ok(hive_services::unload_key(target, flags as u32, 0, true))
+    Ok(hive_services::unload_key(target, flags as u32, false, 0, true))
 }
 
 fn nt_unload_key_ex(target: u64, event: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
-    Ok(hive_services::unload_key(target, 0, event, true))
+    Ok(hive_services::unload_key(target, 0, true, event, true))
 }
 
 fn nt_save_key(key: u64, file: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
@@ -339,6 +343,7 @@ pub fn init() {
     state::register_handler("NtLoadKey", nt_load_key);
     state::register_handler("NtLoadKey2", nt_load_key2);
     state::register_handler("NtLoadKeyEx", nt_load_key_ex);
+    state::register_handler("NtLoadKey3", nt_load_key3);
     state::register_handler("NtUnloadKey", nt_unload_key);
     state::register_handler("NtUnloadKey2", nt_unload_key2);
     state::register_handler("NtUnloadKeyEx", nt_unload_key_ex);

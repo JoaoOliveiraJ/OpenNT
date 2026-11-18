@@ -2,10 +2,27 @@
 //! do NT).
 //!
 //! O Cm abre o primário e os logs de uma hive com ZwCreateFile num handle de
-//! kernel, sem compartilhamento (CmpOpenHiveFile), e os mantém abertos
-//! enquanto a hive está carregada. As leituras e escritas vão ao volume do
-//! FILE_OBJECT do handle. O NtSaveKey e o NtRestoreKey recebem o handle de
-//! arquivo do chamador, que é usado sem ser fechado.
+//! kernel (CmpOpenHiveFile, ntoskrnl 19041 rva 0x6ea5d8) e os mantém
+//! abertos enquanto a hive está carregada:
+//! - o primário de uma hive gravável com READ_CONTROL | FILE_READ_DATA |
+//!   FILE_WRITE_DATA, sem compartilhamento, FILE_OPEN_IF quando a carga pode
+//!   criar a hive (senão FILE_OPEN), CreateOptions FILE_NO_COMPRESSION |
+//!   FILE_OPEN_FOR_BACKUP_INTENT | FILE_SYNCHRONOUS_IO_NONALERT |
+//!   FILE_SEQUENTIAL_ONLY e FILE_ATTRIBUTE_NORMAL;
+//! - os logs (`.LOG1` e `.LOG2`) com FILE_READ_DATA | FILE_WRITE_DATA, sem
+//!   compartilhamento, FILE_OPEN_IF, FILE_NO_COMPRESSION |
+//!   FILE_NO_INTERMEDIATE_BUFFERING | FILE_SEQUENTIAL_ONLY e
+//!   FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM (os atributos de um log
+//!   criado);
+//! - numa carga só de leitura (REG_OPEN_READ_ONLY), FILE_READ_DATA com
+//!   FILE_SHARE_READ e FILE_OPEN, para o primário e para os logs;
+//! - com o token de acesso ao arquivo do NtLoadKey3, a abertura acontece
+//!   impersonando o token (PsImpersonateClient no nível dele) e com
+//!   OBJ_FORCE_ACCESS_CHECK; a impersonação anterior da thread volta depois.
+//!
+//! As leituras e escritas vão ao volume do FILE_OBJECT do handle. O
+//! NtSaveKey e o NtRestoreKey recebem o handle de arquivo do chamador, que é
+//! usado sem ser fechado.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -37,6 +54,61 @@ const CREATE_OPTIONS: u32 = 0x60;
 /// FILE_GENERIC_READ e FILE_GENERIC_READ | FILE_GENERIC_WRITE.
 const READ_ACCESS: u32 = 0x0012_0089;
 const READ_WRITE_ACCESS: u32 = 0x0012_019F;
+/// As aberturas do CmpOpenHiveFile: acesso do primário gravável
+/// (READ_CONTROL | FILE_READ_DATA | FILE_WRITE_DATA), dos logs graváveis e
+/// das cargas só de leitura, FILE_SHARE_READ e as CreateOptions do primário
+/// e dos logs.
+const PRIMARY_ACCESS: u32 = 0x0002_0003;
+const READ_CONTROL: u32 = 0x0002_0000;
+const LOG_ACCESS: u32 = 0x3;
+const READ_ONLY_ACCESS: u32 = 0x1;
+const FILE_SHARE_READ: u32 = 1;
+const PRIMARY_OPTIONS: u32 = 0xC024;
+const LOG_OPTIONS: u32 = 0x800C;
+/// FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM de um log criado.
+const LOG_ATTRIBUTES: u32 = 0x6;
+/// OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, e OBJ_FORCE_ACCESS_CHECK das
+/// aberturas com o token de acesso ao arquivo.
+const OPEN_ATTRIBUTES: u32 = 0x240;
+const OBJ_FORCE_ACCESS_CHECK: u32 = 0x400;
+
+/// Como uma carga abre os arquivos da hive.
+#[derive(Clone, Copy, Default)]
+pub struct OpenMode {
+    /// REG_OPEN_READ_ONLY.
+    pub read_only: bool,
+    /// O token de impersonação referenciado do NtLoadKey3 (o
+    /// CmExtendedParameterFileAccessToken) e o nível dele.
+    pub token: Option<(u64, u32)>,
+}
+
+/// Executa `open` impersonando o token de acesso ao arquivo, com a
+/// impersonação anterior da thread restaurada depois (o
+/// PsReferenceImpersonationTokenEx e os dois PsImpersonateClient do
+/// CmpOpenHiveFile); uma impersonação recusada é o resultado da abertura.
+fn impersonating<T>(token: Option<(u64, u32)>, open: impl FnOnce() -> Result<T, u32>) -> Result<T, u32> {
+    use crate::ntos::ps::{process, security};
+    use crate::ntos::se::token::{thread as thread_tokens, tokens};
+    let Some((token, level)) = token else { return open() };
+    let thread = process::get_current_thread();
+    let previous = thread_tokens::get(thread).filter(|previous| tokens::retain(previous.token).is_ok());
+    let result = match security::impersonate_client(thread, token, false, false, level) {
+        Ok(0) => {
+            let result = open();
+            let _ = match previous {
+                Some(previous) => security::impersonate_client(thread, previous.token, previous.copy_on_open, previous.effective_only, previous.level),
+                None => security::impersonate_client(thread, 0, false, false, 2),
+            };
+            result
+        }
+        Ok(status) => Err(status),
+        Err(error) => Err(if error.status != 0 { error.status } else { STATUS_INSUFFICIENT_RESOURCES }),
+    };
+    if let Some(previous) = previous {
+        let _ = tokens::release(previous.token);
+    }
+    result
+}
 
 /// Argumentos do ZwCreateFile (bloco privado; o texto do nome vem depois).
 #[repr(C)]
@@ -66,9 +138,58 @@ impl HiveFile {
     }
 
     /// [`HiveFile::open`] com o Information do IO_STATUS_BLOCK (FILE_OPENED
-    /// ou [`FILE_CREATED`]), que o CmpInitHiveFromFile confere para saber se
-    /// a hive é nova.
+    /// ou [`FILE_CREATED`]).
     pub fn open_with_disposition(name: &str, disposition: u32, write: bool) -> Result<(HiveFile, u64), u32> {
+        let access = if write { READ_WRITE_ACCESS } else { READ_ACCESS };
+        Self::create(name, access, 0, disposition, CREATE_OPTIONS, OPEN_ATTRIBUTES)
+    }
+
+    /// O primário de uma carga (CmpOpenHiveFile com o índice 0): FILE_OPEN_IF
+    /// quando a carga pode alocar a hive e é gravável, senão FILE_OPEN. O
+    /// Information devolvido é [`FILE_CREATED`] também para um arquivo que já
+    /// existia vazio (o EndOfFile 0 do ZwQueryInformationFile), que o
+    /// CmpInitHiveFromFile trata como hive nova.
+    pub fn open_primary(name: &str, allocate: bool, mode: OpenMode) -> Result<(HiveFile, u64), u32> {
+        let (access, share, disposition) = if mode.read_only { (READ_ONLY_ACCESS, FILE_SHARE_READ, FILE_OPEN) } else { (PRIMARY_ACCESS, 0, if allocate { FILE_OPEN_IF } else { FILE_OPEN }) };
+        let attributes = OPEN_ATTRIBUTES | if mode.token.is_some() { OBJ_FORCE_ACCESS_CHECK } else { 0 };
+        let (file, information) = impersonating(mode.token, || Self::create(name, access, share, disposition, PRIMARY_OPTIONS, attributes))?;
+        let information = if !mode.read_only && information != FILE_CREATED && file.size() == 0 { FILE_CREATED } else { information };
+        Ok((file, information))
+    }
+
+    /// Um log de uma carga (`.LOG1` ou `.LOG2`, CmpOpenHiveFile com os
+    /// índices 4 e 5): criado se faltar, com FILE_ATTRIBUTE_HIDDEN |
+    /// FILE_ATTRIBUTE_SYSTEM; numa carga só de leitura, só o existente.
+    pub fn open_log(name: &str, mode: OpenMode) -> Result<HiveFile, u32> {
+        let (access, share, disposition) = if mode.read_only { (READ_ONLY_ACCESS, FILE_SHARE_READ, FILE_OPEN) } else { (LOG_ACCESS, 0, FILE_OPEN_IF) };
+        let attributes = OPEN_ATTRIBUTES | if mode.token.is_some() { OBJ_FORCE_ACCESS_CHECK } else { 0 };
+        let (file, information) = impersonating(mode.token, || Self::create(name, access, share, disposition, LOG_OPTIONS, attributes))?;
+        if information == FILE_CREATED {
+            file.add_attributes(LOG_ATTRIBUTES);
+        }
+        Ok(file)
+    }
+
+    /// A abertura só com READ_CONTROL (o CmpOpenHiveFile com o bit 8, sem
+    /// acesso aos dados): o FILE_OBJECT de um arquivo que uma hive carregada
+    /// mantém aberto sem compartilhamento, para o CmpIsThisSameFile.
+    pub fn open_identity(name: &str) -> Result<HiveFile, u32> {
+        Self::create(name, READ_CONTROL, 0, FILE_OPEN, PRIMARY_OPTIONS, OPEN_ATTRIBUTES).map(|(file, _)| file)
+    }
+
+    /// Os atributos que a criação do arquivo grava (o FileAttributes do
+    /// ZwCreateFile), somados aos que o volume deu ao arquivo novo.
+    fn add_attributes(&self, attributes: u32) {
+        let Some(ntfs) = crate::drivers::fs::volume_files::fixed_volume() else { return };
+        if !crate::drivers::fs::volume::same(self.volume, ntfs as &'static dyn FileSystem) {
+            return;
+        }
+        let current = self.volume.stat(&self.path).map_or(0, |stat| stat.attributes);
+        let _ = ntfs.set_basic(&self.path, None, current | attributes);
+    }
+
+    /// ZwCreateFile do nome NT num handle de kernel.
+    fn create(name: &str, access: u32, share: u32, disposition: u32, options: u32, object_attributes: u32) -> Result<(HiveFile, u64), u32> {
         let units = name.encode_utf16().count() as u64;
         let block = guest::alloc_bytes(CreateRequest::SIZE + units * 2 + 2);
         if block == 0 {
@@ -83,10 +204,8 @@ impl HiveFile {
         request.name.buffer.set(text);
         request.attributes.length.set(ObjectAttributes::SIZE as u32);
         request.attributes.object_name.set(request.name.address());
-        // OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE.
-        request.attributes.attributes.set(0x240);
-        let access = if write { READ_WRITE_ACCESS } else { READ_ACCESS };
-        let status = zw_files::create_kernel_file(request.handle.address(), access, request.attributes.address(), request.io_status.address(), 0, disposition, CREATE_OPTIONS);
+        request.attributes.attributes.set(object_attributes);
+        let status = zw_files::create_kernel_file(request.handle.address(), access, request.attributes.address(), request.io_status.address(), share, disposition, options);
         let handle = request.handle.get();
         let information = request.io_status.information.get();
         guest::free_bytes(block);

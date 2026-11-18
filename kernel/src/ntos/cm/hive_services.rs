@@ -1,29 +1,42 @@
-//! Os serviços de hive: NtLoadKey/NtLoadKey2/NtLoadKeyEx,
+//! Os serviços de hive: NtLoadKey/NtLoadKey2/NtLoadKeyEx/NtLoadKey3,
 //! NtUnloadKey/NtUnloadKey2/NtUnloadKeyEx, NtSaveKey/NtSaveKeyEx,
 //! NtRestoreKey, NtFlushKey, NtCompressKey e NtCompactKeys (e os Zw*
 //! exportados, com PreviousMode de kernel).
 //!
 //! Captura dos parâmetros, privilégios e códigos como no ntoskrnl 19041:
 //! - NtLoadKeyEx (CmLoadDifferencingKey, rva 0x6e729c): Flags com algum bit
-//!   de 0xFFFF000B é STATUS_INVALID_PARAMETER_3; sem REG_APP_HIVE exige
-//!   SeRestorePrivilege (SeSinglePrivilegeCheck pelo PreviousMode; sem ele,
-//!   STATUS_PRIVILEGE_NOT_HELD). Com REG_APP_HIVE ou
+//!   de 0xFFFF000B é STATUS_INVALID_PARAMETER_3, e REG_FLUSH_HIVE_FILE_GROWTH
+//!   (0x1000) sem REG_HIVE_SINGLE_LOG | REG_BOOT_HIVE também; sem
+//!   REG_APP_HIVE exige SeRestorePrivilege (SeSinglePrivilegeCheck pelo
+//!   PreviousMode; sem ele, STATUS_PRIVILEGE_NOT_HELD). Com REG_APP_HIVE ou
 //!   REG_LOAD_HIVE_OPEN_HANDLE, RootHandle nulo é
 //!   STATUS_INVALID_PARAMETER_7, e REG_APP_HIVE com REG_NO_LAZY_FLUSH,
 //!   REG_START_JOURNAL ou REG_BOOT_HIVE (0x444) é
 //!   STATUS_INVALID_PARAMETER_3; sem nenhum dos dois, RootHandle não nulo é
 //!   STATUS_INVALID_PARAMETER_7 e Event não nulo
-//!   STATUS_INVALID_PARAMETER_5. Uma hive de aplicativo com RootDirectory no
-//!   TargetKey é STATUS_INVALID_PARAMETER_1. O *RootHandle zera antes da
-//!   carga e recebe, depois dela, o handle da raiz aberto com DesiredAccess.
-//!   O Event é sinalizado quando a hive for descarregada. NtLoadKey é o Ex
-//!   com zeros; NtLoadKey2, o Ex com Flags;
+//!   STATUS_INVALID_PARAMETER_5. Depois vem o nome do arquivo e o TargetKey:
+//!   uma hive de aplicativo com RootDirectory no TargetKey é
+//!   STATUS_INVALID_PARAMETER_1 e o *RootHandle zera antes da carga. Então
+//!   as referências: o TrustClassKey (handle de chave, qualquer acesso), o
+//!   Event (EVENT_MODIFY_STATE) e o token de acesso ao arquivo
+//!   (TOKEN_IMPERSONATE; um token primário é STATUS_BAD_TOKEN_TYPE). O
+//!   handle da raiz é aberto pelo nome depois da carga, com DesiredAccess e
+//!   OBJ_CASE_INSENSITIVE (mais OBJ_KERNEL_HANDLE para um chamador de modo
+//!   kernel). O Event é sinalizado quando a hive for descarregada. NtLoadKey
+//!   é o Ex com zeros; NtLoadKey2, o Ex com Flags;
+//! - NtLoadKey3 (rva 0x5cc3b0): os parâmetros estendidos são um vetor de
+//!   CM_EXTENDED_PARAMETER (16 bytes, alinhado a 8 no modo usuário) com o
+//!   tipo no byte baixo: 1 o TrustClassKey, 2 o Event e 3 o token de acesso
+//!   ao arquivo; um tipo repetido ou desconhecido é
+//!   STATUS_INVALID_PARAMETER_4. As Flags ganham
+//!   REG_NO_IMPERSONATION_FALLBACK (0x8000) e o resto é o NtLoadKeyEx;
 //! - NtUnloadKey(2/Ex) (CmUnloadKey, rva 0x66c6bc): SeRestorePrivilege;
 //!   Flags além de REG_FORCE_UNLOAD é STATUS_INVALID_PARAMETER; a chave
 //!   ausente também (o STATUS_OBJECT_NAME_NOT_FOUND vira
-//!   STATUS_INVALID_PARAMETER); o Ex com handles abertos e um evento
-//!   devolve STATUS_PENDING e descarrega quando o último handle fecha,
-//!   sinalizando o evento;
+//!   STATUS_INVALID_PARAMETER); o Event do Ex (EVENT_MODIFY_STATE) é zerado;
+//!   o Ex com handles abertos, com ou sem evento, devolve STATUS_PENDING e
+//!   descarrega quando o último handle fecha, sinalizando o evento
+//!   (`hive_list::unload_key`);
 //! - NtSaveKeyEx (rva 0x729730): SeBackupPrivilege; Format 1
 //!   (REG_STANDARD_FORMAT), 2 (REG_LATEST_FORMAT) ou 4
 //!   (REG_NO_COMPRESSION), senão STATUS_INVALID_PARAMETER; o handle de
@@ -35,7 +48,9 @@
 //!   e o REG_REFRESH_HIVE não o usa); REG_REFRESH_HIVE com outro bit é
 //!   STATUS_INVALID_PARAMETER; REG_WHOLE_HIVE_VOLATILE e REG_REFRESH_HIVE
 //!   vão ao CmpLoadHiveVolatile e ao CmpRefreshHive (`hive_list`);
-//! - NtFlushKey (rva 0x696c00): qualquer acesso no handle;
+//! - NtFlushKey (rva 0x696c00): qualquer acesso no handle, salvo numa hive
+//!   carregada com REG_NO_LAZY_FLUSH (HIVE_NOLAZYFLUSH), em que o modo
+//!   usuário precisa de KEY_WRITE (senão STATUS_ACCESS_DENIED);
 //! - NtCompressKey (rva 0x868250): SeBackupPrivilege, KEY_WRITE no handle,
 //!   o modo nos dois bits baixos do handle e a chave precisa ser a raiz da
 //!   hive (STATUS_INVALID_PARAMETER);
@@ -75,8 +90,12 @@ const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
 const STATUS_OBJECT_PATH_SYNTAX_BAD: u32 = 0xC000_003B;
 const STATUS_PRIVILEGE_NOT_HELD: u32 = 0xC000_0061;
 const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
+const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+const STATUS_BAD_TOKEN_TYPE: u32 = 0xC000_00A8;
+const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
 const STATUS_INVALID_PARAMETER_1: u32 = 0xC000_00EF;
 const STATUS_INVALID_PARAMETER_3: u32 = 0xC000_00F1;
+const STATUS_INVALID_PARAMETER_4: u32 = 0xC000_00F2;
 const STATUS_INVALID_PARAMETER_5: u32 = 0xC000_00F3;
 const STATUS_INVALID_PARAMETER_7: u32 = 0xC000_00F5;
 
@@ -89,15 +108,31 @@ const REG_LOAD_HIVE_OPEN_HANDLE: u32 = 0x800;
 /// REG_NO_LAZY_FLUSH | REG_START_JOURNAL | REG_BOOT_HIVE, recusados numa
 /// hive de aplicativo.
 const APP_HIVE_REFUSED: u32 = 0x444;
+/// REG_FLUSH_HIVE_FILE_GROWTH, que só vale com REG_HIVE_SINGLE_LOG |
+/// REG_BOOT_HIVE.
+const REG_FLUSH_HIVE_FILE_GROWTH: u32 = 0x1000;
+const SINGLE_LOG_BOOT_HIVE: u32 = 0x600;
+/// REG_NO_IMPERSONATION_FALLBACK, que o NtLoadKey3 sempre liga.
+const REG_NO_IMPERSONATION_FALLBACK: u32 = 0x8000;
+/// Os tipos de CM_EXTENDED_PARAMETER: CmExtendedParameterTrustClassKey,
+/// CmExtendedParameterEvent e CmExtendedParameterFileAccessToken.
+const EXTENDED_TRUST_CLASS_KEY: u8 = 1;
+const EXTENDED_EVENT: u8 = 2;
+const EXTENDED_FILE_ACCESS_TOKEN: u8 = 3;
+/// TOKEN_IMPERSONATE e TokenImpersonation.
+const TOKEN_IMPERSONATE: u32 = 4;
+const TOKEN_TYPE_IMPERSONATION: u32 = 2;
 const REG_WHOLE_HIVE_VOLATILE: u32 = 1;
 const REG_REFRESH_HIVE: u32 = 2;
 /// KEY_WRITE, FILE_READ_DATA e FILE_WRITE_DATA.
 const KEY_WRITE: u32 = 0x2_0006;
 const FILE_READ_DATA: u32 = 1;
 const FILE_WRITE_DATA: u32 = 2;
-/// OBJ_INHERIT e OBJ_KERNEL_HANDLE: os atributos do TargetKey que valem
-/// para o handle da raiz.
-const ROOT_HANDLE_ATTRIBUTES: u32 = 0x202;
+/// Os atributos do handle da raiz (o ObOpenObjectByPointer do
+/// CmLoadDifferencingKey): OBJ_CASE_INSENSITIVE, mais OBJ_KERNEL_HANDLE
+/// para um chamador de modo kernel.
+const USER_ROOT_HANDLE_ATTRIBUTES: u32 = 0x40;
+const KERNEL_ROOT_HANDLE_ATTRIBUTES: u32 = 0x240;
 
 /// RegNtPreFlushKey, LoadKey, UnLoadKey, RestoreKey e SaveKey (o pós é o
 /// seguinte).
@@ -116,11 +151,10 @@ fn is_registry_path(path: &str) -> bool {
     lower == "\\registry" || lower.starts_with("\\registry\\")
 }
 
-/// O TargetKey capturado: o nome completo, a raiz e os atributos.
+/// O TargetKey capturado: o nome completo e a raiz.
 struct KeyTarget {
     path: String,
     root: u64,
-    attributes: u32,
 }
 
 /// O nome de chave de um OBJECT_ATTRIBUTES (CmpNameFromAttributes): o
@@ -128,8 +162,7 @@ struct KeyTarget {
 fn key_target(attributes: u64, previous_mode: bool) -> Result<KeyTarget, u32> {
     let target = if previous_mode {
         let parsed = user_registry::parse_user_object_attributes(attributes).ok_or(STATUS_ACCESS_VIOLATION)?;
-        let flags = user_registry::user_object_attributes(attributes).map_err(|_| STATUS_ACCESS_VIOLATION)?;
-        KeyTarget { path: parsed.path, root: parsed.root_directory, attributes: flags & !0x200 }
+        KeyTarget { path: parsed.path, root: parsed.root_directory }
     } else {
         if attributes == 0 {
             return Err(STATUS_INVALID_PARAMETER);
@@ -149,7 +182,7 @@ fn key_target(attributes: u64, previous_mode: bool) -> Result<KeyTarget, u32> {
                 if name.is_empty() { root_path } else { format!("{root_path}\\{name}") }
             }
         };
-        KeyTarget { path, root, attributes: object.attributes.get() }
+        KeyTarget { path, root }
     };
     if is_registry_path(&target.path) { Ok(target) } else { Err(STATUS_OBJECT_PATH_SYNTAX_BAD) }
 }
@@ -223,37 +256,141 @@ fn unicode_block(text: &str) -> u64 {
     block
 }
 
+/// Os parâmetros do CmLoadDifferencingKey que o NtLoadKey(2/3/Ex) passa.
+struct LoadParameters {
+    target: u64,
+    source: u64,
+    flags: u32,
+    trust_class_key: u64,
+    event: u64,
+    desired_access: u32,
+    root_handle: u64,
+    file_access_token: u64,
+}
+
+/// O token de acesso ao arquivo referenciado (TOKEN_IMPERSONATE): o
+/// ponteiro, o nível de impersonação e a referência de kernel a devolver.
+struct FileAccessToken {
+    token: u64,
+    level: u32,
+    reference: Option<crate::ntos::se::token::reference::TokenReference>,
+}
+
+impl FileAccessToken {
+    fn release(&mut self) {
+        if let Some(mut reference) = self.reference.take() {
+            let _ = reference.release();
+        }
+    }
+}
+
+/// ObReferenceObjectByHandle(Token, TOKEN_IMPERSONATE, SeTokenObjectType)
+/// e o TokenType: um token primário é STATUS_BAD_TOKEN_TYPE.
+fn file_access_token(handle: u64, previous_mode: bool) -> Result<FileAccessToken, u32> {
+    use crate::ntos::se::token::{reference as token_reference, tokens};
+    let (token, reference) = if previous_mode {
+        (crate::ntos::ps::user::tokens::lookup(handle, TOKEN_IMPERSONATE)?, None)
+    } else {
+        match token_reference::reference(handle, TOKEN_IMPERSONATE, 0, false) {
+            Ok(Ok(reference)) => (reference.token, Some(reference)),
+            Ok(Err(status)) => return Err(status),
+            Err(error) => return Err(if error.status != 0 { error.status } else { STATUS_INSUFFICIENT_RESOURCES }),
+        }
+    };
+    let mut referenced = FileAccessToken { token, level: 0, reference };
+    match tokens::with(token, |record| (record.kind, record.impersonation_level)) {
+        Some((TOKEN_TYPE_IMPERSONATION, level)) => {
+            referenced.level = level;
+            Ok(referenced)
+        }
+        Some(_) => {
+            referenced.release();
+            Err(STATUS_BAD_TOKEN_TYPE)
+        }
+        None => {
+            referenced.release();
+            Err(STATUS_INVALID_HANDLE)
+        }
+    }
+}
+
 /// NtLoadKeyEx(TargetKey, SourceFile, Flags, TrustClassKey, Event,
 /// DesiredAccess, RootHandle, Reserved).
 #[allow(clippy::too_many_arguments)]
-pub fn load_key(target: u64, source: u64, flags: u32, _trust_class_key: u64, event: u64, desired_access: u32, root_handle: u64, previous_mode: bool) -> u32 {
+pub fn load_key(target: u64, source: u64, flags: u32, trust_class_key: u64, event: u64, desired_access: u32, root_handle: u64, previous_mode: bool) -> u32 {
+    load_differencing_key(&LoadParameters { target, source, flags, trust_class_key, event, desired_access, root_handle, file_access_token: 0 }, previous_mode)
+}
+
+/// NtLoadKey3(TargetKey, SourceFile, Flags, ExtendedParameters,
+/// ExtendedParameterCount, DesiredAccess, RootHandle, Reserved): os
+/// CM_EXTENDED_PARAMETER capturados um a um e o NtLoadKeyEx com
+/// REG_NO_IMPERSONATION_FALLBACK.
+#[allow(clippy::too_many_arguments)]
+pub fn load_key3(target: u64, source: u64, flags: u32, extended: u64, count: u32, desired_access: u32, root_handle: u64, previous_mode: bool) -> u32 {
+    let mut parameters = LoadParameters { target, source, flags: flags | REG_NO_IMPERSONATION_FALLBACK, trust_class_key: 0, event: 0, desired_access, root_handle, file_access_token: 0 };
+    let mut seen = 0u32;
+    for index in 0..count as u64 {
+        let entry = extended.wrapping_add(index * 16);
+        if previous_mode {
+            if entry & 7 != 0 {
+                return STATUS_DATATYPE_MISALIGNMENT;
+            }
+            if !user_state::probe_user_read(entry, 16) {
+                return STATUS_ACCESS_VIOLATION;
+            }
+        }
+        let (Ok(kind), Ok(value)) = (guest::try_read::<u64>(entry), guest::try_read::<u64>(entry + 8)) else { return STATUS_ACCESS_VIOLATION };
+        let (bit, slot) = match kind as u8 {
+            EXTENDED_TRUST_CLASS_KEY => (2, &mut parameters.trust_class_key),
+            EXTENDED_EVENT => (4, &mut parameters.event),
+            EXTENDED_FILE_ACCESS_TOKEN => (8, &mut parameters.file_access_token),
+            _ => return STATUS_INVALID_PARAMETER_4,
+        };
+        if seen & bit != 0 {
+            return STATUS_INVALID_PARAMETER_4;
+        }
+        seen |= bit;
+        *slot = value;
+    }
+    load_differencing_key(&parameters, previous_mode)
+}
+
+/// CmLoadDifferencingKey sem a camada diferencial.
+fn load_differencing_key(parameters: &LoadParameters, previous_mode: bool) -> u32 {
+    let LoadParameters { target, source, flags, trust_class_key, event, desired_access, root_handle, file_access_token: token_handle } = *parameters;
     if flags & 0xFFFF_000B != 0 {
+        return STATUS_INVALID_PARAMETER_3;
+    }
+    if flags & REG_FLUSH_HIVE_FILE_GROWTH != 0 && flags & SINGLE_LOG_BOOT_HIVE != SINGLE_LOG_BOOT_HIVE {
         return STATUS_INVALID_PARAMETER_3;
     }
     let app = flags & REG_APP_HIVE != 0;
     let open_handle = flags & (REG_APP_HIVE | REG_LOAD_HIVE_OPEN_HANDLE) != 0;
-    if app {
+    if !app && !privileged(SE_RESTORE_PRIVILEGE, previous_mode) {
+        return STATUS_PRIVILEGE_NOT_HELD;
+    }
+    if open_handle {
         if root_handle == 0 {
             return STATUS_INVALID_PARAMETER_7;
         }
-        if flags & APP_HIVE_REFUSED != 0 {
+        if app && flags & APP_HIVE_REFUSED != 0 {
             return STATUS_INVALID_PARAMETER_3;
         }
     } else {
-        if !privileged(SE_RESTORE_PRIVILEGE, previous_mode) {
-            return STATUS_PRIVILEGE_NOT_HELD;
-        }
-        if open_handle && root_handle == 0 {
-            return STATUS_INVALID_PARAMETER_7;
-        }
-    }
-    if !open_handle {
         if root_handle != 0 {
             return STATUS_INVALID_PARAMETER_7;
         }
         if event != 0 {
             return STATUS_INVALID_PARAMETER_5;
         }
+    }
+    let source = match file_path(source, previous_mode) {
+        Ok(path) => path,
+        Err(status) => return status,
+    };
+    // *RootHandle = NULL antes da cópia do TargetKey.
+    if open_handle && (previous_mode && !user_state::probe_user_write(root_handle, 8) || guest::try_write::<u64>(root_handle, 0).is_err()) {
+        return STATUS_ACCESS_VIOLATION;
     }
     let target = match key_target(target, previous_mode) {
         Ok(target) => target,
@@ -262,15 +399,16 @@ pub fn load_key(target: u64, source: u64, flags: u32, _trust_class_key: u64, eve
     if app && target.root != 0 {
         return STATUS_INVALID_PARAMETER_1;
     }
-    let source = match file_path(source, previous_mode) {
-        Ok(path) => path,
-        Err(status) => return status,
+    // CmObReferenceObjectByHandle do TrustClassKey, sem acesso pedido.
+    let trust = if trust_class_key != 0 {
+        match key_services::reference_key(trust_class_key, previous_mode, 0) {
+            Ok((node, _)) => Some(node),
+            Err(status) => return status,
+        }
+    } else {
+        None
     };
-    // *RootHandle = NULL antes da carga.
-    if open_handle && (previous_mode && !user_state::probe_user_write(root_handle, 8) || guest::try_write::<u64>(root_handle, 0).is_err()) {
-        return STATUS_ACCESS_VIOLATION;
-    }
-    let event_reference: Option<EventReference> = if event != 0 {
+    let mut reference: Option<EventReference> = if event != 0 {
         match file_request::event_reference(event, previous_mode as u8) {
             Ok(reference) => Some(reference),
             Err(status) => return status,
@@ -278,11 +416,25 @@ pub fn load_key(target: u64, source: u64, flags: u32, _trust_class_key: u64, eve
     } else {
         None
     };
-    let event_pointer = event_reference.as_ref().map_or(0, |reference| reference.pointer);
+    let mut token = if token_handle != 0 {
+        match file_access_token(token_handle, previous_mode) {
+            Ok(token) => Some(token),
+            Err(status) => {
+                if let Some(mut reference) = reference.take() {
+                    reference.release();
+                }
+                return status;
+            }
+        }
+    } else {
+        None
+    };
+    let event_pointer = reference.as_ref().map_or(0, |reference| reference.pointer);
+    let token_pointer = token.as_ref().map_or(0, |token| token.token);
     let root_body = if target.root != 0 { key_services::key_body(target.root, previous_mode).unwrap_or(0) } else { 0 };
+    let trust_body = if trust_class_key != 0 { key_services::key_body(trust_class_key, previous_mode).unwrap_or(0) } else { 0 };
     let names = if callbacks::has() { (unicode_block(&target.path), unicode_block(&source)) } else { (0, 0) };
     let mut mount: Option<String> = None;
-    let mut reference = event_reference;
     let status = filtered(
         REG_NT_PRE_LOAD_KEY,
         RegLoadKeyInformation::SIZE,
@@ -295,13 +447,16 @@ pub fn load_key(target: u64, source: u64, flags: u32, _trust_class_key: u64, eve
             block.key_name.set(names.0);
             block.source_file.set(names.1);
             block.flags.set(flags);
+            block.trust_class_object.set(trust_body);
             block.user_event.set(event_pointer);
             block.desired_access.set(desired_access);
             block.root_handle.set(root_handle);
             block.version.set(2);
+            block.file_access_token.set(token_pointer);
         },
         || {
-            let loaded = if app { hive_list::load_app_hive(&target.path, &source, flags, reference.take()) } else { hive_list::load_hive(&target.path, &source, flags, reference.take()).map(|identifier| registry::hive_path(identifier).unwrap_or_else(|| target.path.clone())) };
+            let request = hive_list::LoadRequest { flags, unload_event: reference.take(), trust, token: token.as_ref().map(|token| (token.token, token.level)), previous_mode };
+            let loaded = if app { hive_list::load_app_hive(&target.path, &source, request) } else { hive_list::load_hive(&target.path, &source, request).map(|identifier| registry::hive_path(identifier).unwrap_or_else(|| target.path.clone())) };
             match loaded {
                 Ok(path) => {
                     mount = Some(path);
@@ -314,6 +469,9 @@ pub fn load_key(target: u64, source: u64, flags: u32, _trust_class_key: u64, eve
     if let Some(mut reference) = reference {
         reference.release();
     }
+    if let Some(token) = token.as_mut() {
+        token.release();
+    }
     for block in [names.0, names.1].into_iter().filter(|&block| block != 0) {
         guest::free_bytes(block);
     }
@@ -324,14 +482,17 @@ pub fn load_key(target: u64, source: u64, flags: u32, _trust_class_key: u64, eve
     // ObReferenceObjectByName e o ObOpenObjectByPointer do
     // CmLoadDifferencingKey).
     let Some(mount) = mount else { return status };
-    match key_services::open_hive_root(&mount, desired_access, target.attributes & ROOT_HANDLE_ATTRIBUTES, root_handle, previous_mode) {
+    let attributes = if previous_mode { USER_ROOT_HANDLE_ATTRIBUTES } else { KERNEL_ROOT_HANDLE_ATTRIBUTES };
+    match key_services::open_hive_root(&mount, desired_access, attributes, root_handle, previous_mode) {
         Ok(opened) => opened,
         Err(error) => if error.status != 0 { error.status } else { STATUS_INSUFFICIENT_RESOURCES },
     }
 }
 
-/// NtUnloadKey2/NtUnloadKeyEx(TargetKey, Flags, Event).
-pub fn unload_key(target: u64, flags: u32, event: u64, previous_mode: bool) -> u32 {
+/// NtUnloadKey(TargetKey) = (TargetKey, 0, FALSE, NULL), NtUnloadKey2 =
+/// (TargetKey, Flags, FALSE, NULL) e NtUnloadKeyEx = (TargetKey, 0, TRUE,
+/// Event): o CmUnloadKey.
+pub fn unload_key(target: u64, flags: u32, extended: bool, event: u64, previous_mode: bool) -> u32 {
     if !privileged(SE_RESTORE_PRIVILEGE, previous_mode) {
         return STATUS_PRIVILEGE_NOT_HELD;
     }
@@ -367,10 +528,7 @@ pub fn unload_key(target: u64, flags: u32, event: u64, previous_mode: bool) -> u
             block.object.set(body);
             block.user_event.set(event_pointer);
         },
-        || match event.take() {
-            Some(event) => hive_list::unload_or_defer(node, flags, event),
-            None => hive_list::unload(node, flags),
-        },
+        || hive_list::unload_key(node, flags, extended, event.take()),
     );
     if let Some(mut event) = event {
         event.release();
@@ -473,6 +631,11 @@ pub fn flush_key(key: u64, previous_mode: bool) -> u32 {
         Ok(resolved) => resolved,
         Err(status) => return status,
     };
+    if previous_mode && hive_list::no_lazy_flush(node) {
+        if let Err(status) = key_services::reference_key(key, previous_mode, KEY_WRITE) {
+            return status;
+        }
+    }
     let body = key_services::key_body(key, previous_mode).unwrap_or(0);
     filtered(
         REG_NT_PRE_FLUSH_KEY,

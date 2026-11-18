@@ -27,6 +27,10 @@
 //! guardam o caminho resolvido, o nome real da chave: o
 //! KeyNameInformation de `CurrentControlSet\Services` é o de
 //! `ControlSet001\Services`, e as notificações de mudança seguem o nó real.
+//! Um link de uma hive não confiável (carregada pelo NtLoadKey) só leva a
+//! chaves da mesma hive ou das hives da classe de confiança dela (o
+//! TrustClassKey do NtLoadKeyEx); fora disso o nome dá STATUS_ACCESS_DENIED
+//! (CmpOKToFollowLink).
 //!
 //! Uma hive volátil (HARDWARE, as do REG_WHOLE_HIVE_VOLATILE) tem células
 //! como as de arquivo, mas nenhum arquivo: a descarga não grava nada.
@@ -161,6 +165,11 @@ struct Hive {
     statistics: ObjectStatistics,
     /// As células das hives carregadas e o nó raiz de cada uma.
     storages: BTreeMap<u32, (Storage, NodeId)>,
+    /// As hives não confiáveis (as do NtLoadKey: o bit 0 de CMHIVE.Flags)
+    /// e a classe de confiança de cada uma (a lista
+    /// CMHIVE.TrustClassEntry): hives da mesma classe têm o mesmo número.
+    /// As hives ausentes daqui são confiáveis.
+    trust: BTreeMap<u32, u32>,
     /// Uma hive limpa ficou suja desde o último aviso (HvpMarkDirty).
     dirtied: bool,
 }
@@ -181,6 +190,7 @@ pub const SYMBOLIC_LINK_VALUE: &str = "SymbolicLinkValue";
 pub const REG_LINK: u32 = 6;
 /// Reparses de um nome antes de desistir (ObpLookupObjectName).
 const MAX_REPARSE: u32 = 64;
+const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
 const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
 const STATUS_OBJECT_PATH_SYNTAX_BAD: u32 = 0xC000_003B;
 
@@ -194,7 +204,7 @@ fn with_hive<T>(body: impl FnOnce(&mut Hive) -> T) -> T {
         let hive = hive.get_or_insert_with(|| {
             let mut nodes = BTreeMap::new();
             nodes.insert(ROOT, KeyNode { name: String::new(), parent: None, children: Vec::new(), values: Vec::new(), security: Arc::new(key_policy::boot_root()), last_write_time: now(), deleted: false, cell: None, volatile: false, link: false, class: Vec::new() });
-            Hive { nodes, next_node: ROOT + 1, handles: BTreeMap::new(), statistics: ObjectStatistics::default(), storages: BTreeMap::new(), dirtied: false }
+            Hive { nodes, next_node: ROOT + 1, handles: BTreeMap::new(), statistics: ObjectStatistics::default(), storages: BTreeMap::new(), trust: BTreeMap::new(), dirtied: false }
         });
         let result = body(hive);
         (result, core::mem::take(&mut hive.dirtied))
@@ -234,13 +244,46 @@ fn link_target(key: &KeyNode) -> Option<String> {
     Some(String::from_utf16_lossy(&units))
 }
 
+/// A hive de arquivo (ou volátil) que guarda o nó: a do próprio nó ou, para
+/// uma chave volátil sem célula, a do ancestral mais próximo com célula
+/// (o KeyHive do KCB). `None` é a hive mestra.
+fn owning_hive_of(hive: &Hive, node: NodeId) -> Option<u32> {
+    let mut current = Some(node);
+    while let Some(id) = current {
+        let key = hive.nodes.get(&id)?;
+        if let Some((identifier, _)) = key.cell {
+            return Some(identifier);
+        }
+        current = key.parent;
+    }
+    None
+}
+
+/// CmpOKToFollowLink: depois de seguir um link de uma hive não confiável
+/// (`source`), o nome só pode parar na mesma hive ou numa hive não
+/// confiável da mesma classe de confiança; senão, STATUS_ACCESS_DENIED.
+fn ok_to_follow_link(hive: &Hive, source: u32, target: Option<u32>) -> bool {
+    match target {
+        Some(target) if target == source => true,
+        Some(target) => hive.trust.get(&target).is_some_and(|class| hive.trust.get(&source) == Some(class)),
+        None => false,
+    }
+}
+
 /// O caminho com cada link do prefixo existente trocado pelo alvo (o
 /// reparse do CmpDoParseKey). O último componente só é seguido sem
 /// `open_link` (OBJ_OPENLINK). Um componente ausente encerra a resolução: o
 /// resto do nome fica como está.
+///
+/// O primeiro link seguido que mora numa hive não confiável fica guardado
+/// (o campo do contexto de parse que o CmpDoParseKey preenche no
+/// STATUS_REPARSE), e a chave mais funda que o nome final alcança precisa
+/// estar numa hive da classe de confiança dele (CmpOKToFollowLink, depois
+/// do CmpPerformCompleteKcbCacheLookup).
 fn resolve(hive: &Hive, path: &str, open_link: bool) -> Result<String, u32> {
     let mut current = String::from(path);
     let mut reparses = 0;
+    let mut link_source: Option<u32> = None;
     'reparse: loop {
         let components = split_path(&current);
         let mut node = ROOT;
@@ -252,6 +295,9 @@ fn resolve(hive: &Hive, path: &str, open_link: bool) -> Result<String, u32> {
                 reparses += 1;
                 if reparses > MAX_REPARSE {
                     return Err(STATUS_OBJECT_NAME_NOT_FOUND);
+                }
+                if link_source.is_none() {
+                    link_source = owning_hive_of(hive, child).filter(|identifier| hive.trust.contains_key(identifier));
                 }
                 let mut target = link_target(key).ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
                 // O nome novo recomeça na raiz do namespace de objetos.
@@ -269,6 +315,11 @@ fn resolve(hive: &Hive, path: &str, open_link: bool) -> Result<String, u32> {
                 continue 'reparse;
             }
             node = child;
+        }
+        if let Some(source) = link_source {
+            if !ok_to_follow_link(hive, source, owning_hive_of(hive, node)) {
+                return Err(STATUS_ACCESS_DENIED);
+            }
         }
         return Ok(current);
     }
@@ -866,6 +917,8 @@ pub fn unlink_hive(identifier: u32, force: bool) -> Result<Storage, u32> {
             }
         }
         let (storage, _) = hive.storages.remove(&identifier).expect("hive registrada");
+        // CmpUnJoinClassOfTrust.
+        hive.trust.remove(&identifier);
         Ok((storage, path, parent_chain))
     })?;
     // CmpPerformUnloadKey: a raiz some do pai.
@@ -1078,6 +1131,31 @@ pub fn refresh_hive(identifier: u32, storage: Storage, keys: Vec<FlatKey>) -> Re
     })?;
     notify_path_changed(&path);
     Ok(())
+}
+
+/// A hive que guarda um nó (a de um nó volátil é a do ancestral com
+/// célula); `None` para a hive mestra.
+pub fn owning_hive(node: NodeId) -> Option<u32> {
+    with_hive(|hive| owning_hive_of(hive, node))
+}
+
+/// A classe de confiança de uma hive não confiável; `None` se a hive é
+/// confiável.
+pub fn trust_class(identifier: u32) -> Option<u32> {
+    with_hive(|hive| hive.trust.get(&identifier).copied())
+}
+
+/// Marca a hive como não confiável na classe `class` (o bit 0 de
+/// CMHIVE.Flags e a TrustClassEntry), ou confiável com `None`.
+pub fn set_trust_class(identifier: u32, class: Option<u32>) {
+    with_hive(|hive| match class {
+        Some(class) => {
+            hive.trust.insert(identifier, class);
+        }
+        None => {
+            hive.trust.remove(&identifier);
+        }
+    });
 }
 
 /// O caminho da raiz de uma hive carregada.

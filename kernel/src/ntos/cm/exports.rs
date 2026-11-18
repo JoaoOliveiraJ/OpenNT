@@ -83,17 +83,17 @@ pub mod cm_hive {
 
     /// ZwUnloadKey(TargetKey).
     fn unload_key(call: &Call) -> Result<u64, KernelError> {
-        Ok(signed_status(hive_services::unload_key(call.arg(1), 0, 0, false)))
+        Ok(signed_status(hive_services::unload_key(call.arg(1), 0, false, 0, false)))
     }
 
     /// ZwUnloadKey2(TargetKey, Flags).
     fn unload_key2(call: &Call) -> Result<u64, KernelError> {
-        Ok(signed_status(hive_services::unload_key(call.arg(1), call.arg(2) as u32, 0, false)))
+        Ok(signed_status(hive_services::unload_key(call.arg(1), call.arg(2) as u32, false, 0, false)))
     }
 
     /// ZwUnloadKeyEx(TargetKey, Event).
     fn unload_key_ex(call: &Call) -> Result<u64, KernelError> {
-        Ok(signed_status(hive_services::unload_key(call.arg(1), 0, call.arg(2), false)))
+        Ok(signed_status(hive_services::unload_key(call.arg(1), 0, true, call.arg(2), false)))
     }
 
     /// ZwSaveKey(KeyHandle, FileHandle).

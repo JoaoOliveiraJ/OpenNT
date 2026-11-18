@@ -4936,7 +4936,13 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   o último componente não é seguido com OBJ_OPENLINK. Os handles guardam o
   caminho resolvido (o nome real). Numa chave de link só cabe o
   `SymbolicLinkValue`; CREATE_LINK sobre chave existente é colisão.
-  `\REGISTRY\A` só abre relativo a um handle de hive de aplicativo.
+  `\REGISTRY\A` só abre relativo a um handle de hive de aplicativo. Classes
+  de confiança (CmpOKToFollowLink): as hives do NtLoadKey são não
+  confiáveis, cada uma na própria classe ou na do TrustClassKey; depois de
+  seguir um link de uma hive não confiável, a chave mais funda alcançada
+  precisa estar na mesma hive ou numa hive da mesma classe, senão
+  STATUS_ACCESS_DENIED (o `Software\Classes` do NTUSER chega ao
+  `<SID>_Classes`, carregado com a raiz do NTUSER como TrustClassKey).
 - **Escritor preguiçoso** (`cm/lazy_flush.rs`): a hive de arquivo que fica
   suja arma um KTIMER de 60 s (2 s expedito); a DPC enfileira o
   trabalhador no work item do sistema, que descarrega as hives sujas menos
@@ -4946,11 +4952,24 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   desligamento ordenado (`po/shutdown.rs`) chama o `lazy_flush::shutdown`,
   o CmShutdownSystem: para o escritor e descarrega todas as hives, depois
   do ShutdownTime que o ExShutdownSystem(0) grava.
+- **Carga e descarga de hives** (`cm/hive_services.rs`, `cm/hive_list.rs`,
+  `cm/hive_file.rs`): NtLoadKey/2/Ex/3 vão ao mesmo CmLoadDifferencingKey;
+  o NtLoadKey3 captura os CM_EXTENDED_PARAMETER (TrustClassKey, Event e o
+  token de acesso ao arquivo, que precisa ser de impersonação: o primário e
+  os logs abrem impersonando-o). A carga abre o primário (sem
+  compartilhamento, FILE_OPEN_IF quando pode criar a hive; vazio é hive
+  nova) e os dois logs, criados ocultos e de sistema se faltarem, antes de
+  ler a hive. O NtUnloadKeyEx com handles abertos congela a hive
+  (STATUS_PENDING, com ou sem evento) até o último handle; uma hive
+  congelada recusa outra descarga com STATUS_TOO_LATE, e as hives do boot
+  com STATUS_ACCESS_DENIED.
 - **Hives de aplicativo e restaurações especiais** (`cm/hive_list.rs`):
   REG_APP_HIVE liga a hive em `\REGISTRY\A\{...}`, devolve o handle da
-  raiz, reaproveita a hive já carregada do mesmo arquivo e a descarrega no
-  fechamento do último handle; REG_LOAD_HIVE_OPEN_HANDLE devolve o handle
-  da raiz de uma carga comum e o Event da carga é sinalizado na descarga;
+  raiz, reaproveita a hive de aplicativo já carregada do mesmo arquivo
+  (salvo REG_PROCESS_PRIVATE, que não compartilha nem é compartilhada) e a
+  descarrega no fechamento do último handle; REG_LOAD_HIVE_OPEN_HANDLE
+  devolve o handle da raiz de uma carga comum e o Event da carga é
+  sinalizado na descarga;
   REG_WHOLE_HIVE_VOLATILE copia a hive do arquivo para uma hive volátil em
   `<chave mestra>\<raiz>`; REG_REFRESH_HIVE relê o primário de uma hive
   REG_NO_LAZY_FLUSH e reconcilia a árvore (os nós que continuam existindo
