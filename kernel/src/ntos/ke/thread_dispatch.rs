@@ -12,7 +12,7 @@
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use super::{clock, pcr};
 use crate::hal::cpu;
@@ -209,6 +209,87 @@ fn remove_ready_locked(thread: u64) -> Result<(), KernelError> {
 pub fn remove_ready(thread: u64) -> Result<(), KernelError> {
     let _queues = QUEUES.lock();
     remove_ready_locked(thread)
+}
+
+/// A varredura anti-inanição do KiQuantumEnd 19041 (0x257550): o instante da
+/// próxima (PRCB+0x313c, TickCount + 0x4b em 0x257add) e o nível em que ela
+/// recomeça (PRCB+0x7c20, 0x257b04/0x257bda). Em ms do tick_count (o tick do
+/// 19041 é 15,625 ms: 75 ticks = 1172 ms, 300 ticks = 4688 ms).
+static STARVATION_NEXT_SCAN: AtomicU32 = AtomicU32::new(0);
+static STARVATION_LEVEL: AtomicU32 = AtomicU32::new(1);
+const STARVATION_SCAN_PERIOD_MS: u32 = 1172;
+/// TickCount - 0x12c (0x257b16).
+const STARVATION_READY_MS: u32 = 4688;
+/// Threads olhadas por varredura (r12d, 0x2575bf).
+const STARVATION_SCAN_LIMIT: u32 = 16;
+/// Threads impulsionadas por varredura (esi, 0x25760b).
+const STARVATION_BOOST_LIMIT: usize = 10;
+/// Prioridades 1 a 14 (0x257ae7).
+const STARVATION_LEVELS: u32 = 0x7FFE;
+/// A prioridade do impulso (0x257f2e).
+const STARVATION_PRIORITY: u8 = 15;
+
+/// KiQuantumEnd 0x2575c3..0x257f75, sob o PrcbLock (QUEUES): a pronta há mais
+/// de 300 ticks com prioridade menor que 15 sai da fila e volta com 15
+/// (KiSetPriorityBoost 0x315db0: PriorityDecrement += (15 - Priority) << 4,
+/// desfeito pelo compute_quantum_end_priority do próximo fim de quantum dela).
+/// Devolve (thread, prioridade anterior, ms na fila) para o log fora da trava.
+fn boost_starved_threads_locked() -> Vec<(u64, u8, u32)> {
+    let now = tick_count();
+    if (STARVATION_NEXT_SCAN.load(Ordering::Relaxed).wrapping_sub(now) as i32) >= 0 {
+        return Vec::new();
+    }
+    STARVATION_NEXT_SCAN.store(now.wrapping_add(STARVATION_SCAN_PERIOD_MS), Ordering::Relaxed);
+    let processor = processor();
+    let summary = processor.ready_summary.get() & STARVATION_LEVELS;
+    if summary == 0 {
+        return Vec::new();
+    }
+    let threshold = now.wrapping_sub(STARVATION_READY_MS);
+    let start = STARVATION_LEVEL.load(Ordering::Relaxed) & 31;
+    let mut levels = summary.rotate_right(start);
+    let (mut scanned, mut starved, mut level) = (0u32, Vec::new(), start);
+    let mut cut = false;
+    'levels: while levels != 0 {
+        level = (levels.trailing_zeros() + start) & 31;
+        levels &= levels - 1;
+        let head = &processor.dispatcher_ready_list_head[level as usize];
+        let mut link = head.flink.get();
+        while link != head.address() && link != 0 {
+            let thread = link - WAIT_LIST_ENTRY;
+            link = list_entry(link).flink.get();
+            scanned += 1;
+            if (threshold.wrapping_sub(kthread(thread).wait_time.get()) as i32) > 0 {
+                starved.push(thread);
+            }
+            if scanned >= STARVATION_SCAN_LIMIT || starved.len() >= STARVATION_BOOST_LIMIT {
+                cut = true;
+                break 'levels;
+            }
+        }
+    }
+    STARVATION_LEVEL.store(if cut { level } else { 1 }, Ordering::Relaxed);
+    let mut boosted = Vec::new();
+    for thread in starved {
+        let kthread = kthread(thread);
+        let priority = kthread.priority.get() as u8;
+        if priority >= STARVATION_PRIORITY || remove_ready_locked(thread).is_err() {
+            continue;
+        }
+        let waited = now.wrapping_sub(kthread.wait_time.get());
+        // Aritmética de byte, como o `sub r10b; shl r10b,4; add [+0x234]`.
+        let delta = STARVATION_PRIORITY.wrapping_sub(priority).wrapping_shl(4);
+        kthread.priority_decrement.set((kthread.priority_decrement.get() as u8).wrapping_add(delta) as i8);
+        kthread.priority.set(STARVATION_PRIORITY as i8);
+        enqueue_ready_locked(thread, false, false);
+        boosted.push((thread, priority, waited));
+    }
+    boosted
+}
+
+/// Vence a próxima varredura anti-inanição (autoteste).
+pub fn force_starvation_scan() {
+    STARVATION_NEXT_SCAN.store(tick_count().wrapping_sub(1), Ordering::Relaxed);
 }
 
 fn enqueue_ready_locked(thread: u64, at_front: bool, preserve_wait_time: bool) {
@@ -577,6 +658,7 @@ pub fn end_execution(thread: u64, new_state: u8) -> Result<(), KernelError> {
     if voluntary_yield {
         kthread.quantum_target.set(cycles);
     }
+    let mut boosted = Vec::new();
     if new_state == state::READY {
         // A thread ainda consta como em execução: sai dela direto para a fila.
         initialize_queues();
@@ -585,8 +667,15 @@ pub fn end_execution(thread: u64, new_state: u8) -> Result<(), KernelError> {
             reserve_yield_target_locked(thread)?;
         }
         enqueue_ready_locked(thread, !expired && !voluntary_yield, false);
+        // KiQuantumEnd: o fim de quantum varre as prontas famintas.
+        if expired {
+            boosted = boost_starved_threads_locked();
+        }
     } else {
         suspend(thread, new_state)?;
+    }
+    for (starved, priority, waited) in boosted {
+        crate::debug_print!("[sched] anti-inanicao: thread {:#x} prioridade {} pronta ha {} ms -> 15", starved, priority, waited);
     }
     let mut dispatch = STATE.lock();
     let execution = &mut dispatch.cpus[cpu];

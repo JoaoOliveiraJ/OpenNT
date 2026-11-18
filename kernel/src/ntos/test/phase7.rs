@@ -6833,6 +6833,7 @@ pub fn run(assert: Assert) {
     user_io_completion(assert);
     user_threads(assert);
     super::yield_execution::run(assert);
+    super::anti_starvation::run(assert);
     user_wait_packets(assert);
     bundled_bring_up_ntdll(assert);
     user_system_services(assert);

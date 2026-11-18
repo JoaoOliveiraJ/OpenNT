@@ -73,5 +73,6 @@ pub mod kernel_crash_trace;
 pub mod user_slist;
 pub mod volume_open;
 pub mod yield_execution;
+pub mod anti_starvation;
 pub mod reparse_points;
 pub mod user_copy_chunk;
