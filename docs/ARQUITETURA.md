@@ -1456,7 +1456,9 @@ endereços de retorno, lida pelos frame pointers só dentro da pilha de kernel
 corrente (StackLimit..StackBase da KTHREAD ou a pilha de boot). A tabela dos
 locais fica em frames fixos fora do heap (`KERNEL_HEAP_CENSUS_PHYS`, 2 MB,
 pelo mapa direto) e soma, por local, os bytes e blocos vivos e as alocações
-feitas; só é tocada com o lock do heap. O censo vai para a serial
+feitas; só é tocada com o lock do heap, e um local sem blocos vivos é
+reaproveitado por uma cadeia nova (a suíte vê mais cadeias do que cabem na
+tabela). O censo vai para a serial
 (`[heap-census]`) na falha do heap e, com `--heap-census` (a opção de carga
 HEAPCENSUS), a cada 4 MB a mais de uso; `cargo xtask heap-census` dá os nomes
 pelos símbolos do kernel.elf do build e soma os locais por função, e o

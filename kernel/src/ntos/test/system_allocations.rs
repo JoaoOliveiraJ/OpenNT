@@ -161,6 +161,10 @@ fn heap_census(assert: Assert) {
     let start = census_probe as fn() -> Vec<u8> as usize as u64;
     let entry = kmalloc::census_of(probe.as_ptr());
     let inside = entry.is_some_and(|entry| entry.chain.iter().any(|&word| word != 0 && word != FOREIGN && (start..start + 0x400).contains(&(map::KERNEL_VIRTUAL_BASE + word as u64))));
+    if !inside {
+        crate::debug_print!("[heapcensus] sonda em {:#x}, local {:?}", start, entry);
+        kmalloc::print_census("autoteste");
+    }
     assert(entry.is_some_and(|entry| entry.index != 0 && entry.bytes >= 0x3000 && entry.blocks >= 1) && inside, "heapcensus: o bloco conta no local de quem o alocou, com a cadeia passando pela funcao");
     let before = entry.map_or(0, |entry| entry.bytes);
     let index = entry.map_or(0, |entry| entry.index);

@@ -147,26 +147,41 @@ fn hash(chain: &Chain) -> usize {
 }
 
 /// O índice do local da cadeia (inserido se novo); 0 quando a tabela não
-/// existe, a cadeia é vazia ou não há lugar. Com o lock do heap.
+/// existe, a cadeia é vazia ou não há lugar. Um local sem blocos vivos é
+/// reaproveitado por uma cadeia nova (nenhum cabeçalho aponta para ele), e a
+/// tabela guarda os locais vivos mesmo depois de ter visto mais cadeias do
+/// que cabem nela. Com o lock do heap.
 fn site_of(chain: &Chain) -> u32 {
     if !ENABLED.load(Ordering::Relaxed) || chain[0] == 0 {
         return 0;
     }
     let start = hash(chain);
+    let mut reusable = None;
     for probe in 0..PROBES {
         // O local 0 é o dos blocos sem local; a sondagem não passa por ele.
         let index = 1 + (start + probe) % (SITE_COUNT - 1);
         // SAFETY: índice dentro da tabela; acesso exclusivo com o lock do heap.
         let site = unsafe { &mut *sites().add(index) };
-        if site.chain[0] == 0 {
-            site.chain = *chain;
-            return index as u32;
-        }
         if site.chain == *chain {
             return index as u32;
         }
+        if site.chain[0] == 0 {
+            // Fim da sequência: a cadeia não está na tabela.
+            let index = reusable.unwrap_or(index);
+            // SAFETY: idem.
+            let site = unsafe { &mut *sites().add(index) };
+            *site = Site { chain: *chain, bytes: 0, blocks: 0, allocations: 0 };
+            return index as u32;
+        }
+        if site.blocks == 0 && reusable.is_none() {
+            reusable = Some(index);
+        }
     }
-    0
+    // Sequência cheia: o primeiro local morto dela, se houver.
+    let Some(index) = reusable else { return 0 };
+    // SAFETY: índice dentro da tabela; lock do heap.
+    unsafe { *sites().add(index) = Site { chain: *chain, bytes: 0, blocks: 0, allocations: 0 } };
+    index as u32
 }
 
 /// Conta o bloco de `size` bytes alocado pela cadeia; devolve o índice do
