@@ -3778,7 +3778,9 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   de `Hardware Profiles` (o `LogPixels` do DPI, `xtask/src/fonts.rs`), e as
   classes COM em processo (`Classes\CLSID`: o LogonUIController, os
   provedores de credencial, a fábrica e os codecs do WIC) e WinRT
-  (`WindowsRuntime\ActivatableClassId`) das DLLs do volume, com os
+  (`WindowsRuntime\ActivatableClassId`) das DLLs do volume, as interfaces
+  com o proxy numa dessas classes (`Classes\Interface`, menos as que o
+  oleaut32 empacota pela biblioteca de tipos), com os
   provedores de `Authentication\Credential Providers` e o
   `Authentication\LogonUI` sem o último logon nem os SIDs de usuário desta
   máquina (`xtask/src/logon_screen.rs`); a

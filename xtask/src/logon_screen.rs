@@ -22,11 +22,19 @@
 //!   gravam o estado da tela em `Authentication\LogonUI`;
 //! - as outras classes COM em processo dessas DLLs são criadas pelo CLSID do
 //!   mesmo jeito: a fábrica e os codecs do WIC (o WindowsCodecs.dll, que
-//!   decodifica a imagem da tela de bloqueio), o propsys.dll, o MSCTF.dll...
+//!   decodifica a imagem da tela de bloqueio), o XamlRuntimeSiteAggregator e
+//!   os repositórios da imagem da tela de bloqueio e dos blocos de usuário
+//!   (o Windows.UI.Immersive.dll), o gerenciador de recursos MRT dos `.pri`,
+//!   o propsys.dll, o MSCTF.dll...;
+//! - uma chamada entre apartamentos (o STA do XAML e as threads do servidor
+//!   RPC do logoncontroller.dll) acha o proxy da interface por
+//!   `Classes\Interface\{iid}\ProxyStubClsid32`, a classe PSFactoryBuffer da
+//!   DLL de proxies.
 //!
 //! As classes COM e WinRT copiadas são as de DLLs de System32 que o volume
-//! leva (`windows_binaries::user_programs`): o convidado é uma instalação
-//! com esses componentes. Do `Authentication\LogonUI` e dos provedores
+//! leva (`windows_binaries::user_programs`), e as interfaces, as que têm o
+//! proxy numa dessas classes: o convidado é uma instalação com esses
+//! componentes. Do `Authentication\LogonUI` e dos provedores
 //! ficam de fora o último logon (o usuário, o provedor e o tempo ocioso
 //! dele), o usuário selecionado, os dados de sessão e as subchaves e os
 //! valores com o SID de um usuário desta máquina: uma instalação nova não
@@ -46,6 +54,11 @@ const LOGON_UI_LOCAL_VALUES: &[&str] = &["LastLoggedOnUser", "LastLoggedOnSAMUse
 /// conteúdo por usuário desta máquina.
 #[cfg(windows)]
 const LOGON_UI_LOCAL_KEYS: &[&str] = &["SessionData", "Creative"];
+
+/// Os proxies do oleaut32.dll que empacotam pela biblioteca de tipos
+/// registrada da interface (PSOAInterface e PSDispatch), em minúsculas.
+#[cfg(windows)]
+const TYPE_LIBRARY_MARSHALERS: &[&str] = &["{00020424-0000-0000-c000-000000000046}", "{00020420-0000-0000-c000-000000000046}"];
 
 /// O texto de um valor REG_SZ ou REG_EXPAND_SZ.
 #[cfg(windows)]
@@ -96,11 +109,25 @@ pub fn software_keys() -> Vec<HostKey> {
         let staged = |dll: Option<String>| dll.as_deref().and_then(system32_file).is_some_and(|file| programs.iter().any(|program| program.eq_ignore_ascii_case(file)));
         // As classes COM em processo das DLLs do volume.
         let objects = "Classes\\CLSID";
+        let mut servers = std::collections::BTreeSet::new();
         for class in registry::list(registry::LOCAL_MACHINE, &format!("SOFTWARE\\{objects}")) {
             let mut server = Vec::new();
             registry::copy(registry::LOCAL_MACHINE, &format!("SOFTWARE\\{objects}\\{class}\\InprocServer32"), "", false, &mut server);
             if staged(server.first().and_then(|key| text(&key.values, ""))) {
                 registry::copy(registry::LOCAL_MACHINE, &format!("SOFTWARE\\{objects}\\{class}"), &format!("{objects}\\{class}"), true, &mut keys);
+                servers.insert(class.to_ascii_lowercase());
+            }
+        }
+        // As interfaces cujo proxy (`ProxyStubClsid32`) é uma dessas classes,
+        // menos as que o oleaut32.dll empacota pela biblioteca de tipos
+        // (PSOAInterface e PSDispatch), que pedem o `Classes\TypeLib` delas.
+        let interfaces = "Classes\\Interface";
+        for interface in registry::list(registry::LOCAL_MACHINE, &format!("SOFTWARE\\{interfaces}")) {
+            let mut proxy = Vec::new();
+            registry::copy(registry::LOCAL_MACHINE, &format!("SOFTWARE\\{interfaces}\\{interface}\\ProxyStubClsid32"), "", false, &mut proxy);
+            let class = proxy.first().and_then(|key| text(&key.values, "")).map(|class| class.trim().to_ascii_lowercase());
+            if class.is_some_and(|class| servers.contains(&class) && !TYPE_LIBRARY_MARSHALERS.contains(&class.as_str())) {
+                registry::copy(registry::LOCAL_MACHINE, &format!("SOFTWARE\\{interfaces}\\{interface}"), &format!("{interfaces}\\{interface}"), true, &mut keys);
             }
         }
         // As classes WinRT das DLLs do volume.
