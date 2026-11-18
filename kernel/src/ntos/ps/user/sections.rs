@@ -35,6 +35,7 @@ use crate::ntos::mm::paging::{self, MapOptions};
 use crate::ntos::mm::section::secured_views;
 use crate::ntos::mm::section::views::{self as section_views, OwnedView};
 use crate::ntos::mm::system_image_pages::{self, ImageRange};
+use crate::ntos::mm::commit as system_commit;
 use crate::ntos::mm::pfn;
 use crate::ntos::mm::process_address_space::SYSTEM_ROOT;
 use crate::ntos::mm::section::{address as section_address, cache as section_cache};
@@ -110,11 +111,14 @@ pub struct Area {
     pub image_layout: Vec<ImageRange>,
     pub image_key: Option<AreaKey>,
     pub system_paging: Option<Arc<dyn AreaPaging>>,
+    /// Páginas de commit do sistema cobradas pelas páginas confirmadas de
+    /// uma seção de pagefile, devolvidas com a control area.
+    pub commit_charge: u64,
 }
 
 impl Area {
     pub fn new(identity: Option<String>, cache: u32) -> Self {
-        Self { frames: BTreeMap::new(), original: BTreeMap::new(), references: 0, views: Vec::new(), identity, cache, image_layout: Vec::new(), image_key: None, system_paging: None }
+        Self { frames: BTreeMap::new(), original: BTreeMap::new(), references: 0, views: Vec::new(), identity, cache, image_layout: Vec::new(), image_key: None, system_paging: None, commit_charge: 0 }
     }
 }
 
@@ -421,6 +425,18 @@ fn status_of(error: &KernelError, default: u32) -> u32 {
 /// Confirma páginas: PFNs zerados, leitura do arquivo em trechos contíguos
 /// de até 1 MiB (o backing só é publicado depois de todas as leituras),
 /// atributo de cache e alias em cada vista; qualquer falha desfaz tudo.
+///
+/// Numa seção de pagefile (sem arquivo nem imagem) as páginas novas cobram
+/// o commit do sistema, como o MiChargeCommitment da criação (SEC_COMMIT) e
+/// do MEM_COMMIT numa vista (SEC_RESERVE) do 19041: o limite é a RAM mais os
+/// arquivos de paginação (`mm/commit.rs`) e a recusa é
+/// STATUS_COMMITMENT_LIMIT. A cobrança volta com a control area. Diferença
+/// declarada: o NT dá os frames no primeiro toque (zero sob demanda) e o
+/// OpenNT os dá aqui, zerados, porque toda vista da seção (as de processo, a
+/// de sistema, a de sessão e as PTEs de sistema de um MDL travado) é alias
+/// dos mesmos frames e nenhuma delas tem ainda a falta que materializaria a
+/// página em todas. Sem frames livres para as páginas já cobradas, a
+/// recusa é STATUS_NO_MEMORY, com uma linha `[section]` na serial.
 pub fn commit(section: &Arc<Section>, first: u64, count: u64) -> Result<u32, KernelError> {
     if first > MAX_SAFE_INTEGER || count > MAX_SAFE_INTEGER || first + count > section.count_pages() {
         return Ok(0xC000_000D);
@@ -430,8 +446,17 @@ pub fn commit(section: &Arc<Section>, first: u64, count: u64) -> Result<u32, Ker
     }
     let Some(area) = section.control_area() else { return Err(KernelError::new("section without control area")) };
     let existing = section.frames().len() as u64;
-    if count > pfn::free_count() + existing {
+    let charged = if section.file.is_none() && !section.is_image { (first..first + count).filter(|&page| section.frame(page).is_none()).count() as u64 } else { 0 };
+    if charged != 0 && !system_commit::charge(charged) {
         return Ok(0xC000_012D);
+    }
+    if count > pfn::free_count() + existing {
+        if charged == 0 {
+            return Ok(0xC000_012D);
+        }
+        system_commit::release(charged);
+        debug_print!("[section] {} paginas de commit cobradas sem frames livres ({} livres): STATUS_NO_MEMORY", charged, pfn::free_count());
+        return Ok(0xC000_0017);
     }
     let mut added: Vec<u64> = Vec::new();
     let mut status = 0u32;
@@ -542,6 +567,9 @@ pub fn commit(section: &Arc<Section>, first: u64, count: u64) -> Result<u32, Ker
             }
             release_original_file_page(&area, page)?;
         }
+        system_commit::release(charged);
+    } else {
+        area.lock().commit_charge += charged;
     }
     Ok(status)
 }
@@ -571,6 +599,8 @@ fn destroy_section(section: &Arc<Section>) -> Result<(), KernelError> {
                 }
                 area.lock().frames.remove(&page);
             }
+            let charge = core::mem::take(&mut area.lock().commit_charge);
+            system_commit::release(charge);
             let originals: Vec<u64> = area.lock().original.keys().copied().collect();
             for page in originals {
                 release_original_file_page(&area, page)?;

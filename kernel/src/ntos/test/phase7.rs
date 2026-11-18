@@ -359,11 +359,17 @@ fn data_sections(assert: Assert) {
         assert(false, "sections: vista com commit parcial");
         return;
     };
+    // O commit do sistema cobrado pela control area da seção de pagefile.
+    let charge = || sparse.control_area().map_or(u64::MAX, |area| area.lock().commit_charge);
     assert(sparse.frames().len() == 1 && paging::translate(lazy.base) != 0 && paging::translate(lazy.base + 0x1000) == 0, "sections: commit parcial confirma so a primeira pagina");
+    let partial_charge = charge();
     assert(sections::commit_view(&lazy, lazy.base + 0x1000, 0x1000, 4).is_ok_and(|status| status == 0) && sparse.frames().len() == 2 && paging::translate(lazy.base + 0x1000) == sparse.frame(1).unwrap_or(1), "sections: commit pela vista publica a pagina nova");
+    let view_charge = charge();
+    assert(partial_charge == 1 && view_charge == 2, "sections: cada pagina nova da secao de pagefile cobra uma pagina de commit do sistema");
     assert(sections::protect_view(&lazy, lazy.base, 0x1000, 2) == 0xC000_0045, "sections: SEC_NO_CHANGE recusa trocar a protecao");
     let sparse_pointer = sparse.pointer();
     assert(sections::unmap(&lazy, None).is_ok() && sections::by_pointer(sparse_pointer).is_none() && sparse.state.lock().destroyed && sparse.frames().is_empty(), "sections: a ultima vista destroi a secao sem handles");
+    assert(charge() == 0, "sections: a destruicao devolve o commit cobrado pela secao");
     // Vistas restantes da primeira seção.
     let pointer = section.pointer();
     assert(sections::unmap(&first, None).is_ok() && paging::translate(first.base) == 0 && sections::by_pointer(pointer).is_some() && sections::unmap(&first, None).is_err(), "sections: desmontagem remove o alias e recusa repeticao");

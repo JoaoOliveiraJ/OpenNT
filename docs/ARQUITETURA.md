@@ -1291,7 +1291,16 @@ além da KUSER_SHARED_DATA:
   `insert.rs`, `ps/user/sections.rs`): uma seção de pagefile com SEC_COMMIT
   tem os frames confirmados na criação, e toda vista (a de sistema, a de
   sessão, as dos processos e as PTEs de sistema de um MDL travado) é alias
-  dos mesmos frames. O MmCreateSection devolve o SECTION ainda como objeto
+  dos mesmos frames. As páginas confirmadas de uma seção de pagefile (na
+  criação com SEC_COMMIT ou pelo MEM_COMMIT numa vista SEC_RESERVE) cobram o
+  commit do sistema (`mm/commit.rs`, limite = RAM mais arquivos de
+  paginação), como o MiChargeCommitment do 19041, e a recusa é
+  STATUS_COMMITMENT_LIMIT; a cobrança volta com a control area. Diferença
+  declarada: o NT dá os frames no primeiro toque e o OpenNT os dá na
+  confirmação, zerados, porque nenhuma daquelas vistas tem ainda a falta
+  que materializaria a página em todas; sem frames livres para páginas já
+  cobradas, a recusa é STATUS_NO_MEMORY com uma linha `[section]` na
+  serial. O MmCreateSection devolve o SECTION ainda como objeto
   novo; o ObInsertObject dele (`insert.rs`, chamado pelo
   `ob/object_create.rs` para um corpo de seção) abre o handle de criação,
   publica um nome capturado e solta a referência de criação, e um segundo
