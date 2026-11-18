@@ -3275,7 +3275,13 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   nada: `CreateFailure::FileOpen`/`ExeFormat`); `create_process` (EPROCESS,
   PID, raiz própria, `ProcessState`, seção de imagem); a herança de handles
   do pai, se pedida; anexado ao processo
-  novo, as cópias de sistema, o executável, a pilha, a PEB
+  novo, as cópias de sistema, o executável, a pilha
+  (`ps/user/memory::create_user_stack`, o RtlCreateUserStack do
+  PspSetupUserStack, com o MaximumStackSize e o CommittedStackSize da
+  imagem; o NtCreateThreadEx usa o mesmo, com os tamanhos pedidos ou os da
+  imagem no lugar dos zeros: a reserva inteira, só o commit comitado no
+  topo, StackLimit na base dele, 3 páginas PAGE_GUARD logo abaixo para a
+  pilha crescer pela falta, DeallocationStack na base da reserva), a PEB
   (`mm/peb_teb.rs`, o MmCreatePeb: imagem, ApiSetMap +0x68, NLS, heap,
   versão, subsistema da imagem; PEB.Ldr NULL para a ntdll;
   CriticalSectionTimeout com o MmCriticalSectionTimeout, os segundos do

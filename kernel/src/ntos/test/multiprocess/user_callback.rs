@@ -467,7 +467,7 @@ fn scenario() -> Option<Outcome> {
             // SAFETY: ETHREAD recém-criada, retida pela thread de usuário.
             let ethread = unsafe { Ethread::at(pointer) };
             ethread.tcb.set_gui_thread(1);
-            let teb = peb_teb::create_teb(&peb_teb::TebDescription { process_id: test.process_id, thread_id: ethread.cid.unique_thread.get(), peb: test.peb, stack_base: stacks + 0x8000, stack_limit: stacks }).unwrap_or(0);
+            let teb = peb_teb::create_teb(&peb_teb::TebDescription { process_id: test.process_id, thread_id: ethread.cid.unique_thread.get(), peb: test.peb, stack_base: stacks + 0x8000, stack_limit: stacks, deallocation_stack: stacks }).unwrap_or(0);
             let thread: Arc<UserThread> = UserThread::new(ethread.cid.unique_thread.get(), pointer, teb, code);
             thread.with(|thread| thread.process_pointer = test.process);
             process::add_thread(test.process);

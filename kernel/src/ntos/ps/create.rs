@@ -705,7 +705,12 @@ pub fn create_user_process(request: &CreateProcessRequest<'_>) -> Result<Created
             push_image(ntdll.image_base, ntdll.size_of_image, &ntdll.full_name);
             // A entrada vê o rsp "depois de um call" (8 mod 16) com endereço
             // de retorno 0, para falhar alto se o programa retornar.
-            let (stack_limit, stack_base) = memory::map_user_stack()?;
+            // A pilha pelo RtlCreateUserStack do PspSetupUserStack, com o
+            // MaximumStackSize e o CommittedStackSize da imagem
+            // (SECTION_IMAGE_INFORMATION +0x10 e +0x18).
+            let stack_size = |offset: usize| u64::from_le_bytes(image_information[offset..offset + 8].try_into().unwrap_or([0; 8]));
+            let stack = memory::create_user_stack(stack_size(0x18), stack_size(0x10), 0, false).map_err(|status| KernelError::with_status("pilha da primeira thread", status))?;
+            let (stack_base, stack_limit, deallocation_stack) = (stack.base, stack.limit, stack.allocation_base);
             let stack_top = stack_base - 8;
             let peb = peb_teb::create_peb(process_pointer, image_base)?;
             loader::create_kernel_ldr()?;
@@ -717,7 +722,7 @@ pub fn create_user_process(request: &CreateProcessRequest<'_>) -> Result<Created
             let block = parameters.write(parameter_flags)?;
             // SAFETY: a PEB recém-criada no processo corrente.
             unsafe { Peb::at(peb) }.process_parameters.set(block);
-            let teb = peb_teb::create_teb(&TebDescription { process_id, thread_id, peb, stack_base, stack_limit })?;
+            let teb = peb_teb::create_teb(&TebDescription { process_id, thread_id, peb, stack_base, stack_limit, deallocation_stack })?;
             let context = memory::map_user_region(threads::CONTEXT_SIZE)?;
             threads::initialize_context(context, start, stack_top, entry_point, peb);
             Ok(Built { thread_id, peb, parameters: block, teb, stack_top, context, entry_point, image_base, size_of_image, image_information, manifest, parameter_flags })

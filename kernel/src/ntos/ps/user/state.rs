@@ -46,8 +46,6 @@ use crate::ntos::inc::types::{Eprocess, Field, IoStatusBlock, NtStruct, UnicodeS
 /// O ProbeForRead/ProbeForWrite de um endereço desalinhado.
 pub const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
 
-/// Pilha de usuário da primeira thread (VA escolhida pelo alocador).
-pub const USER_STACK_SIZE: u64 = 0x10_0000;
 /// O endereço real de usuário da KUSER_SHARED_DATA.
 pub const KUSER_SHARED_DATA_USER_VA: u64 = crate::ntos::mm::shared_user_data::MM_SHARED_USER_DATA_VA;
 

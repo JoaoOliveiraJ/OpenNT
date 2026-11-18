@@ -642,7 +642,7 @@ fn user_thread(process: u64, process_id: u64, peb: u64, stacks: u64, start: u64)
     let ethread = unsafe { Ethread::at(pointer) };
     // GUI: as syscalls da tabela 1 do Shadow vão aos serviços de teste.
     ethread.tcb.set_gui_thread(1);
-    let teb = peb_teb::create_teb(&peb_teb::TebDescription { process_id, thread_id: ethread.cid.unique_thread.get(), peb, stack_base: stacks + 0x8000, stack_limit: stacks }).ok()?;
+    let teb = peb_teb::create_teb(&peb_teb::TebDescription { process_id, thread_id: ethread.cid.unique_thread.get(), peb, stack_base: stacks + 0x8000, stack_limit: stacks, deallocation_stack: stacks }).ok()?;
     let thread = UserThread::new(ethread.cid.unique_thread.get(), pointer, teb, start);
     thread.with(|thread| thread.process_pointer = process);
     process::add_thread(process);

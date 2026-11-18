@@ -26,13 +26,14 @@
 //!   resultado é STATUS_STACK_OVERFLOW.
 //!
 //! O acesso chega aqui pela falta de página de usuário (`ps/user/exceptions`)
-//! e pelas sondas do kernel sobre memória de usuário
-//! (`ps/user/state::probe_user_access`, o toque do kernel numa página de
-//! guarda: a pilha cresce e a sonda segue; fora dela a guarda sai e a sonda
-//! falha). Com um spin lock retido, ou acima de APC_LEVEL, a página fica
-//! como está. As pilhas que o
-//! OpenNT monta são comitadas inteiras; a guarda aparece nas pilhas que o
-//! próprio processo monta (o RtlCreateUserStack das fibras, o
+//! e pelos toques do kernel em memória de usuário (as sondas
+//! `ps/user/state::probe_user_access` e os acessos de `guest_memory`, como
+//! o ProbeForWrite do frame de um KeUserModeCallback: a pilha cresce e o
+//! acesso segue; fora dela a guarda sai e o acesso falha). Com um spin lock
+//! retido, ou acima de APC_LEVEL, a página fica como está. As pilhas que o
+//! kernel monta para as threads (`ps/user/memory::create_user_stack`, o
+//! RtlCreateUserStack) comitam só o topo e põem 3 páginas de guarda
+//! embaixo, como as que o próprio processo monta (as fibras, o
 //! SetThreadStackGuarantee).
 
 use crate::ntos::inc::field::NtStruct;

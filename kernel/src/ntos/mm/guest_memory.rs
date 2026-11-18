@@ -105,7 +105,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::hal::{host, volatile};
 use crate::ntos::mm::memory_map as map;
-use crate::ntos::mm::{page_residency, paging, physical_layout};
+use crate::ntos::mm::{guard_page, page_residency, paging, physical_layout};
 use crate::rtl::{KernelError, SpinLock};
 
 pub const ARENA_SIZE: u64 = 0x100_0000; // 16MB
@@ -383,6 +383,17 @@ fn probe(address: u64, write: bool) -> Result<u64, KernelError> {
     let mut mapping = paging::query_page(page, false);
     if mapping.as_ref().is_some_and(|mapping| !writable(mapping)) && page_residency::fault(page, 3) {
         mapping = paging::query_page(page, false);
+    }
+    // A página de guarda de uma alocação privada de usuário (a guarda da
+    // pilha da thread, que desce): o toque do kernel tira a guarda e, na
+    // pilha, a pilha cresce e o acesso segue, como a falta de modo kernel do
+    // NT (MiAccessCheck e MiCheckForUserStackOverflow); fora da pilha o
+    // acesso falha (STATUS_GUARD_PAGE_VIOLATION no try do NT).
+    if mapping.is_none() && address < map::USER_ADDRESS_LIMIT {
+        let access = if write { guard_page::Access::Write } else { guard_page::Access::Read };
+        if guard_page::touch(page, access) == Some(guard_page::STATUS_PAGE_FAULT_GUARD_PAGE) {
+            mapping = paging::query_page(page, false);
+        }
     }
     match mapping {
         Some(mapping) if writable(&mapping) => Ok(mapping.physical_address),

@@ -60,7 +60,7 @@ use core::any::Any;
 use super::memory_query::{self, Context};
 use super::process_state::{self, ProcessState};
 use super::sections::{self, View};
-use super::state::{self, Region, RegionKind, UserRegion, STATUS_CONFLICTING_ADDRESSES, STATUS_INVALID_PARAMETER, USER_STACK_SIZE};
+use super::state::{self, Region, RegionKind, UserRegion, STATUS_CONFLICTING_ADDRESSES, STATUS_INVALID_PARAMETER};
 use crate::hal::physical;
 use crate::ntos::mm::memory_map::{self as map, USER_ADDRESS_LIMIT};
 use crate::ntos::mm::paging::{self, MapOptions};
@@ -536,6 +536,14 @@ pub fn do_user_allocate(base_pointer: u64, size_pointer: u64, allocation_type: u
 /// topo, = MM_HIGHEST_VAD_ADDRESS + 1).
 #[allow(clippy::too_many_arguments)]
 pub fn allocate_in(space: Space, base_pointer: u64, size_pointer: u64, allocation_type: u32, protect: u32, lowest: u64, highest: u64, align: u64) -> Result<u32, KernelError> {
+    allocate_region(space, base_pointer, size_pointer, allocation_type, protect, lowest, highest, align, true)
+}
+
+/// [`allocate_in`] com a região nova paginável ou residente (`pageable`,
+/// `PrivateRegion::pageable`); o commit sobre uma região existente segue a
+/// dela.
+#[allow(clippy::too_many_arguments)]
+fn allocate_region(space: Space, base_pointer: u64, size_pointer: u64, allocation_type: u32, protect: u32, lowest: u64, highest: u64, align: u64, pageable: bool) -> Result<u32, KernelError> {
     if space.state().is_none() {
         return Ok(STATUS_PROCESS_IS_TERMINATING);
     }
@@ -625,7 +633,7 @@ pub fn allocate_in(space: Space, base_pointer: u64, size_pointer: u64, allocatio
         Ok(base) => base,
         Err(status) => return Ok(status),
     };
-    let region = PrivateRegion::new(base, size, protect, allocation_type, true);
+    let region = PrivateRegion::new(base, size, protect, allocation_type, pageable);
     if allocation_type & MEM_COMMIT != 0 {
         // O commit da região inteira é cobrado do processo (e dos jobs dele)
         // antes das páginas.
@@ -721,12 +729,89 @@ fn register_user_region(space: Space, size: u64, alignment: u64, top_down: bool)
     Ok(region)
 }
 
-/// Pilha da primeira thread do processo corrente, uma alocação comum de
-/// baixo para cima (como a reserva da pilha inicial no NT): devolve a base
-/// (StackLimit e DeallocationStack) e o topo (StackBase) da pilha.
-pub fn map_user_stack() -> Result<(u64, u64), KernelError> {
-    let region = register_user_region(Space::current(), USER_STACK_SIZE, map::ALLOCATION_GRANULARITY, false)?;
-    Ok((region.base, region.base + region.size))
+/// A pilha de usuário de uma thread, os campos do INITIAL_TEB.
+pub struct UserStack {
+    /// StackAllocationBase: a base da reserva (TEB.DeallocationStack).
+    pub allocation_base: u64,
+    /// StackLimit: a página comitada mais baixa, acima da guarda.
+    pub limit: u64,
+    /// StackBase: o topo da reserva.
+    pub base: u64,
+    /// A região privada da reserva inteira (liberada com a thread).
+    pub region: Region,
+}
+
+/// As páginas de guarda abaixo do commit inicial (3 páginas).
+const STACK_GUARD_SIZE: u64 = 3 * PAGE;
+
+/// A pilha de usuário de uma thread do processo corrente, como o
+/// RtlCreateUserStack do ntoskrnl 19041 (rva 0x6c5268) a monta para o
+/// PspSetupUserStack. `commit` e `reserve` já vêm com os padrões da imagem
+/// (SizeOfStackCommit e SizeOfStackReserve no lugar dos zeros); `highest` é
+/// o limite exclusivo da VA (0: o topo de usuário). A pilha da primeira
+/// thread fica residente (`pageable` falso), como as outras estruturas que
+/// o kernel monta para o processo novo; a das threads seguintes, paginável.
+///
+/// - Sem commit, 0x4000. Um commit que alcança a reserva leva a reserva ao
+///   commit arredondado a 1 MB; o commit sobe à página e a reserva aos
+///   64 KB. Um PEB.MinimumStackCommit maior que o commit vira o commit, e a
+///   reserva passa a ser ele arredondado a 1 MB.
+/// - A reserva inteira é uma região privada (o MEM_RESERVE do
+///   ProcessThreadStackAllocation); só o topo, do tamanho do commit, é
+///   comitado PAGE_READWRITE, e o StackLimit fica na base dele. Com espaço
+///   na reserva, as 3 páginas logo abaixo são comitadas
+///   PAGE_READWRITE|PAGE_GUARD: a pilha cresce pela falta na guarda
+///   (`mm/guard_page`, o MiCheckForUserStackOverflow).
+/// - Qualquer falha libera a reserva (MEM_RELEASE) e devolve o status.
+pub fn create_user_stack(commit: u64, reserve: u64, highest: u64, pageable: bool) -> Result<UserStack, u32> {
+    const MEGABYTE: u64 = 0x10_0000;
+    let round = |value: u64, unit: u64| value.checked_add(unit - 1).map(|value| value & !(unit - 1)).ok_or(STATUS_INVALID_PARAMETER);
+    let commit = if commit == 0 { 0x4000 } else { commit };
+    let reserve = if commit >= reserve { round(commit, MEGABYTE)? } else { reserve };
+    let mut commit = round(commit, PAGE)?;
+    let mut reserve = round(reserve, map::ALLOCATION_GRANULARITY)?;
+    let peb = state::current_peb();
+    let minimum = if peb == 0 { 0 } else { state::user_struct::<crate::ntos::inc::types::Peb>(peb).and_then(|block| block.minimum_stack_commit.probe_get()).unwrap_or(0) };
+    if minimum != 0 && commit < minimum {
+        commit = round(minimum, PAGE)?;
+        reserve = round(commit, MEGABYTE)?;
+    }
+    let space = Space::current();
+    let cells = guest::alloc_bytes(16);
+    if cells == 0 {
+        return Err(0xC000_0017);
+    }
+    let call = |base: u64, size: u64, allocation_type: u32, protect: u32| -> u32 {
+        guest::write64(cells, base);
+        guest::write64(cells + 8, size);
+        match allocate_region(space, cells, cells + 8, allocation_type, protect, 0, highest, map::ALLOCATION_GRANULARITY, pageable) {
+            Ok(status) => status,
+            Err(error) => if error.status != 0 { error.status } else { 0xC000_0017 },
+        }
+    };
+    let reserved = call(0, reserve, MEM_RESERVE, 4);
+    let allocation_base = guest::read64(cells);
+    let built = if reserved != 0 {
+        Err(reserved)
+    } else {
+        let region = find_region(allocation_base);
+        let base = allocation_base + reserve;
+        let limit = base - commit;
+        let mut status = call(limit, commit, MEM_COMMIT, 4);
+        if status == 0 && reserve - commit >= STACK_GUARD_SIZE {
+            status = call(limit - STACK_GUARD_SIZE, STACK_GUARD_SIZE, MEM_COMMIT, 4 | PAGE_GUARD);
+        }
+        match region {
+            Some(region) if status == 0 => Ok(UserStack { allocation_base, limit, base, region }),
+            Some(region) => {
+                release_private_region(&region);
+                Err(status)
+            }
+            None => Err(0xC000_0017),
+        }
+    };
+    guest::free_bytes(cells);
+    built
 }
 
 /// Estruturas que o kernel monta para o processo corrente (PEB, TEB,

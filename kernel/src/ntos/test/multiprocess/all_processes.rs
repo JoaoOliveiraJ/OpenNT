@@ -732,6 +732,32 @@ fn null_handle(assert: Assert, services: &Services) {
     // processo antes de ele rodar.
     let request = threads::CreateRequest { start: absolute(HELPER_SPIN), argument_words: [0, 0], flags: 0, zero_bits: 0, commit: 0, reserve: 0 };
     let helper = process_context::with_process(pointer, || threads::create_user_thread(&request)).ok().and_then(|created| created.ok());
+    // A pilha de usuário como o RtlCreateUserStack do 19041 a monta: só o
+    // commit (à página) no topo da reserva, 3 páginas PAGE_GUARD logo abaixo
+    // e o resto só reservado; a TEB da thread com StackLimit no commit e
+    // DeallocationStack na base da reserva.
+    let layout = process_context::with_process(pointer, || {
+        let stack = memory::create_user_stack(0x2800, 0x3_0000, 0, true).ok()?;
+        let owner = stack.region.as_any().downcast_ref::<memory::PrivateRegion>()?;
+        let state = owner.state.lock();
+        let index = |va: u64| (va - owner.base) / 0x1000;
+        let protect = |va: u64| if state.committed_pages.contains(&index(va)) { state.page_protects.get(&index(va)).copied().unwrap_or(owner.protect) } else { 0 };
+        let shape = (owner.base == stack.allocation_base && owner.size == 0x3_0000, stack.base - stack.limit, (stack.limit..stack.base).step_by(0x1000).all(|va| protect(va) == 4), (1..=3).all(|page| protect(stack.limit - page * 0x1000) == 0x104), (stack.allocation_base..stack.limit - 0x3000).step_by(0x1000).all(|va| protect(va) == 0));
+        drop(state);
+        memory::release_private_region(&stack.region);
+        Some(shape)
+    })
+    .ok()
+    .flatten();
+    let teb = helper.as_ref().map_or(0, |thread| thread.with(|thread| thread.teb_va));
+    let helper_stack = process_context::with_process(pointer, || {
+        // SAFETY: a TEB da segunda thread, no processo anexado.
+        let block = unsafe { crate::ntos::inc::types::Teb::at(teb) };
+        (block.nt_tib.stack_base.get(), block.nt_tib.stack_limit.get(), block.deallocation_stack.get())
+    })
+    .ok()
+    .filter(|_| teb != 0);
+    assert(layout == Some((true, 0x3000, true, true, true)) && helper_stack.is_some_and(|(base, limit, deallocation)| deallocation < limit && limit < base && base - limit < base - deallocation), "despacho: pilha de usuario com commit no topo, guarda de 3 paginas e o resto reservado, e a TEB com StackLimit e DeallocationStack");
     let exit = user_process::wait_started(started);
     let helper_status = helper.as_ref().map(|thread| thread.with(|thread| (thread.dead, thread.exit_status)));
     crate::debug_print!("[despacho] NULL: saida {:?}, segunda thread {:?}", exit.as_ref().map_err(|error| format!("{error}")), helper_status);

@@ -67,8 +67,11 @@ pub struct TebDescription {
     pub peb: u64,
     /// Topo da pilha de usuário (NT_TIB.StackBase).
     pub stack_base: u64,
-    /// Base da reserva da pilha (NT_TIB.StackLimit e DeallocationStack).
+    /// A página comitada mais baixa da pilha (NT_TIB.StackLimit).
     pub stack_limit: u64,
+    /// Base da reserva da pilha (DeallocationStack, o StackAllocationBase do
+    /// INITIAL_TEB).
+    pub deallocation_stack: u64,
 }
 
 /// Subsistema e versão do subsistema da imagem mapeada em `image_base`, lidos
@@ -144,7 +147,7 @@ pub fn initialize_teb(teb: u64, thread: &TebDescription) {
     block.client_id.unique_process.set(thread.process_id);
     block.client_id.unique_thread.set(thread.thread_id);
     block.process_environment_block.set(thread.peb);
-    block.deallocation_stack.set(thread.stack_limit);
+    block.deallocation_stack.set(thread.deallocation_stack);
 }
 
 /// MmCreateTeb: a TEB de uma thread do processo corrente, na própria região

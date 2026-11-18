@@ -1746,10 +1746,12 @@ fn user_threads_in(assert: Assert, test: &TestProcess) {
     let (out, info, list, cid, teb_out, timeout, image, peb, rsp) = (block, block + 0x40, block + 0x100, block + 0x180, block + 0x190, block + 0x1A0, block + 0x1000, test.peb, block + 0x3000);
     let (client_id, delay) = unsafe { (nt::ClientId::at(cid), nt::LargeInteger::at(timeout)) };
     let call = |name: &str, a1: u64, a2: u64, a3: u64, a4: u64| state::handler(name).map(|handler| handler(a1, a2, a3, a4, rsp).unwrap_or(1)).unwrap_or(1);
-    // PEB do processo e cabeçalho de imagem mínimos: reserva de pilha de 0x20000.
+    // PEB do processo e cabeçalho de imagem mínimos: reserva de pilha de
+    // 0x20000 e commit de 0x3000.
     unsafe { nt::Peb::at(peb) }.image_base_address.set(image);
     unsafe { nt::ImageDosHeader::at(image) }.e_lfanew.set(0x80);
     unsafe { nt::ImageNtHeaders64::at(image + 0x80) }.optional_header.size_of_stack_reserve.set(0x20000);
+    unsafe { nt::ImageNtHeaders64::at(image + 0x80) }.optional_header.size_of_stack_commit.set(0x3000);
     let process_pointer = test.process;
     let baseline = unsafe { nt::Eprocess::at(process_pointer) }.active_threads.get();
     if baseline == 0 {
@@ -1783,8 +1785,8 @@ fn user_threads_in(assert: Assert, test: &TestProcess) {
     };
     let (pointer, teb) = (thread.pointer(), thread.with(|thread| thread.teb_va));
     let teb_view = unsafe { nt::Teb::at(teb) };
-    let stack = teb_view.nt_tib.stack_limit.get();
-    assert(client_id.unique_thread.get() == thread.thread_id && guest::read64(info + 0x30) == 16 && guest::read64(teb_out) == teb && teb_view.nt_tib.self_.get() == teb && teb_view.client_id.unique_thread.get() == thread.thread_id && teb_view.process_environment_block.get() == peb && teb_view.nt_tib.stack_base.get() == stack + 0x20000, "userthreads: CLIENT_ID, TEB e pilha pela reserva da imagem");
+    let stack = teb_view.deallocation_stack.get();
+    assert(client_id.unique_thread.get() == thread.thread_id && guest::read64(info + 0x30) == 16 && guest::read64(teb_out) == teb && teb_view.nt_tib.self_.get() == teb && teb_view.client_id.unique_thread.get() == thread.thread_id && teb_view.process_environment_block.get() == peb && teb_view.nt_tib.stack_base.get() == stack + 0x20000 && teb_view.nt_tib.stack_limit.get() == stack + 0x20000 - 0x3000, "userthreads: CLIENT_ID, TEB e pilha pela reserva e pelo commit da imagem");
     let startup = unsafe { nt::Context::at(nt::Context::at(thread.with(|thread| thread.context)).rcx.get()) };
     assert(startup.rcx.get() == block + 0x800 && startup.rdx.get() == 0x1122_3344_5566_7788 && thread_dispatch::thread_state(pointer) == thread_dispatch::state::WAITING, "userthreads: contexto inicial com argumento de 64 bits e thread suspensa");
     // Consultas.
@@ -2139,7 +2141,7 @@ fn user_system_services(assert: Assert) {
         let mut request = ProcessParameters::for_image("C:\\teste.exe");
         request.standard_output = 0x44;
         let rupp = request.write(0);
-        let teb = peb.as_ref().ok().and_then(|&peb| peb_teb::create_teb(&peb_teb::TebDescription { process_id: test.process_id, thread_id: test.thread_id, peb, stack_base: 0x30_0000, stack_limit: 0x20_0000 }).ok());
+        let teb = peb.as_ref().ok().and_then(|&peb| peb_teb::create_teb(&peb_teb::TebDescription { process_id: test.process_id, thread_id: test.thread_id, peb, stack_base: 0x30_0000, stack_limit: 0x20_0000, deallocation_stack: 0x20_0000 }).ok());
         if let (Ok(peb), Ok(ldr), Ok(rupp), Some(teb)) = (peb, ldr, rupp, teb) {
             let (teb_view, peb_view, ldr_data, parameters) = unsafe { (nt::Teb::at(teb), nt::Peb::at(peb), nt::PebLdrData::at(ldr), nt::RtlUserProcessParameters::at(rupp)) };
             let separate = teb + 0x2000 <= peb || peb + 0x1000 <= teb;
@@ -3031,6 +3033,7 @@ fn user_windows_process(assert: Assert) {
     // da primeira thread e a lista de threads do processo; o EPROCESS fica
     // retido pelo teste para as asserções depois da saída.
     let placed = core::cell::Cell::new((0u64, 0u64, 0u64));
+    let stack_limit = core::cell::Cell::new(0u64);
     let owner = core::cell::Cell::new(0u64);
     let listed_threads = core::cell::Cell::new(0usize);
     let system_regions = memory::Space::system().regions().len();
@@ -3046,13 +3049,14 @@ fn user_windows_process(assert: Assert) {
         let exe_base = memory::Space::of(pointer).images().iter().find(|image| image.name().is_some_and(|name| name == "C:\\opennt-teste.exe")).map_or(0, |image| image.base());
         let peb = if pointer != 0 { unsafe { nt::Eprocess::at(pointer) }.peb.get() } else { 0 };
         let teb_va = active.as_ref().and_then(|entry| entry.threads.first().copied()).map_or(0, |thread| unsafe { nt::Kthread::at(thread) }.teb.get());
-        let teb = (peb != 0 && teb_va != 0).then(|| crate::ntos::ps::process_context::with_process(pointer, || { let teb = unsafe { nt::Teb::at(teb_va) }; (teb.nt_tib.stack_limit.get(), teb.client_id.unique_thread.get(), teb.client_id.unique_process.get()) }).ok()).flatten();
-        let stack = teb.map_or(0, |(stack, _, _)| stack);
+        let teb = (peb != 0 && teb_va != 0).then(|| crate::ntos::ps::process_context::with_process(pointer, || { let teb = unsafe { nt::Teb::at(teb_va) }; (teb.deallocation_stack.get(), teb.client_id.unique_thread.get(), teb.client_id.unique_process.get(), teb.nt_tib.stack_limit.get()) }).ok()).flatten();
+        let stack = teb.map_or(0, |(stack, _, _, _)| stack);
+        stack_limit.set(teb.map_or(0, |(_, _, _, limit)| limit));
         placed.set((exe_base, peb, stack));
         let image = crate::ntos::ps::user::process_state::get(pointer).map(|identity| identity.image_path()).unwrap_or_default();
         // A primeira thread tem TID próprio, o mesmo na TEB e no ETHREAD.
         let thread_ids: Vec<u64> = active.map(|entry| entry.threads.iter().filter_map(|&thread| crate::ntos::ps::process::thread_record(thread).map(|record| record.id)).collect()).unwrap_or_default();
-        let distinct = thread_ids.len() == 1 && thread_ids[0] != process_id && teb.is_some_and(|(_, thread, process)| thread == thread_ids[0] && process == process_id);
+        let distinct = thread_ids.len() == 1 && thread_ids[0] != process_id && teb.is_some_and(|(_, thread, process, _)| thread == thread_ids[0] && process == process_id);
         *identity.borrow_mut() = (image, distinct);
         Ok(())
     };
@@ -3076,7 +3080,7 @@ fn user_windows_process(assert: Assert) {
     // a imagem e a pilha; o último dereference a devolve.
     let (exe_base, peb, stack) = placed.get();
     let own_root = crate::ntos::mm::process_address_space::root_of(retained).unwrap_or(0);
-    let undone = own_root != 0 && crate::ntos::mm::paging::find_mapping_in(own_root, exe_base, 0x2000).is_none() && crate::ntos::mm::paging::translate_in(own_root, stack) == 0 && crate::ntos::mm::paging::translate_in(own_root, peb) == 0;
+    let undone = own_root != 0 && crate::ntos::mm::paging::find_mapping_in(own_root, exe_base, 0x2000).is_none() && crate::ntos::mm::paging::translate_in(own_root, stack_limit.get()) == 0 && crate::ntos::mm::paging::translate_in(own_root, peb) == 0;
     if retained != 0 {
         let _ = crate::ntos::ps::process::dereference(retained);
     }

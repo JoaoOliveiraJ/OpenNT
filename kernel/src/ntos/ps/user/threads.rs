@@ -1707,8 +1707,9 @@ fn create_thread_ex(out: u64, access: u64, attributes: u64, rsp: u64) -> Result<
     Ok(0)
 }
 
-/// Pilha com compromisso antecipado (política deste kernel: todas as
-/// páginas reservadas têm PFN); qualquer falha desfaz a thread inteira.
+/// A pilha sai do `memory::create_user_stack` (o RtlCreateUserStack do
+/// PspSetupUserStack: o commit no topo da reserva e a guarda embaixo);
+/// qualquer falha desfaz a thread inteira.
 pub fn create_user_thread(request: &CreateRequest) -> Result<Arc<UserThread>, u32> {
     if !current_process_started() || !probe_user_read(request.start, 1) {
         return Err(0xC000_0005);
@@ -1719,40 +1720,43 @@ pub fn create_user_thread(request: &CreateRequest) -> Result<Arc<UserThread>, u3
         let exports = state.ntdll_exports.as_ref().map(|exports| (exports.get("RtlUserThreadStart").copied().unwrap_or(0), exports.get("LdrInitializeThunk").copied().unwrap_or(0)));
         (exports.unwrap_or((0, 0)), state.ntdll_image_base)
     });
-    // SizeOfStackReserve da imagem: a PEB e os cabeçalhos estão em memória
-    // de usuário, então cada passo é sondado.
-    let reserve = (|| -> Result<u64, KernelError> {
-        let image_base = &state::user_struct::<Peb>(peb)?.image_base_address;
-        if !probe_user_read(image_base.address(), 8) {
-            return Err(guest::address_fault(peb));
+    // Um tamanho zero sai da imagem (o SizeOfStackCommit e o
+    // SizeOfStackReserve dos cabeçalhos do ImageBaseAddress da PEB, como no
+    // RtlCreateUserStack): a PEB e os cabeçalhos estão em memória de
+    // usuário, então cada passo é sondado.
+    let (commit, reserve) = if request.commit != 0 && request.reserve != 0 {
+        (request.commit, request.reserve)
+    } else {
+        let image = (|| -> Result<(u64, u64), KernelError> {
+            let image_base = &state::user_struct::<Peb>(peb)?.image_base_address;
+            if !probe_user_read(image_base.address(), 8) {
+                return Err(guest::address_fault(peb));
+            }
+            let image_base = image_base.probe_get()?;
+            if !probe_user_read(image_base, ImageDosHeader::SIZE) {
+                return Err(guest::address_fault(image_base));
+            }
+            let headers = image_base + state::user_struct::<ImageDosHeader>(image_base)?.e_lfanew.probe_get()? as u32 as u64;
+            if !probe_user_read(headers, ImageNtHeaders64::SIZE) {
+                return Err(guest::address_fault(headers));
+            }
+            let optional = &state::user_struct::<ImageNtHeaders64>(headers)?.optional_header;
+            Ok((optional.size_of_stack_commit.probe_get()?, optional.size_of_stack_reserve.probe_get()?))
+        })();
+        match image {
+            Ok((image_commit, image_reserve)) => (if request.commit != 0 { request.commit } else { image_commit }, if request.reserve != 0 { request.reserve } else { image_reserve }),
+            Err(error) => return Err(error.status),
         }
-        let image_base = image_base.probe_get()?;
-        if !probe_user_read(image_base, ImageDosHeader::SIZE) {
-            return Err(guest::address_fault(image_base));
-        }
-        let headers = image_base + state::user_struct::<ImageDosHeader>(image_base)?.e_lfanew.probe_get()? as u32 as u64;
-        if !probe_user_read(headers, ImageNtHeaders64::SIZE) {
-            return Err(guest::address_fault(headers));
-        }
-        state::user_struct::<ImageNtHeaders64>(headers)?.optional_header.size_of_stack_reserve.probe_get()
-    })();
-    let default_reserve = match reserve {
-        Ok(0) => 0x10_0000,
-        Ok(value) => value,
-        Err(error) => return Err(error.status),
     };
-    let wanted = (if request.reserve != 0 { request.reserve } else { default_reserve }).max(if request.commit != 0 { request.commit } else { 0x1000 }) as u128;
-    let stack_size = wanted.div_ceil(0x10000) * 0x10000;
-    if stack_size == 0 || stack_size > 0x7FFF_FFFF {
+    if commit.max(reserve) > 0x7FFF_FFFF {
         return Err(0xC000_000D);
     }
-    let stack_size = stack_size as u64;
     let mut regions: Vec<Region> = Vec::new();
     let mut context = 0u64;
     let mut thread_pointer = 0u64;
     let result = (|| -> Result<Arc<UserThread>, u32> {
-        let (stack, region) = allocate_private(stack_size, if request.zero_bits != 0 { (1u64 << (64 - request.zero_bits)) - 0x1000 } else { 0 })?;
-        regions.push(region);
+        let stack = memory::create_user_stack(commit, reserve, if request.zero_bits != 0 { (1u64 << (64 - request.zero_bits)) - 0x1000 } else { 0 }, true)?;
+        regions.push(stack.region.clone());
         let (teb, region) = allocate_private(0x2000, 0)?;
         regions.push(region);
         let (startup, region) = allocate_private(0x1000, 0)?;
@@ -1781,16 +1785,16 @@ pub fn create_user_thread(request: &CreateRequest) -> Result<Arc<UserThread>, u3
             thread.hidden = request.flags & 4 != 0;
         });
         // O MmCreateTeb sobre a TEB recém-comprometida.
-        peb_teb::initialize_teb(teb, &peb_teb::TebDescription { process_id, thread_id: id, peb, stack_base: stack + stack_size, stack_limit: stack });
+        peb_teb::initialize_teb(teb, &peb_teb::TebDescription { process_id, thread_id: id, peb, stack_base: stack.base, stack_limit: stack.limit, deallocation_stack: stack.allocation_base });
         // SAFETY: TEB recém-comprometida; a thread ainda não roda.
         let block = unsafe { Teb::at(teb) };
         // SameTebFlags: SkipThreadAttach, LoaderWorker e SkipLoaderInit.
         block.same_teb_flags.set((if request.flags & 2 != 0 { 8 } else { 0 }) | (if request.flags & 0x10 != 0 { 0x2000 } else { 0 }) | (if request.flags & 0x20 != 0 { 0x4000 } else { 0 }));
-        initialize_context(startup, exports.0, stack + stack_size - 8, request.start, 0);
+        initialize_context(startup, exports.0, stack.base - 8, request.start, 0);
         // O argumento é um ULONG_PTR opaco: preserva os 64 bits.
         // SAFETY: o CONTEXT de partida acabou de ser montado.
         unsafe { Context::at(startup) }.rdx.set(request.argument_words[0] as u64 | (request.argument_words[1] as u64) << 32);
-        initialize_context(context, exports.1, stack + stack_size - 8, startup, ntdll_base);
+        initialize_context(context, exports.1, stack.base - 8, startup, ntdll_base);
         process::add_thread(process_pointer);
         process::describe_thread(thread_pointer, None, false);
         process::set_thread_start(thread_pointer, request.start);
