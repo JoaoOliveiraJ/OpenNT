@@ -5,7 +5,7 @@
 //! cargo xtask run        [opções de build] [opções de máquina]
 //! cargo xtask test-boot  [MARCADOR] [TIMEOUT_MS] [opções] [--keys=TEXTO] [--expect=TEXTO]... [--hold=MS]
 //!                        [--build-only|--no-build [--image-dir=DIR]] [--kd=com2 --script=ARQ] [--capture=ARQ.png]
-//!                        [--expect-stop] [--watch-screen]
+//!                        [--expect-stop] [--watch-screen] [--capture-every=SEGUNDOS]
 //!                        [--expect-poweroff] [--power-cycles=N] [--allow-reboot]
 //! cargo xtask test-all   [--jobs=N] [--only=ID,...] [--skip=ID,...] [--repeat=N] [--keep] [--cpu-friendly]
 //! cargo xtask capturas   [--jobs=N] [--only=ID,...] [--skip=ID,...] [--keep] [--cpu-friendly]
@@ -110,6 +110,9 @@ test-boot:         --keys=TEXTO (\\n = Enter) --expect=TEXTO (repetivel)
                    --watch-screen (le a tela durante o teste; FIRST_PIXEL_OK na serial quando
                    a tela grafica mostra pixels desenhados e LOGON_SCREEN_OK quando um quarto
                    ou mais dela esta desenhado com 8 cores ou mais)
+                   --capture-every=SEGUNDOS (durante o teste, a tela do QEMU em tela-NNNN.png na
+                   --build-dir: a NNNN e a dos NNNN*SEGUNDOS s desde a subida do QEMU, gravada
+                   so quando mudou; no fim do teste, passando ou nao, tela-final.png)
                    --expect-poweroff (no fim o QEMU sai sozinho pelo desligamento ACPI)
                    --power-cycles=N (religa ate N vezes o QEMU que o convidado desligou)
                    --allow-reboot (o reinicio do convidado reinicia a maquina)
@@ -145,6 +148,8 @@ struct Arguments {
     expect_stop: bool,
     /// `--watch-screen`: a vigia da tela do test-boot.
     watch_screen: bool,
+    /// `--capture-every=SEGUNDOS`: as telas periódicas do test-boot.
+    capture_every: Option<u64>,
     /// `--expect-poweroff`, `--power-cycles=N` e `--allow-reboot`.
     expect_poweroff: bool,
     power_cycles: u32,
@@ -209,6 +214,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
         capture: None,
         expect_stop: false,
         watch_screen: false,
+        capture_every: None,
         expect_poweroff: false,
         power_cycles: 0,
         allow_reboot: false,
@@ -270,6 +276,10 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             "--capture" => parsed.capture = Some(PathBuf::from(required()?)),
             "--expect-stop" => parsed.expect_stop = true,
             "--watch-screen" => parsed.watch_screen = true,
+            "--capture-every" => match required()?.parse::<u64>() {
+                Ok(seconds) if seconds > 0 => parsed.capture_every = Some(seconds),
+                _ => return Err("--capture-every aceita um numero inteiro de segundos maior que zero".into()),
+            },
             "--accel" => parsed.machine.accelerator = required()?,
             "--memory-mb" => {
                 parsed.machine.memory_mb = required()?.parse().map_err(|_| "--memory-mb invalido")?
@@ -323,6 +333,9 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
     // com o comando inteiro do teste, e o `--watch-screen` só vale na execução.
     if parsed.watch_screen && parsed.command != "test-boot" {
         return Err("--watch-screen e opcao do test-boot".into());
+    }
+    if parsed.capture_every.is_some() && parsed.command != "test-boot" {
+        return Err("--capture-every e opcao do test-boot".into());
     }
     if parsed.build_only && parsed.no_build {
         return Err("--build-only e --no-build se excluem".into());
@@ -428,6 +441,7 @@ fn execute(arguments: Arguments) -> Result<(), String> {
                     allow_reboot: arguments.allow_reboot,
                     expect_poweroff: arguments.expect_poweroff,
                     watch_screen: arguments.watch_screen,
+                    capture_every: arguments.capture_every.map(Duration::from_secs),
                 },
                 &log,
                 session,
@@ -561,5 +575,26 @@ fn main() -> ExitCode {
             eprintln!("{message}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_words(words: &[&str]) -> Result<Arguments, String> {
+        parse(words.iter().map(|word| word.to_string()).collect())
+    }
+
+    #[test]
+    fn capture_every_takes_whole_seconds_on_test_boot() {
+        assert_eq!(parse_words(&["test-boot", "--capture-every=5"]).unwrap().capture_every, Some(5));
+        assert_eq!(parse_words(&["test-boot"]).unwrap().capture_every, None);
+        // O test-all monta as imagens com o comando inteiro do teste.
+        assert_eq!(parse_words(&["test-boot", "--build-only", "--capture-every=2"]).unwrap().capture_every, Some(2));
+        for bad in ["--capture-every=0", "--capture-every=-1", "--capture-every=2.5", "--capture-every=x", "--capture-every"] {
+            assert!(parse_words(&["test-boot", bad]).is_err(), "{bad}");
+        }
+        assert!(parse_words(&["run", "--capture-every=5"]).is_err());
     }
 }

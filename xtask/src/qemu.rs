@@ -7,12 +7,14 @@
 //! socket TCP em 127.0.0.1 (`kd_port`), onde o cliente (`cargo xtask
 //! debug`) ou o GDB se conectam; uma sessão de roteiro roda em paralelo ao
 //! `test-boot` e a falha dela derruba o teste. Com `--capture=ARQ.png`, o
-//! QEMU ganha um socket QMP e, no fim do teste, a tela vai para o PNG. Os
-//! testes do desligamento (`--expect-poweroff`, `--power-cycles=N`,
-//! `--allow-reboot`) recebem os eventos SHUTDOWN por um segundo QMP; o
-//! reinício do convidado fica no mesmo QEMU (e no mesmo snapshot do volume)
-//! e o religamento depois do desligamento ACPI sobe outro QEMU sobre uma
-//! cópia gravável do volume NTFS.
+//! QEMU ganha um socket QMP e, no fim do teste, a tela vai para o PNG; com
+//! `--capture-every=SEGUNDOS`, a tela vai para `tela-NNNN.png` durante o
+//! teste e para `tela-final.png` no fim ([`FrameSeries`]). Os testes do
+//! desligamento (`--expect-poweroff`, `--power-cycles=N`, `--allow-reboot`)
+//! recebem os eventos SHUTDOWN por um segundo QMP; o reinício do convidado
+//! fica no mesmo QEMU (e no mesmo snapshot do volume) e o religamento depois
+//! do desligamento ACPI sobe outro QEMU sobre uma cópia gravável do volume
+//! NTFS.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -532,6 +534,10 @@ pub struct TestOptions {
     /// marcador `FIRST_PIXEL_OK` no log da serial quando a tela gráfica
     /// mostra pixels desenhados ([`drawn_pixels`]).
     pub watch_screen: bool,
+    /// `--capture-every=SEGUNDOS`: a tela do QEMU vai para `tela-NNNN.png`
+    /// na pasta do log a cada intervalo (só quando mudou) e, no fim do teste
+    /// (passando ou não), para `tela-final.png` ([`FrameSeries`]).
+    pub capture_every: Option<Duration>,
 }
 
 /// O marcador do `--watch-screen`.
@@ -643,45 +649,243 @@ fn save_capture(image: &crate::png::Image, target: &std::path::Path, result: &st
     }
 }
 
-/// A vigia da tela (`--watch-screen`): a cada [`SCREEN_POLL`] lê a tela
-/// pelo QMP. Na primeira com pixels desenhados escreve a descrição e o
-/// `FIRST_PIXEL_OK` no log da serial e grava o PNG em `first` (se houver);
-/// depois segue lendo até a tela de logon ([`logon_screen`]), que sai com o
-/// `LOGON_SCREEN_OK` e vai para `tela-de-logon.png`, ao lado.
-fn watch_screen(port: u16, scratch: PathBuf, first: Option<PathBuf>, output: Arc<Mutex<String>>, stop: Arc<std::sync::atomic::AtomicBool>) {
-    use std::sync::atomic::Ordering;
-    let mut first_seen = false;
-    while !stop.load(Ordering::Acquire) {
-        thread::sleep(SCREEN_POLL);
-        if stop.load(Ordering::Acquire) || qmp_screendump(port, &scratch).is_err() {
-            continue;
-        }
-        let Ok(bytes) = std::fs::read(&scratch) else { continue };
-        let Ok(image) = crate::png::read_ppm(&bytes) else { continue };
-        if !first_seen {
-            let Some(description) = drawn_pixels(&image) else { continue };
-            first_seen = true;
-            let line = format!("\n[xtask] tela: {description}\n{FIRST_PIXEL_MARKER}\n");
-            print!("{line}");
-            output.lock().unwrap().push_str(&line);
-            if let Some(target) = &first {
-                save_capture(&image, target, "primeira tela desenhada", &description);
-            }
-        }
-        let Some(description) = logon_screen(&image) else { continue };
-        let line = format!("\n[xtask] tela de logon: {description}\n{LOGON_SCREEN_MARKER}\n");
+/// Um passo da vigia da tela (`--watch-screen`) sobre `image`. Na primeira
+/// tela com pixels desenhados escreve a descrição e o `FIRST_PIXEL_OK` no
+/// log da serial e grava o PNG em `first`; depois procura a tela de logon
+/// ([`logon_screen`]), que sai com o `LOGON_SCREEN_OK` e vai para
+/// `tela-de-logon.png`, ao lado. Devolve true quando a vigia acabou (a tela
+/// de logon apareceu).
+fn watch_step(image: &crate::png::Image, first: &Path, first_seen: &mut bool, output: &Mutex<String>) -> bool {
+    if !*first_seen {
+        let Some(description) = drawn_pixels(image) else { return false };
+        *first_seen = true;
+        let line = format!("\n[xtask] tela: {description}\n{FIRST_PIXEL_MARKER}\n");
         print!("{line}");
         output.lock().unwrap().push_str(&line);
-        if let Some(target) = &first {
-            save_capture(&image, &target.with_file_name("tela-de-logon.png"), "tela de logon", &description);
-        }
-        break;
+        save_capture(image, first, "primeira tela desenhada", &description);
     }
-    let _ = std::fs::remove_file(&scratch);
+    let Some(description) = logon_screen(image) else { return false };
+    let line = format!("\n[xtask] tela de logon: {description}\n{LOGON_SCREEN_MARKER}\n");
+    print!("{line}");
+    output.lock().unwrap().push_str(&line);
+    save_capture(image, &first.with_file_name("tela-de-logon.png"), "tela de logon", &description);
+    true
+}
+
+/// O passo da espera da thread da tela: o fim do teste a encontra em até
+/// tanto.
+const SCREEN_STEP: Duration = Duration::from_millis(100);
+
+/// A thread da tela. O QMP atende um cliente por vez, então uma thread só
+/// faz as duas leituras periódicas: a vigia (`watch`, o PNG da primeira
+/// tela desenhada, a cada [`SCREEN_POLL`]) e a série do `--capture-every`
+/// (`frames`); quando as duas vencem juntas, uma leitura serve às duas. Os
+/// prazos contam de `launched` (a subida do QEMU). Devolve a última tela
+/// lida e a série.
+fn screen_thread(
+    port: u16,
+    scratch: PathBuf,
+    launched: Instant,
+    watch: Option<PathBuf>,
+    mut frames: Option<FrameSeries>,
+    output: Arc<Mutex<String>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) -> (Option<crate::png::Image>, Option<FrameSeries>) {
+    use std::sync::atomic::Ordering;
+    let mut first_seen = false;
+    let mut watch_at = watch.is_some().then_some(SCREEN_POLL);
+    let mut frame = frames.as_ref().map(|series| series.next_index(Duration::ZERO));
+    let mut last = None;
+    'screen: loop {
+        let frame_at = frame.zip(frames.as_ref()).map(|(index, series)| series.due(index));
+        let Some(due) = [watch_at, frame_at].into_iter().flatten().min() else { break };
+        loop {
+            if stop.load(Ordering::Acquire) {
+                break 'screen;
+            }
+            let remaining = due.saturating_sub(launched.elapsed());
+            if remaining.is_zero() {
+                break;
+            }
+            thread::sleep(remaining.min(SCREEN_STEP));
+        }
+        let screen = read_screen(port, &scratch);
+        let elapsed = launched.elapsed();
+        if watch_at.is_some_and(|at| at <= elapsed) {
+            watch_at = Some(elapsed + SCREEN_POLL);
+            if let (Ok(image), Some(first)) = (&screen, &watch) {
+                if watch_step(image, first, &mut first_seen, &output) {
+                    watch_at = None;
+                }
+            }
+        }
+        if let (Some(index), Some(series)) = (frame, frames.as_mut()) {
+            if series.due(index) <= elapsed {
+                if let Ok(image) = &screen {
+                    match series.offer(index, elapsed, image, &serial_tail(&output)) {
+                        Ok(Some(path)) => println!("\n[xtask] tela aos {:.1} s: {}", elapsed.as_secs_f64(), path.display()),
+                        Ok(None) => {}
+                        Err(error) => eprintln!("aviso: tela {index} nao gravada: {error}"),
+                    }
+                }
+                frame = Some(series.next_index(launched.elapsed()));
+            }
+        }
+        if let Ok(image) = screen {
+            last = Some(image);
+        }
+    }
+    (last, frames)
 }
 
 /// Limite de tamanho de uma captura (a tela gráfica é reduzida até caber).
 const CAPTURE_LIMIT: usize = 60 * 1024;
+
+/// Limite de tamanho de uma tela do `--capture-every`. A tela vai inteira,
+/// sem cortar a moldura (as telas da série se comparam lado a lado); só a
+/// que passa disto (uma foto de fundo) é reduzida pela metade.
+const FRAME_LIMIT: usize = 256 * 1024;
+/// A tela do fim do teste com `--capture-every`.
+pub const FINAL_FRAME: &str = "tela-final.png";
+
+/// As telas do `--capture-every`: `tela-NNNN.png` na pasta do log, onde
+/// NNNN conta os intervalos desde a subida do QEMU (com
+/// `--capture-every=5`, a `tela-0003.png` é a dos 15 s). Uma tela igual à
+/// última gravada não é gravada de novo: o número que falta na sequência é
+/// uma tela que não mudou (ou uma leitura que não coube no intervalo). Cada
+/// PNG leva nos textos a hora da leitura (`opennt-tempo`) e as últimas
+/// linhas da serial naquele instante (`opennt-serial`).
+pub struct FrameSeries {
+    directory: PathBuf,
+    every: Duration,
+    previous: Option<crate::png::Image>,
+    saved: u64,
+    repeated: u64,
+}
+
+impl FrameSeries {
+    /// A série em `directory`, sem as telas de uma execução anterior.
+    pub fn new(directory: &Path, every: Duration) -> Self {
+        remove_frames(directory);
+        FrameSeries { directory: directory.to_path_buf(), every, previous: None, saved: 0, repeated: 0 }
+    }
+
+    /// O nome do PNG da tela `index`.
+    pub fn name(index: u64) -> String {
+        format!("tela-{index:04}.png")
+    }
+
+    /// A próxima tela depois de `elapsed` desde a subida do QEMU.
+    pub fn next_index(&self, elapsed: Duration) -> u64 {
+        (elapsed.as_nanos() / self.every.as_nanos().max(1)) as u64 + 1
+    }
+
+    /// Quando a tela `index` vence, contado da subida do QEMU.
+    pub fn due(&self, index: u64) -> Duration {
+        u32::try_from(index).ok().and_then(|index| self.every.checked_mul(index)).unwrap_or(Duration::MAX)
+    }
+
+    /// Grava a tela `index`, lida `elapsed` depois da subida do QEMU, a não
+    /// ser que seja igual à última gravada; `serial` vai nos textos do PNG.
+    /// Devolve o PNG gravado.
+    pub fn offer(&mut self, index: u64, elapsed: Duration, image: &crate::png::Image, serial: &str) -> Result<Option<PathBuf>, String> {
+        if self.previous.as_ref() == Some(image) {
+            self.repeated += 1;
+            return Ok(None);
+        }
+        let target = self.directory.join(Self::name(index));
+        let (date, time) = (crate::png::today(), seconds(elapsed));
+        let png = crate::png::encode_within(image, &[("opennt-data", date.as_str()), ("opennt-tempo", time.as_str()), ("opennt-serial", serial)], FRAME_LIMIT);
+        std::fs::write(&target, &png).map_err(|error| format!("{}: {error}", target.display()))?;
+        self.previous = Some(image.clone());
+        self.saved += 1;
+        Ok(Some(target))
+    }
+
+    /// A linha do resumo do fim do teste.
+    pub fn summary(&self) -> String {
+        format!("{} tela(s) gravada(s) em {} ({} igual(is) a anterior nao gravada(s))", self.saved, self.directory.display(), self.repeated)
+    }
+}
+
+/// Um nome de arquivo de uma série do `--capture-every`: `tela-NNNN.png`
+/// (quatro dígitos ou mais) ou `tela-final.png`.
+fn is_frame(name: &str) -> bool {
+    let Some(middle) = name.strip_prefix("tela-").and_then(|rest| rest.strip_suffix(".png")) else { return false };
+    middle == "final" || (middle.len() >= 4 && middle.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+/// Apaga de `directory` as telas de uma série anterior, para a nova não se
+/// misturar com ela.
+fn remove_frames(directory: &Path) {
+    let Ok(entries) = std::fs::read_dir(directory) else { return };
+    for entry in entries.flatten() {
+        if entry.file_name().to_str().is_some_and(is_frame) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// `12.3 s`.
+fn seconds(elapsed: Duration) -> String {
+    format!("{:.1} s", elapsed.as_secs_f64())
+}
+
+/// As últimas linhas da serial ([`serial_proof`] sem saídas esperadas),
+/// tiradas só do fim do log.
+fn serial_tail(output: &Mutex<String>) -> String {
+    const WINDOW: usize = 16 * 1024;
+    let text = output.lock().unwrap();
+    let mut start = text.len().saturating_sub(WINDOW);
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    serial_proof(&text[start..], &[])
+}
+
+/// O resultado do teste nos textos de uma captura.
+fn outcome(result: &Result<(), String>) -> String {
+    match result {
+        Ok(()) => "passou".to_string(),
+        Err(error) => format!("falhou: {error}"),
+    }
+}
+
+/// A tela do fim do `--capture-every` em `target`: lida agora se o QEMU
+/// ainda roda, senão (ou se a leitura falhar) a última que a thread da tela
+/// leu; com o resultado do teste, a hora e as linhas da serial que provam o
+/// teste nos textos.
+fn final_frame(
+    port: u16,
+    target: &Path,
+    alive: bool,
+    last: Option<crate::png::Image>,
+    result: &Result<(), String>,
+    serial: &str,
+    elapsed: Duration,
+) -> Result<(), String> {
+    let fresh = if alive { read_screen(port, &target.with_extension("ppm")) } else { Err("o QEMU ja tinha terminado".to_string()) };
+    let (image, origin) = match (fresh, last) {
+        (Ok(image), _) => (image, "lida no fim do teste"),
+        (Err(_), Some(image)) => (image, "a ultima lida durante o teste"),
+        (Err(error), None) => return Err(error),
+    };
+    let (date, outcome, time) = (crate::png::today(), outcome(result), seconds(elapsed));
+    let texts = [("opennt-data", date.as_str()), ("opennt-resultado", outcome.as_str()), ("opennt-tempo", time.as_str()), ("opennt-origem", origin), ("opennt-serial", serial)];
+    let png = crate::png::encode_within(&image, &texts, FRAME_LIMIT);
+    std::fs::write(target, &png).map_err(|error| format!("{}: {error}", target.display()))?;
+    println!("[xtask] tela final ({origin}, {}x{}, {} bytes): {}", image.width, image.height, png.len(), target.display());
+    Ok(())
+}
+
+/// A tela do QEMU agora: o `screendump` do QMP em `ppm`, apagado depois da
+/// leitura.
+fn read_screen(port: u16, ppm: &Path) -> Result<crate::png::Image, String> {
+    qmp_screendump(port, ppm)?;
+    let bytes = std::fs::read(ppm).map_err(|error| format!("{}: {error}", ppm.display()));
+    let _ = std::fs::remove_file(ppm);
+    crate::png::read_ppm(&bytes?)
+}
 
 /// Uma linha de resposta do QMP que não é evento: `return` ou `error`.
 fn qmp_reply(reader: &mut impl std::io::BufRead) -> Result<String, String> {
@@ -767,15 +971,8 @@ fn capture_screen(port: u16, target: &Path, result: &Result<(), String>, serial:
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
     }
-    let ppm = target.with_extension("ppm");
-    qmp_screendump(port, &ppm)?;
-    let bytes = std::fs::read(&ppm).map_err(|error| format!("{}: {error}", ppm.display()))?;
-    let _ = std::fs::remove_file(&ppm);
-    let image = crate::png::read_ppm(&bytes)?;
-    let outcome = match result {
-        Ok(()) => "passou".to_string(),
-        Err(error) => format!("falhou: {error}"),
-    };
+    let image = read_screen(port, &target.with_extension("ppm"))?;
+    let outcome = outcome(result);
     let date = crate::png::today();
     let texts = [("opennt-data", date.as_str()), ("opennt-resultado", outcome.as_str()), ("opennt-serial", serial)];
     let png = crate::png::encode_capture(&image, &texts, CAPTURE_LIMIT);
@@ -1087,9 +1284,9 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
         "-monitor".to_string(),
         format!("tcp:127.0.0.1:{port},server=on,wait=off"),
     ]);
-    // O QMP só entra com a captura ou a vigia da tela: o `screendump` sai
+    // O QMP só entra com as capturas ou a vigia da tela: o `screendump` sai
     // por ele.
-    let qmp_port = if test.capture.is_some() || test.watch_screen {
+    let qmp_port = if test.capture.is_some() || test.watch_screen || test.capture_every.is_some() {
         let qmp = free_port()?;
         arguments.extend(["-qmp".to_string(), format!("tcp:127.0.0.1:{qmp},server=on,wait=off")]);
         Some(qmp)
@@ -1107,15 +1304,19 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
     arguments.extend(kd_serial(machine));
     let output = Arc::new(Mutex::new(String::new()));
     let current = std::cell::RefCell::new(launch(&qemu, temp.path(), &arguments, &output, events_port)?);
+    let launched = Instant::now();
     let cycles_left = std::cell::Cell::new(test.power_cycles);
-    // A vigia da tela roda durante o teste; o QMP atende um cliente por vez,
-    // então ela para antes da captura do fim.
+    // A vigia da tela e as telas do `--capture-every` rodam durante o teste;
+    // o QMP atende um cliente por vez, então a thread delas para antes das
+    // capturas do fim.
     let screen_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let screen_watcher = match (test.watch_screen, qmp_port) {
+    let screen_watcher = match (test.watch_screen || test.capture_every.is_some(), qmp_port) {
         (true, Some(qmp)) => {
-            let (scratch, first) = (log.with_file_name("tela.ppm"), Some(log.with_file_name("primeira-tela.png")));
+            let scratch = log.with_file_name("tela.ppm");
+            let first = test.watch_screen.then(|| log.with_file_name("primeira-tela.png"));
+            let frames = test.capture_every.map(|every| FrameSeries::new(log.parent().unwrap_or(Path::new(".")), every));
             let (serial, stop) = (Arc::clone(&output), Arc::clone(&screen_stop));
-            Some(thread::spawn(move || watch_screen(qmp, scratch, first, serial, stop)))
+            Some(thread::spawn(move || screen_thread(qmp, scratch, launched, first, frames, serial, stop)))
         }
         _ => None,
     };
@@ -1271,20 +1472,28 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
         (result, _) => result,
     };
     screen_stop.store(true, std::sync::atomic::Ordering::Release);
-    if let Some(watcher) = screen_watcher {
-        let _ = watcher.join();
-    }
+    let (last_screen, frames) = screen_watcher.and_then(|watcher| watcher.join().ok()).unwrap_or((None, None));
     let mut machine = current.into_inner();
-    // A captura sai com o QEMU ainda vivo, passe o teste ou não; se ela
-    // falhar, o resultado do teste não muda.
-    if let (Some(target), Some(qmp)) = (&test.capture, qmp_port) {
+    // As capturas do fim saem com o QEMU ainda vivo, passe o teste ou não
+    // (prazo esgotado, STOP); se elas falharem, o resultado do teste não
+    // muda.
+    if let Some(qmp) = qmp_port.filter(|_| test.capture.is_some() || frames.is_some()) {
         let alive = matches!(machine.process.0.try_wait(), Ok(None));
         let mut needles = vec![test.marker.as_str()];
         needles.extend(test.expect.iter().map(String::as_str));
         let serial = serial_proof(&output.lock().unwrap(), &needles);
-        let captured = if alive { capture_screen(qmp, target, &result, &serial) } else { Err("o QEMU ja tinha terminado".into()) };
-        if let Err(error) = captured {
-            eprintln!("aviso: sem captura de tela ({}): {error}", target.display());
+        if let Some(series) = &frames {
+            let target = log.with_file_name(FINAL_FRAME);
+            if let Err(error) = final_frame(qmp, &target, alive, last_screen, &result, &serial, launched.elapsed()) {
+                eprintln!("aviso: sem tela final ({}): {error}", target.display());
+            }
+            println!("[xtask] {}", series.summary());
+        }
+        if let Some(target) = &test.capture {
+            let captured = if alive { capture_screen(qmp, target, &result, &serial) } else { Err("o QEMU ja tinha terminado".into()) };
+            if let Err(error) = captured {
+                eprintln!("aviso: sem captura de tela ({}): {error}", target.display());
+            }
         }
     }
     drop(machine.process);
@@ -1421,5 +1630,148 @@ mod tests {
             pixel.copy_from_slice(&[0x80, (index % 4) as u8 * 0x30 + 0x40, 0x80]);
         }
         assert!(logon_screen(&four).is_none());
+    }
+
+    /// Uma pasta vazia só do teste.
+    fn scratch_dir(name: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!("opennt-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+
+    fn names_in(directory: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(directory).unwrap().map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn frame_names_and_schedule() {
+        assert_eq!(FrameSeries::name(1), "tela-0001.png");
+        assert_eq!(FrameSeries::name(12_345), "tela-12345.png");
+        assert!(is_frame("tela-0001.png") && is_frame("tela-12345.png") && is_frame(FINAL_FRAME));
+        // As outras capturas da pasta do build não são da série.
+        for other in ["tela-de-logon.png", "primeira-tela.png", "tela-12.png", "tela-0001.ppm", "tela.ppm", "serial.log"] {
+            assert!(!is_frame(other), "{other}");
+        }
+        // A tela N vence aos N intervalos; a próxima depois de um instante é
+        // a do intervalo seguinte.
+        let series = FrameSeries { directory: PathBuf::new(), every: Duration::from_secs(5), previous: None, saved: 0, repeated: 0 };
+        assert_eq!(series.next_index(Duration::ZERO), 1);
+        assert_eq!(series.next_index(Duration::from_millis(4_999)), 1);
+        assert_eq!(series.next_index(Duration::from_secs(5)), 2);
+        assert_eq!(series.next_index(Duration::from_millis(17_200)), 4);
+        assert_eq!(series.due(3), Duration::from_secs(15));
+        assert_eq!(series.due(u64::MAX), Duration::MAX);
+    }
+
+    #[test]
+    fn frame_series_skips_a_frame_equal_to_the_previous_one() {
+        let directory = scratch_dir("frames");
+        // As telas de uma série anterior saem; as outras capturas ficam.
+        for stale in ["tela-0007.png", FINAL_FRAME, "tela-de-logon.png", "primeira-tela.png", "serial.log"] {
+            std::fs::write(directory.join(stale), b"x").unwrap();
+        }
+        let mut series = FrameSeries::new(&directory, Duration::from_secs(5));
+        assert_eq!(names_in(&directory), ["primeira-tela.png", "serial.log", "tela-de-logon.png"]);
+        let black = screen(64, 48, [0, 0, 0]);
+        let mut dot = black.clone();
+        dot.rgb[0..3].copy_from_slice(&[0xFF, 0xFF, 0xFF]);
+        let offered: Vec<Option<PathBuf>> = [&black, &black, &dot, &dot, &black]
+            .iter()
+            .enumerate()
+            .map(|(at, image)| series.offer(at as u64 + 1, Duration::from_secs(5 * (at as u64 + 1)), image, "linha da serial").unwrap())
+            .collect();
+        // A tela igual à anterior gravada não sai; a que volta a ser como uma
+        // mais antiga sai (a comparação é com a anterior).
+        assert_eq!(offered, [Some(directory.join("tela-0001.png")), None, Some(directory.join("tela-0003.png")), None, Some(directory.join("tela-0005.png"))]);
+        assert_eq!((series.saved, series.repeated), (3, 2));
+        assert_eq!(names_in(&directory), ["primeira-tela.png", "serial.log", "tela-0001.png", "tela-0003.png", "tela-0005.png", "tela-de-logon.png"]);
+        // A tela inteira, com a hora e a serial nos textos.
+        let info = crate::png::read_info(&std::fs::read(directory.join("tela-0003.png")).unwrap()).unwrap();
+        assert_eq!((info.width, info.height), (64, 48));
+        assert_eq!(info.text("opennt-tempo"), Some("15.0 s"));
+        assert_eq!(info.text("opennt-serial"), Some("linha da serial"));
+        assert!(series.summary().starts_with("3 tela(s) gravada(s) em "), "{}", series.summary());
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn final_frame_uses_the_last_screen_when_qemu_is_gone() {
+        let directory = scratch_dir("final-frame");
+        let target = directory.join(FINAL_FRAME);
+        let result = Err("tempo esgotado esperando \"X\"".to_string());
+        // Sem QEMU e sem tela lida, não há tela final.
+        assert!(final_frame(0, &target, false, None, &result, "serial", Duration::from_secs(9)).is_err());
+        assert!(!target.exists());
+        // Com o QEMU terminado, a última tela que a thread leu.
+        final_frame(0, &target, false, Some(screen(32, 24, [0x00, 0x77, 0xD6])), &result, "*** STOP", Duration::from_secs(9)).unwrap();
+        let info = crate::png::read_info(&std::fs::read(&target).unwrap()).unwrap();
+        assert_eq!((info.width, info.height), (32, 24));
+        assert_eq!(info.text("opennt-resultado"), Some("falhou: tempo esgotado esperando \"X\""));
+        assert_eq!(info.text("opennt-origem"), Some("a ultima lida durante o teste"));
+        assert_eq!(info.text("opennt-tempo"), Some("9.0 s"));
+        assert_eq!(info.text("opennt-serial"), Some("*** STOP"));
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// Um QMP falso: cada conexão recebe a saudação, aceita o
+    /// `qmp_capabilities` e responde ao `screendump` gravando a próxima de
+    /// `screens` em PPM no arquivo pedido. Na última, liga `stop` antes de
+    /// responder: a thread da tela trata aquela tela e sai.
+    fn fake_qmp(screens: Vec<Image>, stop: Arc<std::sync::atomic::AtomicBool>) -> (u16, thread::JoinHandle<usize>) {
+        use std::io::BufRead;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            for (at, image) in screens.iter().enumerate() {
+                let (stream, _) = listener.accept().unwrap();
+                let mut writer = stream.try_clone().unwrap();
+                let mut reader = std::io::BufReader::new(stream);
+                writer.write_all(b"{\"QMP\": {\"version\": {}, \"capabilities\": []}}\n").unwrap();
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert!(line.contains("qmp_capabilities"), "{line}");
+                writer.write_all(b"{\"return\": {}}\n").unwrap();
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                let file = line.split("\"filename\":\"").nth(1).and_then(|rest| rest.split('"').next()).unwrap_or_else(|| panic!("{line}"));
+                let header = format!("P6\n{} {}\n255\n", image.width, image.height);
+                std::fs::write(file, [header.as_bytes(), &image.rgb].concat()).unwrap();
+                if at + 1 == screens.len() {
+                    stop.store(true, std::sync::atomic::Ordering::Release);
+                }
+                // Um evento antes da resposta, como o QEMU pode mandar.
+                writer.write_all(b"{\"event\": \"RESUME\"}\n{\"return\": {}}\n").unwrap();
+            }
+            screens.len()
+        });
+        (port, server)
+    }
+
+    /// A thread da tela com só o `--capture-every`, contra o QMP falso: cada
+    /// leitura vira uma tela da série, as iguais à anterior não são
+    /// gravadas, e a última lida volta para a tela final.
+    #[test]
+    fn screen_thread_saves_only_the_frames_that_changed() {
+        let directory = scratch_dir("screen-thread");
+        let (a, b) = (screen(40, 30, [0x10, 0x20, 0x30]), screen(40, 30, [0xF0, 0xE0, 0xD0]));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (port, server) = fake_qmp(vec![a.clone(), a.clone(), b.clone(), b.clone(), b, a.clone()], Arc::clone(&stop));
+        let output = Arc::new(Mutex::new("primeira linha\nultima linha\n".to_string()));
+        let frames = FrameSeries::new(&directory, Duration::from_millis(30));
+        let (last, frames) = screen_thread(port, directory.join("tela.ppm"), Instant::now(), None, Some(frames), output, stop);
+        assert_eq!(server.join().unwrap(), 6);
+        let frames = frames.unwrap();
+        assert_eq!((frames.saved, frames.repeated), (3, 3));
+        assert!(last == Some(a), "a ultima tela lida volta da thread");
+        // Três PNGs em ordem, nenhum PPM de sobra.
+        let names = names_in(&directory);
+        assert_eq!(names.len(), 3, "{names:?}");
+        assert!(names.iter().all(|name| is_frame(name) && name != FINAL_FRAME), "{names:?}");
+        let info = crate::png::read_info(&std::fs::read(directory.join(&names[0])).unwrap()).unwrap();
+        assert_eq!(info.text("opennt-serial"), Some("primeira linha\nultima linha\n"));
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 }

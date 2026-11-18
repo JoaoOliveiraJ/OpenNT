@@ -4794,6 +4794,19 @@ e o aviso do QEMU antes da VGA iniciar (640x480) não contam. O vídeo de boot
 do OpenNT (o modo VBE 1024x768) é todo preto, e o kernel só desenha nele a
 tela de bugcheck: o que aparece ali vem de quem desenha depois do boot.
 
+O `test-boot --capture-every=SEGUNDOS` grava a tela durante o teste em
+`<build>/tela-NNNN.png` (`qemu::FrameSeries`): a NNNN é a dos NNNN×SEGUNDOS
+segundos desde a subida do QEMU, e a tela igual à última gravada não é gravada
+de novo, então um número que falta na sequência é uma tela que não mudou. A
+tela vai inteira, sem cortar a moldura, e só a que passa de 256 KB é reduzida
+pela metade. No fim do teste, passando ou não (prazo esgotado, STOP), a tela
+vai para `<build>/tela-final.png`; se o QEMU já terminou, vai a última tela
+lida. Os textos de cada PNG levam a hora da leitura e as últimas linhas da
+serial naquele instante, e os da tela final também o resultado do teste. As
+telas de uma execução anterior saem quando a série começa. O QMP atende um
+cliente por vez: a vigia da tela e a série dividem uma thread
+(`qemu::screen_thread`), e uma leitura serve às duas quando elas vencem juntas.
+
 ## 7. O nome OpenNT nos arquivos
 
 Banners, prompt do shell (`OpenNT> `), mensagens do `xtask`, rótulo do volume

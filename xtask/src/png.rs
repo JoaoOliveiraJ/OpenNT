@@ -9,6 +9,7 @@
 //! lê de volta, com as dimensões, para o `cargo xtask status`.
 
 /// Imagem RGB de 8 bits por canal, linha a linha.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Image {
     pub width: usize,
     pub height: usize,
@@ -128,16 +129,25 @@ pub fn halve(image: &Image) -> Image {
 }
 
 /// O PNG da captura: sem moldura e, se passar de `limit` bytes, reduzido
-/// pela metade até caber. A tela de texto (720 pixels de largura) nunca é
-/// reduzida: pela metade, as letras não se leem mais.
+/// pela metade até caber ([`encode_within`]).
 pub fn encode_capture(image: &Image, texts: &[(&str, &str)], limit: usize) -> Vec<u8> {
-    let mut current = crop(image, 8, (480, 160));
+    encode_within(&crop(image, 8, (480, 160)), texts, limit)
+}
+
+/// O PNG da imagem inteira; se passar de `limit` bytes, reduzido pela
+/// metade até caber. Uma imagem de até 800 pixels de largura nunca é
+/// reduzida: a tela de texto (720) pela metade não se lê mais.
+pub fn encode_within(image: &Image, texts: &[(&str, &str)], limit: usize) -> Vec<u8> {
+    let mut bytes = encode(image, texts);
+    let mut reduced: Option<Image> = None;
     loop {
-        let bytes = encode(&current, texts);
+        let current = reduced.as_ref().unwrap_or(image);
         if bytes.len() <= limit || current.width <= 800 {
             return bytes;
         }
-        current = halve(&current);
+        let half = halve(current);
+        bytes = encode(&half, texts);
+        reduced = Some(half);
     }
 }
 
@@ -814,6 +824,37 @@ mod tests {
         assert_eq!(info.text("opennt-data"), Some("2026-11-15"));
         let ppm = [b"P6\n# x\n3 2\n255\n".to_vec(), image.rgb.clone()].concat();
         assert_eq!(read_ppm(&ppm).unwrap().rgb, image.rgb);
+    }
+
+    #[test]
+    fn encode_within_keeps_the_whole_frame_and_halves_only_what_is_too_big() {
+        // Uma tela quase toda preta fica inteira: sem corte da moldura e sem
+        // redução.
+        let mut quiet = Image { width: 1024, height: 768, rgb: vec![0; 1024 * 768 * 3] };
+        quiet.rgb[(100 * 1024 + 200) * 3..][..3].copy_from_slice(&[255, 255, 255]);
+        let bytes = encode_within(&quiet, &[("opennt-tempo", "5.0 s")], 4096);
+        let info = read_info(&bytes).unwrap();
+        assert_eq!((info.width, info.height), (1024, 768));
+        assert_eq!(info.text("opennt-tempo"), Some("5.0 s"));
+        assert!(bytes.len() <= 4096, "{} bytes", bytes.len());
+        // Ruído não comprime: a tela cai pela metade e para quando a
+        // largura chega a 800 pixels ou menos, mesmo acima do limite.
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let noise: Vec<u8> = (0..1024 * 768 * 3)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 24) as u8
+            })
+            .collect();
+        let bytes = encode_within(&Image { width: 1024, height: 768, rgb: noise }, &[], 64 * 1024);
+        let info = read_info(&bytes).unwrap();
+        assert_eq!((info.width, info.height), (512, 384));
+        // A tela de texto da VGA nunca é reduzida.
+        let text = Image { width: 720, height: 400, rgb: (0..720 * 400 * 3).map(|index| (index % 251) as u8).collect() };
+        let info = read_info(&encode_within(&text, &[], 16)).unwrap();
+        assert_eq!((info.width, info.height), (720, 400));
     }
 
     #[test]
