@@ -6011,6 +6011,7 @@ pub fn run(assert: Assert) {
     section_open_and_map(assert);
     physical_memory_section(assert);
     system_space_views(assert);
+    super::shared_section_views::run(assert);
     virtual_memory_queries(assert);
     user_virtual_memory(assert);
     volume_file_lookup(assert);

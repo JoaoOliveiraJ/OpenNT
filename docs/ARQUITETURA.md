@@ -1100,7 +1100,7 @@ além da KUSER_SHARED_DATA:
   com acesso 0 (seção sem descritor). SEC_NO_CHANGE na criação marca a seção
   e toda vista dela recusa trocar a proteção, como no MiMapViewOfDataSection.
   O NtUnmapViewOfSection de usuário ainda não recusa uma vista SEC_NO_CHANGE
-  (o MiCheckSecuredVad do NT).
+  (o MiCheckSecuredVad do NT). Teste: `ntos/test/shared_section_views.rs`.
 - **Cópias de sistema** (`ps/user/loader.rs`): a ntdll, o apiset e as
   tabelas NLS são mapeados uma vez, na raiz do System (o mapeamento roda
   anexado ao System, venha o pedido de onde vier), e fotografados logo
