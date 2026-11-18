@@ -82,7 +82,18 @@ const POWER_MONITOR_ON: u32 = 1;
 
 /// A tela do console no PoInitSystem: PopUpdateConsoleDisplayState
 /// (PowerMonitorOn) e o mesmo estado em WNF_PO_PRIMARY_DISPLAY_VISIBLE_STATE.
+/// No OpenNT o serviço WNF nasce no primeiro uso, e os autotestes da fase 5
+/// criam e descartam o namespace deles antes disso; sem o serviço ainda de
+/// pé, o boot grava o estado e os valores de energia sem publicar: a
+/// WNF_PO_PRIMARY_DISPLAY_VISIBLE_STATE sai no primeiro SessionDisplayState
+/// do win32kbase e a WNF_UBPM_CONSOLE_MONITOR na próxima mudança da tela.
 pub fn initialize() -> Result<(), KernelError> {
+    if !crate::ntos::ex::wnf::service::exists() {
+        CONSOLE_DISPLAY_STATE.store(POWER_MONITOR_ON, Ordering::Release);
+        power_setting::set_value_ac_dc(&power_setting::GUID_CONSOLE_DISPLAY_STATE, &POWER_MONITOR_ON.to_le_bytes());
+        power_setting::set_value_ac_dc(&power_setting::GUID_MONITOR_POWER_ON, &1u32.to_le_bytes());
+        return Ok(());
+    }
     update_console_display_state(POWER_MONITOR_ON)?;
     publish(WNF_PO_PRIMARY_DISPLAY_VISIBLE_STATE, POWER_MONITOR_ON)
 }
