@@ -700,8 +700,43 @@ pub fn lookup(_dll: &str, name: &str) -> Option<ResolvedImport> {
     Some(ResolvedImport::Thunk(32 + index as u32))
 }
 
-/// Ordinal N do .def = índice N-1 da tabela pública.
+/// Os exports só por ordinal do ntoskrnl 19041 (as entradas sem nome da
+/// EAT, ordinais 1 a 28), que os drivers reais importam pelo número: o
+/// condrv.sys importa o 1 e o 2, o dxgkrnl.sys o 2, o acpi.sys o 4 e o
+/// clipsp.sys do 12 ao 24. Os ordinais 20, 21, 24 e 27 não têm nome público.
+pub static ORDINAL_ONLY: &[(u32, &str)] = &[
+    (1, "PsCaptureUserProcessParameters"),
+    (2, "ZwCreateUserProcess"),
+    (3, "ExAllocateTimerInternal"),
+    (4, "ExAllocateTimerInternal2"),
+    (5, "VslTestRoutine"),
+    (6, "KeYieldExecution"),
+    (7, "KeExpandKernelStackAndCalloutInternal"),
+    (9, "VslCapturePgoData"),
+    (12, "MmGetNumberOfPhysicalPages"),
+    (13, "PnpFreeSystemPdoList"),
+    (14, "PnpGetDeviceInstancePropertyData"),
+    (15, "PnpGetDeviceInstanceRegistryValue"),
+    (16, "PnpGetSystemPdoList"),
+    (17, "RtlGetHostNtSystemRoot"),
+    (19, "ZwPlugPlayControl"),
+    (22, "ExpReducedLicenseData"),
+    (23, "SeCodeIntegrityGetBuildExpiryTime"),
+    (25, "ClipInitHandles"),
+    (28, "ExUpdateOsPfnInRegistry"),
+];
+
+/// Um import do ntoskrnl por ordinal: os ordinais sem nome do 19041 pelo
+/// nome da função ([`ORDINAL_ONLY`]); os outros, e os sem nome ainda sem
+/// implementação, pela numeração do OpenNT (ordinal N do .def = índice N-1
+/// da tabela pública), com o aviso.
 pub fn lookup_ordinal(dll: &str, ordinal: u32) -> Option<ResolvedImport> {
+    if let Some((_, name)) = ORDINAL_ONLY.iter().find(|(number, _)| *number == ordinal) {
+        if let Some(resolved) = lookup(dll, name) {
+            return Some(resolved);
+        }
+        crate::debug_print!("[ldr] ntoskrnl ordinal #{} ({}) sem implementacao: numeracao do OpenNT", ordinal, name);
+    }
     let name = *table().public_names.get((ordinal as usize).checked_sub(1)?)?;
     lookup(dll, name)
 }
