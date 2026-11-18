@@ -657,6 +657,11 @@ const LOGON_SCREEN_PROGRAMS: &[&str] = &[
     "Windows.Globalization.Fontgroups.dll",
     "CredProvDataModel.dll",
     "iertutil.dll",
+    // O urlmon.dll que o Windows.UI.Xaml.dll carrega por delay-load para
+    // normalizar as URIs dos recursos (CWinUriLegacy::GetHealthyUrl, o
+    // CreateURLMonikerEx) no InitializePresenterWithTheme do XAMLHostWindow;
+    // os imports estáticos dele (iertutil, srvcli, netutils) já estão aqui.
+    "urlmon.dll",
     "WindowManagementAPI.dll",
     "TextInputFramework.dll",
     "InputHost.dll",
