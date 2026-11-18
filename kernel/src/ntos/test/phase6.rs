@@ -5556,9 +5556,30 @@ fn rtl_crt_extended_exports(assert: Assert) {
     // ---- informação de sistema / produto ----------------------------------
     let product_type = guest::alloc_bytes(4);
     assert(call_export("RtlGetNtProductType", &[product_type]) == Some(1) && guest::read32(product_type) == 1, "rtl: RtlGetNtProductType = WinNt, TRUE");
-    assert(call_export("RtlGetSuiteMask", &[]) == Some(0) && call_export("RtlIsMultiSessionSku", &[]) == Some(1), "rtl: SuiteMask 0 e MultiSession TRUE (NumberOfInitialSessions 2)");
+    // O DbgMultiSessionSku segue o NumberOfInitialSessions da hive (o boot do
+    // smss semeia 2, como esta instalação; a hive do autoteste não tem o
+    // Session Manager, e o ExIsMultiSessionSku devolve o erro da consulta).
     let flags = crate::ntos::mm::shared_user_data::data().map_or(0, |data| data.shared_data_flags.get());
-    assert(crate::ntos::ex::session_sku::is_multi_session_sku() == Ok(true) && flags & 0x100 != 0, "sku: InitSkuSessionParameters liga o DbgMultiSessionSku com NumberOfInitialSessions 2");
+    let multi_session = crate::ntos::ex::session_sku::is_multi_session_sku() == Ok(true);
+    assert(call_export("RtlGetSuiteMask", &[]) == Some(0) && call_export("RtlIsMultiSessionSku", &[]) == Some(multi_session as u64) && (flags & 0x100 != 0) == multi_session, "rtl: SuiteMask 0 e o RtlIsMultiSessionSku pelo bit 8 do SharedDataFlags");
+    // ExIsMultiSessionSku: mais de uma sessão inicial é multissessão; 1 não.
+    let path = "\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Session Manager";
+    let previous = crate::ntos::cm::registry::read_value_by_path(path, "NumberOfInitialSessions");
+    let handle = crate::ntos::cm::registry::open_or_create(path, None).unwrap_or(0);
+    let two = handle != 0 && crate::ntos::cm::registry::set_value(handle, "NumberOfInitialSessions", 4, 2u32.to_le_bytes().to_vec()) && crate::ntos::ex::session_sku::is_multi_session_sku() == Ok(true);
+    let one = handle != 0 && crate::ntos::cm::registry::set_value(handle, "NumberOfInitialSessions", 4, 1u32.to_le_bytes().to_vec()) && crate::ntos::ex::session_sku::is_multi_session_sku() == Ok(false);
+    if handle != 0 {
+        match previous {
+            Some(value) => {
+                let _ = crate::ntos::cm::registry::set_value(handle, "NumberOfInitialSessions", value.value_type, value.data);
+            }
+            None => {
+                let _ = crate::ntos::cm::registry::delete_value(handle, "NumberOfInitialSessions");
+            }
+        }
+        crate::ntos::cm::registry::close_handle(handle);
+    }
+    assert(two && one, "sku: ExIsMultiSessionSku pelo NumberOfInitialSessions (2 multissessao, 1 nao)");
     let edition = guest::alloc_bytes(4);
     assert(call_export("RtlGetProductInfo", &[10, 0, 0, 0, edition]) == Some(1) && guest::read32(edition) == 0x30, "rtl: RtlGetProductInfo = PROFESSIONAL, TRUE");
 
