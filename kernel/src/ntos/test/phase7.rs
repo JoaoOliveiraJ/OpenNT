@@ -2200,7 +2200,12 @@ fn user_syscalls_core(assert: Assert) {
     assert(call("NtDisplayString", string, 0, 0, 0) == 0, "usercore: NtDisplayString");
     assert(call("NtQueryPerformanceCounter", out, out + 8, 0, 0) == 0 && counter.quad_part.get() != 0 && frequency.quad_part.get() as u64 == crate::ntos::ke::clock::QPC_FREQUENCY && call("NtQueryPerformanceCounter", 0, 0, 0, 0) == 0xC000_0005, "usercore: contador e frequencia de 10 MHz");
     let exit_cell = crate::hal::amd64::usermode::block().exit_code.get();
-    assert(call("NtTerminateProcess", u64::MAX, 0x42, 0, 0) == state::TERMINATE_MAGIC && crate::hal::amd64::usermode::block().exit_code.get() == 0x42, "usercore: NtTerminateProcess publica o codigo para a HAL");
+    // O processo corrente aqui é o System: o NtTerminateProcess dele mesmo
+    // liga o ProcessDelete (o começo do fim do processo), que o teste desfaz.
+    let terminating = unsafe { nt::Eprocess::at(crate::ntos::ps::process::get_current_process()) };
+    let delete_before = terminating.flags.get() & nt::Eprocess::PROCESS_DELETE_MASK;
+    assert(call("NtTerminateProcess", u64::MAX, 0x42, 0, 0) == state::TERMINATE_MAGIC && crate::hal::amd64::usermode::block().exit_code.get() == 0x42 && terminating.flags.get() & nt::Eprocess::PROCESS_DELETE_MASK != 0, "usercore: NtTerminateProcess publica o codigo para a HAL e liga o ProcessDelete");
+    terminating.flags.atomic().fetch_and(!nt::Eprocess::PROCESS_DELETE_MASK | delete_before, core::sync::atomic::Ordering::SeqCst);
     crate::hal::amd64::usermode::block().exit_code.set(exit_cell);
     // Informações do sistema.
     assert(call("NtQuerySystemInformation", 0, buffer, 0x40, info) == 0 && { let system = unsafe { nt::SystemBasicInformation::at(buffer) }; system.page_size.get() == 0x1000 && system.allocation_granularity.get() == 0x10000 && system.minimum_user_mode_address.get() == 0x1_0000 && system.maximum_user_mode_address.get() == 0x7FFF_FFFE_FFFF } && guest::read32(info) == 0x40, "usercore: SYSTEM_BASIC_INFORMATION (usuario de 64 KB a MmHighestUserAddress)");
