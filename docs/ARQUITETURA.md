@@ -3598,7 +3598,9 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   DXGSESSIONMGR::SetConsoleSession e avisa o TTM, sem carregar nada (o
   callout de troca de tela só sai depois de uma mudança da política de
   energia HDR). O lsm exige o `Control\Terminal Server` e o
-  `WinStations` (copiados desta máquina pelo xtask), carrega o sysntfy.dll,
+  `WinStations` (copiados desta máquina pelo xtask) e, depois da conexão
+  do console, a definição do WNF_GPOL_SYSTEM_CHANGES
+  (`cm/wnf_defaults.rs`), que o CPolicyMonitor assina; carrega o sysntfy.dll,
   o WMsgAPI.dll e o usermgrcli.dll, abre o `\KernelObjects\Session<id>` de
   cada sessão pelo NtOpenSession (`mm/session_object.rs`) e avisa as
   mudanças de estado pelo NtNotifyChangeSession

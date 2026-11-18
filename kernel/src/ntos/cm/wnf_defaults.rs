@@ -486,8 +486,26 @@ const PO_SCENARIO_CHANGE: (&str, &str) = (
     ),
 );
 
-pub const DEFINITIONS: [(&str, &str); 53] = {
-    let mut definitions = [("", ""); 53];
+/// WNF_GPOL_SYSTEM_CHANGES — 176 bytes: o nome bem conhecido de escopo de
+/// sistema que o lsm.dll assina no construtor do CPolicyMonitor, já com a
+/// sessão do console conectada (sem a definição o NtSubscribeWnfStateChange
+/// devolve STATUS_OBJECT_NAME_NOT_FOUND e o serviço LSM para). Descritor sem
+/// dono nem grupo, DACL com S-1-5-11, S-1-15-2-1, um SID de capacidade,
+/// S-1-5-32-544 e S-1-5-18; tamanho máximo dos dados zero, sem GUID de tipo.
+const GPOL_SYSTEM_CHANGES: (&str, &str) = (
+    "0D891E2AA3BC0875",
+    concat!(
+        "0100048000000000000000000000000014000000020098000500000000001400",
+        "0100000001010000000000050b0000000000180001000000010200000000000f",
+        "02000000010000000000380001000000010a00000000000f0300000000040000",
+        "b031803f6cbc634c3ce050d1970ca1620f01cb197e7aa6c0fae697f119a30cce",
+        "0000180003000000010200000000000520000000200200000000140003000000",
+        "01010000000000051200000000000000",
+    ),
+);
+
+pub const DEFINITIONS: [(&str, &str); 54] = {
+    let mut definitions = [("", ""); 54];
     definitions[0] = FEATURE_CONFIGURATION_CHANGED;
     definitions[1] = KERNELBASE_NOTIFICATION;
     definitions[2] = KERNELBASE_SECOND_NOTIFICATION;
@@ -498,6 +516,7 @@ pub const DEFINITIONS: [(&str, &str); 53] = {
         index += 1;
     }
     definitions[4 + SMSS_PATH_NOTIFICATIONS.len()] = PO_SCENARIO_CHANGE;
+    definitions[5 + SMSS_PATH_NOTIFICATIONS.len()] = GPOL_SYSTEM_CHANGES;
     definitions
 };
 
