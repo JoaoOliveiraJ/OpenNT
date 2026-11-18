@@ -181,6 +181,7 @@ fn machine_hives(assert: Assert) {
     let expected = link_data("\\Registry\\User\\.Default");
     let followed = registry::node_by_path("\\Registry\\User\\S-1-5-18");
     assert(opened == 0 && shape.is_some_and(|(is_link, volatile, value)| is_link && volatile && value.is_some_and(|value| value.value_type == 6 && value.data == expected)) && followed.is_some() && followed == registry::node_by_path("\\Registry\\User\\.Default"), "cmmodel: \\Registry\\User\\S-1-5-18 e link volatil para \\Registry\\User\\.Default");
+    hardware_profiles(assert);
     let hardware = registry::node_by_path("\\Registry\\Machine\\Hardware");
     let volatile = hardware.is_some_and(|node| registry::hive_of(node).is_some_and(|(_, root)| root) && hive_list::is_volatile_hive(node));
     let listed = registry::read_value_by_path(HIVE_LIST, "\\REGISTRY\\MACHINE\\HARDWARE");
@@ -192,6 +193,47 @@ fn machine_hives(assert: Assert) {
     let software = registry::read_value_by_path("\\Registry\\Machine\\Software\\Microsoft\\Cryptography\\Defaults\\Provider\\Microsoft Strong Cryptographic Provider", "Type");
     let ifeo = registry::node_by_path("\\Registry\\Machine\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options").and_then(registry::hive_of);
     assert(software.is_some_and(|value| value.data == [1, 0, 0, 0]) && ifeo.is_some(), "cmmodel: a SOFTWARE do volume traz os CSPs e as Image File Execution Options");
+}
+
+/// CmpCreateHardwareProfiles: `Hardware Profiles\Current` é link volátil
+/// para o perfil de `Control\IDConfigDB\CurrentConfig`. Uma SYSTEM sem o
+/// IDConfigDB (a hive das tabelas de semente) recebe chaves voláteis de
+/// teste com o perfil 1, apagadas no fim.
+fn hardware_profiles(assert: Assert) {
+    const CONTROL_SET: &str = "\\Registry\\Machine\\SYSTEM\\CurrentControlSet";
+    let configuration = alloc::format!("{CONTROL_SET}\\Control\\IDConfigDB");
+    let profiles = alloc::format!("{CONTROL_SET}\\Hardware Profiles");
+    let seeded = registry::node_by_path(&configuration).is_none() && registry::node_by_path(&profiles).is_none();
+    let mut created = Vec::new();
+    if seeded {
+        for path in [configuration.clone(), profiles.clone(), alloc::format!("{profiles}\\0001"), alloc::format!("{profiles}\\0001\\Software"), alloc::format!("{profiles}\\0001\\Software\\Fonts")] {
+            created.push(open_with(&path, 0, 0x240, true, 1).1);
+        }
+        registry::set_value(created[0] as u32, "CurrentConfig", 4, 1u32.to_le_bytes().to_vec());
+        registry::set_value(created[4] as u32, "LogPixels", 4, 96u32.to_le_bytes().to_vec());
+        hive_init::create_hardware_profiles();
+    }
+    let profile = registry::read_value_by_path(&configuration, "CurrentConfig").filter(|value| value.value_type == 4 && value.data.len() >= 4).map(|value| u32::from_le_bytes([value.data[0], value.data[1], value.data[2], value.data[3]]));
+    let link = alloc::format!("{profiles}\\Current");
+    let (opened, current) = open_with(&link, 0, 0x340, false, 0);
+    let shape = registry::get_node(current as u32).and_then(|node| registry::with_node(node, |key| (key.link, key.volatile, key.value("symboliclinkvalue").cloned())));
+    let expected = profile.map(|profile| link_data(&alloc::format!("{profiles}\\{profile:04}")));
+    let followed = registry::node_by_path(&alloc::format!("{link}\\Software"));
+    let target = profile.and_then(|profile| registry::node_by_path(&alloc::format!("{profiles}\\{profile:04}\\Software")));
+    let linked = opened == 0 && shape.is_some_and(|(is_link, volatile, value)| is_link && volatile && value.is_some_and(|value| value.value_type == 6 && Some(&value.data) == expected.as_ref())) && followed.is_some() && followed == target;
+    if seeded {
+        let removed = registry::delete_key(current as u32);
+        close(current);
+        let mut deleted = removed;
+        for handle in created.into_iter().rev() {
+            deleted &= registry::delete_key(handle as u32);
+            close(handle);
+        }
+        assert(linked && deleted && registry::node_by_path(&configuration).is_none() && registry::node_by_path(&profiles).is_none(), "cmmodel: Hardware Profiles\\Current e link volatil para o perfil de IDConfigDB\\CurrentConfig");
+    } else {
+        close(current);
+        assert(linked, "cmmodel: Hardware Profiles\\Current e link volatil para o perfil de IDConfigDB\\CurrentConfig");
+    }
 }
 
 /// Grava SOURCE num arquivo novo pelo ZwSaveKeyEx (REG_LATEST_FORMAT).

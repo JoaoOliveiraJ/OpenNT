@@ -21,6 +21,14 @@
 //!   e os ícones do Segoe MDL2 Assets, e o `FontLink\SystemLink` cai no
 //!   Segoe UI Symbol.
 //!
+//! O DPI vem do perfil de hardware: o win32kfull lê o `LogPixels` de
+//! `CurrentControlSet\Hardware Profiles\Current\Software\Fonts` (e o
+//! FinishStockFontInitInternal procura as fontes de estoque primeiro ali), e
+//! o `Current` é o link volátil que o kernel cria no boot para o perfil de
+//! `Control\IDConfigDB\CurrentConfig` (o CmpCreateHardwareProfiles). A
+//! SYSTEM leva o `IDConfigDB` e os perfis de `Hardware Profiles` daqui, sem
+//! o `Current`.
+//!
 //! A chave `Fonts` vai só com os valores das fontes do volume: o convidado
 //! é uma instalação com estas fontes. As outras chaves vêm inteiras, com os
 //! valores daqui. Fora do Windows nada é copiado.
@@ -62,6 +70,28 @@ const FONTS: &[&str] = &[
 /// As fontes: (caminho no volume, arquivo de origem).
 pub fn files(windows: &Path) -> Vec<(String, PathBuf)> {
     FONTS.iter().map(|name| (format!("Fonts/{name}"), windows.join("Fonts").join(name))).collect()
+}
+
+/// As chaves da hive SYSTEM, já no conjunto de controle que a hive guarda
+/// (`control_set`, como `ControlSet001`): o `Control\IDConfigDB` e os
+/// perfis de `Hardware Profiles`. O `Current` daqui é o link que o kernel
+/// cria (a abertura o segue até o perfil) e fica de fora.
+pub fn system_keys(control_set: &str) -> Vec<HostKey> {
+    let mut keys = Vec::new();
+    #[cfg(windows)]
+    {
+        use crate::host_language::registry;
+        let host = "SYSTEM\\CurrentControlSet";
+        registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\Control\\IDConfigDB"), &format!("{control_set}\\Control\\IDConfigDB"), true, &mut keys);
+        let profiles = "Hardware Profiles";
+        registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\{profiles}"), &format!("{control_set}\\{profiles}"), false, &mut keys);
+        for profile in registry::list(registry::LOCAL_MACHINE, &format!("{host}\\{profiles}")).into_iter().filter(|name| !name.eq_ignore_ascii_case("Current")) {
+            registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\{profiles}\\{profile}"), &format!("{control_set}\\{profiles}\\{profile}"), true, &mut keys);
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = control_set;
+    keys
 }
 
 /// As chaves da hive SOFTWARE.

@@ -434,10 +434,12 @@ pub fn machine_hives(smss_boot: bool) -> Vec<(&'static str, Vec<u8>)> {
         default.extend(crate::host_language::default_keys().into_iter().map(seed_of));
         // E a SOFTWARE, os assemblies lado a lado do contexto de ativação
         // padrão do sistema e dos controles comuns (`side_by_side`), as
-        // fontes da sessão (`fonts`) e as classes COM e WinRT que o LogonUI
-        // ativa (`logon_screen`).
+        // fontes da sessão (`fonts`, com o perfil de hardware do DPI na
+        // SYSTEM) e as classes COM e WinRT que o LogonUI ativa
+        // (`logon_screen`).
         software.extend(crate::side_by_side::software_keys(&crate::windows_binaries::windows_directory()).into_iter().map(seed_of));
         software.extend(crate::fonts::software_keys().into_iter().map(seed_of));
+        system.extend(crate::fonts::system_keys(&control_set).into_iter().map(seed_of));
         software.extend(crate::logon_screen::software_keys().into_iter().map(seed_of));
     }
     let hives: [(&'static str, Vec<cm::seed::SeedKey>); 5] = [

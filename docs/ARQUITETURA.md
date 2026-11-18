@@ -3769,8 +3769,9 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   credencial (`LOGON_SCREEN_PROGRAMS` em `xtask/src/windows_binaries.rs`),
   os `.mun` e os `.pri` de `\Windows\SystemResources` desses programas, as
   fontes de `\SystemRoot\Fonts` com o GRE_Initialize, o FontSubstitutes, o
-  FontLink e a chave Fonts (`xtask/src/fonts.rs`), e o CLSID do
-  LogonUIController com as classes WinRT das DLLs do volume
+  FontLink e a chave Fonts, e na SYSTEM o `Control\IDConfigDB` e os perfis
+  de `Hardware Profiles` (o `LogPixels` do DPI, `xtask/src/fonts.rs`), e o
+  CLSID do LogonUIController com as classes WinRT das DLLs do volume
   (`WindowsRuntime\ActivatableClassId`, `xtask/src/logon_screen.rs`); a
   hive gerada põe uma chave com mais de 1012 subchaves em folhas sob uma
   raiz 'ri' (`xtask/src/hive_image.rs`). A inicialização do LSA (o
@@ -4230,7 +4231,10 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   liga a SYSTEM de `\SystemRoot\System32\config\SYSTEM`, cria o
   `CurrentControlSet` como link volátil para o `ControlSet%03d` do
   `Select\Current` (CmpCreateControlSet; a hive guarda `ControlSet001`, que
-  as tabelas chamam de `CurrentControlSet`), começa a lista de hives
+  as tabelas chamam de `CurrentControlSet`), cria `Hardware
+  Profiles\Current` como link volátil para o perfil `%04d` de
+  `Control\IDConfigDB\CurrentConfig` (CmpCreateHardwareProfiles; sem o
+  valor ou sem o perfil, nada), começa a lista de hives
   (`CurrentControlSet\Control\hivelist`, volátil: o nome do FILE_OBJECT do
   primário de cada hive, vazio para as voláteis, fora as de aplicativo) e
   liga SOFTWARE, SAM, SECURITY e DEFAULT (`\REGISTRY\USER\.DEFAULT`). O

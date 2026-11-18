@@ -13,6 +13,9 @@
 //!   REG_OPTION_VOLATILE | REG_OPTION_CREATE_LINK e KEY_CREATE_LINK, com o
 //!   `SymbolicLinkValue` REG_LINK = `\Registry\Machine\SYSTEM\ControlSet%03d`
 //!   (o comprimento do texto, sem o NUL);
+//! - o CmpCreateHardwareProfiles (rva 0xa58540) liga `Hardware
+//!   Profiles\Current` ao perfil que `Control\IDConfigDB\CurrentConfig`
+//!   escolhe, também com um link volátil;
 //! - as hives de máquina vêm de `\SystemRoot\System32\config`: SOFTWARE,
 //!   SAM, SECURITY e DEFAULT (`\REGISTRY\USER\.DEFAULT`), além da SYSTEM;
 //!   depois da DEFAULT, o CmpFinishSystemHivesLoad liga
@@ -138,6 +141,60 @@ pub fn create_control_set() -> Result<(), KernelError> {
     Ok(())
 }
 
+/// O conjunto de controle dos dispositivos (o CmpOpenDevicesControlSet com
+/// o CmStateSeparationEnabled zerado, como no boot daqui: a SYSTEM).
+const DEVICES_CONTROL_SET: &str = "\\Registry\\Machine\\SYSTEM\\CurrentControlSet";
+
+/// CmDeleteKeyRecursive: as subchaves primeiro, depois a chave.
+fn delete_key_recursive(node: registry::NodeId) {
+    for child in registry::children(node) {
+        delete_key_recursive(child);
+    }
+    let path = registry::path_of(node).unwrap_or_default();
+    registry::delete_node(node, &path);
+}
+
+/// CmpCreateHardwareProfiles (rva 0xa58540), que o CmInitSystem1 chama
+/// depois do conjunto de controle e ignora a falha:
+/// - lê o REG_DWORD `CurrentConfig` de `Control\IDConfigDB` do conjunto de
+///   controle dos dispositivos (sem a chave, sem o valor ou com outro tipo,
+///   nada é criado) e abre `Hardware Profiles` e `Hardware Profiles\%04d`
+///   (sem elas, nada é criado);
+/// - o estado do perfil que o carregador entrega (o PROFILE_PARAMETER_BLOCK
+///   da extensão do bloco de parâmetros) é HW_PROFILE_STATUS_SUCCESS aqui,
+///   sem casamento de alias nem clonagem: não há `CurrentDockInfo` nem
+///   perfil ACPI;
+/// - um `Hardware Profiles\Current` que já exista é excluído com as
+///   subchaves, e a chave é criada com KEY_CREATE_LINK e
+///   REG_OPTION_VOLATILE | REG_OPTION_CREATE_LINK, com o `SymbolicLinkValue`
+///   REG_LINK = `\Registry\Machine\SYSTEM\CurrentControlSet\Hardware
+///   Profiles\%04d` (o comprimento do texto, sem o NUL).
+///
+/// É por esse link que o win32kfull lê o DPI (`Software\Fonts\LogPixels`) e
+/// as fontes de estoque, e o HKEY_CURRENT_CONFIG dos programas aponta para
+/// ele.
+pub fn create_hardware_profiles() {
+    let Ok(control_set) = registry::resolve_path(DEVICES_CONTROL_SET, false) else { return };
+    let configuration = registry::read_value_by_path(&format!("{control_set}\\Control\\IDConfigDB"), "CurrentConfig");
+    let Some(profile) = configuration.filter(|value| value.value_type == seed::REG_DWORD && value.data.len() >= 4).map(|value| i32::from_le_bytes([value.data[0], value.data[1], value.data[2], value.data[3]])) else { return };
+    let profiles = format!("{control_set}\\Hardware Profiles");
+    if registry::node_by_path(&profiles).is_none() || registry::node_by_path(&format!("{profiles}\\{profile:04}")).is_none() {
+        return;
+    }
+    let link = format!("{profiles}\\Current");
+    if let Some(existing) = registry::node_by_path(&link) {
+        delete_key_recursive(existing);
+    }
+    let resolved = registry::resolve_path(&link, true).unwrap_or(link);
+    let Ok((handle, _)) = registry::create_resolved(&resolved, None, true, true) else { return };
+    if handle == 0 {
+        return;
+    }
+    let target = format!("\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Hardware Profiles\\{profile:04}");
+    registry::set_value(handle, registry::SYMBOLIC_LINK_VALUE, registry::REG_LINK, target.encode_utf16().flat_map(u16::to_le_bytes).collect());
+    registry::close_handle(handle);
+}
+
 /// O perfil do LocalSystem e o perfil padrão (o par do
 /// CmpFinishSystemHivesLoad depois da hive DEFAULT).
 const LOCAL_SYSTEM_USER: &str = "\\Registry\\User\\S-1-5-18";
@@ -169,6 +226,7 @@ pub fn initialize_hives() -> Result<(), KernelError> {
     let from_file = load_machine_hive(SYSTEM_MOUNT, SYSTEM_FILE, || seed::system_keys(smss))?;
     SYSTEM_FROM_FILE.store(from_file, Ordering::Release);
     create_control_set()?;
+    create_hardware_profiles();
     // CmGetSystemControlValues: o idioma da instalação (`Control\Nls\Language`),
     // o ObjectSecurityMode do Session Manager e o `ProductOptions\ProductPolicy`
     // (a entrada do CmControlVector que enche o buffer primário do
