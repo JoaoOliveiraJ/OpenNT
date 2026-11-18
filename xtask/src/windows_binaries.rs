@@ -35,7 +35,8 @@
 //! fecho dos imports, o XAML e os provedores de credencial), os `.mui` dos
 //! programas (no idioma de fallback quando o de interface não tem), os
 //! recursos deles em `\Windows\SystemResources`, os assemblies de WinSxS
-//! (`side_by_side`) e as fontes (`fonts`).
+//! (`side_by_side`), as fontes (`fonts`) e as pastas de dados que a tela de
+//! logon lê (os metadados WinRT e as imagens da tela de bloqueio).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -560,6 +561,10 @@ const LOGON_SCREEN_PROGRAMS: &[&str] = &[
     "credui.dll",
     "uxinit.dll",
     "UxTheme.dll",
+    // O imageres.dll que o authui.dll carrega (o bloco do usuário e os
+    // ícones da tela): um módulo só de recursos, que ficam no
+    // imageres.dll.mun de SystemResources.
+    "imageres.dll",
     // O XAML da experiência de logon: as classes WinRT Windows.UI.Xaml.*, o
     // XAMLHostWindow, o Windows.UI.dll, o Windows.Globalization.dll e o
     // modelo de dados dos provedores de credencial (CredProvDataModel.dll),
@@ -607,6 +612,15 @@ const LOGON_SCREEN_PROGRAMS: &[&str] = &[
     "dsreg.dll",
     "wkscli.dll",
 ];
+
+/// As pastas de dados que a tela de logon lê pelo caminho, inteiras: os
+/// metadados WinRT de `System32\WinMetadata` (os `.winmd` que o
+/// RoGetMetaDataFile do XAML abre para resolver os tipos) e as imagens
+/// padrão da tela de bloqueio de `\Windows\Web\Screen` (o img100.jpg e as
+/// outras que o Windows.UI.Immersive.dll lista quando o sistema não tem
+/// imagem própria em `SystemData`). (pasta no volume, pasta de origem
+/// relativa ao diretório do Windows).
+const LOGON_SCREEN_FOLDERS: &[(&str, &str)] = &[("WinMetadata", "System32/WinMetadata"), ("Web/Screen", "Web/Screen")];
 
 /// As imagens de kernel do caminho do smss (`--initial-process=smss`): o
 /// win32k.sys que o smss da sessão carrega pela classe 38, o win32kbase.sys
@@ -943,6 +957,24 @@ pub fn ntfs_files(root: &Path, kernel_pe: &[u8], initial_process: &str) -> Resul
             }
         }
         println!("fontes no volume NTFS: {faces}");
+        // As pastas de dados da tela de logon (`LOGON_SCREEN_FOLDERS`).
+        let mut data = 0;
+        for (folder, relative) in LOGON_SCREEN_FOLDERS {
+            let directory = windows.join(relative);
+            let mut names = entries(&directory);
+            names.sort();
+            for name in names {
+                let source = directory.join(&name);
+                if !source.is_file() {
+                    continue;
+                }
+                if let Ok(bytes) = fs::read(&source) {
+                    files.push((format!("{folder}/{name}"), bytes));
+                    data += 1;
+                }
+            }
+        }
+        println!("arquivos das pastas de dados da tela de logon no volume NTFS: {data}");
     }
     files.push((String::from("NTOSKRNL.EXE"), kernel_pe.to_vec()));
     files.push((String::from("Windows/System32/ntoskrnl.exe"), kernel_pe.to_vec()));
