@@ -296,16 +296,88 @@ const WNF_DELETE_ACCESS: u32 = 0x1_0000;
 /// WNF_DELIVERY_FLAG de nome destruído, entregue aos assinantes.
 const WNF_NAME_DESTROYED: u32 = 0x10;
 
-/// NtDeleteWnfStateName(StateName) de modo usuário (19041, rva 0x60d820),
-/// para os nomes temporários: o nome sondado e decodificado (o tempo de vida
+/// NtDeleteWnfStateName de um nome permanente ou persistente (19041, rva
+/// 0x60da6d..0x60dad6 e o laço 0x60d92a..0x60db18):
+/// - de modo usuário, a definição (ExpWnfLookupPermanentName, senão o status
+///   da busca) e o ExpWnfCheckCallerAccess com DELETE no descritor dela;
+/// - o ExpWnfDeletePermanentName: o ZwDeleteValueKey do valor do nome na
+///   raiz de definições do tempo de vida (uma falha é o status devolvido);
+/// - em cada instância de escopo do tipo do nome (ExpWnfEnumerateScopeInstances),
+///   a instância do nome, quando existe, recebe o aviso de nome destruído e é
+///   apagada (ExpWnfDeleteNameInstance), sem nova checagem de acesso nem de
+///   criador;
+/// - com o bit de dados permanentes do nome, o ExpWnfDeletePermanentStateData.
+/// Apagada a definição, o resultado é STATUS_SUCCESS.
+fn delete_permanent_name(decoded: u64, user: bool) -> Result<u32, KernelError> {
+    use crate::ntos::cm::key::services as key_services;
+    let lifetime = ((decoded >> 4) & 3) as u32;
+    let scope = ((decoded >> 6) & 0xF) as u32;
+    if user {
+        let definition = match namespace::lookup_definition(decoded)? {
+            Ok(definition) => definition,
+            Err(status) => return Ok(status),
+        };
+        let access = crate::ntos::ex::wnf::security::check(definition.security_descriptor, WNF_DELETE_ACCESS).unwrap_or(0xC000_0022);
+        definition.release();
+        if access & 0x8000_0000 != 0 {
+            return Ok(access);
+        }
+    }
+    let root = match definition_root(lifetime)? {
+        Ok(root) => root,
+        Err(status) => return Ok(status),
+    };
+    let deleted = key_services::named_value(key_services::Kind::DeleteValue, root, &wnf_name::value_name(decoded), 0, &[])?.0;
+    if deleted & 0x8000_0000 != 0 {
+        return Ok(deleted);
+    }
+    let mut instance = namespace::next_scope_instance(scope, 0)?;
+    while instance != 0 {
+        if let Ok(found) = namespace::lookup_name(instance, decoded)? {
+            notifications::notify_name(found.pointer, WNF_NAME_DESTROYED, true, user)?;
+            let pointer = found.pointer;
+            namespace::release_name(&found)?;
+            namespace::delete_name(pointer)?;
+        }
+        instance = namespace::next_scope_instance(scope, instance)?;
+    }
+    if decoded & PERMANENT_DATA != 0 {
+        delete_permanent_state_data(decoded)?;
+    }
+    Ok(0)
+}
+
+/// O bit de dados permanentes do nome (o PermanentData do WNF_STATE_NAME).
+const PERMANENT_DATA: u64 = 0x400;
+
+/// ExpWnfDeletePermanentStateData(NULL, StateName) (19041, rva 0x95ca84):
+/// o valor do nome sai de cada armazém de dados permanentes do escopo
+/// (ExpWnfEnumeratePermanentDataStores). Só nomes permanentes dos escopos
+/// de sistema e de máquina guardam dados na hive (o NtCreateWnfStateName
+/// recusa os demais), e esses têm um armazém só, a chave Data da raiz dos
+/// nomes permanentes.
+fn delete_permanent_state_data(decoded: u64) -> Result<(), KernelError> {
+    use crate::ntos::cm::key::services as key_services;
+    let lifetime = ((decoded >> 4) & 3) as u32;
+    let scope = ((decoded >> 6) & 0xF) as u32;
+    let slot = namespace::definition_root_slot(LIFETIME_PERMANENT)?;
+    if slot == 0 {
+        return Ok(());
+    }
+    let Ok(store) = crate::ntos::ex::wnf::registry::open_permanent_store(scope, lifetime, 0, 0, 0, slot)? else { return Ok(()) };
+    let _ = key_services::named_value(key_services::Kind::DeleteValue, store.handle, &wnf_name::value_name(decoded), 0, &[])?;
+    let _ = previous_mode::with_kernel(|| crate::ntos::ob::close::close(store.handle, Some(0)));
+    Ok(())
+}
+
+/// NtDeleteWnfStateName(StateName) de modo usuário (19041, rva 0x60d820).
+/// Para os nomes temporários: o nome sondado e decodificado (o tempo de vida
 /// WnfWellKnownStateName dá STATUS_INVALID_PARAMETER), o escopo resolvido
 /// pelo processo corrente, a instância achada (senão
 /// STATUS_OBJECT_NAME_NOT_FOUND), o ExpWnfCheckCallerAccess com DELETE, o
 /// processo criador igual ao corrente (senão STATUS_ACCESS_DENIED), o aviso
 /// de nome destruído aos assinantes e o ExpWnfDeleteNameInstance. Os nomes
-/// permanentes e persistentes (a definição no Registro, o
-/// ExpWnfDeletePermanentName) ainda não são apagados pelo OpenNT e devolvem
-/// STATUS_NOT_IMPLEMENTED.
+/// permanentes e persistentes seguem [`delete_permanent_name`].
 pub fn delete_state_name_user(state_name: u64) -> Result<u32, KernelError> {
     use crate::ntos::ps::user::state as user_state;
     critical_region::enter_critical()?;
@@ -321,11 +393,11 @@ pub fn delete_state_name_user(state_name: u64) -> Result<u32, KernelError> {
         if name.lifetime == 0 {
             return Ok(0xC000_000D);
         }
-        if name.lifetime != 3 {
-            return Ok(0xC000_0002);
-        }
         if !ensure_service()? {
             return Ok(0xC000_009A);
+        }
+        if name.lifetime != 3 {
+            return delete_permanent_name(name.decoded_name, true);
         }
         let current = process::get_current_process();
         let scope = match namespace::resolve_creator_scope(current, name.scope)? {
@@ -369,8 +441,8 @@ pub fn delete_state_name_user(state_name: u64) -> Result<u32, KernelError> {
 /// do nome igual ao System (o de todo nome criado pelo ZwCreateWnfStateName;
 /// senão STATUS_ACCESS_DENIED), o aviso de nome destruído aos assinantes
 /// (fora do contexto de quem chama) e o ExpWnfDeleteNameInstance. Os nomes
-/// permanentes e persistentes devolvem STATUS_NOT_IMPLEMENTED, como no caminho
-/// de modo usuário.
+/// permanentes e persistentes seguem [`delete_permanent_name`], sem a
+/// checagem de acesso da definição.
 pub fn delete_state_name_kernel(encoded: u64) -> Result<u32, KernelError> {
     let name = wnf_name::decode(encoded);
     if name.status != 0 {
@@ -379,14 +451,14 @@ pub fn delete_state_name_kernel(encoded: u64) -> Result<u32, KernelError> {
     if name.lifetime == 0 {
         return Ok(0xC000_000D);
     }
-    if name.lifetime != 3 {
-        return Ok(0xC000_0002);
-    }
     if !ensure_service()? {
         return Ok(0xC000_009A);
     }
     critical_region::enter_critical()?;
     let result = (|| -> Result<u32, KernelError> {
+        if name.lifetime != 3 {
+            return delete_permanent_name(name.decoded_name, false);
+        }
         let system = process::get_system_process();
         let scope = match namespace::resolve_kernel_scope(system, name.scope, 0)? {
             Ok(scope) => scope,

@@ -927,6 +927,49 @@ pub fn release_scope(pointer: u64) -> Result<(), KernelError> {
     rundown::release(scope_at(pointer).run_ref.address())
 }
 
+/// O mapa de escopos do silo (o do host com 0), sem criá-lo.
+fn existing_scope_map(silo: u64) -> Result<u64, KernelError> {
+    if silo != 0 {
+        return Ok(silo_state(silo)?.scope_map.get());
+    }
+    let host = with(|namespace| namespace.host_storage)?;
+    Ok(if host != 0 { host_at(host).scope_map.get() } else { 0 })
+}
+
+/// ExpWnfEnumerateScopeInstances(Scope, Previous) do ntoskrnl 19041 (rva
+/// 0x6a3528): a instância seguinte a `previous` (0 = a primeira) na lista do
+/// tipo de escopo, no mapa do silo de servidor corrente (o do host nos
+/// escopos de máquina e sem silo), com o rundown adquirido sob o lock
+/// compartilhado da lista; uma instância em rundown é pulada. O rundown de
+/// `previous` é solto. 0 no fim da lista ou sem mapa.
+pub fn next_scope_instance(scope: u32, previous: u64) -> Result<u64, KernelError> {
+    let silo = if scope < 4 { silo_query::current_server_silo() } else { 0 };
+    let map = existing_scope_map(silo)?;
+    let next = if map != 0 && (scope as usize) < scope_map_at(map).by_data_scope.len() {
+        let entry = &scope_map_at(map).by_data_scope[scope as usize];
+        with_lock(entry.map_entry_lock.address(), false, || {
+            let head = entry.map_entry_head.address();
+            // Uma instância anterior já fora da lista recomeça pela cabeça.
+            let after = if previous != 0 { scope_at(previous).resolver_list_entry.flink.get() } else { 0 };
+            let mut link = if after != 0 { after } else { entry.map_entry_head.flink.get() };
+            while link != head {
+                let candidate = link - offset_of!(WnfScopeInstance, resolver_list_entry) as u64;
+                if rundown::acquire(scope_at(candidate).run_ref.address())? {
+                    return Ok(candidate);
+                }
+                link = list_entry::at(link).flink.get();
+            }
+            Ok(0)
+        })?
+    } else {
+        0
+    };
+    if previous != 0 {
+        release_scope(previous)?;
+    }
+    Ok(next)
+}
+
 pub fn release_name(state: &NameState) -> Result<(), KernelError> {
     rundown::release(name_at(state.pointer).run_ref.address())
 }
