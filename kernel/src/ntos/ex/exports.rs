@@ -1828,3 +1828,29 @@ pub mod ex_firmware_table {
 
     pub static GROUP: Group = Group { name: "ex-firmware-table", names: &["ExGetSystemFirmwareTable"], handlers: &[get_system_firmware_table], data_exports: &[] };
 }
+
+pub mod ex_timer_internal {
+    //! Os ordinais 3 e 4 sem nome do ntoskrnl 19041; a lógica mora em
+    //! `ex/timer.rs`.
+
+    use crate::ntos::ex::timer;
+    use crate::ntos::init::exports::{Call, Group};
+    use crate::rtl::KernelError;
+
+    /// ExAllocateTimerInternal(Callback, CallbackContext, Attributes) -> PEX_TIMER.
+    fn allocate_timer_internal(call: &Call) -> Result<u64, KernelError> {
+        Ok(timer::allocate_internal(call.arg(1), call.arg(2), call.arg(3) as u32))
+    }
+
+    /// ExAllocateTimerInternal2(Callback, CallbackContext, IrTimerId, Attributes) -> PEX_TIMER.
+    fn allocate_timer_internal2(call: &Call) -> Result<u64, KernelError> {
+        Ok(timer::allocate_internal2(call.arg(1), call.arg(2), call.arg(3), call.arg(4) as u32))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "ex-timer-internal",
+        names: &["ExAllocateTimerInternal", "ExAllocateTimerInternal2"],
+        handlers: &[allocate_timer_internal, allocate_timer_internal2],
+        data_exports: &[],
+    };
+}

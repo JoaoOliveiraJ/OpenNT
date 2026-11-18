@@ -558,9 +558,10 @@ pub static GROUP_LAYOUT: &[(&str, usize, usize)] = &[
     ("po-power-requests", 2142, 4),
     ("po-processor-power", 2146, 2),
     ("mm-secure-memory-ex", 2148, 1),
+    ("ex-timer-internal", 2149, 2),
 ];
 
-/// Os 2149 exports de função, na ordem da ABI.
+/// Os 2151 exports de função, na ordem da ABI.
 pub static EXPORT_NAMES: &[&str] = &[
     "DbgPrint",
     "DbgPrintEx",
@@ -2711,4 +2712,6 @@ pub static EXPORT_NAMES: &[&str] = &[
     "PoNotifyMediaBuffering",
     "PoCpuIdledSinceLastCallImprecise",
     "MmSecureVirtualMemoryEx",
+    "ExAllocateTimerInternal",
+    "ExAllocateTimerInternal2",
 ];

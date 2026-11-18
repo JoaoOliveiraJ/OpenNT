@@ -369,10 +369,15 @@ fn ntoskrnl_exports(assert: Assert) {
     use crate::{ntos::init::export_names as abi_names, ntos::init::exports};
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions, ResolvedImport};
     exports::init();
-    assert(abi_names::EXPORT_NAMES.len() == 2149 && abi_names::GROUP_LAYOUT.len() == 552 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 2059 exports em 506 grupos");
+    assert(abi_names::EXPORT_NAMES.len() == 2151 && abi_names::GROUP_LAYOUT.len() == 553 && abi_names::EXPORT_NAMES[0] == "DbgPrint" && abi_names::EXPORT_NAMES[546] == "READ_PORT_UCHAR" && abi_names::EXPORT_NAMES[773] == "ZwDisplayString" && abi_names::EXPORT_NAMES[781] == "KeAcquireQueuedSpinLock", "ntoskrnl: ordem da ABI com 2059 exports em 506 grupos");
     // Ordinais públicos: os slots de função seguidos dos dados sem nome repetido.
     let public_count = abi_names::EXPORT_NAMES.len() + crate::ntos::mm::kernel_data_layout::DEFINITIONS.iter().filter(|entry| !abi_names::EXPORT_NAMES.contains(&entry.name)).count();
     assert(matches!(exports::lookup_ordinal("ntoskrnl.exe", 547), Some(ResolvedImport::Thunk(578))) && exports::lookup("ntoskrnl.exe", "LdrResSearchResource").is_some() && exports::lookup("ntoskrnl.exe", "NaoExisteNoKernel").is_none() && exports::lookup_ordinal("ntoskrnl.exe", 0).is_none() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32).is_some() && exports::lookup_ordinal("ntoskrnl.exe", public_count as u32 + 1).is_none(), "ntoskrnl: ordinais, todos os exports com provedor e nome desconhecido");
+    // Os ordinais sem nome do 19041 vão pelo nome da função: o 3 e o 4 são os
+    // ExAllocateTimerInternal[2] (o acpi.sys importa o 4).
+    let thunk_of = |name: &str| abi_names::EXPORT_NAMES.iter().position(|&candidate| candidate == name).map(|index| 32 + index as u32);
+    let by_ordinal = |ordinal: u32, name: &str| matches!((exports::lookup_ordinal("ntoskrnl.exe", ordinal), thunk_of(name)), (Some(ResolvedImport::Thunk(id)), Some(expected)) if id == expected);
+    assert(by_ordinal(3, "ExAllocateTimerInternal") && by_ordinal(4, "ExAllocateTimerInternal2"), "ntoskrnl: ordinais 3 e 4 sem nome do 19041 sao os ExAllocateTimerInternal e ExAllocateTimerInternal2");
     let options = LoadOptions { image_name: Some(String::from("opennt-ntoskrnl-test.sys")), ..Default::default() };
     let loaded = loader::load(ntoskrnl_importer(b"PsGetThreadId\0"), &options);
     let Ok(mut image) = loaded else {
@@ -2186,7 +2191,7 @@ fn ntoskrnl_mm_group(assert: Assert) {
     use crate::ntos::mm::{image_paging, paging};
     use crate::ntos::init::exports;
     use crate::ntos::mm::pe_loader::{self as loader, LoadOptions};
-    assert(exports::implemented() == 2149 && exports::export_names().len() == 2149, "ntoskrnl: 552 grupos com os 2149 exports implementados");
+    assert(exports::implemented() == 2151 && exports::export_names().len() == 2151, "ntoskrnl: 553 grupos com os 2151 exports implementados");
     let block = guest::alloc_bytes(0x200);
     // MmGetSystemRoutineAddress: trampolim chamável e nome desconhecido.
     let name: alloc::vec::Vec<u16> = "KeGetCurrentIrql".encode_utf16().collect();

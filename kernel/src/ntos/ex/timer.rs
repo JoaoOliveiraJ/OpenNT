@@ -9,8 +9,10 @@
 //! DeleteContext do EXT_DELETE_PARAMETERS, codificados como os ponteiros do
 //! KTIMER2, e o byte do ExpTimerFreedCookie.
 //!
-//! - ExAllocateTimer(Callback, CallbackContext, Attributes) (o
-//!   ExAllocateTimerInternal2 sem identificador IR): EX_TIMER_IDLE_RESILIENT
+//! - ExAllocateTimer, ExAllocateTimerInternal e ExAllocateTimerInternal2 (os
+//!   ordinais 3 e 4 sem nome; o acpi.sys importa o 4) seguem um caminho só.
+//!   ExAllocateTimer(Callback, CallbackContext, Attributes) é o
+//!   ExAllocateTimerInternal2 sem identificador IR: EX_TIMER_IDLE_RESILIENT
 //!   (2), um atributo fora de EX_TIMER_HIGH_RESOLUTION (4), EX_TIMER_NO_WAKE
 //!   (8) e EX_TIMER_NOTIFICATION (bit 31), ou NO_WAKE junto de outro tipo,
 //!   são o bugcheck 0xC7 (9, 0, Attributes). Sem memória, NULL. O KTIMER2 é
@@ -95,10 +97,42 @@ fn check_not_freed(timer_pointer: u64) {
     }
 }
 
-/// ExAllocateTimer(Callback, CallbackContext, Attributes): 0 quando falta
-/// memória.
+/// ExAllocateTimerInternal2(Callback, CallbackContext, IrTimerId,
+/// Attributes) (ntoskrnl 19041 0x349450, o ordinal 4 sem nome; o
+/// AMLIInitialize do acpi.sys pede {9, 0} com IR | HIGH_RESOLUTION):
+/// atributos inválidos, ou IR (2) sem identificador ou identificador sem IR,
+/// são o bugcheck 0xC7 (9, 0, Attributes); sem memória, 0. Com IR, o
+/// KeInitializeIRTimer com o par de USHORT {Index, Sub} lido do ponteiro
+/// (de modo kernel, sem sonda, como no original); sem IR, o
+/// KiInitializeTimer2.
+pub fn allocate_internal2(callback: u64, context: u64, ir_timer_id: u64, attributes: u32) -> u64 {
+    let identifier = (ir_timer_id != 0).then(|| {
+        // SAFETY: o USHORT[2] {Index, Sub} do chamador de modo kernel.
+        unsafe { (Field::<u16>::at(ir_timer_id).get(), Field::<u16>::at(ir_timer_id + 2).get()) }
+    });
+    allocate_with_identifier(callback, context, identifier, attributes)
+}
+
+/// ExAllocateTimerInternal(Callback, CallbackContext, Attributes) (0x5b5f80,
+/// o ordinal 3 sem nome): com IR, o identificador {1, 0} (TestIdentifier).
+pub fn allocate_internal(callback: u64, context: u64, attributes: u32) -> u64 {
+    let identifier = (attributes & ATTRIBUTE_IDLE_RESILIENT != 0).then_some((1, 0));
+    allocate_with_identifier(callback, context, identifier, attributes)
+}
+
+/// ExAllocateTimer(Callback, CallbackContext, Attributes) (0x349420): IR é o
+/// bugcheck 0xC7 (9, 0, Attributes) (0x484270); senão o Internal2 sem
+/// identificador. 0 quando falta memória.
 pub fn allocate(callback: u64, context: u64, attributes: u32) -> u64 {
-    if attributes & ATTRIBUTE_IDLE_RESILIENT != 0 || !ir_timer::attributes_are_valid(attributes) {
+    if attributes & ATTRIBUTE_IDLE_RESILIENT != 0 {
+        bugcheck::bug_check_ex(TIMER_OR_DPC_INVALID, EX_TIMER_CHECK, 0, attributes as u64, 0);
+    }
+    allocate_with_identifier(callback, context, None, attributes)
+}
+
+/// O corpo do ExAllocateTimerInternal2 depois da leitura do identificador.
+fn allocate_with_identifier(callback: u64, context: u64, identifier: Option<(u16, u16)>, attributes: u32) -> u64 {
+    if !ir_timer::attributes_are_valid(attributes) || (attributes & ATTRIBUTE_IDLE_RESILIENT != 0) != identifier.is_some() {
         bugcheck::bug_check_ex(TIMER_OR_DPC_INVALID, EX_TIMER_CHECK, 0, attributes as u64, 0);
     }
     let Ok(timer_pointer) = pool_allocation::allocate_tagged(NON_PAGED_POOL_NX, ExTimer::SIZE, POOL_TAG) else { return 0 };
@@ -106,7 +140,10 @@ pub fn allocate(callback: u64, context: u64, attributes: u32) -> u64 {
         return 0;
     }
     let body = ex_timer(timer_pointer);
-    timer2::initialize(&body.ke_timer, callback, context, attributes);
+    match identifier {
+        Some((index, sub)) => ir_timer::initialize_ir_timer(&body.ke_timer, callback, context, index, sub, attributes),
+        None => timer2::initialize(&body.ke_timer, callback, context, attributes),
+    }
     body.delete_callback.set(timer2::encode(0, timer_pointer));
     body.delete_context.set(timer2::encode(0, timer_pointer));
     body.freed_cookie.set(freed_cookie());

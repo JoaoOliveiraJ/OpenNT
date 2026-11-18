@@ -187,6 +187,21 @@ pub fn attributes_are_valid(attributes: u32) -> bool {
     attributes & !VALID_ATTRIBUTES == 0 && !(attributes & ATTRIBUTE_NO_WAKE != 0 && attributes & 0x6 != 0)
 }
 
+/// KeInitializeIRTimer(Timer, Callback, CallbackContext, IrTimerId*,
+/// Attributes) (ntoskrnl 19041 0x380d20): o KiInitializeTimer2 com o
+/// atributo IR ligado, o byte baixo do índice e o do sub nos bytes 2 e 3 do
+/// Header (Timer2ComponentId e Timer2RelativeId) e o ExCheckValidIRTimerId
+/// (0x380d74: índice abaixo de 16 e sub abaixo do máximo do
+/// ExpIRTimerDescs), senão FAST_FAIL_INVALID_ARG (int 0x29, 0x4907be).
+pub fn initialize_ir_timer(timer: &Ktimer2, callback: u64, context: u64, index: u16, sub: u16, attributes: u32) {
+    timer2::initialize(timer, callback, context, attributes | ATTRIBUTE_IR);
+    let (index, sub) = (index as u8, sub as u8);
+    timer.header.lock.atomic().fetch_or(((sub as i32) << 24) | ((index as i32) << 16), core::sync::atomic::Ordering::SeqCst);
+    if DESCRIPTORS.get(index as usize).is_none_or(|descriptor| sub as u16 >= descriptor.maximum) {
+        crate::ntos::ke::bugcheck::bug_check_ex(0x139, FAST_FAIL_INVALID_ARG, 0, 0, 0);
+    }
+}
+
 /// O último ponteiro solto: o KTIMER2 sai da fila antes de o corpo voltar.
 fn dispose(pointer: u64) {
     timer2::cancel(&body(pointer).ke_timer);
@@ -228,17 +243,12 @@ pub fn create_from_user(handle_out: u64, reserved: u64, object_attributes: u64, 
     }
     guest::write_bytes(pointer, &[0u8; IrTimer::SIZE as usize]);
     let timer = body(pointer);
-    timer2::initialize(&timer.ke_timer, 0, 0, attributes);
+    // O identificador do NtCreateTimer2 é o ULONG `índice | sub << 16`: as
+    // duas metades USHORT são o par {Index, Sub} do KeInitializeIRTimer.
     if ir {
-        // KeInitializeIRTimer (rva 0x380d20): o byte baixo do índice e o do
-        // sub nos bytes 2 e 3 do Header (Timer2ComponentId e
-        // Timer2RelativeId); o ExCheckValidIRTimerId exige o sub abaixo do
-        // máximo, senão FAST_FAIL_INVALID_ARG.
-        let (index, sub) = (identifier as u8, (identifier >> 16) as u8);
-        timer.ke_timer.header.lock.atomic().fetch_or(((sub as i32) << 24) | ((index as i32) << 16), core::sync::atomic::Ordering::SeqCst);
-        if DESCRIPTORS.get(index as usize).is_none_or(|descriptor| sub as u16 >= descriptor.maximum) {
-            crate::ntos::ke::bugcheck::bug_check_ex(0x139, FAST_FAIL_INVALID_ARG, 0, 0, 0);
-        }
+        initialize_ir_timer(&timer.ke_timer, 0, 0, identifier as u16, (identifier >> 16) as u16, attributes);
+    } else {
+        timer2::initialize(&timer.ke_timer, 0, 0, attributes);
     }
     timer.attributes.set(attributes);
     if let Err(error) = dispatcher_objects::create(pointer, KIND, dispose, None, 0, true, DispatcherHooks::default()) {

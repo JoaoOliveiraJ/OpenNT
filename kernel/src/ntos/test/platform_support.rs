@@ -137,6 +137,44 @@ fn timer2_exports(assert: Assert) {
 /// do ExSetTimer em 100 ns (o vsync emulado do dxgkrnl: um EX_TIMER sem
 /// callback em que a fila de blits espera), e o ExDeleteTimer pelo
 /// KeDisableTimer2 com o DeleteCallback.
+/// ExAllocateTimerInternal2 (ordinal 4 sem nome do 19041; o AMLIInitialize
+/// do acpi.sys pede {9, 0} = "Acpi" com IR | HIGH_RESOLUTION) e
+/// ExAllocateTimerInternal (ordinal 3: IR com {1, 0}).
+fn ex_timer_internal_exports(assert: Assert) {
+    let identifier = guest::alloc_bytes(0x10);
+    guest::write32(identifier, 9); // USHORT Index 9, USHORT Sub 0
+    let callback = timer2_fired as extern "win64" fn(u64, u64) as usize as u64;
+    let context = 0x0BAD_F00D_1234_5678u64;
+    let acpi = call_export("ExAllocateTimerInternal2", &[callback, context, identifier, 6]).unwrap_or(0);
+    let plain = call_export("ExAllocateTimerInternal2", &[0, 0, 0, 0]).unwrap_or(0);
+    let test_id = call_export("ExAllocateTimerInternal", &[0, 0, 2]).unwrap_or(0);
+    let reference = call_export("ExAllocateTimer", &[0, 0, 0]).unwrap_or(0);
+    if acpi == 0 || plain == 0 || test_id == 0 || reference == 0 {
+        assert(false, "ex: ExAllocateTimerInternal[2] devolve o EX_TIMER");
+        return;
+    }
+    // Header.Type, Header bytes 2/3 (índice e sub IR), TypeFlags, CollectionIndex[0..2].
+    let shape = |t: u64| (guest::read8(t), guest::read8(t + 2), guest::read8(t + 3), guest::read8(t + 0x81), guest::read8(t + 0x82), guest::read8(t + 0x83));
+    // SAFETY: o KTIMER2 no começo do EX_TIMER recém-alocado.
+    let decoded = timer2::decoded_callback(unsafe { Ktimer2::at(acpi) });
+    let deletes = timer2::decode(guest::read64(acpi + 0x88), acpi) == 0 && timer2::decode(guest::read64(acpi + 0x90), acpi) == 0;
+    let cookie = guest::read8(acpi + 0x98) == guest::read8(reference + 0x98);
+    assert(
+        shape(acpi) == (0x19, 9, 0, 6, 1, 36) && shape(plain) == (0x19, 0, 0, 0, 21, 3) && shape(test_id) == (0x19, 1, 0, 2, 32, 36) && decoded == (callback, context) && deletes && cookie,
+        "ex: ExAllocateTimerInternal2 com {9, 0} e IR|HIGH_RESOLUTION grava o indice e o sub no Header (KeInitializeIRTimer); sem identificador e o ExAllocateTimer; o Internal usa {1, 0}",
+    );
+    // O SleepQueueRequest do acpi.sys: ExSetTimer relativo sem período; o
+    // callback vem com (Timer, Context).
+    TIMER_CALLS.store(0, Ordering::SeqCst);
+    let set = call_export("ExSetTimer", &[acpi, (-10_000i64) as u64, 0, 0]);
+    let fired = pump_until(|| TIMER_CALLS.load(Ordering::SeqCst) >= 1) && TIMER_ARGUMENTS.load(Ordering::SeqCst) == acpi ^ context;
+    assert(set == Some(0) && fired, "ex: o EX_TIMER IR do ExAllocateTimerInternal2 vence e chama o PEXT_CALLBACK com (Timer, Context)");
+    for timer in [acpi, plain, test_id, reference] {
+        let _ = call_export("ExDeleteTimer", &[timer, 1, 1, 0]);
+    }
+    guest::free_bytes(identifier);
+}
+
 fn ex_timer_exports(assert: Assert) {
     let block = guest::alloc_bytes(0x100);
     let (parameters, timeout) = (block, block + 0x40);
@@ -488,6 +526,7 @@ fn stalled_worker(assert: Assert) {
 pub fn run(assert: Assert) {
     timer2_exports(assert);
     ex_timer_exports(assert);
+    ex_timer_internal_exports(assert);
     processor_exports(assert);
     kd_exports(assert);
     errata_exports(assert);
