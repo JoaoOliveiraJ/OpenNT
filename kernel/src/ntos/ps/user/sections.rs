@@ -3,9 +3,10 @@
 //! Seções de dados são donas de seus PFNs. Handles e vistas mantêm o objeto
 //! vivo de forma independente; toda vista é alias das mesmas páginas
 //! confirmadas da control area. Seções de arquivo compartilham a control
-//! area pela identidade do arquivo, guardam a cópia original de cada página
-//! lida e só gravam de volta as diferenças. Vistas copy-on-write recebem
-//! páginas privadas pela falta de escrita.
+//! area pela identidade do arquivo; com alguma seção gravável do arquivo, a
+//! control area guarda a cópia original de cada página lida e só grava de
+//! volta as diferenças (sem seção gravável, nenhuma cópia). Vistas
+//! copy-on-write recebem páginas privadas pela falta de escrita.
 //!
 //! Raiz: cada vista guarda a raiz em que está mapeada (`View::root`, a do
 //! processo dono ou a do System no espaço de sistema). Confirmar páginas
@@ -114,11 +115,18 @@ pub struct Area {
     /// Páginas de commit do sistema cobradas pelas páginas confirmadas de
     /// uma seção de pagefile, devolvidas com a control area.
     pub commit_charge: u64,
+    /// Alguma seção do arquivo admite escrita (PAGE_READWRITE ou
+    /// PAGE_EXECUTE_READWRITE): só então as páginas lidas guardam a cópia
+    /// original do writeback. Sem seção gravável nenhuma vista escreve nos
+    /// frames compartilhados (o NtMapViewOfSection e o NtProtectVirtualMemory
+    /// exigem proteção compatível com a da seção, e as vistas copy-on-write
+    /// escrevem em frames privados), então o flush não tem o que gravar.
+    pub writeback: bool,
 }
 
 impl Area {
     pub fn new(identity: Option<String>, cache: u32) -> Self {
-        Self { frames: BTreeMap::new(), original: BTreeMap::new(), references: 0, views: Vec::new(), identity, cache, image_layout: Vec::new(), image_key: None, system_paging: None, commit_charge: 0 }
+        Self { frames: BTreeMap::new(), original: BTreeMap::new(), references: 0, views: Vec::new(), identity, cache, image_layout: Vec::new(), image_key: None, system_paging: None, commit_charge: 0, writeback: false }
     }
 }
 
@@ -403,6 +411,30 @@ fn capture_original_file_page(area: &AreaRef, page_index: u64, source_frame: u64
     Ok(())
 }
 
+/// A primeira seção gravável de um arquivo liga o writeback da control
+/// area. As páginas já lidas por seções só de leitura ainda são os bytes do
+/// arquivo (nenhuma vista podia escrever nelas) e recebem a cópia original
+/// agora, até o fim do arquivo, como a leitura daria. Sem frames para as
+/// cópias o writeback fica desligado (`false`); as cópias já feitas voltam
+/// com a control area.
+fn enable_writeback(area: &AreaRef, file_size: u64) -> bool {
+    let pages: Vec<(u64, u64)> = {
+        let mut owner = area.lock();
+        if owner.writeback {
+            return true;
+        }
+        owner.writeback = true;
+        owner.frames.iter().filter(|&(&page, _)| page * PAGE < file_size && !owner.original.contains_key(&page)).map(|(&page, &frame)| (page, frame)).collect()
+    };
+    for (page, frame) in pages {
+        if capture_original_file_page(area, page, frame).is_err() {
+            area.lock().writeback = false;
+            return false;
+        }
+    }
+    true
+}
+
 /// A cópia pertence à control area; rollback e destruição devolvem o
 /// frame exatamente uma vez.
 fn release_original_file_page(area: &AreaRef, page_index: u64) -> Result<(), KernelError> {
@@ -507,8 +539,10 @@ pub fn commit(section: &Arc<Section>, first: u64, count: u64) -> Result<u32, Ker
                             }
                             physical::write_bytes(frame, &data);
                         }
-                        for offset in 0..length.div_ceil(PAGE) {
-                            capture_original_file_page(&area, page + offset, frame + offset * PAGE)?;
+                        if area.lock().writeback {
+                            for offset in 0..length.div_ceil(PAGE) {
+                                capture_original_file_page(&area, page + offset, frame + offset * PAGE)?;
+                            }
                         }
                     }
                     index += span as usize;
@@ -748,7 +782,14 @@ pub fn create(options: CreateOptions) -> Result<Created, KernelError> {
     if let Some(identity) = &identity {
         FILE_AREAS.lock().insert(identity.clone(), area.clone());
     }
-    let section = new_section(rounded, size, page_protect, attributes, name.clone(), file, false, false, large, permanent, Some(area));
+    let writeback = file.as_ref().filter(|_| writable(page_protect)).map(|file| file.size());
+    let section = new_section(rounded, size, page_protect, attributes, name.clone(), file, false, false, large, permanent, Some(area.clone()));
+    if let Some(file_size) = writeback {
+        if !enable_writeback(&area, file_size) {
+            destroy_section(&section)?;
+            return Ok(Err(0xC000_0017));
+        }
+    }
     let committed = committed.unwrap_or(attributes & 0x0800_0000 != 0);
     let status = if committed { commit(&section, 0, section.count_pages())? } else { 0 };
     if status != 0 {

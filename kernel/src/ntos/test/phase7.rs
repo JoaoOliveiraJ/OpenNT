@@ -407,6 +407,28 @@ fn file_and_named_sections(assert: Assert) {
         // Sem vistas nem handles: a coleta direta libera a control area.
         assert(crate::ntos::ob::objects::section::collect(other.pointer()).is_ok() && sections::by_pointer(other.pointer()).is_none(), "sections: segunda secao do arquivo coletada");
     }
+    // Seção só de leitura: as páginas lidas não guardam cópia original; a
+    // primeira seção gravável do mesmo arquivo liga o writeback com a cópia
+    // das páginas já lidas, e o flush grava só a diferença.
+    let mut read_only_contents = alloc::vec![0x52u8; 0x2000];
+    read_only_contents[..6].copy_from_slice(b"OpenNT");
+    let read_only_file = MemoryFile::new(Some("opennt-secao-leitura"), read_only_contents);
+    let read_only_shared: Arc<dyn sections::SectionFile> = read_only_file.clone();
+    let originals = |section: &Arc<sections::Section>| section.control_area().map_or(usize::MAX, |area| area.lock().original.len());
+    let Ok(Ok(reader)) = sections::create(CreateOptions { size: 0x2000, page_protect: 2, attributes: 0x0800_0000, file: Some(read_only_shared.clone()), ..CreateOptions::default() }) else {
+        assert(false, "sections: secao so de leitura do arquivo");
+        return;
+    };
+    assert(reader.frames().len() == 2 && originals(&reader) == 0 && sections::flush(&reader).is_ok() && read_only_file.writes.lock().is_empty(), "sections: secao so de leitura do arquivo sem copia original");
+    let Ok(Ok(writer)) = sections::create(CreateOptions { size: 0x2000, page_protect: 4, file: Some(read_only_shared), committed: Some(false), ..CreateOptions::default() }) else {
+        assert(false, "sections: secao gravavel do mesmo arquivo");
+        return;
+    };
+    physical::write_bytes(writer.frame(1).unwrap_or(0) + 0x20, b"ab");
+    assert(writer.frame(1) == reader.frame(1) && originals(&writer) == 2 && sections::flush(&writer).is_ok() && *read_only_file.writes.lock() == [(0x1020u64, 2usize)] && &read_only_file.bytes.lock()[0x1020..0x1022] == b"ab", "sections: a secao gravavel liga o writeback com a copia das paginas ja lidas");
+    for section in [reader, writer] {
+        assert(crate::ntos::ob::objects::section::collect(section.pointer()).is_ok() && sections::by_pointer(section.pointer()).is_none(), "sections: secoes do arquivo so de leitura coletadas");
+    }
 }
 
 fn image_sections(assert: Assert) {
