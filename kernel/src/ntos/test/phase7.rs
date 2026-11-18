@@ -3141,6 +3141,190 @@ fn user_create_token(assert: Assert) {
     assert(ran.is_some(), "usercreatetoken: processo de teste");
 }
 
+/// O token da conta virtual "Window Manager\DWM-1", como o
+/// LsapCreateTokenObject do lsasrv o pede ao NtCreateTokenEx (o usuário
+/// S-1-5-90-0-1, o grupo Window Manager Group S-1-5-90-0 vindo do
+/// LogonUserExExW do dwminit, o rótulo Medium com SE_GROUP_INTEGRITY |
+/// SE_GROUP_INTEGRITY_ENABLED) e como o LSA e o winlogon o usam depois:
+/// a sessão do cliente pelo TokenSessionId, o rótulo System e o
+/// CreateRestrictedToken. Os valores esperados são os do SepCreateTokenEx,
+/// do SeSetSessionIdToken, do SepFilterToken, do SepDuplicateToken e do
+/// SeSubProcessToken do ntoskrnl 19041.
+fn user_virtual_account_token(assert: Assert) {
+    use crate::ntos::ps::user::memory;
+    use crate::ntos::se::logon_session;
+    use crate::ntos::se::token::{handles::UserToken, tokens as token_records};
+    let ran = with_test_process("lsa-dwm.exe", None, |_| {
+        let Ok(block) = memory::map_user_region(0x3000) else {
+            assert(false, "virtualaccount: memoria de usuario");
+            return;
+        };
+        let (out, returned, buffer, data, rsp) = (block, block + 0x10, block + 0x100, block + 0x800, block + 0x2000);
+        let call = |name: &str, a1: u64, a2: u64, a3: u64, a4: u64| state::handler(name).map(|handler| handler(a1, a2, a3, a4, rsp).unwrap_or(1)).unwrap_or(1);
+        let logon = token_records::allocate_luid();
+        let session = logon_session::create_track(logon);
+        // SIDs: DWM-1, Everyone, Window Manager Group, Authenticated Users
+        // (deny-only), os rótulos Medium e acima de System.
+        let (user, everyone, window_manager, authenticated, medium, beyond_system) = (data, data + 0x20, data + 0x40, data + 0x60, data + 0x80, data + 0xA0);
+        guest::write_bytes(user, &[1, 3, 0, 0, 0, 0, 0, 5, 90, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0]);
+        guest::write_bytes(everyone, &[1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0]);
+        guest::write_bytes(window_manager, &[1, 2, 0, 0, 0, 0, 0, 5, 90, 0, 0, 0, 0, 0, 0, 0]);
+        guest::write_bytes(authenticated, &[1, 1, 0, 0, 0, 0, 0, 5, 11, 0, 0, 0]);
+        guest::write_bytes(medium, &[1, 1, 0, 0, 0, 0, 0, 16, 0, 0x20, 0, 0]);
+        guest::write_bytes(beyond_system, &[1, 1, 0, 0, 0, 0, 0, 16, 0, 0x50, 0, 0]);
+        let (luid, expiration, token_user, primary, source, policy) = (data + 0x100, data + 0x108, data + 0x110, data + 0x120, data + 0x130, data + 0x140);
+        guest::write64(luid, logon);
+        guest::write64(expiration, i64::MAX as u64);
+        guest::write64(token_user, user);
+        guest::write32(token_user + 8, 0);
+        guest::write64(primary, user);
+        guest::write_bytes(source, b"Advapi  ");
+        guest::write64(source + 8, 0);
+        let (groups, privileges) = (data + 0x200, data + 0x400);
+        let write_groups = |entries: &[(u64, u32)]| {
+            guest::write32(groups, entries.len() as u32);
+            for (index, &(sid, attributes)) in entries.iter().enumerate() {
+                guest::write64(groups + 8 + index as u64 * 16, sid);
+                guest::write32(groups + 16 + index as u64 * 16, attributes);
+            }
+        };
+        let write_privileges = |entries: &[(u64, u32)]| {
+            guest::write32(privileges, entries.len() as u32);
+            for (index, &(id, attributes)) in entries.iter().enumerate() {
+                guest::write64(privileges + 4 + index as u64 * 12, id);
+                guest::write32(privileges + 12 + index as u64 * 12, attributes);
+            }
+        };
+        let create = |mandatory_policy: u64| {
+            for (index, value) in [luid, expiration, token_user, groups, privileges, 0, 0, 0, mandatory_policy, 0, primary, 0, source].into_iter().enumerate() {
+                guest::write64(rsp + 0x28 + index as u64 * 8, value);
+            }
+            call("NtCreateTokenEx", out, 0xF_01FF, 0, 1)
+        };
+        // SeCreateTokenPrivilege habilitado no token do processo de teste.
+        let _ = call("NtOpenProcessToken", u64::MAX, 0x1A8, out + 8, 0);
+        let own = guest::read64(out + 8);
+        guest::write32(buffer, 1);
+        guest::write64(buffer + 4, 2);
+        guest::write32(buffer + 12, 2);
+        guest::write64(rsp + 0x28, 0);
+        guest::write64(rsp + 0x30, 0);
+        let _ = call("NtAdjustPrivilegesToken", own, 0, buffer, 16);
+        // Everyone repetido e o próprio usuário como grupo saem (a última
+        // entrada ocupa o lugar); o rótulo Medium fica de fora dos grupos.
+        let medium_groups = [(everyone, 1), (window_manager, 7), (everyone, 7), (user, 7), (authenticated, 0x10), (medium, 0x60)];
+        let dwm_privileges = [(23, 3), (20, 3), (34, 0), (14, 0), (33, 0)];
+        write_groups(&medium_groups);
+        write_privileges(&dwm_privileges);
+        let created = create(0) == 0;
+        let token = guest::read64(out);
+        let pointer = state::get_user_handle(token).and_then(|entry| entry.downcast::<UserToken>().map(|object| object.token)).unwrap_or(0);
+        let query_handle = |handle: u64, class: u64, length: u64| {
+            guest::write64(rsp + 0x28, returned);
+            call("NtQueryInformationToken", handle, class, buffer, length)
+        };
+        let group_attributes = |handle: u64| -> alloc::vec::Vec<u32> {
+            if query_handle(handle, 2, 0x200) != 0 {
+                return alloc::vec::Vec::new();
+            }
+            (0..guest::read32(buffer) as u64).map(|index| guest::read32(buffer + 16 + index * 16)).collect()
+        };
+        let privilege_list = |handle: u64| -> alloc::vec::Vec<(u64, u32)> {
+            if query_handle(handle, 3, 0x100) != 0 {
+                return alloc::vec::Vec::new();
+            }
+            (0..guest::read32(buffer) as u64).map(|index| (guest::read64(buffer + 4 + index * 12), guest::read32(buffer + 12 + index * 12))).collect()
+        };
+        let label = |handle: u64| if query_handle(handle, 25, 0x100) == 0 { guest::read_bytes(guest::read64(buffer), 12) } else { alloc::vec::Vec::new() };
+        let window_manager_kept = query_handle(token, 2, 0x200) == 0 && guest::read_bytes(guest::read64(buffer + 24), 16) == guest::read_bytes(window_manager, 16);
+        let groups_ok = group_attributes(token) == [7, 7, 0x10] && window_manager_kept;
+        let label_ok = label(token) == guest::read_bytes(medium, 12);
+        let flags_ok = token_records::token_flags(pointer) == 0x2800;
+        let privileges_ok = privilege_list(token) == [(14, 0), (20, 0), (23, 3), (33, 0), (34, 0)];
+        let policy_ok = query_handle(token, 27, 4) == 0 && guest::read32(buffer) == 0;
+        assert(created && pointer != 0 && groups_ok && label_ok && flags_ok && privileges_ok && policy_ok, "virtualaccount: NtCreateTokenEx tira duplicatas, guarda o rotulo Medium a parte, liga TOKEN_NOT_LOW e TOKEN_IS_FILTERED e desliga os privilegios fora da mascara do LUA");
+        // TokenSessionId, como o LsapAuApiDispatchLogonUser com a sessão do
+        // winlogon: com o SeTcbPrivilege, sem ModifiedId novo; no token
+        // primário de um processo vivo, STATUS_TOKEN_ALREADY_IN_USE.
+        let modified_id = |handle: u64| if query_handle(handle, 10, 56) == 0 { guest::read64(buffer + 48) } else { 0 };
+        let before = modified_id(token);
+        guest::write32(data + 0x150, 1);
+        let session_set = call("NtSetInformationToken", token, 12, data + 0x150, 4) == 0 && query_handle(token, 12, 4) == 0 && guest::read32(buffer) == 1 && modified_id(token) == before;
+        let in_use = call("NtSetInformationToken", own, 12, data + 0x150, 4) == 0xC000_012B;
+        assert(session_set && in_use, "virtualaccount: TokenSessionId grava a sessao do cliente sem ModifiedId novo e recusa o token de um processo vivo");
+        // O dwminit sobe o rótulo a System e tira nove privilégios pelo
+        // CreateRestrictedToken; o token filtrado conserva a sessão e o
+        // TokenFlags (com TOKEN_IS_FILTERED).
+        let (mandatory, system_label) = (data + 0x160, data + 0x170);
+        guest::write_bytes(system_label, &[1, 1, 0, 0, 0, 0, 0, 16, 0, 0x40, 0, 0]);
+        guest::write64(mandatory, system_label);
+        guest::write32(mandatory + 8, 0x20);
+        let raised = call("NtSetInformationToken", token, 25, mandatory, 16) == 0 && label(token) == guest::read_bytes(system_label, 12);
+        let delete = data + 0x600;
+        let dwm_deleted = [3u64, 5, 0xC, 0x13, 0x1D, 0x22, 0x15, 0x19, 0x24];
+        guest::write32(delete, dwm_deleted.len() as u32);
+        for (index, &id) in dwm_deleted.iter().enumerate() {
+            guest::write64(delete + 4 + index as u64 * 12, id);
+            guest::write32(delete + 12 + index as u64 * 12, 0);
+        }
+        guest::write64(rsp + 0x28, 0);
+        guest::write64(rsp + 0x30, out + 16);
+        let filtered = call("NtFilterToken", token, 0, 0, delete) == 0;
+        let restricted = guest::read64(out + 16);
+        let restricted_pointer = state::get_user_handle(restricted).and_then(|entry| entry.downcast::<UserToken>().map(|object| object.token)).unwrap_or(0);
+        let restricted_ok = privilege_list(restricted) == [(14, 0), (20, 0), (23, 3), (33, 0)] && query_handle(restricted, 12, 4) == 0 && guest::read32(buffer) == 1 && token_records::token_flags(restricted_pointer) == 0x2800 && label(restricted) == guest::read_bytes(system_label, 12);
+        assert(raised && filtered && restricted_ok, "virtualaccount: rotulo System e CreateRestrictedToken conservam sessao, rotulo e TokenFlags e tiram os privilegios pedidos");
+        // SepDuplicateToken leva o TokenFlags sem VIRTUALIZE_ENABLED nem
+        // SESSION_NOT_REFERENCED; o SeSubProcessToken põe a sessão do
+        // processo e tira TOKEN_AUDIT_NO_CHILD_PROCESS.
+        token_records::body(restricted_pointer).token_flags.atomic().fetch_or(0x20_0420, core::sync::atomic::Ordering::SeqCst);
+        let duplicate = token_records::duplicate(restricted_pointer, 2, false, 2).ok();
+        let duplicate_ok = duplicate.is_some_and(|copy| token_records::token_flags(copy) == 0x20_2800 && token_records::with(copy, |record| record.session_id) == Some(1));
+        let sub_process = token_records::sub_process_token(restricted_pointer, 3).ok();
+        let sub_process_ok = sub_process.is_some_and(|copy| token_records::token_flags(copy) == 0x2800 && token_records::with(copy, |record| (record.session_id, record.kind)) == Some((3, 1)));
+        for copy in [duplicate, sub_process].into_iter().flatten() {
+            let _ = token_records::release(copy);
+        }
+        assert(duplicate_ok && sub_process_ok, "virtualaccount: copias levam o TokenFlags e o token de processo novo fica na sessao do processo");
+        let _ = call("NtClose", restricted, 0, 0, 0);
+        let _ = call("NtClose", token, 0, 0, 0);
+        // Sem rótulo: Untrusted (S-1-16-0) e sem TOKEN_NOT_LOW, com a
+        // máscara do LUA nos privilégios.
+        write_groups(&[(everyone, 7)]);
+        let unlabeled = create(0) == 0;
+        let token = guest::read64(out);
+        let pointer = state::get_user_handle(token).and_then(|entry| entry.downcast::<UserToken>().map(|object| object.token)).unwrap_or(0);
+        let unlabeled_ok = unlabeled && label(token) == [1, 1, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0] && token_records::token_flags(pointer) == 0 && privilege_list(token) == [(14, 0), (20, 0), (23, 3), (33, 0), (34, 0)];
+        let _ = call("NtClose", token, 0, 0, 0);
+        assert(unlabeled_ok, "virtualaccount: token sem rotulo vale Untrusted e fica sem TOKEN_NOT_LOW");
+        // Recusas do SepCreateTokenEx.
+        let with = |entries: &[(u64, u32)], privilege_entries: &[(u64, u32)], mandatory_policy: u64| {
+            write_groups(entries);
+            write_privileges(privilege_entries);
+            let status = create(mandatory_policy);
+            if status == 0 {
+                let _ = call("NtClose", guest::read64(out), 0, 0, 0);
+            }
+            status
+        };
+        guest::write32(policy, 4);
+        let second_label = with(&[(medium, 0x60), (medium, 0x60)], &dwm_privileges, 0) == 0xC000_000D;
+        let beyond = with(&[(beyond_system, 0x7)], &dwm_privileges, 0) == 0xC000_0446;
+        let enabled_deny_only = with(&[(authenticated, 0x14)], &dwm_privileges, 0) == 0xC000_000D;
+        let duplicate_privilege = with(&[(everyone, 7)], &[(23, 3), (23, 0)], 0) == 0xC000_01A6;
+        let unknown_privilege = with(&[(everyone, 7)], &[(0x25, 0)], 0) == 0xC000_0060;
+        let bad_attributes = with(&[(everyone, 7)], &[(23, 0x8)], 0) == 0xC000_000D;
+        let bad_policy = with(&[(everyone, 7)], &dwm_privileges, policy) == 0xC000_000D;
+        assert(second_label && beyond && enabled_deny_only && duplicate_privilege && unknown_privilege && bad_attributes && bad_policy, "virtualaccount: NtCreateTokenEx recusa segundo rotulo, nivel acima de System, deny-only habilitado, privilegio repetido ou desconhecido, atributo invalido e politica invalida");
+        let _ = call("NtClose", own, 0, 0, 0);
+        assert(session == 0 && logon_session::delete_track(logon) == 0, "virtualaccount: a sessao de logon sai depois do ultimo token");
+        if let Some(region) = memory::find_region(block) {
+            memory::release_private_region(&region);
+        }
+    });
+    assert(ran.is_some(), "virtualaccount: processo de teste");
+}
+
 fn user_query_object(assert: Assert) {
     use crate::ntos::ob::query_object;
     use crate::ntos::ps::user::memory;
@@ -5851,6 +6035,7 @@ pub fn run(assert: Assert) {
     user_address_floor(assert);
     user_tokens(assert);
     user_create_token(assert);
+    user_virtual_account_token(assert);
     user_query_object(assert);
     user_remove_completion(assert);
     user_alpc_foundation(assert);
