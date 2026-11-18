@@ -150,10 +150,23 @@ fn resolve(windows: &Path) -> Resolved {
     resolved
 }
 
-/// As subchaves de Winners dos assemblies, inteiras, no caminho relativo à
-/// raiz da hive SOFTWARE.
+/// Os esquemas de configuração dos manifestos (o `<windowsSettings>` do
+/// asm.v3, como o dpiAware do LogonUI.exe e do dwm.exe): o sxs.dll procura
+/// cada namespace de configuração em `SMI\WinSxs Settings`, com o
+/// targetNamespace e os tipos das configurações de cada versão; sem a chave,
+/// o manifesto que as declara não gera contexto de ativação
+/// (STATUS_SXS_CANT_GEN_ACTCTX).
+const SETTINGS: &str = "Microsoft\\Windows\\CurrentVersion\\SMI";
+
+/// As subchaves de Winners dos assemblies, inteiras, e a chave dos esquemas
+/// de configuração ([`SETTINGS`]), no caminho relativo à raiz da hive
+/// SOFTWARE.
 pub fn software_keys(windows: &Path) -> Vec<HostKey> {
-    resolve(windows).keys
+    #[allow(unused_mut)]
+    let mut keys = resolve(windows).keys;
+    #[cfg(windows)]
+    crate::host_language::registry::copy(crate::host_language::registry::LOCAL_MACHINE, &format!("SOFTWARE\\{SETTINGS}"), SETTINGS, true, &mut keys);
+    keys
 }
 
 /// Os manifestos dos assemblies e os arquivos deles: (caminho no volume,
