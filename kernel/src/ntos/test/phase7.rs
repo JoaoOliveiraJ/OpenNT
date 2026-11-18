@@ -1460,7 +1460,7 @@ fn user_file_syscalls(assert: Assert) {
     guest::write32(rsp + 0x30, 0x20);
     let _ = call("NtOpenFile", handle_pointer, 0x8010_0000, attributes, iosb);
     let plain = guest::read64(handle_pointer);
-    assert(call("NtDeviceIoControlFile", plain, 0, 0, 0) == 0xC000_0008 && call("NtQuerySection", plain, 0, block + 0x800, 24) == 0xC000_0008 && call("NtUnmapViewOfSectionEx", u64::MAX, 0x2_0000_0000, 1, 0) == 0xC000_00BB, "usersyscalls: IOCTL e NtQuerySection em arquivo, placeholder recusado");
+    assert(call("NtDeviceIoControlFile", plain, 0, 0, 0) == 0xC000_0008 && call("NtQuerySection", plain, 0, block + 0x800, 24) == 0xC000_0008 && call("NtUnmapViewOfSectionEx", u64::MAX, 0x2_0000_0000, 4, 0) == 0xC000_00F1, "usersyscalls: IOCTL e NtQuerySection em arquivo, flag de desmapeamento desconhecida recusada");
     let _ = call("NtClose", plain, 0, 0, 0);
     // NtCreateSection de usuário (pagefile).
     let size = block + 0x20;

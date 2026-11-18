@@ -1382,7 +1382,14 @@ além da KUSER_SHARED_DATA:
   STATUS_INVALID_PAGE_PROTECTION e em qualquer modo, só a vista com uma faixa
   protegida por MmSecureVirtualMemory (`mm/secure_memory.rs`); a vista
   SEC_NO_CHANGE sem faixa protegida desmapeia normalmente, inclusive pelo
-  NtUnmapViewOfSection de usuário. Teste: `ntos/test/shared_section_views.rs`.
+  NtUnmapViewOfSection de usuário. O NtUnmapViewOfSectionEx aceita
+  MEM_UNMAP_WITH_TRANSIENT_BOOST (no NT só muda a prioridade das páginas
+  soltas na lista de espera, que o OpenNT não tem) e
+  MEM_PRESERVE_PLACEHOLDER (base de página, senão
+  STATUS_INVALID_PARAMETER_2; como nenhuma vista do OpenNT vem de um
+  placeholder, STATUS_CONFLICTING_ADDRESSES depois da checagem de
+  segurança); outras flags dão STATUS_INVALID_PARAMETER_3. Teste:
+  `ntos/test/shared_section_views.rs`.
 - **Faixas protegidas** (`mm/secure_memory.rs`): o MmSecureVirtualMemory(Ex)
   põe uma entrada de segurança no VAD que contém a faixa (a região
   privada, a vista ou a imagem), com as flags do MiAddSecureEntry do 19041

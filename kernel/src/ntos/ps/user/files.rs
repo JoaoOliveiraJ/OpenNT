@@ -431,12 +431,11 @@ fn nt_unmap_view_of_section(process_handle: u64, base: u64, _a3: u64, _a4: u64, 
     unmap_view::unmap(process_handle, base, 1)
 }
 
-/// MEM_PRESERVE_PLACEHOLDER exige VADs de placeholder.
-fn nt_unmap_view_of_section_ex(process_handle: u64, base: u64, flags: u64, _a4: u64, rsp: u64) -> Result<u32, KernelError> {
-    if flags != 0 {
-        return Ok(0xC000_00BB);
-    }
-    nt_unmap_view_of_section(process_handle, base, 0, 0, rsp)
+/// NtUnmapViewOfSectionEx(process, base, Flags): MEM_UNMAP_WITH_TRANSIENT_BOOST
+/// e MEM_PRESERVE_PLACEHOLDER como o MiUnmapViewOfSection
+/// (`mm/section/unmap_view.rs`).
+fn nt_unmap_view_of_section_ex(process_handle: u64, base: u64, flags: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
+    unmap_view::unmap_ex(process_handle, base, 1, flags as u32)
 }
 
 /// NtQuerySection(SectionBasicInformation) de um handle `section` do processo.
