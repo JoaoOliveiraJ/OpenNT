@@ -235,6 +235,9 @@ static CURRENT: SpinLock<Option<Arc<UserThread>>> = SpinLock::new(None);
 static EXITING: SpinLock<Vec<PendingExit>> = SpinLock::new(Vec::new());
 static APC_PUMP_REGISTERED: AtomicBool = AtomicBool::new(false);
 static DRAINING_APCS: AtomicBool = AtomicBool::new(false);
+/// O diagnóstico da primeira conclusão de E/S adiada drenada por
+/// [`drain_kernel_apcs`] já foi impresso.
+static DEFERRED_COMPLETION_REPORTED: AtomicBool = AtomicBool::new(false);
 /// `exec_user_context(context, teb)` da HAL de modo usuário.
 static EXECUTOR: SpinLock<Option<fn(u64, u64) -> u32>> = SpinLock::new(None);
 /// `call_capture::consume` + `exceptions::hardware`/`pending`: devolve o status
@@ -369,6 +372,9 @@ pub fn drain_kernel_apcs() {
             irql::lower_irql(0);
         }
         // As conclusões primeiro: elas enfileiram as APCs de conclusão.
+        if crate::ntos::io::file::request::has_completions_for(pointer) && !DEFERRED_COMPLETION_REPORTED.swap(true, Ordering::AcqRel) {
+            debug_print!("[apc] primeira conclusao de E/S adiada drenada no contexto da thread de usuario tid={} (pid {})", process::get_current_thread_id(), process::get_current_process_id());
+        }
         crate::ntos::io::file::request::pump();
         let _ = apc::deliver_all_queued();
         if caller_irql != 0 {

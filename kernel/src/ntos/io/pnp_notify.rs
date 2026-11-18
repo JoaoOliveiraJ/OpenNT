@@ -264,6 +264,13 @@ pub fn register(category: u32, flags: u32, data: u64, callback: u64, context: u6
     unsafe { Field::<u64>::at(output) }.set(record);
     if category == EVENT_CATEGORY_DEVICE_INTERFACE_CHANGE && flags & 1 != 0 {
         let existing = device_interface::enabled_links(&class);
+        // Diagnóstico dos registros de sessão (o RIT do win32k com as
+        // classes de mouse, teclado e HID): quantas interfaces já
+        // habilitadas ele recebeu.
+        if let Some(owner) = owner {
+            let data1 = u32::from_le_bytes([class[0], class[1], class[2], class[3]]);
+            debug_print!("[pnp] notificacao de interface {:08x}-... da sessao {}: {} interface(s) existente(s)", data1, owner.id, existing.len());
+        }
         for link in existing {
             notify_interface(&[registration], &INTERFACE_ARRIVAL, &class, &link);
         }
