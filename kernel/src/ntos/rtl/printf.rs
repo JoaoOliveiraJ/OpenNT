@@ -135,11 +135,11 @@ fn write_wide_bounded(buffer: u64, capacity: u64, text: &str) -> u64 {
 /// NULL passam pelo tratador de parâmetro inválido do kernel (que só volta)
 /// e devolvem -1; senão o texto inteiro, sem limite (o contador da CRT é
 /// 0x7FFFFFFF), e o NUL largo; devolve o número de WCHARs sem o NUL.
-pub fn swprintf(buffer: u64, format: u64, arguments: &[u64]) -> Result<u64, KernelError> {
+pub fn swprintf(buffer: u64, format: u64, arguments: &mut dyn FnMut(usize) -> u64) -> Result<u64, KernelError> {
     if buffer == 0 || format == 0 {
         return Ok(-1i64 as u64);
     }
-    let text = guest_strings::format_guest_text(&guest_strings::read_wide_string(format), &mut variadic(arguments), true)?;
+    let text = guest_strings::format_guest_text(&guest_strings::read_wide_string(format), arguments, true)?;
     let units: Vec<u16> = text.encode_utf16().collect();
     let output: Vec<u8> = units.iter().copied().chain(core::iter::once(0)).flat_map(u16::to_le_bytes).collect();
     guest::write_bytes(buffer, &output);

@@ -3209,7 +3209,7 @@ pub mod crt_wide_copy_format {
 
     /// swprintf(Buffer, Format, ...) -> int.
     fn swprintf(call: &Call) -> Result<u64, KernelError> {
-        printf::swprintf(call.arg(1), call.arg(2), &call.args[2..])
+        printf::swprintf(call.arg(1), call.arg(2), &mut |index| call.variadic_arg(3 + index))
     }
 
     /// wcsncpy(Dest, Source, Count) -> wchar_t*.
