@@ -334,6 +334,14 @@ fn set_dispatching(running: bool, current: Option<Arc<UserThread>>) {
 
 /// APCs de kernel podem rodar com a thread suspensa ou esperando: nada de
 /// anel 3 é agendado, mas o contexto salvo e a identidade estão vivos.
+///
+/// Entram também as conclusões de E/S que só o contexto da thread termina
+/// (o IopCompleteRequest, uma APC especial de kernel no NT, entregue com a
+/// thread parada numa espera em PASSIVE_LEVEL): um ZwReadFile assíncrono que
+/// uma thread de usuário fez dentro de um serviço (o RIMStartDeviceRead do
+/// RIT do win32k, com a thread depois parada no KeWaitForMultipleObjects) é
+/// concluído pelo driver num DPC; a conclusão grava o IO_STATUS_BLOCK e
+/// enfileira a APC da ApcRoutine do pedido, que roda logo depois.
 pub fn drain_kernel_apcs() {
     let caller_irql = irql::get_irql();
     if DRAINING_APCS.load(Ordering::Acquire) || caller_irql > 1 {
@@ -343,7 +351,7 @@ pub fn drain_kernel_apcs() {
     DRAINING_APCS.store(true, Ordering::Release);
     for thread in all() {
         let (dead, context, pointer, blocked) = thread.with(|thread| (thread.dead, thread.context, thread.thread_pointer, matches!(thread.kernel, KernelState::Blocked { .. })));
-        if dead || context == 0 || !apc::has_pending(pointer) {
+        if dead || context == 0 || !crate::ntos::ke::thread_apcs_pending(pointer) {
             continue;
         }
         // Bloqueada no kernel acima de PASSIVE_LEVEL (um fast mutex em
@@ -360,6 +368,8 @@ pub fn drain_kernel_apcs() {
         if caller_irql != 0 {
             irql::lower_irql(0);
         }
+        // As conclusões primeiro: elas enfileiram as APCs de conclusão.
+        crate::ntos::io::file::request::pump();
         let _ = apc::deliver_all_queued();
         if caller_irql != 0 {
             irql::raise_irql(caller_irql);

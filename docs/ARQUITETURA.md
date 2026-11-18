@@ -761,7 +761,11 @@ pelo prazo restante). A conclusão de uma requisição de arquivo, que só
 termina no contexto de quem pediu (o papel da APC especial do
 IopCompleteRequest), tira da espera da mesma forma a thread de kernel que
 pediu; uma APC de kernel para uma thread numa espera sondada a põe de volta
-na fila para entregá-la na própria pilha. Os locks do Ex (fast e guarded mutex, ERESOURCE, push
+na fila para entregá-la na própria pilha. Numa thread de usuário parada
+num serviço (o RIT do win32k no KeWaitForMultipleObjects, com o ZwReadFile
+assíncrono do RIMStartDeviceRead pendente no kbdclass ou no mouclass), essa
+conclusão e a APC da ApcRoutine que ela enfileira são drenadas no contexto
+da thread pelo despachante de usuário (`drain_kernel_apcs`). Os locks do Ex (fast e guarded mutex, ERESOURCE, push
 lock, rundown, `context_switch::acquire_signaled`) esperam com um bloco de
 notificação no evento em que a requisição estacionou (o Event do FAST_MUTEX,
 o WakeEvent do bloco do push lock e do rundown, o evento do bloco do
@@ -2964,8 +2968,8 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   entrar no VAD do processo, onde os callbacks a leem.
   As entregas que a thread recebe numa espera sondada (pacotes de conclusão,
   mensagens ALPC, workers de fábrica) rodam como a própria thread
-  (`refresh_ready_user_threads` a torna a corrente), e as APCs de kernel
-  drenadas também (`drain_kernel_apcs`); os pumps de ALPC, de pacotes de
+  (`refresh_ready_user_threads` a torna a corrente), e as APCs de kernel e
+  as conclusões de E/S adiadas drenadas também (`drain_kernel_apcs`); os pumps de ALPC, de pacotes de
   espera e de timers só mexem em memória do kernel. O modo estrito de posse
   (seção 3.3) confere tudo isso. Teste: `ntos/test/multiprocess/ownership.rs`.
 - **Arquivos de paginação e working set** (`mm/paging_file/`,
