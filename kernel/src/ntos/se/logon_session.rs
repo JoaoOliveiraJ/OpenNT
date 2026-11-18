@@ -245,7 +245,9 @@ pub fn dereference_direct(logon_id: u64, server_silo: u64) {
 
 /// SepDeReferenceLogonSession na destruição de um token: no zero a sessão
 /// sai do banco, o token de sessão é solto e, com a marca de término, os
-/// file systems são avisados.
+/// file systems são avisados. O aviso ao LSA que o 19041 dá em seguida (o
+/// SepInformLsaOfDeletedLogon) ainda não existe; o que ele precisa está em
+/// `se/reference_monitor.rs`.
 pub fn dereference_for_token(logon_id: u64, server_silo: u64) {
     let removed = with_sessions(|sessions| {
         let position = sessions.iter().position(|session| session.logon_id == logon_id && session.server_silo == server_silo)?;

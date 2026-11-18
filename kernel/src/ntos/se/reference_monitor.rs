@@ -43,6 +43,30 @@
 //! Monitor ao LSA) ainda não existe. O SepRmVerifyLsaProtectionLevel lê a
 //! variável de firmware de proteção do LSA, que um boot por BIOS não tem, e
 //! não muda nada.
+//!
+//! O que falta para o aviso de sessão de logon apagada (o
+//! SepInformLsaOfDeletedLogon do 19041, rva 0x6f7da0, que o
+//! SepDeReferenceLogonSession chama no zero, depois da limpeza da sessão):
+//! - a fila: um SEP_WORK_ITEM com o comando 3 (LsapLogonSessionDeleted), 8
+//!   bytes de parâmetros (o LUID em +0x18), o tipo 1 em +0x10 e o silo em
+//!   +0x38, posto pelo SepQueueWorkItem na SepLsaDeletedLogonQueueInfo, cujo
+//!   trabalhador é o SepRmCallLsa (rva 0x34d310);
+//! - o SepRmCallLsa só despacha depois do registro da auditoria no ETW:
+//!   sem o AdtpRegisteredWithEtw ele cria ou abre o evento
+//!   `\ADT_ETW_CHANNEL_INIT` (SepAdtOpenEtwReadyEvent) e espera nele; e só
+//!   com o SepRmAuditingEnabled (que o RmAuditSetCommand liga, o
+//!   SepRmSetAuditEventWrkr em 0x7c5319), anexado ao SepRmLsaCallProcess;
+//! - o SepRmDispatchDataToLsa (rva 0x34d558) manda o comando 3 como
+//!   datagrama, ZwRequestPort no LsaCommandPortHandle da conexão de volta:
+//!   TotalLength 0x38, DataLength 0x10, CommandNumber em +0x28, o tipo 1 em
+//!   +0x2C e o LUID em +0x30 (parâmetros acima de 0x1D0 bytes iriam pela
+//!   vista de 4 KB).
+//! O OpenNT precisaria do estado SepRmAuditingEnabled em `se/audit.rs`, do
+//! portão do ETW de auditoria, da fila com o trabalhador que espera e de um
+//! ZwRequestPort por handle na conexão de volta. Sem isso o lsass não fica
+//! sabendo do fim de uma sessão de logon cujo último token saiu: a sessão
+//! do LSA (a do DWM-1 e a do UMFD-1, uma por reinício do dwm) fica para
+//! trás; a do kernel sai do banco normalmente.
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
