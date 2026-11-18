@@ -2,6 +2,7 @@
 
 pub mod power_manager;
 pub mod power_setting;
+pub mod policy_worker;
 pub mod idle;
 pub mod fx;
 pub mod black_box;

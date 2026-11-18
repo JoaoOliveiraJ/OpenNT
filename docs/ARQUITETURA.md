@@ -2933,7 +2933,24 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   no primeiro pedido o nome WNF temporário de escopo de máquina da
   configuração (ou o nome global, sem GUID; GUID desconhecido dá
   STATUS_NOT_FOUND) e o 59 serializa os valores AC, DC e Hot com os
-  carimbos de mudança. Os valores ainda não são publicados nos nomes. O
+  carimbos de mudança. A entrega das mudanças segue o 19041
+  (`po/policy_worker.rs`): da fase 3 do PoInitSystem em diante, o
+  PopSetNotificationWork põe o worker de política (um work item no
+  processo System) a rodar o PopPolicyWorkerNotify, que chama o
+  PopDispatchPowerSettingCallbacks (bit 0x20) e o PopDispatchNotifications
+  (0x80) e espera 10 ms entre as voltas. Os registros do
+  PoRegisterPowerSettingCallback são blocos 'PSet' (o handle) na lista da
+  configuração do GUID ou à espera dela; o registro pede a entrega, então
+  o callback recebe o valor corrente (o callback inicial) e depois cada
+  troca do slot da fonte corrente, com o PopSettingLock solto durante a
+  chamada; um setting de sessão é recusado. O
+  PoUnregisterPowerSettingCallback de dentro do próprio callback fica para
+  a volta; o de outra thread espera o callback voltar. O nome WNF criado
+  pelo nível 58 recebe a publicação do valor corrente e de cada troca (os
+  registros do PopMarshalSettingValues), que é o que o
+  RegisterPowerSettingNotification do user32 e o powrprof assinam (o
+  LogonUI pede GUID_CONSOLE_DISPLAY_STATE e GUID_SESSION_DISPLAY_STATUS);
+  uma configuração nova é avisada no nome global. O
   PowerInformationInternal 0x1F e 0x20 (o RtlGet/SetSystemBootStatus do
   ntdll) lê e grava o boot status data (`po/boot_status.rs`): os itens
   capturados e sondados, o arquivo `\SystemRoot\bootstat.dat` aberto pelo

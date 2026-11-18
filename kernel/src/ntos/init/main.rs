@@ -179,6 +179,11 @@ pub fn kmain() -> ! {
     // Os valores iniciais de GUID_ACDC_POWER_SOURCE (o
     // PopInitilizeAcDcSettings do PoInitSystem).
     crate::ntos::po::power_setting::initialize_ac_dc_settings();
+    // A fase 3 do PoInitSystem (PopOsInitPhase = 3): daqui em diante as
+    // mudanças de power setting e os registros de callback pedem a entrega
+    // ao worker de política; a primeira, a tela ligada logo abaixo, entrega
+    // o valor corrente aos callbacks registrados pelos drivers de boot.
+    crate::ntos::po::power_setting::begin_init_phase(3);
     // A tela do console ligada (o PopUpdateConsoleDisplayState logo depois,
     // no PoInitSystem).
     if let Err(error) = crate::ntos::po::display_state::initialize() {

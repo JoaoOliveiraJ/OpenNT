@@ -1548,8 +1548,15 @@ fn ntoskrnl_medium_groups(assert: Assert) {
         guest::write32(counter, 9);
     }
     assert(counter != 0 && call_export("PoSetDeviceBusyEx", &[counter]) == Some(0) && guest::read32(counter) == 0, "po: contador de ociosidade zerado pelo PoSetDeviceBusyEx");
-    let registration = guest::alloc_bytes(8);
-    assert(call_export("PoUnregisterPowerSettingCallback", &[0xABC0]) == Some(0xFFFF_FFFF_C000_0225) && call_export("PoRegisterPowerSettingCallback", &[0, 0, 0xABC0, 0, registration]) == Some(0) && guest::read64(registration) == 0xABC0 && call_export("PoUnregisterPowerSettingCallback", &[0xABC0]) == Some(0), "po: registro e remocao de callback de power setting");
+    // Um GUID sem configuração: o registro espera em
+    // PopRegisteredPowerSettingCallbacks e o callback nunca é chamado. O
+    // handle é o bloco 'PSet' do registro.
+    let registration = guest::alloc_bytes(0x18);
+    guest::write_bytes(registration + 8, &[0x50, 0x53, 0x4E, 0x4F, 0x01, 0x00, 0x01, 0x00, 0x86, 0x10, 0x52, 0x45, 0x47, 0x49, 0x53, 0x54]);
+    let registered = call_export("PoRegisterPowerSettingCallback", &[0, registration + 8, 0xABC0, 0, registration]);
+    let handle = guest::read64(registration);
+    let tagged = handle != 0 && guest::read32(handle + 0x10) == 0x7465_5350;
+    assert(call_export("PoUnregisterPowerSettingCallback", &[0]) == Some(0xFFFF_FFFF_C000_000D) && registered == Some(0) && tagged && call_export("PoUnregisterPowerSettingCallback", &[handle]) == Some(0) && call_export("PoUnregisterPowerSettingCallback", &[handle]) == Some(0xFFFF_FFFF_C000_000D), "po: registro e remocao de callback de power setting");
     guest::free_bytes(registration);
     guest::free_bytes(seconds);
 }

@@ -27,9 +27,9 @@ fn request_power_irp(call: &Call) -> Result<u64, KernelError> {
     Ok(signed_status(power_manager::request_power_irp(call.arg(1), call.arg(2) as u32, call.arg(3) as u32, call.arg(4), call.arg(5), call.arg(6))))
 }
 
+/// PoRegisterPowerSettingCallback(device, &guid, callback, context, &handle).
 fn register_power_setting_callback(call: &Call) -> Result<u64, KernelError> {
-    power_setting::register_callback(call.arg(1), call.arg(2), call.arg(3), call.arg(4), call.arg(5));
-    Ok(0)
+    Ok(signed_status(power_setting::register_callback(call.arg(1), call.arg(2), call.arg(3), call.arg(4), call.arg(5))))
 }
 
 fn unregister_power_setting_callback(call: &Call) -> Result<u64, KernelError> {
