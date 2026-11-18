@@ -1958,8 +1958,10 @@ fn ntoskrnl_ex_group(assert: Assert) {
     at::<nt::LargeInteger>(block + 0x1B8).quad_part.set(0x01DA_0000_1234_5678);
     assert(call_export("ExSystemTimeToLocalTime", &[block + 0x1B8, block + 0x1C0]) == Some(0) && at::<nt::LargeInteger>(block + 0x1C0).quad_part.get() == 0x01DA_0000_1234_5678 - crate::ntos::ex::time_zone::time_zone_bias() && call_export("EmClientQueryRuleState", &[0, 0]) == Some(0xFFFF_FFFF_C000_000D), "ex: hora local pelo vies do fuso e regra nula");
     // EX_TIMER e ExEventObjectType.
+    // O EX_TIMER começa num KTIMER2 de sincronização (0x19) com o callback
+    // codificado (`platform_support` cobre vencimento e remoção).
     let timer = call_export("ExAllocateTimer", &[0x1234, 0x5678, 0]).unwrap_or(0);
-    assert(timer != 0 && guest::read64(timer + 0x80) == 0x1234 && call_export("ExCancelTimer", &[timer]) == Some(0) && call_export("ExDeleteTimer", &[timer, 1, 0, 0]) == Some(0), "ex: EX_TIMER alocado, cancelado e removido");
+    assert(timer != 0 && guest::read8(timer) == 0x19 && guest::read64(timer + 0x60) != 0x1234 && call_export("ExCancelTimer", &[timer, 0]) == Some(0) && call_export("ExDeleteTimer", &[timer, 1, 0, 0]) == Some(0), "ex: EX_TIMER alocado, cancelado e removido");
     let cell = match exports::lookup("ntoskrnl.exe", "ExEventObjectType") {
         Some(ResolvedImport::Address { address, .. }) => address,
         _ => 0,

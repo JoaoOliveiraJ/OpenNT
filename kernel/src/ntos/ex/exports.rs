@@ -244,16 +244,16 @@ fn interlocked_pop_entry_list(call: &Call) -> Result<u64, KernelError> {
 // ---- EX_TIMER ------------------------------------------------------------
 
 fn allocate_timer(call: &Call) -> Result<u64, KernelError> {
-    Ok(timer::allocate(call.arg(1), call.arg(2)))
+    Ok(timer::allocate(call.arg(1), call.arg(2), call.arg(3) as u32))
 }
 fn set_timer(call: &Call) -> Result<u64, KernelError> {
-    Ok(timer::set(call.arg(1), call.arg(2) as i64, call.arg(3) as u32, call.arg(4)) as u64)
+    Ok(timer::set(call.arg(1), call.arg(2) as i64, call.arg(3) as i64, call.arg(4)) as u64)
 }
 fn cancel_timer(call: &Call) -> Result<u64, KernelError> {
     Ok(timer::cancel(call.arg(1)) as u64)
 }
 fn delete_timer(call: &Call) -> Result<u64, KernelError> {
-    Ok(timer::delete(call.arg(1), call.arg(2) != 0) as u64)
+    Ok(timer::delete(call.arg(1), call.arg(2) as u8 != 0, call.arg(3) as u8 != 0, call.arg(4)) as u64)
 }
 
 fn uuid_create(call: &Call) -> Result<u64, KernelError> {

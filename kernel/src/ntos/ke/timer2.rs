@@ -8,8 +8,9 @@
 //! da tabela KiTimer2Combinations; DueTime[0] em tempo de interrupção
 //! absoluto, DueTime[1] com a tolerância do EXT_SET_PARAMETERS; Period em
 //! 100 ns, no mínimo KeMinimumIncrement. O byte 1 do Header são as
-//! bandeiras do timer: Inserted (0x01), Running (0x10, durante o callback)
-//! e Disabled (0x20, que faz Set e Cancel não mexerem em nada).
+//! bandeiras do timer: Inserted (0x01), Expiring (0x02, da retirada da fila
+//! ao fim do vencimento), CancelPending (0x04), Running (0x10, durante o
+//! callback) e Disabled (0x20, que faz Set e Cancel não mexerem em nada).
 //!
 //! As coleções de árvores do NT (KiTimer2Collections) viram a fila de
 //! endereços inseridos deste módulo; o pump dos timers
@@ -17,9 +18,16 @@
 //! SignalState = 1 (as esperas tratam os dois tipos em `ke/dispatcher.rs`),
 //! o periódico volta para agora + Period e o callback decodificado roda em
 //! DISPATCH_LEVEL com (Timer, CallbackContext), como no KiExpireTimer2.
+//!
+//! O KeDisableTimer2 (não exportado; o ExDeleteTimer o usa) marca Disabled,
+//! tira o timer da fila com Cancel e guarda a rotina de finalização
+//! codificada em DisableCallback/DisableContext. A finalização (o
+//! KiFinalizeTimer2Disablement) roda quando as bandeiras ficam só com
+//! Disabled: na hora, se o timer não estava na fila nem vencendo, ou no fim
+//! do vencimento em curso (depois do callback).
 
 use alloc::vec::Vec;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use super::{clock, irql, pcr};
 use crate::hal::amd64::native_call;
@@ -33,8 +41,14 @@ const TIMER2_NOTIFICATION_OBJECT: u8 = 0x18;
 const TIMER2_SYNCHRONIZATION_OBJECT: u8 = 0x19;
 /// Bandeiras do byte 1 do Header (Timer2Flags).
 const TIMER2_INSERTED: i32 = 0x01 << 8;
+const TIMER2_EXPIRING: i32 = 0x02 << 8;
+const TIMER2_CANCEL_PENDING: i32 = 0x04 << 8;
+const TIMER2_SET_PENDING: i32 = 0x08 << 8;
 const TIMER2_RUNNING: i32 = 0x10 << 8;
 const TIMER2_DISABLED: i32 = 0x20 << 8;
+/// As bandeiras de estado (Inserted..Disabled) que o KiUpdateTimer2Flags
+/// compara com Disabled sozinho antes de finalizar.
+const TIMER2_STATE_MASK: i32 = 0x3F << 8;
 /// `KTIMER2.TypeFlags` aceitos (IdleResilient 2, HighResolution 4,
 /// NoWake 8, PseudoHighRes 0x10) e os dois bytes de CollectionIndex de
 /// cada combinação (KiTimer2Combinations).
@@ -52,6 +66,13 @@ const SATURATED_DUE_TIME: u64 = u64::MAX - 1;
 static SECRETS: SpinLock<Option<(u64, u64)>> = SpinLock::new(None);
 /// Os KTIMER2 inseridos (o papel das coleções do KiTimer2Collections).
 static INSERTED: SpinLock<Vec<u64>> = SpinLock::new(Vec::new());
+/// Passadas de vencimento em curso (o que o KeDisableTimer2 com Wait
+/// espera esvaziar no processador do relógio).
+static EXPIRATIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// A rotina de finalização de um KTIMER2 desabilitado (o DisableCallback do
+/// KeDisableTimer2), chamada com o DisableContext.
+pub type DisableRoutine = fn(context: u64);
 
 fn timer_at(address: u64) -> &'static Ktimer2 {
     // SAFETY: o KTIMER2 vivo do chamador.
@@ -65,14 +86,15 @@ fn secrets() -> (u64, u64) {
     })
 }
 
-/// A codificação de ponteiro do KiInitializeTimer2.
-fn encode(value: u64, timer: u64) -> u64 {
+/// A codificação de ponteiro do KiInitializeTimer2 (também a dos campos
+/// codificados que o EX_TIMER guarda depois do KTIMER2).
+pub fn encode(value: u64, timer: u64) -> u64 {
     let (never, always) = secrets();
     ((always ^ value).swap_bytes() ^ timer).rotate_right((never & 63) as u32) ^ never
 }
 
 /// A decodificação do KiExpireTimer2.
-fn decode(value: u64, timer: u64) -> u64 {
+pub fn decode(value: u64, timer: u64) -> u64 {
     let (never, always) = secrets();
     ((value ^ never).rotate_left((never & 63) as u32) ^ timer).swap_bytes() ^ always
 }
@@ -179,20 +201,88 @@ pub fn cancel(timer: &Ktimer2) -> bool {
     remove_locked(&mut inserted, timer)
 }
 
+/// KeDisableTimer2(Timer, Cancel, Wait, DisableParameters): num timer já
+/// desabilitado não faz nada e devolve FALSE. Senão guarda a rotina de
+/// finalização (codificada em DisableCallback/DisableContext); com Cancel,
+/// tira o timer da fila (TRUE) ou, pego no meio do vencimento, marca
+/// CancelPending (TRUE: o callback não começa); marca Disabled e, se as
+/// bandeiras ficaram só com Disabled, finaliza na hora. Com Wait (abaixo
+/// de DISPATCH_LEVEL), espera o vencimento em curso terminar.
+pub fn disable(timer: &Ktimer2, cancel: bool, wait: bool, finalize: Option<(DisableRoutine, u64)>) -> bool {
+    let address = timer.address();
+    let (canceled, finalize_now) = {
+        let mut inserted = INSERTED.lock();
+        if flags(timer) & TIMER2_DISABLED != 0 {
+            return false;
+        }
+        if let Some((routine, context)) = finalize {
+            timer.disable_callback.set(encode(routine as usize as u64, address));
+            timer.disable_context.set(encode(context, address));
+        }
+        let mut setting = TIMER2_DISABLED;
+        let mut canceled = false;
+        if cancel {
+            let state = flags(timer);
+            if remove_locked(&mut inserted, timer) {
+                canceled = true;
+            } else if state & (TIMER2_EXPIRING | TIMER2_SET_PENDING) != 0 && state & TIMER2_RUNNING == 0 {
+                setting |= TIMER2_CANCEL_PENDING;
+                canceled = true;
+            }
+        }
+        let previous = timer.header.lock.atomic().fetch_or(setting, Ordering::SeqCst);
+        (canceled, (previous | setting) & TIMER2_STATE_MASK == TIMER2_DISABLED)
+    };
+    if finalize_now {
+        finalize_disablement(timer);
+    } else if wait && irql::get_irql() < irql::DISPATCH_LEVEL {
+        // O NT espera a DPC do processador do relógio; aqui, a passada de
+        // vencimento que segura o timer. O corpo não é tocado depois.
+        while EXPIRATIONS.load(Ordering::SeqCst) != 0 {
+            cpu::pause();
+        }
+    }
+    canceled
+}
+
+/// KiFinalizeTimer2Disablement: a rotina guardada pelo [`disable`] recebe o
+/// contexto em DISPATCH_LEVEL (o KeDisableTimer2 e o KiExpireTimer2 chegam
+/// aqui nesse nível). Ela pode liberar o corpo (o ExpFinalizeTimerDeletion
+/// libera o EX_TIMER), então nada mais lê o timer depois.
+fn finalize_disablement(timer: &Ktimer2) {
+    let address = timer.address();
+    let routine = decode(timer.disable_callback.get(), address);
+    if routine == 0 {
+        return;
+    }
+    let context = decode(timer.disable_context.get(), address);
+    // SAFETY: só o `disable` grava um DisableCallback diferente de zero, e
+    // ele grava o endereço de uma `DisableRoutine` (o KeInitializeTimer2
+    // grava zero codificado).
+    let routine: DisableRoutine = unsafe { core::mem::transmute::<usize, DisableRoutine>(routine as usize) };
+    let previous = irql::raise_at_least(irql::DISPATCH_LEVEL);
+    routine(context);
+    irql::lower_irql(previous as u64);
+}
+
 /// Expira os KTIMER2 vencidos (chamado pelo pump dos timers).
 pub fn expire_due() {
     if irql::get_irql() > irql::DISPATCH_LEVEL {
         return;
     }
     let now = clock::uptime_100ns();
+    EXPIRATIONS.fetch_add(1, Ordering::SeqCst);
     let expired: Vec<u64> = {
         let mut inserted = INSERTED.lock();
         let due: Vec<u64> = inserted.iter().copied().filter(|&address| timer_at(address).due_time[0].get() <= now).collect();
         for &address in &due {
             let timer = timer_at(address);
             remove_locked(&mut inserted, timer);
+            // Expiring segura o corpo até o fim do vencimento: um
+            // KeDisableTimer2 no meio não o finaliza.
+            timer.header.lock.atomic().fetch_or(TIMER2_EXPIRING, Ordering::SeqCst);
             let period = timer.period.get() as u64;
-            if period != 0 {
+            if period != 0 && flags(timer) & TIMER2_DISABLED == 0 {
                 let next = absolute_due(now, period);
                 let latest = timer.due_time[1].get();
                 let slack = latest.wrapping_sub(timer.due_time[0].get());
@@ -205,22 +295,32 @@ pub fn expire_due() {
     };
     for address in expired {
         let timer = timer_at(address);
-        timer.header.signal_state.set(1);
-        super::wait::signal(address);
-        let callback = decode(timer.callback.get(), address);
-        if callback == 0 {
-            continue;
+        // Cancelado no meio do vencimento (CancelPending): nem sinal nem
+        // callback.
+        if flags(timer) & TIMER2_CANCEL_PENDING == 0 {
+            timer.header.signal_state.set(1);
+            super::wait::signal(address);
+            let callback = decode(timer.callback.get(), address);
+            if callback != 0 {
+                let context = decode(timer.callback_context.get(), address);
+                timer.header.lock.atomic().fetch_or(TIMER2_RUNNING, Ordering::SeqCst);
+                let previous = irql::raise_irql(irql::DISPATCH_LEVEL);
+                if let Ok(state) = pcr::enter_dpc() {
+                    native_call::call(callback, &[address, context]);
+                    pcr::leave_dpc(state);
+                }
+                irql::lower_irql(previous as u64);
+            }
         }
-        let context = decode(timer.callback_context.get(), address);
-        timer.header.lock.atomic().fetch_or(TIMER2_RUNNING, Ordering::SeqCst);
-        let previous = irql::raise_irql(irql::DISPATCH_LEVEL);
-        if let Ok(state) = pcr::enter_dpc() {
-            native_call::call(callback, &[address, context]);
-            pcr::leave_dpc(state);
+        // O fim do vencimento: desabilitado e fora da fila, finaliza (o
+        // callback já voltou).
+        let ending = TIMER2_EXPIRING | TIMER2_RUNNING | TIMER2_CANCEL_PENDING;
+        let previous = timer.header.lock.atomic().fetch_and(!ending, Ordering::SeqCst);
+        if (previous & !ending) & TIMER2_STATE_MASK == TIMER2_DISABLED {
+            finalize_disablement(timer);
         }
-        irql::lower_irql(previous as u64);
-        timer.header.lock.atomic().fetch_and(!TIMER2_RUNNING, Ordering::SeqCst);
     }
+    EXPIRATIONS.fetch_sub(1, Ordering::SeqCst);
 }
 
 /// Quantos KTIMER2 estão inseridos (diagnóstico dos autotestes).

@@ -2191,11 +2191,25 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
 - **KTIMER2** (`ke/timer2.rs`): o `_KTIMER2` do chamador com Callback e
   contextos codificados pelos segredos do boot, TypeFlags e
   CollectionIndex da KiTimer2Combinations e o byte de bandeiras do Header
-  (Inserted, Running, Disabled). Os inseridos ficam numa fila do módulo
-  (o papel das coleções de árvores do NT) que o pump dos timers expira:
-  SignalState 1 (Timer2Notification/Synchronization nas esperas de
-  `ke/dispatcher.rs`), periódico de volta para agora + Period e o callback
-  em DISPATCH_LEVEL.
+  (Inserted, Expiring, CancelPending, Running, Disabled). Os inseridos
+  ficam numa fila do módulo (o papel das coleções de árvores do NT) que o
+  pump dos timers expira: SignalState 1 (Timer2Notification/Synchronization
+  nas esperas de `ke/dispatcher.rs`), periódico de volta para agora +
+  Period e o callback em DISPATCH_LEVEL. O KeDisableTimer2 (interno) marca
+  Disabled, tira da fila com Cancel e finaliza (DisableCallback com o
+  DisableContext, em DISPATCH_LEVEL) quando o timer sai da fila e do
+  vencimento em curso.
+- **EX_TIMER** (`ex/timer.rs`): o EX_TIMER de 0xA0 bytes do 19041 começa
+  num KTIMER2 (notificação com EX_TIMER_NOTIFICATION, senão sincronização;
+  HIGH_RESOLUTION e NO_WAKE no TypeFlags), seguido do DeleteCallback e do
+  DeleteContext codificados e do ExpTimerFreedCookie. O ExSetTimer recebe o
+  período como LONGLONG em 100 ns e chama o KeSetTimer2; um EX_TIMER sem
+  callback é um objeto de espera (o vsync emulado da fila de blits do
+  dxgkrnl espera nele a cada período). O ExDeleteTimer desabilita o KTIMER2
+  com o ExpFinalizeTimerDeletion, que roda o DeleteCallback, inverte o
+  cookie e libera o EX_TIMER. Atributos, prazos e parâmetros inválidos dão
+  os bugchecks 0xC7 e 0xC6 do original. Teste:
+  `ntos/test/platform_support.rs`.
 - **Errata Manager** (`em/`): o banco do `\SystemRoot\INF\errata.inf`
   desta máquina, os provedores e a avaliação das regras, como no ntoskrnl
   19041. O carregador entrega a imagem do INF (o EmInfFileImage do

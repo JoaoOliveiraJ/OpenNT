@@ -27,11 +27,17 @@ const STATUS_TIMEOUT: u64 = 0x102;
 static TIMER_CALLS: AtomicU64 = AtomicU64::new(0);
 static TIMER_ARGUMENTS: AtomicU64 = AtomicU64::new(0);
 static WORK_PARAMETER: AtomicU64 = AtomicU64::new(0);
+static DELETE_CONTEXT: AtomicU64 = AtomicU64::new(0);
 
 /// PTIMER2_CALLBACK(Timer, Context): conta e guarda Timer ^ Context.
 extern "win64" fn timer2_fired(timer: u64, context: u64) {
     TIMER_CALLS.fetch_add(1, Ordering::SeqCst);
     TIMER_ARGUMENTS.store(timer ^ context, Ordering::SeqCst);
+}
+
+/// PEXT_DELETE_CALLBACK(Context).
+extern "win64" fn ex_timer_deleted(context: u64) {
+    DELETE_CONTEXT.store(context, Ordering::SeqCst);
 }
 
 /// WORKER_THREAD_ROUTINE(Parameter).
@@ -123,6 +129,70 @@ fn timer2_exports(assert: Assert) {
     let still_inserted = timer_flags(timer) & 1 != 0;
     let _ = call_export("KeCancelTimer2", &[timer, 0]);
     assert(periodic && still_inserted && timer2::inserted_count() == 0, "timer2: periodico rearma depois de cada expiracao");
+    guest::free_bytes(block);
+}
+
+/// O EX_TIMER do ExAllocateTimerInternal2: o KTIMER2 no começo, o período
+/// do ExSetTimer em 100 ns (o vsync emulado do dxgkrnl: um EX_TIMER sem
+/// callback em que a fila de blits espera), e o ExDeleteTimer pelo
+/// KeDisableTimer2 com o DeleteCallback.
+fn ex_timer_exports(assert: Assert) {
+    let block = guest::alloc_bytes(0x100);
+    let (parameters, timeout) = (block, block + 0x40);
+    let callback = timer2_fired as extern "win64" fn(u64, u64) as usize as u64;
+    let context = 0x0FED_CBA9_8765_4321u64;
+    let timer = call_export("ExAllocateTimer", &[callback, context, 0]).unwrap_or(0);
+    let high = call_export("ExAllocateTimer", &[0, 0, 4]).unwrap_or(0);
+    let notification = call_export("ExAllocateTimer", &[0, 0, 0x8000_0000]).unwrap_or(0);
+    if timer == 0 || high == 0 || notification == 0 {
+        assert(false, "ex: ExAllocateTimer devolve o EX_TIMER");
+        return;
+    }
+    // SAFETY: o KTIMER2 no começo do EX_TIMER recém-alocado.
+    let decoded = timer2::decoded_callback(unsafe { Ktimer2::at(timer) });
+    let delete_fields = timer2::decode(guest::read64(timer + 0x88), timer) == 0 && timer2::decode(guest::read64(timer + 0x90), timer) == 0;
+    let layouts = (guest::read8(timer), guest::read8(high + 0x81), guest::read8(high + 0x82), guest::read8(notification));
+    assert(decoded == (callback, context) && delete_fields && layouts == (0x19, 4, 1, 0x18), "ex: o EX_TIMER comeca no KTIMER2 (sincronizacao, HIGH_RESOLUTION, NOTIFICATION pelo bit 31) com DeleteCallback/DeleteContext zerados codificados");
+
+    // Período de 2 ms em 100 ns: o callback volta várias vezes.
+    TIMER_CALLS.store(0, Ordering::SeqCst);
+    let first = call_export("ExSetTimer", &[timer, (-1i64) as u64, 20_000, 0]);
+    let period = guest::read64(timer + 0x58);
+    let periodic = pump_until(|| TIMER_CALLS.load(Ordering::SeqCst) >= 3);
+    let arguments = TIMER_ARGUMENTS.load(Ordering::SeqCst) == timer ^ context;
+    let cancelled = (call_export("ExCancelTimer", &[timer, 0]), call_export("ExCancelTimer", &[timer, 0]));
+    assert(first == Some(0) && period == 20_000 && periodic && arguments && cancelled == (Some(1), Some(0)), "ex: ExSetTimer periodico em unidades de 100 ns chama o PEXT_CALLBACK repetidamente com (Timer, Context)");
+
+    // Sem callback, o EX_TIMER é um objeto de espera de sincronização: cada
+    // vencimento (a cada 20 ms) satisfaz uma espera.
+    let waitable = call_export("ExAllocateTimer", &[0, 0, 0]).unwrap_or(0);
+    if waitable == 0 {
+        assert(false, "ex: ExAllocateTimer sem callback devolve o EX_TIMER");
+        return;
+    }
+    guest::write64(timeout, 0);
+    let _ = call_export("ExSetTimer", &[waitable, (-1i64) as u64, 200_000, 0]);
+    let wait_once = || pump_until(|| guest::read32(waitable + 4) != 0) && call_export("KeWaitForSingleObject", &[waitable, 0, 0, 0, timeout]) == Some(0);
+    let first_tick = wait_once();
+    let consumed = call_export("KeWaitForSingleObject", &[waitable, 0, 0, 0, timeout]) == Some(STATUS_TIMEOUT);
+    let second_tick = wait_once();
+    assert(first_tick && consumed && second_tick, "ex: EX_TIMER sem callback sinaliza a cada periodo e a espera consome o sinal");
+
+    // ExDeleteTimer: Cancel tira da fila (TRUE) e a finalização roda o
+    // DeleteCallback com o DeleteContext; sem Cancel, fora da fila, FALSE.
+    let delete_callback = ex_timer_deleted as extern "win64" fn(u64) as usize as u64;
+    guest::write32(parameters, 0);
+    guest::write64(parameters + 8, delete_callback);
+    guest::write64(parameters + 0x10, 0x5151);
+    DELETE_CONTEXT.store(0, Ordering::SeqCst);
+    let inserted_before = timer2::inserted_count();
+    let deleted = call_export("ExDeleteTimer", &[waitable, 1, 0, parameters]);
+    let finalized = DELETE_CONTEXT.load(Ordering::SeqCst) == 0x5151 && timer2::inserted_count() + 1 == inserted_before;
+    guest::write64(parameters + 0x10, 0x5252);
+    let idle = call_export("ExDeleteTimer", &[timer, 0, 0, parameters]);
+    let idle_finalized = DELETE_CONTEXT.load(Ordering::SeqCst) == 0x5252;
+    let plain = (call_export("ExDeleteTimer", &[high, 1, 1, 0]), call_export("ExDeleteTimer", &[notification, 0, 0, 0]));
+    assert(deleted == Some(1) && finalized && idle == Some(0) && idle_finalized && plain == (Some(0), Some(0)), "ex: ExDeleteTimer desabilita o KTIMER2, devolve se o Cancel o tirou da fila e finaliza com o DeleteCallback(DeleteContext)");
     guest::free_bytes(block);
 }
 
@@ -415,6 +485,7 @@ fn stalled_worker(assert: Assert) {
 
 pub fn run(assert: Assert) {
     timer2_exports(assert);
+    ex_timer_exports(assert);
     processor_exports(assert);
     kd_exports(assert);
     errata_exports(assert);
