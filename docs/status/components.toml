@@ -290,8 +290,8 @@ descricao = "O boot do teste lsa-politica até o ScEnableRpcInterface do service
 id = "svchost-dcomlaunch"
 titulo = "svchost do DcomLaunch e o canal do serviço Power"
 marcador = "pedido de conexao aceito"
-comando = "cargo xtask test-boot USER_INITIALIZED 900000 --initial-process=smss --display=basic --build-dir=build/svchost-dcomlaunch --smp=1 --expect=SERVICES_STARTED \"--expect=criou svchost.exe\" \"--expect=pedido de conexao aceito\""
-descricao = "O boot do teste services-scm até o svchost do grupo DcomLaunch. O CreateProcessAsUserW do services.exe cria o svchost com o token do logon de serviço: o PspAllocateProcess faz o RtlAcquirePrivilege (o SeAssignPrimaryTokenPrivilege no token primário de quem chama) ou aceita o token pelo SeIsTokenAssignableToProcess. O svchost roda os ServiceDll do grupo no mesmo processo. O umpo.dll do serviço Power conecta ao \\PowerPort, a porta ALPC que o kernel cria no PopUmpoInitializeChannel, com um objeto Callback ligado pelo NtAlpcSetInformation 9; o kernel aceita o primeiro cliente (pedido de conexao aceito). Depois o umpo sobe o endpoint umpo e pede o NtPowerInformation de modo usuário (PlatformInformation e PowerInformationInternal 4)."
+comando = "cargo xtask test-boot USER_INITIALIZED 900000 --initial-process=smss --display=basic --build-dir=build/svchost-dcomlaunch --smp=1 --expect=SERVICES_STARTED \"--expect=criou svchost.exe\" \"--expect=pedido de conexao aceito\" \"--expect=esquema de energia ativo\""
+descricao = "O boot do teste services-scm até o svchost do grupo DcomLaunch. O CreateProcessAsUserW do services.exe cria o svchost com o token do logon de serviço: o PspAllocateProcess faz o RtlAcquirePrivilege (o SeAssignPrimaryTokenPrivilege no token primário de quem chama) ou aceita o token pelo SeIsTokenAssignableToProcess. O svchost roda os ServiceDll do grupo no mesmo processo. O umpo.dll do serviço Power conecta ao \\PowerPort, a porta ALPC que o kernel cria no PopUmpoInitializeChannel, com um objeto Callback ligado pelo NtAlpcSetInformation 9; o kernel aceita o primeiro cliente (pedido de conexao aceito). O umpo manda pelo \\PowerPort os valores do esquema de energia ativo (esquema de energia ativo), que o kernel grava nas configurações de power setting. Depois o umpo sobe o endpoint umpo e pede o NtPowerInformation de modo usuário (PlatformInformation e PowerInformationInternal 4)."
 
 [[teste]]
 id = "lsm"
@@ -1668,7 +1668,7 @@ para = "O início automático cria o svchost do DcomLaunch (teste svchost-dcomla
 nome = "O svchost do DcomLaunch"
 grupo = "marco"
 teste = "svchost-dcomlaunch"
-faz = "O services.exe cria o svchost do grupo DcomLaunch com o token do logon de serviço; o serviço Power (umpo.dll) conecta ao \\PowerPort do kernel, sobe o endpoint umpo e lê o NtPowerInformation de modo usuário."
+faz = "O services.exe cria o svchost do grupo DcomLaunch com o token do logon de serviço; o serviço Power (umpo.dll) conecta ao \\PowerPort do kernel, sobe o endpoint umpo e lê o NtPowerInformation de modo usuário. O umpo manda pelo \\PowerPort os valores do esquema de energia ativo (esquema de energia ativo), que o kernel grava nas configurações de power setting."
 para = "O RpcSs e o RpcEptMapper sobem no svchost do rpcss e o Local Session Manager sobe no svchost do DcomLaunch (teste lsm)."
 
 [[roda]]

@@ -50,11 +50,11 @@ const LID_OPENED: u8 = 1;
 /// endereços de PopNoMoreInput e PopHiberBootForceMonitorOff, os valores de
 /// PopPowerSettingValues da sessão, o economizador de energia (PopEsState),
 /// a tampa (PopLidOpened) e o TTM (TtmpEnabled; ligado, o NT também chama o
-/// TtmInitCurrentSession). O OpenNT não aplica esquemas de energia (não há
-/// `Control\Power\User\PowerSchemes` nem o serviço de modo usuário que os
-/// publica), então os valores de configuração ficam no zero de antes de
-/// qualquer esquema, como o PopPowerSettingValues (.data sem inicializador)
-/// no boot, e o economizador fica desligado.
+/// TtmInitCurrentSession). Os callbacks internos do Po que gravam o
+/// PopPowerSettingValues (PopInitialSettingCallbacks) não são registrados,
+/// então os valores de configuração ficam no zero de antes de qualquer
+/// esquema, como o PopPowerSettingValues (.data sem inicializador) no boot,
+/// e o economizador fica desligado.
 fn session_power_init(input: u64, output: u64, output_length: u32) -> u32 {
     use crate::ntos::inc::types::extra_ps_user::PowerSessionInit;
     if input != 0 || output == 0 || output_length as u64 != PowerSessionInit::SIZE {

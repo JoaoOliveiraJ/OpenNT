@@ -16,18 +16,24 @@
 //!   muda com a tela esmaecida, não é chamado) e publica os registros do
 //!   valor no nome WNF que o NtPowerInformation 58 devolve;
 //! - uma configuração nova é avisada no nome global de mudança do conjunto
-//!   de settings.
+//!   de settings;
+//! - a mensagem 4 do umpo no `\PowerPort` (`po/umpo_channel.rs`,
+//!   PopSetNewPolicyValue) grava AC e DC e chega ao callback e ao nome WNF;
+//!   no subgrupo do processador só o perfil nulo grava; o setting de sessão
+//!   é ignorado; mensagem curta, DataLength além dela, slot além do Hot e
+//!   tipo desconhecido não gravam; os mínimos do PopValidatePowerSettingData.
 //!
 //! Os valores esperados vêm do PopSetPowerSettingValue,
-//! PopDispatchPowerSettingCallbacks, PopCallPowerSettingCallback e
-//! PopDispatchNotificationsToList do ntoskrnl 19041.
+//! PopDispatchPowerSettingCallbacks, PopCallPowerSettingCallback,
+//! PopDispatchNotificationsToList, PopUmpoProcessPowerMessage,
+//! PopSetNewPolicyValue e PopValidatePowerSettingData do ntoskrnl 19041.
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::phase6::call_export;
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::po::{display_state, power_setting};
+use crate::ntos::po::{display_state, power_setting, umpo_channel};
 use crate::rtl::SpinLock;
 
 type Assert = fn(bool, &str);
@@ -36,6 +42,17 @@ const STATUS_INVALID_PARAMETER: u64 = 0xFFFF_FFFF_C000_000D;
 /// GUIDs só deste teste.
 const TEST_SETTING: [u8; 16] = *b"OPNTPWRSETTEST01";
 const NEW_SETTING: [u8; 16] = *b"OPNTPWRSETTEST02";
+const PORT_SETTING: [u8; 16] = *b"OPNTPWRPORTTST01";
+const PORT_PROCESSOR: [u8; 16] = *b"OPNTPWRPORTTST02";
+const PORT_REJECTED: [u8; 16] = *b"OPNTPWRPORTTST03";
+const PPM_PROFILE: [u8; 16] = *b"OPNTPPMPROFILE01";
+/// NO_SUBGROUP_GUID {fea3413e-7e05-4911-9a71-700331f1c294} (o subgrupo dos
+/// settings sem grupo no umpo).
+const NO_SUBGROUP: [u8; 16] = [0x3e, 0x41, 0xa3, 0xfe, 0x05, 0x7e, 0x11, 0x49, 0x9a, 0x71, 0x70, 0x03, 0x31, 0xf1, 0xc2, 0x94];
+const NULL_GUID: [u8; 16] = [0; 16];
+/// STATUS_INVALID_PARAMETER como o NTSTATUS de 32 bits que o
+/// `umpo_channel` e o `power_setting` devolvem.
+const INVALID_PARAMETER: u32 = 0xC000_000D;
 
 /// As chamadas recebidas: (contexto, GUID, dados).
 static CALLS: SpinLock<Vec<(u64, [u8; 16], Vec<u8>)>> = SpinLock::new(Vec::new());
@@ -200,7 +217,115 @@ pub fn run(assert: Assert) {
     let announced = wnf_state(global, block + 0x340).is_some_and(|(stamp, data)| stamp > before && data.is_empty());
     assert(global_status == Some(0) && global != 0 && announced, "power-setting: a configuracao nova e avisada no nome global");
 
+    power_port(assert, recording);
+
     let _ = unregister(first);
+    guest::free_bytes(block);
+}
+
+/// A mensagem 4 do umpo em `block`, como o UmpoSendKernelPowerPolicyNotification
+/// (umpo.dll 0x3f9d..0x3fd1) a monta; devolve o DataLength do PORT_MESSAGE
+/// (0x4A + dados, o do umpo).
+fn policy_message(block: u64, profile: &[u8; 16], setting: &[u8; 16], subgroup: &[u8; 16], slot: u32, data: &[u8]) -> u32 {
+    let length = 0x4A + data.len();
+    guest::write_bytes(block, &alloc::vec![0u8; length]);
+    guest::write32(block, 4);
+    guest::write32(block + 8, 1);
+    guest::write_bytes(block + 0xC, profile);
+    guest::write_bytes(block + 0x1C, setting);
+    guest::write_bytes(block + 0x2C, subgroup);
+    guest::write32(block + 0x3C, slot);
+    guest::write32(block + 0x40, data.len() as u32);
+    guest::write_bytes(block + 0x44, data);
+    length as u32
+}
+
+fn u32_at(records: &[u8], offset: usize) -> u32 {
+    records.get(offset..offset + 4).map_or(u32::MAX, |bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+/// Os valores de política que o serviço Power manda pelo `\PowerPort`,
+/// direto no PopUmpoProcessPowerMessage (sem ALPC; o caminho da porta é o
+/// expect do boot).
+fn power_port(assert: Assert, recording: u64) {
+    let block = guest::alloc_bytes(0x400);
+    guest::write_bytes(block, &[0u8; 0x400]);
+    let message = block + 0x100;
+    let send = |profile: &[u8; 16], setting: &[u8; 16], subgroup: &[u8; 16], slot: u32, value: u32| {
+        let length = policy_message(message, profile, setting, subgroup, slot, &value.to_le_bytes());
+        umpo_channel::process_power_message(message, length)
+    };
+
+    // A mensagem 4 grava o AC (entregue ao callback já registrado) e o DC
+    // (gravado, sem chamada: a fonte corrente é AC).
+    let (status, handle) = register(&PORT_SETTING, recording, 20, block);
+    let ac = send(&NULL_GUID, &PORT_SETTING, &NO_SUBGROUP, 0, 0x2A);
+    let delivered = wait_until(|| calls_of(20).len() == 1) && value_of(20, 0) == Some(0x2A);
+    let ac_only = power_setting::setting_value(&PORT_SETTING, 0x40).ok();
+    let dc = send(&NULL_GUID, &PORT_SETTING, &NO_SUBGROUP, 1, 0x2B);
+    settle();
+    let both = power_setting::setting_value(&PORT_SETTING, 0x40).ok();
+    assert(
+        status == Some(0) && ac == 0 && dc == 0 && delivered && calls_of(20).len() == 1
+            && ac_only.as_deref().is_some_and(|r| r.len() == 0x20 && u32_at(r, 0) == 0x1C && u32_at(r, 4) != 0 && u32_at(r, 8) == 4 && u32_at(r, 12) == 0x2A && u32_at(r, 16) == 0 && u32_at(r, 20) == 0)
+            && both.as_deref().is_some_and(|r| r.len() == 0x28 && u32_at(r, 0) == 0x24 && u32_at(r, 12) == 0x2A && u32_at(r, 20) == 4 && u32_at(r, 24) == 0x2B && u32_at(r, 32) == 4 && u32_at(r, 36) == 0x2B),
+        "power-port: a mensagem 4 do umpo grava AC e DC e entrega o AC ao callback",
+    );
+
+    // A troca seguinte chega ao callback e ao nome WNF do nível 58.
+    let (request, name_cell, wnf) = (block + 0x200, block + 0x220, block + 0x240);
+    guest::write_bytes(request, &PORT_SETTING);
+    guest::write32(request + 0x10, 0xFFFF_FFFF);
+    let name_status = call_export("ZwPowerInformation", &[58, request, 0x14, name_cell, 8]).map(|status| status & 0xFFFF_FFFF);
+    let name = guest::read64(name_cell);
+    let initial = wait_until(|| wnf_state(name, wnf).is_some_and(|(_, data)| published_ac(&data) == Some(0x2A)));
+    let changed = send(&NULL_GUID, &PORT_SETTING, &NO_SUBGROUP, 0, 0x2C);
+    let published = wait_until(|| wnf_state(name, wnf).is_some_and(|(_, data)| published_ac(&data) == Some(0x2C)));
+    let called = wait_until(|| calls_of(20).len() == 2) && value_of(20, 1) == Some(0x2C);
+    assert(name_status == Some(0) && name != 0 && initial && changed == 0 && published && called, "power-port: a troca vinda do umpo chega ao callback e ao nome WNF");
+
+    // Subgrupo do processador: só o perfil nulo chega à configuração.
+    let profile_only = send(&PPM_PROFILE, &PORT_PROCESSOR, &power_setting::GUID_PROCESSOR_SETTINGS_SUBGROUP, 0, 1);
+    let skipped = power_setting::setting_value(&PORT_PROCESSOR, 0x40) == Err(INVALID_PARAMETER);
+    let default_profile = send(&NULL_GUID, &PORT_PROCESSOR, &power_setting::GUID_PROCESSOR_SETTINGS_SUBGROUP, 0, 2);
+    let stored = power_setting::setting_value(&PORT_PROCESSOR, 0x40).ok().is_some_and(|r| u32_at(&r, 12) == 2);
+    assert(profile_only == 0 && skipped && default_profile == 0 && stored, "power-port: no subgrupo do processador so o perfil nulo grava o valor");
+
+    // Setting de sessão ignorado; DataLength além da mensagem, slot além do
+    // Hot e tipo desconhecido não gravam nada.
+    let presence_before = power_setting::setting_value(&power_setting::GUID_SESSION_USER_PRESENCE, 0x40);
+    let session = send(&NULL_GUID, &power_setting::GUID_SESSION_USER_PRESENCE, &NO_SUBGROUP, 0, 1);
+    let presence_after = power_setting::setting_value(&power_setting::GUID_SESSION_USER_PRESENCE, 0x40);
+    let length = policy_message(message, &NULL_GUID, &PORT_REJECTED, &NO_SUBGROUP, 0, &1u32.to_le_bytes());
+    guest::write32(message + 0x40, 0x100);
+    let truncated = umpo_channel::process_power_message(message, length);
+    let short = umpo_channel::process_power_message(message, 3);
+    let slot = send(&NULL_GUID, &PORT_REJECTED, &NO_SUBGROUP, 3, 1);
+    guest::write32(message, 99);
+    let unknown = umpo_channel::process_power_message(message, length);
+    let nothing = power_setting::setting_value(&PORT_REJECTED, 0x40) == Err(INVALID_PARAMETER);
+    assert(
+        session == 0 && presence_before == presence_after && truncated == INVALID_PARAMETER && short == INVALID_PARAMETER && slot == INVALID_PARAMETER && unknown == 0 && nothing,
+        "power-port: setting de sessao ignorado; mensagem curta, slot invalido e tipo desconhecido nao gravam",
+    );
+
+    // PopValidatePowerSettingData.
+    let clamp = |setting: &[u8; 16], value: u32| {
+        let mut data = value.to_le_bytes();
+        power_setting::validate_data(setting, &mut data);
+        u32::from_le_bytes(data)
+    };
+    let mut wide = [5u8, 0, 0, 0, 0, 0, 0, 0];
+    power_setting::validate_data(&power_setting::GUID_STANDBY_TIMEOUT, &mut wide);
+    assert(
+        clamp(&power_setting::GUID_DISK_POWERDOWN_TIMEOUT, 3) == 15 && clamp(&power_setting::GUID_DISK_POWERDOWN_TIMEOUT, 0) == 0 && clamp(&power_setting::GUID_DISK_POWERDOWN_TIMEOUT, 600) == 600
+            && clamp(&power_setting::GUID_STANDBY_TIMEOUT, 1) == 30 && clamp(&power_setting::GUID_STANDBY_TIMEOUT, 29) == 30 && clamp(&power_setting::GUID_STANDBY_TIMEOUT, 0) == 0 && clamp(&power_setting::GUID_STANDBY_TIMEOUT, 31) == 31
+            && clamp(&power_setting::GUID_HIBERNATE_TIMEOUT, 59) == 60 && clamp(&power_setting::GUID_HIBERNATE_TIMEOUT, 0) == 0 && clamp(&power_setting::GUID_HIBERNATE_TIMEOUT, 61) == 61
+            && clamp(&PORT_SETTING, 1) == 1 && wide[0] == 5,
+        "power-port: os minimos do PopValidatePowerSettingData",
+    );
+
+    let _ = unregister(handle);
     guest::free_bytes(block);
 }
 

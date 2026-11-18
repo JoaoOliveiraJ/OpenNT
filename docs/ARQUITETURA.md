@@ -2981,10 +2981,17 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   pelo nível 58 recebe a publicação do valor corrente e de cada troca (os
   registros do PopMarshalSettingValues), que é o que o
   RegisterPowerSettingNotification do user32 e o powrprof assinam (o
-  LogonUI pede GUID_CONSOLE_DISPLAY_STATE e GUID_SESSION_DISPLAY_STATUS);
-  uma configuração nova é avisada no nome global. O
-  PowerInformationInternal 0x1F e 0x20 (o RtlGet/SetSystemBootStatus do
-  ntdll) lê e grava o boot status data (`po/boot_status.rs`): os itens
+  LogonUI pede GUID_CONSOLE_DISPLAY_STATE, GUID_LOW_POWER_EPOCH,
+  GUID_SESSION_USER_PRESENCE, GUID_LIDSWITCH_STATE_CHANGE e
+  GUID_SESSION_DISPLAY_STATUS; um GUID ainda sem configuração fica no nome
+  global até ela nascer); uma configuração nova é avisada no nome global.
+  Os valores do esquema de energia chegam do serviço Power pelo
+  `\PowerPort` (a mensagem 4, PopSetNewPolicyValue: GUID_ACTIVE_POWERSCHEME
+  e cada setting do esquema ativo, AC e DC; os settings de sessão são
+  ignorados; no subgrupo do processador só o perfil nulo) e passam pelo
+  PopValidatePowerSettingData (mínimos dos timeouts de disco, standby e
+  hibernação). O PowerInformationInternal 0x1F e 0x20 (o
+  RtlGet/SetSystemBootStatus do ntdll) lê e grava o boot status data (`po/boot_status.rs`): os itens
   capturados e sondados, o arquivo `\SystemRoot\bootstat.dat` aberto pelo
   ZwOpenFile (ou o `OsBootstatPath` de `Control`), o acesso do chamador ao
   descritor dele, os campos do RtlpBootStatusFields pelo cache, o checksum
@@ -4221,8 +4228,9 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   do kernel (`po/umpo_channel.rs`, o PopUmpoInitializeChannel do
   PoInitSystem: um objeto Callback ligado à porta pelo NtAlpcSetInformation
   9 e chamado a cada mensagem posta na fila; o callback agenda um work item
-  que trata as mensagens no processo System e aceita o primeiro cliente),
-  sobe o endpoint `umpo` e pede o NtPowerInformation de modo usuário
+  que trata as mensagens no processo System e aceita o primeiro cliente;
+  os datagramas do umpo trazem os valores do esquema ativo
+  (`po/power_setting.rs`)), sobe o endpoint `umpo` e pede o NtPowerInformation de modo usuário
   (`po/power_information.rs`: o PlatformInformation, o PlatformRole e o
   PowerInformationInternal 4). As definições WNF desta máquina
   (`Control\Notifications`), a ProductOptions e a ProfileList vêm do

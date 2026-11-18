@@ -21,18 +21,30 @@
 //!   PopUmpoAlpcClientConnected); o fim do cliente (LPC_PORT_CLOSED e
 //!   LPC_CLIENT_DIED) libera o próximo.
 //!
-//! O conteúdo dos datagramas que o umpo manda (o PopUmpoProcessPowerMessage
-//! de cada mensagem de energia) ainda não é interpretado: a mensagem é
-//! recebida e descartada. O kernel também não manda mensagens ao umpo (o
-//! PopUmpoSendPowerMessage).
+//! As mensagens de energia (LPC_DATAGRAM ou LPC_REPLY sem
+//! LPC_CONTINUATION_REQUIRED) vão ao PopUmpoProcessPowerMessage: o ULONG no
+//! começo dos dados é o tipo. O umpo manda o tipo 4 (PopSetNewPolicyValue)
+//! com cada valor de política: ao subir e a cada troca de esquema,
+//! GUID_ACTIVE_POWERSCHEME e cada setting do esquema ativo, AC e DC; o valor
+//! vai à configuração do setting (`po/power_setting.rs`), que avisa os
+//! callbacks e os nomes WNF pelo worker de política. Os tipos 7, 8, 10 e 14
+//! (resposta de evento legado, resposta de consulta de override de power
+//! request, início dos power requests do umpo e o timeout de doze AoAc)
+//! respondem a mensagens que o kernel do OpenNT não manda ao umpo (o
+//! PopUmpoSendPowerMessage) ou só valem numa plataforma AoAc, e são
+//! ignorados. Um pedido síncrono (LPC_REQUEST) ou uma mensagem com
+//! LPC_CONTINUATION_REQUIRED é cancelado pelo ZwAlpcCancelMessage com o
+//! atributo de contexto recebido.
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use alloc::vec;
 
-use crate::ntos::alpc::{kernel_entry, server};
-use crate::ntos::inc::field::NtStruct;
-use crate::ntos::inc::types::{AlpcPortAttributes, ObjectAttributes, PortMessage};
+use crate::ntos::alpc::{cancel_message, kernel_entry, server};
+use crate::ntos::alpc::message::attributes as message_attributes;
+use crate::ntos::inc::field::{Field, NtStruct};
+use crate::ntos::inc::types::{AlpcMessageAttributes, AlpcPortAttributes, Guid, ObjectAttributes, PortMessage, Reserved};
+use crate::ntos::po::power_setting;
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::rtl::guest_strings;
 use crate::ntos::se::model::{sid, Ace, SecurityPolicy};
@@ -50,7 +62,63 @@ const ALPC_REGISTER_CALLBACK_INFORMATION: u32 = 9;
 const LPC_CONNECTION_REQUEST: u16 = 10;
 const LPC_PORT_CLOSED: u16 = 5;
 const LPC_CLIENT_DIED: u16 = 6;
+const LPC_REQUEST: u16 = 1;
+const LPC_REPLY: u16 = 2;
+const LPC_DATAGRAM: u16 = 3;
+/// LPC_CONTINUATION_REQUIRED no Type do PORT_MESSAGE.
+const LPC_CONTINUATION_REQUIRED: u16 = 0x2000;
 const STATUS_SUCCESS: u32 = 0;
+const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+/// O atributo que o PopUmpoProcessMessages pede em cada recepção, num buffer
+/// de atributos de 0xA0 bytes.
+const ALPC_MESSAGE_CONTEXT_ATTRIBUTE: u32 = 0x2000_0000;
+const RECEIVE_ATTRIBUTES_SIZE: u64 = 0xA0;
+/// O tipo da mensagem de energia com um valor de política.
+const POWER_MESSAGE_NEW_POLICY_VALUE: u32 = 4;
+/// GUID_ACTIVE_POWERSCHEME {31f9f286-5084-42fe-b720-2b0264993763}: o valor é o
+/// GUID do esquema ativo, o primeiro que o umpo manda.
+const GUID_ACTIVE_POWERSCHEME: [u8; 16] = power_setting::guid(0x31f9_f286, 0x5084, 0x42fe, [0xb7, 0x20, 0x2b, 0x02, 0x64, 0x99, 0x37, 0x63]);
+
+/// Os dados de uma mensagem de energia do serviço Power, depois do
+/// PORT_MESSAGE (o que o PopUmpoProcessPowerMessage recebe): o tipo e, de
+/// +8, o corpo dele. O umpo.dll monta a mensagem no UmpoAlpcSendPowerMessage
+/// (0x6a00) e no UmpoSendKernelPowerPolicyNotification (0x3e90).
+#[repr(C)]
+struct PowerMessage {
+    message_type: Field<u32>,
+    _reserved: Reserved<4>,
+    policy: PolicyValue,
+}
+
+/// O corpo da mensagem 4 (o argumento do PopSetNewPolicyValue); os
+/// DataLength bytes de dados vêm logo depois.
+#[repr(C)]
+struct PolicyValue {
+    /// 1 no umpo; o kernel não lê.
+    _version: Field<u32>,
+    /// O perfil do PPM (nulo = o perfil padrão).
+    profile: Guid,
+    setting: Guid,
+    subgroup: Guid,
+    /// 0 AC, 1 DC.
+    slot: Field<u32>,
+    data_length: Field<u32>,
+}
+
+// SAFETY: #[repr(C)] só de células.
+unsafe impl NtStruct for PowerMessage {}
+// SAFETY: #[repr(C)] só de células.
+unsafe impl NtStruct for PolicyValue {}
+
+const _: () = {
+    assert!(core::mem::size_of::<PolicyValue>() == 0x3C);
+    assert!(core::mem::offset_of!(PolicyValue, profile) == 0x4);
+    assert!(core::mem::offset_of!(PolicyValue, setting) == 0x14);
+    assert!(core::mem::offset_of!(PolicyValue, subgroup) == 0x24);
+    assert!(core::mem::offset_of!(PolicyValue, slot) == 0x34);
+    assert!(core::mem::offset_of!(PolicyValue, data_length) == 0x38);
+    assert!(core::mem::offset_of!(PowerMessage, policy) == 0x8);
+};
 
 /// PopAlpcServerPort e PopAlpcClientPort (handles de kernel).
 static SERVER_PORT: AtomicU64 = AtomicU64::new(0);
@@ -184,37 +252,56 @@ fn worker(_item: u64, _context: u64) {
     }
 }
 
-/// PopUmpoProcessMessages: recebe da porta com prazo zero até a fila
-/// esvaziar.
+/// PopUmpoProcessMessages (0x6f30f4): recebe da porta com prazo zero até a
+/// fila esvaziar, pedindo o atributo de contexto de cada mensagem.
 fn process_messages() {
     let server_port = SERVER_PORT.load(Ordering::Acquire);
     if server_port == 0 {
         return;
     }
-    let Ok(block) = zeroed(MAXIMUM_MESSAGE_LENGTH + 0x20) else { return };
+    let Ok(block) = zeroed(MAXIMUM_MESSAGE_LENGTH + 0x20 + RECEIVE_ATTRIBUTES_SIZE + 8) else { return };
     let (message, length, timeout) = (block, block + MAXIMUM_MESSAGE_LENGTH, block + MAXIMUM_MESSAGE_LENGTH + 8);
+    let attributes = block + MAXIMUM_MESSAGE_LENGTH + 0x20;
+    // SAFETY: o bloco zerado reserva os RECEIVE_ATTRIBUTES_SIZE bytes do
+    // ALPC_MESSAGE_ATTRIBUTES e, depois deles, a célula SIZE_T do tamanho.
+    let (receive_attributes, required) = unsafe { (AlpcMessageAttributes::at(attributes), Field::<u64>::at(attributes + RECEIVE_ATTRIBUTES_SIZE)) };
     loop {
+        let _ = message_attributes::initialize(ALPC_MESSAGE_CONTEXT_ATTRIBUTE, Some(receive_attributes), RECEIVE_ATTRIBUTES_SIZE, required);
         guest::write64(length, MAXIMUM_MESSAGE_LENGTH);
         guest::write64(timeout, 0);
-        let arguments = [server_port, 0, 0, 0, message, length, 0, timeout];
+        let arguments = [server_port, 0, 0, 0, message, length, attributes, timeout];
         let status = crate::ntos::ps::previous_mode::with_kernel(|| kernel_entry::send_wait_receive(&arguments)).ok().and_then(Result::ok).unwrap_or(0xC000_0001);
         if status != STATUS_SUCCESS {
+            // STATUS_TIMEOUT: a fila esvaziou. Um erro é o que o 19041 rastreia
+            // no PopDiagTraceUmpoAlpcProcessingError.
+            if status & 0x8000_0000 != 0 {
+                crate::debug_print!("[po] \\PowerPort: recepcao falhou ({:#x})", status);
+            }
             break;
         }
-        process_message(message);
+        process_message(message, message_attributes::get(receive_attributes, ALPC_MESSAGE_CONTEXT_ATTRIBUTE));
     }
     guest::free_bytes(block);
 }
 
-/// PopUmpoProcessMessage: o pedido de conexão, o fim do cliente; os
-/// datagramas de energia são recebidos e descartados.
-fn process_message(message: u64) {
+/// PopUmpoProcessMessage (0x6f3224): pelo byte baixo do Type do
+/// PORT_MESSAGE; o LPC_CONTINUATION_REQUIRED é conferido no Type inteiro.
+fn process_message(message: u64, context: u64) {
     // SAFETY: a mensagem recebida no bloco de MaxMessageLength bytes.
     let header = unsafe { PortMessage::at(message) };
-    let message_type = header.u2.s2.type_.get() as u16 & 0xFF;
-    match message_type {
+    let raw_type = header.u2.s2.type_.get() as u16;
+    match raw_type & 0xFF {
+        LPC_REQUEST => cancel(context),
+        LPC_REPLY | LPC_DATAGRAM if raw_type & LPC_CONTINUATION_REQUIRED != 0 => cancel(context),
+        LPC_REPLY | LPC_DATAGRAM => {
+            let length = header.u1.s1.data_length.get() as u16 as u32;
+            let status = process_power_message(message + PortMessage::SIZE, length);
+            if status & 0x8000_0000 != 0 {
+                crate::debug_print!("[po] \\PowerPort: mensagem de energia recusada ({:#x})", status);
+            }
+        }
         LPC_CONNECTION_REQUEST => accept_connection(message),
-        LPC_PORT_CLOSED | LPC_CLIENT_DIED => {
+        message_type @ (LPC_PORT_CLOSED | LPC_CLIENT_DIED) => {
             CLIENT_CONNECTED.store(false, Ordering::Release);
             let client = CLIENT_PORT.swap(0, Ordering::AcqRel);
             crate::debug_print!("[po] \\PowerPort: o cliente saiu (tipo {}), fechando a porta de comunicacao {:#x}", message_type, client);
@@ -225,6 +312,52 @@ fn process_message(message: u64) {
         }
         _ => {}
     }
+}
+
+/// ZwAlpcCancelMessage(PopAlpcServerPort, 0, ContextAttribute): este canal
+/// não responde pedidos síncronos.
+fn cancel(context: u64) {
+    let server_port = SERVER_PORT.load(Ordering::Acquire);
+    if context == 0 || server_port == 0 {
+        return;
+    }
+    let _ = crate::ntos::ps::previous_mode::with_kernel(|| cancel_message::cancel(server_port, 0, context, 0, crate::ntos::ps::user::alpc::cancel_message));
+}
+
+/// PopUmpoProcessPowerMessage (0x6f3354) sobre os `length` bytes de dados de
+/// uma mensagem em `payload`; os tipos além do 4 não têm efeito no OpenNT
+/// (ver o começo do arquivo). Devolve o NTSTATUS (o 19041 devolve zero para
+/// todo sucesso).
+pub fn process_power_message(payload: u64, length: u32) -> u32 {
+    if length < 4 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: os dados da mensagem recebida (bloco de MaxMessageLength bytes)
+    // ou o bloco do autoteste, com `length` bytes.
+    let message = unsafe { PowerMessage::at(payload) };
+    match message.message_type.get() {
+        POWER_MESSAGE_NEW_POLICY_VALUE => new_policy_value(&message.policy, length),
+        _ => STATUS_SUCCESS,
+    }
+}
+
+/// O corpo da mensagem 4 ao PopSetNewPolicyValue. O 19041 lê o DataLength
+/// sem conferir com a mensagem; o OpenNT recusa dados além dela.
+fn new_policy_value(policy: &PolicyValue, length: u32) -> u32 {
+    let header = core::mem::offset_of!(PowerMessage, policy) as u32 + PolicyValue::SIZE as u32;
+    let data_length = policy.data_length.get();
+    if length < header || data_length > length - header {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let data = guest::read_bytes(policy.address() + PolicyValue::SIZE, data_length as usize);
+    let setting = power_setting::guid_bytes(&policy.setting);
+    let slot = policy.slot.get();
+    if setting == GUID_ACTIVE_POWERSCHEME {
+        if let Ok(scheme) = <[u8; 16]>::try_from(&data[..]) {
+            crate::debug_print!("[po] \\PowerPort: esquema de energia ativo {} ({})", crate::ntos::etw::user_registration::guid_text(&scheme), if slot == 0 { "AC" } else { "DC" });
+        }
+    }
+    power_setting::set_new_policy_value(&power_setting::guid_bytes(&policy.profile), &setting, &power_setting::guid_bytes(&policy.subgroup), slot, &data)
 }
 
 /// ZwAlpcAcceptConnectPort do primeiro cliente, com a porta de comunicação

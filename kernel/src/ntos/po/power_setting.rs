@@ -83,14 +83,16 @@
 //!
 //! Os valores chegam aos callbacks numa cópia em memória do kernel. O
 //! callback de rastro ETW que o 19041 registra em cada configuração nova
-//! (PopTracePowerSettingChange), a contagem de atualizações pendentes do
-//! deep sleep (PopIncrement/DecrementPowerSettingPendingUpdates) e os limites
-//! do PopValidatePowerSettingData (os timeouts de disco, standby e
-//! hibernação, que o OpenNT não recebe) ficam de fora. Os settings que o
-//! kernel repassa ao win32k (PopWin32kPowerSettingCallback: GUID_LOW_POWER_EPOCH
-//! e os de brilho e economia de energia) e aos componentes do Po só ganham
-//! valor pela política de energia do serviço Power, que o OpenNT ainda não
-//! recebe (`po/umpo_channel.rs`).
+//! (PopTracePowerSettingChange) e a contagem de atualizações pendentes do
+//! deep sleep (PopIncrement/DecrementPowerSettingPendingUpdates) ficam de
+//! fora. O PopValidatePowerSettingData sobe ao mínimo os timeouts de disco,
+//! standby e hibernação. Os valores do esquema de energia chegam do serviço
+//! Power pela mensagem 4 do `\PowerPort` (PopSetNewPolicyValue,
+//! `po/umpo_channel.rs`) e vão aos callbacks e aos nomes WNF como qualquer
+//! outro. Os callbacks internos do Po (PopInitialSettingCallbacks do
+//! PopInitializePowerSettingCallbacks: os timeouts de vídeo e de console, o
+//! sono, os botões, o repasse ao win32k pelo PopWin32kPowerSettingCallback)
+//! não são registrados, então o PopPowerSettingValues continua zerado.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -110,7 +112,7 @@ const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
 const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 
 /// Um GUID nos 16 bytes do layout de memória.
-const fn guid(data1: u32, data2: u16, data3: u16, data4: [u8; 8]) -> [u8; 16] {
+pub(crate) const fn guid(data1: u32, data2: u16, data3: u16, data4: [u8; 8]) -> [u8; 16] {
     let a = data1.to_le_bytes();
     let b = data2.to_le_bytes();
     let c = data3.to_le_bytes();
@@ -122,7 +124,7 @@ pub const GUID_ACDC_POWER_SOURCE: [u8; 16] = guid(0x5d3e_9a59, 0xe9d5, 0x4b00, [
 /// GUID_SESSION_DISPLAY_STATUS {2b84c20e-ad23-4ddf-93db-05ffbd7efca5}.
 pub const GUID_SESSION_DISPLAY_STATUS: [u8; 16] = guid(0x2b84_c20e, 0xad23, 0x4ddf, [0x93, 0xdb, 0x05, 0xff, 0xbd, 0x7e, 0xfc, 0xa5]);
 /// GUID_SESSION_USER_PRESENCE {3c0f4548-c03f-4c4d-b9f2-237ede686376}.
-const GUID_SESSION_USER_PRESENCE: [u8; 16] = guid(0x3c0f_4548, 0xc03f, 0x4c4d, [0xb9, 0xf2, 0x23, 0x7e, 0xde, 0x68, 0x63, 0x76]);
+pub const GUID_SESSION_USER_PRESENCE: [u8; 16] = guid(0x3c0f_4548, 0xc03f, 0x4c4d, [0xb9, 0xf2, 0x23, 0x7e, 0xde, 0x68, 0x63, 0x76]);
 /// PopSessionSpecificGuids.
 const SESSION_SPECIFIC_GUIDS: [[u8; 16]; 2] = [GUID_SESSION_DISPLAY_STATUS, GUID_SESSION_USER_PRESENCE];
 /// GUID_CONSOLE_DISPLAY_STATE {6fe69556-704a-47a0-8f24-c28d936fda47}.
@@ -134,6 +136,16 @@ pub const GUID_MONITOR_POWER_ON: [u8; 16] = guid(0x0273_1015, 0x4510, 0x4526, [0
 /// o registro já começa com o valor corrente (sem callback inicial).
 const GUID_IDLE_BACKGROUND_TASK: [u8; 16] = guid(0x515c_31d8, 0xf734, 0x163d, [0xa0, 0xfd, 0x11, 0xa0, 0x8c, 0x91, 0xe8, 0xf1]);
 const GUID_BACKGROUND_TASK_NOTIFICATION: [u8; 16] = guid(0xcf23_f240, 0x2a54, 0x48d8, [0xb1, 0x14, 0xde, 0x15, 0x18, 0xff, 0x05, 0x2e]);
+/// GUID_PROCESSOR_SETTINGS_SUBGROUP {54533251-82be-4824-96c1-47b60b740d00}:
+/// os valores deste subgrupo vão antes aos perfis do PPM.
+pub const GUID_PROCESSOR_SETTINGS_SUBGROUP: [u8; 16] = guid(0x5453_3251, 0x82be, 0x4824, [0x96, 0xc1, 0x47, 0xb6, 0x0b, 0x74, 0x0d, 0x00]);
+/// GUID_DISK_POWERDOWN_TIMEOUT {6738e2c4-e8a5-4a42-b16a-e040e769756e},
+/// GUID_STANDBY_TIMEOUT {29f6c1db-86da-48c5-9fdb-f2b67b1f44da} e
+/// GUID_HIBERNATE_TIMEOUT {9d7815a6-7ee4-497e-8888-515a05f02364}: os
+/// timeouts com mínimo no PopValidatePowerSettingData.
+pub const GUID_DISK_POWERDOWN_TIMEOUT: [u8; 16] = guid(0x6738_e2c4, 0xe8a5, 0x4a42, [0xb1, 0x6a, 0xe0, 0x40, 0xe7, 0x69, 0x75, 0x6e]);
+pub const GUID_STANDBY_TIMEOUT: [u8; 16] = guid(0x29f6_c1db, 0x86da, 0x48c5, [0x9f, 0xdb, 0xf2, 0xb6, 0x7b, 0x1f, 0x44, 0xda]);
+pub const GUID_HIBERNATE_TIMEOUT: [u8; 16] = guid(0x9d78_15a6, 0x7ee4, 0x497e, [0x88, 0x88, 0x51, 0x5a, 0x05, 0xf0, 0x23, 0x64]);
 
 /// Flags da configuração.
 const FLAG_PUBLISH_PENDING: u32 = 1;
@@ -187,7 +199,7 @@ const _: () = {
 };
 
 /// Os 16 bytes de um GUID do NT.
-fn guid_bytes(value: &Guid) -> [u8; 16] {
+pub(crate) fn guid_bytes(value: &Guid) -> [u8; 16] {
     let mut bytes = [0u8; 16];
     bytes[0..4].copy_from_slice(&value.data1.get().to_le_bytes());
     bytes[4..6].copy_from_slice(&value.data2.get().to_le_bytes());
@@ -380,8 +392,34 @@ fn next_change_stamp() -> u32 {
     }
 }
 
+/// PopValidatePowerSettingData (0x6f3bc4) sobre a cópia do valor, antes da
+/// comparação com o slot: um ULONG de GUID_DISK_POWERDOWN_TIMEOUT entre 1 e
+/// 14 vira 15 (fora de uma plataforma AoAc, que o OpenNT não é), de
+/// GUID_STANDBY_TIMEOUT entre 1 e 29 vira 30 e de GUID_HIBERNATE_TIMEOUT
+/// entre 1 e 59 vira 60. O zero (nunca), outros tamanhos e os outros
+/// settings passam iguais.
+pub fn validate_data(setting: &[u8; 16], data: &mut [u8]) {
+    let Ok(bytes) = <[u8; 4]>::try_from(&data[..]) else { return };
+    let minimum = if *setting == GUID_DISK_POWERDOWN_TIMEOUT {
+        15
+    } else if *setting == GUID_STANDBY_TIMEOUT {
+        30
+    } else if *setting == GUID_HIBERNATE_TIMEOUT {
+        60
+    } else {
+        return;
+    };
+    let value = u32::from_le_bytes(bytes);
+    if value != 0 && value < minimum {
+        data.copy_from_slice(&u32::to_le_bytes(minimum));
+    }
+}
+
 /// PopSetPowerSettingValue(Guid, Session, Slot, Data).
 fn set_value(setting: &[u8; 16], session: u32, slot: usize, data: &[u8]) {
+    let mut data = data.to_vec();
+    validate_data(setting, &mut data);
+    let data = &data[..];
     let session_specific = is_session_specific(setting);
     let guard = SETTING_LOCK.acquire_exclusive();
     let (announce, dispatch, publish) = {
@@ -459,6 +497,30 @@ pub fn set_session_display_status(session: u32, state: u32) {
     let data = state.to_le_bytes();
     set_value(&GUID_SESSION_DISPLAY_STATUS, session, SLOT_AC, &data);
     set_value(&GUID_SESSION_DISPLAY_STATUS, session, SLOT_DC, &data);
+}
+
+/// PopSetNewPolicyValue (0x6f33c0): um valor de política que o serviço Power
+/// manda pelo `\PowerPort` (a mensagem 4 do `po/umpo_channel.rs`). Um setting
+/// de sessão é ignorado. Fora do subgrupo do processador o valor vai à
+/// configuração de máquina no slot pedido (0 AC, 1 DC). No subgrupo do
+/// processador o 19041 entrega antes o valor ao perfil do PPM
+/// (PpmSetProfilePolicySetting, com STATUS_NOT_FOUND contando como sucesso)
+/// e só o perfil nulo, o padrão do umpo, chega também à configuração; o
+/// OpenNT não tem os perfis do PPM, que respondem como STATUS_NOT_FOUND. O
+/// 19041 indexa a configuração com o slot sem conferir; o OpenNT recusa os
+/// slots além do Hot. Devolve o NTSTATUS.
+pub fn set_new_policy_value(profile: &[u8; 16], setting: &[u8; 16], subgroup: &[u8; 16], slot: u32, data: &[u8]) -> u32 {
+    if is_session_specific(setting) {
+        return 0;
+    }
+    if *subgroup == GUID_PROCESSOR_SETTINGS_SUBGROUP && *profile != [0u8; 16] {
+        return 0;
+    }
+    if slot as usize > SLOT_HOT {
+        return STATUS_INVALID_PARAMETER;
+    }
+    set_value(setting, ANY_SESSION, slot as usize, data);
+    0
 }
 
 /// PoRegisterPowerSettingCallback(DeviceObject, &SettingGuid, Callback,
