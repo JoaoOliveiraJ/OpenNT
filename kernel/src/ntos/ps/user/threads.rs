@@ -946,11 +946,11 @@ fn resume_terminated(executor: fn(u64, u64) -> u32, caller: u64) -> Result<(), K
     Ok(())
 }
 
-/// Quanto um fim de processo adiado espera, além das [`UNWIND_ROUNDS`]
-/// voltas, as threads que rodam o próprio PspExitThread (as com estado do
-/// win32k): o desfazer do serviço e os callouts de saída podem esperar
-/// outras threads por muitas voltas do despachante. Passado o prazo, o
-/// término roda mesmo assim, com o aviso.
+/// Quanto um fim de processo adiado espera as threads que rodam o próprio
+/// PspExitThread (as com estado do win32k) antes do aviso. O término não
+/// roda antes delas: o PspExitThread da última thread do 19041
+/// (0x6c3af1..0x6c3c83) espera, sem prazo, o objeto de cada outra thread
+/// antes do próprio callout de thread e do callout de processo.
 const UNWIND_TIMEOUT_MS: u64 = 10_000;
 
 /// Um fim de processo pedido e ainda não concluído.
@@ -964,6 +964,8 @@ struct PendingExit {
     /// O término já está rodando: um despacho aninhado nele (uma espera do
     /// término que gira o pump) não o recomeça.
     finishing: bool,
+    /// O aviso de término demorado já saiu.
+    warned: bool,
 }
 
 /// O fim de `process` foi pedido e ainda não concluiu.
@@ -998,7 +1000,7 @@ pub fn begin_exit(process: u64, status: u32) -> bool {
         if exiting.iter().any(|pending| pending.process == process) {
             return false;
         }
-        exiting.push(PendingExit { process, status, rounds: 0, since: clock::uptime_ms(), finishing: false });
+        exiting.push(PendingExit { process, status, rounds: 0, since: clock::uptime_ms(), finishing: false, warned: false });
     }
     process::reference(process);
     for thread in of_process(process) {
@@ -1046,34 +1048,44 @@ pub fn end_exit(process: u64) {
 
 /// Conclui os fins de processo adiados que já podem rodar. Um que espera há
 /// mais de [`UNWIND_ROUNDS`] voltas do despachante (`count_round`: esta
-/// chamada é a de uma volta) — um serviço que nunca deixa o kernel —
-/// conclui mesmo assim, com o aviso: a thread presa fica no índice. Enquanto
-/// uma thread dele ainda tem o próprio término por rodar, a espera vai até
-/// [`UNWIND_TIMEOUT_MS`] desde o pedido.
+/// chamada é a de uma volta) só com threads mortas presas num serviço que
+/// nunca deixa o kernel conclui mesmo assim, com o aviso: a thread presa fica
+/// no índice. Enquanto uma thread dele ainda tem o próprio término por
+/// rodar, o término espera, sem prazo, como o PspExitThread do 19041
+/// (0x6c3c61); passado [`UNWIND_TIMEOUT_MS`] sai um aviso, uma vez.
 fn finish_pending_exits(count_round: bool) {
     if crate::hal::amd64::usermode::in_service() {
         return;
     }
-    let due: Vec<(u64, u64)> = {
+    let due: Vec<(u64, u64, bool)> = {
         let mut exiting = EXITING.lock();
         if count_round {
             exiting.iter_mut().for_each(|pending| pending.rounds += 1);
         }
-        exiting.iter().filter(|pending| !pending.finishing && pending.rounds > UNWIND_ROUNDS).map(|pending| (pending.process, pending.since)).collect()
+        exiting.iter().filter(|pending| !pending.finishing && pending.rounds > UNWIND_ROUNDS).map(|pending| (pending.process, pending.since, pending.warned)).collect()
     };
     let now = clock::uptime_ms();
-    for (process, since) in due.iter().copied() {
+    for (process, since, warned) in due.iter().copied() {
         let threads = of_process(process);
-        let exiting_alone = threads.iter().filter(|thread| thread.termination_pending()).count();
-        if exiting_alone != 0 && now.saturating_sub(since) < UNWIND_TIMEOUT_MS {
+        // Uma thread que roda ou vai rodar o próprio PspExitThread segura o
+        // término: o callout de processo do win32k (o DestroyProcessInfo solta
+        // o ppi->rpwinsta) não pode vir antes do callout de thread dela.
+        let exiting_alone: Vec<&Arc<UserThread>> = threads.iter().filter(|thread| thread.termination_pending()).collect();
+        if !exiting_alone.is_empty() {
+            if !warned && now.saturating_sub(since) >= UNWIND_TIMEOUT_MS {
+                if let Some(pending) = EXITING.lock().iter_mut().find(|pending| pending.process == process) {
+                    pending.warned = true;
+                }
+                for thread in exiting_alone {
+                    let exit_running = thread.with(|thread| thread.exit_running);
+                    crate::debug_print!("[thread] processo {:#x}: tid={} ainda sem o proprio termino (PspExitThread em curso={}); o termino espera", process, thread.thread_id, exit_running);
+                }
+            }
             continue;
         }
         let left = threads.iter().filter(|thread| thread.blocked_in_kernel()).count();
         if left != 0 {
             crate::debug_print!("[thread] {} thread(s) ainda bloqueada(s) no kernel no fim do processo {:#x}", left, process);
-        }
-        if exiting_alone != 0 {
-            crate::debug_print!("[thread] {} thread(s) sem o proprio termino concluido no fim do processo {:#x}", exiting_alone, process);
         }
         crate::ntos::ps::create::finish_exit(process);
     }
