@@ -661,7 +661,12 @@ const LOGON_SCREEN_PROGRAMS: &[&str] = &[
     // normalizar as URIs dos recursos (CWinUriLegacy::GetHealthyUrl, o
     // CreateURLMonikerEx) no InitializePresenterWithTheme do XAMLHostWindow;
     // os imports estáticos dele (iertutil, srvcli, netutils) já estão aqui.
+    // E o windows.storage.dll, o anfitrião das pastas conhecidas
+    // (ext-ms-win-shell32-shellfolders: SHGetKnownFolderPath) que o urlmon.dll
+    // carrega por delay-load nesse mesmo caminho; os imports estáticos dele
+    // (combase, msvcp_win, wldp) já estão aqui.
     "urlmon.dll",
+    "windows.storage.dll",
     "WindowManagementAPI.dll",
     "TextInputFramework.dll",
     "InputHost.dll",
