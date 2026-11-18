@@ -4,7 +4,8 @@
 //! REG_BINARY conservam descritor de segurança, limite de dados e GUID da
 //! referência Windows; não contêm dados publicados nem estado do host. Os
 //! nomes são os que a ntdll, o kernelbase e os programas do caminho do smss
-//! (csrss, wininit, services, lsass) assinam.
+//! (csrss, wininit, services, lsass) assinam, e os da Política de Grupo que o
+//! gpapi.dll assina.
 
 use alloc::vec::Vec;
 
@@ -504,8 +505,17 @@ const GPOL_SYSTEM_CHANGES: (&str, &str) = (
     ),
 );
 
-pub const DEFINITIONS: [(&str, &str); 54] = {
-    let mut definitions = [("", ""); 54];
+/// WNF_GPOL_USER_CHANGES — 176 bytes: o nome bem conhecido de escopo de
+/// usuário da Política de Grupo. O RegisterGPNotification(..., FALSE) do
+/// gpapi.dll (CGPNotify::RegisterForNotification, RtlQueryWnfStateData em
+/// 0x24b5 e RtlSubscribeWnfStateChangeNotification em 0x24ed) assina esse
+/// nome, e o NotifyThread do gpsvc.dll o publica (0x6e8b4); sem a definição
+/// a assinatura devolve STATUS_OBJECT_NAME_NOT_FOUND. O valor da instalação
+/// é o mesmo descritor do WNF_GPOL_SYSTEM_CHANGES, byte a byte.
+const GPOL_USER_CHANGES: (&str, &str) = ("0D891E2AA3BC10F5", GPOL_SYSTEM_CHANGES.1);
+
+pub const DEFINITIONS: [(&str, &str); 55] = {
+    let mut definitions = [("", ""); 55];
     definitions[0] = FEATURE_CONFIGURATION_CHANGED;
     definitions[1] = KERNELBASE_NOTIFICATION;
     definitions[2] = KERNELBASE_SECOND_NOTIFICATION;
@@ -517,6 +527,7 @@ pub const DEFINITIONS: [(&str, &str); 54] = {
     }
     definitions[4 + SMSS_PATH_NOTIFICATIONS.len()] = PO_SCENARIO_CHANGE;
     definitions[5 + SMSS_PATH_NOTIFICATIONS.len()] = GPOL_SYSTEM_CHANGES;
+    definitions[6 + SMSS_PATH_NOTIFICATIONS.len()] = GPOL_USER_CHANGES;
     definitions
 };
 
