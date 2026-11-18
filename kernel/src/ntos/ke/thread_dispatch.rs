@@ -12,6 +12,7 @@
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::{clock, pcr};
 use crate::hal::cpu;
@@ -41,6 +42,10 @@ pub const USER_RUNTIME: u64 = 1 << 63;
 pub struct Owner {
     pub runtime: u64,
     pub yield_requested: bool,
+    /// O pedido veio do KeYieldExecution (NtYieldExecution, ZwYieldExecution
+    /// ou o Sleep(0) de usuário): o fim da execução escolhe a sucessora como
+    /// o KiSelectReadyThreadEx(Prcb, NULL, 1).
+    pub yield_execution: bool,
     /// Porta de conclusão de I/O associada (worker factories, fase 7).
     pub io_completion_port: Option<u64>,
 }
@@ -77,6 +82,24 @@ static STATE: SpinLock<Dispatch> = SpinLock::new(Dispatch {
 /// nas contagens e na NextThread passa por ele, inclusive a prontidão vinda
 /// de outra CPU.
 static QUEUES: SpinLock<()> = SpinLock::new(());
+
+/// A NextThread que um KeYieldExecution reservou para uma thread de
+/// prioridade menor que a da thread que cedeu (YIELD_TARGET) e a thread que
+/// cedeu (YIELDER). No NT a escolhida entra direto pelo KiSwapContext e a
+/// que cedeu vai à fila pelo KiQueueReadyThread, sem preempção; aqui a
+/// reserva vale enquanto a única concorrente mais prioritária na fila é a
+/// thread que cedeu. Mudam só sob o PrcbLock (`QUEUES`).
+static YIELD_TARGET: AtomicU64 = AtomicU64::new(0);
+static YIELDER: AtomicU64 = AtomicU64::new(0);
+
+/// A reserva do KeYieldExecution acaba quando `thread` (a escolhida) sai da
+/// NextThread. Sob o PrcbLock.
+fn end_yield_reservation_locked(thread: u64) {
+    if YIELD_TARGET.load(Ordering::Relaxed) == thread {
+        YIELD_TARGET.store(0, Ordering::Relaxed);
+        YIELDER.store(0, Ordering::Relaxed);
+    }
+}
 
 /// O número da CPU corrente (KPRCB.Number pelo GS; 0 antes da KPCR).
 fn cpu_index() -> usize {
@@ -262,6 +285,11 @@ fn reserve_next_locked(thread: u64) {
     }
     kthread.state.set(state::STANDBY);
     processor().next_thread.set(thread);
+    // Outra reserva encerra a de um KeYieldExecution.
+    if YIELD_TARGET.load(Ordering::Relaxed) != thread {
+        YIELD_TARGET.store(0, Ordering::Relaxed);
+        YIELDER.store(0, Ordering::Relaxed);
+    }
 }
 
 pub fn reserve_next(thread: u64) {
@@ -380,7 +408,7 @@ pub fn register(thread: u64, runtime: u64) -> Result<(), KernelError> {
         if dispatch.owners.contains_key(&thread) {
             return Err(KernelError::new("thread already has scheduler owner"));
         }
-        dispatch.owners.insert(thread, Owner { runtime, yield_requested: false, io_completion_port: None });
+        dispatch.owners.insert(thread, Owner { runtime, yield_requested: false, yield_execution: false, io_completion_port: None });
     }
     make_ready(thread)
 }
@@ -411,6 +439,7 @@ pub fn suspend(thread: u64, new_state: u8) -> Result<(), KernelError> {
         }
         if next_thread() == thread {
             processor().next_thread.set(0);
+            end_yield_reservation_locked(thread);
         }
         let kthread = kthread(thread);
         kthread.state.set(new_state);
@@ -441,8 +470,11 @@ pub fn peek() -> Result<Option<(u64, Owner)>, KernelError> {
         let _queues = QUEUES.lock();
         let mut reserved = next_thread();
         let ready = highest_ready_locked()?;
-        if ready != 0 && (reserved == 0 || priority(ready) > priority(reserved)) {
+        // A reserva de um KeYieldExecution não perde para a thread que cedeu.
+        let yielded = reserved != 0 && reserved == YIELD_TARGET.load(Ordering::Relaxed) && ready == YIELDER.load(Ordering::Relaxed);
+        if ready != 0 && !yielded && (reserved == 0 || priority(ready) > priority(reserved)) {
             if reserved != 0 {
+                end_yield_reservation_locked(reserved);
                 enqueue_ready_locked(reserved, true, false);
             }
             remove_ready_locked(ready)?;
@@ -479,6 +511,7 @@ pub fn begin_execution(thread: u64) -> Result<(), KernelError> {
         }
         if next_thread() == thread {
             processor().next_thread.set(0);
+            end_yield_reservation_locked(thread);
         }
         let kthread = kthread(thread);
         kthread.state.set(state::RUNNING);
@@ -517,7 +550,7 @@ pub fn compute_quantum_end_priority(thread: u64) -> u8 {
 
 pub fn end_execution(thread: u64, new_state: u8) -> Result<(), KernelError> {
     let cpu = cpu_index();
-    let voluntary_yield = {
+    let (voluntary_yield, yield_execution) = {
         let mut dispatch = STATE.lock();
         let execution = &mut dispatch.cpus[cpu];
         if execution.active.as_ref().map(|active| active.pointer) != Some(thread) {
@@ -525,8 +558,8 @@ pub fn end_execution(thread: u64, new_state: u8) -> Result<(), KernelError> {
         }
         account_active_cycles(execution);
         match dispatch.owners.get_mut(&thread) {
-            Some(owner) => core::mem::replace(&mut owner.yield_requested, false),
-            None => false,
+            Some(owner) => (core::mem::replace(&mut owner.yield_requested, false), core::mem::replace(&mut owner.yield_execution, false)),
+            None => (false, false),
         }
     };
     let kthread = kthread(thread);
@@ -534,7 +567,10 @@ pub fn end_execution(thread: u64, new_state: u8) -> Result<(), KernelError> {
     let cycles = kthread.cycle_time.get();
     let quantum_disabled = kthread.disable_quantum() != 0;
     let expired = !quantum_disabled && cycles >= kthread.quantum_target.get();
-    if expired && new_state == state::READY {
+    // O KeYieldExecution recalcula a prioridade de quem cede como o fim do
+    // quantum (KiComputeNewPriority com ajuste 1), mesmo com quantum
+    // restante.
+    if (expired || yield_execution) && new_state == state::READY {
         kthread.priority.set(compute_quantum_end_priority(thread) as i8);
     }
     // Yield explícito entrega a vez mesmo com quantum restante.
@@ -545,6 +581,9 @@ pub fn end_execution(thread: u64, new_state: u8) -> Result<(), KernelError> {
         // A thread ainda consta como em execução: sai dela direto para a fila.
         initialize_queues();
         let _queues = QUEUES.lock();
+        if yield_execution {
+            reserve_yield_target_locked(thread)?;
+        }
         enqueue_ready_locked(thread, !expired && !voluntary_yield, false);
     } else {
         suspend(thread, new_state)?;
@@ -558,6 +597,9 @@ pub fn end_execution(thread: u64, new_state: u8) -> Result<(), KernelError> {
     Ok(())
 }
 
+/// A troca de uma thread de kernel que cede no próprio laço (o
+/// SwitchReason::Yield do escalonador): só para uma pronta de prioridade
+/// igual ou maior, como a rodada do fim de quantum.
 pub fn request_yield(thread: u64) -> Result<bool, KernelError> {
     if !STATE.lock().owners.contains_key(&thread) {
         return Ok(false);
@@ -573,13 +615,71 @@ pub fn request_yield(thread: u64) -> Result<bool, KernelError> {
     Ok(true)
 }
 
+/// A sucessora do KiSelectReadyThreadEx(Prcb, NULL, 1) do KeYieldExecution
+/// (rva 0x2f64d0 do 19041): a NextThread reservada ou a pronta de maior
+/// prioridade a partir de 1 (KiSelectReadyThread(1, Prcb)), qualquer que
+/// seja a prioridade de quem cede. Sob o PrcbLock; 0 sem nenhuma.
+fn select_yield_target_locked(thread: u64) -> Result<u64, KernelError> {
+    let next = next_thread();
+    if next != 0 && next != thread {
+        return Ok(next);
+    }
+    let ready = highest_ready_locked()?;
+    Ok(if ready != 0 && ready != thread && priority(ready) >= 1 { ready } else { 0 })
+}
+
+/// No fim da execução de quem cedeu pelo KeYieldExecution, antes de ela ir
+/// à fila: a sucessora de prioridade menor fica reservada na NextThread
+/// (uma de prioridade igual ou maior já é a escolha do despacho).
+fn reserve_yield_target_locked(thread: u64) -> Result<(), KernelError> {
+    let target = select_yield_target_locked(thread)?;
+    if target == 0 || priority(target) >= priority(thread) {
+        return Ok(());
+    }
+    if next_thread() != target {
+        remove_ready_locked(target)?;
+        reserve_next_locked(target);
+    }
+    YIELD_TARGET.store(target, Ordering::Relaxed);
+    YIELDER.store(thread, Ordering::Relaxed);
+    Ok(())
+}
+
+/// KeYieldExecution(0): o NtYieldExecution, o ZwYieldExecution e o atraso
+/// zero não alertável de UserMode do KeDelayExecutionThread (rva 0x256e39,
+/// a mesma escolha pelo KiSelectReadyThreadEx(Prcb, NULL, 1)). Havendo
+/// NextThread ou uma pronta de prioridade a partir de 1, de qualquer
+/// prioridade relativa à da thread corrente, ela cede a CPU (`true`,
+/// STATUS_SUCCESS); senão STATUS_NO_YIELD_PERFORMED. A troca acontece no fim
+/// da execução (`end_execution`): a prioridade de quem cede recebe o ajuste
+/// do fim de quantum e uma sucessora de prioridade menor fica reservada.
+pub fn request_yield_execution(thread: u64) -> Result<bool, KernelError> {
+    if !STATE.lock().owners.contains_key(&thread) {
+        return Ok(false);
+    }
+    initialize_queues();
+    let target = {
+        let _queues = QUEUES.lock();
+        select_yield_target_locked(thread)?
+    };
+    if target == 0 {
+        return Ok(false);
+    }
+    if let Some(owner) = STATE.lock().owners.get_mut(&thread) {
+        owner.yield_requested = true;
+        owner.yield_execution = true;
+    }
+    Ok(true)
+}
+
 /// ZwYieldExecution fora de uma thread de sistema (o KeYieldExecution(0)):
-/// a thread corrente cede a CPU quando outra pronta tem prioridade igual ou
-/// maior (STATUS_SUCCESS); senão STATUS_NO_YIELD_PERFORMED. As threads de
-/// kernel com pilha própria cedem de fato (`context_switch`).
+/// a thread corrente cede a CPU quando há outra pronta
+/// ([`request_yield_execution`], STATUS_SUCCESS); senão
+/// STATUS_NO_YIELD_PERFORMED. As threads de kernel com pilha própria cedem
+/// de fato (`context_switch`).
 pub fn yield_execution() -> Result<u32, KernelError> {
     let thread = crate::ntos::ps::process::get_current_thread();
-    if !request_yield(thread)? {
+    if !request_yield_execution(thread)? {
         return Ok(0x4000_0024);
     }
     if super::context_switch::on_kernel_thread_stack() == Some(thread) && super::context_switch::kernel_thread_can_block() {

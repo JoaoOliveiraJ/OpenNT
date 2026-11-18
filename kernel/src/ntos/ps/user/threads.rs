@@ -2286,7 +2286,8 @@ fn nt_alert_thread(handle: u64, _a2: u64, _a3: u64, _a4: u64, _rsp: u64) -> Resu
 
 fn nt_yield_execution(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
     let Some(current) = current() else { return Ok(0x4000_0024) };
-    Ok(if thread_dispatch::request_yield(current.pointer())? { 0 } else { 0x4000_0024 })
+    // KeYieldExecution(0): qualquer pronta de prioridade a partir de 1.
+    Ok(if thread_dispatch::request_yield_execution(current.pointer())? { 0 } else { 0x4000_0024 })
 }
 
 fn nt_wait_for_alert_by_thread_id(_address: u64, timeout: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {

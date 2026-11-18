@@ -934,7 +934,16 @@ ms arredondados para cima (um prazo não nulo abaixo de 1 ms espera o
 próximo ms, nunca vence de imediato). O NtDelayExecution com intervalo zero,
 sem Alertable e sem UserApcPending, é a troca do NtYieldExecution
 (STATUS_SUCCESS ou STATUS_NO_YIELD_PERFORMED), como no
-KeDelayExecutionThread. O NtSignalAndWaitForSingleObject referencia o
+KeDelayExecutionThread. Os dois e o ZwYieldExecution escolhem como o
+KeYieldExecution(0) (`thread_dispatch::request_yield_execution`, o
+KiSelectReadyThreadEx(Prcb, NULL, 1)): a NextThread ou a pronta de maior
+prioridade a partir de 1, de qualquer prioridade relativa à da thread que
+cede; no fim da execução a prioridade de quem cede recebe o ajuste do fim
+de quantum e uma sucessora de prioridade menor fica reservada na
+NextThread, sem perder para a thread que cedeu (teste:
+`ntos/test/yield_execution.rs`). A cessão de uma thread de kernel no
+próprio laço do escalonador segue só para uma pronta de prioridade igual ou
+maior. O NtSignalAndWaitForSingleObject referencia o
 objeto a sinalizar sem direito e o de espera com SYNCHRONIZE, sinaliza pelo
 tipo (`ob/wait::SignalObject`: evento com EVENT_MODIFY_STATE, mutant com a
 posse, semáforo com SEMAPHORE_MODIFY_STATE e o limite, outro tipo
