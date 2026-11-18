@@ -2697,13 +2697,23 @@ fn zw_kernel_files(assert: Assert) {
     assert(named == Some(0) && queried_name.starts_with("\\Device\\") && queried_name.to_lowercase().ends_with("\\opennt-zw.txt") && guest::read32(name_length) == nt::ObjectNameInformation::SIZE as u32 + queried_name.encode_utf16().count() as u32 * 2 + 2 && short == Some(0xC000_0004), "zwfile: ObQueryNameString de um FILE_OBJECT da o dispositivo e o arquivo");
     guest::free_bytes(name_buffer);
     guest::free_bytes(name_length);
-    // O alias de instalação do volume de boot (System32 na raiz).
+    // O alias de instalação do volume de boot (o conteúdo de \Windows na
+    // raiz, como o modo usuário o abre).
     {
         use crate::drivers::fs::volume_files::install_alias;
         let root_only = install_alias("/Windows/System32/kbdus.dll", |path| path == "/kbdus.dll");
         let literal = install_alias("/Windows/System32/config/SYSTEM", |path| path == "/Windows/System32/config/SYSTEM" || path == "/config/SYSTEM");
-        let outside = install_alias("/Windows/kbdus.dll", |_| true);
-        assert(root_only.as_deref() == Some("/kbdus.dll") && literal.is_none() && outside.is_none() && install_alias("/Windows/System32/ausente.dll", |_| false).is_none(), "zwfile: o alias de System32 do volume de boot so vale quando o caminho literal falta e a raiz tem o arquivo");
+        let present = install_alias("/Windows/kbdus.dll", |_| true);
+        assert(root_only.as_deref() == Some("/kbdus.dll") && literal.is_none() && present.is_none() && install_alias("/Windows/System32/ausente.dll", |_| false).is_none(), "zwfile: o alias de System32 do volume de boot so vale quando o caminho literal falta e a raiz tem o arquivo");
+        // O \SystemRoot\Fonts e o C:\WINDOWS\FONTS do win32k (os nomes em
+        // maiúsculas do cCapString) são as fontes da raiz, as mesmas do
+        // C:\Windows\Fonts do modo usuário; o System32 sem o arquivo na raiz
+        // não cai no alias de \Windows, e fora de \Windows nada muda.
+        let fonts = install_alias("/Windows/FONTS/VGASYS.FON", |path| path == "/FONTS/VGASYS.FON");
+        let sorting = install_alias("/WINDOWS/Globalization/Sorting/SortDefault.nls", |path| path == "/SortDefault.nls");
+        let system32_only = install_alias("/Windows/System32/kbdus.dll", |path| path == "/System32/kbdus.dll");
+        let outside = install_alias("/ProgramData/x.dat", |_| false);
+        assert(fonts.as_deref() == Some("/FONTS/VGASYS.FON") && sorting.as_deref() == Some("/SortDefault.nls") && system32_only.is_none() && outside.is_none() && install_alias("/Windows", |_| false).is_none(), "zwfile: o alias de \\Windows do volume de boot leva as aberturas do kernel ao conteudo da raiz");
     }
     let again = zw_files::create_kernel_file(output, 0x12019F, attributes, io_status, 3, 2, 0x20);
     let second = guest::read64(output);

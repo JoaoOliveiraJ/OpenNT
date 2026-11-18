@@ -2992,7 +2992,16 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   embutido não tem pilha de IRP, então o I/O Manager responde no lugar as
   operações desses arquivos (`information::related_device` dá 0 para eles)
   e um IRP mandado ao dispositivo de volume termina com
-  STATUS_INVALID_DEVICE_REQUEST. Teste: `kernel_volume_devices` na fase 6.
+  STATUS_INVALID_DEVICE_REQUEST. O volume de boot guarda o conteúdo de
+  `\Windows` na raiz (os programas de System32, `Fonts`, os temas...), que o
+  modo usuário abre pelos aliases de `volume_files::nt_path_to_volume_path`;
+  a abertura do kernel por `\SystemRoot\X` ou `\??\C:\Windows\X` que não
+  existe literalmente em `/Windows` vai ao mesmo arquivo da raiz
+  (`volume_files::install_alias`, o mesmo para `System32` e
+  `Globalization\Sorting`), e os drivers e catálogos que existem em
+  `/Windows/System32` ficam onde estão: sem isso o win32k não abria nenhuma
+  fonte (`\SystemRoot\Fonts\VGASYS.FON`) e a sessão ficava sem fonte
+  padrão. Teste: `kernel_volume_devices` na fase 6.
 - **Arquivos dos volumes do kernel** (`io/file/lifetime.rs`): os volumes
   internos (o disco em memória e o NTFS) não têm driver de file
   system, então o registro de vida faz o papel do FCB: um estado por arquivo

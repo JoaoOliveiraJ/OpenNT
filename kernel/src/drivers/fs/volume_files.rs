@@ -131,15 +131,25 @@ impl ReadCache {
     }
 }
 
+/// Os diretórios de instalação cujo conteúdo o volume de boot guarda na
+/// raiz, do mais longo ao mais curto: os mesmos aliases de
+/// [`nt_path_to_volume_path`], já relativos ao volume.
+const INSTALL_ALIASES: [&str; 3] = ["/windows/globalization/sorting/", "/windows/system32/", "/windows/"];
+
 /// O alias de instalação para um caminho já relativo ao volume de boot (a
-/// abertura pelo dispositivo, `\Device\KernelVolume1\Windows\System32\X`):
-/// os programas de System32 ficam na raiz do volume, então
-/// `/Windows/System32/X` que não existe vira `/X` quando este existe. Fora
-/// disso, `None` (o caminho fica como está).
+/// abertura pelo dispositivo ou pelo `\SystemRoot`,
+/// `\Device\KernelVolume1\Windows\System32\X`, `\SystemRoot\Fonts\X`): o
+/// conteúdo de `\Windows` (os programas de System32, as fontes, os temas...)
+/// fica na raiz do volume, como o modo usuário o abre por
+/// [`nt_path_to_volume_path`]; então `/Windows/System32/X` ou
+/// `/Windows/Fonts/X` que não existe vira `/X` ou `/Fonts/X` quando este
+/// existe, e o kernel e o modo usuário abrem o mesmo arquivo. O caminho
+/// literal que existe (os drivers e catálogos de `/Windows/System32`) fica
+/// como está; fora de `\Windows`, `None`.
 pub fn install_alias(volume_path: &str, exists: impl Fn(&str) -> bool) -> Option<String> {
-    const SYSTEM32: &str = "/windows/system32/";
     let lower = volume_path.replace('\\', "/").to_lowercase();
-    let rest = lower.strip_prefix(SYSTEM32).map(|_| &volume_path[SYSTEM32.len()..])?;
+    let prefix = INSTALL_ALIASES.iter().find(|prefix| lower.starts_with(*prefix))?;
+    let rest = &volume_path[prefix.len()..];
     if rest.is_empty() || exists(volume_path) {
         return None;
     }
