@@ -22,6 +22,7 @@ pub mod unicode_prefix;
 pub mod utf8;
 pub mod resource;
 pub mod unwind;
+pub mod frame_walk;
 pub mod exceptions;
 pub mod strings_counted;
 pub mod ansi_code_page;

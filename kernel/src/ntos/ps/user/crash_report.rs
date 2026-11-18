@@ -19,12 +19,12 @@
 //! módulo + deslocamento (pela lista InLoadOrder do PEB_LDR_DATA ou, fora
 //! dela, pelo VAD do processo e as imagens do System), o export mais próximo
 //! do módulo e os primeiros quadros da pilha de usuário, desenrolados pela
-//! .pdata (RUNTIME_FUNCTION/UNWIND_INFO) de cada módulo; sem RUNTIME_FUNCTION
-//! o quadro é de função folha (o retorno no topo da pilha). Cada exceção
-//! entregue fica anotada na thread ([`noted`]: código, endereço, parâmetros,
-//! registradores inteiros e o frame do despachante), então o bloco de um
-//! ponto posterior (o filtro de exceções, o fim do processo) desenrola a
-//! pilha da própria falha. Sem a anotação, a pilha sai da chamada de sistema
+//! .pdata (RUNTIME_FUNCTION/UNWIND_INFO) de cada módulo (`rtl::frame_walk`);
+//! sem RUNTIME_FUNCTION o quadro é de função folha (o retorno no topo da
+//! pilha). Cada exceção entregue fica anotada na thread ([`noted`]: código,
+//! endereço, parâmetros, registradores inteiros e o frame do despachante),
+//! então o bloco de um ponto posterior (o filtro de exceções, o fim do
+//! processo) desenrola a pilha da própria falha. Sem a anotação, a pilha sai da chamada de sistema
 //! e os quadros do despacho em modo usuário (até o RtlRaiseException ou o
 //! KiUserExceptionDispatcher da ntdll) são omitidos. Um processo imprime um
 //! bloco por código: os pontos seguintes da mesma falha não repetem.
@@ -36,19 +36,18 @@
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::mem::{offset_of, size_of};
+use core::mem::offset_of;
 use core::sync::atomic::Ordering;
 
 use super::memory::{self, Space};
 use super::threads::{self, UserThread};
 use super::{process_state, state};
 use crate::hal::amd64::usermode;
-use crate::ntos::inc::types::{
-    Context, ExceptionRecord, Field, ImageDataDirectory, ImageDosHeader, ImageExportDirectory, ImageNtHeaders64, ImageRuntimeFunctionEntry, LdrDataTableEntry, NtStruct, Peb, PebLdrData, UnicodeString, UnwindInfo,
-};
+use crate::ntos::inc::types::{Context, ExceptionRecord, Field, ImageExportDirectory, LdrDataTableEntry, NtStruct, Peb, PebLdrData, UnicodeString};
 use crate::ntos::mm::guest_memory::{self as guest, GuestScalar};
 use crate::ntos::mm::memory_map::USER_PROBE_ADDRESS;
 use crate::ntos::ps::{process, process_accessors};
+use crate::ntos::rtl::frame_walk::{self, Registers, RSP};
 
 /// SystemWin32WerStartCallout, a classe do NtSetSystemInformation que o
 /// relatório de falha da kernel32 chama.
@@ -98,8 +97,6 @@ const EXCEPTION_CODES: [u32; 32] = [
     0xC06D_007F, // VcppException(ERROR_SEVERITY_ERROR, ERROR_PROC_NOT_FOUND)
 ];
 
-/// Rsp no vetor de inteiros (a ordem dos números de registrador do x64).
-const RSP: usize = 4;
 /// Quadros desenrolados e mostrados.
 const WALK_FRAMES: usize = 24;
 const SHOWN_FRAMES: usize = 10;
@@ -111,22 +108,8 @@ const FRAME_SYMBOL_RANGE: u64 = 0x1000;
 const MAX_MODULES: usize = 512;
 const MAX_EXPORTS: u32 = 0x4000;
 const MAX_NAME: usize = 64;
-/// IMAGE_DIRECTORY_ENTRY_EXPORT e IMAGE_DIRECTORY_ENTRY_EXCEPTION.
+/// IMAGE_DIRECTORY_ENTRY_EXPORT.
 const EXPORT_DIRECTORY: usize = 0;
-const EXCEPTION_DIRECTORY: usize = 3;
-/// UNW_FLAG_CHAININFO e os códigos UWOP_* do UNWIND_CODE.
-const UNW_FLAG_CHAININFO: u8 = 4;
-const UWOP_PUSH_NONVOL: u16 = 0;
-const UWOP_ALLOC_LARGE: u16 = 1;
-const UWOP_ALLOC_SMALL: u16 = 2;
-const UWOP_SET_FPREG: u16 = 3;
-const UWOP_SAVE_NONVOL: u16 = 4;
-const UWOP_SAVE_NONVOL_FAR: u16 = 5;
-const UWOP_EPILOG: u16 = 6;
-const UWOP_SPARE_CODE: u16 = 7;
-const UWOP_PUSH_MACHFRAME: u16 = 10;
-/// Entradas encadeadas e indiretas seguidas por quadro.
-const MAX_CHAIN: usize = 8;
 
 /// O status é um código de exceção.
 fn is_exception_code(status: u32) -> bool {
@@ -225,34 +208,26 @@ fn short_name(path: &str) -> String {
 
 // ---- falha anotada --------------------------------------------------------------
 
-/// Rax..R15 na ordem dos números de registrador do x64, e o Rip.
-#[derive(Clone, Copy)]
-pub struct Registers {
-    integer: [u64; 16],
-    rip: u64,
+/// Os inteiros e o Rip de um CONTEXT, lidos por `get`.
+fn registers_from_fields(context: &Context, get: impl Fn(&Field<u64>) -> Option<u64>) -> Option<Registers> {
+    let fields = [
+        &context.rax, &context.rcx, &context.rdx, &context.rbx, &context.rsp, &context.rbp, &context.rsi, &context.rdi, &context.r8, &context.r9, &context.r10, &context.r11, &context.r12, &context.r13, &context.r14, &context.r15,
+    ];
+    let mut integer = [0u64; 16];
+    for (slot, field) in integer.iter_mut().zip(fields) {
+        *slot = get(field)?;
+    }
+    Some(Registers { integer, rip: get(&context.rip)? })
 }
 
-impl Registers {
-    fn from_fields(context: &Context, get: impl Fn(&Field<u64>) -> Option<u64>) -> Option<Self> {
-        let fields = [
-            &context.rax, &context.rcx, &context.rdx, &context.rbx, &context.rsp, &context.rbp, &context.rsi, &context.rdi, &context.r8, &context.r9, &context.r10, &context.r11, &context.r12, &context.r13, &context.r14, &context.r15,
-        ];
-        let mut integer = [0u64; 16];
-        for (slot, field) in integer.iter_mut().zip(fields) {
-            *slot = get(field)?;
-        }
-        Some(Self { integer, rip: get(&context.rip)? })
-    }
+/// Do CONTEXT salvo de uma thread (memória do kernel).
+fn registers_of_context(context: &Context) -> Registers {
+    registers_from_fields(context, |field| Some(field.get())).unwrap_or(Registers { integer: [0; 16], rip: 0 })
+}
 
-    /// Do CONTEXT salvo de uma thread (memória do kernel).
-    fn of_context(context: &Context) -> Self {
-        Self::from_fields(context, |field| Some(field.get())).unwrap_or(Self { integer: [0; 16], rip: 0 })
-    }
-
-    /// De um CONTEXT de usuário (sondado).
-    fn of_user_context(pointer: u64) -> Option<Self> {
-        Self::from_fields(read_struct::<Context>(pointer)?, |field| field.probe_get().ok())
-    }
+/// De um CONTEXT de usuário (sondado).
+fn registers_of_user_context(pointer: u64) -> Option<Registers> {
+    registers_from_fields(read_struct::<Context>(pointer)?, |field| field.probe_get().ok())
 }
 
 /// Código, endereço e parâmetros de uma exceção; `None` = não conhecido.
@@ -304,7 +279,7 @@ impl Fault {
             exception.fast_fail = Some(block.fault_rcx.get() as u32);
         }
         // SAFETY: o CONTEXT salvo da thread, alocado pelo runtime.
-        let registers = if context != 0 { Registers::of_context(unsafe { Context::at(context) }) } else { Registers { integer: [0; 16], rip: 0 } };
+        let registers = if context != 0 { registers_of_context(unsafe { Context::at(context) }) } else { Registers { integer: [0; 16], rip: 0 } };
         Self { exception, registers, frame: 0 }
     }
 
@@ -381,7 +356,7 @@ pub fn second_chance(record: &[u8], context: u64) {
         thread_id: process::get_current_thread_id(),
         key: exception.code,
         exception,
-        start: Registers::of_user_context(context).map(|registers| (registers, true)),
+        start: registers_of_user_context(context).map(|registers| (registers, true)),
     });
 }
 
@@ -417,7 +392,7 @@ fn from_service(trigger: Trigger, exception: Exception) {
     let thread = threads::current();
     let syscall = thread.as_ref().and_then(|thread| thread.with(|thread| (thread.context != 0).then(|| {
         // SAFETY: o CONTEXT salvo da thread corrente, com os registradores da syscall.
-        Registers::of_context(unsafe { Context::at(thread.context) })
+        registers_of_context(unsafe { Context::at(thread.context) })
     })));
     let noted = thread.as_ref().and_then(|thread| thread.with(|thread| thread.last_exception));
     let rsp = syscall.map_or(0, |registers| registers.integer[RSP]);
@@ -455,7 +430,7 @@ pub fn process_exit(process: u64, status: u32) -> bool {
             let terminating = threads.iter().find(|thread| thread.with(|thread| thread.termination_rsp != 0)).or(threads.first());
             let registers = terminating.and_then(|thread| thread.with(|thread| (thread.context != 0).then(|| {
                 // SAFETY: o CONTEXT da thread, ainda não liberado (o término vem depois).
-                Registers::of_context(unsafe { Context::at(thread.context) })
+                registers_of_context(unsafe { Context::at(thread.context) })
             })));
             (terminating.map_or(0, |thread| thread.thread_id), Exception { code: Some(status), ..Exception::default() }, registers.map(|registers| (registers, false)))
         }
@@ -582,8 +557,8 @@ struct Exports {
 
 impl Exports {
     fn load(base: u64, size: u64) -> Option<Self> {
-        let header = nt_headers(base)?;
-        let (rva, length) = data_directory(header, EXPORT_DIRECTORY)?;
+        let header = frame_walk::nt_headers(&mut UserMemory, base)?;
+        let (rva, length) = frame_walk::data_directory(&mut UserMemory, header, EXPORT_DIRECTORY)?;
         if rva == 0 || rva as u64 + ImageExportDirectory::SIZE > size {
             return None;
         }
@@ -673,202 +648,27 @@ impl Modules {
     }
 }
 
-/// Os cabeçalhos NT de uma imagem mapeada (MZ e PE conferidos).
-fn nt_headers(base: u64) -> Option<u64> {
-    if read::<u16>(base + offset_of!(ImageDosHeader, e_magic) as u64)? != 0x5A4D {
-        return None;
-    }
-    let header = base + read::<u32>(base + offset_of!(ImageDosHeader, e_lfanew) as u64)? as u64;
-    (read::<u32>(header + offset_of!(ImageNtHeaders64, signature) as u64)? == 0x4550).then_some(header)
-}
-
-/// Um IMAGE_DATA_DIRECTORY (RVA, tamanho) dos cabeçalhos NT.
-fn data_directory(header: u64, index: usize) -> Option<(u32, u32)> {
-    if read::<u32>(header + offset_of!(ImageNtHeaders64, optional_header.number_of_rva_and_sizes) as u64)? as usize <= index {
-        return None;
-    }
-    let entry = header + (offset_of!(ImageNtHeaders64, optional_header.data_directory) + index * size_of::<ImageDataDirectory>()) as u64;
-    Some((read::<u32>(entry + offset_of!(ImageDataDirectory, virtual_address) as u64)?, read::<u32>(entry + offset_of!(ImageDataDirectory, size) as u64)?))
-}
-
 // ---- desenrolamento da pilha de usuário -----------------------------------------
 
-/// Uma RUNTIME_FUNCTION da imagem em `base` (RVAs).
-#[derive(Clone, Copy)]
-struct FunctionEntry {
-    begin: u32,
-    end: u32,
-    unwind: u32,
-}
+/// A memória de usuário do processo corrente, lida por [`readable`].
+struct UserMemory;
 
-fn read_function(address: u64) -> Option<FunctionEntry> {
-    let entry = read_struct::<ImageRuntimeFunctionEntry>(address)?;
-    Some(FunctionEntry { begin: entry.begin_address.probe_get().ok()?, end: entry.end_address.probe_get().ok()?, unwind: entry.unwind_info_address.probe_get().ok()? })
-}
-
-/// Busca binária na .pdata da imagem, seguindo as entradas indiretas.
-fn function_entry(base: u64, size: u64, pc: u64) -> Option<FunctionEntry> {
-    let (table, length) = data_directory(nt_headers(base)?, EXCEPTION_DIRECTORY)?;
-    let entry_size = ImageRuntimeFunctionEntry::SIZE;
-    if table == 0 || length as u64 % entry_size != 0 || table as u64 + length as u64 > size {
-        return None;
-    }
-    let relative = pc - base;
-    let (mut lower, mut upper) = (0i64, (length as u64 / entry_size) as i64 - 1);
-    while lower <= upper {
-        let index = (lower + upper) / 2;
-        let mut function = read_function(base + table as u64 + index as u64 * entry_size)?;
-        if relative < function.begin as u64 {
-            upper = index - 1;
-        } else if relative >= function.end as u64 {
-            lower = index + 1;
-        } else {
-            for _ in 0..MAX_CHAIN {
-                if function.unwind & 1 == 0 {
-                    return Some(function);
-                }
-                function = read_function(base + (function.unwind - 1) as u64)?;
-            }
-            return None;
-        }
-    }
-    None
-}
-
-/// Um UNWIND_INFO lido da imagem.
-struct UnwindData {
-    flags: u8,
-    prolog: u8,
-    frame: usize,
-    frame_offset: u64,
-    codes: Vec<u16>,
-    /// Depois dos códigos (em número par): a RUNTIME_FUNCTION encadeada.
-    tail: u64,
-}
-
-/// Slots de 16 bits de cada código (o RtlpUnwindOpSlotTable).
-fn slot_count(operation: u16, information: u16) -> Option<usize> {
-    Some(match operation {
-        UWOP_PUSH_NONVOL | UWOP_ALLOC_SMALL | UWOP_SET_FPREG | UWOP_PUSH_MACHFRAME => 1,
-        UWOP_ALLOC_LARGE => {
-            if information == 0 {
-                2
-            } else {
-                3
-            }
-        }
-        UWOP_SAVE_NONVOL | UWOP_EPILOG | 8 => 2,
-        UWOP_SAVE_NONVOL_FAR | UWOP_SPARE_CODE | 9 => 3,
-        _ => return None,
-    })
-}
-
-impl UnwindData {
-    fn read(address: u64) -> Option<Self> {
-        let info = read_struct::<UnwindInfo>(address)?;
-        let header = info.bitfield_0.probe_get().ok()?;
-        let version = (header & UnwindInfo::VERSION_MASK) >> UnwindInfo::VERSION_SHIFT;
-        if version != 1 && version != 2 {
-            return None;
-        }
-        let frame = info.bitfield_3.probe_get().ok()?;
-        let count = info.count_of_codes.probe_get().ok()? as usize;
-        let first = info.unwind_code[0].address();
-        Some(Self {
-            flags: (header & UnwindInfo::FLAGS_MASK) >> UnwindInfo::FLAGS_SHIFT,
-            prolog: info.size_of_prolog.probe_get().ok()?,
-            frame: ((frame & UnwindInfo::FRAME_REGISTER_MASK) >> UnwindInfo::FRAME_REGISTER_SHIFT) as usize,
-            frame_offset: ((frame & UnwindInfo::FRAME_OFFSET_MASK) >> UnwindInfo::FRAME_OFFSET_SHIFT) as u64 * 16,
-            codes: read_u16s(first, count)?,
-            tail: first + (((count + 1) & !1) * 2) as u64,
-        })
-    }
-
-    /// O establisher frame: RSP antes do SET_FPREG, depois o registrador de
-    /// frame menos o deslocamento.
-    fn establisher(&self, registers: &Registers, relative: u64) -> u64 {
-        if self.frame == 0 {
-            return registers.integer[RSP];
-        }
-        let mut established = relative >= self.prolog as u64 || self.flags & UNW_FLAG_CHAININFO != 0;
-        let mut slot = 0;
-        while !established && slot < self.codes.len() {
-            let code = self.codes[slot];
-            let operation = (code >> 8) & 0xF;
-            established = operation == UWOP_SET_FPREG && (code & 0xFF) as u64 <= relative;
-            let Some(slots) = slot_count(operation, code >> 12) else { break };
-            slot += slots;
-        }
-        if established { registers.integer[self.frame].wrapping_sub(self.frame_offset) } else { registers.integer[RSP] }
+impl frame_walk::Memory for UserMemory {
+    fn read<T: GuestScalar>(&mut self, address: u64) -> Option<T> {
+        read(address)
     }
 }
 
-/// O retorno no topo da pilha (função folha ou fim do desenrolamento).
-fn pop_return(registers: &mut Registers) -> Option<()> {
-    let rsp = registers.integer[RSP];
-    registers.rip = read::<u64>(rsp)?;
-    registers.integer[RSP] = rsp.wrapping_add(8);
-    Some(())
+impl frame_walk::Memory for Modules {
+    fn read<T: GuestScalar>(&mut self, address: u64) -> Option<T> {
+        read(address)
+    }
 }
 
-/// Desfaz um quadro pelos códigos de unwind (sem epílogos nem handlers): os
-/// inteiros e o RIP do chamador. `first`: o RIP é o da falha, não um retorno.
-fn unwind_frame(modules: &mut Modules, registers: &mut Registers, first: bool) -> Option<()> {
-    let pc = if first { registers.rip } else { registers.rip.wrapping_sub(1) };
-    let image = modules.index(pc).map(|index| (modules.list[index].base, modules.list[index].size));
-    let Some((base, mut entry)) = image.and_then(|(base, size)| function_entry(base, size, pc).map(|entry| (base, entry))) else {
-        return pop_return(registers);
-    };
-    let mut machine_frame = false;
-    let mut establisher_frame = None;
-    for _ in 0..MAX_CHAIN {
-        let info = UnwindData::read(base + entry.unwind as u64)?;
-        let relative = pc.wrapping_sub(base + entry.begin as u64);
-        let establisher = *establisher_frame.get_or_insert_with(|| info.establisher(registers, relative));
-        let inside_prolog = relative < info.prolog as u64;
-        let mut slot = 0;
-        while slot < info.codes.len() {
-            let code = info.codes[slot];
-            let operation = (code >> 8) & 0xF;
-            let register = (code >> 12) as usize;
-            let slots = slot_count(operation, code >> 12)?;
-            if slot + slots > info.codes.len() {
-                return None;
-            }
-            let word = |offset: usize| info.codes.get(slot + offset).copied().unwrap_or(0) as u64;
-            let (first_word, second_word) = (word(1), word(2));
-            slot += slots;
-            // No meio do prólogo só as operações já executadas são desfeitas.
-            if operation == UWOP_EPILOG || operation == UWOP_SPARE_CODE || (inside_prolog && (code & 0xFF) as u64 > relative) {
-                continue;
-            }
-            let rsp = registers.integer[RSP];
-            match operation {
-                UWOP_PUSH_NONVOL => {
-                    registers.integer[register] = read::<u64>(rsp)?;
-                    registers.integer[RSP] = rsp.wrapping_add(8);
-                }
-                UWOP_ALLOC_LARGE => registers.integer[RSP] = rsp.wrapping_add(if register != 0 { first_word | second_word << 16 } else { first_word * 8 }),
-                UWOP_ALLOC_SMALL => registers.integer[RSP] = rsp.wrapping_add(register as u64 * 8 + 8),
-                UWOP_SET_FPREG => registers.integer[RSP] = registers.integer[info.frame].wrapping_sub(info.frame_offset),
-                UWOP_SAVE_NONVOL => registers.integer[register] = read::<u64>(establisher.wrapping_add(first_word * 8))?,
-                UWOP_SAVE_NONVOL_FAR => registers.integer[register] = read::<u64>(establisher.wrapping_add(first_word | second_word << 16))?,
-                UWOP_PUSH_MACHFRAME => {
-                    let frame = rsp.wrapping_add(register as u64 * 8);
-                    registers.rip = read::<u64>(frame)?;
-                    registers.integer[RSP] = read::<u64>(frame + 24)?;
-                    machine_frame = true;
-                }
-                // Os XMM salvos não mudam a pilha.
-                _ => {}
-            }
-        }
-        if info.flags & UNW_FLAG_CHAININFO == 0 {
-            break;
-        }
-        entry = read_function(info.tail)?;
+impl frame_walk::Images for Modules {
+    fn image(&mut self, address: u64) -> Option<(u64, u64)> {
+        self.index(address).map(|index| (self.list[index].base, self.list[index].size))
     }
-    if machine_frame { Some(()) } else { pop_return(registers) }
 }
 
 /// Os RIPs dos quadros, a partir de `start`, enquanto a pilha sobe.
@@ -882,7 +682,7 @@ fn walk(modules: &mut Modules, start: Registers) -> Vec<u64> {
         }
         frames.push(rip);
         let rsp = registers.integer[RSP];
-        if unwind_frame(modules, &mut registers, index == 0).is_none() || registers.integer[RSP] <= rsp {
+        if frame_walk::unwind_frame(modules, &mut registers, index == 0).is_none() || registers.integer[RSP] <= rsp {
             break;
         }
     }
