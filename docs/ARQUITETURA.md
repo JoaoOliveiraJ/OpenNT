@@ -408,12 +408,21 @@ da CPU que executa, e `set_current_thread`, o ponto único de troca de
 thread, grava só a célula da própria CPU (`pcr::set_current_thread`, pelo
 GS) antes de carregar a raiz do processo dela. Não há célula global: uma
 troca num AP não muda o que o BSP vê, e um AP que nunca trocou de thread
-tem 0 (o contexto do System, como o BSP antes do escalonador). O autoteste
+tem 0 (o contexto do System, como o BSP antes do escalonador). A troca
+para uma thread que não é de sistema também grava em KPCR.Used_Self
+(gs:[30h]) a KTHREAD.Teb dela, como o SwapContext do 19041, que pula esse
+estado de usuário numa thread de sistema (o Used_Self fica o da última
+thread de usuário): é o NtCurrentTeb do anel 0, e o win32kbase aponta por
+ele o pClientInfo de cada THREADINFO para TEB.Win32ClientInfo (gs:[30h] +
+0x800), onde grava o CallbackWnd que a user32 lê nos callbacks de janela
+(o WM_NCCREATE de toda janela de cliente). O autoteste
 `ntos/test/multiprocess/current_thread.rs` põe cada CPU online, ao mesmo
 tempo, numa thread de um processo de kernel só dela (os APs por um job,
-entre duas barreiras): cada uma vê em gs:[188h] a própria thread, e dela o
-próprio processo e TID, e o PsGetCurrentThread do BSP no meio da janela
-devolve a dele.
+entre duas barreiras), cada uma como thread que não é de sistema com uma
+Teb sintética própria: cada uma vê em gs:[188h] a própria thread, dela o
+próprio processo e TID, e em gs:[30h] a Teb dela, e o PsGetCurrentThread
+do BSP no meio da janela devolve a dele; a volta a nenhuma thread ou a uma
+de sistema deixa a Teb em gs:[30h].
 
 **Identidade de cada CPU.** Cada processador monta a própria KPRCB com o
 próprio CPUID, como o ntoskrnl 19041 no boot de cada CPU

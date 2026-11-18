@@ -7,17 +7,18 @@
 //! KPCR que `init_processor` montou antes do SIPI. Os campos são os da `Kpcr`
 //! gerada dos símbolos (a KPRCB embutida em +0x180, a LockQueue dentro dela);
 //! o CurrentThread de cada uma é a thread corrente daquela CPU (gs:[188h]),
-//! gravado pela troca de thread que roda nela. Na
-//! cauda da reserva, depois da KPCR, fica o bloco de execução de usuário da
-//! CPU (`hal::amd64::usermode::UserExecutionBlock`), endereçado pelos stubs
-//! por `gs:`.
+//! gravado pela troca de thread que roda nela, junto com o Used_Self
+//! (gs:[30h], a TEB da thread de usuário que entra, como no SwapContext).
+//! Na cauda da reserva, depois da KPCR, fica o bloco de execução de usuário
+//! da CPU (`hal::amd64::usermode::UserExecutionBlock`), endereçado pelos
+//! stubs por `gs:`.
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::hal::{cpu, physical};
 use crate::hal::amd64::native_call;
-use crate::ntos::inc::types::{Kpcr, Kprcb, NtStruct};
+use crate::ntos::inc::types::{Kpcr, Kprcb, Kthread, NtStruct};
 use crate::ntos::mm::paging::{self, MapOptions};
 use crate::ntos::mm::{kernel_address, memory_map as map, pfn};
 use crate::rtl::{KernelError, SpinLock};
@@ -171,7 +172,9 @@ fn initialize(kpcr: &Kpcr, number: u32, io_database_lock: u64, vpb_lock: u64) ->
     if vpb_lock != 0 {
         lock_queue[LOCK_QUEUE_IO_VPB].lock.set(vpb_lock);
     }
-    kpcr.used_self.set(base);
+    // O KiSystemStartup só grava o Self; o Used_Self é a TEB da última
+    // thread de usuário que entrou (`set_current_thread`), nenhuma no boot.
+    kpcr.used_self.set(0);
     kpcr.major_version.set(1);
     kpcr.minor_version.set(1);
     kpcr.prcb.mx_csr.set(0x1F80);
@@ -285,9 +288,27 @@ pub fn current_thread() -> u64 {
 /// A troca de thread corrente desta CPU grava KPRCB.CurrentThread na KPCR
 /// dela (pelo GS), nunca na de outra CPU. Antes da KPCR do BSP não há onde
 /// gravar.
+///
+/// Como o SwapContext do 19041, a troca para uma thread que não é de
+/// sistema também grava em KPCR.Used_Self (NtTib.Self, gs:[30h]) a
+/// KTHREAD.Teb dela; numa thread de sistema (MiscFlags.SystemThread), ou
+/// sem thread, o SwapContext pula o estado de usuário e o Used_Self fica o
+/// da última thread de usuário. É por ele que o código de kernel acha a TEB
+/// corrente, o NtCurrentTeb do anel 0: o xxxCreateThreadInfo do win32kbase
+/// aponta o pClientInfo da THREADINFO para gs:[30h] + 0x800
+/// (TEB.Win32ClientInfo), onde o win32k grava o CallbackWnd dos callbacks
+/// de janela que a user32 lê de volta.
 pub fn set_current_thread(thread: u64) {
     if ADDRESS.load(Ordering::Acquire) != 0 {
-        current().prcb.current_thread.set(thread);
+        let kpcr = current();
+        kpcr.prcb.current_thread.set(thread);
+        if thread != 0 {
+            // SAFETY: quem troca a thread corrente passa uma KTHREAD viva.
+            let kthread = unsafe { Kthread::at(thread) };
+            if kthread.system_thread() == 0 {
+                kpcr.used_self.set(kthread.teb.get());
+            }
+        }
     }
 }
 
