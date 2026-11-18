@@ -807,6 +807,13 @@ fn control(arguments: &Control, major: u8, minor: u8) -> u32 {
     control.input_buffer_length.set(arguments.input_length);
     control.io_control_code.set(arguments.code);
     control.type3_input_buffer.set(if method == METHOD_NEITHER { arguments.input } else { 0 });
+    // O IopXxxControlFile marca no slot o acesso do handle:
+    // SL_READ_ACCESS_GRANTED com FILE_READ_DATA e SL_WRITE_ACCESS_GRANTED com
+    // FILE_WRITE_DATA (o que o IoValidateDeviceIoControlAccess e os drivers
+    // conferem).
+    let location = top_location(packet);
+    let granted = (target.access & FILE_READ_DATA != 0) as u8 | if target.access & FILE_WRITE_DATA != 0 { 4 } else { 0 };
+    location.flags.set(location.flags.get() | granted);
     track(packet, &target, event, 0, arguments.apc_context);
     synchronous_service_tail(&target, packet)
 }
