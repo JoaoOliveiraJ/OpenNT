@@ -125,13 +125,16 @@ fn join(words: [u32; 2]) -> u64 {
     (words[1] as u64) << 32 | words[0] as u64
 }
 
-/// Fase associada: a porta e o alvo retidos pelos handles.
+/// Fase associada: a porta e o alvo retidos pelos handles, e a contagem de
+/// pulsos na associação (`ke::dispatcher::pulse_clock`): um KePulseEvent
+/// posterior no alvo satisfaz a espera do pacote.
 #[derive(Clone)]
 pub struct Association {
     pub port_entry: Held,
     pub port: Arc<Port>,
     pub target: Held,
     pub target_pointer: u64,
+    pub pulses_since: u64,
 }
 
 /// Um objeto que a associação retém: pelo handle da tabela de usuário ou,

@@ -961,8 +961,9 @@ sondagem: o pulso que acha o evento não sinalizado fica anotado
 WaitAny que começou antes dele (os KeWaitFor* de uma thread de usuário num
 serviço, como a espera do vblank do dxgkrnl no
 D3DKMTWaitForVerticalBlankEvent2 do dwm e o MsgWaitForMultipleObjectsEx do
-win32k no WinSta0_DesktopSwitch do logoncontroller, e o NtWaitFor* de modo
-usuário) é satisfeita por ele como o KiTryUnwaitThread do KePulseEvent
+win32k no WinSta0_DesktopSwitch do logoncontroller, o NtWaitFor* de modo
+usuário e a associação de um pacote de espera, que guarda a contagem de
+pulsos de quando foi feita) é satisfeita por ele como o KiTryUnwaitThread do KePulseEvent
 satisfaz a registrada: todas num evento de notificação, uma por pulso num de
 sincronização cujo sinal nenhuma espera consumiu. O WaitAll não conta
 pulsos. O NtDelayExecution com intervalo zero,

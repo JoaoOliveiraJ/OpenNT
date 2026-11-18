@@ -149,40 +149,49 @@ impl PolledObjects {
     /// A espera começa aqui (antes da primeira tentativa, para nenhum pulso
     /// escapar entre ela e o bloqueio).
     pub fn new(objects: Vec<u64>, wait_type: u32) -> Self {
-        Self { objects, wait_type, since: PULSE_COUNT.load(Ordering::SeqCst) }
+        Self { objects, wait_type, since: pulse_clock() }
     }
 
     /// A tentativa pela thread `owner`: o estado dos objetos e, sem ele, o
     /// primeiro evento pulsado desde o começo da espera.
     pub fn try_for(&self, owner: u64) -> Option<u32> {
-        try_wait_objects_for(&self.objects, self.wait_type, owner).or_else(|| self.pulsed())
+        try_wait_objects_for(&self.objects, self.wait_type, owner).or_else(|| pulsed_since(&self.objects, self.wait_type, self.since))
     }
 
     /// [`PolledObjects::try_for`] pela thread corrente.
     pub fn try_now(&self) -> Option<u32> {
         self.try_for(process::get_current_thread())
     }
+}
 
-    fn pulsed(&self) -> Option<u32> {
-        if self.wait_type != 1 || PULSE_COUNT.load(Ordering::SeqCst) == self.since {
-            return None;
-        }
-        let mut pulses = PULSES.lock();
-        for (index, object) in self.objects.iter().enumerate() {
-            let Some(record) = pulses.get_mut(object) else { continue };
-            match header_at(*object).type_.get() {
-                object_type::EVENT_NOTIFICATION if record.last > self.since => return Some(index as u32),
-                object_type::EVENT_SYNCHRONIZATION => {
-                    if let Some(slot) = record.unclaimed.iter_mut().filter(|value| **value > self.since).min_by_key(|value| **value) {
-                        *slot = 0;
-                        return Some(index as u32);
-                    }
-                }
-                _ => {}
-            }
-        }
-        None
+/// A contagem de pulsos agora: o começo de uma espera sondada guardada fora
+/// de um [`PolledObjects`] (a associação de um pacote de espera).
+pub fn pulse_clock() -> u64 {
+    PULSE_COUNT.load(Ordering::SeqCst)
+}
+
+/// O primeiro dos `objects` pulsado depois de `since` (a contagem do começo
+/// da espera), só no WaitAny: o evento de notificação por qualquer pulso
+/// posterior; o de sincronização consome um pulso não entregue.
+pub fn pulsed_since(objects: &[u64], wait_type: u32, since: u64) -> Option<u32> {
+    if wait_type != 1 || pulse_clock() == since {
+        return None;
     }
+    let mut pulses = PULSES.lock();
+    for (index, object) in objects.iter().enumerate() {
+        let Some(record) = pulses.get_mut(object) else { continue };
+        match header_at(*object).type_.get() {
+            object_type::EVENT_NOTIFICATION if record.last > since => return Some(index as u32),
+            object_type::EVENT_SYNCHRONIZATION => {
+                if let Some(slot) = record.unclaimed.iter_mut().filter(|value| **value > since).min_by_key(|value| **value) {
+                    *slot = 0;
+                    return Some(index as u32);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn semaphore_at(semaphore: u64) -> &'static Ksemaphore {

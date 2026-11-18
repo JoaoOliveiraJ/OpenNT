@@ -111,7 +111,8 @@ fn poll(packet: &Arc<WaitPacket>) -> bool {
             detach(packet, true);
             return false;
         }
-        if dispatcher::try_wait_objects(&[association.target_pointer], 1).is_none() {
+        let target = [association.target_pointer];
+        if dispatcher::try_wait_objects(&target, 1).or_else(|| dispatcher::pulsed_since(&target, 1, association.pulses_since)).is_none() {
             return false;
         }
         // A associação sai do pacote sob o lock: só quem tomou o sinal o
@@ -225,7 +226,7 @@ pub fn associate(handle: u64, port_handle: u64, target_handle: u64, completion: 
         }
     }
     let _ = dispatcher_objects::reference(packet.pointer);
-    packet.set_association(Some(Association { port_entry, port, target, target_pointer }));
+    packet.set_association(Some(Association { port_entry, port, target, target_pointer, pulses_since: dispatcher::pulse_clock() }));
     PENDING.lock().push((target_pointer, packet.clone()));
     Ok(poll(&packet))
 }

@@ -896,12 +896,20 @@ fn pulse_polled_waits(assert: Assert) {
         "kwait: KePulseEvent num evento de notificacao satisfaz as esperas sondadas WaitAny que ja esperavam (o indice do evento) e deixa o evento nao sinalizado; a que comeca depois e o WaitAll nao o contam",
     );
     let (one, two) = (any(&[synchronization]), any(&[synchronization]));
+    let since = dispatcher::pulse_clock();
     let previous = dispatcher::pulse_event(synchronization);
     let (got_one, got_two) = (one.try_now(), two.try_now());
     let after = any(&[synchronization]);
     assert(
-        previous == 0 && dispatcher::read_state(synchronization) == 0 && got_one == Some(0) && got_two.is_none() && after.try_now().is_none(),
+        previous == 0 && dispatcher::read_state(synchronization) == 0 && got_one == Some(0) && got_two.is_none() && after.try_now().is_none() && dispatcher::pulsed_since(&[synchronization], 1, since).is_none(),
         "kwait: KePulseEvent num evento de sincronizacao entrega o sinal a uma so espera sondada",
+    );
+    // A associação de um pacote de espera guarda a contagem de pulsos.
+    let since = dispatcher::pulse_clock();
+    dispatcher::pulse_event(synchronization);
+    assert(
+        dispatcher::pulsed_since(&[synchronization], 1, since) == Some(0) && dispatcher::pulsed_since(&[synchronization], 1, since).is_none() && dispatcher::pulsed_since(&[notification], 1, since).is_none(),
+        "kwait: o pulso posterior a contagem guardada satisfaz uma vez a espera de sincronizacao de fora de um PolledObjects (o pacote de espera)",
     );
     // Uma thread de sistema pulsa o evento a cada 1 ms; o contexto de boot
     // espera nele com prazo de 2 s pelo caminho sondado do KeWaitForSingleObject.
