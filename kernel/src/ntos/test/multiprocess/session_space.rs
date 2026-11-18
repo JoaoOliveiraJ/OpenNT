@@ -330,6 +330,20 @@ pub fn run(assert: Assert) {
     if found != 0 {
         let _ = process::dereference(found);
     }
+    // O ExplicitScope de sessão do WNF acha o processo da sessão pelo
+    // MmGetSessionById (ExpWnfCaptureScopeInstanceId 0x60fdda); a sessão B,
+    // sem driver de sessão, dá nulo e STATUS_INVALID_PARAMETER.
+    let scope = guest::alloc_bytes(4);
+    guest::write32(scope, id_a);
+    let captured = crate::ntos::ex::wnf::scope_capture::capture_kernel(1, scope);
+    let scope_found = matches!(&captured, Ok(Ok(captured)) if captured.identity != 0);
+    if let Ok(Ok(captured)) = captured {
+        let _ = captured.release();
+    }
+    guest::write32(scope, id_b);
+    let scope_refused = matches!(crate::ntos::ex::wnf::scope_capture::capture_kernel(1, scope), Ok(Err(0xC000_000D)));
+    guest::free_bytes(scope);
+    assert(scope_found && scope_refused, "wnf: ExplicitScope de sessao acha o processo da sessao pelo MmGetSessionById");
 
     // PagedPoolSession.
     let paged_a = inside(a, || pool_allocation::allocate_tagged(PAGED_POOL_SESSION, 0x100, PAGED_TAG).unwrap_or(0)).unwrap_or(0);

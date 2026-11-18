@@ -5,18 +5,13 @@
 //! handle do escopo de processo usa ObReferenceObjectByHandle, que entra
 //! por [`set_handle_reference`] junto com `ntos/ob`.
 
-use alloc::collections::BTreeSet;
-
 use crate::ntos::mm::kernel_pool::{self, AllocateOptions};
 use crate::ntos::ob::object_types;
 use crate::ntos::ps::{process, user_probe};
-use crate::ntos::ps::silo::query as silo_query;
 use core::mem::offset_of;
 
-use super::objects::process_at;
-use crate::ntos::ex::list_entry;
 use crate::ntos::inc::field::{Field, NtStruct, Reserved};
-use crate::ntos::inc::types::{Eprocess, MmSessionSpace, Sid};
+use crate::ntos::inc::types::Sid;
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
 
@@ -80,51 +75,10 @@ impl Captured {
     }
 }
 
-/// Processo de anexação da sessão, com os filtros de
-/// MiSelectSessionAttachProcess do kernel medido.
+/// O processo de anexação da sessão: o ExpWnfCaptureScopeInstanceId do 19041
+/// (0x60fdda) chama o MmGetSessionById, que só falha (nulo) sem a sessão.
 fn reference_session_process(session_identifier: u32) -> u64 {
-    let current_silo = silo_query::current_server_silo();
-    let mut visited = BTreeSet::new();
-    for active in process::list_active_processes() {
-        let session = process_at(active.address).session.get();
-        if session == 0 || !visited.insert(session) {
-            continue;
-        }
-        // SAFETY: MM_SESSION_SPACE de um processo ativo.
-        let space = unsafe { MmSessionSpace::at(session) };
-        if space.session_id.get() != session_identifier {
-            continue;
-        }
-        if current_silo != 0 && space.server_silo.get() != current_silo {
-            continue;
-        }
-        // Sessão sem descarregamento registrado ou com DeletePending (bit 1).
-        if space.driver_unload.function.get() == 0 || space.u.long_flags.get() & 2 != 0 {
-            return 0;
-        }
-        let head = &space.process_list;
-        let mut entry = head.flink.get();
-        while entry != head.address() {
-            let candidate = process_at(entry - offset_of!(Eprocess, session_process_links) as u64);
-            entry = list_entry::at(entry).flink.get();
-            let working_set = &candidate.vm.instance.flags;
-            if working_set.bitfield_1.get() & 1 != 0 {
-                continue;
-            }
-            if candidate.flags.get() & 0xC00 < 0xC00 {
-                continue;
-            }
-            if working_set.u2.get() & 0x60 == 0x40 {
-                continue;
-            }
-            let candidate = candidate.address();
-            if process::reference(candidate).is_some() {
-                return candidate;
-            }
-        }
-        return 0;
-    }
-    0
+    crate::ntos::mm::session::by_id(session_identifier)
 }
 
 fn capture(scope: u32, explicit_scope: u64, access_mode: u8) -> Result<Result<Captured, u32>, KernelError> {

@@ -626,6 +626,12 @@ pub fn by_id(id: u32) -> u64 {
     let sessions = SESSIONS.lock();
     let Some((&pointer, _)) = sessions.iter().find(|(_, state)| state.id == id) else { return 0 };
     let session = space(pointer);
+    // MmGetSessionById 0x206451..0x20645d: com um silo de servidor corrente,
+    // só a sessão do mesmo silo.
+    let silo = crate::ntos::ps::silo::query::current_server_silo();
+    if silo != 0 && session.server_silo.get() != silo {
+        return 0;
+    }
     if session.driver_unload.function.get() == 0 || session.u.flags.delete_pending() != 0 {
         return 0;
     }
