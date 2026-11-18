@@ -138,7 +138,7 @@ pub fn process_attributes(token_pointer: u64, system_application: u64, package_i
         return Ok(0);
     }
     let token = owned_token(token_pointer, "PsQueryProcessAttributesByToken")?;
-    let present = |name: &str| -> Result<u8, KernelError> { Ok(security_attributes::select(&token.security_attributes, Some(&[String::from(name)]))?.is_some() as u8) };
+    let present = |name: &str| -> Result<u8, KernelError> { attribute_present(&token, name).map(|present| present as u8) };
     if system_application != 0 {
         // SAFETY: PBOOLEAN de saída do chamador de kernel.
         unsafe { Field::<u8>::at(system_application) }.set(present("WIN://SYSAPPID")?);
@@ -148,6 +148,19 @@ pub fn process_attributes(token_pointer: u64, system_application: u64, package_i
         unsafe { Field::<u8>::at(package_identity) }.set(present("WIN://PKG")?);
     }
     Ok(0)
+}
+
+/// O SeSecurityAttributePresent do PsQueryProcessAttributesByToken: o
+/// atributo `name` no token, independente de flags e valores.
+fn attribute_present(token: &Token, name: &str) -> Result<bool, KernelError> {
+    Ok(security_attributes::select(&token.security_attributes, Some(&[String::from(name)]))?.is_some())
+}
+
+/// O PsQueryProcessAttributes(Process, &SystemApplication, NULL) do
+/// ProcessBasicInformation estendido (IsStronglyNamed): o WIN://SYSAPPID no
+/// token primário do processo.
+pub fn is_system_application(process: u64) -> bool {
+    process::get_primary_token(process).and_then(tokens::get).is_some_and(|token| attribute_present(&token, "WIN://SYSAPPID").unwrap_or(false))
 }
 
 /// PsReferencePrimaryToken: retém o token primário antes de entregar seu

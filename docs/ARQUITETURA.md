@@ -2797,7 +2797,12 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     lê o EPROCESS do handle (PROCESS_QUERY_LIMITED_INFORMATION): PEB, PID,
     InheritedFromUniqueProcessId, prioridade base e código de saída, ou o
     caminho da imagem do `ProcessState`; NtQueryInformationThread já lia a
-    thread do handle (TEB e CLIENT_ID da ETHREAD).
+    thread do handle (TEB e CLIENT_ID da ETHREAD). A ProcessBasicInformation
+    aceita só 0x30 bytes ou os 0x40 da PROCESS_EXTENDED_BASIC_INFORMATION
+    (Size e os Flags IsProtectedProcess..IsSubsystemProcess do EPROCESS),
+    em modo usuário e em modo kernel (`ps/query_process::basic_information`,
+    a forma que o BasicRender consulta); outro comprimento é
+    STATUS_INFO_LENGTH_MISMATCH sem ReturnLength.
   - Teste: `ntos/test/multiprocess/cross_handles.rs`.
 - **Memória entre processos** (`ps/user/memory.rs`, `mm/copy_virtual.rs`):
   - NtAllocateVirtualMemory(Ex), NtFreeVirtualMemory e

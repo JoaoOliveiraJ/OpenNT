@@ -2,19 +2,19 @@
 //! (ZwQueryInformationProcess).
 //!
 //! ProcessImageInformation (37) vem de `image_information`;
-//! ProcessBasicInformation (0) é montado do EPROCESS achado pelo pid do
-//! handle; ProcessDebugFlags (31) é o PROCESS_DEBUG_INHERIT do
-//! NoDebugInherit, com o handle referenciado com PROCESS_QUERY_INFORMATION.
-//! As demais classes devolvem STATUS_INVALID_PARAMETER.
+//! ProcessBasicInformation (0), na forma de 0x30 bytes ou na estendida de
+//! 0x40 (com Size e Flags), é lido do EPROCESS do handle; ProcessDebugFlags
+//! (31) é o PROCESS_DEBUG_INHERIT do NoDebugInherit, com o handle
+//! referenciado com PROCESS_QUERY_INFORMATION. As demais classes devolvem
+//! STATUS_INVALID_PARAMETER.
 
 use super::{image_information, process};
 use crate::ntos::inc::field::{Field, NtStruct};
-use crate::ntos::inc::types::{Eprocess, ProcessBasicInformation};
+use crate::ntos::inc::types::{Eprocess, Ewow64process, ProcessBasicInformation, ProcessExtendedBasicInformation};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::ob::{object_reference, object_types, reference_trace};
 use crate::rtl::KernelError;
 
-const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
 const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
 const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 /// PROCESS_QUERY_INFORMATION.
@@ -123,29 +123,103 @@ pub fn query_information(handle: u64, class: u32, output: u64, length: u32, retu
     if class != 0 {
         return Ok(0xC000_000D);
     }
-    if (length as u64) < ProcessBasicInformation::SIZE {
-        if returned != 0 {
-            // SAFETY: PULONG ReturnLength do chamador de kernel.
-            unsafe { Field::<u32>::at(returned) }.set(ProcessBasicInformation::SIZE as u32);
-        }
-        return Ok(STATUS_BUFFER_TOO_SMALL);
+    query_basic(handle, output, length, returned)
+}
+
+/// O tamanho do PROCESS_BASIC_INFORMATION e o do
+/// PROCESS_EXTENDED_BASIC_INFORMATION (Size, a básica e Flags).
+pub const BASIC_INFORMATION_SIZE: u32 = ProcessBasicInformation::SIZE as u32;
+pub const EXTENDED_BASIC_INFORMATION_SIZE: u32 = ProcessExtendedBasicInformation::SIZE as u32;
+
+/// Os campos do ProcessBasicInformation de um EPROCESS, como o
+/// NtQueryInformationProcess 19041 os lê (rva 0x621cc1..0x621ebb).
+pub struct BasicInformation {
+    /// EPROCESS.ExitStatus (STATUS_PENDING enquanto vivo).
+    pub exit_status: i32,
+    /// EPROCESS.Peb.
+    pub peb_base_address: u64,
+    /// A afinidade do processo (o escalonador de usuário roda no BSP).
+    pub affinity_mask: u64,
+    /// KPROCESS.BasePriority.
+    pub base_priority: i32,
+    pub unique_process_id: u64,
+    pub inherited_from_unique_process_id: u64,
+    /// Os Flags da forma estendida.
+    pub flags: u32,
+}
+
+/// Lê o ProcessBasicInformation de `process`. Os Flags da forma estendida:
+/// IsProtectedProcess (PsIsProtectedProcess), IsWow64Process (WoW64Process
+/// com Machine x86 0x14C ou ARM 0x1C4), IsProcessDeleting (ProcessDelete ou
+/// ProcessSelfDelete), IsCrossSessionCreate (Flags2.CrossSessionCreate),
+/// IsFrozen (DeepFreeze + FreezeCount do KPROCESS), IsBackground,
+/// IsStronglyNamed (WIN://SYSAPPID no token primário, o
+/// PsQueryProcessAttributes), IsSecureProcess (SecureState.SecureProcess) e
+/// IsSubsystemProcess (PicoContext).
+pub fn basic_information(process: u64) -> BasicInformation {
+    // SAFETY: EPROCESS retido por quem consulta.
+    let eprocess = unsafe { Eprocess::at(process) };
+    let pcb = &eprocess.pcb;
+    let wow64 = eprocess.wo_w64_process.get();
+    // SAFETY: o EWOW64PROCESS de um processo WoW64, retido com ele.
+    let wow64_machine = if wow64 != 0 { unsafe { Ewow64process::at(wow64) }.machine.get() } else { 0 };
+    let flag = |bit: u32, set: bool| if set { 1u32 << bit } else { 0 };
+    let flags = flag(0, super::process_accessors::is_protected(process))
+        | flag(1, matches!(wow64_machine, 0x14C | 0x1C4))
+        | flag(2, eprocess.process_delete() != 0 || eprocess.process_self_delete() != 0)
+        | flag(3, eprocess.cross_session_create() != 0)
+        | flag(4, pcb.deep_freeze() + pcb.freeze_count.get() != 0)
+        | flag(5, eprocess.background() != 0)
+        | flag(6, super::security::is_system_application(process))
+        | flag(7, pcb.secure_state.flags.secure_process() != 0)
+        | flag(8, eprocess.pico_context.get() != 0);
+    BasicInformation {
+        exit_status: eprocess.exit_status.get(),
+        peb_base_address: eprocess.peb.get(),
+        affinity_mask: 1,
+        base_priority: pcb.base_priority.get() as i32,
+        unique_process_id: eprocess.unique_process_id.get(),
+        inherited_from_unique_process_id: eprocess.inherited_from_unique_process_id.get(),
+        flags,
     }
-    let pid = process::process_id_from_handle(handle);
-    let Some(target) = process::list_active_processes().into_iter().find(|entry| entry.pid == pid) else { return Ok(STATUS_INVALID_HANDLE) };
-    // Zera o buffer inteiro (o preenchimento também) antes dos campos.
-    guest::write_bytes(output, &[0; ProcessBasicInformation::SIZE as usize]);
-    // SAFETY: PROCESS_BASIC_INFORMATION do chamador de kernel (tamanho conferido).
-    let information = unsafe { ProcessBasicInformation::at(output) };
-    information.exit_status.set(0x103);
-    // SAFETY: EPROCESS achado na lista de processos ativos.
-    information.peb_base_address.set(unsafe { Eprocess::at(target.address) }.peb.get());
-    information.affinity_mask.set(1);
-    information.base_priority.set(8);
-    information.unique_process_id.set(pid);
-    information.inherited_from_unique_process_id.set(4);
+}
+
+/// ProcessBasicInformation de um chamador de kernel: ProcessInformationLength
+/// 0x30 (PROCESS_BASIC_INFORMATION) ou 0x40 (PROCESS_EXTENDED_BASIC_INFORMATION,
+/// com Size gravado antes de o handle ser referenciado); outro comprimento dá
+/// STATUS_INFO_LENGTH_MISMATCH sem ReturnLength. O handle é referenciado com
+/// PROCESS_QUERY_LIMITED_INFORMATION; os campos são gravados um a um (o
+/// preenchimento fica como estava) e o ReturnLength recebe o comprimento.
+fn query_basic(handle: u64, output: u64, length: u32, returned: u64) -> Result<u32, KernelError> {
+    let extended = length == EXTENDED_BASIC_INFORMATION_SIZE;
+    if !extended && length != BASIC_INFORMATION_SIZE {
+        return Ok(STATUS_INFO_LENGTH_MISMATCH);
+    }
+    // SAFETY: o buffer do chamador de kernel, do comprimento conferido.
+    let extended_information = unsafe { ProcessExtendedBasicInformation::at(output) };
+    if extended {
+        extended_information.size.set(EXTENDED_BASIC_INFORMATION_SIZE as u64);
+    }
+    let process = match reference_process(handle, PROCESS_QUERY_LIMITED_INFORMATION)? {
+        Ok(process) => process,
+        Err(status) => return Ok(status),
+    };
+    let values = basic_information(process);
+    release_process(process)?;
+    // SAFETY: idem; a básica fica depois do Size na forma estendida.
+    let information = if extended { &extended_information.basic_info } else { unsafe { ProcessBasicInformation::at(output) } };
+    information.exit_status.set(values.exit_status);
+    information.peb_base_address.set(values.peb_base_address);
+    information.affinity_mask.set(values.affinity_mask);
+    information.base_priority.set(values.base_priority);
+    information.unique_process_id.set(values.unique_process_id);
+    information.inherited_from_unique_process_id.set(values.inherited_from_unique_process_id);
+    if extended {
+        extended_information.flags.set(values.flags);
+    }
     if returned != 0 {
         // SAFETY: PULONG ReturnLength do chamador de kernel.
-        unsafe { Field::<u32>::at(returned) }.set(ProcessBasicInformation::SIZE as u32);
+        unsafe { Field::<u32>::at(returned) }.set(length);
     }
     Ok(0)
 }

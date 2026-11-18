@@ -690,41 +690,40 @@ fn nt_query_information_process(handle: u64, class: u64, buffer: u64, length: u6
         });
     }
     state::guarded(|| match class {
-        // ProcessBasicInformation (ou a estendida com Size e Flags), do
-        // EPROCESS do handle: o processo consultado pode ser outro.
+        // ProcessBasicInformation (`ps/query_process::basic_information`), do
+        // EPROCESS do handle: o processo consultado pode ser outro. Só 0x30
+        // ou 0x40 (a estendida, com Size gravado antes da referência do
+        // handle e os Flags); outro comprimento dá
+        // STATUS_INFO_LENGTH_MISMATCH sem ReturnLength. Os campos são
+        // gravados um a um, sem zerar o preenchimento.
         0 => {
+            let extended = length == ProcessExtendedBasicInformation::SIZE;
+            if length != ProcessBasicInformation::SIZE && !extended {
+                return Ok(STATUS_INFO_LENGTH_MISMATCH);
+            }
+            if !probe_user_write(buffer, length) {
+                return Ok(0xC000_0005);
+            }
+            let extended_information = state::user_struct::<ProcessExtendedBasicInformation>(buffer)?;
+            if extended {
+                extended_information.size.probe_set(length)?;
+            }
             let target = match queried_process(handle) {
                 Ok(target) => target,
                 Err(status) => return Ok(status),
             };
-            let extended = length >= ProcessExtendedBasicInformation::SIZE;
-            let size = if extended { ProcessExtendedBasicInformation::SIZE } else { ProcessBasicInformation::SIZE };
-            if length != ProcessBasicInformation::SIZE && !extended {
-                set_returned(size as u32)?;
-                return Ok(STATUS_INFO_LENGTH_MISMATCH);
+            let values = query_process::basic_information(target);
+            let basic = if extended { &extended_information.basic_info } else { state::user_struct::<ProcessBasicInformation>(buffer)? };
+            basic.exit_status.probe_set(values.exit_status)?;
+            basic.peb_base_address.probe_set(values.peb_base_address)?;
+            basic.affinity_mask.probe_set(values.affinity_mask)?;
+            basic.base_priority.probe_set(values.base_priority)?;
+            basic.unique_process_id.probe_set(values.unique_process_id)?;
+            basic.inherited_from_unique_process_id.probe_set(values.inherited_from_unique_process_id)?;
+            if extended {
+                extended_information.flags.probe_set(values.flags)?;
             }
-            if !probe_user_write(buffer, size) {
-                return Ok(0xC000_0005);
-            }
-            guest::try_write_bytes(buffer, &alloc::vec![0; size as usize])?;
-            let basic = if extended {
-                let information = state::user_struct::<ProcessExtendedBasicInformation>(buffer)?;
-                information.size.probe_set(size)?;
-                &information.basic_info
-            } else {
-                state::user_struct::<ProcessBasicInformation>(buffer)?
-            };
-            // SAFETY: EPROCESS retido pelo handle que o nomeou (ou o corrente).
-            let process = unsafe { Eprocess::at(target) };
-            // STATUS_PENDING enquanto vivo; o código de saída depois do
-            // término.
-            basic.exit_status.probe_set(process.exit_status.get())?;
-            basic.peb_base_address.probe_set(process.peb.get())?;
-            basic.affinity_mask.probe_set(1)?; // o escalonador de usuário roda no BSP
-            basic.base_priority.probe_set(process.pcb.base_priority.get() as i32)?;
-            basic.unique_process_id.probe_set(process.unique_process_id.get())?;
-            basic.inherited_from_unique_process_id.probe_set(process.inherited_from_unique_process_id.get())?;
-            set_returned(size as u32)?;
+            set_returned(length as u32)?;
             Ok(STATUS_SUCCESS)
         }
         // ProcessDebugPort, do estado da EPROCESS referenciada.

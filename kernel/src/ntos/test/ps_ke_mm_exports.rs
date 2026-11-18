@@ -179,6 +179,21 @@ fn nt_query_information_process(assert: Assert) {
     let zw = status("ZwQueryInformationProcess", &[current, 0, zw_buffer, 0x30, 0]);
     let pid = at::<nt::Ethread>(process::get_current_thread()).cid.unique_process.get();
     assert(nt == 0 && zw == 0 && nt_returned == 0x30 && guest::read_bytes(nt_buffer, 0x30) == guest::read_bytes(zw_buffer, 0x30) && at::<nt::ProcessBasicInformation>(nt_buffer).unique_process_id.get() == pid, "nt-query-process: em KernelMode e o servico do ZwQueryInformationProcess");
+    // A forma estendida de 0x40 bytes que o RunGPU do BasicRender pede:
+    // Size, a básica do EPROCESS (o preenchimento intocado) e os Flags; um
+    // comprimento que não é 0x30 nem 0x40 dá STATUS_INFO_LENGTH_MISMATCH sem
+    // ReturnLength.
+    guest::write_bytes(zw_buffer, &[0xCC; 0x40]);
+    guest::write32(returned, 0);
+    let extended = status("ZwQueryInformationProcess", &[current, 0, zw_buffer, 0x40, returned]);
+    let information = at::<nt::ProcessExtendedBasicInformation>(zw_buffer);
+    // SAFETY: o EPROCESS corrente.
+    let eprocess = unsafe { nt::Eprocess::at(process::get_current_process()) };
+    let fields = information.size.get() == 0x40 && information.basic_info.exit_status.get() == eprocess.exit_status.get() && information.basic_info.peb_base_address.get() == eprocess.peb.get() && information.basic_info.base_priority.get() == eprocess.pcb.base_priority.get() as i32 && information.basic_info.unique_process_id.get() == pid && information.basic_info.inherited_from_unique_process_id.get() == eprocess.inherited_from_unique_process_id.get() && guest::read32(zw_buffer + 0xC) == 0xCCCC_CCCC;
+    let flags = information.flags.get() == crate::ntos::ps::query_process::basic_information(process::get_current_process()).flags && information.flags.get() & 0x106 == 0 && guest::read32(zw_buffer + 0x3C) == 0xCCCC_CCCC;
+    let extended_returned = guest::read32(returned);
+    let mismatch = status("ZwQueryInformationProcess", &[current, 0, zw_buffer, 0x38, returned]);
+    assert(extended == 0 && fields && flags && extended_returned == 0x40 && mismatch == 0xC000_0004 && guest::read32(returned) == 0x40, "nt-query-process: PROCESS_EXTENDED_BASIC_INFORMATION em KernelMode (Size, campos do EPROCESS, Flags) e comprimento invalido");
     // UserMode: o prólogo sonda os parâmetros antes da classe.
     let field = &at::<nt::Ethread>(process::get_current_thread()).tcb.previous_mode;
     let saved = field.get();
