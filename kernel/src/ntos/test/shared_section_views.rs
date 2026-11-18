@@ -19,7 +19,9 @@
 //!   CDCompMappedSharedSectionMarshaler::InitializeSection 0x9F714 do
 //!   win32kbase; CTokenManager::Initialize do dxgkrnl): SEC_COMMIT |
 //!   SEC_NO_CHANGE no MmCreateSection e no ZwCreateSection, vistas com
-//!   SEC_NO_CHANGE e o ObOpenObjectByPointer com HandleAttributes 0xC0000000.
+//!   SEC_NO_CHANGE e o ObOpenObjectByPointer com HandleAttributes 0xC0000000;
+//!   o desmapeamento da vista SEC_NO_CHANGE recusado só enquanto uma faixa
+//!   dela está protegida por MmSecureVirtualMemory (MiUnmapViewOfSection).
 //! - Objetos de um tipo de driver duplicados entre processos e resolvidos
 //!   pelo tipo no destino (os objetos compartilhados do dxgkrnl movidos pelo
 //!   NtDCompositionDuplicateHandleToProcess).
@@ -29,7 +31,7 @@ use crate::ntos::mm::{guest_memory as guest, paging};
 use crate::ntos::ob::objects::section as section_objects;
 use crate::ntos::ob::{object_header, object_types, open_pointer};
 use crate::ntos::ps::process;
-use crate::ntos::ps::user::sections;
+use crate::ntos::ps::user::{sections, state};
 use crate::ntos::test::multiprocess::identity::with_test_process;
 use crate::ntos::test::phase6::call_export;
 
@@ -237,8 +239,18 @@ fn composition_sections(assert: Assert) {
     let (readonly_mapped, readonly) = map_user_view(block + 0x60, body, current, 0x1000, 0, 0, 2);
     assert(readonly_mapped == 0 && view_at(body, readonly).is_some_and(|view| view.no_change) && paging::translate(readonly) == section.frame(0).unwrap_or(1), "dcomp: secao SEC_NO_CHANGE protege toda vista");
     drop(channel);
+    // MiUnmapViewOfSection (rva 0x61e510): num VAD NoChange o
+    // MiCheckSecuredVad da remoção (0x55) recusa a vista com uma faixa do
+    // MmSecureVirtualMemory, em modo usuário e em modo kernel; sem a faixa,
+    // a vista SEC_NO_CHANGE desmapeia pelo NtUnmapViewOfSection de modo
+    // usuário.
+    let user_unmap = |base: u64| state::handler("NtUnmapViewOfSection").map_or(1, |handler| handler(u64::MAX, base, 0, 0, 0).unwrap_or(1));
+    let secured = call_export("MmSecureVirtualMemory", &[uva + 0x1008, 0x10, 4]).unwrap_or(0);
+    let refused = secured != 0 && user_unmap(uva) == 0xC000_0045 && status(call_export("ZwUnmapViewOfSection", &[u64::MAX, uva])) == 0xC000_0045 && view_at(body, uva).is_some();
+    let _ = call_export("MmUnsecureVirtualMemory", &[secured]);
+    assert(refused, "dcomp: faixa do MmSecureVirtualMemory na vista SEC_NO_CHANGE recusa o desmapeamento com STATUS_INVALID_PAGE_PROTECTION");
     let _ = call_export("MmUnmapViewOfSection", &[current, readonly]);
-    let _ = call_export("MmUnmapViewOfSection", &[current, uva]);
+    assert(user_unmap(uva) == 0 && view_at(body, uva).is_none(), "dcomp: solta a faixa, a vista SEC_NO_CHANGE desmapeia pelo NtUnmapViewOfSection de modo usuario");
     let _ = call_export("MmUnmapViewInSystemSpace", &[kva]);
     drop(section);
     assert(section_objects::dereference(body).is_ok() && sections::by_pointer(body).is_none(), "dcomp: secao do canal liberada");

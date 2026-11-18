@@ -12,14 +12,25 @@
 //!   combinada com o processo e um cookie (opaco, não nulo).
 //! - MmUnsecureVirtualMemory(Handle): a busca combina o processo corrente, então
 //!   um handle de outro contexto é ignorado; VOID.
+//! - A entrada (MiAddSecureEntry, rva 0x61fbe0) guarda a faixa em páginas
+//!   inteiras (início arredondado para baixo, fim para cima) com as flags
+//!   0x8 | 1 (PAGE_READONLY) ou 0x8 | 2 (escrita), e o VAD ganha NoChange
+//!   (MiSetVadFlags).
+//! - Desmapear uma vista: o MiUnmapViewOfSection (rva 0x61e510) chama, num
+//!   VAD NoChange de processo sem VmDeleted, o MiCheckSecuredVad(Vad, início
+//!   do VAD, tamanho do VAD, 0x55, PreviousMode) (rva 0x6db108); na
+//!   remoção (0x55) toda entrada com a flag 0x8 que cruza o VAD recusa com
+//!   STATUS_INVALID_PAGE_PROTECTION, em qualquer modo ([`check_unmap`]). Uma
+//!   vista SEC_NO_CHANGE sem entradas desmapeia normalmente: o SEC_NO_CHANGE
+//!   só proíbe trocar a proteção.
 //!
 //! Os "VADs" são as regiões do VAD de cada processo (`ps::user::memory`:
 //! privadas, vistas de seção e imagens), com os mesmos conjuntos de páginas
 //! confirmadas e proteções por página que o ZwQueryVirtualMemory relata.
 //!
-//! Lacuna: a entrada é só registro. No NT uma faixa protegida faz
-//! NtFreeVirtualMemory/NtProtectVirtualMemory falharem enquanto existe; isso
-//! exige um gancho em `ps/user/memory.rs` (free_in/protect_in).
+//! Lacuna: no NT uma faixa protegida também faz NtFreeVirtualMemory e
+//! NtProtectVirtualMemory falharem enquanto existe; isso exige um gancho em
+//! `ps/user/memory.rs` (free_in/protect_in).
 
 use alloc::collections::BTreeMap;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -37,10 +48,14 @@ const PAGE_READONLY: u32 = 2;
 const PAGE_READWRITE: u32 = 4;
 const PAGE_GUARD: u32 = 0x100;
 
+/// STATUS_INVALID_PAGE_PROTECTION.
+const STATUS_INVALID_PAGE_PROTECTION: u32 = 0xC000_0045;
+
+/// Uma entrada de segurança: a faixa [start, end] em páginas inteiras.
 struct Secured {
     process: u64,
-    _base: u64,
-    _size: u64,
+    start: u64,
+    end: u64,
     _probe_mode: u32,
 }
 
@@ -110,8 +125,32 @@ fn secure_range(address: u64, size: u64, probe_mode: u32) -> u64 {
         return 0;
     }
     let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
-    SECURED.lock().insert(handle, Secured { process, _base: address, _size: size, _probe_mode: probe_mode });
+    // As entradas vivem nos VADs do processo e somem com o espaço dele.
+    process::register_process_exit_routine(release_process);
+    SECURED.lock().insert(handle, Secured { process, start: first, end: (end - 1) | (PAGE - 1), _probe_mode: probe_mode });
     handle
+}
+
+/// O fim do processo leva os VADs e as entradas deles.
+fn release_process(process: u64) {
+    SECURED.lock().retain(|_, entry| entry.process != process);
+}
+
+/// O MiCheckSecuredVad da remoção de uma vista (ProbeMode 0x55): o VAD
+/// [base, base + size) de `process` que cruza uma entrada de segurança
+/// recusa com STATUS_INVALID_PAGE_PROTECTION; senão 0. As entradas do
+/// MmSecureVirtualMemory sempre levam a flag 0x8, a que recusa a remoção.
+pub fn check_unmap(process: u64, base: u64, size: u64) -> u32 {
+    if size == 0 {
+        return 0;
+    }
+    let last = base + size - 1;
+    let secured = SECURED.lock();
+    if secured.values().any(|entry| entry.process == process && base <= entry.end && last >= entry.start) {
+        STATUS_INVALID_PAGE_PROTECTION
+    } else {
+        0
+    }
 }
 
 /// MmSecureVirtualMemory(Address, Size, ProbeMode): o handle ou 0.

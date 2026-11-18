@@ -2,10 +2,17 @@
 //!
 //! Uma falha síncrona de writeback conserva a vista e o backing: o chamador
 //! pode repetir sem perder bytes sujos.
+//!
+//! Como o MiUnmapViewOfSection do 19041 (rva 0x61e510), uma vista com uma
+//! faixa protegida por MmSecureVirtualMemory recusa com
+//! STATUS_INVALID_PAGE_PROTECTION (o MiCheckSecuredVad da remoção), em
+//! qualquer modo; uma vista SEC_NO_CHANGE sem faixa protegida desmapeia
+//! normalmente, também de modo usuário (`mm/secure_memory.rs`).
 
 use alloc::sync::Arc;
 
 use crate::ntos::mm::memory_map::USER_ADDRESS_LIMIT;
+use crate::ntos::mm::secure_memory;
 use crate::ntos::mm::section::handles::{self as section_handles, Kind};
 use crate::ntos::mm::section::views::{self as section_views, ImageView, OwnedView};
 use crate::ntos::ke::irql;
@@ -55,6 +62,12 @@ pub fn unmap(handle: u64, base: u64, mode: u8) -> Result<u32, KernelError> {
             }
         }
         let Some(view) = view else { return Ok(0xC000_0019) };
+        // MiCheckSecuredVad(0x55) do VAD inteiro: uma faixa do
+        // MmSecureVirtualMemory na vista recusa a remoção.
+        let secured = secure_memory::check_unmap(process.pointer, view.base(), view.size());
+        if secured != 0 {
+            return Ok(secured);
+        }
         match section_views::unmap(&view) {
             Ok(()) => Ok(0),
             Err(error) if error.status != 0 => Ok(error.status),
