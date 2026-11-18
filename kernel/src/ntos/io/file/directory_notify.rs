@@ -1,5 +1,7 @@
-//! NtNotifyChangeDirectoryFile pelo ZwNotifyChangeDirectoryFile: o pedido
-//! de notificação de mudança num diretório, com o modo anterior KernelMode.
+//! NtNotifyChangeDirectoryFile(Ex): o pedido de notificação de mudança num
+//! diretório, pelo ZwNotifyChangeDirectoryFile (modo anterior KernelMode,
+//! abaixo) e de modo usuário ([`notify_change_directory_user`], o
+//! FindFirstChangeNotificationW e o ReadDirectoryChangesW do kernelbase).
 //!
 //! ntoskrnl 19041: NtNotifyChangeDirectoryFile 0x691630 é o
 //! NtNotifyChangeDirectoryFileEx 0x691690 com a classe
@@ -74,7 +76,8 @@ fn device_at(device: u64) -> &'static DeviceObject {
     unsafe { DeviceObject::at(device) }
 }
 
-/// Os argumentos do NtNotifyChangeDirectoryFile.
+/// Os argumentos do NtNotifyChangeDirectoryFileEx (o
+/// NtNotifyChangeDirectoryFile é a classe FileNotifyInformation).
 pub struct NotifyChange {
     pub handle: u64,
     pub event: u64,
@@ -85,6 +88,58 @@ pub struct NotifyChange {
     pub length: u32,
     pub completion_filter: u32,
     pub watch_tree: bool,
+    /// DIRECTORY_NOTIFY_INFORMATION_CLASS: a FileNotifyExtendedInformation
+    /// (2) vira IRP_MN_NOTIFY_CHANGE_DIRECTORY_EX com a classe; as outras, o
+    /// IRP_MN_NOTIFY_CHANGE_DIRECTORY.
+    pub class: u32,
+}
+
+/// DIRECTORY_NOTIFY_INFORMATION_CLASS FileNotifyInformation e
+/// FileNotifyExtendedInformation.
+pub const FILE_NOTIFY_INFORMATION: u32 = 1;
+const FILE_NOTIFY_EXTENDED_INFORMATION: u32 = 2;
+/// IRP_MN_NOTIFY_CHANGE_DIRECTORY_EX.
+const IRP_MN_NOTIFY_CHANGE_DIRECTORY_EX: u8 = 0x03;
+const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
+const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+/// FILE_LIST_DIRECTORY.
+const FILE_LIST_DIRECTORY: u32 = 0x1;
+
+/// O minor e a classe do IRP da notificação.
+pub fn notify_minor(class: u32) -> (u8, Option<u32>) {
+    if class == FILE_NOTIFY_EXTENDED_INFORMATION { (IRP_MN_NOTIFY_CHANGE_DIRECTORY_EX, Some(class)) } else { (IRP_MN_NOTIFY_CHANGE_DIRECTORY, None) }
+}
+
+/// NtNotifyChangeDirectoryFileEx com PreviousMode UserMode (0x691690). Antes
+/// do caminho comum, o ramo de modo usuário sonda o primeiro ULONG do
+/// IO_STATUS_BLOCK para escrita, o Buffer por ProbeForWrite com alinhamento
+/// de ULONG (quando há Length) e exige o CompletionFilter entre 1 e 0xFFF
+/// (STATUS_INVALID_PARAMETER). Depois o IopReferenceFileObject pede o
+/// FILE_LIST_DIRECTORY do handle. Um arquivo dos volumes do próprio kernel
+/// não tem file system que acompanhe as mudanças
+/// (STATUS_INVALID_DEVICE_REQUEST); um arquivo de driver segue o IRP do I/O
+/// Manager (`io/file/irp_service.rs`). Devolve o NTSTATUS.
+pub fn notify_change_directory_user(arguments: &NotifyChange) -> u32 {
+    use crate::ntos::io::file::read::probe;
+    if !probe(arguments.io_status, 4, true) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    if arguments.length != 0 {
+        if arguments.buffer & 3 != 0 {
+            return STATUS_DATATYPE_MISALIGNMENT;
+        }
+        if !probe(arguments.buffer, arguments.length as u64, true) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+    }
+    if arguments.completion_filter == 0 || arguments.completion_filter & 0xFFFF_F000 != 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if let Some(entry) = crate::ntos::ps::user::state::get_user_handle(arguments.handle).filter(|entry| entry.kind() == "file") {
+        return if entry.access() & FILE_LIST_DIRECTORY == 0 { STATUS_ACCESS_DENIED } else { STATUS_INVALID_DEVICE_REQUEST };
+    }
+    crate::ntos::io::file::irp_service::notify_change_directory(arguments)
 }
 
 /// ZwNotifyChangeDirectoryFile(FileHandle, Event, ApcRoutine, ApcContext,
@@ -171,7 +226,19 @@ pub fn notify_change_directory(arguments: &NotifyChange) -> Result<u32, KernelEr
     }
 }
 
-/// Monta e envia o IRP_MN_NOTIFY_CHANGE_DIRECTORY; a conclusão fica com o
+/// Parameters.NotifyDirectory(Ex) do slot: Length, CompletionFilter e, no
+/// IRP_MN_NOTIFY_CHANGE_DIRECTORY_EX, a classe; SL_WATCH_TREE nos Flags.
+pub fn set_parameters(stack: &IoStackLocation, arguments: &NotifyChange, class: Option<u32>) {
+    let parameters = &stack.parameters.notify_directory_ex;
+    parameters.length.set(arguments.length);
+    parameters.completion_filter.set(arguments.completion_filter);
+    if let Some(class) = class {
+        parameters.directory_notify_information_class.set(crate::ntos::inc::types::DirectoryNotifyInformationClass(class as i32));
+    }
+    stack.flags.set(if arguments.watch_tree { SL_WATCH_TREE } else { 0 });
+}
+
+/// Monta e envia o IRP da notificação; a conclusão fica com o
 /// `file_request`.
 fn dispatch(request: &Shared, device: u64, arguments: &NotifyChange) -> Result<u32, KernelError> {
     let count = match device_at(device).stack_size.get() as u8 {
@@ -211,9 +278,10 @@ fn dispatch(request: &Shared, device: u64, arguments: &NotifyChange) -> Result<u
         let r = request.lock();
         (r.system, r.file, r.thread, r.io_status, r.event.as_ref().map_or(0, |event| event.pointer), r.mdl)
     };
+    let (minor, class) = notify_minor(arguments.class);
     irp_builder::build(packet, &BuildOptions {
         major: IRP_MJ_DIRECTORY_CONTROL,
-        minor: IRP_MN_NOTIFY_CHANGE_DIRECTORY,
+        minor,
         buffer: system,
         device_object: device,
         stack_count: count,
@@ -227,10 +295,7 @@ fn dispatch(request: &Shared, device: u64, arguments: &NotifyChange) -> Result<u
     });
     // SAFETY: IRP recém-construído e o slot do topo dele.
     let (irp, stack) = unsafe { (Irp::at(packet), IoStackLocation::at(irp_builder::first_stack_location(packet, count))) };
-    let parameters = &stack.parameters.notify_directory;
-    parameters.length.set(arguments.length);
-    parameters.completion_filter.set(arguments.completion_filter);
-    stack.flags.set(if arguments.watch_tree { SL_WATCH_TREE } else { 0 });
+    set_parameters(stack, arguments, class);
     irp.mdl_address.set(mdl_address);
     irp.flags.set(irp_flags);
     irp.overlay.asynchronous_parameters.user_apc_routine.set(arguments.apc_routine);

@@ -4548,7 +4548,12 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     do Filter Manager) e FsRtlQueryCachedVdl (FSCTL_QUERY_FILE_REGIONS);
     CcIsThereDirtyDataEx e CcSetDirtyPageThreshold; IoSetIrpExtraCreateParameter
     e IoGetFsTrackOffsetState; ZwSetEaFile, ZwNotifyChangeDirectoryFile
-    (`io/file/directory_notify.rs`), NtSetInformationFile, NtFsControlFile e
+    (`io/file/directory_notify.rs`, que também atende o
+    NtNotifyChangeDirectoryFile(Ex) de modo usuário: as sondas do
+    IO_STATUS_BLOCK e do buffer alinhado a ULONG, o filtro entre 1 e 0xFFF,
+    o FILE_LIST_DIRECTORY, o IRP de um arquivo de driver por
+    `io/file/irp_service.rs` e STATUS_INVALID_DEVICE_REQUEST nos volumes do
+    kernel, que o DirectWrite tolera), NtSetInformationFile, NtFsControlFile e
     ZwCreateSymbolicLinkObject;
   - Ke, Ex, Po, Mm e Io: IoSizeOfIrpEx/IoInitializeIrpEx/IoCleanupIrp,
     IoEnqueueIrp, IoSetIoAttributionIrp e IoReportResourceForDetection; os

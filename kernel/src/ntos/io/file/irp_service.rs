@@ -1,8 +1,8 @@
 //! Os serviços de arquivo de modo usuário sobre um FILE_OBJECT aberto num
 //! driver: NtReadFile, NtWriteFile, NtFsControlFile e NtDeviceIoControlFile
-//! (o IopXxxControlFile), NtQueryInformationFile, NtSetInformationFile e
-//! NtQueryVolumeInformationFile, montados como o I/O Manager do ntoskrnl
-//! 19041 os monta.
+//! (o IopXxxControlFile), NtQueryInformationFile, NtSetInformationFile,
+//! NtQueryVolumeInformationFile e NtNotifyChangeDirectoryFile(Ex), montados
+//! como o I/O Manager do ntoskrnl 19041 os monta.
 //!
 //! - O handle de usuário dá o FILE_OBJECT e o acesso concedido (conferido
 //!   contra o que a operação exige). O IRP sai do StackSize do dispositivo
@@ -814,6 +814,79 @@ fn control(arguments: &Control, major: u8, minor: u8) -> u32 {
     let location = top_location(packet);
     let granted = (target.access & FILE_READ_DATA != 0) as u8 | if target.access & FILE_WRITE_DATA != 0 { 4 } else { 0 };
     location.flags.set(location.flags.get() | granted);
+    track(packet, &target, event, 0, arguments.apc_context);
+    synchronous_service_tail(&target, packet)
+}
+
+// ---- notificação de mudança num diretório --------------------------------------
+
+/// NtNotifyChangeDirectoryFileEx de modo usuário num arquivo de driver,
+/// depois das sondas e do filtro (`io/file/directory_notify.rs`): o
+/// FILE_LIST_DIRECTORY do handle; um arquivo com porta de conclusão não
+/// aceita ApcRoutine (fora o bit 0, STATUS_INVALID_PARAMETER); o evento
+/// referenciado e limpo; o lock de um arquivo síncrono e o evento dele
+/// limpo; o IRP_MJ_DIRECTORY_CONTROL da classe (`directory_notify::notify_minor`)
+/// com o Length, o CompletionFilter e o SL_WATCH_TREE; o buffer num
+/// SystemBuffer zerado (DO_BUFFERED_IO, copiado na conclusão), num MDL das
+/// páginas travadas para escrita (DO_DIRECT_IO) ou no UserBuffer; e o
+/// IopSynchronousServiceTail.
+pub fn notify_change_directory(arguments: &super::directory_notify::NotifyChange) -> u32 {
+    use super::directory_notify;
+    const IRP_MJ_DIRECTORY_CONTROL: u8 = 0x0C;
+    const FILE_LIST_DIRECTORY: u32 = 0x1;
+    let target = match reference(arguments.handle) {
+        Ok(target) => target,
+        Err(status) => return status,
+    };
+    if target.access & FILE_LIST_DIRECTORY == 0 {
+        return conclude(&target, false, None, STATUS_ACCESS_DENIED);
+    }
+    if file_at(target.file).completion_context.get() != 0 && arguments.apc_routine & !1 != 0 {
+        return conclude(&target, false, None, STATUS_INVALID_PARAMETER);
+    }
+    if arguments.apc_routine != 0 {
+        return conclude(&target, false, None, STATUS_NOT_SUPPORTED);
+    }
+    let event = match reference_event(arguments.event) {
+        Ok(event) => event,
+        Err(status) => return conclude(&target, false, None, status),
+    };
+    let synchronous = target.synchronous();
+    if synchronous && information::acquire_file(target.file).is_err() {
+        return conclude(&target, false, event, STATUS_INSUFFICIENT_RESOURCES);
+    }
+    dispatcher::clear_event(file_at(target.file).event.address());
+    let device_flags = device_at(target.device).flags.get();
+    let length = arguments.length;
+    let buffered = length != 0 && device_flags & DO_BUFFERED_IO != 0;
+    let direct = length != 0 && !buffered && device_flags & DO_DIRECT_IO != 0;
+    let (mut system, mut flags) = (0, 0);
+    if buffered {
+        system = guest::alloc_bytes(length as u64);
+        if system == 0 {
+            return conclude(&target, synchronous, event, STATUS_INSUFFICIENT_RESOURCES);
+        }
+        guest::write_bytes(system, &alloc::vec![0u8; length as usize]);
+        flags = IRP_BUFFERED_IO | IRP_DEALLOCATE_BUFFER | IRP_INPUT_OPERATION;
+    }
+    let user_buffer = if length != 0 && !direct { arguments.buffer } else { 0 };
+    let (minor, class) = directory_notify::notify_minor(arguments.class);
+    let user_event = event.as_ref().map_or(0, |event| event.pointer);
+    let packet = allocate(&target, BuildOptions { major: IRP_MJ_DIRECTORY_CONTROL, minor, buffer: system, user_event, user_iosb: arguments.io_status, user_buffer, ..BuildOptions::default() }, flags);
+    if packet == 0 {
+        if system != 0 {
+            let _ = pool_allocation::free(system, 0);
+        }
+        return conclude(&target, synchronous, event, STATUS_INSUFFICIENT_RESOURCES);
+    }
+    if direct {
+        if crate::ntos::io::mdl::allocate_mdl_for_irp(arguments.buffer, length, false, packet) == 0 {
+            irp_builder::free_irp(packet);
+            return conclude(&target, synchronous, event, STATUS_INSUFFICIENT_RESOURCES);
+        }
+        crate::ntos::mm::mdl::probe_and_lock_pages(irp_at(packet).mdl_address.get(), 1);
+    }
+    directory_notify::set_parameters(top_location(packet), arguments, class);
     track(packet, &target, event, 0, arguments.apc_context);
     synchronous_service_tail(&target, packet)
 }

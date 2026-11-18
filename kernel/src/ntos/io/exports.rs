@@ -2403,7 +2403,7 @@ pub mod io_file_services {
     /// ZwNotifyChangeDirectoryFile(FileHandle, Event, ApcRoutine, ApcContext,
     /// IoStatusBlock, Buffer, Length, CompletionFilter, WatchTree) -> NTSTATUS.
     fn notify_change_directory_file(call: &Call) -> Result<u64, KernelError> {
-        let arguments = NotifyChange { handle: call.arg(1), event: call.arg(2), apc_routine: call.arg(3), apc_context: call.arg(4), io_status: call.arg(5), buffer: call.arg(6), length: call.arg(7) as u32, completion_filter: call.arg(8) as u32, watch_tree: call.arg(9) & 0xFF != 0 };
+        let arguments = NotifyChange { handle: call.arg(1), event: call.arg(2), apc_routine: call.arg(3), apc_context: call.arg(4), io_status: call.arg(5), buffer: call.arg(6), length: call.arg(7) as u32, completion_filter: call.arg(8) as u32, watch_tree: call.arg(9) & 0xFF != 0, class: directory_notify::FILE_NOTIFY_INFORMATION };
         Ok(signed_status(previous_mode::with_kernel(|| directory_notify::notify_change_directory(&arguments))??))
     }
 

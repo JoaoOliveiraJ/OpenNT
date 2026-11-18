@@ -978,6 +978,33 @@ fn nt_query_volume_information_file(handle: u64, iosb: u64, out: u64, length: u6
     })
 }
 
+/// NtNotifyChangeDirectoryFile(Ex)(FileHandle, Event, ApcRoutine,
+/// ApcContext, IoStatusBlock, Buffer, Length, CompletionFilter, WatchTree[,
+/// DirectoryNotifyInformationClass]): `io/file/directory_notify.rs`.
+fn notify_change_directory(handle: u64, event: u64, apc_routine: u64, apc_context: u64, rsp: u64, class: u32) -> u32 {
+    use crate::ntos::io::file::directory_notify::{self, NotifyChange};
+    directory_notify::notify_change_directory_user(&NotifyChange {
+        handle,
+        event,
+        apc_routine,
+        apc_context,
+        io_status: state::stack_arg(rsp, 5),
+        buffer: state::stack_arg(rsp, 6),
+        length: state::stack_arg32(rsp, 7),
+        completion_filter: state::stack_arg32(rsp, 8),
+        watch_tree: state::stack_arg(rsp, 9) & 0xFF != 0,
+        class,
+    })
+}
+
+fn nt_notify_change_directory_file(handle: u64, event: u64, apc_routine: u64, apc_context: u64, rsp: u64) -> Result<u32, KernelError> {
+    Ok(notify_change_directory(handle, event, apc_routine, apc_context, rsp, crate::ntos::io::file::directory_notify::FILE_NOTIFY_INFORMATION))
+}
+
+fn nt_notify_change_directory_file_ex(handle: u64, event: u64, apc_routine: u64, apc_context: u64, rsp: u64) -> Result<u32, KernelError> {
+    Ok(notify_change_directory(handle, event, apc_routine, apc_context, rsp, state::stack_arg32(rsp, 10)))
+}
+
 /// Registra os handlers da segunda parte.
 pub fn init_part2() {
     state::register_handler("NtSetInformationFile", nt_set_information_file);
@@ -985,4 +1012,6 @@ pub fn init_part2() {
     state::register_handler("NtQueryDirectoryFile", nt_query_directory_file);
     state::register_handler("NtQueryDirectoryFileEx", nt_query_directory_file_ex);
     state::register_handler("NtQueryVolumeInformationFile", nt_query_volume_information_file);
+    state::register_handler("NtNotifyChangeDirectoryFile", nt_notify_change_directory_file);
+    state::register_handler("NtNotifyChangeDirectoryFileEx", nt_notify_change_directory_file_ex);
 }
