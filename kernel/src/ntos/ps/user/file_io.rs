@@ -144,7 +144,10 @@ pub fn open(out: u64, name: &str, iosb: u64, disposition: u32, request: &OpenReq
         }
         // EA, oplocks, abertura por id e contextos estendidos exigem
         // contratos próprios: pedidos sem suporte nunca têm sucesso.
-        let supported = 1 | 2 | 4 | 8 | 0x10 | 0x20 | 0x40 | 0x800 | 0x1000 | 0x4000 | 0x8000 | 0x2_0000 | 0x20_0000 | 0x40_0000;
+        // FILE_OPEN_FOR_FREE_SPACE_QUERY (0x80_0000) só tira a cota do
+        // usuário das consultas de espaço livre do handle (o volume não tem
+        // cotas): o GetDiskFreeSpaceExW abre o diretório com ela.
+        let supported = 1 | 2 | 4 | 8 | 0x10 | 0x20 | 0x40 | 0x800 | 0x1000 | 0x4000 | 0x8000 | 0x2_0000 | 0x20_0000 | 0x40_0000 | 0x80_0000;
         if options & !supported != 0 || request.ea_length != 0 || granted & 0x0200_0000 != 0 {
             debug_print!("[file-io] create unsupported name={} access=0x{:x} options=0x{:x} eaLength={}", name, granted, options, request.ea_length);
             return fail(0xC000_00BB);
