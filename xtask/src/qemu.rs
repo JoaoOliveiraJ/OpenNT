@@ -1431,6 +1431,10 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
             Ok(description) => format!("passou numa leitura, mas nao em duas seguidas iguais: {description}"),
             Err(missing) => missing,
         };
+        // No QEMU a tela desligada continua com o último quadro: a serial diz
+        // se a política de energia a desligou antes da captura.
+        let switched_off = output.lock().unwrap().contains("[po] tela do console: desligada");
+        let verdict = if switched_off { format!("{verdict} (a politica de energia desligou a tela do console antes da captura)") } else { verdict };
         let line = format!("\n[xtask] a ultima tela lida nao e a tela de logon: {verdict}\n");
         print!("{line}");
         output.lock().unwrap().push_str(&line);

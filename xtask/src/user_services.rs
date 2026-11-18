@@ -20,7 +20,8 @@
 //! memória para separar os serviços de um svchost em processos próprios),
 //! o `FullProcessInformationSID` de `Control\Windows`, que o
 //! BrokerInfrastructure lê ao subir,
-//! a configuração de energia (`Control\Power`), as definições WNF
+//! a configuração de energia (`Control\Power`, com "Desligar a tela: Nunca"
+//! no esquema ativo: `power_policy`), as definições WNF
 //! (`Control\Notifications`), as opções do produto (`Control\ProductOptions`)
 //! e, na SOFTWARE, os grupos do svchost (`Microsoft\Windows NT\CurrentVersion\
 //! Svchost`, os valores com a lista de serviços de cada grupo e as subchaves
@@ -117,6 +118,8 @@ pub fn system_keys(control_set: &str) -> Vec<HostKey> {
         // esquemas, as configurações e os padrões (o Control\Power com as
         // subchaves que esta conta lê).
         registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\Control\\Power"), &format!("{control_set}\\Control\\Power"), true, &mut keys);
+        // "Desligar a tela: Nunca" no esquema ativo (`power_policy`).
+        power_policy(control_set, &mut keys);
         registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\Control\\LsaExtensionConfig"), &format!("{control_set}\\Control\\LsaExtensionConfig"), true, &mut keys);
         // As definições dos nomes WNF permanentes e persistentes desta
         // instalação (`Control\Notifications`: um REG_BINARY por nome, com o
@@ -170,6 +173,86 @@ pub fn system_keys(control_set: &str) -> Vec<HostKey> {
     #[cfg(not(windows))]
     let _ = control_set;
     keys
+}
+
+/// SUB_VIDEO e os dois timeouts de tela que o kernel do 19041 usa na tela de
+/// logon e no console bloqueado: VIDEOIDLE (GUID_VIDEO_POWERDOWN_TIMEOUT) e
+/// VIDEOCONLOCK (GUID_VIDEO_CONSOLE_LOCK_TIMEOUT).
+#[cfg_attr(not(windows), allow(dead_code))]
+const SUB_VIDEO: &str = "7516b95f-f776-4464-8c53-06167f40cc99";
+#[cfg_attr(not(windows), allow(dead_code))]
+const VIDEO_TIMEOUTS: [&str; 2] = ["3c0bc021-c8a8-4e07-a973-6b14cbcb2b7e", "8ec4b3a5-6868-48c2-be75-4f3044be88a7"];
+/// O esquema Equilibrado, o ativo de uma instalação nova.
+#[cfg_attr(not(windows), allow(dead_code))]
+const BALANCED: &str = "381b4222-f694-41f0-9685-ff5bb260df2e";
+
+/// "Desligar a tela: Nunca" no esquema ativo, como o `powercfg /change
+/// monitor-timeout-ac 0` (e `-dc 0`) e o `powercfg /setacvalueindex
+/// SCHEME_CURRENT SUB_VIDEO VIDEOCONLOCK 0` (e o dc) gravam pelo serviço Power:
+/// ACSettingIndex e DCSettingIndex zero em
+/// `Control\Power\User\PowerSchemes\{esquema}\{SUB_VIDEO}\{setting}`. O umpo
+/// manda os valores ao kernel pelo `\PowerPort`. Numa instalação nova a tela
+/// de logon apaga depois de 600 s sem entrada (VIDEOIDLE do Equilibrado, AC) e
+/// a do console bloqueado depois de 60 s (VIDEOCONLOCK); com os dois em zero
+/// o win32k nunca desliga a tela durante os testes, qualquer que seja a
+/// configuração desta máquina. O EnforceConsoleLockScreenTimeout desta máquina
+/// (que faz o VIDEOCONLOCK valer acima do VIDEOIDLE) não vai ao convidado.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn power_policy(control_set: &str, keys: &mut Vec<HostKey>) {
+    let power = format!("{control_set}\\Control\\Power");
+    if let Some(key) = keys.iter_mut().find(|key| key.path.eq_ignore_ascii_case(&power)) {
+        key.values.retain(|(name, _, _)| !name.eq_ignore_ascii_case("EnforceConsoleLockScreenTimeout"));
+    }
+    let schemes = format!("{power}\\User\\PowerSchemes");
+    let active = keys
+        .iter()
+        .find(|key| key.path.eq_ignore_ascii_case(&schemes))
+        .and_then(|key| key.values.iter().find(|(name, kind, _)| name.eq_ignore_ascii_case("ActivePowerScheme") && *kind == 1))
+        .map(|(_, _, data)| {
+            let units: Vec<u16> = data.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).take_while(|&unit| unit != 0).collect();
+            String::from_utf16_lossy(&units)
+        })
+        .filter(|scheme| !scheme.is_empty())
+        .unwrap_or_else(|| String::from(BALANCED));
+    for setting in VIDEO_TIMEOUTS {
+        let zero = 0u32.to_le_bytes().to_vec();
+        // O hive_from_seeds cria as chaves-pai, e o valor que vem depois
+        // substitui o copiado desta máquina.
+        keys.push(HostKey {
+            path: format!("{schemes}\\{active}\\{SUB_VIDEO}\\{setting}"),
+            values: vec![(String::from("ACSettingIndex"), 4, zero.clone()), (String::from("DCSettingIndex"), 4, zero)],
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{power_policy, BALANCED, SUB_VIDEO, VIDEO_TIMEOUTS};
+    use crate::host_language::HostKey;
+
+    /// O plano de energia do convidado: sem o EnforceConsoleLockScreenTimeout
+    /// desta máquina e com os dois timeouts de tela em zero no esquema ativo
+    /// (o Equilibrado quando a chave não diz qual é).
+    #[test]
+    fn power_policy_turns_display_off_never() {
+        let utf16 = |text: &str| text.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect::<Vec<u8>>();
+        let mut keys = vec![
+            HostKey { path: String::from("ControlSet001\\Control\\Power"), values: vec![(String::from("EnforceConsoleLockScreenTimeout"), 4, 1u32.to_le_bytes().to_vec()), (String::from("HibernateEnabled"), 4, 0u32.to_le_bytes().to_vec())] },
+            HostKey { path: String::from("ControlSet001\\Control\\Power\\User\\PowerSchemes"), values: vec![(String::from("ActivePowerScheme"), 1, utf16("8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"))] },
+        ];
+        power_policy("ControlSet001", &mut keys);
+        assert!(keys[0].values.iter().all(|(name, _, _)| name != "EnforceConsoleLockScreenTimeout"));
+        assert!(keys[0].values.iter().any(|(name, _, _)| name == "HibernateEnabled"));
+        for setting in VIDEO_TIMEOUTS {
+            let path = format!("ControlSet001\\Control\\Power\\User\\PowerSchemes\\8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c\\{SUB_VIDEO}\\{setting}");
+            let key = keys.iter().rev().find(|key| key.path == path).expect("chave do timeout");
+            let expected: Vec<(String, u32, Vec<u8>)> = vec![(String::from("ACSettingIndex"), 4, vec![0; 4]), (String::from("DCSettingIndex"), 4, vec![0; 4])];
+            assert_eq!(key.values, expected);
+        }
+        let mut empty = Vec::new();
+        power_policy("ControlSet001", &mut empty);
+        assert!(empty.iter().any(|key| key.path.contains(BALANCED)));
+    }
 }
 
 /// As chaves da hive SOFTWARE: os grupos do svchost, os provedores de

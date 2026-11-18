@@ -4201,7 +4201,11 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   ScAutoStartServices acha no banco do SCM o DcomLaunch, o RpcEptMapper,
   o RpcSs e o LSM (início automático, com as chaves de serviço do Power,
   do BrokerInfrastructure e do SystemEventsBroker, que dividem o svchost
-  do DcomLaunch, e o `Control\Power` copiados desta máquina) e passa pelo
+  do DcomLaunch, e o `Control\Power` copiados desta máquina, com "Desligar
+  a tela: Nunca" no esquema ativo: o VIDEOIDLE e o VIDEOCONLOCK em zero, o
+  que o powercfg grava, e a tela de logon não apaga durante o teste em
+  qualquer máquina; o EnforceConsoleLockScreenTimeout desta máquina não vai
+  ao convidado) e passa pelo
   logon de serviço: o ScLogonService pede ao lsass o LogonUserExExW da
   conta do serviço, e o LsapCreateTokenObject cria o token
   (NtCreateTokenEx) e grava nele a TokenMandatoryPolicy, a

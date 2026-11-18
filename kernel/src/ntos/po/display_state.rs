@@ -21,7 +21,8 @@
 //!   muda nada. Um estado novo é guardado, vai a GUID_CONSOLE_DISPLAY_STATE e,
 //!   como BOOL "monitor ligado" (estado diferente de PowerMonitorOff), a
 //!   GUID_MONITOR_POWER_ON (PopSetPowerSettingValueAcDc: AC e DC da
-//!   configuração de máquina) e a WNF_UBPM_CONSOLE_MONITOR.
+//!   configuração de máquina) e a WNF_UBPM_CONSOLE_MONITOR. Cada mudança sai
+//!   na serial (`[po] tela do console: …`).
 //!
 //! O OpenNT não é uma plataforma AoAc (o PopPlatformAoAc é FALSE) e não tem o
 //! agregador de energia (o PopPowerAggregatorNotifyDisplayPoweredOn de um
@@ -71,6 +72,16 @@ fn update_console_display_state(state: u32) -> Result<(), KernelError> {
     if CONSOLE_DISPLAY_STATE.swap(state, Ordering::AcqRel) == state {
         return Ok(());
     }
+    // Só diagnóstico: no QEMU a tela desligada pelo BasicDisplay (VBE 4F10h)
+    // continua mostrando o último quadro, então a mudança sai na serial.
+    crate::debug_print!(
+        "[po] tela do console: {}",
+        match state {
+            0 => "desligada",
+            2 => "esmaecida",
+            _ => "ligada",
+        }
+    );
     power_setting::set_value_ac_dc(&power_setting::GUID_CONSOLE_DISPLAY_STATE, &state.to_le_bytes());
     let monitor_on = (state != 0) as u32;
     power_setting::set_value_ac_dc(&power_setting::GUID_MONITOR_POWER_ON, &monitor_on.to_le_bytes());
