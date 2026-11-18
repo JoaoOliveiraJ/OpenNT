@@ -5360,6 +5360,29 @@ fn user_wnf(assert: Assert) {
         denied == Some(0xC000_0022) && untyped_denied == Some(0xC000_0022) && kernel_buffer == Some(0xC000_0005) && requery == Some(0) && reread == (1, 0xFEED_BEEF),
         "userwnf: NtUpdateWnfStateData recusa a escrita sem acesso pelo descritor e confere a faixa do buffer",
     );
+    // Um nome cujo descritor tem uma ACE de callback (XA), como os dos nomes
+    // do MrmCoreR e do Windows.UI.Logon em Control\Notifications:
+    // `(A;;CCDC;;;SY)(XA;;CC;;;WD;(...))`. O SeAccessCheck pula a ACE de
+    // callback e concede ao SYSTEM pela ACE simples.
+    let (callback_name, callback_descriptor) = (block + 0x1C0, block + 0x200);
+    let callback_sd: [u8; 76] = [
+        1, 0, 0x04, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 20, 0, 0, 0, // SECURITY_DESCRIPTOR_RELATIVE com DACL em 20
+        2, 0, 56, 0, 2, 0, 0, 0, // ACL: revisão 2, 56 bytes, duas ACEs
+        0, 0, 20, 0, 3, 0, 0, 0, // ACCESS_ALLOWED_ACE CCDC
+        1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0, // S-1-5-18
+        9, 0, 28, 0, 1, 0, 0, 0, // ACCESS_ALLOWED_CALLBACK_ACE CC
+        1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, // S-1-1-0
+        b'a', b'r', b't', b'x', 0, 0, 0, 0, // expressão condicional (ApplicationData)
+    ];
+    guest::write_bytes(callback_descriptor, &callback_sd);
+    guest::write64(callback_name, 0);
+    stack(&[0, 0x40, callback_descriptor]);
+    let callback_created = call("NtCreateWnfStateName", callback_name, 3, 0, 0);
+    guest::write32(data, 0x2468_ACE0);
+    stack(&[0, 0, 0]);
+    let callback_write = call("NtUpdateWnfStateData", callback_name, data, 4, 0);
+    let _ = call("NtDeleteWnfStateName", callback_name, 0, 0, 0);
+    assert(callback_created == Some(0) && callback_write == Some(0), "userwnf: descritor com ACE de callback concede ao SYSTEM pela ACE simples");
     // NtCreateWnfStateName de modo usuário: um nome temporário de escopo de
     // sistema com o descritor (Everyone com GENERIC_ALL) copiado do usuário.
     let (created_name, descriptor) = (block + 0x100, block + 0x140);

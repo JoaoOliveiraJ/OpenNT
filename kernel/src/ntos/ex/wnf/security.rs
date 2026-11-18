@@ -43,6 +43,10 @@ fn read_policy(pointer: u64) -> Option<(SecurityPolicy, Vec<Label>)> {
     let descriptor = query_descriptor::read_descriptor(pointer)?;
     let mut policy = SecurityPolicy { owner: descriptor.owner.clone().unwrap_or_default(), group: descriptor.group.clone(), dacl: None, ..Default::default() };
     if let Some(bytes) = &descriptor.dacl {
+        // A DACL inteira segue junto, como no descritor das chaves: as ACEs
+        // que não são simples (as de callback, tipo 9) não cabem nas entradas
+        // e a avaliação de acesso as pula, como o SeAccessCheck do 19041.
+        policy.dacl_bytes = Some(bytes.clone());
         let mut entries = Vec::new();
         let mut offset = 8usize;
         for _ in 0..u16::from_le_bytes([bytes[4], bytes[5]]) {
