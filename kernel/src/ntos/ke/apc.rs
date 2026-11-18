@@ -97,10 +97,22 @@ fn pending_flag(state: &KapcState, mode: usize) -> &Field<u8> {
     if mode == 0 { &state.kernel_apc_pending } else { &state.user_apc_pending_all }
 }
 
-/// Insere no fim da lista nativa do modo e publica a pendência de kernel.
+/// Insere no fim da lista nativa do modo e publica a pendência de kernel. A
+/// APC especial de usuário vai para o começo da lista de usuário (o ramo
+/// frio do KiInsertQueueApc 19041, rva 0x482442): as especiais saem antes
+/// das normais e, entre si, da mais nova para a mais antiga.
 fn link(state: &KapcState, apc: &Kapc) {
     let head = &state.apc_list_head[apc.apc_mode.get() as u8 as usize];
     let entry = &apc.apc_list_entry;
+    let special = special_user_apc_kernel_routine as extern "win64" fn(u64) as usize as u64;
+    if apc.apc_mode.get() != 0 && is_special_user(apc, special) {
+        let first = head.flink.get();
+        entry.flink.set(first);
+        entry.blink.set(head.address());
+        list_entry(first).blink.set(entry.address());
+        head.flink.set(entry.address());
+        return;
+    }
     let last = head.blink.get();
     entry.flink.set(head.address());
     entry.blink.set(last);
