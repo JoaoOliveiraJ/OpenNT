@@ -3915,10 +3915,15 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   pede o SeTcbPrivilege e um token sem uso; abaixo de High e de Medium os
   privilégios fora das máscaras do 19041 ficam desligados, mas presentes):
   o dwminit do winlogon sobe assim o token da conta DWM-n para System. O CreateProcessAsUser passa o token no PS_ATTRIBUTE_TOKEN do
-  NtCreateUserProcess: o processo novo recebe uma cópia dele com o SessionId
-  da sessão do processo (o SeSubProcessToken do
-  PspInitializeProcessSecurity), e quem cria precisa do
-  SeAssignPrimaryTokenPrivilege habilitado no token efetivo.
+  NtCreateUserProcess. Todo processo novo recebe como token primário o
+  SeSubProcessToken (`tokens::sub_process_token`) do token pedido ou, sem
+  ele, do primário do pai declarado (ou de quem cria): uma cópia com o
+  TokenFlags da origem (o SepDuplicateToken, que toda cópia de token segue),
+  o dono padrão, o ModifiedId e o SessionId da sessão do processo. Quem
+  cria precisa do SeAssignPrimaryTokenPrivilege habilitado no token efetivo
+  ou de um token atribuível; um token de outra sessão que a de quem cria
+  exige o privilégio e leva o processo à sessão do token (o
+  PspAttachSession, `mm::session::join_id`).
 - **Tokens restritos** (`se/token/filter.rs`, `se/capture.rs`): o
   NtFilterToken de modo usuário (o CreateRestrictedToken da kernelbase)
   captura SidsToDisable, PrivilegesToDelete e RestrictedSids com o

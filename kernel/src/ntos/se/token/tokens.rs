@@ -45,6 +45,12 @@ const TOKEN_LOWBOX: u32 = 0x4000;
 /// TOKEN_SESSION_NOT_REFERENCED em TokenFlags: o token não segura mais a
 /// sessão de logon dele.
 pub const TOKEN_SESSION_NOT_REFERENCED: u32 = 0x20;
+/// O TokenFlags que uma cópia herda (SepDuplicateToken): todos menos
+/// SESSION_NOT_REFERENCED e VIRTUALIZE_ENABLED.
+const DUPLICATED_FLAGS: u32 = 0xFFFF_FBDF;
+/// TOKEN_AUDIT_NO_CHILD_PROCESS em TokenFlags: o token primário de um
+/// processo novo nasce sem ele.
+const TOKEN_AUDIT_NO_CHILD_PROCESS: u32 = 0x20_0000;
 
 /// TokenInUse: o token é o primário de algum processo vivo.
 pub fn in_use(pointer: u64) -> bool {
@@ -318,6 +324,18 @@ fn system_privileges() -> Vec<Privilege> {
 /// fica acessível depois de publicar os campos nativos e a referência inicial.
 pub fn create(parent: Option<u64>, initialize: Option<&dyn Fn(&mut Token)>) -> Result<u64, KernelError> {
     let object_type = object_types::token_type();
+    // SepDuplicateToken: a cópia herda o TokenFlags da origem sem
+    // VIRTUALIZE_ENABLED e volta a segurar a sessão de logon; se a origem
+    // já a largou e a sessão não existe mais, a cópia também fica sem ela.
+    // Fora da trava dos registros: a lista de sessões de logon é travada
+    // antes dela no RmDeleteLogonSession.
+    let inherited_flags = parent.and_then(|parent| with(parent, |record| (body(parent).token_flags.get(), record.authentication_id, record.server_silo))).map(|(source_flags, logon_id, server_silo)| {
+        let mut flags = source_flags & DUPLICATED_FLAGS;
+        if source_flags & TOKEN_SESSION_NOT_REFERENCED != 0 && !crate::ntos::se::logon_session::exists(logon_id, server_silo) {
+            flags |= TOKEN_SESSION_NOT_REFERENCED;
+        }
+        flags
+    });
     let pointer = guest::alloc_bytes(TokenBody::SIZE);
     if pointer == 0 {
         return Err(KernelError::with_status("Token allocation failed", STATUS_INSUFFICIENT_RESOURCES));
@@ -333,7 +351,8 @@ pub fn create(parent: Option<u64>, initialize: Option<&dyn Fn(&mut Token)>) -> R
         exclusive_process: 0,
         permanent: false,
         id,
-        modified_id: id,
+        // Uma cópia conserva o ModifiedId da origem (o SepDuplicateToken).
+        modified_id: parent.as_ref().map_or(id, |parent| parent.modified_id),
         parent_token_id: parent.as_ref().map_or(0, |parent| parent.parent_token_id),
         authentication_id: parent.as_ref().map_or(0x3E7, |parent| parent.authentication_id),
         // O contexto de boot não expira; duplicações conservam a política do pai.
@@ -392,6 +411,9 @@ pub fn create(parent: Option<u64>, initialize: Option<&dyn Fn(&mut Token)>) -> R
         drop(tokens);
         guest::free_bytes(pointer);
         return Err(error);
+    }
+    if let Some(flags) = inherited_flags {
+        body(pointer).token_flags.set(flags);
     }
     publish_body(&token);
     let logon_session = (token.authentication_id, token.server_silo);
@@ -491,6 +513,26 @@ pub fn dereference(pointer: u64) -> Option<u64> {
 pub fn account_handle(pointer: u64, change: i64) -> Result<(), KernelError> {
     validate(&TOKENS.lock(), pointer)?;
     object_types::account("Token", 0, change)
+}
+
+/// SeSubProcessToken (ntoskrnl 19041, 0x603e44): o token primário de um
+/// processo novo, a cópia de `source` (o token do PS_ATTRIBUTE_TOKEN ou o
+/// primário do pai) pelo SepDuplicateToken, com o dono padrão dela, o
+/// SessionId da sessão do processo (o MmGetSessionId que o
+/// PspInitializeProcessSecurity passa) e sem TOKEN_AUDIT_NO_CHILD_PROCESS.
+pub fn sub_process_token(source: u64, session_id: u32) -> Result<u64, KernelError> {
+    let owner = with(source, |record| record.owner.clone());
+    let copy = create(
+        Some(source),
+        Some(&|token: &mut Token| {
+            token.session_id = session_id;
+            if let Some(owner) = &owner {
+                token.owner = owner.clone();
+            }
+        }),
+    )?;
+    body(copy).token_flags.atomic().fetch_and(!TOKEN_AUDIT_NO_CHILD_PROCESS, core::sync::atomic::Ordering::SeqCst);
+    Ok(copy)
 }
 
 /// Token de impersonação com cópias próprias de identidade, DACL e

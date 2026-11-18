@@ -585,10 +585,17 @@ fn capture_and_create(request: &UserCreateRequest) -> Result<u32, u32> {
     // PsAttributeToken: o SeAssignPrimaryTokenPrivilege (o RtlAcquirePrivilege
     // do PspAllocateProcess o habilita numa cópia do primário de quem chama
     // antes do SeSinglePrivilegeCheck) ou um token filho ou irmão do primário
-    // (o SeIsTokenAssignableToProcess).
+    // (o SeIsTokenAssignableToProcess, sempre avaliado: a recusa dele vale
+    // mesmo com o privilégio). Um token de outra sessão que a de quem cria
+    // (o SeQuerySessionIdToken contra o MmGetSessionIdEx, 0x7050a3) exige o
+    // privilégio e leva o processo à sessão do token, o que
+    // PROCESS_CREATE_FLAGS_CREATE_SESSION não admite
+    // (STATUS_INVALID_PARAMETER).
     let primary_token = attributes.token.0.as_ref().map(|reference| reference.token);
     if let Some(token) = primary_token {
-        if !crate::ntos::se::privilege::acquired_privilege_check(SE_ASSIGN_PRIMARY_TOKEN_PRIVILEGE, 1) && !crate::ntos::se::token::assignable::is_assignable_to_process(token)? {
+        let privileged = crate::ntos::se::privilege::acquired_privilege_check(SE_ASSIGN_PRIMARY_TOKEN_PRIVILEGE, 1);
+        let assignable = crate::ntos::se::token::assignable::is_assignable_to_process(token)?;
+        if !privileged && !assignable {
             let effective = crate::ntos::ob::object_access::subject().unwrap_or(0);
             let describe = |pointer: u64| {
                 crate::ntos::se::token::tokens::with(pointer, |record| {
@@ -599,6 +606,15 @@ fn capture_and_create(request: &UserCreateRequest) -> Result<u32, u32> {
             };
             crate::debug_print!("[ps] NtCreateUserProcess: token do PS_ATTRIBUTE_TOKEN nao atribuivel ({}); token efetivo de quem cria: {}", describe(token), describe(effective));
             return Err(STATUS_PRIVILEGE_NOT_HELD);
+        }
+        let token_session = crate::ntos::se::token::tokens::with(token, |record| record.session_id).unwrap_or(0);
+        if token_session != crate::ntos::mm::session::session_id_ex(process::get_current_process()) {
+            if !privileged {
+                return Err(STATUS_PRIVILEGE_NOT_HELD);
+            }
+            if request.process_flags & PROCESS_CREATE_SESSION != 0 {
+                return Err(STATUS_INVALID_PARAMETER);
+            }
         }
     }
     let process_access = creator_access(request.process_access, &object_types::process_type())?;

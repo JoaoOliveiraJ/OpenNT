@@ -442,6 +442,23 @@ pub fn join(process: u64, parent: u64) {
     if pointer == 0 {
         return;
     }
+    join_space(process, pointer);
+}
+
+/// O processo novo entra na sessão `id` (o PspAttachSession do
+/// PspAllocateProcess, quando o token pedido é de outra sessão): sem a
+/// sessão, STATUS_PROCESS_IS_TERMINATING.
+pub fn join_id(process: u64, id: u32) -> Result<(), KernelError> {
+    let Some(pointer) = find(id) else {
+        return Err(KernelError::with_status("a sessao do token nao existe", 0xC000_010A));
+    };
+    join_space(process, pointer);
+    Ok(())
+}
+
+/// MiSessionAddProcess: `process` entra na sessão de VA global `pointer`
+/// (nenhuma se ela não está mais viva ou não tem referências).
+fn join_space(process: u64, pointer: u64) {
     let Some(root) = process_address_space::root_of(process) else {
         crate::debug_print!("[mm] processo {:#x} sem raiz propria fica fora da sessao do pai", process);
         return;

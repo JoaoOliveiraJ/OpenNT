@@ -444,13 +444,23 @@ pub fn create_user_process(request: &CreateProcessRequest<'_>) -> Result<Created
     }
     // A sessão, antes da PEB (que recebe o SessionId): uma nova com
     // PROCESS_CREATE_FLAGS_CREATE_SESSION (o MiSessionCreate do
-    // MiMapProcessExecutable), senão a do pai declarado ou de quem cria.
+    // MiMapProcessExecutable); a do token do PS_ATTRIBUTE_TOKEN quando ela
+    // não é a de quem cria (o PspAttachSession do PspAllocateProcess; o
+    // NtCreateUserProcess já exigiu o SeAssignPrimaryTokenPrivilege);
+    // senão a do pai declarado ou de quem cria.
+    let token_session = request.primary_token.map(|token| crate::ntos::se::token::tokens::with(token, |record| record.session_id).unwrap_or(0)).filter(|&session| session != crate::ntos::mm::session::session_id_ex(process::get_current_process()));
     if request.create_session {
         crate::ntos::mm::session::create(process_pointer).map_err(fail)?;
+    } else if let Some(session) = token_session {
+        crate::ntos::mm::session::join_id(process_pointer, session).map_err(fail)?;
     } else {
         crate::ntos::mm::session::join(process_pointer, request.parent.unwrap_or_else(process::get_current_process));
     }
-    if let Some(token) = request.primary_token {
+    // PspInitializeProcessSecurity: o token primário é o SeSubProcessToken
+    // do token pedido ou, sem ele, do primário do pai declarado (ou de quem
+    // cria), com o SessionId da sessão do processo.
+    let token_source = request.primary_token.or_else(|| process::get_primary_token(request.parent.unwrap_or_else(process::get_current_process)));
+    if let Some(token) = token_source {
         let session_id = crate::ntos::mm::session::session_id(process_pointer);
         process::replace_primary_token(process_pointer, token, session_id).map_err(fail)?;
     }
