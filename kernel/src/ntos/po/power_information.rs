@@ -3,9 +3,9 @@
 //!
 //! O nível 94 vai ao gravador black box do kernel; o 41 (SessionPowerInit)
 //! e o 63 (SessionPowerCleanup) são o início e o fim da energia de uma
-//! sessão, que o win32k pede no DriverEntry e na limpeza, e o 29
-//! (SystemVideoState) devolve o estado da tela do console. Os níveis 4
-//! (SystemPowerCapabilities), 5 (SystemBatteryState), 58
+//! sessão, que o win32k pede no DriverEntry e na limpeza. Os níveis 4
+//! (SystemPowerCapabilities), 5 (SystemBatteryState), 29
+//! (SystemVideoState, o estado da tela do console), 58
 //! (PowerSettingNotificationName), 59 (GetPowerSettingValue), 66
 //! (PlatformInformation) e 75 (PlatformRole) têm o mesmo corpo nos dois
 //! modos (`level_answer`); o 87 (PowerInformationInternal) só é atendido de
@@ -78,18 +78,9 @@ const SYSTEM_VIDEO_STATE: u32 = 29;
 /// (PowerMonitorOff), o .data sem inicializador do ntoskrnl.
 static CONSOLE_DISPLAY_STATE: AtomicU32 = AtomicU32::new(0);
 
-/// SystemVideoState (0x6f0f45): sem entrada, uma saída de pelo menos 4
-/// bytes (senão STATUS_BUFFER_TOO_SMALL) com o PopConsoleDisplayState.
-fn system_video_state(input: u64, output: u64, output_length: u32) -> u32 {
-    if input != 0 || output == 0 {
-        return STATUS_INVALID_PARAMETER;
-    }
-    if output_length < 4 {
-        return STATUS_BUFFER_TOO_SMALL;
-    }
-    // SAFETY: a saída do chamador (Zw, KernelMode) com os 4 bytes conferidos.
-    unsafe { crate::ntos::inc::field::Field::<u32>::at(output) }.set(CONSOLE_DISPLAY_STATE.load(Ordering::Acquire));
-    0
+/// O PopConsoleDisplayState corrente (o que o SystemVideoState devolve).
+pub fn console_display_state() -> u32 {
+    CONSOLE_DISPLAY_STATE.load(Ordering::Acquire)
 }
 
 /// SessionPowerCleanup (0x6f17c4): sem entrada nem saída; o
@@ -115,10 +106,7 @@ pub fn query(level: u32, input: u64, input_length: u32, output: u64, output_leng
     if level == SESSION_POWER_CLEANUP {
         return Ok(session_power_cleanup(input, output));
     }
-    if level == SYSTEM_VIDEO_STATE {
-        return Ok(system_video_state(input, output, output_length));
-    }
-    if !matches!(level, SYSTEM_POWER_CAPABILITIES | SYSTEM_BATTERY_STATE | POWER_SETTING_NOTIFICATION_NAME | GET_POWER_SETTING_VALUE | PLATFORM_INFORMATION | PLATFORM_ROLE) {
+    if !matches!(level, SYSTEM_POWER_CAPABILITIES | SYSTEM_BATTERY_STATE | SYSTEM_VIDEO_STATE | POWER_SETTING_NOTIFICATION_NAME | GET_POWER_SETTING_VALUE | PLATFORM_INFORMATION | PLATFORM_ROLE) {
         return Ok(STATUS_INVALID_PARAMETER);
     }
     let input_length = if input == 0 { 0 } else { input_length };
@@ -254,15 +242,18 @@ enum Answer {
 fn level_answer(level: u32, input: &[u8], output_length: u32) -> Result<Answer, KernelError> {
     let has_output = output_length != 0;
     Ok(match level {
-        // SystemPowerCapabilities, SystemBatteryState, PlatformInformation e
-        // PlatformRole: sem entrada, com saída.
-        SYSTEM_POWER_CAPABILITIES | SYSTEM_BATTERY_STATE | PLATFORM_INFORMATION | PLATFORM_ROLE => {
+        // SystemPowerCapabilities, SystemBatteryState, SystemVideoState,
+        // PlatformInformation e PlatformRole: sem entrada, com saída. O
+        // SystemVideoState (0x6f0f45) são os 4 bytes do
+        // PopConsoleDisplayState.
+        SYSTEM_POWER_CAPABILITIES | SYSTEM_BATTERY_STATE | SYSTEM_VIDEO_STATE | PLATFORM_INFORMATION | PLATFORM_ROLE => {
             if !input.is_empty() || !has_output {
                 return Ok(Answer::Status(STATUS_INVALID_PARAMETER));
             }
             Answer::Data(match level {
                 SYSTEM_POWER_CAPABILITIES => capabilities(),
                 SYSTEM_BATTERY_STATE => battery_state(),
+                SYSTEM_VIDEO_STATE => console_display_state().to_le_bytes().to_vec(),
                 PLATFORM_INFORMATION => alloc::vec![platform_aoac()],
                 _ => platform_role().to_le_bytes().to_vec(),
             })

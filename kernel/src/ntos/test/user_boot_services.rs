@@ -508,6 +508,18 @@ fn power_information(assert: Assert, block: u64, rsp: u64, call: Call) {
         platform == 0 && aoac == 0 && platform_input == STATUS_INVALID_PARAMETER && platform_no_output == STATUS_INVALID_PARAMETER && role == 0 && role_value == 1 && role_short == 0xC000_0023 && absence == 0 && absence_value == 0 && absence_short_input == STATUS_INVALID_PARAMETER && absence_no_output == 0xC000_0023 && internal_invalid == STATUS_INVALID_PARAMETER && kernel_only == STATUS_ACCESS_DENIED && out_of_range == STATUS_INVALID_PARAMETER,
         "userboot: NtPowerInformation de modo usuario (66, 75, 87 tipo 4, niveis so de kernel)",
     );
+    // SystemVideoState (29, o CProcessStateManager do LogonUI): sem entrada,
+    // os 4 bytes do PopConsoleDisplayState, sem privilégio.
+    guest::write32(output, 0xEEEE_EEEE);
+    let video = power(29, 0, 0, output, 4);
+    let video_value = guest::read32(output);
+    let video_short = power(29, 0, 0, output, 2);
+    let video_no_output = power(29, 0, 0, 0, 0);
+    let video_empty_output = power(29, 0, 0, output, 0);
+    assert(
+        video == 0 && video_value == crate::ntos::po::power_information::console_display_state() && video_short == 0xC000_0023 && video_no_output == STATUS_INVALID_PARAMETER && video_empty_output == STATUS_INVALID_PARAMETER,
+        "userboot: NtPowerInformation 29 (SystemVideoState) de modo usuario",
+    );
     // SystemPowerCapabilities (0x4c bytes) e SystemBatteryState (0x20).
     let capabilities_output = block + 0x800;
     guest::write_bytes(capabilities_output, &[0xEE; 0x80]);

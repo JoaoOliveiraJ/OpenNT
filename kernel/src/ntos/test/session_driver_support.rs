@@ -147,7 +147,10 @@ fn session_power(assert: Assert) {
     assert(initialized && kernel(no_more_input) && kernel(force_off) && no_more_input != force_off && session.lid_opened.get() == 1 && session.ttm_enabled.get() == 0 && session.setting_ec.get() == 0 && session.energy_saver_on.get() == 0, "power: SessionPowerInit devolve os dois BOOLEANs do Po, a tampa aberta, o TTM desligado e as configuracoes sem esquema");
     assert(power(63, buffer, 0, 0) == Some(STATUS_INVALID_PARAMETER) && power(63, 0, buffer, 8) == Some(STATUS_INVALID_PARAMETER) && power(63, 0, 0, 0) == Some(0), "power: SessionPowerCleanup sem buffers");
     guest::write32(buffer, 0xEEEE_EEEE);
-    assert(power(29, buffer, buffer, 4) == Some(STATUS_INVALID_PARAMETER) && power(29, 0, buffer, 3) == Some(0xC000_0023) && power(29, 0, buffer, 4) == Some(0) && guest::read32(buffer) == 0, "power: SystemVideoState devolve o PopConsoleDisplayState (0 antes de a sessao informar a tela)");
+    // Como no 19041, um comprimento zero anula o ponteiro (a entrada sem
+    // comprimento conta como NULL; a saída sem comprimento, como ausente).
+    let with_input = call_export("ZwPowerInformation", &[29, buffer + 0x40, 4, buffer, 4]).map(|status| status & 0xFFFF_FFFF);
+    assert(with_input == Some(STATUS_INVALID_PARAMETER) && power(29, 0, buffer, 0) == Some(STATUS_INVALID_PARAMETER) && power(29, 0, buffer, 3) == Some(0xC000_0023) && power(29, buffer + 0x40, buffer, 4) == Some(0) && guest::read32(buffer) == crate::ntos::po::power_information::console_display_state(), "power: SystemVideoState sem entrada devolve os 4 bytes do PopConsoleDisplayState");
     guest::free_bytes(buffer);
 }
 

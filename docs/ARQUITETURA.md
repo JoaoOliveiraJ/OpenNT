@@ -2749,10 +2749,12 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   `po/power_setting.rs`): o NtPowerInformation de modo usuário segue o
   19041 (níveis só de kernel recusados, privilégio para entrada fora da
   lista sem privilégio, entrada capturada, saída sondada e o fim comum de
-  cópia); os níveis 4, 5, 58, 59, 66 e 75 têm o mesmo corpo de modo kernel
-  e de usuário. O nível 4 é o PopCapabilities de um desktop S0/S5 (0x4c
-  bytes, só o botão de energia, o S5, o FullWake e o DiskSpinDown) e o 5 é
-  o estado composto sem bateria (AcOnLine). As configurações de power
+  cópia); os níveis 4, 5, 29, 58, 59, 66 e 75 têm o mesmo corpo de modo
+  kernel e de usuário. O nível 4 é o PopCapabilities de um desktop S0/S5
+  (0x4c bytes, só o botão de energia, o S5, o FullWake e o DiskSpinDown), o
+  5 é o estado composto sem bateria (AcOnLine) e o 29 (SystemVideoState,
+  que o CProcessStateManager do LogonUI pede antes de subir o servidor RPC)
+  são os 4 bytes do PopConsoleDisplayState. As configurações de power
   setting nascem do PopSetPowerSettingValue (no boot, o
   PopInitilizeAcDcSettings grava GUID_ACDC_POWER_SOURCE): o nível 58 cria
   no primeiro pedido o nome WNF temporário de escopo de máquina da
