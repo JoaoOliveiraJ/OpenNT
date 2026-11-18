@@ -28,6 +28,7 @@ pub mod context_frame;
 pub mod set_thread_context;
 pub mod exceptions;
 pub mod crash_report;
+pub mod win32k_status;
 pub mod device_io;
 pub mod instrumentation;
 pub mod tls;

@@ -1097,6 +1097,18 @@ chamada de sistema, sem os quadros do despacho em modo usuário. Cada
 processo imprime um bloco por código, e toda leitura de memória de usuário
 confere antes a página presente e a posse (`memory::check_user_access`).
 
+**Diagnóstico dos serviços gráficos do win32k.** Os serviços da tabela do
+win32k vão do stub do win32u.dll direto à rotina do driver
+(`hal/amd64/usermode.rs`), fora do registro de serviços nativos, então a
+linha FALHOU de `ps/user/index.rs` não os vê. `ps/user/win32k_status.rs`
+acompanha os que devolvem NTSTATUS e chegam ao dxgkrnl ou à composição
+(NtGdiDdDDI*, NtDxgk*, NtDComposition*, NtTokenManager*, NtFlipObject* e
+os *CompositionSurface*): uma falha imprime `[win32k] pid:tid Nome FALHOU
+com status (chamador módulo+deslocamento)`. Os nomes saem dos stubs do
+win32u.dll do primeiro processo que falha; cada par (serviço, status)
+imprime as quatro primeiras vezes e depois uma a cada 256. Só escreve na
+serial; o resultado volta ao modo usuário como veio.
+
 **Retomada do pop de SList de usuário.** `ke/user_slist.rs` guarda os
 exports ExpInterlockedPopEntrySListResume, ...Fault e ...End da ntdll
 quando ela é mapeada (`ps/user/loader.rs`). Como no KiPreprocessFault do

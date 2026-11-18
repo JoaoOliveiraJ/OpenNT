@@ -1274,7 +1274,8 @@ pub extern "C" fn opennt_user_syscall(frame: *mut u64) -> u64 {
             packet[2] = *frame.add(5);
             packet[3] = *frame.add(6);
         }
-        result = system_services::copy_arguments(packet.as_mut_ptr() as u64, pcr::current().user_rsp.get(), stack_count) as u64;
+        let entry_rsp = pcr::current().user_rsp.get();
+        result = system_services::copy_arguments(packet.as_mut_ptr() as u64, entry_rsp, stack_count) as u64;
         if result == 0 {
             // O trampolim comum também captura posições sem uso: catorze
             // slots zerados no mínimo.
@@ -1286,6 +1287,7 @@ pub extern "C" fn opennt_user_syscall(frame: *mut u64) -> u64 {
         trace_win32k_service(number, &packet, result);
         if number & 0x1000 != 0 {
             crate::ntos::init::initial_process::win32k_service_returned(number as u32, result);
+            crate::ntos::ps::user::win32k_status::returned(number as u32, result, entry_rsp);
         }
     } else {
         trace_win32k_service(number, &[0; 4], result);
