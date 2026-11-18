@@ -515,8 +515,9 @@ KeContextFromKframes e o KxContextToKframes consultam).
 `rtl/extended_context.rs` tem as rotinas internas do CONTEXT estendido
 (RtlpValidateContextFlags, RtlGetExtendedContextLength2,
 RtlInitializeExtendedContext2, RtlpGetEntireXStateAreaLength,
-RtlpCopyXStateChunk; o ntoskrnl 19041 não as exporta, as da ntdll são as que
-o modo usuário usa), e `ps/context/xstate.rs` move o pedaço XSTATE entre a
+RtlpGetNonLegacyXStateAreaLength, RtlpCopyXStateChunk; o ntoskrnl 19041 não
+as exporta, as da ntdll são as que o modo usuário usa), e
+`ps/context/xstate.rs` move o pedaço XSTATE entre a
 thread e o CONTEXT de usuário: o KiCopyXStateArea da área para o CONTEXT
 estendido do kernel (KeContextFromKframes), a cópia sondada para o pedaço do
 usuário e, na volta, a área mais antiga da lista ou a da thread, recarregada
@@ -528,15 +529,42 @@ interrompido, o machine frame alinhado a 16 abaixo dele, o CONTEXT a 0x590
 do machine frame; All cobre do CONTEXT ao RSP, XState.Length vai até o RSP),
 o NtContinue e o NtRaiseException com CONTEXT_XSTATE e o NtGetContextThread
 e o NtSetContextThread de modo usuário (sem recursos habilitados,
-STATUS_NOT_SUPPORTED; de KernelMode o CONTEXT_XSTATE continua recusado). O
-frame das APCs de usuário segue sem o pedaço XSTATE: no 19041 ele só vem
-numa APC especial com o flag do XSTATE ou numa thread com CET. Os
-autotestes são `ntos/test/extended_state.rs` (fase 6, `XSTATE_KERNEL_OK`: a
-configuração contra o CPUID de cada CPU, os exports, os salvamentos dos
-drivers e duas threads de sistema com YMM diferentes) e
+STATUS_NOT_SUPPORTED). Um chamador de KernelMode do
+PspSetContextThreadInternal (e do PsSetContextThread) passa o próprio
+CONTEXT: o CONTEXT_XSTATE é aceito como no RtlpSanitizeContextFlags e, como
+no PspSetContext, o pedaço que o XState do CONTEXT_EX dele aponta só vai à
+thread quando o contexto de destino é o de UserMode (`ps/context/set.rs`);
+num contexto de KernelMode ele é ignorado.
+
+O frame das APCs de usuário (`ps/user/user_apc.rs`) segue o
+KiInitializeUserApc do 19041: o 7º argumento dele tem o bit 1 numa APC
+especial (a KernelRoutine é a KeSpecialUserApcKernelRoutine), e só então,
+com KF_XSTATE, o CONTEXT leva CONTEXT_XSTATE (0x10005B) e o pedaço XSTATE
+fica logo abaixo do RSP interrompido, alinhado a 64, com
+RtlpGetNonLegacyXStateAreaLength da máscara (EnabledFeatures | supervisor
+visível, sem x87 e SSE e, sem pilha de sombra de usuário, sem o CET_U)
+bytes; o MACHINE_FRAME fica alinhado a 16 abaixo dele e o CONTEXT 0x530
+bytes antes; no CONTEXT_EX, All vai do CONTEXT ao RSP, Legacy é o CONTEXT e
+XState vai do pedaço ao RSP; o pedaço zerado recebe, com a compactação,
+XCOMP_BV = máscara | bit 63 e o estado de usuário da thread
+(KeContextFromKframes). O NtContinueEx do KiUserApcDispatcher devolve dele
+a metade alta dos YMM. A APC especial interrompe o código em qualquer
+instrução (no OpenNT, no começo do intervalo seguinte da thread); a APC
+normal sai só no retorno de uma chamada de sistema (a espera alertável, o
+NtTestAlert, o NtContinue com TestAlert), onde a ABI x64 já trata a metade
+alta dos YMM como volátil, e o frame dela não tem o pedaço. A sonda da
+pilha vem antes da retirada da APC, com o tamanho do frame da especial
+quando SpecialUserApcPending está publicado.
+
+Os autotestes são `ntos/test/extended_state.rs` (fase 6,
+`XSTATE_KERNEL_OK`: a configuração contra o CPUID de cada CPU, os exports,
+os salvamentos dos drivers e duas threads de sistema com YMM diferentes) e
 `ntos/test/multiprocess/extended_state.rs` (fase 7, `XSTATE_USER_OK`: duas
 threads de usuário com AVX e a ntdll real, o NtGetContextThread com
-CONTEXT_XSTATE e a volta de uma exceção pelo NtContinue).
+CONTEXT_XSTATE, a volta de uma exceção pelo NtContinue, um CONTEXT de
+KernelMode com CONTEXT_XSTATE pelo PspSetContextThreadInternal e uma APC
+especial cuja rotina sobrescreve os 16 YMM, que voltam inteiros pelo
+NtContinueEx do frame).
 
 **IPIs medidos em tempo.** Toda espera de resposta a um IPI (`ke/smp.rs`:
 o ICR voltar a ocioso depois do envio e as confirmações do shootdown de
