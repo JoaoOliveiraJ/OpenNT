@@ -127,8 +127,9 @@ fn timer2_exports(assert: Assert) {
     let _ = call_export("KeSetTimer2", &[timer, (-1i64) as u64, 200_000, 0]);
     let periodic = pump_until(|| TIMER_CALLS.load(Ordering::SeqCst) >= 2);
     let still_inserted = timer_flags(timer) & 1 != 0;
-    let _ = call_export("KeCancelTimer2", &[timer, 0]);
-    assert(periodic && still_inserted && timer2::inserted_count() == 0, "timer2: periodico rearma depois de cada expiracao");
+    // Os EX_TIMER dos drivers também são KTIMER2 na fila: conta só este.
+    let removed = call_export("KeCancelTimer2", &[timer, 0]) == Some(1) && timer_flags(timer) & 1 == 0;
+    assert(periodic && still_inserted && removed, "timer2: periodico rearma depois de cada expiracao");
     guest::free_bytes(block);
 }
 
@@ -185,9 +186,10 @@ fn ex_timer_exports(assert: Assert) {
     guest::write64(parameters + 8, delete_callback);
     guest::write64(parameters + 0x10, 0x5151);
     DELETE_CONTEXT.store(0, Ordering::SeqCst);
-    let inserted_before = timer2::inserted_count();
     let deleted = call_export("ExDeleteTimer", &[waitable, 1, 0, parameters]);
-    let finalized = DELETE_CONTEXT.load(Ordering::SeqCst) == 0x5151 && timer2::inserted_count() + 1 == inserted_before;
+    // Pego no meio de um vencimento em outro processador (CancelPending,
+    // também TRUE), a finalização vem no fim dele.
+    let finalized = pump_until(|| DELETE_CONTEXT.load(Ordering::SeqCst) == 0x5151);
     guest::write64(parameters + 0x10, 0x5252);
     let idle = call_export("ExDeleteTimer", &[timer, 0, 0, parameters]);
     let idle_finalized = DELETE_CONTEXT.load(Ordering::SeqCst) == 0x5252;
