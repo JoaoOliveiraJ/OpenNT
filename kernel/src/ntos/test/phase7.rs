@@ -974,6 +974,17 @@ fn user_file_io(assert: Assert) {
     assert(query(14, 8) == 0 && unsafe { nt::FilePositionInformation::at(buffer) }.current_byte_offset.quad_part.get() == expected.len() as i64, "userfiles: FILE_POSITION_INFORMATION depois da leitura");
     assert(query(9, 64) == 0 && { let name_info = unsafe { nt::FileNameInformation::at(buffer) }; name_info.file_name_length.get() == 20 && name_info.file_name[0].get() == b'\\' as u16 } && query(99, 64) == 0xC000_0003 && query(5, 8) == 0xC000_0004, "userfiles: nome, classe e tamanho invalidos");
     assert(state::close_user_handle(handle, true, false).is_ok_and(|status| status == 0), "userfiles: handle fechado");
+    // FILE_NAME_INFORMATION é o caminho da abertura a partir da raiz do
+    // volume (`\Windows\...`), não a posição interna do conteúdo de
+    // `\Windows` na raiz do volume.
+    let windows_opened = open("\\??\\D:\\Windows\\HELLO.TXT", 1, 0x8010_0000, 1, 0x20);
+    let windows_handle = guest::read64(out);
+    guest::write32(rsp + 0x28, 9);
+    let named = windows_opened == 0 && state::handler("NtQueryInformationFile").map(|handler| handler(windows_handle, iosb, buffer, 64, rsp).unwrap_or(1)).unwrap_or(1) == 0;
+    let windows_name: alloc::vec::Vec<u16> = "\\Windows\\HELLO.TXT".encode_utf16().collect();
+    let name_matches = named && { let name_info = unsafe { nt::FileNameInformation::at(buffer) }; name_info.file_name_length.get() == windows_name.len() as u32 * 2 && guest::read_bytes(name_info.file_name.as_ptr() as u64, windows_name.len() * 2) == windows_name.iter().flat_map(|unit| unit.to_le_bytes()).collect::<alloc::vec::Vec<u8>>() };
+    let windows_closed = windows_opened == 0 && state::close_user_handle(windows_handle, true, false).is_ok_and(|status| status == 0);
+    assert(name_matches && windows_closed, "userfiles: FILE_NAME_INFORMATION com o caminho da abertura");
     // Criação, escrita, colisão e DELETE_ON_CLOSE.
     let name = "\\??\\D:\\OPENNTUSR.TXT";
     let created = open(name, 2, 0x4010_0000, 0, 0x20);

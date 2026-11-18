@@ -428,7 +428,14 @@ pub fn nt_query_information_file(handle: u64, iosb: u64, out: u64, length: u64, 
         let (entry, user_file) = object(handle)?;
         let file = &user_file.file;
         let class = state::stack_arg32(rsp, 5);
-        let name: Vec<u16> = file.volume_path().replace('/', "\\").encode_utf16().collect();
+        // FILE_NAME_INFORMATION: o caminho a partir da raiz do volume como a
+        // abertura o nomeou (`\Windows\System32\x.dll`), o mesmo FileName do
+        // FILE_OBJECT que o NtQueryObject devolve depois do dispositivo; o
+        // volume guarda o conteúdo de `\Windows` e de `\Windows\System32` na
+        // raiz, então a posição interna dele não é esse nome. A raiz é `\`.
+        let opened = volume_files::nt_path_to_device_name(&user_file.nt_path.lock()).unwrap_or_else(|| file.volume_path().replace('/', "\\"));
+        let opened = opened.trim_end_matches('\\');
+        let name: Vec<u16> = if opened.is_empty() { alloc::vec![b'\\' as u16] } else { opened.encode_utf16().collect() };
         let name_bytes = name.len() as u64 * 2;
         let need = match class {
             4 => 40,
