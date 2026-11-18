@@ -152,7 +152,70 @@ fn open_file(handle_pointer: u64, attributes: u64, iosb: u64, disposition: u32, 
         Ok(flags) => flags,
         Err(error) => return Ok(error.status),
     };
-    let device_path = device_path_of(&parsed.path);
+    open_by_name(handle_pointer, &parsed.path, object_flags, iosb, disposition, request, special)
+}
+
+/// O DeviceType do DEVICE_OBJECT de `device_path` (0 sem um nativo).
+fn device_type_of(device_path: &str) -> u32 {
+    let (Some(node), None) = crate::ntos::ob::object_manager::resolve(device_path) else { return 0 };
+    let Some(device) = io_manager::device(node).map(|entry| entry.native_device).filter(|&device| device != 0) else { return 0 };
+    // SAFETY: DEVICE_OBJECT vivo do namespace.
+    unsafe { crate::ntos::inc::types::DeviceObject::at(device) }.device_type.get()
+}
+
+/// Um nome dentro do dispositivo do volume de boot
+/// (`\Device\KernelVolume1\...`): o IopParseDevice desse dispositivo é a
+/// abertura no volume (`file_io`), como a por `C:`.
+fn on_boot_volume_device(name: &str) -> bool {
+    let device = crate::drivers::fs::volume_device::device_path(crate::drivers::fs::ntfs::DEVICE_INDEX);
+    name.len() > device.len() + 1 && name[..device.len()].eq_ignore_ascii_case(&device) && name.as_bytes()[device.len()] == b'\\'
+}
+
+/// O ObOpenObjectByName de uma abertura de arquivo por nome: cada volta
+/// abre `name` no dispositivo (o IopParseDevice) ou no volume de boot
+/// (`file_io::create`); o STATUS_REPARSE de um reparse point no caminho dá
+/// o nome novo (`io/reparse.rs`), que recomeça a busca, até as 0x40 voltas
+/// do ObpLookupObjectName. `object_flags` são os OBJ_* da abertura.
+#[allow(clippy::too_many_arguments)]
+pub fn open_by_name(handle_pointer: u64, name: &str, object_flags: u32, iosb: u64, disposition: u32, request: &OpenRequest, special: Option<&pipe_mailslot::Captured>) -> Result<u32, KernelError> {
+    let mut walk = crate::ntos::io::reparse::NameWalk::new(object_flags);
+    let mut name = String::from(name);
+    let mut options = request.options;
+    loop {
+        let request = &OpenRequest { options, ..*request };
+        let device_path = if on_boot_volume_device(&name) { None } else { device_path_of(&name) };
+        if let Some((device_path, _)) = device_path.as_deref().and_then(io_manager::split_device_path) {
+            if let Err(status) = walk.arrive(device_type_of(&device_path)) {
+                return Ok(fail_iosb(iosb, status));
+            }
+            return open_device_name(handle_pointer, device_path_of(&name), object_flags, iosb, disposition, request, special);
+        }
+        if device_path.is_some() || special.is_some() {
+            return open_device_name(handle_pointer, device_path, object_flags, iosb, disposition, request, special);
+        }
+        if let Err(status) = walk.arrive(crate::ntos::io::reparse::FILE_DEVICE_DISK) {
+            return Ok(fail_iosb(iosb, status));
+        }
+        match file_io::create(handle_pointer, &name, iosb, disposition, &OpenRequest { handle_attributes: object_flags, ..*request })? {
+            file_io::Created::Done(status) => return Ok(status),
+            file_io::Created::Reparse(found) => {
+                let reparsed = match found.graft(&mut walk, &name).and_then(|reparsed| walk.restart(&reparsed.name).map(|()| reparsed)) {
+                    Ok(reparsed) => reparsed,
+                    Err(status) => return Ok(fail_iosb(iosb, status)),
+                };
+                debug_print!("[usermode] reparse 0x{:x}: {} -> {}", reparsed.tag, name, reparsed.name);
+                options = reparsed.create_options(options);
+                name = reparsed.name;
+            }
+        }
+    }
+}
+
+/// A abertura de um nome de dispositivo (`device_path_of`): o dispositivo
+/// e o resto do nome pelo I/O Manager, NOT_FOUND quando o dispositivo não
+/// existe, e o pipe ou mailslot fora de um dispositivo.
+#[allow(clippy::too_many_arguments)]
+fn open_device_name(handle_pointer: u64, device_path: Option<String>, object_flags: u32, iosb: u64, disposition: u32, request: &OpenRequest, special: Option<&pipe_mailslot::Captured>) -> Result<u32, KernelError> {
     // O dispositivo e o resto do nome (um arquivo no sistema de arquivos do
     // dispositivo, como `\Device\NamedPipe\ProtectedPrefix`), com o
     // IRP_MJ_CREATE completo: acesso, compartilhamento, disposição e opções.
@@ -205,12 +268,9 @@ fn open_file(handle_pointer: u64, attributes: u64, iosb: u64, disposition: u32, 
         debug_print!("[usermode] device NAO EXISTE: {}", device_path);
         return Ok(fail_iosb(iosb, 0xC000_0034));
     }
-    if special.is_some() {
-        // Pipe ou mailslot fora de um file system de dispositivo: o
-        // IRP_MJ_CREATE_NAMED_PIPE/CREATE_MAILSLOT não tem quem o atenda.
-        return Ok(fail_iosb(iosb, 0xC000_0010));
-    }
-    file_io::open(handle_pointer, &parsed.path, iosb, disposition, &OpenRequest { handle_attributes: object_flags, ..*request })
+    // Pipe ou mailslot fora de um file system de dispositivo: o
+    // IRP_MJ_CREATE_NAMED_PIPE/CREATE_MAILSLOT não tem quem o atenda.
+    Ok(fail_iosb(iosb, 0xC000_0010))
 }
 
 /// NtOpenFile(handle*, access, oa, ioStatus*, share, options).
@@ -268,6 +328,10 @@ fn nt_create_mailslot_file(handle_pointer: u64, access: u64, attributes: u64, io
 /// input*, inputLength, output*, outputLength): o IRP_MJ_FILE_SYSTEM_CONTROL
 /// do I/O Manager (`io/file/irp_service.rs`) ao driver do arquivo.
 fn nt_fs_control_file(handle: u64, event: u64, apc_routine: u64, apc_context: u64, rsp: u64) -> Result<u32, KernelError> {
+    // Um arquivo do volume de boot: o FSCTL vai ao NTFS do kernel (`file_io`).
+    if state::get_user_handle(handle).is_some_and(|entry| entry.kind() == "file") {
+        return file_io::fs_control(handle, event, apc_routine, rsp);
+    }
     if state::get_user_handle(handle).is_some_and(|entry| entry.kind() != "device") {
         return Ok(0xC000_0010);
     }

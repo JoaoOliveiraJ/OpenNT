@@ -232,6 +232,13 @@ fn control_file(major: u8, handle: u64, event: u64, apc_routine: u64, apc_contex
     }
     let device = file_information::related_device(file)?;
     if device == 0 {
+        // Um arquivo de volume do file system embutido (sem pilha de IRP):
+        // o FSCTL vai direto ao volume, com o acesso do handle e KernelMode.
+        if major == IRP_MJ_FILE_SYSTEM_CONTROL {
+            if let Some((volume, path)) = crate::ntos::io::file::zw::file_backing(file) {
+                return volume_fs_control(volume, &path, event, io_status, code, input, input_length, output, output_length, selected.access);
+            }
+        }
         return Ok(0xC000_0010);
     }
     let request = file_request::new(file, thread, None, 0, io_status, output, output_length, apc_routine, apc_context, false);
@@ -295,6 +302,32 @@ fn control_file(major: u8, handle: u64, event: u64, apc_routine: u64, apc_contex
         Err(error) if error.status != 0xC000_0001 => Ok(error.status),
         other => other,
     }
+}
+
+/// O FSCTL de modo kernel num arquivo do file system embutido: os buffers
+/// de kernel do chamador (METHOD_BUFFERED: a saída recebe os bytes que o
+/// volume devolveu), o IO_STATUS_BLOCK e o evento.
+#[allow(clippy::too_many_arguments)]
+fn volume_fs_control(volume: &'static dyn crate::drivers::fs::volume::FileSystem, path: &str, event: u64, io_status: u64, code: u32, input: u64, input_length: u32, output: u64, output_length: u32, access: u32) -> Result<u32, KernelError> {
+    let bytes = if input != 0 { guest::read_bytes(input, input_length as usize) } else { alloc::vec::Vec::new() };
+    let caller = crate::drivers::fs::ntfs_control::ControlCaller { access, user_mode: false };
+    let Some(result) = volume.control(path, code, &bytes, output_length, &caller) else { return Ok(0xC000_0010) };
+    let (status, information) = match result {
+        Ok(result) => {
+            if output != 0 && !result.bytes.is_empty() {
+                guest::write_bytes(output, &result.bytes[..result.bytes.len().min(output_length as usize)]);
+            }
+            (result.status, result.information as u64)
+        }
+        Err(error) => (if error.status != 0 && error.status != 0xC000_0001 { error.status } else { 0xC000_0185 }, 0),
+    };
+    crate::ntos::io::file::zw::write_io_status(io_status, status, information);
+    if event != 0 {
+        if let Ok(reference) = file_request::event_reference(event, 0) {
+            dispatcher::set_event(reference.pointer);
+        }
+    }
+    Ok(status)
 }
 
 /// O bloco de argumentos de pilha de uma syscall (o 5º em +0x28).

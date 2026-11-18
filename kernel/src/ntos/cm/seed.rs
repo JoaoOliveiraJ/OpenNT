@@ -119,6 +119,7 @@ pub fn system_keys(smss_boot: bool) -> Vec<SeedKey> {
     keys.extend(super::arbiters::seed_keys());
     keys.extend(super::pnp_control::seed_keys());
     keys.extend(super::crash_control::seed_keys());
+    keys.extend(super::file_system::seed_keys());
     keys.extend(super::time_zone_information::seed_keys());
     keys.extend(super::network_setup::seed_keys());
     if smss_boot {

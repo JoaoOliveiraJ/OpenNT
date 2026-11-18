@@ -272,6 +272,39 @@ fn option_flags(options: u32) -> u32 {
     (if options & 0x30 != 0 { 2 } else { 0 }) | (if options & 0x10 != 0 { 4 } else { 0 }) | (options & 8) | (if options & 2 != 0 { 0x10 } else { 0 })
 }
 
+/// O ObpLookupObjectName de uma abertura do kernel diante dos reparse
+/// points do volume de boot (o NTFS do kernel responde no lugar do
+/// IRP_MJ_CREATE): enquanto o nome cai nesse volume e o caminho tem um
+/// reparse point que a abertura segue, o nome reparsado (`io/reparse.rs`)
+/// recomeça a busca; devolve o nome final e as opções de criação.
+fn follow_boot_volume_reparse(object_name: String, mut options: u32, object_flags: u32) -> Result<(String, u32), u32> {
+    use crate::ntos::io::reparse::{boot_volume_reparse, NameWalk, FILE_DEVICE_DISK};
+    let mut walk = NameWalk::new(object_flags);
+    let mut name = object_name;
+    loop {
+        let boot = resolve_mounted_file(&name).filter(|(mount, _)| crate::drivers::fs::volume_files::fixed_volume().is_some_and(|fixed| crate::drivers::fs::volume::same(*mount, fixed as &'static dyn FileSystem)));
+        let Some((_, path)) = boot else {
+            // Um nome reparsado fora do volume: o dispositivo alvo passa
+            // pela conferência do IopParseDevice.
+            if let Some((device, _)) = io_manager::split_device_path(&name) {
+                let (node, _) = object_manager::resolve(&device);
+                let native = node.and_then(io_manager::device).map_or(0, |entry| entry.native_device);
+                // SAFETY: DEVICE_OBJECT vivo do namespace.
+                walk.arrive(if native != 0 { unsafe { crate::ntos::inc::types::DeviceObject::at(native) }.device_type.get() } else { 0 })?;
+            }
+            return Ok((name, options));
+        };
+        walk.arrive(FILE_DEVICE_DISK)?;
+        let Some(volume) = crate::drivers::fs::volume_files::volume() else { return Ok((name, options)) };
+        let found = boot_volume_reparse(&volume, &name, &path, options & 0x20_0000 != 0).map_err(|error| if error.status != 0 { error.status } else { 0xC000_0185 })?;
+        let Some(found) = found else { return Ok((name, options)) };
+        let reparsed = found.graft(&mut walk, &name)?;
+        walk.restart(&reparsed.name)?;
+        options = reparsed.create_options(options);
+        name = reparsed.name;
+    }
+}
+
 /// ZwCreateFile/ZwOpenFile/IoCreateFile do kernel.
 #[allow(clippy::too_many_arguments)]
 pub fn create_kernel_file(output: u64, desired_access: u32, attributes_pointer: u64, io_status: u64, share_access: u32, disposition: u32, options: u32) -> Result<u32, KernelError> {
@@ -299,6 +332,16 @@ pub fn create_kernel_file_with_context(output: u64, desired_access: u32, attribu
         Ok(path) => path,
         Err(status) => return Ok(status),
     };
+    // Os reparse points do volume de boot no caminho: o nome e as opções
+    // com que a abertura segue.
+    let (object_name, options) = match follow_boot_volume_reparse(object_name, options, open_flags) {
+        Ok(followed) => followed,
+        Err(status) => {
+            write_io_status(io_status, status, 0);
+            return Ok(status);
+        }
+    };
+    let create = io_manager::CreateParameters { options, ..create };
     // Dispositivo: CREATE IRP pelo I/O Manager. O dispositivo de um volume
     // do kernel entrega o nome (mesmo vazio) ao volume montado nele.
     let device_node = match object_manager::resolve(&object_name) {
@@ -866,6 +909,22 @@ pub fn nt_set_information_file(previous_mode: u8, handle: u64, io_status: u64, i
 /// ZwFsControlFile: IRP_MJ_FILE_SYSTEM_CONTROL ao dispositivo do handle.
 pub fn fs_control_file(handle: u64, io_status: u64, code: u32, input: u64, input_length: u32, output: u64, output_length: u32) -> Result<u32, KernelError> {
     let Some(entry) = entry_of(handle) else { return Ok(STATUS_INVALID_HANDLE) };
+    // Um arquivo do file system embutido: o FSCTL vai ao volume, com o
+    // acesso do handle e KernelMode (METHOD_BUFFERED).
+    if let Backing::Volume { volume, path } = &entry.backing {
+        let data = if input != 0 { guest::read_bytes(input, input_length as usize) } else { alloc::vec::Vec::new() };
+        let caller = crate::drivers::fs::ntfs_control::ControlCaller { access: entry.access, user_mode: false };
+        let Some(result) = volume.control(path, code, &data, output_length, &caller) else { return Ok(0xC000_0010) };
+        let (status, information, bytes) = match result {
+            Ok(result) => (result.status, result.information as u64, result.bytes),
+            Err(error) => (if error.status != 0 && error.status != status_unsuccessful() { error.status } else { 0xC000_0185 }, 0, alloc::vec::Vec::new()),
+        };
+        if output != 0 && !bytes.is_empty() {
+            guest::write_bytes(output, &bytes[..bytes.len().min(output_length as usize)]);
+        }
+        write_io_status(io_status, status, information);
+        return Ok(status);
+    }
     let Backing::Device { path, handle: device_handle } = &entry.backing else { return Ok(STATUS_INVALID_HANDLE) };
     if *device_handle == 0 {
         return Ok(STATUS_INVALID_HANDLE);

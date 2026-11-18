@@ -263,7 +263,12 @@ fn format(info: &Metadata, selected: &Selected, class: u32, buffer: u64, length:
                 open.end_of_file.quad_part.set(info.size as i64);
                 open.file_attributes.set(if info.has_stat { stat.attributes } else { 0x80 });
             }
-            35 => FileAttributeTagInformation::at(scratch).file_attributes.set(if info.has_stat { stat.attributes } else { 0x80 }),
+            35 => {
+                // FileAttributes e a tag do reparse point (0 sem ele).
+                let information = FileAttributeTagInformation::at(scratch);
+                information.file_attributes.set(if info.has_stat { stat.attributes } else { 0x80 });
+                information.reparse_tag.set(if info.has_stat && stat.attributes & 0x400 != 0 { stat.reparse_tag } else { 0 });
+            }
             59 => {
                 let serial = zw_files::file_backing(selected.pointer).and_then(|(volume, _)| volume.volume_serial()).unwrap_or(0);
                 let id = FileIdInformation::at(scratch);

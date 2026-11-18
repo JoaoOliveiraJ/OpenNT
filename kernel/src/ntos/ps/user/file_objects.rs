@@ -136,7 +136,7 @@ impl FileSource for UserFileSource {
     fn stat(&self) -> Option<VolumeStat> {
         self.file.refresh();
         let stat = self.file.stat();
-        Some(VolumeStat { reference: Some(stat.reference), sequence: stat.sequence, directory: stat.directory, size: stat.size, allocated: stat.allocated, attributes: stat.attributes, ea_size: stat.ea_size, need_ea: stat.need_ea, times: stat.times })
+        Some(VolumeStat { reference: Some(stat.reference), sequence: stat.sequence, directory: stat.directory, size: stat.size, allocated: stat.allocated, attributes: stat.attributes, ea_size: stat.ea_size, need_ea: stat.need_ea, reparse_tag: stat.reparse_tag, times: stat.times })
     }
     fn volume(&self) -> Option<&'static dyn FileSystem> {
         volume_files::fixed_volume().map(|fixed| fixed as &'static dyn FileSystem)

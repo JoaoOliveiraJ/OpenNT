@@ -19,6 +19,7 @@ use crate::drivers::fs::ntfs::Stat;
 use crate::drivers::fs::volume_files::{self, VolumeFile};
 use crate::ntos::io::file::irp_service;
 use crate::ntos::io::file::lifetime as file_lifetime;
+use crate::ntos::io::reparse::{self, boot_volume_reparse as volume_reparse, NameWalk, VolumeReparse};
 use crate::ntos::ke::dispatcher;
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
@@ -159,9 +160,28 @@ pub fn extended_create(request: &OpenRequest) -> Result<OpenRequest, u32> {
     Ok(OpenRequest { options: request.options & !FILE_CONTAINS_EXTENDED_CREATE_INFORMATION, ea_buffer, ea_length, ..*request })
 }
 
-/// Abre ou cria o arquivo do volume e publica o handle `file`.
+/// FILE_OPEN_REPARSE_POINT.
+const FILE_OPEN_REPARSE_POINT: u32 = 0x20_0000;
+
+/// Uma volta do IRP_MJ_CREATE no volume de boot: o status final (com o
+/// IO_STATUS_BLOCK já gravado) ou o STATUS_REPARSE de um reparse point no
+/// caminho, que o I/O Manager resolve (`files::open_by_name`).
+pub enum Created {
+    Done(u32),
+    Reparse(VolumeReparse),
+}
+
+/// Abre ou cria `name` e publica o handle, seguindo os reparse points do
+/// caminho como o NtCreateFile (`files::open_by_name`).
 pub fn open(out: u64, name: &str, iosb: u64, disposition: u32, request: &OpenRequest) -> Result<u32, KernelError> {
-    run(iosb, || {
+    super::files::open_by_name(out, name, request.handle_attributes, iosb, disposition, request, None)
+}
+
+/// Uma volta do IRP_MJ_CREATE no volume de boot: abre ou cria o arquivo e
+/// publica o handle `file`, ou devolve o reparse point do caminho.
+pub fn create(out: u64, name: &str, iosb: u64, disposition: u32, request: &OpenRequest) -> Result<Created, KernelError> {
+    let mut reparse = None;
+    let status = run(iosb, || {
         if !state::probe_user_write(out, 8) {
             return fail(AV);
         }
@@ -212,6 +232,13 @@ pub fn open(out: u64, name: &str, iosb: u64, disposition: u32, request: &OpenReq
         }
         let Some(path) = volume_files::nt_path_to_volume_path(name) else { return fail(0xC000_0033) };
         let volume = volume_files::volume().ok_or_else(|| KernelError::with_status("volume de boot ausente", 0xC000_000E))?;
+        // O STATUS_REPARSE do NTFS: um reparse point intermediário, ou o
+        // último componente sem FILE_OPEN_REPARSE_POINT, devolve o buffer
+        // antes da disposição.
+        if let Some(found) = volume_reparse(&volume, name, &path, options & FILE_OPEN_REPARSE_POINT != 0)? {
+            reparse = Some(found);
+            return Ok(reparse::STATUS_REPARSE);
+        }
         let mut file = volume_files::lookup_volume_file(name);
         let mut information = 1u64;
         match file.clone() {
@@ -292,7 +319,30 @@ pub fn open(out: u64, name: &str, iosb: u64, disposition: u32, request: &OpenReq
         let status = complete(iosb, 0, information);
         debug_print!("[usermode] arquivo {}{} ({} bytes)", if information == 2 { "criado: " } else { "aberto: " }, name, file.size());
         Ok(status)
+    })?;
+    Ok(match reparse {
+        Some(found) => Created::Reparse(found),
+        None => Created::Done(status),
     })
+}
+
+/// O nome que uma consulta por nome no volume de boot (o
+/// NtQueryAttributesFile, que abre com FILE_OPEN_REPARSE_POINT) alcança:
+/// os reparse points intermediários seguidos como numa abertura, o último
+/// não.
+fn resolve_query_name(name: &str, object_flags: u32) -> Result<String, u32> {
+    let mut walk = NameWalk::new(object_flags);
+    let mut name = String::from(name);
+    loop {
+        walk.arrive(reparse::FILE_DEVICE_DISK)?;
+        let Some(path) = volume_files::nt_path_to_volume_path(&name) else { return Err(0xC000_0033) };
+        let Some(volume) = volume_files::volume() else { return Err(0xC000_000E) };
+        let found = volume_reparse(&volume, &name, &path, true).map_err(|error| if error.status != 0 { error.status } else { 0xC000_0185 })?;
+        let Some(found) = found else { return Ok(name) };
+        let reparsed = found.graft(&mut walk, &name)?;
+        walk.restart(&reparsed.name)?;
+        name = reparsed.name;
+    }
 }
 
 /// A descrição aberta de `file` (a `UserFile` com o FILE_OBJECT ligado, na
@@ -391,8 +441,16 @@ fn query_attributes(attributes: u64, out: u64, length: u64) -> Result<u32, Kerne
         return Ok(AV);
     }
     let Some(parsed) = parse_user_object_attributes(attributes) else { return Ok(INVALID) };
-    let Some(file) = volume_files::lookup_volume_file(&parsed.path) else {
-        debug_print!("[file-io] attributes absent: {}", parsed.path);
+    let object_flags = match super::registry::user_object_attributes(attributes) {
+        Ok(flags) => flags,
+        Err(error) => return Ok(error.status),
+    };
+    let name = match resolve_query_name(&parsed.path, object_flags) {
+        Ok(name) => name,
+        Err(status) => return Ok(status),
+    };
+    let Some(file) = volume_files::lookup_volume_file(&name) else {
+        debug_print!("[file-io] attributes absent: {}", name);
         return Ok(0xC000_0034);
     };
     if file.pending_delete() {
@@ -488,7 +546,12 @@ pub fn nt_query_information_file(handle: u64, iosb: u64, out: u64, length: u64, 
                 all.alignment_information.alignment_requirement.probe_set(alignment)?;
             }
             34 => network(state::user_struct::<FileNetworkOpenInformation>(out)?, file)?,
-            35 => state::user_struct::<FileAttributeTagInformation>(out)?.file_attributes.probe_set(stat.attributes)?,
+            35 => {
+                // FileAttributes e a tag do reparse point (0 sem ele).
+                let information = state::user_struct::<FileAttributeTagInformation>(out)?;
+                information.file_attributes.probe_set(stat.attributes)?;
+                information.reparse_tag.probe_set(if stat.attributes & 0x400 != 0 { stat.reparse_tag } else { 0 })?;
+            }
             59 => {
                 let id = state::user_struct::<FileIdInformation>(out)?;
                 id.volume_serial_number.probe_set(VOLUME_SERIAL)?;
@@ -784,6 +847,48 @@ fn nt_set_information_file(handle: u64, iosb: u64, buffer: u64, length: u64, rsp
     })
 }
 
+/// NtFsControlFile num arquivo do volume de boot (o IopXxxControlFile com
+/// IRP_MJ_FILE_SYSTEM_CONTROL ao NTFS): os FSCTLs de reparse point
+/// (METHOD_BUFFERED; FSCTL_SET/DELETE com FILE_SPECIAL_ACCESS e o GET com
+/// FILE_ANY_ACCESS, então o acesso é o que o NTFS confere) vão ao volume
+/// com o acesso do handle e o modo usuário (`ntfs_reparse`); os demais
+/// FSCTLs seguem STATUS_INVALID_DEVICE_REQUEST.
+pub fn fs_control(handle: u64, event: u64, apc: u64, rsp: u64) -> Result<u32, KernelError> {
+    use crate::drivers::fs::ntfs_reparse::{FSCTL_DELETE_REPARSE_POINT, FSCTL_GET_REPARSE_POINT, FSCTL_SET_REPARSE_POINT};
+    let iosb = state::stack_arg(rsp, 5);
+    let code = state::stack_arg32(rsp, 6);
+    let (input, input_length) = (state::stack_arg(rsp, 7), state::stack_arg32(rsp, 8));
+    let (output, output_length) = (state::stack_arg(rsp, 9), state::stack_arg32(rsp, 10));
+    if !matches!(code, FSCTL_SET_REPARSE_POINT | FSCTL_GET_REPARSE_POINT | FSCTL_DELETE_REPARSE_POINT) {
+        return Ok(0xC000_0010);
+    }
+    run(iosb, || {
+        let (entry, user_file) = object(handle)?;
+        if apc != 0 {
+            return fail(0xC000_00BB);
+        }
+        let completion = if event != 0 { state::get_user_handle(event) } else { None };
+        if event != 0 && completion.as_ref().is_none_or(|completion| completion.kind() != "event") {
+            return fail(HANDLE);
+        }
+        if !state::probe_user_read(input, input_length as u64) || !state::probe_user_write(output, output_length as u64) {
+            return fail(AV);
+        }
+        let bytes = guest::try_read_bytes(input, input_length as usize)?;
+        let caller = crate::drivers::fs::ntfs_control::ControlCaller { access: entry.access(), user_mode: true };
+        let result = volume_or_fail()?.control(&user_file.file.volume_path(), code, &bytes, output_length, &caller)?;
+        if !result.bytes.is_empty() {
+            guest::try_write_bytes(output, &result.bytes)?;
+        }
+        user_file.file.refresh();
+        let status = complete(iosb, result.status, result.information as u64);
+        if let Some(body) = completion.and_then(|completion| completion.object.native_body()) {
+            dispatcher::set_event(body.pointer);
+        }
+        Ok(status)
+    })
+}
+
 fn nt_flush_buffers_file(handle: u64, iosb: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
     run(iosb, || {
         let (entry, _) = object(handle)?;
@@ -957,7 +1062,10 @@ fn query_directory(handle: u64, event: u64, apc: u64, rsp: u64, extended: bool) 
                 entry.file_attributes.probe_set(stat.attributes)?;
                 entry.file_name_length.probe_set(units.len() as u32 * 2)?;
                 if [2, 3, 37, 38].contains(&class) {
-                    state::user_struct::<FileFullDirInformation>(out + at)?.ea_size.probe_set(stat.ea_size)?;
+                    // Num reparse point o NTFS devolve a tag no lugar do
+                    // tamanho de EA (o dwReserved0 do FindFirstFile).
+                    let ea_size = if stat.attributes & 0x400 != 0 { stat.reparse_tag } else { stat.ea_size };
+                    state::user_struct::<FileFullDirInformation>(out + at)?.ea_size.probe_set(ea_size)?;
                 }
                 if class == 37 || class == 38 {
                     let id = if class == 37 { &state::user_struct::<FileIdBothDirInformation>(out + at)?.file_id } else { &state::user_struct::<FileIdFullDirInformation>(out + at)?.file_id };

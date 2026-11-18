@@ -661,7 +661,7 @@ impl Tx<'_> {
         let mut unsupported = false;
         each_attribute(&record, |attribute| {
             let raw = &attribute.raw;
-            if attribute.attribute_type == 0x20 || attribute.attribute_type == 0xC0 || u16_at(raw, 12) != 0 || (attribute.attribute_type == 0x80 && raw[9] != 0) {
+            if attribute.attribute_type == 0x20 || u16_at(raw, 12) != 0 || (attribute.attribute_type == 0x80 && raw[9] != 0) {
                 unsupported = true;
             }
             !unsupported
@@ -679,13 +679,139 @@ impl Tx<'_> {
         put64(&mut value, 48, size);
         value[8..40].copy_from_slice(&standard[..32]);
         let ea_size = list.iter().find(|attribute| u32_at(attribute, 0) == 0xD0).map_or(0, |raw| u16_at(raw, u16_at(raw, 20) as usize) as u64);
-        put32(&mut value, 60, ea_size);
+        // Com $REPARSE_POINT o campo é a tag (o ReparsePointTag que divide o
+        // lugar com o PackedEaSize nas informações duplicadas).
+        let reparse = list.iter().find(|attribute| u32_at(attribute, 0) == 0xC0).cloned();
+        let field = match reparse {
+            Some(raw) => self.attribute_head(&raw)?.get(0..4).map_or(0, |tag| u32_at(tag, 0) as u64),
+            None => ea_size,
+        };
+        put32(&mut value, 60, field);
         put32(&mut value, 56, u32_at(&standard, 32) as u64);
         replace(list, 0x30, Some(resident(0x30, &value, "")));
         self.record(reference, list, u16_at(record, 22), Some(record), 1)?;
         let parent = parent_of(&value);
         let entries = self.volume.root_index(parent)?.into_iter().map(|entry| if entry.reference == reference { IndexEntry { value: value.clone(), ..entry } } else { entry }).collect();
         self.directory(parent, entries)
+    }
+
+    /// Os primeiros bytes do valor de um atributo cru: o residente inteiro,
+    /// ou o primeiro setor da primeira run (com as escritas pendentes da
+    /// transação por cima).
+    fn attribute_head(&self, raw: &[u8]) -> Result<Vec<u8>, KernelError> {
+        if raw[8] == 0 {
+            return Ok(value_of(raw));
+        }
+        let runs = parse_runs(raw, u16_at(raw, 32) as usize)?;
+        let Some(first) = runs.first() else { return Ok(Vec::new()) };
+        self.volume.read_sectors(first.lcn as u64 * self.volume.geometry.sectors_per_cluster, 1)
+    }
+
+    /// A entrada (tag, referência do arquivo com a sequência) do índice $R
+    /// do `$Extend/$Reparse`, como o NtOfsAddRecords/NtOfsDeleteRecords do
+    /// NtfsCreateReparsePointInternal (0x1ee1cc) a grava: chave de 12 bytes
+    /// (o ULONG da tag e a referência de 64 bits), sem dados, na colação
+    /// COLLATION_NTOFS_ULONGS (a tag, depois os ULONGs baixo e alto da
+    /// referência). O índice fica na raiz residente; um volume sem o
+    /// `$Reparse` não tem índice a manter.
+    fn reparse_index(&mut self, tag: u32, file_reference: u64, insert: bool) -> Result<(), KernelError> {
+        let Some(entry) = self.volume.find("/$Extend/$Reparse")? else { return Ok(()) };
+        let record = self.volume.read_record(entry.reference)?;
+        let root = find_attribute(&record, 0x90)?.filter(|root| !root.non_resident && root.value.len() >= 32);
+        let Some(root) = root else { return fail(0xC000_0032, "$Reparse sem $INDEX_ROOT residente") };
+        if find_attribute(&record, 0xA0)?.is_some() {
+            return fail(0xC000_00BB, "indice $R com blocos INDX");
+        }
+        let value = &root.value;
+        let end = (16 + u32_at(value, 20) as usize).min(value.len());
+        let mut offset = 16 + u32_at(value, 16) as usize;
+        let mut keys: Vec<(u32, u64)> = Vec::new();
+        while offset + 16 <= end {
+            let size = u16_at(value, offset + 8) as usize;
+            let flags = u16_at(value, offset + 12);
+            if flags & 2 != 0 {
+                break;
+            }
+            if flags & 1 != 0 || size < 28 || offset + 28 > end || u16_at(value, offset + 10) != 12 {
+                return fail(0xC000_0032, "entrada de $R invalida");
+            }
+            keys.push((u32_at(value, offset + 16), u64_at(value, offset + 20)));
+            offset += size;
+        }
+        keys.retain(|&key| key != (tag, file_reference));
+        if insert {
+            keys.push((tag, file_reference));
+        }
+        keys.sort_by_key(|&(key_tag, reference)| (key_tag, reference as u32, (reference >> 32) as u32));
+        let mut entries = Vec::new();
+        for (key_tag, reference) in keys {
+            let mut item = [0u8; 32];
+            // DataOffset = cabeçalho + chave, DataLength 0, Length e KeyLength.
+            put16(&mut item, 0, 28);
+            put16(&mut item, 8, 32);
+            put16(&mut item, 10, 12);
+            put32(&mut item, 16, key_tag as u64);
+            put64(&mut item, 20, reference);
+            entries.extend_from_slice(&item);
+        }
+        let mut last = [0u8; 16];
+        put16(&mut last, 8, 16);
+        put16(&mut last, 12, 2);
+        entries.extend_from_slice(&last);
+        let mut new_value = value[..16].to_vec();
+        new_value.resize(32, 0);
+        put32(&mut new_value, 16, 16);
+        put32(&mut new_value, 20, (16 + entries.len()) as u64);
+        put32(&mut new_value, 24, (16 + entries.len()) as u64);
+        new_value.extend_from_slice(&entries);
+        let mut list = attributes(&record)?;
+        replace(&mut list, 0x90, Some(resident(0x90, &new_value, "$R")));
+        self.record(entry.reference, &list, u16_at(&record, 22), Some(&record), 1)
+    }
+
+    /// Grava (`Some`) ou remove (`None`) o $REPARSE_POINT de `path`: o
+    /// atributo (residente enquanto cabe no registro, senão em runs), a
+    /// FILE_ATTRIBUTE_REPARSE_POINT do $STANDARD_INFORMATION com o tempo de
+    /// mudança, a entrada do $R e as informações duplicadas no diretório
+    /// pai (`refresh_name`). As checagens do FSCTL vêm antes
+    /// (`ntfs_reparse`).
+    fn store_reparse(&mut self, path: &str, buffer: Option<&[u8]>) -> Result<(), KernelError> {
+        let (entry, record) = self.require_file(path)?;
+        let mut list = attributes(&record)?;
+        let file_reference = entry.reference | (u16_at(&record, 16) as u64) << 48;
+        if let Some(old) = self.volume.reparse_value(&record)?.filter(|old| old.len() >= 4) {
+            self.reparse_index(u32_at(&old, 0), file_reference, false)?;
+        }
+        if let Some(old) = find_attribute(&record, 0xC0)?.filter(|old| old.non_resident) {
+            let runs = parse_runs(&record, old.run_offset)?;
+            self.release(&runs)?;
+        }
+        replace(&mut list, 0xC0, None);
+        if let Some(buffer) = buffer {
+            let raw = resident(0xC0, buffer, "");
+            let record_size = self.volume.geometry.record_size as usize;
+            let start = align(48 + (record_size / self.sector() as usize + 1) * 2);
+            if start + 8 + raw.len() + list.iter().map(Vec::len).sum::<usize>() <= record_size {
+                replace(&mut list, 0xC0, Some(raw));
+            } else {
+                let runs = self.allocate((buffer.len() as u64).div_ceil(self.cluster()))?;
+                self.transfer(&runs, 0, Some(buffer), buffer.len() as u64)?;
+                let allocated: u64 = runs.iter().map(|run| run.count * self.cluster()).sum();
+                if allocated > buffer.len() as u64 {
+                    self.transfer(&runs, buffer.len() as u64, None, allocated - buffer.len() as u64)?;
+                }
+                let attribute = self.nonresident(0xC0, &merge_runs(&runs), buffer.len() as u64, "");
+                replace(&mut list, 0xC0, Some(attribute));
+            }
+            self.reparse_index(u32_at(buffer, 0), file_reference, true)?;
+        }
+        let mut standard = find_attribute(&record, 0x10)?.map(|standard| standard.value).unwrap_or_else(|| alloc::vec![0; 72]);
+        let marked = if buffer.is_some() { u32_at(&standard, 32) | 0x400 } else { u32_at(&standard, 32) & !0x400 };
+        put32(&mut standard, 32, marked as u64);
+        put64(&mut standard, 16, now());
+        replace(&mut list, 0x10, Some(resident(0x10, &standard, "")));
+        let name = find_attribute(&record, 0x30)?.map(|name| name.value).unwrap_or_default();
+        self.refresh_name(entry.reference, &record, &mut list, u64_at(&name, 48), u64_at(&name, 40))
     }
 
     fn read_ea(&self, record: &[u8]) -> Result<Vec<Entry>, KernelError> {
@@ -868,6 +994,9 @@ impl Tx<'_> {
         if u16_at(&record, 22) & 2 != 0 && !self.volume.root_index(entry.reference)?.is_empty() {
             return fail(0xC000_0101, "diretorio nao vazio");
         }
+        if let Some(value) = self.volume.reparse_value(&record)?.filter(|value| value.len() >= 4) {
+            self.reparse_index(u32_at(&value, 0), entry.reference | (u16_at(&record, 16) as u64) << 48, false)?;
+        }
         let mut runs = Vec::new();
         let mut failure = None;
         each_attribute(&record, |attribute| {
@@ -913,7 +1042,8 @@ impl Tx<'_> {
             for offset in [0, 8, 16, 24] {
                 put64(&mut standard, offset, time);
             }
-            let flags = (file_attributes & !0x90) | if directory { 0x10 } else { 0x20 };
+            // FILE_ATTRIBUTE_REPARSE_POINT só vem do FSCTL_SET_REPARSE_POINT.
+            let flags = (file_attributes & !0x490) | if directory { 0x10 } else { 0x20 };
             put32(&mut standard, 32, flags as u64);
             let file_name = tx.filename(parent.reference, &name, directory, 0, 0, Some(&standard), flags)?;
             let mut list = alloc::vec![resident(0x10, &standard, ""), resident(0x30, &file_name, "")];
@@ -951,7 +1081,9 @@ impl Tx<'_> {
                 }
             }
             if file_attributes != 0 {
-                put32(&mut standard, 32, ((file_attributes & !0x90) | if u16_at(&record, 22) & 2 != 0 { 0x10 } else { 0 }) as u64);
+                // A marca de reparse point fica: a FileBasicInformation não a muda.
+                let reparse = u32_at(&standard, 32) & 0x400;
+                put32(&mut standard, 32, ((file_attributes & !0x490) | reparse | if u16_at(&record, 22) & 2 != 0 { 0x10 } else { 0 }) as u64);
             }
             replace(&mut list, 0x10, Some(resident(0x10, &standard, "")));
             let name = find_attribute(&record, 0x30)?.map(|name| name.value).unwrap_or_default();
@@ -1007,6 +1139,12 @@ impl Ntfs {
                 tx.refresh_name(entry.reference, &record, &mut list, u64_at(&name, 48), u64_at(&name, 40))
             })
         })
+    }
+
+    /// Grava (`Some`) ou remove (`None`) o reparse point de `path` numa
+    /// transação (`Tx::store_reparse`).
+    pub fn store_reparse_point(&self, path: &str, buffer: Option<&[u8]>) -> Result<(), KernelError> {
+        self.with_writer(|writer| writer.transaction(|tx| tx.store_reparse(path, buffer)))
     }
 
     pub fn create(&self, path: &str, directory: bool, file_attributes: u32, reservation: u64) -> Result<Option<Stat>, KernelError> {

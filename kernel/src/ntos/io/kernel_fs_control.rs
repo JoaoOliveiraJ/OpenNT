@@ -162,7 +162,12 @@ pub fn control(file: u64, code: u32, input: u64, input_length: u32, output: u64,
     if code & 3 == 0 && input_length < output_length {
         move_bytes(output, input, input_length as u64);
     }
-    let Some(result) = volume.control(&path, code, &bytes, output_length) else { return Ok(0xC000_0010) };
+    // O FsRtlKernelFsControlFile pede em KernelMode; o acesso é o do
+    // FILE_OBJECT (o WriteAccess que o ntfs.sys aceita no lugar do Ccb).
+    // SAFETY: FILE_OBJECT vivo do chamador.
+    let body = unsafe { FileObject::at(file) };
+    let caller = crate::drivers::fs::ntfs_control::ControlCaller { access: if body.write_access.get() != 0 { 0x0012_0196 } else { 0x0012_0089 }, user_mode: false };
+    let Some(result) = volume.control(&path, code, &bytes, output_length, &caller) else { return Ok(0xC000_0010) };
     match result {
         Ok(result) => {
             let destination = if code & 3 == 0 && input_length >= output_length { input } else { output };

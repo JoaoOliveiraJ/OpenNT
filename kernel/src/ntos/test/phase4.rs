@@ -780,8 +780,8 @@ fn fs_volume_queries(assert: Assert) {
         return;
     };
     // FSCTLs do NTFS.
-    let control = |code: u32, length: u32| volume.control("/HELLO.TXT", code, &[], length).unwrap_or(crate::drivers::fs::ntfs_control::ControlResult { status: 1, information: 0, bytes: alloc::vec::Vec::new() });
-    assert(volume.control("/NADA", 0x9_0028, &[], 0).is_ok_and(|result| result.status == 0xC000_0034) && control(0x9_0028, 0).status == 0 && control(0x9_00F4, 0).status == 0xC000_02B8 && control(0x1234, 0).status == 0xC000_0010, "ntfsctl: volume montado, USN inativo e controle desconhecido");
+    let control = |code: u32, length: u32| volume.control("/HELLO.TXT", code, &[], length, &crate::drivers::fs::ntfs_control::ControlCaller::KERNEL).unwrap_or(crate::drivers::fs::ntfs_control::ControlResult { status: 1, information: 0, bytes: alloc::vec::Vec::new() });
+    assert(volume.control("/NADA", 0x9_0028, &[], 0, &crate::drivers::fs::ntfs_control::ControlCaller::KERNEL).is_ok_and(|result| result.status == 0xC000_0034) && control(0x9_0028, 0).status == 0 && control(0x9_00F4, 0).status == 0xC000_02B8 && control(0x1234, 0).status == 0xC000_0010, "ntfsctl: volume montado, USN inativo e controle desconhecido");
     assert(control(0x9_003C, 2).bytes == alloc::vec![0, 0] && control(0x9_003C, 1).status == 0xC000_0023, "ntfsctl: FSCTL_GET_COMPRESSION");
     let data = control(0x9_0064, 96);
     let field = |at: usize, count: usize| data.bytes[at..at + count].iter().rev().fold(0u64, |value, &byte| value << 8 | byte as u64);
@@ -800,7 +800,7 @@ fn fs_volume_queries(assert: Assert) {
     let read = |bytes: &[u8], at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap_or([0; 8]));
     assert(read(&size.bytes, 0) == geometry.total_sectors && read(&size.bytes, 8) == read(&full.bytes, 16) && size.bytes[16] == 1 && size.bytes[20..22] == [0, 2] && full.bytes[24] == 1, "fsinfo: FileFsSize e FileFsFullSize");
     let attribute = query(5, 64);
-    assert(query(4, 8).bytes[0] == 7 && attribute.information == 20 && attribute.bytes[0] == 6 && attribute.bytes[4] == 255 && attribute.bytes[12..20] == [b'N', 0, b'T', 0, b'F', 0, b'S', 0], "fsinfo: FileFsDevice e FileFsAttribute");
+    assert(query(4, 8).bytes[0] == 7 && attribute.information == 20 && attribute.bytes[0] == 0x86 && attribute.bytes[4] == 255 && attribute.bytes[12..20] == [b'N', 0, b'T', 0, b'F', 0, b'S', 0], "fsinfo: FileFsDevice e FileFsAttribute");
     // FsRtlGetFileNameInformation pela tabela do Filter Manager.
     assert(filters::current_callbacks() == 0 && filters::get_file_name_information(1, 2, 3, 4) == 0xC000_00BB, "filter: sem Filter Manager");
     let table = guest::alloc_bytes(0x30);

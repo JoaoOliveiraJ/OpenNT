@@ -152,6 +152,10 @@ pub struct Stat {
     pub ea_size: u32,
     pub need_ea: u16,
     pub attributes: u32,
+    /// A tag do $REPARSE_POINT com FILE_ATTRIBUTE_REPARSE_POINT (0 sem ele):
+    /// a que o NTFS devolve no lugar do tamanho de EA nas listagens e na
+    /// FileAttributeTagInformation.
+    pub reparse_tag: u32,
     pub times: Vec<u8>,
 }
 
@@ -255,8 +259,8 @@ impl super::volume::FileSystem for Ntfs {
         "NTFS"
     }
 
-    fn control(&self, path: &str, code: u32, input: &[u8], output_length: u32) -> Option<Result<super::ntfs_control::ControlResult, KernelError>> {
-        Some(Ntfs::control(self, path, code, input, output_length))
+    fn control(&self, path: &str, code: u32, input: &[u8], output_length: u32, caller: &super::ntfs_control::ControlCaller) -> Option<Result<super::ntfs_control::ControlResult, KernelError>> {
+        Some(Ntfs::control(self, path, code, input, output_length, caller))
     }
 
     fn query_ea(&self, path: &str, length: usize, options: &super::extended_attributes::QueryOptions, state: &mut super::extended_attributes::QueryState) -> Option<Result<super::extended_attributes::QueryResult, KernelError>> {
@@ -284,7 +288,7 @@ impl super::volume::FileSystem for Ntfs {
     }
 
     fn stat(&self, path: &str) -> Option<super::volume::VolumeStat> {
-        Ntfs::stat(self, path).ok().flatten().map(|stat| super::volume::VolumeStat { reference: Some(stat.reference), sequence: stat.sequence, directory: stat.directory, size: stat.size, allocated: stat.allocated, attributes: stat.attributes, ea_size: stat.ea_size, need_ea: stat.need_ea, times: stat.times })
+        Ntfs::stat(self, path).ok().flatten().map(|stat| super::volume::VolumeStat { reference: Some(stat.reference), sequence: stat.sequence, directory: stat.directory, size: stat.size, allocated: stat.allocated, attributes: stat.attributes, ea_size: stat.ea_size, need_ea: stat.need_ea, reparse_tag: stat.reparse_tag, times: stat.times })
     }
 
     fn read_bytes(&self, path: &str) -> Option<Vec<u8>> {
@@ -651,7 +655,9 @@ impl Ntfs {
             serial: u32_at(&self.boot, 72),
             creation_time: u64_at(&standard.value, 0),
             file_system: "NTFS",
-            attributes: 6,
+            // FILE_CASE_PRESERVED_NAMES | FILE_UNICODE_ON_DISK |
+            // FILE_SUPPORTS_REPARSE_POINTS (`ntfs_reparse`).
+            attributes: 0x86,
             maximum_component_length: 255,
             supports_objects: false,
             device_type: 7,
@@ -681,6 +687,7 @@ impl Ntfs {
         let ea = find_attribute(&record, 0xD0)?.filter(|ea| !ea.non_resident);
         let directory = u16_at(&record, 22) & 2 != 0;
         let file_attributes = standard.as_ref().map(|standard| u32_at(&standard.value, 32)).filter(|&value| value != 0).unwrap_or(if directory { 0x10 } else { 0x20 });
+        let reparse_tag = if file_attributes & super::ntfs_reparse::FILE_ATTRIBUTE_REPARSE_POINT != 0 { self.reparse_value(&record)?.filter(|value| value.len() >= 4).map_or(0, |value| u32_at(&value, 0)) } else { 0 };
         Ok(Some(Stat {
             reference: entry.reference,
             sequence: u16_at(&record, 16),
@@ -690,6 +697,7 @@ impl Ntfs {
             ea_size: ea.as_ref().map_or(0, |ea| u32_at(&ea.value, 4)),
             need_ea: ea.as_ref().map_or(0, |ea| u16_at(&ea.value, 2)),
             attributes: file_attributes,
+            reparse_tag,
             times: standard.map_or(alloc::vec![0; 32], |standard| standard.value[..32].to_vec()),
         }))
     }

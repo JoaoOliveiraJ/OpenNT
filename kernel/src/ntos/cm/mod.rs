@@ -44,6 +44,7 @@ pub mod registry;
 pub mod arbiters;
 pub mod pnp_control;
 pub mod crash_control;
+pub mod file_system;
 pub mod time_zone_information;
 pub mod seed;
 pub mod session_manager;

@@ -21,6 +21,8 @@ pub struct VolumeStat {
     pub attributes: u32,
     pub ea_size: u32,
     pub need_ea: u16,
+    /// A tag do reparse point (FILE_ATTRIBUTE_REPARSE_POINT), 0 sem ele.
+    pub reparse_tag: u32,
     pub times: Vec<u8>,
 }
 
@@ -98,7 +100,7 @@ pub trait FileSystem: Sync {
         None
     }
     /// FSCTL do próprio sistema de arquivos; `None` = sem suporte.
-    fn control(&self, _path: &str, _code: u32, _input: &[u8], _output_length: u32) -> Option<Result<crate::drivers::fs::ntfs_control::ControlResult, KernelError>> {
+    fn control(&self, _path: &str, _code: u32, _input: &[u8], _output_length: u32, _caller: &crate::drivers::fs::ntfs_control::ControlCaller) -> Option<Result<crate::drivers::fs::ntfs_control::ControlResult, KernelError>> {
         None
     }
     /// Consulta de EAs; `None` = sem suporte.

@@ -50,6 +50,8 @@ mod cm {
     pub mod pnp_control;
     #[path = "../../../../kernel/src/ntos/cm/crash_control.rs"]
     pub mod crash_control;
+    #[path = "../../../../kernel/src/ntos/cm/file_system.rs"]
+    pub mod file_system;
     #[path = "../../../../kernel/src/ntos/cm/time_zone_information.rs"]
     pub mod time_zone_information;
     #[path = "../../../../kernel/src/ntos/cm/network_setup.rs"]

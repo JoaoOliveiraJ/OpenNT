@@ -15,7 +15,22 @@ pub struct ControlResult {
     pub bytes: Vec<u8>,
 }
 
-fn result(status: u32, bytes: Vec<u8>) -> ControlResult {
+/// Quem pede o FSCTL: o acesso concedido ao handle (o Ccb->AccessFlags e o
+/// FILE_OBJECT->WriteAccess que o ntfs.sys confere) e se o pedido vem do
+/// modo usuário (o NtfsEffectiveMode das checagens de privilégio).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ControlCaller {
+    pub access: u32,
+    pub user_mode: bool,
+}
+
+impl ControlCaller {
+    /// Um pedido de modo kernel com todo o acesso (o FsRtlKernelFsControlFile
+    /// e o ZwFsControlFile de um driver).
+    pub const KERNEL: ControlCaller = ControlCaller { access: 0x001F_01FF, user_mode: false };
+}
+
+pub(super) fn result(status: u32, bytes: Vec<u8>) -> ControlResult {
     ControlResult { status, information: bytes.len() as u32, bytes }
 }
 
@@ -29,8 +44,12 @@ fn put(bytes: &mut [u8], at: usize, value: u64, count: usize) {
 }
 
 impl Ntfs {
-    pub fn control(&self, path: &str, code: u32, _input: &[u8], output_length: u32) -> Result<ControlResult, KernelError> {
+    pub fn control(&self, path: &str, code: u32, input: &[u8], output_length: u32, caller: &ControlCaller) -> Result<ControlResult, KernelError> {
         let Some(stat) = self.stat(path)? else { return Ok(result(0xC000_0034, Vec::new())) };
+        // FSCTL_SET/GET/DELETE_REPARSE_POINT (`ntfs_reparse`).
+        if matches!(code, super::ntfs_reparse::FSCTL_SET_REPARSE_POINT | super::ntfs_reparse::FSCTL_GET_REPARSE_POINT | super::ntfs_reparse::FSCTL_DELETE_REPARSE_POINT) {
+            return self.reparse_control(path, &stat, code, input, output_length, caller);
+        }
         // FSCTL_IS_VOLUME_MOUNTED: este é um sistema de arquivos montado e vivo.
         if code == 0x9_0028 {
             return Ok(result(0, Vec::new()));

@@ -324,46 +324,59 @@ fn shadow_step(directory: NodeId, parts: &[&str], index: usize, case_insensitive
     Step::Missing
 }
 
-/// Percorre a árvore a partir de `start` e segue links até a profundidade
-/// 8; `shadow` liga a sombra dos diretórios (busca de abertura, com o modo
-/// de quem chama). Um caminho que começa pelo componente de
-/// `private_namespace::anchor_name` parte do diretório do namespace privado.
+/// Percorre a árvore a partir de `start` e segue links até gastar as 0x40
+/// voltas de reparse do ObpLookupObjectName (a 0x40ª é
+/// STATUS_OBJECT_NAME_NOT_FOUND, `io/reparse.rs`); `shadow` liga a sombra
+/// dos diretórios (busca de abertura, com o modo de quem chama). Um caminho
+/// que começa pelo componente de `private_namespace::anchor_name` parte do
+/// diretório do namespace privado.
 fn resolve_inner(path: &str, link_depth: u32, case_insensitive: bool, open_symbolic_link: bool, start: NodeId, shadow: Option<bool>) -> (Option<NodeId>, Option<String>) {
-    if link_depth > 8 {
-        return (None, None); // laço de links
-    }
-    let mut parts = split_path(path);
-    let mut current = start;
-    if start == ROOT && !path.starts_with('\\') {
-        if let Some(anchor) = parts.first().and_then(|first| crate::ntos::ob::private_namespace::anchor_node(first)) {
-            current = anchor;
-            parts.remove(0);
+    let (mut path, mut link_depth, mut start) = (String::from(path), link_depth, start);
+    loop {
+        if link_depth + 1 >= crate::ntos::io::reparse::MAXIMUM_REPARSE {
+            return (None, None); // laço de links
         }
-    }
-    for index in 0..parts.len() {
-        let step = match with_state(|state| child_step(state, current, &parts, index, case_insensitive)) {
-            Step::Missing if shadow.is_some() => shadow_step(current, &parts, index, case_insensitive, shadow == Some(true)),
-            step => step,
-        };
-        match step {
-            Step::Missing => return (None, None),
-            Step::Mount(rest) => return (Some(current), Some(rest)),
-            Step::Found { next, is_link, body, target } => {
-                if is_link && !(open_symbolic_link && index == parts.len() - 1) {
-                    let rest = parts[index + 1..].join("\\");
-                    let target = if body != 0 { namespace_objects::target(body).unwrap_or_default() } else { target.unwrap_or_default() };
-                    let full = if rest.is_empty() { target } else { alloc::format!("{}\\{}", target, rest) };
-                    return resolve_inner(&full, link_depth + 1, case_insensitive, open_symbolic_link, ROOT, shadow);
-                }
-                current = next;
+        let mut parts = split_path(&path);
+        let mut current = start;
+        if start == ROOT && !path.starts_with('\\') {
+            if let Some(anchor) = parts.first().and_then(|first| crate::ntos::ob::private_namespace::anchor_node(first)) {
+                current = anchor;
+                parts.remove(0);
             }
         }
+        let mut reparsed = None;
+        for index in 0..parts.len() {
+            let step = match with_state(|state| child_step(state, current, &parts, index, case_insensitive)) {
+                Step::Missing if shadow.is_some() => shadow_step(current, &parts, index, case_insensitive, shadow == Some(true)),
+                step => step,
+            };
+            match step {
+                Step::Missing => return (None, None),
+                Step::Mount(rest) => return (Some(current), Some(rest)),
+                Step::Found { next, is_link, body, target } => {
+                    if is_link && !(open_symbolic_link && index == parts.len() - 1) {
+                        let rest = parts[index + 1..].join("\\");
+                        let target = if body != 0 { namespace_objects::target(body).unwrap_or_default() } else { target.unwrap_or_default() };
+                        reparsed = Some(if rest.is_empty() { target } else { alloc::format!("{}\\{}", target, rest) });
+                        break;
+                    }
+                    current = next;
+                }
+            }
+        }
+        // O nome do link recomeça na raiz (STATUS_REPARSE).
+        let Some(next_path) = reparsed else {
+            let mounted = with_state(|state| state.nodes.get(&current).is_some_and(|node| node.mount.is_some()));
+            return (Some(current), mounted.then(String::new));
+        };
+        path = next_path;
+        link_depth += 1;
+        start = ROOT;
     }
-    let mounted = with_state(|state| state.nodes.get(&current).is_some_and(|node| node.mount.is_some()));
-    (Some(current), mounted.then(String::new))
 }
 
-/// Percorre a árvore a partir de `start` e segue links até a profundidade 8.
+/// Percorre a árvore a partir de `start` e segue links até gastar as 0x40
+/// voltas de reparse.
 /// Devolve o nó encontrado e o trecho delegado a um volume montado. Sem a
 /// sombra dos diretórios: a busca de quem insere um nome.
 pub fn resolve_from(path: &str, link_depth: u32, case_insensitive: bool, open_symbolic_link: bool, start: NodeId) -> (Option<NodeId>, Option<String>) {

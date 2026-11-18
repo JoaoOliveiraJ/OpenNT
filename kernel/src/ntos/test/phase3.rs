@@ -396,7 +396,7 @@ fn namespace(assert: Assert) {
         assert(matches!(om::close(handle), Ok(true)) && om::get_object(handle).is_none(), "ob: fechamento do arquivo");
     }
     assert(matches!(om::open("\\??\\C:\\nao-existe.bin"), Ok(0)), "ob: arquivo ausente");
-    // Laço de links é cortado na profundidade 8.
+    // Laço de links: cortado ao gastar as 0x40 voltas de reparse.
     assert(om::create_symlink("\\LoopA", "\\LoopB").is_ok() && om::create_symlink("\\LoopB", "\\LoopA").is_ok(), "ob: links em laco");
     assert(om::lookup("\\LoopA\\x").is_none(), "ob: laco de links");
     assert(om::unlink("\\LoopA") && om::unlink("\\LoopB") && om::lookup("\\LoopB").is_none(), "ob: unlink");
