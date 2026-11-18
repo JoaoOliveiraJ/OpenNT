@@ -1085,7 +1085,7 @@ fn wnf_service_update_and_query(assert: Assert) {
     let sid = storage + 0x100;
     guest::write32(storage + 0x120, 0);
     assert(matches!(capture::capture_kernel(2, sid), Ok(Ok(ref captured)) if captured.identity == sid) && matches!(capture::capture_kernel(1, 0), Ok(Ok(ref captured)) if captured.identity == 0), "wnfcapture: SID emprestado em KernelMode e escopo ausente");
-    assert(matches!(capture::capture_kernel(4, sid), Ok(Err(0xC000_000D))) && matches!(capture::capture_kernel(1, storage + 0x120), Ok(Err(0xC000_000D))) && capture::capture_kernel(3, 4).is_err(), "wnfcapture: maquina recusada, sessao sem espaco de sessao, handle sem ObReferenceObjectByHandle");
+    assert(matches!(capture::capture_kernel(4, sid), Ok(Err(0xC000_000D))) && matches!(capture::capture_kernel(1, storage + 0x120), Ok(Err(0xC000_000D))) && matches!(capture::capture_kernel(3, 0x7FF0), Ok(Err(0xC000_0008))), "wnfcapture: maquina recusada, sessao sem espaco de sessao, handle de processo invalido pelo ObReferenceObjectByHandle");
     assert(service::shutdown().is_ok() && !service::exists(), "wnfservice: encerramento");
     guest::free_bytes(storage);
 }
