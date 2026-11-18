@@ -268,10 +268,19 @@ struct PendingConnection {
 
 /// Quem enviou uma mensagem ainda pendente: o CLIENT_ID e a ETHREAD da
 /// thread e a porta do cliente (a qualidade de segurança dele).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub struct Origin {
     pub sender: Sender,
     pub client: u64,
+    /// A thread que enviou espera a resposta (o envio síncrono: o
+    /// KALPC_MESSAGE.WaitingThread que a impersonação dinâmica captura).
+    pub waiting: bool,
+    /// O Type da mensagem na fila (o LPC_NO_IMPERSONATE, 0x4000, recusa a
+    /// impersonação).
+    pub message_type: u16,
+    /// O servidor já recebeu a mensagem (o estado de mensagem recebida que
+    /// o AlpcpImpersonateMessage exige).
+    pub received: bool,
 }
 
 /// A resposta de um pedido, preenchida quando o servidor responde, com a
@@ -413,7 +422,7 @@ impl UserServer {
             }
             let id = UserServer::next_id(&mut state);
             state.connections.insert(id, pending.clone());
-            state.senders.insert(id, Origin { sender, client: port.pointer });
+            state.senders.insert(id, Origin { sender, client: port.pointer, waiting: true, message_type: LPC_CONNECTION_REQUEST, received: false });
             (id, next_sequence(&self.listener))
         };
         self.enqueue(Delivery { id, message_type: LPC_CONNECTION_REQUEST, data: Vec::from(data), sender, port_context: 0, view, sequence, ..Delivery::default() });
@@ -485,9 +494,9 @@ impl Service for UserServer {
 
     /// LPC_REQUEST ou LPC_DATAGRAM na fila; a resposta conclui o job.
     fn exchange(&self, port: &Arc<Port>, data: &[u8], request: &Arc<Request>) -> Reply {
-        let (datagram, answer, mut sender) = {
+        let (datagram, answer, synchronous, type_bits, mut sender) = {
             let state = request.state.lock();
-            (state.datagram, state.answer, state.sender)
+            (state.datagram, state.answer, state.synchronous, state.type_bits, state.sender)
         };
         // A thread que enviou (para a impersonação do cliente).
         if sender.thread_pointer == 0 {
@@ -498,6 +507,13 @@ impl Service for UserServer {
         // passam à mensagem do servidor.
         let (data_view, handles, security) = request.identity.with(|state| (state.view.take(), state.handles.take(), state.security.take()));
         let attributes = SentAttributes { handles, security };
+        // AlpcpSendMessage: um envio com RELEASE_MESSAGE é LPC_DATAGRAM, os
+        // outros LPC_REQUEST, com os bits altos do Type do remetente; o
+        // AlpcpDispatchNewMessage liga o 0x2000 em todo envio sem
+        // RELEASE_MESSAGE (um pedido assíncrono ou de reserva também espera a
+        // resposta). A resposta do cliente a uma mensagem do servidor
+        // (MessageId dela) com RELEASE_MESSAGE é LPC_REPLY.
+        let message_type = (type_bits & !LPC_CONTINUATION_REQUIRED) | if datagram && answer { LPC_REPLY } else if datagram { LPC_DATAGRAM } else { LPC_REQUEST | LPC_CONTINUATION_REQUIRED };
         let (id, context, sequence, link_port) = {
             let mut state = self.state.lock();
             let Some((context, sequence, link_port)) = state.links.get(&port.pointer).filter(|link| !link.disconnected).map(|link| (link.context, next_sequence(&link.server_port), link.server_port.clone())) else { return Reply::Now(JobResult { status: STATUS_PORT_DISCONNECTED, ..JobResult::default() }) };
@@ -505,15 +521,9 @@ impl Service for UserServer {
             if !datagram {
                 state.requests.insert(id, slot.clone());
             }
-            state.senders.insert(id, Origin { sender, client: port.pointer });
+            state.senders.insert(id, Origin { sender, client: port.pointer, waiting: synchronous, message_type, received: false });
             (id, context, sequence, link_port)
         };
-        // AlpcpSendMessage: um envio com RELEASE_MESSAGE é LPC_DATAGRAM, os
-        // outros LPC_REQUEST; o AlpcpDispatchNewMessage liga o 0x2000 em todo
-        // envio sem RELEASE_MESSAGE (um pedido assíncrono ou de reserva também
-        // espera a resposta). A resposta do cliente a uma mensagem do servidor
-        // (MessageId dela) com RELEASE_MESSAGE é LPC_REPLY.
-        let message_type = if datagram && answer { LPC_REPLY } else if datagram { LPC_DATAGRAM } else { LPC_REQUEST | LPC_CONTINUATION_REQUIRED };
         self.enqueue(Delivery { id, message_type, data: Vec::from(data), sender, port_context: context, data_view, sequence, attributes, link_port: Some(link_port), ..Delivery::default() });
         if datagram {
             return Reply::Now(JobResult::default());
@@ -743,6 +753,8 @@ fn receive_one(server: &UserServer, buffer: &Buffer, attributes: u64, options: R
         // Um aviso de fechamento não espera resposta nem abertura do remetente.
         if delivery.message_type == LPC_PORT_CLOSED {
             state.senders.remove(&delivery.id);
+        } else if let Some(origin) = state.senders.get_mut(&delivery.id) {
+            origin.received = true;
         }
         drop(state);
         if options.port_context != 0 && guest::try_write::<u64>(options.port_context, delivery.port_context).is_err() {
@@ -1001,6 +1013,13 @@ pub fn reply_legacy(port: &Arc<Port>, reply: u64) -> u32 {
 /// mensagem `id` ainda pendente no servidor da porta.
 pub fn sender_of(port: &Arc<Port>, id: u32) -> Option<Origin> {
     server_of(port)?.state.lock().senders.get(&id).copied()
+}
+
+/// A porta do cliente ligado a uma porta de comunicação do servidor (o
+/// AlpcpReferenceConnectedPort); `None` em qualquer outra porta.
+pub fn connected_client(port: &Arc<Port>) -> Option<Arc<Port>> {
+    let (_, client) = COMMUNICATION.lock().get(&port.pointer).cloned()?;
+    port_objects::port_of(client)
 }
 
 /// Os handles que o pedido `id`, já recebido pelo servidor da porta, levou, e
@@ -1571,7 +1590,7 @@ fn connection_request(server: &Arc<UserServer>, input: u64, receive: crate::ntos
         }
         let id = UserServer::next_id(&mut state);
         state.requests.insert(id, slot.clone());
-        state.senders.insert(id, Origin { sender, client: 0 });
+        state.senders.insert(id, Origin { sender, client: 0, waiting: true, ..Origin::default() });
         (id, next_sequence(&server.listener))
     };
     let message_type = if server.legacy() { LPC_REQUEST } else { LPC_REQUEST | LPC_CONTINUATION_REQUIRED };

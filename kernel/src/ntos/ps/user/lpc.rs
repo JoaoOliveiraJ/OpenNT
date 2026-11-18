@@ -328,12 +328,12 @@ fn nt_reply_wait_reply_port(handle: u64, message: u64, _: u64, _: u64, _rsp: u64
 
 /// NtImpersonateClientOfPort(PortHandle, Message).
 fn nt_impersonate_client_of_port(handle: u64, message: u64, _: u64, _: u64, _rsp: u64) -> Result<u32, KernelError> {
-    lpc_ports::impersonate_client(handle, message, true)
+    lpc_ports::impersonate_client(handle, message, 0, true)
 }
 
 /// NtAlpcImpersonateClientOfPort(PortHandle, Message, Flags).
-fn nt_alpc_impersonate_client_of_port(handle: u64, message: u64, _flags: u64, _: u64, _rsp: u64) -> Result<u32, KernelError> {
-    lpc_ports::impersonate_client(handle, message, false)
+fn nt_alpc_impersonate_client_of_port(handle: u64, message: u64, flags: u64, _: u64, _rsp: u64) -> Result<u32, KernelError> {
+    lpc_ports::impersonate_client(handle, message, flags as u32, false)
 }
 
 /// NtReadRequestData(PortHandle, Message, DataEntryIndex, Buffer,

@@ -703,14 +703,34 @@ fn connect_port(out: u64, name: u64, oa: u64, port_attributes: u64, rsp: u64, re
         return Ok(AV);
     }
     // ALPC_PORT_ATTRIBUTES opcional: Flags, SecurityQos, MaxViewSize e
-    // DupObjectTypes capturados uma vez.
+    // DupObjectTypes capturados uma vez. Sem ele, os atributos padrão do
+    // AlpcpValidateAndSetPortAttributes de uma porta de cliente:
+    // ALLOW_IMPERSONATION e o QOS anônimo, dinâmico e só efetivo.
     let (port_flags, duplicate_object_types, maximum_view_size, quality) = if port_attributes != 0 {
         let attributes = state::user_struct::<AlpcPortAttributes>(port_attributes)?;
         let qos = &attributes.security_qos;
         let quality = crate::ntos::alpc::security_contexts::Quality { level: qos.impersonation_level.probe_get()?.0 as u32, tracking: qos.context_tracking_mode.probe_get()?, effective_only: qos.effective_only.probe_get()? != 0 };
-        (attributes.flags.probe_get()?, attributes.dup_object_types.probe_get()?, attributes.max_view_size.probe_get()?, quality)
+        let flags = attributes.flags.probe_get()?;
+        if flags & 0x10_0000 != 0 || quality.tracking > 1 {
+            return Ok(INVALID);
+        }
+        if quality.level > 3 {
+            return Ok(0xC000_00A5);
+        }
+        (flags & 0x03FF_0000, attributes.dup_object_types.probe_get()?, attributes.max_view_size.probe_get()?, quality)
     } else {
-        (0, 0, 0, crate::ntos::alpc::security_contexts::Quality { level: 2, tracking: 0, effective_only: false })
+        (0x1_0000, 0, 0, crate::ntos::alpc::security_contexts::Quality { level: 0, tracking: 1, effective_only: true })
+    };
+    // AlpcpCreateClientPort: com rastreamento estático, o contexto do
+    // cliente capturado agora (a impersonação sem atributo de segurança usa
+    // este, não o token da thread no momento do pedido).
+    let connected = if quality.tracking == 0 {
+        match crate::ntos::alpc::message::security::capture_client(process::get_current_thread(), &quality)? {
+            Ok(identity) => Some(identity),
+            Err(status) => return Ok(status),
+        }
+    } else {
+        None
     };
     let initial = PortState {
         service: Some(service.clone()),
@@ -725,6 +745,7 @@ fn connect_port(out: u64, name: u64, oa: u64, port_attributes: u64, rsp: u64, re
         maximum_view_size,
         on_disconnect: Some(disconnect_transport),
         security_quality: Some(quality),
+        client_security: connected.clone(),
         ..PortState::default()
     };
     let disconnecting = service.clone();
@@ -736,6 +757,9 @@ fn connect_port(out: u64, name: u64, oa: u64, port_attributes: u64, rsp: u64, re
         oa,
         Box::new(move |connection| {
             cleanup_transport(connection);
+            if let Some(client) = connection.with(|state| state.client_security.take()) {
+                let _ = client.release();
+            }
             if connection.started() {
                 disconnecting.disconnect(connection);
             }
@@ -743,8 +767,12 @@ fn connect_port(out: u64, name: u64, oa: u64, port_attributes: u64, rsp: u64, re
         port_objects::CreateOptions::default(),
     ) {
         Ok(port) => port,
-        Err(error) if error.status != 0 => return Ok(error.status),
-        Err(error) => return Err(error),
+        Err(error) => {
+            if let Some(connected) = &connected {
+                let _ = connected.release();
+            }
+            return if error.status != 0 { Ok(error.status) } else { Err(error) };
+        }
     };
     let result = port.run(|| -> Result<u32, KernelError> {
         port.set_started(true);
@@ -908,7 +936,10 @@ fn send(port: &Arc<Port>, flags: u32, input: u64, send_attributes: u64, mode: u8
     }
     let Some(identity) = message_identity::activate(port, reserve.as_ref().map(|reserve| reserve.slot.clone()))? else { return Ok(Err(0xC000_009A)) };
     let synchronous = flags & 0x2_0000 != 0;
-    let request = Arc::new(Request { id: identity.identifier, identity: identity.clone(), state: SpinLock::new(RequestState { reserve: reserve.clone(), datagram, synchronous, legacy, legacy_synchronous, sender: current_sender(), answer, ..RequestState::default() }) });
+    // Os bits altos do Type que a mensagem conserva (AlpcpSendMessage): o
+    // LPC_KERNELMODE_MESSAGE só de quem envia em KernelMode.
+    let type_bits = u16::from_le_bytes([header[4], header[5]]) & if mode == 0 { 0xEF00 } else { 0x6F00 };
+    let request = Arc::new(Request { id: identity.identifier, identity: identity.clone(), state: SpinLock::new(RequestState { reserve: reserve.clone(), datagram, synchronous, legacy, legacy_synchronous, sender: current_sender(), answer, type_bits, ..RequestState::default() }) });
     install_cancellation(port, &request);
     let mut stored = false;
     let mut deferred = false;

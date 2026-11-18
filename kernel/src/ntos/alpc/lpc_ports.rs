@@ -33,9 +33,11 @@
 //!   AlpcpSendMessage com 0x10000, o AlpcpProcessSynchronousRequest com
 //!   0x20000), com os status internos do ALPC trocados pelos do LPC;
 //! - NtImpersonateClientOfPort e NtAlpcImpersonateClientOfPort
-//!   ([`impersonate_client`]): o servidor impersona a thread que enviou a
-//!   mensagem pendente, com a qualidade de segurança da porta do cliente
-//!   (SeCreateClientSecurity e SeImpersonateClientEx);
+//!   ([`impersonate_client`]): o nível pedido nas Flags, a mensagem já
+//!   recebida e sem LPC_NO_IMPERSONATE, o contexto de segurança que ela
+//!   leva ou, com ALLOW_IMPERSONATION na porta do cliente, o contexto
+//!   estático da conexão ou a thread que espera a resposta (rastreamento
+//!   dinâmico); sem mensagem, o contexto estático da conexão;
 //! - NtQueryInformationPort ([`query_information`]): só confere o handle
 //!   (READ_CONTROL) e zera o ReturnLength, como o 19041;
 //! - NtReplyWaitReplyPort, NtReadRequestData e NtWriteRequestData: as
@@ -294,6 +296,16 @@ fn connect_captured(out: u64, name: u64, qos: u64, client_view: u64, required_si
     let data = if capacity != 0 { guest::try_read_bytes(information, capacity as usize)? } else { Vec::new() };
     let service = listener.service.clone();
     let disconnecting = service.clone();
+    // AlpcpCreateClientPort: com rastreamento estático, o contexto do cliente
+    // capturado na conexão (o que a impersonação usa depois).
+    let connected = if quality.tracking == 0 {
+        match crate::ntos::alpc::message::security::capture_client(process::get_current_thread(), &quality)? {
+            Ok(identity) => Some(identity),
+            Err(status) => return Ok(status),
+        }
+    } else {
+        None
+    };
     let initial = PortState {
         role: Role::Client,
         service: Some(service.clone()),
@@ -302,6 +314,7 @@ fn connect_captured(out: u64, name: u64, qos: u64, client_view: u64, required_si
         port_flags: CLIENT_PORT_FLAGS,
         on_disconnect: Some(user_alpc::disconnect_transport),
         security_quality: Some(quality),
+        client_security: connected.clone(),
         ..PortState::default()
     };
     let port = match port_objects::create(
@@ -312,6 +325,9 @@ fn connect_captured(out: u64, name: u64, qos: u64, client_view: u64, required_si
         0,
         Box::new(move |connection: &Arc<Port>| {
             user_alpc::cleanup_transport(connection);
+            if let Some(client) = connection.with(|state| state.client_security.take()) {
+                let _ = client.release();
+            }
             if connection.started() {
                 disconnecting.disconnect(connection);
             }
@@ -322,8 +338,12 @@ fn connect_captured(out: u64, name: u64, qos: u64, client_view: u64, required_si
         port_objects::CreateOptions::default(),
     ) {
         Ok(port) => port,
-        Err(error) if error.status != 0 => return Ok(error.status),
-        Err(error) => return Err(error),
+        Err(error) => {
+            if let Some(connected) = &connected {
+                let _ = connected.release();
+            }
+            return if error.status != 0 { Ok(error.status) } else { Err(error) };
+        }
     };
     let result = port.run(|| -> Result<u32, KernelError> {
         let view = match &view_request {
@@ -670,35 +690,107 @@ pub fn copy_request_data(handle: u64, message: u64, write: bool) -> Result<u32, 
 // ---- impersonação e consulta --------------------------------------------------
 
 /// NtAlpcImpersonateClientOfPort(PortHandle, Message, Flags) e
-/// NtImpersonateClientOfPort(PortHandle, Message) (`legacy`, que troca a
-/// mensagem não achada por STATUS_REPLY_MESSAGE_MISMATCH): a thread corrente
-/// impersona a thread que enviou a mensagem ainda pendente no servidor, com
-/// a qualidade de segurança da porta do cliente.
-pub fn impersonate_client(handle: u64, message: u64, legacy: bool) -> Result<u32, KernelError> {
-    if !state::probe_user_read(message, PortMessage::SIZE) {
-        return Ok(STATUS_ACCESS_VIOLATION);
-    }
+/// NtImpersonateClientOfPort(PortHandle, Message) (`legacy`: Flags zero, e a
+/// mensagem não achada vira STATUS_REPLY_MESSAGE_MISMATCH), como no 19041:
+///
+/// - Flags: os bits 2-3 são um nível pedido (Flags acima de 15 dá
+///   STATUS_INVALID_PARAMETER); com eles (ou o bit 1) o nível pedido não
+///   pode passar do nível do contexto (STATUS_ACCESS_DENIED) e é o da
+///   impersonação; o bit 0 escolhe o SeCreateClientSecurityEx, que aqui é o
+///   mesmo contexto;
+/// - com mensagem (o MessageId não pode ser zero), o AlpcpImpersonateMessage
+///   ([`impersonate_message`]);
+/// - sem mensagem, o contexto estático da conexão
+///   ([`impersonate_connection`]).
+pub fn impersonate_client(handle: u64, message: u64, flags: u32, legacy: bool) -> Result<u32, KernelError> {
     let status = state::guarded(|| {
-        let id = state::user_struct::<PortMessage>(message)?.message_id.probe_get()?;
-        with_port(handle, 0, |port| {
-            let Some(origin) = server::sender_of(port, id) else { return Ok(STATUS_ALPC_MESSAGE_NOT_FOUND) };
-            // Um pedido com contexto de segurança (o atributo de segurança)
-            // impersona o token capturado nele, como o AlpcpImpersonateMessage
-            // pelo SeImpersonateClientEx do contexto.
-            if let Some((token, level, effective_only)) = server::received_security(port, id) {
-                let status = ps_security::impersonate_client(process::get_current_thread(), token, true, effective_only, level);
-                let _ = crate::ntos::se::token::tokens::release(token);
-                return status;
+        let id = if message != 0 {
+            if !state::probe_user_read(message, PortMessage::SIZE) {
+                return Ok(STATUS_ACCESS_VIOLATION);
             }
-            let thread = origin.sender.thread_pointer;
-            if thread == 0 {
-                return Ok(STATUS_ALPC_MESSAGE_NOT_FOUND);
+            let id = state::user_struct::<PortMessage>(message)?.message_id.probe_get()?;
+            if id == 0 {
+                return Ok(STATUS_INVALID_PARAMETER);
             }
-            let quality = port_objects::port_of(origin.client).and_then(|client| client.with(|state| state.security_quality)).unwrap_or(DEFAULT_QUALITY);
-            impersonate_thread(thread, quality)
+            Some(id)
+        } else {
+            None
+        };
+        let level = flags >> 2;
+        if level > 3 {
+            return Ok(STATUS_INVALID_PARAMETER);
+        }
+        let requested = (flags & ((level << 2) | 2) != 0).then_some(level);
+        with_port(handle, PORT_CONNECT, |port| match id {
+            Some(id) => impersonate_message(port, id, requested),
+            None => impersonate_connection(port, requested),
         })
     })?;
     Ok(if legacy && status == STATUS_ALPC_MESSAGE_NOT_FOUND { STATUS_REPLY_MESSAGE_MISMATCH } else { status })
+}
+
+/// ALPC_PORFLG_ALLOW_IMPERSONATION (na porta do cliente) e
+/// LPC_NO_IMPERSONATE (no Type da mensagem).
+const ALLOW_IMPERSONATION: u32 = 0x1_0000;
+const LPC_NO_IMPERSONATE: u16 = 0x4000;
+
+/// AlpcpImpersonateMessage: a mensagem `id` precisa já ter sido recebida e
+/// não trazer LPC_NO_IMPERSONATE (STATUS_ACCESS_DENIED). Com o contexto de
+/// segurança que o cliente mandou (o atributo de segurança), o token dele;
+/// senão a porta do cliente precisa de ALLOW_IMPERSONATION, e o
+/// rastreamento estático usa o contexto capturado na conexão, o dinâmico a
+/// thread que enviou e espera a resposta (o SeCreateClientSecurity com a
+/// qualidade da porta do cliente; sem thread esperando, STATUS_ACCESS_DENIED).
+fn impersonate_message(port: &Arc<Port>, id: u32, requested: Option<u32>) -> Result<u32, KernelError> {
+    let Some(origin) = server::sender_of(port, id) else { return Ok(STATUS_ALPC_MESSAGE_NOT_FOUND) };
+    if !origin.received || origin.message_type & LPC_NO_IMPERSONATE != 0 {
+        return Ok(STATUS_ACCESS_DENIED);
+    }
+    if let Some((token, level, effective_only)) = server::received_security(port, id) {
+        let status = match requested {
+            Some(requested) if requested > level => Ok(STATUS_ACCESS_DENIED),
+            requested => ps_security::impersonate_client(process::get_current_thread(), token, true, effective_only, requested.unwrap_or(level)),
+        };
+        let _ = crate::ntos::se::token::tokens::release(token);
+        return status;
+    }
+    let Some(client) = port_objects::port_of(origin.client) else { return Ok(STATUS_ACCESS_DENIED) };
+    let (flags, quality, connected) = client.with(|state| (state.port_flags, state.security_quality.unwrap_or(DEFAULT_QUALITY), state.client_security.clone()));
+    if flags & ALLOW_IMPERSONATION == 0 {
+        return Ok(STATUS_ACCESS_DENIED);
+    }
+    if quality.tracking == 0 {
+        if let Some(connected) = connected {
+            return impersonate_identity(&connected, requested);
+        }
+    }
+    let thread = origin.sender.thread_pointer;
+    if !origin.waiting || thread == 0 || requested.is_some_and(|requested| requested > quality.level) {
+        return Ok(STATUS_ACCESS_DENIED);
+    }
+    impersonate_thread(thread, Quality { level: requested.unwrap_or(quality.level), ..quality })
+}
+
+/// NtAlpcImpersonateClientOfPort sem mensagem: o contexto estático
+/// capturado na conexão do cliente ligado à porta de comunicação (a porta do
+/// cliente precisa de ALLOW_IMPERSONATION e do rastreamento estático; senão,
+/// STATUS_ACCESS_DENIED), pelo SeImpersonateClientEx.
+fn impersonate_connection(port: &Arc<Port>, requested: Option<u32>) -> Result<u32, KernelError> {
+    let Some(client) = server::connected_client(port) else { return Ok(STATUS_ACCESS_DENIED) };
+    let (flags, quality, connected) = client.with(|state| (state.port_flags, state.security_quality.unwrap_or(DEFAULT_QUALITY), state.client_security.clone()));
+    match connected {
+        Some(connected) if flags & ALLOW_IMPERSONATION != 0 && quality.tracking == 0 => impersonate_identity(&connected, requested),
+        _ => Ok(STATUS_ACCESS_DENIED),
+    }
+}
+
+/// A impersonação de um contexto capturado, no nível dele ou no pedido (que
+/// não pode passar dele).
+fn impersonate_identity(identity: &crate::ntos::alpc::security_contexts::ClientIdentity, requested: Option<u32>) -> Result<u32, KernelError> {
+    match requested {
+        Some(requested) if requested > identity.level => Ok(STATUS_ACCESS_DENIED),
+        requested => ps_security::impersonate_client(process::get_current_thread(), identity.token, true, identity.effective_only, requested.unwrap_or(identity.level)),
+    }
 }
 
 /// SeCreateClientSecurity da thread do cliente com a qualidade dada e

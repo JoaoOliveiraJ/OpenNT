@@ -77,6 +77,10 @@ pub struct RequestState {
     pub delivered: bool,
     pub polling: bool,
     pub sender: Sender,
+    /// Os bits altos do Type que o remetente deu e que a mensagem conserva
+    /// (AlpcpSendMessage: Type & 0xEF00 em KernelMode, & 0x6F00 em UserMode,
+    /// sem o LPC_KERNELMODE_MESSAGE de modo usuário).
+    pub type_bits: u16,
     pub job: Option<Box<dyn Job>>,
     /// Conexão: decisão do servidor (status e PORT_MESSAGE de resposta).
     pub connect_result: Option<(u32, Option<Vec<u8>>)>,
