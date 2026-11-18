@@ -7,6 +7,7 @@
 
 pub mod avl;
 pub mod bitmap;
+pub mod dynamic_function_table;
 pub mod crt;
 pub mod image;
 pub mod extended_context;

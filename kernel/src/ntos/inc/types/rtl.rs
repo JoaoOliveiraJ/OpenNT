@@ -1499,3 +1499,134 @@ const _: () = {
     assert!(core::mem::offset_of!(RtlDynamicTimeZoneInformation, time_zone_key_name) == 0xac);
     assert!(core::mem::offset_of!(RtlDynamicTimeZoneInformation, dynamic_daylight_time_disabled) == 0x1ac);
 };
+
+/// `_INVERTED_FUNCTION_TABLE` (0x1810 bytes).
+#[repr(C)]
+pub struct InvertedFunctionTable {
+    pub current_size: Field<u32>,
+    pub maximum_size: Field<u32>,
+    pub epoch: Field<u32>,
+    pub overflow: Field<u8>,
+    _pad_d: Reserved<0x3>,
+    pub table_entry: [InvertedFunctionTableEntry; 256],
+}
+
+unsafe impl NtStruct for InvertedFunctionTable {}
+
+const _: () = {
+    assert!(core::mem::size_of::<InvertedFunctionTable>() == 0x1810);
+    assert!(core::mem::offset_of!(InvertedFunctionTable, current_size) == 0x0);
+    assert!(core::mem::offset_of!(InvertedFunctionTable, maximum_size) == 0x4);
+    assert!(core::mem::offset_of!(InvertedFunctionTable, epoch) == 0x8);
+    assert!(core::mem::offset_of!(InvertedFunctionTable, overflow) == 0xc);
+    assert!(core::mem::offset_of!(InvertedFunctionTable, table_entry) == 0x10);
+};
+
+/// `_INVERTED_FUNCTION_TABLE_ENTRY` (0x18 bytes).
+///
+/// Membros sobrepostos (uniões anônimas do C) ficam nas vistas
+/// `InvertedFunctionTableEntryView1`, alcançada por `Deref`.
+#[repr(C)]
+pub struct InvertedFunctionTableEntry {
+    /// -> `_IMAGE_RUNTIME_FUNCTION_ENTRY`
+    pub function_table: Field<u64>,
+    /// -> `void`
+    pub image_base: Field<u64>,
+    pub size_of_image: Field<u32>,
+    pub size_of_table: Field<u32>,
+}
+
+/// Vista 1 de `_INVERTED_FUNCTION_TABLE_ENTRY` (membros sobrepostos à vista anterior).
+#[repr(C)]
+pub struct InvertedFunctionTableEntryView1 {
+    /// -> `_DYNAMIC_FUNCTION_TABLE`
+    pub dynamic_table: Field<u64>,
+    _pad_8: Reserved<0x10>,
+}
+
+impl core::ops::Deref for InvertedFunctionTableEntry {
+    type Target = InvertedFunctionTableEntryView1;
+    #[inline(always)]
+    fn deref(&self) -> &InvertedFunctionTableEntryView1 {
+        // SAFETY: vistas do mesmo objeto, mesmo tamanho e alinhamento, só de células.
+        unsafe { &*(self as *const Self).cast::<InvertedFunctionTableEntryView1>() }
+    }
+}
+
+unsafe impl NtStruct for InvertedFunctionTableEntry {}
+
+const _: () = {
+    assert!(core::mem::size_of::<InvertedFunctionTableEntry>() == 0x18);
+    assert!(core::mem::offset_of!(InvertedFunctionTableEntry, function_table) == 0x0);
+    assert!(core::mem::offset_of!(InvertedFunctionTableEntry, image_base) == 0x8);
+    assert!(core::mem::offset_of!(InvertedFunctionTableEntry, size_of_image) == 0x10);
+    assert!(core::mem::offset_of!(InvertedFunctionTableEntry, size_of_table) == 0x14);
+    assert!(core::mem::size_of::<InvertedFunctionTableEntryView1>() == 0x18);
+    assert!(core::mem::align_of::<InvertedFunctionTableEntryView1>() == core::mem::align_of::<InvertedFunctionTableEntry>());
+    assert!(core::mem::offset_of!(InvertedFunctionTableEntryView1, dynamic_table) == 0x0);
+};
+
+/// `_DYNAMIC_FUNCTION_TABLE` (0x88 bytes).
+#[repr(C)]
+pub struct DynamicFunctionTable {
+    pub list_entry: ListEntry,
+    /// -> `_IMAGE_RUNTIME_FUNCTION_ENTRY`
+    pub function_table: Field<u64>,
+    pub time_stamp: LargeInteger,
+    pub minimum_address: Field<u64>,
+    pub maximum_address: Field<u64>,
+    pub base_address: Field<u64>,
+    /// -> `fn`
+    pub callback: Field<u64>,
+    /// -> `void`
+    pub context: Field<u64>,
+    /// -> `u16`
+    pub out_of_process_callback_dll: Field<u64>,
+    pub type_: Field<FunctionTableType>,
+    pub entry_count: Field<u32>,
+    pub tree_node_min: RtlBalancedNode,
+    pub tree_node_max: RtlBalancedNode,
+}
+
+unsafe impl NtStruct for DynamicFunctionTable {}
+
+const _: () = {
+    assert!(core::mem::size_of::<DynamicFunctionTable>() == 0x88);
+    assert!(core::mem::offset_of!(DynamicFunctionTable, list_entry) == 0x0);
+    assert!(core::mem::offset_of!(DynamicFunctionTable, function_table) == 0x10);
+    assert!(core::mem::offset_of!(DynamicFunctionTable, time_stamp) == 0x18);
+    assert!(core::mem::offset_of!(DynamicFunctionTable, minimum_address) == 0x20);
+    assert!(core::mem::offset_of!(DynamicFunctionTable, maximum_address) == 0x28);
+    assert!(core::mem::offset_of!(DynamicFunctionTable, base_address) == 0x30);
+    assert!(core::mem::offset_of!(DynamicFunctionTable, callback) == 0x38);
+    assert!(core::mem::offset_of!(DynamicFunctionTable, context) == 0x40);
+    assert!(core::mem::offset_of!(DynamicFunctionTable, out_of_process_callback_dll) == 0x48);
+    assert!(core::mem::offset_of!(DynamicFunctionTable, type_) == 0x50);
+    assert!(core::mem::offset_of!(DynamicFunctionTable, entry_count) == 0x54);
+    assert!(core::mem::offset_of!(DynamicFunctionTable, tree_node_min) == 0x58);
+    assert!(core::mem::offset_of!(DynamicFunctionTable, tree_node_max) == 0x70);
+};
+
+/// `_FUNCTION_TABLE_TYPE`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(transparent)]
+pub struct FunctionTableType(pub i32);
+
+impl FunctionTableType {
+    pub const RF_SORTED: Self = Self(0);
+    pub const RF_UNSORTED: Self = Self(1);
+    pub const RF_CALLBACK: Self = Self(2);
+    pub const RF_KERNEL_DYNAMIC: Self = Self(3);
+}
+
+impl GuestScalar for FunctionTableType {
+    const SIZE: u64 = 4;
+    #[inline(always)]
+    fn from_bits(bits: u64) -> Self {
+        Self(bits as u32 as i32)
+    }
+    #[inline(always)]
+    fn to_bits(self) -> u64 {
+        self.0 as u32 as u64
+    }
+}

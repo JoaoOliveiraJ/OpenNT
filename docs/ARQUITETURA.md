@@ -1178,6 +1178,23 @@ além da KUSER_SHARED_DATA:
     working set. Uma escrita do kernel pelo mapa direto (a cópia do
     NtWriteVirtualMemory para outro processo) não aparece.
   - Teste: `ntos/test/user_jit_memory.rs`.
+- **Tabelas de funções dinâmicas** (`rtl/dynamic_function_table.rs`): o
+  RtlAddGrowableFunctionTable da ntdll, com que o JIT do d3d10warp registra
+  o unwind de cada bloco, chama o NtSetInformationProcess(NtCurrentProcess(),
+  ProcessDynamicFunctionTableInformation = 53) com o {Table, Remove} de 16
+  bytes (`ps/set_process_information.rs::set_dynamic_function_table`: outro
+  handle é STATUS_INVALID_PARAMETER, outro tamanho
+  STATUS_INFO_LENGTH_MISMATCH). O RtlInsertDynamicFunctionTable e o
+  RtlRemoveDynamicFunctionTable mantêm o INVERTED_FUNCTION_TABLE do
+  EPROCESS.InvertedFunctionTable (pool 'RtDF' com quota, crescendo de 10 em
+  10 entradas, sob o InvertedFunctionTableLock numa região guardada): faixas
+  ordenadas pela base a partir da entrada 1, sobreposição dá
+  STATUS_CONFLICTING_ADDRESSES, faixa invertida ou acima de 4 GB
+  STATUS_INTEGER_OVERFLOW, retirada sem a mesma base e o mesmo tamanho
+  STATUS_BAD_FUNCTION_TABLE. A busca do RtlpLookupUserFunctionTable
+  (`lookup`) é a parte do kernel no desenrolamento de pilhas de usuário; o
+  fim do processo libera o vetor. Teste:
+  `ntos/test/dynamic_function_tables.rs`.
 - **O que o kernel monta para o processo** também sai do alocador: a pilha da
   primeira thread é uma alocação de baixo para cima (fica abaixo de 4 GB
   num processo novo); PEB, TEB, parâmetros, entradas do Ldr e as regiões

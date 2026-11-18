@@ -93,6 +93,14 @@ pub fn with_critical<T>(body: impl FnOnce() -> Result<T, KernelError>) -> Result
     result
 }
 
+/// Região guardada com saída garantida, mesmo quando o corpo falha.
+pub fn with_guarded<T>(body: impl FnOnce() -> Result<T, KernelError>) -> Result<T, KernelError> {
+    enter_guarded()?;
+    let result = body();
+    leave_guarded()?;
+    result
+}
+
 /// Instala a consulta de desabilitação usada pela entrega de APCs.
 pub fn init() {
     apc::register_disabled_provider(|special| if special { all_disabled() } else { disabled() });

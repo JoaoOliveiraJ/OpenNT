@@ -1032,6 +1032,9 @@ fn nt_set_information_process(handle: u64, class: u64, buffer: u64, length: u64,
     }
     // As classes que mudam o EPROCESS (`ps/set_process_information`).
     use crate::ntos::ps::set_process_information as set_process;
+    if class as u32 == set_process::PROCESS_DYNAMIC_FUNCTION_TABLE_INFORMATION {
+        return set_process::set_dynamic_function_table(1, handle, buffer, length as u32);
+    }
     if set_process::CLASSES.contains(&(class as u32)) {
         return set_process::set_information(1, class as u32, buffer, length as u32, |access| {
             if handle as u32 == u32::MAX {

@@ -69,6 +69,11 @@
 //! - ProcessEnergyTrackingState (82): pelo menos 8 bytes, o estado vai ao
 //!   PoSetProcessEnergyTrackingState (`po/power_information`), que sem o
 //!   estimador de energia responde STATUS_NOT_SUPPORTED.
+//! - ProcessDynamicFunctionTableInformation (53): o {Table, Remove} de 16
+//!   bytes do RtlAddGrowableFunctionTable e do RtlDeleteGrowableFunctionTable
+//!   da ntdll, só com o pseudo-handle do processo corrente; a tabela entra
+//!   ou sai do registro do processo (`rtl/dynamic_function_table`). Não há
+//!   consulta: o NtQueryInformationProcess responde STATUS_INVALID_INFO_CLASS.
 //!
 //! Em UserMode, antes da classe, o buffer passa pelo ProbeForRead com o
 //! alinhamento da classe (STATUS_DATATYPE_MISALIGNMENT,
@@ -83,6 +88,7 @@ use crate::ntos::ke::critical_region;
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::ob::handles::process as process_handles;
 use crate::ntos::ps::{query_process, user_probe};
+use crate::ntos::rtl::dynamic_function_table;
 use crate::rtl::KernelError;
 
 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
@@ -123,6 +129,10 @@ pub const PROCESS_RAISE_UM_EXCEPTION_ON_INVALID_HANDLE_CLOSE: u32 = 71;
 /// ProcessSubsystemProcess (sem buffer) e ProcessEnergyTrackingState.
 pub const PROCESS_SUBSYSTEM_PROCESS: u32 = 68;
 pub const PROCESS_ENERGY_TRACKING_STATE: u32 = 82;
+/// ProcessDynamicFunctionTableInformation (o {Table, Remove} de 16 bytes),
+/// tratada à parte por depender do valor do handle
+/// ([`set_dynamic_function_table`]).
+pub const PROCESS_DYNAMIC_FUNCTION_TABLE_INFORMATION: u32 = 53;
 /// As classes desta área.
 pub const CLASSES: [u32; 11] = [PROCESS_BASE_PRIORITY, PROCESS_EXCEPTION_PORT, PROCESS_DEFAULT_HARD_ERROR_MODE, PROCESS_PRIORITY_CLASS, PROCESS_FOREGROUND_INFORMATION, PROCESS_BREAK_ON_TERMINATION, PROCESS_DEBUG_FLAGS, PROCESS_HANDLE_CHECKING_MODE, PROCESS_RAISE_UM_EXCEPTION_ON_INVALID_HANDLE_CLOSE, PROCESS_SUBSYSTEM_PROCESS, PROCESS_ENERGY_TRACKING_STATE];
 /// EPROCESS.Flags3.SubsystemProcess.
@@ -485,6 +495,9 @@ pub fn set_information(mode: u8, class: u32, buffer: u64, length: u32, process_o
 /// KernelMode: o pseudo-handle do processo corrente e os handles de kernel) e
 /// solto no fim.
 pub fn set_information_kernel(handle: u64, class: u32, buffer: u64, length: u32) -> Result<u32, KernelError> {
+    if class == PROCESS_DYNAMIC_FUNCTION_TABLE_INFORMATION {
+        return set_dynamic_function_table(0, handle, buffer, length);
+    }
     let mut referenced = 0u64;
     let mut failure: Result<(), KernelError> = Ok(());
     let status = set_information(0, class, buffer, length, |access| match query_process::reference_process(handle, access) {
@@ -503,6 +516,41 @@ pub fn set_information_kernel(handle: u64, class: u32, buffer: u64, length: u32)
     }
     failure?;
     status
+}
+
+/// O ramo da classe 53 do NtSetInformationProcess 19041 (rva 0x65abf2): em
+/// UserMode o ProbeForRead de alinhamento 8 do começo do serviço; depois só
+/// o pseudo-handle do processo corrente (o valor -1, sem referenciar nada;
+/// outro handle é STATUS_INVALID_PARAMETER), exatamente 16 bytes
+/// (STATUS_INFO_LENGTH_MISMATCH), a captura do {Table, Remove} (uma falha
+/// devolve o código da exceção) e o RtlRemoveDynamicFunctionTable ou o
+/// RtlInsertDynamicFunctionTable, cujo status volta.
+pub fn set_dynamic_function_table(mode: u8, handle: u64, buffer: u64, length: u32) -> Result<u32, KernelError> {
+    if mode != 0 {
+        if let Err(status) = probe_input(PROCESS_DYNAMIC_FUNCTION_TABLE_INFORMATION, buffer, length) {
+            return Ok(status);
+        }
+    }
+    if handle != u64::MAX {
+        return Ok(STATUS_INVALID_PARAMETER);
+    }
+    if length != 16 {
+        return Ok(STATUS_INFO_LENGTH_MISMATCH);
+    }
+    let (table, remove) = if mode != 0 {
+        match (guest::try_read::<u64>(buffer), guest::try_read::<u8>(buffer + 8)) {
+            (Ok(table), Ok(remove)) => (table, remove),
+            (Err(error), _) | (_, Err(error)) => return Ok(error.status),
+        }
+    } else {
+        // SAFETY: buffer de entrada de um chamador de modo kernel.
+        unsafe { (Field::<u64>::at(buffer).get(), Field::<u8>::at(buffer + 8).get()) }
+    };
+    if remove != 0 {
+        dynamic_function_table::remove(table)
+    } else {
+        dynamic_function_table::insert(table)
+    }
 }
 
 /// O tipo da mensagem que avisa a porta de exceções trocada.
@@ -603,6 +651,7 @@ fn release_exception_port(process: u64) {
 
 pub fn init() {
     crate::ntos::ps::process::register_process_exit_routine(release_exception_port);
+    crate::ntos::ps::process::register_process_exit_routine(dynamic_function_table::release);
 }
 
 /// PspSetProcessPriorityClass(Process, PriorityClass, PreviousMode): grava
