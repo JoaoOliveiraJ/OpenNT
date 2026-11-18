@@ -11,17 +11,18 @@
 //!
 //! Como os binários de System32, as chaves vêm desta máquina no build, com os
 //! valores daqui: as chaves de serviço desses quatro e as do PlugPlay, do
-//! Power, do BrokerInfrastructure e do SystemEventsBroker (com Parameters e
-//! Security), a ordem dos grupos de serviço (`Control\ServiceGroupOrder`),
-//! os dois valores de `Control` que o services.exe lê no início automático
-//! (o `EarlyStartServices`, a lista do conjunto inicial, e o
-//! `SvcHostSplitThresholdInKB`, o limite de memória para separar os
-//! serviços de um svchost em processos próprios),
+//! Power, do BrokerInfrastructure, do SystemEventsBroker e do registrador
+//! do CoreMessaging (com Parameters e Security), a ordem dos grupos de
+//! serviço (`Control\ServiceGroupOrder`), os dois valores de `Control` que
+//! o services.exe lê no início automático (o `EarlyStartServices`, a lista
+//! do conjunto inicial, e o `SvcHostSplitThresholdInKB`, o limite de
+//! memória para separar os serviços de um svchost em processos próprios),
 //! a configuração de energia (`Control\Power`), as definições WNF
 //! (`Control\Notifications`), as opções do produto (`Control\ProductOptions`)
-//! e,
-//! na SOFTWARE, os grupos do svchost (`Microsoft\Windows NT\CurrentVersion\
-//! Svchost`, os valores com a lista de serviços de cada grupo, e
+//! e, na SOFTWARE, os grupos do svchost (`Microsoft\Windows NT\CurrentVersion\
+//! Svchost`, os valores com a lista de serviços de cada grupo e a subchave do
+//! `LocalServiceNoNetwork`), os descritores das portas de nome transitório
+//! (`Microsoft\SecurityManager\TransientObjects`),
 //! `Microsoft\Rpc\SecurityService`, os provedores de autenticação do RPC, e
 //! os valores de `Microsoft\Windows NT\CurrentVersion\WUDF` e da
 //! `ProfileList`, só com os perfis das contas de serviço).
@@ -38,8 +39,14 @@ use crate::host_language::HostKey;
 /// Os serviços da cadeia do LSM e os do mesmo svchost do DcomLaunch que o
 /// início automático sobe com ele: o PlugPlay (o umpnpmgr.dll) e o Power (o
 /// umpo.dll), que o ScAutoStartServices inicia pelo nome, nessa ordem, antes
-/// dos outros, o BrokerInfrastructure e o SystemEventsBroker.
-const SERVICES: &[&str] = &["DcomLaunch", "RpcEptMapper", "RpcSs", "LSM", "PlugPlay", "Power", "BrokerInfrastructure", "SystemEventsBroker"];
+/// dos outros, o BrokerInfrastructure e o SystemEventsBroker. E o
+/// registrador do CoreMessaging (CoreMessagingRegistrar, o coremessaging.dll
+/// no `svchost.exe -k LocalServiceNoNetwork -p` com a conta LocalService,
+/// início automático depois do rpcss): toda sessão CoreUI do dwm.exe e do
+/// LogonUI conecta por ALPC à porta `\BaseNamedObjects\CoreMessagingRegistrar`
+/// dele e, sem a porta, abre o serviço pelo SCM para iniciá-lo; um serviço
+/// que não existe é um FailFast.
+const SERVICES: &[&str] = &["DcomLaunch", "RpcEptMapper", "RpcSs", "LSM", "PlugPlay", "Power", "BrokerInfrastructure", "SystemEventsBroker", "CoreMessagingRegistrar"];
 
 /// Os valores de `Control` que o services.exe lê: o EarlyStartServices (o
 /// ScStartEarlySetOfServices; sem ele todo serviço automático entra no
@@ -134,6 +141,14 @@ pub fn software_keys() -> Vec<HostKey> {
     {
         use crate::host_language::registry;
         registry::copy(registry::LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Svchost", "Microsoft\\Windows NT\\CurrentVersion\\Svchost", false, &mut keys);
+        // A configuração do grupo do registrador do CoreMessaging (o
+        // CoInitializeSecurityParam e a política de desempacotamento que o
+        // svchost lê ao subir o grupo) e os descritores de segurança dos
+        // objetos de nome transitório, que o sechost lê ao criar as portas
+        // ALPC do registrador (WM_RegistrarServer e WM_SystemWindowIDManager),
+        // da API do compositor e da entrada.
+        registry::copy(registry::LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Svchost\\LocalServiceNoNetwork", "Microsoft\\Windows NT\\CurrentVersion\\Svchost\\LocalServiceNoNetwork", true, &mut keys);
+        registry::copy(registry::LOCAL_MACHINE, "SOFTWARE\\Microsoft\\SecurityManager\\TransientObjects", "Microsoft\\SecurityManager\\TransientObjects", true, &mut keys);
         // Os provedores de autenticação do RPC (o número do serviço de
         // autenticação e o DLL dele: 9, 10 e 16 no sspicli.dll, 14 no
         // schannel.dll, 68 no netlogon.dll), que o RpcGetSecurityProviderInfo

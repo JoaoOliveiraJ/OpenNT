@@ -3759,10 +3759,12 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   Microsoft.Windows.Common-Controls 6.0 (as chaves, os manifestos e os
   arquivos que eles listam, como o comctl32.dll da versão 6,
   `xtask/src/side_by_side.rs`); o services.exe lê as chaves de serviço da
-  cadeia do LSM (DcomLaunch, RpcEptMapper, RpcSs e LSM) e as do PlugPlay e
-  do Power, que ele inicia pelo nome antes dos outros, o
-  Control\ServiceGroupOrder, os valores EarlyStartServices e
-  SvcHostSplitThresholdInKB de Control (o conjunto inicial e a separação
+  cadeia do LSM (DcomLaunch, RpcEptMapper, RpcSs e LSM), as do PlugPlay e
+  do Power, que ele inicia pelo nome antes dos outros, e a do registrador
+  do CoreMessaging (CoreMessagingRegistrar, que toda sessão CoreUI do
+  dwm.exe e do LogonUI exige, com os `SecurityManager\TransientObjects` das
+  portas dele), o Control\ServiceGroupOrder, os valores EarlyStartServices
+  e SvcHostSplitThresholdInKB de Control (o conjunto inicial e a separação
   dos serviços de um svchost) e os grupos do svchost
   (`xtask/src/user_services.rs`). A tela de logon da sessão 1 leva o fecho
   de imports do dwm.exe e do LogonUI.exe com o XAML e os provedores de
