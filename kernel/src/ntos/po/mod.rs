@@ -8,6 +8,7 @@ pub mod fx;
 pub mod black_box;
 pub mod power_information;
 pub mod display_state;
+pub mod user_presence;
 pub mod exports;
 pub mod coalescing;
 pub mod device_wake;

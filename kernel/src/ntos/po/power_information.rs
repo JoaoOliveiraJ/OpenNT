@@ -9,7 +9,9 @@
 //! (PowerSettingNotificationName), 59 (GetPowerSettingValue), 66
 //! (PlatformInformation) e 75 (PlatformRole) têm o mesmo corpo nos dois
 //! modos (`level_answer`), como o 42 (SessionDisplayState, o aviso de tela
-//! do win32k), que o modo usuário não alcança; o 87
+//! do win32k), o 61 (SessionRITState) e o 62 (SessionConnectNotification),
+//! a entrada e a conexão da sessão (`po/user_presence.rs`), que o modo
+//! usuário não alcança; o 87
 //! (PowerInformationInternal) só é atendido de modo usuário. Os demais
 //! níveis de modo kernel devolvem STATUS_INVALID_PARAMETER.
 
@@ -18,7 +20,7 @@ use core::sync::atomic::AtomicU8;
 
 use crate::ntos::inc::types::{NtStruct, SystemPowerCapabilities};
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::po::{black_box, boot_status, display_state, power_setting};
+use crate::ntos::po::{black_box, boot_status, display_state, power_setting, user_presence};
 use crate::rtl::KernelError;
 
 const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
@@ -74,6 +76,10 @@ fn session_power_init(input: u64, output: u64, output_length: u32) -> u32 {
 /// da tela, `po/display_state.rs`).
 const SYSTEM_VIDEO_STATE: u32 = 29;
 const SESSION_DISPLAY_STATE: u32 = 42;
+/// POWER_INFORMATION_LEVEL SessionRITState e SessionConnectNotification (a
+/// entrada e a conexão da sessão, `po/user_presence.rs`).
+const SESSION_RIT_STATE: u32 = 61;
+const SESSION_CONNECT_NOTIFICATION: u32 = 62;
 
 /// SessionPowerCleanup (0x6f17c4): sem entrada nem saída; o
 /// PopFreeSessionState da sessão corrente. O OpenNT não guarda estado de
@@ -98,7 +104,7 @@ pub fn query(level: u32, input: u64, input_length: u32, output: u64, output_leng
     if level == SESSION_POWER_CLEANUP {
         return Ok(session_power_cleanup(input, output));
     }
-    if !matches!(level, SYSTEM_POWER_CAPABILITIES | SYSTEM_BATTERY_STATE | SYSTEM_VIDEO_STATE | SESSION_DISPLAY_STATE | POWER_SETTING_NOTIFICATION_NAME | GET_POWER_SETTING_VALUE | PLATFORM_INFORMATION | PLATFORM_ROLE) {
+    if !matches!(level, SYSTEM_POWER_CAPABILITIES | SYSTEM_BATTERY_STATE | SYSTEM_VIDEO_STATE | SESSION_DISPLAY_STATE | POWER_SETTING_NOTIFICATION_NAME | GET_POWER_SETTING_VALUE | PLATFORM_INFORMATION | PLATFORM_ROLE | SESSION_RIT_STATE | SESSION_CONNECT_NOTIFICATION) {
         return Ok(STATUS_INVALID_PARAMETER);
     }
     let input_length = if input == 0 { 0 } else { input_length };
@@ -258,6 +264,18 @@ fn level_answer(level: u32, input: &[u8], output_length: u32) -> Result<Answer, 
             }
             display_state::session_display_state(input)?;
             Answer::Data(Vec::new())
+        }
+        // SessionRITState (0x6f0ee4) e SessionConnectNotification (0x6f1108),
+        // só de modo kernel: entrada de exatamente 8 e 2 bytes e saída de
+        // exatamente 8 ({InputTimeout, DisplayTimeout} em segundos), da
+        // sessão de quem chama (PsGetProcessSessionIdEx).
+        SESSION_RIT_STATE | SESSION_CONNECT_NOTIFICATION => {
+            let expected = if level == SESSION_RIT_STATE { user_presence::SESSION_RIT_STATE_INPUT } else { user_presence::SESSION_CONNECT_INPUT };
+            if input.len() != expected || output_length != 8 {
+                return Ok(Answer::Status(STATUS_INVALID_PARAMETER));
+            }
+            let session = crate::ntos::mm::session::session_id_ex(crate::ntos::ps::process::get_current_process());
+            Answer::Data(if level == SESSION_RIT_STATE { user_presence::session_input_change(session, input) } else { user_presence::session_connection_change(session, input) })
         }
         // PowerSettingNotificationName (0x6f0bed): com saída de exatamente 8
         // bytes (o WNF_STATE_NAME) e entrada, se houver, de exatamente 0x14

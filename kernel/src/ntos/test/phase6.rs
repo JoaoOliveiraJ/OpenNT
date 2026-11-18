@@ -15990,6 +15990,7 @@ pub fn run(assert: Assert) {
     super::import_cycle::run(assert);
     super::session_driver_support::run(assert);
     super::power_setting_notify::run(assert);
+    super::session_user_presence::run(assert);
     ntoskrnl_exports(assert);
     ntoskrnl_small_groups(assert);
     native_context_execution(assert);

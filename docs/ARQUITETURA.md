@@ -2949,7 +2949,17 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   19041 (níveis só de kernel recusados, privilégio para entrada fora da
   lista sem privilégio, entrada capturada, saída sondada e o fim comum de
   cópia); os níveis 4, 5, 29, 58, 59, 66 e 75 têm o mesmo corpo de modo
-  kernel e de usuário. O nível 4 é o PopCapabilities de um desktop S0/S5
+  kernel e de usuário. Os níveis 61 (SessionRITState) e 62
+  (SessionConnectNotification), só de modo kernel, são a entrada e a
+  conexão da sessão que o win32kbase informa (`po/user_presence.rs`): a
+  conexão do console liga GUID_SESSION_DISPLAY_STATUS da sessão e a torna
+  a sessão do console; a conexão e a entrada ativa deixam a sessão
+  PowerUserPresent, a entrada passiva e a desconexão PowerUserInactive, em
+  GUID_SESSION_USER_PRESENCE da sessão; GUID_GLOBAL_USER_PRESENCE é
+  PowerUserPresent com alguma sessão presente e muda junto com
+  WNF_PO_SLEEP_STUDY_USER_PRESENCE_CHANGED. Os timeouts de entrada e de
+  tela que os dois devolvem ficam zero, porque os callbacks internos do Po
+  que os gravam não são registrados. O nível 4 é o PopCapabilities de um desktop S0/S5
   (0x4c bytes, só o botão de energia, o S5, o FullWake e o DiskSpinDown), o
   5 é o estado composto sem bateria (AcOnLine) e o 29 (SystemVideoState,
   que o CProcessStateManager do LogonUI pede antes de subir o servidor RPC)
@@ -3948,7 +3958,8 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   bloco do heap da sessão e volta no free), o MmPageEntireDriver de uma
   imagem de sessão (só a DllBase), as listas LOOKASIDE_LIST_EX (o
   AllocateEx e o FreeEx recebem a lista) e o ZwPowerInformation de
-  SessionPowerInit (41), SessionPowerCleanup (63) e SystemVideoState (29).
+  SessionPowerInit (41), SessionPowerCleanup (63), SystemVideoState (29),
+  SessionRITState (61) e SessionConnectNotification (62).
   O marcador `WIN32K_LOADED` (`initial_process::session_driver_initialized`)
   sai quando o DriverEntry volta STATUS_SUCCESS com a tabela 1 do
   KeServiceDescriptorTableShadow e os callouts no lugar. Com

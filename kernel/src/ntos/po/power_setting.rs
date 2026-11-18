@@ -18,6 +18,9 @@
 //!   com AC = PoAc (0) e DC = PoDc (1); o PopUpdateConsoleDisplayState grava
 //!   GUID_CONSOLE_DISPLAY_STATE e GUID_MONITOR_POWER_ON, e o SessionDisplayState
 //!   do win32k, GUID_SESSION_DISPLAY_STATUS da sessão (`po/display_state.rs`).
+//!   A conexão e a entrada da sessão (os níveis 61 e 62 do win32k,
+//!   `po/user_presence.rs`) gravam GUID_SESSION_DISPLAY_STATUS e
+//!   GUID_SESSION_USER_PRESENCE da sessão e GUID_GLOBAL_USER_PRESENCE.
 //!   Os valores vêm em blocos {ChangeStamp, dados}: um valor igual ao do slot
 //!   não muda nada; igual ao de outro slot da mesma configuração, reaproveita
 //!   aquele bloco; senão o bloco novo recebe o próximo
@@ -131,6 +134,9 @@ const SESSION_SPECIFIC_GUIDS: [[u8; 16]; 2] = [GUID_SESSION_DISPLAY_STATUS, GUID
 pub const GUID_CONSOLE_DISPLAY_STATE: [u8; 16] = guid(0x6fe6_9556, 0x704a, 0x47a0, [0x8f, 0x24, 0xc2, 0x8d, 0x93, 0x6f, 0xda, 0x47]);
 /// GUID_MONITOR_POWER_ON {02731015-4510-4526-99e6-e5a17ebd1aea}.
 pub const GUID_MONITOR_POWER_ON: [u8; 16] = guid(0x0273_1015, 0x4510, 0x4526, [0x99, 0xe6, 0xe5, 0xa1, 0x7e, 0xbd, 0x1a, 0xea]);
+/// GUID_GLOBAL_USER_PRESENCE {786e8a1d-b427-4344-9207-09e70bdcbea9}: a
+/// presença do usuário da máquina (o PopEvaluateGlobalUserStatus).
+pub const GUID_GLOBAL_USER_PRESENCE: [u8; 16] = guid(0x786e_8a1d, 0xb427, 0x4344, [0x92, 0x07, 0x09, 0xe7, 0x0b, 0xdc, 0xbe, 0xa9]);
 /// GUID_IDLE_BACKGROUND_TASK {515c31d8-f734-163d-a0fd-11a08c91e8f1} e
 /// GUID_BACKGROUND_TASK_NOTIFICATION {cf23f240-2a54-48d8-b114-de1518ff052e}:
 /// o registro já começa com o valor corrente (sem callback inicial).
@@ -497,6 +503,15 @@ pub fn set_session_display_status(session: u32, state: u32) {
     let data = state.to_le_bytes();
     set_value(&GUID_SESSION_DISPLAY_STATUS, session, SLOT_AC, &data);
     set_value(&GUID_SESSION_DISPLAY_STATUS, session, SLOT_DC, &data);
+}
+
+/// O par de PopSetPowerSettingValue do PopSetSessionUserStatus (0x725574 e
+/// 0x725596): o USER_ACTIVITY_PRESENCE da sessão em
+/// GUID_SESSION_USER_PRESENCE, AC e DC (`po/user_presence.rs`).
+pub fn set_session_user_presence(session: u32, status: u32) {
+    let data = status.to_le_bytes();
+    set_value(&GUID_SESSION_USER_PRESENCE, session, SLOT_AC, &data);
+    set_value(&GUID_SESSION_USER_PRESENCE, session, SLOT_DC, &data);
 }
 
 /// PopSetNewPolicyValue (0x6f33c0): um valor de política que o serviço Power

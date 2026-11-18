@@ -4,8 +4,10 @@
 //! fim do arquivo, os estados legados (PoSetSystemState/PoRegisterSystemState),
 //! o botão de energia segurado e as fontes fixas de wake.
 //!
-//! - PoSetUserPresent(Presence): o PopSetSystemState(ES_USER_PRESENT) sob
-//!   a trava da política; o último valor fica como o estado de presença.
+//! - PoSetUserPresent(Reason): o PopSetSystemState(ES_USER_PRESENT, Reason)
+//!   sob a trava da política; o Reason é o POWER_MONITOR_REQUEST_REASON do
+//!   win32kfull (KeepMachineUp), o pedido de ligar a tela do console, não a
+//!   presença do usuário (`po/user_presence.rs`); o último fica registrado.
 //! - PoLatencySensitivityHint(Priority): no NT só age com um perfil PPM que
 //!   peça impulso de latência; o OpenNT não tem gerenciamento de desempenho
 //!   do processador, então só a última dica e o instante dela ficam
@@ -68,7 +70,7 @@ pub fn register_user_services() {
     crate::ntos::ps::user::state::register_handler("NtIsSystemResumeAutomatic", nt_is_system_resume_automatic);
 }
 
-/// O último USER_ACTIVITY_PRESENCE informado.
+/// O último motivo (POWER_MONITOR_REQUEST_REASON) informado.
 pub fn user_presence() -> u32 {
     USER_PRESENCE.load(Ordering::Acquire)
 }
