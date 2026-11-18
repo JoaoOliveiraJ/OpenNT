@@ -2680,6 +2680,13 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   - Os handles desses objetos são linhas do Object Manager
     (`open_pointer::insert_with`, com a razão do OB_OPEN_REASON); o dono
     `objects/created.rs` conta cada abertura e fechamento no cabeçalho.
+    O ObInsertObject não lê o corpo: um evento do ObCreateObject com
+    `*ExEventObjectType` pode ser inserido antes do KeInitializeEvent (o
+    BasicRender faz isso). Um handle desses na tabela de um processo de
+    usuário vale nas esperas e nos serviços de evento de usuário
+    (NtSetEvent, NtResetEvent, NtQueryEvent..., `ps/user/events.rs`), que o
+    referenciam como o ObReferenceObjectByHandle(ExEventObjectType,
+    UserMode) e agem no mesmo KEVENT.
   - As rotinas do OBJECT_TYPE_INITIALIZER são chamadas nos pontos do NT:
     OpenProcedure na abertura de cada handle (Create, Open, Duplicate),
     CloseProcedure em cada fechamento com as contagens anteriores,

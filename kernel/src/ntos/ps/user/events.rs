@@ -3,6 +3,13 @@
 //! KEVENTs têm vidas independentes de handle e de referência de kernel: um
 //! driver pode manter um evento referenciado depois de o handle de usuário
 //! que o criou fechar.
+//!
+//! Os serviços de evento referenciam o handle como o
+//! ObReferenceObjectByHandle(ExEventObjectType, UserMode) do 19041: além dos
+//! eventos do NtCreateEvent, valem os que um driver pôs na tabela do
+//! processo (o ObInsertObject de um evento do ObCreateObject, o
+//! ObOpenObjectByPointer, o ZwCreateEvent sem OBJ_KERNEL_HANDLE), e a
+//! operação age no mesmo KEVENT que o driver sinaliza.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -13,9 +20,14 @@ use super::state;
 use crate::ntos::ke::dispatcher;
 use crate::ntos::ob::objects::dispatcher::{self as dispatcher_objects, DispatcherHooks, UserDispatcher};
 use crate::ntos::ob::object_manager::{self, NodeId};
+use crate::ntos::ob::{object_types, open_pointer};
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::types::{EventBasicInformation, NtStruct};
+use crate::ntos::inc::types::{EventBasicInformation, Kevent, NtStruct};
+
+const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
 
 /// O objeto evento do dono: KEVENT de 0x18 bytes, tipo e nome.
 pub struct EventObject {
@@ -23,6 +35,9 @@ pub struct EventObject {
     pub event_type: u32,
     pub name: String,
     node: SpinLock<Option<NodeId>>,
+    /// A referência de um evento achado na tabela nativa do processo (solta
+    /// pelo dono do corpo em [`release`]).
+    held: Option<open_pointer::Described>,
 }
 
 static EVENTS: SpinLock<BTreeMap<u64, Arc<EventObject>>> = SpinLock::new(BTreeMap::new());
@@ -44,7 +59,7 @@ fn split_name(name: &str) -> (String, String) {
 /// Inicializa o KEVENT, registra o corpo e publica o nome.
 pub fn create(pointer: u64, name: &str, event_type: u32, signaled: bool, attributes: u64, user: bool) -> Result<Arc<EventObject>, KernelError> {
     dispatcher::initialize_event(pointer, event_type as u8, signaled);
-    let object = Arc::new(EventObject { pointer, event_type, name: String::from(name), node: SpinLock::new(None) });
+    let object = Arc::new(EventObject { pointer, event_type, name: String::from(name), node: SpinLock::new(None), held: None });
     if let Err(error) = dispatcher_objects::create(pointer, "event", dispose, None, attributes, user, DispatcherHooks::default()) {
         guest::free_bytes(pointer);
         return Err(error);
@@ -74,20 +89,51 @@ fn publish(object: &Arc<EventObject>, out: u64, access: u32, attributes: u64, su
 
 /// Evento de um handle `event` do processo, com o corpo retido.
 pub fn reference(handle: u64, access: u32) -> Result<Arc<EventObject>, u32> {
-    let Some(entry) = state::get_user_handle(handle) else { return Err(0xC000_0008) };
+    let Some(entry) = state::get_user_handle(handle) else { return reference_native(handle, access) };
     if entry.kind() != "event" {
-        return Err(0xC000_0024);
+        return Err(STATUS_OBJECT_TYPE_MISMATCH);
     }
     if entry.access() & access != access {
-        return Err(0xC000_0022);
+        return Err(STATUS_ACCESS_DENIED);
     }
-    let object = entry.downcast::<UserDispatcher>().and_then(|dispatcher| dispatcher.payload.clone()).and_then(|payload| payload.downcast::<EventObject>().ok()).ok_or(0xC000_0024u32)?;
+    let object = entry.downcast::<UserDispatcher>().and_then(|dispatcher| dispatcher.payload.clone()).and_then(|payload| payload.downcast::<EventObject>().ok()).ok_or(STATUS_OBJECT_TYPE_MISMATCH)?;
     let _ = dispatcher_objects::reference(object.pointer);
     Ok(object)
 }
 
+/// Um handle da tabela nativa do processo corrente: o tipo do objeto tem de
+/// ser o de ExEventObjectType (senão STATUS_OBJECT_TYPE_MISMATCH) e o
+/// handle, conceder `access` (senão STATUS_ACCESS_DENIED). O corpo fica
+/// retido pelo dono dele; o EVENT_TYPE é o Header.Type do KEVENT, o campo
+/// que o NtQueryEvent devolve.
+fn reference_native(handle: u64, access: u32) -> Result<Arc<EventObject>, u32> {
+    let resolved = match open_pointer::resolve(handle, true) {
+        Some(Ok(resolved)) => resolved,
+        Some(Err(status)) => return Err(status),
+        None => return Err(STATUS_INVALID_HANDLE),
+    };
+    let item = resolved.item;
+    if item.object_type.pointer != object_types::event_type().pointer {
+        return Err(STATUS_OBJECT_TYPE_MISMATCH);
+    }
+    if resolved.access & access != access {
+        return Err(STATUS_ACCESS_DENIED);
+    }
+    item.reference();
+    let pointer = item.pointer;
+    // SAFETY: o KEVENT do objeto Event, retido acima.
+    let event_type = unsafe { Kevent::at(pointer) }.header.type_.get() as u32;
+    let name = EVENTS.lock().get(&pointer).map(|object| object.name.clone()).unwrap_or_default();
+    Ok(Arc::new(EventObject { pointer, event_type, name, node: SpinLock::new(None), held: Some(item) }))
+}
+
 pub fn release(object: &EventObject) {
-    let _ = dispatcher_objects::dereference(object.pointer);
+    match &object.held {
+        Some(item) => item.dereference(),
+        None => {
+            let _ = dispatcher_objects::dereference(object.pointer);
+        }
+    }
 }
 
 fn event_of_node(node: NodeId) -> Option<Arc<EventObject>> {

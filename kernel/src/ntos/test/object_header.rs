@@ -450,6 +450,65 @@ fn user_procedures(assert: Assert, block: u64) {
     assert(final_calls, "ob: o ultimo handle (o do System) fecha com OkayToClose e CloseProcedure e o objeto sai com DeleteSecurityDescriptor e DeleteProcedure");
 }
 
+/// O evento de flip do BasicRender num processo de usuário: o
+/// WARPKMALLOCATION::Initialize faz ObCreateObject(KernelMode,
+/// *ExEventObjectType, OBJ_CASE_INSENSITIVE, KernelMode, 0x18),
+/// ObInsertObject(EVENT_MODIFY_STATE) antes do KeInitializeEvent,
+/// ObReferenceObjectByHandle(EVENT_MODIFY_STATE, UserMode) do handle
+/// inserido e ObCloseHandle(UserMode); o OpenPrimaryFlipEvents abre o evento
+/// com ObOpenObjectByPointer(0x80, SYNCHRONIZE | EVENT_MODIFY_STATE,
+/// UserMode). A espera e os serviços de evento de usuário nesse handle usam
+/// o KEVENT que o driver sinaliza.
+fn primary_flip_event(assert: Assert, block: u64) {
+    use crate::ntos::ob::{close, wait};
+    use crate::ntos::ps::user::events;
+    use crate::ntos::test::multiprocess::identity::with_test_process;
+    let event_type = guest::read64(crate::ntos::ex::event::event_object_type());
+    let outcome = with_test_process("evento-flip.exe", None, |_| {
+        let (object_out, handle_out, referenced_out, flip_out) = (block + 0x380, block + 0x388, block + 0x390, block + 0x398);
+        let object_attributes = attributes(block + 0x400, None, 0x40);
+        let created = status(call_export("ObCreateObject", &[0, event_type, object_attributes, 0, 0, 0x18, 0, 0, object_out])) == 0;
+        let event = guest::read64(object_out);
+        if !created || event == 0 {
+            return None;
+        }
+        let inserted = status(call_export("ObInsertObject", &[event, 0, 2, 0, 0, handle_out])) == 0;
+        let handle = guest::read64(handle_out);
+        let _ = call_export("KeInitializeEvent", &[event, 0, 0]);
+        let referenced = status(call_export("ObReferenceObjectByHandle", &[handle, 2, event_type, 1, referenced_out, 0])) == 0 && guest::read64(referenced_out) == event;
+        let closed = status(call_export("ObCloseHandle", &[handle, 1])) == 0;
+        let opened = status(call_export("ObOpenObjectByPointer", &[event, 0x80, 0, 0x10_0002, event_type, 1, flip_out])) == 0;
+        let flip = guest::read64(flip_out);
+        let waits_on_body = wait::reference_objects(&[flip], 1, wait::WAIT_ANY).is_ok_and(|set| {
+            let same = set.objects.as_slice() == [event];
+            set.release();
+            same
+        });
+        let _ = call_export("KeSetEvent", &[event, 0, 0]);
+        let user_event = events::reference(flip, 2).is_ok_and(|object| {
+            let same = object.pointer == event && object.event_type == 0 && crate::ntos::ke::dispatcher::read_state(object.pointer) == 1;
+            crate::ntos::ke::dispatcher::reset_event(object.pointer);
+            events::release(&object);
+            same
+        });
+        let reset = crate::ntos::ke::dispatcher::read_state(event) == 0;
+        let query_denied = events::reference(flip, 1).err() == Some(0xC000_0022);
+        let flip_closed = matches!(close::close(flip, Some(1)), Ok(0));
+        let _ = call_export("ObfDereferenceObject", &[event]);
+        let freed = !object_header::is_object(event);
+        Some([inserted && referenced && closed, opened && waits_on_body, user_event && reset && query_denied, flip_closed && freed])
+    })
+    .flatten();
+    let Some(checks) = outcome else {
+        assert(false, "ob: evento do ObCreateObject num processo de teste");
+        return;
+    };
+    assert(checks[0], "ob: ObInsertObject de um evento antes do KeInitializeEvent poe o handle na tabela do processo e o ObReferenceObjectByHandle UserMode o acha");
+    assert(checks[1], "ob: o handle do ObOpenObjectByPointer UserMode espera no KEVENT do objeto");
+    assert(checks[2], "ob: os servicos de evento de usuario agem no KEVENT do handle nativo e conferem o acesso concedido");
+    assert(checks[3], "ob: fechado o handle e solta a ultima referencia, o evento sai");
+}
+
 pub fn run(assert: Assert) {
     let block = guest::alloc_bytes(0x1000);
     let object_type = object_type_ex(assert, block);
@@ -507,5 +566,6 @@ pub fn run_user(assert: Assert) {
     assert(closed, "ob: o NtClose de UserMode fecha o ultimo handle, o objeto sai e a cota volta ao processo");
     let block = guest::alloc_bytes(0x1000);
     user_procedures(assert, block);
+    primary_flip_event(assert, block);
     guest::free_bytes(block);
 }
