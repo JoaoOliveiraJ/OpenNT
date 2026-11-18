@@ -31,3 +31,24 @@ impl IrpExtensionField for Irp {
         unsafe { Field::<u64>::at(self.address() + IRP_EXTENSION_OFFSET as u64) }
     }
 }
+
+/// `_EXTENDED_CREATE_INFORMATION` (wdm.h; o EaBuffer do NtCreateFile com
+/// FILE_CONTAINS_EXTENDED_CREATE_INFORMATION, 0x18 bytes em x64). O
+/// IopCreateFile do 19041 lê ExtendedCreateFlags em +0, EaBuffer em +8 e
+/// EaLength em +0x10, e exige EaLength >= 0x18.
+#[repr(C)]
+pub struct ExtendedCreateInformation {
+    pub extended_create_flags: Field<i64>,
+    pub ea_buffer: Field<u64>,
+    pub ea_length: Field<u32>,
+    _pad_14: crate::ntos::inc::field::Reserved<4>,
+}
+
+// SAFETY: #[repr(C)] só de células (Field/Reserved).
+unsafe impl NtStruct for ExtendedCreateInformation {}
+
+const _: () = {
+    assert!(core::mem::size_of::<ExtendedCreateInformation>() == 0x18);
+    assert!(core::mem::offset_of!(ExtendedCreateInformation, ea_buffer) == 0x8);
+    assert!(core::mem::offset_of!(ExtendedCreateInformation, ea_length) == 0x10);
+};

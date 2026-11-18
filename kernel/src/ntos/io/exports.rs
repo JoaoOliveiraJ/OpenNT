@@ -655,7 +655,7 @@ pub mod nt_create_file {
     /// IoStatusBlock, AllocationSize, FileAttributes, ShareAccess,
     /// CreateDisposition, CreateOptions, EaBuffer, EaLength).
     fn create(call: &Call) -> Result<u64, KernelError> {
-        Ok(signed_status(zw::nt_create_file(call.arg(1), call.arg(2) as u32, call.arg(3), call.arg(4), call.arg(5), call.arg(6) as u32, call.arg(7) as u32, call.arg(8) as u32, call.arg(9) as u32, call.arg(11) as u32)?))
+        Ok(signed_status(zw::nt_create_file(call.arg(1), call.arg(2) as u32, call.arg(3), call.arg(4), call.arg(5), call.arg(6) as u32, call.arg(7) as u32, call.arg(8) as u32, call.arg(9) as u32, call.arg(10), call.arg(11) as u32)?))
     }
 
     pub static GROUP: Group = Group { name: "nt-create-file", names: &["NtCreateFile"], handlers: &[create], data_exports: &[] };

@@ -140,6 +140,12 @@ fn open_file(handle_pointer: u64, attributes: u64, iosb: u64, disposition: u32, 
     if !state::probe_user_write(handle_pointer, 8) || !state::probe_user_write(iosb, 16) || !state::probe_user_read(attributes, 48) {
         return Ok(0xC000_0005);
     }
+    // O EXTENDED_CREATE_INFORMATION sai antes da abertura, como no
+    // IopCreateFile (`file_io::extended_create`).
+    let request = &match file_io::extended_create(request) {
+        Ok(request) => request,
+        Err(status) => return Ok(status),
+    };
     let Some(parsed) = parse_user_object_attributes(attributes) else { return Ok(STATUS_INVALID_PARAMETER) };
     // OBJ_* do OA, lido uma vez.
     let object_flags = match user_object_attributes(attributes) {
@@ -221,7 +227,7 @@ fn nt_create_file(handle_pointer: u64, access: u64, attributes: u64, iosb: u64, 
         attributes,
         iosb,
         disposition,
-        &OpenRequest { access: access as u32, allocation_pointer: state::stack_arg(rsp, 5), attributes: state::stack_arg32(rsp, 6), share: state::stack_arg32(rsp, 7), options: state::stack_arg32(rsp, 9), ea_length: state::stack_arg32(rsp, 11), handle_attributes: 0 },
+        &OpenRequest { access: access as u32, allocation_pointer: state::stack_arg(rsp, 5), attributes: state::stack_arg32(rsp, 6), share: state::stack_arg32(rsp, 7), options: state::stack_arg32(rsp, 9), ea_buffer: state::stack_arg(rsp, 10), ea_length: state::stack_arg32(rsp, 11), handle_attributes: 0 },
     )
 }
 

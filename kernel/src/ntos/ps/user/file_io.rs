@@ -22,6 +22,7 @@ use crate::ntos::io::file::lifetime as file_lifetime;
 use crate::ntos::ke::dispatcher;
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::types::extra_io::ExtendedCreateInformation;
 use crate::ntos::inc::types::{
     FileAccessInformation, FileAlignmentInformation, FileAllInformation, FileAttributeTagInformation, FileBasicInformation, FileDirectoryInformation, FileDispositionInformation,
     FileDispositionInformationEx, FileEaInformation, FileFullDirInformation, FileIdBothDirInformation, FileIdFullDirInformation, FileIdInformation, FileInternalInformation, FileModeInformation,
@@ -122,8 +123,40 @@ pub struct OpenRequest {
     pub options: u32,
     pub allocation_pointer: u64,
     pub attributes: u32,
+    pub ea_buffer: u64,
     pub ea_length: u32,
     pub handle_attributes: u32,
+}
+
+/// FILE_CONTAINS_EXTENDED_CREATE_INFORMATION.
+const FILE_CONTAINS_EXTENDED_CREATE_INFORMATION: u32 = 0x1000_0000;
+
+/// O IopCreateFile de um chamador de modo usuário (64 bits) com
+/// FILE_CONTAINS_EXTENDED_CREATE_INFORMATION: o EaBuffer é um
+/// EXTENDED_CREATE_INFORMATION { ExtendedCreateFlags, EaBuffer, EaLength }
+/// (EaLength menor que 0x18 é STATUS_INVALID_PARAMETER; o buffer alinhado a
+/// 4 e sondado), os flags (EX_CREATE_FLAG_FILE_SOURCE/DEST_OPEN_FOR_COPY, o
+/// CopyFile do kernelbase) vão para o pacote de abertura e a abertura segue
+/// com o EaBuffer e o EaLength de dentro; as opções que chegam ao file
+/// system perdem o bit (o pacote guarda só os 24 bits baixos). Sem o bit, o
+/// pedido volta como veio.
+pub fn extended_create(request: &OpenRequest) -> Result<OpenRequest, u32> {
+    if request.options & FILE_CONTAINS_EXTENDED_CREATE_INFORMATION == 0 {
+        return Ok(*request);
+    }
+    if (request.ea_length as u64) < ExtendedCreateInformation::SIZE {
+        return Err(INVALID);
+    }
+    if request.ea_buffer & 3 != 0 {
+        return Err(0x8000_0002);
+    }
+    if !state::probe_user_read(request.ea_buffer, request.ea_length as u64) {
+        return Err(AV);
+    }
+    let information = state::user_struct::<ExtendedCreateInformation>(request.ea_buffer).map_err(|error| error.status)?;
+    let ea_buffer = information.ea_buffer.probe_get().map_err(|error| error.status)?;
+    let ea_length = information.ea_length.probe_get().map_err(|error| error.status)?;
+    Ok(OpenRequest { options: request.options & !FILE_CONTAINS_EXTENDED_CREATE_INFORMATION, ea_buffer, ea_length, ..*request })
 }
 
 /// Abre ou cria o arquivo do volume e publica o handle `file`.

@@ -470,11 +470,11 @@ pub fn create_kernel_file_with_context(output: u64, desired_access: u32, attribu
 /// serviço do modo usuário) trata os ponteiros como do modo usuário, com as
 /// sondagens e a captura do serviço NtCreateFile.
 #[allow(clippy::too_many_arguments)]
-pub fn nt_create_file(handle: u64, desired_access: u32, attributes: u64, io_status: u64, allocation: u64, file_attributes: u32, share_access: u32, disposition: u32, options: u32, ea_length: u32) -> Result<u32, KernelError> {
+pub fn nt_create_file(handle: u64, desired_access: u32, attributes: u64, io_status: u64, allocation: u64, file_attributes: u32, share_access: u32, disposition: u32, options: u32, ea_buffer: u64, ea_length: u32) -> Result<u32, KernelError> {
     if crate::ntos::ps::previous_mode::get()? == 0 {
         return create_kernel_file(handle, desired_access, attributes, io_status, share_access, disposition, options);
     }
-    let request = crate::ntos::ps::user::file_io::OpenRequest { access: desired_access, share: share_access, options, allocation_pointer: allocation, attributes: file_attributes, ea_length, handle_attributes: 0 };
+    let request = crate::ntos::ps::user::file_io::OpenRequest { access: desired_access, share: share_access, options, allocation_pointer: allocation, attributes: file_attributes, ea_buffer, ea_length, handle_attributes: 0 };
     crate::ntos::ps::user::files::open_nt_file(handle, attributes, io_status, disposition, &request)
 }
 

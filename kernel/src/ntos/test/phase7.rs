@@ -1017,6 +1017,25 @@ fn user_file_io(assert: Assert) {
     let closed = requiring == 0 && state::close_user_handle(oplocked, true, false).is_ok_and(|status| status == 0);
     assert(closed && request_oplock == 0xC000_0010, "userfiles: FILE_OPEN_REQUIRING_OPLOCK abre e o FSCTL_REQUEST_OPLOCK fica sem suporte");
     assert([0x1_0140, 0x11_0040, 0x10_0140].iter().all(|&options| open("\\??\\D:\\HELLO.TXT", 1, 0x8010_0000, 7, options) == 0xC000_000D), "userfiles: combinacoes de oplock recusadas como no IopCreateFile");
+    // FILE_CONTAINS_EXTENDED_CREATE_INFORMATION (a abertura da origem do
+    // CopyFile): o EXTENDED_CREATE_INFORMATION de 0x18 bytes sai do EaBuffer
+    // e a abertura segue com o EA de dentro e sem o bit; EaLength curto é
+    // STATUS_INVALID_PARAMETER e o buffer desalinhado,
+    // STATUS_DATATYPE_MISALIGNMENT.
+    let extended = buffer + 0x80;
+    guest::write64(extended, 1);
+    guest::write64(extended + 8, 0);
+    guest::write32(extended + 0x10, 0);
+    let copy_source = OpenRequest { access: 0x8010_0000, share: 7, options: 0x1000_0060, ea_buffer: extended, ea_length: 0x18, ..OpenRequest::default() };
+    let unwrapped = file_io::extended_create(&copy_source);
+    let copy_opened = unwrapped.as_ref().is_ok_and(|request| request.options == 0x60 && request.ea_length == 0 && request.ea_buffer == 0) && {
+        guest::write64(out, 0);
+        unwrapped.as_ref().is_ok_and(|request| file_io::open(out, "\\??\\D:\\HELLO.TXT", iosb, 1, request).unwrap_or(1) == 0)
+    };
+    let copy_closed = copy_opened && state::close_user_handle(guest::read64(out), true, false).is_ok_and(|status| status == 0);
+    let short = file_io::extended_create(&OpenRequest { ea_length: 0x10, ..copy_source }).err() == Some(0xC000_000D);
+    let misaligned = file_io::extended_create(&OpenRequest { ea_buffer: extended + 2, ..copy_source }).err() == Some(0x8000_0002);
+    assert(copy_closed && short && misaligned, "userfiles: EXTENDED_CREATE_INFORMATION desembrulhado como no IopCreateFile");
     if let Some(region) = memory::find_region(block) {
         memory::release_private_region(&region);
     }
