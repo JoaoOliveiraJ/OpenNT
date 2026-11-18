@@ -2148,7 +2148,10 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   StartVa, ByteOffset, ByteCount e MDL_ALLOCATED_FIXED_SIZE até 17 páginas) e
   o liga ao IRP; os PFNs e os outros flags vêm de quem descreve as páginas
   (`mm/mdl.rs`): o MmBuildMdlForNonPagedPool (MDL_SOURCE_IS_NONPAGED_POOL e a
-  VA de sistema, sem travar), o MmProbeAndLockPages (MDL_PAGES_LOCKED), o
+  VA de sistema, sem travar), o MmProbeAndLockPages (MDL_PAGES_LOCKED,
+  MDL_WRITE_OPERATION numa operação de escrita e o Process: o processo
+  sondado, o anexado durante um KeStackAttachProcess, num buffer de usuário,
+  nulo num de sistema), o
   IoBuildPartialMdl (os bits herdáveis da origem e a VA deslocada) e o
   MmMapLockedPagesSpecifyCache (MDL_MAPPED_TO_SYSTEM_VA). Em KernelMode, o
   MmMapLockedPagesSpecifyCache de um buffer de usuário mapeia os PFNs do

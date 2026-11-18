@@ -40,8 +40,9 @@ fn unmap_locked_pages(call: &Call) -> Result<u64, KernelError> {
 fn map_io_space_ex(call: &Call) -> Result<u64, KernelError> {
     Ok(io_space::map_ex(call.arg(1), call.arg(2)))
 }
+/// MmProbeAndLockPages(Mdl, AccessMode, Operation).
 fn probe_and_lock_pages(call: &Call) -> Result<u64, KernelError> {
-    mdl::probe_and_lock_pages(call.arg(1));
+    mdl::probe_and_lock_pages_for(call.arg(1), call.arg(3) as u32);
     Ok(0)
 }
 fn unlock_pages(call: &Call) -> Result<u64, KernelError> {
