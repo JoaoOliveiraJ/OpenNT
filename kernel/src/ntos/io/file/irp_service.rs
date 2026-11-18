@@ -98,6 +98,7 @@ const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
 const STATUS_THREAD_IS_TERMINATING: u32 = 0xC000_004B;
 
 /// IRP.Flags (wdm.h).
+const IRP_NOCACHE: u32 = 0x1;
 const IRP_SYNCHRONOUS_API: u32 = 0x4;
 const IRP_BUFFERED_IO: u32 = 0x10;
 const IRP_DEALLOCATE_BUFFER: u32 = 0x20;
@@ -691,6 +692,144 @@ pub fn transfer(arguments: &Transfer, write: bool) -> u32 {
     }
     track(packet, &target, event, 0, arguments.apc_context);
     synchronous_service_tail(&target, packet)
+}
+
+// ---- pedidos de modo kernel do próprio I/O Manager -----------------------------
+
+/// Um arquivo de driver aberto por handle de modo usuário, referenciado, para
+/// as leituras e escritas que o I/O Manager faz por conta própria com um
+/// buffer do pool (a cópia do NtCopyFileChunk). Solta a referência ao sair.
+pub struct DriverFile(Target);
+
+/// O IoStatus de um pedido de modo kernel e se o driver devolveu
+/// STATUS_PENDING.
+pub struct KernelTransfer {
+    pub status: u32,
+    pub information: u64,
+    pub pending: bool,
+}
+
+impl DriverFile {
+    pub fn reference(handle: u64) -> Result<DriverFile, u32> {
+        reference(handle).map(DriverFile)
+    }
+
+    pub fn access(&self) -> u32 {
+        self.0.access
+    }
+
+    /// FILE_OBJECT.Flags.
+    pub fn flags(&self) -> u32 {
+        self.0.flags
+    }
+
+    pub fn sector_size(&self) -> u32 {
+        device_at(self.0.device).sector_size.get() as u32
+    }
+
+    pub fn alignment_requirement(&self) -> u32 {
+        device_at(self.0.device).alignment_requirement.get()
+    }
+
+    /// FILE_OBJECT.CurrentByteOffset.
+    pub fn position(&self) -> i64 {
+        file_at(self.0.file).current_byte_offset.quad_part.get()
+    }
+
+    /// IRP_MJ_READ (`write` = false) ou IRP_MJ_WRITE de modo kernel sobre
+    /// `buffer` (memória do pool), como o IRP de leitura do NtCopyFileChunk
+    /// (IopReadFile com a marca 0x40000000): RequestorMode = KernelMode, o
+    /// buffer no UserBuffer (neither), no SystemBuffer (DO_BUFFERED_IO, sem
+    /// cópia nem liberação na conclusão) ou num MDL do pool (DO_DIRECT_IO),
+    /// IRP_NOCACHE num arquivo sem buffer intermediário e o lock de um
+    /// arquivo síncrono durante o pedido. A conclusão grava um
+    /// IO_STATUS_BLOCK local e sinaliza um evento local, esperado aqui sem
+    /// alerta.
+    pub fn transfer(&self, write: bool, buffer: u64, length: u32, offset: i64, key: u32) -> KernelTransfer {
+        let target = &self.0;
+        let failed = |status| KernelTransfer { status, information: 0, pending: false };
+        let synchronous = target.synchronous();
+        if synchronous && information::acquire_file(target.file).is_err() {
+            return failed(STATUS_INSUFFICIENT_RESOURCES);
+        }
+        let unlock = || {
+            if synchronous {
+                let _ = information::release_file(target.file);
+            }
+        };
+        let local = allocate_local();
+        if local == 0 {
+            unlock();
+            return failed(STATUS_INSUFFICIENT_RESOURCES);
+        }
+        let device_flags = device_at(target.device).flags.get();
+        let mut flags = if write { IRP_WRITE_OPERATION } else { IRP_READ_OPERATION };
+        if target.flags & FO_NO_INTERMEDIATE_BUFFERING != 0 {
+            flags |= IRP_NOCACHE;
+        }
+        let buffered = device_flags & DO_BUFFERED_IO != 0;
+        if buffered {
+            flags |= IRP_BUFFERED_IO;
+        }
+        let options = BuildOptions {
+            major: if write { IRP_MJ_WRITE } else { IRP_MJ_READ },
+            buffer: if buffered { buffer } else { 0 },
+            buffer_length: length,
+            byte_offset: offset as u64,
+            user_event: local,
+            user_iosb: local_iosb(local).address(),
+            user_buffer: if buffered { 0 } else { buffer },
+            ..BuildOptions::default()
+        };
+        let packet = allocate(target, options, flags);
+        if packet == 0 {
+            guest::free_bytes(local);
+            unlock();
+            return failed(STATUS_INSUFFICIENT_RESOURCES);
+        }
+        irp_at(packet).requestor_mode.set(KERNEL_MODE as i8);
+        if device_flags & DO_DIRECT_IO != 0 && length != 0 {
+            let mdl = crate::ntos::io::mdl::allocate_mdl(buffer, length);
+            if mdl == 0 {
+                irp_builder::free_irp(packet);
+                guest::free_bytes(local);
+                unlock();
+                return failed(STATUS_INSUFFICIENT_RESOURCES);
+            }
+            crate::ntos::mm::mdl::build_for_non_paged_pool(mdl);
+            irp_at(packet).mdl_address.set(mdl);
+        }
+        let location = top_location(packet);
+        if write {
+            location.parameters.write.key.set(key);
+        } else {
+            location.parameters.read.key.set(key);
+        }
+        track(packet, target, None, local, 0);
+        let mut status = call_driver(target.device, packet);
+        let pending = status == STATUS_PENDING;
+        if pending {
+            dispatcher::wait_for_single_object(local, 0, KERNEL_MODE, false);
+        }
+        let completed = local_iosb(local);
+        let information = if completed.status.get() != UNWRITTEN {
+            if pending {
+                status = completed.status.get() as u32;
+            }
+            completed.information.get()
+        } else {
+            0
+        };
+        guest::free_bytes(local);
+        unlock();
+        KernelTransfer { status, information, pending }
+    }
+}
+
+impl Drop for DriverFile {
+    fn drop(&mut self) {
+        self.0.release();
+    }
 }
 
 // ---- controle de file system ---------------------------------------------------

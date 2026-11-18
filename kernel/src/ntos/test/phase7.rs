@@ -6794,6 +6794,7 @@ pub fn run(assert: Assert) {
     super::user_service_chain::run(assert);
     user_file_io(assert);
     user_file_io_more(assert);
+    super::user_copy_chunk::run(assert);
     disk_write_stress(assert, 12, 3);
     user_file_syscalls(assert);
     super::reparse_points::run(assert);

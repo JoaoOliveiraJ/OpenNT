@@ -107,6 +107,13 @@ pub struct IndexEntry {
     pub value: Vec<u8>,
 }
 
+/// Um nome do arquivo ($FILE_NAME): a referência do diretório pai, com o
+/// número de sequência, e o nome.
+pub struct Link {
+    pub parent: u64,
+    pub name: Vec<u16>,
+}
+
 /// Run em setores do $DATA não residente.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SectorRun {
@@ -700,6 +707,28 @@ impl Ntfs {
             reparse_tag,
             times: standard.map_or(alloc::vec![0; 32], |standard| standard.value[..32].to_vec()),
         }))
+    }
+
+    /// Os nomes do arquivo, na ordem dos $FILE_NAME do registro, sem os do
+    /// namespace só DOS (FILE_NAME_DOS = 2), como o NtfsQueryLinksInfo
+    /// (ntfs.sys 0x1771c2). O volume não tem $ATTRIBUTE_LIST, então os
+    /// $FILE_NAME do registro base são todos os nomes.
+    pub fn links(&self, path: &str) -> Result<Option<Vec<Link>>, KernelError> {
+        let _shared = self.resource().acquire_shared();
+        let Some(entry) = self.find(path)? else { return Ok(None) };
+        let record = self.read_record(entry.reference)?;
+        let mut links = Vec::new();
+        each_attribute(&record, |attribute| {
+            let value = &attribute.value;
+            if attribute.attribute_type == 0x30 && !attribute.non_resident && value.len() >= 0x42 {
+                let length = value[0x40] as usize;
+                if value[0x41] & 3 != 2 && 0x42 + length * 2 <= value.len() {
+                    links.push(Link { parent: u64_at(value, 0), name: (0..length).map(|index| u16_at(value, 0x42 + index * 2)).collect() });
+                }
+            }
+            true
+        })?;
+        Ok(Some(links))
     }
 
     /// Tamanho real e runs em setores do $DATA, sem ler o arquivo inteiro.

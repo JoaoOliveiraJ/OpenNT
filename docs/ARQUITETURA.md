@@ -3072,6 +3072,23 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   FileObject->SectionObjectPointer->ImageSectionObject sem conferir, como a
   ci.dll ao registrar uma validação recusada, encontra memória válida.
   Teste: `zw_kernel_files` na fase 6.
+- **Cópia de arquivo (NtCopyFileChunk)** (`io/file/copy_chunk.rs`,
+  `irp_service::DriverFile`): o caminho de dados do CopyFile do kernelbase
+  (BaseCopyStream não tem caminho por ReadFile). Como o NtCopyFileChunk do
+  19041, a origem decide o modo: síncrona devolve o status da escrita, com
+  o IO_STATUS_BLOCK gravado e o evento sinalizado; assíncrona devolve
+  STATUS_PENDING com os dois já concluídos. Os parâmetros da escrita são
+  validados antes da leitura (DestOffset obrigatório e não negativo, salvo
+  FILE_WRITE_TO_END_OF_FILE; só FILE_APPEND_DATA escreve no fim), e uma
+  leitura que falha sem ficar pendente (fim do arquivo) volta direto, sem
+  tocar no IO_STATUS_BLOCK. Num destino sem buffer intermediário a escrita
+  sobe ao setor, com o resto zerado. Cada lado é um arquivo do volume do
+  kernel ou um arquivo de driver, lido e escrito por IRP de modo kernel
+  sobre o buffer do pool. Os arquivos do volume respondem também
+  FileHardLinkInformation (46, os $FILE_NAME fora do namespace só DOS) e
+  FileStorageReserveIdInformation (74: o volume não tem áreas de reserva,
+  então o id é 0 e mudar para outro dá STATUS_STORAGE_RESERVE_DOES_NOT_EXIST).
+  Teste: `user_copy_chunk` na fase 7.
 - **Reparse points do volume de boot** (`drivers/fs/ntfs_reparse.rs`,
   `io/reparse.rs`): o NTFS do kernel guarda o reparse point como o
   ntfs.sys, no formato do disco: o atributo $REPARSE_POINT com o buffer do

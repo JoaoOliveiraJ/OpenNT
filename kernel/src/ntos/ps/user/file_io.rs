@@ -101,6 +101,12 @@ fn object(handle: u64) -> Result<(Arc<UserHandle>, Arc<UserFile>), KernelError> 
     Ok((entry, user_file))
 }
 
+/// O handle de arquivo do volume revalidado, para serviços de outros módulos
+/// (NtCopyFileChunk): a descrição aberta, ou o status da recusa.
+pub fn volume_open(handle: u64) -> Result<(Arc<UserHandle>, Arc<UserFile>), u32> {
+    object(handle).map_err(|error| if error.status != 0 { error.status } else { 0xC000_0185 })
+}
+
 /// A descrição `UserFile` de um handle (pelo registro de aberturas).
 fn user_file_of(entry: &UserHandle) -> Option<Arc<UserFile>> {
     let id = entry.downcast::<UserFile>()?.id;
@@ -486,6 +492,9 @@ pub fn nt_query_information_file(handle: u64, iosb: u64, out: u64, length: u64, 
         let (entry, user_file) = object(handle)?;
         let file = &user_file.file;
         let class = state::stack_arg32(rsp, 5);
+        if class == 46 || class == 74 {
+            return query_links_or_reserve(&entry, file, class, out, length, iosb);
+        }
         // FILE_NAME_INFORMATION: o caminho a partir da raiz do volume como a
         // abertura o nomeou (`\Windows\System32\x.dll`), o mesmo FileName do
         // FILE_OBJECT que o NtQueryObject devolve depois do dispositivo; o
@@ -571,6 +580,63 @@ pub fn nt_query_information_file(handle: u64, iosb: u64, out: u64, length: u64, 
         }
         Ok(complete(iosb, if length < need { 0x8000_0005 } else { 0 }, length.min(need)))
     })
+}
+
+/// FileHardLinkInformation (46) e FileStorageReserveIdInformation (74) de um
+/// arquivo do volume, com a validação e o acesso do NtQueryInformationFile
+/// (tamanho mínimo 32 e 4; a 74 exige FILE_READ_ATTRIBUTES), como o
+/// NtfsQueryLinksInfo (ntfs.sys 0x176fe4) e o NtfsQueryStorageReserveIdInfo:
+/// - 46: FILE_LINKS_INFORMATION { BytesNeeded, EntriesReturned, Entry }, uma
+///   FILE_LINK_ENTRY_INFORMATION por $FILE_NAME fora do namespace só DOS
+///   (NextEntryOffset, ParentFileId em +8, FileNameLength em caracteres em
+///   +0x10, FileName em +0x14, alinhadas a 8); BytesNeeded conta todas, a
+///   primeira que não cabe dá STATUS_BUFFER_OVERFLOW e a última escrita tem
+///   NextEntryOffset zero;
+/// - 74: o volume não define áreas de reserva, então todo arquivo está em
+///   StorageReserveIdNone: 16 bytes zerados com espaço para eles, senão 4.
+fn query_links_or_reserve(entry: &UserHandle, file: &VolumeFile, class: u32, out: u64, length: u64, iosb: u64) -> Result<u32, KernelError> {
+    use crate::ntos::io::file::query;
+    let validated = query::validate(1, class, length as u32, iosb, out);
+    if validated != 0 {
+        return fail(validated);
+    }
+    let required = query::ACCESS[class as usize];
+    if entry.access() & required != required {
+        return fail(DENIED);
+    }
+    if class == 74 {
+        let size = if length >= 16 { 16 } else { 4 };
+        guest::try_write_bytes(out, &[0u8; 16][..size as usize])?;
+        return Ok(complete(iosb, 0, size));
+    }
+    let Some(links) = file.volume().links(&file.volume_path())? else { return fail(0xC000_0034) };
+    let mut bytes = alloc::vec![0u8; 8];
+    let (mut needed, mut returned, mut last, mut overflow) = (8u64, 0u32, None, false);
+    for link in &links {
+        let size = (0x14 + link.name.len() * 2 + 7) & !7;
+        needed += size as u64;
+        if overflow || (bytes.len() + size) as u64 > length {
+            overflow = true;
+            continue;
+        }
+        let at = bytes.len();
+        bytes.resize(at + size, 0);
+        bytes[at..at + 4].copy_from_slice(&(size as u32).to_le_bytes());
+        bytes[at + 8..at + 16].copy_from_slice(&link.parent.to_le_bytes());
+        bytes[at + 16..at + 20].copy_from_slice(&(link.name.len() as u32).to_le_bytes());
+        for (index, unit) in link.name.iter().enumerate() {
+            bytes[at + 20 + index * 2..at + 22 + index * 2].copy_from_slice(&unit.to_le_bytes());
+        }
+        returned += 1;
+        last = Some(at);
+    }
+    if let Some(at) = last {
+        bytes[at..at + 4].fill(0);
+    }
+    bytes[0..4].copy_from_slice(&(needed as u32).to_le_bytes());
+    bytes[4..8].copy_from_slice(&returned.to_le_bytes());
+    guest::try_write_bytes(out, &bytes)?;
+    Ok(complete(iosb, if overflow { 0x8000_0005 } else { 0 }, bytes.len() as u64))
 }
 
 /// NtReadFile/NtWriteFile: posição síncrona, append-only sem FILE_WRITE_DATA,
@@ -730,6 +796,7 @@ fn nt_set_information_file(handle: u64, iosb: u64, buffer: u64, length: u64, rsp
             20 => 8,
             64 => 4,
             65 => 20,
+            74 => 4,
             _ => return fail(0xC000_0003),
         };
         if length < minimum {
@@ -792,6 +859,29 @@ fn nt_set_information_file(handle: u64, iosb: u64, buffer: u64, length: u64, rsp
                 let any = file.opens.lock().clone().iter().filter_map(|&id| file_objects::lookup(id)).any(|open| open.delete_requested.load(Ordering::Acquire));
                 file.set_pending_delete(any);
                 file_objects::update_delete_state(&file);
+            }
+            74 => {
+                // FileStorageReserveIdInformation { StorageReserveId, Flags },
+                // como o NtfsSetStorageReserveIdInfo (ntfs.sys 0x140b04):
+                // arquivo de sistema, ou handle sem FILE_WRITE_DATA nem
+                // FILE_WRITE_ATTRIBUTES, STATUS_ACCESS_DENIED; id acima de 15,
+                // STATUS_STORAGE_RESERVE_ID_INVALID; com 8 bytes, Flags fora dos
+                // 4 bits baixos, STATUS_NOT_SUPPORTED. Sem áreas de reserva no
+                // volume, o id 0 (o atual) é sucesso sem mudança e os outros
+                // são STATUS_STORAGE_RESERVE_DOES_NOT_EXIST.
+                if file.stat().reference < 16 || handle_access & 0x102 == 0 {
+                    return fail(DENIED);
+                }
+                let id = guest::try_read::<u32>(buffer)?;
+                if id > 15 {
+                    return fail(0xC000_04AD);
+                }
+                if length >= 8 && guest::try_read::<u32>(buffer + 4)? & !0xF != 0 {
+                    return fail(0xC000_00BB);
+                }
+                if id != 0 {
+                    return fail(0xC000_04AE);
+                }
             }
             _ => {
                 if handle_access & 0x1_0000 == 0 {
@@ -1169,7 +1259,27 @@ fn nt_notify_change_directory_file_ex(handle: u64, event: u64, apc_routine: u64,
 }
 
 /// Registra os handlers da segunda parte.
+/// NtCopyFileChunk(SourceHandle, DestHandle, Event, IoStatusBlock, Length,
+/// SourceOffset*, DestOffset*, SourceKey*, DestKey*, Flags):
+/// `io/file/copy_chunk.rs`.
+fn nt_copy_file_chunk(source: u64, destination: u64, event: u64, io_status: u64, rsp: u64) -> Result<u32, KernelError> {
+    use crate::ntos::io::file::copy_chunk::{self, Arguments};
+    Ok(copy_chunk::copy_file_chunk(&Arguments {
+        source,
+        destination,
+        event,
+        io_status,
+        length: state::stack_arg32(rsp, 5),
+        source_offset: state::stack_arg(rsp, 6),
+        destination_offset: state::stack_arg(rsp, 7),
+        source_key: state::stack_arg(rsp, 8),
+        destination_key: state::stack_arg(rsp, 9),
+        flags: state::stack_arg32(rsp, 10),
+    }))
+}
+
 pub fn init_part2() {
+    state::register_handler("NtCopyFileChunk", nt_copy_file_chunk);
     state::register_handler("NtSetInformationFile", nt_set_information_file);
     state::register_handler("NtFlushBuffersFile", nt_flush_buffers_file);
     state::register_handler("NtQueryDirectoryFile", nt_query_directory_file);
