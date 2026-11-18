@@ -21,6 +21,7 @@ use alloc::vec::Vec;
 use super::super::seed::{SeedKey, REG_EXPAND_SZ, REG_MULTI_SZ, REG_SZ};
 
 const SERVICES: &str = "CurrentControlSet\\Services";
+const CONTROL_CLASS: &str = "CurrentControlSet\\Control\\Class";
 const SERVICE_KERNEL_DRIVER: u32 = 1;
 
 /// (serviço, arquivo em System32\Drivers, Start, Type).
@@ -67,8 +68,25 @@ const I8042PRT_PARAMETERS: &[(&str, u32)] = &[
 const KBDCLASS_PARAMETERS: &[(&str, u32)] = &[("ConnectMultiplePorts", 0), ("KeyboardDataQueueSize", 100), ("MaximumPortsServiced", 3), ("SendOutputToAllPorts", 1)];
 const KBDCLASS_DEVICE_BASE_NAME: &str = "KeyboardClass";
 
-/// Classes de dispositivo com os UpperFilters que o PnP anexa sobre o FDO.
-const DEVICE_CLASSES: &[(&str, &[&str])] = &[("{4D36E96B-E325-11CE-BFC1-08002BE10318}", &["kbdclass"]), ("{4D36E96F-E325-11CE-BFC1-08002BE10318}", &["mouclass"])];
+/// Uma chave de classe de dispositivo em `Control\Class\{guid}`, com os
+/// valores que o `[ClassInstall32]` do INF da classe grava numa instalação
+/// do Windows 10 19041 (c_keyboard.inf, msmouse.inf).
+struct DeviceClass {
+    guid: &'static str,
+    class: &'static str,
+    description: &'static str,
+    upper_filters: &'static [&'static str],
+    icon_path: &'static str,
+    /// `Default Service` da classe Mouse (o i8042prt).
+    default_service: Option<&'static str>,
+}
+
+/// As classes Keyboard e Mouse, com os UpperFilters que o PnP anexa sobre o
+/// FDO do port driver (o kbdclass e o mouclass).
+const DEVICE_CLASSES: &[DeviceClass] = &[
+    DeviceClass { guid: "{4D36E96B-E325-11CE-BFC1-08002BE10318}", class: "Keyboard", description: "@%SystemRoot%\\System32\\SysClass.Dll,-3002", upper_filters: &["kbdclass"], icon_path: "%SystemRoot%\\System32\\setupapi.dll,-3", default_service: None },
+    DeviceClass { guid: "{4D36E96F-E325-11CE-BFC1-08002BE10318}", class: "Mouse", description: "@%SystemRoot%\\System32\\SysClass.Dll,-3004", upper_filters: &["mouclass"], icon_path: "%SystemRoot%\\System32\\setupapi.dll,-2", default_service: Some("i8042prt") },
+];
 
 /// A chave de um serviço de driver como o banco de serviços a instala (sem
 /// ObjectName).
@@ -99,9 +117,15 @@ pub fn parameter_keys() -> Vec<SeedKey> {
     }
     kbdclass.text("KeyboardDeviceBaseName", REG_SZ, KBDCLASS_DEVICE_BASE_NAME);
     keys.push(kbdclass);
-    for &(class, filters) in DEVICE_CLASSES {
-        let mut key = SeedKey::new(&format!("Control\\Class\\{class}"));
-        key.strings("UpperFilters", filters);
+    // No conjunto de controle, como as demais chaves de classe
+    // (`ControlSet001\Control\Class`, pelo link `CurrentControlSet`).
+    for class in DEVICE_CLASSES {
+        let mut key = SeedKey::new(&format!("{CONTROL_CLASS}\\{}", class.guid));
+        key.text("Class", REG_SZ, class.class).text("ClassDesc", REG_SZ, class.description).strings("UpperFilters", class.upper_filters).strings("IconPath", &[class.icon_path]);
+        if let Some(service) = class.default_service {
+            key.text("Default Service", REG_SZ, service);
+        }
+        key.text("NoInstallClass", REG_SZ, "1");
         keys.push(key);
     }
     keys

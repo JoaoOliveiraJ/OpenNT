@@ -127,9 +127,10 @@ pub fn attach_function_driver(pdo: NodeId, driver_name: &str) -> Option<NodeId> 
     Some(fdo)
 }
 
-/// UpperFilters (REG_MULTI_SZ UTF-16LE) da classe de dispositivo.
+/// UpperFilters (REG_MULTI_SZ UTF-16LE) da classe de dispositivo, em
+/// `CurrentControlSet\Control\Class\{guid}`.
 pub fn read_class_upper_filters(class_guid: &str) -> Vec<String> {
-    let Some(entry) = registry::read_value_by_path(&format!("\\Registry\\Machine\\System\\Control\\Class\\{class_guid}"), "UpperFilters") else { return Vec::new() };
+    let Some(entry) = registry::read_value_by_path(&format!("{}\\Control\\Class\\{class_guid}", install::CONTROL_SET), "UpperFilters") else { return Vec::new() };
     let mut names = Vec::new();
     let mut current = String::new();
     let mut index = 0;

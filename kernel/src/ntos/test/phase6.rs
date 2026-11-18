@@ -3009,7 +3009,7 @@ fn pnp_and_boot_services(assert: Assert) {
     let ids = |list: &[&str]| list.iter().map(|id| String::from(*id)).collect::<Vec<String>>();
     assert(pnp::find_function_driver(&ids(&["PNP0303"])) == Some("i8042prt") && pnp::find_function_driver(&ids(&["IDE\\DiskQEMU_HARDDISK"])) == Some("disk") && pnp::find_function_driver(&ids(&["XYZ", "PCI\\VEN_8086&DEV_7010"])) == Some("atapi") && pnp::find_function_driver(&ids(&["ACPI\\PNP0A03"])).is_none(), "pnp: driver funcional por id exato e por prefixo");
     // UpperFilters da classe (REG_MULTI_SZ UTF-16LE).
-    let class = "\\Registry\\Machine\\System\\Control\\Class\\{OPENNT-TEST-CLASS}";
+    let class = "\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Class\\{OPENNT-TEST-CLASS}";
     let handle = registry::open_or_create(class, None).unwrap_or(0);
     let mut multi = Vec::new();
     for name in ["filtroA", "filtroB"] {
