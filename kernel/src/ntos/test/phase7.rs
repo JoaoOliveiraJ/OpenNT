@@ -2257,6 +2257,12 @@ fn user_syscalls_core(assert: Assert) {
     let memory_topology = call("NtQuerySystemInformation", 138, buffer, 0x10, info) == 0xC000_0023 && guest::read32(info) == topology_size && call("NtQuerySystemInformation", 138, buffer, topology_size as u64, info) == 0 && guest::read64(buffer) == runs.len() as u64 && guest::read64(buffer + 0x18) == runs.first().map_or(0, |run| run.0 >> 12);
     let shadow_stack = call("NtQuerySystemInformation", 221, buffer, 4, info) == 0 && guest::read32(buffer) == 0 && guest::read32(info) == 4 && call("NtQuerySystemInformation", 221, buffer, 8, info) == 0xC000_0004;
     assert(dfss && energy && usage && memory_topology && shadow_stack, "usercore: DFSS desligado, estimador de energia, uso de memoria, topologia de memoria e CET");
+    // SystemRecommendedSharedDataAlignment (o CoreMessaging): o
+    // KeLargestCacheLine em pelo menos 4 bytes, alinhamento 4.
+    guest::write32(info, 0);
+    let line = crate::ntos::ke::processor_identity::largest_cache_line();
+    let alignment = call("NtQuerySystemInformation", 58, buffer, 4, info) == 0 && guest::read32(buffer) == line && guest::read32(info) == 4 && call("NtQuerySystemInformation", 58, buffer, 2, info) == 0xC000_0004 && guest::read32(info) == 4 && call("NtQuerySystemInformation", 58, buffer + 2, 4, info) == 0x8000_0002;
+    assert(alignment, "usercore: SystemRecommendedSharedDataAlignment devolve a maior linha de cache");
     guest::write32(rsp + 0x28, 80);
     guest::write64(rsp + 0x30, info);
     guest::write32(string, 4);
@@ -2302,6 +2308,11 @@ fn user_syscalls_core(assert: Assert) {
     let vm_counters = call("NtQueryInformationProcess", u64::MAX, 3, buffer, 0x70) == 0 && guest::read32(info) == 0x70 && guest::read64(buffer) >= guest::read64(buffer + 8) && guest::read64(buffer + 0x48) == current.commit_charge.get() << 12 && guest::read64(buffer + 0x58) == guest::read64(buffer + 0x48);
     let vm_sizes = call("NtQueryInformationProcess", u64::MAX, 3, buffer, 0x58) == 0 && call("NtQueryInformationProcess", u64::MAX, 3, buffer, 0x60) == 0 && call("NtQueryInformationProcess", u64::MAX, 3, buffer, 0x68) == 0xC000_0004 && call("NtQueryInformationProcess", u64::MAX, 3, buffer, 0x50) == 0xC000_0004;
     assert(quota && quota_ex && vm_counters && vm_sizes, "usercore: ProcessQuotaLimits e ProcessVmCounters nos tamanhos do 19041");
+    // ProcessPriorityClass (o GetPriorityClass): Foreground FALSE e a classe
+    // do EPROCESS, exatamente 2 bytes.
+    guest::write32(buffer, 0xAAAA_AAAA);
+    let priority_class = call("NtQueryInformationProcess", u64::MAX, 18, buffer, 2) == 0 && guest::read32(info) == 2 && guest::read8(buffer) == 0 && guest::read8(buffer + 1) == current.priority_class.get() && guest::read16(buffer + 2) == 0xAAAA && call("NtQueryInformationProcess", u64::MAX, 18, buffer, 4) == 0xC000_0004;
+    assert(priority_class, "usercore: ProcessPriorityClass consultada");
     let cookie = (call("NtQueryInformationProcess", u64::MAX, 36, buffer, 4) == 0).then(|| guest::read32(buffer)).unwrap_or(0);
     assert(cookie != 0 && call("NtQueryInformationProcess", u64::MAX, 36, buffer, 4) == 0 && guest::read32(buffer) == cookie && call("NtQueryInformationProcess", u64::MAX, 31, buffer, 4) == 0 && guest::read32(buffer) == 1, "usercore: cookie estavel e sem depurador");
     assert(call("NtQueryInformationProcess", u64::MAX, 27, buffer, 0x100) == 0 && { let image_name = unsafe { nt::UnicodeString::at(buffer) }; image_name.length.get() > 0 && image_name.buffer.get() == buffer + nt::UnicodeString::SIZE } && call("NtQueryInformationProcess", u64::MAX, 99, buffer, 8) == 0xC000_0003 && call("NtSetInformationProcess", u64::MAX, 99, buffer, 8) == 0xC000_0003, "usercore: nome da imagem e classes invalidas");

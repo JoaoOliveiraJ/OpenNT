@@ -1793,6 +1793,25 @@ fn ntoskrnl_thread_information(assert: Assert) {
     let refused = call_export("ZwSetInformationThread", &[current_handle, 22, buffer, 4]) == Some(0xC000_000D) && call_export("ZwSetInformationThread", &[current_handle, 22, buffer, 6]) == Some(0xC000_0004) && call_export("ZwQueryInformationThread", &[current_handle, 22, buffer, 8, 0]) == Some(0xC000_0004);
     ethread.set_thread_io_priority((saved >> 9) & 7);
     assert(lowered && read_back && normal && refused, "threadinfo: ThreadIoPriority consultada e trocada nos tres bits, critica e tamanhos recusados");
+    // ThreadCycleTime (23): os 0x10 bytes com o acumulado e o TSC da
+    // amostra; ThreadNameInformation (38): o nome trocado e lido de volta,
+    // o tamanho exigido no ReturnLength e Length ímpar recusado.
+    let names = guest::alloc_bytes(0x80);
+    let cycles = call_export("ZwQueryInformationThread", &[current_handle, 23, names, 0x10, names + 0x10]) == Some(0) && guest::read64(names + 8) != 0 && guest::read32(names + 0x10) == 0x10 && call_export("ZwQueryInformationThread", &[current_handle, 23, names, 8, 0]) == Some(0xC000_0004);
+    let text: alloc::vec::Vec<u8> = "dwm".encode_utf16().flat_map(u16::to_le_bytes).collect();
+    guest::write_bytes(names + 0x40, &text);
+    let string = at::<nt::UnicodeString>(names + 0x20);
+    string.length.set(6);
+    string.maximum_length.set(8);
+    string.buffer.set(names + 0x40);
+    let named = call_export("ZwSetInformationThread", &[current_handle, 38, names + 0x20, 0x10]) == Some(0) && crate::ntos::ps::set_thread_information::thread_name(thread) == text;
+    let short = call_export("ZwQueryInformationThread", &[current_handle, 38, names, 0x12, names + 0x10]) == Some(0xC000_0023) && guest::read32(names + 0x10) == 0x16;
+    let read_name = call_export("ZwQueryInformationThread", &[current_handle, 38, names, 0x16, names + 0x18]) == Some(0) && guest::read32(names + 0x18) == 0x16 && guest::read16(names) == 6 && guest::read16(names + 2) == 6 && guest::read64(names + 8) == names + 0x10 && guest::read_bytes(names + 0x10, 6) == text;
+    string.length.set(5);
+    let odd = call_export("ZwSetInformationThread", &[current_handle, 38, names + 0x20, 0x10]) == Some(0xC000_000D) && call_export("ZwSetInformationThread", &[current_handle, 38, names + 0x20, 8]) == Some(0xC000_0004);
+    crate::ntos::ps::set_thread_information::delete_name(thread);
+    guest::free_bytes(names);
+    assert(cycles && named && short && read_name && odd, "threadinfo: ThreadCycleTime e ThreadNameInformation trocado e lido de volta");
     guest::free_bytes(buffer);
     zw_thread_impersonation_token(assert);
 }
