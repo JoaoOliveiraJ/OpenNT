@@ -25,6 +25,12 @@ pub fn install_query(query: CodeIntegrityQuery) -> Result<(), KernelError> {
     Ok(())
 }
 
+/// A CI já publicou a consulta (o boot a inicializa na fase 1 quando o
+/// volume traz a ci.dll).
+pub fn installed() -> bool {
+    INSTALLED.lock().is_some()
+}
+
 /// Confere alinhamento, acesso e tamanho antes de escrever o estado.
 pub fn query(output: u64, buffer_length: u64, output_length: u64, from_user_mode: bool) -> Result<u32, KernelError> {
     let length = buffer_length as u32;

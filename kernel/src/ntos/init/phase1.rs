@@ -159,6 +159,22 @@ pub fn init() {
     // NVMe) e `--display=basic` (o BasicDisplay.sys real no adaptador VGA,
     // sobre o dxgkrnl.sys real); com `--usb`, a controladora xHCI recebe o
     // usbxhci.sys.
+    //
+    // O Code Integrity sobe como no SepInitializationPhase1 do NT (rva
+    // 0x79d8f4), que chama o SepInitializeCodeIntegrity sem condição: ele
+    // valida as imagens de kernel carregadas daqui em diante (os drivers da
+    // árvore: acpi.sys, pci.sys, i8042prt.sys...) e responde às classes de
+    // política do NtQuerySystemInformation (a 164, que o IsLockdownSKU do
+    // KERNELBASE consulta no CoInitializeSecurity do combase; sem CI ela é
+    // STATUS_UNSUCCESSFUL e o COM do processo falha). Só o boot dos
+    // autotestes fica sem ele, a menos que um `--start-driver` o peça: os
+    // autotestes carregam imagens de kernel sintéticas do sistema de
+    // arquivos em memória, que a CI recusaria.
+    if crate::ntos::init::boot_config::kernel_test_scope() == "none" || !crate::ntos::init::boot_config::start_driver().is_empty() {
+        if let Err(error) = crate::ntos::se::code_integrity::initialize() {
+            debug_print!("[boot] Code Integrity antes da arvore de dispositivos: {}", error);
+        }
+    }
     if crate::drivers::bus::acpi_stack::enabled()
         || crate::drivers::storage::storage_stack::enabled()
         || crate::drivers::storage::nvme_stack::enabled()
@@ -166,13 +182,6 @@ pub fn init() {
         || crate::drivers::bus::usb_stack::enabled()
         || crate::drivers::net::net_stack::enabled()
     {
-        // `--start-driver` liga o Code Integrity: como no NT, ele já valida
-        // os drivers que a árvore carrega (acpi.sys, pci.sys, i8042prt.sys...).
-        if !crate::ntos::init::boot_config::start_driver().is_empty() {
-            if let Err(error) = crate::ntos::se::code_integrity::initialize() {
-                debug_print!("[boot] Code Integrity antes da arvore de dispositivos: {}", error);
-            }
-        }
         crate::drivers::bus::device_tree::build();
     }
     // `--usb`: a pilha USB 3 e HID real, que a árvore instalou na

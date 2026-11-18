@@ -5041,8 +5041,13 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   ou anexado a ele): o modo estrito de posse recusa a memória de outro.
 - **Drivers reais**: `--start-driver=<serviço>` sobe um driver do volume e
   `--trace-driver-api` mostra cada export chamado (veja o README). O
-  `--start-driver` liga o Code Integrity já no fim da fase 1, antes da
-  árvore de dispositivos, como no NT: os drivers que o PnP carrega (o
+  Code Integrity sobe no fim da fase 1, antes da árvore de dispositivos,
+  como o SepInitializationPhase1 do NT, em todo boot menos o dos autotestes
+  (que carregam imagens de kernel sintéticas do sistema de arquivos em
+  memória), onde só o `--start-driver` o liga. Sem ele a
+  SystemCodeIntegrityPolicyInformation (164) é STATUS_UNSUCCESSFUL, e o
+  IsLockdownSKU do KERNELBASE faz falhar o CoInitializeSecurity do combase
+  (o primeiro empacotamento COM de um processo). Os drivers que o PnP carrega (o
   acpi.sys, o pci.sys, o msisadrv.sys com o KMDF, o i8042prt.sys e os
   filtros de classe) passam pela validação
   (`CI_KERNEL_IMAGE_RESULT name=\FS\i8042prt.sys status=0x0`). Os testes

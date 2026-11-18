@@ -2355,11 +2355,13 @@ fn system_information_leaves(assert: Assert) {
     guest::write_bytes(buffer, &[0xAA; 40]);
     assert(boot_environment_information::query(buffer, 24, length, false).is_ok_and(|status| status == 0) && guest::read32(length) == 20 && boot_information.boot_flags.get() == 0xAAAA_AAAA_AAAA_AAAA, "bootenvinfo: formato antigo de 20 bytes");
     assert(boot_environment_information::query(buffer, 10, length, false).is_ok_and(|status| status == 0xC000_0004) && guest::read32(length) == 32, "bootenvinfo: buffer curto informa 32 bytes");
-    // Integridade de código antes da CI: opções zeradas.
+    // Integridade de código: sem a CI (boot sem a ci.dll no volume), opções
+    // zeradas; com ela, as opções que a CI informa.
     let code_integrity = at::<nt::SystemCodeintegrityInformation>(buffer);
     code_integrity.length.set(8);
     code_integrity.code_integrity_options.set(0xFFFF);
-    assert(code_integrity_information::query(buffer, 8, length, false).is_ok_and(|status| status == 0) && code_integrity.code_integrity_options.get() == 0 && guest::read32(length) == 8, "ciinfo: CodeIntegrityOptions zerado antes da CI");
+    let ci_present = code_integrity_information::installed();
+    assert(code_integrity_information::query(buffer, 8, length, false).is_ok_and(|status| status == 0) && (ci_present || code_integrity.code_integrity_options.get() == 0) && guest::read32(length) == 8, "ciinfo: CodeIntegrityOptions zerado sem a CI, informado pela CI com ela");
     code_integrity.length.set(4);
     assert(code_integrity_information::query(buffer, 4, length, false).is_ok_and(|status| status == 0xC000_0004) && code_integrity_information::query(buffer, 8, length, false).is_ok_and(|status| status == 0xC000_0004), "ciinfo: tamanho e Length do cabecalho conferidos");
     // Secure Boot: sem política entregue pelo loader.

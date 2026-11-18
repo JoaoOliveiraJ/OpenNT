@@ -2425,6 +2425,13 @@ fn user_syscalls_core(assert: Assert) {
     guest::write32(info, 0);
     let secure_boot = call("NtQuerySystemInformation", 145, buffer, 2, info) == 0 && guest::read16(buffer) == 0 && guest::read32(info) == 2 && call("NtQuerySystemInformation", 145, buffer, 1, info) == 0xC000_0004 && guest::read32(info) == 2;
     assert(secure_boot, "usercore: SystemSecureBootInformation sem Secure Boot");
+    // SystemCodeIntegrityPolicyInformation (o IsLockdownSKU do KERNELBASE,
+    // no CoInitializeSecurity do combase): com a CI, que o boot sobe na fase
+    // 1, a resposta dela; sem a ci.dll no volume, STATUS_UNSUCCESSFUL como o
+    // SeCodeIntegrityQueryPolicyInformation sem o callback.
+    let ci = crate::ntos::se::code_integrity_information::installed();
+    let policy = call("NtQuerySystemInformation", 164, buffer, 0x20, info);
+    assert(if ci { policy == 0 } else { policy == 0xC000_0001 }, "usercore: SystemCodeIntegrityPolicyInformation responde pela CI da fase 1");
     guest::write32(rsp + 0x28, 80);
     guest::write64(rsp + 0x30, info);
     guest::write32(string, 4);
