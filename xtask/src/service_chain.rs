@@ -11,7 +11,9 @@
 //!   `Rpc\Extensions` e `CurrentVersion\NetworkServiceTriggers`;
 //! - o lsm.dll lê os valores de `Windows NT\CurrentVersion\Winlogon` e
 //!   `CurrentVersion\SharedPC`; o winsrvext.dll do csrss lê
-//!   `Control\PriorityControl`.
+//!   `Control\PriorityControl`;
+//! - o winlogon.exe lê os assinantes das notificações de sessão em
+//!   `Control\Winlogon\Notifications`.
 //!
 //! O `SYSTEM\Setup` que o lsm.dll também lê não vem daqui: o estado de setup
 //! de uma instalação concluída é o mesmo em toda máquina e sai da tabela
@@ -46,6 +48,14 @@ pub fn system_keys(control_set: &str) -> Vec<HostKey> {
         use crate::host_language::registry;
         let host = "SYSTEM\\CurrentControlSet";
         registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\Control\\PriorityControl"), &format!("{control_set}\\Control\\PriorityControl"), false, &mut keys);
+        // Os assinantes das notificações do winlogon (Components: o serviço,
+        // os eventos e o nome de cada um) e a ordem deles por evento
+        // (Configurations\Default). Sem a chave, o NotifyLoadConfiguration
+        // (winlogon 0x18e60) falha, o NotifyCreateSession mostra o erro pelo
+        // LogonUI e a máquina de estados termina antes da tela de bloqueio.
+        // Um serviço assinante que o convidado não tem só fica no log: o
+        // IsServiceExpectedToStart (0x94594) não espera por ele.
+        registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\Control\\Winlogon\\Notifications"), &format!("{control_set}\\Control\\Winlogon\\Notifications"), true, &mut keys);
     }
     #[cfg(not(windows))]
     let _ = control_set;
