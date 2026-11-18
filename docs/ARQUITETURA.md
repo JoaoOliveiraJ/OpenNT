@@ -920,7 +920,15 @@ real no despachante: a 1 espera um KEVENT sem prazo numa syscall de teste e
 a 2, que só fica pronta depois disso, a vê bloqueada (Waiting, KernelStack
 dentro da pilha dela) e sinaliza o evento; a 1 volta na própria pilha com
 STATUS_SUCCESS e devolve 0 ao anel 3. Um segundo cenário termina a thread
-bloqueada (THREAD_IS_TERMINATING, desfeita na própria pilha). O autoteste
+bloqueada (THREAD_IS_TERMINATING, desfeita na própria pilha). Dois cenários
+terminam uma thread com Win32Thread (um bloco do teste): bloqueada numa
+espera não alertável de UserMode, como a do xxxRealSleepThread do win32kfull,
+o NtTerminateThread da outra só pede o término (ela segue viva, com
+Terminated e TerminationApcRequest), a espera sai com STATUS_USER_APC na
+pilha dela e ela sai no fim do serviço sem voltar ao anel 3; girando no anel
+3, ela sai pelo intervalo sem anel 3. Nos dois, uma rotina de saída de thread
+do teste vê a thread corrente, na própria pilha de kernel, num intervalo de
+serviço e com o Win32Thread publicado. O autoteste
 `ntos/test/multiprocess/queue_wait.rs` faz o mesmo com o KeRemoveQueue: a
 thread que espera na fila fica parada (CycleTime constante) enquanto a
 outra gira 50 ms e insere, e volta com a entrada; com prazo de 100 ms e
