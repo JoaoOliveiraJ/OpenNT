@@ -110,12 +110,26 @@ fn finish_server(request: &Arc<Request>, result: JobResult) -> Result<(), Kernel
         state.queued = true;
         state.direct = message.direct;
     });
-    port.with(|state| state.pending.push(message));
+    // O AlpcpAcceptConnectPort do 19041 (Type 0xb em 0x5e17d0,
+    // AlpcpDispatchMessage em 0x5e1a62 -> AlpcpDispatchReplyToPort 0x5e35bc)
+    // enfileira o LPC_CONNECTION_REPLY de uma conexão assíncrona na porta do
+    // cliente dentro do accept, antes de qualquer mensagem que o servidor
+    // mande depois pela porta de comunicação. Aqui a thread do cliente só
+    // chega a este ponto ao acordar da espera pela decisão, quando o
+    // servidor já pode ter postado nesta porta (post_server_message): a
+    // resposta da conexão (sequência 1) vai à frente dessas mensagens. O
+    // cliente do CoreMessaging (AlpcConnection::Callback_HandleReceivedBuffer)
+    // falha se outra coisa vier primeiro.
+    port.with(|state| state.pending.insert(0, message));
     crate::ntos::alpc::kernel_entry::notify_waiters();
     if let Some(event) = direct {
         dispatcher::set_event(event);
     } else if let Some(completion) = port.with(|state| state.completion.clone()) {
         completion.notify();
+    } else {
+        // AlpcpCompleteDispatchMessage (KeReleaseSemaphoreEx em 0x5e58f4): a
+        // porta esperável é liberada uma vez por mensagem.
+        port.signal_waitable();
     }
     release_request(request, status, true)
 }

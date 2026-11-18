@@ -4943,6 +4943,31 @@ fn user_alpc_connect_port(assert: Assert) {
     let decided = third_port.as_ref().map(|port| port.with(|state| (state.connection_state, state.pending.len())));
     let late = receive(third);
     assert(deferred == Some(0) && pending_state == Some(port_objects::CONNECTION_PENDING) && blocked == Some(0xC000_0707) && decided == Some((port_objects::CONNECTION_CONNECTED, 1)) && late == Some(0) && read(output + nt::PortMessage::SIZE, 1) == [0xAA], "useralpccp: decisao adiada concluida pelo pump");
+    // Conexão assíncrona numa porta esperável, com uma mensagem do servidor
+    // postada antes de a decisão chegar ao cliente: o LPC_CONNECTION_REPLY
+    // sai primeiro e cada mensagem libera o semáforo da porta (19041
+    // AlpcpAcceptConnectPort 0x5e17d0/0x5e1a62, AlpcpCompleteDispatchMessage
+    // 0x5e58f4), a ordem que o AlpcClientConnection do CoreMessaging exige.
+    let waitable = block + 0x700;
+    guest::write_bytes(waitable, &[0u8; nt::AlpcPortAttributes::SIZE as usize]);
+    let port_attributes = unsafe { nt::AlpcPortAttributes::at(waitable) };
+    port_attributes.flags.set(0x7_0000);
+    port_attributes.max_message_length.set(0x200);
+    ALPC_CONNECT_DEFERRED.store(true, Ordering::SeqCst);
+    prepare();
+    let opened = kernel_entry::begin_connection(&[block + 0x628, name, 0, waitable, 0, 0, connection, capacity, 0, 0, 0]).ok().and_then(|mut pending| pending.poll());
+    ALPC_CONNECT_DEFERRED.store(false, Ordering::SeqCst);
+    let fifth = guest::read64(block + 0x628);
+    let fifth_port = port_objects::port_of(open_pointer::resolve(fifth, false).and_then(|resolved| resolved.ok()).map_or(0, |resolved| resolved.item.pointer));
+    let posted = fifth_port.as_ref().and_then(|port| alpc::post_server_message(port, 3, &[0x33], transport::Sender::default(), |_| {}).ok()).and_then(Result::ok);
+    for _ in 0..4 {
+        alpc::pump();
+    }
+    let kinds = fifth_port.as_ref().map(|port| port.with(|state| state.pending.iter().map(|message| message.bytes.as_ref().map_or(0, |bytes| u16::from_le_bytes([bytes[4], bytes[5]]))).collect::<Vec<u16>>()));
+    let signals = fifth_port.as_ref().map_or(0, |port| crate::ntos::ke::dispatcher::read_state(port.wait_object()));
+    let first_kind = receive(fifth).filter(|status| *status == 0).map(|_| unsafe { nt::PortMessage::at(output) }.u2.s2.type_.get());
+    let second_kind = receive(fifth).filter(|status| *status == 0).map(|_| unsafe { nt::PortMessage::at(output) }.u2.s2.type_.get());
+    assert(opened == Some(0) && posted.is_some() && kinds == Some(alloc::vec![11, 3]) && signals == 2 && first_kind == Some(11) && second_kind == Some(3), "useralpccp: conexao assincrona entrega o LPC_CONNECTION_REPLY antes da mensagem do servidor e libera a porta esperavel");
     // Variante Ex: OBJECT_ATTRIBUTES da porta de conexão.
     let attributes = block + 0x500;
     set_object_attributes(unsafe { nt::ObjectAttributes::at(attributes) }, nt::ObjectAttributes::SIZE as u32, 0, name, 0);
@@ -4953,7 +4978,8 @@ fn user_alpc_connect_port(assert: Assert) {
     // Fechamento: cada porta iniciada desconecta o serviço.
     drop(first_port);
     drop(third_port);
-    for handle in [first, second, third, fourth] {
+    drop(fifth_port);
+    for handle in [first, second, third, fourth, fifth] {
         let _ = open_pointer::close(handle);
     }
     transport::unregister(&listener);
