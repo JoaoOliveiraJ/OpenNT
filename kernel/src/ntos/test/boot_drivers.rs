@@ -13,6 +13,10 @@
 //!   IoStartNextPacket (adiado, DOE_SIO_DEFERRED); sem redirecionamento o
 //!   StartIo conclui com STATUS_NOT_FOUND, e um tom sem duração conclui sem
 //!   passar pela fila.
+//! - ksecdd.sys: dois processos de teste cifram e decifram memória pelo
+//!   \Device\KsecDD como o cryptbase.dll (SystemFunction040/041), com as
+//!   quatro opções; o que um processo cifrou o outro decifra, menos com
+//!   SAME_PROCESS, e a opção do SYSTEM não decifra para o token anônimo.
 //! - fs_rec.sys: os reconhecedores registrados pelo IoRegisterFileSystem
 //!   estão nas filas de disco e de CD-ROM, e cada reconhecedor de disco
 //!   responde a um IRP_MN_MOUNT_VOLUME sobre o volume NTFS do segundo disco
@@ -59,6 +63,7 @@ pub fn after_start(name: &str) {
         "null" => null_device(),
         "beep" => beep_device(),
         "fs_rec" => file_system_recognizers(),
+        "ksecdd" => ksecdd_memory_protection(),
         _ => {}
     }
 }
@@ -130,6 +135,40 @@ impl UserCalls {
 
     fn close(&self, handle: u64) -> u32 {
         self.call("NtClose", [handle, 0, 0, 0])
+    }
+
+    /// NtOpenFile(SYNCHRONIZE | FILE_READ_DATA, OBJECT_ATTRIBUTES sem
+    /// atributos, FILE_SHARE_READ | WRITE | DELETE,
+    /// FILE_SYNCHRONOUS_IO_NONALERT) de \Device\KsecDD, como o
+    /// EncryptMemoryInitialize do cryptbase.dll: o status e o handle.
+    fn open_ksecdd(&self) -> (u32, u64) {
+        let units: Vec<u16> = "\\Device\\KsecDD".encode_utf16().collect();
+        let (name, text) = (self.at(Self::NAME), self.at(Self::NAME) + 0x10);
+        for (index, unit) in units.iter().enumerate() {
+            guest::write16(text + index as u64 * 2, *unit);
+        }
+        guest::write16(name, units.len() as u16 * 2);
+        guest::write16(name + 2, units.len() as u16 * 2);
+        guest::write64(name + 8, text);
+        let attributes = self.at(Self::ATTRIBUTES);
+        guest::write_bytes(attributes, &[0; 0x30]);
+        guest::write32(attributes, 0x30);
+        guest::write64(attributes + 0x10, name);
+        self.stack(&[7, 0x20]);
+        let status = self.call("NtOpenFile", [self.at(Self::HANDLE), 0x10_0001, attributes, self.at(Self::IOSB)]);
+        (status, guest::read64(self.at(Self::HANDLE)))
+    }
+
+    /// O SystemFunction040/041 do cryptbase.dll: NtDeviceIoControlFile no
+    /// \Device\KsecDD com o mesmo buffer de entrada e de saída
+    /// (METHOD_OUT_DIRECT), cifrado ou decifrado no lugar. O status, o IOSB
+    /// e o conteúdo do buffer depois do pedido.
+    fn protect_memory(&self, handle: u64, code: u64, data: &[u8]) -> (u32, (u32, u64), Vec<u8>) {
+        let buffer = self.at(Self::DATA);
+        guest::write_bytes(buffer, data);
+        guest::write_bytes(self.at(Self::IOSB), &[0; 16]);
+        let status = self.ioctl(handle, Self::IOSB, code, buffer, data.len() as u64, buffer, data.len() as u64);
+        (status, self.iosb(Self::IOSB), guest::read_bytes(buffer, data.len()))
     }
 }
 
@@ -210,6 +249,106 @@ fn beep_device() {
     let queue_ok = queue == Some((0, 0, true, 0));
     if opened == 0 && waiting == STATUS_PENDING && beep == 0 && (redirect_status, redirect_bytes, frequency, duration) == (0, 8, 440, 100) && queue_ok && alone == STATUS_NOT_FOUND && instant == 0 && short == 0xC000_000D && closed == 0 {
         debug_print!("BEEP_DEVICE_OK StartIo=440Hz/100ms fila=livre");
+    }
+}
+
+// ---- ksecdd.sys --------------------------------------------------------------
+
+/// Os IOCTLs do RtlEncryptMemory/RtlDecryptMemory (SystemFunction040/041 do
+/// cryptbase.dll) por opção: SAME_PROCESS (0), CROSS_PROCESS (1),
+/// SAME_LOGON (2) e a 4 do CredProtectEx(CRED_PROTECT_TO_SYSTEM). O
+/// ksecdd.sys passa todos à extensão de device control que o cng.sys lhe
+/// entregou no DriverEntry (IOCTL 0x390048 no \Device\CNG).
+const KSEC_SAME_PROCESS: (u64, u64) = (0x39_000E, 0x39_0012);
+const KSEC_CROSS_PROCESS: (u64, u64) = (0x39_0016, 0x39_001A);
+const KSEC_SAME_LOGON: (u64, u64) = (0x39_001E, 0x39_0022);
+const KSEC_FOR_SYSTEM: (u64, u64) = (0x39_007A, 0x39_007E);
+const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+
+/// Uma volta de cifra e decifra no mesmo processo: o status e o IOSB da
+/// cifra, o texto cifrado, e se a decifra devolveu o texto original com o
+/// IOSB do tamanho inteiro.
+struct RoundTrip {
+    encrypted: (u32, (u32, u64)),
+    cipher: Vec<u8>,
+    restored: bool,
+}
+
+impl RoundTrip {
+    fn run(user: &UserCalls, handle: u64, (encrypt, decrypt): (u64, u64), plain: &[u8]) -> Self {
+        let (status, iosb, cipher) = user.protect_memory(handle, encrypt, plain);
+        let (back, back_iosb, text) = user.protect_memory(handle, decrypt, &cipher);
+        Self { encrypted: (status, iosb), cipher, restored: back == 0 && back_iosb == (0, plain.len() as u64) && text == plain }
+    }
+
+    fn ok(&self, plain: &[u8]) -> bool {
+        self.encrypted == (0, (0, plain.len() as u64)) && self.cipher != plain && self.restored
+    }
+}
+
+/// O caminho do CredProtectEx do LogonUI e do CredUnprotectEx do lsass:
+/// dois processos de teste usam o \Device\KsecDD como o cryptbase.dll. No
+/// primeiro, cada opção cifra e decifra 32 bytes (AES) no lugar, a
+/// CROSS_PROCESS também 24 bytes (3DES), um tamanho fora de múltiplo de 8
+/// é recusado, e impersonando o token anônimo a decifra da opção 4 é negada
+/// (só a sessão do SYSTEM decifra) e a da SAME_LOGON não devolve o texto. O
+/// segundo processo decifra o que o primeiro cifrou: CROSS_PROCESS, a opção
+/// 4 e SAME_LOGON devolvem o texto (a chave do boot é uma só no cng.sys),
+/// SAME_PROCESS não (a chave mistura o ProcessCookie e a hora de criação do
+/// processo), e a opção 4 cifra igual nos dois.
+fn ksecdd_memory_protection() {
+    let plain: Vec<u8> = (0..32u8).map(|index| index.wrapping_mul(7).wrapping_add(3)).collect();
+    let first = with_test_process("ksec-cifra.exe", None, |_| {
+        let user = UserCalls::new()?;
+        let (opened, handle) = user.open_ksecdd();
+        let trips: Vec<RoundTrip> = [KSEC_SAME_PROCESS, KSEC_CROSS_PROCESS, KSEC_SAME_LOGON, KSEC_FOR_SYSTEM].into_iter().map(|codes| RoundTrip::run(&user, handle, codes, &plain)).collect();
+        let triple_des = RoundTrip::run(&user, handle, KSEC_CROSS_PROCESS, &plain[..24]).ok(&plain[..24]);
+        let odd = user.protect_memory(handle, KSEC_FOR_SYSTEM.0, &plain[..20]).0;
+        let anonymous = user.call("NtImpersonateAnonymousToken", [u64::MAX - 1, 0, 0, 0]);
+        let denied = user.protect_memory(handle, KSEC_FOR_SYSTEM.1, &trips[3].cipher).0;
+        let (other_logon, _, other_text) = user.protect_memory(handle, KSEC_SAME_LOGON.1, &trips[2].cipher);
+        // De volta ao token primário (o PsRevertToSelf da thread de teste),
+        // a opção do SYSTEM decifra de novo.
+        let _ = call_export("PsRevertToSelf", &[]);
+        let (after, _, after_text) = user.protect_memory(handle, KSEC_FOR_SYSTEM.1, &trips[3].cipher);
+        let reverted = after == 0 && after_text == plain;
+        let closed = user.close(handle);
+        Some((opened, trips, triple_des, odd, anonymous, denied, other_logon == 0 && other_text != plain, reverted, closed))
+    })
+    .flatten();
+    let Some((opened, trips, triple_des, odd, anonymous, denied, other_logon, reverted, closed)) = first else {
+        debug_print!("[ksecdd] processo de teste nao montado");
+        return;
+    };
+    let (same_cipher, cross_cipher, logon_cipher, system_cipher) = (trips[0].cipher.clone(), trips[1].cipher.clone(), trips[2].cipher.clone(), trips[3].cipher.clone());
+    let second = with_test_process("ksec-decifra.exe", None, |_| {
+        let user = UserCalls::new()?;
+        let (opened, handle) = user.open_ksecdd();
+        let decrypted = |code: u64, cipher: &[u8]| {
+            let (status, iosb, text) = user.protect_memory(handle, code, cipher);
+            (status, iosb.0, text == plain)
+        };
+        let cross = decrypted(KSEC_CROSS_PROCESS.1, &cross_cipher);
+        let system = decrypted(KSEC_FOR_SYSTEM.1, &system_cipher);
+        let logon = decrypted(KSEC_SAME_LOGON.1, &logon_cipher);
+        let same = decrypted(KSEC_SAME_PROCESS.1, &same_cipher);
+        let (again, _, again_cipher) = user.protect_memory(handle, KSEC_FOR_SYSTEM.0, &plain);
+        let closed = user.close(handle);
+        Some((opened, cross, system, logon, same, again == 0 && again_cipher == system_cipher, closed))
+    })
+    .flatten();
+    let Some((second_opened, cross, system, logon, same, same_system_key, second_closed)) = second else {
+        debug_print!("[ksecdd] segundo processo de teste nao montado");
+        return;
+    };
+    let summary: Vec<_> = trips.iter().map(|trip| (trip.encrypted.0, trip.encrypted.1 .0, trip.cipher != plain, trip.restored)).collect();
+    debug_print!("[ksecdd] \\Device\\KsecDD: abertura={:#x} voltas(same,cross,logon,system)={:?} 3des={} tamanho-impar={:#x} anonimo={:#x} decifra-system-anonima={:#x} logon-alheio-difere={} system-depois-do-revert={} fechamento={:#x}", opened, summary, triple_des, odd, anonymous, denied, other_logon, reverted, closed);
+    debug_print!("[ksecdd] outro processo: abertura={:#x} cross={:?} system={:?} logon={:?} same-process={:?} system-mesma-chave={} fechamento={:#x}", second_opened, cross, system, logon, same, same_system_key, second_closed);
+    let first_ok = opened == 0 && trips.iter().all(|trip| trip.ok(&plain)) && triple_des && odd == STATUS_INVALID_PARAMETER && anonymous == 0 && denied == STATUS_ACCESS_DENIED && other_logon && reverted && closed == 0;
+    let second_ok = second_opened == 0 && cross == (0, 0, true) && system == (0, 0, true) && logon == (0, 0, true) && same == (0, 0, false) && same_system_key && second_closed == 0;
+    if first_ok && second_ok {
+        debug_print!("KSECDD_MEMORY_OK same/cross/logon/system cross-process=ok");
     }
 }
 

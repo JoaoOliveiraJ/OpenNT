@@ -5178,8 +5178,19 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   `ntos/test/boot_drivers.rs` usa o que o driver publicou: um processo de
   teste lê e grava o `\Device\Null` do null.sys (`NULL_DEVICE_OK`) e manda
   IOCTL_BEEP_SET ao `\Device\Beep` do beep.sys pelo StartIo dele
-  (`BEEP_DEVICE_OK`), e os reconhecedores do fs_rec.sys respondem a um
-  IRP_MN_MOUNT_VOLUME sobre o volume NTFS (`FS_REC_OK`).
+  (`BEEP_DEVICE_OK`), os reconhecedores do fs_rec.sys respondem a um
+  IRP_MN_MOUNT_VOLUME sobre o volume NTFS (`FS_REC_OK`), e dois processos
+  de teste cifram e decifram memória pelo `\Device\KsecDD` como o
+  cryptbase.dll (`KSECDD_MEMORY_OK`): o ksecdd.sys passa os IOCTLs do
+  RtlEncryptMemory à extensão de device control que o cng.sys lhe
+  entregou no DriverEntry (0x390048 no `\Device\CNG`), e o CngEncryptMemoryEx
+  deriva a chave do boot com o ProcessCookie e a hora de criação do
+  processo (SAME_PROCESS, pelo ZwQueryInformationProcess de modo kernel e o
+  PsGetProcessCreateTimeQuadPart), com o AuthenticationId do token do
+  sujeito (SAME_LOGON; a opção 4 do CredProtectEx usa o do SYSTEM e só a
+  sessão 0x3e7 decifra) ou sem nada (CROSS_PROCESS). O ProcessCookie
+  (`ps/query_process::process_cookie`) é o mesmo EPROCESS.Cookie nos dois
+  modos.
 - **Depurador do kernel, cliente** (`tools/kd-client`): só a biblioteca
   padrão. O prompt do `cargo xtask debug` (`xtask/src/debug`) e o
   depurador gráfico usam o mesmo código.
