@@ -2775,8 +2775,28 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     reservadas.
   - `commit.rs`: commit do sistema. O limite começa nas páginas físicas e
     sobe com o tamanho de cada arquivo. A página privada comitada cobra do
-    sistema antes do processo. Acima do limite a alocação falha com
-    STATUS_COMMITMENT_LIMIT.
+    sistema antes do processo. Acima do limite, com o limite abaixo do
+    limite máximo, a cobrança espera um pedido de extensão dos arquivos e
+    recomeça se algum cresceu; senão a alocação falha com
+    STATUS_COMMITMENT_LIMIT. Uma cobrança que passa de 90% do limite pede a
+    extensão sem esperar.
+  - `paging_file/extend.rs`: extensão até o MaximumSize, como no 19041. O
+    pedido é um `_MMPAGE_FILE_EXPANSION` do PDB, numa fila atendida por uma
+    thread de prioridade 19 (o papel da MiDereferenceSegmentThread):
+    MiIssuePageExtendRequest, MiExtendPagingFiles,
+    MiAttemptPageFileExtension (o novo fim vai ao file system pelo
+    IoSetInformation com FILE_END_OF_FILE_INFORMATION_EX; a extensão é de
+    pelo menos 64 MB, ou 16 MB na segunda tentativa, e deixa 256 MB livres
+    no volume) e MiFinishPageFileExtension. O limite de commit sobe com o
+    que cresceu. O modified page writer sem espaço chama o
+    MiPageFileNoFreeSpace, que faz o pedido estático (commit acima de 80%
+    do limite, ou 4096 páginas ou mais esperando o arquivo); quem grava
+    páginas para conseguir memória espera esse pedido terminar e continua
+    gravando no espaço novo. No D: (file system embutido), o
+    IoSetInformation de FileEndOfFileInformation num FILE_OBJECT muda o
+    tamanho do arquivo no volume (`io/file/zw.rs`). O volume do boot do
+    smss tem 544 MB livres: o máximo do arquivo, os 256 MB que a extensão
+    deixa e folga.
   - E/S: IoPageRead e IoSynchronousPageWrite (IRP_PAGING_IO,
     `io/paging_io.rs`), enviados ao dispositivo do IoGetRelatedDeviceObject.
     No D: (file system embutido) o volume atende esses IRPs direto nas runs
@@ -2811,7 +2831,7 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     SystemPageFileInformation(Ex).
   - Diferenças: sem working set por processo; pilha inicial, PEB, TEB e
     parâmetros do processo ficam residentes; o writer é síncrono; o arquivo
-    não cresce nem encolhe.
+    cresce mas não encolhe (sem MiAttemptPageFileReduction).
   - Testes: `ntos/test/paging_file.rs` (fase 7) e o [[teste]] `pagefile`
     (`PAGEFILE_OK` e o `MEMORY_PRESSURE_OK` de
     `ntos/test/memory_pressure.rs`).

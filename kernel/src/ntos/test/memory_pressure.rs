@@ -469,7 +469,7 @@ fn run() -> Result<String, String> {
     if exit_status != EXIT_CODE {
         return Err(alloc::format!("codigo de saida {exit_status:#x}"));
     }
-    Ok(alloc::format!("comitados {} MB com {} MB de RAM; arquivo {} de {} paginas, pico {} em uso; {} paginas gravadas, {} lidas, {} de transicao; limite de commit {} paginas", chunks * 4, ram >> 20, name, total, peak, written, read, transitions, limit))
+    Ok(alloc::format!("comitados {} MB com {} MB de RAM; arquivo {} de {} paginas (minimo {}, maximo {}), pico {} em uso; {} paginas gravadas, {} lidas, {} de transicao; limite de commit {} paginas", chunks * 4, ram >> 20, name, total, expected.minimum, expected.maximum, peak, written, read, transitions, limit))
 }
 
 /// Inicia a thread do teste (`--memory-pressure`).

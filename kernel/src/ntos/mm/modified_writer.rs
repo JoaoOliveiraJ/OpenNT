@@ -34,7 +34,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use super::paging;
-use super::paging_file::{self, Slot, MAXIMUM_WRITE_CLUSTER};
+use super::paging_file::{self, extend, Slot, MAXIMUM_WRITE_CLUSTER};
 use super::pfn;
 use super::working_set::{self, ListedPage, COUNTERS};
 use crate::ntos::inc::field::NtStruct;
@@ -151,12 +151,28 @@ fn still_listed(page: &ListedPage, modified: bool) -> bool {
 }
 
 /// Grava até `limit` páginas da lista de modificadas, em clusters; devolve
-/// quantas foram gravadas.
+/// quantas foram gravadas. Sem espaço nos arquivos, pede a extensão deles
+/// (MiPageFileNoFreeSpace) e, se o contexto pode esperar, espera o pedido
+/// e continua gravando no espaço novo.
 pub fn write_modified(limit: u64) -> u64 {
+    let mut written = 0;
+    loop {
+        let (count, no_space) = write_clusters(limit - written);
+        written += count;
+        if !no_space || written >= limit || !extend::wait_for_attempt() {
+            return written;
+        }
+    }
+}
+
+/// Uma passada do writer: (páginas gravadas, os arquivos ficaram sem
+/// espaço).
+fn write_clusters(limit: u64) -> (u64, bool) {
     if !acquire_writer() {
-        return 0;
+        return (0, false);
     }
     let mut written = 0;
+    let mut no_space = false;
     while written < limit {
         let mut cluster: Vec<ListedPage> = Vec::new();
         while cluster.len() < MAXIMUM_WRITE_CLUSTER {
@@ -172,14 +188,21 @@ pub fn write_modified(limit: u64) -> u64 {
         // arquivo antes de desistir.
         let space = paging_file::allocate(cluster.len() as u64).or_else(|| (working_set::release_clean_copies() > 0).then(|| paging_file::allocate(cluster.len() as u64)).flatten());
         let Some((first, count)) = space else {
-            // Sem espaço: as páginas ficam em transição na lista.
-            let mut list = MODIFIED.lock();
-            for page in cluster.into_iter().rev() {
-                list.push_front(page);
-            }
+            // Sem espaço: as páginas ficam em transição na lista, e os
+            // arquivos podem crescer.
+            let waiting = {
+                let mut list = MODIFIED.lock();
+                for page in cluster.into_iter().rev() {
+                    list.push_front(page);
+                }
+                list.len() as u64
+            };
             if !NO_SPACE.swap(true, Ordering::Relaxed) {
-                crate::debug_print!("[mm] arquivo de paginacao sem espaco para o modified page writer");
+                let commitment = super::commit::snapshot();
+                crate::debug_print!("[mm] arquivo de paginacao sem espaco para o modified page writer: {} paginas esperando, commit {} de {} (maximo {})", waiting, commitment.committed, commitment.limit, commitment.limit_maximum);
             }
+            extend::page_file_no_free_space(waiting);
+            no_space = true;
             break;
         };
         let rest: Vec<ListedPage> = cluster.split_off(count as usize);
@@ -218,7 +241,7 @@ pub fn write_modified(limit: u64) -> u64 {
         written += count;
     }
     release_writer();
-    written
+    (written, no_space)
 }
 
 /// Reaproveita até `goal` páginas de reserva: a PTE vira de arquivo de

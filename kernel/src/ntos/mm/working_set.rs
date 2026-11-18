@@ -65,6 +65,8 @@ const PTE_FRAME: u64 = 0x000F_FFFF_FFFF_F000;
 const TEMPLATE_BITS: u64 = PTE_VALID | PTE_WRITE | PTE_OWNER | PTE_WRITE_THROUGH | PTE_CACHE_DISABLE | PTE_NO_EXECUTE;
 /// Páginas que um corte tira de uma vez, no mínimo.
 const TRIM_BATCH: u64 = 64;
+/// O corte de cada volta com os arquivos de paginação cheios.
+const FULL_FILE_TRIM_BATCH: u64 = 1024;
 const STATUS_IN_PAGE_ERROR: u32 = 0xC000_0006;
 const STATUS_NO_MEMORY: u32 = 0xC000_0017;
 
@@ -492,6 +494,19 @@ fn reclaim(count: u64) -> Result<u64, KernelError> {
         if can_do_io() && sync::shared_locks_held() == 0 {
             modified_writer::write_modified(count.max(TRIM_BATCH));
             freed += modified_writer::repurpose(count - freed);
+            // Arquivos cheios que ainda podem crescer: enquanto quem pediu
+            // memória espera, o corte continua (o papel do
+            // MmWorkingSetManager com pouca memória disponível) e a lista de
+            // modificadas cresce; o writer sem espaço passa o tamanho dela
+            // ao MiPageFileNoFreeSpace, que pede a extensão com 4096 páginas
+            // esperando o arquivo.
+            while freed < count && paging_file::free_pages() == 0 && paging_file::extend::can_grow() {
+                if trim(FULL_FILE_TRIM_BATCH) == 0 {
+                    break;
+                }
+                modified_writer::write_modified(count.max(TRIM_BATCH));
+                freed += modified_writer::repurpose(count - freed);
+            }
         } else {
             modified_writer::wake();
         }

@@ -25,13 +25,22 @@
 //!   volume pelo IoGetRelatedDeviceObject.
 //! - MmGetPageFileInformation (rva 0x6a1644): a SystemPageFileInformation
 //!   (`page_file_information`).
+//! - Extensão até o MaximumSize (`extend`): o MiFinishPageFileExtension
+//!   (rva 0x543530) libera no bitmap as páginas novas, soma-as a Size,
+//!   FreeSpace e FreeReservationSpace e, se o modified page writer esperava
+//!   espaço no arquivo (AdriftMdls, ligado pelo MiPageFileNoFreeSpace), o
+//!   acorda (RescanPageFilesEvent); o MiUpdatePagingFileMinimum (rva
+//!   0x543e7c) soma a extensão ao MinimumSize.
 //!
 //! Diferenças declaradas: o NT reserva espaço por VAD
 //! (FreeReservationSpace, MiReservePageFileSpace) e mantém hashes das
 //! páginas gravadas; o OpenNT só aloca espaço na escrita, e o
-//! FreeReservationSpace acompanha o FreeSpace.
+//! FreeReservationSpace acompanha o FreeSpace. O AdriftMdls volta a zero
+//! quando a extensão acorda o writer (no NT, quando o writer revarre os
+//! arquivos).
 
 pub mod create;
+pub mod extend;
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -86,6 +95,9 @@ struct PagingFile {
     /// O arquivo de troca de working sets (Priority com o bit 31): fica fora
     /// do commit, da paginação comum e da SystemPageFileInformation.
     working_set_swap: bool,
+    /// AdriftMdls: o modified page writer achou o arquivo cheio e espera a
+    /// extensão.
+    adrift: bool,
 }
 
 impl PagingFile {
@@ -160,6 +172,23 @@ impl PagingFile {
         self.free += 1;
         self.publish();
     }
+
+    /// MiFinishPageFileExtension: as `pages` depois de Size entram livres;
+    /// devolve o AdriftMdls de antes.
+    fn finish_extension(&mut self, pages: u64) -> bool {
+        let pages = pages.min(self.maximum - self.size);
+        for page in self.size..self.size + pages {
+            self.set(page, false);
+        }
+        self.size += pages;
+        self.free += pages;
+        let descriptor = self.descriptor();
+        descriptor.refresh_allocation_cluster.set(descriptor.refresh_allocation_cluster.get().wrapping_add(1));
+        self.publish();
+        let adrift = core::mem::replace(&mut self.adrift, false);
+        descriptor.set_adrift_mdls(0);
+        adrift
+    }
 }
 
 static FILES: SpinLock<Vec<PagingFile>> = SpinLock::new(Vec::new());
@@ -208,7 +237,7 @@ pub fn insert(new: NewPagingFile) -> Result<u32, u32> {
         bitmap[(page / 64) as usize] &= !(1 << (page % 64));
     }
     let free = new.minimum - RESERVED_PAGES;
-    let file = PagingFile { descriptor: descriptor_address, file_object: new.file_object, name: new.name, size: new.minimum, minimum: new.minimum, maximum: new.maximum, free, peak: 0, highest: 0, bitmap, hint: RESERVED_PAGES, working_set_swap: new.working_set_swap };
+    let file = PagingFile { descriptor: descriptor_address, file_object: new.file_object, name: new.name, size: new.minimum, minimum: new.minimum, maximum: new.maximum, free, peak: 0, highest: 0, bitmap, hint: RESERVED_PAGES, working_set_swap: new.working_set_swap, adrift: false };
     file.publish();
     if file.working_set_swap {
         // WsSwapPagefile | NoReservations | SwapSupported (0x30 | 0x80).
@@ -244,7 +273,57 @@ pub fn insert(new: NewPagingFile) -> Result<u32, u32> {
         number
     };
     super::modified_writer::start();
+    extend::start();
     Ok(number)
+}
+
+/// O que a extensão consulta de um arquivo da lista
+/// (MI_VISIBLE_PARTITION.PagingFile[número]).
+#[derive(Clone, Copy, Debug)]
+pub struct ExtensionView {
+    pub number: u32,
+    pub size: u64,
+    pub maximum: u64,
+    pub file_object: u64,
+    /// Fica fora da extensão por commit (flags 0x50 do MMPAGING_FILE).
+    pub working_set_swap: bool,
+}
+
+/// Os arquivos da lista, na ordem dela.
+pub fn extension_views() -> Vec<ExtensionView> {
+    FILES.lock().iter().enumerate().map(|(number, file)| ExtensionView { number: number as u32, size: file.size, maximum: file.maximum, file_object: file.file_object, working_set_swap: file.working_set_swap }).collect()
+}
+
+/// MiFinishPageFileExtension(Partition, PagingFile, Pages), depois que o
+/// file system aceitou o novo fim do arquivo: devolve se o modified page
+/// writer esperava espaço nele (AdriftMdls).
+pub fn finish_extension(number: u32, pages: u64) -> bool {
+    FILES.lock().get_mut(number as usize).is_some_and(|file| file.finish_extension(pages))
+}
+
+/// MiUpdatePagingFileMinimum(PagingFile, Pages).
+pub fn update_minimum(number: u32, pages: u64) {
+    if let Some(file) = FILES.lock().get_mut(number as usize) {
+        file.minimum = (file.minimum + pages).min(file.maximum);
+        file.descriptor().minimum_size.set(file.minimum);
+    }
+}
+
+/// A parte do MiPageFileNoFreeSpace de cada arquivo comum: sem FreeSpace, o
+/// arquivo fica com AdriftMdls. Devolve se algum ficou.
+pub fn mark_full_files_adrift() -> bool {
+    let mut marked = false;
+    for file in FILES.lock().iter_mut().filter(|file| !file.working_set_swap && file.free == 0) {
+        file.adrift = true;
+        file.descriptor().set_adrift_mdls(1);
+        marked = true;
+    }
+    marked
+}
+
+/// A soma do FreeSpace dos arquivos comuns.
+pub fn free_pages() -> u64 {
+    FILES.lock().iter().filter(|file| !file.working_set_swap).fold(0u64, |sum, file| sum.saturating_add(file.free))
 }
 
 /// MmNumberOfPagingFiles.

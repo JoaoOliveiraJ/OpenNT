@@ -30,8 +30,10 @@ const STAGE2_MAX: usize = 64 * 512; // reserva do stage2 na imagem (LBA 1..64)
 /// Posição do bloco de opções de carga na imagem de boot.
 const LOAD_OPTIONS_OFFSET: u64 = load_options::SECTOR as u64 * 512;
 /// Espaço livre do volume NTFS do boot do smss, em MiB: o máximo do arquivo
-/// de paginação (`cm/session_manager.rs`) e folga para o resto do boot.
-const SMSS_FREE_SPACE_MIB: usize = 288;
+/// de paginação (`cm/session_manager.rs`), os 256 MB que a extensão do
+/// arquivo de paginação sempre deixa livres no volume
+/// (`mm/paging_file/extend.rs`) e folga para o resto do boot.
+const SMSS_FREE_SPACE_MIB: usize = 544;
 /// Os binários do Windows do bundle, para todo build (`--windows-dir` troca):
 /// o caminho entra no build do kernel, então uma pasta só faz builds com
 /// `--build-dir` diferentes reaproveitarem o mesmo kernel compilado.
@@ -366,7 +368,8 @@ pub fn build(options: &BuildOptions) -> Result<BuildOutput, String> {
         ntfs_files.push((format!("Windows/System32/config/{name}"), image));
     }
     // O boot do smss cria o arquivo de paginação do `PagingFiles` (192 MB a
-    // 256 MB em D:): o volume dele tem espaço livre para o máximo.
+    // 256 MB em D:): o volume dele tem espaço livre para o arquivo crescer
+    // até o máximo.
     let free_space_mib = if options.initial_process == "smss" { SMSS_FREE_SPACE_MIB } else { 32 };
     let ntfs_bytes = crate::ntfs_image::build(&ntfs_path, &ntfs_files, free_space_mib, 256)?;
     // O disco do controlador NVMe do QEMU, particionado, com um volume NTFS

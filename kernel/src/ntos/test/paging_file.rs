@@ -19,6 +19,12 @@
 //!   com 256 páginas, o limite de commit sobe 256 páginas e o commit cobra
 //!   as duas reservadas; a mesma chamada de novo acha o arquivo na lista, e
 //!   um máximo menor é STATUS_INVALID_PARAMETER_3.
+//! - A extensão: o pedido para qualquer arquivo que já cabe no limite de
+//!   commit volta atendido sem crescer nada; o pedido para o arquivo 0
+//!   cresce até o máximo só com mais de 256 MB livres no volume (o
+//!   esperado sai do FileFsSizeInformation), e o limite de commit cresce o
+//!   mesmo tanto; a cobrança acima do limite espera o pedido de extensão e
+//!   falha quando nenhum arquivo cresce o bastante.
 //! - Num processo parado com espaço próprio, 16 páginas privadas gravadas:
 //!   o esvaziamento do working set deixa a PTE de transição (Valid 0, Transition,
 //!   Protection MM_READWRITE, Write e o mesmo frame); o modified page writer
@@ -34,6 +40,7 @@ use alloc::vec::Vec;
 
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::paging_file::create::create_paging_file;
+use crate::ntos::mm::paging_file::extend;
 use crate::ntos::mm::{commit, modified_writer, paging, paging_file, working_set};
 use crate::ntos::ps::create::{self, ImageOrigin};
 use crate::ntos::ps::process_context;
@@ -112,7 +119,48 @@ pub fn run(assert: Assert) {
     let listed = files.first().is_some_and(|file| file.total_size == 256 && file.total_in_use == 0 && file.minimum == 256 && file.maximum == 512 && file.name == NAME);
     assert(listed && after.limit == before.limit + 256 && after.limit_maximum == before.limit_maximum + 512 && after.committed >= before.committed + 2, "pagefile: o MMPAGING_FILE tem 256 paginas e o commit ganha o limite e cobra as duas reservadas");
     assert(create(&block, NAME, None, MEGABYTE, 2 * MEGABYTE, 0, 0) == 0 && create(&block, NAME, None, MEGABYTE, MEGABYTE, 0, 0) == STATUS_INVALID_PARAMETER_3 && paging_file::count() == 1, "pagefile: o arquivo ja na lista e achado de novo, e o maximo menor e recusado");
+    extension(assert);
     paging(assert);
+}
+
+/// Os bytes livres do volume do arquivo de paginação 0
+/// (FileFsSizeInformation), como o MiAttemptPageFileExtension os calcula.
+fn volume_free_bytes() -> Option<u64> {
+    let file = paging_file::extension_views().first()?.file_object;
+    let block = Block::new()?;
+    let status = crate::ntos::init::exports::invoke_handler("IoQueryVolumeInformation", &[file, 3, 0x18, block.address, block.address + 0x20]).ok()? as u32;
+    if status != 0 {
+        return None;
+    }
+    let cluster = guest::read32(block.address + 0x14).wrapping_mul(guest::read32(block.address + 0x10)) as u64;
+    Some(cluster.wrapping_mul(guest::read64(block.address + 8)))
+}
+
+/// A extensão do arquivo de 256 a 512 páginas (`paging_file::extend`).
+fn extension(assert: Assert) {
+    let size = || paging_file::information().first().map_or(0, |file| file.total_size);
+    let before = commit::snapshot();
+    // Qualquer arquivo, sem IgnoreCurrentCommit, com o cobrado mais a reserva
+    // do sistema cabendo no limite: ActualExpansion 1, nada cresce.
+    let fits = before.committed + commit::system_commit_reserve() + 1 <= before.limit;
+    let answered = extend::issue_request(1, 0, extend::ANY_PAGE_FILE);
+    assert(fits && answered && size() == 256 && commit::snapshot().limit == before.limit, "pagefile: o pedido de extensao que ja cabe no limite de commit e atendido sem crescer o arquivo");
+    // O arquivo 0, pedido de 16 páginas: a extensão tenta 16384 páginas,
+    // limitadas ao que falta até o máximo (256) e ao que passa de 256 MB
+    // livres no volume.
+    let Some(free) = volume_free_bytes() else {
+        assert(false, "pagefile: FileFsSizeInformation do volume do arquivo de paginacao");
+        return;
+    };
+    let expected = if free <= 0x1000_0000 { 0 } else { 256.min((free - 0x1000_0000) >> 12) };
+    let grew = extend::issue_request(16, 0, 0);
+    let after = commit::snapshot();
+    assert(grew == (expected != 0) && size() == 256 + expected && after.limit == before.limit + expected && after.limit_maximum == before.limit_maximum, "pagefile: o arquivo escolhido cresce ate o maximo sem deixar menos de 256 MB livres no volume, e o limite de commit cresce junto");
+    // A cobrança acima do limite pede a extensão de qualquer arquivo, que
+    // não cobre o que passa do limite, e falha.
+    let failures = commit::failures();
+    let charged = commit::charge(after.limit + 1);
+    assert(!charged && commit::failures() == failures + 1 && size() == 256 + expected, "pagefile: a cobranca acima do limite espera o pedido de extensao e falha quando nenhum arquivo cresce o bastante");
 }
 
 fn validation(assert: Assert, block: &Block) {
