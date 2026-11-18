@@ -1130,8 +1130,9 @@ win32k vão do stub do win32u.dll direto à rotina do driver
 (`hal/amd64/usermode.rs`), fora do registro de serviços nativos, então a
 linha FALHOU de `ps/user/index.rs` não os vê. `ps/user/win32k_status.rs`
 acompanha os que devolvem NTSTATUS e chegam ao dxgkrnl ou à composição
-(NtGdiDdDDI*, NtDxgk*, NtDComposition*, NtTokenManager*, NtFlipObject* e
-os *CompositionSurface*): uma falha imprime `[win32k] pid:tid Nome FALHOU
+(NtGdiDdDDI*, NtDxgk*, NtDComposition*, NtTokenManager*, NtFlipObject*,
+os *CompositionSurface* e os NtUser*DisplayConfig* da configuração de
+vídeo): uma falha imprime `[win32k] pid:tid Nome FALHOU
 com status (chamador módulo+deslocamento)`. Os nomes saem dos stubs do
 win32u.dll do primeiro processo que falha; cada par (serviço, status)
 imprime as quatro primeiras vezes e depois uma a cada 256. Só escreve na

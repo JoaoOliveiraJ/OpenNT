@@ -3,9 +3,10 @@
 //!
 //! Os serviços do D3DKMT (NtGdiDdDDI*, NtDxgk*), da DirectComposition
 //! (NtDComposition*), das superfícies de composição (*CompositionSurface*),
-//! do gerenciador de tokens (NtTokenManager*) e dos flip objects
-//! (NtFlipObject*) vão do stub do win32u.dll direto à rotina do win32k, que
-//! chama o dxgkrnl; ficam fora do registro de serviços nativos, então a
+//! do gerenciador de tokens (NtTokenManager*), dos flip objects
+//! (NtFlipObject*) e da configuração de vídeo (NtUser*DisplayConfig*) vão
+//! do stub do win32u.dll direto à rotina do win32k, que chama o dxgkrnl;
+//! ficam fora do registro de serviços nativos, então a
 //! linha FALHOU de `index` não os vê, e uma falha do dxgkrnl, do dxgmms2 ou
 //! do BasicRender só aparecia como o HRESULT final do processo.
 //!
@@ -39,9 +40,13 @@ static NAMES: SpinLock<Option<BTreeMap<u32, String>>> = SpinLock::new(None);
 /// (número, status) -> quantas vezes falhou.
 static FAILURES: SpinLock<BTreeMap<(u32, u32), u32>> = SpinLock::new(BTreeMap::new());
 
-/// O nome entra na lista dos serviços acompanhados.
+/// O nome entra na lista dos serviços acompanhados: os prefixos, as
+/// superfícies de composição e os serviços da configuração de vídeo
+/// (NtUser*DisplayConfig*, o QueryDisplayConfig/DisplayConfigGetDeviceInfo
+/// do dxgi, do dwmcore e do uDWM; a user32 converte o NTSTATUS deles com o
+/// RtlNtStatusToDosError).
 pub fn watched(name: &str) -> bool {
-    PREFIXES.iter().any(|prefix| name.starts_with(prefix)) || name.contains("CompositionSurface")
+    PREFIXES.iter().any(|prefix| name.starts_with(prefix)) || name.contains("CompositionSurface") || (name.starts_with("NtUser") && name.contains("DisplayConfig"))
 }
 
 /// A ocorrência `count` (a partir de 1) de um par (serviço, status) sai no
@@ -119,18 +124,23 @@ fn build_names() -> Option<BTreeMap<u32, String>> {
     Some(table)
 }
 
-/// Um nome ASCII de export (até 96 caracteres) em memória de usuário.
+/// Um nome ASCII de export (até 96 caracteres) em memória de usuário, lido
+/// por pedaços que não cruzam página (uma sonda por pedaço).
 fn read_ascii(address: u64) -> Option<String> {
     let mut text = String::new();
-    for offset in 0..96u64 {
-        if !state::probe_user_read(address + offset, 1) {
+    let mut cursor = address;
+    while cursor - address < 96 {
+        let chunk = (0x1000 - (cursor & 0xFFF)).min(96 - (cursor - address));
+        if !state::probe_user_read(cursor, chunk) {
             return None;
         }
-        let byte = guest::try_read::<u8>(address + offset).ok()?;
-        if byte == 0 {
+        let bytes = guest::try_read_bytes(cursor, chunk as usize).ok()?;
+        if let Some(end) = bytes.iter().position(|&byte| byte == 0) {
+            text.extend(bytes[..end].iter().map(|&byte| byte as char));
             return Some(text);
         }
-        text.push(byte as char);
+        text.extend(bytes.iter().map(|&byte| byte as char));
+        cursor += chunk;
     }
     None
 }
