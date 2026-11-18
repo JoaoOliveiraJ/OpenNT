@@ -490,3 +490,26 @@ impl MemoryPartitionConfiguration {
 pub fn install() {
     crate::ntos::ps::user::syscalls_core::set_partition_opener(user_open);
 }
+
+/// MiCreateMemoryEventSD (19041 0x7a15dc): a DACL dos eventos do
+/// MiInitializeMemoryEvents (MiMemoryEventNames), na ordem das ACEs. O
+/// descritor não traz dono nem grupo: o ObInsertObject usa os do token do
+/// System (BA/SY, como na partição acima). O mundo abre com
+/// SYNCHRONIZE | EVENT_QUERY_STATE (o clbcatq.dll do DWM-1 abre o
+/// MaximumCommitCondition assim).
+pub fn memory_event_dacl() -> alloc::vec::Vec<Ace> {
+    const QUERY_AND_SYNCHRONIZE: u32 = 0x12_0001;
+    const EVENT_ALL_ACCESS: u32 = 0x1F_0003;
+    vec![
+        Ace::allow(sid(1, &[0]), QUERY_AND_SYNCHRONIZE),
+        Ace::allow(sid(5, &[32, 544]), EVENT_ALL_ACCESS),
+        Ace::allow(sid(5, &[18]), EVENT_ALL_ACCESS),
+        Ace::allow(sid(15, &[2, 1]), QUERY_AND_SYNCHRONIZE),
+        Ace::allow(sid(15, &[2, 2]), QUERY_AND_SYNCHRONIZE),
+    ]
+}
+
+/// O descritor dos eventos de memória com dono e grupo do token do System.
+pub fn memory_event_policy() -> SecurityPolicy {
+    SecurityPolicy { owner: sid(5, &[32, 544]), group: Some(sid(5, &[18])), dacl: Some(memory_event_dacl()), ..SecurityPolicy::default() }
+}

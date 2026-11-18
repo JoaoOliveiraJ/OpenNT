@@ -13910,6 +13910,12 @@ fn mm_memory_events(assert: Assert) {
     };
     assert(state("LowPagedPoolCondition") == Some(0) && state("HighPagedPoolCondition") == Some(1), "mm-memory-events: ZwOpenEvent do LowPagedPoolCondition (nao sinalizado) e o HighPagedPoolCondition sinalizado");
     guest::free_bytes(block);
+    let expected = crate::ntos::mm::partition::memory_event_dacl();
+    let secured = names.iter().all(|name| {
+        let pointer = object_manager::lookup(&alloc::format!("\\KernelObjects\\{name}")).and_then(object_manager::node).and_then(|node| node.data).map_or(0, |data| data.native_pointer);
+        crate::ntos::ob::objects::dispatcher::security(pointer).and_then(|policy| policy.dacl).is_some_and(|dacl| dacl.len() == 5 && dacl.iter().zip(expected.iter()).all(|(ace, want)| ace.sid == want.sid && ace.mask == want.mask && !ace.deny))
+    });
+    assert(secured, "mm-memory-events: DACL do MiCreateMemoryEventSD (WD, AC e S-1-15-2-2 0x120001; BA e SY 0x1F0003)");
 }
 
 /// O repositório persistente do NSI: as chaves dos módulos em Control\Nsi

@@ -184,7 +184,9 @@ fn namespace() -> Result<(), crate::rtl::KernelError> {
         ("MemoryErrors", false),
         ("PhysicalMemoryChange", false),
     ] {
-        crate::ntos::ps::user::events::create_kernel_event(&alloc::format!("\\KernelObjects\\{name}"), 0, signaled)?;
+        // Com o descritor do MiCreateMemoryEventSD.
+        let event = crate::ntos::ps::user::events::create_kernel_event(&alloc::format!("\\KernelObjects\\{name}"), 0, signaled)?;
+        crate::ntos::ob::objects::dispatcher::set_security(event.pointer, crate::ntos::mm::partition::memory_event_policy());
     }
     // O disco em memória no seu dispositivo (\Device\KernelVolume0), o C:;
     // \FS é o nome curto que os componentes do boot usam para ele. No boot
