@@ -184,6 +184,30 @@ fn attached<T>(process: u64, body: impl FnOnce() -> T) -> Result<T, KernelError>
     process_context::with_process(process, body)
 }
 
+/// ObDuplicateObject em KernelMode (o ZwDuplicateObject de um driver; o
+/// DupLsaHandle 0x390034 do ksecdd) para um handle da tabela de usuário de
+/// `source`: os handles de processo já vêm resolvidos (KernelMode não pede
+/// PROCESS_DUP_HANDLE); a cópia entra na tabela de `target`, anexado a ele,
+/// com o acesso da origem (DUPLICATE_SAME_ACCESS) ou o pedido, e os
+/// atributos da origem (DUPLICATE_SAME_ATTRIBUTES) ou os dados;
+/// DUPLICATE_CLOSE_SOURCE fecha a origem anexado a `source`. `None`: o handle
+/// não está na tabela.
+pub fn duplicate_user_handle_kernel(source: u64, source_handle: u64, target: u64, desired: u32, attributes: u32, options: u32) -> Option<Result<u32, u32>> {
+    let source_table = process_state::get(source)?;
+    let entry = state::get_user_handle_in(&source_table, source_handle)?;
+    let Some(target_table) = process_state::get(target) else { return Some(Err(PROCESS_IS_TERMINATING)) };
+    let access = if options & 2 != 0 { entry.access() } else { desired };
+    let handle_attributes = if options & 4 != 0 { entry.attributes() } else { attributes & 3 };
+    let result = match attached(target, || state::duplicate_user_handle_in(&entry, source, &target_table, access, handle_attributes)) {
+        Ok(Ok(handle)) => Ok(handle),
+        Ok(Err(error)) | Err(error) => Err(if error.status != 0 { error.status } else { 0xC000_0001 }),
+    };
+    if options & 1 != 0 {
+        let _ = attached(source, || state::close_user_handle_in(&source_table, source_handle & !3, true, false));
+    }
+    Some(result)
+}
+
 /// NtDuplicateObject(sourceProcess, sourceHandle, targetProcess, target*,
 /// access, attributes, options), o ObDuplicateObject: os dois handles de
 /// processo são da tabela de quem chama e pedem PROCESS_DUP_HANDLE; o handle

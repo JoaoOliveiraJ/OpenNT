@@ -3318,6 +3318,31 @@ fn user_tokens(assert: Assert) {
     let opened = call("NtOpenProcessToken", u64::MAX, 0x18, out, 0);
     let token = guest::read64(out);
     assert(opened == 0 && state::get_user_handle(token).is_some_and(|entry| entry.kind() == "token"), "usertokens: NtOpenProcessToken publica um handle de usuario");
+    // ZwDuplicateObject de modo kernel (o DupLsaHandle 0x390034 do ksecdd)
+    // com handles da tabela de usuário: o processo de destino é um handle
+    // process da tabela (sem PROCESS_DUP_HANDLE em KernelMode), a cópia do
+    // token entra nela com o acesso da origem, e DUPLICATE_CLOSE_SOURCE fecha
+    // a origem.
+    {
+        use crate::ntos::ob::handles::duplicate;
+        guest::write32(rsp + 0x28, 0);
+        guest::write32(rsp + 0x30, 0);
+        guest::write32(rsp + 0x38, 2);
+        let process_status = call("NtDuplicateObject", u64::MAX, u64::MAX, u64::MAX, out);
+        let process_handle = guest::read64(out);
+        guest::write64(out + 8, 0);
+        let copied = duplicate::duplicate_object(process_handle, token, process_handle, out + 8, 0, 0, 2);
+        let copy = guest::read64(out + 8);
+        let same = state::get_user_handle(token).zip(state::get_user_handle(copy)).is_some_and(|(left, right)| state::same_object(&left, &right) && right.access() == left.access() && right.kind() == "token");
+        guest::write64(out + 8, 0);
+        let moved = duplicate::duplicate_object(u64::MAX, copy, process_handle, out + 8, 0, 0, 3);
+        let moved_handle = guest::read64(out + 8);
+        let closed = state::get_user_handle(copy).is_none() && state::get_user_handle(moved_handle).is_some_and(|entry| entry.kind() == "token");
+        for handle in [moved_handle, process_handle] {
+            let _ = call("NtClose", handle, 0, 0, 0);
+        }
+        assert(process_status == 0 && matches!(copied, Ok(0)) && copy != 0 && same && matches!(moved, Ok(0)) && closed, "usertokens: ZwDuplicateObject de modo kernel com handles da tabela de usuario (processo e token)");
+    }
     let query = |handle: u64, class: u64, length: u64| {
         guest::write64(rsp + 0x28, returned);
         call("NtQueryInformationToken", handle, class, buffer, length)

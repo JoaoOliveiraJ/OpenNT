@@ -15,8 +15,14 @@
 //!
 //! Os handles com linha no Object Manager (arquivos, chaves, eventos,
 //! seções, processos...) são duplicados pelo mesmo `open_pointer::insert` do
-//! ObOpenObjectByPointer; os da tabela do ObInsertObject seguem pelo
-//! `handles::inserted::duplicate` que o ObDuplicateObject do OpenNT já usa.
+//! ObOpenObjectByPointer; um handle da tabela de usuário do processo de
+//! origem (um token ou um processo aberto pelo serviço de usuário) entra na
+//! tabela de usuário do destino (`ps::user::handles::duplicate_user_handle_kernel`;
+//! os handles de processo também podem vir dessa tabela); os da tabela do
+//! ObInsertObject seguem pelo `handles::inserted::duplicate` que o
+//! ObDuplicateObject do OpenNT já usa. Lacuna conhecida: um handle da tabela
+//! de usuário copiado para a tabela de kernel do System (OBJ_KERNEL_HANDLE)
+//! ainda segue o caminho antigo.
 //! Diferença honesta: no modo kernel o OpenNT não refaz a checagem de acesso
 //! contra o descritor do objeto quando o DesiredAccess excede o da origem
 //! (o NT a faz no ObpIncrementHandleCount).
@@ -37,7 +43,6 @@ const NT_CURRENT_PROCESS: u64 = u64::MAX;
 const KERNEL_HANDLE_BITS: u64 = 0xFFFF_FFFF_8000_0000;
 
 const STATUS_SUCCESS: u32 = 0;
-const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
 
@@ -47,7 +52,10 @@ fn process_of(handle: u64) -> Result<u64, u32> {
         return Ok(process::get_current_process());
     }
     match open_pointer::resolve(handle, false) {
-        None => Err(STATUS_INVALID_HANDLE),
+        // Um handle da tabela de usuário do processo corrente (o handle de
+        // processo do lsass no DupLsaHandle do ksecdd); KernelMode não
+        // confere PROCESS_DUP_HANDLE.
+        None => crate::ntos::ps::user::handles::process_pointer(handle, 0),
         Some(Err(status)) => Err(status),
         Some(Ok(resolved)) if resolved.item.object_type.name == "Process" => Ok(resolved.item.pointer),
         Some(Ok(_)) => Err(STATUS_OBJECT_TYPE_MISMATCH),
@@ -139,9 +147,10 @@ pub fn duplicate_object(source_process: u64, source_handle: u64, target_process:
     if options & !(DUPLICATE_CLOSE_SOURCE | DUPLICATE_SAME_ACCESS | DUPLICATE_SAME_ATTRIBUTES) != 0 {
         return Ok(STATUS_INVALID_PARAMETER);
     }
-    if let Err(status) = process_of(source_process) {
-        return Ok(status);
-    }
+    let source = match process_of(source_process) {
+        Ok(source) => source,
+        Err(status) => return Ok(status),
+    };
     if target_process == 0 {
         if options & DUPLICATE_CLOSE_SOURCE == 0 {
             return Ok(STATUS_INVALID_PARAMETER);
@@ -156,7 +165,24 @@ pub fn duplicate_object(source_process: u64, source_handle: u64, target_process:
     let resolved = match open_pointer::resolve(source_handle, false) {
         Some(Err(status)) => return Ok(status),
         Some(Ok(resolved)) => resolved,
-        None => return duplicate_namespace_handle(source_handle, target, target_handle, desired, attributes, options),
+        None => {
+            // Handle da tabela de usuário do processo de origem (o token do
+            // lsass no DupLsaHandle do ksecdd).
+            if attributes & OBJ_KERNEL_HANDLE == 0 {
+                if let Some(result) = crate::ntos::ps::user::handles::duplicate_user_handle_kernel(source, source_handle, target, desired, attributes, options) {
+                    return Ok(match result {
+                        Ok(handle) => {
+                            if target_handle != 0 {
+                                write_handle(target_handle, handle as u64);
+                            }
+                            STATUS_SUCCESS
+                        }
+                        Err(status) => status,
+                    });
+                }
+            }
+            return duplicate_namespace_handle(source_handle, target, target_handle, desired, attributes, options);
+        }
     };
     let access = if options & DUPLICATE_SAME_ACCESS != 0 { resolved.access } else { map_generic(desired, &resolved.item.object_type.mapping) & (resolved.item.object_type.valid_access | 0x0100_0000) };
     let handle_attributes = if options & DUPLICATE_SAME_ATTRIBUTES != 0 { resolved.attributes } else { attributes & HANDLE_ATTRIBUTE_MASK };
