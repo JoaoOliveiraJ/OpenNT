@@ -33,12 +33,15 @@
 //! `run` e `test-boot`),
 //! `--memory-pressure` (o teste de pressão de memória sobre o arquivo de paginação do boot do
 //! smss), `--console-process` (no boot comum, o cmd.exe real com um console sem janela, pelo
-//! condrv.sys e pelo conhost.exe reais; o volume leva os programas de modo usuário do smss).
+//! condrv.sys e pelo conhost.exe reais; o volume leva os programas de modo usuário do smss),
+//! `--conta-de-teste` (com `--initial-process=smss`: o winlogon cria no primeiro boot, com o
+//! net.exe real, a conta local `Usuario` sem senha no grupo Administradores, que o LogonUI
+//! abre sozinho).
 //! O kernel dos builds comuns leva só as tabelas de linha do DWARF; o `debug` compila o perfil
 //! `depuracao`, com o DWARF completo (as variáveis locais dos depuradores gráficos).
 //! Fora `--release` e `--windows-dir`, elas não recompilam o kernel: vão no bloco de opções de
 //! carga da imagem de boot (`build.rs`), e o `--initial-process=smss` também troca o volume
-//! NTFS.
+//! NTFS; o `--conta-de-teste`, só a hive SYSTEM dele.
 //! Opções de máquina: `--accel=auto|tcg|whpx` (o test-boot usa `auto`, o WHPX quando a máquina
 //! o tem; o `run` e o `debug` usam o TCG), `--memory-mb=N`, `--smp=N`, `--kd-port=N`,
 //! `--monitor-port=N` (o monitor HMP do QEMU num socket local, no `debug`)
@@ -71,6 +74,7 @@ mod user_services;
 mod window_manager;
 mod windows_binaries;
 mod status;
+mod test_account;
 mod test_all;
 mod time_travel;
 
@@ -121,6 +125,8 @@ opcoes de build:   --release --build-dir=DIR --user-program=shell
                    sobre o arquivo de paginacao)
                    --console-process (boot comum: o cmd.exe real com um console sem janela;
                    o volume leva os programas de modo usuario do smss)
+                   --conta-de-teste (com --initial-process=smss: o winlogon cria no primeiro boot
+                   a conta local Usuario, sem senha, no grupo Administradores)
 opcoes de maquina: --accel=auto|tcg|whpx (test-boot: auto = whpx quando a maquina tem; run e debug: tcg)
                    --memory-mb=N --smp=N --kd-port=N --monitor-port=N
 test-boot:         --keys=TEXTO (\\n = Enter) --expect=TEXTO (repetivel)
@@ -217,6 +223,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             memory_pressure: false,
             tpm: false,
             console_process: false,
+            test_account: false,
         },
         // O test-boot roda no WHPX quando a máquina o tem (`auto`); o `run`
         // e o `debug` ficam no TCG, que o rastro de instruções do depurador
@@ -275,6 +282,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             "--heap-census" => parsed.build.heap_census = true,
             "--memory-pressure" => parsed.build.memory_pressure = true,
             "--console-process" => parsed.build.console_process = true,
+            "--conta-de-teste" => parsed.build.test_account = true,
             "--initial-process" => parsed.build.initial_process = required()?,
             "--storage" => parsed.build.storage = required()?,
             "--display" => parsed.build.display = required()?,
@@ -341,6 +349,9 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
     }
     if !matches!(parsed.build.pnp_root.as_str(), "" | "acpi" | "internal") {
         return Err(format!("--pnp-root aceita acpi ou internal ({} recebido)", parsed.build.pnp_root));
+    }
+    if parsed.build.test_account && parsed.build.initial_process != "smss" {
+        return Err("--conta-de-teste exige --initial-process=smss (o gancho e do winlogon)".into());
     }
     if parsed.build.console_process && parsed.build.initial_process == "smss" {
         return Err("--console-process e do boot comum (sem --initial-process=smss)".into());

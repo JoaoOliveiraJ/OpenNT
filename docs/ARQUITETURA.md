@@ -5332,6 +5332,20 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   kernel32 dá completo, e o CPolicyMonitor do LSM não espera o fim do OOBE.
   Nenhum nome é publicado pelo kernel: o 19041 só assina o
   WNF_DEP_OOBE_COMPLETE no PnP quando `OOBEInProgress` é 1.
+- **Conta de teste** (`xtask/src/test_account.rs`, `--conta-de-teste`, só com
+  `--initial-process=smss`): o volume leva em `SYSTEM\Setup` o `SetupType` 2 e
+  um `CmdLine`, o gancho de primeiro boot que o winlogon de uma instalação
+  concluída roda uma vez, como SYSTEM, antes do LogonUI (o mesmo que o Setup do
+  Windows usa). O comando roda o cmd.exe, o net.exe e o reg.exe reais: cria a
+  conta local `Usuario` sem senha, põe no grupo Administradores, desabilita o
+  Administrador e o Convidado (o banco novo do samsrv os deixa habilitados com a
+  política de produto desta máquina) e volta o `SetupType` a 0 e o `CmdLine` a
+  vazio. Com uma única conta local habilitada e de senha vazia, o LogonUI entra
+  nela sozinho; nenhuma senha fica no Registro. Os nomes do grupo e das contas
+  embutidas vêm das mensagens do samsrv.dll.mui do idioma do convidado, e o
+  comando tem no máximo 259 caracteres (o buffer do winlogon). O banco novo tem
+  a complexidade de senha ligada: a conta fica sem senha porque o `net user
+  /add` não grava senha nenhuma.
 
 ## 5. Testes
 
@@ -6393,6 +6407,15 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   WinSta0; ainda não sai: a Desktop Winlogon é criada, mas o
   NtUserCreateDesktopEx não volta, com o wininit e a RawInputThread
   esperando a resposta de mensagens à thread da Desktop do csrss);
+  `USER_LOGON_OK`, `PROFILE_LOADED`, `USERINIT_STARTED` e
+  `EXPLORER_STARTED` (com `--conta-de-teste`, observações de
+  `initial_process.rs`: o token do logon interativo da conta entra no
+  winlogon.exe da sessão 1, pelo NtDuplicateObject do lsass ou pelo atributo
+  de handle ALPC do UserManager; o NTUSER.DAT desse usuário é montado em
+  `\Registry\User\<SID>`; o winlogon.exe cria o userinit.exe e o userinit.exe
+  cria o explorer.exe, os dois com o token desse usuário; testes
+  logon-do-usuario, perfil-do-usuario, userinit e explorer; o teste
+  area-de-trabalho espera o `DESKTOP_OK` da vigia da tela);
   os de falha são `*** PANIC`, `*** EXCECAO`, `SELFTEST FALHOU` e `*** STOP`
   (a parada do KeBugCheckEx; com `--expect-stop` o STOP faz parte do teste,
   como no `bugcheck`). O `test-boot` procura falhas desde o boot até

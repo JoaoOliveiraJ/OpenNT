@@ -108,6 +108,11 @@ pub struct BuildOptions {
     /// `--tpm`: a máquina ganha um TPM 2.0 (tpm-crb sobre o simulador) e o
     /// PnP sobe o tpm.sys real nele.
     pub tpm: bool,
+    /// `--conta-de-teste`: o volume do boot do smss leva em `SYSTEM\Setup` o
+    /// gancho de primeiro boot que cria a conta local de teste
+    /// (`test_account`). Muda a hive SYSTEM, não o kernel nem as opções de
+    /// carga.
+    pub test_account: bool,
     /// `--console-process`: no boot comum, o kernel roda o cmd.exe real com
     /// um console sem janela (o teste console-processo). Também muda o
     /// volume NTFS, que leva os programas de modo usuário do boot do smss
@@ -219,7 +224,8 @@ impl BuildOptions {
             net: false,
             memory_pressure: false,
             tpm: false,
-            // O `console_process` fica: ele também muda o volume NTFS.
+            // O `console_process` e o `test_account` ficam: eles também mudam o
+            // volume NTFS.
             ..self.clone()
         }
     }
@@ -238,6 +244,7 @@ impl BuildOptions {
         let mut options = self.without_load_options();
         options.initial_process.clear();
         options.console_process = false;
+        options.test_account = false;
         format!("{options:?}")
     }
 }
@@ -408,7 +415,13 @@ pub fn build(options: &BuildOptions) -> Result<BuildOutput, String> {
     let mut ntfs_files = crate::windows_binaries::ntfs_files(&root, &kernel_pe, staged_programs)?;
     // As hives de máquina que o kernel carrega no boot, das tabelas de
     // semente dele.
-    for (name, image) in crate::hive_image::machine_hives(options.initial_process == "smss") {
+    // O gancho de primeiro boot do `--conta-de-teste`, com os nomes do
+    // samsrv.dll.mui do idioma do convidado.
+    let setup_command = if options.test_account { Some(crate::test_account::setup_command(&crate::test_account::builtin_names()?)?) } else { None };
+    if let Some(command) = &setup_command {
+        println!("conta de teste {}: gancho de primeiro boot em SYSTEM\\Setup ({} caracteres)", crate::test_account::ACCOUNT_NAME, command.encode_utf16().count());
+    }
+    for (name, image) in crate::hive_image::machine_hives(options.initial_process == "smss", setup_command.as_deref()) {
         ntfs_files.push((format!("Windows/System32/config/{name}"), image));
     }
     // O boot do smss cria o arquivo de paginação do `PagingFiles` (192 MB a
@@ -463,6 +476,7 @@ mod tests {
             memory_pressure: false,
             tpm: false,
             console_process: false,
+            test_account: false,
         }
     }
 
@@ -538,6 +552,13 @@ mod tests {
         assert_ne!(smss.image_key(), console.image_key());
         assert_eq!(base.kernel_key(), console.kernel_key());
         assert_eq!(console.load_options().unwrap(), "CONSOLEPROCESS");
+        // A conta de teste muda só a hive SYSTEM do volume do smss.
+        let mut account = options();
+        account.initial_process = "smss".into();
+        account.test_account = true;
+        assert_ne!(smss.image_key(), account.image_key());
+        assert_eq!(base.kernel_key(), account.kernel_key());
+        assert_eq!(smss.load_options().unwrap(), account.load_options().unwrap());
         let mut release = options();
         release.release = true;
         assert_ne!(base.kernel_key(), release.kernel_key());

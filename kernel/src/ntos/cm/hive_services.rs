@@ -494,6 +494,9 @@ fn load_differencing_key(parameters: &LoadParameters, previous_mode: bool) -> u3
         guest::free_bytes(block);
     }
     if status != 0 || !open_handle {
+        if let (0, Some(mount)) = (status, mount.as_deref()) {
+            crate::ntos::init::initial_process::user_hive_loaded(mount, &source);
+        }
         return status;
     }
     // O handle da raiz, aberto pelo nome com DesiredAccess (o
@@ -501,10 +504,16 @@ fn load_differencing_key(parameters: &LoadParameters, previous_mode: bool) -> u3
     // CmLoadDifferencingKey).
     let Some(mount) = mount else { return status };
     let attributes = if previous_mode { USER_ROOT_HANDLE_ATTRIBUTES } else { KERNEL_ROOT_HANDLE_ATTRIBUTES };
-    match key_services::open_hive_root(&mount, desired_access, attributes, root_handle, previous_mode) {
+    let status = match key_services::open_hive_root(&mount, desired_access, attributes, root_handle, previous_mode) {
         Ok(opened) => opened,
         Err(error) => if error.status != 0 { error.status } else { STATUS_INSUFFICIENT_RESOURCES },
+    };
+    // A hive montada e o handle da raiz entregue
+    // (`initial_process::user_hive_loaded`).
+    if status == 0 {
+        crate::ntos::init::initial_process::user_hive_loaded(&mount, &source);
     }
+    status
 }
 
 /// NtUnloadKey(TargetKey) = (TargetKey, 0, FALSE, NULL), NtUnloadKey2 =

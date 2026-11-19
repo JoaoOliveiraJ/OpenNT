@@ -418,8 +418,9 @@ fn seed_of(key: crate::host_language::HostKey) -> cm::seed::SeedKey {
 
 /// As hives de máquina de `\SystemRoot\System32\config`, com o nome do
 /// arquivo: SYSTEM, SOFTWARE, SAM, SECURITY e DEFAULT. `smss_boot`: o boot
-/// do processo inicial real (`--initial-process=smss`).
-pub fn machine_hives(smss_boot: bool) -> Vec<(&'static str, Vec<u8>)> {
+/// do processo inicial real (`--initial-process=smss`). `setup_command`: o
+/// gancho de primeiro boot do `--conta-de-teste`.
+pub fn machine_hives(smss_boot: bool, setup_command: Option<&str>) -> Vec<(&'static str, Vec<u8>)> {
     let mut system = cm::seed::system_keys(smss_boot);
     let mut software = cm::seed::software_keys(smss_boot);
     let mut default = cm::seed::default_keys();
@@ -450,6 +451,11 @@ pub fn machine_hives(smss_boot: bool) -> Vec<(&'static str, Vec<u8>)> {
         default.extend(crate::theme::default_keys().into_iter().map(seed_of));
         // As preferências do DWM (`window_manager`).
         software.extend(crate::window_manager::software_keys().into_iter().map(seed_of));
+        // O gancho de primeiro boot do `--conta-de-teste` (`test_account`),
+        // depois do estado de setup: troca o `SetupType` e o `CmdLine`.
+        if let Some(command) = setup_command {
+            system.extend(crate::test_account::system_keys(command).into_iter().map(seed_of));
+        }
     }
     let hives: [(&'static str, Vec<cm::seed::SeedKey>); 5] = [
         ("SYSTEM", system),
@@ -463,7 +469,7 @@ pub fn machine_hives(smss_boot: bool) -> Vec<(&'static str, Vec<u8>)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{cm, hive_from_seeds, HBLOCK, MAX_LEAF, SPLIT_LEAF};
+    use super::{cm, hive_from_seeds, seed_of, HBLOCK, MAX_LEAF, SPLIT_LEAF};
 
     fn u16_at(bytes: &[u8], offset: usize) -> u16 {
         u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap())
@@ -544,5 +550,22 @@ mod tests {
         assert!(seeded(&cm::seed::software_keys(false), "Microsoft\\Windows NT\\CurrentVersion\\Notifications\\Data", "41960B29A3BC0C75").is_none());
         let hive = hive_from_seeds(software, "SOFTWARE");
         assert_eq!(&hive[..4], b"regf");
+    }
+
+    /// O `--conta-de-teste` troca só o `SetupType` (2) e o `CmdLine` do estado
+    /// de setup; os outros valores ficam os de uma instalação concluída.
+    #[test]
+    fn the_test_account_hook_replaces_only_the_setup_command() {
+        let command = "cmd /d /c net user Usuario /add";
+        let mut system = cm::seed::system_keys(true);
+        system.extend(crate::test_account::system_keys(command).into_iter().map(seed_of));
+        let dword = |value: u32| (cm::seed::REG_DWORD, value.to_le_bytes().to_vec());
+        assert_eq!(seeded(&system, "Setup", "SetupType").map(|(kind, data)| (kind, data.to_vec())), Some(dword(2)));
+        let text: Vec<u8> = command.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect();
+        assert_eq!(seeded(&system, "Setup", "CmdLine"), Some((cm::seed::REG_SZ, text.as_slice())));
+        for (name, expected) in [("SystemSetupInProgress", 0), ("OOBEInProgress", 0), ("SetupPhase", 0), ("RestartSetup", 0), ("SetupSupported", 1)] {
+            assert_eq!(seeded(&system, "Setup", name).map(|(kind, data)| (kind, data.to_vec())), Some(dword(expected)), "Setup\\{name}");
+        }
+        assert_eq!(&hive_from_seeds(system, "SYSTEM")[..4], b"regf");
     }
 }

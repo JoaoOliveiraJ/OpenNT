@@ -322,6 +322,46 @@ comando = "cargo xtask test-boot USER_INITIALIZED 900000 --initial-process=smss 
 descricao = "O boot do teste conexao-console até o LogonUI.exe. Depois da conexão, o winlogon da sessão 1 carrega o tema, reabre as Desktops Default, Disconnect e Winlogon da WinSta0 e cria o LogonUI.exe pelo NtCreateUserProcess (LOGONUI_STARTED). O LogonUI mostra a interface XAML da tela de logon, que o dwm compõe (teste tela-de-logon)."
 
 [[teste]]
+id = "logon-do-usuario"
+titulo = "Logon da conta de teste pelo winlogon.exe"
+marcador = "USER_LOGON_OK"
+comando = "cargo xtask test-boot USER_INITIALIZED 900000 --initial-process=smss --display=basic --conta-de-teste --build-dir=build/logon-do-usuario --smp=1 --expect=LOGONUI_STARTED --expect=USER_LOGON_OK"
+espera_falha = true
+descricao = "O boot do teste logonui com a conta de teste (--conta-de-teste). Antes do LogonUI, o winlogon da sessão 1 roda uma vez o CmdLine de SYSTEM\\Setup (SetupType 2): o cmd.exe, o net.exe e o reg.exe reais criam a conta local Usuario sem senha no grupo Administradores, desabilitam o Administrador e o Convidado e voltam o gancho. Com uma única conta local habilitada e de senha vazia, o LogonUI pula a tela de bloqueio e o provedor de senha envia sozinho a credencial da conta. O winlogon chama o LsaLogonUser, direto ou pelo UserManager; o msv1_0 do lsass confere a conta no SAM e o lsass cria o token pelo NtCreateTokenEx. O USER_LOGON_OK sai quando o handle desse token entra no winlogon.exe da sessão 1, pelo NtDuplicateObject do LsapDuplicateHandle do lsass (o último passo do LsaLogonUser que pode falhar) ou pelo atributo de handle ALPC da resposta do UserManager, com o usuário S-1-5-21-...-RID (RID 1000 ou mais) e o grupo INTERACTIVE. Ainda falha: o LogonUI.exe termina antes da interface XAML (teste tela-de-logon), onde o provedor de senha envia a credencial."
+
+[[teste]]
+id = "perfil-do-usuario"
+titulo = "Perfil da conta de teste pelo serviço de perfis"
+marcador = "PROFILE_LOADED"
+comando = "cargo xtask test-boot USER_INITIALIZED 900000 --initial-process=smss --display=basic --conta-de-teste --build-dir=build/perfil-do-usuario --smp=1 --expect=USER_LOGON_OK --expect=PROFILE_LOADED"
+espera_falha = true
+descricao = "O boot do teste logon-do-usuario até o perfil da conta. No NotifyLogon, o winlogon avisa o serviço de perfis (o assinante Profiles de Control\\Winlogon\\Notifications). No primeiro logon, o profsvc cria C:\\Users\\Usuario, copia o perfil Default (o CopyFile do KernelBase move os dados pelo NtCopyFileChunk), grava o ProfileList\\<SID> e monta o NTUSER.DAT em \\Registry\\User\\<SID> pelo NtLoadKey3 com o token do usuário (PROFILE_LOADED: a hive do usuário do USER_LOGON_OK, não a <SID>_Classes). Depois monta o UsrClass.dat em <SID>_Classes e grava o Volatile Environment, que o winlogon lê para montar o ambiente do usuário. Ainda falha: a cadeia não chega ao logon da conta (teste logon-do-usuario)."
+
+[[teste]]
+id = "userinit"
+titulo = "userinit.exe real da conta de teste"
+marcador = "USERINIT_STARTED"
+comando = "cargo xtask test-boot USER_INITIALIZED 1200000 --initial-process=smss --display=basic --conta-de-teste --build-dir=build/userinit --smp=1 --expect=PROFILE_LOADED --expect=USERINIT_STARTED"
+espera_falha = true
+descricao = "O boot do teste perfil-do-usuario até o userinit.exe. Depois do NotifyLogon e do NotifyStartShell, o ShellStartup do winlogon espera o WNF_UMGR_SIHOST_READY (até 30 s) e cria o Userinit de Winlogon (C:\\Windows\\system32\\userinit.exe) pelo CreateProcessAsUserW, com o token do usuário e impersonando-o, na Desktop Winsta0\\Default (USERINIT_STARTED: o userinit.exe criado pelo winlogon.exe da sessão 1 com o token primário do usuário do USER_LOGON_OK). Ainda falha: a cadeia não chega ao logon da conta (teste logon-do-usuario)."
+
+[[teste]]
+id = "explorer"
+titulo = "explorer.exe real da conta de teste"
+marcador = "EXPLORER_STARTED"
+comando = "cargo xtask test-boot USER_INITIALIZED 1200000 --initial-process=smss --display=basic --conta-de-teste --build-dir=build/explorer --smp=1 --expect=USERINIT_STARTED --expect=EXPLORER_STARTED"
+espera_falha = true
+descricao = "O boot do teste userinit até o explorer.exe. O userinit lê o Shell de Winlogon (explorer.exe) e o ExecApplication cria o %SystemRoot%\\Explorer.EXE pelo CreateProcessW, com o token herdado (EXPLORER_STARTED: o explorer.exe criado pelo userinit.exe da sessão 1 com o token do usuário do USER_LOGON_OK). O explorer cria a barra de tarefas e a área de trabalho (teste area-de-trabalho). Ainda falha: a cadeia não chega ao logon da conta (teste logon-do-usuario)."
+
+[[teste]]
+id = "area-de-trabalho"
+titulo = "Área de trabalho do Windows 10 da conta de teste"
+marcador = "DESKTOP_OK"
+comando = "cargo xtask test-boot USER_INITIALIZED 1500000 --initial-process=smss --display=basic --conta-de-teste --build-dir=build/area-de-trabalho --smp=1 --watch-screen --capture-every=30 --expect=USER_LOGON_OK --expect=PROFILE_LOADED --expect=USERINIT_STARTED --expect=EXPLORER_STARTED --expect=DESKTOP_OK"
+espera_falha = true
+descricao = "O boot do teste explorer até a área de trabalho. O explorer cria a barra de tarefas (Shell_TrayWnd) e a janela da área de trabalho (Progman), em que o shell32 desenha o papel de parede do perfil Default: o Web\\Wallpaper\\Windows\\img0.jpg em modo Preencher, que, com a tela de 1024x768, o CTranscodedImage do shell32 troca pelo Web\\4K\\Wallpaper\\Windows\\img0_1024x768.jpg. Depois o explorer sinaliza o ShellDesktopSwitchEvent, o winlogon troca para a Desktop Default (no primeiro logon, em até 600 s mesmo sem o sinal) e o dwm compõe as janelas GDI do explorer. O xtask lê a tela a cada 2 s (--watch-screen). Depois do EXPLORER_STARTED na serial, o DESKTOP_OK sai quando duas leituras seguidas mostram a mesma área de trabalho. Embaixo fica uma barra de 24 a 72 linhas, cada uma com 3/10 ou mais dos pixels escuros (nenhum canal acima de 0x80), e a barra inteira com 2/5 ou mais. Acima dela fica o papel de parede: 3/5 ou mais dos pixels azuis (o azul passa o vermelho por 32 ou mais e não fica abaixo do verde), a maior parte dos vizinhos suaves, 8 cores ou mais com 1/1536 da tela cada, a cor média entre #0060B0 e #30C0FF e a metade esquerda, a dos feixes de luz do img0, com o verde médio 24 ou mais acima do da direita. O img0 de 1024x768 mede 99% de pixels azuis, 320 cores, média #0287E4 e verde médio de 166 à esquerda e 105 à direita; a barra do Windows 10, opaca ou translúcida, com a caixa de busca clara ou sem ela, fica com 56% a 93% dos pixels escuros. Não passam: a tela de bloqueio (o img100.jpg, 26% azul e com o chão escuro da caverna embaixo), a cor de destaque com texto (a animação do primeiro logon e o Bem-vindo), a área de trabalho sem a barra ou com o fundo preto (o papel de parede que não carregou), memória lida como cor e um quadro pela metade. A tela vai para build/area-de-trabalho/area-de-trabalho.png e, com o --capture-every=30, as telas que mudaram ficam em tela-NNNN.png. Ainda falha: a cadeia não chega ao logon da conta (teste logon-do-usuario)."
+
+[[teste]]
 id = "pagefile"
 titulo = "Arquivo de paginação do smss.exe real e pressão de memória"
 marcador = "PAGEFILE_OK"

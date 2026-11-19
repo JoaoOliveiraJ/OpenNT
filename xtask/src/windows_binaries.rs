@@ -858,7 +858,7 @@ fn u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
 
 /// Os bytes do recurso [tipo, nome, primeiro idioma] de um PE em arquivo
 /// (RVAs convertidas pela tabela de seções).
-fn pe_resource(bytes: &[u8], resource_type: u32, name: u32) -> Option<Vec<u8>> {
+pub(crate) fn pe_resource(bytes: &[u8], resource_type: u32, name: u32) -> Option<Vec<u8>> {
     let pe = u32_at(bytes, 0x3C)? as usize;
     let sections = u16_at(bytes, pe + 6)? as usize;
     let optional = pe + 24;

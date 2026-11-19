@@ -306,5 +306,11 @@ pub fn duplicate(entry: &Entry, port: &Arc<Port>, mode: u8) -> Result<Result<Dup
     if outcome.status != 0 {
         return failure(outcome).map(Err);
     }
+    // O token da resposta do UMLogonUser do UserManager ao winlogon
+    // (`initial_process::token_handle_received`); 0x200 é o código ALPC do
+    // tipo Token (`type_code`).
+    if entry.object_type == 0x200 {
+        crate::ntos::init::initial_process::token_handle_received(entry.source_process, target, entry.item.pointer);
+    }
     published.map(Ok).ok_or_else(|| KernelError::new("ALPC duplicated handle was not published"))
 }

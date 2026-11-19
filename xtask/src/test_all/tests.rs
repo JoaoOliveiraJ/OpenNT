@@ -43,8 +43,9 @@ fn every_components_test_is_a_valid_test_boot() {
 }
 
 /// A rodada inteira compila um kernel só: as opções de boot dos testes vão
-/// nas opções de carga, e só o volume do smss e o do processo de console
-/// (`--console-process`) pedem outras pastas de imagens.
+/// nas opções de carga, e só o volume do smss, o do processo de console
+/// (`--console-process`) e o da conta de teste (`--conta-de-teste`) pedem
+/// outras pastas de imagens.
 #[test]
 fn the_whole_round_compiles_one_kernel() {
     let tests = plan::load(&crate::build::workspace_root()).unwrap();
@@ -54,7 +55,7 @@ fn the_whole_round_compiles_one_kernel() {
     kernels.dedup();
     assert_eq!(kernels.len(), 1, "builds do kernel diferentes na rodada");
     let images = runs.iter().map(|run| run.image + 1).max().unwrap_or(0);
-    assert!(images <= 3, "{images} pastas de imagens");
+    assert!(images <= 4, "{images} pastas de imagens");
     // As execuções de uma pasta vêm juntas, e a de cada teste é a da chave dele.
     for pair in runs.windows(2) {
         assert!(pair[0].image <= pair[1].image);

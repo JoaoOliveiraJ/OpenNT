@@ -275,6 +275,11 @@ fn nt_duplicate_object(source_process: u64, source_handle: u64, target_process: 
             // PHANDLE de saída (sondado acima), na memória de quem chama.
             guest::try_write::<u64>(out, inserted as u64)?;
         }
+        // O token que o lsass entrega ao cliente do LsaLogonUser
+        // (`initial_process::token_handle_received`).
+        if let Some(token) = entry.as_ref().filter(|entry| entry.kind() == "token").and_then(|entry| entry.downcast::<crate::ntos::se::token::handles::UserToken>()) {
+            crate::ntos::init::initial_process::token_handle_received(source, target, token.token);
+        }
         Ok(0)
     })();
     let result = match result {

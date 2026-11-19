@@ -31,6 +31,14 @@
 //! e o marcador sai quando o DriverEntry do win32k.sys volta com sucesso, a
 //! tabela 1 do KeServiceDescriptorTableShadow publicada e os callouts Win32
 //! estabelecidos.
+//!
+//! Os marcadores do logon do usuário (`--conta-de-teste`) também são
+//! observações: o `USER_LOGON_OK` ([`token_handle_received`]) quando o token
+//! do logon interativo de uma conta chega ao winlogon.exe da sessão 1, o
+//! `PROFILE_LOADED` ([`user_hive_loaded`]) quando o NTUSER.DAT desse usuário
+//! é montado em `\REGISTRY\USER\<SID>`, e o `USERINIT_STARTED` e o
+//! `EXPLORER_STARTED` quando o winlogon.exe cria o userinit.exe e o
+//! userinit.exe cria o explorer.exe com o token dele.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -120,19 +128,31 @@ pub fn record_creation(creator_pointer: u64, child_pointer: u64) {
 
 static DWM_STARTED: AtomicBool = AtomicBool::new(false);
 static LOGONUI_STARTED: AtomicBool = AtomicBool::new(false);
+static USERINIT_STARTED: AtomicBool = AtomicBool::new(false);
+static EXPLORER_STARTED: AtomicBool = AtomicBool::new(false);
 
-/// O winlogon.exe da sessão 1 criou um processo: o `DWM_STARTED` sai no
-/// primeiro dwm.exe (o que o dwminit.dll cria) e o `LOGONUI_STARTED` no
-/// primeiro LogonUI.exe (o do StartLogonUI), os dois depois da conexão do
-/// console (`SESSION1_CONNECTED`).
+/// Um processo da sessão 1 criado pelo winlogon.exe ou pelo userinit.exe:
+/// o `DWM_STARTED` sai no primeiro dwm.exe que o winlogon cria (o do
+/// dwminit.dll) e o `LOGONUI_STARTED` no primeiro LogonUI.exe (o do
+/// StartLogonUI), os dois depois da conexão do console
+/// (`SESSION1_CONNECTED`); o `USERINIT_STARTED` e o `EXPLORER_STARTED` no
+/// userinit.exe do winlogon e no explorer.exe do userinit com o token do
+/// usuário do `USER_LOGON_OK` ([`user_process_created`]).
 fn logon_process_created(creation: &Creation, child_pointer: u64) {
-    if !creation.creator_name.eq_ignore_ascii_case("winlogon.exe") || crate::ntos::mm::session::session_id(child_pointer) != 1 {
+    if crate::ntos::mm::session::session_id(child_pointer) != 1 {
         return;
     }
-    if creation.child_name.eq_ignore_ascii_case("dwm.exe") && !DWM_STARTED.swap(true, Ordering::AcqRel) {
-        crate::debug_print!("DWM_STARTED");
-    } else if creation.child_name.eq_ignore_ascii_case("LogonUI.exe") && !LOGONUI_STARTED.swap(true, Ordering::AcqRel) {
-        crate::debug_print!("LOGONUI_STARTED");
+    let (creator, child) = (creation.creator_name.as_str(), creation.child_name.as_str());
+    if creator.eq_ignore_ascii_case("winlogon.exe") {
+        if child.eq_ignore_ascii_case("dwm.exe") && !DWM_STARTED.swap(true, Ordering::AcqRel) {
+            crate::debug_print!("DWM_STARTED");
+        } else if child.eq_ignore_ascii_case("LogonUI.exe") && !LOGONUI_STARTED.swap(true, Ordering::AcqRel) {
+            crate::debug_print!("LOGONUI_STARTED");
+        } else if child.eq_ignore_ascii_case("userinit.exe") {
+            user_process_created(creation, child_pointer, &USERINIT_STARTED, "USERINIT_STARTED");
+        }
+    } else if creator.eq_ignore_ascii_case("userinit.exe") && child.eq_ignore_ascii_case("explorer.exe") {
+        user_process_created(creation, child_pointer, &EXPLORER_STARTED, "EXPLORER_STARTED");
     }
 }
 
@@ -387,6 +407,7 @@ pub fn image_mapped(process: u64, dll_name: &str) {
 /// no `\BaseNamedObjects\TermSrvReadyEvent` (o `Global\TermSrvReadyEvent`
 /// que o Local Session Manager sinaliza e que o winlogon espera).
 pub fn event_set(name: &str) {
+    shell_desktop_ready(name);
     if !boot_config::smss_boot() || TERMSRV_READY.load(Ordering::Acquire) || !name.eq_ignore_ascii_case("\\BaseNamedObjects\\TermSrvReadyEvent") {
         return;
     }
@@ -414,6 +435,130 @@ fn console_connected(name: &str) {
         crate::debug_print!("[init] csrss.exe (pid {}) da sessao 1: DoConnect do console concluido ({})", process::get_current_process_id(), name);
         crate::debug_print!("SESSION1_CONNECTED");
     }
+}
+
+/// O RID da primeira conta criada num domínio de contas (o NextRid do banco
+/// novo do samsrv, 0x3E8): as embutidas ficam abaixo (Administrador 500,
+/// Convidado 501, DefaultAccount 503, WDAGUtilityAccount 504).
+const FIRST_ACCOUNT_RID: u32 = 1000;
+/// INTERACTIVE (S-1-5-4), serializado como o `se::model::Sid`.
+const INTERACTIVE_SID: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 5, 4, 0, 0, 0];
+/// A raiz das hives de usuário.
+const USER_HIVES: &str = "\\REGISTRY\\USER\\";
+
+static USER_LOGON_OK: AtomicBool = AtomicBool::new(false);
+static PROFILE_LOADED: AtomicBool = AtomicBool::new(false);
+static SHELL_DESKTOP_SWITCH: AtomicBool = AtomicBool::new(false);
+/// O SID (texto) do usuário do `USER_LOGON_OK`: o `PROFILE_LOADED`, o
+/// `USERINIT_STARTED` e o `EXPLORER_STARTED` só saem para ele.
+static LOGGED_ON_USER: SpinLock<Option<String>> = SpinLock::new(None);
+
+/// O texto de um SID de conta (S-1-5-21-a-b-c-RID, com o RID de uma conta
+/// criada, não embutida), ou None. O SID vem serializado como o
+/// `se::model::Sid`: revisão, número de subautoridades, autoridade
+/// big-endian e subautoridades little-endian.
+fn account_sid_text(sid: &[u8]) -> Option<String> {
+    if sid.len() != 8 + 5 * 4 || sid[0] != 1 || sid[1] != 5 || sid[2..8] != [0, 0, 0, 0, 0, 5] {
+        return None;
+    }
+    let sub: Vec<u32> = sid[8..].chunks_exact(4).map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])).collect();
+    (sub[0] == 21 && sub[4] >= FIRST_ACCOUNT_RID).then(|| alloc::format!("S-1-5-21-{}-{}-{}-{}", sub[1], sub[2], sub[3], sub[4]))
+}
+
+/// O usuário (texto do SID) de um token de logon interativo de uma conta:
+/// o usuário é um SID de conta ([`account_sid_text`]) e o token tem o grupo
+/// INTERACTIVE, como o que o lsass monta no LsapAuApiDispatchLogonUser. Os
+/// logons virtuais do winlogon (DWM-1, S-1-5-90-0-1, e UMFD-1,
+/// S-1-5-96-0-1) e os de serviço não são contas.
+fn interactive_account(token: u64) -> Option<String> {
+    crate::ntos::se::token::tokens::with(token, |token| {
+        if !token.groups.iter().any(|group| group.sid == INTERACTIVE_SID) {
+            return None;
+        }
+        account_sid_text(&token.user)
+    })
+    .flatten()
+}
+
+/// Um handle de token entrou na tabela do processo `target_process`, vindo
+/// de `source_process`: pelo NtDuplicateObject (`ps/user/handles.rs`; o
+/// LsapDuplicateHandle do LsapAuApiDispatchLogonUser do lsass, lsasrv
+/// 0x343ae, põe o token no cliente do LsaLogonUser) ou pelo atributo de
+/// handle de uma mensagem ALPC (`alpc/message/handles.rs`; a resposta do
+/// UMLogonUser do UserManager leva o DuplicateTokenEx do token como
+/// `[system_handle]`). O `USER_LOGON_OK` sai quando o destino é o
+/// winlogon.exe da sessão 1 e o token é o de um logon interativo de uma
+/// conta ([`interactive_account`]): é o token que o LsaLogonUser do winlogon
+/// devolve. No lsass a cópia para o cliente é o último passo que pode falhar
+/// (o LsapPostLogonUser seguinte não muda o status), e a resposta do
+/// UserManager é a própria volta do UMgrLogonUser.
+pub fn token_handle_received(source_process: u64, target_process: u64, token: u64) {
+    if !boot_config::smss_boot() || USER_LOGON_OK.load(Ordering::Acquire) {
+        return;
+    }
+    if !image_name(target_process).eq_ignore_ascii_case("winlogon.exe") || crate::ntos::mm::session::session_id(target_process) != 1 {
+        return;
+    }
+    let Some(user) = interactive_account(token) else { return };
+    if USER_LOGON_OK.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    // SAFETY: os dois EPROCESS estão retidos por quem duplica.
+    let (source_id, target_id) = unsafe { (Eprocess::at(source_process).unique_process_id.get(), Eprocess::at(target_process).unique_process_id.get()) };
+    crate::debug_print!("[init] {} (pid {}) entregou ao winlogon.exe (pid {}) o token do logon interativo de {}", image_name(source_process), source_id, target_id, user);
+    *LOGGED_ON_USER.lock() = Some(user);
+    crate::debug_print!("USER_LOGON_OK");
+}
+
+/// Um NtLoadKey* voltou com sucesso, com a hive do arquivo `file` montada
+/// em `mount` (`cm/hive_services.rs`): o `PROFILE_LOADED` sai quando é o
+/// NTUSER.DAT do usuário do `USER_LOGON_OK` em `\REGISTRY\USER\<SID>`, o
+/// MountRegHive do profsvc (0x1ae68: o NtLoadKey3 com o token do usuário,
+/// do CopyDefaultProfileAndLoadHive no primeiro logon). O `<SID>_Classes`
+/// (o UsrClass.dat) e as hives dos perfis de serviço não contam.
+pub fn user_hive_loaded(mount: &str, file: &str) {
+    if !boot_config::smss_boot() || PROFILE_LOADED.load(Ordering::Acquire) {
+        return;
+    }
+    let Some(user) = LOGGED_ON_USER.lock().clone() else { return };
+    let Some(sid) = mount.get(USER_HIVES.len()..).filter(|_| mount.get(..USER_HIVES.len()).is_some_and(|prefix| prefix.eq_ignore_ascii_case(USER_HIVES))) else { return };
+    if !sid.eq_ignore_ascii_case(&user) || !file.to_ascii_lowercase().ends_with("\\ntuser.dat") || PROFILE_LOADED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    crate::debug_print!("[init] {} (pid {}): {} montado em {}", image_name(process::get_current_process()), process::get_current_process_id(), file, mount);
+    crate::debug_print!("PROFILE_LOADED");
+}
+
+/// O `USERINIT_STARTED` sai no userinit.exe que o ShellStartup do
+/// winlogon.exe cria (CUser::CreateProcessW 0x20e94: o CreateProcessAsUserW
+/// com o token do usuário, impersonando-o) e o `EXPLORER_STARTED` no
+/// explorer.exe que o ExecApplication do userinit.exe cria (0x1bb0: o
+/// CreateProcessW, com o token herdado), os dois só quando o token primário
+/// do processo novo é o do usuário do `USER_LOGON_OK`.
+fn user_process_created(creation: &Creation, child_pointer: u64, done: &AtomicBool, marker: &str) {
+    let Some(user) = LOGGED_ON_USER.lock().clone() else { return };
+    let owner = process::get_primary_token(child_pointer).and_then(|token| crate::ntos::se::token::tokens::with(token, |token| account_sid_text(&token.user))).flatten();
+    if owner.as_deref() != Some(user.as_str()) || done.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    crate::debug_print!("[init] {} (pid {}) criou {} (pid {}) com o token de {}", creation.creator_name, creation.creator_id, creation.child_name, creation.child_id, user);
+    crate::debug_print!("{}", marker);
+}
+
+/// O explorer.exe da sessão 1 sinalizou o `ShellDesktopSwitchEvent` (o
+/// CTray::_FireDesktopSwitchIfReady do explorer, 0x37104, com a barra de
+/// tarefas, a área de trabalho e a volta dos aplicativos prontas): o
+/// winlogon troca para a Desktop Default. Só uma linha no log; o
+/// `DESKTOP_OK` é a tela, lida pelo xtask.
+fn shell_desktop_ready(name: &str) {
+    if !boot_config::smss_boot() || SHELL_DESKTOP_SWITCH.load(Ordering::Acquire) || !name.rsplit('\\').next().is_some_and(|last| last.eq_ignore_ascii_case("ShellDesktopSwitchEvent")) {
+        return;
+    }
+    let current = process::get_current_process();
+    if !image_name(current).eq_ignore_ascii_case("explorer.exe") || crate::ntos::mm::session::session_id(current) != 1 || SHELL_DESKTOP_SWITCH.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    crate::debug_print!("[init] explorer.exe (pid {}): {} sinalizado; o winlogon troca para a Desktop Default", process::get_current_process_id(), name);
 }
 
 /// O Reference Monitor terminou a conexão com o LSA do processo
