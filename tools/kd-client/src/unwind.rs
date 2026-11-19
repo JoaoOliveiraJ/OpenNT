@@ -170,6 +170,8 @@ pub enum Stop {
     BadReturn(u64),
     /// Um quadro do kernel voltaria para o anel 3 sem passagem.
     KernelToUser(u64),
+    /// Um quadro do anel 3 voltaria para o kernel.
+    UserToKernel(u64),
     /// O RSP do chamador não passou do quadro (a pilha não subiu).
     NoProgress(u64),
     /// UNWIND_INFO com versão ou códigos inválidos.
@@ -191,6 +193,7 @@ impl Stop {
             Stop::Unreadable(address) => format!("parou: memoria ilegivel em {address:#x}"),
             Stop::BadReturn(address) => format!("parou: retorno {address:#x} fora de codigo"),
             Stop::KernelToUser(address) => format!("parou: o kernel voltaria para o anel 3 ({address:#x}) sem quadro de syscall"),
+            Stop::UserToKernel(address) => format!("parou: o anel 3 voltaria para o kernel ({address:#x})"),
             Stop::NoProgress(rsp) => format!("parou: a pilha nao subiu (rsp {rsp:#x})"),
             Stop::BadUnwindInfo(address) => format!("parou: UNWIND_INFO invalido em {address:#x}"),
             Stop::UnknownRegister(name) => format!("parou: {name} desconhecido neste quadro"),
@@ -346,8 +349,8 @@ pub fn walk_stack(target: &mut dyn Target, mut context: Context, top_is_return: 
     Walk { frames, stop }
 }
 
-/// O quadro novo faz sentido: código, a pilha subindo e nenhum retorno do
-/// kernel para o anel 3 fora de uma passagem.
+/// O quadro novo faz sentido: código, a pilha subindo e nenhum retorno
+/// entre o kernel e o anel 3 fora de uma passagem.
 fn check(before: &Context, after: &Context, transition: Option<Transition>) -> Result<(), Stop> {
     let rip = after.rip;
     if rip == 0 {
@@ -359,6 +362,9 @@ fn check(before: &Context, after: &Context, transition: Option<Transition>) -> R
     if transition.is_none() {
         if before.rip >= SYSTEM_HALF && rip < USER_LIMIT {
             return Err(Stop::KernelToUser(rip));
+        }
+        if before.rip < USER_LIMIT && rip >= SYSTEM_HALF {
+            return Err(Stop::UserToKernel(rip));
         }
         if after.registers[RSP].is_some() && after.rsp() <= before.rsp() {
             return Err(Stop::NoProgress(after.rsp()));
@@ -1168,6 +1174,12 @@ mod tests {
         let walk = run(0x7ff6_0000_3000);
         assert_eq!(walk.frames.len(), 1);
         assert_eq!(walk.stop, Stop::KernelToUser(0x7ff6_0000_3000));
+        // E o anel 3 nunca volta para o kernel.
+        let user_stack = region(user, 0x80, &[(0x40, 0), (0x48, 0xfffff800_4000_1000)]);
+        let mut memory = Captured { regions: vec![user_stack] };
+        let walk = walk_stack(&mut FramePointers(&mut memory), Context::new(0x7ff6_0000_1000, user, user + 0x40), false, 16);
+        assert_eq!(walk.frames.len(), 1);
+        assert_eq!(walk.stop, Stop::UserToKernel(0xfffff800_4000_1000));
     }
 
     #[test]
