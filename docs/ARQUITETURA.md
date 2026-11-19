@@ -5493,6 +5493,96 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     `ReverseStep+`.
   - Comandos de texto: `apimon`, `irptrace`, `reg`, `regv`, `objdir`,
     `fsls`, `fscat`, `dtv`, `snap` e `rstep`/`rcont`.
+  - Roteiros do kd (`kd_script.rs`): a linguagem do `cargo xtask test-boot
+    --kd=com2 --script=ARQ` e do `cargo xtask debug --script=ARQ`. É outra
+    linguagem que a dos roteiros do `opennt-re` e do `opennt-mcp`
+    (`analysis/script.rs`). Uma linha por comando; `#` no começo da linha
+    comenta. Uma linha que não é da linguagem vai ao depurador como no
+    prompt (`bp`, `continue`, `k`...), e a saída dela fica guardada para as
+    conferências e os `save-*`. O roteiro inteiro é lido antes de rodar: um
+    bloco sem `}` ou um `leave` fora de laço é erro com a linha, sem nada
+    rodar.
+    - Saída: cada comando sai como `[kd-script] > comando` e a saída dele
+      como `[kd-script]   linha`. As linhas dos breakpoints de log, a linha
+      de acerto e a saída dos comandos de acerto saem como `[kd-log] ...`
+      quando chegam, e não só no fim. Tudo vai à saída padrão (o log do
+      test-boot) e à transcrição `kd-sessao.log`, ao lado do `serial.log`
+      (no `--connect`, em `<build>/kd-sessao.log`); a transcrição termina
+      com o erro, se houver. O DbgPrint já está na COM1 e não se repete.
+    - Esperas: `wait-stop [ms]` (padrão 120000), `wait-serial [/t ms]
+      <texto>` (padrão 300000; o texto em qualquer ponto da COM1) e `sleep
+      <ms>` leem a conexão enquanto esperam. Um breakpoint de log, uma
+      condição falsa e a carga de um módulo seguem sozinhos, e um tratador
+      roda. Uma parada sem tratador encerra o `wait-stop`. No `wait-serial`
+      ela é erro, porque a COM1 não anda com a máquina parada (com a máquina
+      já parada, o erro sai depois de 2 s). No `sleep` a máquina fica parada
+      até o fim do tempo. Os comandos `/cmd` de um breakpoint que para rodam
+      quando a parada chega numa espera. Depois de `detach` as esperas só
+      olham a COM1.
+    - Conferências: `expect <texto>` e `expect-not <texto>` (a saída do
+      comando anterior tem ou não tem o texto), `expect-stop <texto>` (a
+      última parada), `expect-console <texto>` (o DbgPrint e as linhas de
+      log recebidos) e `expect-eq <expr> <expr>`. A falha diz o arquivo, a
+      linha e o texto dela (com o `${...}` já trocado). As que olham a
+      saída mostram o comando anterior, a linha dele e a saída, até 100
+      linhas. O `expect-console` mostra as últimas 60 linhas do console e o
+      `wait-serial` as últimas 20 da COM1. Dentro de laços e tratadores, a
+      falha diz onde a execução estava (`dentro de: for-each da linha 30
+      ($t = 0x...) > on-break ...`).
+    - Variáveis: `save <nome> <expr>` (número) e `set <nome> <texto>`. Da
+      saída do comando anterior: `save-word <nome> <texto> <coluna>
+      [ocorrência]` (o número na coluna da linha que tem o texto; colunas a
+      partir de 0, negativas contam do fim), `save-text` (o mesmo, a palavra
+      como texto), `save-after <nome> <rótulo> [ocorrência]` (a palavra
+      depois do rótulo, na mesma linha), `save-line <nome> <texto>
+      [ocorrência]` (a linha inteira), `save-count <nome> <texto>` (quantas
+      linhas têm o texto) e `save-thread <nome> <texto> <coluna> <módulo>`
+      (a primeira thread dessas linhas com um quadro do módulo na pilha). Um
+      texto com espaços vai entre aspas. `$nome` vale nas expressões quando
+      o valor é número; `${nome}` é trocado pelo texto em qualquer linha
+      antes de ela rodar, e `${nome.N}` pela palavra N do texto. O `{expr}`
+      do `/log` e do `print` continua sendo avaliado na hora.
+    - Condições: `if <condição> {`, `} else if <condição> {`, `} else {` e
+      `}`. A condição é uma expressão do depurador (diferente de zero é
+      verdadeiro), uma comparação de textos (`"${p_name}" == "smss.exe"`,
+      `!=`, `contains`) ou uma destas: `output-has <texto>`, `console-has
+      <texto>`, `serial-has <texto>`, `stop-has <texto>`, `stack-has
+      <ethread> <módulo>`, `defined <nome>`, `running`, `stopped`,
+      `wait-serial [/t ms] <texto>` (espera; verdadeira se o texto chegou no
+      prazo) e `wait-stop [ms]` (verdadeira se a máquina parou no prazo).
+      `not` na frente inverte.
+    - Laços: `while <condição> {`, `repeat <n> [variável] {` (a variável vai
+      de 0 a n-1) e `for-each <coleção> <v> [filtro valor]... {`. Coleções:
+      `thread` (filtros `pid`, `state`, `process` e `stack <módulo>`; `$v` é
+      o ETHREAD, com `$v_tid`, `$v_pid`, `$v_start`, `${v_state}` e
+      `${v_process}`), `process` (filtro `name`; `$v` é o EPROCESS, com
+      `$v_pid`, `$v_cr3`, `$v_threads` e `${v_name}`), `module` (os módulos
+      do kernel; filtro `name`; `$v` é a base, com `$v_end`, `$v_size`,
+      `${v_name}` e `${v_path}`), `umodule` (os módulos de usuário do
+      processo escolhido com `.process`; também `$v_entry`), `cpu` (`$v` é o
+      número, com `$v_irql`, `$v_pcr`, `$v_thread`, `$v_rip`, `$v_owner` e
+      `${v_process}`) e `line` (as linhas da saída do comando anterior;
+      filtro `containing`; `${v}` é a linha e `$v_index` o número dela). O
+      `name` e o `process` aceitam o nome sem a extensão (`smss`, `ACPI`).
+      `leave` sai do laço e `next` passa à próxima volta (`break` e
+      `continue` continuam sendo os comandos do depurador). A lista é lida
+      uma vez, no começo, com a máquina parada; o `stack` é conferido em
+      cada volta. Depois do laço as variáveis ficam com o último item e
+      `$v_count` diz quantas voltas rodaram: `for-each thread t state
+      Waiting stack ACPI { leave }` acha uma thread. `while` e `repeat`
+      param com erro em um milhão de voltas.
+    - Tratadores de parada: `on-break <breakpoint> { ... }` registra os
+      comandos que rodam quando o breakpoint para a máquina durante uma
+      espera. O breakpoint é `#n`, `*` (qualquer breakpoint) ou a expressão
+      com que ele foi criado (ou outra que dê o mesmo endereço). Dentro do
+      tratador, `$bp` é o número do breakpoint e `$hits` o acerto. Quando o
+      tratador termina, a máquina segue e a espera continua; `stop` deixa a
+      máquina parada e encerra a espera. Uma parada dentro de um tratador
+      não chama outro. `on-break <breakpoint> off` tira o tratador;
+      registrar o mesmo alvo de novo troca o anterior.
+    - Outros: `echo <texto>`, `print <texto com {expr}>` (o formato do
+      `/log`), `exit` (termina sem erro) e `fail <texto>` (termina com
+      erro).
   - Testes (`cargo test -p kd-client`): pacotes, resposta de parada,
     registradores, PE e `.pdata`, UNWIND_INFO e o desenrolar misto sobre uma
     pilha montada, públicos de PDB, tipos sobre um TPI montado, expressões,
@@ -5510,7 +5600,13 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     MORE_PROCESSING e IoFreeIrp), os exploradores, a árvore de tipos com
     lista e edição, a tabela do `info snapshots` e, contra o alvo de
     mentira, a reprodução: um passo e o passo para trás de volta ao RIP de
-    antes.
+    antes. Os roteiros: a leitura dos blocos e os erros de sintaxe, as
+    variáveis `${...}`, as colunas e a comparação de textos e, contra o alvo
+    de mentira, as linhas de log na transcrição antes da parada, o tratador
+    que deixa a máquina parada e o que a faz seguir até o terceiro acerto,
+    os laços pelas linhas, processos e threads, a espera pela COM1 com prazo
+    e as mensagens de erro com o comando anterior, a saída e a volta do
+    laço.
 - **Depurador gráfico** (`tools/kd-gui`, binário `opennt-dbg`).
   - Uso: `cargo run -p kd-gui --release -- --launch` roda o mesmo build e
     QEMU do `cargo xtask debug --launch` e abre a janela; `--connect=HOST:PORTA`
@@ -5797,6 +5893,12 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   - rastreia 300 instruções a partir da entrada da função, mostra a árvore
     e rastreia até o retorno;
   - desliga; o boot segue até o shell, que o roteiro espera na COM1.
+
+  O roteiro usa também a linguagem dos roteiros do kd: o breakpoint no
+  laço principal tem log e um tratador que deixa a máquina seguir nos dois
+  primeiros acertos e a para no terceiro; laços acham o System, a thread
+  do ACPI.sys (conferida contra o `save-thread`) e o ksecdd.sys, e o
+  `save-after` confere o EPROCESS do `!process 4` e a base do `lmv`.
 
   O boot com `--kd` roda também `ntos/test/kernel_debugger.rs`
   (`KD_EXPORTS_OK`).
