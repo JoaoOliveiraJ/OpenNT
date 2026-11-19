@@ -8,10 +8,9 @@
 //!   com o tamanho necessário; o System (sem PEB) dá STATUS_NOT_FOUND.
 //! - Um processo criado pelo caminho único com a thread principal suspensa
 //!   e uma linha de comando com argumentos:
-//!   - os parâmetros ainda estão no formato auto-relativo (o Buffer é um
-//!     deslocamento, que a ntdll normaliza na partida): a cópia a partir do
-//!     deslocamento falha e o PsQueryProcessCommandLine devolve o erro dela,
-//!     como no NT;
+//!   - os parâmetros já chegam normalizados, com o Buffer absoluto (o
+//!     PspCopyAndFixupParameters do NT): antes de a ntdll rodar, o
+//!     PsQueryProcessCommandLine já devolve a linha de comando;
 //!   - PsResumeProcess tira a suspensão da thread principal (contagem 1 ->
 //!     0), e o processo roda e sai com o código.
 //! - Depois do fim, com o EPROCESS retido, os dois devolvem
@@ -110,8 +109,8 @@ pub fn run(assert: Assert) {
     };
     let process_pointer = created.process_pointer;
     process::reference(process_pointer);
-    let denormalized = query(process_pointer, 0x200);
-    assert((denormalized.0 as i32) < 0 && denormalized.1 != 0, "consulta: parametros ainda auto-relativos (antes da ntdll) = a falha da copia do deslocamento");
+    let early = query(process_pointer, 0x200);
+    assert(early.0 == 0 && early.4 == 1 && early.5 == COMMAND_LINE, "consulta: parametros normalizados desde a criacao (antes da ntdll): a linha de comando sai pelo Buffer absoluto");
     let suspended = |thread: u64| threads::find_by_pointer(thread).map(|thread| thread.with(|thread| thread.suspend_count));
     let before = suspended(created.thread_pointer);
     let resumed = call_export("PsResumeProcess", &[process_pointer]).map(|status| status as u32);

@@ -7,7 +7,8 @@
 //!     do da cópia de sistema), e o API_SET_NAMESPACE v6 lido anexado; a
 //!     PEB traz o subsistema da imagem;
 //!   - PEB.ProcessParameters é o bloco da criação, e o ImagePathName e o
-//!     CommandLine dele, lidos anexado pelo formato auto-relativo, são os
+//!     CommandLine dele, lidos anexado pelos Buffers absolutos (o bloco é
+//!     NORMALIZED, Flags 1), são os
 //!     pedidos; o caminho da imagem fica no estado do processo e a linha de
 //!     comando no registro do processo (a das notificações de processo);
 //!   - a notificação de carga de imagem do executável e da ntdll já rodou na
@@ -92,9 +93,9 @@ fn observe(process_pointer: u64, peb: u64) -> Option<Observed> {
         let version = state::user_struct::<ApiSetNamespace>(map).and_then(|namespace| namespace.version.probe_get()).unwrap_or(0);
         let block = peb.process_parameters.get();
         // SAFETY: o bloco de parâmetros do processo anexado, gravado pelo
-        // kernel no formato auto-relativo.
+        // kernel normalizado (Buffers absolutos).
         let parameters = unsafe { RtlUserProcessParameters::at(block) };
-        let text = |string: &UnicodeString| state::read_user_wide_string(block + string.buffer.get(), string.length.get() as u64 / 2);
+        let text = |string: &UnicodeString| state::read_user_wide_string(string.buffer.get(), string.length.get() as u64 / 2);
         (map, version, peb.image_subsystem.get(), block, text(&parameters.image_path_name), text(&parameters.command_line), parameters.flags.get())
     })
     .ok()
@@ -139,7 +140,7 @@ pub fn run(assert: Assert) {
             }
             let recorded = process::with_record(process_pointer, |record| record.command_line.clone()).flatten();
             let identity = process_state::get(process_pointer).map(|identity| identity.image_path());
-            assert(observed.as_ref().is_some_and(|observed| observed.3 == created.parameters && observed.4 == IMAGE_PATH && observed.5 == COMMAND_LINE && observed.6 == 0) && identity.as_deref() == Some(IMAGE_PATH) && recorded.as_deref() == Some(COMMAND_LINE), "criacao: ImagePathName e CommandLine (com argumentos) certos nos parametros, lidos anexado; o caminho no estado do processo e a linha de comando no registro do processo");
+            assert(observed.as_ref().is_some_and(|observed| observed.3 == created.parameters && observed.4 == IMAGE_PATH && observed.5 == COMMAND_LINE && observed.6 == 1) && identity.as_deref() == Some(IMAGE_PATH) && recorded.as_deref() == Some(COMMAND_LINE), "criacao: ImagePathName e CommandLine (com argumentos) certos nos parametros, lidos anexado; o caminho no estado do processo e a linha de comando no registro do processo");
 
             let exit = user_process::run_created(created);
             if !matches!(exit, Ok(EXIT_CODE)) {

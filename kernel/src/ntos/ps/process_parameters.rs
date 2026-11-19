@@ -12,18 +12,21 @@
 //! condrv.sys chama: o bloco normalizado de um chamador de modo usuário
 //! copiado para um pool de kernel, com Buffers absolutos.
 //!
-//! Formato entregue ao processo: auto-relativo, sem
-//! RTL_USER_PROC_PARAMS_NORMALIZED (o Flags é só o que a criação passa:
-//! RTL_USER_PROC_APP_MANIFEST_PRESENT quando achou o manifesto embutido do
-//! executável, senão 0), com o Buffer de cada
-//! UNICODE_STRING sendo o deslocamento desde a base do bloco; o loader da
-//! ntdll normaliza na inicialização. O Environment é absoluto (a
-//! normalização só converte os Buffers). Os textos ficam bem depois da
-//! estrutura: a ntdll 24H2 lê campos até +0x440. Um texto ausente fica com o
-//! UNICODE_STRING zerado (Buffer NULL), que a normalização preserva; o
-//! MaximumLength de cada texto respeita a capacidade pedida (o diretório
-//! corrente do chamador, por exemplo, vem com espaço para o
-//! SetCurrentDirectory trocar o caminho no lugar).
+//! Formato entregue ao processo: normalizado, como o PspCopyAndFixupParameters
+//! do 19041 (0x612c14) deixa o bloco no processo novo. O Flags tem
+//! RTL_USER_PROC_PARAMS_NORMALIZED mais o que a criação passa
+//! (RTL_USER_PROC_APP_MANIFEST_PRESENT quando achou o manifesto embutido do
+//! executável), e o Buffer de cada UNICODE_STRING e o Environment são VAs do
+//! processo novo; o RtlNormalizeProcessParams da ntdll não muda nada, e quem
+//! lê o bloco antes da ntdll (o condrv.sys, que reescreve a CommandLine do
+//! conhost.exe pelo Buffer, e o PsQueryProcessCommandLine) acha os textos
+//! direto. Os textos ficam bem depois da estrutura: a ntdll 24H2 lê campos
+//! até +0x440. Um texto ausente fica com o UNICODE_STRING zerado (Buffer
+//! NULL); o MaximumLength de cada texto respeita a capacidade pedida (o
+//! diretório corrente do chamador, por exemplo, vem com espaço para o
+//! SetCurrentDirectory trocar o caminho no lugar). O bloco de pool do
+//! [`capture_to_pool`] usa a mesma disposição dos textos, a partir de +0x440
+//! e sem folga entre eles.
 
 use alloc::format;
 use alloc::string::String;
@@ -46,7 +49,13 @@ const STRING_GAP: u64 = 8;
 const MINIMUM_BLOCK: u64 = 0x2000;
 /// RTL_USER_PROC_PARAMS_NORMALIZED: os Buffers do bloco são VAs, não
 /// deslocamentos desde a base.
-const NORMALIZED: u32 = 1;
+pub const NORMALIZED: u32 = 1;
+/// Os nomes dos textos, na ordem de [`ProcessParameters::texts`].
+const TEXT_NAMES: [&str; 8] = ["ImagePathName", "CommandLine", "DllPath", "CurrentDirectory", "WindowTitle", "DesktopInfo", "ShellInfo", "RuntimeData"];
+
+/// Um texto do bloco: os bytes (None: ausente), o MaximumLength pedido e os
+/// bytes do terminador (2 para um texto, 0 para o RuntimeData).
+type Text = (Option<Vec<u8>>, u16, u64);
 /// O menor bloco capturado: a estrutura até o RuntimeData inclusive.
 const MINIMUM_CAPTURED: u64 = offset_of!(RtlUserProcessParameters, current_directores) as u64;
 /// O maior bloco de ambiente capturado.
@@ -150,35 +159,36 @@ impl ProcessParameters {
         units.into_iter().flat_map(u16::to_le_bytes).collect()
     }
 
+    /// Os textos do bloco, na ordem de [`TEXT_NAMES`] e de [`text_targets`].
+    /// Um texto vazio dos obrigatórios fica NULL, como um ausente; o
+    /// RuntimeData são bytes opacos, sem NUL.
+    fn texts(&self) -> [Text; 8] {
+        let capacities = &self.capacities;
+        let required = |text: &str| (!text.is_empty()).then(|| wide(text));
+        [
+            (required(&self.image_path_name), capacities.image_path_name, 2),
+            (required(&self.command_line), capacities.command_line, 2),
+            (required(&self.dll_path), capacities.dll_path, 2),
+            (required(&self.current_directory), capacities.current_directory, 2),
+            (self.window_title.as_deref().map(wide), capacities.window_title, 2),
+            (self.desktop_info.as_deref().map(wide), capacities.desktop_info, 2),
+            (self.shell_info.as_deref().map(wide), capacities.shell_info, 2),
+            (self.runtime_data.clone(), capacities.runtime_data, 0),
+        ]
+    }
+
     /// Grava o bloco no processo corrente (o processo em montagem, anexado)
     /// e devolve a VA dele, para PEB.ProcessParameters. Length cobre a
     /// estrutura, os textos e o ambiente; MaximumLength, o bloco inteiro;
-    /// Flags é `flags` (sem RTL_USER_PROC_PARAMS_NORMALIZED: o bloco é
-    /// auto-relativo).
+    /// Flags é `flags` com RTL_USER_PROC_PARAMS_NORMALIZED (os Buffers são
+    /// VAs do processo novo).
     pub fn write(&self, flags: u32) -> Result<u64, KernelError> {
-        let capacities = &self.capacities;
-        // Um texto vazio dos obrigatórios fica NULL, como um ausente.
-        let required = |text: &str| (!text.is_empty()).then(|| wide(text));
-        let strings: [(&str, Option<Vec<u8>>, u16, u64); 8] = [
-            ("ImagePathName", required(&self.image_path_name), capacities.image_path_name, 2),
-            ("CommandLine", required(&self.command_line), capacities.command_line, 2),
-            ("DllPath", required(&self.dll_path), capacities.dll_path, 2),
-            ("CurrentDirectory", required(&self.current_directory), capacities.current_directory, 2),
-            ("WindowTitle", self.window_title.as_deref().map(wide), capacities.window_title, 2),
-            ("DesktopInfo", self.desktop_info.as_deref().map(wide), capacities.desktop_info, 2),
-            ("ShellInfo", self.shell_info.as_deref().map(wide), capacities.shell_info, 2),
-            // Bytes opacos: sem NUL.
-            ("RuntimeData", self.runtime_data.clone(), capacities.runtime_data, 0),
-        ];
-        // Os UNICODE_STRING guardam o comprimento em 16 bits.
-        if let Some((name, ..)) = strings.iter().find(|(_, bytes, _, terminator)| bytes.as_ref().is_some_and(|bytes| bytes.len() as u64 + terminator > u16::MAX as u64)) {
-            return Err(KernelError::with_status(format!("parametros de processo: {name} longo demais"), STATUS_INVALID_PARAMETER));
+        let texts = self.texts();
+        if let Some(index) = too_long(&texts) {
+            return Err(KernelError::with_status(format!("parametros de processo: {} longo demais", TEXT_NAMES[index]), STATUS_INVALID_PARAMETER));
         }
-        // MaximumLength de cada texto: o pedido, ou o comprimento mais o NUL.
-        let maximum = |bytes: &[u8], capacity: u16, terminator: u64| (bytes.len() as u64 + terminator).max(capacity as u64);
         let environment = self.environment_block();
-        let texts: u64 = strings.iter().filter_map(|(_, bytes, capacity, terminator)| bytes.as_ref().map(|bytes| maximum(bytes, *capacity, *terminator).next_multiple_of(2) + STRING_GAP)).sum();
-        let length = STRINGS_OFFSET + texts + environment.len() as u64;
+        let length = STRINGS_OFFSET + texts_size(&texts, STRING_GAP) + environment.len() as u64;
         let size = length.div_ceil(0x1000).max(MINIMUM_BLOCK / 0x1000) * 0x1000;
         if size > u32::MAX as u64 {
             return Err(KernelError::with_status("parametros de processo grandes demais", STATUS_INVALID_PARAMETER));
@@ -187,24 +197,21 @@ impl ProcessParameters {
         // SAFETY: o bloco acabou de ser comprometido no processo corrente e
         // nenhum código de usuário roda nele ainda.
         let parameters = unsafe { RtlUserProcessParameters::at(block) };
-        let targets: [&UnicodeString; 8] = [&parameters.image_path_name, &parameters.command_line, &parameters.dll_path, &parameters.current_directory.dos_path, &parameters.window_title, &parameters.desktop_info, &parameters.shell_info, &parameters.runtime_data];
-        let mut offset = STRINGS_OFFSET;
-        for (target, (_, bytes, capacity, terminator)) in targets.into_iter().zip(strings.iter()) {
-            let Some(bytes) = bytes else { continue };
-            let maximum = maximum(bytes, *capacity, *terminator);
-            // O bloco novo é zerado: o NUL e a folga já estão lá.
-            guest::write_bytes(block + offset, bytes);
-            target.length.set(bytes.len() as u16);
-            target.maximum_length.set(maximum as u16);
-            target.buffer.set(offset);
-            offset += maximum.next_multiple_of(2) + STRING_GAP;
-        }
-        guest::write_bytes(block + offset, &environment);
-        parameters.environment.set(block + offset);
+        // O bloco novo é zerado: os NULs e a folga já estão lá.
+        let end = place_texts(parameters, block, STRINGS_OFFSET, &texts, STRING_GAP);
+        guest::write_bytes(block + end, &environment);
+        parameters.environment.set(block + end);
         parameters.environment_size.set(environment.len() as u64);
         parameters.maximum_length.set(size as u32);
         parameters.length.set(length as u32);
-        parameters.flags.set(flags & !NORMALIZED);
+        self.write_scalars(parameters, flags | NORMALIZED);
+        Ok(block)
+    }
+
+    /// Os campos escalares de um bloco: o Flags, o console, os handles
+    /// padrão e o STARTUPINFO.
+    fn write_scalars(&self, parameters: &RtlUserProcessParameters, flags: u32) {
+        parameters.flags.set(flags);
         parameters.console_handle.set(self.console_handle);
         parameters.standard_input.set(self.standard_input);
         parameters.standard_output.set(self.standard_output);
@@ -223,8 +230,44 @@ impl ProcessParameters {
         parameters.show_window_flags.set(settings.show_window_flags);
         parameters.process_group_id.set(settings.process_group_id);
         parameters.loader_threads.set(settings.loader_threads);
-        Ok(block)
     }
+}
+
+/// Os UNICODE_STRING dos textos, na ordem de [`ProcessParameters::texts`].
+fn text_targets(parameters: &RtlUserProcessParameters) -> [&UnicodeString; 8] {
+    [&parameters.image_path_name, &parameters.command_line, &parameters.dll_path, &parameters.current_directory.dos_path, &parameters.window_title, &parameters.desktop_info, &parameters.shell_info, &parameters.runtime_data]
+}
+
+/// O MaximumLength de um texto: o pedido, ou o comprimento mais o NUL.
+fn text_maximum(bytes: &[u8], capacity: u16, terminator: u64) -> u64 {
+    (bytes.len() as u64 + terminator).max(capacity as u64)
+}
+
+/// O índice do primeiro texto que não cabe nos 16 bits do UNICODE_STRING.
+fn too_long(texts: &[Text; 8]) -> Option<usize> {
+    texts.iter().position(|(bytes, _, terminator)| bytes.as_ref().is_some_and(|bytes| bytes.len() as u64 + terminator > u16::MAX as u64))
+}
+
+/// Os bytes que os textos presentes ocupam, cada um com o MaximumLength
+/// arredondado a par e `gap` de folga.
+fn texts_size(texts: &[Text; 8], gap: u64) -> u64 {
+    texts.iter().filter_map(|(bytes, capacity, terminator)| bytes.as_ref().map(|bytes| text_maximum(bytes, *capacity, *terminator).next_multiple_of(2) + gap)).sum()
+}
+
+/// Grava os textos presentes no bloco zerado em `block`, a partir de
+/// `block + offset`, com Buffers absolutos (o bloco é NORMALIZED), e devolve
+/// o deslocamento depois do último.
+fn place_texts(parameters: &RtlUserProcessParameters, block: u64, mut offset: u64, texts: &[Text; 8], gap: u64) -> u64 {
+    for (target, (bytes, capacity, terminator)) in text_targets(parameters).into_iter().zip(texts.iter()) {
+        let Some(bytes) = bytes else { continue };
+        let maximum = text_maximum(bytes, *capacity, *terminator);
+        guest::write_bytes(block + offset, bytes);
+        target.length.set(bytes.len() as u16);
+        target.maximum_length.set(maximum as u16);
+        target.buffer.set(block + offset);
+        offset += maximum.next_multiple_of(2) + gap;
+    }
+    offset
 }
 
 /// O texto em UTF-16LE, sem NUL.
@@ -384,25 +427,11 @@ impl ProcessParameters {
     /// um e Buffer absoluto, e `environment` depois deles. Flags = `flags`
     /// (com o NORMALIZED). Devolve a VA do bloco, ou o NTSTATUS da falha.
     fn write_kernel_block(&self, flags: u32, environment: &[u8]) -> Result<u64, u32> {
-        let capacities = &self.capacities;
-        let required = |text: &str| (!text.is_empty()).then(|| wide(text));
-        // Na ordem dos campos da estrutura.
-        let strings: [(Option<Vec<u8>>, u16, u64); 8] = [
-            (required(&self.current_directory), capacities.current_directory, 2),
-            (required(&self.dll_path), capacities.dll_path, 2),
-            (required(&self.image_path_name), capacities.image_path_name, 2),
-            (required(&self.command_line), capacities.command_line, 2),
-            (self.window_title.as_deref().map(wide), capacities.window_title, 2),
-            (self.desktop_info.as_deref().map(wide), capacities.desktop_info, 2),
-            (self.shell_info.as_deref().map(wide), capacities.shell_info, 2),
-            (self.runtime_data.clone(), capacities.runtime_data, 0),
-        ];
-        let maximum = |bytes: &[u8], capacity: u16, terminator: u64| (bytes.len() as u64 + terminator).max(capacity as u64);
-        if strings.iter().any(|(bytes, capacity, terminator)| bytes.as_ref().is_some_and(|bytes| maximum(bytes, *capacity, *terminator) > u16::MAX as u64)) {
+        let texts = self.texts();
+        if too_long(&texts).is_some() {
             return Err(STATUS_INVALID_PARAMETER);
         }
-        let texts: u64 = strings.iter().filter_map(|(bytes, capacity, terminator)| bytes.as_ref().map(|bytes| maximum(bytes, *capacity, *terminator).next_multiple_of(2))).sum();
-        let length = CAPTURE_HEADER + texts;
+        let length = CAPTURE_HEADER + texts_size(&texts, 0);
         let size = length.checked_add(environment.len() as u64).filter(|&size| size <= u32::MAX as u64).ok_or(STATUS_INTEGER_OVERFLOW)?;
         let block = match crate::ntos::ex::pool_quota::allocate(CAPTURE_POOL_TYPE, size, CAPTURE_POOL_TAG) {
             Ok(block) if block != 0 => block,
@@ -411,43 +440,14 @@ impl ProcessParameters {
         guest::write_bytes(block, &alloc::vec![0u8; size as usize]);
         // SAFETY: o bloco de pool recém-alocado e zerado.
         let parameters = unsafe { RtlUserProcessParameters::at(block) };
-        let targets: [&UnicodeString; 8] = [&parameters.current_directory.dos_path, &parameters.dll_path, &parameters.image_path_name, &parameters.command_line, &parameters.window_title, &parameters.desktop_info, &parameters.shell_info, &parameters.runtime_data];
-        let mut offset = CAPTURE_HEADER;
-        for (target, (bytes, capacity, terminator)) in targets.into_iter().zip(strings.iter()) {
-            let Some(bytes) = bytes else { continue };
-            let maximum = maximum(bytes, *capacity, *terminator);
-            // O bloco é zerado: o NUL já está lá.
-            guest::write_bytes(block + offset, bytes);
-            target.length.set(bytes.len() as u16);
-            target.maximum_length.set(maximum as u16);
-            target.buffer.set(block + offset);
-            offset += maximum.next_multiple_of(2);
-        }
+        place_texts(parameters, block, CAPTURE_HEADER, &texts, 0);
         guest::write_bytes(block + length, environment);
         parameters.environment.set(block + length);
         parameters.environment_size.set(environment.len() as u64);
         parameters.environment_version.set(0);
         parameters.maximum_length.set(length as u32);
         parameters.length.set(length as u32);
-        parameters.flags.set(flags);
-        parameters.console_handle.set(self.console_handle);
-        parameters.standard_input.set(self.standard_input);
-        parameters.standard_output.set(self.standard_output);
-        parameters.standard_error.set(self.standard_error);
-        let settings = &self.settings;
-        parameters.debug_flags.set(settings.debug_flags);
-        parameters.console_flags.set(settings.console_flags);
-        parameters.starting_x.set(settings.starting_x);
-        parameters.starting_y.set(settings.starting_y);
-        parameters.count_x.set(settings.count_x);
-        parameters.count_y.set(settings.count_y);
-        parameters.count_chars_x.set(settings.count_chars_x);
-        parameters.count_chars_y.set(settings.count_chars_y);
-        parameters.fill_attribute.set(settings.fill_attribute);
-        parameters.window_flags.set(settings.window_flags);
-        parameters.show_window_flags.set(settings.show_window_flags);
-        parameters.process_group_id.set(settings.process_group_id);
-        parameters.loader_threads.set(settings.loader_threads);
+        self.write_scalars(parameters, flags);
         Ok(block)
     }
 }

@@ -17,7 +17,8 @@
 //! - Com o pai parado depois da criação, o teste confere: PsCreateSuccess com
 //!   a PEB e o bloco de parâmetros do filho, ManifestDetected, o
 //!   ManifestAddress/ManifestSize do RT_MANIFEST na VA do filho, o Flags
-//!   RTL_USER_PROC_APP_MANIFEST_PRESENT (no PS_CREATE_INFO e no bloco), e o
+//!   RTL_USER_PROC_APP_MANIFEST_PRESENT com o NORMALIZED (no PS_CREATE_INFO
+//!   e no bloco, entregue com os Buffers absolutos), e o
 //!   FileHandle (o exe, com o acesso da abertura) e o SectionHandle (a seção
 //!   de imagem do filho, SECTION_ALL_ACCESS) na tabela do pai; o CLIENT_ID
 //!   (e o ReturnLength),
@@ -133,6 +134,9 @@ const IMAGE_FILE_ACCESS: u32 = 0x10_00A1;
 const SECTION_ALL_ACCESS: u32 = 0xF_001F;
 /// RTL_USER_PROC_APP_MANIFEST_PRESENT e o ManifestDetected do OutputFlags.
 const APP_MANIFEST_PRESENT: u32 = 0x2000;
+/// RTL_USER_PROC_PARAMS_NORMALIZED: o bloco entregue ao filho tem os
+/// Buffers absolutos (o PspCopyAndFixupParameters).
+const PARAMS_NORMALIZED: u32 = 1;
 const MANIFEST_DETECTED: u32 = 0x8;
 /// Um exe com IMAGE_FILE_DLL, recusado pelo ProhibitedImageCharacteristics,
 /// e o DllCharacteristics dele.
@@ -696,7 +700,8 @@ fn child_parameters(child: u64) -> Option<ChildParameters> {
         let block = unsafe { Peb::at(peb) }.process_parameters.get();
         // SAFETY: como acima.
         let parameters = unsafe { RtlUserProcessParameters::at(block) };
-        let text = |string: &UnicodeString| state::read_user_wide_string(block + string.buffer.get(), string.length.get() as u64 / 2);
+        // O bloco é NORMALIZED: os Buffers são VAs do filho.
+        let text = |string: &UnicodeString| state::read_user_wide_string(string.buffer.get(), string.length.get() as u64 / 2);
         let runtime = &parameters.runtime_data;
         let environment_bytes = guest::try_read_bytes(parameters.environment.get(), parameters.environment_size.get() as usize).unwrap_or_default();
         let units: Vec<u16> = environment_bytes.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect();
@@ -711,7 +716,7 @@ fn child_parameters(child: u64) -> Option<ChildParameters> {
             window_title: text(&parameters.window_title),
             desktop_info: text(&parameters.desktop_info),
             shell_info_buffer: parameters.shell_info.buffer.get(),
-            runtime_data: guest::try_read_bytes(block + runtime.buffer.get(), runtime.length.get() as usize).unwrap_or_default(),
+            runtime_data: guest::try_read_bytes(runtime.buffer.get(), runtime.length.get() as usize).unwrap_or_default(),
             environment: units.split(|&unit| unit == 0).take_while(|variable| !variable.is_empty()).map(String::from_utf16_lossy).collect(),
             console_handle: parameters.console_handle.get(),
             scalars: (parameters.show_window_flags.get(), parameters.window_flags.get(), parameters.starting_x.get(), parameters.count_chars_x.get()),
@@ -849,7 +854,7 @@ fn parent_creates_child(assert: Assert, services: &Services, system: u64, system
         (info.size.get(), info.state.get(), success.peb_address_native.get(), success.user_process_parameters_native.get(), success.current_parameter_flags.get(), success.output_flags.get())
     })
     .ok();
-    assert(info.is_some_and(|(size, state, peb, block, flags, output)| size == PsCreateInfo::SIZE && state == PsCreateInfo::SUCCESS && peb == child_peb && peb != 0 && parameters.as_ref().is_some_and(|parameters| parameters.block == block) && flags == APP_MANIFEST_PRESENT && output == MANIFEST_DETECTED), "ntcreateuserprocess: PS_CREATE_INFO volta PsCreateSuccess com a PEB, o bloco de parametros do filho, ManifestDetected e o Flags RTL_USER_PROC_APP_MANIFEST_PRESENT");
+    assert(info.is_some_and(|(size, state, peb, block, flags, output)| size == PsCreateInfo::SIZE && state == PsCreateInfo::SUCCESS && peb == child_peb && peb != 0 && parameters.as_ref().is_some_and(|parameters| parameters.block == block) && flags == APP_MANIFEST_PRESENT | PARAMS_NORMALIZED && output == MANIFEST_DETECTED), "ntcreateuserprocess: PS_CREATE_INFO volta PsCreateSuccess com a PEB, o bloco de parametros do filho, ManifestDetected e o Flags RTL_USER_PROC_APP_MANIFEST_PRESENT com o NORMALIZED");
     // O manifesto embutido (a VA no filho) e os handles do arquivo e da
     // seção de imagem, na tabela do pai.
     let (manifest, image_handles) = process_context::with_process(parent, || {
@@ -913,7 +918,7 @@ fn parent_creates_child(assert: Assert, services: &Services, system: u64, system
     assert(from_declared && !from_caller, "ntcreateuserprocess: com INHERIT_HANDLES e ParentProcess, o filho herda o handle do pai declarado com o mesmo valor, e nao o de quem chamou");
     // Os parâmetros do pai, entregues ao filho.
     let delivered = parameters.as_ref().is_some_and(|parameters| {
-        parameters.flags == APP_MANIFEST_PRESENT
+        parameters.flags == APP_MANIFEST_PRESENT | PARAMS_NORMALIZED
             && parameters.image_path_name == CHILD_DOS_PATH
             && parameters.command_line == COMMAND_LINE
             && parameters.current_directory == CURRENT_DIRECTORY
@@ -930,7 +935,7 @@ fn parent_creates_child(assert: Assert, services: &Services, system: u64, system
     if !delivered {
         crate::debug_print!("[ntcreateuserprocess] parametros do filho: {:?}", parameters.as_ref().map(|parameters| (parameters.image_path_name.clone(), parameters.command_line.clone(), parameters.current_directory.clone(), parameters.directory_capacity, parameters.runtime_data.clone(), parameters.environment.clone(), parameters.scalars)));
     }
-    assert(delivered, "ntcreateuserprocess: os parametros auto-relativos do pai chegam ao filho (textos, capacidade do diretorio, RuntimeData binario, ambiente, console e STARTUPINFO), com o Flags RTL_USER_PROC_APP_MANIFEST_PRESENT");
+    assert(delivered, "ntcreateuserprocess: os parametros auto-relativos do pai chegam ao filho normalizados (textos, capacidade do diretorio, RuntimeData binario, ambiente, console e STARTUPINFO), com o Flags RTL_USER_PROC_APP_MANIFEST_PRESENT | NORMALIZED");
     assert(started_child && suspended.is_some_and(|(count, dead, _)| count == 1 && !dead) && exit_status(child) == STATUS_PENDING && process_state::get(child).is_some(), "ntcreateuserprocess: o filho entra no despachante com a thread principal suspensa e nao roda");
 
     // Etapa 2: retomada, espera no handle do processo e a imagem inexistente.

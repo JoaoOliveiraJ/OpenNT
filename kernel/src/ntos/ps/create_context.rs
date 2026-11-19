@@ -636,7 +636,7 @@ fn write_outputs(request: &UserCreateRequest, attributes: &Attributes, input: &C
         success.section_handle.probe_set(image_handles.1)?;
         success.user_process_parameters_native.probe_set(created.parameters)?;
         success.user_process_parameters_wow64.probe_set(0)?;
-        // O Flags do bloco entregue (auto-relativo: a ntdll o normaliza).
+        // O Flags do bloco entregue (NORMALIZED, com os Buffers absolutos).
         success.current_parameter_flags.probe_set(created.parameter_flags)?;
         success.peb_address_native.probe_set(created.peb)?;
         success.peb_address_wow64.probe_set(0)?;

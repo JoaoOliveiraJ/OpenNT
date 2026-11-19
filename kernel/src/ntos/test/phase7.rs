@@ -2265,7 +2265,7 @@ fn user_system_services(assert: Assert) {
             assert(ldr_data.initialized.get() == 1 && ldr_data.in_load_order_module_list.flink.get() == ldr_data.in_load_order_module_list.address() && ldr_data.in_initialization_order_module_list.blink.get() == ldr_data.in_initialization_order_module_list.address(), "userservices: PEB_LDR_DATA com listas vazias");
             let image_path = parameters.image_path_name.buffer.get();
             let environment = parameters.environment.get();
-            assert(parameters.flags.get() == 0 && parameters.console_handle.get() == u64::MAX && parameters.standard_output.get() == 0x44 && parameters.image_path_name.length.get() == 24 && image_path < 0x2000 && guest::read16(rupp + image_path) == b'C' as u16 && environment > rupp && parameters.environment_size.get() != 0 && guest::read16(environment) == b'S' as u16 && parameters.length.get() <= parameters.maximum_length.get(), "userservices: parametros auto-relativos com ambiente absoluto");
+            assert(parameters.flags.get() == 1 && parameters.console_handle.get() == u64::MAX && parameters.standard_output.get() == 0x44 && parameters.image_path_name.length.get() == 24 && image_path > rupp && image_path < rupp + 0x2000 && guest::read16(image_path) == b'C' as u16 && environment > rupp && parameters.environment_size.get() != 0 && guest::read16(environment) == b'S' as u16 && parameters.length.get() <= parameters.maximum_length.get(), "userservices: parametros NORMALIZED, com os Buffers e o ambiente absolutos");
             let entry = guest::alloc_bytes(nt::LdrDataTableEntry::SIZE);
             let links = unsafe { nt::LdrDataTableEntry::at(entry) };
             list_entry::insert_tail(&ldr_data.in_load_order_module_list, &links.in_load_order_links);

@@ -716,9 +716,12 @@ pub fn create_user_process(request: &CreateProcessRequest<'_>) -> Result<Created
             loader::create_kernel_ldr()?;
             // O PspLocateInPEManifest do PspSetupUserProcessAddressSpace,
             // antes da cópia dos parâmetros: o manifesto achado liga
-            // RTL_USER_PROC_APP_MANIFEST_PRESENT no bloco.
+            // RTL_USER_PROC_APP_MANIFEST_PRESENT no bloco. O bloco entregue é
+            // NORMALIZED (o PspCopyAndFixupParameters), e o Flags dele é o
+            // CurrentParameterFlags do PS_CREATE_INFO.
             let manifest = if image_request.detect_manifest { locate_manifest(image_base)? } else { None };
-            let parameter_flags = if manifest.is_some() { APP_MANIFEST_PRESENT } else { 0 };
+            let manifest_flag = if manifest.is_some() { APP_MANIFEST_PRESENT } else { 0 };
+            let parameter_flags = manifest_flag | crate::ntos::ps::process_parameters::NORMALIZED;
             let block = parameters.write(parameter_flags)?;
             // SAFETY: a PEB recém-criada no processo corrente.
             unsafe { Peb::at(peb) }.process_parameters.set(block);

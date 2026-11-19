@@ -3567,9 +3567,11 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   a VA no processo novo e o tamanho voltam no `CreatedProcess` e o bloco de
   parâmetros leva RTL_USER_PROC_APP_MANIFEST_PRESENT), os parâmetros
   (`ps/process_parameters.rs`, o RtlCreateProcessParametersEx: bloco
-  auto-relativo com ImagePathName, CommandLine, diretório corrente, DLLs,
-  título, desktop, shell, runtime, ambiente com EnvironmentSize, console e
-  handles padrão), a TEB (`peb_teb::create_teb`, o MmCreateTeb, também
+  com ImagePathName, CommandLine, diretório corrente, DLLs, título,
+  desktop, shell, runtime, ambiente com EnvironmentSize, console e handles
+  padrão, entregue NORMALIZED com os Buffers absolutos, como o
+  PspCopyAndFixupParameters deixa; o PS_CREATE_INFO leva o Flags com o
+  NORMALIZED no CurrentParameterFlags), a TEB (`peb_teb::create_teb`, o MmCreateTeb, também
   usado pelo NtCreateThreadEx) e o CONTEXT inicial do LdrInitializeThunk; a
   KTHREAD com pilha de kernel própria; as notificações de thread no
   contexto de quem cria e as de carga de imagem anexadas ao processo novo.
