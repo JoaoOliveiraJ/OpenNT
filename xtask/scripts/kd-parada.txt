@@ -1,0 +1,126 @@
+# Roteiro do teste `kd-parada` (cargo xtask test-boot --kd=com2
+# --script=xtask/scripts/kd-parada.txt): a robustez da parada do depurador
+# do kernel. Os autotestes do alvo (`monitor kdtest`) rodam no próximo tique
+# do relógio do BSP no anel 0, com as interrupções desligadas:
+# - a parada por NMI com as interrupções desligadas (o 0x03 do host não
+#   seria visto ali) e o congelamento dos outros processadores;
+# - as exceções do anel 3 pelo filtro por código (`monitor sx`), na
+#   primeira e na segunda chance, e o `monitor exr`;
+# - um comando do host que falta ou chama KeBugCheckEx é abandonado e a
+#   sessão segue;
+# - o passo sobre `hlt` com o IF mascarado não dorme;
+# - uma falta sem tratador no meio de um passo vira uma parada nova, e o
+#   host retoma pulando a instrução.
+# A máquina segue até o fim do boot.
+
+attach
+expect-stop SIGINT
+
+# Parada por NMI: o BSP gira 3 s com as interrupções desligadas e manda uma
+# NMI a si mesmo; a máquina para dentro do giro, com todos os processadores
+# congelados.
+monitor kdtest nmi 3000
+expect autoteste armado
+continue
+wait-stop 60000
+expect-stop nmi:
+expect-stop SIGINT
+cpulist
+expect processadores parados: 1,2,3,4
+bt
+expect spin_with_interrupts_off
+monitor nmi
+expect paradas pedidas por NMI 1
+expect dono da parada (KPRCB.IpiFrozen 4)
+expect congelado (KPRCB.IpiFrozen 2)
+# O giro termina e o tique volta: o pedido de parada comum funciona.
+continue
+sleep 1000
+break
+expect-stop SIGINT
+
+# Primeira chance de uma exceção de usuário (sintética) com a entrada `e`.
+monitor sx e c0000005
+expect primeira chance: para
+monitor kdtest excecao c0000005 1
+continue
+wait-stop 60000
+expect-stop exception:c0000005
+expect-stop chance:1
+monitor exr
+expect primeira chance
+expect STATUS_ACCESS_VIOLATION
+
+# A mesma exceção com a entrada `i`: a máquina segue.
+monitor sx i c0000005
+monitor kdtest excecao c0000005 1
+continue
+sleep 2000
+break
+expect-stop SIGINT
+monitor sx
+expect paradas 1 ignoradas 1
+
+# Segunda chance de um fast fail (sintético) com a entrada `d`.
+monitor sx d c0000409
+monitor kdtest excecao c0000409 2
+continue
+wait-stop 60000
+expect-stop exception:c0000409
+expect-stop chance:2
+monitor exr
+expect segunda chance
+expect nao continuavel
+monitor sx clear
+expect nenhuma entrada
+continue
+sleep 500
+break
+expect-stop SIGINT
+
+# Um comando que falta ou chama KeBugCheckEx com a máquina parada: o comando
+# é abandonado e a sessão segue.
+monitor kdtest falta
+expect falta dentro do depurador
+expect comando abandonado
+monitor kd
+expect KdDebuggerEnabled=1
+monitor kdtest bugcheck
+expect bugcheck 0x000000e2
+expect o bugcheck nao segue
+monitor kd
+expect KdDebuggerEnabled=1
+
+# O passo sobre `hlt` com o IF mascarado: o passo pula a instrução.
+monitor kdtest hlt
+continue
+wait-stop 60000
+expect-stop SIGTRAP
+save parada %rip
+step
+expect-stop SIGTRAP
+expect-eq %rip $parada+1
+continue
+sleep 500
+break
+expect-stop SIGINT
+
+# Uma #GP sem tratador no meio do passo: parada nova na instrução, e o host
+# retoma pulando a leitura (3 bytes).
+monitor kdtest passo-falta
+continue
+wait-stop 60000
+expect-stop SIGTRAP
+save leitura %rip
+step
+expect-stop SIGSEGV
+expect-eq %rip $leitura
+r rip=$leitura+3
+continue
+sleep 500
+break
+expect-stop SIGINT
+
+# Desliga: a máquina segue até o fim do boot.
+detach
+wait-serial [shell] pronto

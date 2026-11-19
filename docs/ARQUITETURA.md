@@ -2765,15 +2765,57 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     relógio no anel 0 consulta o LSR (o 0x03 do host, ou o começo de um
     pacote, para a máquina, como o KdPollBreakIn); a exceção sem tratador e
     o KeBugCheckEx param antes do diagnóstico e da tela de STOP; o pânico
-    para antes de travar.
+    para antes de travar. A entrada do depurador confere o GS pelo MSR, como
+    o KiNmiInterrupt: um passo parado entre o `swapgs` e o `iretq` de volta
+    ao anel 3 entra com o GS do usuário.
+  - Parada por NMI (o `nmi` do monitor do QEMU): é a que funciona com as
+    interrupções desligadas, quando o tique do relógio não vem. Com o
+    depurador ligado, a NMI do BSP tem caminho próprio (`irq_nmi`) e nunca
+    vira exceção (antes, uma NMI no anel 3 matava o processo com
+    STATUS_ACCESS_VIOLATION e no anel 0 caía no diagnóstico fatal). O
+    tratamento segue o KiProcessNMI do 19041 (0x5129b0): o congelamento
+    primeiro (KiCheckForFreezeExecution), a marca de NMI em andamento do
+    processador (KiNmiInProgress) e a KiNMILock tomada sem esperar, com o
+    congelamento conferido enquanto outro processador a tem. No lugar do
+    HalHandleNMI (relatório do WHEA e bugcheck), a NMI é o pedido de parada
+    do host: a resposta leva `nmi:` e continuar volta ao código
+    interrompido. Do anel 3, a parada mostra o quadro do usuário (seletores
+    e GS dele); um passo dali segue na thread de usuário. A NMI que chega no
+    anel 0 com o GS do usuário (logo depois do SYSCALL, antes da troca de
+    pilha, ou entre o `swapgs` e o `iretq`) fica para o próximo tique do
+    relógio no anel 0. `monitor nmi` mostra os contadores e o estado de cada
+    processador.
   - Congelamento: o processador da parada congela os outros com NMI
     pelo código de IPI do Ke (`smp::send_nmi_to_application_processors`; a
     NMI dos APs prende o processador em `rs_kd_freeze_processor` com o
-    quadro publicado) e só os degela ao continuar.
+    quadro publicado) e só os degela ao continuar. KPRCB.IpiFrozen leva o
+    estado com os valores do 19041: 4 no dono, 5 no alvo pendente, 2 no
+    preso, 3 no degelo, 0 rodando. Os APs não têm `int 3` (a IDT deles só
+    tem o portão da NMI, e um `int 3` ali era falta tripla): um bugcheck, um
+    pânico, um DbgBreakPointWithStatus ou o 0x03 lido num DbgPrint de um AP
+    viram um pedido ao BSP por NMI, e a parada mostra o AP (`thread:` dele;
+    a thread 0 do protocolo é o processador da parada). O passo é recusado
+    nessa parada.
   - Passo: roda só no processador da parada, com o IF mascarado durante a
     instrução. O IF original volta depois, e um `pushfq` passo a passo grava
     o IF original. Continuar de um breakpoint dá antes um passo com o byte
-    original.
+    original. O passo sobre `hlt` (que dormiria com o IF mascarado) pula a
+    instrução. O passo sobre o `iretq` (ou o `swapgs` antes dele) de volta
+    ao anel 3 liga o TF no quadro do IRETQ, solta a parada e para no #DB do
+    anel 3 da thread do intervalo (antes, o #DB ia ao processo como
+    STATUS_SINGLE_STEP e a máquina ficava com os outros processadores
+    congelados).
+  - Robustez da sessão (`kd/recovery.rs`): cada pacote do host roda com um
+    ponto de recuperação (um `setjmp` próprio, em assembly). Uma falta sem
+    tratador, um KeBugCheckEx ou um pânico dentro de um comando abandonam o
+    comando; o host recebe o motivo (no texto do `monitor`, ou em pacote `O`
+    antes de um `E0F`) e a sessão segue. O código abandonado não roda
+    destrutores: a mensagem conta as travas que ficaram tomadas. O `int 3`
+    de um breakpoint do host que um comando atinge executa o byte original,
+    que volta no fim da sessão. Uma falta sem tratador no meio de um passo
+    encerra o passo e vira uma parada nova; a exceção de kernel sem tratador
+    retoma se o host mudar o RIP (ou pedir um passo), e segue o diagnóstico
+    se ele só continuar. A falta dupla e o machine check nunca retomam.
   - Nada da parada aloca nem toma trava. As consultas que usam estruturas
     do Rust (módulos, objeto por nome) só rodam quando nenhum processador
     parado tinha SpinLock ou SharedLock.
@@ -2824,9 +2866,36 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
       imagem tiram o processo dos donos. O passo e a saída de um
       breakpoint usam o TF no CONTEXT; o #DB do passo volta pelo mesmo
       caminho e é reconhecido pelo endereço do CONTEXT. `monitor uex on`
-      para também nas outras exceções do anel 3. Antes de devolver um byte
-      de usuário, o byte atual é conferido (tem de ser o 0xCC). Os comparadores de
-      hardware do depurador valem só no anel 0: na entrada do anel 3 a HAL
+      para também nas outras exceções do anel 3 (o FLG_STOP_ON_EXCEPTION do
+      KdpReport: sem os códigos informativos até 0x4000001D, o
+      STATUS_PORT_DISCONNECTED e os positivos a partir de 0x40000020, como o
+      DBG_PRINTEXCEPTION_C do OutputDebugString).
+    - Exceções do anel 3 por código (`kd/exception_filter.rs`, `monitor sx
+      [e|d|i|r] <código|failfast>`): `e` para nas duas chances, `d` só na
+      segunda, `i` nunca; `failfast` vale pelos três códigos de fim imediato
+      (0xC0000409, 0xC0000602 e 0xC000027B). A tabela vale por cima do `uex`
+      e esvazia quando o host se desliga; sem entrada, a segunda chance não
+      para. A primeira chance passa pelo filtro no despacho de hardware e na
+      exceção levantada pelo NtRaiseException (o RaiseException, as
+      exceções do C++ e do RPC). A segunda chance é o ponto do
+      DbgkForwardException(SecondChance) do 19041, com o depurador do kernel
+      no papel da porta de depuração: o NtRaiseException com FirstChance
+      FALSE, a exceção que não pôde ser entregue e o `__fastfail` (`int
+      0x29`), que o KiFastFailDispatch (0x412280) leva direto à segunda
+      chance com o registro (STATUS_STACK_BUFFER_OVERRUN, não continuável, o
+      código do RCX em ExceptionInformation[0]); a HAL agora salva o CONTEXT
+      do `int 0x29` e o despacho termina o processo sem entregar a exceção.
+      O fim do processo pelo NtTerminateProcess com um código da tabela
+      também para: o RaiseFailFastException sem o serviço do WER termina
+      assim, com o código. A resposta leva `exception:código;chance:n;` (e
+      `term:` no fim do processo). A segunda chance e o fim do processo são
+      só para ver: continuar deixa o processo terminar, e o passo é
+      recusado. `monitor exr` mostra a última exceção relatada: o registro,
+      o processo, o código do fast fail (FAST_FAIL_*) e, num 0xC000027B, as
+      STOWED_EXCEPTION_INFORMATION do vetor (ResultCode, endereço ou texto).
+      Antes de gravar num endereço de usuário, o byte atual é conferido; antes
+      de devolver um byte de usuário, também (tem de ser o 0xCC). Os
+      comparadores de hardware do depurador valem só no anel 0: na entrada do anel 3 a HAL
       troca o banco de depuração pelo da thread (o CONTEXT dela).
     - Breakpoints de hardware de usuário (`kd/user_hardware.rs`): um
       `Z1`/`Z2`/`Z4` num endereço de usuário com processo escolhido arma o
@@ -6195,6 +6264,16 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   primeiros acertos e a para no terceiro; laços acham o System, a thread
   do ACPI.sys (conferida contra o `save-thread`) e o ksecdd.sys, e o
   `save-after` confere o EPROCESS do `!process 4` e a base do `lmv`.
+
+  O teste `kd-parada` (`--script=xtask/scripts/kd-parada.txt`) cobre a
+  robustez da parada com os autotestes do alvo (`monitor kdtest`, em
+  `kd/self_test.rs`, que rodam no próximo tique do relógio do BSP no anel
+  0): a parada por NMI com as interrupções desligadas (uma NMI do próprio
+  BSP) e os quatro processadores congelados; uma exceção de usuário
+  sintética pelo filtro na primeira chance (parando e seguindo) e na
+  segunda; um comando que falta e um que chama KeBugCheckEx, abandonados;
+  o passo sobre `hlt`; e uma #GP no meio de um passo, retomada pelo host
+  pulando a instrução.
 
   O boot com `--kd` roda também `ntos/test/kernel_debugger.rs`
   (`KD_EXPORTS_OK`).
