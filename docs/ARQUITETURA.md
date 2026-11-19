@@ -3177,7 +3177,14 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   embutido não tem pilha de IRP, então o I/O Manager responde no lugar as
   operações desses arquivos (`information::related_device` dá 0 para eles)
   e um IRP mandado ao dispositivo de volume termina com
-  STATUS_INVALID_DEVICE_REQUEST. O volume de boot guarda o conteúdo de
+  STATUS_INVALID_DEVICE_REQUEST. A exceção é o IRP_MJ_LOCK_CONTROL do
+  NtLockFile/NtUnlockFile (`information::request_device`,
+  `volume_device::serves`): o dispositivo de volume o entrega às travas do
+  stream (`drivers/fs/volume_streams.rs`, o NtfsCommonLockControl sobre o
+  FsRtlProcessFileLock), a leitura e a escrita de modo usuário conferem
+  essas travas (STATUS_FILE_LOCK_CONFLICT) e o cleanup e o fechamento do
+  último handle de um processo soltam as dele (teste `volume_notify_locks`
+  na fase 7). O volume de boot guarda o conteúdo de
   `\Windows` na raiz (os programas de System32, `Fonts`, os temas...), que o
   modo usuário abre pelos aliases de `volume_files::nt_path_to_volume_path`;
   a abertura do kernel por `\SystemRoot\X` ou `\??\C:\Windows\X` que não

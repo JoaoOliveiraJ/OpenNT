@@ -23,9 +23,13 @@
 //! * Conclusão de IRP (FsRtlCompleteLockIrpReal 0x4ef5b0): rotina própria do
 //!   FS (zerando FileObject->LastLock) ou IofCompleteRequest.
 //!
-//! Limitações (sinalizadas): IRPs pendentes não recebem rotina de
-//! cancelamento (o NT instala FsRtlPrivateCancelFileLockIrp) e
-//! FILE_OBJECT.LastLock, um cache de consulta, nunca é preenchido.
+//! * Um IRP de trava em espera recebe a rotina de cancelamento
+//!   FsRtlPrivateCancelFileLockIrp (0x4ef9f0): o IoCancelIrp o tira da fila e
+//!   o conclui com STATUS_CANCELLED; a concessão e o desbloqueio tiram a rotina
+//!   antes de concluir e pulam o IRP cujo cancelamento já começou.
+//!
+//! Limitação (sinalizada): FILE_OBJECT.LastLock, um cache de consulta, nunca
+//! é preenchido.
 //!
 //! Motor estável para os file systems (FAT/NTFS): `initialize_file_lock`,
 //! `allocate_file_lock`, `uninitialize_file_lock`, `free_file_lock`,
@@ -41,7 +45,7 @@ use crate::hal::amd64::native_call;
 use crate::ntos::inc::field::{Field, NtStruct, Reserved};
 use crate::ntos::inc::types::extra_fsrtl::{FileLock, FileLockInfo};
 use crate::ntos::inc::types::{FileObject, IoStackLocation, IoStatusBlock, Irp, LargeInteger};
-use crate::ntos::io::io_manager;
+use crate::ntos::io::{cancel, io_manager};
 use crate::ntos::mm::guest_memory as guest;
 #[allow(unused_imports)] // usado pelo anexo fsrtl-file-lock-irp
 use crate::rtl::KernelError;
@@ -52,6 +56,7 @@ pub const STATUS_PENDING: u32 = 0x0000_0103;
 pub const STATUS_LOCK_NOT_GRANTED: u32 = 0xC000_0055;
 pub const STATUS_RANGE_NOT_LOCKED: u32 = 0xC000_007E;
 pub const STATUS_INVALID_LOCK_RANGE: u32 = 0xC000_01A1;
+pub const STATUS_CANCELLED: u32 = 0xC000_0120;
 
 /// IO_STACK_LOCATION.Control: SL_PENDING_RETURNED (IoMarkIrpPending).
 const SL_PENDING_RETURNED: u8 = 0x01;
@@ -215,13 +220,15 @@ fn remove_exact(info: u64, lock: &Range) -> bool {
 
 /// FsRtlPrivateCheckWaitingLocks: concede em ordem FIFO os IRPs que não
 /// conflitam mais e os conclui com STATUS_SUCCESS (a trava sai se a rotina de
-/// conclusão do FS falhar).
+/// conclusão do FS falhar). A rotina de cancelamento sai do IRP antes; um IRP
+/// sem ela já está sendo cancelado e fica para o
+/// FsRtlPrivateCancelFileLockIrp.
 fn check_waiting_locks(info: u64) {
     loop {
         let granted = {
             let mut queues = QUEUES.lock();
             let Some(queue) = queues.get_mut(&info) else { return };
-            let position = queue.waiting.iter().position(|waiter| grantable(queue, &waiter.range));
+            let position = queue.waiting.iter().position(|waiter| grantable(queue, &waiter.range) && cancel::set_cancel_routine(waiter.irp, 0) != 0);
             match position.and_then(|index| queue.waiting.remove(index)) {
                 Some(waiter) => {
                     queue.locks.push(waiter.range);
@@ -237,6 +244,38 @@ fn check_waiting_locks(info: u64) {
             remove_exact(info, &granted.range);
         }
     }
+}
+
+/// O endereço do FsRtlPrivateCancelFileLockIrp, a rotina de cancelamento dos
+/// IRPs de trava em espera.
+fn cancel_routine() -> u64 {
+    cancel_lock_irp as extern "win64" fn(u64, u64) as usize as u64
+}
+
+/// FsRtlPrivateCancelFileLockIrp(DeviceObject, Irp) (RVA 0x4ef9f0): solta o
+/// spin lock de cancelamento e tira o IRP da fila do LOCK_INFO guardado em
+/// Irp->IoStatus.Information, concluindo-o com STATUS_CANCELLED.
+extern "win64" fn cancel_lock_irp(_device: u64, irp: u64) {
+    let info = irp_at(irp).io_status.information.get();
+    let _ = cancel::release(irp_at(irp).cancel_irql.get());
+    if info != 0 {
+        cancel_waiting(info, irp);
+    }
+}
+
+/// O corpo do FsRtlPrivateCancelFileLockIrp: o IRP `irp` sai da fila de
+/// espera de `info` e é concluído com STATUS_CANCELLED; um IRP que já saiu
+/// da fila (concedido ou desfeito) não é tocado.
+fn cancel_waiting(info: u64, irp: u64) {
+    let waiter = {
+        let mut queues = QUEUES.lock();
+        let Some(queue) = queues.get_mut(&info) else { return };
+        let Some(index) = queue.waiting.iter().position(|waiter| waiter.irp == irp) else { return };
+        queue.waiting.remove(index)
+    };
+    let Some(waiter) = waiter else { return };
+    irp_at(irp).io_status.information.set(0);
+    complete_lock_irp(info, waiter.context, irp, STATUS_CANCELLED, waiter.range.file_object);
 }
 
 /// FsRtlInitializeFileLock (RVA 0x201850).
@@ -267,6 +306,9 @@ pub fn uninitialize_file_lock(file_lock: &FileLock) {
     }
     let queue = QUEUES.lock().remove(&info).unwrap_or_default();
     for waiter in queue.waiting {
+        // Sem a fila, um cancelamento em curso não acha o IRP: ele é
+        // concluído aqui de qualquer jeito.
+        cancel::set_cancel_routine(waiter.irp, 0);
         irp_at(waiter.irp).io_status.information.set(0);
         complete_lock_irp(info, waiter.context, waiter.irp, STATUS_RANGE_NOT_LOCKED, 0);
     }
@@ -341,6 +383,7 @@ pub fn private_lock(file_lock: &FileLock, file_object: u64, starting_byte: &Larg
     let request = Range::new(starting_byte.quad_part.get() as u64, length.quad_part.get() as u64, exclusive, key, file_object, process_id);
 
     let mut inserted = false;
+    let mut cancelled = false;
     let status = if request.end < request.start && request.length != 0 {
         STATUS_INVALID_LOCK_RANGE
     } else {
@@ -360,6 +403,11 @@ pub fn private_lock(file_lock: &FileLock, file_object: u64, starting_byte: &Larg
             stack.control.atomic().fetch_or(SL_PENDING_RETURNED, Ordering::SeqCst);
             irp.io_status.information.set(info);
             queue.waiting.push_back(Waiter { irp: irp.address(), context, range: request });
+            // A rotina de cancelamento do IRP em espera; um IoCancelIrp que
+            // chegou antes dela (Cancel já ligado) tira o IRP da fila logo
+            // abaixo, fora do lock.
+            cancel::set_cancel_routine(irp.address(), cancel_routine());
+            cancelled = irp.cancel.get() != 0 && cancel::set_cancel_routine(irp.address(), 0) != 0;
             STATUS_PENDING
         } else {
             // Fast I/O não espera: o chamador repete pelo caminho do IRP.
@@ -367,6 +415,11 @@ pub fn private_lock(file_lock: &FileLock, file_object: u64, starting_byte: &Larg
         }
     };
     iosb.status.set(status as i32);
+    if cancelled {
+        if let Some(irp) = irp {
+            cancel_waiting(info, irp.address());
+        }
+    }
 
     if let Some(irp) = irp {
         if status != STATUS_PENDING {
@@ -427,7 +480,9 @@ fn unlock_all(file_lock: &FileLock, file_object: u64, process_id: u64, key: Opti
         }
         let (removed, kept): (Vec<Range>, Vec<Range>) = queue.locks.drain(..).partition(|lock| owned(lock));
         queue.locks = kept;
-        let (cancelled, waiting): (Vec<Waiter>, Vec<Waiter>) = queue.waiting.drain(..).partition(|waiter| owned(&waiter.range));
+        // Os IRPs do dono saem com a rotina de cancelamento tirada; um sem
+        // ela já está sendo cancelado e fica para o FsRtlPrivateCancelFileLockIrp.
+        let (cancelled, waiting): (Vec<Waiter>, Vec<Waiter>) = queue.waiting.drain(..).partition(|waiter| owned(&waiter.range) && cancel::set_cancel_routine(waiter.irp, 0) != 0);
         queue.waiting = waiting.into_iter().collect();
         write_lowest(info, queue);
         (removed, cancelled)

@@ -11,12 +11,14 @@ use alloc::vec::Vec;
 use core::any::Any;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use super::state::{NativeBody, UserObject};
+use super::state::{self, NativeBody, UserObject};
 use crate::drivers::fs::volume::{FileSystem, VolumeStat};
 use crate::drivers::fs::volume_files::{self, VolumeFile};
+use crate::drivers::fs::volume_streams;
 use crate::ntos::io::file::lifetime::{self as file_lifetime, Entry};
 use crate::ntos::ob::objects::file::{self as file_objects, FileCallbacks, FileSource};
 use crate::ntos::ob::object_types;
+use crate::ntos::ps::process;
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::inc::types::{FileObject, NtStruct};
 
@@ -74,6 +76,11 @@ impl UserFile {
             file.current_byte_offset.quad_part.set(value as i64);
         }
     }
+
+    /// O processo corrente ainda tem um handle desta descrição aberta.
+    fn open_in_current_process(&self) -> bool {
+        state::user_handle_values().into_iter().filter_map(|value| state::get_user_handle(value as u64)).any(|entry| entry.kind() == "file" && entry.downcast::<UserFile>().is_some_and(|other| other.id == self.id))
+    }
 }
 
 impl UserObject for UserFile {
@@ -101,8 +108,15 @@ impl UserObject for UserFile {
         file_objects::open_handle(self.file_object())?;
         Ok(true)
     }
+    /// O IopCloseFile (0x64a35a): o processo que fecha o último handle dele
+    /// para um FILE_OBJECT com LockOperation solta as travas dele (o
+    /// IRP_MN_UNLOCK_ALL); o handle que fecha já saiu da tabela.
     fn on_each_handle_close(&self) {
-        let _ = file_objects::close_handle(self.file_object());
+        let pointer = self.file_object();
+        if self.native().is_some_and(|file| file.lock_operation.get() != 0) && !self.open_in_current_process() {
+            volume_streams::unlock_for_process(pointer, process::get_current_process());
+        }
+        let _ = file_objects::close_handle(pointer);
     }
     /// A referência da descrição aberta sobrevive às esperas de usuário.
     fn release(&self) {
@@ -166,7 +180,13 @@ pub fn bind(entry: &Arc<UserFile>, destroy: Arc<dyn Fn() + Send + Sync>) -> Resu
         file_object.flags.set(flags);
         file_object.delete_pending.set(file.pending_delete() as u8);
         entry.file_object.store(pointer, Ordering::Release);
-        file_objects::set_callbacks(pointer, FileCallbacks { cleanup: None, close: None, destroy: Some(destroy) })?;
+        // O cleanup (último handle) é o do NtfsCommonCleanup: as travas de
+        // faixa de bytes do processo que fecha saem (FsRtlFastUnlockAll).
+        let cleanup: Arc<dyn Fn() -> u32 + Send + Sync> = Arc::new(move || {
+            volume_streams::cleanup(pointer, process::get_current_process());
+            0
+        });
+        file_objects::set_callbacks(pointer, FileCallbacks { cleanup: Some(cleanup), close: None, destroy: Some(destroy) })?;
         let marks = file.marks.clone();
         file_lifetime::bind(Entry { access: entry.access, share: entry.share, file_object: pointer, file: Some(marks) }, &file_lifetime::lifetime_volume(volume_files::fixed_volume().ok_or_else(|| KernelError::new("volume de boot ausente"))?), &file.volume_path())
     })();

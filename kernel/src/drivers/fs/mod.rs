@@ -15,3 +15,4 @@ pub mod volume_information;
 pub mod filter_callbacks;
 pub mod volume_files;
 pub mod volume_device;
+pub mod volume_streams;

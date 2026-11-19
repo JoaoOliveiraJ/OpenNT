@@ -1230,6 +1230,7 @@ fn user_file_io_more(assert: Assert) {
     guest::write64(rsp + 0x30, buffer);
     guest::write32(rsp + 0x38, 10);
     guest::write64(rsp + 0x40, 0);
+    guest::write64(rsp + 0x48, 0);
     assert(call("NtWriteFile", handle, 0, 0, 0) == 0, "userfiles: dados escritos");
     let set = |class: u32, data: &[u8]| {
         guest::write_bytes(buffer, data);
@@ -2439,6 +2440,7 @@ fn user_nls(assert: Assert) {
     guest::write64(rsp + 0x30, buffer);
     guest::write32(rsp + 0x38, 10);
     guest::write64(rsp + 0x40, 0);
+    guest::write64(rsp + 0x48, 0);
     let written = call("NtWriteFile", writer, 0, 0, 0);
     let _ = state::close_user_handle(writer, true, false);
     guest::write64(rsp + 0x28, size);
@@ -7027,6 +7029,7 @@ pub fn run(assert: Assert) {
     disk_write_stress(assert, 12, 3);
     user_file_syscalls(assert);
     super::reparse_points::run(assert);
+    super::volume_notify_locks::run(assert);
     super::volume_open::run(assert);
     user_handle_operations(assert);
     user_events_and_semaphores(assert);

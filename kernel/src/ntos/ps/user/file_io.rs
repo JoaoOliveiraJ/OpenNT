@@ -660,6 +660,8 @@ fn file_transfer(handle: u64, event: u64, apc: u64, rsp: u64, write: bool) -> Re
     let out = state::stack_arg(rsp, 6);
     let length = state::stack_arg32(rsp, 7) as u64;
     let pointer = state::stack_arg(rsp, 8);
+    // Key (PULONG opcional) das travas de faixa de bytes.
+    let key_pointer = state::stack_arg(rsp, 9);
     run(iosb, || {
         let Some(entry) = state::get_user_handle(handle) else { return fail(HANDLE) };
         if apc != 0 {
@@ -673,6 +675,9 @@ fn file_transfer(handle: u64, event: u64, apc: u64, rsp: u64, write: bool) -> Re
             return fail(AV);
         }
         if pointer != 0 && !state::probe_user_read(pointer, 8) {
+            return fail(AV);
+        }
+        if key_pointer != 0 && !state::probe_user_read(key_pointer, 4) {
             return fail(AV);
         }
         if entry.kind() == "device" {
@@ -716,6 +721,16 @@ fn file_transfer(handle: u64, event: u64, apc: u64, rsp: u64, write: bool) -> Re
         }
         if options & 8 != 0 && (offset % 512 != 0 || length % 512 != 0 || out % 512 != 0) {
             return fail(INVALID);
+        }
+        // As travas de faixa de bytes do stream: o FsRtlCheckLockForReadAccess
+        // do NtfsCommonRead (0xee93) e o ForWriteAccess do NtfsCommonWrite
+        // (0x1fc67) dão STATUS_FILE_LOCK_CONFLICT. A E/S de seções mapeadas não
+        // passa por aqui, como no NT.
+        if length != 0 {
+            let key = if key_pointer != 0 { guest::try_read::<u32>(key_pointer)? } else { 0 };
+            if !crate::drivers::fs::volume_streams::transfer_allowed(user_file.file_object(), offset, length, key, crate::ntos::ps::process::get_current_process(), write) {
+                return fail(0xC000_0054);
+            }
         }
         let mut status = 0;
         let mut count = 0u64;
@@ -1301,4 +1316,31 @@ pub fn init_part2() {
     state::register_handler("NtQueryVolumeInformationFile", nt_query_volume_information_file);
     state::register_handler("NtNotifyChangeDirectoryFile", nt_notify_change_directory_file);
     state::register_handler("NtNotifyChangeDirectoryFileEx", nt_notify_change_directory_file_ex);
+    state::register_handler("NtLockFile", nt_lock_file);
+    state::register_handler("NtUnlockFile", nt_unlock_file);
+}
+
+/// NtLockFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
+/// ByteOffset, Length, Key, FailImmediately, ExclusiveLock): o
+/// IRP_MJ_LOCK_CONTROL do I/O Manager (`irp_service::lock_file`), nos
+/// arquivos do volume e nos de driver.
+fn nt_lock_file(handle: u64, event: u64, apc_routine: u64, apc_context: u64, rsp: u64) -> Result<u32, KernelError> {
+    Ok(irp_service::lock_file(&irp_service::Lock {
+        handle,
+        event,
+        apc_routine,
+        apc_context,
+        io_status: state::stack_arg(rsp, 5),
+        byte_offset: state::stack_arg(rsp, 6),
+        length: state::stack_arg(rsp, 7),
+        key: state::stack_arg32(rsp, 8),
+        fail_immediately: state::stack_arg(rsp, 9) & 0xFF != 0,
+        exclusive: state::stack_arg(rsp, 10) & 0xFF != 0,
+    }))
+}
+
+/// NtUnlockFile(FileHandle, IoStatusBlock, ByteOffset, Length, Key):
+/// `irp_service::unlock_file`.
+fn nt_unlock_file(handle: u64, io_status: u64, byte_offset: u64, length: u64, rsp: u64) -> Result<u32, KernelError> {
+    Ok(irp_service::unlock_file(handle, io_status, byte_offset, length, state::stack_arg32(rsp, 5)))
 }

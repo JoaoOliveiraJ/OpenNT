@@ -19,11 +19,15 @@
 //! arquivos dão o dispositivo de volume. O file system embutido não tem
 //! pilha de IRP para os arquivos: o I/O Manager responde no lugar as
 //! operações deles (`io/file/information.rs::related_device` não acha
-//! dispositivo de despacho). A exceção é a E/S de paginação dos
-//! arquivos de paginação (MmIsFileObjectAPagingFile): o IoPageRead e o
-//! IoSynchronousPageWrite do Mm chegam aqui como IRP_MJ_READ/WRITE com
-//! IRP_PAGING_IO e um MDL de páginas inteiras, e vão direto às runs do
-//! arquivo (`FileSystem::paging_read`/`paging_write`).
+//! dispositivo de despacho). As exceções:
+//! - a E/S de paginação dos arquivos de paginação
+//!   (MmIsFileObjectAPagingFile): o IoPageRead e o IoSynchronousPageWrite do
+//!   Mm chegam aqui como IRP_MJ_READ/WRITE com IRP_PAGING_IO e um MDL de
+//!   páginas inteiras, e vão direto às runs do arquivo
+//!   (`FileSystem::paging_read`/`paging_write`);
+//! - o IRP_MJ_LOCK_CONTROL do NtLockFile/NtUnlockFile ([`serves`],
+//!   `io/file/information.rs::request_device`), que vai às travas do stream
+//!   (`volume_streams::lock_control`, o NtfsCommonLockControl).
 //!
 //! O volume inteiro, aberto pelo nome do volume sem nome restante (`\??\C:`,
 //! o `\\.\C:` do Win32), chega por IRP, como no NT (`io/parse.rs`):
@@ -91,6 +95,7 @@ const IRP_MJ_WRITE: u8 = 4;
 const IRP_MJ_QUERY_VOLUME_INFORMATION: u8 = 0x0A;
 const IRP_MJ_FILE_SYSTEM_CONTROL: u8 = 0x0D;
 const IRP_MJ_DEVICE_CONTROL: u8 = 0x0E;
+const IRP_MJ_LOCK_CONTROL: u8 = 0x11;
 const IRP_MJ_CLEANUP: u8 = 0x12;
 /// IRP_MN_USER_FS_REQUEST e IRP_MN_KERNEL_CALL do IRP_MJ_FILE_SYSTEM_CONTROL.
 const IRP_MN_USER_FS_REQUEST: u8 = 0x00;
@@ -274,6 +279,13 @@ pub fn is_volume_device(device: u64) -> bool {
     device != 0 && VOLUMES.lock().iter().any(|entry| entry.volume == device)
 }
 
+/// Os IRPs dos arquivos do volume que o dispositivo de volume atende por
+/// despacho (`io/file/information.rs::request_device`): o
+/// IRP_MJ_LOCK_CONTROL das travas de faixa de bytes.
+pub fn serves(major: u8) -> bool {
+    major == IRP_MJ_LOCK_CONTROL
+}
+
 /// O dispositivo real do volume (o `\Device\KernelVolumeN`).
 pub fn real_device(file_system: &'static dyn FileSystem) -> Option<u64> {
     find(file_system).map(|entry| entry.real)
@@ -359,12 +371,22 @@ fn paging_io(device: u64, irp: &Irp) -> Option<(u32, u64)> {
     }
 }
 
-/// A rotina de despacho do file system embutido: a E/S de paginação dos
-/// arquivos de paginação e as aberturas do volume inteiro ([`answer`]); os
-/// arquivos do volume são respondidos no lugar pelo I/O Manager.
+/// A rotina de despacho do file system embutido: o IRP_MJ_LOCK_CONTROL dos
+/// arquivos do volume ([`serves`]), a E/S de paginação dos arquivos de
+/// paginação e as aberturas do volume inteiro ([`answer`]); as outras
+/// operações dos arquivos do volume são respondidas no lugar pelo I/O
+/// Manager.
 extern "win64" fn dispatch(device: u64, packet: u64) -> i32 {
     // SAFETY: IRP vivo entregue a um dispositivo deste driver.
     let irp = unsafe { Irp::at(packet) };
+    if is_volume_device(device) {
+        // SAFETY: a stack location corrente do IRP entregue a este dispositivo.
+        let stack = unsafe { IoStackLocation::at(irp.tail.overlay.current_stack_location.get()) };
+        // O FsRtl conclui o IRP ou o deixa na fila de espera.
+        if stack.major_function.get() == IRP_MJ_LOCK_CONTROL {
+            return super::volume_streams::lock_control(packet, irp, stack);
+        }
+    }
     let (status, information) = paging_io(device, irp).unwrap_or_else(|| answer(device, irp));
     irp.io_status.status.set(status as i32);
     irp.io_status.information.set(information);

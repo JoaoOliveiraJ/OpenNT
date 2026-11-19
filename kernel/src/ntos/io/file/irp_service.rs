@@ -1,8 +1,10 @@
 //! Os serviços de arquivo de modo usuário sobre um FILE_OBJECT aberto num
 //! driver: NtReadFile, NtWriteFile, NtFsControlFile e NtDeviceIoControlFile
 //! (o IopXxxControlFile), NtQueryInformationFile, NtSetInformationFile,
-//! NtQueryVolumeInformationFile e NtNotifyChangeDirectoryFile(Ex), montados
-//! como o I/O Manager do ntoskrnl 19041 os monta.
+//! NtQueryVolumeInformationFile, NtNotifyChangeDirectoryFile(Ex) e
+//! NtLockFile/NtUnlockFile (estes também nos arquivos dos volumes do kernel,
+//! cujo IRP_MJ_LOCK_CONTROL o file system embutido atende), montados como o
+//! I/O Manager do ntoskrnl 19041 os monta.
 //!
 //! - O handle de usuário dá o FILE_OBJECT e o acesso concedido (conferido
 //!   contra o que a operação exige). O IRP sai do StackSize do dispositivo
@@ -232,12 +234,23 @@ impl Target {
 /// ObReferenceObjectByHandle de um handle de arquivo de modo usuário e o
 /// dispositivo relacionado (IoGetRelatedDeviceObject).
 fn reference(handle: u64) -> Result<Target, u32> {
+    reference_for(handle, None)
+}
+
+/// [`reference`] para um IRP `major`: com `Some`, o dispositivo do
+/// `information::request_device`, que leva ao file system embutido os IRPs
+/// que ele atende (o IRP_MJ_LOCK_CONTROL dos arquivos do volume).
+fn reference_for(handle: u64, major: Option<u8>) -> Result<Target, u32> {
     let selected = query::resolve(handle, true)?;
     let file = selected.pointer;
     if file_objects::reference(file).ok().flatten().is_none() {
         return Err(STATUS_INVALID_HANDLE);
     }
-    let device = information::related_device(file).unwrap_or(0);
+    let device = match major {
+        Some(major) => information::request_device(file, major),
+        None => information::related_device(file),
+    }
+    .unwrap_or(0);
     let target = Target { file, device, access: selected.access, flags: file_at(file).flags.get() };
     if device == 0 {
         target.release();
@@ -506,6 +519,13 @@ fn complete(packet: u64, in_thread: bool) {
         irp.flags.set(flags & !(IRP_BUFFERED_IO | IRP_DEALLOCATE_BUFFER));
     }
     free_mdls(irp);
+    // O AuxiliaryBuffer é do I/O Manager (a cópia do *Length do NtLockFile e
+    // do NtUnlockFile) e sai com o IRP, como no IopCompleteRequest.
+    let auxiliary = irp.tail.overlay.auxiliary_buffer.get();
+    if auxiliary != 0 {
+        let _ = pool_allocation::free(auxiliary, 0);
+        irp.tail.overlay.auxiliary_buffer.set(0);
+    }
     if !nt_error(status) || irp.pending_returned.get() != 0 {
         let iosb = irp.user_iosb.get();
         if request.local != 0 {
@@ -1028,6 +1048,179 @@ pub fn notify_change_directory(arguments: &super::directory_notify::NotifyChange
     directory_notify::set_parameters(top_location(packet), arguments, class);
     track(packet, &target, event, 0, arguments.apc_context);
     synchronous_service_tail(&target, packet)
+}
+
+// ---- travas de faixa de bytes --------------------------------------------------
+
+const IRP_MJ_LOCK_CONTROL: u8 = 0x11;
+const IRP_MN_LOCK: u8 = 0x01;
+const IRP_MN_UNLOCK_SINGLE: u8 = 0x02;
+/// IO_STACK_LOCATION.Flags do IRP_MN_LOCK.
+const SL_FAIL_IMMEDIATELY: u8 = 0x01;
+const SL_EXCLUSIVE_LOCK: u8 = 0x02;
+
+/// Os argumentos de NtLockFile.
+#[derive(Clone, Copy)]
+pub struct Lock {
+    pub handle: u64,
+    pub event: u64,
+    pub apc_routine: u64,
+    pub apc_context: u64,
+    pub io_status: u64,
+    pub byte_offset: u64,
+    pub length: u64,
+    pub key: u32,
+    pub fail_immediately: bool,
+    pub exclusive: bool,
+}
+
+/// O ByteOffset e o Length (PLARGE_INTEGER) do NtLockFile e do NtUnlockFile,
+/// cada um alinhado a 4 (a ExRaiseDatatypeMisalignment do ProbeForRead,
+/// 0x655f07 e 0x655f2c), sondado e capturado.
+fn lock_range(byte_offset: u64, length: u64) -> Result<(i64, i64), u32> {
+    let capture = |pointer: u64| -> Result<i64, u32> {
+        if pointer & 3 != 0 {
+            return Err(STATUS_DATATYPE_MISALIGNMENT);
+        }
+        if !probe(pointer, 8, false) {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        guest::try_read::<i64>(pointer).map_err(|_| STATUS_ACCESS_VIOLATION)
+    };
+    Ok((capture(byte_offset)?, capture(length)?))
+}
+
+/// A cópia do *Length (LARGE_INTEGER) para o Parameters.LockControl.Length e
+/// o Tail.Overlay.AuxiliaryBuffer, que a conclusão libera; 0 sem memória.
+fn length_copy(length: i64) -> u64 {
+    let copy = guest::alloc_bytes(8);
+    if copy != 0 {
+        guest::write_bytes(copy, &length.to_le_bytes());
+    }
+    copy
+}
+
+/// O Parameters.LockControl do slot do topo e a cópia do Length no
+/// AuxiliaryBuffer.
+fn set_lock_parameters(packet: u64, copy: u64, key: u32, offset: i64) {
+    irp_at(packet).tail.overlay.auxiliary_buffer.set(copy);
+    let parameters = &top_location(packet).parameters.lock_control;
+    parameters.length.set(copy);
+    parameters.key.set(key);
+    parameters.byte_offset.quad_part.set(offset);
+}
+
+/// NtLockFile de modo usuário (ntoskrnl 19041 0x655e20), sem o Fast I/O (o
+/// IRP chega ao mesmo resultado, como nas leituras deste arquivo): o acesso
+/// FILE_READ_DATA ou FILE_WRITE_DATA do handle (0x655ea2), a sonda do
+/// IO_STATUS_BLOCK (0x655ed9), a faixa capturada, a porta de conclusão sem
+/// ApcRoutine (0x655f4e), FileObject->LockOperation (0x655fb4), o evento (um
+/// handle de evento inválido é ignorado e a trava segue sem evento,
+/// 0x656004-0x65601f), o lock e o evento de um arquivo síncrono e o
+/// IRP_MJ_LOCK_CONTROL / IRP_MN_LOCK com SL_FAIL_IMMEDIATELY e
+/// SL_EXCLUSIVE_LOCK nas Flags, a Key, o ByteOffset e o Length numa cópia do
+/// pool (0x656357-0x6563b1), e o IopSynchronousServiceTail.
+pub fn lock_file(arguments: &Lock) -> u32 {
+    let target = match reference_for(arguments.handle, Some(IRP_MJ_LOCK_CONTROL)) {
+        Ok(target) => target,
+        Err(status) => return status,
+    };
+    if target.access & (FILE_READ_DATA | FILE_WRITE_DATA) == 0 {
+        return conclude(&target, false, None, STATUS_ACCESS_DENIED);
+    }
+    if !probe(arguments.io_status, 4, true) {
+        return conclude(&target, false, None, STATUS_ACCESS_VIOLATION);
+    }
+    let (offset, length) = match lock_range(arguments.byte_offset, arguments.length) {
+        Ok(range) => range,
+        Err(status) => return conclude(&target, false, None, status),
+    };
+    let file = file_at(target.file);
+    if file.completion_context.get() != 0 && arguments.apc_routine & !1 != 0 {
+        return conclude(&target, false, None, STATUS_INVALID_PARAMETER);
+    }
+    if arguments.apc_routine != 0 {
+        return conclude(&target, false, None, STATUS_NOT_SUPPORTED);
+    }
+    file.lock_operation.set(1);
+    let event = reference_event(arguments.event).unwrap_or(None);
+    let synchronous = target.synchronous();
+    if synchronous && information::acquire_file(target.file).is_err() {
+        return conclude(&target, false, event, STATUS_INSUFFICIENT_RESOURCES);
+    }
+    dispatcher::clear_event(file.event.address());
+    let copy = length_copy(length);
+    if copy == 0 {
+        return conclude(&target, synchronous, event, STATUS_INSUFFICIENT_RESOURCES);
+    }
+    let user_event = event.as_ref().map_or(0, |event| event.pointer);
+    let packet = allocate(&target, BuildOptions { major: IRP_MJ_LOCK_CONTROL, minor: IRP_MN_LOCK, user_event, user_iosb: arguments.io_status, ..BuildOptions::default() }, 0);
+    if packet == 0 {
+        guest::free_bytes(copy);
+        return conclude(&target, synchronous, event, STATUS_INSUFFICIENT_RESOURCES);
+    }
+    set_lock_parameters(packet, copy, arguments.key, offset);
+    let mut flags = 0;
+    if arguments.fail_immediately {
+        flags |= SL_FAIL_IMMEDIATELY;
+    }
+    if arguments.exclusive {
+        flags |= SL_EXCLUSIVE_LOCK;
+    }
+    top_location(packet).flags.set(flags);
+    track(packet, &target, event, 0, arguments.apc_context);
+    synchronous_service_tail(&target, packet)
+}
+
+/// NtUnlockFile de modo usuário (ntoskrnl 19041 0x674110): as checagens do
+/// NtLockFile (0x6741b2...) e o IRP_MJ_LOCK_CONTROL / IRP_MN_UNLOCK_SINGLE,
+/// sempre síncrono: num arquivo assíncrono, o evento e o IO_STATUS_BLOCK
+/// locais com IRP_SYNCHRONOUS_API (0x6743c7-0x6743fc, 0x674479), copiados
+/// para o do usuário (o IopSynchronousApiServiceTail, 0x67451c).
+pub fn unlock_file(handle: u64, io_status: u64, byte_offset: u64, length: u64, key: u32) -> u32 {
+    let target = match reference_for(handle, Some(IRP_MJ_LOCK_CONTROL)) {
+        Ok(target) => target,
+        Err(status) => return status,
+    };
+    if target.access & (FILE_READ_DATA | FILE_WRITE_DATA) == 0 {
+        return conclude(&target, false, None, STATUS_ACCESS_DENIED);
+    }
+    if !probe(io_status, 4, true) {
+        return conclude(&target, false, None, STATUS_ACCESS_VIOLATION);
+    }
+    let (offset, length) = match lock_range(byte_offset, length) {
+        Ok(range) => range,
+        Err(status) => return conclude(&target, false, None, status),
+    };
+    let synchronous = target.synchronous();
+    if synchronous && information::acquire_file(target.file).is_err() {
+        return conclude(&target, false, None, STATUS_INSUFFICIENT_RESOURCES);
+    }
+    let local = if synchronous { 0 } else { allocate_local() };
+    let copy = length_copy(length);
+    if copy == 0 || (!synchronous && local == 0) {
+        for block in [copy, local] {
+            if block != 0 {
+                guest::free_bytes(block);
+            }
+        }
+        return conclude(&target, synchronous, None, STATUS_INSUFFICIENT_RESOURCES);
+    }
+    dispatcher::clear_event(file_at(target.file).event.address());
+    let flags = if local != 0 { IRP_SYNCHRONOUS_API } else { 0 };
+    let (user_event, user_iosb) = if local != 0 { (local, local_iosb(local).address()) } else { (0, io_status) };
+    let packet = allocate(&target, BuildOptions { major: IRP_MJ_LOCK_CONTROL, minor: IRP_MN_UNLOCK_SINGLE, user_event, user_iosb, ..BuildOptions::default() }, flags);
+    if packet == 0 {
+        for block in [copy, local] {
+            if block != 0 {
+                guest::free_bytes(block);
+            }
+        }
+        return conclude(&target, synchronous, None, STATUS_INSUFFICIENT_RESOURCES);
+    }
+    set_lock_parameters(packet, copy, key, offset);
+    track(packet, &target, None, local, 0);
+    information_tail(&target, packet, local, io_status)
 }
 
 // ---- informação de arquivo -----------------------------------------------------

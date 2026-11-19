@@ -63,6 +63,16 @@ pub fn related_device(file: u64) -> Result<u64, KernelError> {
     Ok(if !volume_open && crate::drivers::fs::volume_device::is_volume_device(device) { 0 } else { device })
 }
 
+/// O dispositivo de um IRP `major` do arquivo: o de [`related_device`],
+/// salvo os IRPs que o file system embutido atende por despacho
+/// (`volume_device::serves`: o IRP_MJ_LOCK_CONTROL), que vão ao dispositivo
+/// de volume dele.
+pub fn request_device(file: u64, major: u8) -> Result<u64, KernelError> {
+    let device = related_device_object(file)?;
+    let volume_open = file_at(file).flags.get() & FO_VOLUME_OPEN != 0;
+    Ok(if !volume_open && crate::drivers::fs::volume_device::is_volume_device(device) && !crate::drivers::fs::volume_device::serves(major) { 0 } else { device })
+}
+
 /// IoGetRelatedDeviceObject: o dispositivo do VPB (ou o do arquivo, ou o do
 /// volume montado) e o topo da pilha, que uma extensão real de arquivo pode
 /// mandar parar num filtro abaixo do topo.
