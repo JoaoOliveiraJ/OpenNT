@@ -43,40 +43,65 @@ impl Filter {
     }
 }
 
+/// As linhas de uma lista grande que passam no filtro, refeitas só quando a
+/// lista, a sub-lista ou o filtro mudam: filtrar dezenas de milhares de
+/// linhas (com as letras minúsculas de cada campo) a cada quadro deixa a
+/// janela lenta.
+#[derive(Default)]
+pub(crate) struct FilteredRows {
+    /// A lista (o endereço do `Arc`), a sub-lista, o texto e se é regex.
+    key: Option<(usize, usize, String, bool)>,
+    pub(crate) rows: Vec<usize>,
+    /// O erro da expressão regular.
+    pub(crate) error: Option<String>,
+}
+
+impl FilteredRows {
+    pub(crate) fn update(&mut self, list: usize, mode: usize, filter: &str, regex: bool, count: usize, matches: impl Fn(usize, &Filter) -> bool) -> &[usize] {
+        let key = (list, mode, filter.to_string(), regex);
+        if self.key.as_ref() != Some(&key) {
+            let compiled = Filter::new(filter, regex);
+            self.rows = (0..count).filter(|&index| matches(index, &compiled)).collect();
+            self.error = compiled.error.clone();
+            self.key = Some(key);
+        }
+        &self.rows
+    }
+}
+
 fn header(ui: &mut Ui, title: &str) {
     ui.label(RichText::new(title).strong());
 }
 
 /// A aba Log: as mensagens do depurador (comandos, breakpoints de log,
-/// roteiros), o DbgPrint e a COM1.
+/// roteiros), o DbgPrint, a COM1 e os eventos da janela, em rolagem
+/// virtual.
 pub(crate) fn log_tab(ui: &mut Ui, state: &mut UiState) {
-    let colors = palette(ui);
     ui.horizontal(|ui| {
-        for (index, label) in ["Depurador", "DbgPrint", "COM1"].iter().enumerate() {
+        for (index, label) in ["Depurador", "DbgPrint", "COM1", "Eventos"].iter().enumerate() {
             if ui.selectable_label(state.log_mode == index, *label).clicked() {
                 state.log_mode = index;
             }
+        }
+        ui.separator();
+        if ui.small_button("Copiar").on_hover_text("copia o texto desta vista").clicked() {
+            crate::copy_text::copy_tab(ui.ctx(), state, Tab::Log);
         }
     });
     ui.separator();
     match state.log_mode {
         1 => log_panel(ui, &state.console, "re-dbgprint", "(nenhuma saída do DbgPrint ainda; os breakpoints de log também aparecem aqui)"),
         2 => log_panel(ui, &state.serial, "re-serial", "(o log da COM1 aparece aqui quando o depurador abre o QEMU)"),
+        crate::console::EVENTS_MODE => crate::console::events_view(ui, state, "re-log-events"),
         _ => {
-            egui::ScrollArea::both().id_salt("re-log").auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
-                if state.transcript.is_empty() {
-                    hint(ui, "a saída dos comandos (barra de comando embaixo), dos roteiros e dos breakpoints com comandos aparece aqui");
-                    for index in 0..state.launch_log.count() {
-                        ui.label(mono(state.launch_log.line(index)).color(colors.dim));
-                    }
+            if state.transcript_lines.is_empty() {
+                hint(ui, "a saída dos comandos (barra de comando embaixo), dos roteiros e dos breakpoints com comandos aparece aqui");
+                if state.launch_log.count() > 0 {
+                    log_panel(ui, &state.launch_log, "re-log-launch", "");
                 }
-                for entry in &state.transcript {
-                    ui.label(mono(format!("> {}", entry.input)).color(colors.blue));
-                    if !entry.output.trim().is_empty() {
-                        ui.label(mono(entry.output.trim_end()).color(if entry.error { colors.red } else { ui.visuals().text_color() }));
-                    }
-                }
-            });
+            } else {
+                crate::console::transcript_view(ui, state, "re-log");
+            }
         }
     }
 }
@@ -474,31 +499,50 @@ pub(crate) fn symbols_tab(ui: &mut Ui, state: &mut UiState) {
             ui.add(egui::TextEdit::singleline(&mut state.symbols_filter).desired_width(200.0));
         });
         ui.label(RichText::new(&view.source).color(colors.dim));
-        let filter = Filter::new(&state.symbols_filter, false);
-        let rows: Vec<(u64, String, String)> = match state.symbols_mode {
-            1 => view.exports.iter().filter(|(_, name)| filter.matches(&[name])).map(|(address, name)| (*address, name.clone(), String::new())).collect(),
-            2 => view.imports.iter().filter(|(_, dll, name, _)| filter.matches(&[dll, name])).map(|(slot, dll, name, value)| (*slot, format!("{dll}!{name}"), format!("{value:#x}"))).collect(),
-            _ => view.symbols.iter().filter(|(_, name)| filter.matches(&[name])).map(|(address, name)| (*address, name.clone(), String::new())).collect(),
+        // A lista filtrada só é refeita quando o módulo, a sub-lista ou o
+        // filtro mudam; cada quadro monta só as linhas à vista.
+        let mode = state.symbols_mode.min(2);
+        let count = match mode {
+            1 => view.exports.len(),
+            2 => view.imports.len(),
+            _ => view.symbols.len(),
         };
+        let rows: &[usize] = state.symbol_rows.update(Arc::as_ptr(view) as usize, mode, &state.symbols_filter, false, count, |index, filter| match mode {
+            1 => filter.matches(&[&view.exports[index].1]),
+            2 => filter.matches(&[&view.imports[index].1, &view.imports[index].2]),
+            _ => filter.matches(&[&view.symbols[index].1]),
+        });
         let height = row_height(ui);
+        let mut go = None;
         egui::ScrollArea::both().id_salt("re-symbol-rows").auto_shrink([false, false]).show_rows(ui, height, rows.len(), |ui, range| {
-            for (address, name, extra) in &rows[range] {
+            for &index in &rows[range] {
+                let (address, name, extra) = match mode {
+                    1 => (view.exports[index].0, view.exports[index].1.clone(), String::new()),
+                    2 => {
+                        let (slot, dll, name, value) = &view.imports[index];
+                        (*slot, format!("{dll}!{name}"), format!("{value:#x}"))
+                    }
+                    _ => (view.symbols[index].0, view.symbols[index].1.clone(), String::new()),
+                };
                 ui.horizontal(|ui| {
-                    let link = ui.add(egui::Label::new(mono(hex(*address)).color(colors.blue)).sense(Sense::click()));
+                    let link = ui.add(egui::Label::new(mono(hex(address)).color(colors.blue)).sense(Sense::click()));
                     ui.label(mono(name));
                     if !extra.is_empty() {
                         ui.label(mono(format!("-> {extra}")).color(colors.dim));
                     }
                     if link.double_clicked() {
-                        if state.symbols_mode == 2 {
-                            state.follow_in_dump(*address);
-                        } else {
-                            state.go_to_code(*address);
-                        }
+                        go = Some(address);
                     }
                 });
             }
         });
+        if let Some(address) = go {
+            if mode == 2 {
+                state.follow_in_dump(address);
+            } else {
+                state.go_to_code(address);
+            }
+        }
     });
 }
 
@@ -547,13 +591,18 @@ pub(crate) fn references_tab(ui: &mut Ui, state: &mut UiState, strings: bool) {
         hint(ui, if strings { "Strings: texto ASCII e UTF-16 solto na imagem (sem precisar de referência)" } else { "Procurar → Referências a strings (menu de contexto da desmontagem ou os botões acima)" });
         return;
     };
-    let filter = Filter::new(&filter_text, use_regex);
-    let rows: Vec<&ReferenceRow> = view.rows.iter().filter(|row| filter.matches(&[&row.text, &row.disassembly, &row.location])).collect();
+    // A lista filtrada fica guardada até o resultado ou o filtro mudarem.
+    let cache = &mut state.reference_rows[usize::from(strings)];
+    let rows: Vec<&ReferenceRow> = cache.update(Arc::as_ptr(&view) as usize, 0, &filter_text, use_regex, view.rows.len(), |index, filter| {
+        let row = &view.rows[index];
+        filter.matches(&[&row.text, &row.disassembly, &row.location])
+    }).iter().map(|&index| &view.rows[index]).collect();
+    let filter_error = cache.error.clone();
     ui.horizontal(|ui| {
         ui.label(RichText::new(format!("{} em {}: {} de {} resultados", view.title, view.scope, rows.len(), view.rows.len())).strong());
         ui.label(RichText::new(format!("({} módulos, {} do cache, {} ms)", view.modules, view.cached, view.milliseconds)).color(colors.dim));
     });
-    if let Some(error) = filter.error.as_ref().or(view.error.as_ref()) {
+    if let Some(error) = filter_error.as_ref().or(view.error.as_ref()) {
         ui.label(RichText::new(error).color(colors.red));
     }
     let selected_slot = if strings { &mut state.strings_selected } else { &mut state.reference_selected };

@@ -132,7 +132,13 @@ fn main() -> ExitCode {
 
 fn window(config: Config, target: Option<Target>, launch: LaunchOptions, options: &Options, session_dir: PathBuf) -> Result<(), String> {
     let connect = options.connect.clone().unwrap_or_else(|| "127.0.0.1:1234".to_string());
-    let native = eframe::NativeOptions { viewport: egui::ViewportBuilder::default().with_title("opennt-re - depurador de engenharia reversa do OpenNT").with_inner_size([1600.0, 1000.0]), ..Default::default() };
+    // A janela volta com o tamanho, a posição e o maximizado da última vez.
+    let mut viewport = egui::ViewportBuilder::default().with_title("opennt-re - depurador de engenharia reversa do OpenNT").with_inner_size([1600.0, 1000.0]);
+    if let Some(geometry) = kd_re::app::state_path().and_then(|path| kd_re::app::saved_window(&path)) {
+        let (size, position) = geometry.logical();
+        viewport = viewport.with_inner_size(size).with_position(position).with_maximized(geometry.maximized);
+    }
+    let native = eframe::NativeOptions { viewport, ..Default::default() };
     eframe::run_native(
         "opennt-re",
         native,

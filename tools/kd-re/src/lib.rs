@@ -34,8 +34,17 @@
 //! - `monitors`: as abas APIs (o monitor de APIs) e IRPs (o rastreador);
 //! - `explorers`: as abas Tipos (ver como tipo), Registro, Objetos,
 //!   Arquivos e Snapshots (com os passos para trás da reprodução);
-//! - `preferences`: as preferências (aparência, atalhos, eventos) e o
-//!   banco por módulo.
+//! - `preferences`: as preferências (aparência, atalhos, eventos), a lista
+//!   dos atalhos (F1) e o banco por módulo;
+//! - `navigation`: o histórico de idas (voltar e avançar), a janela Ir para
+//!   com a busca aproximada sobre todos os símbolos (numa thread própria) e
+//!   os marcadores;
+//! - `status`: a barra de estado (o alvo, a CPU, o processo, a thread, os
+//!   PDBs chegando, as tarefas do backend e as teclas principais);
+//! - `console`: o painel do console, o transcrito em rolagem virtual e o log
+//!   de eventos da janela;
+//! - `copy_text`: copiar qualquer aba como texto;
+//! - `layout`: a janela, os painéis e o arranjo das abas entre execuções.
 
 pub mod analysis;
 pub mod annotations;
@@ -43,6 +52,8 @@ pub mod app;
 pub mod asm;
 pub mod backend;
 pub mod codes;
+pub mod console;
+pub mod copy_text;
 pub mod cpu;
 pub mod disasm;
 pub mod dump;
@@ -52,13 +63,16 @@ pub mod graph;
 pub mod highlight;
 pub mod imports;
 pub mod launcher;
+pub mod layout;
 pub mod monitors;
+pub mod navigation;
 pub mod offscreen;
 pub mod panels;
 pub mod preferences;
 pub mod scan;
 pub mod scenario;
 pub mod source;
+pub mod status;
 pub mod views;
 
 use eframe::egui;

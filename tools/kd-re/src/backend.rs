@@ -476,6 +476,9 @@ pub struct Shared {
     pub trace_generation: u64,
     /// Os nomes de símbolo (o autocompletar), por geração dos símbolos.
     pub completions: Arc<Vec<String>>,
+    /// Todos os símbolos de todos os módulos carregados, com o endereço (a
+    /// busca aproximada da janela Ir para), por geração dos símbolos.
+    pub symbol_index: Arc<Vec<crate::navigation::SymbolEntry>>,
     pub type_names: Arc<Vec<String>>,
     /// Texto para a área de transferência (a janela copia e limpa).
     pub clipboard: Option<String>,
@@ -1241,39 +1244,55 @@ impl Worker {
         self.set_activity("");
         match snapshot {
             Ok(snapshot) => {
-                let completions = self.completions();
+                // A parada vai para a janela antes dos nomes: refazer o
+                // índice de todos os símbolos leva um tempo quando os
+                // módulos mudam.
                 self.publish(|shared| {
                     shared.snapshot = Arc::new(snapshot);
                     shared.status = Status::Stopped;
-                    if let Some((symbols, types)) = completions {
-                        if let Some(symbols) = symbols {
-                            shared.completions = Arc::new(symbols);
+                });
+                if let Some((symbols, types)) = self.completions() {
+                    self.publish(|shared| {
+                        if let Some((names, index)) = symbols {
+                            shared.completions = Arc::new(names);
+                            shared.symbol_index = Arc::new(index);
                         }
                         if let Some(types) = types {
                             shared.type_names = Arc::new(types);
                         }
-                    }
-                });
+                    });
+                }
             }
             Err(error) if is_connection_error(&error) => self.lost(error),
             Err(error) => self.transcript("(interface)", Err(error)),
         }
     }
 
-    /// Os nomes do autocompletar, quando os símbolos ou os tipos mudaram.
+    /// Os nomes do autocompletar (só as funções) e o índice de todos os
+    /// símbolos com o endereço, quando os símbolos mudaram; os tipos, na
+    /// primeira vez que existem.
     #[allow(clippy::type_complexity)]
-    fn completions(&mut self) -> Option<(Option<Vec<String>>, Option<Vec<String>>)> {
+    fn completions(&mut self) -> Option<(Option<(Vec<String>, Vec<crate::navigation::SymbolEntry>)>, Option<Vec<String>>)> {
         let client = self.client.as_mut()?;
         let symbols = (client.symbols.generation != self.symbols_generation).then(|| {
             self.symbols_generation = client.symbols.generation;
             let mut names: Vec<String> = Vec::new();
+            let mut index: Vec<crate::navigation::SymbolEntry> = Vec::new();
             for module in &client.symbols.modules {
                 let prefix = if client.symbols.is_kernel(module) { String::new() } else { format!("{}!", module.name) };
-                names.extend(module.symbols.iter().filter(|symbol| symbol.function).map(|symbol| format!("{prefix}{}", symbol.name)));
+                for symbol in &module.symbols {
+                    let name = format!("{prefix}{}", symbol.name);
+                    if symbol.function {
+                        names.push(name.clone());
+                    }
+                    index.push(crate::navigation::SymbolEntry { name, address: symbol.address, function: symbol.function });
+                }
             }
             names.sort();
             names.dedup();
-            names
+            index.sort();
+            index.dedup();
+            (names, index)
         });
         let types = if self.types_published {
             None

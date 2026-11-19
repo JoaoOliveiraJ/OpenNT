@@ -38,10 +38,18 @@ pub enum Action {
     ReverseContinue,
     SaveSnapshot,
     ViewAsType,
+    NavigateBack,
+    NavigateForward,
+    ToggleBookmark,
+    NextBookmark,
+    PreviousBookmark,
+    CopyView,
+    ToggleConsole,
+    ShowShortcuts,
 }
 
 impl Action {
-    pub const ALL: [Action; 17] = [
+    pub const ALL: [Action; 25] = [
         Action::Go,
         Action::StepInto,
         Action::StepOver,
@@ -59,6 +67,14 @@ impl Action {
         Action::ReverseContinue,
         Action::SaveSnapshot,
         Action::ViewAsType,
+        Action::NavigateBack,
+        Action::NavigateForward,
+        Action::ToggleBookmark,
+        Action::NextBookmark,
+        Action::PreviousBookmark,
+        Action::CopyView,
+        Action::ToggleConsole,
+        Action::ShowShortcuts,
     ];
 
     pub fn label(self) -> &'static str {
@@ -80,6 +96,24 @@ impl Action {
             Action::ReverseContinue => "Voltar até o breakpoint",
             Action::SaveSnapshot => "Gravar snapshot",
             Action::ViewAsType => "Ver como tipo (o Dump escolhido)",
+            Action::NavigateBack => "Voltar (histórico de idas)",
+            Action::NavigateForward => "Avançar (histórico de idas)",
+            Action::ToggleBookmark => "Ligar ou tirar o marcador",
+            Action::NextBookmark => "Próximo marcador",
+            Action::PreviousBookmark => "Marcador anterior",
+            Action::CopyView => "Copiar a aba ativa como texto",
+            Action::ToggleConsole => "Abrir ou fechar o console",
+            Action::ShowShortcuts => "Lista dos atalhos",
+        }
+    }
+
+    /// O grupo na lista dos atalhos.
+    pub fn group(self) -> ActionGroup {
+        match self {
+            Action::Go | Action::StepInto | Action::StepOver | Action::StepOut | Action::RunToUserCode | Action::Break | Action::Restart | Action::RunToCursor | Action::NewOrigin | Action::ReverseStep | Action::ReverseContinue => ActionGroup::Execution,
+            Action::ToggleBreakpoint => ActionGroup::Breakpoints,
+            Action::GoTo | Action::NavigateBack | Action::NavigateForward | Action::ToggleBookmark | Action::NextBookmark | Action::PreviousBookmark | Action::Xrefs | Action::Pattern => ActionGroup::Navigation,
+            Action::CopyView | Action::ToggleConsole | Action::ShowShortcuts | Action::SaveSnapshot | Action::ViewAsType => ActionGroup::Window,
         }
     }
 
@@ -103,10 +137,58 @@ impl Action {
             Action::ReverseContinue => ("F9", true, true, false),
             Action::SaveSnapshot => ("S", true, true, false),
             Action::ViewAsType => ("T", true, true, false),
+            Action::NavigateBack => ("Left", false, false, true),
+            Action::NavigateForward => ("Right", false, false, true),
+            Action::ToggleBookmark => ("M", true, false, false),
+            Action::NextBookmark => ("F6", false, false, false),
+            Action::PreviousBookmark => ("F6", false, true, false),
+            Action::CopyView => ("C", true, true, false),
+            Action::ToggleConsole => ("J", true, false, false),
+            Action::ShowShortcuts => ("F1", false, false, false),
         };
         Binding { key: key.into(), ctrl, shift, alt }
     }
 }
+
+/// Os grupos da lista dos atalhos.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActionGroup {
+    Execution,
+    Breakpoints,
+    Navigation,
+    Window,
+}
+
+impl ActionGroup {
+    pub const ALL: [ActionGroup; 4] = [ActionGroup::Execution, ActionGroup::Breakpoints, ActionGroup::Navigation, ActionGroup::Window];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            ActionGroup::Execution => "Execução",
+            ActionGroup::Breakpoints => "Breakpoints",
+            ActionGroup::Navigation => "Navegação",
+            ActionGroup::Window => "Janela",
+        }
+    }
+}
+
+/// As teclas que não mudam (a aba CPU, a barra de comando, o mouse).
+pub const FIXED_KEYS: [(&str, &str); 14] = [
+    (";", "comentário na linha (aba CPU)"),
+    (":", "rótulo na linha (aba CPU)"),
+    ("*", "volta à instrução corrente (RIP)"),
+    ("G", "grafo da função"),
+    ("X", "referências cruzadas"),
+    ("H", "modo de destaque"),
+    ("Espaço", "montar uma instrução na linha"),
+    ("Shift+clique", "seleção de várias linhas"),
+    ("Clique duplo", "segue o desvio ou o operando"),
+    ("Botões laterais do mouse", "voltar e avançar no histórico"),
+    ("Tab", "completa o comando (barra de comando)"),
+    ("Seta para cima/baixo", "histórico de comandos; na janela Ir para, escolhe a linha"),
+    ("Enter", "na janela Ir para: vai ao nome escolhido ou avalia a expressão"),
+    ("Esc", "fecha a janela de diálogo aberta"),
+];
 
 /// Uma tecla com os modificadores.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -325,6 +407,8 @@ pub(crate) struct PreferencesUi {
     /// As preferências de eventos já mandadas ao alvo nesta sessão.
     pub(crate) events_sent: Option<(EventOptions, u64)>,
     pub(crate) tab: usize,
+    /// A lista dos atalhos (F1) aberta.
+    pub(crate) shortcuts_open: bool,
 }
 
 /// O diálogo das preferências: aparência, atalhos e eventos.
@@ -427,6 +511,55 @@ pub(crate) fn preferences_window(context: &egui::Context, preferences: &mut Pref
     if !open {
         ui_state.open = false;
         ui_state.capturing = None;
+    }
+}
+
+/// A lista dos atalhos (F1): as ações com a tecla de agora, por grupo, e as
+/// teclas fixas; "Trocar as teclas..." abre o editor das preferências.
+pub(crate) fn shortcuts_window(context: &egui::Context, preferences: &Preferences, ui_state: &mut PreferencesUi) {
+    if !ui_state.shortcuts_open {
+        return;
+    }
+    let mut open = true;
+    let mut edit = false;
+    egui::Window::new("Atalhos de teclado").open(&mut open).resizable(true).default_width(540.0).show(context, |ui| {
+        let conflicts = preferences.conflicts();
+        egui::ScrollArea::vertical().max_height(600.0).show(ui, |ui| {
+            for group in ActionGroup::ALL {
+                ui.label(RichText::new(group.title()).strong());
+                egui::Grid::new(("re-keys", group.title())).num_columns(2).striped(true).min_col_width(200.0).show(ui, |ui| {
+                    for action in Action::ALL.iter().copied().filter(|action| action.group() == group) {
+                        ui.label(action.label());
+                        let mut key = RichText::new(preferences.binding(action).text()).monospace();
+                        if conflicts.contains(&action) {
+                            key = key.color(Color32::from_rgb(0xD0, 0x30, 0x30));
+                        }
+                        ui.label(key);
+                        ui.end_row();
+                    }
+                });
+                ui.add_space(6.0);
+            }
+            ui.label(RichText::new("Teclas fixas").strong());
+            egui::Grid::new("re-keys-fixed").num_columns(2).striped(true).min_col_width(200.0).show(ui, |ui| {
+                for (key, meaning) in FIXED_KEYS {
+                    ui.label(meaning);
+                    ui.label(RichText::new(key).monospace());
+                    ui.end_row();
+                }
+            });
+        });
+        ui.separator();
+        if ui.button("Trocar as teclas...").clicked() {
+            edit = true;
+        }
+    });
+    if edit {
+        ui_state.open = true;
+        ui_state.tab = 1;
+    }
+    if !open {
+        ui_state.shortcuts_open = false;
     }
 }
 
@@ -624,6 +757,19 @@ mod tests {
         let partial: Preferences = serde_json::from_str("{\"scale\": 1.5}").expect("parcial");
         assert_eq!(partial.scale, 1.5);
         assert_eq!(partial.monospace_size, 12.5);
+    }
+
+    #[test]
+    fn every_action_has_a_key_a_label_and_a_group() {
+        for action in Action::ALL {
+            assert!(action.default_binding().key().is_some(), "{action:?}");
+            assert!(!action.label().is_empty());
+            assert!(ActionGroup::ALL.contains(&action.group()));
+        }
+        assert_eq!(Action::NavigateBack.default_binding().text(), "Alt+Left");
+        assert_eq!(Action::PreviousBookmark.default_binding().text(), "Shift+F6");
+        assert_eq!(Action::CopyView.default_binding().text(), "Ctrl+Shift+C");
+        assert!(FIXED_KEYS.iter().all(|(key, meaning)| !key.is_empty() && !meaning.is_empty()));
     }
 
     #[test]

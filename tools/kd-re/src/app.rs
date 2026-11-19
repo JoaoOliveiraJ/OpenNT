@@ -8,13 +8,19 @@
 //! As abas são do `egui_dock`: arrastar uma aba a solta, junta ou divide a
 //! área, e o menu Exibir reabre uma aba fechada ou volta ao arranjo padrão.
 //! Os painéis só leem o `Snapshot` publicado pelo backend e mandam pedidos;
-//! nada aqui espera o alvo. O arranjo, o tema, as expressões observadas, o
-//! histórico de comandos e o roteiro ficam num arquivo de estado; os
+//! nada aqui espera o alvo. O arranjo (abas, tamanho e posição da janela,
+//! painéis divisíveis), o tema, as expressões observadas, o histórico de
+//! comandos e o roteiro ficam num arquivo de estado (`layout.rs`); os
 //! comentários, rótulos e marcadores (por módulo + RVA) e as notas ficam na
 //! pasta do build.
+//!
+//! A navegação (voltar, avançar, Ir para com a busca aproximada, os
+//! marcadores) fica em `navigation.rs`, a barra de estado em `status.rs`, o
+//! console e o log de eventos em `console.rs` e a cópia das abas como texto
+//! em `copy_text.rs`.
 
-use std::collections::{BTreeSet, HashSet};
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -25,8 +31,12 @@ use kd_client::{BreakpointKind, Client};
 use serde::{Deserialize, Serialize};
 
 use crate::backend::{Backend, Entry, ExtraRequest, ExtrasView, ModuleRow, QueryKind, Request, SearchKind, SearchQuery, SearchScope, SharedStore, Snapshot, Status, Target, TimeMode, TraceView, View};
+use crate::console::{EventLog, Level, RowCache, TranscriptLines};
 use crate::launcher::LaunchOptions;
+use crate::layout::{PanelSizes, WindowGeometry};
+use crate::navigation::{GoToPalette, History, PendingGoTo, SymbolEntry};
 use crate::preferences::{Action, ModuleDb, Preferences, PreferencesUi};
+use crate::views::FilteredRows;
 use crate::{cpu, explorers, graph, monitors, panels, views};
 
 /// As abas.
@@ -133,7 +143,7 @@ impl Tab {
 
 /// O arranjo padrão: todas as abas numa fila no alto, a CPU à vista.
 pub fn default_layout() -> DockState<Tab> {
-    let mut dock = DockState::new(Tab::ALL.to_vec());
+    let mut dock = DockState::new(Tab::ALL.to_vec()).with_translations(crate::layout::translations());
     if let Some(path) = dock.find_tab(&Tab::Cpu) {
         let _ = dock.set_active_tab(path);
     }
@@ -236,14 +246,37 @@ pub(crate) enum Dialog {
     RegisterType(u64, String),
 }
 
-/// O estado salvo entre execuções.
-#[derive(Serialize, Deserialize, Default)]
+/// O estado salvo entre execuções. Cada campo tem padrão: um arquivo de
+/// outra versão (com campos a menos ou a mais) ainda vale; o arranjo das
+/// abas é lido à parte (`layout::restore_layout`).
+#[derive(Serialize, Deserialize)]
+#[serde(default)]
 struct Saved {
-    layout: Option<DockState<Tab>>,
+    layout: Option<serde_json::Value>,
+    /// As abas que a versão que gravou conhecia.
+    known_tabs: Vec<String>,
     light: bool,
     watches: Vec<String>,
     history: Vec<String>,
     script: String,
+    window: Option<WindowGeometry>,
+    panels: BTreeMap<String, [f32; 2]>,
+    console_open: bool,
+    console_mode: usize,
+    log_mode: usize,
+}
+
+impl Default for Saved {
+    fn default() -> Self {
+        Saved { layout: None, known_tabs: Vec::new(), light: true, watches: Vec::new(), history: Vec::new(), script: String::new(), window: None, panels: BTreeMap::new(), console_open: false, console_mode: 0, log_mode: 0 }
+    }
+}
+
+/// A posição e o tamanho da janela salvos (o `main` os passa ao
+/// `ViewportBuilder` antes de abrir a janela).
+pub fn saved_window(path: &Path) -> Option<WindowGeometry> {
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str::<Saved>(&text).ok()?.window
 }
 
 /// O estado da interface (campos de texto, cópias do que o backend
@@ -392,15 +425,43 @@ pub struct UiState {
     pub(crate) db_saved: ModuleDb,
     pub(crate) db_loaded: ModuleDb,
     pub(crate) db_armed: HashSet<(String, u64)>,
+    // ---- navegação, console, barra de estado ----
+    /// O índice de todos os símbolos carregados (a janela Ir para).
+    pub(crate) symbol_index: Arc<Vec<SymbolEntry>>,
+    /// O histórico de idas da desmontagem (módulo + RVA).
+    pub(crate) navigation: History<Location>,
+    pub(crate) goto: GoToPalette,
+    /// Uma ida por expressão esperando o snapshot com o resultado.
+    pub(crate) pending_goto: Option<PendingGoTo>,
+    /// O log de eventos da janela.
+    pub(crate) events: EventLog,
+    /// O transcrito em linhas (a aba Log e o console).
+    pub(crate) transcript_lines: TranscriptLines,
+    /// O painel do console embaixo: aberto, o modo (comandos ou eventos), o
+    /// filtro, até onde cada modo foi limpo e a lista filtrada.
+    pub(crate) console_open: bool,
+    pub(crate) console_mode: usize,
+    pub(crate) console_filter: String,
+    pub(crate) console_cleared: [usize; 2],
+    pub(crate) console_rows: RowCache,
+    /// O foco vai para a barra de comando no próximo quadro.
+    pub(crate) focus_command: bool,
+    /// Desde quando o estado do alvo e a tarefa do backend são os de agora
+    /// (os relógios da barra de estado).
+    pub(crate) status_since: Instant,
+    pub(crate) activity_since: Instant,
+    /// Copiar a aba ativa no próximo quadro (Ctrl+Shift+C).
+    pub(crate) copy_active_tab: bool,
+    /// As listas filtradas das abas Símbolos e Referências/Strings.
+    pub(crate) symbol_rows: FilteredRows,
+    pub(crate) reference_rows: [FilteredRows; 2],
 }
 
 impl UiState {
-    /// A desmontagem da aba CPU num endereço.
+    /// A desmontagem da aba CPU num endereço (a ida entra no histórico).
     pub(crate) fn go_to_code(&mut self, address: u64) {
-        self.selected_code = Some(address);
-        self.requests.push(Request::ShowCode(format!("{address:#x}")));
-        self.requests.push(Request::SelectInstruction(Some(address)));
-        self.focus_tab.push(Tab::Cpu);
+        self.record_visit(Some(address));
+        self.show_code_at(address);
     }
 
     /// O Dump escolhido num endereço.
@@ -465,6 +526,15 @@ pub struct DebuggerApp {
     persist: Option<PathBuf>,
     last_saved: String,
     last_save: Instant,
+    /// A última conferência do que mudou (notas, preferências, banco): no
+    /// máximo uma por segundo, porque montar os textos para comparar custa.
+    last_check: Instant,
+    /// A janela e os painéis do último quadro (vão para o arquivo de estado).
+    window: Option<WindowGeometry>,
+    panels: PanelSizes,
+    /// Os tamanhos dos painéis lidos do arquivo, devolvidos ao egui no
+    /// primeiro quadro.
+    pending_panels: Option<BTreeMap<String, [f32; 2]>>,
 }
 
 /// As cores, pelo tema.
@@ -694,26 +764,56 @@ impl DebuggerApp {
                 db_saved: ModuleDb::default(),
                 db_loaded: ModuleDb::default(),
                 db_armed: HashSet::new(),
+                symbol_index: Arc::new(Vec::new()),
+                navigation: History::default(),
+                goto: GoToPalette::default(),
+                pending_goto: None,
+                events: EventLog::default(),
+                transcript_lines: TranscriptLines::default(),
+                console_open: false,
+                console_mode: 0,
+                console_filter: String::new(),
+                console_cleared: [0; 2],
+                console_rows: RowCache::default(),
+                focus_command: false,
+                status_since: Instant::now(),
+                activity_since: Instant::now(),
+                copy_active_tab: false,
+                symbol_rows: FilteredRows::default(),
+                reference_rows: Default::default(),
             },
             persist: None,
             last_saved: String::new(),
             last_save: Instant::now(),
+            last_check: Instant::now(),
+            window: None,
+            panels: Default::default(),
+            pending_panels: None,
         }
     }
 
     /// Com arranjo, tema, expressões, histórico e roteiro salvos em `path`.
     pub fn with_persistence(mut self, path: PathBuf) -> DebuggerApp {
         if let Ok(text) = std::fs::read_to_string(&path) {
-            if let Ok(saved) = serde_json::from_str::<Saved>(&text) {
-                if let Some(layout) = saved.layout {
-                    self.dock = layout;
+            match serde_json::from_str::<Saved>(&text) {
+                Ok(saved) => {
+                    match crate::layout::restore_layout(saved.layout, &saved.known_tabs) {
+                        Some(layout) => self.dock = layout,
+                        None => self.state.events.push(Level::Info, "arranjo das abas salvo ausente ou de outra versão: o padrão"),
+                    }
+                    self.state.light = saved.light;
+                    self.state.watches = saved.watches;
+                    self.state.history = saved.history;
+                    if !saved.script.is_empty() {
+                        self.state.script_text = saved.script;
+                    }
+                    self.window = saved.window;
+                    self.pending_panels = Some(saved.panels);
+                    self.state.console_open = saved.console_open;
+                    self.state.console_mode = saved.console_mode.min(1);
+                    self.state.log_mode = saved.log_mode.min(crate::console::EVENTS_MODE);
                 }
-                self.state.light = saved.light;
-                self.state.watches = saved.watches;
-                self.state.history = saved.history;
-                if !saved.script.is_empty() {
-                    self.state.script_text = saved.script;
-                }
+                Err(error) => self.state.events.push(Level::Warning, format!("{}: {error} (o estado salvo ficou de fora)", path.display())),
             }
         }
         self.persist = Some(path);
@@ -863,15 +963,24 @@ impl DebuggerApp {
         }
     }
 
+    /// Grava o que mudou: as notas, as notas livres, o banco por módulo, as
+    /// preferências e o arquivo de estado. As comparações montam textos
+    /// inteiros (as notas, as preferências em JSON, o banco), então rodam no
+    /// máximo uma vez por segundo, e não a cada quadro; na saída, sempre.
     fn save(&mut self, force: bool) {
+        if !force && self.last_check.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.last_check = Instant::now();
         if let Some(path) = self.state.notes_path.clone() {
             let text = self.state.notes.to_text();
             if text != self.state.notes_saved {
                 if let Some(parent) = path.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
-                if self.state.notes.save(&path).is_ok() {
-                    self.state.notes_saved = text;
+                match self.state.notes.save(&path) {
+                    Ok(_) => self.state.notes_saved = text,
+                    Err(error) => self.save_failed(&path, &error.to_string()),
                 }
             }
         }
@@ -880,29 +989,43 @@ impl DebuggerApp {
                 if let Some(parent) = path.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
-                if std::fs::write(&path, &self.state.session_notes).is_ok() {
-                    self.state.session_notes_saved = self.state.session_notes.clone();
+                match std::fs::write(&path, &self.state.session_notes) {
+                    Ok(()) => self.state.session_notes_saved = self.state.session_notes.clone(),
+                    Err(error) => self.save_failed(&path, &error.to_string()),
                 }
             }
         }
-        self.save_module_db(force);
+        self.save_module_db();
         if let Some(path) = crate::preferences::preferences_path().filter(|_| self.persist.is_some()) {
             let text = self.state.prefs.to_text();
             if text != self.state.prefs_ui.saved {
                 if let Some(parent) = path.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
-                if std::fs::write(&path, &text).is_ok() {
-                    self.state.prefs_ui.saved = text;
+                match std::fs::write(&path, &text) {
+                    Ok(()) => self.state.prefs_ui.saved = text,
+                    Err(error) => self.save_failed(&path, &error.to_string()),
                 }
             }
         }
-        let Some(path) = &self.persist else { return };
+        let Some(path) = self.persist.clone() else { return };
         if !force && self.last_save.elapsed() < Duration::from_secs(3) {
             return;
         }
         self.last_save = Instant::now();
-        let saved = Saved { layout: Some(self.dock.clone()), light: self.state.light, watches: self.state.watches.clone(), history: self.state.history.iter().rev().take(200).rev().cloned().collect(), script: self.state.script_text.clone() };
+        let saved = Saved {
+            layout: serde_json::to_value(&self.dock).ok(),
+            known_tabs: crate::layout::known_tabs(),
+            light: self.state.light,
+            watches: self.state.watches.clone(),
+            history: self.state.history.iter().rev().take(200).rev().cloned().collect(),
+            script: self.state.script_text.clone(),
+            window: self.window,
+            panels: crate::layout::panels_map(&self.panels),
+            console_open: self.state.console_open,
+            console_mode: self.state.console_mode,
+            log_mode: self.state.log_mode,
+        };
         let Ok(text) = serde_json::to_string(&saved) else { return };
         if text == self.last_saved {
             return;
@@ -910,18 +1033,24 @@ impl DebuggerApp {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        if std::fs::write(path, &text).is_ok() {
-            self.last_saved = text;
+        match std::fs::write(&path, &text) {
+            Ok(()) => self.last_saved = text,
+            Err(error) => self.save_failed(&path, &error.to_string()),
         }
+    }
+
+    /// Uma gravação que falhou vai para o log de eventos (uma vez por
+    /// mensagem seguida) e para a barra de estado.
+    fn save_failed(&mut self, path: &Path, error: &str) {
+        let message = format!("não gravou {}: {error}", path.display());
+        self.state.last_message = message.clone();
+        self.state.events.push(Level::Warning, message);
     }
 
     /// Grava o banco por módulo quando as notas ou os breakpoints mudam, e
     /// arma os breakpoints guardados dos módulos que já carregaram.
-    fn save_module_db(&mut self, force: bool) {
+    fn save_module_db(&mut self) {
         let Some(directory) = self.state.db_dir.clone() else { return };
-        if !force && self.last_save.elapsed() < Duration::from_secs(2) {
-            return;
-        }
         let state = &self.state;
         let mut db = ModuleDb::from_session(&state.notes, &state.snapshot.breakpoints, &|address| state.location(address));
         // Os breakpoints guardados de módulos que ainda não carregaram ficam.
@@ -984,6 +1113,7 @@ impl DebuggerApp {
     fn sync(&mut self) {
         let shared = self.backend.shared();
         let state = &mut self.state;
+        let before = crate::console::Before::of(state);
         if !Arc::ptr_eq(&state.snapshot, &shared.snapshot) {
             state.snapshot = Arc::clone(&shared.snapshot);
             for (index, dump) in state.snapshot.dumps.iter().enumerate() {
@@ -1022,6 +1152,9 @@ impl DebuggerApp {
         if !Arc::ptr_eq(&state.completions, &shared.completions) {
             state.completions = Arc::clone(&shared.completions);
         }
+        if !Arc::ptr_eq(&state.symbol_index, &shared.symbol_index) {
+            state.symbol_index = Arc::clone(&shared.symbol_index);
+        }
         if !Arc::ptr_eq(&state.type_names, &shared.type_names) {
             state.type_names = Arc::clone(&shared.type_names);
         }
@@ -1045,16 +1178,30 @@ impl DebuggerApp {
                 state.focus_tab.push(Tab::Trace);
             }
         }
+        drop(shared);
+        state.transcript_lines.sync(&state.transcript);
+        crate::navigation::resolve_pending_goto(state);
+        crate::console::observe(state, before);
+        // Uma sessão nova: os lugares da anterior podem não existir mais,
+        // mas ficam (módulo + RVA); só a ida pendente cai.
+        if matches!(state.status, Status::Launching(_) | Status::Connecting(_)) {
+            state.pending_goto = None;
+        }
     }
 
     /// Um quadro inteiro da janela.
     pub fn show(&mut self, ui: &mut Ui) {
         self.sync();
+        // Os tamanhos dos painéis salvos, antes de os painéis aparecerem.
+        if let Some(sizes) = self.pending_panels.take() {
+            crate::layout::restore_panels(ui.ctx(), &sizes);
+        }
         // Texto que o backend pôs para a área de transferência.
         let clipboard = self.backend.shared.lock().ok().and_then(|mut shared| shared.clipboard.take());
         if let Some(text) = clipboard {
             ui.ctx().copy_text(text.clone());
             self.state.last_message = format!("copiado: {text}");
+            self.state.events.push(Level::Info, self.state.last_message.clone());
         }
         if self.state.theme_applied != Some(self.state.light) {
             crate::apply_theme(ui.ctx(), !self.state.light);
@@ -1067,13 +1214,21 @@ impl DebuggerApp {
         }
         self.apply_session_settings();
         self.shortcuts(ui);
+        // Ctrl+Shift+C: a aba da área com o foco (senão, a CPU).
+        if std::mem::take(&mut self.state.copy_active_tab) {
+            let tab = self.dock.find_active_focused().map(|(_, tab)| *tab).unwrap_or(Tab::Cpu);
+            crate::copy_text::copy_tab(ui.ctx(), &mut self.state, tab);
+        }
         let state = &mut self.state;
         let dock = &self.dock;
         let open: Vec<Tab> = Tab::ALL.iter().copied().filter(|tab| dock.find_tab(tab).is_some()).collect();
         egui::Panel::top("menu").show(ui, |ui| menu_bar(ui, state, &open));
         egui::Panel::top("toolbar").show(ui, |ui| toolbar(ui, state));
-        egui::Panel::bottom("status").show(ui, |ui| status_bar(ui, state));
+        egui::Panel::bottom("status").show(ui, |ui| crate::status::status_bar(ui, state));
         egui::Panel::bottom("command").show(ui, |ui| command_bar(ui, state));
+        if state.console_open {
+            egui::Panel::bottom("re-console").resizable(true).default_size(200.0).min_size(60.0).show(ui, |ui| crate::console::console_panel(ui, state));
+        }
         self.layout_requests();
         egui::CentralPanel::no_frame().show(ui, |ui| {
             let mut style = Style::from_egui(ui.style().as_ref());
@@ -1082,8 +1237,16 @@ impl DebuggerApp {
         });
         dialogs(ui, &mut self.state);
         crate::preferences::preferences_window(ui.ctx(), &mut self.state.prefs, &mut self.state.prefs_ui);
+        crate::preferences::shortcuts_window(ui.ctx(), &self.state.prefs, &mut self.state.prefs_ui);
         crate::cpu::breakpoint_editor(ui, &mut self.state);
         crate::cpu::xrefs_window(ui, &mut self.state);
+        // A janela e os painéis de agora (o arquivo de estado os guarda).
+        if self.persist.is_some() {
+            if let Some(current) = WindowGeometry::current(ui.ctx()) {
+                self.window = Some(current.merged(self.window));
+            }
+            self.panels = crate::layout::capture_panels(ui.ctx());
+        }
         if self.state.argument_count != self.state.sent_argument_count {
             self.state.sent_argument_count = self.state.argument_count;
             self.state.requests.push(Request::SetArgumentCount(self.state.argument_count));
@@ -1152,6 +1315,10 @@ impl DebuggerApp {
                 Action::Break => running,
                 Action::Restart => state.can_restart,
                 Action::ReverseStep | Action::ReverseContinue => stopped && replay,
+                // As da janela valem sempre.
+                Action::CopyView | Action::ToggleConsole | Action::ShowShortcuts => true,
+                // O marcador é uma nota: vale com a máquina rodando.
+                Action::ToggleBookmark => state.dialog.is_none(),
                 _ => stopped && state.dialog.is_none(),
             };
             if !wanted || !prefs.pressed(ui, action) {
@@ -1202,6 +1369,25 @@ impl DebuggerApp {
                         explorers::view_as_type(state, "", address);
                     }
                 }
+                Action::NavigateBack => {
+                    state.navigate_back();
+                }
+                Action::NavigateForward => {
+                    state.navigate_forward();
+                }
+                Action::ToggleBookmark => {
+                    if let Some(address) = target {
+                        state.toggle_bookmark_at(address);
+                    }
+                }
+                Action::NextBookmark => state.jump_to_bookmark(true),
+                Action::PreviousBookmark => state.jump_to_bookmark(false),
+                Action::CopyView => state.copy_active_tab = true,
+                Action::ToggleConsole => {
+                    state.console_open = !state.console_open;
+                    state.focus_command = state.console_open;
+                }
+                Action::ShowShortcuts => state.prefs_ui.shortcuts_open = !state.prefs_ui.shortcuts_open,
             }
         }
         // Ctrl+B com a máquina rodando também pausa.
@@ -1210,6 +1396,14 @@ impl DebuggerApp {
         }
         if !stopped || state.dialog.is_some() {
             return;
+        }
+        // Os botões laterais do mouse andam no histórico.
+        let (mouse_back, mouse_forward) = ui.input(|input| (input.pointer.button_pressed(egui::PointerButton::Extra1), input.pointer.button_pressed(egui::PointerButton::Extra2)));
+        if mouse_back {
+            state.navigate_back();
+        }
+        if mouse_forward {
+            state.navigate_forward();
         }
         // As teclas de uma letra só valem fora dos campos de texto.
         if ui.ctx().egui_wants_keyboard_input() {
@@ -1231,6 +1425,7 @@ impl DebuggerApp {
                     }
                 }
                 "*" => {
+                    state.record_visit(None);
                     state.selected_code = None;
                     state.requests.push(Request::ShowCode(String::new()));
                     state.requests.push(Request::SelectInstruction(None));
@@ -1284,7 +1479,7 @@ fn menu_bar(ui: &mut Ui, state: &mut UiState, open: &[Tab]) {
                     state.requests.push(Request::Start(Target::Launch(options)));
                 }
             }
-            if ui.add_enabled(state.can_restart, egui::Button::new("Reiniciar").shortcut_text("Ctrl+F2")).clicked() {
+            if ui.add_enabled(state.can_restart, egui::Button::new("Reiniciar").shortcut_text(key(state, Action::Restart))).clicked() {
                 state.requests.push(Request::Restart);
             }
             if ui.button("Desconectar").clicked() {
@@ -1340,32 +1535,50 @@ fn menu_bar(ui: &mut Ui, state: &mut UiState, open: &[Tab]) {
                 }
             }
             ui.separator();
+            let mut console = state.console_open;
+            if ui.add(egui::Checkbox::new(&mut console, format!("Console embaixo ({})", key(state, Action::ToggleConsole)))).changed() {
+                state.console_open = console;
+                state.focus_command = console;
+            }
+            if ui.add(egui::Button::new("Copiar a aba ativa como texto").shortcut_text(key(state, Action::CopyView))).on_hover_text("o botão direito no título de qualquer aba também copia").clicked() {
+                state.copy_active_tab = true;
+                ui.close();
+            }
+            ui.separator();
             if ui.button("Restaurar o arranjo padrão").clicked() {
                 state.reset_layout = true;
             }
         });
+        ui.menu_button("Navegar", |ui| crate::navigation::navigate_menu(ui, state));
         ui.menu_button("Depurar", |ui| {
-            if ui.add_enabled(stopped, egui::Button::new("Executar").shortcut_text("F9")).clicked() {
+            if ui.add_enabled(stopped, egui::Button::new("Executar").shortcut_text(key(state, Action::Go))).clicked() {
                 state.requests.push(Request::Go);
             }
-            if ui.add_enabled(running, egui::Button::new("Pausar").shortcut_text("F12")).clicked() {
+            if ui.add_enabled(running, egui::Button::new("Pausar").shortcut_text(key(state, Action::Break))).clicked() {
                 state.requests.push(Request::Break);
             }
-            if ui.add_enabled(stopped, egui::Button::new("Entrar").shortcut_text("F7")).clicked() {
+            if ui.add_enabled(stopped, egui::Button::new("Entrar").shortcut_text(key(state, Action::StepInto))).clicked() {
                 state.requests.push(Request::StepInto);
             }
-            if ui.add_enabled(stopped, egui::Button::new("Passar por cima").shortcut_text("F8")).clicked() {
+            if ui.add_enabled(stopped, egui::Button::new("Passar por cima").shortcut_text(key(state, Action::StepOver))).clicked() {
                 state.requests.push(Request::StepOver);
             }
-            if ui.add_enabled(stopped, egui::Button::new("Executar até o retorno").shortcut_text("Ctrl+F9")).clicked() {
+            if ui.add_enabled(stopped, egui::Button::new("Executar até o retorno").shortcut_text(key(state, Action::StepOut))).clicked() {
                 state.requests.push(Request::StepOut);
             }
-            if ui.add_enabled(stopped, egui::Button::new("Executar até o código de usuário").shortcut_text("Alt+F9")).clicked() {
+            if ui.add_enabled(stopped, egui::Button::new("Executar até o código de usuário").shortcut_text(key(state, Action::RunToUserCode))).clicked() {
                 state.requests.push(Request::RunToUserCode);
             }
-            if ui.add_enabled(stopped && state.selected_code.is_some(), egui::Button::new("Executar até o cursor").shortcut_text("F4")).clicked() {
+            if ui.add_enabled(stopped && state.selected_code.is_some(), egui::Button::new("Executar até o cursor").shortcut_text(key(state, Action::RunToCursor))).clicked() {
                 if let Some(address) = state.selected_code {
                     state.requests.push(Request::RunToCursor(address));
+                }
+            }
+            ui.separator();
+            let target = state.selected_code.or_else(|| current_rip(&state.snapshot));
+            if ui.add_enabled(stopped && target.is_some(), egui::Button::new("Ligar/tirar breakpoint na linha").shortcut_text(key(state, Action::ToggleBreakpoint))).on_hover_text("a linha escolhida na desmontagem, ou a do RIP").clicked() {
+                if let Some(address) = target {
+                    state.requests.push(Request::ToggleBreakpoint(address));
                 }
             }
             if ui.add_enabled(stopped, egui::Button::new("Novo breakpoint...")).clicked() {
@@ -1403,7 +1616,7 @@ fn menu_bar(ui: &mut Ui, state: &mut UiState, open: &[Tab]) {
             if ui.add_enabled(stopped, egui::Button::new("Constante...")).clicked() {
                 state.dialog = Some(Dialog::Constant(String::new(), false));
             }
-            if ui.add_enabled(stopped, egui::Button::new("Padrão...").shortcut_text("Ctrl+B")).clicked() {
+            if ui.add_enabled(stopped, egui::Button::new("Padrão...").shortcut_text(key(state, Action::Pattern))).clicked() {
                 state.dialog = Some(Dialog::Pattern(String::new(), false));
             }
             if ui.add_enabled(stopped, egui::Button::new("Strings soltas")).clicked() {
@@ -1433,7 +1646,28 @@ fn menu_bar(ui: &mut Ui, state: &mut UiState, open: &[Tab]) {
                 state.prefs_ui.open = true;
             }
         });
+        ui.menu_button("Ajuda", |ui| {
+            if ui.add(egui::Button::new("Atalhos de teclado").shortcut_text(key(state, Action::ShowShortcuts))).clicked() {
+                state.prefs_ui.shortcuts_open = true;
+                ui.close();
+            }
+            if ui.button("Trocar as teclas...").clicked() {
+                state.prefs_ui.open = true;
+                state.prefs_ui.tab = 1;
+                ui.close();
+            }
+            if ui.button("Log de eventos da janela").clicked() {
+                state.log_mode = crate::console::EVENTS_MODE;
+                state.focus_tab.push(Tab::Log);
+                ui.close();
+            }
+        });
     });
+}
+
+/// A tecla de uma ação (a das preferências), para os menus e as dicas.
+fn key(state: &UiState, action: Action) -> String {
+    state.prefs.binding(action).text()
 }
 
 /// Os ícones da barra de ferramentas (desenhados, sem fonte de ícones).
@@ -1454,6 +1688,8 @@ enum Icon {
     Graph,
     Script,
     Theme,
+    Back,
+    Forward,
 }
 
 fn icon_button(ui: &mut Ui, icon: Icon, enabled: bool, tooltip: &str) -> bool {
@@ -1562,6 +1798,14 @@ fn icon_button(ui: &mut Ui, icon: Icon, enabled: bool, tooltip: &str) -> bool {
                 at(6.0 * angle.cos(), 6.0 * angle.sin())
             }).collect(), color, Stroke::NONE));
         }
+        Icon::Back => {
+            painter.line_segment([at(7.0, 0.0), at(-3.0, 0.0)], stroke);
+            arrow(&painter, at(-7.0, 0.0), Vec2::new(-1.0, 0.0));
+        }
+        Icon::Forward => {
+            painter.line_segment([at(-7.0, 0.0), at(3.0, 0.0)], stroke);
+            arrow(&painter, at(7.0, 0.0), Vec2::new(1.0, 0.0));
+        }
     }
     let response = response.on_hover_text(tooltip);
     enabled && response.clicked()
@@ -1572,31 +1816,43 @@ fn toolbar(ui: &mut Ui, state: &mut UiState) {
     let running = state.status == Status::Running;
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 1.0;
-        if icon_button(ui, Icon::Restart, state.can_restart, "Reiniciar: fecha o QEMU, recompila e abre de novo (Ctrl+F2)") {
+        if icon_button(ui, Icon::Restart, state.can_restart, &format!("Reiniciar: fecha o QEMU, recompila e abre de novo ({})", key(state, Action::Restart))) {
             state.requests.push(Request::Restart);
         }
         if icon_button(ui, Icon::Close, matches!(state.status, Status::Stopped | Status::Running), "Desconectar") {
             state.requests.push(Request::Disconnect);
         }
         ui.separator();
-        if icon_button(ui, Icon::Run, stopped, "Executar (F9)") {
+        if icon_button(ui, Icon::Run, stopped, &format!("Executar ({})", key(state, Action::Go))) {
             state.requests.push(Request::Go);
         }
-        if icon_button(ui, Icon::Pause, running, "Pausar (F12)") {
+        if icon_button(ui, Icon::Pause, running, &format!("Pausar ({})", key(state, Action::Break))) {
             state.requests.push(Request::Break);
         }
         ui.separator();
-        if icon_button(ui, Icon::StepInto, stopped, "Entrar (F7)") {
+        if icon_button(ui, Icon::StepInto, stopped, &format!("Entrar ({})", key(state, Action::StepInto))) {
             state.requests.push(Request::StepInto);
         }
-        if icon_button(ui, Icon::StepOver, stopped, "Passar por cima (F8)") {
+        if icon_button(ui, Icon::StepOver, stopped, &format!("Passar por cima ({})", key(state, Action::StepOver))) {
             state.requests.push(Request::StepOver);
         }
-        if icon_button(ui, Icon::TillReturn, stopped, "Executar até o retorno (Ctrl+F9)") {
+        if icon_button(ui, Icon::TillReturn, stopped, &format!("Executar até o retorno ({})", key(state, Action::StepOut))) {
             state.requests.push(Request::StepOut);
         }
-        if icon_button(ui, Icon::UserCode, stopped, "Executar até o código de usuário (Alt+F9)") {
+        if icon_button(ui, Icon::UserCode, stopped, &format!("Executar até o código de usuário ({})", key(state, Action::RunToUserCode))) {
             state.requests.push(Request::RunToUserCode);
+        }
+        ui.separator();
+        // O histórico de idas da desmontagem.
+        let back = state.navigation.peek_back().map(Location::display);
+        let forward = state.navigation.peek_forward().map(Location::display);
+        let back_tip = format!("Voltar ({}){}", key(state, Action::NavigateBack), back.as_ref().map(|place| format!(" para {place}")).unwrap_or_default());
+        let forward_tip = format!("Avançar ({}){}", key(state, Action::NavigateForward), forward.as_ref().map(|place| format!(" para {place}")).unwrap_or_default());
+        if icon_button(ui, Icon::Back, stopped && back.is_some(), &back_tip) {
+            state.navigate_back();
+        }
+        if icon_button(ui, Icon::Forward, stopped && forward.is_some(), &forward_tip) {
+            state.navigate_forward();
         }
         if matches!(state.extras.mode, TimeMode::Replay(..)) {
             let reverse = stopped && matches!(state.extras.mode, TimeMode::Replay(_, true));
@@ -1615,8 +1871,12 @@ fn toolbar(ui: &mut Ui, state: &mut UiState) {
         if icon_button(ui, Icon::Labels, true, "Rótulos") {
             state.focus_tab.push(Tab::Comments);
         }
-        if icon_button(ui, Icon::Bookmarks, true, "Marcadores") {
-            state.focus_tab.push(Tab::Comments);
+        if icon_button(ui, Icon::Bookmarks, true, &format!("Marcadores: o próximo ({}), ligar na linha ({}); a lista no menu Navegar", key(state, Action::NextBookmark), key(state, Action::ToggleBookmark))) {
+            if stopped && !state.notes.bookmarks.is_empty() {
+                state.jump_to_bookmark(true);
+            } else {
+                state.focus_tab.push(Tab::Comments);
+            }
         }
         if icon_button(ui, Icon::Patches, true, "Patches") {
             state.focus_tab.push(Tab::Patches);
@@ -1653,66 +1913,6 @@ fn toolbar(ui: &mut Ui, state: &mut UiState) {
             None => "contexto: kernel".to_string(),
         };
         ui.label(RichText::new(context).color(colors.blue).strong());
-    });
-}
-
-/// A barra de estado: Pausado/Rodando e a última mensagem.
-fn status_bar(ui: &mut Ui, state: &mut UiState) {
-    let colors = palette(ui);
-    ui.horizontal(|ui| {
-        let (fill, text) = match &state.status {
-            Status::Stopped => (Color32::from_rgb(0xC0, 0x30, 0x30), "Pausado".to_string()),
-            Status::Running => (Color32::from_rgb(0x20, 0x90, 0x40), "Rodando".to_string()),
-            Status::Launching(_) => (Color32::from_rgb(0xB0, 0x80, 0x10), "Abrindo".to_string()),
-            Status::Connecting(_) => (Color32::from_rgb(0xB0, 0x80, 0x10), "Conectando".to_string()),
-            Status::Idle => (Color32::GRAY, "Sem alvo".to_string()),
-            Status::Disconnected(_) => (Color32::GRAY, "Desconectado".to_string()),
-        };
-        let galley = ui.painter().layout_no_wrap(text.clone(), egui::FontId::proportional(13.0), Color32::WHITE);
-        let (rect, _) = ui.allocate_exact_size(Vec2::new(galley.size().x + 16.0, 18.0), Sense::hover());
-        ui.painter().rect_filled(rect, 2.0, fill);
-        ui.painter().galley(rect.center() - galley.size() / 2.0, galley, Color32::WHITE);
-        let message = match &state.status {
-            Status::Launching(line) => line.clone(),
-            Status::Connecting(address) => format!("conectando a {address}"),
-            Status::Disconnected(reason) => reason.lines().next().unwrap_or("").to_string(),
-            _ => state.last_message.clone(),
-        };
-        if state.status == Status::Stopped {
-            if let Some(processor) = shown_processor(&state.snapshot) {
-                ui.label(mono(format!("CPU {} IRQL {} {}", processor.number, processor.irql, processor.process)).color(colors.blue));
-                ui.separator();
-            }
-        }
-        match &state.extras.mode {
-            TimeMode::Normal => {}
-            TimeMode::Snapshots => {
-                ui.label(mono("snapshots").color(colors.green)).on_hover_text("discos em qcow2: savevm/loadvm na aba Snapshots");
-                ui.separator();
-            }
-            mode @ TimeMode::Recording(_) => {
-                ui.label(mono(format!("● {}", mode.label())).color(colors.red)).on_hover_text("gravação do QEMU (icount): Arquivo > Reproduzir a gravação");
-                ui.separator();
-            }
-            mode @ TimeMode::Replay(..) => {
-                ui.label(mono(format!("⟲ {}", mode.label())).color(colors.yellow)).on_hover_text("reprodução: o gdbstub do QEMU, com os passos para trás");
-                ui.separator();
-            }
-        }
-        if let Some(address) = &state.mcp_address {
-            ui.label(mono(format!("MCP {address}")).color(colors.green)).on_hover_text(format!("servidor MCP desta janela: http://{address}/mcp"));
-            ui.separator();
-        }
-        if state.highlight_mode {
-            ui.label(mono("destaque (H)").color(colors.yellow));
-            ui.separator();
-        }
-        ui.label(mono(message).color(colors.dim));
-        if !state.activity.is_empty() {
-            ui.separator();
-            ui.spinner();
-            ui.label(RichText::new(&state.activity).color(colors.yellow));
-        }
     });
 }
 
@@ -1757,8 +1957,16 @@ fn command_bar(ui: &mut Ui, state: &mut UiState) {
         });
     }
     ui.horizontal(|ui| {
+        let console_key = key(state, Action::ToggleConsole);
+        if ui.selectable_label(state.console_open, "Console").on_hover_text(format!("a saída dos comandos e os eventos num painel aqui em cima ({console_key})")).clicked() {
+            state.console_open = !state.console_open;
+            state.focus_command = state.console_open;
+        }
         ui.label(mono("Comando:").color(colors.blue));
         let response = ui.add(egui::TextEdit::singleline(&mut state.command).id(egui::Id::new("kd-command")).font(TextStyle::Monospace).desired_width(f32::INFINITY).hint_text("bp, g, p, r, db, k, .process <pid>, sxe ld:csrss!winsrv.dll... (help; Tab completa)"));
+        if std::mem::take(&mut state.focus_command) {
+            response.request_focus();
+        }
         state.command_focused = response.has_focus();
         if response.changed() {
             state.suggestions.clear();
@@ -1794,9 +2002,17 @@ fn command_bar(ui: &mut Ui, state: &mut UiState) {
 }
 
 /// As caixas de diálogo (ir para, comentário, rótulo, montar, padrão,
-/// constante, faixa).
+/// constante, faixa). O Ir para é a janela com a busca aproximada
+/// (`navigation::goto_window`).
 fn dialogs(ui: &mut Ui, state: &mut UiState) {
     let Some(dialog) = state.dialog.clone() else { return };
+    if let Dialog::GoTo(initial) = &dialog {
+        if !crate::navigation::goto_window(ui, state, initial) {
+            state.dialog = None;
+            state.dialog_error = None;
+        }
+        return;
+    }
     let (title, hint_text, address, mut text) = match &dialog {
         Dialog::GoTo(text) => ("Ir para a expressão", "símbolo, endereço, @rax+8, ntdll!LdrLoadDll...", None, text.clone()),
         Dialog::Comment(address, text) => ("Comentário", "texto do comentário (vazio apaga)", Some(*address), text.clone()),
@@ -1889,12 +2105,7 @@ fn dialogs(ui: &mut Ui, state: &mut UiState) {
     state.dialog_error = None;
     state.dialog = None;
     match dialog {
-        Dialog::GoTo(_) => {
-            if !text.trim().is_empty() {
-                state.requests.push(Request::ShowCode(text.trim().to_string()));
-                state.focus_tab.push(Tab::Cpu);
-            }
-        }
+        Dialog::GoTo(_) => state.go_to_expression(&text),
         Dialog::Comment(address, _) => {
             let location = state.location(address);
             state.notes.set_comment(location, text.trim());
@@ -2016,6 +2227,15 @@ impl TabViewer for Viewer<'_> {
     fn scroll_bars(&self, _tab: &Tab) -> [bool; 2] {
         [false, false]
     }
+
+    /// O botão direito no título de uma aba: copiar o que ela mostra.
+    fn context_menu(&mut self, ui: &mut Ui, tab: &mut Tab, _path: NodePath) {
+        if ui.button("Copiar a aba como texto").clicked() {
+            crate::copy_text::copy_tab(ui.ctx(), self.state, *tab);
+            ui.close();
+        }
+        ui.separator();
+    }
 }
 
 /// Rola só na vertical até a linha (centralizada), com a margem esquerda
@@ -2103,4 +2323,94 @@ pub(crate) fn shown_processor(snapshot: &Snapshot) -> Option<&kd_client::monitor
         _ => snapshot.stop_processor,
     }?;
     snapshot.processors.iter().find(|processor| processor.number == number)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::{CodeView, Config};
+
+    /// A janela com um backend sem alvo (a thread fica parada esperando).
+    fn app() -> DebuggerApp {
+        let root = crate::workspace_root();
+        let config = Config { root: root.clone(), elf: root.join("build").join("kernel.elf"), serial_log: None, session: None, script: None };
+        DebuggerApp::new(Backend::start(config, None, Arc::new(|| {})), None, String::new())
+    }
+
+    fn ntfs(base: u64) -> ModuleRow {
+        ModuleRow { base, end: base + 0x10_0000, name: "ntfs".into(), file_name: "ntfs.sys".into(), symbols: 0, source: "PDB".into(), pdb: true, pending: false, user: false }
+    }
+
+    #[test]
+    fn navigation_follows_module_and_rva() {
+        let mut app = app();
+        app.state.snapshot = Arc::new(Snapshot { modules: vec![ntfs(0x1000_0000)], ..Default::default() });
+        app.state.selected_code = Some(0x1000_0100);
+        app.state.go_to_code(0x1000_0200);
+        app.state.go_to_code(0x1000_0300);
+        assert_eq!(app.state.navigation.peek_back(), Some(&Location::new("ntfs", 0x200)));
+        // O módulo muda de base (outra sessão): a volta segue o RVA.
+        app.state.snapshot = Arc::new(Snapshot { modules: vec![ntfs(0x2000_0000)], ..Default::default() });
+        app.state.selected_code = Some(0x2000_0300);
+        assert!(app.state.navigate_back());
+        assert_eq!(app.state.selected_code, Some(0x2000_0200));
+        assert!(app.state.navigate_back());
+        assert_eq!(app.state.selected_code, Some(0x2000_0100));
+        assert!(!app.state.navigate_back());
+        assert!(app.state.navigate_forward());
+        assert_eq!(app.state.selected_code, Some(0x2000_0200));
+        assert!(app.state.requests.iter().any(|request| matches!(request, Request::ShowCode(text) if text == "0x20000200")));
+        // Marcadores: o próximo depois da linha, dando a volta.
+        assert!(app.state.toggle_bookmark_at(0x2000_0400));
+        assert!(app.state.toggle_bookmark_at(0x2000_0050));
+        app.state.jump_to_bookmark(true);
+        assert_eq!(app.state.selected_code, Some(0x2000_0400));
+        app.state.jump_to_bookmark(true);
+        assert_eq!(app.state.selected_code, Some(0x2000_0050));
+        app.state.jump_to_bookmark(false);
+        assert_eq!(app.state.selected_code, Some(0x2000_0400));
+        // A ida por expressão: a linha escolhida vira a do resultado quando o
+        // snapshot com o foco novo chega.
+        app.state.go_to_expression("ntfs!NtfsFsdCreate");
+        let generation = app.state.snapshot.generation;
+        app.state.snapshot = Arc::new(Snapshot { generation: generation + 1, modules: vec![ntfs(0x2000_0000)], code: CodeView { focus: 0x2000_0700, ..Default::default() }, ..Default::default() });
+        crate::navigation::resolve_pending_goto(&mut app.state);
+        assert_eq!(app.state.selected_code, Some(0x2000_0700));
+        assert!(app.state.pending_goto.is_none());
+        assert!(app.state.navigate_back());
+        assert_eq!(app.state.selected_code, Some(0x2000_0400));
+    }
+
+    #[test]
+    fn saved_state_reads_old_and_partial_files() {
+        let old: Saved = serde_json::from_str("{\"light\": false, \"watches\": [\"@rax\"], \"history\": [], \"script\": \"\"}").expect("antigo");
+        assert!(!old.light);
+        assert_eq!(old.watches, vec!["@rax".to_string()]);
+        assert!(old.layout.is_none() && old.window.is_none() && !old.console_open && old.known_tabs.is_empty());
+        let empty: Saved = serde_json::from_str("{}").expect("vazio");
+        assert!(empty.light, "sem o campo, o tema claro padrão");
+        // Ida e volta com o arranjo e a janela.
+        let saved = Saved { layout: serde_json::to_value(default_layout()).ok(), known_tabs: crate::layout::known_tabs(), window: Some(WindowGeometry { x: 10.0, y: 20.0, width: 1200.0, height: 800.0, native_scale: 1.0, maximized: false }), console_open: true, ..Saved::default() };
+        let back: Saved = serde_json::from_str(&serde_json::to_string(&saved).expect("json")).expect("volta");
+        assert!(back.console_open);
+        assert_eq!(back.window, saved.window);
+        assert!(crate::layout::restore_layout(back.layout, &back.known_tabs).is_some_and(|dock| dock.find_tab(&Tab::Snapshots).is_some()));
+    }
+
+    #[test]
+    fn draws_the_new_panels_without_a_target() {
+        let mut app = app();
+        app.state.console_open = true;
+        app.state.prefs_ui.shortcuts_open = true;
+        app.state.dialog = Some(Dialog::GoTo("ntclose".into()));
+        app.state.events.push(Level::Warning, "um aviso");
+        let image = crate::offscreen::render(&mut app, [900, 700], 3);
+        assert_eq!(image.size, [900, 700]);
+        // A janela Ir para segue aberta, com o texto inicial.
+        assert!(matches!(app.state.dialog, Some(Dialog::GoTo(_))));
+        assert_eq!(app.state.goto.text, "ntclose");
+        // A cópia de uma aba sem dados diz por quê.
+        assert!(crate::copy_text::tab_text(&app.state, Tab::Bugcheck).is_err());
+        assert!(crate::copy_text::tab_text(&app.state, Tab::Log).is_ok());
+    }
 }
