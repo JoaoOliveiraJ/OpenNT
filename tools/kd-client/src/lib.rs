@@ -31,6 +31,9 @@
 //!   interface gráfica usa);
 //! - `kd_script`: os roteiros do `--script` (conferências, variáveis,
 //!   condições, laços, esperas pela COM1 e tratadores de parada);
+//! - `breakpoints`: os breakpoints adiados (armados na carga da imagem, no
+//!   processo dela) e os por processo (`/p`, modelos e instâncias), a
+//!   limpeza na saída do processo e o limite de acertos;
 //! - `analysis`: decodificador, grafo de fluxo, limites de função e laços,
 //!   argumentos de chamadas e protótipos, referências e strings, padrões,
 //!   roteiros e as notas e patches por módulo + RVA;
@@ -53,6 +56,7 @@
 
 pub mod analysis;
 pub mod api_monitor;
+pub mod breakpoints;
 pub mod bugcheck;
 pub mod client;
 pub mod commands;

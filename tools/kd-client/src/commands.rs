@@ -16,7 +16,12 @@
 //! write <expr> <hex>         grava bytes
 //! poke <1|2|4|8> <expr> <valor>   grava um inteiro
 //! bp <expr> [N] [/w "cond"]  breakpoint de software, a partir do N-esimo acerto, condicional
-//! bu <expr>                  breakpoint adiado (o simbolo de um modulo que ainda vai carregar)
+//! bu <expr>                  breakpoint adiado: armado quando o modulo carregar (driver ou DLL,
+//!                            no processo que carregou; o PDB e baixado na hora)
+//! bp|bu|ba ... /p <proc>     so num processo: PID, EPROCESS ou $var (aquele), nome.exe (cada
+//!                            processo com o nome, tambem os que vao nascer) ou * (todos)
+//! bp|bu|ba ... /max <n>      desliga depois de n acertos que pararam ou registraram
+//! .bplog on|off              as linhas dos breakpoints de log tambem na saida padrao
 //! bc <expr|#n|all>           tira breakpoints
 //! hbp | hbc <expr>           breakpoint de hardware (DR0-DR3)
 //! ba <e|w|r><1|2|4|8> <expr> breakpoint de hardware de execucao, escrita ou acesso
@@ -83,6 +88,7 @@ use super::parse_number;
 const HELP: &str = "attach | break | c/g | wait-stop [ms] | s/t [n] | p [n] | gu | regs | r [<reg>[=<expr>]] | rx (x87, SSE, YMM, DR)
 x <expr> [bytes] | db/dw/dd/dq <expr> [L<n>] | da/du <expr> | write <expr> <hex> | poke <1|2|4|8> <expr> <valor>
 bp <expr> [N] [/w \"cond\"] | bu <expr> | bc <expr|#n|all> | bd/be <n> | bl | hbp/hbc <expr>
+bp/bu/ba ... /p <pid|eprocess|nome.exe|*> (por processo) /max <n> (desliga depois de n acertos) | .bplog on|off
 ba <e|w|r><1|2|4|8> <expr> | watch/unwatch <expr> <bytes> [w|a] | sxe/sxd ld:<modulo> | .bpsave/.bpload <arq>
 bpm <a|w|x> <expr> [bytes] | bpmc <expr> (breakpoint de memoria por pagina, no processo escolhido)
 bt [n] | k [n] | btt <ethread> [n] | context <ethread> | ? <expr> | sym <expr> | ln <expr> | addr <nome> | xs [mod!]padrao
@@ -187,20 +193,38 @@ pub(crate) fn split_two(text: &str) -> Option<(&str, &str)> {
     None
 }
 
-/// `L<n>` de um comando de memória.
-/// As opções de texto de um `bp`: `/log "..."`, `/cmd "..."` e `/g nome`.
+/// As opções de texto de um `bp`: `/log "..."`, `/cmd "..."`, `/g nome`,
+/// `/p processo` e `/max n`.
 #[derive(Default)]
 struct BreakpointOptions {
     log: String,
     command: String,
     group: String,
+    process: String,
+    max_hits: String,
 }
 
-/// Tira as opções `/log`, `/cmd` e `/g` do texto de um `bp` (o resto volta).
+impl BreakpointOptions {
+    /// As opções no pedido (o `/max` precisa ser número).
+    fn apply(self, request: &mut BreakpointRequest) -> Result<(), String> {
+        request.log = self.log;
+        request.command = self.command;
+        request.group = self.group;
+        request.scope = self.process;
+        if !self.max_hits.is_empty() {
+            request.max_hits = parse_number(&self.max_hits).ok_or_else(|| format!("/max {}: numero invalido", self.max_hits))?;
+        }
+        Ok(())
+    }
+}
+
+/// Tira as opções `/log`, `/cmd`, `/g`, `/p` e `/max` do texto de um `bp`
+/// (o resto volta). As de texto livre vêm antes, para que um `/p` dentro
+/// das aspas de um `/log` não conte.
 fn breakpoint_options(text: &str) -> (String, BreakpointOptions) {
     let mut options = BreakpointOptions::default();
     let mut rest = text.to_string();
-    for (key, slot) in [("/log", 0), ("/cmd", 1), ("/g", 2)] {
+    for (key, slot) in [("/log", 0), ("/cmd", 1), ("/g", 2), ("/p", 3), ("/max", 4)] {
         let Some(start) = rest.find(&format!("{key} ")) else { continue };
         let after = rest[start + key.len()..].trim_start();
         let (value, consumed) = if let Some(quoted) = after.strip_prefix('"') {
@@ -215,7 +239,9 @@ fn breakpoint_options(text: &str) -> (String, BreakpointOptions) {
         match slot {
             0 => options.log = value,
             1 => options.command = value,
-            _ => options.group = value,
+            2 => options.group = value,
+            3 => options.process = value,
+            _ => options.max_hits = value,
         }
         rest = format!("{} {}", rest[..start].trim_end(), rest[consumed.min(rest.len())..].trim_start()).trim().to_string();
     }
@@ -229,6 +255,7 @@ fn is_event_filter(text: &str) -> bool {
     matches!(code.as_str(), "cpr" | "epr" | "ct" | "et") || (code == "ld" && text.contains('!'))
 }
 
+/// `L<n>` de um comando de memória.
 fn length_argument(words: &[&str]) -> Option<u64> {
     words.iter().find_map(|word| word.strip_prefix('L').or_else(|| word.strip_prefix('l')).and_then(|count| parse_number(count).or_else(|| u64::from_str_radix(count, 16).ok())))
 }
@@ -242,10 +269,14 @@ impl Client {
         if breakpoint.kind == BreakpointKind::Event {
             return Ok(format!("para no evento {} (#{})", breakpoint.expression, breakpoint.id));
         }
-        if breakpoint.pending {
-            return Ok(format!("adiado: {} (#{}), armado quando o modulo carregar", breakpoint.expression, breakpoint.id));
+        let scope = self.breakpoint_scope_text(breakpoint.id);
+        if self.breakpoint_scope(breakpoint.id).is_some_and(|entry| entry.template) {
+            return Ok(format!("modelo: {} (#{}){scope}; cada processo novo que carregar o modulo ganha a sua instancia", breakpoint.expression, breakpoint.id));
         }
-        let mut text = format!("armado {:#x} {} (#{})", breakpoint.address, self.symbols.describe(breakpoint.address), breakpoint.id);
+        if breakpoint.pending {
+            return Ok(format!("adiado: {} (#{}){scope}, armado quando o modulo carregar", breakpoint.expression, breakpoint.id));
+        }
+        let mut text = format!("armado {:#x} {} (#{}){scope}", breakpoint.address, self.symbols.describe(breakpoint.address), breakpoint.id);
         if breakpoint.pass_count > 1 {
             text.push_str(&format!(" a partir do acerto {}", breakpoint.pass_count));
         }
@@ -275,7 +306,12 @@ impl Client {
             Some(id) => id as u32,
             None => {
                 let address = self.evaluate(target)?;
-                match self.breakpoints.iter().find(|breakpoint| breakpoint.kind == kind && breakpoint.address == address) {
+                // A mesma VA em vários processos: primeiro a do processo
+                // escolhido.
+                let context = self.process().map(|context| context.eprocess);
+                let matching = |breakpoint: &&super::client::Breakpoint| breakpoint.kind == kind && breakpoint.address == address;
+                let found = self.breakpoints.iter().filter(matching).find(|breakpoint| Some(breakpoint.process) == context).or_else(|| self.breakpoints.iter().find(matching));
+                match found {
                     Some(breakpoint) => breakpoint.id,
                     None => {
                         let reply = self.request(&format!("z{},{:x},{:x}", match kind {
@@ -327,6 +363,7 @@ impl Client {
             if breakpoint.process != 0 {
                 output.push_str(&format!(" processo {:#x}", breakpoint.process));
             }
+            output.push_str(&self.breakpoint_scope_text(breakpoint.id));
             output.push_str(&format!(" acertos {}\n", breakpoint.hits));
         }
         output.push_str("armados no alvo:\n");
@@ -745,7 +782,7 @@ impl Client {
                 Ok(format!("{value:#x} em {address:#x}"))
             }
             "bp" | "bu" => {
-                // bp <expr> [N] [/w "condição"] [/log "texto"] [/cmd "comandos"] [/g grupo]
+                // bp <expr> [N] [/w "condição"] [/log "texto"] [/cmd "comandos"] [/g grupo] [/p processo] [/max n]
                 let (rest, options) = breakpoint_options(rest);
                 let rest = rest.as_str();
                 let (main, condition) = match rest.split_once("/w") {
@@ -761,15 +798,15 @@ impl Client {
                 request.condition = condition;
                 request.pass_count = pass_count;
                 request.deferred = command == "bu";
-                request.log = options.log;
-                request.command = options.command;
-                request.group = options.group;
+                options.apply(&mut request)?;
                 self.breakpoint_command(request)
             }
             "bc" if rest == "all" || rest == "*" => {
+                // Sem processo escolhido, o `z0` de um endereço de usuário tira
+                // o breakpoint de todos os processos donos.
                 let list = self.monitor("bl")?;
                 for line in list.lines() {
-                    if let Some(address) = line.strip_prefix("software").and_then(|rest| parse_number(rest.trim())) {
+                    if let Some(address) = line.strip_prefix("software").and_then(|rest| rest.split_whitespace().next()).and_then(parse_number) {
                         self.request(&format!("z0,{address:x},1"))?;
                     }
                 }
@@ -778,24 +815,42 @@ impl Client {
                     if let Some(index) = self.breakpoints.iter().position(|breakpoint| breakpoint.id == id) {
                         self.breakpoints.remove(index);
                     }
+                    self.scopes.remove(&id);
                 }
+                self.refresh_hooks()?;
                 Ok("breakpoints de software removidos".into())
             }
             "bc" => self.clear_command(BreakpointKind::Software, rest, 1),
-            "hbp" => self.breakpoint_command(BreakpointRequest::new(BreakpointKind::Hardware, rest)),
+            "hbp" => {
+                let (rest, options) = breakpoint_options(rest);
+                let mut request = BreakpointRequest::new(BreakpointKind::Hardware, &rest);
+                options.apply(&mut request)?;
+                self.breakpoint_command(request)
+            }
             "hbc" => self.clear_command(BreakpointKind::Hardware, rest, 1),
             "ba" => {
-                // ba e1 <expr> | ba w4 <expr> | ba r8 <expr>
-                let access = words.first().ok_or("uso: ba <e|w|r><1|2|4|8> <expr>")?;
-                let (kind, size) = access.split_at(1);
+                // ba e1 <expr> | ba w4 <expr> | ba r8 <expr>, com as opções do
+                // bp (/p, /max, /log, /cmd, /g e /w "condição"). Um endereço de
+                // usuário vai ao CONTEXT das threads do processo.
+                let usage = "uso: ba <e|w|r><1|2|4|8> <expr> [/p processo] [/w \"cond\"] [/log \"texto\"] [/max n]";
+                let (rest, options) = breakpoint_options(rest);
+                let (main, condition) = match rest.split_once("/w") {
+                    Some((main, condition)) => (main.trim().to_string(), condition.trim().trim_matches('"').to_string()),
+                    None => (rest.clone(), String::new()),
+                };
+                let words: Vec<&str> = main.split_whitespace().collect();
+                let access = words.first().ok_or(usage)?;
+                let (kind, size) = access.split_at(1.min(access.len()));
                 let kind = match kind {
                     "e" => BreakpointKind::Hardware,
                     "w" => BreakpointKind::Write,
                     "r" | "a" => BreakpointKind::Access,
-                    _ => return Err("uso: ba <e|w|r><1|2|4|8> <expr>".into()),
+                    _ => return Err(usage.into()),
                 };
                 let mut request = BreakpointRequest::new(kind, &words[1..].join(" "));
                 request.length = parse_number(size).filter(|size| matches!(size, 1 | 2 | 4 | 8)).unwrap_or(1);
+                request.condition = condition;
+                options.apply(&mut request)?;
                 self.breakpoint_command(request)
             }
             "bpm" | "bpmc" => {
@@ -858,6 +913,17 @@ impl Client {
                 Ok(format!("breakpoint {id} {}", if command == "be" { "ligado" } else { "desligado" }))
             }
             "bl" => self.breakpoint_list(),
+            ".bplog" => {
+                // Os roteiros não leem o console: as linhas de log saem na
+                // hora em que o breakpoint acerta (dentro do wait-stop).
+                match rest {
+                    "on" | "1" => self.set_log_echo(true),
+                    "off" | "0" => self.set_log_echo(false),
+                    "" => {}
+                    _ => return Err("uso: .bplog on|off".into()),
+                }
+                Ok(format!("linhas de log na saida padrao: {}", if self.log_echo { "sim" } else { "nao" }))
+            }
             ".bpsave" => {
                 let path = words.first().ok_or("uso: .bpsave <arquivo>")?;
                 std::fs::write(path, self.breakpoint_specs()).map_err(|error| format!("{path}: {error}"))?;
@@ -1060,7 +1126,7 @@ impl Client {
     /// Os comandos e aliases conhecidos (o autocompletar).
     pub fn command_names() -> &'static [&'static str] {
         &[
-            "attach", "break", "c", "g", "continue", "wait-stop", "s", "t", "step", "p", "gu", "regs", "r", "rx", "x", "db", "dw", "dd", "dq", "da", "du", "write", "poke", "bp", "bu", "bc", "hbp", "hbc", "ba", "bpm", "bpmc", "watch", "unwatch", "sxe", "sxd", "bd", "be", "bl", ".bpsave", ".bpload", "bt", "k", "context", "btt", "?", "sym", "ln", "addr", "xs", "dt", "thread", "cpulist", "ps",
+            "attach", "break", "c", "g", "continue", "wait-stop", "s", "t", "step", "p", "gu", "regs", "r", "rx", "x", "db", "dw", "dd", "dq", "da", "du", "write", "poke", "bp", "bu", "bc", "hbp", "hbc", "ba", "bpm", "bpmc", "watch", "unwatch", "sxe", "sxd", "bd", "be", "bl", ".bplog", ".bpsave", ".bpload", "bt", "k", "context", "btt", "?", "sym", "ln", "addr", "xs", "dt", "thread", "cpulist", "ps",
             "threads", "lm", "lmv", "cpus", "irql", "obj", "log", "bugcheck", "kd", ".reload", "!process", "!thread", "!irp", "!devobj", "!drvobj", "!object", "!handle", "!analyze", "trace", "monitor", "modules", "detach", "help",
             ".process", "lmu", "handles", "vad", "uthreads", "ustack", "kmap", "events", "uex", "bgd", "bge", "bar",
             "apimon", "irptrace", "reg", "regv", "objdir", "fsls", "fscat", "dtv", "rstep", "rcont", "snap",
@@ -1108,6 +1174,17 @@ mod tests {
         assert!(is_event_filter("ld:csrss!winsrv.dll"));
         assert!(is_event_filter("cpr:winlogon.exe"));
         assert!(!is_event_filter("ld:ntfs.sys"));
+        // O `/p` dentro das aspas de um `/log` não conta.
+        let (rest, options) = breakpoint_options("dwmcore!X /log \"hr /p {@rax}\" /p dwm.exe /max 5");
+        assert_eq!(rest, "dwmcore!X");
+        assert_eq!(options.log, "hr /p {@rax}");
+        assert_eq!(options.process, "dwm.exe");
+        assert_eq!(options.max_hits, "5");
+        let mut request = BreakpointRequest::new(BreakpointKind::Software, &rest);
+        options.apply(&mut request).unwrap();
+        assert_eq!((request.scope.as_str(), request.max_hits), ("dwm.exe", 5));
+        let (_, options) = breakpoint_options("x /max cinco");
+        assert!(options.apply(&mut request).is_err());
     }
 
     #[test]

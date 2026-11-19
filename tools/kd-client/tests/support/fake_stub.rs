@@ -50,6 +50,11 @@ struct Target {
     memory_breakpoints: Vec<(u64, u64, String)>,
     /// O monitor de APIs ou o rastreador ligado: o fluxo tem registros.
     stream_enabled: bool,
+    /// Registradores (índice do `g`, valor) postos a cada parada, na ordem
+    /// das paradas (os argumentos dos pontos de evento).
+    register_sets: VecDeque<Vec<(usize, u64)>>,
+    /// A resposta do `ps` (vazia = a resposta padrão).
+    processes: String,
 }
 
 /// Os registros do fluxo do alvo de mentira: uma chamada ao IoCreateDevice
@@ -150,6 +155,7 @@ impl Target {
         let words: Vec<&str> = text.split_whitespace().collect();
         match words.as_slice() {
             ["lm"] => format!("              base                fim  nome             caminho\n{}", self.modules.join("")),
+            ["ps"] if !self.processes.is_empty() => self.processes.clone(),
             // Os processos e as threads (os laços dos roteiros).
             ["ps"] => "   PID           EPROCESS                CR3 threads  nome\n     4 0xffffe00000001000           0x1ab000       2  System\n   100 0xffffe00000042000           0x2cd000       1  smss.exe\n   500 0xffffc00000500000           0x2bb000       5  csrss.exe\n".to_string(),
             ["threads"] => "   PID    TID            ETHREAD estado                    inicio  processo\n     4      8 0xffffe00000003000 Waiting       0xfffff80040100000  System\n     4     12 0xffffe00000004000 Waiting       0xfffff80040102000  System\n   100    104 0xffffe00000043000 Running       0xfffff80040103000  smss.exe\n".to_string(),
@@ -272,6 +278,9 @@ impl Target {
             self.registers[16] = stop.rip;
             self.registers[7] = stop.rsp;
             self.registers[0] = stop.rax;
+            for (index, value) in self.register_sets.pop_front().unwrap_or_default() {
+                self.registers[index] = value;
+            }
             if let Some(name) = stop.load {
                 let base = 0xfffff800_4300_0000u64 + self.modules.len() as u64 * 0x10000;
                 self.modules.push(format!("{base:#x} {:#x}  {name}   \\SystemRoot\\System32\\drivers\\{name}\n", base + 0x10000));
@@ -288,12 +297,18 @@ impl Target {
 
 /// Sobe o alvo; devolve o endereço e o registro dos pacotes recebidos.
 pub fn start(stops: Vec<Stop>) -> (String, Arc<Mutex<Vec<String>>>) {
+    start_with(stops, Vec::new(), Vec::new(), "")
+}
+
+/// Sobe o alvo com registradores por parada (`registers[n]` vale na
+/// parada `n`), memória a mais e a resposta do `ps`.
+pub fn start_with(stops: Vec<Stop>, registers: Vec<Vec<(usize, u64)>>, memory: Vec<(u64, Vec<u8>)>, processes: &str) -> (String, Arc<Mutex<Vec<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap().to_string();
     let log = Arc::new(Mutex::new(Vec::new()));
     // Um driver que não existe nesta máquina (sem símbolos).
     let modules = vec!["0xfffff80042000000 0xfffff80042010000  alvo-falso.sys   \\SystemRoot\\System32\\drivers\\alvo-falso.sys\n".to_string()];
-    let mut target = Target { registers: [0; 24], memory: Vec::new(), stops: stops.into(), log: Arc::clone(&log), modules, memory_breakpoints: Vec::new(), stream_enabled: false };
+    let mut target = Target { registers: [0; 24], memory, stops: stops.into(), log: Arc::clone(&log), modules, memory_breakpoints: Vec::new(), stream_enabled: false, register_sets: registers.into(), processes: processes.to_string() };
     // Pilha: o quadro corrente em STACK + 0x20 com dois chamadores.
     let mut stack = vec![0u8; 0x100];
     let mut put = |offset: usize, value: u64| stack[offset..offset + 8].copy_from_slice(&value.to_le_bytes());

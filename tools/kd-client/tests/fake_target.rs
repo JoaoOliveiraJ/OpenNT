@@ -15,8 +15,82 @@ use std::time::Duration;
 
 use kd_client::client::{BreakpointOptions, BreakpointRequest, Resumed};
 use kd_client::kd_script::ScriptOptions;
+use kd_client::symbols::Symbol;
 use kd_client::BreakpointKind;
-use support::fake_stub::{connect, connect_replay, start, Stop, CODE, STACK, USER_DATA};
+use support::fake_stub::{connect, connect_replay, kernel_module, start, start_with, Stop, CODE, STACK, USER_DATA};
+
+/// Os pacotes de breakpoint e de continuação mandados ao alvo.
+fn breakpoint_packets(log: &std::sync::Mutex<Vec<String>>) -> Vec<String> {
+    log.lock().unwrap().iter().filter(|packet| matches!(packet.as_bytes().first(), Some(b'Z' | b'z' | b'c'))).cloned().collect()
+}
+
+/// Um `bu /p alvo.exe` arma na carga da DLL no processo (o ponto de evento
+/// de imagem, sem a DLL nos módulos da sessão e sem arquivo nesta máquina:
+/// `módulo+0xRVA`), para no acerto e some quando o processo sai.
+#[test]
+fn deferred_user_breakpoint_arms_in_the_loading_process() {
+    let image_hook = CODE + 0x1100;
+    let process_hook = CODE + 0x1200;
+    let name_address = 0xffff_a000_0001_0000u64;
+    let name = b"\\Windows\\System32\\falso.dll".to_vec();
+    let (base, eprocess, pid) = (0x7ff7_1000_0000u64, 0xffff_a000_0000_7000u64, 0x99u64);
+    let stops = vec![
+        Stop::at(image_hook, "T05thread:1;swbreak:;"),
+        Stop::at(base + 0x1234, "T05thread:1;swbreak:;"),
+        Stop::at(process_hook, "T05thread:1;swbreak:;"),
+        Stop::at(CODE + 0x20, "T05thread:1;"),
+    ];
+    // Os argumentos dos pontos de evento: RDI, RSI, RDX, RCX e R8 (índices
+    // 5, 4, 3, 2 e 8 do `g`).
+    let registers = vec![vec![(5, base), (4, 0x20000), (3, pid), (2, name_address), (8, name.len() as u64)], Vec::new(), vec![(5, eprocess), (4, pid), (3, 0)]];
+    let processes = format!("PID EPROCESS CR3 threads nome\n{pid:#x} {eprocess:#x} 0x12345000 3 alvo.exe\n");
+    let (address, log) = start_with(stops, registers, vec![(name_address, name)], &processes);
+    let mut client = connect(&address);
+    let mut kernel = kernel_module();
+    kernel.symbols.push(Symbol { address: image_hook, size: 0x10, name: "opennt_kd_image_event".into(), function: true });
+    kernel.symbols.push(Symbol { address: process_hook, size: 0x10, name: "opennt_kd_process_event".into(), function: true });
+    kernel.symbols.sort_by_key(|symbol| symbol.address);
+    client.symbols.set_kernel(kernel);
+    let text = client.execute("bu /p alvo.exe falso+0x1234").unwrap();
+    assert!(text.contains("modelo") && text.contains("/p alvo.exe"), "{text}");
+    client.go().unwrap();
+    let stop = client.wait_stop(Duration::from_secs(10)).unwrap();
+    assert!(stop.contains("breakpoint #1, acerto 1"), "{stop}");
+    assert_eq!(client.breakpoints().len(), 2);
+    assert_eq!((client.breakpoints()[1].address, client.breakpoints()[1].process), (base + 0x1234, eprocess));
+    assert_eq!(client.breakpoint_instances(0), vec![1]);
+    assert!(client.log_lines().iter().any(|line| line.contains("instancia #1") && line.contains("alvo.exe")), "{:?}", client.log_lines());
+    client.go().unwrap();
+    let stop = client.wait_stop(Duration::from_secs(10)).unwrap();
+    assert!(!stop.contains("breakpoint #"), "{stop}");
+    // A instância saiu com o processo; o modelo segue adiado.
+    assert_eq!(client.breakpoints().len(), 1);
+    assert!(client.breakpoints()[0].pending);
+    assert!(client.breakpoint_instances(0).is_empty());
+    assert_eq!(breakpoint_packets(&log), vec!["Z0,fffff80040101100,1", "c", "Z0,7ff710001234,1", "Z0,fffff80040101200,1", "c", "c", "z0,fffff80040101200,1", "c"]);
+    // O modelo volta pelo arquivo de sessão com o `/p`.
+    assert!(client.breakpoint_specs().trim_end().ends_with("\talvo.exe\t0"), "{:?}", client.breakpoint_specs());
+}
+
+/// O `/max`: depois de dois acertos registrados, o breakpoint se desliga.
+#[test]
+fn hit_limit_disables_the_breakpoint() {
+    let stops = vec![
+        Stop { rip: CODE + 0x10, rsp: STACK, packet: "T05thread:1;swbreak:;", rax: 1, load: None },
+        Stop { rip: CODE + 0x10, rsp: STACK, packet: "T05thread:1;swbreak:;", rax: 2, load: None },
+        Stop::at(CODE + 0x20, "T05thread:1;"),
+    ];
+    let (address, log) = start(stops);
+    let mut client = connect(&address);
+    let text = client.execute("bp kernel::alvo::corrente+0x10 /log \"x={@rax:d}\" /max 2").unwrap();
+    assert!(text.contains("max 2"), "{text}");
+    client.go().unwrap();
+    let stop = client.wait_stop(Duration::from_secs(10)).unwrap();
+    assert!(!stop.contains("breakpoint #0"), "{stop}");
+    assert_eq!(client.log_lines(), &["[bp #0] x=1".to_string(), "[bp #0] x=2".to_string(), "[bp #0] limite de 2 acertos: desligado".to_string()]);
+    assert!(!client.breakpoints()[0].enabled);
+    assert_eq!(breakpoint_packets(&log), vec!["Z0,fffff80040100010,1", "c", "c", "z0,fffff80040100010,1", "c"]);
+}
 
 /// A reprodução: os módulos da gravação, as consultas recusadas sem ir ao
 /// alvo, um passo para a frente e o passo para trás de volta ao RIP de

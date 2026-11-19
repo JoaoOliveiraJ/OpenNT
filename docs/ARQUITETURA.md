@@ -2799,14 +2799,24 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
       gravado pela raiz deste processo para a máquina; o host vê um quadro
       montado do CONTEXT (CS 0x33, GS = TEB, x87/SSE do FltSave), e o quadro
       volta ao CONTEXT na saída (`stop::enter_user`). O 0xCC vai ao quadro
-      físico: num quadro de código compartilhado (a ntdll), o `int 3` de
-      outro processo é reconhecido pelo quadro físico
-      (`breakpoints::classify_user_hit`) e passa sem parar, com o byte
-      original de volta por um passo da thread. O passo e a saída de um
+      físico, e o byte físico (não a VA) identifica o breakpoint de usuário:
+      cada `Z0` acrescenta a raiz do processo escolhido aos donos do slot.
+      Num quadro de código compartilhado (a ntdll, uma DLL em qualquer VA),
+      o `int 3` de um dono para a máquina e o de outro processo passa sem
+      parar (`breakpoints::classify_user_hit`), com o byte original de volta
+      por um passo da thread; o `z0` tira só o processo escolhido, e o byte
+      volta com o último dono. O copy-on-write de uma página de código
+      (`breakpoints::page_copied`, chamado pelo NtProtectVirtualMemory que
+      torna gravável uma página de imagem e pela falta copy-on-write das
+      vistas de dados) leva o breakpoint do processo para a cópia, devolve
+      o byte ao quadro compartilhado quando ele era o único dono e tira da
+      cópia o 0xCC alheio. A saída do processo (`kd/events.rs`, antes de o
+      espaço de endereços ser desmontado) e o desmapeamento de uma vista de
+      imagem tiram o processo dos donos. O passo e a saída de um
       breakpoint usam o TF no CONTEXT; o #DB do passo volta pelo mesmo
       caminho e é reconhecido pelo endereço do CONTEXT. `monitor uex on`
-      para também nas outras exceções do anel 3. Antes de gravar num
-      endereço de usuário, o byte atual é conferido. Os comparadores de
+      para também nas outras exceções do anel 3. Antes de devolver um byte
+      de usuário, o byte atual é conferido (tem de ser o 0xCC). Os comparadores de
       hardware do depurador valem só no anel 0: na entrada do anel 3 a HAL
       troca o banco de depuração pelo da thread (o CONTEXT dela).
     - Breakpoints de hardware de usuário (`kd/user_hardware.rs`): um
@@ -5388,11 +5398,22 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     acesso (`ba e1|w4|r8`), condição (`bp x 3 /w "@rax == 7"`: a partir do
     terceiro acerto, só com a condição verdadeira; os outros acertos seguem
     sozinhos), adiados (`bu`: o símbolo de um módulo que ainda vai carregar)
-    e parada por carga de módulo (`sxe ld:ntfs.sys`). Os dois últimos usam
+    e parada por carga de módulo (`sxe ld:ntfs.sys`). A parada por carga usa
     um breakpoint interno na notificação de carga de imagem do kernel
-    (`ps::notify::image::notify`): o cliente relê a lista de módulos, arma
-    os adiados e segue sozinho quando o módulo novo não é o pedido.
-    `.bpsave`/`.bpload` gravam e recriam a lista.
+    (`ps::notify::image::notify`). Os adiados (`breakpoints.rs`) usam o
+    ponto de evento de imagem (`opennt_kd_image_event`): a cada driver ou
+    DLL nova, o cliente resolve o nome só no módulo novo (exports, PDB
+    baixado na hora com a máquina parada, ou `módulo+0xRVA`) e arma o
+    breakpoint no processo que carregou a imagem. `/p <pid|eprocess>`
+    prende o breakpoint a um processo; `/p nome.exe` e `/p *` fazem um
+    modelo, e cada processo com o nome (também os que nascem depois) ganha
+    uma instância. Num endereço de sistema, o `/p` filtra no acerto. Na
+    saída do processo (`opennt_kd_process_event`), as instâncias dele somem
+    e um `bu` sem `/p` volta a adiado até o próximo processo com o mesmo
+    nome. `/max n` desliga o breakpoint depois de n acertos que pararam ou
+    registraram; `.bplog on` manda as linhas de log também à saída padrão.
+    `.bpsave`/`.bpload` gravam e recriam a lista (com o `/p` por nome e o
+    `/max`).
   - Processos de usuário (`user.rs`, `client.rs`): `.process` escolhe o
     processo e o cliente o reaplica a cada parada; numa parada do anel 3, o
     processo dela vira o das leituras. Os módulos de usuário (a PEB.Ldr e as

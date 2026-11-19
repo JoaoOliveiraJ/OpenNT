@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use super::breakpoints::{self as scoped, Pick, ProcessFilter, Scope, USER_LIMIT};
 use super::bugcheck::{self, Analysis};
 use super::expr::{self, Environment};
 use super::monitor::{self, LoadedModule, Process, Processor, Thread, ThreadContext};
@@ -198,6 +199,13 @@ pub struct BreakpointRequest {
     /// O EPROCESS dono (0 = o processo escolhido no momento, se houver).
     pub process: u64,
     pub options: BreakpointOptions,
+    /// O `/p`: PID ou EPROCESS, nome de imagem (`dwm.exe`: cada processo com
+    /// esse nome, também os que ainda vão nascer) ou `*` (todos). Vazio = o
+    /// campo `process`. Ver `breakpoints.rs`.
+    pub scope: String,
+    /// Desliga depois de tantos acertos que pararam ou registraram (0 = sem
+    /// limite).
+    pub max_hits: u64,
 }
 
 impl BreakpointRequest {
@@ -208,7 +216,7 @@ impl BreakpointRequest {
             BreakpointKind::Write | BreakpointKind::Access => 8,
             _ => 1,
         };
-        Self { kind, expression: expression.trim().to_string(), length, condition: String::new(), pass_count: 0, deferred: false, enabled: true, log: String::new(), command: String::new(), group: String::new(), process: 0, options: BreakpointOptions::default() }
+        Self { kind, expression: expression.trim().to_string(), length, condition: String::new(), pass_count: 0, deferred: false, enabled: true, log: String::new(), command: String::new(), group: String::new(), process: 0, options: BreakpointOptions::default(), scope: String::new(), max_hits: 0 }
     }
 }
 
@@ -307,6 +315,16 @@ pub struct Client {
     stops: u64,
     /// A parada em que os módulos de usuário foram relidos por um nome.
     user_modules_stop: u64,
+    /// O escopo dos breakpoints (filtro de processo, modelo e instâncias,
+    /// limite de acertos), pelo número (`breakpoints.rs`).
+    pub(crate) scopes: HashMap<u32, Scope>,
+    /// Os símbolos das imagens que armaram breakpoints adiados, por caminho
+    /// e base: o PDB não é relido a cada processo novo.
+    pub(crate) image_cache: HashMap<(String, u64), Symbols>,
+    /// O nome de imagem dos processos (EPROCESS), pelo `ps`.
+    pub(crate) process_names: HashMap<u64, String>,
+    /// As linhas de log também vão à saída padrão (`set_log_echo`).
+    pub(crate) log_echo: bool,
 }
 
 impl ReadMemory for Client {
@@ -348,7 +366,9 @@ impl Environment for Client {
     }
 
     fn symbol(&mut self, name: &str) -> Result<u64, String> {
-        self.resolve_symbol(name)
+        // Um módulo sozinho é a base dele (`dwmcore+0x5d7e8`, o RVA de um
+        // ponto sem símbolo).
+        self.resolve_symbol(name).or_else(|error| self.symbols.module_named(name).map(|module| module.base).ok_or(error))
     }
 
     fn variable(&mut self, name: &str) -> Option<u64> {
@@ -416,6 +436,10 @@ impl Client {
             replay: None,
             stops: 0,
             user_modules_stop: 0,
+            scopes: HashMap::new(),
+            image_cache: HashMap::new(),
+            process_names: HashMap::new(),
+            log_echo: false,
         }
     }
 
@@ -521,8 +545,10 @@ impl Client {
         self.pending_commands = None;
         // Módulos carregados desde a última parada entram nos símbolos (a
         // primeira parada, a do attach, ainda não tem o ELF carregado). Um
-        // breakpoint de retorno rápido não espera essa releitura.
-        let fast = stop.reasons.contains(&Reason::SoftwareBreak) && self.register("rip").is_ok_and(|rip| self.fast_resume_at(rip));
+        // breakpoint de retorno rápido não espera essa releitura, nem um
+        // ponto de evento (a carga de uma imagem traz o que precisa nos
+        // registradores; a lista de drivers muda na notificação de carga).
+        let fast = stop.reasons.contains(&Reason::SoftwareBreak) && self.register("rip").is_ok_and(|rip| self.fast_resume_at(rip) || self.event_hooks.iter().any(|(hook, _, _)| *hook == rip));
         if !self.symbols.modules.is_empty() && !fast {
             let _ = self.reload_modules();
         }
@@ -571,6 +597,14 @@ impl Client {
         if software {
             if let Some(&(_, symbol, _)) = self.event_hooks.iter().find(|(address, _, _)| *address == rip) {
                 let user_here = self.breakpoints.iter().any(|breakpoint| breakpoint.enabled && breakpoint.kind == BreakpointKind::Software && breakpoint.address == rip);
+                // Os breakpoints adiados armam na imagem nova; os de um
+                // processo que sai voltam a adiados (`breakpoints.rs`).
+                if symbol == IMAGE_EVENT {
+                    self.on_image_event();
+                } else if symbol == PROCESS_EVENT && self.register("rdx").is_ok_and(|created| created == 0) {
+                    let eprocess = self.register("rdi").unwrap_or(0);
+                    self.on_process_exit(eprocess);
+                }
                 return match self.check_event(symbol) {
                     Some(text) => Hit::Stop(text),
                     None if user_here => Hit::None,
@@ -611,23 +645,33 @@ impl Client {
             _ => None,
         });
         let hardware = stop.reasons.contains(&Reason::HardwareBreak);
-        let index = self.breakpoints.iter().position(|breakpoint| {
-            breakpoint.enabled
-                && !breakpoint.pending
-                && match breakpoint.kind {
-                    BreakpointKind::Software => software && breakpoint.address == rip,
-                    BreakpointKind::Hardware => hardware && memory.is_none() && breakpoint.address == rip,
-                    BreakpointKind::Write | BreakpointKind::Access => memory.is_none() && watched == Some(breakpoint.address),
-                    BreakpointKind::MemoryAccess | BreakpointKind::MemoryWrite | BreakpointKind::MemoryExecute => memory.is_some_and(|address| address >= breakpoint.address && address < breakpoint.address + breakpoint.length.max(1)),
-                    BreakpointKind::Module | BreakpointKind::Event => false,
+        // A mesma VA pode ter um breakpoint em cada processo (as instâncias
+        // de um `/p`): vale o do processo corrente.
+        let candidates: Vec<usize> = (0..self.breakpoints.len())
+            .filter(|&index| {
+                let breakpoint = &self.breakpoints[index];
+                breakpoint.enabled
+                    && !breakpoint.pending
+                    && match breakpoint.kind {
+                        BreakpointKind::Software => software && breakpoint.address == rip,
+                        BreakpointKind::Hardware => hardware && memory.is_none() && breakpoint.address == rip,
+                        BreakpointKind::Write | BreakpointKind::Access => memory.is_none() && watched == Some(breakpoint.address),
+                        BreakpointKind::MemoryAccess | BreakpointKind::MemoryWrite | BreakpointKind::MemoryExecute => memory.is_some_and(|address| address >= breakpoint.address && address < breakpoint.address + breakpoint.length.max(1)),
+                        BreakpointKind::Module | BreakpointKind::Event => false,
+                    }
+            })
+            .collect();
+        let index = match self.pick_for_process(&candidates) {
+            Pick::Found(index) => index,
+            // Um breakpoint filtrado por processo, acertado por outro.
+            Pick::Other => return Hit::Continue,
+            Pick::Nothing => {
+                // Um acesso à página vigiada fora da faixa pedida: segue.
+                if memory.is_some() && self.breakpoints.iter().any(|breakpoint| breakpoint.enabled && breakpoint.kind.is_memory()) {
+                    return Hit::Continue;
                 }
-        });
-        let Some(index) = index else {
-            // Um acesso à página vigiada fora da faixa pedida: segue.
-            if memory.is_some() && self.breakpoints.iter().any(|breakpoint| breakpoint.enabled && breakpoint.kind.is_memory()) {
-                return Hit::Continue;
+                return Hit::None;
             }
-            return Hit::None;
         };
         self.breakpoints[index].hits += 1;
         let breakpoint = self.breakpoints[index].clone();
@@ -652,11 +696,17 @@ impl Client {
             }
         };
         let condition_true = |client: &mut Client, condition: &str, default: bool| if condition.trim().is_empty() { default } else { client.evaluate(condition).map(|value| value != 0).unwrap_or(true) };
-        if !breakpoint.log.trim().is_empty() && condition_true(self, &options.log_condition, true) {
+        let logged = !breakpoint.log.trim().is_empty() && condition_true(self, &options.log_condition, true);
+        if logged {
             let line = format!("[bp {label}] {}", self.format_log(&breakpoint.log));
             self.push_log(line);
         }
         let run_commands = !breakpoint.command.trim().is_empty() && condition_true(self, &options.command_condition, stop_now);
+        // O limite de acertos (`/max`) conta os que pararam ou registraram e
+        // desliga o breakpoint no último.
+        if (stop_now || logged) && self.count_hit(breakpoint.id) {
+            text.push_str(" (limite de acertos: desligado)");
+        }
         if !stop_now {
             if run_commands {
                 self.run_hit_commands(breakpoint.id, &breakpoint.command);
@@ -733,6 +783,9 @@ impl Client {
 
     /// Uma linha de log (breakpoint de log, comando de parada) no console.
     pub(crate) fn push_log(&mut self, line: String) {
+        if self.log_echo {
+            println!("{line}");
+        }
         self.console.push_str(&line);
         self.console.push('\n');
         self.unread_console.push_str(&line);
@@ -748,6 +801,10 @@ impl Client {
     /// Um evento de processo, thread ou imagem: o texto da parada se algum
     /// breakpoint de evento o pede.
     fn check_event(&mut self, symbol: &str) -> Option<String> {
+        // O ponto armado só pelos adiados ou pelos de processo: sem consultas.
+        if !self.breakpoints.iter().any(|breakpoint| breakpoint.enabled && breakpoint.kind == BreakpointKind::Event) {
+            return None;
+        }
         let read = |client: &mut Client, name: &str| client.register(name).unwrap_or(0);
         let (rdi, rsi, rdx, rcx, r8) = (read(self, "rdi"), read(self, "rsi"), read(self, "rdx"), read(self, "rcx"), read(self, "r8"));
         let processes = self.processes().unwrap_or_default();
@@ -1314,7 +1371,7 @@ impl Client {
 
     /// Grava ou tira um breakpoint; `process` (EPROCESS, 0 = o escolhido)
     /// dá a raiz de um endereço de usuário.
-    fn insert_in(&mut self, kind: BreakpointKind, address: u64, length: u64, insert: bool, process: u64) -> Result<(), String> {
+    pub(crate) fn insert_in(&mut self, kind: BreakpointKind, address: u64, length: u64, insert: bool, process: u64) -> Result<(), String> {
         // O breakpoint interno de carga divide o endereço com um do usuário.
         if kind == BreakpointKind::Software && (self.hook_at(address) || self.event_hooks.iter().any(|(hook, _, _)| *hook == address)) {
             return Ok(());
@@ -1389,24 +1446,57 @@ impl Client {
             self.update_load_hook()?;
             return Ok(breakpoint);
         }
-        let address = match self.evaluate(&request.expression) {
+        // O `/p` e o módulo do símbolo (o que a carga de imagem procura).
+        let filter = self.parse_process_filter(&request.scope)?;
+        let module = scoped::expression_module(&request.expression).unwrap_or_default();
+        let context = self.process_context.as_ref().map(|context| context.eprocess);
+        let other_process = match filter {
+            ProcessFilter::Process(eprocess) if context != Some(eprocess) => Some(eprocess),
+            _ => None,
+        };
+        let evaluated = if filter.makes_template() {
+            // Nome ou `*`: um modelo com uma instância por processo; num
+            // endereço de sistema, só o filtro no acerto.
+            match self.evaluate(&request.expression) {
+                Ok(address) if address >= USER_LIMIT => Ok(address),
+                _ => return self.add_template(request, filter, module),
+            }
+        } else if let Some(eprocess) = other_process {
+            // Outro processo: o módulo pelos módulos dele.
+            self.evaluate_in_process(&request.expression, &module, eprocess)
+        } else {
+            self.evaluate(&request.expression)
+        };
+        // O processo de um endereço de usuário: o do `/p`, o pedido ou o
+        // escolhido na sessão. Num endereço de sistema, só o `/p <pid>` (o
+        // filtro no acerto) ou o pedido.
+        let owner = |address: Option<u64>| match &filter {
+            ProcessFilter::Process(eprocess) => *eprocess,
+            _ if request.process != 0 => request.process,
+            _ if address.is_none_or(|address| address < USER_LIMIT) => context.unwrap_or(0),
+            _ => 0,
+        };
+        let address = match evaluated {
             Ok(address) => address,
             Err(error) if request.deferred && (error.contains("nao carregado") || error.contains("nao encontrado")) => {
-                let breakpoint = self.push_breakpoint(request, 0, true);
-                self.update_load_hook()?;
+                // Adiado: armado na carga da imagem, no processo dela (o
+                // `owner`, se houver) ou na primeira que carregar o módulo.
+                let process = owner(None);
+                let mut breakpoint = self.push_breakpoint(request, 0, true);
+                if let Some(entry) = self.breakpoints.iter_mut().find(|entry| entry.id == breakpoint.id) {
+                    entry.process = process;
+                }
+                breakpoint.process = process;
+                self.scopes.insert(breakpoint.id, Scope { filter, max_hits: request.max_hits, module, ..Scope::default() });
+                self.refresh_hooks()?;
                 return Ok(breakpoint);
             }
             Err(error) => return Err(error),
         };
         // O breakpoint de memória vale por página inteira.
-        let (address, length) = if kind.is_memory() {
-            let start = address & !0xFFF;
-            let end = (address + request.length.max(1) + 0xFFF) & !0xFFF;
-            (start, end - start)
-        } else {
-            (address, request.length)
-        };
-        if let Some(index) = self.breakpoints.iter().position(|breakpoint| breakpoint.kind == kind && breakpoint.address == address && !breakpoint.pending) {
+        let (address, length) = scoped::placement(kind, address, request.length);
+        let process = owner(Some(address));
+        if let Some(index) = self.breakpoints.iter().position(|breakpoint| breakpoint.kind == kind && breakpoint.address == address && !breakpoint.pending && (address >= USER_LIMIT || breakpoint.process == process)) {
             if !self.breakpoints[index].enabled && request.enabled {
                 let (length, process) = (self.breakpoints[index].length, self.breakpoints[index].process);
                 self.insert_in(kind, address, length, true, process)?;
@@ -1418,15 +1508,17 @@ impl Client {
             self.breakpoints[index].command = request.command.clone();
             self.breakpoints[index].group = request.group.clone();
             self.breakpoints[index].options = request.options.clone();
-            return Ok(self.breakpoints[index].clone());
+            let id = self.breakpoints[index].id;
+            let scope = self.scopes.entry(id).or_default();
+            scope.max_hits = request.max_hits;
+            scope.counted = 0;
+            if filter != ProcessFilter::Unset {
+                scope.filter = filter;
+            }
+            let copy = self.breakpoints[index].clone();
+            self.refresh_hooks()?;
+            return Ok(copy);
         }
-        let process = if request.process != 0 {
-            request.process
-        } else if address < 0x8000_0000_0000 {
-            self.process_context.as_ref().map_or(0, |context| context.eprocess)
-        } else {
-            0
-        };
         if request.enabled {
             self.insert_in(kind, address, length, true, process)?;
         }
@@ -1436,6 +1528,11 @@ impl Client {
             entry.length = length;
             breakpoint.process = process;
             breakpoint.length = length;
+        }
+        self.scopes.insert(breakpoint.id, Scope { filter, max_hits: request.max_hits, module, ..Scope::default() });
+        // Um breakpoint num processo precisa da saída dele.
+        if process != 0 {
+            self.refresh_hooks()?;
         }
         Ok(breakpoint)
     }
@@ -1459,7 +1556,7 @@ impl Client {
         Ok(self.breakpoints.iter().find(|breakpoint| breakpoint.id == id).cloned().unwrap_or(copy))
     }
 
-    fn push_breakpoint(&mut self, request: &BreakpointRequest, address: u64, pending: bool) -> Breakpoint {
+    pub(crate) fn push_breakpoint(&mut self, request: &BreakpointRequest, address: u64, pending: bool) -> Breakpoint {
         let breakpoint = Breakpoint {
             id: self.next_breakpoint,
             kind: request.kind,
@@ -1491,26 +1588,42 @@ impl Client {
         Ok(())
     }
 
-    /// Arma os breakpoints adiados cujo símbolo já existe.
+    /// Arma os breakpoints adiados cujo símbolo já existe nos drivers (a
+    /// notificação de carga do kernel). Um endereço de usuário fica para a
+    /// carga da imagem no processo certo (`breakpoints.rs`): os módulos de
+    /// usuário da sessão podem ser de outro processo.
     fn resolve_pending(&mut self) {
         for index in 0..self.breakpoints.len() {
             let breakpoint = self.breakpoints[index].clone();
-            if !breakpoint.pending {
+            if !breakpoint.pending || self.scopes.get(&breakpoint.id).is_some_and(|scope| scope.template) {
                 continue;
             }
             let Ok(address) = self.evaluate(&breakpoint.expression) else { continue };
-            if breakpoint.enabled && self.insert(breakpoint.kind, address, breakpoint.length, true).is_err() {
+            if address < USER_LIMIT {
+                continue;
+            }
+            let (address, length) = scoped::placement(breakpoint.kind, address, breakpoint.length);
+            if breakpoint.enabled && self.insert(breakpoint.kind, address, length, true).is_err() {
                 continue;
             }
             self.breakpoints[index].address = address;
+            self.breakpoints[index].length = length;
             self.breakpoints[index].pending = false;
+            // O processo escolhido na criação não filtra um driver; um
+            // `/p <pid>` filtra no acerto.
+            if !self.scopes.get(&breakpoint.id).is_some_and(|scope| matches!(scope.filter, ProcessFilter::Process(_))) {
+                self.breakpoints[index].process = 0;
+            }
         }
     }
 
     /// Liga ou tira o breakpoint interno da notificação de carga de imagem,
-    /// conforme haja paradas por carga de módulo ou breakpoints adiados.
-    fn update_load_hook(&mut self) -> Result<(), String> {
-        let needed = self.breakpoints.iter().any(|breakpoint| breakpoint.enabled && (breakpoint.kind == BreakpointKind::Module || breakpoint.pending));
+    /// conforme haja paradas por carga de módulo ou breakpoints adiados que
+    /// o ponto de evento de imagem não atende (sem ele, um kernel antigo,
+    /// todos os adiados).
+    pub(crate) fn update_load_hook(&mut self) -> Result<(), String> {
+        let image_hook = self.event_hooks.iter().any(|(_, symbol, _)| *symbol == IMAGE_EVENT);
+        let needed = self.breakpoints.iter().any(|breakpoint| breakpoint.enabled && (breakpoint.kind == BreakpointKind::Module || (breakpoint.pending && !image_hook && !self.user_only_pending(breakpoint))));
         match (needed, self.load_hook) {
             (true, None) => {
                 let address = LOAD_HOOKS.iter().find_map(|name| self.symbols.lookup(name).ok()).ok_or("o kernel nao tem a funcao de notificacao de carga de imagem (sem simbolos do kernel?)")?;
@@ -1535,33 +1648,50 @@ impl Client {
         Ok(())
     }
 
-    /// Tira um breakpoint do alvo e da lista.
+    /// Tira um breakpoint do alvo e da lista (um modelo leva as instâncias).
     pub fn remove_breakpoint(&mut self, id: u32) -> Result<Breakpoint, String> {
         self.require_stopped()?;
+        for instance in self.breakpoint_instances(id) {
+            self.remove_breakpoint(instance)?;
+        }
         let index = self.breakpoints.iter().position(|breakpoint| breakpoint.id == id).ok_or_else(|| format!("breakpoint {id} nao existe"))?;
         let breakpoint = self.breakpoints[index].clone();
         if breakpoint.enabled && !breakpoint.pending && !matches!(breakpoint.kind, BreakpointKind::Module | BreakpointKind::Event) {
-            self.insert_in(breakpoint.kind, breakpoint.address, breakpoint.length, false, breakpoint.process)?;
+            let result = self.insert_in(breakpoint.kind, breakpoint.address, breakpoint.length, false, breakpoint.process);
+            // Num processo que já saiu o stub não tem mais o byte: a remoção
+            // da lista segue.
+            if breakpoint.process == 0 || breakpoint.address >= USER_LIMIT {
+                result?;
+            }
         }
         self.breakpoints.remove(index);
-        self.update_load_hook()?;
-        self.update_event_hooks()?;
+        self.scopes.remove(&id);
+        self.refresh_hooks()?;
         Ok(breakpoint)
     }
 
-    /// Desliga (tira do alvo, fica na lista) ou religa.
+    /// Desliga (tira do alvo, fica na lista) ou religa. Um modelo leva as
+    /// instâncias; religado, ganha as dos processos que já têm o módulo.
     pub fn set_breakpoint_enabled(&mut self, id: u32, enabled: bool) -> Result<(), String> {
         self.require_stopped()?;
+        for instance in self.breakpoint_instances(id) {
+            self.set_breakpoint_enabled(instance, enabled)?;
+        }
         let index = self.breakpoints.iter().position(|breakpoint| breakpoint.id == id).ok_or_else(|| format!("breakpoint {id} nao existe"))?;
         let breakpoint = self.breakpoints[index].clone();
         if breakpoint.enabled != enabled {
             if !breakpoint.pending && !matches!(breakpoint.kind, BreakpointKind::Module | BreakpointKind::Event) {
-                self.insert_in(breakpoint.kind, breakpoint.address, breakpoint.length, enabled, breakpoint.process)?;
+                let result = self.insert_in(breakpoint.kind, breakpoint.address, breakpoint.length, enabled, breakpoint.process);
+                if enabled || breakpoint.process == 0 || breakpoint.address >= USER_LIMIT {
+                    result?;
+                }
             }
             self.breakpoints[index].enabled = enabled;
+            if enabled && self.scopes.get(&id).is_some_and(|scope| scope.template) {
+                self.instantiate_existing(id);
+            }
         }
-        self.update_load_hook()?;
-        self.update_event_hooks()
+        self.refresh_hooks()
     }
 
     /// Liga ou desliga todos os breakpoints de um grupo; devolve quantos.
@@ -1611,9 +1741,10 @@ impl Client {
     }
 
     /// Arma ou tira os breakpoints internos nos pontos de evento conforme os
-    /// breakpoints de evento ligados.
-    fn update_event_hooks(&mut self) -> Result<(), String> {
-        let wanted: Vec<&'static str> = [PROCESS_EVENT, THREAD_EVENT, IMAGE_EVENT]
+    /// breakpoints de evento ligados, os adiados (a carga de imagem) e os
+    /// armados num processo (a saída dele).
+    pub(crate) fn update_event_hooks(&mut self) -> Result<(), String> {
+        let explicit: Vec<&'static str> = [PROCESS_EVENT, THREAD_EVENT, IMAGE_EVENT]
             .into_iter()
             .filter(|symbol| {
                 let codes: &[&str] = match *symbol {
@@ -1624,6 +1755,13 @@ impl Client {
                 self.breakpoints.iter().any(|breakpoint| breakpoint.enabled && breakpoint.kind == BreakpointKind::Event && codes.iter().any(|code| breakpoint.expression.to_ascii_lowercase().starts_with(code)))
             })
             .collect();
+        let (image, process) = self.internal_event_needs();
+        let mut wanted = explicit.clone();
+        for (needed, symbol) in [(image, IMAGE_EVENT), (process, PROCESS_EVENT)] {
+            if needed && !wanted.contains(&symbol) {
+                wanted.push(symbol);
+            }
+        }
         let mut keep = Vec::new();
         for (address, symbol, inserted) in std::mem::take(&mut self.event_hooks) {
             if wanted.contains(&symbol) {
@@ -1637,7 +1775,13 @@ impl Client {
             if self.event_hooks.iter().any(|(_, existing, _)| *existing == symbol) {
                 continue;
             }
-            let address = self.symbols.lookup(symbol).map_err(|_| format!("o kernel nao tem o ponto de evento {symbol} (kernel antigo?)"))?;
+            // Sem o símbolo, um `sxe` falha; os adiados ficam com a
+            // notificação de carga e os de processo sem a limpeza na saída.
+            let address = match self.symbols.lookup(symbol) {
+                Ok(address) => address,
+                Err(_) if !explicit.contains(&symbol) => continue,
+                Err(_) => return Err(format!("o kernel nao tem o ponto de evento {symbol} (kernel antigo?)")),
+            };
             let user = self.breakpoints.iter().any(|breakpoint| breakpoint.enabled && breakpoint.kind == BreakpointKind::Software && breakpoint.address == address);
             if !user {
                 let reply = self.request(&format!("Z0,{address:x},1"))?;
@@ -1808,16 +1952,27 @@ impl Client {
     pub fn breakpoint_specs(&self) -> String {
         self.breakpoints
             .iter()
+            // As instâncias de um modelo voltam pelo modelo.
+            .filter(|breakpoint| self.scopes.get(&breakpoint.id).is_none_or(|scope| scope.parent.is_none()))
             .map(|breakpoint| {
                 let mut line = format!("{}\t{}\t{}\t{}\t{}\t{}", breakpoint.kind.key(), breakpoint.enabled as u8, breakpoint.length, breakpoint.pass_count, breakpoint.expression, breakpoint.condition);
                 let options = &breakpoint.options;
                 let flags: String = [(options.single_shot, 's'), (options.silent, 'q'), (options.fast_resume, 'f')].iter().filter(|(on, _)| *on).map(|(_, letter)| *letter).collect();
-                let extended = !options.name.is_empty() || !options.log_condition.is_empty() || !options.command_condition.is_empty() || !flags.is_empty();
+                // O `/p` por nome ou `*` e o limite de acertos (um EPROCESS
+                // não vale na sessão seguinte).
+                let scope = self.scopes.get(&breakpoint.id);
+                let process = scope.map(|scope| scope.filter.clone()).filter(|filter| filter.makes_template()).map(|filter| filter.text()).unwrap_or_default();
+                let max_hits = scope.map_or(0, |scope| scope.max_hits);
+                let scoped = !process.is_empty() || max_hits != 0;
+                let extended = scoped || !options.name.is_empty() || !options.log_condition.is_empty() || !options.command_condition.is_empty() || !flags.is_empty();
                 if extended || !breakpoint.log.is_empty() || !breakpoint.command.is_empty() || !breakpoint.group.is_empty() {
                     line.push_str(&format!("\t{}\t{}\t{}", breakpoint.log, breakpoint.command, breakpoint.group));
                 }
                 if extended {
                     line.push_str(&format!("\t{}\t{}\t{}\t{flags}", options.name, options.log_condition, options.command_condition));
+                }
+                if scoped {
+                    line.push_str(&format!("\t{process}\t{max_hits}"));
                 }
                 line.push('\n');
                 line
@@ -1850,6 +2005,8 @@ impl Client {
             request.options.single_shot = flags.contains('s');
             request.options.silent = flags.contains('q');
             request.options.fast_resume = flags.contains('f');
+            request.scope = fields.get(13).copied().unwrap_or("").to_string();
+            request.max_hits = fields.get(14).and_then(|text| text.parse().ok()).unwrap_or(0);
             request.deferred = true;
             if let Err(error) = self.add_breakpoint_with(&request) {
                 errors.push(format!("{}: {error}", request.expression));
@@ -1944,6 +2101,9 @@ impl Client {
         let reply = self.request("D")?;
         self.stopped = false;
         self.breakpoints.clear();
+        self.scopes.clear();
+        self.image_cache.clear();
+        self.process_names.clear();
         self.load_hook = None;
         self.event_hooks.clear();
         self.process_context = None;
