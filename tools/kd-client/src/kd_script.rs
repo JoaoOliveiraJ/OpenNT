@@ -53,6 +53,9 @@ pub struct ScriptOptions {
     /// A transcrição da sessão: tudo o que o roteiro imprime, gravado à
     /// medida que sai.
     pub transcript: Option<PathBuf>,
+    /// Para onde as linhas vão no lugar da saída padrão (uma janela, um
+    /// servidor MCP pelo stdio): cada linha impressa, com o fim de linha.
+    pub capture: Option<Arc<Mutex<String>>>,
 }
 
 /// As coleções do `for-each`.
@@ -512,6 +515,7 @@ struct Handler {
 struct Runner<'c> {
     client: &'c mut Client,
     name: String,
+    capture: Option<Arc<Mutex<String>>>,
     /// O texto de cada variável (as numéricas também ficam no cliente, para
     /// o `$nome` das expressões).
     variables: HashMap<String, String>,
@@ -536,7 +540,7 @@ impl<'c> Runner<'c> {
     fn new(client: &'c mut Client, options: &ScriptOptions) -> Self {
         let printed_logs = client.log_lines().len();
         let variables = client.variables.iter().map(|(name, value)| (name.clone(), format!("{value:#x}"))).collect();
-        let mut runner = Runner { client, name: options.name.clone(), variables, last_output: String::new(), last_command: None, handlers: Vec::new(), in_handler: None, detached: false, printed_logs, transcript: None, context: Vec::new() };
+        let mut runner = Runner { client, name: options.name.clone(), capture: options.capture.clone(), variables, last_output: String::new(), last_command: None, handlers: Vec::new(), in_handler: None, detached: false, printed_logs, transcript: None, context: Vec::new() };
         if let Some(path) = &options.transcript {
             match File::create(path) {
                 Ok(file) => {
@@ -549,9 +553,17 @@ impl<'c> Runner<'c> {
         runner
     }
 
-    /// Uma linha na saída padrão e na transcrição.
+    /// Uma linha na saída padrão (ou na captura) e na transcrição.
     fn emit(&mut self, line: &str) {
-        println!("{line}");
+        match &self.capture {
+            Some(capture) => {
+                if let Ok(mut text) = capture.lock() {
+                    text.push_str(line);
+                    text.push('\n');
+                }
+            }
+            None => println!("{line}"),
+        }
         self.note(line);
     }
 

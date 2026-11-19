@@ -5640,9 +5640,11 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   - Comandos de texto: `apimon`, `irptrace`, `reg`, `regv`, `objdir`,
     `fsls`, `fscat`, `dtv`, `snap` e `rstep`/`rcont`.
   - Roteiros do kd (`kd_script.rs`): a linguagem do `cargo xtask test-boot
-    --kd=com2 --script=ARQ` e do `cargo xtask debug --script=ARQ`. É outra
-    linguagem que a dos roteiros do `opennt-re` e do `opennt-mcp`
-    (`analysis/script.rs`). Uma linha por comando; `#` no começo da linha
+    --kd=com2 --script=ARQ`, do `cargo xtask debug --script=ARQ` e da aba
+    Script e do `--script` do `opennt-re` (o `ScriptOptions::capture` leva
+    a saída para a janela no lugar da saída padrão). A ferramenta `script`
+    do `opennt-mcp` ainda usa a linguagem antiga de `analysis/script.rs`.
+    Uma linha por comando; `#` no começo da linha
     comenta. Uma linha que não é da linguagem vai ao depurador como no
     prompt (`bp`, `continue`, `k`...), e a saída dela fica guardada para as
     conferências e os `save-*`. O roteiro inteiro é lido antes de rodar: um

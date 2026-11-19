@@ -472,7 +472,7 @@ repeat 3 volta {
 }
 expect-eq $ultima 2
 "#;
-    let options = ScriptOptions { name: "teste.txt".into(), transcript: Some(transcript.clone()) };
+    let options = ScriptOptions { name: "teste.txt".into(), transcript: Some(transcript.clone()), capture: None };
     let result = client.run_script_with(script, &options);
     let text = std::fs::read_to_string(&transcript).unwrap_or_default();
     let _ = std::fs::remove_file(&transcript);

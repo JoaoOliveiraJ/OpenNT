@@ -27,7 +27,7 @@ const USAGE: &str = "uso: opennt-re [opcoes] [opcoes do xtask]
   --build-dir=DIR        diretorio de build (padrao build): kernel.elf, serial.log, opennt-re/
   --headless-qemu        com --launch: o QEMU sem janela
   --root=DIR             raiz do repositorio (padrao: a deste checkout)
-  --script=ARQ           roteiro para rodar depois do attach (a linguagem da aba Script)
+  --script=ARQ           roteiro para rodar depois do attach (a linguagem dos roteiros do kd, a do test-boot)
   --screenshot-dir=DIR   sem janela: roda o cenario e grava as capturas kd-re-*.png em DIR
   --scenario=NOME        com --screenshot-dir: kernel (cpu, registradores, breakpoint, observacao, grafo, referencias), usuario (usuario, memoria),
                          ferramentas (api, irp, tipos, registro; com --start-driver=ntfs) ou voltar (snapshots; com --vm-snapshots)

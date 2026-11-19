@@ -204,9 +204,9 @@ fn debugs_csrss_and_the_kernel() {
     ok(scenario::search(&backend, SearchKind::StringReferences, SearchScope::Module(acpi), &log));
     assert_eq!(backend.shared().snapshot.references.as_ref().map(|view| view.cached), Some(1));
 
-    // Um roteiro.
+    // Um roteiro, na linguagem dos roteiros do kd (a do test-boot).
     let before = backend.shared().transcript.len();
-    backend.send(Request::RunScript("var n = 0\nwhile n < 2\n  n = n + 1\nend\nlog \"voltas {n}\"\n".into()));
+    backend.send(Request::RunScript("save n 0\nwhile $n < 2 {\n  save n $n+1\n}\nprint voltas {$n}\n".into()));
     wait(&backend, "o roteiro", Duration::from_secs(120), |shared| shared.transcript.len() > before && shared.activity.is_empty());
     {
         let shared = backend.shared();

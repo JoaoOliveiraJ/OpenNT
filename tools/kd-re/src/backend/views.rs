@@ -11,14 +11,15 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use kd_client::analysis::cfg::{self, EdgeKind, Layout};
 use kd_client::analysis::decode::{self, Flow, Insn};
 use kd_client::analysis::notes::{Location, Patch, Patches};
-use kd_client::analysis::{refs, script, search};
+use kd_client::analysis::{refs, search};
 use kd_client::client::Resumed;
+use kd_client::kd_script::ScriptOptions;
 use kd_client::unwind::Target as _;
 use kd_client::user::{self, Handle, UserThread};
 use kd_client::{Client, Symbols};
@@ -1037,22 +1038,19 @@ impl Worker {
         Ok(true)
     }
 
-    /// Roda um roteiro (`kd_client::analysis::script`) contra o alvo.
+    /// Roda um roteiro contra o alvo, na linguagem dos roteiros do kd
+    /// (`kd_client::kd_script`, a mesma do `--script` do test-boot e da
+    /// janela do opennt-dbg); a saída vai à transcrição.
     pub(super) fn run_script(&mut self, text: &str) -> Result<bool, String> {
-        let parsed = script::parse(text)?;
         let client = self.client.as_mut().ok_or("sem conexao com o alvo")?;
-        let mut host = ScriptHost { client, output: Vec::new() };
-        let result = script::run(&parsed, &mut host, 100_000);
-        let output = std::mem::take(&mut host.output);
-        let summary = match &result {
-            Ok(run) => format!("roteiro: {} comandos, {} passos", run.commands, run.steps),
-            Err(error) => format!("roteiro: {error}"),
-        };
-        let mut text = output.join("\n");
-        if !text.is_empty() {
-            text.push('\n');
+        let capture = Arc::new(Mutex::new(String::new()));
+        let options = ScriptOptions { capture: Some(Arc::clone(&capture)), ..ScriptOptions::default() };
+        let result = client.run_script_with(text, &options);
+        let mut text = capture.lock().map(|output| output.clone()).unwrap_or_default();
+        match &result {
+            Ok(()) => text.push_str("roteiro: fim"),
+            Err(error) => text.push_str(&format!("roteiro: {error}")),
         }
-        text.push_str(&summary);
         self.transcript("(roteiro)", if result.is_ok() { Ok(text) } else { Err(text) });
         if !self.client.as_ref().is_some_and(Client::is_stopped) {
             self.set_status(super::Status::Running);
@@ -1201,41 +1199,3 @@ fn info_box(client: &mut Client, address: u64, registers: &[RegisterRow]) -> Vec
     }
     lines
 }
-
-/// O anfitrião dos roteiros: comandos do depurador, expressões e a saída.
-/// `g`/`run` esperam a próxima parada (o roteiro segue com a máquina
-/// parada).
-struct ScriptHost<'a> {
-    client: &'a mut Client,
-    output: Vec<String>,
-}
-
-impl script::Host for ScriptHost<'_> {
-    fn execute(&mut self, command: &str) -> Result<String, String> {
-        let word = command.split_whitespace().next().unwrap_or("");
-        let output = match word {
-            "g" | "c" | "run" | "continue" => {
-                self.client.go()?;
-                self.client.wait_stop(Duration::from_secs(300))
-            }
-            _ => self.client.execute(command),
-        };
-        if let Ok(text) = &output {
-            if !text.trim().is_empty() {
-                self.output.push(format!("> {command}\n{}", text.trim_end()));
-            }
-        } else if let Err(error) = &output {
-            self.output.push(format!("> {command}\nerro: {error}"));
-        }
-        output
-    }
-
-    fn evaluate(&mut self, expression: &str) -> Result<u64, String> {
-        self.client.evaluate(expression)
-    }
-
-    fn output(&mut self, text: &str) {
-        self.output.push(text.to_string());
-    }
-}
-
