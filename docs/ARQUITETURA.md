@@ -5842,9 +5842,49 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     `call` ou, na linha do RIP, pelos registradores e pela pilha de
     verdade; o nome vem do destino ou da entrada da IAT (`__imp_`); as
     strings referenciadas por operandos relativos ao RIP.
-  - Referências cruzadas (X ou Ctrl+R): o índice do módulo
-    (`refs::xref_index` sobre a imagem), feito na primeira vez e guardado
-    até um patch; a janela lista origem, local, tipo e instrução.
+  - Nomes nos operandos (`disasm::disassemble_named`, um `SymbolResolver`
+    do iced): o destino das chamadas e dos saltos para fora da função, os
+    operandos relativos ao RIP e os imediatos que caem num módulo aparecem
+    pelo símbolo (`call ntdll!NtClose`, `mov rax, qword ptr
+    [win32kbase!gpsi]`), ou `módulo+0xRVA` sem símbolo; um slot da IAT
+    aparece como o PDB o chamaria (`winlogon!__imp_NtClose`), pelos
+    imports do PE (`imports.rs`: diretório 1 e o de carga adiada, 13). Os
+    saltos dentro da função ficam com o endereço. Vale na CPU, no grafo,
+    nas buscas e nas referências cruzadas.
+  - Comentários do opennt-re (`annotations.rs`, depois dos do `kd-mcp`):
+    o import de cada `call`/`jmp [__imp_X]` e de cada trampolim, com o
+    destino real do slot quando difere (a DLL de um API set, o
+    `__imp_load_` de uma carga adiada pendente); o destino de um ponteiro
+    de função global; o alvo das chamadas pelo CFG
+    (`__guard_dispatch_icall_fptr`: o RAX montado antes, ou o de verdade
+    na linha do RIP); os nomes de NTSTATUS e HRESULT nos imediatos de 32
+    bits a partir de 0x40000000 e os erros do Win32 passados a
+    `SetLastError` ou comparados depois de `GetLastError`; os campos dos
+    tipos do PDB nos operandos de memória: `gs:` é a `_KPCR` no código do
+    kernel da Microsoft e a `_TEB` no modo usuário, e um campo ponteiro
+    lido passa o tipo ao registrador (`_KTHREAD` vira `_ETHREAD`,
+    `_KPROCESS` vira `_EPROCESS`, `_NT_TIB` vira `_TEB`). O menu "Tipos do
+    PDB" dá um tipo a um registrador a partir da linha (`rcx _EPROCESS`,
+    `rbx win32kbase!tagWND`) e abre o operando de memória na aba Tipos.
+  - Códigos de erro (`codes.rs`): os nomes saem do `ntstatus.h` e do
+    `winerror.h` do SDK do Windows desta máquina (a versão mais nova em
+    `Windows Kits\10\Include`, ou `OPENNT_SDK_INCLUDE`), com
+    `HRESULT_FROM_WIN32` e `HRESULT_FROM_NT` montados; o texto sai das
+    tabelas de mensagens do `ntdll.dll` e do `KernelBase.dll` (o `.mui`
+    do idioma). Aparecem nos imediatos, na caixa de informação (o
+    imediato e os registradores lidos) e no LastError/LastStatus da TEB.
+  - Referências cruzadas (X ou Ctrl+R, `analysis.rs`): a análise do módulo
+    inteiro numa thread, em lotes de 1024 funções da `.pdata` (os pedaços
+    encadeados, UNW_FLAG_CHAININFO ou o bit 0 do UnwindData, ficam na
+    função dona); sem `.pdata` (o `kernel.elf`), em faixas de 256 KB das
+    seções de código. Cada lote guarda as referências ordenadas pelo
+    destino (16 bytes cada): chamada e salto diretos, chamada e salto pela
+    IAT, memória, `lea`, imediato no módulo e, no último lote, os
+    ponteiros dos dados pela `.reloc` (vtables, tabelas de despacho). A
+    janela responde com os lotes prontos e se refaz sozinha a cada décimo
+    do total; mostra também a função do endereço (com o número de
+    pedaços) e o que sai dela. A análise vale até um patch no módulo;
+    ficam guardadas até seis.
   - Destaque (H, `highlight.rs`): o texto da instrução em pedaços; um clique
     num registrador ou operando marca as ocorrências na janela, com as
     partes do registrador (`eax` marca `rax`) e o número em qualquer
@@ -5930,8 +5970,11 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     muda, e os breakpoints guardados são armados quando o módulo aparece.
   - Testes de unidade (`cargo test -p kd-re --release`): o destaque, os
     formatos do Dump, o modelo do editor de breakpoints, as colunas dos
-    operandos, os formatos dos XMM e as preferências e o banco por módulo
-    (ida e volta pelo disco).
+    operandos, os formatos dos XMM, as preferências e o banco por módulo
+    (ida e volta pelo disco), os imports e os trampolins, os
+    `#define` do SDK e as tabelas de mensagens, a análise do módulo (os
+    pedaços encadeados, a `.reloc`, os lotes) e os caminhos dos campos
+    dos tipos.
   - Fumaça das ferramentas (`tests/smoke_tools.rs`, `--ignored`): com
     `--start-driver=ntfs`, o monitor e o rastreador ligados no começo do
     boot, o IoCreateDevice do ntfs.sys com STATUS_SUCCESS, um
