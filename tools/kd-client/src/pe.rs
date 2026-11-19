@@ -147,6 +147,11 @@ impl PeImage {
     pub fn exports(&self) -> Vec<(u32, String)> {
         let mut exports = Vec::new();
         let Some((rva, size)) = self.directory(0) else { return exports };
+        // Sem diretório de exports (RVA 0, um driver como o pci.sys): o
+        // offset 0 é o cabeçalho, e os bytes dele virariam nomes.
+        if rva == 0 || size == 0 {
+            return exports;
+        }
         let Some(directory) = self.offset(rva) else { return exports };
         let (Some(names), Some(functions), Some(name_table), Some(ordinals)) = (
             u32_at(&self.bytes, directory + 24),
@@ -301,6 +306,20 @@ pub mod tests {
         assert_eq!(find_function(&functions, 0x0FFF), None);
         assert_eq!(image.bytes_at(0x2018, 6), Some(&[0x01, 0x04, 0x01, 0x00, 0x04, 0x42][..]));
         assert_eq!(image.exports(), vec![(0x1010, "Funcao".to_string())]);
+    }
+
+    #[test]
+    fn image_without_export_directory_has_no_exports() {
+        let mut bytes = tiny_pe(&[], &[], false);
+        // Um diretório lido no offset 0 acharia aqui um nome ("RichD").
+        bytes[24..28].copy_from_slice(&1u32.to_le_bytes());
+        bytes[28..32].copy_from_slice(&0x200u32.to_le_bytes());
+        bytes[32..36].copy_from_slice(&0x204u32.to_le_bytes());
+        bytes[36..40].copy_from_slice(&0x208u32.to_le_bytes());
+        bytes[0x200..0x204].copy_from_slice(&0x1010u32.to_le_bytes());
+        bytes[0x204..0x208].copy_from_slice(&0x210u32.to_le_bytes());
+        bytes[0x210..0x216].copy_from_slice(b"RichD\0");
+        assert!(PeImage::parse(bytes).unwrap().exports().is_empty());
     }
 
     #[test]

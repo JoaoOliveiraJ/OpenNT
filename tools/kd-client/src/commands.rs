@@ -66,7 +66,9 @@
 //! texto), `expect-stop <texto>` (a última parada), `expect-console
 //! <texto>` (a saída do DbgPrint recebida), `expect-eq <expr> <expr>`,
 //! `save <nome> <expr>` (vira `$nome`), `save-word <nome> <texto> <coluna> [ocorrência]`
-//! (um número da saída anterior), `wait-serial <texto>` (o texto no log da
+//! (um número da saída anterior), `save-thread <nome> <texto> <coluna> <módulo>`
+//! (a primeira thread dessas linhas com um quadro do módulo na pilha),
+//! `wait-serial <texto>` (o texto no log da
 //! COM1), `echo <texto>` e `sleep <ms>`.
 
 use std::time::{Duration, Instant};
@@ -1060,6 +1062,29 @@ impl Client {
                         None => 1,
                     };
                     let value = last_output.lines().filter(|line| line.contains(needle)).nth(occurrence - 1).and_then(|line| line.split_whitespace().nth(column)).and_then(parse_number).ok_or_else(|| fail(format!("nenhuma linha {occurrence} com {needle:?} e numero na coluna {column}")))?;
+                    self.variables.insert(name.to_string(), value);
+                    println!("[kd-script]   ${name} = {value:#x}");
+                }
+                "save-thread" => {
+                    // save-thread <nome> <texto da linha> <coluna> <módulo>: das
+                    // linhas da saída anterior com o texto (o ETHREAD na
+                    // coluna), a primeira thread cuja pilha tem um quadro no
+                    // módulo; não depende da ordem da lista.
+                    let mut parts = rest.split_whitespace();
+                    let (Some(name), Some(needle), Some(column), Some(module)) = (parts.next(), parts.next(), parts.next().and_then(|text| text.parse::<usize>().ok()), parts.next()) else {
+                        return Err(fail("uso: save-thread <nome> <texto> <coluna> <modulo>".into()));
+                    };
+                    let candidates: Vec<u64> = last_output.lines().filter(|line| line.contains(needle)).filter_map(|line| line.split_whitespace().nth(column)).filter_map(parse_number).collect();
+                    let mut chosen = None;
+                    for thread in candidates {
+                        let Ok((_, frames)) = self.thread_backtrace(thread, 32) else { continue };
+                        let in_module = frames.iter().any(|frame| self.symbols.module_at(frame.address).is_some_and(|found| found.name.eq_ignore_ascii_case(module) || found.file_name.eq_ignore_ascii_case(module)));
+                        if in_module {
+                            chosen = Some(thread);
+                            break;
+                        }
+                    }
+                    let value = chosen.ok_or_else(|| fail(format!("nenhuma thread das linhas com {needle:?} tem quadro no modulo {module}")))?;
                     self.variables.insert(name.to_string(), value);
                     println!("[kd-script]   ${name} = {value:#x}");
                 }

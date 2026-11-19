@@ -59,12 +59,12 @@ threads
 save-word worker Waiting 2
 btt $worker
 expect kernel::ntos::io::work_items::worker_thread
-# Uma thread de kernel bloqueada (a quinta parada da lista é uma thread de
-# sistema do acpi.sys real, criada na árvore de dispositivos, esperando os
-# eventos dela): registradores e pilha pelo quadro de troca da pilha de
-# kernel dela, até o código do driver.
+# Uma thread de kernel bloqueada: a primeira parada da lista com um quadro
+# do acpi.sys real na pilha (uma thread de sistema dele, criada na árvore de
+# dispositivos, esperando os eventos dela). Registradores e pilha pelo
+# quadro de troca da pilha de kernel dela, até o código do driver.
 threads
-save-word esperando Waiting 2 5
+save-thread esperando Waiting 2 ACPI
 context $esperando
 expect quadro de troca
 btt $esperando

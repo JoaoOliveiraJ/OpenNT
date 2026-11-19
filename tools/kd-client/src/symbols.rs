@@ -24,7 +24,7 @@ use std::sync::Arc;
 use super::demangle::demangle;
 use super::elf::{Elf, SHF_ALLOC};
 use super::pdb::{self, SymbolStore};
-use super::pe::PeImage;
+use super::pe::{find_function, PeImage};
 use super::unwind::FunctionTable;
 
 #[derive(Clone, Debug)]
@@ -329,13 +329,32 @@ impl Symbols {
         (!text.starts_with("0x") && !text.starts_with(&format!("{}+0x", module.name))).then_some(text)
     }
 
-    /// `módulo!símbolo+0x10`, `símbolo+0x10` (kernel) ou `módulo+0xRVA`.
+    /// `símbolo` cobre `address`: pelo tamanho, quando conhecido. Sem tamanho
+    /// (os exports de um módulo sem PDB), o endereço tem de cair na função da
+    /// `.pdata` em que o símbolo começa; num módulo com PDB, ou sem função na
+    /// `.pdata` para o endereço, vale o símbolo mais próximo antes dele.
+    fn covers(module: &Module, symbol: &Symbol, address: u64) -> bool {
+        if symbol.size != 0 {
+            return address < symbol.address + symbol.size;
+        }
+        if module.pdb.is_some() {
+            return true;
+        }
+        let (Some(table), Ok(rva)) = (&module.unwind, u32::try_from(address - module.base)) else { return true };
+        match find_function(&table.functions, rva) {
+            Some(function) => (function.begin as u64..function.end as u64).contains(&(symbol.address - module.base)),
+            None => true,
+        }
+    }
+
+    /// `módulo!símbolo+0x10`, `símbolo+0x10` (kernel) ou `módulo+0xRVA`
+    /// quando nenhum símbolo cobre o endereço.
     pub fn describe(&self, address: u64) -> String {
         let Some(module) = self.module_at(address) else { return format!("{address:#x}") };
         let index = module.symbols.partition_point(|symbol| symbol.address <= address);
         // O último símbolo de função que contém o endereço (ou o mais próximo
-        // antes dele, sem tamanho conhecido).
-        let found = module.symbols[..index].iter().rev().take(64).find(|symbol| symbol.function && (symbol.size == 0 || address < symbol.address + symbol.size)).or_else(|| module.symbols[..index].last().filter(|symbol| symbol.size == 0 || address < symbol.address + symbol.size));
+        // antes dele, sem tamanho conhecido, na mesma função da .pdata).
+        let found = module.symbols[..index].iter().rev().take(64).find(|symbol| symbol.function && Self::covers(module, symbol, address)).or_else(|| module.symbols[..index].last().filter(|symbol| Self::covers(module, symbol, address)));
         let prefix = self.prefix(module);
         match found {
             Some(symbol) if address == symbol.address => format!("{prefix}{}", symbol.name),
@@ -540,6 +559,23 @@ mod tests {
         symbols.set_modules(&[], Path::new("."));
         assert_eq!(symbols.generation, generation + 1);
         assert_eq!(symbols.modules.len(), 1);
+    }
+
+    #[test]
+    fn exports_cover_only_their_pdata_function() {
+        use super::super::pe::RuntimeFunction;
+        let base = 0xfffff800_43000000;
+        let mut module = Module::new(r"\SystemRoot\System32\drivers\pci.sys", r"\SystemRoot\System32\drivers\pci.sys", base, base + 0x20000, vec![symbol(base + 0x1000, 0, "PciExport")], "teste");
+        let functions = vec![RuntimeFunction { begin: 0x1000, end: 0x1040, unwind: 0 }, RuntimeFunction { begin: 0xf800, end: 0xf900, unwind: 0 }];
+        module.unwind = Some(Arc::new(FunctionTable { base, functions, image: None }));
+        let mut symbols = Symbols::default();
+        symbols.add_module(module);
+        assert_eq!(symbols.describe(base + 0x1010), "pci!PciExport+0x10");
+        // Numa função da .pdata sem export: módulo+RVA.
+        assert_eq!(symbols.describe(base + 0xf88e), "pci+0xf88e");
+        assert_eq!(symbols.describe_return(base + 0xf88e), "pci+0xf88e");
+        // Sem função na .pdata para o endereço: o export mais próximo.
+        assert_eq!(symbols.describe(base + 0x2000), "pci!PciExport+0x1000");
     }
 
     #[test]
