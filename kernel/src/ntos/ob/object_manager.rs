@@ -453,6 +453,15 @@ pub fn resolve_open_with(path: &str, case_insensitive: bool, open_symbolic_link:
     resolve_inner(path, 0, start, Lookup { case_insensitive, open_symbolic_link, fallback: Fallback::Shadow { from_user_mode }, ignore_impersonation })
 }
 
+/// O destino de um nó SymbolicLink (o do objeto nativo, quando há um).
+pub fn link_target(node: NodeId) -> Option<String> {
+    let found = self::node(node).filter(|node| node.type_name == "SymbolicLink")?;
+    if found.native_namespace != 0 {
+        return namespace_objects::target(found.native_namespace).ok();
+    }
+    found.data.and_then(|data| data.symlink_target)
+}
+
 /// A busca de abertura do kernel por um nome absoluto, sem distinção de
 /// caixa ([`resolve_lookup_from`] da raiz).
 pub fn resolve(path: &str) -> (Option<NodeId>, Option<String>) {

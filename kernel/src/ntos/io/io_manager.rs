@@ -910,8 +910,15 @@ fn release_create(security: CreateSecurity) {
 /// O dispositivo e o resto do nome de um caminho de abertura: o prefixo mais
 /// longo que resolve (com os links do namespace) para um objeto Device, e o
 /// que sobra, com a barra inicial (um caminho que termina na barra abre a
-/// raiz do sistema de arquivos do dispositivo: o resto é `\`).
+/// raiz do sistema de arquivos do dispositivo: o resto é `\`). Um link cujo
+/// destino passa do dispositivo (\GLOBAL??\CONOUT$ -> \Device\ConDrv\CurrentOut)
+/// leva o resto do destino antes do resto do nome, como o RemainingName que
+/// o ObpLookupObjectName entrega ao IopParseDevice depois do reparse.
 pub fn split_device_path(path: &str) -> Option<(String, String)> {
+    split_device_path_at(path, 0)
+}
+
+fn split_device_path_at(path: &str, depth: u32) -> Option<(String, String)> {
     let parts: Vec<&str> = path.split('\\').filter(|part| !part.is_empty()).collect();
     for count in (1..=parts.len()).rev() {
         let prefix = alloc::format!("\\{}", parts[..count].join("\\"));
@@ -922,6 +929,23 @@ pub fn split_device_path(path: &str) -> Option<(String, String)> {
             rest.push('\\');
         }
         return Some((device, rest));
+    }
+    // Nenhum prefixo resolve inteiro para um Device: o prefixo mais longo
+    // que é um link simbólico (aberto como link) dá o destino, e o destino
+    // seguido do resto do nome é dividido de novo.
+    if depth + 1 >= crate::ntos::io::reparse::MAXIMUM_REPARSE {
+        return None;
+    }
+    for count in (1..=parts.len()).rev() {
+        let prefix = alloc::format!("\\{}", parts[..count].join("\\"));
+        let (Some(node), None) = object_manager::resolve_lookup_from(&prefix, true, true, object_manager::ROOT) else { continue };
+        let Some(target) = object_manager::link_target(node) else { continue };
+        let mut joined = target;
+        joined.extend(parts[count..].iter().map(|part| alloc::format!("\\{part}")));
+        if count == parts.len() && path.ends_with('\\') {
+            joined.push('\\');
+        }
+        return split_device_path_at(&joined, depth + 1);
     }
     None
 }

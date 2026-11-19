@@ -154,12 +154,15 @@ fn namespace() -> Result<(), crate::rtl::KernelError> {
     object_manager::create_symlink("\\DosDevices", "\\??")?;
     object_manager::create_symlink("\\GLOBAL??\\GLOBALROOT", "\\")?;
     object_manager::create_symlink("\\GLOBAL??\\Global", "\\GLOBAL??")?;
-    // Os dispositivos DOS dos file systems de pipes e mailslots, com os
-    // nomes e destinos do `DOS Devices` do Session Manager. No boot do
-    // processo inicial real quem os cria é o smss, a partir do Registro.
+    // Os dispositivos DOS do `DOS Devices` do Session Manager (CON, CONIN$,
+    // CONOUT$, NUL, PIPE, MAILSLOT...). No boot do processo inicial real quem
+    // os cria é o smss, a partir do Registro (SmpInitializeDosDevices); o
+    // condrv, o ntoskrnl e o kernelbase não criam nenhum, e o "CONOUT$" de
+    // um CreateFile vira \??\CONOUT$ (RtlpIsDosDeviceName_Ustr da ntdll).
     if !crate::ntos::init::boot_config::smss_boot() {
-        object_manager::create_symlink("\\GLOBAL??\\PIPE", "\\Device\\NamedPipe")?;
-        object_manager::create_symlink("\\GLOBAL??\\MAILSLOT", "\\Device\\MailSlot")?;
+        for &(name, target) in crate::ntos::cm::session_manager::DOS_DEVICES {
+            object_manager::create_symlink(&alloc::format!("\\GLOBAL??\\{name}"), target)?;
+        }
     }
     object_manager::create_directory("\\KernelObjects")?;
     crate::ntos::mm::partition::init()?;

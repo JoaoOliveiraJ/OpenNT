@@ -114,8 +114,10 @@ const KNOWN_DLLS: &[(&str, &str)] = &[
     ("WS2_32", "WS2_32.dll"),
 ];
 
-/// `DOS Devices`: os links que o smss cria no diretório global.
-const DOS_DEVICES: &[(&str, &str)] = &[
+/// `DOS Devices`: os links que o smss cria no diretório global
+/// (SmpInitializeDosDevices 0xba80, um link permanente por valor, 0xbb7c);
+/// sem o smss, a fase 0 cria os mesmos.
+pub const DOS_DEVICES: &[(&str, &str)] = &[
     ("AUX", "\\DosDevices\\COM1"),
     ("CON", "\\Device\\ConDrv\\Console"),
     ("CONIN$", "\\Device\\ConDrv\\CurrentIn"),

@@ -344,6 +344,30 @@ fn namespace(assert: Assert) {
     let fs = om::lookup("\\FS");
     assert(fs.is_some() && om::lookup("\\??\\C:") == fs && om::lookup("\\DosDevices\\C:") == fs && om::lookup("\\GLOBAL??\\GLOBALROOT\\FS") == fs, "ob: links DOS e GLOBALROOT");
     assert(om::lookup("\\device") == om::lookup("\\Device") && om::lookup("\\Device").is_some(), "ob: resolucao sem caixa");
+    // Sem o smss, os links do `DOS Devices` do Session Manager no \GLOBAL??
+    // (o CONOUT$ do `echo x>CONOUT$` do cmd.exe vai ao \Device\ConDrv).
+    if !crate::ntos::init::boot_config::smss_boot() {
+        let target_of = |name: &str| {
+            let (node, _) = om::resolve_from(&alloc::format!("\\GLOBAL??\\{name}"), 0, true, true, om::ROOT);
+            node.and_then(om::node).filter(|node| node.type_name == "SymbolicLink").and_then(|node| node.data.and_then(|data| data.symlink_target))
+        };
+        let all = crate::ntos::cm::session_manager::DOS_DEVICES.iter().all(|&(name, target)| target_of(name).as_deref() == Some(target));
+        assert(
+            all && target_of("CONOUT$").as_deref() == Some("\\Device\\ConDrv\\CurrentOut") && target_of("conin$").as_deref() == Some("\\Device\\ConDrv\\CurrentIn") && target_of("CON").as_deref() == Some("\\Device\\ConDrv\\Console"),
+            "ob: links do DOS Devices no \\GLOBAL?? sem o smss (CON, CONIN$, CONOUT$, NUL, PIPE...)",
+        );
+    }
+    // Um link cujo destino passa de um dispositivo (o \GLOBAL??\CONOUT$ ->
+    // \Device\ConDrv\CurrentOut): o dispositivo e o resto do destino antes
+    // do resto do nome, como o RemainingName que o ObpLookupObjectName dá ao
+    // IopParseDevice depois do reparse.
+    {
+        let device = om::create_object("\\Device", "OpenNtLinkDev", "Device", None).is_ok();
+        let link = om::create_symlink("\\GLOBAL??\\OPENNTLINKDEV", "\\Device\\OpenNtLinkDev\\Dentro").is_ok();
+        let split = crate::ntos::io::io_manager::split_device_path("\\GLOBAL??\\OPENNTLINKDEV\\Mais");
+        let expected = Some((alloc::string::String::from("\\Device\\OpenNtLinkDev"), alloc::string::String::from("\\Dentro\\Mais")));
+        assert(device && link && split == expected, "io: link para dentro de um dispositivo leva o resto do destino antes do resto do nome");
+    }
     // ObpCreateDosDevicesDirectory: \GLOBAL??\Global volta ao \GLOBAL??.
     assert(om::lookup("\\GLOBAL??\\Global\\GLOBALROOT\\FS") == fs && om::lookup("\\GLOBAL??\\Global") == om::lookup("\\GLOBAL??"), "ob: link Global do \\GLOBAL??");
     // ObpInitializeRootNamespace: um objeto Type por tipo em \ObjectTypes,
