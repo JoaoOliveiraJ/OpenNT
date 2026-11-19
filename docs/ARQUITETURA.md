@@ -2951,8 +2951,11 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   Cada endereço sai como módulo+deslocamento pela PsLoadedModuleList (que
   também traz as imagens de sessão) e com o export mais próximo. O bloco não
   aloca, não espera trava e só lê páginas presentes da metade de sistema
-  mapeadas com cache, então serve em qualquer IRQL; a exceção de kernel que
-  não chega ao despacho (`*** EXCECAO DE KERNEL`) ganha os mesmos quadros.
+  mapeadas com cache, então serve em qualquer IRQL; uma página das imagens
+  de sessão que a raiz corrente não mapeia sai pela raiz de um processo da
+  sessão. A linha `(fim: ...)` diz onde e por que a pilha acabou. A exceção
+  de kernel que não chega ao despacho (`*** EXCECAO DE KERNEL`) ganha os
+  mesmos quadros.
   O autoteste `ntos/test/kernel_crash_trace.rs` (fase 6) confere a descrição
   de um trampolim de export, a decodificação das chamadas, a cadeia de RBP e
   as recusas do leitor.
@@ -5384,15 +5387,32 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     sem a variável, uma vez por PDB); os que chegam depois entram na parada
     seguinte. `.reload /f` pede todos os que faltam e tenta de novo os que
     falharam; `.reload /w` espera a fila.
-  - Pilha (`unwind.rs`): o contexto (RIP, RSP e os registradores
-    conhecidos) passa de quadro em quadro. Nos binários da Microsoft, o
-    desenrolar virtual do x64 pela `.pdata` e pelo UNWIND_INFO (push,
-    alocação, registrador de quadro, registradores salvos, quadro de
-    máquina, informação encadeada; epílogo reconhecido no quadro de cima;
-    função folha). A tabela vem do arquivo desta máquina ou da memória do
-    alvo. No código do OpenNT, os frame pointers (e o prólogo no quadro de
-    cima). Um driver chamado pelo kernel e o kernel chamado pelo driver
-    desenrolam um sobre o outro. O `gu` sai pelo quadro de cima do mesmo
+  - Pilha (`unwind.rs`, `stack.rs`): o contexto (RIP, RSP e os
+    registradores conhecidos) passa de quadro em quadro. Nos binários da
+    Microsoft, o desenrolar virtual do x64 como o RtlVirtualUnwind do 19041,
+    pela `.pdata` (com as entradas indiretas) e pelo UNWIND_INFO: push,
+    alocação, registrador de quadro, registradores salvos por MOV relativos
+    ao establisher frame, quadro de máquina e informação encadeada; no
+    quadro de cima, só os códigos do prólogo já executados, e o epílogo
+    reconhecido pelas instruções (`add rsp`/`lea rsp`, `pop`s, `ret` ou um
+    `jmp` de chamada em cauda); função folha. A tabela vem do arquivo desta
+    máquina ou da memória do alvo. No código do OpenNT, os frame pointers (e
+    o prólogo no quadro de cima). Um driver chamado pelo kernel e o kernel
+    chamado pelo driver desenrolam um sobre o outro; os voláteis, e os
+    salvos do código sem `.pdata`, ficam desconhecidos no chamador. As
+    passagens dos trampolins do OpenNT saem dos símbolos do `kernel.elf`,
+    com o `call rel32` conferido no código: a entrada de syscall (o papel do
+    KTRAP_FRAME) passa para a pilha do anel 3 pelos registradores que ela
+    empilhou e pelo RSP do CONTEXT do intervalo da thread (ou do
+    KPCR.UserRsp do processador dela), lida no espaço do processo da
+    thread; o trampolim dos exports passa para o código nativo que chamou o
+    export pelo CONTEXT que ele salvou; `opennt_kernel_thread_start` e
+    `opennt_kernel_thread_return` são o começo da pilha. `bt`, `k`, `btt` e
+    `ustack` marcam cada passagem e terminam com a linha de onde e por que o
+    desenrolar parou (`Stop`: fim da pilha, limite, memória ilegível,
+    UNWIND_INFO inválido, registrador desconhecido, cadeia de RBP, um
+    retorno do kernel para o anel 3 sem passagem); `kernel` no fim deles
+    para na entrada de syscall. O `gu` sai pelo quadro de cima do mesmo
     desenrolar.
   - Tipos (`tpi.rs`, `types.rs`): o TPI do `build/symbols/ntkrnlmp.pdb` (o
     mesmo leitor do `cargo xtask nt-types`, que agora o usa daqui) ou, sem
