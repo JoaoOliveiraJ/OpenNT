@@ -1,9 +1,9 @@
 //! Leitor dos tipos de um PDB para o `nt-types`: o TPI e o container MSF
-//! são os do cliente do depurador (`kd_client::tpi`, `kd_client::msf`);
+//! são os do cliente do depurador (`opennt_kd::tpi`, `opennt_kd::msf`);
 //! aqui fica só o PE em disco (o RSDS e, nos testes, o código de um export).
 
-pub use kd_client::pe::guid_text;
-pub use kd_client::tpi::*;
+pub use opennt_kd::pe::guid_text;
+pub use opennt_kd::tpi::*;
 
 fn u16_at(data: &[u8], at: usize) -> Result<u16, String> {
     data.get(at..at + 2).map(|b| u16::from_le_bytes([b[0], b[1]])).ok_or_else(|| format!("PDB truncado em {at:#x}"))

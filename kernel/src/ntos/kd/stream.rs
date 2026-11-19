@@ -21,7 +21,7 @@
 //!
 //! O conteúdo do `O` começa com o marcador `\0OSTR` e a versão; um GDB
 //! comum mostraria bytes estranhos, por isso a entrega assíncrona só liga a
-//! pedido. O formato dos registros é o de `tools/kd-client/src/stream.rs`:
+//! pedido. O formato dos registros é o de `tools/opennt-kd/src/stream.rs`:
 //!
 //! ```text
 //! cabeçalho: tamanho u16 | tipo u8 | CPU u8 | flags u32 | sequência u64 | hora u64 (100 ns)

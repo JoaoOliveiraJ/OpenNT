@@ -1,6 +1,6 @@
 //! Consultas do OpenNT sobre objetos cujo estado vive nas coleções do
 //! kernel, sem layout do NT na memória (`monitor obtypes`, `token`, `iocp`,
-//! `waitpkt`, `alpc`). O cliente (`tools/kd-client`, `nt_objects.rs`) lê
+//! `waitpkt`, `alpc`). O cliente (`tools/opennt-kd`, `nt_objects.rs`) lê
 //! pelos tipos do PDB o que está na memória (EPROCESS, ETHREAD, OBJECT_HEADER,
 //! HANDLE_TABLE, WNF) e pede aqui o resto:
 //!

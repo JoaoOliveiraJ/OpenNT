@@ -77,7 +77,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 // O leitor de ELF é o do cliente do depurador (símbolos e linhas).
-use kd_client::elf;
+use opennt_kd::elf;
 use std::time::Duration;
 
 use build::BuildOptions;
@@ -500,7 +500,7 @@ fn script_session(arguments: &Arguments, options: &BuildOptions, machine: &Machi
     let text = std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
     let elf = debug::kernel_elf(images);
     let address = format!("127.0.0.1:{port}");
-    let script_options = kd_client::kd_script::ScriptOptions { name: script.clone(), transcript: Some(debug::transcript_path(log)), capture: None };
+    let script_options = opennt_kd::kd_script::ScriptOptions { name: script.clone(), transcript: Some(debug::transcript_path(log)), capture: None };
     Ok(Some(Box::new(move |serial| debug::run_script(&address, &root, &elf, &text, Some(serial), &script_options))))
 }
 
@@ -515,7 +515,7 @@ fn debug_command(arguments: Arguments) -> Result<(), String> {
         return match &arguments.script {
             Some(script) => {
                 let text = std::fs::read_to_string(script).map_err(|error| format!("{script}: {error}"))?;
-                let script_options = kd_client::kd_script::ScriptOptions { name: script.clone(), transcript: Some(debug::transcript_path(&build_dir.join("serial.log"))), capture: None };
+                let script_options = opennt_kd::kd_script::ScriptOptions { name: script.clone(), transcript: Some(debug::transcript_path(&build_dir.join("serial.log"))), capture: None };
                 debug::run_script(address, &root, &elf, &text, None, &script_options)
             }
             None => debug::interactive(address, &root, &elf, arguments.machine.monitor_port.map(|port| format!("127.0.0.1:{port}")), None),

@@ -1,0 +1,36 @@
+[package]
+name = "opennt-re"
+description = "opennt-re: o depurador de engenharia reversa do OpenNT (kernel e processos de usuario)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "opennt-re"
+path = "src/main.rs"
+
+# Dependências só deste crate: nada aqui entra no build do kernel (alvo
+# x86_64-unknown-none, sem dependências) nem do `xtask` (só o `opennt-kd`).
+[dependencies]
+opennt-kd = { path = "../opennt-kd" }
+# A desmontagem, as anotações e o servidor MCP (a janela pode hospedar o
+# mesmo ponto de acesso, numa porta local).
+opennt-mcp = { path = "../opennt-mcp" }
+# Interface: egui pelo eframe com o backend OpenGL (glow), sem wgpu, sem
+# acessibilidade e sem fontes do sistema (as fontes embutidas do egui).
+eframe = { version = "0.36.2", default-features = false, features = ["default_fonts", "glow"] }
+# Os painéis encaixáveis; o arranjo vai para o arquivo de estado pelo serde.
+egui_dock = { version = "0.21.1", features = ["serde"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+# Desmontagem x86-64 com a sintaxe MASM e o codificador (o montador da
+# janela CPU monta instruções pelas tabelas de opcodes do iced).
+iced-x86 = { version = "1.22.0", default-features = false, features = ["std", "decoder", "encoder", "op_code_info", "masm", "instr_info"] }
+# Linhas de código do kernel pelo DWARF do kernel.elf (sem o carregador de
+# arquivos: as seções vêm do leitor de ELF do opennt-kd).
+addr2line = { version = "0.27.1", default-features = false, features = ["std"] }
+# O filtro com expressão regular da aba Referências.
+regex = { version = "1.11", default-features = false, features = ["std", "unicode-case", "unicode-perl"] }
+# O PNG da captura (já vem com o eframe, para os ícones).
+image = { version = "0.25.10", default-features = false, features = ["png"] }

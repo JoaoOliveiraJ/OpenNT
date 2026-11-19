@@ -139,7 +139,7 @@ do kernel, no QEMU.
 | `kernel/src/drivers/` | VGA, console, teclado PS/2, barramentos, disco ATA e sistemas de arquivos (`drivers/fs/`: RAMFS e NTFS) |
 | `kernel/src/shell/`, `kernel/src/apps/` | Shell e programas de exemplo |
 | `xtask/` | Build, PE32+ do kernel, `os.img`, QEMU, `test-boot`, `test-all`, `capturas`, `status`, `debug` |
-| `tools/` | Ferramentas de desenvolvimento: `kd-client` (o cliente do depurador do kernel), `kd-gui` (o depurador gráfico `opennt-dbg`), `kd-re` (o depurador de engenharia reversa `opennt-re`) e `kd-mcp` (o servidor MCP `opennt-mcp`, para agentes de IA) |
+| `tools/` | Ferramentas de desenvolvimento: `opennt-kd` (o cliente do depurador do kernel), `opennt-dbg` (o depurador gráfico `opennt-dbg`), `opennt-re` (o depurador de engenharia reversa `opennt-re`) e `opennt-mcp` (o servidor MCP `opennt-mcp`, para agentes de IA) |
 | `docs/` | Roadmap, arquitetura e o site de status |
 
 A árvore completa, as regras de dependência de cada componente e as convenções
@@ -207,26 +207,26 @@ cargo xtask test-boot KD_EXPORTS_OK 600000 --kd=com2 --script=xtask/scripts/kd.t
 
 # O depurador gráfico (opennt-dbg): o mesmo build e QEMU do cargo xtask debug,
 # numa janela no estilo do WinDbg. Opções do xtask passam adiante (--accel=whpx).
-cargo run -p kd-gui --release -- --launch
-cargo run -p kd-gui --release -- --connect=127.0.0.1:1234
+cargo run -p opennt-dbg --release -- --launch
+cargo run -p opennt-dbg --release -- --connect=127.0.0.1:1234
 # Testes do cliente e o teste de fumaça do depurador gráfico (abre o QEMU).
-cargo test -p kd-client
-cargo test -p kd-gui --release -- --ignored --nocapture
+cargo test -p opennt-kd
+cargo test -p opennt-dbg --release -- --ignored --nocapture
 
 # O depurador de engenharia reversa (opennt-re): kernel e processos de usuário.
 # Com --initial-process=smss o csrss.exe real roda e pode ser depurado.
-cargo run -p kd-re --release -- --launch --initial-process=smss --smp=1
-cargo test -p kd-re --release -- --ignored --nocapture
+cargo run -p opennt-re --release -- --launch --initial-process=smss --smp=1
+cargo test -p opennt-re --release -- --ignored --nocapture
 # Snapshots da máquina (discos em overlays qcow2) e gravação/reprodução do
 # QEMU com os passos para trás (só TCG; veja os limites abaixo).
-cargo run -p kd-re --release -- --launch --vm-snapshots
+cargo run -p opennt-re --release -- --launch --vm-snapshots
 cargo xtask debug --record=build/gravacao.bin --smp=1
 cargo xtask debug --replay=build/gravacao.bin
 
 # O servidor MCP (opennt-mcp) para agentes de IA: stdio ou HTTP local.
-cargo build -p kd-mcp --release
-cargo test -p kd-mcp
-cargo test -p kd-mcp --release -- --ignored --nocapture
+cargo build -p opennt-mcp --release
+cargo test -p opennt-mcp
+cargo test -p opennt-mcp --release -- --ignored --nocapture
 
 # O site de status (docs/site), os selos e o roadmap; as capturas de tela
 # do fim de cada [[teste]] (docs/site/capturas/<id>.png).
@@ -309,8 +309,8 @@ Comandos do shell: `help`, `version`, `clear`, `echo`, `mem`, `ls`, `cat`,
 
 O OpenNT tem o próprio depurador de kernel. Com `--kd=com2` o kernel atende o
 protocolo remoto do GDB na COM2, com consultas próprias. Há dois clientes com
-o mesmo código (`tools/kd-client`): o prompt de texto `cargo xtask debug` e o
-depurador gráfico `opennt-dbg` (`cargo run -p kd-gui --release -- --launch`).
+o mesmo código (`tools/opennt-kd`): o prompt de texto `cargo xtask debug` e o
+depurador gráfico `opennt-dbg` (`cargo run -p opennt-dbg --release -- --launch`).
 
 - Pilha correta através dos drivers da Microsoft: desenrolar pela `.pdata`
   deles e pelos frame pointers do OpenNT, com os nomes dos PDBs públicos
@@ -347,7 +347,7 @@ depurador gráfico `opennt-dbg` (`cargo run -p kd-gui --release -- --launch`).
 
 ### Depurador de engenharia reversa (opennt-re)
 
-O `opennt-re` (`tools/kd-re`) usa o mesmo cliente e o mesmo depurador do
+O `opennt-re` (`tools/opennt-re`) usa o mesmo cliente e o mesmo depurador do
 kernel, com o layout dos depuradores de engenharia reversa: abas no alto e a
 aba CPU com quatro painéis. Serve ao kernel e aos processos de usuário que
 rodam no OpenNT (csrss.exe, smss.exe, wininit.exe).
@@ -481,7 +481,7 @@ rodam no OpenNT (csrss.exe, smss.exe, wininit.exe).
 
 ### Servidor MCP (opennt-mcp)
 
-O `opennt-mcp` (`tools/kd-mcp`) deixa um agente de IA dirigir o depurador
+O `opennt-mcp` (`tools/opennt-mcp`) deixa um agente de IA dirigir o depurador
 pelo Model Context Protocol (JSON-RPC 2.0). Usa o mesmo cliente do
 `cargo xtask debug` e do opennt-re.
 

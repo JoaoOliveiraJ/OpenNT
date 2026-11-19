@@ -5,7 +5,7 @@
 //! ```
 //!
 //! Sem o arquivo, lê `DIR/serial.log` (DIR = `build`). O relatório
-//! (`kd_client::crash`): a última parada do log com o código, o sentido dos
+//! (`opennt_kd::crash`): a última parada do log com o código, o sentido dos
 //! parâmetros no 19041, onde parou (módulo+deslocamento), o módulo culpado
 //! e o componente provável; a pilha do bloco `[kcrash]` com os nomes dos
 //! PDBs públicos (e do `DIR/kernel.elf` para o kernel do OpenNT); o WdLog
@@ -21,7 +21,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use kd_client::crash::{Analysis, LogSymbolizer, ModuleSymbols, NoSymbols, Options};
+use opennt_kd::crash::{Analysis, LogSymbolizer, ModuleSymbols, NoSymbols, Options};
 
 const USAGE: &str = "uso: cargo xtask crash [--build-dir=DIR] [--all] [--sem-simbolos] [--sem-download] [SERIAL.LOG]
   resume a ultima parada do log (*** STOP ou *** EXCECAO DE KERNEL): o codigo e o sentido dos

@@ -9,4 +9,4 @@ publish = false
 [dependencies]
 # O cliente do depurador do kernel (só a biblioteca padrão), compartilhado
 # com o opennt-dbg.
-kd-client = { path = "../tools/kd-client" }
+opennt-kd = { path = "../tools/opennt-kd" }

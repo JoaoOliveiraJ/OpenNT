@@ -225,7 +225,7 @@ fn parse_options(arguments: &[String]) -> Result<Options, String> {
 /// Baixa o PDB do servidor público de símbolos (`<nome>/<GUID><idade>/<nome>`),
 /// pelo mesmo código do cache de símbolos do depurador.
 /// O PDB do nt_types.toml no cache de símbolos: o arquivo de `arquivo` ou,
-/// quando o depurador (o cache do kd-client) já baixou ali na forma do
+/// quando o depurador (o cache do opennt-kd) já baixou ali na forma do
 /// servidor (`ntkrnlmp.pdb/<GUID><idade>/ntkrnlmp.pdb`), o arquivo dentro
 /// da pasta.
 fn pdb_location(root: &Path, config: &Config) -> PathBuf {
@@ -238,7 +238,7 @@ fn pdb_location(root: &Path, config: &Config) -> PathBuf {
 
 fn download(config: &Config, destination: &Path) -> Result<(), String> {
     eprintln!("baixando {} ({}{:X}) de {}", config.pdb_name, config.pdb_guid, config.pdb_age, config.symbol_server);
-    kd_client::pdb::download(&config.symbol_server, &config.pdb_name, &config.pdb_guid, config.pdb_age, destination).map_err(|error| format!("{error} (instale o curl ou passe --pdb=ARQ)"))
+    opennt_kd::pdb::download(&config.symbol_server, &config.pdb_name, &config.pdb_guid, config.pdb_age, destination).map_err(|error| format!("{error} (instale o curl ou passe --pdb=ARQ)"))
 }
 
 /// Avisa (sem falhar) quando o ntoskrnl.exe desta máquina cita outro PDB.

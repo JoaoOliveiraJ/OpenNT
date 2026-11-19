@@ -12,10 +12,10 @@ exporta; a HAL, os drivers e a inicialização ficam separados, como no NT.
 | `boot` | setor de boot e stage2 em `global_asm!` (modo real → protegido → 64 bits) |
 | `kernel` | binário `no_std` ligado na VA de sistema 0xFFFFF800_40001000 por `kernel/link.ld` (código PIC, executável estático) e empacotado pelo `xtask` como PE32+ de base fixa 0xFFFFF800_40000000 |
 | `xtask` | build, PE do kernel, imagem de disco, volume NTFS, QEMU, `test-boot`, `test-all`, `capturas`, `status` e o cliente de texto do depurador do kernel (`debug`) |
-| `tools/kd-client` | o cliente do depurador do kernel, só com a biblioteca padrão: protocolo remoto do GDB, símbolos (`kernel.elf`, exports dos PEs, PDBs públicos com cache e download), pilha pela `.pdata` e pelos frame pointers, tipos do PDB do ntoskrnl, expressões, breakpoints, rastro de instruções e os comandos de texto; usado pelo `xtask` e pelo `kd-gui` |
-| `tools/kd-gui` | `opennt-dbg`, o depurador gráfico (egui/eframe, painéis do `egui_dock`, desmontagem do iced-x86, linhas e variáveis do DWARF pelo `addr2line`/`gimli`); as dependências dele não entram no build do kernel nem do `xtask` |
-| `tools/kd-re` | `opennt-re`, o depurador de engenharia reversa (layout no estilo dos depuradores de engenharia reversa) para o kernel e os processos de usuário, sobre o mesmo cliente; as dependências dele também ficam fora do kernel e do `xtask` |
-| `tools/kd-mcp` | `opennt-mcp`, o servidor do Model Context Protocol para agentes de IA (JSON-RPC 2.0 por stdio ou HTTP local), sobre o mesmo cliente; também a desmontagem e a análise automática que o `opennt-re` usa |
+| `tools/opennt-kd` | o cliente do depurador do kernel, só com a biblioteca padrão: protocolo remoto do GDB, símbolos (`kernel.elf`, exports dos PEs, PDBs públicos com cache e download), pilha pela `.pdata` e pelos frame pointers, tipos do PDB do ntoskrnl, expressões, breakpoints, rastro de instruções e os comandos de texto; usado pelo `xtask` e pelo `opennt-dbg` |
+| `tools/opennt-dbg` | `opennt-dbg`, o depurador gráfico (egui/eframe, painéis do `egui_dock`, desmontagem do iced-x86, linhas e variáveis do DWARF pelo `addr2line`/`gimli`); as dependências dele não entram no build do kernel nem do `xtask` |
+| `tools/opennt-re` | `opennt-re`, o depurador de engenharia reversa (layout no estilo dos depuradores de engenharia reversa) para o kernel e os processos de usuário, sobre o mesmo cliente; as dependências dele também ficam fora do kernel e do `xtask` |
+| `tools/opennt-mcp` | `opennt-mcp`, o servidor do Model Context Protocol para agentes de IA (JSON-RPC 2.0 por stdio ou HTTP local), sobre o mesmo cliente; também a desmontagem e a análise automática que o `opennt-re` usa |
 
 ## 2. Árvore do kernel
 
@@ -2759,7 +2759,7 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     `iretq`/`sysret`/`hlt`/`int` ou com o buffer cheio (`trace resume`
     continua). O host lê o buffer por `qOpenNTTrace:offset,tamanho`. Os
     outros processadores ficam congelados e as interrupções mascaradas, como
-    no passo comum. O formato é o de `tools/kd-client/src/trace.rs`.
+    no passo comum. O formato é o de `tools/opennt-kd/src/trace.rs`.
   - Paradas (`kd/stop.rs`), pelos trampolins (`hal/amd64/irqstubs.rs`):
     `int 3` e #DB do anel 0 antes do SEH (o KiDebugRoutine); o tique do
     relógio no anel 0 consulta o LSR (o 0x03 do host, ou o começo de um
@@ -3028,7 +3028,7 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   O autoteste `ntos/test/kernel_crash_trace.rs` (fase 6) confere a descrição
   de um trampolim de export, a decodificação das chamadas, a cadeia de RBP e
   as recusas do leitor. A análise sai do próprio log, sem o alvo
-  (`tools/kd-client/src/crash`, `cargo xtask crash [SERIAL.LOG]`): o código
+  (`tools/opennt-kd/src/crash`, `cargo xtask crash [SERIAL.LOG]`): o código
   e o sentido dos parâmetros no 19041, onde parou, o módulo culpado (o do
   ponto de partida, ou o primeiro quadro fora do kernel e da HAL), o
   componente provável e a pilha do `[kcrash]` com os públicos dos PDBs e,
@@ -5417,7 +5417,7 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   sessão 0x3e7 decifra) ou sem nada (CROSS_PROCESS). O ProcessCookie
   (`ps/query_process::process_cookie`) é o mesmo EPROCESS.Cookie nos dois
   modos.
-- **Depurador do kernel, cliente** (`tools/kd-client`): só a biblioteca
+- **Depurador do kernel, cliente** (`tools/opennt-kd`): só a biblioteca
   padrão. O prompt do `cargo xtask debug` (`xtask/src/debug`) e o
   depurador gráfico usam o mesmo código.
   - Modos do `cargo xtask debug`: sem opções, compila com `--kd=com2`, abre
@@ -5731,12 +5731,12 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     - Outros: `echo <texto>`, `print <texto com {expr}>` (o formato do
       `/log`), `exit` (termina sem erro) e `fail <texto>` (termina com
       erro).
-  - Testes (`cargo test -p kd-client`): pacotes, resposta de parada,
+  - Testes (`cargo test -p opennt-kd`): pacotes, resposta de parada,
     registradores, PE e `.pdata`, UNWIND_INFO e o desenrolar misto sobre uma
     pilha montada, públicos de PDB, tipos sobre um TPI montado, expressões,
     bugcheck, o formato do rastro, a árvore de chamadas e a comparação. Contra
     um alvo de mentira num socket local (`tests/fake_target.rs`, o stub em
-    `tests/support/fake_stub.rs`, também usado pelos testes do `kd-mcp`): a
+    `tests/support/fake_stub.rs`, também usado pelos testes do `opennt-mcp`): a
     sessão inteira com breakpoints, passo por cima numa recursão,
     breakpoint condicional com contagem, a parada por carga de módulo, os
     registradores estendidos, as opções de breakpoint (condição de log, uma
@@ -5755,8 +5755,8 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     os laços pelas linhas, processos e threads, a espera pela COM1 com prazo
     e as mensagens de erro com o comando anterior, a saída e a volta do
     laço.
-- **Depurador gráfico** (`tools/kd-gui`, binário `opennt-dbg`).
-  - Uso: `cargo run -p kd-gui --release -- --launch` roda o mesmo build e
+- **Depurador gráfico** (`tools/opennt-dbg`, binário `opennt-dbg`).
+  - Uso: `cargo run -p opennt-dbg --release -- --launch` roda o mesmo build e
     QEMU do `cargo xtask debug --launch` e abre a janela (as outras
     `--opções` vão ao `xtask`: `--initial-process=smss --display=basic`);
     `--connect=HOST:PORTA` entra num QEMU aberto e aceita só a porta ou a
@@ -5866,7 +5866,7 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   - O backend (`backend.rs`) fala com o alvo numa thread e publica um
     snapshot por parada; a janela nunca espera o socket. `scenario.rs` tem
     os roteiros sem janela do teste e das capturas.
-  - Teste de fumaça (`cargo test -p kd-gui --release -- --ignored`,
+  - Teste de fumaça (`cargo test -p opennt-dbg --release -- --ignored`,
     `tests/smoke.rs`), sem janela: abre o OpenNT com o QEMU sem tela, anexa
     no começo do boot, para na carga do ACPI.sys real (`sxe ld`), para
     dentro dele no retorno de uma chamada ao IoCreateDevice e confere a
@@ -5886,8 +5886,8 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     parado no retorno do IoCreateDevice),
     `docs/screenshots/kd-gui-rastro.png` o `trace` e
     `docs/screenshots/kd-gui-bugcheck.png` o `bugcheck`.
-- **Depurador de engenharia reversa** (`tools/kd-re`, binário `opennt-re`).
-  - Uso: `cargo run -p kd-re --release -- --launch` (com
+- **Depurador de engenharia reversa** (`tools/opennt-re`, binário `opennt-re`).
+  - Uso: `cargo run -p opennt-re --release -- --launch` (com
     `--initial-process=smss` o csrss.exe real roda); `--connect=HOST:PORTA`;
     `--script=ARQ` roda um roteiro depois do attach.
   - Layout no estilo dos depuradores de engenharia reversa: abas no alto
@@ -5905,7 +5905,7 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     segmentos, Dump 1-5 (hexadecimal com ASCII ou UTF-16, word, dword,
     qword, endereço, float, double; um byte editado vira patch) e pilha com
     os endereços de retorno nomeados.
-  - Análise automática (`kd_mcp::annotate`, a mesma da ferramenta
+  - Análise automática (`opennt_mcp::annotate`, a mesma da ferramenta
     `disassemble` do servidor MCP): os colchetes das funções na margem
     (`.pdata`, símbolo com tamanho ou o fluxo de código) e dos laços (até
     três níveis), do cache por função; os comentários automáticos das
@@ -5922,7 +5922,7 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     imports do PE (`imports.rs`: diretório 1 e o de carga adiada, 13). Os
     saltos dentro da função ficam com o endereço. Vale na CPU, no grafo,
     nas buscas e nas referências cruzadas.
-  - Comentários do opennt-re (`annotations.rs`, depois dos do `kd-mcp`):
+  - Comentários do opennt-re (`annotations.rs`, depois dos do `opennt-mcp`):
     o import de cada `call`/`jmp [__imp_X]` e de cada trampolim, com o
     destino real do slot quando difere (a DLL de um API set, o
     `__imp_load_` de uma carga adiada pendente); o destino de um ponteiro
@@ -5990,7 +5990,7 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     vermelho; gravar a região num arquivo, página a página).
   - Servidor MCP na janela (menu Arquivo, `backend/mcp.rs`): uma thread
     atende HTTP em 127.0.0.1 e manda cada mensagem ao backend
-    (`Request::Mcp`); o `kd_mcp::Server` roda com a sessão da janela como
+    (`Request::Mcp`); o `opennt_mcp::Server` roda com a sessão da janela como
     `Engine`, e a janela relê a parada depois de cada ferramenta.
   - Backend (`backend.rs`, `backend/views.rs`): além do snapshot do
     `opennt-dbg`, monta o processo escolhido, os Dumps, a pilha, a caixa de
@@ -5999,7 +5999,7 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     `__C_specific_handler`), o grafo, as buscas, o mapa de memória, os
     handles, as threads de usuário, os símbolos e imports de um módulo, os
     patches e os roteiros.
-  - Imagens para as buscas (`kd_client::image`, reexportado em `scan.rs`): o PE desta máquina (cabeçalhos e
+  - Imagens para as buscas (`opennt_kd::image`, reexportado em `scan.rs`): o PE desta máquina (cabeçalhos e
     seções nas RVAs) ou o `kernel.elf`; só o que não tem arquivo é lido do
     alvo. Os patches da sessão são aplicados por cima, e o cache de
     resultados por módulo vale até o próximo patch.
@@ -6010,7 +6010,7 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     `<build>/opennt-re/notas.txt` (módulo + RVA), notas livres em
     `anotacoes.txt`; breakpoints em `breakpoints.txt`; o arranjo, o tema,
     o histórico e o roteiro em `%APPDATA%/opennt-re/estado.json`.
-  - Teste de fumaça (`cargo test -p kd-re --release -- --ignored`,
+  - Teste de fumaça (`cargo test -p opennt-re --release -- --ignored`,
     `tests/smoke.rs`), sem janela, com `--initial-process=smss --smp=1`: para
     na carga do basesrv.dll no csrss.exe real (o evento de imagem), confere
     o contexto (PEB, módulos da PEB.Ldr com os símbolos da ntdll), para num
@@ -6100,7 +6100,7 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     índice de símbolos; as listas grandes (Símbolos, Referências, o console)
     só são refiltradas quando a lista ou o filtro mudam; as comparações
     para gravar notas, preferências e estado rodam uma vez por segundo.
-  - Testes de unidade (`cargo test -p kd-re --release`): o destaque, os
+  - Testes de unidade (`cargo test -p opennt-re --release`): o destaque, os
     formatos do Dump, o modelo do editor de breakpoints, as colunas dos
     operandos, os formatos dos XMM, as preferências e o banco por módulo
     (ida e volta pelo disco), os imports e os trampolins, os
@@ -6112,7 +6112,7 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     versão e a janela desenhada fora da tela com as janelas novas;
     os registros de exceção (violação de acesso, exceções guardadas do
     WinRT, `__fastfail`, C++, encadeados, as entradas conhecidas), o texto
-    dos eventos do kd-client, a regra de casamento dos breakpoints de
+    dos eventos do opennt-kd, a regra de casamento dos breakpoints de
     evento, os planos de seguir e o arquivo deles.
   - Fumaça das ferramentas (`tests/smoke_tools.rs`, `--ignored`): com
     `--start-driver=ntfs`, o monitor e o rastreador ligados no começo do
@@ -6129,7 +6129,7 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     `--scenario=ferramentas` grava `kd-re-api.png`, `kd-re-irp.png`,
     `kd-re-tipos.png` e `kd-re-registro.png`; `--scenario=voltar` grava
     `kd-re-voltar.png`.
-- **Servidor MCP** (`tools/kd-mcp`, binário `opennt-mcp`).
+- **Servidor MCP** (`tools/opennt-mcp`, binário `opennt-mcp`).
   - Uso: `opennt-mcp` (stdio: uma mensagem JSON-RPC por linha na entrada,
     as respostas na saída, o log na saída de erro) ou
     `opennt-mcp --http=PORTA` (`POST http://127.0.0.1:PORTA/mcp`);
@@ -6203,7 +6203,7 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     falhas agrupadas por padrão, as etiquetas e as últimas linhas, `grep`
     e `since_offset`), `crash_analyze` (o `!analyze` da parada e as quedas
     do log) e `wdlog` (a presença do despejo; a decodificação dos anéis é
-    da análise do `kd-client`). As de log funcionam sem sessão com
+    da análise do `opennt-kd`). As de log funcionam sem sessão com
     `path`.
   - Anotações (`tools_notes.rs`): `annotations_list` e `annotation_set`
     leem e gravam o `notas.txt` da sessão do opennt-re
@@ -6213,16 +6213,16 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   - Recursos: `opennt://serial-log`, `opennt://dbgprint`,
     `opennt://breakpoints` e `opennt://modules`.
   - Sessão (`engine.rs`): o trait `Engine` dá o cliente, o `launch`
-    (`kd_client::launcher`), o `connect`, o log da COM1, o monitor do QEMU e
+    (`opennt_kd::launcher`), o `connect`, o log da COM1, o monitor do QEMU e
     o cache das imagens com os índices de referências cruzadas.
     `Standalone` é o do binário; a janela do opennt-re implementa o mesmo
     trait.
   - `screenshot` (`screenshot.rs`): `screendump` do monitor HMP do QEMU
     aberto pelo `launch`, em PNG; sem PNG no QEMU, PPM convertido para PNG
     no crate.
-  - Testes (`cargo test -p kd-mcp`): o protocolo (negociação, a lista de
+  - Testes (`cargo test -p opennt-mcp`): o protocolo (negociação, a lista de
     ferramentas com esquemas válidos, os erros, lotes), as ferramentas
-    contra o alvo de mentira do `kd-client` (registradores estendidos,
+    contra o alvo de mentira do `opennt-kd` (registradores estendidos,
     memória, desmontagem com o comentário da chamada ao IoCreateDevice,
     breakpoint de uma vez só, parada, pilha, símbolos, recursos, as
     ferramentas novas: o monitor com a chamada ao IoCreateDevice, o IRP de
@@ -6235,7 +6235,7 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     o ponto de evento) e o
     binário em stdio; testes de unidade do decodificador de códigos, do
     resumo e da espera no log, dos nomes de processo e das trocas dos
-    roteiros. Ponta a ponta (`cargo test -p kd-mcp --release --
+    roteiros. Ponta a ponta (`cargo test -p opennt-mcp --release --
     --ignored`, `tests/e2e.rs`): o binário em stdio abre o OpenNT pelo
     `launch`, para, lê os registradores, arma um breakpoint em
     `kernel::ntos::ke::run_kernel_tasks`, continua até ele, confere a

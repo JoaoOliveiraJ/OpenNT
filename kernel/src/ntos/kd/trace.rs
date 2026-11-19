@@ -12,7 +12,7 @@
 //! todo e as interrupções ficam mascaradas durante cada passo, como no `s`.
 //!
 //! O formato (cabeçalho de 32 bytes e os registros) é o de
-//! `tools/kd-client/src/trace.rs`:
+//! `tools/opennt-kd/src/trace.rs`:
 //!
 //! ```text
 //! cabeçalho: "OTRC" | versão u8 | CPU u8 | motivo u8 | flags u8 |

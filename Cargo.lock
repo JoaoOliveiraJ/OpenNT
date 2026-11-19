@@ -1026,49 +1026,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kd-client"
-version = "0.6.0"
-
-[[package]]
-name = "kd-gui"
-version = "0.6.0"
-dependencies = [
- "addr2line",
- "eframe",
- "egui_dock",
- "iced-x86",
- "image",
- "kd-client",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "kd-mcp"
-version = "0.6.0"
-dependencies = [
- "iced-x86",
- "kd-client",
- "serde_json",
-]
-
-[[package]]
-name = "kd-re"
-version = "0.6.0"
-dependencies = [
- "addr2line",
- "eframe",
- "egui_dock",
- "iced-x86",
- "image",
- "kd-client",
- "kd-mcp",
- "regex",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "kernel"
 version = "0.6.0"
 
@@ -1564,6 +1521,49 @@ name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
+
+[[package]]
+name = "opennt-dbg"
+version = "0.6.0"
+dependencies = [
+ "addr2line",
+ "eframe",
+ "egui_dock",
+ "iced-x86",
+ "image",
+ "opennt-kd",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "opennt-kd"
+version = "0.6.0"
+
+[[package]]
+name = "opennt-mcp"
+version = "0.6.0"
+dependencies = [
+ "iced-x86",
+ "opennt-kd",
+ "serde_json",
+]
+
+[[package]]
+name = "opennt-re"
+version = "0.6.0"
+dependencies = [
+ "addr2line",
+ "eframe",
+ "egui_dock",
+ "iced-x86",
+ "image",
+ "opennt-kd",
+ "opennt-mcp",
+ "regex",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "orbclient"
@@ -2692,7 +2692,7 @@ checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
 name = "xtask"
 version = "0.6.0"
 dependencies = [
- "kd-client",
+ "opennt-kd",
 ]
 
 [[package]]

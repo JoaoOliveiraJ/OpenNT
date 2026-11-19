@@ -20,7 +20,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use kd_client::Symbols;
+use opennt_kd::Symbols;
 
 const USAGE: &str = "uso: cargo xtask heap-census [--build-dir=DIR] [--all] [SERIAL.LOG]";
 

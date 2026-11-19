@@ -20,11 +20,11 @@
 //!   tela e marcadores na COM1, com o roteiro rodando contra a COM2 em
 //!   paralelo; o roteiro falhando derruba o teste. Com `--connect`, o
 //!   roteiro roda contra um QEMU já aberto. A linguagem dos roteiros é a
-//!   de `kd_client::kd_script`; a transcrição da sessão fica em
+//!   de `opennt_kd::kd_script`; a transcrição da sessão fica em
 //!   `kd-sessao.log`, ao lado do `serial.log`.
 //!
 //! O protocolo, os símbolos (`<build>/kernel.elf` e os PEs desta máquina),
-//! a pilha e os comandos são do crate `kd-client` (`tools/kd-client`), o
+//! a pilha e os comandos são do crate `opennt-kd` (`tools/opennt-kd`), o
 //! mesmo do depurador gráfico.
 
 use std::io::BufRead;
@@ -34,9 +34,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use kd_client::kd_script::ScriptOptions;
-use kd_client::rsp::Connection;
-use kd_client::Client;
+use opennt_kd::kd_script::ScriptOptions;
+use opennt_kd::rsp::Connection;
+use opennt_kd::Client;
 
 /// Abre a sessão: conecta e negocia.
 fn open(address: &str, root: &Path, elf: &Path, deadline: Instant) -> Result<Client, String> {
@@ -76,7 +76,7 @@ pub fn interactive(address: &str, root: &Path, elf: &Path, monitor: Option<Strin
     let mut client = open(address, root, elf, Instant::now() + Duration::from_secs(60))?;
     client.set_qemu_monitor(monitor);
     if let Some(recording) = &replay {
-        let modules = std::fs::read_to_string(kd_client::monitoring::modules_file(recording)).map(|text| kd_client::monitoring::parse_modules(&text)).unwrap_or_default();
+        let modules = std::fs::read_to_string(opennt_kd::monitoring::modules_file(recording)).map(|text| opennt_kd::monitoring::parse_modules(&text)).unwrap_or_default();
         client.set_replay(modules);
         println!("reproducao de {} (rstep e rcont andam para tras)", recording.display());
     }
@@ -144,8 +144,8 @@ pub fn interactive(address: &str, root: &Path, elf: &Path, monitor: Option<Strin
 /// módulos de agora vão para `ARQ.modulos`.
 fn save_recording_modules(client: &Client) {
     if let Some(recording) = std::env::var_os("OPENNT_KD_RECORDING") {
-        let path = kd_client::monitoring::modules_file(Path::new(&recording));
-        let _ = std::fs::write(path, kd_client::monitoring::modules_text(&client.module_list()));
+        let path = opennt_kd::monitoring::modules_file(Path::new(&recording));
+        let _ = std::fs::write(path, opennt_kd::monitoring::modules_text(&client.module_list()));
     }
 }
 
@@ -187,7 +187,7 @@ pub fn serve(mut qemu: Child, address: &str, monitor: Option<&str>) -> Result<()
 /// válida quando o QEMU sai sozinho e fecha o arquivo), depois à força.
 pub fn stop_qemu(qemu: &mut Child, monitor: Option<&str>) {
     if let Some(monitor) = monitor {
-        if kd_client::hmp::command(monitor, "quit", Duration::from_secs(5)).is_ok() {
+        if opennt_kd::hmp::command(monitor, "quit", Duration::from_secs(5)).is_ok() {
             let deadline = Instant::now() + Duration::from_secs(60);
             while Instant::now() < deadline {
                 if let Ok(Some(_)) = qemu.try_wait() {
