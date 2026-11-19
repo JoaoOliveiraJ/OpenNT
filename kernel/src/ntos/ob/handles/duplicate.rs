@@ -30,7 +30,7 @@
 use crate::ntos::inc::types::{Field, NtStruct};
 use crate::ntos::ob::object_manager::{self, OpenOptions};
 use crate::ntos::ob::open_pointer;
-use crate::ntos::ps::process;
+use crate::ntos::ps::{process, process_context};
 use crate::rtl::KernelError;
 
 const DUPLICATE_CLOSE_SOURCE: u32 = 1;
@@ -79,22 +79,29 @@ fn write_handle(target_handle: u64, handle: u64) {
     unsafe { Field::<u64>::at(target_handle) }.set(handle);
 }
 
-fn close_source(handle: u64) -> Result<(), KernelError> {
-    if open_pointer::close(handle).is_none() {
-        crate::ntos::ob::close::close(handle, Some(0))?;
-    }
-    Ok(())
+/// DUPLICATE_CLOSE_SOURCE: o handle de origem fecha na tabela do processo
+/// de origem, anexado a ele (o KeStackAttachProcess + NtClose do
+/// ObDuplicateObject 19041, 0x5f5435).
+fn close_source(source: u64, handle: u64) -> Result<(), KernelError> {
+    process_context::with_process(source, || -> Result<(), KernelError> {
+        if open_pointer::close(handle).is_none() {
+            crate::ntos::ob::close::close(handle, Some(0))?;
+        }
+        Ok(())
+    })?
 }
 
 /// Handle com linha no Object Manager mas sem corpo nativo descrito (nós de
 /// namespace): reabre o mesmo nó com as opções da origem; sem linha, segue
-/// para a tabela do ObInsertObject.
-fn duplicate_namespace_handle(source_handle: u64, target: u64, target_handle: u64, desired: u32, attributes: u32, options: u32) -> Result<u32, KernelError> {
+/// para a tabela do ObInsertObject. O dono da linha é o processo de origem
+/// (`source`).
+#[allow(clippy::too_many_arguments)]
+fn duplicate_namespace_handle(source: u64, source_handle: u64, target: u64, target_handle: u64, desired: u32, attributes: u32, options: u32) -> Result<u32, KernelError> {
     let value = source_handle & !3;
     let kernel_source = value & KERNEL_HANDLE_BITS == KERNEL_HANDLE_BITS;
     let record = if kernel_source || value <= 0x7FFF_FFFF { object_manager::handle_record((value & 0x7FFF_FFFF) as u32) } else { None };
-    let Some(record) = record.filter(|record| record.options.kernel_handle == kernel_source && (kernel_source || record.options.owner_process.unwrap_or(0) == process::get_current_process())) else {
-        return crate::ntos::ob::handles::inserted::duplicate(process::get_current_process(), source_handle, target, target_handle, desired, attributes, options, 0);
+    let Some(record) = record.filter(|record| record.options.kernel_handle == kernel_source && (kernel_source || record.options.owner_process.unwrap_or(0) == source)) else {
+        return crate::ntos::ob::handles::inserted::duplicate(source, source_handle, target, target_handle, desired, attributes, options, 0);
     };
     let access = if options & DUPLICATE_SAME_ACCESS != 0 { record.access } else { desired };
     let handle_attributes = if options & DUPLICATE_SAME_ATTRIBUTES != 0 { record.attributes } else { attributes & HANDLE_ATTRIBUTE_MASK };
@@ -116,7 +123,7 @@ fn duplicate_namespace_handle(source_handle: u64, target: u64, target_handle: u6
         write_handle(target_handle, handle);
     }
     if options & DUPLICATE_CLOSE_SOURCE != 0 {
-        close_source(source_handle)?;
+        close_source(source, source_handle)?;
     }
     Ok(STATUS_SUCCESS)
 }
@@ -155,14 +162,19 @@ pub fn duplicate_object(source_process: u64, source_handle: u64, target_process:
         if options & DUPLICATE_CLOSE_SOURCE == 0 {
             return Ok(STATUS_INVALID_PARAMETER);
         }
-        close_source(source_handle)?;
+        close_source(source, source_handle)?;
         return Ok(STATUS_SUCCESS);
     }
     let target = match process_of(target_process) {
         Ok(target) => target,
         Err(status) => return Ok(status),
     };
-    let resolved = match open_pointer::resolve(source_handle, false) {
+    // O SourceHandle é da tabela do processo de origem: o ObDuplicateObject
+    // 19041 referencia a tabela do SourceProcess (0x5f52a9) e procura o
+    // handle nela (ObpReferenceProcessObjectByHandle, 0x5f52ef). O win32k
+    // duplica assim o evento do sensor do mouse, criado pelo csrss, para o
+    // dwm (CMouseSensor::GetCursorUpdateHandle).
+    let resolved = match process_context::with_process(source, || open_pointer::resolve(source_handle, false))? {
         Some(Err(status)) => return Ok(status),
         Some(Ok(resolved)) => resolved,
         None => {
@@ -181,7 +193,7 @@ pub fn duplicate_object(source_process: u64, source_handle: u64, target_process:
                     });
                 }
             }
-            return duplicate_namespace_handle(source_handle, target, target_handle, desired, attributes, options);
+            return duplicate_namespace_handle(source, source_handle, target, target_handle, desired, attributes, options);
         }
     };
     let access = if options & DUPLICATE_SAME_ACCESS != 0 { resolved.access } else { map_generic(desired, &resolved.item.object_type.mapping) & (resolved.item.object_type.valid_access | 0x0100_0000) };
@@ -196,7 +208,7 @@ pub fn duplicate_object(source_process: u64, source_handle: u64, target_process:
         write_handle(target_handle, handle);
     }
     if options & DUPLICATE_CLOSE_SOURCE != 0 {
-        close_source(source_handle)?;
+        close_source(source, source_handle)?;
     }
     Ok(STATUS_SUCCESS)
 }

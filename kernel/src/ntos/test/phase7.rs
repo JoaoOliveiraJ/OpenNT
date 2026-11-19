@@ -3343,6 +3343,37 @@ fn user_tokens(assert: Assert) {
         }
         assert(process_status == 0 && matches!(copied, Ok(0)) && copy != 0 && same && matches!(moved, Ok(0)) && closed, "usertokens: ZwDuplicateObject de modo kernel com handles da tabela de usuario (processo e token)");
     }
+    // ZwDuplicateObject de modo kernel com o SourceHandle de outro processo:
+    // o CMouseSensor::GetCursorUpdateHandle do win32kbase duplica para o dwm
+    // o evento sem nome que o ZwCreateEvent de modo kernel criou no csrss. O
+    // handle é procurado na tabela do processo de origem (0x5f52ef).
+    {
+        use crate::ntos::ob::handles::duplicate;
+        use crate::ntos::ob::open_pointer;
+        let caller = crate::ntos::ps::process::get_current_process();
+        let cells = guest::alloc_bytes(0x20);
+        let outcome = with_test_process("dup-origem.exe", None, |origin| {
+            let created = crate::ntos::ex::event::create(cells, 0x1F_0003, 0, 0, false).unwrap_or(1);
+            let event = guest::read64(cells);
+            let object = open_pointer::resolve(event, false).and_then(Result::ok).map_or(0, |resolved| resolved.item.pointer);
+            let copied = crate::ntos::ps::process_context::with_process(caller, || {
+                let opened = open_pointer::open(origin.process, 0x200, 0, 0x40, crate::ntos::ob::object_types::process_type().pointer, 0, cells + 8).unwrap_or(1);
+                let origin_handle = guest::read64(cells + 8);
+                guest::write64(cells + 0x10, 0);
+                let status = duplicate::duplicate_object(origin_handle, event, u64::MAX, cells + 0x10, 0x0010_0000, 0, 2).unwrap_or(1);
+                let copy = guest::read64(cells + 0x10);
+                let same = open_pointer::resolve(copy, false).and_then(Result::ok).is_some_and(|resolved| resolved.item.pointer == object && resolved.access == 0x1F_0003);
+                let _ = open_pointer::close(copy);
+                let _ = open_pointer::close(origin_handle);
+                (opened, status, copy, same)
+            })
+            .ok();
+            let _ = open_pointer::close(event);
+            (created, object, copied)
+        });
+        let ok = matches!(outcome, Some((0, object, Some((0, 0, copy, true)))) if object != 0 && copy != 0);
+        assert(ok, "usertokens: ZwDuplicateObject de modo kernel com o SourceHandle da tabela de outro processo (o evento do csrss para o dwm)");
+    }
     let query = |handle: u64, class: u64, length: u64| {
         guest::write64(rsp + 0x28, returned);
         call("NtQueryInformationToken", handle, class, buffer, length)
