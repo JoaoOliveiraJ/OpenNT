@@ -336,10 +336,10 @@ struct ScriptForm {
 
 /// As opções comuns do `xtask` (os botões da janela de abertura).
 const COMMON_OPTIONS: [(&str, &str); 8] = [
-    ("--initial-process=smss", "a cadeia real: smss, csrss, wininit e winlogon (modo usuario)"),
-    ("--display=basic", "o video pelo BasicDisplay.sys e o BasicRender.sys reais"),
-    ("--accel=whpx", "WHPX (sem a opcao, o debug usa o TCG)"),
-    ("--accel=tcg", "TCG (o rastro rapido do QEMU precisa dele)"),
+    ("--initial-process=smss", "a cadeia real: smss, csrss, wininit e winlogon (modo usuário)"),
+    ("--display=basic", "o vídeo pelo BasicDisplay.sys e o BasicRender.sys reais"),
+    ("--accel=whpx", "WHPX (sem a opção, o debug usa o TCG)"),
+    ("--accel=tcg", "TCG (o rastro rápido do QEMU precisa dele)"),
     ("--smp=2", "dois processadores"),
     ("--start-driver=ntfs", "o ntfs.sys real monta o volume"),
     ("--trace-rpc", "cada mensagem ALPC das portas de servidor na COM1"),
@@ -667,6 +667,12 @@ impl DebuggerApp {
     /// opções de abertura e os breakpoints (no backend).
     pub fn apply_session(&mut self, session: &SessionFile) {
         self.state.apply_session(session);
+    }
+
+    /// Um pedido para o backend no próximo quadro, depois dos que já estão
+    /// na fila da janela (o `--script` depois dos breakpoints da sessão).
+    pub fn queue(&mut self, request: Request) {
+        self.state.requests.push(request);
     }
 
     /// Expressões na janela de observação (a captura de tela e os testes),
@@ -1817,7 +1823,7 @@ fn toolbar(ui: &mut Ui, state: &mut UiState) {
                     state.requests.push(Request::Start(Target::Launch(options)));
                 }
             }
-            if ui.button("Opções...").on_hover_text("abrir com outras opcoes do xtask ou conectar a um QEMU aberto (Ctrl+O)").clicked() {
+            if ui.button("Opções...").on_hover_text("abrir com outras opções do xtask ou conectar a um QEMU aberto (Ctrl+O)").clicked() {
                 state.open_form();
             }
             let response = ui.add(egui::TextEdit::singleline(&mut state.connect_address).desired_width(140.0).font(TextStyle::Monospace).hint_text("127.0.0.1:1234"));
@@ -2105,7 +2111,7 @@ fn command_panel(ui: &mut Ui, state: &mut UiState) {
         } else {
             "kd (rodando)>"
         };
-        ui.label(mono(prompt).color(colors.blue)).on_hover_text(if state.busy() { "o backend esta ocupado: o comando espera na fila e roda quando ele voltar" } else { "Enter roda; setas trazem o historico; Tab completa" });
+        ui.label(mono(prompt).color(colors.blue)).on_hover_text(if state.busy() { "o backend está ocupado: o comando espera na fila e roda quando ele voltar" } else { "Enter roda; setas trazem o histórico; Tab completa" });
         let response = ui.add(egui::TextEdit::singleline(&mut state.command).id(egui::Id::new("kd-command")).font(TextStyle::Monospace).desired_width(f32::INFINITY).hint_text("comando (help; Tab completa)"));
         state.command_focused = response.has_focus();
         if response.changed() {

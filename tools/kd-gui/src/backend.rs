@@ -1392,7 +1392,7 @@ impl Worker {
         let mut failure: Option<String> = None;
         for (index, line) in lines.iter().enumerate() {
             if self.cancel.swap(false, Ordering::SeqCst) {
-                failure = Some(format!("parado pelo usuario antes da linha {}", line.number));
+                failure = Some(format!("linha {}: parado pelo usuario antes dela (Cancelar)", line.number));
                 break;
             }
             let progress = ScriptProgress { name: name.to_string(), line: line.number, index: index + 1, total, text: line.text.clone() };

@@ -178,11 +178,6 @@ fn window(config: Config, target: Option<Target>, launch: LaunchOptions, options
             kd_gui::configure(&creation.egui_ctx);
             let context = creation.egui_ctx.clone();
             let backend = Backend::start(config, target, Arc::new(move || context.request_repaint()));
-            // O roteiro entra na fila: roda depois do attach (sem alvo, a
-            // mensagem pede para abrir ou conectar).
-            if let Some(path) = script {
-                backend.send(Request::RunScriptFile(path));
-            }
             let mut app = DebuggerApp::new(backend, Some(launch), connect);
             if let Some(path) = kd_gui::app::state_path() {
                 app = app.with_persistence(path);
@@ -191,6 +186,12 @@ fn window(config: Config, target: Option<Target>, launch: LaunchOptions, options
             // das da última execução.
             if let Some(session) = &session {
                 app.apply_session(session);
+            }
+            // O roteiro vai na fila depois dos breakpoints da sessão: roda
+            // depois do attach (sem alvo, a mensagem pede para abrir ou
+            // conectar).
+            if let Some(path) = script {
+                app.queue(Request::RunScriptFile(path));
             }
             Ok(Box::new(app))
         }),
