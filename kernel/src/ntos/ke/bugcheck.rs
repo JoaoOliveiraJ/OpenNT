@@ -136,6 +136,9 @@ pub fn is_active() -> bool {
 /// KeBugCheckEx(BugCheckCode, P1, P2, P3, P4): nunca volta.
 pub fn bug_check_ex(code: u32, first: u64, second: u64, third: u64, fourth: u64) -> ! {
     let parameters = [first, second, third, fourth];
+    // Chamado de dentro de um comando do depurador do kernel (com a máquina
+    // parada): o comando é abandonado e a sessão segue, sem bugcheck.
+    crate::ntos::kd::stop::bug_check_in_debugger(code, parameters);
     if !READY.load(Ordering::Acquire) {
         crate::ntos::kd::stop::bug_check(code, parameters);
         debug_print!("*** STOP: {:#010x} ({:#018x}, {:#018x}, {:#018x}, {:#018x})", code, first, second, third, fourth);

@@ -21,7 +21,11 @@
 //! `int 0x2D` não podem voltar com IRET cego: no anel 3 o processo morre com o
 //! NTSTATUS da exceção (CONTEXT salvo, saída tipo 3, longjmp ao chamador) e o
 //! kernel continua; no anel 0 vão para [`rs_kernel_exception`], que imprime o
-//! diagnóstico e para a CPU. A falta dupla (vetor 8) entra pela IST1 da TSS
+//! diagnóstico e para a CPU (com o depurador do kernel, a máquina para antes,
+//! e o host pode retomar mudando o RIP). Com o depurador ligado, a NMI tem
+//! caminho próprio (`irq_nmi`): nunca vira exceção, e o GS é conferido pelo
+//! MSR, porque ela chega também nas fronteiras em que o GS ainda é o do
+//! usuário. A falta dupla (vetor 8) entra pela IST1 da TSS
 //! (`usermode::user_mode_init`), numa pilha própria: um estouro de pilha de
 //! kernel, que falta na guarda e não cabe na pilha estourada, vira
 //! diagnóstico em vez de falta tripla. Antes disso, uma falta de página do anel 0 passa
@@ -89,6 +93,11 @@ global_asm!(
 # completa o TrapFrame, guarda o x87/SSE numa area FXSAVE64 entregue ao
 # depurador, e devolve em EAX o resultado de `rs_kd_trap` (1 = voltar com o
 # quadro, possivelmente alterado pelo host; 0 = seguir o caminho comum).
+# RAX, RCX e RDX ja estao no quadro (os chamadores os restauram dele).
+# O GS e conferido pelo MSR, como no KiNmiInterrupt do 19041: um passo que
+# parou entre o SWAPGS e o IRETQ de volta ao anel 3 entra no anel 0 com o GS
+# do usuario; a KPCR volta enquanto o depurador roda e o GS do usuario volta
+# na saida.
 .macro OPENNT_KD_ENTER
     push rbx
     push rbp
@@ -100,13 +109,27 @@ global_asm!(
     and rsp, -16
     sub rsp, 512
     fxsave64 [rsp]
+    mov ebx, edx
+    mov ecx, 0xC0000101
+    rdmsr
+    xor r13d, r13d
+    test edx, edx
+    js 8f
+    swapgs
+    mov r13d, 1
+8:
     OPENNT_NATIVE_SAVE r12, r14
     cld
     mov rdi, rbp
     mov rsi, rsp
+    mov edx, ebx
     call rs_kd_trap
     mov r15d, eax
     OPENNT_NATIVE_RESTORE r12, r14
+    test r13d, r13d
+    jz 9f
+    swapgs
+9:
     fxrstor64 [rsp]
     mov eax, r15d
     mov rsp, rbp
@@ -141,6 +164,14 @@ irq_common:
     push r9
     push r10
     push r11
+    # NMI com o depurador do kernel ligado: o caminho proprio (`irq_nmi`),
+    # antes da troca do GS pelo CS do quadro (a NMI chega tambem nas
+    # fronteiras em que o GS ainda e o do usuario).
+    cmp byte ptr [rsp + 72], 2
+    jne irq_common_not_nmi
+    cmp byte ptr [rip + opennt_kd_trap_active], 0
+    jne irq_nmi
+irq_common_not_nmi:
     # Veio do anel 3 (CS do frame = 0x33)? Troca para a KPCR (drivers leem
     # gs:[0x188]) e captura os registradores de depuracao do usuario.
     movzx edi, byte ptr [rsp + 72]
@@ -294,9 +325,14 @@ irq_restore:
     jz irq_restore_interval
     cmp word ptr [rsp + 88], 0x10
     jne irq_restore_interval
+    # Uma NMI adiada ou um autoteste pedido pelo host entram sem byte na
+    # porta (`opennt_kd_tick_request`).
+    cmp byte ptr [rip + opennt_kd_tick_request], 0
+    jne irq_kd_tick_enter
     in al, dx
     test al, 1
     jz irq_restore_interval
+irq_kd_tick_enter:
     mov edx, 0x40
     OPENNT_KD_ENTER
     mov edi, 0x40
@@ -332,6 +368,49 @@ irq_kernel_registers:
 irq_iret:
     iretq
 
+irq_nmi:
+    # NMI com o depurador ligado (o KxNmiInterrupt/KiProcessNMI do 19041 em
+    # `kd::stop`): o pedido de parada do host (o `nmi` do monitor do QEMU),
+    # o pedido de um AP ou o congelamento. Nunca vai ao despacho de
+    # excecoes: a NMI nao e uma excecao do processo nem do kernel.
+    cmp word ptr [rsp + 88], 0x33
+    jne irq_nmi_kernel
+    # Do anel 3: a fronteira comum (SWAPGS e o banco de depuracao), a parada
+    # com o quadro do usuario e a volta.
+    swapgs
+    call user_debug_leave
+    mov edx, 2
+    OPENNT_KD_ENTER
+    call user_debug_enter
+    swapgs
+    jmp irq_nmi_return
+irq_nmi_kernel:
+    # Do anel 0 com o GS do usuario: uma fronteira (logo depois do SYSCALL,
+    # antes do SWAPGS e da troca de pilha; ou entre o SWAPGS e o IRETQ da
+    # volta). A pilha pode ser a do usuario: a parada fica para o proximo
+    # tique do relogio no anel 0, sem tocar no GS.
+    mov ecx, 0xC0000101
+    rdmsr
+    test edx, edx
+    js irq_nmi_kernel_gs
+    lock or byte ptr [rip + opennt_kd_tick_request], 1
+    jmp irq_nmi_return
+irq_nmi_kernel_gs:
+    mov edx, 2
+    OPENNT_KD_ENTER
+irq_nmi_return:
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    add rsp, 8                      # vetor (a NMI nao tem codigo de erro)
+    iretq
+
 irq_exception:
     # Excecao no anel 3: o processo morre com o codigo NTSTATUS e o kernel
     # continua (o longjmp e user_terminate_current). O estado arquitetural
@@ -339,8 +418,9 @@ irq_exception:
     mov r10d, edi
     cmp word ptr [rsp + r11], 0x33
     jne irq_kernel_exception
-    cmp r10d, 0x29
-    je irq_user_context_saved
+    # O fast fail tambem salva o CONTEXT: o despacho (`ps/user/exceptions.rs`)
+    # o leva direto a segunda chance, sem entrega ao processo, com os
+    # registradores do `int 0x29` para o depurador.
     mov rax, gs:[{context}]
     test rax, rax
     jz irq_user_context_saved
@@ -625,7 +705,9 @@ irq_kernel_trap_with_error:
     iretq
 irq_kernel_diagnostic:
     # Completa o frame com os registradores preservados e entrega ao
-    # diagnostico do kernel, que nao retorna.
+    # diagnostico do kernel. Ele so volta quando o depurador do kernel
+    # retomou a execucao (o host mudou o RIP ou pediu um passo), com RAX =
+    # bytes do vetor e do codigo de erro a descartar antes do IRETQ.
     push rbx
     push rbp
     push r12
@@ -633,13 +715,33 @@ irq_kernel_diagnostic:
     push r14
     push r15
     mov rdi, rsp
+    mov rbx, rsp
     and rsp, -16
     cld
     call rs_kernel_exception
-irq_exception_halt:
-    cli
-    hlt
-    jmp irq_exception_halt
+    mov rsp, rbx
+    mov [rsp + 120], rax            # a celula do vetor guarda os bytes a descartar
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    cmp qword ptr [rsp], 16
+    jne irq_kernel_resume_vector
+    add rsp, 8                      # codigo de erro
+irq_kernel_resume_vector:
+    add rsp, 8                      # vetor
+    iretq
 
 .popsection
 "#,
@@ -830,11 +932,20 @@ fn describe_stack_fault(address: u64) {
     }
 }
 
-/// Diagnóstico de exceção de kernel. Não aloca nem adquire locks.
+/// Diagnóstico de exceção de kernel. Não aloca nem adquire locks. Só volta
+/// quando o depurador do kernel retomou a execução no quadro (o host mudou
+/// o RIP ou pediu um passo): devolve quantos bytes o trampolim descarta
+/// antes do IRETQ (o vetor e, se houver, o código de erro).
 #[no_mangle]
-extern "C" fn rs_kernel_exception(frame: &TrapFrame) -> ! {
+extern "C" fn rs_kernel_exception(frame: *mut TrapFrame) -> u64 {
     // Com o depurador do kernel ligado, a máquina para antes do diagnóstico.
-    crate::ntos::kd::stop::fatal_exception(frame);
+    if crate::ntos::kd::stop::fatal_exception(frame) {
+        // SAFETY: o quadro vivo do trampolim.
+        let vector = (unsafe { (*frame).vector } & 0xFF) as u8;
+        return if has_error_code(vector) { 16 } else { 8 };
+    }
+    // SAFETY: o quadro vivo do trampolim, só lido daqui em diante.
+    let frame = unsafe { &*frame };
     let vector = (frame.vector & 0xFF) as u8;
     let (error_code, rest) = if has_error_code(vector) {
         (Some(frame.hardware[0]), &frame.hardware[1..])

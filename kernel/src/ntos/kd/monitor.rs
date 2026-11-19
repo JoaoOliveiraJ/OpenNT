@@ -15,7 +15,7 @@ use core::fmt::Write;
 use core::mem::offset_of;
 
 use super::packet::Payload;
-use super::{api_monitor, breakpoints, debugger, events, explore, handles, inspect, irp_trace, memory, page_breakpoints, print_log, process_context, regions, stop, stream, trace, user_debug, user_hardware};
+use super::{api_monitor, breakpoints, debugger, events, exception_filter, explore, handles, inspect, irp_trace, memory, page_breakpoints, print_log, process_context, regions, self_test, stop, stream, trace, user_debug, user_hardware};
 use crate::ntos::inc::types::{ClientId, Eprocess, Ethread, EthreadView1, KapcState, Kpcr, Kprcb, Kprocess, Kthread, KthreadView1};
 use crate::ntos::mm::loaded_images;
 use crate::ntos::mm::memory_map::MAX_CPUS;
@@ -48,6 +48,10 @@ const HELP: &str = "comandos do OpenNT:
   kmap               faixas do espaco de sistema
   events             ultimos eventos de processo, thread e imagem (e os simbolos deles)
   uex [on|off]       parar nas excecoes de primeira chance do anel 3
+  sx [e|d|i|r] <codigo|failfast> | sx clear   parar por codigo de excecao do anel 3 (e: as duas chances, d: so a segunda e o fim do processo, i: nunca)
+  exr                a ultima excecao do anel 3 relatada (registro, fast fail, excecoes guardadas)
+  nmi                parada por NMI e congelamento de cada processador (KPRCB.IpiFrozen)
+  kdtest nmi|cli <ms> | excecao <codigo> <1|2> | hlt | passo-falta | falta | bugcheck   autotestes do depurador
   membp [set <inicio> <tamanho> <a|w|x> | clear <inicio>]  breakpoints de memoria por pagina no processo escolhido
   uhw                comparadores de hardware de usuario (por processo)
   api on all|mod=INI-FIM... | off | spec ID:ARGC[:ARG:TIPO].. | names [i] | clear   monitor de APIs
@@ -64,12 +68,12 @@ fn read_u64(cr3: u64, address: u64) -> u64 {
 }
 
 /// O ImageFileName (15 bytes, sem NUL garantido) do EPROCESS.
-fn process_name(cr3: u64, eprocess: u64, output: &mut [u8; 16]) -> usize {
+pub(super) fn process_name(cr3: u64, eprocess: u64, output: &mut [u8; 16]) -> usize {
     let length = memory::read(cr3, eprocess + offset_of!(Eprocess, image_file_name) as u64, &mut output[..15]);
     output[..length].iter().position(|&byte| byte == 0).unwrap_or(length)
 }
 
-fn push_name(out: &mut Payload, bytes: &[u8]) {
+pub(super) fn push_name(out: &mut Payload, bytes: &[u8]) {
     for &byte in bytes {
         out.push(if (0x20..0x7F).contains(&byte) { byte } else { b'?' });
     }
@@ -407,6 +411,10 @@ pub fn run(owner: usize, line: &str, out: &mut Payload) {
         "kmap" => regions::kernel_map(out),
         "events" => events::command(out),
         "uex" => user_debug::command(rest, out),
+        "sx" => exception_filter::command(rest, out),
+        "exr" => user_debug::exr_command(owner, out),
+        "nmi" => stop::describe_nmi(out),
+        "kdtest" => self_test::command(rest, out),
         "membp" => page_breakpoints::command(owner, rest, out),
         "uhw" => user_hardware::command(out),
         "api" => api_monitor::command(rest, out),

@@ -12,11 +12,27 @@
 //!   (TF) e o 0xCC volta depois dele;
 //! - o passo (`s`) e a saída de um breakpoint num `c` usam o TF no CONTEXT
 //!   da thread: o #DB do passo volta por aqui e é reconhecido pelo CONTEXT
-//!   (a identidade da thread);
-//! - com `monitor uex on`, qualquer outra exceção do anel 3 também para (a
-//!   primeira chance). Ao continuar, um `int 3` que não é do depurador é
-//!   pulado (o RIP + 1 do KdpTrap) e as outras exceções seguem ao processo,
-//!   a menos que o host tenha mudado o RIP.
+//!   (a identidade da thread). Um passo pedido numa parada do anel 0 que
+//!   segue para o anel 3 (o `iretq` de volta, ou uma NMI que interrompeu o
+//!   anel 3) também para aqui, pelo CONTEXT do intervalo (`arm_step_from_kernel`);
+//! - as outras exceções passam pelo filtro por código (`kd::exception_filter`,
+//!   `monitor sx`): `monitor uex on` é o FLG_STOP_ON_EXCEPTION do KdpReport
+//!   do 19041, e a tabela vale por cima dele. Ao continuar, um `int 3` que
+//!   não é do depurador é pulado (o RIP + 1 do KdpTrap) e as outras exceções
+//!   seguem ao processo, a menos que o host tenha mudado o RIP;
+//! - a primeira chance de uma exceção levantada pelo NtRaiseException (o
+//!   RaiseException da kernelbase, as exceções do C++ e do RPC) passa pelo
+//!   mesmo filtro antes da entrega (`raised`);
+//! - a segunda chance (`second_chance`): o NtRaiseException com
+//!   FirstChance FALSE, a exceção que não pôde ser entregue e o `__fastfail`
+//!   (int 0x29, que o KiFastFailDispatch do 19041 leva direto à segunda
+//!   chance). É o ponto do DbgkForwardException(SecondChance), com o
+//!   depurador do kernel no papel da porta de depuração; para quando a
+//!   tabela pede. O fim do processo pelo NtTerminateProcess com um código
+//!   da tabela também para (`terminating`): o RaiseFailFastException sem o
+//!   serviço do WER termina assim, com o código (0xC0000602, ou o
+//!   0xC000027B da exceção guardada do WinRT). Essas paradas são só para
+//!   ver: continuar deixa o processo terminar, e o passo é recusado;
 //!
 //! - #DB de um comparador de hardware de usuário do depurador
 //!   (`kd::user_hardware`, o DR6 do CONTEXT) na thread de um processo com a
@@ -30,19 +46,24 @@
 //! Na parada, o host vê um quadro de trap montado do CONTEXT (CS 0x33, a
 //! TEB como base de GS, x87/SSE do FltSave) e o espaço de endereços é o do
 //! processo. Os registradores de depuração que ele lê são os do CONTEXT. O
-//! quadro volta ao CONTEXT na saída.
+//! quadro volta ao CONTEXT na saída. A última exceção relatada fica no
+//! `monitor exr` (o registro, o código do fast fail e as exceções guardadas
+//! de um 0xC000027B).
 
+use core::cell::UnsafeCell;
 use core::fmt::Write;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::mem::{offset_of, size_of};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 use super::breakpoints::{self, HitOwner, Watch};
+use super::exception_filter;
 use super::packet::Payload;
-use super::stop::{self, Kind, UserResume};
-use super::{page_breakpoints, user_hardware};
+use super::stop::{self, Kind, UserException, UserResume};
+use super::{memory, page_breakpoints, process_context, user_hardware};
 use crate::hal::amd64::irqstubs::TrapFrame;
 use crate::hal::cpu;
 use crate::ntos::inc::field::NtStruct;
-use crate::ntos::inc::types::Context;
+use crate::ntos::inc::types::{Context, ExceptionRecord};
 
 const TRAP_FLAG: u32 = 1 << 8;
 const USER_CODE: u64 = 0x33;
@@ -51,6 +72,9 @@ const VECTOR_DEBUG: u32 = 1;
 const VECTOR_BREAKPOINT: u32 = 3;
 const VECTOR_PAGE_FAULT: u32 = 14;
 const VECTOR_DEBUG_SERVICE: u32 = 0x2D;
+/// EXCEPTION_NONCONTINUABLE.
+const NONCONTINUABLE: u32 = 1;
+const RECORD_SIZE: usize = size_of::<ExceptionRecord>();
 
 /// O CONTEXT da thread que dá um passo do depurador (0 = nenhuma).
 static STEP_CONTEXT: AtomicU64 = AtomicU64::new(0);
@@ -71,6 +95,46 @@ static STEP_HARDWARE: AtomicU64 = AtomicU64::new(0);
 /// 1; 0 = nenhuma) e a raiz dela.
 static STEP_PAGE: AtomicU64 = AtomicU64::new(0);
 static STEP_PAGE_ROOT: AtomicU64 = AtomicU64::new(0);
+
+/// A última exceção relatada ao host (o `monitor exr`).
+struct LastException {
+    code: AtomicU32,
+    flags: AtomicU32,
+    address: AtomicU64,
+    count: AtomicU32,
+    information: [AtomicU64; 15],
+    /// 0 = nenhuma, 1 = primeira chance, 2 = segunda chance.
+    chance: AtomicU8,
+    termination: AtomicBool,
+    process: AtomicU64,
+    process_id: AtomicU64,
+    thread_id: AtomicU64,
+}
+
+static LAST: LastException = LastException {
+    code: AtomicU32::new(0),
+    flags: AtomicU32::new(0),
+    address: AtomicU64::new(0),
+    count: AtomicU32::new(0),
+    information: [const { AtomicU64::new(0) }; 15],
+    chance: AtomicU8::new(0),
+    termination: AtomicBool::new(false),
+    process: AtomicU64::new(0),
+    process_id: AtomicU64::new(0),
+    thread_id: AtomicU64::new(0),
+};
+
+/// O CONTEXT de mentira do autoteste `kdtest excecao`.
+#[repr(C, align(16))]
+struct TestContext(UnsafeCell<[u8; size_of::<Context>()]>);
+
+// SAFETY: só o autoteste usa o bloco, no tique do relógio do BSP.
+unsafe impl Sync for TestContext {}
+
+static TEST_CONTEXT: TestContext = TestContext(UnsafeCell::new([0; size_of::<Context>()]));
+/// RIP e RSP do CONTEXT de mentira: metade de usuário, sem memória por trás.
+const TEST_RIP: u64 = 0x7FFE_0000_1000;
+const TEST_RSP: u64 = 0x7FFE_0000_8000;
 
 /// O CONTEXT da thread de usuário da parada corrente, se a parada é do
 /// anel 3 (os registradores de depuração que o host lê).
@@ -104,10 +168,53 @@ fn signal(vector: u32) -> u8 {
     }
 }
 
+/// Sinal do GDB para o código de uma exceção (as levantadas por software,
+/// a segunda chance e o fim do processo).
+fn signal_for_code(code: u32) -> u8 {
+    match code {
+        0xC000_0005 | 0xC000_0006 | 0x8000_0001 | 0x8000_0002 | 0xC000_00FD => stop::SIGSEGV,
+        0xC000_001D | 0xC000_0096 => stop::SIGILL,
+        0xC000_008C..=0xC000_0095 => stop::SIGFPE,
+        0x8000_0003 | 0x8000_0004 => stop::SIGTRAP,
+        exception_filter::STATUS_STACK_BUFFER_OVERRUN | exception_filter::STATUS_FAIL_FAST_EXCEPTION | exception_filter::STATUS_STOWED_EXCEPTION | 0xC000_0374 | 0xC000_0420 => stop::SIGABRT,
+        _ => stop::SIGTRAP,
+    }
+}
+
+fn record_u32(record: &[u8], offset: usize) -> u32 {
+    record.get(offset..offset + 4).map_or(0, |bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+fn record_u64(record: &[u8], offset: usize) -> u64 {
+    record.get(offset..offset + 8).and_then(|bytes| bytes.try_into().ok()).map_or(0, u64::from_le_bytes)
+}
+
+fn record_code(record: &[u8]) -> u32 {
+    record_u32(record, offset_of!(ExceptionRecord, exception_code))
+}
+
+/// A exceção relatada vai ao `monitor exr`.
+fn note(record: &[u8], chance: u8, termination: bool) {
+    LAST.code.store(record_code(record), Ordering::Relaxed);
+    LAST.flags.store(record_u32(record, offset_of!(ExceptionRecord, exception_flags)), Ordering::Relaxed);
+    LAST.address.store(record_u64(record, offset_of!(ExceptionRecord, exception_address)), Ordering::Relaxed);
+    let count = record_u32(record, offset_of!(ExceptionRecord, number_parameters)).min(15);
+    LAST.count.store(count, Ordering::Relaxed);
+    let information = offset_of!(ExceptionRecord, exception_information);
+    for (index, cell) in LAST.information.iter().enumerate() {
+        cell.store(if (index as u32) < count { record_u64(record, information + index * 8) } else { 0 }, Ordering::Relaxed);
+    }
+    LAST.termination.store(termination, Ordering::Relaxed);
+    LAST.process.store(crate::ntos::ps::process::get_current_process(), Ordering::Relaxed);
+    LAST.process_id.store(crate::ntos::ps::process::get_current_process_id(), Ordering::Relaxed);
+    LAST.thread_id.store(crate::ntos::ps::process::get_current_thread_id(), Ordering::Relaxed);
+    LAST.chance.store(chance, Ordering::Release);
+}
+
 /// O `int 3`/#DB/falta do anel 3 com o CONTEXT da thread (`teb` = a TEB
-/// dela). Devolve se o depurador tratou a exceção: a thread segue do
-/// CONTEXT, sem entrega ao processo.
-pub fn exception(context: &Context, vector: u32, teb: u64) -> bool {
+/// dela) e o registro montado pelo despacho. Devolve se o depurador tratou
+/// a exceção: a thread segue do CONTEXT, sem entrega ao processo.
+pub fn exception(context: &Context, vector: u32, teb: u64, record: &[u8]) -> bool {
     if vector == VECTOR_DEBUG_SERVICE {
         return false;
     }
@@ -179,10 +286,89 @@ pub fn exception(context: &Context, vector: u32, teb: u64) -> bool {
             HitOwner::None => {}
         }
     }
-    if BREAK_ON_EXCEPTIONS.load(Ordering::Acquire) {
-        return stop_here(context, teb, signal(vector), Kind::Signal, vector == VECTOR_BREAKPOINT);
+    let code = record_code(record);
+    let stops = exception_filter::first_chance(code, BREAK_ON_EXCEPTIONS.load(Ordering::Acquire));
+    exception_filter::count(code, stops);
+    if stops {
+        note(record, 1, false);
+        let exception = UserException { code, chance: 1, termination: false };
+        return stop_inner(context, teb, signal(vector), Kind::Signal, 0, vector == VECTOR_BREAKPOINT, Some(exception));
     }
     false
+}
+
+/// A primeira chance de uma exceção levantada pelo NtRaiseException, antes
+/// da entrega ao processo. Devolve se o depurador tratou a exceção (o host
+/// mudou o RIP ou pediu um passo): a thread segue do CONTEXT, sem entrega.
+pub fn raised(context: &Context, teb: u64, record: &[u8]) -> bool {
+    if !stop::active() || !super::session::attached() {
+        return false;
+    }
+    let code = record_code(record);
+    let stops = exception_filter::first_chance(code, BREAK_ON_EXCEPTIONS.load(Ordering::Acquire));
+    exception_filter::count(code, stops);
+    if !stops {
+        return false;
+    }
+    note(record, 1, false);
+    let exception = UserException { code, chance: 1, termination: false };
+    stop_inner(context, teb, signal_for_code(code), Kind::Signal, 0, false, Some(exception))
+}
+
+/// A segunda chance de uma exceção do anel 3 (o DbgkForwardException com
+/// SecondChance): o processo termina com o código depois dela, qualquer que
+/// seja a resposta do host.
+pub fn second_chance(context: &Context, teb: u64, record: &[u8]) {
+    observe(context, teb, record, false);
+}
+
+/// O NtTerminateProcess do próprio processo com `code`, com a thread na
+/// chamada (`context`, o CONTEXT da syscall; 0 sem ele): para quando a
+/// tabela pede a segunda chance do código.
+pub fn terminating(context: u64, teb: u64, code: u32) {
+    if context == 0 || code == 0 || !stop::active() || !super::session::attached() || !exception_filter::second_chance(code) {
+        return;
+    }
+    // SAFETY: o CONTEXT da thread viva que chamou (memória do kernel).
+    let context = unsafe { Context::at(context) };
+    let mut record = [0u8; RECORD_SIZE];
+    record[offset_of!(ExceptionRecord, exception_code)..][..4].copy_from_slice(&code.to_le_bytes());
+    record[offset_of!(ExceptionRecord, exception_flags)..][..4].copy_from_slice(&NONCONTINUABLE.to_le_bytes());
+    record[offset_of!(ExceptionRecord, exception_address)..][..8].copy_from_slice(&context.rip.get().to_le_bytes());
+    observe(context, teb, &record, true);
+}
+
+/// A parada só para ver (segunda chance ou fim do processo): o quadro do
+/// CONTEXT, sem passo nem saída de breakpoint, e o CONTEXT intocado.
+fn observe(context: &Context, teb: u64, record: &[u8], termination: bool) {
+    if !stop::active() || !super::session::attached() {
+        return;
+    }
+    let code = record_code(record);
+    let stops = exception_filter::second_chance(code);
+    exception_filter::count(code, stops);
+    if !stops {
+        return;
+    }
+    note(record, 2, termination);
+    let mut frame = frame_of(context);
+    let fx = context.flt_save.address();
+    STOPS.fetch_add(1, Ordering::Relaxed);
+    let flags = cpu::save_and_disable_interrupts();
+    CURRENT_CONTEXT.store(context.address(), Ordering::Release);
+    let exception = UserException { code, chance: 2, termination };
+    let _ = stop::enter_user(&mut frame as *mut TrapFrame as u64, fx, signal_for_code(code), Kind::Signal, 0, teb, Some(exception));
+    CURRENT_CONTEXT.store(0, Ordering::Release);
+    cpu::restore_interrupts(flags);
+}
+
+/// O passo pedido numa parada do anel 0 segue no anel 3 (o TF já está no
+/// quadro que volta ao usuário): o #DB que ele dá na thread do intervalo
+/// (o CONTEXT `context`) para a máquina aqui.
+pub fn arm_step_from_kernel(context: u64) {
+    STEP_OVER.store(0, Ordering::Release);
+    STEP_SILENT.store(false, Ordering::Release);
+    STEP_CONTEXT.store(context, Ordering::Release);
 }
 
 /// Liga o TF da thread para uma instrução; `over` é o breakpoint suspenso.
@@ -243,22 +429,22 @@ fn store_frame(context: &Context, frame: &TrapFrame) {
 /// A parada com o CONTEXT da thread. `skip_int3`: a exceção é um `int 3`
 /// que não é do depurador (ao continuar, o RIP pula o byte).
 fn stop_here(context: &Context, teb: u64, signal: u8, kind: Kind, skip_int3: bool) -> bool {
-    stop_inner(context, teb, signal, kind, 0, skip_int3)
+    stop_inner(context, teb, signal, kind, 0, skip_int3, None)
 }
 
 /// A parada com um dado na resposta (o endereço vigiado).
 fn stop_with_data(context: &Context, teb: u64, signal: u8, kind: Kind, data: u64) -> bool {
-    stop_inner(context, teb, signal, kind, data, false)
+    stop_inner(context, teb, signal, kind, data, false, None)
 }
 
-fn stop_inner(context: &Context, teb: u64, signal: u8, kind: Kind, data: u64, skip_int3: bool) -> bool {
+fn stop_inner(context: &Context, teb: u64, signal: u8, kind: Kind, data: u64, skip_int3: bool, exception: Option<UserException>) -> bool {
     let mut frame = frame_of(context);
     let fx = context.flt_save.address();
     let before = context.rip.get();
     STOPS.fetch_add(1, Ordering::Relaxed);
     let flags = cpu::save_and_disable_interrupts();
     CURRENT_CONTEXT.store(context.address(), Ordering::Release);
-    let resume = stop::enter_user(&mut frame as *mut TrapFrame as u64, fx, signal, kind, data, teb);
+    let resume = stop::enter_user(&mut frame as *mut TrapFrame as u64, fx, signal, kind, data, teb, exception);
     CURRENT_CONTEXT.store(0, Ordering::Release);
     cpu::restore_interrupts(flags);
     store_frame(context, &frame);
@@ -302,6 +488,35 @@ fn stop_inner(context: &Context, teb: u64, signal: u8, kind: Kind, data: u64, sk
     }
 }
 
+/// O autoteste `kdtest excecao`: uma exceção de usuário sintética passa
+/// pelo filtro e pela parada como uma de verdade (primeira chance pelo
+/// caminho do NtRaiseException, segunda chance pelo da segunda chance), com
+/// um CONTEXT de mentira. Roda no tique do relógio do BSP.
+pub fn self_test_exception(code: u32, chance: u8) {
+    // SAFETY: o bloco estático alinhado do tamanho do CONTEXT, só deste
+    // autoteste.
+    let context = unsafe {
+        (*TEST_CONTEXT.0.get()).fill(0);
+        Context::at(TEST_CONTEXT.0.get() as u64)
+    };
+    context.rip.set(TEST_RIP);
+    context.rsp.set(TEST_RSP);
+    context.e_flags.set(0x202);
+    let mut record = [0u8; RECORD_SIZE];
+    record[offset_of!(ExceptionRecord, exception_code)..][..4].copy_from_slice(&code.to_le_bytes());
+    record[offset_of!(ExceptionRecord, exception_address)..][..8].copy_from_slice(&TEST_RIP.to_le_bytes());
+    if chance >= 2 {
+        record[offset_of!(ExceptionRecord, exception_flags)..][..4].copy_from_slice(&NONCONTINUABLE.to_le_bytes());
+        second_chance(context, 0, &record);
+    } else {
+        // Um passo pedido aqui ficaria armado no CONTEXT de mentira: desfeito.
+        let _ = raised(context, 0, &record);
+        if STEP_CONTEXT.load(Ordering::Acquire) == context.address() {
+            STEP_CONTEXT.store(0, Ordering::Release);
+        }
+    }
+}
+
 /// `uex [on|off]`: parar ou não nas exceções de primeira chance do anel 3.
 pub fn command(argument: &str, out: &mut Payload) {
     match argument.trim() {
@@ -311,15 +526,147 @@ pub fn command(argument: &str, out: &mut Payload) {
     }
     let _ = writeln!(
         out,
-        "excecoes do anel 3: {} (paradas {}, int 3 de outros processos passados {})",
+        "excecoes do anel 3: {} (paradas {}, int 3 de outros processos passados {}; por codigo: monitor sx)",
         if BREAK_ON_EXCEPTIONS.load(Ordering::Acquire) { "param na primeira chance" } else { "so os breakpoints do depurador" },
         STOPS.load(Ordering::Relaxed),
         FOREIGN_HITS.load(Ordering::Relaxed)
     );
 }
 
-/// O host se desligou: um passo pendente termina sem parar.
+/// Os códigos do `__fastfail` (FAST_FAIL_* do winnt.h) mais comuns.
+fn fast_fail_name(code: u64) -> Option<&'static str> {
+    Some(match code {
+        0 => "FAST_FAIL_LEGACY_GS_VIOLATION",
+        1 => "FAST_FAIL_VTGUARD_CHECK_FAILURE",
+        2 => "FAST_FAIL_STACK_COOKIE_CHECK_FAILURE",
+        3 => "FAST_FAIL_CORRUPT_LIST_ENTRY",
+        4 => "FAST_FAIL_INCORRECT_STACK",
+        5 => "FAST_FAIL_INVALID_ARG",
+        6 => "FAST_FAIL_GS_COOKIE_INIT",
+        7 => "FAST_FAIL_FATAL_APP_EXIT",
+        8 => "FAST_FAIL_RANGE_CHECK_FAILURE",
+        9 => "FAST_FAIL_UNSAFE_REGISTRY_ACCESS",
+        10 => "FAST_FAIL_GUARD_ICALL_CHECK_FAILURE",
+        11 => "FAST_FAIL_GUARD_WRITE_CHECK_FAILURE",
+        12 => "FAST_FAIL_INVALID_FIBER_SWITCH",
+        13 => "FAST_FAIL_INVALID_SET_OF_CONTEXT",
+        14 => "FAST_FAIL_INVALID_REFERENCE_COUNT",
+        18 => "FAST_FAIL_INVALID_JUMP_BUFFER",
+        19 => "FAST_FAIL_MRDATA_MODIFIED",
+        20 => "FAST_FAIL_CERTIFICATION_FAILURE",
+        21 => "FAST_FAIL_INVALID_EXCEPTION_CHAIN",
+        22 => "FAST_FAIL_CRYPTO_LIBRARY",
+        23 => "FAST_FAIL_INVALID_CALL_IN_DLL_CALLOUT",
+        _ => return None,
+    })
+}
+
+/// STOWED_EXCEPTION_INFORMATION_V1/V2 (winnt.h): cabeçalho (Size,
+/// Signature 'SE01'/'SE02'), ResultCode, ExceptionForm:2 | ThreadId:30 e
+/// ExceptionAddress, StackTraceWordSize, StackTraceWords e StackTrace (forma
+/// 1) ou ErrorText (forma 2).
+const STOWED_V1: u32 = 0x5345_3031;
+const STOWED_V2: u32 = 0x5345_3032;
+
+/// As exceções guardadas de um 0xC000027B: ExceptionInformation[0] aponta o
+/// vetor de ponteiros e [1] é a quantidade.
+fn stowed_exceptions(root: u64, array: u64, count: u64, out: &mut Payload) {
+    for index in 0..count.min(8) {
+        let Some(entry) = memory::read_u64(root, array.wrapping_add(index * 8)).filter(|&entry| entry != 0) else {
+            let _ = writeln!(out, "    [{}] ponteiro ilegivel", index);
+            continue;
+        };
+        let signature = memory::read_u32(root, entry + 4).unwrap_or(0);
+        if signature != STOWED_V1 && signature != STOWED_V2 {
+            let _ = writeln!(out, "    [{}] {:#x}: assinatura {:#x} desconhecida", index, entry, signature);
+            continue;
+        }
+        let result = memory::read_u32(root, entry + 8).unwrap_or(0);
+        let form = memory::read_u32(root, entry + 0xC).unwrap_or(0);
+        let _ = write!(out, "    [{}] {:#x} ResultCode {:#010x} thread {:#x}", index, entry, result, form >> 2);
+        match form & 3 {
+            1 => {
+                let address = memory::read_u64(root, entry + 0x10).unwrap_or(0);
+                let words = memory::read_u32(root, entry + 0x1C).unwrap_or(0);
+                let trace = memory::read_u64(root, entry + 0x20).unwrap_or(0);
+                let _ = writeln!(out, " endereco {:#x}, pilha de {} palavras em {:#x}", address, words, trace);
+            }
+            2 => {
+                let text = memory::read_u64(root, entry + 0x10).unwrap_or(0);
+                out.push_str(" texto \"");
+                for character in 0..80u64 {
+                    let Some(unit) = memory::read_u16(root, text.wrapping_add(character * 2)).filter(|&unit| unit != 0) else { break };
+                    out.push(if (0x20..0x7F).contains(&unit) { unit as u8 } else { b'?' });
+                }
+                out.push_str("\"\n");
+            }
+            other => {
+                let _ = writeln!(out, " forma {}", other);
+            }
+        }
+    }
+}
+
+/// `exr`: a última exceção do anel 3 relatada ao host.
+pub fn exr_command(owner: usize, out: &mut Payload) {
+    let chance = LAST.chance.load(Ordering::Acquire);
+    if chance == 0 {
+        out.push_str("nenhuma excecao do anel 3 relatada\n");
+        return;
+    }
+    let code = LAST.code.load(Ordering::Relaxed);
+    let what = if LAST.termination.load(Ordering::Relaxed) {
+        "fim do processo com o codigo (NtTerminateProcess)"
+    } else if chance == 1 {
+        "primeira chance"
+    } else {
+        "segunda chance"
+    };
+    let _ = writeln!(out, "excecao do anel 3, {}: {:#010x} {}", what, code, exception_filter::name(code).unwrap_or(""));
+    let cr3 = stop::address_space(owner);
+    let process = LAST.process.load(Ordering::Relaxed);
+    let mut name = [0u8; 16];
+    let length = if process != 0 { super::monitor::process_name(cr3, process, &mut name) } else { 0 };
+    let _ = write!(out, "  processo {:#x} pid {:#x} tid {:#x} ", process, LAST.process_id.load(Ordering::Relaxed), LAST.thread_id.load(Ordering::Relaxed));
+    super::monitor::push_name(out, &name[..length]);
+    out.push(b'\n');
+    let flags = LAST.flags.load(Ordering::Relaxed);
+    let _ = writeln!(out, "  flags {:#x}{} endereco {:#x}", flags, if flags & NONCONTINUABLE != 0 { " (nao continuavel)" } else { "" }, LAST.address.load(Ordering::Relaxed));
+    let count = LAST.count.load(Ordering::Relaxed) as usize;
+    let information: [u64; 15] = core::array::from_fn(|index| LAST.information[index].load(Ordering::Relaxed));
+    if count != 0 {
+        let _ = write!(out, "  parametros ({}):", count);
+        for value in &information[..count] {
+            let _ = write!(out, " {:#x}", value);
+        }
+        out.push(b'\n');
+    }
+    match code {
+        exception_filter::STATUS_STACK_BUFFER_OVERRUN if count >= 1 => {
+            let _ = writeln!(out, "  codigo do fast fail {} {}", information[0], fast_fail_name(information[0]).unwrap_or(""));
+        }
+        0xC000_0005 | 0xC000_0006 if count >= 2 => {
+            let access = match information[0] {
+                0 => "leitura",
+                1 => "escrita",
+                8 => "execucao",
+                _ => "acesso",
+            };
+            let _ = writeln!(out, "  {} em {:#x}", access, information[1]);
+        }
+        exception_filter::STATUS_STOWED_EXCEPTION if count >= 2 => {
+            let _ = writeln!(out, "  {} excecao(oes) guardada(s) em {:#x}:", information[1], information[0]);
+            let root = process_context::root_of(cr3, process).unwrap_or(cr3);
+            stowed_exceptions(root, information[0], information[1], out);
+        }
+        _ => {}
+    }
+}
+
+/// O host se desligou: um passo pendente termina sem parar, e o filtro por
+/// código volta ao padrão.
 pub fn reset() {
     STEP_SILENT.store(true, Ordering::Release);
     BREAK_ON_EXCEPTIONS.store(false, Ordering::Release);
+    exception_filter::clear();
 }

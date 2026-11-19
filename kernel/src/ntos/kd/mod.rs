@@ -19,12 +19,17 @@
 //! reversa: o fluxo de registros com a máquina rodando em `stream`, o
 //! monitor de APIs em `api_monitor`, o rastreador de IRPs em `irp_trace` e
 //! os exploradores do Registro, do namespace e dos arquivos em `explore`.
+//! Robustez da parada: o filtro das exceções do anel 3 por código em
+//! `exception_filter`, o ponto de recuperação da sessão (falta, bugcheck ou
+//! pânico dentro de um comando do host) em `recovery` e os autotestes que o
+//! host pede (`monitor kdtest`) em `self_test`.
 pub mod api_monitor;
 pub mod breakpoints;
 pub mod debug_filter;
 pub mod debug_service;
 pub mod debugger;
 pub mod events;
+pub mod exception_filter;
 pub mod explore;
 pub mod exports;
 pub mod extended_state;
@@ -39,8 +44,10 @@ pub mod page_breakpoints;
 pub mod power;
 pub mod print_log;
 pub mod process_context;
+pub mod recovery;
 pub mod regions;
 pub mod registers;
+pub mod self_test;
 pub mod session;
 pub mod stop;
 pub mod stream;

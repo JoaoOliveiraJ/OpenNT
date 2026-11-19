@@ -31,6 +31,15 @@
 //! FALSE e o bit de presença do KUSER_SHARED_DATA.KdDebuggerEnabled, como o
 //! transporte do NT quando o host responde; o `D` (ou `k`) desfaz, tira os
 //! breakpoints, esvazia o filtro de carga e devolve o modo com confirmação.
+//!
+//! A resposta de parada leva, além do sinal e da thread, `nmi:` numa parada
+//! pedida por NMI e `exception:código;chance:n;` numa exceção do anel 3
+//! (com `term:` quando é o fim do processo com o código). A thread 0 do
+//! protocolo (`Hg0`) é o processador da parada, que numa parada pedida por
+//! um AP não é o dono. Cada pacote roda com o ponto de recuperação armado
+//! (`kd::recovery`): um comando que falta, chama KeBugCheckEx ou entra em
+//! pânico é abandonado, o host recebe o motivo (no texto do `monitor`, ou em
+//! pacote `O` antes de um `E0F`) e a sessão segue.
 
 use core::cell::UnsafeCell;
 use core::fmt::Write;
@@ -97,6 +106,7 @@ fn attach() {
 fn detach() {
     ATTACHED.store(false, Ordering::Release);
     HOST_WAITING.store(false, Ordering::Release);
+    stop::restore_session_breakpoints();
     breakpoints::remove_all();
     super::user_hardware::remove_all();
     super::page_breakpoints::remove_all();
@@ -130,11 +140,24 @@ fn selected(owner: usize) -> usize {
     }
 }
 
-/// Thread do protocolo (hexadecimal; -1 = todas, 0 = qualquer) para
-/// processador.
+/// O processador da parada (o dono, ou o AP que pediu a parada ao BSP).
+fn stop_processor(owner: usize) -> usize {
+    let (_, _, _, number) = stop::stop_reason();
+    if stop::processor_stopped(number) {
+        number
+    } else {
+        owner
+    }
+}
+
+/// Thread do protocolo (hexadecimal; -1 = todas, 0 = qualquer: o
+/// processador da parada) para processador.
 fn parse_thread(text: &[u8], owner: usize) -> Option<usize> {
-    if text == b"-1" || text == b"0" {
+    if text == b"-1" {
         return Some(owner);
+    }
+    if text == b"0" {
+        return Some(stop_processor(owner));
     }
     let thread = packet::parse_number(text)? as usize;
     (thread >= 1 && thread <= MAX_CPUS).then(|| thread - 1)
@@ -170,7 +193,14 @@ fn stop_reply(reply: &mut Payload) {
             let _ = write!(reply, "membp:{:x};", data);
         }
         Kind::Library => library_reason(number, reply),
+        Kind::Nmi => reply.push_str("nmi:;"),
         _ => {}
+    }
+    if let Some(exception) = stop::stop_exception() {
+        let _ = write!(reply, "exception:{:x};chance:{};", exception.code, exception.chance);
+        if exception.termination {
+            reply.push_str("term:;");
+        }
     }
     // Os registradores adiantados: o host decide a parada (breakpoint
     // condicional, de log, passo por cima) sem o `g`.
@@ -230,6 +260,24 @@ enum Action {
     Kill,
 }
 
+/// Um pacote do host a tratar com o ponto de recuperação armado.
+struct CommandCall<'a, 'b> {
+    owner: usize,
+    command: &'a mut [u8],
+    reply: &'a mut Payload<'b>,
+    data: &'a mut [u8],
+    text: &'a mut [u8],
+    action: Action,
+}
+
+/// A rotina que o ponto de recuperação chama (`kd::recovery::run`).
+extern "sysv64" fn run_command(argument: u64) {
+    // SAFETY: `argument` é o CommandCall vivo na pilha de `run`, que espera
+    // a volta desta rotina antes de usá-lo de novo.
+    let call = unsafe { &mut *(argument as *mut CommandCall<'_, '_>) };
+    call.action = handle(call.owner, call.command, call.reply, call.data, call.text);
+}
+
 /// O laço da parada: devolve como a máquina sai.
 pub fn run(number: usize) -> Resume {
     // SAFETY: o dono da parada é o único usuário dos buffers.
@@ -257,8 +305,23 @@ pub fn run(number: usize) -> Resume {
         // ligar a FIFO da UART (uma vez por boot).
         transport::enable_fifo();
         attach();
+        let monitor = input[..length].starts_with(b"qRcmd,");
         let mut reply = Payload::new(&mut output[..]);
-        let action = handle(number, &mut input[..length], &mut reply, &mut data[..], &mut text[..]);
+        let mut call = CommandCall { owner: number, command: &mut input[..length], reply: &mut reply, data: &mut data[..], text: &mut text[..], action: Action::Reply };
+        let completed = super::recovery::run(number, run_command, &mut call as *mut CommandCall<'_, '_> as u64);
+        let action = core::mem::replace(&mut call.action, Action::Reply);
+        if !completed {
+            // O comando foi abandonado: o host recebe o motivo (no texto do
+            // `monitor`, que então responde OK; senão antes de um erro).
+            let mut message = Payload::new(&mut text[..]);
+            super::recovery::describe(&mut message);
+            let length = message.len();
+            send_console(&text[..length]);
+            reply.clear();
+            reply.push_str(if monitor { "OK" } else { "E0F" });
+            packet::send(reply.as_bytes());
+            continue;
+        }
         match action {
             Action::Reply => {
                 packet::send(reply.as_bytes());
@@ -269,8 +332,10 @@ pub fn run(number: usize) -> Resume {
             }
             Action::Resume(resume) => {
                 HOST_WAITING.store(true, Ordering::Release);
-                // Os comparadores de usuário voltam às threads (as novas os
+                // Os breakpoints que um comando atingiu voltam, os
+                // comparadores de usuário voltam às threads (as novas os
                 // recebem aqui) e o TLB sai se as PTEs mudaram.
+                stop::restore_session_breakpoints();
                 super::user_hardware::refresh();
                 super::page_breakpoints::resume();
                 process_context::clear();
@@ -571,10 +636,17 @@ fn resume(owner: usize, command: u8, text: &[u8], reply: &mut Payload) -> Action
         reply.push_str("E01");
         return Action::Reply;
     };
+    let step = command == b's' || command == b'S';
+    if step && !stop::step_allowed() {
+        // Parada pedida por um AP (o passo roda só no dono) ou segunda chance
+        // (o processo termina): sem passo.
+        reply.push_str("E01");
+        return Action::Reply;
+    }
     if let Some(address) = address {
         view.set_rip(address);
     }
-    if command == b's' || command == b'S' {
+    if step {
         return Action::Resume(Resume::Step);
     }
     Action::Resume(Resume::Continue { pass: signal != 0 })
@@ -610,6 +682,10 @@ fn v_packet(owner: usize, command: &[u8], reply: &mut Payload) -> Action {
             continue;
         }
         match verb.first() {
+            Some(b's') | Some(b'S') if !stop::step_allowed() => {
+                reply.push_str("E01");
+                return Action::Reply;
+            }
             Some(b's') | Some(b'S') => return Action::Resume(Resume::Step),
             Some(b'c') => return Action::Resume(Resume::Continue { pass: false }),
             Some(b'C') => {
@@ -658,7 +734,7 @@ fn query(owner: usize, command: &[u8], reply: &mut Payload, text: &mut [u8]) {
     } else if command == b"qAttached" {
         reply.push_str("1");
     } else if command == b"qC" {
-        let _ = write!(reply, "QC{:x}", owner + 1);
+        let _ = write!(reply, "QC{:x}", stop_processor(owner) + 1);
     } else if command == b"qfThreadInfo" {
         reply.push(b'm');
         let mut first = true;

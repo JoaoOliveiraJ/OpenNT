@@ -65,8 +65,10 @@ pub fn output(text: &str) {
     }
     transport::unlock();
     crate::hal::cpu::restore_interrupts(flags);
-    // Um 0x03 consumido durante a espera de confirmação é a parada pedida.
+    // Um 0x03 consumido durante a espera de confirmação é a parada pedida, e
+    // o host espera a resposta de parada (o byte já saiu da porta).
     if packet::take_interrupt() {
+        session::set_host_waiting();
         stop::break_in_now();
     }
 }

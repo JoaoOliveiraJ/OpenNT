@@ -145,6 +145,11 @@ fn nt_terminate_process(handle: u64, exit_code: u64, _a3: u64, _a4: u64, _rsp: u
     if let Some(thread) = threads::current() {
         let rsp = pcr::current().user_rsp.get();
         thread.with(|thread| thread.termination_rsp = rsp);
+        // O depurador do kernel vê o fim com um código da tabela dele (o
+        // RaiseFailFastException sem o WER termina assim), com a thread na
+        // chamada: o CONTEXT da syscall.
+        let (context, teb) = thread.with(|thread| (thread.context, thread.teb_va));
+        crate::ntos::kd::user_debug::terminating(context, teb, status);
     }
     crate::debug_print!("[usermode] NtTerminateProcess(exit={:#x})", exit_code as u32);
     crate::ntos::ps::create::begin_termination(target, status);

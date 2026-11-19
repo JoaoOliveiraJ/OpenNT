@@ -53,6 +53,8 @@ const EXIT_INTERVAL: u32 = 2;
 /// O serviço de depuração (`int 0x2D`), que o anel 3 chama pelo portão de
 /// DPL 3 da IDT.
 const DEBUG_SERVICE_VECTOR: u32 = 0x2D;
+/// O `__fastfail` (`int 0x29`), que a HAL salva como STATUS_STACK_BUFFER_OVERRUN.
+const FAST_FAIL_VECTOR: u32 = 0x29;
 
 const _: () = assert!(CONTEXT_EX_OFFSET + ContextEx::SIZE <= RECORD_OFFSET && RECORD_OFFSET + RECORD_SIZE <= MACHINE_OFFSET && MachineFrame::SIZE <= MACHINE_SIZE);
 const _: () = assert!(RECORD_OFFSET + RECORD_SLOT == MACHINE_OFFSET && CONTEXT_EX_OFFSET + 0x20 == RECORD_OFFSET);
@@ -144,6 +146,9 @@ pub fn deliver(thread: &UserThread, record: &[u8]) -> u32 {
         }
         Err(status) => {
             crash_report::undeliverable(thread, &fault, status);
+            // Sem entrega, é a segunda chance: o depurador do kernel a vê
+            // antes do fim do processo (`monitor sx`).
+            crate::ntos::kd::user_debug::second_chance(live_context(thread), thread.with(|thread| thread.teb_va), record);
             status
         }
     }
@@ -265,6 +270,19 @@ pub fn hardware(thread: &UserThread, status: u32) -> u32 {
     let mut record = alloc::vec![0u8; RECORD_SIZE as usize];
     let mut put = |offset: usize, bytes: &[u8]| record[offset..offset + bytes.len()].copy_from_slice(bytes);
     put(offset_of!(ExceptionRecord, exception_code), &status.to_le_bytes());
+    if vector == FAST_FAIL_VECTOR {
+        // O `__fastfail` não é entregue ao processo: o KiFastFailDispatch do
+        // 19041 (0x412280) monta o registro (STATUS_STACK_BUFFER_OVERRUN,
+        // EXCEPTION_NONCONTINUABLE, o RIP depois do `int 0x29` e o código do
+        // RCX em ExceptionInformation[0]) e vai direto à segunda chance, que
+        // termina o processo. O depurador do kernel a vê antes.
+        put(offset_of!(ExceptionRecord, exception_flags), &1u32.to_le_bytes());
+        put(offset_of!(ExceptionRecord, exception_address), &block.fault_rip.get().to_le_bytes());
+        put(offset_of!(ExceptionRecord, number_parameters), &1u32.to_le_bytes());
+        put(offset_of!(ExceptionRecord, exception_information), &block.fault_rcx.get().to_le_bytes());
+        crate::ntos::kd::user_debug::second_chance(live, thread.with(|thread| thread.teb_va), &record);
+        return status;
+    }
     if vector == DEBUG_SERVICE_VECTOR {
         // KiDebugServiceTrap: o RIP salvo é o do `int3` depois do `int 0x2D`;
         // o endereço da exceção fica depois dele e o serviço (RAX) vai em
@@ -305,8 +323,9 @@ pub fn hardware(thread: &UserThread, status: u32) -> u32 {
             return 0;
         }
     }
-    // O depurador do kernel antes da entrega (breakpoints de usuário, passo).
-    if crate::ntos::kd::user_debug::exception(live, vector, thread.with(|thread| thread.teb_va)) {
+    // O depurador do kernel antes da entrega (breakpoints de usuário, passo,
+    // o filtro por código).
+    if crate::ntos::kd::user_debug::exception(live, vector, thread.with(|thread| thread.teb_va), &record) {
         return 0;
     }
     deliver(thread, &record)
@@ -335,6 +354,20 @@ pub fn raise(record: u64, context: u64, first_chance: u64) -> Result<u32, Kernel
                 thread.with(|thread| thread.termination_rsp = rsp);
             }
             crash_report::second_chance(&captured, context);
+            // O depurador do kernel vê a segunda chance com uma cópia do
+            // CONTEXT de quem levantou (`monitor sx`).
+            if let Some(thread) = threads::current().filter(|_| crate::ntos::kd::session::attached()) {
+                let copy = guest::alloc_bytes(CONTEXT_SIZE);
+                if copy != 0 {
+                    let saved = guest::try_read_bytes(context, CONTEXT_SIZE as usize);
+                    if let Ok(saved) = saved {
+                        guest::write_bytes(copy, &saved);
+                        // SAFETY: cópia do kernel, alinhada a 16, do tamanho do CONTEXT.
+                        crate::ntos::kd::user_debug::second_chance(unsafe { Context::at(copy) }, thread.with(|thread| thread.teb_va), &captured);
+                    }
+                    guest::free_bytes(copy);
+                }
+            }
             usermode::block().exit_code.set(code);
             return Ok(state::TERMINATE_MAGIC);
         }
@@ -429,6 +462,11 @@ pub fn pending(thread: &UserThread) -> u32 {
         for (register, value) in [&live.dr0, &live.dr1, &live.dr2, &live.dr3, &live.dr6, &live.dr7].into_iter().zip(registers::debug_registers(values, 1)) {
             register.set(value);
         }
+    }
+    // A primeira chance de uma exceção de software passa pelo filtro do
+    // depurador do kernel antes da entrega (`monitor sx`).
+    if crate::ntos::kd::user_debug::raised(live, thread.with(|thread| thread.teb_va), &record) {
+        return 0;
     }
     deliver(thread, &record)
 }
