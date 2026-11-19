@@ -150,6 +150,9 @@ impl Target {
         let words: Vec<&str> = text.split_whitespace().collect();
         match words.as_slice() {
             ["lm"] => format!("              base                fim  nome             caminho\n{}", self.modules.join("")),
+            // Os processos e as threads (os laços dos roteiros).
+            ["ps"] => "   PID           EPROCESS                CR3 threads  nome\n     4 0xffffe00000001000           0x1ab000       2  System\n   100 0xffffe00000042000           0x2cd000       1  smss.exe\n   500 0xffffc00000500000           0x2bb000       5  csrss.exe\n".to_string(),
+            ["threads"] => "   PID    TID            ETHREAD estado                    inicio  processo\n     4      8 0xffffe00000003000 Waiting       0xfffff80040100000  System\n     4     12 0xffffe00000004000 Waiting       0xfffff80040102000  System\n   100    104 0xffffe00000043000 Running       0xfffff80040103000  smss.exe\n".to_string(),
             ["bl"] => "nenhum breakpoint\n".to_string(),
             ["membp", "set", address, length, kind] => {
                 let address = kd_client::parse_number(address).unwrap_or(0);
@@ -191,7 +194,6 @@ impl Target {
             ["fs", "read", ..] => "dados\t/teste.txt\t5\t5\t\n".to_string(),
             // Os objetos do NT (`nt_objects`): processos, handles e as
             // consultas do `kd/objects.rs`.
-            ["ps"] => "   PID           EPROCESS                CR3 threads  nome\n     4 0xffffc00000004000 0x1aa000       3  System\n   500 0xffffc00000500000 0x2bb000       5  csrss.exe\n".to_string(),
             ["handles", "0xffffc00000500000", "0"] => "EPROCESS 0xffffc00000500000 HANDLE_TABLE 0xffffc00000600000 TableCode 0xffffc00000610000 entradas 4\n  handle             objeto     acesso tipo             nome\n     0x4 0xffffc00000700000   0x1f0003 Event            \\BaseNamedObjects\\x\n     0x8 0xffffc00000800000   0x1f0001 ALPC Port        \\Windows\\ApiPort\n     0xc 0xffffc00000900000   0x1f0003 IoCompletion     \n".to_string(),
             ["obtypes"] => "ObHeaderCookie 0x5a\nINDICE        OBJECT_TYPE  OBJETOS  HANDLES NOME\n     7 0xffffc00000100000       12        3 Process\n    46 0xffffc00000200000        2        1 ALPC Port\n".to_string(),
             ["alpc", port] => format!("ALPC {port} tipo alpc fechada 0 handles 1 PID 500 TID 504 processo 0xffffc00000500000\npapel Listener conexao 0\nfila-do-servidor 2\n"),

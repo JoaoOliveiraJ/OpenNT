@@ -29,6 +29,8 @@
 //!   threads de usuário com o CONTEXT salvo);
 //! - `client`, `commands`: a sessão (comandos de texto e a API tipada que a
 //!   interface gráfica usa);
+//! - `kd_script`: os roteiros do `--script` (conferências, variáveis,
+//!   condições, laços, esperas pela COM1 e tratadores de parada);
 //! - `analysis`: decodificador, grafo de fluxo, limites de função e laços,
 //!   argumentos de chamadas e protótipos, referências e strings, padrões,
 //!   roteiros e as notas e patches por módulo + RVA;
@@ -61,6 +63,7 @@ pub mod expr;
 pub mod hmp;
 pub mod image;
 pub mod irp_timeline;
+pub mod kd_script;
 pub mod launcher;
 pub mod monitor;
 pub mod monitoring;

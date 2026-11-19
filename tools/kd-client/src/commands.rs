@@ -67,15 +67,9 @@
 //! detach | quit
 //! ```
 //!
-//! Roteiro (`--script`): uma linha por comando, `#` comenta, e as
-//! conferências `expect <texto>` (a saída do comando anterior contém o
-//! texto), `expect-stop <texto>` (a última parada), `expect-console
-//! <texto>` (a saída do DbgPrint recebida), `expect-eq <expr> <expr>`,
-//! `save <nome> <expr>` (vira `$nome`), `save-word <nome> <texto> <coluna> [ocorrência]`
-//! (um número da saída anterior), `save-thread <nome> <texto> <coluna> <módulo>`
-//! (a primeira thread dessas linhas com um quadro do módulo na pilha),
-//! `wait-serial <texto>` (o texto no log da
-//! COM1), `echo <texto>` e `sleep <ms>`.
+//! Os roteiros (`--script`: conferências, variáveis, condições, laços,
+//! esperas e tratadores de parada em volta destes comandos) ficam em
+//! `kd_script`.
 
 use std::time::{Duration, Instant};
 
@@ -180,7 +174,7 @@ impl TraceOptions {
 }
 
 /// Divide em duas expressões no primeiro espaço fora de colchetes.
-fn split_two(text: &str) -> Option<(&str, &str)> {
+pub(crate) fn split_two(text: &str) -> Option<(&str, &str)> {
     let mut depth = 0;
     for (index, character) in text.char_indices() {
         match character {
@@ -1072,112 +1066,6 @@ impl Client {
             "apimon", "irptrace", "reg", "regv", "objdir", "fsls", "fscat", "dtv", "rstep", "rcont", "snap",
             "!procs", "!threads", "!waits", "!handles", "!obj", "!obtypes", "!token", "!iocp", "!waitpkt", "!alpc", "!wnf", "!hives",
         ]
-    }
-
-    /// Roda um roteiro; a primeira conferência que falha encerra.
-    pub fn run_script(&mut self, script: &str) -> Result<(), String> {
-        let mut last_output = String::new();
-        for (number, raw) in script.lines().enumerate() {
-            let line = raw.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            println!("[kd-script] > {line}");
-            let fail = |message: String| format!("roteiro, linha {}: {line}: {message}", number + 1);
-            let (command, rest) = line.split_once(char::is_whitespace).map_or((line, ""), |(command, rest)| (command, rest.trim()));
-            match command {
-                "expect" => {
-                    if !last_output.contains(rest) {
-                        return Err(fail(format!("saida sem {rest:?}:\n{last_output}")));
-                    }
-                }
-                "expect-stop" => {
-                    if !self.last_stop.contains(rest) {
-                        return Err(fail(format!("ultima parada sem {rest:?}: {}", self.last_stop)));
-                    }
-                }
-                "expect-console" => {
-                    self.collect_console();
-                    if !self.console.contains(rest) {
-                        return Err(fail(format!("saida do DbgPrint sem {rest:?}:\n{}", self.console)));
-                    }
-                }
-                "expect-eq" => {
-                    let (left, right) = split_two(rest).ok_or_else(|| fail("uso: expect-eq <expr> <expr>".into()))?;
-                    let (a, b) = (self.evaluate(left).map_err(&fail)?, self.evaluate(right).map_err(&fail)?);
-                    if a != b {
-                        return Err(fail(format!("{left} = {a:#x}, {right} = {b:#x}")));
-                    }
-                    println!("[kd-script]   {a:#x} == {b:#x}");
-                }
-                "save" => {
-                    let (name, expression) = split_two(rest).ok_or_else(|| fail("uso: save <nome> <expr>".into()))?;
-                    let value = self.evaluate(expression).map_err(&fail)?;
-                    self.variables.insert(name.to_string(), value);
-                    println!("[kd-script]   ${name} = {value:#x}");
-                }
-                "save-word" => {
-                    // save-word <nome> <texto da linha> <coluna> [ocorrência]:
-                    // um número da linha da saída anterior que contém o texto
-                    // (a primeira, ou a N-ésima delas).
-                    let mut parts = rest.split_whitespace();
-                    let (Some(name), Some(needle), Some(column)) = (parts.next(), parts.next(), parts.next().and_then(|text| text.parse::<usize>().ok())) else {
-                        return Err(fail("uso: save-word <nome> <texto> <coluna> [ocorrencia]".into()));
-                    };
-                    let occurrence = match parts.next() {
-                        Some(text) => text.parse::<usize>().ok().filter(|&value| value >= 1).ok_or_else(|| fail("uso: save-word <nome> <texto> <coluna> [ocorrencia]".into()))?,
-                        None => 1,
-                    };
-                    let value = last_output.lines().filter(|line| line.contains(needle)).nth(occurrence - 1).and_then(|line| line.split_whitespace().nth(column)).and_then(parse_number).ok_or_else(|| fail(format!("nenhuma linha {occurrence} com {needle:?} e numero na coluna {column}")))?;
-                    self.variables.insert(name.to_string(), value);
-                    println!("[kd-script]   ${name} = {value:#x}");
-                }
-                "save-thread" => {
-                    // save-thread <nome> <texto da linha> <coluna> <módulo>: das
-                    // linhas da saída anterior com o texto (o ETHREAD na
-                    // coluna), a primeira thread cuja pilha tem um quadro no
-                    // módulo; não depende da ordem da lista.
-                    let mut parts = rest.split_whitespace();
-                    let (Some(name), Some(needle), Some(column), Some(module)) = (parts.next(), parts.next(), parts.next().and_then(|text| text.parse::<usize>().ok()), parts.next()) else {
-                        return Err(fail("uso: save-thread <nome> <texto> <coluna> <modulo>".into()));
-                    };
-                    let candidates: Vec<u64> = last_output.lines().filter(|line| line.contains(needle)).filter_map(|line| line.split_whitespace().nth(column)).filter_map(parse_number).collect();
-                    let mut chosen = None;
-                    for thread in candidates {
-                        let Ok((_, frames)) = self.thread_backtrace(thread, 32) else { continue };
-                        let in_module = frames.iter().any(|frame| self.symbols.module_at(frame.address).is_some_and(|found| found.name.eq_ignore_ascii_case(module) || found.file_name.eq_ignore_ascii_case(module)));
-                        if in_module {
-                            chosen = Some(thread);
-                            break;
-                        }
-                    }
-                    let value = chosen.ok_or_else(|| fail(format!("nenhuma thread das linhas com {needle:?} tem quadro no modulo {module}")))?;
-                    self.variables.insert(name.to_string(), value);
-                    println!("[kd-script]   ${name} = {value:#x}");
-                }
-                "wait-serial" => {
-                    // O texto em qualquer ponto do log da COM1 (a ordem entre as
-                    // tarefas do kernel não importa).
-                    let serial = self.serial.clone().ok_or_else(|| fail("sem o log da COM1 neste modo".into()))?;
-                    let deadline = Instant::now() + Duration::from_secs(300);
-                    while !serial.lock().unwrap().contains(rest) {
-                        if Instant::now() > deadline {
-                            return Err(fail("tempo esgotado esperando o texto na COM1".into()));
-                        }
-                        std::thread::sleep(Duration::from_millis(100));
-                    }
-                }
-                "echo" => println!("[kd-script] {rest}"),
-                "sleep" => std::thread::sleep(Duration::from_millis(parse_number(rest).unwrap_or(1000))),
-                _ => {
-                    last_output = self.execute(line).map_err(&fail)?;
-                    for output_line in last_output.lines() {
-                        println!("[kd-script]   {output_line}");
-                    }
-                }
-            }
-        }
-        Ok(())
     }
 }
 

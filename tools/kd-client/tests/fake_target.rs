@@ -4,13 +4,17 @@
 //! pointers, os breakpoints (ligar, desligar, religar, tirar) e o passo por
 //! cima de um `call`, inclusive o retorno numa recursão mais funda (o
 //! cliente segue sozinho até o RSP certo), o breakpoint condicional e a
-//! parada pela carga de um módulo.
+//! parada pela carga de um módulo. E os roteiros (`kd_script`): o log que
+//! sai à medida que chega, os tratadores de parada, as condições, os laços
+//! e as mensagens de erro.
 
 mod support;
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use kd_client::client::{BreakpointOptions, BreakpointRequest, Resumed};
+use kd_client::kd_script::ScriptOptions;
 use kd_client::BreakpointKind;
 use support::fake_stub::{connect, connect_replay, start, Stop, CODE, STACK, USER_DATA};
 
@@ -270,4 +274,121 @@ fn memory_breakpoint_by_page() {
     client.execute(&format!("bpmc {:#x}", USER_DATA)).unwrap();
     assert!(client.breakpoints().is_empty());
     assert!(client.monitor("membp").unwrap().contains("nenhum"));
+}
+
+/// O roteiro: as linhas do breakpoint de log saem na transcrição à medida
+/// que chegam (antes da parada), o tratador da parada roda e deixa a
+/// máquina parada, as condições, os laços pelas linhas, processos e
+/// threads, as variáveis tiradas da saída e as esperas pela COM1 com prazo.
+#[test]
+fn script_log_lines_handlers_conditions_and_loops() {
+    // Dois acertos do breakpoint de log (RAX 1 e 2) e a parada no chamador.
+    let stops = vec![
+        Stop { rip: CODE + 0x10, rsp: STACK, packet: "T05thread:1;swbreak:;", rax: 1, load: None },
+        Stop { rip: CODE + 0x10, rsp: STACK, packet: "T05thread:1;swbreak:;", rax: 2, load: None },
+        Stop { rip: CODE + 0x2000, rsp: STACK, packet: "T05thread:1;swbreak:;", rax: 7, load: None },
+    ];
+    let (address, log) = start(stops);
+    let mut client = connect(&address);
+    client.set_serial(Arc::new(Mutex::new("[boot] ok\n[shell] pronto\n".to_string())));
+    let transcript = std::env::temp_dir().join(format!("kd-script-teste-{}.log", std::process::id()));
+    let script = r#"
+bp kernel::alvo::corrente+0x10 /log "rax={@rax:d}"
+bp kernel::alvo::chamador
+set contador 0
+on-break kernel::alvo::chamador {
+    save contador $contador+1
+    expect-stop chamador
+    stop
+}
+continue
+wait-stop 10000
+expect-stop breakpoint #1
+expect-eq $contador 1
+expect-eq $hits 1
+expect-eq @rax 7
+if console-has rax=2 {
+    echo o log chegou
+} else {
+    fail sem o log
+}
+bl
+for-each line linha containing software {
+    echo ${linha.0}
+}
+expect-eq $linha_count 2
+ps
+save-after cr3 0xffffe00000042000
+expect-eq $cr3 0x2cd000
+save-text nome smss.exe -1
+for-each process p name smss {
+    leave
+}
+expect-eq $p_pid 100
+expect-eq $p 0xffffe00000042000
+if "${p_name}" != "${nome}" {
+    fail nome errado: ${p_name}
+}
+for-each thread t state Waiting process System {
+    next
+}
+expect-eq $t_count 2
+expect-eq $t_tid 12
+if wait-serial /t 200 nunca-aparece {
+    fail achou o que nao existe
+}
+wait-serial /t 1000 [shell] pronto
+repeat 3 volta {
+    save ultima $volta
+}
+expect-eq $ultima 2
+"#;
+    let options = ScriptOptions { name: "teste.txt".into(), transcript: Some(transcript.clone()) };
+    let result = client.run_script_with(script, &options);
+    let text = std::fs::read_to_string(&transcript).unwrap_or_default();
+    let _ = std::fs::remove_file(&transcript);
+    result.unwrap();
+    // O breakpoint de log seguiu sozinho duas vezes; o tratador deixou a
+    // máquina parada no chamador.
+    assert_eq!(log.lock().unwrap().iter().filter(|packet| *packet == "c").count(), 3);
+    assert!(client.is_stopped());
+    let first_log = text.find("[kd-log] [bp #0] rax=1").expect(&text);
+    let second_log = text.find("[kd-log] [bp #0] rax=2").expect(&text);
+    let handler = text.find("> on-break kernel::alvo::chamador (linha 5)").expect(&text);
+    assert!(first_log < second_log && second_log < handler, "{text}");
+    assert!(text.contains("[kd-log] [bp #1] acerto 1"), "{text}");
+    assert!(text.contains("[kd-script] [on-break #1] > save contador $contador+1"), "{text}");
+    assert!(text.contains("[kd-script] o log chegou") && text.contains("[kd-script] #0") && text.contains("[kd-script] #1"), "{text}");
+    assert!(text.contains("for-each process p name smss: 1 itens"), "{text}");
+}
+
+/// Uma conferência que falha mostra a linha, o comando anterior e a saída
+/// dele; um erro de sintaxe sai antes de rodar; um erro dentro de um laço
+/// diz a volta.
+#[test]
+fn script_errors_show_the_command_output_and_line() {
+    let (address, _) = start(Vec::new());
+    let mut client = connect(&address);
+    let error = client.run_script("x %rsp 16\n# comentario\nexpect nada-disso\n").unwrap_err();
+    assert!(error.starts_with("roteiro, linha 3: expect nada-disso: a saida do comando anterior nao tem \"nada-disso\""), "{error}");
+    assert!(error.contains("comando (linha 1): x %rsp 16"), "{error}");
+    assert!(error.contains("  | 0xffff800000100f00"), "{error}");
+    let error = client.run_script("if 1 {\necho x\n").unwrap_err();
+    assert!(error.contains("linha 1: if 1 {: if sem }"), "{error}");
+    let error = client.run_script("set n 2\nrepeat 3 i {\n  if $i == $n {\n    fail volta ${i}\n  }\n}\n").unwrap_err();
+    assert!(error.contains("linha 4: fail volta ${i} (= fail volta 0x2): volta 0x2"), "{error}");
+    assert!(error.contains("dentro de: repeat da linha 2, volta 3 de 3"), "{error}");
+}
+
+/// Um tratador sem `stop` faz a máquina seguir: a espera continua até o
+/// acerto em que ele a deixa parada.
+#[test]
+fn script_handler_resumes_until_it_stops() {
+    let stops = (1..=3).map(|rax| Stop { rip: CODE + 0x10, rsp: STACK, packet: "T05thread:1;swbreak:;", rax, load: None }).collect();
+    let (address, log) = start(stops);
+    let mut client = connect(&address);
+    let script = "bp kernel::alvo::corrente+0x10\non-break #0 {\n    print acerto {$hits:d} rax={@rax:d}\n    if $hits >= 3 {\n        stop\n    }\n}\ncontinue\nwait-stop 10000\nexpect-eq @rax 3\nexpect-eq $hits 3\non-break #0 off\n";
+    client.run_script(script).unwrap();
+    assert_eq!(log.lock().unwrap().iter().filter(|packet| *packet == "c").count(), 3);
+    assert!(client.is_stopped());
 }
