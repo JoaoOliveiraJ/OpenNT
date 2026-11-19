@@ -644,13 +644,19 @@ impl Client {
         links
     }
 
+    /// Um número do argumento: decimal ou `0x` direto (o PID decimal do
+    /// `ps`), senão a expressão (`$nome`, `@reg`).
+    fn evaluate_number_argument(&mut self, text: &str) -> Result<u64, String> {
+        match parse_number(text) {
+            Some(value) => Ok(value),
+            None => self.evaluate(text),
+        }
+    }
+
     /// Um processo do argumento: PID (decimal ou `0x`), EPROCESS ou uma
     /// expressão (`$nome`).
     fn object_process(&mut self, text: &str) -> Result<Process, String> {
-        let value = match parse_number(text) {
-            Some(value) => value,
-            None => self.evaluate(text)?,
-        };
+        let value = self.evaluate_number_argument(text)?;
         let processes = self.processes()?;
         processes.into_iter().find(|process| if value < 0x1_0000_0000 { process.pid == value } else { process.eprocess == value }).ok_or_else(|| format!("{text}: processo nao encontrado (ps)"))
     }
@@ -1030,12 +1036,12 @@ impl Client {
         if argument.is_empty() {
             return Err(format!("uso: !{query} <pid|endereco>"));
         }
-        let small = parse_number(argument).is_some_and(|value| value < 0x1_0000_0000);
-        if !small || argument.starts_with('\\') {
-            let body = self.object_body(argument)?;
-            return self.monitor(&format!("{query} {body:#x}"));
+        // O valor vem antes da escolha: um `$pid` do save-word é processo.
+        let value = if argument.starts_with('\\') { self.object_body(argument)? } else { self.evaluate_number_argument(argument)? };
+        if value >= 0x1_0000_0000 {
+            return self.monitor(&format!("{query} {value:#x}"));
         }
-        let process = self.object_process(argument)?;
+        let process = self.object_process(&format!("{value:#x}"))?;
         let handles: Vec<Handle> = self.process_handles(process.eprocess)?.into_iter().filter(|handle| handle.kind == type_name).collect();
         let mut output = format!("EPROCESS {:#x} PID {} {}: {} handles {}\n", process.eprocess, process.pid, process.name, handles.len(), type_column(type_name));
         for handle in handles.iter().take(OBJECTS_PER_PROCESS) {
@@ -1053,11 +1059,8 @@ impl Client {
         if argument.is_empty() {
             return Err("uso: !token <pid|eprocess|endereco do token>".into());
         }
-        let value = match parse_number(argument) {
-            Some(value) => value,
-            None => self.evaluate(argument)?,
-        };
-        let process = if value < 0x1_0000_0000 { Some(self.object_process(argument)?) } else { self.processes()?.into_iter().find(|process| process.eprocess == value) };
+        let value = self.evaluate_number_argument(argument)?;
+        let process = if value < 0x1_0000_0000 { Some(self.object_process(&format!("{value:#x}"))?) } else { self.processes()?.into_iter().find(|process| process.eprocess == value) };
         let token = match &process {
             Some(process) => {
                 let mut layouts = self.layouts()?;
