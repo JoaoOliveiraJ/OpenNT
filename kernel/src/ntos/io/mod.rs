@@ -56,6 +56,7 @@ pub mod redirection_trust;
 pub mod paging_io;
 pub mod share_access;
 pub mod arc_name;
+pub mod boot_partition;
 pub mod shutdown;
 pub mod device_removal;
 pub mod root_device;

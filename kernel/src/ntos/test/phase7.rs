@@ -7056,6 +7056,7 @@ pub fn run(assert: Assert) {
     super::reparse_points::run(assert);
     super::volume_notify_locks::run(assert);
     super::volume_open::run(assert);
+    super::volume_mountdev::run(assert);
     user_handle_operations(assert);
     user_events_and_semaphores(assert);
     super::keyed_events::run(assert);

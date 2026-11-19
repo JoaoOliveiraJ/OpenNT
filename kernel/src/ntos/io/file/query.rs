@@ -166,10 +166,26 @@ fn metadata(selected: &Selected) -> Result<Option<Metadata>, u32> {
     }))
 }
 
+/// O nome da FILE_NORMALIZED_NAME_INFORMATION (48) de um FILE_OBJECT: o
+/// FileName (o nome relativo ao dispositivo que o IopParseDevice deixou) com
+/// cada componente no nome longo gravado, num arquivo do volume NTFS de boot
+/// (`volume_files::normalized_device_name`); nos outros, o FileName como
+/// está. A raiz é `\`.
+fn normalized_name(file: u64) -> String {
+    let name = crate::ntos::rtl::guest_strings::read_unicode_string(file_at(file).file_name.address());
+    let boot_volume = crate::drivers::fs::ntfs::fixed().filter(|&fixed| zw_files::file_backing(file).is_some_and(|(volume, _)| crate::drivers::fs::volume::same(volume, fixed)));
+    match boot_volume {
+        Some(volume) => crate::drivers::fs::volume_files::normalized_device_name(volume, &name),
+        None if name.is_empty() => String::from("\\"),
+        None => name,
+    }
+}
+
 /// Serializa a classe pedida; devolve (status, information).
 fn format(info: &Metadata, selected: &Selected, class: u32, buffer: u64, length: u32, mode: u8) -> (u32, Option<u64>) {
     let stat = &info.stat;
-    let name: alloc::vec::Vec<u16> = info.name.replace('/', "\\").encode_utf16().collect();
+    let text = if class == 48 { normalized_name(selected.pointer) } else { info.name.replace('/', "\\") };
+    let name: alloc::vec::Vec<u16> = text.encode_utf16().collect();
     let name_bytes = name.len() as u32 * 2;
     let name_offset = core::mem::offset_of!(FileNameInformation, file_name) as u32;
     let all_name_offset = core::mem::offset_of!(FileAllInformation, name_information) as u32;
@@ -179,7 +195,7 @@ fn format(info: &Metadata, selected: &Selected, class: u32, buffer: u64, length:
         6 => FileInternalInformation::SIZE as u32,
         7 => FileEaInformation::SIZE as u32,
         8 => FileAccessInformation::SIZE as u32,
-        9 => name_offset + name_bytes,
+        9 | 48 => name_offset + name_bytes,
         14 => FilePositionInformation::SIZE as u32,
         16 => FileModeInformation::SIZE as u32,
         17 => FileAlignmentInformation::SIZE as u32,
@@ -189,8 +205,8 @@ fn format(info: &Metadata, selected: &Selected, class: u32, buffer: u64, length:
         59 => FileIdInformation::SIZE as u32,
         _ => return (CLASS, None),
     };
-    let variable = class == 9 || class == 18;
-    let head = if class == 9 { name_offset } else { all_name_offset + name_offset };
+    let variable = matches!(class, 9 | 18 | 48);
+    let head = if class == 18 { all_name_offset + name_offset } else { name_offset };
     if length < if variable { head } else { needed } {
         return (SHORT, None);
     }
@@ -237,7 +253,8 @@ fn format(info: &Metadata, selected: &Selected, class: u32, buffer: u64, length:
             6 => FileInternalInformation::at(scratch).index_number.quad_part.set(reference as i64),
             7 => FileEaInformation::at(scratch).ea_size.set(stat.ea_size),
             8 => FileAccessInformation::at(scratch).access_flags.set(selected.access),
-            9 => name_information(FileNameInformation::at(scratch)),
+            // FILE_NORMALIZED_NAME_INFORMATION tem o layout do FILE_NAME_INFORMATION.
+            9 | 48 => name_information(FileNameInformation::at(scratch)),
             14 => FilePositionInformation::at(scratch).current_byte_offset.quad_part.set(info.position as i64),
             16 => FileModeInformation::at(scratch).mode.set(mode_flags),
             17 => FileAlignmentInformation::at(scratch).alignment_requirement.set(alignment),

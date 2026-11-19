@@ -56,6 +56,16 @@
 //!   FSCTL_DISMOUNT_VOLUME dão STATUS_ACCESS_DENIED (volume de boot e de
 //!   paginação, com arquivos abertos) e FSCTL_UNLOCK_VOLUME dá
 //!   STATUS_NOT_LOCKED.
+//!
+//! O dispositivo real responde também a interface MOUNTDEV do volume, como
+//! o volmgr.sys de um volume básico ([`mount_control`]): o nome do
+//! dispositivo, o identificador único ("DMIO:ID:" e o GUID estável do
+//! volume), o GUID estável, nenhuma letra sugerida, LINK_CREATED/DELETED e
+//! VOLUME_ONLINE. Sem PDO nem gerenciador de volumes, o volume chega ao
+//! mountmgr.sys real pelo IOCTL_MOUNTMGR_VOLUME_ARRIVAL_NOTIFICATION
+//! ([`announce_to_mount_manager`], no boot do smss por
+//! `io/boot_partition.rs`), e o mountmgr.sys dá a ele o nome
+//! `\??\Volume{...}` e a letra.
 
 use alloc::collections::BTreeSet;
 use alloc::string::String;
@@ -63,6 +73,7 @@ use alloc::vec::Vec;
 
 use super::volume::{self, DiskExtent, FileSystem};
 use crate::ntos::inc::field::NtStruct;
+use crate::ntos::inc::types::extra_fs_fat::{MountdevName, MountdevUniqueId};
 use crate::ntos::inc::types::extra_fs_ntfs::ShareAccess;
 use crate::ntos::inc::types::{DeviceObject, DriverExtension, DriverObject, FileObject, IoSecurityContext, IoStackLocation, Irp, Mdl, Vpb};
 use crate::ntos::io::{file_system, io_manager, share_access};
@@ -123,6 +134,24 @@ const IOCTL_DISK_GET_LENGTH_INFO: u32 = 0x0007_405C;
 const IOCTL_DISK_IS_WRITABLE: u32 = 0x0007_0024;
 const IOCTL_STORAGE_GET_DEVICE_NUMBER: u32 = 0x002D_1080;
 const IOCTL_STORAGE_QUERY_PROPERTY: u32 = 0x002D_1400;
+/// IOCTLs do mount manager (mountdev.h) e de volume (ntddvol.h) que o
+/// mountmgr.sys manda ao volume.
+const IOCTL_MOUNTDEV_QUERY_UNIQUE_ID: u32 = 0x004D_0000;
+const IOCTL_MOUNTDEV_QUERY_DEVICE_NAME: u32 = 0x004D_0008;
+const IOCTL_MOUNTDEV_QUERY_SUGGESTED_LINK_NAME: u32 = 0x004D_000C;
+const IOCTL_MOUNTDEV_LINK_CREATED_LEGACY: u32 = 0x004D_0010;
+const IOCTL_MOUNTDEV_LINK_DELETED_LEGACY: u32 = 0x004D_0014;
+const IOCTL_MOUNTDEV_QUERY_STABLE_GUID: u32 = 0x004D_0018;
+const IOCTL_MOUNTDEV_LINK_CREATED: u32 = 0x004D_C010;
+const IOCTL_MOUNTDEV_LINK_DELETED: u32 = 0x004D_C014;
+const IOCTL_VOLUME_GET_GPT_ATTRIBUTES: u32 = 0x0056_0038;
+const IOCTL_VOLUME_ONLINE: u32 = 0x0056_C008;
+const IOCTL_VOLUME_POST_ONLINE: u32 = 0x0056_C064;
+/// IOCTL_MOUNTMGR_VOLUME_ARRIVAL_NOTIFICATION (mountmgr.h).
+const IOCTL_MOUNTMGR_VOLUME_ARRIVAL_NOTIFICATION: u32 = 0x006D_402C;
+const STATUS_BUFFER_OVERFLOW: u32 = 0x8000_0005;
+const STATUS_NOT_FOUND: u32 = 0xC000_0225;
+const STATUS_NO_SUCH_DEVICE: u32 = 0xC000_000E;
 /// STORAGE_PROPERTY_ID e STORAGE_QUERY_TYPE (ntddstor.h).
 const STORAGE_ACCESS_ALIGNMENT_PROPERTY: u32 = 6;
 const STORAGE_DEVICE_SEEK_PENALTY_PROPERTY: u32 = 7;
@@ -581,6 +610,117 @@ fn disk_extents(extent: &DiskExtent) -> Vec<u8> {
     bytes
 }
 
+/// O GUID estável do volume (MOUNTDEV_STABLE_GUID): "OPEN", "KV", o índice e
+/// o número de série do volume, o mesmo a cada boot da mesma imagem (como o
+/// stable_guid do storage/ata_volume.rs). O mountmgr.sys nomeia o volume
+/// `\??\Volume{4F50454E-4B56-400N-...}` por ele
+/// (QuerySymbolicLinkNamesFromStorage 0x164c8).
+fn stable_guid(entry: &KernelVolume) -> [u8; 16] {
+    let mut bytes = [0u8; 16];
+    bytes[..4].copy_from_slice(&u32::from_be_bytes(*b"OPEN").to_le_bytes());
+    bytes[4..6].copy_from_slice(&u16::from_be_bytes(*b"KV").to_le_bytes());
+    bytes[6..8].copy_from_slice(&(0x4000u16 | entry.index as u16).to_le_bytes());
+    bytes[8..].copy_from_slice(&entry.file_system.volume_serial().unwrap_or(0).to_le_bytes());
+    bytes
+}
+
+/// MOUNTDEV_UNIQUE_ID na forma do volmgr.sys para um volume com GUID
+/// (VmpQueryUniqueIdInternal 0x1114b): "DMIO:ID:" e o GUID estável. É o
+/// valor REG_BINARY do MountedDevices.
+fn unique_id(entry: &KernelVolume) -> Vec<u8> {
+    let mut bytes = b"DMIO:ID:".to_vec();
+    bytes.extend_from_slice(&stable_guid(entry));
+    bytes
+}
+
+/// Os IOCTLs do mount manager, com a semântica do volmgr.sys 19041; `None`
+/// para os outros.
+fn mount_control(entry: &KernelVolume, irp: &Irp, stack: &IoStackLocation) -> Option<(u32, u64)> {
+    let parameters = &stack.parameters.device_io_control;
+    let output_length = parameters.output_buffer_length.get();
+    let input_length = parameters.input_buffer_length.get();
+    let buffer = irp.associated_irp.system_buffer.get();
+    let partition = entry.file_system.disk_extent().is_some();
+    Some(match parameters.io_control_code.get() {
+        // VmpQueryDeviceName 0xc350.
+        IOCTL_MOUNTDEV_QUERY_DEVICE_NAME => {
+            if output_length < MountdevName::SIZE as u32 {
+                return Some((STATUS_INVALID_PARAMETER, 0));
+            }
+            let name: Vec<u16> = device_path(entry.index).encode_utf16().collect();
+            let bytes = name.len() as u32 * 2;
+            // SAFETY: SystemBuffer de saída com ao menos um MOUNTDEV_NAME.
+            let reply = unsafe { MountdevName::at(buffer) };
+            reply.name_length.set(bytes as u16);
+            if output_length < bytes + 2 {
+                return Some((STATUS_BUFFER_OVERFLOW, 2));
+            }
+            guest::write_bytes(reply.name[0].address(), &name.iter().flat_map(|unit| unit.to_le_bytes()).collect::<Vec<u8>>());
+            (STATUS_SUCCESS, bytes as u64 + 2)
+        }
+        // VmpQueryUniqueId 0xf364 e VmpQueryUniqueIdInternal 0xf3cc.
+        IOCTL_MOUNTDEV_QUERY_UNIQUE_ID => {
+            if output_length < MountdevUniqueId::SIZE as u32 {
+                return Some((STATUS_INVALID_PARAMETER, 0));
+            }
+            let id = unique_id(entry);
+            // SAFETY: SystemBuffer de saída com ao menos um MOUNTDEV_UNIQUE_ID.
+            let reply = unsafe { MountdevUniqueId::at(buffer) };
+            reply.unique_id_length.set(id.len() as u16);
+            if output_length - 2 < id.len() as u32 {
+                return Some((STATUS_BUFFER_OVERFLOW, 2));
+            }
+            guest::write_bytes(reply.unique_id[0].address(), &id);
+            (STATUS_SUCCESS, 2 + id.len() as u64)
+        }
+        // VmpQueryStableGuid 0xc4ec (o volume do kernel não é removível).
+        IOCTL_MOUNTDEV_QUERY_STABLE_GUID => {
+            if output_length < 16 {
+                return Some((STATUS_INVALID_PARAMETER, 0));
+            }
+            guest::write_bytes(buffer, &stable_guid(entry));
+            (STATUS_SUCCESS, 16)
+        }
+        // VmpQuerySuggestedLinkName 0x13bc0: o volmgr.sys nunca sugere letra
+        // (o volume de boot e o básico dão STATUS_NOT_FOUND); a letra vem do
+        // MountedDevices ou do IOCTL_MOUNTMGR_BOOT_DL_ASSIGNMENT.
+        IOCTL_MOUNTDEV_QUERY_SUGGESTED_LINK_NAME => (
+            if !partition {
+                STATUS_NO_SUCH_DEVICE
+            } else if output_length < 6 {
+                STATUS_INVALID_PARAMETER
+            } else {
+                STATUS_NOT_FOUND
+            },
+            0,
+        ),
+        // VmpLinkCreated 0xf584 e VmpLinkDeleted 0x1322c: só o MOUNTDEV_NAME
+        // de entrada é conferido.
+        IOCTL_MOUNTDEV_LINK_CREATED | IOCTL_MOUNTDEV_LINK_DELETED | IOCTL_MOUNTDEV_LINK_CREATED_LEGACY | IOCTL_MOUNTDEV_LINK_DELETED_LEGACY => (if input_length < 4 { STATUS_INVALID_PARAMETER } else { STATUS_SUCCESS }, 0),
+        // VmpGetGptAttributes 0xe96c: não é partição GPT.
+        IOCTL_VOLUME_GET_GPT_ATTRIBUTES => (if output_length >= 8 && !partition { STATUS_NO_SUCH_DEVICE } else { STATUS_INVALID_PARAMETER }, 0),
+        // VmpOnline 0xd554 e o POST_ONLINE: o volume do kernel já está online.
+        IOCTL_VOLUME_ONLINE | IOCTL_VOLUME_POST_ONLINE => (STATUS_SUCCESS, 0),
+        _ => return None,
+    })
+}
+
+/// A chegada do volume ao Mount Manager. O gerenciador de volumes do NT a
+/// faz pela interface MOUNTDEV_MOUNTED_DEVICE_GUID no PDO do volume (a
+/// notificação que o DriverEntry do mountmgr.sys registra, 0x1a3db); um
+/// volume do kernel não tem PDO, e o mountmgr.sys aceita um volume fora do
+/// PnP por este IOCTL (MountMgrVolumeArrivalNotification 0x12b1c: OpenDevice
+/// e MountMgrMountedDeviceArrival com ManuallyRegistered, sem as
+/// notificações de dispositivo alvo do PnP). A entrada é o
+/// MOUNTMGR_TARGET_NAME: DeviceNameLength e o nome do dispositivo.
+pub fn announce_to_mount_manager(index: u32) -> Result<u32, KernelError> {
+    let name: Vec<u16> = device_path(index).encode_utf16().collect();
+    let mut input = Vec::with_capacity(2 + name.len() * 2);
+    input.extend_from_slice(&(name.len() as u16 * 2).to_le_bytes());
+    input.extend(name.iter().flat_map(|unit| unit.to_le_bytes()));
+    crate::ntos::io::volume_dos_name::mount_manager_control(IOCTL_MOUNTMGR_VOLUME_ARRIVAL_NOTIFICATION, &input)
+}
+
 /// IRP_MJ_DEVICE_CONTROL (METHOD_BUFFERED) no volume: os IOCTLs que o
 /// gerenciador de volumes responde por um volume simples, com a extensão
 /// do volume no disco (IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
@@ -595,6 +735,9 @@ fn disk_extents(extent: &DiskExtent) -> Vec<u8> {
 /// resposta" e usam o padrão. Um volume sem disco (o disco em memória) não
 /// tem extensão.
 fn volume_control(entry: &KernelVolume, irp: &Irp, stack: &IoStackLocation) -> (u32, u64) {
+    if let Some(answer) = mount_control(entry, irp, stack) {
+        return answer;
+    }
     let parameters = &stack.parameters.device_io_control;
     let code = parameters.io_control_code.get();
     let output_length = parameters.output_buffer_length.get() as u64;

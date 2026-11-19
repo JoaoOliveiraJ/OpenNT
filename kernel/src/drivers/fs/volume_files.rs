@@ -188,6 +188,28 @@ pub fn nt_path_to_device_name(nt_path: &str) -> Option<String> {
     Some(if rest == "\\" { String::new() } else { rest })
 }
 
+/// O nome normalizado (NtfsQueryNameInfo com Normalized, ntfs.sys
+/// 0xefb00/0xf015c): o nome do dispositivo da abertura
+/// ([`nt_path_to_device_name`]) com cada componente trocado pelo nome longo
+/// gravado; um componente que só existe pelo alias de instalação
+/// ([`install_alias`]) usa o nome da entrada no lugar do alias; um que não
+/// existe fica como veio. A raiz é `\`.
+pub fn normalized_device_name(volume: &Ntfs, device_name: &str) -> String {
+    let (mut literal, mut result) = (String::new(), String::new());
+    for component in device_name.split('\\').filter(|part| !part.is_empty()) {
+        let next = alloc::format!("{literal}/{component}");
+        let stored = volume.long_name(&next).ok().flatten().or_else(|| install_alias(&next, |candidate| volume.exists(candidate).unwrap_or(false)).and_then(|aliased| volume.long_name(&aliased).ok().flatten()));
+        result.push('\\');
+        result.push_str(stored.as_deref().unwrap_or(component));
+        literal = next;
+    }
+    if result.is_empty() {
+        String::from("\\")
+    } else {
+        result
+    }
+}
+
 /// Normaliza separadores e prefixos NT/DOS, aceita as unidades C e D e
 /// preserva subdiretórios; só os aliases de instalação apontam para a raiz
 /// do disco de boot. `.`/`..` e caracteres proibidos são recusados.

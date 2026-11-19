@@ -515,6 +515,11 @@ pub fn nt_query_information_file(handle: u64, iosb: u64, out: u64, length: u64, 
         // volume guarda o conteúdo de `\Windows` e de `\Windows\System32` na
         // raiz, então a posição interna dele não é esse nome. A raiz é `\`.
         let opened = volume_files::nt_path_to_device_name(&user_file.nt_path.lock()).unwrap_or_else(|| file.volume_path().replace('/', "\\"));
+        // FILE_NORMALIZED_NAME_INFORMATION (48), que o
+        // GetFinalPathNameByHandleW pede depois da letra (kernelbase
+        // 0x4cb02): o mesmo nome com cada componente no nome longo gravado,
+        // como o NtfsQueryNameInfo com Normalized (ntfs.sys 0xefb00).
+        let opened = if class == 48 { volume_files::normalized_device_name(file.volume(), &opened) } else { opened };
         let opened = opened.trim_end_matches('\\');
         let name: Vec<u16> = if opened.is_empty() { alloc::vec![b'\\' as u16] } else { opened.encode_utf16().collect() };
         let name_bytes = name.len() as u64 * 2;
@@ -524,7 +529,7 @@ pub fn nt_query_information_file(handle: u64, iosb: u64, out: u64, length: u64, 
             6 => 8,
             7 => 4,
             8 => 4,
-            9 => 4 + name_bytes,
+            9 | 48 => 4 + name_bytes,
             14 => 8,
             16 => 4,
             17 => 4,
@@ -534,8 +539,10 @@ pub fn nt_query_information_file(handle: u64, iosb: u64, out: u64, length: u64, 
             59 => 24,
             _ => return fail(0xC000_0003),
         };
-        let variable = class == 9 || class == 18;
-        if length < if variable { if class == 9 { 4 } else { 100 } } else { need } {
+        let variable = matches!(class, 9 | 18 | 48);
+        // O IopQueryOperationLength do 19041: 8 para as classes 9 e 48 e
+        // 0x68 para a 18.
+        if length < if variable { if class == 18 { 104 } else { 8 } } else { need } {
             return fail(0xC000_0004);
         }
         let writable = need.min(length);
@@ -585,7 +592,9 @@ pub fn nt_query_information_file(handle: u64, iosb: u64, out: u64, length: u64, 
             _ => {}
         }
         if variable {
-            let information = if class == 9 { state::user_struct::<FileNameInformation>(out)? } else { &state::user_struct::<FileAllInformation>(out)?.name_information };
+            // FILE_NORMALIZED_NAME_INFORMATION tem o layout do
+            // FILE_NAME_INFORMATION.
+            let information = if class == 18 { &state::user_struct::<FileAllInformation>(out)?.name_information } else { state::user_struct::<FileNameInformation>(out)? };
             information.file_name_length.probe_set(name_bytes as u32)?;
             let header = information.file_name.as_ptr() as u64 - out;
             let characters = (name.len() as u64).min((length - header) / 2);

@@ -22,7 +22,7 @@ const BUFFER_OVERFLOW: u32 = 0x8000_0005;
 /// O chamador retém evento, IOSB e buffers até a conclusão; o IRP construído
 /// é liberado aqui, inclusive quando o driver rejeita o pedido.
 #[allow(clippy::too_many_arguments)]
-fn query_device(device: u64, code: u32, input: u64, input_length: u32, output: u64, output_length: u32, scratch: u64) -> u32 {
+pub(crate) fn query_device(device: u64, code: u32, input: u64, input_length: u32, output: u64, output_length: u32, scratch: u64) -> u32 {
     let event = scratch;
     let status_block = scratch + 24;
     dispatcher::initialize_event(event, 0, false);
@@ -44,6 +44,37 @@ fn query_device(device: u64, code: u32, input: u64, input_length: u32, output: u
     }
     guest::free_bytes(request);
     status
+}
+
+/// Um IOCTL ao Mount Manager sem saída (o IopAssignBootDriveLetter 0xa61aa8
+/// e a chegada de volume): IoGetDeviceObjectPointer(\Device\MountPointManager,
+/// FILE_READ_ATTRIBUTES), o IRP METHOD_BUFFERED com `input` e a referência
+/// solta.
+pub fn mount_manager_control(code: u32, input: &[u8]) -> Result<u32, KernelError> {
+    let block = guest::alloc_bytes(0x100 + input.len() as u64);
+    if block == 0 {
+        return Ok(INSUFFICIENT_RESOURCES);
+    }
+    let (unicode_name, name_buffer, outputs, scratch, data) = (block, block + 0x10, block + 0x70, block + 0x80, block + 0x100);
+    // SAFETY: a UNICODE_STRING de rascunho no início do bloco.
+    kernel_unicode(unsafe { UnicodeString::at(unicode_name) }, MOUNT_MANAGER, name_buffer);
+    match io::get_device_object_pointer(unicode_name, 0x80, outputs, outputs + 8) {
+        Ok(status) if status & 0x8000_0000 == 0 => {}
+        other => {
+            guest::free_bytes(block);
+            return other;
+        }
+    }
+    // SAFETY: células preenchidas pelo IoGetDeviceObjectPointer.
+    let (file, manager) = unsafe { (Field::<u64>::at(outputs).get(), Field::<u64>::at(outputs + 8).get()) };
+    if !input.is_empty() {
+        guest::write_bytes(data, input);
+    }
+    let status = query_device(manager, code, if input.is_empty() { 0 } else { data }, input.len() as u32, 0, 0, scratch);
+    let released = file_objects::dereference(file);
+    guest::free_bytes(block);
+    released?;
+    Ok(status)
 }
 
 /// O pool devolvido pertence ao chamador (ExFreePool); em erro o

@@ -3194,6 +3194,20 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   `/Windows/System32` ficam onde estão: sem isso o win32k não abria nenhuma
   fonte (`\SystemRoot\Fonts\VGASYS.FON`) e a sessão ficava sem fonte
   padrão. Teste: `kernel_volume_devices` na fase 6.
+  O dispositivo real responde a interface MOUNTDEV de um volume básico do
+  volmgr.sys (`volume_device::mount_control`: o nome, o identificador único
+  `DMIO:ID:` com o GUID estável, nenhuma letra sugerida), e o
+  IoGetDeviceObjectPointer do nome do volume faz a abertura direta (o
+  OpenDevice do mountmgr.sys exige FileName vazio). No boot do smss,
+  `io/boot_partition.rs` faz o IopMarkBootPartition e o
+  IopAssignBootDriveLetter do 19041: marca o dispositivo
+  DO_SYSTEM_BOOT_PARTITION, tira o `\GLOBAL??\C:` provisório da fase 1,
+  entrega o volume ao mountmgr.sys real pelo
+  IOCTL_MOUNTMGR_VOLUME_ARRIVAL_NOTIFICATION e pede a letra com o
+  IOCTL_MOUNTMGR_BOOT_DL_ASSIGNMENT (marcador MOUNTMGR_BOOT_VOLUME_OK); se o
+  mountmgr.sys não cria o C:, o link provisório volta. A
+  FILE_NORMALIZED_NAME_INFORMATION (48) devolve o caminho com os nomes longos
+  gravados (`Ntfs::long_name`). Teste: `volume_mountdev` na fase 7.
 - **Arquivos dos volumes do kernel** (`io/file/lifetime.rs`): os volumes
   internos (o disco em memória e o NTFS) não têm driver de file
   system, então o registro de vida faz o papel do FCB: um estado por arquivo

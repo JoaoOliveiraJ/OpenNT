@@ -69,6 +69,36 @@ const _: () = {
     assert!(core::mem::offset_of!(MountdevName, name) == 0x2);
 };
 
+/// `MOUNTDEV_UNIQUE_ID` (mountdev.h; USHORT UniqueIdLength e os bytes a seguir).
+#[repr(C)]
+pub struct MountdevUniqueId {
+    pub unique_id_length: Field<u16>,
+    pub unique_id: [Field<u8>; 2],
+}
+
+unsafe impl NtStruct for MountdevUniqueId {}
+
+const _: () = {
+    assert!(core::mem::size_of::<MountdevUniqueId>() == 0x4);
+    assert!(core::mem::offset_of!(MountdevUniqueId, unique_id) == 0x2);
+};
+
+/// `MOUNTMGR_TARGET_NAME` (mountmgr.h; USHORT DeviceNameLength e o nome a
+/// seguir), a entrada do IOCTL_MOUNTMGR_VOLUME_ARRIVAL_NOTIFICATION e do
+/// QUERY_DOS_VOLUME_PATH(S).
+#[repr(C)]
+pub struct MountmgrTargetName {
+    pub device_name_length: Field<u16>,
+    pub device_name: [Field<u16>; 1],
+}
+
+unsafe impl NtStruct for MountmgrTargetName {}
+
+const _: () = {
+    assert!(core::mem::size_of::<MountmgrTargetName>() == 0x4);
+    assert!(core::mem::offset_of!(MountmgrTargetName, device_name) == 0x2);
+};
+
 /// `_KERNEL_STACK_CONTROL` no InitialStack de uma thread (privada do Ke; o
 /// IoWithinStackLimits do 19041 lê Previous em +0x10: StackBase +0x10,
 /// StackLimit +0x18, InitialStack +0x28; 0x30 bytes).

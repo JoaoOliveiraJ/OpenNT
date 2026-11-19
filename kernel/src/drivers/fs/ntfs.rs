@@ -654,6 +654,22 @@ impl Ntfs {
         Ok(Some(found))
     }
 
+    /// O nome longo gravado de `path` (`/A/B`): o da entrada do índice do pai
+    /// com o mesmo registro e namespace POSIX (0), Win32 (1) ou Win32&DOS
+    /// (3), e não a só DOS (2), que o $FILE_NAME guarda em +0x41 (a chave
+    /// `IndexEntry::value`). A raiz é o nome vazio; `None` quando o caminho
+    /// não existe.
+    pub fn long_name(&self, path: &str) -> Result<Option<String>, KernelError> {
+        let _shared = self.resource().acquire_shared();
+        self.fresh();
+        let Some(entry) = self.find(path)? else { return Ok(None) };
+        let trimmed = path.trim_end_matches('/');
+        let Some(separator) = trimmed.rfind('/') else { return Ok(Some(String::new())) };
+        let Some(parent) = self.find(if separator == 0 { "/" } else { &trimmed[..separator] })? else { return Ok(None) };
+        let stored = self.root_index(parent.reference)?.into_iter().find(|candidate| candidate.reference == entry.reference && candidate.value.get(0x41).is_some_and(|namespace| namespace & 3 != 2)).map(|candidate| candidate.name);
+        Ok(Some(stored.unwrap_or(entry.name)))
+    }
+
     pub fn volume_information(&self) -> Result<VolumeInformation, KernelError> {
         let _shared = self.resource().acquire_shared();
         let record = self.read_record(3)?;

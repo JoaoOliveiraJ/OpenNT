@@ -281,9 +281,37 @@ pub fn walk_physical<T>(device: u64, found: impl Fn(u64) -> Option<T>) -> Option
 }
 
 /// IoGetDeviceObjectPointer(name, access, outFileObject, outDeviceObject):
-/// topo da pilha e um FILE_OBJECT real retido.
+/// topo da pilha e um FILE_OBJECT real retido. No 19041 (0x621240) é o
+/// ZwOpenFile(DesiredAccess, OBJ_KERNEL_HANDLE, compartilhamento 3,
+/// FILE_NON_DIRECTORY_FILE), o ObReferenceObjectByHandle, o
+/// IoGetRelatedDeviceObject do FILE_OBJECT e o ZwClose.
 pub fn get_device_object_pointer(name_pointer: u64, access: u32, file_output: u64, device_output: u64) -> Result<u32, KernelError> {
     let name = guest_strings::read_unicode_string(name_pointer);
+    // Um volume do kernel pelo nome do volume, sem nome restante
+    // (`\Device\KernelVolume1`, `\DosDevices\C:`): o IopParseDevice abre o
+    // dispositivo direto (só os direitos da abertura direta,
+    // FO_DIRECT_DEVICE_OPEN, IRP_MJ_CREATE ao dispositivo real) ou o volume
+    // pelo file system. É o OpenDevice do mountmgr.sys (0x15244), que exige
+    // FileName vazio.
+    if let Some(device) = crate::ntos::io::parse::kernel_volume_device(&name) {
+        let request = crate::ntos::io::parse::OpenRequest { desired_access: access, file_attributes: 0, share_access: 3, disposition: 1, create_options: 0x40, case_insensitive: true, driver_context: Default::default() };
+        let opened = if crate::ntos::io::parse::is_volume_open(access) { crate::ntos::io::parse::open_file(device, "", &request)? } else { crate::ntos::io::parse::open_direct(device, &request)? };
+        if opened.status & 0x8000_0000 != 0 || opened.file_object == 0 {
+            return Ok(if opened.status & 0x8000_0000 != 0 { opened.status } else { 0xC000_0001 });
+        }
+        // ObReferenceObjectByHandle + ZwClose: o handle fecha (IRP_MJ_CLEANUP)
+        // e a referência do CREATE fica com o chamador, cujo
+        // ObDereferenceObject manda o IRP_MJ_CLOSE.
+        file_objects::open_handle(opened.file_object)?;
+        file_objects::close_handle(opened.file_object)?;
+        let related = crate::ntos::io::file::information::related_device_object(opened.file_object)?;
+        // SAFETY: PFILE_OBJECT* e PDEVICE_OBJECT* do chamador de modo kernel.
+        unsafe {
+            Field::<u64>::at(file_output).set(opened.file_object);
+            Field::<u64>::at(device_output).set(related);
+        }
+        return Ok(0);
+    }
     let node = object_manager::lookup(&name).filter(|&node| object_manager::node(node).is_some_and(|node| node.type_name == "Device"));
     let Some(node) = node else { return Ok(0xC000_0034) };
     let entry = io_manager::device(node).unwrap_or_default();
@@ -293,7 +321,12 @@ pub fn get_device_object_pointer(name_pointer: u64, access: u32, file_output: u6
     let create = io_manager::CreateParameters { access, disposition: 1, options: 0x40, ..Default::default() };
     let opened = io_manager::open_device_file(&name, "", Some(create), false)?;
     if opened.status != 0 {
-        return Ok(opened.status as u32);
+        // Os códigos internos do io_manager não são NTSTATUS.
+        return Ok(match opened.status {
+            io_manager::status::NOT_FOUND => 0xC000_0034,
+            io_manager::status::NOT_SUPPORTED => 0xC000_00BB,
+            status => status as u32,
+        });
     }
     file_objects::reference(opened.file_object)?;
     io_manager::close_device(opened.handle)?;

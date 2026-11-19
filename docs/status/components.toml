@@ -212,8 +212,8 @@ descricao = "Espera o shell, digita comandos pelo monitor do QEMU (run hello, ps
 id = "smss-csrss"
 titulo = "smss.exe e csrss.exe reais"
 marcador = "SMSS_CSRSS_OK"
-comando = "cargo xtask test-boot SMSS_CSRSS_OK 300000 --initial-process=smss --build-dir=build/smss --smp=1"
-descricao = "Com --initial-process=smss, o primeiro processo de usuário é o smss.exe real, protegido e crítico como no Windows, com a ntdll real. Ele lê a configuração do Session Manager no Registro, monta o \\KnownDlls, os DosDevices, \\Sessions e os prefixos protegidos dos pipes e mailslots, abre o \\SmApiPort e cria pela chamada de sistema do Windows o smss da sessão, numa sessão nova, que herda os handles dele e se conecta ao \\SmApiPort. O marcador sai quando uma thread do csrss.exe criado por esse smss pede pela primeira vez um serviço do win32k.sys (que o smss da sessão já carregou), com o smss inicial e o csrss vivos."
+comando = "cargo xtask test-boot MOUNTMGR_BOOT_VOLUME_OK 300000 --initial-process=smss --build-dir=build/smss --smp=1 --expect=SMSS_CSRSS_OK"
+descricao = "Com --initial-process=smss, o primeiro processo de usuário é o smss.exe real, protegido e crítico como no Windows, com a ntdll real. Ele lê a configuração do Session Manager no Registro, monta o \\KnownDlls, os DosDevices, \\Sessions e os prefixos protegidos dos pipes e mailslots, abre o \\SmApiPort e cria pela chamada de sistema do Windows o smss da sessão, numa sessão nova, que herda os handles dele e se conecta ao \\SmApiPort. O marcador sai quando uma thread do csrss.exe criado por esse smss pede pela primeira vez um serviço do win32k.sys (que o smss da sessão já carregou), com o smss inicial e o csrss vivos. Antes do csrss, o volume de boot do kernel chega ao mountmgr.sys real (IOCTL_MOUNTMGR_VOLUME_ARRIVAL_NOTIFICATION, marcado DO_SYSTEM_BOOT_PARTITION) e o IOCTL_MOUNTMGR_BOOT_DL_ASSIGNMENT dá a ele o C:, que o IoVolumeDeviceToDosName devolve."
 
 [[teste]]
 id = "etw-user"

@@ -142,6 +142,11 @@ pub fn init() {
     let loaded = crate::ntos::cm::service::system_drivers::start_boot_drivers();
     // IopCallBootDriverReinitializationRoutines: depois do último driver de boot.
     crate::ntos::io::lifecycle::run_boot_driver_reinitialization_routines();
+    // PnpBootDeviceWait(IopMarkBootPartition) do IopInitializeBootDrivers: o
+    // volume de boot chega ao mountmgr.sys marcado DO_SYSTEM_BOOT_PARTITION e
+    // recebe a letra dele, antes do PnPBootDriversInitialized e da
+    // MountMgrDriverReinitialization (as rotinas de reinicialização, abaixo).
+    crate::ntos::io::boot_partition::boot_device_wait();
     crate::ntos::io::pnp::mark_boot_drivers_initialized();
     debug_print!("[boot] servicos carregados: {}", loaded);
     // Catálogo CNG publicado antes de qualquer processo de usuário. O cng.sys

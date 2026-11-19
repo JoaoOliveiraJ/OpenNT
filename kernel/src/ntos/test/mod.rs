@@ -73,6 +73,7 @@ pub mod dynamic_function_tables;
 pub mod kernel_crash_trace;
 pub mod user_slist;
 pub mod volume_open;
+pub mod volume_mountdev;
 pub mod yield_execution;
 pub mod anti_starvation;
 pub mod reparse_points;
