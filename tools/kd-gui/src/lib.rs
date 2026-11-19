@@ -7,6 +7,10 @@
 //! - `launcher`: o `--launch` (build e QEMU pelo `cargo xtask debug
 //!   --launch --no-client`);
 //! - `app`: a janela (egui/eframe com painéis encaixáveis do `egui_dock`);
+//!   as vistas do estado da máquina ficam em `app/views.rs`;
+//! - `details`: as leituras extras das vistas (espera e prioridade das
+//!   threads pelo KTHREAD, a parte de usuário da pilha, o estado do PDB de
+//!   cada módulo) e os textos dos registradores;
 //! - `disasm`: a desmontagem (iced-x86) com os símbolos do cliente;
 //! - `source`: as linhas de código e as variáveis locais pelo DWARF do
 //!   `kernel.elf`;
@@ -15,6 +19,7 @@
 
 pub mod app;
 pub mod backend;
+pub mod details;
 pub mod disasm;
 pub mod launcher;
 pub mod offscreen;

@@ -10,6 +10,10 @@
 //! tipadas abertas, a última consulta do NT, a análise do bugcheck, módulos,
 //! processadores, processos, threads e breakpoints. Os rastros ficam fora
 //! do snapshot (`Shared::trace`), com o símbolo e a instrução de cada RIP.
+//!
+//! As leituras caras (o resto do estado do processador, o KTHREAD de cada
+//! thread e a parte de usuário da pilha) só entram quando a janela as pede
+//! (`Wanted`, pelos painéis abertos).
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -27,8 +31,11 @@ use kd_client::monitor::{Process, Processor, Thread};
 use kd_client::rsp::Connection;
 use kd_client::trace::{self, Class, Source, Trace};
 use kd_client::types::Field;
+use kd_client::unwind::Method;
+use kd_client::user::ProcessContext;
 use kd_client::{registers, Breakpoint, BreakpointKind, Client};
 
+use crate::details::{self, KthreadLayout, PdbStatus, ThreadDetail};
 use crate::disasm::{self, Line};
 use crate::launcher::{Launch, LaunchOptions};
 use crate::source::{Local, LineTable};
@@ -152,8 +159,40 @@ pub enum Request {
     /// Teclas pelo monitor HMP do QEMU (`sendkey`, como
     /// `ctrl_r-scroll_lock-scroll_lock`, o despejo manual do teclado).
     SendKeys(String),
+    /// As leituras extras que os painéis abertos querem.
+    SetWanted(Wanted),
+    /// O processo das leituras (`.process`): PID ou EPROCESS; `None` volta
+    /// ao espaço do processador.
+    SetProcess(Option<String>),
+    /// Continua até o endereço (breakpoint temporário, qualquer RSP).
+    RunTo(u64),
+    /// Troca as opções de um breakpoint (condição, contagem, log,
+    /// comandos, grupo, uma vez só...).
+    EditBreakpoint(u32, BreakpointRequest),
+    SetGroupEnabled(String, bool),
+    /// A janela de memória também como um tipo do PDB do ntoskrnl (vazio:
+    /// só os bytes).
+    ShowMemoryAs(String),
+    /// O log da COM1 a acompanhar (o `serial.log` de um `xtask` aberto à
+    /// parte, no `--connect`).
+    SetSerialLog(Option<PathBuf>),
     Refresh,
     Shutdown,
+}
+
+/// As leituras caras que a janela quer em cada parada (os painéis que as
+/// mostram estão abertos e ligados).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Wanted {
+    /// x87, SSE, a metade alta dos YMM e os registradores de depuração.
+    pub extended: bool,
+    /// Espera e prioridade de cada thread (uma leitura do KTHREAD por
+    /// thread).
+    pub thread_details: bool,
+    /// Só as threads deste processo (PID) ganham os detalhes.
+    pub thread_filter: Option<u64>,
+    /// A parte de usuário da pilha de uma thread que entrou no kernel.
+    pub user_stack: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -185,6 +224,8 @@ pub struct RegisterRow {
     pub value: Option<u64>,
     /// Mudou desde a parada anterior.
     pub changed: bool,
+    /// O símbolo do valor, quando ele cai num módulo.
+    pub symbol: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -195,6 +236,16 @@ pub struct FrameRow {
     pub stack: u64,
     /// Como o quadro foi achado (`.pdata`, frame pointer...).
     pub method: &'static str,
+    /// O módulo do quadro (vazio fora dos módulos).
+    pub module: String,
+    /// O nome sem o módulo (`função+0x10`).
+    pub symbol: String,
+    /// O endereço é da metade de usuário.
+    pub user: bool,
+    /// O primeiro quadro da parte de usuário (do CONTEXT salvo da thread).
+    pub user_start: bool,
+    /// Arquivo e linha (o DWARF do kernel do OpenNT).
+    pub line: Option<(String, u32)>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -218,6 +269,13 @@ pub struct MemoryView {
     pub address: u64,
     pub bytes: Vec<u8>,
     pub error: Option<String>,
+    /// O símbolo de cada qword da janela (os que caem num módulo).
+    pub pointers: Vec<Option<String>>,
+    /// A janela como tipo do PDB: o nome pedido, a vista tipada (endereço,
+    /// tipo) e o erro da busca do tipo.
+    pub type_name: String,
+    pub typed: Option<(u64, u32)>,
+    pub type_error: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -225,6 +283,8 @@ pub struct ThreadRow {
     pub thread: Thread,
     /// O símbolo do endereço de início.
     pub start: String,
+    /// Espera e prioridade pelo KTHREAD (quando pedidas).
+    pub detail: Option<ThreadDetail>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -237,6 +297,14 @@ pub struct ModuleRow {
     pub source: String,
     pub pdb: bool,
     pub pending: bool,
+    /// O caminho no alvo.
+    pub path: String,
+    /// Módulo de usuário do processo das leituras.
+    pub user: bool,
+    pub status: PdbStatus,
+    /// O PDB citado pelo RSDS e a identidade dele (GUID e idade).
+    pub pdb_name: String,
+    pub pdb_id: String,
 }
 
 /// Uma expressão observada.
@@ -279,7 +347,14 @@ pub struct Snapshot {
     pub view_header: String,
     pub registers: Vec<RegisterRow>,
     pub registers_editable: bool,
+    /// O resto do estado do processador (quando pedido; só no processador,
+    /// não numa thread fora da CPU).
+    pub extended: Option<Result<registers::ExtendedState, String>>,
+    /// O símbolo de DR0-DR3.
+    pub debug_symbols: [Option<String>; 4],
     pub frames: Vec<FrameRow>,
+    /// De onde veio a parte de usuário da pilha, ou por que ela falta.
+    pub user_stack_note: String,
     pub selected_frame: usize,
     pub code: CodeView,
     pub source: Option<SourceView>,
@@ -292,6 +367,10 @@ pub struct Snapshot {
     pub stopped_threads: Vec<u64>,
     pub processes: Vec<Process>,
     pub threads: Vec<ThreadRow>,
+    /// Por que os detalhes das threads faltam (sem o PDB do ntoskrnl...).
+    pub threads_note: String,
+    /// O processo das leituras (`.process`), se escolhido.
+    pub process_context: Option<ProcessContext>,
     pub breakpoints: Vec<Breakpoint>,
     pub watches: Vec<WatchRow>,
     /// Os campos das vistas tipadas abertas.
@@ -437,7 +516,25 @@ struct Worker {
     search: Option<SearchResult>,
     symbols_generation: u64,
     types_published: bool,
+    wanted: Wanted,
+    memory_type: String,
+    /// Os offsets do KTHREAD (do PDB, uma vez por sessão).
+    kthread: Option<KthreadLayout>,
+    /// Os detalhes das threads lidos nesta parada, com o filtro de processo
+    /// deles: valem até a máquina andar ou algo mudar o alvo (os pedidos que
+    /// só trocam a vista os reaproveitam).
+    thread_cache: Option<(Option<u64>, HashMap<u64, ThreadDetail>)>,
+    /// O processo das leituras que a pilha de usuário escolheu sozinha (um
+    /// `.process` diferente foi escolhido à mão e fica).
+    auto_process: Option<u64>,
 }
+
+/// Quantas threads ganham os detalhes do KTHREAD por parada (sem filtro de
+/// processo).
+const THREAD_DETAIL_LIMIT: usize = 512;
+
+/// A partir daqui o endereço é do kernel.
+const KERNEL_START: u64 = 0xFFFF_8000_0000_0000;
 
 impl Worker {
     fn new(config: Config, shared: Arc<Mutex<Shared>>, notify: Notify) -> Worker {
@@ -462,6 +559,11 @@ impl Worker {
             search: None,
             symbols_generation: u64::MAX,
             types_published: false,
+            wanted: Wanted::default(),
+            memory_type: String::new(),
+            kthread: None,
+            thread_cache: None,
+            auto_process: None,
         }
     }
 
@@ -535,6 +637,8 @@ impl Worker {
         self.serial_offset = 0;
         self.symbols_generation = u64::MAX;
         self.types_published = false;
+        self.auto_process = None;
+        self.thread_cache = None;
         let address = match &target {
             Target::Connect(address) => {
                 self.publish(|shared| {
@@ -671,6 +775,7 @@ impl Worker {
         let Some(client) = self.client.as_mut() else { return };
         match client.poll(Duration::from_millis(30)) {
             Ok(Some(_)) => {
+                self.thread_cache = None;
                 self.view = View::Owner;
                 self.selected_frame = 0;
                 self.focus = Focus::Frame;
@@ -727,10 +832,30 @@ impl Worker {
                 }
                 return;
             }
+            Request::SetWanted(wanted) => {
+                let changed = wanted != self.wanted;
+                self.wanted = wanted;
+                if changed && self.client.as_ref().is_some_and(Client::is_stopped) {
+                    self.refresh();
+                }
+                return;
+            }
+            Request::SetSerialLog(path) => {
+                self.config.serial_log = path;
+                self.serial_offset = 0;
+                self.publish(|shared| shared.serial.clear());
+                self.tail_serial();
+                return;
+            }
             _ => {}
         }
         if self.client.is_none() {
             return;
+        }
+        // Os pedidos que só trocam a vista guardam os detalhes das threads
+        // desta parada; os outros podem mudar o alvo.
+        if !matches!(request, Request::SelectCpu(_) | Request::SelectThread(_) | Request::SelectFrame(_) | Request::ShowCode(_) | Request::ShowMemory(_) | Request::ShowMemoryAs(_) | Request::Query(..) | Request::SearchMemory { .. } | Request::SetProcess(_)) {
+            self.thread_cache = None;
         }
         let stopped = self.client.as_ref().is_some_and(Client::is_stopped);
         let mut breakpoints_changed = false;
@@ -828,8 +953,22 @@ impl Worker {
             }
             Request::ReloadSymbols => self.with_client(|client| client.reload_modules()).map(|_| true),
             Request::SendKeys(keys) => self.send_keys(&keys).map(|_| false),
+            Request::SetProcess(process) => self.with_client(|client| client.set_process(process.as_deref())).map(|_| true),
+            Request::RunTo(address) => self.resume(|client| client.run_until(address, None).map(|_| Resumed::Running)),
+            Request::EditBreakpoint(id, request) => {
+                breakpoints_changed = true;
+                self.with_client(|client| client.edit_breakpoint(id, &request)).map(|_| true)
+            }
+            Request::SetGroupEnabled(group, enabled) => {
+                breakpoints_changed = true;
+                self.with_client(|client| client.set_group_enabled(&group, enabled)).map(|_| true)
+            }
+            Request::ShowMemoryAs(type_name) => {
+                self.memory_type = type_name.trim().to_string();
+                Ok(true)
+            }
             Request::Refresh => Ok(true),
-            Request::Start(_) | Request::Restart | Request::Disconnect | Request::Shutdown | Request::SetWatches(_) | Request::SetExpanded(_) => Ok(false),
+            Request::Start(_) | Request::Restart | Request::Disconnect | Request::Shutdown | Request::SetWatches(_) | Request::SetExpanded(_) | Request::SetWanted(_) | Request::SetSerialLog(_) => Ok(false),
         };
         if breakpoints_changed && result.is_ok() {
             self.save_session();
@@ -928,6 +1067,9 @@ impl Worker {
 
     /// Monta e publica o snapshot da parada.
     fn refresh(&mut self) {
+        // O log da COM1 até a parada chega antes do snapshot (a janela marca
+        // a parada na linha certa).
+        self.tail_serial();
         self.set_activity("lendo o estado da maquina");
         let snapshot = self.build_snapshot();
         self.set_activity("");
@@ -981,8 +1123,9 @@ impl Worker {
 
     fn build_snapshot(&mut self) -> Result<Snapshot, String> {
         self.generation += 1;
-        let mut snapshot = Snapshot { generation: self.generation, view: self.view, selected_frame: self.selected_frame, memory: MemoryView { expression: self.memory_expression.clone(), ..Default::default() }, ..Default::default() };
+        let mut snapshot = Snapshot { generation: self.generation, view: self.view, selected_frame: self.selected_frame, memory: MemoryView { expression: self.memory_expression.clone(), type_name: self.memory_type.clone(), ..Default::default() }, ..Default::default() };
         let view = self.view;
+        let wanted = self.wanted;
         let elf = self.config.elf.clone();
         let Some(client) = self.client.as_mut() else { return Err("sem conexao com o alvo".into()) };
         snapshot.stop = client.last_stop().to_string();
@@ -990,19 +1133,23 @@ impl Worker {
         snapshot.stop_signal = client.stop_reply().map_or(0, |stop| stop.signal);
         snapshot.stopped_threads = client.stopped_threads()?;
         snapshot.processors = client.processors().unwrap_or_default();
+        // Processos e threads antes da pilha: a parte de usuário dela precisa
+        // do processo dono da thread.
+        snapshot.processes = client.processes().unwrap_or_default();
+        let threads = client.threads(None).unwrap_or_default();
         // Registradores e pilha da visão escolhida.
-        let frames = match view {
+        let mut frames = match view {
             View::Thread(ethread) => {
                 let (context, frames) = client.thread_backtrace(ethread, 64)?;
                 snapshot.view_header = context.header.clone();
-                snapshot.registers = context.registers.iter().map(|(name, value)| RegisterRow { name: name.clone(), value: Some(*value), changed: false }).collect();
+                snapshot.registers = context.registers.iter().map(|(name, value)| RegisterRow { name: name.clone(), value: Some(*value), changed: false, symbol: None }).collect();
                 snapshot.registers_editable = false;
                 frames
             }
             View::Owner | View::Cpu(_) => {
-                let mut rows: Vec<RegisterRow> = client.general_registers()?.into_iter().map(|value| RegisterRow { name: value.layout.name.to_string(), value: value.value, changed: false }).collect();
+                let mut rows: Vec<RegisterRow> = client.general_registers()?.into_iter().map(|value| RegisterRow { name: value.layout.name.to_string(), value: value.value, changed: false, symbol: None }).collect();
                 for layout in registers::EXTRA {
-                    rows.push(RegisterRow { name: layout.name.to_string(), value: client.register(layout.name).ok(), changed: false });
+                    rows.push(RegisterRow { name: layout.name.to_string(), value: client.register(layout.name).ok(), changed: false, symbol: None });
                 }
                 let key = |row: &RegisterRow| format!("{:?}:{}", view, row.name);
                 for row in &mut rows {
@@ -1021,22 +1168,86 @@ impl Worker {
                 };
                 snapshot.registers = rows;
                 snapshot.registers_editable = true;
+                if wanted.extended {
+                    let extended = client.extended_registers();
+                    if let Ok(state) = &extended {
+                        for (index, value) in state.debug.iter().copied().take(4).enumerate() {
+                            snapshot.debug_symbols[index] = value.and_then(|address| client.symbols.name_at(address));
+                        }
+                    }
+                    snapshot.extended = Some(extended);
+                }
                 client.backtrace(64)?
             }
         };
+        // O símbolo de cada registrador que aponta para um módulo.
+        for row in &mut snapshot.registers {
+            row.symbol = row.value.and_then(|value| client.symbols.name_at(value));
+        }
+        // A parte de usuário: uma thread de um processo de usuário parada no
+        // kernel continua pelo CONTEXT de usuário salvo dela, com os módulos
+        // do processo (o processo das leituras passa a ser o dela, a não ser
+        // que outro tenha sido escolhido à mão).
+        let mut user_from = None;
+        let kernel_top = frames.first().is_some_and(|frame| frame.address >= KERNEL_START);
+        if wanted.user_stack && kernel_top {
+            let ethread = match view {
+                View::Thread(ethread) => Some(ethread),
+                View::Cpu(thread) => snapshot.processors.iter().find(|processor| processor.number + 1 == thread).map(|processor| processor.thread),
+                View::Owner => snapshot.stop_processor.and_then(|number| snapshot.processors.iter().find(|processor| processor.number == number)).map(|processor| processor.thread),
+            }
+            .filter(|&ethread| ethread != 0);
+            let owner = ethread
+                .and_then(|ethread| threads.iter().find(|thread| thread.ethread == ethread))
+                .and_then(|thread| snapshot.processes.iter().find(|process| process.pid == thread.pid))
+                .filter(|process| process.pid > 4)
+                .map(|process| process.eprocess);
+            if let (Some(ethread), Some(eprocess)) = (ethread, owner) {
+                let current = client.process().map(|context| context.eprocess);
+                let chosen_by_hand = current.is_some() && current != self.auto_process;
+                if chosen_by_hand && current != Some(eprocess) {
+                    snapshot.user_stack_note = format!("sem a parte de usuario: o processo das leituras foi escolhido a mao (.process); a thread e do EPROCESS {eprocess:#x}");
+                } else {
+                    let mut switched: Result<(), String> = Ok(());
+                    if current != Some(eprocess) {
+                        switched = client.set_process(Some(format!("{eprocess:#x}").as_str())).map(|_| ());
+                        if switched.is_ok() {
+                            self.auto_process = Some(eprocess);
+                        }
+                    }
+                    match switched.and_then(|()| details::user_frames(client, ethread, eprocess, 48)) {
+                        Ok((thread, user)) => {
+                            snapshot.user_stack_note = format!("CONTEXT de usuario salvo da thread {} (TEB {:#x})", thread.tid, thread.teb);
+                            if !user.is_empty() {
+                                user_from = Some(frames.len());
+                                frames.extend(user);
+                            }
+                        }
+                        Err(error) => snapshot.user_stack_note = format!("sem a parte de usuario: {error}"),
+                    }
+                }
+            }
+        }
         snapshot.frames = frames
             .iter()
-            .map(|frame| FrameRow {
-                address: frame.address,
-                name: client.frame_name(frame),
-                stack: frame.stack,
-                method: match frame.method {
-                    kd_client::unwind::Method::Context => "registradores",
-                    kd_client::unwind::Method::Table => ".pdata",
-                    kd_client::unwind::Method::Leaf => "folha",
-                    kd_client::unwind::Method::Epilog => "epilogo",
-                    kd_client::unwind::Method::FramePointer => "frame pointer",
-                },
+            .enumerate()
+            .map(|(index, frame)| {
+                let name = client.frame_name(frame);
+                // O módulo de um endereço de retorno é o do `call`.
+                let lookup = if frame.is_return { frame.address.wrapping_sub(1) } else { frame.address };
+                let module = client.symbols.module_at(lookup).map(|module| module.name.clone()).unwrap_or_default();
+                let user_start = user_from == Some(index);
+                FrameRow {
+                    address: frame.address,
+                    symbol: details::strip_module(&name, &module).to_string(),
+                    name,
+                    stack: frame.stack,
+                    method: if user_start { "CONTEXT de usuario" } else { method_text(frame.method) },
+                    module,
+                    user: frame.address < KERNEL_START,
+                    user_start,
+                    line: None,
+                }
             })
             .collect();
         if snapshot.selected_frame >= frames.len() {
@@ -1062,14 +1273,47 @@ impl Worker {
                 Err(error) => snapshot.memory.error = Some(error),
             }
         }
-        snapshot.modules = client
-            .symbols
-            .modules
-            .iter()
-            .map(|module| ModuleRow { base: module.base, end: module.end, name: module.name.clone(), file_name: module.file_name.clone(), symbols: module.symbols.len(), source: module.source.clone(), pdb: module.pdb.is_some(), pending: module.pdb_pending })
-            .collect();
-        snapshot.processes = client.processes().unwrap_or_default();
-        snapshot.threads = client.threads(None).unwrap_or_default().into_iter().map(|thread| ThreadRow { start: client.symbols.describe(thread.start), thread }).collect();
+        // Os ponteiros da janela e a vista como tipo do PDB.
+        snapshot.memory.pointers = details::pointer_names(&client.symbols, &snapshot.memory.bytes);
+        if !snapshot.memory.type_name.is_empty() && !snapshot.memory.bytes.is_empty() {
+            match client.type_database() {
+                Some(database) => match database.find(&snapshot.memory.type_name) {
+                    Some(ty) => snapshot.memory.typed = Some((snapshot.memory.address, ty)),
+                    None => snapshot.memory.type_error = Some(format!("o tipo {} nao existe no PDB do ntoskrnl", snapshot.memory.type_name)),
+                },
+                None => snapshot.memory.type_error = Some(client.types_note.clone()),
+            }
+        }
+        let symbols = &client.symbols;
+        snapshot.modules = symbols.modules.iter().map(|module| module_row(symbols, module)).collect();
+        snapshot.threads = threads.into_iter().map(|thread| ThreadRow { start: client.symbols.describe(thread.start), detail: None, thread }).collect();
+        // Espera e prioridade pelo KTHREAD (os offsets do PDB do ntoskrnl).
+        if wanted.thread_details {
+            let cached = self.thread_cache.as_ref().filter(|(filter, _)| *filter == wanted.thread_filter).map(|(_, found)| found.clone());
+            let layout = match &self.kthread {
+                Some(layout) => Some(layout.clone()),
+                None => client.type_database().and_then(|database| KthreadLayout::from_types(&database)),
+            };
+            match layout {
+                Some(layout) => {
+                    let chosen: Vec<u64> = snapshot.threads.iter().filter(|row| wanted.thread_filter.is_none_or(|pid| pid == row.thread.pid)).take(THREAD_DETAIL_LIMIT).map(|row| row.thread.ethread).collect();
+                    let found = match cached {
+                        Some(found) => found,
+                        None => details::thread_details(client, &layout, &chosen),
+                    };
+                    for row in &mut snapshot.threads {
+                        row.detail = found.get(&row.thread.ethread).cloned();
+                    }
+                    if chosen.len() == THREAD_DETAIL_LIMIT {
+                        snapshot.threads_note = format!("espera e prioridade so das primeiras {THREAD_DETAIL_LIMIT} threads (escolha um processo para ver as dele)");
+                    }
+                    self.thread_cache = Some((wanted.thread_filter, found));
+                    self.kthread = Some(layout);
+                }
+                None => snapshot.threads_note = if client.types_note.is_empty() { "sem o _KTHREAD no PDB do ntoskrnl".into() } else { client.types_note.clone() },
+            }
+        }
+        snapshot.process_context = client.process().cloned();
         snapshot.breakpoints = client.breakpoints().to_vec();
         // Expressões observadas e as vistas tipadas abertas.
         for expression in &self.watches {
@@ -1104,10 +1348,11 @@ impl Worker {
             };
             snapshot.watches.push(row);
         }
-        let mut wanted: Vec<(u64, u32)> = self.expanded.clone();
-        wanted.extend(snapshot.watches.iter().filter_map(|row| row.typed));
+        let mut typed_keys: Vec<(u64, u32)> = self.expanded.clone();
+        typed_keys.extend(snapshot.watches.iter().filter_map(|row| row.typed));
+        typed_keys.extend(snapshot.memory.typed);
         let mut seen = HashSet::new();
-        for (address, ty) in wanted {
+        for (address, ty) in typed_keys {
             if seen.insert((address, ty)) {
                 snapshot.typed.insert((address, ty), client.typed_fields(ty, address));
             }
@@ -1131,6 +1376,11 @@ impl Worker {
         let Some(client) = self.client.as_mut() else { return Err("sem conexao com o alvo".into()) };
         match self.lines.as_mut() {
             Some(Ok(table)) => {
+                // O arquivo e a linha de cada quadro do kernel do OpenNT.
+                for (row, frame) in snapshot.frames.iter_mut().zip(&frames) {
+                    let pc = if frame.is_return { frame.address.wrapping_sub(1) } else { frame.address };
+                    row.line = table.locate(pc).map(|position| (position.file, position.line));
+                }
                 match table.locate(focus) {
                     Some(position) => match table.file(&position.file) {
                         Some(text) => snapshot.source = Some(SourceView { file: position.file, line: position.line, text }),
@@ -1441,6 +1691,37 @@ fn expand_qemu_blocks(client: &mut Client, blocks: &[(u8, u64)], limit: usize) -
     trace.reason = trace::Reason::Interrupted;
     trace.batches = 1;
     trace
+}
+
+/// Como o desenrolar achou o quadro.
+fn method_text(method: Method) -> &'static str {
+    match method {
+        Method::Context => "registradores",
+        Method::Table => ".pdata",
+        Method::Leaf => "folha",
+        Method::Epilog => "epilogo",
+        Method::FramePointer => "frame pointer",
+    }
+}
+
+/// Uma linha da lista de módulos, com o estado do PDB.
+fn module_row(symbols: &kd_client::Symbols, module: &kd_client::symbols::Module) -> ModuleRow {
+    let (pdb_name, pdb_id) = details::pdb_identity(module);
+    ModuleRow {
+        base: module.base,
+        end: module.end,
+        name: module.name.clone(),
+        file_name: module.file_name.clone(),
+        symbols: module.symbols.len(),
+        source: module.source.clone(),
+        pdb: module.pdb.is_some(),
+        pending: module.pdb_pending,
+        path: module.path.clone(),
+        user: module.user,
+        status: PdbStatus::of(symbols, module),
+        pdb_name,
+        pdb_id,
+    }
 }
 
 /// A desmontagem em volta de `focus`.
