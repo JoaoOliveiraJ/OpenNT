@@ -129,6 +129,12 @@ const STATUS_NO_SUCH_DEVICE: u32 = 0xC000_000E;
 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
 const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
 const STATUS_OBJECT_NAME_INVALID: u32 = 0xC000_0033;
+const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
+const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
+/// CM_GET_DEVICE_INTERFACE_LIST_PRESENT / CM_GETIDLIST_FILTER_PRESENT no
+/// formato do kernel.
+const LIST_PRESENT: u32 = 0x1_0000;
 
 /// O pedido de objeto do cfgmgr32 depois do PiCMCaptureObjectInputData
 /// (64 bits: 0x28 bytes, Size em +0): +4 os flags da operação, +8 o tipo
@@ -174,29 +180,30 @@ pub fn capture_object_input(buffers: &Buffers) -> Result<ObjectInput, u32> {
         return Err(STATUS_INVALID_PARAMETER);
     }
     let pointer = u64::from_le_bytes(bytes[0x10..0x18].try_into().unwrap_or([0; 8]));
-    let length = u32_at(&bytes, 0x18);
-    let name = if pointer == 0 {
-        if length != 0 {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        None
-    } else {
-        if length < 2 {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        if user && pointer & 1 != 0 {
-            return Err(STATUS_DATATYPE_MISALIGNMENT);
-        }
-        let raw = read_caller(pointer, length as u64, user)?;
-        // A cópia é terminada no último WCHAR.
-        let mut units: Vec<u16> = raw.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect();
-        if let Some(last) = units.last_mut() {
-            *last = 0;
-        }
-        let end = units.iter().position(|&unit| unit == 0).unwrap_or(units.len());
-        Some(String::from_utf16_lossy(&units[..end]))
-    };
+    let name = capture_name(pointer, u32_at(&bytes, 0x18), user)?;
     Ok(ObjectInput { flags: u32_at(&bytes, 4), object_type: u32_at(&bytes, 8), name, parameter: u32_at(&bytes, 0x1C), result_size: u32_at(&bytes, 0x20) })
+}
+
+/// O texto de um PiCMCapture*InputData: ponteiro NULL exige tamanho 0;
+/// senão ao menos 2 bytes, cópia com alinhamento 2
+/// (PiControlMakeUserModeCallersCopy) e o último WCHAR zerado.
+fn capture_name(pointer: u64, length: u32, user: bool) -> Result<Option<String>, u32> {
+    if pointer == 0 {
+        return if length != 0 { Err(STATUS_INVALID_PARAMETER) } else { Ok(None) };
+    }
+    if length < 2 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    if user && pointer & 1 != 0 {
+        return Err(STATUS_DATATYPE_MISALIGNMENT);
+    }
+    let raw = read_caller(pointer, length as u64, user)?;
+    let mut units: Vec<u16> = raw.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect();
+    if let Some(last) = units.last_mut() {
+        *last = 0;
+    }
+    let end = units.iter().position(|&unit| unit == 0).unwrap_or(units.len());
+    Ok(Some(String::from_utf16_lossy(&units[..end])))
 }
 
 /// Grava o resultado (os DWORDs do cabeçalho e os bytes extras) no buffer de
@@ -245,12 +252,233 @@ fn return_depth(buffers: &Buffers, status: u32, depth: u32, expected: u32) -> (u
     write_result(buffers, &[0xC, status, depth], &[], 0xC)
 }
 
-/// PiCMReturnBufferResultData: {0x14, Status, 0, BufferLength, 0} e os bytes.
-fn return_buffer(buffers: &Buffers, status: u32, data: &[u8], expected: u32) -> (u32, u64) {
-    if expected != 0x14 {
+/// PiCMReturnBufferResultData (19041 0x6b0564): {0x14, Status, Required,
+/// Extra} em +0, um DWORD zerado em +0x10 e os dados a partir de +0x10;
+/// Information = 0x14 + dados. Resultado esperado diferente de 0x14 ou saída
+/// menor que 0x14 + dados recusam o próprio IOCTL (0x810bd6).
+fn return_buffer(buffers: &Buffers, status: u32, required: u32, extra: u32, data: &[u8], expected: u32) -> (u32, u64) {
+    let total = 0x14u32.saturating_add(data.len() as u32);
+    if expected != 0x14 || buffers.output == 0 || buffers.output_length < total {
         return (STATUS_INVALID_PARAMETER, 0);
     }
-    write_result(buffers, &[0x14, status, 0, data.len() as u32, 0], data, 0x14)
+    let user = previous_mode::get().unwrap_or(0) != 0;
+    if user && buffers.output & 3 != 0 {
+        return (STATUS_DATATYPE_MISALIGNMENT, 0);
+    }
+    if user && !probe_user_write(buffers.output, buffers.output_length as u64) {
+        return (STATUS_ACCESS_VIOLATION, 0);
+    }
+    let mut bytes: Vec<u8> = [0x14, status, required, extra].iter().flat_map(|value| value.to_le_bytes()).collect();
+    bytes.extend_from_slice(data);
+    bytes.resize(bytes.len().max(0x14), 0);
+    match guest::try_write_bytes(buffers.output, &bytes) {
+        Ok(()) => (0, total as u64),
+        Err(_) => (STATUS_ACCESS_VIOLATION, 0),
+    }
+}
+
+/// MULTI_SZ: cada texto com o NUL e mais um NUL; vazia = um NUL
+/// (IopGetDeviceInterfaces 0x6b36b3, PiCMGetDeviceIdList 0x689ef4).
+fn multi_sz_bytes(items: &[String]) -> Vec<u8> {
+    let mut units: Vec<u16> = Vec::new();
+    for item in items {
+        units.extend(item.encode_utf16());
+        units.push(0);
+    }
+    units.push(0);
+    units.iter().flat_map(|unit| unit.to_le_bytes()).collect()
+}
+
+/// PiCMCaptureInterfaceListInputData (0x68ff1c; 0x28 bytes): +4 flags, +8 o
+/// GUID da classe, +0x18/+0x20 a instância opcional, +0x24 o resultado (0x14).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InterfaceListInput {
+    pub flags: u32,
+    pub class: [u8; 16],
+    pub device: Option<String>,
+    pub result_size: u32,
+}
+
+/// PiCMCaptureDeviceListInputData (0x68a104; 0x18 bytes): +4 flags, +8/+0x10
+/// o filtro, +0x14 o resultado (0x14).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeviceListInput {
+    pub flags: u32,
+    pub filter: Option<String>,
+    pub result_size: u32,
+}
+
+/// O cabeçalho comum dos PiCMCapture*InputData de 64 bits: ponteiro e
+/// tamanho, alinhamento 8, sondagem e o Size exato em +0.
+fn capture_fixed(buffers: &Buffers, size: u32) -> Result<(Vec<u8>, bool), u32> {
+    let user = previous_mode::get().unwrap_or(0) != 0;
+    if buffers.input == 0 || buffers.input_length == 0 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    if user && buffers.input & 7 != 0 {
+        return Err(STATUS_DATATYPE_MISALIGNMENT);
+    }
+    if user && !probe_user_read(buffers.input, buffers.input_length as u64) {
+        return Err(STATUS_ACCESS_VIOLATION);
+    }
+    if buffers.input_length < size {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let bytes = read_caller(buffers.input, size as u64, user)?;
+    if u32_at(&bytes, 0) != size {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    Ok((bytes, user))
+}
+
+pub fn capture_interface_list_input(buffers: &Buffers) -> Result<InterfaceListInput, u32> {
+    let (bytes, user) = capture_fixed(buffers, 0x28)?;
+    let pointer = u64::from_le_bytes(bytes[0x18..0x20].try_into().unwrap_or([0; 8]));
+    let device = capture_name(pointer, u32_at(&bytes, 0x20), user)?;
+    let mut class = [0u8; 16];
+    class.copy_from_slice(&bytes[8..0x18]);
+    Ok(InterfaceListInput { flags: u32_at(&bytes, 4), class, device, result_size: u32_at(&bytes, 0x24) })
+}
+
+pub fn capture_device_list_input(buffers: &Buffers) -> Result<DeviceListInput, u32> {
+    let (bytes, user) = capture_fixed(buffers, 0x18)?;
+    let pointer = u64::from_le_bytes(bytes[8..0x10].try_into().unwrap_or([0; 8]));
+    let filter = capture_name(pointer, u32_at(&bytes, 0x10), user)?;
+    Ok(DeviceListInput { flags: u32_at(&bytes, 4), filter, result_size: u32_at(&bytes, 0x14) })
+}
+
+/// PiCMGetDeviceInterfaceList (0x201; 19041 0x68fd38): só o flag 0x10000
+/// (só as habilitadas) é válido; a lista do IopGetDeviceInterfaces no formato
+/// do modo usuário (classe sem interfaces: `L"\0"`); saída curta =
+/// STATUS_BUFFER_TOO_SMALL com o tamanho no resultado.
+fn get_device_interface_list(buffers: &Buffers) -> (u32, u64) {
+    let input = match capture_interface_list_input(buffers) {
+        Ok(input) => input,
+        Err(status) => return (status, 0),
+    };
+    let (status, required, data) = if buffers.output == 0 || buffers.output_length < 0x14 || input.flags & !LIST_PRESENT != 0 {
+        (STATUS_INVALID_PARAMETER, 0, Vec::new())
+    } else {
+        let device = input.device.as_deref().filter(|name| !name.is_empty());
+        let links = crate::ntos::io::device_interface::user_interface_links(&input.class, device, input.flags & LIST_PRESENT == 0);
+        let bytes = multi_sz_bytes(&links);
+        let required = bytes.len() as u32;
+        if buffers.output_length - 0x14 < required { (STATUS_BUFFER_TOO_SMALL, required, Vec::new()) } else { (0, required, bytes) }
+    };
+    return_buffer(buffers, status, required, 0, &data, input.result_size)
+}
+
+/// _CmGetMatchingDeviceListForSubkey/_CmEnumSubkeyCallback (0x7b02fc/0x7b1070):
+/// `Enum\a\b\c` na ordem das subchaves, válidos pelo CmValidateDeviceName,
+/// com `present` só os que têm nó (_CmIsDevicePresent 0x684b78).
+fn enum_instances(base: Option<&str>, present: bool, keep: &dyn Fn(&str) -> bool) -> Result<Vec<String>, u32> {
+    let root = alloc::format!("{}\\Enum", super::install::CONTROL_SET);
+    let sorted = |path: &str| {
+        let mut keys = crate::ntos::cm::registry::list_keys(path);
+        keys.sort_by_key(|key| key.to_uppercase());
+        keys
+    };
+    let mut prefixes: Vec<String> = match base {
+        None => sorted(&root),
+        Some(filter) => {
+            let parts: Vec<&str> = filter.split('\\').collect();
+            if parts.len() > 2 || parts.iter().any(|part| part.is_empty()) {
+                return Err(STATUS_INVALID_PARAMETER);
+            }
+            if crate::ntos::cm::registry::node_by_path(&alloc::format!("{root}\\{filter}")).is_none() {
+                return Err(STATUS_OBJECT_NAME_NOT_FOUND);
+            }
+            alloc::vec![String::from(filter)]
+        }
+    };
+    let mut depth = base.map_or(1, |filter| filter.split('\\').count());
+    while depth < 3 {
+        prefixes = prefixes.iter().flat_map(|prefix| sorted(&alloc::format!("{root}\\{prefix}")).into_iter().map(move |child| alloc::format!("{prefix}\\{child}"))).collect();
+        depth += 1;
+    }
+    Ok(prefixes.into_iter().filter(|id| validate_device_name(id) == 0 && (!present || devnode::by_instance_path(id).is_some()) && keep(id)).collect())
+}
+
+/// _CmServiceFilterCallback (0x9771b0): o Service, ou um dos filtros do
+/// dispositivo ou da classe de instalação.
+fn service_matches(id: &str, service: &str) -> bool {
+    use super::install::{read_multi, read_text, CONTROL_SET};
+    let key = alloc::format!("{CONTROL_SET}\\Enum\\{id}");
+    let same = |name: &String| name.eq_ignore_ascii_case(service);
+    if read_text(&key, "Service").is_some_and(|name| same(&name)) {
+        return true;
+    }
+    let filters = |path: &str| read_multi(path, "UpperFilters").into_iter().chain(read_multi(path, "LowerFilters"));
+    if filters(&key).any(|name| same(&name)) {
+        return true;
+    }
+    read_text(&key, "ClassGUID").is_some_and(|class| filters(&alloc::format!("{CONTROL_SET}\\Control\\Class\\{class}")).any(|name| same(&name)))
+}
+
+/// _CmClassFilterCallback (0x976e20): ClassGUID igual ao texto, sem caixa.
+fn class_matches(id: &str, class: &str) -> bool {
+    let key = alloc::format!("{}\\Enum\\{id}", super::install::CONTROL_SET);
+    super::install::read_text(&key, "ClassGUID").is_some_and(|value| value.eq_ignore_ascii_case(class))
+}
+
+/// PiQueryDeviceRelations (0x8b3fec): o nó tem de existir; BusRelations são
+/// os filhos. As outras relações o NT pede à pilha (PnpQueryDeviceRelations);
+/// aqui ficam vazias.
+fn device_relations(relation: u32, device: &str) -> Result<Vec<String>, u32> {
+    let node = node_of(device).ok_or(STATUS_NO_SUCH_DEVICE)?;
+    Ok(if relation == 0x20 { node.children.iter().filter_map(|&pdo| devnode::get(pdo).map(|child| child.instance_path)).collect() } else { Vec::new() })
+}
+
+/// O chamador é o SYSTEM ou administrador (a aproximação do
+/// PiAuDoesClientHaveAccess(2) no PiAuSecurityObject).
+fn caller_is_system_or_admin() -> bool {
+    let process = crate::ntos::ps::process::get_current_process();
+    let Some(token) = crate::ntos::ps::process::get_primary_token(process) else { return false };
+    let system = crate::ntos::se::token::tokens::with(token, |token| token.user == crate::ntos::se::model::sid(5, &[18])).unwrap_or(false);
+    system || crate::ntos::se::token::information::is_admin(token)
+}
+
+/// PiCMGetDeviceIdList (0x200; 19041 0x689bd4).
+fn get_device_id_list(buffers: &Buffers) -> (u32, u64) {
+    let input = match capture_device_list_input(buffers) {
+        Ok(input) => input,
+        Err(status) => return (status, 0),
+    };
+    if buffers.output == 0 || buffers.output_length < 0x14 {
+        return (STATUS_INVALID_PARAMETER, 0);
+    }
+    // 0x20000 (sem o filtro obrigatório) exige o acesso ao objeto de
+    // segurança do PnP: aqui, SYSTEM ou administrador.
+    if input.flags & 0x2_0000 != 0 && !caller_is_system_or_admin() {
+        return return_buffer(buffers, STATUS_ACCESS_DENIED, 0, 0, &[], input.result_size);
+    }
+    let capacity = match buffers.output_length - 0x14 {
+        room if room >= 2 => room,
+        _ => 0,
+    };
+    let kind = input.flags & 0xFFFF;
+    let present = input.flags & LIST_PRESENT != 0;
+    let result = if !matches!(kind, 0 | 1 | 2 | 4 | 8 | 0x10 | 0x20 | 0x40 | 0x80) || input.flags & 0xFFFC_0000 != 0 {
+        Err(STATUS_INVALID_PARAMETER)
+    } else {
+        match (kind, input.filter.as_deref()) {
+            (0, _) => enum_instances(None, present, &|_| true),
+            (_, None) => Err(STATUS_INVALID_PARAMETER),
+            (1, Some(enumerator)) => enum_instances(Some(enumerator), present, &|_| true),
+            (2, Some(service)) => enum_instances(None, present, &|id| service_matches(id, service)),
+            (0x80, Some(class)) => enum_instances(None, present, &|id| class_matches(id, class)),
+            (relation, Some(device)) => device_relations(relation, device),
+        }
+    };
+    let (status, required, data) = match result {
+        Err(status) => (status, 0, Vec::new()),
+        Ok(ids) => {
+            let bytes = multi_sz_bytes(&ids);
+            let required = bytes.len() as u32;
+            if required > capacity { (STATUS_BUFFER_TOO_SMALL, required, Vec::new()) } else { (0, required, bytes) }
+        }
+    };
+    return_buffer(buffers, status, required, 0, &data, input.result_size)
 }
 
 /// CmValidateDeviceName: até 200 WCHARs, só de 0x21 a 0x7F e sem vírgula,
@@ -417,7 +645,7 @@ fn get_related_device_instance(buffers: &Buffers) -> (u32, u64) {
         },
         _ => (STATUS_INVALID_PARAMETER, Vec::new()),
     };
-    return_buffer(buffers, status, &data, input.result_size)
+    return_buffer(buffers, status, data.len() as u32, 0, &data, input.result_size)
 }
 
 /// PiCMHandleIoctl: NTSTATUS e o Information.
@@ -427,6 +655,8 @@ pub fn handle_ioctl(code: u32, buffers: &Buffers) -> (u32, u64) {
         code::VALIDATE_DEVICE_INSTANCE => validate_device_instance(buffers),
         code::GET_DEVICE_DEPTH => get_device_depth(buffers),
         code::GET_RELATED_DEVICE_INSTANCE => get_related_device_instance(buffers),
+        code::GET_DEVICE_ID_LIST => get_device_id_list(buffers),
+        code::GET_DEVICE_INTERFACE_LIST => get_device_interface_list(buffers),
         _ => match handler_name(code) {
             Some(name) => {
                 debug_print!("[pnp] CMApi: {} ({:#x}) sem suporte no kernel", name, code);

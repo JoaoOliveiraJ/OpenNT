@@ -123,11 +123,11 @@ pub fn run(assert: Assert) {
     let invalid_name = words(2);
     object_input(input, 0, 2, 0x14, Some("Root\\OPENNT_CMAPI\\0000"));
     let (related, related_information) = control(cm_api::code::GET_RELATED_DEVICE_INSTANCE, 0x28, 0x100);
-    let header = words(5);
-    let path = crate::ntos::rtl::guest_strings::read_wide_string(result + 0x14);
+    let header = words(4);
+    let path = crate::ntos::rtl::guest_strings::read_wide_string(result + 0x10);
     object_input(input, 0, 1, 0x14, Some("OPENNT\\CMAPI_CHILD\\1"));
     let _ = control(cm_api::code::GET_RELATED_DEVICE_INSTANCE, 0x28, 0x100);
-    let parent = crate::ntos::rtl::guest_strings::read_wide_string(result + 0x14);
+    let parent = crate::ntos::rtl::guest_strings::read_wide_string(result + 0x10);
     object_input(input, 0, 2, 0x14, Some("OPENNT\\CMAPI_CHILD\\1"));
     let _ = control(cm_api::code::GET_RELATED_DEVICE_INSTANCE, 0x28, 0x100);
     let childless = words(4);
@@ -138,12 +138,39 @@ pub fn run(assert: Assert) {
             && invalid_name == [0xC, STATUS_OBJECT_NAME_INVALID]
             && related == 0
             && related_information == 0x14 + 0x2A
-            && header == [0x14, 0, 0, 0x2A, 0]
+            && header == [0x14, 0, 0x2A, 0]
             && path == "OPENNT\\CMAPI_CHILD\\1"
             && parent == "Root\\OPENNT_CMAPI\\0000"
             && childless == [0x14, STATUS_NO_SUCH_DEVICE, 0, 0]
             && tight.0 == STATUS_INVALID_PARAMETER,
         "deviceapi: GetDeviceDepth e GetRelatedDeviceInstance (pai, filho; nome invalido, sem filho e caminho que nao cabe)",
+    );
+    // PiCMGetDeviceInterfaceList numa classe sem interfaces (a do uDWM,
+    // GUID_DEVINTERFACE_HOLOGRAPHIC_DISPLAY): L"\0", com o tamanho no
+    // resultado {0x14, Status, Required, Extra} do PiCMReturnBufferResultData.
+    const HOLOGRAPHIC: [u8; 16] = [0xab, 0x60, 0xac, 0xde, 0xe2, 0x66, 0xa4, 0x42, 0xad, 0x9b, 0x55, 0x7e, 0xe3, 0x3a, 0xe2, 0xd5];
+    let interface_input = |flags: u32, result_size: u32| {
+        guest::write_bytes(input, &[0u8; 0x40]);
+        guest::write32(input, 0x28);
+        guest::write32(input + 4, flags);
+        guest::write_bytes(input + 8, &HOLOGRAPHIC);
+        guest::write32(input + 0x24, result_size);
+    };
+    interface_input(0x1_0000, 0x14);
+    let (size_call, size_information) = control(cm_api::code::GET_DEVICE_INTERFACE_LIST, 0x28, 0x14);
+    let size_words = words(4);
+    let (list_call, list_information) = control(cm_api::code::GET_DEVICE_INTERFACE_LIST, 0x28, 0x16);
+    let list_words = words(5);
+    interface_input(1, 0x14);
+    let _ = control(cm_api::code::GET_DEVICE_INTERFACE_LIST, 0x28, 0x14);
+    let bad_flags = words(4);
+    interface_input(0x1_0000, 0x10);
+    let bad_expected = control(cm_api::code::GET_DEVICE_INTERFACE_LIST, 0x28, 0x14);
+    interface_input(0x1_0000, 0x14);
+    let short_output = control(cm_api::code::GET_DEVICE_INTERFACE_LIST, 0x28, 0x10);
+    assert(
+        size_call == 0 && size_information == 0x14 && size_words == [0x14, 0xC000_0023, 2, 0] && list_call == 0 && list_information == 0x16 && list_words[..4] == [0x14, 0, 2, 0] && list_words[4] & 0xFFFF == 0 && bad_flags == [0x14, STATUS_INVALID_PARAMETER, 0, 0] && bad_expected == (STATUS_INVALID_PARAMETER, 0) && short_output.0 == STATUS_INVALID_PARAMETER,
+        "deviceapi: GetDeviceInterfaceList de classe sem interfaces devolve L\"\\0\" (tamanho 0xC0000023 com 2; lista 0 com 2 bytes em +0x10); flags e resultado fora do contrato",
     );
     // PiCMValidateDeviceInstance: chave Enum e nó presente.
     let enum_key = alloc::format!("{}\\Enum\\Root\\OPENNT_CMAPI\\0000", crate::ntos::io::pnp::install::CONTROL_SET);

@@ -23,10 +23,12 @@ use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::inc::types::{Guid, NtStruct, UnicodeString};
 use crate::ntos::rtl::guest_strings;
 
-/// Interface de dispositivo: estado e GUID da classe.
+/// Interface de dispositivo: estado, GUID da classe e a instância do nó do
+/// PnP dono (None num link sem nó).
 struct DeviceInterface {
     enabled: bool,
     class: [u8; 16],
+    instance: Option<String>,
 }
 
 static DEVICE_INTERFACES: SpinLock<BTreeMap<String, DeviceInterface>> = SpinLock::new(BTreeMap::new());
@@ -96,7 +98,8 @@ pub fn register_device_interface(physical: u64, guid: u64, reference: u64, outpu
     }
     let mut class = [0u8; 16];
     class.copy_from_slice(&guid_bytes);
-    DEVICE_INTERFACES.lock().entry(link.clone()).or_insert(DeviceInterface { enabled: false, class });
+    let instance = crate::ntos::io::pnp::devnode::get(physical).map(|node| node.instance_path);
+    DEVICE_INTERFACES.lock().entry(link.clone()).or_insert(DeviceInterface { enabled: false, class, instance });
     let length = link.encode_utf16().count() as u64 * 2;
     let buffer = guest::alloc_bytes(length + 2);
     guest_strings::write_wide_string(buffer, &link);
@@ -143,6 +146,29 @@ pub fn interface_enabled(link: &str) -> Option<bool> {
 /// DEVICE_INTERFACE_INCLUDE_NONACTIVE (`include_inactive`).
 pub fn class_links(class: &[u8; 16], include_inactive: bool) -> Vec<String> {
     DEVICE_INTERFACES.lock().iter().filter(|(_, entry)| entry.class == *class && (include_inactive || entry.enabled)).map(|(link, _)| link.clone()).collect()
+}
+
+/// Os links de uma classe como o IopGetDeviceInterfaces (19041 0x6b32e8) os
+/// entrega ao modo usuário (UserModeFormat, PiCMGetDeviceInterfaceList
+/// 0x68fe16): só interfaces de nós do PnP (as que têm chave em
+/// Control\DeviceClasses), prefixo `\\?\`, na ordem das subchaves da classe
+/// (nome em maiúsculas); só as habilitadas salvo `include_inactive`; com
+/// `instance`, só as do DeviceInstance pedido, sem caixa.
+pub fn user_interface_links(class: &[u8; 16], instance: Option<&str>, include_inactive: bool) -> Vec<String> {
+    let mut links: Vec<String> = DEVICE_INTERFACES
+        .lock()
+        .iter()
+        .filter(|(_, entry)| entry.class == *class && (include_inactive || entry.enabled))
+        .filter_map(|(link, entry)| {
+            let owner = entry.instance.as_deref()?;
+            if instance.is_some_and(|wanted| !wanted.eq_ignore_ascii_case(owner)) {
+                return None;
+            }
+            link.strip_prefix("\\??\\").map(|rest| format!("\\\\?\\{rest}"))
+        })
+        .collect();
+    links.sort_by_key(|link| link.to_uppercase());
+    links
 }
 
 // ---- IoOpenDeviceInterfaceRegistryKey (ntoskrnl 19041 0x7ccc50) --------------
