@@ -425,6 +425,19 @@ pub fn create_kernel_file_with_context(output: u64, desired_access: u32, attribu
         return Ok(STATUS_OBJECT_NAME_NOT_FOUND);
     };
     let exists = volume.exists(&path);
+    // [Q-FILESEC hook 4, etapa 2] OBJ_FORCE_ACCESS_CHECK (o
+    // SL_FORCE_ACCESS_CHECK do IopParseDevice): o NtfsAccessCheck em UserMode
+    // do arquivo existente, com a travessia, só registrado.
+    if open_flags & 0x400 != 0 && exists {
+        match crate::ntos::io::parse::volume_open_security(true, access, options, disposition, None) {
+            Ok(security) => {
+                let desired = access | if disposition == FILE_OVERWRITE || disposition == FILE_OVERWRITE_IF { 2 } else { 0 };
+                crate::drivers::fs::ntfs_security::audit(&path, &security, 0x20, access, crate::drivers::fs::ntfs_security::check_traverse(volume, &path, &security).map(|()| 0x20));
+                crate::drivers::fs::ntfs_security::audit(&path, &security, desired, access, crate::drivers::fs::ntfs_security::check(volume, &path, &security, desired));
+            }
+            Err(status) => crate::drivers::fs::ntfs_security::audit_status(&path, access, status),
+        }
+    }
     let writable = volume.writable();
     let lifetime = file_lifetime::lifetime_volume(volume);
     // Exclusão pendente e compartilhamento pertencem ao arquivo.

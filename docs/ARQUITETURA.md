@@ -3275,8 +3275,18 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   descritor guardado e o NtSetSecurityObject troca as partes pedidas com
   AutoInheritFlags 0 (`ntfs_security::modify`). Um volume sem segurança
   continua com o descritor de World e o sucesso sem mudança do
-  IopGetSetSecurityObject. O volume informa FILE_PERSISTENT_ACLS. A
-  abertura ainda não confere o descritor. Teste: `file_security` na fase 7.
+  IopGetSetSecurityObject. O volume informa FILE_PERSISTENT_ACLS. As
+  checagens do NTFS (`ntfs_security::check`, `check_traverse`,
+  `check_create`: o NtfsAccessCheck com a concessão pelo pai, o
+  FILE_TRAVERSE sem SeChangeNotifyPrivilege e o FILE_ADD_FILE do pai) e o
+  contexto do IopParseDevice (`io/parse.rs::volume_open_security`: o
+  token, a regra do nível de impersonação e o
+  IopCheckBackupRestorePrivilege) rodam no NtCreateFile, no
+  NtQueryAttributesFile, no destino de um rename, no ZwCreateFile com
+  OBJ_FORCE_ACCESS_CHECK e na abertura do executável do
+  NtCreateUserProcess, mas por enquanto só registram a recusa
+  (`[filesec] negaria`); a abertura segue com o acesso pedido. Teste:
+  `file_security` na fase 7.
 - **Estado por processo**: o que no NT mora no EPROCESS e o OpenNT ainda não
   guarda numa estrutura do NT fica em `ps/user/process_state.rs`, um
   `ProcessState` por EPROCESS (o System inclusive), criado por

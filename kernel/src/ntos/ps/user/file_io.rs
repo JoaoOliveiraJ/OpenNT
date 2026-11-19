@@ -16,6 +16,7 @@ use super::file_objects::{self, UserFile};
 use super::registry::parse_user_object_attributes;
 use super::state::{self, UserHandle};
 use crate::drivers::fs::ntfs::Stat;
+use crate::drivers::fs::ntfs_security;
 use crate::drivers::fs::volume_files::{self, VolumeFile};
 use crate::ntos::io::file::irp_service;
 use crate::ntos::io::file::lifetime as file_lifetime;
@@ -263,6 +264,14 @@ pub fn create(out: u64, name: &str, iosb: u64, disposition: u32, request: &OpenR
             reparse = Some(found);
             return Ok(reparse::STATUS_REPARSE);
         }
+        // [Q-FILESEC hook 2, etapa 2] O contexto de segurança do
+        // IopParseDevice e as checagens do NTFS só registrados
+        // (`[filesec] negaria`): a abertura segue com o acesso de hoje.
+        let security = crate::ntos::io::parse::volume_open_security(true, granted, options, disposition, request.explicit.clone());
+        match &security {
+            Ok(security) => ntfs_security::audit(&path, security, 0x20, granted, ntfs_security::check_traverse(&*volume, &path, security).map(|()| 0x20)),
+            Err(status) => ntfs_security::audit_status(&path, granted, *status),
+        }
         let mut file = volume_files::lookup_volume_file(name);
         let mut information = 1u64;
         match file.clone() {
@@ -270,6 +279,13 @@ pub fn create(out: u64, name: &str, iosb: u64, disposition: u32, request: &OpenR
                 let stat = existing.stat();
                 if existing.pending_delete() {
                     return fail(0xC000_0056);
+                }
+                // NtfsCheckExistingFile (0x114700); FILE_OVERWRITE(_IF) pede
+                // FILE_WRITE_DATA também (NtfsOpenAttributeInExistingFile
+                // 0x114184).
+                if let Ok(security) = &security {
+                    let desired = granted | if [4, 5].contains(&disposition) { 2 } else { 0 };
+                    ntfs_security::audit(&path, security, desired, granted, ntfs_security::check(&*volume, &path, security, desired));
                 }
                 // FILE_DISALLOW_EXCLUSIVE: um somente-leitura existente não
                 // abre negando o compartilhamento de leitura.
@@ -327,6 +343,12 @@ pub fn create(out: u64, name: &str, iosb: u64, disposition: u32, request: &OpenR
                         return fail(0xC000_003A);
                     }
                     return fail(0xC000_0034);
+                }
+                // NtfsCreateNewFile: FILE_ADD_FILE ou FILE_ADD_SUBDIRECTORY
+                // no pai.
+                if let Ok(security) = &security {
+                    let parent = ntfs_security::parent_of(&path);
+                    ntfs_security::audit(parent, security, if directory { 4 } else { 2 }, granted, ntfs_security::check_create(&*volume, parent, security, directory, granted));
                 }
                 // [Q-FILESEC etapa 1] O descritor do arquivo novo
                 // (NtfsCacheSharedSecurityForCreate, em UserMode): a herança
@@ -489,6 +511,18 @@ fn query_attributes(attributes: u64, out: u64, length: u64) -> Result<u32, Kerne
     };
     if file.pending_delete() {
         return Ok(0xC000_0056);
+    }
+    // [Q-FILESEC hook 3, etapa 2] A travessia e o FILE_READ_ATTRIBUTES (o
+    // pai concede pelo FILE_LIST_DIRECTORY) do NtQueryAttributesFile, só
+    // registrados.
+    if let (Some(path), Some(volume)) = (volume_files::nt_path_to_volume_path(&name), volume_files::volume()) {
+        match crate::ntos::io::parse::volume_open_security(true, 0x80, 0, 1, None) {
+            Ok(security) => {
+                ntfs_security::audit(&path, &security, 0x20, 0x80, ntfs_security::check_traverse(&*volume, &path, &security).map(|()| 0x20));
+                ntfs_security::audit(&path, &security, 0x80, 0x80, ntfs_security::check(&*volume, &path, &security, 0x80));
+            }
+            Err(status) => ntfs_security::audit_status(&path, 0x80, status),
+        }
     }
     let result = if length == FileBasicInformation::SIZE {
         state::user_struct::<FileBasicInformation>(out).and_then(|out| basic(out, &file.stat()))
@@ -963,6 +997,18 @@ fn nt_set_information_file(handle: u64, iosb: u64, buffer: u64, length: u64, rsp
                     name = alloc::format!("{}{}", &old[..old.rfind('/').map_or(0, |index| index + 1)], name);
                 }
                 let Some(target) = volume_files::nt_path_to_volume_path(&name) else { return fail(0xC000_0033) };
+                // [Q-FILESEC hook 6, etapa 2] O IopOpenLinkOrRenameTarget abre
+                // o diretório de destino com FILE_ADD_FILE (ou
+                // FILE_ADD_SUBDIRECTORY) | SYNCHRONIZE e IO_FORCE_ACCESS_CHECK
+                // (0x608f56..0x608fb5): só registrado.
+                if let Some(volume) = volume_files::volume() {
+                    let add = if file.directory() { 4 } else { 2 };
+                    let parent = ntfs_security::parent_of(&target);
+                    match crate::ntos::io::parse::volume_open_security(true, add | 0x10_0000, 0, 1, None) {
+                        Ok(security) => ntfs_security::audit(parent, &security, add, handle_access, ntfs_security::check(&*volume, parent, &security, add | 0x10_0000)),
+                        Err(status) => ntfs_security::audit_status(parent, add, status),
+                    }
+                }
                 if let Some(existing) = volume_files::lookup_volume_file(&target) {
                     if !Arc::ptr_eq(&existing, &file) && !existing.opens.lock().is_empty() {
                         return fail(0xC000_0043);

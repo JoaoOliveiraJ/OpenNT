@@ -155,7 +155,7 @@ pub fn is_capability_sid(identifier: &[u8]) -> bool {
 }
 
 /// O texto do RtlConvertSidToUnicodeString de um SID já copiado.
-fn sid_text(identifier: &[u8]) -> String {
+pub(crate) fn sid_text(identifier: &[u8]) -> String {
     let authority = identifier.get(2..8).unwrap_or(&[0; 6]);
     let mut text = String::from("S-1-");
     if authority[0] != 0 || authority[1] != 0 {

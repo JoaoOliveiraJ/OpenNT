@@ -310,6 +310,81 @@ fn create_access_state(desired: u32) -> Result<u64, KernelError> {
     Ok(block)
 }
 
+/// O que o IopParseDevice dá ao file system numa abertura do volume de boot,
+/// que não tem IRP nem ACCESS_STATE: o token efetivo (o do
+/// SECURITY_SUBJECT_CONTEXT), se o NtfsAccessCheck confere (UserMode, ou
+/// SL_FORCE_ACCESS_CHECK de um OBJ_FORCE_ACCESS_CHECK), o
+/// TOKEN_HAS_TRAVERSE_PRIVILEGE do SepCreateAccessStateFromSubjectContext
+/// (0x345810: SeChangeNotifyPrivilege habilitado), o
+/// TOKEN_HAS_RESTORE_PRIVILEGE e o PreviouslyGrantedAccess do
+/// IopCheckBackupRestorePrivilege (0x650630) e o descritor capturado dos
+/// OBJECT_ATTRIBUTES (AccessState->SecurityDescriptor).
+#[derive(Clone)]
+pub struct VolumeOpenSecurity {
+    pub token: u64,
+    pub check: bool,
+    pub traverse: bool,
+    pub restore: bool,
+    pub previously_granted: u32,
+    pub explicit: Option<crate::ntos::se::policy_descriptor::OwnedDescriptor>,
+    /// As opções depois do IopCheckBackupRestorePrivilege: sem
+    /// FILE_OPEN_FOR_BACKUP_INTENT quando o token não tem nenhum dos dois
+    /// privilégios (`and [rbx], ~0x4000`, 0x650736).
+    pub options: u32,
+}
+
+const SE_BACKUP_PRIVILEGE: u64 = 17;
+const SE_RESTORE_PRIVILEGE: u64 = 18;
+const SE_CHANGE_NOTIFY_PRIVILEGE: u64 = 23;
+const FILE_OPEN_FOR_BACKUP_INTENT: u32 = 0x4000;
+/// Os direitos que o SeBackupPrivilege e o SeRestorePrivilege concedem.
+const BACKUP_ACCESS: u32 = 0x0112_00A9;
+const RESTORE_ACCESS: u32 = 0x011F_0116;
+const STATUS_BAD_IMPERSONATION_LEVEL: u32 = 0xC000_00A5;
+
+/// O contexto de segurança de uma abertura do volume de boot
+/// ([`VolumeOpenSecurity`]) com o acesso pedido `desired` (já mapeado), as
+/// opções e a disposição. Com `check`, uma impersonação abaixo de
+/// SecurityImpersonation é STATUS_BAD_IMPERSONATION_LEVEL (a regra do
+/// SeAccessCheck, `se/access_check.rs`). Com FILE_OPEN_FOR_BACKUP_INTENT, o
+/// IopCheckBackupRestorePrivilege (0x650630): MAXIMUM_ALLOWED pede
+/// 0x11F01BF (0x7fef8c); nas disposições FILE_OPEN, FILE_OPEN_IF e
+/// FILE_OVERWRITE_IF (0x650693..0x6506b1) o SeBackupPrivilege concede o
+/// pedido `& 0x11200A9` e o tira do resto (`and esi, 0xfeedff56`); nas
+/// outras o SeRestorePrivilege é pedido de qualquer jeito (0x6507ed). O
+/// SeRestorePrivilege concede o resto `& 0x11F0116` e
+/// TOKEN_HAS_RESTORE_PRIVILEGE; sem nenhuma concessão, a opção sai
+/// (0x650736).
+pub fn volume_open_security(check: bool, desired: u32, options: u32, disposition: u32, explicit: Option<crate::ntos::se::policy_descriptor::OwnedDescriptor>) -> Result<VolumeOpenSecurity, u32> {
+    use crate::ntos::se::token::{thread as thread_tokens, tokens};
+    let thread = process::get_current_thread();
+    if check && thread_tokens::get(thread).is_some_and(|impersonation| impersonation.level < 2) {
+        return Err(STATUS_BAD_IMPERSONATION_LEVEL);
+    }
+    let token = thread_tokens::effective(thread, false).unwrap_or(0);
+    let enabled = |id: u64| tokens::with(token, |token| token.privileges.iter().any(|privilege| privilege.id == id && privilege.attributes & 2 != 0)).unwrap_or(false);
+    let maximum = desired & MAXIMUM_ALLOWED != 0;
+    let (mut previously_granted, mut restore, mut options) = (0u32, false, options);
+    if options & FILE_OPEN_FOR_BACKUP_INTENT != 0 {
+        let mut remaining = if maximum { desired | 0x011F_01BF } else { desired };
+        let backup_disposition = matches!(disposition, 1 | 3 | 5);
+        let mut backup = false;
+        if backup_disposition && remaining & BACKUP_ACCESS != 0 && enabled(SE_BACKUP_PRIVILEGE) {
+            previously_granted |= remaining & BACKUP_ACCESS;
+            remaining &= 0xFEED_FF56;
+            backup = true;
+        }
+        let wanted = remaining & RESTORE_ACCESS;
+        if (wanted != 0 || !backup_disposition) && enabled(SE_RESTORE_PRIVILEGE) {
+            previously_granted |= wanted;
+            restore = true;
+        } else if !backup {
+            options &= !FILE_OPEN_FOR_BACKUP_INTENT;
+        }
+    }
+    Ok(VolumeOpenSecurity { token, check, traverse: enabled(SE_CHANGE_NOTIFY_PRIVILEGE), restore, previously_granted, explicit, options })
+}
+
 fn release_access_state(block: u64) {
     // SAFETY: o ACCESS_STATE no início do bloco de create_access_state.
     let _ = access_state::delete(unsafe { AccessState::at(block) });

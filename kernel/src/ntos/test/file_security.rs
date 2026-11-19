@@ -241,7 +241,7 @@ impl Harness {
 }
 
 fn cleanup(volume: &Ntfs) {
-    let mut paths = vec![FILE, DIRECTORY, PROTECTED, PARENT, "/OPENNTFS/A", "/OPENNTFS/B"];
+    let mut paths = vec![FILE, DIRECTORY, PROTECTED, PARENT, "/OPENNTFS/A", "/OPENNTFS/B", "/OPENNTFS/DC/R.TXT", "/OPENNTFS/DC/E.TXT", "/OPENNTFS/ND/R.TXT", "/OPENNTFS/DC", "/OPENNTFS/ND", "/OPENNTFS/AD"];
     let big: Vec<alloc::string::String> = (0..BIG).map(|index| alloc::format!("/OPENNTFS/G{index}")).collect();
     paths.extend(big.iter().map(|path| path.as_str()));
     paths.push(ROOT);
@@ -380,6 +380,67 @@ fn query_and_set(assert: Assert, volume: &Ntfs, test: &Harness, token: u64) {
     assert(changed && back, "filesec: o descritor da raiz (registro 5) troca e volta");
 }
 
+/// Roda `action` com outro token de impersonação do teste (os privilégios e
+/// o nível dados) e volta ao token `main`.
+fn as_token(main: u64, privileges: &[u64], level: u32, action: impl FnOnce() -> bool) -> bool {
+    let thread = process::get_current_thread();
+    let other = test_token(privileges);
+    let done = other != 0 && thread_tokens::assign(thread, Some(other), level, false, false).is_ok() && action();
+    let _ = thread_tokens::assign(thread, Some(main), 2, false, false);
+    if other != 0 {
+        let _ = tokens::release(other);
+    }
+    done
+}
+
+/// [Q-FILESEC etapa 2] As decisões do NtfsAccessCheck. A abertura ainda só
+/// as registra (`[filesec] negaria`), então o teste confere a decisão das
+/// checagens e que o NtCreateFile segue concedendo.
+fn access_checks(assert: Assert, volume: &Ntfs, test: &Harness, token: u64) {
+    use crate::ntos::io::parse::volume_open_security;
+    let (system, administrators, users) = (sid(5, &[18]), sid(5, &[32, 544]), sid(5, &[32, 545]));
+    let sd = |aces: Vec<Vec<u8>>| descriptor(0, &administrators, &system, &aces);
+    let all = ace(0, FILE_ALL, &system);
+    // DC: FILE_LIST_DIRECTORY e FILE_DELETE_CHILD para BU; ND: só
+    // FILE_LIST_DIRECTORY (sem FILE_TRAVERSE); AD: FILE_LIST_DIRECTORY e
+    // FILE_ADD_FILE. E.TXT tem a DACL vazia.
+    let made = [
+        ("/OPENNTFS/DC", true, sd(vec![all.clone(), ace(0, 0x41, &users)])),
+        ("/OPENNTFS/DC/R.TXT", false, sd(vec![all.clone(), ace(0, READ_EXECUTE, &users)])),
+        ("/OPENNTFS/DC/E.TXT", false, sd(Vec::new())),
+        ("/OPENNTFS/ND", true, sd(vec![all.clone(), ace(0, 0x1, &users)])),
+        ("/OPENNTFS/ND/R.TXT", false, sd(vec![all.clone(), ace(0, READ_EXECUTE, &users)])),
+        ("/OPENNTFS/AD", true, sd(vec![all.clone(), ace(0, 0x3, &users)])),
+    ];
+    let prepared = made.iter().all(|(path, directory, bytes)| volume.create_with_security(path, *directory, if *directory { 0x10 } else { 0x20 }, 0, Some(bytes)).is_ok());
+    assert(prepared, "filesec: arquivos com os descritores das checagens");
+    let open = |desired: u32, options: u32| volume_open_security(true, desired, options, 1, None);
+    let decide = |path: &str, desired: u32| open(desired, 0).and_then(|security| ntfs_security::check(volume, path, &security, desired));
+    let read = "/OPENNTFS/DC/R.TXT";
+    let empty = "/OPENNTFS/DC/E.TXT";
+    assert(decide(read, 0x1).is_ok() && decide(read, 0x2) == Err(0xC000_0022) && decide(read, 0x0200_0000) == Ok(READ_EXECUTE), "filesec: (A;;0x1200a9;;;BU) concede leitura, nega escrita e MAXIMUM_ALLOWED da 0x1200a9");
+    assert(decide(read, 0x1_0000).is_ok_and(|granted| granted & 0x1_0000 != 0) && decide("/OPENNTFS/ND/R.TXT", 0x1_0000) == Err(0xC000_0022), "filesec: DELETE pelo FILE_DELETE_CHILD do pai, e negado sem ele");
+    assert(decide(empty, 0x80).is_ok() && decide(empty, 0x2_0000) == Err(0xC000_0022), "filesec: DACL vazia com FILE_LIST_DIRECTORY no pai: FILE_READ_ATTRIBUTES sim, READ_CONTROL nao");
+    let create = |parent: &str, desired: u32| open(desired, 0).and_then(|security| ntfs_security::check_create(volume, parent, &security, false, desired));
+    assert(create("/OPENNTFS/ND", 0x0012_0116) == Err(0xC000_0022) && create("/OPENNTFS/AD", 0x0012_0116) == Ok(0x0012_0116) && create("/OPENNTFS/AD", 0x0200_0000) == Ok(FILE_ALL), "filesec: criacao pede FILE_ADD_FILE no pai e concede o pedido (MAXIMUM_ALLOWED vira FILE_ALL_ACCESS)");
+    assert(decide(read, 0x0012_0089 | 0x2) == Err(0xC000_0022), "filesec: FILE_OVERWRITE com GENERIC_READ pede FILE_WRITE_DATA e e negado");
+    let traverse = |security: Result<crate::ntos::io::parse::VolumeOpenSecurity, u32>| security.and_then(|security| ntfs_security::check_traverse(volume, "/OPENNTFS/ND/R.TXT", &security));
+    let privileged = traverse(open(0x1, 0)).is_ok();
+    let unprivileged = as_token(token, &[], 2, || traverse(open(0x1, 0)) == Err(0xC000_0022));
+    assert(privileged && unprivileged, "filesec: sem SeChangeNotifyPrivilege o diretorio sem FILE_TRAVERSE nega o filho; com ele, passa");
+    let backup = as_token(token, &[23, 17], 2, || open(0x1, 0x4000).is_ok_and(|security| security.previously_granted == 0x1 && ntfs_security::check(volume, empty, &security, 0x1).is_ok()) && decide(empty, 0x1) == Err(0xC000_0022));
+    let restore = as_token(token, &[23, 18], 2, || open(0x4_0000, 0x4000).is_ok_and(|security| security.restore && ntfs_security::check(volume, empty, &security, 0x4_0000).is_ok()));
+    let neither = open(0x1, 0x4000).is_ok_and(|security| security.options & 0x4000 == 0 && ntfs_security::check(volume, empty, &security, 0x1) == Err(0xC000_0022));
+    assert(backup && restore && neither, "filesec: FILE_OPEN_FOR_BACKUP_INTENT com SeBackupPrivilege le e com SeRestorePrivilege da WRITE_DAC; sem os dois a opcao cai e nega");
+    let identification = as_token(token, &[23], 1, || open(0x1, 0).err() == Some(0xC000_00A5));
+    assert(identification, "filesec: impersonacao Identification -> STATUS_BAD_IMPERSONATION_LEVEL");
+    let kernel = volume_open_security(false, 0x2, 0, 1, None).and_then(|security| ntfs_security::check(volume, empty, &security, 0x2));
+    assert(kernel == Ok(0x2), "filesec: abertura de modo kernel sem OBJ_FORCE_ACCESS_CHECK nao confere o descritor");
+    let (opened, handle) = test.open(read, 0x0010_0002, 1, 0x60, None);
+    test.close(handle);
+    assert(opened == 0, "filesec: etapa 2 so registra: o NtCreateFile negado pelo descritor ainda abre");
+}
+
 pub fn run(assert: Assert) {
     let Some(volume) = volume_files::volume() else {
         assert(false, "filesec: volume de boot");
@@ -397,6 +458,7 @@ pub fn run(assert: Assert) {
     if token != 0 && thread_tokens::assign(thread, Some(token), 2, false, false).is_ok() {
         inheritance(assert, &volume, &test);
         query_and_set(assert, &volume, &test, token);
+        access_checks(assert, &volume, &test, token);
         let _ = thread_tokens::assign(thread, None, 0, false, false);
     } else {
         assert(false, "filesec: token de impersonacao do teste");

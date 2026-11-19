@@ -25,16 +25,20 @@
 //!
 //! A gravação no $Secure mora em `ntfs_write` (`Tx::security_id_for`).
 
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use super::ntfs::{find_named_attribute, u32_at, u64_at, Ntfs, RawIndexEntry};
 use super::volume::FileSystem;
+use crate::ntos::io::parse::VolumeOpenSecurity;
 use crate::ntos::ob::{object_access, object_security};
 use crate::ntos::ps::process;
+use crate::ntos::se::access_check::subject_of_token;
 use crate::ntos::se::inherit_descriptor::Captured;
 use crate::ntos::se::policy_descriptor::OwnedDescriptor;
-use crate::ntos::se::{assign, query_descriptor, set_security};
+use crate::ntos::se::token::tokens;
+use crate::ntos::se::{access_evaluation, assign, query_descriptor, set_security};
 use crate::rtl::KernelError;
 
 /// O registro do $Secure.
@@ -201,6 +205,121 @@ pub fn descriptor_for_create(volume: &dyn FileSystem, path: &str, explicit: Opti
         Err(error) => return Some(Err(status_of(&error))),
     };
     Some(assign_for_create(parent.as_ref(), explicit, directory, user_mode, creator_token()))
+}
+
+/// O descritor guardado de um caminho: `None` quando o volume não guarda
+/// segurança, `Some(None)` num descritor ilegível (o SeAccessCheck nega).
+fn descriptor_of(volume: &dyn FileSystem, path: &str) -> Result<Option<Option<OwnedDescriptor>>, u32> {
+    match volume.query_security(path) {
+        None => Ok(None),
+        Some(Ok(bytes)) => Ok(Some(query_descriptor::from_relative(&bytes))),
+        Some(Err(error)) => Err(status_of(&error)),
+    }
+}
+
+/// NtfsAccessCheck (0x114af0): o acesso `desired` (mapeado) ao arquivo,
+/// menos o já concedido, pelo SeAccessCheck em UserMode com o token da
+/// abertura; sem conferência (KernelMode sem SL_FORCE_ACCESS_CHECK) ou num
+/// volume sem segurança, o pedido inteiro. Uma recusa com DELETE ou
+/// FILE_READ_ATTRIBUTES no pedido (0x114f45) ainda passa pelo pai:
+/// FILE_LIST_DIRECTORY concede FILE_READ_ATTRIBUTES (0x1150b0) e
+/// FILE_DELETE_CHILD concede DELETE (0x115251); o resto volta ao arquivo.
+/// `Ok(acesso concedido)` ou `Err(NTSTATUS)`.
+pub fn check(volume: &dyn FileSystem, path: &str, open: &VolumeOpenSecurity, desired: u32) -> Result<u32, u32> {
+    let grant_all = || access_evaluation::kernel_mode_grant(desired, open.previously_granted, &FILE_MAPPING);
+    if !open.check {
+        return Ok(grant_all());
+    }
+    let Some(file) = descriptor_of(volume, path)? else { return Ok(grant_all()) };
+    let remaining = desired & !open.previously_granted;
+    if remaining == 0 {
+        return Ok(open.previously_granted | desired);
+    }
+    let subject = subject_of_token(open.token).ok_or(0xC000_007Cu32)?;
+    match access_evaluation::access_check(file.as_ref(), &subject, remaining, open.previously_granted, &FILE_MAPPING) {
+        Ok(granted) => Ok(granted),
+        Err(0xC000_0022) if remaining & 0x1_0080 != 0 && path != "/" => {
+            let parent = descriptor_of(volume, parent_of(path))?.flatten();
+            let mut extra = 0;
+            if remaining & 0x80 != 0 && access_evaluation::access_check(parent.as_ref(), &subject, 0x1, 0, &FILE_MAPPING).is_ok() {
+                extra |= 0x80;
+            }
+            if remaining & 0x1_0000 != 0 && access_evaluation::access_check(parent.as_ref(), &subject, 0x40, 0, &FILE_MAPPING).is_ok() {
+                extra |= 0x1_0000;
+            }
+            if extra == 0 {
+                return Err(0xC000_0022);
+            }
+            let rest = remaining & !extra;
+            let granted = if rest == 0 { open.previously_granted } else { access_evaluation::access_check(file.as_ref(), &subject, rest, open.previously_granted, &FILE_MAPPING)? };
+            Ok(granted | extra)
+        }
+        Err(status) => Err(status),
+    }
+}
+
+/// CREATE_FLAG_TRAVERSE_CHECK do NtfsCommonCreate (0x10743c): sem
+/// TOKEN_HAS_TRAVERSE_PRIVILEGE, FILE_TRAVERSE na raiz e em cada diretório
+/// do caminho até o pai (0x1076bd → 0x108be3..0x108c13).
+pub fn check_traverse(volume: &dyn FileSystem, path: &str, open: &VolumeOpenSecurity) -> Result<(), u32> {
+    if !open.check || open.traverse {
+        return Ok(());
+    }
+    let walked = VolumeOpenSecurity { previously_granted: 0, ..open.clone() };
+    let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    let mut directory = String::new();
+    for part in parts {
+        let current = if directory.is_empty() { "/" } else { directory.as_str() };
+        check(volume, current, &walked, 0x20)?;
+        directory.push('/');
+        directory.push_str(part);
+    }
+    Ok(())
+}
+
+/// NtfsCreateNewFile (0x135310..0x1353b4): FILE_ADD_SUBDIRECTORY (diretório)
+/// ou FILE_ADD_FILE no pai, com ACCESS_SYSTEM_SECURITY quando pedido (nada
+/// com TOKEN_HAS_RESTORE_PRIVILEGE); depois o pedido inteiro é concedido
+/// (MAXIMUM_ALLOWED vira FILE_ALL_ACCESS), sem conferir o descritor do
+/// arquivo novo. `Ok(acesso concedido)` ou `Err(NTSTATUS)`.
+pub fn check_create(volume: &dyn FileSystem, parent: &str, open: &VolumeOpenSecurity, directory: bool, desired: u32) -> Result<u32, u32> {
+    let mut parent_desired = (if directory { 4 } else { 2 }) | (desired & 0x0100_0000);
+    if open.restore {
+        parent_desired = 0;
+    }
+    if parent_desired != 0 {
+        check(volume, parent, &VolumeOpenSecurity { previously_granted: 0, ..open.clone() }, parent_desired)?;
+    }
+    let mut granted = desired | open.previously_granted;
+    if granted & 0x0200_0000 != 0 {
+        granted = (granted | 0x1F_01FF) & !0x0200_0000;
+    }
+    Ok(granted)
+}
+
+/// O processo corrente para as linhas do `[filesec]`: pid:tid e o
+/// ImageFileName.
+fn caller() -> String {
+    let process = process::get_current_process();
+    let name: String = crate::ntos::mm::guest_memory::read_bytes(crate::ntos::ps::process_accessors::image_file_name(process), 15).into_iter().take_while(|&byte| byte != 0).map(|byte| byte as char).collect();
+    alloc::format!("{}:{} {}", process::get_current_process_id(), process::get_current_thread_id(), name)
+}
+
+/// [Q-FILESEC etapa 2] A decisão do NtfsAccessCheck só registrada: a
+/// abertura segue com o acesso `granted` de hoje. Uma recusa dá
+/// `[filesec] negaria <pid:tid processo> <SID do usuário> <caminho>
+/// desired=… granted=… status=…`.
+pub fn audit(path: &str, open: &VolumeOpenSecurity, desired: u32, granted: u32, decision: Result<u32, u32>) {
+    if let Err(status) = decision {
+        let user = tokens::with(open.token, |token| crate::ntos::se::token::lowbox::sid_text(&token.user)).unwrap_or_default();
+        debug_print!("[filesec] negaria {} {} {} desired={:#x} granted={:#x} status={:#x}", caller(), user, path, desired, granted, status);
+    }
+}
+
+/// [`audit`] de uma abertura recusada antes da checagem (o
+/// STATUS_BAD_IMPERSONATION_LEVEL do contexto de segurança).
+pub fn audit_status(path: &str, granted: u32, status: u32) {
+    debug_print!("[filesec] negaria {} - {} desired={:#x} granted={:#x} status={:#x}", caller(), path, granted, granted, status);
 }
 
 /// NtfsModifySecurity (0xdf2d4) do IRP_MJ_SET_SECURITY: as partes de

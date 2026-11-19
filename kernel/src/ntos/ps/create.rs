@@ -484,6 +484,14 @@ pub struct ImageFile {
 fn image_file_access(file: &VolumeFile, additional: u32) -> Result<u32, CreateFailure> {
     let sharing = |access: u32| file_io::sharing_status(file, access, IMAGE_FILE_SHARE).map_err(CreateFailure::Other);
     let requested = IMAGE_FILE_ACCESS | additional;
+    // [Q-FILESEC hook 5, etapa 2] O NtCreateUserProcess abre a imagem com
+    // OBJ_FORCE_ACCESS_CHECK (OA 0x640, 0x60aacb): o NtfsAccessCheck com o
+    // token de quem cria, só registrado.
+    let path = file.volume_path();
+    match crate::ntos::io::parse::volume_open_security(true, requested, 0x60, 1, None) {
+        Ok(security) => crate::drivers::fs::ntfs_security::audit(&path, &security, requested, requested, crate::drivers::fs::ntfs_security::check(&**file.volume(), &path, &security, requested)),
+        Err(status) => crate::drivers::fs::ntfs_security::audit_status(&path, requested, status),
+    }
     let status = sharing(requested)?;
     if status == 0 {
         return Ok(requested);
