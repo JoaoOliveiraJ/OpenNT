@@ -224,6 +224,18 @@ fn parse_options(arguments: &[String]) -> Result<Options, String> {
 
 /// Baixa o PDB do servidor público de símbolos (`<nome>/<GUID><idade>/<nome>`),
 /// pelo mesmo código do cache de símbolos do depurador.
+/// O PDB do nt_types.toml no cache de símbolos: o arquivo de `arquivo` ou,
+/// quando o depurador (o cache do kd-client) já baixou ali na forma do
+/// servidor (`ntkrnlmp.pdb/<GUID><idade>/ntkrnlmp.pdb`), o arquivo dentro
+/// da pasta.
+fn pdb_location(root: &Path, config: &Config) -> PathBuf {
+    let path = root.join(&config.pdb_file);
+    if path.is_dir() {
+        return path.join(format!("{}{:X}", config.pdb_guid, config.pdb_age)).join(&config.pdb_name);
+    }
+    path
+}
+
 fn download(config: &Config, destination: &Path) -> Result<(), String> {
     eprintln!("baixando {} ({}{:X}) de {}", config.pdb_name, config.pdb_guid, config.pdb_age, config.symbol_server);
     kd_client::pdb::download(&config.symbol_server, &config.pdb_name, &config.pdb_guid, config.pdb_age, destination).map_err(|error| format!("{error} (instale o curl ou passe --pdb=ARQ)"))
@@ -410,8 +422,8 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
     let pdb_path = match &options.pdb {
         Some(path) => path.clone(),
         None => {
-            let path = root.join(&config.pdb_file);
-            if !path.exists() {
+            let path = pdb_location(&root, &config);
+            if !path.is_file() {
                 download(&config, &path)?;
             }
             path

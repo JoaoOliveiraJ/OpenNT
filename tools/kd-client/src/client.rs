@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 use super::bugcheck::{self, Analysis};
 use super::expr::{self, Environment};
 use super::monitor::{self, LoadedModule, Process, Processor, Thread, ThreadContext};
-use super::pdb::SymbolStore;
-use super::pe::PeImage;
+use super::pdb::{Fetch, PdbId, SymbolStore};
+use super::pe::{parse_guid_text, PeImage};
 use super::registers::{self, Value};
 use super::rsp::{hex, is_timeout, unhex, Connection};
 use super::stop::{Reason, StopReply};
@@ -302,6 +302,11 @@ pub struct Client {
     /// Sessão de reprodução: o gdbstub do QEMU no lugar do depurador do
     /// kernel (sem as consultas do OpenNT; os módulos vêm da gravação).
     pub(crate) replay: Option<super::monitoring::Replay>,
+    /// Paradas desde o attach (a releitura dos módulos de usuário por um
+    /// nome que falta vale uma vez por parada).
+    stops: u64,
+    /// A parada em que os módulos de usuário foram relidos por um nome.
+    user_modules_stop: u64,
 }
 
 impl ReadMemory for Client {
@@ -343,7 +348,7 @@ impl Environment for Client {
     }
 
     fn symbol(&mut self, name: &str) -> Result<u64, String> {
-        self.symbols.lookup(name)
+        self.resolve_symbol(name)
     }
 
     fn variable(&mut self, name: &str) -> Option<u64> {
@@ -409,6 +414,8 @@ impl Client {
             monitors: super::monitoring::Monitors::default(),
             qemu_monitor: None,
             replay: None,
+            stops: 0,
+            user_modules_stop: 0,
         }
     }
 
@@ -466,6 +473,10 @@ impl Client {
 
     fn describe_stop(&mut self, stop: &StopReply) -> String {
         let rip = self.register("rip").ok();
+        // A linha da parada sai com o nome já na primeira parada num módulo.
+        if let Some(rip) = rip {
+            self.settle_symbols(&[rip]);
+        }
         let location = rip.map(|rip| format!(" em {:#x} {}", rip, self.symbols.describe(rip))).unwrap_or_default();
         let processor = stop.processor().map(|number| format!(" (CPU {number})")).unwrap_or_default();
         format!("parado: {} {}{processor}{location}", stop.signal_name(), stop.reason_text())
@@ -479,6 +490,7 @@ impl Client {
         let stop = StopReply::parse(&packet).ok_or_else(|| format!("resposta de parada inesperada: {packet:?}"))?;
         self.stopped = true;
         self.registers = None;
+        self.stops += 1;
         // Uma parada nova é do dono dela: as leituras voltam para ele.
         if self.selected.take().is_some() {
             let _ = self.request("Hg0");
@@ -835,15 +847,74 @@ impl Client {
         self.on_stop(stop).map(|_| ())
     }
 
-    /// Lê a lista de módulos do alvo e os símbolos de cada um.
+    /// Lê a lista de módulos do alvo e os símbolos de cada um (o cabeçalho
+    /// de uma imagem que esta máquina não tem sai da memória do alvo).
     pub fn reload_modules(&mut self) -> Result<(), String> {
         let list: Vec<(u64, u64, String)> = match &self.replay {
             // Na reprodução, os módulos da gravação (a execução é a mesma).
             Some(replay) => replay.modules.clone(),
             None => self.loaded_modules()?.into_iter().map(|module| (module.base, module.end, module.path)).collect(),
         };
-        self.symbols.set_modules(&list, &self.root);
+        let root = self.root.clone();
+        // Os símbolos saem do cliente enquanto a leitura da memória o usa.
+        let mut symbols = std::mem::take(&mut self.symbols);
+        symbols.set_modules_from(&list, &root, &mut |address, length| self.read_memory(address, length).ok());
+        self.symbols = symbols;
         Ok(())
+    }
+
+    /// O endereço de um nome para as expressões e os breakpoints. Um
+    /// `módulo!nome` vale já no primeiro uso: um módulo do processo
+    /// escolhido que ainda não está nos símbolos (uma DLL recém-carregada)
+    /// entra relendo os módulos de usuário (uma vez por parada), e o PDB do
+    /// módulo que ainda não chegou é esperado (uma vez por PDB).
+    pub fn resolve_symbol(&mut self, name: &str) -> Result<u64, String> {
+        let error = match self.symbols.lookup(name) {
+            Ok(address) => return Ok(address),
+            Err(error) => error,
+        };
+        let Some((module, _)) = name.split_once('!') else { return Err(error) };
+        if self.symbols.module_named(module).is_none() {
+            if !self.stopped || self.process_context.is_none() || self.user_modules_stop == self.stops {
+                return Err(error);
+            }
+            self.user_modules_stop = self.stops;
+            if self.reload_user_modules().is_err() || self.symbols.module_named(module).is_none() {
+                return Err(error);
+            }
+        }
+        self.symbols.wait_module_pdb(module);
+        self.symbols.lookup(name)
+    }
+
+    /// Espera os PDBs ainda ausentes dos módulos destes endereços (todos
+    /// pedidos com pressa de uma vez, e cada um esperado uma vez por
+    /// sessão): a parada e a pilha saem com os nomes já no primeiro uso.
+    /// `true` se os símbolos mudaram.
+    pub fn settle_symbols(&mut self, addresses: &[u64]) -> bool {
+        let mut changed = self.symbols.refresh();
+        let mut missing: Vec<u64> = Vec::new();
+        for &address in addresses {
+            let Some(module) = self.symbols.module_at(address) else { continue };
+            if module.pdb.is_some() || module.pdb_id.is_none() || missing.iter().any(|&other| self.symbols.module_at(other).is_some_and(|found| found.base == module.base)) {
+                continue;
+            }
+            missing.push(address);
+        }
+        for &address in &missing {
+            self.symbols.prefetch_at(address);
+        }
+        for &address in &missing {
+            changed |= self.symbols.wait_pdb_at(address);
+        }
+        changed
+    }
+
+    /// `settle_symbols` com os endereços de uma pilha (o de retorno conta
+    /// pelo byte da chamada).
+    pub fn settle_frames(&mut self, frames: &[Frame]) -> bool {
+        let addresses: Vec<u64> = frames.iter().map(|frame| if frame.is_return { frame.address.wrapping_sub(1) } else { frame.address }).collect();
+        self.settle_symbols(&addresses)
     }
 
     pub(crate) fn require_stopped(&self) -> Result<(), String> {
@@ -1032,46 +1103,69 @@ impl Client {
         self.types.clone()
     }
 
-    /// Os tipos do PDB do ntoskrnl: do cache (`build/symbols/ntkrnlmp.pdb`);
-    /// ausente, o download começa e a próxima tentativa os acha.
+    /// A identidade do PDB de onde as estruturas do kernel saem: a seção
+    /// `[pdb]` do `nt_types.toml` (`nome`, `guid`, `idade`).
+    fn kernel_types_id(&self) -> Option<PdbId> {
+        let config = std::fs::read_to_string(self.root.join("kernel/src/ntos/inc/types/nt_types.toml")).ok()?;
+        let mut in_pdb = false;
+        let mut fields: HashMap<&str, &str> = HashMap::new();
+        for line in config.lines().map(str::trim) {
+            if line.starts_with('[') {
+                in_pdb = line == "[pdb]";
+            } else if in_pdb && !line.starts_with('#') {
+                if let Some((key, value)) = line.split_once('=') {
+                    fields.insert(key.trim(), value.trim().trim_matches('"'));
+                }
+            }
+        }
+        let guid = parse_guid_text(fields.get("guid")?)?;
+        let age = fields.get("idade")?.parse().ok()?;
+        Some(PdbId::new(fields.get("nome").copied().unwrap_or("ntkrnlmp.pdb"), guid, age))
+    }
+
+    /// Os tipos do PDB do ntoskrnl: o `build/symbols/ntkrnlmp.pdb` do
+    /// `cargo xtask nt-types` ou, sem ele, o PDB da identidade do
+    /// `nt_types.toml` em qualquer pasta do cache, baixado com pressa quando
+    /// falta (a espera vale uma vez; depois, a próxima tentativa o acha).
     pub fn type_database(&mut self) -> Option<Arc<TypeDb>> {
         if let Some(types) = &self.types {
             return Some(Arc::clone(types));
         }
-        let store = self.symbols.store.clone().unwrap_or_else(|| SymbolStore::new(&self.root));
-        let path = store.path("ntkrnlmp.pdb");
-        if path.is_file() {
-            match TypeDb::load(&path) {
+        if self.symbols.store.is_none() {
+            self.symbols.store = Some(SymbolStore::new(&self.root));
+        }
+        let store = self.symbols.store.clone()?;
+        let flat = store.path("ntkrnlmp.pdb");
+        let id = self.kernel_types_id();
+        let path = if flat.is_file() { Some(flat.clone()) } else { id.as_ref().and_then(|id| store.fetch_now(id, store.wait)) };
+        match path {
+            Some(path) => match TypeDb::load(&path) {
                 Ok(types) => {
                     self.types_note = format!("tipos de {}", path.display());
                     self.types = Some(Arc::new(types));
                 }
                 Err(error) => self.types_note = format!("tipos: {error}"),
+            },
+            None => {
+                self.types_note = match id.as_ref().and_then(|id| store.state(id)) {
+                    Some(Fetch::Downloading) => "baixando o PDB do ntoskrnl (tente de novo em alguns segundos)".into(),
+                    Some(Fetch::Failed(error)) => format!("sem os tipos: {}", error.lines().next().unwrap_or("")),
+                    None => format!("sem os tipos: {} ausente", flat.display()),
+                };
             }
-            return self.types.clone();
         }
-        // O GUID e a idade do PDB de onde as estruturas do kernel saem.
-        let config = std::fs::read_to_string(self.root.join("kernel/src/ntos/inc/types/nt_types.toml")).unwrap_or_default();
-        let field = |key: &str| config.lines().find_map(|line| line.trim().strip_prefix(key).and_then(|rest| rest.trim().strip_prefix('=')).map(|value| value.trim().trim_matches('"').to_string()));
-        match (field("pdb_guid"), field("pdb_age").and_then(|age| age.parse::<u32>().ok())) {
-            (Some(guid), Some(age)) if store.download => {
-                if store.fetch_state("ntkrnlmp.pdb").is_none() {
-                    let destination = path.clone();
-                    let server = store.server.clone();
-                    std::thread::spawn(move || {
-                        let _ = super::pdb::download(&server, "ntkrnlmp.pdb", &guid, age, &destination);
-                    });
-                }
-                self.types_note = "baixando o PDB do ntoskrnl (tente de novo em alguns segundos)".into();
-            }
-            _ => self.types_note = format!("sem os tipos: {} ausente", path.display()),
-        }
-        None
+        self.types.clone()
     }
 
     /// Os campos de um tipo em `address` (com o símbolo dos ponteiros).
     pub fn typed_fields(&mut self, ty: u32, address: u64) -> Result<Vec<types::Field>, String> {
         let database = self.type_database().ok_or_else(|| self.types_note.clone())?;
+        Ok(self.typed_fields_in(&database, ty, address))
+    }
+
+    /// Os campos de um tipo de qualquer PDB (o do ntoskrnl ou o de um
+    /// módulo) em `address`, com o símbolo dos ponteiros.
+    pub fn typed_fields_in(&mut self, database: &TypeDb, ty: u32, address: u64) -> Vec<types::Field> {
         let mut fields = database.fields(self, ty, address, &|_| None);
         for field in &mut fields {
             if let (Some(number), types::Kind::Pointer { .. }) = (field.number, database.kind(field.ty)) {
@@ -1080,7 +1174,7 @@ impl Client {
                 }
             }
         }
-        Ok(fields)
+        fields
     }
 
     /// Espera a próxima parada (o passo por cima que segue sozinho não
@@ -1606,12 +1700,16 @@ impl Client {
     }
 
     /// Recarrega os módulos de usuário do processo escolhido nos símbolos;
-    /// devolve quantos.
+    /// devolve quantos. Os PDBs deles são pedidos no primeiro uso de cada
+    /// módulo (os que já estão no cache entram na hora).
     pub fn reload_user_modules(&mut self) -> Result<usize, String> {
         let context = self.process_context.clone().ok_or("nenhum processo escolhido (.process <pid>)")?;
         let modules = self.user_modules()?;
         let list: Vec<(u64, u64, String)> = modules.iter().map(|module| (module.base, module.base + module.size.max(0x1000), if module.path.is_empty() { module.name.clone() } else { module.path.clone() })).collect();
-        self.symbols.set_user_modules(context.eprocess, &list, &self.root);
+        let root = self.root.clone();
+        let mut symbols = std::mem::take(&mut self.symbols);
+        symbols.set_user_modules_from(context.eprocess, &list, &root, &mut |address, length| self.read_memory(address, length).ok());
+        self.symbols = symbols;
         Ok(list.len())
     }
 
@@ -1857,6 +1955,7 @@ impl Client {
         let text = self.monitor("bugcheck")?;
         let (code, parameters) = bugcheck::parse_monitor(&text).ok_or("nenhum bugcheck parou a maquina")?;
         let frames = self.backtrace(32).unwrap_or_default();
+        self.settle_frames(&frames);
         let stack: Vec<(u64, String)> = frames.iter().map(|frame| (frame.address, self.frame_name(frame))).collect();
         let symbols = &self.symbols;
         let mut analysis = bugcheck::analyze(code, parameters, stack, &|address| symbols.module_at(address).map(|module| module.name.clone()), &|address| symbols.describe(address));

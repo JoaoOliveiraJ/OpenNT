@@ -8,7 +8,7 @@
 use std::fs;
 
 use super::layout::{camel, screaming, snake, Generator};
-use super::{generate, open_pdb, outdated, pdb, proofs, Config, CONFIG};
+use super::{generate, open_pdb, outdated, pdb, pdb_location, proofs, Config, CONFIG};
 
 #[test]
 fn names_follow_the_nt_convention() {
@@ -48,8 +48,8 @@ fn names_follow_the_nt_convention() {
 fn inputs() -> Option<(std::path::PathBuf, Config, pdb::Tpi)> {
     let root = crate::build::workspace_root();
     let config = Config::load(&root.join(CONFIG)).unwrap();
-    let path = root.join(&config.pdb_file);
-    if !path.exists() {
+    let path = pdb_location(&root, &config);
+    if !path.is_file() {
         eprintln!("{} ausente (rode `cargo xtask nt-types`); teste pulado", path.display());
         return None;
     }

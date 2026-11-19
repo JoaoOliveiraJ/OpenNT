@@ -226,6 +226,60 @@ pub fn guid_text(guid: &[u8; 16]) -> String {
     text
 }
 
+/// O inverso do `guid_text`: 32 dígitos hexadecimais (hífens e chaves são
+/// ignorados) com Data1-3 escritos em big-endian.
+pub fn parse_guid_text(text: &str) -> Option<[u8; 16]> {
+    let digits: String = text.trim().chars().filter(|character| !matches!(character, '-' | '{' | '}')).collect();
+    if digits.len() != 32 || !digits.chars().all(|character| character.is_ascii_hexdigit()) {
+        return None;
+    }
+    // A posição no texto de cada byte do GUID.
+    const ORDER: [usize; 16] = [3, 2, 1, 0, 5, 4, 7, 6, 8, 9, 10, 11, 12, 13, 14, 15];
+    let mut guid = [0u8; 16];
+    for (position, &source) in ORDER.iter().enumerate() {
+        guid[position] = u8::from_str_radix(&digits[2 * source..2 * source + 2], 16).ok()?;
+    }
+    Some(guid)
+}
+
+/// GUID, idade e nome do PDB de um registro CodeView (`RSDS`).
+pub fn rsds_record(bytes: &[u8]) -> Option<([u8; 16], u32, String)> {
+    if bytes.get(..4)? != b"RSDS" {
+        return None;
+    }
+    let guid: [u8; 16] = bytes.get(4..20)?.try_into().ok()?;
+    Some((guid, u32_at(bytes, 20)?, c_string(bytes, 24)?))
+}
+
+/// As entradas CodeView (tipo 2) de um diretório de depuração lido da
+/// memória: (RVA dos dados, tamanho).
+pub fn codeview_entries(directory: &[u8]) -> Vec<(u32, u32)> {
+    directory.chunks_exact(28).filter(|entry| u32_at(entry, 12) == Some(2)).filter_map(|entry| Some((u32_at(entry, 20)?, u32_at(entry, 16)?))).collect()
+}
+
+/// Os exports nomeados de um diretório de exports lido da memória do alvo:
+/// `region` são os bytes de `[rva, rva + region.len())`, a região que o
+/// diretório 0 aponta (o diretório, as tabelas e os nomes ficam nela). Os
+/// encaminhamentos (o endereço cai dentro da região) ficam de fora.
+pub fn exports_in_region(region: &[u8], rva: u32) -> Vec<(u32, String)> {
+    let mut exports = Vec::new();
+    let end = rva.saturating_add(region.len() as u32);
+    let at = |target: u32| target.checked_sub(rva).map(|offset| offset as usize).filter(|&offset| offset < region.len());
+    let (Some(names), Some(functions), Some(name_table), Some(ordinals)) = (u32_at(region, 24), u32_at(region, 28).and_then(at), u32_at(region, 32).and_then(at), u32_at(region, 36).and_then(at)) else {
+        return exports;
+    };
+    for index in 0..(names as usize).min(0x10000) {
+        let Some(name) = u32_at(region, name_table + 4 * index).and_then(at).and_then(|offset| c_string(region, offset)) else { continue };
+        let Some(ordinal) = u16_at(region, ordinals + 2 * index) else { continue };
+        let Some(function) = u32_at(region, functions + 4 * ordinal as usize) else { continue };
+        if function == 0 || (function >= rva && function < end) {
+            continue;
+        }
+        exports.push((function, name));
+    }
+    exports
+}
+
 #[cfg(test)]
 pub mod tests {
     use super::*;
@@ -326,5 +380,42 @@ pub mod tests {
     fn guid_in_symbol_server_format() {
         let guid = [0x78, 0x56, 0x34, 0x12, 0xBC, 0x9A, 0xF0, 0xDE, 1, 2, 3, 4, 5, 6, 7, 8];
         assert_eq!(guid_text(&guid), "123456789ABCDEF00102030405060708");
+        assert_eq!(parse_guid_text("123456789ABCDEF00102030405060708"), Some(guid));
+        assert_eq!(parse_guid_text("{12345678-9abc-def0-0102-030405060708}"), Some(guid));
+        assert_eq!(parse_guid_text("1234"), None);
+        assert_eq!(parse_guid_text("Z23456789ABCDEF00102030405060708"), None);
+    }
+
+    #[test]
+    fn exports_and_codeview_from_target_memory() {
+        // A região do diretório de exports em RVA 0x3000: dois nomes, um
+        // deles encaminhado (o endereço cai dentro da região).
+        let mut region = vec![0u8; 0x80];
+        region[24..28].copy_from_slice(&2u32.to_le_bytes());
+        region[28..32].copy_from_slice(&0x3040u32.to_le_bytes());
+        region[32..36].copy_from_slice(&0x3048u32.to_le_bytes());
+        region[36..40].copy_from_slice(&0x3050u32.to_le_bytes());
+        region[0x40..0x44].copy_from_slice(&0x1200u32.to_le_bytes());
+        region[0x44..0x48].copy_from_slice(&0x3070u32.to_le_bytes());
+        region[0x48..0x4C].copy_from_slice(&0x3058u32.to_le_bytes());
+        region[0x4C..0x50].copy_from_slice(&0x3060u32.to_le_bytes());
+        region[0x50..0x52].copy_from_slice(&0u16.to_le_bytes());
+        region[0x52..0x54].copy_from_slice(&1u16.to_le_bytes());
+        region[0x58..0x5D].copy_from_slice(b"Alfa\0");
+        region[0x60..0x65].copy_from_slice(b"Beta\0");
+        assert_eq!(exports_in_region(&region, 0x3000), vec![(0x1200, "Alfa".to_string())]);
+        // Uma entrada de depuração CodeView e o RSDS dela.
+        let mut directory = vec![0u8; 56];
+        directory[12..16].copy_from_slice(&13u32.to_le_bytes());
+        directory[28 + 12..28 + 16].copy_from_slice(&2u32.to_le_bytes());
+        directory[28 + 16..28 + 20].copy_from_slice(&0x30u32.to_le_bytes());
+        directory[28 + 20..28 + 24].copy_from_slice(&0x2400u32.to_le_bytes());
+        assert_eq!(codeview_entries(&directory), vec![(0x2400, 0x30)]);
+        let mut record = b"RSDS".to_vec();
+        record.extend_from_slice(&[9u8; 16]);
+        record.extend_from_slice(&2u32.to_le_bytes());
+        record.extend_from_slice(b"ntdll.pdb\0");
+        assert_eq!(rsds_record(&record), Some(([9u8; 16], 2, "ntdll.pdb".to_string())));
+        assert_eq!(rsds_record(b"NB10"), None);
     }
 }

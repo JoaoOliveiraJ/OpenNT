@@ -26,14 +26,17 @@
 //! bl                         breakpoints do cliente e os armados no alvo
 //! .bpsave | .bpload <arq>    grava ou recria os breakpoints
 //! bt [n] | k [n]             pilha (.pdata nos binarios da Microsoft, frame pointers no OpenNT)
-//! ? <expr> | sym <expr> | ln <expr>   valor, simbolo e simbolo mais proximo
+//! ? <expr> | sym <expr> | ln <expr>   valor, simbolo e simbolo mais proximo (com arquivo:linha, se o PDB tem)
 //! addr <nome>                nome -> endereco
-//! dt <tipo> [expr]           struct do NT campo a campo (tipos do PDB do ntoskrnl)
+//! xs [modulo!]padrao         simbolos que casam com o padrao (`*` e `?`)
+//! dt [modulo!]<tipo> [expr]  struct campo a campo (o PDB do ntoskrnl ou o do modulo)
 //! thread <n>                 processador das leituras (thread n = CPU n-1)
 //! context <ethread>          registradores de uma thread (fora da CPU: quadro de troca)
 //! btt <ethread> [n]          pilha de uma thread pelo quadro de troca
 //! cpulist                    processadores parados (threads do protocolo)
-//! modules | lmv <modulo> | .reload    modulos com simbolos, detalhe de um, recarregar
+//! modules | lmv <modulo> | .reload [/f] [/w]   modulos com simbolos, detalhe de um, recarregar
+//!                            (/f pede todos os PDBs que faltam e tenta de novo os que falharam;
+//!                            /w espera os downloads)
 //! ps | threads [pid] | lm | cpus | irql | obj <caminho> | log [bytes] | bugcheck | kd
 //! !process [pid|eprocess] | !thread [ethread] | !irp <expr> | !devobj <expr|caminho>
 //! !drvobj <expr|caminho|nome> | !object <caminho> | !handle <pid> <handle> | !analyze
@@ -88,8 +91,8 @@ x <expr> [bytes] | db/dw/dd/dq <expr> [L<n>] | da/du <expr> | write <expr> <hex>
 bp <expr> [N] [/w \"cond\"] | bu <expr> | bc <expr|#n|all> | bd/be <n> | bl | hbp/hbc <expr>
 ba <e|w|r><1|2|4|8> <expr> | watch/unwatch <expr> <bytes> [w|a] | sxe/sxd ld:<modulo> | .bpsave/.bpload <arq>
 bpm <a|w|x> <expr> [bytes] | bpmc <expr> (breakpoint de memoria por pagina, no processo escolhido)
-bt [n] | k [n] | btt <ethread> [n] | context <ethread> | ? <expr> | sym <expr> | ln <expr> | addr <nome>
-dt <tipo> [expr] | thread <n> | cpulist | modules | lmv <modulo> | .reload
+bt [n] | k [n] | btt <ethread> [n] | context <ethread> | ? <expr> | sym <expr> | ln <expr> | addr <nome> | xs [mod!]padrao
+dt [mod!]<tipo> [expr] | thread <n> | cpulist | modules | lmv <modulo> | .reload [/f] [/w]
 ps | threads [pid] | lm | cpus | irql | obj <caminho> | log [bytes] | bugcheck | kd | monitor <texto>
 !process [pid|eprocess] | !thread [ethread] | !irp <expr> | !devobj <expr|caminho> | !drvobj <expr|caminho>
 !object <caminho> | !handle <pid> <handle> | !analyze
@@ -378,10 +381,20 @@ impl Client {
         let mut output = format!("{} ({})\n  caminho   {}\n  base      {:#018x}\n  fim       {:#018x}\n  tamanho   {:#x}\n  simbolos  {} ({})\n", module.name, module.file_name, module.path, module.base, module.end, module.end - module.base, module.symbols.len(), module.source);
         if let Some(image) = &module.image {
             output.push_str(&format!("  data      {:#010x}\n  checksum  {:#010x}\n  entrada   {:#018x}\n", image.header.time_date_stamp, image.header.checksum, module.base + image.header.entry_point as u64));
-            if let Some((guid, age, pdb)) = image.rsds() {
-                output.push_str(&format!("  PDB       {pdb} {}{age:X}\n", super::pe::guid_text(&guid)));
-            }
             output.push_str(&format!("  secoes    {}\n", image.sections.iter().map(|section| section.name.as_str()).collect::<Vec<_>>().join(" ")));
+        }
+        // A identidade vem do arquivo desta máquina ou do cabeçalho no alvo.
+        if let Some(id) = &module.pdb_id {
+            let state = match (&module.pdb, module.pdb_pending, module.pdb_requested()) {
+                (Some(path), _, _) => path.display().to_string(),
+                (None, true, _) => "baixando".to_string(),
+                (None, false, false) => "pedido no primeiro uso".to_string(),
+                (None, false, true) => "ausente".to_string(),
+            };
+            output.push_str(&format!("  PDB       {} {} ({state})\n", id.name, id.signature()));
+        }
+        if let Some(lines) = &module.lines {
+            output.push_str(&format!("  linhas    {} em {} arquivos\n", lines.entries.iter().filter(|entry| entry.line != 0).count(), lines.files.len()));
         }
         if let Some(table) = &module.unwind {
             output.push_str(&format!("  .pdata    {} funcoes\n", table.functions.len()));
@@ -389,22 +402,22 @@ impl Client {
         Ok(output)
     }
 
-    /// `dt <tipo> [expr]`.
+    /// `dt [módulo!]<tipo> [expr]`: sem módulo (ou `nt!`), o PDB do
+    /// ntoskrnl; com ele, o PDB do módulo (esperado se ainda não chegou).
     fn display_type(&mut self, rest: &str) -> Result<String, String> {
         let (type_name, address) = match rest.split_once(char::is_whitespace) {
             Some((type_name, expression)) => (type_name, Some(self.evaluate(expression.trim())?)),
             None => (rest, None),
         };
         if type_name.is_empty() {
-            return Err("uso: dt <tipo> [expr]".into());
+            return Err("uso: dt [modulo!]<tipo> [expr]".into());
         }
-        let database = self.type_database().ok_or_else(|| self.types_note.clone())?;
-        let index = database.find(type_name).ok_or_else(|| format!("tipo {type_name} nao encontrado no PDB do ntoskrnl"))?;
+        let (database, index) = self.types_for(type_name)?;
         let mut output = format!("{} ({:#x} bytes)", database.name(index), database.size(index));
         match address {
             Some(address) => {
                 output.push_str(&format!(" em {address:#x}\n"));
-                for field in self.typed_fields(index, address)? {
+                for field in self.typed_fields_in(&database, index, address) {
                     output.push_str(&format!("   +{:#05x} {:<28} : {:<24} {}\n", field.offset, field.name, field.type_name, field.value));
                 }
             }
@@ -865,11 +878,13 @@ impl Client {
             "bt" => {
                 let limit = words.first().and_then(|text| parse_number(text)).unwrap_or(32) as usize;
                 let frames = self.backtrace(limit)?;
+                self.settle_frames(&frames);
                 Ok(self.format_frames(&frames))
             }
             "k" | "kb" | "kn" | "kp" => {
                 let limit = words.first().and_then(|text| parse_number(text)).unwrap_or(32) as usize;
                 let frames = self.backtrace(limit)?;
+                self.settle_frames(&frames);
                 Ok(self.format_frames_with_stack(&frames))
             }
             "context" => {
@@ -880,25 +895,51 @@ impl Client {
                 let thread = self.evaluate(words.first().ok_or("uso: btt <ethread> [n]")?)?;
                 let limit = words.get(1).and_then(|text| parse_number(text)).unwrap_or(32) as usize;
                 let (context, frames) = self.thread_backtrace(thread, limit)?;
+                self.settle_frames(&frames);
                 Ok(format!("{}\n{}", context.header, self.format_frames(&frames)))
             }
             "?" => {
                 let value = self.evaluate(rest)?;
+                self.settle_symbols(&[value]);
                 let symbol = self.symbols.name_at(value).map(|name| format!(" {name}")).unwrap_or_default();
                 Ok(format!("= {value:#x} ({value}){symbol}"))
             }
             "sym" => {
                 let address = self.evaluate(rest)?;
-                Ok(format!("{address:#x} {}", self.symbols.describe(address)))
+                self.settle_symbols(&[address]);
+                let line = self.symbols.line_at(address).map(|line| format!(" [{line}]")).unwrap_or_default();
+                Ok(format!("{address:#x} {}{line}", self.symbols.describe(address)))
             }
             "ln" => {
                 let address = self.evaluate(rest)?;
+                self.settle_symbols(&[address]);
                 let module = self.symbols.module_at(address).map(|module| format!(" (modulo {} {:#x}-{:#x})", module.name, module.base, module.end)).unwrap_or_default();
-                Ok(format!("{address:#x} {}{module}", self.symbols.describe(address)))
+                let line = self.symbols.line_at(address).map(|line| format!(" [{line}]")).unwrap_or_default();
+                Ok(format!("{address:#x} {}{line}{module}", self.symbols.describe(address)))
             }
             "addr" => {
-                let address = self.symbols.lookup(rest)?;
+                let address = self.resolve_symbol(rest)?;
                 Ok(format!("{address:#x} {}", self.symbols.describe(address)))
+            }
+            "xs" => {
+                if rest.is_empty() {
+                    return Err("uso: xs [modulo!]padrao (com * e ?)".into());
+                }
+                // Um módulo nomeado sem curingas: o PDB dele é esperado.
+                if let Some((module, _)) = rest.split_once('!') {
+                    if !module.contains(['*', '?']) {
+                        self.symbols.wait_module_pdb(module);
+                    }
+                }
+                let found = self.symbols.search(rest, 500);
+                if found.is_empty() {
+                    return Ok(format!("nenhum simbolo casa com {rest}"));
+                }
+                let mut output: String = found.iter().map(|(address, name)| format!("{address:#018x} {name}\n")).collect();
+                if found.len() >= 500 {
+                    output.push_str("(so os 500 primeiros)\n");
+                }
+                Ok(output)
             }
             "dt" => self.display_type(rest),
             "thread" => {
@@ -919,10 +960,28 @@ impl Client {
             }
             "lmv" => self.module_detail(rest),
             ".reload" => {
+                // /f: pede todos os PDBs que faltam (os de usuário ainda não
+                // usados também) e tenta de novo os que falharam; /w: espera.
+                let everything = words.contains(&"/f");
+                let wait = words.contains(&"/w");
                 self.reload_modules()?;
+                if self.process().is_some() {
+                    let _ = self.reload_user_modules();
+                }
+                self.symbols.reload_pdbs(everything);
+                if wait {
+                    if let Some(store) = self.symbols.store.clone() {
+                        store.wait_all(std::time::Duration::from_secs(900));
+                    }
+                }
+                self.symbols.refresh();
                 let pending: Vec<String> = self.symbols.modules.iter().filter(|module| module.pdb_pending).map(|module| module.name.clone()).collect();
                 let with_pdb = self.symbols.modules.iter().filter(|module| module.pdb.is_some()).count();
-                Ok(format!("{} modulos, {with_pdb} com PDB{}", self.symbols.modules.len(), if pending.is_empty() { String::new() } else { format!(", baixando: {}", pending.join(" ")) }))
+                let mut output = format!("{} modulos, {with_pdb} com PDB{}", self.symbols.modules.len(), if pending.is_empty() { String::new() } else { format!(", baixando: {}", pending.join(" ")) });
+                for (name, source) in self.symbols.missing_pdbs().into_iter().filter(|(name, _)| !pending.contains(name)) {
+                    output.push_str(&format!("\n  {name}: {source}"));
+                }
+                Ok(output)
             }
             "!process" => self.nt_view("process", rest),
             "!thread" => self.nt_view("thread", rest),
@@ -976,6 +1035,7 @@ impl Client {
                 let process = self.process().map(|context| format!("{:#x}", context.eprocess)).ok_or("nenhum processo escolhido (.process <pid>)")?;
                 let thread = self.user_threads(&process)?.into_iter().find(|thread| thread.tid == tid).ok_or_else(|| format!("thread {tid} nao e deste processo"))?;
                 let (_, frames) = self.user_thread_backtrace(&thread, limit)?;
+                self.settle_frames(&frames);
                 Ok(self.format_frames_with_stack(&frames))
             }
             "bgd" | "bge" => {
@@ -1006,7 +1066,7 @@ impl Client {
     /// Os comandos e aliases conhecidos (o autocompletar).
     pub fn command_names() -> &'static [&'static str] {
         &[
-            "attach", "break", "c", "g", "continue", "wait-stop", "s", "t", "step", "p", "gu", "regs", "r", "rx", "x", "db", "dw", "dd", "dq", "da", "du", "write", "poke", "bp", "bu", "bc", "hbp", "hbc", "ba", "bpm", "bpmc", "watch", "unwatch", "sxe", "sxd", "bd", "be", "bl", ".bpsave", ".bpload", "bt", "k", "context", "btt", "?", "sym", "ln", "addr", "dt", "thread", "cpulist", "ps",
+            "attach", "break", "c", "g", "continue", "wait-stop", "s", "t", "step", "p", "gu", "regs", "r", "rx", "x", "db", "dw", "dd", "dq", "da", "du", "write", "poke", "bp", "bu", "bc", "hbp", "hbc", "ba", "bpm", "bpmc", "watch", "unwatch", "sxe", "sxd", "bd", "be", "bl", ".bpsave", ".bpload", "bt", "k", "context", "btt", "?", "sym", "ln", "addr", "xs", "dt", "thread", "cpulist", "ps",
             "threads", "lm", "lmv", "cpus", "irql", "obj", "log", "bugcheck", "kd", ".reload", "!process", "!thread", "!irp", "!devobj", "!drvobj", "!object", "!handle", "!analyze", "trace", "monitor", "modules", "detach", "help",
             ".process", "lmu", "handles", "vad", "uthreads", "ustack", "kmap", "events", "uex", "bgd", "bge", "bar",
             "apimon", "irptrace", "reg", "regv", "objdir", "fsls", "fscat", "dtv", "rstep", "rcont", "snap",

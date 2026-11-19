@@ -3,29 +3,44 @@
 //! - O kernel do OpenNT: a tabela de símbolos do ELF do build
 //!   (`<build>/kernel.elf`), com os nomes do Rust legíveis; o kernel roda na
 //!   VA em que foi ligado, então os endereços do ELF valem como estão.
-//! - Os binários da Microsoft carregados (a lista `monitor lm` do alvo): a
-//!   tabela de exports de cada PE, lida do arquivo desta máquina, a tabela de
-//!   funções (`.pdata`, para a pilha) e os nomes públicos (S_PUB32) do PDB
-//!   público dele, do cache `build/symbols` (baixado do servidor de símbolos
-//!   quando falta, em segundo plano).
+//! - Os binários da Microsoft carregados (a lista `monitor lm` do alvo e a
+//!   PEB.Ldr dos processos): a tabela de exports de cada PE, a tabela de
+//!   funções (`.pdata`, para a pilha) e os símbolos do PDB dele (`pdb.rs`: os
+//!   públicos e, quando o PDB os tem, os procedimentos com tamanho e as
+//!   linhas). O arquivo desta máquina só vale quando é a imagem carregada (o
+//!   mesmo tamanho; na dúvida, a data e o checksum do cabeçalho no alvo).
+//!   Sem ele, a identidade do PDB, as seções e os exports saem da memória do
+//!   alvo.
+//! - Os PDBs ficam no cache (`build/symbols` ou as pastas de
+//!   `OPENNT_SYMBOLS`) e faltando são baixados do servidor de símbolos: o de
+//!   um driver assim que o módulo aparece (no fundo da fila); o de um módulo
+//!   de usuário na primeira vez que alguém usa o módulo (um endereço
+//!   descrito, uma busca por nome). `refresh` junta os que chegaram; uma
+//!   busca por `módulo!nome` e a pilha esperam o do módulo
+//!   (`wait_module_pdb`, `wait_pdb_at`).
 //!
 //! Os módulos aparecem pelo nome sem extensão (`ntfs!NtfsCommonCreate+0x1a3`,
 //! como no WinDbg); a busca aceita o nome com ou sem extensão, e `nt` é o
-//! kernel.
+//! kernel. Um endereço que nenhum símbolo cobre sai como `módulo+0xRVA`; uma
+//! parte separada (fria) de uma função, sem símbolo próprio, sai como a
+//! função dona dela mais o deslocamento.
 //!
 //! Os módulos de usuário de um processo (a PEB.Ldr do processo escolhido ou
 //! da parada) entram à parte (`set_user_modules`): a lista de módulos do
-//! kernel não os apaga, e a troca de processo troca só eles.
+//! kernel não os apaga, e a troca de processo troca só eles. Os de outro
+//! processo ficam guardados pela base e pelo caminho: voltar a ele, ou a
+//! mesma DLL na mesma base em outro processo, não relê o PE nem o PDB.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use super::demangle::demangle;
 use super::elf::{Elf, SHF_ALLOC};
-use super::pdb::{self, SymbolStore};
-use super::pe::{find_function, PeImage};
-use super::unwind::FunctionTable;
+use super::pdb::{self, Fetch, LineTable, PdbId, PdbSection, SymbolStore};
+use super::pe::{codeview_entries, exports_in_region, find_function, rsds_record, PeImage, RuntimeFunction};
+use super::unwind::{FunctionTable, UnwindInfo};
 
 #[derive(Clone, Debug)]
 pub struct Symbol {
@@ -58,6 +73,19 @@ pub struct Module {
     pub pdb_pending: bool,
     /// Módulo de usuário (do processo de `Symbols::user_process`).
     pub user: bool,
+    /// A identidade do PDB (o RSDS do arquivo desta máquina ou do alvo).
+    pub pdb_id: Option<PdbId>,
+    /// As seções da imagem (o PDB dá os endereços por seção).
+    pub sections: Vec<PdbSection>,
+    /// De onde vieram os nomes antes do PDB (`exports de ...`, `imagem do
+    /// alvo`).
+    pub origin: String,
+    /// As linhas de código, quando o PDB as tem.
+    pub lines: Option<Arc<LineTable>>,
+    /// O PDB já foi pedido (o de um módulo de usuário espera o primeiro uso).
+    pdb_requested: Arc<AtomicBool>,
+    /// O PDB do cache não pôde ser lido: não é relido a cada parada.
+    pdb_broken: bool,
 }
 
 impl std::fmt::Debug for Module {
@@ -68,7 +96,31 @@ impl std::fmt::Debug for Module {
 
 impl Module {
     pub fn new(name: &str, path: &str, base: u64, end: u64, symbols: Vec<Symbol>, source: &str) -> Self {
-        Module { name: display_name(name), file_name: base_name(name).to_string(), path: path.to_string(), base, end, symbols, source: source.to_string(), image: None, unwind: None, pdb: None, pdb_pending: false, user: false }
+        Module {
+            name: display_name(name),
+            file_name: base_name(name).to_string(),
+            path: path.to_string(),
+            base,
+            end,
+            symbols,
+            source: source.to_string(),
+            image: None,
+            unwind: None,
+            pdb: None,
+            pdb_pending: false,
+            user: false,
+            pdb_id: None,
+            sections: Vec::new(),
+            origin: source.to_string(),
+            lines: None,
+            pdb_requested: Arc::new(AtomicBool::new(false)),
+            pdb_broken: false,
+        }
+    }
+
+    /// O PDB já foi pedido ao cache ou ao servidor.
+    pub fn pdb_requested(&self) -> bool {
+        self.pdb_requested.load(Ordering::Relaxed)
     }
 }
 
@@ -84,6 +136,8 @@ pub struct Symbols {
     pub store: Option<SymbolStore>,
     /// O EPROCESS dos módulos de usuário carregados (0 = nenhum).
     pub user_process: u64,
+    /// Os módulos de usuário de outros processos, pela base e pelo caminho.
+    user_cache: HashMap<(u64, String), Module>,
 }
 
 /// Nome base sem diretório (barras dos dois tipos).
@@ -115,6 +169,66 @@ pub fn host_file(path: &str) -> Option<PathBuf> {
     candidates.push(windows.join("System32").join(base));
     candidates.push(windows.join("System32").join("drivers").join(base));
     candidates.into_iter().find(|candidate| candidate.is_file())
+}
+
+/// Arredonda para a página.
+fn align_page(value: u64) -> u64 {
+    value.saturating_add(0xFFF) & !0xFFF
+}
+
+/// O RVA cai numa seção de código (sem seções conhecidas, sim).
+fn is_code(sections: &[PdbSection], rva: u32) -> bool {
+    match sections.iter().filter(|section| section.address <= rva).max_by_key(|section| section.address) {
+        Some(section) => section.code,
+        None => sections.is_empty(),
+    }
+}
+
+/// Em ordem de endereço; o mesmo nome no mesmo endereço fica uma vez (o que
+/// tem tamanho, se um deles tem).
+fn sort_symbols(symbols: &mut Vec<Symbol>) {
+    symbols.sort_by(|a, b| a.address.cmp(&b.address).then_with(|| a.name.cmp(&b.name)).then_with(|| b.size.cmp(&a.size)));
+    symbols.dedup_by(|later, earlier| later.address == earlier.address && later.name == earlier.name);
+}
+
+/// O que o depurador lê de uma imagem na memória do alvo.
+struct TargetImage {
+    stamp: u32,
+    size: u32,
+    checksum: u32,
+    sections: Vec<PdbSection>,
+    id: Option<PdbId>,
+    exports: Vec<(u32, String)>,
+}
+
+impl TargetImage {
+    /// O cabeçalho (com as seções), o RSDS e os exports da imagem em
+    /// `base`, lidos do alvo.
+    fn read(base: u64, read: &mut dyn FnMut(u64, usize) -> Option<Vec<u8>>) -> Option<Self> {
+        let image = read(base, 0x400).and_then(PeImage::parse_mapped).or_else(|| read(base, 0x1000).and_then(PeImage::parse_mapped))?;
+        let mut id = None;
+        if let Some((rva, size)) = image.directory(6).filter(|&(rva, size)| rva != 0 && size != 0) {
+            if let Some(directory) = read(base + rva as u64, (size as usize).min(28 * 16)) {
+                for (data, length) in codeview_entries(&directory) {
+                    if let Some((guid, age, name)) = read(base + data as u64, (length as usize).clamp(24, 0x200)).as_deref().and_then(rsds_record) {
+                        id = Some(PdbId::new(&name, guid, age)).filter(|id| !id.name.is_empty());
+                        break;
+                    }
+                }
+            }
+        }
+        let exports = match image.directory(0) {
+            Some((rva, size)) if rva != 0 && size != 0 && size <= 0x10_0000 => read(base + rva as u64, size as usize).map(|region| exports_in_region(&region, rva)).unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        Some(Self { stamp: image.header.time_date_stamp, size: image.header.size_of_image, checksum: image.header.checksum, sections: PdbSection::of_image(&image), id, exports })
+    }
+
+    /// O arquivo desta máquina é esta imagem (o ImageBase do cabeçalho muda
+    /// com a relocação; a data, o tamanho e o checksum não).
+    fn same_image(&self, image: &PeImage) -> bool {
+        image.header.time_date_stamp == self.stamp && image.header.size_of_image == self.size && image.header.checksum == self.checksum
+    }
 }
 
 impl Symbols {
@@ -169,6 +283,13 @@ impl Symbols {
     /// Troca os módulos carregados (fora o kernel) pela lista do alvo:
     /// (base, fim, caminho). `root` é a raiz do repositório (o cache de PDBs).
     pub fn set_modules(&mut self, list: &[(u64, u64, String)], root: &Path) {
+        self.set_modules_from(list, root, &mut |_, _| None);
+    }
+
+    /// O `set_modules` com a memória do alvo (`read(endereço, tamanho)`): o
+    /// cabeçalho de uma imagem sem arquivo nesta máquina, ou com um arquivo
+    /// de outro tamanho, sai dela.
+    pub fn set_modules_from(&mut self, list: &[(u64, u64, String)], root: &Path, read: &mut dyn FnMut(u64, usize) -> Option<Vec<u8>>) {
         if self.store.is_none() {
             self.store = Some(SymbolStore::new(root));
         }
@@ -195,16 +316,17 @@ impl Symbols {
                     continue;
                 }
             }
+            // Um módulo que já estava fica como está; o PDB que chegou para
+            // ele entra no `refresh_modules` abaixo.
             if let Some(module) = previous.remove(&(*base, path.clone())) {
-                if !module.pdb_pending || self.store.as_ref().is_some_and(|store| store.busy()) {
-                    self.modules.push(module);
-                    continue;
-                }
+                self.modules.push(module);
+                continue;
             }
-            let module = self.load_module(*base, *end, path);
+            let module = self.load_module(*base, *end, path, false, &mut *read);
             self.modules.push(module);
         }
         self.modules.extend(user);
+        self.refresh_modules();
         if signature(&self.modules) != before {
             self.generation += 1;
         }
@@ -213,6 +335,12 @@ impl Symbols {
     /// Troca os módulos de usuário pelos do processo `process` (EPROCESS):
     /// (base, fim, caminho). Os de mesma base e caminho ficam como estão.
     pub fn set_user_modules(&mut self, process: u64, list: &[(u64, u64, String)], root: &Path) {
+        self.set_user_modules_from(process, list, root, &mut |_, _| None);
+    }
+
+    /// O `set_user_modules` com a memória do alvo (veja `set_modules_from`).
+    /// Os módulos do processo anterior ficam guardados para a volta.
+    pub fn set_user_modules_from(&mut self, process: u64, list: &[(u64, u64, String)], root: &Path, read: &mut dyn FnMut(u64, usize) -> Option<Vec<u8>>) {
         if self.store.is_none() {
             self.store = Some(SymbolStore::new(root));
         }
@@ -220,18 +348,17 @@ impl Symbols {
         let (user, system): (Vec<Module>, Vec<Module>) = self.modules.drain(..).partition(|module| module.user);
         self.modules = system;
         self.kernel = kernel.and_then(|(base, path)| self.modules.iter().position(|module| module.base == base && module.path == path));
-        let mut previous: HashMap<(u64, String), Module> = user.into_iter().map(|module| ((module.base, module.path.clone()), module)).collect();
+        for module in user {
+            self.user_cache.insert((module.base, module.path.clone()), module);
+        }
         for (base, end, path) in list {
-            let module = match previous.remove(&(*base, path.clone())) {
-                Some(module) if !module.pdb_pending || self.store.as_ref().is_some_and(|store| store.busy()) => module,
-                _ => {
-                    let mut module = self.load_module(*base, *end, path);
-                    module.user = true;
-                    module
-                }
+            let module = match self.user_cache.remove(&(*base, path.clone())) {
+                Some(module) => module,
+                None => self.load_module(*base, *end, path, true, &mut *read),
             };
             self.modules.push(module);
         }
+        self.refresh_modules();
         self.user_process = process;
         self.generation += 1;
     }
@@ -246,61 +373,259 @@ impl Symbols {
         self.modules.iter().any(|module| module.pdb_pending)
     }
 
-    fn load_module(&self, base: u64, end: u64, path: &str) -> Module {
+    /// Lê o módulo: o PE desta máquina (se é a imagem carregada) ou o
+    /// cabeçalho do alvo, os exports, a `.pdata` e o PDB do cache. O PDB de
+    /// um driver que falta é pedido já; o de um módulo de usuário, no
+    /// primeiro uso.
+    fn load_module(&self, base: u64, end: u64, path: &str, user: bool, read: &mut dyn FnMut(u64, usize) -> Option<Vec<u8>>) -> Module {
         let mut module = Module::new(path, path, base, end, Vec::new(), "sem simbolos");
-        let Some(file) = host_file(path) else { return module };
-        let Some(image) = std::fs::read(&file).ok().and_then(PeImage::parse) else { return module };
-        let image = Arc::new(image);
-        let mut names: Vec<(u32, String)> = image.exports();
-        module.source = format!("exports de {}", file.display());
+        module.user = user;
+        let host = host_file(path).and_then(|file| {
+            let image = PeImage::parse(std::fs::read(&file).ok()?)?;
+            Some((file, Arc::new(image)))
+        });
+        // O mesmo tamanho basta; senão (ou sem o arquivo) o cabeçalho do alvo
+        // decide.
+        let same_size = |image: &PeImage| align_page(image.header.size_of_image as u64) == align_page(end.saturating_sub(base));
+        let target = match &host {
+            Some((_, image)) if same_size(&**image) => None,
+            _ => TargetImage::read(base, &mut *read),
+        };
+        let mut other_version = None;
+        let host = match (host, &target) {
+            (Some((file, image)), Some(target)) if !target.same_image(&image) => {
+                other_version = Some(file);
+                None
+            }
+            (host, _) => host,
+        };
+        let mut symbols: Vec<Symbol> = match (&host, &target) {
+            (Some((file, image)), _) => {
+                module.origin = format!("exports de {}", file.display());
+                module.pdb_id = PdbId::of_image(image);
+                module.sections = PdbSection::of_image(image);
+                let functions = image.runtime_functions();
+                if !functions.is_empty() {
+                    module.unwind = Some(Arc::new(FunctionTable { base, functions, image: Some(Arc::clone(image)) }));
+                }
+                module.image = Some(Arc::clone(image));
+                image.exports().into_iter().map(|(rva, name)| Symbol { address: base + rva as u64, size: 0, name, function: is_code(&module.sections, rva) }).collect()
+            }
+            (None, Some(target)) => {
+                module.origin = match &other_version {
+                    Some(file) => format!("imagem do alvo ({} e outra versao)", file.display()),
+                    None => "imagem do alvo".to_string(),
+                };
+                module.pdb_id = target.id.clone();
+                module.sections = target.sections.clone();
+                target.exports.iter().map(|(rva, name)| Symbol { address: base + *rva as u64, size: 0, name: name.clone(), function: is_code(&module.sections, *rva) }).collect()
+            }
+            (None, None) => return module,
+        };
+        sort_symbols(&mut symbols);
+        module.symbols = symbols;
+        module.source = module.origin.clone();
         if let Some(store) = &self.store {
-            match store.request(&image) {
-                Some(pdb_path) => {
-                    if let Some(publics) = pdb::publics(&pdb_path, &image) {
-                        module.source = format!("PDB {} + exports", pdb_path.display());
-                        names.extend(publics);
-                        module.pdb = Some(pdb_path);
-                    }
-                }
-                None => {
-                    let pdb_name = image.rsds().map(|(_, _, name)| base_name(&name).to_string()).unwrap_or_default();
-                    match store.fetch_state(&pdb_name) {
-                        Some(pdb::Fetch::Downloading) => {
-                            module.pdb_pending = true;
-                            module.source = format!("{} (baixando {pdb_name})", module.source);
-                        }
-                        Some(pdb::Fetch::Failed(error)) => module.source = format!("{} (PDB indisponivel: {})", module.source, error.lines().next().unwrap_or("")),
-                        None => {}
-                    }
-                }
+            Self::load_pdb(&mut module, store, !user);
+        }
+        module
+    }
+
+    /// Procura o PDB do módulo no cache e o junta. Sem ele, com `download`,
+    /// pede o download; o texto de origem diz o estado.
+    fn load_pdb(module: &mut Module, store: &SymbolStore, download: bool) {
+        let Some(id) = module.pdb_id.clone() else { return };
+        let found = if download {
+            module.pdb_requested.store(true, Ordering::Relaxed);
+            store.request(&id)
+        } else {
+            store.find(&id)
+        };
+        match found {
+            Some(path) => {
+                module.pdb_requested.store(true, Ordering::Relaxed);
+                Self::merge_pdb(module, &path, &id);
+            }
+            None => Self::note_pdb_state(module, store, &id),
+        }
+    }
+
+    /// A marca de pendente e o texto de origem pelo estado do download.
+    fn note_pdb_state(module: &mut Module, store: &SymbolStore, id: &PdbId) {
+        let state = store.state(id);
+        let requested = module.pdb_requested();
+        module.pdb_pending = state == Some(Fetch::Downloading);
+        module.source = match state {
+            Some(Fetch::Downloading) => format!("{} (baixando {})", module.origin, id.name),
+            Some(Fetch::Failed(error)) => format!("{} (PDB indisponivel: {})", module.origin, error.lines().next().unwrap_or("")),
+            None if !requested => format!("{} ({} pedido no primeiro uso)", module.origin, id.name),
+            None if !store.download => format!("{} ({} fora do cache)", module.origin, id.name),
+            None => module.origin.clone(),
+        };
+    }
+
+    /// Junta os símbolos e as linhas do PDB aos do módulo.
+    fn merge_pdb(module: &mut Module, path: &Path, id: &PdbId) -> bool {
+        module.pdb_pending = false;
+        let Some(data) = pdb::load(path, id, &module.sections) else {
+            module.source = format!("{} (PDB {} ilegivel)", module.origin, path.display());
+            module.pdb_broken = true;
+            return false;
+        };
+        let base = module.base;
+        module.symbols.extend(data.symbols.into_iter().map(|symbol| Symbol { address: base + symbol.rva as u64, size: symbol.size as u64, name: symbol.name, function: symbol.function }));
+        sort_symbols(&mut module.symbols);
+        module.lines = data.lines.map(Arc::new);
+        module.pdb = Some(path.to_path_buf());
+        module.source = format!("PDB {}{} + {}", path.display(), if data.private { " (privado)" } else { "" }, module.origin);
+        true
+    }
+
+    /// Junta os PDBs que chegaram aos módulos que os pediram e atualiza o
+    /// estado dos outros; `true` se algo mudou. Sem download novo nem disco
+    /// quando nada chegou.
+    fn refresh_modules(&mut self) -> bool {
+        let Some(store) = self.store.clone() else { return false };
+        let mut changed = false;
+        for module in &mut self.modules {
+            if module.pdb.is_some() || module.pdb_broken || !module.pdb_requested() {
+                continue;
+            }
+            let Some(id) = module.pdb_id.clone() else { continue };
+            let before = (module.pdb_pending, module.source.clone());
+            if store.state(&id).is_none() && store.arrived(&id) {
+                Self::load_pdb(module, &store, false);
+            } else {
+                Self::note_pdb_state(module, &store, &id);
+            }
+            changed |= module.pdb.is_some() || module.pdb_pending != before.0 || module.source != before.1;
+        }
+        changed
+    }
+
+    /// Os PDBs que chegaram desde a última vez entram nos módulos (kernel e
+    /// usuário); `true` se os símbolos mudaram. Barato: só consulta a fila.
+    pub fn refresh(&mut self) -> bool {
+        let changed = self.refresh_modules();
+        if changed {
+            self.generation += 1;
+        }
+        changed
+    }
+
+    /// Procura de novo no disco o PDB de todo módulo que ainda está sem ele
+    /// (um PDB posto no cache à mão). `everything`: esquece as falhas e pede
+    /// os que faltam, inclusive os dos módulos de usuário ainda não usados;
+    /// sem ele, só os já pedidos voltam à fila. Devolve quantos módulos
+    /// ganharam o PDB.
+    pub fn reload_pdbs(&mut self, everything: bool) -> usize {
+        let Some(store) = self.store.clone() else { return 0 };
+        if everything {
+            store.forget_failures();
+        }
+        let mut loaded = 0;
+        for module in &mut self.modules {
+            if everything {
+                module.pdb_broken = false;
+            }
+            if module.pdb.is_none() && module.pdb_id.is_some() && !module.pdb_broken {
+                let download = everything || module.pdb_requested();
+                Self::load_pdb(module, &store, download);
+                loaded += module.pdb.is_some() as usize;
             }
         }
-        let functions = image.runtime_functions();
-        if !functions.is_empty() {
-            module.unwind = Some(Arc::new(FunctionTable { base, functions, image: Some(Arc::clone(&image)) }));
+        if loaded > 0 {
+            self.generation += 1;
         }
-        let mut symbols: Vec<Symbol> = names.into_iter().map(|(rva, name)| Symbol { address: base + rva as u64, size: 0, name, function: true }).collect();
-        symbols.sort_by_key(|symbol| symbol.address);
-        symbols.dedup_by(|a, b| a.address == b.address && a.name == b.name);
-        module.symbols = symbols;
-        module.image = Some(image);
-        module
+        loaded
+    }
+
+    /// Os módulos ainda sem PDB: (nome, estado) para o `.reload`.
+    pub fn missing_pdbs(&self) -> Vec<(String, String)> {
+        self.modules.iter().filter(|module| module.pdb.is_none() && module.pdb_id.is_some() && module.pdb_requested()).map(|module| (module.name.clone(), module.source.clone())).collect()
+    }
+
+    /// Põe com pressa (na frente da fila) o PDB do módulo do endereço, sem
+    /// esperar.
+    pub fn prefetch_at(&self, address: u64) {
+        let Some(module) = self.module_at(address) else { return };
+        if module.pdb.is_some() {
+            return;
+        }
+        module.pdb_requested.store(true, Ordering::Relaxed);
+        if let (Some(store), Some(id)) = (&self.store, &module.pdb_id) {
+            if store.find(id).is_none() {
+                store.enqueue(id, true);
+            }
+        }
+    }
+
+    /// Espera com pressa o PDB de um módulo (pelo nome) que ainda não o tem;
+    /// `true` se os símbolos mudaram.
+    pub fn wait_module_pdb(&mut self, name: &str) -> bool {
+        match self.module_index(name) {
+            Some(index) => self.wait_pdb_of(index),
+            None => false,
+        }
+    }
+
+    /// Espera com pressa o PDB do módulo de um endereço.
+    pub fn wait_pdb_at(&mut self, address: u64) -> bool {
+        match self.modules.iter().position(|module| address >= module.base && address < module.end) {
+            Some(index) => self.wait_pdb_of(index),
+            None => false,
+        }
+    }
+
+    fn wait_pdb_of(&mut self, index: usize) -> bool {
+        let Some(store) = self.store.clone() else { return false };
+        let module = &mut self.modules[index];
+        let Some(id) = module.pdb_id.clone() else { return false };
+        if module.pdb.is_some() || module.pdb_broken {
+            return false;
+        }
+        module.pdb_requested.store(true, Ordering::Relaxed);
+        match store.fetch_now(&id, store.wait) {
+            Some(path) => {
+                Self::merge_pdb(module, &path, &id);
+                self.generation += 1;
+                true
+            }
+            None => {
+                Self::note_pdb_state(module, &store, &id);
+                false
+            }
+        }
+    }
+
+    /// O primeiro uso de um módulo pede o PDB dele (no fundo da fila).
+    fn touch(&self, module: &Module) {
+        if module.pdb.is_some() || module.pdb_requested.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        if let (Some(store), Some(id)) = (&self.store, &module.pdb_id) {
+            store.enqueue(id, false);
+        }
     }
 
     pub fn module_at(&self, address: u64) -> Option<&Module> {
         self.modules.iter().find(|module| address >= module.base && address < module.end)
     }
 
+    fn module_index(&self, name: &str) -> Option<usize> {
+        let wanted = name.to_ascii_lowercase();
+        if wanted == "nt" || wanted == "kernel" {
+            if let Some(index) = self.kernel {
+                return Some(index);
+            }
+        }
+        self.modules.iter().position(|module| module.name.to_ascii_lowercase() == wanted || module.file_name.to_ascii_lowercase() == wanted)
+    }
+
     /// Um módulo pelo nome (com ou sem extensão, sem diferença de caixa;
     /// `nt` e `kernel` são o kernel).
     pub fn module_named(&self, name: &str) -> Option<&Module> {
-        let wanted = name.to_ascii_lowercase();
-        if wanted == "nt" || wanted == "kernel" {
-            if let Some(kernel) = self.kernel() {
-                return Some(kernel);
-            }
-        }
-        self.modules.iter().find(|module| module.name.to_ascii_lowercase() == wanted || module.file_name.to_ascii_lowercase() == wanted)
+        self.module_index(name).map(|index| &self.modules[index])
     }
 
     fn prefix(&self, module: &Module) -> String {
@@ -311,11 +636,66 @@ impl Symbols {
         }
     }
 
+    /// O símbolo de função que começa exatamente em `address`.
+    fn symbol_starting_at(module: &Module, address: u64) -> Option<&Symbol> {
+        let index = module.symbols.partition_point(|symbol| symbol.address < address);
+        module.symbols[index..].iter().take_while(|symbol| symbol.address == address).find(|symbol| symbol.function)
+    }
+
+    /// A função dona de uma parte separada do código (a entrada da `.pdata`
+    /// do endereço é encadeada, UNW_FLAG_CHAININFO, ou aponta outra entrada
+    /// pelo bit 0). Só com o arquivo desta máquina (os UNWIND_INFO saem
+    /// dele).
+    fn primary_function(module: &Module, rva: u32) -> Option<RuntimeFunction> {
+        let table = module.unwind.as_ref()?;
+        let image = table.image.as_ref()?;
+        let mut function = find_function(&table.functions, rva)?;
+        let mut chained = false;
+        for _ in 0..8 {
+            let parent = if function.unwind & 1 != 0 {
+                let entry = image.bytes_at(function.unwind & !1, 12)?;
+                Some(RuntimeFunction { begin: u32::from_le_bytes(entry.get(0..4)?.try_into().ok()?), end: u32::from_le_bytes(entry.get(4..8)?.try_into().ok()?), unwind: u32::from_le_bytes(entry.get(8..12)?.try_into().ok()?) })
+            } else {
+                let count = *image.bytes_at(function.unwind, 4)?.get(2)? as usize;
+                UnwindInfo::parse(image.bytes_at(function.unwind, UnwindInfo::size(count))?)?.chained
+            };
+            match parent {
+                Some(parent) if parent.begin != function.begin => {
+                    function = parent;
+                    chained = true;
+                }
+                _ => break,
+            }
+        }
+        chained.then_some(function)
+    }
+
+    /// O símbolo da função dona quando o endereço cai numa parte separada
+    /// (fria) sem símbolo próprio.
+    fn fragment_symbol(module: &Module, address: u64) -> Option<&Symbol> {
+        let rva = u32::try_from(address - module.base).ok()?;
+        let table = module.unwind.as_ref()?;
+        let own = find_function(&table.functions, rva)?;
+        if Self::symbol_starting_at(module, module.base + own.begin as u64).is_some() {
+            return None;
+        }
+        let primary = Self::primary_function(module, rva)?;
+        let start = module.base + primary.begin as u64;
+        if start > address {
+            return None;
+        }
+        Self::symbol_starting_at(module, start)
+    }
+
     /// O símbolo de função que contém o endereço (ou o mais próximo antes
     /// dele, quando o tamanho não é conhecido): o começo e o nome
-    /// (`módulo!nome` fora do kernel).
+    /// (`módulo!nome` fora do kernel). Numa parte fria, a função dona.
     pub fn function_at(&self, address: u64) -> Option<(u64, String)> {
         let module = self.module_at(address)?;
+        self.touch(module);
+        if let Some(symbol) = Self::fragment_symbol(module, address) {
+            return Some((symbol.address, format!("{}{}", self.prefix(module), symbol.name)));
+        }
         let index = module.symbols.partition_point(|symbol| symbol.address <= address);
         let symbol = module.symbols[..index].iter().rev().take(64).find(|symbol| symbol.function && (symbol.size == 0 || address < symbol.address + symbol.size))?;
         Some((symbol.address, format!("{}{}", self.prefix(module), symbol.name)))
@@ -327,6 +707,15 @@ impl Symbols {
         let text = self.describe(address);
         let module = self.module_at(address)?;
         (!text.starts_with("0x") && !text.starts_with(&format!("{}+0x", module.name))).then_some(text)
+    }
+
+    /// `arquivo:linha` do código no endereço, quando o PDB do módulo tem
+    /// linhas.
+    pub fn line_at(&self, address: u64) -> Option<String> {
+        let module = self.module_at(address)?;
+        let lines = module.lines.as_ref()?;
+        let (file, line) = lines.at(u32::try_from(address - module.base).ok()?)?;
+        Some(format!("{file}:{line}"))
     }
 
     /// `símbolo` cobre `address`: pelo tamanho, quando conhecido. Sem tamanho
@@ -348,14 +737,19 @@ impl Symbols {
     }
 
     /// `módulo!símbolo+0x10`, `símbolo+0x10` (kernel) ou `módulo+0xRVA`
-    /// quando nenhum símbolo cobre o endereço.
+    /// quando nenhum símbolo cobre o endereço. Uma parte fria sem símbolo
+    /// próprio sai como a função dona mais o deslocamento.
     pub fn describe(&self, address: u64) -> String {
         let Some(module) = self.module_at(address) else { return format!("{address:#x}") };
+        self.touch(module);
+        let prefix = self.prefix(module);
+        if let Some(symbol) = Self::fragment_symbol(module, address) {
+            return format!("{prefix}{}+{:#x}", symbol.name, address - symbol.address);
+        }
         let index = module.symbols.partition_point(|symbol| symbol.address <= address);
         // O último símbolo de função que contém o endereço (ou o mais próximo
         // antes dele, sem tamanho conhecido, na mesma função da .pdata).
         let found = module.symbols[..index].iter().rev().take(64).find(|symbol| symbol.function && Self::covers(module, symbol, address)).or_else(|| module.symbols[..index].last().filter(|symbol| Self::covers(module, symbol, address)));
-        let prefix = self.prefix(module);
         match found {
             Some(symbol) if address == symbol.address => format!("{prefix}{}", symbol.name),
             Some(symbol) => format!("{prefix}{}+{:#x}", symbol.name, address - symbol.address),
@@ -377,11 +771,23 @@ impl Symbols {
         }
     }
 
+    /// Por que um nome não está num módulo (o estado do PDB dele).
+    fn pdb_hint(module: &Module) -> String {
+        if module.pdb.is_some() || (module.pdb_id.is_none() && module.image.is_none() && module.sections.is_empty()) {
+            return String::new();
+        }
+        if module.pdb_pending {
+            return format!(" (o PDB de {} ainda esta chegando; .reload /w espera)", module.name);
+        }
+        format!(" ({}: {})", module.name, module.source)
+    }
+
     /// Endereço de um nome: `módulo!símbolo`, o nome completo, o nome sem os
     /// argumentos genéricos ou o fim do caminho (`::nome`).
     pub fn lookup(&self, query: &str) -> Result<u64, String> {
         if let Some((module, name)) = query.split_once('!') {
             let module = self.module_named(module).ok_or_else(|| format!("modulo {module} nao carregado"))?;
+            self.touch(module);
             if let Some(symbol) = module.symbols.iter().find(|symbol| symbol.name == name) {
                 return Ok(symbol.address);
             }
@@ -391,7 +797,7 @@ impl Symbols {
                     return Ok(module.base + image.header.entry_point as u64);
                 }
             }
-            return Err(format!("{query}: simbolo nao encontrado"));
+            return Err(format!("{query}: simbolo nao encontrado{}", Self::pdb_hint(module)));
         }
         let all = || self.modules.iter().flat_map(|module| module.symbols.iter());
         let pick = |matches: Vec<&Symbol>| -> Option<Result<u64, String>> {
@@ -422,12 +828,40 @@ impl Symbols {
         Err(format!("{query}: simbolo nao encontrado"))
     }
 
+    /// Os símbolos que casam com um padrão com `*` e `?` (`módulo!padrão`,
+    /// o módulo também com curingas; sem `!`, todos os módulos): endereço e
+    /// nome completo, em ordem de endereço, no máximo `limit`.
+    pub fn search(&self, pattern: &str, limit: usize) -> Vec<(u64, String)> {
+        let (module_pattern, name_pattern) = pattern.split_once('!').map_or(("*", pattern), |(module, name)| (module, name));
+        let module_pattern = module_pattern.to_ascii_lowercase();
+        let mut found = Vec::new();
+        for module in &self.modules {
+            let kernel_alias = self.is_kernel(module) && (module_pattern == "nt" || module_pattern == "kernel");
+            if !kernel_alias && !wildcard_match(&module_pattern, &module.name.to_ascii_lowercase()) && !wildcard_match(&module_pattern, &module.file_name.to_ascii_lowercase()) {
+                continue;
+            }
+            if pattern.contains('!') {
+                self.touch(module);
+            }
+            for symbol in module.symbols.iter().filter(|symbol| wildcard_match(name_pattern, &symbol.name)) {
+                if found.len() >= limit {
+                    break;
+                }
+                found.push((symbol.address, format!("{}{}", self.prefix(module), symbol.name)));
+            }
+        }
+        found.sort();
+        found.dedup();
+        found
+    }
+
     /// Nomes que começam com o texto (o autocompletar): `módulo!` restringe
     /// ao módulo.
     pub fn complete(&self, prefix: &str, limit: usize) -> Vec<String> {
         let mut found = Vec::new();
         if let Some((module_name, name)) = prefix.split_once('!') {
             if let Some(module) = self.module_named(module_name) {
+                self.touch(module);
                 for symbol in &module.symbols {
                     if symbol.name.starts_with(name) {
                         found.push(format!("{}!{}", module.name, symbol.name));
@@ -457,6 +891,33 @@ impl Symbols {
         found.truncate(limit);
         found
     }
+}
+
+/// `*` (qualquer sequência) e `?` (um caractere).
+pub fn wildcard_match(pattern: &str, text: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let text: Vec<char> = text.chars().collect();
+    let (mut p, mut t) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while t < text.len() {
+        if p < pattern.len() && (pattern[p] == '?' || pattern[p] == text[t]) {
+            p += 1;
+            t += 1;
+        } else if p < pattern.len() && pattern[p] == '*' {
+            star = Some((p, t));
+            p += 1;
+        } else if let Some((star_p, star_t)) = star {
+            p = star_p + 1;
+            t = star_t + 1;
+            star = Some((star_p, star_t + 1));
+        } else {
+            return false;
+        }
+    }
+    while p < pattern.len() && pattern[p] == '*' {
+        p += 1;
+    }
+    p == pattern.len()
 }
 
 fn without_generics(name: &str) -> String {
@@ -540,10 +1001,24 @@ mod tests {
         assert_eq!(symbols.lookup("ksecdd!SspiInitAsyncInterface"), Ok(0xfffff800_42001000));
         assert_eq!(symbols.lookup("ksecdd.sys!KSecRegisterSecurityProvider"), Ok(0xfffff800_42002000));
         assert_eq!(symbols.lookup("nt!kernel::ntos::ke::run_kernel_tasks"), Ok(0xfffff800_40002000));
-        assert!(symbols.lookup("nada!x").is_err());
+        assert!(symbols.lookup("nada!x").unwrap_err().contains("nao carregado"));
+        assert!(symbols.lookup("ksecdd!Falta").unwrap_err().contains("nao encontrado"));
         assert!(symbols.lookup("inexistente").is_err());
         assert_eq!(symbols.complete("ksecdd!Ss", 5), vec!["ksecdd!SspiInitAsyncInterface".to_string()]);
         assert_eq!(symbols.complete("kse", 5), vec!["ksecdd!".to_string()]);
+    }
+
+    #[test]
+    fn searches_with_wildcards() {
+        let symbols = sample();
+        assert_eq!(symbols.search("ksecdd!*Security*", 10), vec![(0xfffff800_42002000, "ksecdd!KSecRegisterSecurityProvider".to_string())]);
+        assert_eq!(symbols.search("nt!*run_kernel?tasks", 10), vec![(0xfffff800_40002000, "kernel::ntos::ke::run_kernel_tasks".to_string())]);
+        assert_eq!(symbols.search("k*!Sspi*", 10).len(), 1);
+        assert_eq!(symbols.search("*", 3).len(), 3);
+        assert!(wildcard_match("a*b?d", "aXXbcd"));
+        assert!(!wildcard_match("a*b?d", "aXXbd"));
+        assert!(wildcard_match("*", ""));
+        assert!(!wildcard_match("", "x"));
     }
 
     #[test]
@@ -563,7 +1038,6 @@ mod tests {
 
     #[test]
     fn exports_cover_only_their_pdata_function() {
-        use super::super::pe::RuntimeFunction;
         let base = 0xfffff800_43000000;
         let mut module = Module::new(r"\SystemRoot\System32\drivers\pci.sys", r"\SystemRoot\System32\drivers\pci.sys", base, base + 0x20000, vec![symbol(base + 0x1000, 0, "PciExport")], "teste");
         let functions = vec![RuntimeFunction { begin: 0x1000, end: 0x1040, unwind: 0 }, RuntimeFunction { begin: 0xf800, end: 0xf900, unwind: 0 }];
@@ -576,6 +1050,75 @@ mod tests {
         assert_eq!(symbols.describe_return(base + 0xf88e), "pci+0xf88e");
         // Sem função na .pdata para o endereço: o export mais próximo.
         assert_eq!(symbols.describe(base + 0x2000), "pci!PciExport+0x1000");
+    }
+
+    #[test]
+    fn cold_fragments_belong_to_their_function() {
+        use super::super::pe::tests::tiny_pe;
+        // .pdata: a função em 0x1000 e a parte fria dela em 0x1100, com o
+        // UNWIND_INFO encadeado (flags 4) apontando a função principal.
+        let pdata = [RuntimeFunction { begin: 0x1000, end: 0x1040, unwind: 0x2018 }, RuntimeFunction { begin: 0x1100, end: 0x1180, unwind: 0x2020 }];
+        let mut rdata = vec![0x01, 0x00, 0x00, 0x00, 0, 0, 0, 0];
+        rdata.extend_from_slice(&[0x21, 0x00, 0x00, 0x00]);
+        rdata.extend_from_slice(&0x1000u32.to_le_bytes());
+        rdata.extend_from_slice(&0x1040u32.to_le_bytes());
+        rdata.extend_from_slice(&0x2018u32.to_le_bytes());
+        let image = Arc::new(PeImage::parse(tiny_pe(&pdata, &rdata, false)).unwrap());
+        let base = 0x7ff6_0000_0000;
+        let mut module = Module::new("teste.dll", r"C:\Windows\System32\teste.dll", base, base + 0x3000, vec![symbol(base + 0x1000, 0, "Funcao"), symbol(base + 0x1090, 0, "Outra")], "teste");
+        module.unwind = Some(Arc::new(FunctionTable { base, functions: image.runtime_functions(), image: Some(Arc::clone(&image)) }));
+        module.pdb = Some(PathBuf::from("teste.pdb"));
+        let mut symbols = Symbols::default();
+        symbols.add_module(module);
+        // Sem a regra da parte fria, o símbolo mais próximo (Outra) levaria.
+        assert_eq!(symbols.describe(base + 0x1120), "teste!Funcao+0x120");
+        assert_eq!(symbols.function_at(base + 0x1120), Some((base + 0x1000, "teste!Funcao".into())));
+        assert_eq!(symbols.describe(base + 0x1010), "teste!Funcao+0x10");
+        assert_eq!(symbols.describe(base + 0x10a0), "teste!Outra+0x10");
+    }
+
+    #[test]
+    fn user_modules_are_kept_per_process() {
+        let mut symbols = sample();
+        let list = vec![(0x7ffa_0000_0000, 0x7ffa_0001_0000, r"C:\OpenNT\naoexiste\kd_teste_um.dll".to_string()), (0x7ffb_0000_0000, 0x7ffb_0001_0000, r"C:\OpenNT\naoexiste\kd_teste_dois.dll".to_string())];
+        symbols.set_user_modules(0x1000, &list, Path::new("."));
+        assert_eq!(symbols.user_modules().count(), 2);
+        assert!(symbols.module_named("kd_teste_um").is_some_and(|module| module.user));
+        // Outro processo com só a segunda DLL: a primeira sai, mas fica
+        // guardada para a volta.
+        symbols.set_user_modules(0x2000, &list[1..], Path::new("."));
+        assert_eq!(symbols.user_modules().count(), 1);
+        assert!(symbols.module_named("kd_teste_um").is_none());
+        symbols.set_user_modules(0x1000, &list, Path::new("."));
+        assert_eq!(symbols.user_modules().count(), 2);
+        // Os módulos do kernel continuam.
+        assert!(symbols.module_named("ksecdd").is_some());
+        assert!(symbols.kernel().is_some());
+    }
+
+    #[test]
+    fn modules_from_target_memory() {
+        // Uma imagem que não existe nesta máquina: o cabeçalho, as seções e os
+        // exports saem da memória do alvo.
+        use super::super::pe::tests::tiny_pe;
+        let mut mapped = tiny_pe(&[], &[], true);
+        // Na imagem mapeada o RVA é o offset: a .rdata (arquivo 0x600) vai
+        // para 0x2000.
+        mapped.resize(0x3000, 0);
+        let rdata: Vec<u8> = mapped[0x600..0x800].to_vec();
+        mapped[0x2000..0x2200].copy_from_slice(&rdata);
+        let base = 0xfffff800_44000000u64;
+        let mut read = |address: u64, length: usize| -> Option<Vec<u8>> {
+            let start = usize::try_from(address.checked_sub(base)?).ok()?;
+            mapped.get(start..(start + length).min(mapped.len())).map(<[u8]>::to_vec)
+        };
+        let mut symbols = Symbols { store: Some(SymbolStore::offline(PathBuf::from("."))), ..Default::default() };
+        symbols.set_modules_from(&[(base, base + 0x3000, r"\SystemRoot\System32\drivers\naoexiste_kd.sys".to_string())], Path::new("."), &mut read);
+        let module = symbols.module_named("naoexiste_kd").unwrap();
+        assert_eq!(module.origin, "imagem do alvo");
+        assert_eq!(module.sections.len(), 2);
+        assert!(!module.sections[0].code);
+        assert_eq!(symbols.lookup("naoexiste_kd!Funcao"), Ok(base + 0x1010));
     }
 
     #[test]

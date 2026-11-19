@@ -12,8 +12,10 @@
 //! - `stop`: a resposta de parada (`T05thread:1;swbreak:;`);
 //! - `registers`: a ordem do pacote `g` do GDB para x86-64;
 //! - `symbols`, `elf`, `pe`, `msf`, `pdb`, `demangle`: os símbolos do
-//!   `kernel.elf` (com os nomes do Rust legíveis), dos exports dos PEs desta
-//!   máquina e dos públicos dos PDBs (cache e servidor de símbolos);
+//!   `kernel.elf` (com os nomes do Rust legíveis), dos exports dos PEs
+//!   (desta máquina ou da memória do alvo) e dos PDBs (públicos e, quando
+//!   existem, privados e linhas; cache em várias pastas e a fila de
+//!   downloads do servidor de símbolos);
 //! - `unwind`: a pilha pela `.pdata` dos binários da Microsoft e pelos frame
 //!   pointers do código do OpenNT;
 //! - `tpi`, `types`: os tipos do PDB do ntoskrnl e as vistas tipadas;

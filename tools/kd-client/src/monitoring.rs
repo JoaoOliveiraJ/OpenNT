@@ -403,12 +403,14 @@ impl Client {
     /// Os tipos de um PDB de usuário (o do módulo que contém `address`, ou
     /// do módulo pelo nome), carregados uma vez.
     pub fn user_type_database(&mut self, module: &str) -> Result<Arc<TypeDb>, String> {
-        let found = match super::parse_number(module) {
-            Some(address) => self.symbols.module_at(address),
-            None => self.symbols.module_named(module),
+        let address = match super::parse_number(module) {
+            Some(address) => address,
+            None => self.symbols.module_named(module).map(|found| found.base).ok_or_else(|| format!("modulo {module} nao carregado"))?,
         };
-        let found = found.ok_or_else(|| format!("modulo {module} nao carregado"))?;
-        let path = found.pdb.clone().ok_or_else(|| format!("{}: sem PDB (o download pode estar em andamento)", found.name))?;
+        // Os tipos vêm do PDB: o que ainda não chegou é esperado.
+        self.symbols.wait_pdb_at(address);
+        let found = self.symbols.module_at(address).ok_or_else(|| format!("modulo {module} nao carregado"))?;
+        let path = found.pdb.clone().ok_or_else(|| format!("{}: sem PDB ({})", found.name, found.source))?;
         if let Some(types) = self.monitors.user_types.get(&path) {
             return Ok(Arc::clone(types));
         }
