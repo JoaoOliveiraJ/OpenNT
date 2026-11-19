@@ -58,6 +58,9 @@
 //! dtv [modulo!]<tipo> <expr> [abertos,...]   o endereco como tipo, em arvore
 //! snap save|load|del <nome> | snap list   snapshots da maquina (monitor do QEMU)
 //! rstep | rcont              passo para tras e para tras ate o breakpoint (reproducao)
+//! !procs | !threads [pid] | !waits <ethread> | !handles <pid> [texto] | !obj <end|caminho> | !obtypes
+//! !token <pid|end> | !iocp <pid|end> | !waitpkt <pid|end> | !alpc <pid|end|caminho> | !wnf [pid | nome <valor>] | !hives
+//!                            objetos do NT pelos tipos do PDB, em colunas fixas (`nt_objects`)
 //! detach | quit
 //! ```
 //!
@@ -99,6 +102,8 @@ irptrace on | off | show [n] [texto] | irp <n|endereco> (rastreador de IRPs)
 reg <caminho> | regv <caminho> <nome> | objdir [caminho] | fsls [caminho] | fscat <caminho> [desl] [bytes]
 dtv [modulo!]<tipo> <expr> [abertos,...] (o endereco como tipo, em arvore) | snap save|load|del <nome> | snap list
 rstep | rcont (passo para tras e para tras ate o breakpoint, na reproducao com --replay)
+!procs | !threads [pid] | !waits <ethread> | !handles <pid> [texto] | !obj <end|caminho> | !obtypes (objetos do NT pelo PDB)
+!token <pid|end> | !iocp <pid|end> | !waitpkt <pid|end> | !alpc <pid|end|caminho> | !wnf [pid | nome <valor>] | !hives
 detach | quit
 expressoes: 0x.., decimais, $nome, @reg, simbolos, poi() by() wo() dwo() [..], operadores do C, ((_IRP*)x)->Campo
 ";
@@ -993,6 +998,7 @@ impl Client {
             "modules" => Ok(self.symbols.modules.iter().map(|module| format!("{:#018x} {:#018x} {:<16} {} simbolos ({})\n", module.base, module.end, module.name, module.symbols.len(), module.source)).collect()),
             "detach" => self.detach(),
             "help" => Ok(HELP.to_string()),
+            name if super::nt_objects::COMMANDS.contains(&name) => self.objects_command(name, rest),
             other => Err(format!("comando desconhecido: {other} (help)")),
         }
     }
@@ -1004,6 +1010,7 @@ impl Client {
             "threads", "lm", "lmv", "cpus", "irql", "obj", "log", "bugcheck", "kd", ".reload", "!process", "!thread", "!irp", "!devobj", "!drvobj", "!object", "!handle", "!analyze", "trace", "monitor", "modules", "detach", "help",
             ".process", "lmu", "handles", "vad", "uthreads", "ustack", "kmap", "events", "uex", "bgd", "bge", "bar",
             "apimon", "irptrace", "reg", "regv", "objdir", "fsls", "fscat", "dtv", "rstep", "rcont", "snap",
+            "!procs", "!threads", "!waits", "!handles", "!obj", "!obtypes", "!token", "!iocp", "!waitpkt", "!alpc", "!wnf", "!hives",
         ]
     }
 

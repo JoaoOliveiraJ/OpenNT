@@ -40,6 +40,9 @@
 //! - `explore`: as respostas dos exploradores do Registro, do namespace e
 //!   dos arquivos;
 //! - `struct_view`: um endereço como tipo do PDB, em árvore editável;
+//! - `nt_objects`: processos, threads e esperas, handles, OBJECT_HEADER e
+//!   descritor de segurança, WNF e hives pelos tipos do PDB, e o token, as
+//!   portas de conclusão, os pacotes de espera e o ALPC pelo stub;
 //! - `hmp`: o monitor do QEMU (snapshots e record/replay);
 //! - `monitoring`: a sessão com tudo isso e os passos para trás da
 //!   reprodução.
@@ -60,6 +63,7 @@ pub mod launcher;
 pub mod monitor;
 pub mod monitoring;
 pub mod msf;
+pub mod nt_objects;
 pub mod ntstatus;
 pub mod pdb;
 pub mod pe;

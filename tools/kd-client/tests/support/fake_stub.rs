@@ -189,6 +189,13 @@ impl Target {
             ["fs", "ls", ..] => "pasta\t/\t2\nf\tWindows\t1\t0\t0x10\t0x0\nf\tteste.txt\t0\t5\t0x20\t0x1d9a0b0c0d0e0f0\n".to_string(),
             ["fs", "read", _, offset, ..] if *offset == "0" => "dados\t/teste.txt\t5\t0\t6f6c612121\n".to_string(),
             ["fs", "read", ..] => "dados\t/teste.txt\t5\t5\t\n".to_string(),
+            // Os objetos do NT (`nt_objects`): processos, handles e as
+            // consultas do `kd/objects.rs`.
+            ["ps"] => "   PID           EPROCESS                CR3 threads  nome\n     4 0xffffc00000004000 0x1aa000       3  System\n   500 0xffffc00000500000 0x2bb000       5  csrss.exe\n".to_string(),
+            ["handles", "0xffffc00000500000", "0"] => "EPROCESS 0xffffc00000500000 HANDLE_TABLE 0xffffc00000600000 TableCode 0xffffc00000610000 entradas 4\n  handle             objeto     acesso tipo             nome\n     0x4 0xffffc00000700000   0x1f0003 Event            \\BaseNamedObjects\\x\n     0x8 0xffffc00000800000   0x1f0001 ALPC Port        \\Windows\\ApiPort\n     0xc 0xffffc00000900000   0x1f0003 IoCompletion     \n".to_string(),
+            ["obtypes"] => "ObHeaderCookie 0x5a\nINDICE        OBJECT_TYPE  OBJETOS  HANDLES NOME\n     7 0xffffc00000100000       12        3 Process\n    46 0xffffc00000200000        2        1 ALPC Port\n".to_string(),
+            ["alpc", port] => format!("ALPC {port} tipo alpc fechada 0 handles 1 PID 500 TID 504 processo 0xffffc00000500000\npapel Listener conexao 0\nfila-do-servidor 2\n"),
+            ["iocp", port] => format!("IOCP {port} fechada 0 concorrencia 1 processo-exclusivo - nome -\npacotes 0 ativas 0 esperando 0 associadas 0\n"),
             _ => "comandos do OpenNT\n".to_string(),
         }
     }

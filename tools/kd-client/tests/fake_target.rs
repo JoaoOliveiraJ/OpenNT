@@ -43,6 +43,30 @@ fn replay_steps_back_to_the_previous_rip() {
     assert!(normal.reverse_step().unwrap_err().contains("reproducao"));
 }
 
+/// Os comandos de objetos do NT que não precisam do PDB: a tabela de
+/// handles filtrada (com o tipo `ALPC Port` inteiro), as portas de um
+/// processo consultadas no stub pelo handle, a ObTypeIndexTable e a porta
+/// de conclusão pelo endereço.
+#[test]
+fn object_commands_over_the_stub() {
+    let (address, _) = start(Vec::new());
+    let mut client = connect(&address);
+    let output = client.execute("!handles 500 alpc").unwrap();
+    assert!(output.contains("PID 500 csrss.exe handles 3 mostrados 1"), "{output}");
+    assert!(output.contains("ALPC_Port"), "{output}");
+    assert!(output.contains("\\Windows\\ApiPort"), "{output}");
+    let output = client.execute("!alpc 500").unwrap();
+    assert!(output.contains("1 handles ALPC_Port"), "{output}");
+    assert!(output.contains("HANDLE 0x8 objeto 0xffffc00000800000"), "{output}");
+    assert!(output.contains("ALPC 0xffffc00000800000 tipo alpc"), "{output}");
+    assert!(output.contains("fila-do-servidor 2"), "{output}");
+    let output = client.execute("!obtypes").unwrap();
+    assert!(output.contains("ObHeaderCookie 0x5a"), "{output}");
+    let output = client.execute("!iocp 0xffffc00000900000").unwrap();
+    assert!(output.contains("IOCP 0xffffc00000900000"), "{output}");
+    assert!(client.execute("!handles 77").unwrap_err().contains("processo nao encontrado"));
+}
+
 #[test]
 fn backtrace_registers_and_memory() {
     let (address, log) = start(Vec::new());
