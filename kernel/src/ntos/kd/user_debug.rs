@@ -12,7 +12,10 @@
 //!   (TF) e o 0xCC volta depois dele;
 //! - o passo (`s`) e a saída de um breakpoint num `c` usam o TF no CONTEXT
 //!   da thread: o #DB do passo volta por aqui e é reconhecido pelo CONTEXT
-//!   (a identidade da thread). Um passo pedido numa parada do anel 0 que
+//!   (a identidade da thread), numa tabela com um passo pendente por thread
+//!   (outra thread pode sair de outro breakpoint antes de o #DB desta
+//!   chegar); o #DB de um passo do depurador nunca vai ao processo. Um passo
+//!   pedido numa parada do anel 0 que
 //!   segue para o anel 3 (o `iretq` de volta, ou uma NMI que interrompeu o
 //!   anel 3) também para aqui, pelo CONTEXT do intervalo (`arm_step_from_kernel`);
 //! - as outras exceções passam pelo filtro por código (`kd::exception_filter`,
@@ -76,12 +79,55 @@ const VECTOR_DEBUG_SERVICE: u32 = 0x2D;
 const NONCONTINUABLE: u32 = 1;
 const RECORD_SIZE: usize = size_of::<ExceptionRecord>();
 
-/// O CONTEXT da thread que dá um passo do depurador (0 = nenhuma).
-static STEP_CONTEXT: AtomicU64 = AtomicU64::new(0);
-/// O breakpoint suspenso pelo passo (0 = nenhum).
-static STEP_OVER: AtomicU64 = AtomicU64::new(0);
-/// O passo só sai de um breakpoint: no fim, a thread segue sem parar.
-static STEP_SILENT: AtomicBool = AtomicBool::new(false);
+/// Um passo do depurador numa thread de usuário: o TF está ligado no
+/// CONTEXT dela e o #DB que ele dá é do depurador, nunca do processo.
+/// Cada thread tem o seu: entre o `iretq` com o TF e a instrução, o tique
+/// pode trocar de thread, e outra thread pode passar por cima de outro
+/// breakpoint antes de o #DB desta chegar (um único passo global perdia o
+/// primeiro, e o STATUS_SINGLE_STEP ia ao processo).
+struct PendingStep {
+    /// O CONTEXT da thread (0 = vaga livre).
+    context: AtomicU64,
+    /// O breakpoint suspenso pelo passo (0 = nenhum).
+    over: AtomicU64,
+    /// O passo só sai de um breakpoint: no fim, a thread segue sem parar.
+    silent: AtomicBool,
+}
+
+/// Passos pendentes no máximo (threads entre o `iretq` com o TF e o #DB).
+const STEP_SLOTS: usize = 128;
+
+static STEPS: [PendingStep; STEP_SLOTS] = [const { PendingStep { context: AtomicU64::new(0), over: AtomicU64::new(0), silent: AtomicBool::new(false) } }; STEP_SLOTS];
+/// Passos que não acharam vaga (a tabela cheia).
+static STEP_OVERFLOWS: AtomicU64 = AtomicU64::new(0);
+
+/// Registra o passo da thread do CONTEXT `context` (a vaga dela, ou uma
+/// livre). Sem vaga, devolve `false`: o TF não deve ser ligado.
+fn push_step(context: u64, over: u64, silent: bool) -> bool {
+    let slot = STEPS.iter().find(|slot| slot.context.load(Ordering::Acquire) == context).or_else(|| STEPS.iter().find(|slot| slot.context.compare_exchange(0, context, Ordering::AcqRel, Ordering::Acquire).is_ok()));
+    let Some(slot) = slot else {
+        STEP_OVERFLOWS.fetch_add(1, Ordering::Relaxed);
+        return false;
+    };
+    slot.over.store(over, Ordering::Release);
+    slot.silent.store(silent, Ordering::Release);
+    true
+}
+
+/// Tira o passo pendente da thread do CONTEXT `context`: (breakpoint
+/// suspenso, silencioso), ou `None` se o #DB não é de um passo do
+/// depurador.
+fn take_step(context: u64) -> Option<(u64, bool)> {
+    let slot = STEPS.iter().find(|slot| slot.context.load(Ordering::Acquire) == context)?;
+    let found = (slot.over.swap(0, Ordering::AcqRel), slot.silent.load(Ordering::Acquire));
+    slot.context.store(0, Ordering::Release);
+    Some(found)
+}
+
+/// Passos pendentes agora (o `monitor uex`).
+fn pending_steps() -> usize {
+    STEPS.iter().filter(|slot| slot.context.load(Ordering::Acquire) != 0).count()
+}
 /// Parar em toda exceção de primeira chance do anel 3 (`monitor uex`).
 static BREAK_ON_EXCEPTIONS: AtomicBool = AtomicBool::new(false);
 /// Paradas e passagens (para o `monitor uex`).
@@ -221,18 +267,19 @@ pub fn exception(context: &Context, vector: u32, teb: u64, record: &[u8]) -> boo
     let rip = context.rip.get();
     // O passo do depurador terminou (também depois de o host se desligar:
     // o #DB do TF que o depurador ligou não vai ao processo).
-    if vector == VECTOR_DEBUG && STEP_CONTEXT.load(Ordering::Acquire) == context.address() {
-        STEP_CONTEXT.store(0, Ordering::Release);
-        context.e_flags.set(context.e_flags.get() & !TRAP_FLAG);
-        let over = STEP_OVER.swap(0, Ordering::AcqRel);
-        if over != 0 {
-            breakpoints::restore(over);
+    if vector == VECTOR_DEBUG {
+        if let Some((over, silent)) = take_step(context.address()) {
+            context.e_flags.set(context.e_flags.get() & !TRAP_FLAG);
+            if over != 0 {
+                breakpoints::restore(over);
+            }
+            finish_step_extras(context);
+            // Também depois de o host se desligar: o passo termina sem parar.
+            if silent || !stop::active() || !super::session::attached() {
+                return true;
+            }
+            return stop_here(context, teb, stop::SIGTRAP, Kind::Signal, false);
         }
-        finish_step_extras(context);
-        if STEP_SILENT.load(Ordering::Acquire) || !stop::active() || !super::session::attached() {
-            return true;
-        }
-        return stop_here(context, teb, stop::SIGTRAP, Kind::Signal, false);
     }
     if !stop::active() || !super::session::attached() {
         return false;
@@ -366,16 +413,20 @@ fn observe(context: &Context, teb: u64, record: &[u8], termination: bool) {
 /// quadro que volta ao usuário): o #DB que ele dá na thread do intervalo
 /// (o CONTEXT `context`) para a máquina aqui.
 pub fn arm_step_from_kernel(context: u64) {
-    STEP_OVER.store(0, Ordering::Release);
-    STEP_SILENT.store(false, Ordering::Release);
-    STEP_CONTEXT.store(context, Ordering::Release);
+    push_step(context, 0, false);
 }
 
 /// Liga o TF da thread para uma instrução; `over` é o breakpoint suspenso.
+/// Sem vaga na tabela de passos, o TF não liga: o breakpoint suspenso volta
+/// já (a instrução original não executa por baixo dele; a thread bate nele
+/// de novo, o que é melhor que um #DB entregue ao processo).
 fn begin_step(context: &Context, over: u64, silent: bool) {
-    STEP_OVER.store(over, Ordering::Release);
-    STEP_SILENT.store(silent, Ordering::Release);
-    STEP_CONTEXT.store(context.address(), Ordering::Release);
+    if !push_step(context.address(), over, silent) {
+        if over != 0 {
+            breakpoints::restore(over);
+        }
+        return;
+    }
     context.e_flags.set(context.e_flags.get() | TRAP_FLAG);
 }
 
@@ -511,9 +562,7 @@ pub fn self_test_exception(code: u32, chance: u8) {
     } else {
         // Um passo pedido aqui ficaria armado no CONTEXT de mentira: desfeito.
         let _ = raised(context, 0, &record);
-        if STEP_CONTEXT.load(Ordering::Acquire) == context.address() {
-            STEP_CONTEXT.store(0, Ordering::Release);
-        }
+        let _ = take_step(context.address());
     }
 }
 
@@ -526,10 +575,12 @@ pub fn command(argument: &str, out: &mut Payload) {
     }
     let _ = writeln!(
         out,
-        "excecoes do anel 3: {} (paradas {}, int 3 de outros processos passados {}; por codigo: monitor sx)",
+        "excecoes do anel 3: {} (paradas {}, int 3 de outros processos passados {}, passos pendentes {}, passos sem vaga {}; por codigo: monitor sx)",
         if BREAK_ON_EXCEPTIONS.load(Ordering::Acquire) { "param na primeira chance" } else { "so os breakpoints do depurador" },
         STOPS.load(Ordering::Relaxed),
-        FOREIGN_HITS.load(Ordering::Relaxed)
+        FOREIGN_HITS.load(Ordering::Relaxed),
+        pending_steps(),
+        STEP_OVERFLOWS.load(Ordering::Relaxed)
     );
 }
 
@@ -666,7 +717,6 @@ pub fn exr_command(owner: usize, out: &mut Payload) {
 /// O host se desligou: um passo pendente termina sem parar, e o filtro por
 /// código volta ao padrão.
 pub fn reset() {
-    STEP_SILENT.store(true, Ordering::Release);
     BREAK_ON_EXCEPTIONS.store(false, Ordering::Release);
     exception_filter::clear();
 }
