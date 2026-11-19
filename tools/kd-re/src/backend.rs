@@ -41,9 +41,12 @@ use crate::source::{Local, LineTable};
 mod extras;
 #[path = "backend/mcp.rs"]
 mod mcp;
+#[path = "backend/usermode.rs"]
+mod usermode;
 #[path = "backend/views.rs"]
 mod views;
 pub use extras::{ExtraRequest, ExtrasView, FilePreview, MonitorStore, RegistryKeyView, SharedStore, StructTree, TimeMode};
+pub use usermode::{FileSymbols, PdbState, PlanRow, ProcessRow, ThreadStacks, UserThreadRow, UserModuleRow, UserRequest, UserView};
 pub use views::{GraphBlock, GraphView, MapRow, MemoryMapView, ReferenceRow, ReferenceView, SearchKind, SearchQuery, SearchScope, SehRow, StackRow, SymbolView, XrefRow, XrefView};
 use kd_client::analysis::notes::Patch;
 use kd_client::user::{Handle, ProcessContext, UserThread};
@@ -226,6 +229,8 @@ pub enum Request {
     /// As abas do monitor de APIs, dos IRPs, dos tipos, dos exploradores,
     /// dos snapshots e da reprodução (`backend/extras.rs`).
     Extra(ExtraRequest),
+    /// As abas Processos e Exceção (`backend/usermode.rs`).
+    User(UserRequest),
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -421,6 +426,9 @@ pub struct Snapshot {
     pub xrefs: Option<Arc<XrefView>>,
     /// A janela de pilha segue o RSP (senão, a expressão pedida).
     pub stack_locked: bool,
+    /// Os processos de usuário, os módulos e as threads do escolhido, a
+    /// exceção da parada e os planos de seguir (`backend/usermode.rs`).
+    pub user: UserView,
 }
 
 /// Uma entrada do painel de comandos.
@@ -583,6 +591,8 @@ struct Worker {
     mcp_cache: kd_mcp::ImageCache,
     mcp_stop: Option<Arc<std::sync::atomic::AtomicBool>>,
     store: SharedStore,
+    /// Os processos de usuário, as exceções e os planos de seguir.
+    user: usermode::UserState,
 }
 
 impl Worker {
@@ -617,6 +627,7 @@ impl Worker {
             mcp_cache: kd_mcp::ImageCache::default(),
             mcp_stop: None,
             store: SharedStore::default(),
+            user: usermode::UserState::default(),
         }
     }
 
@@ -659,6 +670,12 @@ impl Worker {
             // Um PDB que chegou: os nomes trocam sem esperar outra parada.
             if self.client.as_ref().is_some_and(|client| client.is_stopped() && client.symbols.pending() && !client.symbols.store.as_ref().is_some_and(|store| store.busy())) {
                 let _ = self.with_client(|client| client.reload_modules());
+                // Os de usuário também (o reload_modules só refaz os do kernel).
+                let root = self.config.root.clone();
+                let _ = self.with_client(|client| {
+                    usermode::swap_user_pdbs(client, &root);
+                    Ok(())
+                });
                 self.refresh();
             }
             // A janela Xrefs esperando lotes da análise de um módulo.
@@ -764,6 +781,7 @@ impl Worker {
                 self.after_attach();
                 self.lines = None;
                 self.re = views::ReState::default();
+                self.user_after_attach();
                 if let Some(path) = self.config.script.clone() {
                     match std::fs::read_to_string(&path) {
                         Ok(text) => {
@@ -846,6 +864,11 @@ impl Worker {
                 self.view = View::Owner;
                 self.selected_frame = 0;
                 self.focus = Focus::Frame;
+                // Os planos de seguir: um evento do processo seguido arma os
+                // breakpoints nele e a máquina segue sozinha.
+                if self.follow_after_stop() {
+                    return;
+                }
                 // Os comandos de parada do breakpoint (o "command on hit").
                 let commands = self.client.as_ref().and_then(Client::stop_commands);
                 if let Some((id, commands)) = commands {
@@ -1139,6 +1162,7 @@ impl Worker {
                 }
                 result
             }
+            Request::User(request) => self.user_request(request),
             Request::Start(_) | Request::Restart | Request::Disconnect | Request::Shutdown | Request::SetWatches(_) | Request::SetExpanded(_) | Request::Mcp { .. } | Request::SetMcp(_) | Request::SetArgumentCount(_) => Ok(false),
         };
         if breakpoints_changed && result.is_ok() {
@@ -1201,6 +1225,10 @@ impl Worker {
             self.transcript(trimmed, Ok(String::new()));
             self.handle(action);
             return Ok(false);
+        }
+        // Os planos de seguir (`backend/usermode.rs`).
+        if word == "seguir" {
+            return self.follow_command(trimmed);
         }
         self.set_activity(trimmed);
         let result = self.with_client(|client| client.execute(trimmed));
@@ -1466,12 +1494,14 @@ impl Worker {
             let text = client.execute(&kind.command(&argument));
             snapshot.query = Some(QueryResult { kind, argument, text });
         }
-        // Parada por bugcheck: a análise vem junto.
-        if snapshot.stop_signal == 6 {
+        // Parada por bugcheck: a análise vem junto (o sinal 6 do anel 3 é
+        // uma exceção de usuário, como o int 0x29 do __fastfail).
+        if snapshot.stop_signal == 6 && !client.stopped_in_user_mode() {
             snapshot.bugcheck = client.analyze().ok();
         }
         snapshot.search = self.search.clone();
         self.add_re_views(&mut snapshot);
+        self.add_user_views(&mut snapshot);
         // Linha de código e variáveis locais (só o kernel do OpenNT tem DWARF).
         if self.lines.is_none() {
             self.set_activity("lendo o DWARF do kernel.elf");

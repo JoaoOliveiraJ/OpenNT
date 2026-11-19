@@ -45,6 +45,9 @@
 //!   de eventos da janela;
 //! - `copy_text`: copiar qualquer aba como texto;
 //! - `layout`: a janela, os painéis e o arranjo das abas entre execuções;
+//! - `processes`: as abas Processos (processos com sessão, contexto,
+//!   módulos com o PDB, threads com as pilhas de usuário e de kernel,
+//!   breakpoints de usuário, seguir um processo desde a criação) e Exceção;
 //! - `exception`: o EXCEPTION_RECORD em palavras (fail-fast, exceções
 //!   guardadas do WinRT, violação de acesso, C++) e onde achá-lo numa
 //!   parada;
@@ -75,6 +78,7 @@ pub mod navigation;
 pub mod offscreen;
 pub mod panels;
 pub mod preferences;
+pub mod processes;
 pub mod scan;
 pub mod scenario;
 pub mod source;

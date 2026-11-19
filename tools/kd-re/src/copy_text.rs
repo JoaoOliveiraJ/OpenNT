@@ -211,6 +211,12 @@ pub(crate) fn tab_text(state: &UiState, tab: Tab) -> Result<String, String> {
             }
             table(&["tipo", "módulo + RVA", "endereço agora", "texto"], rows.into_iter().filter(|(kind, location, text)| filter.matches(&[kind, &location.display(), text])).map(|(kind, location, text)| vec![kind.to_string(), location.display(), state.address_of(location).map(hex).unwrap_or_else(|| "(módulo ausente)".into()), text]))
         }
+        Tab::Exception => match &snapshot.user.exception {
+            // O relatório decodificado inteiro (registro, exceções guardadas,
+            // tipo do C++), campo a campo.
+            Some(report) => format!("{report:#?}\n"),
+            None => return empty("Exceção"),
+        },
         Tab::Processes => table(&["PID", "EPROCESS", "CR3", "threads", "nome"], snapshot.processes.iter().map(|process| vec![process.pid.to_string(), hex(process.eprocess), format!("{:#x}", process.cr3), process.threads.to_string(), process.name.clone()])),
         Tab::Watch => {
             let mut text = table(&["expressão", "valor", "tipo"], snapshot.watches.iter().map(|watch| vec![watch.expression.clone(), match &watch.value { Ok(value) => value.clone(), Err(error) => format!("erro: {error}") }, watch.type_name.clone()]));

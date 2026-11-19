@@ -1,6 +1,7 @@
 //! Os painéis herdados do depurador gráfico do kernel, adaptados: código-
-//! fonte, observação, variáveis locais, módulos, processos, threads, objetos
-//! do NT, análise do bugcheck e o rastro de instruções.
+//! fonte, observação, variáveis locais, módulos, threads, objetos do NT,
+//! análise do bugcheck e o rastro de instruções (a lista de processos fica
+//! na aba Processos, `processes.rs`).
 
 use std::sync::Arc;
 
@@ -190,76 +191,6 @@ pub(crate) fn modules_panel(ui: &mut Ui, state: &mut UiState) {
                 ui.label(mono(module.symbols.to_string()));
                 ui.label(if module.pdb { RichText::new("sim").color(colors.green) } else if module.pending { RichText::new("baixando").color(colors.yellow) } else { RichText::new("-").color(colors.dim) });
                 ui.label(RichText::new(&module.source).color(colors.dim));
-                ui.end_row();
-            }
-        });
-    });
-}
-
-pub(crate) fn processes_panel(ui: &mut Ui, state: &mut UiState) {
-    let colors = palette(ui);
-    let snapshot = Arc::clone(&state.snapshot);
-    egui::ScrollArea::both().id_salt("processes").auto_shrink([false, false]).show(ui, |ui| {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Processos (clique: filtra as threads; clique duplo: depura o processo; botão direito: detalhes)").strong());
-            let current = snapshot.process.as_ref().map_or("o kernel".to_string(), |process| format!("{} (PID {})", process.name, process.pid));
-            ui.label(RichText::new(format!("contexto: {current}")).color(colors.blue));
-            if snapshot.process.is_some() && ui.button("Voltar ao kernel").clicked() {
-                state.requests.push(Request::SelectProcess(None));
-            }
-        });
-        egui::Grid::new("process-grid").num_columns(5).striped(true).spacing([10.0, 2.0]).show(ui, |ui| {
-            for title in ["PID", "EPROCESS", "CR3", "threads", "nome"] {
-                ui.label(RichText::new(title).strong());
-            }
-            ui.end_row();
-            for process in &snapshot.processes {
-                let selected = state.thread_filter == Some(process.pid);
-                let response = ui.selectable_label(selected, mono(process.pid.to_string()));
-                if response.double_clicked() {
-                    state.requests.push(Request::SelectProcess(Some(process.eprocess)));
-                    state.focus_tab.push(Tab::Cpu);
-                } else if response.clicked() {
-                    state.thread_filter = if selected { None } else { Some(process.pid) };
-                }
-                response.context_menu(|ui| {
-                    if ui.button("Depurar este processo (contexto de usuário)").clicked() {
-                        state.requests.push(Request::SelectProcess(Some(process.eprocess)));
-                        state.focus_tab.push(Tab::Cpu);
-                        ui.close();
-                    }
-                    if ui.button("!process").clicked() {
-                        state.query_kind = QueryKind::Process;
-                        state.query_argument = format!("{:#x}", process.eprocess);
-                        state.requests.push(Request::Query(QueryKind::Process, state.query_argument.clone()));
-                        state.focus_tab.push(Tab::NtObjects);
-                        ui.close();
-                    }
-                });
-                ui.label(mono(hex(process.eprocess)));
-                ui.label(mono(format!("{:x}", process.cr3)));
-                ui.label(mono(process.threads.to_string()));
-                ui.label(mono(&process.name).color(colors.blue));
-                ui.end_row();
-            }
-        });
-        ui.add_space(8.0);
-        ui.label(RichText::new("Processadores").strong());
-        egui::Grid::new("processor-grid").num_columns(6).striped(true).spacing([10.0, 2.0]).show(ui, |ui| {
-            for title in ["CPU", "IRQL", "KPCR", "thread", "RIP", "processo"] {
-                ui.label(RichText::new(title).strong());
-            }
-            ui.end_row();
-            for processor in &snapshot.processors {
-                let label = format!("{}{}", processor.number, if processor.owner { " *" } else { "" });
-                if ui.selectable_label(snapshot.view == View::Cpu(processor.number + 1), mono(label)).on_hover_text("registradores e pilha deste processador").clicked() {
-                    state.requests.push(Request::SelectCpu(processor.number + 1));
-                }
-                ui.label(mono(processor.irql.to_string()));
-                ui.label(mono(hex(processor.pcr)));
-                ui.label(mono(hex(processor.thread)));
-                ui.label(mono(hex(processor.rip)));
-                ui.label(mono(&processor.process));
                 ui.end_row();
             }
         });

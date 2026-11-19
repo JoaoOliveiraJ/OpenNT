@@ -37,7 +37,7 @@ use crate::layout::{PanelSizes, WindowGeometry};
 use crate::navigation::{GoToPalette, History, PendingGoTo, SymbolEntry};
 use crate::preferences::{Action, ModuleDb, Preferences, PreferencesUi};
 use crate::views::FilteredRows;
-use crate::{cpu, explorers, graph, monitors, panels, views};
+use crate::{cpu, explorers, graph, monitors, panels, processes, views};
 
 /// As abas.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -61,6 +61,7 @@ pub enum Tab {
     Patches,
     Comments,
     Processes,
+    Exception,
     Watch,
     NtObjects,
     Bugcheck,
@@ -74,7 +75,7 @@ pub enum Tab {
 }
 
 impl Tab {
-    pub const ALL: [Tab; 29] = [
+    pub const ALL: [Tab; 30] = [
         Tab::Cpu,
         Tab::Graph,
         Tab::Log,
@@ -94,6 +95,7 @@ impl Tab {
         Tab::Patches,
         Tab::Comments,
         Tab::Processes,
+        Tab::Exception,
         Tab::Watch,
         Tab::NtObjects,
         Tab::Bugcheck,
@@ -127,6 +129,7 @@ impl Tab {
             Tab::Patches => "Patches",
             Tab::Comments => "Comentários/Rótulos",
             Tab::Processes => "Processos",
+            Tab::Exception => "Exceção",
             Tab::Watch => "Observação",
             Tab::NtObjects => "Objetos do NT",
             Tab::Bugcheck => "Bugcheck",
@@ -455,6 +458,8 @@ pub struct UiState {
     /// As listas filtradas das abas Símbolos e Referências/Strings.
     pub(crate) symbol_rows: FilteredRows,
     pub(crate) reference_rows: [FilteredRows; 2],
+    // ---- processos de usuário e exceções ----
+    pub(crate) user: processes::UserUi,
 }
 
 impl UiState {
@@ -781,6 +786,7 @@ impl DebuggerApp {
                 copy_active_tab: false,
                 symbol_rows: FilteredRows::default(),
                 reference_rows: Default::default(),
+                user: processes::UserUi::default(),
             },
             persist: None,
             last_saved: String::new(),
@@ -1213,6 +1219,7 @@ impl DebuggerApp {
             self.state.prefs_ui.applied = Some(self.state.prefs.clone());
         }
         self.apply_session_settings();
+        processes::frame(&mut self.state);
         self.shortcuts(ui);
         // Ctrl+Shift+C: a aba da área com o foco (senão, a CPU).
         if std::mem::take(&mut self.state.copy_active_tab) {
@@ -2200,9 +2207,8 @@ impl TabViewer for Viewer<'_> {
             Tab::Trace => panels::trace_panel(ui, state),
             Tab::Patches => views::patches_tab(ui, state),
             Tab::Comments => views::comments_tab(ui, state),
-            Tab::Processes => {
-                panels::processes_panel(ui, state);
-            }
+            Tab::Processes => processes::processes_tab(ui, state),
+            Tab::Exception => processes::exception_tab(ui, state),
             Tab::Watch => {
                 panels::watch_panel(ui, state);
                 ui.separator();
