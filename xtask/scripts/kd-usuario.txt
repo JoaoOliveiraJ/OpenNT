@@ -1,0 +1,49 @@
+# Roteiro do teste `kd-usuario` (cargo xtask test-boot --kd=com2
+# --initial-process=smss --script=xtask/scripts/kd-usuario.txt): um
+# breakpoint de usuário num processo de verdade, o csrss.exe que o smss.exe
+# real cria. O breakpoint é adiado (a ntdll ainda não está no processo
+# quando ele é pedido), arma na carga da ntdll no csrss.exe e é de log: a
+# cada acerto o cliente registra a linha e continua, e o stub sai do
+# breakpoint por um passo da thread (o byte original por uma instrução, o
+# TF e o 0xCC de volta no #DB). O #DB desse passo é do depurador: não pode
+# chegar ao processo como STATUS_SINGLE_STEP (0x80000004), nem quando outra
+# thread sai de um breakpoint antes de ele chegar. O csrss.exe segue vivo
+# depois dos acertos e o boot chega ao fim do roteiro do smss.
+
+attach
+expect-stop SIGINT
+
+# Adiado, só no csrss.exe, com log, desligado depois de 200 acertos.
+bu /p csrss.exe ntdll!RtlAllocateHeap /log "heap tamanho {@r8:d}" /max 200
+expect modelo
+continue
+wait-serial /t 600000 SMSS_CSRSS_OK
+break
+expect-stop SIGINT
+
+# O breakpoint armou no csrss.exe e registrou acertos.
+expect-console heap tamanho
+bl
+expect acertos
+ps
+expect csrss.exe
+if serial-has "first chance 0x80000004" {
+    fail o passo do depurador chegou ao processo como STATUS_SINGLE_STEP
+}
+
+# Sem o breakpoint, o csrss.exe continua rodando.
+bc all
+continue
+sleep 3000
+break
+expect-stop SIGINT
+ps
+expect csrss.exe
+if serial-has "first chance 0x80000004" {
+    fail o passo do depurador chegou ao processo como STATUS_SINGLE_STEP
+}
+if serial-has "status=0x80000004" {
+    fail uma thread saiu com STATUS_SINGLE_STEP
+}
+
+detach
