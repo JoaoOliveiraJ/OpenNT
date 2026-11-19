@@ -19,7 +19,9 @@
 //!   (ou `cargo xtask debug ... --script=ARQ`): o teste automático, QEMU sem
 //!   tela e marcadores na COM1, com o roteiro rodando contra a COM2 em
 //!   paralelo; o roteiro falhando derruba o teste. Com `--connect`, o
-//!   roteiro roda contra um QEMU já aberto.
+//!   roteiro roda contra um QEMU já aberto. A linguagem dos roteiros é a
+//!   de `kd_client::kd_script`; a transcrição da sessão fica em
+//!   `kd-sessao.log`, ao lado do `serial.log`.
 //!
 //! O protocolo, os símbolos (`<build>/kernel.elf` e os PEs desta máquina),
 //! a pilha e os comandos são do crate `kd-client` (`tools/kd-client`), o
@@ -32,6 +34,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use kd_client::kd_script::ScriptOptions;
 use kd_client::rsp::Connection;
 use kd_client::Client;
 
@@ -42,13 +45,20 @@ fn open(address: &str, root: &Path, elf: &Path, deadline: Instant) -> Result<Cli
 }
 
 /// Roteiro contra o socket da COM2 (o lado do teste); `serial` é a saída
-/// da COM1, quando o QEMU é do próprio teste.
-pub fn run_script(address: &str, root: &Path, elf: &Path, script: &str, serial: Option<Arc<Mutex<String>>>) -> Result<(), String> {
+/// da COM1, quando o QEMU é do próprio teste. `options` traz o nome do
+/// roteiro (nas mensagens de erro) e a transcrição da sessão
+/// (`kd-sessao.log`), gravada à medida que o roteiro imprime.
+pub fn run_script(address: &str, root: &Path, elf: &Path, script: &str, serial: Option<Arc<Mutex<String>>>, options: &ScriptOptions) -> Result<(), String> {
     let mut client = open(address, root, elf, Instant::now() + Duration::from_secs(60))?;
     if let Some(serial) = serial {
         client.set_serial(serial);
     }
-    client.run_script(script)
+    client.run_script_with(script, options)
+}
+
+/// A transcrição da sessão de um roteiro: ao lado do `serial.log`.
+pub fn transcript_path(log: &Path) -> PathBuf {
+    log.with_file_name("kd-sessao.log")
 }
 
 /// A saída do DbgPrint que chegou, no terminal.

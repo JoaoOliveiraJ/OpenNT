@@ -117,7 +117,8 @@ test-boot:         --keys=TEXTO (\\n = Enter) --expect=TEXTO (repetivel)
                    --build-only (so monta a imagem do teste) --no-build (usa a imagem ja montada)
                    --image-dir=DIR (com --no-build: as imagens de DIR, com as opcoes de carga
                    deste teste numa copia do os.img em --build-dir, onde tambem ficam os logs)
-                   --script=ARQ (com --kd: roteiro do cliente do depurador em paralelo)
+                   --script=ARQ (com --kd: roteiro do cliente do depurador em paralelo; a
+                   transcricao da sessao fica em kd-sessao.log, ao lado do serial.log)
                    --capture=ARQ.png (no fim do teste, a tela do QEMU pelo screendump do QMP)
                    --watch-screen (le a tela durante o teste; FIRST_PIXEL_OK na serial quando
                    a tela grafica mostra pixels desenhados e LOGON_SCREEN_OK quando um quarto
@@ -436,7 +437,7 @@ fn execute(arguments: Arguments) -> Result<(), String> {
             if !options.kd.is_empty() && machine.kd_port.is_none() {
                 machine.kd_port = Some(qemu::free_port()?);
             }
-            let session = script_session(&arguments, &options, &machine, &images)?;
+            let session = script_session(&arguments, &options, &machine, &images, &log)?;
             // O volume de dados fica como o build o deixou: cada teste começa
             // dele, e execuções paralelas dividem o mesmo arquivo.
             let ntfs = images.join("ntfs.img");
@@ -469,7 +470,8 @@ fn execute(arguments: Arguments) -> Result<(), String> {
 
 /// `test-boot --kd=com2 --script=ARQ`: o roteiro do cliente do depurador
 /// roda contra a COM2 em paralelo ao teste (a falha dele derruba o teste).
-fn script_session(arguments: &Arguments, options: &BuildOptions, machine: &MachineOptions, images: &Path) -> Result<Option<qemu::Session>, String> {
+/// A transcrição da sessão fica ao lado do `log` (a serial).
+fn script_session(arguments: &Arguments, options: &BuildOptions, machine: &MachineOptions, images: &Path, log: &Path) -> Result<Option<qemu::Session>, String> {
     let Some(script) = &arguments.script else { return Ok(None) };
     let (Some(port), false) = (machine.kd_port, options.kd.is_empty()) else {
         return Err("--script exige --kd=com2 (o depurador do kernel)".into());
@@ -479,7 +481,8 @@ fn script_session(arguments: &Arguments, options: &BuildOptions, machine: &Machi
     let text = std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
     let elf = debug::kernel_elf(images);
     let address = format!("127.0.0.1:{port}");
-    Ok(Some(Box::new(move |serial| debug::run_script(&address, &root, &elf, &text, Some(serial)))))
+    let script_options = kd_client::kd_script::ScriptOptions { name: script.clone(), transcript: Some(debug::transcript_path(log)) };
+    Ok(Some(Box::new(move |serial| debug::run_script(&address, &root, &elf, &text, Some(serial), &script_options))))
 }
 
 /// `cargo xtask debug`: conecta a um QEMU aberto (`--connect`), roda um
@@ -493,7 +496,8 @@ fn debug_command(arguments: Arguments) -> Result<(), String> {
         return match &arguments.script {
             Some(script) => {
                 let text = std::fs::read_to_string(script).map_err(|error| format!("{script}: {error}"))?;
-                debug::run_script(address, &root, &elf, &text, None)
+                let script_options = kd_client::kd_script::ScriptOptions { name: script.clone(), transcript: Some(debug::transcript_path(&build_dir.join("serial.log"))) };
+                debug::run_script(address, &root, &elf, &text, None, &script_options)
             }
             None => debug::interactive(address, &root, &elf, arguments.machine.monitor_port.map(|port| format!("127.0.0.1:{port}")), None),
         };
