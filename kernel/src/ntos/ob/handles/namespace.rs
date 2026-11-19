@@ -247,6 +247,74 @@ pub fn create_link_from_kernel(output_handle: u64, access: u32, attributes: u64,
     create_link(output_handle, access, attributes, &text, false)
 }
 
+/// O OBJECT_ATTRIBUTES, o UNICODE_STRING e o texto de um nome de modo
+/// kernel numa alocação só, com a célula do handle de saída; o bloco sai no
+/// drop.
+struct KernelName {
+    block: u64,
+}
+
+impl KernelName {
+    fn new(root: u64, name: &str, attributes: u32) -> Option<Self> {
+        let units = name.encode_utf16().count() as u64;
+        if units * 2 > 0xFFFC {
+            return None;
+        }
+        let size = ObjectAttributes::SIZE + 8 + UnicodeString::SIZE + units * 2 + 2;
+        let block = guest::alloc_bytes(size);
+        if block == 0 {
+            return None;
+        }
+        guest::write_bytes(block, &vec![0u8; size as usize]);
+        let string = block + ObjectAttributes::SIZE + 8;
+        let text = string + UnicodeString::SIZE;
+        crate::ntos::rtl::guest_strings::write_wide_string(text, name);
+        crate::ntos::rtl::guest_strings::write_string_fields(string, (units * 2) as u16, (units * 2 + 2) as u16, text);
+        // SAFETY: bloco de kernel zerado com o tamanho do OBJECT_ATTRIBUTES.
+        let object_attributes = unsafe { ObjectAttributes::at(block) };
+        object_attributes.length.set(ObjectAttributes::SIZE as u32);
+        object_attributes.root_directory.set(root);
+        object_attributes.object_name.set(string);
+        object_attributes.attributes.set(attributes);
+        Some(Self { block })
+    }
+
+    fn attributes(&self) -> u64 {
+        self.block
+    }
+
+    fn handle_cell(&self) -> u64 {
+        self.block + ObjectAttributes::SIZE
+    }
+
+    fn handle(&self) -> u64 {
+        guest::read64(self.handle_cell())
+    }
+}
+
+impl Drop for KernelName {
+    fn drop(&mut self) {
+        guest::free_bytes(self.block);
+    }
+}
+
+/// ZwCreateDirectoryObject(&Handle, DesiredAccess, {RootDirectory, Name,
+/// Attributes}) de modo kernel: o handle (também com OBJ_OPENIF num nome que
+/// já existe) ou o NTSTATUS da falha.
+pub fn create_directory_from_kernel(root: u64, name: &str, access: u32, attributes: u32) -> Result<u64, u32> {
+    let Some(request) = KernelName::new(root, name, attributes) else { return Err(0xC000_009A) };
+    let status = open(request.handle_cell(), access, request.attributes(), "Directory", false, true);
+    if status as i32 >= 0 { Ok(request.handle()) } else { Err(status) }
+}
+
+/// ZwCreateSymbolicLinkObject de modo kernel com o destino em texto: o
+/// handle ou o NTSTATUS da falha.
+pub fn create_link_named_from_kernel(root: u64, name: &str, access: u32, attributes: u32, target: &str) -> Result<u64, u32> {
+    let Some(request) = KernelName::new(root, name, attributes) else { return Err(0xC000_009A) };
+    let status = create_link(request.handle_cell(), access, request.attributes(), target, false);
+    if status as i32 >= 0 { Ok(request.handle()) } else { Err(status) }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn open_inner(output_handle: u64, access: u32, attributes: u64, kind: &str, from_user_mode: bool, create: bool, link_target: Option<&str>, setup: Option<&mut Option<DirectorySetup>>, created: &mut Option<NodeId>) -> u32 {
     let input = match capture(attributes, from_user_mode) {
@@ -254,10 +322,11 @@ fn open_inner(output_handle: u64, access: u32, attributes: u64, kind: &str, from
         Err(status) => return status,
     };
     // A abertura procura também nos diretórios sombra; a criação não.
+    // OBJ_IGNORE_IMPERSONATED_DEVICEMAP: o `\??` pelo mapa do processo.
     let (found, rest) = if create {
         object_manager::resolve_from(&input.name, 0, input.case_insensitive, kind == "SymbolicLink", input.start)
     } else {
-        object_manager::resolve_open_from(&input.name, input.case_insensitive, kind == "SymbolicLink", input.start, from_user_mode)
+        object_manager::resolve_open_with(&input.name, input.case_insensitive, kind == "SymbolicLink", input.start, from_user_mode, input.flags & 0x800 != 0)
     };
     if rest.is_some_and(|rest| !rest.is_empty()) {
         return 0xC000_003A;
@@ -270,7 +339,10 @@ fn open_inner(output_handle: u64, access: u32, attributes: u64, kind: &str, from
         if node.is_none() {
             let mut parts: Vec<&str> = input.name.split('\\').filter(|part| !part.is_empty()).collect();
             let Some(name) = parts.pop() else { return 0xC000_0033 };
-            let (parent, parent_rest) = object_manager::resolve_from(&parts.join("\\"), 0, input.case_insensitive, false, input.start);
+            // O pai de um nome absoluto continua absoluto: `\??\X` tem o
+            // pai `\??`, o diretório de devices DOS de quem cria.
+            let parent_path = if input.name.starts_with('\\') { alloc::format!("\\{}", parts.join("\\")) } else { parts.join("\\") };
+            let (parent, parent_rest) = object_manager::resolve_from(&parent_path, 0, input.case_insensitive, false, input.start);
             let parent = parent.filter(|&parent| object_manager::node(parent).is_some_and(|node| node.type_name == "Directory") && parent_rest.is_none());
             let Some(parent) = parent else { return 0xC000_003A };
             // DIRECTORY_CREATE_SUBDIRECTORY ou DIRECTORY_CREATE_OBJECT no pai

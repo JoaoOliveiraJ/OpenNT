@@ -3381,10 +3381,28 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     namespace privado, o caminho começa por um componente com o nó e um
     segredo do kernel, que a busca resolve de volta ao diretório; o
     NtQueryObject continua sem nome para esses objetos.
-  - Fora do modelo: o `\??` é um link real sem DEVICE_MAP por LUID, o
-    SessionId do diretório não restringe criações e o bit 8 não muda a
-    herança dos descritores. Teste: `namespace`, `private_namespaces` e
-    `shadow_directories` na fase 3.
+  - Mapas de devices DOS (`ob/device_map.rs`, `se/logon_session.rs`): o
+    `\??` não é um objeto. Um nome absoluto `\??\X` (e o próprio `\??`)
+    começa no DosDevicesDirectory do DEVICE_MAP de quem procura
+    (ObpReferenceDeviceMap): o da sessão de logon do token de impersonação,
+    ou o EPROCESS.DeviceMap, preenchido no primeiro uso pelo token primário
+    (ObSetCurrentProcessDeviceMap). O token do SYSTEM usa o mapa do
+    `\GLOBAL??`, ligado ao System na entrada da fase 1
+    (ObpSetSiloDeviceMap); outra sessão de logon recebe o
+    `\Sessions\0\DosDevices\<LUID>` na primeira vez (SeGetTokenDeviceMap,
+    com o link `Global`; o `\Sessions\0\DosDevices` é do csrss da sessão 0).
+    Na busca de abertura, o nome que falta num diretório sem sombra com
+    DeviceMap vem do GlobalDosDevicesDirectory (o `\GLOBAL??`); a busca de
+    quem cria não sai do diretório. O `\DosDevices` da raiz é um link para
+    `\??`. O ProcessDeviceMap consulta (só o processo corrente) e troca
+    (ObSetProcessDeviceMap) o mapa; o processo solta o dele no fim e na
+    troca do token primário, a sessão de logon no fim dela (os links do
+    diretório viram temporários). O DriveMap e o DriveType vêm dos links
+    `X:` do diretório na consulta. Teste: `ntos/test/dos_device_maps.rs`
+    na fase 6.
+  - Fora do modelo: o SessionId do diretório não restringe criações e o
+    bit 8 não muda a herança dos descritores. Teste: `namespace`,
+    `private_namespaces` e `shadow_directories` na fase 3.
 - **Handles e informações entre processos** (`ps/user/handles.rs`):
   - NtDuplicateObject é o ObDuplicateObject: os handles do processo de
     origem e do de destino saem da tabela de quem chama e pedem
@@ -3635,7 +3653,7 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     Session Manager (`cm/session_manager.rs`: `D:\pagefile.sys 192 256`).
     Antes ele abre `Control\CrashControl` e lista os volumes com o
     ProcessDeviceMap (`ob/device_map.rs`, montado a partir dos links `X:`
-    do `\GLOBAL??`).
+    do `\??` do processo, o `\GLOBAL??` para o SYSTEM).
   - Até 16 arquivos, cada um com um `_MMPAGING_FILE` do PDB no pool. O
     espaço livre é um bitmap do tamanho máximo; as páginas 0 e 1 ficam
     reservadas.
@@ -4245,8 +4263,8 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   csrss a sessão do wininit.exe: o csrss põe a `\Windows\ApiPort` como
   ProcessExceptionPort do processo novo, lê ThreadTimes e
   ThreadIsTerminated (NtQueryInformationThread) e retoma a thread; a
-  ProcessDeviceMap do NtQueryInformationProcess dá as letras do
-  `\GLOBAL??` (`ob/device_map.rs`). O wininit.exe conecta à
+  ProcessDeviceMap do NtQueryInformationProcess dá as letras do `\??` do
+  processo corrente (`ob/device_map.rs`). O wininit.exe conecta à
   `\Windows\ApiPort` (a ntdll pelo LPC, com PORT_VIEW, e o csrss, servidor
   ALPC, aceita com a vista), sobe a classe de prioridade
   (ProcessPriorityClass), registra o servidor RPC `\RPC Control\WMsgKRpc…`

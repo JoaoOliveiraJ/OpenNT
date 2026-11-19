@@ -71,6 +71,22 @@
 //! de logon do token (STATUS_NO_SUCH_LOGON_SESSION se não existe) e grava o
 //! SessionId no token da sessão e no da sessão irmã, quando existem — não no
 //! token do handle.
+//!
+//! O mapa de devices DOS da sessão (SEP_LOGON_SESSION_REFERENCES.pDeviceMap,
+//! `ob/device_map.rs`): o SeGetTokenDeviceMap (rva 0x6770fc) recusa um token
+//! sem a sessão (TOKEN_SESSION_NOT_REFERENCED ou sem LogonSession:
+//! STATUS_NO_SUCH_LOGON_SESSION) e devolve o mapa da sessão, sem referência;
+//! na primeira vez cria o `\Sessions\0\DosDevices\%08x-%08x` (HighPart e
+//! LowPart do AuthenticationId; OBJ_CASE_INSENSITIVE | OBJ_OPENIF |
+//! OBJ_KERNEL_HANDLE, sem OBJ_PERMANENT), o ObpSetDeviceMap dele sem processo
+//! com a Flag 2 (o global é o `\GLOBAL??`) e, dentro, o link permanente
+//! `Global` para `\Global??`; o mapa entra na sessão por compare-exchange (o
+//! perdedor solta o seu). O `\Sessions\0\DosDevices` é do csrss da sessão 0
+//! (CsrCreateSessionObjectDirectory); sem ele a criação falha e o `\??` de
+//! quem não é SYSTEM fica sem mapa, como no NT. Quando a sessão sai
+//! (SepDeReferenceLogonSession e SepDeleteLogonSessionTrack), o
+//! SepCleanupLUIDDeviceMapDirectory (rva 0x6f78cc) torna temporários os
+//! links do diretório e o mapa é solto.
 
 use alloc::vec::Vec;
 
@@ -127,11 +143,14 @@ struct LogonSession {
     buddy_logon_id: u64,
     account_name: Vec<u16>,
     authority_name: Vec<u16>,
+    /// pDeviceMap: o DEVICE_MAP do `\??` da sessão, com a referência dela
+    /// (0 até o primeiro SeGetTokenDeviceMap).
+    device_map: u64,
 }
 
 impl LogonSession {
     fn new(logon_id: u64, server_silo: u64) -> Self {
-        Self { logon_id, reference_count: 1, flags: 0, server_silo, token: 0, buddy_logon_id: 0, account_name: Vec::new(), authority_name: Vec::new() }
+        Self { logon_id, reference_count: 1, flags: 0, server_silo, token: 0, buddy_logon_id: 0, account_name: Vec::new(), authority_name: Vec::new(), device_map: 0 }
     }
 }
 
@@ -350,6 +369,7 @@ pub fn delete_track(logon_id: u64) -> u32 {
     });
     match removed {
         Ok(session) => {
+            release_device_map(&session);
             if session.token != 0 {
                 let _ = tokens::release(session.token);
             }
@@ -410,6 +430,7 @@ pub fn dereference_for_token(logon_id: u64, server_silo: u64) {
     if session.token != 0 {
         let _ = tokens::release(session.token);
     }
+    release_device_map(&session);
     if session.flags & SESSION_TERMINATION_NOTIFY != 0 {
         inform_file_systems(session.logon_id, session.server_silo);
     }
@@ -613,4 +634,104 @@ pub fn terminated_routines() -> Vec<(u64, u64)> {
 /// ReferenceCount e Flags da sessão (para o autoteste).
 pub fn reference_state(logon_id: u64, server_silo: u64) -> Option<(u64, u32)> {
     find(logon_id, server_silo).map(|session| (session.reference_count, session.flags))
+}
+
+/// O pDeviceMap da sessão (0 sem mapa; `None` sem a sessão).
+pub fn device_map(logon_id: u64, server_silo: u64) -> Option<u64> {
+    find(logon_id, server_silo).map(|session| session.device_map)
+}
+
+/// O diretório de devices DOS de um LogonId: `\Sessions\<sessão de
+/// serviço>\DosDevices\<HighPart>-<LowPart>`, com a sessão de serviço 0 do
+/// silo hospedeiro (PsGetServerSiloServiceSessionId).
+pub fn dos_devices_directory_name(logon_id: u64) -> alloc::string::String {
+    alloc::format!("\\Sessions\\0\\DosDevices\\{:08x}-{:08x}", logon_id >> 32, logon_id & 0xFFFF_FFFF)
+}
+
+/// O status de uma falha interna como NTSTATUS (STATUS_UNSUCCESSFUL sem um).
+fn status_of(error: KernelError) -> u32 {
+    if error.status != 0 { error.status } else { 0xC000_0001 }
+}
+
+/// SeGetTokenDeviceMap(Token, DeviceMap*): o mapa de devices DOS da sessão
+/// de logon do token, sem referência própria (a sessão o retém).
+pub fn token_device_map(token: u64) -> Result<u64, u32> {
+    use crate::ntos::ob::device_map;
+    use crate::ntos::ob::handles::namespace as namespace_handles;
+    /// DIRECTORY_ALL_ACCESS, SYMBOLIC_LINK_ALL_ACCESS e os atributos do NT:
+    /// OBJ_CASE_INSENSITIVE | OBJ_OPENIF | OBJ_KERNEL_HANDLE (0x2C0), e o
+    /// link com OBJ_PERMANENT (0x2D0).
+    const DIRECTORY_ALL_ACCESS: u32 = 0xF000F;
+    const SYMBOLIC_LINK_ALL_ACCESS: u32 = 0xF0001;
+    const DIRECTORY_ATTRIBUTES: u32 = 0x2C0;
+    const LINK_ATTRIBUTES: u32 = 0x2D0;
+    if token == 0 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    if tokens::body(token).token_flags.get() & tokens::TOKEN_SESSION_NOT_REFERENCED != 0 {
+        return Err(STATUS_NO_SUCH_LOGON_SESSION);
+    }
+    let Some(Some((logon_id, server_silo))) = tokens::with(token, |record| record.logon_reference) else { return Err(STATUS_NO_SUCH_LOGON_SESSION) };
+    match device_map(logon_id, server_silo) {
+        None => return Err(STATUS_NO_SUCH_LOGON_SESSION),
+        Some(existing) if existing != 0 => return Ok(existing),
+        Some(_) => {}
+    }
+    let authentication_id = tokens::with(token, |record| record.authentication_id).unwrap_or(logon_id);
+    let directory = namespace_handles::create_directory_from_kernel(0, &dos_devices_directory_name(authentication_id), DIRECTORY_ALL_ACCESS, DIRECTORY_ATTRIBUTES)?;
+    let result = (|| -> Result<u64, u32> {
+        let created = match device_map::set_device_map(0, directory, 0, device_map::SET_GLOBAL_DIRECTORY) {
+            Ok(Ok(created)) => created,
+            Ok(Err(status)) => return Err(status),
+            Err(error) => return Err(status_of(error)),
+        };
+        match namespace_handles::create_link_named_from_kernel(directory, "Global", SYMBOLIC_LINK_ALL_ACCESS, LINK_ATTRIBUTES, "\\Global??") {
+            Ok(link) => {
+                let _ = crate::ntos::ob::close::close(link, Some(0));
+            }
+            Err(status) => {
+                device_map::dereference(created);
+                return Err(status);
+            }
+        }
+        let installed = with_sessions(|sessions| {
+            let session = sessions.iter_mut().find(|session| session.logon_id == logon_id && session.server_silo == server_silo)?;
+            if session.device_map == 0 {
+                session.device_map = created;
+            }
+            Some(session.device_map)
+        });
+        if installed != Some(created) {
+            device_map::dereference(created);
+        }
+        installed.ok_or(STATUS_NO_SUCH_LOGON_SESSION)
+    })();
+    let _ = crate::ntos::ob::close::close(directory, Some(0));
+    result
+}
+
+/// SepCleanupLUIDDeviceMapDirectory(LogonId*, Silo): os links do diretório
+/// de devices DOS da sessão viram temporários (o ZwMakeTemporaryObject de
+/// cada um, aberto e fechado em seguida) e saem do namespace.
+fn cleanup_device_map_directory(logon_id: u64) {
+    use crate::ntos::ob::object_manager;
+    let Some(directory) = object_manager::resolve_from(&dos_devices_directory_name(logon_id), 0, true, false, object_manager::ROOT).0 else { return };
+    let children = object_manager::node(directory).and_then(|node| node.children).unwrap_or_default();
+    for (_, child) in children {
+        if object_manager::node(child).is_none_or(|node| node.type_name != "SymbolicLink") {
+            continue;
+        }
+        if let Ok(Some(body)) = crate::ntos::ob::objects::namespace::ensure(child) {
+            crate::ntos::ob::handles::namespace::make_temporary_by_pointer(body);
+        }
+    }
+}
+
+/// A saída do mapa de uma sessão apagada: a limpeza do diretório e o
+/// ObfDereferenceDeviceMap.
+fn release_device_map(session: &LogonSession) {
+    if session.device_map != 0 {
+        cleanup_device_map_directory(session.logon_id);
+        crate::ntos::ob::device_map::dereference(session.device_map);
+    }
 }

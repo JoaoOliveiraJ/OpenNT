@@ -7,7 +7,7 @@
 //! `query_object` e os handles dos objetos inseridos em `handles::inserted`.
 
 use crate::ntos::init::exports::{signed_status, Call, Group};
-use crate::ntos::ob::{object_manager, object_open, object_reference, object_security, reference_trace};
+use crate::ntos::ob::{object_open, object_reference, object_security, reference_trace};
 use crate::rtl::KernelError;
 
 fn reference_object(call: &Call) -> Result<u64, KernelError> {
@@ -42,8 +42,17 @@ fn query_name_string(call: &Call) -> Result<u64, KernelError> {
     Ok(signed_status(crate::ntos::ob::query_object::query_name_string(call.arg(1), call.arg(2), call.arg(3) as u32, call.arg(4))))
 }
 
-fn is_dos_device_locally_mapped(_: &Call) -> Result<u64, KernelError> {
-    Ok(object_manager::is_dos_device_locally_mapped() as u64)
+/// ObIsDosDeviceLocallyMapped(Index, DosDeviceState*).
+fn is_dos_device_locally_mapped(call: &Call) -> Result<u64, KernelError> {
+    use crate::ntos::inc::field::{Field, NtStruct};
+    Ok(signed_status(match crate::ntos::ob::device_map::is_dos_device_locally_mapped(call.arg(1) as u32) {
+        Ok(mapped) => {
+            // SAFETY: PBOOLEAN de saída de um chamador de modo kernel.
+            unsafe { Field::<u8>::at(call.arg(2)) }.set(mapped as u8);
+            0
+        }
+        Err(status) => status,
+    }))
 }
 
 /// ObSetSecurityObjectByPointer(Object, SecurityInformation, SecurityDescriptor).

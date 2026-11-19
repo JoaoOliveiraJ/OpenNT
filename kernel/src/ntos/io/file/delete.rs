@@ -45,7 +45,7 @@ fn has_reparse(name: &str, insensitive: bool, start: NodeId) -> bool {
             None => String::from(part),
             Some(previous) => alloc::format!("{previous}\\{part}"),
         };
-        let found = object_manager::resolve_from(&next, 0, insensitive, true, start).0.and_then(object_manager::node);
+        let found = object_manager::resolve_lookup_from(&next, insensitive, true, start).0.and_then(object_manager::node);
         if found.as_ref().is_some_and(|node| node.type_name == "SymbolicLink") {
             return true;
         }
@@ -207,7 +207,7 @@ pub fn remove(attributes: u64) -> Result<u32, KernelError> {
         if flags & 0x1000 != 0 && has_reparse(&name, flags & 0x40 != 0, start) {
             return Ok(0xC000_050B);
         }
-        let (node, rest) = object_manager::resolve_from(&name, 0, flags & 0x40 != 0, false, start);
+        let (node, rest) = object_manager::resolve_lookup_from(&name, flags & 0x40 != 0, false, start);
         let Some(node) = node.and_then(object_manager::node) else { return Ok(0xC000_003A) };
         let Some(volume) = node.mount else { return Ok(if node.type_name == "Device" { 0xC000_0010 } else { 0xC000_0024 }) };
         remove_from_volume(volume, &alloc::format!("/{}", rest.unwrap_or_default()), 0)

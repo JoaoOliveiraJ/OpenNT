@@ -3342,7 +3342,12 @@ fn ob_group_exports(assert: Assert) {
     let merged = status(call_export("ObSetSecurityObjectByPointer", &[device, 4, new_descriptor]));
     let current = object_security::security_descriptor(device);
     let current_dacl = current.and_then(crate::ntos::se::query_descriptor::read_descriptor).and_then(|descriptor| descriptor.dacl);
-    assert(built && original.is_some() && merged == 0 && current.is_some_and(|current| current != new_descriptor && Some(current) != original) && current_dacl.is_some_and(|acl| acl.len() >= 28 && acl[4..6] == [1, 0] && acl[16..28] == [1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0]) && call_export("ObIsDosDeviceLocallyMapped", &[0]) == Some(0), "ob: ObSetSecurityObjectByPointer mescla a DACL numa copia e device maps");
+    // ObIsDosDeviceLocallyMapped(Index, DosDeviceState*): Index de 1 a 26;
+    // nenhuma sessão de logon tem C: no próprio `\??`.
+    guest::write8(security + 0xF0, 0xAA);
+    let bad_index = status(call_export("ObIsDosDeviceLocallyMapped", &[0, security + 0xF0])) == 0xC000_000D && status(call_export("ObIsDosDeviceLocallyMapped", &[27, security + 0xF0])) == 0xC000_000D && guest::read8(security + 0xF0) == 0xAA;
+    let drive_c = status(call_export("ObIsDosDeviceLocallyMapped", &[3, security + 0xF0])) == 0 && guest::read8(security + 0xF0) == 0;
+    assert(built && original.is_some() && merged == 0 && current.is_some_and(|current| current != new_descriptor && Some(current) != original) && current_dacl.is_some_and(|acl| acl.len() >= 28 && acl[4..6] == [1, 0] && acl[16..28] == [1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0]) && bad_index && drive_c, "ob: ObSetSecurityObjectByPointer mescla a DACL numa copia e device maps");
     guest::free_bytes(security);
     reference_trace::clear();
     reference_trace::set_enabled(true);
@@ -16342,6 +16347,7 @@ pub fn run(assert: Assert) {
     super::security_session_exports::run(assert);
     super::security_uac_tokens::run(assert);
     super::lsa_logon_notice::run(assert);
+    super::dos_device_maps::run(assert);
     super::fsrtl_cc_file_exports::run(assert);
     super::ke_ex_po_io_exports::run(assert);
     debug_print!("PHASE6_SELFTEST_OK");

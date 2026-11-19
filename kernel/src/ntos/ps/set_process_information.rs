@@ -75,6 +75,15 @@
 //!   ou sai do registro do processo (`rtl/dynamic_function_table`). Não há
 //!   consulta: o NtQueryInformationProcess responde STATUS_INVALID_INFO_CLASS.
 //!
+//! - ProcessDeviceMap (23): o HANDLE de um diretório (8 bytes; outro tamanho
+//!   dá STATUS_INFO_LENGTH_MISMATCH) que vira o `\??` do processo. Como no
+//!   ramo da classe do 19041 (rva 0x658b32): um token sandbox no modo
+//!   anterior (RtlIsSandboxedToken) é STATUS_ACCESS_DENIED, o processo com
+//!   PROCESS_SET_INFORMATION e o ObSetProcessDeviceMap com o handle e o modo
+//!   anterior (`ob/device_map.rs`; o csrss põe assim o
+//!   `\Sessions\<n>\DosDevices` nos processos de uma sessão de Terminal
+//!   Server).
+//!
 //! Em UserMode, antes da classe, o buffer passa pelo ProbeForRead com o
 //! alinhamento da classe (STATUS_DATATYPE_MISALIGNMENT,
 //! STATUS_ACCESS_VIOLATION), como no início do NtSetInformationProcess.
@@ -92,6 +101,7 @@ use crate::ntos::rtl::dynamic_function_table;
 use crate::rtl::KernelError;
 
 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
 const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
 const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
@@ -120,6 +130,7 @@ pub const PROCESS_BASE_PRIORITY: u32 = 5;
 pub const PROCESS_EXCEPTION_PORT: u32 = 8;
 pub const PROCESS_DEFAULT_HARD_ERROR_MODE: u32 = 12;
 pub const PROCESS_PRIORITY_CLASS: u32 = 18;
+pub const PROCESS_DEVICE_MAP: u32 = 23;
 pub const PROCESS_FOREGROUND_INFORMATION: u32 = 25;
 pub const PROCESS_BREAK_ON_TERMINATION: u32 = 29;
 pub const PROCESS_DEBUG_FLAGS: u32 = 31;
@@ -134,7 +145,7 @@ pub const PROCESS_ENERGY_TRACKING_STATE: u32 = 82;
 /// ([`set_dynamic_function_table`]).
 pub const PROCESS_DYNAMIC_FUNCTION_TABLE_INFORMATION: u32 = 53;
 /// As classes desta área.
-pub const CLASSES: [u32; 11] = [PROCESS_BASE_PRIORITY, PROCESS_EXCEPTION_PORT, PROCESS_DEFAULT_HARD_ERROR_MODE, PROCESS_PRIORITY_CLASS, PROCESS_FOREGROUND_INFORMATION, PROCESS_BREAK_ON_TERMINATION, PROCESS_DEBUG_FLAGS, PROCESS_HANDLE_CHECKING_MODE, PROCESS_RAISE_UM_EXCEPTION_ON_INVALID_HANDLE_CLOSE, PROCESS_SUBSYSTEM_PROCESS, PROCESS_ENERGY_TRACKING_STATE];
+pub const CLASSES: [u32; 12] = [PROCESS_BASE_PRIORITY, PROCESS_EXCEPTION_PORT, PROCESS_DEFAULT_HARD_ERROR_MODE, PROCESS_PRIORITY_CLASS, PROCESS_DEVICE_MAP, PROCESS_FOREGROUND_INFORMATION, PROCESS_BREAK_ON_TERMINATION, PROCESS_DEBUG_FLAGS, PROCESS_HANDLE_CHECKING_MODE, PROCESS_RAISE_UM_EXCEPTION_ON_INVALID_HANDLE_CLOSE, PROCESS_SUBSYSTEM_PROCESS, PROCESS_ENERGY_TRACKING_STATE];
 /// EPROCESS.Flags3.SubsystemProcess.
 const SUBSYSTEM_PROCESS_FLAG: u32 = 1 << 6;
 /// O PROCESS_ENERGY_TRACKING_STATE capturado (o resto da cópia local fica
@@ -393,6 +404,28 @@ pub fn set_information(mode: u8, class: u32, buffer: u64, length: u32, process_o
             Ok(0)
         }
         PROCESS_EXCEPTION_PORT => set_exception_port(mode, buffer, length, process_of),
+        PROCESS_DEVICE_MAP => {
+            if length != 8 {
+                return Ok(STATUS_INFO_LENGTH_MISMATCH);
+            }
+            let directory = if mode != 0 {
+                match guest::try_read::<u64>(buffer) {
+                    Ok(handle) => handle,
+                    Err(_) => return Ok(STATUS_ACCESS_VIOLATION),
+                }
+            } else {
+                // SAFETY: buffer de entrada de um chamador de modo kernel.
+                unsafe { Field::<u64>::at(buffer) }.get()
+            };
+            if crate::ntos::rtl::security::is_sandboxed_token(0, mode).unwrap_or(false) {
+                return Ok(STATUS_ACCESS_DENIED);
+            }
+            let process = match process_of(PROCESS_SET_INFORMATION) {
+                Ok(process) => process,
+                Err(status) => return Ok(status),
+            };
+            crate::ntos::ob::device_map::set_process_device_map(process, directory, mode)
+        }
         PROCESS_PRIORITY_CLASS => {
             if length != 2 {
                 return Ok(STATUS_INFO_LENGTH_MISMATCH);

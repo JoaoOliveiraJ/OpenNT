@@ -88,7 +88,9 @@ pub fn register_device_interface(physical: u64, guid: u64, reference: u64, outpu
     let base = symbolic_link_base(&link);
     let known = DEVICE_INTERFACES.lock().keys().any(|registered| symbolic_link_base(registered) == base);
     if !known {
-        if let Err(error) = object_manager::create_symlink(base, &target) {
+        // Os links de interface ficam no \GLOBAL?? (o \?? é o mapa de quem chama).
+        let global = base.strip_prefix("\\??\\").or_else(|| base.strip_prefix("\\DosDevices\\")).map_or_else(|| String::from(base), |rest| format!("\\GLOBAL??\\{rest}"));
+        if let Err(error) = object_manager::create_symlink(&global, &target) {
             return device::kernel_status(error);
         }
     }

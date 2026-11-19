@@ -12,6 +12,10 @@
 
 pub fn init() {
     debug_print!("[boot] fase 1: I/O manager + drivers + servicos");
+    // ObpSetSiloDeviceMap: o \GLOBAL?? vira o mapa de devices DOS do sistema
+    // e do System, antes de qualquer nome \?? (o handle de kernel do mapa
+    // pede a tabela de handles do System).
+    crate::ntos::ob::device_map::initialize().unwrap_or_else(|error| panic!("mapa de devices DOS: {error}"));
     crate::ntos::io::io_manager::init().unwrap_or_else(|error| panic!("I/O Manager: {error}"));
     // Exports do kernel para drivers: resolvedor do loader e trampolins.
     crate::ntos::init::exports::init();
@@ -51,9 +55,9 @@ pub fn init() {
             Ok(volume) => {
                 crate::drivers::fs::ntfs::set_mounted(Some(volume));
                 let link_drives = |device: alloc::string::String| -> Result<(), crate::rtl::KernelError> {
-                    crate::ntos::ob::object_manager::create_symlink("\\DosDevices\\D:", &device)?;
+                    crate::ntos::ob::object_manager::create_symlink("\\GLOBAL??\\D:", &device)?;
                     if crate::ntos::init::boot_config::smss_boot() {
-                        crate::ntos::ob::object_manager::create_symlink("\\DosDevices\\C:", &device)?;
+                        crate::ntos::ob::object_manager::create_symlink("\\GLOBAL??\\C:", &device)?;
                     }
                     Ok(())
                 };

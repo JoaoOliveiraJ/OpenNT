@@ -331,7 +331,15 @@ fn name_target(root: u64, name: &str, from_user_mode: bool) -> Result<(object_ma
     if leaf.is_empty() {
         return Err(STATUS_OBJECT_NAME_INVALID);
     }
-    let directory = if parent.is_empty() { Some(start) } else { object_manager::resolve_from(parent, 0, true, false, start).0 };
+    // O pai de um nome absoluto continua absoluto: `\??\X` tem o pai `\??`,
+    // o diretório de devices DOS de quem cria (`ob/device_map.rs`).
+    let directory = if parent.is_empty() {
+        Some(start)
+    } else if name.starts_with('\\') {
+        object_manager::resolve_from(&alloc::format!("\\{parent}"), 0, true, false, start).0
+    } else {
+        object_manager::resolve_from(parent, 0, true, false, start).0
+    };
     let directory = directory.filter(|&node| object_manager::node(node).is_some_and(|node| node.children.is_some() && node.mount.is_none())).ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
     Ok((directory, alloc::string::String::from(leaf)))
 }

@@ -823,8 +823,10 @@ fn nt_query_information_process(handle: u64, class: u64, buffer: u64, length: u6
         // alinhamento 4; o PROCESS_DEVICEMAP_INFORMATION de 0x24 bytes ou o
         // _EX de 0x30 com Flags (só PROCESS_LUID_DOSDEVICES_ONLY), outro
         // comprimento dá STATUS_INFO_LENGTH_MISMATCH; o handle com
-        // PROCESS_QUERY_INFORMATION; o DriveMap e o DriveType[32] no buffer e
-        // o comprimento no ReturnLength.
+        // PROCESS_QUERY_INFORMATION e o ObQueryDeviceMapInformation do
+        // processo dele (outro que não o corrente é STATUS_INVALID_PARAMETER);
+        // o DriveMap e o DriveType[32] no buffer e o comprimento no
+        // ReturnLength.
         23 => {
             if length != 0 && buffer & 3 != 0 {
                 return Ok(0x8000_0002);
@@ -843,12 +845,15 @@ fn nt_query_information_process(handle: u64, class: u64, buffer: u64, length: u6
                 }
                 _ => return Ok(STATUS_INFO_LENGTH_MISMATCH),
             };
-            if handle as u32 != u32::MAX {
-                if let Err(status) = super::handles::process_pointer(handle, 0x400) {
-                    return Ok(status);
+            let target = if handle as u32 != u32::MAX {
+                match super::handles::process_pointer(handle, 0x400) {
+                    Ok(target) => target,
+                    Err(status) => return Ok(status),
                 }
-            }
-            let information = match crate::ntos::ob::device_map::query(flags) {
+            } else {
+                crate::ntos::ps::process::get_current_process()
+            };
+            let information = match crate::ntos::ob::device_map::query(target, flags) {
                 Ok(information) => information,
                 Err(status) => return Ok(status),
             };

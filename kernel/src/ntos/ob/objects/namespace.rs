@@ -1,14 +1,15 @@
 //! Corpos nativos de diretório e link simbólico.
 //!
 //! O nó do namespace é o dono compartilhado por aberturas por nome e por
-//! ponteiro. O corpo privado (0x48 bytes) guarda referências (+0), handles
+//! ponteiro. O corpo privado (0x50 bytes) guarda referências (+0), handles
 //! (+8), permanência (+12), o UNICODE_STRING do destino do link (+0x10), o
 //! número de filhos (+0x20) e, num diretório, os campos do OBJECT_DIRECTORY
 //! que o OpenNT usa: SessionId (+0x28), Flags (+0x2C), SessionObject
-//! (+0x30), ShadowDirectory (+0x38, o corpo do diretório sombra, retido) e
+//! (+0x30), ShadowDirectory (+0x38, o corpo do diretório sombra, retido),
 //! NamespaceEntry (+0x40, o OBJECT_NAMESPACE_ENTRY de um namespace
-//! privado). As contagens vivem só na memória do corpo e mudam por operações
-//! atômicas, como o PointerCount/HandleCount do NT.
+//! privado) e DeviceMap (+0x48, o DEVICE_MAP de um diretório de devices
+//! DOS, `ob/device_map.rs`). As contagens vivem só na memória do corpo e
+//! mudam por operações atômicas, como o PointerCount/HandleCount do NT.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -49,13 +50,17 @@ struct NamespaceBody {
     /// OBJECT_DIRECTORY.NamespaceEntry: o OBJECT_NAMESPACE_ENTRY de um
     /// namespace privado registrado (0 fora da tabela).
     namespace_entry: Field<u64>,
+    /// OBJECT_DIRECTORY.DeviceMap: o DEVICE_MAP cujo DosDevicesDirectory é
+    /// este diretório (sem referência própria: o mapa retém o diretório e
+    /// zera o campo ao sair), sob o DeviceMapLock.
+    device_map: Field<u64>,
 }
 
 // SAFETY: #[repr(C)] só de células.
 unsafe impl NtStruct for NamespaceBody {}
 
 const _: () = {
-    assert!(core::mem::size_of::<NamespaceBody>() == 0x48);
+    assert!(core::mem::size_of::<NamespaceBody>() == 0x50);
     assert!(core::mem::offset_of!(NamespaceBody, link_target) == 0x10);
     assert!(core::mem::offset_of!(NamespaceBody, children) == 0x20);
     assert!(core::mem::offset_of!(NamespaceBody, session_id) == 0x28);
@@ -63,6 +68,7 @@ const _: () = {
     assert!(core::mem::offset_of!(NamespaceBody, session_object) == 0x30);
     assert!(core::mem::offset_of!(NamespaceBody, shadow_directory) == 0x38);
     assert!(core::mem::offset_of!(NamespaceBody, namespace_entry) == 0x40);
+    assert!(core::mem::offset_of!(NamespaceBody, device_map) == 0x48);
 };
 
 /// SessionId de diretório sem sessão.
@@ -271,6 +277,19 @@ pub fn namespace_entry(pointer: u64) -> u64 {
 pub fn set_namespace_entry(pointer: u64, entry: u64) -> Result<(), KernelError> {
     assert_live(pointer)?;
     body(pointer).namespace_entry.set(entry);
+    Ok(())
+}
+
+/// OBJECT_DIRECTORY.DeviceMap (0 sem mapa, ou para outro corpo).
+pub fn device_map(pointer: u64) -> u64 {
+    if BODIES.lock().get(&pointer).is_some_and(|body| body.directory) { body(pointer).device_map.get() } else { 0 }
+}
+
+/// Grava o DeviceMap de um diretório vivo (o chamador segura o
+/// DeviceMapLock, como o ObpSetDeviceMap e o ObfDereferenceDeviceMap).
+pub fn set_device_map(pointer: u64, map: u64) -> Result<(), KernelError> {
+    assert_live(pointer)?;
+    body(pointer).device_map.set(map);
     Ok(())
 }
 

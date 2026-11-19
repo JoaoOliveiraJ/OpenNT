@@ -2596,7 +2596,7 @@ fn user_syscalls_core(assert: Assert) {
     assert(luid, "usercore: ProcessLUIDDeviceMapsEnabled responde 1 e confere comprimento e alinhamento");
     // ProcessDeviceMap: o C: do \GLOBAL?? no DriveMap com o tipo pelo
     // DEVICE_OBJECT do destino; o _EX de 0x30 com Flags e as recusas.
-    let expected = crate::ntos::ob::device_map::query(0).unwrap_or_default();
+    let expected = crate::ntos::ob::device_map::query(0, 0).unwrap_or_default();
     guest::write_bytes(buffer, &[0xAA; 0x30]);
     guest::write64(rsp + 0x28, info);
     let mapped = call("NtQueryInformationProcess", u64::MAX, 23, buffer, 0x24) == 0 && guest::read32(info) == 0x24 && guest::read32(buffer) == expected.drive_map && expected.drive_map & 4 != 0 && guest::read_bytes(buffer + 4, 32) == expected.drive_type.to_vec() && guest::read8(buffer + 6) != crate::ntos::ob::device_map::DRIVE_UNKNOWN && guest::read8(buffer + 0x24) == 0xAA;

@@ -78,3 +78,4 @@ pub mod anti_starvation;
 pub mod reparse_points;
 pub mod volume_notify_locks;
 pub mod user_copy_chunk;
+pub mod dos_device_maps;

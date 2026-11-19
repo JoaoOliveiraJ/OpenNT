@@ -144,12 +144,14 @@ fn namespace() -> Result<(), crate::rtl::KernelError> {
     crate::ntos::ex::callbacks::init()?;
     // ObpInitializeRootNamespace: o \ObjectTypes com um objeto Type por tipo.
     crate::ntos::ob::object_types::initialize_type_directory()?;
-    // \GLOBAL??: o diretório global de devices DOS; todas as grafias resolvem
-    // aos mesmos objetos, inclusive o GLOBALROOT para a raiz NT e o Global
-    // de volta ao próprio \GLOBAL?? (ObpCreateDosDevicesDirectory).
+    // \GLOBAL??: o diretório global de devices DOS, com o GLOBALROOT para a
+    // raiz NT e o Global de volta ao próprio \GLOBAL??, e o \DosDevices da
+    // raiz como link para \?? (ObpCreateDosDevicesDirectory). O \?? não é um
+    // objeto: o ObpLookupObjectName o troca pelo diretório do mapa de
+    // devices de quem procura (`ob/device_map.rs`), que a fase 1 liga ao
+    // \GLOBAL?? para o System e os tokens do SYSTEM.
     object_manager::create_directory("\\GLOBAL??")?;
-    object_manager::create_symlink("\\DosDevices", "\\GLOBAL??")?;
-    object_manager::create_symlink("\\??", "\\GLOBAL??")?;
+    object_manager::create_symlink("\\DosDevices", "\\??")?;
     object_manager::create_symlink("\\GLOBAL??\\GLOBALROOT", "\\")?;
     object_manager::create_symlink("\\GLOBAL??\\Global", "\\GLOBAL??")?;
     // Os dispositivos DOS dos file systems de pipes e mailslots, com os
@@ -195,7 +197,7 @@ fn namespace() -> Result<(), crate::rtl::KernelError> {
     let memory = volume_device::mount(0, &memory_file_system::VOLUME)?;
     object_manager::create_symlink("\\FS", &memory)?;
     if !crate::ntos::init::boot_config::smss_boot() {
-        object_manager::create_symlink("\\DosDevices\\C:", &memory)?;
+        object_manager::create_symlink("\\GLOBAL??\\C:", &memory)?;
     }
     Ok(())
 }

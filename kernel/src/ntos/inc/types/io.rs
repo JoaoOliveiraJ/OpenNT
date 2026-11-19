@@ -4732,6 +4732,35 @@ const _: () = {
     assert!(core::mem::offset_of!(CopyInformation, source_file_offset) == 0x8);
 };
 
+/// `_DEVICE_MAP` (0x48 bytes).
+#[repr(C)]
+pub struct DeviceMap {
+    /// -> `_OBJECT_DIRECTORY`
+    pub dos_devices_directory: Field<u64>,
+    /// -> `_OBJECT_DIRECTORY`
+    pub global_dos_devices_directory: Field<u64>,
+    /// -> `void`
+    pub dos_devices_directory_handle: Field<u64>,
+    pub reference_count: Field<i32>,
+    pub drive_map: Field<u32>,
+    pub drive_type: [Field<u8>; 32],
+    /// -> `_EJOB`
+    pub server_silo: Field<u64>,
+}
+
+unsafe impl NtStruct for DeviceMap {}
+
+const _: () = {
+    assert!(core::mem::size_of::<DeviceMap>() == 0x48);
+    assert!(core::mem::offset_of!(DeviceMap, dos_devices_directory) == 0x0);
+    assert!(core::mem::offset_of!(DeviceMap, global_dos_devices_directory) == 0x8);
+    assert!(core::mem::offset_of!(DeviceMap, dos_devices_directory_handle) == 0x10);
+    assert!(core::mem::offset_of!(DeviceMap, reference_count) == 0x18);
+    assert!(core::mem::offset_of!(DeviceMap, drive_map) == 0x1c);
+    assert!(core::mem::offset_of!(DeviceMap, drive_type) == 0x20);
+    assert!(core::mem::offset_of!(DeviceMap, server_silo) == 0x40);
+};
+
 /// `_INTERFACE` (0x20 bytes).
 #[repr(C)]
 pub struct Interface {

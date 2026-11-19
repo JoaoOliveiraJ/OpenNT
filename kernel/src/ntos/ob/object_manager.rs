@@ -296,27 +296,58 @@ fn child_step(state: &State, directory: NodeId, parts: &[&str], index: usize, ca
     Step::Found { next, is_link: next_node.type_name == "SymbolicLink", body: next_node.native_namespace, target: next_node.data.as_ref().and_then(|data| data.symlink_target.clone()) }
 }
 
-/// ObpGetShadowDirectory na busca de abertura (ObpLookupObjectName sem
-/// objeto a inserir): o componente que falta num diretório com sombra
-/// (Flags & 4) é procurado no ShadowDirectory, e na sombra dele em seguida.
+/// Onde a busca procura o componente que falta no diretório (o
+/// ObpLookupObjectName só procura fora dele sem objeto a inserir).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fallback {
+    /// A busca de quem insere um nome: só o próprio diretório.
+    None,
+    /// A busca de abertura do kernel sem o modo de quem chama: só o
+    /// GlobalDosDevicesDirectory do DeviceMap (o `\??` de uma sessão de
+    /// logon cai no `\GLOBAL??`).
+    DeviceMap,
+    /// A busca de abertura com o modo de quem chama: a sombra dos
+    /// diretórios e o DeviceMap.
+    Shadow { from_user_mode: bool },
+}
+
+/// As regras de uma busca.
+#[derive(Clone, Copy)]
+struct Lookup {
+    case_insensitive: bool,
+    open_symbolic_link: bool,
+    fallback: Fallback,
+    /// OBJ_IGNORE_IMPERSONATED_DEVICEMAP: o `\??` pelo mapa do processo
+    /// mesmo com a thread impersonando.
+    ignore_impersonation: bool,
+}
+
+/// A sombra do ObpLookupObjectName na busca de abertura: o componente que
+/// falta num diretório com sombra (Flags & 4) é procurado no
+/// ShadowDirectory; num diretório sem sombra com DeviceMap (o `\??` de uma
+/// sessão de logon), no GlobalDosDevicesDirectory do mapa
+/// (`ob/device_map.rs`); e assim por diante a partir do diretório achado.
 /// Um diretório criado por token sandbox (Flags & 0x10) só usa a sombra
 /// para quem também é sandbox (o RtlIsSandboxedToken de quem chama;
-/// KernelMode nunca é). O diretório sem sombra com DeviceMap (o \?? por
-/// LUID) não existe no OpenNT.
-fn shadow_step(directory: NodeId, parts: &[&str], index: usize, case_insensitive: bool, from_user_mode: bool) -> Step {
+/// KernelMode nunca é). A busca do kernel sem modo ([`Fallback::DeviceMap`])
+/// não usa o ShadowDirectory.
+fn shadow_step(directory: NodeId, parts: &[&str], index: usize, lookup: Lookup) -> Step {
     let mut current = directory;
     let mut sandboxed: Option<bool> = None;
     for _ in 0..32 {
         let body = with_state(|state| state.nodes.get(&current).map_or(0, |node| node.native_namespace));
         let flags = namespace_objects::directory_flags(body);
-        if flags & namespace_objects::DIRECTORY_SHADOW == 0 {
-            return Step::Missing;
-        }
-        if flags & namespace_objects::DIRECTORY_SANDBOXED_SHADOW != 0 && !*sandboxed.get_or_insert_with(|| from_user_mode && crate::ntos::rtl::security::is_sandboxed_token(0, 1).unwrap_or(false)) {
-            return Step::Missing;
-        }
-        let Some((shadow, true)) = namespace_objects::get(namespace_objects::shadow_directory(body)) else { return Step::Missing };
-        match with_state(|state| child_step(state, shadow, parts, index, case_insensitive)) {
+        let next = if flags & namespace_objects::DIRECTORY_SHADOW != 0 {
+            let Fallback::Shadow { from_user_mode } = lookup.fallback else { return Step::Missing };
+            if flags & namespace_objects::DIRECTORY_SANDBOXED_SHADOW != 0 && !*sandboxed.get_or_insert_with(|| from_user_mode && crate::ntos::rtl::security::is_sandboxed_token(0, 1).unwrap_or(false)) {
+                return Step::Missing;
+            }
+            namespace_objects::shadow_directory(body)
+        } else {
+            crate::ntos::ob::device_map::global_directory(body)
+        };
+        let Some((shadow, true)) = namespace_objects::get(next) else { return Step::Missing };
+        match with_state(|state| child_step(state, shadow, parts, index, lookup.case_insensitive)) {
             Step::Missing => current = shadow,
             found => return found,
         }
@@ -324,13 +355,24 @@ fn shadow_step(directory: NodeId, parts: &[&str], index: usize, case_insensitive
     Step::Missing
 }
 
+/// O resto de um nome absoluto que o ObpLookupObjectName começa no
+/// DosDevicesDirectory do mapa de devices: `\??` (o próprio diretório) e
+/// `\??\X`.
+fn dos_devices_rest(path: &str) -> Option<&str> {
+    if path == "\\??" {
+        return Some("");
+    }
+    path.strip_prefix("\\??\\")
+}
+
 /// Percorre a árvore a partir de `start` e segue links até gastar as 0x40
 /// voltas de reparse do ObpLookupObjectName (a 0x40ª é
-/// STATUS_OBJECT_NAME_NOT_FOUND, `io/reparse.rs`); `shadow` liga a sombra
-/// dos diretórios (busca de abertura, com o modo de quem chama). Um caminho
-/// que começa pelo componente de `private_namespace::anchor_name` parte do
-/// diretório do namespace privado.
-fn resolve_inner(path: &str, link_depth: u32, case_insensitive: bool, open_symbolic_link: bool, start: NodeId, shadow: Option<bool>) -> (Option<NodeId>, Option<String>) {
+/// STATUS_OBJECT_NAME_NOT_FOUND, `io/reparse.rs`). Um caminho que começa
+/// pelo componente de `private_namespace::anchor_name` parte do diretório do
+/// namespace privado; um nome absoluto `\??\X` parte do diretório de devices
+/// DOS de quem procura (sem mapa, segue da raiz, onde `\??` não existe),
+/// também depois do reparse de um link (o `\DosDevices\X` vira `\??\X`).
+fn resolve_inner(path: &str, link_depth: u32, start: NodeId, lookup: Lookup) -> (Option<NodeId>, Option<String>) {
     let (mut path, mut link_depth, mut start) = (String::from(path), link_depth, start);
     loop {
         if link_depth + 1 >= crate::ntos::io::reparse::MAXIMUM_REPARSE {
@@ -343,18 +385,25 @@ fn resolve_inner(path: &str, link_depth: u32, case_insensitive: bool, open_symbo
                 current = anchor;
                 parts.remove(0);
             }
+        } else if start == ROOT {
+            if let Some(rest) = dos_devices_rest(&path) {
+                if let Some(directory) = crate::ntos::ob::device_map::dos_devices_directory(lookup.ignore_impersonation) {
+                    current = directory;
+                    parts = split_path(rest);
+                }
+            }
         }
         let mut reparsed = None;
         for index in 0..parts.len() {
-            let step = match with_state(|state| child_step(state, current, &parts, index, case_insensitive)) {
-                Step::Missing if shadow.is_some() => shadow_step(current, &parts, index, case_insensitive, shadow == Some(true)),
+            let step = match with_state(|state| child_step(state, current, &parts, index, lookup.case_insensitive)) {
+                Step::Missing if lookup.fallback != Fallback::None => shadow_step(current, &parts, index, lookup),
                 step => step,
             };
             match step {
                 Step::Missing => return (None, None),
                 Step::Mount(rest) => return (Some(current), Some(rest)),
                 Step::Found { next, is_link, body, target } => {
-                    if is_link && !(open_symbolic_link && index == parts.len() - 1) {
+                    if is_link && !(lookup.open_symbolic_link && index == parts.len() - 1) {
                         let rest = parts[index + 1..].join("\\");
                         let target = if body != 0 { namespace_objects::target(body).unwrap_or_default() } else { target.unwrap_or_default() };
                         reparsed = Some(if rest.is_empty() { target } else { alloc::format!("{}\\{}", target, rest) });
@@ -378,19 +427,36 @@ fn resolve_inner(path: &str, link_depth: u32, case_insensitive: bool, open_symbo
 /// Percorre a árvore a partir de `start` e segue links até gastar as 0x40
 /// voltas de reparse.
 /// Devolve o nó encontrado e o trecho delegado a um volume montado. Sem a
-/// sombra dos diretórios: a busca de quem insere um nome.
+/// sombra dos diretórios nem o diretório global do mapa de devices: a busca
+/// de quem insere um nome.
 pub fn resolve_from(path: &str, link_depth: u32, case_insensitive: bool, open_symbolic_link: bool, start: NodeId) -> (Option<NodeId>, Option<String>) {
-    resolve_inner(path, link_depth, case_insensitive, open_symbolic_link, start, None)
+    resolve_inner(path, link_depth, start, Lookup { case_insensitive, open_symbolic_link, fallback: Fallback::None, ignore_impersonation: false })
+}
+
+/// [`resolve_from`] de uma abertura do kernel: o nome que falta num
+/// diretório de devices DOS de uma sessão de logon é procurado no
+/// `\GLOBAL??`.
+pub fn resolve_lookup_from(path: &str, case_insensitive: bool, open_symbolic_link: bool, start: NodeId) -> (Option<NodeId>, Option<String>) {
+    resolve_inner(path, 0, start, Lookup { case_insensitive, open_symbolic_link, fallback: Fallback::DeviceMap, ignore_impersonation: false })
 }
 
 /// [`resolve_from`] de uma abertura: o nome que falta num diretório com
-/// sombra é procurado nela.
+/// sombra é procurado nela (e no `\GLOBAL??`, num diretório de devices DOS
+/// de uma sessão de logon).
 pub fn resolve_open_from(path: &str, case_insensitive: bool, open_symbolic_link: bool, start: NodeId, from_user_mode: bool) -> (Option<NodeId>, Option<String>) {
-    resolve_inner(path, 0, case_insensitive, open_symbolic_link, start, Some(from_user_mode))
+    resolve_open_with(path, case_insensitive, open_symbolic_link, start, from_user_mode, false)
 }
 
+/// [`resolve_open_from`] com o OBJ_IGNORE_IMPERSONATED_DEVICEMAP dos
+/// atributos.
+pub fn resolve_open_with(path: &str, case_insensitive: bool, open_symbolic_link: bool, start: NodeId, from_user_mode: bool, ignore_impersonation: bool) -> (Option<NodeId>, Option<String>) {
+    resolve_inner(path, 0, start, Lookup { case_insensitive, open_symbolic_link, fallback: Fallback::Shadow { from_user_mode }, ignore_impersonation })
+}
+
+/// A busca de abertura do kernel por um nome absoluto, sem distinção de
+/// caixa ([`resolve_lookup_from`] da raiz).
 pub fn resolve(path: &str) -> (Option<NodeId>, Option<String>) {
-    resolve_from(path, 0, true, false, ROOT)
+    resolve_lookup_from(path, true, false, ROOT)
 }
 
 /// Busca um filho pela chave minúscula ou pelo nome sem caixa.
@@ -943,10 +1009,4 @@ pub fn is_attached(id: NodeId) -> bool {
 /// Liga o corpo de namespace ao nó (`native_namespace`).
 pub fn set_native_namespace(id: NodeId, body: u64) {
     update_node(id, |node| node.native_namespace = body);
-}
-
-/// ObIsDosDeviceLocallyMapped: sem device maps por LUID (sem sessões de
-/// logon), nenhuma letra é mapeada localmente.
-pub fn is_dos_device_locally_mapped() -> bool {
-    false
 }

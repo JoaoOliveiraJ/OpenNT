@@ -822,6 +822,9 @@ fn collect_process(process: u64) -> Result<(), KernelError> {
         let record = state.processes.remove(&process).unwrap();
         (token, record, state.image_provider)
     };
+    // PspProcessDelete: o mapa de devices DOS sai antes do token, cuja
+    // sessão de logon pode sair junto e soltar o mapa dela.
+    crate::ntos::ob::device_map::dereference_process(process);
     if let Some(token) = token {
         eprocess(process).token.object.set(0);
         tokens::release(token)?;
@@ -1140,6 +1143,9 @@ pub fn replace_primary_token(process: u64, source: u64, session_id: u32, explici
     let copy = tokens::sub_process_token(source, session_id, explicit)?;
     let previous = STATE.lock().primary_tokens.insert(process, copy);
     eprocess(process).token.object.set(copy);
+    // PspAssignPrimaryToken: o mapa de devices DOS do token anterior sai
+    // (ObDereferenceDeviceMap); o próximo `\??` o refaz pelo token novo.
+    crate::ntos::ob::device_map::dereference_process(process);
     if let Some(previous) = previous {
         tokens::release(previous)?;
     }
