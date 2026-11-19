@@ -5330,14 +5330,36 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     `KD_REPLAY` e entrega esse endereço em `KD_READY`. Fechar a entrada
     padrão manda `quit` ao monitor antes de matar o QEMU (a gravação só
     vale com a saída normal).
-  - Símbolos (`symbols.rs`, `pe.rs`, `pdb.rs`): o `kernel.elf` com os nomes
-    do Rust legíveis; para cada binário da Microsoft carregado, os exports
-    do PE desta máquina e os nomes públicos do PDB público dele. O PDB vem
-    do cache `build/symbols` (`OPENNT_SYMBOLS` troca a pasta) ou do servidor
-    público de símbolos, baixado pelo `curl` numa thread
-    (`OPENNT_SYMBOL_DOWNLOAD=0` desliga). O download é o mesmo do
-    `cargo xtask nt-types`. Os módulos aparecem sem extensão
-    (`ntfs!NtfsCommonCreate+0x1a3`); `nt` é o kernel.
+  - Símbolos (`symbols.rs`, `pe.rs`, `pdb.rs`, `msf.rs`): o `kernel.elf`
+    com os nomes do Rust legíveis; para cada binário da Microsoft carregado,
+    os exports do PE e os símbolos do PDB dele: os públicos, os dados
+    globais e, quando o PDB não foi despido, os procedimentos com tamanho e
+    as linhas (`sym` e `ln` mostram `arquivo:linha`). O arquivo desta
+    máquina só vale quando é a imagem carregada (o mesmo tamanho; na dúvida,
+    a data e o checksum do cabeçalho no alvo); sem ele, a identidade do PDB,
+    as seções e os exports saem da memória do alvo. Os módulos aparecem sem
+    extensão (`ntfs!NtfsCommonCreate+0x1a3`); `nt` é o kernel. Um endereço
+    que nenhum símbolo cobre sai como `módulo+0xRVA`; uma parte fria de uma
+    função (entrada encadeada da `.pdata`, sem símbolo próprio) sai como a
+    função dona mais o deslocamento. `xs [módulo!]padrão` lista os símbolos
+    que casam com `*` e `?`.
+  - Cache de PDBs (`pdb.rs`): as pastas de `OPENNT_SYMBOLS`, separadas por
+    `;` (sem a variável, `build/symbols`); a primeira recebe os downloads.
+    Em cada pasta valem `<nome>/<GUID><idade>/<nome>` (a forma do servidor,
+    a dos downloads), `<nome>.<GUID><idade>.pdb` e `<nome>`, sempre
+    conferidos pelo GUID e pela idade (só o superbloco, o diretório e o
+    começo de dois streams são lidos). O que falta vem do servidor público
+    (`OPENNT_SYMBOL_SERVER`) pelo `curl`, numa fila de quatro downloads com
+    prazo (`OPENNT_SYMBOL_DOWNLOAD=0` desliga); o download é o mesmo do
+    `cargo xtask nt-types`. O PDB de um driver entra na fila quando o
+    módulo aparece; o de um módulo de usuário, no primeiro uso do módulo
+    (os que já estão no cache entram na hora). `módulo!nome` numa expressão
+    ou num breakpoint, a linha da parada, `k`, `bt`, `btt`, `ustack`, `sym`,
+    `ln`, `?`, `dt módulo!tipo` e `!analyze` passam o PDB que falta para a
+    frente da fila e esperam por ele (`OPENNT_SYMBOL_WAIT` segundos, 120
+    sem a variável, uma vez por PDB); os que chegam depois entram na parada
+    seguinte. `.reload /f` pede todos os que faltam e tenta de novo os que
+    falharam; `.reload /w` espera a fila.
   - Pilha (`unwind.rs`): o contexto (RIP, RSP e os registradores
     conhecidos) passa de quadro em quadro. Nos binários da Microsoft, o
     desenrolar virtual do x64 pela `.pdata` e pelo UNWIND_INFO (push,
@@ -5349,10 +5371,13 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     desenrolam um sobre o outro. O `gu` sai pelo quadro de cima do mesmo
     desenrolar.
   - Tipos (`tpi.rs`, `types.rs`): o TPI do `build/symbols/ntkrnlmp.pdb` (o
-    mesmo leitor do `cargo xtask nt-types`, que agora o usa daqui).
+    mesmo leitor do `cargo xtask nt-types`, que agora o usa daqui) ou, sem
+    ele, do PDB com a identidade da seção `[pdb]` do `nt_types.toml` em
+    qualquer pasta do cache, baixado na primeira vez que falta.
     `dt _IRP endereço` mostra a struct campo a campo; enums com o nome do
     valor, bitfields, arrays de caracteres como texto, ponteiros com o
-    símbolo. O PDB carrega na primeira expressão tipada.
+    símbolo. `dt módulo!tipo endereço` usa o PDB do módulo. O PDB carrega na
+    primeira expressão tipada.
   - Expressões (`expr.rs`): números (`0x`, `` ` ``, `0n`, hexadecimal sem
     prefixo), registradores (`@rax`, `%rax`, `rax`), `$variáveis`,
     símbolos do Rust e `módulo!símbolo`, `poi`/`by`/`wo`/`dwo`/`qwo`,
@@ -5372,8 +5397,12 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     processo e o cliente o reaplica a cada parada; numa parada do anel 3, o
     processo dela vira o das leituras. Os módulos de usuário (a PEB.Ldr e as
     imagens do VAD) entram nos símbolos à parte (`set_user_modules`), com os
-    exports do PE desta máquina e o PDB público. A pilha de uma thread de
-    usuário sai do CONTEXT salvo dela. Comandos: `.process`, `lmu`,
+    exports do PE desta máquina e o PDB público. Os de outro processo ficam
+    guardados pela base e pelo caminho para a volta. Um `módulo!nome` de uma
+    DLL que ainda não está na lista relê a PEB.Ldr e o VAD do processo
+    escolhido (uma vez por parada), então o `bu` numa DLL do processo
+    escolhido que ainda vai carregar arma na parada de carga dela. A pilha
+    de uma thread de usuário sai do CONTEXT salvo dela. Comandos: `.process`, `lmu`,
     `handles`, `vad`, `uthreads`, `ustack`, `kmap`, `events`, `uex`.
   - Eventos e breakpoints com ação: `sxe cpr[:nome]`, `epr`, `ct[:pid]`,
     `et` e `ld:processo!dll` (breakpoints internos nos pontos de evento do
