@@ -3262,7 +3262,7 @@ fn io_group_exports(assert: Assert) {
     assert(status(registered) == 0 && status(interface) == 0 && link_name == "\\DosDevices\\#{112233445566778899aabbccddeef001}" && status(enabled) == 0 && guest::read32(context) == 0x55 && device_interface::interface_enabled(&link_name) == Some(true), "io: interface de dispositivo habilitada notifica o callback PnP nativo");
     assert(status(call_export("IoUnregisterPlugPlayNotification", &[registration])) == 0 && status(call_export("IoUnregisterPlugPlayNotification", &[registration])) == 0xC000_0034, "io: IoUnregisterPlugPlayNotification");
     let configuration = call_export("IoGetConfigurationInformation", &[]);
-    assert(configuration.is_some_and(|pointer| pointer != 0) && call_export("IoGetConfigurationInformation", &[]) == configuration && call_export("IoSizeofWorkItem", &[]) == Some(crate::ntos::io::work_items::work_item_size()) && call_export("IoGetRequestorProcess", &[0]) == Some(crate::ntos::ps::process::get_system_process()), "io: configuracao global, tamanho do work item e processo do IRP");
+    assert(configuration.is_some_and(|pointer| pointer != 0) && call_export("IoGetConfigurationInformation", &[]) == configuration && call_export("IoSizeofWorkItem", &[]) == Some(crate::ntos::io::work_items::work_item_size()), "io: configuracao global e tamanho do work item");
     // Exclusão dos dispositivos e descarga do driver.
     let deleted = (status(call_export("IoDeleteDevice", &[second])), status(call_export("IoDeleteDevice", &[first])));
     assert(deleted == (0, 0) && object_manager::lookup("\\Device\\OpenNtIoTest").is_none() && at::<nt::DriverObject>(driver).device_object.get() == 0, "io: IoDeleteDevice retira o dispositivo do namespace e da lista");
@@ -7079,6 +7079,29 @@ fn io_irp_request_exports(assert: Assert) {
     assert(call_export("IoGetGenericIrpExtension", &[target]) == Some(0x5A5A) && activity == Some(0) && guest::read_bytes(cells + 0x10, 16) == [9u8; 16], "io-irp-request: IoPropagateIrpExtension copia extensao generica e activity id");
     call_export("IoFreeIrp", &[source]);
     call_export("IoFreeIrp", &[target]);
+
+    // IoGetRequestorProcess (0x2d99a0): NULL sem thread, o processo da thread
+    // pelo ApcEnvironment, o IssuingProcess sem as marcas.
+    let saved = (probe_irp.flags.get(), probe_irp.tail.overlay.thread.get(), probe_irp.apc_environment.get(), probe_irp.overlay.asynchronous_parameters.issuing_process.get());
+    let current_thread = process::get_current_thread();
+    probe_irp.flags.set(0);
+    probe_irp.tail.overlay.thread.set(0);
+    let none = call_export("IoGetRequestorProcess", &[probe]);
+    probe_irp.tail.overlay.thread.set(current_thread);
+    probe_irp.apc_environment.set(0);
+    let own = call_export("IoGetRequestorProcess", &[probe]);
+    probe_irp.apc_environment.set(2);
+    let unknown = call_export("IoGetRequestorProcess", &[probe]);
+    probe_irp.apc_environment.set(0);
+    probe_irp.flags.set(0x2000);
+    probe_irp.overlay.asynchronous_parameters.issuing_process.set(process::get_system_process() | 2);
+    let issuing = call_export("IoGetRequestorProcess", &[probe]);
+    probe_irp.flags.set(saved.0);
+    probe_irp.tail.overlay.thread.set(saved.1);
+    probe_irp.apc_environment.set(saved.2);
+    probe_irp.overlay.asynchronous_parameters.issuing_process.set(saved.3);
+    let own_process = at::<nt::Kthread>(current_thread).process.get();
+    assert(none == Some(0) && own == Some(own_process) && unknown == Some(0) && issuing == Some(process::get_system_process()), "io-irp-request: IoGetRequestorProcess pela thread, pelo ApcEnvironment e pelo IssuingProcess");
 
     // IoGetRequestorProcessId: UniqueProcessId do processo do IRP.
     let owner = call_export("IoGetRequestorProcess", &[probe]).unwrap_or(0);

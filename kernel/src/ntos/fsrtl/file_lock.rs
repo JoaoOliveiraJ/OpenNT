@@ -475,7 +475,7 @@ const SL_FAIL_IMMEDIATELY: u8 = 1;
 const SL_EXCLUSIVE_LOCK: u8 = 2;
 
 fn requestor_process(irp: &Irp) -> Result<u64, KernelError> {
-    crate::ntos::init::exports::invoke_handler("IoGetRequestorProcess", &[irp.address()])
+    Ok(crate::ntos::io::irp_request::requestor_process(irp.address()))
 }
 
 fn current_stack(irp: &Irp) -> &'static IoStackLocation {

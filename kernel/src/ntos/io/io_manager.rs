@@ -310,7 +310,9 @@ pub fn iof_complete_request(packet: u64) -> i32 {
     0
 }
 
-/// IoBuildSynchronousFsdRequest: o buffer já é memória de kernel.
+/// IoBuildSynchronousFsdRequest: o buffer já é memória de kernel; a
+/// Tail.Overlay.Thread é a thread corrente (IopBuildAsynchronousFsdRequest
+/// 0x358e46).
 pub fn build_synchronous_fsd_request(major: u8, device: u64, buffer: u64, length: u32, byte_offset_pointer: u64, event: u64, io_status: u64) -> u64 {
     let stack_count = stack_size_of(device);
     // SAFETY: StartingOffset (PLARGE_INTEGER) do chamador de modo kernel.
@@ -320,7 +322,7 @@ pub fn build_synchronous_fsd_request(major: u8, device: u64, buffer: u64, length
     // IoAllocateMdl + MmProbeAndLockPages do IopBuildAsynchronousFsdRequest),
     // não no SystemBuffer.
     let direct = matches!(major, irp_mj::READ | irp_mj::WRITE) && buffer != 0 && device_at(device).flags.get() & DO_DIRECT_IO != 0;
-    builder::build(address, &BuildOptions { major, buffer: if direct { 0 } else { buffer }, buffer_length: length, device_object: device, stack_count, byte_offset, user_event: event, user_iosb: io_status, ..Default::default() });
+    builder::build(address, &BuildOptions { major, buffer: if direct { 0 } else { buffer }, buffer_length: length, device_object: device, stack_count, byte_offset, user_event: event, user_iosb: io_status, thread: process::get_current_thread(), ..Default::default() });
     if direct {
         let descriptor = super::mdl::allocate_mdl(buffer, length);
         if descriptor != 0 {
@@ -382,7 +384,9 @@ pub fn build_device_io_control_request(code: u32, device: u64, input: u64, input
         user_buffer: output,
         file_object: context.file_object,
         requestor_mode: context.requestor_mode,
-        thread: context.thread,
+        // IopBuildDeviceIoControlRequest (0x22b3f7): Tail.Overlay.Thread =
+        // KeGetCurrentThread() quando o chamador não deu outra.
+        thread: if context.thread != 0 { context.thread } else { process::get_current_thread() },
         ..Default::default()
     });
     if !method_neither {

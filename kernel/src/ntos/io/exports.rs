@@ -329,9 +329,9 @@ fn io_allocate_sfio_stream_identifier(call: &Call) -> Result<u64, KernelError> {
     sfio_stream::allocate_identifier(call.arg(4));
     Ok(0)
 }
-/// Os IRPs nascem de código de kernel: o dono é o System.
-fn io_get_requestor_process(_: &Call) -> Result<u64, KernelError> {
-    Ok(process::get_system_process())
+/// IoGetRequestorProcess(Irp): `irp_request::requestor_process`.
+fn io_get_requestor_process(call: &Call) -> Result<u64, KernelError> {
+    Ok(crate::ntos::io::irp_request::requestor_process(call.arg(1)))
 }
 fn io_get_device_attachment_base_ref(call: &Call) -> Result<u64, KernelError> {
     device_objects::attached_reference(call.arg(1), true)

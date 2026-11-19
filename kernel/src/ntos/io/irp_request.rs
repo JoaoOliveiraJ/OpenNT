@@ -10,6 +10,7 @@
 //!   IoSetCompletionRoutineEx       rva 0x31dab0  (+ IopUnloadSafeCompletion 0x31f420)
 //!   IoIsOperationSynchronous       rva 0x2f4390
 //!   IoPropagateIrpExtension        rva 0x2e67b0 -> IoPropagateIrpExtensionEx 0x2e67d0
+//!   IoGetRequestorProcess          rva 0x2d99a0
 //!   IoGetRequestorProcessId        rva 0x3cf2d0
 //!   IoGetRequestorSessionId        rva 0x32be20
 //!   IoGetInitiatorProcess          rva 0x32c4d0 (-> IopGetFileObjectExtension 0x2d6f90, slot 1)
@@ -20,10 +21,10 @@
 //! Reuso: `io_manager::iof_call_driver`, `retained_irp::completion_routine`
 //! (o mesmo KeSetEvent + STATUS_MORE_PROCESSING_REQUIRED do
 //! CmpCompleteFlushAndPurgeIrp), `irp_builder::{allocate_irp, free_irp}`,
-//! `mdl::allocate_mdl`, as extensões de IRP de `irp_extension` (o corpo do
-//! IoPropagateIrpExtensionEx e do IoGet/SetActivityIdIrp) e o provider do
-//! IoGetRequestorProcess (sem função de assunto: a política do OpenNT vive no
-//! adaptador, então é chamado pelo nome). O
+//! `mdl::allocate_mdl` e as extensões de IRP de `irp_extension` (o corpo do
+//! IoPropagateIrpExtensionEx e do IoGet/SetActivityIdIrp). O
+//! IoGetRequestorProcess vive aqui (`requestor_process`): o IoGetRequestorProcessId,
+//! o IoIs32bitProcess e os donos de lock do FsRtl o chamam direto. O
 //! IopUnloadSafeCompletion é uma rotina privada (id próprio, fora da EAT).
 
 use core::mem::offset_of;
@@ -32,7 +33,7 @@ use crate::hal::amd64::native_call;
 use crate::ntos::inc::field::{Field, Reserved};
 use crate::ntos::inc::types::extra_io::IrpExtensionField;
 use crate::ntos::inc::types::{DeviceObject, Eprocess, Ethread, FileObject, IoStackLocation, IopFileObjectExtension, Irp, Kthread, LargeInteger, NtStruct};
-use crate::ntos::init::exports::{invoke_handler, private_routines};
+use crate::ntos::init::exports::private_routines;
 use crate::ntos::io::{io_manager, irp_builder, irp_extension, mdl, retained_irp};
 use crate::ntos::ke::dispatcher;
 use crate::ntos::mm::guest_memory as guest;
@@ -363,9 +364,32 @@ pub fn propagate_irp_extension(source: u64, target: u64, flags: u32) {
     }
 }
 
+/// IoGetRequestorProcess(Irp) (ntoskrnl 19041 rva 0x2d99a0): com
+/// IRP_ISSUING_PROCESS, o Overlay.AsynchronousParameters.IssuingProcess sem as
+/// marcas; senão o processo da Tail.Overlay.Thread pelo ApcEnvironment (0:
+/// KTHREAD.Process, 1: KTHREAD.ApcState.Process, outro: NULL); sem thread, NULL.
+pub fn requestor_process(packet: u64) -> u64 {
+    // SAFETY: IRP vivo do chamador.
+    let irp = unsafe { Irp::at(packet) };
+    if irp.flags.get() & IRP_ISSUING_PROCESS != 0 {
+        return irp.overlay.asynchronous_parameters.issuing_process.get() & !ISSUING_PROCESS_MARKS;
+    }
+    let thread = irp.tail.overlay.thread.get();
+    if thread == 0 {
+        return 0;
+    }
+    // SAFETY: Tail.Overlay.Thread de um IRP vivo.
+    let thread = unsafe { Kthread::at(thread) };
+    match irp.apc_environment.get() {
+        0 => thread.process.get(),
+        1 => thread.apc_state.process.get(),
+        _ => 0,
+    }
+}
+
 /// IoGetRequestorProcessId: UniqueProcessId (ULONG) do IoGetRequestorProcess.
 pub fn requestor_process_id(packet: u64) -> Result<u32, KernelError> {
-    let owner = invoke_handler("IoGetRequestorProcess", &[packet])?;
+    let owner = requestor_process(packet);
     // SAFETY: o IoGetRequestorProcess devolve um EPROCESS vivo ou NULL.
     Ok(if owner == 0 { 0 } else { unsafe { Eprocess::at(owner) }.unique_process_id.get() as u32 })
 }
@@ -454,22 +478,7 @@ pub fn is_32bit_requestor(packet: u64) -> bool {
     if irp.requestor_mode.get() != USER_MODE {
         return false;
     }
-    let owner = if irp.flags.get() & IRP_ISSUING_PROCESS != 0 {
-        irp.overlay.asynchronous_parameters.issuing_process.get() & !ISSUING_PROCESS_MARKS
-    } else {
-        let thread = irp.tail.overlay.thread.get();
-        if thread == 0 {
-            return false;
-        }
-        // SAFETY: Tail.Overlay.Thread de um IRP vivo.
-        let thread = unsafe { Kthread::at(thread) };
-        match irp.apc_environment.get() {
-            0 => thread.process.get(),
-            1 => thread.apc_state.process.get(),
-            _ => return false,
-        }
-    };
-    is_wow64_process(owner)
+    is_wow64_process(requestor_process(packet))
 }
 
 /// IoIsInitiator32bitProcess(Irp): o processo iniciador do FILE_OBJECT do
