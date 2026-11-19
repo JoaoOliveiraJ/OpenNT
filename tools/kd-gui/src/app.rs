@@ -186,6 +186,52 @@ fn transcript_text(entries: &[Entry], which: Option<usize>) -> String {
     text
 }
 
+/// Os atalhos de teclado (a janela Ajuda > Atalhos e as dicas dos menus).
+/// As teclas de execução são as do WinDbg; Alt+1 a Alt+9 abrem os painéis
+/// como no WinDbg.
+const SHORTCUTS: [(&str, &str); 27] = [
+    ("F5", "continuar"),
+    ("Ctrl+B", "parar a máquina (o Ctrl+Break não chega à janela); com um roteiro rodando, para o roteiro antes"),
+    ("F10", "passar por cima do call"),
+    ("F11", "entrar: um passo"),
+    ("Shift+F11", "sair da função (até o retorno)"),
+    ("F9", "liga ou tira o breakpoint na linha escolhida da desmontagem (ou no RIP)"),
+    ("Ctrl+O", "abrir o OpenNT com outras opções ou conectar a um QEMU aberto"),
+    ("Ctrl+Shift+F5", "reiniciar: fecha o QEMU, recompila e abre de novo"),
+    ("Shift+F5", "desconectar (um QEMU de fora segue rodando)"),
+    ("Ctrl+S", "salvar ou abrir uma sessão"),
+    ("Ctrl+R", "rodar um roteiro do kd"),
+    ("Ctrl+Shift+R", "rodar de novo o último roteiro"),
+    ("Ctrl+Shift+G", "gravar os comandos num roteiro / parar a gravação"),
+    ("Ctrl+L", "limpar o painel de comandos"),
+    ("Alt+1", "painel Comandos, com o cursor no prompt"),
+    ("Alt+2", "Observação"),
+    ("Alt+3", "Variáveis locais"),
+    ("Alt+4", "Registradores"),
+    ("Alt+5", "Memória"),
+    ("Alt+6", "Pilha de chamadas"),
+    ("Alt+7", "Desmontagem"),
+    ("Alt+8", "Código-fonte"),
+    ("Alt+9", "Threads"),
+    ("Alt+F9", "Breakpoints"),
+    ("Tab, setas", "no prompt: completa comandos, símbolos e tipos; histórico"),
+    ("Esc", "fecha a janela de diálogo aberta"),
+    ("F1", "esta lista"),
+];
+
+/// Os painéis de Alt+1 a Alt+9 (a ordem do WinDbg).
+const ALT_PANELS: [(Key, Tab); 9] = [
+    (Key::Num1, Tab::Command),
+    (Key::Num2, Tab::Watch),
+    (Key::Num3, Tab::Locals),
+    (Key::Num4, Tab::Registers),
+    (Key::Num5, Tab::Memory),
+    (Key::Num6, Tab::CallStack),
+    (Key::Num7, Tab::Disassembly),
+    (Key::Num8, Tab::Source),
+    (Key::Num9, Tab::Threads),
+];
+
 /// Como a memória aparece.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MemoryFormat {
@@ -340,6 +386,10 @@ pub struct UiState {
     can_restart: bool,
     transcript: Vec<Entry>,
     transcript_lines: Vec<TranscriptLine>,
+    /// O Ctrl+L: as linhas antes desta saem da vista.
+    transcript_start: usize,
+    /// A janela Ajuda > Atalhos do teclado.
+    shortcuts_help: bool,
     console: LogLines,
     serial: LogLines,
     launch_log: LogLines,
@@ -502,6 +552,8 @@ impl DebuggerApp {
                 can_restart: false,
                 transcript: Vec::new(),
                 transcript_lines: Vec::new(),
+                transcript_start: 0,
+                shortcuts_help: false,
                 console: LogLines::default(),
                 serial: LogLines::default(),
                 launch_log: LogLines::default(),
@@ -683,6 +735,7 @@ impl DebuggerApp {
         if shared.transcript.len() < state.transcript.len() {
             state.transcript.clear();
             state.transcript_lines.clear();
+            state.transcript_start = 0;
         }
         let known = state.transcript.len();
         for (offset, entry) in shared.transcript[known..].iter().enumerate() {
@@ -746,6 +799,7 @@ impl DebuggerApp {
         open_dialog(ui, &mut self.state);
         session_dialog(ui, &mut self.state);
         script_dialog(ui, &mut self.state);
+        shortcuts_window(ui, &mut self.state);
         if std::mem::take(&mut self.state.cancel) {
             self.backend.cancel();
         }
@@ -807,18 +861,61 @@ impl DebuggerApp {
         }
     }
 
+    /// Os atalhos de teclado. O egui ignora Shift e Alt a mais num atalho
+    /// sem eles (o F5 também pegaria o Shift+F5): os com mais modificadores
+    /// são conferidos antes.
     fn shortcuts(&mut self, ui: &Ui) {
         let stopped = self.state.ready();
         let running = self.state.status == Status::Running;
+        let connected = matches!(self.state.status, Status::Stopped | Status::Running);
         let pressed = |modifiers: Modifiers, key: Key| ui.input_mut(|input| input.consume_key(modifiers, key));
+        let ctrl_shift = Modifiers::CTRL | Modifiers::SHIFT;
+        if pressed(Modifiers::NONE, Key::F1) {
+            self.state.shortcuts_help = !self.state.shortcuts_help;
+        }
         if pressed(Modifiers::CTRL, Key::O) && self.state.open_dialog.is_none() {
             self.state.open_form();
         }
+        if pressed(ctrl_shift, Key::R) {
+            if let Some(last) = self.state.recent_scripts.first().cloned().filter(|_| connected && self.state.script.is_none()) {
+                self.state.run_script_file(&last);
+            }
+        } else if pressed(Modifiers::CTRL, Key::R) {
+            self.state.open_scripts();
+        }
+        if pressed(ctrl_shift, Key::G) {
+            self.state.toggle_recording();
+        }
+        if pressed(Modifiers::CTRL, Key::S) {
+            self.state.open_sessions();
+        }
+        if pressed(Modifiers::CTRL, Key::L) {
+            self.state.transcript_start = self.state.transcript_lines.len();
+        }
+        if pressed(ctrl_shift, Key::F5) {
+            if self.state.can_restart && !matches!(self.state.status, Status::Launching(_) | Status::Connecting(_)) {
+                self.state.requests.push(Request::Restart);
+            }
+        } else if pressed(Modifiers::SHIFT, Key::F5) {
+            if connected {
+                self.state.requests.push(Request::Disconnect);
+            }
+        } else if stopped && pressed(Modifiers::NONE, Key::F5) {
+            self.state.requests.push(Request::Go);
+        }
+        for (key, tab) in ALT_PANELS {
+            if pressed(Modifiers::ALT, key) {
+                self.state.focus_tab.push(tab);
+                if tab == Tab::Command {
+                    ui.memory_mut(|memory| memory.request_focus(egui::Id::new("kd-command")));
+                }
+            }
+        }
+        if pressed(Modifiers::ALT, Key::F9) {
+            self.state.focus_tab.push(Tab::Breakpoints);
+        }
         if stopped && pressed(Modifiers::SHIFT, Key::F11) {
             self.state.requests.push(Request::StepOut);
-        }
-        if stopped && pressed(Modifiers::NONE, Key::F5) {
-            self.state.requests.push(Request::Go);
         }
         if stopped && pressed(Modifiers::NONE, Key::F10) {
             self.state.requests.push(Request::StepOver);
@@ -978,6 +1075,25 @@ impl UiState {
         remember_recent(&mut self.recent_scripts, &path, 12);
         self.requests.push(Request::RunScriptFile(PathBuf::from(path)));
         self.focus_tab.push(Tab::Command);
+    }
+
+    /// Liga a gravação no arquivo da janela Roteiros (ou no padrão) ou a
+    /// desliga.
+    fn toggle_recording(&mut self) {
+        if self.recording.is_some() {
+            self.requests.push(Request::StopRecording);
+            return;
+        }
+        let folder = self.build_path().join("opennt-dbg").join("roteiros");
+        let path = match self.script_dialog.as_ref().map(|form| form.record_path.trim()).filter(|path| !path.is_empty()) {
+            Some(path) => PathBuf::from(path),
+            None => match self.script_memory.record_path.trim() {
+                "" => folder.join("gravado.kd"),
+                path => PathBuf::from(path),
+            },
+        };
+        let xtask = self.launch.as_ref().map(|launch| launch.extra.clone()).unwrap_or_default();
+        self.requests.push(Request::StartRecording { path, xtask });
     }
 
     /// O botão Conectar da barra: o endereço do campo (`HOST:PORTA`, a
@@ -1294,13 +1410,33 @@ fn script_dialog(ui: &mut Ui, state: &mut UiState) {
     }
 }
 
+/// A janela Ajuda > Atalhos do teclado.
+fn shortcuts_window(ui: &mut Ui, state: &mut UiState) {
+    if !state.shortcuts_help {
+        return;
+    }
+    let mut open = true;
+    egui::Window::new("Atalhos do teclado").id(egui::Id::new("kd-shortcuts")).collapsible(false).resizable(false).default_width(520.0).anchor(Align2::RIGHT_TOP, Vec2::new(-20.0, 70.0)).open(&mut open).show(ui.ctx(), |ui| {
+        egui::Grid::new("kd-shortcuts-grid").num_columns(2).striped(true).spacing([16.0, 3.0]).show(ui, |ui| {
+            for (keys, action) in SHORTCUTS {
+                ui.label(mono(keys).strong());
+                ui.label(action);
+                ui.end_row();
+            }
+        });
+    });
+    if !open || ui.input(|input| input.key_pressed(Key::Escape)) {
+        state.shortcuts_help = false;
+    }
+}
+
 fn menu_bar(ui: &mut Ui, state: &mut UiState, open: &[Tab]) {
     let stopped = state.ready();
     let running = state.status == Status::Running;
     egui::MenuBar::new().ui(ui, |ui| {
         let opening = matches!(state.status, Status::Launching(_) | Status::Connecting(_));
         ui.menu_button("Sessão", |ui| {
-            if ui.add_enabled(!opening, egui::Button::new("Abrir ou conectar...").shortcut_text("Ctrl+O")).on_hover_text("as opcoes do xtask, o diretorio de build ou o endereco de um QEMU aberto").clicked() {
+            if ui.add_enabled(!opening, egui::Button::new("Abrir ou conectar...").shortcut_text("Ctrl+O")).on_hover_text("as opções do xtask, o diretório de build ou o endereço de um QEMU aberto").clicked() {
                 state.open_form();
             }
             if let Some(options) = state.launch.clone() {
@@ -1308,17 +1444,17 @@ fn menu_bar(ui: &mut Ui, state: &mut UiState, open: &[Tab]) {
                     state.requests.push(Request::Start(Target::Launch(options)));
                 }
             }
-            if ui.add_enabled(state.can_restart && !opening, egui::Button::new("Reiniciar (recompilar e abrir de novo)")).clicked() {
+            if ui.add_enabled(state.can_restart && !opening, egui::Button::new("Reiniciar (recompilar e abrir de novo)").shortcut_text("Ctrl+Shift+F5")).clicked() {
                 state.requests.push(Request::Restart);
             }
             if ui.add_enabled(opening, egui::Button::new("Cancelar a abertura")).clicked() {
                 state.cancel = true;
             }
-            if ui.button("Desconectar").clicked() {
+            if ui.add(egui::Button::new("Desconectar").shortcut_text("Shift+F5")).clicked() {
                 state.requests.push(Request::Disconnect);
             }
             ui.separator();
-            if ui.button("Salvar ou abrir sessão...").on_hover_text("breakpoints, expressoes observadas, memoria e as opcoes de abertura num arquivo com nome").clicked() {
+            if ui.add(egui::Button::new("Salvar ou abrir sessão...").shortcut_text("Ctrl+S")).on_hover_text("breakpoints, expressões observadas, memória e as opções de abertura num arquivo com nome").clicked() {
                 state.open_sessions();
             }
             ui.separator();
@@ -1355,11 +1491,11 @@ fn menu_bar(ui: &mut Ui, state: &mut UiState, open: &[Tab]) {
             }
         });
         ui.menu_button("Roteiro", |ui| {
-            if ui.button("Rodar um roteiro do kd...").on_hover_text("a linguagem do --script do cargo xtask test-boot --kd=com2").clicked() {
+            if ui.add(egui::Button::new("Rodar um roteiro do kd...").shortcut_text("Ctrl+R")).on_hover_text("a linguagem do --script do cargo xtask test-boot --kd=com2").clicked() {
                 state.open_scripts();
             }
             if let Some(last) = state.recent_scripts.first().cloned() {
-                if ui.add_enabled(state.script.is_none(), egui::Button::new(format!("Rodar de novo: {last}"))).clicked() {
+                if ui.add_enabled(state.script.is_none(), egui::Button::new(format!("Rodar de novo: {last}")).shortcut_text("Ctrl+Shift+R")).clicked() {
                     state.run_script_file(&last);
                 }
             }
@@ -1369,13 +1505,16 @@ fn menu_bar(ui: &mut Ui, state: &mut UiState, open: &[Tab]) {
             ui.separator();
             match &state.recording {
                 Some((path, lines)) => {
-                    if ui.button(format!("Parar a gravação ({lines} linhas em {})", path.display())).clicked() {
+                    if ui.add(egui::Button::new(format!("Parar a gravação ({lines} linhas em {})", path.display())).shortcut_text("Ctrl+Shift+G")).clicked() {
                         state.requests.push(Request::StopRecording);
                     }
                 }
                 None => {
                     if ui.button("Gravar os comandos num roteiro...").on_hover_text("os comandos digitados e os botões viram um roteiro que o test-boot roda").clicked() {
                         state.open_scripts();
+                    }
+                    if ui.add(egui::Button::new("Gravar já (no arquivo da janela Roteiros)").shortcut_text("Ctrl+Shift+G")).clicked() {
+                        state.toggle_recording();
                     }
                 }
             }
@@ -1400,6 +1539,14 @@ fn menu_bar(ui: &mut Ui, state: &mut UiState, open: &[Tab]) {
                 state.light = true;
             }
         });
+        ui.menu_button("Ajuda", |ui| {
+            if ui.add(egui::Button::new("Atalhos do teclado").shortcut_text("F1")).clicked() {
+                state.shortcuts_help = true;
+            }
+            if ui.add(egui::Button::new("Limpar o painel de comandos").shortcut_text("Ctrl+L")).clicked() {
+                state.transcript_start = state.transcript_lines.len();
+            }
+        });
     });
 }
 
@@ -1415,6 +1562,14 @@ enum Icon {
     Breakpoint,
     Trace,
     Theme,
+    /// Abrir ou conectar (o símbolo de ligar).
+    Open,
+    Disconnect,
+    Session,
+    Script,
+    Record,
+    /// A gravação ligada.
+    Recording,
 }
 
 fn icon_button(ui: &mut Ui, icon: Icon, enabled: bool, tooltip: &str) -> bool {
@@ -1428,10 +1583,10 @@ fn icon_button(ui: &mut Ui, icon: Icon, enabled: bool, tooltip: &str) -> bool {
         colors.dim.gamma_multiply(0.6)
     } else {
         match icon {
-            Icon::Go => colors.green,
+            Icon::Go | Icon::Open => colors.green,
             Icon::Break => colors.yellow,
-            Icon::Breakpoint => colors.red,
-            Icon::Restart | Icon::Trace => colors.blue,
+            Icon::Breakpoint | Icon::Disconnect | Icon::Record | Icon::Recording => colors.red,
+            Icon::Restart | Icon::Trace | Icon::Session | Icon::Script => colors.blue,
             _ => ui.visuals().text_color(),
         }
     };
@@ -1489,6 +1644,39 @@ fn icon_button(ui: &mut Ui, icon: Icon, enabled: bool, tooltip: &str) -> bool {
             }
             arrow(&painter, at(8.0, 6.0), Vec2::new(1.0, 0.0));
         }
+        Icon::Open => {
+            // Um arco aberto em cima e o traço.
+            let points: Vec<Pos2> = (0..=20)
+                .map(|step| {
+                    let angle = -std::f32::consts::FRAC_PI_2 + 0.7 + (2.0 * std::f32::consts::PI - 1.4) * step as f32 / 20.0;
+                    at(7.0 * angle.cos(), 1.0 + 7.0 * angle.sin())
+                })
+                .collect();
+            painter.add(egui::Shape::line(points, stroke));
+            painter.line_segment([at(0.0, -8.0), at(0.0, 0.0)], stroke);
+        }
+        Icon::Disconnect => {
+            painter.rect_filled(egui::Rect::from_center_size(center, Vec2::splat(11.0)), 2.0, color);
+        }
+        Icon::Session => {
+            // Um disquete: o corpo, a janela de cima e a etiqueta.
+            painter.rect_stroke(egui::Rect::from_center_size(center, Vec2::splat(14.0)), 2.0, Stroke::new(1.5, color), egui::StrokeKind::Inside);
+            painter.rect_filled(egui::Rect::from_min_size(at(-4.0, -7.0), Vec2::new(8.0, 4.5)), 0.0, color);
+            painter.line_segment([at(-4.0, 3.0), at(4.0, 3.0)], Stroke::new(1.5, color));
+        }
+        Icon::Script => {
+            // Uma página com linhas e o triângulo de rodar.
+            painter.rect_stroke(egui::Rect::from_center_size(at(-2.5, 0.0), Vec2::new(11.0, 15.0)), 1.0, Stroke::new(1.5, color), egui::StrokeKind::Inside);
+            for index in 0..3 {
+                let y = -4.0 + index as f32 * 3.5;
+                painter.line_segment([at(-6.0, y), at(0.5, y)], Stroke::new(1.2, color));
+            }
+            painter.add(egui::Shape::convex_polygon(vec![at(3.0, 1.5), at(9.5, 5.0), at(3.0, 8.5)], color, Stroke::NONE));
+        }
+        Icon::Record | Icon::Recording => {
+            painter.circle_stroke(center, 7.0, Stroke::new(1.5, color));
+            painter.circle_filled(center, if icon == Icon::Recording { 5.0 } else { 3.0 }, color);
+        }
         Icon::Theme => {
             painter.circle_stroke(center, 6.5, stroke);
             painter.add(egui::Shape::convex_polygon((0..=12).map(|step| {
@@ -1532,9 +1720,31 @@ fn toolbar(ui: &mut Ui, state: &mut UiState) {
         if icon_button(ui, Icon::Trace, stopped, "Rastro de instruções (painel Rastro)") {
             state.focus_tab.push(Tab::Trace);
         }
-        if icon_button(ui, Icon::Restart, state.can_restart, "Reiniciar: fecha o QEMU, recompila e abre de novo") {
+        let opening = matches!(state.status, Status::Launching(_) | Status::Connecting(_));
+        if icon_button(ui, Icon::Restart, state.can_restart && !opening, "Reiniciar: fecha o QEMU, recompila e abre de novo (Ctrl+Shift+F5)") {
             state.requests.push(Request::Restart);
         }
+        ui.add_space(6.0);
+        if icon_button(ui, Icon::Open, !opening, "Abrir o OpenNT com outras opções do xtask ou conectar a um QEMU aberto (Ctrl+O)") {
+            state.open_form();
+        }
+        if icon_button(ui, Icon::Disconnect, matches!(state.status, Status::Stopped | Status::Running), "Desconectar (Shift+F5): um QEMU aberto pelo depurador fecha; um de fora segue rodando") {
+            state.requests.push(Request::Disconnect);
+        }
+        if icon_button(ui, Icon::Session, true, "Salvar ou abrir uma sessão: breakpoints, expressões, memória e opções de abertura (Ctrl+S)") {
+            state.open_sessions();
+        }
+        if icon_button(ui, Icon::Script, true, "Rodar um roteiro do kd (Ctrl+R); Ctrl+Shift+R roda de novo o último") {
+            state.open_scripts();
+        }
+        let (icon, tooltip) = match &state.recording {
+            Some((path, lines)) => (Icon::Recording, format!("Parar a gravação: {lines} linhas em {} (Ctrl+Shift+G)", path.display())),
+            None => (Icon::Record, "Gravar os comandos num roteiro que o test-boot roda (Ctrl+Shift+G)".to_string()),
+        };
+        if icon_button(ui, icon, true, &tooltip) {
+            state.toggle_recording();
+        }
+        ui.add_space(6.0);
         if icon_button(ui, Icon::Theme, true, "Alterna o tema claro e o escuro") {
             state.light = !state.light;
         }
@@ -1766,9 +1976,10 @@ fn command_panel(ui: &mut Ui, state: &mut UiState) {
         });
     } else {
         let mut copy: Option<Option<usize>> = None;
-        egui::ScrollArea::both().id_salt("transcript").auto_shrink([false, false]).stick_to_bottom(true).max_height(output_height).show_rows(ui, height, state.transcript_lines.len(), |ui, range| {
+        let start = state.transcript_start.min(state.transcript_lines.len());
+        egui::ScrollArea::both().id_salt("transcript").auto_shrink([false, false]).stick_to_bottom(true).max_height(output_height).show_rows(ui, height, state.transcript_lines.len() - start, |ui, range| {
             for index in range {
-                let line = &state.transcript_lines[index];
+                let line = &state.transcript_lines[start + index];
                 let color = match line.kind {
                     LineKind::Input => colors.blue,
                     LineKind::Output => ui.visuals().text_color(),
