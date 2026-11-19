@@ -5968,13 +5968,38 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     (`<build>/opennt-re/db/<modulo>.json`) guarda comentários, rótulos,
     marcadores e breakpoints por RVA; é lido na abertura e gravado quando
     muda, e os breakpoints guardados são armados quando o módulo aparece.
+  - Navegação e uso (`navigation.rs`, `status.rs`, `console.rs`,
+    `copy_text.rs`, `layout.rs`): o histórico de idas da desmontagem por
+    módulo + RVA (Alt+Esquerda e Alt+Direita, os botões laterais do mouse,
+    o menu Navegar e os botões da barra de ferramentas); a janela Ir para
+    (Ctrl+G) com a busca aproximada sobre todos os símbolos carregados (o
+    índice que o backend publica a cada troca de módulos, procurado numa
+    thread própria; uma tecla nova cancela a busca anterior), os rótulos e
+    os marcadores, e o avaliador para o que parece expressão; os marcadores
+    (Ctrl+M liga, F6 e Shift+F6 andam, a lista no menu Navegar); a lista dos
+    atalhos (F1), e as teclas das preferências nos menus, nas dicas da barra
+    de ferramentas e na barra de estado; a barra de estado com o estado do
+    alvo (rodando há quanto tempo), a CPU, o IRQL, o processo, a thread, o
+    modo, os PDBs que ainda estão chegando e a tarefa do backend com o
+    tempo; o console embaixo (Ctrl+J: comandos ou eventos, filtro, cópia) e
+    o log de eventos da janela (aba Log, Eventos); copiar qualquer aba como
+    texto (Ctrl+Shift+C ou o botão direito no título da aba); a posição, o
+    tamanho e o maximizado da janela (em pixels físicos), os painéis
+    divisíveis e o arranjo das abas (lido à parte do resto, com as abas
+    novas da versão) no arquivo de estado. A parada chega à janela antes do
+    índice de símbolos; as listas grandes (Símbolos, Referências, o console)
+    só são refiltradas quando a lista ou o filtro mudam; as comparações
+    para gravar notas, preferências e estado rodam uma vez por segundo.
   - Testes de unidade (`cargo test -p kd-re --release`): o destaque, os
     formatos do Dump, o modelo do editor de breakpoints, as colunas dos
     operandos, os formatos dos XMM, as preferências e o banco por módulo
     (ida e volta pelo disco), os imports e os trampolins, os
     `#define` do SDK e as tabelas de mensagens, a análise do módulo (os
-    pedaços encadeados, a `.reloc`, os lotes) e os caminhos dos campos
-    dos tipos.
+    pedaços encadeados, a `.reloc`, os lotes), os caminhos dos campos
+    dos tipos, o histórico, a busca aproximada (a nota, a ordem, o limite
+    e a thread), os marcadores, a barra de estado, o transcrito em linhas,
+    o log de eventos, a geometria da janela, o arranjo salvo de outra
+    versão e a janela desenhada fora da tela com as janelas novas.
   - Fumaça das ferramentas (`tests/smoke_tools.rs`, `--ignored`): com
     `--start-driver=ntfs`, o monitor e o rastreador ligados no começo do
     boot, o IoCreateDevice do ntfs.sys com STATUS_SUCCESS, um
