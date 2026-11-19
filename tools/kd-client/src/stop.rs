@@ -6,8 +6,11 @@
 //! primeiros do `g`), a impressão digital da lista de módulos (`modgen:`),
 //! o EPROCESS corrente do processador (`process:`) e, numa carga de imagem
 //! do filtro de carga, `library:;load:base,tamanho,pid,nome;` (o nome em
-//! hexadecimal). Um alvo sem eles (o gdbstub do QEMU, um kernel antigo)
-//! deixa os campos vazios e o cliente pergunta como antes.
+//! hexadecimal). Numa parada pedida por NMI vem `nmi:`; numa exceção do
+//! anel 3 que o filtro por código parou, `exception:código;chance:n;` (e
+//! `term:` quando é o fim do processo com o código). Um alvo sem eles (o
+//! gdbstub do QEMU, um kernel antigo) deixa os campos vazios e o cliente
+//! pergunta como antes.
 
 /// Nomes dos sinais que o depurador do OpenNT usa.
 pub const SIGNALS: &[(u8, &str)] = &[(2, "SIGINT (pedido de parada)"), (4, "SIGILL"), (5, "SIGTRAP"), (6, "SIGABRT (bugcheck/panico)"), (8, "SIGFPE"), (11, "SIGSEGV")];
@@ -27,6 +30,12 @@ pub enum Reason {
     /// `load:` do OpenNT): base, tamanho, PID (0 = imagem de sistema) e o
     /// nome-base. Sem o `load:` (um GDB comum), tudo zero e nome vazio.
     Library { base: u64, size: u64, pid: u64, name: String },
+    /// Parada pedida por NMI (`nmi:`).
+    Nmi,
+    /// Exceção do anel 3 parada pelo filtro por código (`exception:`,
+    /// `chance:`, `term:`): o código, a chance (1 ou 2) e se é o fim do
+    /// processo com o código.
+    Exception { code: u32, chance: u8, termination: bool },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,6 +74,9 @@ impl StopReply {
         let mut reply = StopReply { signal, thread: None, reasons: Vec::new(), registers: Vec::new(), module_generation: None, process: None, packet: packet.to_string() };
         let mut load = None;
         let mut library = false;
+        let mut exception: Option<u32> = None;
+        let mut chance = 0u8;
+        let mut termination = false;
         for field in packet.get(3..).unwrap_or("").split(';').filter(|field| !field.is_empty()) {
             let (key, value) = field.split_once(':').unwrap_or((field, ""));
             match key {
@@ -77,6 +89,10 @@ impl StopReply {
                 "load" => load = parse_load(value),
                 "modgen" => reply.module_generation = u64::from_str_radix(value, 16).ok(),
                 "process" => reply.process = u64::from_str_radix(value, 16).ok().filter(|&process| process != 0),
+                "nmi" => reply.reasons.push(Reason::Nmi),
+                "exception" => exception = u32::from_str_radix(value, 16).ok(),
+                "chance" => chance = value.parse().unwrap_or(0),
+                "term" => termination = true,
                 // Só dígitos hexadecimais: um registrador adiantado.
                 _ if !key.is_empty() && key.len() <= 4 && key.bytes().all(|byte| byte.is_ascii_hexdigit()) => {
                     if let Ok(number) = usize::from_str_radix(key, 16) {
@@ -88,6 +104,9 @@ impl StopReply {
         }
         if library || load.is_some() {
             reply.reasons.push(load.unwrap_or(Reason::Library { base: 0, size: 0, pid: 0, name: String::new() }));
+        }
+        if let Some(code) = exception {
+            reply.reasons.push(Reason::Exception { code, chance, termination });
         }
         Some(reply)
     }
@@ -141,6 +160,16 @@ impl StopReply {
                 Reason::Memory { address } => format!("membp {address:x}"),
                 Reason::Library { name, .. } if name.is_empty() => "library".to_string(),
                 Reason::Library { name, pid, .. } => format!("library {name} (PID {pid})"),
+                Reason::Nmi => "nmi".to_string(),
+                Reason::Exception { code, chance, termination } => {
+                    let which = match chance {
+                        1 => "primeira chance",
+                        2 => "segunda chance",
+                        _ => "chance ?",
+                    };
+                    let end = if *termination { ", fim do processo" } else { "" };
+                    format!("excecao {code:#010x} ({which}{end})")
+                }
             })
             .collect::<Vec<_>>()
             .join(" ")
@@ -200,5 +229,18 @@ mod tests {
         assert!(plain.registers.is_empty());
         assert_eq!(plain.module_generation, None);
         assert!(StopReply::parse("T05thread:1;").unwrap().library().is_none());
+    }
+
+    /// A parada por NMI e a exceção do anel 3 do filtro por código.
+    #[test]
+    fn parses_nmi_and_ring3_exception() {
+        let stop = StopReply::parse("T02thread:1;nmi:;").unwrap();
+        assert_eq!(stop.reasons, vec![Reason::Nmi]);
+        assert_eq!(stop.reason_text(), "nmi");
+        let stop = StopReply::parse("T0bthread:1;exception:c0000409;chance:2;term:;process:ffffa00000123080;").unwrap();
+        assert_eq!(stop.reasons, vec![Reason::Exception { code: 0xC000_0409, chance: 2, termination: true }]);
+        assert_eq!(stop.reason_text(), "excecao 0xc0000409 (segunda chance, fim do processo)");
+        assert!(stop.registers.is_empty());
+        assert_eq!(stop.brief(), "T0bthread:1;exception:c0000409;chance:2;term:;");
     }
 }

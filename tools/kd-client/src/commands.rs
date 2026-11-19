@@ -66,6 +66,7 @@
 //! dtv [modulo!]<tipo> <expr> [abertos,...]   o endereco como tipo, em arvore
 //! snap save|load|del <nome> | snap list   snapshots da maquina (monitor do QEMU)
 //! rstep | rcont              passo para tras e para tras ate o breakpoint (reproducao)
+//! nmi                        uma NMI pelo monitor do QEMU (para com as interrupcoes desligadas)
 //! !procs | !threads [pid] | !waits <ethread> | !handles <pid> [texto] | !obj <end|caminho> | !obtypes
 //! !token <pid|end> | !iocp <pid|end> | !waitpkt <pid|end> | !alpc <pid|end|caminho> | !wnf [pid | nome <valor>] | !hives
 //!                            objetos do NT pelos tipos do PDB, em colunas fixas (`nt_objects`)
@@ -106,6 +107,7 @@ irptrace on | off | show [n] [texto] | irp <n|endereco> (rastreador de IRPs)
 reg <caminho> | regv <caminho> <nome> | objdir [caminho] | fsls [caminho] | fscat <caminho> [desl] [bytes]
 dtv [modulo!]<tipo> <expr> [abertos,...] (o endereco como tipo, em arvore) | snap save|load|del <nome> | snap list
 rstep | rcont (passo para tras e para tras ate o breakpoint, na reproducao com --replay)
+nmi (uma NMI pelo monitor do QEMU: para o alvo mesmo com as interrupcoes desligadas)
 !procs | !threads [pid] | !waits <ethread> | !handles <pid> [texto] | !obj <end|caminho> | !obtypes (objetos do NT pelo PDB)
 !token <pid|end> | !iocp <pid|end> | !waitpkt <pid|end> | !alpc <pid|end|caminho> | !wnf [pid | nome <valor>] | !hives
 detach | quit
@@ -1114,7 +1116,7 @@ impl Client {
                 let created = self.add_range_watch(kind, start, length)?;
                 Ok(created.iter().map(|breakpoint| format!("#{} {:#x} ({} bytes)", breakpoint.id, breakpoint.address, breakpoint.length)).collect::<Vec<_>>().join("\n"))
             }
-            "apimon" | "irptrace" | "reg" | "regv" | "objdir" | "fsls" | "fscat" | "dtv" | "rstep" | "rcont" | "snap" => self.re_command(command, &words),
+            "apimon" | "irptrace" | "reg" | "regv" | "objdir" | "fsls" | "fscat" | "dtv" | "rstep" | "rcont" | "snap" | "nmi" => self.re_command(command, &words),
             "modules" => Ok(self.symbols.modules.iter().map(|module| format!("{:#018x} {:#018x} {:<16} {} simbolos ({})\n", module.base, module.end, module.name, module.symbols.len(), module.source)).collect()),
             "detach" => self.detach(),
             "help" => Ok(HELP.to_string()),
@@ -1129,7 +1131,7 @@ impl Client {
             "attach", "break", "c", "g", "continue", "wait-stop", "s", "t", "step", "p", "gu", "regs", "r", "rx", "x", "db", "dw", "dd", "dq", "da", "du", "write", "poke", "bp", "bu", "bc", "hbp", "hbc", "ba", "bpm", "bpmc", "watch", "unwatch", "sxe", "sxd", "bd", "be", "bl", ".bplog", ".bpsave", ".bpload", "bt", "k", "context", "btt", "?", "sym", "ln", "addr", "xs", "dt", "thread", "cpulist", "ps",
             "threads", "lm", "lmv", "cpus", "irql", "obj", "log", "bugcheck", "kd", ".reload", "!process", "!thread", "!irp", "!devobj", "!drvobj", "!object", "!handle", "!analyze", "trace", "monitor", "modules", "detach", "help",
             ".process", "lmu", "handles", "vad", "uthreads", "ustack", "kmap", "events", "uex", "bgd", "bge", "bar",
-            "apimon", "irptrace", "reg", "regv", "objdir", "fsls", "fscat", "dtv", "rstep", "rcont", "snap",
+            "apimon", "irptrace", "reg", "regv", "objdir", "fsls", "fscat", "dtv", "rstep", "rcont", "snap", "nmi",
             "!procs", "!threads", "!waits", "!handles", "!obj", "!obtypes", "!token", "!iocp", "!waitpkt", "!alpc", "!wnf", "!hives",
         ]
     }

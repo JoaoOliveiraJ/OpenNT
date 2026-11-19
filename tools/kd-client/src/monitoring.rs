@@ -716,6 +716,16 @@ impl Client {
             }
             "rstep" => self.reverse_step(),
             "rcont" => self.reverse_continue(),
+            "nmi" => {
+                // O botão de NMI do QEMU (pelo LINT1 do BSP): o depurador do
+                // alvo para mesmo num trecho com as interrupções desligadas,
+                // onde o 0x03 do `break` não é visto.
+                let output = self.hmp("nmi", Duration::from_secs(10))?;
+                if let Some(error) = hmp::error_text(&output) {
+                    return Err(format!("nmi: {error}"));
+                }
+                Ok("NMI mandada pelo monitor do QEMU (a parada chega no wait-stop)".into())
+            }
             "snap" => match words.first().copied().unwrap_or("list") {
                 "save" => self.snapshot_save(words.get(1).ok_or("uso: snap save <nome>")?),
                 "load" => self.snapshot_load(words.get(1).ok_or("uso: snap load <nome>")?),
