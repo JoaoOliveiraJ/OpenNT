@@ -44,7 +44,11 @@
 //! - `console`: o painel do console, o transcrito em rolagem virtual e o log
 //!   de eventos da janela;
 //! - `copy_text`: copiar qualquer aba como texto;
-//! - `layout`: a janela, os painéis e o arranjo das abas entre execuções.
+//! - `layout`: a janela, os painéis e o arranjo das abas entre execuções;
+//! - `exception`: o EXCEPTION_RECORD em palavras (fail-fast, exceções
+//!   guardadas do WinRT, violação de acesso, C++) e onde achá-lo numa
+//!   parada;
+//! - `follow`: os planos de seguir e o texto dos eventos do kd-client.
 
 pub mod analysis;
 pub mod annotations;
@@ -58,7 +62,9 @@ pub mod cpu;
 pub mod disasm;
 pub mod dump;
 pub mod editor;
+pub mod exception;
 pub mod explorers;
+pub mod follow;
 pub mod graph;
 pub mod highlight;
 pub mod imports;
