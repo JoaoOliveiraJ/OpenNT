@@ -19,6 +19,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
@@ -37,7 +38,7 @@ use kd_client::{registers, Breakpoint, BreakpointKind, Client};
 
 use crate::details::{self, KthreadLayout, PdbStatus, ThreadDetail};
 use crate::disasm::{self, Line};
-use crate::launcher::{Launch, LaunchOptions};
+use crate::launcher::{Launch, LaunchOptions, CANCELLED};
 use crate::source::{Local, LineTable};
 
 /// Onde está o alvo.
@@ -428,6 +429,8 @@ pub struct Shared {
     pub launch_log: String,
     /// Pode reiniciar (o alvo é do próprio depurador).
     pub can_restart: bool,
+    /// O alvo da sessão (o último pedido), para reabrir ou reconectar.
+    pub target: Option<Target>,
     pub trace: Option<Arc<TraceView>>,
     pub reference: Option<Arc<TraceView>>,
     /// Muda a cada rastro novo.
@@ -440,6 +443,9 @@ pub struct Shared {
 pub struct Backend {
     requests: Sender<Request>,
     pub shared: Arc<Mutex<Shared>>,
+    /// Cancela a abertura ou o roteiro em andamento: a janela liga direto,
+    /// sem passar pela fila (o backend está ocupado justamente nisso).
+    cancel: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -450,16 +456,22 @@ impl Backend {
     pub fn start(config: Config, target: Option<Target>, notify: Notify) -> Backend {
         let (requests, receiver) = mpsc::channel();
         let shared = Arc::new(Mutex::new(Shared::default()));
-        let worker = Worker::new(config, Arc::clone(&shared), notify);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker = Worker::new(config, Arc::clone(&shared), notify, Arc::clone(&cancel));
         let thread = thread::Builder::new()
             .name("kd-backend".into())
             .spawn(move || worker.run(receiver, target))
             .expect("thread do backend");
-        Backend { requests, shared, thread: Some(thread) }
+        Backend { requests, shared, cancel, thread: Some(thread) }
     }
 
     pub fn send(&self, request: Request) {
         let _ = self.requests.send(request);
+    }
+
+    /// Cancela a abertura (build, QEMU, conexão) ou o roteiro em andamento.
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::SeqCst);
     }
 
     pub fn shared(&self) -> MutexGuard<'_, Shared> {
@@ -499,6 +511,7 @@ struct Worker {
     config: Config,
     shared: Arc<Mutex<Shared>>,
     notify: Notify,
+    cancel: Arc<AtomicBool>,
     target: Option<Target>,
     client: Option<Client>,
     launch: Option<Launch>,
@@ -537,11 +550,12 @@ const THREAD_DETAIL_LIMIT: usize = 512;
 const KERNEL_START: u64 = 0xFFFF_8000_0000_0000;
 
 impl Worker {
-    fn new(config: Config, shared: Arc<Mutex<Shared>>, notify: Notify) -> Worker {
+    fn new(config: Config, shared: Arc<Mutex<Shared>>, notify: Notify, cancel: Arc<AtomicBool>) -> Worker {
         Worker {
             config,
             shared,
             notify,
+            cancel,
             target: None,
             client: None,
             launch: None,
@@ -629,7 +643,10 @@ impl Worker {
     /// Conecta (abrindo o QEMU antes, no `--launch`) e anexa.
     fn start(&mut self, target: Target) {
         self.disconnect("reiniciando");
+        self.cancel.store(false, Ordering::SeqCst);
         self.target = Some(target.clone());
+        let published = target.clone();
+        self.publish(|shared| shared.target = Some(published));
         self.view = View::Owner;
         self.selected_frame = 0;
         self.focus = Focus::Frame;
@@ -651,6 +668,11 @@ impl Worker {
             Target::Launch(options) => {
                 self.config.elf = options.build_path().join("kernel.elf");
                 self.config.serial_log = Some(options.build_path().join("serial.log"));
+                // Os breakpoints da sessão seguem o diretório de build da
+                // abertura (a janela de abertura pode trocá-lo).
+                if self.config.session.is_some() {
+                    self.config.session = Some(options.build_path().join("opennt-dbg").join("breakpoints.txt"));
+                }
                 self.publish(|shared| {
                     shared.can_restart = true;
                     shared.launch_log.clear();
@@ -660,7 +682,7 @@ impl Worker {
                 self.set_status(Status::Launching("compilando com --kd=com2 e abrindo o QEMU".into()));
                 let shared = Arc::clone(&self.shared);
                 let notify = Arc::clone(&self.notify);
-                let launched = Launch::start(options, |line| {
+                let launched = Launch::start(options, &self.cancel, |line| {
                     {
                         let mut shared = shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                         shared.launch_log.push_str(line);
@@ -683,11 +705,22 @@ impl Worker {
             }
         };
         self.set_status(Status::Connecting(address.clone()));
-        let connection = match Connection::connect(&address, Instant::now() + Duration::from_secs(60)) {
-            Ok(connection) => connection,
-            Err(error) => {
-                self.set_status(Status::Disconnected(error));
-                return;
+        // Tentativas de um segundo até o prazo, para o Cancelar valer logo.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let connection = loop {
+            match Connection::connect(&address, (Instant::now() + Duration::from_secs(1)).min(deadline)) {
+                Ok(connection) => break connection,
+                Err(error) => {
+                    let cancelled = self.cancel.swap(false, Ordering::SeqCst);
+                    if cancelled || Instant::now() >= deadline {
+                        // O QEMU aberto pela sessão não fica para trás.
+                        if let Some(mut launch) = self.launch.take() {
+                            launch.stop();
+                        }
+                        self.set_status(Status::Disconnected(if cancelled { CANCELLED.to_string() } else { error }));
+                        return;
+                    }
+                }
             }
         };
         let mut client = Client::new(connection, self.config.root.clone(), self.config.elf.clone());
@@ -695,6 +728,12 @@ impl Worker {
         match client.attach(Duration::from_secs(180)) {
             Ok(text) => {
                 self.transcript("attach", Ok(text));
+                // Num QEMU de fora, o log da COM1 é o do diretório de build
+                // (ou o do --serial-log): a janela diz qual arquivo segue.
+                if let (Some(Target::Connect(_)), Some(path)) = (&self.target, &self.config.serial_log) {
+                    let note = if path.exists() { format!("log da COM1 lido de {} (--serial-log=ARQ troca o arquivo)", path.display()) } else { format!("sem o log da COM1: {} nao existe (--serial-log=ARQ indica o arquivo)", path.display()) };
+                    self.transcript("(sessao)", Ok(note));
+                }
                 // Os breakpoints da sessão anterior (os de módulos que ainda
                 // não carregaram ficam adiados).
                 if let Some(path) = &self.config.session {

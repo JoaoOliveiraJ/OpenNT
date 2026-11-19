@@ -3,6 +3,7 @@
 //! ```text
 //! cargo run -p kd-gui --release -- --launch              build com --kd=com2, QEMU e a janela
 //! cargo run -p kd-gui --release -- --connect=127.0.0.1:1234   a um `cargo xtask run --kd=com2`
+//! cargo run -p kd-gui --release -- --launch --initial-process=smss --display=basic
 //! cargo run -p kd-gui --release -- --launch --screenshot=docs/screenshots/kd-gui.png --scenario=driver
 //! ```
 
@@ -16,14 +17,15 @@ use egui_dock::{DockState, NodeIndex};
 use kd_client::commands::TraceOptions;
 use kd_gui::app::{DebuggerApp, Tab};
 use kd_gui::backend::{Backend, Config, Request, Status, Target};
-use kd_gui::launcher::LaunchOptions;
+use kd_gui::launcher::{self, LaunchOptions};
 use kd_gui::{offscreen, scenario};
 
 const USAGE: &str = "uso: opennt-dbg [opcoes] [opcoes do xtask]
   --launch               compila com --kd=com2 e abre o QEMU (cargo xtask debug --launch --no-client)
-  --connect=HOST:PORTA   conecta a um QEMU aberto (cargo xtask run --kd=com2: 127.0.0.1:1234)
+  --connect=HOST:PORTA   conecta a um QEMU aberto (cargo xtask run --kd=com2: 127.0.0.1:1234;
+                         aceita so a porta ou a linha \"KD_READY 127.0.0.1:PORTA\" do xtask)
   --build-dir=DIR        diretorio de build (padrao build): kernel.elf, serial.log
-  --serial-log=ARQ       o log da COM1 a acompanhar (padrao com --connect: DIR/serial.log)
+  --serial-log=ARQ       o log da COM1 a acompanhar (padrao DIR/serial.log; o --launch usa o do build)
   --headless-qemu        com --launch: o QEMU sem janela
   --root=DIR             raiz do repositorio (padrao: a deste checkout)
   --screenshot=ARQ.png   sem janela: espera a parada, desenha a janela fora da tela e sai
@@ -56,7 +58,7 @@ fn parse(arguments: impl Iterator<Item = String>) -> Result<Options, String> {
         let required = || value.clone().ok_or_else(|| format!("{name} exige um valor ({name}=...)"));
         match name.as_str() {
             "--launch" => options.launch = true,
-            "--connect" => options.connect = Some(required()?),
+            "--connect" => options.connect = Some(launcher::parse_connect_address(&required()?)?),
             "--build-dir" => options.build_dir = PathBuf::from(required()?),
             "--serial-log" => options.serial_log = Some(PathBuf::from(required()?)),
             "--headless-qemu" => options.headless = true,
@@ -97,9 +99,10 @@ fn main() -> ExitCode {
     let launch = LaunchOptions { root: options.root.clone(), build_dir: options.build_dir.clone(), headless: options.headless || options.screenshot.is_some(), extra: options.extra.clone() };
     // A sessão (os breakpoints) só na janela: a captura começa limpa.
     let session = options.screenshot.is_none().then(|| launch.build_path().join("opennt-dbg").join("breakpoints.txt"));
-    // O log da COM1: o pedido, ou o do diretório de build ao conectar a um
-    // `cargo xtask run --kd=com2` (no `--launch` o backend usa o do build).
-    let serial_log = options.serial_log.clone().map(|path| if path.is_absolute() { path } else { options.root.join(path) }).or_else(|| options.connect.as_ref().map(|_| launch.build_path().join("serial.log")));
+    // O log da COM1: o pedido (relativo à raiz) ou o do diretório de build,
+    // o de um QEMU de fora (o backend troca pelo do build no --launch e numa
+    // conexão aberta pela janela).
+    let serial_log = Some(options.serial_log.clone().map(|path| if path.is_absolute() { path } else { options.root.join(path) }).unwrap_or_else(|| launch.build_path().join("serial.log")));
     let config = Config { root: options.root.clone(), elf: launch.build_path().join("kernel.elf"), serial_log, session };
     let target = if options.launch {
         Some(Target::Launch(launch.clone()))

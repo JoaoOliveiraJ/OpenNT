@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::backend::{Backend, Entry, QueryKind, Request, Snapshot, Status, Target, TraceView, View};
 use crate::disasm::{self, ValueHint};
-use crate::launcher::LaunchOptions;
+use crate::launcher::{self, LaunchOptions};
 
 /// Os painéis.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -212,13 +212,50 @@ enum TraceDisplay {
     Diff,
 }
 
-/// O estado salvo entre execuções.
+/// O estado salvo entre execuções (os campos que faltam num arquivo velho
+/// ficam com o padrão).
 #[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
 struct Saved {
     layout: Option<DockState<Tab>>,
     light: bool,
     watches: Vec<String>,
     history: Vec<String>,
+    /// As opções do xtask das últimas aberturas (a mais nova antes).
+    recent_launch: Vec<String>,
+    /// Os últimos endereços conectados.
+    recent_connect: Vec<String>,
+}
+
+/// As opções comuns do `xtask` (os botões da janela de abertura).
+const COMMON_OPTIONS: [(&str, &str); 8] = [
+    ("--initial-process=smss", "a cadeia real: smss, csrss, wininit e winlogon (modo usuario)"),
+    ("--display=basic", "o video pelo BasicDisplay.sys e o BasicRender.sys reais"),
+    ("--accel=whpx", "WHPX (sem a opcao, o debug usa o TCG)"),
+    ("--accel=tcg", "TCG (o rastro rapido do QEMU precisa dele)"),
+    ("--smp=2", "dois processadores"),
+    ("--start-driver=ntfs", "o ntfs.sys real monta o volume"),
+    ("--trace-rpc", "cada mensagem ALPC das portas de servidor na COM1"),
+    ("--usb", "a controladora xHCI com teclado e tablet USB"),
+];
+
+/// O formulário da janela Abrir ou conectar.
+#[derive(Clone, Debug, Default)]
+struct OpenForm {
+    /// As opções do xtask em texto (`--initial-process=smss --display=basic`).
+    options: String,
+    build_dir: String,
+    headless: bool,
+    address: String,
+    error: Option<String>,
+}
+
+/// Põe `item` no começo de uma lista de recentes, sem repetir e com no
+/// máximo `limit` itens.
+fn remember_recent(list: &mut Vec<String>, item: &str, limit: usize) {
+    list.retain(|known| known != item);
+    list.insert(0, item.to_string());
+    list.truncate(limit);
 }
 
 /// O estado da interface (campos de texto, cópias do que o backend
@@ -256,6 +293,14 @@ pub struct UiState {
     thread_filter: Option<u64>,
     connect_address: String,
     launch: Option<LaunchOptions>,
+    /// A janela Abrir ou conectar (aberta quando `Some`).
+    open_dialog: Option<OpenForm>,
+    recent_launch: Vec<String>,
+    recent_connect: Vec<String>,
+    /// O alvo da sessão, como o backend publicou.
+    target: Option<Target>,
+    /// O botão Cancelar (vai direto ao backend, fora da fila de pedidos).
+    cancel: bool,
     /// A geração do snapshot que já rolou o código até o foco.
     scrolled_code: u64,
     scrolled_source: u64,
@@ -399,6 +444,11 @@ impl DebuggerApp {
                 thread_filter: None,
                 connect_address,
                 launch,
+                open_dialog: None,
+                recent_launch: Vec::new(),
+                recent_connect: Vec::new(),
+                target: None,
+                cancel: false,
                 scrolled_code: 0,
                 scrolled_source: 0,
                 requests: Vec::new(),
@@ -453,6 +503,8 @@ impl DebuggerApp {
                 self.state.light = saved.light;
                 self.state.watches = saved.watches;
                 self.state.history = saved.history;
+                self.state.recent_launch = saved.recent_launch;
+                self.state.recent_connect = saved.recent_connect;
             }
         }
         self.persist = Some(path);
@@ -488,7 +540,14 @@ impl DebuggerApp {
             return;
         }
         self.last_save = Instant::now();
-        let saved = Saved { layout: Some(self.dock.clone()), light: self.state.light, watches: self.state.watches.clone(), history: self.state.history.iter().rev().take(200).rev().cloned().collect() };
+        let saved = Saved {
+            layout: Some(self.dock.clone()),
+            light: self.state.light,
+            watches: self.state.watches.clone(),
+            history: self.state.history.iter().rev().take(200).rev().cloned().collect(),
+            recent_launch: self.state.recent_launch.clone(),
+            recent_connect: self.state.recent_connect.clone(),
+        };
         let Ok(text) = serde_json::to_string(&saved) else { return };
         if text == self.last_saved {
             return;
@@ -519,6 +578,7 @@ impl DebuggerApp {
         state.status = shared.status.clone();
         state.activity = shared.activity.clone();
         state.can_restart = shared.can_restart;
+        state.target = shared.target.clone();
         if shared.transcript.len() < state.transcript.len() {
             state.transcript.clear();
         }
@@ -578,6 +638,10 @@ impl DebuggerApp {
         });
         // As leituras caras que os painéis abertos querem.
         views::sync_wanted(&mut self.state, &open);
+        open_dialog(ui, &mut self.state);
+        if std::mem::take(&mut self.state.cancel) {
+            self.backend.cancel();
+        }
         // Observação: as expressões e as vistas abertas vão ao backend.
         if self.state.watches != self.state.sent_watches {
             self.state.sent_watches = self.state.watches.clone();
@@ -640,6 +704,9 @@ impl DebuggerApp {
         let stopped = self.state.status == Status::Stopped;
         let running = self.state.status == Status::Running;
         let pressed = |modifiers: Modifiers, key: Key| ui.input_mut(|input| input.consume_key(modifiers, key));
+        if pressed(Modifiers::CTRL, Key::O) && self.state.open_dialog.is_none() {
+            self.state.open_form();
+        }
         if stopped && pressed(Modifiers::SHIFT, Key::F11) {
             self.state.requests.push(Request::StepOut);
         }
@@ -676,18 +743,179 @@ impl eframe::App for DebuggerApp {
     }
 }
 
+impl UiState {
+    /// Abre a janela Abrir ou conectar com as opções da última abertura
+    /// (as da linha de comando, senão as da última vez).
+    fn open_form(&mut self) {
+        let recent = self.recent_launch.first().cloned().unwrap_or_default();
+        let (options, build_dir, headless) = match &self.launch {
+            Some(launch) if !launch.extra.is_empty() => (launch.extra.join(" "), launch.build_dir.display().to_string(), launch.headless),
+            Some(launch) => (recent, launch.build_dir.display().to_string(), launch.headless),
+            None => (recent, "build".to_string(), false),
+        };
+        self.open_dialog = Some(OpenForm { options, build_dir, headless, address: self.connect_address.clone(), error: None });
+    }
+
+    /// Abre o OpenNT com estas opções e as guarda como as últimas.
+    fn launch_with(&mut self, options: LaunchOptions) {
+        remember_recent(&mut self.recent_launch, &options.extra.join(" "), 12);
+        self.requests.push(Request::Start(Target::Launch(options.clone())));
+        self.launch = Some(options);
+    }
+
+    /// Conecta a um endereço já conferido e o guarda nos recentes.
+    fn connect_to(&mut self, address: String) {
+        remember_recent(&mut self.recent_connect, &address, 12);
+        self.connect_address = address.clone();
+        self.requests.push(Request::Start(Target::Connect(address)));
+    }
+
+    /// O botão Conectar da barra: o endereço do campo (`HOST:PORTA`, a
+    /// porta ou a linha `KD_READY`); um endereço inválido abre a janela
+    /// com o erro.
+    fn connect_to_typed_address(&mut self) {
+        match launcher::parse_connect_address(&self.connect_address) {
+            Ok(address) => self.connect_to(address),
+            Err(error) => {
+                self.open_form();
+                if let Some(form) = self.open_dialog.as_mut() {
+                    form.error = Some(error);
+                }
+            }
+        }
+    }
+}
+
+/// As opções de abertura do formulário (a raiz vem da linha de comando).
+fn form_launch_options(base: Option<&LaunchOptions>, form: &OpenForm) -> Result<LaunchOptions, String> {
+    let extra = launcher::parse_xtask_options(&form.options)?;
+    let build_dir = form.build_dir.trim();
+    let root = base.map_or_else(crate::workspace_root, |launch| launch.root.clone());
+    Ok(LaunchOptions { root, build_dir: PathBuf::from(if build_dir.is_empty() { "build" } else { build_dir }), headless: form.headless, extra })
+}
+
+/// A janela Abrir ou conectar: as opções do `xtask` (com os botões das
+/// opções comuns e as últimas usadas), o diretório de build, o QEMU sem
+/// janela, e o endereço de um QEMU já aberto.
+fn open_dialog(ui: &mut Ui, state: &mut UiState) {
+    let Some(mut form) = state.open_dialog.take() else { return };
+    let colors = palette(ui);
+    let mut open = true;
+    let mut close = false;
+    egui::Window::new("Abrir ou conectar").id(egui::Id::new("kd-open-dialog")).collapsible(false).resizable(false).default_width(660.0).anchor(Align2::CENTER_TOP, Vec2::new(0.0, 90.0)).open(&mut open).show(ui.ctx(), |ui| {
+        ui.label(RichText::new("Abrir o OpenNT: compilar com --kd=com2 e iniciar o QEMU").strong());
+        let mut submit_launch = false;
+        ui.horizontal(|ui| {
+            ui.label("Opções do xtask:");
+            let response = ui.add(egui::TextEdit::singleline(&mut form.options).font(TextStyle::Monospace).desired_width(500.0).hint_text("--initial-process=smss --display=basic"));
+            if response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter)) {
+                submit_launch = true;
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            for (option, tooltip) in COMMON_OPTIONS {
+                if ui.selectable_label(launcher::has_option(&form.options, option), mono(option)).on_hover_text(tooltip).clicked() {
+                    form.options = launcher::toggle_option(&form.options, option);
+                }
+            }
+        });
+        if !state.recent_launch.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("últimas:").color(colors.dim));
+                for recent in state.recent_launch.iter().take(6) {
+                    let shown = if recent.is_empty() { "(sem opções)" } else { recent.as_str() };
+                    if ui.small_button(mono(shown)).on_hover_text("usar estas opções").clicked() {
+                        form.options = recent.clone();
+                    }
+                }
+            });
+        }
+        ui.horizontal(|ui| {
+            ui.label("Diretório de build:");
+            ui.add(egui::TextEdit::singleline(&mut form.build_dir).font(TextStyle::Monospace).desired_width(220.0).hint_text("build"));
+            ui.checkbox(&mut form.headless, "QEMU sem janela");
+        });
+        let preview = form_launch_options(state.launch.as_ref(), &form);
+        match &preview {
+            Ok(options) => hint(ui, &options.command_line()),
+            Err(error) => {
+                ui.label(RichText::new(error).color(colors.red));
+            }
+        }
+        if ui.add_enabled(preview.is_ok(), egui::Button::new("Abrir")).clicked() || submit_launch {
+            match preview {
+                Ok(options) => {
+                    state.launch_with(options);
+                    close = true;
+                }
+                Err(error) => form.error = Some(error),
+            }
+        }
+        ui.separator();
+        ui.label(RichText::new("Conectar a um QEMU já aberto").strong());
+        let mut submit_connect = false;
+        ui.horizontal(|ui| {
+            ui.label("Endereço:");
+            let response = ui.add(egui::TextEdit::singleline(&mut form.address).font(TextStyle::Monospace).desired_width(320.0).hint_text("127.0.0.1:1234, a porta ou a linha KD_READY"));
+            if response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter)) {
+                submit_connect = true;
+            }
+            if ui.button("Conectar").clicked() {
+                submit_connect = true;
+            }
+        });
+        if !state.recent_connect.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("últimos:").color(colors.dim));
+                for recent in state.recent_connect.iter().take(6) {
+                    if ui.small_button(mono(recent)).clicked() {
+                        form.address = recent.clone();
+                    }
+                }
+            });
+        }
+        hint(ui, "O cargo xtask debug --launch --no-client imprime KD_READY 127.0.0.1:PORTA (cole a linha inteira); o cargo xtask run --kd=com2 escuta em 127.0.0.1:1234. Desconectar deixa a máquina rodando. Com outro diretório de build, abra o opennt-dbg com --build-dir=DIR (o kernel.elf e o serial.log).");
+        if submit_connect {
+            match launcher::parse_connect_address(&form.address) {
+                Ok(address) => {
+                    state.connect_to(address);
+                    close = true;
+                }
+                Err(error) => form.error = Some(error),
+            }
+        }
+        if let Some(error) = &form.error {
+            ui.separator();
+            ui.label(RichText::new(error).color(colors.red));
+        }
+        if ui.input(|input| input.key_pressed(Key::Escape)) {
+            close = true;
+        }
+    });
+    if open && !close {
+        state.open_dialog = Some(form);
+    }
+}
+
 fn menu_bar(ui: &mut Ui, state: &mut UiState, open: &[Tab]) {
     let stopped = state.status == Status::Stopped;
     let running = state.status == Status::Running;
     egui::MenuBar::new().ui(ui, |ui| {
+        let opening = matches!(state.status, Status::Launching(_) | Status::Connecting(_));
         ui.menu_button("Sessão", |ui| {
+            if ui.add_enabled(!opening, egui::Button::new("Abrir ou conectar...").shortcut_text("Ctrl+O")).on_hover_text("as opcoes do xtask, o diretorio de build ou o endereco de um QEMU aberto").clicked() {
+                state.open_form();
+            }
             if let Some(options) = state.launch.clone() {
-                if ui.button("Abrir o OpenNT (compilar e iniciar o QEMU)").clicked() {
+                if ui.add_enabled(!opening, egui::Button::new("Abrir o OpenNT com as últimas opções")).on_hover_text(options.command_line()).clicked() {
                     state.requests.push(Request::Start(Target::Launch(options)));
                 }
             }
-            if ui.add_enabled(state.can_restart, egui::Button::new("Reiniciar (recompilar e abrir de novo)")).clicked() {
+            if ui.add_enabled(state.can_restart && !opening, egui::Button::new("Reiniciar (recompilar e abrir de novo)")).clicked() {
                 state.requests.push(Request::Restart);
+            }
+            if ui.add_enabled(opening, egui::Button::new("Cancelar a abertura")).clicked() {
+                state.cancel = true;
             }
             if ui.button("Desconectar").clicked() {
                 state.requests.push(Request::Disconnect);
@@ -885,15 +1113,24 @@ fn toolbar(ui: &mut Ui, state: &mut UiState) {
         }
         ui.separator();
         let connected = matches!(state.status, Status::Stopped | Status::Running);
-        if !connected && !matches!(state.status, Status::Launching(_) | Status::Connecting(_)) {
+        let opening = matches!(state.status, Status::Launching(_) | Status::Connecting(_));
+        if opening {
+            if ui.button("Cancelar").on_hover_text("para a abertura: o cargo, o build e o QEMU terminam").clicked() {
+                state.cancel = true;
+            }
+        } else if !connected {
             if let Some(options) = state.launch.clone() {
-                if ui.button("Abrir o OpenNT").on_hover_text("cargo xtask debug --launch").clicked() {
+                if ui.button("Abrir o OpenNT").on_hover_text(options.command_line()).clicked() {
                     state.requests.push(Request::Start(Target::Launch(options)));
                 }
             }
-            ui.add(egui::TextEdit::singleline(&mut state.connect_address).desired_width(140.0).font(TextStyle::Monospace));
-            if ui.button("Conectar").clicked() {
-                state.requests.push(Request::Start(Target::Connect(state.connect_address.trim().to_string())));
+            if ui.button("Opções...").on_hover_text("abrir com outras opcoes do xtask ou conectar a um QEMU aberto (Ctrl+O)").clicked() {
+                state.open_form();
+            }
+            let response = ui.add(egui::TextEdit::singleline(&mut state.connect_address).desired_width(140.0).font(TextStyle::Monospace).hint_text("127.0.0.1:1234"));
+            let submit = response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
+            if ui.button("Conectar").on_hover_text("HOST:PORTA, a porta ou a linha KD_READY do xtask").clicked() || submit {
+                state.connect_to_typed_address();
             }
         }
         ui.separator();
@@ -1891,4 +2128,33 @@ fn trace_diff(ui: &mut Ui, state: &mut UiState, trace: &TraceView, colors: Palet
             columns[1].label(mono(describe(&reference, b as usize)).color(color));
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recent_lists() {
+        let mut list = vec!["b".to_string(), "a".to_string()];
+        remember_recent(&mut list, "a", 3);
+        assert_eq!(list, vec!["a".to_string(), "b".to_string()]);
+        remember_recent(&mut list, "c", 2);
+        assert_eq!(list, vec!["c".to_string(), "a".to_string()]);
+    }
+
+    #[test]
+    fn launch_options_from_the_form() {
+        let form = OpenForm { options: "--initial-process=smss --display=basic".into(), build_dir: " build/dbg ".into(), headless: true, address: String::new(), error: None };
+        let base = LaunchOptions { root: PathBuf::from("raiz"), build_dir: PathBuf::from("build"), headless: false, extra: Vec::new() };
+        let options = form_launch_options(Some(&base), &form).unwrap();
+        assert_eq!(options.root, PathBuf::from("raiz"));
+        assert_eq!(options.build_dir, PathBuf::from("build/dbg"));
+        assert!(options.headless);
+        assert_eq!(options.extra, vec!["--initial-process=smss".to_string(), "--display=basic".to_string()]);
+        let empty = OpenForm { build_dir: String::new(), ..form.clone() };
+        assert_eq!(form_launch_options(Some(&base), &empty).unwrap().build_dir, PathBuf::from("build"));
+        let wrong = OpenForm { options: "smss".into(), ..form };
+        assert!(form_launch_options(Some(&base), &wrong).is_err());
+    }
 }
