@@ -5609,8 +5609,35 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     laço.
 - **Depurador gráfico** (`tools/kd-gui`, binário `opennt-dbg`).
   - Uso: `cargo run -p kd-gui --release -- --launch` roda o mesmo build e
-    QEMU do `cargo xtask debug --launch` e abre a janela; `--connect=HOST:PORTA`
-    entra num QEMU aberto.
+    QEMU do `cargo xtask debug --launch` e abre a janela (as outras
+    `--opções` vão ao `xtask`: `--initial-process=smss --display=basic`);
+    `--connect=HOST:PORTA` entra num QEMU aberto e aceita só a porta ou a
+    linha `KD_READY 127.0.0.1:PORTA` colada; `--serial-log=ARQ` diz o log
+    da COM1 desse QEMU (padrão `<build>/serial.log`); `--session=ARQ` abre
+    uma sessão salva; `--script=ARQ` roda um roteiro do kd depois do
+    attach.
+  - Abrir ou conectar (Ctrl+O): o campo das opções do `xtask`, botões das
+    opções comuns, as últimas opções usadas, o diretório de build e o QEMU
+    sem janela; ou o endereço de um QEMU já aberto (os últimos ficam em
+    `estado.json`). Cancelar durante o build, a subida do QEMU ou a conexão
+    mata o `cargo` (e com ele o `xtask`, o `rustc` e o QEMU).
+  - Sessões com nome (Ctrl+S): os breakpoints no texto do `.bpsave`, as
+    expressões observadas, a memória e as opções de abertura em
+    `<build>/opennt-dbg/sessoes/<nome>.json`. Abrir troca os breakpoints
+    (na hora com a máquina parada, senão na próxima parada ou no attach).
+  - Roteiros (Ctrl+R): a linguagem do `--script` do `cargo xtask test-boot
+    --kd=com2`, lida inteira antes de rodar; cada linha vai ao painel
+    Comandos na hora, o Cancelar para entre linhas e nas esperas, e a
+    primeira conferência que falha para o roteiro. Na janela, `attach` não
+    faz nada e `wait-stop` volta na hora com a máquina já parada. A
+    gravação (Ctrl+Shift+G) escreve os comandos digitados, os botões de
+    execução (com `wait-stop` depois de um `c`) e os breakpoints da margem
+    e do painel num roteiro que o `cargo xtask debug --script=ARQ` roda.
+  - Falhas: a conexão que cai, o QEMU que termina (a linha `KD_QEMU_EXITED`
+    do `xtask`), a abertura ou o attach que falha aparecem num aviso no
+    alto da janela com como o QEMU saiu, um `*** STOP` ou pânico na COM1,
+    as últimas linhas da COM1 e do `xtask`, e os botões Reiniciar ou
+    Conectar de novo.
   - Interface: egui/eframe (Rust puro, backend OpenGL `glow`, sem wgpu) com
     painéis encaixáveis do `egui_dock`. Arranjo padrão: Desmontagem e
     Código-fonte no centro; Registradores, Observação e Variáveis locais à
@@ -5624,9 +5651,12 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     (adiados quando o módulo ainda não carregou).
   - Barra de ferramentas com ícones desenhados e dicas; teclas do WinDbg:
     F5 continua, F10 passa por cima, F11 entra, Shift+F11 sai, F9 liga ou
-    tira o breakpoint na linha escolhida, Ctrl+B para. Barra de estado:
-    conexão, estado do alvo, CPU, thread, processo e IRQL. Tema escuro e
-    claro.
+    tira o breakpoint na linha escolhida, Ctrl+B para, Ctrl+Shift+F5
+    reinicia, Shift+F5 desconecta, Alt+1 a Alt+9 abrem os painéis e F1
+    lista os atalhos. Os botões de execução só valem com o backend livre
+    (segurar o F10 não empilha passos). O painel Comandos tem rolagem
+    virtual. Barra de estado: conexão, estado do alvo, CPU, thread,
+    processo, IRQL, o roteiro rodando e a gravação. Tema escuro e claro.
   - Painéis: Desmontagem (iced-x86, sintaxe MASM, marcador do RIP, margem
     de breakpoints, destinos dos desvios; botão direito: breakpoint,
     executar até aqui, memória); Código-fonte (a linha do DWARF);
