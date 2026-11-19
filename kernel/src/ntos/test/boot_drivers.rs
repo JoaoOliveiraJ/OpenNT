@@ -17,6 +17,11 @@
 //!   \Device\KsecDD como o cryptbase.dll (SystemFunction040/041), com as
 //!   quatro opções; o que um processo cifrou o outro decifra, menos com
 //!   SAME_PROCESS, e a opção do SYSTEM não decifra para o token anônimo.
+//!   Depois, um processo de teste WinTcb-Light faz o cliente protegido do LSA
+//!   e outro faz o lsass.exe: o 0x478 do LsapOpenCaller é recusado só com a
+//!   proteção ligada, o 0x1000 abre, e o CopyVm, o AllocVm e o DupLsaHandle
+//!   do ksecdd servem o cliente, que libera a faixa pelo 0x390058 do
+//!   LsaFreeReturnBuffer.
 //! - fs_rec.sys: os reconhecedores registrados pelo IoRegisterFileSystem
 //!   estão nas filas de disco e de CD-ROM, e cada reconhecedor de disco
 //!   responde a um IRP_MN_MOUNT_VOLUME sobre o volume NTFS do segundo disco
@@ -26,7 +31,7 @@
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::ntos::inc::types::{DeviceObject, DevobjExtension, IoStackLocation, Irp, NtStruct};
+use crate::ntos::inc::types::{DeviceObject, DevobjExtension, Eprocess, IoStackLocation, Irp, NtStruct};
 use crate::ntos::io::{file_system, io_manager};
 use crate::ntos::io::irp_builder::{self, BuildOptions};
 use crate::ntos::mm::guest_memory as guest;
@@ -63,7 +68,10 @@ pub fn after_start(name: &str) {
         "null" => null_device(),
         "beep" => beep_device(),
         "fs_rec" => file_system_recognizers(),
-        "ksecdd" => ksecdd_memory_protection(),
+        "ksecdd" => {
+            ksecdd_memory_protection();
+            ksecdd_protected_client();
+        }
         _ => {}
     }
 }
@@ -349,6 +357,201 @@ fn ksecdd_memory_protection() {
     let second_ok = second_opened == 0 && cross == (0, 0, true) && system == (0, 0, true) && logon == (0, 0, true) && same == (0, 0, false) && same_system_key && second_closed == 0;
     if first_ok && second_ok {
         debug_print!("KSECDD_MEMORY_OK same/cross/logon/system cross-process=ok");
+    }
+}
+
+const IOCTL_KSEC_DUP_LSA_HANDLE: u64 = 0x39_0034;
+const IOCTL_KSEC_ALLOC_VM: u64 = 0x39_004C;
+const IOCTL_KSEC_COPY_VM: u64 = 0x39_0054;
+/// O LsaFreeReturnBuffer do sspicli num processo protegido.
+const IOCTL_KSEC_FREE_CLIENT_VM: u64 = 0x39_0058;
+const IOCTL_KSEC_INSERT_PROTECTED_ADDRESS: u64 = 0x39_005C;
+const IOCTL_KSEC_REMOVE_PROTECTED_ADDRESS: u64 = 0x39_0060;
+/// O LsapOpenKsec do lsass.exe: o processo vira o LSA do ksecdd.
+const IOCTL_KSEC_CONNECT_LSA: u64 = 0x39_8000;
+/// O primeiro NtOpenProcess do LsapOpenCaller e o da segunda tentativa.
+const PROCESS_LSA_CALLER: u64 = 0x478;
+const PROCESS_QUERY_LIMITED_INFORMATION: u64 = 0x1000;
+const WINTCB_LIGHT: u8 = 0x61;
+const MEM_COMMIT: u32 = 0x1000;
+const MEM_FREE: u32 = 0x1_0000;
+
+impl UserCalls {
+    /// NtOpenProcess(out, access, OBJECT_ATTRIBUTES vazio, CLIENT_ID {pid, 0}).
+    fn open_process(&self, process_id: u64, access: u64) -> (u32, u64) {
+        let attributes = self.at(Self::ATTRIBUTES);
+        guest::write_bytes(attributes, &[0; 0x30]);
+        guest::write32(attributes, 0x30);
+        let client_id = self.at(Self::DATA + 0x80);
+        guest::write64(client_id, process_id);
+        guest::write64(client_id + 8, 0);
+        guest::write64(self.at(Self::HANDLE), 0);
+        let status = self.call("NtOpenProcess", [self.at(Self::HANDLE), access, attributes, client_id]);
+        (status, guest::read64(self.at(Self::HANDLE)))
+    }
+
+    /// O State do MEMORY_BASIC_INFORMATION de `base` no próprio processo.
+    fn region_state(&self, base: u64) -> u32 {
+        let information = self.at(Self::DATA + 0x100);
+        self.stack(&[0x30, 0]);
+        match self.call("NtQueryVirtualMemory", [u64::MAX, base, 0, information]) {
+            0 => guest::read32(information + 0x20),
+            _ => 0,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct ProtectedClient {
+    opened: u32,
+    registered: u32,
+    lsa_opened: u32,
+    connected: u32,
+    control: u32,
+    denied: u32,
+    limited: u32,
+    queried: u32,
+    protected_flag: u32,
+    read: u32,
+    read_ok: bool,
+    written: u32,
+    written_ok: bool,
+    outside: u32,
+    allocated: u32,
+    committed: u32,
+    duplicated: u32,
+    token_closed: u32,
+    freed: u32,
+    again: u32,
+    released: u32,
+    removed: u32,
+    closed: u32,
+}
+
+/// O cliente protegido do LSA (services.exe, wininit.exe: o sspicli abre o
+/// \Device\KsecDD quando a PEB diz IsProtectedProcess). Um processo de teste
+/// WinTcb-Light faz o cliente e, dentro dele, um processo comum faz o lsass:
+/// registra-se no ksecdd (0x398000), abre o cliente como o LsapOpenCaller
+/// (0x478 recusado só com a proteção ligada, 0x1000 aceito, IsProtectedProcess
+/// nos Flags da ProcessBasicInformation estendida), lê e grava a faixa que o
+/// cliente registrou (0x39005C, CopyVm 0x390054), aloca no cliente (AllocVm
+/// 0x39004C) e duplica para ele o próprio token (DupLsaHandle 0x390034). De
+/// volta ao cliente, o LsaFreeReturnBuffer (0x390058) libera a faixa uma vez.
+fn ksecdd_protected_client() {
+    let pattern: Vec<u8> = (0..0x40u8).map(|index| index ^ 0xA5).collect();
+    let outcome = with_test_process("ksec-cliente.exe", None, |client| {
+        let mut result = ProtectedClient::default();
+        // SAFETY: o EPROCESS do processo de teste, vivo durante o corpo.
+        let protection = &unsafe { Eprocess::at(client.process) }.protection.level;
+        protection.set(WINTCB_LIGHT);
+        let user = UserCalls::new()?;
+        let (opened, handle) = user.open_ksecdd();
+        result.opened = opened;
+        let shared = user.at(UserCalls::DATA + 0x200);
+        guest::write_bytes(shared, &pattern);
+        let request = user.at(UserCalls::DATA + 0x180);
+        guest::write64(request, shared);
+        guest::write64(request + 8, 0x40);
+        result.registered = user.ioctl(handle, UserCalls::IOSB, IOCTL_KSEC_INSERT_PROTECTED_ADDRESS, request, 16, 0, 0);
+        let (client_process, client_id) = (client.process, client.process_id);
+        let lsa = with_test_process("ksec-lsa.exe", None, |lsa| {
+            // Sem lsass neste boot o \Security\LSA_AUTHENTICATION_INITIALIZED
+            // não sinaliza: com SecurityPort = 1 o CreateClient do
+            // IsOkayToExec (o 0x398000 o chama) devolve na hora
+            // STATUS_PROCESS_IS_TERMINATING (ksecdd 0x5b79) em vez de esperar.
+            // SAFETY: o EPROCESS do processo de teste interno.
+            unsafe { Eprocess::at(lsa.process) }.security_port.set(1);
+            let user = UserCalls::new()?;
+            let (opened, ksec) = user.open_ksecdd();
+            let out = user.at(UserCalls::DATA + 0x1C0);
+            let connected = user.ioctl(ksec, UserCalls::IOSB, IOCTL_KSEC_CONNECT_LSA, 0, 0, out, 4);
+            // O mesmo pedido sem e com a proteção do alvo.
+            // SAFETY: o EPROCESS do cliente, vivo durante o processo interno.
+            let level = &unsafe { Eprocess::at(client_process) }.protection.level;
+            level.set(0);
+            let (control, control_handle) = user.open_process(client_id, PROCESS_LSA_CALLER);
+            if control == 0 {
+                user.close(control_handle);
+            }
+            level.set(WINTCB_LIGHT);
+            let (denied, _) = user.open_process(client_id, PROCESS_LSA_CALLER);
+            let (limited, process) = user.open_process(client_id, PROCESS_QUERY_LIMITED_INFORMATION);
+            let information = user.at(UserCalls::DATA + 0x100);
+            user.stack(&[0]);
+            let queried = user.call("NtQueryInformationProcess", [process, 0, information, 0x40]);
+            let protected_flag = guest::read32(information + 0x38) & 1;
+            let request = user.at(UserCalls::DATA + 0x180);
+            let local = user.at(UserCalls::DATA + 0x200);
+            let copy = |client_address: u64, to_client: u32| {
+                guest::write64(request, process);
+                guest::write64(request + 8, client_address);
+                guest::write64(request + 0x10, local);
+                guest::write32(request + 0x18, 0x40);
+                guest::write32(request + 0x1C, to_client);
+                user.ioctl(ksec, UserCalls::IOSB, IOCTL_KSEC_COPY_VM, request, 0x20, 0, 0)
+            };
+            guest::write_bytes(local, &[0; 0x40]);
+            let read = copy(shared, 0);
+            let read_back = guest::read_bytes(local, 0x40);
+            let inverted: Vec<u8> = read_back.iter().map(|byte| !byte).collect();
+            guest::write_bytes(local, &inverted);
+            let written = copy(shared, 1);
+            let outside = copy(shared + 0x1000, 0);
+            guest::write64(request, process);
+            guest::write64(request + 8, 0x100);
+            guest::write64(out, 0);
+            let allocated = user.ioctl(ksec, UserCalls::IOSB, IOCTL_KSEC_ALLOC_VM, request, 16, out, 8);
+            let base = guest::read64(out);
+            user.call("NtOpenProcessToken", [u64::MAX, 8, user.at(UserCalls::HANDLE), 0]);
+            guest::write64(request, guest::read64(user.at(UserCalls::HANDLE)));
+            guest::write64(request + 8, process);
+            guest::write64(request + 0x10, 0);
+            guest::write64(out, 0);
+            let duplicated = user.ioctl(ksec, UserCalls::IOSB, IOCTL_KSEC_DUP_LSA_HANDLE, request, 0x18, out, 8);
+            let client_token = guest::read64(out);
+            Some((opened, connected, control, denied, limited, queried, protected_flag, read, read_back == pattern, written, outside, allocated, base, duplicated, client_token))
+        })
+        .flatten();
+        let (lsa_opened, connected, control, denied, limited, queried, protected_flag, read, read_ok, written, outside, allocated, base, duplicated, client_token) = lsa?;
+        result.lsa_opened = lsa_opened;
+        result.connected = connected;
+        result.control = control;
+        result.denied = denied;
+        result.limited = limited;
+        result.queried = queried;
+        result.protected_flag = protected_flag;
+        result.read = read;
+        result.read_ok = read_ok;
+        result.written = written;
+        result.outside = outside;
+        result.allocated = allocated;
+        result.duplicated = duplicated;
+        result.written_ok = guest::read_bytes(shared, 0x40).iter().zip(&pattern).all(|(byte, original)| *byte == !original);
+        result.committed = user.region_state(base);
+        let cell = user.at(UserCalls::DATA + 0x1C0);
+        guest::write64(cell, base);
+        result.freed = user.ioctl(handle, UserCalls::IOSB, IOCTL_KSEC_FREE_CLIENT_VM, cell, 8, 0, 0);
+        result.again = user.ioctl(handle, UserCalls::IOSB, IOCTL_KSEC_FREE_CLIENT_VM, cell, 8, 0, 0);
+        result.released = user.region_state(base);
+        result.token_closed = user.close(client_token);
+        guest::write64(request, shared);
+        guest::write64(request + 8, 0x40);
+        result.removed = user.ioctl(handle, UserCalls::IOSB, IOCTL_KSEC_REMOVE_PROTECTED_ADDRESS, request, 16, 0, 0);
+        result.closed = user.close(handle);
+        Some(result)
+    })
+    .flatten();
+    let Some(result) = outcome else {
+        debug_print!("[ksecdd] cliente protegido: processo de teste nao montado");
+        return;
+    };
+    debug_print!("[ksecdd] cliente protegido: {:?}", result);
+    let lsa_ok = result.lsa_opened == 0 && result.connected == 0 && result.control == 0 && result.denied == STATUS_ACCESS_DENIED && result.limited == 0 && result.queried == 0 && result.protected_flag == 1;
+    let copy_ok = result.registered == 0 && result.read == 0 && result.read_ok && result.written == 0 && result.written_ok && result.outside == STATUS_ACCESS_DENIED && result.removed == 0;
+    let vm_ok = result.allocated == 0 && result.committed == MEM_COMMIT && result.freed == 0 && result.again == STATUS_INVALID_PARAMETER && result.released == MEM_FREE;
+    let handle_ok = result.duplicated == 0 && result.token_closed == 0;
+    if result.opened == 0 && result.closed == 0 && lsa_ok && copy_ok && vm_ok && handle_ok {
+        debug_print!("KSECDD_PROTECTED_CLIENT_OK open=0x1000 copy alloc dup free=0x390058");
     }
 }
 

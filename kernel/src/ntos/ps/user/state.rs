@@ -775,7 +775,7 @@ fn alloc_entry(table: &ProcessState, entry: Arc<UserHandle>, duplicate_from: Opt
             if target == 0 {
                 return Ok(access);
             }
-            crate::ntos::ps::open_procedure::apply(route_kind, mode, target, access).map_err(|status| KernelError::with_status("OpenProcedure recusou o handle", status))
+            crate::ntos::ps::open_procedure::apply(route_kind, mode, table.process, target, access).map_err(|status| KernelError::with_status("OpenProcedure recusou o handle", status))
         };
         if !entry.object.opened_natively() || duplicate_from.is_some() {
             let mut data = entry.object.callback_data();

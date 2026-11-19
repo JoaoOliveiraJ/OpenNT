@@ -54,7 +54,14 @@ struct CiCallbacks {
     query_policy_information: Field<u64>,
     /// CiValidateDynamicCodePages (o MmChangeImageProtection a chama).
     validate_dynamic_code_pages: Field<u64>,
-    _reserved_98: Reserved<0x48>,
+    _reserved_98: Reserved<0x28>,
+    /// CiCheckProcessDebugAccessPolicy (ci.dll, gravado pelo CipInitialize em
+    /// 0x451eb): libera o acesso a um processo protegido com a política de
+    /// depuração carregada (o PsTestProtectedProcessIncompatibility o chama;
+    /// o OpenNT não o chama, `process_debug_access_allowed`).
+    #[allow(dead_code)]
+    check_process_debug_access_policy: Field<u64>,
+    _reserved_c8: Reserved<0x18>,
     /// Versão/flags do contrato, informados pelo kernel.
     kernel_version: Field<u64>,
 }
@@ -117,6 +124,7 @@ const _: () = {
     assert!(offset_of!(CiCallbacks, initialize_policy) == 0x60);
     assert!(offset_of!(CiCallbacks, required_signing_level) == 0x70);
     assert!(offset_of!(CiCallbacks, validate_dynamic_code_pages) == 0x90);
+    assert!(offset_of!(CiCallbacks, check_process_debug_access_policy) == 0xC0);
     assert!(offset_of!(CiCallbacks, kernel_version) == 0xE0);
     assert!(core::mem::size_of::<CiPrivateCallbacks>() == 0x40);
     assert!(offset_of!(CiPrivateCallbacks, set_runtime_signing_level) == 0x20);
@@ -451,6 +459,16 @@ pub fn query_policy_information(class: u32, input: u64, input_length: u32, outpu
 /// A CI publicou o CiValidateDynamicCodePages.
 pub fn dynamic_code_validator_present() -> bool {
     callback(|table| &table.validate_dynamic_code_pages).is_ok()
+}
+
+/// SeCiCallbacks+0xC0 (CiCheckProcessDebugAccessPolicy) do
+/// PsTestProtectedProcessIncompatibility (0x6079d8). O OpenNT não chama a
+/// ci.dll no caminho dos handles: sem a CI o slot é vazio e o resultado é
+/// falso; com ela, sem política de depuração de Secure Boot carregada (o caso
+/// de todo boot do OpenNT), a lista da rotina é vazia e ela devolve FALSE
+/// (ci.dll 0x4ecd5 -> 0x4ed6c), o mesmo resultado.
+pub fn process_debug_access_allowed(_opener: u64, _target: u64) -> bool {
+    false
 }
 
 /// Os slots da SeCiCallbacks dos níveis de assinatura em cache.

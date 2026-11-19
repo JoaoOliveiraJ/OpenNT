@@ -487,7 +487,7 @@ pub fn insert(item: &Described, granted: u32, attributes: u32, owner: u64) -> Re
 /// ajustar; uma falha depois disso desfaz pelo fechamento do dono.
 pub fn insert_with(item: &Described, granted: u32, attributes: u32, owner: u64, reason: OpenReason, access_mode: u8) -> Result<u32, KernelError> {
     // A OpenProcedure de processos e threads (PspProcessOpen/PspThreadOpen).
-    let granted = crate::ntos::ps::open_procedure::apply(&item.object_type.name, access_mode, item.pointer, granted).map_err(|status| KernelError::with_status("OpenProcedure recusou o handle", status))?;
+    let granted = crate::ntos::ps::open_procedure::apply(&item.object_type.name, access_mode, owner, item.pointer, granted).map_err(|status| KernelError::with_status("OpenProcedure recusou o handle", status))?;
     let mut open = HandleOpen { reason, access_mode, process: owner, granted, attributes };
     let counted = match item.owner.open_handle_for(item.pointer, &mut open) {
         Some(Ok(())) => true,

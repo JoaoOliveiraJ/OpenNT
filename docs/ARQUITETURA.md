@@ -3419,7 +3419,13 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     PROCESS_SET_LIMITED_INFORMATION, PROCESS_TERMINATE de UserMode num
     processo DisallowUserTerminate é negado; THREAD_QUERY_INFORMATION,
     THREAD_SET_INFORMATION e THREAD_SUSPEND_RESUME implicam as versões
-    limitadas e THREAD_RESUME.
+    limitadas e THREAD_RESUME. Antes disso vem a proteção do alvo: os
+    direitos que o RtlProtectedAccess nega pelo signatário do PS_PROTECTION
+    dele (sem o de término para o pai) recusam o handle de UserMode quando a
+    proteção do processo dono do handle não domina a do alvo
+    (RtlTestProtectedAccess; a política de depuração da CI,
+    SeCiCallbacks+0xC0, não é consultada e vale FALSE, como num boot sem
+    política de Secure Boot).
   - NtQueryInformationProcess(ProcessBasicInformation, ProcessImageFileName)
     lê o EPROCESS do handle (PROCESS_QUERY_LIMITED_INFORMATION): PEB, PID,
     InheritedFromUniqueProcessId, prioridade base e código de saída, ou o
@@ -5423,7 +5429,14 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   sujeito (SAME_LOGON; a opção 4 do CredProtectEx usa o do SYSTEM e só a
   sessão 0x3e7 decifra) ou sem nada (CROSS_PROCESS). O ProcessCookie
   (`ps/query_process::process_cookie`) é o mesmo EPROCESS.Cookie nos dois
-  modos.
+  modos. Por fim um processo de teste WinTcb-Light faz o cliente protegido
+  do LSA e outro faz o lsass.exe (`KSECDD_PROTECTED_CLIENT_OK`): o 0x478 do
+  LsapOpenCaller é recusado só com a proteção ligada (o RtlProtectedAccess
+  do PspProcessOpen, `ps/open_procedure.rs`), o 0x1000 abre, o CopyVm, o
+  AllocVm e o DupLsaHandle do ksecdd servem o cliente (o ZwDuplicateObject
+  de modo kernel com handles da tabela de usuário) e o cliente libera a
+  faixa pelo 0x390058 do LsaFreeReturnBuffer (o IoGetRequestorProcess
+  real).
 - **Depurador do kernel, cliente** (`tools/opennt-kd`): só a biblioteca
   padrão. O prompt do `cargo xtask debug` (`xtask/src/debug`) e o
   depurador gráfico usam o mesmo código.
