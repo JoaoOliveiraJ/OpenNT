@@ -6090,7 +6090,55 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     `registry_read`, `object_list`, `file_list` e `file_read`. Endereços
     são expressões em texto e os endereços dos resultados vão em texto
     (`0x...`). Cada resultado é um objeto (`structuredContent`) e o mesmo
-    JSON em `content`.
+    JSON em `content`. O argumento `process` aceita o nome (`dwm.exe`,
+    `svchost.exe#2` = a segunda instância na lista do alvo), o PID ou o
+    EPROCESS (`processes.rs`).
+  - Ferramentas do fluxo dos agentes (`tools_flow.rs`):
+    - `continue_until`: continua e espera o primeiro de: uma parada, um
+      texto na COM1 (`marker`/`markers`, lidos só no que o log ganhou;
+      `from_start` olha o log inteiro e, achando, volta sem continuar) ou
+      o prazo (`break_on_timeout` para a máquina em vez do erro). Devolve o
+      motivo (`breakpoint`, `event`, `stop`, `serial`, `timeout`), a
+      parada, as linhas novas dos breakpoints de log e do DbgPrint desde a
+      última entrega e os breakpoints adiados que armaram. O `launch` com
+      `until_marker` faz o mesmo depois do attach;
+    - `breakpoint_user`: breakpoint num processo de usuário pelo nome;
+      com a DLL ainda fora do processo (ou o processo ainda não criado),
+      fica adiado num breakpoint de evento `ld:processo!dll` e arma na
+      parada desse evento (os módulos do processo relidos, o breakpoint
+      gravado no processo), com a máquina seguindo sozinha;
+      `continue_until`, `wait_for_stop`, `wait_for_serial` e `kd_script`
+      atendem o aviso. O estado fica em `session.rs` (`Session`, dentro do
+      `Server`);
+    - `stack`: a pilha do processador da parada, de uma thread de kernel
+      (`thread`) ou das threads de usuário de um processo (de usuário pelo
+      CONTEXT salvo e de kernel pelo quadro de troca), agrupadas por pilha
+      igual; cada quadro em uma linha `endereço símbolo`;
+    - `memory_view`: bytes, words, dwords, qwords, pointers (com o
+      símbolo de cada qword), ascii, unicode e unicode_string;
+    - `kd_script`: os roteiros do `test-boot --kd=com2 --script` sobre a
+      sessão (`kdscript.rs`), com o log na resposta (nunca na saída
+      padrão, que é o canal do stdio), as esperas dentro do prazo da
+      ferramenta, `wait-serial`/`wait-stop`/`sleep` atendendo as paradas,
+      os comandos de parada (`/cmd`) rodando no `wait-stop` e `$nome`
+      trocado no texto da linha; `attach` não faz nada e `detach` é
+      recusado. A linha que falha encerra com `ok=false` e o log até ela.
+  - Ferramentas de análise (`tools_analysis.rs`): `status_decode`
+    (NTSTATUS, HRESULT com `HRESULT_FROM_WIN32`/`HRESULT_FROM_NT` e erros
+    do Win32, pelos valores dos cabeçalhos públicos, em `status.rs`),
+    `symbol_search` (trecho do nome em todos os módulos), `serial_summary`
+    (`serial.rs`: marcadores `*_OK`, processos criados, blocos `[crash]` e
+    `[kcrash]`, o código de parada, a presença do WdLog do dxgkrnl, as
+    falhas agrupadas por padrão, as etiquetas e as últimas linhas, `grep`
+    e `since_offset`), `crash_analyze` (o `!analyze` da parada e as quedas
+    do log) e `wdlog` (a presença do despejo; a decodificação dos anéis é
+    da análise do `kd-client`). As de log funcionam sem sessão com
+    `path`.
+  - Anotações (`tools_notes.rs`): `annotations_list` e `annotation_set`
+    leem e gravam o `notas.txt` da sessão do opennt-re
+    (`Engine::notes_file`, `<build>/opennt-re/notas.txt`) por módulo + RVA
+    (o kernel do OpenNT é `kernel`); o `disassemble` mostra os rótulos e
+    comentários do arquivo em `user_label` e `user_comment`.
   - Recursos: `opennt://serial-log`, `opennt://dbgprint`,
     `opennt://breakpoints` e `opennt://modules`.
   - Sessão (`engine.rs`): o trait `Engine` dá o cliente, o `launch`
@@ -6108,13 +6156,21 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     breakpoint de uma vez só, parada, pilha, símbolos, recursos, as
     ferramentas novas: o monitor com a chamada ao IoCreateDevice, o IRP de
     CREATE, o Registro, o namespace, os arquivos e os erros sem
-    reprodução e sem monitor do QEMU) e o
-    binário em stdio. Ponta a ponta (`cargo test -p kd-mcp --release --
+    reprodução e sem monitor do QEMU; as dos agentes: o roteiro com
+    `expect`/`save`/`$x`/`bp`/`c`/`wait-stop`, o roteiro que falha, o
+    `continue_until` pelo texto já na COM1 e até o breakpoint, a memória
+    em formatos, a pilha, os códigos de erro, o resumo do log, a queda, as
+    anotações na desmontagem, a busca de símbolos e o erro do adiado sem
+    o ponto de evento) e o
+    binário em stdio; testes de unidade do decodificador de códigos, do
+    resumo e da espera no log, dos nomes de processo e das trocas dos
+    roteiros. Ponta a ponta (`cargo test -p kd-mcp --release --
     --ignored`, `tests/e2e.rs`): o binário em stdio abre o OpenNT pelo
     `launch`, para, lê os registradores, arma um breakpoint em
     `kernel::ntos::ke::run_kernel_tasks`, continua até ele, confere a
-    desmontagem e a pilha, tira o breakpoint, continua e espera
-    `[shell] pronto` na COM1 (`OPENNT_MCP_BUILD_DIR` troca o build).
+    desmontagem e a pilha (`backtrace` e `stack`), tira o breakpoint,
+    continua com `continue_until` até `[shell] pronto` na COM1 e resume o
+    log (`OPENNT_MCP_BUILD_DIR` troca o build).
 - **Teste do depurador**: o teste `kd` é um `test-boot` com
   `--kd=com2 --script=xtask/scripts/kd.txt`. O roteiro roda contra a COM2
   em paralelo ao boot e a falha dele derruba o teste. Passos:

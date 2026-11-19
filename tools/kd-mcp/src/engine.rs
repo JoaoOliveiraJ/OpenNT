@@ -43,6 +43,12 @@ pub trait Engine {
     fn launch_log(&mut self) -> Vec<String> {
         Vec::new()
     }
+    /// O arquivo das anotações compartilhadas com o opennt-re (comentários,
+    /// rótulos e marcadores por módulo + RVA): o `notas.txt` da pasta de
+    /// sessão do opennt-re no build (`<build>/opennt-re/notas.txt`).
+    fn notes_file(&self) -> PathBuf {
+        self.build_dir().unwrap_or_else(|| self.root().join("build")).join("opennt-re").join("notas.txt")
+    }
 }
 
 /// As imagens dos módulos para as buscas (do arquivo desta máquina, do

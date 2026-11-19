@@ -82,11 +82,15 @@ fn launch_break_registers_breakpoint_and_serial_marker() {
     assert_eq!(listing["lines"][0]["function_start"], true, "{listing}");
     let frames = session.call("backtrace", json!({"limit": 16}), Duration::from_secs(60));
     assert!(frames["frames"].as_array().unwrap().iter().any(|frame| frame["symbol"].as_str().unwrap_or("").contains("kmain")), "{frames}");
-    // Sem o breakpoint, a máquina segue até o marcador da COM1.
+    let compact = session.call("stack", json!({"limit": 16}), Duration::from_secs(60));
+    assert!(compact["frames"].as_array().unwrap().iter().any(|frame| frame.as_str().unwrap_or("").contains("kmain")), "{compact}");
+    // Sem o breakpoint, a máquina segue até o marcador da COM1 (e para nele).
     session.call("breakpoint_clear", json!({"id": id}), Duration::from_secs(60));
-    session.call("go", json!({}), Duration::from_secs(60));
-    let marker = session.call("wait_for_serial", json!({"marker": "[shell] pronto", "timeout_ms": 600_000}), Duration::from_secs(700));
-    assert_eq!(marker["found"], true, "{marker}");
+    let marker = session.call("continue_until", json!({"marker": "[shell] pronto", "timeout_ms": 600_000}), Duration::from_secs(700));
+    assert_eq!(marker["reason"], "serial", "{marker}");
+    assert_eq!(marker["stopped"], true, "{marker}");
+    let summary = session.call("serial_summary", json!({"tail": 5}), Duration::from_secs(60));
+    assert!(!summary["markers"].as_array().unwrap().is_empty(), "{summary}");
     let log = session.call("read_serial_log", json!({"max_bytes": 2048}), Duration::from_secs(60));
     assert!(log["size"].as_u64().unwrap() > 0);
     session.call("detach", json!({}), Duration::from_secs(120));

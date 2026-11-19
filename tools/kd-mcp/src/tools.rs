@@ -10,11 +10,20 @@
 //! - as esperas têm `timeout_ms` e nunca deixam a máquina parada no meio
 //!   (o tempo esgotado devolve erro e a máquina segue rodando);
 //! - o resultado de cada ferramenta é um objeto JSON (`structuredContent`)
-//!   e o mesmo texto formatado em `content`.
+//!   e o mesmo texto formatado em `content`;
+//! - o argumento `process` aceita o nome (`dwm.exe`, `svchost.exe#2` = a
+//!   segunda instância), o PID ou o EPROCESS.
+//!
+//! As ferramentas dos agentes ficam em `tools_flow.rs` (continuar até uma
+//! parada ou um texto da COM1, o breakpoint de usuário adiado, as pilhas, a
+//! memória em formatos, os roteiros), `tools_analysis.rs` (os códigos de
+//! erro, a busca de símbolos, o resumo do log, a queda e o WdLog) e
+//! `tools_notes.rs` (as anotações compartilhadas com o opennt-re).
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use kd_client::analysis::notes::Notes;
 use kd_client::analysis::script;
 use kd_client::analysis::search;
 use kd_client::client::{BreakpointOptions, BreakpointRequest, Resumed};
@@ -26,11 +35,19 @@ use serde_json::{json, Map, Value};
 
 use crate::annotate::{self, Live};
 
+#[path = "tools_analysis.rs"]
+mod analysis;
 #[path = "tools_extra.rs"]
 mod extra;
+#[path = "tools_flow.rs"]
+mod flow;
+#[path = "tools_notes.rs"]
+mod notes;
 use crate::disasm;
 use crate::engine::Engine;
+use crate::processes;
 use crate::screenshot;
+use crate::session::Session;
 
 /// Como uma ferramenta falhou.
 #[derive(Debug, PartialEq, Eq)]
@@ -86,11 +103,11 @@ fn timeout(default_ms: u64) -> Value {
 /// As ferramentas: nome, descrição e o esquema dos argumentos.
 pub fn definitions() -> Vec<(&'static str, &'static str, Value)> {
     let address = || text("expressao do endereco: 0x..., simbolo (modulo!nome), @registrador, poi(...), aritmetica");
-    let process = || text("PID ou EPROCESS do processo das leituras (muda o processo escolhido, como .process); vazio = o atual");
+    let process = || text("processo das leituras: nome (dwm.exe, svchost.exe#2), PID ou EPROCESS (muda o processo escolhido, como .process); vazio = o atual");
     vec![
         (
             "launch",
-            "Compila o OpenNT com o depurador (--kd=com2), abre o QEMU pelo cargo xtask e anexa (a maquina para). Demora: o build e o boot ate o attach.",
+            "Compila o OpenNT com o depurador (--kd=com2), abre o QEMU pelo cargo xtask e anexa (a maquina para). Com until_marker, continua o boot ate o texto aparecer na COM1 e para ali (o attach, c, wait-serial, break dos roteiros). Demora: o build e o boot.",
             object(
                 json!({
                     "build_dir": text("diretorio de build (padrao build/mcp)"),
@@ -99,12 +116,18 @@ pub fn definitions() -> Vec<(&'static str, &'static str, Value)> {
                     "initial_process": text("processo inicial (--initial-process), por exemplo smss para o csrss.exe real"),
                     "accel": text("acelerador do QEMU (--accel): whpx ou tcg"),
                     "extra": {"type": "array", "items": {"type": "string"}, "description": "outras opcoes do xtask (--start-driver=..., --display=basic)"},
+                    "until_marker": text("depois do attach, continua ate este texto na COM1 (criou dwm.exe, Windows.UI.Xaml.dll) e para"),
+                    "marker_timeout_ms": integer("prazo do until_marker (padrao 600000)", 1, 30 * 60 * 1000),
                     "timeout_ms": timeout(1_800_000)
                 }),
                 &[],
             ),
         ),
-        ("connect", "Conecta a um QEMU ja aberto com --kd=com2 (cargo xtask run --kd=com2: 127.0.0.1:1234) e anexa.", object(json!({"address": text("HOST:PORTA da COM2"), "elf": text("o kernel.elf do build (padrao <build>/kernel.elf)")}), &["address"])),
+        (
+            "connect",
+            "Conecta a um QEMU ja aberto com --kd=com2 (cargo xtask run --kd=com2: 127.0.0.1:1234; ou o test-boot de outro agente) e anexa.",
+            object(json!({"address": text("HOST:PORTA da COM2"), "elf": text("o kernel.elf do build (padrao <build>/kernel.elf)"), "serial_log": text("o serial.log desse boot (wait-serial, continue_until com texto, serial_summary)")}), &["address"]),
+        ),
         ("detach", "Desliga a sessao: a maquina segue sem depurador; o QEMU aberto pelo launch fecha.", object(json!({}), &[])),
         ("status", "Estado da sessao: conectado, parado ou rodando, a ultima parada, o RIP, o processo escolhido e o numero de modulos e breakpoints.", object(json!({}), &[])),
         ("break", "Pede a parada da maquina e espera.", object(json!({"timeout_ms": timeout(60_000)}), &[])),
@@ -127,8 +150,8 @@ pub fn definitions() -> Vec<(&'static str, &'static str, Value)> {
         ("symbol_resolve", "O endereco de um nome (simbolo do kernel, modulo!export, PDB publico).", object(json!({"name": text("nome do simbolo")}), &["name"])),
         ("modules", "Modulos carregados: os do kernel e, com um processo escolhido, os de usuario dele.", object(json!({"process": process()}), &[])),
         ("processes", "Processos (PID, EPROCESS, CR3, threads, nome).", object(json!({}), &[])),
-        ("threads", "Threads: as do kernel, ou as de usuario de um processo (TEB, CONTEXT, RIP, prioridade, suspensao, espera, LastError, tempos, ciclos).", object(json!({"process": text("PID ou EPROCESS (vazio = threads do kernel)")}), &[])),
-        ("set_process", "Escolhe o processo das leituras e dos breakpoints de usuario (vazio volta ao kernel).", object(json!({"process": text("PID ou EPROCESS; vazio ou 0 = o kernel")}), &[])),
+        ("threads", "Threads: as do kernel, ou as de usuario de um processo (TEB, CONTEXT, RIP, prioridade, suspensao, espera, LastError, tempos, ciclos).", object(json!({"process": text("nome (dwm.exe), PID ou EPROCESS (vazio = threads do kernel)")}), &[])),
+        ("set_process", "Escolhe o processo das leituras e dos breakpoints de usuario (vazio volta ao kernel).", object(json!({"process": text("nome (dwm.exe, svchost.exe#2), PID ou EPROCESS; vazio ou 0 = o kernel")}), &[])),
         (
             "breakpoint_set",
             "Arma um breakpoint: software, hardware (DR0-DR3; num endereco de usuario, por processo), escrita/acesso (vigias de hardware), memoria por pagina (memory_access, memory_write, memory_execute), carga de modulo ou evento; com condicao, log, comandos e as opcoes de acerto.",
@@ -195,6 +218,9 @@ pub fn definitions() -> Vec<(&'static str, &'static str, Value)> {
     ]
     .into_iter()
     .chain(extra::definitions())
+    .chain(flow::definitions())
+    .chain(analysis::definitions())
+    .chain(notes::definitions())
     .collect()
 }
 
@@ -257,6 +283,11 @@ impl Arguments<'_> {
         self.0.get(key).and_then(Value::as_str).map(|text| text.trim().to_string()).filter(|text| !text.is_empty())
     }
 
+    /// O texto como veio, vazio inclusive (o "vazio apaga" das anotações).
+    fn raw(&self, key: &str) -> Option<&str> {
+        self.0.get(key).and_then(Value::as_str)
+    }
+
     fn integer(&self, key: &str) -> Option<u64> {
         self.0.get(key).and_then(Value::as_u64)
     }
@@ -274,37 +305,44 @@ impl Arguments<'_> {
     }
 }
 
-/// O `tools/call`.
-pub fn call(engine: &mut dyn Engine, name: &str, arguments: &Value) -> ToolResult {
+/// O `tools/call`. `session` é o estado da conexão MCP (os breakpoints de
+/// usuário adiados e o que já foi entregue dos logs).
+pub fn call(engine: &mut dyn Engine, session: &mut Session, name: &str, arguments: &Value) -> ToolResult {
     let Some((_, _, schema)) = definitions().into_iter().find(|(tool, _, _)| *tool == name) else { return Err(ToolError::InvalidParams(format!("ferramenta desconhecida: {name}"))) };
     let empty = Map::new();
     let arguments = if arguments.is_null() { Value::Object(empty.clone()) } else { arguments.clone() };
     validate(&schema, &arguments).map_err(ToolError::InvalidParams)?;
     let map = arguments.as_object().unwrap_or(&empty);
     let args = Arguments(map);
-    let result = run(engine, name, &args);
-    if !matches!(name, "status" | "read_serial_log" | "breakpoint_list" | "symbol_lookup" | "symbol_resolve" | "snapshot_list" | "api_monitor_fetch" | "irp_trace_fetch" | "registry_list" | "registry_read" | "object_list" | "file_list" | "file_read" | "view_struct") {
+    let result = run(engine, session, name, &args);
+    if !matches!(
+        name,
+        "status" | "read_serial_log" | "breakpoint_list" | "symbol_lookup" | "symbol_resolve" | "snapshot_list" | "api_monitor_fetch" | "irp_trace_fetch" | "registry_list" | "registry_read" | "object_list" | "file_list" | "file_read" | "view_struct" | "status_decode" | "serial_summary" | "crash_analyze" | "wdlog" | "annotations_list" | "annotation_set"
+    ) {
         engine.changed();
     }
     result
 }
 
-/// A parada em JSON: o texto, o RIP e o símbolo.
+/// A parada em JSON: o texto, o RIP, o símbolo e o processo das leituras.
 fn stop_value(client: &mut Client, text: &str) -> Value {
     let rip = client.register("rip").ok();
-    json!({
+    let mut value = json!({
         "stopped": client.is_stopped(),
         "stop": text.split(" [").next().unwrap_or(text),
         "rip": rip.map(hex),
         "symbol": rip.map(|rip| client.symbols.describe(rip)),
         "user_mode": client.stopped_in_user_mode(),
-    })
+    });
+    if let Some(context) = client.process() {
+        value["process"] = json!(format!("{} (PID {})", context.name, context.pid));
+    }
+    value
 }
 
-/// Espera a parada e roda os comandos do breakpoint que parou.
-fn wait_stop(client: &mut Client, timeout: Duration) -> Result<Value, String> {
-    let text = client.wait_stop(timeout)?;
-    let mut value = stop_value(client, &text);
+/// A parada em JSON com a saída dos comandos do breakpoint que parou.
+fn finish_stop(client: &mut Client, text: &str) -> Value {
+    let mut value = stop_value(client, text);
     if let Some((id, commands)) = client.stop_commands() {
         let mut outputs = Vec::new();
         for command in commands.split(';').map(str::trim).filter(|command| !command.is_empty()) {
@@ -316,12 +354,20 @@ fn wait_stop(client: &mut Client, timeout: Duration) -> Result<Value, String> {
         }
         value["breakpoint_commands"] = json!({"breakpoint": id, "outputs": outputs});
     }
-    Ok(value)
+    value
 }
 
+/// Espera a parada e roda os comandos do breakpoint que parou.
+fn wait_stop(client: &mut Client, timeout: Duration) -> Result<Value, String> {
+    let text = client.wait_stop(timeout)?;
+    Ok(finish_stop(client, &text))
+}
+
+/// Escolhe o processo do argumento `process` (nome, PID ou EPROCESS).
 fn set_process_argument(client: &mut Client, args: &Arguments) -> Result<(), String> {
     if let Some(process) = args.text("process") {
-        client.set_process(Some(&process))?;
+        let target = processes::argument(client, &process)?;
+        client.set_process(Some(&target))?;
     }
     Ok(())
 }
@@ -402,7 +448,7 @@ fn module_base(client: &mut Client, text: &str) -> Result<u64, String> {
     client.symbols.module_at(address).map(|module| module.base).ok_or_else(|| format!("{text}: fora dos modulos"))
 }
 
-fn run(engine: &mut dyn Engine, name: &str, args: &Arguments) -> ToolResult {
+fn run(engine: &mut dyn Engine, session: &mut Session, name: &str, args: &Arguments) -> ToolResult {
     match name {
         "launch" => {
             let mut extra = Vec::new();
@@ -417,28 +463,47 @@ fn run(engine: &mut dyn Engine, name: &str, args: &Arguments) -> ToolResult {
             }
             extra.extend(args.list("extra"));
             let options = LaunchOptions { root: engine.root(), build_dir: PathBuf::from(args.text("build_dir").unwrap_or_else(|| "build/mcp".into())), headless: args.flag("headless").unwrap_or(true), extra };
+            session.reset();
+            session.serial_log = None;
             let text = engine.launch(options, args.timeout(1_800_000))?;
             let monitor = engine.monitor_address();
             let serial = engine.serial_log().map(|path| path.display().to_string());
-            let client = engine.client()?;
-            let mut value = stop_value(client, &text);
+            let mut value = {
+                let client = engine.client()?;
+                session.mark_seen(client);
+                stop_value(client, &text)
+            };
             value["attach"] = json!(text);
             value["monitor"] = json!(monitor);
             value["serial_log"] = json!(serial);
+            if let Some(marker) = args.text("until_marker") {
+                // O boot segue até o texto e a máquina para ali.
+                let until = flow::Until { markers: vec![marker], from_start: false, break_on_marker: true, break_on_timeout: false, max_log_lines: 20, timeout: Duration::from_millis(args.integer("marker_timeout_ms").unwrap_or(600_000).min(MAX_WAIT_MS)) };
+                value["until_marker"] = flow::run_until(engine, session, &until)?;
+            }
             Ok(value)
         }
         "connect" => {
             let address = args.text("address").unwrap_or_default();
+            session.reset();
+            session.serial_log = args.text("serial_log").map(PathBuf::from).map(|path| if path.is_absolute() { path } else { engine.root().join(path) });
             let text = engine.connect(&address, args.text("elf").map(PathBuf::from))?;
+            let serial = session.serial_path(engine).map(|path| path.display().to_string());
             let client = engine.client()?;
+            session.mark_seen(client);
             let mut value = stop_value(client, &text);
             value["attach"] = json!(text);
+            value["serial_log"] = json!(serial);
             Ok(value)
         }
-        "detach" => Ok(json!({"detached": engine.detach()?})),
+        "detach" => {
+            session.reset();
+            Ok(json!({"detached": engine.detach()?}))
+        }
         "status" => {
             let log = engine.launch_log();
-            let serial = engine.serial_log().map(|path| path.display().to_string());
+            let serial = session.serial_path(engine).map(|path| path.display().to_string());
+            let pending = session.pending.len();
             let Ok(client) = engine.client() else { return Ok(json!({"connected": false, "launch_log": log, "serial_log": serial})) };
             if !client.is_stopped() {
                 let _ = client.poll(Duration::from_millis(20))?;
@@ -448,6 +513,7 @@ fn run(engine: &mut dyn Engine, name: &str, args: &Arguments) -> ToolResult {
                 "stopped": client.is_stopped(),
                 "last_stop": client.last_stop().split(" [").next().unwrap_or(""),
                 "breakpoints": client.breakpoints().len(),
+                "pending_user_breakpoints": pending,
                 "modules": client.symbols.modules.len(),
                 "process": client.process().map(|context| json!({"name": context.name, "pid": context.pid, "eprocess": hex(context.eprocess)})),
                 "serial_log": serial,
@@ -472,7 +538,20 @@ fn run(engine: &mut dyn Engine, name: &str, args: &Arguments) -> ToolResult {
         }
         "wait_for_stop" => {
             let client = engine.client()?;
-            Ok(wait_stop(client, args.timeout(60_000))?)
+            let deadline = Instant::now() + args.timeout(60_000);
+            loop {
+                let text = client.wait_stop(deadline.saturating_duration_since(Instant::now()))?;
+                // O aviso de carga de uma DLL com breakpoints adiados: arma e segue.
+                if session.service_stop(client) {
+                    client.go()?;
+                    continue;
+                }
+                let mut value = finish_stop(client, &text);
+                if !session.armed.is_empty() {
+                    value["armed"] = json!(std::mem::take(&mut session.armed));
+                }
+                return Ok(value);
+            }
         }
         "step_into" => {
             let client = engine.client()?;
@@ -557,6 +636,8 @@ fn run(engine: &mut dyn Engine, name: &str, args: &Arguments) -> ToolResult {
             Ok(json!({"address": hex(address), "written": bytes.len()}))
         }
         "disassemble" => {
+            // Os rótulos e comentários do usuário (os do opennt-re).
+            let user_notes = Notes::load(&engine.notes_file()).unwrap_or_default();
             let client = engine.client()?;
             set_process_argument(client, args)?;
             let address = client.evaluate(&args.text("address").unwrap_or_else(|| "@rip".into()))?;
@@ -584,7 +665,7 @@ fn run(engine: &mut dyn Engine, name: &str, args: &Arguments) -> ToolResult {
                 .map(|line| {
                     let function = functions.iter().find(|function| function.contains(line.address));
                     let inner = loops.iter().filter(|candidate| line.address >= candidate.start && line.address < candidate.end).count();
-                    json!({
+                    let mut row = json!({
                         "address": hex(line.address),
                         "bytes": line.bytes,
                         "text": line.text,
@@ -593,7 +674,17 @@ fn run(engine: &mut dyn Engine, name: &str, args: &Arguments) -> ToolResult {
                         "function_start": function.is_some_and(|function| function.start == line.address),
                         "function_end": function.is_some_and(|function| line.address + (line.bytes.len() / 2) as u64 >= function.end),
                         "loop_depth": inner,
-                    })
+                    });
+                    if !user_notes.comments.is_empty() || !user_notes.labels.is_empty() {
+                        let location = notes::location_of(client, line.address);
+                        if let Some(label) = user_notes.labels.get(&location) {
+                            row["user_label"] = json!(label);
+                        }
+                        if let Some(comment) = user_notes.comments.get(&location) {
+                            row["user_comment"] = json!(comment);
+                        }
+                    }
+                    row
                 })
                 .collect();
             let functions: Vec<Value> = functions.iter().map(|function| json!({"start": hex(function.start), "end": hex(function.end), "source": function.source.name(), "name": client.symbols.describe(function.start)})).collect();
@@ -627,6 +718,7 @@ fn run(engine: &mut dyn Engine, name: &str, args: &Arguments) -> ToolResult {
             let client = engine.client()?;
             match args.text("process") {
                 Some(process) => {
+                    let process = processes::argument(client, &process)?;
                     let list: Vec<Value> = client
                         .user_threads(&process)?
                         .into_iter()
@@ -644,7 +736,11 @@ fn run(engine: &mut dyn Engine, name: &str, args: &Arguments) -> ToolResult {
         }
         "set_process" => {
             let client = engine.client()?;
-            let context = client.set_process(args.text("process").as_deref())?;
+            let target = match args.text("process") {
+                Some(process) if process != "0" => Some(processes::argument(client, &process)?),
+                _ => None,
+            };
+            let context = client.set_process(target.as_deref())?;
             Ok(json!({"process": context.map(|context| json!({"name": context.name, "pid": context.pid, "eprocess": hex(context.eprocess), "cr3": hex(context.cr3), "peb": hex(context.peb)}))}))
         }
         "breakpoint_set" => {
@@ -686,7 +782,8 @@ fn run(engine: &mut dyn Engine, name: &str, args: &Arguments) -> ToolResult {
         "breakpoint_list" => {
             let client = engine.client()?;
             let list: Vec<Value> = client.breakpoints().iter().map(|breakpoint| breakpoint_value(client, breakpoint)).collect();
-            Ok(json!({"breakpoints": list, "log": client.log_lines().iter().rev().take(50).rev().cloned().collect::<Vec<_>>()}))
+            let pending: Vec<Value> = session.pending.iter().map(|pending| json!({"expression": pending.request.expression, "process": pending.process, "module": pending.module, "event_breakpoint": pending.event})).collect();
+            Ok(json!({"breakpoints": list, "pending_user": pending, "log": client.log_lines().iter().rev().take(50).rev().cloned().collect::<Vec<_>>()}))
         }
         "backtrace" => {
             let client = engine.client()?;
@@ -751,9 +848,9 @@ fn run(engine: &mut dyn Engine, name: &str, args: &Arguments) -> ToolResult {
             let had = client.trace.take().is_some();
             Ok(json!({"cleared": had}))
         }
-        "wait_for_serial" => wait_for_serial(engine, args),
+        "wait_for_serial" => wait_for_serial(engine, session, args),
         "read_serial_log" => {
-            let path = engine.serial_log().ok_or("log da COM1 desconhecido (use launch, ou connect com o build)")?;
+            let path = session.serial_path(engine).ok_or("log da COM1 desconhecido (use launch, ou connect com serial_log)")?;
             let bytes = std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
             let max = args.integer("max_bytes").unwrap_or(16384) as usize;
             let start = match args.integer("offset") {
@@ -787,7 +884,11 @@ fn run(engine: &mut dyn Engine, name: &str, args: &Arguments) -> ToolResult {
             let (width, height) = screenshot::capture(&monitor, &path)?;
             Ok(json!({"path": path.display().to_string(), "width": width, "height": height, "format": "png"}))
         }
-        _ => extra::run(engine, name, args).unwrap_or_else(|| Err(ToolError::InvalidParams(format!("ferramenta desconhecida: {name}")))),
+        _ => extra::run(engine, name, args)
+            .or_else(|| flow::run(engine, session, name, args))
+            .or_else(|| analysis::run(engine, session, name, args))
+            .or_else(|| notes::run(engine, name, args))
+            .unwrap_or_else(|| Err(ToolError::InvalidParams(format!("ferramenta desconhecida: {name}")))),
     }
 }
 
@@ -841,9 +942,10 @@ fn search_tool(engine: &mut dyn Engine, name: &str, args: &Arguments) -> ToolRes
     }
 }
 
-/// Espera um texto no log da COM1, recolhendo as paradas da máquina.
-fn wait_for_serial(engine: &mut dyn Engine, args: &Arguments) -> ToolResult {
-    let path = engine.serial_log().ok_or("log da COM1 desconhecido (use launch, ou connect com o build)")?;
+/// Espera um texto no log da COM1, recolhendo as paradas da máquina (os
+/// avisos de carga dos breakpoints adiados são atendidos e a máquina segue).
+fn wait_for_serial(engine: &mut dyn Engine, session: &mut Session, args: &Arguments) -> ToolResult {
+    let path = session.serial_path(engine).ok_or("log da COM1 desconhecido (use launch, ou connect com serial_log)")?;
     let marker = args.text("marker").unwrap_or_default();
     let after = args.integer("after_offset").unwrap_or(0) as usize;
     let deadline = Instant::now() + args.timeout(300_000);
@@ -860,9 +962,16 @@ fn wait_for_serial(engine: &mut dyn Engine, args: &Arguments) -> ToolResult {
         if let Ok(client) = engine.client() {
             if !client.is_stopped() {
                 if let Some(stop) = client.poll(Duration::from_millis(100))? {
-                    let mut value = stop_value(client, &stop);
+                    if session.service_stop(client) {
+                        client.go()?;
+                        continue;
+                    }
+                    let mut value = finish_stop(client, &stop);
                     value["found"] = json!(false);
                     value["note"] = json!("a maquina parou antes do texto aparecer");
+                    if !session.armed.is_empty() {
+                        value["armed"] = json!(std::mem::take(&mut session.armed));
+                    }
                     return Ok(value);
                 }
             } else {
@@ -888,17 +997,16 @@ pub fn resources() -> Vec<Value> {
 }
 
 /// O `resources/read`.
-pub fn read_resource(engine: &mut dyn Engine, uri: &str) -> Result<Value, String> {
+pub fn read_resource(engine: &mut dyn Engine, session: &Session, uri: &str) -> Result<Value, String> {
     let (mime, text) = match uri {
         "opennt://serial-log" => {
-            let path = engine.serial_log().ok_or("log da COM1 desconhecido")?;
+            let path = session.serial_path(engine).ok_or("log da COM1 desconhecido")?;
             let bytes = std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
             ("text/plain", String::from_utf8_lossy(&bytes[bytes.len().saturating_sub(64 << 10)..]).into_owned())
         }
         "opennt://dbgprint" => {
             let client = engine.client()?;
-            let console = client.console();
-            ("text/plain", console[console.len().saturating_sub(64 << 10)..].to_string())
+            ("text/plain", crate::serial::tail_text(client.console(), 64 << 10).to_string())
         }
         "opennt://breakpoints" => {
             let client = engine.client()?;

@@ -14,6 +14,7 @@
 use serde_json::{json, Value};
 
 use crate::engine::Engine;
+use crate::session::Session;
 use crate::tools::{self, ToolError};
 
 /// As versões do protocolo aceitas (a primeira é a preferida).
@@ -24,11 +25,14 @@ pub const INVALID_REQUEST: i64 = -32600;
 pub const METHOD_NOT_FOUND: i64 = -32601;
 pub const INVALID_PARAMS: i64 = -32602;
 
-/// O estado de uma conexão MCP (a versão negociada).
+/// O estado de uma conexão MCP: a versão negociada e o estado das
+/// ferramentas (`Session`: os breakpoints de usuário adiados, o que já foi
+/// entregue dos logs, o log da COM1 do `connect`).
 #[derive(Default)]
 pub struct Server {
     pub version: Option<String>,
     pub client_name: String,
+    pub session: Session,
 }
 
 fn error(id: Value, code: i64, message: &str) -> Value {
@@ -86,7 +90,7 @@ impl Server {
             "resources/list" => result(id, json!({"resources": tools::resources()})),
             "resources/templates/list" => result(id, json!({"resourceTemplates": []})),
             "resources/read" => match params.get("uri").and_then(Value::as_str) {
-                Some(uri) => match tools::read_resource(engine, uri) {
+                Some(uri) => match tools::read_resource(engine, &self.session, uri) {
                     Ok(contents) => result(id, json!({"contents": [contents]})),
                     Err(message) => error(id, INVALID_PARAMS, &message),
                 },
@@ -109,14 +113,14 @@ impl Server {
                 "resources": {"subscribe": false, "listChanged": false}
             },
             "serverInfo": {"name": "opennt-mcp", "title": "Depurador do OpenNT", "version": env!("CARGO_PKG_VERSION")},
-            "instructions": "Depurador do kernel do OpenNT (e dos processos de usuario dentro dele). Comece por launch (compila e abre o QEMU) ou connect; break para a maquina; go continua e wait_for_stop espera a proxima parada. Enderecos sao expressoes em texto: 0x..., simbolos (ntdll!LdrLoadDll, kernel::ntos::ke::run_kernel_tasks), @rip, poi(@rsp)."
+            "instructions": "Depurador do kernel do OpenNT (e dos processos de usuario dentro dele). Comece por launch (compila, abre o QEMU e anexa; until_marker continua o boot ate um texto da COM1) ou connect (um QEMU ja aberto com --kd=com2, com serial_log). Fluxo comum: breakpoint_user (por nome de processo, dwm.exe; adiado ate a DLL carregar) ou breakpoint_set, continue_until (ate uma parada ou um texto da COM1, com as linhas novas dos breakpoints de log), stack, registers_get, memory_view, disassemble. kd_script roda os roteiros do test-boot --kd=com2 e devolve o log. Sem sessao: status_decode (NTSTATUS, HRESULT, Win32), serial_summary, crash_analyze e wdlog sobre um serial.log, annotations_list. Enderecos sao expressoes em texto: 0x..., simbolos (ntdll!LdrLoadDll, kernel::ntos::ke::run_kernel_tasks), @rip, poi(@rsp); process aceita o nome (dwm.exe, svchost.exe#2), o PID ou o EPROCESS."
         })
     }
 
     fn call(&mut self, id: Value, params: &Value, engine: &mut dyn Engine) -> Value {
         let Some(name) = params.get("name").and_then(Value::as_str) else { return error(id, INVALID_PARAMS, "tools/call precisa de name") };
         let arguments = params.get("arguments").cloned().unwrap_or(Value::Object(Default::default()));
-        match tools::call(engine, name, &arguments) {
+        match tools::call(engine, &mut self.session, name, &arguments) {
             Ok(value) => {
                 let text = serde_json::to_string_pretty(&value).unwrap_or_default();
                 result(id, json!({"content": [{"type": "text", "text": text}], "structuredContent": value, "isError": false}))

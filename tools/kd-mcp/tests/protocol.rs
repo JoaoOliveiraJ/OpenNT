@@ -200,6 +200,105 @@ fn reverse_engineering_tools_against_the_fake_stub() {
 }
 
 #[test]
+fn agent_tools_against_the_fake_stub() {
+    // Duas paradas no `call` do preparo do IoCreateDevice: a do roteiro e a
+    // do continue_until.
+    let stop = || Stop { rip: CODE + 0x108, rsp: STACK, packet: "T05thread:1;swbreak:;", rax: 0, load: None };
+    let (address, _) = start(vec![stop(), stop()]);
+    let root = std::env::temp_dir().join(format!("opennt-mcp-agentes-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let serial = root.join("serial.log");
+    std::fs::write(&serial, "HELLO_KERNEL_OK\n[init] smss.exe (pid 84) criou csrss.exe (pid 92) por NtCreateUserProcess\n[usermode] NtOpenKey falhou 0xc0000034\n").unwrap();
+    let mut server = Server::new();
+    let mut engine = Standalone::new(root.clone());
+    request(&mut server, &mut engine, 1, "initialize", json!({"protocolVersion": "2025-06-18"}));
+    let attached = call(&mut server, &mut engine, 2, "connect", json!({"address": address, "elf": "inexistente/kernel.elf", "serial_log": serial.display().to_string()}));
+    assert_eq!(attached["serial_log"], serial.display().to_string());
+    engine.client.as_mut().unwrap().symbols.set_kernel(fake_stub::kernel_module());
+
+    // O roteiro do test-boot pela sessão: o log volta na resposta.
+    let target = CODE + 0x108;
+    let script = format!("# o roteiro dos agentes\nattach\n? 1+2\nexpect 0x3\nsave x 0x10\nexpect-eq $x 0x10\necho ola\nbp {target:#x}\nc\nwait-stop 10000\nexpect-stop breakpoint #\nr rip\nexpect {target:#x}\n");
+    let report = call(&mut server, &mut engine, 3, "kd_script", json!({"script": script, "timeout_ms": 20000}));
+    assert_eq!(report["ok"], true, "{report}");
+    assert_eq!(report["variables"]["x"], "0x10");
+    assert!(report["log"].as_array().unwrap().iter().any(|line| line == "  ola"), "{report}");
+    assert_eq!(report["stopped"], true);
+    assert!(report["last_stop"].as_str().unwrap().contains("breakpoint #0"), "{report}");
+    let failed = call(&mut server, &mut engine, 4, "kd_script", json!({"script": "? 5\nexpect nada-disso\necho nunca"}));
+    assert_eq!(failed["ok"], false);
+    assert_eq!(failed["failed_line"], 2);
+    assert!(failed["error"].as_str().unwrap().contains("nada-disso"), "{failed}");
+
+    // O texto já na COM1: volta sem continuar; depois, até o breakpoint.
+    let found = call(&mut server, &mut engine, 5, "continue_until", json!({"marker": "HELLO_KERNEL_OK", "from_start": true}));
+    assert_eq!(found["reason"], "serial", "{found}");
+    assert_eq!(found["line"], "HELLO_KERNEL_OK");
+    assert_eq!(found["stopped"], true);
+    let stopped = call(&mut server, &mut engine, 6, "continue_until", json!({"timeout_ms": 10000}));
+    assert_eq!(stopped["reason"], "breakpoint", "{stopped}");
+    assert_eq!(stopped["rip"], format!("{target:#x}"));
+    assert!(stopped["log"][0].as_str().unwrap().contains("acerto 2"), "{stopped}");
+
+    // A memória em formatos e a pilha.
+    let pointers = call(&mut server, &mut engine, 7, "memory_view", json!({"address": "@rsp", "format": "pointers", "count": 8}));
+    assert!(pointers["rows"][5].as_str().unwrap().contains("kernel::alvo::chamador+0x10"), "{pointers}");
+    let bytes = call(&mut server, &mut engine, 8, "memory_view", json!({"address": format!("{CODE:#x}"), "format": "bytes", "count": 4}));
+    assert!(bytes["rows"][0].as_str().unwrap().starts_with(&format!("{CODE:#x}: 48 83 ec 20")), "{bytes}");
+    let frames = call(&mut server, &mut engine, 9, "stack", json!({"limit": 4}));
+    assert_eq!(frames["cpu"], true);
+    assert!(frames["frames"][0].as_str().unwrap().starts_with(&format!("{target:#x} ")), "{frames}");
+
+    // Os códigos de erro, o resumo do log e a queda.
+    let decoded = call(&mut server, &mut engine, 10, "status_decode", json!({"codes": ["0x80070578", "c0000034", "0xd0000409", "87", "zz"]}));
+    let results = decoded["results"].as_array().unwrap();
+    assert_eq!(results[0]["best"], "HRESULT_FROM_WIN32(ERROR_INVALID_WINDOW_HANDLE = 1400)");
+    assert_eq!(results[1]["best"], "STATUS_OBJECT_NAME_NOT_FOUND (NTSTATUS)");
+    assert_eq!(results[2]["best"], "HRESULT_FROM_NT(STATUS_STACK_BUFFER_OVERRUN)");
+    assert_eq!(results[3]["best"], "ERROR_INVALID_PARAMETER (87, erro do Win32)");
+    assert!(results[4]["error"].is_string());
+    let summary = call(&mut server, &mut engine, 11, "serial_summary", json!({"tail": 1}));
+    assert_eq!(summary["markers"][0]["marker"], "HELLO_KERNEL_OK");
+    assert_eq!(summary["processes"][0]["name"], "csrss.exe");
+    assert_eq!(summary["failures"][0]["count"], 1);
+    assert_eq!(summary["end_offset"], summary["bytes"]);
+    let crash = call(&mut server, &mut engine, 12, "crash_analyze", json!({}));
+    assert!(crash["live"]["error"].as_str().unwrap().contains("bugcheck"), "{crash}");
+    assert!(crash["serial"]["bugcheck"]["stop_code"].is_null());
+    assert_eq!(call(&mut server, &mut engine, 13, "wdlog", json!({}))["present"], false);
+
+    // As anotações do opennt-re: gravadas por endereço, listadas e vistas
+    // na desmontagem.
+    let set = call(&mut server, &mut engine, 14, "annotation_set", json!({"address": format!("{:#x}", CODE + 0x2000), "label": "chamador_meu", "comment": "quem chama"}));
+    assert_eq!(set["location"], "kernel+0x102000");
+    assert!(root.join("build").join("opennt-re").join("notas.txt").is_file());
+    let listed = call(&mut server, &mut engine, 15, "annotations_list", json!({"module": "kernel"}));
+    assert_eq!(listed["total"], 2);
+    assert_eq!(listed["annotations"][0]["text"], "chamador_meu");
+    assert_eq!(listed["annotations"][0]["address"], format!("{:#x}", CODE + 0x2000));
+    let listing = call(&mut server, &mut engine, 16, "disassemble", json!({"address": format!("{:#x}", CODE + 0x2000), "count": 1, "annotate": false}));
+    assert_eq!(listing["lines"][0]["user_label"], "chamador_meu", "{listing}");
+    assert_eq!(listing["lines"][0]["user_comment"], "quem chama");
+    let bookmark = call(&mut server, &mut engine, 17, "annotation_set", json!({"location": "ntdll+0x10", "bookmark": true}));
+    assert_eq!(bookmark["bookmark"], true);
+
+    // Os símbolos pelo trecho do nome.
+    let symbols = call(&mut server, &mut engine, 18, "symbol_search", json!({"pattern": "ALVO::CHAM"}));
+    assert_eq!(symbols["matches"], 1);
+    assert_eq!(symbols["results"][0], format!("{:#x} kernel::alvo::chamador", CODE + 0x2000));
+    assert_eq!(call(&mut server, &mut engine, 19, "breakpoint_list", json!({}))["pending_user"], json!([]));
+
+    // O adiado de usuário precisa do ponto de evento de carga de imagem do
+    // kernel, que o alvo de mentira não tem: o erro diz isso.
+    let pending = request(&mut server, &mut engine, 20, "tools/call", json!({"name": "breakpoint_user", "arguments": {"process": "dwm.exe", "address": "d2d1!DoStackCapture"}}));
+    assert_eq!(pending["result"]["isError"], true, "{pending}");
+    assert!(pending["result"]["content"][0]["text"].as_str().unwrap().contains("ponto de evento"), "{pending}");
+    call(&mut server, &mut engine, 21, "detach", json!({}));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn stdio_binary_round_trip() {
     let (address, _) = start(Vec::new());
     let mut child = Command::new(env!("CARGO_BIN_EXE_opennt-mcp")).arg("--root=.").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
