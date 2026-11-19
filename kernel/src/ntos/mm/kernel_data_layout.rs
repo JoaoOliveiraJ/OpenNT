@@ -155,6 +155,11 @@ pub const DEFINITIONS: &[KernelDataEntry] = &[
     // de produção; o ntoskrnl 19041 guarda 0xF0004A61). O OpenNT se
     // apresenta como o build 26100 (`ke/version`): 0xF00065F4.
     KernelDataEntry { name: "NtBuildNumber", size: 4, storage_size: 4, alignment: 4, initial: &[0xF4, 0x65, 0x00, 0xF0] },
+    // ULONG InitSafeBootMode: o modo de boot seguro (0 no boot normal). O
+    // ntoskrnl 19041 exporta a variável da .data, não uma rotina: o
+    // InitUserScreen do win32kbase (0x6b6a0) lê [__imp_InitSafeBootMode] e
+    // grava o valor no SM_CLEANBOOT.
+    KernelDataEntry { name: "InitSafeBootMode", size: 4, storage_size: 4, alignment: 4, initial: &[0; 4] },
     // PACL SePublicDefaultDacl: o ponteiro exportado e a ACL logo depois
     // (os 0x54 bytes que o SepInitSystemDacls do 19041 aloca), montada pelo
     // `se/system_dacls` na primeira resolução.

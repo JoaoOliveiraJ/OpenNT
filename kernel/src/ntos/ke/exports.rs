@@ -180,6 +180,9 @@ fn query_dpc_watchdog_information(call: &Call) -> Result<u64, KernelError> {
 fn synchronize_execution(call: &Call) -> Result<u64, KernelError> {
     Ok(interrupt_object::ke_synchronize_execution(call.arg(1), call.arg(2), call.arg(3)))
 }
+/// O slot de InitSafeBootMode na ordem da ABI (append-only); o export
+/// público é a célula ULONG de `data_exports`, que o resolvedor e a EAT
+/// entregam antes do trampolim.
 fn init_safe_boot_mode(_: &Call) -> Result<u64, KernelError> {
     Ok(version::safe_boot_mode())
 }
@@ -356,7 +359,7 @@ pub static GROUP: Group = Group {
         initialize_mutant, initialize_apc, insert_queue_apc, ipi_generic_call, save_extended_processor_state, restore_extended_processor_state, set_actual_base_priority_thread,
         try_to_acquire_guarded_mutex, acquire_guarded_mutex_unsafe, release_guarded_mutex_unsafe,
     ],
-    data_exports: &[("KiBugCheckData", bugcheck::bug_check_data), ("KeNumberProcessors", processor_group::number_processors_cell)],
+    data_exports: &[("KiBugCheckData", bugcheck::bug_check_data), ("KeNumberProcessors", processor_group::number_processors_cell), ("InitSafeBootMode", version::safe_boot_mode_cell)],
 };
 
 // ---- KeQueryPrcbAddress, KeQueryPriorityThread e KeQueryRuntimeThread -------

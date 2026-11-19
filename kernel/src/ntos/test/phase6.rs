@@ -13489,6 +13489,12 @@ fn usb_driver_support_exports(assert: Assert) {
     };
     let shared = crate::ntos::mm::shared_user_data::data().map_or(0, |data| data.nt_build_number.get());
     assert(cell != 0 && guest::read32(cell) == 0xF000_65F4 && guest::read32(cell) == 0xF000_0000 | shared, "nt-build-number: 0xF00065F4, o build do KUSER_SHARED_DATA");
+    // InitSafeBootMode: a variável ULONG da .kdata (não um trampolim), 0 no
+    // boot normal, a mesma no resolvedor e na EAT.
+    let cell = crate::ntos::mm::kernel_data::address("InitSafeBootMode").unwrap_or(0);
+    let resolved = matches!(crate::ntos::init::exports::lookup("ntoskrnl.exe", "InitSafeBootMode"), Some(crate::ntos::mm::pe_loader::ResolvedImport::Address { address, .. }) if address == cell);
+    let published = crate::ntos::init::exports::export_module().is_ok_and(|module| module.exports.exports.get("InitSafeBootMode").copied() == Some(cell));
+    assert(cell != 0 && resolved && published && guest::read32(cell) == 0, "init-safe-boot-mode: a celula ULONG da .kdata com 0, no resolvedor e na EAT");
 }
 
 fn whea_error_source_exports(assert: Assert) {

@@ -41,7 +41,13 @@ pub const fn build_number() -> u32 {
     0xF000_0000 | VERSION.2
 }
 
-/// InitSafeBootMode: boot normal.
+/// InitSafeBootMode: a célula ULONG da imagem do kernel (`.kdata`), 0 no
+/// boot normal. É o export público (o ntoskrnl 19041 exporta a variável).
+pub fn safe_boot_mode_cell() -> u64 {
+    crate::ntos::mm::kernel_data::required_address("InitSafeBootMode")
+}
+
+/// O valor de InitSafeBootMode.
 pub fn safe_boot_mode() -> u64 {
-    0
+    crate::ntos::mm::guest_memory::read32(safe_boot_mode_cell()) as u64
 }
