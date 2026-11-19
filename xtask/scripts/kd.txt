@@ -99,6 +99,40 @@ save-word dispositivo dispositivos: 1
 !devobj $dispositivo
 expect DEVICE_OBJECT
 expect pilha de dispositivos
+
+# Objetos do NT pelos tipos do PDB do ntoskrnl (EPROCESS, ETHREAD com os
+# blocos de espera, HANDLE_TABLE, OBJECT_HEADER com o descritor) e as
+# consultas do stub sobre o que vive só nas coleções do kernel (a tabela de
+# tipos, o token, as portas de conclusão e as ALPC de um processo).
+!obtypes
+expect ObHeaderCookie
+expect Process
+!procs
+expect EPROCESS
+expect System
+!threads 4
+expect ETHREAD
+expect Waiting
+save-word bloqueada Waiting 0
+!waits $bloqueada
+expect BLOCO
+expect WaitBlockActive
+!handles 4
+expect mostrados
+# O OBJECT_HEADER de um objeto do ObCreateObject (o evento chaveado com
+# nome da inicialização do executivo): o TypeIndex decodificado pela
+# ObTypeIndexTable e as contagens. Os objetos que o OpenNT ainda cria sem
+# o cabeçalho do Ob (processos, drivers, diretórios) dão um erro claro.
+!obj \KernelObjects\CritSecOutOfMemoryEvent
+expect tipo KeyedEvent
+expect PointerCount
+!token 4
+expect TOKEN
+expect usuario S-1-5-18
+!iocp 4
+expect handles IoCompletion
+!alpc 4
+expect handles ALPC_Port
 lmv ksecdd
 expect ksecdd.sys
 
