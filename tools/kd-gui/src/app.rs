@@ -20,7 +20,7 @@ use kd_client::commands::TraceOptions;
 use kd_client::{BreakpointKind, Client};
 use serde::{Deserialize, Serialize};
 
-use crate::backend::{Backend, Entry, QueryKind, Request, Snapshot, Status, Target, TraceView, View};
+use crate::backend::{Backend, Entry, QueryKind, Request, ScriptProgress, Snapshot, Status, Target, TraceView, View};
 use crate::disasm::{self, ValueHint};
 use crate::launcher::{self, LaunchOptions};
 use crate::session::{self, SessionFile};
@@ -226,6 +226,23 @@ struct Saved {
     recent_launch: Vec<String>,
     /// Os últimos endereços conectados.
     recent_connect: Vec<String>,
+    /// Os últimos roteiros rodados.
+    recent_scripts: Vec<String>,
+}
+
+/// O formulário da janela Roteiros (rodar um roteiro do kd e gravar os
+/// comandos num roteiro).
+#[derive(Clone, Debug, Default)]
+struct ScriptForm {
+    /// O arquivo do roteiro (relativo à raiz do repositório ou absoluto).
+    path: String,
+    /// Um roteiro escrito na própria janela.
+    text: String,
+    /// Onde gravar os comandos.
+    record_path: String,
+    /// Os roteiros `.kd` da pasta do diretório de build.
+    found: Vec<String>,
+    error: Option<String>,
 }
 
 /// As opções comuns do `xtask` (os botões da janela de abertura).
@@ -316,6 +333,14 @@ pub struct UiState {
     cancel: bool,
     /// A janela Sessões (aberta quando `Some`).
     session_dialog: Option<SessionForm>,
+    /// A janela Roteiros (aberta quando `Some`) e os campos dela entre uma
+    /// abertura e outra.
+    script_dialog: Option<ScriptForm>,
+    script_memory: ScriptForm,
+    recent_scripts: Vec<String>,
+    /// O roteiro rodando e a gravação, como o backend publicou.
+    script: Option<ScriptProgress>,
+    recording: Option<(PathBuf, usize)>,
     /// A geração do snapshot que já rolou o código até o foco.
     scrolled_code: u64,
     scrolled_source: u64,
@@ -465,6 +490,11 @@ impl DebuggerApp {
                 target: None,
                 cancel: false,
                 session_dialog: None,
+                script_dialog: None,
+                script_memory: ScriptForm::default(),
+                recent_scripts: Vec::new(),
+                script: None,
+                recording: None,
                 scrolled_code: 0,
                 scrolled_source: 0,
                 requests: Vec::new(),
@@ -521,6 +551,7 @@ impl DebuggerApp {
                 self.state.history = saved.history;
                 self.state.recent_launch = saved.recent_launch;
                 self.state.recent_connect = saved.recent_connect;
+                self.state.recent_scripts = saved.recent_scripts;
             }
         }
         self.persist = Some(path);
@@ -569,6 +600,7 @@ impl DebuggerApp {
             history: self.state.history.iter().rev().take(200).rev().cloned().collect(),
             recent_launch: self.state.recent_launch.clone(),
             recent_connect: self.state.recent_connect.clone(),
+            recent_scripts: self.state.recent_scripts.clone(),
         };
         let Ok(text) = serde_json::to_string(&saved) else { return };
         if text == self.last_saved {
@@ -601,6 +633,8 @@ impl DebuggerApp {
         state.activity = shared.activity.clone();
         state.can_restart = shared.can_restart;
         state.target = shared.target.clone();
+        state.script = shared.script.clone();
+        state.recording = shared.recording.clone();
         if shared.transcript.len() < state.transcript.len() {
             state.transcript.clear();
         }
@@ -662,6 +696,7 @@ impl DebuggerApp {
         views::sync_wanted(&mut self.state, &open);
         open_dialog(ui, &mut self.state);
         session_dialog(ui, &mut self.state);
+        script_dialog(ui, &mut self.state);
         if std::mem::take(&mut self.state.cancel) {
             self.backend.cancel();
         }
@@ -845,6 +880,33 @@ impl UiState {
             self.connect_address = session.connect.clone();
         }
         self.requests.push(Request::LoadBreakpoints(session.breakpoints.clone()));
+    }
+
+    /// Abre a janela Roteiros com os roteiros da pasta do diretório de build.
+    fn open_scripts(&mut self) {
+        let folder = self.build_path().join("opennt-dbg").join("roteiros");
+        let mut found: Vec<String> = std::fs::read_dir(&folder)
+            .map(|entries| entries.filter_map(Result::ok).map(|entry| entry.path()).filter(|path| path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("kd") || extension.eq_ignore_ascii_case("txt"))).map(|path| self.shown_path(&path)).collect())
+            .unwrap_or_default();
+        found.sort();
+        let previous = self.script_dialog.take().unwrap_or_else(|| std::mem::take(&mut self.script_memory));
+        let path = if previous.path.is_empty() { self.recent_scripts.first().cloned().unwrap_or_default() } else { previous.path };
+        let record_path = if previous.record_path.is_empty() { self.shown_path(&folder.join("gravado.kd")) } else { previous.record_path };
+        self.script_dialog = Some(ScriptForm { path, text: previous.text, record_path, found, error: None });
+    }
+
+    /// Um caminho como a janela mostra: relativo à raiz quando dá.
+    fn shown_path(&self, path: &std::path::Path) -> String {
+        let root = self.root();
+        path.strip_prefix(&root).map_or_else(|_| path.display().to_string(), |relative| relative.display().to_string().replace('\\', "/"))
+    }
+
+    /// Roda o roteiro de um arquivo e o guarda nos recentes.
+    fn run_script_file(&mut self, path: &str) {
+        let path = path.trim().to_string();
+        remember_recent(&mut self.recent_scripts, &path, 12);
+        self.requests.push(Request::RunScriptFile(PathBuf::from(path)));
+        self.focus_tab.push(Tab::Command);
     }
 
     /// O botão Conectar da barra: o endereço do campo (`HOST:PORTA`, a
@@ -1057,6 +1119,110 @@ fn session_dialog(ui: &mut Ui, state: &mut UiState) {
     }
 }
 
+/// A janela Roteiros: rodar um roteiro do kd (de um arquivo ou escrito
+/// aqui) e gravar os comandos da janela num roteiro.
+fn script_dialog(ui: &mut Ui, state: &mut UiState) {
+    let Some(mut form) = state.script_dialog.take() else { return };
+    let colors = palette(ui);
+    let connected = matches!(state.status, Status::Stopped | Status::Running);
+    let mut open = true;
+    let mut close = false;
+    egui::Window::new("Roteiros").id(egui::Id::new("kd-script-dialog")).collapsible(false).resizable(true).default_width(640.0).anchor(Align2::CENTER_TOP, Vec2::new(0.0, 80.0)).open(&mut open).show(ui.ctx(), |ui| {
+        ui.label(RichText::new("Rodar um roteiro do kd").strong());
+        hint(ui, "A linguagem do --script do cargo xtask test-boot --kd=com2: um comando por linha, # comenta; expect, expect-stop, expect-console, expect-eq, save, save-word, save-thread ($nome), wait-serial, wait-stop [ms], echo, sleep. A saída vai ao painel Comandos; a primeira conferência que falha para o roteiro.");
+        let mut run_file = false;
+        ui.horizontal(|ui| {
+            ui.label("Arquivo:");
+            let response = ui.add(egui::TextEdit::singleline(&mut form.path).font(TextStyle::Monospace).desired_width(440.0).hint_text("build/opennt-dbg/roteiros/logon.kd"));
+            if response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter)) {
+                run_file = true;
+            }
+            if ui.add_enabled(connected && state.script.is_none(), egui::Button::new("Rodar")).clicked() {
+                run_file = true;
+            }
+        });
+        let quick: Vec<String> = state.recent_scripts.iter().chain(form.found.iter()).take(10).cloned().collect();
+        if !quick.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("últimos e da pasta:").color(colors.dim));
+                for path in &quick {
+                    if ui.small_button(mono(path)).clicked() {
+                        form.path = path.clone();
+                    }
+                }
+            });
+        }
+        ui.collapsing("Escrever o roteiro aqui", |ui| {
+            ui.add(egui::TextEdit::multiline(&mut form.text).font(TextStyle::Monospace).desired_rows(6).desired_width(f32::INFINITY).hint_text("bp nt!NtCreateFile\nc\nwait-stop 300000\nk 20"));
+            if ui.add_enabled(connected && state.script.is_none() && !form.text.trim().is_empty(), egui::Button::new("Rodar o texto")).clicked() {
+                state.requests.push(Request::RunScript { name: "(roteiro da janela)".into(), text: form.text.clone() });
+                state.focus_tab.push(Tab::Command);
+                close = true;
+            }
+        });
+        if !connected {
+            ui.label(RichText::new("o roteiro precisa da conexão com o alvo: abra o OpenNT ou conecte antes (Ctrl+O)").color(colors.yellow));
+        }
+        if state.script.is_some() && ui.button("Parar o roteiro").clicked() {
+            state.cancel = true;
+        }
+        if run_file && connected && state.script.is_none() {
+            if form.path.trim().is_empty() {
+                form.error = Some("diga o arquivo do roteiro".into());
+            } else {
+                let path = form.path.clone();
+                state.run_script_file(&path);
+                close = true;
+            }
+        }
+        ui.separator();
+        ui.label(RichText::new("Gravar os comandos num roteiro").strong());
+        hint(ui, "Os comandos digitados, os botões de execução, os breakpoints pela margem e pelo painel viram linhas do roteiro (um c ganha o wait-stop quando a máquina para). O arquivo é recriado; o cabeçalho diz como rodá-lo com o cargo xtask debug --script.");
+        match state.recording.clone() {
+            Some((path, lines)) => {
+                ui.label(mono(format!("gravando em {} ({lines} linhas)", path.display())).color(colors.red));
+                if ui.button("Parar a gravação").clicked() {
+                    state.requests.push(Request::StopRecording);
+                    close = true;
+                }
+            }
+            None => {
+                ui.horizontal(|ui| {
+                    ui.label("Arquivo:");
+                    ui.add(egui::TextEdit::singleline(&mut form.record_path).font(TextStyle::Monospace).desired_width(440.0));
+                    if ui.button("Gravar").clicked() {
+                        if form.record_path.trim().is_empty() {
+                            form.error = Some("diga o arquivo da gravação".into());
+                        } else {
+                            let xtask = state.launch.as_ref().map(|launch| launch.extra.clone()).unwrap_or_default();
+                            state.requests.push(Request::StartRecording { path: PathBuf::from(form.record_path.trim()), xtask });
+                            close = true;
+                        }
+                    }
+                });
+                let target = PathBuf::from(form.record_path.trim());
+                let target = if target.is_absolute() { target } else { state.root().join(target) };
+                if target.is_file() {
+                    ui.label(RichText::new("o arquivo já existe e será substituído").color(colors.yellow));
+                }
+            }
+        }
+        if let Some(error) = &form.error {
+            ui.separator();
+            ui.label(RichText::new(error).color(colors.red));
+        }
+        if ui.input(|input| input.key_pressed(Key::Escape)) {
+            close = true;
+        }
+    });
+    if open && !close {
+        state.script_dialog = Some(form);
+    } else {
+        // Os campos voltam na próxima abertura.
+        state.script_memory = form;
+    }
+}
+
 fn menu_bar(ui: &mut Ui, state: &mut UiState, open: &[Tab]) {
     let stopped = state.status == Status::Stopped;
     let running = state.status == Status::Running;
@@ -1115,6 +1281,32 @@ fn menu_bar(ui: &mut Ui, state: &mut UiState, open: &[Tab]) {
                 state.query_kind = QueryKind::Analyze;
                 state.requests.push(Request::Query(QueryKind::Analyze, String::new()));
                 state.focus_tab.push(Tab::NtObjects);
+            }
+        });
+        ui.menu_button("Roteiro", |ui| {
+            if ui.button("Rodar um roteiro do kd...").on_hover_text("a linguagem do --script do cargo xtask test-boot --kd=com2").clicked() {
+                state.open_scripts();
+            }
+            if let Some(last) = state.recent_scripts.first().cloned() {
+                if ui.add_enabled(state.script.is_none(), egui::Button::new(format!("Rodar de novo: {last}"))).clicked() {
+                    state.run_script_file(&last);
+                }
+            }
+            if ui.add_enabled(state.script.is_some(), egui::Button::new("Parar o roteiro")).clicked() {
+                state.cancel = true;
+            }
+            ui.separator();
+            match &state.recording {
+                Some((path, lines)) => {
+                    if ui.button(format!("Parar a gravação ({lines} linhas em {})", path.display())).clicked() {
+                        state.requests.push(Request::StopRecording);
+                    }
+                }
+                None => {
+                    if ui.button("Gravar os comandos num roteiro...").on_hover_text("os comandos digitados e os botões viram um roteiro que o test-boot roda").clicked() {
+                        state.open_scripts();
+                    }
+                }
             }
         });
         ui.menu_button("Painéis", |ui| {
@@ -1353,6 +1545,19 @@ fn status_bar(ui: &mut Ui, state: &mut UiState) {
                 ui.separator();
                 ui.label(mono(snapshot.stop.split(" [").next().unwrap_or("")).color(colors.dim));
             }
+        }
+        if let Some(progress) = &state.script {
+            ui.separator();
+            ui.label(RichText::new(format!("roteiro {}/{} (linha {})", progress.index, progress.total, progress.line)).color(colors.yellow).strong()).on_hover_text(&progress.name);
+            if ui.small_button("parar").on_hover_text("para o roteiro entre uma linha e outra (ou na espera)").clicked() {
+                state.cancel = true;
+            }
+        }
+        if let Some((path, lines)) = &state.recording {
+            ui.separator();
+            let (rect, _) = ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
+            ui.painter().circle_filled(rect.center(), 4.5, colors.red);
+            ui.label(RichText::new(format!("gravando ({lines} linhas)")).color(colors.red)).on_hover_text(path.display().to_string());
         }
         if !state.activity.is_empty() {
             ui.separator();

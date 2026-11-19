@@ -9,6 +9,8 @@
 //!   aberto digitados na janela;
 //! - `session`: as sessões com nome (breakpoints, expressões, memória e
 //!   opções de abertura);
+//! - `script`: os roteiros do kd (a linguagem do `--script` do test-boot)
+//!   e o texto da gravação dos comandos;
 //! - `app`: a janela (egui/eframe com painéis encaixáveis do `egui_dock`);
 //!   as vistas do estado da máquina ficam em `app/views.rs`;
 //! - `details`: as leituras extras das vistas (espera e prioridade das
@@ -27,6 +29,7 @@ pub mod disasm;
 pub mod launcher;
 pub mod offscreen;
 pub mod scenario;
+pub mod script;
 pub mod session;
 pub mod source;
 

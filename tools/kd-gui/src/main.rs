@@ -29,6 +29,8 @@ const USAGE: &str = "uso: opennt-dbg [opcoes] [opcoes do xtask]
   --serial-log=ARQ       o log da COM1 a acompanhar (padrao DIR/serial.log; o --launch usa o do build)
   --headless-qemu        com --launch: o QEMU sem janela
   --root=DIR             raiz do repositorio (padrao: a deste checkout)
+  --script=ARQ           roteiro do kd para rodar depois do attach (a linguagem do --script do
+                         cargo xtask test-boot --kd=com2; menu Roteiro)
   --session=ARQ          sessao salva (menu Sessao): breakpoints, expressoes, memoria e as opcoes
                          de abertura; com --launch, abre com as opcoes do xtask dela (as da linha
                          de comando, quando houver, valem no lugar)
@@ -46,6 +48,8 @@ struct Options {
     build_dir_given: bool,
     serial_log: Option<PathBuf>,
     session: Option<PathBuf>,
+    /// O roteiro do kd que roda depois do attach (`--script`).
+    script: Option<PathBuf>,
     /// O endereço de um QEMU de fora salvo na sessão (vai ao campo Conectar).
     session_connect: Option<String>,
     headless: bool,
@@ -58,7 +62,7 @@ struct Options {
 }
 
 fn parse(arguments: impl Iterator<Item = String>) -> Result<Options, String> {
-    let mut options = Options { launch: false, connect: None, build_dir: PathBuf::from("build"), build_dir_given: false, serial_log: None, session: None, session_connect: None, headless: false, root: kd_gui::workspace_root(), screenshot: None, scenario: "breakpoint".into(), break_at: None, size: [1600, 1000], extra: Vec::new() };
+    let mut options = Options { launch: false, connect: None, build_dir: PathBuf::from("build"), build_dir_given: false, serial_log: None, session: None, script: None, session_connect: None, headless: false, root: kd_gui::workspace_root(), screenshot: None, scenario: "breakpoint".into(), break_at: None, size: [1600, 1000], extra: Vec::new() };
     for argument in arguments {
         let (name, value) = match argument.split_once('=') {
             Some((name, value)) => (name.to_string(), Some(value.to_string())),
@@ -74,6 +78,7 @@ fn parse(arguments: impl Iterator<Item = String>) -> Result<Options, String> {
             }
             "--serial-log" => options.serial_log = Some(PathBuf::from(required()?)),
             "--session" => options.session = Some(PathBuf::from(required()?)),
+            "--script" => options.script = Some(PathBuf::from(required()?)),
             "--headless-qemu" => options.headless = true,
             "--root" => options.root = PathBuf::from(required()?),
             "--screenshot" => options.screenshot = Some(PathBuf::from(required()?)),
@@ -164,6 +169,7 @@ fn main() -> ExitCode {
 
 fn window(config: Config, target: Option<Target>, launch: LaunchOptions, options: &Options, session: Option<SessionFile>) -> Result<(), String> {
     let connect = options.connect.clone().or_else(|| options.session_connect.clone()).unwrap_or_else(|| "127.0.0.1:1234".to_string());
+    let script = options.script.clone();
     let native = eframe::NativeOptions { viewport: egui::ViewportBuilder::default().with_title("opennt-dbg - depurador do kernel do OpenNT").with_inner_size([1600.0, 1000.0]), ..Default::default() };
     eframe::run_native(
         "opennt-dbg",
@@ -172,6 +178,11 @@ fn window(config: Config, target: Option<Target>, launch: LaunchOptions, options
             kd_gui::configure(&creation.egui_ctx);
             let context = creation.egui_ctx.clone();
             let backend = Backend::start(config, target, Arc::new(move || context.request_repaint()));
+            // O roteiro entra na fila: roda depois do attach (sem alvo, a
+            // mensagem pede para abrir ou conectar).
+            if let Some(path) = script {
+                backend.send(Request::RunScriptFile(path));
+            }
             let mut app = DebuggerApp::new(backend, Some(launch), connect);
             if let Some(path) = kd_gui::app::state_path() {
                 app = app.with_persistence(path);
