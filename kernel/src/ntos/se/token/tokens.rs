@@ -456,7 +456,11 @@ pub fn create(parent: Option<u64>, initialize: Option<&dyn Fn(&mut Token)>) -> R
         expiration_time: parent.as_ref().map_or(0x7FFF_FFFF_FFFF_FFFF, |parent| parent.expiration_time),
         user: user.clone(),
         user_attributes: parent.as_ref().map_or(0, |parent| parent.user_attributes),
-        owner: user.clone(),
+        // O SeMakeSystemToken (0xa47fc7..0xa48452) passa ao SepCreateToken o
+        // dono padrão Administradores (o grupo tem SE_GROUP_OWNER) e o grupo
+        // primário SYSTEM; numa cópia, o SeSubProcessToken e o duplicate
+        // repõem o dono da origem.
+        owner: if parent.is_some() { user.clone() } else { sid(5, &[32, 544]) },
         primary_group: parent.as_ref().map_or_else(|| user.clone(), |parent| parent.primary_group.clone()),
         kind: 1,
         session_id: parent.as_ref().map_or(0, |parent| parent.session_id),
@@ -493,7 +497,9 @@ pub fn create(parent: Option<u64>, initialize: Option<&dyn Fn(&mut Token)>) -> R
         security: SecurityPolicy { owner: user.clone(), dacl: Some(alloc::vec![Ace::allow(user.clone(), 0x1F01FF)]), ..Default::default() },
         default_dacl: match &parent {
             Some(parent) => parent.default_dacl.clone(),
-            None => Some(alloc::vec![Ace::allow(user.clone(), 0x1000_0000)]),
+            // SeSystemDefaultDacl: SYSTEM GENERIC_ALL e Administradores
+            // GENERIC_READ | GENERIC_EXECUTE | READ_CONTROL.
+            None => Some(alloc::vec![Ace::allow(user.clone(), 0x1000_0000), Ace::allow(sid(5, &[32, 544]), 0xA002_0000)]),
         },
         impersonation_level: 2,
         // O SeMakeSystemToken fixa TOKEN_MANDATORY_POLICY_NO_WRITE_UP no
