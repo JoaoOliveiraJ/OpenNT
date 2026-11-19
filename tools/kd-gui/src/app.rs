@@ -435,6 +435,11 @@ pub struct UiState {
     /// O roteiro rodando e a gravação, como o backend publicou.
     script: Option<ScriptProgress>,
     recording: Option<(PathBuf, usize)>,
+    /// A última falha da sessão (o aviso no alto da janela) e qual o
+    /// usuário já fechou.
+    failure: Option<String>,
+    failure_generation: u64,
+    dismissed_failure: u64,
     /// A geração do snapshot que já rolou o código até o foco.
     scrolled_code: u64,
     scrolled_source: u64,
@@ -592,6 +597,9 @@ impl DebuggerApp {
                 recent_scripts: Vec::new(),
                 script: None,
                 recording: None,
+                failure: None,
+                failure_generation: 0,
+                dismissed_failure: 0,
                 scrolled_code: 0,
                 scrolled_source: 0,
                 requests: Vec::new(),
@@ -732,6 +740,8 @@ impl DebuggerApp {
         state.target = shared.target.clone();
         state.script = shared.script.clone();
         state.recording = shared.recording.clone();
+        state.failure = shared.failure.clone();
+        state.failure_generation = shared.failure_generation;
         if shared.transcript.len() < state.transcript.len() {
             state.transcript.clear();
             state.transcript_lines.clear();
@@ -787,6 +797,9 @@ impl DebuggerApp {
         let open: Vec<Tab> = Tab::ALL.iter().copied().filter(|tab| dock.find_tab(tab).is_some()).collect();
         egui::Panel::top("menu").show(ui, |ui| menu_bar(ui, state, &open));
         egui::Panel::top("toolbar").show(ui, |ui| toolbar(ui, state));
+        if state.failure.is_some() && state.dismissed_failure != state.failure_generation {
+            egui::Panel::top("failure").show(ui, |ui| failure_banner(ui, state));
+        }
         egui::Panel::bottom("status").show(ui, |ui| status_bar(ui, state));
         self.layout_requests();
         egui::CentralPanel::no_frame().show(ui, |ui| {
@@ -1407,6 +1420,49 @@ fn script_dialog(ui: &mut Ui, state: &mut UiState) {
     } else {
         // Os campos voltam na próxima abertura.
         state.script_memory = form;
+    }
+}
+
+/// O aviso de falha no alto da janela (a conexão caiu, o QEMU terminou, a
+/// abertura ou o attach falhou): a primeira linha em vermelho, o resto da
+/// mensagem (como o QEMU saiu, as últimas linhas da COM1 e do xtask) e os
+/// botões para continuar.
+fn failure_banner(ui: &mut Ui, state: &mut UiState) {
+    let Some(message) = state.failure.clone() else { return };
+    let colors = palette(ui);
+    let mut lines = message.lines();
+    let headline = lines.next().unwrap_or("").to_string();
+    let details = lines.collect::<Vec<_>>().join("\n");
+    let generation = state.failure_generation;
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new(&headline).color(colors.red).strong());
+        let retry = match &state.target {
+            Some(Target::Launch(_)) => Some(("Reiniciar".to_string(), "recompila e abre o OpenNT com as mesmas opções (Ctrl+Shift+F5)".to_string())),
+            Some(Target::Connect(address)) => Some((format!("Conectar de novo a {address}"), "a mesma sessão de antes, no mesmo endereço".to_string())),
+            None => None,
+        };
+        if let Some((label, tooltip)) = retry {
+            if ui.button(label).on_hover_text(tooltip).clicked() {
+                state.requests.push(Request::Restart);
+                state.dismissed_failure = generation;
+            }
+        }
+        if ui.button("Abrir ou conectar...").clicked() {
+            state.open_form();
+        }
+        if ui.button("Copiar a mensagem").clicked() {
+            ui.ctx().copy_text(message.clone());
+        }
+        if ui.button("Fechar o aviso").clicked() {
+            state.dismissed_failure = generation;
+        }
+    });
+    if !details.trim().is_empty() {
+        egui::CollapsingHeader::new("detalhes").id_salt(("kd-failure", generation)).default_open(true).show(ui, |ui| {
+            egui::ScrollArea::vertical().id_salt("kd-failure-details").max_height(200.0).show(ui, |ui| {
+                ui.label(mono(details.trim()));
+            });
+        });
     }
 }
 

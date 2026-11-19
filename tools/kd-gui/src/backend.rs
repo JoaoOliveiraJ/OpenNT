@@ -430,6 +430,10 @@ impl TraceView {
     }
 }
 
+/// O erro de quando o `xtask` termina com a máquina parada (rodando, o
+/// socket fechado avisa antes).
+pub const QEMU_ENDED: &str = "o QEMU terminou";
+
 /// O roteiro rodando (a barra de estado e o painel de comandos).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ScriptProgress {
@@ -464,6 +468,12 @@ pub struct Shared {
     pub script: Option<ScriptProgress>,
     /// A gravação ligada: o arquivo e quantas linhas já foram.
     pub recording: Option<(PathBuf, usize)>,
+    /// A última falha da sessão (a conexão caiu, o QEMU terminou, a
+    /// abertura falhou): a primeira linha diz o que foi, o resto o que se
+    /// sabe e como continuar. Some num início novo.
+    pub failure: Option<String>,
+    /// Cresce a cada falha nova (a janela fecha o aviso de uma só).
+    pub failure_generation: u64,
     pub trace: Option<Arc<TraceView>>,
     pub reference: Option<Arc<TraceView>>,
     /// Muda a cada rastro novo.
@@ -591,6 +601,8 @@ struct Worker {
     /// `save-thread`); valem também nos comandos digitados depois.
     variables: HashMap<String, u64>,
     recording: Option<Recording>,
+    /// Como o QEMU saiu (a linha `KD_QEMU_EXITED` do xtask).
+    qemu_exit: Option<String>,
 }
 
 /// Quantas threads ganham os detalhes do KTHREAD por parada (sem filtro de
@@ -632,6 +644,7 @@ impl Worker {
             pending_breakpoints: None,
             variables: HashMap::new(),
             recording: None,
+            qemu_exit: None,
         }
     }
 
@@ -678,9 +691,16 @@ impl Worker {
             self.tail_serial();
             if let Some(launch) = self.launch.as_mut() {
                 let mut text = String::new();
+                let mut exited = None;
                 while let Ok(line) = launch.output.try_recv() {
+                    if let Some(status) = line.strip_prefix("KD_QEMU_EXITED ") {
+                        exited = Some(status.trim().to_string());
+                    }
                     text.push_str(&line);
                     text.push('\n');
+                }
+                if exited.is_some() {
+                    self.qemu_exit = exited;
                 }
                 if !text.is_empty() {
                     self.publish(|shared| shared.launch_log.push_str(&text));
@@ -689,7 +709,7 @@ impl Worker {
             // A janela do QEMU fechada com a máquina parada (rodando, o
             // socket fechado já avisa).
             if self.launch.as_mut().is_some_and(|launch| !launch.alive()) {
-                self.lost("o QEMU terminou".into());
+                self.lost(QEMU_ENDED.into());
             }
         }
     }
@@ -699,8 +719,12 @@ impl Worker {
         self.disconnect("reiniciando");
         self.cancel.store(false, Ordering::SeqCst);
         self.target = Some(target.clone());
+        self.qemu_exit = None;
         let published = target.clone();
-        self.publish(|shared| shared.target = Some(published));
+        self.publish(|shared| {
+            shared.target = Some(published);
+            shared.failure = None;
+        });
         self.view = View::Owner;
         self.selected_frame = 0;
         self.focus = Focus::Frame;
@@ -753,8 +777,12 @@ impl Worker {
                         self.launch = Some(launch);
                         address
                     }
-                    Err(error) => {
+                    Err(error) if error == CANCELLED => {
                         self.set_status(Status::Disconnected(error));
+                        return;
+                    }
+                    Err(error) => {
+                        self.fail(format!("A abertura falhou: {error}\n\nO comando: {}\nPara continuar: Ctrl+O para conferir as opções do xtask e abrir de novo.", options.command_line()));
                         return;
                     }
                 }
@@ -773,7 +801,11 @@ impl Worker {
                         if let Some(mut launch) = self.launch.take() {
                             launch.stop();
                         }
-                        self.set_status(Status::Disconnected(if cancelled { CANCELLED.to_string() } else { error }));
+                        if cancelled {
+                            self.set_status(Status::Disconnected(CANCELLED.to_string()));
+                        } else {
+                            self.fail(format!("Sem conexão com o depurador em {address}: {error}\n\nO QEMU precisa estar aberto com o kernel de --kd=com2: o cargo xtask debug --launch --no-client imprime KD_READY 127.0.0.1:PORTA (cole a linha em Ctrl+O), e o cargo xtask run --kd=com2 escuta em 127.0.0.1:1234."));
+                        }
                         return;
                     }
                 }
@@ -810,7 +842,12 @@ impl Worker {
                 self.lines = None;
                 self.refresh();
             }
-            Err(error) => self.set_status(Status::Disconnected(format!("attach: {error}"))),
+            Err(error) => {
+                if let Some(mut launch) = self.launch.take() {
+                    launch.stop();
+                }
+                self.fail(format!("O attach falhou: {error}\n\nO socket abriu, mas o depurador do kernel não respondeu: o kernel precisa do --kd=com2 (o cargo xtask debug já o liga) e de ter chegado ao ponto em que o kd atende. Num QEMU de fora, confira se outro cliente (outro opennt-dbg, o opennt-re ou o cargo xtask debug) já está conectado."));
+            }
         }
         self.set_activity("");
     }
@@ -898,13 +935,62 @@ impl Worker {
         }
     }
 
-    /// A conexão caiu (o QEMU fechou).
+    /// Uma falha da sessão: a barra de estado e o aviso da janela mostram a
+    /// mensagem (a primeira linha diz o que foi).
+    fn fail(&self, message: String) {
+        self.publish(|shared| {
+            shared.status = Status::Disconnected(message.clone());
+            shared.failure = Some(message);
+            shared.failure_generation += 1;
+        });
+    }
+
+    /// A conexão caiu ou o QEMU terminou: a mensagem diz como o QEMU saiu
+    /// (a linha `KD_QEMU_EXITED` do xtask ou o código de saída dele), se a
+    /// COM1 mostra um bugcheck ou pânico, as últimas linhas da COM1 e do
+    /// xtask, e como continuar.
     fn lost(&mut self, error: String) {
         self.client = None;
+        self.cancel.store(false, Ordering::SeqCst);
+        if self.recording.is_some() {
+            self.record(&[format!("# a sessao caiu: {error}")]);
+        }
+        let launched = self.launch.is_some();
+        let mut qemu_status = self.qemu_exit.clone();
+        let mut xtask_status = None;
         if let Some(mut launch) = self.launch.take() {
+            // O xtask sai logo depois do QEMU: um instante para a linha
+            // KD_QEMU_EXITED e o código de saída.
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                let mut text = String::new();
+                while let Ok(line) = launch.output.try_recv() {
+                    if let Some(status) = line.strip_prefix("KD_QEMU_EXITED ") {
+                        qemu_status = Some(status.trim().to_string());
+                    }
+                    text.push_str(&line);
+                    text.push('\n');
+                }
+                if !text.is_empty() {
+                    self.publish(|shared| shared.launch_log.push_str(&text));
+                }
+                if let Some(status) = launch.exit_status() {
+                    xtask_status = Some(status);
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
             launch.stop();
         }
-        self.set_status(Status::Disconnected(error));
+        self.tail_serial();
+        let (serial, xtask) = {
+            let shared = self.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            (tail_lines(&shared.serial, 12), if launched { tail_lines(&shared.launch_log, 8) } else { Vec::new() })
+        };
+        self.fail(loss_message(&error, launched, qemu_status.as_deref(), xtask_status.as_deref(), &serial, &xtask));
     }
 
     /// Grava os breakpoints no arquivo da sessão.
@@ -2283,6 +2369,56 @@ fn code_view(client: &mut Client, focus: u64) -> CodeView {
     view
 }
 
+/// As últimas `count` linhas não vazias de um texto (as da COM1 e do xtask
+/// na mensagem de queda).
+pub fn tail_lines(text: &str, count: usize) -> Vec<String> {
+    let mut lines: Vec<String> = text.lines().rev().map(|line| line.trim_end().to_string()).filter(|line| !line.is_empty()).take(count).collect();
+    lines.reverse();
+    lines
+}
+
+/// Como o QEMU saiu, em texto (o `ExitStatus` do Rust: "exit code: 0").
+fn describe_qemu_exit(status: &str) -> String {
+    let code = status.rsplit(':').next().map(str::trim).unwrap_or(status);
+    if code == "0" {
+        "O QEMU saiu normalmente (a janela dele foi fechada ou o sistema desligou).".to_string()
+    } else {
+        format!("O QEMU saiu com {status}.")
+    }
+}
+
+/// A mensagem de quando a sessão cai: o que aconteceu na primeira linha (a
+/// barra de estado), depois como o QEMU saiu, um bugcheck ou pânico na
+/// COM1, as últimas linhas da COM1 e do xtask, e como continuar.
+pub fn loss_message(error: &str, launched: bool, qemu_status: Option<&str>, xtask_status: Option<&str>, serial_tail: &[String], xtask_tail: &[String]) -> String {
+    let mut lines = vec![if error == QEMU_ENDED { "O QEMU terminou e a sessão acabou.".to_string() } else { format!("A conexão com o alvo caiu: {error}") }];
+    match (qemu_status, xtask_status) {
+        (Some(status), _) => lines.push(describe_qemu_exit(status)),
+        (None, Some(status)) => lines.push(format!("O xtask saiu com {status}, sem a linha KD_QEMU_EXITED (o QEMU pode ter caído junto ou sido morto).")),
+        (None, None) if launched => lines.push("O QEMU aberto pelo depurador foi fechado.".to_string()),
+        (None, None) => lines.push("O QEMU de fora fechou o socket da COM2 ou terminou.".to_string()),
+    }
+    let serial = serial_tail.join("\n");
+    if serial.contains("*** STOP") {
+        lines.push("A COM1 mostra um bugcheck (*** STOP) que não chegou como parada ao depurador.".to_string());
+    } else if serial.to_ascii_lowercase().contains("panic") {
+        lines.push("A COM1 mostra um pânico do kernel.".to_string());
+    }
+    if !serial_tail.is_empty() {
+        lines.push(String::new());
+        lines.push("Últimas linhas da COM1:".to_string());
+        lines.extend(serial_tail.iter().map(|line| format!("  {line}")));
+    }
+    if !xtask_tail.is_empty() {
+        lines.push(String::new());
+        lines.push("Últimas linhas do xtask:".to_string());
+        lines.extend(xtask_tail.iter().map(|line| format!("  {line}")));
+    }
+    lines.push(String::new());
+    lines.push(if launched { "Para continuar: Reiniciar (Ctrl+Shift+F5) recompila e abre o OpenNT com as mesmas opções; Ctrl+O troca as opções." } else { "Para continuar: Conectar de novo ao mesmo endereço, ou Ctrl+O para outro." }.to_string());
+    lines.join("\n")
+}
+
 /// O erro é de conexão (o alvo sumiu), não de um comando.
 fn is_connection_error(error: &str) -> bool {
     error.contains("fechou a conexao") || error.contains("depurador:") || error.contains("os error") || error.contains("nao confirmou")
@@ -2290,7 +2426,28 @@ fn is_connection_error(error: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_pattern;
+    use super::{loss_message, parse_pattern, tail_lines, QEMU_ENDED};
+
+    #[test]
+    fn loss_messages() {
+        let serial = tail_lines("a\n\nb\r\n*** STOP: 0x000000E2\n", 2);
+        assert_eq!(serial, vec!["b".to_string(), "*** STOP: 0x000000E2".to_string()]);
+        let message = loss_message(QEMU_ENDED, true, Some("exit code: 0"), None, &serial, &["KD_QEMU_EXITED exit code: 0".to_string()]);
+        let first = message.lines().next().unwrap();
+        assert_eq!(first, "O QEMU terminou e a sessão acabou.");
+        assert!(message.contains("saiu normalmente"));
+        assert!(message.contains("bugcheck (*** STOP)"));
+        assert!(message.contains("Últimas linhas do xtask:"));
+        assert!(message.contains("Reiniciar (Ctrl+Shift+F5)"));
+        let message = loss_message("o alvo fechou a conexao", false, None, None, &[], &[]);
+        assert!(message.starts_with("A conexão com o alvo caiu: o alvo fechou a conexao"));
+        assert!(message.contains("QEMU de fora"));
+        assert!(message.contains("Conectar de novo"));
+        assert!(!message.contains("COM1"));
+        let message = loss_message("o alvo fechou a conexao", true, None, Some("exit code: 101"), &[], &[]);
+        assert!(message.contains("O xtask saiu com exit code: 101"));
+        assert!(loss_message(QEMU_ENDED, true, Some("exit code: 1"), None, &[], &[]).contains("O QEMU saiu com exit code: 1."));
+    }
 
     #[test]
     fn search_patterns() {
