@@ -181,6 +181,11 @@ impl Port {
         mirror.completion_port.set(state.completion.as_ref().map_or(0, |completion| completion.port_pointer()));
         result
     }
+    /// Lê o estado sem regravar os contadores espelhados no corpo (o
+    /// depurador do kernel, com a máquina parada).
+    pub fn inspect<R>(&self, body: impl FnOnce(&PortState) -> R) -> R {
+        body(&self.state.lock())
+    }
     pub fn closed(&self) -> bool {
         self.body().closed.get() != 0
     }

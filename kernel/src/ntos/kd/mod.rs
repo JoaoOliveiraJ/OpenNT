@@ -33,6 +33,7 @@ pub mod inspect;
 pub mod irp_trace;
 pub mod memory;
 pub mod monitor;
+pub mod objects;
 pub mod packet;
 pub mod page_breakpoints;
 pub mod power;

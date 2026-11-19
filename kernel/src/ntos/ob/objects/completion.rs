@@ -130,6 +130,12 @@ impl Port {
         }
         result
     }
+
+    /// Lê as coleções sem publicar nada na KQUEUE nem testar esperas (o
+    /// depurador do kernel, com a máquina parada).
+    pub fn inspect<R>(&self, body: impl FnOnce(&PortState) -> R) -> R {
+        body(&self.state.lock())
+    }
 }
 
 static PORTS: SpinLock<BTreeMap<u64, Arc<Port>>> = SpinLock::new(BTreeMap::new());

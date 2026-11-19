@@ -56,6 +56,7 @@ const HELP: &str = "comandos do OpenNT:
   reg keys|values <caminho> [i] | reg value <caminho> <nome> [desl]   o Registro vivo
   objdir <caminho> [i]   diretorio do namespace do Object Manager
   fs ls <caminho> [i] | fs read <caminho> <desl> [bytes]   arquivos do volume do kernel
+  obtypes | token <end> | iocp <end> | waitpkt <end> | alpc <end>   tipos de objeto, token, IOCP, pacote de espera, porta ALPC
 ";
 
 fn read_u64(cr3: u64, address: u64) -> u64 {
@@ -382,6 +383,7 @@ pub fn run(owner: usize, line: &str, out: &mut Payload) {
         "reg" => explore::registry(rest, out),
         "objdir" => explore::object_directory(rest, out),
         "fs" => explore::files(rest, out),
+        "obtypes" | "token" | "iocp" | "waitpkt" | "alpc" => super::objects::run(owner, command, argument, out),
         _ => out.push_str(HELP),
     }
 }
