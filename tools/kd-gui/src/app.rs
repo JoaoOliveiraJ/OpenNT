@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::backend::{Backend, Entry, QueryKind, Request, Snapshot, Status, Target, TraceView, View};
 use crate::disasm::{self, ValueHint};
 use crate::launcher::{self, LaunchOptions};
+use crate::session::{self, SessionFile};
 
 /// Os painéis.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -250,6 +251,18 @@ struct OpenForm {
     error: Option<String>,
 }
 
+/// O formulário da janela Sessões (salvar e abrir uma sessão com nome).
+#[derive(Clone, Debug, Default)]
+struct SessionForm {
+    /// O nome (vira `<build>/opennt-dbg/sessoes/<nome>.json`) ou um caminho.
+    name: String,
+    /// Ao abrir, também abre o OpenNT (ou conecta ao endereço da sessão).
+    open_target: bool,
+    /// As sessões da pasta, lidas quando a janela abre.
+    saved: Vec<(String, PathBuf)>,
+    error: Option<String>,
+}
+
 /// Põe `item` no começo de uma lista de recentes, sem repetir e com no
 /// máximo `limit` itens.
 fn remember_recent(list: &mut Vec<String>, item: &str, limit: usize) {
@@ -301,6 +314,8 @@ pub struct UiState {
     target: Option<Target>,
     /// O botão Cancelar (vai direto ao backend, fora da fila de pedidos).
     cancel: bool,
+    /// A janela Sessões (aberta quando `Some`).
+    session_dialog: Option<SessionForm>,
     /// A geração do snapshot que já rolou o código até o foco.
     scrolled_code: u64,
     scrolled_source: u64,
@@ -449,6 +464,7 @@ impl DebuggerApp {
                 recent_connect: Vec::new(),
                 target: None,
                 cancel: false,
+                session_dialog: None,
                 scrolled_code: 0,
                 scrolled_source: 0,
                 requests: Vec::new(),
@@ -509,6 +525,12 @@ impl DebuggerApp {
         }
         self.persist = Some(path);
         self
+    }
+
+    /// Aplica uma sessão salva (o `--session=ARQ`): expressões, memória,
+    /// opções de abertura e os breakpoints (no backend).
+    pub fn apply_session(&mut self, session: &SessionFile) {
+        self.state.apply_session(session);
     }
 
     /// Expressões na janela de observação (a captura de tela e os testes),
@@ -639,6 +661,7 @@ impl DebuggerApp {
         // As leituras caras que os painéis abertos querem.
         views::sync_wanted(&mut self.state, &open);
         open_dialog(ui, &mut self.state);
+        session_dialog(ui, &mut self.state);
         if std::mem::take(&mut self.state.cancel) {
             self.backend.cancel();
         }
@@ -770,6 +793,60 @@ impl UiState {
         self.requests.push(Request::Start(Target::Connect(address)));
     }
 
+    /// O diretório de build da sessão (o da última abertura).
+    fn build_path(&self) -> PathBuf {
+        match &self.launch {
+            Some(launch) => launch.build_path(),
+            None => crate::workspace_root().join("build"),
+        }
+    }
+
+    /// A raiz do repositório (a da linha de comando).
+    fn root(&self) -> PathBuf {
+        self.launch.as_ref().map_or_else(crate::workspace_root, |launch| launch.root.clone())
+    }
+
+    /// Abre a janela Sessões com a lista da pasta.
+    fn open_sessions(&mut self) {
+        let saved = session::list(&session::directory(&self.build_path()));
+        let name = self.session_dialog.as_ref().map(|form| form.name.clone()).unwrap_or_default();
+        let disconnected = !matches!(self.status, Status::Stopped | Status::Running | Status::Launching(_) | Status::Connecting(_));
+        self.session_dialog = Some(SessionForm { name, open_target: disconnected, saved, error: None });
+    }
+
+    /// A sessão de agora (os breakpoints o backend põe ao gravar).
+    fn current_session(&self) -> SessionFile {
+        let (xtask, build_dir, headless) = match &self.launch {
+            Some(launch) => (launch.extra.clone(), launch.build_dir.display().to_string(), launch.headless),
+            None => (Vec::new(), String::new(), false),
+        };
+        let connect = match &self.target {
+            Some(Target::Connect(address)) => address.clone(),
+            _ => String::new(),
+        };
+        SessionFile { version: session::VERSION, breakpoints: String::new(), watches: self.watches.clone(), memory: self.memory_address.trim().to_string(), xtask, build_dir, headless, connect }
+    }
+
+    /// Aplica uma sessão: as expressões e a memória na hora, as opções de
+    /// abertura para o próximo Abrir, e os breakpoints pelo backend (na
+    /// hora com a máquina parada, senão na próxima parada ou no attach).
+    fn apply_session(&mut self, session: &SessionFile) {
+        self.watches = session.watches.clone();
+        if !session.memory.is_empty() {
+            self.memory_address = session.memory.clone();
+            self.requests.push(Request::ShowMemory(session.memory.clone()));
+        }
+        if !session.xtask.is_empty() || !session.build_dir.is_empty() {
+            let root = self.root();
+            let build_dir = if session.build_dir.is_empty() { PathBuf::from("build") } else { PathBuf::from(&session.build_dir) };
+            self.launch = Some(LaunchOptions { root, build_dir, headless: session.headless, extra: session.xtask.clone() });
+        }
+        if !session.connect.is_empty() {
+            self.connect_address = session.connect.clone();
+        }
+        self.requests.push(Request::LoadBreakpoints(session.breakpoints.clone()));
+    }
+
     /// O botão Conectar da barra: o endereço do campo (`HOST:PORTA`, a
     /// porta ou a linha `KD_READY`); um endereço inválido abre a janela
     /// com o erro.
@@ -897,6 +974,89 @@ fn open_dialog(ui: &mut Ui, state: &mut UiState) {
     }
 }
 
+/// A janela Sessões: grava a sessão de agora com um nome ou abre uma das
+/// salvas na pasta do diretório de build (ou por caminho).
+fn session_dialog(ui: &mut Ui, state: &mut UiState) {
+    let Some(mut form) = state.session_dialog.take() else { return };
+    let colors = palette(ui);
+    let folder = session::directory(&state.build_path());
+    let mut open = true;
+    let mut close = false;
+    egui::Window::new("Sessões").id(egui::Id::new("kd-session-dialog")).collapsible(false).resizable(false).default_width(560.0).anchor(Align2::CENTER_TOP, Vec2::new(0.0, 90.0)).open(&mut open).show(ui.ctx(), |ui| {
+        hint(ui, &format!("Uma sessão guarda os breakpoints, as expressões observadas, a memória e como abrir o alvo. Pasta: {}", folder.display()));
+        let mut save = false;
+        let mut load: Option<PathBuf> = None;
+        ui.horizontal(|ui| {
+            ui.label("Nome:");
+            let response = ui.add(egui::TextEdit::singleline(&mut form.name).font(TextStyle::Monospace).desired_width(300.0).hint_text("logon, csrss... ou um caminho .json"));
+            if response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter)) {
+                save = true;
+            }
+            if ui.button("Salvar").on_hover_text("grava a sessão de agora com este nome").clicked() {
+                save = true;
+            }
+            if ui.button("Abrir").on_hover_text("abre a sessão com este nome ou caminho").clicked() {
+                match session::path_for(&state.root(), &folder, &form.name) {
+                    Ok(path) => load = Some(path),
+                    Err(error) => form.error = Some(error),
+                }
+            }
+        });
+        ui.checkbox(&mut form.open_target, "ao abrir, abrir também o OpenNT com as opções da sessão (ou conectar ao endereço dela)");
+        ui.separator();
+        if form.saved.is_empty() {
+            hint(ui, "nenhuma sessão salva nesta pasta");
+        }
+        egui::ScrollArea::vertical().id_salt("session-list").max_height(220.0).show(ui, |ui| {
+            for (name, path) in &form.saved {
+                ui.horizontal(|ui| {
+                    if ui.button("abrir").clicked() {
+                        load = Some(path.clone());
+                    }
+                    if ui.selectable_label(form.name == *name, mono(name)).on_hover_text(path.display().to_string()).clicked() {
+                        form.name = name.clone();
+                    }
+                });
+            }
+        });
+        if save {
+            match session::path_for(&state.root(), &folder, &form.name) {
+                Ok(path) => {
+                    let session = state.current_session();
+                    state.requests.push(Request::SaveSession { path, session });
+                    close = true;
+                }
+                Err(error) => form.error = Some(error),
+            }
+        }
+        if let Some(path) = load {
+            match SessionFile::load(&path) {
+                Ok(loaded) => {
+                    state.apply_session(&loaded);
+                    if form.open_target {
+                        if !loaded.connect.is_empty() {
+                            state.connect_to(loaded.connect.clone());
+                        } else if let Some(options) = state.launch.clone() {
+                            state.launch_with(options);
+                        }
+                    }
+                    close = true;
+                }
+                Err(error) => form.error = Some(error),
+            }
+        }
+        if let Some(error) = &form.error {
+            ui.label(RichText::new(error).color(colors.red));
+        }
+        if ui.input(|input| input.key_pressed(Key::Escape)) {
+            close = true;
+        }
+    });
+    if open && !close {
+        state.session_dialog = Some(form);
+    }
+}
+
 fn menu_bar(ui: &mut Ui, state: &mut UiState, open: &[Tab]) {
     let stopped = state.status == Status::Stopped;
     let running = state.status == Status::Running;
@@ -919,6 +1079,10 @@ fn menu_bar(ui: &mut Ui, state: &mut UiState, open: &[Tab]) {
             }
             if ui.button("Desconectar").clicked() {
                 state.requests.push(Request::Disconnect);
+            }
+            ui.separator();
+            if ui.button("Salvar ou abrir sessão...").on_hover_text("breakpoints, expressoes observadas, memoria e as opcoes de abertura num arquivo com nome").clicked() {
+                state.open_sessions();
             }
             ui.separator();
             if ui.add_enabled(stopped, egui::Button::new("Recarregar símbolos")).clicked() {

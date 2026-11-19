@@ -39,6 +39,7 @@ use kd_client::{registers, Breakpoint, BreakpointKind, Client};
 use crate::details::{self, KthreadLayout, PdbStatus, ThreadDetail};
 use crate::disasm::{self, Line};
 use crate::launcher::{Launch, LaunchOptions, CANCELLED};
+use crate::session::{self, SessionFile};
 use crate::source::{Local, LineTable};
 
 /// Onde está o alvo.
@@ -157,6 +158,12 @@ pub enum Request {
     LoadReference(PathBuf),
     TraceAsReference,
     ReloadSymbols,
+    /// Troca os breakpoints pelos de uma sessão (o texto do `.bpsave`):
+    /// na hora com a máquina parada, senão na próxima parada ou no
+    /// próximo attach.
+    LoadBreakpoints(String),
+    /// Grava uma sessão com nome; o backend põe os breakpoints de agora.
+    SaveSession { path: PathBuf, session: SessionFile },
     /// Teclas pelo monitor HMP do QEMU (`sendkey`, como
     /// `ctrl_r-scroll_lock-scroll_lock`, o despejo manual do teclado).
     SendKeys(String),
@@ -540,6 +547,9 @@ struct Worker {
     /// O processo das leituras que a pilha de usuário escolheu sozinha (um
     /// `.process` diferente foi escolhido à mão e fica).
     auto_process: Option<u64>,
+    /// Os breakpoints de uma sessão aberta que ainda esperam a máquina
+    /// parar (ou o attach).
+    pending_breakpoints: Option<String>,
 }
 
 /// Quantas threads ganham os detalhes do KTHREAD por parada (sem filtro de
@@ -578,6 +588,7 @@ impl Worker {
             kthread: None,
             thread_cache: None,
             auto_process: None,
+            pending_breakpoints: None,
         }
     }
 
@@ -734,16 +745,23 @@ impl Worker {
                     let note = if path.exists() { format!("log da COM1 lido de {} (--serial-log=ARQ troca o arquivo)", path.display()) } else { format!("sem o log da COM1: {} nao existe (--serial-log=ARQ indica o arquivo)", path.display()) };
                     self.transcript("(sessao)", Ok(note));
                 }
-                // Os breakpoints da sessão anterior (os de módulos que ainda
-                // não carregaram ficam adiados).
-                if let Some(path) = &self.config.session {
-                    if let Ok(text) = std::fs::read_to_string(path) {
-                        let errors = client.restore_breakpoints(&text);
-                        let restored = format!("{} breakpoints da sessao anterior ({})", client.breakpoints().len(), path.display());
-                        self.transcript("(sessao)", if errors.is_empty() { Ok(restored) } else { Err(format!("{restored}\n{}", errors.join("\n"))) });
-                    }
+                // Os breakpoints de uma sessão aberta antes do attach; senão,
+                // os da sessão anterior deste diretório de build (os de
+                // módulos que ainda não carregaram ficam adiados).
+                let opened = self.pending_breakpoints.take();
+                let restore = match &opened {
+                    Some(text) => Some((text.clone(), "da sessao aberta".to_string())),
+                    None => self.config.session.as_ref().and_then(|path| std::fs::read_to_string(path).ok().map(|text| (text, format!("da sessao anterior ({})", path.display())))),
+                };
+                if let Some((text, origin)) = restore {
+                    let errors = client.restore_breakpoints(&text);
+                    let restored = format!("{} breakpoints {origin}", client.breakpoints().len());
+                    self.transcript("(sessao)", if errors.is_empty() { Ok(restored) } else { Err(format!("{restored}\n{}", errors.join("\n"))) });
                 }
                 self.client = Some(client);
+                if opened.is_some() {
+                    self.save_session();
+                }
                 self.lines = None;
                 self.refresh();
             }
@@ -818,6 +836,15 @@ impl Worker {
                 self.view = View::Owner;
                 self.selected_frame = 0;
                 self.focus = Focus::Frame;
+                // Os breakpoints de uma sessão aberta com a máquina rodando.
+                if let Some(text) = self.pending_breakpoints.take() {
+                    if let Err(error) = self.apply_breakpoints(&text) {
+                        if is_connection_error(&error) {
+                            return self.lost(error);
+                        }
+                        self.transcript("(sessao)", Err(error));
+                    }
+                }
                 self.refresh();
             }
             Ok(None) => {}
@@ -841,6 +868,34 @@ impl Worker {
             let _ = std::fs::create_dir_all(parent);
         }
         let _ = std::fs::write(path, client.breakpoint_specs());
+    }
+
+    /// Troca os breakpoints de agora pelos de uma sessão (com a máquina
+    /// parada; os de módulos que ainda não carregaram ficam adiados).
+    fn apply_breakpoints(&mut self, text: &str) -> Result<(), String> {
+        let client = self.client.as_mut().ok_or("sem conexao com o alvo")?;
+        let ids: Vec<u32> = client.breakpoints().iter().map(|breakpoint| breakpoint.id).collect();
+        for id in ids {
+            client.remove_breakpoint(id)?;
+        }
+        let errors = client.restore_breakpoints(text);
+        let restored = format!("{} breakpoints da sessao aberta", client.breakpoints().len());
+        self.transcript("(sessao)", if errors.is_empty() { Ok(restored) } else { Err(format!("{restored}\n{}", errors.join("\n"))) });
+        self.save_session();
+        Ok(())
+    }
+
+    /// Grava uma sessão com nome: os breakpoints são os do cliente (ou os
+    /// que esperam o attach, ou os do `breakpoints.txt` sem conexão).
+    fn save_named_session(&mut self, path: &std::path::Path, mut session: SessionFile) {
+        session.version = session::VERSION;
+        session.breakpoints = match (&self.pending_breakpoints, &self.client) {
+            (Some(text), _) => text.clone(),
+            (None, Some(client)) => client.breakpoint_specs(),
+            (None, None) => self.config.session.as_ref().and_then(|file| std::fs::read_to_string(file).ok()).unwrap_or_default(),
+        };
+        let result = session.save(path).map(|_| format!("sessao salva em {} ({} breakpoints, {} expressoes observadas)", path.display(), session.breakpoint_count(), session.watches.len()));
+        self.transcript("(sessao)", result);
     }
 
     fn handle(&mut self, request: Request) {
@@ -884,6 +939,26 @@ impl Worker {
                 self.serial_offset = 0;
                 self.publish(|shared| shared.serial.clear());
                 self.tail_serial();
+                return;
+            }
+            Request::LoadBreakpoints(text) => {
+                if self.client.as_ref().is_some_and(Client::is_stopped) {
+                    if let Err(error) = self.apply_breakpoints(&text) {
+                        if is_connection_error(&error) {
+                            return self.lost(error);
+                        }
+                        self.transcript("(sessao)", Err(error));
+                    }
+                    self.refresh();
+                } else {
+                    let note = if self.client.is_some() { "os breakpoints da sessao entram na proxima parada (Ctrl+B para agora)" } else { "os breakpoints da sessao entram no proximo attach" };
+                    self.pending_breakpoints = Some(text);
+                    self.transcript("(sessao)", Ok(note.to_string()));
+                }
+                return;
+            }
+            Request::SaveSession { path, session } => {
+                self.save_named_session(&path, session);
                 return;
             }
             _ => {}
@@ -1007,7 +1082,7 @@ impl Worker {
                 Ok(true)
             }
             Request::Refresh => Ok(true),
-            Request::Start(_) | Request::Restart | Request::Disconnect | Request::Shutdown | Request::SetWatches(_) | Request::SetExpanded(_) | Request::SetWanted(_) | Request::SetSerialLog(_) => Ok(false),
+            Request::Start(_) | Request::Restart | Request::Disconnect | Request::Shutdown | Request::SetWatches(_) | Request::SetExpanded(_) | Request::SetWanted(_) | Request::SetSerialLog(_) | Request::LoadBreakpoints(_) | Request::SaveSession { .. } => Ok(false),
         };
         if breakpoints_changed && result.is_ok() {
             self.save_session();

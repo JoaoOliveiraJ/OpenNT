@@ -18,6 +18,7 @@ use kd_client::commands::TraceOptions;
 use kd_gui::app::{DebuggerApp, Tab};
 use kd_gui::backend::{Backend, Config, Request, Status, Target};
 use kd_gui::launcher::{self, LaunchOptions};
+use kd_gui::session::SessionFile;
 use kd_gui::{offscreen, scenario};
 
 const USAGE: &str = "uso: opennt-dbg [opcoes] [opcoes do xtask]
@@ -28,6 +29,9 @@ const USAGE: &str = "uso: opennt-dbg [opcoes] [opcoes do xtask]
   --serial-log=ARQ       o log da COM1 a acompanhar (padrao DIR/serial.log; o --launch usa o do build)
   --headless-qemu        com --launch: o QEMU sem janela
   --root=DIR             raiz do repositorio (padrao: a deste checkout)
+  --session=ARQ          sessao salva (menu Sessao): breakpoints, expressoes, memoria e as opcoes
+                         de abertura; com --launch, abre com as opcoes do xtask dela (as da linha
+                         de comando, quando houver, valem no lugar)
   --screenshot=ARQ.png   sem janela: espera a parada, desenha a janela fora da tela e sai
   --scenario=NOME        com --screenshot: breakpoint (padrao), driver, trace ou bugcheck
   --break-at=EXPR        com --screenshot: breakpoint e continuar antes da captura
@@ -38,7 +42,12 @@ struct Options {
     launch: bool,
     connect: Option<String>,
     build_dir: PathBuf,
+    /// O `--build-dir` veio da linha de comando (senão vale o da sessão).
+    build_dir_given: bool,
     serial_log: Option<PathBuf>,
+    session: Option<PathBuf>,
+    /// O endereço de um QEMU de fora salvo na sessão (vai ao campo Conectar).
+    session_connect: Option<String>,
     headless: bool,
     root: PathBuf,
     screenshot: Option<PathBuf>,
@@ -49,7 +58,7 @@ struct Options {
 }
 
 fn parse(arguments: impl Iterator<Item = String>) -> Result<Options, String> {
-    let mut options = Options { launch: false, connect: None, build_dir: PathBuf::from("build"), serial_log: None, headless: false, root: kd_gui::workspace_root(), screenshot: None, scenario: "breakpoint".into(), break_at: None, size: [1600, 1000], extra: Vec::new() };
+    let mut options = Options { launch: false, connect: None, build_dir: PathBuf::from("build"), build_dir_given: false, serial_log: None, session: None, session_connect: None, headless: false, root: kd_gui::workspace_root(), screenshot: None, scenario: "breakpoint".into(), break_at: None, size: [1600, 1000], extra: Vec::new() };
     for argument in arguments {
         let (name, value) = match argument.split_once('=') {
             Some((name, value)) => (name.to_string(), Some(value.to_string())),
@@ -59,8 +68,12 @@ fn parse(arguments: impl Iterator<Item = String>) -> Result<Options, String> {
         match name.as_str() {
             "--launch" => options.launch = true,
             "--connect" => options.connect = Some(launcher::parse_connect_address(&required()?)?),
-            "--build-dir" => options.build_dir = PathBuf::from(required()?),
+            "--build-dir" => {
+                options.build_dir = PathBuf::from(required()?);
+                options.build_dir_given = true;
+            }
             "--serial-log" => options.serial_log = Some(PathBuf::from(required()?)),
+            "--session" => options.session = Some(PathBuf::from(required()?)),
             "--headless-qemu" => options.headless = true,
             "--root" => options.root = PathBuf::from(required()?),
             "--screenshot" => options.screenshot = Some(PathBuf::from(required()?)),
@@ -89,13 +102,40 @@ fn parse(arguments: impl Iterator<Item = String>) -> Result<Options, String> {
 }
 
 fn main() -> ExitCode {
-    let options = match parse(std::env::args().skip(1)) {
+    let mut options = match parse(std::env::args().skip(1)) {
         Ok(options) => options,
         Err(message) => {
             eprintln!("{message}");
             return ExitCode::FAILURE;
         }
     };
+    // A sessão salva só na janela (a captura começa limpa).
+    let saved_session = match options.session.as_ref().filter(|_| options.screenshot.is_none()) {
+        Some(path) => {
+            let path = if path.is_absolute() { path.clone() } else { options.root.join(path) };
+            match SessionFile::load(&path) {
+                Ok(session) => Some(session),
+                Err(message) => {
+                    eprintln!("{message}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        None => None,
+    };
+    if let Some(session) = &saved_session {
+        if options.extra.is_empty() {
+            options.extra = session.xtask.clone();
+        }
+        if !options.build_dir_given && !session.build_dir.is_empty() {
+            options.build_dir = PathBuf::from(&session.build_dir);
+        }
+        options.headless |= session.headless;
+        if options.connect.is_none() && !session.connect.is_empty() && !options.launch {
+            // O endereço da sessão fica no campo Conectar (sem conectar sozinho).
+            options.session_connect = Some(session.connect.clone());
+        }
+    }
     let launch = LaunchOptions { root: options.root.clone(), build_dir: options.build_dir.clone(), headless: options.headless || options.screenshot.is_some(), extra: options.extra.clone() };
     // A sessão (os breakpoints) só na janela: a captura começa limpa.
     let session = options.screenshot.is_none().then(|| launch.build_path().join("opennt-dbg").join("breakpoints.txt"));
@@ -111,7 +151,7 @@ fn main() -> ExitCode {
     };
     let result = match &options.screenshot {
         Some(path) => screenshot(config, target, &options, path),
-        None => window(config, target, launch, &options),
+        None => window(config, target, launch, &options, saved_session),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -122,8 +162,8 @@ fn main() -> ExitCode {
     }
 }
 
-fn window(config: Config, target: Option<Target>, launch: LaunchOptions, options: &Options) -> Result<(), String> {
-    let connect = options.connect.clone().unwrap_or_else(|| "127.0.0.1:1234".to_string());
+fn window(config: Config, target: Option<Target>, launch: LaunchOptions, options: &Options, session: Option<SessionFile>) -> Result<(), String> {
+    let connect = options.connect.clone().or_else(|| options.session_connect.clone()).unwrap_or_else(|| "127.0.0.1:1234".to_string());
     let native = eframe::NativeOptions { viewport: egui::ViewportBuilder::default().with_title("opennt-dbg - depurador do kernel do OpenNT").with_inner_size([1600.0, 1000.0]), ..Default::default() };
     eframe::run_native(
         "opennt-dbg",
@@ -135,6 +175,11 @@ fn window(config: Config, target: Option<Target>, launch: LaunchOptions, options
             let mut app = DebuggerApp::new(backend, Some(launch), connect);
             if let Some(path) = kd_gui::app::state_path() {
                 app = app.with_persistence(path);
+            }
+            // Depois do estado salvo: as expressões da sessão valem no lugar
+            // das da última execução.
+            if let Some(session) = &session {
+                app.apply_session(session);
             }
             Ok(Box::new(app))
         }),
