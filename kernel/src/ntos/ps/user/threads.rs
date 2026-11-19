@@ -562,6 +562,13 @@ fn refresh_ready_user_threads() {
         } else if candidate.waiting() {
             continue;
         }
+        // O despacho de usuário só roda fora de qualquer intervalo: uma thread
+        // de usuário Running que não está numa CPU é um estado restaurado por
+        // engano, e o `make_ready` a pularia para sempre.
+        if thread_dispatch::thread_state(pointer) == thread_dispatch::state::RUNNING && !thread_dispatch::on_processor(pointer) {
+            crate::debug_print!("[thread] tid={} pronta com KTHREAD.State Running fora da CPU; volta a Waiting para entrar na fila", candidate.thread_id);
+            let _ = thread_dispatch::suspend(pointer, thread_dispatch::state::WAITING);
+        }
         let _ = thread_dispatch::make_ready(pointer);
     }
 }

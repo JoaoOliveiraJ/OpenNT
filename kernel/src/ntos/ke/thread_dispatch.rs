@@ -828,6 +828,15 @@ pub fn active_thread() -> Option<u64> {
     STATE.lock().cpus[cpu].active.as_ref().map(|active| active.pointer)
 }
 
+/// A thread está numa CPU: é a execução ativa de alguma CPU ou uma execução
+/// suspensa sob outra na mesma CPU (um pump aninhado no intervalo dela). Uma
+/// thread de usuário que deixou a CPU numa espera
+/// (`context_switch::block_current`, o `end_execution` já a tirou) não está
+/// em nenhuma. Toma só o STATE: não chamar com o QUEUES tomado.
+pub fn on_processor(thread: u64) -> bool {
+    STATE.lock().cpus.iter().any(|execution| execution.active.as_ref().is_some_and(|active| active.pointer == thread) || execution.stack.iter().flatten().any(|suspended| suspended.pointer == thread))
+}
+
 // ---- ciclos de thread e cessão do processador -----------------------------
 //
 // (append de `ke-processors` ao ke/thread_dispatch.rs. Usa o que o arquivo

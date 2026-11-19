@@ -84,6 +84,12 @@ static PROBE_SEEN: AtomicU32 = AtomicU32::new(0);
 /// O Win32Thread que o teste publicou na thread GUI.
 static WIN32_THREAD: AtomicU64 = AtomicU64::new(0);
 static PROBE_REGISTERED: AtomicBool = AtomicBool::new(false);
+/// O cenário do dreno do IOCPDispatcher::Close no término da thread GUI.
+static DRAIN: AtomicBool = AtomicBool::new(false);
+static DRAINED: AtomicU32 = AtomicU32::new(0);
+static DRAIN_STATUS: AtomicU32 = AtomicU32::new(UNSET);
+static DRAIN_DONE: AtomicBool = AtomicBool::new(false);
+static STRANDED: AtomicBool = AtomicBool::new(false);
 /// Bits de `PROBE_SEEN`: a rotina rodou para a thread observada, ela era a
 /// corrente, o RSP estava na pilha de kernel dela, num intervalo de serviço,
 /// e o Win32Thread ainda era o publicado.
@@ -171,7 +177,86 @@ extern "win64" fn terminate_service(_: u64, _: u64, _: u64, _: u64) -> u64 {
     // SAFETY: a ETHREAD da thread 1, retida pela thread de usuário dela.
     let flagged = unsafe { Ethread::at(waiter) }.terminated() != 0 && kthread(waiter).termination_apc_request() != 0;
     REQUESTED_ALIVE.store(alive && flagged, Ordering::SeqCst);
+    if DRAIN.load(Ordering::SeqCst) {
+        watch_drain(waiter);
+    }
     status as u64
+}
+
+/// A parceira do cenário do dreno: sai da CPU a cada 1 ms (o despachante
+/// roda o término da thread 1) até o dreno acabar, no máximo 3 s. Se a
+/// thread 1 aparece com a espera concluída, KTHREAD Running e fora de
+/// qualquer CPU, o defeito está presente: o teste a resgata, para a suíte
+/// seguir e a asserção falhar em vez de travar.
+fn watch_drain(waiter: u64) {
+    use crate::ntos::ke::thread_dispatch;
+    let interval = guest::alloc_bytes(8);
+    let idle = guest::alloc_bytes(Kevent::SIZE);
+    if interval != 0 && idle != 0 {
+        guest::write64(interval, (-10_000i64) as u64);
+        dispatcher::initialize_event(idle, 0, false);
+        let started = crate::ntos::ke::clock::uptime_ms();
+        while !DRAIN_DONE.load(Ordering::SeqCst) && crate::ntos::ke::clock::uptime_ms() - started < 3_000 {
+            let _ = dispatcher::wait_for_single_object(idle, interval, 0, false);
+            let stuck = threads::find_by_pointer(waiter).is_some_and(|thread| matches!(thread.kernel_state(), KernelState::Blocked { status: Some(_) })) && kthread(waiter).state.get() == thread_dispatch::state::RUNNING && !thread_dispatch::on_processor(waiter);
+            if stuck {
+                STRANDED.store(true, Ordering::SeqCst);
+                let _ = thread_dispatch::suspend(waiter, thread_dispatch::state::WAITING);
+                let _ = thread_dispatch::make_ready(waiter);
+            }
+        }
+    }
+    for block in [interval, idle] {
+        if block != 0 {
+            guest::free_bytes(block);
+        }
+    }
+}
+
+/// O dreno do IOCPDispatcher::Close (win32kbase 0xa8fd2..0xa9023) no
+/// PspExitThread da thread GUI: porta de kernel com três pacotes e
+/// ZwRemoveIoCompletionEx (1 entrada, 20 ms relativos, não alertável) até
+/// não devolver STATUS_SUCCESS. A quarta chamada acha a fila vazia e tira a
+/// thread da CPU até o prazo.
+fn drain_like_iocp_close() {
+    use crate::ntos::alpc::completion_reference;
+    use crate::ntos::io::completion::{create as create_completion, set as set_completion};
+    let block = guest::alloc_bytes(0x100);
+    if block == 0 {
+        return;
+    }
+    let created = create_completion::create(block, 0x1F_0003, 0, 1, 0).unwrap_or(1);
+    let handle = guest::read64(block);
+    let mut posted = 0;
+    if created == 0 {
+        if let Some(mut reference) = completion_reference::reference(handle, 0).ok().and_then(|reference| reference.ok()) {
+            for key in 1..=3u64 {
+                if set_completion::post(reference.port.pointer, key, 0x100 + key, 0, key, 0, 0).unwrap_or(1) == 0 {
+                    posted += 1;
+                }
+            }
+            let _ = reference.release();
+        }
+    }
+    // LARGE_INTEGER -200000 (0xa8ff8): 20 ms relativos.
+    guest::write64(block + 0x10, (-200_000i64) as u64);
+    let (mut drained, mut status) = (0, UNSET);
+    if posted == 3 {
+        for _ in 0..8 {
+            status = crate::ntos::test::phase6::call_export("ZwRemoveIoCompletionEx", &[handle, block + 0x40, 1, block + 0x18, block + 0x10, 0]).map_or(UNSET, |status| status as u32);
+            if status != 0 {
+                break;
+            }
+            drained += 1;
+        }
+    }
+    DRAINED.store(drained, Ordering::SeqCst);
+    DRAIN_STATUS.store(status, Ordering::SeqCst);
+    DRAIN_DONE.store(true, Ordering::SeqCst);
+    if created == 0 {
+        let _ = crate::ntos::ob::open_pointer::close(handle);
+    }
+    guest::free_bytes(block);
 }
 
 /// A rotina de saída de thread do teste: para a thread observada, o contexto
@@ -197,6 +282,9 @@ fn exit_probe(thread: u64) {
         seen |= SEEN_WIN32_THREAD;
     }
     PROBE_SEEN.fetch_or(seen, Ordering::SeqCst);
+    if DRAIN.load(Ordering::SeqCst) {
+        drain_like_iocp_close();
+    }
 }
 
 /// `mov eax, serviço; mov r10, rcx; syscall`.
@@ -265,6 +353,7 @@ enum Scenario {
     Terminate,
     TerminateGui,
     TerminateGuiRing3,
+    TerminateGuiDrain,
 }
 
 /// O que um cenário observou.
@@ -279,6 +368,10 @@ struct Outcome {
     probe: u32,
     dead: bool,
     stacks_released: bool,
+    drained: u32,
+    drain_status: u32,
+    drain_done: bool,
+    stranded: bool,
 }
 
 /// Memória de usuário do processo corrente (`protect`: 0x40 RWX, 4 RW).
@@ -303,9 +396,10 @@ fn scenario(kind: Scenario) -> Option<Outcome> {
         Scenario::Terminate => "bloqueio-termino.exe",
         Scenario::TerminateGui => "bloqueio-termino-gui.exe",
         Scenario::TerminateGuiRing3 => "anel3-termino-gui.exe",
+        Scenario::TerminateGuiDrain => "iocp-termino-gui.exe",
     };
     let terminate = kind != Scenario::Signal;
-    let gui = matches!(kind, Scenario::TerminateGui | Scenario::TerminateGuiRing3);
+    let gui = matches!(kind, Scenario::TerminateGui | Scenario::TerminateGuiRing3 | Scenario::TerminateGuiDrain);
     with_test_process(name, None, |test| {
         let (code, stacks) = (allocate(0x1000, 0x40), allocate(0x8000, 4));
         let event = guest::alloc_bytes(Kevent::SIZE);
@@ -313,7 +407,7 @@ fn scenario(kind: Scenario) -> Option<Outcome> {
         let win32_thread = if gui { guest::alloc_bytes(0x100) } else { 0 };
         let waiter = user_thread(test.process, code);
         let partner = user_thread(test.process, code + 0x100);
-        let mut outcome = Outcome { ran: false, user_result: UNSET, wait_result: UNSET, own_stack: false, saw_blocked: false, terminate_status: UNSET, requested_alive: false, probe: 0, dead: false, stacks_released: false };
+        let mut outcome = Outcome { ran: false, user_result: UNSET, wait_result: UNSET, own_stack: false, saw_blocked: false, terminate_status: UNSET, requested_alive: false, probe: 0, dead: false, stacks_released: false, drained: 0, drain_status: UNSET, drain_done: false, stranded: false };
         let mut handle = 0;
         if let (Some(waiter), Some(partner), true) = (waiter.as_ref(), partner.as_ref(), event != 0 && code != 0 && stacks != 0 && (win32_thread != 0 || !gui)) {
             if kind == Scenario::TerminateGuiRing3 {
@@ -337,6 +431,11 @@ fn scenario(kind: Scenario) -> Option<Outcome> {
             SAW_WAITER_BLOCKED.store(false, Ordering::SeqCst);
             REQUESTED_ALIVE.store(false, Ordering::SeqCst);
             PROBE_SEEN.store(0, Ordering::SeqCst);
+            DRAINED.store(0, Ordering::SeqCst);
+            DRAIN_STATUS.store(UNSET, Ordering::SeqCst);
+            DRAIN_DONE.store(false, Ordering::SeqCst);
+            STRANDED.store(false, Ordering::SeqCst);
+            DRAIN.store(kind == Scenario::TerminateGuiDrain, Ordering::SeqCst);
             // A espera do xxxRealSleepThread é de UserMode, não alertável.
             WAIT_MODE.store(gui as u8, Ordering::SeqCst);
             if gui {
@@ -355,6 +454,11 @@ fn scenario(kind: Scenario) -> Option<Outcome> {
             }
             PROBED.store(0, Ordering::SeqCst);
             WAIT_MODE.store(0, Ordering::SeqCst);
+            DRAIN.store(false, Ordering::SeqCst);
+            outcome.drained = DRAINED.load(Ordering::SeqCst);
+            outcome.drain_status = DRAIN_STATUS.load(Ordering::SeqCst);
+            outcome.drain_done = DRAIN_DONE.load(Ordering::SeqCst);
+            outcome.stranded = STRANDED.load(Ordering::SeqCst);
             if gui && waiter.pointer() != 0 {
                 kthread(waiter.pointer()).win32_thread.set(0);
             }
@@ -465,6 +569,16 @@ pub fn run(assert: Assert) {
         assert(outcome.terminate_status == 0 && outcome.requested_alive, "bloqueio: o NtTerminateThread de uma thread GUI no anel 3 so pede o termino");
         assert(outcome.probe == SEEN_ALL, "bloqueio: a APC de termino da thread GUI que estava no anel 3 roda o PspExitThread na pilha de kernel dela, num intervalo de servico, com ela corrente e o Win32Thread publicado");
         assert(outcome.dead && outcome.stacks_released, "bloqueio: a thread GUI sai sem voltar ao anel 3, as pilhas voltam ao Mm e nenhuma fica no indice");
+    }
+
+    let drain = scenario(Scenario::TerminateGuiDrain);
+    let ok = drain.as_ref().is_some_and(|outcome| outcome.ran);
+    assert(ok, "dreno: thread GUI terminada numa espera de UserMode, com o dreno de uma porta de conclusao no PspExitThread");
+    if let Some(outcome) = drain.filter(|_| ok) {
+        crate::debug_print!("[bloqueio] dreno: pacotes={} status={:#x} fim={} presa={}", outcome.drained, outcome.drain_status, outcome.drain_done, outcome.stranded);
+        assert(outcome.drain_done && outcome.drained == 3 && outcome.drain_status == 0x102, "dreno: o ZwRemoveIoCompletionEx no PspExitThread da thread GUI entrega os 3 pacotes e depois STATUS_TIMEOUT (IoRemoveIoCompletion 19041 0x20472d; IOCPDispatcher::Close 0xa901e)");
+        assert(!outcome.stranded, "dreno: a thread GUI que deixou a CPU no ZwRemoveIoCompletionEx do proprio termino volta a fila quando o prazo vence (KTHREAD.State nao fica Running fora da CPU; KiReadyThread 0x247fb0)");
+        assert(outcome.probe == SEEN_ALL && outcome.dead && outcome.stacks_released && outcome.user_result == UNSET, "dreno: a thread GUI sai depois do dreno, as pilhas voltam ao Mm e nenhuma fica no indice");
     }
 
     let _ = service_table::restore_shadow_second_table(saved_shadow);

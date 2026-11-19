@@ -242,16 +242,22 @@ impl AlertWait {
                 target.wait_status.set(status as i64);
             }
         });
-        // O KTHREAD.State de uma thread de kernel do escalonador é do
-        // despachante. O fim da espera pode vir de outra thread (a reserva de
-        // pacotes da porta de conclusão roda no contexto de quem publica),
-        // com a thread parada fora da CPU: um Running restaurado aqui faria o
-        // KiReadyThread do KiUnwaitThread pular a thread, que nunca mais
-        // seria escolhida. Quem a tira da espera a apronta, e o despachante a
-        // põe Running ao retomá-la.
+        // O KTHREAD.State é do despachante: quem conclui uma espera nunca põe
+        // a thread Running (o KiUnwaitThread a apronta pelo KiReadyThread,
+        // 0x247fb0; só a troca de contexto a põe Running). A de kernel do
+        // escalonador é aprontada por quem a tira da espera. A de usuário de
+        // uma espera cooperativa volta ao estado de antes só se ainda está na
+        // CPU (girou no lugar, ou já foi retomada e conclui a própria
+        // espera); se deixou a CPU (`context_switch::block_current`), a
+        // conclusão vem do despachante (`threads::refresh_ready_user_threads`)
+        // ou de quem postou o pacote (a reserva da porta de conclusão), e ela
+        // fica Waiting para o `make_ready` que vem depois a pôr na fila. Um
+        // Running restaurado fora da CPU faria o `make_ready` pular a thread,
+        // que nunca mais seria escolhida (a thread de entrada do dwm no
+        // IOCPDispatcher::Close do próprio término, win32kbase 0xa9001).
         match thread_dispatch::owner(thread) {
             Some(owner) if kernel_scheduled(owner) => {}
-            Some(_) if self.cooperative => thread_dispatch::suspend(thread, self.previous_state)?,
+            Some(_) if self.cooperative && thread_dispatch::on_processor(thread) => thread_dispatch::suspend(thread, self.previous_state)?,
             Some(_) => {}
             None => target.state.set(self.previous_state),
         }
