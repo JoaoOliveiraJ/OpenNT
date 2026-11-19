@@ -23,6 +23,7 @@ const USAGE: &str = "uso: opennt-dbg [opcoes] [opcoes do xtask]
   --launch               compila com --kd=com2 e abre o QEMU (cargo xtask debug --launch --no-client)
   --connect=HOST:PORTA   conecta a um QEMU aberto (cargo xtask run --kd=com2: 127.0.0.1:1234)
   --build-dir=DIR        diretorio de build (padrao build): kernel.elf, serial.log
+  --serial-log=ARQ       o log da COM1 a acompanhar (padrao com --connect: DIR/serial.log)
   --headless-qemu        com --launch: o QEMU sem janela
   --root=DIR             raiz do repositorio (padrao: a deste checkout)
   --screenshot=ARQ.png   sem janela: espera a parada, desenha a janela fora da tela e sai
@@ -35,6 +36,7 @@ struct Options {
     launch: bool,
     connect: Option<String>,
     build_dir: PathBuf,
+    serial_log: Option<PathBuf>,
     headless: bool,
     root: PathBuf,
     screenshot: Option<PathBuf>,
@@ -45,7 +47,7 @@ struct Options {
 }
 
 fn parse(arguments: impl Iterator<Item = String>) -> Result<Options, String> {
-    let mut options = Options { launch: false, connect: None, build_dir: PathBuf::from("build"), headless: false, root: kd_gui::workspace_root(), screenshot: None, scenario: "breakpoint".into(), break_at: None, size: [1600, 1000], extra: Vec::new() };
+    let mut options = Options { launch: false, connect: None, build_dir: PathBuf::from("build"), serial_log: None, headless: false, root: kd_gui::workspace_root(), screenshot: None, scenario: "breakpoint".into(), break_at: None, size: [1600, 1000], extra: Vec::new() };
     for argument in arguments {
         let (name, value) = match argument.split_once('=') {
             Some((name, value)) => (name.to_string(), Some(value.to_string())),
@@ -56,6 +58,7 @@ fn parse(arguments: impl Iterator<Item = String>) -> Result<Options, String> {
             "--launch" => options.launch = true,
             "--connect" => options.connect = Some(required()?),
             "--build-dir" => options.build_dir = PathBuf::from(required()?),
+            "--serial-log" => options.serial_log = Some(PathBuf::from(required()?)),
             "--headless-qemu" => options.headless = true,
             "--root" => options.root = PathBuf::from(required()?),
             "--screenshot" => options.screenshot = Some(PathBuf::from(required()?)),
@@ -94,7 +97,10 @@ fn main() -> ExitCode {
     let launch = LaunchOptions { root: options.root.clone(), build_dir: options.build_dir.clone(), headless: options.headless || options.screenshot.is_some(), extra: options.extra.clone() };
     // A sessão (os breakpoints) só na janela: a captura começa limpa.
     let session = options.screenshot.is_none().then(|| launch.build_path().join("opennt-dbg").join("breakpoints.txt"));
-    let config = Config { root: options.root.clone(), elf: launch.build_path().join("kernel.elf"), serial_log: None, session };
+    // O log da COM1: o pedido, ou o do diretório de build ao conectar a um
+    // `cargo xtask run --kd=com2` (no `--launch` o backend usa o do build).
+    let serial_log = options.serial_log.clone().map(|path| if path.is_absolute() { path } else { options.root.join(path) }).or_else(|| options.connect.as_ref().map(|_| launch.build_path().join("serial.log")));
+    let config = Config { root: options.root.clone(), elf: launch.build_path().join("kernel.elf"), serial_log, session };
     let target = if options.launch {
         Some(Target::Launch(launch.clone()))
     } else {

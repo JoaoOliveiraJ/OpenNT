@@ -3,7 +3,11 @@
 //! Painéis reabre uma aba fechada) e a barra de estado. Os painéis só leem
 //! o `Snapshot` publicado pelo backend e mandam pedidos; nada aqui espera o
 //! alvo. O arranjo, o tema, as expressões observadas e o histórico de
-//! comandos ficam num arquivo de estado entre uma execução e outra.
+//! comandos ficam num arquivo de estado entre uma execução e outra. As
+//! vistas do estado da máquina (registradores, pilha, processos, threads,
+//! módulos, memória, breakpoints e o log da COM1) ficam em `views`.
+
+mod views;
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -12,9 +16,8 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align, Align2, Color32, FontId, Key, Modifiers, Pos2, RichText, Sense, Stroke, TextStyle, Ui, Vec2, WidgetText};
 use egui_dock::{DockArea, DockState, NodeIndex, NodePath, Style, TabViewer};
-use kd_client::client::BreakpointRequest;
 use kd_client::commands::TraceOptions;
-use kd_client::{registers, BreakpointKind, Client};
+use kd_client::{BreakpointKind, Client};
 use serde::{Deserialize, Serialize};
 
 use crate::backend::{Backend, Entry, QueryKind, Request, Snapshot, Status, Target, TraceView, View};
@@ -146,12 +149,14 @@ enum MemoryFormat {
     Words,
     Dwords,
     Qwords,
+    /// Um qword por linha com o símbolo (o `dps` do WinDbg).
+    Pointers,
     Ascii,
     Unicode,
 }
 
 impl MemoryFormat {
-    const ALL: [MemoryFormat; 6] = [MemoryFormat::Bytes, MemoryFormat::Words, MemoryFormat::Dwords, MemoryFormat::Qwords, MemoryFormat::Ascii, MemoryFormat::Unicode];
+    const ALL: [MemoryFormat; 7] = [MemoryFormat::Bytes, MemoryFormat::Words, MemoryFormat::Dwords, MemoryFormat::Qwords, MemoryFormat::Pointers, MemoryFormat::Ascii, MemoryFormat::Unicode];
 
     fn label(self) -> &'static str {
         match self {
@@ -159,6 +164,7 @@ impl MemoryFormat {
             MemoryFormat::Words => "words (2)",
             MemoryFormat::Dwords => "dwords (4)",
             MemoryFormat::Qwords => "qwords (8)",
+            MemoryFormat::Pointers => "ponteiros com símbolo",
             MemoryFormat::Ascii => "ASCII",
             MemoryFormat::Unicode => "UTF-16",
         }
@@ -168,7 +174,7 @@ impl MemoryFormat {
         match self {
             MemoryFormat::Words | MemoryFormat::Unicode => 2,
             MemoryFormat::Dwords => 4,
-            MemoryFormat::Qwords => 8,
+            MemoryFormat::Qwords | MemoryFormat::Pointers => 8,
             _ => 1,
         }
     }
@@ -288,6 +294,8 @@ pub struct UiState {
     bugcheck_seen: u64,
     reset_layout: bool,
     toggle_tab: Option<Tab>,
+    /// O estado das vistas (`views`).
+    views: views::ViewsState,
 }
 
 pub struct DebuggerApp {
@@ -427,6 +435,7 @@ impl DebuggerApp {
                 bugcheck_seen: 0,
                 reset_layout: false,
                 toggle_tab: None,
+                views: views::ViewsState::default(),
             },
             persist: None,
             last_saved: String::new(),
@@ -543,6 +552,8 @@ impl DebuggerApp {
                 state.focus_tab.push(Tab::Trace);
             }
         }
+        drop(shared);
+        views::after_sync(&mut self.state);
     }
 
     /// Um quadro inteiro da janela.
@@ -565,6 +576,8 @@ impl DebuggerApp {
             style.tab_bar.fill_tab_bar = true;
             DockArea::new(&mut self.dock).style(style).show_leaf_close_all_buttons(false).show_leaf_collapse_buttons(false).show_inside(ui, &mut Viewer { state: &mut self.state });
         });
+        // As leituras caras que os painéis abertos querem.
+        views::sync_wanted(&mut self.state, &open);
         // Observação: as expressões e as vistas abertas vão ao backend.
         if self.state.watches != self.state.sent_watches {
             self.state.sent_watches = self.state.watches.clone();
@@ -969,20 +982,20 @@ impl TabViewer for Viewer<'_> {
             Tab::Command => command_panel(ui, state),
             Tab::Disassembly => disassembly_panel(ui, state),
             Tab::Source => source_panel(ui, state),
-            Tab::Registers => registers_panel(ui, state),
+            Tab::Registers => views::registers_panel(ui, state),
             Tab::Watch => watch_panel(ui, state),
             Tab::Locals => locals_panel(ui, state),
-            Tab::Memory => memory_panel(ui, state),
-            Tab::CallStack => call_stack_panel(ui, state),
-            Tab::Modules => modules_panel(ui, state),
-            Tab::Processes => processes_panel(ui, state),
-            Tab::Threads => threads_panel(ui, state),
-            Tab::Breakpoints => breakpoints_panel(ui, state),
+            Tab::Memory => views::memory_panel(ui, state),
+            Tab::CallStack => views::call_stack_panel(ui, state),
+            Tab::Modules => views::modules_panel(ui, state),
+            Tab::Processes => views::processes_panel(ui, state),
+            Tab::Threads => views::threads_panel(ui, state),
+            Tab::Breakpoints => views::breakpoints_panel(ui, state),
             Tab::NtObjects => nt_objects_panel(ui, state),
             Tab::Trace => trace_panel(ui, state),
             Tab::Bugcheck => bugcheck_panel(ui, state),
             Tab::DbgPrint => log_panel(ui, &state.console, "dbgprint", "(nenhuma saída do DbgPrint ainda)"),
-            Tab::Serial => log_panel(ui, &state.serial, "serial", "(o log da COM1 aparece aqui quando o depurador abre o QEMU)"),
+            Tab::Serial => views::serial_panel(ui, state),
         }
     }
 
@@ -1231,6 +1244,8 @@ fn disassembly_panel(ui: &mut Ui, state: &mut UiState) {
                 if label.clicked() {
                     state.selected_code = Some(line.address);
                 }
+                // Botão direito: breakpoint, executar até aqui, memória.
+                views::code_line_menu(&label, state, line.address, line.target);
                 if let Some(target) = line.target {
                     if label.double_clicked() {
                         state.code_address = format!("{target:#x}");
@@ -1284,89 +1299,6 @@ fn source_panel(ui: &mut Ui, state: &mut UiState) {
             }
         }
     });
-}
-
-fn registers_panel(ui: &mut Ui, state: &mut UiState) {
-    let colors = palette(ui);
-    let snapshot = Arc::clone(&state.snapshot);
-    ui.horizontal(|ui| {
-        let selected = match snapshot.view {
-            View::Owner => snapshot.stop_processor.map(|number| number + 1),
-            View::Cpu(thread) => Some(thread),
-            View::Thread(_) => None,
-        };
-        let text = match (snapshot.view, selected) {
-            (View::Thread(ethread), _) => format!("ETHREAD {ethread:#x}"),
-            (_, Some(thread)) => format!("CPU {}", thread - 1),
-            _ => "CPU".to_string(),
-        };
-        egui::ComboBox::from_id_salt("cpu").selected_text(text).show_ui(ui, |ui| {
-            for &thread in &snapshot.stopped_threads {
-                let owner = snapshot.stop_processor == Some(thread - 1);
-                let label = format!("CPU {}{}", thread - 1, if owner { " (parada)" } else { "" });
-                if ui.selectable_label(selected == Some(thread), label).clicked() {
-                    state.requests.push(Request::SelectCpu(thread));
-                }
-            }
-        });
-        ui.label(RichText::new(&snapshot.view_header).color(colors.dim));
-    });
-    ui.separator();
-    if snapshot.registers.is_empty() {
-        hint(ui, "sem registradores (a máquina não parou ainda)");
-        return;
-    }
-    let editable = snapshot.registers_editable && state.status == Status::Stopped;
-    // Duas colunas de pares nome/valor quando cabem (rax..rdi ao lado de
-    // r8..r15, como no WinDbg).
-    let columns = if ui.available_width() > 480.0 { 2 } else { 1 };
-    let rows = snapshot.registers.len().div_ceil(columns);
-    egui::ScrollArea::vertical().id_salt("registers").auto_shrink([false, false]).show(ui, |ui| {
-        egui::Grid::new("register-grid").num_columns(2 * columns).striped(true).spacing([12.0, 2.0]).show(ui, |ui| {
-            for index in 0..rows {
-                for column in 0..columns {
-                    match snapshot.registers.get(index + column * rows) {
-                        Some(row) => register_cell(ui, state, row, editable, colors),
-                        None => {
-                            ui.label("");
-                            ui.label("");
-                        }
-                    }
-                }
-                ui.end_row();
-            }
-        });
-        hint(ui, "vermelho: mudou desde a parada anterior");
-    });
-}
-
-fn register_cell(ui: &mut Ui, state: &mut UiState, row: &crate::backend::RegisterRow, editable: bool, colors: Palette) {
-    ui.label(mono(&row.name).color(colors.blue));
-    let editing = state.register_edit.as_ref().is_some_and(|(name, _)| *name == row.name);
-    if editing {
-        let Some((_, text)) = state.register_edit.as_mut() else { return };
-        let response = ui.add(egui::TextEdit::singleline(text).font(TextStyle::Monospace).desired_width(150.0));
-        response.request_focus();
-        if response.lost_focus() {
-            if ui.input(|input| input.key_pressed(Key::Enter)) {
-                if let Some(value) = parse_hex(text) {
-                    state.requests.push(Request::WriteRegister(row.name.clone(), value));
-                }
-            }
-            state.register_edit = None;
-        }
-        return;
-    }
-    let text = match row.value {
-        Some(value) if row.name == "eflags" || row.name == "rflags" => format!("{value:08x} {}", registers::flags_text(value)),
-        Some(value) if matches!(row.name.as_str(), "cs" | "ss" | "ds" | "es" | "fs" | "gs") => format!("{value:04x}"),
-        Some(value) => hex(value),
-        None => "????????????????".into(),
-    };
-    let label = ui.add(egui::Label::new(mono(text).color(if row.changed { colors.red } else { ui.visuals().text_color() })).sense(Sense::click()));
-    if editable && label.on_hover_text("clique para editar (Enter grava)").clicked() {
-        state.register_edit = Some((row.name.clone(), row.value.map(hex).unwrap_or_default()));
-    }
 }
 
 /// Uma árvore de campos tipados (a observação e a vista de struct).
@@ -1477,394 +1409,6 @@ fn locals_panel(ui: &mut Ui, state: &mut UiState) {
             }
         });
         hint(ui, "azul: parâmetro");
-    });
-}
-
-fn memory_panel(ui: &mut Ui, state: &mut UiState) {
-    let colors = palette(ui);
-    let snapshot = Arc::clone(&state.snapshot);
-    ui.horizontal(|ui| {
-        ui.label("Endereço:");
-        let response = ui.add(egui::TextEdit::singleline(&mut state.memory_address).font(TextStyle::Monospace).desired_width(240.0).hint_text("%rsp, símbolo, 0x..."));
-        if ui.button("Ir").clicked() || (response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter))) {
-            state.requests.push(Request::ShowMemory(state.memory_address.clone()));
-        }
-        let address = snapshot.memory.address;
-        if !snapshot.memory.bytes.is_empty() {
-            if ui.button("-0x200").clicked() {
-                state.memory_address = format!("{:#x}", address.wrapping_sub(0x200));
-                state.requests.push(Request::ShowMemory(state.memory_address.clone()));
-            }
-            if ui.button("+0x200").clicked() {
-                state.memory_address = format!("{:#x}", address.wrapping_add(0x200));
-                state.requests.push(Request::ShowMemory(state.memory_address.clone()));
-            }
-        }
-        egui::ComboBox::from_id_salt("memory-format").selected_text(state.memory_format.label()).show_ui(ui, |ui| {
-            for format in MemoryFormat::ALL {
-                ui.selectable_value(&mut state.memory_format, format, format.label());
-            }
-        });
-    });
-    ui.horizontal(|ui| {
-        ui.label("Procurar:");
-        ui.add(egui::TextEdit::singleline(&mut state.search_pattern).font(TextStyle::Monospace).desired_width(200.0).hint_text("48 8b 05 | \"texto\" | u\"texto\""));
-        ui.label("bytes:");
-        ui.add(egui::TextEdit::singleline(&mut state.search_length).font(TextStyle::Monospace).desired_width(80.0));
-        if ui.add_enabled(state.status == Status::Stopped, egui::Button::new("Procurar")).on_hover_text("a partir do endereço acima").clicked() {
-            let length = parse_hex(&state.search_length).unwrap_or(0x10000);
-            state.requests.push(Request::SearchMemory { start: state.memory_address.clone(), length, pattern: state.search_pattern.clone() });
-        }
-    });
-    if let Some(search) = &snapshot.search {
-        ui.horizontal_wrapped(|ui| {
-            match &search.error {
-                Some(error) => {
-                    ui.label(RichText::new(error).color(colors.red));
-                }
-                None => {
-                    ui.label(format!("{} ocorrências de {} a partir de {:#x}:", search.hits.len(), search.pattern, search.start));
-                    for &hit in search.hits.iter().take(32) {
-                        if ui.link(mono(format!("{hit:#x}"))).clicked() {
-                            state.memory_address = format!("{hit:#x}");
-                            state.requests.push(Request::ShowMemory(state.memory_address.clone()));
-                        }
-                    }
-                }
-            }
-        });
-    }
-    ui.separator();
-    if let Some(error) = &snapshot.memory.error {
-        ui.label(RichText::new(error).color(colors.red));
-    }
-    if snapshot.memory.bytes.is_empty() {
-        hint(ui, "digite um endereço (com a máquina parada, clique num byte para editá-lo; clique duplo num qword segue o ponteiro)");
-        return;
-    }
-    let editable = state.status == Status::Stopped;
-    let format = state.memory_format;
-    egui::ScrollArea::both().id_salt("memory").auto_shrink([false, false]).show(ui, |ui| {
-        for (row, chunk) in snapshot.memory.bytes.chunks(16).enumerate() {
-            let base = snapshot.memory.address + row as u64 * 16;
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 5.0;
-                ui.label(mono(hex(base)).color(colors.blue));
-                match format {
-                    MemoryFormat::Bytes => {
-                        for (column, &byte) in chunk.iter().enumerate() {
-                            let address = base + column as u64;
-                            if state.memory_edit.as_ref().is_some_and(|(at, _)| *at == address) {
-                                let Some((_, text)) = state.memory_edit.as_mut() else { return };
-                                let response = ui.add(egui::TextEdit::singleline(text).font(TextStyle::Monospace).desired_width(18.0).char_limit(2));
-                                response.request_focus();
-                                if response.lost_focus() {
-                                    if ui.input(|input| input.key_pressed(Key::Enter)) {
-                                        if let Ok(value) = u8::from_str_radix(text.trim(), 16) {
-                                            state.requests.push(Request::WriteMemory(address, vec![value]));
-                                        }
-                                    }
-                                    state.memory_edit = None;
-                                }
-                            } else {
-                                let label = ui.add(egui::Label::new(mono(format!("{byte:02x}"))).sense(Sense::click()));
-                                if editable && label.clicked() {
-                                    state.memory_edit = Some((address, format!("{byte:02x}")));
-                                }
-                            }
-                            if column == 7 {
-                                ui.add_space(4.0);
-                            }
-                        }
-                        let text: String = chunk.iter().map(|&byte| if (0x20..0x7F).contains(&byte) { byte as char } else { '.' }).collect();
-                        ui.add_space(8.0);
-                        ui.label(mono(text).color(colors.dim));
-                    }
-                    MemoryFormat::Words | MemoryFormat::Dwords | MemoryFormat::Qwords => {
-                        let unit = format.unit();
-                        for piece in chunk.chunks(unit) {
-                            let mut raw = [0u8; 8];
-                            raw[..piece.len()].copy_from_slice(piece);
-                            let value = u64::from_le_bytes(raw);
-                            let label = ui.add(egui::Label::new(mono(format!("{value:0width$x}", width = unit * 2))).sense(Sense::click()));
-                            if unit == 8 && label.double_clicked() {
-                                state.memory_address = format!("{value:#x}");
-                                state.requests.push(Request::ShowMemory(state.memory_address.clone()));
-                            }
-                            if unit == 8 {
-                                label.on_hover_text("clique duplo: segue o ponteiro");
-                            }
-                        }
-                    }
-                    MemoryFormat::Ascii => {
-                        let text: String = chunk.iter().map(|&byte| if (0x20..0x7F).contains(&byte) { byte as char } else { '.' }).collect();
-                        ui.label(mono(text));
-                    }
-                    MemoryFormat::Unicode => {
-                        let text: String = chunk.chunks(2).map(|pair| {
-                            let unit = u16::from_le_bytes([pair[0], *pair.get(1).unwrap_or(&0)]);
-                            char::from_u32(unit as u32).filter(|character| !character.is_control()).unwrap_or('.')
-                        }).collect();
-                        ui.label(mono(text));
-                    }
-                }
-            });
-        }
-    });
-}
-
-fn call_stack_panel(ui: &mut Ui, state: &mut UiState) {
-    let colors = palette(ui);
-    let snapshot = Arc::clone(&state.snapshot);
-    if snapshot.frames.is_empty() {
-        hint(ui, "sem pilha (a máquina não parou ainda)");
-        return;
-    }
-    egui::ScrollArea::both().id_salt("stack").auto_shrink([false, false]).show(ui, |ui| {
-        egui::Grid::new("stack-grid").num_columns(5).striped(true).spacing([10.0, 2.0]).show(ui, |ui| {
-            for title in ["#", "RSP do quadro", "endereço", "função", "como"] {
-                ui.label(RichText::new(title).strong());
-            }
-            ui.end_row();
-            for (index, frame) in snapshot.frames.iter().enumerate() {
-                let selected = index == snapshot.selected_frame;
-                ui.label(mono(format!("{index:02}")).color(colors.dim));
-                ui.label(mono(hex(frame.stack)).color(colors.dim));
-                ui.label(mono(hex(frame.address)));
-                if ui.selectable_label(selected, mono(&frame.name)).on_hover_text("mostra o código deste quadro").clicked() {
-                    state.requests.push(Request::SelectFrame(index));
-                }
-                ui.label(RichText::new(frame.method).color(colors.dim));
-                ui.end_row();
-            }
-        });
-    });
-}
-
-fn modules_panel(ui: &mut Ui, state: &mut UiState) {
-    let colors = palette(ui);
-    let snapshot = Arc::clone(&state.snapshot);
-    ui.horizontal(|ui| {
-        if ui.add_enabled(state.status == Status::Stopped, egui::Button::new("Recarregar símbolos")).on_hover_text("lê a lista de módulos de novo e troca os PDBs que chegaram").clicked() {
-            state.requests.push(Request::ReloadSymbols);
-        }
-        let pending = snapshot.modules.iter().filter(|module| module.pending).count();
-        if pending > 0 {
-            ui.spinner();
-            hint(ui, &format!("baixando {pending} PDB(s) do servidor de símbolos"));
-        }
-    });
-    egui::ScrollArea::both().id_salt("modules").auto_shrink([false, false]).show(ui, |ui| {
-        egui::Grid::new("module-grid").num_columns(6).striped(true).spacing([10.0, 2.0]).show(ui, |ui| {
-            for title in ["nome", "base", "fim", "símbolos", "PDB", "origem"] {
-                ui.label(RichText::new(title).strong());
-            }
-            ui.end_row();
-            for module in &snapshot.modules {
-                if ui.link(mono(&module.name)).on_hover_text("detalhes do módulo (lmv)").clicked() {
-                    state.query_kind = QueryKind::Module;
-                    state.query_argument = module.name.clone();
-                    state.requests.push(Request::Query(QueryKind::Module, module.name.clone()));
-                    state.focus_tab.push(Tab::NtObjects);
-                }
-                ui.label(mono(hex(module.base)));
-                ui.label(mono(hex(module.end)));
-                ui.label(mono(module.symbols.to_string()));
-                ui.label(if module.pdb { RichText::new("sim").color(colors.green) } else if module.pending { RichText::new("baixando").color(colors.yellow) } else { RichText::new("-").color(colors.dim) });
-                ui.label(RichText::new(&module.source).color(colors.dim));
-                ui.end_row();
-            }
-        });
-    });
-}
-
-fn processes_panel(ui: &mut Ui, state: &mut UiState) {
-    let colors = palette(ui);
-    let snapshot = Arc::clone(&state.snapshot);
-    egui::ScrollArea::both().id_salt("processes").auto_shrink([false, false]).show(ui, |ui| {
-        ui.label(RichText::new("Processos (clique: filtra as threads; botão direito: detalhes)").strong());
-        egui::Grid::new("process-grid").num_columns(5).striped(true).spacing([10.0, 2.0]).show(ui, |ui| {
-            for title in ["PID", "EPROCESS", "CR3", "threads", "nome"] {
-                ui.label(RichText::new(title).strong());
-            }
-            ui.end_row();
-            for process in &snapshot.processes {
-                let selected = state.thread_filter == Some(process.pid);
-                let response = ui.selectable_label(selected, mono(process.pid.to_string()));
-                if response.clicked() {
-                    state.thread_filter = if selected { None } else { Some(process.pid) };
-                }
-                response.context_menu(|ui| {
-                    if ui.button("!process").clicked() {
-                        state.query_kind = QueryKind::Process;
-                        state.query_argument = format!("{:#x}", process.eprocess);
-                        state.requests.push(Request::Query(QueryKind::Process, state.query_argument.clone()));
-                        state.focus_tab.push(Tab::NtObjects);
-                        ui.close();
-                    }
-                });
-                ui.label(mono(hex(process.eprocess)));
-                ui.label(mono(format!("{:x}", process.cr3)));
-                ui.label(mono(process.threads.to_string()));
-                ui.label(mono(&process.name).color(colors.blue));
-                ui.end_row();
-            }
-        });
-        ui.add_space(8.0);
-        ui.label(RichText::new("Processadores").strong());
-        egui::Grid::new("processor-grid").num_columns(6).striped(true).spacing([10.0, 2.0]).show(ui, |ui| {
-            for title in ["CPU", "IRQL", "KPCR", "thread", "RIP", "processo"] {
-                ui.label(RichText::new(title).strong());
-            }
-            ui.end_row();
-            for processor in &snapshot.processors {
-                let label = format!("{}{}", processor.number, if processor.owner { " *" } else { "" });
-                if ui.selectable_label(snapshot.view == View::Cpu(processor.number + 1), mono(label)).on_hover_text("registradores e pilha deste processador").clicked() {
-                    state.requests.push(Request::SelectCpu(processor.number + 1));
-                }
-                ui.label(mono(processor.irql.to_string()));
-                ui.label(mono(hex(processor.pcr)));
-                ui.label(mono(hex(processor.thread)));
-                ui.label(mono(hex(processor.rip)));
-                ui.label(mono(&processor.process));
-                ui.end_row();
-            }
-        });
-    });
-}
-
-fn threads_panel(ui: &mut Ui, state: &mut UiState) {
-    let colors = palette(ui);
-    let snapshot = Arc::clone(&state.snapshot);
-    if let Some(pid) = state.thread_filter {
-        ui.horizontal(|ui| {
-            ui.label(format!("só o processo {pid}"));
-            if ui.button("todas").clicked() {
-                state.thread_filter = None;
-            }
-        });
-    }
-    egui::ScrollArea::both().id_salt("threads").auto_shrink([false, false]).show(ui, |ui| {
-        egui::Grid::new("thread-grid").num_columns(6).striped(true).spacing([10.0, 2.0]).show(ui, |ui| {
-            for title in ["PID", "TID", "ETHREAD", "estado", "início", "processo"] {
-                ui.label(RichText::new(title).strong());
-            }
-            ui.end_row();
-            for row in snapshot.threads.iter().filter(|row| state.thread_filter.is_none_or(|pid| pid == row.thread.pid)) {
-                let thread = &row.thread;
-                let running = snapshot.processors.iter().find(|processor| processor.thread == thread.ethread).map(|processor| processor.number + 1);
-                let selected = snapshot.view == View::Thread(thread.ethread)
-                    || (running.is_some()
-                        && running
-                            == match snapshot.view {
-                                View::Cpu(cpu) => Some(cpu),
-                                View::Owner => snapshot.stop_processor.map(|number| number + 1),
-                                View::Thread(_) => None,
-                            });
-                ui.label(mono(thread.pid.to_string()));
-                ui.label(mono(thread.tid.to_string()));
-                let response = ui.selectable_label(selected, mono(hex(thread.ethread))).on_hover_text("clique: registradores e pilha desta thread; botão direito: !thread");
-                if response.clicked() {
-                    state.requests.push(Request::SelectThread(thread.ethread));
-                }
-                response.context_menu(|ui| {
-                    if ui.button("!thread").clicked() {
-                        state.query_kind = QueryKind::Thread;
-                        state.query_argument = format!("{:#x}", thread.ethread);
-                        state.requests.push(Request::Query(QueryKind::Thread, state.query_argument.clone()));
-                        state.focus_tab.push(Tab::NtObjects);
-                        ui.close();
-                    }
-                });
-                ui.label(mono(&thread.state).color(if thread.state == "Running" { colors.green } else { colors.dim }));
-                ui.label(mono(&row.start));
-                ui.label(mono(&thread.process));
-                ui.end_row();
-            }
-        });
-    });
-}
-
-fn breakpoints_panel(ui: &mut Ui, state: &mut UiState) {
-    let colors = palette(ui);
-    let snapshot = Arc::clone(&state.snapshot);
-    let stopped = state.status == Status::Stopped;
-    ui.horizontal_wrapped(|ui| {
-        let hint_text = if state.breakpoint_kind == BreakpointKind::Module { "nome do módulo (ntfs.sys)" } else { "símbolo ou endereço" };
-        let response = ui.add(egui::TextEdit::singleline(&mut state.breakpoint_expression).font(TextStyle::Monospace).desired_width(240.0).hint_text(hint_text));
-        egui::ComboBox::from_id_salt("breakpoint-kind").selected_text(state.breakpoint_kind.name()).show_ui(ui, |ui| {
-            for kind in [BreakpointKind::Software, BreakpointKind::Hardware, BreakpointKind::Write, BreakpointKind::Access, BreakpointKind::Module] {
-                ui.selectable_value(&mut state.breakpoint_kind, kind, kind.name());
-            }
-        });
-        ui.add(egui::TextEdit::singleline(&mut state.breakpoint_condition).font(TextStyle::Monospace).desired_width(150.0).hint_text("condição (@rcx==0)"));
-        ui.add(egui::TextEdit::singleline(&mut state.breakpoint_pass).font(TextStyle::Monospace).desired_width(40.0).hint_text("N"));
-        ui.checkbox(&mut state.breakpoint_deferred, "adiado").on_hover_text("aceita um símbolo de um módulo que ainda vai carregar (bu)");
-        let submit = response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
-        if (ui.add_enabled(stopped, egui::Button::new("Adicionar")).clicked() || (submit && stopped)) && !state.breakpoint_expression.trim().is_empty() {
-            let mut request = BreakpointRequest::new(state.breakpoint_kind, state.breakpoint_expression.trim());
-            request.condition = state.breakpoint_condition.trim().to_string();
-            request.pass_count = state.breakpoint_pass.trim().parse().unwrap_or(0);
-            request.deferred = state.breakpoint_deferred;
-            state.requests.push(Request::AddBreakpointWith(request));
-        }
-    });
-    ui.separator();
-    if snapshot.breakpoints.is_empty() {
-        hint(ui, "nenhum breakpoint (clique na margem da desmontagem ou F9; os da sessão voltam no próximo attach)");
-        return;
-    }
-    egui::ScrollArea::both().id_salt("breakpoints").auto_shrink([false, false]).show(ui, |ui| {
-        egui::Grid::new("breakpoint-grid").num_columns(8).striped(true).spacing([10.0, 2.0]).show(ui, |ui| {
-            for title in ["#", "ligado", "tipo", "endereço", "expressão", "condição / N", "acertos", ""] {
-                ui.label(RichText::new(title).strong());
-            }
-            ui.end_row();
-            for breakpoint in &snapshot.breakpoints {
-                ui.label(mono(breakpoint.id.to_string()));
-                let mut enabled = breakpoint.enabled;
-                if ui.add_enabled(stopped, egui::Checkbox::without_text(&mut enabled)).changed() {
-                    state.requests.push(Request::EnableBreakpoint(breakpoint.id, enabled));
-                }
-                ui.label(breakpoint.kind.name());
-                if breakpoint.kind == BreakpointKind::Module {
-                    ui.label(mono("ao carregar").color(colors.dim));
-                } else if breakpoint.pending {
-                    ui.label(mono("(adiado)").color(colors.yellow));
-                } else if ui.add(egui::Label::new(mono(hex(breakpoint.address)).color(colors.blue)).sense(Sense::click())).on_hover_text("mostra na desmontagem").clicked() {
-                    state.code_address = format!("{:#x}", breakpoint.address);
-                    state.requests.push(Request::ShowCode(state.code_address.clone()));
-                }
-                ui.label(mono(&breakpoint.expression));
-                let editing = state.condition_edit.as_ref().is_some_and(|(id, _, _)| *id == breakpoint.id);
-                if editing {
-                    ui.horizontal(|ui| {
-                        let Some((id, condition, pass)) = state.condition_edit.as_mut() else { return };
-                        ui.add(egui::TextEdit::singleline(condition).font(TextStyle::Monospace).desired_width(120.0));
-                        ui.add(egui::TextEdit::singleline(pass).font(TextStyle::Monospace).desired_width(36.0));
-                        if ui.button("ok").clicked() {
-                            state.requests.push(Request::SetBreakpointCondition(*id, condition.clone(), pass.trim().parse().unwrap_or(0)));
-                            state.condition_edit = None;
-                        }
-                    });
-                } else {
-                    let text = match (breakpoint.condition.is_empty(), breakpoint.pass_count > 1) {
-                        (true, false) => "-".to_string(),
-                        (false, false) => breakpoint.condition.clone(),
-                        (true, true) => format!("a partir de {}", breakpoint.pass_count),
-                        (false, true) => format!("{} a partir de {}", breakpoint.condition, breakpoint.pass_count),
-                    };
-                    if ui.add(egui::Label::new(mono(text)).sense(Sense::click())).on_hover_text("clique para editar a condição e a contagem").clicked() {
-                        state.condition_edit = Some((breakpoint.id, breakpoint.condition.clone(), if breakpoint.pass_count > 1 { breakpoint.pass_count.to_string() } else { String::new() }));
-                    }
-                }
-                ui.label(mono(breakpoint.hits.to_string()));
-                if ui.add_enabled(stopped, egui::Button::new("remover")).clicked() {
-                    state.requests.push(Request::RemoveBreakpoint(breakpoint.id));
-                }
-                ui.end_row();
-            }
-        });
     });
 }
 
