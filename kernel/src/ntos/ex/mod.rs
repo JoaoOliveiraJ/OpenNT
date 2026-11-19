@@ -39,6 +39,7 @@ pub mod time_zone;
 pub mod timer_resolution;
 pub mod interlocked_list;
 pub mod system_information;
+pub mod console_information;
 pub mod boot_display;
 pub mod exports;
 pub mod interlocked;

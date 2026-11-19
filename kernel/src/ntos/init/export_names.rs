@@ -559,9 +559,10 @@ pub static GROUP_LAYOUT: &[(&str, usize, usize)] = &[
     ("po-processor-power", 2146, 2),
     ("mm-secure-memory-ex", 2148, 1),
     ("ex-timer-internal", 2149, 2),
+    ("ps-user-process-create", 2151, 2),
 ];
 
-/// Os 2151 exports de função, na ordem da ABI.
+/// Os 2153 exports de função, na ordem da ABI.
 pub static EXPORT_NAMES: &[&str] = &[
     "DbgPrint",
     "DbgPrintEx",
@@ -2714,4 +2715,6 @@ pub static EXPORT_NAMES: &[&str] = &[
     "MmSecureVirtualMemoryEx",
     "ExAllocateTimerInternal",
     "ExAllocateTimerInternal2",
+    "PsCaptureUserProcessParameters",
+    "ZwCreateUserProcess",
 ];

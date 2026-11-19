@@ -5030,7 +5030,22 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     o IopParseDevice. O `--start-driver=condrv` carrega o condrv.sys real e
     `ntos/test/console_driver.rs` abre o servidor, a referência e a conexão
     de um console e troca as mensagens CONNECT e DISCONNECT pelos IOCTLs do
-    condrv (`CONDRV_OK`).
+    condrv (`CONDRV_OK`);
+  - o caminho de console de um programa de console (`ex/console_information.rs`,
+    `ps/process_parameters.rs`): o NtSetSystemInformation(132,
+    SystemConsoleInformation) que o kernelbase chama quando o
+    `\Device\ConDrv\Server` ainda não existe (com o bit DriverLoaded, o
+    ZwLoadDriver da chave do condrv sob o ExpConDrvLoadLock e sem checar
+    privilégio; sem ele, o SeLoadDriverPrivilege e o ZwUnloadDriver), e os
+    ordinais 1 e 2 sem nome que o condrv.sys importa para criar o
+    conhost.exe: o PsCaptureUserProcessParameters (o bloco NORMALIZED do
+    cliente copiado para um pool 'PsPb' com Buffers absolutos, o diretório
+    corrente trocado pelo NtSystemRoot e o console e os handles padrão
+    zerados) e o ZwCreateUserProcess (o NtCreateUserProcess com
+    PreviousMode KernelMode). O volume do smss leva o conhost.exe, o
+    cmd.exe, o net.exe, o net1.exe e o reg.exe com as DLLs deles
+    (`CONSOLE_PROGRAMS`) e as fontes do console (Consolas e Lucida
+    Console, com a chave `Console`).
 - **Os exports que eram os últimos imports de drivers de software** (76,
   cada um no componente dono, conferidos contra o ntoskrnl 19041):
   - SDDL em `se/sddl.rs` (SeConvertSidToStringSid, SeConvertStringSidToSid

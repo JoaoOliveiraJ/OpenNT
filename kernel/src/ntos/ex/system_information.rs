@@ -521,7 +521,8 @@ fn query_interrupt_steering(input: u64, input_length: u32, output: u64, length: 
 }
 
 /// ZwSetSystemInformation: 131 registra as rotinas de entropia do chamador,
-/// 82 troca a base de uma thread pelo CLIENT_ID; classes desconhecidas =
+/// 82 troca a base de uma thread pelo CLIENT_ID, 132 carrega ou descarrega o
+/// condrv.sys (`console_information`); classes desconhecidas =
 /// STATUS_INVALID_INFO_CLASS.
 pub fn set(class: u32, buffer: u64, length: u32) -> u32 {
     let status_of = |error: KernelError| if error.status != 0 { error.status } else { 0xC000_0001 };
@@ -533,6 +534,7 @@ pub fn set(class: u32, buffer: u64, length: u32) -> u32 {
         SYSTEM_UNLOAD_GDI_DRIVER_INFORMATION => return unload_gdi_driver(buffer, length).unwrap_or_else(status_of),
         SYSTEM_THREAD_PRIORITY_CLIENT_ID_INFORMATION => return thread_priority_client_id(buffer, length, 0).unwrap_or_else(status_of),
         SYSTEM_PRIORITY_SEPERATION => return priority_seperation(buffer, length, 0),
+        crate::ntos::ex::console_information::SYSTEM_CONSOLE_INFORMATION => return crate::ntos::ex::console_information::set(buffer, length, 0),
         _ => {}
     }
     if class == 131 {
@@ -821,6 +823,10 @@ pub fn set_from_user_mode(class: u32, buffer: u64, length: u32) -> Result<u32, K
     }
     if matches!(class, 44 | 102) {
         return Ok(crate::ntos::ex::time_zone::set(class, buffer, length, true));
+    }
+    // SystemConsoleInformation (132): a sonda acima é a da entrada do 19041.
+    if class == crate::ntos::ex::console_information::SYSTEM_CONSOLE_INFORMATION {
+        return Ok(crate::ntos::ex::console_information::set(buffer, length, 1));
     }
     if matches!(class, SYSTEM_LOAD_GDI_DRIVER_INFORMATION | SYSTEM_UNLOAD_GDI_DRIVER_INFORMATION | SYSTEM_LOAD_GDI_DRIVER_IN_SYSTEM_SPACE) {
         let expected = if class == SYSTEM_UNLOAD_GDI_DRIVER_INFORMATION { 8 } else { crate::ntos::inc::types::extra_ps_user::SystemGdiDriverInformation::SIZE as u32 };

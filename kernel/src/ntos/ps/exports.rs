@@ -1823,3 +1823,47 @@ pub mod ps_charge_pool_quota {
 
     pub static GROUP: Group = Group { name: "ps-charge-pool-quota", names: &["PsChargePoolQuota"], handlers: &[charge], data_exports: &[] };
 }
+
+pub mod ps_user_process_create {
+    //! PsCaptureUserProcessParameters e ZwCreateUserProcess, os ordinais 1 e
+    //! 2 sem nome do ntoskrnl 19041 que o condrv.sys importa para criar o
+    //! conhost.exe (no OpenNT eles também têm nome na EAT); a lógica mora em
+    //! `ps/process_parameters` e `ps/create_context`.
+
+    use crate::ntos::init::exports::{signed_status, Call, Group};
+    use crate::ntos::ps::create_context::{self, UserCreateRequest};
+    use crate::ntos::ps::{previous_mode, process_parameters};
+    use crate::rtl::KernelError;
+
+    /// PsCaptureUserProcessParameters(PRTL_USER_PROCESS_PARAMETERS* Out,
+    /// PRTL_USER_PROCESS_PARAMETERS UserParameters) -> NTSTATUS.
+    fn capture_user_process_parameters(call: &Call) -> Result<u64, KernelError> {
+        Ok(signed_status(process_parameters::capture_to_pool(call.arg(1), call.arg(2))))
+    }
+
+    /// ZwCreateUserProcess: o NtCreateUserProcess com PreviousMode =
+    /// KernelMode.
+    fn zw_create_user_process(call: &Call) -> Result<u64, KernelError> {
+        let request = UserCreateRequest {
+            process_handle: call.arg(1),
+            thread_handle: call.arg(2),
+            process_access: call.arg(3) as u32,
+            thread_access: call.arg(4) as u32,
+            process_attributes: call.arg(5),
+            thread_attributes: call.arg(6),
+            process_flags: call.arg(7) as u32,
+            thread_flags: call.arg(8) as u32,
+            parameters: call.arg(9),
+            create_info: call.arg(10),
+            attribute_list: call.arg(11),
+        };
+        Ok(signed_status(previous_mode::with_kernel(|| create_context::create(&request))??))
+    }
+
+    pub static GROUP: Group = Group {
+        name: "ps-user-process-create",
+        names: &["PsCaptureUserProcessParameters", "ZwCreateUserProcess"],
+        handlers: &[capture_user_process_parameters, zw_create_user_process],
+        data_exports: &[],
+    };
+}

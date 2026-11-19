@@ -24,6 +24,13 @@
 //!   (Function 2), lido por outro IOCTL_CONDRV_READ_IO.
 //!
 //! A serial mostra `CONDRV_OK` no fim, ou `CONDRV_FALHOU` com o passo.
+//!
+//! Depois, com todos os handles fechados, o SystemConsoleInformation (132)
+//! do ZwSetSystemInformation, que o kernelbase chama quando o servidor ainda
+//! não existe: Length 3 dá STATUS_INFO_LENGTH_MISMATCH e o bit DriverLoaded
+//! com o condrv já carregado dá STATUS_IMAGE_ALREADY_LOADED (o ZwLoadDriver
+//! da chave do serviço). A serial mostra `CONSOLE_INFORMATION_OK`, ou
+//! `CONSOLE_INFORMATION_FALHOU` com o status.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -46,6 +53,10 @@ const FILE_SYNCHRONOUS_IO_NONALERT: u64 = 0x20;
 const OBJ_CASE_INSENSITIVE: u32 = 0x40;
 const OBJ_KERNEL_HANDLE: u32 = 0x200;
 const STATUS_PENDING: u64 = 0x103;
+const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
+const STATUS_IMAGE_ALREADY_LOADED: u32 = 0xC000_010E;
+/// SystemConsoleInformation.
+const SYSTEM_CONSOLE_INFORMATION: u64 = 132;
 /// Prazo das esperas do teste: 10 s relativos.
 const TIMEOUT_100NS: i64 = -100_000_000;
 
@@ -145,8 +156,35 @@ pub fn after_driver_start(name: &str) {
     }
     match exercise() {
         Ok(()) => debug_print!("CONDRV_OK"),
-        Err(message) => debug_print!("CONDRV_FALHOU: {}", message),
+        Err(message) => {
+            debug_print!("CONDRV_FALHOU: {}", message);
+            return;
+        }
     }
+    match console_information() {
+        Ok(()) => debug_print!("CONSOLE_INFORMATION_OK"),
+        Err(message) => debug_print!("CONSOLE_INFORMATION_FALHOU: {}", message),
+    }
+}
+
+/// ZwSetSystemInformation(SystemConsoleInformation) com o condrv carregado
+/// pelo `--start-driver`: Length 3 e depois o bit DriverLoaded com Length 4.
+fn console_information() -> Result<(), String> {
+    use alloc::format;
+    let information = guest::alloc_bytes(8);
+    guest::write64(information, 1);
+    // O NTSTATUS volta estendido com sinal (`signed_status`).
+    let short = call_export("ZwSetSystemInformation", &[SYSTEM_CONSOLE_INFORMATION, information, 3]).unwrap_or(1) as u32;
+    let load = call_export("ZwSetSystemInformation", &[SYSTEM_CONSOLE_INFORMATION, information, 4]).unwrap_or(1) as u32;
+    guest::free_bytes(information);
+    debug_print!("[condrv] SystemConsoleInformation: Length 3 -> {:#x}, carga com o condrv carregado -> {:#x}", short, load);
+    if short != STATUS_INFO_LENGTH_MISMATCH {
+        return Err(format!("Length 3: {short:#x} (esperado {STATUS_INFO_LENGTH_MISMATCH:#x})"));
+    }
+    if load != STATUS_IMAGE_ALREADY_LOADED {
+        return Err(format!("carga com o condrv carregado: {load:#x} (esperado {STATUS_IMAGE_ALREADY_LOADED:#x})"));
+    }
+    Ok(())
 }
 
 fn exercise() -> Result<(), String> {

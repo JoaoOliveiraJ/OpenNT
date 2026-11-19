@@ -332,8 +332,8 @@ descricao = "Boot do smss real com 256 MB de RAM. O smss.exe lê o PagingFiles d
 id = "condrv"
 titulo = "Driver condrv.sys real"
 marcador = "CONDRV_OK"
-comando = "cargo xtask test-boot DRIVER_START_COMPLETED 400000 --start-driver=condrv --build-dir=build/condrv --smp=1 \"--expect=name=condrv state=4 win32=0\" --expect=CONDRV_OK --hold=30000"
-descricao = "O gerenciador de serviços inicia o condrv.sys da Microsoft (o driver do console, \\Device\\ConDrv) e o kernel faz o que o conhost e a kernelbase fazem para abrir um console: abre o servidor (\\Device\\ConDrv\\Server), a referência relativa a ele e a conexão (\\Connect relativa à referência), que fica pendente até o servidor, numa thread de sistema, ler a mensagem de conexão pelo IOCTL_CONDRV_READ_IO e concluí-la pelo IOCTL_CONDRV_COMPLETE_IO; o fechamento do cliente chega ao servidor como a mensagem de desconexão. O marcador CONDRV_OK sai no fim e o sistema segue rodando 30 s sem falha na serial (--hold)."
+comando = "cargo xtask test-boot DRIVER_START_COMPLETED 400000 --start-driver=condrv --build-dir=build/condrv --smp=1 \"--expect=name=condrv state=4 win32=0\" --expect=CONDRV_OK --expect=CONSOLE_INFORMATION_OK --hold=30000"
+descricao = "O gerenciador de serviços inicia o condrv.sys da Microsoft (o driver do console, \\Device\\ConDrv) e o kernel faz o que o conhost e a kernelbase fazem para abrir um console: abre o servidor (\\Device\\ConDrv\\Server), a referência relativa a ele e a conexão (\\Connect relativa à referência), que fica pendente até o servidor, numa thread de sistema, ler a mensagem de conexão pelo IOCTL_CONDRV_READ_IO e concluí-la pelo IOCTL_CONDRV_COMPLETE_IO; o fechamento do cliente chega ao servidor como a mensagem de desconexão. O marcador CONDRV_OK sai no fim. Depois, o SystemConsoleInformation (132) do ZwSetSystemInformation, a classe que o kernelbase chama para carregar o condrv sob demanda: com Length 3 dá STATUS_INFO_LENGTH_MISMATCH e, com o condrv já carregado, o ZwLoadDriver da chave do serviço dá STATUS_IMAGE_ALREADY_LOADED (CONSOLE_INFORMATION_OK). O sistema segue rodando 30 s sem falha na serial (--hold)."
 
 [[teste]]
 id = "watchdog"

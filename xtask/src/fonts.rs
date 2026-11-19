@@ -19,7 +19,12 @@
 //!   = Microsoft Sans Serif, `MS Shell Dlg 2` = Tahoma), as métricas de
 //!   janela e o XAML da tela de logon (pelo DirectWrite), a família Segoe UI
 //!   e os ícones do Segoe MDL2 Assets, e o `FontLink\SystemLink` cai no
-//!   Segoe UI Symbol.
+//!   Segoe UI Symbol;
+//! - o conhost.exe usa o Consolas 16 (o `Console\TrueTypeFont` não tem
+//!   entrada para a página de código, e o
+//!   RetrieveDefaultFontNameForCodepage do conhost cai no Consolas), e o
+//!   win32kfull o carrega com as outras fontes de `Fonts` no
+//!   AddInitialFonts do csrss, antes do `CmdLine` do winlogon.
 //!
 //! O DPI vem do perfil de hardware: o win32kfull lê o `LogPixels` de
 //! `CurrentControlSet\Hardware Profiles\Current\Software\Fonts` (e o
@@ -65,6 +70,14 @@ const FONTS: &[&str] = &[
     "seguibli.ttf",
     "segmdl2.ttf",
     "seguisym.ttf",
+    // A fonte padrão do console: o conhost.exe pede o Consolas quando a
+    // página de código não tem entrada em Console\TrueTypeFont; o Lucida
+    // Console é a entrada "0" dessa chave.
+    "consola.ttf",
+    "consolab.ttf",
+    "consolai.ttf",
+    "consolaz.ttf",
+    "lucon.ttf",
 ];
 
 /// As fontes: (caminho no volume, arquivo de origem).
@@ -106,7 +119,7 @@ pub fn software_keys() -> Vec<HostKey> {
     {
         use crate::host_language::registry;
         let current = "Microsoft\\Windows NT\\CurrentVersion";
-        for (path, recursive) in [("GRE_Initialize", true), ("FontSubstitutes", false), ("FontLink\\SystemLink", false)] {
+        for (path, recursive) in [("GRE_Initialize", true), ("FontSubstitutes", false), ("FontLink\\SystemLink", false), ("Console", true)] {
             registry::copy(registry::LOCAL_MACHINE, &format!("SOFTWARE\\{current}\\{path}"), &format!("{current}\\{path}"), recursive, &mut keys);
         }
         let first = keys.len();
@@ -122,4 +135,30 @@ pub fn software_keys() -> Vec<HostKey> {
         }
     }
     keys
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::files;
+
+    /// A fonte padrão do console vai para a pasta Fonts do volume.
+    #[test]
+    fn the_console_font_is_staged() {
+        assert!(files(Path::new("C:/Windows")).iter().any(|(path, _)| path == "Fonts/consola.ttf"));
+    }
+
+    /// O `Console\TrueTypeFont` desta máquina vem com a SOFTWARE, com o
+    /// Consolas em "00", e a chave `Fonts` com o valor do Consolas.
+    #[cfg(windows)]
+    #[test]
+    fn the_console_key_and_the_consolas_value_are_copied() {
+        let keys = super::software_keys();
+        let consolas: Vec<u8> = "Consolas".encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect();
+        let true_type = keys.iter().find(|key| key.path == "Microsoft\\Windows NT\\CurrentVersion\\Console\\TrueTypeFont").expect("Console\\TrueTypeFont");
+        assert!(true_type.values.iter().any(|(name, kind, data)| name == "00" && *kind == 1 && *data == consolas), "{:?}", true_type.values.iter().map(|(name, _, _)| name).collect::<Vec<_>>());
+        let fonts = keys.iter().find(|key| key.path == "Microsoft\\Windows NT\\CurrentVersion\\Fonts").expect("Fonts");
+        assert!(fonts.values.iter().any(|(name, _, _)| name == "Consolas (TrueType)"));
+    }
 }

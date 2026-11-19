@@ -515,6 +515,13 @@ const SMSS_PROGRAMS: &[&str] = &[
 /// já estão no volume.
 const SERVICE_CHAIN_PROGRAMS: &[&str] = &["umpo.dll", "psmsrv.dll", "SystemEventsBrokerServer.dll", "brokerlib.dll", "umpnpmgr.dll"];
 
+/// O console: o conhost.exe que o condrv.sys cria para um programa de
+/// console, o cmd.exe (com o cmdext.dll do ext-ms-win-cmd-util), o net.exe,
+/// o net1.exe e o reg.exe do gancho do `--conta-de-teste` (SYSTEM\Setup
+/// CmdLine), o mpr.dll que o net.exe importa, o netmsg.dll e o neth.dll das
+/// mensagens do net e o winmm.dll do PlaySound atrasado do conhost.
+const CONSOLE_PROGRAMS: &[&str] = &["conhost.exe", "cmd.exe", "cmdext.dll", "net.exe", "net1.exe", "reg.exe", "mpr.dll", "netmsg.dll", "neth.dll", "winmm.dll"];
+
 /// A tela de logon da sessão 1: o dwm.exe que o dwminit.dll do winlogon
 /// cria e o LogonUI.exe do StartLogonUI, com o fecho dos imports estáticos
 /// deles (pelos API sets desta máquina) e as cargas sob demanda do caminho
@@ -765,7 +772,7 @@ pub fn windows_directory() -> PathBuf {
 
 /// Os programas de modo usuário do boot do smss, na raiz do volume.
 pub fn user_programs() -> impl Iterator<Item = &'static str> {
-    SMSS_PROGRAMS.iter().chain(SERVICE_CHAIN_PROGRAMS).chain(LOGON_SCREEN_PROGRAMS).copied()
+    SMSS_PROGRAMS.iter().chain(SERVICE_CHAIN_PROGRAMS).chain(LOGON_SCREEN_PROGRAMS).chain(CONSOLE_PROGRAMS).copied()
 }
 
 /// Os nomes de arquivo de `directory`.

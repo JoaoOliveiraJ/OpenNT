@@ -8,7 +8,9 @@
 //! corrente: a criação roda anexada a ele). [`capture`] faz o caminho inverso
 //! para o NtCreateUserProcess: lê o bloco que o chamador montou na memória de
 //! usuário dele, normalizado ou não, antes de a criação anexar ao processo
-//! novo.
+//! novo. [`capture_to_pool`] é o PsCaptureUserProcessParameters que o
+//! condrv.sys chama: o bloco normalizado de um chamador de modo usuário
+//! copiado para um pool de kernel, com Buffers absolutos.
 //!
 //! Formato entregue ao processo: auto-relativo, sem
 //! RTL_USER_PROC_PARAMS_NORMALIZED (o Flags é só o que a criação passa:
@@ -247,6 +249,21 @@ fn text_of(bytes: &[u8]) -> String {
 /// handles padrão passam como valores. Devolve o NTSTATUS da falha:
 /// ACCESS_VIOLATION numa sonda, INVALID_PARAMETER num bloco malformado.
 pub fn capture(address: u64) -> Result<ProcessParameters, u32> {
+    capture_with_header(address).map(|(parameters, _)| parameters)
+}
+
+/// Os campos do cabeçalho de um bloco capturado que o
+/// PsCaptureUserProcessParameters confere: o Flags, o Environment e o
+/// EnvironmentSize, como o chamador os deixou.
+#[derive(Clone, Copy, Debug)]
+struct CapturedHeader {
+    flags: u32,
+    environment: u64,
+    environment_size: u64,
+}
+
+/// O [`capture`] com o [`CapturedHeader`] da cópia de kernel.
+fn capture_with_header(address: u64) -> Result<(ProcessParameters, CapturedHeader), u32> {
     if address % 8 != 0 || !state::probe_user_read(address, 8) {
         return Err(STATUS_ACCESS_VIOLATION);
     }
@@ -266,9 +283,173 @@ pub fn capture(address: u64) -> Result<ProcessParameters, u32> {
     }
     guest::write_bytes(copy, &bytes);
     // SAFETY: a cópia de kernel recém-alocada e zerada além do Length.
-    let result = read_captured(address, unsafe { RtlUserProcessParameters::at(copy) });
+    let copied = unsafe { RtlUserProcessParameters::at(copy) };
+    let header = CapturedHeader { flags: copied.flags.get(), environment: copied.environment.get(), environment_size: copied.environment_size.get() };
+    let result = read_captured(address, copied).map(|parameters| (parameters, header));
     guest::free_bytes(copy);
     result
+}
+
+// ---- PsCaptureUserProcessParameters ------------------------------------------
+//
+// ntoskrnl 19041 0x6a5500 = PspCaptureUserProcessParameters(Out, Params, NULL,
+// Flags 3, CurrentServerSilo) 0x606d2c, o export só por ordinal (1) que o
+// condrv.sys chama no CdpLaunchServerProcess, na thread do cliente, com o
+// bloco que o kernelbase montou (ConsoleLaunchServerProcess):
+// - Params alinhado a 4 (senão STATUS_DATATYPE_MISALIGNMENT) e sondado;
+// - Flags do chamador sem o bit 14; `(Flags ^ 1) & 0xF7010E11` diferente de
+//   zero (sem RTL_USER_PROC_PARAMS_NORMALIZED, ou um bit proibido) ou 0x20
+//   junto com 0x40: STATUS_INVALID_PARAMETER;
+// - Environment com EnvironmentSize diferente de zero e par, senão
+//   STATUS_INVALID_PARAMETER;
+// - o Flags 3 da chamada: o CurrentDirectory vira o PsProtectedCurrentDirectory
+//   do silo (o NtSystemRoot), o RuntimeData o PspProtectedRuntimeData (vazio),
+//   o ambiente do chamador fica, e o ConsoleHandle e os três handles padrão
+//   vão a zero;
+// - um bloco ExAllocatePoolWithQuotaTag(NonPagedPoolNx |
+//   POOL_QUOTA_FAIL_INSTEAD_OF_RAISE, 'PsPb') de ((0x441 + soma dos
+//   MaximumLength) & ~1) + EnvironmentSize bytes: o cabeçalho de 0x440, os
+//   textos a partir de +0x440 cada um com o seu MaximumLength e Buffer
+//   absoluto (o bloco continua NORMALIZED), depois o ambiente; Length =
+//   MaximumLength = cabeçalho + textos; EnvironmentVersion (+0x3f8) e
+//   +0x420..+0x43f zerados. Quem chama libera com ExFreePoolWithTag(bloco, 0).
+//
+// O condrv reescreve a CommandLine do bloco no lugar (RtlStringCbPrintfW com o
+// MaximumLength dela) antes do ZwCreateUserProcess, por isso cada texto
+// guarda o MaximumLength do chamador. O DesktopInfo passa como veio: é ele
+// que põe a janela do conhost na WinSta0\Default de quem chamou.
+
+/// RTL_USER_PROC_RESERVED_14: o bit que a captura limpa.
+const CAPTURE_CLEARED_FLAG: u32 = 0x4000;
+/// Os bits que a captura recusa, com o NORMALIZED invertido.
+const CAPTURE_REFUSED_FLAGS: u32 = 0xF701_0E11;
+/// Dois flags que não podem vir juntos.
+const CAPTURE_EXCLUSIVE_FLAGS: u32 = 0x60;
+/// NonPagedPoolNx | POOL_QUOTA_FAIL_INSTEAD_OF_RAISE.
+const CAPTURE_POOL_TYPE: u32 = 0x208;
+/// 'PsPb'.
+const CAPTURE_POOL_TAG: u32 = u32::from_le_bytes(*b"PsPb");
+/// O cabeçalho copiado: a estrutura inteira.
+const CAPTURE_HEADER: u64 = 0x440;
+const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
+const STATUS_INTEGER_OVERFLOW: u32 = 0xC000_0095;
+const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
+
+/// PsCaptureUserProcessParameters(Out, UserParameters): captura o bloco
+/// NORMALIZED do chamador de modo usuário em `user` para um bloco de pool
+/// de kernel e grava a VA dele em `*out` (um ponteiro de kernel). Devolve o
+/// NTSTATUS.
+pub fn capture_to_pool(out: u64, user: u64) -> u32 {
+    if user % 4 != 0 {
+        return STATUS_DATATYPE_MISALIGNMENT;
+    }
+    let (mut parameters, header) = match capture_with_header(user) {
+        Ok(captured) => captured,
+        Err(status) => return status,
+    };
+    let flags = header.flags & !CAPTURE_CLEARED_FLAG;
+    if (flags ^ NORMALIZED) & CAPTURE_REFUSED_FLAGS != 0 || flags & CAPTURE_EXCLUSIVE_FLAGS == CAPTURE_EXCLUSIVE_FLAGS {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if header.environment == 0 || header.environment_size == 0 || header.environment_size % 2 != 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // O ambiente como o chamador o deixou: EnvironmentSize bytes (o
+    // `capture` já os sondou).
+    if !state::probe_user_read(header.environment, header.environment_size) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    let Ok(environment) = guest::try_read_bytes(header.environment, header.environment_size as usize) else { return STATUS_ACCESS_VIOLATION };
+    // O Flags 3 da chamada.
+    parameters.current_directory = crate::ntos::rtl::guest_strings::read_wide_string(crate::ntos::rtl::version::nt_system_root());
+    parameters.capacities.current_directory = 0;
+    parameters.runtime_data = None;
+    parameters.capacities.runtime_data = 0;
+    parameters.console_handle = 0;
+    parameters.standard_input = 0;
+    parameters.standard_output = 0;
+    parameters.standard_error = 0;
+    let block = match parameters.write_kernel_block(flags, &environment) {
+        Ok(block) => block,
+        Err(status) => return status,
+    };
+    // SAFETY: o PVOID* de saída de um chamador de modo kernel.
+    unsafe { crate::ntos::inc::field::Field::<u64>::at(out) }.set(block);
+    0
+}
+
+impl ProcessParameters {
+    /// O bloco de pool de kernel do [`capture_to_pool`]: o cabeçalho de
+    /// 0x440 bytes, os textos a partir de +0x440 com o MaximumLength de cada
+    /// um e Buffer absoluto, e `environment` depois deles. Flags = `flags`
+    /// (com o NORMALIZED). Devolve a VA do bloco, ou o NTSTATUS da falha.
+    fn write_kernel_block(&self, flags: u32, environment: &[u8]) -> Result<u64, u32> {
+        let capacities = &self.capacities;
+        let required = |text: &str| (!text.is_empty()).then(|| wide(text));
+        // Na ordem dos campos da estrutura.
+        let strings: [(Option<Vec<u8>>, u16, u64); 8] = [
+            (required(&self.current_directory), capacities.current_directory, 2),
+            (required(&self.dll_path), capacities.dll_path, 2),
+            (required(&self.image_path_name), capacities.image_path_name, 2),
+            (required(&self.command_line), capacities.command_line, 2),
+            (self.window_title.as_deref().map(wide), capacities.window_title, 2),
+            (self.desktop_info.as_deref().map(wide), capacities.desktop_info, 2),
+            (self.shell_info.as_deref().map(wide), capacities.shell_info, 2),
+            (self.runtime_data.clone(), capacities.runtime_data, 0),
+        ];
+        let maximum = |bytes: &[u8], capacity: u16, terminator: u64| (bytes.len() as u64 + terminator).max(capacity as u64);
+        if strings.iter().any(|(bytes, capacity, terminator)| bytes.as_ref().is_some_and(|bytes| maximum(bytes, *capacity, *terminator) > u16::MAX as u64)) {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let texts: u64 = strings.iter().filter_map(|(bytes, capacity, terminator)| bytes.as_ref().map(|bytes| maximum(bytes, *capacity, *terminator).next_multiple_of(2))).sum();
+        let length = CAPTURE_HEADER + texts;
+        let size = length.checked_add(environment.len() as u64).filter(|&size| size <= u32::MAX as u64).ok_or(STATUS_INTEGER_OVERFLOW)?;
+        let block = match crate::ntos::ex::pool_quota::allocate(CAPTURE_POOL_TYPE, size, CAPTURE_POOL_TAG) {
+            Ok(block) if block != 0 => block,
+            _ => return Err(STATUS_INSUFFICIENT_RESOURCES),
+        };
+        guest::write_bytes(block, &alloc::vec![0u8; size as usize]);
+        // SAFETY: o bloco de pool recém-alocado e zerado.
+        let parameters = unsafe { RtlUserProcessParameters::at(block) };
+        let targets: [&UnicodeString; 8] = [&parameters.current_directory.dos_path, &parameters.dll_path, &parameters.image_path_name, &parameters.command_line, &parameters.window_title, &parameters.desktop_info, &parameters.shell_info, &parameters.runtime_data];
+        let mut offset = CAPTURE_HEADER;
+        for (target, (bytes, capacity, terminator)) in targets.into_iter().zip(strings.iter()) {
+            let Some(bytes) = bytes else { continue };
+            let maximum = maximum(bytes, *capacity, *terminator);
+            // O bloco é zerado: o NUL já está lá.
+            guest::write_bytes(block + offset, bytes);
+            target.length.set(bytes.len() as u16);
+            target.maximum_length.set(maximum as u16);
+            target.buffer.set(block + offset);
+            offset += maximum.next_multiple_of(2);
+        }
+        guest::write_bytes(block + length, environment);
+        parameters.environment.set(block + length);
+        parameters.environment_size.set(environment.len() as u64);
+        parameters.environment_version.set(0);
+        parameters.maximum_length.set(length as u32);
+        parameters.length.set(length as u32);
+        parameters.flags.set(flags);
+        parameters.console_handle.set(self.console_handle);
+        parameters.standard_input.set(self.standard_input);
+        parameters.standard_output.set(self.standard_output);
+        parameters.standard_error.set(self.standard_error);
+        let settings = &self.settings;
+        parameters.debug_flags.set(settings.debug_flags);
+        parameters.console_flags.set(settings.console_flags);
+        parameters.starting_x.set(settings.starting_x);
+        parameters.starting_y.set(settings.starting_y);
+        parameters.count_x.set(settings.count_x);
+        parameters.count_y.set(settings.count_y);
+        parameters.count_chars_x.set(settings.count_chars_x);
+        parameters.count_chars_y.set(settings.count_chars_y);
+        parameters.fill_attribute.set(settings.fill_attribute);
+        parameters.window_flags.set(settings.window_flags);
+        parameters.show_window_flags.set(settings.show_window_flags);
+        parameters.process_group_id.set(settings.process_group_id);
+        parameters.loader_threads.set(settings.loader_threads);
+        Ok(block)
+    }
 }
 
 /// Os campos da cópia de kernel de um bloco do chamador em `block`.

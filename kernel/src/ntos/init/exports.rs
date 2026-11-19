@@ -66,7 +66,7 @@ pub struct Group {
 }
 
 /// Grupos implementados (qualquer ordem: a posição vem de `GROUP_LAYOUT`).
-fn groups() -> [&'static Group; 553] {
+fn groups() -> [&'static Group; 554] {
     [
         &crate::ntos::ps::exports::ps_jobs::GROUP,
         &crate::ntos::alpc::exports::zw_alpc_server::GROUP,
@@ -622,6 +622,7 @@ fn groups() -> [&'static Group; 553] {
         &crate::ntos::po::exports::po_processor_power::GROUP,
         &crate::ntos::mm::exports::mm_secure_memory_ex::GROUP,
         &crate::ntos::ex::exports::ex_timer_internal::GROUP,
+        &crate::ntos::ps::exports::ps_user_process_create::GROUP,
     ]
 }
 
