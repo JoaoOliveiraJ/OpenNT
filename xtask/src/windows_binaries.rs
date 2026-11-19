@@ -541,6 +541,14 @@ const LOGON_SCREEN_PROGRAMS: &[&str] = &[
     "dwmcore.dll",
     "dwmghost.dll",
     "d2d1.dll",
+    // A Compression API do cabinet.dll (CreateDecompressor/Decompress/
+    // CloseDecompressor, importados por ordinal e com carga atrasada): o
+    // CTrackedShader::DecompressShader do d2d1.dll (0x89fc4) descomprime com
+    // ela os shaders embutidos no primeiro CreateEffect. Sem ela o
+    // CD3DDevice::Create do dwmcore.dll falha em todo quadro (E_FAIL no
+    // CD2DContext::PopulateEffectTable) até o freio de falhas de
+    // renderização do ProcessFrame encerrar o dwm.
+    "cabinet.dll",
     "d3d11.dll",
     "d3d10warp.dll",
     "D3DCOMPILER_47.dll",
