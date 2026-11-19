@@ -24,6 +24,8 @@
 //! - `tpi`, `types`: os tipos do PDB do ntoskrnl e as vistas tipadas;
 //! - `expr`: as expressões (operadores, memória, símbolos e campos tipados);
 //! - `bugcheck`: a análise de uma parada por bugcheck;
+//! - `crash`: a análise de uma parada pelo log da serial, sem o alvo (o
+//!   bloco `[kcrash]` com nomes, o WdLog do dxgkrnl e a primeira tela);
 //! - `trace`: o rastro de instruções (formato, árvore de chamadas, diff);
 //! - `x86`: o mínimo de decodificação para o passo por cima (o tamanho de
 //!   um `call`), o prólogo e a classe de uma instrução;
@@ -63,6 +65,7 @@ pub mod breakpoints;
 pub mod bugcheck;
 pub mod client;
 pub mod commands;
+pub mod crash;
 pub mod demangle;
 pub mod elf;
 pub mod explore;

@@ -1,0 +1,25 @@
+[OpenNT] kernel 64-bit vivo (BIOS real mode -> long mode)
+HELLO_KERNEL_OK
+[mm] kernel PE registrado: base=0xfffff80040000000 size=0x11c5000
+[ci-loader] validating \Device\KernelVolume1\win32k.sys bytes=598528
+CI_KERNEL_IMAGE_RESULT name=\Device\KernelVolume1\win32k.sys status=0x0 validationMode=2 signatureContext=0x0 signingLevel=12 imageFlags=0x4 verificationFlags=0x0 importsResolved=false relocationsApplied=false entryPointExecuted=false
+[pe] base=0xfffff92040000000 (fisico 0xbdd5000) imagem=634880 bytes, 11 secoes
+[ci-loader] validating \Device\KernelVolume1\win32kbase.sys bytes=2911744
+CI_KERNEL_IMAGE_RESULT name=\Device\KernelVolume1\win32kbase.sys status=0x0 validationMode=2 signatureContext=0x0 signingLevel=12 imageFlags=0x4 verificationFlags=0x0 importsResolved=false relocationsApplied=false entryPointExecuted=false
+[pe] base=0xfffff920400a0000 (fisico 0xc0ba000) imagem=2973696 bytes, 13 secoes
+[ci-loader] validating \Device\KernelVolume1\win32kfull.sys bytes=3809792
+CI_KERNEL_IMAGE_RESULT name=\Device\KernelVolume1\win32kfull.sys status=0x0 validationMode=2 signatureContext=0x0 signingLevel=12 imageFlags=0x4 verificationFlags=0x0 importsResolved=false relocationsApplied=false entryPointExecuted=false
+[pe] base=0xfffff92040380000 (fisico 0xc4d0000) imagem=3883008 bytes, 12 secoes
+[kernel-seh] unhandled software exception code=0xc0000005 pc=0xfffff92040469655
+
+*** STOP (KeBugCheckEx): 0x0000001e (0xc0000005, 0xfffff92040469655, 0x0, 0x0)
+[kcrash] excecao 0xc0000005 em 0xfffff92040469655 = win32kfull.sys+0xe9655 (xxxDwmStopRedirection+0x35), leitura de 0x40
+[kcrash] rip=fffff92040469655 rsp=ffffa00701cff0d0 rbp=0000000000000000 rax=0000000000000001 rcx=000000000000b1e0 rdx=0000000000000000 r8=0000000000000000 r9=0000000000000000
+[kcrash] rbx=0000000000000001 rsi=fffff900400bf050 rdi=0000000000000000 r10=0000000000000000 r11=ffffa00701cfeb90 r12=0000000000000000 r13=fffff90040032190 r14=0000000000000001 r15=0000000000000001
+[kcrash] pilha (rsp 0xffffa00701cff0d0): win32kfull.sys+0xe9655 (xxxDwmStopRedirection+0x35) | win32kbase.sys+0x7627e (?LockUnInitialize@tagDomLock@@QEBAXXZ+0x1de) | win32kbase.sys+0x4113a | win32kbase.sys+0x3df75 (UserThreadCallout+0x575)
+[kcrash]   win32kfull.sys+0xe3d46 (W32pThreadCallout+0x76) | win32kbase.sys+0x4f413 (W32CalloutDispatch+0x463) | win32k.sys+0x10d1 (SysEntryGetW32pArgumentTableFilter+0x41) | ntoskrnl.exe+0x47afc3
+[kcrash]   ntoskrnl.exe+0x4b59e4 | ntoskrnl.exe+0xb06875 | ntoskrnl.exe+0xb06b48 | ntoskrnl.exe+0x6c0541
+[kcrash]   ntoskrnl.exe+0xb4e3fa | ntoskrnl.exe+0xb51fd3 | ntoskrnl.exe+0x853430
+[bugcheck] codigo de parada: KMODE_EXCEPTION_NOT_HANDLED
+[bugcheck] o que falhou: win32kfull.sys
+[bugcheck] tela de bugcheck: framebuffer 1024x768 (tipo 2), fonte do BIOS carregada
