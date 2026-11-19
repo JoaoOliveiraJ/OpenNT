@@ -5,7 +5,10 @@
 # principal do kernel, consulta objetos do NT (processo, thread, driver e
 # dispositivo), dá um passo, rastreia instruções passo a passo dentro do
 # convidado e se desliga; a máquina segue até o fim do boot (os marcadores
-# da COM1 são do comando do teste).
+# da COM1 são do comando do teste). Usa também a linguagem dos roteiros
+# (docs/ARQUITETURA.md): o tratador de parada (on-break), as condições, os
+# laços pelos processos, threads e módulos e as variáveis tiradas da saída.
+# A transcrição da sessão fica em kd-sessao.log, ao lado do serial.log.
 
 # Anexar: o primeiro pacote com a máquina rodando a para no tique seguinte.
 attach
@@ -31,12 +34,24 @@ sleep 1500
 break
 expect-stop SIGINT
 
-# Breakpoint de software numa função do laço principal do kernel.
-bp kernel::ntos::ke::run_kernel_tasks
+# Breakpoint de software numa função do laço principal do kernel, com uma
+# linha de log a cada acerto (sai na transcrição na hora) e um tratador de
+# parada: nos dois primeiros acertos o tratador imprime e a máquina segue
+# sozinha; no terceiro ele a deixa parada e o wait-stop termina.
+bp kernel::ntos::ke::run_kernel_tasks /w "1" /log "laco rsp={@rsp}"
+on-break kernel::ntos::ke::run_kernel_tasks {
+    print acerto {$hits:d} em {@rip:s}
+    if $hits >= 3 {
+        stop
+    }
+}
 continue
 wait-stop 600000
 expect-stop swbreak
 expect-eq %rip kernel::ntos::ke::run_kernel_tasks
+expect-eq $hits 3
+expect-console laco rsp=
+on-break kernel::ntos::ke::run_kernel_tasks off
 
 # Os registradores além do pacote `g`: a metade alta dos YMM sai do XSAVE na
 # CPU da parada (o kernel liga o AVX no boot).
@@ -51,6 +66,11 @@ expect SspiInitAsyncInterface
 # Estado do OpenNT na parada.
 ps
 expect System
+# O laço pelos processos acha o System.
+for-each process sistema name System {
+    leave
+}
+expect-eq $sistema_pid 4
 threads
 # As quatro primeiras threads de sistema depois da do boot são as worker
 # threads do ExpWorkerInitialization, paradas à espera de itens (uma delas
@@ -65,6 +85,12 @@ expect kernel::ntos::io::work_items::worker_thread
 # quadro de troca da pilha de kernel dela, até o código do driver.
 threads
 save-thread esperando Waiting 2 ACPI
+# O mesmo pelo laço das threads: a primeira parada com um quadro do
+# acpi.sys na pilha.
+for-each thread acpi state Waiting stack ACPI {
+    leave
+}
+expect-eq $acpi $esperando
 context $esperando
 expect quadro de troca
 btt $esperando
@@ -72,6 +98,10 @@ expect kernel::ntos::ke::wait::
 expect ACPI
 lm
 expect ksecdd.sys
+for-each module ksecdd name ksecdd {
+    leave
+}
+expect-eq $ksecdd_count 1
 cpus
 irql
 obj \Device
@@ -90,6 +120,8 @@ expect-eq poi(@rsp) [%rsp]
 !process 4
 expect EPROCESS
 expect threads:
+save-after sistema_ep EPROCESS
+expect-eq $sistema_ep $sistema
 !thread $esperando
 expect motivo da espera
 !drvobj \Driver\ACPI
@@ -135,6 +167,9 @@ expect handles IoCompletion
 expect handles ALPC_Port
 lmv ksecdd
 expect ksecdd.sys
+# A base que o cliente usa nos símbolos é a da lista do alvo.
+save-after base_ksecdd "  base "
+expect-eq $base_ksecdd $ksecdd
 
 # Extensões para os processos de usuário: o processo das leituras, a
 # tabela de handles do System, as faixas do sistema, os pontos de evento e
@@ -204,5 +239,5 @@ hbc kernel::ntos::ke::run_kernel_tasks
 # Desliga: a máquina segue até o fim do boot (o shell e o serviço de
 # teclado lendo do driver real, em qualquer ordem).
 detach
-wait-serial [shell] pronto
+wait-serial /t 300000 [shell] pronto
 wait-serial [kbd] lendo teclas do driver real
