@@ -3,6 +3,12 @@
 //! OpenNT por `p`), uma pilha capturada, código, módulos e as paradas
 //! roteirizadas. Os testes do `kd-client` (`fake_target.rs`) e os do
 //! servidor MCP (`tools/kd-mcp/tests`) usam o mesmo stub.
+//!
+//! `start_opennt` liga o que o depurador do OpenNT anuncia além do GDB:
+//! pacote de 16 KB, leitura binária (`x`), o filtro de carga
+//! (`QOpenNTLoadBreak`: uma parada roteirizada com `load` que não casa com
+//! o filtro não chega ao cliente, como no alvo) e as respostas de parada
+//! com os registradores adiantados e a impressão digital dos módulos.
 
 #![allow(dead_code)]
 
@@ -14,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use kd_client::rsp::{encode, hex, unhex, Connection, Decoder, Frame};
+use kd_client::rsp::{checksum, encode, hex, unhex, Connection, Decoder, Frame};
 use kd_client::symbols::{Module, Symbol};
 use kd_client::Client;
 
@@ -55,6 +61,18 @@ struct Target {
     register_sets: VecDeque<Vec<(usize, u64)>>,
     /// A resposta do `ps` (vazia = a resposta padrão).
     processes: String,
+    /// As extensões do depurador do OpenNT (`start_opennt`).
+    opennt: bool,
+    /// O filtro de carga pedido pelo cliente (minúsculas; `*` = qualquer).
+    load_filter: Vec<String>,
+}
+
+/// O quadro de um pacote com conteúdo binário.
+fn frame_bytes(payload: &[u8]) -> Vec<u8> {
+    let mut frame = vec![b'$'];
+    frame.extend_from_slice(payload);
+    frame.extend_from_slice(format!("#{:02x}", checksum(payload)).as_bytes());
+    frame
 }
 
 /// Os registros do fluxo do alvo de mentira: uma chamada ao IoCreateDevice
@@ -151,6 +169,46 @@ impl Target {
         reply
     }
 
+    /// Os 24 registradores gerais como na resposta de parada do OpenNT, e a
+    /// impressão digital da lista de módulos (muda a cada módulo novo).
+    fn opennt_stop_fields(&self) -> String {
+        let mut fields = String::new();
+        for (index, value) in self.registers.iter().enumerate() {
+            let size = if index <= 16 { 8 } else { 4 };
+            fields.push_str(&format!("{index:02x}:{};", hex(&value.to_le_bytes()[..size])));
+        }
+        fields.push_str(&format!("modgen:{:x};", self.modules.len() + 1));
+        fields
+    }
+
+    /// Uma imagem passa pelo filtro de carga (nome ou nome sem extensão).
+    fn load_filter_matches(&self, name: &str) -> bool {
+        let name = name.to_ascii_lowercase();
+        let stem = name.rsplit_once('.').map_or(name.as_str(), |(stem, _)| stem).to_string();
+        self.load_filter.iter().any(|wanted| wanted == "*" || *wanted == name || *wanted == stem)
+    }
+
+    /// `x endereço,tamanho`: `b` e os bytes escapados.
+    fn binary_read(&mut self, packet: &str) -> Vec<u8> {
+        self.log.lock().unwrap().push(packet.to_string());
+        let (address, length) = packet[1..].split_once(',').unwrap();
+        match self.read(u64::from_str_radix(address, 16).unwrap(), usize::from_str_radix(length, 16).unwrap()) {
+            Some(bytes) => {
+                let mut reply = vec![b'b'];
+                for byte in bytes {
+                    if matches!(byte, b'#' | b'$' | b'}' | b'*') {
+                        reply.push(b'}');
+                        reply.push(byte ^ 0x20);
+                    } else {
+                        reply.push(byte);
+                    }
+                }
+                reply
+            }
+            None => b"E14".to_vec(),
+        }
+    }
+
     fn monitor(&mut self, text: &str) -> String {
         let words: Vec<&str> = text.split_whitespace().collect();
         match words.as_slice() {
@@ -210,8 +268,13 @@ impl Target {
 
     fn answer(&mut self, packet: &str, stream: &mut TcpStream) -> Option<String> {
         self.log.lock().unwrap().push(packet.to_string());
-        let reply = if packet.starts_with("qSupported") {
+        let reply = if packet.starts_with("qSupported") && self.opennt {
+            "PacketSize=4000;swbreak+;hwbreak+;QStartNoAckMode+;vContSupported+;qXfer:libraries:read+;binary-upload+;QOpenNTLoadBreak+".to_string()
+        } else if packet.starts_with("qSupported") {
             "PacketSize=1000;swbreak+;hwbreak+;QStartNoAckMode+;ReverseStep+;ReverseContinue+".to_string()
+        } else if let Some(list) = packet.strip_prefix("QOpenNTLoadBreak:").filter(|_| self.opennt) {
+            self.load_filter = list.split(';').filter(|name| !name.is_empty()).map(str::to_ascii_lowercase).collect();
+            "OK".to_string()
         } else if packet == "QStartNoAckMode" || packet.starts_with('Z') || packet.starts_with('z') || packet.starts_with("Hg") || packet.starts_with('M') || packet.starts_with('P') {
             if let Some(rest) = packet.strip_prefix('P') {
                 let (number, value) = rest.split_once('=').unwrap();
@@ -233,6 +296,8 @@ impl Target {
                 }
             }
             "OK".to_string()
+        } else if packet == "?" && self.opennt {
+            format!("T02thread:1;{}", self.opennt_stop_fields())
         } else if packet == "?" {
             "T02thread:1;".to_string()
         } else if packet == "g" {
@@ -274,18 +339,31 @@ impl Target {
             }
             hex(&reply)
         } else if packet == "c" || packet == "s" || packet == "bs" || packet == "bc" {
-            let stop = self.stops.pop_front().expect("parada roteirizada");
-            self.registers[16] = stop.rip;
-            self.registers[7] = stop.rsp;
-            self.registers[0] = stop.rax;
-            for (index, value) in self.register_sets.pop_front().unwrap_or_default() {
-                self.registers[index] = value;
+            loop {
+                let stop = self.stops.pop_front().expect("parada roteirizada");
+                self.registers[16] = stop.rip;
+                self.registers[7] = stop.rsp;
+                self.registers[0] = stop.rax;
+                for (index, value) in self.register_sets.pop_front().unwrap_or_default() {
+                    self.registers[index] = value;
+                }
+                let mut loaded = None;
+                if let Some(name) = stop.load {
+                    let base = 0xfffff800_4300_0000u64 + self.modules.len() as u64 * 0x10000;
+                    self.modules.push(format!("{base:#x} {:#x}  {name}   \\SystemRoot\\System32\\drivers\\{name}\n", base + 0x10000));
+                    loaded = Some((name, base));
+                }
+                if !self.opennt {
+                    break stop.packet.to_string();
+                }
+                // O alvo do OpenNT: a carga só para com o filtro casando,
+                // como uma parada de biblioteca com os argumentos.
+                match loaded {
+                    Some((name, _)) if !self.load_filter_matches(name) => continue,
+                    Some((name, base)) => break format!("T05thread:1;library:;load:{base:x},10000,0,{};{}", hex(name.as_bytes()), self.opennt_stop_fields()),
+                    None => break format!("{}{}", stop.packet, self.opennt_stop_fields()),
+                }
             }
-            if let Some(name) = stop.load {
-                let base = 0xfffff800_4300_0000u64 + self.modules.len() as u64 * 0x10000;
-                self.modules.push(format!("{base:#x} {:#x}  {name}   \\SystemRoot\\System32\\drivers\\{name}\n", base + 0x10000));
-            }
-            stop.packet.to_string()
         } else if packet == "D" {
             "OK".to_string()
         } else {
@@ -297,18 +375,27 @@ impl Target {
 
 /// Sobe o alvo; devolve o endereço e o registro dos pacotes recebidos.
 pub fn start(stops: Vec<Stop>) -> (String, Arc<Mutex<Vec<String>>>) {
-    start_with(stops, Vec::new(), Vec::new(), "")
+    start_target(stops, Vec::new(), Vec::new(), "", false)
+}
+
+/// Sobe o alvo com as extensões do depurador do OpenNT.
+pub fn start_opennt(stops: Vec<Stop>) -> (String, Arc<Mutex<Vec<String>>>) {
+    start_target(stops, Vec::new(), Vec::new(), "", true)
 }
 
 /// Sobe o alvo com registradores por parada (`registers[n]` vale na
 /// parada `n`), memória a mais e a resposta do `ps`.
 pub fn start_with(stops: Vec<Stop>, registers: Vec<Vec<(usize, u64)>>, memory: Vec<(u64, Vec<u8>)>, processes: &str) -> (String, Arc<Mutex<Vec<String>>>) {
+    start_target(stops, registers, memory, processes, false)
+}
+
+fn start_target(stops: Vec<Stop>, registers: Vec<Vec<(usize, u64)>>, memory: Vec<(u64, Vec<u8>)>, processes: &str, opennt: bool) -> (String, Arc<Mutex<Vec<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap().to_string();
     let log = Arc::new(Mutex::new(Vec::new()));
     // Um driver que não existe nesta máquina (sem símbolos).
     let modules = vec!["0xfffff80042000000 0xfffff80042010000  alvo-falso.sys   \\SystemRoot\\System32\\drivers\\alvo-falso.sys\n".to_string()];
-    let mut target = Target { registers: [0; 24], memory, stops: stops.into(), log: Arc::clone(&log), modules, memory_breakpoints: Vec::new(), stream_enabled: false, register_sets: registers.into(), processes: processes.to_string() };
+    let mut target = Target { registers: [0; 24], memory, stops: stops.into(), log: Arc::clone(&log), modules, memory_breakpoints: Vec::new(), stream_enabled: false, register_sets: registers.into(), processes: processes.to_string(), opennt, load_filter: Vec::new() };
     // Pilha: o quadro corrente em STACK + 0x20 com dois chamadores.
     let mut stack = vec![0u8; 0x100];
     let mut put = |offset: usize, value: u64| stack[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
@@ -343,6 +430,11 @@ pub fn start_with(stops: Vec<Stop>, registers: Vec<Vec<(usize, u64)>>, memory: V
                 let Frame::Packet(packet) = frame else { continue };
                 if !no_ack {
                     stream.write_all(b"+").unwrap();
+                }
+                if target.opennt && packet.starts_with('x') {
+                    let reply = target.binary_read(&packet);
+                    stream.write_all(&frame_bytes(&reply)).unwrap();
+                    continue;
                 }
                 if let Some(reply) = target.answer(&packet, &mut stream) {
                     stream.write_all(&encode(&reply)).unwrap();

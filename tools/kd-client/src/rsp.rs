@@ -4,7 +4,9 @@
 //! Pacotes `$dados#cs`; confirmação `+`/`-` até o modo sem confirmação
 //! (`QStartNoAckMode`); `O` com texto em hexadecimal é saída do alvo
 //! (DbgPrint e respostas do `monitor`), entregue a quem pediu; 0x03 avulso
-//! pede a parada.
+//! pede a parada. As respostas chegam com a compressão `X*n` desfeita; a
+//! do `x` (leitura binária) é pedida por `request_bytes`, que devolve os
+//! bytes crus para o `unescape_binary`.
 //!
 //! O enquadramento (`encode`, `Decoder`) não depende do socket: os testes
 //! o exercitam com bytes prontos.
@@ -61,12 +63,38 @@ pub fn expand_run_length(payload: &[u8]) -> Vec<u8> {
     output
 }
 
+/// Desfaz o escape dos dados binários do protocolo (`}` seguido do byte
+/// XOR 0x20), a resposta do `x` depois do `b`.
+pub fn unescape_binary(data: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(data.len());
+    let mut bytes = data.iter();
+    while let Some(&byte) = bytes.next() {
+        if byte == b'}' {
+            if let Some(&escaped) = bytes.next() {
+                output.push(escaped ^ 0x20);
+            }
+        } else {
+            output.push(byte);
+        }
+    }
+    output
+}
+
 /// Um pacote completo recebido.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Frame {
     /// Conteúdo já sem a compressão.
     Packet(String),
     /// Soma de verificação errada (o lado com confirmação manda `-`).
+    Corrupt,
+}
+
+/// Um pacote completo com os bytes crus (os dados binários do `x` não são
+/// texto).
+#[derive(Debug, PartialEq, Eq)]
+pub enum RawFrame {
+    /// Conteúdo já sem a compressão.
+    Packet(Vec<u8>),
     Corrupt,
 }
 
@@ -100,9 +128,18 @@ impl Decoder {
         None
     }
 
+    /// O próximo pacote completo como texto (os bytes que não são UTF-8
+    /// viram U+FFFD).
+    pub fn next_frame(&mut self) -> Option<Frame> {
+        Some(match self.next_raw_frame()? {
+            RawFrame::Packet(bytes) => Frame::Packet(String::from_utf8_lossy(&bytes).into_owned()),
+            RawFrame::Corrupt => Frame::Corrupt,
+        })
+    }
+
     /// O próximo pacote completo. Um pacote só sai do buffer inteiro: bytes
     /// de um pacote pela metade ficam para a próxima leitura.
-    pub fn next_frame(&mut self) -> Option<Frame> {
+    pub fn next_raw_frame(&mut self) -> Option<RawFrame> {
         match self.buffer.iter().position(|&byte| byte == b'$') {
             Some(start) => {
                 self.buffer.drain(..start);
@@ -122,9 +159,9 @@ impl Decoder {
         let payload = &packet[begin + 1..hash];
         let expected = std::str::from_utf8(&packet[hash + 1..hash + 3]).ok().and_then(|text| u8::from_str_radix(text, 16).ok());
         if expected == Some(checksum(payload)) {
-            Some(Frame::Packet(String::from_utf8_lossy(&expand_run_length(payload)).into_owned()))
+            Some(RawFrame::Packet(expand_run_length(payload)))
         } else {
-            Some(Frame::Corrupt)
+            Some(RawFrame::Corrupt)
         }
     }
 }
@@ -215,17 +252,17 @@ impl Connection {
         Err(format!("o alvo nao confirmou o pacote {payload:?}"))
     }
 
-    /// Recebe o próximo pacote (confirmando-o).
-    fn receive_raw(&mut self, deadline: Instant) -> Result<String, String> {
+    /// Recebe o próximo pacote (confirmando-o), com os bytes crus.
+    fn receive_raw(&mut self, deadline: Instant) -> Result<Vec<u8>, String> {
         loop {
-            match self.decoder.next_frame() {
-                Some(Frame::Packet(packet)) => {
+            match self.decoder.next_raw_frame() {
+                Some(RawFrame::Packet(packet)) => {
                     if !self.no_ack {
                         self.write(b"+")?;
                     }
                     return Ok(packet);
                 }
-                Some(Frame::Corrupt) => {
+                Some(RawFrame::Corrupt) => {
                     if !self.no_ack {
                         self.write(b"-")?;
                     }
@@ -235,21 +272,31 @@ impl Connection {
         }
     }
 
-    /// Próximo pacote que não é saída `O` (a saída acumula no console; os
-    /// registros do fluxo ficam à parte).
-    pub fn receive(&mut self, timeout: Duration) -> Result<String, String> {
+    /// Próximo pacote que não é saída `O`, com os bytes crus (a saída
+    /// acumula no console; os registros do fluxo ficam à parte).
+    pub fn receive_bytes(&mut self, timeout: Duration) -> Result<Vec<u8>, String> {
         let deadline = Instant::now() + timeout;
         loop {
             let packet = self.receive_raw(deadline)?;
-            if let Some(bytes) = stream_bytes(&packet) {
-                self.records.push(bytes);
-                continue;
+            if packet.first() == Some(&b'O') {
+                // O `O` é sempre texto em hexadecimal.
+                let text = String::from_utf8_lossy(&packet);
+                if let Some(bytes) = stream_bytes(&text) {
+                    self.records.push(bytes);
+                    continue;
+                }
+                if let Some(text) = console_text(&text) {
+                    self.console.push_str(&text);
+                    continue;
+                }
             }
-            match console_text(&packet) {
-                Some(text) => self.console.push_str(&text),
-                None => return Ok(packet),
-            }
+            return Ok(packet);
         }
+    }
+
+    /// Próximo pacote que não é saída `O`, como texto.
+    pub fn receive(&mut self, timeout: Duration) -> Result<String, String> {
+        self.receive_bytes(timeout).map(|packet| String::from_utf8_lossy(&packet).into_owned())
     }
 
     /// Consome os `O` do fluxo de registros recebidos.
@@ -261,6 +308,12 @@ impl Connection {
     pub fn request(&mut self, payload: &str, timeout: Duration) -> Result<String, String> {
         self.send(payload, timeout)?;
         self.receive(timeout)
+    }
+
+    /// Pacote e resposta com os bytes crus (a leitura binária `x`).
+    pub fn request_bytes(&mut self, payload: &str, timeout: Duration) -> Result<Vec<u8>, String> {
+        self.send(payload, timeout)?;
+        self.receive_bytes(timeout)
     }
 
     pub fn set_no_ack(&mut self) {
@@ -358,5 +411,27 @@ mod tests {
         assert_eq!(hex(&[0, 0xab, 0x7f]), "00ab7f");
         assert_eq!(unhex("00ab7f"), vec![0, 0xab, 0x7f]);
         assert_eq!(unhex("xx01"), vec![0, 1]);
+    }
+
+    /// A resposta do `x`: bytes acima de 0x7F intactos, o escape desfeito
+    /// depois da compressão (16 zeros como `\0*,`: 15 cópias além do
+    /// primeiro, 15 + 29 = `,`).
+    #[test]
+    fn binary_reply_keeps_raw_bytes() {
+        // Dados: FF 80 '#' '}' 16 zeros '*'.
+        let payload = [b'b', 0xFF, 0x80, b'}', b'#' ^ 0x20, b'}', b'}' ^ 0x20, 0x00, b'*', 15 + 29, b'}', b'*' ^ 0x20];
+        let mut decoder = Decoder::default();
+        decoder.push(&encode_raw(&payload));
+        let Some(RawFrame::Packet(bytes)) = decoder.next_raw_frame() else { panic!("pacote binario") };
+        assert_eq!(bytes[0], b'b');
+        let data = unescape_binary(&bytes[1..]);
+        let mut expected = vec![0xFF, 0x80, b'#', b'}'];
+        expected.extend(std::iter::repeat_n(0u8, 16));
+        expected.push(b'*');
+        assert_eq!(data, expected);
+        // O mesmo pacote como texto perde os bytes que não são UTF-8.
+        decoder.push(&encode_raw(&payload));
+        let Some(Frame::Packet(text)) = decoder.next_frame() else { panic!("pacote") };
+        assert!(text.contains('\u{FFFD}'));
     }
 }

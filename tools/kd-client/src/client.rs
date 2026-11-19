@@ -16,7 +16,7 @@ use super::monitor::{self, LoadedModule, Process, Processor, Thread, ThreadConte
 use super::pdb::{Fetch, PdbId, SymbolStore};
 use super::pe::{parse_guid_text, PeImage};
 use super::registers::{self, Value};
-use super::rsp::{hex, is_timeout, unhex, Connection};
+use super::rsp::{hex, is_timeout, unescape_binary, unhex, Connection};
 use super::stop::{Reason, StopReply};
 use super::symbols::Symbols;
 use super::trace::Trace;
@@ -41,6 +41,38 @@ const IMAGE_EVENT: &str = "opennt_kd_image_event";
 
 /// CS do anel 3: a parada foi numa thread de usuário.
 const USER_CODE_SELECTOR: u64 = 0x33;
+
+/// O pacote de um alvo que não anuncia `PacketSize`.
+const DEFAULT_PACKET_SIZE: usize = 0x1000;
+
+/// Os 24 registradores gerais adiantados na resposta de parada, na ordem
+/// do `g` (todos ou nenhum): dispensam o `g` da parada.
+fn expedited_general(stop: &StopReply) -> Option<String> {
+    let mut general = String::new();
+    for layout in registers::GENERAL {
+        let digits = stop.register(layout.number)?;
+        if digits.len() != layout.size * 2 {
+            return None;
+        }
+        general.push_str(digits);
+    }
+    Some(general)
+}
+
+/// Um nome pedido (com ou sem a extensão, sem diferença de caixa) é o
+/// arquivo carregado.
+fn module_matches(wanted: &str, file: &str) -> bool {
+    let (wanted, file) = (wanted.to_ascii_lowercase(), file.to_ascii_lowercase());
+    file == wanted || file.rsplit_once('.').is_some_and(|(stem, _)| stem == wanted)
+}
+
+/// O módulo de uma expressão `módulo!símbolo` (o nome logo antes do `!`).
+fn pending_module(expression: &str) -> Option<String> {
+    let (head, _) = expression.split_once('!')?;
+    let mut module: Vec<char> = head.chars().rev().take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')).collect();
+    module.reverse();
+    (!module.is_empty()).then(|| module.into_iter().collect())
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BreakpointKind {
@@ -270,6 +302,22 @@ pub struct Client {
     run_to: Option<RunTo>,
     /// O pacote `g` da parada corrente, do processador escolhido.
     registers: Option<String>,
+    /// Os 24 registradores gerais adiantados na resposta de parada (o
+    /// começo do `g`), do dono da parada: valem até um `Hg`, uma gravação ou
+    /// a máquina seguir.
+    expedited: Option<String>,
+    /// A impressão digital da lista de módulos do alvo na última releitura
+    /// (`modgen:` da resposta de parada): igual, o `lm` não vai.
+    module_generation: Option<u64>,
+    /// O maior pacote do alvo (`PacketSize` do qSupported).
+    packet_size: usize,
+    /// O alvo lê memória em binário (`x`, `binary-upload+`).
+    binary_upload: bool,
+    /// O alvo filtra as cargas de imagem (`QOpenNTLoadBreak+`): sem o
+    /// breakpoint em toda notificação de carga.
+    load_filter_supported: bool,
+    /// O filtro que está no alvo (`None` = desconhecido, manda de novo).
+    load_filter: Option<Vec<String>>,
     /// Thread do protocolo escolhida por `Hg` (`None` = o dono da parada).
     selected: Option<u64>,
     /// Os tipos do PDB do ntoskrnl (carregados na primeira vista tipada).
@@ -416,6 +464,12 @@ impl Client {
             next_breakpoint: 0,
             run_to: None,
             registers: None,
+            expedited: None,
+            module_generation: None,
+            packet_size: DEFAULT_PACKET_SIZE,
+            binary_upload: false,
+            load_filter_supported: false,
+            load_filter: None,
             selected: None,
             types: None,
             types_note: String::new(),
@@ -515,17 +569,32 @@ impl Client {
         self.stopped = true;
         self.registers = None;
         self.stops += 1;
+        // Os registradores adiantados da resposta dispensam o `g` (CS e RIP
+        // abaixo, as condições dos breakpoints).
+        self.expedited = expedited_general(&stop);
         // Uma parada nova é do dono dela: as leituras voltam para ele.
         if self.selected.take().is_some() {
             let _ = self.request("Hg0");
         }
         // Parada numa thread de usuário: o processo dela passa a ser o das
         // leituras; senão o escolhido antes volta (o alvo o esquece a cada
-        // continuação).
+        // continuação). O alvo novo manda o processo corrente na resposta:
+        // sendo o mesmo do contexto, só a escolha volta (sem o `.process` de
+        // consulta nem o `ps` do `set_process`).
         if self.register("cs").ok() == Some(USER_CODE_SELECTOR) {
-            if let Ok(text) = self.monitor(".process") {
-                if let Some((eprocess, _)) = user::parse_current_process(&text) {
+            match stop.process {
+                Some(eprocess) if self.process_context.as_ref().is_some_and(|context| context.eprocess == eprocess) => {
+                    let _ = self.monitor(&format!(".process {eprocess:#x}"));
+                }
+                Some(eprocess) => {
                     let _ = self.set_process(Some(&format!("{eprocess:#x}")));
+                }
+                None => {
+                    if let Ok(text) = self.monitor(".process") {
+                        if let Some((eprocess, _)) = user::parse_current_process(&text) {
+                            let _ = self.set_process(Some(&format!("{eprocess:#x}")));
+                        }
+                    }
                 }
             }
         } else if let Some(context) = self.process_context.clone() {
@@ -544,13 +613,17 @@ impl Client {
         }
         self.pending_commands = None;
         // Módulos carregados desde a última parada entram nos símbolos (a
-        // primeira parada, a do attach, ainda não tem o ELF carregado). Um
-        // breakpoint de retorno rápido não espera essa releitura, nem um
-        // ponto de evento (a carga de uma imagem traz o que precisa nos
-        // registradores; a lista de drivers muda na notificação de carga).
+        // primeira parada, a do attach, ainda não tem o ELF carregado), só
+        // quando a impressão digital da lista mudou. Um breakpoint de
+        // retorno rápido não espera essa releitura, nem um ponto de evento
+        // (a carga de uma imagem traz o que precisa nos registradores; a
+        // lista de drivers muda na notificação de carga).
         let fast = stop.reasons.contains(&Reason::SoftwareBreak) && self.register("rip").is_ok_and(|rip| self.fast_resume_at(rip) || self.event_hooks.iter().any(|(hook, _, _)| *hook == rip));
-        if !self.symbols.modules.is_empty() && !fast {
-            let _ = self.reload_modules();
+        if !self.symbols.modules.is_empty() && !fast && self.refresh_modules(stop.module_generation) && self.breakpoints.iter().any(|breakpoint| breakpoint.enabled && breakpoint.pending) {
+            // Módulos novos (ou PDBs que chegaram): os adiados que já
+            // resolvem são armados aqui mesmo.
+            self.resolve_pending();
+            let _ = self.update_load_hook();
         }
         let mut note = String::new();
         if !self.tracing {
@@ -568,7 +641,7 @@ impl Client {
                 note.push_str(" (breakpoint de uma vez so removido)");
             }
         }
-        self.last_stop = format!("{}{note} [{}]", self.describe_stop(&stop), packet);
+        self.last_stop = format!("{}{note} [{}]", self.describe_stop(&stop), stop.brief());
         self.stop = Some(stop);
         Ok(Some(self.last_stop.clone()))
     }
@@ -592,6 +665,10 @@ impl Client {
 
     /// Uma parada num breakpoint: contagem, condição, carga de módulo.
     fn check_hit(&mut self, stop: &StopReply) -> Hit {
+        if let Some((base, _, pid, name)) = stop.library() {
+            let name = name.to_string();
+            return self.check_load(base, pid, &name);
+        }
         let Ok(rip) = self.register("rip") else { return Hit::None };
         let software = stop.reasons.contains(&Reason::SoftwareBreak);
         if software {
@@ -615,13 +692,9 @@ impl Client {
         if software && self.hook_at(rip) {
             let fresh = self.new_modules();
             self.resolve_pending();
-            let matches = |wanted: &str, file: &str| {
-                let (wanted, file) = (wanted.to_ascii_lowercase(), file.to_ascii_lowercase());
-                file == wanted || file.rsplit_once('.').is_some_and(|(stem, _)| stem == wanted)
-            };
             let mut loaded = Vec::new();
             for breakpoint in self.breakpoints.iter_mut().filter(|breakpoint| breakpoint.enabled && breakpoint.kind == BreakpointKind::Module) {
-                if let Some(file) = fresh.iter().find(|file| matches(&breakpoint.expression, file)) {
+                if let Some(file) = fresh.iter().find(|file| module_matches(&breakpoint.expression, file)) {
                     breakpoint.hits += 1;
                     loaded.push((breakpoint.id, file.clone()));
                 }
@@ -728,6 +801,114 @@ impl Client {
             self.single_shot = Some(breakpoint.id);
         }
         Hit::Stop(text)
+    }
+
+    /// Uma carga de imagem que o filtro do alvo deixou parar (`library:`):
+    /// a lista de módulos já foi relida pela impressão digital da parada;
+    /// uma DLL de usuário que interessa traz os módulos do processo dela; os
+    /// adiados que já resolvem são armados e o filtro encolhe. A máquina só
+    /// fica parada se uma parada por carga de módulo ou um evento `ld:`
+    /// pedir. Os argumentos do evento (RDI..R8) vêm nos registradores
+    /// adiantados, então o evento `ld:` não custa o `g`.
+    fn check_load(&mut self, base: u64, pid: u64, name: &str) -> Hit {
+        if pid != 0 && self.load_needs_modules(name) {
+            self.refresh_process_modules(pid);
+        }
+        let fresh = self.new_modules();
+        // Os adiados de usuário armam na imagem nova, no processo dela
+        // (`breakpoints.rs`, pelos argumentos do evento nos registradores);
+        // os de sistema, pela avaliação de sempre.
+        self.on_image_event();
+        self.resolve_pending();
+        let candidates = if name.is_empty() { fresh } else { vec![name.to_string()] };
+        let mut loaded = Vec::new();
+        for breakpoint in self.breakpoints.iter_mut().filter(|breakpoint| breakpoint.enabled && breakpoint.kind == BreakpointKind::Module) {
+            if let Some(file) = candidates.iter().find(|file| module_matches(&breakpoint.expression, file)) {
+                breakpoint.hits += 1;
+                loaded.push((breakpoint.id, file.clone()));
+            }
+        }
+        let image_events = self.breakpoints.iter().any(|breakpoint| breakpoint.enabled && breakpoint.kind == BreakpointKind::Event && breakpoint.expression.to_ascii_lowercase().starts_with("ld"));
+        let event = if image_events { self.check_event(IMAGE_EVENT) } else { None };
+        let _ = self.update_load_hook();
+        if let Some((id, file)) = loaded.first() {
+            let base = if base != 0 { base } else { self.symbols.module_named(file).map(|module| module.base).unwrap_or(0) };
+            return Hit::Stop(format!(" (modulo carregado: {file} em {base:#x}, breakpoint #{id})"));
+        }
+        match event {
+            Some(text) => Hit::Stop(text),
+            None => Hit::Continue,
+        }
+    }
+
+    /// Uma parada por carga ou um adiado espera o arquivo `file` pelo nome
+    /// (ou é um adiado sem módulo): os módulos de usuário do processo da
+    /// carga precisam entrar nos símbolos. Um `*` do filtro que só tenta de
+    /// novo um adiado de módulo já conhecido não relê nada (a PEB.Ldr custa
+    /// três leituras por módulo).
+    fn load_needs_modules(&self, file: &str) -> bool {
+        self.breakpoints.iter().filter(|breakpoint| breakpoint.enabled).any(|breakpoint| match breakpoint.kind {
+            BreakpointKind::Module => module_matches(&breakpoint.expression, file),
+            _ if breakpoint.pending => pending_module(&breakpoint.expression).is_none_or(|module| module_matches(&module, file)),
+            _ => false,
+        })
+    }
+
+    /// Os módulos de usuário do processo `pid` entram nos símbolos (a carga
+    /// de uma DLL que um adiado ou uma parada por módulo espera): o processo
+    /// passa a ser o das leituras, como no evento `ld:`. O mesmo processo
+    /// do contexto relê só os módulos (o `set_process` não releria).
+    fn refresh_process_modules(&mut self, pid: u64) {
+        if self.process_context.as_ref().is_some_and(|context| context.pid == pid) {
+            let _ = self.reload_user_modules();
+        } else {
+            let _ = self.set_process(Some(&pid.to_string()));
+        }
+    }
+
+    /// Os nomes de imagem que o filtro de carga do alvo deve deixar parar:
+    /// as paradas por carga de módulo, os módulos dos breakpoints adiados e
+    /// as DLLs dos eventos `ld:`. `*` (qualquer imagem) para um adiado sem
+    /// módulo, um `ld:` sem DLL ou um adiado cujo módulo já está nos
+    /// símbolos mas espera um PDB que está chegando ou uma página da imagem
+    /// ainda fora da memória (o endereço já resolvido e a gravação falhou):
+    /// tenta de novo na próxima carga, como antes.
+    fn load_filter_names(&self) -> Vec<String> {
+        let downloading = self.symbols.pending();
+        let mut names: Vec<String> = Vec::new();
+        for breakpoint in self.breakpoints.iter().filter(|breakpoint| breakpoint.enabled) {
+            let name = match breakpoint.kind {
+                BreakpointKind::Module => Some(breakpoint.expression.trim().to_ascii_lowercase()),
+                BreakpointKind::Event => {
+                    let expression = breakpoint.expression.trim().to_ascii_lowercase();
+                    expression.strip_prefix("ld").map(|rest| {
+                        let wanted = rest.trim_start_matches(':');
+                        let dll = wanted.split_once('!').map_or(wanted, |(_, dll)| dll).trim();
+                        if dll.is_empty() || dll == "*" {
+                            "*".to_string()
+                        } else {
+                            dll.to_string()
+                        }
+                    })
+                }
+                _ if breakpoint.pending => Some(match pending_module(&breakpoint.expression) {
+                    Some(module) if self.symbols.module_named(&module).is_some() && (downloading || breakpoint.address != 0) => "*".to_string(),
+                    Some(module) => module.to_ascii_lowercase(),
+                    None => "*".to_string(),
+                }),
+                _ => None,
+            };
+            if let Some(name) = name.filter(|name| !name.is_empty()) {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+        }
+        if names.iter().any(|name| name == "*") {
+            return vec!["*".to_string()];
+        }
+        names.sort();
+        names
     }
 
     /// Os comandos de um acerto que não para: rodam aqui mesmo (os que
@@ -873,6 +1054,7 @@ impl Client {
         let supported = self.connection.request("qSupported:swbreak+;hwbreak+;vContSupported+", timeout)?;
         self.collect_console();
         self.note_replay_features(&supported);
+        self.note_target_features(&supported);
         if supported.contains("QStartNoAckMode+") && self.request("QStartNoAckMode")? == "OK" {
             self.connection.set_no_ack();
         }
@@ -885,9 +1067,35 @@ impl Client {
         }
         let description = self.on_stop(stop)?.unwrap_or_default();
         output.push_str(&description);
-        self.reload_modules()?;
+        // A parada do attach já releu a lista se o alvo manda a impressão
+        // digital e o ELF carregou.
+        if self.module_generation.is_none() {
+            self.reload_modules()?;
+            self.module_generation = self.stop.as_ref().and_then(|stop| stop.module_generation);
+        }
         self.new_modules();
+        // Um filtro de carga deixado por uma sessão que caiu sem `D` sai.
+        if self.load_filter_supported {
+            let _ = self.update_load_hook();
+        }
         Ok(output)
+    }
+
+    /// O que o alvo anuncia no qSupported além do modo sem confirmação: o
+    /// tamanho do pacote, a leitura binária e o filtro de carga.
+    fn note_target_features(&mut self, supported: &str) {
+        for feature in supported.split(';') {
+            if let Some(size) = feature.strip_prefix("PacketSize=") {
+                if let Ok(size) = usize::from_str_radix(size, 16) {
+                    self.packet_size = size;
+                }
+            }
+            match feature {
+                "binary-upload+" => self.binary_upload = true,
+                "QOpenNTLoadBreak+" => self.load_filter_supported = true,
+                _ => {}
+            }
+        }
     }
 
     /// Depois de um `loadvm`: a memória e a sessão do alvo voltaram ao
@@ -895,13 +1103,41 @@ impl Client {
     /// ligados da sessão voltam a ser gravados (o alvo ignora os repetidos).
     pub(crate) fn resync_after_restore(&mut self) -> Result<(), String> {
         self.stopped = true;
-        self.registers = None;
+        self.forget_registers();
         let stop = self.request("?")?;
         let addresses: Vec<u64> = self.breakpoints.iter().filter(|breakpoint| breakpoint.enabled && breakpoint.kind == BreakpointKind::Software && !breakpoint.pending && breakpoint.process == 0).map(|breakpoint| breakpoint.address).collect();
         for address in addresses {
             let _ = self.request(&format!("Z0,{address:x},1"));
         }
+        // O filtro de carga do alvo voltou ao do snapshot: vai de novo.
+        self.load_filter = None;
+        if self.load_filter_supported {
+            let _ = self.update_load_hook();
+        }
         self.on_stop(stop).map(|_| ())
+    }
+
+    /// A releitura da lista de módulos numa parada: só quando a impressão
+    /// digital `generation` da resposta mudou desde a última (ou o alvo não
+    /// a manda) ou quando PDBs que estavam chegando terminaram (os módulos
+    /// com PDB pendente são recarregados, os de usuário também). Antes, cada
+    /// parada (passo, breakpoint, carga de módulo) custava um `monitor lm`:
+    /// cerca de 100 bytes de texto por módulo, o dobro em hexadecimal (com
+    /// 150 módulos, 29 KB pela serial). Devolve se releu.
+    fn refresh_modules(&mut self, generation: Option<u64>) -> bool {
+        let idle = !self.symbols.store.as_ref().is_some_and(|store| store.busy());
+        let kernel_pending = idle && self.symbols.modules.iter().any(|module| !module.user && module.pdb_pending);
+        let user_pending = idle && self.process_context.is_some() && self.symbols.user_modules().any(|module| module.pdb_pending);
+        let changed = generation.is_none() || generation != self.module_generation;
+        let mut refreshed = false;
+        if (changed || kernel_pending) && self.reload_modules().is_ok() {
+            self.module_generation = generation;
+            refreshed = true;
+        }
+        if user_pending && self.reload_user_modules().is_ok() {
+            refreshed = true;
+        }
+        refreshed
     }
 
     /// Lê a lista de módulos do alvo e os símbolos de cada um (o cabeçalho
@@ -1022,17 +1258,34 @@ impl Client {
         monitor::thread_context(&text).ok_or_else(|| format!("contexto de {thread:#x}: {}", text.trim()))
     }
 
-    /// Os registradores gerais do processador escolhido.
+    /// Os registradores gerais do processador escolhido (os adiados da
+    /// resposta de parada, quando vieram; senão o `g`).
     pub fn general_registers(&mut self) -> Result<Vec<Value>, String> {
         self.require_stopped()?;
         if self.registers.is_none() {
-            let reply = self.request("g")?;
-            if reply.starts_with('E') {
-                return Err(format!("registradores: {reply}"));
+            if let Some(general) = &self.expedited {
+                return registers::parse_general(general);
             }
-            self.registers = Some(reply);
+            self.fetch_registers()?;
         }
         registers::parse_general(self.registers.as_deref().unwrap_or(""))
+    }
+
+    /// O pacote `g` inteiro (com x87 e SSE) da parada.
+    fn fetch_registers(&mut self) -> Result<(), String> {
+        let reply = self.request("g")?;
+        if reply.starts_with('E') {
+            return Err(format!("registradores: {reply}"));
+        }
+        self.registers = Some(reply);
+        Ok(())
+    }
+
+    /// Os registradores lidos na parada deixam de valer (gravação, outro
+    /// processador, a máquina seguiu).
+    fn forget_registers(&mut self) {
+        self.registers = None;
+        self.expedited = None;
     }
 
     /// Um registrador pelo nome (os gerais pelo `g`, FS_BASE e GS_BASE pelo
@@ -1054,7 +1307,11 @@ impl Client {
     /// do processador escolhido (os do `g` e as extensões do OpenNT por
     /// `p`; o que o alvo não tem fica `None`).
     pub fn extended_registers(&mut self) -> Result<registers::ExtendedState, String> {
-        self.general_registers()?;
+        self.require_stopped()?;
+        // Os adiantados não têm x87 nem SSE: o `g` inteiro.
+        if self.registers.is_none() {
+            self.fetch_registers()?;
+        }
         let mut state = registers::parse_extended(self.registers.as_deref().unwrap_or(""));
         let read = |client: &mut Client, number: usize| -> Option<Vec<u8>> {
             let reply = client.request(&format!("p{number:x}")).ok()?;
@@ -1082,7 +1339,7 @@ impl Client {
     pub fn write_register_bytes(&mut self, number: usize, bytes: &[u8]) -> Result<(), String> {
         self.require_stopped()?;
         let reply = self.request(&format!("P{number:x}={}", hex(bytes)))?;
-        self.registers = None;
+        self.forget_registers();
         if reply == "OK" {
             Ok(())
         } else {
@@ -1095,7 +1352,7 @@ impl Client {
         self.require_stopped()?;
         let layout = registers::find(name).ok_or_else(|| format!("registrador desconhecido: {name}"))?;
         let reply = self.request(&registers::write_packet(layout, value))?;
-        self.registers = None;
+        self.forget_registers();
         if reply == "OK" {
             Ok(())
         } else {
@@ -1103,19 +1360,51 @@ impl Client {
         }
     }
 
+    /// Bytes por leitura de memória: o que cabe no pacote do alvo (o `m`
+    /// manda dois dígitos por byte; o `x` cabe mesmo com todo byte escapado).
+    /// Com o alvo de 16 KB, 0x1FF0 bytes por ida e volta (antes, 0x400).
+    fn read_chunk(&self) -> usize {
+        (self.packet_size / 2).saturating_sub(16).clamp(0x100, 0x8000)
+    }
+
+    /// Pacote e resposta com os bytes crus (a leitura binária).
+    pub(crate) fn request_bytes(&mut self, payload: &str) -> Result<Vec<u8>, String> {
+        let reply = self.connection.request_bytes(payload, self.timeout);
+        self.collect_console();
+        reply
+    }
+
+    /// Um pedaço de memória: `x` em binário num alvo com `binary-upload`
+    /// (metade dos bytes do `m` pela serial), senão `m` em hexadecimal. O
+    /// erro de fora é o do transporte; o de dentro, a resposta do alvo.
+    fn read_memory_chunk(&mut self, address: u64, length: usize) -> Result<Result<Vec<u8>, String>, String> {
+        if self.binary_upload {
+            let reply = self.request_bytes(&format!("x{address:x},{length:x}"))?;
+            return Ok(match reply.split_first() {
+                Some((b'b', data)) => Ok(unescape_binary(data)),
+                _ => Err(String::from_utf8_lossy(&reply).into_owned()),
+            });
+        }
+        let reply = self.request(&format!("m{address:x},{length:x}"))?;
+        Ok(if reply.starts_with('E') || reply.is_empty() { Err(reply) } else { Ok(unhex(&reply)) })
+    }
+
     pub fn read_memory(&mut self, address: u64, length: usize) -> Result<Vec<u8>, String> {
         self.require_stopped()?;
+        let step = self.read_chunk();
         let mut bytes = Vec::with_capacity(length);
         while bytes.len() < length {
-            let chunk = (length - bytes.len()).min(0x400);
-            let reply = self.request(&format!("m{:x},{:x}", address + bytes.len() as u64, chunk))?;
-            if reply.starts_with('E') || reply.is_empty() {
-                if bytes.is_empty() {
-                    return Err(format!("memoria em {address:#x} inacessivel ({reply})"));
+            let chunk = (length - bytes.len()).min(step);
+            let data = match self.read_memory_chunk(address + bytes.len() as u64, chunk)? {
+                Ok(data) if !data.is_empty() => data,
+                result => {
+                    if bytes.is_empty() {
+                        let reply = result.err().unwrap_or_default();
+                        return Err(format!("memoria em {address:#x} inacessivel ({reply})"));
+                    }
+                    break;
                 }
-                break;
-            }
-            let data = unhex(&reply);
+            };
             let short = data.len() < chunk;
             bytes.extend_from_slice(&data);
             if short {
@@ -1274,7 +1563,7 @@ impl Client {
         self.require_stopped()?;
         self.connection.send(packet, self.timeout)?;
         self.stopped = false;
-        self.registers = None;
+        self.forget_registers();
         Ok(())
     }
 
@@ -1603,11 +1892,15 @@ impl Client {
                 continue;
             }
             let (address, length) = scoped::placement(breakpoint.kind, address, breakpoint.length);
-            if breakpoint.enabled && self.insert(breakpoint.kind, address, length, true).is_err() {
-                continue;
-            }
             self.breakpoints[index].address = address;
             self.breakpoints[index].length = length;
+            if breakpoint.enabled && self.insert(breakpoint.kind, address, length, true).is_err() {
+                // O endereço já se sabe e a gravação falhou (a página da
+                // imagem ainda não está na memória): fica adiado, e o filtro
+                // de carga deixa as cargas seguintes pararem para tentar de
+                // novo.
+                continue;
+            }
             self.breakpoints[index].pending = false;
             // O processo escolhido na criação não filtra um driver; um
             // `/p <pid>` filtra no acerto.
@@ -1620,8 +1913,25 @@ impl Client {
     /// Liga ou tira o breakpoint interno da notificação de carga de imagem,
     /// conforme haja paradas por carga de módulo ou breakpoints adiados que
     /// o ponto de evento de imagem não atende (sem ele, um kernel antigo,
-    /// todos os adiados).
+    /// todos os adiados). Com um alvo que filtra as cargas
+    /// (`QOpenNTLoadBreak+`) vai o filtro no lugar do breakpoint: só as
+    /// imagens pedidas param a máquina, com os argumentos do evento de
+    /// imagem. Com o breakpoint, toda carga de imagem (de sistema ou DLL em
+    /// qualquer processo) parava e custava três idas e voltas (`g`,
+    /// `monitor lm`, `c`) e o `lm` inteiro em hexadecimal.
     pub(crate) fn update_load_hook(&mut self) -> Result<(), String> {
+        if self.load_filter_supported {
+            let names = self.load_filter_names();
+            if self.load_filter.as_ref() != Some(&names) {
+                let reply = self.request(&format!("QOpenNTLoadBreak:{}", names.join(";")))?;
+                if reply != "OK" {
+                    self.load_filter = None;
+                    return Err(format!("filtro de carga no alvo: {reply:?}"));
+                }
+                self.load_filter = Some(names);
+            }
+            return Ok(());
+        }
         let image_hook = self.event_hooks.iter().any(|(_, symbol, _)| *symbol == IMAGE_EVENT);
         let needed = self.breakpoints.iter().any(|breakpoint| breakpoint.enabled && (breakpoint.kind == BreakpointKind::Module || (breakpoint.pending && !image_hook && !self.user_only_pending(breakpoint))));
         match (needed, self.load_hook) {
@@ -1742,10 +2052,16 @@ impl Client {
 
     /// Arma ou tira os breakpoints internos nos pontos de evento conforme os
     /// breakpoints de evento ligados, os adiados (a carga de imagem) e os
-    /// armados num processo (a saída dele).
+    /// armados num processo (a saída dele). Num alvo com o filtro de carga,
+    /// o evento `ld:` e os adiados vão pelo filtro (`update_load_hook`), e a
+    /// parada da carga traz os mesmos argumentos do ponto de evento.
     pub(crate) fn update_event_hooks(&mut self) -> Result<(), String> {
+        if self.load_filter_supported {
+            self.update_load_hook()?;
+        }
         let explicit: Vec<&'static str> = [PROCESS_EVENT, THREAD_EVENT, IMAGE_EVENT]
             .into_iter()
+            .filter(|symbol| !(*symbol == IMAGE_EVENT && self.load_filter_supported))
             .filter(|symbol| {
                 let codes: &[&str] = match *symbol {
                     PROCESS_EVENT => &["cpr", "epr"],
@@ -1756,6 +2072,7 @@ impl Client {
             })
             .collect();
         let (image, process) = self.internal_event_needs();
+        let image = image && !self.load_filter_supported;
         let mut wanted = explicit.clone();
         for (needed, symbol) in [(image, IMAGE_EVENT), (process, PROCESS_EVENT)] {
             if needed && !wanted.contains(&symbol) {
@@ -2074,7 +2391,8 @@ impl Client {
         if reply != "OK" {
             return Err(format!("thread {thread}: {reply}"));
         }
-        self.registers = None;
+        // Os adiantados são do dono da parada.
+        self.forget_registers();
         self.selected = Some(thread);
         Ok(())
     }
@@ -2100,11 +2418,15 @@ impl Client {
         }
         let reply = self.request("D")?;
         self.stopped = false;
+        self.forget_registers();
         self.breakpoints.clear();
         self.scopes.clear();
         self.image_cache.clear();
         self.process_names.clear();
         self.load_hook = None;
+        // O `D` esvazia o filtro de carga do alvo.
+        self.load_filter = Some(Vec::new());
+        self.module_generation = None;
         self.event_hooks.clear();
         self.process_context = None;
         Ok(format!("desligado ({reply})"))
@@ -2154,8 +2476,11 @@ impl Client {
     /// Lê bytes do buffer do rastro do alvo (`qOpenNTTrace:offset,tamanho`).
     pub(crate) fn trace_bytes(&mut self, offset: usize, length: usize) -> Result<Vec<u8>, String> {
         let mut bytes = Vec::with_capacity(length);
+        // Pedaços múltiplos de 64 que cabem no pacote do alvo (0x7C0 com o
+        // pacote de 4 KB, 0x1FC0 com o de 16 KB).
+        let step = self.read_chunk() & !0x3F;
         while bytes.len() < length {
-            let chunk = (length - bytes.len()).min(0x7C0);
+            let chunk = (length - bytes.len()).min(step);
             let reply = self.request(&format!("qOpenNTTrace:{:x},{:x}", offset + bytes.len(), chunk))?;
             if reply.starts_with('E') || reply.is_empty() {
                 return Err(format!("rastro: leitura em {:#x}: {reply}", offset + bytes.len()));

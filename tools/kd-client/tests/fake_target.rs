@@ -17,7 +17,7 @@ use kd_client::client::{BreakpointOptions, BreakpointRequest, Resumed};
 use kd_client::kd_script::ScriptOptions;
 use kd_client::symbols::Symbol;
 use kd_client::BreakpointKind;
-use support::fake_stub::{connect, connect_replay, kernel_module, start, start_with, Stop, CODE, STACK, USER_DATA};
+use support::fake_stub::{connect, connect_replay, kernel_module, start, start_opennt, start_with, Stop, CODE, STACK, USER_DATA};
 
 /// Os pacotes de breakpoint e de continuação mandados ao alvo.
 fn breakpoint_packets(log: &std::sync::Mutex<Vec<String>>) -> Vec<String> {
@@ -261,6 +261,61 @@ fn stops_when_a_module_loads() {
     assert_eq!(sent, vec!["Z0,fffff80040101000,1", "c", "c"]);
     let list = client.execute("bl").unwrap();
     assert!(list.contains("ld:novo") && list.contains("(adiado)"), "{list}");
+}
+
+/// Com as extensões do alvo do OpenNT: o filtro de carga no lugar do
+/// breakpoint na notificação (a carga de outro módulo nem chega ao
+/// cliente), nenhum `g` (os registradores vêm na resposta de parada), o
+/// `lm` só quando a impressão digital muda e a memória pelo `x` binário.
+#[test]
+fn opennt_target_filters_loads_without_g_or_lm() {
+    let stops = vec![
+        // A carga de outro módulo: o filtro do alvo não deixa parar.
+        Stop { rip: CODE + 0x1000, rsp: STACK, packet: "T05thread:1;swbreak:;", rax: 0, load: Some("outro.sys") },
+        Stop { rip: CODE + 0x1000, rsp: STACK, packet: "T05thread:1;swbreak:;", rax: 0, load: Some("novo.sys") },
+        // Um passo depois: a lista de módulos não mudou.
+        Stop::at(CODE + 4, "T05thread:1;"),
+    ];
+    let (address, log) = start_opennt(stops);
+    let mut client = connect(&address);
+    // `monitor lm` (o `qRcmd` com "lm" em hexadecimal).
+    fn lm_requests(log: &std::sync::Mutex<Vec<String>>) -> usize {
+        log.lock().unwrap().iter().filter(|packet| *packet == "qRcmd,6c6d").count()
+    }
+    // O attach leu a lista uma vez e esvaziou o filtro de uma sessão velha.
+    assert_eq!(lm_requests(&log), 1);
+    assert!(log.lock().unwrap().iter().any(|packet| packet == "QOpenNTLoadBreak:"));
+    let text = client.execute("sxe ld:novo").unwrap();
+    assert!(text.contains("para quando novo carregar"), "{text}");
+    let text = client.execute("bu novo!Entrada").unwrap();
+    assert!(text.contains("adiado"), "{text}");
+    client.go().unwrap();
+    let stop = client.wait_stop(Duration::from_secs(10)).unwrap();
+    assert!(stop.contains("modulo carregado: novo.sys"), "{stop}");
+    assert!(stop.contains("library novo.sys"), "{stop}");
+    assert!(client.symbols.module_named("novo").is_some());
+    // Os dois módulos novos: uma releitura nesta parada.
+    assert_eq!(lm_requests(&log), 2);
+    assert_eq!(client.register("rip").unwrap(), CODE + 0x1000);
+    // Um passo: a mesma impressão digital, sem `lm`; o RIP sem `g`.
+    client.step().unwrap();
+    assert_eq!(client.register("rip").unwrap(), CODE + 4);
+    assert_eq!(lm_requests(&log), 2);
+    // A memória em binário (os bytes acima de 0x7F intactos).
+    let code = client.read_memory(CODE, 10).unwrap();
+    assert_eq!(code, vec![0x48, 0x83, 0xEC, 0x20, 0xE8, 0, 0, 0, 0, 0x90]);
+    let sent = log.lock().unwrap().clone();
+    assert!(sent.iter().any(|packet| packet == "xfffff80040100000,a"), "{sent:?}");
+    assert!(!sent.iter().any(|packet| packet.starts_with('m')), "{sent:?}");
+    assert!(!sent.iter().any(|packet| packet == "g"), "{sent:?}");
+    // Nenhum breakpoint na notificação de carga; o filtro foi uma vez.
+    assert!(!sent.iter().any(|packet| packet.starts_with("Z0")), "{sent:?}");
+    assert_eq!(sent.iter().filter(|packet| packet.starts_with("QOpenNTLoadBreak:novo")).count(), 1, "{sent:?}");
+    assert_eq!(sent.iter().filter(|packet| *packet == "c").count(), 1);
+    // O registrador gravado volta pelo `g`.
+    client.write_register("rax", 0x55).unwrap();
+    assert_eq!(client.register("rax").unwrap(), 0x55);
+    assert!(log.lock().unwrap().iter().any(|packet| packet == "g"));
 }
 
 #[test]
