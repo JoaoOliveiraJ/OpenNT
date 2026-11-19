@@ -91,7 +91,8 @@ bp <expr> [N] [/w \"cond\"] | bu <expr> | bc <expr|#n|all> | bd/be <n> | bl | hb
 bp/bu/ba ... /p <pid|eprocess|nome.exe|*> (por processo) /max <n> (desliga depois de n acertos) | .bplog on|off
 ba <e|w|r><1|2|4|8> <expr> | watch/unwatch <expr> <bytes> [w|a] | sxe/sxd ld:<modulo> | .bpsave/.bpload <arq>
 bpm <a|w|x> <expr> [bytes] | bpmc <expr> (breakpoint de memoria por pagina, no processo escolhido)
-bt [n] | k [n] | btt <ethread> [n] | context <ethread> | ? <expr> | sym <expr> | ln <expr> | addr <nome> | xs [mod!]padrao
+bt [n] [kernel] | k [n] [kernel] | btt <ethread> [n] [kernel] (kernel: sem a pilha do anel 3) | context <ethread>
+? <expr> | sym <expr> | ln <expr> | addr <nome> | xs [mod!]padrao
 dt [mod!]<tipo> [expr] | thread <n> | cpulist | modules | lmv <modulo> | .reload [/f] [/w]
 ps | threads [pid] | lm | cpus | irql | obj <caminho> | log [bytes] | bugcheck | kd | monitor <texto>
 !process [pid|eprocess] | !thread [ethread] | !irp <expr> | !devobj <expr|caminho> | !drvobj <expr|caminho>
@@ -935,28 +936,27 @@ impl Client {
                 let errors = self.restore_breakpoints(&text);
                 Ok(if errors.is_empty() { format!("{} breakpoints", self.breakpoints.len()) } else { errors.join("\n") })
             }
-            "bt" => {
+            "bt" | "k" | "kb" | "kn" | "kp" => {
+                // `kernel`: para na entrada de syscall, sem a pilha do anel 3.
                 let limit = words.first().and_then(|text| parse_number(text)).unwrap_or(32) as usize;
-                let frames = self.backtrace(limit)?;
-                self.settle_frames(&frames);
-                Ok(self.format_frames(&frames))
-            }
-            "k" | "kb" | "kn" | "kp" => {
-                let limit = words.first().and_then(|text| parse_number(text)).unwrap_or(32) as usize;
-                let frames = self.backtrace(limit)?;
-                self.settle_frames(&frames);
-                Ok(self.format_frames_with_stack(&frames))
+                let user = !words.contains(&"kernel");
+                let before = self.process().map(|context| context.eprocess);
+                let walk = self.stack(limit, user)?;
+                self.settle_frames(&walk.frames);
+                Ok(format!("{}{}", self.format_walk(&walk, command != "bt"), self.process_change_note(before)))
             }
             "context" => {
                 let thread = self.evaluate(rest)?;
                 self.monitor(&format!("context {thread:x}"))
             }
             "btt" => {
-                let thread = self.evaluate(words.first().ok_or("uso: btt <ethread> [n]")?)?;
+                let thread = self.evaluate(words.first().ok_or("uso: btt <ethread> [n] [kernel]")?)?;
                 let limit = words.get(1).and_then(|text| parse_number(text)).unwrap_or(32) as usize;
-                let (context, frames) = self.thread_backtrace(thread, limit)?;
-                self.settle_frames(&frames);
-                Ok(format!("{}\n{}", context.header, self.format_frames(&frames)))
+                let user = !words.contains(&"kernel");
+                let before = self.process().map(|context| context.eprocess);
+                let (context, walk) = self.thread_stack(thread, limit, user)?;
+                self.settle_frames(&walk.frames);
+                Ok(format!("{}\n{}{}", context.header, self.format_walk(&walk, false), self.process_change_note(before)))
             }
             "?" => {
                 let value = self.evaluate(rest)?;
@@ -1094,9 +1094,9 @@ impl Client {
                 let limit = words.get(1).and_then(|text| parse_number(text)).unwrap_or(32) as usize;
                 let process = self.process().map(|context| format!("{:#x}", context.eprocess)).ok_or("nenhum processo escolhido (.process <pid>)")?;
                 let thread = self.user_threads(&process)?.into_iter().find(|thread| thread.tid == tid).ok_or_else(|| format!("thread {tid} nao e deste processo"))?;
-                let (_, frames) = self.user_thread_backtrace(&thread, limit)?;
-                self.settle_frames(&frames);
-                Ok(self.format_frames_with_stack(&frames))
+                let (_, walk) = self.user_thread_stack(&thread, limit)?;
+                self.settle_frames(&walk.frames);
+                Ok(self.format_walk(&walk, true))
             }
             "bgd" | "bge" => {
                 let count = self.set_group_enabled(rest, command == "bge")?;

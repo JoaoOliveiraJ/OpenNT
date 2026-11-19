@@ -656,10 +656,12 @@ impl<'c> Runner<'c> {
         self.last_command = Some((line, command.to_string()));
     }
 
-    /// A pilha da thread (pelo quadro de troca) tem um quadro no módulo.
+    /// A pilha da thread (pelo quadro de troca) tem um quadro no módulo. Só
+    /// a parte de kernel: sem trocar o processo das leituras a cada
+    /// candidata.
     fn thread_in_module(&mut self, thread: u64, module: &str) -> bool {
-        let Ok((_, frames)) = self.client.thread_backtrace(thread, 32) else { return false };
-        frames.iter().any(|frame| self.client.symbols.module_at(frame.address).is_some_and(|found| found.name.eq_ignore_ascii_case(module) || found.file_name.eq_ignore_ascii_case(module)))
+        let Ok((_, walk)) = self.client.thread_stack(thread, 32, false) else { return false };
+        walk.frames.iter().any(|frame| self.client.symbols.module_at(frame.address).is_some_and(|found| found.name.eq_ignore_ascii_case(module) || found.file_name.eq_ignore_ascii_case(module)))
     }
 
     fn run_block(&mut self, nodes: &[Node]) -> Result<Flow, String> {

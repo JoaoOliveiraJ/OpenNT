@@ -21,7 +21,7 @@ use super::stop::{Reason, StopReply};
 use super::symbols::Symbols;
 use super::trace::Trace;
 use super::types::{self, TypeDb};
-use super::unwind::{self, Context, Frame, FunctionTable, ReadMemory, Target};
+use super::unwind::{Frame, FunctionTable, ReadMemory, Target};
 use super::user::{self, Handle, KernelRange, ProcessContext, Region, UserModule, UserThread};
 use super::x86;
 
@@ -2234,13 +2234,11 @@ impl Client {
     }
 
     /// A pilha de usuário de uma thread (o CONTEXT salvo, desenrolado pela
-    /// `.pdata` dos módulos do processo escolhido).
+    /// `.pdata` dos módulos do processo escolhido); o motivo do fim sai do
+    /// `user_thread_stack` (`stack.rs`).
     pub fn user_thread_backtrace(&mut self, thread: &UserThread, limit: usize) -> Result<(Vec<(String, u64)>, Vec<Frame>), String> {
-        let registers = self.user_thread_registers(thread)?;
-        let rip = registers.iter().find(|(name, _)| name == "rip").map(|(_, value)| *value).unwrap_or(0);
-        let named: Vec<(&str, u64)> = registers.iter().map(|(name, value)| (name.as_str(), *value)).collect();
-        let frames = unwind::walk(self, Context::from_named(rip, &named), false, limit);
-        Ok((registers, frames))
+        let (registers, walk) = self.user_thread_stack(thread, limit)?;
+        Ok((registers, walk.frames))
     }
 
     /// Parar ou não nas exceções de primeira chance do anel 3.
@@ -2333,39 +2331,42 @@ impl Client {
     }
 
     /// A pilha do processador escolhido: `.pdata` nos binários da
-    /// Microsoft, frame pointers no código do OpenNT.
+    /// Microsoft, frame pointers no código do OpenNT, as passagens dos
+    /// trampolins e a pilha do anel 3 depois da entrada de syscall
+    /// (`Client::stack`, com o motivo do fim).
     pub fn backtrace(&mut self, limit: usize) -> Result<Vec<Frame>, String> {
-        let values = self.general_registers()?;
-        let rip = self.register("rip")?;
-        let named: Vec<(&str, u64)> = values.iter().filter_map(|value| value.value.map(|number| (value.layout.name, number))).collect();
-        let context = Context::from_named(rip, &named);
-        Ok(unwind::walk(self, context, false, limit))
+        Ok(self.stack(limit, true)?.frames)
     }
 
     /// A pilha de uma thread pelo `monitor context` (a de uma thread fora
-    /// da CPU começa no quadro de troca: o RIP já é um retorno).
+    /// da CPU começa no quadro de troca: o RIP já é um retorno), até o anel
+    /// 3 (`Client::thread_stack`).
     pub fn thread_backtrace(&mut self, thread: u64, limit: usize) -> Result<(ThreadContext, Vec<Frame>), String> {
-        let context = self.thread_context(thread)?;
-        let Some(rip) = context.register("rip") else { return Err(format!("contexto de {thread:#x}: {}", context.header)) };
-        let named: Vec<(&str, u64)> = context.registers.iter().map(|(name, value)| (name.as_str(), *value)).collect();
-        let start = Context::from_named(rip, &named);
-        let frames = unwind::walk(self, start, context.processor.is_none(), limit);
-        Ok((context, frames))
+        let (context, walk) = self.thread_stack(thread, limit, true)?;
+        Ok((context, walk.frames))
     }
 
-    /// `#n endereço símbolo` por quadro.
+    /// `#n endereço símbolo` por quadro, com uma linha antes de cada
+    /// passagem (quadro de máquina, syscall, trampolim dos exports).
     pub fn format_frames(&self, frames: &[Frame]) -> String {
         let mut output = String::new();
         for (depth, frame) in frames.iter().enumerate() {
+            if let Some(transition) = frame.transition {
+                output.push_str(&format!("    --- {} ---\n", transition.text()));
+            }
             output.push_str(&format!("#{depth:<2} {:#018x} {}\n", frame.address, self.frame_name(frame)));
         }
         output
     }
 
-    /// A pilha como o `k` do WinDbg: RSP do quadro, endereço e símbolo.
+    /// A pilha como o `k` do WinDbg: RSP do quadro, endereço e símbolo, com
+    /// as passagens.
     pub fn format_frames_with_stack(&self, frames: &[Frame]) -> String {
         let mut output = String::from(" #  Child-SP           RetAddr            Call Site\n");
         for (depth, frame) in frames.iter().enumerate() {
+            if let Some(transition) = frame.transition {
+                output.push_str(&format!("   --- {} ---\n", transition.text()));
+            }
             let next = frames.get(depth + 1).map_or(0, |frame| frame.address);
             output.push_str(&format!("{depth:02} {:#018x} {next:#018x} {}\n", frame.stack, self.frame_name(frame)));
         }

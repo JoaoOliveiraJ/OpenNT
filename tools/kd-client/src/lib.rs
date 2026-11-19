@@ -17,7 +17,10 @@
 //!   existem, privados e linhas; cache em várias pastas e a fila de
 //!   downloads do servidor de símbolos);
 //! - `unwind`: a pilha pela `.pdata` dos binários da Microsoft e pelos frame
-//!   pointers do código do OpenNT;
+//!   pointers do código do OpenNT, com o motivo do fim;
+//! - `stack`: as passagens dos trampolins do kernel do OpenNT (a entrada de
+//!   syscall para a pilha do anel 3, o trampolim dos exports para o código
+//!   nativo, o começo das threads) e a pilha inteira de uma thread;
 //! - `tpi`, `types`: os tipos do PDB do ntoskrnl e as vistas tipadas;
 //! - `expr`: as expressões (operadores, memória, símbolos e campos tipados);
 //! - `bugcheck`: a análise de uma parada por bugcheck;
@@ -78,6 +81,7 @@ pub mod pdb;
 pub mod pe;
 pub mod registers;
 pub mod rsp;
+pub mod stack;
 pub mod stop;
 pub mod stream;
 pub mod struct_view;
