@@ -860,6 +860,13 @@ fn parent_creates_child(assert: Assert, services: &Services, system: u64, system
     .unwrap_or_default();
     let manifest_bytes = process_context::with_process(child, || guest::try_read_bytes(manifest.0, manifest.1 as usize).unwrap_or_default()).unwrap_or_default();
     assert(manifest == (IMAGE_BASE + 0x1000 + (RESOURCE_OFFSET + MANIFEST_DATA) as u64, MANIFEST_TEXT.len() as u32) && manifest_bytes == MANIFEST_TEXT, "ntcreateuserprocess: ManifestAddress e ManifestSize apontam o RT_MANIFEST 1 da imagem do filho, na VA do filho");
+    // Na tabela do System o mesmo valor pode ser outro handle (o herdável do
+    // próprio teste, `system_inheritable`): o que não pode estar lá é o
+    // objeto do handle do pai.
+    let in_system = |handle: u64| {
+        let own = process_context::with_process(parent, || state::get_user_handle(handle)).ok().flatten();
+        own.zip(state::get_user_handle(handle)).is_some_and(|(own, system)| state::same_object(&own, &system))
+    };
     let image_section = process::image_section(child);
     let handles_in_parent = process_context::with_process(parent, || {
         let file = state::get_user_handle(image_handles.0).is_some_and(|entry| entry.kind() == "file" && entry.access() == IMAGE_FILE_ACCESS && entry.downcast::<UserFile>().is_some_and(|file| file.nt_path.lock().as_str() == CHILD_NT_PATH));
@@ -867,7 +874,7 @@ fn parent_creates_child(assert: Assert, services: &Services, system: u64, system
         file && section
     })
     .unwrap_or(false);
-    assert(handles_in_parent && state::get_user_handle(image_handles.0).is_none() && state::get_user_handle(image_handles.1).is_none(), "ntcreateuserprocess: FileHandle (o exe do filho, SYNCHRONIZE|FILE_EXECUTE|AdditionalFileAccess) e SectionHandle (a secao de imagem do filho, SECTION_ALL_ACCESS) na tabela do pai, e nao na do System");
+    assert(handles_in_parent && !in_system(image_handles.0) && !in_system(image_handles.1), "ntcreateuserprocess: FileHandle (o exe do filho, SYNCHRONIZE|FILE_EXECUTE|AdditionalFileAccess) e SectionHandle (a secao de imagem do filho, SECTION_ALL_ACCESS) na tabela do pai, e nao na do System");
     // CLIENT_ID, TEB e SECTION_IMAGE_INFORMATION.
     let image = process_context::with_process(parent, || {
         // SAFETY: o SECTION_IMAGE_INFORMATION do pai, anexado.
@@ -887,7 +894,7 @@ fn parent_creates_child(assert: Assert, services: &Services, system: u64, system
         process_ok && thread_ok
     })
     .unwrap_or(false);
-    assert(in_parent && state::get_user_handle(process_handle).is_none() && state::get_user_handle(thread_handle).is_none(), "ntcreateuserprocess: handles do processo e da thread do filho validos na tabela do pai, com o acesso pedido, e nao na do System");
+    assert(in_parent && !in_system(process_handle) && !in_system(thread_handle), "ntcreateuserprocess: handles do processo e da thread do filho validos na tabela do pai, com o acesso pedido, e nao na do System");
     // O pai declarado.
     // SAFETY: EPROCESS retido pelo teste.
     let inherited_from = unsafe { Eprocess::at(child) }.inherited_from_unique_process_id.get();
