@@ -3,6 +3,12 @@
 //! (ou `-` para repetir) até o host pedir o modo sem confirmação
 //! (`QStartNoAckMode`), e o byte 0x03 avulso como pedido de parada.
 //!
+//! O que sai para o host vai com a compressão de repetições do protocolo
+//! (`X*n`: o byte X mais n - 29 cópias), que todo cliente do RSP desfaz
+//! antes de ler o conteúdo: zeros em hexadecimal (memória zerada,
+//! registradores nulos) e o preenchimento dos textos do `monitor` encolhem
+//! até 30 vezes. A soma vale sobre os bytes enviados.
+//!
 //! Nada aqui aloca: o depurador roda com os outros processadores congelados
 //! e com o processador parado onde quer que estivesse, inclusive com a trava
 //! do heap tomada. Os buffers são estáticos e só o dono da parada os usa.
@@ -12,8 +18,17 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use super::transport;
 
-/// Maior pacote aceito, anunciado no `PacketSize` do qSupported.
-pub const PACKET_SIZE: usize = 0x1000;
+/// Maior pacote aceito, anunciado no `PacketSize` do qSupported: uma leitura
+/// de memória leva até 8 KB por ida e volta (`m` em hexadecimal até 0x1FFC
+/// bytes, `x` em binário até `BINARY_READ_MAXIMUM`).
+pub const PACKET_SIZE: usize = 0x4000;
+/// Maior leitura binária (`x`): no pior caso cada byte vai escapado (dois
+/// bytes), e a resposta ainda cabe no pacote.
+pub const BINARY_READ_MAXIMUM: usize = PACKET_SIZE / 2 - 16;
+/// Repetições a partir das quais o `X*n` compensa (são três bytes).
+const RUN_MINIMUM: usize = 4;
+/// Maior repetição num `*`: o contador é n + 29 e vai até o `~` (126).
+const RUN_MAXIMUM: usize = 98;
 /// Prazo de uma confirmação antes de repetir o pacote.
 const ACK_TIMEOUT_MS: u64 = 2000;
 const ACK_RETRIES: u32 = 5;
@@ -101,6 +116,11 @@ impl<'a> Payload<'a> {
         self.length
     }
 
+    /// Tamanho do buffer (o máximo que o pacote leva).
+    pub fn capacity(&self) -> usize {
+        self.buffer.len()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.length == 0
     }
@@ -173,18 +193,74 @@ pub fn unescape_binary(data: &mut [u8]) -> usize {
     write
 }
 
-fn checksum(payload: &[u8]) -> u8 {
-    payload.iter().fold(0u8, |sum, &byte| sum.wrapping_add(byte))
+/// Dados binários do protocolo (a resposta do `x`, o `qXfer`): `#`, `$`,
+/// `}` e `*` vão como `}` seguido do byte XOR 0x20. Põe em `reply` o
+/// maior prefixo de `data` que cabe inteiro e devolve quantos bytes de
+/// `data` foram.
+pub fn push_escaped(reply: &mut Payload, data: &[u8]) -> usize {
+    for (index, &byte) in data.iter().enumerate() {
+        let escaped = matches!(byte, b'#' | b'$' | b'}' | b'*');
+        let needed = if escaped { 2 } else { 1 };
+        if reply.len() + needed > reply.capacity() {
+            return index;
+        }
+        if escaped {
+            reply.push(b'}');
+            reply.push(byte ^ 0x20);
+        } else {
+            reply.push(byte);
+        }
+    }
+    data.len()
+}
+
+/// Um byte que pode ser repetido com `*` (os do enquadramento e o escape
+/// ficam de fora).
+fn repeatable(byte: u8) -> bool {
+    !matches!(byte, b'#' | b'$' | b'}' | b'*')
+}
+
+/// O conteúdo com a compressão de repetições: uma sequência de 4 a 98 bytes
+/// iguais vira o byte, `*` e o número de cópias além da primeira mais 29.
+/// Seis e sete cópias dariam `#` e `$`: vão cinco e o resto segue literal.
+/// Cada byte de saída vai a `emit`.
+fn run_length_encode(payload: &[u8], mut emit: impl FnMut(u8)) {
+    let mut index = 0;
+    while index < payload.len() {
+        let byte = payload[index];
+        let mut run = 1;
+        while run < RUN_MAXIMUM && index + run < payload.len() && payload[index + run] == byte {
+            run += 1;
+        }
+        if run >= RUN_MINIMUM && repeatable(byte) {
+            let mut copies = run - 1;
+            if copies == 6 || copies == 7 {
+                copies = 5;
+            }
+            emit(byte);
+            emit(b'*');
+            emit(copies as u8 + 29);
+            index += copies + 1;
+        } else {
+            emit(byte);
+            index += 1;
+        }
+    }
 }
 
 fn transmit(payload: &[u8]) {
-    transport::write(b'$');
-    transport::write_all(payload);
-    transport::write(b'#');
-    let sum = checksum(payload);
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    transport::write(DIGITS[(sum >> 4) as usize]);
-    transport::write(DIGITS[(sum & 15) as usize]);
+    let mut sender = transport::Sender::new();
+    let mut sum = 0u8;
+    sender.put(b'$');
+    run_length_encode(payload, |byte| {
+        sum = sum.wrapping_add(byte);
+        sender.put(byte);
+    });
+    sender.put(b'#');
+    sender.put(DIGITS[(sum >> 4) as usize]);
+    sender.put(DIGITS[(sum & 15) as usize]);
+    sender.flush();
 }
 
 /// Envia um pacote e, no modo com confirmação, espera o `+` (repete no `-`

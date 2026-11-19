@@ -15,20 +15,32 @@
 //! pelo `monitor .process`, `m`/`M`/`X` e o `Z0` usam a raiz dele
 //! (`kd::process_context`) até a máquina seguir.
 //!
+//! Para o host decidir uma parada sem idas e voltas, a resposta de parada
+//! (`T`) leva, além do sinal, da thread e da razão: os 24 primeiros
+//! registradores do `g` (inteiros, RIP, EFLAGS e seletores, `n:valor;` como
+//! os registradores adiantados do GDB), a impressão digital da lista de
+//! módulos (`modgen:`), o EPROCESS corrente do processador (`process:`) e,
+//! numa carga de imagem do filtro do host (`QOpenNTLoadBreak`,
+//! `kd::events`), `library:;load:base,tamanho,pid,nome;`. Antes, cada parada
+//! custava ao cliente um `g` (1072 dígitos), um `monitor lm` (dezenas de KB
+//! em hexadecimal) e, numa parada de usuário, `.process` e `ps`. Leituras
+//! grandes vão pelo `x` (binário, `binary-upload` do GDB: metade dos bytes
+//! do `m`) em pacotes de até 16 KB.
+//!
 //! Anexar: o primeiro pacote válido do host liga KdDebuggerNotPresent =
 //! FALSE e o bit de presença do KUSER_SHARED_DATA.KdDebuggerEnabled, como o
 //! transporte do NT quando o host responde; o `D` (ou `k`) desfaz, tira os
-//! breakpoints e devolve o modo com confirmação.
+//! breakpoints, esvazia o filtro de carga e devolve o modo com confirmação.
 
 use core::cell::UnsafeCell;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use super::breakpoints::{self, Watch};
-use super::packet::{self, Payload, Received, PACKET_SIZE};
+use super::packet::{self, Payload, Received, BINARY_READ_MAXIMUM, PACKET_SIZE};
 use super::registers::{self, View};
 use super::stop::{self, Kind, Resume};
-use super::{debugger, memory, monitor, process_context};
+use super::{debugger, events, memory, monitor, process_context, transport};
 use crate::ntos::mm::memory_map::MAX_CPUS;
 
 /// Um host trocou pacotes e não se desligou.
@@ -43,6 +55,11 @@ static SELECTED: AtomicU32 = AtomicU32::new(0);
 
 /// Tamanho do texto de saída do `monitor` e do XML das bibliotecas.
 pub const TEXT_SIZE: usize = 0x6000;
+/// Registradores adiantados na resposta de parada: os 24 primeiros do `g`
+/// (rax..r15, rip, eflags, cs, ss, ds, es, fs, gs), sempre no quadro.
+const EXPEDITED_REGISTERS: usize = 24;
+/// Maior nome de imagem no `load:` (o nome-base).
+const LOAD_NAME_MAXIMUM: usize = 64;
 
 struct Buffers {
     input: UnsafeCell<[u8; PACKET_SIZE + 16]>,
@@ -85,6 +102,7 @@ fn detach() {
     super::page_breakpoints::remove_all();
     super::page_breakpoints::resume();
     super::user_debug::reset();
+    events::set_load_filter(b"");
     packet::set_no_ack(false);
     REPORT_SOFTWARE_BREAK.store(false, Ordering::Release);
     REPORT_HARDWARE_BREAK.store(false, Ordering::Release);
@@ -151,8 +169,56 @@ fn stop_reply(reply: &mut Payload) {
             }
             let _ = write!(reply, "membp:{:x};", data);
         }
+        Kind::Library => library_reason(number, reply),
         _ => {}
     }
+    // Os registradores adiantados: o host decide a parada (breakpoint
+    // condicional, de log, passo por cima) sem o `g`.
+    if let Some(view) = stop::view(number) {
+        let mut value = [0u8; 16];
+        for register in 0..EXPEDITED_REGISTERS {
+            if view.read(register, &mut value) {
+                let _ = write!(reply, "{:02x}:", register);
+                reply.push_hex(&value[..registers::size(register)]);
+                reply.push(b';');
+            }
+        }
+    }
+    // A lista de módulos só é relida pelo host quando a impressão muda.
+    if let Some(generation) = monitor::module_generation() {
+        let _ = write!(reply, "modgen:{:x};", generation);
+    }
+    let process = monitor::processor_process(number);
+    if process != 0 {
+        let _ = write!(reply, "process:{:x};", process);
+    }
+}
+
+/// `library:;load:base,tamanho,pid,nome;` de uma carga do filtro: os
+/// argumentos de `opennt_kd_load_break` (RDI base, RSI tamanho, RDX PID, RCX
+/// e R8 o caminho) e o nome-base do caminho em hexadecimal.
+fn library_reason(number: usize, reply: &mut Payload) {
+    reply.push_str("library:;");
+    let Some(view) = stop::view(number) else { return };
+    let register = |index: usize| {
+        let mut value = [0u8; 16];
+        if !view.read(index, &mut value) {
+            return 0;
+        }
+        let mut quad = [0u8; 8];
+        quad.copy_from_slice(&value[..8]);
+        u64::from_le_bytes(quad)
+    };
+    let (base, size, process_id, name, name_length) = (register(5), register(4), register(3), register(2), register(8));
+    let _ = write!(reply, "load:{:x},{:x},{:x},", base, size, process_id);
+    let mut path = [0u8; 512];
+    let length = (name_length as usize).min(path.len());
+    let read = if name != 0 && length != 0 { memory::read(stop::address_space(number), name, &mut path[..length]) } else { 0 };
+    let path = &path[..read];
+    let start = path.iter().rposition(|&byte| byte == b'\\' || byte == b'/').map_or(0, |slash| slash + 1);
+    let base_name = &path[start..];
+    reply.push_hex(&base_name[..base_name.len().min(LOAD_NAME_MAXIMUM)]);
+    reply.push(b';');
 }
 
 /// O que fazer depois de um comando.
@@ -187,6 +253,9 @@ pub fn run(number: usize) -> Resume {
             }
             Received::Packet(length) => length,
         };
+        // O host espera a resposta e não manda nada: o ponto seguro para
+        // ligar a FIFO da UART (uma vez por boot).
+        transport::enable_fifo();
         attach();
         let mut reply = Payload::new(&mut output[..]);
         let action = handle(number, &mut input[..length], &mut reply, &mut data[..], &mut text[..]);
@@ -243,6 +312,7 @@ fn handle(owner: usize, command: &mut [u8], reply: &mut Payload, data: &mut [u8]
         b'p' => read_register(owner, selected(owner), &command[1..], reply),
         b'P' => write_register(selected(owner), &command[1..], reply),
         b'm' => read_memory(selected(owner), &command[1..], reply, data),
+        b'x' => read_memory_binary(selected(owner), &command[1..], reply, data),
         b'M' => write_memory_hex(selected(owner), &command[1..], reply, data),
         b'X' => write_memory_binary(selected(owner), &mut command[1..], reply),
         b'Z' | b'z' => breakpoint(owner, first == b'Z', &command[1..], reply),
@@ -271,6 +341,10 @@ fn handle(owner: usize, command: &mut [u8], reply: &mut Payload, data: &mut [u8]
             if command == b"QStartNoAckMode" {
                 reply.push_str("OK");
                 return Action::ReplyThenNoAck;
+            }
+            if let Some(list) = command.strip_prefix(b"QOpenNTLoadBreak:") {
+                events::set_load_filter(list);
+                reply.push_str("OK");
             }
         }
         b'v' => return v_packet(owner, command, reply),
@@ -380,6 +454,27 @@ fn read_memory(number: usize, text: &[u8], reply: &mut Payload, data: &mut [u8])
     }
     breakpoints::mask_read(cr3, address, &mut data[..done]);
     reply.push_hex(&data[..done]);
+}
+
+/// `x endereço,tamanho` (o `binary-upload` do GDB): `b` e os bytes em
+/// binário escapado, metade do que o `m` manda. Até `BINARY_READ_MAXIMUM`
+/// bytes, que sempre cabem escapados; uma resposta mais curta quer dizer que
+/// o resto não pôde ser lido, como no `m`.
+fn read_memory_binary(number: usize, text: &[u8], reply: &mut Payload, data: &mut [u8]) {
+    let Some((address, length, _)) = split_address_length(text) else {
+        reply.push_str("E01");
+        return;
+    };
+    let length = length.min(BINARY_READ_MAXIMUM).min(data.len());
+    let cr3 = process_context::memory_space(number);
+    let done = memory::read(cr3, address, &mut data[..length]);
+    if done == 0 && length != 0 {
+        reply.push_str("E14");
+        return;
+    }
+    breakpoints::mask_read(cr3, address, &mut data[..done]);
+    reply.push(b'b');
+    packet::push_escaped(reply, &data[..done]);
 }
 
 fn store(number: usize, address: u64, bytes: &mut [u8], reply: &mut Payload) {
@@ -559,7 +654,7 @@ fn query(owner: usize, command: &[u8], reply: &mut Payload, text: &mut [u8]) {
         let has = |name: &[u8]| features.split(|&byte| byte == b';' || byte == b':').any(|feature| feature == name);
         REPORT_SOFTWARE_BREAK.store(has(b"swbreak+"), Ordering::Release);
         REPORT_HARDWARE_BREAK.store(has(b"hwbreak+"), Ordering::Release);
-        let _ = write!(reply, "PacketSize={:x};swbreak+;hwbreak+;QStartNoAckMode+;vContSupported+;qXfer:libraries:read+", PACKET_SIZE);
+        let _ = write!(reply, "PacketSize={:x};swbreak+;hwbreak+;QStartNoAckMode+;vContSupported+;qXfer:libraries:read+;binary-upload+;QOpenNTLoadBreak+", PACKET_SIZE);
     } else if command == b"qAttached" {
         reply.push_str("1");
     } else if command == b"qC" {

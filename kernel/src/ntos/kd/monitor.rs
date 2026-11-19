@@ -175,6 +175,38 @@ pub fn libraries_xml(out: &mut Payload) {
     out.push_str("</library-list>");
 }
 
+/// Impressão digital da lista de módulos (base e tamanho de cada imagem, na
+/// ordem da lista): muda quando uma imagem entra ou sai. Vai em toda
+/// resposta de parada (`modgen:`) para o host só reler a lista (`lm`, dezenas
+/// de KB em hexadecimal) quando ela mudou. `None` com a trava do registro de
+/// imagens tomada no código parado.
+pub fn module_generation() -> Option<u64> {
+    let mut hash = 0xCBF2_9CE4_8422_2325u64;
+    let mut count = 0u64;
+    let listed = loaded_images::try_for_each(|image| {
+        for value in [image.image_base, image.size_of_image] {
+            hash = (hash ^ value).wrapping_mul(0x0000_0100_0000_01B3);
+        }
+        count += 1;
+    });
+    listed.then_some(hash ^ count)
+}
+
+/// O EPROCESS corrente do processador parado `number` (o processo da
+/// thread dele, KTHREAD.ApcState.Process); 0 se ilegível.
+pub fn processor_process(number: usize) -> u64 {
+    let pcr = stop::processor_control_region(number);
+    if !stop::processor_stopped(number) || pcr == 0 {
+        return 0;
+    }
+    let cr3 = stop::address_space(number);
+    let thread = read_u64(cr3, pcr + (offset_of!(Kpcr, prcb) + offset_of!(Kprcb, current_thread)) as u64);
+    if thread == 0 {
+        return 0;
+    }
+    read_u64(cr3, thread + (offset_of!(Kthread, apc_state) + offset_of!(KapcState, process)) as u64)
+}
+
 /// Uma linha sobre o processador `number`: IRQL, thread e processo
 /// correntes (o `qThreadExtraInfo`).
 pub fn describe_processor(number: usize, out: &mut Payload) {

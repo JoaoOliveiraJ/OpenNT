@@ -6,7 +6,7 @@
 //! - `int 3` (vetor 3) no anel 0: breakpoint do depurador (o RIP volta para
 //!   o 0xCC), `int 3` fixo no código (DbgBreakPoint, o RIP fica depois
 //!   dele) e as paradas pedidas pelo próprio kernel (pedido de parada na
-//!   inicialização, bugcheck, pânico);
+//!   inicialização, bugcheck, pânico, carga de imagem do filtro do host);
 //! - #DB (vetor 1): fim de um passo (DR6.BS) ou comparador de hardware
 //!   (DR6.B0-B3);
 //! - o tique do relógio do LAPIC no anel 0, quando o LSR da porta tem um
@@ -141,6 +141,9 @@ pub enum Kind {
     /// Breakpoint de memória por página (`kd::page_breakpoints`): o dado da
     /// parada é o endereço acessado.
     Memory(Watch),
+    /// Carga de imagem pedida pelo filtro do host (`kd::events`): os
+    /// argumentos do evento estão nos registradores do processador.
+    Library,
 }
 
 impl Kind {
@@ -154,6 +157,7 @@ impl Kind {
             Kind::Memory(Watch::Write) => 5,
             Kind::Memory(Watch::Execute) => 6,
             Kind::Memory(Watch::Access) => 7,
+            Kind::Library => 8,
         }
     }
 
@@ -166,6 +170,7 @@ impl Kind {
             5 => Kind::Memory(Watch::Write),
             6 => Kind::Memory(Watch::Execute),
             7 => Kind::Memory(Watch::Access),
+            8 => Kind::Library,
             _ => Kind::Signal,
         }
     }
@@ -203,6 +208,13 @@ opennt_kd_break_with_status:
     mov rcx, rdi
     int3
     ret
+# Carga de imagem que o filtro do host pediu (`kd::events`): os argumentos
+# do evento ficam nos registradores (RDI base, RSI tamanho, RDX PID, RCX
+# nome, R8 tamanho do nome, R9 sistema).
+.global opennt_kd_load_break
+opennt_kd_load_break:
+    int3
+    ret
 .popsection
 "#
 );
@@ -212,6 +224,7 @@ extern "sysv64" {
     fn opennt_kd_bugcheck_break();
     fn opennt_kd_panic_break();
     fn opennt_kd_break_with_status(status: u64);
+    fn opennt_kd_load_break(base: u64, size: u64, process_id: u64, name: u64, name_length: u64, system: u64);
 }
 
 fn helper_address(function: unsafe extern "sysv64" fn()) -> u64 {
@@ -683,6 +696,11 @@ extern "sysv64" fn rs_kd_trap(frame: *mut TrapFrame, fx: u64, reason: u32) -> u3
             if address == helper_address(opennt_kd_bugcheck_break) || address == helper_address(opennt_kd_panic_break) {
                 return enter(number, frame, fx, false, SIGABRT, Kind::Signal, 0).unwrap_or_else(repeat);
             }
+            let load_break: unsafe extern "sysv64" fn(u64, u64, u64, u64, u64, u64) = opennt_kd_load_break;
+            if address == load_break as usize as u64 {
+                // Carga de imagem do filtro: o RIP fica depois do `int 3`.
+                return enter(number, frame, fx, false, SIGTRAP, Kind::Library, 0).unwrap_or_else(repeat);
+            }
             if breakpoints::inserted_at(address) {
                 view.set_rip(address);
                 return enter(number, frame, fx, false, SIGTRAP, Kind::SoftwareBreak, 0).unwrap_or(HANDLED);
@@ -790,6 +808,17 @@ pub fn panic_stop() {
     if active() && !stopped() {
         // SAFETY: `int 3; ret` reconhecido pela entrada do vetor 3.
         unsafe { opennt_kd_panic_break() };
+    }
+}
+
+/// Carga de imagem que casou com o filtro do host (`kd::events`): para a
+/// máquina com os argumentos do evento nos registradores (a resposta de
+/// parada os leva em `load:`).
+pub fn load_break(base: u64, size: u64, process_id: u64, name: u64, name_length: u64, system: u64) {
+    if active() {
+        // SAFETY: `int 3; ret` reconhecido pela entrada do vetor 3; os
+        // argumentos só ficam nos registradores.
+        unsafe { opennt_kd_load_break(base, size, process_id, name, name_length, system) };
     }
 }
 
