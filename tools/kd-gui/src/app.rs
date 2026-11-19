@@ -143,6 +143,49 @@ impl LogLines {
     }
 }
 
+/// Uma linha do painel de comandos (a rolagem é virtual: um roteiro longo
+/// gera milhares de linhas e a janela só desenha as que aparecem).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TranscriptLine {
+    kind: LineKind,
+    text: String,
+    /// A entrada de onde a linha veio (o menu do botão direito copia).
+    entry: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LineKind {
+    Input,
+    Output,
+    Error,
+}
+
+/// As linhas de uma entrada do painel de comandos.
+fn push_transcript_lines(lines: &mut Vec<TranscriptLine>, index: usize, entry: &Entry) {
+    lines.push(TranscriptLine { kind: LineKind::Input, text: format!("kd> {}", entry.input), entry: index });
+    let kind = if entry.error { LineKind::Error } else { LineKind::Output };
+    for line in entry.output.trim_end().lines() {
+        lines.push(TranscriptLine { kind, text: line.trim_end_matches('\r').to_string(), entry: index });
+    }
+}
+
+/// O texto do painel de comandos para copiar: uma entrada ou todas.
+fn transcript_text(entries: &[Entry], which: Option<usize>) -> String {
+    let chosen: Vec<&Entry> = match which {
+        Some(index) => entries.get(index).into_iter().collect(),
+        None => entries.iter().collect(),
+    };
+    let mut text = String::new();
+    for entry in chosen {
+        text.push_str(&format!("kd> {}\n", entry.input));
+        if !entry.output.trim().is_empty() {
+            text.push_str(entry.output.trim_end());
+            text.push('\n');
+        }
+    }
+    text
+}
+
 /// Como a memória aparece.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MemoryFormat {
@@ -296,6 +339,7 @@ pub struct UiState {
     activity: String,
     can_restart: bool,
     transcript: Vec<Entry>,
+    transcript_lines: Vec<TranscriptLine>,
     console: LogLines,
     serial: LogLines,
     launch_log: LogLines,
@@ -457,6 +501,7 @@ impl DebuggerApp {
                 activity: String::new(),
                 can_restart: false,
                 transcript: Vec::new(),
+                transcript_lines: Vec::new(),
                 console: LogLines::default(),
                 serial: LogLines::default(),
                 launch_log: LogLines::default(),
@@ -637,8 +682,12 @@ impl DebuggerApp {
         state.recording = shared.recording.clone();
         if shared.transcript.len() < state.transcript.len() {
             state.transcript.clear();
+            state.transcript_lines.clear();
         }
         let known = state.transcript.len();
+        for (offset, entry) in shared.transcript[known..].iter().enumerate() {
+            push_transcript_lines(&mut state.transcript_lines, known + offset, entry);
+        }
         state.transcript.extend(shared.transcript[known..].iter().cloned());
         state.console.sync(&shared.console);
         state.serial.sync(&shared.serial);
@@ -759,7 +808,7 @@ impl DebuggerApp {
     }
 
     fn shortcuts(&mut self, ui: &Ui) {
-        let stopped = self.state.status == Status::Stopped;
+        let stopped = self.state.ready();
         let running = self.state.status == Status::Running;
         let pressed = |modifiers: Modifiers, key: Key| ui.input_mut(|input| input.consume_key(modifiers, key));
         if pressed(Modifiers::CTRL, Key::O) && self.state.open_dialog.is_none() {
@@ -786,7 +835,7 @@ impl DebuggerApp {
         // O Ctrl+Break não chega ao egui (o Windows o entrega como VK_CANCEL):
         // a parada é o Ctrl+B.
         if running && pressed(Modifiers::CTRL, Key::B) {
-            self.state.requests.push(Request::Break);
+            self.state.request_break();
         }
     }
 }
@@ -802,6 +851,28 @@ impl eframe::App for DebuggerApp {
 }
 
 impl UiState {
+    /// O backend está ocupado (um roteiro, a leitura do estado da máquina,
+    /// um comando longo): os pedidos esperam na fila dele, então os botões
+    /// de execução desligam até ele voltar (segurar o F10 não empilha
+    /// passos).
+    fn busy(&self) -> bool {
+        self.script.is_some() || !self.activity.is_empty()
+    }
+
+    /// Parado e com o backend livre: os botões de execução valem.
+    fn ready(&self) -> bool {
+        self.status == Status::Stopped && !self.busy()
+    }
+
+    /// Parar a máquina; com um roteiro rodando, o roteiro para antes (o
+    /// pedido de parada espera na fila do backend até ele).
+    fn request_break(&mut self) {
+        if self.script.is_some() {
+            self.cancel = true;
+        }
+        self.requests.push(Request::Break);
+    }
+
     /// Abre a janela Abrir ou conectar com as opções da última abertura
     /// (as da linha de comando, senão as da última vez).
     fn open_form(&mut self) {
@@ -1224,7 +1295,7 @@ fn script_dialog(ui: &mut Ui, state: &mut UiState) {
 }
 
 fn menu_bar(ui: &mut Ui, state: &mut UiState, open: &[Tab]) {
-    let stopped = state.status == Status::Stopped;
+    let stopped = state.ready();
     let running = state.status == Status::Running;
     egui::MenuBar::new().ui(ui, |ui| {
         let opening = matches!(state.status, Status::Launching(_) | Status::Connecting(_));
@@ -1260,7 +1331,7 @@ fn menu_bar(ui: &mut Ui, state: &mut UiState, open: &[Tab]) {
                 state.requests.push(Request::Go);
             }
             if ui.add_enabled(running, egui::Button::new("Parar").shortcut_text("Ctrl+B")).clicked() {
-                state.requests.push(Request::Break);
+                state.request_break();
             }
             if ui.add_enabled(stopped, egui::Button::new("Entrar").shortcut_text("F11")).clicked() {
                 state.requests.push(Request::StepInto);
@@ -1431,7 +1502,7 @@ fn icon_button(ui: &mut Ui, icon: Icon, enabled: bool, tooltip: &str) -> bool {
 }
 
 fn toolbar(ui: &mut Ui, state: &mut UiState) {
-    let stopped = state.status == Status::Stopped;
+    let stopped = state.ready();
     let running = state.status == Status::Running;
     let colors = palette(ui);
     ui.horizontal(|ui| {
@@ -1440,7 +1511,7 @@ fn toolbar(ui: &mut Ui, state: &mut UiState) {
             state.requests.push(Request::Go);
         }
         if icon_button(ui, Icon::Break, running, "Parar a máquina (Ctrl+B)") {
-            state.requests.push(Request::Break);
+            state.request_break();
         }
         ui.add_space(6.0);
         if icon_button(ui, Icon::StepInto, stopped, "Entrar: um passo, entra no call (F11)") {
@@ -1682,20 +1753,44 @@ fn command_panel(ui: &mut Ui, state: &mut UiState) {
     let suggestions_height = if state.suggestions.is_empty() { 0.0 } else { (state.suggestions.len().min(8) as f32) * row_height(ui) + 8.0 };
     let input_height = row_height(ui) + 14.0 + suggestions_height;
     let output_height = (ui.available_height() - input_height).max(40.0);
-    egui::ScrollArea::vertical().id_salt("transcript").auto_shrink([false, false]).stick_to_bottom(true).max_height(output_height).show(ui, |ui| {
-        if state.transcript.is_empty() {
-            hint(ui, "comandos do WinDbg e do cargo xtask debug (help): k, r, db/dq, u, bp, bl, bc, g, p, t, gu, lm, dt, !process, !thread, !irp, !devobj, !drvobj, !object, !analyze, trace... Tab completa comandos e símbolos.");
-            for index in 0..state.launch_log.count() {
+    // Rolagem virtual: só as linhas à vista são desenhadas (a saída do
+    // build e de um roteiro longo têm milhares).
+    let height = row_height(ui);
+    if state.transcript.is_empty() {
+        hint(ui, "comandos do WinDbg e do cargo xtask debug (help): k, r, db/dq, u, bp, bl, bc, g, p, t, gu, lm, dt, !process, !thread, !irp, !devobj, !drvobj, !object, !analyze, trace... Tab completa comandos e símbolos. Menu Roteiro: rodar e gravar roteiros do kd.");
+        let lines = state.launch_log.count();
+        egui::ScrollArea::both().id_salt("transcript").auto_shrink([false, false]).stick_to_bottom(true).max_height((output_height - height * 2.0).max(20.0)).show_rows(ui, height, lines, |ui, range| {
+            for index in range {
                 ui.label(mono(state.launch_log.line(index)).color(colors.dim));
             }
-        }
-        for entry in &state.transcript {
-            ui.label(mono(format!("kd> {}", entry.input)).color(colors.blue));
-            if !entry.output.trim().is_empty() {
-                ui.label(mono(entry.output.trim_end()).color(if entry.error { colors.red } else { ui.visuals().text_color() }));
+        });
+    } else {
+        let mut copy: Option<Option<usize>> = None;
+        egui::ScrollArea::both().id_salt("transcript").auto_shrink([false, false]).stick_to_bottom(true).max_height(output_height).show_rows(ui, height, state.transcript_lines.len(), |ui, range| {
+            for index in range {
+                let line = &state.transcript_lines[index];
+                let color = match line.kind {
+                    LineKind::Input => colors.blue,
+                    LineKind::Output => ui.visuals().text_color(),
+                    LineKind::Error => colors.red,
+                };
+                let response = ui.add(egui::Label::new(mono(&line.text).color(color)).sense(Sense::click()));
+                response.context_menu(|ui| {
+                    if ui.button("Copiar este comando e a saída").clicked() {
+                        copy = Some(Some(line.entry));
+                        ui.close();
+                    }
+                    if ui.button("Copiar o painel inteiro").clicked() {
+                        copy = Some(None);
+                        ui.close();
+                    }
+                });
             }
+        });
+        if let Some(which) = copy {
+            ui.ctx().copy_text(transcript_text(&state.transcript, which));
         }
-    });
+    }
     // Tab: completa (antes do campo, que usaria a tecla para trocar o foco).
     if state.command_focused && ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Tab)) {
         let (start, found) = completions_for(state);
@@ -1734,8 +1829,16 @@ fn command_panel(ui: &mut Ui, state: &mut UiState) {
         });
     }
     ui.horizontal(|ui| {
-        let prompt = if state.status == Status::Stopped { "kd>" } else { "kd (rodando)>" };
-        ui.label(mono(prompt).color(colors.blue));
+        let prompt = if state.script.is_some() {
+            "kd (roteiro)>"
+        } else if state.busy() {
+            "kd (ocupado)>"
+        } else if state.status == Status::Stopped {
+            "kd>"
+        } else {
+            "kd (rodando)>"
+        };
+        ui.label(mono(prompt).color(colors.blue)).on_hover_text(if state.busy() { "o backend esta ocupado: o comando espera na fila e roda quando ele voltar" } else { "Enter roda; setas trazem o historico; Tab completa" });
         let response = ui.add(egui::TextEdit::singleline(&mut state.command).id(egui::Id::new("kd-command")).font(TextStyle::Monospace).desired_width(f32::INFINITY).hint_text("comando (help; Tab completa)"));
         state.command_focused = response.has_focus();
         if response.changed() {
@@ -2510,6 +2613,26 @@ mod tests {
         assert_eq!(list, vec!["a".to_string(), "b".to_string()]);
         remember_recent(&mut list, "c", 2);
         assert_eq!(list, vec!["c".to_string(), "a".to_string()]);
+    }
+
+    #[test]
+    fn transcript_rows_and_copy() {
+        let entries = vec![
+            Entry { input: "k 2".into(), output: "00 nt!KiSystemCall64\r\n01 ntdll!NtClose\n".into(), error: false },
+            Entry { input: "bp x".into(), output: "simbolo desconhecido".into(), error: true },
+            Entry { input: "g".into(), output: String::new(), error: false },
+        ];
+        let mut lines = Vec::new();
+        for (index, entry) in entries.iter().enumerate() {
+            push_transcript_lines(&mut lines, index, entry);
+        }
+        let texts: Vec<&str> = lines.iter().map(|line| line.text.as_str()).collect();
+        assert_eq!(texts, vec!["kd> k 2", "00 nt!KiSystemCall64", "01 ntdll!NtClose", "kd> bp x", "simbolo desconhecido", "kd> g"]);
+        assert_eq!(lines[4].kind, LineKind::Error);
+        assert_eq!(lines[4].entry, 1);
+        assert_eq!(transcript_text(&entries, Some(1)), "kd> bp x\nsimbolo desconhecido\n");
+        assert_eq!(transcript_text(&entries, Some(9)), "");
+        assert!(transcript_text(&entries, None).ends_with("kd> g\n"));
     }
 
     #[test]

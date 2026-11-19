@@ -953,6 +953,12 @@ impl Worker {
             }
         }
         self.process(request);
+        // Nenhum pedido deixa a atividade presa: com ela, a janela desliga
+        // os botões de execução.
+        let stale = !self.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).activity.is_empty();
+        if stale {
+            self.set_activity("");
+        }
     }
 
     fn process(&mut self, request: Request) {
