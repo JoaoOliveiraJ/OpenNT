@@ -5628,8 +5628,12 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     conexão, estado do alvo, CPU, thread, processo e IRQL. Tema escuro e
     claro.
   - Painéis: Desmontagem (iced-x86, sintaxe MASM, marcador do RIP, margem
-    de breakpoints, destinos dos desvios); Código-fonte (a linha do DWARF);
-    Registradores (os que mudaram em vermelho, editáveis); Observação
+    de breakpoints, destinos dos desvios; botão direito: breakpoint,
+    executar até aqui, memória); Código-fonte (a linha do DWARF);
+    Registradores (os que mudaram em vermelho, editáveis, com o símbolo do
+    valor; seletores decodificados com a base de FS e GS; DR0-DR7 com o DR6
+    e o DR7 em palavras; XMM e YMM em hexadecimal ou por lanes inteiras e
+    de ponto flutuante; x87, MMX e MXCSR); Observação
     (expressões com valor e tipo; um valor tipado abre a struct campo a
     campo, e campos de struct e ponteiros abrem de novo); Variáveis locais
     (parâmetros e variáveis do quadro de cima pelo DWARF do `kernel.elf`:
@@ -5638,16 +5642,32 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     com o DWARF completo; os builds comuns levam só as tabelas de linha, que
     bastam para o arquivo:linha e os nomes de função, mas não para as
     variáveis); Memória
-    (bytes, words, dwords, qwords, ASCII, UTF-16; procura de bytes, texto ou
-    UTF-16; clique duplo num qword segue o ponteiro); Pilha de chamadas (RSP
-    de cada quadro e o método do desenrolar); Breakpoints (condição,
-    contagem, acertos, adiados, carga de módulo); Módulos (PDB baixado ou
-    não; clique abre o `lmv`); Objetos do NT (as consultas do `kd/inspect.rs`,
+    (bytes, words, dwords, qwords, ponteiros com símbolo, ASCII, UTF-16;
+    procura de bytes, texto ou UTF-16; um qword que parece ponteiro segue
+    com um clique e "voltar" desfaz; a janela também como uma struct do PDB
+    do ntoskrnl, campo a campo); Pilha de chamadas (RSP, módulo, função e
+    arquivo:linha de cada quadro e o método do desenrolar; numa thread de
+    um processo de usuário parada no kernel, segue pelo CONTEXT de usuário
+    salvo da thread, com os módulos do processo, que vira o processo das
+    leituras); Breakpoints (condição, contagem, acertos, adiados, carga de
+    módulo, eventos, por página; log, comandos, grupo e as opções de acerto
+    num editor; ligar e desligar um grupo); Módulos (do sistema e do
+    processo das leituras, escolhido na lista; o estado do PDB: o ELF do
+    OpenNT, PDB público, baixando, falhou, só exports ou sem arquivo, com o
+    nome e a identidade do PDB; clique abre o `lmv`); Processos e CPUs (o
+    `.process` pelo botão direito) e Threads (estado, motivo e modo da
+    espera, prioridade e base, suspensão e tempos, lidos do KTHREAD pelos
+    offsets e enums do PDB do ntoskrnl); Objetos do NT (as consultas do `kd/inspect.rs`,
     o módulo e qualquer struct do PDB; endereços azuis abrem como IRP,
     dispositivo, driver, thread ou processo pelo botão direito); Análise do
     bugcheck (abre sozinha numa parada pelo KeBugCheckEx); Rastro; Comandos
     (histórico e Tab para completar comandos, símbolos e tipos); DbgPrint e
-    o log da COM1.
+    o log da COM1 (filtro, cada parada marcada na linha em que aconteceu e
+    a lista delas; `--serial-log=ARQ` ou o campo do painel acompanham o
+    `serial.log` de um `xtask` aberto à parte, e o `--connect` usa o do
+    diretório de build). As leituras caras (o resto do estado do
+    processador, o KTHREAD de cada thread e a parte de usuário da pilha) só
+    entram com o painel que as mostra aberto e a opção dele ligada.
   - Rastro: os modos do `trace` (N instruções, até um endereço, até o
     retorno, até entrar ou sair de um módulo), "só a função corrente",
     módulos pulados e um endereço vigiado. A tabela é virtual (centenas de
@@ -5672,7 +5692,9 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     `tests/smoke.rs`), sem janela: abre o OpenNT com o QEMU sem tela, anexa
     no começo do boot, para na carga do ACPI.sys real (`sxe ld`), para
     dentro dele no retorno de uma chamada ao IoCreateDevice e confere a
-    pilha pela `.pdata` com os nomes do PDB público, rastreia 200 instruções
+    pilha pela `.pdata` com os nomes do PDB público, confere as vistas (o
+    módulo e a linha de cada quadro, o estado do PDB, o SSE e o DR7, o
+    KTHREAD de cada thread), rastreia 200 instruções
     no driver, mostra o objeto de driver, um IRP de PnP e o dispositivo dele
     na rotina IRP_MJ_PNP do driver, pede a parada com a máquina rodando,
     rastreia `kernel::ntos::ke::run_kernel_tasks` até o retorno (árvore com

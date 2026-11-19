@@ -7,6 +7,9 @@
 //! - a parada dentro do acpi.sys real (no retorno de uma chamada ao
 //!   IoCreateDevice) e a pilha através dele pela `.pdata`, com os nomes do
 //!   PDB público;
+//! - as vistas: o módulo e a linha de cada quadro, o estado do PDB de cada
+//!   módulo, o estado estendido do processador (SSE, DR7) e a espera e a
+//!   prioridade das threads pelo KTHREAD;
 //! - um rastro curto dentro do driver, com os símbolos e a árvore;
 //! - o objeto de driver, um IRP de PnP e o objeto de dispositivo dele (na
 //!   rotina de despacho IRP_MJ_PNP do driver);
@@ -30,7 +33,8 @@ use kd_client::client::BreakpointRequest;
 use kd_client::commands::TraceOptions;
 use kd_client::BreakpointKind;
 use kd_gui::app::{DebuggerApp, Tab};
-use kd_gui::backend::{Backend, Config, QueryKind, Request, Shared, Status, Target};
+use kd_gui::backend::{Backend, Config, QueryKind, Request, Shared, Status, Target, Wanted};
+use kd_gui::details::PdbStatus;
 use kd_gui::launcher::LaunchOptions;
 use kd_gui::{offscreen, scenario};
 
@@ -130,7 +134,39 @@ fn launches_breaks_and_stops_at_a_breakpoint() {
         assert!(first_kernel >= 1, "{frames:?}");
         assert_eq!(frames[first_kernel].method, ".pdata", "{frames:?}");
         assert!(frames[first_kernel..].iter().any(|frame| frame.name.starts_with("kernel::ntos::io::")), "a pilha nao volta ao kernel: {frames:?}");
+        // As vistas: o módulo de cada quadro, a linha do DWARF nos quadros do
+        // kernel do OpenNT e o estado do PDB de cada módulo.
+        assert_eq!(frames[0].module, module, "{frames:?}");
+        assert!(frames[first_kernel..].iter().any(|frame| frame.line.is_some()), "sem arquivo:linha nos quadros do kernel: {frames:?}");
+        assert!(snapshot.modules.iter().any(|row| row.status == PdbStatus::Elf), "{:?}", snapshot.modules);
+        let row = snapshot.modules.iter().find(|row| row.name == module).expect("o modulo do driver");
+        assert!(!matches!(row.status, PdbStatus::Elf | PdbStatus::NoFile), "{row:?}");
     }
+
+    // As leituras extras das vistas: o resto do estado do processador e a
+    // espera e a prioridade das threads pelo KTHREAD (os offsets do PDB).
+    let before = generation(&backend);
+    backend.send(Request::SetWanted(Wanted { extended: true, thread_details: true, thread_filter: None, user_stack: true }));
+    wait(&backend, "as leituras extras", Duration::from_secs(300), |shared| shared.snapshot.generation > before && shared.activity.is_empty());
+    {
+        let shared = backend.shared();
+        let snapshot = &shared.snapshot;
+        let extended = snapshot.extended.as_ref().expect("o estado estendido pedido").as_ref().unwrap_or_else(|error| panic!("{error}"));
+        assert!(extended.xmm.iter().all(Option::is_some), "{extended:?}");
+        assert!(extended.debug[5].is_some(), "sem o DR7: {extended:?}");
+        // O mesmo campo State do KTHREAD que a tabela do alvo mostra (sem o
+        // PDB do ntoskrnl ainda, a nota diz por quê).
+        let detailed: Vec<_> = snapshot.threads.iter().filter_map(|row| row.detail.as_ref().map(|detail| (row, detail))).collect();
+        if snapshot.threads_note.is_empty() || !detailed.is_empty() {
+            assert!(!detailed.is_empty(), "nenhuma thread com detalhes: {}", snapshot.threads_note);
+            for (row, detail) in &detailed {
+                assert!(detail.state == row.thread.state || detail.state.starts_with("GateWait"), "{row:?} {detail:?}");
+            }
+        }
+    }
+    let before = generation(&backend);
+    backend.send(Request::SetWanted(Wanted::default()));
+    wait(&backend, "sem as leituras extras", Duration::from_secs(120), |shared| shared.snapshot.generation > before && shared.activity.is_empty());
 
     // Um rastro curto dentro do driver.
     let traces = backend.shared().trace_generation;
