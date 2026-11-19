@@ -128,6 +128,16 @@ pub fn remove_all() {
     }
 }
 
+/// O processo saiu: os comparadores dele ficam livres (as threads saem
+/// com ele, sem precisar do DR7 limpo).
+pub fn process_exited(eprocess: u64) {
+    for index in 0..SLOTS {
+        if matches!(slot(index), Some((_, _, _, process, _)) if process == eprocess) {
+            TABLE[index].kind.store(0, Ordering::Release);
+        }
+    }
+}
+
 /// Algum comparador de usuário armado.
 pub fn any() -> bool {
     (0..SLOTS).any(|index| slot(index).is_some())

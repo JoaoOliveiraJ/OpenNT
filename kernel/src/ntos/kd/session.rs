@@ -437,7 +437,9 @@ fn breakpoint(owner: usize, insert: bool, text: &[u8], reply: &mut Payload) {
     };
     let done = match kind {
         b"0" if insert => breakpoints::insert(process_context::memory_space(owner), address),
-        b"0" => breakpoints::remove(address),
+        // Na metade de usuário, o processo escolhido deixa de ser dono (o
+        // byte volta quando não sobra nenhum).
+        b"0" => breakpoints::remove(process_context::memory_space(owner), address),
         b"1" | b"2" | b"4" => {
             let watch = match kind {
                 b"1" => Watch::Execute,

@@ -183,6 +183,9 @@ pub fn unmap(view: &OwnedView) -> Result<(), KernelError> {
     // cópias privadas voltam ao PFN; os frames protótipo voltam com a
     // última referência da control area.
     if !image.unmapped.swap(true, Ordering::AcqRel) {
+        // Os breakpoints do depurador deste processo nos quadros da vista
+        // saem antes de os quadros voltarem ao PFN.
+        crate::ntos::kd::breakpoints::view_unmapped(image.root, &image.pages.lock().frames);
         let count = image.pages.lock().frames.len() as u64;
         if paging_root_alive(image.root) {
             for index in 0..count {

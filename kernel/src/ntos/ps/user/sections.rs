@@ -1166,6 +1166,10 @@ pub fn fault(address: u64, error: u32) -> bool {
             view.state.lock().private_frames.remove(&index);
             let _ = section_cache::restore(&[frame]);
             pfn::free_page(frame);
+        } else {
+            // A cópia leva os 0xCC do depurador (código numa vista de
+            // dados copy-on-write).
+            crate::ntos::kd::breakpoints::page_copied(root, address & !(PAGE - 1), original, frame);
         }
         return published;
     }

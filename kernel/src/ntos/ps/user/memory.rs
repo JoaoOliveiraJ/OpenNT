@@ -1471,9 +1471,15 @@ pub fn protect_in(space: Space, base_pointer: u64, size_pointer: u64, new_protec
     // cópia privada do processo (o PAGE_WRITECOPY resolvido).
     let mut changes = changes;
     if writable {
-        for (_, index, physical) in changes.iter_mut() {
+        for (va, index, physical) in changes.iter_mut() {
             match region.write_copy(*index) {
-                Some(Ok(copy)) => *physical = copy,
+                Some(Ok(copy)) => {
+                    // A cópia leva os 0xCC do depurador: o breakpoint do
+                    // processo segue com ele, e o quadro compartilhado fica
+                    // com o dos outros.
+                    crate::ntos::kd::breakpoints::page_copied(root, *va, *physical, copy);
+                    *physical = copy;
+                }
                 Some(Err(status)) => return Ok(status),
                 None => {}
             }

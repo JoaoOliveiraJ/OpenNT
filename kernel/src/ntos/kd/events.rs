@@ -16,6 +16,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::packet::Payload;
 use super::stop;
+use crate::hal::cpu;
 use crate::ntos::ps::process;
 
 static LAST_PROCESS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
@@ -54,10 +55,17 @@ pub extern "sysv64" fn opennt_kd_image_event(base: u64, size: u64, process_id: u
 /// O gancho de `ps::notify::process::notify`.
 pub fn process(pointer: u64, process_id: u64, created: bool) {
     if stop::active() {
-        // Um processo saindo leva os breakpoints de memória dele antes de o
-        // espaço de endereços ser desmontado.
+        // Um processo saindo leva os breakpoints dele (de memória, de
+        // hardware e de software) antes de o espaço de endereços ser
+        // desmontado: o byte original volta aos quadros de imagem que outros
+        // processos executam. O host, parado no evento logo depois, já vê
+        // os slots livres.
         if !created {
             super::page_breakpoints::process_exited(pointer);
+            super::user_hardware::process_exited(pointer);
+            if let Some(root) = super::process_context::root_of(cpu::read_cr3(), pointer) {
+                super::breakpoints::process_exited(root);
+            }
         }
         opennt_kd_process_event(pointer, process_id, created as u64);
     }
