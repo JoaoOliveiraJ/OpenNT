@@ -164,6 +164,10 @@ pub struct Stat {
     /// FileAttributeTagInformation.
     pub reparse_tag: u32,
     pub times: Vec<u8>,
+    /// O SecurityId do $STANDARD_INFORMATION (+0x34; 0 num de 48 bytes):
+    /// a chave do descritor do arquivo no $SII do $Secure
+    /// (`ntfs_security`).
+    pub security_id: u32,
 }
 
 struct Caches {
@@ -192,6 +196,10 @@ pub struct Ntfs {
     caches: SpinLock<Caches>,
     /// Estado do writer (`ntfs_write`), acoplado na primeira mutação.
     pub(super) writer: super::ntfs_write::WriterLock,
+    /// Os descritores do $SDS já lidos, por SecurityId. Uma entrada do $SDS
+    /// nunca muda depois de gravada; só uma transação desfeita, que pode ter
+    /// dado o id a outro descritor, esvazia o cache (`ntfs_write`).
+    pub(super) secure_cache: SpinLock<BTreeMap<u32, Arc<Vec<u8>>>>,
 }
 
 fn ascii(bytes: &[u8], offset: usize, length: usize) -> String {
@@ -223,7 +231,7 @@ pub fn mount(drive: u8) -> Result<Arc<Ntfs>, KernelError> {
         return Err(error("NTFS: geometria nao suportada"));
     }
     let generation = generation_of(drive);
-    Ok(Arc::new(Ntfs { drive, geometry, boot, pending: SpinLock::new(Vec::new()), caches: SpinLock::new(Caches { generation, directories: BTreeMap::new(), layouts: BTreeMap::new() }), writer: super::ntfs_write::new_writer() }))
+    Ok(Arc::new(Ntfs { drive, geometry, boot, pending: SpinLock::new(Vec::new()), caches: SpinLock::new(Caches { generation, directories: BTreeMap::new(), layouts: BTreeMap::new() }), writer: super::ntfs_write::new_writer(), secure_cache: SpinLock::new(BTreeMap::new()) }))
 }
 
 /// Índice do dispositivo do volume (`\Device\KernelVolume1`, o D:).
@@ -244,6 +252,9 @@ static MOUNTED: SpinLock<Option<Arc<Ntfs>>> = SpinLock::new(None);
 static FIXED: SpinLock<Option<&'static Ntfs>> = SpinLock::new(None);
 
 pub fn set_mounted(volume: Option<Arc<Ntfs>>) {
+    if let Some(volume) = &volume {
+        super::ntfs_security::log_summary(volume);
+    }
     *MOUNTED.lock() = volume;
 }
 
@@ -346,6 +357,24 @@ impl super::volume::FileSystem for Ntfs {
         Some(Ntfs::remove(self, path).map(|()| true))
     }
 
+    /// O descritor do $Secure (`ntfs_security`); um volume sem descritor
+    /// nenhum fica sem segurança.
+    fn query_security(&self, path: &str) -> Option<Result<Vec<u8>, KernelError>> {
+        match Ntfs::file_security(self, path) {
+            Ok(Some(descriptor)) => Some(Ok(descriptor.to_vec())),
+            Ok(None) => None,
+            Err(error) => Some(Err(error)),
+        }
+    }
+
+    fn set_security(&self, path: &str, descriptor: &[u8]) -> Option<Result<(), KernelError>> {
+        Some(Ntfs::set_security(self, path, descriptor))
+    }
+
+    fn create_secured(&self, path: &str, directory: bool, attributes: u32, security: &[u8]) -> Option<Result<(), KernelError>> {
+        Some(Ntfs::create_with_security(self, path, directory, attributes, 0, Some(security)).map(|_| ()))
+    }
+
     fn volume_serial(&self) -> Option<u64> {
         Ntfs::volume_information(self).ok().map(|information| information.serial as u64)
     }
@@ -399,6 +428,58 @@ pub fn find_attribute(record: &[u8], attribute_type: u32) -> Result<Option<Attri
         true
     })?;
     Ok(found)
+}
+
+/// O nome de um atributo cru (NameLength em +9, NameOffset em +10); vazio
+/// no atributo sem nome.
+pub fn attribute_name(raw: &[u8]) -> String {
+    let length = raw[9] as usize;
+    let offset = u16_at(raw, 10) as usize;
+    if length == 0 || offset + length * 2 > raw.len() {
+        return String::new();
+    }
+    utf16_at(raw, offset, length)
+}
+
+/// O atributo do tipo e do nome dados (o $Secure tem dois $INDEX_ROOT, o
+/// $SDH e o $SII, e o $DATA dele é o $SDS).
+pub fn find_named_attribute(record: &[u8], attribute_type: u32, name: &str) -> Result<Option<Attribute>, KernelError> {
+    let mut found = None;
+    each_attribute(record, |attribute| {
+        if attribute.attribute_type == attribute_type && attribute_name(&attribute.raw) == name {
+            found = Some(attribute.clone());
+            return false;
+        }
+        true
+    })?;
+    Ok(found)
+}
+
+/// Uma entrada de um índice (das folhas e dos nós, sem a entrada final):
+/// os 8 bytes do começo (a referência do arquivo num $I30; DataOffset e
+/// DataLength num índice de visão), o KeyLength e o que vem depois do
+/// cabeçalho de 16 bytes, sem o VCN do filho (a chave e, num índice de
+/// visão, os dados e o preenchimento).
+#[derive(Clone, Debug)]
+pub struct RawIndexEntry {
+    pub head: [u8; 8],
+    pub key_length: usize,
+    pub body: Vec<u8>,
+}
+
+impl RawIndexEntry {
+    pub fn key(&self) -> &[u8] {
+        &self.body[..self.key_length.min(self.body.len())]
+    }
+
+    /// Os dados de uma entrada de índice de visão: DataOffset (a partir do
+    /// começo da entrada) e DataLength.
+    pub fn view_data(&self) -> Option<&[u8]> {
+        let offset = u16_at(&self.head, 0) as usize;
+        let length = u16_at(&self.head, 2) as usize;
+        let start = offset.checked_sub(16)?;
+        self.body.get(start..start + length)
+    }
 }
 
 /// Runlist -> runs; runs esparsas ou vazias não são suportadas.
@@ -552,13 +633,34 @@ impl Ntfs {
         }
         let index = find_attribute(&root, 0x90)?.filter(|index| !index.non_resident).ok_or_else(|| error("NTFS: $INDEX_ROOT nao residente nao suportado"))?;
         let allocation = find_attribute(&root, 0xA0)?;
+        let mut names = Vec::new();
+        for entry in self.index_entries(&root, &index, allocation.as_ref())? {
+            let value = entry.key();
+            if value.len() < 66 || 66 + value[64] as usize * 2 > value.len() {
+                return Err(error("NTFS: nome de indice invalido"));
+            }
+            let reference = u32_at(&entry.head, 0) as u64 | (u16_at(&entry.head, 4) as u64) << 32;
+            names.push(IndexEntry { name: file_name_of(value), reference, sequence: u16_at(&entry.head, 6), value: value.to_vec() });
+        }
+        self.caches.lock().directories.insert(reference, names.clone());
+        Ok(names)
+    }
+
+    /// As entradas do índice da raiz `index` (um $INDEX_ROOT residente) e
+    /// dos blocos INDX do $INDEX_ALLOCATION `allocation`, em ordem: o filho
+    /// de cada entrada vem antes dela.
+    pub fn index_entries(&self, record: &[u8], index: &Attribute, allocation: Option<&Attribute>) -> Result<Vec<RawIndexEntry>, KernelError> {
+        let _shared = self.resource().acquire_shared();
+        if index.non_resident || index.value.len() < 32 {
+            return Err(error("NTFS: $INDEX_ROOT nao residente nao suportado"));
+        }
         let block_size = u32_at(&index.value, 8) as u64;
-        let runs = match &allocation {
-            Some(allocation) if allocation.non_resident => parse_runs(&root, allocation.run_offset)?,
+        let runs = match allocation {
+            Some(allocation) if allocation.non_resident => parse_runs(record, allocation.run_offset)?,
             _ => Vec::new(),
         };
         let mut visited = alloc::collections::BTreeSet::new();
-        let mut names = Vec::new();
+        let mut entries = Vec::new();
         let read_block = |vcn: u64, visited: &mut alloc::collections::BTreeSet<u64>| -> Result<Vec<u8>, KernelError> {
             if !visited.insert(vcn) || visited.len() > 65536 {
                 return Err(error("NTFS: ciclo no indice"));
@@ -598,7 +700,7 @@ impl Ntfs {
             apply_fixup(&mut block, usa, count, self.geometry.sector_size as usize, "NTFS: fixup INDX invalido")?;
             Ok(block)
         };
-        fn walk(node: &[u8], header: usize, depth: u32, names: &mut Vec<IndexEntry>, visited: &mut alloc::collections::BTreeSet<u64>, read_block: &dyn Fn(u64, &mut alloc::collections::BTreeSet<u64>) -> Result<Vec<u8>, KernelError>) -> Result<(), KernelError> {
+        fn walk(node: &[u8], header: usize, depth: u32, entries: &mut Vec<RawIndexEntry>, visited: &mut alloc::collections::BTreeSet<u64>, read_block: &dyn Fn(u64, &mut alloc::collections::BTreeSet<u64>) -> Result<Vec<u8>, KernelError>) -> Result<(), KernelError> {
             if depth > 32 {
                 return Err(error("NTFS: profundidade de indice invalida"));
             }
@@ -609,31 +711,65 @@ impl Ntfs {
             }
             while offset + 16 <= end {
                 let size = u16_at(node, offset + 8) as usize;
-                let stream_length = u16_at(node, offset + 10) as usize;
+                let key_length = u16_at(node, offset + 10) as usize;
                 let flags = u16_at(node, offset + 12);
-                if size < 16 || size % 8 != 0 || offset + size > end || 16 + stream_length + if flags & 1 != 0 { 8 } else { 0 } > size {
+                let child = if flags & 1 != 0 { 8 } else { 0 };
+                if size < 16 || size % 8 != 0 || offset + size > end || 16 + key_length + child > size {
                     return Err(error("NTFS: entrada de indice invalida"));
                 }
                 if flags & 1 != 0 {
-                    let child = read_block(u64_at(node, offset + size - 8), visited)?;
-                    walk(&child, 24, depth + 1, names, visited, read_block)?;
+                    let block = read_block(u64_at(node, offset + size - 8), visited)?;
+                    walk(&block, 24, depth + 1, entries, visited, read_block)?;
                 }
                 if flags & 2 != 0 {
                     return Ok(());
                 }
-                if stream_length < 66 || 66 + node[offset + 16 + 64] as usize * 2 > stream_length {
-                    return Err(error("NTFS: nome de indice invalido"));
-                }
-                let reference = u32_at(node, offset) as u64 | (u16_at(node, offset + 4) as u64) << 32;
-                let value = node[offset + 16..offset + 16 + stream_length].to_vec();
-                names.push(IndexEntry { name: file_name_of(&value), reference, sequence: u16_at(node, offset + 6), value });
+                let mut head = [0u8; 8];
+                head.copy_from_slice(&node[offset..offset + 8]);
+                entries.push(RawIndexEntry { head, key_length, body: node[offset + 16..offset + size - child].to_vec() });
                 offset += size;
             }
             Err(error("NTFS: indice sem entrada final"))
         }
-        walk(&index.value, 16, 0, &mut names, &mut visited, &read_block)?;
-        self.caches.lock().directories.insert(reference, names.clone());
-        Ok(names)
+        walk(&index.value, 16, 0, &mut entries, &mut visited, &read_block)?;
+        Ok(entries)
+    }
+
+    /// `[offset, offset+length)` do valor de um atributo do registro: o
+    /// residente, ou pelas runs (com as escritas pendentes por cima), cortado
+    /// no tamanho real.
+    pub fn read_attribute_range(&self, record: &[u8], attribute: &Attribute, offset: u64, length: u64) -> Result<Vec<u8>, KernelError> {
+        let _shared = self.resource().acquire_shared();
+        if !attribute.non_resident {
+            let start = (offset as usize).min(attribute.value.len());
+            let end = (offset.saturating_add(length) as usize).min(attribute.value.len());
+            return Ok(attribute.value[start..end].to_vec());
+        }
+        let length = length.min(attribute.real_size.saturating_sub(offset));
+        let (cluster, sector) = (self.geometry.cluster_size, self.geometry.sector_size);
+        let mut out = Vec::with_capacity(length as usize);
+        let mut base = 0u64;
+        for run in parse_runs(record, attribute.run_offset)? {
+            if out.len() as u64 >= length {
+                break;
+            }
+            let end = base + run.count * cluster;
+            let want = offset + out.len() as u64;
+            if want >= end {
+                base = end;
+                continue;
+            }
+            let take = (offset + length).min(end) - want;
+            let physical = run.lcn as u64 * cluster + (want - base);
+            let skip = physical % sector;
+            let bytes = self.read_sectors(physical / sector, (skip + take).div_ceil(sector))?;
+            out.extend_from_slice(&bytes[skip as usize..(skip + take) as usize]);
+            base = end;
+        }
+        if (out.len() as u64) < length {
+            return Err(error("NTFS: runlist menor que atributo"));
+        }
+        Ok(out)
     }
 
     /// Resolve um caminho `/A/B` sem diferença de caixa; `.` e `..` são recusados.
@@ -686,8 +822,9 @@ impl Ntfs {
             creation_time: u64_at(&standard.value, 0),
             file_system: "NTFS",
             // FILE_CASE_PRESERVED_NAMES | FILE_UNICODE_ON_DISK |
+            // FILE_PERSISTENT_ACLS (o $Secure, `ntfs_security`) |
             // FILE_SUPPORTS_REPARSE_POINTS (`ntfs_reparse`).
-            attributes: 0x86,
+            attributes: 0x8E,
             maximum_component_length: 255,
             supports_objects: false,
             device_type: 7,
@@ -728,6 +865,7 @@ impl Ntfs {
             need_ea: ea.as_ref().map_or(0, |ea| u16_at(&ea.value, 2)),
             attributes: file_attributes,
             reparse_tag,
+            security_id: standard.as_ref().filter(|standard| standard.value.len() >= 72).map_or(0, |standard| u32_at(&standard.value, 52)),
             times: standard.map_or(alloc::vec![0; 32], |standard| standard.value[..32].to_vec()),
         }))
     }

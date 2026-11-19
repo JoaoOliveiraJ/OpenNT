@@ -370,6 +370,21 @@ pub fn compute_auto_inherit_by_object_type(child: u64, parent: u64) -> u32 {
     flags
 }
 
+/// [`compute_auto_inherit_by_object_type`] sobre componentes já lidos (o
+/// descritor explícito do filho, se houver, e o do pai).
+pub fn auto_inherit_flags(child: Option<&OwnedDescriptor>, parent: Option<&OwnedDescriptor>) -> u32 {
+    let Some(parent) = parent else { return 0 };
+    let child_control = child.map_or(0, |child| child.control);
+    let mut flags = 0;
+    if child_control & SE_DACL_PRESENT == 0 && parent.control & SE_DACL_AUTO_INHERITED != 0 {
+        flags |= SEF_DACL_AUTO_INHERIT;
+    }
+    if child_control & SE_SACL_PRESENT == 0 && parent.control & SE_SACL_AUTO_INHERITED != 0 {
+        flags |= SEF_SACL_AUTO_INHERIT;
+    }
+    flags
+}
+
 /// SeCheckForCriticalAceRemoval(CurrentSd, NewSd, Subject, *AceRemoved): no
 /// 19041 a detecção (SepCheckForCriticalAceRemoval) só alimenta telemetria;
 /// a saída é sempre FALSE.

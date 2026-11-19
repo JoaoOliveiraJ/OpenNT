@@ -11,6 +11,7 @@ pub mod extended_attributes;
 pub mod ntfs_write;
 pub mod ntfs_control;
 pub mod ntfs_reparse;
+pub mod ntfs_security;
 pub mod volume_information;
 pub mod filter_callbacks;
 pub mod volume_files;

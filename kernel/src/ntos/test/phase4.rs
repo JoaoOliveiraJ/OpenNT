@@ -800,7 +800,7 @@ fn fs_volume_queries(assert: Assert) {
     let read = |bytes: &[u8], at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap_or([0; 8]));
     assert(read(&size.bytes, 0) == geometry.total_sectors && read(&size.bytes, 8) == read(&full.bytes, 16) && size.bytes[16] == 1 && size.bytes[20..22] == [0, 2] && full.bytes[24] == 1, "fsinfo: FileFsSize e FileFsFullSize");
     let attribute = query(5, 64);
-    assert(query(4, 8).bytes[0] == 7 && attribute.information == 20 && attribute.bytes[0] == 0x86 && attribute.bytes[4] == 255 && attribute.bytes[12..20] == [b'N', 0, b'T', 0, b'F', 0, b'S', 0], "fsinfo: FileFsDevice e FileFsAttribute");
+    assert(query(4, 8).bytes[0] == 7 && attribute.information == 20 && attribute.bytes[0] == 0x8E && attribute.bytes[4] == 255 && attribute.bytes[12..20] == [b'N', 0, b'T', 0, b'F', 0, b'S', 0], "fsinfo: FileFsDevice e FileFsAttribute (com FILE_PERSISTENT_ACLS)");
     // FsRtlGetFileNameInformation pela tabela do Filter Manager.
     assert(filters::current_callbacks() == 0 && filters::get_file_name_information(1, 2, 3, 4) == 0xC000_00BB, "filter: sem Filter Manager");
     let table = guest::alloc_bytes(0x30);

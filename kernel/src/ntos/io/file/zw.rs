@@ -305,6 +305,22 @@ fn follow_boot_volume_reparse(object_name: String, mut options: u32, object_flag
     }
 }
 
+/// Um arquivo novo de uma abertura do kernel: o descritor do
+/// NtfsCacheSharedSecurityForCreate (o explícito dos OBJECT_ATTRIBUTES, o
+/// AccessState->SecurityDescriptor do IopParseDevice, capturado em
+/// KernelMode; a herança do diretório pai; o token de quem abre, sem as
+/// checagens de dono e de privilégio do UserMode). Um volume sem segurança
+/// cria pelo `truncate`.
+fn create_new_file(volume: &'static dyn FileSystem, path: &str, attributes_pointer: u64) -> Result<(), KernelError> {
+    let explicit_pointer = if attributes_pointer != 0 { object_attributes_at(attributes_pointer).security_descriptor.get() } else { 0 };
+    let explicit = crate::ntos::ob::object_security::capture_descriptor(explicit_pointer, false).map_err(|status| KernelError::with_status("ZwCreateFile: descritor dos OBJECT_ATTRIBUTES", status))?;
+    match crate::drivers::fs::ntfs_security::descriptor_for_create(volume, path, explicit.as_ref(), false, false) {
+        Some(Ok(descriptor)) => volume.create_secured(path, false, 0x20, &descriptor).unwrap_or_else(|| volume.truncate(path)),
+        Some(Err(status)) => Err(KernelError::with_status("ZwCreateFile: descritor do arquivo novo", status)),
+        None => volume.truncate(path),
+    }
+}
+
 /// ZwCreateFile/ZwOpenFile/IoCreateFile do kernel.
 #[allow(clippy::too_many_arguments)]
 pub fn create_kernel_file(output: u64, desired_access: u32, attributes_pointer: u64, io_status: u64, share_access: u32, disposition: u32, options: u32) -> Result<u32, KernelError> {
@@ -426,10 +442,11 @@ pub fn create_kernel_file_with_context(output: u64, desired_access: u32, attribu
             if !writable {
                 return Ok(STATUS_MEDIA_WRITE_PROTECTED);
             }
-            volume.truncate(&path)?;
             if exists {
+                volume.truncate(&path)?;
                 FILE_SUPERSEDED
             } else {
+                create_new_file(volume, &path, attributes_pointer)?;
                 FILE_CREATED
             }
         }
@@ -446,7 +463,7 @@ pub fn create_kernel_file_with_context(output: u64, desired_access: u32, attribu
                 if !writable {
                     return Ok(STATUS_MEDIA_WRITE_PROTECTED);
                 }
-                volume.truncate(&path)?;
+                create_new_file(volume, &path, attributes_pointer)?;
                 FILE_CREATED
             }
         }
@@ -457,7 +474,7 @@ pub fn create_kernel_file_with_context(output: u64, desired_access: u32, attribu
                 if !writable {
                     return Ok(STATUS_MEDIA_WRITE_PROTECTED);
                 }
-                volume.truncate(&path)?;
+                create_new_file(volume, &path, attributes_pointer)?;
                 FILE_CREATED
             }
         }
@@ -468,10 +485,11 @@ pub fn create_kernel_file_with_context(output: u64, desired_access: u32, attribu
             if disposition == FILE_OVERWRITE && !exists {
                 return not_found(io_status);
             }
-            volume.truncate(&path)?;
             if exists {
+                volume.truncate(&path)?;
                 FILE_OVERWRITTEN
             } else {
+                create_new_file(volume, &path, attributes_pointer)?;
                 FILE_CREATED
             }
         }
@@ -520,7 +538,7 @@ pub fn nt_create_file(handle: u64, desired_access: u32, attributes: u64, io_stat
     if crate::ntos::ps::previous_mode::get()? == 0 {
         return create_kernel_file(handle, desired_access, attributes, io_status, share_access, disposition, options);
     }
-    let request = crate::ntos::ps::user::file_io::OpenRequest { access: desired_access, share: share_access, options, allocation_pointer: allocation, attributes: file_attributes, ea_buffer, ea_length, handle_attributes: 0 };
+    let request = crate::ntos::ps::user::file_io::OpenRequest { access: desired_access, share: share_access, options, allocation_pointer: allocation, attributes: file_attributes, ea_buffer, ea_length, handle_attributes: 0, explicit: None };
     crate::ntos::ps::user::files::open_nt_file(handle, attributes, io_status, disposition, &request)
 }
 
@@ -559,6 +577,16 @@ pub fn file_options(file: u64) -> u32 {
 /// Volume e caminho do FILE_OBJECT (arquivos de volume).
 pub fn file_backing(file: u64) -> Option<(&'static dyn FileSystem, String)> {
     FILES_BY_OBJECT.lock().get(&file).map(|(volume, path, _)| (*volume, path.clone()))
+}
+
+/// O volume e o caminho de um FILE_OBJECT de arquivo de volume: o de um
+/// arquivo aberto pelo kernel (`file_backing`) ou o da fonte de um arquivo
+/// de modo usuário ou do executável de um processo.
+pub fn volume_file_of(file: u64) -> Option<(&'static dyn FileSystem, String)> {
+    file_backing(file).or_else(|| {
+        let source = file_objects::source(file)?;
+        Some((source.volume()?, source.volume_path()?))
+    })
 }
 
 /// IoQueryFileInformation/ZwQueryInformationFile por FILE_OBJECT para os

@@ -186,7 +186,21 @@ fn open_file(handle_pointer: u64, attributes: u64, iosb: u64, disposition: u32, 
             return open_relative_to_device(handle_pointer, &root, &parsed.path, object_flags, iosb, disposition, request);
         }
     }
-    open_by_name(handle_pointer, &parsed.path, object_flags, iosb, disposition, request, special)
+    // [Q-FILESEC hook 1, step 1+] O AccessState->SecurityDescriptor dos OA.
+    let explicit = match capture_explicit_descriptor(attributes) {
+        Ok(descriptor) => descriptor,
+        Err(status) => return Ok(status),
+    };
+    open_by_name(handle_pointer, &parsed.path, object_flags, iosb, disposition, &OpenRequest { explicit, ..request.clone() }, special)
+}
+
+/// O SeCaptureSecurityDescriptor do OBJECT_ATTRIBUTES.SecurityDescriptor de
+/// modo usuário (o ObpCaptureObjectCreateInformation do ObOpenObjectByName),
+/// que o IopParseDevice põe no AccessState->SecurityDescriptor: `None` sem
+/// descritor, ou o NTSTATUS de um descritor inválido ou ilegível.
+fn capture_explicit_descriptor(attributes: u64) -> Result<Option<crate::ntos::se::policy_descriptor::OwnedDescriptor>, u32> {
+    let pointer = state::user_struct::<crate::ntos::inc::types::ObjectAttributes>(attributes).and_then(|object| object.security_descriptor.probe_get()).map_err(|error| if error.status != 0 { error.status } else { 0xC000_0005 })?;
+    crate::ntos::ob::object_security::capture_descriptor(pointer, true)
 }
 
 /// O EaBuffer de um IRP_MJ_CREATE de dispositivo, sondado para leitura
@@ -302,7 +316,7 @@ pub fn open_by_name(handle_pointer: u64, name: &str, object_flags: u32, iosb: u6
     let mut name = String::from(name);
     let mut options = request.options;
     loop {
-        let request = &OpenRequest { options, ..*request };
+        let request = &OpenRequest { options, ..request.clone() };
         // Um volume do kernel pelo nome do volume, sem nome restante
         // (`\??\C:`, o `\\.\C:` do Win32): o IopParseDevice abre o volume
         // inteiro (`io/parse.rs`), não a raiz (`\??\C:\`).
@@ -327,7 +341,7 @@ pub fn open_by_name(handle_pointer: u64, name: &str, object_flags: u32, iosb: u6
         if let Err(status) = walk.arrive(crate::ntos::io::reparse::FILE_DEVICE_DISK) {
             return Ok(fail_iosb(iosb, status));
         }
-        match file_io::create(handle_pointer, &name, iosb, disposition, &OpenRequest { handle_attributes: object_flags, ..*request })? {
+        match file_io::create(handle_pointer, &name, iosb, disposition, &OpenRequest { handle_attributes: object_flags, ..request.clone() })? {
             file_io::Created::Done(status) => return Ok(status),
             file_io::Created::Reparse(found) => {
                 let reparsed = match found.graft(&mut walk, &name).and_then(|reparsed| walk.restart(&reparsed.name).map(|()| reparsed)) {
@@ -454,7 +468,7 @@ fn nt_create_file(handle_pointer: u64, access: u64, attributes: u64, iosb: u64, 
         attributes,
         iosb,
         disposition,
-        &OpenRequest { access: access as u32, allocation_pointer: state::stack_arg(rsp, 5), attributes: state::stack_arg32(rsp, 6), share: state::stack_arg32(rsp, 7), options: state::stack_arg32(rsp, 9), ea_buffer: state::stack_arg(rsp, 10), ea_length: state::stack_arg32(rsp, 11), handle_attributes: 0 },
+        &OpenRequest { access: access as u32, allocation_pointer: state::stack_arg(rsp, 5), attributes: state::stack_arg32(rsp, 6), share: state::stack_arg32(rsp, 7), options: state::stack_arg32(rsp, 9), ea_buffer: state::stack_arg(rsp, 10), ea_length: state::stack_arg32(rsp, 11), handle_attributes: 0, explicit: None },
     )
 }
 

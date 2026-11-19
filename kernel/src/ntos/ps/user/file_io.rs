@@ -123,7 +123,7 @@ fn size64(pointer: u64) -> Result<u64, KernelError> {
 }
 
 /// Parâmetros de NtCreateFile/NtOpenFile.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub struct OpenRequest {
     pub access: u32,
     pub share: u32,
@@ -133,6 +133,10 @@ pub struct OpenRequest {
     pub ea_buffer: u64,
     pub ea_length: u32,
     pub handle_attributes: u32,
+    /// O descritor dos OBJECT_ATTRIBUTES capturado (o
+    /// AccessState->SecurityDescriptor que o IopParseDevice dá ao file
+    /// system): o de um arquivo novo (`ntfs_security::assign_for_create`).
+    pub explicit: Option<crate::ntos::se::policy_descriptor::OwnedDescriptor>,
 }
 
 /// FILE_CONTAINS_EXTENDED_CREATE_INFORMATION.
@@ -149,7 +153,7 @@ const FILE_CONTAINS_EXTENDED_CREATE_INFORMATION: u32 = 0x1000_0000;
 /// pedido volta como veio.
 pub fn extended_create(request: &OpenRequest) -> Result<OpenRequest, u32> {
     if request.options & FILE_CONTAINS_EXTENDED_CREATE_INFORMATION == 0 {
-        return Ok(*request);
+        return Ok(request.clone());
     }
     if (request.ea_length as u64) < ExtendedCreateInformation::SIZE {
         return Err(INVALID);
@@ -163,7 +167,7 @@ pub fn extended_create(request: &OpenRequest) -> Result<OpenRequest, u32> {
     let information = state::user_struct::<ExtendedCreateInformation>(request.ea_buffer).map_err(|error| error.status)?;
     let ea_buffer = information.ea_buffer.probe_get().map_err(|error| error.status)?;
     let ea_length = information.ea_length.probe_get().map_err(|error| error.status)?;
-    Ok(OpenRequest { options: request.options & !FILE_CONTAINS_EXTENDED_CREATE_INFORMATION, ea_buffer, ea_length, ..*request })
+    Ok(OpenRequest { options: request.options & !FILE_CONTAINS_EXTENDED_CREATE_INFORMATION, ea_buffer, ea_length, ..request.clone() })
 }
 
 /// FILE_OPEN_REPARSE_POINT.
@@ -324,7 +328,17 @@ pub fn create(out: u64, name: &str, iosb: u64, disposition: u32, request: &OpenR
                     }
                     return fail(0xC000_0034);
                 }
-                volume.create(&path, directory, request.attributes, reservation)?;
+                // [Q-FILESEC etapa 1] O descritor do arquivo novo
+                // (NtfsCacheSharedSecurityForCreate, em UserMode): a herança
+                // do pai, o descritor dos OBJECT_ATTRIBUTES e o token de quem
+                // cria. O descritor do arquivo novo não é conferido contra
+                // quem cria (NtfsCreateNewFile 0x135396..0x1353b4).
+                let descriptor = match crate::drivers::fs::ntfs_security::descriptor_for_create(&*volume, &path, request.explicit.as_ref(), directory, true) {
+                    Some(Ok(descriptor)) => Some(descriptor),
+                    Some(Err(status)) => return fail(status),
+                    None => None,
+                };
+                volume.create_with_security(&path, directory, request.attributes, reservation, descriptor.as_deref())?;
                 file = volume_files::lookup_volume_file(name);
                 information = 2;
             }

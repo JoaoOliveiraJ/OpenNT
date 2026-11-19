@@ -3262,6 +3262,21 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   NtQueryAttributesFile segue os intermediários e não o último; a
   FileAttributeTagInformation e as listagens dão a tag. O volume informa
   FILE_SUPPORTS_REPARSE_POINTS. Teste: `reparse_points` na fase 7.
+- **Segurança dos arquivos do volume de boot** (`drivers/fs/ntfs_security.rs`):
+  o NTFS do kernel guarda o descritor de cada arquivo como o ntfs.sys, no
+  $Secure: o SecurityId do $STANDARD_INFORMATION é a chave do $SII, o $SDH
+  acha um descritor igual pelo hash e o $SDS guarda as entradas alinhadas a
+  16 com a cópia 0x40000 adiante (`ntfs_write::security_id_for`; os índices
+  de visão usam a mesma B-tree do $I30). Um arquivo novo recebe o descritor
+  do SeAssignSecurityEx (herança do pai, o descritor dos OBJECT_ATTRIBUTES e
+  o token de quem cria; em modo usuário, as checagens de dono e de SACL),
+  tanto no NtCreateFile quanto no ZwCreateFile; o FILE_SUPERSEDE e o
+  FILE_OVERWRITE mantêm o SecurityId. O NtQuerySecurityObject devolve o
+  descritor guardado e o NtSetSecurityObject troca as partes pedidas com
+  AutoInheritFlags 0 (`ntfs_security::modify`). Um volume sem segurança
+  continua com o descritor de World e o sucesso sem mudança do
+  IopGetSetSecurityObject. O volume informa FILE_PERSISTENT_ACLS. A
+  abertura ainda não confere o descritor. Teste: `file_security` na fase 7.
 - **Estado por processo**: o que no NT mora no EPROCESS e o OpenNT ainda não
   guarda numa estrutura do NT fica em `ps/user/process_state.rs`, um
   `ProcessState` por EPROCESS (o System inclusive), criado por

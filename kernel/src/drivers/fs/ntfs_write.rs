@@ -6,10 +6,12 @@
 //! remontagem.
 
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use super::extended_attributes::{self as ea, Entry};
-use super::ntfs::{each_attribute, find_attribute, parse_runs, u16_at, u32_at, u64_at, IndexEntry, Ntfs, PendingWrite, Run, Stat};
+use super::ntfs::{attribute_name, each_attribute, find_attribute, find_named_attribute, parse_runs, u16_at, u32_at, u64_at, IndexEntry, Ntfs, PendingWrite, RawIndexEntry, Run, Stat};
+use super::ntfs_security::{self as security, Header, FIRST_SECURITY_ID, SDS_MIRROR, SECURE_RECORD};
 use crate::drivers::storage::ata_pio;
 use crate::ntos::ke::clock;
 use crate::rtl::{KernelError, SpinLock};
@@ -161,6 +163,72 @@ fn replace(attributes: &mut Vec<Vec<u8>>, attribute_type: u32, raw: Option<Vec<u
         attributes.push(raw);
     }
     attributes.sort_by_key(|attribute| u32_at(attribute, 0));
+}
+
+/// [`replace`] do atributo do tipo e do nome dados (o $Secure tem dois
+/// índices, o $SDH e o $SII); a lista fica na ordem do registro do NTFS,
+/// por tipo e depois por nome.
+fn replace_named(attributes: &mut Vec<Vec<u8>>, attribute_type: u32, name: &str, raw: Option<Vec<u8>>) {
+    if let Some(at) = attributes.iter().position(|attribute| u32_at(attribute, 0) == attribute_type && attribute_name(attribute) == name) {
+        attributes.remove(at);
+    }
+    if let Some(raw) = raw {
+        attributes.push(raw);
+    }
+    attributes.sort_by_key(|attribute| (u32_at(attribute, 0), attribute_name(attribute).to_uppercase()));
+}
+
+fn align16(value: u64) -> u64 {
+    value.div_ceil(16) * 16
+}
+
+/// Uma entrada a gravar num índice: os 8 bytes do começo, o KeyLength e o
+/// corpo depois do cabeçalho (a chave e, num índice de visão, os dados).
+struct IndexItem {
+    head: [u8; 8],
+    key_length: usize,
+    body: Vec<u8>,
+}
+
+impl IndexItem {
+    /// A entrada de um $I30: a referência com a sequência (1 quando zero) e
+    /// o $FILE_NAME.
+    fn of_entry(entry: &IndexEntry) -> Self {
+        let reference = entry.reference | (if entry.sequence != 0 { entry.sequence } else { 1 } as u64) << 48;
+        Self { head: reference.to_le_bytes(), key_length: entry.value.len(), body: entry.value.clone() }
+    }
+
+    /// Uma entrada lida de volta sem mudança.
+    fn of_raw(entry: &RawIndexEntry) -> Self {
+        Self { head: entry.head, key_length: entry.key_length, body: entry.body.clone() }
+    }
+
+    /// A entrada de um índice de visão: DataOffset (cabeçalho + chave) e
+    /// DataLength no começo, a chave, os dados e o preenchimento.
+    fn view(key: &[u8], data: &[u8], padding: &[u8]) -> Self {
+        let mut head = [0u8; 8];
+        head[0..2].copy_from_slice(&((16 + key.len()) as u16).to_le_bytes());
+        head[2..4].copy_from_slice(&(data.len() as u16).to_le_bytes());
+        Self { head, key_length: key.len(), body: [key, data, padding].concat() }
+    }
+
+    /// Os bytes da entrada (a final sem item), com o VCN do filho no fim.
+    fn encode(item: Option<&Self>, child: Option<u64>) -> Vec<u8> {
+        let body = item.map_or(0, |item| item.body.len());
+        let size = align(16 + body) + if child.is_some() { 8 } else { 0 };
+        let mut bytes = alloc::vec![0u8; size];
+        if let Some(item) = item {
+            bytes[0..8].copy_from_slice(&item.head);
+            bytes[16..16 + body].copy_from_slice(&item.body);
+        }
+        put16(&mut bytes, 8, size as u64);
+        put16(&mut bytes, 10, item.map_or(0, |item| item.key_length) as u64);
+        put16(&mut bytes, 12, (if item.is_some() { 0 } else { 2 }) | if child.is_some() { 1 } else { 0 });
+        if let Some(child) = child {
+            put64(&mut bytes, size - 8, child);
+        }
+        bytes
+    }
 }
 
 fn value_of(raw: &[u8]) -> Vec<u8> {
@@ -463,6 +531,9 @@ impl Tx<'_> {
             Ok(result)
         })();
         if let Err(error) = &result {
+            // Um SecurityId dado nesta transação volta a ficar livre: o
+            // descritor lido dele não vale mais.
+            self.volume.secure_cache.lock().clear();
             if committing {
                 self.state.poisoned = true;
                 self.state.allocation = None;
@@ -516,63 +587,52 @@ impl Tx<'_> {
         Ok(value)
     }
 
-    fn entry(entry: Option<&IndexEntry>, child: Option<u64>) -> Vec<u8> {
-        let size = align(16 + entry.map_or(0, |entry| entry.value.len())) + if child.is_some() { 8 } else { 0 };
-        let mut bytes = alloc::vec![0u8; size];
-        if let Some(entry) = entry {
-            put64(&mut bytes, 0, entry.reference | (if entry.sequence != 0 { entry.sequence } else { 1 } as u64) << 48);
-            bytes[16..16 + entry.value.len()].copy_from_slice(&entry.value);
-        }
-        put16(&mut bytes, 8, size as u64);
-        put16(&mut bytes, 10, entry.map_or(0, |entry| entry.value.len()) as u64);
-        put16(&mut bytes, 12, (if entry.is_some() { 0 } else { 2 }) | if child.is_some() { 1 } else { 0 });
-        if let Some(child) = child {
-            put64(&mut bytes, size - 8, child);
-        }
-        bytes
-    }
-
-    /// Reconstrói o índice $I30 do diretório (raiz residente e, se não
-    /// couber, blocos INDX numa B-tree).
-    fn directory(&mut self, reference: u64, mut entries: Vec<IndexEntry>) -> Result<(), KernelError> {
-        let record = self.volume.read_record(reference)?;
-        let mut list = attributes(&record)?;
-        if let Some(old) = find_attribute(&record, 0xA0)? {
-            let runs = parse_runs(&record, old.run_offset)?;
+    /// Tira o índice `name` da lista (raiz, blocos e bitmap) e libera os
+    /// clusters dos blocos INDX dele.
+    fn drop_index(&mut self, record: &[u8], list: &mut Vec<Vec<u8>>, name: &str) -> Result<(), KernelError> {
+        if let Some(old) = find_named_attribute(record, 0xA0, name)?.filter(|old| old.non_resident) {
+            let runs = parse_runs(record, old.run_offset)?;
             self.release(&runs)?;
         }
         for attribute_type in [0x90, 0xA0, 0xB0] {
-            replace(&mut list, attribute_type, None);
+            replace_named(list, attribute_type, name, None);
         }
-        if find_attribute(&record, 0xE0)?.is_some() {
-            // Espaço para a raiz residente: EAs grandes de diretório vão
-            // para runs em vez de impedir a criação de filhos.
-            let index_room = 512 + 4096usize.min(entries.iter().fold(16, |total, entry| total + align(16 + entry.value.len())));
-            let current = self.read_ea(&record)?;
-            self.store_ea(&record, &mut list, &current, index_room)?;
-        }
-        entries.sort_by_key(|entry| entry.name.to_uppercase());
+        Ok(())
+    }
+
+    /// O espaço livre de um registro com os atributos da lista (o fim do
+    /// registro e o marcador final de fora).
+    fn room(&self, list: &[Vec<u8>]) -> i64 {
         let record_size = self.volume.geometry.record_size as usize;
         let sector = self.sector() as usize;
+        record_size as i64 - align(48 + (record_size / sector + 1) * 2) as i64 - list.iter().map(|attribute| attribute.len() as i64).sum::<i64>() - 8
+    }
+
+    /// Grava o índice `name` na lista com as entradas já em ordem de
+    /// colação: a raiz residente ($INDEX_ROOT do tipo indexado e da colação
+    /// dados) e, se as entradas não couberem em `root_limit` bytes, uma
+    /// B-tree de blocos INDX de 4 KB ($INDEX_ALLOCATION e $BITMAP de mesmo
+    /// nome). O índice antigo já saiu da lista (`drop_index`).
+    fn build_index(&mut self, list: &mut Vec<Vec<u8>>, name: &str, indexed_type: u32, collation: u32, items: Vec<IndexItem>, root_limit: i64) -> Result<(), KernelError> {
+        let sector = self.sector() as usize;
         let cluster = self.cluster() as usize;
-        let root_limit = record_size as i64 - align(48 + (record_size / sector + 1) * 2) as i64 - list.iter().map(|attribute| attribute.len() as i64).sum::<i64>() - 512;
         let block_size = 4096usize;
         let usa_count = block_size / sector + 1;
         let start = align(40 + usa_count * 2);
         let mut blocks: Vec<Vec<u8>> = Vec::new();
-        let mut nodes: Vec<(IndexEntry, Option<u64>)> = entries.into_iter().map(|entry| (entry, None)).collect();
+        let mut nodes: Vec<(IndexItem, Option<u64>)> = items.into_iter().map(|item| (item, None)).collect();
         let mut last_child: Option<u64> = None;
-        let encoded = |nodes: &[(IndexEntry, Option<u64>)], last_child: Option<u64>| -> Vec<u8> {
-            let mut bytes: Vec<u8> = nodes.iter().flat_map(|(entry, child)| Self::entry(Some(entry), *child)).collect();
-            bytes.extend(Self::entry(None, last_child));
+        let encoded = |nodes: &[(IndexItem, Option<u64>)], last_child: Option<u64>| -> Vec<u8> {
+            let mut bytes: Vec<u8> = nodes.iter().flat_map(|(item, child)| IndexItem::encode(Some(item), *child)).collect();
+            bytes.extend(IndexItem::encode(None, last_child));
             bytes
         };
         while encoded(&nodes, last_child).len() as i64 > root_limit {
-            let mut groups: Vec<Vec<(IndexEntry, Option<u64>)>> = Vec::new();
+            let mut groups: Vec<Vec<(IndexItem, Option<u64>)>> = Vec::new();
             let mut group = Vec::new();
             let mut used = 0;
             for node in nodes {
-                let size = Self::entry(Some(&node.0), node.1).len();
+                let size = IndexItem::encode(Some(&node.0), node.1).len();
                 if used + size + 24 > block_size - start && !group.is_empty() {
                     groups.push(core::mem::take(&mut group));
                     used = 0;
@@ -592,8 +652,8 @@ impl Tx<'_> {
             for (index, mut children) in groups.into_iter().enumerate() {
                 let separator = if index + 1 < group_count { children.pop() } else { None };
                 let vcn = (blocks.len() * block_size / cluster.min(block_size)) as u64;
-                let mut leaf: Vec<u8> = children.iter().flat_map(|(entry, child)| Self::entry(Some(entry), *child)).collect();
-                leaf.extend(Self::entry(None, separator.as_ref().map_or(last_child, |separator| separator.1)));
+                let mut leaf: Vec<u8> = children.iter().flat_map(|(item, child)| IndexItem::encode(Some(item), *child)).collect();
+                leaf.extend(IndexItem::encode(None, separator.as_ref().map_or(last_child, |separator| separator.1)));
                 let mut block = alloc::vec![0u8; block_size];
                 block[0..4].copy_from_slice(b"INDX");
                 put16(&mut block, 4, 40);
@@ -616,8 +676,8 @@ impl Tx<'_> {
         }
         let keys = encoded(&nodes, last_child);
         let mut root = alloc::vec![0u8; 32 + keys.len()];
-        put32(&mut root, 0, 0x30);
-        put32(&mut root, 4, 1);
+        put32(&mut root, 0, indexed_type as u64);
+        put32(&mut root, 4, collation as u64);
         put32(&mut root, 8, block_size as u64);
         root[12] = if cluster <= block_size { (block_size / cluster) as u8 } else { 0xF4 };
         put32(&mut root, 16, 16);
@@ -625,21 +685,41 @@ impl Tx<'_> {
         put32(&mut root, 24, (16 + keys.len()) as u64);
         root[28] = !blocks.is_empty() as u8;
         root[32..].copy_from_slice(&keys);
-        replace(&mut list, 0x90, Some(resident(0x90, &root, "$I30")));
+        replace_named(list, 0x90, name, Some(resident(0x90, &root, name)));
         if !blocks.is_empty() {
             let data = blocks.concat();
             let runs = self.allocate((data.len() as u64).div_ceil(self.cluster()))?;
             let allocated: u64 = runs.iter().map(|run| run.count * self.cluster()).sum();
             self.transfer(&runs, 0, None, allocated)?;
             self.transfer(&runs, 0, Some(&data), data.len() as u64)?;
-            let attribute = self.nonresident(0xA0, &runs, data.len() as u64, "$I30");
-            replace(&mut list, 0xA0, Some(attribute));
+            let attribute = self.nonresident(0xA0, &runs, data.len() as u64, name);
+            replace_named(list, 0xA0, name, Some(attribute));
             let mut bits = alloc::vec![0u8; blocks.len().div_ceil(8)];
             for index in 0..blocks.len() {
                 set_bit(&mut bits, index as u64, true)?;
             }
-            replace(&mut list, 0xB0, Some(resident(0xB0, &bits, "$I30")));
+            replace_named(list, 0xB0, name, Some(resident(0xB0, &bits, name)));
         }
+        Ok(())
+    }
+
+    /// Reconstrói o índice $I30 do diretório (raiz residente e, se não
+    /// couber, blocos INDX numa B-tree).
+    fn directory(&mut self, reference: u64, mut entries: Vec<IndexEntry>) -> Result<(), KernelError> {
+        let record = self.volume.read_record(reference)?;
+        let mut list = attributes(&record)?;
+        self.drop_index(&record, &mut list, "$I30")?;
+        if find_attribute(&record, 0xE0)?.is_some() {
+            // Espaço para a raiz residente: EAs grandes de diretório vão
+            // para runs em vez de impedir a criação de filhos.
+            let index_room = 512 + 4096usize.min(entries.iter().fold(16, |total, entry| total + align(16 + entry.value.len())));
+            let current = self.read_ea(&record)?;
+            self.store_ea(&record, &mut list, &current, index_room)?;
+        }
+        entries.sort_by_key(|entry| entry.name.to_uppercase());
+        let root_limit = self.room(&list) + 8 - 512;
+        let items = entries.iter().map(IndexItem::of_entry).collect();
+        self.build_index(&mut list, "$I30", 0x30, 1, items, root_limit)?;
         if let Some(standard) = find_attribute(&record, 0x10)? {
             let mut value = standard.value;
             put64(&mut value, 8, now());
@@ -767,6 +847,89 @@ impl Tx<'_> {
         let mut list = attributes(&record)?;
         replace(&mut list, 0x90, Some(resident(0x90, &new_value, "$R")));
         self.record(entry.reference, &list, u16_at(&record, 22), Some(&record), 1)
+    }
+
+    /// GetSecurityIdFromSecurityDescriptorUnsafe (ntfs.sys 0xe0290): o
+    /// SecurityId de um descritor self-relative. Um descritor igual já no
+    /// $Secure (as entradas do $SDH com o mesmo hash, conferidas byte a
+    /// byte, NtOfsLookupSecurityDescriptorInIndex 0xe0574) dá o id dele;
+    /// senão o id é o último do $SII mais 1 (0x100 num $SII vazio,
+    /// NtfsInitializeSecurity 0x19d98c) e a entrada vai ao fim do $SDS
+    /// (0xe033f..0xe04c5): alinhada a 16 depois do fim da metade principal
+    /// do bloco de 256 KB corrente, ou no começo do bloco seguinte (+0x80000)
+    /// quando não cabe com 0x14 bytes de folga; o vão é zerado nas duas
+    /// metades, a entrada vai ao lugar e à cópia (+0x40000) e o $SII e o
+    /// $SDH ganham o cabeçalho.
+    fn security_id_for(&mut self, descriptor: &[u8]) -> Result<u32, KernelError> {
+        let hash = security::hash(descriptor);
+        let record = self.volume.read_record(SECURE_RECORD)?;
+        let sii = self.volume.view_entries(&record, "$SII")?;
+        let sdh = self.volume.view_entries(&record, "$SDH")?;
+        for entry in &sdh {
+            let key = entry.key();
+            if key.len() != 8 || u32_at(key, 0) != hash {
+                continue;
+            }
+            let id = u32_at(key, 4);
+            if self.volume.security_descriptor(id)?.is_some_and(|found| found[..] == *descriptor) {
+                return Ok(id);
+            }
+        }
+        let id = sii.iter().filter(|entry| entry.key().len() == 4).map(|entry| u32_at(entry.key(), 0)).max().map_or(FIRST_SECURITY_ID, |last| last + 1);
+        let sds = find_named_attribute(&record, 0x80, "$SDS")?.filter(|sds| sds.non_resident).ok_or_else(|| KernelError::with_status("NTFS: $Secure sem $SDS nao residente", 0xC000_0032))?;
+        let entry_length = (Header::SIZE + descriptor.len()) as u64;
+        let end = sds.real_size & !SDS_MIRROR;
+        let mut offset = align16(end);
+        if SDS_MIRROR - (offset & (SDS_MIRROR - 1)) < align16(entry_length) + 0x14 {
+            offset = (offset & !(SDS_MIRROR - 1)) + 2 * SDS_MIRROR;
+        }
+        let length = offset + SDS_MIRROR + entry_length;
+        let cluster = self.cluster();
+        let mut runs = parse_runs(&record, sds.run_offset)?;
+        let have: u64 = runs.iter().map(|run| run.count).sum();
+        let need = length.div_ceil(cluster);
+        if need > have {
+            // Clusters novos zerados: o que a entrada não cobre (o resto da
+            // metade principal de um bloco novo) lê zeros, como o
+            // NtOfsSetLength.
+            let extra = self.allocate(need - have)?;
+            self.transfer(&extra, 0, None, (need - have) * cluster)?;
+            runs.extend(extra);
+            runs = merge_runs(&runs);
+        }
+        // O vão até a entrada, só dentro da metade principal do bloco do
+        // fim antigo (e a mesma faixa na cópia).
+        let gap_end = offset.min((end & !(SDS_MIRROR - 1)) + SDS_MIRROR);
+        if gap_end > end {
+            self.transfer(&runs, end, None, gap_end - end)?;
+            self.transfer(&runs, end + SDS_MIRROR, None, gap_end - end)?;
+        }
+        let header = Header { hash, id, offset, length: entry_length as u32 };
+        let bytes = [&header.bytes()[..], descriptor].concat();
+        self.transfer(&runs, offset, Some(&bytes), entry_length)?;
+        self.transfer(&runs, offset + SDS_MIRROR, Some(&bytes), entry_length)?;
+        let mut list = attributes(&record)?;
+        let attribute = self.nonresident(0x80, &runs, length, "$SDS");
+        replace_named(&mut list, 0x80, "$SDS", Some(attribute));
+        // $SII: chave SecurityId (COLLATION_NTOFS_ULONG); $SDH: chave (Hash,
+        // SecurityId) (COLLATION_NTOFS_SECURITY_HASH), os dados com o
+        // preenchimento "II" que o NTFS grava.
+        let mut by_id: Vec<(u32, IndexItem)> = sii.iter().filter(|entry| entry.key().len() == 4).map(|entry| (u32_at(entry.key(), 0), IndexItem::of_raw(entry))).collect();
+        by_id.push((id, IndexItem::view(&id.to_le_bytes(), &header.bytes(), &[])));
+        by_id.sort_by_key(|(key, _)| *key);
+        let mut by_hash: Vec<((u32, u32), IndexItem)> = sdh.iter().filter(|entry| entry.key().len() == 8).map(|entry| ((u32_at(entry.key(), 0), u32_at(entry.key(), 4)), IndexItem::of_raw(entry))).collect();
+        by_hash.push(((hash, id), IndexItem::view(&[hash.to_le_bytes(), id.to_le_bytes()].concat(), &header.bytes(), &[b'I', 0, b'I', 0])));
+        by_hash.sort_by_key(|(key, _)| *key);
+        self.drop_index(&record, &mut list, "$SDH")?;
+        self.drop_index(&record, &mut list, "$SII")?;
+        // As duas raízes dividem o que sobra do registro.
+        let root_limit = (self.room(&list) - 512) / 2;
+        self.build_index(&mut list, "$SDH", 0, 0x12, by_hash.into_iter().map(|(_, item)| item).collect(), root_limit)?;
+        self.build_index(&mut list, "$SII", 0, 0x10, by_id.into_iter().map(|(_, item)| item).collect(), root_limit)?;
+        self.record(SECURE_RECORD, &list, u16_at(&record, 22), Some(&record), 1)?;
+        self.volume.secure_cache.lock().insert(id, Arc::new(descriptor.to_vec()));
+        debug_print!("[ntfs] $Secure: SecurityId {:#x} novo ({} bytes em {:#x}; $SDS com {} bytes)", id, entry_length, offset, length);
+        Ok(id)
     }
 
     /// Grava (`Some`) ou remove (`None`) o $REPARSE_POINT de `path`: o
@@ -1019,7 +1182,9 @@ impl Tx<'_> {
         self.record(entry.reference, &[], 0, None, (u16_at(&record, 16) % 65535) + 1)
     }
 
-    fn create(&mut self, path: &str, directory: bool, file_attributes: u32, reservation: u64) -> Result<(), KernelError> {
+    /// Cria o arquivo com o SecurityId dado no $STANDARD_INFORMATION (0 =
+    /// o primeiro do volume, como o registro de um volume antigo).
+    fn create(&mut self, path: &str, directory: bool, file_attributes: u32, reservation: u64, security_id: u32) -> Result<(), KernelError> {
         self.transaction(|tx| {
             let (parent, name) = tx.split(path)?;
             if tx.volume.find(path)?.is_some() {
@@ -1045,6 +1210,7 @@ impl Tx<'_> {
             // FILE_ATTRIBUTE_REPARSE_POINT só vem do FSCTL_SET_REPARSE_POINT.
             let flags = (file_attributes & !0x490) | if directory { 0x10 } else { 0x20 };
             put32(&mut standard, 32, flags as u64);
+            put32(&mut standard, 52, security_id as u64);
             let file_name = tx.filename(parent.reference, &name, directory, 0, 0, Some(&standard), flags)?;
             let mut list = alloc::vec![resident(0x10, &standard, ""), resident(0x30, &file_name, "")];
             if !directory {
@@ -1148,8 +1314,55 @@ impl Ntfs {
     }
 
     pub fn create(&self, path: &str, directory: bool, file_attributes: u32, reservation: u64) -> Result<Option<Stat>, KernelError> {
-        self.with_writer(|tx| tx.create(path, directory, file_attributes, reservation))?;
+        self.create_with_security(path, directory, file_attributes, reservation, None)
+    }
+
+    /// Cria o arquivo com o descritor self-relative dado, que ganha o
+    /// SecurityId de um descritor igual do $Secure ou um novo
+    /// (GetSecurityIdFromSecurityDescriptorUnsafe); sem descritor, o
+    /// SecurityId fica 0 (o primeiro do volume).
+    pub fn create_with_security(&self, path: &str, directory: bool, file_attributes: u32, reservation: u64, security: Option<&[u8]>) -> Result<Option<Stat>, KernelError> {
+        self.with_writer(|writer| {
+            writer.transaction(|tx| {
+                let security_id = match security {
+                    Some(descriptor) => tx.security_id_for(descriptor)?,
+                    None => 0,
+                };
+                tx.create(path, directory, file_attributes, reservation, security_id)
+            })
+        })?;
         self.stat(path)
+    }
+
+    /// Troca o descritor do arquivo (o NtfsModifySecurity depois da mescla,
+    /// `ntfs_security::modify`): o SecurityId do descritor no
+    /// $STANDARD_INFORMATION (um de 48 bytes cresce para 72, como no
+    /// NtfsGrowStandardInformation 0x16fbb0) e o ChangeTime de agora
+    /// (NtfsUpdateFileTimestampsForChange 0xdf250), com as informações
+    /// duplicadas no diretório pai. A raiz (registro 5) também aceita.
+    pub fn set_security(&self, path: &str, descriptor: &[u8]) -> Result<(), KernelError> {
+        self.with_writer(|writer| {
+            writer.transaction(|tx| {
+                let Some(entry) = tx.volume.find(path)? else { return fail(0xC000_0034, "arquivo ausente") };
+                if entry.reference < 16 && entry.reference != 5 {
+                    return fail(0xC000_0022, "metadado reservado");
+                }
+                let security_id = tx.security_id_for(descriptor)?;
+                let record = tx.volume.read_record(entry.reference)?;
+                let mut list = attributes(&record)?;
+                let mut standard = find_attribute(&record, 0x10)?.map(|standard| standard.value).unwrap_or_else(|| alloc::vec![0; 72]);
+                if standard.len() < 72 {
+                    standard.resize(72, 0);
+                }
+                put32(&mut standard, 52, security_id as u64);
+                put64(&mut standard, 16, now());
+                replace(&mut list, 0x10, Some(resident(0x10, &standard, "")));
+                match find_attribute(&record, 0x30)?.filter(|name| name.value.len() >= 66) {
+                    Some(name) => tx.refresh_name(entry.reference, &record, &mut list, u64_at(&name.value, 48), u64_at(&name.value, 40)),
+                    None => tx.record(entry.reference, &list, u16_at(&record, 22), Some(&record), 1),
+                }
+            })
+        })
     }
 
     pub fn write(&self, path: &str, offset: u64, bytes: &[u8]) -> Result<u64, KernelError> {
@@ -1188,11 +1401,14 @@ impl Ntfs {
         })
     }
 
+    /// FILE_SUPERSEDE: o arquivo novo no lugar do antigo, com o SecurityId
+    /// dele (o descritor do arquivo fica).
     pub fn supersede(&self, path: &str, file_attributes: u32, reservation: u64) -> Result<(), KernelError> {
         self.with_writer(|writer| {
             writer.transaction(|tx| {
+                let security_id = tx.volume.stat(path)?.map_or(0, |stat| stat.security_id);
                 tx.remove(path)?;
-                tx.create(path, false, file_attributes, reservation)
+                tx.create(path, false, file_attributes, reservation, security_id)
             })
         })
     }

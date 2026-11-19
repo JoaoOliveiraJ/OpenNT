@@ -18,11 +18,19 @@ use crate::ntos::io::file::zw as zw_files;
 /// O descritor de um objeto pelo SecurityProcedure do tipo: arquivos pelo
 /// IRP_MJ_QUERY_SECURITY do driver, dispositivos pelo DEVICE_OBJECT, chaves
 /// pelo descritor do nó e os demais pelo descritor do objeto
-/// (SeQuerySecurityDescriptorInfo).
+/// (SeQuerySecurityDescriptorInfo). Um arquivo de volume do kernel, sem
+/// DEVICE_OBJECT de file system, responde pelo volume: o NTFS dá o
+/// descritor do $Secure (NtfsCommonQuerySecurityInfo 0xed6b0 →
+/// NtfsQuerySecurity 0xed4e4 → SeQuerySecurityDescriptorInfo); um volume sem
+/// segurança, ou um arquivo de imagem sem volume, o descritor de World.
 fn query_object(pointer: u64, type_name: &str, information: u32, buffer: u64, capacity: u32, requestor_mode: u8) -> Result<QueryResult, KernelError> {
     if type_name == object_types::file_type().name {
         let device = crate::ntos::io::file::information::related_device(pointer)?;
         if device == 0 && (zw_files::file_backing(pointer).is_some() || file_objects::source(pointer).is_some()) {
+            if let Some(result) = zw_files::volume_file_of(pointer).and_then(|(volume, path)| volume.query_security(&path)) {
+                let descriptor = query_descriptor::from_relative(&result?).ok_or_else(|| KernelError::with_status("descritor invalido no volume", 0xC000_0079))?;
+                return Ok(query_descriptor::query_descriptor(Some(&descriptor), information, buffer, capacity));
+            }
             return Ok(file_security::query_unsupported_file(information, buffer, capacity));
         }
         return file_security::query_file(pointer, information, buffer, capacity, requestor_mode);

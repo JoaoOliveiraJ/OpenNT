@@ -68,6 +68,37 @@ pub fn read_descriptor(pointer: u64) -> Option<OwnedDescriptor> {
     Some(owned)
 }
 
+/// Os componentes de um descritor self-relative em bytes (o que um file
+/// system guarda, como o $SDS do NTFS): owner e group pelos offsets, SACL e
+/// DACL só com SE_SACL_PRESENT/SE_DACL_PRESENT e offset não nulo. `None`
+/// num descritor que não é self-relative ou com um componente fora dos
+/// bytes.
+pub fn from_relative(bytes: &[u8]) -> Option<OwnedDescriptor> {
+    let u16_at = |offset: usize| bytes.get(offset..offset + 2).map(|part| u16::from_le_bytes([part[0], part[1]]));
+    let u32_at = |offset: usize| bytes.get(offset..offset + 4).map(|part| u32::from_le_bytes([part[0], part[1], part[2], part[3]]) as usize);
+    let control = u16_at(2)?;
+    if bytes.len() < SecurityDescriptorRelative::SIZE as usize || bytes[0] != 1 || control & 0x8000 == 0 {
+        return None;
+    }
+    let sid = |field: usize| -> Option<Option<Vec<u8>>> {
+        let offset = u32_at(field)?;
+        if offset == 0 {
+            return Some(None);
+        }
+        let count = *bytes.get(offset + 1)? as usize;
+        bytes.get(offset..offset + 8 + 4 * count).map(|sid| Some(sid.to_vec()))
+    };
+    let acl = |field: usize, present: u16| -> Option<Option<Vec<u8>>> {
+        let offset = u32_at(field)?;
+        if control & present == 0 || offset == 0 {
+            return Some(None);
+        }
+        let size = u16_at(offset + 2)? as usize;
+        bytes.get(offset..offset + size).filter(|_| size >= 8).map(|acl| Some(acl.to_vec()))
+    };
+    Some(OwnedDescriptor { control, owner: sid(4)?, group: sid(8)?, sacl: acl(12, 0x10)?, dacl: acl(16, 0x04)? })
+}
+
 /// A SACL conserva só as categorias pedidas: auditoria usa
 /// SACL_SECURITY_INFORMATION; label, atributos, escopo, confiança e filtro
 /// de acesso (tipos 17–21) usam seus bits; ordem e bytes ficam intactos.

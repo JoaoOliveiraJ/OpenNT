@@ -1152,8 +1152,8 @@ fn user_file_io(assert: Assert) {
         unwrapped.as_ref().is_ok_and(|request| file_io::open(out, "\\??\\D:\\HELLO.TXT", iosb, 1, request).unwrap_or(1) == 0)
     };
     let copy_closed = copy_opened && state::close_user_handle(guest::read64(out), true, false).is_ok_and(|status| status == 0);
-    let short = file_io::extended_create(&OpenRequest { ea_length: 0x10, ..copy_source }).err() == Some(0xC000_000D);
-    let misaligned = file_io::extended_create(&OpenRequest { ea_buffer: extended + 2, ..copy_source }).err() == Some(0x8000_0002);
+    let short = file_io::extended_create(&OpenRequest { ea_length: 0x10, ..copy_source.clone() }).err() == Some(0xC000_000D);
+    let misaligned = file_io::extended_create(&OpenRequest { ea_buffer: extended + 2, ..copy_source.clone() }).err() == Some(0x8000_0002);
     assert(copy_closed && short && misaligned, "userfiles: EXTENDED_CREATE_INFORMATION desembrulhado como no IopCreateFile");
     if let Some(region) = memory::find_region(block) {
         memory::release_private_region(&region);
@@ -7102,6 +7102,7 @@ pub fn run(assert: Assert) {
     user_file_syscalls(assert);
     super::reparse_points::run(assert);
     super::volume_notify_locks::run(assert);
+    super::file_security::run(assert);
     super::volume_open::run(assert);
     super::volume_mountdev::run(assert);
     user_handle_operations(assert);

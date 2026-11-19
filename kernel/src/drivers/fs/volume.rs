@@ -101,6 +101,22 @@ pub trait FileSystem: Sync {
     fn remove(&self, _path: &str) -> Option<Result<bool, KernelError>> {
         None
     }
+    /// O descritor self-relative de um arquivo (o $Secure do NTFS); `None`
+    /// = o volume não guarda segurança, e o IopGetSetSecurityObject
+    /// responde com o descritor de World.
+    fn query_security(&self, _path: &str) -> Option<Result<Vec<u8>, KernelError>> {
+        None
+    }
+    /// Troca o descritor self-relative de um arquivo; `None` = sem
+    /// segurança (o NtSetSecurityObject termina com sucesso sem guardar).
+    fn set_security(&self, _path: &str, _descriptor: &[u8]) -> Option<Result<(), KernelError>> {
+        None
+    }
+    /// Cria um arquivo vazio com o descritor dado; `None` = sem segurança
+    /// (quem chama cria pelo `truncate`).
+    fn create_secured(&self, _path: &str, _directory: bool, _attributes: u32, _security: &[u8]) -> Option<Result<(), KernelError>> {
+        None
+    }
     /// Número de série.
     fn volume_serial(&self) -> Option<u64> {
         None

@@ -242,18 +242,8 @@ pub fn assign_new(object_type: &object_types::ObjectType, parent: Option<crate::
     let explicit = capture_descriptor(explicit, from_user_mode)?;
     let token = object_access::subject().or_else(|| crate::ntos::ps::process::get_primary_token(crate::ntos::ps::process::get_current_process())).unwrap_or(0);
     if from_user_mode {
-        if let Some(owner) = explicit.as_ref().and_then(|explicit| explicit.owner.as_ref()) {
-            let assignable = crate::ntos::se::token::tokens::with(token, |token| {
-                token.user == *owner || token.groups.iter().any(|group| group.sid == *owner && group.attributes & 0x8 != 0) || token.privileges.iter().any(|privilege| privilege.id == 18 && privilege.attributes & 2 != 0)
-            });
-            if assignable != Some(true) {
-                return Err(0xC000_005A);
-            }
-        }
-        let audit = explicit.as_ref().and_then(|explicit| explicit.sacl.as_deref()).is_some_and(crate::ntos::se::model::sacl_requires_security_privilege);
-        let privileged = crate::ntos::se::token::tokens::with(token, |token| token.privileges.iter().any(|privilege| privilege.id == 8 && privilege.attributes & 2 != 0)).unwrap_or(false);
-        if audit && !privileged {
-            return Err(0xC000_0061);
+        if let Some(explicit) = explicit.as_ref() {
+            check_explicit_for_user(explicit, token)?;
         }
     }
     let container = object_type.name == "Directory";
@@ -262,6 +252,28 @@ pub fn assign_new(object_type: &object_types::ObjectType, parent: Option<crate::
     let assigned = crate::ntos::se::assign::assign_components_for_token(parent.as_ref(), explicit.as_ref(), &object_type.mapping, container, 0, token)?;
     let owned = crate::ntos::se::policy_descriptor::OwnedDescriptor { control: assigned.control, owner: Some(assigned.owner), group: Some(assigned.group), dacl: assigned.dacl, sacl: assigned.sacl };
     Ok(policy_descriptor::policy_of(&owned))
+}
+
+/// As validações de UserMode de um descritor explícito (o
+/// SEF_FORCE_USER_MODE do SeAssignSecurityEx): o dono precisa ser
+/// atribuível pelo token (o usuário, um grupo com SE_GROUP_OWNER ou o
+/// SeRestorePrivilege; senão STATUS_INVALID_OWNER) e uma SACL de auditoria
+/// pede o SeSecurityPrivilege (STATUS_PRIVILEGE_NOT_HELD).
+pub fn check_explicit_for_user(explicit: &crate::ntos::se::policy_descriptor::OwnedDescriptor, token: u64) -> Result<(), u32> {
+    if let Some(owner) = explicit.owner.as_ref() {
+        let assignable = crate::ntos::se::token::tokens::with(token, |token| {
+            token.user == *owner || token.groups.iter().any(|group| group.sid == *owner && group.attributes & 0x8 != 0) || token.privileges.iter().any(|privilege| privilege.id == 18 && privilege.attributes & 2 != 0)
+        });
+        if assignable != Some(true) {
+            return Err(0xC000_005A);
+        }
+    }
+    let audit = explicit.sacl.as_deref().is_some_and(crate::ntos::se::model::sacl_requires_security_privilege);
+    let privileged = crate::ntos::se::token::tokens::with(token, |token| token.privileges.iter().any(|privilege| privilege.id == 8 && privilege.attributes & 2 != 0)).unwrap_or(false);
+    if audit && !privileged {
+        return Err(0xC000_0061);
+    }
+    Ok(())
 }
 
 /// O ObCheckCreateObjectAccess do ObpLookupObjectName de uma criação por
@@ -611,14 +623,21 @@ const IRP_MJ_SET_SECURITY: u8 = 0x15;
 
 /// IRP_MJ_SET_SECURITY síncrono ao dispositivo do arquivo. Como o
 /// IopGetSetSecurityObject, um file system sem segurança
-/// (STATUS_INVALID_DEVICE_REQUEST) ignora a alteração com STATUS_SUCCESS; os
-/// arquivos dos volumes do próprio kernel, sem DEVICE_OBJECT de file system,
-/// são esse caso (a consulta deles devolve o descritor de World).
+/// (STATUS_INVALID_DEVICE_REQUEST) ignora a alteração com STATUS_SUCCESS.
+/// Os arquivos dos volumes do próprio kernel não têm DEVICE_OBJECT de file
+/// system: o NTFS do kernel guarda o descritor mesclado no $Secure (o
+/// NtfsCommonSetSecurityInfo, `ntfs_security::modify`), e um volume sem
+/// segurança é o caso do STATUS_SUCCESS sem mudança.
 fn set_file_security(file: u64, information: u32, captured: u64) -> Result<u32, crate::rtl::KernelError> {
     use crate::ntos::inc::types::{IoStackLocation, IoStatusBlock, Irp, Kevent};
     const STATUS_INVALID_DEVICE_REQUEST: u32 = 0xC000_0010;
     let device = crate::ntos::io::file::information::related_device(file)?;
     if device == 0 {
+        if let Some((volume, path)) = crate::ntos::io::file::zw::volume_file_of(file) {
+            if let Some(status) = crate::drivers::fs::ntfs_security::modify(volume, &path, information, captured) {
+                return Ok(status);
+            }
+        }
         return Ok(0);
     }
     let event = guest::alloc_bytes(Kevent::SIZE);
