@@ -2707,7 +2707,11 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   um Windows sem /DEBUG (KdPitchDebugger).
   - Transporte (`kd/transport.rs`): a fase 0 programa a UART com E/S
     programada, sem IRQ. A FIFO fica intocada para não perder um pedido que
-    chegou antes.
+    chegou antes; a sessão a liga (gatilho de 14 bytes) no primeiro pacote,
+    quando o host espera a resposta. Com ela, cada lote de 16 bytes sai num
+    `rep outsb` depois de um THRE (cerca de 9 µs por byte no WHPX, contra
+    42 µs de uma leitura do LSR e um OUT por byte), e tudo o que vai ao
+    host usa a compressão `X*n` do protocolo.
   - Estado visto pelos drivers (`kd/debugger.rs`), como o KdInitSystem com
     transporte: KdDebuggerEnabled e o bit 0 do
     KUSER_SHARED_DATA.KdDebuggerEnabled ligados; KdComPortInUse com a porta;
@@ -2722,7 +2726,12 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     processador pelo mapa direto, sem travas nem faltas (`kd/memory.rs`).
     `Z0` grava o 0xCC pelo quadro físico; `Z1`/`Z2`/`Z4` são DR0-DR3
     (`kd/breakpoints.rs`, publicados em KPRCB.ProcessorState.SpecialRegisters).
-    `qXfer:libraries:read` dá a lista de módulos ao GDB.
+    `qXfer:libraries:read` dá a lista de módulos ao GDB. `x` lê memória em
+    binário (o `binary-upload` do GDB: metade dos bytes do `m`), em pacotes
+    de 16 KB. A resposta de parada leva os 24 primeiros registradores do `g`
+    (os adiantados do GDB), a impressão digital da lista de módulos
+    (`modgen:`) e o EPROCESS corrente do processador (`process:`): o cliente
+    decide a parada sem `g`, sem `monitor lm` e sem `.process`.
   - Consultas pelo `qRcmd` (o `monitor` do GDB): `kd/monitor.rs` lista
     processos e threads pelas listas nativas, os registradores de uma thread
     fora da CPU pelo quadro de troca, módulos, processadores com IRQL e
@@ -2846,7 +2855,12 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
       `opennt_kd_process_event`, `opennt_kd_thread_event` e
       `opennt_kd_image_event` (sysv64, argumentos nos registradores) antes de
       olhar as rotinas registradas. O host arma breakpoints nelas e lê os
-      argumentos.
+      argumentos. Para as cargas de imagem há o filtro do host
+      (`QOpenNTLoadBreak:nome;nome...`, `*` = qualquer): só uma carga cujo
+      nome-base, ou ele sem a extensão, está no filtro para a máquina, em
+      `opennt_kd_load_break` com os mesmos argumentos, e a resposta de parada
+      leva `library:;load:base,tamanho,pid,nome;`. As outras cargas não param
+      (no KD do 19041 cada módulo de sistema custa uma ida e volta ao host).
     - Consultas: `handles` (a HANDLE_TABLE inteira, com o tipo pelo
       TypeIndex e o ObHeaderCookie, o nome pelo NameInfo, pelo FILE_OBJECT
       ou pelo ImageFileName, e o tipo da tabela de usuário quando a linha
@@ -5398,13 +5412,20 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     acesso (`ba e1|w4|r8`), condição (`bp x 3 /w "@rax == 7"`: a partir do
     terceiro acerto, só com a condição verdadeira; os outros acertos seguem
     sozinhos), adiados (`bu`: o símbolo de um módulo que ainda vai carregar)
-    e parada por carga de módulo (`sxe ld:ntfs.sys`). A parada por carga usa
-    um breakpoint interno na notificação de carga de imagem do kernel
-    (`ps::notify::image::notify`). Os adiados (`breakpoints.rs`) usam o
-    ponto de evento de imagem (`opennt_kd_image_event`): a cada driver ou
-    DLL nova, o cliente resolve o nome só no módulo novo (exports, PDB
+    e parada por carga de módulo (`sxe ld:ntfs.sys`). Os dois últimos usam
+    o filtro de carga do alvo com os nomes dos módulos pedidos (num kernel
+    sem o filtro, um breakpoint interno na notificação de carga de imagem,
+    `ps::notify::image::notify`, que parava em toda carga, e o ponto de
+    evento de imagem `opennt_kd_image_event`): só a carga pedida para a
+    máquina, com os argumentos do evento de imagem nos registradores da
+    resposta. O cliente traz os módulos (os de usuário do processo da
+    carga, quando é uma DLL) e segue sozinho quando nada pede a parada. Um
+    adiado (`breakpoints.rs`) resolve o nome só no módulo novo (exports, PDB
     baixado na hora com a máquina parada, ou `módulo+0xRVA`) e arma o
-    breakpoint no processo que carregou a imagem. `/p <pid|eprocess>`
+    breakpoint no processo que carregou a imagem. A lista de módulos só é
+    relida (`monitor lm`) quando a impressão digital da resposta de parada
+    muda, e os registradores da parada vêm da própria resposta.
+    `/p <pid|eprocess>`
     prende o breakpoint a um processo; `/p nome.exe` e `/p *` fazem um
     modelo, e cada processo com o nome (também os que nascem depois) ganha
     uma instância. Num endereço de sistema, o `/p` filtra no acerto. Na
