@@ -32,6 +32,7 @@ use kd_client::registers::ExtendedState;
 use kd_client::{registers, Breakpoint, BreakpointKind, Client};
 use kd_mcp::annotate::{self, Live};
 
+use crate::annotations::{self, ImportCache};
 use crate::disasm::{self, Line};
 use crate::launcher::{Launch, LaunchOptions};
 use crate::source::{Local, LineTable};
@@ -204,8 +205,12 @@ pub enum Request {
     AddRangeWatch(BreakpointKind, String, u64),
     /// Todas as opções de um breakpoint (o editor).
     EditBreakpoint(u32, BreakpointRequest),
-    /// Quem referencia o endereço (o índice do módulo, feito uma vez).
+    /// Quem referencia o endereço (a análise do módulo, feita aos poucos
+    /// numa thread) e o que sai da função dele.
     Xrefs(u64),
+    /// O tipo de um registrador a partir de uma instrução (`type_name`
+    /// vazio tira): os operandos `[reg+deslocamento]` ganham o nome do campo.
+    RegisterType { address: u64, register: String, type_name: String },
     /// Grava uma faixa de memória num arquivo.
     DumpToFile { address: u64, size: u64, path: PathBuf },
     /// Quantos argumentos a caixa da convenção de chamada mostra.
@@ -653,6 +658,8 @@ impl Worker {
                 let _ = self.with_client(|client| client.reload_modules());
                 self.refresh();
             }
+            // A janela Xrefs esperando lotes da análise de um módulo.
+            self.poll_analysis();
             self.forward_console();
             self.tail_serial();
             if let Some(launch) = self.launch.as_mut() {
@@ -1110,11 +1117,12 @@ impl Worker {
                 self.with_client(|client| client.edit_breakpoint(id, &request)).map(|_| true)
             }
             Request::Xrefs(address) => {
-                self.set_activity("referencias cruzadas (indice do modulo)");
+                self.set_activity("referencias cruzadas (analise do modulo)");
                 let result = self.xrefs(address);
                 self.set_activity("");
                 result
             }
+            Request::RegisterType { address, register, type_name } => self.set_register_type(address, &register, &type_name),
             Request::DumpToFile { address, size, path } => self.dump_to_file(address, size, &path),
             Request::ShowStack(expression) => {
                 self.stack_expression = expression;
@@ -1363,7 +1371,7 @@ impl Worker {
             Focus::Frame => frames.get(snapshot.selected_frame).map_or(0, |frame| frame.address),
         };
         let live = named.iter().find(|(name, _)| name == "rip").map(|(_, rip)| Live { rip: *rip, registers: named.clone() });
-        snapshot.code = code_view(client, focus, live.as_ref(), &mut self.re.loops);
+        snapshot.code = code_view(client, focus, live.as_ref(), &mut self.re);
         // Memória pedida.
         if !snapshot.memory.expression.trim().is_empty() {
             match client.evaluate(&snapshot.memory.expression) {
@@ -1766,27 +1774,32 @@ fn expand_qemu_blocks(client: &mut Client, blocks: &[(u8, u64)], limit: usize) -
 }
 
 /// A desmontagem em volta de `focus`, com a análise automática: as
-/// funções, os laços (do cache por função) e os comentários.
-fn code_view(client: &mut Client, focus: u64, live: Option<&Live>, loops: &mut HashMap<(u64, u64), Vec<Loop>>) -> CodeView {
-    let mut view = code_lines(client, focus);
+/// funções, os laços (do cache por função), os comentários das chamadas e
+/// os do opennt-re (imports, CFG, strings, códigos de erro e os campos dos
+/// tipos).
+fn code_view(client: &mut Client, focus: u64, live: Option<&Live>, re: &mut views::ReState) -> CodeView {
+    let mut view = code_lines(client, focus, &mut re.imports);
     if view.lines.is_empty() {
         return view;
     }
     view.functions = annotate::functions_for_lines(client, &view.lines);
     for function in &view.functions {
         let key = (function.start, function.end);
-        if !loops.contains_key(&key) {
+        if !re.loops.contains_key(&key) {
             let found = annotate::loops_for(client, std::slice::from_ref(function));
-            loops.insert(key, found);
+            re.loops.insert(key, found);
         }
-        view.loops.extend(loops[&key].iter().copied());
+        view.loops.extend(re.loops[&key].iter().copied());
     }
     view.auto_comments = annotate::auto_comments(client, &view.lines, live);
+    let context = annotations::Context { imports: &re.imports, register_types: &re.register_types, live, read_target: true };
+    annotations::enrich(client, &mut view.lines, &context);
     view
 }
 
-/// As linhas da desmontagem em volta de `focus`.
-fn code_lines(client: &mut Client, focus: u64) -> CodeView {
+/// As linhas da desmontagem em volta de `focus` (com os nomes nos
+/// operandos).
+fn code_lines(client: &mut Client, focus: u64, imports: &mut ImportCache) -> CodeView {
     const BEFORE: u64 = 0x120;
     const AFTER: u64 = 0x180;
     let mut view = CodeView { focus, ..Default::default() };
@@ -1794,9 +1807,11 @@ fn code_lines(client: &mut Client, focus: u64) -> CodeView {
         return view;
     }
     let start = disasm::window_start(focus, &client.symbols, BEFORE);
+    imports.load(&client.symbols, focus);
+    let imports: &ImportCache = imports;
     let attempt = |client: &mut Client, start: u64| -> Result<Option<Vec<Line>>, String> {
         let bytes = client.read_memory(start, (focus - start + AFTER) as usize)?;
-        Ok(disasm::clip(disasm::disassemble(start, &bytes, Some(&client.symbols)), focus, BEFORE, AFTER))
+        Ok(disasm::clip(disasm::disassemble_named(start, &bytes, &client.symbols, Some(imports)), focus, BEFORE, AFTER))
     };
     match attempt(client, start) {
         Ok(Some(lines)) => view.lines = lines,

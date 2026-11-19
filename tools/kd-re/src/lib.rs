@@ -12,7 +12,16 @@
 //! - `app`: a janela (abas, barra de ferramentas, atalhos, diálogos, barra
 //!   de comando e de estado); `cpu`, `graph`, `views` e `panels`: as abas;
 //! - `disasm`: a desmontagem (iced-x86) com os símbolos do cliente (o
-//!   módulo do `kd-mcp`, com a análise automática em `kd_mcp::annotate`);
+//!   módulo do `kd-mcp`, com a análise automática em `kd_mcp::annotate`) e
+//!   os nomes dentro dos operandos;
+//! - `annotations`: os comentários a mais das linhas (imports, trampolins,
+//!   o alvo do CFG, strings, NTSTATUS/HRESULT/Win32 e os campos dos tipos
+//!   do PDB nos operandos de memória);
+//! - `analysis`: a análise de um módulo inteiro aos poucos (as funções da
+//!   `.pdata` com os pedaços juntos, as referências cruzadas e os ponteiros
+//!   dos dados pela `.reloc`);
+//! - `imports`: os imports de um PE (comuns e de carga adiada);
+//! - `codes`: os nomes e os textos de NTSTATUS, HRESULT e erros do Win32;
 //! - `highlight`: os pedaços de uma instrução para o modo de destaque (H);
 //! - `dump`: os formatos das janelas Dump;
 //! - `editor`: o modelo do editor de breakpoints;
@@ -28,9 +37,12 @@
 //! - `preferences`: as preferências (aparência, atalhos, eventos) e o
 //!   banco por módulo.
 
+pub mod analysis;
+pub mod annotations;
 pub mod app;
 pub mod asm;
 pub mod backend;
+pub mod codes;
 pub mod cpu;
 pub mod disasm;
 pub mod dump;
@@ -38,6 +50,7 @@ pub mod editor;
 pub mod explorers;
 pub mod graph;
 pub mod highlight;
+pub mod imports;
 pub mod launcher;
 pub mod monitors;
 pub mod offscreen;

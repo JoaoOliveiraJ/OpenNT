@@ -5,6 +5,9 @@
 //! buscas (referências a strings, constantes, chamadas entre módulos,
 //! xrefs, padrões e strings soltas), o mapa de memória, os handles, as
 //! threads de usuário, os símbolos de um módulo, os patches e os roteiros.
+//! As referências cruzadas saem da análise do módulo inteiro
+//! (`crate::analysis`), feita aos poucos numa thread: a janela Xrefs mostra
+//! o que já foi analisado e se refaz quando chegam lotes novos.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -18,11 +21,19 @@ use kd_client::analysis::{refs, script, search};
 use kd_client::client::Resumed;
 use kd_client::unwind::Target as _;
 use kd_client::user::{self, Handle, UserThread};
-use kd_client::Client;
+use kd_client::{Client, Symbols};
 
 use super::{FrameRow, MemoryView, RegisterRow, Snapshot, Worker};
+use crate::analysis::{self, ModuleAnalysis, RefKind};
+use crate::annotations::{self, ImportCache, RegisterType};
+use crate::codes::codes;
 use crate::disasm::{self, Line};
+use crate::imports::ImportMap;
 use crate::scan::{self, ModuleImage, SharedImage};
+
+/// Análises de módulo guardadas ao mesmo tempo (a de um módulo grande pesa
+/// dezenas de MB).
+const MAX_ANALYSES: usize = 6;
 
 /// Uma linha da janela de pilha: o endereço, o qword e o que ele parece ser.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -166,13 +177,18 @@ pub struct MapRow {
     pub executable: bool,
 }
 
-/// Uma referência ao endereço pedido (a janela Xrefs).
+/// Uma referência ao endereço pedido, ou uma saída da função dele (a
+/// janela Xrefs).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct XrefRow {
     pub from: u64,
     pub location: String,
     pub kind: String,
     pub disassembly: String,
+    /// O endereço referenciado (nas saídas, o destino).
+    pub to: u64,
+    /// O nome do destino (o import, o símbolo ou `módulo+0xRVA`).
+    pub to_name: String,
 }
 
 /// O resultado da tecla X.
@@ -183,9 +199,18 @@ pub struct XrefView {
     pub module: String,
     pub rows: Vec<XrefRow>,
     pub milliseconds: u128,
-    /// O índice do módulo veio do cache.
+    /// A análise do módulo já existia (feita antes desta consulta).
     pub cached: bool,
     pub error: Option<String>,
+    /// A função que contém o endereço (a `.pdata` com os pedaços juntos,
+    /// ou o símbolo com tamanho): começo, nome e quantos pedaços.
+    pub function: Option<(u64, String, usize)>,
+    /// O que sai dessa função: chamadas, saltos para fora, a IAT, a
+    /// memória, os endereços e os imediatos no módulo.
+    pub callees: Vec<XrefRow>,
+    /// A análise do módulo ainda anda: (lotes prontos, total). As
+    /// referências mostradas são as dos lotes prontos.
+    pub progress: Option<(usize, usize)>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -225,10 +250,26 @@ pub struct ReState {
     pub symbol_view: Option<Arc<SymbolView>>,
     /// Os laços por função (início, fim) para a margem da desmontagem.
     pub loops: HashMap<(u64, u64), Vec<kd_client::analysis::functions::Loop>>,
-    /// O índice de referências cruzadas por módulo (com a geração dos
-    /// patches).
-    pub xref_index: HashMap<u64, (u64, Arc<HashMap<u64, Vec<(u64, refs::RefKind)>>>)>,
     pub xrefs: Option<Arc<XrefView>>,
+    /// Os imports de cada módulo (os nomes dos slots da IAT na
+    /// desmontagem).
+    pub imports: ImportCache,
+    /// Os tipos dados aos registradores (o menu "Tipo do registrador").
+    pub register_types: Vec<RegisterType>,
+    /// A análise de cada módulo, pela base.
+    pub analyses: HashMap<u64, Arc<ModuleAnalysis>>,
+    /// A janela Xrefs espera a análise do módulo: o endereço pedido e o
+    /// andamento já mostrado.
+    pub xref_pending: Option<(u64, analysis::Progress)>,
+}
+
+impl Drop for ReState {
+    /// As threads das análises param junto (um attach novo troca o estado).
+    fn drop(&mut self) {
+        for analysis in self.analyses.values() {
+            analysis.cancel();
+        }
+    }
 }
 
 impl Default for ReState {
@@ -250,8 +291,11 @@ impl Default for ReState {
             user_threads: None,
             symbol_view: None,
             loops: HashMap::new(),
-            xref_index: HashMap::new(),
             xrefs: None,
+            imports: ImportCache::default(),
+            register_types: Vec::new(),
+            analyses: HashMap::new(),
+            xref_pending: None,
         }
     }
 }
@@ -530,6 +574,7 @@ impl Worker {
         let graph = cfg::build(entry, range, &mut fetch, 20_000);
         let layout = cfg::layout(&graph);
         let client = self.client.as_mut().ok_or("sem conexao com o alvo")?;
+        self.re.imports.load(&client.symbols, entry);
         let mut blocks = Vec::new();
         for block in &graph.blocks {
             let length = (block.end - block.start) as usize;
@@ -537,8 +582,12 @@ impl Worker {
                 Some(image) => image.read(block.start, length).unwrap_or_default(),
                 None => client.read_memory(block.start, length).unwrap_or_default(),
             };
-            let mut lines = disasm::disassemble(block.start, &bytes, Some(&client.symbols));
+            // Os nomes nos operandos e os comentários do arquivo (sem ler a
+            // memória do alvo linha a linha: o grafo pode ter milhares).
+            let mut lines = disasm::disassemble_named(block.start, &bytes, &client.symbols, Some(&self.re.imports));
             lines.retain(|line| line.address < block.end);
+            let context = annotations::Context { imports: &self.re.imports, register_types: &self.re.register_types, live: None, read_target: false };
+            annotations::enrich(client, &mut lines, &context);
             let edges = block.edges.iter().filter_map(|edge| graph.block_at(edge.to).filter(|&index| graph.blocks[index].start == edge.to).map(|index| (index, edge.kind))).collect();
             blocks.push(GraphBlock { start: block.start, end: block.end, lines, edges, exit: block.exit });
         }
@@ -635,13 +684,14 @@ impl Worker {
                 SearchKind::Strings => search::strings(&image.bytes, image.base, 5, 20000).into_iter().map(|found| (found.address, found.address, if found.wide { format!("L\"{}\"", found.text) } else { format!("\"{}\"", found.text) })).collect(),
             };
             let client = self.client.as_mut().ok_or("sem conexao com o alvo")?;
+            self.re.imports.load(&client.symbols, image.base);
             let mut module_rows = Vec::with_capacity(found.len());
             for (address, target, text) in found {
                 let code = image.read(address, 16).unwrap_or_default();
                 let disassembly = if matches!(query.kind, SearchKind::Strings | SearchKind::Pattern(_)) {
                     hex_bytes(&code[..code.len().min(8)])
                 } else {
-                    disasm::disassemble(address, &code, Some(&client.symbols)).into_iter().next().map(|line| line.text).unwrap_or_default()
+                    disasm::first_named(address, &code, &client.symbols, Some(&self.re.imports))
                 };
                 let text = if matches!(query.kind, SearchKind::IntermodularCalls) { client.symbols.describe(target) } else { text };
                 module_rows.push(ReferenceRow { address, location: client.symbols.describe(address), disassembly, text, target });
@@ -796,37 +846,123 @@ impl Worker {
         Ok(true)
     }
 
-    /// Quem referencia o endereço: o índice de referências cruzadas do
-    /// módulo dele (feito na primeira vez e guardado até um patch).
-    pub(super) fn xrefs(&mut self, address: u64) -> Result<bool, String> {
-        let started = Instant::now();
-        let image = self.module_image(address).ok_or_else(|| format!("{address:#x} fora dos modulos"))?;
+    /// A análise do módulo da imagem (começada na primeira vez numa thread
+    /// e refeita depois de um patch) e se ela já existia.
+    fn module_analysis(&mut self, image: &SharedImage) -> (Arc<ModuleAnalysis>, bool) {
         let generation = self.re.patch_generation;
-        let cached = self.re.xref_index.get(&image.base).filter(|(stamp, _)| *stamp == generation).map(|(_, index)| Arc::clone(index));
-        let was_cached = cached.is_some();
-        let index = match cached {
-            Some(index) => index,
-            None => {
-                let index = Arc::new(refs::xref_index(&image.instructions(), (image.base, image.base + image.bytes.len() as u64)));
-                self.re.xref_index.insert(image.base, (generation, Arc::clone(&index)));
-                index
+        let end = image.base + image.bytes.len() as u64;
+        if let Some(existing) = self.re.analyses.get(&image.base) {
+            if existing.generation == generation && existing.end == end && existing.name == image.name {
+                return (Arc::clone(existing), true);
             }
-        };
-        let client = self.client.as_mut().ok_or("sem conexao com o alvo")?;
-        let mut rows = Vec::new();
-        for (from, kind) in index.get(&address).cloned().unwrap_or_default() {
-            let code = image.read(from, 16).unwrap_or_default();
-            let disassembly = disasm::disassemble(from, &code, Some(&client.symbols)).into_iter().next().map(|line| line.text).unwrap_or_default();
-            let kind = match kind {
-                refs::RefKind::Call => "chamada",
-                refs::RefKind::Jump => "salto",
-                refs::RefKind::Memory => "memória",
-                refs::RefKind::Immediate => "imediato",
-            };
-            rows.push(XrefRow { from, location: client.symbols.describe(from), kind: kind.into(), disassembly });
+            existing.cancel();
         }
-        rows.sort_by_key(|row| row.from);
-        self.re.xrefs = Some(Arc::new(XrefView { target: address, name: client.symbols.describe(address), module: image.name.clone(), rows, milliseconds: started.elapsed().as_millis(), cached: was_cached, error: None }));
+        let imports = match self.client.as_ref() {
+            Some(client) => self.re.imports.load(&client.symbols, image.base).unwrap_or_default(),
+            None => Arc::new(ImportMap::default()),
+        };
+        if self.re.analyses.len() >= MAX_ANALYSES {
+            let other = self.re.analyses.keys().copied().find(|&base| base != image.base);
+            if let Some(analysis) = other.and_then(|base| self.re.analyses.remove(&base)) {
+                analysis.cancel();
+            }
+        }
+        let analysis = ModuleAnalysis::start(Arc::clone(image), imports, generation);
+        self.re.analyses.insert(image.base, Arc::clone(&analysis));
+        (analysis, false)
+    }
+
+    /// Quem referencia o endereço (a análise do módulo dele, com o que já
+    /// ficou pronto) e o que sai da função que o contém.
+    pub(super) fn xrefs(&mut self, address: u64) -> Result<bool, String> {
+        let image = self.module_image(address).ok_or_else(|| format!("{address:#x} fora dos modulos"))?;
+        let (analysis, existed) = self.module_analysis(&image);
+        let progress = analysis.progress();
+        let client = self.client.as_mut().ok_or("sem conexao com o alvo")?;
+        self.re.imports.load(&client.symbols, address);
+        let symbols: &Symbols = &client.symbols;
+        let imports: &ImportCache = &self.re.imports;
+        let row = |from: u64, to: u64, kind: RefKind| -> XrefRow {
+            let disassembly = if kind == RefKind::Data {
+                format!("dq {}", annotation_name(symbols, imports, to))
+            } else {
+                let code = image.read(from, 16).unwrap_or_default();
+                disasm::first_named(from, &code, symbols, Some(imports))
+            };
+            XrefRow { from, location: symbols.describe(from), kind: kind.name().into(), disassembly, to, to_name: annotation_name(symbols, imports, to) }
+        };
+        let rows: Vec<XrefRow> = analysis.references_to(address).into_iter().map(|reference| row(reference.from, reference.to, reference.kind)).collect();
+        // A função: a da .pdata (com os pedaços), senão o símbolo com
+        // tamanho (o kernel do OpenNT).
+        let function = analysis.function_at(address).cloned().or_else(|| {
+            let module = symbols.module_at(address)?;
+            let index = module.symbols.partition_point(|symbol| symbol.address <= address);
+            let symbol = module.symbols[..index].iter().rev().take(64).find(|symbol| symbol.function && symbol.size != 0 && address < symbol.address + symbol.size)?;
+            Some(analysis::plain_function(symbol.address, symbol.address + symbol.size))
+        });
+        let callees: Vec<XrefRow> = function.as_ref().map(|function| analysis::references_from(&image, &analysis.imports, function).into_iter().map(|reference| row(reference.from, reference.to, reference.kind)).collect()).unwrap_or_default();
+        let function_info = function.as_ref().map(|function| (function.start, symbols.describe(function.start), function.chunks.len()));
+        let view = XrefView {
+            target: address,
+            name: symbols.describe(address),
+            module: image.name.clone(),
+            rows,
+            milliseconds: progress.milliseconds,
+            cached: existed,
+            error: None,
+            function: function_info,
+            callees,
+            progress: (!progress.finished).then_some((progress.done, progress.total)),
+        };
+        self.re.xref_pending = (!progress.finished).then_some((address, progress));
+        self.re.xrefs = Some(Arc::new(view));
+        Ok(true)
+    }
+
+    /// Com a janela Xrefs esperando a análise do módulo: refaz a resposta
+    /// quando ficam prontos mais lotes (a cada décimo do total) e no fim.
+    pub(super) fn poll_analysis(&mut self) {
+        let Some((address, shown)) = self.re.xref_pending else { return };
+        if !self.client.as_ref().is_some_and(Client::is_stopped) {
+            return;
+        }
+        let Some(analysis) = self.re.analyses.values().find(|analysis| address >= analysis.base && address < analysis.end).cloned() else {
+            self.re.xref_pending = None;
+            return;
+        };
+        let progress = analysis.progress();
+        if progress == shown || (!progress.finished && progress.done < shown.done + (progress.total / 10).max(1)) {
+            return;
+        }
+        if self.xrefs(address).is_err() {
+            self.re.xref_pending = None;
+            return;
+        }
+        // Só a janela Xrefs muda: o snapshot publicado ganha a vista nova.
+        let current = self.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).snapshot.clone();
+        let mut copy = (*current).clone();
+        copy.xrefs = self.re.xrefs.clone();
+        self.generation += 1;
+        copy.generation = self.generation;
+        self.publish(|shared| shared.snapshot = Arc::new(copy));
+    }
+
+    /// Dá um tipo a um registrador a partir de uma instrução (vazio tira):
+    /// os operandos `[reg+deslocamento]` seguintes ganham o nome do campo.
+    pub(super) fn set_register_type(&mut self, address: u64, register: &str, type_name: &str) -> Result<bool, String> {
+        let register = register.trim().to_ascii_lowercase();
+        if annotations::register_named(&register).is_none() {
+            return Err(format!("{register}: um registrador de 64 bits (rax..r15)"));
+        }
+        let type_name = type_name.trim().to_string();
+        if !type_name.is_empty() {
+            let client = self.client.as_mut().ok_or("sem conexao com o alvo")?;
+            client.types_for(type_name.trim_end_matches('*').trim())?;
+        }
+        self.re.register_types.retain(|entry| !(entry.address == address && entry.register == register));
+        if !type_name.is_empty() {
+            self.re.register_types.push(RegisterType { address, register, type_name });
+        }
         Ok(true)
     }
 
@@ -946,6 +1082,19 @@ impl Worker {
     }
 }
 
+/// O nome de um destino: o import de um slot da IAT, o símbolo ou
+/// `módulo+0xRVA`, senão o número.
+fn annotation_name(symbols: &Symbols, imports: &ImportCache, address: u64) -> String {
+    if let Some((_, import)) = imports.get(symbols, address) {
+        return format!("IAT de {}", import.display());
+    }
+    if symbols.module_at(address).is_some() {
+        symbols.describe(address)
+    } else {
+        format!("{address:#x}")
+    }
+}
+
 /// A localização módulo + RVA de um endereço (absoluta fora dos módulos).
 pub fn location_of(client: &Client, address: u64) -> Location {
     match client.symbols.module_at(address) {
@@ -1028,12 +1177,20 @@ fn info_box(client: &mut Client, address: u64, registers: &[RegisterRow]) -> Vec
     }
     for name in disasm::read_registers(address, &code) {
         if let Some(number) = value(&name) {
-            let symbol = client.symbols.name_at(number).map(|name| format!(" {name}")).unwrap_or_default();
+            // O símbolo, ou o nome do NTSTATUS/HRESULT que o valor é.
+            let symbol = client.symbols.name_at(number).or_else(|| codes().immediate(number)).map(|name| format!(" {name}")).unwrap_or_default();
             lines.push(format!("{name} = {number:#x}{symbol}"));
         }
     }
     if let Some(target) = line.target {
         lines.push(format!("destino: {target:#x} {}", client.symbols.describe(target)));
+    }
+    // O imediato que é um código de erro, com o texto da tabela de
+    // mensagens do binário.
+    if let Some(immediate) = decode::decode(&code, address).and_then(|insn| insn.immediate) {
+        if codes().immediate(immediate).is_some() {
+            lines.extend(codes().explain(immediate as u32).into_iter().map(|text| format!("imediato {text}")));
+        }
     }
     if let Some(insn) = decode::decode(&code, address) {
         if insn.flow == Flow::Conditional {

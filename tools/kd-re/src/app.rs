@@ -231,6 +231,9 @@ pub(crate) enum Dialog {
     Fill(u64, String, String),
     /// Gravar uma faixa num arquivo: início, tamanho e o caminho.
     DumpRegion(u64, String, String),
+    /// O tipo de um registrador a partir da linha: `rcx _EPROCESS`
+    /// (só o registrador tira o tipo).
+    RegisterType(u64, String),
 }
 
 /// O estado salvo entre execuções.
@@ -1805,6 +1808,7 @@ fn dialogs(ui: &mut Ui, state: &mut UiState) {
         Dialog::BinaryEdit(address, text) => ("Edição binária", "bytes em hexadecimal: 90 90 cc", Some(*address), text.clone()),
         Dialog::Fill(address, _, byte) => ("Preencher", "o byte (hexadecimal): 90", Some(*address), byte.clone()),
         Dialog::DumpRegion(address, _, path) => ("Gravar a região num arquivo", "caminho do arquivo", Some(*address), path.clone()),
+        Dialog::RegisterType(address, text) => ("Tipo de um registrador", "rcx _EPROCESS | rdx nt!_IRP | rbx win32kbase!tagWND | rcx (tira)", Some(*address), text.clone()),
     };
     let mut open = true;
     let mut submit = false;
@@ -1878,6 +1882,7 @@ fn dialogs(ui: &mut Ui, state: &mut UiState) {
             Dialog::BinaryEdit(address, _) => Dialog::BinaryEdit(address, text),
             Dialog::Fill(address, _, _) => Dialog::Fill(address, extra_text, text),
             Dialog::DumpRegion(address, _, _) => Dialog::DumpRegion(address, extra_text, text),
+            Dialog::RegisterType(address, _) => Dialog::RegisterType(address, text),
         });
         return;
     }
@@ -1934,6 +1939,16 @@ fn dialogs(ui: &mut Ui, state: &mut UiState) {
             let size = parse_hex(&extra_text).unwrap_or(0x1000);
             state.dump_path = text.trim().to_string();
             state.requests.push(Request::DumpToFile { address, size, path: PathBuf::from(text.trim()) });
+        }
+        Dialog::RegisterType(address, _) => {
+            let mut words = text.split_whitespace();
+            match words.next() {
+                Some(register) => {
+                    let type_name = words.collect::<Vec<_>>().join(" ");
+                    state.requests.push(Request::RegisterType { address, register: register.to_string(), type_name });
+                }
+                None => state.last_message = "tipo de registrador: o registrador e o tipo (rcx _EPROCESS)".into(),
+            }
         }
     }
 }

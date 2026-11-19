@@ -16,6 +16,21 @@ const LAYER_GAP: f32 = 46.0;
 const COLUMN_GAP: f32 = 40.0;
 const PADDING: f32 = 6.0;
 
+/// O texto de uma linha no bloco: a instrução e o comentário dela (os
+/// imports, as strings, os códigos de erro e os campos), cortado. Os saltos
+/// condicionais ficam sem (as arestas já mostram o destino).
+fn block_line_text(line: &crate::disasm::Line) -> String {
+    let conditional = line.text.starts_with('j') && !line.text.starts_with("jmp");
+    match &line.comment {
+        Some(comment) if !comment.is_empty() && !conditional => {
+            let short: String = comment.chars().take(48).collect();
+            let cut = if comment.chars().count() > 48 { "…" } else { "" };
+            format!("{}  ; {short}{cut}", line.text)
+        }
+        _ => line.text.clone(),
+    }
+}
+
 /// As posições dos blocos (canto superior esquerdo e tamanho) num plano
 /// sem zoom.
 fn block_rects(graph: &GraphView, glyph: f32, line_height: f32) -> Vec<Rect> {
@@ -23,7 +38,7 @@ fn block_rects(graph: &GraphView, glyph: f32, line_height: f32) -> Vec<Rect> {
         .blocks
         .iter()
         .map(|block| {
-            let longest = block.lines.iter().map(|line| line.text.chars().count() + 10).max().unwrap_or(10).min(72);
+            let longest = block.lines.iter().map(|line| block_line_text(line).chars().count() + 10).max().unwrap_or(10).min(110);
             Vec2::new(longest as f32 * glyph + 2.0 * PADDING, block.lines.len().max(1) as f32 * line_height + 2.0 * PADDING)
         })
         .collect();
@@ -187,7 +202,7 @@ pub(crate) fn graph_tab(ui: &mut Ui, state: &mut UiState) {
             }
             let color = if Some(line.address) == rip { Color32::WHITE } else { text_color };
             let label = state.label_at(line.address).map(|label| format!("{label}: ")).unwrap_or_default();
-            let text = format!("{:08x}  {label}{}", line.address & 0xFFFF_FFFF, line.text);
+            let text = format!("{:08x}  {label}{}", line.address & 0xFFFF_FFFF, block_line_text(line));
             painter.text(Pos2::new(rect.left() + PADDING * zoom, line_rect.center().y), Align2::LEFT_CENTER, text, font.clone(), color);
             if let Some(pointer) = response.interact_pointer_pos() {
                 if line_rect.contains(pointer) && (response.clicked() || response.double_clicked()) {

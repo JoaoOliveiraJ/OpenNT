@@ -499,6 +499,18 @@ pub(crate) fn code_menu(ui: &mut Ui, state: &mut UiState, line: &Line, lines: &[
         state.notes.toggle_bookmark(location);
         ui.close();
     }
+    ui.menu_button("Tipos do PDB", |ui| {
+        if ui.add_enabled(stopped, egui::Button::new("Tipo de um registrador daqui em diante...")).on_hover_text("rcx _EPROCESS: os operandos [rcx+deslocamento] seguintes mostram o campo").clicked() {
+            state.dialog = Some(Dialog::RegisterType(address, String::new()));
+            ui.close();
+        }
+        if let Some(memory) = line.memory {
+            if ui.add_enabled(stopped, egui::Button::new(format!("Ver o operando ({memory:#x}) como tipo"))).clicked() {
+                crate::explorers::view_as_type(state, "", memory);
+                ui.close();
+            }
+        }
+    });
     ui.separator();
     ui.add_enabled_ui(stopped, |ui| {
         if ui.add(egui::Button::new("Referências a este endereço").shortcut_text("Ctrl+R / X")).clicked() {
@@ -566,6 +578,10 @@ fn info_pane(ui: &mut Ui, state: &mut UiState) {
             // O comentário automático inteiro (a chamada com os argumentos).
             if let Some(comment) = snapshot.code.auto_comments.get(&address) {
                 ui.add(egui::Label::new(mono(comment).color(colors.green)).wrap());
+            }
+            // O comentário da linha inteiro (imports, CFG, campos, códigos).
+            if let Some(comment) = snapshot.code.lines.iter().find(|line| line.address == address).and_then(|line| line.comment.as_ref()) {
+                ui.add(egui::Label::new(mono(comment).color(colors.dim)).wrap());
             }
             let location = state.location(address);
             let function = snapshot.code.functions.iter().find(|function| function.contains(address));
@@ -651,8 +667,12 @@ fn registers_pane(ui: &mut Ui, state: &mut UiState) {
         // LastError e LastStatus da TEB numa parada de usuário.
         if let Some((error, status)) = snapshot.last_error {
             ui.add_space(4.0);
-            ui.label(mono(format!("LastError  {error:08X}")).color(if error != 0 { colors.red } else { ui.visuals().text_color() }));
-            ui.label(mono(format!("LastStatus {status:08X}")).color(if status != 0 { colors.red } else { ui.visuals().text_color() }));
+            // Com os nomes do winerror.h e do ntstatus.h.
+            let codes = crate::codes::codes();
+            let error_name = codes.win32(error as u32).map(|name| format!(" {name}")).unwrap_or_default();
+            let status_name = codes.ntstatus(status as u32).map(|name| format!(" {name}")).unwrap_or_default();
+            ui.label(mono(format!("LastError  {error:08X}{error_name}")).color(if error != 0 { colors.red } else { ui.visuals().text_color() }));
+            ui.label(mono(format!("LastStatus {status:08X}{status_name}")).color(if status != 0 { colors.red } else { ui.visuals().text_color() }));
         }
         ui.add_space(6.0);
         egui::Grid::new("re-segments").num_columns(4).spacing([8.0, 1.0]).show(ui, |ui| {
@@ -1118,10 +1138,17 @@ pub(crate) fn xrefs_window(ui: &mut Ui, state: &mut UiState) {
     let mut go_to = None;
     egui::Window::new("Referências cruzadas").id(egui::Id::new("re-xrefs")).default_size([720.0, 320.0]).open(&mut open).show(ui.ctx(), |ui| {
         let Some(view) = &snapshot.xrefs else {
-            hint(ui, "procurando (o índice do módulo é feito na primeira vez)...");
+            hint(ui, "procurando (a análise do módulo começa na primeira vez, numa thread)...");
             return;
         };
-        ui.label(RichText::new(format!("{} referências a {:#x} {} no módulo {} ({} ms{})", view.rows.len(), view.target, view.name, view.module, view.milliseconds, if view.cached { ", índice do cache" } else { "" })).strong());
+        let analysis = match view.progress {
+            Some((done, total)) => format!("análise do módulo em {done} de {total} lotes, a lista cresce sozinha"),
+            None => format!("análise do módulo em {} ms{}", view.milliseconds, if view.cached { ", já pronta" } else { "" }),
+        };
+        ui.label(RichText::new(format!("{} referências a {:#x} {} no módulo {} ({analysis})", view.rows.len(), view.target, view.name, view.module)).strong());
+        if let Some((start, name, chunks)) = &view.function {
+            ui.label(mono(format!("função {name} em {start:#x}{}", if *chunks > 1 { format!(" ({chunks} pedaços na .pdata)") } else { String::new() })));
+        }
         if let Some(error) = &view.error {
             ui.label(RichText::new(error).color(Color32::from_rgb(0xC0, 0x20, 0x20)));
         }
@@ -1142,7 +1169,28 @@ pub(crate) fn xrefs_window(ui: &mut Ui, state: &mut UiState) {
                 }
             });
             if view.rows.is_empty() {
-                hint(ui, "nenhuma referência direta no módulo (chamadas indiretas e tabelas não entram)");
+                hint(ui, if view.progress.is_some() { "nenhuma referência nos lotes já analisados" } else { "nenhuma referência no módulo (chamadas por registrador não entram; os ponteiros dos dados vêm da .reloc)" });
+            }
+            if !view.callees.is_empty() {
+                ui.add_space(6.0);
+                ui.label(RichText::new(format!("{} saídas da função (chamadas, saltos para fora, IAT, memória, endereços)", view.callees.len())).strong());
+                egui::Grid::new("re-xrefs-callees").num_columns(4).striped(true).spacing([10.0, 2.0]).show(ui, |ui| {
+                    for title in ["de", "tipo", "para", "instrução"] {
+                        ui.label(RichText::new(title).strong());
+                    }
+                    ui.end_row();
+                    for row in &view.callees {
+                        if ui.add(egui::Label::new(mono(hex(row.from))).sense(Sense::click())).on_hover_text("clique duplo: vai à instrução").double_clicked() {
+                            go_to = Some(row.from);
+                        }
+                        ui.label(&row.kind);
+                        if ui.add(egui::Label::new(mono(&row.to_name)).sense(Sense::click())).on_hover_text(format!("{:#x}; clique duplo: vai ao destino", row.to)).double_clicked() {
+                            go_to = Some(row.to);
+                        }
+                        ui.label(mono(&row.disassembly));
+                        ui.end_row();
+                    }
+                });
             }
         });
     });
