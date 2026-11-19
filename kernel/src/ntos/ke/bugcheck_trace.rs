@@ -16,7 +16,8 @@
 //!   (`rtl::frame_walk`) e, nas funções do kernel (sem .pdata, compiladas
 //!   com frame pointers), pela cadeia de RBP; a pilha termina no retorno de
 //!   um contexto nativo (`win32_thunk::kernel_thread_return`) ou num endereço
-//!   fora da metade de sistema.
+//!   fora da metade de sistema, e a linha `(fim: ...)` diz onde e por quê
+//!   ([`WalkEnd`]).
 //!
 //! Cada endereço sai como módulo+deslocamento pela PsLoadedModuleList (as
 //! KLDR_DATA_TABLE_ENTRY, que também trazem as imagens de sessão: win32k*.sys
@@ -28,8 +29,13 @@
 //! não espera trava e só lê páginas presentes da metade de sistema mapeadas
 //! com cache, pela tabela de páginas da raiz corrente, sem trazer páginas de
 //! volta ([`Walker`]); um endereço que não pode ser lido encerra o quadro ou
-//! a pilha. Um bloco por boot: uma falta dentro do próprio diagnóstico não o
-//! repete.
+//! a pilha. O espaço de sessão só existe nas raízes dos processos da sessão:
+//! quando a raiz corrente não mapeia uma página das imagens de sessão
+//! (win32k*.sys, cdd.dll; o System, um processo sem sessão, o aviso de uma
+//! thread sobre outra), a página sai pela raiz do primeiro processo da
+//! PsActiveProcessHead que a mapeia, lida pelo endereço físico (as imagens
+//! de sessão ficam na mesma VA em todas as sessões que as carregam). Um
+//! bloco por boot: uma falta dentro do próprio diagnóstico não o repete.
 
 use core::fmt::{self, Write};
 use core::mem::offset_of;
@@ -37,11 +43,12 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use super::pcr;
 use crate::hal::amd64::win32_thunk;
-use crate::hal::cpu;
-use crate::ntos::inc::types::{Context, ExceptionRecord, ImageExportDirectory, KldrDataTableEntry, NtStruct};
+use crate::hal::{cpu, physical};
+use crate::ntos::inc::types::{Context, Eprocess, ExceptionRecord, ImageExportDirectory, KldrDataTableEntry, Kprocess, NtStruct};
 use crate::ntos::mm::guest_memory::{self as guest, GuestScalar};
-use crate::ntos::mm::memory_map::{KERNEL_VIRTUAL_BASE, MAX_CPUS};
+use crate::ntos::mm::memory_map::{self, KERNEL_VIRTUAL_BASE, MAX_CPUS};
 use crate::ntos::mm::{kernel_data, loaded_images, paging};
+use crate::ntos::ps::process;
 use crate::ntos::rtl::frame_walk::{self, Images, Memory, Registers, RBP, RSP};
 use crate::ntos::rtl::native_context;
 
@@ -64,6 +71,10 @@ const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
 const STATUS_IN_PAGE_ERROR: u32 = 0xC000_0006;
 /// A metade de sistema: VAs canônicas com o bit 47 ligado.
 const SYSTEM_HALF: u64 = 0x1_FFFF;
+/// Processos da PsActiveProcessHead olhados para achar a raiz de uma sessão.
+const MAX_PROCESSES: usize = 1024;
+/// O frame físico numa entrada de tabela de páginas (sem flags nem NX).
+const FRAME_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 
 /// O bloco já saiu neste boot.
 static TRACED: AtomicBool = AtomicBool::new(false);
@@ -266,12 +277,12 @@ fn stack_lines(walker: &mut Walker, line: &mut Line, registers: Registers, exact
     frame_lines(walker, line, "pilha (rsp", registers.integer[RSP], &frames[..count]);
 }
 
+/// Os quadros, quatro por linha, e a linha de onde e por que a pilha acabou
+/// (o último `walk`).
 fn frame_lines(walker: &mut Walker, line: &mut Line, origin: &str, pointer: u64, frames: &[u64]) {
     let _ = write!(line, "[kcrash] {origin} {pointer:#x}):");
     if frames.is_empty() {
         let _ = line.write_str(" ilegivel");
-        line.emit();
-        return;
     }
     for (index, &address) in frames.iter().enumerate() {
         if index != 0 && index % FRAMES_PER_LINE == 0 {
@@ -283,6 +294,9 @@ fn frame_lines(walker: &mut Walker, line: &mut Line, origin: &str, pointer: u64,
         let _ = line.write_str(" ");
         walker.describe(line, address, FRAME_SYMBOL_RANGE);
     }
+    line.emit();
+    let end = walker.end;
+    let _ = write!(line, "[kcrash]  (fim: {end})");
     line.emit();
 }
 
@@ -307,6 +321,7 @@ fn kernel_frames_into(walker: &mut Walker, frames: &mut [u64; MAX_FRAMES]) -> (u
     registers.integer[RSP] = rbp;
     registers.integer[RBP] = rbp;
     if walker.frame_pointer_step(&mut registers).is_none() {
+        walker.end = WalkEnd::FramePointer(rbp);
         return (0, rbp);
     }
     (walker.walk(registers, false, frames), rbp)
@@ -398,35 +413,143 @@ impl fmt::Display for Symbol {
     }
 }
 
+/// Por que a pilha acabou (o último `Walker::walk`).
+#[derive(Clone, Copy)]
+enum WalkEnd {
+    /// Os MAX_FRAMES quadros.
+    Limit,
+    /// Retorno zero.
+    Zero,
+    /// O retorno de um contexto nativo (`kernel_thread_return`).
+    NativeStart,
+    /// Um retorno fora da metade de sistema (o anel 3 ou lixo).
+    OutsideSystem(u64),
+    /// O quadro não pôde ser desfeito.
+    Unwind(frame_walk::Fail),
+    /// A pilha não subiu (o RSP do chamador).
+    NoProgress(u64),
+    /// A cadeia de RBP do kernel não começa (o RBP de partida).
+    FramePointer(u64),
+}
+
+impl fmt::Display for WalkEnd {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WalkEnd::Limit => write!(formatter, "limite de {MAX_FRAMES} quadros"),
+            WalkEnd::Zero => formatter.write_str("retorno zero"),
+            WalkEnd::NativeStart => formatter.write_str("comeco do contexto nativo"),
+            WalkEnd::OutsideSystem(address) => write!(formatter, "retorno {address:#x} fora da metade de sistema"),
+            WalkEnd::Unwind(fail) => write!(formatter, "{fail}"),
+            WalkEnd::NoProgress(rsp) => write!(formatter, "a pilha nao subiu (rsp {rsp:#x})"),
+            WalkEnd::FramePointer(rbp) => write!(formatter, "cadeia de RBP do kernel invalida (rbp {rbp:#x})"),
+        }
+    }
+}
+
+/// Como ler uma página conferida: pela VA (presente na raiz corrente) ou
+/// pelo endereço físico (uma página de sessão vista pela raiz de outro
+/// processo).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Page {
+    Virtual,
+    Physical(u64),
+}
+
 /// Leitor da metade de sistema que não falta, com as últimas páginas
 /// conferidas e os últimos módulos achados.
 struct Walker {
-    pages: [u64; 2],
+    pages: [(u64, Page); 2],
     next_page: usize,
+    /// A raiz (PML4 física) de um processo com o espaço de sessão, achada
+    /// na primeira página de sessão que a raiz corrente não mapeia.
+    session_root: Option<u64>,
     modules: [Module; CACHED_MODULES],
     next_module: usize,
+    end: WalkEnd,
+}
+
+/// A página presente de `va` pelas tabelas da raiz `root`, mapeada com
+/// cache (sem PWT, PCD nem PAT): o endereço físico dela. Cada tabela é
+/// conferida contra o limite do mapa direto antes de ser lida (uma raiz de
+/// um processo que sai não para o diagnóstico).
+fn translate_in(root: u64, va: u64) -> Option<u64> {
+    let mut table = root & FRAME_MASK;
+    for (level, shift) in [39u32, 30, 21, 12].into_iter().enumerate() {
+        if table == 0 || table >= memory_map::PHYSICAL_MEMORY_LIMIT {
+            return None;
+        }
+        let entry = physical::read64(table + ((va >> shift) & 511) * 8);
+        if entry & paging::PAGE_PRESENT == 0 {
+            return None;
+        }
+        let large = (level == 1 || level == 2) && entry & paging::PAGE_PS != 0;
+        if level == 3 || large {
+            // O PAT fica no bit 7 da PTE de 4 KB e no bit 12 das grandes.
+            let pat = if level == 3 { entry & 0x80 != 0 } else { entry & 0x1000 != 0 };
+            if entry & (paging::PAGE_PWT | paging::PAGE_PCD) != 0 || pat {
+                return None;
+            }
+            let size = 1u64 << shift;
+            let frame = (entry & FRAME_MASK & !(size - 1)) + (va & (size - 1) & !0xFFF);
+            return (frame < memory_map::PHYSICAL_MEMORY_LIMIT).then_some(frame);
+        }
+        table = entry & FRAME_MASK;
+    }
+    None
 }
 
 impl Walker {
     fn new() -> Self {
-        Self { pages: [u64::MAX; 2], next_page: 0, modules: [Module::EMPTY; CACHED_MODULES], next_module: 0 }
+        Self { pages: [(u64::MAX, Page::Virtual); 2], next_page: 0, session_root: None, modules: [Module::EMPTY; CACHED_MODULES], next_module: 0, end: WalkEnd::Limit }
     }
 
-    /// A página está presente na raiz corrente e mapeada com cache (sem PWT,
-    /// PCD nem PAT: memória comum, não registradores de dispositivo).
-    fn page_readable(&mut self, page: u64) -> bool {
-        if self.pages.contains(&page) {
-            return true;
+    /// Como ler a página: presente na raiz corrente e mapeada com cache
+    /// (sem PWT, PCD nem PAT: memória comum, não registradores de
+    /// dispositivo), ou, no espaço de sessão que a raiz corrente não tem,
+    /// pela raiz de um processo da sessão.
+    fn page(&mut self, page: u64) -> Option<Page> {
+        if let Some(&(_, found)) = self.pages.iter().find(|(cached, _)| *cached == page) {
+            return Some(found);
         }
         if !system_address(page) {
-            return false;
+            return None;
         }
-        let readable = paging::query_page(page, false).is_some_and(|mapping| mapping.flags & (paging::PAGE_PWT | paging::PAGE_PCD) == 0 && !mapping.pat);
-        if readable {
-            self.pages[self.next_page] = page;
-            self.next_page ^= 1;
+        // Só as imagens de sessão saem por outra raiz: o pool de sessão é de
+        // cada sessão, a mesma VA em outra seria outro dado.
+        let session_image = (memory_map::SESSION_IMAGE_BASE..memory_map::SESSION_IMAGE_TOP).contains(&page);
+        let found = match paging::query_page(page, false) {
+            Some(mapping) if mapping.flags & (paging::PAGE_PWT | paging::PAGE_PCD) == 0 && !mapping.pat => Page::Virtual,
+            Some(_) => return None,
+            None if session_image => Page::Physical(self.session_frame(page)?),
+            None => return None,
+        };
+        self.pages[self.next_page] = (page, found);
+        self.next_page ^= 1;
+        Some(found)
+    }
+
+    /// O endereço físico de uma página de sessão pela raiz do primeiro
+    /// processo da PsActiveProcessHead que a mapeia (sem esperar a trava).
+    fn session_frame(&mut self, page: u64) -> Option<u64> {
+        if let Some(frame) = self.session_root.and_then(|root| translate_in(root, page)) {
+            return Some(frame);
         }
-        readable
+        let head = process::try_active_process_head()?;
+        let mut link = self.read::<u64>(head)?;
+        for _ in 0..MAX_PROCESSES {
+            if link == 0 || link == head {
+                return None;
+            }
+            let eprocess = link - offset_of!(Eprocess, active_process_links) as u64;
+            if let Some(root) = self.read::<u64>(eprocess + offset_of!(Kprocess, directory_table_base) as u64) {
+                if let Some(frame) = translate_in(root, page) {
+                    self.session_root = Some(root);
+                    return Some(frame);
+                }
+            }
+            link = self.read::<u64>(link)?;
+        }
+        None
     }
 
     /// O módulo que contém `address`: a PsLoadedModuleList ou, antes de ela
@@ -572,20 +695,36 @@ impl Walker {
     }
 
     /// Os RIPs dos quadros a partir de `start` (`exact`: o primeiro RIP é o da
-    /// falha, não um retorno), enquanto a pilha sobe.
+    /// falha, não um retorno), enquanto a pilha sobe; `end` fica com o motivo
+    /// do fim.
     fn walk(&mut self, start: Registers, exact: bool, frames: &mut [u64; MAX_FRAMES]) -> usize {
         let sentinel = win32_thunk::kernel_thread_return();
         let mut registers = start;
         let mut count = 0;
+        self.end = WalkEnd::Limit;
         while count < MAX_FRAMES {
             let rip = registers.rip;
-            if rip == 0 || rip == sentinel || !system_address(rip) {
+            if rip == 0 {
+                self.end = WalkEnd::Zero;
+                break;
+            }
+            if rip == sentinel {
+                self.end = WalkEnd::NativeStart;
+                break;
+            }
+            if !system_address(rip) {
+                self.end = WalkEnd::OutsideSystem(rip);
                 break;
             }
             frames[count] = rip;
             count += 1;
             let rsp = registers.integer[RSP];
-            if frame_walk::unwind_frame(self, &mut registers, exact && count == 1).is_none() || registers.integer[RSP] <= rsp {
+            if let Err(fail) = frame_walk::unwind_frame_why(self, &mut registers, exact && count == 1) {
+                self.end = WalkEnd::Unwind(fail);
+                break;
+            }
+            if registers.integer[RSP] <= rsp {
+                self.end = WalkEnd::NoProgress(registers.integer[RSP]);
                 break;
             }
         }
@@ -596,10 +735,23 @@ impl Walker {
 impl Memory for Walker {
     fn read<T: GuestScalar>(&mut self, address: u64) -> Option<T> {
         let last = address.checked_add(T::SIZE - 1)?;
-        if !self.page_readable(address & !0xFFF) || !self.page_readable(last & !0xFFF) {
-            return None;
+        let first_page = self.page(address & !0xFFF)?;
+        let last_page = self.page(last & !0xFFF)?;
+        if first_page == Page::Virtual && last_page == Page::Virtual {
+            return Some(guest::read::<T>(address));
         }
-        Some(guest::read::<T>(address))
+        // Uma página de sessão de outra raiz: byte a byte pelo físico.
+        let mut bits = 0u64;
+        for index in 0..T::SIZE {
+            let at = address + index;
+            let page = if at & !0xFFF == address & !0xFFF { first_page } else { last_page };
+            let byte = match page {
+                Page::Virtual => guest::read::<u8>(at),
+                Page::Physical(frame) => physical::read8(frame + (at & 0xFFF)),
+            };
+            bits |= (byte as u64) << (index * 8);
+        }
+        Some(T::from_bits(bits))
     }
 }
 
@@ -652,7 +804,7 @@ pub fn call_target(return_address: u64) -> Option<u64> {
 /// A faixa pode ser lida pelo diagnóstico.
 pub fn readable(address: u64, length: u64) -> bool {
     let mut walker = Walker::new();
-    length != 0 && address.checked_add(length - 1).is_some_and(|last| (address & !0xFFF..=last & !0xFFF).step_by(0x1000).all(|page| walker.page_readable(page)))
+    length != 0 && address.checked_add(length - 1).is_some_and(|last| (address & !0xFFF..=last & !0xFFF).step_by(0x1000).all(|page| walker.page(page).is_some()))
 }
 
 /// A cadeia de RBP a partir de quem chama: quantos retornos couberam em

@@ -4,12 +4,16 @@
 //! contém o RIP, como no RtlVirtualUnwind, mas sem epílogos nem handlers; um
 //! quadro sem RUNTIME_FUNCTION é o de uma função folha (o retorno no topo da
 //! pilha), salvo quando quem lê a memória sabe outra regra
-//! ([`Images::frameless`]). Toda leitura passa pelo leitor de quem chama
-//! ([`Memory`]), que recusa em vez de faltar, e nada aqui aloca nem toma
-//! trava: o diagnóstico de falhas de processos (`ps::user::crash_report`,
-//! memória de usuário sondada) e o das paradas do kernel
-//! (`ke::bugcheck_trace`, em qualquer IRQL) usam o mesmo desenrolamento.
+//! ([`Images::frameless`]). Uma imagem cuja .pdata não pode ser lida para o
+//! desenrolar em vez de virar folha (o retorno adivinhado no topo da pilha
+//! seria lixo). Toda leitura passa pelo leitor de quem chama ([`Memory`]),
+//! que recusa em vez de faltar, e nada aqui aloca nem toma trava: o
+//! diagnóstico de falhas de processos (`ps::user::crash_report`, memória de
+//! usuário sondada) e o das paradas do kernel (`ke::bugcheck_trace`, em
+//! qualquer IRQL) usam o mesmo desenrolamento. [`unwind_frame_why`] diz por
+//! que um quadro não pôde ser desfeito ([`Fail`]).
 
+use core::fmt;
 use core::mem::{offset_of, size_of};
 
 use crate::ntos::inc::types::{ImageDataDirectory, ImageDosHeader, ImageNtHeaders64, ImageRuntimeFunctionEntry, NtStruct, UnwindInfo};
@@ -43,6 +47,29 @@ pub struct Registers {
     pub rip: u64,
 }
 
+/// Por que um quadro não pôde ser desfeito.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fail {
+    /// Memória que o leitor recusou (a pilha, os cabeçalhos da imagem, a
+    /// .pdata ou o UNWIND_INFO).
+    Unreadable(u64),
+    /// UNWIND_INFO com versão ou códigos inválidos.
+    BadUnwindInfo(u64),
+    /// Sem RUNTIME_FUNCTION para o endereço, e a regra de quem lê (função
+    /// folha, cadeia de RBP) também não achou o quadro.
+    NoFrame(u64),
+}
+
+impl fmt::Display for Fail {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Fail::Unreadable(address) => write!(formatter, "memoria ilegivel em {address:#x}"),
+            Fail::BadUnwindInfo(address) => write!(formatter, "UNWIND_INFO invalido em {address:#x}"),
+            Fail::NoFrame(pc) => write!(formatter, "quadro de {pc:#x} sem .pdata e sem cadeia de RBP valida"),
+        }
+    }
+}
+
 /// IMAGE_DIRECTORY_ENTRY_EXCEPTION.
 const EXCEPTION_DIRECTORY: usize = 3;
 /// UNW_FLAG_CHAININFO e os códigos UWOP_* do UNWIND_CODE.
@@ -58,6 +85,10 @@ const UWOP_SPARE_CODE: u16 = 7;
 const UWOP_PUSH_MACHFRAME: u16 = 10;
 /// Entradas encadeadas e indiretas seguidas por quadro.
 const MAX_CHAIN: usize = 8;
+
+fn need<T: GuestScalar>(memory: &mut impl Memory, address: u64) -> Result<T, Fail> {
+    memory.read::<T>(address).ok_or(Fail::Unreadable(address))
+}
 
 // ---- cabeçalhos da imagem --------------------------------------------------------
 
@@ -89,21 +120,23 @@ struct FunctionEntry {
     unwind: u32,
 }
 
-fn read_function(memory: &mut impl Memory, address: u64) -> Option<FunctionEntry> {
-    Some(FunctionEntry {
-        begin: memory.read::<u32>(address + offset_of!(ImageRuntimeFunctionEntry, begin_address) as u64)?,
-        end: memory.read::<u32>(address + offset_of!(ImageRuntimeFunctionEntry, end_address) as u64)?,
-        unwind: memory.read::<u32>(address + offset_of!(ImageRuntimeFunctionEntry, unwind_info_address) as u64)?,
+fn read_function(memory: &mut impl Memory, address: u64) -> Result<FunctionEntry, Fail> {
+    Ok(FunctionEntry {
+        begin: need::<u32>(memory, address + offset_of!(ImageRuntimeFunctionEntry, begin_address) as u64)?,
+        end: need::<u32>(memory, address + offset_of!(ImageRuntimeFunctionEntry, end_address) as u64)?,
+        unwind: need::<u32>(memory, address + offset_of!(ImageRuntimeFunctionEntry, unwind_info_address) as u64)?,
     })
 }
 
 /// Busca binária na .pdata da imagem, seguindo as entradas indiretas.
-fn function_entry(memory: &mut impl Memory, base: u64, size: u64, pc: u64) -> Option<FunctionEntry> {
-    let header = nt_headers(memory, base)?;
-    let (table, length) = data_directory(memory, header, EXCEPTION_DIRECTORY)?;
+/// `Ok(None)`: a imagem não tem .pdata ou não tem entrada para `pc`; erro
+/// quando os cabeçalhos ou a tabela não podem ser lidos.
+fn function_entry(memory: &mut impl Memory, base: u64, size: u64, pc: u64) -> Result<Option<FunctionEntry>, Fail> {
+    let header = nt_headers(memory, base).ok_or(Fail::Unreadable(base))?;
+    let Some((table, length)) = data_directory(memory, header, EXCEPTION_DIRECTORY) else { return Ok(None) };
     let entry_size = ImageRuntimeFunctionEntry::SIZE;
     if table == 0 || length as u64 % entry_size != 0 || table as u64 + length as u64 > size {
-        return None;
+        return Ok(None);
     }
     let relative = pc - base;
     let (mut lower, mut upper) = (0i64, (length as u64 / entry_size) as i64 - 1);
@@ -117,14 +150,14 @@ fn function_entry(memory: &mut impl Memory, base: u64, size: u64, pc: u64) -> Op
         } else {
             for _ in 0..MAX_CHAIN {
                 if function.unwind & 1 == 0 {
-                    return Some(function);
+                    return Ok(Some(function));
                 }
                 function = read_function(memory, base + (function.unwind - 1) as u64)?;
             }
-            return None;
+            return Err(Fail::BadUnwindInfo(base + function.unwind as u64));
         }
     }
-    None
+    Ok(None)
 }
 
 /// Um UNWIND_INFO lido da imagem (CountOfCodes cabe num byte).
@@ -157,21 +190,21 @@ fn slot_count(operation: u16, information: u16) -> Option<usize> {
 }
 
 impl UnwindData {
-    fn read(memory: &mut impl Memory, address: u64) -> Option<Self> {
-        let header = memory.read::<u8>(address + offset_of!(UnwindInfo, bitfield_0) as u64)?;
+    fn read(memory: &mut impl Memory, address: u64) -> Result<Self, Fail> {
+        let header = need::<u8>(memory, address + offset_of!(UnwindInfo, bitfield_0) as u64)?;
         let version = (header & UnwindInfo::VERSION_MASK) >> UnwindInfo::VERSION_SHIFT;
         if version != 1 && version != 2 {
-            return None;
+            return Err(Fail::BadUnwindInfo(address));
         }
-        let prolog = memory.read::<u8>(address + offset_of!(UnwindInfo, size_of_prolog) as u64)?;
-        let count = memory.read::<u8>(address + offset_of!(UnwindInfo, count_of_codes) as u64)? as usize;
-        let frame = memory.read::<u8>(address + offset_of!(UnwindInfo, bitfield_3) as u64)?;
+        let prolog = need::<u8>(memory, address + offset_of!(UnwindInfo, size_of_prolog) as u64)?;
+        let count = need::<u8>(memory, address + offset_of!(UnwindInfo, count_of_codes) as u64)? as usize;
+        let frame = need::<u8>(memory, address + offset_of!(UnwindInfo, bitfield_3) as u64)?;
         let first = address + offset_of!(UnwindInfo, unwind_code) as u64;
         let mut codes = [0u16; 256];
         for (index, code) in codes.iter_mut().take(count).enumerate() {
-            *code = memory.read::<u16>(first + index as u64 * 2)?;
+            *code = need::<u16>(memory, first + index as u64 * 2)?;
         }
-        Some(Self {
+        Ok(Self {
             flags: (header & UnwindInfo::FLAGS_MASK) >> UnwindInfo::FLAGS_SHIFT,
             prolog,
             frame: ((frame & UnwindInfo::FRAME_REGISTER_MASK) >> UnwindInfo::FRAME_REGISTER_SHIFT) as usize,
@@ -219,15 +252,24 @@ pub fn pop_return(memory: &mut impl Memory, registers: &mut Registers) -> Option
 /// Desfaz um quadro pelos códigos de unwind (sem epílogos nem handlers): os
 /// inteiros e o RIP do chamador. `first`: o RIP é o da falha, não um retorno.
 pub fn unwind_frame<M: Images>(memory: &mut M, registers: &mut Registers, first: bool) -> Option<()> {
+    unwind_frame_why(memory, registers, first).ok()
+}
+
+/// [`unwind_frame`] com o motivo de um quadro que não pôde ser desfeito.
+pub fn unwind_frame_why<M: Images>(memory: &mut M, registers: &mut Registers, first: bool) -> Result<(), Fail> {
     let pc = if first { registers.rip } else { registers.rip.wrapping_sub(1) };
-    let image = memory.image(pc);
-    let Some((base, mut entry)) = image.and_then(|(base, size)| function_entry(memory, base, size, pc).map(|entry| (base, entry))) else {
-        return memory.frameless(pc, registers);
+    let found = match memory.image(pc) {
+        Some((base, size)) => function_entry(memory, base, size, pc)?.map(|entry| (base, entry)),
+        None => None,
+    };
+    let Some((base, mut entry)) = found else {
+        return memory.frameless(pc, registers).ok_or(Fail::NoFrame(pc));
     };
     let mut machine_frame = false;
     let mut establisher_frame = None;
     for _ in 0..MAX_CHAIN {
-        let info = UnwindData::read(memory, base + entry.unwind as u64)?;
+        let address = base + entry.unwind as u64;
+        let info = UnwindData::read(memory, address)?;
         let relative = pc.wrapping_sub(base + entry.begin as u64);
         let establisher = *establisher_frame.get_or_insert_with(|| info.establisher(registers, relative));
         let inside_prolog = relative < info.prolog as u64;
@@ -237,9 +279,9 @@ pub fn unwind_frame<M: Images>(memory: &mut M, registers: &mut Registers, first:
             let code = codes[slot];
             let operation = (code >> 8) & 0xF;
             let register = (code >> 12) as usize;
-            let slots = slot_count(operation, code >> 12)?;
+            let slots = slot_count(operation, code >> 12).ok_or(Fail::BadUnwindInfo(address))?;
             if slot + slots > codes.len() {
-                return None;
+                return Err(Fail::BadUnwindInfo(address));
             }
             let word = |offset: usize| codes.get(slot + offset).copied().unwrap_or(0) as u64;
             let (first_word, second_word) = (word(1), word(2));
@@ -251,18 +293,18 @@ pub fn unwind_frame<M: Images>(memory: &mut M, registers: &mut Registers, first:
             let rsp = registers.integer[RSP];
             match operation {
                 UWOP_PUSH_NONVOL => {
-                    registers.integer[register] = memory.read::<u64>(rsp)?;
+                    registers.integer[register] = need::<u64>(memory, rsp)?;
                     registers.integer[RSP] = rsp.wrapping_add(8);
                 }
                 UWOP_ALLOC_LARGE => registers.integer[RSP] = rsp.wrapping_add(if register != 0 { first_word | second_word << 16 } else { first_word * 8 }),
                 UWOP_ALLOC_SMALL => registers.integer[RSP] = rsp.wrapping_add(register as u64 * 8 + 8),
                 UWOP_SET_FPREG => registers.integer[RSP] = registers.integer[info.frame].wrapping_sub(info.frame_offset),
-                UWOP_SAVE_NONVOL => registers.integer[register] = memory.read::<u64>(establisher.wrapping_add(first_word * 8))?,
-                UWOP_SAVE_NONVOL_FAR => registers.integer[register] = memory.read::<u64>(establisher.wrapping_add(first_word | second_word << 16))?,
+                UWOP_SAVE_NONVOL => registers.integer[register] = need::<u64>(memory, establisher.wrapping_add(first_word * 8))?,
+                UWOP_SAVE_NONVOL_FAR => registers.integer[register] = need::<u64>(memory, establisher.wrapping_add(first_word | second_word << 16))?,
                 UWOP_PUSH_MACHFRAME => {
                     let frame = rsp.wrapping_add(register as u64 * 8);
-                    registers.rip = memory.read::<u64>(frame)?;
-                    registers.integer[RSP] = memory.read::<u64>(frame + 24)?;
+                    registers.rip = need::<u64>(memory, frame)?;
+                    registers.integer[RSP] = need::<u64>(memory, frame + 24)?;
                     machine_frame = true;
                 }
                 // Os XMM salvos não mudam a pilha.
@@ -274,5 +316,9 @@ pub fn unwind_frame<M: Images>(memory: &mut M, registers: &mut Registers, first:
         }
         entry = read_function(memory, info.tail)?;
     }
-    if machine_frame { Some(()) } else { pop_return(memory, registers) }
+    if machine_frame {
+        Ok(())
+    } else {
+        pop_return(memory, registers).ok_or(Fail::Unreadable(registers.integer[RSP]))
+    }
 }
