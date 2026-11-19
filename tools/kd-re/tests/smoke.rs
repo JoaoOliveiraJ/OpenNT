@@ -7,6 +7,10 @@
 //!   da ntdll), um breakpoint de usuário no ntdll!LdrLoadDll que só o
 //!   csrss acerta, a pilha de usuário até o CSRSRV, as threads de usuário,
 //!   os handles e o mapa de memória (VAD);
+//! - a aba Processos: a sessão do csrss, o PDB da ntdll, as pilhas de
+//!   usuário e de kernel de uma thread, e um plano de seguir (a carga do
+//!   winsrv.dll no csrss arma o ponto de entrada dele e a máquina segue até
+//!   lá);
 //! - o grafo de fluxo de uma função do kernel e de uma da ntdll;
 //! - as referências a strings conhecidas no ACPI.sys real (ASCII e UTF-16)
 //!   e no CSRSRV.dll;
@@ -24,7 +28,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kd_re::app::{DebuggerApp, Tab};
-use kd_re::backend::{Backend, Config, Request, SearchKind, SearchScope, Shared, Status, Target};
+use kd_re::backend::{Backend, Config, PdbState, Request, SearchKind, SearchScope, Shared, Status, Target, UserRequest};
+use kd_re::follow::FollowPlan;
 use kd_re::launcher::LaunchOptions;
 use kd_re::{offscreen, scenario};
 
@@ -93,6 +98,31 @@ fn debugs_csrss_and_the_kernel() {
         assert!(!snapshot.stack.is_empty());
         assert!(!snapshot.info_box.is_empty());
     }
+    // A aba Processos: a imagem do csrss (com os tipos do ntoskrnl), os
+    // módulos com o PDB da ntdll, as threads e as duas pilhas de uma delas.
+    let tid = {
+        let shared = backend.shared();
+        let user = &shared.snapshot.user;
+        let csrss: Vec<_> = user.processes.iter().filter(|row| row.name.eq_ignore_ascii_case("csrss.exe")).collect();
+        assert!(!csrss.is_empty(), "{:?}", user.processes);
+        log(&format!("csrss na aba Processos: {csrss:?}"));
+        if user.types_note.is_empty() {
+            assert!(csrss.iter().all(|row| row.image.to_ascii_lowercase().ends_with("csrss.exe")), "sem a imagem do csrss: {csrss:?}");
+        }
+        assert!(user.modules.iter().any(|module| module.name.eq_ignore_ascii_case("ntdll") && matches!(module.pdb, PdbState::Loaded(_))), "{:?}", user.modules);
+        let threads = user.threads.as_deref().expect("as threads de usuario").as_ref().expect("uthreads");
+        threads.iter().find(|row| row.thread.context != 0).map(|row| row.thread.tid).unwrap_or_else(|| panic!("nenhuma thread com CONTEXT: {threads:?}"))
+    };
+    let before = generation(&backend);
+    backend.send(Request::User(UserRequest::ThreadStacks(Some(tid))));
+    wait(&backend, "as pilhas da thread", Duration::from_secs(300), |shared| shared.snapshot.generation > before && shared.snapshot.user.stacks.is_some() && shared.activity.is_empty());
+    {
+        let shared = backend.shared();
+        let stacks = shared.snapshot.user.stacks.as_ref().expect("pilhas");
+        assert_eq!(stacks.tid, tid);
+        assert!(stacks.kernel.as_ref().is_ok_and(|frames| !frames.is_empty()), "{stacks:?}");
+        assert!(stacks.user.is_ok(), "{stacks:?}");
+    }
     let before = generation(&backend);
     backend.send(Request::LoadUserThreads);
     backend.send(Request::LoadHandles);
@@ -118,6 +148,27 @@ fn debugs_csrss_and_the_kernel() {
         let shared = backend.shared();
         let references = shared.snapshot.references.as_ref().expect("referencias");
         assert!(references.rows.iter().any(|row| row.text.contains("\\Sessions")), "{:?}", references.rows.iter().take(20).collect::<Vec<_>>());
+    }
+
+    // Seguir: quando o csrss carregar o winsrv.dll (a carga do LdrLoadDll
+    // parado), o plano arma o ponto de entrada dele só no csrss e segue; a
+    // parada seguinte é lá.
+    let ldr = backend.shared().snapshot.breakpoints.iter().find(|breakpoint| breakpoint.expression.contains("LdrLoadDll")).map(|breakpoint| breakpoint.id);
+    if let Some(id) = ldr {
+        backend.send(Request::RemoveBreakpoint(id));
+    }
+    let before = generation(&backend);
+    backend.send(Request::User(UserRequest::Follow(FollowPlan { process: "csrss.exe".into(), module: "winsrv.dll".into(), symbols: vec!["$iment(winsrv)".into()], ..Default::default() })));
+    wait(&backend, "o plano de seguir armado", Duration::from_secs(60), |shared| shared.snapshot.generation > before && shared.snapshot.user.plans.iter().any(|plan| plan.trigger_armed));
+    let before = generation(&backend);
+    backend.send(Request::Go);
+    wait(&backend, "a parada no ponto de entrada do winsrv.dll", Duration::from_secs(900), |shared| shared.status == Status::Stopped && shared.snapshot.generation > before && shared.snapshot.stop.contains("swbreak") && shared.snapshot.user_mode && shared.activity.is_empty());
+    {
+        let shared = backend.shared();
+        assert!(shared.snapshot.stop.to_ascii_lowercase().contains("winsrv"), "{}", shared.snapshot.stop);
+        assert!(shared.transcript.iter().any(|entry| entry.input == "(seguir)" && entry.output.contains("armado")), "sem o plano armado no log");
+        let plan = shared.snapshot.user.plans.first().expect("o plano");
+        assert!(plan.instances.iter().any(|line| line.contains("armados")), "{plan:?}");
     }
 
     // Grafos: uma função do kernel e uma da ntdll.

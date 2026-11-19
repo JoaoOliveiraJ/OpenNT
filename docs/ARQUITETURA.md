@@ -5823,7 +5823,7 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     (CPU, Grafo, Log, Notas, Breakpoints, Mapa de memória, Pilha de
     chamadas, SEH, Script, Símbolos, Código-fonte, Referências, Threads,
     Handles, Rastro, Strings, Patches, Comentários/Rótulos, Processos,
-    Observação, Objetos do NT, Bugcheck), barra de comando e barra de estado
+    Exceção, Observação, Objetos do NT, Bugcheck), barra de comando e barra de estado
     (Pausado ou Rodando e a última mensagem). As abas são do `egui_dock`; o
     menu Exibir reabre uma aba e restaura o arranjo. Tema claro (padrão) e
     escuro.
@@ -5944,10 +5944,13 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     na carga do basesrv.dll no csrss.exe real (o evento de imagem), confere
     o contexto (PEB, módulos da PEB.Ldr com os símbolos da ntdll), para num
     breakpoint de usuário no ntdll!LdrLoadDll com a pilha até o CSRSRV, lê
-    threads de usuário, handles e o mapa de memória, monta o grafo de uma
-    função do kernel e de uma da ntdll, acha referências conhecidas no
-    ACPI.sys real (`PNP0A03` em ASCII e uma UTF-16) e no CSRSRV.dll, roda um
-    roteiro e desenha a janela fora da tela.
+    threads de usuário, handles e o mapa de memória, confere a aba Processos
+    (a imagem do csrss, o PDB da ntdll, as pilhas de usuário e de kernel de
+    uma thread), segue o csrss até a carga do winsrv.dll e para no ponto de
+    entrada dele, monta o grafo de uma função do kernel e de uma da ntdll,
+    acha referências conhecidas no ACPI.sys real (`PNP0A03` em ASCII e uma
+    UTF-16) e no CSRSRV.dll, roda um roteiro e desenha a janela fora da
+    tela.
   - Abas novas (`monitors.rs`, `explorers.rs`, `backend/extras.rs`): APIs
     (tabela virtual, filtros, detalhe, ir para o chamador, CSV), IRPs
     (lista e linha do tempo com as barras dos saltos), Tipos, Registro
@@ -5960,6 +5963,42 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     (`TimeMode`) sai das opções do `xtask` do alvo e aparece na barra de
     estado; o menu Arquivo reabre o alvo com snapshots, gravando ou
     reproduzindo. O Dump tem "Ver como tipo" (Ctrl+Shift+T).
+  - Processos de usuário (`processes.rs`, `backend/usermode.rs`): a aba
+    Processos tem a barra do contexto (kernel ou o processo escolhido, com
+    sessão, CR3 e PEB; voltar ao kernel; o processo do CR3 da parada), a
+    lista de processos com sessão, pai e imagem (o `_EPROCESS.Session`, o
+    InheritedFromUniqueProcessId e o SeAuditProcessCreationInfo pelos tipos
+    do PDB do ntoskrnl, lidos uma vez por processo; clique troca o
+    contexto), os módulos do processo com entrada e o estado do PDB, o
+    breakpoint de usuário com sugestões de símbolos, as threads de usuário
+    com a pilha de usuário (o CONTEXT salvo) e a de kernel, e os eventos
+    registrados (`cpr:*`, `epr:*`, `ld:*!` com log, sem parar).
+  - Seguir (`follow.rs`): um plano `processo[!dll] [símbolos]` vira o
+    breakpoint de evento `ld:processo!dll` (ou `cpr:processo`); na parada
+    dele o backend troca o contexto para o processo, espera o PDB do módulo,
+    arma os breakpoints de usuário só naquele processo e segue sozinho
+    (`seguir dwm.exe!dwmcore.dll CD2DContext::InitializeD2D` na barra de
+    comando). Os símbolos de módulos que ainda não carregaram esperam as
+    cargas seguintes do processo (`ld:processo!`); os planos ficam em
+    `<build>/opennt-re/seguir.txt`. Um breakpoint de usuário num módulo
+    ainda não carregado vira um plano de uma vez só. Os símbolos de uma DLL
+    saem do arquivo desta máquina e do PDB do cache, antes de o processo
+    existir.
+  - Aba Exceção (`exception.rs`): numa parada na entrada do
+    KERNELBASE!RaiseFailFastException, do ntdll!KiUserExceptionDispatcher
+    (o registro em RSP + 0x4F0), do RtlDispatchException, do
+    RtlRaiseException, do NtRaiseException, do RtlReportException, do
+    UnhandledExceptionFilter ou do RaiseException, o EXCEPTION_RECORD é lido
+    e explicado: o código, as flags, o endereço, o sentido dos parâmetros
+    (violação de acesso, o código do `__fastfail`, o HRESULT do fail-fast do
+    MIL), as exceções guardadas do WinRT (STATUS_STOWED_EXCEPTION: HRESULT,
+    thread, pilha ou texto de cada STOWED_EXCEPTION_INFORMATION e as
+    aninhadas), o tipo lançado de uma exceção do C++ (pela ThrowInfo), os
+    registros encadeados e a pilha desenrolada do CONTEXT. Numa parada de
+    primeira chance (`uex`) o registro ainda não existe: o botão arma uma
+    parada de uma vez só no KiUserExceptionDispatcher. Os breakpoints
+    prontos (fail-fast, exceção não tratada, toda exceção entregue, saída
+    com erro, erros do WinRT só com log) valem para o processo escolhido.
   - Preferências e banco por módulo (`preferences.rs`): fontes, escala,
     cores que trocam as da paleta, o editor de atalhos (as ações com a
     tecla, conflitos em vermelho) e as paradas em eventos (mandadas ao
@@ -5999,7 +6038,11 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     dos tipos, o histórico, a busca aproximada (a nota, a ordem, o limite
     e a thread), os marcadores, a barra de estado, o transcrito em linhas,
     o log de eventos, a geometria da janela, o arranjo salvo de outra
-    versão e a janela desenhada fora da tela com as janelas novas.
+    versão e a janela desenhada fora da tela com as janelas novas;
+    os registros de exceção (violação de acesso, exceções guardadas do
+    WinRT, `__fastfail`, C++, encadeados, as entradas conhecidas), o texto
+    dos eventos do kd-client, a regra de casamento dos breakpoints de
+    evento, os planos de seguir e o arquivo deles.
   - Fumaça das ferramentas (`tests/smoke_tools.rs`, `--ignored`): com
     `--start-driver=ntfs`, o monitor e o rastreador ligados no começo do
     boot, o IoCreateDevice do ntfs.sys com STATUS_SUCCESS, um
