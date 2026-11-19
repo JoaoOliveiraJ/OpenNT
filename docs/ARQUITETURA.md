@@ -2958,7 +2958,22 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   mesmos quadros.
   O autoteste `ntos/test/kernel_crash_trace.rs` (fase 6) confere a descrição
   de um trampolim de export, a decodificação das chamadas, a cadeia de RBP e
-  as recusas do leitor.
+  as recusas do leitor. A análise sai do próprio log, sem o alvo
+  (`tools/kd-client/src/crash`, `cargo xtask crash [SERIAL.LOG]`): o código
+  e o sentido dos parâmetros no 19041, onde parou, o módulo culpado (o do
+  ponto de partida, ou o primeiro quadro fora do kernel e da HAL), o
+  componente provável e a pilha do `[kcrash]` com os públicos dos PDBs e,
+  no `ntoskrnl.exe` (o kernel do OpenNT), com os símbolos do `kernel.elf`;
+  as imagens vêm das linhas `[pe] base=` do boot. Dos dados secundários sai
+  o WdLog do dxgkrnl (os anéis de asserções, erros, avisos, eventos e
+  rastro, com o status de cada entrada) e, por sequência, as apresentações
+  (`DdiPresentDisplayOnly`) e as mudanças de VidPn da primeira tela. O
+  test-boot que falha com uma parada imprime o mesmo resumo, e o
+  `test-boot --manual-crash` manda a parada manual pelo monitor do QEMU no
+  fim da execução, para que um boot que não para também traga os dados
+  secundários. O `cargo xtask logsum SERIAL.LOG` resume o log inteiro:
+  marcadores, fim, memória, a árvore de processos com o fim de cada um, as
+  falhas de syscall por processo, as syscalls sem implementação e os laços.
 - **Pedidos térmicos** (`po/thermal.rs`, `po/reason_context.rs`): a
   extensão de resfriamento de cada alvo recebe a
   GUID_THERMAL_COOLING_INTERFACE por um IRP_MN_QUERY_INTERFACE síncrono ao
