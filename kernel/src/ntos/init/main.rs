@@ -254,6 +254,12 @@ pub fn kmain() -> ! {
         debug_print!("[ex] \\NLS nao criado: {}", error);
     }
 
+    // `--console-process`: o cmd.exe real com um console sem janela, pelo
+    // condrv.sys e pelo conhost.exe reais, antes do shell.
+    if boot_config::console_process() && !boot_config::smss_boot() {
+        crate::ntos::test::console_process::run();
+    }
+
     // processos: no boot do processo inicial real, o smss.exe; senão, o
     // serviço de teclado (IPC) e o shell. No boot do smss nenhum leitor do
     // kernel fica no \Device\KeyboardClass0: o kbdclass completa o READ que

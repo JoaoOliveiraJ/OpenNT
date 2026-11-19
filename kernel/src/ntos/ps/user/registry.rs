@@ -60,6 +60,9 @@ pub fn parse_user_object_attributes(attributes: u64) -> Option<Parsed> {
         // Raiz de registro (chave) ou de objetos (diretório, inclusive aberto
         // como arquivo, ou o handle nativo de um diretório do namespace).
         let root_path = match state::get_user_handle(root_directory) {
+            // Um arquivo de dispositivo: o nome vai como veio, relativo ao
+            // FILE_OBJECT da raiz (o IopParseFile, `files::open_file`).
+            Some(root) if root.kind() == "device" => return Some(Parsed { path: name, root_directory }),
             Some(root) => root.object.object_path()?,
             None => {
                 // Um namespace privado (diretório sem nome) dá o caminho ancorado.

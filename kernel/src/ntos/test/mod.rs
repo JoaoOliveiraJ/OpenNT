@@ -29,6 +29,7 @@ pub mod file_system_mount;
 pub mod minifilters;
 pub mod minifilter_support;
 pub mod console_driver;
+pub mod console_process;
 pub mod kernel_waits;
 pub mod extended_state;
 pub mod irql_cr8;

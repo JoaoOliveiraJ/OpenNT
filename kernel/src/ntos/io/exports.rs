@@ -117,19 +117,22 @@ fn io_get_driver_object_extension(call: &Call) -> Result<u64, KernelError> {
 fn io_get_current_process(_: &Call) -> Result<u64, KernelError> {
     Ok(process::get_current_process())
 }
-/// IoCreateFile: a abertura completa do ZwCreateFile.
+/// IoCreateFile: a abertura completa do ZwCreateFile, com o EaBuffer e o
+/// EaLength (10º e 11º argumentos).
 fn io_create_file(call: &Call) -> Result<u64, KernelError> {
-    Ok(zw_files::create_kernel_file(call.arg(1), call.arg(2) as u32, call.arg(3), call.arg(4), call.arg(7) as u32, call.arg(8) as u32, call.arg(9) as u32)? as u64)
+    let context = crate::ntos::io::parse::DriverCreateContext { ea_buffer: call.arg(10), ea_length: call.arg(11) as u32, ..Default::default() };
+    Ok(zw_files::create_kernel_file_with_context(call.arg(1), call.arg(2) as u32, call.arg(3), call.arg(4), call.arg(7) as u32, call.arg(8) as u32, call.arg(9) as u32, context)? as u64)
 }
 /// IoCreateFileEx: a do IoCreateFile com o IO_DRIVER_CREATE_CONTEXT do 15º
 /// argumento (Size, ExtraCreateParameter em +8, DeviceObjectHint em +0x10).
 fn io_create_file_ex(call: &Call) -> Result<u64, KernelError> {
     let driver_context = call.variadic_arg(15);
     let context = if driver_context != 0 {
-        crate::ntos::io::parse::DriverCreateContext { extra_create_parameter: crate::ntos::mm::guest_memory::read64(driver_context + 8), device_object_hint: crate::ntos::mm::guest_memory::read64(driver_context + 0x10) }
+        crate::ntos::io::parse::DriverCreateContext { extra_create_parameter: crate::ntos::mm::guest_memory::read64(driver_context + 8), device_object_hint: crate::ntos::mm::guest_memory::read64(driver_context + 0x10), ..Default::default() }
     } else {
         crate::ntos::io::parse::DriverCreateContext::default()
     };
+    let context = crate::ntos::io::parse::DriverCreateContext { ea_buffer: call.arg(10), ea_length: call.arg(11) as u32, ..context };
     Ok(zw_files::create_kernel_file_with_context(call.arg(1), call.arg(2) as u32, call.arg(3), call.arg(4), call.arg(7) as u32, call.arg(8) as u32, call.arg(9) as u32, context)? as u64)
 }
 fn io_get_related_device_object(call: &Call) -> Result<u64, KernelError> {
@@ -1416,7 +1419,7 @@ pub mod io_file_system_support {
     /// CreateFileType, InternalParameters, Options, DeviceObject) = IoCreateFileEx
     /// com IO_DRIVER_CREATE_CONTEXT{DeviceObjectHint = o 15º argumento}.
     fn create_file_specify_device_object_hint(call: &Call) -> Result<u64, KernelError> {
-        let context = crate::ntos::io::parse::DriverCreateContext { extra_create_parameter: 0, device_object_hint: call.variadic_arg(15) };
+        let context = crate::ntos::io::parse::DriverCreateContext { extra_create_parameter: 0, device_object_hint: call.variadic_arg(15), ea_buffer: call.arg(10), ea_length: call.arg(11) as u32 };
         zw_files::create_kernel_file_with_context(call.arg(1), call.arg(2) as u32, call.arg(3), call.arg(4), call.arg(7) as u32, call.arg(8) as u32, call.arg(9) as u32, context).map(signed_status)
     }
 

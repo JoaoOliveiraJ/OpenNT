@@ -87,6 +87,23 @@ impl UserObject for UserDevice {
     }
 }
 
+impl UserDevice {
+    /// O handle `device` de um FILE_OBJECT que já existe: o
+    /// ObOpenObjectByPointer de UserMode com que o CdpLaunchServerProcess do
+    /// condrv.sys põe o servidor do console no conhost.exe
+    /// (`ob/open_pointer.rs`). Sem handle do I/O manager (o I/O vai por IRP
+    /// ao dispositivo relacionado do FILE_OBJECT, como numa abertura do
+    /// IopParseDevice), com uma referência própria no FILE_OBJECT, solta no
+    /// `release`. O caminho é o do DEVICE_OBJECT do FILE_OBJECT.
+    pub fn existing(file_object: u64) -> Result<Self, KernelError> {
+        // SAFETY: FILE_OBJECT vivo, retido por quem abre o handle.
+        let device = unsafe { crate::ntos::inc::types::FileObject::at(file_object) }.device_object.get();
+        let device_path = crate::ntos::io::device::find_device_node_by_pointer(device).and_then(crate::ntos::ob::object_manager::path_of).unwrap_or_default();
+        file_objects::reference(file_object)?;
+        Ok(Self { device_path, options: 0, device_handle: 0, file_object, position: crate::rtl::SpinLock::new(0) })
+    }
+}
+
 fn is_separator(character: Option<char>) -> bool {
     matches!(character, Some('\\') | Some('/'))
 }
@@ -160,7 +177,102 @@ fn open_file(handle_pointer: u64, attributes: u64, iosb: u64, disposition: u32, 
         Ok(flags) => flags,
         Err(error) => return Ok(error.status),
     };
+    // RootDirectory que é um arquivo de dispositivo (o `\Reference` do
+    // servidor do condrv, o `\Connect` da referência, o `\Input` e o
+    // `\Output` da conexão): o IopParseFile, que vai ao IopParseDevice com
+    // RelatedFileObject = a raiz.
+    if parsed.root_directory != 0 && special.is_none() {
+        if let Some(root) = state::get_user_handle(parsed.root_directory).filter(|entry| entry.kind() == "device") {
+            return open_relative_to_device(handle_pointer, &root, &parsed.path, object_flags, iosb, disposition, request);
+        }
+    }
     open_by_name(handle_pointer, &parsed.path, object_flags, iosb, disposition, request, special)
+}
+
+/// O EaBuffer de um IRP_MJ_CREATE de dispositivo, sondado para leitura
+/// (o ProbeForRead do IopCreateFile): (buffer, comprimento), (0, 0) sem EA,
+/// ou STATUS_ACCESS_VIOLATION.
+fn user_ea(request: &OpenRequest) -> Result<(u64, u32), u32> {
+    if request.ea_buffer == 0 || request.ea_length == 0 {
+        return Ok((0, 0));
+    }
+    if !state::probe_user_read(request.ea_buffer, request.ea_length as u64) {
+        return Err(0xC000_0005);
+    }
+    Ok((request.ea_buffer, request.ea_length))
+}
+
+/// O NtCreateFile relativo a um handle `device`: o FILE_OBJECT novo, no
+/// dispositivo da raiz, aponta o FILE_OBJECT dela (RelatedFileObject) e o
+/// nome vai como veio, com o IRP_MJ_CREATE completo e o EA (a mesma
+/// abertura de kernel de `io/file/zw.rs`).
+fn open_relative_to_device(handle_pointer: u64, root: &state::UserHandle, name: &str, object_flags: u32, iosb: u64, disposition: u32, request: &OpenRequest) -> Result<u32, KernelError> {
+    let Some(device) = root.downcast::<UserDevice>() else { return Ok(fail_iosb(iosb, STATUS_INVALID_HANDLE)) };
+    let (ea_buffer, ea_length) = match user_ea(request) {
+        Ok(ea) => ea,
+        Err(status) => return Ok(fail_iosb(iosb, status)),
+    };
+    debug_print!("[usermode] abre device relativo: {}{} (raiz {:#x})", device.device_path, name, device.file_object);
+    let create = device_create_parameters(request, disposition, object_flags, None);
+    let opened = match io_manager::open_related_device_file_with_ea(&device.device_path, name, device.file_object, create, ea_buffer, ea_length, true) {
+        Ok(opened) => opened,
+        Err(error) if error.status != 0 => return Ok(fail_iosb(iosb, error.status)),
+        Err(error) => return Err(error),
+    };
+    publish_device(handle_pointer, iosb, device.device_path.clone(), request, object_flags, opened)
+}
+
+/// O IRP_MJ_CREATE de uma abertura de dispositivo de modo usuário:
+/// acesso, compartilhamento, disposição, opções, atributos e o tipo de
+/// criação do file system (`special`).
+fn device_create_parameters(request: &OpenRequest, disposition: u32, object_flags: u32, special: Option<&pipe_mailslot::Captured>) -> io_manager::CreateParameters {
+    io_manager::CreateParameters {
+        access: request.access,
+        share: request.share,
+        disposition,
+        options: request.options,
+        file_attributes: request.attributes,
+        case_sensitive: object_flags & 0x40 == 0,
+        file_type: special.map_or(0, |captured| captured.file_type()),
+        extra_parameters: special.map_or(0, |captured| captured.pointer()),
+        user_mode: true,
+        ..Default::default()
+    }
+}
+
+/// O handle `device` de uma abertura de dispositivo concluída, na tabela
+/// do processo, ou a falha do IRP_MJ_CREATE no IO_STATUS_BLOCK (um EA
+/// inconsistente leva o deslocamento da entrada ruim no Information).
+fn publish_device(handle_pointer: u64, iosb: u64, device_path: String, request: &OpenRequest, object_flags: u32, opened: io_manager::Opened) -> Result<u32, KernelError> {
+    if opened.status != 0 {
+        let status = if opened.status == io_manager::status::NOT_FOUND { 0xC000_0034 } else { opened.status as u32 };
+        if status == crate::ntos::io::buffer_validation::STATUS_EA_LIST_INCONSISTENT {
+            return Ok(if state::set_user_iosb(iosb, status, opened.information).is_err() { 0xC000_0005 } else { status });
+        }
+        return Ok(fail_iosb(iosb, status));
+    }
+    let information = if opened.information != 0 { opened.information } else { 1 };
+    let object = Arc::new(UserDevice { device_path, options: request.options, device_handle: opened.handle, file_object: opened.file_object, position: crate::rtl::SpinLock::new(0) });
+    let access = file_objects::access(request.access);
+    match state::alloc_user_handle(object, access, object_flags & 2) {
+        Ok(handle) => {
+            if guest::try_write::<u64>(handle_pointer, handle as u64).is_err() {
+                close::close_user(handle as u64, true);
+                return Ok(0xC000_0005);
+            }
+            // O Information do IRP_MJ_CREATE (FILE_OPENED quando o driver
+            // não informa).
+            Ok(if state::set_user_iosb(iosb, 0, information).is_err() { 0xC000_0005 } else { 0 })
+        }
+        Err(error) => {
+            let _ = io_manager::close_device(opened.handle);
+            if error.status != 0 {
+                Ok(fail_iosb(iosb, error.status))
+            } else {
+                Err(error)
+            }
+        }
+    }
 }
 
 /// O DeviceType do DEVICE_OBJECT de `device_path` (0 sem um nativo).
@@ -240,47 +352,23 @@ fn open_device_name(handle_pointer: u64, device_path: Option<String>, object_fla
     // IRP_MJ_CREATE completo: acesso, compartilhamento, disposição e opções.
     if let Some((device_path, rest)) = device_path.as_deref().and_then(io_manager::split_device_path) {
         debug_print!("[usermode] abre device: {}{}", device_path, rest);
-        let create = io_manager::CreateParameters {
-            access: request.access,
-            share: request.share,
-            disposition,
-            options: request.options,
-            file_attributes: request.attributes,
-            case_sensitive: object_flags & 0x40 == 0,
-            file_type: special.map_or(0, |captured| captured.file_type()),
-            extra_parameters: special.map_or(0, |captured| captured.pointer()),
-            user_mode: true,
+        // O EA vai só no IRP_MJ_CREATE de arquivo (o dos pipes e mailslots
+        // leva os parâmetros do file system no lugar do EaLength).
+        let (ea_buffer, ea_length) = if special.is_none() {
+            match user_ea(request) {
+                Ok(ea) => ea,
+                Err(status) => return Ok(fail_iosb(iosb, status)),
+            }
+        } else {
+            (0, 0)
         };
-        let opened = match io_manager::open_device_file(&device_path, &rest, Some(create), true) {
+        let create = device_create_parameters(request, disposition, object_flags, special);
+        let opened = match io_manager::open_related_device_file_with_ea(&device_path, &rest, 0, create, ea_buffer, ea_length, true) {
             Ok(opened) => opened,
             Err(error) if error.status != 0 => return Ok(fail_iosb(iosb, error.status)),
             Err(error) => return Err(error),
         };
-        if opened.status != 0 {
-            return Ok(fail_iosb(iosb, if opened.status == io_manager::status::NOT_FOUND { 0xC000_0034 } else { opened.status as u32 }));
-        }
-        let information = if opened.information != 0 { opened.information } else { 1 };
-        let object = Arc::new(UserDevice { device_path: device_path.clone(), options: request.options, device_handle: opened.handle, file_object: opened.file_object, position: crate::rtl::SpinLock::new(0) });
-        let access = file_objects::access(request.access);
-        return match state::alloc_user_handle(object, access, object_flags & 2) {
-            Ok(handle) => {
-                if guest::try_write::<u64>(handle_pointer, handle as u64).is_err() {
-                    close::close_user(handle as u64, true);
-                    return Ok(0xC000_0005);
-                }
-                // O Information do IRP_MJ_CREATE (FILE_OPENED quando o
-                // driver não informa).
-                Ok(if state::set_user_iosb(iosb, 0, information).is_err() { 0xC000_0005 } else { 0 })
-            }
-            Err(error) => {
-                let _ = io_manager::close_device(opened.handle);
-                if error.status != 0 {
-                    Ok(fail_iosb(iosb, error.status))
-                } else {
-                    Err(error)
-                }
-            }
-        };
+        return publish_device(handle_pointer, iosb, device_path, request, object_flags, opened);
     }
     if let Some(device_path) = device_path {
         // Dispositivo que ainda não existe: NOT_FOUND real; o processo repete.

@@ -69,6 +69,9 @@ pub const MEMORY_PRESSURE: &str = "MEMORYPRESSURE";
 /// A máquina tem um TPM 2.0 (tpm-crb do QEMU): o tpm.sys real sobe pelo PnP
 /// e o kernel manda comandos a ele pelo tbs.sys.
 pub const TPM: &str = "TPM";
+/// O teste do processo de console de ponta a ponta no boot comum: o
+/// cmd.exe real com um console sem janela (`test/console_process.rs`).
+pub const CONSOLE_PROCESS: &str = "CONSOLEPROCESS";
 
 /// O valor de `NOME=valor`.
 pub fn value<'a>(text: &'a str, name: &str) -> Option<&'a str> {

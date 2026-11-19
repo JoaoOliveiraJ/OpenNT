@@ -107,6 +107,11 @@ const DIRECT_DEVICE_OPEN_ACCESS: u32 = !0xFEE1_FF7F;
 pub struct DriverCreateContext {
     pub extra_create_parameter: u64,
     pub device_object_hint: u64,
+    /// O EaBuffer e o EaLength do ZwCreateFile/IoCreateFile, que vão ao
+    /// IRP_MJ_CREATE de um arquivo de dispositivo
+    /// (`io_manager::open_related_device_file_with_ea`).
+    pub ea_buffer: u64,
+    pub ea_length: u32,
 }
 
 /// Os parâmetros do ZwCreateFile que chegam ao file system.

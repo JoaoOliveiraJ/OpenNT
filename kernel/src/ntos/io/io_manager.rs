@@ -438,6 +438,12 @@ pub struct CreateParameters {
     /// NAMED_PIPE_CREATE_PARAMETERS ou MAILSLOT_CREATE_PARAMETERS.
     pub extra_parameters: u64,
     pub user_mode: bool,
+    /// O EaBuffer do IRP_MJ_CREATE: a cópia de kernel já validada
+    /// ([`open_related_device_file_with_ea`]) que vai no
+    /// AssociatedIrp.SystemBuffer, com o EaLength na stack location; 0
+    /// sem EA.
+    pub ea_buffer: u64,
+    pub ea_length: u32,
 }
 
 impl CreateParameters {
@@ -866,7 +872,7 @@ fn prepare_create(packet: u64, stack_count: u32, create: &CreateParameters) -> R
         parameters.options.set((create.disposition << 24) | (create.options & 0x00FF_FFFF));
         parameters.file_attributes.set(create.file_attributes as u16);
         parameters.share_access.set(create.share as u16);
-        parameters.ea_length.set(0);
+        parameters.ea_length.set(if create.ea_buffer != 0 { create.ea_length } else { 0 });
     } else {
         // Parameters.CreatePipe/CreateMailslot: o mesmo contexto, as opções
         // e o compartilhamento, Reserved zero e os parâmetros do file system
@@ -882,6 +888,13 @@ fn prepare_create(packet: u64, stack_count: u32, create: &CreateParameters) -> R
     // SAFETY: o IRP recém-montado por `builder::build`.
     let irp = unsafe { Irp::at(packet) };
     irp.flags.set(irp.flags.get() | IRP_CREATE_FLAGS);
+    // O EA do IopParseDevice: Irp->AssociatedIrp.SystemBuffer é a cópia de
+    // kernel (o CdCreateConnection do condrv.sys lê dela o "server" e o
+    // "attach"), sem IRP_DEALLOCATE_BUFFER: quem abre a libera depois do
+    // CREATE.
+    if create.file_type == 0 && create.ea_buffer != 0 {
+        irp.associated_irp.system_buffer.set(create.ea_buffer);
+    }
     Ok(CreateSecurity { context, access_state, aux })
 }
 
@@ -1022,6 +1035,29 @@ pub fn open_device_file(path: &str, name: &str, create: Option<CreateParameters>
 /// conclusão do IRP.
 pub fn open_related_device_file(path: &str, name: &str, related_file_object: u64, create: Option<CreateParameters>, external_handles: bool) -> Result<Opened, KernelError> {
     open_file_object(path, name, related_file_object, create, external_handles)
+}
+
+/// O [`open_related_device_file`] com o EaBuffer de quem abre (de modo
+/// usuário, já sondado), como o IopCreateFile: o EA é copiado para um bloco
+/// de kernel e conferido pelo IoCheckEaBufferValidity (um EA inconsistente
+/// volta em `Opened` com STATUS_EA_LIST_INCONSISTENT e o deslocamento da
+/// entrada ruim no Information, sem IRP); o IRP_MJ_CREATE leva a cópia no
+/// AssociatedIrp.SystemBuffer e o EaLength na stack location, e a cópia é
+/// liberada quando o CREATE termina (também depois de um STATUS_PENDING: a
+/// abertura espera a conclusão). Sem EA (buffer ou comprimento 0), a
+/// abertura comum.
+#[allow(clippy::too_many_arguments)]
+pub fn open_related_device_file_with_ea(path: &str, name: &str, related_file_object: u64, create: CreateParameters, ea_buffer: u64, ea_length: u32, external_handles: bool) -> Result<Opened, KernelError> {
+    if ea_buffer == 0 || ea_length == 0 {
+        return open_file_object(path, name, related_file_object, Some(create), external_handles);
+    }
+    let copy = match super::buffer_validation::capture_create_ea(ea_buffer, ea_length) {
+        Ok(copy) => copy,
+        Err((status, information)) => return Ok(Opened { status: status as i32, handle: 0, file_object: 0, information }),
+    };
+    let opened = open_file_object(path, name, related_file_object, Some(CreateParameters { ea_buffer: copy, ea_length, ..create }), external_handles);
+    guest::free_bytes(copy);
+    opened
 }
 
 fn open_file_object(path: &str, name: &str, related_file_object: u64, create: Option<CreateParameters>, external_handles: bool) -> Result<Opened, KernelError> {

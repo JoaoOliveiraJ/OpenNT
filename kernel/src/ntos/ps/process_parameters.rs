@@ -292,7 +292,22 @@ fn text_of(bytes: &[u8]) -> String {
 /// handles padrão passam como valores. Devolve o NTSTATUS da falha:
 /// ACCESS_VIOLATION numa sonda, INVALID_PARAMETER num bloco malformado.
 pub fn capture(address: u64) -> Result<ProcessParameters, u32> {
-    capture_with_header(address).map(|(parameters, _)| parameters)
+    capture_from(address, 1)
+}
+
+/// O [`capture`] de um chamador de `mode` (0 KernelMode, 1 UserMode): de
+/// KernelMode (o ZwCreateUserProcess do condrv.sys, com o bloco do
+/// PsCaptureUserProcessParameters) o bloco vale como veio, o
+/// PspCaptureProcessParameters do 19041 (0x607600): o mesmo parser, sem as
+/// sondas de usuário.
+pub fn capture_from(address: u64, mode: u8) -> Result<ProcessParameters, u32> {
+    capture_with_header(address, mode).map(|(parameters, _)| parameters)
+}
+
+/// A sonda de leitura de um ponteiro do bloco: só de um chamador de modo
+/// usuário.
+fn probe_read(mode: u8, va: u64, size: u64) -> bool {
+    mode == 0 || state::probe_user_read(va, size)
 }
 
 /// Os campos do cabeçalho de um bloco capturado que o
@@ -306,8 +321,8 @@ struct CapturedHeader {
 }
 
 /// O [`capture`] com o [`CapturedHeader`] da cópia de kernel.
-fn capture_with_header(address: u64) -> Result<(ProcessParameters, CapturedHeader), u32> {
-    if address % 8 != 0 || !state::probe_user_read(address, 8) {
+fn capture_with_header(address: u64, mode: u8) -> Result<(ProcessParameters, CapturedHeader), u32> {
+    if address % 8 != 0 || !probe_read(mode, address, 8) {
         return Err(STATUS_ACCESS_VIOLATION);
     }
     let maximum_length = guest::try_read::<u32>(address).map_err(|_| STATUS_ACCESS_VIOLATION)? as u64;
@@ -316,7 +331,7 @@ fn capture_with_header(address: u64) -> Result<(ProcessParameters, CapturedHeade
         return Err(STATUS_INVALID_PARAMETER);
     }
     let captured = length.min(RtlUserProcessParameters::SIZE);
-    if !state::probe_user_read(address, captured) {
+    if !probe_read(mode, address, captured) {
         return Err(STATUS_ACCESS_VIOLATION);
     }
     let bytes = guest::try_read_bytes(address, captured as usize).map_err(|_| STATUS_ACCESS_VIOLATION)?;
@@ -328,7 +343,7 @@ fn capture_with_header(address: u64) -> Result<(ProcessParameters, CapturedHeade
     // SAFETY: a cópia de kernel recém-alocada e zerada além do Length.
     let copied = unsafe { RtlUserProcessParameters::at(copy) };
     let header = CapturedHeader { flags: copied.flags.get(), environment: copied.environment.get(), environment_size: copied.environment_size.get() };
-    let result = read_captured(address, copied).map(|parameters| (parameters, header));
+    let result = read_captured(address, copied, mode).map(|parameters| (parameters, header));
     guest::free_bytes(copy);
     result
 }
@@ -386,7 +401,7 @@ pub fn capture_to_pool(out: u64, user: u64) -> u32 {
     if user % 4 != 0 {
         return STATUS_DATATYPE_MISALIGNMENT;
     }
-    let (mut parameters, header) = match capture_with_header(user) {
+    let (mut parameters, header) = match capture_with_header(user, 1) {
         Ok(captured) => captured,
         Err(status) => return status,
     };
@@ -453,10 +468,10 @@ impl ProcessParameters {
 }
 
 /// Os campos da cópia de kernel de um bloco do chamador em `block`.
-fn read_captured(block: u64, copy: &RtlUserProcessParameters) -> Result<ProcessParameters, u32> {
+fn read_captured(block: u64, copy: &RtlUserProcessParameters, mode: u8) -> Result<ProcessParameters, u32> {
     let normalized = copy.flags.get() & NORMALIZED != 0;
-    let string = |string: &UnicodeString| capture_string(block, normalized, string);
-    let text = |string: &UnicodeString| -> Result<(Option<String>, u16), u32> { capture_string(block, normalized, string).map(|captured| captured.map_or((None, 0), |(bytes, maximum)| (Some(text_of(&bytes)), maximum))) };
+    let string = |string: &UnicodeString| capture_string(block, normalized, string, mode);
+    let text = |string: &UnicodeString| -> Result<(Option<String>, u16), u32> { capture_string(block, normalized, string, mode).map(|captured| captured.map_or((None, 0), |(bytes, maximum)| (Some(text_of(&bytes)), maximum))) };
     let (image_path_name, image_capacity) = text(&copy.image_path_name)?;
     let (command_line, command_capacity) = text(&copy.command_line)?;
     let (current_directory, directory_capacity) = text(&copy.current_directory.dos_path)?;
@@ -465,7 +480,7 @@ fn read_captured(block: u64, copy: &RtlUserProcessParameters) -> Result<ProcessP
     let (desktop_info, desktop_capacity) = text(&copy.desktop_info)?;
     let (shell_info, shell_capacity) = text(&copy.shell_info)?;
     let (runtime_data, runtime_capacity) = string(&copy.runtime_data)?.map_or((None, 0), |(bytes, maximum)| (Some(bytes), maximum));
-    let environment = capture_environment(copy.environment.get(), copy.environment_size.get())?;
+    let environment = capture_environment(copy.environment.get(), copy.environment_size.get(), mode)?;
     Ok(ProcessParameters {
         image_path_name: image_path_name.unwrap_or_default(),
         command_line: command_line.unwrap_or_default(),
@@ -510,7 +525,7 @@ fn read_captured(block: u64, copy: &RtlUserProcessParameters) -> Result<ProcessP
 
 /// Um UNICODE_STRING do bloco do chamador (a cópia de kernel `string`): os
 /// bytes e o MaximumLength, ou `None` com Buffer NULL.
-fn capture_string(block: u64, normalized: bool, string: &UnicodeString) -> Result<Option<(Vec<u8>, u16)>, u32> {
+fn capture_string(block: u64, normalized: bool, string: &UnicodeString, mode: u8) -> Result<Option<(Vec<u8>, u16)>, u32> {
     let (length, maximum, buffer) = (string.length.get(), string.maximum_length.get(), string.buffer.get());
     if length > maximum {
         return Err(STATUS_INVALID_PARAMETER);
@@ -519,7 +534,7 @@ fn capture_string(block: u64, normalized: bool, string: &UnicodeString) -> Resul
         return if length == 0 { Ok(None) } else { Err(STATUS_INVALID_PARAMETER) };
     }
     let address = if normalized { buffer } else { block.checked_add(buffer).ok_or(STATUS_INVALID_PARAMETER)? };
-    if !state::probe_user_read(address, length as u64) {
+    if !probe_read(mode, address, length as u64) {
         return Err(STATUS_ACCESS_VIOLATION);
     }
     let bytes = guest::try_read_bytes(address, length as usize).map_err(|_| STATUS_ACCESS_VIOLATION)?;
@@ -529,7 +544,7 @@ fn capture_string(block: u64, normalized: bool, string: &UnicodeString) -> Resul
 /// O bloco de ambiente do chamador em `address`: `size` bytes ou, com 0, até
 /// o NUL duplo (no máximo [`ENVIRONMENT_LIMIT`]); as variáveis até a primeira
 /// vazia.
-fn capture_environment(address: u64, size: u64) -> Result<Vec<String>, u32> {
+fn capture_environment(address: u64, size: u64, mode: u8) -> Result<Vec<String>, u32> {
     if address == 0 {
         return Ok(Vec::new());
     }
@@ -537,7 +552,7 @@ fn capture_environment(address: u64, size: u64) -> Result<Vec<String>, u32> {
         return Err(STATUS_INVALID_PARAMETER);
     }
     let bytes = if size != 0 {
-        if !state::probe_user_read(address, size) {
+        if !probe_read(mode, address, size) {
             return Err(STATUS_ACCESS_VIOLATION);
         }
         guest::try_read_bytes(address, size as usize).map_err(|_| STATUS_ACCESS_VIOLATION)?
@@ -550,7 +565,7 @@ fn capture_environment(address: u64, size: u64) -> Result<Vec<String>, u32> {
             if bytes.len() as u64 + chunk > ENVIRONMENT_LIMIT {
                 return Err(STATUS_INVALID_PARAMETER);
             }
-            if !state::probe_user_read(at, chunk) {
+            if !probe_read(mode, at, chunk) {
                 return Err(STATUS_ACCESS_VIOLATION);
             }
             bytes.extend(guest::try_read_bytes(at, chunk as usize).map_err(|_| STATUS_ACCESS_VIOLATION)?);

@@ -45,8 +45,11 @@
 //!   (`process_parameters::capture`);
 //! - os OBJECT_ATTRIBUTES de processo e thread (sem nome; OBJ_INHERIT vai
 //!   para o handle) e as flags: PROCESS_CREATE_FLAGS_* conhecidas são
-//!   aceitas, as que pedem um processo diferente (mínimo, clone, auxiliar,
-//!   store, espaço de outro) dão STATUS_NOT_SUPPORTED; o bit 0x200, que o
+//!   aceitas, as que pedem um processo diferente (mínimo, clone, store,
+//!   espaço de outro) dão STATUS_NOT_SUPPORTED; AUXILIARY_PROCESS (0x8000,
+//!   o conhost.exe que o condrv.sys cria) liga o
+//!   EPROCESS.Flags3.AuxiliaryProcess e, junto com FORCE_BREAKAWAY, dá
+//!   STATUS_INVALID_PARAMETER_MIX; o bit 0x200, que o
 //!   kernelbase liga em toda criação sem CREATE_SUSPENDED, só escolhe o
 //!   OwnerProcessId (o PspAllocateProcess);
 //!   PROTECTED_PROCESS cria o processo com o PS_PROTECTION do atributo
@@ -83,6 +86,16 @@
 //! fecha. Sem WriteOutputOnExit (o RtlCreateUserProcess da ntdll), nenhum
 //! dos dois é aberto. Uma falha antes da criação não cria nada; uma falha ao
 //! abrir os handles termina o processo novo.
+//!
+//! O ZwCreateUserProcess (PreviousMode KernelMode, o CdpCreateProcess do
+//! condrv.sys) passa pelo mesmo corpo, como no NtCreateUserProcess 19041
+//! (0x60a630): nada é sondado (só com PreviousMode diferente de KernelMode,
+//! 0x60a801), o bloco de parâmetros é usado como veio (o
+//! PspCaptureProcessParameters de KernelMode), o ParentProcess e o Token
+//! aceitam handles de kernel sem conferir acesso, o SeSinglePrivilegeCheck
+//! do PspAllocateProcess passa (0x705051) e, com OBJ_KERNEL_HANDLE nos
+//! OBJECT_ATTRIBUTES, os handles do processo e da thread nascem na tabela
+//! de kernel.
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -118,8 +131,12 @@ const SE_ASSIGN_PRIMARY_TOKEN_PRIVILEGE: u64 = 3;
 
 /// PROCESS_CREATE_PROCESS: o direito que o handle do pai declarado precisa.
 const PROCESS_CREATE_PROCESS: u32 = 0x80;
-/// OBJ_INHERIT: o único atributo de OBJECT_ATTRIBUTES que vai para o handle.
+/// OBJ_INHERIT: o único atributo de OBJECT_ATTRIBUTES que vai para o handle
+/// de um chamador de modo usuário.
 const OBJ_INHERIT: u32 = 2;
+/// OBJ_KERNEL_HANDLE: de um chamador de modo kernel, o handle nasce na
+/// tabela de kernel.
+const OBJ_KERNEL_HANDLE: u32 = 0x200;
 /// PROCESS_CREATE_FLAGS_* conhecidas: BREAKAWAY, NO_DEBUG_INHERIT,
 /// INHERIT_HANDLES, OVERRIDE_ADDRESS_SPACE, LARGE_PAGES,
 /// LARGE_PAGE_SYSTEM_DLL, PROTECTED_PROCESS, CREATE_SESSION,
@@ -129,8 +146,14 @@ const OBJ_INHERIT: u32 = 2;
 const PROCESS_FLAGS_KNOWN: u32 = 0x0006_FFFF;
 /// As que pedem um processo diferente, sem suporte aqui:
 /// OVERRIDE_ADDRESS_SPACE, MINIMAL_PROCESS, CLONE_MINIMAL,
-/// CLONE_MINIMAL_REDUCED_COMMIT, AUXILIARY_PROCESS e CREATE_STORE.
-const PROCESS_FLAGS_UNSUPPORTED: u32 = 0x0002_E808;
+/// CLONE_MINIMAL_REDUCED_COMMIT e CREATE_STORE.
+const PROCESS_FLAGS_UNSUPPORTED: u32 = 0x0002_6808;
+/// PROCESS_CREATE_FLAGS_AUXILIARY_PROCESS: o PspAllocateProcess liga o
+/// EPROCESS.Flags3.AuxiliaryProcess (0x704311).
+const PROCESS_AUXILIARY: u32 = 0x8000;
+/// STATUS_INVALID_PARAMETER_MIX: AUXILIARY_PROCESS com FORCE_BREAKAWAY
+/// (0x60a7d8).
+const STATUS_INVALID_PARAMETER_MIX: u32 = 0xC000_0030;
 /// O bit 0x200 (o PROCESS_CREATE_FLAGS_SUSPENDED dos cabeçalhos): o
 /// CreateProcessInternalW do kernelbase o liga em toda criação sem
 /// CREATE_SUSPENDED, e o PspAllocateProcess do 19041 só o lê para o
@@ -235,6 +258,20 @@ impl Drop for TokenAttribute {
     }
 }
 
+/// O pai declarado por um handle de kernel (ZwCreateUserProcess),
+/// referenciado pelo ObReferenceObjectByHandle de KernelMode até o fim da
+/// criação.
+#[derive(Default)]
+struct ParentReference(Option<u64>);
+
+impl Drop for ParentReference {
+    fn drop(&mut self) {
+        if let Some(process) = self.0.take() {
+            let _ = crate::ntos::ps::query_process::release_process(process);
+        }
+    }
+}
+
 /// Os jobs do PS_ATTRIBUTE_JOB_LIST, referenciados até o fim da criação.
 #[derive(Default)]
 struct JobList(Vec<u64>);
@@ -262,6 +299,19 @@ struct Attributes {
     jobs: JobList,
     /// PsAttributeToken.
     token: TokenAttribute,
+    /// A referência do pai declarado em KernelMode.
+    parent_reference: ParentReference,
+}
+
+/// A sonda de leitura de um ponteiro do chamador: só em UserMode (`mode`
+/// 1); em KernelMode o ponteiro vale como veio.
+fn probe_read(mode: u8, va: u64, size: u64) -> bool {
+    mode == 0 || state::probe_user_read(va, size)
+}
+
+/// A sonda de escrita, como [`probe_read`].
+fn probe_write(mode: u8, va: u64, size: u64) -> bool {
+    mode == 0 || state::probe_user_write(va, size)
 }
 
 /// O NTSTATUS de um erro de sonda ou de criação.
@@ -280,11 +330,11 @@ struct CreateInfoInput {
 
 /// O PS_CREATE_INFO de entrada (o PspCaptureCreateInfo): gravável inteiro,
 /// com PsCreateInitialState e o Size do tipo; o InitState decodificado.
-fn capture_create_info(address: u64) -> Result<CreateInfoInput, u32> {
+fn capture_create_info(address: u64, mode: u8) -> Result<CreateInfoInput, u32> {
     if address == 0 {
         return Err(STATUS_INVALID_PARAMETER);
     }
-    if !state::probe_user_write(address, PsCreateInfo::SIZE) {
+    if !probe_write(mode, address, PsCreateInfo::SIZE) {
         return Err(STATUS_ACCESS_VIOLATION);
     }
     let read = || -> Result<(u32, u64, u32, u32), KernelError> {
@@ -303,12 +353,13 @@ fn capture_create_info(address: u64) -> Result<CreateInfoInput, u32> {
 }
 
 /// Os OBJECT_ATTRIBUTES de processo ou de thread (opcionais): sem nome; o
-/// OBJ_INHERIT vira o atributo do handle.
-fn capture_object_attributes(address: u64) -> Result<u32, u32> {
+/// OBJ_INHERIT vira o atributo do handle, e de um chamador de modo kernel
+/// também o OBJ_KERNEL_HANDLE.
+fn capture_object_attributes(address: u64, mode: u8) -> Result<u32, u32> {
     if address == 0 {
         return Ok(0);
     }
-    if !state::probe_user_read(address, ObjectAttributes::SIZE) {
+    if !probe_read(mode, address, ObjectAttributes::SIZE) {
         return Err(STATUS_ACCESS_VIOLATION);
     }
     let read = || -> Result<(u32, u64, u32), KernelError> {
@@ -323,13 +374,13 @@ fn capture_object_attributes(address: u64) -> Result<u32, u32> {
     if name != 0 {
         return Err(STATUS_OBJECT_NAME_INVALID);
     }
-    Ok(attributes & OBJ_INHERIT)
+    Ok(attributes & if mode == 0 { OBJ_INHERIT | OBJ_KERNEL_HANDLE } else { OBJ_INHERIT })
 }
 
 /// Uma saída de tamanho `size` em `value` (e o PSIZE_T, se veio), sondadas
 /// para escrita.
-fn output(value: u64, return_length: u64, size: u64) -> Result<Output, u32> {
-    if !state::probe_user_write(value, size) || (return_length != 0 && !state::probe_user_write(return_length, 8)) {
+fn output(value: u64, return_length: u64, size: u64, mode: u8) -> Result<Output, u32> {
+    if !probe_write(mode, value, size) || (return_length != 0 && !probe_write(mode, return_length, 8)) {
         return Err(STATUS_ACCESS_VIOLATION);
     }
     Ok(Output { value, return_length })
@@ -337,11 +388,11 @@ fn output(value: u64, return_length: u64, size: u64) -> Result<Output, u32> {
 
 /// A PS_ATTRIBUTE_LIST do chamador, copiada uma vez para o kernel e lida da
 /// cópia.
-fn capture_attributes(list: u64) -> Result<Attributes, u32> {
+fn capture_attributes(list: u64, mode: u8) -> Result<Attributes, u32> {
     if list == 0 {
         return Ok(Attributes::default());
     }
-    if list % 8 != 0 || !state::probe_user_read(list, 8) {
+    if list % 8 != 0 || !probe_read(mode, list, 8) {
         return Err(STATUS_ACCESS_VIOLATION);
     }
     let total = guest::try_read::<u64>(list).map_err(|error| status_of(&error))?;
@@ -349,7 +400,7 @@ fn capture_attributes(list: u64) -> Result<Attributes, u32> {
     if !(header..=header + MAXIMUM_ATTRIBUTES * PsAttribute::SIZE).contains(&total) || (total - header) % PsAttribute::SIZE != 0 {
         return Err(STATUS_INVALID_PARAMETER);
     }
-    if !state::probe_user_read(list, total) {
+    if !probe_read(mode, list, total) {
         return Err(STATUS_ACCESS_VIOLATION);
     }
     let bytes = guest::try_read_bytes(list, total as usize).map_err(|error| status_of(&error))?;
@@ -361,13 +412,13 @@ fn capture_attributes(list: u64) -> Result<Attributes, u32> {
     let count = ((total - header) / PsAttribute::SIZE) as usize;
     // SAFETY: a cópia de kernel recém-alocada, com `count` entradas.
     let entries = unsafe { PsAttribute::array_at(copy + header, count) };
-    let captured = read_attributes(entries);
+    let captured = read_attributes(entries, mode);
     guest::free_bytes(copy);
     captured
 }
 
 /// As entradas da cópia de kernel da lista.
-fn read_attributes(entries: &[PsAttribute]) -> Result<Attributes, u32> {
+fn read_attributes(entries: &[PsAttribute], mode: u8) -> Result<Attributes, u32> {
     let mut captured = Attributes::default();
     let mut seen: Vec<u64> = Vec::new();
     for entry in entries {
@@ -387,7 +438,7 @@ fn read_attributes(entries: &[PsAttribute]) -> Result<Attributes, u32> {
                 if size == 0 || size % 2 != 0 || size > 0xFFFE {
                     return Err(STATUS_INVALID_PARAMETER);
                 }
-                if !state::probe_user_read(inline, size) {
+                if !probe_read(mode, inline, size) {
                     return Err(STATUS_ACCESS_VIOLATION);
                 }
                 captured.image_name = Some(state::try_read_user_wide_string(inline, size / 2).map_err(|error| status_of(&error))?);
@@ -397,7 +448,16 @@ fn read_attributes(entries: &[PsAttribute]) -> Result<Attributes, u32> {
                 if size != 8 {
                     return Err(STATUS_INVALID_PARAMETER);
                 }
-                let parent = handles::process_pointer(inline, PROCESS_CREATE_PROCESS)?;
+                // De KernelMode, o ObReferenceObjectByHandle de KernelMode:
+                // um handle de kernel, sem conferir o acesso (o do condrv.sys
+                // tem só PROCESS_QUERY_LIMITED_INFORMATION).
+                let parent = if mode == 0 {
+                    let referenced = crate::ntos::ps::query_process::reference_process(inline, PROCESS_CREATE_PROCESS).map_err(|error| status_of(&error))??;
+                    captured.parent_reference = ParentReference(Some(referenced));
+                    referenced
+                } else {
+                    handles::process_pointer(inline, PROCESS_CREATE_PROCESS)?
+                };
                 if process::with_record(parent, |record| record.terminated || record.exiting) != Some(false) {
                     return Err(STATUS_PROCESS_IS_TERMINATING);
                 }
@@ -411,7 +471,7 @@ fn read_attributes(entries: &[PsAttribute]) -> Result<Attributes, u32> {
                 if size != 1 {
                     return Err(STATUS_INVALID_PARAMETER);
                 }
-                if !state::probe_user_read(inline, 1) {
+                if !probe_read(mode, inline, 1) {
                     return Err(STATUS_ACCESS_VIOLATION);
                 }
                 let class = guest::try_read::<u8>(inline).map_err(|error| status_of(&error))?;
@@ -425,21 +485,21 @@ fn read_attributes(entries: &[PsAttribute]) -> Result<Attributes, u32> {
                 if size != ClientId::SIZE {
                     return Err(STATUS_INVALID_PARAMETER);
                 }
-                captured.client_id = Some(output(inline, return_length, size)?);
+                captured.client_id = Some(output(inline, return_length, size, mode)?);
             }
             attribute::TEB_ADDRESS => {
                 expect(attribute::THREAD)?;
                 if size != 8 {
                     return Err(STATUS_INVALID_PARAMETER);
                 }
-                captured.teb_address = Some(output(inline, return_length, size)?);
+                captured.teb_address = Some(output(inline, return_length, size, mode)?);
             }
             attribute::IMAGE_INFO => {
                 expect(0)?;
                 if size < SectionImageInformation::SIZE {
                     return Err(STATUS_INVALID_PARAMETER);
                 }
-                captured.image_info = Some(output(inline, return_length, SectionImageInformation::SIZE)?);
+                captured.image_info = Some(output(inline, return_length, SectionImageInformation::SIZE, mode)?);
             }
             attribute::PROTECTION_LEVEL => {
                 expect(attribute::INPUT)?;
@@ -457,12 +517,12 @@ fn read_attributes(entries: &[PsAttribute]) -> Result<Attributes, u32> {
                 if size == 0 || size % 8 != 0 || size > 0x7_FFFF_FFF8 {
                     return Err(STATUS_INVALID_PARAMETER);
                 }
-                if !state::probe_user_read(inline, size) {
+                if !probe_read(mode, inline, size) {
                     return Err(STATUS_ACCESS_VIOLATION);
                 }
                 let handles = guest::try_read_bytes(inline, size as usize).map_err(|error| status_of(&error))?;
                 for handle in handles.chunks_exact(8).map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8]))) {
-                    let job = crate::ntos::ps::job::object::reference_by_handle(handle, crate::ntos::ps::job::JOB_OBJECT_ASSIGN_PROCESS, 1)?;
+                    let job = crate::ntos::ps::job::object::reference_by_handle(handle, crate::ntos::ps::job::JOB_OBJECT_ASSIGN_PROCESS, mode)?;
                     captured.jobs.0.push(job);
                 }
             }
@@ -474,7 +534,7 @@ fn read_attributes(entries: &[PsAttribute]) -> Result<Attributes, u32> {
                 if size != 8 {
                     return Err(STATUS_INVALID_PARAMETER);
                 }
-                let reference = match crate::ntos::se::token::reference::reference(inline, TOKEN_ASSIGN_PRIMARY, 1, false).map_err(|error| status_of(&error))? {
+                let reference = match crate::ntos::se::token::reference::reference(inline, TOKEN_ASSIGN_PRIMARY, mode, false).map_err(|error| status_of(&error))? {
                     Ok(reference) => reference,
                     Err(status) => return Err(status),
                 };
@@ -644,6 +704,24 @@ fn write_outputs(request: &UserCreateRequest, attributes: &Attributes, input: &C
     info.state.probe_set(PsCreateInfo::SUCCESS)
 }
 
+/// Um handle de kernel (OBJ_KERNEL_HANDLE) para o objeto `pointer` com o
+/// acesso já mapeado: o ObOpenObjectByPointer de KernelMode. Devolve o
+/// handle ou o NTSTATUS.
+fn kernel_handle(pointer: u64, attributes: u32, access: u32, object_type: u64) -> Result<u64, u32> {
+    let cell = guest::alloc_bytes(8);
+    if cell == 0 {
+        return Err(STATUS_NO_MEMORY);
+    }
+    let opened = crate::ntos::ob::open_pointer::open_by_pointer(pointer, attributes | OBJ_KERNEL_HANDLE, 0, access, object_type, 0, cell);
+    let handle = guest::read64(cell);
+    guest::free_bytes(cell);
+    match opened {
+        Ok(0) => Ok(handle),
+        Ok(status) => Err(status),
+        Err(error) => Err(status_of(&error)),
+    }
+}
+
 /// O job do pai do processo novo, retido durante a criação.
 struct CreatorJob(u64);
 
@@ -675,26 +753,33 @@ pub fn create(request: &UserCreateRequest) -> Result<u32, KernelError> {
 }
 
 fn capture_and_create(request: &UserCreateRequest) -> Result<u32, u32> {
-    if !state::probe_user_write(request.process_handle, 8) || !state::probe_user_write(request.thread_handle, 8) {
+    // 0 no ZwCreateUserProcess, 1 no NtCreateUserProcess.
+    let mode = crate::ntos::ps::previous_mode::get().unwrap_or(1);
+    if !probe_write(mode, request.process_handle, 8) || !probe_write(mode, request.thread_handle, 8) {
         return Err(STATUS_ACCESS_VIOLATION);
     }
-    let create_info = capture_create_info(request.create_info)?;
+    let create_info = capture_create_info(request.create_info, mode)?;
     if request.process_flags & !PROCESS_FLAGS_KNOWN != 0 || request.thread_flags & !THREAD_FLAGS_KNOWN != 0 {
         return Err(STATUS_INVALID_PARAMETER);
+    }
+    if request.process_flags & (PROCESS_AUXILIARY | PROCESS_FORCE_BREAKAWAY) == PROCESS_AUXILIARY | PROCESS_FORCE_BREAKAWAY {
+        return Err(STATUS_INVALID_PARAMETER_MIX);
     }
     if request.process_flags & PROCESS_FLAGS_UNSUPPORTED != 0 {
         crate::debug_print!("[ps] NtCreateUserProcess: flags de processo {:#x} sem suporte", request.process_flags & PROCESS_FLAGS_UNSUPPORTED);
         return Err(STATUS_NOT_SUPPORTED);
     }
-    if request.process_flags & PROCESS_FORCE_BREAKAWAY != 0 && !crate::ntos::se::privilege::acquired_privilege_check(SE_TCB_PRIVILEGE, 1) {
+    if request.process_flags & PROCESS_FORCE_BREAKAWAY != 0 && mode != 0 && !crate::ntos::se::privilege::acquired_privilege_check(SE_TCB_PRIVILEGE, 1) {
         return Err(STATUS_PRIVILEGE_NOT_HELD);
     }
-    let process_handle_attributes = capture_object_attributes(request.process_attributes)?;
-    let thread_handle_attributes = capture_object_attributes(request.thread_attributes)?;
-    let attributes = capture_attributes(request.attribute_list)?;
+    let process_handle_attributes = capture_object_attributes(request.process_attributes, mode)?;
+    let thread_handle_attributes = capture_object_attributes(request.thread_attributes, mode)?;
+    let attributes = capture_attributes(request.attribute_list, mode)?;
     let Some(image_name) = attributes.image_name.clone() else { return Err(STATUS_INVALID_PARAMETER) };
     let dos_path = String::from(image_name.strip_prefix("\\??\\").unwrap_or(&image_name));
-    let mut parameters = if request.parameters != 0 { process_parameters::capture(request.parameters)? } else { ProcessParameters::for_image(&dos_path) };
+    // De KernelMode o bloco vale como veio (o PspCaptureProcessParameters):
+    // o mesmo parser, sem sondas; o DesktopInfo passa nos dois modos.
+    let mut parameters = if request.parameters != 0 { process_parameters::capture_from(request.parameters, mode)? } else { ProcessParameters::for_image(&dos_path) };
     if parameters.image_path_name.is_empty() {
         parameters.image_path_name = dos_path.clone();
     }
@@ -710,7 +795,8 @@ fn capture_and_create(request: &UserCreateRequest) -> Result<u32, u32> {
     // (STATUS_INVALID_PARAMETER).
     let primary_token = attributes.token.0.as_ref().map(|reference| reference.token);
     if let Some(token) = primary_token {
-        let privileged = crate::ntos::se::privilege::acquired_privilege_check(SE_ASSIGN_PRIMARY_TOKEN_PRIVILEGE, 1);
+        // O SeSinglePrivilegeCheck com PreviousMode KernelMode passa.
+        let privileged = mode == 0 || crate::ntos::se::privilege::acquired_privilege_check(SE_ASSIGN_PRIMARY_TOKEN_PRIVILEGE, 1);
         let assignable = crate::ntos::se::token::assignable::is_assignable_to_process(token)?;
         if !privileged && !assignable {
             let effective = crate::ntos::ob::object_access::subject().unwrap_or(0);
@@ -793,6 +879,10 @@ fn capture_and_create(request: &UserCreateRequest) -> Result<u32, u32> {
         let owner = unsafe { Eprocess::at(creator) }.unique_process_id.get() | if request.process_flags & PROCESS_OWNER_PLAIN != 0 { 0 } else { 2 };
         unsafe { Eprocess::at(created.process_pointer) }.owner_process_id.set(owner);
     }
+    if request.process_flags & PROCESS_AUXILIARY != 0 {
+        // SAFETY: o EPROCESS recém-criado, retido pelo processo criado.
+        unsafe { Eprocess::at(created.process_pointer) }.flags3.atomic().fetch_or(Eprocess::AUXILIARY_PROCESS_MASK, core::sync::atomic::Ordering::SeqCst);
+    }
     let summary = Created {
         process_pointer: created.process_pointer,
         process_id: created.process_id,
@@ -810,20 +900,37 @@ fn capture_and_create(request: &UserCreateRequest) -> Result<u32, u32> {
     // NtResumeThread. Uma falha aqui já terminou o processo.
     drop(user_process::start_created(created).map_err(|error| create::failure_status(&error))?);
     let process = summary.process_pointer;
-    let process_handle = state::alloc_user_handle(Arc::new(UserProcess { pointer: process, process_id: summary.process_id }), process_access, process_handle_attributes);
+    // De KernelMode com OBJ_KERNEL_HANDLE, os dois handles nascem na tabela
+    // de kernel (o ObOpenObjectByPointer do PspInsertThread).
+    let kernel_handles = mode == 0 && process_handle_attributes & OBJ_KERNEL_HANDLE != 0;
+    let close_handle = |handle: u64| {
+        if kernel_handles {
+            let _ = crate::ntos::ob::close::close(handle, Some(0));
+        } else {
+            let _ = state::close_user_handle(handle, true, true);
+        }
+    };
+    let process_handle = if kernel_handles {
+        kernel_handle(process, process_handle_attributes, process_access, object_types::process_type().pointer)
+    } else {
+        state::alloc_user_handle(Arc::new(UserProcess { pointer: process, process_id: summary.process_id }), process_access, process_handle_attributes).map(u64::from).map_err(|error| create::failure_status(&error))
+    };
     let process_handle = match process_handle {
-        Ok(handle) => handle as u64,
-        Err(error) => {
-            let status = create::failure_status(&error);
+        Ok(handle) => handle,
+        Err(status) => {
             create::exit_process(process, status);
             return Err(status);
         }
     };
-    let thread_handle = match threads::thread_handle(&main, thread_access, thread_handle_attributes) {
+    let thread_handle = if kernel_handles {
+        kernel_handle(main.pointer(), thread_handle_attributes | OBJ_KERNEL_HANDLE, thread_access, object_types::thread_type().pointer)
+    } else {
+        threads::thread_handle(&main, thread_access, thread_handle_attributes).map_err(|error| create::failure_status(&error))
+    };
+    let thread_handle = match thread_handle {
         Ok(handle) => handle,
-        Err(error) => {
-            let status = create::failure_status(&error);
-            let _ = state::close_user_handle(process_handle, true, true);
+        Err(status) => {
+            close_handle(process_handle);
             create::exit_process(process, status);
             return Err(status);
         }
@@ -836,8 +943,8 @@ fn capture_and_create(request: &UserCreateRequest) -> Result<u32, u32> {
             Ok(handles) => handles,
             Err(error) => {
                 let status = create::failure_status(&error);
-                let _ = state::close_user_handle(thread_handle, true, true);
-                let _ = state::close_user_handle(process_handle, true, true);
+                close_handle(thread_handle);
+                close_handle(process_handle);
                 create::exit_process(process, status);
                 return Err(status);
             }

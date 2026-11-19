@@ -128,6 +128,13 @@ pub fn shutdown_test() -> &'static str {
     value(name::SHUTDOWN_TEST).unwrap_or("")
 }
 
+/// `CONSOLEPROCESS` (`--console-process`): no boot comum, depois do
+/// `--start-driver`, o cmd.exe real com um console sem janela, pelo
+/// condrv.sys e pelo conhost.exe reais (`ntos/test/console_process.rs`).
+pub fn console_process() -> bool {
+    flag(name::CONSOLE_PROCESS)
+}
+
 /// O boot do processo inicial real (`--initial-process=smss`).
 pub fn smss_boot() -> bool {
     initial_process() == "smss"

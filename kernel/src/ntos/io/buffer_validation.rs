@@ -87,6 +87,41 @@ pub fn check_ea_buffer_validity(buffer: u64, length: u32, error_offset: &Field<u
     }
 }
 
+/// O EaBuffer de um IRP_MJ_CREATE, como o IopCreateFile: os `length` bytes
+/// de `buffer` (de um chamador de modo usuário, já sondados) copiados para
+/// um bloco de kernel e conferidos pelo [`check_ea_buffer_validity`].
+/// Devolve a cópia, que quem abre libera com `guest::free_bytes` depois do
+/// CREATE, ou (NTSTATUS, Information): STATUS_EA_LIST_INCONSISTENT leva o
+/// deslocamento da entrada ruim, que o NtCreateFile põe no IO_STATUS_BLOCK.
+pub fn capture_create_ea(buffer: u64, length: u32) -> Result<u64, (u32, u64)> {
+    if length > MAXIMUM_LENGTH {
+        return Err((STATUS_EA_LIST_INCONSISTENT, 0));
+    }
+    let bytes = guest::try_read_bytes(buffer, length as usize).map_err(|error| (probe_status(error), 0))?;
+    let copy = guest::alloc_bytes(length as u64);
+    let offset = guest::alloc_bytes(4);
+    if copy == 0 || offset == 0 {
+        for block in [copy, offset] {
+            if block != 0 {
+                guest::free_bytes(block);
+            }
+        }
+        return Err((0xC000_009A, 0));
+    }
+    guest::write_bytes(copy, &bytes);
+    // SAFETY: a célula ULONG recém-alocada.
+    let error_offset = unsafe { Field::<u32>::at(offset) };
+    error_offset.set(0);
+    let status = check_ea_buffer_validity(copy, length, error_offset);
+    let bad_entry = error_offset.get();
+    guest::free_bytes(offset);
+    if status != STATUS_SUCCESS {
+        guest::free_bytes(copy);
+        return Err((status, bad_entry as u64));
+    }
+    Ok(copy)
+}
+
 fn first_bad_quota(buffer: u64, length: u32) -> Result<Option<u64>, KernelError> {
     let mut entry = buffer;
     let mut remaining = length;

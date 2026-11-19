@@ -45,6 +45,18 @@
 //!   herda os handles de quem chama; sem WriteOutputOnExit, o PS_CREATE_INFO
 //!   só recebe o estado. Os FileHandle/SectionHandle das criações diretas são
 //!   fechados como o kernel32 faz.
+//! - O ZwCreateUserProcess de modo kernel (o CdpCreateProcess do condrv.sys),
+//!   com o bloco do PsCaptureUserProcessParameters e handles de kernel:
+//!   handles de kernel na saída, Flags3.AuxiliaryProcess, o bloco do filho
+//!   normalizado com ConsoleHandle 0, o diretório do NtSystemRoot e o
+//!   DesktopInfo de quem chamou; AUXILIARY_PROCESS com FORCE_BREAKAWAY dá
+//!   STATUS_INVALID_PARAMETER_MIX e a captura recusa o bloco auto-relativo.
+//!   Quem cria é o System (fora de sessão, MmGetSessionIdEx -1) com o token
+//!   dele, que é da sessão 0: o PspAllocateProcess leva o filho à sessão do
+//!   token (o PspAttachSession). Como num sistema real, essa sessão existe:
+//!   sem ela, o teste a abre antes, como o smss de sessão no boot, por um
+//!   processo criado suspenso pelo NtCreateUserProcess com
+//!   PROCESS_CREATE_FLAGS_CREATE_SESSION, terminado no fim.
 //! - `process_parameters::capture` de um bloco normalizado (Buffers
 //!   absolutos) devolve os textos, as capacidades, o RuntimeData, os
 //!   escalares e o ambiente; Length > MaximumLength num texto dá
@@ -115,6 +127,15 @@ const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
 const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
+const STATUS_INVALID_PARAMETER_MIX: u32 = 0xC000_0030;
+/// MAXIMUM_ALLOWED, o acesso que o condrv.sys pede.
+const MAXIMUM_ALLOWED: u64 = 0x0200_0000;
+/// PROCESS_CREATE_FLAGS_AUXILIARY_PROCESS e FORCE_BREAKAWAY.
+const AUXILIARY_PROCESS: u32 = 0x8000;
+const FORCE_BREAKAWAY: u32 = 0x400;
+/// PROCESS_CREATE_FLAGS_CREATE_SESSION: o processo novo abre uma sessão (o
+/// que o smss de sessão pede no boot).
+const CREATE_SESSION: u32 = 0x80;
 /// Valor das células de status antes de o programa escrevê-las.
 const UNSET: u32 = 0xFFFF_FFFF;
 /// Prazo de cada etapa do pai.
@@ -175,6 +196,7 @@ const PARENT_ENTRY: usize = 3;
 
 // PS_ATTRIBUTE_* (`PsAttributeValue(número, thread, entrada, aditivo)`).
 const ATTRIBUTE_PARENT_PROCESS: u64 = 0x6_0000;
+const ATTRIBUTE_TOKEN: u64 = 0x6_0002;
 const ATTRIBUTE_DEBUG_OBJECT: u64 = 0x6_0001;
 const ATTRIBUTE_CLIENT_ID: u64 = 0x1_0003;
 const ATTRIBUTE_TEB_ADDRESS: u64 = 0x1_0004;
@@ -758,6 +780,7 @@ pub fn run(assert: Assert) {
     rejections(assert, &services);
     creator_inheritance(assert, system, system_inheritable);
     let _ = state::close_user_handle(system_inheritable, true, false);
+    kernel_mode_creation(assert);
     capture_normalized(assert);
     remove_volume_file(CHILD_NT_PATH);
     assert(crate::drivers::fs::volume_files::lookup_volume_file(CHILD_NT_PATH).is_none(), "ntcreateuserprocess: exe do filho removido do volume");
@@ -1072,6 +1095,177 @@ fn creator_inheritance(assert: Assert, system: u64, system_inheritable: u64) {
         }
     }
     crate::ntos::mm::kernel_stack::reap();
+}
+
+/// O ZwCreateUserProcess de modo kernel, como o CdpCreateProcess do
+/// condrv.sys: o bloco do PsCaptureUserProcessParameters (feito de um bloco
+/// normalizado na memória de usuário), OBJECT_ATTRIBUTES com
+/// OBJ_KERNEL_HANDLE, AUXILIARY_PROCESS, a thread suspensa e o ImageName, o
+/// ParentProcess e o Token por handles de kernel. Confere os handles de
+/// kernel, o Flags3.AuxiliaryProcess, os parâmetros do filho (NORMALIZED,
+/// ConsoleHandle 0, o diretório corrente do NtSystemRoot e o DesktopInfo de
+/// quem chamou), a recusa de AUXILIARY_PROCESS com FORCE_BREAKAWAY e a do
+/// bloco não normalizado na captura.
+fn kernel_mode_creation(assert: Assert) {
+    use crate::ntos::ob::{close, object_types, open_pointer};
+    use crate::ntos::test::phase6::call_export;
+    let Some(scratch) = Scratch::new(0x3000) else {
+        assert(false, "zwcreateuserprocess: memoria de usuario");
+        return;
+    };
+    // O bloco de quem chama, normalizado, e um auto-relativo.
+    let (user_block, relative_block, environment) = (scratch.block, scratch.block + 0x1000, scratch.block + 0x2800);
+    guest::write_bytes(environment, &environment_block());
+    build_parameters(user_block, user_block, true, environment);
+    build_parameters(relative_block, relative_block, false, environment);
+    let kernel = guest::alloc_bytes(0x400);
+    if kernel == 0 {
+        assert(false, "zwcreateuserprocess: memoria de kernel");
+        return;
+    }
+    guest::write_bytes(kernel, &[0u8; 0x400]);
+    let (captured_out, process_out, thread_out, attributes, info, name, list, cell) = (kernel, kernel + 8, kernel + 0x10, kernel + 0x20, kernel + 0x60, kernel + 0xC0, kernel + 0x140, kernel + 0x3F0);
+    let capture = |block: u64| call_export("PsCaptureUserProcessParameters", &[captured_out, block]).map_or(u32::MAX, |status| status as u32);
+    let relative = capture(relative_block);
+    let captured = capture(user_block);
+    let block = guest::read64(captured_out);
+    // SAFETY: o bloco de pool que o PsCaptureUserProcessParameters devolveu.
+    let pooled = (captured == 0 && block != 0).then(|| unsafe { RtlUserProcessParameters::at(block) });
+    let pool_ok = pooled.is_some_and(|parameters| {
+        parameters.flags.get() & 1 != 0
+            && parameters.console_handle.get() == 0
+            && parameters.desktop_info.buffer.get() > block
+            && state::read_user_wide_string(parameters.desktop_info.buffer.get(), parameters.desktop_info.length.get() as u64 / 2) == DESKTOP_INFO
+            && state::read_user_wide_string(parameters.command_line.buffer.get(), parameters.command_line.length.get() as u64 / 2) == COMMAND_LINE
+            && parameters.command_line.maximum_length.get() as usize == COMMAND_LINE.encode_utf16().count() * 2 + 2
+    });
+    assert(relative == STATUS_INVALID_PARAMETER && pool_ok, "zwcreateuserprocess: PsCaptureUserProcessParameters copia o bloco normalizado para o pool (Buffers absolutos, ConsoleHandle 0, DesktopInfo e o MaximumLength da linha de comando) e recusa o auto-relativo");
+    if pooled.is_none() {
+        guest::free_bytes(kernel);
+        return;
+    }
+    // Os handles de kernel do processo corrente e do token primário dele
+    // (o ObOpenObjectByPointer do CdpLaunchServerProcess).
+    let current = process::get_current_process();
+    let token = process::get_primary_token(current).unwrap_or(0);
+    // A sessão do token de quem cria existe, como num sistema real: quem
+    // cria é o System, fora de sessão (MmGetSessionIdEx -1), e o token dele
+    // é da sessão 0, que o smss de sessão abre no boot. O PspAllocateProcess
+    // compara o SeQuerySessionIdToken com o MmGetSessionIdEx de quem cria e
+    // leva o filho à sessão do token (o PspAttachSession, que sem a sessão
+    // dá STATUS_PROCESS_IS_TERMINATING).
+    let token_session = crate::ntos::se::token::tokens::with(token, |record| record.session_id).unwrap_or(0);
+    let Some(session_holder) = SessionHolder::open(token_session) else {
+        assert(false, "zwcreateuserprocess: a sessao do token de quem cria, aberta pelo NtCreateUserProcess com PROCESS_CREATE_FLAGS_CREATE_SESSION");
+        let _ = call_export("ExFreePoolWithTag", &[block, 0]);
+        guest::free_bytes(kernel);
+        return;
+    };
+    let kernel_handle = |pointer: u64, access: u32, object_type: u64| -> u64 {
+        guest::write64(cell, 0);
+        match open_pointer::open_by_pointer(pointer, 0x200, 0, access, object_type, 0, cell) {
+            Ok(0) => guest::read64(cell),
+            _ => 0,
+        }
+    };
+    let parent = kernel_handle(current, PROCESS_QUERY_LIMITED, object_types::process_type().pointer);
+    let token_handle = kernel_handle(token, 0xB, object_types::token_type().pointer);
+    // OBJECT_ATTRIBUTES {0x30, OBJ_KERNEL_HANDLE} e o PS_CREATE_INFO do
+    // condrv: só o Size e o PsCreateInitialState, sem WriteOutputOnExit (sem
+    // os handles do arquivo e da seção).
+    guest::write32(attributes, 0x30);
+    guest::write32(attributes + 0x18, 0x200);
+    let mut initial = create_info(PsCreateInfo::SIZE);
+    initial[0x10..0x18].copy_from_slice(&[0; 8]);
+    guest::write_bytes(info, &initial);
+    let text = wide(CHILD_NT_PATH);
+    guest::write_bytes(name, &text);
+    let entries = attribute_list(&[(ATTRIBUTE_IMAGE_NAME, text.len() as u64, name, 0), (ATTRIBUTE_TOKEN, 8, token_handle, 0), (ATTRIBUTE_PARENT_PROCESS, 8, parent, 0)]);
+    guest::write_bytes(list, &entries);
+    let create_with = |process_flags: u32| {
+        guest::write64(process_out, 0);
+        guest::write64(thread_out, 0);
+        call_export("ZwCreateUserProcess", &[process_out, thread_out, MAXIMUM_ALLOWED, MAXIMUM_ALLOWED, attributes, attributes, process_flags as u64, create::THREAD_CREATE_SUSPENDED as u64, block, info, list]).map_or(u32::MAX, |status| status as u32)
+    };
+    let mixed = create_with(AUXILIARY_PROCESS | FORCE_BREAKAWAY);
+    let mixed_handles = (guest::read64(process_out), guest::read64(thread_out));
+    let status = create_with(AUXILIARY_PROCESS);
+    let (process_handle, thread_handle) = (guest::read64(process_out), guest::read64(thread_out));
+    let kernel_bit = |handle: u64| handle & 0xFFFF_FFFF_8000_0000 == 0xFFFF_FFFF_8000_0000;
+    let child = match crate::ntos::ps::query_process::reference_process(process_handle, 0) {
+        Ok(Ok(child)) => child,
+        _ => 0,
+    };
+    // SAFETY: o EPROCESS do filho, referenciado acima.
+    let auxiliary = child != 0 && unsafe { Eprocess::at(child) }.flags3.get() & Eprocess::AUXILIARY_PROCESS_MASK != 0;
+    let parameters = if child != 0 { child_parameters(child) } else { None };
+    let child_session = if child != 0 { crate::ntos::mm::session::session_id_ex(child) } else { u32::MAX };
+    crate::debug_print!("[zwcreateuserprocess] status={:#x} handles {:#x}/{:#x} auxiliar {} misto {:#x} {:x?}; sessao do token {} e do filho {:#x}", status, process_handle, thread_handle, auxiliary, mixed, mixed_handles, token_session, child_session);
+    assert(mixed == STATUS_INVALID_PARAMETER_MIX && mixed_handles == (0, 0), "zwcreateuserprocess: AUXILIARY_PROCESS com FORCE_BREAKAWAY da STATUS_INVALID_PARAMETER_MIX sem criar processo");
+    assert(status == 0 && kernel_bit(process_handle) && kernel_bit(thread_handle) && auxiliary, "zwcreateuserprocess: KernelMode com OBJ_KERNEL_HANDLE da handles de kernel, e AUXILIARY_PROCESS liga o Flags3.AuxiliaryProcess");
+    let delivered = parameters.as_ref().is_some_and(|parameters| parameters.flags & 1 != 0 && parameters.console_handle == 0 && parameters.current_directory.trim_end_matches('\\').eq_ignore_ascii_case("C:\\Windows") && parameters.desktop_info == DESKTOP_INFO && parameters.command_line == COMMAND_LINE);
+    assert(delivered, "zwcreateuserprocess: o filho recebe o bloco capturado normalizado, com ConsoleHandle 0, o diretorio do NtSystemRoot e o DesktopInfo de quem chamou");
+    if child != 0 {
+        create::exit_process(child, DIRECT_CHILD_CODE);
+        let _ = crate::ntos::ps::query_process::release_process(child);
+    }
+    for handle in [thread_handle, process_handle, token_handle, parent] {
+        if handle != 0 {
+            let _ = close::close(handle, Some(0));
+        }
+    }
+    // O processo que abriu a sessão termina; ela some com o último processo.
+    drop(session_holder);
+    let _ = call_export("ExFreePoolWithTag", &[block, 0]);
+    guest::free_bytes(kernel);
+    crate::ntos::mm::kernel_stack::reap();
+}
+
+/// O processo que abre a sessão `id` para o [`kernel_mode_creation`], como
+/// o smss de sessão no boot: criado pelo NtCreateUserProcess com
+/// PROCESS_CREATE_FLAGS_CREATE_SESSION (o MiSessionCreate do
+/// MiMapProcessExecutable), com a thread principal suspensa, ele é o mestre da
+/// sessão nova. Com a sessão já aberta, nada é criado. No `drop`, o
+/// processo termina com DIRECT_CHILD_CODE e os handles dele são fechados.
+struct SessionHolder {
+    process: u64,
+    handles: [u64; 2],
+}
+
+impl SessionHolder {
+    fn open(id: u32) -> Option<Self> {
+        if crate::ntos::mm::session::find(id).is_some() {
+            return Some(Self { process: 0, handles: [0; 2] });
+        }
+        let scratch = Scratch::new(0x2000)?;
+        let name = scratch.block + 0x600;
+        let text = wide(CHILD_NT_PATH);
+        guest::write_bytes(name, &text);
+        // Sem WriteOutputOnExit: o PS_CREATE_INFO só recebe o estado.
+        let mut quiet = create_info(PsCreateInfo::SIZE);
+        quiet[0x10..0x14].copy_from_slice(&0x2000_0002u32.to_le_bytes());
+        let (status, process_handle) = call_create(&scratch, CREATE_SESSION, &quiet, &attribute_list(&[(ATTRIBUTE_IMAGE_NAME, text.len() as u64, name, 0)]));
+        let thread_handle = guest::read64(scratch.block + 8);
+        let process = state::get_user_handle(process_handle).and_then(|entry| entry.downcast::<UserProcess>().map(|object| object.pointer)).unwrap_or(0);
+        let session = if process != 0 { crate::ntos::mm::session::session_id_ex(process) } else { u32::MAX };
+        crate::debug_print!("[zwcreateuserprocess] sessao {} pelo NtCreateUserProcess com CREATE_SESSION: status {:#x}, processo {:#x} na sessao {:#x}", id, status, process, session);
+        // Um processo criado que não ficou na sessão pedida termina no drop.
+        let holder = Self { process, handles: [thread_handle, process_handle] };
+        (status == 0 && process != 0 && session == id).then_some(holder)
+    }
+}
+
+impl Drop for SessionHolder {
+    fn drop(&mut self) {
+        if self.process != 0 {
+            create::exit_process(self.process, DIRECT_CHILD_CODE);
+        }
+        for handle in self.handles {
+            if handle != 0 {
+                let _ = state::close_user_handle(handle, true, false);
+            }
+        }
+    }
 }
 
 /// A captura de um bloco normalizado (Buffers absolutos).

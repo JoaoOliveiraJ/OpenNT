@@ -5047,7 +5047,28 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     PreviousMode KernelMode). O volume do smss leva o conhost.exe, o
     cmd.exe, o net.exe, o net1.exe e o reg.exe com as DLLs deles
     (`CONSOLE_PROGRAMS`) e as fontes do console (Consolas e Lucida
-    Console, com a chave `Console`).
+    Console, com a chave `Console`). O NtCreateUserProcess de KernelMode
+    (`ps/create_context.rs`) não sonda nada, usa o bloco de parâmetros
+    como veio, aceita handles de kernel no ParentProcess e no Token,
+    passa o SeSinglePrivilegeCheck e, com OBJ_KERNEL_HANDLE, devolve
+    handles de kernel; PROCESS_CREATE_FLAGS_AUXILIARY_PROCESS liga o
+    Flags3.AuxiliaryProcess. O NtCreateFile de modo usuário relativo a um
+    handle de dispositivo (o `\Reference`, o `\Connect`, o `\Input` e o
+    `\Output` do condrv) abre no dispositivo da raiz com
+    RelatedFileObject = ela (`ps/user/files.rs`), e o EaBuffer de uma
+    abertura de dispositivo, de modo usuário ou do ZwCreateFile, vai
+    copiado e validado (IoCheckEaBufferValidity) ao
+    AssociatedIrp.SystemBuffer do IRP_MJ_CREATE, com o EaLength na stack
+    location (`io_manager::open_related_device_file_with_ea`). O
+    ObOpenObjectByPointer de UserMode de um FILE_OBJECT num processo de
+    usuário põe o handle na tabela de usuário dele, como um `device`
+    sem handle do I/O manager (`ob/open_pointer.rs`: o servidor do
+    console que o condrv entrega ao conhost), e a classe 49
+    (ProcessConsoleHostProcess) do NtSetInformationProcess grava o
+    OwnerProcessId do processo corrente (o ConsoleCommitState do
+    kernelbase). O `--console-process` roda no boot comum o cmd.exe real
+    com um console sem janela, pelo condrv.sys e pelo conhost.exe reais
+    (`ntos/test/console_process.rs`, `CONSOLE_PROCESS_OK`).
 - **Os exports que eram os últimos imports de drivers de software** (76,
   cada um no componente dono, conferidos contra o ntoskrnl 19041):
   - SDDL em `se/sddl.rs` (SeConvertSidToStringSid, SeConvertStringSidToSid

@@ -681,7 +681,10 @@ pub mod zw {
         Ok(close::close(call.arg(1), Some(0))? as u64)
     }
     fn create_file(call: &Call) -> Result<u64, KernelError> {
-        Ok(zw_files::create_kernel_file(call.arg(1), call.arg(2) as u32, call.arg(3), call.arg(4), call.arg(7) as u32, call.arg(8) as u32, call.arg(9) as u32)? as u64)
+        // O EaBuffer e o EaLength (10º e 11º) vão ao IRP_MJ_CREATE de um
+        // arquivo de dispositivo.
+        let context = crate::ntos::io::parse::DriverCreateContext { ea_buffer: call.arg(10), ea_length: call.arg(11) as u32, ..Default::default() };
+        Ok(zw_files::create_kernel_file_with_context(call.arg(1), call.arg(2) as u32, call.arg(3), call.arg(4), call.arg(7) as u32, call.arg(8) as u32, call.arg(9) as u32, context)? as u64)
     }
     fn read(call: &Call) -> Result<u64, KernelError> {
         Ok(read_file::read(call.arg(1), call.arg(2), call.arg(3), call.arg(4), call.arg(5), call.arg(6), call.arg(7) as u32, call.arg(8), call.arg(9))? as u64)

@@ -907,7 +907,9 @@ fn nt_query_information_process(handle: u64, class: u64, buffer: u64, length: u6
         }
         // ProcessConsoleHostProcess (ULONG_PTR): o EPROCESS.OwnerProcessId
         // que o PspAllocateProcess grava (o processo que criou, com o bit 2
-        // sem o 0x200 das flags de criação); ProcessSequenceNumber
+        // sem o 0x200 das flags de criação) e que a classe 49 do
+        // NtSetInformationProcess troca (o PID do conhost com o bit 0, o
+        // ConsoleCommitState do kernelbase); ProcessSequenceNumber
         // (ULONGLONG): o EPROCESS.SequenceNumber. As duas pelo handle com
         // PROCESS_QUERY_LIMITED_INFORMATION, como o NtQueryInformationProcess
         // 19041; outro comprimento é STATUS_INFO_LENGTH_MISMATCH. O csrss as
@@ -1039,6 +1041,9 @@ fn nt_set_information_process(handle: u64, class: u64, buffer: u64, length: u64,
     use crate::ntos::ps::set_process_information as set_process;
     if class as u32 == set_process::PROCESS_DYNAMIC_FUNCTION_TABLE_INFORMATION {
         return set_process::set_dynamic_function_table(1, handle, buffer, length as u32);
+    }
+    if class as u32 == set_process::PROCESS_CONSOLE_HOST_PROCESS {
+        return set_process::set_console_host_process(1, handle, buffer, length as u32);
     }
     if set_process::CLASSES.contains(&(class as u32)) {
         return set_process::set_information(1, class as u32, buffer, length as u32, |access| {

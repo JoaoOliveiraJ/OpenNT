@@ -144,6 +144,8 @@ pub const PROCESS_ENERGY_TRACKING_STATE: u32 = 82;
 /// tratada à parte por depender do valor do handle
 /// ([`set_dynamic_function_table`]).
 pub const PROCESS_DYNAMIC_FUNCTION_TABLE_INFORMATION: u32 = 53;
+/// ProcessConsoleHostProcess.
+pub const PROCESS_CONSOLE_HOST_PROCESS: u32 = 49;
 /// As classes desta área.
 pub const CLASSES: [u32; 12] = [PROCESS_BASE_PRIORITY, PROCESS_EXCEPTION_PORT, PROCESS_DEFAULT_HARD_ERROR_MODE, PROCESS_PRIORITY_CLASS, PROCESS_DEVICE_MAP, PROCESS_FOREGROUND_INFORMATION, PROCESS_BREAK_ON_TERMINATION, PROCESS_DEBUG_FLAGS, PROCESS_HANDLE_CHECKING_MODE, PROCESS_RAISE_UM_EXCEPTION_ON_INVALID_HANDLE_CLOSE, PROCESS_SUBSYSTEM_PROCESS, PROCESS_ENERGY_TRACKING_STATE];
 /// EPROCESS.Flags3.SubsystemProcess.
@@ -531,6 +533,9 @@ pub fn set_information_kernel(handle: u64, class: u32, buffer: u64, length: u32)
     if class == PROCESS_DYNAMIC_FUNCTION_TABLE_INFORMATION {
         return set_dynamic_function_table(0, handle, buffer, length);
     }
+    if class == PROCESS_CONSOLE_HOST_PROCESS {
+        return set_console_host_process(0, handle, buffer, length);
+    }
     let mut referenced = 0u64;
     let mut failure: Result<(), KernelError> = Ok(());
     let status = set_information(0, class, buffer, length, |access| match query_process::reference_process(handle, access) {
@@ -584,6 +589,45 @@ pub fn set_dynamic_function_table(mode: u8, handle: u64, buffer: u64, length: u3
     } else {
         dynamic_function_table::insert(table)
     }
+}
+
+/// O ramo da classe 49 do NtSetInformationProcess 19041 (rva 0x659cc8):
+/// em UserMode o ProbeForRead de alinhamento 8 do começo do serviço;
+/// exatamente 8 bytes (STATUS_INFO_LENGTH_MISMATCH), só o pseudo-handle do
+/// processo corrente (outro handle é STATUS_INVALID_PARAMETER, sem
+/// referenciar nada), o valor com os dois bits baixos iguais a 01 (senão
+/// STATUS_INVALID_PARAMETER) e o EPROCESS.OwnerProcessId do processo
+/// corrente trocado por ele. O ConsoleCommitState do kernelbase chama assim
+/// logo depois da conexão ao console, com o PID do conhost que o IOCTL
+/// 0x500023 do condrv devolve, e ignora o status; a consulta da classe 49
+/// devolve o valor.
+pub fn set_console_host_process(mode: u8, handle: u64, buffer: u64, length: u32) -> Result<u32, KernelError> {
+    if mode != 0 {
+        if let Err(status) = probe_input(PROCESS_CONSOLE_HOST_PROCESS, buffer, length) {
+            return Ok(status);
+        }
+    }
+    if length != 8 {
+        return Ok(STATUS_INFO_LENGTH_MISMATCH);
+    }
+    if handle != u64::MAX {
+        return Ok(STATUS_INVALID_PARAMETER);
+    }
+    let value = if mode != 0 {
+        match guest::try_read::<u64>(buffer) {
+            Ok(value) => value,
+            Err(error) => return Ok(error.status),
+        }
+    } else {
+        // SAFETY: buffer de entrada de um chamador de modo kernel.
+        unsafe { Field::<u64>::at(buffer) }.get()
+    };
+    if value & 3 != 1 {
+        return Ok(STATUS_INVALID_PARAMETER);
+    }
+    // SAFETY: o EPROCESS do processo corrente, vivo durante a chamada.
+    unsafe { Eprocess::at(crate::ntos::ps::process::get_current_process()) }.owner_process_id.set(value);
+    Ok(0)
 }
 
 /// O tipo da mensagem que avisa a porta de exceções trocada.

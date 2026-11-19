@@ -2698,6 +2698,22 @@ fn user_syscalls_core(assert: Assert) {
     let subsystem_ok = if master { subsystem == 0 && current.flags3.get() & 0x40 != 0 } else { subsystem == 0xC000_0061 && current.flags3.get() == saved_flags3 };
     current.flags3.set(saved_flags3);
     assert(energy && subsystem_ok, "usercore: ProcessEnergyTrackingState sem estimador e ProcessSubsystemProcess so do mestre da sessao");
+    // ProcessConsoleHostProcess (o ConsoleCommitState do kernelbase): 8 bytes,
+    // só o pseudo-handle, bits baixos 01; a consulta devolve o valor.
+    let saved_owner = current.owner_process_id.get();
+    let host = (0x1234u64 << 2) | 1;
+    guest::write64(buffer, host);
+    let set_ok = call("NtSetInformationProcess", u64::MAX, 49, buffer, 8) == 0 && current.owner_process_id.get() == host;
+    let query_ok = call("NtQueryInformationProcess", u64::MAX, 49, buffer + 8, 8) == 0 && guest::read64(buffer + 8) == host;
+    let refused = call("NtSetInformationProcess", u64::MAX, 49, buffer, 4) == 0xC000_0004
+        && call("NtSetInformationProcess", 4, 49, buffer, 8) == 0xC000_000D
+        && {
+            guest::write64(buffer, (0x1234 << 2) | 2);
+            call("NtSetInformationProcess", u64::MAX, 49, buffer, 8) == 0xC000_000D
+        }
+        && current.owner_process_id.get() == host;
+    current.owner_process_id.set(saved_owner);
+    assert(set_ok && query_ok && refused, "usercore: ProcessConsoleHostProcess como o NtSetInformationProcess 19041");
     let cookie = (call("NtQueryInformationProcess", u64::MAX, 36, buffer, 4) == 0).then(|| guest::read32(buffer)).unwrap_or(0);
     assert(cookie != 0 && call("NtQueryInformationProcess", u64::MAX, 36, buffer, 4) == 0 && guest::read32(buffer) == cookie && call("NtQueryInformationProcess", u64::MAX, 31, buffer, 4) == 0 && guest::read32(buffer) == 1, "usercore: cookie estavel e sem depurador");
     assert(call("NtQueryInformationProcess", u64::MAX, 27, buffer, 0x100) == 0 && { let image_name = unsafe { nt::UnicodeString::at(buffer) }; image_name.length.get() > 0 && image_name.buffer.get() == buffer + nt::UnicodeString::SIZE } && call("NtQueryInformationProcess", u64::MAX, 99, buffer, 8) == 0xC000_0003 && call("NtSetInformationProcess", u64::MAX, 99, buffer, 8) == 0xC000_0003, "usercore: nome da imagem e classes invalidas");

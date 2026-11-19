@@ -32,7 +32,8 @@
 //! `--tpm` (também opção de máquina: um TPM 2.0 tpm-crb sobre o simulador de TPM, em
 //! `run` e `test-boot`),
 //! `--memory-pressure` (o teste de pressão de memória sobre o arquivo de paginação do boot do
-//! smss).
+//! smss), `--console-process` (no boot comum, o cmd.exe real com um console sem janela, pelo
+//! condrv.sys e pelo conhost.exe reais; o volume leva os programas de modo usuário do smss).
 //! O kernel dos builds comuns leva só as tabelas de linha do DWARF; o `debug` compila o perfil
 //! `depuracao`, com o DWARF completo (as variáveis locais dos depuradores gráficos).
 //! Fora `--release` e `--windows-dir`, elas não recompilam o kernel: vão no bloco de opções de
@@ -118,6 +119,8 @@ opcoes de build:   --release --build-dir=DIR --user-program=shell
                    --shutdown-test=poweroff|reboot (com --start-driver=ntfs: grava e desliga)
                    --memory-pressure (com --initial-process=smss: teste de pressao de memoria
                    sobre o arquivo de paginacao)
+                   --console-process (boot comum: o cmd.exe real com um console sem janela;
+                   o volume leva os programas de modo usuario do smss)
 opcoes de maquina: --accel=auto|tcg|whpx (test-boot: auto = whpx quando a maquina tem; run e debug: tcg)
                    --memory-mb=N --smp=N --kd-port=N --monitor-port=N
 test-boot:         --keys=TEXTO (\\n = Enter) --expect=TEXTO (repetivel)
@@ -213,6 +216,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             net: false,
             memory_pressure: false,
             tpm: false,
+            console_process: false,
         },
         // O test-boot roda no WHPX quando a máquina o tem (`auto`); o `run`
         // e o `debug` ficam no TCG, que o rastro de instruções do depurador
@@ -270,6 +274,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             "--trace-rpc" => parsed.build.trace_rpc = true,
             "--heap-census" => parsed.build.heap_census = true,
             "--memory-pressure" => parsed.build.memory_pressure = true,
+            "--console-process" => parsed.build.console_process = true,
             "--initial-process" => parsed.build.initial_process = required()?,
             "--storage" => parsed.build.storage = required()?,
             "--display" => parsed.build.display = required()?,
@@ -336,6 +341,9 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
     }
     if !matches!(parsed.build.pnp_root.as_str(), "" | "acpi" | "internal") {
         return Err(format!("--pnp-root aceita acpi ou internal ({} recebido)", parsed.build.pnp_root));
+    }
+    if parsed.build.console_process && parsed.build.initial_process == "smss" {
+        return Err("--console-process e do boot comum (sem --initial-process=smss)".into());
     }
     if !matches!(parsed.build.shutdown_test.as_str(), "" | "poweroff" | "reboot") {
         return Err(format!("--shutdown-test aceita poweroff ou reboot ({} recebido)", parsed.build.shutdown_test));

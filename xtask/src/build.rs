@@ -108,6 +108,11 @@ pub struct BuildOptions {
     /// `--tpm`: a máquina ganha um TPM 2.0 (tpm-crb sobre o simulador) e o
     /// PnP sobe o tpm.sys real nele.
     pub tpm: bool,
+    /// `--console-process`: no boot comum, o kernel roda o cmd.exe real com
+    /// um console sem janela (o teste console-processo). Também muda o
+    /// volume NTFS, que leva os programas de modo usuário do boot do smss
+    /// (o cmd.exe, o conhost.exe e as DLLs deles); o kernel é o mesmo.
+    pub console_process: bool,
 }
 
 impl BuildOptions {
@@ -164,6 +169,9 @@ impl BuildOptions {
         if self.tpm {
             words.push(String::from(name::TPM));
         }
+        if self.console_process {
+            words.push(String::from(name::CONSOLE_PROCESS));
+        }
         Ok(words.join(" "))
     }
 
@@ -211,6 +219,7 @@ impl BuildOptions {
             net: false,
             memory_pressure: false,
             tpm: false,
+            // O `console_process` fica: ele também muda o volume NTFS.
             ..self.clone()
         }
     }
@@ -228,6 +237,7 @@ impl BuildOptions {
     pub fn kernel_key(&self) -> String {
         let mut options = self.without_load_options();
         options.initial_process.clear();
+        options.console_process = false;
         format!("{options:?}")
     }
 }
@@ -391,7 +401,11 @@ pub fn build(options: &BuildOptions) -> Result<BuildOutput, String> {
     fs::write(&image_path, &image).map_err(|error| format!("{}: {error}", image_path.display()))?;
     // Segundo disco IDE (mestre-escravo primário): o volume NTFS de dados.
     let ntfs_path = build_dir.join("ntfs.img");
-    let mut ntfs_files = crate::windows_binaries::ntfs_files(&root, &kernel_pe, &options.initial_process)?;
+    // O volume do `--console-process` leva os programas de modo usuário do
+    // boot do smss (o cmd.exe, o conhost.exe e as DLLs deles); as hives e o
+    // espaço livre seguem os do boot comum.
+    let staged_programs = if options.console_process { "smss" } else { options.initial_process.as_str() };
+    let mut ntfs_files = crate::windows_binaries::ntfs_files(&root, &kernel_pe, staged_programs)?;
     // As hives de máquina que o kernel carrega no boot, das tabelas de
     // semente dele.
     for (name, image) in crate::hive_image::machine_hives(options.initial_process == "smss") {
@@ -448,6 +462,7 @@ mod tests {
             net: false,
             memory_pressure: false,
             tpm: false,
+            console_process: false,
         }
     }
 
@@ -515,6 +530,14 @@ mod tests {
         smss.initial_process = "smss".into();
         assert_ne!(base.image_key(), smss.image_key());
         assert_eq!(base.kernel_key(), smss.kernel_key());
+        // O processo de console muda o volume (os programas do smss), não o
+        // kernel, e vai nas opções de carga.
+        let mut console = options();
+        console.console_process = true;
+        assert_ne!(base.image_key(), console.image_key());
+        assert_ne!(smss.image_key(), console.image_key());
+        assert_eq!(base.kernel_key(), console.kernel_key());
+        assert_eq!(console.load_options().unwrap(), "CONSOLEPROCESS");
         let mut release = options();
         release.release = true;
         assert_ne!(base.kernel_key(), release.kernel_key());

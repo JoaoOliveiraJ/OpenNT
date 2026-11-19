@@ -325,7 +325,7 @@ pub fn create_kernel_file_with_context(output: u64, desired_access: u32, attribu
     if let Some((device_path, related)) = device_root(attributes_pointer) {
         let name_pointer = object_attributes_at(attributes_pointer).object_name.get();
         let name = if name_pointer != 0 { guest_strings::read_unicode_string(name_pointer) } else { String::new() };
-        let opened = io_manager::open_related_device_file(&device_path, &name, related, Some(create), true)?;
+        let opened = io_manager::open_related_device_file_with_ea(&device_path, &name, related, create, driver_context.ea_buffer, driver_context.ea_length, true)?;
         return publish_device_open(opened, device_path, output, io_status, access, share_access, options, owner_process, open_flags);
     }
     let object_name = match file_path_from_object_attributes(attributes_pointer) {
@@ -386,7 +386,7 @@ pub fn create_kernel_file_with_context(output: u64, desired_access: u32, attribu
     // o IRP_MJ_CREATE completo ao dispositivo com o resto do nome.
     if crate::ntos::io::parse::split_volume_path(&object_name).is_none() && resolve_mounted_file(&object_name).is_none() {
         if let Some((device_path, rest)) = io_manager::split_device_path(&object_name).filter(|(_, rest)| !rest.is_empty()) {
-            let opened = io_manager::open_related_device_file(&device_path, &rest, 0, Some(create), true)?;
+            let opened = io_manager::open_related_device_file_with_ea(&device_path, &rest, 0, create, driver_context.ea_buffer, driver_context.ea_length, true)?;
             return publish_device_open(opened, device_path, output, io_status, access, share_access, options, owner_process, open_flags);
         }
     }

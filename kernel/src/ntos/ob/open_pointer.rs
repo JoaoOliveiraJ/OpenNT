@@ -526,6 +526,17 @@ fn publish_handle(item: &Described, granted: u32, attributes: u32, owner: u64, c
 fn create(item: &Described, attributes: u32, granted: u32, access_state: u64, remaining: u32, output_handle: u64, access_mode: u8) -> Outcome {
     let failure = |error: KernelError| Outcome { status: if error.status != 0 { error.status } else { 0xC000_0001 }, granted: None, value: 0, error: Some(error) };
     let owner = if attributes & 0x200 != 0 { process::get_system_process() } else { process::get_current_process() };
+    // Um FILE_OBJECT aberto em UserMode num processo de usuário (o
+    // ObOpenObjectByPointer do CdpLaunchServerProcess do condrv.sys, anexado
+    // ao conhost.exe, que recebe assim o servidor do console): o handle entra
+    // na tabela de usuário do processo, onde as syscalls de I/O o procuram,
+    // como um `device` sem handle do I/O manager e com o corpo nativo do
+    // FILE_OBJECT.
+    if attributes & 0x200 == 0 && access_mode != 0 && item.object_type.name == "File" {
+        if let Some(table) = crate::ntos::ps::user::process_state::get(owner) {
+            return create_user_file_handle(&table, item, attributes, granted, access_state, remaining, output_handle);
+        }
+    }
     let identifier = match insert_with(item, granted, attributes, owner, OpenReason::Open, access_mode) {
         Ok(identifier) => identifier,
         Err(error) => return failure(error),
@@ -542,6 +553,40 @@ fn create(item: &Described, attributes: u32, granted: u32, access_state: u64, re
         state.remaining_desired_access.set(remaining & !(granted | 0x0200_0000));
         state.security_evaluated.set(1);
     }
+    Outcome { status: 0, granted: Some(granted), value: identifier, error: None }
+}
+
+/// O handle de usuário de um FILE_OBJECT (o ramo de UserMode do [`create`]):
+/// um `device` (`files::UserDevice::existing`) na tabela `table`, com o
+/// acesso concedido e o OBJ_INHERIT; o ACCESS_STATE recebe o acesso como
+/// na tabela nativa.
+#[allow(clippy::too_many_arguments)]
+fn create_user_file_handle(table: &crate::ntos::ps::user::process_state::ProcessState, item: &Described, attributes: u32, granted: u32, access_state: u64, remaining: u32, output_handle: u64) -> Outcome {
+    let failure = |error: KernelError| Outcome { status: if error.status != 0 { error.status } else { 0xC000_0001 }, granted: None, value: 0, error: Some(error) };
+    let device = match crate::ntos::ps::user::files::UserDevice::existing(item.pointer) {
+        Ok(device) => device,
+        Err(error) => return failure(error),
+    };
+    let identifier = match crate::ntos::ps::user::state::alloc_user_handle_in(table, Arc::new(device), granted, attributes & 2, None) {
+        Ok(identifier) => identifier,
+        Err(error) => {
+            // A referência que o `existing` tomou.
+            let _ = crate::ntos::ob::objects::file::dereference(item.pointer);
+            return failure(error);
+        }
+    };
+    if let Err(error) = guest::try_write::<u64>(output_handle, identifier as u64) {
+        let _ = crate::ntos::ps::user::state::close_user_handle_in(table, identifier as u64, true, true);
+        return failure(error);
+    }
+    if access_state != 0 {
+        // SAFETY: ACCESS_STATE de um chamador de kernel.
+        let state = unsafe { AccessState::at(access_state) };
+        state.previously_granted_access.set(granted);
+        state.remaining_desired_access.set(remaining & !(granted | 0x0200_0000));
+        state.security_evaluated.set(1);
+    }
+    crate::debug_print!("[ob] FILE_OBJECT {:#x} aberto em UserMode no processo {:#x}: handle de usuario {:#x}", item.pointer, table.process, identifier);
     Outcome { status: 0, granted: Some(granted), value: identifier, error: None }
 }
 
