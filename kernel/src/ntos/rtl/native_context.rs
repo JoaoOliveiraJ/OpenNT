@@ -208,6 +208,19 @@ pub fn current() -> Result<u64, KernelError> {
 /// [`current`] sem esperar a trava das invocações (o diagnóstico de uma
 /// parada, que pode ter vindo de dentro dela): `None` sem invocação com
 /// CONTEXT ou com a trava tomada.
+/// O CONTEXT da chamada nativa mais interna em curso na pilha de kernel que
+/// contém `address`: a de uma thread que deixou a CPU dentro de um export
+/// (`address` = o KTHREAD.KernelStack salvo no bloqueio). Diagnóstico: não
+/// espera a trava das invocações.
+pub fn context_on_stack(address: u64) -> Option<u64> {
+    if !memory_map::is_kernel_stack(address) {
+        return None;
+    }
+    let stack = (1 << 63) | (address - memory_map::KERNEL_STACK_BASE) / kernel_stack::SLOT_SIZE;
+    let invocations = INVOCATIONS.try_lock()?;
+    invocations.iter().rev().find(|invocation| invocation.stack == stack).map(|invocation| invocation.context).filter(|&context| context != 0)
+}
+
 pub fn try_current() -> Option<u64> {
     let stack = current_stack();
     let invocations = INVOCATIONS.try_lock()?;

@@ -810,6 +810,44 @@ pub fn readable(address: u64, length: u64) -> bool {
 /// A cadeia de RBP a partir de quem chama: quantos retornos couberam em
 /// `frames`.
 #[inline(never)]
+/// A chamada nativa em curso numa thread que deixou a CPU dentro dela (o
+/// CONTEXT de `native_context::context_on_stack`): o export chamado, quem o
+/// chamou e os quadros nativos, em linhas que começam com `prefix`. Só
+/// diagnóstico, como o bloco [kcrash] de uma parada dentro de uma chamada.
+pub fn describe_native_call(prefix: &str, context: u64) {
+    let mut walker = Walker::new();
+    let mut line = Line::new();
+    let Some(registers) = registers_at(&mut walker, context) else {
+        let _ = write!(line, "{prefix} CONTEXT ilegivel ({context:#x})");
+        line.emit();
+        return;
+    };
+    let _ = write!(line, "{prefix} parada em ");
+    match walker.call_target(registers.rip) {
+        Some(target) => walker.callee(&mut line, target),
+        None => {
+            let _ = line.write_str("uma chamada ao kernel");
+        }
+    }
+    let _ = line.write_str(", chamada de ");
+    walker.describe(&mut line, registers.rip, FRAME_SYMBOL_RANGE);
+    line.emit();
+    let mut frames = [0u64; MAX_FRAMES];
+    let count = walker.walk(registers, false, &mut frames);
+    let _ = write!(line, "{prefix} quadros nativos (rsp {:#x}):", registers.integer[RSP]);
+    for (index, &address) in frames[..count].iter().enumerate() {
+        if index != 0 && index % FRAMES_PER_LINE == 0 {
+            line.emit();
+            let _ = write!(line, "{prefix}  ");
+        } else if index != 0 {
+            let _ = line.write_str(" |");
+        }
+        let _ = line.write_str(" ");
+        walker.describe(&mut line, address, FRAME_SYMBOL_RANGE);
+    }
+    line.emit();
+}
+
 pub fn kernel_frames(frames: &mut [u64; MAX_FRAMES]) -> usize {
     kernel_frames_into(&mut Walker::new(), frames).0
 }

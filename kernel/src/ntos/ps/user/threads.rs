@@ -67,7 +67,7 @@ use crate::ntos::se::token::thread as thread_tokens;
 use crate::rtl::{sync, KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::{kernel_stack, peb_teb};
-use crate::ntos::inc::types::{ClientId, Context, Eprocess, Ethread, ImageDosHeader, ImageNtHeaders64, Kthread, NtStruct, ObjectAttributes, Peb, PsAttribute, PsAttributeList, Teb, ThreadBasicInformation};
+use crate::ntos::inc::types::{ClientId, Context, Eprocess, Ethread, ImageDosHeader, ImageNtHeaders64, Kthread, KwaitBlock, NtStruct, ObjectAttributes, Peb, PsAttribute, PsAttributeList, Teb, ThreadBasicInformation};
 use core::mem::offset_of;
 
 pub const CONTEXT_SIZE: u64 = Context::SIZE;
@@ -1033,6 +1033,44 @@ pub fn exit_ready(process: u64) -> bool {
     !in_slice && !of_process(process).iter().any(|thread| thread.blocked_in_kernel() || thread.termination_pending())
 }
 
+/// O aviso de um término que segura o fim do processo: onde a thread está,
+/// a última espera publicada na KTHREAD (WaitMode, Alertable, WaitReason e o
+/// objeto do primeiro KWAIT_BLOCK com o DISPATCHER_HEADER.Type; numa espera
+/// só por sondagem esses campos são de uma espera anterior) e, se ela deixou
+/// a CPU dentro de um export chamado por código nativo (o win32k no callout
+/// de saída), o export, quem o chamou e os quadros nativos.
+fn describe_unfinished_exit(thread: &UserThread, process: u64) {
+    let (exit_running, kernel) = thread.with(|thread| (thread.exit_running, thread.kernel));
+    let pointer = thread.pointer();
+    if pointer == 0 {
+        crate::debug_print!("[thread] processo {:#x}: tid={} ainda sem o proprio termino (sem KTHREAD); o termino espera", process, thread.thread_id);
+        return;
+    }
+    let tcb = kernel_thread(pointer);
+    let block = tcb.wait_block_list.get();
+    // SAFETY: a KWAIT_BLOCK da última espera publicada na KTHREAD viva.
+    let object = if block != 0 { unsafe { KwaitBlock::at(block) }.object.get() } else { 0 };
+    let kind = if object != 0 { guest::read8(object) } else { 0xFF };
+    crate::debug_print!(
+        "[thread] processo {:#x}: tid={} ainda sem o proprio termino (PspExitThread em curso={}, servico={:?}, estado={}, WaitMode={}, Alertable={}, WaitReason={}, objeto={:#x} tipo={}); o termino espera",
+        process,
+        thread.thread_id,
+        exit_running,
+        kernel,
+        thread_dispatch::thread_state(pointer),
+        tcb.wait_mode.get(),
+        tcb.alertable(),
+        tcb.wait_reason.get(),
+        object,
+        kind
+    );
+    if matches!(kernel, KernelState::Blocked { .. }) {
+        if let Some(context) = crate::ntos::rtl::native_context::context_on_stack(tcb.kernel_stack.get()) {
+            crate::ntos::ke::bugcheck_trace::describe_native_call(&alloc::format!("[thread] tid={}", thread.thread_id), context);
+        }
+    }
+}
+
 /// O fim pedido de `process` concluiu: sai do registro e solta o EPROCESS.
 pub fn end_exit(process: u64) {
     let removed = {
@@ -1077,8 +1115,7 @@ fn finish_pending_exits(count_round: bool) {
                     pending.warned = true;
                 }
                 for thread in exiting_alone {
-                    let exit_running = thread.with(|thread| thread.exit_running);
-                    crate::debug_print!("[thread] processo {:#x}: tid={} ainda sem o proprio termino (PspExitThread em curso={}); o termino espera", process, thread.thread_id, exit_running);
+                    describe_unfinished_exit(thread, process);
                 }
             }
             continue;
