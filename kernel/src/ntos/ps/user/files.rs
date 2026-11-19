@@ -544,12 +544,15 @@ fn nt_device_io_control_file(handle: u64, event: u64, apc: u64, context: u64, rs
     let input_length = state::stack_arg32(rsp, 8);
     let output = state::stack_arg(rsp, 9);
     let output_length = state::stack_arg32(rsp, 10);
-    // Uma abertura do IopParseDevice (o volume inteiro, sem handle do I/O
-    // manager): o IopXxxControlFile completo, com o acesso que o código
-    // pede (FILE_READ_ACCESS/FILE_WRITE_ACCESS contra o do handle) e o
-    // dispositivo relacionado do FILE_OBJECT.
+    // Uma abertura do IopParseDevice (o volume inteiro) ou do
+    // ObOpenObjectByPointer de um FILE_OBJECT (o servidor do console que o
+    // condrv.sys põe no conhost.exe), sem handle do I/O manager: o
+    // IopXxxControlFile completo, com o acesso que o código pede
+    // (FILE_READ_ACCESS/FILE_WRITE_ACCESS contra o do handle), o dispositivo
+    // relacionado do FILE_OBJECT e o FastIoDeviceControl do driver antes do
+    // IRP (o CdpServerFastIoctl do condrv atende os IOCTLs do servidor).
     if device.device_handle == 0 {
-        return Ok(irp_service::device_control(&irp_service::Control { handle, event, apc_routine: apc, apc_context: context, io_status: iosb, code, input, input_length, output, output_length }));
+        return Ok(irp_service::device_control(&irp_service::Control { handle, event, apc_routine: apc, apc_context: context, io_status: iosb, code, input, input_length, output, output_length }, true));
     }
     if apc != 0 {
         return Ok(0xC000_00BB);
@@ -626,7 +629,7 @@ fn nt_device_io_control_file(handle: u64, event: u64, apc: u64, context: u64, rs
     // \Device\KsecDD o pedido METHOD_OUT_DIRECT 0x39006a, concluído na
     // porta de conclusão do arquivo.
     if code & 3 == 1 || code & 3 == 2 || event != 0 {
-        return Ok(irp_service::device_control(&irp_service::Control { handle, event, apc_routine: apc, apc_context: context, io_status: iosb, code, input, input_length, output, output_length }));
+        return Ok(irp_service::device_control(&irp_service::Control { handle, event, apc_routine: apc, apc_context: context, io_status: iosb, code, input, input_length, output, output_length }, false));
     }
     let packet = io_manager::build_device_io_control_request(code, top, input, input_length, output, output_length, 0, 0, iosb, Some(RequestContext { file_object: device.file_object, requestor_mode: 1, thread: process::get_current_thread() }));
     if packet == 0 {

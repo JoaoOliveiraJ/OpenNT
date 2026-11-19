@@ -74,6 +74,7 @@ use crate::ntos::io::file::{information, query};
 use crate::ntos::io::irp_builder::{self, BuildOptions};
 use crate::ntos::io::threads::thread_requests;
 use crate::ntos::io::completion::file_port;
+use crate::ntos::io::device_control::{fast_device_control, FastControl};
 use crate::ntos::io::{cancel, io_manager};
 use crate::ntos::ke::{apc, dispatcher, irql};
 use crate::ntos::mm::guest_memory as guest;
@@ -117,6 +118,8 @@ const FO_SEQUENTIAL_ONLY: u32 = 0x20;
 const FO_NAMED_PIPE: u32 = 0x80;
 const FO_MAILSLOT: u32 = 0x200;
 const FO_DELETE_ON_CLOSE: u32 = 0x1_0000;
+/// FILE_SKIP_SET_EVENT_ON_HANDLE do Fast I/O.
+const FO_SKIP_SET_FAST_IO: u32 = 0x0800_0000;
 /// DEVICE_OBJECT.Flags.
 const DO_BUFFERED_IO: u32 = 0x4;
 const DO_DIRECT_IO: u32 = 0x10;
@@ -872,14 +875,15 @@ pub struct Control {
 /// NtFsControlFile de modo usuário: o IopXxxControlFile com
 /// IRP_MJ_FILE_SYSTEM_CONTROL / IRP_MN_USER_FS_REQUEST.
 pub fn fs_control(arguments: &Control) -> u32 {
-    control(arguments, IRP_MJ_FILE_SYSTEM_CONTROL, IRP_MN_USER_FS_REQUEST)
+    control(arguments, IRP_MJ_FILE_SYSTEM_CONTROL, IRP_MN_USER_FS_REQUEST, false)
 }
 
-/// NtDeviceIoControlFile de modo usuário pelo IRP: o IopXxxControlFile com
-/// IRP_MJ_DEVICE_CONTROL, depois do FastIoDeviceControl que quem chama já
-/// tentou.
-pub fn device_control(arguments: &Control) -> u32 {
-    control(arguments, IRP_MJ_DEVICE_CONTROL, 0)
+/// NtDeviceIoControlFile de modo usuário: o IopXxxControlFile com
+/// DeviceIoControl = TRUE (ntoskrnl 19041 rva 0x64b730). Com `fast_io`, o
+/// FastIoDeviceControl do driver do dispositivo relacionado antes do
+/// IRP_MJ_DEVICE_CONTROL; `false` quando quem chama já o tentou.
+pub fn device_control(arguments: &Control, fast_io: bool) -> u32 {
+    control(arguments, IRP_MJ_DEVICE_CONTROL, 0, fast_io)
 }
 
 /// O IopXxxControlFile: o acesso que o código pede, os buffers do método
@@ -887,7 +891,7 @@ pub fn device_control(arguments: &Control) -> u32 {
 /// num SystemBuffer e a saída num MDL das páginas de usuário sondadas e
 /// travadas (IoAllocateMdl + MmProbeAndLockPages), que a conclusão
 /// destrava e libera.
-fn control(arguments: &Control, major: u8, minor: u8) -> u32 {
+fn control(arguments: &Control, major: u8, minor: u8, fast_io: bool) -> u32 {
     let target = match reference(arguments.handle) {
         Ok(target) => target,
         Err(status) => return status,
@@ -917,6 +921,40 @@ fn control(arguments: &Control, major: u8, minor: u8) -> u32 {
     let synchronous = target.synchronous();
     if synchronous && information::acquire_file(target.file).is_err() {
         return conclude(&target, false, event, STATUS_INSUFFICIENT_RESOURCES);
+    }
+    // O Fast I/O do IopXxxControlFile (0x64bd31..0x64c094): o
+    // FastIoDeviceControl do driver de `target.device` com os buffers de
+    // usuário como vieram (as sondas do método já foram feitas acima; os de
+    // METHOD_NEITHER o driver captura), num arquivo síncrono ou não.
+    // Atendido: o IoStatus no IOSB do usuário (a falha da escrita não muda o
+    // status), o pacote na porta do arquivo, o evento do pedido sinalizado
+    // (com FO_SKIP_SET_FAST_IO só quando a porta recebe um aviso), o lock
+    // solto e o FileObject->Event como está. O condrv.sys atende assim os
+    // IOCTLs do servidor do console (CdpServerFastIoctl 0x88d0), que o IRP
+    // recusa com STATUS_INVALID_DEVICE_REQUEST (CdpServerIoctl 0x7860).
+    if fast_io {
+        match fast_device_control(target.file, target.device, arguments.input, arguments.input_length, arguments.output, arguments.output_length, arguments.code) {
+            FastControl::NotHandled => {}
+            FastControl::NoMemory => return conclude(&target, synchronous, event, STATUS_INSUFFICIENT_RESOURCES),
+            FastControl::Handled { status, information: transferred } => {
+                let _ = write_user_iosb(arguments.io_status, status, transferred);
+                let warning = status & 0xC000_0000 == 0x8000_0000;
+                let port = file_port::takes_fast_io_packet(target.file, status);
+                if let Some(event) = &event {
+                    if file_at(target.file).flags.get() & FO_SKIP_SET_FAST_IO == 0 || (port && warning) {
+                        dispatcher::set_event(event.pointer);
+                    }
+                }
+                let mut result = status;
+                if port && arguments.apc_context != 0 {
+                    file_port::complete(target.file, arguments.apc_context, status, transferred, false);
+                    if warning {
+                        result = STATUS_PENDING;
+                    }
+                }
+                return conclude(&target, synchronous, event, result);
+            }
+        }
     }
     dispatcher::clear_event(file_at(target.file).event.address());
     let mut system = 0;

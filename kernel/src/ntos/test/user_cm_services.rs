@@ -243,7 +243,30 @@ fn device_control(assert: Assert, block: u64, call: Call, stack: Stack) {
     let result = (guest::read32(output), guest::read32(output + 4));
     stack(&[iosb, cm_api::code::GET_DEVICE_STATUS as u64, input + 4, 0x28, output, 0x14]);
     let misaligned = call("NtDeviceIoControlFile", handle, 0, 0, 0);
+    // O mesmo FILE_OBJECT aberto por ponteiro em UserMode no processo (o
+    // ObOpenObjectByPointer com que o CdpLaunchServerProcess do condrv.sys
+    // põe o servidor do console no conhost.exe): um `device` sem handle do
+    // I/O manager, cujo IOCTL segue o IopXxxControlFile de `irp_service`, que
+    // tenta o FastIoDeviceControl antes do IRP (o IRP_MJ_DEVICE_CONTROL do
+    // \CMApi é STATUS_NOT_SUPPORTED).
+    let file_object = state::get_user_handle(handle).and_then(|entry| entry.downcast::<crate::ntos::ps::user::files::UserDevice>().map(|device| device.file_object)).unwrap_or(0);
+    let pointer_out = block + 0x1020;
+    let by_pointer = crate::ntos::ob::open_pointer::open_by_pointer(file_object, 0, 0, 0x1000_0000, crate::ntos::ob::object_types::file_type().pointer, 1, pointer_out).unwrap_or(u32::MAX);
+    let pointer_handle = guest::read64(pointer_out);
+    guest::write_bytes(output, &[0u8; 0x14]);
+    io_status.information.set(0);
+    stack(&[iosb, cm_api::code::GET_DEVICE_STATUS as u64, input, 0x28, output, 0x14]);
+    let fast = call("NtDeviceIoControlFile", pointer_handle, 0, 0, 0);
+    let fast_information = io_status.information.get();
+    let fast_result = (guest::read32(output), guest::read32(output + 4));
     previous_mode.set(saved);
+    assert(
+        by_pointer == 0 && pointer_handle != 0 && pointer_handle < 0x8000_0000 && fast == 0 && fast_information == 0x14 && fast_result == (0x14, STATUS_NO_SUCH_DEVICE),
+        &alloc::format!("usercm: o handle de usuario do ObOpenObjectByPointer (o servidor do console no conhost) vai ao FastIoDeviceControl antes do IRP: aberto {by_pointer:#x} handle {pointer_handle:#x}, ioctl {fast:#x}, Information {fast_information:#x}, resultado {:#x}/{:#x}", fast_result.0, fast_result.1),
+    );
+    if by_pointer == 0 {
+        let _ = call("NtClose", pointer_handle, 0, 0, 0);
+    }
     assert(
         opened == 0 && controlled == 0 && information == 0x14 && result == (0x14, STATUS_NO_SUCH_DEVICE) && misaligned == STATUS_DATATYPE_MISALIGNMENT,
         &alloc::format!("usercm: NtDeviceIoControlFile de usuario vai ao FastIoDeviceControl do \\CMApi (resultado no buffer, entrada desalinhada recusada): aberto {opened:#x}, ioctl {controlled:#x}, Information {information:#x}, resultado {:#x}/{:#x}, desalinhado {misaligned:#x}", result.0, result.1),

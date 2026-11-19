@@ -100,6 +100,14 @@ pub fn skips_file_event(file: u64) -> bool {
     file_at(file).flags.get() & FO_SKIP_SET_EVENT != 0
 }
 
+/// O Fast I/O atendido vai à porta do arquivo (IopXxxControlFile
+/// 0x64bf58): há contexto de conclusão, o status não é erro e o
+/// FO_SKIP_COMPLETION_PORT não está ligado (ou o status é um aviso).
+pub fn takes_fast_io_packet(file: u64, status: u32) -> bool {
+    let object = file_at(file);
+    object.completion_context.get() != 0 && status & 0xC000_0000 != 0xC000_0000 && (object.flags.get() & FO_SKIP_COMPLETION_PORT == 0 || status & 0xC000_0000 == 0x8000_0000)
+}
+
 /// A conclusão de um IRP de `file`: o pacote na IOCP do arquivo, quando ela
 /// existe e o pedido levou contexto (`apc_context`, o UserApcContext).
 pub fn complete(file: u64, apc_context: u64, status: u32, information: u64, pending_returned: bool) {
