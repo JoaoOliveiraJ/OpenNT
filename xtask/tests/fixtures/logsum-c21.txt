@@ -1,0 +1,77 @@
+[OpenNT] kernel 64-bit vivo (BIOS real mode -> long mode)
+HELLO_KERNEL_OK
+MOUNTMGR_BOOT_VOLUME_OK \Device\KernelVolume1 -> C: (chegada Ok(0), BOOT_DL Ok(0), NtSystemRoot C)
+KERNEL_RS_OK
+[init] processo inicial \SystemRoot\System32\smss.exe (pid 60): protegido 0x61, critico
+[usermode] 60:64 NtOpenKey FALHOU com 0xc0000034 (rip 0x18009d7e4, chamador 0x0) [diag-arquivo] "\Registry\Machine\Software\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\smss.exe"
+[usermode] 60:64 NtSetInformationVirtualMemory FALHOU com 0xc00000bb (rip 0x1800a0994, chamador 0x0)
+[usermode] 60:64 NtOpenFile FALHOU com 0xc0000034 (rip 0x18009dc04, chamador 0x0) [diag-arquivo] "\Device\RdyBoost"
+[usermode] 60:64 NtOpenKey FALHOU com 0xc0000034 (rip 0x18009d7e4, chamador 0x0) [diag-arquivo] "\Registry\Machine\System\CurrentControlSet\Control\MiniNT"
+[usermode] 60:64 NtEnumerateValueKey FALHOU com 0x8000001a (rip 0x18009d804, chamador 0x0)
+[usermode] 60:64 NtEnumerateValueKey FALHOU com 0x8000001a (rip 0x18009d804, chamador 0x0)
+[usermode] 60:64 NtEnumerateValueKey FALHOU com 0x8000001a (rip 0x18009d804, chamador 0x0)
+[usermode] 60:64 NtEnumerateValueKey FALHOU com 0x8000001a (rip 0x18009d804, chamador 0x0)
+[ps] NtCreateUserProcess: smss.exe pid=0x4c tid=0x50 handles 0xa8/0xac arquivo/secao 0x0/0x0 (suspensa)
+[mm] memoria (criado 76): PFN livres 328528/352256 paginas, commit 10630/352256 paginas (maximo 352256, pico 10630), nao residentes 0, heap 26480/65535 KB
+[init] smss.exe (pid 60) criou smss.exe (pid 76) por NtCreateUserProcess
+[ps] NtCreateUserProcess: csrss.exe pid=0x60 tid=0x64 handles 0x54/0x58 arquivo/secao 0x0/0x0 (suspensa)
+[mm] memoria (criado 96): PFN livres 325342/352256 paginas, commit 11061/401408 paginas (maximo 417792, pico 11061), nao residentes 0, heap 28227/65535 KB
+[init] smss.exe (pid 76) criou csrss.exe (pid 96) por NtCreateUserProcess
+SMSS_CSRSS_OK
+[usermode] syscall NtGetMUIRegistryInfo sem implementacao (sem provedor)
+[ps] NtCreateUserProcess: smss.exe pid=0x94 tid=0x98 handles 0xb8/0xbc arquivo/secao 0x0/0x0 (suspensa)
+[mm] memoria (criado 148): PFN livres 316484/352256 paginas, commit 11216/401408 paginas (maximo 417792, pico 11216), nao residentes 0, heap 29131/65535 KB
+[init] smss.exe (pid 60) criou smss.exe (pid 148) por NtCreateUserProcess
+[ps] NtCreateUserProcess: wininit.exe pid=0x9c tid=0xa0 handles 0x5c/0x60 arquivo/secao 0x0/0x0 (suspensa)
+[mm] memoria (criado 156): PFN livres 315742/352256 paginas, commit 11240/401408 paginas (maximo 417792, pico 11240), nao residentes 0, heap 29163/65535 KB
+[init] smss.exe (pid 76) criou wininit.exe (pid 156) por NtCreateUserProcess
+[usermode] 148:152 NtOpenKey FALHOU com 0xc0000034 (rip 0x18009d7e4, chamador 0x0) [diag-arquivo] "\Registry\Machine\Software\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\smss.exe"
+[usermode] 148:152 NtSetInformationVirtualMemory FALHOU com 0xc00000bb (rip 0x1800a0994, chamador 0x0)
+[usermode] 156:160 NtOpenKey FALHOU com 0xc0000034 (rip 0x18009d7e4, chamador 0x0) [diag-arquivo] "\Registry\Machine\Software\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\wininit.exe"
+[usermode] NtTerminateProcess(exit=0x0)
+[ps] fim do processo 0xffffc000c0082bb0 pedido: codigo 0x0
+[rpc] \SmApiPort pid 76 -> 60 LPC_PORT_CLOSED(0x5) id 5 atrib 0x0
+[mm] memoria (terminado 76): PFN livres 316118/352256 paginas, commit 11227/401408 paginas (maximo 417792, pico 11247), nao residentes 0, heap 29178/65535 KB
+[ps] NtCreateUserProcess: csrss.exe pid=0xa4 tid=0xa8 handles 0x54/0x58 arquivo/secao 0x0/0x0 (suspensa)
+[mm] memoria (criado 164): PFN livres 314111/352256 paginas, commit 11667/401408 paginas (maximo 417792, pico 11667), nao residentes 0, heap 29402/65535 KB
+[init] smss.exe (pid 148) criou csrss.exe (pid 164) por NtCreateUserProcess
+[usermode] 156:160 NtSetInformationVirtualMemory FALHOU com 0xc00000bb (rip 0x1800a0994, chamador 0x0)
+[ps] NtCreateUserProcess: winlogon.exe pid=0xc8 tid=0xcc handles 0x5c/0x60 arquivo/secao 0x0/0x0 (suspensa)
+[mm] memoria (criado 200): PFN livres 304304/352256 paginas, commit 12617/401408 paginas (maximo 417792, pico 12617), nao residentes 0, heap 30702/65535 KB
+[init] smss.exe (pid 148) criou winlogon.exe (pid 200) por NtCreateUserProcess
+[usermode] 156:160 NtOpenKey FALHOU com 0xc0000034 (rip 0x18009d7e4, chamador 0x0) [diag-arquivo] "\Registry\Machine\System\CurrentControlSet\Control\StateSeparation\RedirectionMap\Keys"
+[usermode] 156:160 NtSetInformationVirtualMemory FALHOU com 0xc00000bb (rip 0x1800a0994, chamador 0x0)
+[usermode] 156:160 NtOpenKey FALHOU com 0xc0000034 (rip 0x18009d7e4, chamador 0x0) [diag-arquivo] "\Registry\Machine\Software\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\wininit.exe"
+[usermode] 156:160 NtOpenKey FALHOU com 0xc0000034 (rip 0x18009d7e4, chamador 0x0) [diag-arquivo] "\Registry\MACHINE\System\CurrentControlSet\Control\SafeBoot\Option"
+[usermode] 156:160 NtOpenKey FALHOU com 0xc0000034 (rip 0x18009d7e4, chamador 0x0) [diag-arquivo] "\Registry\Machine\System\CurrentControlSet\Control\Srp\GP\DLL"
+[usermode] 156:160 NtOpenKey FALHOU com 0xc0000034 (rip 0x18009d7e4, chamador 0x0) [diag-arquivo] "\Registry\Machine\Software\Policies\Microsoft\Windows\Safer\CodeIdentifiers"
+[usermode] 156:160 NtOpenKey FALHOU com 0xc0000034 (rip 0x18009d7e4, chamador 0x0) [diag-arquivo] "\REGISTRY\USER\S-1-5-18\Software\Policies\Microsoft\Windows\Safer\CodeIdentifiers"
+[usermode] NtTerminateProcess(exit=0x0)
+[ps] fim do processo 0xffffc000c009de10 pedido: codigo 0x0
+[rpc] \SmApiPort pid 148 -> 60 LPC_PORT_CLOSED(0x5) id 8 atrib 0x0
+[mm] memoria (terminado 148): PFN livres 303944/352256 paginas, commit 12603/401408 paginas (maximo 417792, pico 12622), nao residentes 0, heap 30720/65535 KB
+ C2=00000000048A0FF8 SP=00000000048A1000
+ C2=00000000048A0FF8 SP=00000000048A1000
+ C2=00000000048A0FF8 SP=00000000048A1000
+ C2=00000000048A0FF8 SP=00000000048A1000
+ C2=00000000048A0FF8 SP=00000000048A1000
+ C2=00000000048A0FF8 SP=00000000048A1000
+ C2=00000000048A0FF8 SP=00000000048A1000
+ C2=00000000048A0FF8 SP=00000000048A1000
+ C2=00000000048A0FF8 SP=00000000048A1000
+ C2=00000000048A0FF8 SP=00000000048A1000
+ C2=00000000048A0FF8 SP=00000000048A1000
+ C2=00000000048A0FF8 SP=00000000048A1000
+[pnp] notificacao de interface 4d1e55b2-... da sessao 1: 0 interface(s) existente(s)
+[kernel-seh] unhandled software exception code=0xc0000005 pc=0xfffff92040469655
+
+*** STOP (KeBugCheckEx): 0x0000001e (0xc0000005, 0xfffff92040469655, 0x0, 0x0)
+[kcrash] excecao 0xc0000005 em 0xfffff92040469655 = win32kfull.sys+0xe9655 (xxxDwmStopRedirection+0x35), leitura de 0x40
+[kcrash] rip=fffff92040469655 rsp=ffffa00701cff0d0 rbp=0000000000000000 rax=0000000000000001 rcx=000000000000b1e0 rdx=0000000000000000 r8=0000000000000000 r9=0000000000000000
+[kcrash] rbx=0000000000000001 rsi=fffff900400bf050 rdi=0000000000000000 r10=0000000000000000 r11=ffffa00701cfeb90 r12=0000000000000000 r13=fffff90040032190 r14=0000000000000001 r15=0000000000000001
+[kcrash] pilha (rsp 0xffffa00701cff0d0): win32kfull.sys+0xe9655 (xxxDwmStopRedirection+0x35) | win32kbase.sys+0x7627e (?LockUnInitialize@tagDomLock@@QEBAXXZ+0x1de) | win32kbase.sys+0x4113a | win32kbase.sys+0x3df75 (UserThreadCallout+0x575)
+[kcrash]   win32kfull.sys+0xe3d46 (W32pThreadCallout+0x76) | win32kbase.sys+0x4f413 (W32CalloutDispatch+0x463) | win32k.sys+0x10d1 (SysEntryGetW32pArgumentTableFilter+0x41) | ntoskrnl.exe+0x47afc3
+[kcrash]   ntoskrnl.exe+0x4b59e4 | ntoskrnl.exe+0xb06875 | ntoskrnl.exe+0xb06b48 | ntoskrnl.exe+0x6c0541
+[kcrash]   ntoskrnl.exe+0xb4e3fa | ntoskrnl.exe+0xb51fd3 | ntoskrnl.exe+0x853430
+[bugcheck] codigo de parada: KMODE_EXCEPTION_NOT_HANDLED
+[bugcheck] o que falhou: win32kfull.sys

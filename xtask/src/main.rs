@@ -6,13 +6,15 @@
 //! cargo xtask test-boot  [MARCADOR] [TIMEOUT_MS] [opções] [--keys=TEXTO] [--expect=TEXTO]... [--hold=MS]
 //!                        [--build-only|--no-build [--image-dir=DIR]] [--kd=com2 --script=ARQ] [--capture=ARQ.png]
 //!                        [--expect-stop] [--watch-screen] [--capture-every=SEGUNDOS]
-//!                        [--expect-poweroff] [--power-cycles=N] [--allow-reboot]
+//!                        [--expect-poweroff] [--power-cycles=N] [--allow-reboot] [--manual-crash]
 //! cargo xtask test-all   [--jobs=N] [--only=ID,...] [--skip=ID,...] [--repeat=N] [--keep] [--cpu-friendly]
 //! cargo xtask capturas   [--jobs=N] [--only=ID,...] [--skip=ID,...] [--keep] [--cpu-friendly]
 //! cargo xtask debug      [opções] [--launch [--no-client [--headless]]] [--connect=HOST:PORTA]
 //!                        [--vm-snapshots | --record=ARQ | --replay=ARQ [--gdb-port=N]]
 //! cargo xtask status     [--reference=NTOSKRNL.EXE]
 //! cargo xtask heap-census [--build-dir=DIR] [--all] [SERIAL.LOG]
+//! cargo xtask crash      [--build-dir=DIR] [--all] [--sem-simbolos] [--sem-download] [SERIAL.LOG]
+//! cargo xtask logsum     SERIAL.LOG [--since=MARCADOR] [--until=MARCADOR] [--boot=N|all] [--all] [--only=LISTA]
 //! cargo xtask nt-types   [--check] [--pdb=ARQ]
 //! ```
 //!
@@ -46,12 +48,14 @@
 extern crate alloc;
 
 mod build;
+mod crash;
 mod debug;
 mod fonts;
 mod heap_census;
 mod hive_image;
 mod host_language;
 mod kernel_pe;
+mod log_summary;
 mod logon_screen;
 mod nt_types;
 mod ntfs_image;
@@ -79,7 +83,7 @@ use std::time::Duration;
 use build::BuildOptions;
 use qemu::{MachineOptions, TestOptions};
 
-const USAGE: &str = "uso: cargo xtask <build|run|test-boot|test-all|capturas|debug|status|nt-types|heap-census> [opcoes]
+const USAGE: &str = "uso: cargo xtask <build|run|test-boot|test-all|capturas|debug|status|nt-types|heap-census|crash|logsum> [opcoes]
   build      compila boot + kernel e monta build/os.img
   run        build + QEMU com janela (serial neste terminal)
   test-boot  build + QEMU sem tela; espera MARCADOR [TIMEOUT_MS]
@@ -95,6 +99,10 @@ const USAGE: &str = "uso: cargo xtask <build|run|test-boot|test-all|capturas|deb
   status     gera docs/site/*.html e docs/status/*.svg (cargo xtask status --help)
   nt-types   gera kernel/src/ntos/inc/types do PDB do ntoskrnl (cargo xtask nt-types --help)
   heap-census  da nomes ao censo do heap do kernel de uma serial (cargo xtask heap-census --help)
+  crash      resume a parada de uma serial: codigo, parametros, culpado, pilha do [kcrash] com
+             nomes, WdLog do dxgkrnl e a primeira tela (cargo xtask crash --help)
+  logsum     resumo compacto de uma serial: marcadores, fim, processos, FALHOU, lacos
+             (cargo xtask logsum --help)
 opcoes de build:   --release --build-dir=DIR --user-program=shell
                    --kernel-test-scope=none|all|disk-stress --console-mirror --start-driver=NOME[,NOME...]
                    --trace-driver-api --initial-process=smss --storage=real|nvme --display=basic
@@ -130,6 +138,9 @@ test-boot:         --keys=TEXTO (\\n = Enter) --expect=TEXTO (repetivel)
                    --power-cycles=N (religa ate N vezes o QEMU que o convidado desligou)
                    --allow-reboot (o reinicio do convidado reinicia a maquina)
                    --expect-stop (o *** STOP do bugcheck faz parte do teste, nao e falha)
+                   --manual-crash (no fim, com o QEMU vivo e sem STOP, a parada manual pelo
+                   teclado: Ctrl direito + Scroll Lock duas vezes, 0xE2; os dados secundarios do
+                   bugcheck, como o WdLog do dxgkrnl, saem na serial e o resumo da parada no fim)
                    no --keys, {combo} vai cru ao sendkey: {ctrl_r-scroll_lock-scroll_lock}";
 
 struct Arguments {
@@ -159,6 +170,8 @@ struct Arguments {
     capture: Option<PathBuf>,
     /// `--expect-stop`: o STOP do bugcheck faz parte do teste.
     expect_stop: bool,
+    /// `--manual-crash`: a parada manual pelo teclado no fim do test-boot.
+    manual_crash: bool,
     /// `--watch-screen`: a vigia da tela do test-boot.
     watch_screen: bool,
     /// `--capture-every=SEGUNDOS`: as telas periódicas do test-boot.
@@ -228,6 +241,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
         headless: false,
         capture: None,
         expect_stop: false,
+        manual_crash: false,
         watch_screen: false,
         capture_every: None,
         expect_poweroff: false,
@@ -292,6 +306,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             "--gdb-port" if parsed.command == "debug" => parsed.gdb_port = Some(required()?.parse().map_err(|_| "--gdb-port invalido")?),
             "--capture" => parsed.capture = Some(PathBuf::from(required()?)),
             "--expect-stop" => parsed.expect_stop = true,
+            "--manual-crash" => parsed.manual_crash = true,
             "--watch-screen" => parsed.watch_screen = true,
             "--capture-every" => match required()?.parse::<u64>() {
                 Ok(seconds) if seconds > 0 => parsed.capture_every = Some(seconds),
@@ -353,6 +368,9 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
     }
     if parsed.capture_every.is_some() && parsed.command != "test-boot" {
         return Err("--capture-every e opcao do test-boot".into());
+    }
+    if parsed.manual_crash && parsed.command != "test-boot" {
+        return Err("--manual-crash e opcao do test-boot".into());
     }
     if parsed.build_only && parsed.no_build {
         return Err("--build-only e --no-build se excluem".into());
@@ -454,6 +472,7 @@ fn execute(arguments: Arguments) -> Result<(), String> {
                     hold: Duration::from_millis(arguments.hold_ms),
                     capture: arguments.capture.map(|path| if path.is_absolute() { path } else { build::workspace_root().join(path) }),
                     expect_stop: arguments.expect_stop,
+                    manual_crash: arguments.manual_crash,
                     power_cycles: arguments.power_cycles,
                     allow_reboot: arguments.allow_reboot,
                     expect_poweroff: arguments.expect_poweroff,
@@ -580,12 +599,14 @@ fn debug_command(arguments: Arguments) -> Result<(), String> {
 
 fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
-    // `status`, `nt-types`, `test-all` e `capturas` têm opções próprias; os dois
-    // primeiros não compilam o kernel.
+    // `status`, `nt-types`, `heap-census`, `crash`, `logsum`, `test-all` e
+    // `capturas` têm opções próprias; só os dois últimos compilam o kernel.
     let result = match arguments.first().map(String::as_str) {
         Some("status") => status::run(&arguments[1..]),
         Some("nt-types") => nt_types::run(&arguments[1..]),
         Some("heap-census") => heap_census::run(&arguments[1..]),
+        Some("crash") => crash::run(&arguments[1..]),
+        Some("logsum") => log_summary::run(&arguments[1..]),
         Some("test-all") => test_all::run(&arguments[1..]),
         Some("capturas") => test_all::capture(&arguments[1..]),
         _ => parse(arguments).and_then(execute),
@@ -617,5 +638,12 @@ mod tests {
             assert!(parse_words(&["test-boot", bad]).is_err(), "{bad}");
         }
         assert!(parse_words(&["run", "--capture-every=5"]).is_err());
+    }
+
+    #[test]
+    fn manual_crash_is_a_test_boot_option() {
+        assert!(parse_words(&["test-boot", "--manual-crash"]).unwrap().manual_crash);
+        assert!(!parse_words(&["test-boot"]).unwrap().manual_crash);
+        assert!(parse_words(&["run", "--manual-crash"]).is_err());
     }
 }

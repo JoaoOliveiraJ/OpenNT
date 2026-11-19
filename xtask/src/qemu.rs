@@ -11,7 +11,11 @@
 //! tela de logon que a vigia do `--watch-screen` confirmou, quando o teste
 //! passou com ela); com
 //! `--capture-every=SEGUNDOS`, a tela vai para `tela-NNNN.png` durante o
-//! teste e para `tela-final.png` no fim ([`FrameSeries`]). Os testes do
+//! teste e para `tela-final.png` no fim ([`FrameSeries`]). Com
+//! `--manual-crash`, o fim do teste manda a parada manual pelo teclado
+//! ([`manual_crash`]) para os dados secundários do bugcheck saírem na serial;
+//! a parada (essa ou a do teste que falhou) sai resumida
+//! ([`crate::crash::summarize`]). Os testes do
 //! desligamento (`--expect-poweroff`, `--power-cycles=N`, `--allow-reboot`)
 //! recebem os eventos SHUTDOWN por um segundo QMP; o reinício do convidado
 //! fica no mesmo QEMU (e no mesmo snapshot do volume) e o religamento depois
@@ -525,6 +529,10 @@ pub struct TestOptions {
     /// `--expect-stop`: o bugcheck faz parte do teste, e o `*** STOP` na
     /// serial deixa de ser falha.
     pub expect_stop: bool,
+    /// `--manual-crash`: no fim do teste (passando ou não), com o QEMU vivo
+    /// e sem STOP na serial, a parada manual pelo teclado ([`manual_crash`])
+    /// para os dados secundários do bugcheck saírem na serial.
+    pub manual_crash: bool,
     /// `--power-cycles=N`: o QEMU que o convidado desliga é religado sobre o
     /// mesmo disco, até N vezes.
     pub power_cycles: u32,
@@ -1033,6 +1041,74 @@ fn type_keys(monitor: &mut TcpStream, text: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// O `sendkey` da parada manual: Ctrl direito segurado e Scroll Lock duas
+/// vezes. O i8042prt.sys real (CrashOnCtrlScroll=1 na semente do Registro)
+/// chama o KeBugCheckEx(0xE2) na ISR do teclado; com CrashDumpEnabled o
+/// kernel publica na serial os dados secundários dos callbacks de motivo,
+/// entre eles o WdLog do dxgkrnl.
+const MANUAL_CRASH_KEYS: &str = "sendkey ctrl_r-scroll_lock-scroll_lock 30\n";
+
+/// As linhas que fecham a parada manual: o fim da coleta dos dados e o
+/// reinício ou a parada da máquina.
+const MANUAL_CRASH_DONE: &[&str] = &["[bugcheck] coleta de dados do erro: 100%", "[bugcheck] callbacks:", "[bugcheck] reiniciando", "[bugcheck] maquina parada"];
+
+/// Quanto a parada manual espera os dados secundários.
+const MANUAL_CRASH_WAIT: Duration = Duration::from_secs(120);
+
+/// `--manual-crash`: com o QEMU vivo e sem STOP na serial, manda a parada
+/// manual pelo monitor HMP e espera os dados secundários chegarem (ou o QEMU
+/// sair). A linha `[xtask]` que a anuncia fica no log.
+fn manual_crash(port: u16, machine: &mut Machine, output: &Arc<Mutex<String>>) {
+    if !matches!(machine.process.0.try_wait(), Ok(None)) {
+        println!("\n[xtask] --manual-crash: o QEMU ja tinha terminado");
+        return;
+    }
+    if output.lock().unwrap().contains("*** STOP") {
+        println!("\n[xtask] --manual-crash: a serial ja tem um STOP; nada a provocar");
+        return;
+    }
+    let start = {
+        let mut text = output.lock().unwrap();
+        let note = "\n[xtask] parada manual pelo teclado (Ctrl direito + Scroll Lock duas vezes) pelo monitor do QEMU\n";
+        print!("{note}");
+        text.push_str(note);
+        text.len()
+    };
+    let mut monitor = match connect_monitor(port, Instant::now() + Duration::from_secs(5)) {
+        Ok(monitor) => monitor,
+        Err(error) => {
+            eprintln!("aviso: --manual-crash: {error}");
+            return;
+        }
+    };
+    if let Err(error) = monitor.write_all(MANUAL_CRASH_KEYS.as_bytes()) {
+        eprintln!("aviso: --manual-crash: monitor HMP: {error}");
+        return;
+    }
+    let deadline = Instant::now() + MANUAL_CRASH_WAIT;
+    loop {
+        {
+            let text = output.lock().unwrap();
+            let tail = &text[start.min(text.len())..];
+            if MANUAL_CRASH_DONE.iter().any(|marker| tail.contains(marker)) {
+                break;
+            }
+        }
+        if !matches!(machine.process.0.try_wait(), Ok(None)) {
+            machine.drain();
+            break;
+        }
+        if Instant::now() > deadline {
+            eprintln!("aviso: --manual-crash: os dados do bugcheck nao terminaram em {} s", MANUAL_CRASH_WAIT.as_secs());
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    // As últimas linhas (o reinício) ainda estão chegando.
+    thread::sleep(Duration::from_millis(500));
+    drop(monitor);
+}
+
 struct QemuProcess(Child);
 
 impl Drop for QemuProcess {
@@ -1469,6 +1545,9 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
             }
         }
     }
+    if test.manual_crash {
+        manual_crash(port, &mut machine, &output);
+    }
     drop(machine.process);
     machine.reader.take();
     drop(simulator);
@@ -1479,13 +1558,22 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
     let text = output.lock().unwrap().clone();
     std::fs::write(log, &text).map_err(|error| format!("{}: {error}", log.display()))?;
     println!();
+    // A parada (a do teste que falhou ou a manual) sai resumida, com a pilha
+    // do [kcrash] e o WdLog do dxgkrnl.
+    let stopped = text.contains("*** STOP") || text.contains("*** EXCECAO DE KERNEL");
     match result {
         Ok(()) => {
+            if test.manual_crash && stopped {
+                crate::crash::summarize(log, &text);
+            }
             println!("TEST-BOOT OK: {:?} encontrado (serial em {})", test.marker, log.display());
             Ok(())
         }
         Err(error) => {
             crate::heap_census::summarize_failure(log, &text);
+            if stopped {
+                crate::crash::summarize(log, &text);
+            }
             Err(format!("TEST-BOOT FALHOU: {error} (serial em {})", log.display()))
         }
     }
