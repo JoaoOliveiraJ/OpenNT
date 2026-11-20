@@ -31,6 +31,12 @@
 //!   CLIENT_ID do servidor), com um pedido síncrono; o servidor recebe esse
 //!   pedido e responde com RELEASE_MESSAGE, que chega como LPC_REPLY e não se
 //!   responde mais;
+//! - o handle que a resposta ALPC leva (o token do UMgrLogonUser do
+//!   UserManager ao winlogon): o servidor responde com o atributo de handles
+//!   de um token; o cliente com as flags da porta de cliente do RPC recebe a
+//!   forma indireta, pede o token pela classe 3 e solta a mensagem reenviando
+//!   o MessageId sem atributos; o cliente só com ALLOW_DUP_OBJECT recebe o
+//!   handle já duplicado no atributo;
 //! - o tick que não aninha: um processo de kernel em execução que é dado como
 //!   pronto continua em execução (não entra na fila), e a espera dele deixa a
 //!   CPU sem girar o escalonador na pilha dele; ela vence pelo prazo com
@@ -60,7 +66,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use super::phase6::{call_export, kernel_handle_attributes, object_attributes_for, port_message_with, unicode_string_for};
 use crate::ntos::alpc::lpc;
 use crate::nano::interrupts;
-use crate::ntos::inc::types::{Kdpc, Kevent, Kqueue, Kthread, NtStruct, PortMessage};
+use crate::ntos::inc::types::{AlpcHandleAttr, AlpcMessageHandleInformation, AlpcPortAttributes, Kdpc, Kevent, Kqueue, Kthread, NtStruct, PortMessage};
 use crate::ntos::ke::{clock, dispatcher, thread_dispatch, wait};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::ob::object_manager;
@@ -611,6 +617,186 @@ fn alpc_answer_pair(assert: Assert) {
     guest::free_bytes(block);
 }
 
+// ---- o handle que a resposta ALPC leva -------------------------------------
+
+/// O bloco usa os campos do par ALPC e mais: [0x90] o ALPC_PORT_ATTRIBUTES do
+/// cliente, [0x340] o ALPC_MESSAGE_ATTRIBUTES de envio do servidor com o
+/// ALPC_HANDLE_ATTR, [0x360] o handle do token do servidor, [0x808] o
+/// ALPC_MESSAGE_HANDLE_INFORMATION da classe 3, [0x820] o ReturnLength,
+/// [0x828] o ALPC_MESSAGE_ATTRIBUTES de recepção do cliente com o
+/// ALPC_HANDLE_ATTR, [0x850] o ALPC_MESSAGE_ATTRIBUTES vazio do reenvio,
+/// [0x860] o TOKEN_TYPE consultado, [0x868] o comprimento dele e [0x870] a
+/// rodada (0 indireta, 1 direta). Resultados:
+/// [0] criação, [1] conexão recebida, [2] aceitação, [3] pedido recebido, [4]
+/// o token aberto, [5] a resposta com o atributo de handles, [6] conexão do
+/// cliente, [7] o pedido síncrono, [8] o ValidAttributes da recepção, [9]
+/// Flags << 32 | ObjectType do ALPC_HANDLE_ATTR recebido, [10] o Handle dele,
+/// [11] a classe 3 do índice 0, [12] ObjectType << 32 | GrantedAccess dela,
+/// [13] status << 32 | TOKEN_TYPE do handle recebido, [14] o reenvio da
+/// resposta sem atributos (o DropMsgAttributes do RPC), [15] a classe 3 depois
+/// do reenvio, [16] o DesiredAccess do ALPC_HANDLE_ATTR recebido.
+const ALPC_HANDLE_NAMES: [&str; 2] = ["\\OpenNtAlpcHandleIndirect", "\\OpenNtAlpcHandleDirect"];
+const ALPC_MESSAGE_HANDLE_ATTRIBUTE: u32 = 0x1000_0000;
+/// TOKEN_QUERY.
+const TOKEN_QUERY: u64 = 8;
+
+extern "win64" fn alpc_handle_server(block: u64) {
+    let (server_out, communication_out, length, attributes, receive, reply, send_attributes, token_out) = (block, block + 8, block + 0x10, block + 0x40, block + 0x100, block + 0x300, block + 0x340, block + 0x360);
+    let name = ALPC_HANDLE_NAMES[guest::read64(block + 0x870) as usize & 1];
+    let object_attributes = object_attributes_for(block + 0x700, name, 0x200);
+    let created = call_export("ZwAlpcCreatePort", &[server_out, object_attributes, attributes]).unwrap_or(u64::MAX);
+    record(block, 0, created);
+    call_export("KeSetEvent", &[block + 0x28, 0, 0]);
+    if created != 0 {
+        return;
+    }
+    let server = guest::read64(server_out);
+    let next = || {
+        guest::write64(length, 0x200);
+        call_export("ZwAlpcSendWaitReceivePort", &[server, 0, 0, 0, receive, length, 0, 0]).unwrap_or(u64::MAX)
+    };
+    // SAFETY: PORT_MESSAGE recebido.
+    let message = unsafe { PortMessage::at(receive) };
+    record(block, 1, next());
+    let unnamed = kernel_handle_attributes();
+    record(block, 2, call_export("ZwAlpcAcceptConnectPort", &[communication_out, server, 0, unnamed, 0, 0xC0DE, receive, 0, 1]).unwrap_or(u64::MAX));
+    guest::free_bytes(unnamed);
+    record(block, 3, next());
+    // O token do próprio processo (System), como o do logon que o
+    // UserManager devolve ao winlogon, num handle de kernel.
+    let opened = call_export("ZwOpenProcessTokenEx", &[u64::MAX, TOKEN_QUERY, 0x200, token_out]).unwrap_or(u64::MAX);
+    record(block, 4, opened);
+    if opened != 0 {
+        return;
+    }
+    let token = guest::read64(token_out);
+    port_message_with(reply, b"TOKN");
+    // SAFETY: PORT_MESSAGE montado acima.
+    unsafe { PortMessage::at(reply) }.message_id.set(message.message_id.get());
+    guest::write_bytes(send_attributes, &[0u8; 0x20]);
+    guest::write32(send_attributes, ALPC_MESSAGE_HANDLE_ATTRIBUTE);
+    guest::write32(send_attributes + 4, ALPC_MESSAGE_HANDLE_ATTRIBUTE);
+    let attribute = send_attributes + 8;
+    guest::write64(attribute + core::mem::offset_of!(AlpcHandleAttr, handle) as u64, token);
+    guest::write32(attribute + core::mem::offset_of!(AlpcHandleAttr, desired_access) as u64, TOKEN_QUERY as u32);
+    let communication = guest::read64(communication_out);
+    // A resposta com RELEASE_MESSAGE (o LPC_REPLY do RPC do servidor).
+    record(block, 5, call_export("ZwAlpcSendWaitReceivePort", &[communication, 0x1_0000, reply, send_attributes, 0, 0, 0, 0]).unwrap_or(u64::MAX));
+    // A mensagem tem a própria referência ao token.
+    call_export("ZwClose", &[token]);
+}
+
+extern "win64" fn alpc_handle_client(block: u64) {
+    let (client_out, length, attributes, connect, exchange) = (block + 0x20, block + 0x18, block + 0x90, block + 0x400, block + 0x500);
+    let (information, returned, receive_attributes, drop_attributes, token_type) = (block + 0x808, block + 0x820, block + 0x828, block + 0x850, block + 0x860);
+    let ready = call_export("KeWaitForSingleObject", &[block + 0x28, 0, 0, 0, 0]).unwrap_or(u64::MAX);
+    if ready != 0 || guest::read64(block + RESULTS) != 0 {
+        record(block, 6, ready | 0x1_0000_0000);
+        return;
+    }
+    let name = guest::read64(block + 0x800);
+    port_message_with(connect, b"HELO");
+    guest::write64(length, 0x100);
+    let connected = call_export("ZwAlpcConnectPort", &[client_out, name, 0, attributes, 0x2_0000, 0, connect, length, 0, 0, 0]).unwrap_or(u64::MAX);
+    record(block, 6, connected);
+    if connected != 0 {
+        return;
+    }
+    let client = guest::read64(client_out);
+    port_message_with(exchange, b"LOGN");
+    guest::write64(length, 0x200);
+    guest::write_bytes(receive_attributes, &[0u8; 0x20]);
+    guest::write32(receive_attributes, ALPC_MESSAGE_HANDLE_ATTRIBUTE);
+    record(block, 7, call_export("ZwAlpcSendWaitReceivePort", &[client, 0x2_0000, exchange, 0, exchange, length, receive_attributes, 0]).unwrap_or(u64::MAX));
+    record(block, 8, guest::read32(receive_attributes + 4) as u64);
+    let attribute = receive_attributes + 8;
+    record(block, 9, (guest::read32(attribute + core::mem::offset_of!(AlpcHandleAttr, flags) as u64) as u64) << 32 | guest::read32(attribute + core::mem::offset_of!(AlpcHandleAttr, object_type) as u64) as u64);
+    let direct = guest::read64(attribute + core::mem::offset_of!(AlpcHandleAttr, handle) as u64);
+    record(block, 10, direct);
+    record(block, 16, guest::read32(attribute + core::mem::offset_of!(AlpcHandleAttr, desired_access) as u64) as u64);
+    let query = || {
+        guest::write_bytes(information, &[0u8; AlpcMessageHandleInformation::SIZE as usize]);
+        guest::write32(returned, 0);
+        call_export("ZwAlpcQueryInformationMessage", &[client, exchange, 3, information, AlpcMessageHandleInformation::SIZE, returned]).unwrap_or(u64::MAX)
+    };
+    let queried = query();
+    record(block, 11, queried);
+    // SAFETY: ALPC_MESSAGE_HANDLE_INFORMATION do teste.
+    let entry = unsafe { AlpcMessageHandleInformation::at(information) };
+    record(block, 12, (entry.object_type.get() as u64) << 32 | entry.granted_access.get() as u64);
+    // O handle recebido, direto no atributo ou pela classe 3 (um handle de
+    // kernel: o bit 31 estende o sinal).
+    let token = if direct != 0 { direct } else if queried == 0 { entry.handle.get() as i32 as u64 } else { 0 };
+    if token != 0 {
+        let status = call_export("ZwQueryInformationToken", &[token, 8, token_type, 4, token_type + 8]).unwrap_or(u64::MAX);
+        record(block, 13, status << 32 | guest::read32(token_type) as u64);
+        call_export("ZwClose", &[token]);
+    }
+    // O reenvio da resposta recebida, sem flags e com os atributos vazios.
+    guest::write64(drop_attributes, 0);
+    record(block, 14, call_export("ZwAlpcSendWaitReceivePort", &[client, 0, exchange, drop_attributes, 0, 0, 0, 0]).unwrap_or(u64::MAX));
+    record(block, 15, query());
+    call_export("ZwClose", &[client]);
+}
+
+/// Uma rodada do par com o cliente nas flags `client_flags`; devolve os
+/// resultados.
+fn alpc_handle_round(direct: bool, client_flags: u32) -> (bool, Vec<u64>) {
+    let block = guest::alloc_bytes(0xA00);
+    guest::write_bytes(block, &alloc::vec![0; 0xA00]);
+    for index in 0..17 {
+        record(block, index, PENDING_RESULT);
+    }
+    guest::write64(block + 0x870, direct as u64);
+    dispatcher::initialize_event(block + 0x28, 0, false);
+    // SAFETY: ALPC_PORT_ATTRIBUTES do teste.
+    unsafe { AlpcPortAttributes::at(block + 0x40) }.max_message_length.set(0x200);
+    // SAFETY: ALPC_PORT_ATTRIBUTES do cliente.
+    let client = unsafe { AlpcPortAttributes::at(block + 0x90) };
+    client.flags.set(client_flags);
+    client.max_message_length.set(0x200);
+    client.dup_object_types.set(0xFFD);
+    let name = unicode_string_for(ALPC_HANDLE_NAMES[direct as usize]);
+    guest::write64(block + 0x800, name);
+    let (server_handle, server) = start(alpc_handle_server, block);
+    let (client_handle, client) = start(alpc_handle_client, block);
+    let finished = server != 0 && client != 0 && pump(20_000, &|| kernel_threads::is_terminated(server) && kernel_threads::is_terminated(client));
+    let results: Vec<u64> = (0..17).map(|index| guest::read64(block + RESULTS + index * 8)).collect();
+    let _ = call_export("ZwClose", &[guest::read64(block + 8)]);
+    let _ = call_export("ZwClose", &[guest::read64(block)]);
+    for handle in [server_handle, client_handle] {
+        let _ = object_manager::close(handle as u32);
+    }
+    guest::free_bytes(name);
+    guest::free_bytes(block);
+    (finished, results)
+}
+
+/// O token que a resposta do UserManager leva ao winlogon (um [system_handle]
+/// do RPC): o servidor responde com o ALPC_HANDLE_ATTR de um token e o cliente
+/// o recebe pelas regras da porta dele. Com as flags da porta de cliente do
+/// RPC (0x2090000: ALLOW_MULTIHANDLE_ATTRIBUTE e ALLOW_DUP_OBJECT) a recepção
+/// traz {INDIRECT, 1 handle}, a classe 3 duplica o token e a mensagem segue
+/// resolvível até o reenvio sem atributos; só com ALLOW_DUP_OBJECT (0x80000) o
+/// atributo traz o handle já duplicado, o tipo Token (0x200) e o acesso, e a
+/// mensagem sai na recepção.
+fn alpc_reply_handle_pair(assert: Assert) {
+    let (finished, results) = alpc_handle_round(false, 0x209_0000);
+    debug_print!("[kwait] handle da resposta ALPC, forma indireta: {:x?}", results);
+    let setup = results[..8].iter().all(|&status| status == 0);
+    assert(
+        finished && setup && results[8] as u32 & ALPC_MESSAGE_HANDLE_ATTRIBUTE != 0 && results[9] == (0x4_0000 << 32 | 1) && results[10] == 0 && results[11] == 0 && results[12] == (0x200 << 32 | TOKEN_QUERY) && results[13] == 1 && results[14] == 0 && results[15] as u32 == 0xC000_0702,
+        "kwait: resposta ALPC com o atributo de handles de um token, cliente com ALLOW_MULTIHANDLE_ATTRIBUTE: {INDIRECT, 1}, a classe 3 duplica o token e o reenvio sem atributos solta a mensagem",
+    );
+    let (finished, results) = alpc_handle_round(true, 0x8_0000);
+    debug_print!("[kwait] handle da resposta ALPC, forma direta: {:x?}", results);
+    let setup = results[..8].iter().all(|&status| status == 0);
+    assert(
+        finished && setup && results[8] as u32 & ALPC_MESSAGE_HANDLE_ATTRIBUTE != 0 && results[9] == 0x200 && results[10] >> 31 == 0x1_FFFF_FFFF && results[16] == TOKEN_QUERY && results[11] as u32 == 0xC000_0702 && results[13] == 1 && results[14] as u32 == 0xC000_0702 && results[15] as u32 == 0xC000_0702,
+        "kwait: resposta ALPC com o atributo de handles de um token, cliente so com ALLOW_DUP_OBJECT: o handle ja duplicado no atributo, do tipo Token, e a mensagem sai na recepcao",
+    );
+}
+
 // ---- o tick que não aninha ------------------------------------------------
 
 /// [0] status da espera, [1] estado da thread depois de ser dada como
@@ -1043,6 +1229,7 @@ pub fn run(assert: Assert) {
     alpc_kernel_pair(assert);
     lpc_kernel_pair(assert);
     alpc_answer_pair(assert);
+    alpc_reply_handle_pair(assert);
     shared_queue_waiters(assert, true);
     shared_queue_waiters(assert, false);
 }
