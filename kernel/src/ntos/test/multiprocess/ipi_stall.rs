@@ -80,11 +80,13 @@ pub fn run(assert: Assert) {
 
     // A espera sem prazo: o alvo que responde depois do diagnóstico ainda
     // conclui (o flush de TLB do 19041 gira no PacketBarrier sem limite).
-    let start = clock::uptime_ms();
-    let arrival = start + 60;
-    let slow = smp::wait_on_targets(20, "autoteste de IPI lento", || if clock::uptime_ms() < arrival { 0b100 } else { 0 });
-    let waited = clock::uptime_ms() - start;
-    assert(slow.slow == 0b100 && slow.elapsed_ms >= 60 && waited >= 60, "ipi: o alvo que responde depois do diagnostico conclui a espera sem prazo, dado como lento, sem parar o sistema");
+    // A chegada pelo mesmo contador de desempenho que a espera lê.
+    let counter = clock::query_performance_counter_value;
+    let start = counter();
+    let arrival = start + 60 * clock::QPC_FREQUENCY / 1000;
+    let slow = smp::wait_on_targets(20, "autoteste de IPI lento", || if counter() < arrival { 0b100 } else { 0 });
+    let waited = (counter() - start) * 1000 / clock::QPC_FREQUENCY;
+    assert(slow.slow == 0b100 && waited >= 60 && slow.elapsed_ms <= waited, "ipi: o alvo que responde depois do diagnostico conclui a espera sem prazo, dado como lento, sem parar o sistema");
     let arrival = clock::uptime_ms() + 5;
     let prompt = smp::wait_on_targets(2_000, "autoteste de IPI", || if clock::uptime_ms() < arrival { 0b10 } else { 0 });
     assert(prompt.slow == 0 && prompt.elapsed_ms < 2_000, "ipi: o alvo que responde antes do diagnostico conclui a espera sem ser dado como lento");
