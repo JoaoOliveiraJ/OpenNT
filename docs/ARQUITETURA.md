@@ -5209,6 +5209,12 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   autenticação do RPC em `SOFTWARE\Microsoft\Rpc\SecurityService`, também
   copiado. O marcador `LSA_POLICY_READY` sai quando o lsass publica o
   `\RPC Control\LSARPC_ENDPOINT` (o LsapRPCInit).
+- **AlpcWaitForPortReferences** (`alpc/query_information.rs`, a classe 11
+  do NtAlpcQueryInformation que o TpWaitForAlpcCompletion da ntdll pede ao
+  desmontar um TP_ALPC): cada envio com o bit 18 (0x40000) das flags, de
+  modo usuário, de modo kernel ou do trabalho adiado do worker factory,
+  conta uma referência na porta (o ALPC_PORT.ReferenceNo); a consulta
+  espera, alertável, o número dado, com um esperador por porta.
 - **O RPC local entre o services.exe e o lsass.exe**: um pedido a um
   servidor ALPC de modo usuário (`alpc/server.rs`) chega com o MessageId do
   servidor. O NtAlpcQueryInformationMessage das classes de token

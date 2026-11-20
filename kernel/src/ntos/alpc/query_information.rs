@@ -2,6 +2,14 @@
 //!
 //! Estado básico da porta e SID do processo conectado; Nt e Zw
 //! compartilham objetos e serialização, com a sondagem de cada modo.
+//!
+//! AlpcWaitForPortReferences (classe 11; AlpcpWaitForPortReferences,
+//! ntoskrnl 19041 0x66164c), que o TpWaitForAlpcCompletion da ntdll pede
+//! ao desmontar um TP_ALPC: espera o ALPC_PORT.ReferenceNo chegar ao valor
+//! dado. Cada NtAlpcSendWaitReceivePort com o bit 18 (0x40000) das flags e
+//! cada trabalho adiado do NtWaitForWorkViaWorkerFactory com o mesmo bit
+//! conta uma referência na porta (AlpcpTrackPortReferences 0x69b178) e
+//! acorda quem espera aquele número.
 
 use alloc::sync::Arc;
 
@@ -184,6 +192,96 @@ fn query_server_session(port: Option<&Arc<Port>>, output: u64, length: u32, retu
     Ok(if written != 0 { written } else { status })
 }
 
+/// O bit das flags de envio (e das do trabalho adiado do worker factory)
+/// que conta uma referência na porta.
+pub const TRACK_PORT_REFERENCES: u32 = 0x4_0000;
+/// SynchronizationEvent.
+const SYNCHRONIZATION_EVENT: u8 = 1;
+/// KWAIT_REASON WrUserRequest.
+const WR_USER_REQUEST: u8 = 13;
+const KERNEL_MODE: u8 = 0;
+const STATUS_THREAD_IS_TERMINATING: u32 = 0xC000_004B;
+
+/// AlpcpTrackPortReferences: ReferenceNo + 1; quem espera exatamente o
+/// número novo é acordado (KeSetEvent do bloco de espera).
+pub fn track_port_references(port: &Arc<Port>) {
+    let wake = port.with(|state| {
+        state.reference_no = state.reference_no.wrapping_add(1);
+        state.reference_wait.filter(|&(_, target)| target == state.reference_no).map(|(event, _)| event)
+    });
+    if let Some(event) = wake {
+        crate::ntos::ke::dispatcher::set_event(event);
+    }
+}
+
+/// AlpcpWaitForPortReferences(Port, Buffer, Length, ReturnLength,
+/// PreviousMode): porta e exatamente 4 bytes (o ReferenceNo esperado),
+/// senão STATUS_INVALID_PARAMETER; o ReturnLength recebe 0. Com o número já
+/// alcançado, sucesso; senão, sob o lock da porta, um segundo esperador é
+/// STATUS_INVALID_PARAMETER, e o primeiro põe o bloco de espera e espera o
+/// evento de sincronização (WrUserRequest, KernelMode, alertável, sem
+/// prazo). Um alerta ou APC volta a esperar, a menos que a thread esteja
+/// terminando (STATUS_THREAD_IS_TERMINATING). O bloco sai da porta no fim.
+fn wait_for_port_references(port: Option<&Arc<Port>>, buffer: u64, length: u32, returned: u64, mode: u8) -> Result<u32, KernelError> {
+    use crate::ntos::inc::types::Kevent;
+    use crate::ntos::ke::{dispatcher, wait};
+    let Some(port) = port else { return Ok(INVALID_PARAMETER) };
+    if length != 4 {
+        return Ok(INVALID_PARAMETER);
+    }
+    let target = if mode != 0 {
+        match read_field::<i32>(buffer.min(USER_LIMIT), 0) {
+            Ok(target) => target,
+            Err(status) => return Ok(status),
+        }
+    } else {
+        guest::read32(buffer) as i32
+    };
+    if returned != 0 {
+        if let Err(status) = write_field::<u32>(returned, 0, 0) {
+            return Ok(status);
+        }
+    }
+    if port.with(|state| state.reference_no) == target {
+        return Ok(0);
+    }
+    let event = guest::alloc_bytes(Kevent::SIZE);
+    if event == 0 {
+        return Ok(crate::ntos::inc::status::STATUS_INSUFFICIENT_RESOURCES);
+    }
+    dispatcher::initialize_event(event, SYNCHRONIZATION_EVENT, false);
+    let armed = port.with(|state| {
+        if state.reference_wait.is_some() {
+            return Err(INVALID_PARAMETER);
+        }
+        if state.reference_no == target {
+            return Ok(false);
+        }
+        state.reference_wait = Some((event, target));
+        Ok(true)
+    });
+    let status = match armed {
+        Err(status) => status,
+        Ok(false) => 0,
+        Ok(true) => {
+            let thread = process::get_current_thread();
+            let status = loop {
+                let status = wait::wait_for_objects(&[event], false, wait::Deadline::Infinite, KERNEL_MODE, true, WR_USER_REQUEST);
+                if status == 0 {
+                    break 0;
+                }
+                if crate::ntos::ps::thread_accessors::is_terminating(thread) {
+                    break STATUS_THREAD_IS_TERMINATING;
+                }
+            };
+            port.with(|state| state.reference_wait = None);
+            status
+        }
+    };
+    guest::free_bytes(event);
+    Ok(status)
+}
+
 pub fn query(handle: u64, class: u32, output: u64, length: u32, returned: u64, mode: u8) -> Result<u32, KernelError> {
     critical_region::enter_critical()?;
     let mut reference: Option<PortReference> = None;
@@ -215,8 +313,9 @@ pub fn query(handle: u64, class: u32, output: u64, length: u32, returned: u64, m
             0 => Ok(query_basic(port.as_ref(), output, length, returned, mode)),
             3 => query_connected_sid(port.as_ref(), output, returned, mode),
             12 => query_server_session(port.as_ref(), output, length, returned, mode),
-            // Servidor e espera de referências exigem operações próprias.
-            4 | 11 => Ok(0xC000_00BB),
+            11 => wait_for_port_references(port.as_ref(), output, length, returned, mode),
+            // AlpcServerInformation exige operações próprias.
+            4 => Ok(0xC000_00BB),
             _ => Ok(INVALID_PARAMETER),
         }
     })();

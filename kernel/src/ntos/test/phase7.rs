@@ -5780,6 +5780,24 @@ fn user_alpc_zw_group(assert: Assert) {
     unsafe { nt::PortMessage::at(input) }.message_id.set(0);
     let no_message = zw("ZwAlpcQueryInformationMessage", &[handle, input, 0, output, 64, 0]);
     assert(basic == Some(0) && unsafe { nt::AlpcBasicInformation::at(output) }.sequence_no.get() == port.sequence() && guest::read32(block + 0x480) == 16 && unsupported == Some(0xC000_0004) && no_message == Some(0xC000_000D), "zwalpc: consultas e set-information");
+    // AlpcWaitForPortReferences (11): o ReferenceNo já alcançado volta na
+    // hora com 0 no ReturnLength; um envio com o bit 18 (0x40000) conta uma
+    // referência na porta; comprimento diferente de 4 é
+    // STATUS_INVALID_PARAMETER.
+    let references = port.with(|state| state.reference_no);
+    let target = block + 0x4C0;
+    guest::write32(target, references as u32);
+    guest::write32(block + 0x480, 0x5555);
+    let reached = zw("ZwAlpcQueryInformation", &[handle, 11, target, 4, block + 0x480]);
+    let reached_length = guest::read32(block + 0x480);
+    let bad_length = zw("ZwAlpcQueryInformation", &[handle, 11, target, 8, 0]);
+    message(input, &[7, 8, 9]);
+    guest::write64(length, 0x100);
+    let _ = zw("ZwAlpcSendWaitReceivePort", &[handle, 0x2_0000 | 0x4_0000, input, 0, output, length, 0, 0]);
+    let counted = port.with(|state| state.reference_no) == references.wrapping_add(1);
+    guest::write32(target, references.wrapping_add(1) as u32);
+    let after = zw("ZwAlpcQueryInformation", &[handle, 11, target, 4, 0]);
+    assert(reached == Some(0) && reached_length == 0 && bad_length == Some(0xC000_000D) && counted && after == Some(0) && port.with(|state| state.reference_wait.is_none()), "zwalpc: AlpcWaitForPortReferences com o ReferenceNo alcancado e o envio que conta referencia");
     // Recursos: contexto, reserva, seção e vista.
     let attribute = block + 0x500;
     let security_attribute = unsafe { nt::AlpcSecurityAttr::at(attribute) };

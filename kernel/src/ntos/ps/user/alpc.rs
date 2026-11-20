@@ -1395,6 +1395,11 @@ fn send_receive(handle: u64, flags: u64, input: u64, send_attributes: u64, rsp: 
     };
     let port = reference.port.clone();
     let index = reference.handle_index;
+    // NtAlpcSendWaitReceivePort 0x5e7a91: o bit 18 conta a referência logo
+    // depois de referenciar a porta.
+    if flags as u32 & crate::ntos::alpc::query_information::TRACK_PORT_REFERENCES != 0 {
+        crate::ntos::alpc::query_information::track_port_references(&port);
+    }
     let result = (|| -> Result<u32, KernelError> {
         if !state::probe_syscall_stack(rsp, 32) {
             return Ok(AV);
@@ -1438,6 +1443,11 @@ pub fn deferred_send(handle: u64, flags: u32, input: u64) -> Result<u32, KernelE
         Err(status) => return Ok(status),
     };
     let port = reference.port.clone();
+    // NtWaitForWorkViaWorkerFactory 0x2036ed: o mesmo bit nas flags do
+    // trabalho adiado.
+    if flags & crate::ntos::alpc::query_information::TRACK_PORT_REFERENCES != 0 {
+        crate::ntos::alpc::query_information::track_port_references(&port);
+    }
     let receive = ReceiveArguments { output: 0, length: 0, receive_attributes: 0, timeout: 0 };
     let result = port.run(|| {
         if port.kind == "alpc" && crate::ntos::alpc::server::owns(&port) {
@@ -1463,6 +1473,9 @@ fn begin_kernel_exchange(arguments: &[u64; 8]) -> Result<Box<dyn Pending>, Kerne
         Err(status) => return Ok(Box::new(Completed(status))),
     };
     let port = reference.port.clone();
+    if arguments[1] as u32 & crate::ntos::alpc::query_information::TRACK_PORT_REFERENCES != 0 {
+        crate::ntos::alpc::query_information::track_port_references(&port);
+    }
     let receive = ReceiveArguments { output: arguments[4], length: arguments[5], receive_attributes: arguments[6], timeout: arguments[7] };
     // O lado servidor de uma conexão (porta de conexão ou de comunicação de
     // um servidor de kernel) tem a fila e as respostas próprias.

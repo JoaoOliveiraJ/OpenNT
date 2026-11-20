@@ -150,6 +150,12 @@ pub struct PortState {
     pub reserves: BTreeMap<u32, Arc<Reserve>>,
     /// Vistas da seção de transferência LPC (local e supervisor).
     pub views: Vec<Arc<crate::ntos::ps::user::sections::View>>,
+    /// ALPC_PORT.ReferenceNo: as referências contadas pelo
+    /// AlpcpTrackPortReferences (`alpc/query_information.rs`).
+    pub reference_no: i32,
+    /// ALPC_PORT.ReferenceNoWait: o KEVENT e o ReferenceNo que o
+    /// AlpcWaitForPortReferences espera.
+    pub reference_wait: Option<(u64, i32)>,
 }
 
 pub struct Port {
