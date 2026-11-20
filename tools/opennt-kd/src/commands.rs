@@ -35,7 +35,7 @@
 //! addr <nome>                nome -> endereco
 //! xs [modulo!]padrao         simbolos que casam com o padrao (`*` e `?`)
 //! dt [modulo!]<tipo> [expr]  struct campo a campo (o PDB do ntoskrnl ou o do modulo)
-//! thread <n>                 processador das leituras (thread n = CPU n-1)
+//! thread [n]                 processador das leituras (thread n = CPU n-1; sem n, o escolhido)
 //! context <ethread>          registradores de uma thread (fora da CPU: quadro de troca)
 //! btt <ethread> [n]          pilha de uma thread pelo quadro de troca
 //! cpulist                    processadores parados (threads do protocolo)
@@ -50,8 +50,8 @@
 //! monitor <texto>            comando do OpenNT no alvo
 //! .process [pid|eprocess|0]  processo das leituras e dos breakpoints de usuario
 //! lmu                        modulos de usuario do processo escolhido (PEB.Ldr e VAD)
-//! handles | vad | uthreads <pid> [i]   handles, regioes e threads de usuario de um processo
-//! ustack <tid> [n]           pilha de usuario de uma thread do processo escolhido
+//! handles | vad | uthreads [pid] [i]   handles, regioes e threads de usuario de um processo (sem pid: o do .process)
+//! ustack <tid|expr> [n]      pilha de usuario de uma thread do processo escolhido
 //! kmap | events | uex [on|off]   faixas do sistema, ultimos eventos, excecoes do anel 3
 //! sxe | sxd cpr[:nome] | epr[:nome] | ct[:pid] | et[:pid] | ld:processo!dll   eventos
 //! bp <expr> /log "texto {expr}" | /cmd "r; k" | /g grupo   log, comandos de parada, grupo
@@ -94,11 +94,11 @@ ba <e|w|r><1|2|4|8> <expr> | watch/unwatch <expr> <bytes> [w|a] | sxe/sxd ld:<mo
 bpm <a|w|x> <expr> [bytes] | bpmc <expr> (breakpoint de memoria por pagina, no processo escolhido)
 bt [n] [kernel] | k [n] [kernel] | btt <ethread> [n] [kernel] (kernel: sem a pilha do anel 3) | context <ethread>
 ? <expr> | sym <expr> | ln <expr> | addr <nome> | xs [mod!]padrao
-dt [mod!]<tipo> [expr] | thread <n> | cpulist | modules | lmv <modulo> | .reload [/f] [/w]
+dt [mod!]<tipo> [expr] | thread [n] | cpulist | modules | lmv <modulo> | .reload [/f] [/w]
 ps | threads [pid] | lm | cpus | irql | obj <caminho> | log [bytes] | bugcheck | kd | monitor <texto>
 !process [pid|eprocess] | !thread [ethread] | !irp <expr> | !devobj <expr|caminho> | !drvobj <expr|caminho>
 !object <caminho> | !handle <pid> <handle> | !analyze
-.process [pid|eprocess|0] | lmu | handles/vad/uthreads <pid> [i] | ustack <tid> [n] | kmap | events | uex [on|off]
+.process [pid|eprocess|0] | lmu | handles/vad/uthreads [pid] [i] | ustack <tid|expr> [n] | kmap | events | uex [on|off]
 sxe cpr[:nome]|epr[:nome]|ct[:pid]|et[:pid]|ld:proc!dll | bp <expr> /log \"txt {expr}\" /cmd \"r\" /g grupo | bgd/bge <grupo> | bar <w|a> <expr> <bytes>
 trace [n] [ate <expr>] [ret] [over] [entra|sai <mod>] [pula <mod>] [vigia <expr> [bytes]]
 trace show [de] [n] | trace tree [n] | trace save <arq> | trace diff <arq> | trace ref | trace status
@@ -1028,8 +1028,9 @@ impl Client {
                 Ok(output)
             }
             "dt" => self.display_type(rest),
+            "thread" if rest.is_empty() => self.current_thread_text(),
             "thread" => {
-                let thread = parse_number(rest).ok_or("uso: thread <n>")?;
+                let thread = parse_number(rest).ok_or("uso: thread [n] (sem n: a thread escolhida)")?;
                 self.select_thread(thread)?;
                 Ok(format!("thread {thread} (CPU {})", thread.saturating_sub(1)))
             }
@@ -1105,18 +1106,28 @@ impl Client {
                 Ok(output)
             }
             "handles" | "vad" | "uthreads" => {
-                // O processo pode vir de uma expressão ($nome, @reg, módulo!símbolo).
+                // O processo pode vir de uma expressão ($nome, @reg, módulo!símbolo);
+                // sem ele, vale o escolhido com `.process`.
                 let process = match words.first() {
-                    Some(first) if first.starts_with(['$', '@']) || first.contains(['!', '(']) => format!("{:#x}", self.evaluate(first)?),
+                    Some(first) if first.starts_with(['$', '@', '{']) || first.contains(['!', '(']) => format!("{:#x}", self.evaluate(first)?),
                     Some(first) => first.to_string(),
-                    None => return Err(format!("uso: {command} <pid|eprocess> [indice]")),
+                    None => match self.process() {
+                        Some(context) => format!("{:#x}", context.eprocess),
+                        None => return Err(format!("uso: {command} <pid|eprocess> [indice] (sem processo: o escolhido com .process)")),
+                    },
                 };
                 let tail = words.get(1).map(|start| format!(" {start}")).unwrap_or_default();
                 self.monitor(&format!("{command} {process}{tail}"))
             }
             "kmap" | "events" | "uex" => self.monitor(line),
             "ustack" => {
-                let tid = words.first().and_then(|text| parse_number(text)).ok_or("uso: ustack <tid> [n] (processo escolhido com .process)")?;
+                // O TID pode vir de uma expressão ($t_tid, {$t_tid} como no print).
+                let usage = "uso: ustack <tid> [n] (processo escolhido com .process)";
+                let first = words.first().ok_or(usage)?;
+                let tid = match parse_number(first) {
+                    Some(tid) => tid,
+                    None => self.evaluate(first).map_err(|error| format!("{usage}: {error}"))?,
+                };
                 let limit = words.get(1).and_then(|text| parse_number(text)).unwrap_or(32) as usize;
                 let process = self.process().map(|context| format!("{:#x}", context.eprocess)).ok_or("nenhum processo escolhido (.process <pid>)")?;
                 let thread = self.user_threads(&process)?.into_iter().find(|thread| thread.tid == tid).ok_or_else(|| format!("thread {tid} nao e deste processo"))?;

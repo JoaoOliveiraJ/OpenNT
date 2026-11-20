@@ -14,7 +14,9 @@
 //! - operadores do C com a precedência do C: `|| && | ^ & == != < > <= >=
 //!   << >> + - * / %` e os unários `- ~ ! * &`;
 //! - tipos do PDB do ntoskrnl: `(_IRP*)@rcx`, `((nt!_IRP*)@rcx)->Tail.Overlay.CurrentStackLocation`,
-//!   `p->Campo`, `s.Campo`, `*p`, `&s.Campo`, `p[2]`.
+//!   `p->Campo`, `s.Campo`, `*p`, `&s.Campo`, `p[2]`;
+//! - a expressão inteira entre chaves (`{$t_tid}`), a forma dos campos do
+//!   `print` e do `/log`, vale a de dentro.
 
 use std::sync::Arc;
 
@@ -219,6 +221,10 @@ fn tokenize(text: &str) -> Result<Vec<Token>, String> {
 
 /// Avalia uma expressão.
 pub fn evaluate(environment: &mut dyn Environment, text: &str) -> Result<Value, String> {
+    // `{expr}` inteiro, como num campo do `print` (um roteiro escreve
+    // `ustack {$t_tid}`): as chaves saem.
+    let text = text.trim();
+    let text = text.strip_prefix('{').and_then(|inner| inner.strip_suffix('}')).unwrap_or(text);
     let tokens = tokenize(text)?;
     if tokens.is_empty() {
         return Err("expressao vazia".into());
@@ -719,6 +725,18 @@ mod tests {
         // A forma sem `@` dos roteiros da tela preta (kd_black4, kd_udwm).
         assert_eq!(number(&mut environment, "dwo(poi(poi(gs_base+0x188)+0xb8)+0x5a8)"), Ok(0xdeadbeef));
         assert!(number(&mut environment, "@gs_basex").is_err());
+    }
+
+    #[test]
+    fn braced_expression() {
+        // `ustack {$t_tid} 40` do kd_autologon3: a forma do campo do print.
+        let mut environment = fake();
+        assert_eq!(number(&mut environment, "{$base}"), Ok(0x1000));
+        assert_eq!(number(&mut environment, " {$base+0x10} "), Ok(0x1010));
+        assert_eq!(number(&mut environment, "{poi(@rsp)}"), Ok(0x2000));
+        // Só as chaves de fora: uma sobra continua erro.
+        assert!(number(&mut environment, "{$base").is_err());
+        assert!(number(&mut environment, "{}").is_err());
     }
 
     #[test]

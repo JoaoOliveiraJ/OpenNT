@@ -426,6 +426,18 @@ fn pick_word(line: &str, index: i64) -> Option<&str> {
 
 /// Troca `${nome}` pelo texto da variável e `${nome.N}` pela palavra N
 /// dele.
+/// As linhas de `output` com `needle`; sem nenhuma, as que o têm sem
+/// diferença de maiúsculas (o `lmu` mostra `msv1_0.DLL` como a PEB guarda,
+/// e o roteiro escreve `msv1_0.dll`).
+fn lines_with<'a>(output: &'a str, needle: &str) -> Vec<&'a str> {
+    let exact: Vec<&str> = output.lines().filter(|text| text.contains(needle)).collect();
+    if !exact.is_empty() {
+        return exact;
+    }
+    let lower = needle.to_ascii_lowercase();
+    output.lines().filter(|text| text.to_ascii_lowercase().contains(&lower)).collect()
+}
+
 fn substitute(variables: &HashMap<String, String>, text: &str) -> Result<String, String> {
     let mut output = String::new();
     let mut rest = text;
@@ -1146,7 +1158,7 @@ impl<'c, 'h> Runner<'c, 'h> {
                 let (Some(column), Some(occurrence)) = (parts.get(2).and_then(|text| text.parse::<i64>().ok()), occurrence(3)) else {
                     return Err(self.error(line, shown, &usage));
                 };
-                let found = self.last_output.lines().filter(|text| text.contains(needle.as_str())).nth(occurrence - 1).and_then(|text| pick_word(text, column)).map(str::to_string);
+                let found = lines_with(&self.last_output, &needle).into_iter().nth(occurrence - 1).and_then(|text| pick_word(text, column)).map(str::to_string);
                 match found {
                     Some(value) if word == "save-text" || parse_number(&value).is_some() => self.save_value(&name, &value),
                     _ => {
@@ -1166,7 +1178,7 @@ impl<'c, 'h> Runner<'c, 'h> {
             }
             "save-line" => {
                 let Some(occurrence) = occurrence(2) else { return Err(self.error(line, shown, &usage)) };
-                let found = self.last_output.lines().filter(|text| text.contains(needle.as_str())).nth(occurrence - 1).map(|text| text.trim().to_string());
+                let found = lines_with(&self.last_output, &needle).into_iter().nth(occurrence - 1).map(|text| text.trim().to_string());
                 match found {
                     Some(value) => {
                         self.set_text(&name, &value);
@@ -1187,7 +1199,7 @@ impl<'c, 'h> Runner<'c, 'h> {
                 let (Some(column), Some(module)) = (parts.get(2).and_then(|text| text.parse::<i64>().ok()), parts.get(3).cloned()) else {
                     return Err(self.error(line, shown, &usage));
                 };
-                let candidates: Vec<u64> = self.last_output.lines().filter(|text| text.contains(needle.as_str())).filter_map(|text| pick_word(text, column)).filter_map(parse_number).collect();
+                let candidates: Vec<u64> = lines_with(&self.last_output, &needle).into_iter().filter_map(|text| pick_word(text, column)).filter_map(parse_number).collect();
                 let mut chosen = None;
                 for thread in candidates {
                     if self.thread_in_module(thread, &module) {
@@ -1705,6 +1717,18 @@ mod tests {
         assert_eq!(pick_word("a b", 2), None);
         assert_eq!(pick_word("a b", -3), None);
         assert!(is_identifier("t_tid") && is_identifier("_x1") && !is_identifier("1x") && !is_identifier("a-b") && !is_identifier(""));
+    }
+
+    #[test]
+    fn finds_lines_ignoring_case_only_without_exact() {
+        // O `lmu` do kd_domain1: a PEB guarda `msv1_0.DLL`.
+        let output = "0x1e90000 0x1f1c000 msv1_0.DLL   19 simbolos\n0x140000000 0x140012000 lsass.exe   4 simbolos\n";
+        assert_eq!(lines_with(output, "msv1_0.dll"), vec!["0x1e90000 0x1f1c000 msv1_0.DLL   19 simbolos"]);
+        assert_eq!(lines_with(output, "lsass.exe").len(), 1);
+        // Com uma linha exata, as outras formas ficam de fora.
+        let output = "a Foo 1\na foo 2\n";
+        assert_eq!(lines_with(output, "foo"), vec!["a foo 2"]);
+        assert!(lines_with(output, "bar").is_empty());
     }
 
     #[test]

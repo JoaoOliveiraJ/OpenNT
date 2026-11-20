@@ -3023,7 +3023,10 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     decide a parada sem `g`, sem `monitor lm` e sem `.process`.
   - Consultas pelo `qRcmd` (o `monitor` do GDB): `kd/monitor.rs` lista
     processos e threads pelas listas nativas, os registradores de uma thread
-    fora da CPU pelo quadro de troca, módulos, processadores com IRQL e
+    fora da CPU pelo quadro de troca (sem ele, KernelStack = InitialStack:
+    uma thread de usuário fora de um serviço, numa espera adiada ou no fim
+    do intervalo, pelo CONTEXT do anel 3, com a TEB e a faixa da pilha de
+    usuário do NT_TIB), módulos, processadores com IRQL e
     thread corrente, objeto por nome, o anel do DbgPrint, breakpoints e o
     bugcheck (código, nome do KiBugCodeMessages e o driver de um parâmetro).
     `kd/inspect.rs` mostra objetos do NT com os layouts do PDB
@@ -3094,6 +3097,16 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     anel 3 da thread do intervalo (antes, o #DB ia ao processo como
     STATUS_SINGLE_STEP e a máquina ficava com os outros processadores
     congelados).
+  - Passo de usuário (`kd/user_debug.rs`): o TF no CONTEXT da thread, com um
+    passo pendente por thread. O #DB dele é do depurador também quando o
+    passo para a máquina (o `s` numa parada de usuário, ou o passo do anel 0
+    que seguiu para o anel 3) e o host continua depois: só um `C sig`
+    explícito o entrega ao processo. O `pushfq` passo a passo empilha o
+    RFLAGS sem o TF (o RtlCaptureContext começa assim). Uma exceção da
+    própria instrução que vai ao processo, ou uma APC de usuário que desvia
+    o CONTEXT, desfaz o passo antes da cópia do CONTEXT para a pilha de
+    usuário: o TF não volta depois pelo NtContinue, e o breakpoint suspenso
+    volta.
   - Robustez da sessão (`kd/recovery.rs`): cada pacote do host roda com um
     ponto de recuperação (um `setjmp` próprio, em assembly). Uma falta sem
     tratador, um KeBugCheckEx ou um pânico dentro de um comando abandonam o
@@ -6159,7 +6172,10 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     KPCR.UserRsp do processador dela), lida no espaço do processo da
     thread; o trampolim dos exports passa para o código nativo que chamou o
     export pelo CONTEXT que ele salvou; `opennt_kernel_thread_start` e
-    `opennt_kernel_thread_return` são o começo da pilha. `bt`, `k`, `btt` e
+    `opennt_kernel_thread_return` são o começo da pilha. O `btt` de uma
+    thread de usuário sem quadro de troca (uma espera adiada) começa no
+    CONTEXT do anel 3 que o `monitor context` dá, no processo dela, e avisa
+    quando o RSP está fora da pilha da TEB. `bt`, `k`, `btt` e
     `ustack` marcam cada passagem e terminam com a linha de onde e por que o
     desenrolar parou (`Stop`: fim da pilha, limite, memória ilegível,
     UNWIND_INFO inválido, registrador desconhecido, cadeia de RBP, um
@@ -6220,7 +6236,11 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     escolhido (uma vez por parada), então o `bu` numa DLL do processo
     escolhido que ainda vai carregar arma na parada de carga dela. A pilha
     de uma thread de usuário sai do CONTEXT salvo dela. Comandos: `.process`, `lmu`,
-    `handles`, `vad`, `uthreads`, `ustack`, `kmap`, `events`, `uex`.
+    `handles`, `vad`, `uthreads`, `ustack`, `kmap`, `events`, `uex`;
+    `handles`, `vad` e `uthreads` sem processo valem o do `.process`, o TID
+    do `ustack` pode ser expressão (`$t_tid`, ou `{$t_tid}` como no campo do
+    `print`) e `thread` sem número mostra a thread do protocolo e o que roda
+    no processador dela.
   - Eventos e breakpoints com ação: `sxe cpr[:nome]`, `epr`, `ct[:pid]`,
     `et` e `ld:processo!dll` (breakpoints internos nos pontos de evento do
     kernel, filtrados pelo cliente); `bp x /log "texto {expr}"` registra e
@@ -6368,7 +6388,10 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
       depois do rótulo, na mesma linha), `save-line <nome> <texto>
       [ocorrência]` (a linha inteira), `save-count <nome> <texto>` (quantas
       linhas têm o texto) e `save-thread <nome> <texto> <coluna> <módulo>`
-      (a primeira thread dessas linhas com um quadro do módulo na pilha). Um
+      (a primeira thread dessas linhas com um quadro do módulo na pilha).
+      Sem nenhuma linha com o texto exato, `save-word`, `save-text`,
+      `save-line` e `save-thread` aceitam o texto sem diferença de
+      maiúsculas (o `lmu` mostra `msv1_0.DLL`). Um
       texto com espaços vai entre aspas. `$nome` vale nas expressões quando
       o valor é número; `${nome}` é trocado pelo texto em qualquer linha
       antes de ela rodar, e `${nome.N}` pela palavra N do texto. O `{expr}`

@@ -2401,6 +2401,17 @@ impl Client {
         Ok(())
     }
 
+    /// `thread` sem número: a thread do protocolo das leituras (a escolhida,
+    /// ou a da parada) e o que roda no processador dela (IRQL, ETHREAD,
+    /// processo).
+    pub fn current_thread_text(&mut self) -> Result<String, String> {
+        self.require_stopped()?;
+        let thread = self.selected.or_else(|| self.stop.as_ref().and_then(|stop| stop.thread)).ok_or("a parada nao disse a thread do protocolo (thread <n> escolhe uma)")?;
+        let processor = thread.saturating_sub(1);
+        let detail = self.processors().ok().and_then(|list| list.into_iter().find(|entry| entry.number == processor)).map(|entry| format!(": IRQL {} ETHREAD {:#x} {}", entry.irql, entry.thread, entry.process)).unwrap_or_default();
+        Ok(format!("thread {thread} (CPU {processor}){}{detail}", if self.selected.is_some() { "" } else { ", a da parada" }))
+    }
+
     /// Os processadores parados (as threads do protocolo).
     pub fn stopped_threads(&mut self) -> Result<Vec<u64>, String> {
         self.require_stopped()?;
