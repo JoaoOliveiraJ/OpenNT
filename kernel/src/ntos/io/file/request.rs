@@ -20,7 +20,8 @@ use crate::ntos::ps::process;
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::inc::field::Field;
-use crate::ntos::inc::types::{Ethread, FileObject, IoStatusBlock, Kthread, Mdl, NtStruct};
+use crate::ntos::inc::types::{DeviceObject, Ethread, FileObject, IoStatusBlock, Kthread, Mdl, NtStruct};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 /// MDL_PAGES_LOCKED.
 const MDL_PAGES_LOCKED: i16 = 0x0002;
@@ -32,6 +33,33 @@ fn file_at(file: u64) -> &'static FileObject {
 }
 
 const TAG: u32 = 0x7443_6F49;
+/// FILE_DEVICE_KEYBOARD: o dispositivo de classe do kbdclass
+/// (`\Device\KeyboardClassN`).
+const FILE_DEVICE_KEYBOARD: u32 = 0x0B;
+/// O `KEYBOARD_INPUT_OK` já saiu.
+static KEYBOARD_INPUT_REPORTED: AtomicBool = AtomicBool::new(false);
+
+/// Diagnóstico da entrada: a primeira leitura do teclado concluída com dados
+/// para um leitor de modo kernel com rotina de APC, o ZwReadFile do
+/// RIMStartDeviceRead do RIT do win32k (a ApcRoutine é o rimInputApc), sai
+/// na serial com o `KEYBOARD_INPUT_OK`. É a conclusão do IRP_MJ_READ real do
+/// kbdclass, no contexto de quem leu (o csrss da sessão). O serviço de
+/// teclado do boot do shell lê sem APC e não conta.
+fn report_first_keyboard_input(r: &Request, status: u32, count: u64) {
+    if r.mode != 0 || r.apc_routine == 0 || status != 0 || count == 0 || r.file == 0 || KEYBOARD_INPUT_REPORTED.load(Ordering::Relaxed) {
+        return;
+    }
+    // O RIT abre a interface de dispositivo, que aponta para o PDO; o
+    // IRP_MJ_READ vai ao topo da pilha (IoGetAttachedDevice), o kbdclass.
+    let device = file_at(r.file).device_object.get();
+    let top = if device != 0 { crate::ntos::ob::objects::device::top(device) } else { 0 };
+    // SAFETY: o FILE_OBJECT do pedido retém o dispositivo e a pilha dele.
+    if top == 0 || unsafe { DeviceObject::at(top) }.device_type.get() != FILE_DEVICE_KEYBOARD || KEYBOARD_INPUT_REPORTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    debug_print!("[kbd] primeira leitura do teclado concluida para o leitor de kernel: pid {} tid {}, {} bytes\nKEYBOARD_INPUT_OK", process::get_current_process_id(), process::get_current_thread_id(), count);
+}
+
 /// Requisição sem método de transferência (leitura/escrita).
 pub const NO_METHOD: u32 = u32::MAX;
 
@@ -267,6 +295,7 @@ pub fn finish(request: &Shared) -> Result<(), KernelError> {
     } else if r.file != 0 && !r.skip_file_event {
         dispatcher::set_event(file_at(r.file).event.address());
     }
+    report_first_keyboard_input(&r, status, count);
     if r.apc != 0 && !r.rundown && !r.skip_apc && apc::insert(r.apc, r.io_status, 0) {
         r.apc = 0;
     }
