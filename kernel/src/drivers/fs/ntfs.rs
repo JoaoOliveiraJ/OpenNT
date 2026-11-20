@@ -174,9 +174,35 @@ pub struct Stat {
     pub security_id: u32,
 }
 
+/// As entradas de um diretório, na ordem do índice, com a busca pelo nome
+/// sem diferença de caixa (o lookup do NTFS desce a árvore B pelo nome; aqui
+/// o diretório inteiro já lido ganha um mapa do nome em maiúsculas).
+pub struct Directory {
+    pub entries: Vec<IndexEntry>,
+    /// O nome em maiúsculas (`str::to_uppercase`) -> a primeira entrada com
+    /// ele na ordem do índice.
+    by_name: BTreeMap<String, usize>,
+}
+
+impl Directory {
+    fn new(entries: Vec<IndexEntry>) -> Self {
+        let mut by_name = BTreeMap::new();
+        for (index, entry) in entries.iter().enumerate() {
+            by_name.entry(entry.name.to_uppercase()).or_insert(index);
+        }
+        Self { entries, by_name }
+    }
+
+    /// A primeira entrada (na ordem do índice) com o nome `name`, sem
+    /// diferença de caixa.
+    pub fn find(&self, name: &str) -> Option<&IndexEntry> {
+        self.by_name.get(&name.to_uppercase()).map(|&index| &self.entries[index])
+    }
+}
+
 struct Caches {
     generation: u64,
-    directories: BTreeMap<u64, Vec<IndexEntry>>,
+    directories: BTreeMap<u64, Arc<Directory>>,
     layouts: BTreeMap<String, Option<Layout>>,
 }
 
@@ -652,10 +678,16 @@ impl Ntfs {
 
     /// Entradas do diretório `reference`, com blocos INDX dos índices grandes.
     pub fn root_index(&self, reference: u64) -> Result<Vec<IndexEntry>, KernelError> {
+        Ok(self.directory(reference)?.entries.clone())
+    }
+
+    /// O diretório `reference` lido (e guardado até a próxima mudança do
+    /// volume), sem cópia das entradas.
+    pub fn directory(&self, reference: u64) -> Result<Arc<Directory>, KernelError> {
         let _shared = self.resource().acquire_shared();
         self.fresh();
-        if let Some(entries) = self.caches.lock().directories.get(&reference) {
-            return Ok(entries.clone());
+        if let Some(directory) = self.caches.lock().directories.get(&reference) {
+            return Ok(directory.clone());
         }
         let root = self.read_record(reference)?;
         if u16_at(&root, 22) & 2 == 0 {
@@ -672,8 +704,9 @@ impl Ntfs {
             let reference = u32_at(&entry.head, 0) as u64 | (u16_at(&entry.head, 4) as u64) << 32;
             names.push(IndexEntry { name: file_name_of(value), reference, sequence: u16_at(&entry.head, 6), value: value.to_vec() });
         }
-        self.caches.lock().directories.insert(reference, names.clone());
-        Ok(names)
+        let directory = Arc::new(Directory::new(names));
+        self.caches.lock().directories.insert(reference, directory.clone());
+        Ok(directory)
     }
 
     /// As entradas do índice da raiz `index` (um $INDEX_ROOT residente) e
@@ -814,9 +847,8 @@ impl Ntfs {
             if part == "." || part == ".." {
                 return Err(error("NTFS: caminho nao canonico"));
             }
-            let wanted = part.to_uppercase();
-            match self.root_index(found.reference)?.into_iter().find(|entry| entry.name.to_uppercase() == wanted) {
-                Some(entry) => found = entry,
+            match self.directory(found.reference)?.find(part) {
+                Some(entry) => found = entry.clone(),
                 None => return Ok(None),
             }
         }
@@ -835,7 +867,7 @@ impl Ntfs {
         let trimmed = path.trim_end_matches('/');
         let Some(separator) = trimmed.rfind('/') else { return Ok(Some(String::new())) };
         let Some(parent) = self.find(if separator == 0 { "/" } else { &trimmed[..separator] })? else { return Ok(None) };
-        let stored = self.root_index(parent.reference)?.into_iter().find(|candidate| candidate.reference == entry.reference && candidate.value.get(0x41).is_some_and(|namespace| namespace & 3 != 2)).map(|candidate| candidate.name);
+        let stored = self.directory(parent.reference)?.entries.iter().find(|candidate| candidate.reference == entry.reference && candidate.value.get(0x41).is_some_and(|namespace| namespace & 3 != 2)).map(|candidate| candidate.name.clone());
         Ok(Some(stored.unwrap_or(entry.name)))
     }
 
@@ -906,7 +938,7 @@ impl Ntfs {
         let prefix = path.trim_end_matches('/');
         // Como na enumeração do NTFS, os arquivos de metadados (registros
         // abaixo de 16: $MFT, '.', $Extend...) não aparecem na listagem.
-        Ok(Some(self.root_index(entry.reference)?.into_iter().filter(|child| child.reference >= FIRST_USER_RECORD).map(|child| alloc::format!("{prefix}/{}", child.name)).collect()))
+        Ok(Some(self.directory(entry.reference)?.entries.iter().filter(|child| child.reference >= FIRST_USER_RECORD).map(|child| alloc::format!("{prefix}/{}", child.name)).collect()))
     }
 
     pub fn stat(&self, path: &str) -> Result<Option<Stat>, KernelError> {

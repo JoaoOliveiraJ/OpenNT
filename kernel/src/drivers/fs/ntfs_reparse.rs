@@ -154,13 +154,12 @@ impl Ntfs {
         let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
         let mut directory = 5u64;
         for (index, part) in parts.iter().enumerate() {
-            let wanted = part.to_uppercase();
-            let entries = match self.root_index(directory) {
+            let entries = match self.directory(directory) {
                 Ok(entries) => entries,
                 Err(error) if error.status == STATUS_NOT_A_DIRECTORY => return Ok(None),
                 Err(error) => return Err(error),
             };
-            let Some(entry) = entries.into_iter().find(|entry| entry.name.to_uppercase() == wanted) else { return Ok(None) };
+            let Some(entry) = entries.find(part).cloned() else { return Ok(None) };
             let last = index + 1 == parts.len();
             let marked = entry.value.len() >= 60 && u32_at(&entry.value, 56) & FILE_ATTRIBUTE_REPARSE_POINT != 0;
             if marked && !(last && open_reparse_point) {
