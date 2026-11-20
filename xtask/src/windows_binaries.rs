@@ -532,8 +532,10 @@ const SERVICE_CHAIN_PROGRAMS: &[&str] = &["umpo.dll", "psmsrv.dll", "SystemEvent
 /// console, o cmd.exe (com o cmdext.dll do ext-ms-win-cmd-util), o net.exe,
 /// o net1.exe e o reg.exe do gancho do `--conta-de-teste` (SYSTEM\Setup
 /// CmdLine), o mpr.dll que o net.exe importa, o netmsg.dll e o neth.dll das
-/// mensagens do net e o winmm.dll do PlaySound atrasado do conhost.
-const CONSOLE_PROGRAMS: &[&str] = &["conhost.exe", "cmd.exe", "cmdext.dll", "net.exe", "net1.exe", "reg.exe", "mpr.dll", "netmsg.dll", "neth.dll", "winmm.dll"];
+/// mensagens do net e o winmm.dll do PlaySound atrasado do conhost. E o
+/// secinit.exe do mesmo gancho, que põe a máquina no grupo de trabalho, com
+/// o netjoin.dll do NetpJoinWorkgroup e o netbios.dll da checagem do nome.
+const CONSOLE_PROGRAMS: &[&str] = &["conhost.exe", "cmd.exe", "cmdext.dll", "net.exe", "net1.exe", "reg.exe", "mpr.dll", "netmsg.dll", "neth.dll", "winmm.dll", "secinit.exe", "netjoin.dll", "netbios.dll"];
 
 /// A tela de logon da sessão 1: o dwm.exe que o dwminit.dll do winlogon
 /// cria e o LogonUI.exe do StartLogonUI, com o fecho dos imports estáticos

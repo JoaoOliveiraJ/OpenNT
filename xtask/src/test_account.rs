@@ -63,8 +63,9 @@ pub struct BuiltinNames {
 }
 
 /// O `CmdLine` do gancho: cria a conta, põe no grupo Administradores,
-/// desabilita as contas embutidas e volta o gancho, nessa ordem (com `&`
-/// cada parte roda mesmo se a anterior falhar).
+/// desabilita as contas embutidas, põe a máquina no grupo de trabalho
+/// ([`builtin_accounts_command`]: o secinit.exe) e volta o gancho, nessa
+/// ordem (com `&` cada parte roda mesmo se a anterior falhar).
 pub fn setup_command(names: &BuiltinNames) -> Result<String, String> {
     let administrators = argument(&names.administrators)?;
     let administrator = argument(&names.administrator)?;
@@ -74,6 +75,7 @@ pub fn setup_command(names: &BuiltinNames) -> Result<String, String> {
          &net localgroup {administrators} {ACCOUNT_NAME} /add\
          &net user {administrator} /active:no\
          &net user {guest} /active:no\
+         &secinit\
          &reg add HKLM\\SYSTEM\\Setup /v SetupType /t REG_DWORD /d 0 /f\
          &reg add HKLM\\SYSTEM\\Setup /v CmdLine /d \"\" /f"
     );
@@ -94,12 +96,20 @@ pub fn setup_command(names: &BuiltinNames) -> Result<String, String> {
 /// cifrada do ShouldDisableAccountByDefault (NtQuerySystemInformation 134),
 /// que o OpenNT não responde. Rodar o próprio modelo pelo secedit.exe (o
 /// scecli, o scesrv no lsass e o banco ESE dele) é a alternativa mais fiel.
+/// Antes de voltar o gancho roda o secinit.exe, como o RunSecInit do Setup
+/// (oobe\winsetup.dll): ele espera o SAM e o fim do início automático dos
+/// serviços e põe a máquina no grupo de trabalho WORKGROUP
+/// (NetJoinDomain; sem o wkssvc, o NetpJoinWorkgroup do netjoin.dll grava o
+/// nome pelo LsaSetInformationPolicy). Sem o nome do domínio primário da
+/// política, o NlSamInitialize do msv1_0 recusa o logon local
+/// (STATUS_NO_SUCH_DOMAIN).
 pub fn builtin_accounts_command(names: &BuiltinNames) -> Result<String, String> {
     let administrator = argument(&names.administrator)?;
     let guest = argument(&names.guest)?;
     let command = format!(
         "cmd /d /c net user {administrator} /active:no\
          &net user {guest} /active:no\
+         &secinit\
          &reg add HKLM\\SYSTEM\\Setup /v SetupType /t REG_DWORD /d 0 /f\
          &reg add HKLM\\SYSTEM\\Setup /v CmdLine /d \"\" /f"
     );
@@ -222,9 +232,9 @@ mod tests {
         let command = setup_command(&portuguese()).unwrap();
         assert_eq!(
             command,
-            "cmd /d /c net user Usuario /add&net localgroup Administradores Usuario /add&net user Administrador /active:no&net user Convidado /active:no&reg add HKLM\\SYSTEM\\Setup /v SetupType /t REG_DWORD /d 0 /f&reg add HKLM\\SYSTEM\\Setup /v CmdLine /d \"\" /f"
+            "cmd /d /c net user Usuario /add&net localgroup Administradores Usuario /add&net user Administrador /active:no&net user Convidado /active:no&secinit&reg add HKLM\\SYSTEM\\Setup /v SetupType /t REG_DWORD /d 0 /f&reg add HKLM\\SYSTEM\\Setup /v CmdLine /d \"\" /f"
         );
-        assert_eq!(command.encode_utf16().count(), 245);
+        assert_eq!(command.encode_utf16().count(), 253);
         assert!(command.encode_utf16().count() <= COMMAND_LINE_MAX);
     }
 
@@ -233,7 +243,7 @@ mod tests {
     fn the_builtin_accounts_command_only_disables_them() {
         assert_eq!(
             builtin_accounts_command(&portuguese()).unwrap(),
-            "cmd /d /c net user Administrador /active:no&net user Convidado /active:no&reg add HKLM\\SYSTEM\\Setup /v SetupType /t REG_DWORD /d 0 /f&reg add HKLM\\SYSTEM\\Setup /v CmdLine /d \"\" /f"
+            "cmd /d /c net user Administrador /active:no&net user Convidado /active:no&secinit&reg add HKLM\\SYSTEM\\Setup /v SetupType /t REG_DWORD /d 0 /f&reg add HKLM\\SYSTEM\\Setup /v CmdLine /d \"\" /f"
         );
     }
 
