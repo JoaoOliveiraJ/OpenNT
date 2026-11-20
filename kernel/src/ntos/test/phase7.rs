@@ -7236,6 +7236,7 @@ pub fn run(assert: Assert) {
     user_tokens(assert);
     user_create_token(assert);
     user_virtual_account_token(assert);
+    super::user_lowbox::run(assert);
     user_query_object(assert);
     user_remove_completion(assert);
     user_alpc_foundation(assert);
