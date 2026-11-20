@@ -22,8 +22,9 @@
 //! BrokerInfrastructure lê ao subir,
 //! a configuração de energia (`Control\Power`, com "Desligar a tela: Nunca"
 //! no esquema ativo: `power_policy`), as definições WNF
-//! (`Control\Notifications`), as opções do produto (`Control\ProductOptions`)
-//! e, na SOFTWARE, os grupos do svchost (`Microsoft\Windows NT\CurrentVersion\
+//! (`Control\Notifications`), as opções do produto (`Control\ProductOptions`,
+//! com a política de licença de uma instalação limpa e não ativada desta
+//! edição: `product_policy`) e, na SOFTWARE, os grupos do svchost (`Microsoft\Windows NT\CurrentVersion\
 //! Svchost`, os valores com a lista de serviços de cada grupo e as subchaves
 //! do `LocalServiceNoNetwork` e do `LocalService`), os descritores das
 //! portas de nome transitório
@@ -103,16 +104,25 @@ pub fn system_keys(control_set: &str) -> Vec<HostKey> {
         // PRODUCT_UNDEFINED.
         let product_options = keys.len();
         registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\Control\\ProductOptions"), &format!("{control_set}\\Control\\ProductOptions"), false, &mut keys);
-        // Só o tipo, a suíte e a política; na política, as entradas com a
-        // última ativação desta instalação ficam zeradas (o blob mantém o
-        // tamanho, e o NtQueryLicenseValue não muda).
+        // Só o tipo, a suíte e a política. A política é a de uma instalação
+        // limpa e não ativada desta edição (`product_policy`): as entradas
+        // das licenças da edição, com os dados delas, e o estado de ativação
+        // de uma instalação nova; sem as licenças, o valor fica de fora.
         if let Some(options) = keys.get_mut(product_options) {
             options.values.retain(|(name, _, _)| PRODUCT_OPTIONS_VALUES.iter().any(|kept| kept.eq_ignore_ascii_case(name)));
-            for (name, _, data) in options.values.iter_mut() {
-                if name.eq_ignore_ascii_case("ProductPolicy") {
-                    scrub_product_policy(data);
+            let windows = crate::windows_binaries::windows_directory();
+            options.values.retain_mut(|(name, _, data)| {
+                if !name.eq_ignore_ascii_case("ProductPolicy") {
+                    return true;
                 }
-            }
+                match crate::product_policy::guest_policy(data, &windows) {
+                    Some(policy) => {
+                        *data = policy;
+                        true
+                    }
+                    None => false,
+                }
+            });
         }
         // A configuração de energia que o serviço Power (o umpo.dll) lê: os
         // esquemas, as configurações e os padrões (o Control\Power com as
@@ -307,33 +317,6 @@ pub fn software_keys() -> Vec<HostKey> {
 #[cfg(windows)]
 const PRODUCT_OPTIONS_VALUES: &[&str] = &["ProductType", "ProductSuite", "ProductPolicy"];
 
-/// As entradas do ProductPolicy que guardam a última ativação desta
-/// instalação.
-const POLICY_HOST_ENTRIES: &[&str] = &["Security-SPP-LastWindowsActivationTime", "Security-SPP-LastWindowsActivationHResult"];
-
-/// Zera os dados das entradas de [`POLICY_HOST_ENTRIES`] no ProductPolicy:
-/// cabeçalho de cinco u32 (total, tamanho dos dados, tamanho do marcador de
-/// fim, flags, versão 1) e entradas `u16 tamanho, u16 tamanho do nome, u16
-/// tipo, u16 tamanho dos dados, u32 flags, u32 reservado, nome (UTF-16),
-/// dados`.
-fn scrub_product_policy(blob: &mut [u8]) {
-    let word = |bytes: &[u8], at: usize| u16::from_le_bytes([bytes[at], bytes[at + 1]]) as usize;
-    let Some(data) = blob.get(4..8).map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize) else { return };
-    let (mut at, end) = (0x14, (0x14 + data).min(blob.len()));
-    while at + 16 <= end {
-        let (size, name_size, data_size) = (word(blob, at), word(blob, at + 2), word(blob, at + 6));
-        if size == 0 || at + 16 + name_size + data_size > end {
-            break;
-        }
-        let name: Vec<u16> = blob[at + 16..at + 16 + name_size].chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect();
-        let name = String::from_utf16_lossy(&name);
-        if POLICY_HOST_ENTRIES.iter().any(|host| host.eq_ignore_ascii_case(&name)) {
-            blob[at + 16 + name_size..at + 16 + name_size + data_size].fill(0);
-        }
-        at += size;
-    }
-}
-
 #[cfg(all(test, windows))]
 mod software_tests {
     /// O desempacotador do ActivationPropertiesIn ({00000338-...}) na lista
@@ -343,41 +326,5 @@ mod software_tests {
     fn trusted_unmarshalers_are_staged() {
         let keys = super::software_keys();
         assert!(keys.iter().any(|key| key.path.eq_ignore_ascii_case("Classes\\Unmarshalers\\System\\{00000338-0000-0000-C000-000000000046}")));
-    }
-}
-
-#[cfg(test)]
-mod product_policy_tests {
-    use super::scrub_product_policy;
-
-    fn entry(name: &str, data: &[u8]) -> Vec<u8> {
-        let name: Vec<u8> = name.encode_utf16().flat_map(|unit| unit.to_le_bytes()).collect();
-        let size = 16 + name.len() + data.len();
-        let mut bytes = Vec::new();
-        for value in [size as u16, name.len() as u16, 4, data.len() as u16] {
-            bytes.extend_from_slice(&value.to_le_bytes());
-        }
-        bytes.extend_from_slice(&[0; 8]);
-        bytes.extend_from_slice(&name);
-        bytes.extend_from_slice(data);
-        bytes
-    }
-
-    #[test]
-    fn activation_entries_are_zeroed() {
-        let entries = [entry("Kernel-ProductInfo", &[0x30, 0, 0, 0]), entry("Security-SPP-LastWindowsActivationTime", &[1, 2, 3, 4, 5, 6, 7, 8]), entry("Security-SPP-LastWindowsActivationHResult", &[9, 9, 9, 9])].concat();
-        let mut blob = Vec::new();
-        for value in [0x14 + entries.len() as u32 + 4, entries.len() as u32, 4, 0, 1] {
-            blob.extend_from_slice(&value.to_le_bytes());
-        }
-        blob.extend_from_slice(&entries);
-        blob.extend_from_slice(&[0x45, 0x23, 0x01, 0x00]);
-        let before = blob.len();
-        scrub_product_policy(&mut blob);
-        assert_eq!(blob.len(), before);
-        let text = |bytes: &[u8]| bytes.windows(4).any(|window| window == [0x30, 0, 0, 0]);
-        assert!(text(&blob));
-        assert!(!blob.windows(8).any(|window| window == [1, 2, 3, 4, 5, 6, 7, 8]));
-        assert!(!blob.windows(4).any(|window| window == [9, 9, 9, 9]));
     }
 }

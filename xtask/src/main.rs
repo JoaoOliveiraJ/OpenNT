@@ -78,6 +78,7 @@ mod logon_screen;
 mod nt_types;
 mod ntfs_image;
 mod png;
+mod product_policy;
 mod qcow2;
 mod qemu;
 mod screen_check;
