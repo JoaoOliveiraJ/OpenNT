@@ -3706,6 +3706,21 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   descarta. Nenhuma operação copia o bitmap inteiro (cerca de 300 KB num
   volume de 2,5 M clusters). Teste: `ntfs_writer` na fase 4 (abortos no meio
   da alocação e numa transação aninhada, reserva grande gravada no disco).
+- **Escrita no lugar do NTFS do volume de boot**
+  (`ntfs_write.rs::mutate_data`): como no NtfsCommonWrite, a escrita que não
+  muda tamanho, alocação, residência, atributos nem EAs grava os dados e o
+  registro do arquivo, sem o $FILE_NAME duplicado no índice $I30 do pai;
+  uma mudança deles reescreve a entrada. Diferença declarada: as horas da
+  entrada do índice ficam para a próxima mudança dessas (o 19041 as
+  atualiza no cleanup, NtfsUpdateDuplicateInfo); a listagem e o stat leem o
+  registro do arquivo, não a entrada. Antes, toda escrita reconstruía o
+  índice inteiro do pai (a raiz, para os arquivos do System32), e com o
+  writeback das seções de arquivo por trecho de bytes alterados (hoje
+  agrupado em até 16 páginas, `ps/user/sections.rs::flush`) o FNTCACHE.DAT
+  do win32k segurava a thread do csrss de 30 s a mais de 4 min numa fatia
+  só, acima do timeout de controle de 30 s do services.exe. Um intervalo de
+  usuário de mais de 2 s vai para a serial (`[sched] intervalo longo`,
+  `ps/dispatch_perf.rs`). Teste: `ntfs_writer` na fase 4.
 - **Estado por processo**: o que no NT mora no EPROCESS e o OpenNT ainda não
   guarda numa estrutura do NT fica em `ps/user/process_state.rs`, um
   `ProcessState` por EPROCESS (o System inclusive), criado por

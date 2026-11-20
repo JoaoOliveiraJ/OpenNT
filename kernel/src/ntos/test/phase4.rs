@@ -780,6 +780,17 @@ fn ntfs_writer(assert: Assert) {
     assert(volume.space().is_ok_and(|space| space.free_clusters == created_free - 40) && created_free <= initial, "ntfswrite: clusters alocados no $Bitmap");
     let remounted = ntfs::mount(1);
     assert(remounted.as_ref().is_ok_and(|fresh| matches!(fresh.read_bytes("/NOVO.TXT"), Ok(Some(bytes)) if bytes == pattern)), "ntfswrite: dados persistidos no disco");
+    // Como o NtfsCommonWrite: a escrita no lugar (sem mudar tamanho,
+    // alocação, atributos nem EAs) grava os dados e o registro do arquivo,
+    // não o registro nem o índice $I30 do pai; a extensão atualiza a
+    // entrada do índice com o tamanho novo.
+    let root = volume.read_record(5).ok();
+    let in_place = matches!(volume.write("/NOVO.TXT", 5_000, b"q"), Ok(1));
+    let untouched = root.is_some() && volume.read_record(5).ok() == root;
+    let read_back = matches!(volume.read_range("/NOVO.TXT", 4_999, 3), Ok(Some(bytes)) if bytes == [pattern[4_999], b'q', pattern[5_001]]);
+    let extended = matches!(volume.write("/NOVO.TXT", 20_000, b"z"), Ok(1));
+    let entry_size = volume.find("/NOVO.TXT").ok().flatten().map(|entry| ntfs::u64_at(&entry.value, 48));
+    assert(in_place && untouched && read_back && extended && entry_size == Some(20_001), "ntfswrite: escrita no lugar nao reescreve o indice do pai; a extensao atualiza a entrada");
     assert(matches!(volume.resize("/NOVO.TXT", 100), Ok(100)) && matches!(volume.read_bytes("/NOVO.TXT"), Ok(Some(bytes)) if bytes[..] == pattern[..100]) && volume.space().is_ok_and(|space| space.free_clusters == created_free - 1), "ntfswrite: reducao libera clusters");
     // O ValidDataLength (o tamanho inicializado, +56 do $DATA): como o NTFS,
     // a extensão não grava zeros nos clusters que aloca (os da redução acima

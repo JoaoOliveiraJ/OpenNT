@@ -1269,20 +1269,33 @@ impl Tx<'_> {
             let attribute = if allocated != 0 { self.nonresident_valid(0x80, &runs, size, valid, "") } else { resident(0x80, &[], "") };
             replace(&mut list, 0x80, Some(attribute));
         }
+        let mut ea_changed = false;
         if size != old_size || bytes.is_some_and(|bytes| !bytes.is_empty()) {
             let entries = self.read_ea(&record)?;
             let kept: Vec<Entry> = entries.iter().filter(|entry| !entry.name.starts_with(b"$KERNEL.PURGE.")).cloned().collect();
             if kept.len() != entries.len() {
                 self.store_ea(&record, &mut list, &kept, 0)?;
+                ea_changed = true;
             }
         }
         let mut standard = find_attribute(&record, 0x10)?.map(|standard| standard.value).unwrap_or_else(|| alloc::vec![0; 72]);
+        let old_flags = u32_at(&standard, 32) as u64;
         put64(&mut standard, 8, now());
         put64(&mut standard, 16, now());
-        let flags = u32_at(&standard, 32) as u64 | 0x20;
+        let flags = old_flags | 0x20;
         put32(&mut standard, 32, flags);
         replace(&mut list, 0x10, Some(resident(0x10, &standard, "")));
-        self.refresh_name(entry.reference, &record, &mut list, size, allocated)?;
+        // O NtfsCommonWrite não reescreve o índice do pai: as informações
+        // duplicadas do $FILE_NAME (tamanhos, atributos, tamanho dos EAs) vão
+        // para o $I30 no cleanup (NtfsUpdateDuplicateInfo). Uma escrita no
+        // lugar, sem mudar nenhuma delas, grava só o registro do arquivo.
+        let old_allocated = if data.non_resident { data.allocated_size } else { 0 };
+        let duplicated_same = size == old_size && allocated == old_allocated && data.non_resident == (allocated != 0) && flags == old_flags && !ea_changed;
+        if duplicated_same {
+            self.record(entry.reference, &list, u16_at(&record, 22), Some(&record), 1)?;
+        } else {
+            self.refresh_name(entry.reference, &record, &mut list, size, allocated)?;
+        }
         Ok(bytes.map_or(size, |bytes| bytes.len() as u64))
     }
 
