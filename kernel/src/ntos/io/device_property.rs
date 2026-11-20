@@ -308,15 +308,15 @@ fn parse_guid(text: &str) -> Option<[u8; 16]> {
 /// na chave da instância: DeviceDesc (2), HardwareIds (3), CompatibleIds
 /// (4), Service (6), Class (9), ClassGuid (10), Driver (11), Manufacturer
 /// (13), LocationInfo (15) e PDOName (16).
-fn standard_device_property(node: &crate::ntos::io::pnp::devnode::DeviceNode, key: &Devpropkey) -> Option<(u32, alloc::vec::Vec<u8>)> {
+fn standard_device_property(node: &crate::ntos::io::pnp::devnode::DeviceNode, fmtid: &[u8; 16], pid: u32) -> Option<(u32, alloc::vec::Vec<u8>)> {
     use crate::ntos::io::pnp::install;
-    if guest::read_bytes(key.fmtid.address(), 16) != DEVPKEY_DEVICE {
+    if *fmtid != DEVPKEY_DEVICE {
         return None;
     }
     let instance = format!("{}\\Enum\\{}", install::CONTROL_SET, node.instance_path);
     let text = |value: String| -> (u32, alloc::vec::Vec<u8>) { (DEVPROP_TYPE_STRING, crate::ntos::cm::registry::encode_wide(&value)) };
     let display = |value: String| -> String { if value.starts_with('@') { value.rsplit_once(';').map(|(_, text)| String::from(text)).unwrap_or(value) } else { value } };
-    match key.pid.get() {
+    match pid {
         2 => install::read_text(&instance, "DeviceDesc").map(display).map(text),
         3 => (!node.hardware_ids.is_empty()).then(|| (DEVPROP_TYPE_STRING_LIST, install::multi_sz_owned(&node.hardware_ids))),
         4 => (!node.compatible_ids.is_empty()).then(|| (DEVPROP_TYPE_STRING_LIST, install::multi_sz_owned(&node.compatible_ids))),
@@ -341,9 +341,40 @@ pub fn query_device_property_data(pdo: u64, key: &Devpropkey, lcid: u32, _flags:
     if !is_pnp_device(pdo) {
         return PROPERTY_STATUS_INVALID_DEVICE_REQUEST;
     }
-    let stored = PROPERTIES.lock().get(&read_key(Owner::Device(pdo), key, lcid)).cloned();
-    let found = stored.or_else(|| crate::ntos::io::pnp::devnode::get(pdo).and_then(|node| standard_device_property(&node, key)));
+    let property_key = read_key(Owner::Device(pdo), key, lcid);
+    let stored = PROPERTIES.lock().get(&property_key).cloned();
+    let found = stored.or_else(|| crate::ntos::io::pnp::devnode::get(pdo).and_then(|node| standard_device_property(&node, &property_key.1, property_key.2)));
     answer_property(found, size, data, required, type_output)
+}
+
+/// Um objeto do PnP pelo nome, como o PiCMGetObjectProperty o entrega ao
+/// _PnpGetObjectProperty: o caminho de instância de um dispositivo ou o
+/// link simbólico de uma interface.
+pub enum NamedObject<'a> {
+    Device(&'a str),
+    Interface(&'a str),
+}
+
+/// A propriedade DEVPROPKEY (LCID neutro) de um objeto nomeado:
+/// `Ok((tipo, bytes))`, ou STATUS_NOT_FOUND (propriedade ou interface
+/// ausente, o status do armazenamento antes da troca que o
+/// IoGet*PropertyData faz) e STATUS_NO_SUCH_DEVICE (instância sem devnode).
+pub fn named_object_property(object: NamedObject, fmtid: [u8; 16], pid: u32) -> Result<(u32, alloc::vec::Vec<u8>), u32> {
+    const STATUS_NOT_FOUND: u32 = 0xC000_0225;
+    const STATUS_NO_SUCH_DEVICE: u32 = 0xC000_000E;
+    match object {
+        NamedObject::Device(instance) => {
+            let Some(node) = crate::ntos::io::pnp::devnode::by_instance_path(instance).and_then(crate::ntos::io::pnp::devnode::get) else { return Err(STATUS_NO_SUCH_DEVICE) };
+            let stored = PROPERTIES.lock().get(&(Owner::Device(node.pdo), fmtid, pid, 0)).cloned();
+            stored.or_else(|| standard_device_property(&node, &fmtid, pid)).ok_or(STATUS_NOT_FOUND)
+        }
+        NamedObject::Interface(link) => {
+            if crate::ntos::io::device_interface::interface_enabled(link).is_none() {
+                return Err(STATUS_NOT_FOUND);
+            }
+            PROPERTIES.lock().get(&(Owner::Interface(String::from(link)), fmtid, pid, 0)).cloned().ok_or(STATUS_NOT_FOUND)
+        }
+    }
 }
 
 /// Leitura do armazenamento: a propriedade guardada pela chave.

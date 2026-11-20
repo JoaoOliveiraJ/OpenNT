@@ -132,6 +132,7 @@ const STATUS_OBJECT_NAME_INVALID: u32 = 0xC000_0033;
 const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
 const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
 const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
+const STATUS_NOT_FOUND: u32 = 0xC000_0225;
 /// CM_GET_DEVICE_INTERFACE_LIST_PRESENT / CM_GETIDLIST_FILTER_PRESENT no
 /// formato do kernel.
 const LIST_PRESENT: u32 = 0x1_0000;
@@ -648,9 +649,71 @@ fn get_related_device_instance(buffers: &Buffers) -> (u32, u64) {
     return_buffer(buffers, status, data.len() as u32, 0, &data, input.result_size)
 }
 
+/// O pedido de propriedade do cfgmgr32 depois do
+/// PiCMCapturePropertyInputData (19041 0x6adbb4; 64 bits: 0x48 bytes, Size
+/// em +0): +4 os flags, +8 o tipo do objeto, +0x10/+0x18 o nome, +0x1C o
+/// DEVPROPKEY (FMTID e PID), +0x30 e +0x38/+0x40 (um segundo texto) que a
+/// leitura exige zerados, e +0x44 o tamanho do resultado esperado.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PropertyInput {
+    pub flags: u32,
+    pub object_type: u32,
+    pub name: Option<String>,
+    pub fmtid: [u8; 16],
+    pub pid: u32,
+    pub reserved: u32,
+    pub second: Option<String>,
+    pub result_size: u32,
+}
+
+pub fn capture_property_input(buffers: &Buffers) -> Result<PropertyInput, u32> {
+    let (bytes, user) = capture_fixed(buffers, 0x48)?;
+    let pointer = |offset: usize| u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap_or([0; 8]));
+    let name = capture_name(pointer(0x10), u32_at(&bytes, 0x18), user)?;
+    let second = capture_name(pointer(0x38), u32_at(&bytes, 0x40), user)?;
+    let mut fmtid = [0u8; 16];
+    fmtid.copy_from_slice(&bytes[0x1C..0x2C]);
+    Ok(PropertyInput { flags: u32_at(&bytes, 4), object_type: u32_at(&bytes, 8), name, fmtid, pid: u32_at(&bytes, 0x2C), reserved: u32_at(&bytes, 0x30), second, result_size: u32_at(&bytes, 0x44) })
+}
+
+/// PiCMGetObjectProperty (0x204; 19041 0x6ad91c): o nome é obrigatório e os
+/// flags, +0x30 e o segundo texto têm de vir zerados, com saída de ao menos
+/// 0x14 bytes (senão STATUS_INVALID_PARAMETER no resultado). O tipo do
+/// objeto vira o do PnP: dispositivo (1) e interface (2) pelo armazenamento
+/// de propriedades (`io/device_property.rs`); contêiner (3), classe de
+/// interface (4), classe de instalação (5), 6 e os objetos do banco de
+/// drivers (0x10001..0x10005) não têm armazenamento no OpenNT e respondem
+/// STATUS_NOT_FOUND; outro tipo é STATUS_INVALID_PARAMETER. O resultado é o
+/// do PiCMReturnBufferResultData: Required = o tamanho da propriedade e
+/// Extra = o DEVPROPTYPE, com os dados só no sucesso; buffer curto é
+/// STATUS_BUFFER_TOO_SMALL com o tamanho e o tipo.
+fn get_object_property(buffers: &Buffers) -> (u32, u64) {
+    use crate::ntos::io::device_property::{named_object_property, NamedObject};
+    let input = match capture_property_input(buffers) {
+        Ok(input) => input,
+        Err(status) => return (status, 0),
+    };
+    let valid = input.name.is_some() && input.flags == 0 && input.reserved == 0 && input.second.is_none() && buffers.output != 0 && buffers.output_length >= 0x14;
+    let name = input.name.as_deref().unwrap_or("");
+    let found = match input.object_type {
+        _ if !valid => Err(STATUS_INVALID_PARAMETER),
+        1 => named_object_property(NamedObject::Device(name), input.fmtid, input.pid),
+        2 => named_object_property(NamedObject::Interface(name), input.fmtid, input.pid),
+        3..=6 | 0x1_0001..=0x1_0005 => Err(STATUS_NOT_FOUND),
+        _ => Err(STATUS_INVALID_PARAMETER),
+    };
+    let (status, required, property_type, data) = match found {
+        Ok((property_type, bytes)) if (bytes.len() as u64) > (buffers.output_length - 0x14) as u64 => (STATUS_BUFFER_TOO_SMALL, bytes.len() as u32, property_type, Vec::new()),
+        Ok((property_type, bytes)) => (0, bytes.len() as u32, property_type, bytes),
+        Err(status) => (status, 0, 0, Vec::new()),
+    };
+    return_buffer(buffers, status, required, property_type, &data, input.result_size)
+}
+
 /// PiCMHandleIoctl: NTSTATUS e o Information.
 pub fn handle_ioctl(code: u32, buffers: &Buffers) -> (u32, u64) {
     match code {
+        code::GET_OBJECT_PROPERTY => get_object_property(buffers),
         code::GET_DEVICE_STATUS => get_device_status(buffers),
         code::VALIDATE_DEVICE_INSTANCE => validate_device_instance(buffers),
         code::GET_DEVICE_DEPTH => get_device_depth(buffers),

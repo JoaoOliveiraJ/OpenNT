@@ -196,6 +196,47 @@ pub fn run(assert: Assert) {
         present == [8, 0] && no_key == [8, STATUS_NO_SUCH_DEVICE] && bad_flags == [8, STATUS_INVALID_PARAMETER] && wrong_size.0 == STATUS_INVALID_PARAMETER && unknown.0 == STATUS_NOT_SUPPORTED,
         "deviceapi: ValidateDeviceInstance (chave Enum e no presente) e recusas de entrada e de codigo",
     );
+    // PiCMGetObjectProperty (0x204): o pedido de 0x48 bytes com o
+    // DEVPROPKEY; a propriedade guardada no nó volta com Required = tamanho
+    // e Extra = DEVPROPTYPE, a saída curta dá STATUS_BUFFER_TOO_SMALL, a
+    // ausente STATUS_NOT_FOUND, a instância sem nó STATUS_NO_SUCH_DEVICE e
+    // flags não nulos STATUS_INVALID_PARAMETER, todos no resultado.
+    let property_input = |object_type: u32, name: &str, fmtid: [u8; 16], pid: u32, flags: u32| {
+        guest::write_bytes(input, &[0u8; 0x200]);
+        guest::write32(input, 0x48);
+        guest::write32(input + 4, flags);
+        guest::write32(input + 8, object_type);
+        let units: Vec<u16> = name.encode_utf16().chain(core::iter::once(0)).collect();
+        guest::write_bytes(input + 0x80, &units.iter().flat_map(|unit| unit.to_le_bytes()).collect::<Vec<u8>>());
+        guest::write64(input + 0x10, input + 0x80);
+        guest::write32(input + 0x18, units.len() as u32 * 2);
+        guest::write_bytes(input + 0x1C, &fmtid);
+        guest::write32(input + 0x2C, pid);
+        guest::write32(input + 0x44, 0x14);
+    };
+    let property_key = [0x5Au8; 16];
+    crate::ntos::io::device_property::store_device_property(fake_pdo, property_key, 7, 7, &0x1234_5678u32.to_le_bytes());
+    property_input(1, "Root\\OPENNT_CMAPI\\0000", property_key, 7, 0);
+    let found = (control(cm_api::code::GET_OBJECT_PROPERTY, 0x48, 0x100), words(5));
+    let short = (control(cm_api::code::GET_OBJECT_PROPERTY, 0x48, 0x14), words(4));
+    property_input(1, "Root\\OPENNT_CMAPI\\0000", property_key, 8, 0);
+    let _ = control(cm_api::code::GET_OBJECT_PROPERTY, 0x48, 0x100);
+    let absent = words(4);
+    property_input(1, "Root\\OPENNT_SEM_NO\\0000", property_key, 7, 0);
+    let _ = control(cm_api::code::GET_OBJECT_PROPERTY, 0x48, 0x100);
+    let no_node = words(4);
+    property_input(1, "Root\\OPENNT_CMAPI\\0000", property_key, 7, 1);
+    let _ = control(cm_api::code::GET_OBJECT_PROPERTY, 0x48, 0x100);
+    let bad_flags = words(4);
+    crate::ntos::io::device_property::store_device_property(fake_pdo, property_key, 7, 0, &[]);
+    assert(
+        found == ((0, 0x18), alloc::vec![0x14, 0, 4, 7, 0x1234_5678])
+            && short == ((0, 0x14), alloc::vec![0x14, 0xC000_0023, 4, 7])
+            && absent == [0x14, 0xC000_0225, 0, 0]
+            && no_node == [0x14, STATUS_NO_SUCH_DEVICE, 0, 0]
+            && bad_flags == [0x14, STATUS_INVALID_PARAMETER, 0, 0],
+        "deviceapi: GetObjectProperty devolve a propriedade do no (tamanho e tipo), BUFFER_TOO_SMALL, NOT_FOUND, NO_SUCH_DEVICE e flags recusados no resultado",
+    );
     devnode::remove(fake_child);
     devnode::remove(fake_pdo);
     guest::free_bytes(fake_pdo);
