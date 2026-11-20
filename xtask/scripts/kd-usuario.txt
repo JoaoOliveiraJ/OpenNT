@@ -10,9 +10,9 @@
 # thread sai de um breakpoint antes de ele chegar, nem quando o host pede um
 # passo (s) numa parada de usuário e continua depois. O csrss.exe segue vivo
 # depois dos acertos e o boot chega ao fim do roteiro do smss. No fim, a
-# pilha de cada thread do csrss.exe em espera chega ao RtlUserThreadStart,
-# também a das threads sem serviço suspenso (uma espera adiada), lida do
-# CONTEXT do anel 3 delas.
+# pilha de cada thread em espera do smss.exe e do csrss.exe chega ao começo
+# da thread, também a das threads sem serviço suspenso (uma espera adiada),
+# lida do CONTEXT do anel 3 delas.
 
 attach
 expect-stop SIGINT
@@ -45,22 +45,6 @@ if serial-has "first chance 0x80000004" {
     fail o passo do depurador chegou ao processo como STATUS_SINGLE_STEP
 }
 
-# A pilha das threads do csrss.exe em espera: a de uma espera adiada sai do
-# CONTEXT do anel 3 (sem quadro de troca), a de um serviço bloqueado do
-# quadro de troca e atravessa a syscall.
-set anel3 nao
-for-each thread t process csrss state Waiting {
-    btt $t 48
-    expect-not #0  0x0000000000000000
-    expect RtlUserThreadStart
-    if output-has "no anel 3" {
-        set anel3 sim
-    }
-}
-if "${anel3}" != "sim" {
-    fail nenhuma thread do csrss.exe em espera adiada (a pilha pelo CONTEXT do anel 3)
-}
-
 # Sem o breakpoint, o csrss.exe continua rodando.
 bc all
 continue
@@ -69,6 +53,33 @@ break
 expect-stop SIGINT
 ps
 expect csrss.exe
+
+# A pilha das threads em espera do smss.exe e do csrss.exe, parados há 3 s:
+# a de uma espera adiada (as do porto ALPC do smss.exe) sai do CONTEXT do
+# anel 3, sem quadro de troca; a de um serviço bloqueado sai do quadro de
+# troca e atravessa a syscall. As duas vão até o começo da thread.
+set anel3 nao
+for-each thread t process smss state Waiting {
+    btt $t 48
+    expect-not #0  0x0000000000000000
+    expect-not -- parou:
+    expect -- fim da pilha
+    if output-has "no anel 3" {
+        set anel3 sim
+    }
+}
+for-each thread t process csrss state Waiting {
+    btt $t 48
+    expect-not #0  0x0000000000000000
+    expect-not -- parou:
+    expect -- fim da pilha
+    if output-has "no anel 3" {
+        set anel3 sim
+    }
+}
+if "${anel3}" != "sim" {
+    fail nenhuma thread em espera adiada (a pilha pelo CONTEXT do anel 3)
+}
 if serial-has "first chance 0x80000004" {
     fail o passo do depurador chegou ao processo como STATUS_SINGLE_STEP
 }

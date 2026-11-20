@@ -383,6 +383,9 @@ impl ReadMemory for Client {
 
 impl Target for Client {
     fn function_table(&mut self, address: u64) -> Option<Arc<FunctionTable>> {
+        if self.symbols.module_at(address).is_none() && !self.reread_user_modules_for(address) {
+            return None;
+        }
         if self.tables_generation != self.symbols.generation {
             self.function_tables.clear();
             self.tables_generation = self.symbols.generation;
@@ -1178,6 +1181,19 @@ impl Client {
         }
         self.symbols.wait_module_pdb(module);
         self.symbols.lookup(name)
+    }
+
+    /// Um endereço da metade de usuário fora dos módulos conhecidos (uma DLL
+    /// carregada depois da última leitura da PEB.Ldr, como a pilha de uma
+    /// thread do csrss.exe que já está no win32u depois de uma parada no
+    /// começo dele): os módulos de usuário do processo escolhido são relidos,
+    /// uma vez por parada. `true` se o endereço passou a ter módulo.
+    fn reread_user_modules_for(&mut self, address: u64) -> bool {
+        if address < 0x10000 || address >= USER_LIMIT || !self.stopped || self.process_context.is_none() || self.user_modules_stop == self.stops {
+            return false;
+        }
+        self.user_modules_stop = self.stops;
+        self.reload_user_modules().is_ok() && self.symbols.module_at(address).is_some()
     }
 
     /// Espera os PDBs ainda ausentes dos módulos destes endereços (todos
