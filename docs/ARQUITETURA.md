@@ -1638,7 +1638,12 @@ além da KUSER_SHARED_DATA:
   aceita UserPhysicalFlags e NumaNode, recusa os bits de nó no
   AllocationAttributes, e a seção de páginas físicas de usuário (AWE) passa
   pelas regras do MiCreatePagingFileMap até o SeLockMemoryPrivilege
-  (`mm/physical_pages.rs`). A vista é ViewShare, sem ZeroBits nem
+  (`mm/physical_pages.rs`). Os serviços AWE (NtAllocateUserPhysicalPages(Ex),
+  NtFreeUserPhysicalPages, NtMapUserPhysicalPages(Scatter)) fazem as
+  checagens do 19041 até a AweInfo, que o OpenNT ainda não tem: a alocação
+  termina em STATUS_PRIVILEGE_NOT_HELD (com uma linha `[awe-boundary]` quando
+  o processo tem o SeLockMemoryPrivilege), a liberação e os mapeamentos em
+  STATUS_INVALID_PARAMETER_1 (sem AweInfo e sem VAD AWE). A vista é ViewShare, sem ZeroBits nem
   CommitSize, com AddressRequirements (o MiMapExParametersInitialize: sem
   Alignment, LowestStartingAddress na granularidade, HighestEndingAddress
   no fim de uma página e até 0x7FFFFFFEFFFF, nada com uma base pedida),

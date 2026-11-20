@@ -1775,8 +1775,35 @@ fn nt_are_mapped_files_the_same(image_address: u64, file_address: u64, _a3: u64,
     Ok(crate::ntos::mm::section::image_segment::are_mapped_files_the_same(image_address, file_address))
 }
 
+/// NtAllocateUserPhysicalPages(Ex), NtFreeUserPhysicalPages e
+/// NtMapUserPhysicalPages(Scatter): `mm/physical_pages`.
+fn nt_allocate_user_physical_pages(process: u64, count: u64, pfns: u64, _a4: u64, _user_rsp: u64) -> Result<u32, KernelError> {
+    crate::ntos::mm::physical_pages::allocate(process, count, pfns, 0, 0, 1)
+}
+
+fn nt_allocate_user_physical_pages_ex(process: u64, count: u64, pfns: u64, parameters: u64, user_rsp: u64) -> Result<u32, KernelError> {
+    crate::ntos::mm::physical_pages::allocate(process, count, pfns, parameters, state::stack_arg32(user_rsp, 5), 1)
+}
+
+fn nt_free_user_physical_pages(process: u64, count: u64, pfns: u64, _a4: u64, _user_rsp: u64) -> Result<u32, KernelError> {
+    crate::ntos::mm::physical_pages::free(process, count, pfns, 1)
+}
+
+fn nt_map_user_physical_pages(address: u64, count: u64, pfns: u64, _a4: u64, _user_rsp: u64) -> Result<u32, KernelError> {
+    crate::ntos::mm::physical_pages::map(address, count, pfns)
+}
+
+fn nt_map_user_physical_pages_scatter(addresses: u64, count: u64, pfns: u64, _a4: u64, _user_rsp: u64) -> Result<u32, KernelError> {
+    crate::ntos::mm::physical_pages::map_scatter(addresses, count, pfns)
+}
+
 /// Registra os handlers Nt*VirtualMemory e o NtCreatePagingFile.
 pub fn init() {
+    state::register_handler("NtAllocateUserPhysicalPages", nt_allocate_user_physical_pages);
+    state::register_handler("NtAllocateUserPhysicalPagesEx", nt_allocate_user_physical_pages_ex);
+    state::register_handler("NtFreeUserPhysicalPages", nt_free_user_physical_pages);
+    state::register_handler("NtMapUserPhysicalPages", nt_map_user_physical_pages);
+    state::register_handler("NtMapUserPhysicalPagesScatter", nt_map_user_physical_pages_scatter);
     state::register_handler("NtAreMappedFilesTheSame", nt_are_mapped_files_the_same);
     state::register_handler("NtFlushVirtualMemory", nt_flush_virtual_memory);
     state::register_handler("NtLockVirtualMemory", nt_lock_virtual_memory);

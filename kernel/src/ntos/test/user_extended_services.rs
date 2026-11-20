@@ -4,7 +4,7 @@
 //! NtMapViewOfSectionEx com os parâmetros estendidos, e o
 //! NtSetCachedSigningLevel(2) de modo usuário (com uma SeCiCallbacks de
 //! teste quando a ci.dll não está carregada), o NtExtendSection e o
-//! NtSetVolumeInformationFile.
+//! NtSetVolumeInformationFile, e as recusas dos serviços AWE.
 
 use crate::ntos::inc::field::NtStruct;
 use crate::ntos::inc::types::{EventBasicInformation, Eprocess};
@@ -46,6 +46,7 @@ pub fn run(assert: Assert) {
     set_signing_level(assert, block, rsp, &call);
     extend_section(assert, block, rsp, &call);
     set_volume_information(assert, block, rsp, &call);
+    user_physical_pages(assert, block, rsp, &call);
     if let Some(region) = memory::find_region(block) {
         memory::release_private_region(&region);
     }
@@ -626,3 +627,68 @@ fn set_volume_information(assert: Assert, block: u64, rsp: u64, call: Call) {
     );
 }
 
+/// Os serviços AWE: as checagens do 19041 antes da AweInfo (zero páginas, o
+/// tamanho, as sondas, os parâmetros estendidos do Ex, a seção que não é
+/// AWE, o handle) e, sem AweInfo nem VAD AWE no OpenNT, o
+/// STATUS_PRIVILEGE_NOT_HELD da alocação, o STATUS_INVALID_PARAMETER_1 da
+/// liberação (com o NumberOfPages zerado) e dos mapeamentos.
+fn user_physical_pages(assert: Assert, block: u64, rsp: u64, call: Call) {
+    const STATUS_PRIVILEGE_NOT_HELD: u32 = 0xC000_0061;
+    const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+    let (count, pfns, parameters, addresses, cells) = (block + 0x2C00, block + 0x2C40, block + 0x2C80, block + 0x2CC0, block + 0x2D00);
+    let allocate = |handle: u64, pages: u64, array: u64| {
+        guest::write64(count, pages);
+        call("NtAllocateUserPhysicalPages", handle, count, array, 0)
+    };
+    let allocate_ex = |kind: u64, value: u64| {
+        guest::write64(count, 2);
+        parameter(parameters, kind, value);
+        guest::write64(rsp + 0x28, 1);
+        call("NtAllocateUserPhysicalPagesEx", u64::MAX, count, pfns, parameters)
+    };
+    let zero = allocate(u64::MAX, 0, pfns);
+    let allocated = allocate(u64::MAX, 4, pfns);
+    let huge = allocate(u64::MAX, 0x2000_0000_0000_0000, pfns);
+    let unaligned = allocate(u64::MAX, 4, pfns + 4);
+    let bad_count = call("NtAllocateUserPhysicalPages", u64::MAX, 0xFFFF_8000_0000_0000, pfns, 0);
+    let graphics = allocate_ex(5, 1);
+    let both = allocate_ex(5, 0xA);
+    let partition = allocate_ex(3, u64::MAX);
+    let node = allocate_ex(2, 1);
+    let nonpaged = allocate_ex(5, 2);
+    // Uma seção de pagefile não é AWE.
+    guest::write64(cells + 8, 0x1000);
+    guest::write64(rsp + 0x28, 4);
+    guest::write64(rsp + 0x30, 0x0800_0000);
+    guest::write64(rsp + 0x38, 0);
+    let section_created = call("NtCreateSection", cells, 0xF_001F, 0, cells + 8);
+    let section = guest::read64(cells);
+    let not_awe = allocate(section, 4, pfns);
+    let _ = state::close_user_handle(section, true, false);
+    let bad_handle = allocate(0x7FF8, 4, pfns);
+    assert(
+        zero == 0 && allocated == STATUS_PRIVILEGE_NOT_HELD && huge == STATUS_INVALID_PARAMETER_2 && unaligned == STATUS_DATATYPE_MISALIGNMENT && bad_count == STATUS_ACCESS_VIOLATION
+            && graphics == STATUS_INVALID_PARAMETER && both == STATUS_INVALID_PARAMETER && partition == STATUS_INVALID_PARAMETER && node == STATUS_INVALID_PARAMETER && nonpaged == STATUS_PRIVILEGE_NOT_HELD
+            && section_created == 0 && not_awe == STATUS_INVALID_HANDLE && bad_handle == STATUS_INVALID_HANDLE,
+        &alloc::format!("extended: NtAllocateUserPhysicalPages(Ex) confere os parametros e o handle antes da AweInfo (zero {zero:#x}, quatro {allocated:#x}, grande {huge:#x}, alinhamento {unaligned:#x}, contagem {bad_count:#x}, ex {graphics:#x}/{both:#x}/{partition:#x}/{node:#x}/{nonpaged:#x}, secao {section_created:#x}/{not_awe:#x}, handle {bad_handle:#x})"),
+    );
+    guest::write64(count, 0);
+    let free_zero = call("NtFreeUserPhysicalPages", u64::MAX, count, pfns, 0);
+    guest::write64(count, 2);
+    let free_some = call("NtFreeUserPhysicalPages", u64::MAX, count, pfns, 0);
+    let free_count = guest::read64(count);
+    guest::write64(count, 2);
+    let free_bad_handle = call("NtFreeUserPhysicalPages", 0x7FF8, count, pfns, 0);
+    let map_zero = call("NtMapUserPhysicalPages", 0x2_0000_0000, 0, 0, 0);
+    let map_unmap = call("NtMapUserPhysicalPages", 0x2_0000_0000, 1, 0, 0);
+    let map_unaligned = call("NtMapUserPhysicalPages", 0x2_0000_0000, 1, pfns + 4, 0);
+    guest::write64(addresses, 0x2_0000_0000);
+    let scatter_zero = call("NtMapUserPhysicalPagesScatter", addresses, 0, 0, 0);
+    let scatter_one = call("NtMapUserPhysicalPagesScatter", addresses, 1, pfns, 0);
+    let scatter_unaligned = call("NtMapUserPhysicalPagesScatter", addresses + 4, 1, 0, 0);
+    assert(
+        free_zero == STATUS_INVALID_PARAMETER_2 && free_some == STATUS_INVALID_PARAMETER_1 && free_count == 0 && free_bad_handle == STATUS_INVALID_HANDLE && map_zero == STATUS_INVALID_PARAMETER_2
+            && map_unmap == STATUS_INVALID_PARAMETER_1 && map_unaligned == STATUS_DATATYPE_MISALIGNMENT && scatter_zero == 0 && scatter_one == STATUS_INVALID_PARAMETER_1 && scatter_unaligned == STATUS_DATATYPE_MISALIGNMENT,
+        &alloc::format!("extended: NtFreeUserPhysicalPages e NtMapUserPhysicalPages(Scatter) sem AweInfo nem VAD AWE (liberacao {free_zero:#x}/{free_some:#x}/{free_count:#x}/{free_bad_handle:#x}, mapa {map_zero:#x}/{map_unmap:#x}/{map_unaligned:#x}, espalhado {scatter_zero:#x}/{scatter_one:#x}/{scatter_unaligned:#x})"),
+    );
+}
