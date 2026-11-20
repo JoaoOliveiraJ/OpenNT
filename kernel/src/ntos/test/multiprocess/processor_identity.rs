@@ -203,6 +203,8 @@ fn shared_data(assert: Assert) {
     let agrees = published.iter().zip(expected.iter()).all(|(&value, wanted)| wanted.is_none_or(|wanted| value == wanted as u8));
     assert(agrees, "cpu-identidade: ProcessorFeatures (PF_*) da KUSER_SHARED_DATA pela lista do KiInitializeKernel");
     assert(data.active_processor_count.get() == smp::online_cpu_count() as u32 && data.test_ret_instruction.get() == 0xC3, "cpu-identidade: ActiveProcessorCount com os processadores online e TestRetInstruction");
+    // O RtlBackoff da ntdll divide por ele com mais de um processador.
+    assert(data.cycles_per_yield.get() != 0, "cpu-identidade: CyclesPerYield medido no boot (os ciclos de um pause, nunca zero)");
     let user_view = with_test_process("cpu-recursos.exe", None, |_| guest::read_bytes(0x7FFE_0274, 64));
     assert(user_view.is_some_and(|view| view == published), "cpu-identidade: a visao de usuario (0x7FFE0274) que o IsProcessorFeaturePresent le e a mesma");
 }

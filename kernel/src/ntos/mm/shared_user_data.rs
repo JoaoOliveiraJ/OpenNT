@@ -180,8 +180,27 @@ pub fn init() -> bool {
     // QpcFrequency, os incrementos QPC, TickCountMultiplier, QpcBias, o
     // atalho do QPC em modo usuário e o primeiro tick.
     clock::publish_shared_constants(data);
+    // O Phase1InitializationDiscard do 19041 (0xa3b95e..0xa3b96a). Com mais
+    // de um processador, o RtlBackoff da ntdll (a espera das seções
+    // críticas e dos SRW locks contendidos) divide por ele: zero dava
+    // STATUS_INTEGER_DIVIDE_BY_ZERO no services.exe com duas CPUs.
+    data.cycles_per_yield.set(compute_cycles_per_yield());
     debug_print!("[mm] KUSER_SHARED_DATA mapeada (frame {:#x}); pagina de referencia do QPC em {:#x}", frame, hypervisor_shared_user_va());
     true
+}
+
+/// ExpComputeCyclesPerYield (19041 0xa6b1a0): os ciclos do TSC de 256
+/// `pause` com as interrupções desligadas, divididos por 256, entre 1 e
+/// 0xFFFF; o KUSER_SHARED_DATA.CyclesPerYield.
+pub fn compute_cycles_per_yield() -> u16 {
+    let flags = crate::hal::cpu::save_and_disable_interrupts();
+    let started = crate::hal::cpu::rdtsc();
+    for _ in 0..0x100 {
+        core::hint::spin_loop();
+    }
+    let elapsed = crate::hal::cpu::rdtsc().wrapping_sub(started);
+    crate::hal::cpu::restore_interrupts(flags);
+    (elapsed >> 8).clamp(1, 0xFFFF) as u16
 }
 
 /// ActiveProcessorCount: os processadores online, atualizado quando um AP
