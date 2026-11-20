@@ -236,6 +236,13 @@ fn identifier_key(identifier: &[u8; 16], silo: u64) -> String {
     entry_key(identifier, silo, false)
 }
 
+/// Os GUIDs das entradas de provedor de trace (EtwTraceGuidType), na ordem
+/// das entradas: o que o EtwpGetNextGuidEntry percorre para o
+/// EtwpGetTraceGuidList.
+pub fn trace_guids() -> Vec<[u8; 16]> {
+    with(|etw| etw.entries.iter().filter(|(key, _)| key.starts_with("0:")).map(|(_, entry)| entry.identifier).collect())
+}
+
 /// Retira IsEnabled enquanto os outros campos são publicados.
 fn publish_information(target: &TraceEnableInfo, information: &Information, session: u16) {
     target.is_enabled.set(0);

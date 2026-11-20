@@ -2978,9 +2978,16 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   dos descritores; EtwActivityIdControl usa o TEB.ActivityId da thread
   (thread de sistema: STATUS_NOT_SUPPORTED) e a semente do
   KPRCB.EtwSupport para IDs novos. O despacho do NtTraceControl valida os
-  43 códigos como o 19041; ficam sem implementação (STATUS_INVALID_DEVICE_REQUEST
-  depois da validação) o EnableTraceEx2 de modo usuário (17), as respostas a notificações, as listas de GUIDs e
-  grupos, WDI, compressão e sessões privadas, que nenhum processo do boot
+  43 códigos como o 19041. O EnableTraceEx2 de modo usuário (17 com o tipo
+  EtwNotificationTypeEnable) habilita, desabilita ou pede a captura de
+  estado do provedor na sessão do LoggerId pelo mesmo EtwEnableTrace (sem
+  os descritores de filtro); o 21 lista os GUIDs das entradas de provedor
+  e os 10 do global logger de modo usuário; o 25 devolve o ETW_REF_CLOCK
+  {StartTime, StartPerfClock} gravado no início da sessão. Ficam sem
+  implementação (STATUS_INVALID_DEVICE_REQUEST depois da validação) as
+  outras notificações do 17, as respostas a notificações (18 e 19), a
+  informação de um GUID e a enumeração (22 e 23), as listas de grupos e de
+  exclusão, WDI, compressão e sessões privadas, que nenhum processo do boot
   usa; os grupos de provedores dos traits, os eventos de imagem do
   EtwTrackProviderBinary e os loggers clássicos por TRACEHANDLE (NtTraceEvent
   0x200) também não existem. Os autologgers do Registro (`autologger.rs`, o

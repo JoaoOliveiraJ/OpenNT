@@ -1046,13 +1046,19 @@ pub fn trace_control(code: u32, input: u64, input_length: u32, output: u64, outp
         16 => user_registration::receive_notification(&mut buffer, output_length, wow64),
         17 if input_length < 0x48 || output_length != 0x48 || get32(&buffer, 4) != input_length => invalid,
         17 if get32(&buffer, 0) == 3 && input_length < 0x78 => invalid,
+        17 if get32(&buffer, 0) == ETW_NOTIFICATION_TYPE_ENABLE => match enable_guid(&buffer)? {
+            0 => Ok(0x48),
+            status => Err((status, 0)),
+        },
         18 if input_length < 0x48 || get32(&buffer, 4) != input_length => invalid,
         19 if input_length != 8 => invalid,
         20 if input_length != 0 || output_length != 0 => invalid,
+        21 => trace_guid_list(&mut buffer, output_length),
         22 if input_length != 0x10 => invalid,
         24 if input_length != 0 || output_length != 0 => invalid,
         24 => status_only(register_security_provider()),
         25 if input_length != 4 || output_length != 0x10 => invalid,
+        25 => query_reference_time(&mut buffer),
         26 if input_length != 8 => invalid,
         26 => status_only(user_registration::track_provider_binary(u64::from_le_bytes(buffer[0..8].try_into().unwrap()), mode)?),
         27 if input_length != 4 => invalid,
@@ -1106,6 +1112,95 @@ pub fn trace_control(code: u32, input: u64, input_length: u32, output: u64, outp
         }
     }
     Ok(status)
+}
+
+/// ETW_NOTIFICATION_TYPE EtwNotificationTypeEnable: o EnableTraceEx2 de modo
+/// usuário (o EtwSendNotification da ntdll).
+const ETW_NOTIFICATION_TYPE_ENABLE: u32 = 3;
+/// O LoggerId que o EtwpValidateEnableNotification recusa com
+/// STATUS_ACCESS_DENIED.
+const RESERVED_LOGGER_ID: u16 = 3;
+/// A lista fixa de provedores do global logger de modo usuário
+/// (EtwpUmglProviders, 10 GUIDs) que o EtwpGetTraceGuidList soma às
+/// entradas.
+const UMGL_PROVIDERS: [[u8; 16]; 10] = [
+    [0x11, 0xca, 0x81, 0xd7, 0xc0, 0x61, 0x87, 0x43, 0xb8, 0x3d, 0xaf, 0x52, 0xd3, 0xd2, 0xdd, 0x6a],
+    [0xb2, 0x60, 0xde, 0xd3, 0x63, 0xa6, 0xd5, 0x45, 0x98, 0x26, 0xa0, 0xa5, 0x94, 0x9d, 0x2c, 0xb0],
+    [0xe2, 0xd0, 0x61, 0xc8, 0xc1, 0xa2, 0x36, 0x4d, 0x9f, 0x9c, 0x97, 0x0b, 0xab, 0x94, 0x3a, 0x12],
+    [0xc1, 0xd2, 0xda, 0xbd, 0xd1, 0x52, 0xea, 0x4a, 0x94, 0xd6, 0xb3, 0xca, 0x92, 0x36, 0xf6, 0x2e],
+    [0x06, 0x78, 0x86, 0x05, 0x46, 0xc2, 0xef, 0x43, 0xa1, 0x47, 0xe1, 0x7d, 0x2b, 0xdb, 0x14, 0x96],
+    [0x1d, 0x5d, 0xb1, 0x2c, 0xc0, 0x5f, 0xd2, 0x11, 0xab, 0xe1, 0x00, 0xa0, 0xc9, 0x11, 0xf5, 0x18],
+    [0xab, 0x62, 0x29, 0x22, 0x80, 0x61, 0x88, 0x4b, 0xa8, 0x25, 0x34, 0x6b, 0x75, 0xf2, 0xa2, 0x4a],
+    [0x36, 0x67, 0xc6, 0x3a, 0x59, 0xcc, 0xff, 0x4c, 0x81, 0x15, 0x8d, 0xf5, 0x0e, 0x39, 0x81, 0x6b],
+    [0x62, 0x57, 0x69, 0x42, 0x50, 0xea, 0x7a, 0x49, 0x90, 0x68, 0x5c, 0xbb, 0xb3, 0x5e, 0x0b, 0x95],
+    [0x8a, 0xf5, 0xee, 0x3b, 0x6e, 0x6e, 0x5d, 0x44, 0xb2, 0xa4, 0x37, 0xab, 0x73, 0x7b, 0xd4, 0x7e],
+];
+
+/// EtwpEnableGuid (ntoskrnl 19041, 0x715bc4) de uma notificação
+/// EtwNotificationTypeEnable (NtTraceControl 17, 0x5eb2c8) sobre a cópia de
+/// trabalho: o ETW_NOTIFICATION_HEADER (0x48 bytes) com o GUID do provedor
+/// em +0x28 e o TRACE_ENABLE_INFO em +0x48 (IsEnabled, Level em +0x4C,
+/// LoggerId em +0x4E, EnableProperty em +0x50, MatchAnyKeyword em +0x58,
+/// MatchAllKeyword em +0x60). O EtwpValidateEnableNotification (0x7164a0)
+/// recusa IsEnabled acima de 2 (STATUS_INVALID_PARAMETER) e o LoggerId 3
+/// (STATUS_ACCESS_DENIED); a sessão do LoggerId (senão
+/// STATUS_WMI_INSTANCE_NOT_FOUND) recebe a habilitação (1), a desabilitação
+/// (0) ou a captura de estado (2), o mesmo EtwEnableTrace do modo kernel. O
+/// OpenNT ignora os descritores de filtro (+0x74) e a checagem de acesso
+/// TRACELOG_GUID_ENABLE ao GUID, que não tem descritor de segurança aqui.
+fn enable_guid(buffer: &[u8]) -> Result<u32, KernelError> {
+    let control = get32(buffer, 0x48);
+    let level = buffer[0x4C];
+    let logger_id = u16::from_le_bytes([buffer[0x4E], buffer[0x4F]]);
+    let property = get32(buffer, 0x50);
+    let any = u64::from_le_bytes(buffer[0x58..0x60].try_into().unwrap_or([0; 8]));
+    let all = u64::from_le_bytes(buffer[0x60..0x68].try_into().unwrap_or([0; 8]));
+    if control > 2 {
+        return Ok(STATUS_INVALID_PARAMETER);
+    }
+    if logger_id == RESERVED_LOGGER_ID {
+        return Ok(STATUS_ACCESS_DENIED);
+    }
+    if !LOGGERS.lock().contains_key(&logger_id) {
+        return Ok(STATUS_WMI_INSTANCE_NOT_FOUND);
+    }
+    let provider = guest::alloc_bytes(16);
+    if provider == 0 {
+        return Ok(STATUS_INSUFFICIENT_RESOURCES);
+    }
+    guest::write_bytes(provider, &buffer[0x28..0x38]);
+    let status = enable_trace(provider, 0, logger_id, control, level, any, all, property);
+    guest::free_bytes(provider);
+    status
+}
+
+/// EtwpGetTraceGuidList (0x9349d8; NtTraceControl 21): os GUIDs das
+/// entradas de provedor seguidos dos 10 do global logger de modo usuário,
+/// 16 bytes cada, até onde a saída couber; o ReturnLength é o tamanho de
+/// todos, e faltar espaço é STATUS_BUFFER_TOO_SMALL.
+fn trace_guid_list(buffer: &mut [u8], output_length: u32) -> Outcome {
+    let capacity = (output_length / 16) as usize;
+    let guids: Vec<[u8; 16]> = provider_state::trace_guids().into_iter().chain(UMGL_PROVIDERS).collect();
+    for (index, identifier) in guids.iter().take(capacity).enumerate() {
+        buffer[index * 16..index * 16 + 16].copy_from_slice(identifier);
+    }
+    let length = guids.len() as u32 * 16;
+    if guids.len() > capacity {
+        return Err((STATUS_BUFFER_TOO_SMALL, length));
+    }
+    Ok(length)
+}
+
+/// EtwpQueryReferenceTime (0x934c40; NtTraceControl 25): o ETW_REF_CLOCK
+/// {StartTime, StartPerfClock} da sessão do LoggerId da entrada (senão
+/// STATUS_WMI_INSTANCE_NOT_FOUND); o ReturnLength é 0x10 nos dois casos.
+fn query_reference_time(buffer: &mut [u8]) -> Outcome {
+    let logger_id = get32(buffer, 0);
+    let reference = u16::try_from(logger_id).ok().and_then(|id| LOGGERS.lock().get(&id).map(|logger| logger.context.reference_time));
+    let Some([start_time, start_perf_clock]) = reference else { return Err((STATUS_WMI_INSTANCE_NOT_FOUND, 0x10)) };
+    put64(buffer, 0, start_time as u64);
+    put64(buffer, 8, start_perf_clock as u64);
+    Ok(0x10)
 }
 
 /// EtwEnableTrace: habilita (1), desabilita (0) ou pede captura de estado

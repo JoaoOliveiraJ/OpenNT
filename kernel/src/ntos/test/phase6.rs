@@ -4789,6 +4789,46 @@ fn etw_trace_session(assert: Assert, block: u64, prepare: &dyn Fn(u32)) {
     let registration = guest::read64(handle);
     let enabled = call_export("EtwEnableTrace", &[provider, 0, logger_id, 1, 4, 0x10, 0, 0]);
     assert(registered == Some(0) && enabled == Some(0) && ETW_SESSION_CALLBACK[0].load(SeqCst) == 1 && ETW_SESSION_CALLBACK[1].load(SeqCst) == 1 && ETW_SESSION_CALLBACK[2].load(SeqCst) == 4 && ETW_SESSION_CALLBACK[3].load(SeqCst) == 0x10, "etw-session: EtwEnableTrace chama a rotina do provedor com nivel e keywords");
+    // NtTraceControl 17 (EtwNotificationTypeEnable, o EnableTraceEx2 de
+    // modo usuário): a mesma habilitação pelo cabeçalho de notificação; 21
+    // (a lista de GUIDs, com os 10 do global logger de usuário) e 25 (o
+    // ETW_REF_CLOCK da sessão).
+    let notify = guest::alloc_bytes(0x200);
+    let enable_packet = |control: u32, level: u8, any: u64, logger: u16| {
+        guest::write_bytes(notify, &[0u8; 0x78]);
+        guest::write32(notify, 3);
+        guest::write32(notify + 4, 0x78);
+        guest::write_bytes(notify + 0x28, &guest::read_bytes(provider, 16));
+        guest::write32(notify + 0x48, control);
+        guest::write8(notify + 0x4C, level);
+        guest::write16(notify + 0x4E, logger);
+        guest::write64(notify + 0x58, any);
+        call_export("ZwTraceControl", &[17, notify, 0x78, notify + 0x100, 0x48, returned])
+    };
+    let disabled = enable_packet(0, 0, 0, logger_id as u16);
+    let disabled_seen = ETW_SESSION_CALLBACK[1].load(SeqCst);
+    let reserved = enable_packet(1, 4, 0x10, 3);
+    let bad_control = enable_packet(3, 4, 0x10, logger_id as u16);
+    let missing = enable_packet(1, 4, 0x10, 0x3F);
+    let reenabled = enable_packet(1, 4, 0x10, logger_id as u16);
+    assert(
+        disabled == Some(0) && disabled_seen == 0 && reserved == Some(0xFFFF_FFFF_C000_0022) && bad_control == Some(0xFFFF_FFFF_C000_000D) && missing == Some(0xFFFF_FFFF_C000_0296) && reenabled == Some(0) && ETW_SESSION_CALLBACK[1].load(SeqCst) == 1 && ETW_SESSION_CALLBACK[2].load(SeqCst) == 4,
+        "etw-session: NtTraceControl 17 (EnableTraceEx2) desabilita e habilita o provedor na sessao; LoggerId 3, IsEnabled invalido e sessao ausente recusados",
+    );
+    let list = call_export("ZwTraceControl", &[21, 0, 0, notify, 0x200, returned]);
+    let list_length = guest::read32(returned);
+    let listed = (0..list_length.min(0x200) / 16).any(|index| guest::read_bytes(notify + index as u64 * 16, 16) == guest::read_bytes(provider, 16));
+    let short_list = call_export("ZwTraceControl", &[21, 0, 0, notify, 0x10, returned]);
+    guest::write32(notify + 0x100, logger_id as u32);
+    let reference = call_export("ZwTraceControl", &[25, notify + 0x100, 4, notify, 0x10, returned]);
+    let reference_ok = guest::read64(notify) != 0 && guest::read32(returned) == 0x10;
+    guest::write32(notify + 0x100, 0x3F);
+    let reference_missing = call_export("ZwTraceControl", &[25, notify + 0x100, 4, notify, 0x10, returned]);
+    assert(
+        list == Some(0) && list_length >= 11 * 16 && list_length % 16 == 0 && listed && short_list == Some(0xFFFF_FFFF_C000_0023) && guest::read32(returned) == list_length && reference == Some(0) && reference_ok && reference_missing == Some(0xFFFF_FFFF_C000_0296),
+        "etw-session: NtTraceControl 21 (lista de GUIDs com o provedor e os 10 do global logger) e 25 (ETW_REF_CLOCK da sessao)",
+    );
+    guest::free_bytes(notify);
     // EVENT_DESCRIPTOR Id 7, Level 4, Keyword 0x10 e um segmento "etw!".
     guest::write16(descriptor, 7);
     guest::write8(descriptor + 4, 4);
