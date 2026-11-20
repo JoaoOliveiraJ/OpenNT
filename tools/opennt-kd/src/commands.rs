@@ -258,6 +258,17 @@ fn is_event_filter(text: &str) -> bool {
     matches!(code.as_str(), "cpr" | "epr" | "ct" | "et") || (code == "ld" && text.contains('!'))
 }
 
+/// O erro do `bp` diz que o módulo da expressão ainda não carregou: o
+/// `módulo!símbolo` de um módulo ausente, ou o `módulo+RVA` com um nome com
+/// pontos (`Windows.UI.Logon+0x48b50`), que não é símbolo de ninguém.
+fn names_unloaded_module(error: &str, expression: &str) -> bool {
+    if error.contains("modulo ") && error.contains("nao carregado") {
+        return true;
+    }
+    let head = expression.trim().split(|character: char| matches!(character, '+' | '-' | '*' | '(' | ')') || character.is_whitespace()).next().unwrap_or("");
+    head.contains('.') && !head.contains('!') && error.starts_with(&format!("{head}: simbolo nao encontrado"))
+}
+
 /// `L<n>` de um comando de memória.
 fn length_argument(words: &[&str]) -> Option<u64> {
     words.iter().find_map(|word| word.strip_prefix('L').or_else(|| word.strip_prefix('l')).and_then(|count| parse_number(count).or_else(|| u64::from_str_radix(count, 16).ok())))
@@ -802,7 +813,20 @@ impl Client {
                 request.pass_count = pass_count;
                 request.deferred = command == "bu";
                 options.apply(&mut request)?;
-                self.breakpoint_command(request)
+                if request.deferred {
+                    return self.breakpoint_command(request);
+                }
+                // Um `bp` num módulo que ainda não carregou vira adiado, como
+                // o `bu` (o símbolo que falta num módulo carregado continua
+                // sendo erro: é um nome errado).
+                match self.breakpoint_command(request.clone()) {
+                    Err(error) if names_unloaded_module(&error, &request.expression) => {
+                        request.deferred = true;
+                        let text = self.breakpoint_command(request)?;
+                        Ok(format!("{error}: o bp ficou adiado (como o bu)\n{text}"))
+                    }
+                    other => other,
+                }
             }
             "bc" if rest == "all" || rest == "*" => {
                 // Sem processo escolhido, o `z0` de um endereço de usuário tira
@@ -1187,6 +1211,17 @@ mod tests {
         assert_eq!((request.scope.as_str(), request.max_hits), ("dwm.exe", 5));
         let (_, options) = breakpoint_options("x /max cinco");
         assert!(options.apply(&mut request).is_err());
+    }
+
+    #[test]
+    fn bp_defers_only_for_a_module_not_loaded() {
+        assert!(names_unloaded_module("modulo Windows.UI.Xaml nao carregado", "Windows.UI.Xaml!CImageSource::FireImageOpened"));
+        assert!(names_unloaded_module("modulo dwmcore nao carregado no processo 0xffffc000c012e500", "dwmcore!X"));
+        assert!(names_unloaded_module("Windows.UI.Logon: simbolo nao encontrado", "Windows.UI.Logon+0x48b50"));
+        // Um símbolo que falta num módulo carregado é nome errado.
+        assert!(!names_unloaded_module("ntfs!NtfsFalta: simbolo nao encontrado", "ntfs!NtfsFalta"));
+        assert!(!names_unloaded_module("kernel::falta: simbolo nao encontrado", "kernel::falta"));
+        assert!(!names_unloaded_module("a maquina esta rodando", "Windows.UI.Logon+0x10"));
     }
 
     #[test]
