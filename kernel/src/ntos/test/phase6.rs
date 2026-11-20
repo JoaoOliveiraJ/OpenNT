@@ -6131,6 +6131,13 @@ fn ex_lookaside_wnf_exports(assert: Assert) {
     use crate::ntos::init::exports;
 
     let export = |name: &str| exports::export_module().ok().and_then(|module| module.exports.exports.get(name).copied());
+    // A busca de um export público só, que as listas lookaside fazem a cada
+    // falta e a cada devolução, dá o endereço da EAT montada inteira (um
+    // trampolim e um dado real), e nada para um nome ausente.
+    assert(
+        ["ExAllocatePoolWithTag", "ExFreePool", "InitSafeBootMode"].iter().all(|&name| export(name).is_some() && exports::public_export_address(name) == export(name)) && exports::public_export_address("OpenNtNaoExiste").is_none(),
+        "lookaside: o endereco publico de um export sem montar a tabela inteira",
+    );
 
     // Lookaside-Ex: a inicialização instala os exports de pool em AllocateEx/FreeEx.
     // O cabeçalho SLIST exige alinhamento de 16 bytes.

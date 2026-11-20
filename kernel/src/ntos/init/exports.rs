@@ -743,21 +743,31 @@ pub fn lookup_ordinal(dll: &str, ordinal: u32) -> Option<ResolvedImport> {
     lookup(dll, name)
 }
 
+/// O endereço público da entrada `index` da tabela pública (o dado real ou
+/// o trampolim); `None` = um nome de dado sem célula.
+fn public_address(table: &Table, index: usize, name: &str) -> Result<Option<u64>, KernelError> {
+    Ok(match table.data.get(name) {
+        Some(getter) => Some(getter()),
+        None if index < abi_names::EXPORT_NAMES.len() => Some(thunk_address(32 + index as u64)?),
+        None => None,
+    })
+}
+
 /// Visão de resolvedor dos provedores reais (encaminhamentos da HAL).
-/// Endereço público de um export (o mesmo que a EAT entrega aos drivers).
-fn public_export_address(name: &str) -> Option<u64> {
-    export_module().ok()?.exports.exports.get(name).copied()
+/// Endereço público de um export (o mesmo que a EAT entrega aos drivers),
+/// achado na tabela pública sem montar o módulo inteiro: as listas
+/// lookaside perguntam a cada falta e a cada devolução.
+pub fn public_export_address(name: &str) -> Option<u64> {
+    let table = table();
+    let index = table.public_names.iter().rposition(|&candidate| candidate == name)?;
+    public_address(&table, index, name).ok().flatten()
 }
 
 pub fn export_module() -> Result<ExportedModule, KernelError> {
     let table = table();
     let mut exports = Exports::default();
     for (index, &name) in table.public_names.iter().enumerate() {
-        let address = match table.data.get(name) {
-            Some(getter) => getter(),
-            None if index < abi_names::EXPORT_NAMES.len() => thunk_address(32 + index as u64)?,
-            None => continue,
-        };
+        let Some(address) = public_address(&table, index, name)? else { continue };
         exports.exports.insert(name.to_string(), address);
         exports.exports_by_ordinal.insert(index as u32 + 1, address);
     }
