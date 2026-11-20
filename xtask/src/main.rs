@@ -121,8 +121,8 @@ opcoes de build:   --release --build-dir=DIR --user-program=shell
                    --trace-rpc (cada mensagem ALPC das portas de servidor na serial, com a
                    interface e o opnum dos pedidos LRPC e o status das respostas)
                    --heap-census (censo do heap do kernel na serial a cada 4 MB a mais de uso)
-                   --slow-service-exit (toda saida de servico passa pelo despachante, sem a
-                   volta direta ao anel 3: comparacao e bisseccao)
+                   --fast-service-exit (a saida de um servico volta direto ao anel 3 quando
+                   nada pede o despachante; sem a opcao, toda saida passa por ele)
                    --windows-dir=DIR (binarios do Windows do bundle; padrao build/windows)
                    --pnp-root=acpi|internal (raiz da arvore de dispositivos; padrao acpi)
                    --usb (controladora xHCI com teclado e tablet USB)
@@ -229,7 +229,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             trace_driver_api: false,
             trace_rpc: false,
             heap_census: false,
-            slow_service_exit: false,
+            fast_service_exit: false,
             initial_process: String::new(),
             storage: String::new(),
             display: String::new(),
@@ -300,7 +300,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             "--trace-driver-api" => parsed.build.trace_driver_api = true,
             "--trace-rpc" => parsed.build.trace_rpc = true,
             "--heap-census" => parsed.build.heap_census = true,
-            "--slow-service-exit" => parsed.build.slow_service_exit = true,
+            "--fast-service-exit" => parsed.build.fast_service_exit = true,
             "--memory-pressure" => parsed.build.memory_pressure = true,
             "--console-process" => parsed.build.console_process = true,
             "--conta-de-teste" => parsed.build.test_account = true,

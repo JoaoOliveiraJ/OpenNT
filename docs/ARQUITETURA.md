@@ -1077,7 +1077,9 @@ intervalo, e elas chegavam a 40% do tempo da CPU. O autoteste
 pingue-pongue por dois eventos dentro de serviços de teste e conta as
 voltas num número fixo de tiques.
 
-A saída de um serviço é a do KiSystemServiceExit do 19041 (0x411510): sem
+Com a opção de boot `--fast-service-exit` (FASTSERVICEEXIT; desligada por
+padrão enquanto a cadeia até a tela de logon ainda para às vezes com ela),
+a saída de um serviço é a do KiSystemServiceExit do 19041 (0x411510): sem
 troca de thread a fazer, ela volta direto ao anel 3 pelo `user_syscall_exit`
 do stub e o intervalo segue (`usermode::continues_in_interval`). O 19041
 não testa o escalonador ali, porque a troca, quando era preciso, já
@@ -1106,7 +1108,7 @@ de strings (o NlsValidateLocale do KERNELBASE num processo do SYSTEM), tinha
 1 a 2% da CPU e ficava à frente da fila da prioridade dele por segundos. A
 linha `[perf] servicos:` conta os retornos diretos e as saídas lentas por
 motivo, e a `[perf] threads:` as cinco threads com mais tempo de
-intervalo. O autoteste `ntos/test/multiprocess/service_exit.rs` confere
+intervalo. O autoteste `ntos/test/multiprocess/service_exit.rs` liga a volta direta e confere
 muitas chamadas por intervalo num serviço que só conta, o fim do intervalo
 num serviço que sinaliza (a thread de prioridade maior que esperava roda
 antes da sinalização seguinte) e, numa espera adiada repetida com um

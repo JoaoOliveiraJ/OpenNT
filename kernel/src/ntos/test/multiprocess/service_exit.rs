@@ -335,7 +335,11 @@ pub fn run(assert: Assert) {
         let _ = service_table::restore_shadow_second_table(saved_shadow);
         return;
     }
+    // A volta direta é opcional no boot (`--fast-service-exit`): ligada
+    // para o teste dela.
+    threads::force_fast_exit(true);
     let outcome = run_phases();
+    threads::force_fast_exit(false);
     crate::debug_print!("[servico-direto] {:?}", outcome);
     let counted = outcome.as_ref().is_some_and(|outcome| outcome.counted && outcome.slices != 0 && outcome.calls >= outcome.slices * MINIMUM_CALLS_PER_SLICE);
     assert(counted, "servico-direto: o servico que nao bloqueou volta ao anel 3 no mesmo intervalo (muitas chamadas por intervalo)");

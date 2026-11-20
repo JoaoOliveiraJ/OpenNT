@@ -2306,6 +2306,14 @@ static POLLED_EPOCH: AtomicU64 = AtomicU64::new(u64::MAX);
 /// começo dele.
 static SLICE_THREAD: AtomicU64 = AtomicU64::new(0);
 static SLICE_TICK: AtomicU32 = AtomicU32::new(0);
+/// A volta direta ligada sem a opção de boot (os autotestes dela).
+static FAST_EXIT_FORCED: AtomicBool = AtomicBool::new(false);
+
+/// Liga ou desliga a volta direta ao anel 3 independentemente da opção
+/// `FASTSERVICEEXIT` (autoteste `multiprocess/service_exit`).
+pub fn force_fast_exit(on: bool) {
+    FAST_EXIT_FORCED.store(on, Ordering::Relaxed);
+}
 
 /// O KiSystemServiceExit do 19041 (0x411510): depois de um serviço que não
 /// bloqueou, a thread corrente volta ao anel 3 no mesmo intervalo. O 19041
@@ -2328,7 +2336,7 @@ static SLICE_TICK: AtomicU32 = AtomicU32::new(0);
 /// ou o depurador armou um passo. `Err` dá o motivo (`dispatch_perf::slow`).
 pub fn may_return_to_user() -> Result<(), usize> {
     use crate::ntos::ps::dispatch_perf::slow as why;
-    if crate::ntos::init::boot_config::slow_service_exit() {
+    if !crate::ntos::init::boot_config::fast_service_exit() && !FAST_EXIT_FORCED.load(Ordering::Relaxed) {
         return Err(why::DISABLED);
     }
     let pointer = process::get_current_thread();
