@@ -710,60 +710,14 @@ fn poll_user_waits() {
     candidates.sort_by_cached_key(|thread| (core::cmp::Reverse(thread_priority::query_priority(thread.pointer())), thread.with(|thread| thread.process_pointer)));
     for candidate in candidates {
         let pointer = candidate.pointer();
-        if let Some(mut wait) = candidate.take_wait() {
-            // A registrada não é sondada: só o desfecho, sem o contexto da
-            // thread, e a conclusão (ou a sondagem de uma acordada) nele.
-            if wait.registered.is_some() {
-                if !registered_done(&wait) {
-                    // Uma acordada sem saída há WOKEN_BACKSTOP_MS sonda mesmo
-                    // assim: uma mudança que não acordou ninguém espera no
-                    // máximo isso.
-                    if !woken_backstop_due(&wait) {
-                        candidate.restore_wait(wait);
-                        continue;
-                    }
-                    process::set_current_thread(pointer);
-                    match woken_backstop(&mut wait) {
-                        Some(status) => finish_wait(&candidate, wait, status),
-                        None => {
-                            candidate.restore_wait(wait);
-                            continue;
-                        }
-                    }
-                    let _ = thread_dispatch::make_ready(pointer);
-                    continue;
-                }
-                process::set_current_thread(pointer);
-                match settle_registered(&mut wait, true) {
-                    Some(status) => finish_wait(&candidate, wait, status),
-                    None => {
-                        candidate.restore_wait(wait);
-                        continue;
-                    }
-                }
+        match poll_installed(&candidate) {
+            Polled::Waiting => continue,
+            // A registrada concluída volta à fila direto.
+            Polled::Settled => {
                 let _ = thread_dispatch::make_ready(pointer);
                 continue;
             }
-            dispatch_perf::POLLS.fetch_add(1, Ordering::Relaxed);
-            let outcome = match poll_delay(&wait) {
-                Some(outcome) => outcome,
-                None => {
-                    process::set_current_thread(pointer);
-                    poll_wait(&mut wait)
-                }
-            };
-            match outcome {
-                None => {
-                    candidate.restore_wait(wait);
-                    continue;
-                }
-                Some(status) => {
-                    process::set_current_thread(pointer);
-                    finish_wait(&candidate, wait, status)
-                }
-            }
-        } else if candidate.waiting() {
-            continue;
+            Polled::Free => {}
         }
         // O despacho de usuário só roda fora de qualquer intervalo: uma thread
         // de usuário Running que não está numa CPU é um estado restaurado por
@@ -774,6 +728,99 @@ fn poll_user_waits() {
         }
         let _ = thread_dispatch::make_ready(pointer);
     }
+}
+
+/// O desfecho de [`poll_installed`].
+enum Polled {
+    /// A espera continua instalada.
+    Waiting,
+    /// A espera registrada concluiu (ou a acordada sondou e concluiu).
+    Settled,
+    /// A thread ficou sem espera: concluída pela sondagem, ou sem espera.
+    Free,
+}
+
+/// Sonda a espera instalada de `candidate` (com ela como thread corrente
+/// quando a sondagem precisa do contexto dela; quem chama restaura a dele) e
+/// a conclui se terminou. A registrada não é sondada: só o desfecho, e a
+/// conclusão (ou a sondagem de uma acordada) no contexto da thread.
+fn poll_installed(candidate: &Arc<UserThread>) -> Polled {
+    let pointer = candidate.pointer();
+    let Some(mut wait) = candidate.take_wait() else {
+        return if candidate.waiting() { Polled::Waiting } else { Polled::Free };
+    };
+    if wait.registered.is_some() {
+        if !registered_done(&wait) {
+            // Uma acordada sem saída há WOKEN_BACKSTOP_MS sonda mesmo
+            // assim: uma mudança que não acordou ninguém espera no máximo
+            // isso.
+            if !woken_backstop_due(&wait) {
+                candidate.restore_wait(wait);
+                return Polled::Waiting;
+            }
+            process::set_current_thread(pointer);
+            return match woken_backstop(&mut wait) {
+                Some(status) => {
+                    finish_wait(candidate, wait, status);
+                    Polled::Settled
+                }
+                None => {
+                    candidate.restore_wait(wait);
+                    Polled::Waiting
+                }
+            };
+        }
+        process::set_current_thread(pointer);
+        return match settle_registered(&mut wait, true) {
+            Some(status) => {
+                finish_wait(candidate, wait, status);
+                Polled::Settled
+            }
+            None => {
+                candidate.restore_wait(wait);
+                Polled::Waiting
+            }
+        };
+    }
+    dispatch_perf::POLLS.fetch_add(1, Ordering::Relaxed);
+    let outcome = match poll_delay(&wait) {
+        Some(outcome) => outcome,
+        None => {
+            process::set_current_thread(pointer);
+            poll_wait(&mut wait)
+        }
+    };
+    match outcome {
+        None => {
+            candidate.restore_wait(wait);
+            Polled::Waiting
+        }
+        Some(status) => {
+            process::set_current_thread(pointer);
+            finish_wait(candidate, wait, status);
+            Polled::Free
+        }
+    }
+}
+
+/// [`poll_installed`] de uma thread só (a sondagem do refresh): `true` se a
+/// thread ficou sem espera.
+pub fn poll_installed_wait(candidate: &Arc<UserThread>) -> bool {
+    !matches!(poll_installed(candidate), Polled::Waiting)
+}
+
+/// Uma thread de usuário pronta que não pode voltar ao anel 3: com a espera
+/// de usuário ainda instalada (o KeAlertThread a pôs na fila) ou suspensa.
+/// No 19041 o KiUnwaitThread termina a espera e a APC de suspensão roda
+/// antes do anel 3 (KeAlertThread 0x35be90), então ela nunca volta ao modo
+/// usuário com a espera pela metade. Volta a Waiting e `true`; a sondagem
+/// seguinte termina a espera.
+pub fn hold_before_ring3(thread: &UserThread) -> Result<bool, KernelError> {
+    let (pointer, held) = thread.with(|thread| (thread.thread_pointer, thread.waiting || thread.suspend_count != 0));
+    if held {
+        thread_dispatch::suspend(pointer, thread_dispatch::state::WAITING)?;
+    }
+    Ok(held)
 }
 
 /// Um intervalo de [`dispatch_one`].
@@ -935,7 +982,7 @@ fn dispatch_from(executor: fn(u64, u64) -> u32, caller: u64) -> Result<Dispatche
                 continue;
             }
         }
-        let (dead, process, suspended) = next.with(|thread| (thread.dead, thread.process_pointer, thread.suspend_count != 0));
+        let (dead, process) = next.with(|thread| (thread.dead, thread.process_pointer));
         let kernel = next.kernel_state();
         // Bloqueada no kernel com a espera ainda pendente (um alerta a
         // pôs na fila antes da sondagem): volta a esperar.
@@ -950,13 +997,13 @@ fn dispatch_from(executor: fn(u64, u64) -> u32, caller: u64) -> Result<Dispatche
                 thread_dispatch::suspend(pointer, thread_dispatch::state::TERMINATED)?;
                 continue;
             }
-            if !process_started(process) {
-                thread_dispatch::suspend(pointer, thread_dispatch::state::WAITING)?;
+            // Suspensa (o sinal de uma espera registrada apronta mesmo a
+            // suspensa) ou com a espera instalada: a retomada (ou a
+            // sondagem) a põe na fila de novo.
+            if hold_before_ring3(&next)? {
                 continue;
             }
-            // Suspensa (o sinal de uma espera registrada apronta mesmo a
-            // suspensa): a retomada a põe na fila de novo.
-            if suspended {
+            if !process_started(process) {
                 thread_dispatch::suspend(pointer, thread_dispatch::state::WAITING)?;
                 continue;
             }

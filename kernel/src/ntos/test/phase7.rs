@@ -2125,6 +2125,31 @@ fn user_threads_in(assert: Assert, test: &TestProcess) {
     assert(call("NtAlertThreadByThreadId", thread.thread_id, 0, 0, 0) == 0 && call("NtWaitForAlertByThreadId", 0, 0, 0, 0) == 0x101 && call("NtAlertThreadByThreadId", 0xFFFF_0000, 0, 0, 0) == 0xC000_000B, "userthreads: alerta por id consumido");
     delay.quad_part.set(0);
     assert(call("NtWaitForAlertByThreadId", 0, timeout, 0, 0) == 0x102, "userthreads: espera de alerta com prazo zero");
+    // KeWaitForAlertByThreadId (0x256bbb, 0x256c76, 0x256c01): o alerta vem
+    // antes, e só então o KiBeginThreadWait de UserMode não alertável, que
+    // devolve STATUS_USER_APC com UserApcPending, sem esperar.
+    let apc_state = &unsafe { nt::Kthread::at(pointer) }.apc_state;
+    apc_state.set_user_apc_pending(1);
+    delay.quad_part.set(-10_000_000);
+    let alert_first = call("NtAlertThreadByThreadId", thread.thread_id, 0, 0, 0) == 0 && call("NtWaitForAlertByThreadId", 0, timeout, 0, 0) == 0x101;
+    let user_apc = call("NtWaitForAlertByThreadId", 0, timeout, 0, 0) == 0xC0 && !thread.waiting();
+    apc_state.set_user_apc_pending(0);
+    assert(alert_first && user_apc, "userthreads: a espera de alerta por id devolve STATUS_ALERTED antes e STATUS_USER_APC com UserApcPending");
+    // KeAlertThread numa thread suspensa dentro de uma espera alertável: ela
+    // fica pronta com a espera instalada, mas não volta ao anel 3 (o
+    // despacho a devolve a Waiting) até o NtResumeThread; aí a espera
+    // termina com STATUS_ALERTED.
+    delay.quad_part.set(-100_000_000);
+    let blocked = call("NtDelayExecution", 1, timeout, 0, 0) == 0x103 && thread.waiting();
+    let suspended = call("NtSuspendThread", handle, 0, 0, 0) == 0;
+    let alerted = call("NtAlertThread", handle, 0, 0, 0) == 0;
+    let held = matches!(threads::hold_before_ring3(&thread), Ok(true)) && thread_dispatch::thread_state(pointer) == thread_dispatch::state::WAITING && thread.waiting();
+    let resumed = call("NtResumeThread", handle, 0, 0, 0) == 0;
+    let finished = threads::poll_installed_wait(&thread);
+    process::set_current_thread(pointer);
+    let context_rax = unsafe { nt::Context::at(thread.with(|thread| thread.context)) }.rax.get();
+    assert(blocked && suspended && alerted && held && resumed && finished && context_rax == 0x101 && !thread.waiting(), "userthreads: thread suspensa e alertada numa espera alertavel nao roda ate a retomada e conclui com STATUS_ALERTED");
+    delay.quad_part.set(0);
     // Atraso zero não alertável: só a troca do NtYieldExecution (sucesso
     // ou STATUS_NO_YIELD_PERFORMED), sem espera; alertável, a espera de
     // prazo zero vence com STATUS_SUCCESS.
