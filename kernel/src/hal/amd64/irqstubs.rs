@@ -171,6 +171,10 @@ irq_common:
     jne irq_common_not_nmi
     cmp byte ptr [rip + opennt_kd_trap_active], 0
     jne irq_nmi
+    # Sem o depurador, a NMI do perfil por amostragem (`kd::sampler`, a
+    # injetada pelo host): so a amostra, sem GS e sem trava, e a volta.
+    cmp byte ptr [rip + opennt_sampler_nmi], 0
+    jne irq_sample_nmi
 irq_common_not_nmi:
     # Veio do anel 3 (CS do frame = 0x33)? Troca para a KPCR (drivers leem
     # gs:[0x188]) e captura os registradores de depuracao do usuario.
@@ -198,6 +202,14 @@ irq_entry_cs:
     swapgs
     call user_debug_leave
 irq_gs_ready:
+    # Perfil pelo tique do relogio do BSP (`kd::sampler`): a amostra do
+    # quadro interrompido. Os registradores volateis ja estao no quadro.
+    cmp byte ptr [rsp + 72], 0x40
+    jne irq_sample_done
+    cmp byte ptr [rip + opennt_sampler_timer], 0
+    je irq_sample_done
+    call irq_sample_frame
+irq_sample_done:
     movzx edi, byte ptr [rsp + 72]  # vetor (push imm8 estende o sinal: so o byte)
     # R9 = pagina de IRQ pelo mapa direto (ja salvo no quadro).
     movabs r9, {irq_page}
@@ -378,6 +390,26 @@ irq_kernel_registers:
     swapgs
 irq_iret:
     iretq
+
+irq_sample_nmi:
+    call irq_sample_frame
+    jmp irq_nmi_return
+
+# A amostra do perfil (`opennt_sampler_record(rip, cs, cr3, rbp, rsp)`) do
+# quadro de `irq_common` sem codigo de erro: chamada com R11..RAX e o vetor
+# empilhados, o quadro do hardware fica 8 bytes acima deles (o retorno desta
+# chamada). O hardware alinha o quadro em 16 e por cima ficam 16 qwords
+# (o quadro, o vetor, os 9 registradores e este retorno): a chamada ao Rust
+# sai alinhada. O RBP ainda e o interrompido. Destroi so os volateis.
+irq_sample_frame:
+    mov rdi, [rsp + 88]
+    movzx esi, word ptr [rsp + 96]
+    mov rdx, cr3
+    mov rcx, rbp
+    mov r8, [rsp + 112]
+    cld
+    call opennt_sampler_record
+    ret
 
 irq_nmi:
     # NMI com o depurador ligado (o KxNmiInterrupt/KiProcessNMI do 19041 em

@@ -483,6 +483,7 @@ pub fn tick(minimum_priority: i32) {
         return;
     }
     super::dispatch_perf::not_spinning();
+    crate::ntos::kd::sampler::drain();
     super::dispatch_perf::report_if_due();
     reap();
     // Como a interrupção de relógio do NT, cada tick vence os timers devidos

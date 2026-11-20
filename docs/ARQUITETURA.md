@@ -1288,7 +1288,22 @@ de strings (o NlsValidateLocale do KERNELBASE num processo do SYSTEM), tinha
 1 a 2% da CPU e ficava à frente da fila da prioridade dele por segundos. A
 linha `[perf] servicos:` conta os retornos diretos e as saídas lentas por
 motivo, e a `[perf] threads:` as cinco threads com mais tempo de
-intervalo. O autoteste `ntos/test/multiprocess/service_exit.rs` liga a volta direta e confere
+intervalo. A linha `[perf]` mostra também o tempo gasto escrevendo na
+serial e os bytes escritos (`hal/serial.rs`): no WHPX cada byte do log
+custa cerca de 5 µs, porque o 16550 do QEMU entrega byte a byte ao
+arquivo da serial. O perfil por amostragem (`kd/sampler.rs`, `--perfil`
+ou `--perfil=nmi`, a opção de carga PROFILE) amostra o processador de boot
+pelo tique do relógio (100 Hz; só o que roda com IF=1, e um serviço, que
+roda com IF=0, aparece no `ret` do stub) ou pelas NMIs que o test-boot
+injeta pelo QMP a cada 2 ms (também os serviços e os ISRs; só com uma CPU,
+depois da linha `[perfil]` do kernel). Cada amostra do anel 0 leva a
+cadeia de frame pointers; o tique agrega por janela e escreve, depois de
+cada `[perf]`, linhas `[pf]`: o anel 3 por (pid, módulo+deslocamento), o
+anel 0 pela pilha e os serviços por (pid, número) com as chamadas, as
+falhas e o tempo dos que voltaram sem trocar de thread. `cargo xtask
+perfil SERIAL [--de=S] [--ate=S] [--pid=N]` soma as janelas e dá os nomes
+(o `kernel.elf` ao lado da serial, os exports ou o PDB do cache dos
+módulos desta máquina, os stubs da ntdll e do win32u). O autoteste `ntos/test/multiprocess/service_exit.rs` liga a volta direta e confere
 muitas chamadas por intervalo num serviço que só conta, o fim do intervalo
 num serviço que sinaliza (a thread de prioridade maior que esperava roda
 antes da sinalização seguinte) e, numa espera adiada repetida com um
@@ -6199,7 +6214,7 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   `--build-dir`). Cada execução tem a pasta `build/test-all/<id>` (`<id>.<n>`
   com `--repeat`). As opções de boot dos testes (`--kernel-test-scope`,
   `--start-driver`, `--kd`, `--initial-process`, `--storage`, `--display`,
-  `--pnp-root`, `--usb`, `--tpm`, `--trace-driver-api`, `--trace-rpc`, `--heap-census`, `--console-mirror`) não entram no
+  `--pnp-root`, `--usb`, `--tpm`, `--trace-driver-api`, `--trace-rpc`, `--heap-census`, `--perfil`, `--console-mirror`) não entram no
   build: vão no bloco de opções de carga da imagem de boot (abaixo), então
   a rodada inteira compila um kernel só. Uma thread monta as imagens
   (`test-boot --build-only`) uma vez por chave de imagem

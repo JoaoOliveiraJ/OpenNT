@@ -54,6 +54,7 @@ pub fn init() {
     // identidade de cada AP na própria KPRCB e os conjuntos de pacote, núcleo e cache
     crate::ntos::ke::processor_identity::initialize_application_processors().unwrap_or_else(|error| panic!("{error}"));
     crate::ntos::kd::initialize(); // depurador do kernel (`--kd`): KdInitSystem com o transporte serial
+    crate::ntos::kd::sampler::initialize(); // perfil por amostragem (`--perfil`)
     crate::ntos::mm::user_half::assert_user_only(); // trampolim desfeito: nada do kernel abaixo de MmSystemRangeStart
     crate::ntos::mm::image_paging::init().unwrap_or_else(|error| panic!("image paging: {error}"));
     kernel_pool::init(); // pool executivo (paginável com apoio no NTFS)

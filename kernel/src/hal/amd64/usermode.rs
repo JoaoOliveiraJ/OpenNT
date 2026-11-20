@@ -1301,6 +1301,7 @@ pub extern "C" fn opennt_user_syscall(frame: *mut u64) -> u64 {
     let mut result: u64 = 0;
     let mut stack_count = 0u64;
     let number = unsafe { *frame };
+    let sampled = crate::ntos::kd::sampler::service_start();
     // O papel do KTHREAD.TrapFrame, que o KiSystemServiceStart grava antes da
     // busca na tabela: o CONTEXT do intervalo recebe os registradores desta
     // syscall já aqui. A conversão em thread GUI logo abaixo chama o win32k,
@@ -1359,6 +1360,7 @@ pub extern "C" fn opennt_user_syscall(frame: *mut u64) -> u64 {
     // (o KiServiceExit com UserApcPending): o PspExitThread roda aqui, na
     // pilha dela, e o intervalo acaba sem voltar ao anel 3.
     crate::ntos::ps::user::threads::service_exit_termination();
+    crate::ntos::kd::sampler::note_service(number, sampled, result);
     if continues_in_interval() {
         return result;
     }

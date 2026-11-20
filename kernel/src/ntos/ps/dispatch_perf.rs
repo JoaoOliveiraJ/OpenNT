@@ -153,7 +153,7 @@ fn report_exits() {
     crate::debug_print!("{}", line.trim_end_matches(','));
 }
 
-const VALUES: usize = 18;
+const VALUES: usize = 20;
 
 /// O uptime da próxima linha e os totais da anterior.
 struct Last {
@@ -203,6 +203,8 @@ pub fn report_if_due() {
             steps,
             step_count,
             POLLS_SKIPPED.load(Ordering::Relaxed),
+            crate::hal::serial::cost().0,
+            crate::hal::serial::cost().1,
         ];
         let mut delta = [0u64; VALUES];
         for (index, value) in current.iter().enumerate() {
@@ -214,7 +216,7 @@ pub fn report_if_due() {
     // O despacho sem os intervalos: as sondagens dele, os pumps, os fins de
     // processo e a escolha; os passos de kernel ficam fora do despacho.
     crate::debug_print!(
-        "[perf] t={} ms: hlt {} ms ({}x), giro {} ms ({}x), sondagem {} ms ({}x, {} dispensadas, {} esperas, {} de {} cargas de CR3), despacho fora dos intervalos {} ms ({}x; pumps {} ms, fins {} ms), intervalos {} ms ({}x), passos de kernel {} ms ({}x)",
+        "[perf] t={} ms: hlt {} ms ({}x), giro {} ms ({}x), sondagem {} ms ({}x, {} dispensadas, {} esperas, {} de {} cargas de CR3), despacho fora dos intervalos {} ms ({}x; pumps {} ms, fins {} ms), intervalos {} ms ({}x), passos de kernel {} ms ({}x), serial {} ms ({} bytes)",
         now,
         milliseconds(values[0]),
         values[1],
@@ -233,10 +235,14 @@ pub fn report_if_due() {
         milliseconds(values[8]),
         values[9],
         milliseconds(values[15]),
-        values[16]
+        values[16],
+        milliseconds(values[18]),
+        values[19]
     );
     report_exits();
     report_threads();
+    crate::ntos::kd::sampler::report_images();
+    crate::ntos::kd::sampler::report();
 }
 
 /// Os intervalos de uma thread de usuário no intervalo da linha `[perf]`.

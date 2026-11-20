@@ -81,6 +81,7 @@ mod png;
 mod product_policy;
 mod qcow2;
 mod qemu;
+mod sample_profile;
 mod screen_check;
 mod service_chain;
 mod side_by_side;
@@ -104,7 +105,7 @@ use std::time::Duration;
 use build::BuildOptions;
 use qemu::{MachineOptions, TestOptions};
 
-const USAGE: &str = "uso: cargo xtask <build|run|test-boot|test-all|capturas|debug|status|nt-types|heap-census|crash|logsum> [opcoes]
+const USAGE: &str = "uso: cargo xtask <build|run|test-boot|test-all|capturas|debug|status|nt-types|heap-census|perfil|crash|logsum> [opcoes]
   build      compila boot + kernel e monta build/os.img
   run        build + QEMU com janela (serial neste terminal)
   test-boot  build + QEMU sem tela; espera MARCADOR [TIMEOUT_MS]
@@ -120,6 +121,8 @@ const USAGE: &str = "uso: cargo xtask <build|run|test-boot|test-all|capturas|deb
   status     gera docs/site/*.html e docs/status/*.svg (cargo xtask status --help)
   nt-types   gera kernel/src/ntos/inc/types do PDB do ntoskrnl (cargo xtask nt-types --help)
   heap-census  da nomes ao censo do heap do kernel de uma serial (cargo xtask heap-census --help)
+  perfil     resume o perfil por amostragem (--perfil) de uma serial: processos, funcoes do
+             kernel, modulos de usuario e servicos (cargo xtask perfil --help)
   crash      resume a parada de uma serial: codigo, parametros, culpado, pilha do [kcrash] com
              nomes, WdLog do dxgkrnl e a primeira tela (cargo xtask crash --help)
   logsum     resumo compacto de uma serial: marcadores, fim, processos, FALHOU, lacos
@@ -130,6 +133,9 @@ opcoes de build:   --release --build-dir=DIR --user-program=shell
                    --trace-rpc (cada mensagem ALPC das portas de servidor na serial, com a
                    interface e o opnum dos pedidos LRPC e o status das respostas)
                    --heap-census (censo do heap do kernel na serial a cada 4 MB a mais de uso)
+                   --perfil[=nmi] (perfil por amostragem do processador de boot em linhas [pf]
+                   da serial: pelo tique do relogio ou, com nmi, pelas NMIs que o test-boot
+                   injeta pelo QMP a cada 2 ms; cargo xtask perfil SERIAL resume)
                    --slow-service-exit (toda saida de servico passa pelo despachante; sem a
                    opcao ela volta direto ao anel 3 quando nada pede o despachante;
                    --fast-service-exit, o padrao, e aceita e nao muda nada)
@@ -265,6 +271,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             trace_driver_api: false,
             trace_rpc: false,
             heap_census: false,
+            profile: String::new(),
             slow_service_exit: false,
             user_smp: false,
             initial_process: String::new(),
@@ -341,6 +348,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             "--trace-driver-api" => parsed.build.trace_driver_api = true,
             "--trace-rpc" => parsed.build.trace_rpc = true,
             "--heap-census" => parsed.build.heap_census = true,
+            "--perfil" => parsed.build.profile = value.clone().unwrap_or_else(|| String::from("timer")),
             "--slow-service-exit" => parsed.build.slow_service_exit = true,
             "--user-smp" => parsed.build.user_smp = true,
             "--fast-service-exit" => {}
@@ -600,6 +608,7 @@ fn execute(arguments: Arguments) -> Result<(), String> {
                     watch_screen: arguments.watch_screen,
                     capture_every: arguments.capture_every.map(Duration::from_secs),
                     inputs: arguments.inputs,
+                    nmi_samples: options.profile == "nmi",
                 },
                 &log,
                 session,
@@ -721,12 +730,13 @@ fn debug_command(arguments: Arguments) -> Result<(), String> {
 
 fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
-    // `status`, `nt-types`, `heap-census`, `crash`, `logsum`, `test-all` e
+    // `status`, `nt-types`, `heap-census`, `perfil`, `crash`, `logsum`, `test-all` e
     // `capturas` têm opções próprias; só os dois últimos compilam o kernel.
     let result = match arguments.first().map(String::as_str) {
         Some("status") => status::run(&arguments[1..]),
         Some("nt-types") => nt_types::run(&arguments[1..]),
         Some("heap-census") => heap_census::run(&arguments[1..]),
+        Some("perfil") => sample_profile::run(&arguments[1..]),
         Some("crash") => crash::run(&arguments[1..]),
         Some("logsum") => log_summary::run(&arguments[1..]),
         Some("test-all") => test_all::run(&arguments[1..]),

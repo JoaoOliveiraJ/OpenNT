@@ -123,6 +123,12 @@ pub fn heap_census() -> bool {
     flag(name::HEAP_CENSUS)
 }
 
+/// `PROFILE` (`--perfil[=nmi]`): a fonte do perfil por amostragem (`timer`
+/// ou `nmi`; a opção sem valor é o tique do relógio), ou nenhuma.
+pub fn profile() -> Option<&'static str> {
+    value(name::PROFILE).or_else(|| flag(name::PROFILE).then_some("timer"))
+}
+
 /// `OPENNT_TRACE_SYSCALLS` no ambiente do build: imprime cada serviço de
 /// modo usuário despachado, com os argumentos e o resultado (diagnóstico).
 pub const TRACE_SYSCALLS: bool = option_env!("OPENNT_TRACE_SYSCALLS").is_some();

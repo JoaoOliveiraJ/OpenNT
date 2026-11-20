@@ -70,6 +70,10 @@ pub struct BuildOptions {
     /// `--heap-census`: o censo do heap do kernel na serial a cada 4 MB a
     /// mais de uso (`hal::heap_census`).
     pub heap_census: bool,
+    /// `--perfil[=nmi]`: o perfil por amostragem do processador de boot
+    /// (`kd/sampler.rs`), pelo tique do relógio (`timer`) ou pela NMI que o
+    /// test-boot injeta pelo QMP (`nmi`); vazio = sem perfil.
+    pub profile: String,
     /// `--slow-service-exit`: toda saída de serviço passa pelo despachante
     /// (sem a volta direta ao anel 3, o KiSystemServiceExit, que é o padrão).
     pub slow_service_exit: bool,
@@ -160,6 +164,7 @@ impl BuildOptions {
             (name::DISPLAY, self.display.as_str()),
             (name::PNP_ROOT, self.pnp_root.as_str()),
             (name::SHUTDOWN_TEST, self.shutdown_test.as_str()),
+            (name::PROFILE, self.profile.as_str()),
         ];
         let mut words: Vec<String> = Vec::new();
         if !debug.is_empty() {
@@ -242,6 +247,7 @@ impl BuildOptions {
             trace_driver_api: false,
             trace_rpc: false,
             heap_census: false,
+            profile: String::new(),
             slow_service_exit: false,
             user_smp: false,
             storage: String::new(),
@@ -533,6 +539,7 @@ mod tests {
             trace_driver_api: false,
             trace_rpc: false,
             heap_census: false,
+            profile: String::new(),
             slow_service_exit: false,
             user_smp: false,
             initial_process: String::new(),

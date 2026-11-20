@@ -595,6 +595,9 @@ pub struct TestOptions {
     /// comando): a entrada pelo monitor HMP depois de um marcador
     /// ([`InputSend`]).
     pub inputs: Vec<InputSend>,
+    /// `--perfil=nmi`: um QMP só para o perfil por amostragem, por onde uma
+    /// thread injeta NMIs no convidado durante o teste ([`nmi_pump`]).
+    pub nmi_samples: bool,
 }
 
 /// Intervalo entre duas leituras da tela.
@@ -1109,6 +1112,52 @@ fn qmp_reply(reader: &mut impl std::io::BufRead) -> Result<String, String> {
             return Err(format!("QMP: {}", line.trim()));
         }
     }
+}
+
+/// Intervalo entre duas NMIs do perfil por amostragem.
+const NMI_PERIOD: Duration = Duration::from_millis(2);
+
+/// A linha do kernel que liga a NMI do perfil (`kd/sampler.rs`): antes dela
+/// uma NMI cai no caminho das exceções do kernel (ou, antes da IDT, numa
+/// falta tripla).
+const NMI_READY: &str = "[perfil] amostragem pela NMI";
+
+/// As NMIs do `--perfil=nmi`: o `inject-nmi` pelo QMP dedicado a cada
+/// [`NMI_PERIOD`] (sem relação com o relógio do convidado), da linha
+/// [`NMI_READY`] na serial até `stop`.
+fn nmi_pump(port: u16, serial: Arc<Mutex<String>>, stop: Arc<std::sync::atomic::AtomicBool>) {
+    let running = || !stop.load(std::sync::atomic::Ordering::Acquire);
+    while !serial.lock().unwrap().contains(NMI_READY) {
+        if !running() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let stream = loop {
+        if !running() {
+            return;
+        }
+        match TcpStream::connect(("127.0.0.1", port)) {
+            Ok(stream) => break stream,
+            Err(_) => thread::sleep(Duration::from_millis(100)),
+        }
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let Ok(mut writer) = stream.try_clone() else { return };
+    let mut reader = std::io::BufReader::new(stream);
+    let mut greeting = String::new();
+    if std::io::BufRead::read_line(&mut reader, &mut greeting).is_err() || writer.write_all(b"{\"execute\":\"qmp_capabilities\"}\n").is_err() || qmp_reply(&mut reader).is_err() {
+        return;
+    }
+    let mut sent = 0u64;
+    while running() {
+        if writer.write_all(b"{\"execute\":\"inject-nmi\"}\n").is_err() || qmp_reply(&mut reader).is_err() {
+            break;
+        }
+        sent += 1;
+        thread::sleep(NMI_PERIOD);
+    }
+    println!("\n[xtask] perfil: {sent} NMIs injetadas");
 }
 
 /// Grava a tela do QEMU em PPM pelo `screendump` do QMP (o QEMU desta
@@ -1754,6 +1803,14 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
     } else {
         None
     };
+    // Um QMP só para as NMIs do perfil por amostragem.
+    let nmi_port = if test.nmi_samples {
+        let nmi = free_port()?;
+        arguments.extend(["-qmp".to_string(), format!("tcp:127.0.0.1:{nmi},server=on,wait=off")]);
+        Some(nmi)
+    } else {
+        None
+    };
     // Um segundo QMP só para os eventos de fim da máquina.
     let events_port = if test.expect_poweroff || test.power_cycles > 0 {
         let events = free_port()?;
@@ -1778,6 +1835,10 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
     // O teste da barra de tarefas: depois da área de trabalho, a vigia
     // procura o relógio da barra passando de minuto.
     let taskbar_test = expects(TASKBAR_MARKER);
+    let nmi_pumper = nmi_port.map(|port| {
+        let (serial, stop) = (Arc::clone(&output), Arc::clone(&screen_stop));
+        thread::spawn(move || nmi_pump(port, serial, stop))
+    });
     let screen_watcher = match (test.watch_screen || test.capture_every.is_some(), qmp_port) {
         (true, Some(qmp)) => {
             let scratch = log.with_file_name("tela.ppm");
@@ -2027,6 +2088,9 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
         (result, _) => result,
     };
     screen_stop.store(true, std::sync::atomic::Ordering::Release);
+    if let Some(pumper) = nmi_pumper {
+        let _ = pumper.join();
+    }
     let ScreenOutcome { last: last_screen, frames, logon, desktop, taskbar } = screen_watcher.and_then(|watcher| watcher.join().ok()).unwrap_or_default();
     // O teste da tela de logon que falhou diz no log o que faltou na última
     // tela lida.

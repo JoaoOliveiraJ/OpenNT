@@ -4,12 +4,21 @@
 //! com interrupções desligadas, para que outro escritor não consuma as
 //! posições entre a consulta de THRE e os OUTs.
 
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use super::{cpu, port};
 
 const COM1: u16 = 0x3F8;
 static FIFO_SIZE: AtomicUsize = AtomicUsize::new(1);
+/// TSC gasto nos lotes e bytes escritos (a linha `[perf]` mostra o custo do
+/// log: sob um hipervisor cada lote são saídas da máquina virtual).
+static SEND_TSC: AtomicU64 = AtomicU64::new(0);
+static SENT_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// O TSC gasto e os bytes escritos desde o boot.
+pub fn cost() -> (u64, u64) {
+    (SEND_TSC.load(Ordering::Relaxed), SENT_BYTES.load(Ordering::Relaxed))
+}
 
 pub fn init() {
     port::write8(COM1 + 1, 0x00);
@@ -29,6 +38,7 @@ pub fn init() {
 /// instrução de string inteira sai uma vez.
 fn send(bytes: &[u8]) {
     let flags = cpu::save_and_disable_interrupts();
+    let started = cpu::rdtsc();
     while port::read8(COM1 + 5) & 0x20 == 0 {
         core::hint::spin_loop();
     }
@@ -43,6 +53,8 @@ fn send(bytes: &[u8]) {
             options(nostack, preserves_flags, readonly),
         );
     }
+    SEND_TSC.fetch_add(cpu::rdtsc().wrapping_sub(started), Ordering::Relaxed);
+    SENT_BYTES.fetch_add(bytes.len() as u64, Ordering::Relaxed);
     cpu::restore_interrupts(flags);
 }
 
@@ -75,3 +87,4 @@ pub fn write(text: &[u8]) {
 pub fn puts(text: &str) {
     write(text.as_bytes());
 }
+

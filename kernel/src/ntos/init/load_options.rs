@@ -79,6 +79,9 @@ pub const TPM: &str = "TPM";
 /// O teste do processo de console de ponta a ponta no boot comum: o
 /// cmd.exe real com um console sem janela (`test/console_process.rs`).
 pub const CONSOLE_PROCESS: &str = "CONSOLEPROCESS";
+/// `timer` ou `nmi`: o perfil por amostragem do processador de boot, pelo
+/// tique do relógio ou pela NMI que o xtask injeta (`kd/sampler.rs`).
+pub const PROFILE: &str = "PROFILE";
 
 /// O valor de `NOME=valor`.
 pub fn value<'a>(text: &'a str, name: &str) -> Option<&'a str> {
