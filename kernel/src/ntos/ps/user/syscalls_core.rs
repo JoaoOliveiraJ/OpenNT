@@ -13,7 +13,7 @@ use super::state::{self, probe_user_read, probe_user_write, stack_arg, STATUS_IN
 use super::threads;
 use crate::hal::{amd64::usermode, kmalloc, serial};
 use crate::ntos::ex::boot_environment_information;
-use crate::ntos::ke::{clock, dispatcher, pcr, processor_information, smp};
+use crate::ntos::ke::{clock, pcr, processor_information, smp};
 use crate::ntos::mm::{memory_information, memory_map, pfn};
 use crate::ntos::ob::handles::namespace as namespace_handles;
 use crate::ntos::ob::wait as ob_wait;
@@ -280,11 +280,11 @@ fn nt_continue(context: u64, _alertable: u64, _a3: u64, _a4: u64, _rsp: u64) -> 
 }
 
 /// A espera de um serviço de modo usuário nos objetos capturados: pelo
-/// despachante (PENDING + espera sondada) ou, fora dele, a espera do Ke no
-/// lugar (o prazo vai numa célula do kernel).
+/// despachante (PENDING + espera registrada) ou, fora dele, a espera do Ke
+/// no lugar (o prazo vai numa célula do kernel).
 fn wait_captured(set: ob_wait::WaitObjects, wait_type: u32, timeout: Option<i64>, alertable: bool) -> u32 {
     if threads::active() {
-        return threads::wait_referenced(set, wait_type, dispatcher::timeout_value_to_ms(timeout), alertable);
+        return threads::wait_referenced(set, wait_type, timeout, alertable);
     }
     let cell = match timeout {
         Some(value) => {

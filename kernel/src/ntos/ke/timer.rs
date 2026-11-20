@@ -208,7 +208,7 @@ fn throttled_delay_pump() {
 pub fn delay_execution_thread(interval_pointer: u64, wait_mode: u8, alertable: bool) -> Result<u32, KernelError> {
     // Interval pode vir do modo usuário (NtDelayExecution): leitura sondada.
     let interval = guest::try_read::<i64>(interval_pointer)?;
-    if super::context_switch::kernel_thread_can_block() {
+    if super::wait::can_wait() {
         let deadline = if interval <= 0 { super::wait::Deadline::after(Some(interval.unsigned_abs())) } else { super::wait::Deadline::SystemTime(interval as u64) };
         return Ok(super::wait::delay(deadline, wait_mode, alertable));
     }

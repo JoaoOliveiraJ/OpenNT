@@ -352,6 +352,30 @@ pub fn block_current(poll: &mut dyn FnMut() -> Option<u32>) -> u32 {
     threads::take_kernel_wait_status(&thread)
 }
 
+/// O KiSwapContext de uma espera registrada no despachante (`ke::wait`, a
+/// espera número `serial`, com os blocos já ligados) da thread de usuário
+/// corrente num serviço ([`can_block`]): a thread deixa a CPU com o serviço
+/// suspenso na pilha dela, sem sondagem; o sinal a apronta (o
+/// KiUnwaitThread) e o despachante a retoma aqui. A IRQL da espera fica em
+/// KTHREAD.WaitIrql, como em [`block_current`]. Devolve o status da saída.
+pub fn block_registered(serial: u64) -> u32 {
+    let thread = threads::current().expect("bloqueio sem thread de usuario corrente");
+    let pointer = thread.pointer();
+    // SAFETY: a KTHREAD da thread corrente está viva enquanto ela executa.
+    let kthread = unsafe { Kthread::at(pointer) };
+    threads::block_in_registered_wait(&thread, serial);
+    let wait_irql = irql::get_irql();
+    kthread.wait_irql.set(wait_irql);
+    if wait_irql != irql::PASSIVE_LEVEL {
+        irql::lower_irql(irql::PASSIVE_LEVEL as u64);
+    }
+    leave_cpu(kthread);
+    if wait_irql > irql::get_irql() {
+        irql::raise_irql(wait_irql);
+    }
+    threads::take_kernel_wait_status(&thread)
+}
+
 /// A troca em si: o serviço em curso fica suspenso na pilha da thread e a CPU
 /// volta ao despachante do intervalo; volta aqui na retomada.
 fn leave_cpu(kthread: &Kthread) {
@@ -641,12 +665,13 @@ pub fn quantum_end_at_service_entry() {
 /// rundown): `poll` tenta a palavra do lock e devolve, junto, o evento em
 /// que a requisição ficou estacionada (o Event do FAST_MUTEX, o WakeEvent do
 /// bloco de espera do push lock e do rundown, o evento do bloco do
-/// ERESOURCE). Numa thread de kernel a thread sai das prontas com um bloco
-/// de notificação nesse evento (`ke::wait`): o KeSetEvent de quem solta o
-/// lock a apronta, e ela confere a palavra de novo ao voltar, como o laço do
-/// ExpAcquireFastMutexContended. Fora dela, [`acquire_until`].
+/// ERESOURCE). Numa thread de kernel, ou numa de usuário dentro de uma
+/// syscall, a thread sai das prontas com um bloco de notificação nesse
+/// evento (`ke::wait`): o KeSetEvent de quem solta o lock a apronta, e ela
+/// confere a palavra de novo ao voltar, como o laço do
+/// ExpAcquireFastMutexContended. Fora delas, [`acquire_until`].
 pub fn acquire_signaled<T>(mut poll: impl FnMut() -> (Result<Option<T>, KernelError>, Option<u64>), wait_reason: u8, pump: fn()) -> Result<T, KernelError> {
-    if !kernel_thread_can_block() {
+    if !super::wait::can_wait() {
         return acquire_until(|| poll().0, pump);
     }
     let mut outcome: Option<Result<T, KernelError>> = None;
@@ -667,8 +692,11 @@ pub fn acquire_signaled<T>(mut poll: impl FnMut() -> (Result<Option<T>, KernelEr
                 super::wait::wait_once(&mut retry, Some(event), super::wait::Deadline::Infinite, 0, false, wait_reason);
             }
             // Sem evento estacionado: a condição fica com o despachante.
-            None => {
+            None if kernel_thread_can_block() => {
                 scheduler::block_polled(&mut retry);
+            }
+            None => {
+                wait_until(&mut retry, pump);
             }
         }
         if let Some(done) = outcome.take() {

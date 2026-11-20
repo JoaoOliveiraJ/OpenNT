@@ -968,7 +968,7 @@ sinalizado; a última thread viva do processo conclui o fim dele ali mesmo,
 com o callout de saída de processo antes das notificações de processo. Os
 serviços Nt* que
 esperam por handle (NtWaitFor*, NtDelayExecution) continuam com o modelo
-PENDING + espera sondada, sem pilha suspensa. O NtWaitForSingleObject e o
+PENDING, sem pilha suspensa, com a espera registrada no despachante (abaixo). O NtWaitForSingleObject e o
 NtWaitForMultipleObjects de modo usuário capturam o prazo e os handles e
 resolvem os objetos pelo mesmo `ob/wait::reference_objects` do
 ObWaitForMultipleObjects (tabela nativa, tabela de usuário, SYNCHRONIZE em
@@ -978,27 +978,78 @@ WaitAll recusa com STATUS_INVALID_HANDLE) e, nos demais tipos, o
 ObpDefaultObject (um evento de notificação sempre sinalizado); Count fora de
 1..64 dá STATUS_INVALID_PARAMETER_1, WaitType além de WaitAny
 STATUS_INVALID_PARAMETER_3, e um objeto repetido só é recusado no WaitAll
-(STATUS_INVALID_PARAMETER_MIX). Os prazos dessas esperas sondadas contam em
+(STATUS_INVALID_PARAMETER_MIX). Os prazos dessas esperas contam em
 ms arredondados para cima (um prazo não nulo abaixo de 1 ms espera o
-próximo ms, nunca vence de imediato). Uma espera sondada não tem bloco na
+próximo ms, nunca vence de imediato). Uma espera sondada (a do contexto de
+boot, a associação de um pacote de espera) não tem bloco na
 WaitListHead, e o KePulseEvent sinaliza e limpa o evento antes de qualquer
 sondagem: o pulso que acha o evento não sinalizado fica anotado
 (`dispatcher::PolledObjects`, na contagem global de pulsos), e a espera
-WaitAny que começou antes dele (os KeWaitFor* de uma thread de usuário num
-serviço, como a espera do vblank do dxgkrnl no
-D3DKMTWaitForVerticalBlankEvent2 do dwm e o MsgWaitForMultipleObjectsEx do
-win32k no WinSta0_DesktopSwitch do logoncontroller, o NtWaitFor* de modo
-usuário e a associação de um pacote de espera, que guarda a contagem de
-pulsos de quando foi feita) é satisfeita por ele como o KiTryUnwaitThread do KePulseEvent
-satisfaz a registrada: todas num evento de notificação, uma por pulso num de
+WaitAny que começou antes dele (a associação de um pacote de espera guarda
+a contagem de pulsos de quando foi feita) é satisfeita por ele como o
+KiTryUnwaitThread do KePulseEvent satisfaz a registrada: todas num evento de notificação, uma por pulso num de
 sincronização cujo sinal nenhuma espera consumiu. O WaitAll não conta
 pulsos. Do mesmo jeito, o KeResetEvent e o KeClearEvent de um evento
 sinalizado (19041 0x344c50: só zeram o SignalState, e as esperas que o
 KeSetEvent já tinha satisfeito continuam satisfeitas) e o KeSetTimer que
 rearma um KTIMER ou KTIMER2 vencido anotam um pulso: a espera sondada que
 já esperava quando o objeto foi sinalizado conclui mesmo com o reset antes
-da sondagem dela, e a que começa depois do reset não (o `wait_objects` do
-`cm/notify.rs` também passa pelo `PolledObjects`). O NtDelayExecution com intervalo zero,
+da sondagem dela, e a que começa depois do reset não.
+
+**Esperas registradas das threads de usuário.** As esperas de objeto, de
+prazo e de alerta das threads de usuário passam pelos blocos de espera do
+despachante (`ke/wait.rs`), como as das threads de kernel, em vez de serem
+sondadas a cada volta do despachante de usuário. Dentro de um serviço
+bloqueado no kernel (os KeWaitFor*, o KeDelayExecutionThread, o
+fast/guarded mutex, o ERESOURCE, o push lock e o rundown, pelo
+`acquire_signaled`), o laço do `ke::wait` liga os KWAIT_BLOCKs e a thread
+deixa a CPU com o serviço suspenso (`context_switch::block_registered`); a
+APC de kernel interrompe a espera em PASSIVE_LEVEL, a thread a entrega e
+espera de novo, como o KeWaitForSingleObject do NT. Num serviço de UserMode
+que devolve STATUS_PENDING (o NtWaitForSingleObject, o
+NtWaitForMultipleObjects, o NtSignalAndWaitForSingleObject, o
+NtDelayExecution, a espera do `cm/notify.rs`), `threads::wait_registered`
+tenta os objetos, confere os alertas e a APC de usuário pendente (o
+KiCheckAlertability) e liga os blocos dentro do serviço
+(`wait::begin_user_wait`, WaitInProgress, sem tocar no KTHREAD.State); a APC
+de kernel não interrompe essa espera, que o despachante conclui no
+contexto da thread. Quando a thread deixa a CPU, o despacho de usuário a
+põe Waiting e confirma a espera (`wait::commit_user_wait`, o
+KiCommitThreadWait, depois do `end_execution`, como o `run_step` das threads
+de kernel); um alerta ou uma APC de usuário que chegou com a espera em curso
+a desfaz, e a espera já satisfeita dentro do intervalo (WaitAborted) volta
+direto à fila. O sinal (KeSetEvent, KePulseEvent, KeReleaseSemaphore, o
+mutant, o timer da thread no prazo, o fim de uma thread ou processo) desfaz
+a espera e apronta a thread dentro dele (o KiUnwaitThread -> KiReadyThread);
+o despachante só leva o KTHREAD.WaitStatus ao CONTEXT (ou à retomada do
+serviço bloqueado) ao escolhê-la, sem sondar nada e sem carregar o CR3
+dela. Uma thread aprontada assim que está suspensa volta a esperar até a
+retomada. O término e o fim do processo desligam os blocos com
+STATUS_THREAD_IS_TERMINATING, e o pedido de término do 19041 tira a espera
+registrada de UserMode com STATUS_USER_APC (`wait::user_apc_published`).
+Os blocos embutidos (KTHREAD.WaitBlock[0..3]) recebem só os campos que o
+KiWaitMultiple grava: o SpareLong e o SparePtr deles são outros campos da
+KTHREAD na mesma memória (ContextSwitches, State/WaitIrql/WaitMode,
+WaitTime, ThreadCounters, XStateSave, o Win32Thread no SparePtr do
+WaitBlock[2], Ucb/Uch). As esperas acordadas (`threads::Registered::woken`)
+são as de uma condição que não é o estado de um objeto: o
+NtWaitForAlertByThreadId (o NtAlertThreadByThreadId a acorda pelo
+`wait::wake`, como o KeAlertThreadByThreadId), a retirada de uma porta de
+conclusão e a espera de trabalho da worker factory (um bloco de notificação
+na KQUEUE da porta, que o pacote novo, a vaga de concorrência liberada, o
+consumidor que saiu, o fechamento, o encerramento da fábrica e o pedido da
+classe 12 sinalizam; o timer da espera vence também no fim da ociosidade do
+worker) e as esperas do transporte ALPC/LPC (o `notify_waiters` de toda
+mudança do transporte, como para as threads de kernel). A saída de uma
+acordada só faz a sondagem dela rodar, no contexto da thread; sem
+conclusão, os blocos são ligados de novo. Uma acordada sem saída é sondada
+mesmo assim a cada 50 ms (`WOKEN_BACKSTOP_MS`). As demais esperas de
+serviço (a E/S de dispositivo, as condições próprias de um serviço e os
+`context_switch::wait_until` sem objeto) seguem sondadas a cada volta.
+Autoteste: `ntos/test/multiprocess/registered_wait.rs` (a thread pronta
+dentro do KeSetEvent, nenhuma espera sondada, o KeWaitForSingleObject
+dentro do serviço, a suspensa, o alerta por id, o atraso, o fim do processo
+sem bloco na WaitListHead e os campos sobrepostos intactos). O NtDelayExecution com intervalo zero,
 sem Alertable e sem UserApcPending, é a troca do NtYieldExecution
 (STATUS_SUCCESS ou STATUS_NO_YIELD_PERFORMED), como no
 KeDelayExecutionThread. Os dois e o ZwYieldExecution escolhem como o

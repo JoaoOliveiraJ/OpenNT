@@ -42,11 +42,22 @@
 //! última a sair conclui o fim do processo, com o callout de processo.
 //!
 //! Uma thread também pode bloquear dentro de uma syscall
-//! (`ke::context_switch::block_current`): o serviço fica suspenso na pilha de
-//! kernel dela ([`KernelState::Blocked`]), o intervalo termina e o
-//! despachante roda as outras. A espera dela é sondada como as demais;
-//! quando conclui, o despachante a retoma na própria pilha em vez de entrar
-//! no anel 3, e o serviço termina o intervalo como qualquer syscall.
+//! (`ke::context_switch::block_registered`, `block_current`): o serviço fica
+//! suspenso na pilha de kernel dela ([`KernelState::Blocked`]), o intervalo
+//! termina e o despachante roda as outras. Quando a espera conclui, o
+//! despachante a retoma na própria pilha em vez de entrar no anel 3, e o
+//! serviço termina o intervalo como qualquer syscall.
+//!
+//! As esperas de objeto, de prazo e de alerta das threads de usuário são
+//! registradas no despachante ([`Registered`], `ke::wait`), como as das
+//! threads de kernel: o sinal apronta a thread (o KiUnwaitThread) e o
+//! despachante só leva o status ao CONTEXT ou à retomada do serviço, sem
+//! sondar. As acordadas (o alerta por id, a porta de conclusão, o
+//! transporte ALPC) voltam à fila pelo sinal da fila ou pelo `wake` de quem
+//! muda a condição, e a sondagem delas roda só então (e, sem nada, a cada
+//! [`WOKEN_BACKSTOP_MS`]). As demais (E/S de dispositivo, notificação de
+//! registro e as condições próprias de um serviço) seguem sondadas a cada
+//! volta do despachante.
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -112,6 +123,126 @@ pub struct Wait {
     /// O KWAIT_REASON publicado na KTHREAD; `None` deriva da forma da
     /// espera ([`wait_reason`]).
     pub reason: Option<u8>,
+    /// A espera registrada no despachante ([`Registered`]): sem sondagem a
+    /// cada volta; o sinal a conclui.
+    pub registered: Option<Registered>,
+}
+
+/// A espera de uma thread de usuário registrada no despachante (`ke::wait`),
+/// como a de uma thread de kernel: os KWAIT_BLOCKs da KTHREAD ligados aos
+/// objetos e o timer do prazo. O sinal de um objeto, o prazo, um alerta ou
+/// uma APC de usuário a desfazem dentro do próprio sinal e põem a thread na
+/// fila (o KiUnwaitThread -> KiReadyThread do 19041); o status fica em
+/// KTHREAD.WaitStatus e o despachante só o leva ao CONTEXT ao escolher a
+/// thread, sem sondar nada. Numa espera acordada (`woken`) os blocos são de
+/// notificação (ou nenhum, com o `ke::wait::wake` de quem muda a condição):
+/// a saída só faz a sondagem da espera (`Wait.poll`) rodar de novo, no
+/// contexto da thread, e sem conclusão a espera volta a ser registrada.
+pub struct Registered {
+    /// A KTHREAD que espera.
+    pub thread: u64,
+    pub objects: Vec<u64>,
+    /// O WAIT_TYPE dos blocos (WaitAny 1, WaitAll 0) numa espera de objetos.
+    pub kind: u8,
+    pub deadline: crate::ntos::ke::wait::Deadline,
+    /// O status do prazo vencido (STATUS_TIMEOUT; STATUS_SUCCESS num atraso).
+    pub timeout_status: u32,
+    pub alertable: bool,
+    pub woken: bool,
+    /// Numa acordada, o instante (uptime em ms) em que a sondagem quer rodar
+    /// de novo mesmo sem sinal (a ociosidade de um worker): o timer da espera
+    /// vence no menor entre ele e o prazo, e o vencimento antes do prazo só
+    /// faz a sondagem rodar.
+    pub poll_deadline: Option<Arc<AtomicU64>>,
+    /// O número da espera ligada (0 = nenhuma).
+    serial: u64,
+    /// Uptime (ms) da última sondagem de uma acordada.
+    polled_at: u64,
+}
+
+impl Registered {
+    /// Uma espera de objetos de UserMode (o NtWaitForSingleObject, o
+    /// NtWaitForMultipleObjects): `kind` WaitAny ou WaitAll.
+    pub fn objects(thread: u64, objects: Vec<u64>, kind: u8, deadline: crate::ntos::ke::wait::Deadline, alertable: bool) -> Self {
+        Registered { thread, objects, kind, deadline, timeout_status: crate::ntos::ke::wait::STATUS_TIMEOUT, alertable, woken: false, poll_deadline: None, serial: 0, polled_at: 0 }
+    }
+
+    /// Só o timer da thread (o KeDelayExecutionThread): STATUS_SUCCESS no
+    /// vencimento.
+    pub fn delay(thread: u64, deadline: crate::ntos::ke::wait::Deadline, alertable: bool) -> Self {
+        Registered { thread, objects: Vec::new(), kind: crate::ntos::ke::wait::wait_type::ANY, deadline, timeout_status: 0, alertable, woken: false, poll_deadline: None, serial: 0, polled_at: 0 }
+    }
+
+    /// Uma espera acordada: o sinal de `watch` (blocos de notificação, que
+    /// não consomem), um `ke::wait::wake` ou o prazo devolvem a thread à
+    /// fila, e a sondagem da espera decide.
+    pub fn woken(thread: u64, watch: Vec<u64>, deadline: crate::ntos::ke::wait::Deadline, alertable: bool) -> Self {
+        Registered { thread, objects: watch, kind: crate::ntos::ke::wait::wait_type::NOTIFICATION, deadline, timeout_status: crate::ntos::ke::wait::STATUS_TIMEOUT, alertable, woken: true, poll_deadline: None, serial: 0, polled_at: clock::uptime_ms() }
+    }
+
+    /// A espera de kernel dentro de um serviço (o KeWaitFor*, o
+    /// KeDelayExecutionThread, a aquisição de um lock do Ex), já ligada pelo
+    /// laço do `ke::wait` com o número `serial`: o despachante só leva o
+    /// desfecho à retomada; o laço decide o resto (a APC de kernel, a espera
+    /// de novo).
+    fn linked(thread: u64, serial: u64) -> Self {
+        Registered { thread, objects: Vec::new(), kind: crate::ntos::ke::wait::wait_type::ANY, deadline: crate::ntos::ke::wait::Deadline::Infinite, timeout_status: crate::ntos::ke::wait::STATUS_TIMEOUT, alertable: false, woken: false, poll_deadline: None, serial, polled_at: 0 }
+    }
+
+    fn spec(&self, reason: u8) -> crate::ntos::ke::wait::WaitSpec {
+        use crate::ntos::ke::wait::{wait_type, WaitSpec};
+        let kind = if self.woken { wait_type::NOTIFICATION } else { self.kind };
+        WaitSpec { timeout_key: self.timeout_status, explicit: self.woken, deferred: true, ..WaitSpec::new(kind, None, 1, self.alertable, reason) }
+    }
+
+    /// O prazo do timer da espera: o dela ou, se vem antes, o da sondagem
+    /// (nunca menos de 1 ms à frente).
+    fn wake_deadline(&self) -> crate::ntos::ke::wait::Deadline {
+        use crate::ntos::ke::wait::Deadline;
+        let Some(poll) = self.poll_deadline.as_ref() else { return self.deadline };
+        // Um prazo da sondagem já vencido vale daqui a 1 ms: o registro nunca
+        // conclui por ele, e a sondagem roda no vencimento.
+        let now = clock::uptime_100ns();
+        let at = poll.load(Ordering::Acquire).saturating_mul(10_000).max(now + 10_000);
+        let poll_remaining = at - now;
+        match self.deadline.remaining() {
+            Some(remaining) if remaining <= poll_remaining => self.deadline,
+            _ => Deadline::Uptime(at),
+        }
+    }
+
+    /// Liga os blocos (a tentativa dos objetos e o prazo primeiro):
+    /// `Some(status)` quando concluiu ali mesmo.
+    fn link(&mut self, reason: u8) -> Option<u32> {
+        use crate::ntos::ke::wait::{begin_user_wait, UserWaitStart};
+        let deadline = self.wake_deadline();
+        match begin_user_wait(self.thread, &self.objects, deadline, self.spec(reason)) {
+            Ok(UserWaitStart::Done(status)) => Some(status),
+            Ok(UserWaitStart::Linked(serial)) => {
+                self.serial = serial;
+                None
+            }
+            Err(status) => Some(status),
+        }
+    }
+
+    /// O status da espera ligada, quando ela já saiu.
+    fn outcome(&self) -> Option<u32> {
+        if self.serial == 0 {
+            return None;
+        }
+        crate::ntos::ke::wait::user_wait_outcome(self.thread, self.serial)
+    }
+}
+
+impl Drop for Registered {
+    /// Uma espera descartada sem conclusão não deixa blocos ligados em
+    /// objetos que sobrevivem à KTHREAD.
+    fn drop(&mut self) {
+        if self.serial != 0 {
+            crate::ntos::ke::wait::withdraw_user_wait(self.thread, self.serial);
+        }
+    }
 }
 
 /// O KWAIT_REASON de uma espera de usuário, como o 19041 passa ao
@@ -575,6 +706,39 @@ fn poll_user_waits() {
     for candidate in candidates {
         let pointer = candidate.pointer();
         if let Some(mut wait) = candidate.take_wait() {
+            // A registrada não é sondada: só o desfecho, sem o contexto da
+            // thread, e a conclusão (ou a sondagem de uma acordada) nele.
+            if wait.registered.is_some() {
+                if !registered_done(&wait) {
+                    // Uma acordada sem saída há WOKEN_BACKSTOP_MS sonda mesmo
+                    // assim: uma mudança que não acordou ninguém espera no
+                    // máximo isso.
+                    if !woken_backstop_due(&wait) {
+                        candidate.restore_wait(wait);
+                        continue;
+                    }
+                    process::set_current_thread(pointer);
+                    match woken_backstop(&mut wait) {
+                        Some(status) => finish_wait(&candidate, wait, status),
+                        None => {
+                            candidate.restore_wait(wait);
+                            continue;
+                        }
+                    }
+                    let _ = thread_dispatch::make_ready(pointer);
+                    continue;
+                }
+                process::set_current_thread(pointer);
+                match settle_registered(&mut wait, true) {
+                    Some(status) => finish_wait(&candidate, wait, status),
+                    None => {
+                        candidate.restore_wait(wait);
+                        continue;
+                    }
+                }
+                let _ = thread_dispatch::make_ready(pointer);
+                continue;
+            }
             dispatch_perf::POLLS.fetch_add(1, Ordering::Relaxed);
             let outcome = match poll_delay(&wait) {
                 Some(outcome) => outcome,
@@ -746,7 +910,21 @@ fn dispatch_from(executor: fn(u64, u64) -> u32, caller: u64) -> Result<Dispatche
             thread_dispatch::suspend(pointer, thread_dispatch::state::WAITING)?;
             continue;
         };
-        let (dead, process) = next.with(|thread| (thread.dead, thread.process_pointer));
+        // Na fila com a espera ainda instalada: a registrada que o sinal
+        // satisfez conclui aqui, no contexto da thread (o status vai ao
+        // CONTEXT, ou à retomada do serviço bloqueado); a que segue (uma
+        // acordada sem conclusão, ou a thread aprontada por fora da espera)
+        // volta a esperar.
+        if next.waiting() {
+            process::set_current_thread(pointer);
+            let settled = settle(&next);
+            process::set_current_thread(caller);
+            if !settled {
+                thread_dispatch::suspend(pointer, thread_dispatch::state::WAITING)?;
+                continue;
+            }
+        }
+        let (dead, process, suspended) = next.with(|thread| (thread.dead, thread.process_pointer, thread.suspend_count != 0));
         let kernel = next.kernel_state();
         // Bloqueada no kernel com a espera ainda pendente (um alerta a
         // pôs na fila antes da sondagem): volta a esperar.
@@ -762,6 +940,12 @@ fn dispatch_from(executor: fn(u64, u64) -> u32, caller: u64) -> Result<Dispatche
                 continue;
             }
             if !process_started(process) {
+                thread_dispatch::suspend(pointer, thread_dispatch::state::WAITING)?;
+                continue;
+            }
+            // Suspensa (o sinal de uma espera registrada apronta mesmo a
+            // suspensa): a retomada a põe na fila de novo.
+            if suspended {
                 thread_dispatch::suspend(pointer, thread_dispatch::state::WAITING)?;
                 continue;
             }
@@ -962,16 +1146,24 @@ fn execute(thread: &Arc<UserThread>, executor: fn(u64, u64) -> u32) -> Result<(u
         executor(context, teb)
     };
     SLICE_THREAD.store(0, Ordering::Release);
-    let new_state = thread.with(|thread| {
-        if thread.dead {
-            thread_dispatch::state::TERMINATED
-        } else if thread.waiting || thread.suspend_count != 0 {
-            thread_dispatch::state::WAITING
-        } else {
-            thread_dispatch::state::READY
-        }
-    });
+    let (dead, waiting, suspended, registered) = thread.with(|thread| (thread.dead, thread.waiting, thread.suspend_count != 0, thread.wait.as_ref().is_some_and(|wait| wait.registered.is_some())));
+    let new_state = if dead {
+        thread_dispatch::state::TERMINATED
+    } else if waiting || suspended {
+        thread_dispatch::state::WAITING
+    } else {
+        thread_dispatch::state::READY
+    };
     thread_dispatch::end_execution(pointer, new_state)?;
+    // O KiCommitThreadWait, com a thread já Waiting e fora da CPU (como o
+    // `scheduler::run_step` das threads de kernel): a espera registrada passa
+    // a WaitCommitted e o sinal seguinte a apronta. A que já saiu antes
+    // (WaitAborted: satisfeita dentro do próprio intervalo, ou um alerta
+    // pendente) volta à fila aqui, e o despachante leva o status ao CONTEXT
+    // ao escolhê-la.
+    if !dead && waiting && registered && !crate::ntos::ke::wait::commit_user_wait(pointer) && !suspended {
+        thread_dispatch::make_ready(pointer)?;
+    }
     let elapsed = (clock::uptime_ms() - started) * 10_000;
     let kernel = process::thread_kernel_time(pointer).saturating_sub(kernel_before);
     process::account_thread(pointer, false, elapsed.saturating_sub(kernel));
@@ -1194,6 +1386,14 @@ fn finish_pending_exits(count_round: bool) {
 }
 
 fn finish_wait(thread: &UserThread, mut wait: Wait, status: u32) {
+    // Uma espera registrada ainda ligada (concluída de fora: o término, o fim
+    // do processo) sai dos objetos com o status.
+    if let Some(registered) = wait.registered.as_mut() {
+        if registered.serial != 0 {
+            crate::ntos::ke::wait::cancel_user_wait(registered.thread, registered.serial, status);
+            registered.serial = 0;
+        }
+    }
     if let Some(alerts) = wait.alerts.as_mut() {
         let _ = alerts.finish(status);
     }
@@ -1238,6 +1438,12 @@ fn poll_delay(wait: &Wait) -> Option<Option<u32>> {
 }
 
 fn poll_wait(wait: &mut Wait) -> Option<u32> {
+    // A registrada da thread corrente, ainda na CPU (o laço de um callback):
+    // o desfecho, e numa acordada que não concluiu, os blocos de novo (a
+    // thread deixa a CPU em seguida e a saída do intervalo confirma).
+    if wait.registered.is_some() {
+        return settle_registered(wait, false);
+    }
     if wait.alert.is_none() && (wait.entries.is_some() || wait.delay || wait.alertable.is_some()) {
         if wait.alerts.is_none() {
             wait.alerts = thread_alert::wait(process::get_current_thread(), 1, wait.alertable.unwrap_or(false), false).ok();
@@ -1271,14 +1477,19 @@ fn poll_wait(wait: &mut Wait) -> Option<u32> {
 }
 
 fn block_current(mut wait: Wait) {
-    if let Some(alerts) = wait.alerts.as_mut() {
-        let _ = alerts.arm();
+    // A registrada já tem os alertas e as APCs pelo despachante (`ke::wait`)
+    // e os campos de espera da KTHREAD gravados pelo registro.
+    let registered = wait.registered.is_some();
+    if !registered {
+        if let Some(alerts) = wait.alerts.as_mut() {
+            let _ = alerts.arm();
+        }
     }
     let Some(current) = current() else { return };
     completion_objects::deactivate(current.pointer());
     // A espera de kernel dentro de um serviço (`block_in_kernel`) já gravou
     // os campos dela no KeWait*.
-    if !current.blocked_in_kernel() {
+    if !current.blocked_in_kernel() && !registered {
         crate::ntos::ke::wait::publish_user_wait(current.pointer(), wait_reason(&wait), wait.alertable.unwrap_or(false));
     }
     current.with(|thread| {
@@ -1294,6 +1505,15 @@ fn block_current(mut wait: Wait) {
 pub fn block_in_kernel(thread: &UserThread, wait: Wait) {
     thread.with(|thread| thread.kernel = KernelState::Blocked { status: None });
     block_current(wait);
+}
+
+/// Bloqueio dentro de uma syscall numa espera já registrada no despachante
+/// (`ke::wait`, a espera número `serial` da thread corrente `thread`): o
+/// sinal a apronta, e o despachante publica o status (KTHREAD.WaitStatus) e
+/// retoma o serviço na pilha da thread, sem sondá-la.
+pub fn block_in_registered_wait(thread: &UserThread, serial: u64) {
+    let pointer = thread.pointer();
+    block_in_kernel(thread, Wait { registered: Some(Registered::linked(pointer, serial)), kernel: true, ..Wait::default() });
 }
 
 /// O despacho dos intervalos de um callback de modo usuário (o
@@ -1494,6 +1714,189 @@ fn conclude(wait: &mut Wait, status: u32) {
     }
 }
 
+/// A espera instalada de `thread`, que o despachante achou na fila (a thread
+/// fora da CPU, no contexto dela, que quem chama carregou): a registrada que
+/// já saiu conclui, e `true`; a que ainda espera, ou uma sondada (a thread
+/// foi aprontada por fora da espera), `false`.
+fn settle(thread: &UserThread) -> bool {
+    let Some(mut wait) = thread.take_wait() else { return !thread.waiting() };
+    if !registered_done(&wait) {
+        thread.restore_wait(wait);
+        return false;
+    }
+    match settle_registered(&mut wait, true) {
+        Some(status) => {
+            finish_wait(thread, wait, status);
+            true
+        }
+        None => {
+            thread.restore_wait(wait);
+            false
+        }
+    }
+}
+
+/// Quanto uma espera acordada fica sem sondar (sem sinal, `ke::wait::wake`
+/// nem prazo) antes de o despachante a sondar mesmo assim.
+const WOKEN_BACKSTOP_MS: u64 = 50;
+
+/// A espera acordada de `wait`, ainda ligada, não é sondada há
+/// [`WOKEN_BACKSTOP_MS`].
+fn woken_backstop_due(wait: &Wait) -> bool {
+    wait.registered.as_ref().is_some_and(|registered| registered.woken && registered.serial != 0 && clock::uptime_ms().saturating_sub(registered.polled_at) >= WOKEN_BACKSTOP_MS)
+}
+
+/// A sondagem de uma espera acordada ainda ligada, no contexto da thread
+/// (que quem chama carregou): concluída, a espera sai dos objetos com o
+/// status (`finish_wait`).
+fn woken_backstop(wait: &mut Wait) -> Option<u32> {
+    if let Some(registered) = wait.registered.as_mut() {
+        registered.polled_at = clock::uptime_ms();
+    }
+    dispatch_perf::POLLS.fetch_add(1, Ordering::Relaxed);
+    wait.poll.as_mut().and_then(|poll| poll())
+}
+
+/// A espera registrada de `wait` já saiu (o desfecho dela está pronto): a
+/// conclusão roda no contexto da thread.
+fn registered_done(wait: &Wait) -> bool {
+    wait.registered.as_ref().is_some_and(|registered| registered.outcome().is_some())
+}
+
+/// O desfecho de uma espera registrada ([`Registered`]): `None` enquanto ela
+/// espera. Numa acordada que saiu, a sondagem roda (no contexto da thread,
+/// que quem chama já carregou): concluída, o status dela; o prazo, um alerta
+/// ou uma APC de usuário sem conclusão, o status da saída; senão os blocos
+/// são ligados de novo. `off_cpu`: a thread está fora da CPU (o despachante)
+/// e a espera nova é confirmada aqui, com a thread de volta a Waiting; senão
+/// (a thread corrente, no laço de um callback) a saída do intervalo confirma.
+fn settle_registered(wait: &mut Wait, off_cpu: bool) -> Option<u32> {
+    use crate::ntos::ke::wait::{STATUS_ALERTED, STATUS_TIMEOUT, STATUS_USER_APC};
+    let reason = wait_reason(wait);
+    loop {
+        let registered = wait.registered.as_mut()?;
+        let status = registered.outcome()?;
+        registered.serial = 0;
+        if !registered.woken {
+            return Some(status);
+        }
+        registered.polled_at = clock::uptime_ms();
+        if let Some(done) = wait.poll.as_mut().and_then(|poll| poll()) {
+            return Some(done);
+        }
+        let registered = wait.registered.as_mut()?;
+        let expired = status == STATUS_TIMEOUT && registered.deadline.remaining() == Some(0);
+        if expired || status == STATUS_ALERTED || status == STATUS_USER_APC {
+            return Some(status);
+        }
+        if let Some(done) = registered.link(reason) {
+            return Some(done);
+        }
+        if !off_cpu {
+            return None;
+        }
+        // A thread (pronta pela saída) volta a Waiting e a espera nova é
+        // confirmada; a que já saiu de novo antes disso é sondada outra vez.
+        let thread = registered.thread;
+        let _ = thread_dispatch::suspend(thread, thread_dispatch::state::WAITING);
+        if crate::ntos::ke::wait::commit_user_wait(thread) {
+            return None;
+        }
+        let _ = thread_dispatch::make_ready(thread);
+    }
+}
+
+/// Uma espera de serviço de UserMode registrada no despachante
+/// ([`Registered`]), como o KeWaitForMultipleObjects do 19041: a tentativa
+/// (os objetos, ou a sondagem numa espera acordada), os alertas e a APC de
+/// usuário pendente (o KiCheckAlertability), o registro dos blocos sob o
+/// lock do despachante (a tentativa de novo e o prazo) e, numa acordada, a
+/// sondagem depois do registro (um `wake` entre as duas não se perde). Sem
+/// conclusão, STATUS_PENDING com a espera instalada: o sinal apronta a
+/// thread e o despachante grava o status no CONTEXT quando a escolhe.
+fn wait_registered(mut wait: Wait) -> u32 {
+    let reason = wait_reason(&wait);
+    let Some((thread, woken, alertable)) = wait.registered.as_ref().map(|registered| (registered.thread, registered.woken, registered.alertable)) else {
+        conclude(&mut wait, NOT_SUPPORTED);
+        return NOT_SUPPORTED;
+    };
+    let mut immediate = if woken {
+        wait.poll.as_mut().and_then(|poll| poll())
+    } else {
+        wait.registered.as_ref().filter(|registered| !registered.objects.is_empty()).and_then(|registered| dispatcher::try_wait_objects_for(&registered.objects, registered.kind as u32, thread))
+    };
+    // Fora do despachante (sem thread de usuário corrente) a espera que
+    // bloquearia é recusada, como na sondada; com o prazo já vencido, ela
+    // volta o status do prazo.
+    if immediate.is_none() && (thread == 0 || !active()) {
+        let expired = wait.registered.as_ref().filter(|registered| registered.deadline.remaining() == Some(0)).map(|registered| registered.timeout_status);
+        immediate = Some(expired.unwrap_or(NOT_SUPPORTED));
+    }
+    if immediate.is_none() {
+        immediate = thread_alert::consume(thread, 1, alertable);
+    }
+    if immediate.is_none() {
+        immediate = wait.registered.as_mut().and_then(|registered| registered.link(reason));
+    }
+    if immediate.is_none() && woken {
+        if let Some(done) = wait.poll.as_mut().and_then(|poll| poll()) {
+            if let Some(registered) = wait.registered.as_mut() {
+                crate::ntos::ke::wait::withdraw_user_wait(registered.thread, registered.serial);
+                registered.serial = 0;
+            }
+            immediate = Some(done);
+        }
+    }
+    if let Some(status) = immediate {
+        conclude(&mut wait, status);
+        return status;
+    }
+    for entry in wait.entries.iter().flatten() {
+        state::retain_user_handle_reference(entry);
+    }
+    block_current(wait);
+    PENDING
+}
+
+/// Uma espera de serviço do transporte ALPC/LPC (a recepção de uma mensagem,
+/// a resposta de um pedido síncrono, a decisão de uma conexão), com o prazo
+/// apontado por `timeout` (0 = sem prazo): uma espera acordada
+/// ([`Registered`]) pelo `alpc::kernel_entry::notify_waiters` de toda mudança
+/// do transporte, como as de kernel, e a sondagem da operação só roda então.
+pub fn wait_transport(mut wait: Wait, timeout: u64) -> u32 {
+    let thread = current_pointer();
+    let deadline = crate::ntos::ke::wait::Deadline::after(dispatcher::timeout_pointer_to_ms(timeout).map(|ms| ms.saturating_mul(10_000)));
+    let alertable = wait.alertable.unwrap_or(false);
+    crate::ntos::alpc::kernel_entry::watch(thread);
+    let previous = wait.cleanup.take();
+    wait.cleanup = Some(Box::new(move |status| {
+        crate::ntos::alpc::kernel_entry::unwatch(thread);
+        if let Some(previous) = previous {
+            previous(status);
+        }
+    }));
+    wait.registered = Some(Registered::woken(thread, Vec::new(), deadline, alertable));
+    wait_registered(wait)
+}
+
+/// Uma espera de serviço já montada com a [`Registered`] (a retirada de uma
+/// porta de conclusão): [`wait_registered`] para quem a monta fora daqui.
+pub fn wait_registered_service(wait: Wait) -> u32 {
+    wait_registered(wait)
+}
+
+/// O prazo de uma espera de serviço (o LARGE_INTEGER capturado; `None` sem
+/// prazo), em ms inteiros arredondados para cima, como as esperas sondadas:
+/// um prazo não nulo nunca vence antes do próximo ms.
+fn service_deadline(timeout: Option<i64>) -> crate::ntos::ke::wait::Deadline {
+    crate::ntos::ke::wait::Deadline::after(dispatcher::timeout_value_to_ms(timeout).map(|ms| ms.saturating_mul(10_000)))
+}
+
+/// A KTHREAD da thread de usuário corrente (0 fora do despachante).
+fn current_pointer() -> u64 {
+    current().map_or(0, |thread| thread.pointer())
+}
+
 /// Espera personalizada: `timeout_ms` None deriva o prazo do ponteiro;
 /// `Some(None)` é infinito. Fora do laço, a espera que bloquearia recusa
 /// com 0xC00000BB; o pendente interno (0x103) é trocado antes da retomada.
@@ -1517,33 +1920,24 @@ pub fn wait_custom(mut wait: Wait, timeout: u64, timeout_ms: Option<Option<u64>>
 
 /// A espera de um serviço de modo usuário nos objetos capturados por
 /// `ob/wait::reference_objects` (WaitAny devolve o primeiro índice
-/// satisfeito, WaitAll o status conjunto), com o prazo em ms (`None` = sem
-/// prazo): as referências da captura ficam com a espera e saem quando ela
-/// conclui. Um KePulseEvent num evento esperado também a satisfaz
-/// (`dispatcher::PolledObjects`), como satisfaz a espera registrada.
-pub fn wait_referenced(set: crate::ntos::ob::wait::WaitObjects, wait_type: u32, timeout_ms: Option<u64>, alertable: bool) -> u32 {
+/// satisfeito, WaitAll o status conjunto), com o prazo capturado (`None` =
+/// sem prazo): o ObWaitForMultipleObjects de UserMode, registrada no
+/// despachante ([`Registered`], UserRequest). As referências da captura
+/// ficam com a espera e saem quando ela conclui.
+pub fn wait_referenced(set: crate::ntos::ob::wait::WaitObjects, wait_type: u32, timeout: Option<i64>, alertable: bool) -> u32 {
     let objects = set.objects.clone();
-    let polled = dispatcher::PolledObjects::new(objects.clone(), wait_type);
-    let wait = Wait { objects, wait_type, alertable: Some(alertable), poll: Some(Box::new(move || polled.try_now())), cleanup: Some(Box::new(move |_status| set.release())), ..Wait::default() };
-    wait_custom(wait, 0, Some(timeout_ms))
+    let registered = Registered::objects(current_pointer(), objects.clone(), wait_type as u8, service_deadline(timeout), alertable);
+    let wait = Wait { objects, wait_type, alertable: Some(alertable), cleanup: Some(Box::new(move |_status| set.release())), reason: Some(crate::ntos::ke::wait::reason::USER_REQUEST), registered: Some(registered), ..Wait::default() };
+    wait_registered(wait)
 }
 
+/// A espera de modo usuário nos `objects` (os handles de `entries` retidos
+/// até ela concluir), com o prazo apontado por `timeout` (0 = sem prazo),
+/// registrada no despachante.
 pub fn wait_objects(entries: Vec<Arc<UserHandle>>, objects: Vec<u64>, wait_type: u32, timeout: u64, alertable: bool) -> u32 {
-    let ms = dispatcher::timeout_pointer_to_ms(timeout);
-    // Pelos PolledObjects: os pulsos e os resets de objeto sinalizado contam.
-    let polled = dispatcher::PolledObjects::new(objects.clone(), wait_type);
-    let mut wait = Wait { entries: Some(entries), objects, wait_type, alertable: Some(alertable), deadline: ms.map(|ms| clock::uptime_ms() + ms), poll: Some(Box::new(move || polled.try_now())), ..Wait::default() };
-    if let Some(immediate) = poll_wait(&mut wait) {
-        if let Some(alerts) = wait.alerts.as_mut() {
-            let _ = alerts.finish(immediate);
-        }
-        return immediate;
-    }
-    for entry in wait.entries.iter().flatten() {
-        state::retain_user_handle_reference(entry);
-    }
-    block_current(wait);
-    PENDING
+    let deadline = crate::ntos::ke::wait::Deadline::after(dispatcher::timeout_pointer_to_ms(timeout).map(|ms| ms.saturating_mul(10_000)));
+    let registered = Registered::objects(current_pointer(), objects.clone(), wait_type as u8, deadline, alertable);
+    wait_registered(Wait { entries: Some(entries), objects, wait_type, alertable: Some(alertable), registered: Some(registered), ..Wait::default() })
 }
 
 /// Fim do processo `process`: as threads dele (e só as dele) morrem, as
@@ -2200,6 +2594,9 @@ fn request_termination(thread: &Arc<UserThread>, status: u32) {
             finish_wait(thread, wait, THREAD_IS_TERMINATING);
         }
     }
+    // A espera registrada de UserMode de um serviço bloqueado sai com
+    // STATUS_USER_APC, como a sondada pelo KiCheckAlertability.
+    crate::ntos::ke::wait::user_apc_published(pointer);
     // A thread que pede o próprio término sai no fim deste serviço: nada a
     // alertar nem retomar.
     if pointer == process::get_current_thread() {
@@ -2519,7 +2916,8 @@ fn nt_delay_execution(alertable: u64, interval: u64, _a3: u64, _a4: u64, _rsp: u
         }
         return nt_yield_execution(0, 0, 0, 0, 0);
     }
-    Ok(wait_custom(Wait { delay: true, alertable: Some(alertable), ..Wait::default() }, 0, Some(dispatcher::timeout_value_to_ms(Some(interval)))))
+    let registered = Registered::delay(current_pointer(), service_deadline(Some(interval)), alertable);
+    Ok(wait_registered(Wait { delay: true, alertable: Some(alertable), registered: Some(registered), ..Wait::default() }))
 }
 
 fn nt_alert_thread(handle: u64, _a2: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
@@ -2542,12 +2940,15 @@ fn nt_wait_for_alert_by_thread_id(_address: u64, timeout: u64, _a3: u64, _a4: u6
     if current.with(|thread| core::mem::replace(&mut thread.alerted, false)) {
         return Ok(0x101);
     }
-    let ms = dispatcher::timeout_value_to_ms(timeout);
-    if ms == Some(0) {
+    if dispatcher::timeout_value_to_ms(timeout) == Some(0) {
         return Ok(0x102);
     }
-    block_current(Wait { alert: Some(current), deadline: ms.map(|ms| clock::uptime_ms() + ms), ..Wait::default() });
-    Ok(PENDING)
+    // Uma espera acordada sem objetos: o NtAlertThreadByThreadId a acorda
+    // (`ke::wait::wake`), e a sondagem consome o alerta.
+    let target = current.clone();
+    let poll = move || target.with(|thread| core::mem::replace(&mut thread.alerted, false)).then_some(0x101);
+    let registered = Registered::woken(current.pointer(), Vec::new(), service_deadline(timeout), false);
+    Ok(wait_registered(Wait { alert: Some(current), poll: Some(Box::new(poll)), registered: Some(registered), ..Wait::default() }))
 }
 
 /// NtAlertThreadByThreadId(ThreadId), como no 19041: um id desconhecido dá
@@ -2563,7 +2964,9 @@ fn nt_alert_thread_by_thread_id(id: u64, _a2: u64, _a3: u64, _a4: u64, _rsp: u64
         return Ok(0xC000_0022);
     }
     thread.with(|thread| thread.alerted = true);
-    dispatcher::note_wake();
+    // A espera acordada do NtWaitForAlertByThreadId volta à fila e consome o
+    // alerta (o KeAlertThreadByThreadId do 19041 apronta a thread ali).
+    crate::ntos::ke::wait::wake(thread.pointer());
     Ok(0)
 }
 

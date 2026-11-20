@@ -50,6 +50,18 @@ pub fn notify_waiters() {
     }
 }
 
+/// Uma thread de usuário parada numa espera de serviço do transporte (a
+/// recepção, a resposta, a conexão: `ps/user/threads::wait_transport`) volta
+/// pelo [`notify_waiters`] como as de kernel.
+pub fn watch(thread: u64) {
+    WAITERS.lock().insert(thread);
+}
+
+/// A espera de serviço do transporte de `thread` acabou.
+pub fn unwatch(thread: u64) {
+    WAITERS.lock().remove(&thread);
+}
+
 /// Uma espera do ALPC: numa thread de kernel, a saída das prontas até
 /// [`notify_waiters`], o prazo ou um alerta (`ke::wait`); fora dela, a
 /// espera sondada do `context_switch`.

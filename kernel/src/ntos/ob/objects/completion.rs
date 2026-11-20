@@ -114,19 +114,27 @@ impl Port {
 
     /// Altera as coleções e publica na KQUEUE os pacotes (SignalState) e os
     /// consumidores ativos (CurrentCount). A fila que ganhou pacotes testa
-    /// as esperas do cabeçalho (o KiWaitTest), fora do lock da porta.
+    /// as esperas do cabeçalho (o KiWaitTest), fora do lock da porta. Com
+    /// pacotes na fila e vaga de concorrência, uma vaga liberada ou um
+    /// consumidor que saiu também acordam as esperas de usuário paradas na
+    /// fila (blocos de notificação, que sondam a retirada): a vez pode ter
+    /// passado a uma delas.
     pub fn with<R>(&self, body: impl FnOnce(&mut PortState) -> R) -> R {
-        let (result, grew) = {
+        let (result, grew, opened) = {
             let mut state = self.state.lock();
+            let (active, waiters) = (state.active.len(), state.waiters.len());
             let result = body(&mut state);
             let queue = self.queue();
             let depth = state.packets.len() as i32;
             let previous = queue.header.signal_state.atomic().swap(depth, Ordering::SeqCst);
             queue.current_count.set(state.active.len() as u32);
-            (result, depth > previous)
+            let room = depth > 0 && (state.active.len() as u32) < queue.maximum_count.get();
+            (result, depth > previous, room && (state.active.len() < active || state.waiters.len() < waiters))
         };
         if grew {
             ke_wait::signal(self.pointer);
+        } else if opened {
+            ke_wait::retest(self.pointer);
         }
         result
     }
@@ -242,6 +250,8 @@ pub fn close_port(port: &Port) {
     if port.mark_closed() {
         return;
     }
+    // As esperas paradas na fila veem a porta fechada (STATUS_ABANDONED).
+    ke_wait::retest(port.pointer);
     if let Some(node) = port.node.lock().take() {
         object_manager::remove_named(node);
     }

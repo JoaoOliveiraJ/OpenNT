@@ -1384,7 +1384,7 @@ pub fn exchange_messages(port: &Arc<Port>, flags: u32, input: u64, send_attribut
     }
     let polled = receiver.clone();
     let wait = Wait { poll: Some(Box::new(move || polled.poll())), cleanup: Some(Box::new(release_wait)), ..Wait::default() };
-    Ok(Status(threads::wait_custom(wait, timeout, None)))
+    Ok(Status(threads::wait_transport(wait, timeout)))
 }
 
 fn send_receive(handle: u64, flags: u64, input: u64, send_attributes: u64, rsp: u64) -> Result<u32, KernelError> {

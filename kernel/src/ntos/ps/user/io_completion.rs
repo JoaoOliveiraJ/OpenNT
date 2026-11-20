@@ -150,6 +150,9 @@ pub struct RemoveOptions {
     pub cleanup: Option<Box<dyn FnOnce() + Send>>,
     /// Prazo explícito em ms; None deriva do ponteiro.
     pub timeout_ms: Option<Option<u64>>,
+    /// O instante (uptime em ms) em que a sondagem extra quer rodar mesmo sem
+    /// pacote novo (a ociosidade de um worker).
+    pub poll_deadline: Option<Arc<core::sync::atomic::AtomicU64>>,
 }
 
 /// Associa a thread corrente à porta, entra na fila LIFO de consumidores e
@@ -165,9 +168,10 @@ pub fn remove_entry(entry: Arc<UserHandle>, port: Arc<Port>, timeout: u64, alert
     if let Some(thread) = thread {
         completion_objects::associate(thread, &port);
     }
+    let port_pointer = port.pointer;
     let waiter = Arc::new(Waiter { thread, waiting: None, reserve: None });
     port.with(|state| state.waiters.push(waiter.clone()));
-    let RemoveOptions { entries: extra, poll: mut extra_poll, cleanup: extra_cleanup, timeout_ms } = options;
+    let RemoveOptions { entries: extra, poll: mut extra_poll, cleanup: extra_cleanup, timeout_ms, poll_deadline } = options;
     let mut entries = alloc::vec![entry];
     entries.extend(extra);
     let (poll_port, poll_waiter, mut deliver) = (port.clone(), waiter.clone(), deliver);
@@ -207,7 +211,13 @@ pub fn remove_entry(entry: Arc<UserHandle>, port: Arc<Port>, timeout: u64, alert
             cleanup();
         }
     };
-    threads::wait_custom(Wait { entries: Some(entries), alertable: Some(alertable), poll: Some(Box::new(poll)), cleanup: Some(Box::new(cleanup)), reason: Some(crate::ntos::ke::wait::reason::WR_QUEUE), ..Wait::default() }, timeout, timeout_ms)
+    // Uma espera acordada pela fila da porta (a KQUEUE): um pacote novo, uma
+    // vaga de concorrência liberada ou um consumidor que saiu sinalizam o
+    // cabeçalho (`Port::with`), e só então a retirada é sondada.
+    let deadline = crate::ntos::ke::wait::Deadline::after(timeout_ms.unwrap_or_else(|| crate::ntos::ke::dispatcher::timeout_pointer_to_ms(timeout)).map(|ms| ms.saturating_mul(10_000)));
+    let mut registered = threads::Registered::woken(thread.unwrap_or(0), alloc::vec![port_pointer], deadline, alertable);
+    registered.poll_deadline = poll_deadline;
+    threads::wait_registered_service(Wait { entries: Some(entries), alertable: Some(alertable), poll: Some(Box::new(poll)), cleanup: Some(Box::new(cleanup)), reason: Some(crate::ntos::ke::wait::reason::WR_QUEUE), registered: Some(registered), ..Wait::default() })
 }
 
 /// NtRemoveIoCompletion(handle, key*, context*, iosb*, timeout*).

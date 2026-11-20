@@ -213,6 +213,8 @@ fn create_workers(factory: &Arc<Factory>, desired: u32) -> Result<u32, KernelErr
 fn shutdown(factory: &Arc<Factory>) {
     factory.set_shutdown(true);
     factory.set_minimum(0);
+    // Os workers parados na fila veem o encerramento (STATUS_ABANDONED).
+    crate::ntos::ke::wait::retest(factory.port.pointer);
     if let Some(listener) = factory.on_queued.lock().clone() {
         factory.port.listeners.lock().retain(|candidate| !Arc::ptr_eq(candidate, &listener));
     }
@@ -810,6 +812,8 @@ fn timeout_waiters(factory: &Factory, buffer: u64) -> u32 {
     if !factory.creating() && ready > minimum {
         count = (ready - minimum).min(waiting(factory));
         factory.add_timeout_requests(count);
+        // Os workers parados na fila conferem o pedido agora.
+        crate::ntos::ke::wait::retest(factory.port.pointer);
     }
     match guest::try_write::<u32>(buffer, count) {
         Ok(()) => 0,
@@ -925,17 +929,19 @@ fn wait_for_work(handle: u64, out: u64, count: u32, returned: u64, send: &mut Op
     // IdleTimeout sem trabalho, ou quando a classe 12 pede, a espera termina
     // com STATUS_TIMEOUT se o worker não deve ficar; senão o prazo recomeça.
     let idle_ms = ((-factory.idle_timeout()) / 10_000).max(1) as u64;
-    let mut deadline = clock::uptime_ms() + idle_ms;
-    let (watched, waiter) = (factory.clone(), thread.clone());
+    // O fim da ociosidade (uptime em ms), também o prazo do timer da espera
+    // acordada: a sondagem roda nele mesmo sem pacote.
+    let deadline = Arc::new(core::sync::atomic::AtomicU64::new(clock::uptime_ms() + idle_ms));
+    let (watched, waiter, idle) = (factory.clone(), thread.clone(), deadline.clone());
     let poll = move || -> Option<u32> {
         if watched.shutdown() {
             return Some(0x80);
         }
         let now = clock::uptime_ms();
-        if !watched.take_timeout_request() && now < deadline {
+        if !watched.take_timeout_request() && now < idle.load(core::sync::atomic::Ordering::Acquire) {
             return None;
         }
-        deadline = now + idle_ms;
+        idle.store(now + idle_ms, core::sync::atomic::Ordering::Release);
         let waiter = waiter.as_ref()?;
         if should_stay(&watched, waiter) {
             return None;
@@ -943,7 +949,7 @@ fn wait_for_work(handle: u64, out: u64, count: u32, returned: u64, send: &mut Op
         retire(&watched, waiter);
         Some(0x102)
     };
-    let options = RemoveOptions { entries: alloc::vec![entry], poll: Some(Box::new(poll)), cleanup: None, timeout_ms: Some(None) };
+    let options = RemoveOptions { entries: alloc::vec![entry], poll: Some(Box::new(poll)), cleanup: None, timeout_ms: Some(None), poll_deadline: Some(deadline) };
     let status = io_completion::remove_entry(factory.port_entry.clone(), factory.port.clone(), 0, true, validate, deliver, options);
     if let Some(thread) = thread {
         thread.mark_wait_worker_factory(factory.pointer);

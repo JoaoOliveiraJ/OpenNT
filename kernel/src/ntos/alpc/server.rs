@@ -1357,7 +1357,7 @@ fn send_new(server: &Arc<UserServer>, port: &Arc<Port>, flags: u32, input: u64, 
     let pending = Arc::new(SpinLock::new(SyncReply { server: server.clone(), key, slot, port_context, buffer, attributes: receive.receive_attributes, done: false }));
     let (polled, abandoned) = (pending.clone(), pending);
     let wait = Wait { poll: Some(Box::new(move || polled.lock().take_reply())), cleanup: Some(Box::new(move |_| abandoned.lock().abandon())), ..Wait::default() };
-    Ok(threads::wait_custom(wait, receive.timeout, None))
+    Ok(threads::wait_transport(wait, receive.timeout))
 }
 
 /// A resposta (se houver mensagem de envio; `release` é o
@@ -1402,7 +1402,7 @@ fn reply_and_receive(server: Arc<UserServer>, port: &Arc<Port>, input: u64, send
     let attributes = receive.receive_attributes;
     let waiting = server.clone();
     let wait = Wait { poll: Some(Box::new(move || receive_one(&waiting, &buffer, attributes, options))), ..Wait::default() };
-    Ok(threads::wait_custom(wait, receive.timeout, None))
+    Ok(threads::wait_transport(wait, receive.timeout))
 }
 
 /// O servidor de usuário dono de um nó AlpcPort (a porta de conexão com

@@ -4,11 +4,10 @@
 //! Toda mudança que pode satisfazer uma espera (KeSetEvent, KePulseEvent,
 //! KeReleaseSemaphore, KeReleaseMutex) testa as esperas registradas no
 //! objeto (`wait::signal`, o KiWaitTest), que aprontam as threads de kernel
-//! paradas nele. A espera de uma thread de kernel registra os blocos e deixa
-//! a CPU (`ke::wait`); a de uma thread de usuário numa syscall bloqueia
-//! (`context_switch`) e é sondada pelo despachante de usuário; a do contexto
-//! de boot drena timers, DPCs, work items e o escalonador enquanto aguarda o
-//! estado ou o prazo.
+//! paradas nele. A espera de uma thread de kernel, ou de uma thread de
+//! usuário numa syscall, registra os blocos e deixa a CPU (`ke::wait`); a do
+//! contexto de boot drena timers, DPCs, work items e o escalonador enquanto
+//! aguarda o estado ou o prazo.
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -533,13 +532,13 @@ fn expired(timeout: Option<u64>, deadline: Option<u64>) -> bool {
     timeout == Some(0) || deadline.is_some_and(|deadline| clock::uptime_100ns() >= deadline)
 }
 
-/// KeWaitForSingleObject. Uma thread de kernel registra o bloco e deixa a
-/// CPU até o sinal ou o prazo (`ke::wait`); numa syscall a thread bloqueia
-/// até o objeto ser sinalizado (ou pulsado, [`PolledObjects`]) ou o prazo
-/// vencer (`context_switch::wait_until`); no contexto de boot a espera gira
-/// o `pump_kernel`.
+/// KeWaitForSingleObject. Uma thread de kernel, ou uma thread de usuário
+/// dentro de uma syscall, registra o bloco e deixa a CPU até o sinal ou o
+/// prazo (`ke::wait`); só o contexto de boot (e um pump aninhado) espera
+/// sondando o objeto (ou o pulso, [`PolledObjects`]) e girando o
+/// `pump_kernel`.
 pub fn wait_for_single_object(object: u64, timeout_pointer: u64, wait_mode: u8, alertable: bool) -> u32 {
-    if context_switch::kernel_thread_can_block() {
+    if wait::can_wait() {
         return wait::wait_for_objects(&[object], false, wait::Deadline::after(timeout_to_100ns(timeout_pointer)), wait_mode, alertable, wait::reason::EXECUTIVE);
     }
     let (timeout, deadline) = deadline(timeout_pointer);
@@ -595,7 +594,7 @@ pub fn wait_for_multiple_objects(count: u32, objects_pointer: u64, wait_type: u3
     }
     // SAFETY: vetor PVOID Object[Count] do chamador.
     let objects: Vec<u64> = unsafe { Field::<u64>::array_at(objects_pointer, count as usize) }.iter().map(Field::get).collect();
-    if context_switch::kernel_thread_can_block() {
+    if wait::can_wait() {
         return wait::wait_for_objects(&objects, wait_type == 0, wait::Deadline::after(timeout_to_100ns(timeout_pointer)), wait_mode, alertable, wait::reason::EXECUTIVE);
     }
     let (timeout, deadline) = deadline(timeout_pointer);
