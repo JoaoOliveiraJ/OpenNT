@@ -5331,11 +5331,16 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   tema que o uxinit do winlogon carrega sem o serviço Themes (o
   `aero.msstyles` com o `.mui` e as chaves `ThemeManager` da SOFTWARE e da
   DEFAULT, `xtask/src/theme.rs`),
-  o logon do usuário até a barra de tarefas e a área de trabalho, sem o
-  sihost (o userinit.exe com o userinitext.dll e o winlogonext.dll, o
+  o logon do usuário até a barra de tarefas e a área de trabalho (o
+  userinit.exe com o userinitext.dll e o winlogonext.dll, o
   explorer.exe de `\Windows` com o `.mui`, na raiz do volume, o
   shell32.dll, o ExplorerFrame.dll da barra e o SndVolSSO.dll do ícone de
-  volume: `USER_LOGON_PROGRAMS` e `WINDOWS_PROGRAMS`), o papel de parede
+  volume, e o sihost.exe que o UserManager cria na sessão do usuário, com
+  o Windows.Shell.ServiceHostBuilder.dll, o DesktopShellExt.dll, os
+  componentes que ele cria em processo, os imports estáticos deles e as
+  cargas atrasadas de primeiro nível, porque um componente que falha
+  derruba o sihost: `USER_LOGON_PROGRAMS` e `WINDOWS_PROGRAMS`; o shell
+  imersivo do twinui fica fora), o papel de parede
   padrão do perfil Default (as imagens img0 de
   `\Windows\Web\Wallpaper\Windows` e de `\Windows\Web\4K\Wallpaper\Windows`,
   `WALLPAPER_FOLDERS`), as

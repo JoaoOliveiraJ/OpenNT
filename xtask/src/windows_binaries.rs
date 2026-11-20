@@ -837,10 +837,8 @@ const LOGON_SCREEN_PROGRAMS: &[&str] = &[
     "wkscli.dll",
 ];
 
-/// O logon do usuário até a barra de tarefas e a área de trabalho, sem o
-/// sihost (a barra e a janela da área de trabalho do explorer não dependem
-/// dele; o winlogon só espera o WNF_UMGR_SIHOST_READY por 30 s antes do
-/// userinit). O userinit.exe, que o ShellStartup do winlogon cria na
+/// O logon do usuário até a barra de tarefas e a área de trabalho. O
+/// userinit.exe, que o ShellStartup do winlogon cria na
 /// Winsta0\Default pelo `Userinit` do Winlogon, com o userinitext.dll
 /// (ext-ms-win-session-userinit, carga atrasada do userinit) e o
 /// winlogonext.dll (ext-ms-win-session-winlogon, carga atrasada do
@@ -854,13 +852,39 @@ const LOGON_SCREEN_PROGRAMS: &[&str] = &[
 /// dui70.dll, o duser.dll e o oleacc.dll, cargas atrasadas do explorer, do
 /// shell32 e do ExplorerFrame (o winmm.dll, a outra, vem com o console); e o
 /// SndVolSSO.dll do ícone de volume, que o CTray::_OnCreate chama sempre
-/// (carga atrasada do explorer), com o MMDevAPI.dll que ele importa. O shell
-/// imersivo (twinui.dll, twinui.pcshell.dll e
-/// windows.immersiveshell.serviceprovider.dll, que o _StartImmersiveShell da
-/// bandeja inicia antes do ShellDesktopSwitchEvent e que pede o
-/// ShellServiceHost do sihost), o AppResolver.dll (a espera INFINITE do
-/// AppResolverReadyEvent antes do CreateDesktopAndTray) e o stobject.dll
-/// ficam para a etapa do sihost.
+/// (carga atrasada do explorer), com o MMDevAPI.dll que ele importa.
+///
+/// E o Shell Infrastructure Host: o sihost.exe, que o UserManager
+/// (`user_services`) cria na sessão do usuário pelo
+/// UMgrLaunchShellInfrastructureHost do NotifyLogon do winlogon, o
+/// Windows.Shell.ServiceHostBuilder.dll que monta os componentes, o
+/// DesktopShellExt.dll das extensões do desktop e os componentes de serviço
+/// que o sihost cria em processo pelo CLSID: o servidor da área de
+/// transferência (ClipboardServer.dll), o gerenciador de ativação
+/// (ActivationManager.dll), o tempo de vida e o primeiro plano dos
+/// aplicativos (modernexecserver.dll, que sinaliza o
+/// BINotifiedNewSessionEvent pelo qual as tarefas de primeiro logon do
+/// explorer esperam até 60 s), o gerenciamento de janelas
+/// (WindowManagement.dll), a plataforma de notificações
+/// (notificationplatformcomponent.dll), os serviços de aplicativo e o
+/// compartilhamento (AppContracts.dll, ShareHost.dll e twinui.appcore.dll,
+/// com o cliente CDP, cdp.dll, dos dois primeiros e o NPSM.dll do
+/// registrador NPSM do twinui.appcore), a mudança de estado de
+/// pacote (PackageStateChangeHandler.dll), o gerenciador da UI Automation
+/// (UiaManager.dll), o componente de áudio (AudioSes.dll), o tempo de vida
+/// dos aplicativos de desktop empacotados e da busca (daxexec.dll e
+/// mssrch.dll) e o registrador COM do shell (CoreShellExtFramework.dll); os
+/// imports estáticos deles que faltavam (AppXDeploymentClient.dll,
+/// fltLib.dll, container.dll, tquery.dll e esent.dll); e as cargas
+/// atrasadas de primeiro nível deles com o fecho estático de cada uma: o
+/// sihost trata como falha crítica (fail fast) qualquer HRESULT de erro de
+/// um componente ao subir, e um sihost reiniciado encerra o explorer, então
+/// o stub do KernelBase não serve. Ficam fora o activeds.dll (o ADSI, só de
+/// conta de domínio) e o cmclient.dll (os contêineres; uma instalação de
+/// desktop não tem). O shell imersivo (twinui.dll, twinui.pcshell.dll e
+/// windows.immersiveshell.serviceprovider.dll), que roda os componentes
+/// dele no explorer com o mesmo tratamento de falha crítica e sem
+/// reinício, o AppResolver.dll e o stobject.dll também ficam fora.
 const USER_LOGON_PROGRAMS: &[&str] = &[
     // O userinit.
     "userinit.exe",
@@ -890,6 +914,75 @@ const USER_LOGON_PROGRAMS: &[&str] = &[
     "stobject.dll",
     "wmiclnt.dll",
     "batmeter.dll",
+    // O sihost e os componentes dele.
+    "sihost.exe",
+    "Windows.Shell.ServiceHostBuilder.dll",
+    "DesktopShellExt.dll",
+    "ClipboardServer.dll",
+    "ActivationManager.dll",
+    "modernexecserver.dll",
+    "WindowManagement.dll",
+    "notificationplatformcomponent.dll",
+    "AppContracts.dll",
+    "ShareHost.dll",
+    "PackageStateChangeHandler.dll",
+    "twinui.appcore.dll",
+    "UiaManager.dll",
+    "AudioSes.dll",
+    "daxexec.dll",
+    "mssrch.dll",
+    "CoreShellExtFramework.dll",
+    "cdp.dll",
+    "NPSM.dll",
+    // Os imports estáticos dos componentes.
+    "AppXDeploymentClient.dll",
+    "fltLib.dll",
+    "container.dll",
+    "tquery.dll",
+    "esent.dll",
+    // As cargas atrasadas dos componentes, com o fecho estático de cada uma:
+    // a resolução de nomes de domínio (ntdsapi) e a proteção de pastas
+    // (efswrt, edputil, feclient) do usermgr.dll e do ClipboardServer; o
+    // corretor sob demanda (OnDemandBrokerClient) do AppContracts; os
+    // contatos do ShareHost (ContactActivation e o UserDataTypeHelperUtil);
+    // os pacotes de componentes do AudioSes (CompPkgSup); o despejo, as
+    // cópias de sombra e o agente de eventos de sistema do mssrch (dbgcore,
+    // vssapi e o vsstrace, SystemEventsBrokerClient); a WLAN, o streaming de
+    // jogos, os gatilhos de serviço, o Bluetooth e o SQLite do cdp (wlanapi,
+    // gamestreamingext, sbservicetrigger, BluetoothApis, winsqlite3); o
+    // telefone do NPSM (PhoneOm e o Phoneutil); o repositório de pacotes, o
+    // Storage Sense, o log de eventos e a aplicabilidade do
+    // AppXDeploymentClient (AppxAllUserStore, StorageUsage, wevtapi,
+    // AppxApplicabilityEngine); o armazenamento e o bind filter do
+    // container (wc_storage, bindfltapi); e os símbolos e a pasta de busca
+    // do tquery (dbghelp, Windows.Storage.Search).
+    "ntdsapi.dll",
+    "efswrt.dll",
+    "edputil.dll",
+    "feclient.dll",
+    "OnDemandBrokerClient.dll",
+    "ContactActivation.dll",
+    "UserDataTypeHelperUtil.dll",
+    "CompPkgSup.dll",
+    "dbgcore.dll",
+    "vssapi.dll",
+    "vsstrace.dll",
+    "SystemEventsBrokerClient.dll",
+    "wlanapi.dll",
+    "gamestreamingext.dll",
+    "sbservicetrigger.dll",
+    "BluetoothApis.dll",
+    "winsqlite3.dll",
+    "PhoneOm.dll",
+    "Phoneutil.dll",
+    "AppxAllUserStore.dll",
+    "StorageUsage.dll",
+    "wevtapi.dll",
+    "AppxApplicabilityEngine.dll",
+    "wc_storage.dll",
+    "bindfltapi.dll",
+    "dbghelp.dll",
+    "Windows.Storage.Search.dll",
 ];
 
 /// Os programas do logon do usuário que ficam em `\Windows`, não em

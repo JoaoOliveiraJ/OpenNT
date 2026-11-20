@@ -90,9 +90,8 @@ const LOGON_UI_LOCAL_KEYS: &[&str] = &["SessionData", "Creative", "LogonSoundPla
 /// Windows.System.UserPicker...), serviços com a identidade SYSTEM; e o
 /// WindowManagement, o sihost.exe (`ExePath`) com as classes de janela do
 /// shell imersivo. O RPCSS acha o servidor pelo `Server` da classe e inicia
-/// o serviço do `ServiceName` ou o programa do `ExePath`; enquanto o
-/// serviço ou o programa não está no convidado (a etapa do sihost), a
-/// ativação falha ao iniciar o servidor, e não na busca da classe.
+/// o serviço do `ServiceName` (os de `user_services`) ou o programa do
+/// `ExePath` (o sihost.exe de `windows_binaries`).
 #[cfg(windows)]
 const WINRT_SERVERS: &[&str] = &["DispBrokerDesktopSvc", "StateRepository", "UserManager", "WindowManagement"];
 
@@ -108,8 +107,8 @@ const WINRT_SERVERS: &[&str] = &["DispBrokerDesktopSvc", "StateRepository", "Use
 /// as fábricas do explorer (`LocalServer32`
 /// `%SystemRoot%\explorer.exe /factory,{...}`): o CLSID_DesktopExplorerHost,
 /// o CLSID_ControlPanelProcessExplorerHost e o
-/// CLSID_SeparateMultipleProcessExplorerHost. Do sihost.exe (a etapa do
-/// UserManager): o ShellServiceHost, que o twinui e o
+/// CLSID_SeparateMultipleProcessExplorerHost. Do sihost.exe, que o
+/// UserManager cria: o ShellServiceHost, que o twinui e o
 /// TerminateShellApplications do explorer pedem, o
 /// ShellServiceHostBrokerProvider, o CLSID_CoreShellServiceProvider e o
 /// UiaManager.
