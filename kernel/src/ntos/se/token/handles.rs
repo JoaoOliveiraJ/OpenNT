@@ -91,7 +91,8 @@ fn register_owner() {
     }
 }
 
-/// Resolve -2 (thread corrente) ou um handle de thread real do System.
+/// Resolve -2 (thread corrente), um handle de thread da tabela de usuário
+/// do processo corrente ou um handle de thread real do System.
 fn resolve_thread(handle: u64, from_user_mode: bool) -> Result<u64, u32> {
     if handle as i64 == -2 {
         let pointer = process::get_current_thread();
@@ -100,9 +101,9 @@ fn resolve_thread(handle: u64, from_user_mode: bool) -> Result<u64, u32> {
     if handle > 0x7FFF_FFFF {
         return Err(0xC000_0008);
     }
-    // A tabela de usuário (fase 7) atende o modo usuário e processos comuns.
+    // A tabela de usuário atende o modo usuário e os processos comuns.
     if from_user_mode || process::get_current_process() != process::get_system_process() {
-        return Err(0xC000_0008);
+        return resolve_user_thread(handle, from_user_mode);
     }
     let Some(node) = object_manager::get_object(handle as u32).and_then(object_manager::node) else {
         return Err(0xC000_0008);
@@ -119,6 +120,31 @@ fn resolve_thread(handle: u64, from_user_mode: bool) -> Result<u64, u32> {
     // QUERY_INFORMATION também satisfaz.
     if from_user_mode && data.access.unwrap_or(0) & 0x840 == 0 {
         return Err(0xC000_0022);
+    }
+    Ok(pointer)
+}
+
+/// Um handle de thread da tabela de usuário do processo corrente, como o
+/// ObReferenceObjectByHandle do NtOpenThreadTokenEx do 19041 com
+/// THREAD_QUERY_LIMITED_INFORMATION e PsThreadType: outro tipo de objeto dá
+/// STATUS_OBJECT_TYPE_MISMATCH; em UserMode, um handle sem
+/// THREAD_QUERY_LIMITED_INFORMATION nem THREAD_QUERY_INFORMATION dá
+/// STATUS_ACCESS_DENIED. É o caminho do CsrThread->ThreadHandle que o csrss
+/// passa (sxssrv BaseSrvSxsCreateActivationContextFromStructEx 0x35c1,
+/// basesrv BaseSrvGetUserToken 0xae5c), que antes dava
+/// STATUS_INVALID_HANDLE em toda criação de processo.
+fn resolve_user_thread(handle: u64, from_user_mode: bool) -> Result<u64, u32> {
+    use crate::ntos::ps::user::{state as user_state, threads as user_threads};
+    let Some(entry) = user_state::get_user_handle(handle) else { return Err(0xC000_0008) };
+    if entry.kind() != "thread" {
+        return Err(0xC000_0024);
+    }
+    if from_user_mode && entry.access() & 0x840 == 0 {
+        return Err(0xC000_0022);
+    }
+    let pointer = user_threads::resolve(handle, 0)?.pointer();
+    if !process::is_thread(pointer) {
+        return Err(0xC000_0008);
     }
     Ok(pointer)
 }

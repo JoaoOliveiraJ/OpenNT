@@ -3576,6 +3576,12 @@ fn user_tokens(assert: Assert) {
     let statistics = state::with_syscall_record(state::SyscallRecord::raw(raw), || call("NtQueryInformationToken", token, 10, buffer, 56));
     assert(statistics == 0 && guest::read32(returned) == 56, "usertokens: TokenStatistics pela variante de syscall");
     assert(call("NtOpenThreadToken", (-2i64) as u64, 8, 0, out) == 0xC000_007C, "usertokens: thread sem impersonacao nao tem token");
+    // O NtOpenThreadToken resolve um handle real pela tabela de usuário,
+    // como o ObReferenceObjectByHandle com PsThreadType (o
+    // CsrThread->ThreadHandle que o csrss passa): um handle de token dá
+    // STATUS_OBJECT_TYPE_MISMATCH (antes, todo handle real dava
+    // STATUS_INVALID_HANDLE) e um valor livre, STATUS_INVALID_HANDLE.
+    assert(call("NtOpenThreadToken", token, 8, 0, out) == 0xC000_0024 && call("NtOpenThreadToken", 0x7FF0, 8, 0, out) == 0xC000_0008, "usertokens: NtOpenThreadToken pela tabela de usuario (tipo e handle livre)");
     guest::write32(rsp + 0x28, 0);
     guest::write64(rsp + 0x30, returned);
     assert(call("NtQuerySecurityAttributesToken", token, 0, 0, buffer) == 0xC000_000D && call("NtQuerySecurityAttributesToken", 0x7FF0, 0, 0, buffer) == 0xC000_000D, "usertokens: atributos de seguranca exigem saida");
