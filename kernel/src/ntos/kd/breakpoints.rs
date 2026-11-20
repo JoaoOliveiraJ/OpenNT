@@ -43,7 +43,8 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use super::memory;
 use crate::hal::cpu;
 use crate::ntos::ke::pcr;
-use crate::ntos::mm::memory_map::{direct_map, PHYSICAL_MEMORY_LIMIT};
+use crate::hal::physical::direct_map_limit;
+use crate::ntos::mm::memory_map::direct_map;
 
 const SOFTWARE_SLOTS: usize = 64;
 /// Processos donos de um mesmo byte físico de usuário.
@@ -66,7 +67,7 @@ fn root_key(cr3: u64) -> u64 {
 }
 
 fn read_physical(physical: u64) -> Option<u8> {
-    if physical >= PHYSICAL_MEMORY_LIMIT {
+    if physical >= direct_map_limit() {
         return None;
     }
     // SAFETY: o mapa direto cobre toda a faixa física abaixo do limite.

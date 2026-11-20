@@ -428,8 +428,7 @@ fn routine(name: &str, call: &Call) -> Result<u64, KernelError> {
         }
         // Toda a faixa física está no mapa direto (como o MmMapIoSpace).
         "HalpMapPhysicalMemoryWriteThrough64" | "HalpMapEarlyPages" => {
-            let end = call.arg(1).checked_add(call.arg(2) as u32 as u64 * 0x1000);
-            if end.is_some_and(|end| end <= crate::ntos::mm::memory_map::PHYSICAL_MEMORY_LIMIT) { physical::to_virtual(call.arg(1)) } else { 0 }
+            if physical::in_direct_map(call.arg(1), call.arg(2) as u32 as u64 * 0x1000) { physical::to_virtual(call.arg(1)) } else { 0 }
         }
         "HalpUnmapVirtualAddress" => {
             if call.arg(3) & 0xFF != 0 {

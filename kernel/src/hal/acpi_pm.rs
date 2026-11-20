@@ -218,7 +218,7 @@ pub fn facs_mapping() -> u64 {
         return 0;
     }
     let physical_address = u32::from_le_bytes(fadt.bytes[0x24..0x28].try_into().unwrap()) as u64;
-    if physical_address == 0 || physical_address + 0x40 > crate::ntos::mm::memory_map::PHYSICAL_MEMORY_LIMIT || physical::read32(physical_address) != u32::from_le_bytes(*b"FACS") {
+    if physical_address == 0 || physical_address + 0x40 > crate::hal::physical::direct_map_limit() || physical::read32(physical_address) != u32::from_le_bytes(*b"FACS") {
         return 0;
     }
     let mapping = physical::to_virtual(physical_address);

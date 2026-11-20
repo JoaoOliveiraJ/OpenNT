@@ -1,7 +1,10 @@
 //! Descritores físicos no layout MMPFN de 48 bytes do NT.
 //!
 //! O bitmap do PFN decide a propriedade; estes bytes acompanham suas
-//! transições e as referências das tabelas que a CPU realmente usa.
+//! transições e as referências das tabelas que a CPU realmente usa. O
+//! descritor do frame N fica em `virtual_base + 48 * N`, na janela do banco
+//! (`native_pfn_database`), que só tem páginas para os frames do bloco de
+//! memória física: um frame fora dele não tem descritor.
 //! Campos usados: u1.Flink, PteAddress, u2 (Blink/ShareCount),
 //! u3.ReferenceCount, u3.e1 (PageLocation, CacheAttribute) e u4
 //! (PteFrame, PfnExists).
@@ -11,7 +14,6 @@ use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
 use super::{memory_map as map, pfn::AllocationSnapshot};
-use crate::hal::physical;
 use crate::ntos::inc::field::{Field, NtStruct};
 use crate::ntos::inc::types::{Mmpfn, Mmpfnentry1, MmpfnU4};
 use crate::rtl::{KernelError, SpinLock};
@@ -67,9 +69,11 @@ impl References {
 }
 
 struct Descriptors {
-    physical_base: u64,
     virtual_base: u64,
     frame_count: u64,
+    /// As faixas de frames do bloco [primeiro, fim): só elas têm as páginas
+    /// dos descritores mapeadas na janela.
+    frame_ranges: Vec<(u64, u64)>,
     first_free_frame: u64,
     last_free_frame: u64,
     free_frame_count: u64,
@@ -79,9 +83,9 @@ struct Descriptors {
 }
 
 static STATE: SpinLock<Descriptors> = SpinLock::new(Descriptors {
-    physical_base: 0,
     virtual_base: 0,
     frame_count: 0,
+    frame_ranges: Vec::new(),
     first_free_frame: LIST_END,
     last_free_frame: LIST_END,
     free_frame_count: 0,
@@ -95,11 +99,11 @@ fn write_exact(field: &Field<u64>, replacement: u64) {
     field.atomic().store(replacement, Ordering::SeqCst);
 }
 
-/// Descritor pelo endereço físico (`physical_base + 48 * frame`).
+/// Descritor pela VA da janela (`virtual_base + 48 * frame`).
 fn pfn(address: u64) -> &'static Mmpfn {
-    // SAFETY: descritor do banco de PFNs, alcançado pela VA do mapa direto,
-    // sob o lock STATE.
-    unsafe { Mmpfn::at(physical::range_to_virtual(address, DESCRIPTOR_SIZE)) }
+    // SAFETY: descritor de um frame do bloco, numa página mapeada da janela
+    // do banco de PFNs.
+    unsafe { Mmpfn::at(address) }
 }
 
 fn page_location(address: u64) -> u8 {
@@ -113,10 +117,10 @@ fn entry_byte(location: u8, cache: u8) -> u8 {
 
 impl Descriptors {
     fn descriptor_address(&self, frame_number: u64) -> u64 {
-        if self.physical_base == 0 || frame_number >= self.frame_count {
+        if self.virtual_base == 0 || frame_number >= self.frame_count || !self.frame_ranges.iter().any(|&(first, end)| frame_number >= first && frame_number < end) {
             return 0;
         }
-        self.physical_base + frame_number * DESCRIPTOR_SIZE
+        self.virtual_base + frame_number * DESCRIPTOR_SIZE
     }
 
     fn existing_address(&self, frame_number: u64) -> u64 {
@@ -206,9 +210,9 @@ impl Descriptors {
     }
 }
 
-/// Configuração montada por `native_pfn_database`.
+/// Configuração montada por `native_pfn_database`: a janela já tem as
+/// páginas (zeradas) dos descritores dos frames do bloco.
 pub struct Configuration {
-    pub physical_base: u64,
     pub virtual_base: u64,
     pub frame_count: u64,
     pub physical_ranges: Vec<(u64, u64)>,
@@ -220,13 +224,13 @@ pub struct Configuration {
 /// lista livre.
 pub fn initialize(configuration: Configuration) -> Result<(), KernelError> {
     let mut state = STATE.lock();
-    if state.physical_base != 0 {
+    if state.virtual_base != 0 {
         return Err(KernelError::new("native frame descriptors already initialized"));
     }
-    if configuration.physical_base == 0
-        || configuration.physical_base % map::PAGE_SIZE != 0
+    if configuration.virtual_base == 0
+        || configuration.virtual_base % map::PAGE_SIZE != 0
         || configuration.frame_count == 0
-        || configuration.frame_count > map::PHYSICAL_MEMORY_LIMIT / map::PAGE_SIZE
+        || configuration.frame_count > map::PHYSICAL_ADDRESS_LIMIT / map::PAGE_SIZE
         || configuration.free_count > configuration.frame_count
     {
         return Err(KernelError::new("invalid native frame descriptor configuration"));
@@ -240,21 +244,14 @@ pub fn initialize(configuration: Configuration) -> Result<(), KernelError> {
     if ranges.iter().any(|range| !inside(range.base / map::PAGE_SIZE, range.frames as u64)) {
         return Err(KernelError::new("free PFN outside admitted memory"));
     }
-    physical::zero(configuration.physical_base, (configuration.frame_count * DESCRIPTOR_SIZE) as usize);
-    // A lista livre é encadeada andando os frames em ordem: o livre anterior
-    // recebe o Flink quando o próximo aparece.
+    // A lista livre é encadeada andando os frames do bloco em ordem: o
+    // livre anterior recebe o Flink quando o próximo aparece.
     let mut first_free = LIST_END;
     let mut previous_free = LIST_END;
     let mut free_count = 0u64;
-    let mut admitted_index = 0usize;
     let mut range_index = 0usize;
-    for frame_number in 0..configuration.frame_count {
-        while admitted_index < admitted.len() && frame_number >= admitted[admitted_index].1 {
-            admitted_index += 1;
-        }
-        if admitted_index == admitted.len() || frame_number < admitted[admitted_index].0 {
-            continue;
-        }
+    let descriptor = |frame_number: u64| pfn(configuration.virtual_base + frame_number * DESCRIPTOR_SIZE);
+    for frame_number in admitted.iter().flat_map(|&(first, end)| first..end.min(configuration.frame_count)) {
         while range_index < ranges.len() && frame_number >= ranges[range_index].base / map::PAGE_SIZE + ranges[range_index].frames as u64 {
             range_index += 1;
         }
@@ -262,7 +259,7 @@ pub fn initialize(configuration: Configuration) -> Result<(), KernelError> {
             let first = range.base / map::PAGE_SIZE;
             frame_number >= first && !range.used((frame_number - first) as usize)
         });
-        let entry = pfn(configuration.physical_base + frame_number * DESCRIPTOR_SIZE);
+        let entry = descriptor(frame_number);
         entry.u4.entire_field.set(FRAME_EXISTS);
         entry.u3.reference_count.set(if available { 0 } else { 1 });
         entry.u3.e1.bitfield_0.set(entry_byte(if available { FREE_PAGE } else { ACTIVE_PAGE }, CACHED_MEMORY));
@@ -272,7 +269,7 @@ pub fn initialize(configuration: Configuration) -> Result<(), KernelError> {
             if previous_free == LIST_END {
                 first_free = frame_number;
             } else {
-                pfn(configuration.physical_base + previous_free * DESCRIPTOR_SIZE).u1.next.set(frame_number);
+                descriptor(previous_free).u1.next.set(frame_number);
             }
             previous_free = frame_number;
             free_count += 1;
@@ -281,9 +278,9 @@ pub fn initialize(configuration: Configuration) -> Result<(), KernelError> {
     if free_count != configuration.free_count {
         return Err(KernelError::new("PFN snapshot accounting mismatch"));
     }
-    state.physical_base = configuration.physical_base;
     state.virtual_base = configuration.virtual_base;
     state.frame_count = configuration.frame_count;
+    state.frame_ranges = admitted;
     state.first_free_frame = first_free;
     state.last_free_frame = previous_free;
     state.free_frame_count = free_count;
@@ -293,9 +290,9 @@ pub fn initialize(configuration: Configuration) -> Result<(), KernelError> {
 /// Só no rollback do bootstrap, depois de desligar os observadores.
 pub fn reset() {
     let mut state = STATE.lock();
-    state.physical_base = 0;
     state.virtual_base = 0;
     state.frame_count = 0;
+    state.frame_ranges.clear();
     state.first_free_frame = LIST_END;
     state.last_free_frame = LIST_END;
     state.free_frame_count = 0;
@@ -310,7 +307,7 @@ pub fn allocated(physical_address: u64) {
     assert!(address != 0 && page_location(address) == FREE_PAGE, "allocated PFN was not on native free list");
     state.remove_free_frame(address);
     // u1..u3 zerados (os 40 bytes antes de u4).
-    physical::zero(address, core::mem::offset_of!(Mmpfn, u4));
+    crate::hal::volatile::zero(address, core::mem::offset_of!(Mmpfn, u4));
     let entry = pfn(address);
     write_exact(&entry.u4.entire_field, FRAME_EXISTS);
     entry.u3.reference_count.set(1);
@@ -331,6 +328,13 @@ pub fn mapping_of(physical_address: u64) -> Option<(u64, u64, u64)> {
     Some((entry.u2.entire_field.get(), entry.pte_address.get(), entry.u4.entire_field.get() & FRAME_NUMBER_MASK))
 }
 
+/// O MMPFN de `frame_number`, se o frame é do bloco de memória física e o
+/// banco está montado.
+pub fn descriptor(frame_number: u64) -> Option<&'static Mmpfn> {
+    let address = STATE.lock().descriptor_address(frame_number);
+    (address != 0).then(|| pfn(address))
+}
+
 pub fn can_release(physical_address: u64) -> bool {
     STATE.lock().can_release(physical_address)
 }
@@ -340,7 +344,7 @@ pub fn released(physical_address: u64) {
     let frame_number = physical_address / 4096;
     assert!(state.can_release(physical_address), "native PFN still referenced at release");
     let address = state.existing_address(frame_number);
-    physical::zero(address, core::mem::offset_of!(Mmpfn, u4));
+    crate::hal::volatile::zero(address, core::mem::offset_of!(Mmpfn, u4));
     let entry = pfn(address);
     write_exact(&entry.u4.entire_field, FRAME_EXISTS);
     entry.u3.e1.bitfield_0.set(entry_byte(FREE_PAGE, CACHED_MEMORY));
@@ -471,7 +475,6 @@ pub fn walk_free_list() -> FreeListWalk {
 
 #[derive(Clone, Copy, Debug)]
 pub struct Information {
-    pub physical_base: u64,
     pub virtual_base: u64,
     pub frame_count: u64,
     pub descriptor_size: u64,
@@ -482,8 +485,7 @@ pub struct Information {
 
 pub fn information() -> Option<Information> {
     let state = STATE.lock();
-    (state.physical_base != 0).then(|| Information {
-        physical_base: state.physical_base,
+    (state.virtual_base != 0).then(|| Information {
         virtual_base: state.virtual_base,
         frame_count: state.frame_count,
         descriptor_size: DESCRIPTOR_SIZE,

@@ -29,10 +29,7 @@ static IO_PAGE_REFERENCES: SpinLock<BTreeMap<u64, u32>> = SpinLock::new(BTreeMap
 
 /// VA de sistema da faixa física, ou 0 (NULL) fora do mapa direto.
 fn system_address(physical_address: u64, size: u64) -> u64 {
-    match physical_address.checked_add(size.max(1)) {
-        Some(end) if end <= crate::ntos::mm::memory_map::PHYSICAL_MEMORY_LIMIT => physical::to_virtual(physical_address),
-        _ => 0,
-    }
+    if physical::in_direct_map(physical_address, size.max(1)) { physical::to_virtual(physical_address) } else { 0 }
 }
 
 /// PFNs de [PA, PA + tamanho), como o MmIsIoSpaceActive os calcula.

@@ -23,6 +23,7 @@ pub mod mdl;
 pub mod memory;
 pub mod memory_map;
 pub mod module_queries;
+pub mod direct_map;
 pub mod native_frame_descriptors;
 pub mod native_pfn_database;
 pub mod page_residency;

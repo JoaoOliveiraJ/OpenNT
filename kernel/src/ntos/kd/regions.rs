@@ -188,7 +188,7 @@ pub fn kernel_map(out: &mut Payload) {
         ("alocacao virtual do kernel", map::KERNEL_VIRTUAL_ALLOC_BASE, map::KERNEL_VIRTUAL_ALLOC_TOP),
         ("pool global de sessao", map::SESSION_GLOBAL_BASE, map::SESSION_GLOBAL_TOP),
         ("pilhas de kernel", map::KERNEL_STACK_BASE, map::KERNEL_STACK_TOP),
-        ("mapa direto da memoria fisica", map::DIRECT_MAP_BASE, map::DIRECT_MAP_BASE + map::PHYSICAL_MEMORY_LIMIT),
+        ("mapa direto da memoria fisica", map::DIRECT_MAP_BASE, map::DIRECT_MAP_BASE + crate::hal::physical::direct_map_limit()),
         ("KPCR dos processadores", map::PCR_VIRTUAL_BASE, map::KERNEL_DATA_POOL_BASE),
         ("pool de dados do kernel", map::KERNEL_DATA_POOL_BASE, map::KERNEL_DATA_POOL_TOP),
         ("imagem do kernel (ntoskrnl)", map::KERNEL_VIRTUAL_BASE, map::KERNEL_VIRTUAL_BASE + map::KERNEL_IMAGE_MAX),

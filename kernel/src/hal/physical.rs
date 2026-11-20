@@ -8,17 +8,38 @@
 //! (`hal::volatile`): as células são compartilhadas com os trampolins de IRQ,
 //! com os APs e com o hardware.
 
-use core::sync::atomic::{AtomicU32, AtomicU64};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use super::volatile;
 use crate::ntos::mm::memory_map as map;
+
+/// Fim exclusivo da parte mapeada do mapa direto: os 4 GB do stage2 até o
+/// `mm/direct_map` estendê-lo ao topo da RAM, no boot.
+static DIRECT_MAP_LIMIT: AtomicU64 = AtomicU64::new(map::BOOT_DIRECT_MAP_LIMIT);
+
+/// O fim (exclusivo) da faixa física que o mapa direto alcança.
+#[inline]
+pub fn direct_map_limit() -> u64 {
+    DIRECT_MAP_LIMIT.load(Ordering::Relaxed)
+}
+
+/// A faixa física [physical_address, + length) está no mapa direto.
+pub fn in_direct_map(physical_address: u64, length: u64) -> bool {
+    physical_address.checked_add(length).is_some_and(|end| end <= direct_map_limit())
+}
+
+/// O mapa direto passa a ir até `top` (só cresce; `mm/direct_map`, com as
+/// entradas já gravadas).
+pub fn extend_direct_map(top: u64) {
+    DIRECT_MAP_LIMIT.fetch_max(top.min(map::PHYSICAL_ADDRESS_LIMIT), Ordering::Release);
+}
 
 /// VA do mapa direto que alcança `physical_address`. Endereços acima do
 /// limite físico (VAs, sobretudo) não têm tradução e param o sistema.
 #[inline]
 #[track_caller]
 pub fn to_virtual(physical_address: u64) -> u64 {
-    assert!(physical_address < map::PHYSICAL_MEMORY_LIMIT, "endereco fisico fora do mapa direto: {physical_address:#x}");
+    assert!(physical_address < direct_map_limit(), "endereco fisico fora do mapa direto: {physical_address:#x}");
     map::direct_map(physical_address)
 }
 
@@ -26,8 +47,7 @@ pub fn to_virtual(physical_address: u64) -> u64 {
 #[inline]
 #[track_caller]
 pub fn range_to_virtual(physical_address: u64, length: u64) -> u64 {
-    let end = physical_address.checked_add(length);
-    assert!(end.is_some_and(|end| end <= map::PHYSICAL_MEMORY_LIMIT), "faixa fisica fora do mapa direto: {physical_address:#x}+{length:#x}");
+    assert!(in_direct_map(physical_address, length), "faixa fisica fora do mapa direto: {physical_address:#x}+{length:#x}");
     map::direct_map(physical_address)
 }
 

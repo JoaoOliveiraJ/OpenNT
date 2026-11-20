@@ -75,7 +75,7 @@ fn load_options() {
 /// topo da RAM; a lista livre do banco nativo encadeia exatamente os frames
 /// livres do bitmap.
 fn physical_memory_block(assert: fn(bool, &str)) {
-    use crate::ntos::mm::physical_layout;
+    use crate::ntos::mm::{native_frame_descriptors, physical_layout};
     let block = physical_layout::ranges();
     let page = memory_map::PAGE_SIZE;
     let block_pages: u64 = block.iter().map(|&(base, top)| (top - base) / page).sum();
@@ -91,7 +91,7 @@ fn physical_memory_block(assert: fn(bool, &str)) {
     let firmware = physical_layout::firmware_map();
     let whole_ram = firmware.iter().filter(|range| range.range_type == 1).all(|ram| {
         let base = ram.base.max(page).div_ceil(page) * page;
-        let top = (ram.base + ram.length).min(memory_map::PHYSICAL_MEMORY_LIMIT) / page * page;
+        let top = (ram.base + ram.length).min(memory_map::PHYSICAL_ADDRESS_LIMIT) / page * page;
         let touched = firmware.iter().any(|other| other.range_type != 1 && other.base < ram.base + ram.length && other.base + other.length > ram.base);
         base >= top || touched || physical_layout::contains_ram_range(base, top - base)
     });
@@ -111,6 +111,32 @@ fn physical_memory_block(assert: fn(bool, &str)) {
     );
     let (walk, available) = pfn::native_free_list();
     assert(walk.linked && walk.reached == walk.free_count && walk.last_reached == walk.last_free && walk.free_count == available, "banco de PFN nativo: a lista livre encadeia os frames livres do bitmap");
+    // O banco só tem descritores dos frames do bloco: as pontas sim, o
+    // primeiro frame depois de uma faixa (um buraco) não.
+    let described = |frame: u64| native_frame_descriptors::descriptor(frame).is_some_and(|entry| entry.u4.pfn_exists() != 0);
+    let hole = block.first().map(|range| range.1 / page).filter(|&frame| block.len() > 1 && !physical_layout::contains_ram_range(frame * page, page));
+    assert(described(lowest) && described(highest) && hole.is_none_or(|frame| native_frame_descriptors::descriptor(frame).is_none()), "banco de PFN nativo: descritores so dos frames do bloco");
+    high_memory(assert, &block);
+}
+
+/// RAM acima de 4 GB: o mapa direto vai até o topo do bloco e um frame de
+/// lá sai do PFN, guarda dados pelo endereço físico, tem o descritor em uso
+/// e volta à lista livre.
+fn high_memory(assert: fn(bool, &str), block: &[(u64, u64)]) {
+    use crate::ntos::mm::native_frame_descriptors;
+    let top = block.last().map_or(0, |range| range.1);
+    if top <= memory_map::BOOT_DIRECT_MAP_LIMIT {
+        return;
+    }
+    assert(physical::direct_map_limit() >= top, "mapa direto ate o topo da RAM acima de 4 GB");
+    let frame = pfn::alloc_contiguous(1, 1, 0xF_FFFF_FFFF, memory_map::BOOT_DIRECT_MAP_LIMIT / memory_map::PAGE_SIZE, 0);
+    assert(frame >= memory_map::BOOT_DIRECT_MAP_LIMIT && frame < top, "PFN entrega um frame acima de 4 GB");
+    physical::write64(frame, 0x0123_4567_89AB_CDEF);
+    physical::write64(frame + 0xFF8, !frame);
+    let kept = physical::read64(frame) == 0x0123_4567_89AB_CDEF && physical::read64(frame + 0xFF8) == !frame;
+    let active = native_frame_descriptors::mapping_of(frame) == Some((0, 0, 0));
+    let freed = pfn::free_page(frame) && native_frame_descriptors::mapping_of(frame).is_none();
+    assert(kept && active && freed, "frame acima de 4 GB: dados pelo mapa direto, descritor em uso e devolvido a lista livre");
 }
 
 fn is_text(data: Option<FileData>, expected: &str) -> bool {

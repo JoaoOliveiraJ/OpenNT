@@ -17,7 +17,7 @@ use crate::drivers::fs::{memory_file_system, volume_device};
 use crate::ntos::ke::clock;
 use crate::ntos::cm::state_separation;
 use crate::ntos::ke::{critical_region, pcr, smp};
-use crate::ntos::mm::{dump_mdl, kernel_data, kernel_pool, loaded_images, memory_map, native_pfn_database, pfn, pool_lock, process_address_space, recursive_mapping, shared_user_data};
+use crate::ntos::mm::{direct_map, dump_mdl, kernel_data, kernel_pool, loaded_images, memory_map, native_pfn_database, pfn, pool_lock, process_address_space, recursive_mapping, shared_user_data};
 use crate::ntos::ob::object_manager;
 use crate::ntos::ps::scheduler;
 use crate::rtl::text::latin1_to_string;
@@ -33,6 +33,8 @@ pub fn init() {
     // memory manager: alocador de frames físicos, tabelas supervisoras reais
     // (antes dos APs) e descritores nativos ligados ao PFN e às PTEs
     pfn::init().unwrap_or_else(|error| panic!("PFN: {error}"));
+    // a RAM acima de 4 GB entra no mapa direto antes de algum frame dela sair do PFN
+    direct_map::extend().unwrap_or_else(|error| panic!("mapa direto: {error}"));
     recursive_mapping::initialize().unwrap_or_else(|error| panic!("mapeamento recursivo: {error}"));
     // PML4[256..512) presentes e permanentes: toda raiz futura copia a metade de sistema
     process_address_space::prepare_system_space().unwrap_or_else(|error| panic!("metade de sistema: {error}"));

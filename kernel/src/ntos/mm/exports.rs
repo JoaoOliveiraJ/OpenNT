@@ -81,8 +81,11 @@ fn probe_for_write(call: &Call) -> Result<u64, KernelError> {
     small::probe_user_address(call.arg(1), call.arg(2), call.arg(3) as u32);
     Ok(0)
 }
+/// MmAllocatePagesForMdl(LowAddress, HighAddress, SkipBytes, TotalBytes): o
+/// MiAllocatePagesForMdl da partição do sistema com o CacheType 3 e sem
+/// flags (ntoskrnl 19041 0x3a5db0).
 fn allocate_pages_for_mdl(call: &Call) -> Result<u64, KernelError> {
-    Ok(mdl::allocate_pages(call.arg(4)))
+    Ok(mdl::allocate_pages_ex(call.arg(1), call.arg(2), call.arg(3), call.arg(4), 3, 0, 0))
 }
 fn free_pages_from_mdl(call: &Call) -> Result<u64, KernelError> {
     mdl::free_pages(call.arg(1));

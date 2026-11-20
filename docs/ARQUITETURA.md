@@ -258,18 +258,19 @@ pertence só aos processos:
 | VA | Índice da PML4 | Conteúdo |
 | --- | --- | --- |
 | 0xFFFF8000_00000000 | 256 | tabelas de páginas (mapeamento recursivo) |
-| 0xFFFF8080_00000000 | 257 | banco de PFNs nativo (MmPfnDatabase) |
+| 0xFFFF8080_00000000 | 257 | banco de PFNs nativo (MmPfnDatabase): MMPFN[pfn] em base + 48 * pfn, só as páginas dos frames do bloco mapeadas |
 | 0xFFFFA000_00000000 | 320 | pool executivo, PTEs de sistema dos MDLs (0xFFFFA001_40000000..0xFFFFA001_80000000), dump, memória contígua e independente, visões de sistema, VirtualAlloc de kernel, VAs globais das sessões (0xFFFFA006_80000000), pilhas de kernel das threads (0xFFFFA007_00000000..0xFFFFA008_00000000) |
-| 0xFFFFB000_00000000 | 352 | **mapa direto**: toda a faixa física [0, 4 GB) em `DIRECT_MAP_BASE + PA` |
+| 0xFFFFB000_00000000 | 352 | **mapa direto**: a faixa física [0, topo da RAM) em `DIRECT_MAP_BASE + PA` (os 4 GB de baixo pelo stage2, o resto pelo `mm/direct_map` no boot) |
 | 0xFFFFC000_C0000000 | 384 | **janela do heap**: heap do kernel (kmalloc, o alocador do Rust) sobre os frames de 32 MB a 96 MB e a arena dos convidados (IRPs, DEVICE_OBJECTs, MDLs, ExAllocatePool2...) sobre os de 256 MB a 272 MB, na VA `KERNEL_HEAP_BASE + 224 MB` |
 | 0xFFFFF780_00000000 | 495 | KUSER_SHARED_DATA (visão do kernel) |
 | 0xFFFFF800_00000000 | 496 | KPCR, pool de dados, a **imagem do kernel** (0xFFFFF800_40000000), a pilha de boot (topo em 0xFFFFF800_41200000) e a janela de imagens de kernel (0xFFFFF801_00000000..0xFFFFF802_00000000) |
 | 0xFFFFF900_00000000 | 498 | **espaço de sessão**: tabela de topo própria de cada sessão (vazio na raiz do System e dos processos sem sessão); SessionCore, VA dinâmica (pool de sessão) e imagens de sessão |
 
 **Memória física.** O bloco de memória física (`mm/physical_layout.rs`, o
-MmPhysicalMemoryBlock) é toda a RAM do mapa E820 abaixo do limite do mapa
-direto, menos os descritores reservados, ACPI e NVS e menos a página 0 (o
-primeiro PFN do bloco é 1, como num 19041). Dele saem o
+MmPhysicalMemoryBlock) é toda a RAM do mapa E820, abaixo e acima de 4 GB
+(até o slot do mapa direto, 512 GB, e a largura física da CPU), menos os
+descritores reservados, ACPI e NVS e menos a página 0 (o primeiro PFN do
+bloco é 1, como num 19041). Dele saem o
 MmNumberOfPhysicalPages, o MmLowestPhysicalPage e o MmHighestPhysicalPage,
 os únicos totais que o sistema mostra: SystemBasicInformation (classes 0,
 62 e 114), as classes 182 e 184, o NumberOfPhysicalPages da
@@ -280,7 +281,15 @@ menos `memory_map::PFN_EXCLUDED`, a memória que o kernel ocupa desde o boot
 censo, o heap e os frames da arena dos convidados), como o MiInitializePfnDatabase põe na lista livre só os
 descritores livres do carregador. Esses frames ficam no banco nativo como
 páginas em uso. A lista livre do banco nativo é encadeada na ordem dos
-frames, a partir do bitmap.
+frames, a partir do bitmap. Logo depois do alocador, o `mm/direct_map`
+estende o mapa direto do stage2 até o topo da RAM (uma PD por GB acima de
+4 GB, em frames do PFN, com as mesmas páginas de 2 MB) e só então o
+`hal::physical` aceita endereços acima de 4 GB (`direct_map_limit`). O banco
+de PFN nativo (`mm/native_pfn_database.rs`) é mapeado esparso, como no
+MiMapPfnDatabase: só as páginas da janela que guardam descritores de frames
+do bloco têm frame (não contíguos), e os descritores são lidos pela VA da
+janela; um frame fora do bloco (o buraco de PCI, por exemplo) não tem
+descritor.
 
 **Imagem do kernel.** O ntoskrnl é ligado na sua VA de sistema, como no NT:
 a ImageBase do PE é `KERNEL_VIRTUAL_BASE` = 0xFFFFF800_40000000 (cabeçalhos
@@ -1725,8 +1734,9 @@ além da KUSER_SHARED_DATA:
   os exports e o mapa SSN → nome continuam globais (a base é a mesma em
   todos).
 
-O stage2 monta o mapa direto (páginas de 2 MB de supervisor, RW e NX; tabelas
-em 0x76000-0x7AFFF) antes de entrar no kernel. A regra:
+O stage2 monta o mapa direto dos 4 GB de baixo (páginas de 2 MB de
+supervisor, RW e NX; tabelas em 0x76000-0x7AFFF) antes de entrar no kernel,
+e o kernel o estende ao topo da RAM no boot (`mm/direct_map`). A regra:
 
 - **Endereço físico nunca é ponteiro.** Quem tem um PA usa `hal::physical`,
   que traduz pelo mapa direto e para o sistema se receber algo fora da faixa

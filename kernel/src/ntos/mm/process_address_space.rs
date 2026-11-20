@@ -115,7 +115,7 @@ pub fn is_root(root: u64) -> bool {
     root == SYSTEM_ROOT
         || (root != 0
             && root % map::PAGE_SIZE == 0
-            && root < map::PHYSICAL_MEMORY_LIMIT
+            && root < crate::hal::physical::direct_map_limit()
             && paging::read_entry_exact(root + map::PAGE_TABLE_RECURSIVE_INDEX * 8) == recursive_mapping::self_reference(root))
 }
 

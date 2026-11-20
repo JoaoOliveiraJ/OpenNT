@@ -9,7 +9,6 @@ use alloc::vec::Vec;
 use crate::hal::physical;
 use crate::rtl::{KernelError, SpinLock};
 
-const PHYSICAL_LIMIT: u64 = crate::ntos::mm::memory_map::PHYSICAL_MEMORY_LIMIT; // fim do mapa direto
 const MAX_TABLE_SIZE: u64 = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
@@ -31,7 +30,7 @@ struct Catalog {
 static CATALOG: SpinLock<Catalog> = SpinLock::new(Catalog { tables: None, root_pointer: 0 });
 
 fn in_range(address: u64, size: u64) -> bool {
-    address > 0 && size > 0 && address.checked_add(size).is_some_and(|end| end <= PHYSICAL_LIMIT)
+    address > 0 && size > 0 && address.checked_add(size).is_some_and(|end| end <= super::physical::direct_map_limit())
 }
 
 fn read(address: u64, size: u64) -> Result<Vec<u8>, KernelError> {
@@ -56,7 +55,7 @@ fn u32_at(bytes: &[u8], offset: usize) -> u32 {
 /// Ponteiro de 64 bits do firmware, nunca truncado para outro endereço baixo.
 fn address64(bytes: &[u8], offset: usize) -> Result<u64, KernelError> {
     let address = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
-    if address >= PHYSICAL_LIMIT {
+    if address >= super::physical::direct_map_limit() {
         return Err(KernelError::new("ACPI address above the direct map"));
     }
     Ok(address)

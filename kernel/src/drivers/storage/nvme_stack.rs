@@ -86,7 +86,7 @@ fn log_controller_state() {
     let Some(bar) = function.bars.iter().find(|bar| bar.index == 0) else { return };
     let base = (bar.value & 0xFFFF_C000) as u64 | (bar.high_value as u64) << 32;
     let command = crate::hal::pci_config::read(function.bus, function.device, function.function, 0x04, 4).unwrap_or(0);
-    if base == 0 || base >= crate::ntos::mm::memory_map::PHYSICAL_MEMORY_LIMIT {
+    if base == 0 || base >= crate::hal::physical::direct_map_limit() {
         debug_print!("[nvme] BAR0 {:#x} fora do mapa direto; comando/estado PCI {:#010x}", base, command);
         return;
     }
@@ -115,7 +115,7 @@ fn log_controller_state() {
     let entries = (register(0x24) & 0xFFF) as u64 + 1;
     let word = |physical: u64| crate::hal::volatile::read32(crate::hal::physical::to_virtual(physical));
     let (submission, completion) = (pair(0x28) & !0xFFF, pair(0x30) & !0xFFF);
-    if submission == 0 || completion == 0 || completion + entries * 16 > crate::ntos::mm::memory_map::PHYSICAL_MEMORY_LIMIT || submission + entries * 64 > crate::ntos::mm::memory_map::PHYSICAL_MEMORY_LIMIT {
+    if submission == 0 || completion == 0 || completion + entries * 16 > crate::hal::physical::direct_map_limit() || submission + entries * 64 > crate::hal::physical::direct_map_limit() {
         return;
     }
     let commands: alloc::vec::Vec<String> = (0..entries).filter_map(|index| {

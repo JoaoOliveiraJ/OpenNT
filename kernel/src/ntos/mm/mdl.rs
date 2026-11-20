@@ -397,38 +397,6 @@ pub fn unmap_reserved_mapping(descriptor: u64) {
     set_flags(descriptor, 0, MDL_MAPPED_TO_SYSTEM_VA);
 }
 
-/// MmAllocatePagesForMdl — páginas físicas reais da arena PFN descritas num
-/// MDL novo (sem mapear); 0 em falha.
-pub fn allocate_pages(byte_count: u64) -> u64 {
-    if byte_count == 0 || byte_count > 0x7FFF_FFFF {
-        return 0;
-    }
-    let page_count = byte_count.div_ceil(0x1000);
-    let mut frames = Vec::new();
-    for _ in 0..page_count {
-        let frame = pfn::alloc_page();
-        if frame == 0 {
-            for frame in frames {
-                pfn::free_page(frame);
-            }
-            return 0;
-        }
-        frames.push(frame);
-    }
-    let address = guest::alloc_bytes(Mdl::SIZE + page_count * 8);
-    let descriptor = mdl(address);
-    descriptor.next.set(0);
-    descriptor.size.set((Mdl::SIZE + page_count * 8) as i16);
-    descriptor.mdl_flags.set(0);
-    descriptor.start_va.set(0);
-    descriptor.byte_count.set(byte_count as u32);
-    descriptor.byte_offset.set(0);
-    for (entry, frame) in pfn_array(descriptor, page_count).iter().zip(&frames) {
-        entry.set(frame / 0x1000);
-    }
-    address
-}
-
 /// MmFreePagesFromMdl — devolve as páginas físicas; o MDL continua vivo
 /// (quem alocou libera).
 pub fn free_pages(descriptor: u64) {
@@ -586,7 +554,7 @@ const MM_ALLOCATE_REQUIRE_CONTIGUOUS_CHUNKS: u32 = 0x20;
 const MM_ALLOCATE_FAST_LARGE_PAGES: u32 = 0x40;
 const MM_ALLOCATE_AND_HOT_REMOVE: u32 = 0x100;
 /// Bit interno que MiValidateMdlAllocationRequest liga quando a faixa pedida
-/// começa no PFN 0 e alcança o maior PFN físico (o limite de 4 GiB do OpenNT).
+/// começa no PFN 0 e alcança o MmHighestPhysicalPage.
 const MM_ALLOCATE_WHOLE_RANGE: u32 = 0x1_0000;
 
 fn free_allocated_frames(frames: &[u64]) {
@@ -799,13 +767,7 @@ const PFN_CACHED: u8 = 1;
 
 /// O MMPFN publicado de `frame`, se existe.
 fn existing_pfn(frame: u64) -> Option<&'static crate::ntos::inc::types::Mmpfn> {
-    let database = super::native_pfn_database::information()?;
-    if frame >= database.frame_count {
-        return None;
-    }
-    // SAFETY: descritor do banco publicado, pela VA do mapa direto.
-    let entry = unsafe { crate::ntos::inc::types::Mmpfn::at(crate::hal::physical::range_to_virtual(database.physical_base + frame * database.descriptor_size, database.descriptor_size)) };
-    (entry.u4.pfn_exists() != 0).then_some(entry)
+    super::native_frame_descriptors::descriptor(frame).filter(|entry| entry.u4.pfn_exists() != 0)
 }
 
 /// MmAreMdlPagesCached(Mdl) -> BOOLEAN.

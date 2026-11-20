@@ -201,7 +201,7 @@ fn add_entry_flags(address: u64, flags: u64) {
 
 fn table_of(entry: u64) -> u64 {
     let frame = frame_of(entry, 4096);
-    assert!(frame < map::PHYSICAL_MEMORY_LIMIT, "paging-structure frame outside the direct map");
+    assert!(frame < physical::direct_map_limit(), "paging-structure frame outside the direct map");
     frame
 }
 

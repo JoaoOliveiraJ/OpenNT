@@ -2,9 +2,12 @@
 //!
 //! Como no 19041 (o MmInitializeMemoryLimits sobre a lista de descritores de
 //! memória do carregador), o bloco de memória física é toda a RAM que o
-//! firmware entrega, abaixo do limite do mapa direto do stage2: os
-//! descritores de RAM do E820 menos os reservados, ACPI e NVS, em páginas
-//! inteiras. A página física 0 fica de fora, como a página do firmware que
+//! firmware entrega, abaixo e acima de 4 GB: os descritores de RAM do E820
+//! menos os reservados, ACPI e NVS, em páginas inteiras, até o maior
+//! endereço físico que o kernel alcança (o slot do mapa direto,
+//! `memory_map::PHYSICAL_ADDRESS_LIMIT`, e a largura física da CPU). A RAM
+//! acima de 4 GB entra no mapa direto logo depois do alocador de frames
+//! (`mm/direct_map`). A página física 0 fica de fora, como a página do firmware que
 //! o carregador do Windows reserva (num 19041 o primeiro trecho do bloco
 //! começa no PFN 1). A memória que o kernel já ocupa no boot (a imagem, a
 //! pilha de boot, o heap, as tabelas abaixo de 1 MB) continua sendo RAM
@@ -46,8 +49,16 @@ pub struct FirmwareRange {
 /// O mapa E820 habilitado (bit 0 dos atributos estendidos), copiado no boot.
 static FIRMWARE_MAP: SpinLock<Vec<FirmwareRange>> = SpinLock::new(Vec::new());
 
+/// O maior endereço físico (exclusivo) que o bloco admite: o slot do mapa
+/// direto, limitado à largura física da CPU (CPUID 0x80000008, EAX[7:0]).
+fn physical_address_limit() -> u64 {
+    let width = crate::hal::cpu::cpuid(0x8000_0008)[0] & 0xFF;
+    if (32..64).contains(&width) { (1u64 << width).min(map::PHYSICAL_ADDRESS_LIMIT) } else { map::PHYSICAL_ADDRESS_LIMIT }
+}
+
 pub fn init() -> Result<(), KernelError> {
     let count = physical::read16(map::E820_COUNT_PHYS) as u64;
+    let limit = physical_address_limit();
     if count == 0 || count > map::E820_MAX_ENTRIES {
         return Err(KernelError::new("Invalid E820 table for physical memory initialization"));
     }
@@ -63,10 +74,10 @@ pub fn init() -> Result<(), KernelError> {
         let base = physical::read64(at);
         let length = physical::read64(at + 8);
         let end = base.saturating_add(length);
-        if length == 0 || base >= map::PHYSICAL_MEMORY_LIMIT {
+        if length == 0 || base >= limit {
             continue;
         }
-        let range = (base, end.min(map::PHYSICAL_MEMORY_LIMIT));
+        let range = (base, end.min(limit));
         if physical::read32(at + 16) == 1 { usable.push(range) } else { reserved.push(range) }
     }
     let mut candidates = usable;

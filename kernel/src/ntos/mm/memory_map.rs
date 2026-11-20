@@ -184,8 +184,12 @@ pub const BOOT_LOAD_OPTIONS_PHYS: u64 = 0xFC00;
 pub const E820_COUNT_PHYS: u64 = 0x4FF0;
 pub const E820_TABLE_PHYS: u64 = 0x5000;
 pub const E820_MAX_ENTRIES: u64 = 170;
-/// O stage2 mapeia 4GB no mapa direto; RAM acima não é admitida ainda.
-pub const PHYSICAL_MEMORY_LIMIT: u64 = 0x1_0000_0000;
+/// A parte do mapa direto que o stage2 monta: [0, 4 GB). O resto, até o
+/// topo da RAM, o kernel liga no boot (`mm/direct_map`).
+pub const BOOT_DIRECT_MAP_LIMIT: u64 = 0x1_0000_0000;
+/// Maior endereço físico (exclusivo) que o kernel alcança: o slot inteiro
+/// do mapa direto (512 GB). O bloco de memória física fica abaixo dele.
+pub const PHYSICAL_ADDRESS_LIMIT: u64 = 0x80_0000_0000;
 
 // ---- Imagens de sistema ------------------------------------------------------
 //
@@ -307,9 +311,13 @@ const _: () = assert!(SYSTEM_PTE_BASE > KERNEL_POOL_TOP + PAGE_SIZE && SYSTEM_PT
 /// Primeira janela da metade supervisora: as tabelas reais (mapeamento
 /// recursivo), sem alocações comuns.
 pub const PAGE_TABLE_RECURSIVE_INDEX: u64 = 256;
-/// Array nativo de descritores dos frames e célula MmPfnDatabase (slot 257).
+/// Array nativo de descritores dos frames e célula MmPfnDatabase (slot 257):
+/// um MMPFN de 48 bytes por frame até PHYSICAL_ADDRESS_LIMIT e a página da
+/// variável depois do array (`native_pfn_database`, mapeado esparso).
 pub const PFN_DATABASE_BASE: u64 = 0xFFFF_8080_0000_0000;
-pub const PFN_DATABASE_TOP: u64 = 0xFFFF_8080_0400_0000;
+pub const PFN_DESCRIPTOR_SIZE: u64 = 48;
+pub const PFN_DATABASE_TOP: u64 = PFN_DATABASE_BASE + PHYSICAL_ADDRESS_LIMIT / PAGE_SIZE * PFN_DESCRIPTOR_SIZE + PAGE_SIZE;
+const _: () = assert!((PFN_DATABASE_TOP - 1) >> 39 == PFN_DATABASE_BASE >> 39);
 pub const PML4_PHYS: u64 = 0x70000;
 /// Identidade transitória do stage2: PML4[0] -> esta PDPT -> esta PD, com uma
 /// única página de 2 MB em [0, 2 MB) (o código do stage2 enquanto liga a
@@ -329,12 +337,14 @@ pub const LAPIC_PHYS: u64 = 0xFEE0_0000;
 
 // ---- Mapa direto da memória física (metade de sistema) ---------------------
 //
-// Toda a faixa física [0, PHYSICAL_MEMORY_LIMIT) — RAM, firmware e MMIO
-// (LAPIC, framebuffer de texto, BARs) — aparece uma vez em
-// DIRECT_MAP_BASE + PA, com páginas de 2 MB de supervisor, RW e NX. O stage2
-// monta as tabelas (uma PDPT e quatro PDs, frames fixos abaixo de 1 MB, fora
-// do PFN) e liga a entrada DIRECT_MAP_PML4_INDEX da PML4 antes de entrar no
-// kernel; daí em diante todo acesso por endereço físico (`hal::physical`,
+// Toda a faixa física [0, 4 GB) — RAM, firmware e MMIO (LAPIC, framebuffer
+// de texto, BARs) — aparece uma vez em DIRECT_MAP_BASE + PA, com páginas de
+// 2 MB de supervisor, RW e NX. O stage2 monta as tabelas (uma PDPT e quatro
+// PDs, frames fixos abaixo de 1 MB, fora do PFN) e liga a entrada
+// DIRECT_MAP_PML4_INDEX da PML4 antes de entrar no kernel; logo depois do
+// alocador de frames o kernel estende o mesmo mapa de 4 GB ao topo da RAM
+// (`mm/direct_map`, PDs em frames do PFN nas entradas seguintes da PDPT), e
+// `hal::physical::direct_map_limit` diz até onde ele vai. Daí em diante todo acesso por endereço físico (`hal::physical`,
 // tabelas de páginas, descritores de PFN, cabeçalhos do heap e da arena,
 // células de baixo nível, dados do trampolim dos APs, tabelas ACPI) passa
 // por aqui. O slot inteiro da PML4 (512 GB) é reservado; nenhuma outra
@@ -342,9 +352,9 @@ pub const LAPIC_PHYS: u64 = 0xFEE0_0000;
 // referências deste mapa, como não contava as da identidade baixa.
 pub const DIRECT_MAP_BASE: u64 = 0xFFFF_B000_0000_0000;
 pub const DIRECT_MAP_PML4_INDEX: u64 = 352;
-/// Fim exclusivo da parte mapeada (o slot reservado vai até +512 GB).
-pub const DIRECT_MAP_TOP: u64 = DIRECT_MAP_BASE + PHYSICAL_MEMORY_LIMIT;
-pub const DIRECT_MAP_SLOT_TOP: u64 = DIRECT_MAP_BASE + 0x80_0000_0000;
+/// Fim do slot reservado (+512 GB); a parte mapeada termina no
+/// `hal::physical::direct_map_limit`.
+pub const DIRECT_MAP_SLOT_TOP: u64 = DIRECT_MAP_BASE + PHYSICAL_ADDRESS_LIMIT;
 /// Tabelas do mapa direto montadas pelo stage2 (PDPT e PDs contíguas).
 pub const DIRECT_MAP_PDPT_PHYS: u64 = 0x76000;
 pub const DIRECT_MAP_PD_PHYS: u64 = 0x77000;
@@ -354,9 +364,9 @@ pub const fn direct_map(physical_address: u64) -> u64 {
     DIRECT_MAP_BASE + physical_address
 }
 
-/// A VA está na parte mapeada do mapa direto.
+/// A VA está no slot do mapa direto.
 pub const fn is_direct_map(address: u64) -> bool {
-    address >= DIRECT_MAP_BASE && address < DIRECT_MAP_TOP
+    address >= DIRECT_MAP_BASE && address < DIRECT_MAP_SLOT_TOP
 }
 
 const _: () = assert!((DIRECT_MAP_BASE >> 39) & 511 == DIRECT_MAP_PML4_INDEX);
@@ -366,7 +376,8 @@ const _: () = assert!(DIRECT_MAP_PML4_INDEX != (KERNEL_POOL_BASE >> 39) & 511 &&
 // com as PDs da antiga identidade de 4 GB sem uso) e antes da página de
 // contagem de IRQs (0x81000).
 const _: () = assert!(DIRECT_MAP_PDPT_PHYS == BOOT_IDENTITY_PD_PHYS + 4 * PAGE_SIZE && DIRECT_MAP_PD_PHYS == DIRECT_MAP_PDPT_PHYS + PAGE_SIZE);
-const _: () = assert!(DIRECT_MAP_PD_PHYS + 4 * PAGE_SIZE <= 0x8_1000 && PHYSICAL_MEMORY_LIMIT == 4 * 0x4000_0000);
+const _: () = assert!(DIRECT_MAP_PD_PHYS + 4 * PAGE_SIZE <= 0x8_1000 && BOOT_DIRECT_MAP_LIMIT == 4 * 0x4000_0000);
+const _: () = assert!(PHYSICAL_ADDRESS_LIMIT == 512 * 0x4000_0000 && PHYSICAL_ADDRESS_LIMIT % 0x4000_0000 == 0);
 
 // ---- Janela do heap do kernel (metade de sistema) --------------------------
 //

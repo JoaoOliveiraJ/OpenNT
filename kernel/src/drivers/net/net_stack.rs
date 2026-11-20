@@ -108,7 +108,7 @@ fn log_controller_state() {
     let Some(bar) = function.bars.iter().find(|bar| bar.index == 0) else { return };
     let base = (bar.value & 0xFFFF_FFF0) as u64;
     let command = crate::hal::pci_config::read(function.bus, function.device, function.function, 0x04, 4).unwrap_or(0);
-    if base == 0 || base >= crate::ntos::mm::memory_map::PHYSICAL_MEMORY_LIMIT {
+    if base == 0 || base >= crate::hal::physical::direct_map_limit() {
         debug_print!("[net] BAR0 {:#x} fora do mapa direto; comando/estado PCI {:#010x}", base, command);
         return;
     }

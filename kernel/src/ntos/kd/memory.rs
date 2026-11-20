@@ -8,7 +8,8 @@
 //! página ausente termina a leitura ali, e a escrita passa por cima da
 //! proteção da página (é assim que o breakpoint de software entra no código).
 
-use crate::ntos::mm::memory_map::{direct_map, PHYSICAL_MEMORY_LIMIT};
+use crate::hal::physical::direct_map_limit;
+use crate::ntos::mm::memory_map::direct_map;
 
 const PRESENT: u64 = 1;
 const LARGE_PAGE: u64 = 0x80;
@@ -24,7 +25,7 @@ fn canonical(address: u64) -> bool {
 /// Uma entrada de tabela de páginas pelo endereço físico.
 fn table_entry(table: u64, index: u64) -> Option<u64> {
     let physical = (table & TABLE_ADDRESS) + index * 8;
-    if physical + 8 > PHYSICAL_MEMORY_LIMIT {
+    if physical + 8 > direct_map_limit() {
         return None;
     }
     // SAFETY: o mapa direto cobre toda a faixa física abaixo do limite.
@@ -82,7 +83,7 @@ pub fn pte_address(cr3: u64, address: u64) -> Option<u64> {
         return None;
     }
     let physical = (pd & TABLE_ADDRESS) + ((address >> 12) & 511) * 8;
-    (physical + 8 <= PHYSICAL_MEMORY_LIMIT).then_some(physical)
+    (physical + 8 <= direct_map_limit()).then_some(physical)
 }
 
 /// Lê um qword físico pelo mapa direto.
@@ -103,7 +104,7 @@ fn window(cr3: u64, address: u64, wanted: usize) -> Option<(u64, usize)> {
     let physical = translate(cr3, address)?;
     let in_page = (0x1000 - (address & 0xFFF)) as usize;
     let length = wanted.min(in_page);
-    if physical + length as u64 > PHYSICAL_MEMORY_LIMIT {
+    if physical + length as u64 > direct_map_limit() {
         return None;
     }
     Some((direct_map(physical), length))

@@ -475,7 +475,7 @@ struct Walker {
 fn translate_in(root: u64, va: u64) -> Option<u64> {
     let mut table = root & FRAME_MASK;
     for (level, shift) in [39u32, 30, 21, 12].into_iter().enumerate() {
-        if table == 0 || table >= memory_map::PHYSICAL_MEMORY_LIMIT {
+        if table == 0 || table >= physical::direct_map_limit() {
             return None;
         }
         let entry = physical::read64(table + ((va >> shift) & 511) * 8);
@@ -491,7 +491,7 @@ fn translate_in(root: u64, va: u64) -> Option<u64> {
             }
             let size = 1u64 << shift;
             let frame = (entry & FRAME_MASK & !(size - 1)) + (va & (size - 1) & !0xFFF);
-            return (frame < memory_map::PHYSICAL_MEMORY_LIMIT).then_some(frame);
+            return (frame < physical::direct_map_limit()).then_some(frame);
         }
         table = entry & FRAME_MASK;
     }
