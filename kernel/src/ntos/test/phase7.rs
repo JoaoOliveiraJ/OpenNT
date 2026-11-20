@@ -5077,6 +5077,32 @@ fn user_alpc_message_handles(assert: Assert) {
     assert(same_access == Some(0x1F_0003) && pseudo_summary == Some((0x20, 0x1000)), "useralpchnd: mesmo acesso e pseudo-handle de processo");
     let refusals = (simple(0x100, event, 0).and_then(|result| result.err()), simple(0, event, 0x20_0000).and_then(|result| result.err()), simple(0, 0x7FFF_0000, 0x10_0002).and_then(|result| result.err()), simple(0, 0x1_0000_0000, 0x10_0002).and_then(|result| result.err()), simple(0, event, 0x1F_0003 | 0x0100_0000).and_then(|result| result.err()));
     assert(refusals == (Some(0xC000_000D), Some(0xC000_0022), Some(0xC000_0008), Some(0xC000_0008), Some(0xC000_0022)), "useralpchnd: recusas da captura simples");
+    // O atributo de handles de uma resposta: a recusa da captura recusa o
+    // envio; a chave do Cm, que a captura não descreve, deixa a resposta
+    // sair sem os handles (diferença do 19041, que a duplicaria).
+    let key_name = block + 0x1C00;
+    let key_text = block + 0x1D00;
+    state::write_user_wide(key_text, "\\Registry\\Machine\\System");
+    state::write_unicode_string(key_name + 0x40, key_text, "\\Registry\\Machine\\System");
+    set_object_attributes(unsafe { nt::ObjectAttributes::at(key_name) }, nt::ObjectAttributes::SIZE as u32, 0, key_name + 0x40, 0x40);
+    let key_opened = state::handler("NtOpenKey").map(|open| open(block + 0x10, 0x2_0019, key_name, 0, 0));
+    let key = guest::read64(block + 0x10);
+    let reply = |flags: u32, value: u64, access: u32| {
+        handle_attribute.flags.set(flags);
+        handle_attribute.handle.set(value);
+        handle_attribute.object_type.set(0);
+        handle_attribute.desired_access.set(access);
+        message_handles::capture_reply(attribute, 1)
+    };
+    let key_reply = reply(0x1_0000, key, 0);
+    let event_reply = reply(0, event, 0x10_0002);
+    let event_carried = event_reply.as_ref().ok().and_then(|handles| handles.as_ref().map(|data| data.entries.lock().len()));
+    if let Ok(Some(data)) = &event_reply {
+        message_identity::Retained::release(data.as_ref());
+    }
+    let missing_reply = reply(0, 0x7FFF_0000, 0x10_0002).err();
+    assert(matches!(key_opened, Some(Ok(0))) && key != 0 && matches!(key_reply, Ok(None)) && event_carried == Some(1) && missing_reply == Some(0xC000_0008), "useralpchnd: resposta com a chave do Cm sai sem os handles, com o evento leva o handle, e o handle invalido recusa o envio");
+    let _ = state::handler("NtClose").map(|close| close(key, 0, 0, 0, block + 0x800));
     // Forma indireta.
     let array = block + 0x200;
     for entry in unsafe { nt::AlpcHandleAttr32::array_at(array, 2) } {

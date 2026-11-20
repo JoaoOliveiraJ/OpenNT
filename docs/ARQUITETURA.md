@@ -5423,7 +5423,10 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     handle de kernel no System); os outros tipos, como linha do Object
     Manager. É o `[system_handle]` do RPC: o UMgrLogonUser do UserManager
     devolve assim o token do logon ao winlogon, e o RpcGetUserToken do LSM
-    o token da sessão ao DcomLaunch;
+    o token da sessão ao DcomLaunch. Diferença do 19041: uma resposta com um
+    objeto que a captura não descreve (a chave do Cm, que ainda não tem
+    dono no `open_pointer`) sai sem os handles em vez de levar a chave
+    duplicada; uma recusa da captura com NTSTATUS recusa o envio;
   - todo pedido sem RELEASE_MESSAGE chega com LPC_CONTINUATION_REQUIRED
     (os assíncronos também), e a desconexão ou o fechamento da porta de
     comunicação pelo servidor termina com STATUS_PORT_DISCONNECTED os

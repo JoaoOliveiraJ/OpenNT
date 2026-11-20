@@ -992,7 +992,7 @@ fn send_reply(server: &UserServer, port: &Arc<Port>, input: u64, attributes: u64
 
 /// Os handles de uma resposta (o ALPC_MESSAGE_HANDLE_ATTRIBUTE válido no
 /// ALPC_MESSAGE_ATTRIBUTES de envio), capturados do processo de quem
-/// responde como os de um pedido (`message_handles::capture`).
+/// responde como os de um pedido (`message_handles::capture_reply`).
 fn capture_reply_handles(attributes: u64, mode: u8) -> Result<Option<Arc<HandleData>>, u32> {
     if attributes == 0 {
         return Ok(None);
@@ -1001,12 +1001,7 @@ fn capture_reply_handles(attributes: u64, mode: u8) -> Result<Option<Arc<HandleD
     if header.valid_attributes.probe_get().map_err(|error| error.status)? & HANDLE_ATTRIBUTE == 0 {
         return Ok(None);
     }
-    let at = crate::ntos::ps::user::alpc::attribute_address(attributes, HANDLE_ATTRIBUTE);
-    match message_handles::capture(at, mode) {
-        Ok(Ok(handles)) => Ok(Some(handles)),
-        Ok(Err(status)) => Err(status),
-        Err(error) => Err(if error.status != 0 { error.status } else { 0xC000_0001 }),
-    }
+    message_handles::capture_reply(crate::ntos::ps::user::alpc::attribute_address(attributes, HANDLE_ATTRIBUTE), mode)
 }
 
 /// A linha do `--trace-rpc` da resposta do servidor ao pedido `id`: o Type

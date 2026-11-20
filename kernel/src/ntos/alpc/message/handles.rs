@@ -205,6 +205,23 @@ pub fn capture(address: u64, mode: u8) -> Result<Result<Arc<HandleData>, u32>, K
     }
 }
 
+/// O atributo de handles de uma resposta (`alpc/server.rs`), capturado
+/// como o de um pedido: uma recusa da captura (um NTSTATUS) recusa o envio.
+/// Diferença do 19041: um objeto que a captura não descreve (a chave do Cm,
+/// sem dono no `open_pointer`) não recusa a resposta, que sai sem os
+/// handles, como antes de as respostas levarem handles; o 19041 duplicaria
+/// a chave no cliente.
+pub fn capture_reply(address: u64, mode: u8) -> Result<Option<Arc<HandleData>>, u32> {
+    match capture(address, mode) {
+        Ok(Ok(handles)) => Ok(Some(handles)),
+        Ok(Err(status)) => Err(status),
+        Err(error) => {
+            crate::debug_print!("[alpc] resposta do pid {} sem o atributo de handles: {}", process::get_current_process_id(), error);
+            Ok(None)
+        }
+    }
+}
+
 /// Lê ALPC_HANDLE_ATTR (forma simples ou vetor de ALPC_HANDLE_ATTR32) do
 /// buffer do chamador, com sonda em cada campo.
 fn capture_descriptors(address: u64, mode: u8) -> Result<Vec<Descriptor>, u32> {
