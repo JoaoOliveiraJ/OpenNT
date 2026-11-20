@@ -815,6 +815,53 @@ fn start(buffer: &mut [u8]) -> Result<(), u32> {
     Ok(())
 }
 
+/// As propriedades de uma sessão que o próprio kernel inicia (os valores
+/// de uma chave de autologger).
+pub struct SessionSettings<'a> {
+    pub name: &'a str,
+    pub guid: [u8; 16],
+    pub clock: u32,
+    pub buffer_size: u32,
+    pub minimum_buffers: u32,
+    pub maximum_buffers: u32,
+    pub maximum_file_size: u32,
+    pub log_file_mode: u32,
+    pub flush_timer: u32,
+}
+
+/// O EtwpStartLogger que o EtwStartAutoLogger chama: o
+/// WMI_LOGGER_INFORMATION montado das propriedades (o LoggerName num buffer
+/// do pool). Devolve o LoggerId ou o status.
+pub fn start_session(settings: &SessionSettings) -> Result<u16, u32> {
+    let units: Vec<u16> = settings.name.encode_utf16().collect();
+    let length = units.len() * 2;
+    if length == 0 || length > 0xFFFE {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let text = guest::alloc_bytes(length as u64);
+    if text == 0 {
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    }
+    guest::write_bytes(text, &units.iter().flat_map(|unit| unit.to_le_bytes()).collect::<Vec<u8>>());
+    let mut buffer = alloc::vec![0u8; INFORMATION_SIZE];
+    put32(&mut buffer, info::BUFFER_SIZE_WNODE, INFORMATION_SIZE as u32);
+    buffer[info::GUID..info::GUID + 16].copy_from_slice(&settings.guid);
+    put32(&mut buffer, info::CLIENT_CONTEXT, settings.clock);
+    put32(&mut buffer, info::FLAGS, WNODE_FLAG_TRACED_GUID);
+    put32(&mut buffer, info::BUFFER_SIZE, settings.buffer_size);
+    put32(&mut buffer, info::MINIMUM_BUFFERS, settings.minimum_buffers);
+    put32(&mut buffer, info::MAXIMUM_BUFFERS, settings.maximum_buffers);
+    put32(&mut buffer, info::MAXIMUM_FILE_SIZE, settings.maximum_file_size);
+    put32(&mut buffer, info::LOG_FILE_MODE, settings.log_file_mode);
+    put32(&mut buffer, info::FLUSH_TIMER, settings.flush_timer);
+    buffer[info::LOGGER_NAME..info::LOGGER_NAME + 2].copy_from_slice(&(length as u16).to_le_bytes());
+    buffer[info::LOGGER_NAME + 2..info::LOGGER_NAME + 4].copy_from_slice(&(length as u16).to_le_bytes());
+    put64(&mut buffer, info::LOGGER_NAME + 8, text);
+    let result = start(&mut buffer).map(|()| u16::from_le_bytes([buffer[info::HISTORICAL_CONTEXT], buffer[info::HISTORICAL_CONTEXT + 1]]));
+    guest::free_bytes(text);
+    result
+}
+
 /// Stop: os provedores desabilitados, o último flush aos consumidores de
 /// tempo real e o fim da thread do logger, o buffer corrente fechado, as
 /// propriedades finais e os buffers devolvidos.
@@ -1084,6 +1131,15 @@ pub fn enable_trace(provider: u64, _source: u64, logger_id: u16, control_code: u
 pub fn enable_provider(logger_id: u16, provider: [u8; 16], level: u8, any_keyword: u64) -> Result<u32, KernelError> {
     let Some(session) = LOGGERS.lock().get(&logger_id).map(|logger| logger.session) else { return Ok(STATUS_WMI_INSTANCE_NOT_FOUND) };
     provider_state::enable_identifier(session, provider, provider_state::EnableOptions { level, any_keyword, ..Default::default() })?;
+    Ok(0)
+}
+
+/// O EtwpEnableTrace de um provedor de autologger: nível, MatchAnyKeyword,
+/// MatchAllKeyword e o EnableProperty (EVENT_ENABLE_PROPERTY_IGNORE_KEYWORD_0
+/// tira a keyword zero, como no EtwEnableTrace).
+pub fn enable_provider_options(logger_id: u16, provider: [u8; 16], level: u8, any_keyword: u64, all_keyword: u64, property: u32) -> Result<u32, KernelError> {
+    let Some(session) = LOGGERS.lock().get(&logger_id).map(|logger| logger.session) else { return Ok(STATUS_WMI_INSTANCE_NOT_FOUND) };
+    provider_state::enable_identifier(session, provider, provider_state::EnableOptions { level, any_keyword, all_keyword, include_keyword_zero: property & 0x10 == 0 })?;
     Ok(0)
 }
 

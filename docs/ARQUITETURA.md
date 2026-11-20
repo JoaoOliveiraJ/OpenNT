@@ -2802,9 +2802,15 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   depois da validação) o EnableTraceEx2 de modo usuário (17), as respostas a notificações, as listas de GUIDs e
   grupos, WDI, compressão e sessões privadas, que nenhum processo do boot
   usa; os grupos de provedores dos traits, os eventos de imagem do
-  EtwTrackProviderBinary, os loggers clássicos por TRACEHANDLE (NtTraceEvent
-  0x200) e os autologgers do Registro também não existem. Testes:
-  `etw_trace_session`, `etw_user_registration` e `etw_realtime` na fase 6;
+  EtwTrackProviderBinary e os loggers clássicos por TRACEHANDLE (NtTraceEvent
+  0x200) também não existem. Os autologgers do Registro (`autologger.rs`, o
+  EtwpInitializeAutoLoggers da fase 1, depois das hives) iniciam cada
+  sessão de `Control\WMI\Autologger` com Start, com as propriedades da
+  chave, habilitam os provedores das subchaves (Enabled, EnableLevel,
+  MatchAnyKeyword, MatchAllKeyword, EnableProperty) e gravam o Status de
+  cada chave; o arquivo da sessão e o RtBackup não existem. Testes:
+  `etw_trace_session`, `etw_user_registration` e `etw_realtime` (com os
+  autologgers) na fase 6;
   o marcador `ETW_USER_REGISTRATION_OK` no boot do smss real.
 - **Trava e energia do KD** (`kd/power.rs`): KdDebuggerLock em
   DISPATCH_LEVEL, a lista dos tratadores de energia do transporte e, com o

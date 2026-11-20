@@ -103,6 +103,11 @@ pub fn init() {
     // Definições WNF da hive (Control\Notifications), que NTDLL e KERNELBASE
     // consultam; os dados só existem depois de publicação real.
     crate::ntos::cm::wnf_defaults::initialize().unwrap_or_else(|error| panic!("{error}"));
+    // EtwInitialize da fase 1 (EtwInitializeSiloState ->
+    // EtwpInitializeAutoLoggers): as sessões de `Control\WMI\Autologger`
+    // da hive SYSTEM, com os provedores delas habilitados, antes dos drivers
+    // e de qualquer processo de usuário.
+    crate::ntos::etw::autologger::initialize();
     // EmInitSystem: o banco do Errata Manager a partir da imagem do
     // \SystemRoot\INF\errata.inf que o carregador entrega (lida do volume
     // de boot, agora montado), os callbacks da HAL e os embutidos; o work

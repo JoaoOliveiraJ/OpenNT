@@ -61,6 +61,7 @@ extern crate alloc;
 mod build;
 mod crash;
 mod debug;
+mod event_log;
 mod fonts;
 mod heap_census;
 mod hive_image;
