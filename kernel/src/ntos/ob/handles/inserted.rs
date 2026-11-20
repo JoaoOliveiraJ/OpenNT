@@ -5,7 +5,6 @@
 //! Handles de kernel ficam na tabela do System e valem em qualquer
 //! contexto; um handle de usuário só existe na tabela do processo dono.
 
-use crate::ntos::inc::types::{Field, NtStruct};
 use crate::ntos::ob::object_header::OpenReason;
 use crate::ntos::ob::object_types::ObjectType;
 use crate::ntos::ob::open_pointer::Described;
@@ -148,8 +147,11 @@ pub fn duplicate(source_process: u64, source_handle: u64, target_process: u64, t
     let identifier = open_pointer::insert_with(&resolved.item, access, open_attributes, owner, OpenReason::Duplicate, mode)?;
     let handle = if kernel { KERNEL_HANDLE_MASK | identifier as u64 } else { identifier as u64 };
     if target_handle_out != 0 {
-        // SAFETY: PHANDLE TargetHandle de um chamador de kernel.
-        unsafe { Field::<u64>::at(target_handle_out) }.set(handle);
+        // O ObDuplicateObject 19041 grava `*TargetHandle` sem exigir
+        // alinhamento: o NtDCompositionSendDwmLpcMessage do win32kbase troca
+        // os handles no próprio lugar, dentro da mensagem, em endereços
+        // alinhados a 4.
+        crate::ntos::mm::guest_memory::write64(target_handle_out, handle);
     }
     if options & DUPLICATE_CLOSE_SOURCE != 0 {
         close_source()?;
