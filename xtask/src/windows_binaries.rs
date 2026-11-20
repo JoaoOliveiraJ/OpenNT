@@ -789,6 +789,13 @@ const LOGON_SCREEN_PROGRAMS: &[&str] = &[
     "SmartcardCredentialProvider.dll",
     "TrustedSignalCredProv.dll",
     "wlidcredprov.dll",
+    // Os auxiliares que o credprovhost.dll cria: o `2FAHelper` de
+    // `Authentication\Credential Providers` no _CreateCredentialProviders
+    // (0x12b8a: sem ele o CoCreateInstance falha, a thread dos provedores
+    // termina e nenhum bloco de credencial aparece) e o `CredProvHelper` do
+    // CStartCredProvsJob (0xa1b0, opcional).
+    "CredProv2faHelper.dll",
+    "CredProvHelper.dll",
     "AadAuthHelper.dll",
     "cryptngc.dll",
     "ngckeyenum.dll",
