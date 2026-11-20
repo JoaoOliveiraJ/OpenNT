@@ -3000,35 +3000,57 @@ fn nt_query_information_thread(handle: u64, class: u64, out: u64, length: u64, r
     if matches!(requested_class(class), query_thread::THREAD_BREAK_ON_TERMINATION | 22 | 23 | 24 | 38) {
         return query_thread::query_user(rsp);
     }
-    let thread = match resolve(handle, 0x40) {
+    let class = class as u32;
+    let length = length as u32 as u64;
+    let returned = state::stack_arg(rsp, 5);
+    // O ProbeForWrite do buffer (alinhamento 4) e do ReturnLength vem antes
+    // de tudo (0x5fba0d..0x5fba4e).
+    if length != 0 && out & 3 != 0 {
+        return Ok(0x8000_0002);
+    }
+    if (length != 0 && !probe_user_write(out, length)) || (returned != 0 && !probe_user_write(returned, 4)) {
+        return Ok(0xC000_0005);
+    }
+    // O tamanho exato da classe (STATUS_INFO_LENGTH_MISMATCH) antes do
+    // handle, e o acesso de cada classe (o switch de 0x5fc1ac): Basic,
+    // Times, PriorityBoost e IsTerminated com THREAD_QUERY_LIMITED_INFORMATION
+    // (0x800); Win32StartAddress, IsIoPending e HideFromDebugger com
+    // THREAD_QUERY_INFORMATION (0x40). AmILastThread não usa o handle.
+    let (need, access) = match class {
+        0 => (48, 0x800),
+        // ThreadTimes: o KERNEL_USER_TIMES.
+        1 => (32, 0x800),
+        9 => (8, 0x40),
+        12 => (4, 0),
+        14 => (4, 0x800),
+        16 => (4, 0x40),
+        17 => (1, 0x40),
+        // ThreadIsTerminated (ULONG).
+        20 => (4, 0x800),
+        _ => {
+            crate::debug_print!("[usermode] NtQueryInformationThread classe {}", class);
+            return Ok(0xC000_0003);
+        }
+    };
+    if length != need {
+        return Ok(0xC000_0004);
+    }
+    // ThreadAmILastThread (ULONG): EPROCESS.ActiveThreads == 1 do processo
+    // corrente (0x5fbf79), sem referenciar o handle.
+    if class == 12 {
+        return state::guarded(|| {
+            guest::try_write::<u32>(out, (of_process(process::get_current_process()).iter().filter(|thread| !thread.dead()).count() == 1) as u32)?;
+            if returned != 0 {
+                guest::try_write::<u32>(returned, need as u32)?;
+            }
+            Ok(0)
+        });
+    }
+    let thread = match resolve(handle, access) {
         Ok(thread) => thread,
         Err(status) => return Ok(status),
     };
-    let returned = state::stack_arg(rsp, 5);
-    let need = match class {
-        0 => 48,
-        // ThreadTimes: o KERNEL_USER_TIMES.
-        1 => 32,
-        9 => 8,
-        17 => 1,
-        12 => 4,
-        // ThreadIsTerminated (ULONG).
-        20 => 4,
-        _ => return Ok(0xC000_0003),
-    };
-    if returned != 0 && !probe_user_write(returned, 4) {
-        return Ok(0xC000_0005);
-    }
     state::guarded(|| {
-        if returned != 0 {
-            guest::try_write::<u32>(returned, need as u32)?;
-        }
-        if length != need {
-            return Ok(0xC000_0004);
-        }
-        if !probe_user_write(out, need) {
-            return Ok(0xC000_0005);
-        }
         let (pointer, exit_status, dead, teb, start, hidden) = thread.with(|thread| (thread.thread_pointer, thread.exit_status, thread.dead, thread.teb_va, thread.start, thread.hidden));
         match class {
             0 => {
@@ -3059,17 +3081,31 @@ fn nt_query_information_thread(handle: u64, class: u64, out: u64, length: u64, r
             }
             // ThreadQuerySetWin32StartAddress (PVOID).
             9 => guest::try_write::<u64>(out, start)?,
+            // ThreadPriorityBoost (ULONG): KTHREAD.ThreadFlags.DisableBoost
+            // (0x7f0c4e).
+            14 => guest::try_write::<u32>(out, kernel_thread(pointer).disable_boost())?,
+            // ThreadIsIoPending (ULONG): a IrpList da ETHREAD não vazia
+            // (0x5fc0fa). O CRpcThread::WorkerLoop do combase mantém o
+            // worker vivo enquanto ele tem IRPs pendentes.
+            16 => {
+                // SAFETY: a ETHREAD retida pelo handle resolvido.
+                let irps = &unsafe { crate::ntos::inc::types::Ethread::at(pointer) }.irp_list;
+                let first = irps.flink.get();
+                guest::try_write::<u32>(out, (first != 0 && first != irps.address()) as u32)?;
+            }
             // ThreadHideFromDebugger (BOOLEAN).
             17 => guest::try_write::<u8>(out, hidden as u8)?,
             // ThreadIsTerminated: o PsIsThreadTerminating (o bit Terminated
             // do CrossThreadFlags, ligado quando o fim é pedido).
-            20 => {
+            _ => {
                 // SAFETY: a ETHREAD retida pelo handle resolvido.
                 let flags = unsafe { crate::ntos::inc::types::Ethread::at(pointer) }.cross_thread_flags.get();
                 guest::try_write::<u32>(out, (dead || flags & crate::ntos::inc::types::Ethread::TERMINATED_MASK != 0) as u32)?;
             }
-            // ThreadAmILastThread (ULONG): as threads do processo corrente.
-            _ => guest::try_write::<u32>(out, (of_process(process::get_current_process()).iter().filter(|thread| !thread.dead()).count() == 1) as u32)?,
+        }
+        // O ReturnLength só depois dos dados, no sucesso.
+        if returned != 0 {
+            guest::try_write::<u32>(returned, need as u32)?;
         }
         Ok(0)
     })
@@ -3197,13 +3233,13 @@ fn set_priority_class(handle: u64, class: u64, input: u64, length: u64) -> Resul
             return Ok(0xC000_0061);
         }
     }
+    // Numa thread que já terminou também: o NtSetInformationThread 19041
+    // não tem STATUS_THREAD_IS_TERMINATING, e o KeSetPriorityThread só
+    // grava os campos da KTHREAD terminada.
     let thread = match resolve(handle, THREAD_SET_LIMITED_INFORMATION) {
         Ok(thread) => thread,
         Err(status) => return Ok(status),
     };
-    if thread.dead() {
-        return Ok(THREAD_IS_TERMINATING);
-    }
     let pointer = thread.pointer();
     if class == THREAD_PRIORITY {
         thread_priority::set_priority(pointer, value as u64)?;
@@ -3288,27 +3324,56 @@ fn nt_set_information_thread(handle: u64, class: u64, input: u64, length: u64, r
     if class == THREAD_IMPERSONATION_TOKEN {
         return set_impersonation_token(handle, input, length);
     }
-    let thread = match resolve(handle, 0x20) {
+    // Cada classe confere o tamanho e captura o valor antes do handle (a
+    // tabela de 0x64b5f4); uma classe desconhecida nem referencia o handle.
+    // Não há STATUS_THREAD_IS_TERMINATING: uma thread que já terminou ainda
+    // aceita as classes.
+    let (need, access) = match class {
+        // ThreadZeroTlsCell e ThreadHideFromDebugger: THREAD_SET_INFORMATION.
+        10 => (4, 0x20),
+        17 => (0, 0x20),
+        // ThreadPriorityBoost: THREAD_SET_LIMITED_INFORMATION.
+        14 => (4, THREAD_SET_LIMITED_INFORMATION),
+        _ => {
+            crate::debug_print!("[thread] NtSetInformationThread class={}", class);
+            return Ok(0xC000_0003);
+        }
+    };
+    if length != need {
+        return Ok(0xC000_0004);
+    }
+    if need != 0 && !probe_user_read(input, need) {
+        return Ok(0xC000_0005);
+    }
+    // ULONG da classe (sondado acima).
+    let value = if need == 4 {
+        match guest::try_read::<u32>(input) {
+            Ok(value) => value,
+            Err(error) => return Ok(error.status),
+        }
+    } else {
+        0
+    };
+    let thread = match resolve(handle, access) {
         Ok(thread) => thread,
         Err(status) => return Ok(status),
     };
-    if thread.dead() {
-        return Ok(THREAD_IS_TERMINATING);
-    }
     match class {
+        // ThreadPriorityBoost: o KeSetDisableBoostThread (0x77275c), o bit
+        // DisableBoost da KTHREAD.ThreadFlags ligado para um valor não nulo.
+        14 => {
+            let flags = kernel_thread(thread.pointer()).thread_flags.atomic();
+            let mask = crate::ntos::inc::types::Kthread::DISABLE_BOOST_MASK as i32;
+            if value != 0 {
+                flags.fetch_or(mask, core::sync::atomic::Ordering::SeqCst);
+            } else {
+                flags.fetch_and(!mask, core::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(0)
+        }
         // ThreadZeroTlsCell: TlsFree zera o índice em toda TEB viva.
         10 => {
-            if length != 4 {
-                return Ok(0xC000_0004);
-            }
-            if !probe_user_read(input, 4) {
-                return Ok(0xC000_0005);
-            }
-            // ULONG: o índice TLS (sondado acima).
-            let index = match guest::try_read::<u32>(input) {
-                Ok(index) => index as u64,
-                Err(error) => return Ok(error.status),
-            };
+            let index = value as u64;
             if index >= 1088 {
                 return Ok(0xC000_000D);
             }
@@ -3347,16 +3412,10 @@ fn nt_set_information_thread(handle: u64, class: u64, input: u64, length: u64, r
             }
             Ok(0)
         }
-        17 => {
-            if length != 0 {
-                return Ok(0xC000_0004);
-            }
+        // ThreadHideFromDebugger.
+        _ => {
             thread.with(|thread| thread.hidden = true);
             Ok(0)
-        }
-        _ => {
-            crate::debug_print!("[thread] NtSetInformationThread class={}", class);
-            Ok(0xC000_0003)
         }
     }
 }

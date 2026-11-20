@@ -140,6 +140,7 @@ fn resolve_user_thread(handle: u64, from_user_mode: bool) -> Result<u64, u32> {
         return Err(0xC000_0024);
     }
     if from_user_mode && entry.access() & 0x840 == 0 {
+        user_state::note_denial("handle", "thread", 0x800, entry.access());
         return Err(0xC000_0022);
     }
     let pointer = user_threads::resolve(handle, 0)?.pointer();

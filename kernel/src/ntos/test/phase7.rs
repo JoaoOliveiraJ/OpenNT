@@ -1995,6 +1995,63 @@ fn user_threads_in(assert: Assert, test: &TestProcess) {
     assert(basic.base_priority.get() == 0 && basic.priority.get() == thread_priority::query_priority(pointer), "userthreads: ThreadBasicInformation publica o incremento da base, 0 numa thread normal");
     assert(call("NtQueryInformationThread", handle, 9, info, 8) == 0 && guest::read64(info) == block + 0x800 && call("NtQueryInformationThread", handle, 17, info, 1) == 0 && guest::read8(info) == 1, "userthreads: endereco inicial e oculta do depurador");
     assert(call("NtQueryInformationThread", handle, 0, info, 40) == 0xC000_0004 && call("NtQueryInformationThread", handle, 5, info, 8) == 0xC000_0003, "userthreads: tamanho e classe invalidos");
+    // O acesso de cada classe (o switch de 0x5fc1ac): só com
+    // THREAD_QUERY_LIMITED_INFORMATION, Basic, Times e IsTerminated
+    // respondem; Win32StartAddress e IsIoPending pedem
+    // THREAD_QUERY_INFORMATION. O tamanho vem antes do handle e o
+    // ReturnLength só é escrito no sucesso.
+    let duplicate = |access: u64| {
+        for (offset, value) in [(0x28u64, access), (0x30, 0), (0x38, 0)] {
+            guest::write64(rsp + offset, value);
+        }
+        let status = call("NtDuplicateObject", u64::MAX, handle, u64::MAX, out);
+        guest::write64(rsp + 0x28, info + 0x38);
+        (status == 0).then(|| guest::read64(out))
+    };
+    let limited = duplicate(0x800);
+    let terminate_only = duplicate(1);
+    let limited_queries = limited.is_some_and(|limited| {
+        call("NtQueryInformationThread", limited, 0, info, 48) == 0
+            && basic.client_id.unique_thread.get() == thread.thread_id
+            && call("NtQueryInformationThread", limited, 1, info, 32) == 0
+            && call("NtQueryInformationThread", limited, 20, info, 4) == 0
+            && guest::read32(info) == 0
+            && call("NtQueryInformationThread", limited, 16, info, 4) == 0xC000_0022
+            && call("NtQueryInformationThread", limited, 9, info, 8) == 0xC000_0022
+    });
+    assert(limited_queries, "userthreads: com THREAD_QUERY_LIMITED_INFORMATION, Basic, Times e IsTerminated respondem e IsIoPending e Win32StartAddress sao recusados");
+    guest::write32(info + 0x38, 0xEEEE);
+    let mismatch = call("NtQueryInformationThread", 0xDEAD0, 16, info, 8) == 0xC000_0004 && guest::read32(info + 0x38) == 0xEEEE;
+    assert(mismatch, "userthreads: o tamanho errado vem antes do handle invalido e nao escreve o ReturnLength");
+    // ThreadIsIoPending (0x5fc0fa): a IrpList da ETHREAD não vazia.
+    let idle = call("NtQueryInformationThread", handle, 16, info, 4) == 0 && guest::read32(info) == 0 && guest::read32(info + 0x38) == 4;
+    let irp = crate::ntos::test::phase6::call_export("IoAllocateIrp", &[1, 0]).unwrap_or(0);
+    let pending = irp != 0
+        && crate::ntos::io::threads::thread_requests::insert(irp, pointer).is_ok()
+        && call("NtQueryInformationThread", handle, 16, info, 4) == 0
+        && guest::read32(info) == 1;
+    if irp != 0 {
+        let _ = crate::ntos::io::threads::thread_requests::remove(irp, pointer);
+        let _ = crate::ntos::test::phase6::call_export("IoFreeIrp", &[irp]);
+    }
+    assert(idle && pending, "userthreads: ThreadIsIoPending segue a IrpList da ETHREAD");
+    // ThreadPriorityBoost: o DisableBoost da KTHREAD (KeSetDisableBoostThread).
+    guest::write32(info, 1);
+    let disabled = call("NtSetInformationThread", handle, 14, info, 4) == 0 && call("NtQueryInformationThread", handle, 14, info, 4) == 0 && guest::read32(info) == 1;
+    guest::write32(info, 0);
+    let enabled = call("NtSetInformationThread", handle, 14, info, 4) == 0 && call("NtQueryInformationThread", handle, 14, info, 4) == 0 && guest::read32(info) == 0;
+    assert(disabled && enabled, "userthreads: ThreadPriorityBoost liga e desliga o DisableBoost");
+    // NtOpenThreadToken com um handle real (0x6536a2): o
+    // ObReferenceObjectByHandle(THREAD_QUERY_LIMITED_INFORMATION) e, sem
+    // impersonação, STATUS_NO_TOKEN.
+    let token_out = block + 0x380;
+    let no_token = call("NtOpenThreadToken", handle, 8, 0, token_out) == 0xC000_007C;
+    let limited_no_token = limited.map(|limited| call("NtOpenThreadToken", limited, 8, 0, token_out)) == Some(0xC000_007C);
+    let token_denied = terminate_only.map(|handle| call("NtOpenThreadToken", handle, 8, 0, token_out)) == Some(0xC000_0022);
+    assert(no_token && limited_no_token && token_denied && call("NtOpenThreadToken", 0xDEAD0, 8, 0, token_out) == 0xC000_0008, "userthreads: NtOpenThreadToken com handle de thread real: sem token, acesso negado e handle invalido");
+    for value in [limited, terminate_only].into_iter().flatten() {
+        let _ = call("NtClose", value, 0, 0, 0);
+    }
     // Suspensão, retomada e prioridades.
     assert(call("NtResumeThread", handle, info, 0, 0) == 0 && guest::read32(info) == 1 && thread_dispatch::thread_state(pointer) == thread_dispatch::state::READY, "userthreads: retomada deixa a thread pronta");
     assert(call("NtSuspendThread", handle, info, 0, 0) == 0 && guest::read32(info) == 0 && thread_dispatch::thread_state(pointer) == thread_dispatch::state::WAITING, "userthreads: suspensao tira da fila");
@@ -2046,6 +2103,12 @@ fn user_threads_in(assert: Assert, test: &TestProcess) {
     let impersonated = call("NtImpersonateThread", handle, handle, qos_address, 0) == 0;
     let primary = process::get_primary_token(process_pointer);
     let copied = crate::ntos::se::token::thread::get(pointer).is_some_and(|state| state.level & 3 == 2 && state.copy_on_open && !state.effective_only && Some(state.token) != primary);
+    // A thread impersonando: o NtOpenThreadToken pelo handle real abre o token.
+    let opened_token = call("NtOpenThreadToken", handle, 8, 0, block + 0x380) == 0;
+    if opened_token {
+        let _ = call("NtClose", guest::read64(block + 0x380), 0, 0, 0);
+    }
+    assert(opened_token, "userthreads: NtOpenThreadToken pelo handle real da thread que impersona abre o token");
     guest::write64(info, 0);
     let reverted = call("NtSetInformationThread", handle, 5, info, 8) == 0 && crate::ntos::se::token::thread::get(pointer).is_none();
     assert(refused && impersonated && copied && reverted, "userthreads: NtImpersonateThread com direitos dos handles, copia estatica e retorno ao proprio token");
@@ -2094,6 +2157,15 @@ fn user_threads_in(assert: Assert, test: &TestProcess) {
     assert(call("NtTerminateThread", handle, 0x1234, 0, 0) == 0 && thread.dead() && !thread.waiting() && port.as_ref().is_some_and(|port| port.with(|state| state.waiters.is_empty() && state.associated.is_empty())), "userthreads: NtTerminateThread encerra a espera e dissocia");
     guest::write64(rsp + 0x28, 0);
     assert(call("NtQueryInformationThread", handle, 0, info, 48) == 0 && basic.exit_status.get() == 0x1234 && basic.teb_base_address.get() == 0 && call("NtTerminateThread", handle, 0, 0, 0) == 0xC000_004B && call("NtResumeThread", handle, 0, 0, 0) == 0xC000_004B, "userthreads: status de saida e recusas apos o termino");
+    // O NtSetInformationThread 19041 não tem STATUS_THREAD_IS_TERMINATING:
+    // a prioridade de uma thread terminada ainda muda (KeSetPriorityThread).
+    // Acima da corrente, para não pedir troca de thread.
+    let raised = (thread_priority::query_priority(pointer) + 1).clamp(2, 15);
+    guest::write32(info, raised as u32);
+    let dead_priority = call("NtSetInformationThread", handle, 2, info, 4) == 0 && thread_priority::query_priority(pointer) == raised;
+    guest::write32(info, 1);
+    let dead_boost = call("NtSetInformationThread", handle, 14, info, 4) == 0;
+    assert(dead_priority && dead_boost, "userthreads: NtSetInformationThread numa thread terminada aplica a classe em vez de STATUS_THREAD_IS_TERMINATING");
     process::set_current_thread(previous_thread);
     threads::set_running(false, None);
     for value in [port_handle, opened, handle] {
