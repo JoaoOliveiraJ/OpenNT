@@ -109,7 +109,84 @@ fn mount_and_read() -> Result<(), alloc::string::String> {
     let expected = crate::drivers::fs::ntfs::mounted().and_then(|volume| volume.read_bytes(&format!("/{KNOWN_FILE}")).ok().flatten()).ok_or("o leitor do kernel nao achou o arquivo conhecido")?;
     let device = ata_volume::create(1).map_err(|error| format!("dispositivo do volume: {error}"))?;
     let volume = format!("\\Device\\{}", ata_volume::DEVICE_NAME);
-    read_known_file(device, &volume, KNOWN_FILE, &expected)
+    read_known_file(device, &volume, KNOWN_FILE, &expected)?;
+    known_file_security(&volume, KNOWN_FILE)
+}
+
+/// O descritor que o xtask gravou para `file` (na raiz do volume): o
+/// SecurityId do $STANDARD_INFORMATION (+0x34) e a entrada do $SDS com
+/// esse SecurityId (cabeçalho de 20 bytes: hash, SecurityId, deslocamento e
+/// tamanho; entradas alinhadas a 16 em cada bloco primário de 256 KB, com
+/// a cópia no bloco seguinte), lidos do volume pelo leitor do kernel.
+fn builder_descriptor(file: &str) -> Option<crate::ntos::se::inherit_descriptor::Captured> {
+    use crate::drivers::fs::ntfs;
+    let volume = ntfs::mounted()?;
+    let entry = volume.find(&alloc::format!("/{file}")).ok()??;
+    let record = volume.read_record(entry.reference).ok()?;
+    let standard = ntfs::find_attribute(&record, 0x10).ok()??;
+    let id = u32::from_le_bytes(standard.value.get(52..56)?.try_into().ok()?);
+    // O $SDS é o único $DATA do $Secure (registro 9).
+    let secure = volume.read_record(9).ok()?;
+    let sds = ntfs::find_attribute(&secure, 0x80).ok()??;
+    let geometry = volume.geometry;
+    let mut bytes = Vec::new();
+    for run in ntfs::parse_runs(&secure, sds.run_offset).ok()? {
+        bytes.extend(volume.read_sectors(run.lcn as u64 * geometry.sectors_per_cluster, run.count * geometry.sectors_per_cluster).ok()?);
+    }
+    bytes.truncate(sds.real_size as usize);
+    let dword = |at: usize| bytes.get(at..at + 4).map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]));
+    let mut block = 0usize;
+    while block < bytes.len() {
+        let mut offset = block;
+        while offset + 20 <= (block + 0x4_0000).min(bytes.len()) {
+            let length = dword(offset + 16)? as usize;
+            if length < 20 {
+                break;
+            }
+            if dword(offset + 4)? == id {
+                return crate::ntos::cm::hive::security_cells::parse_self_relative(bytes.get(offset + 20..offset + length)?).ok();
+            }
+            offset = (offset + length).next_multiple_of(16);
+        }
+        block += 0x8_0000;
+    }
+    None
+}
+
+/// O descritor de `<volume>\<file>` pelo file system (ZwQuerySecurityObject
+/// com dono, grupo e DACL: o IRP_MJ_QUERY_SECURITY, em que o ntfs.sys acha
+/// o SecurityId no $SII e lê o $SDS) igual ao que o xtask gravou
+/// ([`builder_descriptor`]).
+fn known_file_security(volume: &str, file: &str) -> Result<(), alloc::string::String> {
+    use alloc::format;
+    let expected = builder_descriptor(file).ok_or("o leitor do kernel nao achou o descritor do arquivo no $Secure")?;
+    let block = guest::alloc_bytes(0x400);
+    let buffer = guest::alloc_bytes(0x1000);
+    let attributes = object_attributes(block, &format!("{volume}\\{file}"));
+    let (handle, iosb, needed) = (block + 0x300, block + 0x310, block + 0x320);
+    let result = (|| -> Result<(), alloc::string::String> {
+        let opened = call_export("ZwCreateFile", &[handle, FILE_GENERIC_READ, attributes, iosb, 0, 0, FILE_SHARE_READ, FILE_OPEN, FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE, 0, 0]).unwrap_or(u64::MAX) as u32;
+        if opened != 0 {
+            return Err(format!("abertura para o descritor devolveu {opened:#x}"));
+        }
+        let file_handle = guest::read64(handle);
+        let queried = call_export("ZwQuerySecurityObject", &[file_handle, 7, buffer, 0x1000, needed]).unwrap_or(u64::MAX) as u32;
+        let length = guest::read32(needed) as usize;
+        let closed = call_export("ZwClose", &[file_handle]).unwrap_or(u64::MAX) as u32;
+        if queried != 0 || closed != 0 {
+            return Err(format!("ZwQuerySecurityObject devolveu {queried:#x} ({length} bytes), fechamento {closed:#x}"));
+        }
+        let found = crate::ntos::cm::hive::security_cells::parse_self_relative(&guest::read_bytes(buffer, length.min(0x1000))).map_err(|status| format!("descritor do ntfs.sys ilegivel ({status:#x})"))?;
+        debug_print!("[fs-mount] descritor de {} pelo ntfs.sys: {} bytes, control {:#x}", file, length, found.control);
+        if found.owner != expected.owner || found.group != expected.group || found.dacl != expected.dacl || found.control & 0x1404 != expected.control & 0x1404 {
+            return Err(format!("o descritor do ntfs.sys (control {:#x}) difere do gravado no $Secure (control {:#x})", found.control, expected.control));
+        }
+        debug_print!("FILE_SYSTEM_SECURITY_OK {}", file);
+        Ok(())
+    })();
+    guest::free_bytes(buffer);
+    guest::free_bytes(block);
+    result
 }
 
 /// Abre `<volume>\<arquivo>` pelos exports (o IopParseDevice monta o volume

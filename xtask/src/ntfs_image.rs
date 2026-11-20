@@ -53,7 +53,9 @@
 //! diretório é residente enquanto cabe no registro; senão os nomes vão para
 //! blocos INDX e o $INDEX_ROOT guarda os separadores da B-tree.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+
+use crate::host_security::descriptor::{self, Descriptor};
 
 use std::fs;
 use std::path::Path;
@@ -450,25 +452,44 @@ impl Clusters {
 /// em `room` bytes, os blocos INDX ($INDEX_ALLOCATION e $BITMAP).
 fn directory_index(children: &[(u64, Vec<u8>)], room: usize, clusters: &mut Clusters) -> Result<Vec<Attribute>, String> {
     let entries: Vec<Vec<u8>> = children.iter().map(|(record, key)| index_entry(reference(*record), key, None)).collect();
+    index_attributes("$I30", 0x30, 1, &entries, room, clusters)
+}
+
+/// A entrada `entry` (de um índice de arquivos ou de visão) como nó da
+/// B-tree: INDEX_ENTRY_NODE e o VCN do filho no fim.
+fn with_child(entry: &[u8], vcn: u64) -> Vec<u8> {
+    let mut node = entry.to_vec();
+    let size = node.len() + 8;
+    node.extend_from_slice(&vcn.to_le_bytes());
+    put16(&mut node, 8, size as u16);
+    node[12] |= 1;
+    node
+}
+
+/// Um índice com nome `name` ($I30, ou um índice de visão como o $SII e o
+/// $SDH do $Secure) com as entradas em ordem de colação: o $INDEX_ROOT
+/// residente e, se não couber em `room` bytes, os blocos INDX
+/// ($INDEX_ALLOCATION e $BITMAP com o mesmo nome).
+fn index_attributes(name: &'static str, indexed_type: u32, collation: u32, entries: &[Vec<u8>], room: usize, clusters: &mut Clusters) -> Result<Vec<Attribute>, String> {
     let all: usize = entries.iter().map(Vec::len).sum::<usize>() + 16;
-    let root_overhead = encode_attribute(&resident(0x90, "$I30", index_root_value(0x30, 1, &[], false)), 0).len();
+    let root_overhead = encode_attribute(&resident(0x90, name, index_root_value(indexed_type, collation, &[], false)), 0).len();
     if all + root_overhead <= room {
         let flat = [entries.concat(), end_entry(None)].concat();
-        return Ok(vec![resident(0x90, "$I30", index_root_value(0x30, 1, &flat, false))]);
+        return Ok(vec![resident(0x90, name, index_root_value(indexed_type, collation, &flat, false))]);
     }
     // B-tree de dois níveis: cada separador sai da folha anterior e vai para
     // o $INDEX_ROOT com o VCN do filho.
     let usable = INDEX_BLOCK - 0x40 - 24;
-    let mut groups: Vec<Vec<(u64, Vec<u8>)>> = Vec::new();
+    let mut groups: Vec<Vec<&Vec<u8>>> = Vec::new();
     let mut group = Vec::new();
     let mut used = 0;
-    for (child, entry) in children.iter().zip(&entries) {
+    for entry in entries {
         if used + entry.len() > usable && !group.is_empty() {
             groups.push(std::mem::take(&mut group));
             used = 0;
         }
         used += entry.len();
-        group.push(child.clone());
+        group.push(entry);
     }
     if !group.is_empty() {
         groups.push(group);
@@ -479,12 +500,12 @@ fn directory_index(children: &[(u64, Vec<u8>)], room: usize, clusters: &mut Clus
     for (number, mut group) in groups.into_iter().enumerate() {
         let vcn = (number * (INDEX_BLOCK / CLUSTER)) as u64;
         if number + 1 < group_count {
-            let (record, key) = group.pop().ok_or("grupo de indice vazio")?;
-            root_entries.push(index_entry(reference(record), &key, Some(vcn)));
+            let separator = group.pop().ok_or("grupo de indice vazio")?;
+            root_entries.push(with_child(separator, vcn));
         } else {
             root_entries.push(end_entry(Some(vcn)));
         }
-        let leaf = [group.iter().map(|(record, key)| index_entry(reference(*record), key, None)).collect::<Vec<_>>().concat(), end_entry(None)].concat();
+        let leaf = [group.iter().map(|entry| entry.as_slice()).collect::<Vec<_>>().concat(), end_entry(None)].concat();
         let mut block = vec![0u8; INDEX_BLOCK];
         block[..4].copy_from_slice(b"INDX");
         put16(&mut block, 4, 0x28);
@@ -505,9 +526,9 @@ fn directory_index(children: &[(u64, Vec<u8>)], room: usize, clusters: &mut Clus
     let length = (count * INDEX_BLOCK) as u64;
     let (lcn, run) = clusters.allocate(blocks.concat());
     Ok(vec![
-        resident(0x90, "$I30", index_root_value(0x30, 1, &root, true)),
-        nonresident(0xA0, "$I30", vec![(Some(lcn), run)], length),
-        resident(0xB0, "$I30", low_bits(count, count.div_ceil(64) * 8)),
+        resident(0x90, name, index_root_value(indexed_type, collation, &root, true)),
+        nonresident(0xA0, name, vec![(Some(lcn), run)], length),
+        resident(0xB0, name, low_bits(count, count.div_ceil(64) * 8)),
     ])
 }
 
@@ -582,42 +603,45 @@ impl Descriptors {
 
 /// O $SDS e as entradas dos índices do $Secure. Cada entrada do $SDS é o
 /// SECURITY_DESCRIPTOR_HEADER (hash, SecurityId, deslocamento no $SDS e
-/// tamanho) seguido do descritor, alinhada a 16 bytes no primeiro bloco de
-/// 256 KB, com a cópia do bloco no seguinte; o $SII tem uma entrada por
-/// SecurityId e o $SDH uma por hash e SecurityId (colação
-/// COLLATION_NTOFS_SECURITY_HASH: o hash e depois o SecurityId), ambas com o
-/// cabeçalho como dados.
-fn secure_streams(descriptors: &[Vec<u8>]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), String> {
-    let mut block = Vec::new();
+/// tamanho) seguido do descritor, alinhada a 16 bytes num bloco primário de
+/// 256 KB, com a cópia a +0x40000 (o bloco seguinte); uma entrada que não
+/// cabe no resto do bloco vai para o começo do próximo bloco primário, como
+/// o GetSecurityIdFromSecurityDescriptorUnsafe (ntfs.sys 0xe0290, 0xe051b).
+/// O $SII tem uma entrada por SecurityId e o $SDH uma por hash e
+/// SecurityId (colação COLLATION_NTOFS_SECURITY_HASH: o hash e depois o
+/// SecurityId), ambas com o cabeçalho como dados, cada uma já em ordem.
+fn secure_streams(descriptors: &[Vec<u8>]) -> (Vec<u8>, Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    let mut sds: Vec<u8> = Vec::new();
+    let mut end = 0usize;
     let mut sii = Vec::new();
     let mut sdh = Vec::new();
     for (index, descriptor) in descriptors.iter().enumerate() {
         let id = SECURITY_ID + index as u32;
         let hash = security_hash(descriptor);
-        let offset = block.len().next_multiple_of(16);
-        block.resize(offset, 0);
+        let length = 20 + descriptor.len();
+        let mut offset = end.next_multiple_of(16);
+        if SDS_MIRROR - (offset & (SDS_MIRROR - 1)) < length.next_multiple_of(16) + 0x14 {
+            offset = (offset & !(SDS_MIRROR - 1)) + 2 * SDS_MIRROR;
+        }
         let mut header = vec![0u8; 20];
         put32(&mut header, 0, hash);
         put32(&mut header, 4, id);
         put64(&mut header, 8, offset as u64);
-        put32(&mut header, 16, (20 + descriptor.len()) as u32);
-        block.extend_from_slice(&header);
-        block.extend_from_slice(descriptor);
+        put32(&mut header, 16, length as u32);
+        let entry = [header.as_slice(), descriptor.as_slice()].concat();
+        sds.resize(sds.len().max(offset + SDS_MIRROR + length), 0);
+        sds[offset..offset + length].copy_from_slice(&entry);
+        sds[offset + SDS_MIRROR..offset + SDS_MIRROR + length].copy_from_slice(&entry);
+        end = offset + length;
         sii.push((id, view_entry(&id.to_le_bytes(), &header, &[])));
         let key = [hash.to_le_bytes(), id.to_le_bytes()].concat();
         sdh.push(((hash, id), view_entry(&key, &header, &[b'I', 0, b'I', 0])));
     }
-    if block.len() > SDS_MIRROR {
-        return Err(format!("$SDS com {} bytes nao cabe no primeiro bloco", block.len()));
-    }
     sii.sort_by_key(|(id, _)| *id);
     sdh.sort_by_key(|(key, _)| *key);
-    let mut sds = vec![0u8; SDS_MIRROR + block.len()];
-    sds[..block.len()].copy_from_slice(&block);
-    sds[SDS_MIRROR..].copy_from_slice(&block);
-    let sii = sii.into_iter().flat_map(|(_, entry)| entry).collect();
-    let sdh = sdh.into_iter().flat_map(|(_, entry)| entry).collect();
-    Ok((sds, sii, sdh))
+    let sii = sii.into_iter().map(|(_, entry)| entry).collect();
+    let sdh = sdh.into_iter().map(|(_, entry)| entry).collect();
+    (sds, sii, sdh)
 }
 
 /// Tabela de maiúsculas do l_intl.nls (o trie de três níveis da seção de
@@ -669,10 +693,12 @@ fn attribute_definitions() -> Vec<u8> {
     table
 }
 
-/// Monta a imagem com os arquivos extras `(nome no volume, bytes)` e os
-/// metadados de `nodes` e a grava em `output`; devolve o tamanho.
-pub fn build(output: &Path, extras: &[(String, Vec<u8>)], nodes: &[Node], free_space_mib: usize, extra_records: usize) -> Result<usize, String> {
-    let image = volume_image(extras, nodes, free_space_mib, extra_records, 0)?;
+/// Monta a imagem com os arquivos extras `(nome no volume, bytes)`, os
+/// metadados de `nodes` e o descritor da raiz `root` (com ele, um arquivo
+/// ou diretório sem descritor próprio herda do pai) e a grava em `output`;
+/// devolve o tamanho.
+pub fn build(output: &Path, extras: &[(String, Vec<u8>)], nodes: &[Node], root: Option<&[u8]>, free_space_mib: usize, extra_records: usize) -> Result<usize, String> {
+    let image = volume_image(extras, nodes, root, free_space_mib, extra_records, 0)?;
     write(output, &image)?;
     Ok(image.len())
 }
@@ -697,7 +723,7 @@ const DISK_SIGNATURE: u32 = 0x4F4E_5654;
 /// os arquivos extras. O setor de boot do volume leva o deslocamento da
 /// partição em HiddenSectors, como o formatador grava. Devolve o tamanho.
 pub fn build_partitioned(output: &Path, extras: &[(String, Vec<u8>)], free_space_mib: usize, extra_records: usize) -> Result<usize, String> {
-    let volume = volume_image(extras, &[], free_space_mib, extra_records, PARTITION_START_LBA as u32)?;
+    let volume = volume_image(extras, &[], None, free_space_mib, extra_records, PARTITION_START_LBA as u32)?;
     let volume_sectors = volume.len() / SECTOR;
     let mut disk = vec![0u8; (PARTITION_START_LBA + volume_sectors) * SECTOR];
     put32(&mut disk, 0x1B8, DISK_SIGNATURE);
@@ -716,10 +742,16 @@ pub fn build_partitioned(output: &Path, extras: &[(String, Vec<u8>)], free_space
     Ok(disk.len())
 }
 
-/// A imagem do volume; `hidden_sectors` é o LBA do início da partição que a
-/// contém (0 num disco sem partições). Um nome terminado em '/' é um
+/// O caminho do diretório pai, em maiúsculas (`""` para a raiz).
+fn parent_key(path: &str) -> String {
+    path.rsplit_once('/').map_or("", |(parent, _)| parent).to_uppercase()
+}
+
+/// A imagem do volume; `root` é o descritor da raiz (sem ele, o comum do
+/// volume, e nada herda) e `hidden_sectors` o LBA do início da partição que
+/// a contém (0 num disco sem partições). Um nome terminado em '/' é um
 /// diretório vazio: uma pasta da instalação sem arquivo da imagem dentro.
-fn volume_image(entries: &[(String, Vec<u8>)], nodes: &[Node], free_space_mib: usize, extra_records: usize, hidden_sectors: u32) -> Result<Vec<u8>, String> {
+fn volume_image(entries: &[(String, Vec<u8>)], nodes: &[Node], root: Option<&[u8]>, free_space_mib: usize, extra_records: usize, hidden_sectors: u32) -> Result<Vec<u8>, String> {
     let extras: Vec<&(String, Vec<u8>)> = entries.iter().filter(|(name, _)| !name.ends_with('/')).collect();
     // Diretórios intermediários dos nomes com '/' e os vazios, na ordem de
     // criação, e os diretórios dos nós (com os pais).
@@ -738,22 +770,66 @@ fn volume_image(entries: &[(String, Vec<u8>)], nodes: &[Node], free_space_mib: u
             }
         }
     }
-    // Atributos e SecurityId dos nós, pelo caminho em maiúsculas.
+    // Atributos e SecurityId dos nós, pelo caminho em maiúsculas (sem
+    // descritor próprio, `None`).
     let mut descriptors = Descriptors(vec![security_descriptor()]);
-    let mut metadata: BTreeMap<String, (u32, u32)> = BTreeMap::new();
+    let extra_names: BTreeSet<String> = extras.iter().map(|(name, _)| name.to_uppercase()).collect();
+    let mut metadata: BTreeMap<String, (u32, Option<u32>)> = BTreeMap::new();
     for node in nodes {
-        let file = extras.iter().any(|(name, _)| name.eq_ignore_ascii_case(&node.path));
+        let file = extra_names.contains(&node.path.to_uppercase());
         if file == node.directory {
             return Err(format!("no do volume sem {}: {}", if node.directory { "diretorio (e um arquivo extra)" } else { "arquivo extra" }, node.path));
         }
         let security_id = match &node.security {
-            Some(descriptor) => descriptors.id(descriptor).map_err(|error| format!("{}: {error}", node.path))?,
-            None => SECURITY_ID,
+            Some(descriptor) => Some(descriptors.id(descriptor).map_err(|error| format!("{}: {error}", node.path))?),
+            None => None,
         };
         if metadata.insert(node.path.to_uppercase(), (node.attributes & STORED_ATTRIBUTES, security_id)).is_some() {
             return Err(format!("no do volume repetido: {}", node.path));
         }
     }
+    // A raiz com o descritor dado e a herança: um diretório ou arquivo de
+    // usuário sem descritor próprio herda do diretório pai (a herança do
+    // NTFS, com o dono Administradores e o grupo SYSTEM que o
+    // SeAssignSecurity dá a um criador SYSTEM), em vez do comum do volume,
+    // que tem Todos sem herança. Os registros abaixo de 16 ficam com o
+    // comum. Sem raiz, tudo fica como antes.
+    let root_id = match root {
+        Some(descriptor) => descriptors.id(descriptor).map_err(|error| format!("raiz do volume: {error}"))?,
+        None => SECURITY_ID,
+    };
+    let mut inherited: BTreeMap<String, u32> = BTreeMap::new();
+    let mut hello_id = SECURITY_ID;
+    if let Some(root) = root.and_then(Descriptor::parse) {
+        let own: BTreeMap<String, &[u8]> = nodes.iter().filter_map(|node| node.security.as_deref().map(|security| (node.path.to_uppercase(), security))).collect();
+        let mut folders: BTreeMap<String, Descriptor> = BTreeMap::new();
+        for directory in &directories {
+            let key = directory.to_uppercase();
+            let descriptor = match own.get(&key).and_then(|bytes| Descriptor::parse(bytes)) {
+                Some(descriptor) => descriptor,
+                None => {
+                    let parent = parent_key(directory);
+                    let Some(parent) = (if parent.is_empty() { Some(&root) } else { folders.get(&parent) }) else { continue };
+                    let descriptor = descriptor::inherited(parent, true);
+                    inherited.insert(key.clone(), descriptors.id(&descriptor.to_bytes())?);
+                    descriptor
+                }
+            };
+            folders.insert(key, descriptor);
+        }
+        for (name, _) in &extras {
+            let key = name.to_uppercase();
+            if own.contains_key(&key) {
+                continue;
+            }
+            let parent = parent_key(name);
+            let Some(parent) = (if parent.is_empty() { Some(&root) } else { folders.get(&parent) }) else { continue };
+            inherited.insert(key, descriptors.id(&descriptor::inherited(parent, false).to_bytes())?);
+        }
+        hello_id = descriptors.id(&descriptor::inherited(&root, false).to_bytes())?;
+    }
+    // O SecurityId de um caminho: o do nó, o herdado ou o comum.
+    let security_id_of = |key: &str, node: Option<u32>| node.or_else(|| inherited.get(key).copied()).unwrap_or(SECURITY_ID);
     let first_extra = HELLO_RECORD + 1;
     let directory_record = |path: &str| -> u64 {
         if path.is_empty() {
@@ -790,10 +866,23 @@ fn volume_image(entries: &[(String, Vec<u8>)], nodes: &[Node], free_space_mib: u
     let upcase = upcase_table()?;
     let upcase_length = upcase.len() as u64;
     let (upcase_lcn, upcase_count) = clusters.allocate(upcase);
-    // $SDS: os descritores no primeiro bloco de 256 KB e a cópia no seguinte.
-    let (sds, sii_entries, sdh_entries) = secure_streams(&descriptors.0)?;
+    // $SDS: os descritores em blocos de 256 KB, cada um com a cópia no
+    // seguinte.
+    let (sds, sii_entries, sdh_entries) = secure_streams(&descriptors.0);
     let sds_length = sds.len();
     let (sds_lcn, sds_count) = clusters.allocate(sds);
+    // O $SDH e o $SII: residentes enquanto cabem na metade do espaço livre
+    // do registro do $Secure; senão uma B-tree com blocos INDX
+    // ($INDEX_ALLOCATION e $BITMAP com o nome do índice), como o NTFS
+    // deixa um $Secure com muitos descritores.
+    let secure_name = file_name_value(ROOT, "$Secure", VIEW_INDEX_DUPLICATE | HIDDEN_SYSTEM, 0, 0, 3)?;
+    let secure_base = [standard_information(HIDDEN_SYSTEM), file_name_attribute(secure_name), nonresident(0x80, "$SDS", vec![(Some(sds_lcn), sds_count)], sds_length as u64)];
+    let secure_room = (RECORD_SIZE - first_attribute_offset() - 8 - attributes_size(&secure_base) - 512) / 2;
+    let mut secure_indexes = index_attributes("$SDH", 0, 0x12, &sdh_entries, secure_room, &mut clusters)?;
+    secure_indexes.extend(index_attributes("$SII", 0, 0x10, &sii_entries, secure_room, &mut clusters)?);
+    // Os atributos do registro em ordem de tipo e, no mesmo tipo, de nome
+    // ($SDH antes de $SII; a ordenação é estável).
+    secure_indexes.sort_by_key(|attribute| attribute.kind);
     // ---- dados dos arquivos extras
     let mut file_runs = Vec::new();
     for (_, blob) in &extras {
@@ -821,11 +910,9 @@ fn volume_image(entries: &[(String, Vec<u8>)], nodes: &[Node], free_space_mib: u
     system_file(&mut records, &mut children, 4, ROOT, "$AttrDef", IN_USE, HIDDEN_SYSTEM, (bytes_of(attrdef_count), attribute_table_length), vec![nonresident(0x80, "", vec![(Some(attrdef_lcn), attrdef_count)], attribute_table_length)])?;
     system_file(&mut records, &mut children, 7, ROOT, "$Boot", IN_USE, HIDDEN_SYSTEM, (bytes_of(BOOT_CLUSTERS as u64), (BOOT_CLUSTERS * CLUSTER) as u64), vec![nonresident(0x80, "", vec![(Some(0), BOOT_CLUSTERS as u64)], (BOOT_CLUSTERS * CLUSTER) as u64)])?;
     system_file(&mut records, &mut children, 10, ROOT, "$UpCase", IN_USE, HIDDEN_SYSTEM, (bytes_of(upcase_count), upcase_length), vec![nonresident(0x80, "", vec![(Some(upcase_lcn), upcase_count)], upcase_length)])?;
-    system_file(&mut records, &mut children, 9, ROOT, "$Secure", VIEW_INDEX, VIEW_INDEX_DUPLICATE | HIDDEN_SYSTEM, (0, 0), vec![
-        nonresident(0x80, "$SDS", vec![(Some(sds_lcn), sds_count)], sds_length as u64),
-        resident(0x90, "$SDH", index_root_value(0, 0x12, &[sdh_entries, end_entry(None)].concat(), false)),
-        resident(0x90, "$SII", index_root_value(0, 0x10, &[sii_entries, end_entry(None)].concat(), false)),
-    ])?;
+    let mut secure_attributes = vec![nonresident(0x80, "$SDS", vec![(Some(sds_lcn), sds_count)], sds_length as u64)];
+    secure_attributes.append(&mut secure_indexes);
+    system_file(&mut records, &mut children, 9, ROOT, "$Secure", VIEW_INDEX, VIEW_INDEX_DUPLICATE | HIDDEN_SYSTEM, (0, 0), secure_attributes)?;
     // Arquivos do $Extend: índices de visão vazios.
     system_file(&mut records, &mut children, quota, EXTEND, "$Quota", VIEW_INDEX, VIEW_INDEX_DUPLICATE | HIDDEN_SYSTEM, (0, 0), vec![resident(0x90, "$O", index_root_value(0, 0x11, &end_entry(None), false)), resident(0x90, "$Q", index_root_value(0, 0x10, &end_entry(None), false))])?;
     system_file(&mut records, &mut children, object_id, EXTEND, "$ObjId", VIEW_INDEX, VIEW_INDEX_DUPLICATE | HIDDEN_SYSTEM, (0, 0), vec![resident(0x90, "$O", index_root_value(0, 0x13, &end_entry(None), false))])?;
@@ -837,7 +924,7 @@ fn volume_image(entries: &[(String, Vec<u8>)], nodes: &[Node], free_space_mib: u
     // HELLO.TXT e os arquivos extras.
     let hello = file_name_value(ROOT, HELLO_NAME, FILE_ARCHIVE, 0, HELLO_DATA.len() as u64, name_space(HELLO_NAME))?;
     children.entry(ROOT).or_default().push((HELLO_RECORD, hello.clone()));
-    records.push((HELLO_RECORD, IN_USE, vec![standard_information(0), file_name_attribute(hello), resident(0x80, "", HELLO_DATA.to_vec())]));
+    records.push((HELLO_RECORD, IN_USE, vec![standard_information_with(0, hello_id), file_name_attribute(hello), resident(0x80, "", HELLO_DATA.to_vec())]));
     for (index, (name, blob)) in extras.iter().enumerate() {
         let number = first_extra + index as u64;
         let (parent_path, leaf) = split(name);
@@ -847,10 +934,12 @@ fn volume_image(entries: &[(String, Vec<u8>)], nodes: &[Node], free_space_mib: u
             None => (resident(0x80, "", Vec::new()), 0),
         };
         // Sem nó: o $STANDARD_INFORMATION sem atributos e o arquivo no
-        // índice do pai como arquivo pronto para backup.
-        let (attributes, security_id, listed) = match metadata.get(&name.to_uppercase()) {
-            Some(&(attributes, security_id)) => (attributes, security_id, attributes),
-            None => (0, SECURITY_ID, FILE_ARCHIVE),
+        // índice do pai como arquivo pronto para backup, com o descritor
+        // herdado (ou o comum).
+        let key = name.to_uppercase();
+        let (attributes, security_id, listed) = match metadata.get(&key) {
+            Some(&(attributes, security_id)) => (attributes, security_id_of(key.as_str(), security_id), attributes),
+            None => (0, security_id_of(key.as_str(), None), FILE_ARCHIVE),
         };
         let value = file_name_value(parent, &leaf, listed, allocated, blob.len() as u64, name_space(&leaf))?;
         children.entry(parent).or_default().push((number, value.clone()));
@@ -860,7 +949,9 @@ fn volume_image(entries: &[(String, Vec<u8>)], nodes: &[Node], free_space_mib: u
     let mut directory_names = Vec::new();
     for directory in &directories {
         let (parent_path, leaf) = split(directory);
-        let (attributes, security_id) = metadata.get(&directory.to_uppercase()).copied().unwrap_or((0, SECURITY_ID));
+        let key = directory.to_uppercase();
+        let (attributes, node_security) = metadata.get(&key).copied().unwrap_or((0, None));
+        let security_id = security_id_of(key.as_str(), node_security);
         let value = file_name_value(directory_record(&parent_path), &leaf, attributes | DIRECTORY_DUPLICATE, 0, 0, name_space(&leaf))?;
         children.entry(directory_record(&parent_path)).or_default().push((directory_record(directory), value.clone()));
         directory_names.push((directory_record(directory), value, attributes, security_id));
@@ -896,7 +987,7 @@ fn volume_image(entries: &[(String, Vec<u8>)], nodes: &[Node], free_space_mib: u
     }
     let extend_base = vec![standard_information(HIDDEN_SYSTEM), file_name_attribute(extend_name)];
     let extend_index = directory_index(&sorted(EXTEND, &children), index_room(&extend_base), &mut clusters)?;
-    let root_base = vec![standard_information(0), file_name_attribute(root_name)];
+    let root_base = vec![standard_information_with(0, root_id), file_name_attribute(root_name)];
     let root_room = index_room(&root_base);
     let index_start = clusters.next;
     let provisional = directory_index(&sorted(ROOT, &children), root_room, &mut Clusters { next: index_start, writes: Vec::new() })?;
@@ -1100,7 +1191,7 @@ mod tests {
             Node { path: String::from("Users/Default/Desktop"), directory: true, attributes: 0x11, security: Some(first.clone()) },
             Node { path: String::from("Users/Default/AppData/Local"), directory: true, attributes: 0x2410, security: None },
         ];
-        let image = volume_image(&extras, &nodes, 1, 0, 0).unwrap();
+        let image = volume_image(&extras, &nodes, None, 1, 0, 0).unwrap();
         let tree = tree(&image);
         assert_eq!(tree["Users"], (DIRECTORY, 0x01, 0x101, 0x01 | DIRECTORY_DUPLICATE));
         assert_eq!(tree["Users/Default"], (DIRECTORY, 0x03, 0x102, 0x03 | DIRECTORY_DUPLICATE));
@@ -1148,7 +1239,7 @@ mod tests {
     /// Sem nós, o $Secure tem só o descritor comum, como antes.
     #[test]
     fn without_nodes_the_volume_has_one_descriptor() {
-        let image = volume_image(&[(String::from("A.TXT"), b"a".to_vec())], &[], 1, 0, 0).unwrap();
+        let image = volume_image(&[(String::from("A.TXT"), b"a".to_vec())], &[], None, 1, 0, 0).unwrap();
         let secure = attributes(&record(&image, 9));
         let (_, _, _, _, length) = secure.iter().find(|attribute| attribute.0 == 0x80).unwrap();
         assert_eq!(*length as usize, SDS_MIRROR + 20 + security_descriptor().len());
@@ -1158,9 +1249,139 @@ mod tests {
     fn nodes_must_match_the_files() {
         let extras = vec![(String::from("Users/A.TXT"), b"a".to_vec())];
         let node = |path: &str, directory: bool| Node { path: String::from(path), directory, attributes: 0, security: None };
-        assert!(volume_image(&extras, &[node("Users/B.TXT", false)], 1, 0, 0).is_err());
-        assert!(volume_image(&extras, &[node("Users/A.TXT", true)], 1, 0, 0).is_err());
-        assert!(volume_image(&extras, &[node("Users", true), node("USERS", true)], 1, 0, 0).is_err());
-        assert!(volume_image(&extras, &[Node { path: String::from("Users"), directory: true, attributes: 0, security: Some(vec![1, 0, 4]) }], 1, 0, 0).is_err());
+        assert!(volume_image(&extras, &[node("Users/B.TXT", false)], None, 1, 0, 0).is_err());
+        assert!(volume_image(&extras, &[node("Users/A.TXT", true)], None, 1, 0, 0).is_err());
+        assert!(volume_image(&extras, &[node("Users", true), node("USERS", true)], None, 1, 0, 0).is_err());
+        assert!(volume_image(&extras, &[Node { path: String::from("Users"), directory: true, attributes: 0, security: Some(vec![1, 0, 4]) }], None, 1, 0, 0).is_err());
+    }
+
+    /// As chaves de um índice do registro `record`, em ordem: a raiz
+    /// residente e, numa B-tree, cada folha antes do separador que aponta
+    /// para ela.
+    fn index_keys(image: &[u8], record: &[Read], name: &str) -> Vec<Vec<u8>> {
+        let (_, _, root, _, _) = record.iter().find(|attribute| attribute.0 == 0x90 && attribute.1 == name).unwrap();
+        let blocks = record.iter().find(|attribute| attribute.0 == 0xA0 && attribute.1 == name).and_then(|attribute| attribute.3).map(|(lcn, _)| lcn as usize * CLUSTER);
+        // (chave, VCN do filho) das entradas a partir de `at`, até a final.
+        let walk = |bytes: &[u8], mut at: usize| {
+            let mut entries = Vec::new();
+            loop {
+                let (size, key_length, flags) = (word(bytes, at + 8) as usize, word(bytes, at + 10) as usize, word(bytes, at + 12));
+                let child = (flags & 1 != 0).then(|| qword(bytes, at + size - 8));
+                let key = (flags & 2 == 0).then(|| bytes[at + 16..at + 16 + key_length].to_vec());
+                entries.push((key, child));
+                if flags & 2 != 0 {
+                    return entries;
+                }
+                at += size;
+            }
+        };
+        let block = |vcn: u64| {
+            let at = blocks.unwrap() + vcn as usize * CLUSTER;
+            let mut block = image[at..at + INDEX_BLOCK].to_vec();
+            for index in 1..=INDEX_BLOCK / SECTOR {
+                let tail = index * SECTOR - 2;
+                let original = [block[0x28 + index * 2], block[0x28 + index * 2 + 1]];
+                block[tail..tail + 2].copy_from_slice(&original);
+            }
+            assert_eq!(&block[..4], b"INDX");
+            block
+        };
+        let mut keys = Vec::new();
+        for (key, child) in walk(root.as_slice(), 16 + dword(root, 16) as usize) {
+            if let Some(vcn) = child {
+                let leaf = block(vcn);
+                keys.extend(walk(leaf.as_slice(), 0x18 + dword(&leaf, 0x18) as usize).into_iter().filter_map(|(key, _)| key));
+            }
+            keys.extend(key);
+        }
+        keys
+    }
+
+    /// Com 120 descritores além do comum, o $SII e o $SDH não cabem no
+    /// registro do $Secure: vão para blocos INDX ($INDEX_ALLOCATION e
+    /// $BITMAP com o nome do índice), com as chaves em ordem, o $SII de
+    /// 0x100 em diante, e os atributos em ordem de tipo e de nome.
+    #[test]
+    fn many_descriptors_spill_the_secure_indexes() {
+        let extras: Vec<(String, Vec<u8>)> = (0..120).map(|index| (format!("F{index:03}.TXT"), b"x".to_vec())).collect();
+        let nodes: Vec<Node> = (0..120u8).map(|index| Node { path: format!("F{index:03}.TXT"), directory: false, attributes: 0x20, security: Some(descriptor_with_owner(100 + index)) }).collect();
+        let image = volume_image(&extras, &nodes, None, 1, 0, 0).unwrap();
+        let secure = attributes(&record(&image, 9));
+        for name in ["$SII", "$SDH"] {
+            assert!(secure.iter().any(|attribute| attribute.0 == 0xA0 && attribute.1 == name && attribute.3.is_some()), "{name} sem $INDEX_ALLOCATION");
+            assert!(secure.iter().any(|attribute| attribute.0 == 0xB0 && attribute.1 == name), "{name} sem $BITMAP");
+        }
+        let order: Vec<(u32, String)> = secure.iter().map(|attribute| (attribute.0, attribute.1.clone())).collect();
+        let mut sorted = order.clone();
+        sorted.sort();
+        assert_eq!(order, sorted);
+        let sii: Vec<u32> = index_keys(&image, &secure, "$SII").iter().map(|key| dword(key, 0)).collect();
+        assert_eq!(sii, (0..121).map(|index| SECURITY_ID + index).collect::<Vec<_>>());
+        let sdh: Vec<(u32, u32)> = index_keys(&image, &secure, "$SDH").iter().map(|key| (dword(key, 0), dword(key, 4))).collect();
+        let mut expected = sdh.clone();
+        expected.sort();
+        assert_eq!(sdh.len(), 121);
+        assert_eq!(sdh, expected);
+    }
+
+    /// Com o descritor da raiz: a raiz o leva, um diretório sem nó herda
+    /// dela, um arquivo sem nó herda do diretório pai (na raiz e no
+    /// diretório herdado, o mesmo descritor de arquivo), e o HELLO.TXT
+    /// também; os registros do sistema ficam com o comum.
+    #[test]
+    fn without_a_node_files_and_directories_inherit_from_the_root() {
+        let system = descriptor::sid(5, &[18]);
+        let root = Descriptor { control: 0x1404, owner: Some(system.clone()), group: Some(system.clone()), sacl: None, dacl: Some((2, vec![descriptor::Ace::new(0, descriptor::OBJECT_INHERIT | descriptor::CONTAINER_INHERIT, 0x001F_01FF, system)])) };
+        let extras = vec![(String::from("A.TXT"), b"a".to_vec()), (String::from("Dir/B.TXT"), b"b".to_vec())];
+        let image = volume_image(&extras, &[], Some(root.to_bytes().as_slice()), 1, 0, 0).unwrap();
+        let standard = |number: u64| attributes(&record(&image, number)).into_iter().find(|attribute| attribute.0 == 0x10).map(|attribute| dword(&attribute.2, 52));
+        assert_eq!(standard(ROOT), Some(SECURITY_ID + 1));
+        assert_eq!(standard(9), Some(SECURITY_ID));
+        let tree = tree(&image);
+        assert_eq!(tree["Dir"], (DIRECTORY, 0, SECURITY_ID + 2, DIRECTORY_DUPLICATE));
+        assert_eq!(tree["A.TXT"], (IN_USE, 0, SECURITY_ID + 3, FILE_ARCHIVE));
+        assert_eq!(tree["Dir/B.TXT"], (IN_USE, 0, SECURITY_ID + 3, FILE_ARCHIVE));
+        assert_eq!(tree["HELLO.TXT"].2, SECURITY_ID + 3);
+        // O descritor herdado do arquivo no $SDS.
+        let secure = attributes(&record(&image, 9));
+        let Some((_, _, _, Some((lcn, _)), length)) = secure.iter().find(|attribute| attribute.0 == 0x80) else { panic!("$SDS ausente") };
+        let sds = &image[*lcn as usize * CLUSTER..*lcn as usize * CLUSTER + *length as usize];
+        let file = descriptor::inherited(&root, false).to_bytes();
+        let mut offset = 0;
+        let found = loop {
+            offset = usize::next_multiple_of(offset, 16);
+            if offset + 20 > SDS_MIRROR || dword(sds, offset + 16) == 0 {
+                break None;
+            }
+            let entry_length = dword(sds, offset + 16) as usize;
+            if dword(sds, offset + 4) == SECURITY_ID + 3 {
+                break Some(sds[offset + 20..offset + entry_length].to_vec());
+            }
+            offset += entry_length;
+        };
+        assert_eq!(found, Some(file));
+    }
+
+    /// Uma entrada que não cabe no resto do bloco de 256 KB do $SDS vai para
+    /// o começo do bloco primário seguinte (0x80000), com a cópia a +0x40000.
+    #[test]
+    fn sds_entries_roll_over_to_the_next_primary_block() {
+        let big: Vec<Vec<u8>> = (0..5u8).map(|index| {
+            let mut descriptor = security_descriptor();
+            descriptor[1] = index;
+            descriptor.resize(60_000, 0);
+            descriptor
+        }).collect();
+        let (sds, sii, _) = secure_streams(&big);
+        assert_eq!(sii.len(), 5);
+        let offsets: Vec<u64> = (0..5).map(|index| {
+            let entry = &sii[index];
+            qword(entry, word(entry, 0) as usize + 8)
+        }).collect();
+        assert_eq!(offsets[4], 0x80000);
+        assert!(offsets[..4].iter().all(|&offset| offset < 0x40000));
+        let last = offsets[4] as usize;
+        assert_eq!(&sds[last..last + 20], &sds[last + SDS_MIRROR..last + SDS_MIRROR + 20]);
+        assert_eq!(sds.len(), last + SDS_MIRROR + 20 + 60_000);
     }
 }

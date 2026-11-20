@@ -141,14 +141,17 @@ fn key_objects_and_security(assert: Assert) {
     // Política da hive: raiz administrada por SYSTEM, filhos herdam.
     let root = key_policy::boot_root();
     let child = key_policy::boot_child(&root);
-    assert(child.as_ref().is_ok_and(|child| child.control & 4 != 0 && child.dacl.as_ref().is_some_and(|dacl| u16::from_le_bytes([dacl[4], dacl[5]]) == 3) && child.owner == root.owner), "keypolicy: filho herda as tres ACEs da raiz");
+    // A raiz do CmpHiveRootSecurityDescriptor: seis ACEs e só
+    // SE_DACL_PRESENT.
+    assert(root.control == 0x0004 && root.dacl.as_ref().is_some_and(|dacl| u16::from_le_bytes([dacl[4], dacl[5]]) == 6), "keypolicy: raiz com as seis ACEs do CmpHiveRootSecurityDescriptor");
+    assert(child.as_ref().is_ok_and(|child| child.control & 4 != 0 && child.dacl.as_ref().is_some_and(|dacl| u16::from_le_bytes([dacl[4], dacl[5]]) == 6) && child.owner == root.owner), "keypolicy: filho herda as seis ACEs da raiz");
     assert(registry::with_node(node, |key| key.security.dacl.is_some()).unwrap_or(false), "keypolicy: no da hive com descritor herdado");
     assert(key_security::access(&root, 0, true) == Err(0xC000_0022) && key_security::access(&root, 0x20019, false) == Ok(0x20019), "keysecurity: acesso vazio negado; modo kernel concede o explicito");
     let null_dacl = Captured { control: 4, owner: root.owner.clone(), group: root.group.clone(), dacl: None, sacl: None };
     assert(key_security::access(&null_dacl, 0x200_0000, true) == Ok(0xF003F), "keysecurity: MAXIMUM_ALLOWED numa DACL nula");
     assert(matches!(key_security::create(&root, 0, true), Ok(Ok(ref created)) if created.dacl.is_some() && created.control & 4 != 0), "keysecurity: criacao herda a DACL do pai");
     let policy = key_security::access_policy(&root);
-    assert(policy.dacl.as_ref().is_some_and(|dacl| dacl.len() == 3 && dacl[2].mask == 0x20019 && !dacl[0].deny) && policy.dacl_bytes.is_some(), "keysecurity: politica de acesso a partir do descritor");
+    assert(policy.dacl.as_ref().is_some_and(|dacl| dacl.len() == 6 && dacl[2].mask == 0x20019 && !dacl[0].deny) && policy.dacl_bytes.is_some(), "keysecurity: politica de acesso a partir do descritor");
     let output = guest::alloc_bytes(0x100);
     let body = key_objects::for_handle(handle).unwrap_or(0);
     let result = key_security::query(body, 4, output, 0x100);

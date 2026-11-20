@@ -186,10 +186,40 @@ fn system_hive_from_file(assert: Assert) {
         }
     }
     assert(complete, "hive: cada valor das tabelas de semente esta na hive SYSTEM do arquivo");
-    let expected = policy::boot_child(&policy::boot_root()).ok();
-    let disk = registry::node_by_path("\\Registry\\Machine\\System\\CurrentControlSet\\Services\\disk");
-    let descriptors = [root, disk].iter().all(|node| node.and_then(|node| registry::with_node(node, |key| Captured::clone(&key.security))) == expected);
-    assert(descriptors, "hive: descritores da hive SYSTEM iguais aos da politica do kernel");
+    // Os descritores de uma instalação nova que o xtask grava
+    // (`hive_image`): a raiz da SYSTEM e, numa chave sem descritor próprio
+    // desta máquina, a forma herdada. No boot do processo inicial real o
+    // Services\disk pode levar o descritor próprio daqui (sem SID de conta).
+    let security = |node: Option<NodeId>| node.and_then(|node| registry::with_node(node, |key| Captured::clone(&key.security)));
+    let (machine_root, inherited) = fresh_install_descriptors();
+    let disk = security(registry::node_by_path("\\Registry\\Machine\\System\\CurrentControlSet\\Services\\disk"));
+    let smss = crate::ntos::init::boot_config::smss_boot();
+    let disk_ok = disk.as_ref() == Some(&inherited) || smss && disk.as_ref().is_some_and(|captured| captured.dacl.is_some() && !has_domain_sid(captured));
+    assert(security(root) == Some(machine_root) && disk_ok, "hive: raiz da SYSTEM com o descritor de uma instalacao nova e Services\\disk com a forma herdada");
+    // Cada 'sk' da SYSTEM com a contagem das chaves de arquivo que apontam
+    // para ela e sem SID de domínio. As chaves de arquivo são todas as
+    // células 'nk' da hive: da raiz pelas listas estáveis de subchaves, cada
+    // filho pelo número (CmpFindSubKeyByNumber); as voláteis não têm célula.
+    let counted = registry::with_storage(identifier, |storage| {
+        let mut counts: BTreeMap<u32, u32> = BTreeMap::new();
+        let mut every_cell = true;
+        let mut stack = alloc::vec![storage.root_cell()];
+        while let Some(nk) = stack.pop() {
+            let Some(node) = key_cells::node(storage, nk) else {
+                every_cell = false;
+                continue;
+            };
+            *counts.entry(node.security.get()).or_default() += 1;
+            for index in 0..key_cells::sub_key_count(storage, nk) as usize {
+                match key_cells::nth_subkey(storage, nk, index) {
+                    Some(child) => stack.push(child),
+                    None => every_cell = false,
+                }
+            }
+        }
+        every_cell && counts.len() >= 2 && counts.iter().all(|(&sk, &count)| crate::ntos::cm::hive::security_cells::reference_count(storage, sk) == Some(count) && crate::ntos::cm::hive::security_cells::read(storage, sk).is_ok_and(|captured| !has_domain_sid(&captured)))
+    });
+    assert(counted == Some(true), "hive: cada sk da SYSTEM com a contagem das chaves que a usam e sem SID de dominio");
     let layout = registry::with_storage(identifier, |storage| {
         let root_cell = storage.root_cell();
         let services = key_cells::find_child(storage, root_cell, "ControlSet001").and_then(|cell| key_cells::find_child(storage, cell, "Services"));
@@ -209,6 +239,66 @@ fn system_hive_from_file(assert: Assert) {
     let deleted = registry::delete_key(key as u32);
     registry::close_handle(key as u32);
     assert(deleted, "hive: exclusao da chave de teste da SYSTEM");
+}
+
+/// A raiz das hives de máquina de uma instalação nova e a forma herdada
+/// das subchaves, como o xtask as grava (`hive_image::machine_root` e
+/// `descriptor::inherited_key`): `O:BA G:SY D:PAI(A;CI;KR;;;BU)
+/// (A;CI;KA;;;BA)(A;CI;KA;;;SY)(A;CI;KA;;;CO)(A;CI;KR;;;AC)(A;CI;KR;;;RR)`
+/// e `O:BA G:SY D:AI(A;CIID;KR;;;BU)(A;CIID;KA;;;BA)(A;CIID;KA;;;SY)
+/// (A;CIIOID;KA;;;CO)(A;CIID;KR;;;AC)(A;CIID;KR;;;RR)`.
+fn fresh_install_descriptors() -> (Captured, Captured) {
+    fn sid(authority: u8, subauthorities: &[u32]) -> Vec<u8> {
+        let mut bytes = alloc::vec![1u8, subauthorities.len() as u8, 0, 0, 0, 0, 0, authority];
+        for value in subauthorities {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes
+    }
+    fn acl(aces: &[(u8, u32, &Vec<u8>)]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for &(flags, mask, sid) in aces {
+            body.extend_from_slice(&[0, flags]);
+            body.extend_from_slice(&((8 + sid.len()) as u16).to_le_bytes());
+            body.extend_from_slice(&mask.to_le_bytes());
+            body.extend_from_slice(sid);
+        }
+        let mut acl = alloc::vec![2u8, 0];
+        acl.extend_from_slice(&((8 + body.len()) as u16).to_le_bytes());
+        acl.extend_from_slice(&(aces.len() as u16).to_le_bytes());
+        acl.extend_from_slice(&[0, 0]);
+        acl.extend_from_slice(&body);
+        acl
+    }
+    let (users, administrators, system, creator, packages) = (sid(5, &[32, 545]), sid(5, &[32, 544]), sid(5, &[18]), sid(3, &[0]), sid(15, &[2, 1]));
+    let registry_read = sid(15, &[3, 1024, 1_065_365_936, 1_281_604_716, 3_511_738_428, 1_654_721_687, 432_734_479, 3_232_135_806, 4_053_264_122, 3_456_934_681]);
+    const CI: u8 = 0x02;
+    const IO: u8 = 0x08;
+    const ID: u8 = 0x10;
+    const KR: u32 = 0x2_0019;
+    const KA: u32 = 0xF_003F;
+    let root = Captured {
+        control: 0x1404,
+        owner: administrators.clone(),
+        group: system.clone(),
+        dacl: Some(acl(&[(CI, KR, &users), (CI, KA, &administrators), (CI, KA, &system), (CI, KA, &creator), (CI, KR, &packages), (CI, KR, &registry_read)])),
+        sacl: None,
+    };
+    let inherited = Captured {
+        control: 0x0404,
+        owner: administrators.clone(),
+        group: system.clone(),
+        dacl: Some(acl(&[(CI | ID, KR, &users), (CI | ID, KA, &administrators), (CI | ID, KA, &system), (CI | IO | ID, KA, &creator), (CI | ID, KR, &packages), (CI | ID, KR, &registry_read)])),
+        sacl: None,
+    };
+    (root, inherited)
+}
+
+/// Se o descritor tem um SID de domínio (S-1-5-21-…) no dono, no grupo ou
+/// na DACL.
+fn has_domain_sid(descriptor: &Captured) -> bool {
+    let found = |bytes: &[u8]| bytes.windows(12).any(|window| window[0] == 1 && window[2..12] == [0, 0, 0, 0, 0, 5, 21, 0, 0, 0]);
+    found(descriptor.owner.as_slice()) || found(descriptor.group.as_slice()) || descriptor.dacl.as_deref().is_some_and(found)
 }
 
 /// Descritor próprio: owner e group SYSTEM, DACL com SYSTEM e Everyone de

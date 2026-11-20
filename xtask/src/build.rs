@@ -419,17 +419,23 @@ pub fn build(options: &BuildOptions) -> Result<BuildOutput, String> {
     // boot do smss (o cmd.exe, o conhost.exe e as DLLs deles); as hives e o
     // espaço livre seguem os do boot comum.
     let staged_programs = if options.console_process { "smss" } else { options.initial_process.as_str() };
-    let mut ntfs_files = crate::windows_binaries::ntfs_files(&root, &kernel_pe, staged_programs)?;
-    // As hives de máquina que o kernel carrega no boot, das tabelas de
-    // semente dele.
+    let staged = crate::windows_binaries::ntfs_files(&root, &kernel_pe, staged_programs)?;
+    // A origem daqui de cada arquivo, para o descritor de segurança dele
+    // (`host_security::system_nodes`); um arquivo gerado não tem origem.
+    let mut origins: Vec<(String, Option<std::path::PathBuf>)> = staged.iter().map(|file| (file.path.clone(), file.host.clone())).collect();
+    let mut ntfs_files: Vec<(String, Vec<u8>)> = staged.into_iter().map(|file| (file.path, file.bytes)).collect();
     // O gancho de primeiro boot do `--conta-de-teste`, com os nomes do
     // samsrv.dll.mui do idioma do convidado.
     let setup_command = if options.test_account { Some(crate::test_account::setup_command(&crate::test_account::builtin_names()?)?) } else { None };
     if let Some(command) = &setup_command {
         println!("conta de teste {}: gancho de primeiro boot em SYSTEM\\Setup ({} caracteres)", crate::test_account::ACCOUNT_NAME, command.encode_utf16().count());
     }
+    // As hives de máquina que o kernel carrega no boot, das tabelas de
+    // semente dele.
     for (name, image) in crate::hive_image::machine_hives(options.initial_process == "smss", setup_command.as_deref()) {
-        ntfs_files.push((format!("Windows/System32/config/{name}"), image));
+        let path = format!("Windows/System32/config/{name}");
+        origins.push((path.clone(), None));
+        ntfs_files.push((path, image));
     }
     // No boot do smss, os perfis de usuário de uma instalação nova
     // (`user_profiles`): `\Users`, o perfil padrão e o público, com os
@@ -446,11 +452,18 @@ pub fn build(options: &BuildOptions) -> Result<BuildOutput, String> {
         ntfs_files.extend(profiles.files);
         nodes = profiles.nodes;
     }
+    // Os descritores de segurança dos arquivos do Windows desta máquina
+    // (sem SID de conta), a raiz com o de System32 e, no boot do smss, as
+    // pastas vazias de uma instalação nova que a cadeia usa. Os perfis
+    // ficam com os nós deles.
+    let security = crate::host_security::system_nodes(&origins, &nodes, options.initial_process == "smss");
+    println!("descritores dos arquivos do Windows no volume NTFS: {} nos ({} pastas), raiz {}", security.nodes.len(), security.nodes.iter().filter(|node| node.directory).count(), if security.root.is_some() { "com o descritor de System32" } else { "com o descritor comum" });
+    nodes.extend(security.nodes);
     // O boot do smss cria o arquivo de paginação do `PagingFiles` (192 MB a
     // 256 MB em D:): o volume dele tem espaço livre para o arquivo crescer
     // até o máximo.
     let free_space_mib = if options.initial_process == "smss" { SMSS_FREE_SPACE_MIB } else { 32 };
-    let ntfs_bytes = crate::ntfs_image::build(&ntfs_path, &ntfs_files, &nodes, free_space_mib, 256)?;
+    let ntfs_bytes = crate::ntfs_image::build(&ntfs_path, &ntfs_files, &nodes, security.root.as_deref(), free_space_mib, 256)?;
     // O disco do controlador NVMe do QEMU, particionado, com um volume NTFS
     // próprio: montado em todo build (a opção de carga `--storage=nvme`
     // não muda as imagens), ligado só às máquinas com a opção.

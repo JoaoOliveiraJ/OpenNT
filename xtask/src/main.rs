@@ -66,6 +66,7 @@ mod fonts;
 mod heap_census;
 mod hive_image;
 mod host_language;
+mod host_security;
 mod kernel_pe;
 mod log_summary;
 mod logon_screen;

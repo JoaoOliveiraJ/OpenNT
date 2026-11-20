@@ -1007,10 +1007,31 @@ fn vgk_source(root: &Path) -> Option<PathBuf> {
     std::env::var_os("OPENNT_VGK_SYS").map(PathBuf::from).or_else(|| Some(root.join("vgk.sys"))).filter(|path| path.is_file())
 }
 
+/// Um arquivo do volume NTFS: o caminho no volume, os bytes e o arquivo
+/// desta máquina de onde veio, cujo descritor de segurança o volume leva
+/// (`host_security::system_nodes`); `None` para um arquivo gerado (o PE do
+/// kernel) ou de fora do Windows (o vgk.sys), que herda do pai no volume.
+pub struct Staged {
+    pub path: String,
+    pub bytes: Vec<u8>,
+    pub host: Option<PathBuf>,
+}
+
+impl Staged {
+    fn copied(path: String, bytes: Vec<u8>, host: &Path) -> Staged {
+        Staged { path, bytes, host: Some(host.to_path_buf()) }
+    }
+
+    fn generated(path: String, bytes: Vec<u8>) -> Staged {
+        Staged { path, bytes, host: None }
+    }
+}
+
 /// Arquivos do volume NTFS que existem nesta máquina, mais o PE do kernel
 /// gerado (`NTOSKRNL.EXE` e o caminho canônico em System32) e, com
-/// `initial_process == "smss"`, os programas de [`SMSS_PROGRAMS`].
-pub fn ntfs_files(root: &Path, kernel_pe: &[u8], initial_process: &str) -> Result<Vec<(String, Vec<u8>)>, String> {
+/// `initial_process == "smss"`, os programas de [`SMSS_PROGRAMS`]; cada um
+/// com a origem daqui ([`Staged`]).
+pub fn ntfs_files(root: &Path, kernel_pe: &[u8], initial_process: &str) -> Result<Vec<Staged>, String> {
     let windows = windows_directory();
     let mut files = Vec::new();
     let mut present = 0;
@@ -1020,7 +1041,7 @@ pub fn ntfs_files(root: &Path, kernel_pe: &[u8], initial_process: &str) -> Resul
             println!("AVISO: {} ausente no Windows desta maquina", source.display());
             continue;
         }
-        files.push((String::from(*name), fs::read(&source).map_err(|error| format!("{}: {error}", source.display()))?));
+        files.push(Staged::copied(String::from(*name), fs::read(&source).map_err(|error| format!("{}: {error}", source.display()))?, &source));
         present += 1;
     }
     println!("binarios do Windows no volume NTFS: {present} de {}", NTFS_FILES.len());
@@ -1028,7 +1049,7 @@ pub fn ntfs_files(root: &Path, kernel_pe: &[u8], initial_process: &str) -> Resul
         Some(source) => {
             let bytes = fs::read(&source).map_err(|error| format!("{}: {error}", source.display()))?;
             println!("VGK.SYS no volume NTFS ({} bytes)", bytes.len());
-            files.push((String::from("VGK.SYS"), bytes));
+            files.push(Staged::generated(String::from("VGK.SYS"), bytes));
         }
         None => println!("AVISO: vgk.sys ausente (OPENNT_VGK_SYS ou vgk.sys na raiz) — volume sem o vgk"),
     }
@@ -1051,7 +1072,7 @@ pub fn ntfs_files(root: &Path, kernel_pe: &[u8], initial_process: &str) -> Resul
     let mut nls = 0;
     for (name, source) in tables {
         if let Ok(bytes) = fs::read(&source) {
-            files.push((name, bytes));
+            files.push(Staged::copied(name, bytes, &source));
             nls += 1;
         }
     }
@@ -1063,7 +1084,7 @@ pub fn ntfs_files(root: &Path, kernel_pe: &[u8], initial_process: &str) -> Resul
             match fs::read(&source) {
                 Ok(bytes) => {
                     // Na raiz, como o resto de System32 (e de System32\Drivers).
-                    files.push((name.rsplit('/').next().unwrap_or(name).to_uppercase(), bytes));
+                    files.push(Staged::copied(name.rsplit('/').next().unwrap_or(name).to_uppercase(), bytes, &source));
                     staged += 1;
                 }
                 Err(_) => println!("AVISO: {} ausente no Windows desta maquina", source.display()),
@@ -1075,7 +1096,7 @@ pub fn ntfs_files(root: &Path, kernel_pe: &[u8], initial_process: &str) -> Resul
             let source = windows.join(relative);
             match fs::read(&source) {
                 Ok(bytes) => {
-                    files.push((String::from(*name), bytes));
+                    files.push(Staged::copied(String::from(*name), bytes, &source));
                     images += 1;
                 }
                 Err(_) => println!("AVISO: {} ausente no Windows desta maquina", source.display()),
@@ -1090,14 +1111,14 @@ pub fn ntfs_files(root: &Path, kernel_pe: &[u8], initial_process: &str) -> Resul
         let mut layouts = Vec::new();
         for name in crate::host_language::keyboard_layout_files() {
             let staged_name = name.to_uppercase();
-            if files.iter().any(|(staged, _)| *staged == staged_name) {
+            if files.iter().any(|file| file.path == staged_name) {
                 layouts.push(staged_name);
                 continue;
             }
             let source = system32.join(&name);
             match fs::read(&source) {
                 Ok(bytes) => {
-                    files.push((staged_name.clone(), bytes));
+                    files.push(Staged::copied(staged_name.clone(), bytes, &source));
                     layouts.push(staged_name);
                 }
                 Err(_) => println!("AVISO: {} ausente no Windows desta maquina", source.display()),
@@ -1116,7 +1137,7 @@ pub fn ntfs_files(root: &Path, kernel_pe: &[u8], initial_process: &str) -> Resul
         for name in names {
             for (path, source) in crate::host_language::mui_files(&system32, name, &languages, &fallbacks) {
                 if let Ok(bytes) = fs::read(&source) {
-                    files.push((path, bytes));
+                    files.push(Staged::copied(path, bytes, &source));
                     resources += 1;
                 }
             }
@@ -1129,7 +1150,7 @@ pub fn ntfs_files(root: &Path, kernel_pe: &[u8], initial_process: &str) -> Resul
         let mut packages = 0;
         for (path, source) in system_resource_files(&windows, &languages, &fallbacks) {
             if let Ok(bytes) = fs::read(&source) {
-                files.push((path, bytes));
+                files.push(Staged::copied(path, bytes, &source));
                 packages += 1;
             }
         }
@@ -1140,7 +1161,7 @@ pub fn ntfs_files(root: &Path, kernel_pe: &[u8], initial_process: &str) -> Resul
         let mut assemblies = 0;
         for (path, source) in crate::side_by_side::assembly_files(&windows) {
             if let Ok(bytes) = fs::read(&source) {
-                files.push((path, bytes));
+                files.push(Staged::copied(path, bytes, &source));
                 assemblies += 1;
             }
         }
@@ -1150,7 +1171,7 @@ pub fn ntfs_files(root: &Path, kernel_pe: &[u8], initial_process: &str) -> Resul
         for (path, source) in crate::fonts::files(&windows) {
             match fs::read(&source) {
                 Ok(bytes) => {
-                    files.push((path, bytes));
+                    files.push(Staged::copied(path, bytes, &source));
                     faces += 1;
                 }
                 Err(_) => println!("AVISO: {} ausente no Windows desta maquina", source.display()),
@@ -1163,7 +1184,7 @@ pub fn ntfs_files(root: &Path, kernel_pe: &[u8], initial_process: &str) -> Resul
         for (path, source) in crate::theme::files(&windows, &languages, &fallbacks) {
             match fs::read(&source) {
                 Ok(bytes) => {
-                    files.push((path, bytes));
+                    files.push(Staged::copied(path, bytes, &source));
                     styles += 1;
                 }
                 Err(_) => println!("AVISO: {} ausente no Windows desta maquina", source.display()),
@@ -1183,15 +1204,16 @@ pub fn ntfs_files(root: &Path, kernel_pe: &[u8], initial_process: &str) -> Resul
                     continue;
                 }
                 if let Ok(bytes) = fs::read(&source) {
-                    files.push((format!("{folder}/{name}"), bytes));
+                    files.push(Staged::copied(format!("{folder}/{name}"), bytes, &source));
                     data += 1;
                 }
             }
         }
         let pictures = std::env::var("ProgramData").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("C:/ProgramData")).join("Microsoft/User Account Pictures");
         for name in USER_ACCOUNT_PICTURES {
-            if let Ok(bytes) = fs::read(pictures.join(name)) {
-                files.push((format!("ProgramData/Microsoft/User Account Pictures/{name}"), bytes));
+            let source = pictures.join(name);
+            if let Ok(bytes) = fs::read(&source) {
+                files.push(Staged::copied(format!("ProgramData/Microsoft/User Account Pictures/{name}"), bytes, &source));
                 data += 1;
             }
         }
@@ -1200,12 +1222,14 @@ pub fn ntfs_files(root: &Path, kernel_pe: &[u8], initial_process: &str) -> Resul
         // SystemData (CreateDirectoryW com o descritor dela) e grava em
         // `SystemData\S-1-5-18\ReadOnly` a imagem da tela de bloqueio reduzida
         // para a tela. Sem a pasta mãe o CreateDirectoryW falha
-        // (ERROR_PATH_NOT_FOUND) e o LogonUI fica sem a imagem.
-        files.push((String::from("ProgramData/Microsoft/Windows/"), Vec::new()));
+        // (ERROR_PATH_NOT_FOUND) e o LogonUI fica sem a imagem. O nome
+        // terminado em '/' é a pasta vazia, com o descritor da daqui.
+        let system_data_parent = std::env::var("ProgramData").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("C:/ProgramData")).join("Microsoft/Windows");
+        files.push(Staged { path: String::from("ProgramData/Microsoft/Windows/"), bytes: Vec::new(), host: system_data_parent.is_dir().then_some(system_data_parent) });
         println!("arquivos das pastas de dados da tela de logon no volume NTFS: {data}");
     }
-    files.push((String::from("NTOSKRNL.EXE"), kernel_pe.to_vec()));
-    files.push((String::from("Windows/System32/ntoskrnl.exe"), kernel_pe.to_vec()));
+    files.push(Staged::generated(String::from("NTOSKRNL.EXE"), kernel_pe.to_vec()));
+    files.push(Staged::generated(String::from("Windows/System32/ntoskrnl.exe"), kernel_pe.to_vec()));
     Ok(files)
 }
 

@@ -4060,8 +4060,9 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     0xFF — um log novo, que o LFS inicializa —, $Volume 3.1, $AttrDef com a
     tabela do ntfs.sys, $Bitmap, $Boot, $BadClus com o $Bad esparso,
     $Secure com o descritor comum e os dos nós no $SDS (cada entrada
-    alinhada a 16 bytes, com a cópia no bloco seguinte) e os índices
-    $SDH/$SII, $UpCase pelo
+    alinhada a 16 bytes num bloco de 256 KB, com a cópia no bloco seguinte;
+    a que não cabe vai para o próximo bloco primário) e os índices
+    $SDH/$SII, residentes ou em B-tree com blocos INDX, $UpCase pelo
     RtlUpcaseUnicodeChar, $Extend; 12..15 reservados), $Quota, $ObjId e
     $Reparse depois dos registros de usuário (o NTFS só aceita uma entrada de
     índice que aponte um registro abaixo de 16 na raiz), os índices $I30 nomeados e em B-tree quando não cabem no
@@ -4076,7 +4077,17 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     distinto, a partir de 0x101) e põem no volume diretórios vazios; o
     $STANDARD_INFORMATION e o $FILE_NAME guardam os atributos sem o de
     diretório, que o NTFS marca no registro (e no
-    DUP_FILE_NAME_INDEX_PRESENT).
+    DUP_FILE_NAME_INDEX_PRESENT). Os arquivos do Windows levam o
+    descritor que têm nesta máquina, sem SID de conta
+    (`xtask/src/host_security.rs`): a raiz leva o de
+    `C:\Windows\System32` (ela responde também por `C:\` e `C:\Windows`),
+    uma pasta casa com a pasta daqui pelos nomes, e um arquivo gerado (as
+    hives, o PE do kernel, o HELLO.TXT) ou uma pasta sem par herda do pai
+    com a herança do NTFS, com o dono Administradores e o grupo SYSTEM de
+    um criador SYSTEM. No boot do smss o volume leva também as pastas
+    vazias de uma instalação nova que a cadeia usa (ProgramData, o Temp, os
+    perfis de serviço, o perfil do SYSTEM, LogFiles e Logs). O kernel ainda
+    não lê esses descritores.
     O leitor do kernel lê o mesmo volume; a listagem dele esconde os
     registros abaixo de 16, como a enumeração do NTFS, e o stat soma o
     FILE_ATTRIBUTE_DIRECTORY aos atributos de um diretório.
@@ -4938,7 +4949,15 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   atividade de cada sessão (sem os `DwmInitSessionActivityId_*` desta
   máquina, `xtask/src/window_manager.rs`); a
   hive gerada põe uma chave com mais de 1012 subchaves em folhas sob uma
-  raiz 'ri' (`xtask/src/hive_image.rs`). A inicialização do LSA (o
+  raiz 'ri' (`xtask/src/hive_image.rs`), e cada chave leva o descritor de
+  uma instalação nova: a raiz da SOFTWARE, da SYSTEM e da SAM com
+  Usuários, Administradores, SYSTEM, CREATOR OWNER, ALL APPLICATION
+  PACKAGES e a capacidade registryRead (na DEFAULT, os dois últimos só na
+  raiz; a SECURITY só com SYSTEM e Administradores), as subchaves na
+  forma herdada e, no boot do smss, o descritor próprio desta máquina das
+  chaves que o têm protegido ou com ACEs explícitas (sem SID de conta),
+  uma célula 'sk' por descritor distinto. A raiz do Registro do kernel
+  (`cm/key/policy.rs`) é o CmpHiveRootSecurityDescriptor. A inicialização do LSA (o
   LsapInitLsa e o LsapStartLsa do lsasrv) pede ainda: o
   NtQueryInformationProcess das classes ProcessWow64Information (0) e
   ProcessProtectionInformation (o PS_PROTECTION do EPROCESS); os alarmes de

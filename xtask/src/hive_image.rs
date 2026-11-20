@@ -22,15 +22,29 @@
 //!   sob uma raiz 'ri';
 //!   'vk' com o nome comprimido (VALUE_COMP_NAME) e até 4 bytes de dado no
 //!   próprio campo (bit 31 do tamanho); acima de 16344 bytes, 'db';
-//! - uma célula 'sk' (lista circular dela mesma) com o descritor de todas
-//!   as chaves e a contagem delas.
+//! - uma célula 'sk' por descritor distinto, com a contagem das chaves que
+//!   o usam, numa lista circular que começa na célula da raiz: cada célula
+//!   nova entra logo depois da célula do pai da primeira chave que a usa
+//!   (CmpInsertSecurityCellList, 0x69e850).
 //!
-//! O descritor é o que a política do kernel dá às chaves criadas no boot
-//! sob `\Registry\Machine` (`cm/key/policy.rs`): as ACEs da raiz do
-//! Registro herdadas (INHERITED_ACE | CONTAINER_INHERIT_ACE) — SYSTEM e
-//! Administrators com KEY_ALL_ACCESS, Everyone com KEY_READ —, owner e
-//! group SYSTEM e control SE_DACL_AUTO_INHERITED | SE_DACL_PRESENT. O
-//! autoteste da hive confere que o kernel atribui o mesmo descritor.
+//! Os descritores são os de uma instalação nova (`HiveSecurity`):
+//! - a raiz da SOFTWARE, da SYSTEM e da SAM é
+//!   `O:BA G:SY D:PAI(A;CI;KR;;;BU)(A;CI;KA;;;BA)(A;CI;KA;;;SY)(A;CI;KA;;;CO)(A;CI;KR;;;AC)(A;CI;KR;;;RR)`
+//!   (RR é a capacidade registryRead); a da DEFAULT, a mesma com o AC e o RR
+//!   sem herança; a da SECURITY, SYSTEM com KEY_ALL_ACCESS e Administradores
+//!   com READ_CONTROL | WRITE_DAC, protegida;
+//! - uma subchave herda do pai, na forma das chaves de uma instalação nova
+//!   (`D:AI(A;CIID;KR;;;BU)…(A;CIIOID;KA;;;CO)…`, dono Administradores e
+//!   grupo SYSTEM);
+//! - no boot do processo inicial real, uma chave que existe nesta máquina
+//!   com um descritor protegido ou com ACEs explícitas leva esse descritor,
+//!   sem os SIDs de conta (as chaves de serviço com as ACEs do SID do
+//!   serviço, de LocalService e de NetworkService; as do TrustedInstaller
+//!   com leitura só para SYSTEM e Administradores).
+//!
+//! Com o AC (ALL APPLICATION PACKAGES) e o RR, um token LowBox lê o HKLM
+//! (as chaves já passam pela checagem de acesso no modo usuário); um token
+//! sem BUILTIN\Users perde a leitura, como no 19041.
 
 #[allow(dead_code)]
 mod cm {
@@ -70,6 +84,8 @@ mod cm {
 
 use std::collections::BTreeMap;
 
+use crate::host_security::descriptor::{self, Ace, Descriptor};
+
 const HBLOCK: usize = 0x1000;
 const HBIN_HEADER: usize = 0x20;
 const NIL: u32 = 0xFFFF_FFFF;
@@ -80,43 +96,128 @@ const BIG_SEGMENT: usize = 0x3fd8;
 const MAX_LEAF: usize = 1012;
 const SPLIT_LEAF: usize = MAX_LEAF / 2;
 
-/// SID S-1-5-18 (SYSTEM).
-const SYSTEM_SID: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0];
-/// (mask, SID) das ACEs da raiz: SYSTEM e Administrators com KEY_ALL_ACCESS
-/// e Everyone com KEY_READ.
-const ACES: [(u32, &[u8]); 3] = [(0xF003F, &SYSTEM_SID), (0xF003F, &[1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 32, 2, 0, 0]), (0x20019, &[1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0])];
+/// KEY_READ e KEY_ALL_ACCESS; READ_CONTROL | WRITE_DAC.
+const KEY_READ: u32 = 0x0002_0019;
+const KEY_ALL_ACCESS: u32 = 0x000F_003F;
+const READ_CONTROL_WRITE_DAC: u32 = 0x0006_0000;
 
-/// SECURITY_DESCRIPTOR_RELATIVE: cabeçalho, DACL, owner e group (a ordem do
-/// kernel em `cm/hive/security_cells.rs`).
-fn descriptor(control: u16, ace_flags: u8) -> Vec<u8> {
-    let mut acl = Vec::new();
-    for (mask, sid) in ACES {
-        let size = 8 + sid.len();
-        acl.push(0);
-        acl.push(ace_flags);
-        acl.extend_from_slice(&(size as u16).to_le_bytes());
-        acl.extend_from_slice(&mask.to_le_bytes());
-        acl.extend_from_slice(sid);
+/// SYSTEM, Administradores, Usuários, CREATOR OWNER, ALL APPLICATION
+/// PACKAGES e a capacidade registryRead (S-1-15-3-1024-…, o SHA-256 de
+/// "REGISTRYREAD" do RtlDeriveCapabilitySidsFromName).
+fn system() -> Vec<u8> {
+    descriptor::sid(5, &[18])
+}
+fn administrators() -> Vec<u8> {
+    descriptor::sid(5, &[32, 544])
+}
+fn users() -> Vec<u8> {
+    descriptor::sid(5, &[32, 545])
+}
+fn creator_owner() -> Vec<u8> {
+    descriptor::sid(3, &[0])
+}
+fn all_application_packages() -> Vec<u8> {
+    descriptor::sid(15, &[2, 1])
+}
+fn registry_read() -> Vec<u8> {
+    descriptor::sid(15, &[3, 1024, 1_065_365_936, 1_281_604_716, 3_511_738_428, 1_654_721_687, 432_734_479, 3_232_135_806, 4_053_264_122, 3_456_934_681])
+}
+
+/// A raiz de uma hive de máquina de uma instalação nova:
+/// `O:BA G:SY D:PAI(A;CI;KR;;;BU)(A;CI;KA;;;BA)(A;CI;KA;;;SY)(A;CI;KA;;;CO)(A;CI;KR;;;AC)(A;CI;KR;;;RR)`.
+/// Na DEFAULT (`packages_inherit` falso) o AC e o RR valem só para a raiz.
+fn machine_root(packages_inherit: bool) -> Descriptor {
+    const CI: u8 = descriptor::CONTAINER_INHERIT;
+    let packages = if packages_inherit { CI } else { 0 };
+    let aces = vec![
+        Ace::new(0, CI, KEY_READ, users()),
+        Ace::new(0, CI, KEY_ALL_ACCESS, administrators()),
+        Ace::new(0, CI, KEY_ALL_ACCESS, system()),
+        Ace::new(0, CI, KEY_ALL_ACCESS, creator_owner()),
+        Ace::new(0, packages, KEY_READ, all_application_packages()),
+        Ace::new(0, packages, KEY_READ, registry_read()),
+    ];
+    Descriptor { control: descriptor::SELF_RELATIVE | descriptor::DACL_PROTECTED | descriptor::DACL_AUTO_INHERITED | descriptor::DACL_PRESENT, owner: Some(administrators()), group: Some(system()), sacl: None, dacl: Some((2, aces)) }
+}
+
+/// A raiz da SECURITY: SYSTEM com KEY_ALL_ACCESS e Administradores com
+/// READ_CONTROL | WRITE_DAC, protegida (o padrão conhecido; a hive desta
+/// máquina não se lê sem elevação).
+fn security_root() -> Descriptor {
+    const CI: u8 = descriptor::CONTAINER_INHERIT;
+    let aces = vec![Ace::new(0, CI, KEY_ALL_ACCESS, system()), Ace::new(0, CI, READ_CONTROL_WRITE_DAC, administrators())];
+    Descriptor { control: descriptor::SELF_RELATIVE | descriptor::DACL_PROTECTED | descriptor::DACL_PRESENT, owner: Some(system()), group: Some(system()), sacl: None, dacl: Some((2, aces)) }
+}
+
+/// Onde uma hive do convidado está nesta máquina, para os descritores
+/// próprios das chaves no boot do processo inicial real.
+#[derive(Clone, Copy)]
+enum HostHive {
+    System,
+    Software,
+    Default,
+}
+
+/// Os descritores das chaves de uma hive: o da raiz e, no boot do processo
+/// inicial real, a hive desta máquina de onde vêm os descritores próprios.
+struct HiveSecurity {
+    root: Descriptor,
+    host: Option<HostHive>,
+}
+
+/// O descritor próprio desta máquina da chave `path` (relativa à raiz da
+/// hive), sem os SIDs de conta: só quando é protegido ou tem ACEs
+/// explícitas; os outros herdam do pai no convidado.
+#[cfg(windows)]
+fn host_key_descriptor(hive: HostHive, path: &str) -> Option<Descriptor> {
+    use crate::host_language::registry;
+    let control_set = format!("ControlSet{:03}", cm::seed::CURRENT_CONTROL_SET);
+    let (root, host) = match hive {
+        HostHive::System => match path.split_once('\\') {
+            Some((first, rest)) if first.eq_ignore_ascii_case(&control_set) => (registry::LOCAL_MACHINE, format!("SYSTEM\\CurrentControlSet\\{rest}")),
+            _ if path.eq_ignore_ascii_case(&control_set) => (registry::LOCAL_MACHINE, String::from("SYSTEM\\CurrentControlSet")),
+            _ => (registry::LOCAL_MACHINE, format!("SYSTEM\\{path}")),
+        },
+        HostHive::Software => (registry::LOCAL_MACHINE, format!("SOFTWARE\\{path}")),
+        HostHive::Default => (registry::USERS, format!(".DEFAULT\\{path}")),
+    };
+    let mut own = Descriptor::parse(&crate::host_security::key_security_of(root, &host)?)?;
+    if own.dacl.is_none() || !(own.dacl_protected() || own.has_explicit_aces()) {
+        return None;
     }
-    let mut header = vec![2u8, 0];
-    header.extend_from_slice(&((8 + acl.len()) as u16).to_le_bytes());
-    header.extend_from_slice(&(ACES.len() as u16).to_le_bytes());
-    header.extend_from_slice(&[0, 0]);
-    header.extend_from_slice(&acl);
-    let acl = header;
-    let mut bytes = vec![0u8; 20];
-    bytes[0] = 1;
-    bytes[2..4].copy_from_slice(&(control | 0x8000).to_le_bytes());
-    let dacl = bytes.len() as u32;
-    bytes.extend_from_slice(&acl);
-    let owner = bytes.len() as u32;
-    bytes.extend_from_slice(&SYSTEM_SID);
-    let group = bytes.len() as u32;
-    bytes.extend_from_slice(&SYSTEM_SID);
-    bytes[4..8].copy_from_slice(&owner.to_le_bytes());
-    bytes[8..12].copy_from_slice(&group.to_le_bytes());
-    bytes[16..20].copy_from_slice(&dacl.to_le_bytes());
-    bytes
+    own.remove_accounts();
+    Some(own)
+}
+
+#[cfg(not(windows))]
+fn host_key_descriptor(_hive: HostHive, _path: &str) -> Option<Descriptor> {
+    None
+}
+
+/// O descritor de cada chave (no índice de `keys`), em pré-ordem: a raiz,
+/// o próprio desta máquina ou o herdado do pai.
+fn key_descriptors(keys: &[Key], security: &HiveSecurity) -> Vec<Vec<u8>> {
+    let mut descriptors: Vec<Option<Descriptor>> = vec![None; keys.len()];
+    let mut stack = vec![(0usize, None::<usize>, String::new())];
+    while let Some((index, parent, path)) = stack.pop() {
+        let descriptor = match parent {
+            None => security.root.clone(),
+            Some(parent) => {
+                let own = security.host.and_then(|hive| host_key_descriptor(hive, &path));
+                match (own, &descriptors[parent]) {
+                    (Some(own), _) => own,
+                    (None, Some(parent)) => descriptor::inherited_key(parent),
+                    (None, None) => security.root.clone(),
+                }
+            }
+        };
+        descriptors[index] = Some(descriptor);
+        for &child in keys[index].children.values() {
+            let child_path = if path.is_empty() { keys[child].name.clone() } else { format!("{path}\\{}", keys[child].name) };
+            stack.push((child, Some(index), child_path));
+        }
+    }
+    descriptors.into_iter().map(|descriptor| descriptor.map(|descriptor| descriptor.to_bytes()).unwrap_or_default()).collect()
 }
 
 /// Uma chave da árvore a gravar.
@@ -198,6 +299,11 @@ impl Bins {
     fn put64(&mut self, cell: u32, offset: usize, value: u64) {
         self.put(cell, offset, &value.to_le_bytes());
     }
+
+    fn get32(&self, cell: u32, offset: usize) -> u32 {
+        let at = cell as usize + 4 + offset;
+        u32::from_le_bytes(self.data[at..at + 4].try_into().unwrap())
+    }
 }
 
 fn compressed(name: &str) -> Vec<u8> {
@@ -226,11 +332,15 @@ fn data_cell(bins: &mut Bins, data: &[u8]) -> u32 {
     big
 }
 
-/// Grava a árvore (a primeira chave é a raiz) e devolve o arquivo inteiro.
-fn write_hive(keys: &[Key], time: u64, file_name: &str) -> Vec<u8> {
+/// Grava a árvore (a primeira chave é a raiz), com o descritor
+/// autorrelativo de cada chave em `security` (no índice de `keys`), e
+/// devolve o arquivo inteiro.
+fn write_hive(keys: &[Key], security: &[Vec<u8>], time: u64, file_name: &str) -> Vec<u8> {
     let mut bins = Bins { data: Vec::new(), bin_start: 0 };
-    let shared = descriptor(0x0404, 0x12);
     let mut cells = vec![NIL; keys.len()];
+    // A 'sk' de cada chave e, por descritor distinto, a célula e a contagem.
+    let mut key_sk = vec![NIL; keys.len()];
+    let mut sks: BTreeMap<&[u8], (u32, u32)> = BTreeMap::new();
     // Pré-ordem com o pai de cada chave.
     let mut order = Vec::new();
     let mut stack = vec![(0usize, None::<usize>)];
@@ -240,7 +350,6 @@ fn write_hive(keys: &[Key], time: u64, file_name: &str) -> Vec<u8> {
             stack.push((child, Some(index)));
         }
     }
-    let mut sk = NIL;
     for &(index, parent) in &order {
         let key = &keys[index];
         let name = compressed(&key.name);
@@ -264,18 +373,38 @@ fn write_hive(keys: &[Key], time: u64, file_name: &str) -> Vec<u8> {
         bins.put32(cell, 0x40, key.values.iter().map(|(_, _, data)| data.len() as u32).max().unwrap_or(0));
         bins.put16(cell, 0x48, name.len() as u16);
         bins.put(cell, 0x4c, &name);
-        // Segurança: uma 'sk' só, criada com a raiz (lista circular dela
-        // mesma), com a contagem de todas as chaves.
-        if sk == NIL {
-            sk = bins.cell(0x14 + shared.len());
-            bins.put(sk, 0, b"sk");
-            bins.put32(sk, 4, sk);
-            bins.put32(sk, 8, sk);
-            bins.put32(sk, 0x10, shared.len() as u32);
-            bins.put(sk, 0x14, &shared);
-        }
-        let count = u32::from_le_bytes(bins.data[sk as usize + 4 + 0xc..sk as usize + 4 + 0x10].try_into().unwrap());
-        bins.put32(sk, 0xc, count + 1);
+        // Segurança: a 'sk' do descritor da chave, se já existe, com mais
+        // uma referência; senão uma célula nova, na lista circular logo
+        // depois da 'sk' do pai (a da raiz aponta para si mesma).
+        let descriptor = security[index].as_slice();
+        let sk = match sks.get_mut(descriptor) {
+            Some((sk, count)) => {
+                *count += 1;
+                *sk
+            }
+            None => {
+                let sk = bins.cell(0x14 + descriptor.len());
+                bins.put(sk, 0, b"sk");
+                bins.put32(sk, 0x10, descriptor.len() as u32);
+                bins.put(sk, 0x14, descriptor);
+                match parent.map(|parent| key_sk[parent]) {
+                    Some(anchor) if anchor != NIL => {
+                        let next = bins.get32(anchor, 4);
+                        bins.put32(sk, 4, next);
+                        bins.put32(sk, 8, anchor);
+                        bins.put32(anchor, 4, sk);
+                        bins.put32(next, 8, sk);
+                    }
+                    _ => {
+                        bins.put32(sk, 4, sk);
+                        bins.put32(sk, 8, sk);
+                    }
+                }
+                sks.insert(descriptor, (sk, 1));
+                sk
+            }
+        };
+        key_sk[index] = sk;
         bins.put32(cell, 0x2c, sk);
         if !key.values.is_empty() {
             let list = bins.cell(key.values.len() * 4);
@@ -301,6 +430,10 @@ fn write_hive(keys: &[Key], time: u64, file_name: &str) -> Vec<u8> {
                 bins.put32(list, position * 4, value);
             }
         }
+    }
+    // A contagem de cada 'sk': as chaves que a usam.
+    for &(sk, count) in sks.values() {
+        bins.put32(sk, 0xc, count);
     }
     // Listas 'lh', com as células dos filhos já conhecidas; acima de
     // MAX_LEAF subchaves, folhas 'lh' sob uma raiz 'ri'.
@@ -378,8 +511,8 @@ fn now_filetime() -> u64 {
 }
 
 /// Uma hive com as chaves das tabelas de semente (caminhos relativos à
-/// raiz, que se chama ROOT).
-fn hive_from_seeds(seeds: Vec<cm::seed::SeedKey>, file_name: &str) -> Vec<u8> {
+/// raiz, que se chama ROOT) e os descritores de `security`.
+fn hive_from_seeds(seeds: Vec<cm::seed::SeedKey>, file_name: &str, security: &HiveSecurity) -> Vec<u8> {
     let mut keys = vec![Key { name: String::from("ROOT"), values: Vec::new(), children: BTreeMap::new(), link: false }];
     for seed in seeds {
         let mut current = 0;
@@ -404,7 +537,8 @@ fn hive_from_seeds(seeds: Vec<cm::seed::SeedKey>, file_name: &str) -> Vec<u8> {
             }
         }
     }
-    write_hive(&keys, now_filetime(), file_name)
+    let descriptors = key_descriptors(&keys, security);
+    write_hive(&keys, &descriptors, now_filetime(), file_name)
 }
 
 /// Uma chave copiada desta máquina como chave de semente.
@@ -464,19 +598,24 @@ pub fn machine_hives(smss_boot: bool, setup_command: Option<&str>) -> Vec<(&'sta
             system.extend(crate::test_account::system_keys(command).into_iter().map(seed_of));
         }
     }
-    let hives: [(&'static str, Vec<cm::seed::SeedKey>); 5] = [
-        ("SYSTEM", system),
-        ("SOFTWARE", software),
-        ("SAM", cm::seed::sam_keys()),
-        ("SECURITY", cm::seed::security_keys()),
-        ("DEFAULT", default),
+    // Os descritores: as raízes de uma instalação nova e, no boot do
+    // processo inicial real, os descritores próprios das chaves desta
+    // máquina (a SAM e a SECURITY não se leem sem elevação).
+    let host = |hive: HostHive| smss_boot.then_some(hive);
+    let hives: [(&'static str, Vec<cm::seed::SeedKey>, HiveSecurity); 5] = [
+        ("SYSTEM", system, HiveSecurity { root: machine_root(true), host: host(HostHive::System) }),
+        ("SOFTWARE", software, HiveSecurity { root: machine_root(true), host: host(HostHive::Software) }),
+        ("SAM", cm::seed::sam_keys(), HiveSecurity { root: machine_root(true), host: None }),
+        ("SECURITY", cm::seed::security_keys(), HiveSecurity { root: security_root(), host: None }),
+        ("DEFAULT", default, HiveSecurity { root: machine_root(false), host: host(HostHive::Default) }),
     ];
-    hives.into_iter().map(|(name, seeds)| (name, hive_from_seeds(seeds, &format!("\\SystemRoot\\System32\\config\\{name}")))).collect()
+    hives.into_iter().map(|(name, seeds, security)| (name, hive_from_seeds(seeds, &format!("\\SystemRoot\\System32\\config\\{name}"), &security))).collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{cm, hive_from_seeds, seed_of, HBLOCK, MAX_LEAF, SPLIT_LEAF};
+    use super::{cm, hive_from_seeds, machine_root, seed_of, HiveSecurity, HBLOCK, MAX_LEAF, SPLIT_LEAF};
+    use crate::host_security::descriptor::{self, Descriptor};
 
     fn u16_at(bytes: &[u8], offset: usize) -> u16 {
         u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap())
@@ -498,13 +637,71 @@ mod tests {
         String::from_utf8(hive[at + 0x4c..at + 0x4c + length].to_vec()).unwrap()
     }
 
+    /// Os descritores de uma hive de máquina sem os desta máquina.
+    fn plain() -> HiveSecurity {
+        HiveSecurity { root: machine_root(true), host: None }
+    }
+
+    /// A 'nk' da subchave `child` de `parent` (lista 'lh').
+    fn child(hive: &[u8], parent: u32, child: &str) -> u32 {
+        let list = cell(u32_at(hive, cell(parent) + 0x1c));
+        assert_eq!(&hive[list..list + 2], b"lh");
+        (0..u16_at(hive, list + 2) as usize).map(|entry| u32_at(hive, list + 4 + entry * 8)).find(|&nk| name(hive, nk).eq_ignore_ascii_case(child)).expect(child)
+    }
+
+    /// O descritor da 'sk' de uma 'nk'.
+    fn key_descriptor(hive: &[u8], nk: u32) -> Descriptor {
+        let sk = cell(u32_at(hive, cell(nk) + 0x2c));
+        assert_eq!(&hive[sk..sk + 2], b"sk");
+        let length = u32_at(hive, sk + 0x10) as usize;
+        Descriptor::parse(&hive[sk + 0x14..sk + 0x14 + length]).unwrap()
+    }
+
+    /// Cada descritor distinto numa 'sk', com a contagem das chaves que o
+    /// usam e a lista circular a partir da 'sk' da raiz; a raiz com o
+    /// descritor de uma instalação nova e os filhos na forma herdada, e
+    /// nenhum SID de conta.
+    #[test]
+    fn keys_get_the_fresh_install_descriptors_in_shared_cells() {
+        let seeds: Vec<cm::seed::SeedKey> = ["Services\\disk", "Services\\Tcpip\\Parameters", "Control"].iter().map(|path| cm::seed::SeedKey::new(path)).collect();
+        let hive = hive_from_seeds(seeds, "TEST", &plain());
+        let root = u32_at(&hive, 0x24);
+        assert_eq!(key_descriptor(&hive, root), machine_root(true));
+        let services = child(&hive, root, "Services");
+        let disk = child(&hive, services, "disk");
+        let inherited = descriptor::inherited_key(&machine_root(true));
+        assert_eq!(key_descriptor(&hive, disk), inherited);
+        assert_eq!(inherited.control, 0x8404);
+        // Duas 'sk' (a da raiz e a herdada), em lista circular, com as
+        // contagens 1 e 5 (Services, disk, Tcpip, Parameters e Control).
+        let root_sk = u32_at(&hive, cell(root) + 0x2c);
+        let child_sk = u32_at(&hive, cell(disk) + 0x2c);
+        assert_ne!(root_sk, child_sk);
+        assert_eq!(u32_at(&hive, cell(services) + 0x2c), child_sk);
+        assert_eq!((u32_at(&hive, cell(root_sk) + 4), u32_at(&hive, cell(root_sk) + 8)), (child_sk, child_sk));
+        assert_eq!((u32_at(&hive, cell(child_sk) + 4), u32_at(&hive, cell(child_sk) + 8)), (root_sk, root_sk));
+        assert_eq!((u32_at(&hive, cell(root_sk) + 0xc), u32_at(&hive, cell(child_sk) + 0xc)), (1, 5));
+        for descriptor in [key_descriptor(&hive, root), key_descriptor(&hive, disk)] {
+            assert!(descriptor.sids().all(|sid| !descriptor::is_account(sid)));
+        }
+    }
+
+    /// A raiz da DEFAULT dá aos filhos só Usuários, Administradores, SYSTEM
+    /// e CREATOR OWNER: o AC e o RR valem só para a raiz.
+    #[test]
+    fn default_hive_packages_do_not_inherit() {
+        let child = descriptor::inherited_key(&machine_root(false));
+        let sids: Vec<Vec<u8>> = child.dacl.unwrap().1.into_iter().filter_map(|ace| ace.sid).collect();
+        assert_eq!(sids, vec![descriptor::sid(5, &[32, 545]), descriptor::sid(5, &[32, 544]), descriptor::sid(5, &[18]), descriptor::sid(3, &[0])]);
+    }
+
     /// Uma chave com mais subchaves que uma folha leva uma raiz 'ri' com
     /// folhas 'lh' em ordem, como o CmpAddSubKeyEx deixa depois de dividir.
     #[test]
     fn many_subkeys_go_under_an_index_root() {
         let total = MAX_LEAF + 100;
         let seeds: Vec<cm::seed::SeedKey> = (0..total).map(|number| cm::seed::SeedKey::new(&format!("Many\\Key{number:05}"))).collect();
-        let hive = hive_from_seeds(seeds, "TEST");
+        let hive = hive_from_seeds(seeds, "TEST", &plain());
         let root = u32_at(&hive, 0x24);
         let many = u32_at(&hive, cell(u32_at(&hive, cell(root) + 0x1c)) + 4);
         assert_eq!(name(&hive, many), "Many");
@@ -555,7 +752,7 @@ mod tests {
         // Os outros boots não levam o estado de setup.
         assert!(seeded(&cm::seed::system_keys(false), "Setup", "SetupType").is_none());
         assert!(seeded(&cm::seed::software_keys(false), "Microsoft\\Windows NT\\CurrentVersion\\Notifications\\Data", "41960B29A3BC0C75").is_none());
-        let hive = hive_from_seeds(software, "SOFTWARE");
+        let hive = hive_from_seeds(software, "SOFTWARE", &plain());
         assert_eq!(&hive[..4], b"regf");
     }
 
@@ -573,6 +770,6 @@ mod tests {
         for (name, expected) in [("SystemSetupInProgress", 0), ("OOBEInProgress", 0), ("SetupPhase", 0), ("RestartSetup", 0), ("SetupSupported", 1)] {
             assert_eq!(seeded(&system, "Setup", name).map(|(kind, data)| (kind, data.to_vec())), Some(dword(expected)), "Setup\\{name}");
         }
-        assert_eq!(&hive_from_seeds(system, "SYSTEM")[..4], b"regf");
+        assert_eq!(&hive_from_seeds(system, "SYSTEM", &plain())[..4], b"regf");
     }
 }
