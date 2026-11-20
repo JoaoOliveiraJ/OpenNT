@@ -491,12 +491,27 @@ pub fn tick(minimum_priority: i32) {
     let (mut steps, mut slices) = (0, 0);
     let user_slices = |slices: usize| minimum_priority < 0 && slices < USER_SLICES_PER_TICK && user_threads::can_dispatch();
     // As threads de usuário paradas cuja espera já concluiu entram na fila
-    // antes da seleção, mesmo quando nenhuma delas está pronta.
-    if minimum_priority < 0 {
-        user_threads::refresh_waiting();
-    }
-    // A sondagem do começo do tick acabou de rodar.
+    // antes da seleção, mesmo quando nenhuma delas está pronta. Pelo
+    // despacho, que também roda os pumps (ALPC, fábricas de workers, pacotes
+    // de espera, E/S de dispositivo) e os fins de processo adiados: eles
+    // andam a cada tique mesmo sem thread de usuário pronta (a criação
+    // adiada de um worker, o pedido a um servidor de kernel, a nova
+    // tentativa de uma fábrica), e não só depois de um intervalo.
     let mut repolled = true;
+    if minimum_priority < 0 {
+        if user_slices(slices) {
+            match user_threads::dispatch_one() {
+                Ok(Dispatched::Ran { .. }) => {
+                    slices += 1;
+                    repolled = false;
+                }
+                Ok(Dispatched::Idle) => {}
+                Err(error) => debug_print!("[sched] despacho de usuario falhou: {}", error),
+            }
+        } else {
+            user_threads::refresh_waiting();
+        }
+    }
     while steps < budget || user_slices(slices) {
         let selected = refresh_waiting_threads().and_then(|_| thread_dispatch::peek());
         let (thread, owner) = match selected {

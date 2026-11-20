@@ -1059,7 +1059,10 @@ carrega a raiz do processo dela. A sondagem vai pela prioridade e, na mesma
 prioridade, pelo processo: sem PCID nem páginas globais, cada carga de CR3
 esvazia o TLB, também o do kernel; um NtDelayExecution já sondado se decide
 sem o contexto da thread (o alerta e as APCs são conferidos pelo ponteiro
-dela). O tique sonda no começo e, quando um intervalo deixa a fila vazia,
+dela). O tique começa pelo `dispatch_one`, então os pumps e os fins de
+processo adiados andam a cada tique mesmo sem thread de usuário pronta (a
+criação adiada de um worker de uma fábrica, a nova tentativa dela, o pedido
+a um servidor de kernel); quando um intervalo deixa a fila vazia, ele
 chama o `dispatch_one` de novo, que sonda uma vez e já dá o intervalo à
 thread que o anterior acordou (um envio e espera ALPC, a resposta adiada de
 uma fábrica, o KeSetEvent de uma thread de kernel), como o KiUnwaitThread
