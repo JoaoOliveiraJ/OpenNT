@@ -5640,9 +5640,14 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
 
 - **Autotestes no QEMU** ficam em `ntos/test/` e rodam conforme
   `--kernel-test-scope`. A suíte completa:
-  `cargo xtask test-boot PHASE3_SELFTEST_OK 240000 --kernel-test-scope=all --smp=4 --expect=PHASE4_SELFTEST_OK ... --expect=PHASE6_SELFTEST_OK --expect=MULTIPROCESS_OK --expect=PHASE7_SELFTEST_OK --expect=KBDTEST_OK --expect=SELFTEST_OK`
+  `cargo xtask test-boot PHASE3_SELFTEST_OK 900000 --kernel-test-scope=all --smp=4 --expect=PHASE4_SELFTEST_OK --expect=PHASE5_SELFTEST_OK --expect=XSTATE_KERNEL_OK --expect=TIME_KEEPING_OK --expect=PHASE6_SELFTEST_OK --expect=MULTIPROCESS_OK --expect=XSTATE_USER_OK --expect=TIME_USER_OK --expect=PIPES_OK --expect=LPC_PORTS_OK --expect=PHASE7_SELFTEST_OK --expect=KBDTEST_OK --expect=SELFTEST_OK`
   (os `--expect` são procurados em ordem, cada um depois do anterior: o
-  `MULTIPROCESS_OK` sai dentro da fase 7, antes do `PHASE7_SELFTEST_OK`).
+  estado estendido e a hora saem dentro da fase 6, antes do
+  `PHASE6_SELFTEST_OK`; o `MULTIPROCESS_OK`, o estado estendido e a hora em
+  modo usuário, os pipes e as portas LPC, dentro da fase 7, antes do
+  `PHASE7_SELFTEST_OK`). Um sub-teste que deixa de ser chamado some da serial
+  e reprova a suíte; por isso os testes `pipes`, `lpc`, `relogio` e `xstate`
+  são `coberto_pela_suite`.
 - **Validação inteira**: `cargo xtask test-all` (`xtask/src/test_all/`) roda
   a suíte completa com 4 CPUs e com 1 (`suite-smp4`, `suite-smp1`, prazo de
   900 s) e todo `[[teste]]` de `docs/status/components.toml`, cujo `comando`

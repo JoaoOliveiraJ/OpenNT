@@ -13,15 +13,26 @@ const COMPONENTS: &str = "docs/status/components.toml";
 /// Os valores da chave `acelerador` de um `[[teste]]`.
 pub const ACCELERATORS: &[&str] = &["tcg", "whpx"];
 
-/// A suíte completa de autoteste, rodada com 4 CPUs e com 1 (`--smp`).
+/// A suíte completa de autoteste, rodada com 4 CPUs e com 1 (`--smp`). As
+/// saídas esperadas seguem a ordem das fontes: na fase 6, o estado estendido
+/// e a hora antes do PHASE6; na fase 7, depois do processo de usuário, o
+/// estado estendido e a hora em modo usuário, os pipes e as portas LPC antes
+/// do PHASE7. Cada marcador conferido aqui é um sub-teste que não pode sair
+/// da suíte sem ela falhar.
 pub const SUITE: &[&str] = &[
     "PHASE3_SELFTEST_OK",
     "900000",
     "--kernel-test-scope=all",
     "--expect=PHASE4_SELFTEST_OK",
     "--expect=PHASE5_SELFTEST_OK",
+    "--expect=XSTATE_KERNEL_OK",
+    "--expect=TIME_KEEPING_OK",
     "--expect=PHASE6_SELFTEST_OK",
     "--expect=MULTIPROCESS_OK",
+    "--expect=XSTATE_USER_OK",
+    "--expect=TIME_USER_OK",
+    "--expect=PIPES_OK",
+    "--expect=LPC_PORTS_OK",
     "--expect=PHASE7_SELFTEST_OK",
     "--expect=KBDTEST_OK",
     "--expect=SELFTEST_OK",
