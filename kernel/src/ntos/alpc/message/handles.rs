@@ -16,9 +16,10 @@ use crate::ntos::ob::objects::port::Port;
 use crate::ntos::ob::{handle_table, object_access, object_manager};
 use crate::ntos::ob::handles::process as process_handles;
 use crate::ntos::ps::process;
+use crate::ntos::ps::user::state;
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::alpc::message::buffer::read_field;
-use crate::ntos::inc::types::{AlpcHandleAttr, AlpcHandleAttr32, NtStruct};
+use crate::ntos::inc::types::{AlpcHandleAttr, AlpcHandleAttr32, AlpcMessageAttributes, NtStruct};
 use core::mem::offset_of;
 
 /// Códigos ALPC são máscaras por espécie, não índices dinâmicos de OBJECT_TYPE.
@@ -262,6 +263,98 @@ fn capture_entries(descriptors: &[Descriptor], mode: u8) -> Result<Result<Arc<Ha
         }
     }
     Ok(Ok(Arc::new(HandleData { entries: SpinLock::new(entries), released: SpinLock::new(false) })))
+}
+
+/// ALPC_PORFLG_ALLOW_DUP_OBJECT e ALPC_PORFLG_ALLOW_MULTIHANDLE_ATTRIBUTE.
+const ALLOW_DUP_OBJECT: u32 = 0x8_0000;
+const ALLOW_MULTIHANDLE_ATTRIBUTE: u32 = 0x200_0000;
+/// ALPC_HANDLEFLG_INDIRECT: os handles se pedem um a um pela classe 3.
+const HANDLE_INDIRECT: u32 = 0x4_0000;
+
+/// O ALPC_HANDLE_ATTR que a recepção publica.
+pub enum Exposed {
+    /// Nada: a porta não aceita handles (sem ALLOW_DUP_OBJECT), a mensagem
+    /// leva mais de um sem ALLOW_MULTIHANDLE_ATTRIBUTE ou a duplicação
+    /// falhou; os handles saem com a mensagem.
+    Nothing,
+    /// {Flags INDIRECT, Handle 0, ObjectType = o número de handles}: os
+    /// handles ficam com a mensagem, e quem recebeu pede cada um pela
+    /// classe 3.
+    Indirect([u8; 24]),
+    /// O único handle, já duplicado no dono da porta, com o tipo e o acesso
+    /// concedido; a mensagem não guarda mais os handles.
+    Duplicated([u8; 24]),
+}
+
+/// AlpcpExposeHandleAttribute: o ALPC_HANDLE_ATTR de recepção pelas regras
+/// da porta `port` (a que recebe, ou a de comunicação ligada ao cliente
+/// quando o servidor recebe pela porta de conexão).
+pub fn expose(handles: &HandleData, port: &Arc<Port>, mode: u8) -> Exposed {
+    let flags = port.with(|state| state.port_flags);
+    if flags & ALLOW_DUP_OBJECT == 0 {
+        return Exposed::Nothing;
+    }
+    let entries = handles.entries.lock();
+    let mut bytes = [0u8; 24];
+    let put32 = |bytes: &mut [u8; 24], offset: usize, value: u32| bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    if flags & ALLOW_MULTIHANDLE_ATTRIBUTE != 0 {
+        put32(&mut bytes, offset_of!(AlpcHandleAttr, flags), HANDLE_INDIRECT);
+        put32(&mut bytes, offset_of!(AlpcHandleAttr, object_type), entries.len() as u32);
+        return Exposed::Indirect(bytes);
+    }
+    if entries.len() != 1 {
+        return Exposed::Nothing;
+    }
+    let Some(duplicated) = duplicate(&entries[0], port, mode).ok().and_then(Result::ok) else { return Exposed::Nothing };
+    // HANDLE de 64 bits: o de kernel (bit 31) estende o sinal.
+    let handle = offset_of!(AlpcHandleAttr, handle);
+    bytes[handle..handle + 8].copy_from_slice(&(duplicated.handle as i32 as u64).to_le_bytes());
+    put32(&mut bytes, offset_of!(AlpcHandleAttr, object_type), duplicated.object_type);
+    put32(&mut bytes, offset_of!(AlpcHandleAttr, desired_access), duplicated.granted);
+    Exposed::Duplicated(bytes)
+}
+
+/// ALPC_MESSAGE_HANDLE_ATTRIBUTE.
+const HANDLE_ATTRIBUTE: u32 = 0x1000_0000;
+
+/// A recepção de uma mensagem com handles (o AlpcpExposeAttributes de quem
+/// recebe): com o ALPC_MESSAGE_HANDLE_ATTRIBUTE alocado em `attributes`, o
+/// ALPC_HANDLE_ATTR de [`expose`] pelas regras de `port` e o bit no
+/// ValidAttributes. Devolve os handles quando eles ficam com a mensagem (a
+/// forma indireta, que quem recebeu pede um a um pela classe 3); nos outros
+/// casos eles saem aqui. Uma exposição sem atributo não falha a recepção; só
+/// a escrita no buffer de atributos falha.
+pub fn deliver(handles: Arc<HandleData>, port: &Arc<Port>, attributes: u64, mode: u8) -> Result<Option<Arc<HandleData>>, u32> {
+    let allocated = attributes != 0 && state::user_struct::<AlpcMessageAttributes>(attributes).and_then(|header| header.allocated_attributes.probe_get()).is_ok_and(|allocated| allocated & HANDLE_ATTRIBUTE != 0);
+    let (bytes, retained) = match allocated.then(|| expose(&handles, port, mode)) {
+        Some(Exposed::Indirect(bytes)) => (bytes, true),
+        Some(Exposed::Duplicated(bytes)) => (bytes, false),
+        Some(Exposed::Nothing) | None => {
+            handles.release();
+            return Ok(None);
+        }
+    };
+    let published = (|| -> Result<(), u32> {
+        let at = crate::ntos::ps::user::alpc::attribute_address(attributes, HANDLE_ATTRIBUTE);
+        if !message_buffer::writable(at, AlpcHandleAttr::SIZE, mode) {
+            return Err(0xC000_0005);
+        }
+        message_buffer::write_block(at, &bytes)?;
+        let header = state::user_struct::<AlpcMessageAttributes>(attributes).map_err(|error| error.status)?;
+        let valid = header.valid_attributes.probe_get().map_err(|error| error.status)?;
+        header.valid_attributes.probe_set(valid | HANDLE_ATTRIBUTE).map_err(|error| error.status)
+    })();
+    match published {
+        Ok(()) if retained => Ok(Some(handles)),
+        Ok(()) => {
+            handles.release();
+            Ok(None)
+        }
+        Err(status) => {
+            handles.release();
+            Err(status)
+        }
+    }
 }
 
 /// Handle duplicado na tabela do dono da porta.

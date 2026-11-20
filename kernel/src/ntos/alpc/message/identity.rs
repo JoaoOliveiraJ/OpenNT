@@ -54,6 +54,9 @@ pub struct IdentityState {
     /// A vista que a resposta de um servidor de modo usuário trouxe, até o
     /// cliente receber a resposta.
     pub reply_view: Option<Arc<crate::ntos::alpc::message::view::Carried>>,
+    /// Os handles que a resposta de um servidor de modo usuário trouxe, até
+    /// o cliente recebê-la (a recepção os expõe ou os passa a `handles`).
+    pub reply_handles: Option<Arc<crate::ntos::alpc::message::handles::HandleData>>,
     /// A resposta de um servidor de modo usuário veio sem
     /// ALPC_MSGFLG_RELEASE_MESSAGE, até o cliente recebê-la.
     pub continuation: bool,
@@ -265,8 +268,12 @@ pub fn dereference(identity: &Arc<Identity>, borrowed: bool) -> Result<(), Kerne
     let Some(remaining) = remaining else { return Err(KernelError::new("ALPC message reference underflow")) };
     if remaining == 0 {
         clear_attributes(identity);
-        // A vista de uma resposta nunca recebida.
-        drop(identity.with(|state| state.reply_view.take()));
+        // A vista e os handles de uma resposta nunca recebida.
+        let (view, handles) = identity.with(|state| (state.reply_view.take(), state.reply_handles.take()));
+        drop(view);
+        if let Some(handles) = handles {
+            handles.release();
+        }
     }
     if borrowed {
         let _ = crate::ntos::ob::objects::dispatcher::dereference(identity.port.pointer);

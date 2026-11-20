@@ -5407,6 +5407,19 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     handles e a classe 3 do NtAlpcQueryInformationMessage para cada um), o
     ALPC_TOKEN_ATTR e as classes de token pelo token do contexto, e o
     NtAlpcImpersonateClientOfPort impersona o token capturado no contexto;
+  - os handles da resposta também chegam ao cliente (o AlpcpCaptureAttributes
+    roda nas respostas, e o AlpcpExposeHandleAttribute na porta do
+    cliente): o atributo de handles do envio do servidor é capturado do
+    processo dele e fica com a resposta até o cliente recebê-la. Com
+    ALLOW_MULTIHANDLE_ATTRIBUTE (a porta de cliente do rpcrt4, Flags
+    0x2090000) a recepção traz {INDIRECT, Handle 0, ObjectType = o número de
+    handles} e a mensagem continua resolvível pelo MessageId: a classe 3 do
+    NtAlpcQueryInformationMessage duplica cada handle no cliente, até o
+    reenvio da resposta sem flags e sem atributos (o DropMsgAttributes do
+    rpcrt4) ou o fechamento da porta. Só com ALLOW_DUP_OBJECT a recepção
+    traz o único handle já duplicado no cliente, e a mensagem sai. É o
+    `[system_handle]` do RPC: o UMgrLogonUser do UserManager devolve assim
+    o token do logon ao winlogon;
   - todo pedido sem RELEASE_MESSAGE chega com LPC_CONTINUATION_REQUIRED
     (os assíncronos também), e a desconexão ou o fechamento da porta de
     comunicação pelo servidor termina com STATUS_PORT_DISCONNECTED os

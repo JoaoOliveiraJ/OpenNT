@@ -15,7 +15,7 @@ use super::{events, state};
 use crate::ntos::alpc::cancel_message::{self, Selection};
 use crate::ntos::alpc::kernel_entry::{self, Completed, Pending};
 use crate::ntos::alpc::message::buffer::{self as message_buffer, Buffer};
-use crate::ntos::alpc::message::identity::{self as message_identity, Identity};
+use crate::ntos::alpc::message::identity::{self as message_identity, Identity, Retained};
 use crate::ntos::alpc::small::{context_attribute, direct_event, wake_policy};
 use crate::ntos::alpc::transport::{JobResult, Message, Reply, Request, RequestState, Sender};
 use crate::ntos::alpc::{kernel_wait, legacy_service, port_reference};
@@ -401,6 +401,10 @@ pub fn cleanup_transport(connection: &Arc<Port>) {
     let pending = connection.with(|state| core::mem::take(&mut state.pending));
     for message in pending {
         let _ = message_identity::release(&message.identity);
+    }
+    let retained = connection.with(|state| core::mem::take(&mut state.retained_replies));
+    for identity in retained.values() {
+        let _ = message_identity::release(identity);
     }
     let requests = connection.with(|state| core::mem::take(&mut state.jobs));
     for request in requests {
@@ -966,10 +970,27 @@ fn send(port: &Arc<Port>, flags: u32, input: u64, send_attributes: u64, mode: u8
     // reenvio de uma resposta recebida com o atributo de vista UNMAP_EXISTING
     // solta a vista que ela trouxe (o DropMsgAttributes do RPC).
     if reserve_id != 0 && reserve_id & 0x8000_0000 == 0 {
+        // O reenvio de uma resposta recebida que guardava os handles (o
+        // DropMsgAttributes do RPC, sem flags e sem atributos): a mensagem sai,
+        // com os handles que a classe 3 não pediu.
+        let dropped = if flags & 0x3_0000 == 0 {
+            port.with(|state| match state.retained_replies.get(&reserve_id) {
+                Some(identity) if callback == 0 || callback == identity.callback => state.retained_replies.remove(&reserve_id),
+                _ => None,
+            })
+        } else {
+            None
+        };
+        if let Some(identity) = &dropped {
+            message_identity::release(identity)?;
+        }
         if valid & message_view::VIEW_ATTRIBUTE != 0 && flags & 0x3_0000 == 0 {
             if let Some(status) = message_view::release_received(port, reserve_id, attribute_address(send_attributes, message_view::VIEW_ATTRIBUTE), mode)? {
                 return Ok(if status == 0 { Ok(None) } else { Err(status) });
             }
+        }
+        if dropped.is_some() {
+            return Ok(Ok(None));
         }
         // A resposta a uma mensagem que o servidor mandou a esta porta (o
         // callback): volta a quem a mandou.
@@ -1215,8 +1236,31 @@ impl Receiver {
                 Err(status) => published = Err(status),
             }
         }
+        // Os handles da resposta, pelas regras desta porta (o
+        // AlpcpExposeHandleAttribute do AlpcpExposeAttributes): na forma
+        // indireta (ALLOW_MULTIHANDLE_ATTRIBUTE, a porta de cliente do RPC)
+        // eles ficam com a mensagem, que continua resolvível pelo MessageId
+        // para a classe 3 até o DropMsgAttributes do RPC; senão saem aqui.
+        let mut retained = false;
+        if let Some(handles) = identity.with(|state| state.reply_handles.take()) {
+            if published.is_err() {
+                handles.release();
+            } else {
+                match message_handles::deliver(handles, port, self.receive_attributes, self.mode) {
+                    Ok(Some(handles)) => {
+                        identity.with(|state| state.handles = Some(handles));
+                        port.with(|state| state.retained_replies.insert(identity.identifier, identity.clone()));
+                        retained = true;
+                    }
+                    Ok(None) => {}
+                    Err(status) => published = Err(status),
+                }
+            }
+        }
         take(port);
-        message_identity::release(&identity)?;
+        if !retained {
+            message_identity::release(&identity)?;
+        }
         Ok(Some(published.err().unwrap_or(0)))
     }
 
@@ -1482,7 +1526,7 @@ fn begin_kernel_exchange(arguments: &[u64; 8]) -> Result<Box<dyn Pending>, Kerne
     if port.kind == "alpc" && crate::ntos::alpc::server::owns(&port) {
         // O despacho NT ignora os bits baixos das flags (o contrato LPC de
         // kernel só vem do LpcRequestPort e do LpcSendWaitReceivePort).
-        let pending = port.run(|| crate::ntos::alpc::server::begin_kernel_exchange(&port, arguments[1] as u32 & 0xFFFF_0000, arguments[2], receive));
+        let pending = port.run(|| crate::ntos::alpc::server::begin_kernel_exchange(&port, arguments[1] as u32 & 0xFFFF_0000, arguments[2], arguments[3], receive));
         let _ = reference.release();
         return pending;
     }

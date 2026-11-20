@@ -144,6 +144,11 @@ pub struct PortState {
     /// é também um pedido, que o cliente responde uma vez pelo mesmo
     /// MessageId.
     pub answerable: BTreeMap<u32, u32>,
+    /// As respostas recebidas cujos handles ficaram com a mensagem (a forma
+    /// indireta do atributo de handles), pelo MessageId: a classe 3 do
+    /// NtAlpcQueryInformationMessage ainda as acha, até o reenvio do
+    /// MessageId sem pedido (o DropMsgAttributes do RPC) ou o fechamento.
+    pub retained_replies: BTreeMap<u32, Arc<crate::ntos::alpc::message::identity::Identity>>,
     pub owned_security_contexts: Vec<Arc<ContextRecord>>,
     pub pending: Vec<Message>,
     pub jobs: Vec<Arc<Request>>,

@@ -83,7 +83,7 @@ fn port_at(port_object: u64) -> Option<Arc<Port>> {
 fn exchange(port: &Arc<Port>, flags: u32, input: u64, receive: ReceiveArguments) -> Result<u32, KernelError> {
     let pending: alloc::boxed::Box<dyn Pending> = port.run(|| -> Result<alloc::boxed::Box<dyn Pending>, KernelError> {
         if port.kind == "alpc" && crate::ntos::alpc::server::owns(port) {
-            return crate::ntos::alpc::server::begin_kernel_exchange(port, flags, input, receive);
+            return crate::ntos::alpc::server::begin_kernel_exchange(port, flags, input, 0, receive);
         }
         Ok(match transport::exchange_messages(port, flags, input, 0, receive, 0)? {
             Exchange::Status(status) => alloc::boxed::Box::new(Completed(status)),

@@ -91,10 +91,10 @@ use crate::ntos::alpc::rpc_trace::{self, Direction, Record};
 use crate::ntos::alpc::small::context_attribute;
 use crate::ntos::alpc::transport::{self, Job, JobResult, Listener, Reply, Request, Sender, Service};
 use crate::ntos::inc::field::NtStruct;
-use crate::ntos::alpc::message::handles::HandleData;
+use crate::ntos::alpc::message::handles::{self as message_handles, HandleData};
 use crate::ntos::alpc::message::identity::Retained;
 use crate::ntos::alpc::security_contexts::Borrowed;
-use crate::ntos::inc::types::{AlpcDataViewAttr, AlpcHandleAttr, AlpcMessageAttributes, AlpcPortAttributes, AlpcSecurityAttr, ObjectAttributes, PortMessage};
+use crate::ntos::inc::types::{AlpcDataViewAttr, AlpcMessageAttributes, AlpcPortAttributes, AlpcSecurityAttr, ObjectAttributes, PortMessage};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::ob::object_manager;
 use crate::ntos::ob::objects::port::{self as port_objects, Port, PortState, Role};
@@ -156,11 +156,6 @@ const TOKEN_ATTRIBUTE: u32 = 0x0800_0000;
 /// ALPC_MESSAGE_SECURITY_ATTRIBUTE e ALPC_MESSAGE_HANDLE_ATTRIBUTE.
 const SECURITY_ATTRIBUTE: u32 = 0x8000_0000;
 const HANDLE_ATTRIBUTE: u32 = 0x1000_0000;
-/// ALPC_PORFLG_ALLOW_DUP_OBJECT e ALPC_PORFLG_ALLOW_MULTIHANDLE_ATTRIBUTE.
-const ALLOW_DUP_OBJECT: u32 = 0x8_0000;
-const ALLOW_MULTIHANDLE_ATTRIBUTE: u32 = 0x200_0000;
-/// ALPC_HANDLEFLG_INDIRECT: os handles se pedem um a um pela classe 3.
-const HANDLE_INDIRECT: u32 = 0x4_0000;
 /// O maior PORT_MESSAGE de uma porta ALPC.
 const MAXIMUM_MESSAGE_LENGTH: u64 = 0xFFFF;
 /// OBJ_INHERIT e OBJ_KERNEL_HANDLE não valem para um handle de usuário.
@@ -329,11 +324,32 @@ struct Requeue {
     owner: Arc<Port>,
 }
 
+/// Os handles que uma resposta leva (o atributo de handles do envio do
+/// servidor, capturado como o AlpcpCaptureAttributes faz também nas
+/// respostas), até o cliente recebê-la; uma resposta que ninguém recebe os
+/// solta com ela.
+struct ReplyHandles(SpinLock<Option<Arc<HandleData>>>);
+
+impl Default for ReplyHandles {
+    fn default() -> Self {
+        Self(SpinLock::new(None))
+    }
+}
+
+impl Drop for ReplyHandles {
+    fn drop(&mut self) {
+        if let Some(handles) = self.0.lock().take() {
+            handles.release();
+        }
+    }
+}
+
 /// A resposta de um pedido, preenchida quando o servidor responde, com a
-/// vista de dados que ela leva.
+/// vista de dados e os handles que ela leva.
 struct ReplyCell {
     result: SpinLock<Option<JobResult>>,
     view: SpinLock<Option<Arc<message_view::Carried>>>,
+    handles: ReplyHandles,
     /// O servidor respondeu sem ALPC_MSGFLG_RELEASE_MESSAGE.
     continuation: core::sync::atomic::AtomicBool,
     requeue: Option<Requeue>,
@@ -341,7 +357,7 @@ struct ReplyCell {
 
 impl Default for ReplyCell {
     fn default() -> Self {
-        Self { result: SpinLock::new(None), view: SpinLock::new(None), continuation: core::sync::atomic::AtomicBool::new(false), requeue: None }
+        Self { result: SpinLock::new(None), view: SpinLock::new(None), handles: ReplyHandles::default(), continuation: core::sync::atomic::AtomicBool::new(false), requeue: None }
     }
 }
 
@@ -521,8 +537,8 @@ fn refuse(connection: &PendingConnection) {
 }
 
 /// A continuação do pedido de um cliente: conclui quando o servidor responde;
-/// a vista que a resposta leva fica com a identidade do pedido até o cliente
-/// receber a resposta.
+/// a vista e os handles que a resposta leva ficam com a identidade do pedido
+/// até o cliente receber a resposta.
 struct ReplyJob {
     slot: ReplySlot,
     identity: Arc<Identity>,
@@ -533,6 +549,19 @@ impl Job for ReplyJob {
         let result = self.slot.result.lock().take()?;
         if let Some(view) = self.slot.view.lock().take() {
             self.identity.with(|state| state.reply_view = Some(view));
+        }
+        // A identidade que já saiu de todo não guarda mais nada.
+        if let Some(handles) = self.slot.handles.0.lock().take() {
+            let orphan = self.identity.with(|state| {
+                if state.references == 0 {
+                    return Some(handles);
+                }
+                state.reply_handles = Some(handles);
+                None
+            });
+            if let Some(handles) = orphan {
+                handles.release();
+            }
         }
         if self.slot.continuation.load(core::sync::atomic::Ordering::Acquire) {
             self.identity.with(|state| state.continuation = true);
@@ -708,8 +737,11 @@ fn publish_attributes(attributes: u64, delivery: &Delivery, sequence: u32, view:
         attribute.context_handle.probe_set(security.handle()).map_err(|error| error.status)?;
         valid |= SECURITY_ATTRIBUTE;
     }
-    if let Some(handles) = delivery.attributes.handles.as_ref().filter(|_| allocated & HANDLE_ATTRIBUTE != 0) {
-        if let Some(bytes) = expose_handles(handles, delivery.link_port.as_ref()) {
+    // O ALPC_HANDLE_ATTR pelas regras da porta de comunicação ligada ao
+    // cliente (`message_handles::expose`); na forma indireta o servidor pede
+    // cada handle pela classe 3 ([`received_handles`]).
+    if let Some((handles, link_port)) = delivery.attributes.handles.as_ref().zip(delivery.link_port.as_ref()).filter(|_| allocated & HANDLE_ATTRIBUTE != 0) {
+        if let message_handles::Exposed::Indirect(bytes) | message_handles::Exposed::Duplicated(bytes) = message_handles::expose(handles, link_port, 1) {
             let at = crate::ntos::ps::user::alpc::attribute_address(attributes, HANDLE_ATTRIBUTE);
             guest::try_write_bytes(at, &bytes).map_err(|_| STATUS_ACCESS_VIOLATION)?;
             valid |= HANDLE_ATTRIBUTE;
@@ -745,36 +777,6 @@ fn publish_attributes(attributes: u64, delivery: &Delivery, sequence: u32, view:
         valid |= VIEW_ATTRIBUTE;
     }
     header.valid_attributes.probe_set(valid).map_err(|error| error.status)
-}
-
-/// O ALPC_HANDLE_ATTR de recepção (AlpcpExposeHandleAttribute), pelas regras
-/// da porta de comunicação ligada ao cliente: sem ALLOW_DUP_OBJECT nada sai;
-/// com ALLOW_MULTIHANDLE_ATTRIBUTE, {Flags INDIRECT, Handle 0, ObjectType = o
-/// número de handles}, e o servidor pede cada um pela classe 3; senão um
-/// handle só, já duplicado no servidor, com o tipo e o acesso concedido.
-fn expose_handles(handles: &HandleData, link_port: Option<&Arc<Port>>) -> Option<[u8; 24]> {
-    let port = link_port?;
-    let flags = port.with(|state| state.port_flags);
-    if flags & ALLOW_DUP_OBJECT == 0 {
-        return None;
-    }
-    let entries = handles.entries.lock();
-    let mut bytes = [0u8; 24];
-    let put32 = |bytes: &mut [u8; 24], offset: usize, value: u32| bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-    if flags & ALLOW_MULTIHANDLE_ATTRIBUTE != 0 {
-        put32(&mut bytes, offset_of!(AlpcHandleAttr, flags), HANDLE_INDIRECT);
-        put32(&mut bytes, offset_of!(AlpcHandleAttr, object_type), entries.len() as u32);
-        return Some(bytes);
-    }
-    if entries.len() != 1 {
-        return None;
-    }
-    let duplicated = crate::ntos::alpc::message::handles::duplicate(&entries[0], port, 1).ok()?.ok()?;
-    let handle = offset_of!(AlpcHandleAttr, handle);
-    bytes[handle..handle + 8].copy_from_slice(&(duplicated.handle as u64).to_le_bytes());
-    put32(&mut bytes, offset_of!(AlpcHandleAttr, object_type), duplicated.object_type);
-    put32(&mut bytes, offset_of!(AlpcHandleAttr, desired_access), duplicated.granted);
-    Some(bytes)
 }
 
 /// O que a recepção faz além de entregar a mensagem.
@@ -950,6 +952,13 @@ fn send_reply(server: &UserServer, port: &Arc<Port>, input: u64, attributes: u64
         Ok(captured) => captured,
         Err(status) => return status,
     };
+    // O atributo de handles da resposta (o token do UMgrLogonUser do
+    // UserManager, um [system_handle] do RPC); uma captura recusada recusa o
+    // envio, sem concluir o pedido.
+    let handles = match capture_reply_handles(attributes, mode) {
+        Ok(handles) => handles,
+        Err(status) => return status,
+    };
     let (slot, exposed, _received, origin) = {
         let mut state = server.state.lock();
         let slot = state.requests.remove(&id);
@@ -962,17 +971,42 @@ fn send_reply(server: &UserServer, port: &Arc<Port>, input: u64, attributes: u64
         (slot, exposed, received, origin)
     };
     if rpc_trace::enabled() {
-        trace_reply(server, slot.as_ref(), origin, id, attributes, release, view.is_some(), &captured.data);
+        let carried = if view.is_some() { rpc_trace::CARRIED_VIEW } else { 0 } | if handles.is_some() { rpc_trace::CARRIED_HANDLES } else { 0 };
+        trace_reply(server, slot.as_ref(), origin, id, attributes, release, carried, &captured.data);
     }
-    let Some(slot) = slot else { return STATUS_REPLY_MESSAGE_MISMATCH };
+    let Some(slot) = slot else {
+        if let Some(handles) = handles {
+            handles.release();
+        }
+        return STATUS_REPLY_MESSAGE_MISMATCH;
+    };
     // A resposta com UNMAP_EXISTING apaga a vista que o pedido trouxe ao
     // servidor (o AlpcpCaptureViewAttributeInternal com a vista da mensagem).
     if let Some(binding) = exposed.filter(|binding| unmap && !binding.state.lock().deleted) {
         let _ = crate::ntos::alpc::section_views::delete_referenced(&binding);
     }
     slot.continuation.store(!release && !server.legacy(), core::sync::atomic::Ordering::Release);
-    complete(server, &slot, id, captured.data, view);
+    complete(server, &slot, id, captured.data, view, handles);
     STATUS_SUCCESS
+}
+
+/// Os handles de uma resposta (o ALPC_MESSAGE_HANDLE_ATTRIBUTE válido no
+/// ALPC_MESSAGE_ATTRIBUTES de envio), capturados do processo de quem
+/// responde como os de um pedido (`message_handles::capture`).
+fn capture_reply_handles(attributes: u64, mode: u8) -> Result<Option<Arc<HandleData>>, u32> {
+    if attributes == 0 {
+        return Ok(None);
+    }
+    let header = state::user_struct::<AlpcMessageAttributes>(attributes).map_err(|error| error.status)?;
+    if header.valid_attributes.probe_get().map_err(|error| error.status)? & HANDLE_ATTRIBUTE == 0 {
+        return Ok(None);
+    }
+    let at = crate::ntos::ps::user::alpc::attribute_address(attributes, HANDLE_ATTRIBUTE);
+    match message_handles::capture(at, mode) {
+        Ok(Ok(handles)) => Ok(Some(handles)),
+        Ok(Err(status)) => Err(status),
+        Err(error) => Err(if error.status != 0 { error.status } else { 0xC000_0001 }),
+    }
 }
 
 /// A linha do `--trace-rpc` da resposta do servidor ao pedido `id`: o Type
@@ -981,7 +1015,7 @@ fn send_reply(server: &UserServer, port: &Arc<Port>, input: u64, attributes: u64
 /// `ps/user/alpc.rs`), o ValidAttributes do envio e, sem pedido pendente com
 /// esse id, a recusa STATUS_REPLY_MESSAGE_MISMATCH.
 #[allow(clippy::too_many_arguments)]
-fn trace_reply(server: &UserServer, slot: Option<&ReplySlot>, origin: Option<Origin>, id: u32, attributes: u64, release: bool, view: bool, data: &[u8]) {
+fn trace_reply(server: &UserServer, slot: Option<&ReplySlot>, origin: Option<Origin>, id: u32, attributes: u64, release: bool, carried: u32, data: &[u8]) {
     let continuation = slot.is_some_and(|slot| slot.requeue.is_none()) && !release && !server.legacy();
     let message_type = if continuation { LPC_REQUEST | LPC_CONTINUATION_REQUIRED } else { LPC_REPLY };
     let sent_attributes = if attributes != 0 { state::user_struct::<AlpcMessageAttributes>(attributes).and_then(|header| header.valid_attributes.probe_get()).unwrap_or(0) } else { 0 };
@@ -994,7 +1028,7 @@ fn trace_reply(server: &UserServer, slot: Option<&ReplySlot>, origin: Option<Ori
         message_type,
         id,
         attributes: sent_attributes,
-        carried: if view { rpc_trace::CARRIED_VIEW } else { 0 },
+        carried,
         data,
         status: slot.is_none().then_some(STATUS_REPLY_MESSAGE_MISMATCH),
     });
@@ -1005,9 +1039,13 @@ fn trace_reply(server: &UserServer, slot: Option<&ReplySlot>, origin: Option<Ori
 /// SYNC_REQUEST, o LPC_REPLY na fila da porta de conexão (o
 /// AlpcpDispatchReplyToPort, com o PortContext e a sequência da porta que
 /// enviou).
-fn complete(server: &UserServer, slot: &ReplySlot, id: u32, data: Vec<u8>, view: Option<Arc<message_view::Carried>>) {
+fn complete(server: &UserServer, slot: &ReplySlot, id: u32, data: Vec<u8>, view: Option<Arc<message_view::Carried>>, handles: Option<Arc<HandleData>>) {
     let replier = current_sender();
     if let Some(requeue) = &slot.requeue {
+        // O LPC_REPLY na fila do servidor não leva handles.
+        if let Some(handles) = handles {
+            handles.release();
+        }
         let sequence = {
             let _state = server.state.lock();
             next_sequence(&requeue.owner)
@@ -1016,6 +1054,7 @@ fn complete(server: &UserServer, slot: &ReplySlot, id: u32, data: Vec<u8>, view:
         return;
     }
     *slot.view.lock() = view;
+    *slot.handles.0.lock() = handles;
     *slot.result.lock() = Some(JobResult { status: STATUS_SUCCESS, data, sender: Some(replier) });
     kernel_entry::notify_waiters();
 }
@@ -1187,7 +1226,7 @@ pub fn reply_from_client(client: &Arc<Port>, id: u32, data: Vec<u8>) -> Option<u
     if rpc_trace::enabled() {
         rpc_trace::message(&Record { listener: server.listener.pointer, client_port: client.pointer, client: client.process_id(), server: server.listener.process_id(), message_type: LPC_REPLY, id, data: &data, ..Record::default() });
     }
-    complete(&server, &slot, id, data, None);
+    complete(&server, &slot, id, data, None, None);
     Some(STATUS_SUCCESS)
 }
 
@@ -2141,7 +2180,7 @@ pub fn begin_kernel_legacy_receive(port: &Arc<Port>, reply: u64, receive: u64, p
 /// \Windows\ApiPort do csrss e pelo LpcRequestPort e pelo
 /// LpcSendWaitReceivePort à DwmApiPort do dwm.exe) ou a resposta. `Some`
 /// com a operação que já decide a chamada; `None` para seguir à recepção.
-fn kernel_send(server: &Arc<UserServer>, port: &Arc<Port>, flags: u32, input: u64, receive: &crate::ntos::ps::user::alpc::ReceiveArguments) -> Result<Option<Box<dyn crate::ntos::alpc::kernel_entry::Pending>>, KernelError> {
+fn kernel_send(server: &Arc<UserServer>, port: &Arc<Port>, flags: u32, input: u64, send_attributes: u64, receive: &crate::ntos::ps::user::alpc::ReceiveArguments) -> Result<Option<Box<dyn crate::ntos::alpc::kernel_entry::Pending>>, KernelError> {
     use crate::ntos::alpc::kernel_entry::Completed;
     let completed = |status: u32| -> Result<Option<Box<dyn crate::ntos::alpc::kernel_entry::Pending>>, KernelError> { Ok(Some(Box::new(Completed(status)))) };
     let synchronous = flags & SYNC_REQUEST != 0;
@@ -2158,7 +2197,7 @@ fn kernel_send(server: &Arc<UserServer>, port: &Arc<Port>, flags: u32, input: u6
             return completed(STATUS_NOT_SUPPORTED);
         }
         Ok(SendKind::Reply) => {
-            let status = send_reply(server, port, input, 0, 0, flags & RELEASE_MESSAGE != 0);
+            let status = send_reply(server, port, input, send_attributes, 0, flags & RELEASE_MESSAGE != 0);
             return if status != 0 { completed(status) } else { Ok(None) };
         }
         Ok(SendKind::New(message_type)) => message_type,
@@ -2187,14 +2226,15 @@ fn kernel_send(server: &Arc<UserServer>, port: &Arc<Port>, flags: u32, input: u6
 }
 
 /// ZwAlpcSendWaitReceivePort na porta de conexão ou de comunicação de um
-/// servidor de kernel: o envio e a recepção como em [`exchange`], com os
-/// buffers do chamador sem sonda e a espera pela continuação de kernel (o
-/// prazo e o modo de espera do ZwAlpcSendWaitReceivePort).
-pub fn begin_kernel_exchange(port: &Arc<Port>, flags: u32, input: u64, receive: crate::ntos::ps::user::alpc::ReceiveArguments) -> Result<Box<dyn crate::ntos::alpc::kernel_entry::Pending>, KernelError> {
+/// servidor de kernel: o envio (a resposta com os atributos de envio
+/// `send_attributes`) e a recepção como em [`exchange`], com os buffers do
+/// chamador sem sonda e a espera pela continuação de kernel (o prazo e o
+/// modo de espera do ZwAlpcSendWaitReceivePort).
+pub fn begin_kernel_exchange(port: &Arc<Port>, flags: u32, input: u64, send_attributes: u64, receive: crate::ntos::ps::user::alpc::ReceiveArguments) -> Result<Box<dyn crate::ntos::alpc::kernel_entry::Pending>, KernelError> {
     use crate::ntos::alpc::kernel_entry::Completed;
     use crate::ntos::alpc::kernel_wait;
     let Some(server) = server_of(port) else { return Ok(Box::new(Completed(STATUS_INVALID_PORT_HANDLE))) };
-    if let Some(decided) = kernel_send(&server, port, flags, input, &receive)? {
+    if let Some(decided) = kernel_send(&server, port, flags, input, send_attributes, &receive)? {
         return Ok(decided);
     }
     if receive.output == 0 {
