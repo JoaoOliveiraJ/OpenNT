@@ -628,16 +628,21 @@ pub fn build_partitioned(output: &Path, extras: &[(String, Vec<u8>)], free_space
 }
 
 /// A imagem do volume; `hidden_sectors` é o LBA do início da partição que a
-/// contém (0 num disco sem partições).
-fn volume_image(extras: &[(String, Vec<u8>)], free_space_mib: usize, extra_records: usize, hidden_sectors: u32) -> Result<Vec<u8>, String> {
-    // Diretórios intermediários dos nomes com '/', na ordem de criação.
+/// contém (0 num disco sem partições). Um nome terminado em '/' é um
+/// diretório vazio: uma pasta da instalação sem arquivo da imagem dentro.
+fn volume_image(entries: &[(String, Vec<u8>)], free_space_mib: usize, extra_records: usize, hidden_sectors: u32) -> Result<Vec<u8>, String> {
+    let extras: Vec<&(String, Vec<u8>)> = entries.iter().filter(|(name, _)| !name.ends_with('/')).collect();
+    // Diretórios intermediários dos nomes com '/' e os vazios, na ordem de
+    // criação.
     let mut directories: Vec<String> = Vec::new();
-    for (name, _) in extras {
-        let components: Vec<&str> = name.split('/').collect();
+    for (name, _) in entries {
+        let empty_directory = name.ends_with('/');
+        let components: Vec<&str> = name.trim_end_matches('/').split('/').collect();
         if components.iter().any(|component| component.is_empty()) {
             return Err(format!("caminho NTFS invalido: {name}"));
         }
-        for depth in 1..components.len() {
+        let depths = if empty_directory { components.len() } else { components.len() - 1 };
+        for depth in 1..=depths {
             let directory = components[..depth].join("/");
             if !directories.iter().any(|known| known.eq_ignore_ascii_case(&directory)) {
                 directories.push(directory);
@@ -696,7 +701,7 @@ fn volume_image(extras: &[(String, Vec<u8>)], free_space_mib: usize, extra_recor
     let (sds_lcn, sds_count) = clusters.allocate(sds);
     // ---- dados dos arquivos extras
     let mut file_runs = Vec::new();
-    for (_, blob) in extras {
+    for (_, blob) in &extras {
         file_runs.push(if blob.is_empty() { None } else { Some(clusters.allocate(blob.clone())) });
     }
     // ---- registros

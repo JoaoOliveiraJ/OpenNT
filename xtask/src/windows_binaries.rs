@@ -690,6 +690,17 @@ const LOGON_SCREEN_PROGRAMS: &[&str] = &[
     // (combase, msvcp_win, wldp) já estão aqui.
     "urlmon.dll",
     "windows.storage.dll",
+    // O shell32.dll da imagem da tela de bloqueio: o
+    // CLockScreen::_GetImageForUser do Windows.UI.Immersive.dll decodifica o
+    // img100.jpg, reduz para o tamanho da tela e grava o resultado na pasta
+    // SystemData do S-1-5-18 (CImageSanitizationBroker::SaveScaledImageStream
+    // -> SaveStreamToSystemDataFolder -> GetSystemDataFolderForUser), que acha
+    // a pasta com o SHGetKnownFolderPath do SHELL32.dll, carga atrasada. Sem o
+    // shell32 a carga atrasada falha com 0x8007007F, o LogonUI não recebe o
+    // fluxo da imagem e a tela de bloqueio fica só com a cor de destaque. O
+    // aepic.dll vai junto, como no logon do usuário.
+    "shell32.dll",
+    "aepic.dll",
     "WindowManagementAPI.dll",
     "TextInputFramework.dll",
     "InputHost.dll",
@@ -1156,6 +1167,13 @@ pub fn ntfs_files(root: &Path, kernel_pe: &[u8], initial_process: &str) -> Resul
                 data += 1;
             }
         }
+        // A pasta `%ProgramData%\Microsoft\Windows`, vazia: o
+        // GetSystemDataFolderForUser do Windows.UI.Immersive.dll cria nela a
+        // SystemData (CreateDirectoryW com o descritor dela) e grava em
+        // `SystemData\S-1-5-18\ReadOnly` a imagem da tela de bloqueio reduzida
+        // para a tela. Sem a pasta mãe o CreateDirectoryW falha
+        // (ERROR_PATH_NOT_FOUND) e o LogonUI fica sem a imagem.
+        files.push((String::from("ProgramData/Microsoft/Windows/"), Vec::new()));
         println!("arquivos das pastas de dados da tela de logon no volume NTFS: {data}");
     }
     files.push((String::from("NTOSKRNL.EXE"), kernel_pe.to_vec()));
