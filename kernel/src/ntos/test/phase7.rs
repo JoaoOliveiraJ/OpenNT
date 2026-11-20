@@ -7379,6 +7379,7 @@ pub fn run(assert: Assert) {
     remote_threads(assert);
     super::yield_execution::run(assert);
     super::anti_starvation::run(assert);
+    super::thread_reclaim::run(assert);
     user_wait_packets(assert);
     bundled_bring_up_ntdll(assert);
     user_system_services(assert);

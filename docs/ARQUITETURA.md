@@ -3911,6 +3911,22 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   trocar de volta (e o despachante desfizer o serviço) e chamar de novo. Toda falha depois da criação
   de um processo também passa pelo término. Teste:
   `ntos/test/multiprocess/lifecycle.rs`.
+- **Recolhimento de threads**: a thread de usuário que sai (o
+  NtTerminateThread de outra thread ou dela mesma, ou o PspExitThread no
+  próprio contexto) solta na hora a espera, as APCs, o token de
+  impersonação, a associação com IOCP e os mutantes, e o objeto thread fica
+  sinalizado; o ceifador do despachante
+  (`threads::release_execution_resources`) devolve a pilha, a TEB, o
+  CONTEXT e a pilha de kernel. A ETHREAD vive enquanto houver handle
+  (`ThreadHandleObject`) ou referência (`process::reference_thread`, as
+  esperas e associações que retêm o handle), como o objeto do NT: o último
+  fechamento tira a thread do índice e o `process::collect_thread` solta o
+  registro, o TID e a memória (o PspThreadDelete). Com `--heap-census`, a
+  cada 256 threads de usuário que saem vai para a serial o censo de objetos
+  (`[heap-census] objetos`): o heap, as threads mortas com handles abertos,
+  as ETHREADs registradas, os corpos de despacho por tipo
+  (quantos/sem handle/referências), os pacotes de espera por fase e os
+  handles do processo por tipo. Teste: `ntos/test/thread_reclaim.rs`.
 - **Criação de processos**: um caminho só, `ps/create.rs::
   create_user_process` (o papel do PspCreateProcess/PspAllocateProcess com
   o PspAllocateThread e o PspInsertProcess/PspInsertThread). Todo processo
