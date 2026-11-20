@@ -579,8 +579,20 @@ fn locate_manifest(image_base: u64) -> Result<Option<Manifest>, KernelError> {
 }
 
 /// A imagem no VAD do processo corrente (o processo em montagem, anexado).
-fn push_image(base: u64, size: u64, name: &str) {
-    memory::insert_region(Space::current(), RegionKind::ProcessImages, Arc::new(ImageRegion { base, size, name: String::from(name), file: None }));
+/// O nome é o do FILE_OBJECT da imagem (o `\Device\...` do volume, como o
+/// MmGetFileNameForAddress devolve e o carregador grava para as DLLs), com o
+/// arquivo do volume quando há.
+fn push_image(base: u64, size: u64, name: &str, file: Option<Arc<VolumeFile>>) {
+    memory::insert_region(Space::current(), RegionKind::ProcessImages, Arc::new(ImageRegion { base, size, name: String::from(name), file }));
+}
+
+/// O nome nativo (`\Device\...`) de uma imagem do volume: o do ponto de
+/// montagem do volume, como o das DLLs, ou o do dispositivo do volume do
+/// kernel; sem arquivo, `fallback`.
+fn image_region_name(file: Option<&Arc<VolumeFile>>, fallback: &str) -> String {
+    let Some(file) = file else { return String::from(fallback) };
+    let name = file.nt_path();
+    if name.starts_with("\\Device\\") { name } else { crate::drivers::fs::ntfs::nt_path(&file.volume_path()) }
 }
 
 /// A imagem principal no espaço do processo em montagem (o corrente,
@@ -588,7 +600,7 @@ fn push_image(base: u64, size: u64, name: &str) {
 /// vista da seção de imagem no VAD do NT), com EPROCESS.SectionBaseAddress
 /// na base real. Devolve (entry, base, tamanho) e o
 /// SECTION_IMAGE_INFORMATION.
-fn map_main_image(process_pointer: u64, source: &Arc<dyn ImageSource>, options: &LoadOptions, name: &str) -> Result<((u64, u64, u64), [u8; INFORMATION_SIZE]), KernelError> {
+fn map_main_image(process_pointer: u64, source: &Arc<dyn ImageSource>, options: &LoadOptions, name: &str, file: Option<Arc<VolumeFile>>) -> Result<((u64, u64, u64), [u8; INFORMATION_SIZE]), KernelError> {
     let Some(owner) = process_state::get(process_pointer) else { return Err(KernelError::new("imagem principal sem estado do processo")) };
     let image = pe_loader::load_from_source(source.clone(), options)?;
     let placed = (image.entry_point, image.image_base, image.size_of_image);
@@ -596,7 +608,7 @@ fn map_main_image(process_pointer: u64, source: &Arc<dyn ImageSource>, options: 
     owner.adopt_image(image);
     // SAFETY: o EPROCESS em montagem, retido pelo chamador.
     unsafe { Eprocess::at(process_pointer) }.section_base_address.set(placed.1);
-    push_image(placed.1, placed.2, name);
+    push_image(placed.1, placed.2, &image_region_name(file.as_ref(), name), file);
     Ok((placed, information))
 }
 
@@ -735,8 +747,17 @@ pub fn create_user_process(request: &CreateProcessRequest<'_>) -> Result<Created
     let built = cid::allocate(cid::Kind::Thread).and_then(|thread_id| {
         process_context::with_process(process_pointer, || -> Result<Built, KernelError> {
             loader::map_system_images()?;
-            let ((entry_point, image_base, size_of_image), image_information) = map_main_image(process_pointer, &image_source, &load_options, &parameters.image_path_name)?;
-            push_image(ntdll.image_base, ntdll.size_of_image, &ntdll.full_name);
+            // As regiões do exe e da ntdll com o nome do FILE_OBJECT (o
+            // MmGetFileNameForAddress 0x8c3fb4), não o caminho DOS: o
+            // BasepFillUEFInfo do kernelbase (SetUnhandledExceptionFilter)
+            // consulta MemoryMappedFilenameInformation nelas.
+            let main_file = image_file.as_ref().map(|image| image.file.clone());
+            let ((entry_point, image_base, size_of_image), image_information) = map_main_image(process_pointer, &image_source, &load_options, &parameters.image_path_name, main_file)?;
+            // A ntdll do volume, ou a fonte de onde a do System foi mapeada
+            // (o nome que a região dela no System já leva).
+            let ntdll_file = volume_files::lookup_volume_file("\\SystemRoot\\System32\\ntdll.dll").filter(|file| !file.directory());
+            let ntdll_source = ntdll.notification_source.as_ref().map_or_else(|| ntdll.full_name.clone(), |source| String::from(source.name()));
+            push_image(ntdll.image_base, ntdll.size_of_image, &image_region_name(ntdll_file.as_ref(), &ntdll_source), ntdll_file);
             // A entrada vê o rsp "depois de um call" (8 mod 16) com endereço
             // de retorno 0, para falhar alto se o programa retornar.
             // A pilha pelo RtlCreateUserStack do PspSetupUserStack, com o

@@ -944,12 +944,99 @@ pub fn with_process_handle(handle: u64, desired: u32, body: impl FnOnce(u64) -> 
 }
 
 /// NtAllocateVirtualMemory(process, base*, zeroBits, size*, type, protect),
-/// no processo do handle (PROCESS_VM_OPERATION).
-pub fn nt_allocate_virtual_memory(process: u64, base_pointer: u64, _zero_bits: u64, size_pointer: u64, user_rsp: u64) -> Result<u32, KernelError> {
-    let allocation_type = state::stack_arg32(user_rsp, 5);
+/// no processo do handle (PROCESS_VM_OPERATION), como o 19041:
+/// - os 7 bits baixos do tipo (o nó NUMA preferido do VirtualAllocExNuma)
+///   saem dele e os bits de placeholder só existem no Ex (0x5fa7fd..0x5fa815,
+///   STATUS_INVALID_PARAMETER);
+/// - o MiValidateAllocationType (0x5f9f60): bits desconhecidos, nenhuma
+///   operação, ou MEM_RESET/MEM_RESET_UNDO com outros bits dão
+///   STATUS_INVALID_PARAMETER;
+/// - o MiValidateZeroBits (`map_view_parameters::zero_bits`); sem base, o
+///   limite superior é o do MiGetUserReservationHighestAddress (todos os
+///   bits acima do ZeroBits zerados);
+/// - MEM_RESET vai ao [`reset_in`].
+pub fn nt_allocate_virtual_memory(process: u64, base_pointer: u64, zero_bits: u64, size_pointer: u64, user_rsp: u64) -> Result<u32, KernelError> {
+    let allocation_type = state::stack_arg32(user_rsp, 5) & !0x7F;
     let protect = state::stack_arg32(user_rsp, 6);
+    if allocation_type & (MEM_RESERVE_PLACEHOLDER | MEM_REPLACE_PLACEHOLDER) != 0 {
+        return Ok(STATUS_INVALID_PARAMETER);
+    }
     // Os ponteiros de saída são acessados por cópias sondadas.
-    with_process_handle(process, PROCESS_VM_OPERATION, |target| state::guarded(|| allocate_in(Space::of(target), base_pointer, size_pointer, allocation_type, protect, 0, 0, map::ALLOCATION_GRANULARITY)))
+    with_process_handle(process, PROCESS_VM_OPERATION, |target| {
+        if !valid_operation_type(allocation_type) {
+            return Ok(STATUS_INVALID_PARAMETER);
+        }
+        let zero = match crate::ntos::mm::section::map_view_parameters::zero_bits(zero_bits) {
+            Ok(zero) => zero,
+            Err(status) => return Ok(status),
+        };
+        state::guarded(|| {
+            if allocation_type == MEM_RESET {
+                return reset_in(Space::of(target), base_pointer, size_pointer);
+            }
+            // Um commit sem base também reserva (0x5f9e1c liga MEM_RESERVE).
+            let highest = if zero != 0 && guest::try_read::<u64>(base_pointer)? == 0 { (u64::MAX >> zero).min(map::HIGHEST_USER_ADDRESS) + 1 } else { 0 };
+            allocate_in(Space::of(target), base_pointer, size_pointer, allocation_type, protect, 0, highest, map::ALLOCATION_GRANULARITY)
+        })
+    })
+}
+
+const MEM_REPLACE_PLACEHOLDER: u32 = 0x4000;
+const MEM_RESERVE_PLACEHOLDER: u32 = 0x4_0000;
+const MEM_RESET: u32 = 0x8_0000;
+const MEM_RESET_UNDO: u32 = 0x100_0000;
+
+/// A parte do MiValidateAllocationType (19041 0x5f9f60) comum a todo
+/// pedido: nenhum bit fora dos conhecidos (0x9E038FFF), ao menos uma
+/// operação (COMMIT, RESERVE, RESET ou RESET_UNDO) e MEM_RESET ou
+/// MEM_RESET_UNDO sozinhos.
+fn valid_operation_type(allocation_type: u32) -> bool {
+    if allocation_type & 0x9E03_8FFF != 0 || allocation_type & (MEM_COMMIT | MEM_RESERVE | MEM_RESET | MEM_RESET_UNDO) == 0 {
+        return false;
+    }
+    !(allocation_type & MEM_RESET != 0 && allocation_type != MEM_RESET) && !(allocation_type & MEM_RESET_UNDO != 0 && allocation_type != MEM_RESET_UNDO)
+}
+
+/// MEM_RESET do NtAllocateVirtualMemory: a base sobe e o fim desce à página
+/// (MiAllocateVirtualMemoryPrepare 0x5f9eed; faixa vazia é
+/// STATUS_CONFLICTING_ADDRESSES) e a faixa precisa estar num VAD só. Como o
+/// MiResetVirtualMemory (0x31e6fc): numa região privada é sucesso, comitada
+/// ou não (o resultado do MiWalkVaRange é descartado; as páginas só deixam
+/// de precisar ser preservadas); numa vista de arquivo é
+/// STATUS_USER_MAPPED_FILE; numa vista do pagefile, sucesso se gravável,
+/// senão STATUS_SECTION_PROTECTION. A base e o tamanho arredondados voltam.
+pub fn reset_in(space: Space, base_pointer: u64, size_pointer: u64) -> Result<u32, KernelError> {
+    let (base, size) = (guest::try_read::<u64>(base_pointer)?, guest::try_read::<u64>(size_pointer)?);
+    if size == 0 || base > map::HIGHEST_USER_ADDRESS || USER_ADDRESS_LIMIT - base < size {
+        return Ok(STATUS_INVALID_PARAMETER);
+    }
+    let first = base.div_ceil(PAGE) * PAGE;
+    let end = (base + size) & !(PAGE - 1);
+    if first >= end {
+        return Ok(STATUS_CONFLICTING_ADDRESSES);
+    }
+    let Some(region) = space.find(first).filter(|region| end <= region.base() + region.size()) else { return Ok(STATUS_CONFLICTING_ADDRESSES) };
+    let status = if private(&region).is_some() {
+        0
+    } else if let Some(view) = view_of(&region) {
+        if view.section.file.is_some() {
+            0xC000_0243
+        } else if view.protect & (4 | 8 | 0x40 | 0x80) != 0 {
+            0
+        } else {
+            0xC000_004E
+        }
+    } else if region.as_any().downcast_ref::<super::loader::ImageRegion>().is_some() {
+        0xC000_0243
+    } else {
+        STATUS_CONFLICTING_ADDRESSES
+    };
+    if status != 0 {
+        return Ok(status);
+    }
+    guest::try_write::<u64>(base_pointer, first)?;
+    guest::try_write::<u64>(size_pointer, end - first)?;
+    Ok(0)
 }
 
 /// NtAllocateVirtualMemoryEx(process, base*, size*, type, protect, params*,

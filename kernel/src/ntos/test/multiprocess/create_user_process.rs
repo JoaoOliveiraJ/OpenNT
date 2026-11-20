@@ -913,6 +913,22 @@ fn parent_creates_child(assert: Assert, services: &Services, system: u64, system
     let thread_matches = main.as_ref().is_some_and(|thread| thread.thread_id == child_thread_id) && child_thread_id != child_id;
     assert(thread_matches && client_length == ClientId::SIZE && suspended.is_some_and(|(_, _, own_teb)| own_teb == teb && teb != 0), "ntcreateuserprocess: CLIENT_ID (PID e TID do filho, ReturnLength 16) e a TEB da thread principal nas saidas");
     assert(image == Some((IMAGE_BASE + 0x1000, 3, 0x8664, 0x0022)), "ntcreateuserprocess: SECTION_IMAGE_INFORMATION da imagem do filho (entry na base real, subsistema CUI, AMD64)");
+    // O MemoryMappedFilenameInformation do exe e da ntdll do filho é o nome
+    // do FILE_OBJECT (`\Device\...`, o MmGetFileNameForAddress), como o das
+    // DLLs, não o caminho DOS (que o view_name recusa: FILE_INVALID). As
+    // regiões de imagem do VAD do filho (as do NtCreateUserProcess).
+    let images = memory::Space::of(child).images();
+    let name_at = |address: u64| images.iter().find(|region| address >= region.base() && address - region.base() < region.size()).and_then(crate::ntos::ps::user::memory_query::view_name);
+    let exe_name = name_at(IMAGE_BASE);
+    let ntdll_name = crate::ntos::ps::user::loader::ntdll_module().and_then(|ntdll| name_at(ntdll.image_base));
+    let native = |name: &Option<String>, file: &str| name.as_ref().is_some_and(|name| name.starts_with("\\Device\\") && name.to_ascii_lowercase().ends_with(file));
+    // A ntdll do boot dos autotestes vem do bundle (`\BootBundle\apps`): o
+    // nome é o da fonte da ntdll do System, também absoluto.
+    let absolute_ntdll = |name: &Option<String>| name.as_ref().is_some_and(|name| name.starts_with('\\') && name.to_ascii_lowercase().ends_with("\\ntdll.dll"));
+    if !(native(&exe_name, "\\filhoc2.exe") && absolute_ntdll(&ntdll_name)) {
+        crate::debug_print!("[ntcreateuserprocess] nomes das imagens: exe {:?} ntdll {:?}", exe_name, ntdll_name);
+    }
+    assert(native(&exe_name, "\\filhoc2.exe") && absolute_ntdll(&ntdll_name), "ntcreateuserprocess: as regioes do exe e da ntdll do filho tem o nome nativo do FILE_OBJECT (\\Device\\...)");
     // Os handles: na tabela do pai, com o acesso pedido; não na do System.
     let in_parent = process_context::with_process(parent, || {
         let process_entry = state::get_user_handle(process_handle);

@@ -62,18 +62,21 @@ pub struct Prefix {
     pub access: u32,
 }
 
-/// ZeroBits abaixo de 32 conta bits altos; acima, é uma máscara (zeros à
-/// esquerda); mais de 53 é inválido. Depois, a proteção sem o bit de
-/// enclave.
-pub fn prefix(zero_bits: u64, protect: u32) -> Result<Prefix, u32> {
-    let zero = match zero_bits {
+/// MiValidateZeroBits (19041 0x6388bc): ZeroBits abaixo de 32 conta bits
+/// altos a partir do bit 32; acima, é uma máscara (63 menos o bit mais
+/// significativo); mais de 53 é STATUS_INVALID_PARAMETER.
+pub fn zero_bits(value: u64) -> Result<u32, u32> {
+    let zero = match value {
         0 => 0,
         bits if bits < 32 => bits as u32 + 32,
         bits => bits.leading_zeros(),
     };
-    if zero > 53 {
-        return Err(INVALID);
-    }
+    if zero > 53 { Err(INVALID) } else { Ok(zero) }
+}
+
+/// ZeroBits pelo [`zero_bits`]; depois, a proteção sem o bit de enclave.
+pub fn prefix(zero_bits: u64, protect: u32) -> Result<Prefix, u32> {
+    let zero = self::zero_bits(zero_bits)?;
     let mask = protection(protect & !0x4000_0000);
     if mask < 0 {
         return Err(PROTECTION);

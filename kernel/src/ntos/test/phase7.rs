@@ -1015,6 +1015,30 @@ fn user_virtual_memory(assert: Assert) {
         guest::write64(size_pointer, size);
         memory::nt_free_virtual_memory(u64::MAX, base_pointer, size_pointer, kind, 0).unwrap_or(1)
     };
+    // O tipo (MiValidateAllocationType 0x5f9f60): bit desconhecido, nenhuma
+    // operação, MEM_RESET com outro bit e placeholder fora do Ex recusados;
+    // os 7 bits baixos (o nó NUMA do VirtualAllocExNuma) saem do tipo.
+    let refused_types = [0x8000_3000u32, 0x10_0000, 0x8_1000, 0x4_2000].iter().all(|&kind| allocate(0, 0x1000, kind, 4) == 0xC000_000D);
+    let numa = allocate(0, 0x1000, 0x3001, 4) == 0 && free(guest::read64(base_pointer), 0, 0x8000) == 0;
+    assert(refused_types && numa, "usermemory: tipos recusados pelo MiValidateAllocationType e o no NUMA dos bits baixos ignorado");
+    // ZeroBits (MiValidateZeroBits 0x6388bc): 1 conta a partir do bit 32 (a
+    // reserva fica abaixo de 2 GB); 22 (54 bits) é inválido.
+    let allocate_zero = |zero: u64| {
+        guest::write64(base_pointer, 0);
+        guest::write64(size_pointer, 0x1000);
+        guest::write32(rsp + 0x28, 0x3000);
+        guest::write32(rsp + 0x30, 4);
+        memory::nt_allocate_virtual_memory(u64::MAX, base_pointer, zero, size_pointer, rsp).unwrap_or(1)
+    };
+    let low = allocate_zero(1) == 0 && guest::read64(base_pointer) + 0x1000 <= 0x8000_0000 && free(guest::read64(base_pointer), 0, 0x8000) == 0;
+    assert(low && allocate_zero(22) == 0xC000_000D, "usermemory: ZeroBits 1 reserva abaixo de 2 GB e 22 e invalido");
+    // MEM_RESET (MiAllocateVirtualMemoryPrepare 0x5f9eed, MiResetVirtualMemory
+    // 0x31e6fc): a faixa encolhe às páginas inteiras e vale numa região
+    // privada, comitada ou só reservada; faixa vazia é
+    // STATUS_CONFLICTING_ADDRESSES.
+    let reset = allocate(data + 0x10, 0x2000, 0x8_0000, 4) == 0 && guest::read64(base_pointer) == data + 0x1000 && guest::read64(size_pointer) == 0x1000;
+    let reset_reserved = allocate(reserved, 0x1000, 0x8_0000, 4) == 0;
+    assert(reset && reset_reserved && allocate(data + 0x10, 0x100, 0x8_0000, 4) == 0xC000_0018 && allocate(unreserved, 0x1000, 0x8_0000, 4) == 0xC000_0018, "usermemory: MEM_RESET encolhe a faixa as paginas inteiras numa regiao privada e recusa faixa vazia ou sem regiao");
     assert(free(reserved + 0x1000, 0x1000, 0x4000) == 0 && paging::translate(reserved + 0x1000) == 0 && memory::find_region(reserved).is_some(), "usermemory: MEM_DECOMMIT desmapeia e conserva a reserva");
     // MEM_RELEASE de parte da região (o MiFreeVadRange do 19041): o começo
     // (o RtlCreateHeap libera assim a folga aleatória da reserva), o meio e
