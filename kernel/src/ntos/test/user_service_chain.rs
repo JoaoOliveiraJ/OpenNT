@@ -1,7 +1,7 @@
 //! Autotestes dos serviços de modo usuário que os serviços do início
 //! automático do services.exe pedem e que não tinham provedor:
 //! NtCompareObjects (`ob/compare_objects`), NtCompareTokens
-//! (`se/token/compare`), NtSetUuidSeed (`ex/uuid`) e
+//! (`se/token/compare`), NtSetUuidSeed e NtAllocateUuids (`ex/uuid`) e
 //! NtIsSystemResumeAutomatic (`po/system_state`).
 
 use crate::ntos::ex::uuid;
@@ -38,6 +38,7 @@ pub fn run(assert: Assert) {
     compare_objects(assert, block, rsp, &call);
     compare_tokens(assert, block, &call);
     uuid_seed(assert, block, &call);
+    allocate_uuids(assert, block, &call);
     if let Some(region) = memory::find_region(block) {
         memory::release_private_region(&region);
     }
@@ -140,6 +141,29 @@ fn compare_tokens(assert: Assert, block: u64, call: Call) {
         let _ = call("NtClose", handle, 0, 0, 0);
         let _ = tokens::release(token);
     }
+}
+
+/// NtAllocateUuids (ExpAllocateUuids 0x69cdd4): uma faixa de até 10000
+/// intervalos de 100 ns no máximo 1 s atrás, a sequência lida e gravada na
+/// chave do Executive, o NodeId corrente e RPC_NT_UUID_LOCAL_ONLY sem
+/// ExpUuidCacheValid; o pedido seguinte começa no fim da faixa (ou repete o
+/// tick com a marca nos bits 23..27 da parte alta); alinhamento e ponteiro
+/// inválido recusados.
+fn allocate_uuids(assert: Assert, block: u64, call: Call) {
+    let (time, range, sequence, seed) = (block + 0x700, block + 0x708, block + 0x70C, block + 0x710);
+    let now = crate::ntos::ke::clock::system_time_100ns();
+    let (node, valid) = uuid::node_seed();
+    let expected = if valid { 0 } else { 0x4002_0056 };
+    let first = call("NtAllocateUuids", time, range, sequence, seed);
+    let (first_time, first_range, first_sequence) = (guest::read64(time), guest::read32(range), guest::read32(sequence));
+    let first_node = guest::read_bytes(seed, 6);
+    let saved = crate::ntos::cm::registry::read_value_by_path(uuid::SEQUENCE_KEY, uuid::SEQUENCE_VALUE).map(|value| value.data);
+    assert(first == expected && first_node == node && (1..=10_000).contains(&first_range) && first_time <= now + 10_000_000 && saved.as_deref() == Some(&first_sequence.to_le_bytes()[..]), "servicechain: NtAllocateUuids devolve a faixa, a sequencia gravada na chave do Executive e o NodeId");
+    let second = call("NtAllocateUuids", time, range, sequence, seed);
+    let (second_time, second_sequence) = (guest::read64(time), guest::read32(sequence));
+    let repeated = (second_time >> 32) & 0x0F80_0000 != 0;
+    assert(second == expected && second_sequence == first_sequence && (second_time >= first_time + first_range as u64 || repeated), "servicechain: o NtAllocateUuids seguinte comeca no fim da faixa anterior com a mesma sequencia");
+    assert(call("NtAllocateUuids", time + 1, range, sequence, seed) == 0x8000_0002 && call("NtAllocateUuids", 0, range, sequence, seed) == STATUS_ACCESS_VIOLATION, "servicechain: NtAllocateUuids recusa Time desalinhado e ponteiro invalido");
 }
 
 /// Sem o SID de serviço do RpcEptMapper, STATUS_ACCESS_DENIED e o nó
