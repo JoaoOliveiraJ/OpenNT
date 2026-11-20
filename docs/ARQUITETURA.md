@@ -4932,12 +4932,23 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   de `Hardware Profiles` (o `LogPixels` do DPI, `xtask/src/fonts.rs`), o
   tema que o uxinit do winlogon carrega sem o serviço Themes (o
   `aero.msstyles` com o `.mui` e as chaves `ThemeManager` da SOFTWARE e da
-  DEFAULT, `xtask/src/theme.rs`), as
+  DEFAULT, `xtask/src/theme.rs`),
+  o logon do usuário até a barra de tarefas e a área de trabalho, sem o
+  sihost (o userinit.exe com o userinitext.dll e o winlogonext.dll, o
+  explorer.exe de `\Windows` com o `.mui`, na raiz do volume, o
+  shell32.dll, o ExplorerFrame.dll da barra e o SndVolSSO.dll do ícone de
+  volume: `USER_LOGON_PROGRAMS` e `WINDOWS_PROGRAMS`), o papel de parede
+  padrão do perfil Default (as imagens img0 de
+  `\Windows\Web\Wallpaper\Windows` e de `\Windows\Web\4K\Wallpaper\Windows`,
+  `WALLPAPER_FOLDERS`), as
   classes COM em processo (`Classes\CLSID`: o LogonUIController, os
   provedores de credencial, a fábrica e os codecs do WIC) e WinRT
   (`WindowsRuntime\ActivatableClassId`) das DLLs do volume, as classes
-  WinRT fora de processo do DispBrokerDesktopSvc com o
-  `WindowsRuntime\Server` dele, as interfaces
+  WinRT fora de processo do DispBrokerDesktopSvc, do StateRepository, do
+  UserManager e do WindowManagement com o `WindowsRuntime\Server` de cada
+  um, as classes COM fora de processo que o explorer.exe e o sihost.exe
+  registram, com o AppID delas (`SHELL_LOCAL_CLASSES`), sem os valores com o
+  SID de uma conta (`S-1-5-21-...`) nos dados, as interfaces
   com o proxy numa dessas classes (`Classes\Interface`, menos as que o
   oleaut32 empacota pela biblioteca de tipos), com os
   provedores de `Authentication\Credential Providers` e o
@@ -6898,6 +6909,37 @@ suaves), a cor de destaque com o relógio, que o LogonUI mostra sem a imagem
 linhas ou das colunas); um quadro rasgado mais perto do fim e a imagem
 surgindo do preto não ficam iguais na leitura seguinte. O teste da tela de
 logon que falha escreve no log o que faltou na última tela lida.
+
+Num teste que espera o `DESKTOP_OK` (o marcador ou um `--expect`), a vigia
+procura a área de trabalho em vez da tela de logon
+(`screen_check::desktop_screen`), e só depois de o `EXPLORER_STARTED`
+aparecer na serial. Embaixo, uma barra de 24 a 72 linhas contadas de baixo,
+cada uma com 3/10 ou mais dos pixels escuros (nenhum canal acima de 0x80), e
+2/5 ou mais da barra escura; acima dela, o papel de parede: 3/5 ou mais dos
+pixels azuis (o azul pelo menos 32 acima do vermelho e não abaixo do verde),
+metade ou mais dos vizinhos suaves, 8 cores ou mais com 1/1536 da tela, a
+cor média de #0060B0 a #30C0FF e o verde médio da metade esquerda pelo menos
+24 acima do da direita. Duas leituras seguidas iguais põem no log a linha
+`[xtask] area de trabalho` e o `DESKTOP_OK` e vão para
+`<build>/area-de-trabalho.png`. Os limites vêm do papel de parede padrão do
+19041, o `Web\Wallpaper\Windows\img0.jpg` do perfil Default em modo
+Preencher (com a tela de 1024x768, o
+`CTranscodedImage::_CheckSystemWallpaperForBestMatch` do shell32 troca pelo
+`Web\4K\Wallpaper\Windows\img0_1024x768.jpg`), decodificado pelo GDI+ nos
+dois tamanhos: 99% dos pixels azuis, 99% dos vizinhos suaves, 204 a 320
+cores, média de #0287E4 a #038EEA e verde médio de 166 ou 167 à esquerda e
+de 105 a 117 à direita. O canal mais forte de cada pixel do img0 vai de 169 a
+255, então o papel de parede nunca conta como barra. A barra modelada de 40
+linhas (opaca #101010 ou #202020, ou #202020 translúcida de 55% a 85% sobre
+o papel de parede, com a caixa de busca clara de 344 colunas ou sem ela, em
+800x600, 1024x768 e 1280x800) fica com 56% a 93% dos pixels escuros. Não
+passam: a tela de bloqueio (26% azul, e o chão escuro da caverna dá
+centenas de linhas escuras embaixo), a cor de destaque com texto (a animação
+do primeiro logon e o Bem-vindo), a área de trabalho sem a barra ou com o
+fundo preto do perfil (o papel de parede que não carregou), a imagem
+surgindo do preto, a memória lida como cor e um quadro pela metade. O teste
+da área de trabalho que falha escreve no log o que faltou na última tela
+lida.
 
 Num teste que espera o `TASKBAR_OK`, a vigia segue depois do `DESKTOP_OK` e,
 com o `SHELL_TRAY_CREATED` na serial, confere a barra de tarefas

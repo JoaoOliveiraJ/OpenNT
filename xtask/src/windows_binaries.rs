@@ -32,12 +32,17 @@
 //! subsistema Win32 (win32k.sys, win32kbase.sys, win32kfull.sys e o
 //! cdd.dll; o hidparse.sys que o win32kbase importa já vem com a pilha USB).
 //! Leva também a tela de logon da sessão 1 (o dwm.exe e o LogonUI.exe com o
-//! fecho dos imports, o XAML e os provedores de credencial), os `.mui` dos
+//! fecho dos imports, o XAML e os provedores de credencial), o logon do
+//! usuário até a área de trabalho (o userinit.exe e o explorer.exe, que
+//! fica em `\Windows`, com o shell32.dll e os servidores em processo da
+//! barra de tarefas e da área de trabalho), os `.mui` dos
 //! programas (no idioma de fallback quando o de interface não tem), os
 //! recursos deles em `\Windows\SystemResources`, os assemblies de WinSxS
 //! (`side_by_side`), as fontes (`fonts`), o tema visual (`theme`) e as
 //! pastas de dados que a tela de logon lê (os metadados WinRT, as imagens da tela de bloqueio e as do
-//! bloco do usuário, e os dados do ICU e dos fusos de `\Windows\Globalization`).
+//! bloco do usuário, e os dados do ICU e dos fusos de `\Windows\Globalization`),
+//! e o papel de parede padrão do perfil Default (as imagens img0 de
+//! `\Windows\Web\Wallpaper\Windows` e de `\Windows\Web\4K\Wallpaper\Windows`).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -776,6 +781,53 @@ const LOGON_SCREEN_PROGRAMS: &[&str] = &[
     "wkscli.dll",
 ];
 
+/// O logon do usuário até a barra de tarefas e a área de trabalho, sem o
+/// sihost (a barra e a janela da área de trabalho do explorer não dependem
+/// dele; o winlogon só espera o WNF_UMGR_SIHOST_READY por 30 s antes do
+/// userinit). O userinit.exe, que o ShellStartup do winlogon cria na
+/// Winsta0\Default pelo `Userinit` do Winlogon, com o userinitext.dll
+/// (ext-ms-win-session-userinit, carga atrasada do userinit) e o
+/// winlogonext.dll (ext-ms-win-session-winlogon, carga atrasada do
+/// winlogon), e o mprext.dll, carga atrasada do mpr.dll do
+/// RestoreNetworkConnections do winlogon (o mpr.dll vem com o console). E o
+/// que o explorer.exe (`WINDOWS_PROGRAMS`) carrega até mostrar a barra
+/// (Shell_TrayWnd) e a janela da área de trabalho (Progman): o shell32.dll
+/// e o aepic.dll, os imports estáticos dele que faltavam; o
+/// ExplorerFrame.dll, o servidor em processo da CLSID_RebarBandSite do
+/// BandSite_CreateView da barra e da CLSID_ExplorerHostCreator; o
+/// dui70.dll, o duser.dll e o oleacc.dll, cargas atrasadas do explorer, do
+/// shell32 e do ExplorerFrame (o winmm.dll, a outra, vem com o console); e o
+/// SndVolSSO.dll do ícone de volume, que o CTray::_OnCreate chama sempre
+/// (carga atrasada do explorer), com o MMDevAPI.dll que ele importa. O shell
+/// imersivo (twinui.dll, twinui.pcshell.dll e
+/// windows.immersiveshell.serviceprovider.dll, que o _StartImmersiveShell da
+/// bandeja inicia antes do ShellDesktopSwitchEvent e que pede o
+/// ShellServiceHost do sihost), o AppResolver.dll (a espera INFINITE do
+/// AppResolverReadyEvent antes do CreateDesktopAndTray) e o stobject.dll
+/// ficam para a etapa do sihost.
+const USER_LOGON_PROGRAMS: &[&str] = &[
+    // O userinit.
+    "userinit.exe",
+    "userinitext.dll",
+    "winlogonext.dll",
+    "mprext.dll",
+    // O explorer: os imports estáticos, a barra e as cargas atrasadas (o
+    // shell32.dll e o aepic.dll já vão com a tela de logon).
+    "ExplorerFrame.dll",
+    "dui70.dll",
+    "duser.dll",
+    "oleacc.dll",
+    "SndVolSSO.dll",
+    "MMDevAPI.dll",
+];
+
+/// Os programas do logon do usuário que ficam em `\Windows`, não em
+/// System32: o explorer.exe, que o ExecProcesses do userinit cria pelo
+/// `%SystemRoot%\Explorer.EXE` (o `explorer.exe` do `Shell` do Winlogon vira
+/// esse caminho). A raiz do volume serve as duas pastas, então o programa e
+/// o `.mui` de `\Windows\<idioma>` vão para a raiz como os de System32.
+const WINDOWS_PROGRAMS: &[&str] = &["explorer.exe"];
+
 /// As pastas de dados que a tela de logon lê pelo caminho, inteiras: os
 /// metadados WinRT de `System32\WinMetadata` (os `.winmd` que o
 /// RoGetMetaDataFile do XAML abre para resolver os tipos) e as imagens
@@ -800,6 +852,25 @@ const LOGON_SCREEN_FOLDERS: &[(&str, &str)] = &[
 /// `<conta>.dat` das contas desta máquina ficam de fora.
 const USER_ACCOUNT_PICTURES: &[&str] = &["user.png", "user-32.png", "user-40.png", "user-48.png", "user-192.png", "user.bmp", "guest.png", "guest.bmp"];
 
+/// O papel de parede padrão do perfil Default: o `Control Panel\Desktop`
+/// da hive Default nomeia o `C:\Windows\Web\Wallpaper\Windows\img0.jpg`
+/// (WallpaperStyle 10, preencher), que o CWallpaperRenderer do shell32
+/// decodifica pelo WIC e desenha na janela da área de trabalho do explorer;
+/// o CTranscodedImage::_CheckSystemWallpaperForBestMatch troca a imagem
+/// padrão pela de `Web\4K\Wallpaper\Windows` do tamanho do monitor principal
+/// (o img0_1024x768.jpg numa tela de 1024x768). Sem a imagem, a área de
+/// trabalho fica na cor de fundo da hive Default, preta. (pasta no volume,
+/// pasta de origem relativa ao diretório do Windows); só as imagens img0
+/// ([`stock_wallpaper`]).
+const WALLPAPER_FOLDERS: &[(&str, &str)] = &[("Web/Wallpaper/Windows", "Web/Wallpaper/Windows"), ("Web/4K/Wallpaper/Windows", "Web/4K/Wallpaper/Windows")];
+
+/// Uma imagem img0 da instalação (`img0.jpg`, `img0_1024x768.jpg`...): outra
+/// imagem que alguém ponha nessas pastas fica fora do volume.
+fn stock_wallpaper(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.starts_with("img0") && name.ends_with(".jpg")
+}
+
 /// As imagens de kernel do caminho do smss (`--initial-process=smss`): o
 /// win32k.sys que o smss da sessão carrega pela classe 38, o win32kbase.sys
 /// e o win32kfull.sys que ele carrega como imagens de sessão e o cdd.dll (o
@@ -819,7 +890,7 @@ pub fn windows_directory() -> PathBuf {
 
 /// Os programas de modo usuário do boot do smss, na raiz do volume.
 pub fn user_programs() -> impl Iterator<Item = &'static str> {
-    SMSS_PROGRAMS.iter().chain(SERVICE_CHAIN_PROGRAMS).chain(LOGON_SCREEN_PROGRAMS).chain(CONSOLE_PROGRAMS).copied()
+    SMSS_PROGRAMS.iter().chain(SERVICE_CHAIN_PROGRAMS).chain(LOGON_SCREEN_PROGRAMS).chain(CONSOLE_PROGRAMS).chain(USER_LOGON_PROGRAMS).copied()
 }
 
 /// Os nomes de arquivo de `directory`.
@@ -1143,6 +1214,26 @@ pub fn ntfs_files(root: &Path, kernel_pe: &[u8], initial_process: &str) -> Resul
             }
         }
         println!("recursos .mui no volume NTFS: {resources} (idiomas {}; fallback {})", languages.join(", "), fallbacks.join(", "));
+        // Os programas de `\Windows` (`WINDOWS_PROGRAMS`) com o `.mui` de
+        // `\Windows\<idioma>`, na raiz como os de System32 (o
+        // `%SystemRoot%\Explorer.EXE` do userinit e o
+        // `<idioma>\explorer.exe.mui` que o carregador procura ao lado dele).
+        let mut outside = 0;
+        for &name in WINDOWS_PROGRAMS {
+            let source = windows.join(name);
+            let Ok(bytes) = fs::read(&source) else {
+                println!("AVISO: {} ausente no Windows desta maquina", source.display());
+                continue;
+            };
+            files.push(Staged::copied(name.to_uppercase(), bytes, &source));
+            outside += 1;
+            for (path, source) in crate::host_language::mui_files(&windows, name, &languages, &fallbacks) {
+                if let Ok(bytes) = fs::read(&source) {
+                    files.push(Staged::copied(path, bytes, &source));
+                }
+            }
+        }
+        println!("programas de \\Windows no volume NTFS: {outside} de {}", WINDOWS_PROGRAMS.len());
         // Os módulos de recursos de `\Windows\SystemResources` dos
         // programas: o `<nome>.mun` que o carregador abre no lugar da seção
         // de recursos do módulo e o pacote MRT `<módulo>\<módulo>.pri` (com
@@ -1227,6 +1318,25 @@ pub fn ntfs_files(root: &Path, kernel_pe: &[u8], initial_process: &str) -> Resul
         let system_data_parent = std::env::var("ProgramData").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("C:/ProgramData")).join("Microsoft/Windows");
         files.push(Staged { path: String::from("ProgramData/Microsoft/Windows/"), bytes: Vec::new(), host: system_data_parent.is_dir().then_some(system_data_parent) });
         println!("arquivos das pastas de dados da tela de logon no volume NTFS: {data}");
+        // O papel de parede padrão do perfil Default (`WALLPAPER_FOLDERS`),
+        // só as imagens img0.
+        let mut wallpapers = 0;
+        for (folder, relative) in WALLPAPER_FOLDERS {
+            let directory = windows.join(relative);
+            let mut names: Vec<String> = entries(&directory).into_iter().filter(|name| stock_wallpaper(name)).collect();
+            names.sort();
+            for name in names {
+                let source = directory.join(&name);
+                if !source.is_file() {
+                    continue;
+                }
+                if let Ok(bytes) = fs::read(&source) {
+                    files.push(Staged::copied(format!("{folder}/{name}"), bytes, &source));
+                    wallpapers += 1;
+                }
+            }
+        }
+        println!("papel de parede padrao no volume NTFS: {wallpapers} imagens");
     }
     files.push(Staged::generated(String::from("NTOSKRNL.EXE"), kernel_pe.to_vec()));
     files.push(Staged::generated(String::from("Windows/System32/ntoskrnl.exe"), kernel_pe.to_vec()));
@@ -1246,5 +1356,139 @@ mod tests {
         for (index, name) in names.iter().enumerate() {
             assert!(!names[..index].contains(name), "{name} aparece em mais de uma lista de programas");
         }
+    }
+
+    /// Os programas de `\Windows` vão para a mesma raiz que os de System32:
+    /// nenhum nome pode estar nas duas.
+    #[test]
+    fn windows_programs_do_not_collide_with_system32_programs() {
+        for name in super::WINDOWS_PROGRAMS {
+            assert!(!user_programs().any(|program| program.eq_ignore_ascii_case(name)), "{name} também está numa lista de System32");
+        }
+    }
+
+    /// Do papel de parede padrão vão só as imagens img0 da instalação.
+    #[test]
+    fn only_the_stock_wallpapers_are_staged() {
+        assert!(super::stock_wallpaper("img0.jpg"));
+        assert!(super::stock_wallpaper("IMG0_1024X768.JPG"));
+        assert!(!super::stock_wallpaper("ferias.jpg"));
+        assert!(!super::stock_wallpaper("img0.jpg.bak"));
+    }
+
+    /// Os API sets do apisetschema.dll (versão 6, seção `.apiset`): o nome
+    /// sem a última versão (o trecho do hash) -> os anfitriões, o padrão
+    /// primeiro e depois os de um importador (importador, anfitrião).
+    #[cfg(windows)]
+    fn api_sets(bytes: &[u8]) -> std::collections::HashMap<String, Vec<(String, String)>> {
+        use super::{u16_at, u32_at};
+        let mut sets = std::collections::HashMap::new();
+        let Some(pe) = u32_at(bytes, 0x3C).map(|offset| offset as usize) else { return sets };
+        let (Some(sections), Some(optional_size)) = (u16_at(bytes, pe + 6), u16_at(bytes, pe + 20)) else { return sets };
+        let table = pe + 24 + optional_size as usize;
+        let section = (0..sections as usize).find_map(|index| {
+            let at = table + index * 40;
+            if !bytes.get(at..at + 8)?.starts_with(b".apiset") {
+                return None;
+            }
+            let (size, raw) = (u32_at(bytes, at + 16)? as usize, u32_at(bytes, at + 20)? as usize);
+            bytes.get(raw..raw + size)
+        });
+        let Some(data) = section else { return sets };
+        let text = |offset: u32, length: u32| -> String {
+            let raw = data.get(offset as usize..offset as usize + length as usize).unwrap_or_default();
+            let units: Vec<u16> = raw.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect();
+            String::from_utf16_lossy(&units).to_ascii_lowercase()
+        };
+        let (Some(6), Some(count), Some(entries)) = (u32_at(data, 0), u32_at(data, 12), u32_at(data, 16)) else { return sets };
+        for index in 0..count as usize {
+            let at = entries as usize + index * 24;
+            let (Some(name), Some(hashed), Some(values), Some(value_count)) = (u32_at(data, at + 4), u32_at(data, at + 12), u32_at(data, at + 16), u32_at(data, at + 20)) else { break };
+            let mut hosts = Vec::new();
+            for value in 0..value_count as usize {
+                let at = values as usize + value * 20;
+                let (Some(importer), Some(importer_length), Some(host), Some(host_length)) = (u32_at(data, at + 4), u32_at(data, at + 8), u32_at(data, at + 12), u32_at(data, at + 16)) else { break };
+                hosts.push((text(importer, importer_length), text(host, host_length)));
+            }
+            sets.insert(text(name, hashed), hosts);
+        }
+        sets
+    }
+
+    /// O arquivo que atende o import `name` de `importer`: o próprio nome,
+    /// ou o anfitrião do API set (o do importador, se o esquema tiver um,
+    /// senão o padrão); None para um API set sem anfitrião, que o carregador
+    /// trata como ausente.
+    #[cfg(windows)]
+    fn host_of(sets: &std::collections::HashMap<String, Vec<(String, String)>>, name: &str, importer: &str) -> Option<String> {
+        let name = name.to_ascii_lowercase();
+        if !name.starts_with("api-") && !name.starts_with("ext-") {
+            return Some(name);
+        }
+        let stem = name.strip_suffix(".dll").unwrap_or(name.as_str());
+        let key = stem.rfind('-').map_or(stem, |cut| &stem[..cut]);
+        let hosts = sets.get(key)?;
+        let (_, default) = hosts.first()?;
+        let host = hosts.iter().skip(1).find(|(from, _)| from == importer).map_or(default, |(_, host)| host);
+        Some(host.clone()).filter(|host| !host.is_empty())
+    }
+
+    /// Os nomes (em minúsculas) das DLLs da tabela de imports estáticos de
+    /// um PE em arquivo.
+    #[cfg(windows)]
+    fn static_imports(bytes: &[u8]) -> Vec<String> {
+        use super::{u16_at, u32_at};
+        let mut names = Vec::new();
+        let Some(pe) = u32_at(bytes, 0x3C).map(|offset| offset as usize) else { return names };
+        let (Some(sections), Some(optional_size), Some(magic)) = (u16_at(bytes, pe + 6), u16_at(bytes, pe + 20), u16_at(bytes, pe + 24)) else { return names };
+        let optional = pe + 24;
+        let table = optional + optional_size as usize;
+        let to_offset = |rva: u32| -> Option<usize> {
+            (0..sections as usize).find_map(|index| {
+                let at = table + index * 40;
+                let (size, address, raw) = (u32_at(bytes, at + 8)?, u32_at(bytes, at + 12)?, u32_at(bytes, at + 20)?);
+                (rva >= address && rva - address < size).then(|| (rva - address + raw) as usize)
+            })
+        };
+        // O diretório de imports é o segundo: em +96 + 8 no PE32 e em
+        // +112 + 8 no PE32+.
+        let directories = if magic == 0x10B { optional + 96 } else { optional + 112 };
+        let Some(mut descriptor) = u32_at(bytes, directories + 8).filter(|&rva| rva != 0).and_then(to_offset) else { return names };
+        // IMAGE_IMPORT_DESCRIPTOR de 20 bytes, o nome em +12, até o
+        // descritor zerado.
+        while let Some(name) = u32_at(bytes, descriptor + 12).filter(|&rva| rva != 0) {
+            let Some(tail) = to_offset(name).and_then(|start| bytes.get(start..)) else { break };
+            let length = tail.iter().position(|&byte| byte == 0).unwrap_or(tail.len());
+            names.push(String::from_utf8_lossy(&tail[..length]).to_ascii_lowercase());
+            descriptor += 20;
+        }
+        names
+    }
+
+    /// Todo import estático dos programas do logon do usuário e do
+    /// explorer.exe resolve, pelos API sets desta máquina, para um programa
+    /// do volume (como o carregador do convidado os resolve).
+    #[cfg(windows)]
+    #[test]
+    fn user_logon_programs_close_under_static_imports() {
+        let windows = super::windows_directory();
+        let system32 = windows.join("System32");
+        let sets = api_sets(&std::fs::read(system32.join("apisetschema.dll")).expect("apisetschema.dll"));
+        assert!(!sets.is_empty(), "esquema de API sets vazio");
+        let staged: Vec<String> = user_programs().chain(super::WINDOWS_PROGRAMS.iter().copied()).map(str::to_ascii_lowercase).collect();
+        let roots = super::USER_LOGON_PROGRAMS.iter().map(|name| system32.join(name)).chain(super::WINDOWS_PROGRAMS.iter().map(|name| windows.join(name)));
+        let mut missing = Vec::new();
+        for path in roots {
+            let importer = path.file_name().and_then(|name| name.to_str()).unwrap_or_default().to_ascii_lowercase();
+            let bytes = std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            let imports = static_imports(&bytes);
+            assert!(!imports.is_empty(), "{importer} sem imports estáticos");
+            for import in imports {
+                if let Some(host) = host_of(&sets, &import, &importer).filter(|host| !staged.contains(host)) {
+                    missing.push(format!("{importer} -> {import} ({host})"));
+                }
+            }
+        }
+        assert!(missing.is_empty(), "imports estáticos fora do volume: {missing:?}");
     }
 }
