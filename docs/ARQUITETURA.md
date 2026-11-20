@@ -578,6 +578,28 @@ KernelMode com CONTEXT_XSTATE pelo PspSetContextThreadInternal e uma APC
 especial cuja rotina sobrescreve os 16 YMM, que voltam inteiros pelo
 NtContinueEx do frame).
 
+**Laço ocioso.** Como o KiIdleLoop do 19041 chama o HalProcessorIdle, o
+processador que não tem o que rodar dorme no HLT com as interrupções
+ligadas (`hal::cpu::processor_idle`, `sti; hlt`: a sombra do STI cobre o
+HLT, então uma interrupção que chega depois da conferência acorda o
+processador na hora). No BSP, o `scheduler::idle` do laço do kmain confere
+as esperas sondadas (se o tique daquela volta não acabou de conferir) e,
+com as interrupções desligadas, que não há thread pronta, IRQ por
+despachar nem DPC na fila e que a IRQL é PASSIVE_LEVEL; o tique do LAPIC a
+100 Hz, as IRQs de dispositivo e a NMI o acordam. Um KTIMER que vence antes
+do próximo tique faz o laço girar até ele, para vencer na hora. Os APs
+dormem no HLT do laço de trabalhos do trampolim com o IF desligado: o
+`smp::start_job` publica a rotina e manda a NMI, e a NMI que chega entre o
+teste do trabalho e o HLT volta ao teste (`ap_nmi_done`), sem perder o
+trabalho; os shootdowns e o congelamento do depurador já vinham pela NMI.
+Antes, cada CPU virtual girava sem parar: um QEMU de 4 CPUs ainda no boot
+gastava 4,3 núcleos do hospedeiro e agora gasta 1,5; o de 1 CPU parado na
+tela de logon, 1,4 e agora 0,05 (o resto era a thread de entrada do QEMU,
+que o test-boot agora fecha com um pipe em vez do NUL). O autoteste
+`ntos/test/kernel_waits.rs` confere que o `idle` dorme e que o tique o
+acorda, com as interrupções ligadas, e que um DPC na fila não o deixa
+dormir.
+
 **IPIs medidos em tempo.** Toda espera de resposta a um IPI (`ke/smp.rs`:
 o ICR voltar a ocioso depois do envio e as confirmações do shootdown de
 TLB) passa por `smp::stall_on_targets`, que lê o contador de desempenho (o
@@ -969,7 +991,13 @@ usuário e a associação de um pacote de espera, que guarda a contagem de
 pulsos de quando foi feita) é satisfeita por ele como o KiTryUnwaitThread do KePulseEvent
 satisfaz a registrada: todas num evento de notificação, uma por pulso num de
 sincronização cujo sinal nenhuma espera consumiu. O WaitAll não conta
-pulsos. O NtDelayExecution com intervalo zero,
+pulsos. Do mesmo jeito, o KeResetEvent e o KeClearEvent de um evento
+sinalizado (19041 0x344c50: só zeram o SignalState, e as esperas que o
+KeSetEvent já tinha satisfeito continuam satisfeitas) e o KeSetTimer que
+rearma um KTIMER ou KTIMER2 vencido anotam um pulso: a espera sondada que
+já esperava quando o objeto foi sinalizado conclui mesmo com o reset antes
+da sondagem dela, e a que começa depois do reset não (o `wait_objects` do
+`cm/notify.rs` também passa pelo `PolledObjects`). O NtDelayExecution com intervalo zero,
 sem Alertable e sem UserApcPending, é a troca do NtYieldExecution
 (STATUS_SUCCESS ou STATUS_NO_YIELD_PERFORMED), como no
 KeDelayExecutionThread. Os dois e o ZwYieldExecution escolhem como o
@@ -1020,13 +1048,30 @@ interrompe com STATUS_ALERTED; nos três a vaga da fila volta.
 
 **Despachante de todos os processos.** Um despachante só serve as threads
 de usuário de todos os processos vivos (`ps/user/threads.rs`):
-`dispatch_one` sonda as esperas de todas as threads dos processos que
-entraram nele (`ProcessState.started`), roda o `pump_kernel` e os pumps de
-ALPC, `device_io`, fábricas e pacotes de espera, retoma as threads
+`dispatch_one` roda o `pump_kernel` e os pumps de ALPC, `device_io`,
+fábricas e pacotes de espera, sonda depois deles as esperas de todas as
+threads dos processos que entraram nele (`ProcessState.started`), retoma as threads
 terminadas que precisam desfazer um serviço bloqueado, conclui os términos
 adiados e dá um intervalo à thread de usuário pronta mais prioritária da
 fila do `thread_dispatch`, de qualquer processo; a troca de thread corrente
-carrega a raiz do processo dela. Um despacho aninhado (um pump dentro do
+carrega a raiz do processo dela. A sondagem vai pela prioridade e, na mesma
+prioridade, pelo processo: sem PCID nem páginas globais, cada carga de CR3
+esvazia o TLB, também o do kernel; um NtDelayExecution já sondado se decide
+sem o contexto da thread (o alerta e as APCs são conferidos pelo ponteiro
+dela). O tique sonda no começo e, quando um intervalo deixa a fila vazia,
+chama o `dispatch_one` de novo, que sonda uma vez e já dá o intervalo à
+thread que o anterior acordou (um envio e espera ALPC, a resposta adiada de
+uma fábrica, o KeSetEvent de uma thread de kernel), como o KiUnwaitThread
+do 19041 a apronta dentro do sinal, em vez de esperar o próximo tique de
+10 ms. Os contadores do despachante (`ps/dispatch_perf.rs`: o tempo no HLT
+e no giro do laço ocioso, nas sondagens, com as esperas sondadas e as
+cargas de CR3, e no despacho fora dos intervalos) saem na serial a cada
+5 s como linhas `[perf]`, e o xtask anota em cada uma a hora do hospedeiro
+(`[xtask] [perf] aos N s`). Até a tela de logon eram duas sondagens por
+intervalo, e elas chegavam a 40% do tempo da CPU. O autoteste
+`ntos/test/multiprocess/polled_wake.rs` põe duas threads de usuário em
+pingue-pongue por dois eventos dentro de serviços de teste e conta as
+voltas num número fixo de tiques. Um despacho aninhado (um pump dentro do
 despacho) devolve `Idle`, e só o BSP despacha usuário (assert). Um processo
 entra no despachante por `ps/user/process.rs::start_created` (o CONTEXT do
 LdrInitializeThunk e o registro da thread principal) e anda com os outros,
@@ -1320,8 +1365,18 @@ além da KUSER_SHARED_DATA:
   seções do PE no layout virtual (o `pe_loader` com `prototype`: sem VA,
   sem relocação, sem imports, sem cookie e sem a tabela de exports). Todas
   as seções do mesmo arquivo usam a mesma control area (a identidade do
-  arquivo, o papel do ImageSectionObject); a seção e cada vista a retêm, e a
-  última referência devolve os frames. A vista (`image_view.rs`, o
+  arquivo, o papel do ImageSectionObject); a seção e cada vista a retêm.
+  Sem seção nem vista, a control area de um arquivo segue na lista das sem
+  uso (a MmUnusedSegmentList do 19041, em que o MiCheckControlArea a põe
+  com as páginas protótipo em standby): a seção seguinte do mesmo arquivo
+  usa as mesmas páginas sem ler o arquivo, se ele não mudou (o tamanho e as
+  horas de escrita e de mudança do $STANDARD_INFORMATION de quando ela foi
+  montada; um arquivo mudado ganha outra). As sem uso passam de um oitavo
+  da memória física (até 128 MB) ou voltam ao PFN pela recuperação de
+  memória (`page_residency`, o MiDeleteUnusedSegments), a mais antiga
+  primeiro. Antes, metade dos bytes de imagem lidos no boot até a tela de
+  logon era de recargas (o d3d10warp.dll seis vezes, a kernelbase.dll
+  cinco). Teste: `retained_image_segments` na fase 7. A vista (`image_view.rs`, o
   MiMapViewOfImageSection) mapeia na raiz do processo as páginas de código
   e somente leitura sobre os frames protótipo, divididos entre os processos
   e sem escrita, e as páginas graváveis sobre cópias privadas feitas no
@@ -3290,6 +3345,18 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   NtCreateUserProcess, mas por enquanto só registram a recusa
   (`[filesec] negaria`); a abertura segue com o acesso pedido. Teste:
   `file_security` na fase 7.
+- **Tamanho válido dos arquivos do volume de boot** (`drivers/fs/ntfs.rs`,
+  `ntfs_write.rs::mutate_data`): como o ntfs.sys, o NTFS do kernel não grava
+  zeros nos clusters que aloca. O $DATA não residente guarda o
+  ValidDataLength no tamanho inicializado (+56): a extensão (SetEndOfFile,
+  AllocationSize) só muda as runs e os tamanhos, a leitura acima do
+  ValidDataLength dá zeros sem ler os clusters, uma escrita acima dele zera
+  só o vão até ela e o leva ao fim dela, e o corte o traz ao tamanho novo. A
+  E/S de paginação dos arquivos de paginação lê os clusters crus (o
+  MiCreatePagingFile do 19041 só põe o EndOfFile, e o Mm só lê o que
+  gravou). Antes, os 448 MB do `D:\pagefile.sys` e do `C:\swapfile.sys`
+  eram gravados com zeros em todo boot do smss (de 5 a 17 s com a thread do
+  smss parada). Teste: `ntfs_writer` na fase 4.
 - **Estado por processo**: o que no NT mora no EPROCESS e o OpenNT ainda não
   guarda numa estrutura do NT fica em `ps/user/process_state.rs`, um
   `ProcessState` por EPROCESS (o System inclusive), criado por
