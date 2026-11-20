@@ -459,7 +459,9 @@ pub struct PeImage {
     pub physical_base: u64,
     pub preferred_base: u64,
     /// Frames de uma imagem de usuário ou os frames mestres de uma imagem de
-    /// sessão (vazio na de kernel).
+    /// sessão (vazio na de kernel). Os de uma carga protótipo passam a quem
+    /// recebe a imagem, que os devolve ao PFN (a control area da seção de
+    /// imagem): a carga não guarda outra lista deles.
     pub pages: Vec<u64>,
     pub page_protects: Vec<u32>,
     pub sections: Vec<SectionInfo>,
@@ -733,6 +735,7 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
             image_base = range.0;
             relocation_delta = image_base.wrapping_sub(preferred_base) as i64;
         }
+        owned.frames.reserve_exact(size_of_image.div_ceil(0x1000) as usize);
         for _ in 0..size_of_image.div_ceil(0x1000) {
             let frame = pfn::alloc_page();
             if frame == 0 {
@@ -977,7 +980,13 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
             exports,
             physical_base,
             preferred_base,
-            pages: if user_space || session { owned.frames.clone() } else { Vec::new() },
+            pages: if prototype {
+                core::mem::take(&mut owned.frames)
+            } else if user_space || session {
+                owned.frames.clone()
+            } else {
+                Vec::new()
+            },
             page_protects,
             sections: sections.clone(),
             resolved_imports,

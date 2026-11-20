@@ -50,9 +50,10 @@ const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 /// página pelas características das seções do PE.
 pub struct ImageSegment {
     key: SegmentKey,
-    /// A carga que é dona dos frames (devolvidos no `Drop`).
+    /// A carga protótipo (solta no `Drop`).
     image: SpinLock<Option<PeImage>>,
-    /// Um frame do PFN por página da imagem.
+    /// Um frame do PFN por página da imagem, desta control area (a carga os
+    /// entrega a ela e o `Drop` os devolve ao PFN).
     pub frames: Vec<u64>,
     /// PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE ou as variantes EXECUTE.
     pub protections: Vec<u32>,
@@ -202,6 +203,9 @@ impl Drop for ImageSegment {
                 crate::debug_print!("[section-image] control area {:?}: {}", self.key, error);
             }
         }
+        for &frame in &self.frames {
+            pfn::free_page(frame);
+        }
     }
 }
 
@@ -281,8 +285,8 @@ pub fn of_section(section: &Arc<Section>, name: &str) -> Result<Result<Arc<Image
                     return Ok(Err(if error.message.contains("PFN") { STATUS_INSUFFICIENT_RESOURCES } else { 0xC000_007B }));
                 }
             };
-            // Os vetores passam para a control area (a carga guardada só
-            // devolve os frames, pela lista própria dela).
+            // Os frames e as proteções passam para a control area, que
+            // devolve os frames ao PFN no fim.
             let (frames, protections) = (core::mem::take(&mut image.pages), core::mem::take(&mut image.page_protects));
             let created = Arc::new(ImageSegment { key: key.clone(), frames, protections, preferred_base: image.preferred_base, size_of_image: image.size_of_image, image: SpinLock::new(Some(image)), version });
             // Outra seção do mesmo arquivo pode ter montado a dela enquanto
