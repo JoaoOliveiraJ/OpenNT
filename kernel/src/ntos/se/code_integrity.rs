@@ -566,6 +566,38 @@ pub fn signing_callback(slot: SigningCallback) -> u64 {
     .get()
 }
 
+/// Autoteste do NtSetCachedSigningLevel sem a ci.dll (as suítes): uma
+/// SeCiCallbacks de teste só com o SetFileCache e o CompareSigningLevels,
+/// instalada apenas quando nenhuma CI foi inicializada. Os outros slots
+/// ficam nulos, e os callbacks dentro da imagem da CI continuam ausentes.
+/// Devolve a tabela para [`remove_test_signing_callbacks`].
+pub fn install_test_signing_callbacks(set_file_cache: u64, compare_signing_levels: u64) -> Option<u64> {
+    let mut state = STATE.lock();
+    if state.callbacks != 0 || state.initialization.is_some() {
+        return None;
+    }
+    let table = guest::alloc_bytes(core::mem::size_of::<CiCallbacks>() as u64);
+    if table == 0 {
+        return None;
+    }
+    guest::write_bytes(table, &[0; core::mem::size_of::<CiCallbacks>()]);
+    // SAFETY: a tabela de 0xE8 bytes recém-alocada.
+    let callbacks = unsafe { CiCallbacks::at(table) };
+    callbacks.set_file_cache.set(set_file_cache);
+    callbacks.compare_signing_levels.set(compare_signing_levels);
+    state.callbacks = table;
+    Some(table)
+}
+
+/// Tira a tabela de [`install_test_signing_callbacks`].
+pub fn remove_test_signing_callbacks(table: u64) {
+    let mut state = STATE.lock();
+    if state.callbacks == table && state.initialization.is_none() {
+        state.callbacks = 0;
+        guest::free_bytes(table);
+    }
+}
+
 /// Carrega a ci.dll, chama o CiInitialize com os provedores privados reais,
 /// inicializa a política e instala o validador de imagens de kernel. Uma
 /// falha fica registrada e é devolvida nas chamadas seguintes.

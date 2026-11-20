@@ -184,6 +184,32 @@ pub fn probe_and_lock_pages(descriptor: u64, operation: u32) {
     set_flags(descriptor, MDL_PAGES_LOCKED, 0);
 }
 
+/// MmProbeAndLockSelectedPages(Mdl, SegmentArray, AccessMode, Operation):
+/// o MDL de um buffer de usuário espalhado em páginas inteiras (o
+/// FILE_SEGMENT_ELEMENT do NtReadFileScatter/NtWriteFileGather), com
+/// StartVa = a primeira página. Cada página da lista volta ao working set
+/// pela sonda, o vetor de PFNs recebe o frame dela na ordem da lista e o
+/// frame fica travado até o MmUnlockPages, como numa sonda contígua; o MDL
+/// guarda o processo sondado. Quem chama já conferiu as páginas.
+pub fn probe_and_lock_selected_pages(descriptor: u64, segments: &[u64], operation: u32) {
+    let descriptor = mdl(descriptor);
+    if operation != IO_READ_ACCESS {
+        set_flags(descriptor, MDL_WRITE_OPERATION, 0);
+    } else {
+        set_flags(descriptor, 0, MDL_WRITE_OPERATION);
+    }
+    descriptor.process.set(crate::ntos::ps::process::get_current_process());
+    let (_, pages) = covered_pages(descriptor);
+    for (entry, &page) in pfn_array(descriptor, pages).iter().zip(segments.iter()) {
+        let page = page & !0xFFF;
+        let _ = guest::try_read::<u8>(page);
+        let frame = paging::translate(page) / 0x1000;
+        entry.set(frame);
+        super::working_set::lock_frame(frame * 0x1000);
+    }
+    set_flags(descriptor, MDL_PAGES_LOCKED, 0);
+}
+
 /// MmUnlockPages: como no NT, um mapeamento de sistema do MDL sai antes.
 pub fn unlock_pages(descriptor: u64) {
     if mdl(descriptor).mdl_flags.get() & MDL_MAPPED_TO_SYSTEM_VA != 0 && super::system_ptes::contains(mdl(descriptor).mapped_system_va.get()) {

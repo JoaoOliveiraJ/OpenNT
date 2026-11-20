@@ -114,6 +114,8 @@ const FO_SYNCHRONOUS_IO: u32 = 0x2;
 const FO_ALERTABLE_IO: u32 = 0x4;
 const FO_NO_INTERMEDIATE_BUFFERING: u32 = 0x8;
 const FO_WRITE_THROUGH: u32 = 0x10;
+/// IO_STACK_LOCATION.Flags do IRP_MJ_WRITE de um arquivo FO_WRITE_THROUGH.
+const SL_WRITE_THROUGH: u8 = 0x04;
 const FO_SEQUENTIAL_ONLY: u32 = 0x20;
 const FO_NAMED_PIPE: u32 = 0x80;
 const FO_MAILSLOT: u32 = 0x200;
@@ -793,6 +795,74 @@ pub fn transfer(arguments: &Transfer, write: bool) -> u32 {
         location.parameters.write.key.set(key);
     } else {
         location.parameters.read.key.set(key);
+    }
+    track(packet, &target, event, 0, arguments.apc_context);
+    synchronous_service_tail(&target, packet)
+}
+
+/// Os argumentos de NtReadFileScatter/NtWriteFileGather já validados por
+/// `io/file/scatter_gather`: o ByteOffset e a Key capturados.
+#[derive(Clone, Copy)]
+pub struct SegmentTransfer {
+    pub handle: u64,
+    pub event: u64,
+    pub apc_routine: u64,
+    pub apc_context: u64,
+    pub io_status: u64,
+    pub length: u32,
+    pub byte_offset: i64,
+    pub key: u32,
+}
+
+/// O IRP_MJ_READ (`write` = false) ou IRP_MJ_WRITE de NtReadFileScatter e
+/// NtWriteFileGather (ntoskrnl 0x67e7e8 e 0x67eff5) num arquivo de driver:
+/// o evento referenciado e limpo, o evento do FILE_OBJECT limpo
+/// (IopResetEvent), o IRP com IRP_NOCACHE, IRP_DEFER_IO_COMPLETION e a
+/// operação, o SL_WRITE_THROUGH de um FILE_OBJECT FO_WRITE_THROUGH, o
+/// UserBuffer na primeira página, o MDL do IoAllocateMdl sobre a primeira
+/// página com as páginas da lista travadas pelo MmProbeAndLockSelectedPages
+/// (para escrita na leitura) e o IopSynchronousServiceTail. A rotina de APC
+/// de usuário segue o NtReadFile deste caminho (STATUS_NOT_SUPPORTED).
+pub fn segment_transfer(arguments: &SegmentTransfer, segments: &[u64], write: bool) -> u32 {
+    let target = match reference(arguments.handle) {
+        Ok(target) => target,
+        Err(status) => return status,
+    };
+    if arguments.apc_routine != 0 {
+        return conclude(&target, false, None, STATUS_NOT_SUPPORTED);
+    }
+    let event = match reference_event(arguments.event) {
+        Ok(event) => event,
+        Err(status) => return conclude(&target, false, None, status),
+    };
+    dispatcher::clear_event(file_at(target.file).event.address());
+    let mut flags = IRP_DEFER_IO_COMPLETION | if write { IRP_WRITE_OPERATION } else { IRP_READ_OPERATION };
+    if target.flags & FO_NO_INTERMEDIATE_BUFFERING != 0 {
+        flags |= IRP_NOCACHE;
+    }
+    let first = segments.first().copied().unwrap_or(0);
+    let user_event = event.as_ref().map_or(0, |event| event.pointer);
+    let packet = allocate(&target, BuildOptions { major: if write { IRP_MJ_WRITE } else { IRP_MJ_READ }, buffer_length: arguments.length, byte_offset: arguments.byte_offset as u64, user_event, user_iosb: arguments.io_status, user_buffer: if arguments.length != 0 { first } else { 0 }, ..BuildOptions::default() }, flags);
+    if packet == 0 {
+        return conclude(&target, false, event, STATUS_INSUFFICIENT_RESOURCES);
+    }
+    let location = top_location(packet);
+    if write {
+        location.parameters.write.key.set(arguments.key);
+        if target.flags & FO_WRITE_THROUGH != 0 {
+            location.flags.set(SL_WRITE_THROUGH);
+        }
+    } else {
+        location.parameters.read.key.set(arguments.key);
+    }
+    if arguments.length != 0 {
+        let mdl = crate::ntos::io::mdl::allocate_mdl_for_irp(first, arguments.length, false, packet);
+        if mdl == 0 {
+            irp_builder::free_irp(packet);
+            return conclude(&target, false, event, STATUS_INSUFFICIENT_RESOURCES);
+        }
+        // Leitura: IoWriteAccess (o dispositivo escreve nas páginas).
+        crate::ntos::mm::mdl::probe_and_lock_selected_pages(mdl, segments, if write { 0 } else { 1 });
     }
     track(packet, &target, event, 0, arguments.apc_context);
     synchronous_service_tail(&target, packet)

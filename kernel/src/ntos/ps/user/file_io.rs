@@ -918,6 +918,53 @@ fn nt_write_file(handle: u64, event: u64, apc: u64, context: u64, rsp: u64) -> R
     file_transfer(handle, event, apc, context, rsp, true)
 }
 
+/// A leitura espalhada (`write` = false) ou a escrita reunida de um arquivo
+/// do volume de boot para NtReadFileScatter/NtWriteFileGather
+/// (`io/file/scatter_gather`, que já validou os argumentos): o arquivo
+/// revalidado, as travas de faixa de bytes do stream e os bytes entre o
+/// arquivo e as páginas da lista, uma página inteira por elemento e a
+/// última até `length`. A leitura a partir do fim é STATUS_END_OF_FILE e a
+/// que o cruza devolve até o fim; o ByteOffset -1 da escrita é o fim do
+/// arquivo. Devolve (status, Information), ou o status da recusa.
+pub fn segment_transfer(handle: u64, segments: &[u64], length: u32, offset: i64, key: u32, write: bool) -> Result<(u32, u64), u32> {
+    let failed = |error: KernelError| if error.status != 0 { error.status } else { 0xC000_0185 };
+    let (_, user_file) = object(handle).map_err(failed)?;
+    let file = &user_file.file;
+    if file.directory() {
+        return Err(0xC000_00BA);
+    }
+    let offset = if write && offset == -1 { file.size() } else { offset as u64 };
+    let length = length as u64;
+    if length != 0 && !crate::drivers::fs::volume_streams::transfer_allowed(user_file.file_object(), offset, length, key, crate::ntos::ps::process::get_current_process(), write) {
+        return Err(0xC000_0054);
+    }
+    let pages = segments.iter().enumerate().map(|(index, &page)| (page, (length - index as u64 * 0x1000).min(0x1000)));
+    if write {
+        let mut data = Vec::with_capacity(length as usize);
+        for (page, size) in pages {
+            data.extend_from_slice(&guest::try_read_bytes(page, size as usize).map_err(failed)?);
+        }
+        if data.is_empty() {
+            return Ok((0, 0));
+        }
+        let volume = volume_files::volume().ok_or(0xC000_000Eu32)?;
+        let count = volume.write(&file.volume_path(), offset, &data).map_err(failed)?;
+        file.refresh();
+        return Ok((0, count));
+    }
+    if length == 0 {
+        return Ok((0, 0));
+    }
+    if offset >= file.size() {
+        return Err(0xC000_0011);
+    }
+    let data = file.read_at(offset, length.min(file.size() - offset)).map_err(failed)?;
+    for ((page, _), chunk) in pages.zip(data.chunks(0x1000)) {
+        guest::try_write_bytes(page, chunk).map_err(failed)?;
+    }
+    Ok((0, data.len() as u64))
+}
+
 /// Registra os handlers implementados.
 pub fn init() {
     state::register_handler("NtQueryAttributesFile", nt_query_attributes_file);
@@ -925,7 +972,24 @@ pub fn init() {
     state::register_handler("NtQueryInformationFile", nt_query_information_file);
     state::register_handler("NtReadFile", nt_read_file);
     state::register_handler("NtWriteFile", nt_write_file);
+    state::register_handler("NtReadFileScatter", nt_read_file_scatter);
+    state::register_handler("NtWriteFileGather", nt_write_file_gather);
     init_part2();
+}
+
+/// NtReadFileScatter/NtWriteFileGather(FileHandle, Event, ApcRoutine,
+/// ApcContext, IoStatusBlock, SegmentArray, Length, ByteOffset, Key):
+/// `io/file/scatter_gather`.
+fn segment_request(handle: u64, event: u64, apc: u64, context: u64, rsp: u64) -> crate::ntos::io::file::scatter_gather::Request {
+    crate::ntos::io::file::scatter_gather::Request { handle, event, apc_routine: apc, apc_context: context, io_status: state::stack_arg(rsp, 5), segments: state::stack_arg(rsp, 6), length: state::stack_arg32(rsp, 7), byte_offset: state::stack_arg(rsp, 8), key: state::stack_arg(rsp, 9) }
+}
+
+fn nt_read_file_scatter(handle: u64, event: u64, apc: u64, context: u64, rsp: u64) -> Result<u32, KernelError> {
+    Ok(crate::ntos::io::file::scatter_gather::transfer(&segment_request(handle, event, apc, context, rsp), false))
+}
+
+fn nt_write_file_gather(handle: u64, event: u64, apc: u64, context: u64, rsp: u64) -> Result<u32, KernelError> {
+    Ok(crate::ntos::io::file::scatter_gather::transfer(&segment_request(handle, event, apc, context, rsp), true))
 }
 
 // ---- parte 2: NtSetInformationFile, flush, diretórios e volume -------------

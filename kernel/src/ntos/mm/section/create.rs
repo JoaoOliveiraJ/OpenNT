@@ -297,6 +297,50 @@ pub(crate) fn open_and_publish(pointer: u64, flags: u32, access: u32, mode: u8, 
 /// `file_object` vem preenchido).
 #[allow(clippy::too_many_arguments)]
 pub fn create(output: u64, access: u32, object_attributes: u64, size_pointer: u64, protect: u32, allocation: u32, file_handle: u64, mode: u8, object_request: Option<u64>) -> Result<u32, KernelError> {
+    create_common(output, access, object_attributes, size_pointer, protect, allocation, file_handle, mode, object_request, None)
+}
+
+/// NtCreateSectionEx(SectionHandle, DesiredAccess, ObjectAttributes,
+/// MaximumSize, SectionPageProtection, AllocationAttributes, FileHandle,
+/// ExtendedParameters, ExtendedParameterCount) (ntoskrnl 0x8c7960, o
+/// MiCreateSectionCommon sem a conversão dos bits de nó do NtCreateSection):
+/// os parâmetros estendidos são capturados depois dos atributos e das
+/// sondas (`mm/extended_parameters`); depois, como o
+/// MiInitializeCreateSectionPacket, os bits de nó no AllocationAttributes e
+/// um nó além de KeNumberNodes são STATUS_INVALID_PARAMETER. O
+/// UserPhysicalFlags é das seções AWE (`user_physical_section`).
+#[allow(clippy::too_many_arguments)]
+pub fn create_ex(output: u64, access: u32, object_attributes: u64, size_pointer: u64, protect: u32, allocation: u32, file_handle: u64, parameters: u64, count: u32, mode: u8) -> Result<u32, KernelError> {
+    create_common(output, access, object_attributes, size_pointer, protect, allocation, file_handle, mode, None, Some((parameters, count)))
+}
+
+/// MiCreatePagingFileMap com o UserPhysicalFlags (0x61c9a3): uma seção
+/// sem arquivo, só SEC_RESERVE entre os atributos aceitos (sem SEC_COMMIT,
+/// SEC_LARGE_PAGES com SEC_64K_PAGES ou SEC_NOCACHE com SEC_WRITECOMBINE),
+/// PAGE_READWRITE (STATUS_INVALID_PAGE_PROTECTION) e o
+/// SeLockMemoryPrivilege; numa seção de arquivo ou de imagem, o
+/// MiCreateImageOrDataSection recusa com STATUS_INVALID_PARAMETER_6.
+fn user_physical_section(allocation: u32, protect: u32, file_handle: u64, mode: u8) -> u32 {
+    if file_handle != 0 {
+        return 0xC000_00F4;
+    }
+    let attributes = allocation & !0x7F;
+    if attributes & 0x2BF7_FFFF != 0 || attributes & 0x0400_0000 == 0 || attributes & 0x0800_0000 != 0 || attributes & 0x8008_0000 == 0x8008_0000 || attributes & 0x5000_0000 == 0x5000_0000 {
+        return 0xC000_000D;
+    }
+    if protect & 7 != 4 {
+        return 0xC000_0045;
+    }
+    if protect != 4 {
+        return 0xC000_000D;
+    }
+    // As seções AWE seguem as páginas físicas de usuário do processo
+    // (`mm/physical_pages`).
+    crate::ntos::mm::physical_pages::user_physical_section(privilege(4, mode))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_common(output: u64, access: u32, object_attributes: u64, size_pointer: u64, protect: u32, allocation: u32, file_handle: u64, mode: u8, object_request: Option<u64>, extended: Option<(u64, u32)>) -> Result<u32, KernelError> {
     if irql::get_irql() != 0 {
         return Err(KernelError::new("ZwCreateSection requires PASSIVE_LEVEL"));
     }
@@ -306,6 +350,21 @@ pub fn create(output: u64, access: u32, object_attributes: u64, size_pointer: u6
     // A entrada Mm recebe MaximumSize por ponteiro obrigatório; Nt/Zw aceitam NULL.
     let size = if size_pointer != 0 || object_request.is_some() { guest::try_read64(size_pointer)? } else { 0 };
     let kernel_object = object_request.is_some();
+    if let Some((parameters, count)) = extended {
+        if let Decoded::Status(status) = section_parameters::decode(allocation, protect, size, file_handle, 1, kernel_object) {
+            return Ok(status);
+        }
+        let captured = match crate::ntos::mm::extended_parameters::capture_section_create(parameters, count, mode != 0) {
+            Ok(captured) => captured,
+            Err(status) => return Ok(status),
+        };
+        if allocation & 0x7F != 0 || captured.numa_node_plus_one > crate::ntos::ke::processor_group::number_nodes() as u32 {
+            return Ok(0xC000_000D);
+        }
+        if captured.user_physical_flags.is_some() {
+            return Ok(user_physical_section(allocation, protect, file_handle, mode));
+        }
+    }
     let mut file_handle = file_handle;
     let mut partition_body = None;
     let request = match section_parameters::decode(allocation, protect, size, file_handle, 1, kernel_object) {

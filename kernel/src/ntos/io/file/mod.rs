@@ -3,7 +3,8 @@
 //! atributos estendidos (NtQueryEaFile, NtSetEaFile), a notificação de
 //! mudança de diretório (NtNotifyChangeDirectoryFile), os serviços de modo
 //! usuário sobre IRP, a criação de pipes e mailslots, a contagem de
-//! keep-alive dos processos por arquivo e a cópia do NtCopyFileChunk.
+//! keep-alive dos processos por arquivo, a cópia do NtCopyFileChunk e a E/S
+//! por lista de páginas (NtReadFileScatter, NtWriteFileGather).
 
 pub mod read;
 pub mod write;
@@ -21,3 +22,4 @@ pub mod irp_service;
 pub mod pipe_mailslot;
 pub mod keep_alive;
 pub mod copy_chunk;
+pub mod scatter_gather;

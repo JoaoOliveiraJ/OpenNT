@@ -756,6 +756,12 @@ fn nt_create_section(handle_pointer: u64, access: u64, attributes: u64, size_poi
     create_section::create(handle_pointer, access as u32, attributes, size_pointer, state::stack_arg32(rsp, 5), state::stack_arg32(rsp, 6), state::stack_arg(rsp, 7), 1, None)
 }
 
+/// NtCreateSectionEx(handle*, access, oa?, maxSize*, pageProt, secProt,
+/// file, ExtendedParameters, ExtendedParameterCount).
+fn nt_create_section_ex(handle_pointer: u64, access: u64, attributes: u64, size_pointer: u64, rsp: u64) -> Result<u32, KernelError> {
+    create_section::create_ex(handle_pointer, access as u32, attributes, size_pointer, state::stack_arg32(rsp, 5), state::stack_arg32(rsp, 6), state::stack_arg(rsp, 7), state::stack_arg(rsp, 8), state::stack_arg32(rsp, 9), 1)
+}
+
 fn nt_open_section(handle_pointer: u64, access: u64, attributes: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
     open_section::open(handle_pointer, access as u32, attributes, 1)
 }
@@ -764,6 +770,12 @@ fn nt_open_section(handle_pointer: u64, access: u64, attributes: u64, _a4: u64, 
 /// viewSize*, inherit, allocType, protect).
 fn nt_map_view_of_section(section: u64, process_handle: u64, base_pointer: u64, zero_bits: u64, rsp: u64) -> Result<u32, KernelError> {
     map_view::map(section, process_handle, base_pointer, zero_bits, state::stack_arg(rsp, 5), state::stack_arg(rsp, 6), state::stack_arg(rsp, 7), state::stack_arg32(rsp, 8), state::stack_arg32(rsp, 9), state::stack_arg32(rsp, 10), 1)
+}
+
+/// NtMapViewOfSectionEx(section, process, base*, offset*, viewSize*,
+/// allocType, protect, ExtendedParameters, ExtendedParameterCount).
+fn nt_map_view_of_section_ex(section: u64, process_handle: u64, base_pointer: u64, offset_pointer: u64, rsp: u64) -> Result<u32, KernelError> {
+    map_view::map_ex(section, process_handle, base_pointer, offset_pointer, state::stack_arg(rsp, 5), state::stack_arg32(rsp, 6), state::stack_arg32(rsp, 7), state::stack_arg(rsp, 8), state::stack_arg32(rsp, 9), 1)
 }
 
 fn nt_unmap_view_of_section(process_handle: u64, base: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
@@ -845,6 +857,8 @@ pub fn init() {
     state::register_handler("NtFsControlFile", nt_fs_control_file);
     state::register_handler("NtClose", nt_close);
     state::register_handler("NtCreateSection", nt_create_section);
+    state::register_handler("NtCreateSectionEx", nt_create_section_ex);
+    state::register_handler("NtMapViewOfSectionEx", nt_map_view_of_section_ex);
     state::register_handler("NtOpenSection", nt_open_section);
     state::register_handler("NtMapViewOfSection", nt_map_view_of_section);
     state::register_handler("NtUnmapViewOfSection", nt_unmap_view_of_section);

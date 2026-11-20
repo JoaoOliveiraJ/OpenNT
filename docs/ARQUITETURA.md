@@ -1619,6 +1619,20 @@ além da KUSER_SHARED_DATA:
   que `ob/objects/section.rs` aplica às seções marcadas. Vistas dela (o
   MiMapViewOfPhysicalSection) ainda não existem: o NtMapViewOfSection
   recusa com uma linha `[section]` na serial.
+- **NtCreateSectionEx e NtMapViewOfSectionEx** (`mm/section/create.rs`,
+  `mm/section/map_view.rs`): os parâmetros estendidos passam pelas capturas
+  do 19041 (`mm/extended_parameters.rs`: o vetor sondado para escrita, um
+  tipo de cada, o cabeçalho sem bits reservados, o nó como nó + 1). A seção
+  aceita UserPhysicalFlags e NumaNode, recusa os bits de nó no
+  AllocationAttributes, e a seção de páginas físicas de usuário (AWE) passa
+  pelas regras do MiCreatePagingFileMap até o SeLockMemoryPrivilege
+  (`mm/physical_pages.rs`). A vista é ViewShare, sem ZeroBits nem
+  CommitSize, com AddressRequirements (o MiMapExParametersInitialize: sem
+  Alignment, LowestStartingAddress na granularidade, HighestEndingAddress
+  no fim de uma página e até 0x7FFFFFFEFFFF, nada com uma base pedida),
+  NumaNode e o AttributeFlags SOFT_FAULT_PAGES; a base e o deslocamento
+  fora da granularidade dão STATUS_MAPPED_ALIGNMENT, e o
+  MEM_REPLACE_PLACEHOLDER não acha placeholder (STATUS_CONFLICTING_ADDRESSES).
 - **Seções do VidMm e do DirectComposition** (`mm/section/create.rs`,
   `insert.rs`, `ps/user/sections.rs`): uma seção de pagefile com SEC_COMMIT
   tem os frames confirmados na criação, e toda vista (a de sistema, a de
@@ -3581,7 +3595,17 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   kernel), NtCancelSynchronousIoFile (as requisições síncronas da thread
   canceladas, ou STATUS_NOT_FOUND) e NtDeleteFile (a abertura DeleteOnly com
   FILE_DELETE_ON_CLOSE) seguem o 19041 (teste `user_desktop_services` na
-  fase 7). Um arquivo do volume aberto pelo modo usuário não tem o backing do
+  fase 7). O NtReadFileScatter e o NtWriteFileGather (`io/file/scatter_gather.rs`)
+  fazem as checagens do 19041 na ordem de cada serviço (arquivo
+  FO_NO_INTERMEDIATE_BUFFERING e assíncrono, dispositivo de file system sem
+  DO_BUFFERED_IO, a lista de páginas inteiras alinhada e copiada, o setor do
+  dispositivo, o ByteOffset obrigatório); num arquivo de driver o IRP leva o
+  MDL das páginas da lista (MmProbeAndLockSelectedPages, `mm/mdl.rs`), e num
+  arquivo do volume os bytes vão entre o arquivo e as páginas ali mesmo
+  (`ps/user/file_io::segment_transfer`), com a conclusão de um pedido
+  assíncrono atendido na hora: o IO_STATUS_BLOCK, o evento (ou o do
+  FILE_OBJECT), a APC de usuário ou o pacote da porta de conclusão (teste
+  `user_extended_services` na fase 7). Um arquivo do volume aberto pelo modo usuário não tem o backing do
   ZwCreateFile: as seções graváveis (`mm/section/file.rs`) e as EAs
   (`io/kernel_ea.rs`) usam o volume e o caminho da fonte do FILE_OBJECT. O volume de boot guarda o conteúdo de
   `\Windows` na raiz (os programas de System32, `Fonts`, os temas...), que o
@@ -5678,8 +5702,12 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     CI (`se/code_integrity.rs`); sem CI inicializada, FALSE/STATUS_UNSUCCESSFUL;
     de modo usuário, o NtGetCachedSigningLevel (a falha da CI, como o
     STATUS_NOT_FOUND de um arquivo sem cache, volta antes de qualquer sonda
-    das saídas) e o NtCompareSigningLevels (STATUS_INVALID_IMAGE_HASH quando a
-    CI diz que o nível não basta);
+    das saídas), o NtCompareSigningLevels (STATUS_INVALID_IMAGE_HASH quando a
+    CI diz que o nível não basta) e o NtSetCachedSigningLevel(2) (as checagens
+    comuns, a flag 2 recusada, o nível do processo PPL ou o 0 da flag 4, os
+    handles e o SE_SET_FILE_CACHE_INFORMATION capturados, a CI com UserMode;
+    teste `user_extended_services` com uma SeCiCallbacks de teste quando a CI
+    não está carregada);
   - o rastreamento de I/O (`io/io_perf.rs`): com um IoRegisterIoTracking
     ativo, o IofCallDriver carimba a extensão Timestamp do IRP e o
     IofCompleteRequest entrega o tempo decorrido e o DeviceType a cada

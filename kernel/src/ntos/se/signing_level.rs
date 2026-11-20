@@ -20,9 +20,27 @@
 //!   sondadas (Flags e ThumbprintSize alinhados a 4, SigningLevel e
 //!   Thumbprint a 1, ThumbprintAlgorithm a 4) e gravadas; uma exceção é o
 //!   status.
+//! - NtSetCachedSigningLevel(Flags, InputSigningLevel, SourceFiles,
+//!   SourceFileCount, TargetFile) e NtSetCachedSigningLevel2 (0x72b410, com
+//!   o SE_SET_FILE_CACHE_INFORMATION opcional no sexto argumento): as
+//!   checagens comuns do modo kernel; depois a flag 2 é
+//!   STATUS_INVALID_PARAMETER_1 e a flag 1 é ligada. Sem a flag 4, só um
+//!   processo PPL (PS_PROTECTION.Type 1) grava (STATUS_ACCESS_DENIED), com o
+//!   nível de assinatura do processo, ou o das seções quando o
+//!   CompareSigningLevels da CI não o aceita acima dele; com a flag 4, o
+//!   nível 0. Os handles de origem (alinhados a 8) e o
+//!   SE_SET_FILE_CACHE_INFORMATION (alinhado a 4, 0x18 bytes, Size menor é
+//!   STATUS_INVALID_PARAMETER_6) são sondados e copiados; o caminho do
+//!   catálogo é capturado como o SepCaptureUnicodeStringArray (buffer
+//!   alinhado a 2, MaximumLength = Length) e validado pelo
+//!   RtlUnicodeStringValidateEx. A CI recebe UserMode como modo anterior e
+//!   abre os handles por conta própria, nos volumes servidos pelo kernel
+//!   como em qualquer outro (o EA $KERNEL.PURGE.ESBCACHE).
 
 use crate::hal::amd64::native_call;
 use crate::ntos::ex::pool_allocation;
+use crate::ntos::inc::field::NtStruct;
+use crate::ntos::inc::types::Eprocess;
 use crate::ntos::init::exports;
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::ob::object_types;
@@ -274,10 +292,164 @@ fn nt_get_cached_signing_level(file: u64, flags: u64, level: u64, thumbprint: u6
     get_cached_user(file, flags, level, thumbprint, state::stack_arg(rsp, 5), state::stack_arg(rsp, 6))
 }
 
-/// Os handlers dos serviços NtCompareSigningLevels e
-/// NtGetCachedSigningLevel de modo usuário.
+const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+const STATUS_INVALID_PARAMETER_6: u32 = 0xC000_00F4;
+/// 'SeAt', a cópia do SepCaptureUnicodeStringArray.
+const CAPTURED_STRING_TAG: u32 = 0x7441_6553;
+/// PsProtectedTypeProtectedLight.
+const PROTECTED_LIGHT: u8 = 1;
+/// SE_SET_FILE_CACHE_INFORMATION: Size e o UNICODE_STRING
+/// CatalogDirectoryPath em +8.
+const CACHE_INFORMATION_SIZE: u64 = 0x18;
+
+/// O ProbeForRead de uma entrada de modo usuário: alinhamento e faixa.
+fn probe_input(address: u64, length: u64, alignment: u64) -> Result<(), u32> {
+    if length == 0 {
+        return Ok(());
+    }
+    if address & (alignment - 1) != 0 {
+        return Err(STATUS_DATATYPE_MISALIGNMENT);
+    }
+    if !crate::ntos::ps::user_probe::probe_user_read(address, length) {
+        return Err(STATUS_ACCESS_VIOLATION);
+    }
+    Ok(())
+}
+
+/// O nível que um processo de modo usuário grava sem a flag 4: só um
+/// processo PPL; o nível de assinatura dele, ou o das seções quando o
+/// CompareSigningLevels da CI (ou a falta dele) não aceita o das seções
+/// como satisfazendo o do processo.
+fn user_level() -> Result<u8, u32> {
+    // SAFETY: o processo corrente (ApcState.Process) está vivo durante o
+    // serviço.
+    let process = unsafe { Eprocess::at(crate::ntos::ps::process::get_current_process()) };
+    if process.protection.type_() != PROTECTED_LIGHT {
+        return Err(STATUS_ACCESS_DENIED);
+    }
+    let signer = process.signature_level.get() & 0xF;
+    let section = process.section_signature_level.get() & 0xF;
+    let accepted = match code_integrity::signing_callback(SigningCallback::CompareSigningLevels) {
+        0 => false,
+        routine => native_call::call(routine, &[section as u64, signer as u64]) as u32 != 0,
+    };
+    Ok(if accepted { signer } else { section })
+}
+
+/// O SepCaptureUnicodeStringArray de um UNICODE_STRING de modo usuário:
+/// uma alocação 'SeAt' com a estrutura e o texto, MaximumLength = Length;
+/// o buffer alinhado a 2 e sondado. Depois, o RtlUnicodeStringValidateEx
+/// da cópia (Length par).
+fn capture_catalog_path(string: u64) -> Result<u64, u32> {
+    let fault = |error: KernelError| error.status;
+    probe_input(string, 16, 4)?;
+    let length = guest::try_read::<u16>(string).map_err(fault)? as u64;
+    let buffer = guest::try_read::<u64>(string + 8).map_err(fault)?;
+    if length != 0 {
+        if buffer & 1 != 0 {
+            return Err(STATUS_DATATYPE_MISALIGNMENT);
+        }
+        probe_input(buffer, length, 1)?;
+    }
+    let text = guest::try_read_bytes(buffer, length as usize).map_err(fault)?;
+    let copy = pool_allocation::allocate_tagged(PAGED_POOL, 16 + length, CAPTURED_STRING_TAG).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+    if copy == 0 {
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    }
+    guest::write16(copy, length as u16);
+    guest::write16(copy + 2, length as u16);
+    guest::write32(copy + 4, 0);
+    guest::write64(copy + 8, copy + 16);
+    guest::write_bytes(copy + 16, &text);
+    if length & 1 != 0 {
+        let _ = pool_allocation::free(copy, CAPTURED_STRING_TAG as u64);
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    Ok(copy)
+}
+
+/// NtSetCachedSigningLevel2(Flags, InputSigningLevel, SourceFiles,
+/// SourceFileCount, TargetFile, CacheInformation) de modo usuário (o
+/// NtSetCachedSigningLevel passa CacheInformation nulo).
+pub fn set_cached_user(flags: u32, input_level: u8, source_files: u64, count: u32, target: u64, cache_information: u64) -> Result<u32, KernelError> {
+    let routine = code_integrity::signing_callback(SigningCallback::SetFileCache);
+    if routine == 0 {
+        return Ok(STATUS_UNSUCCESSFUL);
+    }
+    if input_level & 0x30 != 0 {
+        return Ok(STATUS_INVALID_PARAMETER_2);
+    }
+    if count.wrapping_sub(1) > 0xFFF {
+        return Ok(STATUS_INVALID_PARAMETER_4);
+    }
+    if flags & 6 == 0 && input_level != 0 {
+        return Ok(STATUS_INVALID_PARAMETER_2);
+    }
+    if flags & 3 == 3 || flags & 2 != 0 {
+        return Ok(STATUS_INVALID_PARAMETER_1);
+    }
+    let flags = flags | 1;
+    let level = if flags & 4 != 0 {
+        0
+    } else {
+        match user_level() {
+            Ok(level) => level,
+            Err(status) => return Ok(status),
+        }
+    };
+    let bytes = count as u64 * 8;
+    let copy = pool_allocation::allocate_tagged(PAGED_POOL, bytes, SOURCE_FILES_TAG)?;
+    if copy == 0 {
+        return Ok(STATUS_INSUFFICIENT_RESOURCES);
+    }
+    let mut captured = 0;
+    let status = (|| -> Result<u32, u32> {
+        let fault = |error: KernelError| error.status;
+        probe_input(source_files, bytes, 8)?;
+        if cache_information != 0 {
+            probe_input(cache_information, CACHE_INFORMATION_SIZE, 4)?;
+        }
+        guest::write_bytes(copy, &guest::try_read_bytes(source_files, bytes as usize).map_err(fault)?);
+        if cache_information != 0 {
+            if guest::try_read::<u32>(cache_information).map_err(fault)? < CACHE_INFORMATION_SIZE as u32 {
+                return Err(STATUS_INVALID_PARAMETER_6);
+            }
+            if guest::try_read::<u16>(cache_information + 8).map_err(fault)? != 0 {
+                captured = capture_catalog_path(cache_information + 8)?;
+            }
+        }
+        if flags & 6 != 0 && count != 1 {
+            return Err(STATUS_INVALID_PARAMETER_4);
+        }
+        if flags & 6 != 0 && guest::read64(copy) != target {
+            return Err(STATUS_INVALID_PARAMETER_5);
+        }
+        Ok(native_call::call(routine, &[(flags & 0x807) as u64, USER_MODE, input_level as u64, level as u64, copy, count as u64, target, captured]) as u32)
+    })()
+    .unwrap_or_else(|status| status);
+    if captured != 0 {
+        pool_allocation::free(captured, CAPTURED_STRING_TAG as u64)?;
+    }
+    pool_allocation::free(copy, SOURCE_FILES_TAG as u64)?;
+    Ok(status)
+}
+
+fn nt_set_cached_signing_level(flags: u64, input_level: u64, source_files: u64, count: u64, rsp: u64) -> Result<u32, KernelError> {
+    use crate::ntos::ps::user::state;
+    set_cached_user(flags as u32, input_level as u8, source_files, count as u32, state::stack_arg(rsp, 5), 0)
+}
+
+fn nt_set_cached_signing_level2(flags: u64, input_level: u64, source_files: u64, count: u64, rsp: u64) -> Result<u32, KernelError> {
+    use crate::ntos::ps::user::state;
+    set_cached_user(flags as u32, input_level as u8, source_files, count as u32, state::stack_arg(rsp, 5), state::stack_arg(rsp, 6))
+}
+
+/// Os handlers dos serviços NtCompareSigningLevels, NtGetCachedSigningLevel
+/// e NtSetCachedSigningLevel(2) de modo usuário.
 pub fn register_user_services() {
     use crate::ntos::ps::user::state;
     state::register_handler("NtCompareSigningLevels", nt_compare_signing_levels);
     state::register_handler("NtGetCachedSigningLevel", nt_get_cached_signing_level);
+    state::register_handler("NtSetCachedSigningLevel", nt_set_cached_signing_level);
+    state::register_handler("NtSetCachedSigningLevel2", nt_set_cached_signing_level2);
 }

@@ -39,6 +39,82 @@ const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 
 #[allow(clippy::too_many_arguments)]
 pub fn map(section_handle: u64, process_handle: u64, base_pointer: u64, zero_bits: u64, commit_size: u64, offset_pointer: u64, size_pointer: u64, inherit: u32, allocation: u32, protect: u32, mode: u8) -> Result<u32, KernelError> {
+    map_common(section_handle, process_handle, base_pointer, zero_bits, commit_size, offset_pointer, size_pointer, inherit, allocation, protect, mode, None)
+}
+
+/// NtMapViewOfSectionEx(SectionHandle, ProcessHandle, BaseAddress*,
+/// SectionOffset*, ViewSize*, AllocationType, Win32Protect,
+/// ExtendedParameters, ExtendedParameterCount) (ntoskrnl 0x6fb890, o
+/// MiMapViewOfSectionExCommon): o NtMapViewOfSection sem ZeroBits nem
+/// CommitSize, com a vista ViewShare; os parâmetros estendidos
+/// AddressRequirements, NumaNode e AttributeFlags (só
+/// MEM_EXTENDED_PARAMETER_SOFT_FAULT_PAGES) capturados depois dos ponteiros
+/// e conferidos pelo MiMapExParametersInitialize ([`extended_bounds`]); a
+/// base e o deslocamento alinhados à granularidade (STATUS_MAPPED_ALIGNMENT,
+/// o MiMapViewOfSection) e a vista entre LowestStartingAddress e
+/// HighestEndingAddress.
+#[allow(clippy::too_many_arguments)]
+pub fn map_ex(section_handle: u64, process_handle: u64, base_pointer: u64, offset_pointer: u64, size_pointer: u64, allocation: u32, protect: u32, parameters: u64, count: u32, mode: u8) -> Result<u32, KernelError> {
+    map_common(section_handle, process_handle, base_pointer, 0, 0, offset_pointer, size_pointer, VIEW_SHARE, allocation, protect, mode, Some((parameters, count)))
+}
+
+/// ViewShare.
+const VIEW_SHARE: u32 = 1;
+/// MEM_REPLACE_PLACEHOLDER.
+const MEM_REPLACE_PLACEHOLDER: u32 = 0x4000;
+/// MEM_EXTENDED_PARAMETER_SOFT_FAULT_PAGES, o único AttributeFlags de vista.
+const SOFT_FAULT_PAGES: u64 = 0x20;
+/// MiGetUserReservationHighestAddress de um processo de 64 bits.
+const USER_RESERVATION_HIGHEST: u64 = 0x7FFF_FFFE_FFFF;
+const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+const STATUS_MAPPED_ALIGNMENT: u32 = 0xC000_0220;
+const STATUS_CONFLICTING_ADDRESSES: u32 = 0xC000_0018;
+
+/// MiMapExParametersInitialize (0x6fcda8): sem Alignment; com
+/// MEM_REPLACE_PLACEHOLDER sem faixa e com granularidade de página;
+/// LowestStartingAddress alinhado à granularidade; uma base pedida sem
+/// faixa; HighestEndingAddress (0 = o topo das reservas de usuário) até
+/// 0x7FFFFFFEFFFF e terminando numa página; a faixa acima de Lowest e
+/// cabendo o ViewSize pedido; nenhum nó no AllocationType e o nó dentro de
+/// KeNumberNodes. Devolve (Lowest, Highest inclusivo, granularidade).
+fn extended_bounds(captured: &crate::ntos::mm::extended_parameters::AllocateMap, base: u64, size: u64, allocation: u32) -> Result<(u64, u64, u64), u32> {
+    if captured.alignment != 0 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let mut granularity = 0x1_0000;
+    if allocation & MEM_REPLACE_PLACEHOLDER != 0 {
+        if captured.lowest != 0 || captured.highest != 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        granularity = 0x1000;
+    }
+    if captured.lowest & (granularity - 1) != 0 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    if base != 0 && (captured.lowest != 0 || captured.highest != 0) {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let highest = if captured.highest == 0 {
+        USER_RESERVATION_HIGHEST
+    } else if captured.highest > USER_RESERVATION_HIGHEST || (captured.highest + 1) & 0xFFF != 0 {
+        return Err(STATUS_INVALID_PARAMETER);
+    } else {
+        captured.highest
+    };
+    if captured.lowest >= highest {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    if size != 0 && highest - captured.lowest + 1 < size {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    if allocation & 0x7F != 0 || captured.numa_node_plus_one > crate::ntos::ke::processor_group::number_nodes() as u32 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    Ok((captured.lowest, highest, granularity))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn map_common(section_handle: u64, process_handle: u64, base_pointer: u64, zero_bits: u64, commit_size: u64, offset_pointer: u64, size_pointer: u64, inherit: u32, allocation: u32, protect: u32, mode: u8, extended: Option<(u64, u32)>) -> Result<u32, KernelError> {
     if irql::get_irql() != 0 {
         return Err(KernelError::new("section mapping requires PASSIVE_LEVEL"));
     }
@@ -68,9 +144,34 @@ pub fn map(section_handle: u64, process_handle: u64, base_pointer: u64, zero_bit
         if crate::ntos::mm::section::physical_memory::is_physical_memory(reference.pointer) {
             debug_print!("[section] vista de \\Device\\PhysicalMemory (offset {:#x}, tamanho {:#x}) ainda sem suporte", offset, size);
         }
+        let captured_extended = match extended {
+            Some((parameters, count)) => match crate::ntos::mm::extended_parameters::capture_allocate_map(parameters, count, mode != 0, 1 << 1 | 1 << 2 | 1 << 5) {
+                Ok(captured) if captured.attribute_flags & !SOFT_FAULT_PAGES != 0 => return Ok(STATUS_INVALID_PARAMETER),
+                Ok(captured) => Some(captured),
+                Err(status) => return Ok(status),
+            },
+            None => None,
+        };
         let Some(section) = reference.section.clone() else { return Ok(0xC000_0024) };
         let traits = SectionTraits { is_image: section.is_image, size: section.size, page_protect: section.page_protect(), cache_flags: section.state.lock().cache_flags };
         let input = MapInput { zero: zero_bits, protect, base, size, offset, allocation, inherit, numa_nodes: 0, commit: commit_size };
+        let bounds = match &captured_extended {
+            Some(captured) => match extended_bounds(captured, base, size, allocation) {
+                Ok(bounds) => Some(bounds),
+                Err(status) => return Ok(status),
+            },
+            None => None,
+        };
+        if let Some((_, _, granularity)) = bounds {
+            if !crate::ntos::mm::section::physical_memory::is_physical_memory(reference.pointer) && (base | offset) & (granularity - 1) != 0 {
+                return Ok(STATUS_MAPPED_ALIGNMENT);
+            }
+            // O MiFindPlaceholderVadToReplace não acha placeholder: o OpenNT
+            // não cria reservas de placeholder (`ps/user/memory::free_in`).
+            if allocation & MEM_REPLACE_PLACEHOLDER != 0 {
+                return Ok(STATUS_CONFLICTING_ADDRESSES);
+            }
+        }
         let request = match map_view_parameters::decode(&traits, &input, Some(prefix)) {
             Decoded::Status(status) => return Ok(status),
             Decoded::Boundary(reason) => Err(reason),
@@ -121,7 +222,8 @@ pub fn map(section_handle: u64, process_handle: u64, base_pointer: u64, zero_bit
                 protect: request.protect,
                 commit_size: request.commit,
                 alignment: request.alignment,
-                upper: Some(request.upper),
+                upper: Some(bounds.map_or(request.upper, |(_, highest, _)| highest.min(request.upper))),
+                minimum: bounds.map(|(lowest, _, _)| lowest).filter(|&lowest| lowest != 0),
                 reserve: request.allocation & 0x2000 != 0,
                 top_down: request.allocation & 0x10_0000 != 0,
                 no_change: request.allocation & 0x40_0000 != 0,
