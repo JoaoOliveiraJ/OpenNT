@@ -4824,7 +4824,10 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   (`po/power_information.rs`: o PlatformInformation, o PlatformRole e o
   PowerInformationInternal 4). As definições WNF desta máquina
   (`Control\Notifications`), a ProductOptions e a ProfileList vêm do
-  xtask, e o NtGetCompleteWnfStateSubscription entrega ao modo usuário os
+  xtask; o ProductPolicy é o de uma instalação limpa e não ativada da
+  edição (`xtask/src/product_policy.rs`: só as entradas das licenças PPD da
+  edição, com os dados delas, e o estado de ativação de uma instalação
+  nova), e o NtGetCompleteWnfStateSubscription entrega ao modo usuário os
   callbacks WNF (`ex/wnf/notifications.rs`). O svchost do rpcss sobe o
   RpcEptMapper (`\RPC Control\epmapper`) e o RpcSs, que pede o
   NtPowerInformation 58 (o PowerSettingRegisterNotification do powrprof),
