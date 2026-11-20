@@ -305,15 +305,18 @@ pub fn same_screen(a: &Image, b: &Image) -> bool {
 // O `--mouse` do test-boot move o mouse PS/2 do QEMU pelo monitor e lê a tela
 // antes e depois ([`cursor_moved`]). O ponteiro do Windows é a seta branca
 // com contorno preto (12x19 pixels no tamanho padrão) que o adaptador de
-// vídeo desenha por cima da tela: quando ele anda, a tela muda só em dois
-// lugares do tamanho dele, onde ele estava e onde está.
+// vídeo desenha por cima da tela. Quando ele anda, a tela muda onde ele
+// estava e onde está; um controle que se acende sob o ponteiro (o botão de
+// energia do LogonUI, 48x48) muda junto em volta da seta, então a seta é
+// achada pela forma dela ([`arrows_in`]: o miolo branco fechado pelo
+// contorno preto) dentro das mudanças, não pelo tamanho da mudança.
 
 /// O marcador do ponteiro que andou.
 pub const CURSOR_MOVED_MARKER: &str = "CURSOR_MOVED_OK";
 /// O lado das células em que as mudanças da tela se agrupam: duas mudanças
 /// a menos de uma célula uma da outra são do mesmo desenho.
 const CURSOR_CELL: usize = 8;
-/// O maior lado de um grupo de mudanças que pode ser o ponteiro.
+/// O maior lado da seta do ponteiro (o miolo e o contorno).
 const CURSOR_MAXIMUM: usize = 40;
 /// Pixels brancos que o ponteiro tem, no mínimo (o preenchimento da seta).
 const CURSOR_WHITE_MINIMUM: usize = 20;
@@ -323,7 +326,7 @@ const CURSOR_BLACK_MINIMUM: usize = 10;
 const CURSOR_MINIMUM_STEP: i64 = 8;
 
 /// Um grupo de pixels que mudaram de uma tela para a outra.
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 struct Change {
     left: usize,
     top: usize,
@@ -344,28 +347,88 @@ impl Change {
         (((self.left + self.right) / 2) as i64, ((self.top + self.bottom) / 2) as i64)
     }
 
-    /// Os pixels de `image` dentro do grupo que passam em `test`.
-    fn count_in(&self, image: &Image, test: impl Fn(&[u8]) -> bool) -> usize {
-        (self.top..=self.bottom)
-            .flat_map(|y| (self.left..=self.right).map(move |x| (x, y)))
-            .filter(|&(x, y)| {
-                let at = (y * image.width + x) * 3;
-                test(&image.rgb[at..at + 3])
-            })
-            .count()
-    }
-
-    /// O ponteiro está no grupo em `image`: o miolo branco da seta e o
-    /// contorno preto ([`CURSOR_WHITE_MINIMUM`] e [`CURSOR_BLACK_MINIMUM`]).
-    /// O texto branco do relógio, sem contorno, não passa.
-    fn pointer_in(&self, image: &Image) -> bool {
-        self.count_in(image, |rgb| rgb.iter().all(|&channel| channel >= 0xF0)) >= CURSOR_WHITE_MINIMUM
-            && self.count_in(image, |rgb| rgb.iter().all(|&channel| channel <= BLACK_LEVEL)) >= CURSOR_BLACK_MINIMUM
+    fn same_box(&self, other: &Change) -> bool {
+        (self.left, self.top, self.right, self.bottom) == (other.left, other.top, other.right, other.bottom)
     }
 
     fn describe(&self) -> String {
         format!("{}x{} em ({},{})", self.width(), self.height(), self.left, self.top)
     }
+}
+
+/// As setas do ponteiro em `image` dentro de `area` (com uma margem do
+/// contorno): cada miolo branco (os canais em 0xF0 ou mais, vizinhos na
+/// linha ou na coluna) de [`CURSOR_WHITE_MINIMUM`] pixels ou mais, fechado
+/// pelo contorno preto: dos pixels em volta dele, a metade ou mais são
+/// pretos e pelo menos [`CURSOR_BLACK_MINIMUM`], e o miolo com o contorno
+/// cabe em [`CURSOR_MAXIMUM`] de lado. Devolve a caixa de cada uma (o miolo
+/// e o contorno). O fundo em volta não conta: a seta sobre um controle
+/// aceso, sobre o branco ou sobre a foto é achada do mesmo jeito; o texto
+/// branco sem contorno (o relógio) e uma área branca grande não passam.
+fn arrows_in(image: &Image, area: &Change) -> Vec<Change> {
+    let (width, height) = (image.width, image.height);
+    let (left, top) = (area.left.saturating_sub(2), area.top.saturating_sub(2));
+    let (right, bottom) = ((area.right + 2).min(width - 1), (area.bottom + 2).min(height - 1));
+    let pixel = |x: usize, y: usize| {
+        let at = (y * width + x) * 3;
+        [image.rgb[at], image.rgb[at + 1], image.rgb[at + 2]]
+    };
+    let white = |x: usize, y: usize| pixel(x, y).iter().all(|&channel| channel >= 0xF0);
+    let box_width = right - left + 1;
+    let mut seen = vec![false; box_width * (bottom - top + 1)];
+    let mut arrows = Vec::new();
+    for y in top..=bottom {
+        for x in left..=right {
+            if seen[(y - top) * box_width + x - left] || !white(x, y) {
+                continue;
+            }
+            // O miolo: os brancos ligados a este, até passar do tamanho da
+            // seta (então é uma área branca, não a seta).
+            let mut fill = vec![(x, y)];
+            let mut pending = vec![(x, y)];
+            seen[(y - top) * box_width + x - left] = true;
+            let mut large = false;
+            while let Some((cx, cy)) = pending.pop() {
+                let neighbours = [(cx.wrapping_sub(1), cy), (cx + 1, cy), (cx, cy.wrapping_sub(1)), (cx, cy + 1)];
+                for (nx, ny) in neighbours {
+                    if nx < left || nx > right || ny < top || ny > bottom || seen[(ny - top) * box_width + nx - left] || !white(nx, ny) {
+                        continue;
+                    }
+                    seen[(ny - top) * box_width + nx - left] = true;
+                    fill.push((nx, ny));
+                    pending.push((nx, ny));
+                }
+                if fill.len() > CURSOR_MAXIMUM * CURSOR_MAXIMUM {
+                    large = true;
+                }
+            }
+            if large || fill.len() < CURSOR_WHITE_MINIMUM {
+                continue;
+            }
+            // O contorno: os pixels fora do miolo vizinhos dele.
+            let mut outline: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+            for &(cx, cy) in &fill {
+                for (nx, ny) in [(cx.wrapping_sub(1), cy), (cx + 1, cy), (cx, cy.wrapping_sub(1)), (cx, cy + 1)] {
+                    if nx < width && ny < height && !white(nx, ny) {
+                        outline.insert((nx, ny));
+                    }
+                }
+            }
+            let black: Vec<&(usize, usize)> = outline.iter().filter(|&&(nx, ny)| is_black(pixel(nx, ny))).collect();
+            if black.len() < CURSOR_BLACK_MINIMUM || black.len() * 2 < outline.len() {
+                continue;
+            }
+            let points = fill.iter().chain(black.iter().copied());
+            let mut arrow = Change { left: usize::MAX, top: usize::MAX, right: 0, bottom: 0 };
+            for &(px, py) in points {
+                (arrow.left, arrow.right, arrow.top, arrow.bottom) = (arrow.left.min(px), arrow.right.max(px), arrow.top.min(py), arrow.bottom.max(py));
+            }
+            if arrow.width() <= CURSOR_MAXIMUM && arrow.height() <= CURSOR_MAXIMUM {
+                arrows.push(arrow);
+            }
+        }
+    }
+    arrows
 }
 
 /// Os grupos de pixels que mudaram de `before` para `after` (mesmo tamanho):
@@ -436,11 +499,11 @@ pub fn drawn_screen(image: &Image) -> Result<String, String> {
 
 /// O ponteiro andou de `before` para `after`, depois de o mouse andar
 /// (`dx`, `dy`) (o sinal de cada eixo; a aceleração do Windows muda a
-/// distância): entre as mudanças da tela há um grupo do tamanho do ponteiro
-/// com a seta (branca com contorno preto) só antes, onde ele estava, e um
-/// só depois, onde ele está, o segundo deslocado do primeiro no sentido do movimento. Outras
-/// mudanças maiores (o relógio que virou o minuto) não contam. Devolve de
-/// onde para onde o ponteiro foi, ou o que faltou.
+/// distância): dentro das mudanças da tela há uma seta ([`arrows_in`]) só
+/// antes, onde ele estava, e uma só depois, onde ele está, a segunda
+/// deslocada da primeira no sentido do movimento. Uma seta parada, o
+/// relógio que virou o minuto e o controle que se acendeu sob o ponteiro não
+/// contam. Devolve de onde para onde o ponteiro foi, ou o que faltou.
 pub fn cursor_moved(before: &Image, after: &Image, dx: i32, dy: i32) -> Result<String, String> {
     if (before.width, before.height) != (after.width, after.height) || before.rgb.len() != after.rgb.len() {
         return Err(format!("a tela mudou de tamanho ({}x{} para {}x{})", before.width, before.height, after.width, after.height));
@@ -449,9 +512,13 @@ pub fn cursor_moved(before: &Image, after: &Image, dx: i32, dy: i32) -> Result<S
     if groups.is_empty() {
         return Err("a tela nao mudou".into());
     }
-    let pointer_sized = |change: &&Change| change.width() <= CURSOR_MAXIMUM && change.height() <= CURSOR_MAXIMUM;
-    let left: Vec<&Change> = groups.iter().filter(pointer_sized).filter(|change| change.pointer_in(before) && !change.pointer_in(after)).collect();
-    let arrived: Vec<&Change> = groups.iter().filter(pointer_sized).filter(|change| change.pointer_in(after) && !change.pointer_in(before)).collect();
+    let (mut left, mut arrived): (Vec<Change>, Vec<Change>) = (Vec::new(), Vec::new());
+    for group in &groups {
+        let (old, new) = (arrows_in(before, group), arrows_in(after, group));
+        let stays = |arrow: &Change, others: &[Change]| others.iter().any(|other| arrow.same_box(other));
+        left.extend(old.iter().filter(|arrow| !stays(arrow, &new)).copied());
+        arrived.extend(new.iter().filter(|arrow| !stays(arrow, &old)).copied());
+    }
     let all: Vec<String> = groups.iter().take(6).map(Change::describe).collect();
     let (old, new) = match (left.as_slice(), arrived.as_slice()) {
         ([old], [new]) => (old, new),
@@ -1110,6 +1177,41 @@ mod tests {
         pointer(&mut boot, 512, 384);
         assert!(drawn_screen(&boot).unwrap_err().contains("da tela desenhada"));
         assert!(drawn_screen(&filled(WIDTH, HEIGHT, BUGCHECK_BACKGROUND)).unwrap_err().contains("bugcheck"));
+    }
+
+    /// O ponteiro que para sobre um controle que se acende (como o botão de
+    /// energia do LogonUI, 48x48 em (952,698)): o controle muda em volta da
+    /// seta, numa mudança maior que ela, e a seta é achada pela forma com o
+    /// fundo aceso escuro, claro ou branco. A seta parada sobre o controle que
+    /// se acendeu não andou; a seta que anda pouco, com os dois lugares numa
+    /// mudança só, andou.
+    #[test]
+    fn cursor_moved_finds_the_arrow_over_a_highlighted_control() {
+        const BACKGROUND: [u8; 3] = [0x00, 0x4A, 0x7F];
+        let screen = |highlight: Option<[u8; 3]>, x: usize, y: usize| {
+            let mut image = filled(WIDTH, HEIGHT, BACKGROUND);
+            paint(&mut image, 952..1000, 698..746, |_, _| highlight.unwrap_or(BACKGROUND));
+            // O ícone do botão: um traço branco sem contorno.
+            paint(&mut image, 968..984, 730..733, |_, _| [0xFF, 0xFF, 0xFF]);
+            pointer(&mut image, x, y);
+            image
+        };
+        let before = screen(None, 820, 610);
+        for highlight in [[0x1A, 0x5C, 0x8E], [0xCC, 0xCC, 0xCC], [0xFF, 0xFF, 0xFF]] {
+            let after = screen(Some(highlight), 960, 705);
+            let moved = cursor_moved(&before, &after, 150, 100).unwrap_or_else(|missing| panic!("{highlight:?}: {missing}"));
+            assert!(moved.starts_with("o ponteiro foi de (825,619) para (965,714)"), "{highlight:?}: {moved}");
+        }
+        let still = cursor_moved(&screen(None, 960, 705), &screen(Some([0x1A, 0x5C, 0x8E]), 960, 705), 150, 100).unwrap_err();
+        assert!(still.contains("0 com o ponteiro so antes e 0 com o ponteiro so depois"), "{still}");
+        let near = |x, y| {
+            let mut image = filled(WIDTH, HEIGHT, BACKGROUND);
+            pointer(&mut image, x, y);
+            image
+        };
+        assert_eq!(changes(&near(512, 384), &near(528, 392)).len(), 1, "os dois lugares numa mudanca so");
+        let moved = cursor_moved(&near(512, 384), &near(528, 392), 16, 8).unwrap();
+        assert!(moved.starts_with("o ponteiro foi de (517,393) para (533,401)"), "{moved}");
     }
 
     /// A tela de bloqueio dispensada: a de credenciais (outro fundo, sem o
