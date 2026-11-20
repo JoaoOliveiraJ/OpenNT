@@ -1676,8 +1676,22 @@ fn nt_reset_write_watch(process: u64, base: u64, size: u64, _unused: u64, _user_
     write_watch::nt_reset_write_watch(process, base, size)
 }
 
+/// NtFlushVirtualMemory(ProcessHandle, BaseAddress*, RegionSize*,
+/// IoStatus): `mm/virtual_memory_services`.
+fn nt_flush_virtual_memory(process: u64, base_pointer: u64, size_pointer: u64, io_status: u64, _user_rsp: u64) -> Result<u32, KernelError> {
+    crate::ntos::mm::virtual_memory_services::flush_user(process, base_pointer, size_pointer, io_status)
+}
+
+/// NtAreMappedFilesTheSame(File1MappedAsAnImage, File2MappedAsFile):
+/// `mm/section/image_segment`.
+fn nt_are_mapped_files_the_same(image_address: u64, file_address: u64, _a3: u64, _a4: u64, _user_rsp: u64) -> Result<u32, KernelError> {
+    Ok(crate::ntos::mm::section::image_segment::are_mapped_files_the_same(image_address, file_address))
+}
+
 /// Registra os handlers Nt*VirtualMemory e o NtCreatePagingFile.
 pub fn init() {
+    state::register_handler("NtAreMappedFilesTheSame", nt_are_mapped_files_the_same);
+    state::register_handler("NtFlushVirtualMemory", nt_flush_virtual_memory);
     state::register_handler("NtLockVirtualMemory", nt_lock_virtual_memory);
     state::register_handler("NtUnlockVirtualMemory", nt_unlock_virtual_memory);
     state::register_handler("NtCreatePagingFile", nt_create_paging_file);

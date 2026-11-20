@@ -14,13 +14,27 @@
 //! usuário não alcança; o 87
 //! (PowerInformationInternal) só é atendido de modo usuário. Os demais
 //! níveis de modo kernel devolvem STATUS_INVALID_PARAMETER.
+//!
+//! Só de modo usuário: LastWakeTime e LastSleepTime (14 e 15, o
+//! PopAction.WakeTime/SleepTime, zero num sistema que nunca dormiu),
+//! SystemExecutionState (16, `po/power_request.rs`),
+//! SystemMonitorHiberBootPowerOff (28, que exige um contexto administrador:
+//! o PopHiberBootForceMonitorOff ligado e o PoPowerOffMonitor,
+//! `po/win32_callout.rs`; o PopSuspendResumePdc não tem PDC no OpenNT), os
+//! pedidos de energia (43 PowerRequestCreate, 44 PowerRequestAction e 72
+//! PlmPowerRequestCreate), SessionLockState (64: o
+//! PopSessionWinlogonNotification, cujo status o NT descarta),
+//! SystemHiberbootState (65, o Hiberboot das capacidades filtradas, que o
+//! OpenNT não tem), UpdateBlackBoxRecorder (94, `po/black_box.rs`) e
+//! SessionAllowExternalDmaDevices (95: o ExNotifyCallback do
+//! PipCslCallbackObject, sem registrados no OpenNT).
 
 use alloc::vec::Vec;
 use core::sync::atomic::AtomicU8;
 
 use crate::ntos::inc::types::{NtStruct, SystemPowerCapabilities};
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::po::{black_box, boot_status, display_state, power_setting, user_presence};
+use crate::ntos::po::{black_box, boot_status, display_state, power_request, power_setting, user_presence};
 use crate::rtl::KernelError;
 
 const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
@@ -34,6 +48,29 @@ const POWER_SETTING_NOTIFICATION_NAME: u32 = 58;
 const GET_POWER_SETTING_VALUE: u32 = 59;
 /// POWER_INFORMATION_LEVEL PlatformInformation.
 const PLATFORM_INFORMATION: u32 = 66;
+
+/// POWER_INFORMATION_LEVEL LastWakeTime, LastSleepTime,
+/// SystemExecutionState e SystemMonitorHiberBootPowerOff.
+const LAST_WAKE_TIME: u32 = 14;
+const LAST_SLEEP_TIME: u32 = 15;
+const SYSTEM_EXECUTION_STATE: u32 = 16;
+const SYSTEM_MONITOR_HIBER_BOOT_POWER_OFF: u32 = 28;
+/// POWER_INFORMATION_LEVEL PowerRequestCreate, PowerRequestAction e
+/// PlmPowerRequestCreate.
+const POWER_REQUEST_CREATE: u32 = 43;
+const POWER_REQUEST_ACTION: u32 = 44;
+const PLM_POWER_REQUEST_CREATE: u32 = 72;
+/// POWER_INFORMATION_LEVEL SessionLockState, SystemHiberbootState,
+/// UpdateBlackBoxRecorder e SessionAllowExternalDmaDevices.
+const SESSION_LOCK_STATE: u32 = 64;
+const SYSTEM_HIBERBOOT_STATE: u32 = 65;
+const UPDATE_BLACK_BOX_RECORDER: u32 = 94;
+const SESSION_ALLOW_EXTERNAL_DMA_DEVICES: u32 = 95;
+/// Os níveis que pedem um contexto administrador (PspIsContextAdmin) ao
+/// modo usuário.
+const ADMIN_LEVELS: [u32; 4] = [28, 45, 50, 78];
+/// O deslocamento do Hiberboot no SYSTEM_POWER_CAPABILITIES.
+const HIBERBOOT_OFFSET: usize = 0x12;
 
 /// POWER_INFORMATION_LEVEL SessionPowerInit e SessionPowerCleanup.
 const SESSION_POWER_INIT: u32 = 41;
@@ -168,7 +205,7 @@ const PLATFORM_ROLE_DESKTOP: u32 = 1;
 const MAXIMUM_CAPTURE: u32 = 0x1000;
 
 /// PopPlatformAoAc: FALSE numa plataforma sem Modern Standby.
-fn platform_aoac() -> u8 {
+pub(crate) fn platform_aoac() -> u8 {
     0
 }
 
@@ -340,6 +377,90 @@ fn level_answer(level: u32, input: &[u8], output_length: u32) -> Result<Answer, 
                 }
             }
         }
+        // LastWakeTime e LastSleepTime (0x6f13cc e 0x6f145a): sem entrada,
+        // com saída; os 8 bytes de PopAction.WakeTime/SleepTime, que só uma
+        // transição de sono grava.
+        LAST_WAKE_TIME | LAST_SLEEP_TIME => {
+            if !input.is_empty() || !has_output {
+                return Ok(Answer::Status(STATUS_INVALID_PARAMETER));
+            }
+            Answer::Data(0u64.to_le_bytes().to_vec())
+        }
+        // SystemExecutionState (0x6f0ba0): sem entrada, com saída; o ULONG
+        // dos pedidos de sistema e de tela ligados.
+        SYSTEM_EXECUTION_STATE => {
+            if !input.is_empty() || !has_output {
+                return Ok(Answer::Status(STATUS_INVALID_PARAMETER));
+            }
+            Answer::Data(power_request::system_execution_state().to_le_bytes().to_vec())
+        }
+        // SystemMonitorHiberBootPowerOff (0x6f1838): sem conferir entrada nem
+        // saída; o status do PoPowerOffMonitor volta direto.
+        SYSTEM_MONITOR_HIBER_BOOT_POWER_OFF => {
+            HIBER_BOOT_FORCE_MONITOR_OFF.store(1, core::sync::atomic::Ordering::SeqCst);
+            Answer::Status(super::win32_callout::power_off_monitor())
+        }
+        // PowerRequestCreate e PlmPowerRequestCreate (0x6f0d47): entrada de
+        // exatamente 0x28 bytes e saída de exatamente 8 (senão
+        // STATUS_BUFFER_TOO_SMALL); o handle do pedido.
+        POWER_REQUEST_CREATE | PLM_POWER_REQUEST_CREATE => {
+            if input.is_empty() || !has_output {
+                return Ok(Answer::Status(STATUS_INVALID_PARAMETER));
+            }
+            if input.len() != super::reason_context::CONTEXT_SIZE || output_length != 8 {
+                return Ok(Answer::Status(STATUS_BUFFER_TOO_SMALL));
+            }
+            match power_request::create_info(input, level == PLM_POWER_REQUEST_CREATE) {
+                Ok(handle) => Answer::Data(handle.to_le_bytes().to_vec()),
+                Err(status) => Answer::Status(status),
+            }
+        }
+        // PowerRequestAction (0x6f0c6d): entrada de exatamente 0x18 bytes
+        // (senão STATUS_BUFFER_TOO_SMALL) e nenhuma saída.
+        POWER_REQUEST_ACTION => {
+            if input.is_empty() || has_output {
+                return Ok(Answer::Status(STATUS_INVALID_PARAMETER));
+            }
+            if input.len() != 0x18 {
+                return Ok(Answer::Status(STATUS_BUFFER_TOO_SMALL));
+            }
+            Answer::Status(power_request::action_info(input)?)
+        }
+        // SessionLockState (0x6f14fc): entrada de exatamente 8 bytes e
+        // nenhuma saída; o status do PopSessionWinlogonNotification é
+        // descartado.
+        SESSION_LOCK_STATE => {
+            if input.len() != 8 || has_output {
+                return Ok(Answer::Status(STATUS_INVALID_PARAMETER));
+            }
+            Answer::Data(Vec::new())
+        }
+        // SystemHiberbootState (0x6f15f6): sem entrada, com saída; o
+        // BOOLEAN Hiberboot das capacidades filtradas (com ele, a política
+        // do registro).
+        SYSTEM_HIBERBOOT_STATE => {
+            if !input.is_empty() || !has_output {
+                return Ok(Answer::Status(STATUS_INVALID_PARAMETER));
+            }
+            Answer::Data(alloc::vec![capabilities().get(HIBERBOOT_OFFSET).copied().unwrap_or(0)])
+        }
+        // UpdateBlackBoxRecorder de modo usuário (0x6f0b5c): entrada de
+        // exatamente 0x20 bytes (senão STATUS_BUFFER_TOO_SMALL) e nenhuma
+        // saída.
+        UPDATE_BLACK_BOX_RECORDER => {
+            if input.is_empty() || has_output {
+                return Ok(Answer::Status(STATUS_INVALID_PARAMETER));
+            }
+            Answer::Status(black_box::update_from_user(input)?)
+        }
+        // SessionAllowExternalDmaDevices (0x6f10d6): entrada de exatamente 1
+        // byte e nenhuma saída; o ExNotifyCallback do PipCslCallbackObject.
+        SESSION_ALLOW_EXTERNAL_DMA_DEVICES => {
+            if input.len() != 1 || has_output {
+                return Ok(Answer::Status(STATUS_INVALID_PARAMETER));
+            }
+            Answer::Data(Vec::new())
+        }
         _ => {
             crate::debug_print!("[po] NtPowerInformation de modo usuario: nivel {} sem suporte", level);
             Answer::Status(STATUS_NOT_IMPLEMENTED)
@@ -359,6 +480,9 @@ pub fn query_user(level: u32, input: u64, input_length: u32, output: u64, output
     let output_length = if output == 0 { 0 } else { output_length };
     let output = if output_length == 0 { 0 } else { output };
     if KERNEL_ONLY_LEVELS.contains(&level) {
+        return Ok(STATUS_ACCESS_DENIED);
+    }
+    if ADMIN_LEVELS.contains(&level) && !crate::ntos::ps::security::is_context_admin() {
         return Ok(STATUS_ACCESS_DENIED);
     }
     let captured = if input != 0 {
@@ -401,9 +525,17 @@ fn nt_power_information(level: u64, input: u64, input_length: u64, output: u64, 
     query_user(level as u32, input, input_length as u32, output, crate::ntos::ps::user::state::stack_arg32(rsp, 5))
 }
 
-/// O handler do serviço NtPowerInformation de modo usuário.
+/// NtSetThreadExecutionState(EsFlags, PreviousFlags*): o pedido legado da
+/// thread (`po/power_request.rs`).
+fn nt_set_thread_execution_state(flags: u64, previous_flags: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
+    power_request::set_thread_execution_state(flags as u32, previous_flags)
+}
+
+/// Os handlers dos serviços NtPowerInformation e NtSetThreadExecutionState
+/// de modo usuário.
 pub fn register_user_services() {
     crate::ntos::ps::user::state::register_handler("NtPowerInformation", nt_power_information);
+    crate::ntos::ps::user::state::register_handler("NtSetThreadExecutionState", nt_set_thread_execution_state);
 }
 
 /// PoEnergyEstimationEnabled: o estimador de energia (E3) do Po não existe

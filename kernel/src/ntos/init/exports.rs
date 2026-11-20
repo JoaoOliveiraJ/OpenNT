@@ -811,6 +811,7 @@ pub fn init() {
     crate::ntos::ps::job::initialize_type();
     crate::ntos::ps::memory_reserve::initialize_types();
     crate::ntos::ex::timer_object::initialize();
+    crate::ntos::po::power_request::initialize_type();
     crate::ntos::ps::user::wait_packets::init();
     crate::ntos::ps::user::nls::init();
     crate::ntos::ps::user::syscalls_core::init();
@@ -822,6 +823,7 @@ pub fn init() {
     crate::ntos::po::power_information::register_user_services();
     crate::ntos::ob::compare_objects::register_user_services();
     crate::ntos::se::token::compare::register_user_services();
+    crate::ntos::se::signing_level::register_user_services();
     crate::ntos::ex::uuid::register_user_services();
     crate::ntos::ex::global_atom::register_user_services();
     crate::ntos::ex::keyed_event::register_user_services();

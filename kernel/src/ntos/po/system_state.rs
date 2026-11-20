@@ -240,6 +240,12 @@ pub fn set_system_state(flags: u32) {
     apply_system_state(flags, SYSTEM_STATE_SOURCE);
 }
 
+/// PopSystemRequiredSet (o ES_SYSTEM_REQUIRED sem ES_CONTINUOUS do
+/// NtSetThreadExecutionState): o PopResetIdleTime.
+pub fn system_required_set() {
+    SYSTEM_IDLE_RESET.store(clock::uptime_ms(), Ordering::Release);
+}
+
 /// O instante (ms desde o boot) do último ES_SYSTEM_REQUIRED.
 pub fn system_idle_reset() -> u64 {
     SYSTEM_IDLE_RESET.load(Ordering::Acquire)

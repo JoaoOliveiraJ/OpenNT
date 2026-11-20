@@ -197,8 +197,13 @@ impl SectionFile for CapturedFile {
         if file_lifetime::write_detached(self.backing_reference.load(Ordering::Acquire), offset as usize, data)? {
             return Ok(());
         }
+        let source_volume = || self.source.as_ref().and_then(|source| Some((source.volume()?, source.volume_path()?)));
         match &self.backing {
             Some((volume, path)) if volume.writable() => volume.write_at(path, offset, data).map(|_| ()),
+            None => match source_volume() {
+                Some((volume, path)) if volume.writable() => volume.write_at(&path, offset, data).map(|_| ()),
+                _ => Err(KernelError::with_status("readonly section file", 0xC000_00A2)),
+            },
             _ => Err(KernelError::with_status("readonly section file", 0xC000_00A2)),
         }
     }
@@ -252,7 +257,12 @@ fn capture_selected(pointer: u64, access: u32, mode: u8, protect: u32, image: bo
     if stat.as_ref().is_some_and(|stat| stat.directory) {
         return Err(0xC000_00BA);
     }
-    let backing_writable = backing.as_ref().is_some_and(|(volume, _)| volume.writable());
+    // Um arquivo do volume aberto pelo modo usuário não tem backing do
+    // ZwCreateFile: o volume é o da fonte do FILE_OBJECT.
+    let backing_writable = match &backing {
+        Some((volume, _)) => volume.writable(),
+        None => source.as_ref().and_then(|source| source.volume()).is_some_and(|volume| volume.writable()),
+    };
     if write && !image && (!backing_writable || stat.as_ref().is_some_and(|stat| stat.attributes & 1 != 0)) {
         return Err(0xC000_0022);
     }

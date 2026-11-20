@@ -3150,6 +3150,25 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   PassiveCooling/ActiveCooling do driver só quando muda, sem trava, e o
   último pedido devolve a interface. A extensão fica num registro por
   dispositivo (no NT, na DOPE do alvo).
+- **Pedidos de energia de modo usuário** (`po/power_request.rs`,
+  `po/reason_context.rs`): o NtPowerInformation 43 (PowerRequestCreate) e 72
+  (PlmPowerRequestCreate) capturam o COUNTED_REASON_CONTEXT com sondas de
+  modo usuário e devolvem um handle sem acesso de um objeto PowerRequest de
+  dono UserMode; o 44 (PowerRequestAction) liga e desliga o tipo interno pelo
+  handle; o fechamento do último handle (PopClosePowerRequestObject) desconta
+  os tipos ligados. O NtSetThreadExecutionState guarda o pedido legado da
+  thread em ETHREAD.LegacyPowerObject (o PspExitThread o solta) e devolve as
+  flags anteriores com ES_CONTINUOUS; sem ES_CONTINUOUS, só reinicia a
+  ociosidade e avisa o win32k da presença no console.
+- **Callouts de energia ao win32k** (`po/win32_callout.rs`): o
+  PopInvokeWin32Callout manda os callouts de evento (tipo 3), estado (4) e
+  informação (5) pelo despachante do win32k, por sessão; a troca de hora
+  (`po/time_change.rs`) termina no evento PsW32SystemTime (o WM_TIMECHANGE),
+  o NtSetThreadExecutionState(ES_DISPLAY_REQUIRED) na presença do usuário no
+  console, e o NtPowerInformation 28 no PoPowerOffMonitor (bloqueio da troca
+  de console, tarefas e tela apagada). O evento de desligamento
+  (PopDispatchShutdownEvent) espera o PopExecutePowerAction, que o OpenNT
+  ainda não tem.
 - **Ações de energia** (`po/power_action.rs`): ZwInitiatePowerAction valida
   como o NtInitiatePowerAction; sem a política de energia
   (PopExecutePowerAction) as ações reais devolvem STATUS_NOT_SUPPORTED, e
@@ -3160,7 +3179,10 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   19041 (níveis só de kernel recusados, privilégio para entrada fora da
   lista sem privilégio, entrada capturada, saída sondada e o fim comum de
   cópia); os níveis 4, 5, 29, 58, 59, 66 e 75 têm o mesmo corpo de modo
-  kernel e de usuário. Os níveis 61 (SessionRITState) e 62
+  kernel e de usuário; só de modo usuário, os níveis 14 e 15 (zero sem
+  transição de sono), 16 (SystemExecutionState pelos pedidos ligados), 28
+  (contexto administrador), 64, 65, 94 (o gravador black box com o buffer
+  sondado e a categoria SCM só para processo protegido) e 95. Os níveis 61 (SessionRITState) e 62
   (SessionConnectNotification), só de modo kernel, são a entrada e a
   conexão da sessão que o win32kbase informa (`po/user_presence.rs`): a
   conexão do console liga GUID_SESSION_DISPLAY_STATUS da sessão e a torna
@@ -3284,7 +3306,17 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   FsRtlProcessFileLock), a leitura e a escrita de modo usuário conferem
   essas travas (STATUS_FILE_LOCK_CONFLICT) e o cleanup e o fechamento do
   último handle de um processo soltam as dele (teste `volume_notify_locks`
-  na fase 7). O volume de boot guarda o conteúdo de
+  na fase 7). Os serviços de modo usuário NtFlushBuffersFile(Ex) (acesso de
+  escrita ou de acréscimo; o IRP_MJ_FLUSH_BUFFERS com o minor dos flags num
+  arquivo de driver), NtFlushVirtualMemory (a vista de arquivo gravada de
+  volta), NtQueryEaFile/NtSetEaFile (sondas, a lista FILE_GET_EA_INFORMATION
+  conferida, FILE_READ_EA/FILE_WRITE_EA, e as EAs `$KERNEL.` só do modo
+  kernel), NtCancelSynchronousIoFile (as requisições síncronas da thread
+  canceladas, ou STATUS_NOT_FOUND) e NtDeleteFile (a abertura DeleteOnly com
+  FILE_DELETE_ON_CLOSE) seguem o 19041 (teste `user_desktop_services` na
+  fase 7). Um arquivo do volume aberto pelo modo usuário não tem o backing do
+  ZwCreateFile: as seções graváveis (`mm/section/file.rs`) e as EAs
+  (`io/kernel_ea.rs`) usam o volume e o caminho da fonte do FILE_OBJECT. O volume de boot guarda o conteúdo de
   `\Windows` na raiz (os programas de System32, `Fonts`, os temas...), que o
   modo usuário abre pelos aliases de `volume_files::nt_path_to_volume_path`;
   a abertura do kernel por `\SystemRoot\X` ou `\??\C:\Windows\X` que não
@@ -5214,6 +5246,10 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     comprimento reservado que o original devolve) e os níveis de assinatura
     em `se/signing_level.rs`, pelos slots nomeados da tabela de callbacks da
     CI (`se/code_integrity.rs`); sem CI inicializada, FALSE/STATUS_UNSUCCESSFUL;
+    de modo usuário, o NtGetCachedSigningLevel (a falha da CI, como o
+    STATUS_NOT_FOUND de um arquivo sem cache, volta antes de qualquer sonda
+    das saídas) e o NtCompareSigningLevels (STATUS_INVALID_IMAGE_HASH quando a
+    CI diz que o nível não basta);
   - o rastreamento de I/O (`io/io_perf.rs`): com um IoRegisterIoTracking
     ativo, o IofCallDriver carimba a extensão Timestamp do IRP e o
     IofCompleteRequest entrega o tempo decorrido e o DeviceType a cada

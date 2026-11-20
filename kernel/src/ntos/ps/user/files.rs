@@ -459,6 +459,33 @@ fn nt_open_file(handle_pointer: u64, access: u64, attributes: u64, iosb: u64, rs
     open_nt_file(handle_pointer, attributes, iosb, 1, &OpenRequest { access: access as u32, share: state::stack_arg32(rsp, 5), options: state::stack_arg32(rsp, 6), ..OpenRequest::default() })
 }
 
+/// NtDeleteFile(ObjectAttributes) de modo usuário (ntoskrnl 19041,
+/// 0x77ca70): o ObOpenObjectByNameEx com o OPEN_PACKET DeleteOnly do
+/// IopParseDevice, DesiredAccess DELETE, FILE_DELETE_ON_CLOSE, ShareAccess 7
+/// e FILE_OPEN, cujo FILE_OBJECT é fechado logo (o file system retira o nome
+/// no fechamento); o status é o da abertura. O NT não cria handle; aqui a
+/// abertura de modo usuário pede uma página de rascunho do processo para o
+/// handle e o IO_STATUS_BLOCK, solta antes da volta.
+fn nt_delete_file(attributes: u64, _a2: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
+    const DELETE: u32 = 0x1_0000;
+    const FILE_DELETE_ON_CLOSE: u32 = 0x1000;
+    const FILE_SHARE_ALL: u32 = 7;
+    const FILE_OPEN: u32 = 1;
+    let Ok(scratch) = super::memory::map_user_region(0x1000) else { return Ok(0xC000_009A) };
+    let status = open_file(scratch, attributes, scratch + 0x10, FILE_OPEN, &OpenRequest { access: DELETE, share: FILE_SHARE_ALL, options: FILE_DELETE_ON_CLOSE, ..OpenRequest::default() }, None);
+    if matches!(status, Ok(status) if status & 0x8000_0000 == 0) {
+        // O fechamento do NtClose: a tabela de usuário, senão a nativa.
+        let handle = guest::read64(scratch);
+        if close::close_user(handle, false) == STATUS_INVALID_HANDLE {
+            let _ = close::close(handle, Some(1));
+        }
+    }
+    if let Some(region) = super::memory::find_region(scratch) {
+        super::memory::release_private_region(&region);
+    }
+    status
+}
+
 /// NtCreateFile(handle*, access, oa, ioStatus*, allocSize*, fileAttrs, share,
 /// disposition, options, ea*, eaLength).
 fn nt_create_file(handle_pointer: u64, access: u64, attributes: u64, iosb: u64, rsp: u64) -> Result<u32, KernelError> {
@@ -753,6 +780,7 @@ pub fn release_user_resources(process: u64) {
 pub fn init() {
     process::register_process_exit_routine(release_user_resources);
     state::register_handler("NtOpenFile", nt_open_file);
+    state::register_handler("NtDeleteFile", nt_delete_file);
     state::register_handler("NtCreateFile", nt_create_file);
     state::register_handler("NtDeviceIoControlFile", nt_device_io_control_file);
     state::register_handler("NtCreateNamedPipeFile", nt_create_named_pipe_file);

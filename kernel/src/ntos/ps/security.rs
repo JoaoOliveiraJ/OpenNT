@@ -156,6 +156,15 @@ fn attribute_present(token: &Token, name: &str) -> Result<bool, KernelError> {
     Ok(security_attributes::select(&token.security_attributes, Some(&[String::from(name)]))?.is_some())
 }
 
+/// PspIsContextAdmin (0x70cd58): o SeTokenIsAdmin do token do contexto
+/// capturado, o de impersonação da thread corrente se houver, senão o
+/// primário do processo.
+pub fn is_context_admin() -> bool {
+    let impersonation = crate::ntos::se::token::thread::get(process::get_current_thread()).map(|state| state.token);
+    let token = impersonation.or_else(|| process::get_primary_token(process::get_current_process())).unwrap_or(0);
+    token != 0 && crate::ntos::se::token::information::is_admin(token)
+}
+
 /// O PsQueryProcessAttributes(Process, &SystemApplication, NULL) do
 /// ProcessBasicInformation estendido (IsStronglyNamed): o WIN://SYSAPPID no
 /// token primário do processo.

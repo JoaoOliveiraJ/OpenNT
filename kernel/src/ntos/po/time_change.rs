@@ -6,8 +6,9 @@
 //! DISPATCH_LEVEL, chama o ExNotifyCallback de \Callback\SetSystemTime
 //! (ExCbSetSystemTime, argumentos nulos) e pede o trabalho de política 0x10,
 //! o PopPolicyTimeChange: WNF_PO_SYSTEM_TIME_CHANGED com os 16 bytes de
-//! PopTimeChangeInfo e o callout de evento do win32k. O trabalho de política
-//! corre aqui mesmo, depois do callback.
+//! PopTimeChangeInfo e o callout de evento do win32k (PsW32SystemTime,
+//! `po/win32_callout.rs`). O trabalho de política corre aqui mesmo, depois do
+//! callback.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -47,4 +48,5 @@ pub fn notify_system_time_set(new_time: i64, old_time: i64) {
     guest::write64(block + 16, old_time as u64);
     let _ = crate::ntos::ex::wnf::service::update(block, block + 8, 16, 0, 0, 0, false);
     guest::free_bytes(block);
+    super::win32_callout::system_time_changed();
 }

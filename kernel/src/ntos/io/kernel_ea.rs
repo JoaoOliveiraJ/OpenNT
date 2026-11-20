@@ -126,6 +126,12 @@ fn failure_status(error: &KernelError) -> u32 {
     if error.status != STATUS_UNSUCCESSFUL { error.status } else { 0xC000_0185 }
 }
 
+/// O arquivo de volume por trás do FILE_OBJECT: o do ZwCreateFile, ou, num
+/// arquivo aberto pelo modo usuário, o volume e o caminho da fonte dele.
+fn volume_backing(file: u64) -> Option<(&'static dyn crate::drivers::fs::volume::FileSystem, alloc::string::String)> {
+    crate::ntos::io::file::zw::file_backing(file).or_else(|| file_objects::source(file).and_then(|source| Some((source.volume()?, source.volume_path()?))))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn query(file: u64, buffer: u64, length: u32, single: u8, names: u64, names_length: u32, index: u64, restart: u8, returned: u64) -> Result<u32, KernelError> {
     let (single, restart) = (single != 0, restart != 0);
@@ -136,7 +142,7 @@ pub fn query(file: u64, buffer: u64, length: u32, single: u8, names: u64, names_
     if device != 0 {
         return native(file, buffer, length, Some(&Query { restart, single, names, names_length, index, returned }), device);
     }
-    let backing = crate::ntos::io::file::zw::file_backing(file);
+    let backing = volume_backing(file);
     let (mut status, mut information, mut bytes) = (0xC000_004F, 0, Vec::new());
     if let Some((volume, path)) = backing {
         let options = QueryOptions { single, restart, names: (names != 0 && names_length != 0).then(|| read(names, names_length)), index: (index != 0).then(|| ulong_at(index).get()) };
@@ -157,6 +163,12 @@ pub fn query(file: u64, buffer: u64, length: u32, single: u8, names: u64, names_
 }
 
 pub fn set(file: u64, buffer: u64, length: u32) -> Result<u32, KernelError> {
+    set_with_mode(file, buffer, length, true)
+}
+
+/// A gravação de EAs com o modo de quem pede: só uma chamada de kernel grava
+/// as EAs `$KERNEL.` no volume do kernel.
+pub fn set_with_mode(file: u64, buffer: u64, length: u32, kernel_call: bool) -> Result<u32, KernelError> {
     if file_at(file).flags.get() & FO_DIRECT_DEVICE_OPEN != 0 {
         return Ok(0xC000_0010);
     }
@@ -164,8 +176,8 @@ pub fn set(file: u64, buffer: u64, length: u32) -> Result<u32, KernelError> {
     if device != 0 {
         return native(file, buffer, length, None, device);
     }
-    let Some((volume, path)) = crate::ntos::io::file::zw::file_backing(file) else { return Ok(0xC000_004F) };
-    match volume.set_ea(&path, &read(buffer, length), true) {
+    let Some((volume, path)) = volume_backing(file) else { return Ok(0xC000_004F) };
+    match volume.set_ea(&path, &read(buffer, length), kernel_call) {
         None => Ok(0xC000_004F),
         Some(Ok(())) => Ok(0),
         Some(Err(error)) => Ok(failure_status(&error)),

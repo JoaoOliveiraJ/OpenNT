@@ -8,6 +8,7 @@
 
 use crate::ntos::inc::field::{Field, NtStruct};
 use crate::ntos::ke::irql;
+use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::{memory_map, query_virtual, virtual_lock};
 use crate::ntos::ps::process;
 use crate::ntos::ps::user::memory::{self, Space};
@@ -204,6 +205,37 @@ pub fn flush(process_handle: u64, base_pointer: u64, size_pointer: u64, io_statu
         let block = unsafe { crate::ntos::inc::types::IoStatusBlock::at(io_status) };
         block.status.set(status as i32);
         block.information.set(0);
+        Ok(status)
+    })
+}
+
+/// NtFlushVirtualMemory de modo usuário (0x668e50): BaseAddress* e
+/// RegionSize* sondados para escrita (8 bytes) e o IoStatus (4 bytes), senão
+/// STATUS_ACCESS_VIOLATION; as faixas do modo kernel; o handle com
+/// PROCESS_VM_OPERATION (a recusa volta sem gravar nada); depois do Mm,
+/// *RegionSize, *BaseAddress alinhado à página e o IO_STATUS_BLOCK {status,
+/// 0} gravados, qualquer que seja o status (uma falha nessa gravação não
+/// muda o retorno).
+pub fn flush_user(process_handle: u64, base_pointer: u64, size_pointer: u64, io_status: u64) -> Result<u32, KernelError> {
+    const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+    const PROCESS_VM_OPERATION: u32 = 0x8;
+    use crate::ntos::ps::user_probe;
+    if !user_probe::probe_user_write(base_pointer, 8) || !user_probe::probe_user_write(size_pointer, 8) || !user_probe::probe_user_write(io_status, 4) {
+        return Ok(STATUS_ACCESS_VIOLATION);
+    }
+    let (Ok(base), Ok(size)) = (guest::try_read::<u64>(base_pointer), guest::try_read::<u64>(size_pointer)) else { return Ok(STATUS_ACCESS_VIOLATION) };
+    if base > memory_map::HIGHEST_USER_ADDRESS {
+        return Ok(STATUS_INVALID_PARAMETER_2);
+    }
+    if memory_map::USER_PROBE_ADDRESS - base < size {
+        return Ok(STATUS_INVALID_PARAMETER_3);
+    }
+    memory::with_process_handle(process_handle, PROCESS_VM_OPERATION, |process| {
+        let (status, length) = flush_range(process, base, size)?;
+        let _ = guest::try_write::<u64>(size_pointer, length)
+            .and_then(|()| guest::try_write::<u64>(base_pointer, base & !0xFFF))
+            .and_then(|()| guest::try_write::<u32>(io_status, status))
+            .and_then(|()| guest::try_write::<u64>(io_status + 8, 0));
         Ok(status)
     })
 }

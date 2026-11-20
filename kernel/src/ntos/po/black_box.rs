@@ -205,6 +205,45 @@ pub fn update_from_kernel(input: u64, input_length: u32, output: u64, output_len
     update_kernel_request(input)
 }
 
+/// PopBlackBoxUpdate(Request, UserMode) (0x6f2178) sobre os 32 bytes que o
+/// NtPowerInformation capturou: a categoria acima de 0x15 é
+/// STATUS_INVALID_PARAMETER; com comprimento, o buffer do chamador sondado
+/// para leitura (STATUS_ACCESS_VIOLATION); a categoria marcada (SCM) só
+/// para um processo protegido que domine PsProtectedSignerWinTcb-Light
+/// (RtlTestProtectedAccess com 0x61, senão STATUS_ACCESS_DENIED); depois o
+/// mesmo caminho do modo kernel.
+pub fn update_from_user(request: &[u8]) -> Result<u32, KernelError> {
+    const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+    const PROTECTED_WINTCB_LIGHT: u8 = 0x61;
+    if request.len() != 32 {
+        return Ok(STATUS_BUFFER_TOO_SMALL);
+    }
+    let index = u32::from_le_bytes([request[0x18], request[0x19], request[0x1A], request[0x1B]]) as usize;
+    if index >= CATEGORIES.len() {
+        return Ok(STATUS_INVALID_PARAMETER);
+    }
+    let buffer = u64::from_le_bytes(request[0..8].try_into().unwrap_or([0; 8]));
+    let length = u64::from_le_bytes(request[8..16].try_into().unwrap_or([0; 8]));
+    if length != 0 && !crate::ntos::ps::user_probe::probe_user_read(buffer, length) {
+        return Ok(STATUS_ACCESS_VIOLATION);
+    }
+    if CATEGORIES[index].2 & 1 != 0 {
+        // SAFETY: o EPROCESS corrente.
+        let protection = unsafe { crate::ntos::inc::types::Eprocess::at(crate::ntos::ps::process::get_current_process()) }.protection.level.get();
+        if !crate::ntos::ps::open_procedure::test_protected_access(protection, PROTECTED_WINTCB_LIGHT) {
+            return Ok(STATUS_ACCESS_DENIED);
+        }
+    }
+    let copy = guest::alloc_bytes(32);
+    if copy == 0 {
+        return Ok(STATUS_INSUFFICIENT_RESOURCES);
+    }
+    guest::write_bytes(copy, request);
+    let status = update_kernel_request(copy);
+    guest::free_bytes(copy);
+    status
+}
+
 /// Cópia possuída pelo consumidor.
 #[derive(Clone, Debug)]
 pub struct Snapshot {

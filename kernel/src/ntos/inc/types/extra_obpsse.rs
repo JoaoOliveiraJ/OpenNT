@@ -1,7 +1,8 @@
 //! Os parâmetros dos callouts do Win32k, os registros internos dos
 //! atributos de segurança do token e as mensagens e itens entre o Reference
 //! Monitor e o LSA, que os símbolos do ntoskrnl não têm (layouts lidos de
-//! PspExitThread/PsConvertToGuiThread, de
+//! PspExitThread/PsConvertToGuiThread, dos callouts de energia do Po e do
+//! W32CalloutDispatch do win32kbase, de
 //! AuthzBasepCopyoutInternalSecurityAttributes e das rotinas SepRm* do
 //! ntoskrnl 19041).
 //!
@@ -38,11 +39,86 @@ pub struct Win32ProcessCalloutParameters {
 
 unsafe impl NtStruct for Win32ProcessCalloutParameters {}
 
+/// Parâmetro do callout de evento de energia do Win32k (PsW32PowerEvent,
+/// tipo 3; o WIN32_POWEREVENT_PARAMETERS que o PopEventCalloutDispatch
+/// 0x3a707c monta na pilha e o QueuePowerRequest do win32kbase enfileira):
+/// o PSPOWEREVENTTYPE e o código do evento. 0x10 bytes.
+#[repr(C)]
+pub struct Win32PowerEventParameters {
+    pub event_number: Field<u32>,
+    _reserved_04: Reserved<4>,
+    pub code: Field<u64>,
+}
+
+unsafe impl NtStruct for Win32PowerEventParameters {}
+
+/// Parâmetro do callout de estado de energia do Win32k (PsW32PowerState,
+/// tipo 4; o WIN32_POWERSTATE_PARAMETERS do PopDispatchStateCallout
+/// 0x7259b4, que o UserPowerStateCallout do win32kbase lê): Promotion, a
+/// POWER_ACTION, o SYSTEM_POWER_STATE mínimo, as flags e a tarefa
+/// (POWERSTATETASK). 0x18 bytes no bloco de pilha do NT.
+#[repr(C)]
+pub struct Win32PowerStateParameters {
+    pub promotion: Field<u8>,
+    _reserved_01: Reserved<3>,
+    pub system_action: Field<u32>,
+    pub min_system_state: Field<u32>,
+    pub flags: Field<u32>,
+    pub power_state_task: Field<u32>,
+    _reserved_14: Reserved<4>,
+}
+
+unsafe impl NtStruct for Win32PowerStateParameters {}
+
+/// Parâmetro do callout de informação de energia do Win32k (PsW32PowerInfo,
+/// tipo 5; o bloco do PopNotifyConsoleUserPresent 0x772ce0, que o
+/// W32CalloutDispatch do win32kbase passa campo a campo ao
+/// UserPowerInfoCallout): o tipo da informação, um BOOLEAN, a entrada e a
+/// saída com os comprimentos. 0x28 bytes.
+#[repr(C)]
+pub struct Win32PowerInfoParameters {
+    pub information_type: Field<u32>,
+    pub flag: Field<u8>,
+    _reserved_05: Reserved<3>,
+    pub input_length: Field<u32>,
+    _reserved_0c: Reserved<4>,
+    pub input: Field<u64>,
+    pub output_length: Field<u32>,
+    _reserved_1c: Reserved<4>,
+    pub output: Field<u64>,
+}
+
+unsafe impl NtStruct for Win32PowerInfoParameters {}
+
+/// A entrada da informação 1 (presença do usuário no console) do callout de
+/// informação de energia: o BOOLEAN de presença e o motivo. 8 bytes.
+#[repr(C)]
+pub struct Win32ConsoleUserPresent {
+    pub present: Field<u8>,
+    _reserved_01: Reserved<3>,
+    pub reason: Field<u32>,
+}
+
+unsafe impl NtStruct for Win32ConsoleUserPresent {}
+
 const _: () = {
     assert!(core::mem::size_of::<Win32ThreadCalloutParameters>() == 0x10);
     assert!(core::mem::offset_of!(Win32ThreadCalloutParameters, callout_type) == 0x08);
     assert!(core::mem::size_of::<Win32ProcessCalloutParameters>() == 0x10);
     assert!(core::mem::offset_of!(Win32ProcessCalloutParameters, initialize) == 0x08);
+    assert!(core::mem::size_of::<Win32PowerEventParameters>() == 0x10);
+    assert!(core::mem::offset_of!(Win32PowerEventParameters, code) == 0x08);
+    assert!(core::mem::size_of::<Win32PowerStateParameters>() == 0x18);
+    assert!(core::mem::offset_of!(Win32PowerStateParameters, min_system_state) == 0x08);
+    assert!(core::mem::offset_of!(Win32PowerStateParameters, power_state_task) == 0x10);
+    assert!(core::mem::size_of::<Win32PowerInfoParameters>() == 0x28);
+    assert!(core::mem::offset_of!(Win32PowerInfoParameters, flag) == 0x04);
+    assert!(core::mem::offset_of!(Win32PowerInfoParameters, input_length) == 0x08);
+    assert!(core::mem::offset_of!(Win32PowerInfoParameters, input) == 0x10);
+    assert!(core::mem::offset_of!(Win32PowerInfoParameters, output_length) == 0x18);
+    assert!(core::mem::offset_of!(Win32PowerInfoParameters, output) == 0x20);
+    assert!(core::mem::size_of::<Win32ConsoleUserPresent>() == 0x08);
+    assert!(core::mem::offset_of!(Win32ConsoleUserPresent, reason) == 0x04);
 };
 
 /// Registro de um atributo de segurança no formato interno do token, que

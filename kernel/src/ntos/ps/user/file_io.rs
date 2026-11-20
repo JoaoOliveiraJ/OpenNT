@@ -1077,15 +1077,89 @@ pub fn fs_control(handle: u64, event: u64, apc: u64, rsp: u64) -> Result<u32, Ke
     })
 }
 
-fn nt_flush_buffers_file(handle: u64, iosb: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
-    run(iosb, || {
-        let (entry, _) = object(handle)?;
-        if entry.access() & (2 | 4 | 0x100) == 0 {
-            return fail(DENIED);
-        }
-        volume_or_fail()?.flush()?;
-        Ok(complete(iosb, 0, 0))
+/// NtQueryEaFile(FileHandle, IoStatusBlock, Buffer, Length,
+/// ReturnSingleEntry, EaList, EaListLength, EaIndex, RestartScan):
+/// `io/file/ea`.
+fn nt_query_ea_file(handle: u64, iosb: u64, buffer: u64, length: u64, rsp: u64) -> Result<u32, KernelError> {
+    crate::ntos::io::file::ea::query_ea_file(&crate::ntos::io::file::ea::QueryEa {
+        handle,
+        io_status: iosb,
+        buffer,
+        length: length as u32,
+        single: state::stack_arg(rsp, 5) as u8 != 0,
+        ea_list: state::stack_arg(rsp, 6),
+        ea_list_length: state::stack_arg32(rsp, 7),
+        ea_index: state::stack_arg(rsp, 8),
+        restart: state::stack_arg(rsp, 9) as u8 != 0,
+        user: true,
     })
+}
+
+/// NtCancelSynchronousIoFile(ThreadHandle, IoRequestToCancel,
+/// IoStatusBlock): `io/file/irp_service`.
+fn nt_cancel_synchronous_io_file(thread: u64, io_request: u64, iosb: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
+    irp_service::cancel_synchronous_io(thread, io_request, iosb)
+}
+
+/// NtSetEaFile(FileHandle, IoStatusBlock, Buffer, Length): `io/file/ea`.
+fn nt_set_ea_file(handle: u64, iosb: u64, buffer: u64, length: u64, _rsp: u64) -> Result<u32, KernelError> {
+    crate::ntos::io::file::ea::set_ea_file(handle, iosb, buffer, length as u32, true)
+}
+
+/// NtFlushBuffersFile(FileHandle, IoStatusBlock): o NtFlushBuffersFileEx
+/// sem flags nem parâmetros, como no ntoskrnl 19041 (0x67d0f0).
+fn nt_flush_buffers_file(handle: u64, iosb: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
+    flush_buffers(handle, 0, 0, 0, iosb)
+}
+
+/// NtFlushBuffersFileEx(FileHandle, Flags, Parameters, ParametersSize,
+/// IoStatusBlock).
+fn nt_flush_buffers_file_ex(handle: u64, flags: u64, parameters: u64, parameters_size: u64, rsp: u64) -> Result<u32, KernelError> {
+    flush_buffers(handle, flags as u32, parameters, parameters_size as u32, state::stack_arg(rsp, 5))
+}
+
+/// NtFlushBuffersFileEx de modo usuário (ntoskrnl 19041, 0x67d120):
+/// Parameters ou ParametersSize diferentes de zero são
+/// STATUS_INVALID_PARAMETER; o IO_STATUS_BLOCK sondado para escrita; o
+/// arquivo pede FILE_WRITE_DATA ou FILE_APPEND_DATA (STATUS_ACCESS_DENIED,
+/// sem IO_STATUS_BLOCK, como as recusas antes do IRP). O IRP_MJ_FLUSH_BUFFERS
+/// leva o minor dos flags (FLUSH_FLAGS_FILE_DATA_ONLY = IRP_MN_FLUSH_DATA_ONLY,
+/// FLUSH_FLAGS_NO_SYNC = IRP_MN_FLUSH_NO_SYNC, FLUSH_FLAGS_FILE_DATA_SYNC_ONLY
+/// = IRP_MN_FLUSH_DATA_SYNC_ONLY, nessa ordem), que o I/O Manager não
+/// confere: um arquivo de driver o recebe (`irp_service::flush_buffers`); no
+/// volume do kernel, cujas escritas já são síncronas, todo minor grava as
+/// estruturas pendentes no disco.
+fn flush_buffers(handle: u64, flags: u32, parameters: u64, parameters_size: u32, iosb: u64) -> Result<u32, KernelError> {
+    if parameters != 0 || parameters_size != 0 {
+        return Ok(0xC000_000D);
+    }
+    if !state::probe_user_write(iosb, 4) {
+        return Ok(AV);
+    }
+    if driver_file(handle) {
+        let minor = if flags & 1 != 0 {
+            2
+        } else if flags & 2 != 0 {
+            3
+        } else if flags & 4 != 0 {
+            4
+        } else {
+            0
+        };
+        return Ok(irp_service::flush_buffers(handle, iosb, minor));
+    }
+    let entry = match object(handle) {
+        Ok((entry, _)) => entry,
+        Err(error) => return Ok(error.status),
+    };
+    if entry.access() & (2 | 4) == 0 {
+        return Ok(DENIED);
+    }
+    let status = match volume_or_fail().and_then(|volume| volume.flush()) {
+        Ok(()) => 0,
+        Err(error) => if error.status != 0 { error.status } else { 0xC000_0185 },
+    };
+    Ok(complete(iosb, status, 0))
 }
 
 /// Curingas DOS: `*`, `?`, `<` (DOS_STAR), `>` (DOS_QM), `"` (DOS_DOT);
@@ -1380,6 +1454,10 @@ pub fn init_part2() {
     state::register_handler("NtCopyFileChunk", nt_copy_file_chunk);
     state::register_handler("NtSetInformationFile", nt_set_information_file);
     state::register_handler("NtFlushBuffersFile", nt_flush_buffers_file);
+    state::register_handler("NtFlushBuffersFileEx", nt_flush_buffers_file_ex);
+    state::register_handler("NtQueryEaFile", nt_query_ea_file);
+    state::register_handler("NtCancelSynchronousIoFile", nt_cancel_synchronous_io_file);
+    state::register_handler("NtSetEaFile", nt_set_ea_file);
     state::register_handler("NtQueryDirectoryFile", nt_query_directory_file);
     state::register_handler("NtQueryDirectoryFileEx", nt_query_directory_file_ex);
     state::register_handler("NtQueryVolumeInformationFile", nt_query_volume_information_file);

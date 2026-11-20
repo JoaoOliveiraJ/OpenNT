@@ -2164,7 +2164,7 @@ pub mod zw_query_ea_file {
     /// ZwQueryEaFile(FileHandle, IoStatusBlock, Buffer, Length,
     /// ReturnSingleEntry, EaList, EaListLength, EaIndex, RestartScan) -> NTSTATUS.
     fn query_ea_file(call: &Call) -> Result<u64, KernelError> {
-        let request = QueryEa { handle: call.arg(1), io_status: call.arg(2), buffer: call.arg(3), length: call.arg(4) as u32, single: call.arg(5) as u8 != 0, ea_list: call.arg(6), ea_list_length: call.arg(7) as u32, ea_index: call.arg(8), restart: call.arg(9) as u8 != 0 };
+        let request = QueryEa { handle: call.arg(1), io_status: call.arg(2), buffer: call.arg(3), length: call.arg(4) as u32, single: call.arg(5) as u8 != 0, ea_list: call.arg(6), ea_list_length: call.arg(7) as u32, ea_index: call.arg(8), restart: call.arg(9) as u8 != 0, user: false };
         Ok(signed_status(previous_mode::with_kernel(|| ea::query_ea_file(&request))??))
     }
 
@@ -2400,7 +2400,7 @@ pub mod io_file_services {
 
     /// ZwSetEaFile(FileHandle, IoStatusBlock, Buffer, Length) -> NTSTATUS.
     fn set_ea_file(call: &Call) -> Result<u64, KernelError> {
-        Ok(signed_status(previous_mode::with_kernel(|| ea::set_ea_file(call.arg(1), call.arg(2), call.arg(3), call.arg(4) as u32))??))
+        Ok(signed_status(previous_mode::with_kernel(|| ea::set_ea_file(call.arg(1), call.arg(2), call.arg(3), call.arg(4) as u32, false))??))
     }
 
     /// ZwNotifyChangeDirectoryFile(FileHandle, Event, ApcRoutine, ApcContext,

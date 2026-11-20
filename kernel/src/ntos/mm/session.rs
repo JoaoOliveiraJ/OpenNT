@@ -179,6 +179,14 @@ pub fn id_of(session: u64) -> Option<u32> {
     SESSIONS.lock().get(&session).map(|state| state.id)
 }
 
+/// Os ids das sessões vivas, em ordem crescente (a volta do
+/// MmGetNextSession).
+pub fn ids() -> alloc::vec::Vec<u32> {
+    let mut ids: alloc::vec::Vec<u32> = SESSIONS.lock().values().map(|state| state.id).collect();
+    ids.sort_unstable();
+    ids
+}
+
 /// Quantas sessões vivas.
 pub fn count() -> usize {
     SESSIONS.lock().len()

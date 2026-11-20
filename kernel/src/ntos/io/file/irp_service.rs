@@ -135,6 +135,7 @@ const IRP_MJ_READ: u8 = 0x03;
 const IRP_MJ_WRITE: u8 = 0x04;
 const IRP_MJ_QUERY_INFORMATION: u8 = 0x05;
 const IRP_MJ_SET_INFORMATION: u8 = 0x06;
+const IRP_MJ_FLUSH_BUFFERS: u8 = 0x09;
 const IRP_MJ_FILE_SYSTEM_CONTROL: u8 = 0x0D;
 const IRP_MJ_DEVICE_CONTROL: u8 = 0x0E;
 const IRP_MN_USER_FS_REQUEST: u8 = 0x00;
@@ -596,6 +597,67 @@ fn rundown(thread: u64) {
 pub fn init() {
     process::register_thread_exit_routine(rundown);
     dispatcher::register_completion_pump(drain_deferred);
+}
+
+/// IRP.Flags que o IopCancelIrpsInCurrentThreadList considera: as
+/// requisições de paginação e de fechamento ficam, a API síncrona e a
+/// criação são canceladas.
+const IRP_PAGING_IO: u32 = 0x2;
+const IRP_CREATE_OPERATION: u32 = 0x80;
+const IRP_CLOSE_OPERATION: u32 = 0x400;
+/// THREAD_TERMINATE, o acesso do NtCancelSynchronousIoFile ao handle.
+const THREAD_TERMINATE: u32 = 0x1;
+const STATUS_NOT_FOUND: u32 = 0xC000_0225;
+
+/// IopCancelSynchronousIrpsForThread(Thread, IoRequestToCancel) (0x891150):
+/// cancela as requisições síncronas da thread (de um arquivo síncrono, com
+/// IRP_SYNCHRONOUS_API ou de criação; nunca paginação nem fechamento), só a
+/// do IO_STATUS_BLOCK dado quando há um, e diz se achou alguma. O NT cancela
+/// no contexto da thread alvo por APC; aqui o IoCancelIrp corre em quem
+/// pede.
+fn cancel_synchronous_for_thread(thread: u64, io_request: u64) -> bool {
+    let candidates: Vec<u64> = REQUESTS
+        .lock()
+        .iter()
+        .filter(|(&packet, request)| {
+            let irp = irp_at(packet);
+            let flags = irp.flags.get();
+            request.thread == thread
+                && !request.abandoned
+                && flags & (IRP_PAGING_IO | IRP_CLOSE_OPERATION) == 0
+                && (request.synchronous || flags & (IRP_SYNCHRONOUS_API | IRP_CREATE_OPERATION) != 0)
+                && (io_request == 0 || irp.user_iosb.get() == io_request)
+        })
+        .map(|(&packet, _)| packet)
+        .collect();
+    let mut found = false;
+    for packet in candidates {
+        if REQUESTS.lock().contains_key(&packet) {
+            let _ = cancel::irp(packet);
+            found = true;
+        }
+    }
+    found
+}
+
+/// NtCancelSynchronousIoFile(ThreadHandle, IoRequestToCancel, IoStatusBlock)
+/// de modo usuário (0x894680): o IO_STATUS_BLOCK sondado para escrita, o
+/// handle da thread com THREAD_TERMINATE (a recusa volta sem gravar nada) e
+/// o STATUS_SUCCESS quando alguma requisição síncrona foi cancelada, senão
+/// STATUS_NOT_FOUND, também no IO_STATUS_BLOCK (Information 0; uma falha
+/// nessa gravação não muda o retorno).
+pub fn cancel_synchronous_io(thread_handle: u64, io_request: u64, io_status: u64) -> Result<u32, crate::rtl::KernelError> {
+    if !probe(io_status, 4, true) {
+        return Ok(STATUS_ACCESS_VIOLATION);
+    }
+    let mut reference = match crate::ntos::ob::handles::thread::reference(thread_handle, THREAD_TERMINATE, USER_MODE)? {
+        Ok(reference) => reference,
+        Err(status) => return Ok(status),
+    };
+    let status = if cancel_synchronous_for_thread(reference.pointer, io_request) { STATUS_SUCCESS } else { STATUS_NOT_FOUND };
+    reference.release()?;
+    let _ = write_user_iosb(io_status, status, 0);
+    Ok(status)
 }
 
 /// Quantas requisições deste caminho estão vivas para a thread (ETHREAD).
@@ -1257,6 +1319,43 @@ pub fn unlock_file(handle: u64, io_status: u64, byte_offset: u64, length: u64, k
         return conclude(&target, synchronous, None, STATUS_INSUFFICIENT_RESOURCES);
     }
     set_lock_parameters(packet, copy, key, offset);
+    track(packet, &target, None, local, 0);
+    information_tail(&target, packet, local, io_status)
+}
+
+/// NtFlushBuffersFileEx de um arquivo de driver (0x67d120, depois das
+/// conferências de Parameters e da sonda do IO_STATUS_BLOCK): o acesso
+/// FILE_WRITE_DATA, ou FILE_APPEND_DATA fora de um pipe nomeado (senão
+/// STATUS_ACCESS_DENIED), e o IRP_MJ_FLUSH_BUFFERS com o `minor` dos flags
+/// pela cauda síncrona do I/O Manager (o evento local num arquivo
+/// assíncrono).
+pub fn flush_buffers(handle: u64, io_status: u64, minor: u8) -> u32 {
+    let target = match reference_for(handle, Some(IRP_MJ_FLUSH_BUFFERS)) {
+        Ok(target) => target,
+        Err(status) => return status,
+    };
+    let required = FILE_WRITE_DATA | if target.flags & FO_NAMED_PIPE != 0 { 0 } else { FILE_APPEND_DATA };
+    if target.access & required == 0 {
+        return conclude(&target, false, None, STATUS_ACCESS_DENIED);
+    }
+    let synchronous = target.synchronous();
+    if synchronous && information::acquire_file(target.file).is_err() {
+        return conclude(&target, false, None, STATUS_INSUFFICIENT_RESOURCES);
+    }
+    let local = if synchronous { 0 } else { allocate_local() };
+    if !synchronous && local == 0 {
+        return conclude(&target, synchronous, None, STATUS_INSUFFICIENT_RESOURCES);
+    }
+    dispatcher::clear_event(file_at(target.file).event.address());
+    let flags = if local != 0 { IRP_SYNCHRONOUS_API } else { 0 };
+    let (user_event, user_iosb) = if local != 0 { (local, local_iosb(local).address()) } else { (0, io_status) };
+    let packet = allocate(&target, BuildOptions { major: IRP_MJ_FLUSH_BUFFERS, minor, user_event, user_iosb, ..BuildOptions::default() }, flags);
+    if packet == 0 {
+        if local != 0 {
+            guest::free_bytes(local);
+        }
+        return conclude(&target, synchronous, None, STATUS_INSUFFICIENT_RESOURCES);
+    }
     track(packet, &target, None, local, 0);
     information_tail(&target, packet, local, io_status)
 }

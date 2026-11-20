@@ -419,3 +419,48 @@ pub fn exports(segment: &ImageSegment, image_base: u64) -> Result<Exports, Kerne
     let (rva, size) = (u32::from_le_bytes([directory[0], directory[1], directory[2], directory[3]]) as u64, u32::from_le_bytes([directory[4], directory[5], directory[6], directory[7]]) as u64);
     pe_exports::read_exports(&read_rva, image_base, segment.size_of_image, rva, size)
 }
+
+/// NtAreMappedFilesTheSame(File1MappedAsAnImage, File2MappedAsFile) no
+/// processo corrente (ntoskrnl 19041, 0x6a0330):
+/// - um endereço sem alocação (sem VAD) é STATUS_INVALID_ADDRESS;
+/// - os dois na mesma alocação, STATUS_SUCCESS;
+/// - memória privada ou uma vista sem arquivo (de pagefile),
+///   STATUS_CONFLICTING_ADDRESSES;
+/// - senão STATUS_SUCCESS só quando a control area da primeira vista é a de
+///   imagem do arquivo da segunda (o ImageSectionObject dos
+///   SECTION_OBJECT_POINTERS dele), e STATUS_NOT_SAME_DEVICE nos outros
+///   casos.
+///
+/// O EXE e a ntdll que a criação do processo mapeia não são vistas de seção
+/// no OpenNT: um endereço neles dá STATUS_CONFLICTING_ADDRESSES.
+pub fn are_mapped_files_the_same(image_address: u64, file_address: u64) -> u32 {
+    use crate::ntos::ps::user::sections;
+    const STATUS_INVALID_ADDRESS: u32 = 0xC000_0141;
+    const STATUS_CONFLICTING_ADDRESSES: u32 = 0xC000_0018;
+    const STATUS_NOT_SAME_DEVICE: u32 = 0xC000_00D4;
+    const MEM_FREE: u32 = 0x1_0000;
+    let highest = crate::ntos::mm::memory_map::HIGHEST_USER_ADDRESS;
+    if image_address > highest || file_address > highest {
+        return STATUS_INVALID_ADDRESS;
+    }
+    let process = crate::ntos::ps::process::get_current_process();
+    let (first, second) = (crate::ntos::mm::query_virtual::describe_address(process, image_address), crate::ntos::mm::query_virtual::describe_address(process, file_address));
+    if first.state == MEM_FREE || second.state == MEM_FREE {
+        return STATUS_INVALID_ADDRESS;
+    }
+    if first.allocation_base == second.allocation_base {
+        return 0;
+    }
+    let view_at = |address: u64| sections::views().into_iter().find(|view| view.owner_process == Some(process) && !view.retiring() && address >= view.base && address - view.base < view.size);
+    let (Some(image_view), Some(file_view)) = (view_at(image_address), view_at(file_address)) else { return STATUS_CONFLICTING_ADDRESSES };
+    let (Some(_), Some(file)) = (image_view.section.file.as_ref(), file_view.section.file.as_ref()) else { return STATUS_CONFLICTING_ADDRESSES };
+    let image_segment = image_view.section.state.lock().image_segment.clone();
+    let file_segment = match file.identity() {
+        Some(identity) => SEGMENTS.lock().get(&SegmentKey::File(identity)).and_then(Weak::upgrade),
+        None => file_view.section.state.lock().image_segment.clone(),
+    };
+    match (image_segment, file_segment) {
+        (Some(first), Some(second)) if Arc::ptr_eq(&first, &second) => 0,
+        _ => STATUS_NOT_SAME_DEVICE,
+    }
+}

@@ -8,6 +8,18 @@
 //! SeCiCallbacks (`se/code_integrity`). Sem a CI inicializada os slots são
 //! nulos: a comparação devolve FALSE e as consultas STATUS_UNSUCCESSFUL. As
 //! entradas Zw rodam em KernelMode (sem sondas).
+//!
+//! De modo usuário:
+//! - NtCompareSigningLevels(Actual, Expected) (0x69ffe0): o EAX do callback
+//!   da CI (0 sem ele) vira STATUS_SUCCESS quando não é zero e
+//!   STATUS_INVALID_IMAGE_HASH quando é.
+//! - NtGetCachedSigningLevel (0x682700): File, Flags e SigningLevel nulos
+//!   são STATUS_INVALID_PARAMETER; o handle com FILE_READ_DATA em UserMode;
+//!   uma falha da CI (STATUS_NOT_FOUND num arquivo sem o cache) volta sem
+//!   tocar a memória do chamador. Só depois do sucesso as saídas são
+//!   sondadas (Flags e ThumbprintSize alinhados a 4, SigningLevel e
+//!   Thumbprint a 1, ThumbprintAlgorithm a 4) e gravadas; uma exceção é o
+//!   status.
 
 use crate::hal::amd64::native_call;
 use crate::ntos::ex::pool_allocation;
@@ -154,4 +166,118 @@ pub fn set_cached(flags: u32, input_level: u8, source_files: u64, count: u32, ta
     };
     pool_allocation::free(copy, SOURCE_FILES_TAG as u64)?;
     Ok(status)
+}
+
+const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
+const STATUS_INVALID_IMAGE_HASH: u32 = 0xC000_0428;
+const USER_MODE: u64 = 1;
+
+/// NtCompareSigningLevels(ActualSigningLevel, ExpectedSigningLevel) de modo
+/// usuário.
+pub fn compare_user(actual: u8, expected: u8) -> u32 {
+    if compare(actual, expected) as u32 != 0 {
+        0
+    } else {
+        STATUS_INVALID_IMAGE_HASH
+    }
+}
+
+/// O ProbeForWrite de uma saída de modo usuário: alinhamento e faixa.
+fn probe_output(address: u64, length: u64, alignment: u64) -> Result<(), u32> {
+    if length == 0 {
+        return Ok(());
+    }
+    if address & (alignment - 1) != 0 {
+        return Err(STATUS_DATATYPE_MISALIGNMENT);
+    }
+    if !crate::ntos::ps::user_probe::probe_user_write(address, length) {
+        return Err(STATUS_ACCESS_VIOLATION);
+    }
+    Ok(())
+}
+
+/// Grava os resultados da CI nas saídas de modo usuário, na ordem do
+/// NtGetCachedSigningLevel; o status final ou a exceção.
+fn write_user_outputs(status: u32, locals: u64, flags: u64, level: u64, thumbprint: u64, size: u64, algorithm: u64) -> Result<u32, u32> {
+    let (local_flags, local_size, local_algorithm, local_level, local_thumbprint) = (locals + 8, locals + 0xC, locals + 0x10, locals + 0x14, locals + 0x20);
+    probe_output(flags, 4, 4)?;
+    probe_output(level, 1, 1)?;
+    let cached_flags = guest::read32(local_flags);
+    let fault = |error: KernelError| error.status;
+    guest::try_write::<u32>(flags, cached_flags).map_err(fault)?;
+    guest::try_write::<u8>(level, guest::read8(local_level)).map_err(fault)?;
+    if size == 0 {
+        return Ok(status);
+    }
+    probe_output(size, 4, 4)?;
+    if cached_flags & 2 == 0 {
+        guest::try_write::<u32>(size, 0).map_err(fault)?;
+        return Ok(status);
+    }
+    let length = guest::read32(local_size);
+    let mut result = status;
+    if guest::try_read::<u32>(size).map_err(fault)? >= length && thumbprint != 0 {
+        probe_output(thumbprint, length as u64, 1)?;
+        guest::try_write_bytes(thumbprint, &guest::read_bytes(local_thumbprint, length as usize)).map_err(fault)?;
+    } else {
+        result = STATUS_BUFFER_TOO_SMALL;
+    }
+    guest::try_write::<u32>(size, length).map_err(fault)?;
+    if algorithm != 0 {
+        probe_output(algorithm, 4, 4)?;
+        guest::try_write::<u32>(algorithm, guest::read32(local_algorithm)).map_err(fault)?;
+    }
+    Ok(result)
+}
+
+/// NtGetCachedSigningLevel(File, Flags*, SigningLevel*, Thumbprint,
+/// ThumbprintSize*, ThumbprintAlgorithm*) de modo usuário.
+pub fn get_cached_user(file: u64, flags: u64, level: u64, thumbprint: u64, size: u64, algorithm: u64) -> Result<u32, KernelError> {
+    if file == 0 || flags == 0 || level == 0 {
+        return Ok(STATUS_INVALID_PARAMETER);
+    }
+    // Locais: objeto (8), flags (4), tamanho (4), algoritmo (4), nível (1) e
+    // a impressão digital (0x40).
+    let locals = guest::alloc_bytes(0x60);
+    if locals == 0 {
+        return Ok(STATUS_INSUFFICIENT_RESOURCES);
+    }
+    guest::write_bytes(locals, &[0; 0x60]);
+    guest::write32(locals + 0xC, THUMBPRINT_CAPACITY);
+    let result = (|| -> Result<u32, KernelError> {
+        let referenced = exports::invoke_handler("ObReferenceObjectByHandle", &[file, FILE_READ_DATA, object_types::file_type().pointer, USER_MODE, locals, 0])? as u32;
+        if referenced & 0x8000_0000 != 0 {
+            return Ok(referenced);
+        }
+        let file_object = guest::read64(locals);
+        let wants = thumbprint != 0;
+        let status = get_for_file_object(file_object, locals + 8, locals + 0x14, if wants { locals + 0x20 } else { 0 }, if wants { locals + 0xC } else { 0 }, if wants { locals + 0x10 } else { 0 });
+        let status = if status & 0x8000_0000 != 0 {
+            status
+        } else {
+            write_user_outputs(status, locals, flags, level, thumbprint, size, algorithm).unwrap_or_else(|exception| exception)
+        };
+        exports::invoke_handler("ObfDereferenceObject", &[file_object])?;
+        Ok(status)
+    })();
+    guest::free_bytes(locals);
+    result
+}
+
+fn nt_compare_signing_levels(actual: u64, expected: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
+    Ok(compare_user(actual as u8, expected as u8))
+}
+
+fn nt_get_cached_signing_level(file: u64, flags: u64, level: u64, thumbprint: u64, rsp: u64) -> Result<u32, KernelError> {
+    use crate::ntos::ps::user::state;
+    get_cached_user(file, flags, level, thumbprint, state::stack_arg(rsp, 5), state::stack_arg(rsp, 6))
+}
+
+/// Os handlers dos serviços NtCompareSigningLevels e
+/// NtGetCachedSigningLevel de modo usuário.
+pub fn register_user_services() {
+    use crate::ntos::ps::user::state;
+    state::register_handler("NtCompareSigningLevels", nt_compare_signing_levels);
+    state::register_handler("NtGetCachedSigningLevel", nt_get_cached_signing_level);
 }

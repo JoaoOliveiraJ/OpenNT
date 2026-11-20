@@ -39,6 +39,24 @@
 //! - o IopSynchronousServiceTail espera a conclusão e o IO_STATUS_BLOCK do
 //!   chamador recebe Status e Information.
 //! Os arquivos dos volumes do próprio kernel gravam pelo FsRtlSetKernelEaFile.
+//!
+//! De modo usuário (os serviços NtQueryEaFile e NtSetEaFile):
+//! - NtQueryEaFile: o IO_STATUS_BLOCK sondado para escrita e o Buffer pelo
+//!   ProbeForWrite alinhado a 4; o EaIndex lido do ponteiro sondado; a
+//!   EaList alinhada a 4, sondada e capturada em pool, com cada
+//!   FILE_GET_EA_INFORMATION conferido (pelo menos 5 bytes, o nome com o
+//!   terminador dentro da lista, NextEntryOffset igual ao tamanho alinhado a
+//!   4 e dentro dela): um erro é o STATUS_EA_LIST_INCONSISTENT no
+//!   IO_STATUS_BLOCK, com o deslocamento da entrada em Information (0 quando
+//!   faltam os 5 bytes), sem IRP; o handle com FILE_READ_EA; o IRP com
+//!   RequestorMode UserMode.
+//! - NtSetEaFile: o IO_STATUS_BLOCK sondado para escrita e o Buffer pelo
+//!   ProbeForRead alinhado a 4; o handle com FILE_WRITE_EA; o IRP com
+//!   RequestorMode UserMode; no volume do kernel, as EAs `$KERNEL.` são do
+//!   modo kernel.
+//! Uma recusa do handle ou do acesso volta sem tocar no IO_STATUS_BLOCK; uma
+//! sonda que falha é STATUS_ACCESS_VIOLATION (STATUS_DATATYPE_MISALIGNMENT
+//! no alinhamento).
 
 use crate::ntos::inc::types::{DeviceObject, IoStackLocation, Irp, NtStruct};
 use crate::ntos::io::file::{information as file_information, query as file_query};
@@ -53,6 +71,13 @@ use crate::rtl::KernelError;
 
 const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
+const STATUS_EA_LIST_INCONSISTENT: u32 = 0x8000_0014;
+/// FILE_READ_EA e FILE_WRITE_EA.
+const FILE_READ_EA: u32 = 0x8;
+const FILE_WRITE_EA: u32 = 0x10;
 /// IRP_MJ_QUERY_EA e IRP_MJ_SET_EA.
 const IRP_MJ_QUERY_EA: u8 = 7;
 const IRP_MJ_SET_EA: u8 = 8;
@@ -82,6 +107,8 @@ pub struct QueryEa {
     pub ea_list_length: u32,
     pub ea_index: u64,
     pub restart: bool,
+    /// PreviousMode UserMode (o serviço NtQueryEaFile).
+    pub user: bool,
 }
 
 fn pool(length: u32) -> u64 {
@@ -94,18 +121,115 @@ fn free_pool(pointer: u64) {
     }
 }
 
+/// O ProbeForRead/ProbeForWrite de modo usuário: alinhamento e faixa
+/// (comprimento zero não confere nada).
+fn probe_user(address: u64, length: u64, alignment: u64, write: bool) -> Result<(), u32> {
+    if length == 0 {
+        return Ok(());
+    }
+    if address & (alignment - 1) != 0 {
+        return Err(STATUS_DATATYPE_MISALIGNMENT);
+    }
+    let probed = if write { crate::ntos::ps::user_probe::probe_user_write(address, length) } else { crate::ntos::ps::user_probe::probe_user_read(address, length) };
+    if probed { Ok(()) } else { Err(STATUS_ACCESS_VIOLATION) }
+}
+
+/// A conferência da lista FILE_GET_EA_INFORMATION capturada do modo usuário:
+/// `Err(Information)` do STATUS_EA_LIST_INCONSISTENT.
+fn check_get_ea_list(list: &[u8]) -> Result<(), u64> {
+    let mut offset = 0usize;
+    let mut remaining = list.len() as i64;
+    loop {
+        if remaining < 5 {
+            return Err(0);
+        }
+        let size = list[offset + 4] as i64 + 6;
+        if remaining < size {
+            return Err(offset as u64);
+        }
+        let next = u32::from_le_bytes([list[offset], list[offset + 1], list[offset + 2], list[offset + 3]]);
+        if next == 0 {
+            return Ok(());
+        }
+        if (size + 3) & !3 != next as i64 || (next as i32) < 0 {
+            return Err(offset as u64);
+        }
+        remaining -= next as i64;
+        if remaining < 0 {
+            return Err(offset as u64);
+        }
+        offset += next as usize;
+    }
+}
+
+/// Grava o IO_STATUS_BLOCK de um pedido recusado antes do IRP.
+fn early_io_status(io_status: u64, status: u32, information: u64) -> u32 {
+    if guest::try_write::<u32>(io_status, status).and_then(|()| guest::try_write::<u64>(io_status + 8, information)).is_err() {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    status
+}
+
 /// ZwQueryEaFile(FileHandle, IoStatusBlock, Buffer, Length,
-/// ReturnSingleEntry, EaList, EaListLength, EaIndex, RestartScan).
+/// ReturnSingleEntry, EaList, EaListLength, EaIndex, RestartScan), ou o
+/// serviço de modo usuário com `request.user`.
 pub fn query_ea_file(request: &QueryEa) -> Result<u32, KernelError> {
+    let mut index_cell = 0;
+    if request.user {
+        if let Err(status) = probe_user(request.io_status, 4, 1, true).and_then(|()| probe_user(request.buffer, request.length as u64, 4, true)) {
+            return Ok(status);
+        }
+        if request.ea_index != 0 {
+            let Ok(index) = probe_user(request.ea_index, 4, 1, false).map_err(|_| ()).and_then(|()| guest::try_read::<u32>(request.ea_index).map_err(|_| ())) else { return Ok(STATUS_ACCESS_VIOLATION) };
+            index_cell = guest::alloc_bytes(4);
+            if index_cell == 0 {
+                return Ok(STATUS_INSUFFICIENT_RESOURCES);
+            }
+            guest::write32(index_cell, index);
+        }
+    }
+    let ea_index = if request.user { index_cell } else { request.ea_index };
+    let result = query_ea_file_with_index(request, ea_index);
+    if index_cell != 0 {
+        guest::free_bytes(index_cell);
+    }
+    result
+}
+
+/// O corpo do NtQueryEaFile com o EaIndex já em memória do kernel no modo
+/// usuário.
+fn query_ea_file_with_index(request: &QueryEa, ea_index: u64) -> Result<u32, KernelError> {
     let mut list = 0;
     if request.ea_list != 0 && request.ea_list_length != 0 {
+        if request.user {
+            if let Err(status) = probe_user(request.ea_list, request.ea_list_length as u64, 4, false) {
+                return Ok(status);
+            }
+        }
         list = pool(request.ea_list_length);
         if list == 0 {
             return Ok(STATUS_INSUFFICIENT_RESOURCES);
         }
-        guest::write_bytes(list, &guest::read_bytes(request.ea_list, request.ea_list_length as usize));
+        let captured = if request.user {
+            match guest::try_read_bytes(request.ea_list, request.ea_list_length as usize) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    free_pool(list);
+                    return Ok(error.status);
+                }
+            }
+        } else {
+            guest::read_bytes(request.ea_list, request.ea_list_length as usize)
+        };
+        if request.user {
+            if let Err(information) = check_get_ea_list(&captured) {
+                free_pool(list);
+                return Ok(early_io_status(request.io_status, STATUS_EA_LIST_INCONSISTENT, information));
+            }
+        }
+        guest::write_bytes(list, &captured);
     }
-    let selected = match file_query::resolve(request.handle, false) {
+    let selected = match file_query::resolve(request.handle, request.user) {
         Ok(selected) if selected.pointer != 0 => selected,
         Ok(_) => {
             free_pool(list);
@@ -116,6 +240,10 @@ pub fn query_ea_file(request: &QueryEa) -> Result<u32, KernelError> {
             return Ok(status);
         }
     };
+    if request.user && selected.access & FILE_READ_EA == 0 {
+        free_pool(list);
+        return Ok(STATUS_ACCESS_DENIED);
+    }
     let file = selected.pointer;
     if file_objects::reference(file)?.is_none() {
         free_pool(list);
@@ -129,18 +257,24 @@ pub fn query_ea_file(request: &QueryEa) -> Result<u32, KernelError> {
             if returned == 0 {
                 return Ok((STATUS_INSUFFICIENT_RESOURCES, u64::MAX));
             }
-            let status = kernel_ea::query(file, request.buffer, request.length, request.single as u8, list, if list != 0 { request.ea_list_length } else { 0 }, request.ea_index, request.restart as u8, returned)?;
+            let status = kernel_ea::query(file, request.buffer, request.length, request.single as u8, list, if list != 0 { request.ea_list_length } else { 0 }, ea_index, request.restart as u8, returned)?;
             let information = guest::read32(returned) as u64;
             guest::free_bytes(returned);
             return Ok((status, information));
         }
-        send(request, file, device, list)
+        send(request, file, device, list, ea_index)
     })();
     file_objects::dereference(file)?;
     // A cópia da lista pertence ao IRP (AuxiliaryBuffer) até a conclusão.
     free_pool(list);
     let (status, information) = result?;
     if information != u64::MAX {
+        if request.user {
+            // A conclusão grava o IO_STATUS_BLOCK de usuário sob exceção
+            // descartada; o retorno é o status do pedido.
+            let _ = early_io_status(request.io_status, status, information);
+            return Ok(status);
+        }
         guest::write32(request.io_status, status);
         guest::write64(request.io_status + 8, information);
     }
@@ -150,7 +284,7 @@ pub fn query_ea_file(request: &QueryEa) -> Result<u32, KernelError> {
 /// O IRP_MJ_QUERY_EA do NtQueryEaFile ao dispositivo do file system:
 /// (status, Information), ou Information = u64::MAX quando o pedido não
 /// chegou a ser concluído (o IO_STATUS_BLOCK fica como estava).
-fn send(request: &QueryEa, file: u64, device: u64, list: u64) -> Result<(u32, u64), KernelError> {
+fn send(request: &QueryEa, file: u64, device: u64, list: u64, ea_index: u64) -> Result<(u32, u64), KernelError> {
     let routine = retained_irp::completion_routine()?;
     if routine == 0 {
         return Ok((STATUS_INSUFFICIENT_RESOURCES, u64::MAX));
@@ -169,7 +303,7 @@ fn send(request: &QueryEa, file: u64, device: u64, list: u64) -> Result<(u32, u6
             return Ok((STATUS_INSUFFICIENT_RESOURCES, u64::MAX));
         }
         dispatcher::initialize_event(event, 0, false);
-        irp_builder::build(irp, &BuildOptions { major: IRP_MJ_QUERY_EA, device_object: device, stack_count: count, file_object: file, requestor_mode: 0, thread: process::get_current_thread(), ..BuildOptions::default() });
+        irp_builder::build(irp, &BuildOptions { major: IRP_MJ_QUERY_EA, device_object: device, stack_count: count, file_object: file, requestor_mode: request.user as u8, thread: process::get_current_thread(), ..BuildOptions::default() });
         let stack = irp_builder::first_stack_location(irp, count);
         // SAFETY: IRP recém-construído e o slot do topo dele.
         let (packet, location) = unsafe { (Irp::at(irp), IoStackLocation::at(stack)) };
@@ -179,8 +313,8 @@ fn send(request: &QueryEa, file: u64, device: u64, list: u64) -> Result<(u32, u6
         parameters.length.set(request.length);
         parameters.ea_list.set(list);
         parameters.ea_list_length.set(if list != 0 { request.ea_list_length } else { 0 });
-        parameters.ea_index.set(if request.ea_index != 0 { guest::read32(request.ea_index) } else { 0 });
-        let flags = (if request.restart { SL_RESTART_SCAN } else { 0 }) | (if request.single { SL_RETURN_SINGLE_ENTRY } else { 0 }) | (if request.ea_index != 0 { SL_INDEX_SPECIFIED } else { 0 });
+        parameters.ea_index.set(if ea_index != 0 { guest::read32(ea_index) } else { 0 });
+        let flags = (if request.restart { SL_RESTART_SCAN } else { 0 }) | (if request.single { SL_RETURN_SINGLE_ENTRY } else { 0 }) | (if ea_index != 0 { SL_INDEX_SPECIFIED } else { 0 });
         location.flags.set(flags);
         let device_flags = target.flags.get();
         if device_flags & DO_BUFFERED_IO != 0 {
@@ -234,13 +368,22 @@ fn send(request: &QueryEa, file: u64, device: u64, list: u64) -> Result<(u32, u6
 
 // ---- ZwSetEaFile ---------------------------------------------------------------
 
-/// ZwSetEaFile(FileHandle, IoStatusBlock, Buffer, Length).
-pub fn set_ea_file(handle: u64, io_status: u64, buffer: u64, length: u32) -> Result<u32, KernelError> {
-    let selected = match file_query::resolve(handle, false) {
+/// ZwSetEaFile(FileHandle, IoStatusBlock, Buffer, Length), ou o serviço de
+/// modo usuário com `user`.
+pub fn set_ea_file(handle: u64, io_status: u64, buffer: u64, length: u32, user: bool) -> Result<u32, KernelError> {
+    if user {
+        if let Err(status) = probe_user(io_status, 4, 1, true).and_then(|()| probe_user(buffer, length as u64, 4, false)) {
+            return Ok(status);
+        }
+    }
+    let selected = match file_query::resolve(handle, user) {
         Ok(selected) if selected.pointer != 0 => selected,
         Ok(_) => return Ok(STATUS_INVALID_HANDLE),
         Err(status) => return Ok(status),
     };
+    if user && selected.access & FILE_WRITE_EA == 0 {
+        return Ok(STATUS_ACCESS_DENIED);
+    }
     let file = selected.pointer;
     if file_objects::reference(file)?.is_none() {
         return Ok(STATUS_INVALID_HANDLE);
@@ -249,13 +392,17 @@ pub fn set_ea_file(handle: u64, io_status: u64, buffer: u64, length: u32) -> Res
         let device = file_information::related_device(file)?;
         if device == 0 {
             // Arquivo de volume do kernel: a gravação direta no volume.
-            return Ok((kernel_ea::set(file, buffer, length)?, 0));
+            return Ok((kernel_ea::set_with_mode(file, buffer, length, !user)?, 0));
         }
-        send_set(file, device, buffer, length)
+        send_set(file, device, buffer, length, user)
     })();
     file_objects::dereference(file)?;
     let (status, information) = result?;
     if information != u64::MAX {
+        if user {
+            let _ = early_io_status(io_status, status, information);
+            return Ok(status);
+        }
         guest::write32(io_status, status);
         guest::write64(io_status + 8, information);
     }
@@ -266,7 +413,7 @@ pub fn set_ea_file(handle: u64, io_status: u64, buffer: u64, length: u32) -> Res
 /// Information), com Information = u64::MAX quando o pedido não chegou a ser
 /// concluído (o IO_STATUS_BLOCK fica como estava). Uma lista recusada pelo
 /// IoCheckEaBufferValidity volta como (status, ErrorOffset).
-fn send_set(file: u64, device: u64, buffer: u64, length: u32) -> Result<(u32, u64), KernelError> {
+fn send_set(file: u64, device: u64, buffer: u64, length: u32, user: bool) -> Result<(u32, u64), KernelError> {
     let routine = retained_irp::completion_routine()?;
     if routine == 0 {
         return Ok((STATUS_INSUFFICIENT_RESOURCES, u64::MAX));
@@ -285,7 +432,7 @@ fn send_set(file: u64, device: u64, buffer: u64, length: u32) -> Result<(u32, u6
             return Ok((STATUS_INSUFFICIENT_RESOURCES, u64::MAX));
         }
         dispatcher::initialize_event(event, 0, false);
-        irp_builder::build(irp, &BuildOptions { major: IRP_MJ_SET_EA, device_object: device, stack_count: count, file_object: file, requestor_mode: 0, thread: process::get_current_thread(), ..BuildOptions::default() });
+        irp_builder::build(irp, &BuildOptions { major: IRP_MJ_SET_EA, device_object: device, stack_count: count, file_object: file, requestor_mode: user as u8, thread: process::get_current_thread(), ..BuildOptions::default() });
         let stack = irp_builder::first_stack_location(irp, count);
         // SAFETY: IRP recém-construído e o slot do topo dele.
         let (packet, location) = unsafe { (Irp::at(irp), IoStackLocation::at(stack)) };
