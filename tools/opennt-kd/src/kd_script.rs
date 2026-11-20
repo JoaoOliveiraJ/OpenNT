@@ -15,11 +15,18 @@
 //! `wait-serial`, `sleep`) atendem as paradas enquanto esperam: um
 //! breakpoint de log ou a carga de um módulo seguem sozinhos, um tratador
 //! roda, e só uma parada sem tratador encerra a espera.
+//!
+//! O mesmo roteiro roda na janela do `opennt-dbg` e no servidor do
+//! `opennt-mcp`: o anfitrião (`ScriptHost`) recebe as linhas no lugar da
+//! saída padrão e pode cancelar, dar um prazo, passar o log da COM1,
+//! atender uma parada antes dos tratadores e responder a um comando no
+//! lugar do depurador (`Client::run_script_hosted`).
 
-use std::collections::HashMap;
+use std::cell::Cell;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
-use std::io::Write;
-use std::path::PathBuf;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -56,6 +63,75 @@ pub struct ScriptOptions {
     /// Para onde as linhas vão no lugar da saída padrão (uma janela, um
     /// servidor MCP pelo stdio): cada linha impressa, com o fim de linha.
     pub capture: Option<Arc<Mutex<String>>>,
+}
+
+/// O anfitrião de um roteiro fora do test-boot (a janela do `opennt-dbg`,
+/// o servidor do `opennt-mcp`). Cada método tem um padrão que não faz nada;
+/// a linguagem, as variáveis, as esperas e os tratadores são os mesmos.
+pub trait ScriptHost {
+    /// Cada linha que o roteiro imprime, no lugar da saída padrão (a
+    /// transcrição, se houver, também recebe).
+    fn output(&mut self, _line: &str) {}
+
+    /// Antes de cada comando ou bloco: a linha no arquivo e o texto dela.
+    fn progress(&mut self, _line: usize, _text: &str) {}
+
+    /// Depois de cada comando e a cada fatia das esperas (a janela põe o
+    /// DbgPrint, a COM1 e o estado do alvo em dia).
+    fn tick(&mut self, _client: &mut Client) {}
+
+    /// O usuário pediu para parar: o roteiro para antes do próximo comando
+    /// ou dentro da espera.
+    fn cancelled(&self) -> bool {
+        false
+    }
+
+    /// O fim do prazo: as esperas não passam dele e nenhum comando começa
+    /// depois.
+    fn deadline(&self) -> Option<Instant> {
+        None
+    }
+
+    /// O log da COM1 (o `wait-serial`, o `serial-has`) quando o cliente não
+    /// tem a COM1 do test-boot: o arquivo é lido do começo e acompanhado.
+    fn serial_log(&self) -> Option<PathBuf> {
+        None
+    }
+
+    /// Uma parada chegou numa espera, antes dos `/cmd` e dos tratadores:
+    /// `true` quando o anfitrião a atendeu (o roteiro faz a máquina seguir
+    /// e a espera continua).
+    fn service_stop(&mut self, _client: &mut Client) -> bool {
+        false
+    }
+
+    /// Um comando do depurador que o anfitrião responde no lugar do cliente
+    /// (o `attach` de uma sessão já anexada, o `detach` recusado); `None`
+    /// manda ao depurador. `word` é a primeira palavra de `text`.
+    fn intercept(&mut self, _client: &mut Client, _word: &str, _text: &str) -> Option<Result<String, String>> {
+        None
+    }
+}
+
+/// O resultado de um roteiro rodado por `Client::run_script_hosted`.
+#[derive(Clone, Debug)]
+pub struct ScriptOutcome {
+    /// O erro é a mensagem inteira (arquivo, linha, contexto, saída).
+    pub result: Result<(), String>,
+    /// A linha do arquivo (do 1) que falhou.
+    pub failed_line: Option<usize>,
+    /// Quantos comandos rodaram (os blocos não contam; um laço conta cada
+    /// volta).
+    pub commands: usize,
+    /// As variáveis que o roteiro definiu, com o texto delas (as numéricas
+    /// em hexadecimal, `0x...`, como o `save` as guarda).
+    pub variables: BTreeMap<String, String>,
+}
+
+/// Confere a sintaxe do roteiro inteiro sem rodar nada (os blocos, os
+/// `for-each`, os `leave` fora de laço): o erro vem com a linha.
+pub fn check_script(script: &str) -> Result<(), (usize, String)> {
+    parse(script).map(|_| ())
 }
 
 /// As coleções do `for-each`.
@@ -397,16 +473,35 @@ fn compare_text(text: &str) -> Option<bool> {
     })
 }
 
-/// `[/t <ms>] <texto>`: o prazo (ou o padrão) e o texto.
-fn wait_options(argument: &str, default: Duration) -> Result<(Duration, &str), String> {
+/// `[/t <ms>] <texto>`: o prazo pedido (o texto dele, que pode ser
+/// `$variavel` ou expressão sem espaços) e o texto.
+fn wait_options(argument: &str) -> (Option<&str>, &str) {
     match argument.strip_prefix("/t") {
         Some(rest) if rest.starts_with(char::is_whitespace) => {
             let rest = rest.trim_start();
             let (number, text) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
-            let milliseconds = parse_number(number).ok_or_else(|| format!("/t {number}: o prazo e em milissegundos"))?;
-            Ok((Duration::from_millis(milliseconds), unquote(text)))
+            (Some(number), unquote(text))
         }
-        _ => Ok((default, unquote(argument))),
+        _ => (None, unquote(argument)),
+    }
+}
+
+/// Lê o que o log da COM1 ganhou desde `offset` (um arquivo menor que o
+/// lido recomeçou: o texto volta a ser só o dele).
+fn read_serial_file(path: &Path, offset: &mut u64, serial: &Mutex<String>) {
+    let Ok(mut file) = File::open(path) else { return };
+    let Ok(length) = file.metadata().map(|metadata| metadata.len()) else { return };
+    if length < *offset {
+        *offset = 0;
+        serial_text(serial).clear();
+    }
+    if length == *offset || file.seek(SeekFrom::Start(*offset)).is_err() {
+        return;
+    }
+    let mut bytes = Vec::new();
+    if file.take(length - *offset).read_to_end(&mut bytes).is_ok() && !bytes.is_empty() {
+        *offset += bytes.len() as u64;
+        serial_text(serial).push_str(&String::from_utf8_lossy(&bytes));
     }
 }
 
@@ -455,7 +550,7 @@ fn quote_lines(text: &str, limit: usize, tail: bool) -> String {
 }
 
 /// O texto da COM1 (um leitor que entrou em pânico não impede a leitura).
-fn serial_text(serial: &Arc<Mutex<String>>) -> MutexGuard<'_, String> {
+fn serial_text(serial: &Mutex<String>) -> MutexGuard<'_, String> {
     serial.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
@@ -512,10 +607,21 @@ struct Handler {
     body: Vec<Node>,
 }
 
-struct Runner<'c> {
+struct Runner<'c, 'h> {
     client: &'c mut Client,
     name: String,
     capture: Option<Arc<Mutex<String>>>,
+    host: Option<&'h mut dyn ScriptHost>,
+    /// O texto da COM1: o do test-boot, ou o do log do anfitrião.
+    serial: Option<Arc<Mutex<String>>>,
+    /// O log do anfitrião e quanto dele já foi lido.
+    serial_file: Option<(PathBuf, u64)>,
+    /// As variáveis definidas por este roteiro (o `ScriptOutcome`).
+    assigned: BTreeSet<String>,
+    /// Comandos rodados.
+    commands: usize,
+    /// A linha da última mensagem de erro montada (a que encerra o roteiro).
+    failed_line: Cell<Option<usize>>,
     /// O texto de cada variável (as numéricas também ficam no cliente, para
     /// o `$nome` das expressões).
     variables: HashMap<String, String>,
@@ -536,11 +642,36 @@ struct Runner<'c> {
     context: Vec<String>,
 }
 
-impl<'c> Runner<'c> {
-    fn new(client: &'c mut Client, options: &ScriptOptions) -> Self {
+impl<'c, 'h> Runner<'c, 'h> {
+    fn new(client: &'c mut Client, options: &ScriptOptions, host: Option<&'h mut dyn ScriptHost>) -> Self {
         let printed_logs = client.log_lines().len();
         let variables = client.variables.iter().map(|(name, value)| (name.clone(), format!("{value:#x}"))).collect();
-        let mut runner = Runner { client, name: options.name.clone(), capture: options.capture.clone(), variables, last_output: String::new(), last_command: None, handlers: Vec::new(), in_handler: None, detached: false, printed_logs, transcript: None, context: Vec::new() };
+        // Sem a COM1 do test-boot, o log do anfitrião (lido do começo).
+        let serial_file = match (&client.serial, host.as_deref().and_then(|host| host.serial_log())) {
+            (None, Some(path)) => Some((path, 0)),
+            _ => None,
+        };
+        let serial = client.serial.clone().or_else(|| serial_file.as_ref().map(|_| Arc::new(Mutex::new(String::new()))));
+        let mut runner = Runner {
+            client,
+            name: options.name.clone(),
+            capture: options.capture.clone(),
+            host,
+            serial,
+            serial_file,
+            assigned: BTreeSet::new(),
+            commands: 0,
+            failed_line: Cell::new(None),
+            variables,
+            last_output: String::new(),
+            last_command: None,
+            handlers: Vec::new(),
+            in_handler: None,
+            detached: false,
+            printed_logs,
+            transcript: None,
+            context: Vec::new(),
+        };
         if let Some(path) = &options.transcript {
             match File::create(path) {
                 Ok(file) => {
@@ -553,18 +684,88 @@ impl<'c> Runner<'c> {
         runner
     }
 
-    /// Uma linha na saída padrão (ou na captura) e na transcrição.
+    /// Uma linha no anfitrião, na captura ou na saída padrão, e na
+    /// transcrição.
     fn emit(&mut self, line: &str) {
-        match &self.capture {
-            Some(capture) => {
-                if let Ok(mut text) = capture.lock() {
-                    text.push_str(line);
-                    text.push('\n');
+        if let Some(host) = self.host.as_deref_mut() {
+            host.output(line);
+        } else {
+            match &self.capture {
+                Some(capture) => {
+                    if let Ok(mut text) = capture.lock() {
+                        text.push_str(line);
+                        text.push('\n');
+                    }
                 }
+                None => println!("{line}"),
             }
-            None => println!("{line}"),
         }
         self.note(line);
+    }
+
+    /// O anfitrião põe a janela em dia.
+    fn tick(&mut self) {
+        if let Some(host) = self.host.as_deref_mut() {
+            host.tick(self.client);
+        }
+    }
+
+    /// O usuário pediu para parar.
+    fn cancelled(&self) -> bool {
+        self.host.as_deref().is_some_and(|host| host.cancelled())
+    }
+
+    /// O fim de uma espera, sem passar do prazo do anfitrião.
+    fn cap(&self, deadline: Instant) -> Instant {
+        match self.host.as_deref().and_then(|host| host.deadline()) {
+            Some(limit) => deadline.min(limit),
+            None => deadline,
+        }
+    }
+
+    /// Antes de cada comando ou bloco: o progresso, o Cancelar e o prazo.
+    fn checkpoint(&mut self, node: &Node) -> Result<(), String> {
+        if let Some(host) = self.host.as_deref_mut() {
+            host.progress(node.line, &node.text);
+        }
+        if self.cancelled() {
+            return Err(self.error(node.line, &node.text, "parado pelo usuario antes desta linha (Cancelar)"));
+        }
+        if self.host.as_deref().and_then(|host| host.deadline()).is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(self.error(node.line, &node.text, "prazo esgotado antes desta linha"));
+        }
+        Ok(())
+    }
+
+    /// O texto da COM1, com o log do anfitrião lido até o fim.
+    fn serial_buffer(&mut self) -> Option<Arc<Mutex<String>>> {
+        if let (Some((path, offset)), Some(serial)) = (&mut self.serial_file, &self.serial) {
+            read_serial_file(path, offset, serial);
+        }
+        self.serial.clone()
+    }
+
+    /// Um prazo em milissegundos: número, `$variavel` ou expressão; vazio
+    /// é o padrão.
+    fn milliseconds(&mut self, text: &str, default: u64) -> Result<u64, String> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Ok(default);
+        }
+        if let Some(value) = parse_number(text) {
+            return Ok(value);
+        }
+        self.client.evaluate(text).map_err(|error| format!("{text:?} nao e um prazo em milissegundos ({error})"))
+    }
+
+    /// O prazo e o texto de `[/t <ms>] <texto>`.
+    fn wait_arguments<'t>(&mut self, argument: &'t str) -> Result<(Duration, &'t str), String> {
+        let (number, text) = wait_options(argument);
+        let timeout = match number {
+            Some(number) => Duration::from_millis(self.milliseconds(number, 0).map_err(|error| format!("/t: {error}"))?),
+            None => SERIAL_WAIT,
+        };
+        Ok((timeout, text))
     }
 
     /// Uma linha só na transcrição.
@@ -599,6 +800,7 @@ impl<'c> Runner<'c> {
 
     /// A mensagem de erro de uma linha do roteiro.
     fn error(&self, line: usize, text: &str, message: &str) -> String {
+        self.failed_line.set(Some(line));
         let script = if self.name.is_empty() { "roteiro".to_string() } else { format!("roteiro {}", self.name) };
         let mut error = format!("{script}, linha {line}: {text}: {message}");
         if !self.context.is_empty() {
@@ -621,14 +823,15 @@ impl<'c> Runner<'c> {
         format!("{}\n  saida do comando:{}", self.command_line(), quote_lines(&self.last_output, ERROR_LINES, false))
     }
 
-    fn serial_tail(&self) -> String {
-        match &self.client.serial {
-            Some(serial) => quote_lines(&serial_text(serial), SERIAL_LINES, true),
+    fn serial_tail(&mut self) -> String {
+        match self.serial_buffer() {
+            Some(serial) => quote_lines(&serial_text(&serial), SERIAL_LINES, true),
             None => " (sem a COM1)".to_string(),
         }
     }
 
     fn set_number(&mut self, name: &str, value: u64) {
+        self.assigned.insert(name.to_string());
         self.variables.insert(name.to_string(), format!("{value:#x}"));
         self.client.variables.insert(name.to_string(), value);
     }
@@ -636,6 +839,7 @@ impl<'c> Runner<'c> {
     /// Uma variável de texto; se o texto é um número, `$nome` também vale nas
     /// expressões.
     fn set_text(&mut self, name: &str, text: &str) {
+        self.assigned.insert(name.to_string());
         self.variables.insert(name.to_string(), text.to_string());
         match parse_number(text) {
             Some(value) => {
@@ -678,8 +882,10 @@ impl<'c> Runner<'c> {
 
     fn run_block(&mut self, nodes: &[Node]) -> Result<Flow, String> {
         for node in nodes {
+            self.checkpoint(node)?;
             let flow = self.run_node(node);
             self.flush_log();
+            self.tick();
             let flow = flow?;
             if flow != Flow::Normal {
                 return Ok(flow);
@@ -718,6 +924,10 @@ impl<'c> Runner<'c> {
                     turns += 1;
                     if turns > LOOP_LIMIT {
                         return Err(self.error(node.line, &node.text, &format!("mais de {LOOP_LIMIT} voltas")));
+                    }
+                    // Um laço sem comandos dentro também para no Cancelar.
+                    if self.cancelled() {
+                        return Err(self.error(node.line, &node.text, &format!("parado pelo usuario na volta {turns} (Cancelar)")));
                     }
                     self.context.push(format!("while da linha {}, volta {turns}", node.line));
                     let result = self.run_block(body);
@@ -771,6 +981,7 @@ impl<'c> Runner<'c> {
     fn command(&mut self, line: usize, raw: &str) -> Result<Flow, String> {
         let text = substitute(&self.variables, raw).map_err(|error| self.error(line, raw, &error))?;
         let shown = if text == raw { raw.to_string() } else { format!("{raw} (= {text})") };
+        self.commands += 1;
         self.emit(&format!("{} > {text}", self.prefix()));
         let (word, rest) = text.split_once(char::is_whitespace).map_or((text.as_str(), ""), |(word, rest)| (word, rest.trim()));
         match word {
@@ -824,7 +1035,7 @@ impl<'c> Runner<'c> {
             }
             "save-word" | "save-text" | "save-after" | "save-line" | "save-count" | "save-thread" => self.save_from_output(line, &shown, word, rest)?,
             "wait-serial" => {
-                let (timeout, needle) = wait_options(rest, SERIAL_WAIT).map_err(|error| self.error(line, &shown, &error))?;
+                let (timeout, needle) = self.wait_arguments(rest).map_err(|error| self.error(line, &shown, &error))?;
                 match self.wait_serial(line, &shown, needle, timeout)? {
                     SerialWait::Found => {}
                     SerialWait::Timeout => {
@@ -836,7 +1047,7 @@ impl<'c> Runner<'c> {
                 }
             }
             "wait-stop" => {
-                let milliseconds = rest.split_whitespace().next().and_then(parse_number).unwrap_or(STOP_WAIT_MS);
+                let milliseconds = self.milliseconds(rest, STOP_WAIT_MS).map_err(|error| self.error(line, &shown, &format!("uso: wait-stop [ms]: {error}")))?;
                 match self.wait_stop(line, &shown, Duration::from_millis(milliseconds))? {
                     StopWait::Stopped(stop) => self.record_output(line, &text, stop),
                     StopWait::Timeout => return Err(self.error(line, &shown, &format!("tempo esgotado ({milliseconds} ms) esperando a parada (a maquina segue rodando; use break)"))),
@@ -844,7 +1055,9 @@ impl<'c> Runner<'c> {
                 }
             }
             "sleep" => {
-                let milliseconds = parse_number(rest).unwrap_or(1000);
+                // `sleep $espera`, `sleep 2*60000`; um argumento que não dá
+                // número é erro (antes virava 1000 ms sem aviso).
+                let milliseconds = self.milliseconds(rest, 1000).map_err(|error| self.error(line, &shown, &format!("uso: sleep <ms>: {error}")))?;
                 if self.sleep(line, &shown, Duration::from_millis(milliseconds))? == Flow::Exit {
                     return Ok(Flow::Exit);
                 }
@@ -874,7 +1087,15 @@ impl<'c> Runner<'c> {
             }
             "fail" => return Err(self.error(line, &shown, if rest.is_empty() { "fail" } else { rest })),
             _ => {
-                let output = self.client.execute(&text).map_err(|error| self.error(line, &shown, &error))?;
+                let answered = match self.host.as_deref_mut() {
+                    Some(host) => host.intercept(self.client, word, &text),
+                    None => None,
+                };
+                let output = match answered {
+                    Some(result) => result,
+                    None => self.client.execute(&text),
+                }
+                .map_err(|error| self.error(line, &shown, &error))?;
                 match word {
                     "detach" => self.detached = true,
                     "attach" => self.detached = false,
@@ -988,7 +1209,7 @@ impl<'c> Runner<'c> {
                 self.client.console().contains(unquote(argument))
             }
             "serial-has" => {
-                let serial = self.client.serial.clone().ok_or_else(|| self.error(line, shown, "sem o log da COM1 neste modo"))?;
+                let serial = self.serial_buffer().ok_or_else(|| self.error(line, shown, "sem o log da COM1 neste modo"))?;
                 let found = serial_text(&serial).contains(unquote(argument));
                 found
             }
@@ -1002,7 +1223,7 @@ impl<'c> Runner<'c> {
             "running" if argument.is_empty() => !self.client.is_stopped(),
             "stopped" if argument.is_empty() => self.client.is_stopped(),
             "wait-serial" => {
-                let (timeout, needle) = wait_options(argument, SERIAL_WAIT).map_err(|error| self.error(line, shown, &error))?;
+                let (timeout, needle) = self.wait_arguments(argument).map_err(|error| self.error(line, shown, &error))?;
                 match self.wait_serial(line, shown, needle, timeout)? {
                     SerialWait::Found => true,
                     SerialWait::Timeout | SerialWait::Stopped(_) => false,
@@ -1010,7 +1231,7 @@ impl<'c> Runner<'c> {
                 }
             }
             "wait-stop" => {
-                let milliseconds = argument.split_whitespace().next().and_then(parse_number).unwrap_or(STOP_WAIT_MS);
+                let milliseconds = self.milliseconds(argument, STOP_WAIT_MS).map_err(|error| self.error(line, shown, &format!("uso: wait-stop [ms]: {error}")))?;
                 match self.wait_stop(line, shown, Duration::from_millis(milliseconds))? {
                     StopWait::Stopped(stop) => {
                         self.record_output(line, rest, stop);
@@ -1186,7 +1407,19 @@ impl<'c> Runner<'c> {
     /// e o tratador dele. Sem tratador (ou dentro de um), a máquina fica
     /// parada; depois de um tratador ela segue, a não ser que ele tenha dito
     /// `stop`.
-    fn dispatch(&mut self, stop: &str) -> Result<Handled, String> {
+    fn dispatch(&mut self, line: usize, shown: &str, stop: &str) -> Result<Handled, String> {
+        // O anfitrião primeiro (o opennt-mcp arma os breakpoints adiados de
+        // usuário no aviso de carga da DLL).
+        let serviced = match self.host.as_deref_mut() {
+            Some(host) => host.service_stop(self.client),
+            None => false,
+        };
+        if serviced {
+            if self.client.is_stopped() && !self.detached {
+                self.client.go().map_err(|error| self.error(line, shown, &format!("a maquina nao seguiu depois da parada atendida: {error}")))?;
+            }
+            return Ok(Handled::Resumed);
+        }
         if self.in_handler.is_some() {
             return Ok(Handled::Stopped);
         }
@@ -1238,16 +1471,20 @@ impl<'c> Runner<'c> {
         if self.client.is_stopped() {
             return Ok(StopWait::Stopped(format!("{} (a maquina ja estava parada)", self.client.last_stop())));
         }
-        let deadline = Instant::now() + timeout;
+        let deadline = self.cap(Instant::now() + timeout);
         loop {
+            if self.cancelled() {
+                return Err(self.error(line, shown, "parado pelo usuario (Cancelar)"));
+            }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Ok(StopWait::Timeout);
             }
             let stop = self.client.poll(remaining.min(POLL)).map_err(|error| self.error(line, shown, &error))?;
             self.flush_log();
+            self.tick();
             let Some(stop) = stop else { continue };
-            match self.dispatch(&stop)? {
+            match self.dispatch(line, shown, &stop)? {
                 Handled::Resumed => {}
                 Handled::Stopped => return Ok(StopWait::Stopped(self.client.last_stop().to_string())),
                 Handled::Exit => return Ok(StopWait::Exit),
@@ -1261,12 +1498,17 @@ impl<'c> Runner<'c> {
         if needle.is_empty() {
             return Err(self.error(line, shown, "falta o texto que a COM1 deve mostrar"));
         }
-        let serial = self.client.serial.clone().ok_or_else(|| self.error(line, shown, "sem o log da COM1 neste modo (o test-boot passa a COM1 ao roteiro; o --connect nao)"))?;
-        let deadline = Instant::now() + timeout;
+        let serial = self.serial_buffer().ok_or_else(|| self.error(line, shown, "sem o log da COM1 neste modo (o test-boot passa a COM1 ao roteiro; o --connect nao)"))?;
+        let deadline = self.cap(Instant::now() + timeout);
         let mut stopped_since: Option<Instant> = None;
         loop {
+            // O log do anfitrião é lido de novo a cada volta.
+            self.serial_buffer();
             if serial_text(&serial).contains(needle) {
                 return Ok(SerialWait::Found);
+            }
+            if self.cancelled() {
+                return Err(self.error(line, shown, "parado pelo usuario (Cancelar)"));
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -1275,6 +1517,7 @@ impl<'c> Runner<'c> {
             let slice = remaining.min(POLL);
             if self.detached {
                 std::thread::sleep(slice);
+                self.tick();
                 continue;
             }
             if self.client.is_stopped() {
@@ -1283,13 +1526,15 @@ impl<'c> Runner<'c> {
                     return Ok(SerialWait::Stopped(self.client.last_stop().to_string()));
                 }
                 std::thread::sleep(slice);
+                self.tick();
                 continue;
             }
             stopped_since = None;
             let stop = self.client.poll(slice).map_err(|error| self.error(line, shown, &error))?;
             self.flush_log();
+            self.tick();
             let Some(stop) = stop else { continue };
-            match self.dispatch(&stop)? {
+            match self.dispatch(line, shown, &stop)? {
                 Handled::Resumed => {}
                 Handled::Stopped => return Ok(SerialWait::Stopped(self.client.last_stop().to_string())),
                 Handled::Exit => return Ok(SerialWait::Exit),
@@ -1300,8 +1545,13 @@ impl<'c> Runner<'c> {
     /// `sleep`: o tempo passa com as paradas atendidas; uma parada sem
     /// tratador deixa a máquina parada até o fim do tempo.
     fn sleep(&mut self, line: usize, shown: &str, duration: Duration) -> Result<Flow, String> {
-        let deadline = Instant::now() + duration;
+        // O prazo do anfitrião encurta o sleep sem erro; o comando seguinte
+        // é que não começa.
+        let deadline = self.cap(Instant::now() + duration);
         loop {
+            if self.cancelled() {
+                return Err(self.error(line, shown, "parado pelo usuario (Cancelar)"));
+            }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Ok(Flow::Normal);
@@ -1309,12 +1559,14 @@ impl<'c> Runner<'c> {
             let slice = remaining.min(POLL);
             if self.detached || self.client.is_stopped() {
                 std::thread::sleep(slice);
+                self.tick();
                 continue;
             }
             let stop = self.client.poll(slice).map_err(|error| self.error(line, shown, &error))?;
             self.flush_log();
+            self.tick();
             let Some(stop) = stop else { continue };
-            match self.dispatch(&stop)? {
+            match self.dispatch(line, shown, &stop)? {
                 Handled::Resumed => {}
                 Handled::Stopped => {
                     let prefix = self.prefix();
@@ -1335,7 +1587,18 @@ impl Client {
 
     /// Roda um roteiro com nome e transcrição.
     pub fn run_script_with(&mut self, script: &str, options: &ScriptOptions) -> Result<(), String> {
-        let mut runner = Runner::new(self, options);
+        self.run_script_inner(script, options, None).result
+    }
+
+    /// Roda um roteiro por um anfitrião (a janela do opennt-dbg, o servidor
+    /// do opennt-mcp): as linhas vão para ele, e o resultado diz a linha que
+    /// falhou, quantos comandos rodaram e as variáveis definidas.
+    pub fn run_script_hosted(&mut self, script: &str, options: &ScriptOptions, host: &mut dyn ScriptHost) -> ScriptOutcome {
+        self.run_script_inner(script, options, Some(host))
+    }
+
+    fn run_script_inner(&mut self, script: &str, options: &ScriptOptions, host: Option<&mut dyn ScriptHost>) -> ScriptOutcome {
+        let mut runner = Runner::new(self, options, host);
         let result = match parse(script) {
             Ok(nodes) => runner.run_block(&nodes).map(|_| ()),
             Err((line, message)) => {
@@ -1349,7 +1612,9 @@ impl Client {
             // transcrição.
             runner.note(&format!("[kd-script] FALHOU: {error}"));
         }
-        result
+        let failed_line = if result.is_err() { runner.failed_line.get() } else { None };
+        let variables = runner.assigned.iter().filter_map(|name| runner.variables.get(name).map(|value| (name.clone(), value.clone()))).collect();
+        ScriptOutcome { result, failed_line, commands: runner.commands, variables }
     }
 }
 
@@ -1458,10 +1723,11 @@ mod tests {
         assert_eq!(compare_text("\"winlogon.exe\" contains \"logon\""), Some(true));
         assert_eq!(compare_text("$x == 1"), None);
         assert_eq!(compare_text("\"a\" == \"b\" lixo"), None);
-        assert_eq!(wait_options("/t 5000 [shell] pronto", SERIAL_WAIT).unwrap(), (Duration::from_millis(5000), "[shell] pronto"));
-        assert_eq!(wait_options("criou dwm.exe", SERIAL_WAIT).unwrap(), (SERIAL_WAIT, "criou dwm.exe"));
-        assert_eq!(wait_options("/t 0x10 \"a b\"", SERIAL_WAIT).unwrap(), (Duration::from_millis(16), "a b"));
-        assert!(wait_options("/t muito x", SERIAL_WAIT).is_err());
+        assert_eq!(wait_options("/t 5000 [shell] pronto"), (Some("5000"), "[shell] pronto"));
+        assert_eq!(wait_options("criou dwm.exe"), (None, "criou dwm.exe"));
+        assert_eq!(wait_options("/t 0x10 \"a b\""), (Some("0x10"), "a b"));
+        assert_eq!(wait_options("/t $espera x"), (Some("$espera"), "x"));
+        assert_eq!(wait_options("/texto"), (None, "/texto"));
         assert!(name_matches("smss", "smss.exe") && name_matches("ACPI", "acpi.sys") && name_matches("System", "System"));
         assert!(!name_matches("System", "SystemSettings.exe"));
     }

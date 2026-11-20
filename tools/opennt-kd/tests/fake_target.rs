@@ -10,13 +10,14 @@
 
 mod support;
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use opennt_kd::client::{BreakpointOptions, BreakpointRequest, Resumed};
-use opennt_kd::kd_script::ScriptOptions;
+use opennt_kd::kd_script::{check_script, ScriptHost, ScriptOptions};
 use opennt_kd::symbols::Symbol;
-use opennt_kd::BreakpointKind;
+use opennt_kd::{BreakpointKind, Client};
 use support::fake_stub::{connect, connect_replay, kernel_module, start, start_opennt, start_with, Stop, CODE, STACK, USER_DATA};
 
 /// Os pacotes de breakpoint e de continuação mandados ao alvo.
@@ -520,4 +521,178 @@ fn script_handler_resumes_until_it_stops() {
     client.run_script(script).unwrap();
     assert_eq!(log.lock().unwrap().iter().filter(|packet| *packet == "c").count(), 3);
     assert!(client.is_stopped());
+}
+
+/// Um `bp` num módulo que ainda não carregou fica adiado, como o `bu`; um
+/// símbolo que falta num módulo carregado continua sendo erro.
+#[test]
+fn bp_on_a_module_not_loaded_is_deferred() {
+    let (address, _) = start(Vec::new());
+    let mut client = connect(&address);
+    let text = client.execute("bp novo!Entrada /log \"entrou\"").unwrap();
+    assert!(text.contains("modulo novo nao carregado: o bp ficou adiado (como o bu)"), "{text}");
+    assert!(text.contains("adiado: novo!Entrada"), "{text}");
+    assert!(client.breakpoints().iter().any(|breakpoint| breakpoint.pending && breakpoint.expression == "novo!Entrada" && breakpoint.log == "entrou"));
+    let error = client.execute("bp kernel::alvo::nao_existe").unwrap_err();
+    assert!(error.contains("simbolo nao encontrado"), "{error}");
+    assert_eq!(client.breakpoints().len(), 1);
+}
+
+/// O `sleep` e o `wait-stop` aceitam `$variavel` e expressões; um argumento
+/// que não dá número é erro (antes o `sleep` dormia 1000 ms sem aviso).
+#[test]
+fn script_sleep_takes_variables_and_rejects_text() {
+    let (address, _) = start(Vec::new());
+    let mut client = connect(&address);
+    let started = Instant::now();
+    client.run_script("set espera 60\nsleep $espera\nsave t 2*0n30\nsleep $t\nwait-stop $t\n").unwrap();
+    let elapsed = started.elapsed();
+    assert!(elapsed >= Duration::from_millis(120) && elapsed < Duration::from_millis(1500), "{elapsed:?}");
+    let error = client.run_script("echo a\nsleep muito\n").unwrap_err();
+    assert!(error.contains("linha 2: sleep muito: uso: sleep <ms>"), "{error}");
+    let error = client.run_script("wait-stop $nada\n").unwrap_err();
+    assert!(error.contains("uso: wait-stop [ms]"), "{error}");
+    let error = client.run_script("wait-serial /t depressa x\n").unwrap_err();
+    assert!(error.contains("/t:"), "{error}");
+}
+
+/// Um anfitrião de teste: guarda as linhas, o progresso e as voltas, e
+/// responde ao `attach` e ao `detach` como a janela e o servidor MCP.
+#[derive(Default)]
+struct TestHost {
+    lines: Vec<String>,
+    progress: Vec<usize>,
+    ticks: usize,
+    /// Cancela depois de tantos passos.
+    cancel_after: Option<usize>,
+    deadline: Option<Instant>,
+    serial: Option<PathBuf>,
+    /// Atende a parada com este RAX (e a máquina segue).
+    service_rax: Option<u64>,
+    serviced: usize,
+}
+
+impl ScriptHost for TestHost {
+    fn output(&mut self, line: &str) {
+        self.lines.push(line.to_string());
+    }
+
+    fn progress(&mut self, line: usize, _text: &str) {
+        self.progress.push(line);
+    }
+
+    fn tick(&mut self, _client: &mut Client) {
+        self.ticks += 1;
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel_after.is_some_and(|steps| self.progress.len() > steps)
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    fn serial_log(&self) -> Option<PathBuf> {
+        self.serial.clone()
+    }
+
+    fn service_stop(&mut self, client: &mut Client) -> bool {
+        let wanted = self.service_rax.is_some() && client.register("rax").ok() == self.service_rax;
+        self.serviced += usize::from(wanted);
+        wanted
+    }
+
+    fn intercept(&mut self, client: &mut Client, word: &str, _text: &str) -> Option<Result<String, String>> {
+        match word {
+            "attach" => Some(Ok(format!("sessao ja anexada\n{}", client.last_stop()))),
+            "detach" => Some(Err("detach recusado pelo anfitriao".into())),
+            _ => None,
+        }
+    }
+}
+
+/// O roteiro por um anfitrião: as linhas vão para ele, o `attach` e o
+/// `detach` são dele, o `wait-serial` lê o log que ele passa (e acompanha o
+/// arquivo crescendo), e o resultado diz os comandos, as variáveis e a
+/// linha que falhou.
+#[test]
+fn hosted_script_routes_lines_and_reports_the_outcome() {
+    let (address, _) = start(Vec::new());
+    let mut client = connect(&address);
+    let serial = std::env::temp_dir().join(format!("kd-script-com1-{}.log", std::process::id()));
+    std::fs::write(&serial, "[boot] ok\n[shell] pronto\n").unwrap();
+    let appender = {
+        let serial = serial.clone();
+        std::thread::spawn(move || {
+            use std::io::Write;
+            std::thread::sleep(Duration::from_millis(300));
+            let mut file = std::fs::OpenOptions::new().append(true).open(&serial).unwrap();
+            file.write_all(b"[shell] depois\n").unwrap();
+        })
+    };
+    let mut host = TestHost { serial: Some(serial.clone()), ..TestHost::default() };
+    let script = "attach\nexpect sessao ja anexada\nwait-serial /t 2000 [shell] pronto\nif serial-has [boot] ok {\n  echo com1 ok\n}\nwait-serial /t 1500 [shell] depois\nset n 3\nsave x 0x10\nrepeat $n i {\n  echo volta ${i}\n}\n";
+    let outcome = client.run_script_hosted(script, &ScriptOptions::default(), &mut host);
+    appender.join().unwrap();
+    let _ = std::fs::remove_file(&serial);
+    assert_eq!(outcome.result, Ok(()), "{:?}", host.lines);
+    assert_eq!(outcome.failed_line, None);
+    assert_eq!(outcome.commands, 10);
+    assert_eq!(outcome.variables.get("x").map(String::as_str), Some("0x10"));
+    assert_eq!(outcome.variables.get("n").map(String::as_str), Some("3"));
+    assert_eq!(outcome.variables.get("i").map(String::as_str), Some("0x2"));
+    assert!(host.lines.iter().any(|line| line == "[kd-script]   sessao ja anexada"), "{:?}", host.lines);
+    assert!(host.lines.iter().any(|line| line == "[kd-script] com1 ok"), "{:?}", host.lines);
+    assert!(host.lines.iter().any(|line| line == "[kd-script] volta 0x2"), "{:?}", host.lines);
+    assert_eq!(host.progress, vec![1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 11, 11]);
+    assert!(host.ticks >= host.progress.len());
+
+    // O `detach` recusado pelo anfitrião encerra na linha dele.
+    let mut host = TestHost::default();
+    let outcome = client.run_script_hosted("echo a\ndetach\necho nunca\n", &ScriptOptions::default(), &mut host);
+    assert!(outcome.result.as_ref().unwrap_err().contains("linha 2: detach: detach recusado pelo anfitriao"), "{outcome:?}");
+    assert_eq!((outcome.failed_line, outcome.commands), (Some(2), 2));
+    assert!(!host.lines.iter().any(|line| line.contains("nunca")));
+
+    // Um erro de sintaxe: nada roda, e a linha vem no resultado.
+    assert_eq!(check_script("echo a\nif 1 {\n").unwrap_err().0, 2);
+    let mut host = TestHost::default();
+    let outcome = client.run_script_hosted("echo a\nif 1 {\n", &ScriptOptions::default(), &mut host);
+    assert_eq!((outcome.failed_line, outcome.commands), (Some(2), 0));
+    assert!(host.lines.is_empty(), "{:?}", host.lines);
+}
+
+/// O Cancelar para antes do próximo comando; o prazo encurta o `sleep` e
+/// não deixa o comando seguinte começar.
+#[test]
+fn hosted_script_cancel_and_deadline() {
+    let (address, _) = start(Vec::new());
+    let mut client = connect(&address);
+    let mut host = TestHost { cancel_after: Some(1), ..TestHost::default() };
+    let outcome = client.run_script_hosted("echo a\necho b\n", &ScriptOptions::default(), &mut host);
+    assert!(outcome.result.as_ref().unwrap_err().contains("parado pelo usuario antes desta linha (Cancelar)"), "{outcome:?}");
+    assert_eq!((outcome.failed_line, outcome.commands), (Some(2), 1));
+
+    let started = Instant::now();
+    let mut host = TestHost { deadline: Some(started + Duration::from_millis(200)), ..TestHost::default() };
+    let outcome = client.run_script_hosted("sleep 5000\necho nunca\n", &ScriptOptions::default(), &mut host);
+    assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
+    assert!(outcome.result.as_ref().unwrap_err().contains("linha 2: echo nunca: prazo esgotado antes desta linha"), "{outcome:?}");
+    assert_eq!(outcome.failed_line, Some(2));
+}
+
+/// O anfitrião atende uma parada antes dos tratadores (o aviso de carga dos
+/// adiados do opennt-mcp): a máquina segue e a espera chega à parada
+/// seguinte.
+#[test]
+fn hosted_script_host_services_a_stop() {
+    let stops = (1..=2).map(|rax| Stop { rip: CODE + 0x10, rsp: STACK, packet: "T05thread:1;swbreak:;", rax, load: None }).collect();
+    let (address, log) = start(stops);
+    let mut client = connect(&address);
+    let mut host = TestHost { service_rax: Some(1), ..TestHost::default() };
+    let outcome = client.run_script_hosted("bp kernel::alvo::corrente+0x10\ncontinue\nwait-stop 10000\nexpect-eq @rax 2\n", &ScriptOptions::default(), &mut host);
+    assert_eq!(outcome.result, Ok(()), "{:?}", host.lines);
+    assert_eq!(host.serviced, 1);
+    assert_eq!(log.lock().unwrap().iter().filter(|packet| *packet == "c").count(), 2);
 }
