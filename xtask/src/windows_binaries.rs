@@ -622,6 +622,16 @@ const LOGON_SCREEN_PROGRAMS: &[&str] = &[
     "credprovhost.dll",
     "shacct.dll",
     "Windows.UI.Immersive.dll",
+    // O ShutdownUX.dll do botão de energia da tela de logon: o
+    // SystemProviderUserControl::_OnShutdownClick do Windows.UI.Logon.dll
+    // (0x192e0c) chama o SystemStatusViewModel::InvokeShutdownViewModel
+    // (0x1c7fd0), que ativa a classe WinRT
+    // Windows.Internal.UI.Shutdown.ShutdownUXViewModel (RoActivateInstance
+    // no construtor, 0x1c6e4e); o authui.dll cria as escolhas de desligamento
+    // pelo CLSID {14ce31dc-abc2-484c-b061-cf3416aed8ff} do mesmo DLL. Sem a
+    // classe registrada, o clique lança uma exceção dentro do tratador do
+    // XAML e o LogonUI termina. Os imports dele já estão no volume.
+    "shutdownux.dll",
     // As classes dos controles da tela que o Windows.UI.Logon.dll ativa: o
     // ícone e o painel de rede, a entrada de texto e a acessibilidade (o
     // uiautomationcore.dll).
