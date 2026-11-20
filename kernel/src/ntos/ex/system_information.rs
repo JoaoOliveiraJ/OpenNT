@@ -377,6 +377,52 @@ fn set_reported(returned: u64, reported: u32) {
 
 /// SystemRegisterFirmwareTableInformationHandler (só de modo kernel).
 pub const SYSTEM_REGISTER_FIRMWARE_TABLE_INFORMATION_HANDLER: u32 = 75;
+/// SystemPrefetcherInformation e SystemWin32WerStartCallout.
+pub const SYSTEM_PREFETCHER_INFORMATION: u32 = 56;
+pub const SYSTEM_WIN32_WER_START_CALLOUT: u32 = 177;
+/// O tipo do callout Win32 que o SystemWin32WerStartCallout pede ao win32k.
+const WIN32_WER_START_CALLOUT: i32 = 0x20;
+
+/// SystemWin32WerStartCallout (NtSetSystemInformation 19041, 0x7090aa; o
+/// WerpReportFault do kernel32): com 8 bytes, o SeTcbPrivilege (senão
+/// STATUS_PRIVILEGE_NOT_HELD) e o HANDLE do processo com
+/// PROCESS_QUERY_LIMITED_INFORMATION; sem buffer, o processo corrente;
+/// outro comprimento, STATUS_INFO_LENGTH_MISMATCH. Um processo numa sessão
+/// recebe o PsInvokeWin32Callout(0x20, Processo, 1, &SessionId) do win32k
+/// dela, e o status é o do callout; fora de sessão, STATUS_SUCCESS.
+pub fn win32_wer_start_callout(buffer: u64, length: u32, previous_mode: u8) -> Result<u32, KernelError> {
+    use crate::ntos::ps::{process, win32};
+    match length {
+        8 => {
+            if !crate::ntos::se::privilege::single_privilege_check(SE_TCB_PRIVILEGE, previous_mode as u32) {
+                return Ok(STATUS_PRIVILEGE_NOT_HELD);
+            }
+            let handle = if previous_mode != 0 {
+                match guest::try_read::<u64>(buffer) {
+                    Ok(handle) => handle,
+                    Err(error) => return Ok(error.status),
+                }
+            } else {
+                // SAFETY: o buffer de modo kernel com 8 bytes conferidos.
+                unsafe { Field::<u64>::at(buffer) }.get()
+            };
+            let mut target = match crate::ntos::ob::process_reference::reference(handle, PROCESS_QUERY_LIMITED_INFORMATION, previous_mode)? {
+                Ok(target) => target,
+                Err(status) => return Ok(status),
+            };
+            let session = crate::ntos::mm::session::session_id_ex(target.pointer);
+            let status = if session != u32::MAX { win32::invoke_callout_for_session(WIN32_WER_START_CALLOUT, target.pointer, session) } else { 0 };
+            target.release()?;
+            Ok(status)
+        }
+        0 => {
+            let current = process::get_current_process();
+            let session = crate::ntos::mm::session::session_id_ex(current);
+            Ok(if session != u32::MAX { win32::invoke_callout_for_session(WIN32_WER_START_CALLOUT, current, session) } else { 0 })
+        }
+        _ => Ok(STATUS_INFO_LENGTH_MISMATCH),
+    }
+}
 /// SystemProcessorPerformanceInformation, SystemFirmwareTableInformation e
 /// SystemCpuSetInformation.
 pub const SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION: u32 = 8;
@@ -660,6 +706,9 @@ pub fn set(class: u32, buffer: u64, length: u32) -> u32 {
         // SystemRegisterFirmwareTableInformationHandler (0x708532):
         // `ex/firmware_table`.
         SYSTEM_REGISTER_FIRMWARE_TABLE_INFORMATION_HANDLER => return crate::ntos::ex::firmware_table::register_handler(buffer, length, false),
+        // SystemPrefetcherInformation (0x7083fa): `pf/prefetcher_information`.
+        SYSTEM_PREFETCHER_INFORMATION => return crate::ntos::pf::prefetcher_information::set(buffer, length, false).unwrap_or_else(status_of),
+        SYSTEM_WIN32_WER_START_CALLOUT => return win32_wer_start_callout(buffer, length, 0).unwrap_or_else(status_of),
         _ => {}
     }
     if class == 131 {
@@ -965,6 +1014,12 @@ pub fn set_from_user_mode(class: u32, buffer: u64, length: u32) -> Result<u32, K
     }
     if class == SYSTEM_REGISTER_FIRMWARE_TABLE_INFORMATION_HANDLER {
         return Ok(crate::ntos::ex::firmware_table::register_handler(buffer, length, true));
+    }
+    if class == SYSTEM_PREFETCHER_INFORMATION {
+        return crate::ntos::pf::prefetcher_information::set(buffer, length, true);
+    }
+    if class == SYSTEM_WIN32_WER_START_CALLOUT {
+        return win32_wer_start_callout(buffer, length, 1);
     }
     if class != SYSTEM_EXTEND_SERVICE_TABLE_INFORMATION {
         debug_print!("[usermode] NtSetSystemInformation classe {} (sem suporte de modo usuario)", class);

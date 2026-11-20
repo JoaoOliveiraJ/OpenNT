@@ -16,6 +16,8 @@
 //! serviço SysMain liga o rastreamento pelo NtSetSystemInformation
 //! (SystemSuperfetchInformation), que o OpenNT não implementa.
 
+pub mod prefetcher_information;
+
 use alloc::vec;
 
 use crate::ntos::mm::guest_memory as guest;

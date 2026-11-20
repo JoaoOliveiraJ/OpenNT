@@ -95,6 +95,7 @@ pub fn run(assert: Assert) {
     push_lock_address_wait(assert);
     firmware_tables(assert);
     system_information_classes(assert);
+    set_system_information_classes(assert);
     mdl_pages_cached(assert);
     copy_memory(assert);
     thread_tag(assert);
@@ -453,6 +454,55 @@ fn system_information_classes(assert: Assert) {
     let registrations = [register(1, 0, 0x18), register(1, 0, 0x18), register(0, 0x1234, 0x18), register(0, 0, 0x18), register(0, 0, 0x18), register(1, 0, 0x10)];
     assert(registrations == [0, 0x4000_0000, STATUS_INVALID_PARAMETER, 0, STATUS_INVALID_PARAMETER, 0xC000_0004], "zw-system-information: SystemRegisterFirmwareTableInformationHandler registra, recusa a repeticao e remove so pelo mesmo DriverObject");
     for block in [returned, buffer, input, handler] {
+        guest::free_bytes(block);
+    }
+}
+
+/// ZwSetSystemInformation 56 (SystemPrefetcherInformation, a validação do
+/// PfSnSetPrefetcherInformation com os cenários do prefetcher desligados) e
+/// 177 (SystemWin32WerStartCallout: o System fora de sessão não chama o
+/// win32k).
+fn set_system_information_classes(assert: Assert) {
+    let header = zeroed(0x20);
+    let inner = zeroed(0x48);
+    let prefetch = |class: u32, inner_length: u32, length: u64| {
+        guest::write32(header, 1);
+        guest::write32(header + 4, 0x6B75_6843);
+        guest::write32(header + 8, class);
+        guest::write64(header + 0x10, inner);
+        guest::write32(header + 0x18, inner_length);
+        status("ZwSetSystemInformation", &[56, header, length])
+    };
+    let short = prefetch(3, 4, 0x1F);
+    guest::write32(inner, 2);
+    let boot_phase = prefetch(3, 4, 0x20);
+    guest::write32(inner, 5);
+    let late_phase = prefetch(3, 4, 0x20);
+    let phase_length = prefetch(3, 8, 0x20);
+    guest::write_bytes(inner, &[1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0]);
+    let operation = prefetch(5, 0xC, 0x20);
+    guest::write8(inner, 2);
+    let operation_version = prefetch(5, 0xC, 0x20);
+    guest::write32(inner, 1);
+    guest::write32(inner + 4, 1);
+    guest::write64(inner + 8, u64::MAX);
+    let launch = prefetch(8, 0x10, 0x20);
+    guest::write32(inner, 2);
+    let launch_version = prefetch(8, 0x10, 0x20);
+    let launch_length = prefetch(8, 0xC, 0x20);
+    let unknown = prefetch(9, 0, 0x20);
+    guest::write32(header + 4, 0);
+    let bad_magic = status("ZwSetSystemInformation", &[56, header, 0x20]);
+    assert(
+        [short, boot_phase, late_phase, phase_length, operation, operation_version, launch, launch_version, launch_length, unknown, bad_magic] == [0xC000_0004, 0, STATUS_INVALID_PARAMETER, STATUS_INVALID_PARAMETER, 0, STATUS_INVALID_PARAMETER, 0, 0xC000_0059, 0xC000_0206, 0xC000_0003, STATUS_INVALID_PARAMETER],
+        "zw-set-system-information: SystemPrefetcherInformation (tamanho, Magic, fase do boot, operacao, lancamento de aplicativo, classe desconhecida)",
+    );
+    guest::write64(inner, u64::MAX);
+    let wer_current = status("ZwSetSystemInformation", &[177, 0, 0]);
+    let wer_handle = status("ZwSetSystemInformation", &[177, inner, 8]);
+    let wer_length = status("ZwSetSystemInformation", &[177, inner, 4]);
+    assert(wer_current == 0 && wer_handle == 0 && wer_length == 0xC000_0004, "zw-set-system-information: SystemWin32WerStartCallout (o System fora de sessao, sem callout; tamanho invalido)");
+    for block in [header, inner] {
         guest::free_bytes(block);
     }
 }

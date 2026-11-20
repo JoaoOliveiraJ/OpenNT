@@ -5562,7 +5562,10 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     classes com entrada e a sonda com o alinhamento de cada uma), as classes
     8 (o tempo de kernel e de usuário que `ps::process::account_thread`
     cobra de cada processador, com o ocioso no resto), 76 (as tabelas de
-    firmware nos dois modos) do NtQuerySystemInformation,
+    firmware nos dois modos) do NtQuerySystemInformation, as classes 56
+    (a validação do PfSnSetPrefetcherInformation em `pf/`, com os cenários
+    do prefetcher desligados) e 177 (o callout Win32 do WER para o processo
+    numa sessão) do NtSetSystemInformation nos dois modos,
     PsChargeProcessPoolQuota/PsReturnPoolQuota em
     `ps/pool_quota.rs`, ZwSetInformationProcess (ProcessBreakOnTermination e
     ProcessDebugFlags, as mesmas rotinas do NtSetInformationProcess de
