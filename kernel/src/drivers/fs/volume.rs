@@ -135,6 +135,11 @@ pub trait FileSystem: Sync {
     fn disk_extent(&self) -> Option<DiskExtent> {
         None
     }
+    /// IRP_MJ_SET_VOLUME_INFORMATION numa abertura do volume: a
+    /// FS_INFORMATION_CLASS e o buffer; o NTSTATUS, `None` = sem suporte.
+    fn set_volume_information(&self, _class: u32, _buffer: &[u8]) -> Option<Result<u32, KernelError>> {
+        None
+    }
     /// FSCTL do próprio sistema de arquivos; `None` = sem suporte.
     fn control(&self, _path: &str, _code: u32, _input: &[u8], _output_length: u32, _caller: &crate::drivers::fs::ntfs_control::ControlCaller) -> Option<Result<crate::drivers::fs::ntfs_control::ControlResult, KernelError>> {
         None

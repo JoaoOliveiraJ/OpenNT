@@ -3617,7 +3617,16 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   (`ps/user/file_io::segment_transfer`), com a conclusão de um pedido
   assíncrono atendido na hora: o IO_STATUS_BLOCK, o evento (ou o do
   FILE_OBJECT), a APC de usuário ou o pacote da porta de conclusão (teste
-  `user_extended_services` na fase 7). Um arquivo do volume aberto pelo modo usuário não tem o backing do
+  `user_extended_services` na fase 7). O NtSetVolumeInformationFile
+  (`io/file/irp_service.rs::set_volume_information`, o 0x76c860) confere a
+  classe, o tamanho, as sondas, o acesso e o VolumeLabelLength e manda o
+  IRP_MJ_SET_VOLUME_INFORMATION, com o GUID_IO_VOLUME_CHANGE ao PDO depois
+  do sucesso; um arquivo do file system embutido que não é a abertura do
+  volume recebe STATUS_ACCESS_DENIED, como do NTFS. Na abertura do volume, o
+  file system embutido grava o rótulo no $VOLUME_NAME e no VPB e o ObjectId
+  do volume no $OBJECT_ID do $Volume e no $O do `$Extend/$ObjId`
+  (`ntfs_write.rs`, lido pelo FileFsObjectIdInformation); sem a tabela de
+  cotas aberta, o FileFsControlInformation é STATUS_INVALID_PARAMETER. Um arquivo do volume aberto pelo modo usuário não tem o backing do
   ZwCreateFile: as seções graváveis (`mm/section/file.rs`) e as EAs
   (`io/kernel_ea.rs`) usam o volume e o caminho da fonte do FILE_OBJECT. O volume de boot guarda o conteúdo de
   `\Windows` na raiz (os programas de System32, `Fonts`, os temas...), que o

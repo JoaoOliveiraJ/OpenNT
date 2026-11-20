@@ -3,7 +3,8 @@
 //! volume sem buffer intermediário, o NtCreateSectionEx e o
 //! NtMapViewOfSectionEx com os parâmetros estendidos, e o
 //! NtSetCachedSigningLevel(2) de modo usuário (com uma SeCiCallbacks de
-//! teste quando a ci.dll não está carregada) e o NtExtendSection.
+//! teste quando a ci.dll não está carregada), o NtExtendSection e o
+//! NtSetVolumeInformationFile.
 
 use crate::ntos::inc::field::NtStruct;
 use crate::ntos::inc::types::{EventBasicInformation, Eprocess};
@@ -44,6 +45,7 @@ pub fn run(assert: Assert) {
     sections_ex(assert, block, rsp, &call);
     set_signing_level(assert, block, rsp, &call);
     extend_section(assert, block, rsp, &call);
+    set_volume_information(assert, block, rsp, &call);
     if let Some(region) = memory::find_region(block) {
         memory::release_private_region(&region);
     }
@@ -520,6 +522,107 @@ fn extend_section(assert: Assert, block: u64, rsp: u64, call: Call) {
         read_only_created == 0 && within == (0, 0x3000) && beyond == STATUS_SECTION_NOT_EXTENDED && query_created == 0 && denied == STATUS_ACCESS_DENIED && pagefile_created == 0
             && pagefile_extend == STATUS_SECTION_NOT_EXTENDED && final_size == 0x5000,
         &alloc::format!("extended: NtExtendSection recusa a secao so leitura alem do arquivo, o handle sem SECTION_EXTEND_SIZE e a secao sem arquivo (so leitura {read_only_created:#x}/{within:x?}/{beyond:#x}, acesso {query_created:#x}/{denied:#x}, sem arquivo {pagefile_created:#x}/{pagefile_extend:#x}, arquivo {final_size:#x})"),
+    );
+}
+
+/// NtSetVolumeInformationFile: as recusas do I/O Manager (classe, tamanho,
+/// alinhamento, IO_STATUS_BLOCK, acesso, VolumeLabelLength) e a resposta
+/// do file system a um arquivo que não é a abertura do volume
+/// (STATUS_ACCESS_DENIED); na abertura do volume `\??\D:`, o rótulo novo
+/// (visto pelo FileFsVolumeInformation e no VPB) e as recusas do
+/// NtfsSetFsLabelInfo, o FileFsControlInformation e o
+/// FileFsDataCopyInformation recusados, e o ObjectId do volume gravado e
+/// lido pelo FileFsObjectIdInformation, trocado por outro.
+fn set_volume_information(assert: Assert, block: u64, rsp: u64, call: Call) {
+    let (out, iosb, buffer, query) = (block + 0xE00, block + 0xE10, block + 0xE40, block + 0xEC0);
+    let open = |name: &str, access: u32, share: u32| {
+        guest::write64(out, 0);
+        let status = file_io::open(out, name, iosb, 1, &OpenRequest { access, share, options: 0x20, ..OpenRequest::default() }).unwrap_or(1);
+        (status, guest::read64(out))
+    };
+    let set = |handle: u64, at: u64, length: u64, class: u64| {
+        guest::write_bytes(iosb, &[0xEE; 16]);
+        guest::write64(rsp + 0x28, class);
+        call("NtSetVolumeInformationFile", handle, iosb, at, length)
+    };
+    let label = |text: &str| {
+        let units: alloc::vec::Vec<u8> = text.encode_utf16().flat_map(|unit| unit.to_le_bytes()).collect();
+        guest::write32(buffer, units.len() as u32);
+        guest::write_bytes(buffer + 4, &units);
+        4 + units.len() as u64
+    };
+    let volume_label = |handle: u64| {
+        guest::write_bytes(query, &[0; 0x80]);
+        guest::write64(rsp + 0x28, 1);
+        let status = call("NtQueryVolumeInformationFile", handle, iosb, query, 0x80);
+        let length = guest::read32(query + 12) as usize;
+        let units: alloc::vec::Vec<u16> = guest::read_bytes(query + 18, length.min(0x60)).chunks_exact(2).map(|unit| u16::from_le_bytes([unit[0], unit[1]])).collect();
+        (status, alloc::string::String::from_utf16_lossy(&units))
+    };
+    // Um arquivo do volume (não a abertura do volume).
+    let (file_opened, file) = open(SCATTER_FILE, 0xC010_0000, 7);
+    let length = label("ARQUIVO");
+    let not_volume = set(file, buffer, length, 2);
+    let wrong_class = set(file, buffer, length, 1);
+    let short = set(file, buffer, 4, 2);
+    let unaligned = set(file, buffer + 2, length, 2);
+    guest::write32(buffer, 0x100);
+    let long_label = set(file, buffer, 8, 2);
+    guest::write32(buffer, 0x8000_0000);
+    let negative_label = set(file, buffer, 8, 2);
+    let length = label("ARQUIVO");
+    guest::write64(rsp + 0x28, 2);
+    let bad_iosb = call("NtSetVolumeInformationFile", file, 0xFFFF_8000_0000_0000, buffer, length);
+    let _ = state::close_user_handle(file, true, false);
+    let (_, read_only) = open(SCATTER_FILE, 0x8010_0000, 7);
+    let no_write = set(read_only, buffer, length, 2);
+    let _ = state::close_user_handle(read_only, true, false);
+    assert(
+        file_opened == 0 && not_volume == STATUS_ACCESS_DENIED && wrong_class == 0xC000_0003 && short == 0xC000_0004 && unaligned == STATUS_DATATYPE_MISALIGNMENT && long_label == STATUS_INVALID_PARAMETER
+            && negative_label == STATUS_INVALID_PARAMETER && bad_iosb == STATUS_ACCESS_VIOLATION && no_write == STATUS_ACCESS_DENIED,
+        &alloc::format!("extended: NtSetVolumeInformationFile confere os parametros e recusa o arquivo que nao e o volume (abertura {file_opened:#x}, arquivo {not_volume:#x}, classe {wrong_class:#x}, curto {short:#x}, alinhamento {unaligned:#x}, rotulo {long_label:#x}/{negative_label:#x}, iosb {bad_iosb:#x}, so leitura {no_write:#x})"),
+    );
+    // A abertura do volume pelo file system, com escrita.
+    let (volume_opened, volume) = open("\\??\\D:", 0xC010_0000, 3);
+    let (original_status, original) = volume_label(volume);
+    let length = label("OPENNTVOL");
+    let relabeled = set(volume, buffer, length, 2);
+    let relabeled_iosb = guest::read32(iosb);
+    let (_, new_label) = volume_label(volume);
+    let vpb_label = crate::drivers::fs::volume_device::vpb_label(crate::drivers::fs::ntfs::DEVICE_INDEX);
+    let too_long = set(volume, buffer, label("ABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFG"), 2);
+    guest::write32(buffer, 5);
+    let odd = set(volume, buffer, 12, 2);
+    let restored = set(volume, buffer, label(&original), 2);
+    let (_, restored_label) = volume_label(volume);
+    guest::write_bytes(buffer, &[0; 0x40]);
+    let control = set(volume, buffer, 0x30, 6);
+    let data_copy = set(volume, buffer, 4, 10);
+    assert(
+        volume_opened == 0 && original_status == 0 && relabeled == 0 && relabeled_iosb == 0 && new_label == "OPENNTVOL" && vpb_label.as_deref() == Some("OPENNTVOL") && too_long == 0xC000_0086 && odd == 0xC000_0086
+            && restored == 0 && restored_label == original && control == STATUS_INVALID_PARAMETER && data_copy == STATUS_INVALID_PARAMETER,
+        &alloc::format!("extended: NtSetVolumeInformationFile troca o rotulo do volume (abertura {volume_opened:#x}, original {original_status:#x}/{original:?}, novo {relabeled:#x}/{relabeled_iosb:#x}/{new_label:?}/{vpb_label:?}, longo {too_long:#x}, impar {odd:#x}, de volta {restored:#x}/{restored_label:?}, controle {control:#x}, copia {data_copy:#x})"),
+    );
+    // O ObjectId do volume.
+    let object_id = |handle: u64| {
+        guest::write_bytes(query, &[0; 0x40]);
+        guest::write64(rsp + 0x28, 8);
+        let status = call("NtQueryVolumeInformationFile", handle, iosb, query, 0x40);
+        (status, guest::read_bytes(query, 0x40))
+    };
+    let (absent, _) = object_id(volume);
+    let first: alloc::vec::Vec<u8> = (0..0x40u8).map(|byte| byte.wrapping_mul(7).wrapping_add(1)).collect();
+    guest::write_bytes(buffer, &first);
+    let stored = set(volume, buffer, 0x40, 8);
+    let (read_status, read) = object_id(volume);
+    let second: alloc::vec::Vec<u8> = (0..0x40u8).map(|byte| byte.wrapping_mul(13).wrapping_add(5)).collect();
+    guest::write_bytes(buffer, &second);
+    let replaced = set(volume, buffer, 0x40, 8);
+    let (replaced_status, replaced_read) = object_id(volume);
+    let _ = state::close_user_handle(volume, true, false);
+    assert(
+        absent == 0xC000_0034 && stored == 0 && read_status == 0 && read == first && replaced == 0 && replaced_status == 0 && replaced_read == second,
+        &alloc::format!("extended: NtSetVolumeInformationFile grava o ObjectId do volume ($OBJECT_ID e $O) e o FileFsObjectIdInformation o le (ausente {absent:#x}, gravado {stored:#x}, lido {read_status:#x}/{}, trocado {replaced:#x}/{replaced_status:#x}/{})", read == first, replaced_read == second),
     );
 }
 

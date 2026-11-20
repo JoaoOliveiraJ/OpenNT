@@ -106,6 +106,7 @@ const IRP_MJ_CLOSE: u8 = 0x02;
 const IRP_MJ_READ: u8 = 3;
 const IRP_MJ_WRITE: u8 = 4;
 const IRP_MJ_QUERY_VOLUME_INFORMATION: u8 = 0x0A;
+const IRP_MJ_SET_VOLUME_INFORMATION: u8 = 0x0B;
 const IRP_MJ_FILE_SYSTEM_CONTROL: u8 = 0x0D;
 const IRP_MJ_DEVICE_CONTROL: u8 = 0x0E;
 const IRP_MJ_LOCK_CONTROL: u8 = 0x11;
@@ -329,6 +330,15 @@ fn find(file_system: &'static dyn FileSystem) -> Option<KernelVolume> {
     VOLUMES.lock().iter().copied().find(|entry| volume::same(entry.file_system, file_system))
 }
 
+/// O VolumeLabel do VPB do volume `\Device\KernelVolume<index>`.
+pub fn vpb_label(index: u32) -> Option<String> {
+    let vpb = VOLUMES.lock().iter().find(|entry| entry.index == index).map(|entry| entry.vpb).filter(|&vpb| vpb != 0)?;
+    // SAFETY: o VPB permanente do volume.
+    let vpb = unsafe { Vpb::at(vpb) };
+    let units: Vec<u16> = vpb.volume_label.iter().take(vpb.volume_label_length.get() as usize / 2).map(|cell| cell.get()).collect();
+    Some(String::from_utf16_lossy(&units))
+}
+
 /// O dispositivo é o de volume do file system embutido (sem despacho).
 pub fn is_volume_device(device: u64) -> bool {
     device != 0 && VOLUMES.lock().iter().any(|entry| entry.volume == device)
@@ -522,6 +532,7 @@ fn volume_request(entry: &KernelVolume, irp: &Irp, stack: &IoStackLocation, file
         }
         IRP_MJ_CLOSE => (STATUS_SUCCESS, 0),
         IRP_MJ_QUERY_VOLUME_INFORMATION => query_volume(entry, irp, stack),
+        IRP_MJ_SET_VOLUME_INFORMATION => set_volume(entry, irp, stack),
         IRP_MJ_FILE_SYSTEM_CONTROL => volume_fs_control(entry, irp, stack),
         // O file system passa os IOCTLs do volume ao dispositivo alvo.
         IRP_MJ_DEVICE_CONTROL => volume_control(entry, irp, stack),
@@ -580,6 +591,35 @@ fn query_volume(entry: &KernelVolume, irp: &Irp, stack: &IoStackLocation) -> (u3
             (result.status, result.information as u64)
         }
         Err(error) => (if error.status != 0 { error.status } else { STATUS_UNEXPECTED_IO_ERROR }, 0),
+    }
+}
+
+/// IRP_MJ_SET_VOLUME_INFORMATION numa abertura do volume: o file system
+/// (`FileSystem::set_volume_information`, o NtfsCommonSetVolumeInfo) e,
+/// depois de um rótulo novo, o VolumeLabel do VPB, que o NtfsSetFsLabelInfo
+/// também troca.
+fn set_volume(entry: &KernelVolume, irp: &Irp, stack: &IoStackLocation) -> (u32, u64) {
+    let parameters = &stack.parameters.set_volume;
+    let class = parameters.fs_information_class.get().0 as u32;
+    let length = parameters.length.get() as usize;
+    let system = irp.associated_irp.system_buffer.get();
+    let bytes = if system != 0 { guest::read_bytes(system, length) } else { Vec::new() };
+    match entry.file_system.set_volume_information(class, &bytes) {
+        None => (STATUS_INVALID_DEVICE_REQUEST, 0),
+        Some(Err(error)) => (if error.status != 0 { error.status } else { STATUS_UNEXPECTED_IO_ERROR }, 0),
+        Some(Ok(status)) => {
+            if status == STATUS_SUCCESS && class == 2 && entry.vpb != 0 && bytes.len() >= 4 {
+                let label_length = (u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize).min(bytes.len() - 4);
+                // SAFETY: o VPB permanente do volume.
+                let vpb = unsafe { Vpb::at(entry.vpb) };
+                let units: Vec<u16> = bytes[4..4 + label_length].chunks_exact(2).map(|unit| u16::from_le_bytes([unit[0], unit[1]])).take(vpb.volume_label.len()).collect();
+                for (cell, unit) in vpb.volume_label.iter().zip(units.iter()) {
+                    cell.set(*unit);
+                }
+                vpb.volume_label_length.set(units.len() as u16 * 2);
+            }
+            (status, 0)
+        }
     }
 }
 

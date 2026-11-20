@@ -281,6 +281,10 @@ impl super::volume::FileSystem for Ntfs {
         "NTFS"
     }
 
+    fn set_volume_information(&self, class: u32, buffer: &[u8]) -> Option<Result<u32, KernelError>> {
+        Some(Ntfs::set_volume_information(self, class, buffer))
+    }
+
     fn control(&self, path: &str, code: u32, input: &[u8], output_length: u32, caller: &super::ntfs_control::ControlCaller) -> Option<Result<super::ntfs_control::ControlResult, KernelError>> {
         Some(Ntfs::control(self, path, code, input, output_length, caller))
     }
@@ -818,6 +822,37 @@ impl Ntfs {
         let Some(parent) = self.find(if separator == 0 { "/" } else { &trimmed[..separator] })? else { return Ok(None) };
         let stored = self.root_index(parent.reference)?.into_iter().find(|candidate| candidate.reference == entry.reference && candidate.value.get(0x41).is_some_and(|namespace| namespace & 3 != 2)).map(|candidate| candidate.name);
         Ok(Some(stored.unwrap_or(entry.name)))
+    }
+
+    /// O índice $O do `$Extend/$ObjId` na raiz residente: a referência e o
+    /// registro do arquivo e as entradas (a chave de 16 bytes do ObjectId e
+    /// os dados); `None` num volume sem o $ObjId. Um $O com blocos INDX
+    /// ainda não é lido (STATUS_NOT_SUPPORTED).
+    pub(crate) fn object_id_index(&self) -> Result<Option<(u64, Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>)>, KernelError> {
+        let Some(entry) = self.find("/$Extend/$ObjId")? else { return Ok(None) };
+        let record = self.read_record(entry.reference)?;
+        let Some(root) = find_named_attribute(&record, 0x90, "$O")?.filter(|root| !root.non_resident && root.value.len() >= 32) else {
+            return Err(KernelError::with_status("NTFS: $ObjId sem $INDEX_ROOT residente", 0xC000_0032));
+        };
+        if find_attribute(&record, 0xA0)?.is_some() {
+            return Err(KernelError::with_status("NTFS: indice $O com blocos INDX", 0xC000_00BB));
+        }
+        let value = &root.value;
+        let end = (16 + u32_at(value, 20) as usize).min(value.len());
+        let mut offset = 16 + u32_at(value, 16) as usize;
+        let mut entries = Vec::new();
+        while offset + 16 <= end {
+            let (data_offset, data_length, size, key_length, flags) = (u16_at(value, offset) as usize, u16_at(value, offset + 2) as usize, u16_at(value, offset + 8) as usize, u16_at(value, offset + 10) as usize, u16_at(value, offset + 12));
+            if flags & 2 != 0 {
+                break;
+            }
+            if size < 16 || offset + size > end || key_length != 16 || data_offset + data_length > size {
+                return Err(KernelError::with_status("NTFS: entrada de $O invalida", 0xC000_0032));
+            }
+            entries.push((value[offset + 16..offset + 32].to_vec(), value[offset + data_offset..offset + data_offset + data_length].to_vec()));
+            offset += size;
+        }
+        Ok(Some((entry.reference, record, entries)))
     }
 
     pub fn volume_information(&self) -> Result<VolumeInformation, KernelError> {

@@ -131,6 +131,14 @@ fn align(value: usize) -> usize {
     value.div_ceil(8) * 8
 }
 
+/// O registro do $Volume na MFT.
+const VOLUME_RECORD: u64 = 3;
+const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
+const STATUS_INVALID_VOLUME_LABEL: u32 = 0xC000_0086;
+const STATUS_DUPLICATE_NAME: u32 = 0xC000_00BD;
+const STATUS_VOLUME_NOT_UPGRADED: u32 = 0xC000_029C;
+
 fn put16(bytes: &mut [u8], offset: usize, value: u64) {
     bytes[offset..offset + 2].copy_from_slice(&(value as u16).to_le_bytes());
 }
@@ -917,6 +925,69 @@ impl Tx<'_> {
         self.volume.read_sectors(first.lcn as u64 * self.volume.geometry.sectors_per_cluster, 1)
     }
 
+    /// O $VOLUME_NAME do $Volume (o NtfsSetFsLabelInfo, ntfs.sys
+    /// 0x1763b8): o valor trocado, ou criado, com os bytes do rótulo.
+    fn store_volume_label(&mut self, label: &[u8]) -> Result<(), KernelError> {
+        let record = self.volume.read_record(VOLUME_RECORD)?;
+        let mut list = attributes(&record)?;
+        replace(&mut list, 0x60, Some(resident(0x60, label, "")));
+        self.record(VOLUME_RECORD, &list, u16_at(&record, 22), Some(&record), 1)
+    }
+
+    /// O ObjectId do $Volume (o NtfsSetFsVolumeObjectIdInfo, ntfs.sys
+    /// 0x2813e0, com o NtfsDeleteObjectIdInternal e o NtfsSetObjectIdInternal):
+    /// a entrada do ObjectId anterior sai do $O do `$Extend/$ObjId`, a nova
+    /// entra (chave de 16 bytes; dados: a referência do $Volume com a
+    /// sequência e o ExtendedInfo de 48 bytes, na colação
+    /// COLLATION_NTOFS_ULONGS) e o $OBJECT_ID do $Volume guarda os 16 bytes.
+    /// Sem o $ObjId, STATUS_VOLUME_NOT_UPGRADED; um ObjectId que outro
+    /// arquivo já tem, STATUS_DUPLICATE_NAME (o NtOfsAddRecords), sem mudar
+    /// nada.
+    fn store_volume_object_id(&mut self, object_id: &[u8], extended: &[u8]) -> Result<u32, KernelError> {
+        let Some((index_reference, index_record, mut entries)) = self.volume.object_id_index()? else { return Ok(STATUS_VOLUME_NOT_UPGRADED) };
+        let record = self.volume.read_record(VOLUME_RECORD)?;
+        if let Some(old) = find_attribute(&record, 0x40)?.filter(|old| !old.non_resident && old.value.len() >= 16) {
+            entries.retain(|(key, _)| key[..] != old.value[..16]);
+        }
+        if entries.iter().any(|(key, _)| key[..] == object_id[..16]) {
+            return Ok(STATUS_DUPLICATE_NAME);
+        }
+        let mut data = (VOLUME_RECORD | (u16_at(&record, 16) as u64) << 48).to_le_bytes().to_vec();
+        data.extend_from_slice(&extended[..48]);
+        entries.push((object_id[..16].to_vec(), data));
+        entries.sort_by_key(|(key, _)| [u32_at(key, 0), u32_at(key, 4), u32_at(key, 8), u32_at(key, 12)]);
+        let mut items = Vec::new();
+        for (key, data) in &entries {
+            let mut item = alloc::vec![0u8; 16];
+            // DataOffset, DataLength, Length e KeyLength.
+            put16(&mut item, 0, 16 + key.len() as u64);
+            put16(&mut item, 2, data.len() as u64);
+            put16(&mut item, 8, (16 + key.len() + data.len()) as u64);
+            put16(&mut item, 10, key.len() as u64);
+            item.extend_from_slice(key);
+            item.extend_from_slice(data);
+            items.extend_from_slice(&item);
+        }
+        let mut last = [0u8; 16];
+        put16(&mut last, 8, 16);
+        put16(&mut last, 12, 2);
+        items.extend_from_slice(&last);
+        let Some(root) = find_attribute(&index_record, 0x90)? else { return fail(0xC000_0032, "$ObjId sem $INDEX_ROOT") };
+        let mut value = root.value[..16].to_vec();
+        value.resize(32, 0);
+        put32(&mut value, 16, 16);
+        put32(&mut value, 20, (16 + items.len()) as u64);
+        put32(&mut value, 24, (16 + items.len()) as u64);
+        value.extend_from_slice(&items);
+        let mut index_list = attributes(&index_record)?;
+        replace(&mut index_list, 0x90, Some(resident(0x90, &value, "$O")));
+        self.record(index_reference, &index_list, u16_at(&index_record, 22), Some(&index_record), 1)?;
+        let mut list = attributes(&record)?;
+        replace(&mut list, 0x40, Some(resident(0x40, &object_id[..16], "")));
+        self.record(VOLUME_RECORD, &list, u16_at(&record, 22), Some(&record), 1)?;
+        Ok(0)
+    }
+
     /// A entrada (tag, referência do arquivo com a sequência) do índice $R
     /// do `$Extend/$Reparse`, como o NtOfsAddRecords/NtOfsDeleteRecords do
     /// NtfsCreateReparsePointInternal (0x1ee1cc) a grava: chave de 12 bytes
@@ -1478,6 +1549,48 @@ impl Ntfs {
     /// transação (`Tx::store_reparse`).
     pub fn store_reparse_point(&self, path: &str, buffer: Option<&[u8]>) -> Result<(), KernelError> {
         self.with_writer(|writer| writer.transaction(|tx| tx.store_reparse(path, buffer)))
+    }
+
+    /// IRP_MJ_SET_VOLUME_INFORMATION numa abertura do volume (o
+    /// NtfsCommonSetVolumeInfo, ntfs.sys 0x176120): FileFsLabelInformation
+    /// (2: até 0x40 bytes e par, senão STATUS_INVALID_VOLUME_LABEL),
+    /// FileFsObjectIdInformation (8) e, como num volume sem a tabela de
+    /// cotas aberta (Vcb->QuotaTableScb nulo, o file system embutido não
+    /// abre o $Quota), STATUS_INVALID_PARAMETER no FileFsControlInformation
+    /// (6) e em qualquer outra classe.
+    pub fn set_volume_information(&self, class: u32, buffer: &[u8]) -> Result<u32, KernelError> {
+        match class {
+            2 => {
+                let length = u32_at(buffer, 0) as usize;
+                if length > 0x40 || length & 1 != 0 || 4 + length > buffer.len() {
+                    return Ok(STATUS_INVALID_VOLUME_LABEL);
+                }
+                let label = buffer[4..4 + length].to_vec();
+                self.with_writer(|writer| writer.transaction(|tx| tx.store_volume_label(&label)))?;
+                Ok(0)
+            }
+            8 if buffer.len() >= 64 => self.with_writer(|writer| writer.transaction(|tx| tx.store_volume_object_id(&buffer[..16], &buffer[16..64]))),
+            _ => Ok(STATUS_INVALID_PARAMETER),
+        }
+    }
+
+    /// O FILE_FS_OBJECTID_INFORMATION do volume (o
+    /// NtfsQueryFsVolumeObjectIdInfo, ntfs.sys 0x160a8c): sem o $ObjId,
+    /// STATUS_VOLUME_NOT_UPGRADED; sem o $OBJECT_ID no $Volume,
+    /// STATUS_OBJECT_NAME_NOT_FOUND; senão o ObjectId e o ExtendedInfo da
+    /// entrada dele no $O.
+    pub fn volume_object_id(&self) -> Result<Result<[u8; 64], u32>, KernelError> {
+        self.with_writer(|tx| {
+            let Some((_, _, entries)) = tx.volume.object_id_index()? else { return Ok(Err(STATUS_VOLUME_NOT_UPGRADED)) };
+            let record = tx.volume.read_record(VOLUME_RECORD)?;
+            let Some(object_id) = find_attribute(&record, 0x40)?.filter(|id| !id.non_resident && id.value.len() >= 16).map(|id| id.value) else { return Ok(Err(STATUS_OBJECT_NAME_NOT_FOUND)) };
+            let mut bytes = [0u8; 64];
+            bytes[..16].copy_from_slice(&object_id[..16]);
+            if let Some((_, data)) = entries.iter().find(|(key, _)| key[..] == object_id[..16]).filter(|(_, data)| data.len() >= 56) {
+                bytes[16..].copy_from_slice(&data[8..56]);
+            }
+            Ok(Ok(bytes))
+        })
     }
 
     pub fn create(&self, path: &str, directory: bool, file_attributes: u32, reservation: u64) -> Result<Option<Stat>, KernelError> {

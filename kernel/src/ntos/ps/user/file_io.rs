@@ -1566,6 +1566,13 @@ fn nt_query_volume_information_file(handle: u64, iosb: u64, out: u64, length: u6
     })
 }
 
+/// NtSetVolumeInformationFile(FileHandle, IoStatusBlock, FsInformation,
+/// Length, FsInformationClass): `io/file/irp_service`, para os arquivos de
+/// driver e os do volume de boot.
+fn nt_set_volume_information_file(handle: u64, iosb: u64, buffer: u64, length: u64, rsp: u64) -> Result<u32, KernelError> {
+    Ok(irp_service::set_volume_information(handle, iosb, buffer, length as u32, state::stack_arg32(rsp, 5)))
+}
+
 /// NtNotifyChangeDirectoryFile(Ex)(FileHandle, Event, ApcRoutine,
 /// ApcContext, IoStatusBlock, Buffer, Length, CompletionFilter, WatchTree[,
 /// DirectoryNotifyInformationClass]): `io/file/directory_notify.rs`.
@@ -1624,6 +1631,7 @@ pub fn init_part2() {
     state::register_handler("NtQueryDirectoryFile", nt_query_directory_file);
     state::register_handler("NtQueryDirectoryFileEx", nt_query_directory_file_ex);
     state::register_handler("NtQueryVolumeInformationFile", nt_query_volume_information_file);
+    state::register_handler("NtSetVolumeInformationFile", nt_set_volume_information_file);
     state::register_handler("NtNotifyChangeDirectoryFile", nt_notify_change_directory_file);
     state::register_handler("NtNotifyChangeDirectoryFileEx", nt_notify_change_directory_file_ex);
     state::register_handler("NtLockFile", nt_lock_file);

@@ -1728,6 +1728,139 @@ pub fn query_volume_information(handle: u64, io_status: u64, buffer: u64, length
     information_tail(&target, packet, local, io_status)
 }
 
+/// IopSetFsOperationLength, o alinhamento do ProbeForRead e
+/// IopSetFsOperationAccess do ntoskrnl 19041 (0x983880, 0x983c70, 0x984e40),
+/// por FS_INFORMATION_CLASS: FileFsLabelInformation (2),
+/// FileFsControlInformation (6), FileFsObjectIdInformation (8) e
+/// FileFsDataCopyInformation (10).
+const FS_SET_MINIMUM: [u8; 15] = [0, 0, 8, 0, 0, 0, 48, 0, 64, 0, 4, 0, 0, 0, 0];
+const FS_SET_ALIGNMENT: [u8; 15] = [0, 8, 4, 8, 4, 4, 8, 8, 8, 8, 4, 4, 4, 8, 8];
+const FS_SET_ACCESS: [u32; 15] = [0, 0, 0x2, 0, 0, 0, 0x2, 0, 0x2, 0, 0x100, 0, 0, 0, 0];
+const FILE_FS_LABEL_INFORMATION: u32 = 2;
+const IRP_MJ_SET_VOLUME_INFORMATION: u8 = 0x0B;
+/// GUID_IO_VOLUME_CHANGE {7373654a-812a-11d0-bec7-08002be2092f}.
+const GUID_IO_VOLUME_CHANGE: [u8; 16] = [0x4A, 0x65, 0x73, 0x73, 0x2A, 0x81, 0xD0, 0x11, 0xBE, 0xC7, 0x08, 0x00, 0x2B, 0xE2, 0x09, 0x2F];
+/// TARGET_DEVICE_CUSTOM_NOTIFICATION sem dados: Version 1, Size 0x24,
+/// Event em +4, FileObject em +0x18, NameBufferOffset (-1) em +0x20.
+const VOLUME_CHANGE_SIZE: usize = 0x28;
+
+/// NtSetVolumeInformationFile(FileHandle, IoStatusBlock, FsInformation,
+/// Length, FsInformationClass) de modo usuário (ntoskrnl 0x76c860): a classe
+/// (STATUS_INVALID_INFO_CLASS) e o tamanho mínimo
+/// (STATUS_INFO_LENGTH_MISMATCH), o IO_STATUS_BLOCK e o buffer sondados
+/// (com o alinhamento da classe), o handle com o acesso da classe, a cópia
+/// para o SystemBuffer e, no rótulo, o VolumeLabelLength não negativo e
+/// dentro do Length (STATUS_INVALID_PARAMETER). Um arquivo de driver recebe
+/// o IRP_MJ_SET_VOLUME_INFORMATION (com o lock e a cauda de um arquivo
+/// síncrono, ou o evento local de um assíncrono); depois do sucesso, o PDO
+/// do IoGetRelatedTargetDevice recebe o GUID_IO_VOLUME_CHANGE pelo
+/// IoReportTargetDeviceChange. Um arquivo do file system embutido que não é
+/// a abertura do volume recebe a resposta do NtfsCommonSetVolumeInfo para
+/// quem não é UserVolumeOpen: STATUS_ACCESS_DENIED.
+pub fn set_volume_information(handle: u64, io_status: u64, buffer: u64, length: u32, class: u32) -> u32 {
+    let index = class as usize;
+    let minimum = FS_SET_MINIMUM.get(index).copied().unwrap_or(0) as u32;
+    if minimum == 0 {
+        return STATUS_INVALID_INFO_CLASS;
+    }
+    if length < minimum {
+        return STATUS_INFO_LENGTH_MISMATCH;
+    }
+    if !probe(io_status, 4, true) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    if buffer & (FS_SET_ALIGNMENT[index] as u64 - 1) != 0 {
+        return STATUS_DATATYPE_MISALIGNMENT;
+    }
+    if !probe(buffer, length as u64, false) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    let selected = match query::resolve(handle, true) {
+        Ok(selected) => selected,
+        Err(status) => return status,
+    };
+    let required = FS_SET_ACCESS[index];
+    if required != 0 && selected.access & required != required {
+        return STATUS_ACCESS_DENIED;
+    }
+    let input = match guest::try_read_bytes(buffer, length as usize) {
+        Ok(input) => input,
+        Err(_) => return STATUS_ACCESS_VIOLATION,
+    };
+    if class == FILE_FS_LABEL_INFORMATION {
+        let label = i32::from_le_bytes(input[..4].try_into().unwrap_or([0; 4]));
+        if label < 0 || label as u64 + 4 > length as u64 {
+            return STATUS_INVALID_PARAMETER;
+        }
+    }
+    if information::related_device(selected.pointer).unwrap_or(0) == 0 {
+        return STATUS_ACCESS_DENIED;
+    }
+    let target = match reference(handle) {
+        Ok(target) => target,
+        Err(status) => return status,
+    };
+    let synchronous = target.synchronous();
+    if synchronous && information::acquire_file(target.file).is_err() {
+        return conclude(&target, false, None, STATUS_INSUFFICIENT_RESOURCES);
+    }
+    let local = if synchronous { 0 } else { allocate_local() };
+    let system = guest::alloc_bytes(length as u64);
+    if system == 0 || (!synchronous && local == 0) {
+        for block in [system, local] {
+            if block != 0 {
+                guest::free_bytes(block);
+            }
+        }
+        return conclude(&target, synchronous, None, STATUS_INSUFFICIENT_RESOURCES);
+    }
+    guest::write_bytes(system, &input);
+    dispatcher::clear_event(file_at(target.file).event.address());
+    let flags = IRP_BUFFERED_IO | IRP_DEALLOCATE_BUFFER | IRP_DEFER_IO_COMPLETION | if local != 0 { IRP_SYNCHRONOUS_API } else { 0 };
+    let (user_event, user_iosb) = if local != 0 { (local, local_iosb(local).address()) } else { (0, io_status) };
+    let packet = allocate(&target, BuildOptions { major: IRP_MJ_SET_VOLUME_INFORMATION, buffer: system, user_event, user_iosb, ..BuildOptions::default() }, flags);
+    if packet == 0 {
+        let _ = pool_allocation::free(system, 0);
+        if local != 0 {
+            guest::free_bytes(local);
+        }
+        return conclude(&target, synchronous, None, STATUS_INSUFFICIENT_RESOURCES);
+    }
+    let parameters = &top_location(packet).parameters.set_volume;
+    parameters.length.set(length);
+    parameters.fs_information_class.set(crate::ntos::inc::types::Fsinfoclass(class as i32));
+    let file = target.file;
+    let _ = file_objects::reference(file);
+    track(packet, &target, None, local, 0);
+    let status = information_tail(&target, packet, local, io_status);
+    if !nt_error(status) {
+        report_volume_change(file);
+    }
+    dereference_file(file);
+    status
+}
+
+/// O IoReportTargetDeviceChange(GUID_IO_VOLUME_CHANGE) ao PDO do
+/// IoGetRelatedTargetDevice de `file` (nada sem ele).
+fn report_volume_change(file: u64) {
+    let Ok((status, pdo)) = crate::ntos::io::pnp::related_target_device(file) else { return };
+    if nt_error(status) || pdo == 0 {
+        return;
+    }
+    let notification = guest::alloc_bytes(VOLUME_CHANGE_SIZE as u64);
+    if notification != 0 {
+        let mut bytes = [0u8; VOLUME_CHANGE_SIZE];
+        bytes[0..2].copy_from_slice(&1u16.to_le_bytes());
+        bytes[2..4].copy_from_slice(&0x24u16.to_le_bytes());
+        bytes[4..20].copy_from_slice(&GUID_IO_VOLUME_CHANGE);
+        bytes[0x20..0x24].copy_from_slice(&(-1i32).to_le_bytes());
+        guest::write_bytes(notification, &bytes);
+        crate::ntos::io::pnp_notify::report_target_device_change(pdo, notification);
+        guest::free_bytes(notification);
+    }
+    let _ = crate::ntos::init::exports::invoke_handler("ObfDereferenceObject", &[pdo]);
+}
+
 /// NtSetInformationFile de modo usuário num arquivo de driver.
 pub fn set_information(handle: u64, io_status: u64, buffer: u64, length: u32, class: u32) -> u32 {
     let index = class as usize;

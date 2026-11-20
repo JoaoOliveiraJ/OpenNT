@@ -19,6 +19,7 @@ pub fn minimum(class: u32) -> Option<u32> {
         4 => Some(8),
         5 => Some(12),
         7 => Some(32),
+        8 => Some(64),
         // FILE_FS_SECTOR_SIZE_INFORMATION.
         11 => Some(0x1C),
         _ => None,
@@ -29,6 +30,11 @@ pub fn minimum(class: u32) -> Option<u32> {
 pub trait VolumeQuery {
     fn volume_information(&self) -> Result<VolumeInformation, KernelError>;
     fn space(&self) -> Option<Result<Space, KernelError>>;
+    /// O FILE_FS_OBJECTID_INFORMATION do volume (o ObjectId e o
+    /// ExtendedInfo), ou o status da falta dele; `None` = sem suporte.
+    fn volume_object_id(&self) -> Option<Result<Result<[u8; 64], u32>, KernelError>> {
+        None
+    }
 }
 
 impl VolumeQuery for Ntfs {
@@ -38,6 +44,10 @@ impl VolumeQuery for Ntfs {
 
     fn space(&self) -> Option<Result<Space, KernelError>> {
         Some(Ntfs::space(self))
+    }
+
+    fn volume_object_id(&self) -> Option<Result<Result<[u8; 64], u32>, KernelError>> {
+        Some(Ntfs::volume_object_id(self))
     }
 }
 
@@ -79,8 +89,8 @@ fn put(bytes: &mut [u8], at: usize, value: u64, count: usize) {
     bytes[at..at + count].copy_from_slice(&value.to_le_bytes()[..count]);
 }
 
-/// FileFsVolume (1), Size (3), Device (4), Attribute (5), FullSize (7) e
-/// SectorSize (11). O
+/// FileFsVolume (1), Size (3), Device (4), Attribute (5), FullSize (7),
+/// ObjectId (8) e SectorSize (11). O
 /// nome é copiado byte a byte, inclusive um último byte ímpar, sem
 /// terminador; o campo de comprimento sempre descreve o nome inteiro.
 pub fn query(volume: Option<&dyn VolumeQuery>, class: u32, length: u32) -> Result<QueryResult, KernelError> {
@@ -89,6 +99,17 @@ pub fn query(volume: Option<&dyn VolumeQuery>, class: u32, length: u32) -> Resul
         return Ok(fail(0xC000_0004));
     }
     let Some(volume) = volume else { return Ok(fail(0xC000_0010)) };
+    // FileFsObjectIdInformation (o NtfsQueryFsVolumeObjectIdInfo): os 64
+    // bytes, ou o status de um volume sem a tabela ou sem o ObjectId.
+    if class == 8 {
+        return Ok(match volume.volume_object_id() {
+            None => fail(0xC000_0010),
+            Some(found) => match found? {
+                Ok(bytes) => QueryResult { status: 0, information: 64, bytes: bytes.to_vec() },
+                Err(status) => fail(status),
+            },
+        });
+    }
     let identity = volume.volume_information()?;
     let mut text: Vec<u16> = Vec::new();
     let mut offset = 0usize;
