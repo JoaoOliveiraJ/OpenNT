@@ -84,6 +84,32 @@ pub fn setup_command(names: &BuiltinNames) -> Result<String, String> {
     Ok(command)
 }
 
+/// O `CmdLine` do gancho sem a conta de teste (`--desligar-contas-embutidas`
+/// e o `run` do boot do smss): só desabilita o Administrador e o Convidado
+/// internos e volta o gancho. O estado final do SAM é o que o Setup do
+/// Windows deixa ao aplicar o modelo de segurança `inf\defltbase.inf`
+/// (EnableAdminAccount = 0 e EnableGuestAccount = 0, pelo scesrv até o
+/// SamSetInformationUser com USER_ACCOUNT_DISABLED); o banco que o samsrv
+/// cria no primeiro boot só os desabilitaria pela consulta de licença
+/// cifrada do ShouldDisableAccountByDefault (NtQuerySystemInformation 134),
+/// que o OpenNT não responde. Rodar o próprio modelo pelo secedit.exe (o
+/// scecli, o scesrv no lsass e o banco ESE dele) é a alternativa mais fiel.
+pub fn builtin_accounts_command(names: &BuiltinNames) -> Result<String, String> {
+    let administrator = argument(&names.administrator)?;
+    let guest = argument(&names.guest)?;
+    let command = format!(
+        "cmd /d /c net user {administrator} /active:no\
+         &net user {guest} /active:no\
+         &reg add HKLM\\SYSTEM\\Setup /v SetupType /t REG_DWORD /d 0 /f\
+         &reg add HKLM\\SYSTEM\\Setup /v CmdLine /d \"\" /f"
+    );
+    let length = command.encode_utf16().count();
+    if length > COMMAND_LINE_MAX {
+        return Err(format!("--desligar-contas-embutidas: comando com {length} caracteres (o winlogon le ate {COMMAND_LINE_MAX}): {command}"));
+    }
+    Ok(command)
+}
+
 /// Um nome como argumento do cmd: entre aspas com espaço ou um caractere
 /// especial do cmd; aspas, `%` e caracteres de controle não passam.
 fn argument(name: &str) -> Result<String, String> {
@@ -182,7 +208,7 @@ fn samsrv_name(table: &[u8], id: u32) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{message_text, samsrv_name, setup_command, system_keys, BuiltinNames, COMMAND_LINE_MAX};
+    use super::{builtin_accounts_command, message_text, samsrv_name, setup_command, system_keys, BuiltinNames, COMMAND_LINE_MAX};
 
     fn portuguese() -> BuiltinNames {
         BuiltinNames { administrators: "Administradores".into(), administrator: "Administrador".into(), guest: "Convidado".into() }
@@ -200,6 +226,15 @@ mod tests {
         );
         assert_eq!(command.encode_utf16().count(), 245);
         assert!(command.encode_utf16().count() <= COMMAND_LINE_MAX);
+    }
+
+    /// Sem a conta, o comando só desabilita as embutidas e volta o gancho.
+    #[test]
+    fn the_builtin_accounts_command_only_disables_them() {
+        assert_eq!(
+            builtin_accounts_command(&portuguese()).unwrap(),
+            "cmd /d /c net user Administrador /active:no&net user Convidado /active:no&reg add HKLM\\SYSTEM\\Setup /v SetupType /t REG_DWORD /d 0 /f&reg add HKLM\\SYSTEM\\Setup /v CmdLine /d \"\" /f"
+        );
     }
 
     /// Nome com espaço vai entre aspas; aspas e `%` não passam; um comando

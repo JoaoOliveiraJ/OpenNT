@@ -116,6 +116,15 @@ pub struct BuildOptions {
     /// (`test_account`). Muda a hive SYSTEM, não o kernel nem as opções de
     /// carga.
     pub test_account: bool,
+    /// `--desligar-contas-embutidas` (e o `run` do boot do smss): o volume do
+    /// boot do smss leva em `SYSTEM\Setup` o gancho de primeiro boot que só
+    /// desabilita o Administrador e o Convidado internos
+    /// (`test_account::builtin_accounts_command`), o estado em que eles chegam
+    /// numa instalação nova (o modelo de segurança `defltbase.inf` do Setup,
+    /// EnableAdminAccount e EnableGuestAccount 0). Só nas execuções que chegam
+    /// à tela de credenciais: os testes que param na tela de bloqueio não
+    /// pagam o cmd.exe e o net.exe do primeiro boot.
+    pub builtin_accounts_off: bool,
     /// `--console-process`: no boot comum, o kernel roda o cmd.exe real com
     /// um console sem janela (o teste console-processo). Também muda o
     /// volume NTFS, que leva os programas de modo usuário do boot do smss
@@ -252,6 +261,7 @@ impl BuildOptions {
         options.initial_process.clear();
         options.console_process = false;
         options.test_account = false;
+        options.builtin_accounts_off = false;
         format!("{options:?}")
     }
 }
@@ -426,9 +436,18 @@ pub fn build(options: &BuildOptions) -> Result<BuildOutput, String> {
     let mut ntfs_files: Vec<(String, Vec<u8>)> = staged.into_iter().map(|file| (file.path, file.bytes)).collect();
     // O gancho de primeiro boot do `--conta-de-teste`, com os nomes do
     // samsrv.dll.mui do idioma do convidado.
-    let setup_command = if options.test_account { Some(crate::test_account::setup_command(&crate::test_account::builtin_names()?)?) } else { None };
+    // Sem a conta, o `--desligar-contas-embutidas` só desabilita as contas
+    // embutidas, com o mesmo gancho.
+    let setup_command = if options.test_account {
+        Some(crate::test_account::setup_command(&crate::test_account::builtin_names()?)?)
+    } else if options.builtin_accounts_off && options.initial_process == "smss" {
+        Some(crate::test_account::builtin_accounts_command(&crate::test_account::builtin_names()?)?)
+    } else {
+        None
+    };
     if let Some(command) = &setup_command {
-        println!("conta de teste {}: gancho de primeiro boot em SYSTEM\\Setup ({} caracteres)", crate::test_account::ACCOUNT_NAME, command.encode_utf16().count());
+        let what = if options.test_account { format!("conta de teste {}", crate::test_account::ACCOUNT_NAME) } else { String::from("contas embutidas desligadas") };
+        println!("{what}: gancho de primeiro boot em SYSTEM\\Setup ({} caracteres)", command.encode_utf16().count());
     }
     // As hives de máquina que o kernel carrega no boot, das tabelas de
     // semente dele.
@@ -513,6 +532,7 @@ mod tests {
             tpm: false,
             console_process: false,
             test_account: false,
+            builtin_accounts_off: false,
         }
     }
 

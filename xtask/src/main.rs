@@ -38,7 +38,11 @@
 //! condrv.sys e pelo conhost.exe reais; o volume leva os programas de modo usuário do smss),
 //! `--conta-de-teste` (com `--initial-process=smss`: o winlogon cria no primeiro boot, com o
 //! net.exe real, a conta local `Usuario` sem senha no grupo Administradores, que o LogonUI
-//! abre sozinho).
+//! abre sozinho), `--desligar-contas-embutidas` (com `--initial-process=smss`: o winlogon
+//! desabilita no primeiro boot o Administrador e o Convidado internos, como o modelo de
+//! segurança do Setup; o gancho só entra nas execuções que chegam à tela de credenciais: o
+//! `run` do smss, o `--conta-de-teste` e esta opção, e não nos testes que param na tela de
+//! bloqueio).
 //! O kernel dos builds comuns leva só as tabelas de linha do DWARF; o `debug` compila o perfil
 //! `depuracao`, com o DWARF completo (as variáveis locais dos depuradores gráficos).
 //! Fora `--release` e `--windows-dir`, elas não recompilam o kernel: vão no bloco de opções de
@@ -140,6 +144,10 @@ opcoes de build:   --release --build-dir=DIR --user-program=shell
                    o volume leva os programas de modo usuario do smss)
                    --conta-de-teste (com --initial-process=smss: o winlogon cria no primeiro boot
                    a conta local Usuario, sem senha, no grupo Administradores)
+                   --desligar-contas-embutidas (com --initial-process=smss: o winlogon desabilita
+                   no primeiro boot o Administrador e o Convidado, como numa instalacao nova;
+                   vale sozinho no run do smss e com --conta-de-teste; os testes que param na
+                   tela de bloqueio ficam sem ele, sem o cmd.exe e o net.exe do primeiro boot)
 opcoes de maquina: --accel=auto|tcg|whpx (test-boot: auto = whpx quando a maquina tem; run e debug: tcg)
                    --memory-mb=N --smp=N --kd-port=N --monitor-port=N
                    --ata-fault=read (o volume de dados atras do blkdebug do QEMU: uma leitura do
@@ -264,6 +272,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             tpm: false,
             console_process: false,
             test_account: false,
+            builtin_accounts_off: false,
         },
         // O test-boot roda no WHPX quando a máquina o tem (`auto`); o `run`
         // e o `debug` ficam no TCG, que o rastro de instruções do depurador
@@ -328,6 +337,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             "--memory-pressure" => parsed.build.memory_pressure = true,
             "--console-process" => parsed.build.console_process = true,
             "--conta-de-teste" => parsed.build.test_account = true,
+            "--desligar-contas-embutidas" => parsed.build.builtin_accounts_off = true,
             "--initial-process" => parsed.build.initial_process = required()?,
             "--storage" => parsed.build.storage = required()?,
             "--display" => parsed.build.display = required()?,
@@ -407,6 +417,15 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
     }
     if parsed.build.test_account && parsed.build.initial_process != "smss" {
         return Err("--conta-de-teste exige --initial-process=smss (o gancho e do winlogon)".into());
+    }
+    if parsed.build.builtin_accounts_off && parsed.build.initial_process != "smss" {
+        return Err("--desligar-contas-embutidas exige --initial-process=smss (o gancho e do winlogon)".into());
+    }
+    // O `run` do boot do smss é a execução interativa que chega à tela de
+    // credenciais: as contas embutidas saem desabilitadas, como numa
+    // instalação nova.
+    if parsed.command == "run" && parsed.build.initial_process == "smss" {
+        parsed.build.builtin_accounts_off = true;
     }
     if parsed.build.console_process && parsed.build.initial_process == "smss" {
         return Err("--console-process e do boot comum (sem --initial-process=smss)".into());
