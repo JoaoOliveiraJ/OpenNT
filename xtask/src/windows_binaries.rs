@@ -952,7 +952,8 @@ const USER_LOGON_PROGRAMS: &[&str] = &[
     // gamestreamingext, sbservicetrigger, BluetoothApis, winsqlite3); o
     // telefone do NPSM (PhoneOm e o Phoneutil); o repositório de pacotes, o
     // Storage Sense, o log de eventos e a aplicabilidade do
-    // AppXDeploymentClient (AppxAllUserStore, StorageUsage, wevtapi,
+    // AppXDeploymentClient (AppxAllUserStore, StorageUsage, o wevtapi, que
+    // já vai com o EventLog em SERVICE_CHAIN_PROGRAMS,
     // AppxApplicabilityEngine); o armazenamento e o bind filter do
     // container (wc_storage, bindfltapi); e os símbolos e a pasta de busca
     // do tquery (dbghelp, Windows.Storage.Search).
@@ -977,7 +978,6 @@ const USER_LOGON_PROGRAMS: &[&str] = &[
     "Phoneutil.dll",
     "AppxAllUserStore.dll",
     "StorageUsage.dll",
-    "wevtapi.dll",
     "AppxApplicabilityEngine.dll",
     "wc_storage.dll",
     "bindfltapi.dll",

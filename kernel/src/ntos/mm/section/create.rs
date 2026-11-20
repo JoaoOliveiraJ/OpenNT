@@ -510,7 +510,7 @@ fn create_common(output: u64, access: u32, object_attributes: u64, size_pointer:
         };
         created = Some(section.clone());
         if deferred_commit {
-            let status = sections::commit(&section, 0, section.size / sections::PAGE)?;
+            let status = sections::commit(&section, 0, section.size() / sections::PAGE)?;
             if status != 0 {
                 return Ok(status);
             }

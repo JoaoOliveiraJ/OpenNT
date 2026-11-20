@@ -837,7 +837,10 @@ pub fn create_user_process(request: &CreateProcessRequest<'_>) -> Result<Created
             // MmGetFileNameForAddress 0x8c3fb4), não o caminho DOS: o
             // BasepFillUEFInfo do kernelbase (SetUnhandledExceptionFilter)
             // consulta MemoryMappedFilenameInformation nelas.
-            let main_file = image_file.as_ref().map(|image| image.file.clone());
+            let main_file = image_file.as_ref().and_then(|image| match image {
+                ImageFile::Volume { file, .. } => Some(file.clone()),
+                ImageFile::Driver { .. } => None,
+            });
             let ((entry_point, image_base, size_of_image), image_information) = map_main_image(process_pointer, &image_source, &load_options, &parameters.image_path_name, main_file)?;
             // A ntdll do volume, ou a fonte de onde a do System foi mapeada
             // (o nome que a região dela no System já leva).

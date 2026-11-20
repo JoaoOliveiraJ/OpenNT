@@ -433,7 +433,14 @@ pub fn capture_stream(pointer: u64, pointers: u64, size: u64) -> Arc<CapturedFil
         held: AtomicBool::new(false),
         backing_reference: AtomicU64::new(0),
         driver_pointers: pointers,
+        file_id: driver_file_id(pointers),
     })
+}
+
+/// O `file_id` de um arquivo de file system real: os
+/// SECTION_OBJECT_POINTERS do stream, os mesmos em toda abertura.
+fn driver_file_id(pointers: u64) -> Option<String> {
+    (pointers != 0).then(|| format!("sop:{pointers:#x}"))
 }
 
 /// O arquivo de um file system real: o tamanho pelo FsRtlGetFileSize
@@ -461,5 +468,6 @@ fn capture_driver_file(pointer: u64, pointers: u64, access: u32, image: bool) ->
         held: AtomicBool::new(false),
         backing_reference: AtomicU64::new(0),
         driver_pointers: pointers,
+        file_id: driver_file_id(pointers),
     }))
 }
