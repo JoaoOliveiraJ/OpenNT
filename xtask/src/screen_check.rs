@@ -12,6 +12,9 @@ use crate::png::Image;
 pub const FIRST_PIXEL_MARKER: &str = "FIRST_PIXEL_OK";
 /// O marcador da tela de logon.
 pub const LOGON_SCREEN_MARKER: &str = "LOGON_SCREEN_OK";
+/// A vigia só procura a tela de logon depois deste marcador na serial: o
+/// LogonUI.exe que o winlogon criou (`initial_process.rs`).
+pub const LOGON_AFTER: &str = "LOGONUI_STARTED";
 /// Pixels não pretos que uma tela gráfica precisa ter.
 const DRAWN_MINIMUM: usize = 64;
 /// Um canal acima disto não é preto.

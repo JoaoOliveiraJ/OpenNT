@@ -697,6 +697,9 @@ struct Watch {
     candidate: Option<crate::png::Image>,
     /// A tela de logon confirmada (`LOGON_SCREEN_OK`).
     logon: Option<crate::png::Image>,
+    /// O `LOGONUI_STARTED` já apareceu na serial: antes dele nenhuma tela é
+    /// a de logon.
+    logonui_seen: bool,
     /// O teste espera o `DESKTOP_OK`: a vigia procura a área de trabalho
     /// em vez da tela de logon.
     wants_desktop: bool,
@@ -711,8 +714,9 @@ struct Watch {
 
 /// Um passo da vigia da tela (`--watch-screen`) sobre `image`. Na primeira
 /// tela com pixels desenhados escreve a descrição e o `FIRST_PIXEL_OK` no
-/// log da serial e grava o PNG em `first`; depois procura a tela de logon
-/// ([`screen_check::logon_screen`]). Quando duas leituras seguidas passam e
+/// log da serial e grava o PNG em `first`; depois, só com o
+/// `LOGONUI_STARTED` na serial ([`screen_check::LOGON_AFTER`]), procura a
+/// tela de logon ([`screen_check::logon_screen`]). Quando duas leituras seguidas passam e
 /// são a mesma tela, a segunda sai com o `LOGON_SCREEN_OK`, vai para
 /// `tela-de-logon.png`, ao lado, e fica em `watch.logon`. Devolve true
 /// quando a vigia acabou (a tela de logon apareceu). Num teste da área de
@@ -729,6 +733,12 @@ fn watch_step(image: &crate::png::Image, first: &Path, watch: &mut Watch, output
     }
     if watch.wants_desktop {
         return desktop_step(image, first, watch, output);
+    }
+    if !watch.logonui_seen {
+        watch.logonui_seen = output.lock().unwrap().contains(screen_check::LOGON_AFTER);
+        if !watch.logonui_seen {
+            return false;
+        }
     }
     let Ok(description) = screen_check::logon_screen(image) else {
         watch.candidate = None;
@@ -2247,6 +2257,13 @@ mod tests {
 
         assert!(!watch_step(&pointer, &first, &mut watch, &output));
         assert!(watch.first_seen && first.is_file());
+        // Antes do LOGONUI_STARTED na serial, nem a tela de bloqueio parada é
+        // a tela de logon.
+        for _ in 0..3 {
+            assert!(!watch_step(&lock, &first, &mut watch, &output));
+        }
+        assert!(!output.lock().unwrap().contains(LOGON_SCREEN_MARKER));
+        output.lock().unwrap().push_str("\nLOGONUI_STARTED\n");
         for image in [&torn, &faded, &lock] {
             assert!(!watch_step(image, &first, &mut watch, &output));
         }
