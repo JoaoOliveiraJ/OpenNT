@@ -13,7 +13,9 @@
 //!   `CurrentVersion\SharedPC`; o winsrvext.dll do csrss lê
 //!   `Control\PriorityControl`;
 //! - o winlogon.exe lê os assinantes das notificações de sessão em
-//!   `Control\Winlogon\Notifications`.
+//!   `Control\Winlogon\Notifications`;
+//! - o mpr.dll (o net.exe, o explorer) lê a ordem dos provedores de rede em
+//!   `Control\NetworkProvider`.
 //!
 //! O `SYSTEM\Setup` que o lsm.dll também lê não vem daqui: o estado de setup
 //! de uma instalação concluída é o mesmo em toda máquina e sai da tabela
@@ -56,6 +58,13 @@ pub fn system_keys(control_set: &str) -> Vec<HostKey> {
         // Um serviço assinante que o convidado não tem só fica no log: o
         // IsServiceExpectedToStart (0x94594) não espera por ele.
         registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\Control\\Winlogon\\Notifications"), &format!("{control_set}\\Control\\Winlogon\\Notifications"), true, &mut keys);
+        // A ordem dos provedores de rede (HwOrder, Order e ProviderOrder):
+        // o _MprDllInit do mpr.dll abre HwOrder e ProviderOrder com
+        // KEY_READ e, sem elas, o DllMain volta FALSE e o processo que
+        // importa o mpr.dll (o net.exe do `--conta-de-teste`, o explorer)
+        // não inicia (0xC0000142). Os provedores só carregam numa chamada
+        // WNet.
+        registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\Control\\NetworkProvider"), &format!("{control_set}\\Control\\NetworkProvider"), true, &mut keys);
     }
     #[cfg(not(windows))]
     let _ = control_set;
