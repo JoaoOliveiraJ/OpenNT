@@ -453,6 +453,20 @@ fn system_information_classes(assert: Assert) {
     };
     let registrations = [register(1, 0, 0x18), register(1, 0, 0x18), register(0, 0x1234, 0x18), register(0, 0, 0x18), register(0, 0, 0x18), register(1, 0, 0x10)];
     assert(registrations == [0, 0x4000_0000, STATUS_INVALID_PARAMETER, 0, STATUS_INVALID_PARAMETER, 0xC000_0004], "zw-system-information: SystemRegisterFirmwareTableInformationHandler registra, recusa a repeticao e remove so pelo mesmo DriverObject");
+    // Com o DRIVER_OBJECT de um driver carregado (o \Driver\DeviceApi): o
+    // registro segura uma referência dele e a remoção a solta.
+    let device = crate::ntos::io::pnp::device_api::device_object();
+    // SAFETY: o DEVICE_OBJECT vivo do \Device\DeviceApi.
+    let driver = if device != 0 { unsafe { DeviceObject::at(device) }.driver_object.get() } else { 0 };
+    let before = crate::ntos::ob::objects::driver::reference_count(driver);
+    let held = register(1, driver, 0x18);
+    let during = crate::ntos::ob::objects::driver::reference_count(driver);
+    let released = register(0, driver, 0x18);
+    let after = crate::ntos::ob::objects::driver::reference_count(driver);
+    assert(
+        driver != 0 && held == 0 && released == 0 && before.is_some() && during == before.map(|count| count + 1) && after == before,
+        "zw-system-information: o provedor registrado segura uma referencia do DriverObject e a remocao a solta",
+    );
     for block in [returned, buffer, input, handler] {
         guest::free_bytes(block);
     }

@@ -66,6 +66,7 @@ use crate::ntos::inc::field::{Field, NtStruct, Reserved};
 use crate::ntos::inc::types::extra_ps_user::SystemFirmwareTableHandler;
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::io_space;
+use crate::ntos::ob::{object_reference, reference_trace};
 use crate::rtl::{KernelError, SpinLock};
 
 const STATUS_SUCCESS: u32 = 0;
@@ -464,8 +465,11 @@ pub fn register_handler(buffer: u64, length: u32, user: bool) -> u32 {
         if !register {
             return Err(STATUS_INVALID_PARAMETER);
         }
+        // ObfReferenceObject pelo dono do objeto: o DRIVER_OBJECT do OpenNT
+        // não tem OBJECT_HEADER (`ob/objects/driver.rs` conta as
+        // referências).
         if driver_object != 0 {
-            crate::ntos::ob::object_header::reference(driver_object, 1);
+            let _ = object_reference::reference_with_tag(driver_object, reference_trace::DEFAULT_TAG, true);
         }
         providers.list.push(Provider { signature, handler: Handler::Native(routine), driver_object });
         Ok(None)
@@ -473,7 +477,7 @@ pub fn register_handler(buffer: u64, length: u32, user: bool) -> u32 {
     match released {
         Ok(Some(driver_object)) => {
             if driver_object != 0 {
-                crate::ntos::ob::object_header::dereference(driver_object, false);
+                let _ = object_reference::dereference_with_tag(driver_object, reference_trace::DEFAULT_TAG, true);
             }
             0
         }
