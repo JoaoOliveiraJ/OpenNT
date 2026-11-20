@@ -95,7 +95,11 @@ pub fn close_user(handle: u64, force: bool) -> u32 {
     if handle > 0x7FFF_FFFF {
         return STATUS_INVALID_HANDLE;
     }
-    match PROVIDERS.lock().user {
+    // A tabela sai da trava antes do fechamento: a destruição do objeto pode
+    // fechar outros handles (o token LowBox fecha os handles de kernel
+    // guardados) e voltar a este módulo.
+    let table = PROVIDERS.lock().user;
+    match table {
         Some(table) => (table.close)(handle & !3, force),
         None => STATUS_INVALID_HANDLE,
     }
