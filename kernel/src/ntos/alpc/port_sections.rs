@@ -81,7 +81,7 @@ pub fn attach(port: &Arc<Port>, section: &Arc<Section>, creation: Creation) -> R
         handle,
         table: table.clone(),
         section: section.clone(),
-        actual_size: creation.actual_size.unwrap_or(section.size),
+        actual_size: creation.actual_size.unwrap_or(section.size()),
         secure: creation.secure,
         created_backing: creation.created_backing,
         creator_process: creation.creator_process,

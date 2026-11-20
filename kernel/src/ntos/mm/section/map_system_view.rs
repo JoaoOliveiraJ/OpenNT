@@ -29,10 +29,10 @@ pub fn insert(section: &Arc<Section>, size: u64, offset: u64, flags: u64) -> Res
     if size > 0xFFFF_0000 {
         return Ok(Err(0xC000_001F));
     }
-    if size == 0 || offset >= section.size {
+    if size == 0 || offset >= section.size() {
         return Ok(Err(0xC000_0017));
     }
-    if offset as u128 + size as u128 > section.size as u128 {
+    if offset as u128 + size as u128 > section.size() as u128 {
         return Ok(Err(0xC000_001F));
     }
     if let Err(error) = system_image_pages::prepare(section) {

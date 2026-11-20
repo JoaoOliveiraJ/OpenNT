@@ -122,12 +122,12 @@ pub fn map(section: &Arc<Section>, request: &Request, process: u64, regions: Reg
     section_views::register(owned.clone(), process, true);
     let finish = || -> Result<(), KernelError> {
         let dll_name = file.base_name().unwrap_or_else(|| String::from(&name[name.rfind(['\\', '/']).map_or(0, |at| at + 1)..]));
-        if offset == 0 && size == section.size && regions == RegionKind::ProcessImages {
+        if offset == 0 && size == section.size() && regions == RegionKind::ProcessImages {
             crate::ntos::init::initial_process::image_mapped(process, &dll_name);
         }
         // A captura de chamada de teste (`call_capture`) lê os exports das
         // páginas protótipo só quando está armada.
-        if offset == 0 && size == section.size && regions == RegionKind::ProcessImages && state::with(|state| !state.capture_export.is_empty()) {
+        if offset == 0 && size == section.size() && regions == RegionKind::ProcessImages && state::with(|state| !state.capture_export.is_empty()) {
             let exports = image_segment::exports(&segment, image_base)?;
             crate::ntos::ps::user::call_capture::arm(&dll_name, &exports.exports);
         }

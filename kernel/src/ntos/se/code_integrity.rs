@@ -276,7 +276,7 @@ fn open_image(name: &str) -> Result<Request, KernelError> {
         let section = reference.section.clone();
         request.reference = Some(reference);
         let section = section.ok_or_else(|| failure("CI section missing", 0xC000_0008))?;
-        let view = map_system_view::insert(&section, section.size, 0, 1)?.map_err(|status| failure("CI map image section", status))?;
+        let view = map_system_view::insert(&section, section.size(), 0, 1)?.map_err(|status| failure("CI map image section", status))?;
         request.view = Some(view);
         request.section = Some(section);
         Ok(())
@@ -347,9 +347,9 @@ fn validate_kernel_image(source: &Arc<dyn ImageSource>, options: &LoadOptions) -
         let arguments = [
             image_file_object,
             view.base,
-            section.size,
+            section.size(),
             view.base,
-            section.size,
+            section.size(),
             outputs.validation_mode.address(),
             process::get_current_process(),
             0,
@@ -448,9 +448,9 @@ pub fn user_image_signing_level(name: &str) -> Option<Option<u8>> {
         let arguments = [
             image_file_object,
             view.base,
-            section.size,
+            section.size(),
             view.base,
-            section.size,
+            section.size(),
             outputs.validation_mode.address(),
             process::get_current_process(),
             0,

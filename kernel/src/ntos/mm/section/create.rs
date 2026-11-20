@@ -457,7 +457,9 @@ fn create_common(output: u64, access: u32, object_attributes: u64, size_pointer:
                         return Ok(status);
                     }
                 }
-                dimensions = Some(((maximum + 4095) & !4095, true, false));
+                // O SizeOfSection é o tamanho pedido (ou o do arquivo), sem
+                // arredondar; as páginas da seção cobrem até a última.
+                dimensions = Some((maximum, true, false));
             }
             Some(_) => {}
         }
@@ -470,8 +472,8 @@ fn create_common(output: u64, access: u32, object_attributes: u64, size_pointer:
         let outcome = if image {
             sections::create_image(backing.ok_or_else(|| KernelError::new("image section without file"))?, None, request.page_protect, request.flags & 0x400 == 0)?
         } else {
-            let (rounded, committed, large) = dimensions.unwrap_or((0, false, false));
-            sections::create(CreateOptions { size: rounded, page_protect: request.page_protect, attributes: request.attributes, file: backing, large, committed: Some(committed), ..CreateOptions::default() })?
+            let (section_size, committed, large) = dimensions.unwrap_or((0, false, false));
+            sections::create(CreateOptions { size: section_size, page_protect: request.page_protect, attributes: request.attributes, file: backing, large, committed: Some(committed), ..CreateOptions::default() })?
         };
         let section = match outcome {
             Ok(section) => section,

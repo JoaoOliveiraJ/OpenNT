@@ -762,6 +762,11 @@ fn nt_create_section_ex(handle_pointer: u64, access: u64, attributes: u64, size_
     create_section::create_ex(handle_pointer, access as u32, attributes, size_pointer, state::stack_arg32(rsp, 5), state::stack_arg32(rsp, 6), state::stack_arg(rsp, 7), state::stack_arg(rsp, 8), state::stack_arg32(rsp, 9), 1)
 }
 
+/// NtExtendSection(SectionHandle, NewSectionSize*): `mm/section/extend`.
+fn nt_extend_section(section: u64, size_pointer: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
+    crate::ntos::mm::section::extend::nt_extend_section(section, size_pointer, 1)
+}
+
 fn nt_open_section(handle_pointer: u64, access: u64, attributes: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
     open_section::open(handle_pointer, access as u32, attributes, 1)
 }
@@ -817,7 +822,7 @@ fn nt_query_section(handle: u64, class: u64, out: u64, length: u64, rsp: u64) ->
         guest::try_write_bytes(out, &[0; SectionBasicInformation::SIZE as usize])?;
         let information = state::user_struct::<SectionBasicInformation>(out)?;
         information.allocation_attributes.probe_set(section.attributes)?;
-        information.maximum_size.quad_part.probe_set(section.maximum_size as i64)?;
+        information.maximum_size.quad_part.probe_set(section.maximum_size() as i64)?;
         Ok(0)
     })
 }
@@ -858,6 +863,7 @@ pub fn init() {
     state::register_handler("NtClose", nt_close);
     state::register_handler("NtCreateSection", nt_create_section);
     state::register_handler("NtCreateSectionEx", nt_create_section_ex);
+    state::register_handler("NtExtendSection", nt_extend_section);
     state::register_handler("NtMapViewOfSectionEx", nt_map_view_of_section_ex);
     state::register_handler("NtOpenSection", nt_open_section);
     state::register_handler("NtMapViewOfSection", nt_map_view_of_section);

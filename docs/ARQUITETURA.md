@@ -1619,6 +1619,18 @@ além da KUSER_SHARED_DATA:
   que `ob/objects/section.rs` aplica às seções marcadas. Vistas dela (o
   MiMapViewOfPhysicalSection) ainda não existem: o NtMapViewOfSection
   recusa com uma linha `[section]` na serial.
+- **NtExtendSection** (`mm/section/extend.rs`, o MmExtendSection do
+  19041): uma seção de dados de arquivo cresce; a de imagem, a sem arquivo
+  e a de `\Device\PhysicalMemory` dão STATUS_SECTION_NOT_EXTENDED, e um
+  tamanho que não passa do SizeOfSection volta como ele. Acima do arquivo,
+  a seção precisa ser gravável e o arquivo cresce pelo mesmo resize do
+  MmCreateSection (`SectionFile::set_size`, `mm/section/file.rs`); o
+  SizeOfSection e o tamanho em páginas da seção (`Section::extend`, agora
+  atômicos) crescem, com as páginas novas confirmadas na control area como
+  na criação, e as vistas novas cobrem a faixa nova. O NewSectionSize volta
+  com o tamanho que ficou, qualquer que seja o status. Como no 19041, a
+  seção de arquivo guarda o SizeOfSection pedido (ou o tamanho do arquivo)
+  sem arredondar à página.
 - **NtCreateSectionEx e NtMapViewOfSectionEx** (`mm/section/create.rs`,
   `mm/section/map_view.rs`): os parâmetros estendidos passam pelas capturas
   do 19041 (`mm/extended_parameters.rs`: o vetor sondado para escrita, um

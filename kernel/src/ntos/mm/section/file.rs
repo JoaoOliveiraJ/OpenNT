@@ -147,6 +147,21 @@ impl SectionFile for CapturedFile {
         self.size.load(Ordering::Acquire)
     }
 
+    /// O EndOfFile de agora: o do volume, ou o da fonte do FILE_OBJECT de
+    /// um arquivo aberto pelo modo usuário.
+    fn file_size(&self) -> u64 {
+        if let Some(stat) = self.backing.as_ref().and_then(|(volume, path)| volume.stat(path)) {
+            return stat.size;
+        }
+        self.source.as_ref().map_or_else(|| self.size(), |source| source.size())
+    }
+
+    /// O FsRtlSetFileSize do MmExtendSection: o mesmo [`CapturedFile::resize`]
+    /// do MmCreateSection.
+    fn set_size(&self, length: u64) -> Option<Result<u32, KernelError>> {
+        Some(self.resize(length))
+    }
+
     /// Bytes desligados (arquivo apagado com seção viva) têm precedência.
     fn read_at(&self, offset: u64, length: u64) -> Result<Vec<u8>, KernelError> {
         if let Some(detached) = file_lifetime::read_detached(self.backing_reference.load(Ordering::Acquire), offset as usize, length as usize) {

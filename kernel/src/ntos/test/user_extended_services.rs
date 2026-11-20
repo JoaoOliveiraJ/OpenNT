@@ -3,7 +3,7 @@
 //! volume sem buffer intermediário, o NtCreateSectionEx e o
 //! NtMapViewOfSectionEx com os parâmetros estendidos, e o
 //! NtSetCachedSigningLevel(2) de modo usuário (com uma SeCiCallbacks de
-//! teste quando a ci.dll não está carregada).
+//! teste quando a ci.dll não está carregada) e o NtExtendSection.
 
 use crate::ntos::inc::field::NtStruct;
 use crate::ntos::inc::types::{EventBasicInformation, Eprocess};
@@ -29,6 +29,9 @@ const STATUS_MAPPED_ALIGNMENT: u32 = 0xC000_0220;
 const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
 const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
 const SCATTER_FILE: &str = "\\??\\D:\\OPENNTSCATTER.BIN";
+const EXTEND_FILE: &str = "\\??\\D:\\OPENNTEXTEND.BIN";
+const STATUS_SECTION_TOO_BIG: u32 = 0xC000_0040;
+const STATUS_SECTION_NOT_EXTENDED: u32 = 0xC000_0087;
 
 pub fn run(assert: Assert) {
     let Ok(block) = memory::map_user_region(0x4000) else {
@@ -40,6 +43,7 @@ pub fn run(assert: Assert) {
     scatter_gather(assert, block, rsp, &call);
     sections_ex(assert, block, rsp, &call);
     set_signing_level(assert, block, rsp, &call);
+    extend_section(assert, block, rsp, &call);
     if let Some(region) = memory::find_region(block) {
         memory::release_private_region(&region);
     }
@@ -412,6 +416,110 @@ fn set_signing_level(assert: Assert, block: u64, rsp: u64, call: Call) {
         with_path == 0x1234 && captured_length == 22 && captured_pointer != 0 && captured_pointer != information + 8 && short_information == STATUS_INVALID_PARAMETER_6 && odd_path == STATUS_INVALID_PARAMETER
             && unaligned_information == STATUS_DATATYPE_MISALIGNMENT && (!not_light || unprotected == STATUS_ACCESS_DENIED) && accepted == 0x1234 && accepted_level == 0x0C && refused == 0x1234 && refused_level == 0x08,
         &alloc::format!("extended: NtSetCachedSigningLevel2 captura o caminho do catalogo e o nivel do processo PPL ({with_path:#x}/{captured_length}/{captured_pointer:#x}, curto {short_information:#x}, impar {odd_path:#x}, alinhamento {unaligned_information:#x}, sem PPL {unprotected:#x}, PPL {accepted:#x}/{accepted_level:#x} {refused:#x}/{refused_level:#x})"),
+    );
+}
+
+/// NtExtendSection numa seção de dados de um arquivo do volume: um tamanho
+/// menor volta como o SizeOfSection; um maior estende o arquivo e a seção
+/// (NtQuerySection, FileStandardInformation e uma vista da seção inteira);
+/// a seção só leitura cresce até o arquivo e não além dele; a seção sem
+/// arquivo, o tamanho acima do máximo, o handle sem SECTION_EXTEND_SIZE e o
+/// ponteiro desalinhado são recusados.
+fn extend_section(assert: Assert, block: u64, rsp: u64, call: Call) {
+    let (out, iosb, cells, data, info) = (block + 0xC00, block + 0xC10, block + 0xC40, block + 0x1000, block + 0xD00);
+    guest::write64(out, 0);
+    let created = file_io::open(out, EXTEND_FILE, iosb, 5, &OpenRequest { access: 0xC010_0000, share: 7, options: 0x20, ..OpenRequest::default() }).unwrap_or(1);
+    let file = guest::read64(out);
+    guest::write_bytes(data, &[0x5A; 0x1800]);
+    guest::write64(rsp + 0x28, iosb);
+    guest::write64(rsp + 0x30, data);
+    guest::write32(rsp + 0x38, 0x1800);
+    guest::write64(rsp + 0x40, 0);
+    guest::write64(rsp + 0x48, 0);
+    let written = call("NtWriteFile", file, 0, 0, 0);
+    // NtCreateSection(handle*, access, NULL, size*, protect, SEC_COMMIT, file).
+    let create = |access: u64, size: u64, protect: u64, file: u64| {
+        guest::write64(cells, 0);
+        guest::write64(cells + 8, size);
+        guest::write64(rsp + 0x28, protect);
+        guest::write64(rsp + 0x30, 0x0800_0000);
+        guest::write64(rsp + 0x38, file);
+        let status = call("NtCreateSection", cells, access, 0, if size != 0 || file == 0 { cells + 8 } else { 0 });
+        (status, guest::read64(cells))
+    };
+    let extend = |section: u64, size: u64| {
+        guest::write64(cells + 0x10, size);
+        let status = call("NtExtendSection", section, cells + 0x10, 0, 0);
+        (status, guest::read64(cells + 0x10))
+    };
+    // O SizeOfSection pelo objeto (o MaximumSize do NtQuerySection).
+    let maximum = |section: u64| {
+        use crate::ntos::mm::section::handles::{self as section_handles, Kind};
+        match section_handles::reference(section, Kind::Section, 0, 0) {
+            Ok(reference) => {
+                let size = reference.section.as_ref().map_or(u64::MAX, |section| section.maximum_size());
+                let _ = reference.release();
+                size
+            }
+            Err(status) => 0xDEAD_0000_0000_0000 | status as u64,
+        }
+    };
+    let end_of_file = || {
+        guest::write64(rsp + 0x28, 5);
+        if call("NtQueryInformationFile", file, iosb, info, 24) == 0 { guest::read64(info + 8) } else { u64::MAX }
+    };
+    let (section_created, section) = create(0xF_001F, 0, 4, file);
+    let initial = maximum(section);
+    let smaller = extend(section, 0x1000);
+    let larger = extend(section, 0x5000);
+    let grown = maximum(section);
+    let file_grown = end_of_file();
+    // A vista da seção inteira depois de crescer: NtMapViewOfSection(section,
+    // process, base*, 0, 0, offset*, viewSize*, ViewUnmap, 0, PAGE_READWRITE).
+    guest::write64(cells + 0x18, 0);
+    guest::write64(cells + 0x20, 0);
+    guest::write64(cells + 0x28, 0);
+    guest::write64(rsp + 0x28, 0);
+    guest::write64(rsp + 0x30, cells + 0x28);
+    guest::write64(rsp + 0x38, cells + 0x20);
+    guest::write64(rsp + 0x40, 2);
+    guest::write64(rsp + 0x48, 0);
+    guest::write64(rsp + 0x50, 4);
+    let mapped = call("NtMapViewOfSection", section, u64::MAX, cells + 0x18, 0);
+    let (view, view_size) = (guest::read64(cells + 0x18), guest::read64(cells + 0x20));
+    let (first, last) = if mapped == 0 { (guest::try_read::<u8>(view).map_or(0x100, u32::from), guest::try_read::<u8>(view + 0x4FFF).map_or(0x100, u32::from)) } else { (0x200, 0x200) };
+    let contents = (first, last) == (0x5A, 0);
+    if mapped == 0 {
+        let _ = call("NtUnmapViewOfSection", u64::MAX, view, 0, 0);
+    }
+    let shrink = extend(section, 0x3000);
+    let too_big = extend(section, 0x40_0000_0000_0000);
+    guest::write64(cells + 0x30, 0x6000);
+    let misaligned = call("NtExtendSection", section, cells + 0x2E, 0, 0);
+    let _ = state::close_user_handle(section, true, false);
+    assert(
+        created == 0 && written == 0 && section_created == 0 && initial == 0x1800 && smaller == (0, 0x1800) && larger == (0, 0x5000) && grown == 0x5000 && file_grown == 0x5000
+            && mapped == 0 && view_size == 0x5000 && contents && shrink == (0, 0x5000) && too_big == (STATUS_SECTION_TOO_BIG, 0x40_0000_0000_0000) && misaligned == STATUS_DATATYPE_MISALIGNMENT,
+        &alloc::format!("extended: NtExtendSection estende o arquivo e a secao (abertura {created:#x}/{written:#x}, secao {section_created:#x}, inicial {initial:#x}, menor {smaller:x?}, maior {larger:x?}, consulta {grown:#x}, arquivo {file_grown:#x}, vista {mapped:#x}/{view_size:#x}/{first:#x}/{last:#x}, de novo {shrink:x?}, grande {too_big:x?}, alinhamento {misaligned:#x})"),
+    );
+    // Só leitura: cresce até o arquivo (0x5000), não além.
+    let (read_only_created, read_only) = create(0xF_001F, 0x1000, 2, file);
+    let within = extend(read_only, 0x3000);
+    let beyond = extend(read_only, 0x6000).0;
+    let _ = state::close_user_handle(read_only, true, false);
+    // SECTION_QUERY | SECTION_MAP_READ, sem SECTION_EXTEND_SIZE.
+    let (query_created, query_only) = create(0x5, 0, 2, file);
+    let denied = extend(query_only, 0x6000).0;
+    let _ = state::close_user_handle(query_only, true, false);
+    let (pagefile_created, pagefile) = create(0xF_001F, 0x1000, 4, 0);
+    let pagefile_extend = extend(pagefile, 0x2000).0;
+    let _ = state::close_user_handle(pagefile, true, false);
+    let final_size = end_of_file();
+    let _ = state::close_user_handle(file, true, false);
+    assert(
+        read_only_created == 0 && within == (0, 0x3000) && beyond == STATUS_SECTION_NOT_EXTENDED && query_created == 0 && denied == STATUS_ACCESS_DENIED && pagefile_created == 0
+            && pagefile_extend == STATUS_SECTION_NOT_EXTENDED && final_size == 0x5000,
+        &alloc::format!("extended: NtExtendSection recusa a secao so leitura alem do arquivo, o handle sem SECTION_EXTEND_SIZE e a secao sem arquivo (so leitura {read_only_created:#x}/{within:x?}/{beyond:#x}, acesso {query_created:#x}/{denied:#x}, sem arquivo {pagefile_created:#x}/{pagefile_extend:#x}, arquivo {final_size:#x})"),
     );
 }
 

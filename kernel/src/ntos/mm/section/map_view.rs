@@ -153,7 +153,7 @@ fn map_common(section_handle: u64, process_handle: u64, base_pointer: u64, zero_
             None => None,
         };
         let Some(section) = reference.section.clone() else { return Ok(0xC000_0024) };
-        let traits = SectionTraits { is_image: section.is_image, size: section.size, page_protect: section.page_protect(), cache_flags: section.state.lock().cache_flags };
+        let traits = SectionTraits { is_image: section.is_image, size: section.size(), page_protect: section.page_protect(), cache_flags: section.state.lock().cache_flags };
         let input = MapInput { zero: zero_bits, protect, base, size, offset, allocation, inherit, numa_nodes: 0, commit: commit_size };
         let bounds = match &captured_extended {
             Some(captured) => match extended_bounds(captured, base, size, allocation) {

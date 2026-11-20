@@ -153,7 +153,7 @@ pub fn open(path: &str, primary: &Image) -> Result<Result<Opened, u32>, KernelEr
         let section = reference.section.clone();
         reference.release()?;
         let Some(section) = section else { return Err(KernelError::new("created resource SECTION has no owner")) };
-        let view = match map_system_view::insert(&section, section.size, 0, 0)? {
+        let view = match map_system_view::insert(&section, section.size(), 0, 0)? {
             Ok(view) => view,
             Err(status) => return Ok(Err(status)),
         };

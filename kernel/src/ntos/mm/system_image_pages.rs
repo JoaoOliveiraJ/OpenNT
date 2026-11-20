@@ -48,11 +48,11 @@ fn invalid(message: &str) -> KernelError {
 pub fn layout(section: &Section) -> Result<Vec<ImageRange>, KernelError> {
     let file = section.file.as_ref().ok_or_else(|| invalid("image section without file"))?;
     let image = match image_header::parse_with(file.size(), &|offset, length| file.read_at(offset, length))? {
-        Ok(image) if image.segment_size == section.size => image,
+        Ok(image) if image.segment_size == section.size() => image,
         _ => return Err(invalid("invalid system image section")),
     };
     if image.flat {
-        return Ok(vec![ImageRange { base: 0, length: section.size, file_offset: 0, raw_size: file.size().min(section.size), flags: 0xE000_0000 }]);
+        return Ok(vec![ImageRange { base: 0, length: section.size(), file_offset: 0, raw_size: file.size().min(section.size()), flags: 0xE000_0000 }]);
     }
     let dos = read(file, 0, 64)?;
     let word = |bytes: &[u8], offset: usize| u16::from_le_bytes([bytes[offset], bytes[offset + 1]]);
@@ -73,7 +73,7 @@ pub fn layout(section: &Section) -> Result<Vec<ImageRange>, KernelError> {
         let raw_size = dword(&table, position + 16) as u64;
         let file_offset = dword(&table, position + 20) as u64;
         let length = raw_size.max(dword(&table, position + 8) as u64);
-        if base + length > section.size || file_offset + raw_size > file.size() {
+        if base + length > section.size() || file_offset + raw_size > file.size() {
             return Err(invalid("invalid image section range"));
         }
         ranges.push(ImageRange { base, length, file_offset, raw_size, flags: dword(&table, position + 36) });

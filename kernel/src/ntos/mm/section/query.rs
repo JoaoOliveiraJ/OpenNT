@@ -67,7 +67,7 @@ pub fn query(handle: u64, class: u32, information: u64, length: u64, result_leng
         // SAFETY: buffer de saída de um chamador de modo kernel, com o tamanho conferido.
         let basic = unsafe { SectionBasicInformation::at(information) };
         basic.allocation_attributes.set(section.attributes);
-        basic.maximum_size.quad_part.set(section.maximum_size as i64);
+        basic.maximum_size.quad_part.set(section.maximum_size() as i64);
         if result_length != 0 {
             // SAFETY: PSIZE_T de saída do chamador de modo kernel.
             unsafe { Field::<u64>::at(result_length) }.set(required);

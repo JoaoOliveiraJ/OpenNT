@@ -324,7 +324,7 @@ fn data_sections(assert: Assert) {
         assert(false, "sections: secao de dados criada");
         return;
     };
-    assert(section.pointer() != 0 && section.size == 0x3000 && section.maximum_size == 0x2800 && section.frames().len() == 3, "sections: SEC_COMMIT arredonda e confirma as paginas");
+    assert(section.pointer() != 0 && section.size() == 0x3000 && section.maximum_size() == 0x2800 && section.frames().len() == 3, "sections: SEC_COMMIT arredonda e confirma as paginas");
     let regions = crate::ntos::ps::user::memory::Space::current().regions().len();
     let request = MapRequest { protect: 4, ..MapRequest::default() };
     let first = sections::map(&section, &request);
@@ -499,7 +499,7 @@ fn image_sections(assert: Assert) {
         assert(false, "sections: secao de imagem criada");
         return;
     };
-    assert(image.is_image && image.size == 0x2000 && image.attributes == 0x0100_0000 && system_image_pages::prepare(&image).is_ok() && system_image_pages::protection(&image, 0) == 2 && system_image_pages::protection(&image, 1) == 0x20, "sections: layout PE com cabecalho legivel e codigo executavel");
+    assert(image.is_image && image.size() == 0x2000 && image.attributes == 0x0100_0000 && system_image_pages::prepare(&image).is_ok() && system_image_pages::protection(&image, 0) == 2 && system_image_pages::protection(&image, 1) == 0x20, "sections: layout PE com cabecalho legivel e codigo executavel");
     let Ok(Ok(view)) = sections::map(&image, &MapRequest { protect: 0x80, commit_size: 0x2000, ..MapRequest::default() }) else {
         assert(false, "sections: vista de imagem");
         return;
@@ -659,13 +659,13 @@ fn flat_image_sections(assert: Assert) {
     // página também é aceita, arredondada.
     let mut rounded = minimal_image();
     rounded[0x40 + 80..0x40 + 84].copy_from_slice(&0x1800u32.to_le_bytes());
-    assert(sections::create_image(MemoryFile::new(None, rounded), None, 0x80, false).is_ok_and(|created| created.is_ok_and(|image| image.size == 0x2000 && crate::ntos::ob::objects::section::collect(image.pointer()).is_ok())), "flatimage: SizeOfImage arredondado a pagina");
+    assert(sections::create_image(MemoryFile::new(None, rounded), None, 0x80, false).is_ok_and(|created| created.is_ok_and(|image| image.size() == 0x2000 && crate::ntos::ob::objects::section::collect(image.pointer()).is_ok())), "flatimage: SizeOfImage arredondado a pagina");
     // A vista pelo backing compartilhado (o caminho do MmMapViewInSystemSpace).
     let Ok(Ok(image)) = sections::create_image(MemoryFile::new(None, flat_image()), None, 0x80, false) else {
         assert(false, "flatimage: secao de imagem plana criada");
         return;
     };
-    assert(image.size == 0x2000 && image.attributes == 0x0100_0000 && system_image_pages::prepare(&image).is_ok() && system_image_pages::protection(&image, 0) == 0x80 && system_image_pages::protection(&image, 1) == 0x80, "flatimage: secao de duas paginas, toda PAGE_EXECUTE_WRITECOPY");
+    assert(image.size() == 0x2000 && image.attributes == 0x0100_0000 && system_image_pages::prepare(&image).is_ok() && system_image_pages::protection(&image, 0) == 0x80 && system_image_pages::protection(&image, 1) == 0x80, "flatimage: secao de duas paginas, toda PAGE_EXECUTE_WRITECOPY");
     let Ok(Ok(view)) = sections::map(&image, &MapRequest { protect: 0x80, commit_size: 0x2000, ..MapRequest::default() }) else {
         assert(false, "flatimage: vista do backing compartilhado");
         return;
@@ -737,7 +737,7 @@ fn section_creation(assert: Assert) {
     let status = create_section::create(output, 0xF_001F, 0, size, 4, 0x0800_0000, 0, 0, None);
     let handle = guest::read64(output);
     let pointer = pointer_of(handle);
-    assert(status.is_ok_and(|status| status == 0) && sections::by_pointer(pointer).is_some_and(|section| section.size == 0x3000 && section.frames().len() == 3), "createsection: ZwCreateSection de pagefile confirmado");
+    assert(status.is_ok_and(|status| status == 0) && sections::by_pointer(pointer).is_some_and(|section| section.size() == 0x3000 && section.frames().len() == 3), "createsection: ZwCreateSection de pagefile confirmado");
     assert(open_pointer::close(handle) == Some(0) && sections::by_pointer(pointer).is_none(), "createsection: fechar o ultimo handle destroi a secao");
     // Nome, colisão e OPENIF.
     let attributes = object_attributes_named(block, "\\OpenNtSecaoNt", 0x40);
@@ -778,7 +778,7 @@ fn section_creation(assert: Assert) {
     let from_file = create_section::create_object(output, 0, 0, size, 2, 0x0800_0000, 0, file_object, 0);
     let file_section = guest::read64(output);
     let mapped = sections::by_pointer(file_section);
-    assert(from_file.is_ok_and(|status| status == 0) && mapped.as_ref().is_some_and(|section| section.size == 0x2000 && section.maximum_size == 0x2000 && crate::hal::physical::read_bytes(section.frame(0).unwrap_or(0), 6) == b"OpenNT") && crate::ntos::ob::objects::file::reference_count(file_object) > before && section_objects::file_object(file_section).is_ok_and(|object| object == file_object), "createsection: secao de arquivo le o FILE_OBJECT e retem o arquivo");
+    assert(from_file.is_ok_and(|status| status == 0) && mapped.as_ref().is_some_and(|section| section.size() == 0x2000 && section.maximum_size() == 0x1400 && crate::hal::physical::read_bytes(section.frame(0).unwrap_or(0), 6) == b"OpenNT") && crate::ntos::ob::objects::file::reference_count(file_object) > before && section_objects::file_object(file_section).is_ok_and(|object| object == file_object), "createsection: secao de arquivo le o FILE_OBJECT e retem o arquivo");
     assert(create_section::create_object(output, 0, 0, size, 4, 0x0800_0000, 0, file_object, 0).is_ok_and(|status| status == 0xC000_0022), "createsection: arquivo sem escrita recusa PAGE_READWRITE");
     drop(mapped);
     assert(section_objects::dereference(file_section).is_ok() && sections::by_pointer(file_section).is_none() && crate::ntos::ob::objects::file::reference_count(file_object) == before, "createsection: destruicao solta o arquivo");

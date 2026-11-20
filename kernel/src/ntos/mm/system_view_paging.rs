@@ -158,7 +158,7 @@ fn materialize(record: &RecordRef, incoming: Option<&Arc<Section>>) -> Result<()
         match covering {
             Some(view) => page_in(&view, section_page - view.offset / 4096)?,
             None => {
-                let contains_page = |section: &Section| section.size > section_page * 4096;
+                let contains_page = |section: &Section| section.size() > section_page * 4096;
                 let owner = views.iter().find(|candidate| !candidate.retiring() && contains_page(&candidate.section)).map(|view| view.section.clone());
                 let section = owner.or_else(|| incoming.filter(|section| contains_page(section)).cloned());
                 if let Some(section) = section {

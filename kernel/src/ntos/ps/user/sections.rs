@@ -91,6 +91,15 @@ pub trait SectionFile: Send + Sync {
     fn write_at(&self, _offset: u64, _data: &[u8]) -> Result<(), KernelError> {
         Err(KernelError::with_status("section file is read-only", 0xC000_0185))
     }
+    /// O tamanho do arquivo agora (o FsRtlGetFileSize do MmExtendSection).
+    fn file_size(&self) -> u64 {
+        self.size()
+    }
+    /// Estende o arquivo (o FsRtlSetFileSize do MmExtendSection): o status,
+    /// ou None num arquivo que não cresce.
+    fn set_size(&self, _length: u64) -> Option<Result<u32, KernelError>> {
+        None
+    }
     fn nt_path(&self) -> Option<String> {
         None
     }
@@ -166,8 +175,10 @@ pub struct SectionMut {
 
 pub struct Section {
     pointer: AtomicU64,
-    pub size: u64,
-    pub maximum_size: u64,
+    /// O tamanho em páginas e o SizeOfSection pedido; o NtExtendSection
+    /// os aumenta (`mm/section/extend`).
+    size: AtomicU64,
+    maximum_size: AtomicU64,
     /// Proteção da seção; a CSR rebaixa a da SharedSection depois de
     /// mapeá-la (nenhum cliente obtém vista gravável).
     page_protect: AtomicU32,
@@ -181,6 +192,23 @@ pub struct Section {
 }
 
 impl Section {
+    /// O tamanho da seção arredondado à página (o fim das vistas).
+    pub fn size(&self) -> u64 {
+        self.size.load(Ordering::Acquire)
+    }
+
+    /// O SizeOfSection (o MaximumSize do NtQuerySection).
+    pub fn maximum_size(&self) -> u64 {
+        self.maximum_size.load(Ordering::Acquire)
+    }
+
+    /// A seção estendida para `maximum_size` bytes (o MmExtendSection): o
+    /// SizeOfSection e o tamanho em páginas crescem juntos.
+    pub fn extend(&self, maximum_size: u64) {
+        self.maximum_size.fetch_max(maximum_size, Ordering::AcqRel);
+        self.size.fetch_max((maximum_size + 0xFFF) & !0xFFF, Ordering::AcqRel);
+    }
+
     pub fn page_protect(&self) -> u32 {
         self.page_protect.load(Ordering::SeqCst)
     }
@@ -235,8 +263,8 @@ impl Section {
         self.state.lock().views.len()
     }
 
-    fn count_pages(&self) -> u64 {
-        self.size / PAGE
+    pub fn count_pages(&self) -> u64 {
+        self.size() / PAGE
     }
 }
 
@@ -746,7 +774,7 @@ fn publish_name(name: &str, pointer: u64) -> Result<(), KernelError> {
 }
 
 fn register(section: &Arc<Section>) -> Result<u64, KernelError> {
-    let pointer = section_objects::register(SectionState { size: section.size, name: section.name().unwrap_or_default(), permanent: section.permanent, ..SectionState::default() }, destroy_by_pointer)?;
+    let pointer = section_objects::register(SectionState { size: section.size(), name: section.name().unwrap_or_default(), permanent: section.permanent, ..SectionState::default() }, destroy_by_pointer)?;
     if pointer != 0 {
         section.pointer.store(pointer, Ordering::Release);
         SECTIONS.lock().insert(pointer, section.clone());
@@ -757,8 +785,8 @@ fn register(section: &Arc<Section>) -> Result<u64, KernelError> {
 fn new_section(size: u64, maximum_size: u64, page_protect: u32, attributes: u32, name: Option<String>, file: Option<Arc<dyn SectionFile>>, is_image: bool, no_execute: bool, large: bool, permanent: bool, area: Option<AreaRef>) -> Arc<Section> {
     Arc::new(Section {
         pointer: AtomicU64::new(0),
-        size,
-        maximum_size,
+        size: AtomicU64::new(size),
+        maximum_size: AtomicU64::new(maximum_size),
         page_protect: AtomicU32::new(page_protect),
         attributes,
         file,
@@ -912,9 +940,9 @@ pub fn map(section: &Arc<Section>, options: &MapRequest) -> Result<Mapped, Kerne
     if !compatible(section.is_image, section.page_protect(), options.protect) {
         return Ok(Err(0xC000_004E));
     }
-    let requested: i128 = if options.size != 0 { options.size as i128 } else { section.size as i128 - offset as i128 };
+    let requested: i128 = if options.size != 0 { options.size as i128 } else { section.size() as i128 - offset as i128 };
     let size = if requested <= 0 { 0 } else { (requested as u128).div_ceil(PAGE as u128) * PAGE as u128 };
-    if size == 0 || size > MAX_SAFE_INTEGER as u128 || (!options.reserve && offset as u128 + size > section.size as u128) {
+    if size == 0 || size > MAX_SAFE_INTEGER as u128 || (!options.reserve && offset as u128 + size > section.size() as u128) {
         return Ok(Err(0xC000_001F));
     }
     let size = size as u64;
@@ -972,7 +1000,7 @@ pub fn map(section: &Arc<Section>, options: &MapRequest) -> Result<Mapped, Kerne
         name: section.file.as_ref().and_then(|file| file.nt_path()),
         state: SpinLock::new(ViewMut { regions: options.regions, frames: BTreeMap::new(), private_frames: BTreeMap::new(), committed_pages: BTreeSet::new(), page_protects: BTreeMap::new(), retirement: None, unmapped: false, secured_reads: Vec::new(), system_paging: false, in_page_exceptions: false, release_process_view: None }),
     });
-    let available = section.size.saturating_sub(offset);
+    let available = section.size().saturating_sub(offset);
     let commit_size = options.commit_size.min(size).min(available);
     let status = if commit_size != 0 { commit(section, offset / PAGE, commit_size.div_ceil(PAGE))? } else { 0 };
     if status != 0 {
