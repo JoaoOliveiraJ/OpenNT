@@ -244,6 +244,13 @@ pub fn open_by_name_ex(attributes_pointer: u64, object_type: u64, mode: u8, acce
     let node = object_manager::lookup(&name);
     let pointer = native_pointer_of_node(node);
     if pointer == 0 {
+        // Um diretório do namespace (sem corpo com OBJECT_HEADER aqui)
+        // aberto com outro tipo é STATUS_OBJECT_TYPE_MISMATCH, como o nome
+        // achado com outro tipo no NT, não um nome ausente.
+        let directory = node.and_then(object_manager::node).is_some_and(|snapshot| snapshot.type_name == "Directory");
+        if directory && type_differs(object_type, object_types::directory_type().pointer) {
+            return Ok(signed_status(TYPE_MISMATCH));
+        }
         return Ok(signed_status(NAME_NOT_FOUND));
     }
     if executive_callbacks::exists(pointer) {

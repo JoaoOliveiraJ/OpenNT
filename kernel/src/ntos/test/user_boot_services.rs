@@ -403,6 +403,9 @@ fn executive_timer(assert: Assert, block: u64, rsp: u64, call: Call) {
     let directory = call("NtCreateDirectoryObject", block + 0x648, 0xF, attributes(oa, "\\OpenNtTimerDiretorio"), 0);
     let mismatch = call("NtOpenTimer", opened_cell, 0x1F_0003, attributes(oa, "\\OpenNtTimerDiretorio"), 0);
     let closed = [named_handle, opened_handle, guest::read64(block + 0x648)].map(|handle| call("NtClose", handle, 0, 0, 0));
+    if !(named == 0 && opened == 0 && opened_handle != 0 && opened_handle != named_handle && missing == 0xC000_0034 && directory == 0 && mismatch == 0xC000_0024 && closed == [0, 0, 0]) {
+        crate::debug_print!("[userboot] NtOpenTimer: criado {:#x} ({:#x}), aberto {:#x} ({:#x}), ausente {:#x}, diretorio {:#x}, outro tipo {:#x}, fechados {:x?}", named, named_handle, opened, opened_handle, missing, directory, mismatch, closed);
+    }
     assert(
         named == 0 && opened == 0 && opened_handle != 0 && opened_handle != named_handle && missing == 0xC000_0034 && directory == 0 && mismatch == 0xC000_0024 && closed == [0, 0, 0],
         "userboot: NtOpenTimer abre o ETIMER nomeado e recusa nome ausente e objeto de outro tipo",
