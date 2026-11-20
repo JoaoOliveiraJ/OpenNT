@@ -155,7 +155,9 @@ test-boot:         --keys=TEXTO (\\n = Enter) --expect=TEXTO (repetivel)
                    --capture=ARQ.png (no fim do teste, a tela do QEMU pelo screendump do QMP)
                    --watch-screen (le a tela durante o teste; FIRST_PIXEL_OK na serial quando
                    a tela grafica mostra pixels desenhados e LOGON_SCREEN_OK quando um quarto
-                   ou mais dela esta desenhado com 8 cores ou mais)
+                   ou mais dela esta desenhado com 8 cores ou mais; com DESKTOP_OK no marcador
+                   ou num --expect, DESKTOP_OK depois do EXPLORER_STARTED quando ela mostra o
+                   papel de parede azul do img0 com a barra de tarefas escura embaixo)
                    --capture-every=SEGUNDOS (durante o teste, a tela do QEMU em tela-NNNN.png na
                    --build-dir: a NNNN e a dos NNNN*SEGUNDOS s desde a subida do QEMU, gravada
                    so quando mudou; no fim do teste, passando ou nao, tela-final.png)

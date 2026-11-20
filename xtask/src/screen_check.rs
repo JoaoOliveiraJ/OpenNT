@@ -1,7 +1,8 @@
 //! O que uma tela do QEMU mostra, para a vigia do `test-boot --watch-screen`
 //! (`qemu::screen_thread`): o primeiro desenho depois do boot
-//! ([`drawn_pixels`], o `FIRST_PIXEL_OK`) e a tela de logon ([`logon_screen`]
-//! em duas leituras seguidas iguais, [`same_screen`], o `LOGON_SCREEN_OK`).
+//! ([`drawn_pixels`], o `FIRST_PIXEL_OK`), a tela de logon ([`logon_screen`]
+//! em duas leituras seguidas iguais, [`same_screen`], o `LOGON_SCREEN_OK`) e
+//! a área de trabalho ([`desktop_screen`], o `DESKTOP_OK`).
 
 use std::collections::HashMap;
 
@@ -555,6 +556,250 @@ pub fn lock_dismissed(before: &Image, after: &Image) -> Result<String, String> {
     ))
 }
 
+// ---- área de trabalho ---------------------------------------------------------
+//
+// Numa conta nova do 19041, o perfil Default dá o papel de parede
+// `C:\Windows\Web\Wallpaper\Windows\img0.jpg` (1920x1200: o azul com os
+// feixes de luz e a janela do Windows) em modo Preencher (WallpaperStyle
+// 10) e o fundo preto (Colors\Background 0 0 0). O shell32 desenha o papel
+// de parede na janela da área de trabalho, e o CTranscodedImage troca o
+// img0 padrão pelo `Web\4K\Wallpaper\Windows\img0_1024x768.jpg` quando o
+// monitor principal tem até 1024x768 (_CheckSystemWallpaperForBestMatch,
+// shell32 0x5026a4; sem o arquivo fica o img0.jpg). A barra de tarefas (o
+// tema escuro do sistema, o padrão do 19041) fica embaixo, com 40 linhas a
+// 96 DPI, opaca ou translúcida sobre o papel de parede, com o Iniciar, a
+// caixa de busca, os ícones fixados e a área de notificação. Os limites
+// abaixo vêm das duas imagens decodificadas pelo GDI+ na tela de 1024x768
+// (o img0.jpg reduzido para cobrir a tela e o img0_1024x768.jpg inteiro),
+// com uma barra modelada de 40 linhas: opaca (#101010 ou #202020) ou #202020
+// translúcida de 55% a 85%, com a caixa de busca clara de 344 colunas ou sem
+// ela, em 800x600, 1024x768 e 1280x800:
+//
+// - o fundo acima da barra: 99% dos pixels azuis (o azul passa o vermelho
+//   por 32 ou mais e não fica abaixo do verde), 99% dos vizinhos suaves, 204
+//   a 320 cores com 512 pixels ou mais, cor média de #0287E4 a #038EEA e
+//   verde médio de 166 ou 167 na metade esquerda (a dos feixes de luz) e de
+//   105 a 117 na direita;
+// - o canal mais forte de cada pixel do img0 vai de 169 a 255: nenhum pixel
+//   dele conta como barra;
+// - a barra: 40 linhas (30 e 48 nos outros tamanhos dela) com 56% a 93% dos
+//   pixels escuros; a linha que cruza a caixa de busca clara fica com 32%
+//   (800x600) a 58% (1280x800).
+//
+// Não passam:
+//
+// - a tela de bloqueio (o img100.jpg): 26% de pixels azuis, cor média
+//   #1E3039, mais clara à direita, e o chão escuro da caverna dá centenas
+//   de linhas escuras embaixo;
+// - a cor de destaque com texto (a animação do primeiro logon, o
+//   Bem-vindo, a tela de bugcheck): 1 ou 2 cores;
+// - a área de trabalho sem a barra, ou a barra sobre o fundo preto do
+//   perfil (o papel de parede que não carregou);
+// - a imagem surgindo do preto (o img0 pela metade é todo escuro), memória
+//   lida como cor, ruído e um quadro pela metade.
+
+/// O marcador da área de trabalho.
+pub const DESKTOP_MARKER: &str = "DESKTOP_OK";
+/// A vigia só procura a área de trabalho depois deste marcador na serial:
+/// o explorer.exe que o userinit.exe criou com o token do usuário
+/// (`initial_process.rs`).
+pub const DESKTOP_AFTER: &str = "EXPLORER_STARTED";
+/// Um pixel da barra de tarefas: nenhum canal acima disto.
+const TASKBAR_DARK: u8 = 0x80;
+/// Uma linha é da barra com pelo menos 3/10 dos pixels escuros (a caixa de
+/// busca clara e os ícones tiram até dois terços de uma linha em 800x600).
+const TASKBAR_ROW: (usize, usize) = (3, 10);
+/// A barra, contada de baixo para cima: 30 linhas com botões pequenos, 40 a
+/// 96 DPI, 48 a 120%.
+const TASKBAR_ROWS: core::ops::RangeInclusive<usize> = 24..=72;
+/// Pelo menos 2/5 da barra escura.
+const TASKBAR_SHARE: (usize, usize) = (2, 5);
+/// Um pixel azul do papel de parede: o azul passa o vermelho pelo menos
+/// por isto e não fica abaixo do verde.
+const BLUE_OVER_RED: u16 = 32;
+/// Pelo menos 3/5 do fundo azul.
+const WALLPAPER_BLUE: (usize, usize) = (3, 5);
+/// A cor média do fundo, canal a canal (o img0: #0287E4 a #038EEA).
+const WALLPAPER_MEAN: ([u8; 3], [u8; 3]) = ([0x00, 0x60, 0xB0], [0x30, 0xC0, 0xFF]);
+/// O verde médio da metade esquerda do fundo passa o da direita pelo menos
+/// por isto (o img0: 51 a 61, os feixes de luz à esquerda).
+const WALLPAPER_LEFT_LIGHTER: u64 = 0x18;
+
+fn is_taskbar_dark(rgb: [u8; 3]) -> bool {
+    rgb.iter().all(|&channel| channel <= TASKBAR_DARK)
+}
+
+fn is_wallpaper_blue(rgb: [u8; 3]) -> bool {
+    !is_black(rgb) && u16::from(rgb[2]) >= u16::from(rgb[0]) + BLUE_OVER_RED && rgb[2] >= rgb[1]
+}
+
+/// As medidas de [`desktop_screen`] numa tela gráfica.
+struct DesktopMeasures {
+    width: usize,
+    height: usize,
+    /// As linhas da barra de tarefas, contadas de baixo para cima até a
+    /// primeira com menos de 3/10 dos pixels escuros, e os pixels escuros
+    /// nelas.
+    taskbar: usize,
+    taskbar_dark: usize,
+    /// Os pixels do fundo (as linhas acima da barra), os azuis, os pares de
+    /// vizinhos desenhados na linha e os suaves.
+    wallpaper: usize,
+    blue: usize,
+    pairs: usize,
+    smooth: usize,
+    /// As cores do fundo com pelo menos 1/[`LOGON_COLOR_SHARE`] da tela.
+    colors: usize,
+    /// A cor média do fundo e o verde médio das metades esquerda e direita.
+    mean: [u8; 3],
+    left_green: u64,
+    right_green: u64,
+    /// Pixels do fundo azul da tela de bugcheck.
+    bugcheck: usize,
+}
+
+impl DesktopMeasures {
+    fn of(image: &Image) -> DesktopMeasures {
+        let (width, height) = (image.width, image.height);
+        let rows: Vec<&[u8]> = image.rgb.chunks_exact(width * 3).take(height).collect();
+        let (row_part, row_whole) = TASKBAR_ROW;
+        let (mut taskbar, mut taskbar_dark) = (0, 0);
+        for row in rows.iter().rev() {
+            let dark = row.chunks_exact(3).filter(|pixel| is_taskbar_dark([pixel[0], pixel[1], pixel[2]])).count();
+            if dark * row_whole < width * row_part {
+                break;
+            }
+            taskbar += 1;
+            taskbar_dark += dark;
+        }
+        let above = rows.len() - taskbar;
+        let mut measures = DesktopMeasures { width, height, taskbar, taskbar_dark, wallpaper: above * width, blue: 0, pairs: 0, smooth: 0, colors: 0, mean: [0; 3], left_green: 0, right_green: 0, bugcheck: 0 };
+        let mut colors: HashMap<[u8; 3], usize> = HashMap::new();
+        let mut sums = [0u64; 3];
+        let (mut left, mut right) = (0u64, 0u64);
+        for row in &rows[..above] {
+            let mut previous: Option<[u8; 3]> = None;
+            for (x, pixel) in row.chunks_exact(3).enumerate() {
+                let rgb = [pixel[0], pixel[1], pixel[2]];
+                if rgb == BUGCHECK_BACKGROUND {
+                    measures.bugcheck += 1;
+                }
+                for (sum, channel) in sums.iter_mut().zip(rgb) {
+                    *sum += u64::from(channel);
+                }
+                if x < width / 2 {
+                    left += u64::from(rgb[1]);
+                } else {
+                    right += u64::from(rgb[1]);
+                }
+                *colors.entry(rgb).or_default() += 1;
+                if is_wallpaper_blue(rgb) {
+                    measures.blue += 1;
+                }
+                if is_black(rgb) {
+                    previous = None;
+                    continue;
+                }
+                if let Some(before) = previous {
+                    measures.pairs += 1;
+                    if before.iter().zip(rgb).all(|(&a, b)| a.abs_diff(b) <= SMOOTH_STEP) {
+                        measures.smooth += 1;
+                    }
+                }
+                previous = Some(rgb);
+            }
+        }
+        let minimum = measures.color_minimum();
+        measures.colors = colors.values().filter(|&&count| count >= minimum).count();
+        let count = measures.wallpaper.max(1) as u64;
+        measures.mean = sums.map(|sum| (sum / count) as u8);
+        measures.left_green = left / (above * (width / 2)).max(1) as u64;
+        measures.right_green = right / (above * (width - width / 2)).max(1) as u64;
+        measures
+    }
+
+    fn total(&self) -> usize {
+        self.width * self.height
+    }
+
+    /// Os pixels que uma cor do fundo precisa ter para contar.
+    fn color_minimum(&self) -> usize {
+        (self.total() / LOGON_COLOR_SHARE).max(1)
+    }
+
+    /// O que falta para ser a área de trabalho (vazio: nada).
+    fn missing(&self) -> Vec<String> {
+        let percent = LogonMeasures::percent;
+        let mut missing = Vec::new();
+        if self.bugcheck * 2 > self.total() {
+            missing.push("e a tela de bugcheck".to_string());
+        }
+        if !TASKBAR_ROWS.contains(&self.taskbar) {
+            missing.push(format!("barra de tarefas escura de {} linhas embaixo (de {} a {})", self.taskbar, TASKBAR_ROWS.start(), TASKBAR_ROWS.end()));
+        } else if self.taskbar_dark * TASKBAR_SHARE.1 < self.taskbar * self.width * TASKBAR_SHARE.0 {
+            missing.push(format!("{}% da barra de tarefas escura (minimo {}%)", percent(self.taskbar_dark, self.taskbar * self.width), 100 * TASKBAR_SHARE.0 / TASKBAR_SHARE.1));
+        }
+        if self.blue * WALLPAPER_BLUE.1 < self.wallpaper * WALLPAPER_BLUE.0 {
+            missing.push(format!("{}% do fundo azul (minimo {}%)", percent(self.blue, self.wallpaper), 100 * WALLPAPER_BLUE.0 / WALLPAPER_BLUE.1));
+        }
+        if self.smooth * LOGON_SMOOTH_DIVISOR < self.pairs {
+            missing.push(format!("{}% dos vizinhos do fundo suaves (minimo {}%)", percent(self.smooth, self.pairs), 100 / LOGON_SMOOTH_DIVISOR));
+        }
+        if self.colors < LOGON_COLORS {
+            missing.push(format!("{} cores do fundo com {} pixels ou mais (minimo {LOGON_COLORS})", self.colors, self.color_minimum()));
+        }
+        let (low, high) = WALLPAPER_MEAN;
+        if (0..3).any(|channel| self.mean[channel] < low[channel] || self.mean[channel] > high[channel]) {
+            missing.push(format!(
+                "cor media do fundo #{:02x}{:02x}{:02x} (de #{:02x}{:02x}{:02x} a #{:02x}{:02x}{:02x})",
+                self.mean[0], self.mean[1], self.mean[2], low[0], low[1], low[2], high[0], high[1], high[2]
+            ));
+        }
+        if self.left_green < self.right_green + WALLPAPER_LEFT_LIGHTER {
+            missing.push(format!("verde medio de {} a esquerda e {} a direita (minimo {WALLPAPER_LEFT_LIGHTER} a mais a esquerda)", self.left_green, self.right_green));
+        }
+        missing
+    }
+
+    fn describe(&self) -> String {
+        format!(
+            "barra de tarefas de {} linhas embaixo ({}% escura); fundo: {}% azul, {}% dos vizinhos suaves, {} cores com {} pixels ou mais, cor media #{:02x}{:02x}{:02x}, verde medio {} a esquerda e {} a direita",
+            self.taskbar,
+            LogonMeasures::percent(self.taskbar_dark, self.taskbar * self.width),
+            LogonMeasures::percent(self.blue, self.wallpaper),
+            LogonMeasures::percent(self.smooth, self.pairs),
+            self.colors,
+            self.color_minimum(),
+            self.mean[0],
+            self.mean[1],
+            self.mean[2],
+            self.left_green,
+            self.right_green
+        )
+    }
+}
+
+/// A área de trabalho do Windows 10 numa tela do QEMU: a descrição dela, ou
+/// o que falta. É uma tela gráfica ([`is_graphics`]) que não é a de
+/// bugcheck, com a barra de tarefas escura embaixo (de 24 a 72 linhas, cada
+/// uma com 3/10 ou mais dos pixels escuros, e 2/5 ou mais da barra) e, acima
+/// dela, o papel de parede azul do img0: 3/5 ou mais dos pixels azuis, a
+/// maior parte dos vizinhos suaves, pelo menos [`LOGON_COLORS`] cores de
+/// 1/[`LOGON_COLOR_SHARE`] da tela, a cor média dele e a metade esquerda
+/// mais clara (os números medidos estão acima).
+pub fn desktop_screen(image: &Image) -> Result<String, String> {
+    if !is_graphics(image) {
+        return Err(format!("tela {}x{}, nao e uma tela grafica de 800x600 ou mais", image.width, image.height));
+    }
+    let measures = DesktopMeasures::of(image);
+    let missing = measures.missing();
+    if missing.is_empty() {
+        Ok(measures.describe())
+    } else {
+        Err(missing.join("; "))
+    }
+}
+
 /// Telas sintéticas para os testes da vigia.
 #[cfg(test)]
 pub mod samples {
@@ -672,6 +917,62 @@ pub mod samples {
             })
             .collect();
         Image { width: WIDTH, height: HEIGHT, rgb }
+    }
+
+    /// Um papel de parede com a forma do img0_1024x768.jpg: o azul, mais
+    /// claro à esquerda, onde ficam os feixes de luz, em 16 faixas de 64
+    /// colunas por 8 de 96 linhas (128 tons de 6144 pixels cada, como as
+    /// centenas de tons de 512 pixels ou mais do img0).
+    pub fn wallpaper() -> Image {
+        let mut image = filled(WIDTH, HEIGHT, [0, 0, 0]);
+        paint(&mut image, 0..WIDTH, 0..HEIGHT, |x, y| {
+            let (column, row) = ((x / 64) as u8, (y / 96) as u8);
+            [0x02, 0xB0 - column * 5 + row, 0xF8 - column * 3]
+        });
+        image
+    }
+
+    /// A barra de tarefas escura nas `height` linhas de baixo: #202020 com
+    /// opacidade `alpha`/256 sobre o que está embaixo (256 = opaca), o
+    /// logotipo do Iniciar, a caixa de busca clara de 344 colunas
+    /// (`search_box`), os botões da Cortana e da Visão de Tarefas, quatro
+    /// ícones fixados coloridos e a área de notificação com o relógio, todos
+    /// cheios (o pior caso para a parte escura da barra).
+    pub fn taskbar(image: &mut Image, height: usize, alpha: u32, search_box: bool) {
+        const WHITE: [u8; 3] = [0xFF, 0xFF, 0xFF];
+        let (width, top) = (image.width, image.height - height);
+        let middle = top + height / 2;
+        for channel in &mut image.rgb[top * width * 3..] {
+            *channel = ((0x20 * alpha + u32::from(*channel) * (256 - alpha)) / 256) as u8;
+        }
+        for (x, y) in [(16, middle - 8), (25, middle - 8), (16, middle + 1), (25, middle + 1)] {
+            paint(image, x..x + 7, y..y + 7, |_, _| WHITE);
+        }
+        if search_box {
+            let bottom = image.height - 4;
+            paint(image, 48..392, top + 4..bottom, |_, _| [0xF2, 0xF2, 0xF2]);
+            paint(image, 60..74, middle - 7..middle + 7, |_, _| [0x20, 0x20, 0x20]);
+        }
+        paint(image, 408..424, middle - 8..middle + 8, |_, _| WHITE);
+        for (x, y) in [(454..474, middle - 8..middle - 6), (454..474, middle + 6..middle + 8), (454..456, middle - 8..middle + 8), (472..474, middle - 8..middle + 8)] {
+            paint(image, x, y, |_, _| WHITE);
+        }
+        for (index, color) in [[0x00, 0x78, 0xD7], [0xF8, 0xD7, 0x75], [0x00, 0x78, 0xD7], [0x00, 0x63, 0xB1]].into_iter().enumerate() {
+            let left = 500 + index * 48;
+            paint(image, left..left + 24, middle - 12..middle + 12, |_, _| color);
+        }
+        for left in [width - 200, width - 176, width - 152, width - 32] {
+            paint(image, left..left + 16, middle - 8..middle + 8, |_, _| WHITE);
+        }
+        paint(image, width - 120..width - 60, middle - 12..middle - 4, |_, _| WHITE);
+        paint(image, width - 120..width - 60, middle + 4..middle + 12, |_, _| WHITE);
+    }
+
+    /// A área de trabalho: o [`wallpaper`] com a [`taskbar`].
+    pub fn desktop(height: usize, alpha: u32, search_box: bool) -> Image {
+        let mut image = wallpaper();
+        taskbar(&mut image, height, alpha, search_box);
+        image
     }
 }
 
@@ -857,5 +1158,63 @@ mod tests {
         faded.rgb.iter_mut().for_each(|channel| *channel /= 2);
         assert!(!same_screen(&twelve, &faded), "transicao");
         assert!(!same_screen(&twelve, &filled(800, 600, [0, 0, 0])));
+    }
+
+    /// A área de trabalho sintética passa com a barra opaca ou translúcida
+    /// (60%), com e sem a caixa de busca clara e nas alturas da barra do
+    /// Windows 10 (30 linhas com botões pequenos, 40 a 96 DPI, 48 a 120%).
+    #[test]
+    fn desktop_passes_with_the_taskbar_opaque_or_translucent() {
+        for (height, alpha, search_box) in [(40, 256, true), (40, 256, false), (40, 154, true), (30, 256, true), (48, 256, true)] {
+            let description = desktop_screen(&desktop(height, alpha, search_box)).unwrap_or_else(|missing| panic!("{height} {alpha} {search_box}: {missing}"));
+            assert!(description.starts_with(&format!("barra de tarefas de {height} linhas embaixo")), "{description}");
+            assert!(description.contains("128 cores com 512 pixels ou mais"), "{description}");
+        }
+        let measures = DesktopMeasures::of(&desktop(40, 256, true));
+        assert_eq!((measures.left_green, measures.right_green), (161, 121));
+    }
+
+    /// Sem a barra de tarefas, sem o papel de parede azul do img0 (uma cor
+    /// lisa, o preto do fundo do perfil, a tela de bloqueio) ou com a barra
+    /// alta demais, não é a área de trabalho; a tela de bugcheck e a de
+    /// texto também não.
+    #[test]
+    fn desktop_needs_the_taskbar_and_the_blue_wallpaper() {
+        let missing = desktop_screen(&wallpaper()).unwrap_err();
+        assert!(missing.starts_with("barra de tarefas escura de 0 linhas embaixo"), "{missing}");
+        assert!(desktop_screen(&desktop(96, 256, true)).unwrap_err().contains("96 linhas"));
+        let mut accent = filled(WIDTH, HEIGHT, [0x00, 0x78, 0xD7]);
+        taskbar(&mut accent, 40, 256, true);
+        let missing = desktop_screen(&accent).unwrap_err();
+        assert!(missing.starts_with("1 cores do fundo") && missing.contains("verde medio"), "{missing}");
+        let mut black = filled(WIDTH, HEIGHT, [0, 0, 0]);
+        taskbar(&mut black, 40, 256, true);
+        assert!(desktop_screen(&black).unwrap_err().contains("768 linhas"));
+        for clock_too in [false, true] {
+            let mut lock = lock_screen(clock_too);
+            assert!(desktop_screen(&lock).unwrap_err().contains("do fundo azul"));
+            taskbar(&mut lock, 40, 256, true);
+            assert!(desktop_screen(&lock).unwrap_err().contains("do fundo azul"));
+        }
+        assert!(desktop_screen(&filled(WIDTH, HEIGHT, BUGCHECK_BACKGROUND)).unwrap_err().contains("bugcheck"));
+        assert!(desktop_screen(&filled(720, 400, [0xAA, 0xAA, 0xAA])).unwrap_err().contains("720x400"));
+    }
+
+    /// Lixo cobrindo a tela, um quadro pela metade e a imagem surgindo do
+    /// preto não são a área de trabalho.
+    #[test]
+    fn memory_noise_and_partial_frames_are_not_a_desktop() {
+        assert!(desktop_screen(&memory_as_pixels()).unwrap_err().contains("dos vizinhos do fundo suaves"));
+        assert!(desktop_screen(&noise()).unwrap_err().contains("0 cores do fundo"));
+        let full = desktop(40, 256, true);
+        assert!(desktop_screen(&only_rows(&full, 0..HEIGHT / 2)).unwrap_err().contains("384 linhas"));
+        assert!(desktop_screen(&only_rows(&full, HEIGHT / 2..HEIGHT)).unwrap_err().contains("do fundo azul"));
+        for half in [0..WIDTH / 2, WIDTH / 2..WIDTH] {
+            assert!(desktop_screen(&only_columns(&full, half.clone())).unwrap_err().contains("768 linhas"), "{half:?}");
+        }
+        let mut faded = full.clone();
+        faded.rgb.iter_mut().for_each(|channel| *channel /= 2);
+        assert!(desktop_screen(&faded).is_err());
+        assert!(!same_screen(&full, &faded));
     }
 }
