@@ -230,6 +230,19 @@ fn agent_tools_against_the_fake_stub() {
     assert_eq!(failed["ok"], false);
     assert_eq!(failed["failed_line"], 2);
     assert!(failed["error"].as_str().unwrap().contains("nada-disso"), "{failed}");
+    // O executor é o do opennt-kd: blocos, laços, ${texto}, a COM1 da sessão
+    // no wait-serial; o detach é recusado na linha dele.
+    let language = "set alvo smss.exe\nrepeat 2 i {\n  echo volta ${i}\n}\nif serial-has HELLO_KERNEL_OK {\n  echo com1 ${alvo}\n}\nwait-serial /t 2000 criou csrss.exe\nsleep $i\ndetach\necho nunca\n";
+    let report = call(&mut server, &mut engine, 41, "kd_script", json!({"script": language, "timeout_ms": 20000}));
+    assert_eq!(report["ok"], false, "{report}");
+    assert_eq!(report["failed_line"], 10, "{report}");
+    assert!(report["error"].as_str().unwrap().contains("use a ferramenta detach"), "{report}");
+    assert_eq!(report["variables"]["alvo"], "smss.exe");
+    assert_eq!(report["variables"]["i"], "0x1");
+    let log: Vec<&str> = report["log"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+    assert!(log.contains(&"  volta 0x1") && log.contains(&"  com1 smss.exe") && log.contains(&"> wait-serial /t 2000 criou csrss.exe"), "{log:?}");
+    assert!(!log.iter().any(|line| line.contains("nunca")), "{log:?}");
+    assert!(engine.client.as_ref().unwrap().is_stopped());
 
     // O texto já na COM1: volta sem continuar; depois, até o breakpoint.
     let found = call(&mut server, &mut engine, 5, "continue_until", json!({"marker": "HELLO_KERNEL_OK", "from_start": true}));

@@ -28,18 +28,19 @@ use std::time::{Duration, Instant};
 use opennt_kd::bugcheck::Analysis;
 use opennt_kd::client::{BreakpointRequest, Resumed};
 use opennt_kd::commands::TraceOptions;
+use opennt_kd::kd_script::{self, ScriptHost, ScriptOptions, ScriptOutcome};
 use opennt_kd::monitor::{Process, Processor, Thread};
 use opennt_kd::rsp::Connection;
 use opennt_kd::trace::{self, Class, Source, Trace};
 use opennt_kd::types::Field;
 use opennt_kd::unwind::Method;
 use opennt_kd::user::ProcessContext;
-use opennt_kd::{registers, Breakpoint, BreakpointKind, Client};
+use opennt_kd::{parse_number, registers, Breakpoint, BreakpointKind, Client};
 
 use crate::details::{self, KthreadLayout, PdbStatus, ThreadDetail};
 use crate::disasm::{self, Line};
 use crate::launcher::{Launch, LaunchOptions, CANCELLED};
-use crate::script::{self, Step};
+use crate::script::{self, PanelLine};
 use crate::session::{self, SessionFile};
 use crate::source::{Local, LineTable};
 
@@ -879,9 +880,7 @@ impl Worker {
     fn forward_console(&mut self) {
         let Some(client) = self.client.as_mut() else { return };
         let text = client.take_console();
-        if !text.is_empty() {
-            self.publish(|shared| shared.console.push_str(&text));
-        }
+        self.publish_console(text);
     }
 
     fn tail_serial(&mut self) {
@@ -1353,202 +1352,68 @@ impl Worker {
         Ok(refresh)
     }
 
-    fn client_mut(&mut self) -> Result<&mut Client, String> {
-        self.client.as_mut().ok_or_else(|| "sem conexao com o alvo".to_string())
-    }
-
     /// O estado do alvo (rodando ou parado) durante um roteiro, sem montar o
     /// snapshot (ele fica para o fim do roteiro).
-    fn publish_run_state(&self) {
-        let status = match &self.client {
-            Some(client) if client.is_stopped() => Status::Stopped,
-            Some(_) => Status::Running,
-            None => return,
-        };
+    fn publish_run_state(&self, client: &Client) {
+        let status = if client.is_stopped() { Status::Stopped } else { Status::Running };
         let changed = self.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).status != status;
         if changed {
             self.set_status(status);
         }
     }
 
-    /// Roda um roteiro do kd (a linguagem do `--script` do test-boot): o
-    /// roteiro é lido inteiro antes (um erro de uso não deixa a máquina
-    /// andar), cada linha vai ao painel de comandos na hora, o Cancelar
-    /// para entre uma linha e outra e dentro das esperas, e a primeira
+    /// O DbgPrint novo no painel.
+    fn publish_console(&self, text: String) {
+        if !text.is_empty() {
+            self.publish(|shared| shared.console.push_str(&text));
+        }
+    }
+
+    /// Roda um roteiro do kd pelo executor do opennt-kd (a linguagem do
+    /// `--script` do test-boot, com blocos, laços e tratadores): o roteiro
+    /// é conferido inteiro antes (um erro de sintaxe não deixa a máquina
+    /// andar), cada comando vai ao painel de comandos na hora, o Cancelar
+    /// para entre um comando e outro e dentro das esperas, e a primeira
     /// conferência ou comando que falha encerra, como no test-boot.
     fn run_script(&mut self, name: &str, text: &str) -> Result<bool, String> {
-        let lines = match script::parse(text) {
-            Ok(lines) => lines,
-            Err(error) => {
-                self.transcript("(roteiro)", Err(format!("{name}: o roteiro nao rodou:\n{error}")));
-                return Ok(false);
-            }
-        };
+        if let Err((line, error)) = kd_script::check_script(text) {
+            self.transcript("(roteiro)", Err(format!("{name}: o roteiro nao rodou:\nlinha {line}: {error}")));
+            return Ok(false);
+        }
+        let Some(mut client) = self.client.take() else { return Err("sem conexao com o alvo".into()) };
         self.cancel.store(false, Ordering::SeqCst);
         let started = Instant::now();
-        let total = lines.len();
+        let (order, total) = script::command_lines(text);
         self.transcript("(roteiro)", Ok(format!("{name}: {total} linhas de comando")));
-        let mut last_output = String::new();
-        let mut failure: Option<String> = None;
-        for (index, line) in lines.iter().enumerate() {
-            if self.cancel.swap(false, Ordering::SeqCst) {
-                failure = Some(format!("linha {}: parado pelo usuario antes dela (Cancelar)", line.number));
-                break;
-            }
-            let progress = ScriptProgress { name: name.to_string(), line: line.number, index: index + 1, total, text: line.text.clone() };
-            self.publish(|shared| shared.script = Some(progress));
-            self.set_activity(&format!("roteiro {}/{total}: {}", index + 1, line.text));
-            let input = format!("{}    # roteiro, linha {}", line.text, line.number);
-            let result = self.script_step(&line.step, &mut last_output);
-            self.forward_console();
-            self.publish_run_state();
-            match result {
-                Ok(output) => self.transcript(&input, Ok(output)),
-                Err(error) => {
-                    self.transcript(&input, Err(error.clone()));
-                    failure = Some(if is_connection_error(&error) { error } else { format!("linha {}: {}: {error}", line.number, line.text) });
-                    break;
-                }
+        let options = ScriptOptions { name: name.to_string(), ..ScriptOptions::default() };
+        let mut host = WindowScript { worker: self, name: name.to_string(), order, total, line: 0, entry: None };
+        let outcome = client.run_script_hosted(text, &options, &mut host);
+        host.finish(&outcome);
+        self.client = Some(client);
+        // As variáveis numéricas do roteiro valem nos comandos digitados
+        // depois.
+        for (variable, value) in &outcome.variables {
+            if let Some(number) = parse_number(value) {
+                self.variables.insert(variable.clone(), number);
             }
         }
         self.cancel.store(false, Ordering::SeqCst);
         self.set_activity("");
         self.publish(|shared| shared.script = None);
         let seconds = started.elapsed().as_secs_f64();
-        match failure {
-            None => self.transcript("(roteiro)", Ok(format!("{name}: fim, {total} linhas em {seconds:.1} s"))),
-            Some(error) if is_connection_error(&error) => return Err(error),
-            Some(error) => self.transcript("(roteiro)", Err(format!("{name}: parou na {error}"))),
+        match &outcome.result {
+            Ok(()) => self.transcript("(roteiro)", Ok(format!("{name}: fim, {total} linhas em {seconds:.1} s"))),
+            Err(error) if is_connection_error(error) => return Err(error.clone()),
+            Err(_) => {
+                let line = outcome.failed_line.map_or(String::new(), |line| format!(" na linha {line}"));
+                self.transcript("(roteiro)", Err(format!("{name}: parou{line}")));
+            }
         }
         if self.client.as_ref().is_some_and(Client::is_stopped) {
             Ok(true)
         } else {
             self.set_status(Status::Running);
             Ok(false)
-        }
-    }
-
-    /// Um passo do roteiro; devolve o texto do painel de comandos.
-    fn script_step(&mut self, step: &Step, last_output: &mut String) -> Result<String, String> {
-        match step {
-            Step::Attach => Ok("a janela ja esta anexada".into()),
-            Step::Expect(text) => {
-                if last_output.contains(text.as_str()) {
-                    Ok(String::new())
-                } else {
-                    Err(format!("saida sem {text:?}:\n{last_output}"))
-                }
-            }
-            Step::ExpectStop(text) => {
-                let stop = self.client_mut()?.last_stop().to_string();
-                if stop.contains(text.as_str()) {
-                    Ok(stop)
-                } else {
-                    Err(format!("ultima parada sem {text:?}: {stop}"))
-                }
-            }
-            Step::ExpectConsole(text) => {
-                self.forward_console();
-                let client = self.client_mut()?;
-                if client.console().contains(text.as_str()) {
-                    Ok(String::new())
-                } else {
-                    Err(format!("saida do DbgPrint sem {text:?}; o fim dela:\n{}", script::tail(client.console(), 2000)))
-                }
-            }
-            Step::ExpectEq(left, right) => {
-                let (left_text, right_text) = (script::substitute(left, &self.variables), script::substitute(right, &self.variables));
-                let client = self.client_mut()?;
-                let (a, b) = (client.evaluate(&left_text)?, client.evaluate(&right_text)?);
-                if a == b {
-                    Ok(format!("{a:#x} == {b:#x}"))
-                } else {
-                    Err(format!("{left} = {a:#x}, {right} = {b:#x}"))
-                }
-            }
-            Step::Save { name, expression } => {
-                let expression = script::substitute(expression, &self.variables);
-                let value = self.client_mut()?.evaluate(&expression)?;
-                self.variables.insert(name.clone(), value);
-                Ok(format!("${name} = {value:#x}"))
-            }
-            Step::SaveWord { name, needle, column, occurrence } => {
-                let value = script::word_value(last_output, needle, *column, *occurrence).ok_or_else(|| format!("nenhuma linha {occurrence} com {needle:?} e numero na coluna {column}"))?;
-                self.variables.insert(name.clone(), value);
-                Ok(format!("${name} = {value:#x}"))
-            }
-            Step::SaveThread { name, needle, column, module } => {
-                let candidates = script::column_values(last_output, needle, *column);
-                let client = self.client_mut()?;
-                let mut chosen = None;
-                for thread in candidates {
-                    let Ok((_, frames)) = client.thread_backtrace(thread, 32) else { continue };
-                    let in_module = frames.iter().any(|frame| client.symbols.module_at(frame.address).is_some_and(|found| found.name.eq_ignore_ascii_case(module) || found.file_name.eq_ignore_ascii_case(module)));
-                    if in_module {
-                        chosen = Some(thread);
-                        break;
-                    }
-                }
-                let value = chosen.ok_or_else(|| format!("nenhuma thread das linhas com {needle:?} tem quadro no modulo {module}"))?;
-                self.variables.insert(name.clone(), value);
-                Ok(format!("${name} = {value:#x}"))
-            }
-            Step::WaitSerial(text) => {
-                if self.config.serial_log.is_none() {
-                    return Err("sem o log da COM1 nesta sessao (o wait-serial precisa do --launch ou do --serial-log=ARQ)".into());
-                }
-                let found = self.script_wait(Duration::from_secs(script::WAIT_SERIAL_SECONDS), |worker| {
-                    worker.tail_serial();
-                    let seen = worker.shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).serial.contains(text.as_str());
-                    seen.then(|| format!("{text:?} na COM1"))
-                })?;
-                found.ok_or_else(|| "tempo esgotado esperando o texto na COM1".to_string())
-            }
-            Step::WaitStop(milliseconds) => {
-                let found = self.script_wait(Duration::from_millis(*milliseconds), |worker| worker.client.as_ref().filter(|client| client.is_stopped()).map(|client| client.last_stop().to_string()))?;
-                found.ok_or_else(|| "tempo esgotado esperando a parada (a maquina segue rodando; use break)".to_string())
-            }
-            Step::Echo(text) => Ok(text.clone()),
-            Step::Sleep(milliseconds) => {
-                self.script_wait(Duration::from_millis(*milliseconds), |_| None)?;
-                Ok(String::new())
-            }
-            Step::Command(text) => {
-                let line = script::substitute(text, &self.variables);
-                let output = self.client_mut()?.execute(&line)?;
-                *last_output = output.clone();
-                Ok(output)
-            }
-        }
-    }
-
-    /// Uma espera do roteiro: confere `done` a cada 100 ms, com o DbgPrint,
-    /// a COM1 e as paradas da máquina em dia, até o prazo (`Ok(None)`) ou o
-    /// Cancelar (erro).
-    fn script_wait(&mut self, timeout: Duration, mut done: impl FnMut(&mut Worker) -> Option<String>) -> Result<Option<String>, String> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if let Some(output) = done(self) {
-                return Ok(Some(output));
-            }
-            if self.cancel.load(Ordering::SeqCst) {
-                return Err("parado pelo usuario (Cancelar)".into());
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Ok(None);
-            }
-            let step = remaining.min(Duration::from_millis(100));
-            match self.client.as_mut() {
-                Some(client) if !client.is_stopped() => {
-                    client.poll(step)?;
-                }
-                Some(_) => thread::sleep(step),
-                None => return Err("sem conexao com o alvo".into()),
-            }
-            self.forward_console();
-            self.tail_serial();
-            self.publish_run_state();
         }
     }
 
@@ -2420,6 +2285,97 @@ pub fn loss_message(error: &str, launched: bool, qemu_status: Option<&str>, xtas
 }
 
 /// O erro é de conexão (o alvo sumiu), não de um comando.
+/// A janela como anfitriã de um roteiro do opennt-kd: cada comando vira
+/// uma entrada do painel de comandos (a saída dele junta até o próximo), a
+/// barra de estado mostra a linha, e as esperas põem o DbgPrint, a COM1 e o
+/// estado do alvo em dia.
+struct WindowScript<'w> {
+    worker: &'w mut Worker,
+    name: String,
+    /// O número de ordem de cada linha de comando do arquivo e o total.
+    order: HashMap<usize, usize>,
+    total: usize,
+    /// A linha do arquivo que está rodando.
+    line: usize,
+    /// A entrada aberta: a linha do arquivo, o comando e a saída até agora.
+    entry: Option<(usize, String, String)>,
+}
+
+impl WindowScript<'_> {
+    fn flush(&mut self) {
+        if let Some((_, input, output)) = self.entry.take() {
+            self.worker.transcript(&input, Ok(output));
+        }
+    }
+
+    /// O fim: a entrada aberta sai; a do comando que falhou sai com o erro.
+    fn finish(&mut self, outcome: &ScriptOutcome) {
+        let Err(error) = &outcome.result else { return self.flush() };
+        match self.entry.take() {
+            Some((line, input, output)) if outcome.failed_line == Some(line) => {
+                let text = if output.is_empty() { error.clone() } else { format!("{output}\n{error}") };
+                self.worker.transcript(&input, Err(text));
+            }
+            entry => {
+                self.entry = entry;
+                self.flush();
+                self.worker.transcript("(roteiro)", Err(error.clone()));
+            }
+        }
+    }
+}
+
+impl ScriptHost for WindowScript<'_> {
+    fn output(&mut self, line: &str) {
+        match script::panel_line(line) {
+            PanelLine::Skip => {}
+            PanelLine::Command(command) => {
+                self.flush();
+                self.entry = Some((self.line, format!("{command}    # roteiro, linha {}", self.line), String::new()));
+            }
+            PanelLine::Item(text) => {
+                self.flush();
+                self.entry = Some((self.line, text, String::new()));
+            }
+            PanelLine::Output(text) => match &mut self.entry {
+                Some((_, _, output)) => {
+                    if !output.is_empty() {
+                        output.push('\n');
+                    }
+                    output.push_str(&text);
+                }
+                None => self.entry = Some((self.line, "(roteiro)".to_string(), text)),
+            },
+        }
+    }
+
+    fn progress(&mut self, line: usize, text: &str) {
+        self.line = line;
+        let index = self.order.get(&line).copied().unwrap_or(0);
+        let progress = ScriptProgress { name: self.name.clone(), line, index, total: self.total, text: text.to_string() };
+        self.worker.publish(|shared| shared.script = Some(progress));
+        self.worker.set_activity(&format!("roteiro {index}/{}: {text}", self.total));
+    }
+
+    fn tick(&mut self, client: &mut Client) {
+        self.worker.publish_console(client.take_console());
+        self.worker.tail_serial();
+        self.worker.publish_run_state(client);
+    }
+
+    fn cancelled(&self) -> bool {
+        self.worker.cancel.load(Ordering::SeqCst)
+    }
+
+    fn serial_log(&self) -> Option<PathBuf> {
+        self.worker.config.serial_log.clone()
+    }
+
+    fn intercept(&mut self, _client: &mut Client, word: &str, _text: &str) -> Option<Result<String, String>> {
+        (word == "attach").then(|| Ok("a janela ja esta anexada".to_string()))
+    }
+}
+
 fn is_connection_error(error: &str) -> bool {
     error.contains("fechou a conexao") || error.contains("depurador:") || error.contains("os error") || error.contains("nao confirmou")
 }

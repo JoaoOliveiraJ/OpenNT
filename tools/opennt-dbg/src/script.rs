@@ -1,154 +1,78 @@
-//! Os roteiros do kd na janela: a linguagem do `--script` do `cargo xtask
-//! test-boot --kd=com2` (a do `Client::run_script`), uma linha por comando,
-//! `#` comenta, com as conferências `expect`, `expect-stop`,
-//! `expect-console`, `expect-eq`, as variáveis de `save`, `save-word` e
-//! `save-thread` (viram `$nome`), `wait-serial`, `wait-stop`, `echo` e
-//! `sleep`. O backend roda as linhas (`backend.rs`, com o Cancelar e a
-//! saída no painel de comandos); aqui ficam a leitura, a troca das
-//! variáveis e o texto da gravação (os comandos da janela viram um roteiro
-//! que o test-boot também roda).
+//! Os roteiros do kd na janela. Quem roda é o executor do `opennt-kd`
+//! (`Client::run_script_hosted`: a linguagem do `--script` do `cargo xtask
+//! test-boot --kd=com2`, com conferências, variáveis, blocos, laços,
+//! esperas e tratadores); o backend é o anfitrião (`backend.rs`: o
+//! Cancelar, a barra de estado e o painel de comandos). Aqui ficam o texto
+//! do lado da janela: as linhas do executor no painel, a ordem das linhas
+//! de comando, a troca das variáveis nos comandos digitados e o texto da
+//! gravação (os comandos da janela viram um roteiro que o test-boot também
+//! roda).
 //!
 //! Diferenças da janela: `attach` não faz nada (a sessão já está anexada);
-//! `wait-stop` volta na hora quando a máquina já parou (no `sleep` ou no
-//! `wait-serial` a janela acompanha as paradas); `wait-serial` lê o log da
-//! COM1 que a janela segue.
+//! `wait-serial` lê o log da COM1 que a janela segue.
 
 use std::collections::HashMap;
 use std::time::Duration;
 
 use opennt_kd::client::BreakpointRequest;
-use opennt_kd::{parse_number, Breakpoint, BreakpointKind};
+use opennt_kd::{Breakpoint, BreakpointKind};
 
 /// O prazo do `wait-stop` sem número (o do opennt-kd).
 pub const WAIT_STOP_DEFAULT_MS: u64 = 120_000;
 
-/// O prazo do `wait-serial` (o do opennt-kd).
-pub const WAIT_SERIAL_SECONDS: u64 = 300;
-
-/// Um passo do roteiro.
+/// Uma linha do executor no painel de comandos.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Step {
-    /// `attach`: na janela a sessão já está anexada.
-    Attach,
-    /// A saída do último comando contém o texto.
-    Expect(String),
-    /// A descrição da última parada contém o texto.
-    ExpectStop(String),
-    /// A saída do DbgPrint da sessão contém o texto.
-    ExpectConsole(String),
-    /// As duas expressões dão o mesmo valor.
-    ExpectEq(String, String),
-    Save { name: String, expression: String },
-    /// Um número da saída anterior: a coluna da N-ésima linha com o texto.
-    SaveWord { name: String, needle: String, column: usize, occurrence: usize },
-    /// Das linhas da saída anterior com o texto (o ETHREAD na coluna), a
-    /// primeira thread com um quadro do módulo na pilha.
-    SaveThread { name: String, needle: String, column: usize, module: String },
-    /// O texto em qualquer ponto do log da COM1.
-    WaitSerial(String),
-    /// A próxima parada, até o prazo em milissegundos.
-    WaitStop(u64),
-    Echo(String),
-    Sleep(u64),
-    /// Qualquer outro comando do depurador (`bp`, `g`, `k`, `!process`...).
+pub enum PanelLine {
+    /// Um comando ou bloco (`> texto`): abre uma entrada.
     Command(String),
+    /// Uma volta de `for-each` (`-- $t = ...`): abre uma entrada.
+    Item(String),
+    /// Saída da entrada aberta.
+    Output(String),
+    /// As linhas dos breakpoints de log (já vão no painel do DbgPrint).
+    Skip,
 }
 
-/// Uma linha do roteiro, com o número dela no arquivo (do 1).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Line {
-    pub number: usize,
-    pub text: String,
-    pub step: Step,
-}
-
-/// Lê o roteiro inteiro antes de rodar: um erro de uso aparece com a linha
-/// antes de a máquina andar.
-pub fn parse(text: &str) -> Result<Vec<Line>, String> {
-    let mut lines = Vec::new();
-    let mut errors = Vec::new();
-    for (index, raw) in text.lines().enumerate() {
-        let text = raw.trim();
-        if text.is_empty() || text.starts_with('#') {
-            continue;
-        }
-        match parse_step(text) {
-            Ok(step) => lines.push(Line { number: index + 1, text: text.to_string(), step }),
-            Err(error) => errors.push(format!("linha {}: {text}: {error}", index + 1)),
-        }
+/// Onde uma linha do executor vai no painel: sem o `[kd-script] ` e a
+/// indentação da saída; as linhas de um tratador guardam a marca
+/// `[on-break #n]` no comando.
+pub fn panel_line(line: &str) -> PanelLine {
+    if line.starts_with("[kd-log] ") {
+        return PanelLine::Skip;
     }
-    if errors.is_empty() {
-        Ok(lines)
+    let text = line.strip_prefix("[kd-script] ").unwrap_or(line);
+    let (marker, bare) = match text.strip_prefix("[on-break #").and_then(|rest| rest.split_once("] ")) {
+        Some((id, rest)) => (format!("[on-break #{id}] "), rest),
+        None => (String::new(), text),
+    };
+    if let Some(command) = bare.strip_prefix("> ") {
+        PanelLine::Command(format!("{marker}{command}"))
+    } else if bare.starts_with("-- ") {
+        PanelLine::Item(format!("{marker}{bare}"))
     } else {
-        Err(errors.join("\n"))
+        PanelLine::Output(bare.strip_prefix("  ").unwrap_or(bare).to_string())
     }
 }
 
-fn parse_step(line: &str) -> Result<Step, String> {
-    let (command, rest) = line.split_once(char::is_whitespace).map_or((line, ""), |(command, rest)| (command, rest.trim()));
-    let words: Vec<&str> = rest.split_whitespace().collect();
-    Ok(match command {
-        "attach" => Step::Attach,
-        "expect" => Step::Expect(rest.to_string()),
-        "expect-stop" => Step::ExpectStop(rest.to_string()),
-        "expect-console" => Step::ExpectConsole(rest.to_string()),
-        "expect-eq" => {
-            let (left, right) = split_two(rest).ok_or("uso: expect-eq <expr> <expr>")?;
-            Step::ExpectEq(left.to_string(), right.to_string())
-        }
-        "save" => {
-            let (name, expression) = split_two(rest).ok_or("uso: save <nome> <expr>")?;
-            Step::Save { name: name.trim_start_matches('$').to_string(), expression: expression.to_string() }
-        }
-        "save-word" => {
-            const USAGE: &str = "uso: save-word <nome> <texto> <coluna> [ocorrencia]";
-            let (Some(name), Some(needle), Some(column)) = (words.first(), words.get(1), words.get(2).and_then(|text| text.parse::<usize>().ok())) else {
-                return Err(USAGE.into());
-            };
-            let occurrence = match words.get(3) {
-                Some(text) => text.parse::<usize>().ok().filter(|&value| value >= 1).ok_or(USAGE)?,
-                None => 1,
-            };
-            Step::SaveWord { name: name.trim_start_matches('$').to_string(), needle: needle.to_string(), column, occurrence }
-        }
-        "save-thread" => {
-            let (Some(name), Some(needle), Some(column), Some(module)) = (words.first(), words.get(1), words.get(2).and_then(|text| text.parse::<usize>().ok()), words.get(3)) else {
-                return Err("uso: save-thread <nome> <texto> <coluna> <modulo>".into());
-            };
-            Step::SaveThread { name: name.trim_start_matches('$').to_string(), needle: needle.to_string(), column, module: module.to_string() }
-        }
-        "wait-serial" if !rest.is_empty() => Step::WaitSerial(rest.to_string()),
-        "wait-serial" => return Err("uso: wait-serial <texto>".into()),
-        "wait-stop" => Step::WaitStop(match words.first() {
-            Some(text) => parse_number(text).ok_or("uso: wait-stop [ms]")?,
-            None => WAIT_STOP_DEFAULT_MS,
-        }),
-        "echo" => Step::Echo(rest.to_string()),
-        "sleep" => Step::Sleep(parse_number(rest).unwrap_or(1000)),
-        _ => Step::Command(line.to_string()),
-    })
-}
-
-/// Separa no primeiro espaço fora de parênteses e colchetes (`expect-eq
-/// poi(@rsp + 8) 4`); os dois lados precisam existir.
-pub fn split_two(text: &str) -> Option<(&str, &str)> {
-    let mut depth = 0i32;
-    for (index, character) in text.char_indices() {
-        match character {
-            '[' | '(' => depth += 1,
-            ']' | ')' => depth -= 1,
-            _ if character.is_whitespace() && depth == 0 => {
-                let (left, right) = (text[..index].trim(), text[index..].trim());
-                return (!left.is_empty() && !right.is_empty()).then_some((left, right));
-            }
-            _ => {}
+/// As linhas de comando do roteiro (sem as vazias e os comentários): o
+/// número de ordem de cada uma (do 1) pelo número da linha no arquivo, e o
+/// total (a barra de estado).
+pub fn command_lines(text: &str) -> (HashMap<usize, usize>, usize) {
+    let mut order = HashMap::new();
+    for (index, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if !line.is_empty() && !line.starts_with('#') {
+            let next = order.len() + 1;
+            order.insert(index + 1, next);
         }
     }
-    None
+    let total = order.len();
+    (order, total)
 }
 
-/// Troca cada `$nome` conhecido pelo valor (`0x...`); um `$nome` que o
-/// roteiro não salvou fica como está (o avaliador do cliente decide).
+/// Troca cada `$nome` conhecido pelo valor (`0x...`) num comando digitado;
+/// um `$nome` que o roteiro não salvou fica como está (o avaliador do
+/// cliente decide).
 pub fn substitute(text: &str, variables: &HashMap<String, u64>) -> String {
     let mut output = String::with_capacity(text.len());
     let mut rest = text;
@@ -168,30 +92,6 @@ pub fn substitute(text: &str, variables: &HashMap<String, u64>) -> String {
     }
     output.push_str(rest);
     output
-}
-
-/// O número da coluna `column` (do 0) da N-ésima linha de `output` que
-/// contém `needle` (o `save-word`).
-pub fn word_value(output: &str, needle: &str, column: usize, occurrence: usize) -> Option<u64> {
-    output.lines().filter(|line| line.contains(needle)).nth(occurrence.checked_sub(1)?).and_then(|line| line.split_whitespace().nth(column)).and_then(parse_number)
-}
-
-/// Os números da coluna nas linhas com o texto (os candidatos do
-/// `save-thread`), na ordem da saída.
-pub fn column_values(output: &str, needle: &str, column: usize) -> Vec<u64> {
-    output.lines().filter(|line| line.contains(needle)).filter_map(|line| line.split_whitespace().nth(column)).filter_map(parse_number).collect()
-}
-
-/// O fim de um texto longo (as mensagens de erro do `expect-console`).
-pub fn tail(text: &str, bytes: usize) -> &str {
-    if text.len() <= bytes {
-        return text;
-    }
-    let mut start = text.len() - bytes;
-    while !text.is_char_boundary(start) {
-        start += 1;
-    }
-    &text[start..]
 }
 
 /// O começo de um roteiro gravado: como rodar de novo e o `attach`.
@@ -281,33 +181,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_the_test_boot_language() {
-        let text = "attach\n# comentario\nc\nwait-serial lsm.dll mapeado\n\nbreak\nps\nsave-word svc svchost.exe 0 1\n.process $svc\nwait-stop 280000\nexpect-stop swbreak\nexpect-eq poi(@rsp + 8) 4\nsave-thread t ntdll.dll 2 lsm\nsleep 1500\necho fim\nwait-stop\n";
-        let lines = parse(text).unwrap();
-        let steps: Vec<&Step> = lines.iter().map(|line| &line.step).collect();
-        assert_eq!(steps[0], &Step::Attach);
-        assert_eq!(steps[1], &Step::Command("c".into()));
-        assert_eq!(steps[2], &Step::WaitSerial("lsm.dll mapeado".into()));
-        assert_eq!(lines[3].number, 6);
-        assert_eq!(steps[5], &Step::SaveWord { name: "svc".into(), needle: "svchost.exe".into(), column: 0, occurrence: 1 });
-        assert_eq!(steps[6], &Step::Command(".process $svc".into()));
-        assert_eq!(steps[7], &Step::WaitStop(280_000));
-        assert_eq!(steps[8], &Step::ExpectStop("swbreak".into()));
-        assert_eq!(steps[9], &Step::ExpectEq("poi(@rsp + 8)".into(), "4".into()));
-        assert_eq!(steps[10], &Step::SaveThread { name: "t".into(), needle: "ntdll.dll".into(), column: 2, module: "lsm".into() });
-        assert_eq!(steps[11], &Step::Sleep(1500));
-        assert_eq!(steps[12], &Step::Echo("fim".into()));
-        assert_eq!(steps[13], &Step::WaitStop(WAIT_STOP_DEFAULT_MS));
+    fn executor_lines_in_the_panel() {
+        assert_eq!(panel_line("[kd-script] > save-word svc svchost.exe 0"), PanelLine::Command("save-word svc svchost.exe 0".into()));
+        assert_eq!(panel_line("[kd-script]   $svc = 0x1a4"), PanelLine::Output("$svc = 0x1a4".into()));
+        assert_eq!(panel_line("[kd-script] fim"), PanelLine::Output("fim".into()));
+        assert_eq!(panel_line("[kd-script] > if output-has ok: sim"), PanelLine::Command("if output-has ok: sim".into()));
+        assert_eq!(panel_line("[kd-script] -- $t = 0xffff8000 (Waiting, dwm.exe) (1 de 3)"), PanelLine::Item("-- $t = 0xffff8000 (Waiting, dwm.exe) (1 de 3)".into()));
+        assert_eq!(panel_line("[kd-script] [on-break #2] > k 4"), PanelLine::Command("[on-break #2] k 4".into()));
+        assert_eq!(panel_line("[kd-script] [on-break #2]   #0 nt!KiSwapContext"), PanelLine::Output("#0 nt!KiSwapContext".into()));
+        assert_eq!(panel_line("[kd-log] [bp #0] rax=1"), PanelLine::Skip);
     }
 
     #[test]
-    fn usage_errors_come_before_running() {
-        let error = parse("c\nsave-word x\nexpect-eq so_um\nwait-stop logo\nwait-serial\n").unwrap_err();
-        assert!(error.contains("linha 2: save-word x"));
-        assert!(error.contains("linha 3: expect-eq so_um"));
-        assert!(error.contains("linha 4: wait-stop logo"));
-        assert!(error.contains("linha 5: wait-serial"));
-        assert!(parse("save-word x svchost 1 0").is_err());
+    fn command_line_order() {
+        let (order, total) = command_lines("attach\n# comentario\n\nc\nrepeat 2 {\n  echo x\n}\n");
+        assert_eq!(total, 5);
+        assert_eq!((order.get(&1), order.get(&4), order.get(&6), order.get(&7)), (Some(&1), Some(&2), Some(&4), Some(&5)));
+        assert_eq!(order.get(&2), None);
     }
 
     #[test]
@@ -320,21 +210,6 @@ mod tests {
         assert_eq!(substitute("? $t1+$t1", &variables), "? 0x10+0x10");
         assert_eq!(substitute("? $outro $ fim$", &variables), "? $outro $ fim$");
         assert_eq!(substitute("sem variaveis", &variables), "sem variaveis");
-    }
-
-    #[test]
-    fn numbers_from_output() {
-        let output = "pid 4 System\n  0x1a4  svchost.exe  0xffffa001\n  0x1b8  svchost.exe  0xffffa002\n";
-        assert_eq!(word_value(output, "svchost.exe", 0, 1), Some(0x1a4));
-        assert_eq!(word_value(output, "svchost.exe", 2, 2), Some(0xffffa002));
-        assert_eq!(word_value(output, "svchost.exe", 1, 1), None);
-        assert_eq!(word_value(output, "svchost.exe", 0, 3), None);
-        assert_eq!(word_value(output, "svchost.exe", 0, 0), None);
-        assert_eq!(column_values(output, "svchost", 2), vec![0xffffa001, 0xffffa002]);
-        assert_eq!(split_two("x  poi(@rsp + 8)"), Some(("x", "poi(@rsp + 8)")));
-        assert_eq!(split_two("so_um"), None);
-        assert_eq!(tail("abcdef", 3), "def");
-        assert_eq!(tail("ab", 3), "ab");
     }
 
     #[test]

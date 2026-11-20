@@ -92,7 +92,7 @@ pub fn definitions() -> Vec<(&'static str, &'static str, Value)> {
         ),
         (
             "kd_script",
-            "Roda um roteiro do depurador na linguagem do cargo xtask test-boot --kd=com2 --script (bp/bu com /log, c, wait-stop, wait-serial, break, ps, save-word, .process $x, r, k, db, expect...) sobre esta sessao e devolve o log. wait-serial e wait-stop atendem as paradas; $nome vira o valor salvo; attach e ignorado. A primeira linha que falha encerra (ok=false, com o log ate ela e o erro).",
+            "Roda um roteiro do depurador na linguagem do cargo xtask test-boot --kd=com2 --script (bp/bu com /log, c, wait-stop, wait-serial, sleep, break, ps, save-word, set, .process $x, r, k, db, expect..., if/while/repeat/for-each, on-break) sobre esta sessao e devolve o log. As esperas atendem as paradas e param no prazo; $nome vale nas expressoes e ${nome} vira o texto; attach e ignorado e detach recusado. A primeira linha que falha encerra (ok=false, failed_line, o log ate ela e o erro).",
             object(
                 json!({
                     "script": text("o roteiro"),
@@ -463,7 +463,7 @@ fn kd_script(engine: &mut dyn Engine, session: &mut Session, args: &Arguments) -
     let report = kdscript::run(client, session, &script, &options);
     let total = report.log.len() + report.dropped;
     let skip = report.log.len().saturating_sub(max_lines);
-    let variables: Map<String, Value> = report.variables.iter().map(|(name, value)| (name.clone(), json!(hex(*value)))).collect();
+    let variables: Map<String, Value> = report.variables.iter().map(|(name, value)| (name.clone(), json!(value))).collect();
     let mut value = json!({
         "ok": report.ok,
         "commands": report.commands,

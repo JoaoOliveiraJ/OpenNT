@@ -5645,8 +5645,10 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   - Breakpoints (`client.rs`): software, hardware de execução, escrita e
     acesso (`ba e1|w4|r8`), condição (`bp x 3 /w "@rax == 7"`: a partir do
     terceiro acerto, só com a condição verdadeira; os outros acertos seguem
-    sozinhos), adiados (`bu`: o símbolo de um módulo que ainda vai carregar)
-    e parada por carga de módulo (`sxe ld:ntfs.sys`). Os dois últimos usam
+    sozinhos), adiados (`bu`: o símbolo de um módulo que ainda vai carregar;
+    um `bp` num módulo que não carregou vira o mesmo adiado, e um símbolo
+    que falta num módulo carregado continua sendo erro) e parada por carga
+    de módulo (`sxe ld:ntfs.sys`). Os dois últimos usam
     o filtro de carga do alvo com os nomes dos módulos pedidos (num kernel
     sem o filtro, um breakpoint interno na notificação de carga de imagem,
     `ps::notify::image::notify`, que parava em toda carga, e o ponto de
@@ -5772,8 +5774,16 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   - Roteiros do kd (`kd_script.rs`): a linguagem do `cargo xtask test-boot
     --kd=com2 --script=ARQ`, do `cargo xtask debug --script=ARQ` e da aba
     Script e do `--script` do `opennt-re` (o `ScriptOptions::capture` leva
-    a saída para a janela no lugar da saída padrão). A ferramenta `script`
-    do `opennt-mcp` ainda usa a linguagem antiga de `analysis/script.rs`.
+    a saída para a janela no lugar da saída padrão), dos roteiros do
+    `opennt-dbg` e da ferramenta `kd_script` do `opennt-mcp`. Esses dois
+    rodam pelo `run_script_hosted` com um `ScriptHost`: o anfitrião recebe
+    as linhas, pode cancelar, dar um prazo (as esperas não passam dele e
+    nenhum comando começa depois), passar o log da COM1, atender uma
+    parada antes dos tratadores e responder a um comando no lugar do
+    depurador; o `ScriptOutcome` diz a linha que falhou, os comandos e as
+    variáveis. `check_script` confere a sintaxe sem rodar. A ferramenta
+    `run_script` do `opennt-mcp` ainda usa a linguagem antiga de
+    `analysis/script.rs`.
     Uma linha por comando; `#` no começo da linha
     comenta. Uma linha que não é da linguagem vai ao depurador como no
     prompt (`bp`, `continue`, `k`...), e a saída dela fica guardada para as
@@ -5789,7 +5799,9 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
       com o erro, se houver. O DbgPrint já está na COM1 e não se repete.
     - Esperas: `wait-stop [ms]` (padrão 120000), `wait-serial [/t ms]
       <texto>` (padrão 300000; o texto em qualquer ponto da COM1) e `sleep
-      <ms>` leem a conexão enquanto esperam. Um breakpoint de log, uma
+      <ms>` (padrão 1000) leem a conexão enquanto esperam. O prazo é um
+      número, `$variável` ou expressão (`sleep $espera`, `sleep 2*0n60000`);
+      um prazo que não dá número é erro. Um breakpoint de log, uma
       condição falsa e a carga de um módulo seguem sozinhos, e um tratador
       roda. Uma parada sem tratador encerra o `wait-stop`. No `wait-serial`
       ela é erro, porque a COM1 não anda com a máquina parada (com a máquina
@@ -5884,7 +5896,11 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     que deixa a máquina parada e o que a faz seguir até o terceiro acerto,
     os laços pelas linhas, processos e threads, a espera pela COM1 com prazo
     e as mensagens de erro com o comando anterior, a saída e a volta do
-    laço.
+    laço; o `sleep` com `$variável` e o erro de um prazo que não é número;
+    o `bp` num módulo ausente que fica adiado; e o roteiro com anfitrião (as
+    linhas, o `attach` e o `detach` dele, a COM1 por arquivo que cresce, o
+    Cancelar, o prazo, a parada atendida, a linha que falhou e as
+    variáveis).
 - **Depurador gráfico** (`tools/opennt-dbg`, binário `opennt-dbg`).
   - Uso: `cargo run -p opennt-dbg --release -- --launch` roda o mesmo build e
     QEMU do `cargo xtask debug --launch` e abre a janela (as outras
@@ -5903,11 +5919,15 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     expressões observadas, a memória e as opções de abertura em
     `<build>/opennt-dbg/sessoes/<nome>.json`. Abrir troca os breakpoints
     (na hora com a máquina parada, senão na próxima parada ou no attach).
-  - Roteiros (Ctrl+R): a linguagem do `--script` do `cargo xtask test-boot
-    --kd=com2`, lida inteira antes de rodar; cada linha vai ao painel
-    Comandos na hora, o Cancelar para entre linhas e nas esperas, e a
-    primeira conferência que falha para o roteiro. Na janela, `attach` não
-    faz nada e `wait-stop` volta na hora com a máquina já parada. A
+  - Roteiros (Ctrl+R): o executor do `opennt-kd` (`run_script_hosted`, a
+    linguagem inteira do `--script` do `cargo xtask test-boot --kd=com2`),
+    com a janela como anfitriã (`WindowScript` em `backend.rs`). O roteiro
+    é conferido inteiro antes de rodar; cada comando vai ao painel Comandos
+    na hora, a barra de estado mostra a linha, o Cancelar para entre
+    comandos e nas esperas, e a primeira conferência que falha para o
+    roteiro. Na janela, `attach` não faz nada e o `wait-serial` lê o log da
+    COM1 da sessão. As variáveis numéricas valem nos comandos digitados
+    depois. A
     gravação (Ctrl+Shift+G) escreve os comandos digitados, os botões de
     execução (com `wait-stop` depois de um `c`) e os breakpoints da margem
     e do painel num roteiro que o `cargo xtask debug --script=ARQ` roda.
@@ -6318,12 +6338,14 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     - `memory_view`: bytes, words, dwords, qwords, pointers (com o
       símbolo de cada qword), ascii, unicode e unicode_string;
     - `kd_script`: os roteiros do `test-boot --kd=com2 --script` sobre a
-      sessão (`kdscript.rs`), com o log na resposta (nunca na saída
-      padrão, que é o canal do stdio), as esperas dentro do prazo da
-      ferramenta, `wait-serial`/`wait-stop`/`sleep` atendendo as paradas,
-      os comandos de parada (`/cmd`) rodando no `wait-stop` e `$nome`
-      trocado no texto da linha; `attach` não faz nada e `detach` é
-      recusado. A linha que falha encerra com `ok=false` e o log até ela.
+      sessão, pelo executor do `opennt-kd` (`run_script_hosted`; o
+      servidor é o anfitrião em `kdscript.rs`), com o log na resposta
+      (nunca na saída padrão, que é o canal do stdio; as linhas dos
+      breakpoints de log vão no `breakpoint_log`), as esperas dentro do
+      prazo da ferramenta, o `wait-serial` no log da COM1 da sessão e o
+      aviso de carga dos breakpoints de usuário adiados atendido nas
+      esperas; `attach` não faz nada e `detach` é recusado. A linha que
+      falha encerra com `ok=false`, `failed_line` e o log até ela.
   - Ferramentas de análise (`tools_analysis.rs`): `status_decode`
     (NTSTATUS, HRESULT com `HRESULT_FROM_WIN32`/`HRESULT_FROM_NT` e erros
     do Win32, pelos valores dos cabeçalhos públicos, em `status.rs`),
