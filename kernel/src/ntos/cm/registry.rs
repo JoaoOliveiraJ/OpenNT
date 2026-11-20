@@ -49,6 +49,7 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::num::NonZeroU64;
 use core::ops::{Deref, Index};
 
 use crate::ntos::cm::hive::key_cells;
@@ -76,10 +77,10 @@ pub struct Value {
 /// nome sem diferença de caixa, [`name_hash`]: a busca compara o hash e
 /// confirma pelo nome do filho), o descritor (compartilhado entre as chaves
 /// da mesma célula 'sk') e as flags. O conteúdo vem das células
-/// ([`KeyView`]); só um nó sem célula guarda o dele.
+/// ([`KeyView`]); só um nó sem célula guarda o dele. São 64 bytes por nó.
 #[derive(Clone, Debug)]
 pub struct KeyNode {
-    pub parent: Option<NodeId>,
+    parent: Option<NonZeroU64>,
     pub children: Vec<(u32, NodeId)>,
     pub security: Arc<Captured>,
     pub deleted: bool,
@@ -89,12 +90,20 @@ pub struct KeyNode {
     pub volatile: bool,
     /// Chave de link (REG_OPTION_CREATE_LINK, KEY_SYM_LINK na célula).
     pub link: bool,
-    /// O nome quando ele não vem da célula: os nós sem célula, a raiz de
-    /// uma hive carregada (o nome do ponto de montagem) e as chaves
-    /// excluídas com handle aberto.
-    name: Option<Box<str>>,
-    /// Valores, classe e LastWriteTime de um nó sem célula.
-    owned: Option<Box<OwnedKey>>,
+    /// O nome quando ele não vem da célula (os nós sem célula, a raiz de
+    /// uma hive carregada e as chaves excluídas com handle aberto) e o
+    /// conteúdo de um nó sem célula.
+    extra: Option<Box<Extra>>,
+}
+
+const _: () = assert!(core::mem::size_of::<KeyNode>() == 64 && core::mem::size_of::<Option<KeyNode>>() == 64);
+
+/// O que um nó guarda além da identidade: o nome que não vem da célula e,
+/// sem célula, o conteúdo.
+#[derive(Clone, Debug)]
+struct Extra {
+    name: Box<str>,
+    owned: Option<OwnedKey>,
 }
 
 /// O conteúdo de um nó sem célula: valores em ordem de inserção, a classe
@@ -110,12 +119,29 @@ impl KeyNode {
     /// Um nó que guarda o próprio conteúdo (sem célula).
     fn in_memory(name: &str, parent: Option<NodeId>, security: Arc<Captured>, volatile: bool, link: bool, class: &[u16], time: u64) -> KeyNode {
         let owned = OwnedKey { values: Vec::new(), class: class.to_vec(), last_write_time: time };
-        KeyNode { parent, children: Vec::new(), security, deleted: false, cell: None, volatile, link, name: Some(Box::from(name)), owned: Some(Box::new(owned)) }
+        KeyNode { parent: parent.and_then(NonZeroU64::new), children: Vec::new(), security, deleted: false, cell: None, volatile, link, extra: Some(Box::new(Extra { name: Box::from(name), owned: Some(owned) })) }
     }
 
     /// Um nó de uma chave guardada na célula 'nk' `cell` da hive `hive`.
     fn stored(parent: Option<NodeId>, security: Arc<Captured>, hive: u32, cell: u32, link: bool) -> KeyNode {
-        KeyNode { parent, children: Vec::new(), security, deleted: false, cell: Some((hive, cell)), volatile: false, link, name: None, owned: None }
+        KeyNode { parent: parent.and_then(NonZeroU64::new), children: Vec::new(), security, deleted: false, cell: Some((hive, cell)), volatile: false, link, extra: None }
+    }
+
+    /// O pai (nenhum só na raiz do Registro).
+    pub fn parent(&self) -> Option<NodeId> {
+        self.parent.map(NonZeroU64::get)
+    }
+
+    fn name_override(&self) -> Option<&str> {
+        self.extra.as_deref().map(|extra| &*extra.name)
+    }
+
+    fn owned(&self) -> Option<&OwnedKey> {
+        self.extra.as_deref().and_then(|extra| extra.owned.as_ref())
+    }
+
+    fn owned_mut(&mut self) -> Option<&mut OwnedKey> {
+        self.extra.as_deref_mut().and_then(|extra| extra.owned.as_mut())
     }
 }
 
@@ -148,7 +174,7 @@ impl<'a> KeyView<'a> {
 
     /// O nome da chave.
     pub fn name(&self) -> String {
-        match &self.node.name {
+        match self.node.name_override() {
             Some(name) => name.to_string(),
             None => self.name_units().map(|units| units.to_string_lossy()).unwrap_or_default(),
         }
@@ -156,7 +182,7 @@ impl<'a> KeyView<'a> {
 
     /// O nome é `lower` (já em minúsculas), sem diferença de caixa.
     pub fn name_is(&self, lower: &str) -> bool {
-        match &self.node.name {
+        match self.node.name_override() {
             Some(name) => same_name(name, lower),
             None => self.name_units().is_some_and(|units| same_chars(lossy_chars(units.iter()), lower.chars())),
         }
@@ -164,7 +190,7 @@ impl<'a> KeyView<'a> {
 
     /// O tamanho do nome em bytes de UTF-16.
     pub fn name_length(&self) -> u32 {
-        match &self.node.name {
+        match self.node.name_override() {
             Some(name) => name.encode_utf16().count() as u32 * 2,
             None => self.name_units().map_or(0, |units| units.len() as u32 * 2),
         }
@@ -172,7 +198,7 @@ impl<'a> KeyView<'a> {
 
     /// LastWriteTime em 100 ns desde 1601.
     pub fn last_write_time(&self) -> u64 {
-        match (&self.node.owned, self.stored()) {
+        match (self.node.owned(), self.stored()) {
             (Some(owned), _) => owned.last_write_time,
             (None, Some((storage, cell))) => key_cells::last_write_time(storage, cell),
             (None, None) => 0,
@@ -181,7 +207,7 @@ impl<'a> KeyView<'a> {
 
     /// A classe em UTF-16 (vazia sem classe).
     pub fn class(&self) -> Vec<u16> {
-        match (&self.node.owned, self.stored()) {
+        match (self.node.owned(), self.stored()) {
             (Some(owned), _) => owned.class.clone(),
             (None, Some((storage, cell))) => key_cells::class_units(storage, cell),
             (None, None) => Vec::new(),
@@ -190,7 +216,7 @@ impl<'a> KeyView<'a> {
 
     /// O tamanho da classe em bytes.
     pub fn class_length(&self) -> u32 {
-        match (&self.node.owned, self.stored()) {
+        match (self.node.owned(), self.stored()) {
             (Some(owned), _) => owned.class.len() as u32 * 2,
             (None, Some((storage, cell))) => key_cells::class_length(storage, cell),
             (None, None) => 0,
@@ -199,7 +225,7 @@ impl<'a> KeyView<'a> {
 
     /// Quantos valores a chave tem.
     pub fn value_count(&self) -> usize {
-        match (&self.node.owned, self.stored()) {
+        match (self.node.owned(), self.stored()) {
             (Some(owned), _) => owned.values.len(),
             (None, Some((storage, cell))) => key_cells::value_count(storage, cell) as usize,
             (None, None) => 0,
@@ -208,7 +234,7 @@ impl<'a> KeyView<'a> {
 
     /// A cópia do valor `index`, na ordem da chave.
     pub fn value_at(&self, index: usize) -> Option<Value> {
-        match (&self.node.owned, self.stored()) {
+        match (self.node.owned(), self.stored()) {
             (Some(owned), _) => owned.values.get(index).cloned(),
             (None, Some((storage, cell))) => key_cells::value_cell(storage, cell, u32::try_from(index).ok()?).and_then(|value| key_cells::read_value(storage, value)),
             (None, None) => None,
@@ -224,7 +250,7 @@ impl<'a> KeyView<'a> {
     /// A cópia do valor de nome `lower` (já em minúsculas), sem diferença
     /// de caixa.
     pub fn value(&self, lower: &str) -> Option<Value> {
-        match (&self.node.owned, self.stored()) {
+        match (self.node.owned(), self.stored()) {
             (Some(owned), _) => owned.values.iter().find(|value| same_name(&value.name, lower)).cloned(),
             (None, Some((storage, _))) => key_cells::read_value(storage, self.value_cell(lower)?),
             (None, None) => None,
@@ -233,7 +259,7 @@ impl<'a> KeyView<'a> {
 
     /// A chave tem o valor de nome `lower` (já em minúsculas)?
     pub fn has_value(&self, lower: &str) -> bool {
-        match &self.node.owned {
+        match self.node.owned() {
             Some(owned) => owned.values.iter().any(|value| same_name(&value.name, lower)),
             None => self.value_cell(lower).is_some(),
         }
@@ -246,7 +272,7 @@ impl<'a> KeyView<'a> {
 
     /// Os nomes dos valores, em ordem.
     pub fn value_names(&self) -> Vec<String> {
-        match (&self.node.owned, self.stored()) {
+        match (self.node.owned(), self.stored()) {
             (Some(owned), _) => owned.values.iter().map(|value| value.name.clone()).collect(),
             (None, Some((storage, cell))) => (0..key_cells::value_count(storage, cell)).filter_map(|index| key_cells::value_cell(storage, cell, index)).filter_map(|value| key_cells::value_name_units(storage, value)).map(|units| units.to_string_lossy()).collect(),
             (None, None) => Vec::new(),
@@ -256,7 +282,7 @@ impl<'a> KeyView<'a> {
     /// O tamanho do nome (bytes de UTF-16) e do dado de cada valor, em
     /// ordem, sem copiar os dados.
     pub fn value_sizes(&self) -> Vec<(u32, u32)> {
-        match (&self.node.owned, self.stored()) {
+        match (self.node.owned(), self.stored()) {
             (Some(owned), _) => owned.values.iter().map(|value| (value.name.encode_utf16().count() as u32 * 2, value.data.len() as u32)).collect(),
             (None, Some((storage, cell))) => (0..key_cells::value_count(storage, cell)).filter_map(|index| key_cells::value_cell(storage, cell, index)).filter_map(|value| key_cells::value_sizes(storage, value)).collect(),
             (None, None) => Vec::new(),
@@ -523,7 +549,7 @@ fn owning_hive_of(hive: &Hive, node: NodeId) -> Option<u32> {
         if let Some((identifier, _)) = key.cell {
             return Some(identifier);
         }
-        current = key.parent;
+        current = key.parent();
     }
     None
 }
@@ -638,7 +664,7 @@ fn ancestry(hive: &Hive, node: NodeId) -> Vec<NodeId> {
     let mut current = Some(node);
     while let Some(id) = current {
         chain.push(id);
-        current = hive.nodes.get(&id).and_then(|key| key.parent);
+        current = hive.nodes.get(&id).and_then(|key| key.parent());
     }
     chain
 }
@@ -701,8 +727,7 @@ fn retire(hive: &mut Hive, node: NodeId, open: bool) {
         key.deleted = true;
         key.cell = None;
         key.children = Vec::new();
-        key.name = Some(name.into_boxed_str());
-        key.owned = Some(Box::new(OwnedKey { values: Vec::new(), class: Vec::new(), last_write_time: time }));
+        key.extra = Some(Box::new(Extra { name: name.into_boxed_str(), owned: Some(OwnedKey { values: Vec::new(), class: Vec::new(), last_write_time: time }) }));
     }
 }
 
@@ -914,7 +939,7 @@ pub fn delete_node(node: NodeId, path: &str) -> bool {
         }
         // O pai é o do próprio nó: um handle aberto por um link guarda o
         // caminho resolvido, e a árvore é a fonte de verdade.
-        let parent = key.parent?;
+        let parent = key.parent()?;
         let cell = key.cell;
         let real = node_path(hive, node);
         let parent_chain = ancestry(hive, parent);
@@ -1014,7 +1039,7 @@ fn store_value(hive: &mut Hive, node: NodeId, name: &str, value_type: u32, data:
         let existing = key.value_cell(&lower);
         return cell_op(hive, identifier, cell, |storage| key_cells::set_value_at(storage, cell, existing, name, value_type, &data, time));
     }
-    let Some(owned) = hive.nodes.get_mut(&node).and_then(|key| key.owned.as_mut()) else { return false };
+    let Some(owned) = hive.nodes.get_mut(&node).and_then(|key| key.owned_mut()) else { return false };
     match owned.values.iter_mut().find(|value| same_name(&value.name, &lower)) {
         Some(slot) => {
             slot.value_type = value_type;
@@ -1029,7 +1054,7 @@ fn store_value(hive: &mut Hive, node: NodeId, name: &str, value_type: u32, data:
 /// O LastWriteTime de um nó (nas células, ou no próprio nó).
 fn store_last_write_time(hive: &mut Hive, node: NodeId, time: u64) {
     let Some(key) = hive.nodes.get_mut(&node) else { return };
-    if let Some(owned) = key.owned.as_mut() {
+    if let Some(owned) = key.owned_mut() {
         owned.last_write_time = time;
         return;
     }
@@ -1078,7 +1103,7 @@ fn remove_value(hive: &mut Hive, node: NodeId, lower: &str, time: u64) -> bool {
         let Some(value) = key.value_cell(lower) else { return false };
         return cell_op(hive, identifier, cell, |storage| key_cells::delete_value_at(storage, cell, value, time));
     }
-    let Some(owned) = hive.nodes.get_mut(&node).and_then(|key| key.owned.as_mut()) else { return false };
+    let Some(owned) = hive.nodes.get_mut(&node).and_then(|key| key.owned_mut()) else { return false };
     let before = owned.values.len();
     owned.values.retain(|value| !same_name(&value.name, lower));
     if owned.values.len() == before {
@@ -1192,7 +1217,7 @@ pub fn link_hive(path: &str, identifier: u32, storage: Storage, checked: Checked
                 Some(_) => key_cells::key_name_units(&storage, cell).map_or(0, |units| hash_chars(lossy_chars(units.iter()))),
                 None => {
                     // A raiz tem o nome do ponto de montagem.
-                    key.name = Some(Box::from(*name));
+                    key.extra = Some(Box::new(Extra { name: Box::from(*name), owned: None }));
                     name_hash(name)
                 }
             };
@@ -1247,7 +1272,7 @@ fn node_path(hive: &Hive, node: NodeId) -> String {
     while let Some(id) = current.filter(|&id| id != ROOT) {
         let Some(key) = hive.view(id) else { break };
         names.push(key.name());
-        current = key.parent;
+        current = key.parent();
     }
     let mut path = String::new();
     for name in names.iter().rev() {
@@ -1270,7 +1295,7 @@ pub fn unlink_hive(identifier: u32, force: bool) -> Result<Storage, u32> {
             return Err(STATUS_CANNOT_DELETE);
         }
         let path = node_path(hive, root);
-        let parent = hive.nodes.get(&root).and_then(|key| key.parent);
+        let parent = hive.nodes.get(&root).and_then(|key| key.parent());
         let parent_chain = parent.map(|parent| ancestry(hive, parent)).unwrap_or_default();
         if let Some(parent) = parent.and_then(|parent| hive.nodes.get_mut(&parent)) {
             parent.children.retain(|&(_, child)| child != root);
@@ -1390,7 +1415,7 @@ pub fn restore_subtree(node: NodeId, source: &Storage, checked: &Checked) -> Res
         nodes.retain(|&candidate| candidate != node);
         let open = open_nodes(hive);
         for &child in nodes.iter().rev() {
-            let (parent, cell) = hive.nodes.get(&child).map_or((None, None), |key| (key.parent, key.cell));
+            let (parent, cell) = hive.nodes.get(&child).map_or((None, None), |key| (key.parent(), key.cell));
             if let Some(parent) = parent.and_then(|parent| hive.nodes.get_mut(&parent)) {
                 parent.children.retain(|&(_, candidate)| candidate != child);
             }
@@ -1493,7 +1518,7 @@ pub fn refresh_hive(identifier: u32, storage: Storage, checked: Checked) -> Resu
         })?;
         let open = open_nodes(hive);
         for node in old.into_iter().filter(|node| !kept.contains(node)) {
-            let parent = hive.nodes.get(&node).and_then(|key| key.parent);
+            let parent = hive.nodes.get(&node).and_then(|key| key.parent());
             if let Some(parent) = parent.and_then(|parent| hive.nodes.get_mut(&parent)) {
                 parent.children.retain(|&(_, child)| child != node);
             }
@@ -1505,9 +1530,9 @@ pub fn refresh_hive(identifier: u32, storage: Storage, checked: Checked) -> Resu
                 entry.security = security;
                 entry.link = link;
                 entry.volatile = false;
-                entry.owned = None;
-                if node != root {
-                    entry.name = None;
+                match entry.extra.as_deref_mut() {
+                    Some(extra) if node == root => extra.owned = None,
+                    _ => entry.extra = None,
                 }
             }
         }
