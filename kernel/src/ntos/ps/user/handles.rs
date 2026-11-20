@@ -389,8 +389,27 @@ fn duplicate_object_manager_handle(source: u64, source_handle: u64, target_proce
             }
             access & (object_type.valid_access | 0x0100_0000)
         };
+        // ObDuplicateObject (ntoskrnl 19041, 0x5f55e7..0x5f5663): direitos além
+        // dos do handle de origem não são recusados direto. Com
+        // DUPLICATE_NO_RIGHTS_UPGRADE (8) ou um tipo com SecurityProcedure
+        // própria, ACCESS_DENIED; senão o SeCreateAccessState e o
+        // ObpGrantAccess(ObDuplicateHandle) no processo de destino (anexado,
+        // 0x5f5608) checam o pedido contra o descritor do objeto. O
+        // GetSharingHandleDuplicate do dwmredir (DuplicateHandle com
+        // GENERIC_READ de um handle Composition aberto com acesso 1) depende
+        // disso para o CWindowList::CreateSprite do uDWM pôr a janela na cena.
+        let mut access = access;
         if access & !resolved.access != 0 {
-            return Ok(0xC000_0022);
+            let procedure = object_types::type_object(object_type.pointer).map_or(0, |native| native.type_info.security_procedure.get());
+            if options & 8 != 0 || (procedure != 0 && procedure != crate::ntos::ob::object_security::default_object_method_address()) {
+                return Ok(0xC000_0022);
+            }
+            let checked = crate::ntos::ob::object_security::has_descriptor(&resolved.item);
+            let policy = crate::ntos::ob::object_security::described_policy(&resolved.item);
+            access = match attached(target, || crate::ntos::ob::object_access::check(&policy, crate::ntos::ob::object_access::subject(), access, object_type, !checked))? {
+                Ok(granted) => granted,
+                Err(status) => return Ok(status),
+            };
         }
         let inserted = open_pointer::insert(&resolved.item, access, attributes & 2, target)?;
         if out != 0 {

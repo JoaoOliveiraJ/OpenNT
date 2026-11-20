@@ -53,10 +53,13 @@ const READ_CONTROL: u32 = 0x0002_0000;
 const WRITE_DAC: u32 = 0x0004_0000;
 const WRITE_OWNER: u32 = 0x0008_0000;
 const GENERIC_ALL: u32 = 0x1000_0000;
+const GENERIC_READ: u32 = 0x8000_0000;
 const EVENT_QUERY_STATE: u32 = 0x0001;
 const EVENT_MODIFY_STATE: u32 = 0x0002;
 const EVENT_ALL_ACCESS: u32 = 0x001F_0003;
 const DIRECTORY_ALL_ACCESS: u32 = 0x000F_000F;
+const DIRECTORY_QUERY: u32 = 0x0001;
+const DIRECTORY_TRAVERSE: u32 = 0x0002;
 const PROCESS_QUERY_INFORMATION: u32 = 0x0400;
 const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
 const THREAD_QUERY_INFORMATION: u32 = 0x0040;
@@ -232,6 +235,15 @@ impl Calls {
         .unwrap_or(Err(1))
     }
 
+    /// NtOpenDirectoryObject: `Ok(handle)` ou o NTSTATUS.
+    fn open_directory(&self, name: &str, access: u32) -> Result<u64, u32> {
+        with_block(|block| {
+            let attributes = attributes(block, name, None);
+            handle_result(block, call(block, "NtOpenDirectoryObject", block + HANDLE, access as u64, attributes, 0))
+        })
+        .unwrap_or(Err(1))
+    }
+
     /// NtOpenEvent: `Ok(handle)` ou o NTSTATUS.
     fn open_event(&self, name: &str, access: u32) -> Result<u64, u32> {
         with_block(|block| {
@@ -264,6 +276,18 @@ impl Calls {
 
     fn close(&self, handle: u64) {
         with_block(|block| call(block, "NtClose", handle, 0, 0, 0));
+    }
+
+    /// NtDuplicateObject do processo corrente para ele mesmo, com o acesso e
+    /// as opções pedidos: `Ok(handle)` ou o NTSTATUS.
+    fn duplicate(&self, handle: u64, access: u32, options: u32) -> Result<u64, u32> {
+        with_block(|block| {
+            guest::write64(block + STACK + 0x28, access as u64);
+            guest::write64(block + STACK + 0x30, 0);
+            guest::write64(block + STACK + 0x38, options as u64);
+            handle_result(block, call(block, "NtDuplicateObject", u64::MAX, handle, u64::MAX, block + HANDLE))
+        })
+        .unwrap_or(Err(1))
     }
 
     /// NtSetSecurityObject com um descritor relativo.
@@ -425,6 +449,48 @@ fn take_ownership(assert: Assert) {
     assert(ran.is_some(), "acl: processo de A");
 }
 
+/// NtDuplicateObject com direitos além dos do handle de origem num objeto
+/// do Object Manager (um diretório): o ObDuplicateObject 19041
+/// (0x5f55e7..0x5f5663) só recusa direto com DUPLICATE_NO_RIGHTS_UPGRADE (8)
+/// ou um tipo com SecurityProcedure própria; senão o SeCreateAccessState e o
+/// ObpGrantAccess no processo de destino checam o pedido contra o descritor.
+/// O GetSharingHandleDuplicate do dwmredir (GENERIC_READ de um handle
+/// Composition aberto com acesso 1) depende disso.
+fn duplicate_rights_upgrade(assert: Assert) {
+    let ran = as_identity("acl-duplicata.exe", &user_a(), MEDIUM_INTEGRITY, &[], |a, _| {
+        let generous = relative_descriptor(Some(&user_a()), Some(&[allow(DIRECTORY_ALL_ACCESS, user_a())]));
+        // Sem READ_CONTROL: a ACE de OWNER RIGHTS tira do dono o implícito.
+        let narrow = relative_descriptor(Some(&user_a()), Some(&[allow(DIRECTORY_QUERY | DIRECTORY_TRAVERSE, sid(3, &[4])), allow(DIRECTORY_QUERY | DIRECTORY_TRAVERSE, user_a())]));
+        let wide = a.create_directory("\\OpenNtAcl\\DupLarga", &generous);
+        let tight = a.create_directory("\\OpenNtAcl\\DupEstreita", &narrow);
+        let source = a.open_directory("\\OpenNtAcl\\DupLarga", DIRECTORY_QUERY);
+        let upgraded = source.map(|handle| a.duplicate(handle, GENERIC_READ, 0));
+        let upgraded_granted = match upgraded {
+            Ok(Ok(copy)) => {
+                let granted = a.granted(copy);
+                a.close(copy);
+                Ok(granted)
+            }
+            Ok(Err(status)) | Err(status) => Err(status),
+        };
+        let no_upgrade = source.map(|handle| a.duplicate(handle, GENERIC_READ, 8).err());
+        let source_tight = a.open_directory("\\OpenNtAcl\\DupEstreita", DIRECTORY_QUERY);
+        let denied = source_tight.map(|handle| a.duplicate(handle, GENERIC_READ, 0).err());
+        for handle in [wide, tight, source, source_tight].into_iter().flatten() {
+            a.close(handle);
+        }
+        (upgraded_granted, no_upgrade, denied)
+    });
+    let Some((upgraded_granted, no_upgrade, denied)) = ran else {
+        assert(false, "acl: processo de A para o NtDuplicateObject");
+        return;
+    };
+    crate::debug_print!("[acl] NtDuplicateObject: GENERIC_READ -> {:x?}, opcao 8 -> {:x?}, sem READ_CONTROL -> {:x?}", upgraded_granted, no_upgrade, denied);
+    assert(upgraded_granted == Ok(READ_CONTROL | DIRECTORY_QUERY | DIRECTORY_TRAVERSE), "acl: NtDuplicateObject com GENERIC_READ de um diretorio aberto so com DIRECTORY_QUERY concede pelo descritor (ObpGrantAccess no destino)");
+    assert(no_upgrade == Ok(Some(STATUS_ACCESS_DENIED)), "acl: NtDuplicateObject com DUPLICATE_NO_RIGHTS_UPGRADE recusa direitos alem dos da origem");
+    assert(denied == Ok(Some(STATUS_ACCESS_DENIED)), "acl: NtDuplicateObject com GENERIC_READ recusado quando o descritor nao da READ_CONTROL");
+}
+
 /// O descritor do processo e os direitos implícitos de processo e thread.
 fn process_and_thread(assert: Assert) {
     let ran = as_identity("acl-processo.exe", &user_a(), MEDIUM_INTEGRITY, &[], |a, process_id| {
@@ -573,6 +639,7 @@ pub fn run(assert: Assert) {
         take_ownership(assert);
         process_and_thread(assert);
         kernel_events_without_descriptor(assert);
+        duplicate_rights_upgrade(assert);
         if let Ok(directory) = directory {
             root.close(directory);
         }
