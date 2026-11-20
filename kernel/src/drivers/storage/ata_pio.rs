@@ -606,6 +606,16 @@ pub fn read_sectors_pio(lba: u64, count: u32, drive: u8) -> Result<Vec<u8>, Kern
     Ok(out)
 }
 
+/// Uma escrita em `[lba, lba + count)`: o cache de metadados
+/// (`sector_cache`) esquece as unidades cobertas antes do comando e de novo
+/// depois dele, com sucesso ou não.
+fn writing<T>(lba: u64, count: u32, drive: u8, write: impl FnOnce() -> Result<T, KernelError>) -> Result<T, KernelError> {
+    super::sector_cache::invalidate(lba, count as u64, drive);
+    let result = write();
+    super::sector_cache::invalidate(lba, count as u64, drive);
+    result
+}
+
 /// Grava setores completos por DMA a partir do buffer físico de passagem.
 pub fn write_sectors(lba: u64, bytes: &[u8], drive: u8) -> Result<(), KernelError> {
     if bytes.len() % 512 != 0 {
@@ -613,6 +623,10 @@ pub fn write_sectors(lba: u64, bytes: &[u8], drive: u8) -> Result<(), KernelErro
     }
     let count = (bytes.len() / 512) as u32;
     validate_range(lba, count as u64, drive)?;
+    writing(lba, count, drive, || write_sectors_dma(lba, bytes, count, drive))
+}
+
+fn write_sectors_dma(lba: u64, bytes: &[u8], count: u32, drive: u8) -> Result<(), KernelError> {
     let mut done = 0;
     while done < count {
         let chunk = READ_BOUNCE_SECTORS.min(count - done);
@@ -633,6 +647,10 @@ pub fn write_sectors_pio(lba: u64, bytes: &[u8], drive: u8) -> Result<(), Kernel
     }
     let count = (bytes.len() / 512) as u32;
     validate_range(lba, count as u64, drive)?;
+    writing(lba, count, drive, || write_sectors_pio_commands(lba, bytes, count, drive))
+}
+
+fn write_sectors_pio_commands(lba: u64, bytes: &[u8], count: u32, drive: u8) -> Result<(), KernelError> {
     let mut done = 0;
     while done < count {
         let chunk = (count - done).min(256);

@@ -4445,6 +4445,17 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     os prazos lidos do Registro; o teste `ata-falha` (`--ata-fault=read`)
     põe o volume de dados atrás do filtro blkdebug do QEMU, que devolve um
     erro de E/S a uma leitura do kernel.
+  - O NTFS interno lê os registros do MFT e os blocos INDX dos diretórios
+    pelo cache de setores (`drivers/storage/sector_cache.rs`), como o NTFS
+    do Windows os lê pelo Cache Manager: unidades alinhadas de 4 KB em
+    frames do PFN (até 16 MB, com despejo da menos usada). Toda escrita no
+    disco passa pelo `ata_pio::write_sectors` (ou a versão PIO), que tira
+    do cache as unidades cobertas antes e depois do comando; uma leitura
+    que cruzou uma escrita não entra no cache, e as escritas pendentes de
+    uma transação continuam sobrepostas pelo volume. Antes, cada `stat`,
+    passo de caminho e enumeração de diretório lia o disco de novo: no boot
+    até a barra de tarefas, um terço do tempo da CPU ia para o DMA dessas
+    leituras.
   - O `--start-driver` de um driver de file system (Type 2) cria o volume e
     abre e lê um arquivo conhecido pelos exports
     (`ntos/test/file_system_mount.rs`); a fase 6 cobre o caminho com dois

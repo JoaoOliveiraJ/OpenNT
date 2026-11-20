@@ -16,7 +16,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::drivers::storage::ata_pio;
+use crate::drivers::storage::{ata_pio, sector_cache};
 use crate::hal::physical;
 use crate::rtl::{KernelError, SharedLock, SpinLock};
 
@@ -547,7 +547,22 @@ impl Ntfs {
     /// Lê setores com as escritas pendentes sobrepostas.
     pub fn read_sectors(&self, lba: u64, count: u64) -> Result<Vec<u8>, KernelError> {
         let _shared = self.resource().acquire_shared();
-        let mut bytes = ata_pio::read_sectors(lba, count as u32, self.drive)?;
+        let bytes = ata_pio::read_sectors(lba, count as u32, self.drive)?;
+        Ok(self.overlay_pending(lba, count, bytes))
+    }
+
+    /// Setores de metadados (os registros do MFT e os blocos INDX) pelo
+    /// cache de setores do disco (`sector_cache`), com as escritas pendentes
+    /// sobrepostas como em [`Self::read_sectors`].
+    pub fn read_metadata_sectors(&self, lba: u64, count: u64) -> Result<Vec<u8>, KernelError> {
+        let _shared = self.resource().acquire_shared();
+        let bytes = sector_cache::read(lba, count, self.drive, self.geometry.total_sectors)?;
+        Ok(self.overlay_pending(lba, count, bytes))
+    }
+
+    /// As escritas pendentes da transação em curso por cima de `count`
+    /// setores lidos a partir de `lba`.
+    fn overlay_pending(&self, lba: u64, count: u64, mut bytes: Vec<u8>) -> Vec<u8> {
         for operation in self.pending.lock().iter() {
             let first = lba.max(operation.lba);
             let last = (lba + count).min(operation.lba + operation.count);
@@ -560,7 +575,7 @@ impl Ntfs {
                 None => bytes[target].fill(0),
             }
         }
-        Ok(bytes)
+        bytes
     }
 
     /// Registro MFT com fixup.
@@ -568,7 +583,7 @@ impl Ntfs {
         let _shared = self.resource().acquire_shared();
         let volume = &self.geometry;
         let offset = volume.mft_lcn * volume.cluster_size + number * volume.record_size;
-        let mut record = self.read_sectors(offset / volume.sector_size, volume.record_size / volume.sector_size)?;
+        let mut record = self.read_metadata_sectors(offset / volume.sector_size, volume.record_size / volume.sector_size)?;
         if &record[0..4] != b"FILE" {
             return Err(KernelError::new(alloc::format!("NTFS: record sem magic FILE (rec {number})")));
         }
@@ -695,7 +710,7 @@ impl Ntfs {
                 }
                 let take = (block_size - done).min(run_end - cursor);
                 let physical_offset = run.lcn as u64 * self.geometry.cluster_size + cursor - run_start;
-                let sectors = self.read_sectors(physical_offset / self.geometry.sector_size, take / self.geometry.sector_size)?;
+                let sectors = self.read_metadata_sectors(physical_offset / self.geometry.sector_size, take / self.geometry.sector_size)?;
                 block[done as usize..(done + take) as usize].copy_from_slice(&sectors[..take as usize]);
                 cursor += take;
                 done += take;
