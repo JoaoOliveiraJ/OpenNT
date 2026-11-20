@@ -216,7 +216,7 @@ coberto_pela_suite = true
 id = "shell"
 titulo = "Teste do shell"
 marcador = "[shell] pronto"
-comando = "cargo xtask test-boot KERNEL_RS_OK 120000 \"--keys=run hello\\nps\\n\" \"--expect== 42\" \"--expect=PID  STATE\""
+comando = "cargo xtask test-boot KERNEL_RS_OK 120000 --smp=1 \"--keys=run hello\\nps\\n\" \"--expect== 42\" \"--expect=PID  STATE\""
 descricao = "Espera o shell, digita comandos pelo monitor do QEMU (run hello, ps) e confere a saída: teclado, IPC, shell e console. Com os binários do Windows no build, as teclas chegam pelo i8042prt.sys e pelo kbdclass.sys reais."
 
 [[teste]]
@@ -599,7 +599,7 @@ descricao = "Boot com --kd=com2 e o roteiro xtask/scripts/kd-parada.txt, com os 
 id = "bugcheck"
 titulo = "Tela de bugcheck pelo despejo manual do teclado"
 marcador = "[bugcheck] maquina parada"
-comando = "cargo xtask test-boot \"[shell] pronto\" 300000 --display=basic --build-dir=build/bugcheck \"--keys={ctrl_r-scroll_lock-scroll_lock}\" --expect-stop \"--expect=*** STOP (KeBugCheckEx): 0x000000e2\" \"--expect=[kcrash] parada dentro de KeBugCheckEx, chamada de i8042prt.sys+\" \"--expect=[bugcheck] codigo de parada: MANUALLY_INITIATED_CRASH\" \"--expect=[bugcheck] tela de bugcheck: framebuffer 1024x768 (tipo 2), fonte do BIOS carregada\" \"--expect=[bugcheck] callback (motivo 2)\" \"--expect=[bugcheck] coleta de dados do erro: 100%\" \"--expect=[bugcheck] maquina parada\""
+comando = "cargo xtask test-boot \"[shell] pronto\" 300000 --display=basic --build-dir=build/bugcheck --smp=2 \"--keys={ctrl_r-scroll_lock-scroll_lock}\" --expect-stop \"--expect=*** STOP (KeBugCheckEx): 0x000000e2\" \"--expect=[kcrash] parada dentro de KeBugCheckEx, chamada de i8042prt.sys+\" \"--expect=[bugcheck] codigo de parada: MANUALLY_INITIATED_CRASH\" \"--expect=[bugcheck] tela de bugcheck: framebuffer 1024x768 (tipo 2), fonte do BIOS carregada\" \"--expect=[bugcheck] callback (motivo 2)\" \"--expect=[bugcheck] coleta de dados do erro: 100%\" \"--expect=[bugcheck] maquina parada\""
 descricao = "Com o vídeo de boot do carregador (--display=basic, o modo VBE 1024x768x32), o teste segura o Ctrl direito e aperta o Scroll Lock duas vezes pelo monitor do QEMU: é o despejo manual pelo teclado do Windows (CrashOnCtrlScroll), e o próprio i8042prt.sys real, na ISR do teclado, chama KeBugCheckEx(MANUALLY_INITIATED_CRASH). Depois da linha STOP, o bloco [kcrash] do diagnóstico mostra a rotina chamada (o KeBugCheckEx, pelo slot da IAT da instrução de chamada), o ponto do i8042prt.sys de onde ela veio, os registradores e a pilha desenrolada pela .pdata. O kernel segue o KeBugCheck2: grava o KiBugCheckData, congela os outros processadores pela NMI, acha o nome do código na tabela de mensagens da imagem do kernel, desenha a tela de bugcheck do Windows 10 no framebuffer (fundo azul, o \":(\", o parágrafo e o progresso nos textos do bootres.dll.mui da instalação, o código de parada), roda os callbacks de motivo dos drivers reais, publica os dados do erro na serial com o progresso chegando a 100% e, com o AutoReboot desligado no CrashControl, para a máquina com a tela à vista. A captura do site é essa tela."
 
 [[teste]]
@@ -627,7 +627,7 @@ descricao = "Como o teste shutdown, mas com o NtShutdownSystem(ShutdownReboot): 
 id = "shell-shutdown"
 titulo = "Comando shutdown do shell"
 marcador = "desligando (ShutdownPowerOff)"
-comando = "cargo xtask test-boot KERNEL_RS_OK 240000 \"--keys=shutdown\\n\" \"--expect=desligando (ShutdownPowerOff)\" --expect=SHUTDOWN_NOTIFIED --expect=FLUSHED --expect=POWER_OFF --expect-poweroff"
+comando = "cargo xtask test-boot KERNEL_RS_OK 240000 --smp=2 \"--keys=shutdown\\n\" \"--expect=desligando (ShutdownPowerOff)\" --expect=SHUTDOWN_NOTIFIED --expect=FLUSHED --expect=POWER_OFF --expect-poweroff"
 descricao = "No boot comum, o shell recebe o comando shutdown pelo teclado, que chama o NtShutdownSystem(ShutdownPowerOff) de modo kernel: o desligamento ordenado avisa o mountmgr.sys pela fila do IoRegisterShutdownNotification (SHUTDOWN_NOTIFIED), descarrega as hives e o Cache Manager (FLUSHED) e a HAL desliga a máquina pelo S5 da ACPI (POWER_OFF); o QEMU sai sozinho, com o evento SHUTDOWN do QMP de motivo guest-shutdown."
 
 [[teste]]
