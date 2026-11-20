@@ -2,7 +2,8 @@
 //! (`--initial-process=smss`).
 //!
 //! As sessões de autologger do log de eventos
-//! (`Control\WMI\Autologger\EventLog-System` e `EventLog-Application`), que o
+//! (`Control\WMI\Autologger\EventLog-System`, `EventLog-Application` e
+//! `EventLog-Security`), que o
 //! kernel inicia no boot (o EtwpInitializeAutoLoggers do 19041): os valores
 //! da sessão e as subchaves dos provedores do próprio Windows, como esta
 //! instalação os tem. O services.exe grava os eventos do Service Control
@@ -37,9 +38,12 @@
 
 use crate::host_language::HostKey;
 
-/// As sessões de autologger do log de eventos.
+/// As sessões de autologger do log de eventos. A EventLog-Security (sem
+/// provedores nas subchaves) é a do canal Security: o
+/// EventSession::AssertSession do wevtsvc a consulta pelo nome
+/// (ControlTraceW QUERY) e, sem ela, lança o erro e o serviço para.
 #[cfg(windows)]
-const AUTOLOGGERS: &[&str] = &["EventLog-System", "EventLog-Application"];
+const AUTOLOGGERS: &[&str] = &["EventLog-System", "EventLog-Application", "EventLog-Security"];
 
 /// As subchaves de `Services\EventLog` de uma instalação nova: o
 /// Parameters (o ServiceDll), o State e os canais clássicos.
