@@ -275,6 +275,17 @@ pub fn software_keys() -> Vec<HostKey> {
         // desempacotamento do svchost que registra a fábrica da
         // GlobalBrokerInstance).
         registry::copy(registry::LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Svchost\\LocalService", "Microsoft\\Windows NT\\CurrentVersion\\Svchost\\LocalService", true, &mut keys);
+        // Os desempacotadores de confiança do sistema
+        // (`Classes\Unmarshalers\System\{clsid}`): com a política de
+        // desempacotamento forte dos grupos do svchost (`COM_UnmarshalingPolicy`
+        // 1 no `Svchost\LocalService` e em mais 18 grupos), o
+        // CheckSystemTrustedUnmarshalerKey do combase só aceita um
+        // desempacotador personalizado com a chave dele aqui; sem ela, o
+        // ActivationPropertiesIn ({00000338-...}) que o RPCSS manda no
+        // GetClassObject é recusado com E_ACCESSDENIED antes de a chamada
+        // chegar ao servidor (a ativação da GlobalBrokerInstance do dwm.exe e
+        // as dos servidores COM dos outros grupos fortes falham).
+        registry::copy(registry::LOCAL_MACHINE, "SOFTWARE\\Classes\\Unmarshalers", "Classes\\Unmarshalers", true, &mut keys);
         registry::copy(registry::LOCAL_MACHINE, "SOFTWARE\\Microsoft\\SecurityManager\\TransientObjects", "Microsoft\\SecurityManager\\TransientObjects", true, &mut keys);
         // Os provedores de autenticação do RPC (o número do serviço de
         // autenticação e o DLL dele: 9, 10 e 16 no sspicli.dll, 14 no
@@ -320,6 +331,18 @@ fn scrub_product_policy(blob: &mut [u8]) {
             blob[at + 16 + name_size..at + 16 + name_size + data_size].fill(0);
         }
         at += size;
+    }
+}
+
+#[cfg(all(test, windows))]
+mod software_tests {
+    /// O desempacotador do ActivationPropertiesIn ({00000338-...}) na lista
+    /// de confiança do sistema que o CheckSystemTrustedUnmarshalerKey do
+    /// combase abre nos grupos de política forte.
+    #[test]
+    fn trusted_unmarshalers_are_staged() {
+        let keys = super::software_keys();
+        assert!(keys.iter().any(|key| key.path.eq_ignore_ascii_case("Classes\\Unmarshalers\\System\\{00000338-0000-0000-C000-000000000046}")));
     }
 }
 
