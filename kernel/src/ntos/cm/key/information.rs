@@ -32,9 +32,12 @@ fn snapshot(key: &KeyView) -> Snapshot {
 /// no Full, logo depois do cabeçalho (0x2C). Sem classe, ClassOffset é
 /// 0xFFFFFFFF. As contagens e os máximos do Full e do Cached são os do KCB
 /// (`registry::KeyView::counts`). Classe acima de 8 é
-/// STATUS_INVALID_PARAMETER (NtQueryKey); Flags (5), Virtualization (6) e
-/// Trust (8) ainda não são servidas.
+/// STATUS_INVALID_PARAMETER (NtQueryKey); Trust (8) do NtQueryKey em
+/// `write_trust`; Flags (5) e Virtualization (6) ainda não são servidas.
 pub fn write(node: NodeId, absolute_path: &str, class: u32, output: u64, buffer_length: u32, output_length: u64, handle_tags: u32) -> u32 {
+    if class == 8 {
+        return write_trust(node, output, buffer_length, output_length);
+    }
     if let Some(status) = refused(class) {
         return status;
     }
@@ -132,4 +135,30 @@ fn write_snapshot(key: &Snapshot, absolute_path: &str, class: u32, output: u64, 
         return 0xC000_0005;
     }
     if (buffer_length as usize) < required { 0x8000_0005 } else { 0 }
+}
+
+/// KeyTrustInformation (CmQueryKey 19041 0x5f5bd9): depois do
+/// CmpIsKeyDeletedForKeyBody, ResultLength = 4; buffer menor dá
+/// BUFFER_TOO_SMALL. Só o bit 0 (TrustedKey) do ULONG do chamador muda: 1
+/// se a hive da chave não tem o bit 0 de CMHIVE.Flags (não confiável, que
+/// o CmpLoadKeyCommon liga e o CmpJoinClassOfTrust desliga). As hives do
+/// boot e a mestra são confiáveis. O ntdll RtlpValidateKeyTrust encerra o
+/// processo (FAST_FAIL_UNSAFE_REGISTRY_ACCESS) se esta consulta falha.
+fn write_trust(node: NodeId, output: u64, buffer_length: u32, output_length: u64) -> u32 {
+    if registry::is_deleted(node) {
+        return 0xC000_017C;
+    }
+    if output_length != 0 && guest::try_write::<u32>(output_length, 4).is_err() {
+        return 0xC000_0005;
+    }
+    if buffer_length < 4 {
+        return 0xC000_0023;
+    }
+    let trusted = registry::owning_hive(node).is_none_or(|hive| registry::trust_class(hive).is_none());
+    let Ok(current) = guest::try_read::<u32>(output) else { return 0xC000_0005 };
+    let value = if trusted { current | 1 } else { current & !1 };
+    if guest::try_write::<u32>(output, value).is_err() {
+        return 0xC000_0005;
+    }
+    0
 }

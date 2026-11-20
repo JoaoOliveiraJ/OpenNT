@@ -99,6 +99,13 @@ fn key_information_classes(assert: Assert) {
     let name = unsafe { KeyNameInformation::at(buffer) };
     assert(key_information::write(node, path, 3, buffer, 0x200, length, 0) == 0 && name.name_length.get() == path.len() as u32 * 2 && name.name[0].get() == b'\\' as u16, "keyinfo: Name com caminho absoluto");
     assert(key_information::write(node, path, 7, buffer, 0x200, length, 0x5) == 0 && unsafe { KeyHandleTagsInformation::at(buffer) }.handle_tags.get() == 5 && key_information::write(node, path, 5, buffer, 0x200, length, 0) == 0xC000_0003, "keyinfo: HandleTags e classe invalida");
+    // KeyTrustInformation (CmQueryKey 0x5f5bd9): ResultLength 4, só o bit 0
+    // do ULONG do chamador muda; a hive do boot é confiável.
+    guest::write32(buffer, 0xFFFF_FFFE);
+    let trust = key_information::write(node, path, 8, buffer, 4, length, 0);
+    assert(trust == 0 && guest::read32(length) == 4 && guest::read32(buffer) == 0xFFFF_FFFF, "keyinfo: Trust numa hive do boot liga TrustedKey e preserva os outros bits");
+    guest::write32(length, 0);
+    assert(key_information::write(node, path, 8, buffer, 3, length, 0) == 0xC000_0023 && guest::read32(length) == 4, "keyinfo: Trust com buffer menor que 4 = BUFFER_TOO_SMALL com ResultLength 4");
     // KEY_VALUE_*.
     let value = registry::get_value(handle, "valor").unwrap_or(registry::Value { name: alloc::string::String::new(), value_type: 0, data: alloc::vec::Vec::new() });
     let partial = unsafe { KeyValuePartialInformation::at(buffer) };

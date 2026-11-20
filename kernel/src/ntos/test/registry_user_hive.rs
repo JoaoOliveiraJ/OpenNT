@@ -220,6 +220,14 @@ fn mount_user_hives(assert: Assert) -> (u64, u64) {
     let hidden_system = |path: &str| file_attributes(path).is_some_and(|attributes| attributes & 6 == 6);
     assert(hidden_system("/opennt-ntuser.dat.LOG1") && hidden_system("/opennt-ntuser.dat.LOG2"), "userhive: a carga cria o .LOG1 e o .LOG2 ocultos e de sistema");
     assert(user.and_then(registry::trust_class) == user, "userhive: a hive do NtLoadKey e nao confiavel, na propria classe de confianca");
+    // ZwQueryKey(KeyTrustInformation): o bit 0 do CMHIVE.Flags que o
+    // CmpLoadKeyCommon liga aparece como TrustedKey = 0.
+    let key = open(USER, false);
+    let trust = guest::alloc_bytes(8);
+    guest::write32(trust, 0xFFFF_FFFF);
+    let queried = status(call_export("ZwQueryKey", &[key, 8, trust, 4, trust + 4]));
+    close(key);
+    assert(queried == 0 && guest::read32(trust) == 0xFFFF_FFFE && guest::read32(trust + 4) == 4, "userhive: ZwQueryKey(KeyTrustInformation) na hive do NtLoadKey desliga TrustedKey");
     // NtLoadKey3: parâmetros estendidos repetidos ou desconhecidos.
     let (repeated, _) = load3(CLASSES, CLASSES_FILE, 0x800, &[(1, root), (1, root)]);
     let (unknown, _) = load3(CLASSES, CLASSES_FILE, 0x800, &[(7, 0)]);
