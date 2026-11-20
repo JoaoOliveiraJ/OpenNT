@@ -41,12 +41,15 @@ impl Pending for super::kernel_wait::Request {
 static WAITERS: SpinLock<BTreeSet<u64>> = SpinLock::new(BTreeSet::new());
 
 /// O transporte mudou: as threads de kernel paradas numa espera do ALPC
-/// voltam à fila e sondam a operação delas de novo.
+/// voltam à fila e sondam a operação delas de novo. Saem com o incremento do
+/// AlpcpSignal do 19041 (o KeReleaseSemaphoreEx do AlpcWaitSemaphore com
+/// Increment 1, 0x20571a); lá só a destinatária acorda, aqui todas as que
+/// vigiam o transporte.
 pub fn notify_waiters() {
     crate::ntos::ke::dispatcher::note_wake();
     let waiters: alloc::vec::Vec<u64> = WAITERS.lock().iter().copied().collect();
     for thread in waiters {
-        wait::wake(thread);
+        wait::wake_with_increment(thread, 1);
     }
 }
 

@@ -545,6 +545,124 @@ pub fn make_ready(thread: u64) -> Result<(), KernelError> {
     Ok(())
 }
 
+/// KTHREAD.AdjustReason (KADJUST_REASON): AdjustUnwait, o que o
+/// KiExitDispatcher grava nas threads que o sinal tirou da espera.
+pub const ADJUST_UNWAIT: u8 = 1;
+
+/// O incremento do KeAlertThread (19041 0x35beb1: r13d = 2, o Increment do
+/// KiExitDispatcher em 0x35bf26).
+pub const ALERT_INCREMENT: i8 = 2;
+
+/// Dois ticks do relógio do 19041 (KeMaximumIncrement, 15,625 ms) no tick em
+/// ms do OpenNT, arredondado para cima como o [`STARVATION_READY_MS`]: a
+/// espera mais curta que isso ainda ganha o impulso por cima da prioridade
+/// corrente (0x2c4657 `cmp eax, 2`).
+const UNWAIT_LONG_WAIT_MS: u32 = ((2 * super::clock::MAXIMUM_INCREMENT as u64).div_ceil(10_000)) as u32;
+
+/// O KiReadyThread de uma thread que um sinal tirou da espera: o
+/// KiExitDispatcher (0x2c4150) drena a DeferredReadyListHead gravando
+/// AdjustReason = AdjustUnwait e AdjustIncrement = o Increment do sinal
+/// (0x2c4231/0x2c4238), e o KiDeferredReadySingleThread aplica o ajuste sob a
+/// ThreadLock antes da fila ([`adjust_unwait_locked`]). Só a thread que estava
+/// Waiting é ajustada (o KiTryUnwaitThread só põe na lista uma thread
+/// Waiting, 0x2c2f14); uma já pronta, reservada ou em execução fica onde
+/// está, como no [`make_ready`].
+pub fn ready_after_wait(thread: u64, increment: i8) -> Result<(), KernelError> {
+    initialize_queues();
+    super::thread_lock::with_lock_raised(thread, || {
+        let _queues = QUEUES.lock();
+        let current = thread_state(thread);
+        if current == state::READY || current == state::STANDBY || current == state::RUNNING {
+            return Ok(());
+        }
+        if current == state::TERMINATED {
+            return Err(KernelError::new("cannot ready a terminated thread"));
+        }
+        if current == state::WAITING {
+            adjust_unwait_locked(thread, increment);
+        }
+        enqueue_ready_locked(thread, false, false);
+        Ok(())
+    })
+}
+
+/// O ramo AdjustUnwait do KiDeferredReadySingleThread do 19041
+/// (0x2c45f8..0x2c4721, 0x2c4b02..0x2c4bd3, 0x2c4e28..0x2c4ef1,
+/// 0x2c50ff..0x2c5133), sob a ThreadLock e o PrcbLock, antes da fila:
+///
+/// - prioridade de tempo real (16 ou mais): nada muda;
+/// - com o quantum gasto (CycleTime >= QuantumTarget), com a base em 14 ou
+///   mais, ou depois de uma espera de dois ticks ou mais sem impulso em curso
+///   (PriorityDecrement zero), a prioridade decai como no fim de quantum
+///   ([`compute_quantum_end_priority`]: um ponto e os impulsos, sem baixar da
+///   base nem do piso) e o quantum renova no fim;
+/// - o impulso: sem DisableBoost, sem quantum gasto numa espera curta, com
+///   prioridade acima de zero e sem impulso em curso (ou só o de primeiro
+///   plano, num processo de primeiro plano), a prioridade vai a
+///   Base + Increment, mais o PsPrioritySeparation no processo de primeiro
+///   plano (MemoryPriority 2 no working set, 0x2c4667), até 15, quando isso a
+///   sobe; a parte do primeiro plano fica no ForegroundBoost
+///   (PriorityDecrement bits 0..3), que o fim de quantum desfaz.
+///
+/// Os impulsos de primeiro plano agendados (KiScheduleNextForegroundBoost) e
+/// o autoboost de locks (AbWaitEntryCount) não existem no OpenNT.
+fn adjust_unwait_locked(thread: u64, increment: i8) {
+    let target = kthread(thread);
+    // 0x2c4231..0x2c4238 e o `mov word [+0x235], 0` de 0x2c470c: o
+    // AdjustIncrement fica, Preempted e AdjustReason voltam a zero.
+    target.adjust_increment.set(increment);
+    target.preempted.set(0);
+    target.adjust_reason.set(0);
+    if target.priority.get() >= 16 {
+        return;
+    }
+    let waited = tick_count().wrapping_sub(target.wait_time.get());
+    let long_wait = waited >= UNWAIT_LONG_WAIT_MS;
+    // Os bits do `dil` do 19041: 1 quantum gasto numa espera curta, 2
+    // processo de primeiro plano, 4 quantum gasto, 8 o quantum renova.
+    let mut flags = 0u8;
+    let cycles = target.cycle_time.get();
+    if cycles >= target.quantum_target.get() {
+        flags = if long_wait { 4 } else { 5 };
+    }
+    if flags >= 4 || target.base_priority.get() >= 14 || (long_wait && target.priority_decrement.get() == 0) {
+        flags |= 8;
+        target.priority.set(compute_quantum_end_priority(thread) as i8);
+    }
+    // SAFETY: o processo dono de uma thread viva.
+    let process = unsafe { crate::ntos::inc::types::Eprocess::at(target.process.get()) };
+    if process.vm.instance.flags.memory_priority.get() == 2 {
+        flags |= 2;
+    }
+    let priority = target.priority.get() as i32;
+    let decrement = target.priority_decrement.get() as u8;
+    let eligible = decrement == 0 || (decrement & 0xF0 == 0 && flags & 2 != 0);
+    if target.disable_boost() == 0 && flags & 1 == 0 && priority > 0 && eligible {
+        let unwait = target.base_priority.get() as i32 + increment as i32;
+        let mut boosted = unwait;
+        if flags & 2 != 0 {
+            boosted += crate::ntos::ps::quantum::priority_separation() as i32;
+        }
+        boosted = boosted.min(15);
+        if boosted > priority {
+            // 0x2c4ef1..0x2c4f07: o que passou da base + incremento é do
+            // primeiro plano (aritmética de byte).
+            let foreground = if boosted > unwait { (boosted - unwait) as u8 } else { 0 };
+            target.priority_decrement.set(((decrement & 0xF0) | (foreground & 0x0F)) as i8);
+            target.priority.set(boosted as i8);
+        }
+    }
+    // 0x2c4b02..0x2c4b1e: CycleTime + QuantumReset * KiCyclesPerClockQuantum,
+    // sem a doação de quantum.
+    if flags & 8 != 0 {
+        let reset = target.quantum_reset.get() as u32;
+        target.quantum_target.set(cycles.wrapping_add(reset.wrapping_mul(cycles_per_quantum()) as u64));
+        if target.quantum_donation() != 0 {
+            target.set_quantum_donation(0);
+        }
+    }
+}
+
 pub fn suspend(thread: u64, new_state: u8) -> Result<(), KernelError> {
     {
         let _queues = QUEUES.lock();

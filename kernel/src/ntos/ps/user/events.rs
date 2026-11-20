@@ -269,8 +269,18 @@ fn modify(handle: u64, previous: u64, operation: fn(u64) -> u32) -> u32 {
     if written.is_err() { 0xC000_0005 } else { 0 }
 }
 
+/// O KeSetEvent(Event, EVENT_INCREMENT, FALSE) do NtSetEvent (0x6625c1).
+fn set_event_from_service(event: u64) -> u32 {
+    dispatcher::set_event_with_increment(event, dispatcher::SYNCHRONIZATION_INCREMENT)
+}
+
+/// O KePulseEvent(Event, EVENT_INCREMENT, FALSE) do NtPulseEvent (0x6bf575).
+fn pulse_event_from_service(event: u64) -> u32 {
+    dispatcher::pulse_event_with_increment(event, dispatcher::SYNCHRONIZATION_INCREMENT)
+}
+
 fn nt_set_event(handle: u64, previous: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
-    let status = modify(handle, previous, dispatcher::set_event);
+    let status = modify(handle, previous, set_event_from_service);
     if status == 0 {
         if let Ok(object) = reference(handle, 0) {
             crate::ntos::init::initial_process::event_set(&object.name);
@@ -292,7 +302,7 @@ fn nt_clear_event(handle: u64, _a2: u64, _a3: u64, _a4: u64, _rsp: u64) -> Resul
 /// 0x6bf4f0): a mesma ordem do NtSetEvent (sonda, EVENT_MODIFY_STATE) com o
 /// KePulseEvent, que acorda os que esperam e deixa o evento não sinalizado.
 fn nt_pulse_event(handle: u64, previous: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
-    Ok(modify(handle, previous, dispatcher::pulse_event))
+    Ok(modify(handle, previous, pulse_event_from_service))
 }
 
 /// NtSetEventBoostPriority(EventHandle) (rva 0x94f390): EVENT_MODIFY_STATE;

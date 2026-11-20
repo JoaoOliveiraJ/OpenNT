@@ -221,22 +221,34 @@ fn remove_entry(entry: &ListEntry) {
 }
 
 /// O lock do despachante. As threads que uma saída de espera apronta entram
-/// na fila depois de o lock ser solto.
+/// na fila depois de o lock ser solto, com o ajuste de prioridade de quem
+/// sai de uma espera e o incremento do sinal (o KiExitDispatcher que drena a
+/// DeferredReadyListHead, `thread_dispatch::ready_after_wait`).
 pub struct DispatcherLock {
     guard: Option<SpinLockGuard<'static, WaitTable>>,
     ready: Vec<u64>,
+    /// O Increment do KeSetEvent, KeReleaseSemaphore, KeReleaseMutant,
+    /// KePulseEvent, KeInsertQueueApc ou KeAlertThread que tirou as threads
+    /// da espera (zero no vencimento de um timer, como o KiTimerWaitTest,
+    /// 0x24767b, e nos sinais internos).
+    increment: i8,
 }
 
 /// Toma o lock do despachante.
 pub fn lock() -> DispatcherLock {
-    DispatcherLock { guard: Some(DISPATCHER.lock()), ready: Vec::new() }
+    lock_with_increment(0)
+}
+
+/// Toma o lock do despachante para um sinal com o incremento `increment`.
+pub fn lock_with_increment(increment: i8) -> DispatcherLock {
+    DispatcherLock { guard: Some(DISPATCHER.lock()), ready: Vec::new(), increment }
 }
 
 impl Drop for DispatcherLock {
     fn drop(&mut self) {
         self.guard.take();
         for thread in core::mem::take(&mut self.ready) {
-            if let Err(error) = thread_dispatch::make_ready(thread) {
+            if let Err(error) = thread_dispatch::ready_after_wait(thread, self.increment) {
                 debug_print!("[wait] thread {:#x} nao entrou na fila pronta: {}", thread, error);
             }
             scheduler::thread_readied(thread);
@@ -465,8 +477,15 @@ pub fn set_signal_observer(observer: fn(u64)) {
 /// espera nele: as threads de kernel registradas e, já fora do lock do
 /// despachante, os pacotes de espera associados ao objeto.
 pub fn signal(object: u64) {
+    signal_with_increment(object, 0);
+}
+
+/// [`signal`] com o Increment do sinal (o KeSetEvent, o KeReleaseSemaphore,
+/// o KeReleaseMutant, o KePulseEvent): as threads que ele tira da espera
+/// ganham o impulso (`thread_dispatch::ready_after_wait`).
+pub fn signal_with_increment(object: u64, increment: i8) {
     dispatcher::note_wake();
-    lock().wait_test(object);
+    lock_with_increment(increment).wait_test(object);
     let observer = *SIGNAL_OBSERVER.lock();
     if let Some(observer) = observer {
         observer(object);
@@ -776,8 +795,14 @@ fn cancel(thread: u64) {
 /// conclusão, uma mensagem ALPC que chegou): ela volta à fila e sonda de
 /// novo. Uma espera de objeto não é tocada.
 pub fn wake(thread: u64) -> bool {
+    wake_with_increment(thread, 0)
+}
+
+/// [`wake`] com o incremento de quem acorda (o KeAlertThreadByThreadId, 1 em
+/// 0x25c312; o KeReleaseSemaphoreEx do AlpcpSignal, 1 em 0x20571a).
+pub fn wake_with_increment(thread: u64, increment: i8) -> bool {
     dispatcher::note_wake();
-    let mut lock = lock();
+    let mut lock = lock_with_increment(increment);
     if !lock.table().waits.get(&thread).is_some_and(|wait| wait.explicit) {
         return false;
     }
@@ -786,22 +811,26 @@ pub fn wake(thread: u64) -> bool {
 
 /// Um alerta para `thread` (KeAlertThread): uma espera registrada alertável,
 /// de modo igual ou menor que o da espera, sai com STATUS_ALERTED. `true` se
-/// a espera saiu.
+/// a espera saiu. Quem chama segura a ThreadLock dela e a apronta depois de
+/// soltá-la, com o ALERT_INCREMENT (`thread_alert::alert`): aqui ela não
+/// entra na fila.
 pub fn alert(thread: u64, mode: u8) -> bool {
     let mut lock = lock();
     let Some(wait) = lock.table().waits.get(&thread) else { return false };
     if !wait.alertable || mode > wait.mode {
         return false;
     }
-    lock.unwait(thread, STATUS_ALERTED as u64)
+    let woken = lock.unwait(thread, STATUS_ALERTED as u64);
+    lock.ready.retain(|&ready| ready != thread);
+    woken
 }
 
 /// Uma APC enfileirada para `thread` (o KiInsertQueueApc): a de usuário numa
 /// espera alertável de UserMode publica UserApcPending e sai com
 /// STATUS_USER_APC; a de kernel numa espera em PASSIVE_LEVEL, com as APCs
 /// do tipo dela habilitadas, sai com STATUS_KERNEL_APC.
-pub fn apc_queued(thread: u64, user_mode: bool, special: bool) {
-    let mut lock = lock();
+pub fn apc_queued(thread: u64, user_mode: bool, special: bool, increment: i8) {
+    let mut lock = lock_with_increment(increment);
     let target = kthread(thread);
     let Some(wait) = lock.table().waits.get(&thread) else {
         // Uma thread de kernel numa espera sondada, parada em PASSIVE_LEVEL,

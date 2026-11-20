@@ -100,8 +100,10 @@ fn initialize_event(call: &Call) -> Result<u64, KernelError> {
     dispatcher::initialize_event(call.arg(1), call.arg(2) as u8, call.arg(3) & 0xFF != 0);
     Ok(0)
 }
+/// KeSetEvent(Event, Increment, Wait): o KPRIORITY Increment vai em byte
+/// ao AdjustIncrement (0x2c4238).
 fn set_event(call: &Call) -> Result<u64, KernelError> {
-    Ok(dispatcher::set_event(call.arg(1)) as u64)
+    Ok(dispatcher::set_event_with_increment(call.arg(1), call.arg(2) as u8 as i8) as u64)
 }
 fn clear_event(call: &Call) -> Result<u64, KernelError> {
     dispatcher::clear_event(call.arg(1));
@@ -190,8 +192,9 @@ fn initialize_semaphore(call: &Call) -> Result<u64, KernelError> {
     dispatcher::initialize_driver_semaphore(call.arg(1), call.arg(2) as u32, call.arg(3) as u32);
     Ok(0)
 }
+/// KeReleaseSemaphore(Semaphore, Increment, Adjustment, Wait).
 fn release_semaphore(call: &Call) -> Result<u64, KernelError> {
-    Ok(dispatcher::release_driver_semaphore(call.arg(1), call.arg(3) as i32) as i64 as u64)
+    Ok(dispatcher::release_driver_semaphore_with_increment(call.arg(1), call.arg(3) as i32, call.arg(2) as u8 as i8) as i64 as u64)
 }
 fn initialize_guarded_mutex(call: &Call) -> Result<u64, KernelError> {
     fast_mutex::initialize(call.arg(1));
@@ -296,8 +299,9 @@ fn initialize_apc(call: &Call) -> Result<u64, KernelError> {
     apc::initialize(call.arg(1), call.arg(2), call.arg(3) as u8, call.arg(4), call.arg(5), call.arg(6), call.arg(7) as u8, call.arg(8));
     Ok(0)
 }
+/// KeInsertQueueApc(Apc, SystemArgument1, SystemArgument2, Increment).
 fn insert_queue_apc(call: &Call) -> Result<u64, KernelError> {
-    Ok(apc::insert(call.arg(1), call.arg(2), call.arg(3)) as u64)
+    Ok(apc::insert_with_increment(call.arg(1), call.arg(2), call.arg(3), call.arg(4) as u8 as i8) as u64)
 }
 fn ipi_generic_call(call: &Call) -> Result<u64, KernelError> {
     Ok(callout::ipi_generic_call(call.arg(1), call.arg(2)))
@@ -678,8 +682,9 @@ pub mod ke_ex_sync {
         Ok(process_attachment::is_attached() as u64)
     }
 
+    /// KePulseEvent(Event, Increment, Wait).
     fn pulse_event(call: &Call) -> Result<u64, KernelError> {
-        Ok(dispatcher::pulse_event(call.arg(1)) as u64)
+        Ok(dispatcher::pulse_event_with_increment(call.arg(1), call.arg(2) as u8 as i8) as u64)
     }
 
     fn query_interrupt_time_precise(call: &Call) -> Result<u64, KernelError> {

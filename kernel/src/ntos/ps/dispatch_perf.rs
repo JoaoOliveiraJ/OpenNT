@@ -50,6 +50,20 @@ pub static REFRESH: Section = Section::new();
 pub static DISPATCH: Section = Section::new();
 /// Os intervalos de usuário.
 pub static SLICE: Section = Section::new();
+/// Dentro do despacho: os pumps do kernel e dos objetos de usuário (ISRs
+/// adiadas, timers, DPCs, conclusões, ALPC, E/S de dispositivo, fábricas de
+/// workers, pacotes de espera).
+pub static PUMPS: Section = Section::new();
+/// Dentro do despacho: as threads terminadas retomadas e os fins de processo
+/// adiados.
+pub static EXITS: Section = Section::new();
+/// Os passos das threads de kernel (`scheduler::run_step`), fora do despacho
+/// de usuário.
+pub static KERNEL_STEPS: Section = Section::new();
+/// As sondagens das esperas de usuário que o despacho dispensou: nada que
+/// conclua uma espera andou desde a anterior (a época de despertar e o
+/// tique do relógio).
+pub static POLLS_SKIPPED: AtomicU64 = AtomicU64::new(0);
 /// Esperas de usuário sondadas.
 pub static POLLS: AtomicU64 = AtomicU64::new(0);
 /// Trocas de processo (cargas de CR3) nas sondagens.
@@ -139,7 +153,7 @@ fn report_exits() {
     crate::debug_print!("{}", line.trim_end_matches(','));
 }
 
-const VALUES: usize = 13;
+const VALUES: usize = 18;
 
 /// O uptime da próxima linha e os totais da anterior.
 struct Last {
@@ -167,7 +181,29 @@ pub fn report_if_due() {
         let (refresh, refreshes) = REFRESH.take();
         let (dispatch, dispatches) = DISPATCH.take();
         let (slice, slices) = SLICE.take();
-        let current = [halt, halts, spin, spins, refresh, refreshes, dispatch, dispatches, slice, slices, POLLS.load(Ordering::Relaxed), SWITCHES.load(Ordering::Relaxed), CR3_LOADS.load(Ordering::Relaxed)];
+        let (pumps, _) = PUMPS.take();
+        let (exits, _) = EXITS.take();
+        let (steps, step_count) = KERNEL_STEPS.take();
+        let current = [
+            halt,
+            halts,
+            spin,
+            spins,
+            refresh,
+            refreshes,
+            dispatch,
+            dispatches,
+            slice,
+            slices,
+            POLLS.load(Ordering::Relaxed),
+            SWITCHES.load(Ordering::Relaxed),
+            CR3_LOADS.load(Ordering::Relaxed),
+            pumps,
+            exits,
+            steps,
+            step_count,
+            POLLS_SKIPPED.load(Ordering::Relaxed),
+        ];
         let mut delta = [0u64; VALUES];
         for (index, value) in current.iter().enumerate() {
             delta[index] = value.wrapping_sub(last.values[index]);
@@ -176,9 +212,9 @@ pub fn report_if_due() {
         delta
     };
     // O despacho sem os intervalos: as sondagens dele, os pumps, os fins de
-    // processo e a escolha.
+    // processo e a escolha; os passos de kernel ficam fora do despacho.
     crate::debug_print!(
-        "[perf] t={} ms: hlt {} ms ({}x), giro {} ms ({}x), sondagem {} ms ({}x, {} esperas, {} de {} cargas de CR3), despacho fora dos intervalos {} ms ({}x), intervalos {} ms ({}x)",
+        "[perf] t={} ms: hlt {} ms ({}x), giro {} ms ({}x), sondagem {} ms ({}x, {} dispensadas, {} esperas, {} de {} cargas de CR3), despacho fora dos intervalos {} ms ({}x; pumps {} ms, fins {} ms), intervalos {} ms ({}x), passos de kernel {} ms ({}x)",
         now,
         milliseconds(values[0]),
         values[1],
@@ -186,13 +222,18 @@ pub fn report_if_due() {
         values[3],
         milliseconds(values[4]),
         values[5],
+        values[17],
         values[10],
         values[11],
         values[12],
         milliseconds(values[6].saturating_sub(values[8])),
         values[7],
+        milliseconds(values[13]),
+        milliseconds(values[14]),
         milliseconds(values[8]),
-        values[9]
+        values[9],
+        milliseconds(values[15]),
+        values[16]
     );
     report_exits();
     report_threads();

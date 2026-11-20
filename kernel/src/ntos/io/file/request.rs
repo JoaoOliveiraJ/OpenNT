@@ -265,7 +265,7 @@ pub fn finish(request: &Shared) -> Result<(), KernelError> {
         let thread = r.thread;
         drop(r);
         AWAITING.lock().insert(thread);
-        wait::apc_queued(thread, false, true);
+        wait::apc_queued(thread, false, true, 0);
         return Ok(());
     }
     let status = r.status;

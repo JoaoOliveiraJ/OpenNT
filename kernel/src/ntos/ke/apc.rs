@@ -185,8 +185,16 @@ pub fn initialize(apc: u64, thread: u64, environment: u8, kernel_routine: u64, r
     packet.inserted.set(0);
 }
 
-/// KeInsertQueueApc sob KTHREAD.ThreadLock.
+/// KeInsertQueueApc sob KTHREAD.ThreadLock, sem incremento (o
+/// NtQueueApcThreadEx2 passa 0, 19041 0x5cfbcd).
 pub fn insert(apc: u64, first: u64, second: u64) -> bool {
+    insert_with_increment(apc, first, second, 0)
+}
+
+/// KeInsertQueueApc(Apc, SystemArgument1, SystemArgument2, Increment): a
+/// thread que a APC tira de uma espera ganha o impulso do Increment (o
+/// KiExitDispatcher de 0x25f26c).
+pub fn insert_with_increment(apc: u64, first: u64, second: u64, increment: i8) -> bool {
     let packet = apc_at(apc);
     let thread = packet.thread.get();
     let (user_mode, special) = (packet.apc_mode.get() != 0, packet.reserved[NORMAL_ROUTINE].get() == 0);
@@ -195,7 +203,7 @@ pub fn insert(apc: u64, first: u64, second: u64) -> bool {
         super::dispatcher::note_wake();
         // O KiInsertQueueApc: uma thread de kernel parada numa espera que a
         // APC interrompe sai dela (STATUS_KERNEL_APC/STATUS_USER_APC).
-        super::wait::apc_queued(thread, user_mode, special);
+        super::wait::apc_queued(thread, user_mode, special, increment);
     }
     inserted
 }

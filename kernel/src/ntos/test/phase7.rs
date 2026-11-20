@@ -7330,6 +7330,7 @@ pub fn run(assert: Assert) {
     crate::ntos::test::multiprocess::polled_wake::run(assert);
     crate::ntos::test::multiprocess::service_exit::run(assert);
     crate::ntos::test::multiprocess::registered_wait::run(assert);
+    crate::ntos::test::multiprocess::dispatch_overhead::run(assert);
     user_handle_table(assert);
     user_memory_helpers(assert);
     map_view_parameter_validation(assert);

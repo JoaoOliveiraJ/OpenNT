@@ -634,7 +634,7 @@ fn drive_until_stage(process: u64, offset: usize, stage: u32) -> bool {
             crate::debug_print!("[jobs] etapa {} nao alcancada em {} ms (celula {:?})", stage, STAGE_DEADLINE_MS, cell(process, offset));
             return false;
         }
-        if let Err(error) = threads::dispatch_one() {
+        if let Err(error) = threads::dispatch_round() {
             crate::debug_print!("[jobs] despacho falhou esperando a etapa {}: {}", stage, error);
             return false;
         }

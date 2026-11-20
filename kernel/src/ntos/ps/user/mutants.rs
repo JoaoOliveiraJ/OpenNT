@@ -164,7 +164,8 @@ fn nt_release_mutant(handle: u64, previous: u64, _a3: u64, _a4: u64, _rsp: u64) 
         Ok((_, pointer)) => pointer,
         Err(status) => return Ok(status),
     };
-    Ok(match dispatcher::release_mutant(pointer, false) {
+    // O KeReleaseMutant(Mutant, MUTANT_INCREMENT, FALSE, FALSE) (0x663bfb).
+    Ok(match dispatcher::release_mutant_with_increment(pointer, false, dispatcher::SYNCHRONIZATION_INCREMENT) {
         Ok(old) => {
             // LONG *PreviousCount, sondado acima.
             if previous != 0 && guest::try_write::<u32>(previous, old as u32).is_err() { 0xC000_0005 } else { 0 }

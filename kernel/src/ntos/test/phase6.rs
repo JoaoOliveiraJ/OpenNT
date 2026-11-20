@@ -16087,6 +16087,7 @@ pub fn run(assert: Assert) {
     zw_write_file(assert);
     kernel_system_threads(assert);
     super::kernel_waits::run(assert);
+    super::unwait_boost::run(assert);
     super::extended_state::run(assert);
     super::irql_cr8::run(assert);
     zw_group_exports(assert);

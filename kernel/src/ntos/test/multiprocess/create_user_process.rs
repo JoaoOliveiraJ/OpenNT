@@ -689,7 +689,7 @@ fn drive_until(parent: u64, offset: usize) -> Option<u32> {
             Some(_) => {}
             None => return None,
         }
-        if clock::uptime_ms() >= deadline || threads::dispatch_one().is_err() {
+        if clock::uptime_ms() >= deadline || threads::dispatch_round().is_err() {
             return None;
         }
     }
@@ -860,7 +860,7 @@ fn parent_creates_child(assert: Assert, services: &Services, system: u64, system
     let main = threads::of_process(child).first().cloned();
     // Voltas do despachante com o pai cedendo a CPU: o filho suspenso não roda.
     for _ in 0..SUSPENDED_ROUNDS {
-        let _ = threads::dispatch_one();
+        let _ = threads::dispatch_round();
     }
     let suspended = main.as_ref().map(|thread| thread.with(|thread| (thread.suspend_count, thread.dead, thread.teb_va)));
     let started_child = process_state::get(child).is_some_and(|state| state.started.load(Ordering::Acquire));

@@ -63,8 +63,22 @@ pub fn initialize_event(event: u64, event_type: u8, initial_state: bool) {
 /// satisfaz quem espera no evento (o de sincronização volta a não
 /// sinalizado ao entregar o sinal a uma thread).
 pub fn set_event(event: u64) -> u32 {
+    set_event_with_increment(event, 0)
+}
+
+/// O incremento dos serviços de sincronização de modo usuário: o
+/// EVENT_INCREMENT, SEMAPHORE_INCREMENT e MUTANT_INCREMENT que o NtSetEvent,
+/// o NtPulseEvent, o NtReleaseSemaphore, o NtReleaseMutant e o
+/// NtSignalAndWaitForSingleObject passam (19041 0x6625c1, 0x6bf575,
+/// 0x66193a, 0x663bfb, 0x564a28..0x564a77), e o KeReleaseMutex (0x35f9cb).
+pub const SYNCHRONIZATION_INCREMENT: i8 = 1;
+
+/// KeSetEvent(Event, Increment, Wait): [`set_event`] com o Increment, que
+/// as threads tiradas da espera ganham (`thread_dispatch::ready_after_wait`;
+/// o KeSetEvent passa o Increment ao KiExitDispatcher, 0x2c3d04).
+pub fn set_event_with_increment(event: u64, increment: i8) -> u32 {
     let previous = header_at(event).signal_state.atomic().swap(1, Ordering::SeqCst) as u32;
-    wait::signal(event);
+    wait::signal_with_increment(event, increment);
     previous
 }
 
@@ -107,7 +121,13 @@ pub fn read_state(object: u64) -> u32 {
 /// veriam o evento já não sinalizado: o pulso fica anotado para elas
 /// ([`PolledObjects`]).
 pub fn pulse_event(event: u64) -> u32 {
-    let previous = set_event(event);
+    pulse_event_with_increment(event, 0)
+}
+
+/// KePulseEvent(Event, Increment, Wait): [`pulse_event`] com o Increment
+/// (0x33ab77).
+pub fn pulse_event_with_increment(event: u64, increment: i8) -> u32 {
+    let previous = set_event_with_increment(event, increment);
     // Ainda sinalizado: nenhuma espera consumiu o sinal (o de sincronização).
     // A troca crua anota o pulso uma vez só (o `reset_event` anotaria de
     // novo); com o evento já sinalizado antes, é o reset que conta.
@@ -252,6 +272,11 @@ pub fn initialize_semaphore(semaphore: u64, count: u32, limit: u32) {
 /// ao SignalState é um compare-exchange: duas liberações simultâneas nunca
 /// perdem uma permissão nem ultrapassam o Limit.
 pub fn release_semaphore(semaphore: u64, release_count: i64) -> Result<u32, u32> {
+    release_semaphore_with_increment(semaphore, release_count, 0)
+}
+
+/// [`release_semaphore`] com o Increment do KeReleaseSemaphore.
+pub fn release_semaphore_with_increment(semaphore: u64, release_count: i64, increment: i8) -> Result<u32, u32> {
     let semaphore = semaphore_at(semaphore);
     let state = &semaphore.header.signal_state;
     let limit = semaphore.limit.get() as u32;
@@ -266,7 +291,7 @@ pub fn release_semaphore(semaphore: u64, release_count: i64) -> Result<u32, u32>
         let next = (previous as u32).wrapping_add(release_count as u32) as i32;
         match state.atomic().compare_exchange(previous, next, Ordering::SeqCst, Ordering::SeqCst) {
             Ok(_) => {
-                wait::signal(semaphore.address());
+                wait::signal_with_increment(semaphore.address(), increment);
                 return Ok(previous as u32);
             }
             Err(observed) => previous = observed,
@@ -291,6 +316,13 @@ pub fn initialize_driver_semaphore(semaphore: u64, count: u32, limit: u32) {
 /// KeReleaseSemaphore dos drivers: devolve o SignalState anterior; o novo é
 /// anterior + ajuste, limitado ao Limit (num compare-exchange).
 pub fn release_driver_semaphore(semaphore: u64, adjustment: i32) -> i32 {
+    release_driver_semaphore_with_increment(semaphore, adjustment, 0)
+}
+
+/// KeReleaseSemaphore(Semaphore, Increment, Adjustment, Wait):
+/// [`release_driver_semaphore`] com o Increment (o KiExitDispatcher de
+/// 0x2f1aab).
+pub fn release_driver_semaphore_with_increment(semaphore: u64, adjustment: i32, increment: i8) -> i32 {
     let object = semaphore;
     let semaphore = semaphore_at(semaphore);
     let limit = semaphore.limit.get();
@@ -301,7 +333,7 @@ pub fn release_driver_semaphore(semaphore: u64, adjustment: i32) -> i32 {
         match state.compare_exchange(previous, released, Ordering::SeqCst, Ordering::SeqCst) {
             Ok(_) => {
                 if released > 0 {
-                    wait::signal(object);
+                    wait::signal_with_increment(object, increment);
                 }
                 return previous;
             }
@@ -336,6 +368,12 @@ pub fn initialize_mutex(mutex: u64, _level: u32) {
 /// Exige a posse (salvo abandono explícito). `Ok(estado anterior)`. O novo
 /// SignalState entra por compare-exchange.
 pub fn release_mutant(mutex: u64, abandon: bool) -> Result<i32, u32> {
+    release_mutant_with_increment(mutex, abandon, 0)
+}
+
+/// KeReleaseMutant(Mutant, Increment, Abandoned, Wait): [`release_mutant`]
+/// com o Increment (0x2c2d12).
+pub fn release_mutant_with_increment(mutex: u64, abandon: bool, increment: i8) -> Result<i32, u32> {
     let mutant = mutant_at(mutex);
     let state = mutant.header.signal_state.atomic();
     let mut previous = state.load(Ordering::SeqCst);
@@ -356,14 +394,15 @@ pub fn release_mutant(mutex: u64, abandon: bool) -> Result<i32, u32> {
         mutant.mutant_flags.set(1);
     }
     if next == 1 {
-        wait::signal(mutex);
+        wait::signal_with_increment(mutex, increment);
     }
     Ok(previous)
 }
 
-/// KeReleaseMutex: erro ou estado anterior.
+/// KeReleaseMutex: erro ou estado anterior. O KeReleaseMutant(Mutex, 1,
+/// FALSE, Wait) do 19041 (0x35f9cb).
 pub fn release_mutex(mutex: u64) -> u32 {
-    match release_mutant(mutex, false) {
+    match release_mutant_with_increment(mutex, false, SYNCHRONIZATION_INCREMENT) {
         Ok(previous) => previous as u32,
         Err(status) => status,
     }
@@ -503,6 +542,20 @@ pub fn pump_kernel() {
         }
         return;
     }
+    pump_kernel_work();
+    // Numa espera de driver, threads de sistema podem produzir o evento.
+    pump_scheduler();
+}
+
+/// O trabalho do despachante sem o tick do escalonador: interrupções de
+/// dispositivo, timers, DPCs, o gerenciador das worker threads e as
+/// conclusões registradas. É o que o despacho de usuário roda antes de
+/// escolher (`threads::dispatch_one`): ele já roda dentro do tick, que
+/// alterna os passos das threads de kernel e os intervalos de usuário pela
+/// prioridade (o KiSwapThread do 19041 escolhe entre todas as prontas), e um
+/// tick aninhado ali rodaria as threads de kernel a cada 2 ms fora da
+/// prioridade delas, contadas como despacho de usuário.
+pub fn pump_kernel_work() {
     super::interrupt_object::service_during_wait();
     timer::check_timers();
     let _ = dpc::run_queue();
@@ -511,8 +564,6 @@ pub fn pump_kernel() {
     for pump in pumps {
         pump();
     }
-    // Numa espera de driver, threads de sistema podem produzir o evento.
-    pump_scheduler();
 }
 
 pub fn register_completion_pump(pump: fn()) {

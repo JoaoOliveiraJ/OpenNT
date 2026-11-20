@@ -302,12 +302,12 @@ impl SignalObject {
         let status = match self.type_name.as_str() {
             "Event" if user && self.access & EVENT_MODIFY_STATE == 0 => STATUS_ACCESS_DENIED,
             "Event" => {
-                dispatcher::set_event(self.pointer);
+                dispatcher::set_event_with_increment(self.pointer, dispatcher::SYNCHRONIZATION_INCREMENT);
                 0
             }
-            "Mutant" => dispatcher::release_mutant(self.pointer, false).map_or_else(|status| status, |_| 0),
+            "Mutant" => dispatcher::release_mutant_with_increment(self.pointer, false, dispatcher::SYNCHRONIZATION_INCREMENT).map_or_else(|status| status, |_| 0),
             "Semaphore" if user && self.access & SEMAPHORE_MODIFY_STATE == 0 => STATUS_ACCESS_DENIED,
-            "Semaphore" => dispatcher::release_semaphore(self.pointer, 1).map_or_else(|status| status, |_| 0),
+            "Semaphore" => dispatcher::release_semaphore_with_increment(self.pointer, 1, dispatcher::SYNCHRONIZATION_INCREMENT).map_or_else(|status| status, |_| 0),
             _ => STATUS_OBJECT_TYPE_MISMATCH,
         };
         self.held.release();

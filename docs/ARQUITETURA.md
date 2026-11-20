@@ -818,7 +818,30 @@ como a interrupção de relógio), o fim de uma thread ou de um processo
 satisfazem os blocos consumindo pela thread que espera (o evento de
 sincronização, a permissão do semáforo, a posse do mutant; o WaitAll só com
 todos disponíveis), e a saída da espera (o KiUnwaitThread) desliga os blocos,
-cancela o timer, grava KTHREAD.WaitStatus e põe a thread na fila pronta. O
+cancela o timer, grava KTHREAD.WaitStatus e põe a thread na fila pronta. A
+thread que sai da espera entra na fila com o ajuste de prioridade do
+KiDeferredReadySingleThread do 19041 (o ramo AdjustUnwait,
+`thread_dispatch::ready_after_wait`, sob a ThreadLock e o PrcbLock): o sinal
+leva o incremento dele, o Increment do KeSetEvent, KePulseEvent,
+KeReleaseSemaphore, KeReleaseMutant e KeInsertQueueApc dos drivers; 1 no
+NtSetEvent, NtPulseEvent, NtReleaseSemaphore, NtReleaseMutant,
+NtSignalAndWaitForSingleObject, KeReleaseMutex, NtAlertThreadByThreadId e na
+entrega ALPC (o AlpcpSignal; aqui todas as threads que vigiam o transporte
+acordam, não só a destinatária); 2 no KeAlertThread; zero no vencimento de um
+timer (o KiTimerWaitTest) e nos sinais internos do kernel. Abaixo de 16, a
+prioridade vai a Base + incremento, mais o PsPrioritySeparation num processo
+de primeiro plano (MemoryPriority 2 no working set; essa parte fica no
+ForegroundBoost), até 15, quando isso a sobe. Com o quantum gasto, com a base
+em 14 ou mais ou depois de uma espera de dois ticks do 19041 (32 ms) ou mais
+sem impulso em curso, a prioridade antes decai como no fim de quantum e o
+quantum renova; com DisableBoost, com um impulso incomum em curso ou com o
+quantum gasto numa espera curta, não sobe. O fim de quantum desfaz o impulso
+aos poucos (o KiComputeNewPriority). O autoteste `ntos/test/unwait_boost.rs`
+(fase 6) para uma thread de sistema num evento, grava na KTHREAD dela cada
+combinação (base, prioridade, impulso em curso, DisableBoost, espera curta ou
+longa, quantum gasto, processo de primeiro plano) e confere a prioridade, o
+PriorityDecrement e o quantum com que o KeSetEvent ou o KeAlertThread a põe
+na fila. O
 KeInsertQueue entrega a entrada direto à thread mais recente parada na fila
 (o KiInsertQueue: o bloco WaitDequeue com WrQueue entra na cabeça da
 WaitListHead; com vaga livre e quem insere fora da fila, a entrada não passa
@@ -1110,7 +1133,10 @@ interrompe com STATUS_ALERTED; nos três a vaga da fila volta.
 
 **Despachante de todos os processos.** Um despachante só serve as threads
 de usuário de todos os processos vivos (`ps/user/threads.rs`):
-`dispatch_one` roda o `pump_kernel` e os pumps de ALPC, `device_io`,
+`dispatch_one` roda o trabalho do despachante sem o tick do escalonador
+(`dispatcher::pump_kernel_work`: as interrupções de dispositivo adiadas, os
+timers, as DPCs, o gerenciador das worker threads e as conclusões
+registradas) e os pumps de ALPC, `device_io`,
 fábricas e pacotes de espera, sonda depois deles as esperas de todas as
 threads dos processos que entraram nele (`ProcessState.started`), retoma as threads
 terminadas que precisam desfazer um serviço bloqueado, conclui os términos
@@ -1136,7 +1162,25 @@ cargas de CR3, e no despacho fora dos intervalos) saem na serial a cada
 intervalo, e elas chegavam a 40% do tempo da CPU. O autoteste
 `ntos/test/multiprocess/polled_wake.rs` põe duas threads de usuário em
 pingue-pongue por dois eventos dentro de serviços de teste e conta as
-voltas num número fixo de tiques.
+voltas num número fixo de tiques. O despacho roda dentro do tick, que já
+alterna os passos das threads de kernel e os intervalos de usuário pela
+prioridade: antes, o `pump_kernel` dele aninhava um tick a cada 2 ms, que
+rodava as threads de kernel fora da prioridade delas e contava o tempo delas
+como despacho de usuário. Quem despacha fora do tick (o contexto de boot em
+`threads::wait_for_process`, os autotestes) usa `threads::dispatch_round`,
+o despacho e os passos de kernel do tick (`scheduler::tick(0)`). A sondagem
+das esperas de usuário só roda quando tem o que achar: a época de despertar
+andou ou passou um tique do relógio desde a anterior (`threads::poll_due`).
+As esperas registradas ficam prontas no próprio sinal; o tique cobre o
+prazo das esperas que ainda são sondadas, a sondagem de garantia das
+acordadas e uma condição que mude sem sinal, com no máximo um tique de
+atraso. A linha `[perf]` separa, no despacho fora dos intervalos, os pumps
+e os fins de processo, conta as sondagens dispensadas e mostra o tempo dos
+passos das threads de kernel. O autoteste
+`ntos/test/multiprocess/dispatch_overhead.rs` confere que o `dispatch_one`
+com uma thread de sistema pronta não a roda e o `dispatch_round` a roda, e
+que, no mesmo tique e sem despertar, as sondagens seguidas são dispensadas e
+um despertar ou o tique seguinte as fazem rodar.
 
 A saída de um serviço é a do KiSystemServiceExit do 19041 (0x411510; a
 opção de boot `--slow-service-exit`, SLOWSERVICEEXIT, a desliga para isolar

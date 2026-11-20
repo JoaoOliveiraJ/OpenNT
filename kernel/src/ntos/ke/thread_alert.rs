@@ -86,8 +86,9 @@ pub fn alert(thread: u64, mode: u8) -> Result<u8, KernelError> {
         previous
     });
     // A prontidão é publicada depois de soltar o ThreadLock.
+    // O KiExitDispatcher do KeAlertThread (0x35bf30) com o ALERT_INCREMENT.
     if delivered && thread_dispatch::owner(thread).is_some() {
-        thread_dispatch::make_ready(thread)?;
+        thread_dispatch::ready_after_wait(thread, thread_dispatch::ALERT_INCREMENT)?;
     }
     Ok(previous)
 }

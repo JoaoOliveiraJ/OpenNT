@@ -140,7 +140,9 @@ fn nt_release_semaphore(handle: u64, count: u64, previous: u64, _a4: u64, _rsp: 
     if previous != 0 && !state::probe_user_write(previous, 4) {
         return Ok(0xC000_0005);
     }
-    Ok(match dispatcher::release_semaphore(pointer, count as u32 as i32 as i64) {
+    // O KeReleaseSemaphore(Semaphore, SEMAPHORE_INCREMENT, Count, FALSE)
+    // (0x66193a).
+    Ok(match dispatcher::release_semaphore_with_increment(pointer, count as u32 as i32 as i64, dispatcher::SYNCHRONIZATION_INCREMENT) {
         Ok(old) => {
             // LONG *PreviousCount, sondado acima.
             if previous != 0 && guest::try_write::<u32>(previous, old).is_err() { 0xC000_0005 } else { 0 }

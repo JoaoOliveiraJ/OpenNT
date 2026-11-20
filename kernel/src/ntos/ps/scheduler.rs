@@ -387,7 +387,9 @@ fn run_step(pid: u32, thread: u64) -> Result<(), KernelError> {
     process::dispatch_thread(thread);
     thread_dispatch::begin_execution(thread)?;
     let started = clock::uptime_100ns();
+    let cycles = crate::hal::cpu::rdtsc();
     let reason = context_switch::resume(thread);
+    super::dispatch_perf::KERNEL_STEPS.add_since(cycles);
     process::set_current_thread(previous);
     let (new_state, yield_requested, registered_wait) = {
         let mut state = STATE.lock();

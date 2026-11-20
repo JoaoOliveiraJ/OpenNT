@@ -680,6 +680,10 @@ pub fn attach_scheduling(thread: &Arc<UserThread>) -> Result<(), KernelError> {
 /// roda no contexto da thread (thread corrente e raiz dela); quem chama
 /// restaura a dele.
 fn refresh_ready_user_threads() {
+    if !poll_due() {
+        dispatch_perf::POLLS_SKIPPED.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
     let started = crate::hal::cpu::rdtsc();
     let loads = dispatch_perf::CR3_LOADS.load(Ordering::Relaxed);
     poll_user_waits();
@@ -692,6 +696,7 @@ fn poll_user_waits() {
     // A época antes da sondagem: o que despertar durante ou depois dela faz a
     // próxima saída de serviço passar pelo despachante.
     POLLED_EPOCH.store(dispatcher::wake_epoch(), Ordering::Release);
+    POLLED_TICK.store(crate::nano::interrupts::tick_count(), Ordering::Relaxed);
     let mut candidates: Vec<Arc<UserThread>> = all()
         .into_iter()
         .filter(|thread| {
@@ -888,18 +893,24 @@ pub fn refresh_waiting() {
 
 /// O corpo de [`dispatch_one`], com o despacho já marcado como em curso.
 fn dispatch_from(executor: fn(u64, u64) -> u32, caller: u64) -> Result<Dispatched, KernelError> {
-    // Uma sondagem só, depois dos pumps e antes da escolha: o tique sondou
-    // no começo dele e depois de cada intervalo que deixou a fila vazia, e o
-    // que os pumps concluírem entra nela também.
-    dispatcher::pump_kernel();
+    // Os pumps sem o tick do escalonador: o despacho roda dentro do tick,
+    // que já alterna as threads de kernel e as de usuário pela prioridade.
+    let started = crate::hal::cpu::rdtsc();
+    dispatcher::pump_kernel_work();
     let pumps = *PUMPS.lock();
     for routine in pumps.into_iter().flatten() {
         routine();
     }
+    dispatch_perf::PUMPS.add_since(started);
+    // Uma sondagem só, depois dos pumps e antes da escolha: o tique sondou
+    // no começo dele e depois de cada intervalo que deixou a fila vazia, e o
+    // que os pumps concluírem entra nela também.
     refresh_ready_user_threads();
     process::set_current_thread(caller);
+    let started = crate::hal::cpu::rdtsc();
     resume_terminated(executor, caller)?;
     finish_pending_exits(true);
+    dispatch_perf::EXITS.add_since(started);
     for _ in 0..DISCARD_LIMIT {
         let Some((pointer, owner)) = thread_dispatch::peek()? else { return Ok(Dispatched::Idle) };
         // Uma thread de kernel mais prioritária é entregue no próximo pump.
@@ -1085,12 +1096,23 @@ pub fn wait_for_process(process: u64) -> Result<u32, KernelError> {
             context_switch::wait_until(&mut || matches!(progress(process), Progress::Done).then_some(0), dispatcher::pump_kernel);
             continue;
         }
-        if let Err(error) = dispatch_one() {
+        if let Err(error) = dispatch_round() {
             break Err(error);
         }
     };
     let _ = process::dereference(process);
     result
+}
+
+/// Uma volta do despachante para quem espera fora do tick (o contexto de
+/// boot em [`wait_for_process`], os autotestes): um despacho de usuário
+/// ([`dispatch_one`]) e os passos das threads de kernel prontas que o tick
+/// daria (`scheduler::tick(0)`, sem intervalo de usuário), já que o despacho
+/// não aninha o tick.
+pub fn dispatch_round() -> Result<Dispatched, KernelError> {
+    let dispatched = dispatch_one()?;
+    crate::ntos::ps::scheduler::tick(0);
+    Ok(dispatched)
 }
 
 /// Onde está o fim de um processo esperado (ver [`wait_for_process`]).
@@ -2786,6 +2808,22 @@ pub fn service_exit_termination() {
 /// A época de despertar que a última sondagem das esperas de usuário cobriu
 /// (`u64::MAX` antes da primeira: nada volta direto).
 static POLLED_EPOCH: AtomicU64 = AtomicU64::new(u64::MAX);
+/// O tique do relógio (vetor 0x40) da última sondagem das esperas de usuário
+/// (`u32::MAX` antes da primeira).
+static POLLED_TICK: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// A sondagem das esperas de usuário tem o que achar: desde a anterior, a
+/// época de despertar andou (um sinal, um pulso, uma entrega ALPC, uma APC,
+/// um alerta, um IRP concluído, um término) ou passou um tique do relógio. O
+/// tique é o limite do que nenhuma época cobre: o prazo de uma espera
+/// sondada (a sondagem compara o uptime), a sondagem de garantia das esperas
+/// acordadas (`WOKEN_BACKSTOP_MS`) e uma condição que muda sem sinal; no
+/// pior caso, um tique (10 ms) de atraso, nunca uma espera perdida. As
+/// esperas registradas não dependem da sondagem: o sinal as apronta.
+fn poll_due() -> bool {
+    dispatcher::wake_epoch() != POLLED_EPOCH.load(Ordering::Acquire) || crate::nano::interrupts::tick_count() != POLLED_TICK.load(Ordering::Relaxed)
+}
+
 /// O intervalo despachado em curso ([`execute`]): a KTHREAD e o tique do
 /// começo dele.
 static SLICE_THREAD: AtomicU64 = AtomicU64::new(0);
@@ -3043,8 +3081,9 @@ fn nt_alert_thread_by_thread_id(id: u64, _a2: u64, _a3: u64, _a4: u64, _rsp: u64
     }
     thread.with(|thread| thread.alerted = true);
     // A espera acordada do NtWaitForAlertByThreadId volta à fila e consome o
-    // alerta (o KeAlertThreadByThreadId do 19041 apronta a thread ali).
-    crate::ntos::ke::wait::wake(thread.pointer());
+    // alerta (o KeAlertThreadByThreadId do 19041 apronta a thread ali, com
+    // o incremento 1 de 0x25c312).
+    crate::ntos::ke::wait::wake_with_increment(thread.pointer(), 1);
     Ok(0)
 }
 
