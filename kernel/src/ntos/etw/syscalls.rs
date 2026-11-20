@@ -15,9 +15,10 @@ fn nt_trace_event(handle: u64, flags: u64, field_size: u64, fields: u64, _rsp: u
     super::user_registration::trace_event(handle, flags as u32, field_size as u32, fields, 1)
 }
 
-/// Registra os serviços e o tipo EtwRegistration.
+/// Registra os serviços e os tipos EtwRegistration e EtwConsumer.
 pub fn init() {
     super::user_registration::initialize_type();
+    super::realtime::initialize_type();
     state::register_handler("NtTraceControl", nt_trace_control);
     state::register_handler("NtTraceEvent", nt_trace_event);
 }

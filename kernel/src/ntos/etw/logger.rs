@@ -13,6 +13,20 @@
 //! EventsLost. Sem arquivo nem consumidor de tempo real, os buffers ficam
 //! na memória até o Stop.
 //!
+//! Cada sessão tem a sua thread do logger (EtwpLogger), que espera o
+//! LoggerEvent. Numa sessão em EVENT_TRACE_REAL_TIME_MODE ela também acorda
+//! a cada FlushTimer (segundos, ou milissegundos com
+//! EVENT_TRACE_USE_MS_FLUSH_TIMER): o flush dos buffers ativos
+//! (EtwpFlushActiveBuffers) fecha o buffer corrente com eventos, a thread
+//! entrega cada buffer cheio aos consumidores de tempo real (`realtime`,
+//! EtwpFlushBufferToRealtime) e o buffer volta a ficar livre; depois de um
+//! flush vai o marcador vazio. Sem consumidor, os buffers cheios ficam
+//! guardados na sessão e vão ao primeiro que conectar (no NT eles vão ao
+//! arquivo de reserva do tempo real, `RtBackup`, e voltam dele na conexão).
+//! Uma sessão de um fluxo só (EVENT_TRACE_NO_PER_PROCESSOR_BUFFERING) marca
+//! os buffers com o processador 0. O Stop pede à thread o último flush,
+//! espera que ela desligue os consumidores e termine.
+//!
 //! O despacho do NtTraceControl segue o ntoskrnl 19041 (rva 0x5eaf60): o
 //! bit alto do código em UserMode marca o chamador WoW64; as sondas da
 //! entrada (faixa abaixo de MM_USER_PROBE_ADDRESS), da saída (ProbeForWrite)
@@ -27,9 +41,11 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use super::{activity, provider_state, user_registration};
-use crate::ntos::inc::types::{EtwBufferState, EventHeader, NtStruct, WmiBufferHeader};
+use super::{activity, provider_state, realtime, user_registration};
+use crate::ntos::inc::types::{EtwBufferState, EventHeader, Kevent, NtStruct, WmiBufferHeader};
+use crate::ntos::ke::dispatcher;
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::kernel_pool::{self, AllocateOptions};
 use crate::rtl::{KernelError, SpinLock};
@@ -44,8 +60,24 @@ const KERNEL_LOGGER_NAME: &str = "NT Kernel Logger";
 const WNODE_FLAG_TRACED_GUID: u32 = 0x2_0000;
 const EVENT_TRACE_FILE_MODE_CIRCULAR: u32 = 0x2;
 const EVENT_TRACE_FILE_MODE_NEWFILE: u32 = 0x8;
-const EVENT_TRACE_REAL_TIME_MODE: u32 = 0x100;
+/// EVENT_TRACE_USE_MS_FLUSH_TIMER: o FlushTimer em milissegundos.
+const EVENT_TRACE_USE_MS_FLUSH_TIMER: u32 = 0x10;
+pub const EVENT_TRACE_REAL_TIME_MODE: u32 = 0x100;
 const EVENT_TRACE_BUFFERING_MODE: u32 = 0x400;
+/// EVENT_TRACE_NO_PER_PROCESSOR_BUFFERING: um fluxo só de buffers.
+pub const EVENT_TRACE_NO_PER_PROCESSOR_BUFFERING: u32 = 0x1000_0000;
+/// ETW_BUFFER_TYPE_EMPTY_MARKER e ETW_BUFFER_FLAG_FLUSH_MARKER: o marcador
+/// vazio do EtwpRealtimeSendEmptyMarker.
+const ETW_BUFFER_TYPE_EMPTY_MARKER: u16 = 6;
+const ETW_BUFFER_FLAG_FLUSH_MARKER: u16 = 1;
+/// THREAD_ALL_ACCESS do handle da thread do logger (fechado em seguida).
+const THREAD_ALL_ACCESS: u32 = 0x1F_FFFF;
+/// KEVENT de sincronização (o LoggerEvent) e de notificação (o fim da thread).
+const SYNCHRONIZATION_EVENT: u8 = 1;
+const NOTIFICATION_EVENT: u8 = 0;
+const STATUS_TIMEOUT: u32 = 0x102;
+/// O prazo do Stop para a thread do logger terminar (100 ns, relativo).
+const STOP_WAIT: i64 = -100_000_000;
 /// WMI_LOGGER_CONTEXT.EventMarker[0]: o HeaderType de um EVENT_HEADER de 64 bits.
 const EVENT_HEADER_MARKER: u16 = 0xC013;
 /// EVENT_HEADER_EXT_TYPE_RELATED_ACTIVITYID.
@@ -92,11 +124,39 @@ mod info {
     pub const REAL_TIME_CONSUMER_COUNT: usize = 0xA0;
 }
 
+/// Um KEVENT do pool do kernel, devolvido com a última referência.
+pub struct KernelEvent(u64);
+
+impl KernelEvent {
+    fn new(event_type: u8) -> Option<Arc<Self>> {
+        let event = guest::alloc_bytes(Kevent::SIZE);
+        if event == 0 {
+            return None;
+        }
+        dispatcher::initialize_event(event, event_type, false);
+        Some(Arc::new(Self(event)))
+    }
+
+    pub fn pointer(&self) -> u64 {
+        self.0
+    }
+}
+
+impl Drop for KernelEvent {
+    fn drop(&mut self) {
+        guest::free_bytes(self.0);
+    }
+}
+
 /// Os buffers de uma sessão e os contadores do que passou por eles.
 struct Buffers {
     logger_id: u16,
     clock: u32,
     circular: bool,
+    /// Um fluxo só (EVENT_TRACE_NO_PER_PROCESSOR_BUFFERING): processador 0.
+    single_stream: bool,
+    /// O LoggerEvent da thread do logger, sinalizado a cada buffer cheio.
+    wake: Option<Arc<KernelEvent>>,
     size: u32,
     blocks: Vec<u64>,
     /// Buffer que recebe os eventos (None: todos cheios).
@@ -125,9 +185,10 @@ fn timestamp(clock: u32) -> i64 {
 }
 
 impl Buffers {
-    fn new(logger_id: u16, clock: u32, circular: bool, size_kb: u32, count: u32) -> Result<Self, u32> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(logger_id: u16, clock: u32, circular: bool, single_stream: bool, wake: Option<Arc<KernelEvent>>, size_kb: u32, count: u32) -> Result<Self, u32> {
         let size = size_kb * 1024;
-        let mut buffers = Self { logger_id, clock, circular, size, blocks: Vec::new(), current: None, full: Vec::new(), sequence: 0, events: 0, events_lost: 0, buffers_written: 0 };
+        let mut buffers = Self { logger_id, clock, circular, single_stream, wake, size, blocks: Vec::new(), current: None, full: Vec::new(), sequence: 0, events: 0, events_lost: 0, buffers_written: 0 };
         for _ in 0..count {
             let block = kernel_pool::allocate(size as u64, AllocateOptions { tag: BUFFER_TAG, zero: true, ..Default::default() }).map_err(|_| STATUS_INSUFFICIENT_RESOURCES);
             match block {
@@ -153,7 +214,8 @@ impl Buffers {
         self.sequence += 1;
         header.sequence_number.set(self.sequence);
         header.set_clock_type(self.clock as u64);
-        header.client_context.processor_number.set(crate::ntos::ke::processor_group::current_processor_number() as u8);
+        let processor = if self.single_stream { 0 } else { crate::ntos::ke::processor_group::current_processor_number() as u8 };
+        header.client_context.processor_number.set(processor);
         header.client_context.alignment.set(8);
         header.client_context.logger_id.set(self.logger_id);
         header.state.set(EtwBufferState::ETW_BUFFER_STATE_GENERAL_LOGGING);
@@ -170,6 +232,37 @@ impl Buffers {
         self.full.push(index);
         self.buffers_written += 1;
         self.current = None;
+        // A thread do logger entrega o buffer aos consumidores de tempo real.
+        if let Some(wake) = &self.wake {
+            dispatcher::set_event(wake.pointer());
+        }
+    }
+
+    /// EtwpFlushActiveBuffers: o buffer corrente com eventos passa a Flush e
+    /// o próximo assume. Devolve se havia o que fechar.
+    fn flush_current(&mut self) -> bool {
+        let Some(current) = self.current else { return false };
+        if header(self.blocks[current]).current_offset.get() <= BUFFER_HEADER_SIZE {
+            return false;
+        }
+        self.retire(current);
+        self.next_buffer();
+        true
+    }
+
+    /// O buffer cheio mais antigo, para a entrega em tempo real: os Offset
+    /// bytes dele (o cabeçalho e os registros). O buffer volta a ficar livre.
+    fn take_full(&mut self) -> Option<Vec<u8>> {
+        if self.full.is_empty() {
+            return None;
+        }
+        let index = self.full.remove(0);
+        let block = self.blocks[index];
+        let header = header(block);
+        let used = header.offset.get().clamp(BUFFER_HEADER_SIZE, self.size);
+        let bytes = guest::read_bytes(block, used as usize);
+        header.state.set(EtwBufferState::ETW_BUFFER_STATE_FREE);
+        Some(bytes)
     }
 
     fn next_buffer(&mut self) -> Option<usize> {
@@ -290,9 +383,250 @@ struct Logger {
     log_file_name: String,
     session: u16,
     buffers: Arc<SpinLock<Buffers>>,
+    context: Arc<LoggerContext>,
+}
+
+/// O que a thread do logger e os consumidores de tempo real dividem com a
+/// sessão (a parte do WMI_LOGGER_CONTEXT que a thread usa).
+pub struct LoggerContext {
+    pub id: u16,
+    buffers: Arc<SpinLock<Buffers>>,
+    /// LoggerEvent: acorda a thread do logger.
+    event: Arc<KernelEvent>,
+    /// Sinalizado quando a thread do logger termina.
+    stopped: Arc<KernelEvent>,
+    /// LoggerMode e FlushTimer correntes (o Update e o código 7 mudam).
+    mode: AtomicU32,
+    flush_timer: AtomicU32,
+    pub maximum_buffers: u32,
+    /// RealtimeReferenceTime: (StartTime, StartPerfClock) do início.
+    pub reference_time: [i64; 2],
+    stopping: AtomicBool,
+    /// DbgRequestFlush: o próximo trabalho da thread começa pelo flush.
+    flush_requested: AtomicBool,
+    thread_id: AtomicU64,
+    /// Consumers: a lista dos consumidores de tempo real.
+    consumers: SpinLock<Vec<Arc<realtime::Consumer>>>,
+    /// RealTimeBuffersDelivered e RealTimeBuffersLost.
+    delivered: AtomicU32,
+    lost: AtomicU32,
+}
+
+impl LoggerContext {
+    pub fn mode(&self) -> u32 {
+        self.mode.load(Ordering::SeqCst)
+    }
+
+    /// EtwpIsSingleStreamLogger.
+    pub fn single_stream(&self) -> bool {
+        self.mode() & EVENT_TRACE_NO_PER_PROCESSOR_BUFFERING != 0
+    }
+
+    fn wake(&self) {
+        dispatcher::set_event(self.event.pointer());
+    }
+
+    /// Pede o flush dos buffers ativos à thread do logger.
+    pub fn request_flush(&self) {
+        self.flush_requested.store(true, Ordering::SeqCst);
+        self.wake();
+    }
+
+    /// O consumidor entra na lista (a TransitionConsumer que o
+    /// EtwpRealtimeUpdateConsumers liga) e a thread entrega o guardado.
+    pub fn add_consumer(&self, consumer: Arc<realtime::Consumer>) {
+        self.consumers.lock().push(consumer);
+        self.wake();
+    }
+
+    pub fn has_consumer(&self, body: u64) -> bool {
+        self.consumers.lock().iter().any(|consumer| consumer.body() == body)
+    }
+
+    /// Tira o consumidor da lista; false se ele não estava nela.
+    pub fn remove_consumer(&self, body: u64) -> bool {
+        let mut consumers = self.consumers.lock();
+        let before = consumers.len();
+        consumers.retain(|consumer| consumer.body() != body);
+        consumers.len() != before
+    }
+
+    pub fn consumers(&self) -> Vec<Arc<realtime::Consumer>> {
+        self.consumers.lock().clone()
+    }
+
+    /// (EventsLost, RealTimeBuffersLost) que os contadores do consumidor
+    /// recebem a cada entrega.
+    pub fn loss_counters(&self) -> (u32, u32) {
+        let events_lost = self.buffers.lock().events_lost;
+        (events_lost, self.lost.load(Ordering::SeqCst))
+    }
+
+    /// Um buffer de dados entregue a algum consumidor ou a nenhum.
+    pub fn count_delivery(&self, taken: bool) {
+        let counter = if taken { &self.delivered } else { &self.lost };
+        counter.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// O período do FlushTimer em milissegundos numa sessão de tempo real;
+    /// None sem FlushTimer (os buffers só saem cheios ou no flush pedido).
+    fn flush_period(&self) -> Option<u64> {
+        let mode = self.mode();
+        let timer = self.flush_timer.load(Ordering::SeqCst) as u64;
+        if mode & EVENT_TRACE_REAL_TIME_MODE == 0 || timer == 0 {
+            return None;
+        }
+        Some(if mode & EVENT_TRACE_USE_MS_FLUSH_TIMER != 0 { timer } else { timer * 1000 })
+    }
+
+    /// O marcador vazio do EtwpRealtimeSendEmptyMarker: o cabeçalho do
+    /// EtwpInitializeBufferHeader (BufferSize da sessão, CurrentOffset e
+    /// Offset 0x48, o LoggerId) com BufferType 6, BufferFlag
+    /// ETW_BUFFER_FLAG_FLUSH_MARKER e o estado Flush.
+    fn marker(&self) -> Option<Vec<u8>> {
+        let block = guest::alloc_bytes(BUFFER_HEADER_SIZE as u64);
+        if block == 0 {
+            return None;
+        }
+        guest::write_bytes(block, &[0u8; BUFFER_HEADER_SIZE as usize]);
+        let header = header(block);
+        header.buffer_size.set(self.buffers.lock().size);
+        header.current_offset.set(BUFFER_HEADER_SIZE);
+        header.offset.set(BUFFER_HEADER_SIZE);
+        header.client_context.logger_id.set(self.id);
+        header.buffer_type.set(ETW_BUFFER_TYPE_EMPTY_MARKER);
+        header.buffer_flag.set(ETW_BUFFER_FLAG_FLUSH_MARKER);
+        header.state.set(EtwBufferState::ETW_BUFFER_STATE_FLUSH);
+        let bytes = guest::read_bytes(block, BUFFER_HEADER_SIZE as usize);
+        guest::free_bytes(block);
+        Some(bytes)
+    }
+}
+
+/// O trabalho da thread do logger depois de acordar, numa sessão de tempo
+/// real: o flush (pedido ou do FlushTimer), cada buffer cheio aos
+/// consumidores, o marcador vazio depois do flush e a desassociação dos
+/// consumidores que pediram o desligamento. Sem consumidor, os buffers
+/// cheios ficam guardados e o corrente continua recebendo eventos (o flush
+/// sem consumidor só gastaria buffers, que aqui não vão a arquivo).
+fn run(context: &LoggerContext, timer: bool) {
+    let flush = context.flush_requested.swap(false, Ordering::SeqCst) || timer;
+    if context.mode() & EVENT_TRACE_REAL_TIME_MODE == 0 {
+        return;
+    }
+    let consumers = context.consumers();
+    if consumers.iter().all(|consumer| consumer.disconnected()) {
+        return;
+    }
+    if flush {
+        context.buffers.lock().flush_current();
+    }
+    loop {
+        let next = context.buffers.lock().take_full();
+        let Some(bytes) = next else { break };
+        realtime::deliver(context, &consumers, &bytes, false);
+    }
+    if flush {
+        if let Some(marker) = context.marker() {
+            realtime::deliver(context, &consumers, &marker, true);
+        }
+        for consumer in consumers.iter().filter(|consumer| consumer.shutting_down()) {
+            realtime::disassociate(context, consumer);
+        }
+    }
+}
+
+/// EtwpLogger: a thread de cada sessão. Espera o LoggerEvent (e o
+/// FlushTimer de uma sessão de tempo real) e faz o trabalho; no Stop, o
+/// último flush, os consumidores desligados e o fim sinalizado.
+extern "win64" fn logger_thread(context_pointer: u64) {
+    // SAFETY: a referência do Arc que `start_thread` entregou à thread.
+    let context = unsafe { Arc::from_raw(context_pointer as *const LoggerContext) };
+    let timeout = guest::alloc_bytes(8);
+    let mut deadline: Option<u64> = None;
+    loop {
+        let now = crate::ntos::ke::clock::uptime_ms();
+        deadline = match (context.flush_period(), deadline) {
+            (None, _) => None,
+            (Some(period), None) => Some(now + period),
+            (Some(_), Some(deadline)) => Some(deadline),
+        };
+        let timed_out = match deadline {
+            Some(deadline) if deadline <= now => true,
+            Some(deadline) if timeout != 0 => {
+                guest::write64(timeout, (-(((deadline - now) * 10_000) as i64)) as u64);
+                dispatcher::wait_for_single_object(context.event.pointer(), timeout, 0, false) == STATUS_TIMEOUT
+            }
+            _ => {
+                dispatcher::wait_for_single_object(context.event.pointer(), 0, 0, false);
+                false
+            }
+        };
+        if context.stopping.load(Ordering::SeqCst) {
+            break;
+        }
+        let timer = timed_out || deadline.is_some_and(|deadline| crate::ntos::ke::clock::uptime_ms() >= deadline);
+        if timer {
+            deadline = None;
+        }
+        run(&context, timer);
+    }
+    // EtwpStopLoggerInstance: o último flush aos consumidores e
+    // EtwpRealtimeDisconnectAllConsumers.
+    run(&context, true);
+    realtime::disconnect_all(&context);
+    dispatcher::set_event(context.stopped.pointer());
+    if timeout != 0 {
+        guest::free_bytes(timeout);
+    }
+}
+
+/// A thread do logger da sessão (PsCreateSystemThread no System), com uma
+/// referência do contexto.
+fn start_thread(context: &Arc<LoggerContext>) -> Result<(), u32> {
+    let entry: extern "win64" fn(u64) = logger_thread;
+    let start = crate::ntos::mm::kernel_address::image_address(entry as usize as u64).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+    let raw = Arc::into_raw(context.clone()) as u64;
+    match crate::ntos::ps::kernel_threads::create_system_thread(0, start, raw, THREAD_ALL_ACCESS, 0, None) {
+        Ok(handle) => {
+            let thread = crate::ntos::ps::kernel_threads::of_handle(handle).unwrap_or(0);
+            let _ = crate::ntos::ob::object_manager::close(handle as u32);
+            context.thread_id.store(if thread != 0 { crate::ntos::ps::thread_accessors::id(thread) } else { 0 }, Ordering::SeqCst);
+            Ok(())
+        }
+        Err(_) => {
+            // SAFETY: a referência entregue acima, que nenhuma thread recebeu.
+            drop(unsafe { Arc::from_raw(raw as *const LoggerContext) });
+            Err(STATUS_INSUFFICIENT_RESOURCES)
+        }
+    }
+}
+
+/// O fim da thread do logger: o pedido, o último flush e a espera (com
+/// prazo) pelos consumidores desligados.
+fn stop_thread(context: &LoggerContext) {
+    context.stopping.store(true, Ordering::SeqCst);
+    context.wake();
+    let timeout = guest::alloc_bytes(8);
+    if timeout != 0 {
+        guest::write64(timeout, STOP_WAIT as u64);
+    }
+    dispatcher::wait_for_single_object(context.stopped.pointer(), timeout, 0, false);
+    if timeout != 0 {
+        guest::free_bytes(timeout);
+    }
 }
 
 static LOGGERS: SpinLock<BTreeMap<u16, Logger>> = SpinLock::new(BTreeMap::new());
+
+/// O contexto da sessão do LoggerId (EtwpAcquireLoggerContextByLoggerId):
+/// None fora de MaxLoggers ou sem a sessão.
+pub fn context(logger_id: u32) -> Option<Arc<LoggerContext>> {
+    if logger_id >= MAX_LOGGERS {
+        return None;
+    }
+    LOGGERS.lock().get(&(logger_id as u16)).map(|logger| logger.context.clone())
+}
 
 fn get32(buffer: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(buffer[offset..offset + 4].try_into().unwrap())
@@ -376,10 +710,12 @@ fn fill(buffer: &mut [u8], logger: &Logger) {
     put32(buffer, info::FREE_BUFFERS, buffers.free_count());
     put32(buffer, info::EVENTS_LOST, buffers.events_lost);
     put32(buffer, info::BUFFERS_WRITTEN, buffers.buffers_written);
+    drop(buffers);
+    let context = &logger.context;
     put32(buffer, info::LOG_BUFFERS_LOST, 0);
-    put32(buffer, info::REAL_TIME_BUFFERS_LOST, 0);
-    put64(buffer, info::LOGGER_THREAD_ID, 0);
-    put32(buffer, info::REAL_TIME_CONSUMER_COUNT, 0);
+    put32(buffer, info::REAL_TIME_BUFFERS_LOST, context.lost.load(Ordering::SeqCst));
+    put64(buffer, info::LOGGER_THREAD_ID, context.thread_id.load(Ordering::SeqCst));
+    put32(buffer, info::REAL_TIME_CONSUMER_COUNT, context.consumers.lock().len() as u32);
 }
 
 /// EtwpStartTrace.
@@ -412,8 +748,27 @@ fn start(buffer: &mut [u8]) -> Result<(), u32> {
         clock => clock,
     };
     let log_file_mode = get32(buffer, info::LOG_FILE_MODE);
+    let flush_timer = get32(buffer, info::FLUSH_TIMER);
     let circular = log_file_mode & (EVENT_TRACE_FILE_MODE_CIRCULAR | EVENT_TRACE_BUFFERING_MODE) != 0;
-    let buffers = Arc::new(SpinLock::new(Buffers::new(id, clock, circular, buffer_size, minimum_buffers)?));
+    let single_stream = log_file_mode & EVENT_TRACE_NO_PER_PROCESSOR_BUFFERING != 0;
+    let (Some(event), Some(stopped)) = (KernelEvent::new(SYNCHRONIZATION_EVENT), KernelEvent::new(NOTIFICATION_EVENT)) else { return Err(STATUS_INSUFFICIENT_RESOURCES) };
+    let buffers = Arc::new(SpinLock::new(Buffers::new(id, clock, circular, single_stream, Some(event.clone()), buffer_size, minimum_buffers)?));
+    let context = Arc::new(LoggerContext {
+        id,
+        buffers: buffers.clone(),
+        event,
+        stopped,
+        mode: AtomicU32::new(log_file_mode),
+        flush_timer: AtomicU32::new(flush_timer),
+        maximum_buffers,
+        reference_time: [crate::ntos::ke::clock::system_time_100ns() as i64, timestamp(clock)],
+        stopping: AtomicBool::new(false),
+        flush_requested: AtomicBool::new(false),
+        thread_id: AtomicU64::new(0),
+        consumers: SpinLock::new(Vec::new()),
+        delivered: AtomicU32::new(0),
+        lost: AtomicU32::new(0),
+    });
     let sink = buffers.clone();
     let consumer: provider_state::Consumer = Arc::new(move |event| sink.lock().log(event));
     let session = match provider_state::open_session(consumer, None, Some(guid(buffer))) {
@@ -423,6 +778,12 @@ fn start(buffer: &mut [u8]) -> Result<(), u32> {
             return Err(STATUS_INSUFFICIENT_RESOURCES);
         }
     };
+    // EtwpStartLogger: a sessão só existe com a thread do logger.
+    if let Err(status) = start_thread(&context) {
+        let _ = provider_state::close_session(session);
+        buffers.lock().release();
+        return Err(status);
+    }
     let logger = Logger {
         id,
         name,
@@ -433,18 +794,20 @@ fn start(buffer: &mut [u8]) -> Result<(), u32> {
         maximum_buffers,
         maximum_file_size: get32(buffer, info::MAXIMUM_FILE_SIZE),
         log_file_mode,
-        flush_timer: get32(buffer, info::FLUSH_TIMER),
+        flush_timer,
         enable_flags: get32(buffer, info::ENABLE_FLAGS),
         age_limit: get32(buffer, info::AGE_LIMIT),
         log_file_name,
         session,
         buffers,
+        context,
     };
     fill(buffer, &logger);
     let mut loggers = LOGGERS.lock();
     if loggers.contains_key(&id) {
         drop(loggers);
         let _ = provider_state::close_session(session);
+        stop_thread(&logger.context);
         logger.buffers.lock().release();
         return Err(STATUS_OBJECT_NAME_COLLISION);
     }
@@ -452,7 +815,8 @@ fn start(buffer: &mut [u8]) -> Result<(), u32> {
     Ok(())
 }
 
-/// Stop: os provedores desabilitados, o buffer corrente fechado, as
+/// Stop: os provedores desabilitados, o último flush aos consumidores de
+/// tempo real e o fim da thread do logger, o buffer corrente fechado, as
 /// propriedades finais e os buffers devolvidos.
 fn stop(buffer: &mut [u8]) -> Result<(), u32> {
     let logger = {
@@ -461,6 +825,7 @@ fn stop(buffer: &mut [u8]) -> Result<(), u32> {
         loggers.remove(&id).unwrap()
     };
     let _ = provider_state::close_session(logger.session);
+    stop_thread(&logger.context);
     {
         let mut buffers = logger.buffers.lock();
         if let Some(current) = buffers.current {
@@ -480,6 +845,10 @@ fn with_logger(buffer: &mut [u8], change: impl FnOnce(&mut Logger, &[u8]) -> Res
     let logger = loggers.get_mut(&id).unwrap();
     let input = buffer.to_vec();
     change(logger, &input)?;
+    // O modo e o FlushTimer que a thread do logger lê.
+    logger.context.mode.store(logger.log_file_mode, Ordering::SeqCst);
+    logger.context.flush_timer.store(logger.flush_timer, Ordering::SeqCst);
+    logger.context.wake();
     fill(buffer, logger);
     Ok(())
 }
@@ -502,15 +871,14 @@ fn update(buffer: &mut [u8]) -> Result<(), u32> {
     })
 }
 
-/// Flush: o buffer corrente com eventos passa a Flush e o próximo assume.
+/// Flush: o buffer corrente com eventos passa a Flush e o próximo assume;
+/// numa sessão de tempo real a thread do logger entrega o buffer e o
+/// marcador vazio aos consumidores.
 fn flush(buffer: &mut [u8]) -> Result<(), u32> {
     with_logger(buffer, |logger, _| {
-        let mut buffers = logger.buffers.lock();
-        if let Some(current) = buffers.current {
-            if header(buffers.blocks[current]).current_offset.get() > BUFFER_HEADER_SIZE {
-                buffers.retire(current);
-                buffers.next_buffer();
-            }
+        logger.buffers.lock().flush_current();
+        if logger.log_file_mode & EVENT_TRACE_REAL_TIME_MODE != 0 {
+            logger.context.request_flush();
         }
         Ok(())
     })
@@ -609,16 +977,22 @@ pub fn trace_control(code: u32, input: u64, input_length: u32, output: u64, outp
     let unsupported: Outcome = Err((STATUS_INVALID_DEVICE_REQUEST, 0));
     let result: Outcome = match code {
         1..=7 => logger_control(code, &mut buffer, input_length, output_length),
-        // EtwRealtimeConnect: nenhuma sessão entrega em tempo real.
-        11 if input_length != 0x60 || output_length != 0x60 => invalid,
+        // EtwRealtimeConnect: o consumidor de tempo real (`realtime`).
+        11 if input_length != realtime::CONNECT_SIZE || output_length != realtime::CONNECT_SIZE => invalid,
+        11 => realtime::connect(&mut buffer, wow64),
         12 if output_length != 0x10 => invalid,
         12 => match activity::create_id(output) {
             Ok(()) => Ok(0),
             Err(_) => Err((STATUS_ACCESS_VIOLATION, 0)),
         },
-        // WDI e o desligamento de consumidores de tempo real.
+        // WDI e o desligamento de consumidores de tempo real (o handle do
+        // EtwConsumer no buffer do chamador).
         13 if input_length != 0x30 || output_length != 0 => invalid,
         14 if input_length != 8 || output_length != 0 => invalid,
+        14 => match guest::try_read::<u64>(input) {
+            Err(_) => Err((STATUS_ACCESS_VIOLATION, 0)),
+            Ok(handle) => status_only(realtime::disconnect_by_handle(handle, mode)?),
+        },
         15 if input_length != 0xA0 || !(0xA0..=0x1_0000).contains(&output_length) => invalid,
         15 => user_registration::register_guid(&mut buffer, output_length, wow64),
         16 if input_length != 0 || !(0x48..=0x1_0000).contains(&output_length) => invalid,
@@ -660,9 +1034,9 @@ pub fn trace_control(code: u32, input: u64, input_length: u32, output: u64, outp
             put32(&mut buffer, 0, if code == 42 { MAX_LOGGERS } else { 0 });
             Ok(4)
         }
-        // 8-10 e 29 não existem; os demais pedem consumidores de tempo
-        // real, WDI, respostas a notificações, listas e compressão que
-        // nenhuma sessão daqui oferece.
+        // 8-10 e 29 não existem; os demais pedem WDI, respostas a
+        // notificações, listas e compressão que nenhuma sessão daqui
+        // oferece.
         _ => unsupported,
     };
     let (status, length) = match result {

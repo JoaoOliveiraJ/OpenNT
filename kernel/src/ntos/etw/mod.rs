@@ -4,6 +4,7 @@ pub mod event_enabled;
 pub mod provider_state;
 pub mod activity;
 pub mod logger;
+pub mod realtime;
 pub mod rundown;
 pub mod user_registration;
 pub mod wmi;

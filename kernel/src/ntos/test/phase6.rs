@@ -16106,6 +16106,7 @@ pub fn run(assert: Assert) {
     process_exit_synchronization(assert);
     thread_process_queries(assert);
     etw_trace_control(assert);
+    super::etw_realtime::run(assert);
     rtl_security_descriptors(assert);
     driver_helper_exports(assert);
     io_diagnostics_exports(assert);

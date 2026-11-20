@@ -2773,9 +2773,21 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   pacote pelo NtTraceControl 16 e chama o callback do EventRegister). As
   sessões (`logger.rs`, NtTraceControl 1-7) têm buffers de verdade
   (WMI_BUFFER_HEADER e registros EVENT_HEADER com HeaderType 0xC013, itens
-  estendidos e dados), Flush e Stop; EtwWrite/EtwWriteTransfer/EtwWriteEx/
-  EtwWriteString e o NtTraceEvent 0x300 da ntdll entregam só às sessões
-  cujo nível e keywords aceitam o evento. O NtTraceControl 24 (o
+  estendidos e dados), Flush e Stop, e uma thread do logger cada (o
+  EtwpLogger, com o LoggerThreadId na consulta); EtwWrite/EtwWriteTransfer/
+  EtwWriteEx/EtwWriteString e o NtTraceEvent 0x300 da ntdll entregam só às
+  sessões cujo nível e keywords aceitam o evento. Numa sessão de tempo
+  real a thread acorda a cada buffer cheio, a cada flush pedido e a cada
+  FlushTimer e entrega os buffers cheios aos consumidores de tempo real
+  (`realtime.rs`): o NtTraceControl 11 (EtwpRealtimeConnect) cria o objeto
+  EtwConsumer com o espaço reservado, o bitmap, a lista e os eventos que o
+  sechost passa; a thread, anexada ao processo do consumidor, copia cada
+  buffer na primeira faixa livre do espaço (ou em páginas novas), põe o
+  SlistEntry na lista, sobe o contador e sinaliza o evento de dados, com o
+  marcador vazio depois do flush nas sessões por processador; o 14 e o
+  fechamento do handle desligam o consumidor (o evento de desligamento).
+  Sem consumidor, os buffers cheios ficam guardados na sessão e vão ao
+  primeiro que conectar, no lugar do arquivo `RtBackup` do NT. O NtTraceControl 24 (o
   EtwpRegisterSecurityProvider) registra o primeiro processo como provedor
   de eventos de segurança (o lsass.exe, pelo EtwRegisterSecurityProvider do
   AdtpInitializeAuditingCommon); um segundo registro dá
@@ -2787,14 +2799,13 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   (thread de sistema: STATUS_NOT_SUPPORTED) e a semente do
   KPRCB.EtwSupport para IDs novos. O despacho do NtTraceControl valida os
   43 códigos como o 19041; ficam sem implementação (STATUS_INVALID_DEVICE_REQUEST
-  depois da validação) os consumidores de tempo real, o EnableTraceEx2 de
-  modo usuário (17), as respostas a notificações, as listas de GUIDs e
+  depois da validação) o EnableTraceEx2 de modo usuário (17), as respostas a notificações, as listas de GUIDs e
   grupos, WDI, compressão e sessões privadas, que nenhum processo do boot
   usa; os grupos de provedores dos traits, os eventos de imagem do
   EtwTrackProviderBinary, os loggers clássicos por TRACEHANDLE (NtTraceEvent
   0x200) e os autologgers do Registro também não existem. Testes:
-  `etw_trace_session` e `etw_user_registration` na fase 6; o marcador
-  `ETW_USER_REGISTRATION_OK` no boot do smss real.
+  `etw_trace_session`, `etw_user_registration` e `etw_realtime` na fase 6;
+  o marcador `ETW_USER_REGISTRATION_OK` no boot do smss real.
 - **Trava e energia do KD** (`kd/power.rs`): KdDebuggerLock em
   DISPATCH_LEVEL, a lista dos tratadores de energia do transporte e, com o
   KdPitchDebugger de um boot sem depurador, KdPowerTransitionEx sem efeito

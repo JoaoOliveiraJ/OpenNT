@@ -83,3 +83,4 @@ pub mod volume_notify_locks;
 pub mod file_security;
 pub mod user_copy_chunk;
 pub mod dos_device_maps;
+pub mod etw_realtime;
