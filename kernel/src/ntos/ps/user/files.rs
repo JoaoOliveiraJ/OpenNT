@@ -171,6 +171,25 @@ fn open_file(handle_pointer: u64, attributes: u64, iosb: u64, disposition: u32, 
         Ok(request) => request,
         Err(status) => return Ok(status),
     };
+    // FILE_OPEN_BY_FILE_ID relativo a um arquivo do volume: o nome binário
+    // vira o caminho do registro, aberto como os demais.
+    if request.options & FILE_OPEN_BY_FILE_ID != 0 && special.is_none() {
+        match volume_name_by_file_id(attributes) {
+            Ok(Some(name)) => {
+                let object_flags = match user_object_attributes(attributes) {
+                    Ok(flags) => flags,
+                    Err(error) => return Ok(error.status),
+                };
+                let explicit = match capture_explicit_descriptor(attributes) {
+                    Ok(descriptor) => descriptor,
+                    Err(status) => return Ok(status),
+                };
+                return open_by_name(handle_pointer, &name, object_flags, iosb, disposition, &OpenRequest { explicit, options: request.options & !FILE_OPEN_BY_FILE_ID, ..request.clone() }, None);
+            }
+            Ok(None) => {}
+            Err(status) => return Ok(fail_iosb(iosb, status)),
+        }
+    }
     let Some(parsed) = parse_user_object_attributes(attributes) else { return Ok(STATUS_INVALID_PARAMETER) };
     // OBJ_* do OA, lido uma vez.
     let object_flags = match user_object_attributes(attributes) {
@@ -192,6 +211,44 @@ fn open_file(handle_pointer: u64, attributes: u64, iosb: u64, disposition: u32, 
         Err(status) => return Ok(status),
     };
     open_by_name(handle_pointer, &parsed.path, object_flags, iosb, disposition, &OpenRequest { explicit, ..request.clone() }, special)
+}
+
+/// FILE_OPEN_BY_FILE_ID.
+const FILE_OPEN_BY_FILE_ID: u32 = 0x2000;
+
+/// FILE_OPEN_BY_FILE_ID relativo a um handle do volume de boot (o
+/// OpenFileById do Win32: RootDirectory é qualquer arquivo do volume e o
+/// ObjectName traz os 8 bytes do FILE_REFERENCE): o NTFS abre o registro
+/// pela referência, e aqui ela vira o caminho dele no volume, na letra da
+/// raiz. `Ok(None)` quando a raiz não é um arquivo do volume (o caminho
+/// comum segue); um ObjectName que não tem 8 bytes, ou uma referência fora
+/// de uso ou de outra sequência, é STATUS_INVALID_PARAMETER (o
+/// ERROR_INVALID_PARAMETER do OpenFileById de um id apagado).
+fn volume_name_by_file_id(attributes: u64) -> Result<Option<String>, u32> {
+    use crate::ntos::inc::types::{ObjectAttributes, UnicodeString};
+    let status = |error: KernelError| if error.status != 0 { error.status } else { 0xC000_0005 };
+    let object = state::user_struct::<ObjectAttributes>(attributes).map_err(status)?;
+    let root = object.root_directory.probe_get().map_err(status)?;
+    let Some(root_entry) = state::get_user_handle(root).filter(|entry| entry.kind() == "file") else { return Ok(None) };
+    let Some(root_file) = root_entry.downcast::<super::file_objects::UserFile>() else { return Ok(None) };
+    let name = object.object_name.probe_get().map_err(status)?;
+    if name == 0 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let string = state::user_struct::<UnicodeString>(name).map_err(status)?;
+    let (length, buffer) = (string.length.probe_get().map_err(status)?, string.buffer.probe_get().map_err(status)?);
+    if length != 8 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    if !state::probe_user_read(buffer, 8) {
+        return Err(0xC000_0005);
+    }
+    let reference = guest::try_read::<u64>(buffer).map_err(status)?;
+    let volume = crate::drivers::fs::volume_files::volume().ok_or(0xC000_000Eu32)?;
+    let Some(path) = volume.path_of_reference(reference).map_err(|_| STATUS_INVALID_PARAMETER)? else { return Err(STATUS_INVALID_PARAMETER) };
+    let root_name = root_file.nt_path.lock().clone();
+    let drive = if root_name.len() >= 6 && root_name.starts_with("\\??\\") && root_name.as_bytes()[5] == b':' { String::from(&root_name[..6]) } else { String::from("\\??\\C:") };
+    Ok(Some(alloc::format!("{drive}{}", path.replace('/', "\\"))))
 }
 
 /// O SeCaptureSecurityDescriptor do OBJECT_ATTRIBUTES.SecurityDescriptor de

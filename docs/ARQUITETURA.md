@@ -4804,7 +4804,11 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   fora do namespace, `ob/query_object.rs`). O wininit cria então a Desktop
   Default, chama o SwitchDesktop e o SetThreadDesktop e sobe o servidor RPC
   de pipe nomeado `\PIPE\InitShutdown` (a porta de conclusão e os modos de
-  notificação de um arquivo de driver, `io/completion/file_port.rs`). O
+  notificação de um arquivo de driver, `io/completion/file_port.rs`; os
+  arquivos do volume de boot usam o mesmo FILE_OBJECT: as classes 30 e 41
+  do NtSetInformationFile, o pacote do ApcContext no fim da leitura,
+  escrita ou consulta de diretório e, sem porta, a APC de usuário da
+  ApcRoutine, `ps/user/file_io.rs`). O
   CreateProcessW do services.exe chega ao NtCreateUserProcess com o bit
   0x200 que o kernelbase liga em toda criação sem CREATE_SUSPENDED (no
   19041 ele só escolhe o OwnerProcessId, `ps/create_context.rs`), e o

@@ -34,6 +34,25 @@
 //! - a escrita relatada como FILE_ACTION_MODIFIED só no fechamento;
 //! - o pedido num arquivo (STATUS_INVALID_PARAMETER) e o fechamento do
 //!   diretório (STATUS_NOTIFY_CLEANUP).
+//!
+//! E a conclusão de E/S de um arquivo do volume como o I/O Manager 19041 a
+//! faz para todo arquivo:
+//!
+//! - FileCompletionInformation (30) liga a porta ao FILE_OBJECT assíncrono
+//!   (o síncrono e a segunda porta dão STATUS_INVALID_PARAMETER); a
+//!   leitura com ApcContext põe o pacote (Key, contexto, IoStatus) na IOCP;
+//! - ApcRoutine num arquivo com porta é STATUS_INVALID_PARAMETER (IopReadFile
+//!   0x5ce41f);
+//! - FileIoCompletionNotificationInformation (41) com
+//!   FILE_SKIP_COMPLETION_PORT_ON_SUCCESS dispensa o pacote do sucesso;
+//! - sem porta, a ApcRoutine vira a APC de usuário do IopCompleteRequest
+//!   (ApcRoutine, ApcContext, IoStatusBlock) na thread que pediu.
+//!
+//! E duas aberturas que o NTFS atende: FILE_OPEN_BY_FILE_ID (o
+//! FILE_REFERENCE da FileInternalInformation, com a sequência, como
+//! ObjectName de 8 bytes relativo a um arquivo do volume; sequência errada
+//! ou outro tamanho de nome dão STATUS_INVALID_PARAMETER) e MAXIMUM_ALLOWED
+//! (o máximo que o descritor concede).
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -158,6 +177,154 @@ fn dos(path: &str) -> String {
 pub fn run(assert: Assert) {
     locks(assert);
     notify(assert);
+    completion(assert);
+}
+
+const COMPLETION_FILE: &str = "/OPENNTCP.TXT";
+
+/// A KAPC de usuário de `thread` com o NormalContext `context` (nos dois
+/// ambientes de APC), retirada da fila e devolvida ao pool: o
+/// SystemArgument1 dela.
+fn take_user_apc(thread: u64, context: u64) -> Option<u64> {
+    // SAFETY: KTHREAD da thread corrente.
+    let kthread = unsafe { nt::Kthread::at(thread) };
+    let offset = core::mem::offset_of!(nt::Kapc, apc_list_entry) as u64;
+    for state in [&kthread.apc_state, &kthread.saved_apc_state] {
+        let head = &state.apc_list_head[1];
+        let mut link = head.flink.get();
+        let mut steps = 0;
+        while link != 0 && link != head.address() && steps < 64 {
+            // SAFETY: elo da fila de APCs de usuário da thread.
+            let packet = unsafe { nt::Kapc::at(link - offset) };
+            if packet.normal_context.get() == context {
+                let argument = packet.system_argument1.get();
+                let removed = crate::ntos::ke::apc::remove(link - offset).unwrap_or(false);
+                let _ = crate::ntos::mm::kernel_pool::free(link - offset, None);
+                return removed.then_some(argument);
+            }
+            link = packet.apc_list_entry.flink.get();
+            steps += 1;
+        }
+    }
+    None
+}
+
+/// A porta de conclusão e a APC de usuário de um arquivo do volume.
+fn completion(assert: Assert) {
+    let Some(volume) = volume_files::volume() else {
+        assert(false, "completion: volume de boot");
+        return;
+    };
+    let Ok(block) = memory::map_user_region(0x4000) else {
+        assert(false, "completion: memoria de usuario");
+        return;
+    };
+    let test = Harness { block };
+    let _ = volume.remove(COMPLETION_FILE);
+    volume_files::forget(COMPLETION_FILE);
+    let prepared = volume.create(COMPLETION_FILE, false, 0x20, 0).is_ok() && volume.write(COMPLETION_FILE, 0, &[0x43; 64]).is_ok();
+    let name = dos(COMPLETION_FILE);
+    let (opened, asynchronous) = test.open(&name, 0xC000_0000, 3, 0x40);
+    let (opened_sync, synchronous) = test.open(&name, 0xC010_0000, 3, 0x60);
+    let (opened_plain, plain) = test.open(&name, 0xC000_0000, 3, 0x40);
+    guest::write64(test.at(Harness::HANDLE), 0);
+    let port_status = test.call("NtCreateIoCompletion", test.at(Harness::HANDLE), 0x1F_0003, 0, 0);
+    let port = guest::read64(test.at(Harness::HANDLE));
+    assert(prepared && opened == 0 && opened_sync == 0 && opened_plain == 0 && port_status == 0, "completion: arquivo, aberturas e porta de conclusao");
+    let iosb = test.at(Harness::IOSB);
+    let information = test.at(0x3000);
+    let set = |handle: u64, class: u64, length: u64| {
+        test.arguments(&[class]);
+        test.call("NtSetInformationFile", handle, iosb, information, length)
+    };
+    // FileCompletionInformation { Port, Key }.
+    guest::write64(information, port);
+    guest::write64(information + 8, 0x77);
+    let refused_sync = set(synchronous, 30, 16);
+    let associated = set(asynchronous, 30, 16);
+    let again = set(asynchronous, 30, 16);
+    // Um FILE_OBJECT que já tem porta é STATUS_INVALID_PARAMETER antes da
+    // referência da IOCP (0x2d322c); STATUS_PORT_ALREADY_SET só na corrida.
+    assert(refused_sync == 0xC000_000D && associated == 0 && again == 0xC000_000D, "completion: FileCompletionInformation liga a porta ao arquivo assincrono, recusa o sincrono e a segunda porta");
+    // A leitura com ApcContext: o pacote (Key, contexto, IoStatus) na porta.
+    let read_with = |handle: u64, apc: u64, context: u64| {
+        guest::write64(test.at(Harness::RANGE), 0);
+        test.arguments(&[iosb, test.at(Harness::DATA), 5, test.at(Harness::RANGE), 0]);
+        test.call("NtReadFile", handle, 0, apc, context)
+    };
+    let remove = || {
+        let out = test.at(0x3100);
+        guest::write64(test.at(Harness::TIMEOUT), 0);
+        test.arguments(&[test.at(Harness::TIMEOUT)]);
+        let status = test.call("NtRemoveIoCompletion", port, out, out + 8, out + 0x10);
+        (status, guest::read64(out), guest::read64(out + 8), guest::read32(out + 0x10), guest::read64(out + 0x18))
+    };
+    let read = read_with(asynchronous, 0, 0x1234);
+    let packet = remove();
+    assert(read == 0 && packet == (0, 0x77, 0x1234, 0, 5), "completion: a leitura com ApcContext poe o pacote na porta do arquivo");
+    let apc_refused = read_with(asynchronous, 0x7FFE_0000_1000, 0x1234);
+    assert(apc_refused == 0xC000_000D, "completion: ApcRoutine num arquivo com porta e STATUS_INVALID_PARAMETER");
+    // FILE_SKIP_COMPLETION_PORT_ON_SUCCESS: o sucesso não põe pacote.
+    guest::write32(information, 1);
+    let modes = set(asynchronous, 41, 4);
+    let skipped = read_with(asynchronous, 0, 0x5678);
+    let empty = remove().0;
+    assert(modes == 0 && skipped == 0 && empty == 0x102, "completion: FILE_SKIP_COMPLETION_PORT_ON_SUCCESS dispensa o pacote do sucesso");
+    // Sem porta: a APC de usuário (ApcRoutine, ApcContext, IoStatusBlock).
+    let queued = read_with(plain, 0x7FFE_0000_1000, 0x4321_8765);
+    let argument = take_user_apc(crate::ntos::ps::process::get_current_thread(), 0x4321_8765);
+    assert(queued == 0 && argument == Some(iosb), "completion: sem porta, a ApcRoutine vira a APC de usuario com o IoStatusBlock");
+    // FILE_OPEN_BY_FILE_ID relativo ao arquivo do volume.
+    test.arguments(&[6]);
+    let internal = test.call("NtQueryInformationFile", plain, iosb, information, 8);
+    let reference = guest::read64(information);
+    let by_id = |name: &[u8]| {
+        guest::write_bytes(test.at(Harness::TEXT), name);
+        // SAFETY: UNICODE_STRING e OBJECT_ATTRIBUTES no bloco de usuário do teste.
+        let (string, attributes) = unsafe { (nt::UnicodeString::at(test.at(Harness::STRING)), nt::ObjectAttributes::at(test.at(Harness::ATTRIBUTES))) };
+        string.length.set(name.len() as u16);
+        string.maximum_length.set(name.len() as u16);
+        string.buffer.set(test.at(Harness::TEXT));
+        attributes.length.set(nt::ObjectAttributes::SIZE as u32);
+        attributes.root_directory.set(plain);
+        attributes.object_name.set(test.at(Harness::STRING));
+        attributes.attributes.set(0x40);
+        attributes.security_descriptor.set(0);
+        attributes.security_quality_of_service.set(0);
+        guest::write64(test.at(Harness::HANDLE), 0);
+        test.arguments(&[0, 0, 3, 1, 0x2060, 0, 0]);
+        let status = test.call("NtCreateFile", test.at(Harness::HANDLE), 0x0012_0089, test.at(Harness::ATTRIBUTES), iosb);
+        (status, guest::read64(test.at(Harness::HANDLE)))
+    };
+    let (opened_by_id, by_id_handle) = by_id(&reference.to_le_bytes());
+    guest::write_bytes(test.at(Harness::DATA), &[0; 8]);
+    let read_by_id = opened_by_id == 0 && test.transfer(by_id_handle, false, 0, 5) == 0 && guest::read_bytes(test.at(Harness::DATA), 5) == [0x43; 5];
+    if opened_by_id == 0 {
+        test.close(by_id_handle);
+    }
+    let wrong_sequence = by_id(&(reference ^ 0xFFFF_0000_0000_0000).to_le_bytes()).0;
+    let short_name = by_id(&reference.to_le_bytes()[..6]).0;
+    assert(internal == 0 && read_by_id && wrong_sequence == 0xC000_000D && short_name == 0xC000_000D, "completion: FILE_OPEN_BY_FILE_ID abre pelo FILE_REFERENCE com sequencia e recusa sequencia errada e nome de outro tamanho");
+    // MAXIMUM_ALLOWED: o compartilhamento confere o acesso concedido (o
+    // máximo, com DELETE), então as aberturas sem FILE_SHARE_DELETE o
+    // recusam; sozinho, o máximo do descritor (o arquivo sem descritor
+    // próprio concede FILE_ALL_ACCESS), sem o bit MAXIMUM_ALLOWED.
+    let shared = test.open(&name, 0x0200_0000, 7, 0x40).0;
+    for handle in [asynchronous, synchronous, plain, port] {
+        test.close(handle);
+    }
+    let (opened_maximum, maximum) = test.open(&name, 0x0200_0000, 7, 0x40);
+    test.arguments(&[8]);
+    let granted = if opened_maximum == 0 && test.call("NtQueryInformationFile", maximum, iosb, information, 4) == 0 { guest::read32(information) } else { 0 };
+    if opened_maximum == 0 {
+        test.close(maximum);
+    }
+    assert(shared == 0xC000_0043 && opened_maximum == 0 && granted & 0x1F_01FF == 0x1F_01FF && granted & 0x0200_0000 == 0, "completion: MAXIMUM_ALLOWED concede o maximo do descritor sem o bit MAXIMUM_ALLOWED e o compartilhamento confere esse maximo");
+    let _ = volume.remove(COMPLETION_FILE);
+    volume_files::forget(COMPLETION_FILE);
+    if let Some(region) = memory::find_region(block) {
+        memory::release_private_region(&region);
+    }
 }
 
 /// As travas de faixa de bytes (Q-FSGAPS G3).

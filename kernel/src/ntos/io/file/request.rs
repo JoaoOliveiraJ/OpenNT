@@ -168,6 +168,24 @@ extern "win64" fn deallocate_apc(apc: u64) {
     }
 }
 
+/// A APC de usuário do IopCompleteRequest de um pedido que já concluiu:
+/// NormalRoutine = ApcRoutine, NormalContext = ApcContext e
+/// SystemArgument1 = o IO_STATUS_BLOCK, na thread `thread`; o pacote volta
+/// ao pool na entrega ou no rundown. `false` sem memória para o KAPC.
+pub fn queue_completion_apc(thread: u64, routine: u64, context: u64, io_status: u64) -> Result<bool, KernelError> {
+    let free = free_routine()?;
+    let Ok(packet) = kernel_pool::allocate(0x58, AllocateOptions { paged: false, tag: TAG, ..Default::default() }) else { return Ok(false) };
+    if packet == 0 {
+        return Ok(false);
+    }
+    apc::initialize(packet, thread, 0, free, free, routine, 1, context);
+    if !apc::insert(packet, io_status, 0) {
+        let _ = kernel_pool::free(packet, None);
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 /// O endereço de [`deallocate_apc`], a rotina de kernel/rundown das APCs de
 /// conclusão.
 pub fn free_routine() -> Result<u64, KernelError> {

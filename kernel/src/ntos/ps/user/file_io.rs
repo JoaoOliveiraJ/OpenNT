@@ -212,6 +212,9 @@ pub fn open(out: u64, name: &str, iosb: u64, disposition: u32, request: &OpenReq
     super::files::open_by_name(out, name, request.handle_attributes, iosb, disposition, request, None)
 }
 
+/// MAXIMUM_ALLOWED num DesiredAccess.
+const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
+
 /// Uma volta do IRP_MJ_CREATE no volume de boot: abre ou cria o arquivo e
 /// publica o handle `file`, ou devolve o reparse point do caminho.
 pub fn create(out: u64, name: &str, iosb: u64, disposition: u32, request: &OpenRequest) -> Result<Created, KernelError> {
@@ -220,7 +223,7 @@ pub fn create(out: u64, name: &str, iosb: u64, disposition: u32, request: &OpenR
         if !state::probe_user_write(out, 8) {
             return fail(AV);
         }
-        let granted = access(request.access);
+        let mut granted = access(request.access);
         let (share, options) = (request.share, request.options);
         let directory = options & 1 != 0;
         let non_directory = options & 0x40 != 0;
@@ -241,7 +244,7 @@ pub fn create(out: u64, name: &str, iosb: u64, disposition: u32, request: &OpenR
         // os arquivos dos seus streams (COplockFileHandle) e aceita a recusa
         // do FSCTL como "sem oplock".
         let supported = 1 | 2 | 4 | 8 | 0x10 | 0x20 | 0x40 | 0x800 | 0x1000 | 0x4000 | 0x8000 | 0x1_0000 | 0x2_0000 | 0x20_0000 | 0x40_0000 | 0x80_0000;
-        if options & !supported != 0 || request.ea_length != 0 || granted & 0x0200_0000 != 0 {
+        if options & !supported != 0 || request.ea_length != 0 {
             debug_print!("[file-io] create unsupported name={} access=0x{:x} options=0x{:x} eaLength={}", name, granted, options, request.ea_length);
             return fail(0xC000_00BB);
         }
@@ -274,6 +277,27 @@ pub fn create(out: u64, name: &str, iosb: u64, disposition: u32, request: &OpenR
         }
         let mut file = volume_files::lookup_volume_file(name);
         let mut information = 1u64;
+        // MAXIMUM_ALLOWED: o acesso concedido é o máximo que o descritor do
+        // arquivo dá a quem abre (o SeAccessCheck do NtfsAccessCheck com
+        // MAXIMUM_ALLOWED, `ntfs_security::check`), somado aos direitos
+        // pedidos; num somente-leitura sem FILE_WRITE_DATA e
+        // FILE_APPEND_DATA. Um arquivo novo recebe o máximo do descritor que
+        // ganhou, depois de criado.
+        let maximum_allowed = granted & MAXIMUM_ALLOWED != 0;
+        if maximum_allowed {
+            if let Some(existing) = &file {
+                let explicit = granted & !MAXIMUM_ALLOWED;
+                let maximum = match &security {
+                    Ok(security) => match ntfs_security::check(&*volume, &path, security, granted) {
+                        Ok(maximum) => maximum & !MAXIMUM_ALLOWED,
+                        Err(status) => return fail(status),
+                    },
+                    Err(status) => return fail(*status),
+                };
+                let read_only = existing.stat().attributes & 1 != 0;
+                granted = explicit | if read_only { maximum & !6 } else { maximum };
+            }
+        }
         match file.clone() {
             Some(existing) => {
                 let stat = existing.stat();
@@ -363,6 +387,11 @@ pub fn create(out: u64, name: &str, iosb: u64, disposition: u32, request: &OpenR
                 volume.create_with_security(&path, directory, request.attributes, reservation, descriptor.as_deref())?;
                 file = volume_files::lookup_volume_file(name);
                 information = 2;
+                if maximum_allowed {
+                    let explicit = granted & !MAXIMUM_ALLOWED;
+                    let maximum = security.as_ref().ok().and_then(|security| ntfs_security::check(&*volume, &path, security, granted).ok()).unwrap_or(0) & !MAXIMUM_ALLOWED;
+                    granted = explicit | maximum;
+                }
             }
         }
         let Some(file) = file else { return fail(0xC000_0034) };
@@ -606,7 +635,9 @@ pub fn nt_query_information_file(handle: u64, iosb: u64, out: u64, length: u64, 
         match class {
             4 => basic(state::user_struct::<FileBasicInformation>(out)?, &stat)?,
             5 => standard(state::user_struct::<FileStandardInformation>(out)?, file)?,
-            6 => state::user_struct::<FileInternalInformation>(out)?.index_number.quad_part.probe_set(stat.reference as i64)?,
+            // O FILE_REFERENCE inteiro, com a sequência (o NtfsQueryInternalInfo
+            // copia o Fcb->FileReference): o id do OpenFileById.
+            6 => state::user_struct::<FileInternalInformation>(out)?.index_number.quad_part.probe_set(file_reference(stat.reference, stat.sequence) as i64)?,
             7 => state::user_struct::<FileEaInformation>(out)?.ea_size.probe_set(stat.ea_size)?,
             8 => state::user_struct::<FileAccessInformation>(out)?.access_flags.probe_set(handle_access)?,
             14 => state::user_struct::<FilePositionInformation>(out)?.current_byte_offset.quad_part.probe_set(user_file.position() as i64)?,
@@ -711,8 +742,11 @@ fn query_links_or_reserve(entry: &UserHandle, file: &VolumeFile, class: u32, out
 }
 
 /// NtReadFile/NtWriteFile: posição síncrona, append-only sem FILE_WRITE_DATA,
-/// alinhamento de NO_INTERMEDIATE_BUFFERING e o evento de conclusão.
-fn file_transfer(handle: u64, event: u64, apc: u64, rsp: u64, write: bool) -> Result<u32, KernelError> {
+/// alinhamento de NO_INTERMEDIATE_BUFFERING e o evento de conclusão. A
+/// conclusão de um arquivo do volume é a do IopCompleteRequest: a APC de
+/// usuário (ApcRoutine) ou o pacote na porta de conclusão do FILE_OBJECT
+/// (ApcContext), salvo num erro síncrono.
+fn file_transfer(handle: u64, event: u64, apc: u64, apc_context: u64, rsp: u64, write: bool) -> Result<u32, KernelError> {
     let iosb = state::stack_arg(rsp, 5);
     let out = state::stack_arg(rsp, 6);
     let length = state::stack_arg32(rsp, 7) as u64;
@@ -721,7 +755,7 @@ fn file_transfer(handle: u64, event: u64, apc: u64, rsp: u64, write: bool) -> Re
     let key_pointer = state::stack_arg(rsp, 9);
     run(iosb, || {
         let Some(entry) = state::get_user_handle(handle) else { return fail(HANDLE) };
-        if apc != 0 {
+        if apc != 0 && matches!(entry.kind(), "device" | "console") {
             return fail(0xC000_00BB);
         }
         let completion = if event != 0 { state::get_user_handle(event) } else { None };
@@ -748,6 +782,13 @@ fn file_transfer(handle: u64, event: u64, apc: u64, rsp: u64, write: bool) -> Re
         }
         let (entry, user_file) = object(handle)?;
         let file = &user_file.file;
+        // IopReadFile/IopWriteFile (0x5ce41f): ApcRoutine num FILE_OBJECT com
+        // porta de conclusão é STATUS_INVALID_PARAMETER.
+        let file_object = user_file.file_object();
+        // SAFETY: o FILE_OBJECT retido pela descrição aberta.
+        if apc & !1 != 0 && file_object != 0 && unsafe { crate::ntos::inc::types::FileObject::at(file_object) }.completion_context.get() != 0 {
+            return fail(INVALID);
+        }
         if file.directory() {
             return fail(0xC000_00BA);
         }
@@ -821,8 +862,30 @@ fn file_transfer(handle: u64, event: u64, apc: u64, rsp: u64, write: bool) -> Re
         if let Some(body) = completion.and_then(|completion| completion.object.native_body()) {
             dispatcher::set_event(body.pointer);
         }
+        notify_completion(file_object, apc, apc_context, iosb, status, count)?;
         Ok(status)
     })
+}
+
+/// O fim do IopCompleteRequest de um pedido do volume que concluiu na hora:
+/// com ApcRoutine, a APC de usuário (ApcRoutine, ApcContext, IoStatusBlock)
+/// na thread corrente; senão, com porta no FILE_OBJECT e ApcContext, o
+/// pacote na IOCP (FO_SKIP_COMPLETION_PORT dispensa o de um sucesso). Um
+/// erro que não ficou pendente não chega aqui no 19041.
+fn notify_completion(file_object: u64, apc: u64, apc_context: u64, iosb: u64, status: u32, information: u64) -> Result<(), KernelError> {
+    if status & 0xC000_0000 == 0xC000_0000 {
+        return Ok(());
+    }
+    if apc & !1 != 0 {
+        if !crate::ntos::io::file::request::queue_completion_apc(crate::ntos::ps::process::get_current_thread(), apc, apc_context, iosb)? {
+            return fail(0xC000_009A);
+        }
+        return Ok(());
+    }
+    if file_object != 0 {
+        crate::ntos::io::completion::file_port::complete(file_object, apc_context, status, information, false);
+    }
+    Ok(())
 }
 
 /// Handle de um arquivo de driver: o I/O Manager monta o IRP
@@ -845,14 +908,14 @@ fn nt_read_file(handle: u64, event: u64, apc: u64, context: u64, rsp: u64) -> Re
     if let Some(status) = driver_transfer(handle, event, apc, context, rsp, false) {
         return Ok(status);
     }
-    file_transfer(handle, event, apc, rsp, false)
+    file_transfer(handle, event, apc, context, rsp, false)
 }
 
 fn nt_write_file(handle: u64, event: u64, apc: u64, context: u64, rsp: u64) -> Result<u32, KernelError> {
     if let Some(status) = driver_transfer(handle, event, apc, context, rsp, true) {
         return Ok(status);
     }
-    file_transfer(handle, event, apc, rsp, true)
+    file_transfer(handle, event, apc, context, rsp, true)
 }
 
 /// Registra os handlers implementados.
@@ -892,6 +955,11 @@ fn nt_set_information_file(handle: u64, iosb: u64, buffer: u64, length: u64, rsp
             64 => 4,
             65 => 20,
             74 => 4,
+            // FileCompletionInformation e FileIoCompletionNotificationInformation
+            // (IopSetOperationLength 0x10 e 4, sem direito no
+            // IopSetOperationAccess): do I/O Manager para todo arquivo.
+            30 => 16,
+            41 => 4,
             _ => return fail(0xC000_0003),
         };
         if length < minimum {
@@ -902,6 +970,23 @@ fn nt_set_information_file(handle: u64, iosb: u64, buffer: u64, length: u64, rsp
         }
         let handle_access = entry.access();
         match class {
+            // A porta de conclusão e os modos de notificação ficam no
+            // FILE_OBJECT (`io/completion/file_port.rs`), como para os
+            // arquivos de driver: CreateIoCompletionPort, o
+            // TpBindFileToDirect do CreateThreadpoolIo e o
+            // SetFileCompletionNotificationModes.
+            30 | 41 => {
+                let status = if class == 30 {
+                    let port = guest::try_read::<u64>(buffer)?;
+                    let key = guest::try_read::<u64>(buffer + 8)?;
+                    crate::ntos::io::completion::file_port::associate(user_file.file_object(), port, key)
+                } else {
+                    crate::ntos::io::completion::file_port::set_notification_modes(user_file.file_object(), guest::try_read::<u32>(buffer)?)
+                };
+                if status != 0 {
+                    return fail(status);
+                }
+            }
             14 => {
                 let position = size64(buffer)?;
                 if user_file.options & 8 != 0 && position % 512 != 0 {
@@ -1218,7 +1303,7 @@ pub fn matches(pattern: &str, name: &str) -> bool {
 /// (padrão fixado na primeira chamada, `.` e `..` fora da raiz), entradas
 /// alinhadas a 8 com NextEntryOffset, RETURN_SINGLE_ENTRY, RESTART_SCAN,
 /// INDEX_SPECIFIED, NO_SUCH_FILE na primeira e NO_MORE_FILES depois.
-fn query_directory(handle: u64, event: u64, apc: u64, rsp: u64, extended: bool) -> Result<u32, KernelError> {
+fn query_directory(handle: u64, event: u64, apc: u64, apc_context: u64, rsp: u64, extended: bool) -> Result<u32, KernelError> {
     let iosb = state::stack_arg(rsp, 5);
     let out = state::stack_arg(rsp, 6);
     let length = state::stack_arg32(rsp, 7) as u64;
@@ -1231,8 +1316,12 @@ fn query_directory(handle: u64, event: u64, apc: u64, rsp: u64, extended: bool) 
         if entry.access() & 1 == 0 {
             return fail(DENIED);
         }
-        if apc != 0 {
-            return fail(0xC000_00BB);
+        // ApcRoutine num FILE_OBJECT com porta de conclusão: o
+        // NtQueryDirectoryFileEx recusa como o IopReadFile.
+        let file_object = user_file.file_object();
+        // SAFETY: o FILE_OBJECT retido pela descrição aberta.
+        if apc & !1 != 0 && file_object != 0 && unsafe { crate::ntos::inc::types::FileObject::at(file_object) }.completion_context.get() != 0 {
+            return fail(INVALID);
         }
         let completion = if event != 0 { state::get_user_handle(event) } else { None };
         if event != 0 && completion.as_ref().is_none_or(|completion| completion.kind() != "event") {
@@ -1371,16 +1460,17 @@ fn query_directory(handle: u64, event: u64, apc: u64, rsp: u64, extended: bool) 
         if let Some(body) = completion.and_then(|completion| completion.object.native_body()) {
             dispatcher::set_event(body.pointer);
         }
+        notify_completion(file_object, apc, apc_context, iosb, status, used)?;
         Ok(status)
     })
 }
 
-fn nt_query_directory_file(handle: u64, event: u64, apc: u64, _context: u64, rsp: u64) -> Result<u32, KernelError> {
-    query_directory(handle, event, apc, rsp, false)
+fn nt_query_directory_file(handle: u64, event: u64, apc: u64, context: u64, rsp: u64) -> Result<u32, KernelError> {
+    query_directory(handle, event, apc, context, rsp, false)
 }
 
-fn nt_query_directory_file_ex(handle: u64, event: u64, apc: u64, _context: u64, rsp: u64) -> Result<u32, KernelError> {
-    query_directory(handle, event, apc, rsp, true)
+fn nt_query_directory_file_ex(handle: u64, event: u64, apc: u64, context: u64, rsp: u64) -> Result<u32, KernelError> {
+    query_directory(handle, event, apc, context, rsp, true)
 }
 
 /// NtQueryVolumeInformationFile: arquivos pelo volume do arquivo; handles

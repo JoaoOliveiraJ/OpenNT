@@ -909,6 +909,48 @@ impl Ntfs {
         Ok(Some(links))
     }
 
+    /// O caminho do volume do arquivo de referência `reference` (o número do
+    /// registro nos 48 bits baixos e a sequência nos 16 altos; sequência 0
+    /// não é conferida): a abertura por id (FILE_OPEN_BY_FILE_ID), subindo
+    /// pelo primeiro $FILE_NAME que não é só DOS de cada registro até a raiz
+    /// (registro 5). `None` para um registro fora de uso, que não é base ou
+    /// de outra sequência.
+    pub fn path_of_reference(&self, reference: u64) -> Result<Option<String>, KernelError> {
+        const ROOT: u64 = 5;
+        let _shared = self.resource().acquire_shared();
+        let (mut number, mut sequence) = (reference & 0xFFFF_FFFF_FFFF, (reference >> 48) as u16);
+        let mut components: Vec<String> = Vec::new();
+        while number != ROOT {
+            if components.len() >= 256 {
+                return Ok(None);
+            }
+            let Ok(record) = self.read_record(number) else { return Ok(None) };
+            // +0x10 SequenceNumber, +0x16 Flags (1 = em uso), +0x20 a
+            // referência do registro base (0 num registro base).
+            if u16_at(&record, 0x16) & 1 == 0 || u64_at(&record, 0x20) != 0 || (sequence != 0 && u16_at(&record, 0x10) != sequence) {
+                return Ok(None);
+            }
+            let mut link = None;
+            each_attribute(&record, |attribute| {
+                let value = &attribute.value;
+                if attribute.attribute_type == 0x30 && !attribute.non_resident && value.len() >= 0x42 {
+                    let length = value[0x40] as usize;
+                    if value[0x41] & 3 != 2 && 0x42 + length * 2 <= value.len() {
+                        link = Some((u64_at(value, 0), utf16_at(value, 0x42, length)));
+                        return false;
+                    }
+                }
+                true
+            })?;
+            let Some((parent, name)) = link else { return Ok(None) };
+            components.push(name);
+            number = parent & 0xFFFF_FFFF_FFFF;
+            sequence = (parent >> 48) as u16;
+        }
+        components.reverse();
+        Ok(Some(alloc::format!("/{}", components.join("/"))))
+    }
+
     /// Tamanho real e runs em setores do $DATA, sem ler o arquivo inteiro.
     pub fn file_layout(&self, path: &str) -> Result<Option<Layout>, KernelError> {
         let _shared = self.resource().acquire_shared();
