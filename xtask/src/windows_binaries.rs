@@ -714,6 +714,17 @@ const LOGON_SCREEN_PROGRAMS: &[&str] = &[
     "Windows.UI.XamlHost.dll",
     "Windows.UI.Xaml.Resources.Common.dll",
     "Windows.UI.Xaml.Resources.19h1.dll",
+    // O Windows.ApplicationModel.dll, servidor em processo da classe WinRT
+    // Windows.ApplicationModel.DesignMode: o AcrylicBrush::OnElementConnected
+    // do Windows.UI.Xaml.Controls.dll (0xf110, noexcept) chama primeiro o
+    // SharedHelpers::IsInDesignModeV1 (0x8440), que pede a fábrica de
+    // IDesignModeStatics e, sem a classe registrada, lança
+    // REGDB_E_CLASSNOTREG (0x80040154) pelo winrt::throw_hresult. A exceção
+    // sai de uma função noexcept e o LogonUI termina pelo terminate
+    // (0xC0000409, FAST_FAIL_FATAL_APP_EXIT) quando o menu do botão de
+    // energia abre, porque o fundo dele é um AcrylicBrush. Os imports
+    // estáticos já estão no volume; a classe vem pelo caminho do DLL.
+    "Windows.ApplicationModel.dll",
     // O FontGlyphAnimator.dll, servidor em processo da classe WinRT
     // Windows.Internal.UI.FontGlyphAnimator.Data.AnimationDataProvider que o
     // FontGlyphAnimatorModel do Windows.UI.Logon.dll cria (ref new) no
