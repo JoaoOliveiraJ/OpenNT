@@ -25,6 +25,14 @@ fn is_black(rgb: [u8; 3]) -> bool {
 /// Uma tela gráfica de pelo menos 800x600, como o vídeo de boot (1024x768):
 /// a de texto da VGA (720x400) mostra o console do carregador, e o aviso do
 /// QEMU antes da VGA iniciar ocupa 640x480.
+///
+/// Todas as conferências deste módulo leem o `screendump` do QEMU no tamanho
+/// dele, nunca um PNG: o PNG de uma tela com foto sai reduzido à metade
+/// (`png::encode_within`), e limites absolutos como o branco do relógio
+/// ([`lock_screen_shown`]), o ponteiro e esta própria guarda só valem na
+/// tela inteira. Cada PNG que o test-boot grava leva o tamanho da tela no
+/// texto `opennt-tela`; para conferir um PNG de novo, amplie-o antes, pelo
+/// vizinho mais próximo, para esse tamanho.
 fn is_graphics(image: &Image) -> bool {
     image.width >= 800 && image.height >= 600
 }

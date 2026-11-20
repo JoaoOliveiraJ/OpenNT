@@ -662,9 +662,18 @@ impl InputSend {
 /// teclas de um `--send`.
 pub const KEYS_SENT: &str = "[xtask] teclas enviadas pelo monitor";
 
+/// O tamanho da tela do QEMU (`LARGURAxALTURA`) no texto `opennt-tela` de
+/// cada PNG: o PNG pode sair reduzido ([`crate::png::encode_within`]), e as
+/// conferências de [`screen_check`] valem na tela inteira; quem confere um PNG
+/// de novo o amplia antes, pelo vizinho mais próximo, para este tamanho.
+fn native_size(image: &crate::png::Image) -> String {
+    format!("{}x{}", image.width, image.height)
+}
+
 /// Grava uma captura da tela em `target`, com a descrição nos metadados.
 fn save_capture(image: &crate::png::Image, target: &std::path::Path, result: &str, description: &str) {
-    let png = crate::png::encode_capture(image, &[("opennt-data", crate::png::today().as_str()), ("opennt-resultado", result), ("opennt-serial", description)], CAPTURE_LIMIT);
+    let screen = native_size(image);
+    let png = crate::png::encode_capture(image, &[("opennt-data", crate::png::today().as_str()), ("opennt-tela", screen.as_str()), ("opennt-resultado", result), ("opennt-serial", description)], CAPTURE_LIMIT);
     if std::fs::write(target, &png).is_ok() {
         println!("[xtask] {result}: {}", target.display());
     }
@@ -849,8 +858,8 @@ impl FrameSeries {
             return Ok(None);
         }
         let target = self.directory.join(Self::name(index));
-        let (date, time) = (crate::png::today(), seconds(elapsed));
-        let png = crate::png::encode_within(image, &[("opennt-data", date.as_str()), ("opennt-tempo", time.as_str()), ("opennt-serial", serial)], FRAME_LIMIT);
+        let (date, time, screen) = (crate::png::today(), seconds(elapsed), native_size(image));
+        let png = crate::png::encode_within(image, &[("opennt-data", date.as_str()), ("opennt-tela", screen.as_str()), ("opennt-tempo", time.as_str()), ("opennt-serial", serial)], FRAME_LIMIT);
         std::fs::write(&target, &png).map_err(|error| format!("{}: {error}", target.display()))?;
         self.previous = Some(image.clone());
         self.saved += 1;
@@ -925,8 +934,8 @@ fn final_frame(
         (Err(_), Some(image)) => (image, "a ultima lida durante o teste"),
         (Err(error), None) => return Err(error),
     };
-    let (date, outcome, time) = (crate::png::today(), outcome(result), seconds(elapsed));
-    let texts = [("opennt-data", date.as_str()), ("opennt-resultado", outcome.as_str()), ("opennt-tempo", time.as_str()), ("opennt-origem", origin), ("opennt-serial", serial)];
+    let (date, outcome, time, screen) = (crate::png::today(), outcome(result), seconds(elapsed), native_size(&image));
+    let texts = [("opennt-data", date.as_str()), ("opennt-tela", screen.as_str()), ("opennt-resultado", outcome.as_str()), ("opennt-tempo", time.as_str()), ("opennt-origem", origin), ("opennt-serial", serial)];
     let png = crate::png::encode_within(&image, &texts, FRAME_LIMIT);
     std::fs::write(target, &png).map_err(|error| format!("{}: {error}", target.display()))?;
     println!("[xtask] tela final ({origin}, {}x{}, {} bytes): {}", image.width, image.height, png.len(), target.display());
@@ -1036,8 +1045,8 @@ fn write_capture(image: &crate::png::Image, target: &Path, result: &Result<(), S
         std::fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
     }
     let outcome = outcome(result);
-    let date = crate::png::today();
-    let texts = [("opennt-data", date.as_str()), ("opennt-resultado", outcome.as_str()), ("opennt-serial", serial)];
+    let (date, screen) = (crate::png::today(), native_size(image));
+    let texts = [("opennt-data", date.as_str()), ("opennt-tela", screen.as_str()), ("opennt-resultado", outcome.as_str()), ("opennt-serial", serial)];
     let png = crate::png::encode_capture(image, &texts, CAPTURE_LIMIT);
     std::fs::write(target, &png).map_err(|error| format!("{}: {error}", target.display()))?;
     let info = crate::png::read_info(&png).ok_or("PNG gerado ilegivel")?;
@@ -2050,6 +2059,7 @@ mod tests {
         let info = crate::png::read_info(&std::fs::read(directory.join("tela-0003.png")).unwrap()).unwrap();
         assert_eq!((info.width, info.height), (64, 48));
         assert_eq!(info.text("opennt-tempo"), Some("15.0 s"));
+        assert_eq!(info.text("opennt-tela"), Some("64x48"));
         assert_eq!(info.text("opennt-serial"), Some("linha da serial"));
         assert!(series.summary().starts_with("3 tela(s) gravada(s) em "), "{}", series.summary());
         std::fs::remove_dir_all(&directory).unwrap();
@@ -2070,6 +2080,7 @@ mod tests {
         assert_eq!(info.text("opennt-resultado"), Some("falhou: tempo esgotado esperando \"X\""));
         assert_eq!(info.text("opennt-origem"), Some("a ultima lida durante o teste"));
         assert_eq!(info.text("opennt-tempo"), Some("9.0 s"));
+        assert_eq!(info.text("opennt-tela"), Some("32x24"));
         assert_eq!(info.text("opennt-serial"), Some("*** STOP"));
         std::fs::remove_dir_all(&directory).unwrap();
     }
@@ -2167,6 +2178,8 @@ mod tests {
         assert_eq!((text.matches(FIRST_PIXEL_MARKER).count(), text.matches(LOGON_SCREEN_MARKER).count()), (1, 1), "{text}");
         let saved = crate::png::read_info(&std::fs::read(directory.join("tela-de-logon.png")).unwrap()).unwrap();
         assert_eq!(saved.text("opennt-resultado"), Some("tela de logon"));
+        // O PNG pode sair reduzido; o tamanho da tela conferida vai junto.
+        assert_eq!(saved.text("opennt-tela"), Some("1024x768"));
 
         // Uma leitura que não é a tela de logon entre duas que são recomeça
         // a contagem.
@@ -2188,6 +2201,7 @@ mod tests {
         write_capture(&image, &target, &Ok(()), "LOGON_SCREEN_OK\n").unwrap();
         let info = crate::png::read_info(&std::fs::read(&target).unwrap()).unwrap();
         assert_eq!(info.text("opennt-resultado"), Some("passou"));
+        assert_eq!(info.text("opennt-tela"), Some("1024x768"));
         assert_eq!(info.text("opennt-serial"), Some("LOGON_SCREEN_OK\n"));
         std::fs::remove_dir_all(&directory).unwrap();
     }
