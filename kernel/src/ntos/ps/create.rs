@@ -528,6 +528,29 @@ fn open_image(image: &ImageOrigin, image_name: &str, additional_access: u32) -> 
     Ok((Arc::new(VolumeImage { name: name.clone(), file: file.clone() }), Arc::new(VolumeSource { name, file: file.clone() }), Some(ImageFile { file, access })))
 }
 
+/// IMAGE_SUBSYSTEM_WINDOWS_CUI.
+const SUBSYSTEM_WINDOWS_CUI: u32 = 3;
+
+/// O ConsoleHandle do PspCopyAndFixupParameters (0x612c92): num programa de
+/// console (SubSystemType do SECTION_IMAGE_INFORMATION, +0x20, igual a
+/// IMAGE_SUBSYSTEM_WINDOWS_CUI) com um ConsoleHandle que é handle (positivo:
+/// nem NULL nem os valores -1/-2/-3 do kernelbase), o ObDuplicateObject do
+/// handle do pai para o processo novo (anexado a ele), com
+/// DUPLICATE_SAME_ACCESS | DUPLICATE_SAME_ATTRIBUTES, e o valor novo no
+/// bloco já gravado. É assim que o filho de um programa de console recebe o
+/// `\Reference` do condrv do pai, que o kernelbase abre sem OBJ_INHERIT
+/// (ConsoleCreateHandle 0x489e0 do ConsoleAllocate). Uma falha deixa o
+/// valor do pai, como no NT.
+fn fixup_console_handle(block: u64, parent: u64, child: u64, console_handle: u64, image_information: &[u8; INFORMATION_SIZE]) {
+    let subsystem = u32::from_le_bytes(image_information[0x20..0x24].try_into().unwrap_or([0; 4]));
+    if subsystem != SUBSYSTEM_WINDOWS_CUI || (console_handle as i64) <= 0 || parent == child {
+        return;
+    }
+    let Some(Ok(handle)) = crate::ntos::ps::user::handles::duplicate_user_handle_kernel(parent, console_handle, child, 0, 0, 6) else { return };
+    // SAFETY: o bloco gravado agora no processo novo (anexado).
+    unsafe { crate::ntos::inc::types::RtlUserProcessParameters::at(block) }.console_handle.set(handle as u64);
+}
+
 /// O PspLocateInPEManifest: o LdrResSearchResource(SectionBaseAddress,
 /// {RT_MANIFEST, CREATEPROCESS_MANIFEST_RESOURCE_ID, 0}, 3, Flags 0x30: só o
 /// módulo principal, o primeiro idioma) na imagem principal, mapeada no
@@ -731,6 +754,7 @@ pub fn create_user_process(request: &CreateProcessRequest<'_>) -> Result<Created
             let manifest_flag = if manifest.is_some() { APP_MANIFEST_PRESENT } else { 0 };
             let parameter_flags = manifest_flag | crate::ntos::ps::process_parameters::NORMALIZED;
             let block = parameters.write(parameter_flags)?;
+            fixup_console_handle(block, request.parent.unwrap_or_else(process::get_current_process), process_pointer, parameters.console_handle, &image_information);
             // SAFETY: a PEB recém-criada no processo corrente.
             unsafe { Peb::at(peb) }.process_parameters.set(block);
             let teb = peb_teb::create_teb(&TebDescription { process_id, thread_id, peb, stack_base, stack_limit, deallocation_stack, current_locale: crate::ntos::ps::locale::thread_locale_of(process_pointer) })?;
