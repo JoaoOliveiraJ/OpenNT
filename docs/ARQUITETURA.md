@@ -4642,7 +4642,8 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   KdDebuggerNotPresent, sondagem de alinhamento 1) e
   SystemHypervisorSharedPageInformation do NtQuerySystemInformation
   (`ex/system_information.rs::query_fixed`, também no Zw). O NtCreateTimer,
-  o NtSetTimer e o NtCancelTimer de modo usuário são adaptadores do ETIMER
+  o NtOpenTimer (o ObOpenObjectByName com ExTimerObjectType), o NtSetTimer
+  e o NtCancelTimer de modo usuário são adaptadores do ETIMER
   do Executive (`ex/timer_object.rs`, PreviousMode UserMode, em
   `ps/user/timer_objects.rs`). O NtCreateIRTimer é o NtCreateTimer2 com o
   atributo IR (2): o identificador IR passa pelo ExpCheckIRTimerAccess

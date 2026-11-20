@@ -94,6 +94,11 @@ fn nt_create_timer(out: u64, access: u64, attributes: u64, timer_type: u64, _rsp
     timer_object::create(out, access as u32, attributes, timer_type as u32, USER_MODE)
 }
 
+/// NtOpenTimer(TimerHandle, DesiredAccess, ObjectAttributes).
+fn nt_open_timer(out: u64, access: u64, attributes: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
+    timer_object::open(out, access as u32, attributes, USER_MODE)
+}
+
 /// NtSetTimer(TimerHandle, DueTime, TimerApcRoutine, TimerContext,
 /// ResumeTimer, Period, PreviousState): os três últimos na pilha.
 fn nt_set_timer(handle: u64, due: u64, apc_routine: u64, apc_context: u64, rsp: u64) -> Result<u32, KernelError> {
@@ -117,6 +122,7 @@ fn nt_cancel_timer(handle: u64, current_state: u64, _a3: u64, _a4: u64, _rsp: u6
 
 pub fn init() {
     state::register_handler("NtCreateTimer", nt_create_timer);
+    state::register_handler("NtOpenTimer", nt_open_timer);
     state::register_handler("NtSetTimer", nt_set_timer);
     state::register_handler("NtSetTimerEx", nt_set_timer_ex);
     state::register_handler("NtCancelTimer", nt_cancel_timer);

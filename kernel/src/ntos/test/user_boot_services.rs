@@ -391,6 +391,22 @@ fn executive_timer(assert: Assert, block: u64, rsp: u64, call: Call) {
         "userboot: NtCreateTimer, NtSetTimer e NtCancelTimer do ETIMER de modo usuario",
     );
     assert(query_ok && query_refused && idle, "userboot: NtQueryTimer do ETIMER (restante, estado, recusas e timer fora da fila)");
+    // NtOpenTimer (o OpenWaitableTimerW): um timer nomeado abre pelo nome;
+    // um nome ausente dá STATUS_OBJECT_NAME_NOT_FOUND e um objeto de outro
+    // tipo, STATUS_OBJECT_TYPE_MISMATCH.
+    let (named_cell, opened_cell, oa) = (block + 0x638, block + 0x640, block + 0x1C00);
+    let named = call("NtCreateTimer", named_cell, 0x1F_0003, attributes(oa, "\\OpenNtTimerAberto"), 0);
+    let named_handle = guest::read64(named_cell);
+    let opened = call("NtOpenTimer", opened_cell, 0x1F_0003, attributes(oa, "\\OpenNtTimerAberto"), 0);
+    let opened_handle = guest::read64(opened_cell);
+    let missing = call("NtOpenTimer", opened_cell, 0x1F_0003, attributes(oa, "\\OpenNtTimerAusente"), 0);
+    let directory = call("NtCreateDirectoryObject", block + 0x648, 0xF, attributes(oa, "\\OpenNtTimerDiretorio"), 0);
+    let mismatch = call("NtOpenTimer", opened_cell, 0x1F_0003, attributes(oa, "\\OpenNtTimerDiretorio"), 0);
+    let closed = [named_handle, opened_handle, guest::read64(block + 0x648)].map(|handle| call("NtClose", handle, 0, 0, 0));
+    assert(
+        named == 0 && opened == 0 && opened_handle != 0 && opened_handle != named_handle && missing == 0xC000_0034 && directory == 0 && mismatch == 0xC000_0024 && closed == [0, 0, 0],
+        "userboot: NtOpenTimer abre o ETIMER nomeado e recusa nome ausente e objeto de outro tipo",
+    );
 }
 
 /// NtSetTimerEx no ETIMER (o SetWaitableTimer do kernelbase): as recusas de

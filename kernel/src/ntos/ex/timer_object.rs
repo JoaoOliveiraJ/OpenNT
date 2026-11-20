@@ -261,6 +261,48 @@ pub fn create(handle_out: u64, access: u32, attributes: u64, timer_type_value: u
     result
 }
 
+/// NtOpenTimer (ntoskrnl 19041, 0x94f0d0) no modo `mode`: em UserMode a
+/// célula do handle é sondada para escrita (sem exigir alinhamento); o
+/// ObOpenObjectByName com ExTimerObjectType e o acesso pedido (sem
+/// OBJECT_ATTRIBUTES, STATUS_INVALID_PARAMETER); o handle sai no sucesso.
+/// Devolve o NTSTATUS.
+pub fn open(handle_out: u64, access: u32, attributes: u64, mode: u8) -> Result<u32, KernelError> {
+    use crate::ntos::ob::object_open;
+    if mode != 0 && !user_probe::probe_user_write(handle_out, 8) {
+        return Ok(STATUS_ACCESS_VIOLATION);
+    }
+    if attributes == 0 {
+        return Ok(STATUS_INVALID_PARAMETER);
+    }
+    let captured = if mode != 0 {
+        match object_open::capture_user_attributes(attributes) {
+            Ok(block) => Some(block),
+            Err(status) => return Ok(status),
+        }
+    } else {
+        None
+    };
+    let cell = guest::alloc_bytes(8);
+    if cell == 0 {
+        if let Some(block) = captured {
+            guest::free_bytes(block);
+        }
+        return Ok(STATUS_INSUFFICIENT_RESOURCES);
+    }
+    guest::write64(cell, 0);
+    let status = object_open::open_by_name(captured.unwrap_or(attributes), timer_type(), mode, access, cell).map(|value| value as u32);
+    let handle = guest::read64(cell);
+    guest::free_bytes(cell);
+    if let Some(block) = captured {
+        guest::free_bytes(block);
+    }
+    let status = status?;
+    if status & 0x8000_0000 == 0 && !write_output::<u64>(mode, handle_out, handle)? {
+        return Ok(STATUS_ACCESS_VIOLATION);
+    }
+    Ok(status)
+}
+
 /// NtSetTimer no modo `mode` (TolerableDelay 0). Devolve o NTSTATUS.
 #[allow(clippy::too_many_arguments)]
 pub fn set(handle: u64, due_time: u64, apc_routine: u64, apc_context: u64, resume: bool, period: i32, previous_state: u64, mode: u8) -> Result<u32, KernelError> {
