@@ -128,7 +128,7 @@ Cache Manager e os drivers reais do Windows para a tela gráfica (win32k.sys, dx
 
 | Componente | Estado | Teste automático |
 | --- | --- | --- |
-| Cache Manager | Parcial | fase6, ntfs |
+| Cache Manager | Parcial | fase6, ntfs, nvme, e-process |
 | win32k.sys, win32kbase.sys e win32kfull.sys | Parcial | win32k, win32k-display |
 | acpi.sys e pci.sys | Parcial | acpi, usb |
 | Pilha USB 3 e HID (usbxhci.sys, ucx01000.sys, usbhub3.sys, hidusb.sys, hidclass.sys, kbdhid.sys e mouhid.sys) | Parcial | usb |
