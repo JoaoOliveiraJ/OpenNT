@@ -3564,7 +3564,9 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   FILE_OBJECT (teste `volume_notify_locks` na fase 7). Os serviços de modo usuário NtFlushBuffersFile(Ex) (acesso de
   escrita ou de acréscimo; o IRP_MJ_FLUSH_BUFFERS com o minor dos flags num
   arquivo de driver), NtFlushVirtualMemory (a vista de arquivo gravada de
-  volta), NtQueryEaFile/NtSetEaFile (sondas, a lista FILE_GET_EA_INFORMATION
+  volta: `ps/user/sections.rs::flush` junta as páginas alteradas vizinhas,
+  até 16 por escrita, do primeiro ao último byte alterado, com o conteúdo
+  atual do arquivo nos bytes que a vista não mudou), NtQueryEaFile/NtSetEaFile (sondas, a lista FILE_GET_EA_INFORMATION
   conferida, FILE_READ_EA/FILE_WRITE_EA, e as EAs `$KERNEL.` só do modo
   kernel), NtCancelSynchronousIoFile (as requisições síncronas da thread
   canceladas, ou STATUS_NOT_FOUND) e NtDeleteFile (a abertura DeleteOnly com
