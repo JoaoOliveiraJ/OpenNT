@@ -15,6 +15,7 @@ use crate::ntos::ob::object_manager::{ObjectData, ObjectHooks};
 use crate::ntos::ob::object_types::{self, ObjectType};
 use crate::ntos::ob::open_pointer::{self, ObjectOwner, Slot};
 use crate::ntos::ob::object_access;
+use crate::ntos::ob::shared_policy::{self, SharedPolicy};
 use crate::ntos::mm::section::create as create_section;
 use crate::ntos::se::model::SecurityPolicy;
 use crate::ntos::se::token::tokens;
@@ -47,13 +48,17 @@ pub struct DispatcherHooks {
 }
 
 struct Body {
-    kind: String,
-    object_type: ObjectType,
-    security: SecurityPolicy,
-    /// O SecurityDescriptor nulo do NT: objeto sem nome, criado sem
-    /// descritor, num tipo sem SecurityRequired. A abertura por ponteiro e o
-    /// ObCheckObjectAccess concedem o pedido sem SeAccessCheck.
-    no_descriptor: bool,
+    kind: &'static str,
+    /// O tipo, dividido por todos os corpos dele.
+    object_type: Arc<ObjectType>,
+    /// O descritor, dividido entre corpos com a mesma política
+    /// (`ob/shared_policy.rs`, o ObLogSecurityDescriptor). `None` é o
+    /// SecurityDescriptor nulo do NT: objeto sem nome, criado sem descritor,
+    /// num tipo sem SecurityRequired; nada é guardado, a abertura por
+    /// ponteiro e o ObCheckObjectAccess concedem o pedido sem SeAccessCheck,
+    /// a consulta devolve o descritor vazio e o NtSetSecurityObject dá
+    /// STATUS_NO_SECURITY_ON_OBJECT.
+    security: Option<SharedPolicy>,
     refs: u32,
     handles: u32,
     /// Contagens espelhadas no próprio corpo (+0 referências, +8 handles).
@@ -65,6 +70,20 @@ struct Body {
 
 static BODIES: SpinLock<BTreeMap<u64, Body>> = SpinLock::new(BTreeMap::new());
 
+/// Os tipos dos corpos, um registro por OBJECT_TYPE.
+static TYPES: SpinLock<alloc::vec::Vec<Arc<ObjectType>>> = SpinLock::new(alloc::vec::Vec::new());
+
+/// O registro dividido do tipo `object_type`.
+fn shared_type(object_type: ObjectType) -> Arc<ObjectType> {
+    let mut types = TYPES.lock();
+    if let Some(known) = types.iter().find(|known| known.pointer == object_type.pointer) {
+        return known.clone();
+    }
+    let known = Arc::new(object_type);
+    types.push(known.clone());
+    known
+}
+
 fn status(code: u32) -> KernelError {
     KernelError::with_status(alloc::format!("dispatcher object status {code:x}"), code)
 }
@@ -75,7 +94,7 @@ static OWNER: DispatcherOwner = DispatcherOwner;
 
 impl ObjectOwner for DispatcherOwner {
     fn object_type(&self, pointer: u64) -> ObjectType {
-        BODIES.lock().get(&pointer).map(|body| body.object_type.clone()).unwrap_or_else(object_types::event_type)
+        BODIES.lock().get(&pointer).map(|body| ObjectType::clone(&body.object_type)).unwrap_or_else(object_types::event_type)
     }
     fn reference(&self, pointer: u64) {
         let _ = reference(pointer);
@@ -93,14 +112,7 @@ impl ObjectOwner for DispatcherOwner {
         security(pointer).unwrap_or_default()
     }
     fn set_security(&self, pointer: u64, security: SecurityPolicy) -> bool {
-        BODIES
-            .lock()
-            .get_mut(&pointer)
-            .map(|body| {
-                body.security = security;
-                body.no_descriptor = false;
-            })
-            .is_some()
+        replace_security(pointer, security)
     }
     fn has_descriptor(&self, pointer: u64) -> bool {
         has_descriptor(pointer)
@@ -120,15 +132,18 @@ fn caller_read<T: guest::GuestScalar>(address: u64, from_user_mode: bool) -> Res
     if from_user_mode { guest::try_read::<T>(address).map_err(|_| status(0xC000_0005)) } else { Ok(guest::read::<T>(address)) }
 }
 
-/// Captura a política de segurança e registra o corpo. `attributes` é o
+/// Atribui o descritor e registra o corpo. `attributes` é o
 /// OBJECT_ATTRIBUTES (SecurityDescriptor em +32; zero = política do sujeito).
 ///
-/// Como o ObInsertObjectEx do 19041, um objeto sem nome (ObjectName ausente
-/// ou vazio), sem descritor explícito e de um tipo sem SecurityRequired fica
-/// sem descritor (`no_descriptor`); a política do sujeito ainda é guardada
-/// para quando o objeto ganhar um nome ([`mark_named`]) ou um descritor
-/// (NtSetSecurityObject).
-pub fn create(pointer: u64, kind: &str, dispose: fn(u64), busy: Option<fn(u64) -> bool>, attributes: u64, from_user_mode: bool, hooks: DispatcherHooks) -> Result<u64, KernelError> {
+/// Como o ObInsertObjectEx do 19041 (0x652192..0x6521b7 confere o
+/// SecurityRequired do TypeInfo, o nome e o SecurityDescriptor do
+/// ObjectCreateInfo; sem os três, 0x6521bd..0x652201 vai direto ao
+/// ObpCreateHandle, sem SeAssignSecurity), um objeto sem nome (ObjectName
+/// ausente ou vazio), sem descritor explícito e de um tipo sem
+/// SecurityRequired fica sem descritor e nada da política do sujeito é
+/// guardado. Os outros recebem o descritor do SeAssignSecurity, dividido
+/// entre corpos iguais.
+pub fn create(pointer: u64, kind: &'static str, dispose: fn(u64), busy: Option<fn(u64) -> bool>, attributes: u64, from_user_mode: bool, hooks: DispatcherHooks) -> Result<u64, KernelError> {
     let object_type = if kind == "event" { Some(object_types::event_type()) } else { object_types::user_type(kind) };
     let Some(object_type) = object_type.filter(|_| !BODIES.lock().contains_key(&pointer)) else {
         return Err(KernelError::new("invalid dispatcher object registration"));
@@ -150,33 +165,51 @@ pub fn create(pointer: u64, kind: &str, dispose: fn(u64), busy: Option<fn(u64) -
     // O SeAssignSecurity do objeto novo: o descritor explícito sobre o dono,
     // o grupo e a DACL padrão do token efetivo (a herança do diretório entra
     // quando o nome é publicado).
-    let policy = if descriptor != 0 { crate::ntos::ob::object_security::assign_new(&object_type, None, descriptor, from_user_mode).map_err(status)? } else { object_access::capture(subject) };
-    if from_user_mode && policy.sacl.as_deref().is_some_and(crate::ntos::se::model::sacl_requires_security_privilege) {
+    let policy = if descriptor != 0 {
+        Some(crate::ntos::ob::object_security::assign_new(&object_type, None, descriptor, from_user_mode).map_err(status)?)
+    } else if no_descriptor {
+        None
+    } else {
+        Some(object_access::capture(subject))
+    };
+    if from_user_mode && policy.as_ref().and_then(|policy| policy.sacl.as_deref()).is_some_and(crate::ntos::se::model::sacl_requires_security_privilege) {
         let privileged = subject.and_then(|token| tokens::with(token, |token| token.privileges.iter().any(|privilege| privilege.id == 8 && privilege.attributes & 2 != 0))).unwrap_or(false);
         if !privileged {
             return Err(status(0xC000_0061));
         }
     }
     object_types::bind_native(pointer, &object_type.name)?;
-    BODIES.lock().insert(pointer, Body { kind: String::from(kind), object_type, security: policy, no_descriptor, refs: 0, handles: 0, mirror: false, dispose, busy, hooks });
+    let (object_type, security) = (shared_type(object_type), policy.map(shared_policy::share));
+    BODIES.lock().insert(pointer, Body { kind, object_type, security, refs: 0, handles: 0, mirror: false, dispose, busy, hooks });
     open_pointer::register_owner(Slot::Dispatcher, |pointer| BODIES.lock().contains_key(&pointer), &OWNER);
     Ok(pointer)
 }
 
 /// O objeto vai ganhar um nome que não veio no OBJECT_ATTRIBUTES (os
-/// objetos nomeados do próprio kernel): como no ObInsertObjectEx de um
-/// objeto nomeado, ele passa a ter o descritor (a política do sujeito
-/// capturada na criação; a herança do diretório entra com o nome).
+/// objetos nomeados do próprio kernel, logo depois do [`create`] e no mesmo
+/// contexto): como no ObInsertObjectEx de um objeto nomeado, ele passa a ter
+/// o descritor do sujeito (a herança do diretório entra com o nome).
 pub fn mark_named(pointer: u64) {
-    if let Some(body) = BODIES.lock().get_mut(&pointer) {
-        body.no_descriptor = false;
+    if BODIES.lock().get(&pointer).is_none_or(|body| body.security.is_some()) {
+        return;
     }
+    let policy = shared_policy::share(object_access::capture(object_access::subject()));
+    let previous = BODIES.lock().get_mut(&pointer).and_then(|body| body.security.replace(policy));
+    drop(previous);
 }
 
 /// O corpo tem descritor de segurança (falso para o SecurityDescriptor nulo
 /// do NT).
 pub fn has_descriptor(pointer: u64) -> bool {
-    BODIES.lock().get(&pointer).is_none_or(|body| !body.no_descriptor)
+    BODIES.lock().get(&pointer).is_none_or(|body| body.security.is_some())
+}
+
+/// Troca o descritor de um corpo vivo pela cópia dividida de `policy`;
+/// `false` sem o corpo. A cópia anterior cai fora da trava dos corpos.
+fn replace_security(pointer: u64, policy: SecurityPolicy) -> bool {
+    let policy = shared_policy::share(policy);
+    let previous = BODIES.lock().get_mut(&pointer).map(|body| body.security.replace(policy));
+    previous.is_some()
 }
 
 fn assert_live(pointer: u64) -> Result<(), KernelError> {
@@ -251,7 +284,7 @@ pub fn dereference(pointer: u64) -> Result<u32, KernelError> {
 /// Verificação do dono, retenção e mais um handle.
 pub fn open(pointer: u64) -> Result<(), KernelError> {
     assert_live(pointer)?;
-    let (hooks, type_name) = BODIES.lock().get(&pointer).map(|body| (body.hooks, body.object_type.name.clone())).unwrap();
+    let (hooks, object_type) = BODIES.lock().get(&pointer).map(|body| (body.hooks, body.object_type.clone())).unwrap();
     if let Some(before) = hooks.before_handle_open {
         before(pointer)?;
     }
@@ -260,12 +293,12 @@ pub fn open(pointer: u64) -> Result<(), KernelError> {
         body.handles += 1;
         mirror(pointer, body);
     }
-    object_types::account(&type_name, 0, 1)
+    object_types::account(&object_type.name, 0, 1)
 }
 
 /// Conta o fechamento, notifica o último handle e solta a referência.
 pub fn close(pointer: u64) -> Result<(), KernelError> {
-    let (last, hooks, type_name) = {
+    let (last, hooks, object_type) = {
         let mut bodies = BODIES.lock();
         let body = bodies.get_mut(&pointer).ok_or_else(|| KernelError::new("dispatcher object has been released"))?;
         if body.handles == 0 {
@@ -273,9 +306,9 @@ pub fn close(pointer: u64) -> Result<(), KernelError> {
         }
         body.handles -= 1;
         mirror(pointer, body);
-        (body.handles == 0, body.hooks, body.object_type.name.clone())
+        (body.handles == 0, body.hooks, body.object_type.clone())
     };
-    let _ = object_types::account(&type_name, 0, -1);
+    let _ = object_types::account(&object_type.name, 0, -1);
     if last {
         if let Some(notify) = hooks.on_last_handle_close {
             notify(pointer);
@@ -308,22 +341,30 @@ pub fn data(pointer: u64) -> ObjectData {
 
 /// Política definida pelo criador (o objeto passa a ter descritor).
 pub fn set_security(pointer: u64, policy: SecurityPolicy) {
-    if let Some(body) = BODIES.lock().get_mut(&pointer) {
-        body.security = policy;
-        body.no_descriptor = false;
+    replace_security(pointer, policy);
+}
+
+/// Os dois corpos têm a mesma cópia dividida do descritor.
+pub fn same_security(left: u64, right: u64) -> bool {
+    let bodies = BODIES.lock();
+    match (bodies.get(&left).and_then(|body| body.security.as_ref()), bodies.get(&right).and_then(|body| body.security.as_ref())) {
+        (Some(left), Some(right)) => left.same(right),
+        _ => false,
     }
 }
 
+/// O descritor do corpo como política; `None` sem o corpo ou sem descritor.
 pub fn security(pointer: u64) -> Option<SecurityPolicy> {
-    BODIES.lock().get(&pointer).map(|body| body.security.clone())
+    let shared = BODIES.lock().get(&pointer).and_then(|body| body.security.clone())?;
+    Some(SecurityPolicy::clone(&shared))
 }
 
 /// O censo dos corpos vivos (o diagnóstico do `--heap-census`): por tipo,
 /// quantos, quantos sem handle e as referências somadas.
-pub fn census() -> alloc::vec::Vec<(String, u32, u32, u32)> {
-    let mut groups: BTreeMap<String, (u32, u32, u32)> = BTreeMap::new();
+pub fn census() -> alloc::vec::Vec<(&'static str, u32, u32, u32)> {
+    let mut groups: BTreeMap<&'static str, (u32, u32, u32)> = BTreeMap::new();
     for body in BODIES.lock().values() {
-        let group = groups.entry(body.kind.clone()).or_default();
+        let group = groups.entry(body.kind).or_default();
         group.0 += 1;
         group.1 += (body.handles == 0) as u32;
         group.2 += body.refs;
@@ -333,7 +374,7 @@ pub fn census() -> alloc::vec::Vec<(String, u32, u32, u32)> {
 
 /// (tipo do objeto, referências, handles) de um corpo vivo.
 pub fn get(pointer: u64) -> Option<(String, u32, u32)> {
-    BODIES.lock().get(&pointer).map(|body| (body.kind.clone(), body.refs, body.handles))
+    BODIES.lock().get(&pointer).map(|body| (String::from(body.kind), body.refs, body.handles))
 }
 
 /// Handle de usuário de um corpo de despacho (`{ ...body.data, type: kind }`),
@@ -382,36 +423,20 @@ impl crate::ntos::ps::user::state::UserObject for UserDispatcher {
     }
 }
 
-fn static_kind(kind: &str) -> &'static str {
-    match kind {
-        "event" => "event",
-        "semaphore" => "semaphore",
-        "mutant" => "mutant",
-        "timer" => "timer",
-        "keyedevent" => "keyedevent",
-        "completion" => "completion",
-        "partition" => "partition",
-        "waitpacket" => "waitpacket",
-        "workerfactory" => "workerfactory",
-        "alpc" => "alpc",
-        "port" => "port",
-        _ => "dispatcher",
-    }
-}
-
 /// Verifica os direitos e publica um handle de usuário com os ganchos do
 /// corpo; recusa coleta o corpo e uma falha ao gravar a saída desfaz o handle.
 pub fn publish(pointer: u64, output: u64, desired: u32, attributes: u32, success: u32, creating: bool, payload: Option<Arc<dyn core::any::Any + Send + Sync>>) -> Result<u32, KernelError> {
-    let Some((kind, object_type, policy, no_descriptor)) = BODIES.lock().get(&pointer).map(|body| (body.kind.clone(), body.object_type.clone(), body.security.clone(), body.no_descriptor)) else { return Err(KernelError::new("dispatcher object has been released")) };
+    let Some((kind, object_type, security)) = BODIES.lock().get(&pointer).map(|body| (body.kind, body.object_type.clone(), body.security.clone())) else { return Err(KernelError::new("dispatcher object has been released")) };
     // Sem descritor, o ObpCreateHandle não passa pelo SeAccessCheck.
-    let access = match object_access::check(&policy, object_access::subject(), desired, &object_type, creating || no_descriptor) {
+    let unchecked = SecurityPolicy::default();
+    let access = match object_access::check(security.as_deref().unwrap_or(&unchecked), object_access::subject(), desired, &object_type, creating || security.is_none()) {
         Ok(access) => access,
         Err(status) => {
             collect(pointer);
             return Ok(status);
         }
     };
-    let object = Arc::new(UserDispatcher { pointer, kind: static_kind(&kind), payload });
+    let object = Arc::new(UserDispatcher { pointer, kind, payload });
     let handle = match crate::ntos::ps::user::state::alloc_user_handle(object, access, attributes & 2) {
         Ok(handle) => handle,
         Err(error) => {

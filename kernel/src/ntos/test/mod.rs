@@ -80,6 +80,7 @@ pub mod volume_mountdev;
 pub mod yield_execution;
 pub mod anti_starvation;
 pub mod thread_reclaim;
+pub mod object_descriptors;
 pub mod reparse_points;
 pub mod volume_notify_locks;
 pub mod file_security;

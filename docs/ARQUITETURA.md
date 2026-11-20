@@ -2733,13 +2733,23 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   ZwQueryObject e o Nt/ZwQuerySecurityObject (que passa pelo
   SecurityProcedure de cada tipo: IRP_MJ_QUERY_SECURITY nos arquivos, o
   DEVICE_OBJECT, o nó da chave, o SeQuerySecurityDescriptorInfo nos demais).
-  Um objeto pode não ter descritor (o SecurityDescriptor nulo do NT: sem
-  nome, criado sem descritor, num tipo sem SecurityRequired; as seções e os
-  corpos de `ob/objects/dispatcher.rs` — eventos, mutantes, semáforos,
-  portas, timers — assim marcam `no_descriptor`, e um nome dado depois pelo
-  próprio kernel ou o NtSetSecurityObject dão o descritor): a abertura por
-  ponteiro, o handle de usuário e o ObCheckObjectAccess concedem o acesso
-  pedido sem SeAccessCheck, como o ObpCreateHandle (`has_descriptor`). O
+  Um objeto pode não ter descritor (o SecurityDescriptor nulo do NT, o
+  atalho do ObInsertObjectEx 0x652192..0x652201: sem nome, criado sem
+  descritor, num tipo sem SecurityRequired; as seções marcam
+  `no_descriptor`, e os corpos de `ob/objects/dispatcher.rs` — eventos,
+  mutantes, semáforos, portas, timers, pacotes de espera — não guardam
+  política nenhuma; um nome dado depois pelo próprio kernel dá o descritor
+  do sujeito): a abertura por ponteiro, o handle de usuário e o
+  ObCheckObjectAccess concedem o acesso pedido sem SeAccessCheck, como o
+  ObpCreateHandle (`has_descriptor`); o Nt/ZwQuerySecurityObject devolve o
+  descritor vazio de 0x14 bytes (SeQuerySecurityDescriptorInfo 0x6de652), o
+  NtSetSecurityObject dá STATUS_NO_SECURITY_ON_OBJECT
+  (SeSetSecurityDescriptorInfoEx 0x695cfa) e o SecurityDescriptorSize do
+  ObjectBasicInformation é zero (NtQueryObject 0x70fd78). Os corpos de
+  despacho com descritor dividem a cópia da política com os iguais
+  (`ob/shared_policy.rs`, contada como as entradas do
+  ObLogSecurityDescriptor 0x6d8b90, que saem com o último objeto que as
+  usa; autoteste `ntos/test/object_descriptors.rs`). O
   ZwCreateEvent passa o OBJECT_ATTRIBUTES adiante (o descritor explícito de
   um chamador de kernel vale); o evento da vertical blank que o dxgkrnl cria
   como SYSTEM, sem nome nem descritor, abre por ponteiro em UserMode no

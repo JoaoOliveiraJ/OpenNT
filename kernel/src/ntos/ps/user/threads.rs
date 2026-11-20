@@ -2634,8 +2634,9 @@ static EXITED_THREADS: AtomicU32 = AtomicU32::new(0);
 /// saem: o heap do kernel, as threads do índice (mortas, mortas com handles
 /// abertos e os handles delas, mortas com regiões), as ETHREADs registradas
 /// (soltas pelo dono e ainda referenciadas, já saídas), os corpos de
-/// despacho por tipo (quantos/sem handle/referências), os pacotes de espera
-/// por fase e os handles do processo da thread por tipo.
+/// despacho por tipo (quantos/sem handle/referências), as cópias divididas
+/// de descritores (`ob/shared_policy.rs`), os pacotes de espera por fase e
+/// os handles do processo da thread por tipo.
 fn object_census_on_exit(process_pointer: u64) {
     if !crate::ntos::init::boot_config::heap_census() || EXITED_THREADS.fetch_add(1, Ordering::Relaxed) % 256 != 255 {
         return;
@@ -2666,7 +2667,7 @@ fn object_census_on_exit(process_pointer: u64) {
         }
     }
     crate::debug_print!(
-        "[heap-census] objetos apos {} saidas: heap {} KB; threads {} (mortas {}, com handles {} [{} handles], com regioes {}); ETHREADs {} (soltas {}, saidas {}); corpos{}; pacotes ociosos/associados/enfileirados/fechados {}/{}/{}/{}; handles do processo{}",
+        "[heap-census] objetos apos {} saidas: heap {} KB; threads {} (mortas {}, com handles {} [{} handles], com regioes {}); ETHREADs {} (soltas {}, saidas {}); corpos{}; descritores divididos {}; pacotes ociosos/associados/enfileirados/fechados {}/{}/{}/{}; handles do processo{}",
         EXITED_THREADS.load(Ordering::Relaxed),
         heap_used / 1024,
         total,
@@ -2678,6 +2679,7 @@ fn object_census_on_exit(process_pointer: u64) {
         released,
         exiting,
         bodies,
+        crate::ntos::ob::shared_policy::live(),
         packets[0],
         packets[1],
         packets[2],

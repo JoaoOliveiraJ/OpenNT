@@ -500,9 +500,12 @@ pub fn create(kind: &'static str, initial: PortState, maximum: u32, sequence: u3
         dispatcher_objects::collect(pointer);
         KernelError::with_status(alloc::format!("port object status {status:x}"), status)
     };
-    let policy = dispatcher_objects::security(pointer).unwrap_or_default();
+    // Sem descritor (a porta sem nome criada sem descritor) o ObpCreateHandle
+    // não passa pelo SeAccessCheck.
+    let policy = dispatcher_objects::security(pointer);
     let object_type = crate::ntos::ob::object_types::user_type(kind).ok_or_else(|| KernelError::new("ALPC Port type missing"))?;
-    if let Err(status) = object_access::check(&policy, object_access::subject(), 0x1F_0001, &object_type, options.grant_on_create) {
+    let unchecked = crate::ntos::se::model::SecurityPolicy::default();
+    if let Err(status) = object_access::check(policy.as_ref().unwrap_or(&unchecked), object_access::subject(), 0x1F_0001, &object_type, options.grant_on_create || policy.is_none()) {
         return Err(fail(status));
     }
     if kind == "alpc" {

@@ -23,6 +23,7 @@ pub mod object_create;
 pub mod object_open;
 pub mod object_reference;
 pub mod object_security;
+pub mod shared_policy;
 pub mod wait;
 pub mod name_info;
 pub mod handle_attributes;

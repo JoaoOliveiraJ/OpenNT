@@ -93,7 +93,13 @@ fn from_body(pointer: u64, attributes: u32, access: u32) -> Result<Collected, u3
     let exclusive = item.owner.exclusive_process(pointer) != 0;
     let mut collected = information(item.object_type.clone(), record.name, attributes, access, record.handles.unwrap_or_else(|| handle_count(pointer)), record.references);
     collected.object_flags = (if record.permanent { 0x10 } else { 0 }) | (if exclusive { 0x20 } else { 0 });
-    collected.security_length = security_length(&crate::ntos::ob::object_security::described_policy(&item), access);
+    // Sem descritor (o objeto sem nome criado sem descritor) o tamanho fica
+    // zero: o NtQueryObject do 19041 só pergunta ao SecurityProcedure com
+    // READ_CONTROL e OBJECT_HEADER.SecurityDescriptor presente
+    // (0x70fd78..0x70fd8a).
+    if crate::ntos::ob::object_security::has_descriptor(&item) {
+        collected.security_length = security_length(&crate::ntos::ob::object_security::described_policy(&item), access);
+    }
     if let Some(allocation) = allocation {
         if allocation.paged {
             collected.paged_charge = allocation.bytes as u32;

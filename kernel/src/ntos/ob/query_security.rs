@@ -41,6 +41,12 @@ fn query_object(pointer: u64, type_name: &str, information: u32, buffer: u64, ca
     if type_name == object_types::key_type().name {
         return key_services::query_security(pointer, information, buffer, capacity);
     }
+    // O SecurityDescriptor nulo (o objeto sem nome criado sem descritor):
+    // o SeQuerySecurityDescriptorInfo do 19041 (0x6de274 -> 0x6de652) devolve
+    // o descritor vazio de 0x14 bytes (Revision 1, SE_SELF_RELATIVE).
+    if crate::ntos::ob::open_pointer::describe(pointer).is_some_and(|described| !crate::ntos::ob::object_security::has_descriptor(&described)) {
+        return Ok(query_descriptor::query_descriptor(None, information, buffer, capacity));
+    }
     let policy = crate::ntos::ob::object_security::object_policy(pointer).ok_or_else(|| KernelError::new("security object has no policy owner"))?;
     let descriptor = policy_descriptor::capture(&policy)?;
     Ok(query_descriptor::query_descriptor(Some(&descriptor), information, buffer, capacity))

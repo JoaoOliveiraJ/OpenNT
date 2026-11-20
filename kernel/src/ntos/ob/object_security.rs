@@ -120,6 +120,12 @@ pub fn set_object_security(object: u64, information: u32, captured: u64) -> u32 
         return crate::ntos::cm::key::security::set(body.node, information, captured);
     }
     let Some(described) = open_pointer::describe(object) else { return STATUS_INVALID_HANDLE };
+    // O SecurityDescriptor nulo (o objeto sem nome criado sem descritor):
+    // o SeSetSecurityDescriptorInfoEx do 19041 (0x695cc4 -> 0x695cfa) recusa
+    // o *ObjectsSecurityDescriptor nulo com STATUS_NO_SECURITY_ON_OBJECT.
+    if !has_descriptor(&described) {
+        return STATUS_NO_SECURITY_ON_OBJECT;
+    }
     let current = match object_access::descriptor_of(&described.owner.security(object), &described.object_type) {
         Ok(current) => current,
         Err(status) => return status,

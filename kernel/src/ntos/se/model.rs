@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 pub type Sid = Vec<u8>;
 
 /// Entrada de ACL. `sid` ausente marca uma ACE não suportada (só `raw`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Ace {
     pub sid: Option<Sid>,
     pub mask: u32,
@@ -39,7 +39,7 @@ pub struct Privilege {
 
 /// Segurança capturada por um objeto (dono, grupo, DACL e opcionais).
 /// `dacl: None` é uma DACL nula (acesso total).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct SecurityPolicy {
     pub owner: Sid,
     pub group: Option<Sid>,
