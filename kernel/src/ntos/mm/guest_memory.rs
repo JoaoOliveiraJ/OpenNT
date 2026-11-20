@@ -573,6 +573,9 @@ pub fn write64(address: u64, value: u64) {
     write(address, value)
 }
 
+/// A falha leva o local de quem pediu a cópia (sem closure no caminho, o
+/// `track_caller` chega até ele).
+#[track_caller]
 fn kernel_fault(error: KernelError) -> ! {
     panic!("acesso de kernel a memoria de convidado: {}", error)
 }
@@ -581,11 +584,16 @@ fn kernel_fault(error: KernelError) -> ! {
 /// e bytes (MMIO); a falha para o sistema.
 #[track_caller]
 pub fn write_bytes(address: u64, bytes: &[u8]) {
-    try_write_bytes(address, bytes).unwrap_or_else(|error| kernel_fault(error))
+    if let Err(error) = try_write_bytes(address, bytes) {
+        kernel_fault(error)
+    }
 }
 #[track_caller]
 pub fn read_bytes(address: u64, length: usize) -> Vec<u8> {
-    try_read_bytes(address, length).unwrap_or_else(|error| kernel_fault(error))
+    match try_read_bytes(address, length) {
+        Ok(bytes) => bytes,
+        Err(error) => kernel_fault(error),
+    }
 }
 
 // ---- operações atômicas ----------------------------------------------------
