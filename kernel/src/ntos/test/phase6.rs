@@ -193,16 +193,16 @@ fn pe_primitives(assert: Assert) {
     assert(exports.exports.get("Alpha") == Some(&(IMAGE_BASE + 0x1010)) && exports.exports_by_ordinal.get(&2) == Some(&(IMAGE_BASE + 0x1020)) && exports.forwarders.get("Forward").map(String::as_str) == Some("other.Beta") && exports.forwarders_by_ordinal.contains_key(&3) && !exports.exports.contains_key("Forward"), "peexports: nomes, ordinal sem nome e encaminhamento");
     assert(pe_exports::read_exports(&read_rva, IMAGE_BASE, 0x4000, 0x2000, 20).is_err() && pe_exports::read_exports(&read_rva, IMAGE_BASE, 0x4000, 0, 0).is_ok_and(|empty| empty.exports.is_empty()), "peexports: diretorio invalido ou ausente");
     // Encaminhamentos entre módulos e ciclos.
-    let module = ExportedModule { name: String::from("opennt-test.dll"), exports: exports.clone() };
+    let module = ExportedModule { name: String::from("opennt-test.dll"), exports: Arc::new(exports.clone()) };
     let mut other = pe_exports::Exports::default();
     other.exports.insert(String::from("Beta"), 0x9999);
-    let other = Arc::new(ExportedModule { name: String::from("other.dll"), exports: other });
+    let other = Arc::new(ExportedModule { name: String::from("other.dll"), exports: Arc::new(other) });
     let mut loader = |dll: &str, _importer: &str| if dll == "other.dll" { Ok(other.clone()) } else { Err(crate::rtl::KernelError::new("modulo ausente")) };
     let mut chain = alloc::collections::BTreeSet::new();
     assert(matches!(resolver::resolve_export(&module, &Symbol::Name(String::from("Forward")), &mut loader, &mut chain), Ok(0x9999)) && matches!(resolver::resolve_export(&module, &Symbol::Ordinal(2), &mut loader, &mut chain), Ok(address) if address == IMAGE_BASE + 0x1020) && resolver::resolve_export(&module, &Symbol::Name(String::from("Ausente")), &mut loader, &mut chain).is_err() && chain.is_empty(), "peresolver: encaminhamento, ordinal e ausente");
     let mut looping = pe_exports::Exports::default();
     looping.forwarders.insert(String::from("Loop"), String::from("loop.Loop"));
-    let looping = Arc::new(ExportedModule { name: String::from("loop.dll"), exports: looping });
+    let looping = Arc::new(ExportedModule { name: String::from("loop.dll"), exports: Arc::new(looping) });
     let mut cyclic = |_dll: &str, _importer: &str| Ok(looping.clone());
     assert(resolver::resolve_export(&looping, &Symbol::Name(String::from("Loop")), &mut cyclic, &mut chain).is_err_and(|error| error.message.contains("ciclo")), "peresolver: ciclo de encaminhamentos detectado");
     // API set v6 pela seção .apiset.

@@ -9,6 +9,7 @@
 use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::{String, ToString};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::hal::amd64::native_call;
@@ -22,6 +23,7 @@ use crate::ntos::mm::sysload::kernel_image_source;
 use crate::ntos::inc::field::Field;
 use crate::ntos::inc::types::{DeviceObject, DriverExtension, DriverObject, NtStruct, UnicodeString};
 use crate::ntos::mm::pe_loader::{self, LoadOptions, PeImage};
+use crate::ntos::rtl::image::pe_exports::Exports;
 
 /// Estado de um driver nativo.
 struct NativeDriver {
@@ -34,7 +36,8 @@ struct NativeDriver {
     /// DriverName (o nome do objeto).
     object_name_buffer: u64,
     initialized: bool,
-    exports: BTreeMap<String, u64>,
+    /// A tabela de exports da imagem, compartilhada com ela.
+    exports: Arc<Exports>,
     image: Option<PeImage>,
     registry_allocation: Vec<u64>,
     import_references: u32,
@@ -212,7 +215,7 @@ pub fn begin_driver(name: &str, object_name: &str, image_base: u64, image_size: 
             return Err(error);
         }
     };
-    DRIVERS.lock().insert(driver, NativeDriver { name: name.to_string(), object_name: object_name.to_string(), node, name_buffer, object_name_buffer, initialized: false, exports: BTreeMap::new(), image: None, registry_allocation: Vec::new(), import_references: 0, kernel_library_pinned: false });
+    DRIVERS.lock().insert(driver, NativeDriver { name: name.to_string(), object_name: object_name.to_string(), node, name_buffer, object_name_buffer, initialized: false, exports: Arc::default(), image: None, registry_allocation: Vec::new(), import_references: 0, kernel_library_pinned: false });
     *CURRENT.lock() = Some(driver);
     // A imagem e as alocações só são liberadas quando o provedor remove a
     // última referência, inclusive depois de um unload já concluído.
@@ -237,7 +240,7 @@ pub fn end_driver() {
 /// Endereço absoluto de um export do driver (diretório de exports real).
 pub fn get_driver_export(driver_name: &str, export_name: &str) -> u64 {
     let Some(node) = driver_node(driver_name) else { return 0 };
-    DRIVERS.lock().values().find(|entry| entry.node == node).and_then(|entry| entry.exports.get(export_name).copied()).unwrap_or(0)
+    DRIVERS.lock().values().find(|entry| entry.node == node).and_then(|entry| entry.exports.exports.get(export_name).copied()).unwrap_or(0)
 }
 
 fn service_name(file_path: &str, options: &DriverOptions) -> String {
@@ -294,7 +297,7 @@ fn load_driver_inner(file_path: &str, name: &str, object_name: &str, options: &D
     }
     let image = pe_loader::load_from_source(source, &load)?.drop_import_report();
     let (image_base, size_of_image, entry_point) = (image.image_base, image.size_of_image, image.entry_point);
-    let exports = image.exports.exports.clone();
+    let exports = image.exports.clone();
     let driver = match begin_driver(name, object_name, image_base, size_of_image, entry_point) {
         Ok(driver) => driver,
         Err(error) => {
@@ -443,7 +446,7 @@ pub fn has_image(driver: u64) -> bool {
 
 /// Exports do driver carregado (diretório de exports real), para os
 /// importadores de `mm::sysload`.
-pub fn driver_exports(driver_name: &str) -> Option<BTreeMap<String, u64>> {
+pub fn driver_exports(driver_name: &str) -> Option<Arc<Exports>> {
     DRIVERS.lock().values().find(|entry| entry.name.eq_ignore_ascii_case(driver_name)).map(|entry| entry.exports.clone())
 }
 

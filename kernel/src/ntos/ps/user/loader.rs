@@ -60,7 +60,7 @@ pub struct Module {
     pub image_base: u64,
     pub size_of_image: u64,
     pub entry_point: u64,
-    pub exports: Exports,
+    pub exports: Arc<Exports>,
     pub is_exe: bool,
     pub notification_source: Option<Arc<dyn FileSource>>,
 }

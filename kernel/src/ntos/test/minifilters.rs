@@ -123,7 +123,7 @@ fn embedded_string(record: u64, length_offset: u64) -> String {
 
 impl FilterManager {
     fn new() -> Result<FilterManager, String> {
-        let exports = crate::ntos::io::lifecycle::driver_exports("fltmgr").ok_or_else(|| String::from("fltmgr.sys nao carregado"))?;
+        let exports = crate::ntos::io::lifecycle::driver_exports("fltmgr").map(|exports| exports.exports.clone()).ok_or_else(|| String::from("fltmgr.sys nao carregado"))?;
         let scratch = guest::alloc_bytes(0x3000);
         if scratch == 0 {
             return Err(String::from("sem memoria para o teste"));

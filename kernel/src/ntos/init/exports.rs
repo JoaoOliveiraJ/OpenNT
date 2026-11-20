@@ -771,7 +771,7 @@ pub fn export_module() -> Result<ExportedModule, KernelError> {
         exports.exports.insert(name.to_string(), address);
         exports.exports_by_ordinal.insert(index as u32 + 1, address);
     }
-    Ok(ExportedModule { name: String::from("ntoskrnl.exe"), exports })
+    Ok(ExportedModule { name: String::from("ntoskrnl.exe"), exports: Arc::new(exports) })
 }
 
 /// Liga a tabela ao loader (resolvedor de `ntoskrnl.exe` e trampolins).

@@ -205,11 +205,11 @@ pub fn native_image(image_base: u64) -> Option<(u64, Vec<SectionInfo>)> {
 /// Exports das imagens de kernel cujos imports estão sendo resolvidos (as
 /// entradas com LOAD_IN_PROGRESS), pelo id da imagem carregada: lidos da
 /// imagem já mapeada e relocada, antes de qualquer import.
-static RESOLVING: SpinLock<alloc::collections::BTreeMap<u64, Exports>> = SpinLock::new(alloc::collections::BTreeMap::new());
+static RESOLVING: SpinLock<alloc::collections::BTreeMap<u64, Arc<Exports>>> = SpinLock::new(alloc::collections::BTreeMap::new());
 
 /// Exports de uma imagem em resolução de imports (`None` = a imagem já
 /// terminou a carga ou não é deste loader).
-pub fn resolving_exports(id: u64) -> Option<Exports> {
+pub fn resolving_exports(id: u64) -> Option<Arc<Exports>> {
     RESOLVING.lock().get(&id).cloned()
 }
 
@@ -454,7 +454,8 @@ pub struct PeImage {
     pub entry_point: u64,
     pub image_base: u64,
     pub size_of_image: u64,
-    pub exports: Exports,
+    /// A tabela de exports, compartilhada com os módulos que a usam.
+    pub exports: Arc<Exports>,
     /// Frame da primeira página (as demais não são contíguas).
     pub physical_base: u64,
     pub preferred_base: u64,
@@ -941,7 +942,7 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
         // As páginas protótipo de uma seção de imagem não guardam a tabela de
         // exports: a ntdll de cada processo resolve os imports pela imagem
         // mapeada (`image_segment::exports` lê a tabela quando alguém pede).
-        let exports = if prototype { pe_exports::Exports::default() } else { pe_exports::read_exports(&read_rva, image_base, size_of_image, export_rva, export_size)? };
+        let exports = Arc::new(if prototype { pe_exports::Exports::default() } else { pe_exports::read_exports(&read_rva, image_base, size_of_image, export_rva, export_size)? });
         // O bit consumido por ObRegisterCallbacks é uma decisão da CI, não
         // uma promessa do cabeçalho: contrato integral aceito no modo 2.
         let loader_flags = match code_integrity {

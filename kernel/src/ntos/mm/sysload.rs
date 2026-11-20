@@ -217,8 +217,8 @@ fn check_header(name: &str, source: &Arc<dyn ImageSource>) -> Result<(), KernelE
     Ok(())
 }
 
-fn exported(name: &str, exports: BTreeMap<String, u64>) -> Arc<ExportedModule> {
-    Arc::new(ExportedModule { name: String::from(name), exports: crate::ntos::rtl::image::pe_exports::Exports { exports, ..Default::default() } })
+fn exported(name: &str, exports: Arc<crate::ntos::rtl::image::pe_exports::Exports>) -> Arc<ExportedModule> {
+    Arc::new(ExportedModule { name: String::from(name), exports })
 }
 
 /// Módulo de uma imagem cujos imports estão sendo resolvidos (LOAD_IN_PROGRESS
@@ -654,11 +654,12 @@ pub mod pe_resolver {
     use crate::ntos::rtl::image::pe_exports::Exports;
     use crate::rtl::KernelError;
 
-    /// Módulo com nome e tabela de exports.
+    /// Módulo com nome e tabela de exports (a da imagem carregada,
+    /// compartilhada: cada módulo que a usa não guarda outra cópia).
     #[derive(Clone, Debug)]
     pub struct ExportedModule {
         pub name: String,
-        pub exports: Exports,
+        pub exports: Arc<Exports>,
     }
 
     /// Símbolo procurado: nome ou ordinal.

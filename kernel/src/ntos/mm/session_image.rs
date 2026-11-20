@@ -163,7 +163,7 @@ pub fn entry_of(base: u64) -> Option<u64> {
 
 /// Os exports de uma imagem de sessão (o import de outra imagem a acha na
 /// lista de imagens carregadas).
-pub fn exports_of(base: u64) -> Option<crate::ntos::rtl::image::pe_exports::Exports> {
+pub fn exports_of(base: u64) -> Option<alloc::sync::Arc<crate::ntos::rtl::image::pe_exports::Exports>> {
     IMAGES.lock().get(&base).map(|image| image.image.exports.clone())
 }
 
