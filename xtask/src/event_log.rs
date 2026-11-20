@@ -97,6 +97,32 @@ pub fn windows_file(path: &str) -> bool {
     inside && !lower.contains("\\driverstore\\")
 }
 
+/// O nome do arquivo de um caminho do Registro (depois da última barra), em
+/// minúsculas.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn file_name(path: &str) -> String {
+    path.trim().trim_matches('"').rsplit(['\\', '/']).next().unwrap_or("").to_ascii_lowercase()
+}
+
+/// Os arquivos de mensagens de uma fonte clássica (os valores `*File`, com
+/// vários separados por ';') estão todos no volume do convidado (`staged`,
+/// os nomes em minúsculas). Uma fonte só com ProviderGuid passa aqui e
+/// depende do provedor.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn source_on_volume(values: &[(String, u32, Vec<u8>)], staged: &std::collections::HashSet<String>) -> bool {
+    let texts = values.iter().filter(|(name, _, _)| name.to_ascii_lowercase().ends_with("file")).filter_map(|(_, kind, data)| string_value(*kind, data));
+    let files: Vec<String> = texts.flat_map(|text| text.split(';').map(str::trim).filter(|file| !file.is_empty()).map(String::from).collect::<Vec<_>>()).collect();
+    files.iter().all(|file| staged.contains(&file_name(file)))
+}
+
+/// Os nomes das imagens que o boot põe no volume (`windows_binaries`),
+/// calculados uma vez.
+#[cfg(windows)]
+fn staged() -> &'static std::collections::HashSet<String> {
+    static NAMES: std::sync::OnceLock<std::collections::HashSet<String>> = std::sync::OnceLock::new();
+    NAMES.get_or_init(crate::windows_binaries::staged_image_names)
+}
+
 /// Tira o `Status` (o resultado que o kernel grava em cada boot).
 #[cfg_attr(not(windows), allow(dead_code))]
 fn without_status(key: &mut HostKey) {
@@ -104,13 +130,18 @@ fn without_status(key: &mut HostKey) {
 }
 
 /// O provedor `guid` tem registro em `WINEVT\Publishers` só com arquivos do
-/// Windows (ResourceFileName e MessageFileName).
+/// Windows (ResourceFileName e MessageFileName) que o boot põe no volume.
+/// Um provedor cujo binário não está no convidado nunca grava eventos, e
+/// cada chave copiada fica na memória do kernel (as hives inteiras vivem no
+/// heap de 64 MB): os 861 provedores do Windows com os ~1160 canais deles
+/// somavam ~5,7 MB e esgotavam o heap aos ~165 s da cadeia.
 #[cfg(windows)]
 fn inbox_publisher(guid: &str) -> bool {
     use crate::host_language::registry;
     let path = format!("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\WINEVT\\Publishers\\{guid}");
-    let files: Vec<String> = ["ResourceFileName", "MessageFileName"].iter().flat_map(|name| registry::strings(registry::LOCAL_MACHINE, &path, name)).collect();
-    !files.is_empty() && files.iter().all(|file| windows_file(file))
+    let texts: Vec<String> = ["ResourceFileName", "MessageFileName"].iter().flat_map(|name| registry::strings(registry::LOCAL_MACHINE, &path, name)).collect();
+    let files: Vec<&str> = texts.iter().flat_map(|text| text.split(';')).map(str::trim).filter(|file| !file.is_empty()).collect();
+    !files.is_empty() && files.iter().all(|file| windows_file(file) && staged().contains(&file_name(file)))
 }
 
 /// As chaves da hive SYSTEM, já no conjunto de controle que a hive guarda
@@ -155,7 +186,7 @@ pub fn system_keys(control_set: &str) -> Vec<HostKey> {
             for source in registry::list(registry::LOCAL_MACHINE, &format!("{service}\\{channel}")) {
                 let mut copied = Vec::new();
                 registry::copy(registry::LOCAL_MACHINE, &format!("{service}\\{channel}\\{source}"), &format!("{guest_service}\\{channel}\\{source}"), false, &mut copied);
-                if copied.first().is_some_and(|key| windows_source(&key.values, inbox_publisher)) {
+                if copied.first().is_some_and(|key| windows_source(&key.values, inbox_publisher) && source_on_volume(&key.values, staged())) {
                     keys.extend(copied);
                 }
             }
@@ -201,6 +232,11 @@ pub fn software_keys() -> Vec<HostKey> {
         use crate::host_language::registry;
         registry::copy(registry::LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Svchost\\LocalServiceNetworkRestricted", "Microsoft\\Windows NT\\CurrentVersion\\Svchost\\LocalServiceNetworkRestricted", true, &mut keys);
         let winevt = "Microsoft\\Windows\\CurrentVersion\\WINEVT";
+        // `WINEVT\Policies`, vazia numa instalação nova: o construtor do
+        // GroupPolicyManager do wevtsvc (rva 0x587fc) a abre com KEY_READ no
+        // EventService::SecondPhaseInit e, sem ela, lança ERROR_FILE_NOT_FOUND
+        // (policy.cpp linha 138, rva 0x96f95): o 7023 do EventLog com %%2.
+        keys.push(HostKey { path: format!("{winevt}\\Policies"), values: Vec::new() });
         let mut publishers = std::collections::HashSet::new();
         for guid in registry::list(registry::LOCAL_MACHINE, &format!("SOFTWARE\\{winevt}\\Publishers")) {
             if inbox_publisher(&guid) {
@@ -221,7 +257,19 @@ pub fn software_keys() -> Vec<HostKey> {
 
 #[cfg(test)]
 mod tests {
-    use super::{security_channel, windows_file, windows_source, without_status};
+    use super::{security_channel, source_on_volume, windows_file, windows_source, without_status};
+
+    /// Uma fonte clássica entra só com todos os arquivos de mensagens no
+    /// volume; sem arquivo, a decisão fica com o provedor.
+    #[test]
+    fn sources_need_files_on_volume() {
+        let staged: std::collections::HashSet<String> = ["services.exe", "netevent.dll"].iter().map(|name| String::from(*name)).collect();
+        assert!(source_on_volume(&[text("EventMessageFile", "%SystemRoot%\\system32\\Services.exe")], &staged));
+        assert!(source_on_volume(&[text("EventMessageFile", "\"%SystemRoot%\\System32\\netevent.dll\"; %SystemRoot%\\system32\\services.exe")], &staged));
+        assert!(!source_on_volume(&[text("EventMessageFile", "%SystemRoot%\\System32\\netevent.dll;%SystemRoot%\\System32\\kernel32.dll")], &staged));
+        assert!(!source_on_volume(&[text("ParameterMessageFile", "%SystemRoot%\\System32\\kernel32.dll"), text("EventMessageFile", "%SystemRoot%\\system32\\services.exe")], &staged));
+        assert!(source_on_volume(&[text("ProviderGuid", "{555908d1-a6d7-4695-8e1e-26931d2012f4}")], &staged));
+    }
 
     /// O canal Security de uma instalação nova: a mensagem 257 do wevtapi.dll
     /// e o `Security.evtx` em `winevt\Logs`.

@@ -960,6 +960,17 @@ pub fn user_programs() -> impl Iterator<Item = &'static str> {
     SMSS_PROGRAMS.iter().chain(SERVICE_CHAIN_PROGRAMS).chain(LOGON_SCREEN_PROGRAMS).chain(CONSOLE_PROGRAMS).chain(USER_LOGON_PROGRAMS).copied()
 }
 
+/// Os nomes, em minúsculas, das imagens que o boot do smss põe no volume:
+/// os programas de modo usuário, os arquivos de `NTFS_FILES` (drivers e
+/// DLLs de kernel) e as imagens de kernel da sessão. O log de eventos só
+/// registra os provedores cujos arquivos de recurso e de mensagens estão
+/// aqui (`event_log`).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn staged_image_names() -> std::collections::HashSet<String> {
+    let volume = NTFS_FILES.iter().chain(SMSS_KERNEL_IMAGES).map(|&(_, relative)| relative.rsplit('/').next().unwrap_or(relative));
+    user_programs().chain(volume).map(str::to_ascii_lowercase).collect()
+}
+
 /// Os nomes de arquivo de `directory`.
 fn entries(directory: &Path) -> Vec<String> {
     fs::read_dir(directory).map(|entries| entries.filter_map(|entry| entry.ok()).filter_map(|entry| entry.file_name().into_string().ok()).collect()).unwrap_or_default()
@@ -1437,8 +1448,14 @@ pub fn ntfs_files(root: &Path, kernel_pe: &[u8], initial_process: &str) -> Resul
         // instalação nova: o wevtsvc.dll cria nele os `.evtx` dos canais
         // (`%SystemRoot%\System32\winevt\Logs`). Um nome terminado em '/' é
         // um diretório vazio (`ntfs_image`), com o descritor da pasta daqui.
+        // O conteúdo de `\Windows\System32` fica na raiz do volume: o modo
+        // usuário abre `C:\Windows\System32\winevt\Logs\X` como
+        // `/winevt/Logs/X` (`volume_files::nt_path_to_volume_path`), e o
+        // NtCreateFile de um arquivo novo confere o pai por esse caminho; em
+        // `Windows/System32/winevt/Logs` o File::OpenFile do wevtsvc recebe
+        // STATUS_OBJECT_PATH_NOT_FOUND.
         let event_logs = system32.join("winevt/Logs");
-        files.push(Staged { path: String::from("Windows/System32/winevt/Logs/"), bytes: Vec::new(), host: event_logs.is_dir().then_some(event_logs) });
+        files.push(Staged { path: String::from("winevt/Logs/"), bytes: Vec::new(), host: event_logs.is_dir().then_some(event_logs) });
     }
     files.push(Staged::generated(String::from("NTOSKRNL.EXE"), kernel_pe.to_vec()));
     files.push(Staged::generated(String::from("Windows/System32/ntoskrnl.exe"), kernel_pe.to_vec()));

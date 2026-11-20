@@ -5054,10 +5054,16 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   wevtsvc.dll no grupo `LocalServiceNetworkRestricted` do svchost) vem como
   numa instalação nova: a chave dele com o Parameters, o State e os canais
   clássicos com as fontes de eventos do Windows, os provedores e canais do
-  Windows de `WINEVT`, as sessões de autologger EventLog-System e
-  EventLog-Application com os provedores do Windows, e o
-  `System32\winevt\Logs` vazio no volume (`xtask/src/event_log.rs`); o
-  wevtsvc consome as duas sessões pelo tempo real do ETW
+  Windows de `WINEVT` com o `WINEVT\Policies` vazio (o GroupPolicyManager
+  do EventService::SecondPhaseInit o abre e, sem ele, o serviço para com
+  ERROR_FILE_NOT_FOUND), as sessões de autologger EventLog-System,
+  EventLog-Application e EventLog-Security com os provedores do Windows, e
+  o `System32\winevt\Logs` vazio na raiz do volume, onde o modo usuário
+  cria os `.evtx` (`xtask/src/event_log.rs`). Dos provedores, canais e
+  fontes clássicas só entram os cujos arquivos de recursos e de mensagens o
+  boot põe no volume (`windows_binaries::staged_image_names`): um provedor
+  sem o binário no convidado não grava eventos, e a hive inteira fica no
+  heap do kernel. O wevtsvc consome as sessões pelo tempo real do ETW
   (`etw/realtime.rs`). A tela de logon da sessão 1 leva o fecho
   de imports do dwm.exe e do LogonUI.exe com o XAML e os provedores de
   credencial (`LOGON_SCREEN_PROGRAMS` em `xtask/src/windows_binaries.rs`:
