@@ -2741,6 +2741,32 @@ makefile de Windows dele (`-DTPM_WINDOWS`, `-lcrypto -lws2_32`); o
 `tpm_server.exe` precisa do `libcrypto-3-x64.dll` e do `libwinpthread-1.dll`
 na mesma pasta.
 
+A RAM do convidado no QEMU do OpenNT: com o `tools/qemu/lazy-ram.patch`, o
+QEMU no Windows só reserva (VirtualAlloc com MEM_RESERVE) os blocos de RAM
+de 512 MB ou mais e compromete pedaços de 64 KB no primeiro acesso. Sem o
+patch, o QEMU compromete a RAM toda ao subir: um convidado de 8 GB cobra
+8,2 GB do commit do host desde o primeiro segundo, embora o boot até o
+LogonUI toque uns 500 MB. No mesmo boot do teste `logonui` com 8 GB, os
+bytes privados do QEMU chegam a 8508 MB sem o patch e a 777 MB com ele, e
+o LogonUI sobe no mesmo tempo (31,7 s e 31,8 s). Três caminhos comprometem
+a RAM. O WHvMapGpaRange aceita uma faixa só reservada, e o acesso do
+convidado a uma página sem commit volta do WHvRunVirtualProcessor como
+WHvRunVpExitReasonMemoryAccess, com o GPA mapeado (GpaUnmapped = 0) e a
+instrução por executar: o acelerador compromete o pedaço e roda a
+instrução de novo (`whpx_commit_guest_ram`). O acesso do próprio QEMU cai
+num tratador de exceção vetorizado, que compromete o pedaço e retoma o
+acesso. O kernel do host não compromete por ninguém (um ReadFile num
+buffer só reservado volta ERROR_NOACCESS), então o `address_space_map`, de
+onde saem os buffers de DMA dos discos, compromete a faixa antes de
+devolvê-la. O commit não volta: o de um QEMU cresce com a RAM que o
+convidado já tocou e pode chegar ao tamanho dela. Sem commit livre, o
+pedido espera até 10 s o arquivo de paginação crescer e depois o QEMU para
+com `cannot commit guest RAM`. O build: as fontes do QEMU 11.1.0 com os
+dois patches de `tools/qemu`, `configure --target-list=x86_64-softmmu
+--enable-whpx --enable-tpm --disable-werror --disable-docs` e `ninja
+qemu-system-x86_64.exe` no MSYS2 UCRT64, com TMP e TEMP numa pasta que
+exista.
+
 ### 3.6 A interface x86 BIOS
 
 Os drivers de vídeo do Windows chamam o BIOS de vídeo da máquina (as
@@ -6195,9 +6221,11 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   convidado com `--allow-reboot` fica no mesmo QEMU e no mesmo snapshot; o
   `--power-cycles`, que sobe outro QEMU depois do desligamento ACPI, usa uma
   cópia gravável do volume na pasta da execução, apagada no fim); uma execução que passa
-  do prazo do test-boot mais o `--hold` e 2 minutos é morta com o QEMU. Cada
-  QEMU compromete ao subir toda a memória do convidado (uns 5 GB com
-  `-m 4096`), e com o commit do host esgotado processos morrem sem mensagem
+  do prazo do test-boot mais o `--hold` e 2 minutos é morta com o QEMU. Um
+  QEMU pode comprometer toda a memória do convidado (o QEMU do OpenNT
+  compromete a RAM conforme o convidado a toca, §3.5; um QEMU sem o
+  `tools/qemu/lazy-ram.patch` compromete tudo ao subir), e com o commit do
+  host esgotado processos morrem sem mensagem
   (o próprio test-all, o cargo, o rustc): os QEMUs começam um de cada vez,
   só quando o commit livre (GlobalMemoryStatusEx) cobre a memória do
   convidado, 1 GB do QEMU, uma margem de 6 GB para o build e a memória dos

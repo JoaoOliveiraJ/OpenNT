@@ -1,0 +1,334 @@
+diff -ruN a/include/system/os-win32.h b/include/system/os-win32.h
+--- a/include/system/os-win32.h
++++ b/include/system/os-win32.h
+@@ -272,6 +272,14 @@
+ void *qemu_win32_map_alloc(size_t size, HANDLE *h, Error **errp);
+ void qemu_win32_map_free(void *ptr, HANDLE h, Error **errp);
+ 
++/*
++ * Large guest RAM blocks are reserved and committed on first touch (see
++ * qemu_anon_ram_alloc). qemu_ram_commit() commits [host, host + len) when it
++ * lies in such a block and returns false when it does not; with @force it
++ * calls VirtualAlloc even for chunks already marked committed.
++ */
++bool qemu_ram_commit(void *host, size_t len, bool force);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff -ruN a/system/physmem.c b/system/physmem.c
+--- a/system/physmem.c
++++ b/system/physmem.c
+@@ -3763,7 +3763,20 @@
+     *plen = flatview_extend_translation(fv, addr, len, mr, xlat,
+                                         l, is_write, attrs);
+     fuzz_dma_read_cb(addr, *plen, mr);
++#ifdef _WIN32
++    {
++        /*
++         * DMA buffers go to the kernel (ReadFile, WriteFile), which fails on
++         * guest RAM that is reserved but not yet committed.
++         */
++        void *ptr = qemu_ram_ptr_length(mr->ram_block, xlat, plen, true,
++                                        is_write);
++        qemu_ram_commit(ptr, *plen, false);
++        return ptr;
++    }
++#else
+     return qemu_ram_ptr_length(mr->ram_block, xlat, plen, true, is_write);
++#endif
+ }
+ 
+ /* Unmaps a memory region previously mapped by address_space_map().
+diff -ruN a/target/i386/whpx/whpx-all.c b/target/i386/whpx/whpx-all.c
+--- a/target/i386/whpx/whpx-all.c
++++ b/target/i386/whpx/whpx-all.c
+@@ -1029,6 +1029,40 @@
+     return 0;
+ }
+ 
++/*
++ * Guest RAM is committed on first touch (util/oslib-win32.c). A guest access
++ * to a page that is reserved but not committed exits as a memory access on a
++ * mapped GPA, before the instruction executes: commit the chunk and run the
++ * instruction again. A writable RAM mapping has no other reason to exit; the
++ * same page exiting over and over goes to the emulator as before.
++ */
++static bool whpx_commit_guest_ram(WHV_MEMORY_ACCESS_CONTEXT *ctx)
++{
++    static __thread uint64_t last_page = -1;
++    static __thread unsigned int repeats;
++    uint64_t page = ctx->Gpa & qemu_real_host_page_mask();
++    MemoryRegion *mr;
++    hwaddr xlat, len = 1;
++
++    if (ctx->AccessInfo.GpaUnmapped) {
++        return false;
++    }
++    if (page != last_page) {
++        last_page = page;
++        repeats = 0;
++    } else if (++repeats > 8) {
++        return false;
++    }
++
++    RCU_READ_LOCK_GUARD();
++    mr = address_space_translate(&address_space_memory, ctx->Gpa, &xlat, &len,
++                                 false, MEMTXATTRS_UNSPECIFIED);
++    if (!memory_region_is_ram(mr) || mr->readonly || mr->rom_device) {
++        return false;
++    }
++    return qemu_ram_commit(memory_region_get_ram_ptr(mr) + xlat, 1, true);
++}
++
+ static int whpx_handle_mmio(CPUState *cpu, WHV_RUN_VP_EXIT_CONTEXT *exit_ctx)
+ {
+     WHV_MEMORY_ACCESS_CONTEXT *ctx = &exit_ctx->MemoryAccess;
+@@ -2293,6 +2327,10 @@
+ 
+         switch (vcpu->exit_ctx.ExitReason) {
+         case WHvRunVpExitReasonMemoryAccess:
++            if (whpx_commit_guest_ram(&vcpu->exit_ctx.MemoryAccess)) {
++                ret = 0;
++                break;
++            }
+             ret = whpx_handle_mmio(cpu, &vcpu->exit_ctx);
+             break;
+ 
+diff -ruN a/util/oslib-win32.c b/util/oslib-win32.c
+--- a/util/oslib-win32.c
++++ b/util/oslib-win32.c
+@@ -34,6 +34,8 @@
+ #include "qemu/sockets.h"
+ #include "qemu/cutils.h"
+ #include "qemu/error-report.h"
++#include "qemu/bitmap.h"
++#include "qemu/units.h"
+ #include <malloc.h>
+ 
+ static int get_allocation_granularity(void)
+@@ -44,6 +46,195 @@
+     return system_info.dwAllocationGranularity;
+ }
+ 
++/*
++ * Guest RAM committed on first touch.
++ *
++ * VirtualAlloc(MEM_COMMIT) of the whole block charges the system commit for
++ * every byte of guest RAM at startup, although a guest usually touches a
++ * fraction of it: an 8 GB guest costs 8 GB of commit from the first second,
++ * and a few of them push Windows to grow the pagefile. Large blocks are only
++ * reserved instead, and committed in LAZY_RAM_CHUNK pieces when first used:
++ *
++ * - accesses by QEMU itself fault, and lazy_ram_fault() (a vectored
++ *   exception handler) commits the chunk and resumes the access;
++ * - the kernel does not fault on reserved pages handed to it (ReadFile into
++ *   one fails with ERROR_NOACCESS), so address_space_map(), the source of
++ *   DMA buffers, commits the range first;
++ * - WHPX maps a reserved range without complaint; a guest access to a page
++ *   that is not committed exits with WHvRunVpExitReasonMemoryAccess and the
++ *   instruction not executed, and the accelerator commits and runs it again.
++ *
++ * Pages are never decommitted: the commit charge grows with the guest RAM
++ * touched, up to the size of the block.
++ */
++#define LAZY_RAM_MIN_SIZE   (512 * MiB)
++#define LAZY_RAM_CHUNK      (64 * KiB)
++#define LAZY_RAM_SLOTS      16
++
++typedef struct LazyRam {
++    char *base;                 /* NULL: free slot */
++    size_t size;
++    unsigned long *committed;   /* one bit per chunk */
++} LazyRam;
++
++static LazyRam lazy_ram[LAZY_RAM_SLOTS];
++static SRWLOCK lazy_ram_lock = SRWLOCK_INIT;
++
++static LazyRam *lazy_ram_find(const char *p)
++{
++    int i;
++
++    for (i = 0; i < LAZY_RAM_SLOTS; i++) {
++        char *base = qatomic_load_acquire(&lazy_ram[i].base);
++
++        if (base && p >= base && p - base < lazy_ram[i].size) {
++            return &lazy_ram[i];
++        }
++    }
++    return NULL;
++}
++
++/* Commit [p, p + len), waiting up to 10 s for a growing pagefile. */
++static bool lazy_ram_commit_range(char *p, size_t len)
++{
++    int tries;
++
++    for (tries = 0; ; tries++) {
++        DWORD err;
++
++        if (VirtualAlloc(p, len, MEM_COMMIT, PAGE_READWRITE)) {
++            return true;
++        }
++        err = GetLastError();
++        if (tries == 200 || (err != ERROR_COMMITMENT_LIMIT &&
++                             err != ERROR_NOT_ENOUGH_MEMORY &&
++                             err != ERROR_PAGEFILE_QUOTA)) {
++            fprintf(stderr, "qemu: cannot commit guest RAM at %p (+%zu): "
++                    "Windows error %lu\n", p, len, err);
++            return false;
++        }
++        Sleep(50);
++    }
++}
++
++/* Commit the chunks that cover [off, off + len) of @r, in runs. */
++static bool lazy_ram_commit(LazyRam *r, size_t off, size_t len, bool force)
++{
++    size_t chunk = off / LAZY_RAM_CHUNK;
++    size_t last = (off + len - 1) / LAZY_RAM_CHUNK;
++
++    while (chunk <= last) {
++        size_t run = chunk, end;
++
++        if (!force && test_bit(chunk, r->committed)) {
++            chunk++;
++            continue;
++        }
++        while (run + 1 <= last && (force || !test_bit(run + 1, r->committed))) {
++            run++;
++        }
++        end = MIN((run + 1) * LAZY_RAM_CHUNK, r->size);
++        if (!lazy_ram_commit_range(r->base + chunk * LAZY_RAM_CHUNK,
++                                   end - chunk * LAZY_RAM_CHUNK)) {
++            return false;
++        }
++        for (; chunk <= run; chunk++) {
++            set_bit_atomic(chunk, r->committed);
++        }
++    }
++    return true;
++}
++
++bool qemu_ram_commit(void *host, size_t len, bool force)
++{
++    char *p = host;
++    LazyRam *r = lazy_ram_find(p);
++    size_t off;
++
++    if (!r) {
++        return false;
++    }
++    off = p - r->base;
++    len = MIN(MAX(len, 1), r->size - off);
++    if (!lazy_ram_commit(r, off, len, force)) {
++        abort();
++    }
++    return true;
++}
++
++static LONG CALLBACK lazy_ram_fault(PEXCEPTION_POINTERS info)
++{
++    PEXCEPTION_RECORD rec = info->ExceptionRecord;
++    char *p;
++    LazyRam *r;
++
++    /* Reads (0) and writes (1) only; a DEP fault (8) is not ours. */
++    if (rec->ExceptionCode != EXCEPTION_ACCESS_VIOLATION ||
++        rec->NumberParameters < 2 || rec->ExceptionInformation[0] > 1) {
++        return EXCEPTION_CONTINUE_SEARCH;
++    }
++    p = (char *)rec->ExceptionInformation[1];
++    r = lazy_ram_find(p);
++    /*
++     * Forced: the bit may already be set by a thread that committed the
++     * chunk after this access faulted. A committed read-write page does not
++     * fault again on a read or a write, so resuming cannot loop.
++     */
++    if (!r || !lazy_ram_commit(r, p - r->base, 1, true)) {
++        return EXCEPTION_CONTINUE_SEARCH;
++    }
++    return EXCEPTION_CONTINUE_EXECUTION;
++}
++
++static void *lazy_ram_alloc(size_t size)
++{
++    static bool handler_added;
++    char *ptr = VirtualAlloc(NULL, size, MEM_RESERVE, PAGE_READWRITE);
++    LazyRam *slot = NULL;
++    int i;
++
++    if (!ptr) {
++        return NULL;
++    }
++    AcquireSRWLockExclusive(&lazy_ram_lock);
++    if (!handler_added) {
++        handler_added = AddVectoredExceptionHandler(1, lazy_ram_fault) != NULL;
++    }
++    for (i = 0; handler_added && i < LAZY_RAM_SLOTS; i++) {
++        if (!lazy_ram[i].base) {
++            slot = &lazy_ram[i];
++            break;
++        }
++    }
++    if (slot) {
++        slot->size = size;
++        slot->committed = bitmap_new(DIV_ROUND_UP(size, LAZY_RAM_CHUNK));
++        qatomic_store_release(&slot->base, ptr);
++    }
++    ReleaseSRWLockExclusive(&lazy_ram_lock);
++    if (!slot && !VirtualAlloc(ptr, size, MEM_COMMIT, PAGE_READWRITE)) {
++        VirtualFree(ptr, 0, MEM_RELEASE);
++        return NULL;
++    }
++    return ptr;
++}
++
++static void lazy_ram_forget(void *ptr)
++{
++    int i;
++
++    AcquireSRWLockExclusive(&lazy_ram_lock);
++    for (i = 0; i < LAZY_RAM_SLOTS; i++) {
++        if (lazy_ram[i].base == ptr) {
++            qatomic_store_release(&lazy_ram[i].base, NULL);
++            g_free(lazy_ram[i].committed);
++            lazy_ram[i].committed = NULL;
++            lazy_ram[i].size = 0;
++        }
++    }
++    ReleaseSRWLockExclusive(&lazy_ram_lock);
++}
++
+ void *qemu_anon_ram_alloc(size_t size, uint64_t *align, bool shared,
+                           bool noreserve)
+ {
+@@ -58,7 +249,11 @@
+         return NULL;
+     }
+ 
+-    ptr = VirtualAlloc(NULL, size, MEM_COMMIT, PAGE_READWRITE);
++    if (size >= LAZY_RAM_MIN_SIZE) {
++        ptr = lazy_ram_alloc(size);
++    } else {
++        ptr = VirtualAlloc(NULL, size, MEM_COMMIT, PAGE_READWRITE);
++    }
+     trace_qemu_anon_ram_alloc(size, ptr);
+ 
+     if (ptr && align) {
+@@ -71,6 +266,7 @@
+ {
+     trace_qemu_anon_ram_free(ptr, size);
+     if (ptr) {
++        lazy_ram_forget(ptr);
+         VirtualFree(ptr, 0, MEM_RELEASE);
+     }
+ }
+@@ -272,6 +468,7 @@
+     size_t pagesize = qemu_real_host_page_size();
+ 
+     sz = (sz + pagesize - 1) & -pagesize;
++    qemu_ram_commit(area, sz, false);
+     for (i = 0; i < sz / pagesize; i++) {
+         memset(area + pagesize * i, 0, 1);
+     }

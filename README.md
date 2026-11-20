@@ -286,9 +286,10 @@ também o volume NTFS. Um kernel compilado serve a todo `--build-dir`.
 O `test-all` compila o kernel uma vez e monta as imagens uma vez por volume
 (`build/test-all/imagem-<n>`: a do boot comum e a do smss), e roda o QEMU em
 `--jobs=N` pistas (`test-boot --no-build --image-dir`; padrão: metade das
-CPUs), cada execução com as próprias opções de carga. Cada QEMU compromete
-toda a memória do convidado ao subir, então um QEMU só começa quando o
-commit livre do host o cobre com folga.
+CPUs), cada execução com as próprias opções de carga. O QEMU do OpenNT
+compromete a memória do convidado conforme o convidado a usa
+(`tools/qemu/lazy-ram.patch`), mas pode chegar a toda ela, então um QEMU só
+começa quando o commit livre do host cobre a memória inteira com folga.
 Opções: `--only=ID,...`, `--skip=ID,...`, `--suite` (só as suítes,
 `suite-smp4` e `suite-smp1`) ou `--no-suite`, `--repeat=N` (cada teste N
 vezes, para caçar falhas intermitentes), `--keep` (guarda a pasta de toda
