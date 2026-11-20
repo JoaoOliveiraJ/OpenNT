@@ -12,7 +12,9 @@
 //! Como os binários de System32, as chaves vêm desta máquina no build, com os
 //! valores daqui: as chaves de serviço desses quatro e as do PlugPlay, do
 //! Power, do BrokerInfrastructure, do SystemEventsBroker, do registrador
-//! do CoreMessaging e da política de vídeo (com Parameters e Security), a
+//! do CoreMessaging e da política de vídeo (com Parameters e Security) e a
+//! do gerenciador de usuários (UserManager, com Parameters e TriggerInfo e
+//! sem Security), a
 //! ordem dos grupos de serviço (`Control\ServiceGroupOrder`), os dois
 //! valores de `Control` que
 //! o services.exe lê no início automático (o `EarlyStartServices`, a lista
@@ -60,8 +62,20 @@ use crate::host_language::HostKey;
 /// automático atrasado): o servidor da classe WinRT fora de processo
 /// DispBrokerDesktop.GlobalBrokerInstance, que a SessionBrokerInstance do
 /// dwm.exe ativa pelo RPCSS na partida (`logon_screen`), o que inicia o
-/// serviço antes do atraso.
-const SERVICES: &[&str] = &["DcomLaunch", "RpcEptMapper", "RpcSs", "LSM", "PlugPlay", "Power", "BrokerInfrastructure", "SystemEventsBroker", "CoreMessagingRegistrar", "DispBrokerDesktopSvc"];
+/// serviço antes do atraso. E o gerenciador de usuários (UserManager, o
+/// usermgr.dll no `svchost.exe -k netsvcs -p` com a conta LocalSystem,
+/// início automático depois do RpcSs e do ProfSvc de `user_profiles`, com o
+/// gatilho da interface RPC b18fbab6-56f8-4702-84e0-41053293a869): com ele
+/// RUNNING o winlogon faz o logon por ele (UMgrLogonUser), avisa o logon
+/// (UMgrInformUserLogon, que manda ao services.exe o controle 0x21 dos
+/// serviços por usuário) e pede o sihost.exe
+/// (UMgrLaunchShellInfrastructureHost). O próprio usermgr.dll ativa as
+/// fábricas Windows.System.User e Windows.System.Internal.UserManager ao
+/// subir (o servidor WinRT UserManager de `logon_screen`) e para o serviço
+/// sem elas; e marca o svchost dele como crítico (RtlSetProcessIsCritical,
+/// com o `ShellInfrastructure` do Winlogon). A chave não tem Security: o
+/// services.exe dá ao serviço o descritor padrão (ScCreateScServiceObject).
+const SERVICES: &[&str] = &["DcomLaunch", "RpcEptMapper", "RpcSs", "LSM", "PlugPlay", "Power", "BrokerInfrastructure", "SystemEventsBroker", "CoreMessagingRegistrar", "DispBrokerDesktopSvc", "UserManager"];
 
 /// Os valores de `Control` que o services.exe lê: o EarlyStartServices (o
 /// ScStartEarlySetOfServices; sem ele todo serviço automático entra no
@@ -90,6 +104,10 @@ pub fn system_keys(control_set: &str) -> Vec<HostKey> {
         for service in SERVICES {
             registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\Services\\{service}"), &format!("{control_set}\\Services\\{service}"), true, &mut keys);
         }
+        // O UserManager de uma instalação nova não tem Security (o descritor
+        // é o padrão do services.exe); uma Security desta máquina teria SIDs
+        // daqui.
+        keys.retain(|key| !key.path.to_ascii_lowercase().ends_with("\\services\\usermanager\\security"));
         registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\Control\\ServiceGroupOrder"), &format!("{control_set}\\Control\\ServiceGroupOrder"), false, &mut keys);
         // Só os valores de CONTROL_VALUES da chave Control.
         let first = keys.len();
@@ -419,5 +437,48 @@ mod software_tests {
     fn trusted_unmarshalers_are_staged() {
         let keys = super::software_keys();
         assert!(keys.iter().any(|key| key.path.eq_ignore_ascii_case("Classes\\Unmarshalers\\System\\{00000338-0000-0000-C000-000000000046}")));
+    }
+}
+
+#[cfg(all(test, windows))]
+mod service_tests {
+    use crate::host_language::HostKey;
+
+    fn key<'a>(keys: &'a [HostKey], path: &str) -> Option<&'a HostKey> {
+        keys.iter().find(|key| key.path.eq_ignore_ascii_case(path))
+    }
+
+    /// As partes de um REG_SZ, REG_EXPAND_SZ ou REG_MULTI_SZ.
+    fn text(key: &HostKey, name: &str) -> Vec<String> {
+        key.values
+            .iter()
+            .find(|(value, _, _)| value.eq_ignore_ascii_case(name))
+            .map(|(_, _, data)| {
+                let units: Vec<u16> = data.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect();
+                String::from_utf16_lossy(&units).split('\0').filter(|part| !part.is_empty()).map(String::from).collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// O UserManager como numa instalação nova: o usermgr.dll no svchost do
+    /// netsvcs com a conta LocalSystem, as dependências RpcSs e ProfSvc, o
+    /// gatilho da interface RPC, sem Security; o usermgr.dll no volume e o
+    /// servidor WinRT dele com a classe Windows.System.User.
+    #[test]
+    fn user_manager_as_fresh_install() {
+        let keys = super::system_keys("ControlSet001");
+        let service = key(&keys, "ControlSet001\\Services\\UserManager").expect("Services\\UserManager");
+        assert_eq!(text(service, "DependOnService"), ["RpcSs", "ProfSvc"]);
+        assert_eq!(text(service, "ObjectName"), ["LocalSystem"]);
+        assert!(text(service, "ImagePath").first().is_some_and(|path| path.to_ascii_lowercase().ends_with("svchost.exe -k netsvcs -p")));
+        assert!(key(&keys, "ControlSet001\\Services\\UserManager\\TriggerInfo\\0").is_some());
+        let parameters = key(&keys, "ControlSet001\\Services\\UserManager\\Parameters").expect("Services\\UserManager\\Parameters");
+        assert!(text(parameters, "ServiceDll").first().is_some_and(|path| path.to_ascii_lowercase().ends_with("usermgr.dll")));
+        assert!(!keys.iter().any(|key| key.path.to_ascii_lowercase().ends_with("\\services\\usermanager\\security")));
+        assert!(crate::user_profiles::system_keys("ControlSet001").iter().any(|key| key.path.eq_ignore_ascii_case("ControlSet001\\Services\\ProfSvc")), "o UserManager depende do ProfSvc");
+        assert!(crate::windows_binaries::user_programs().any(|program| program.eq_ignore_ascii_case("usermgr.dll")));
+        let software = crate::logon_screen::software_keys();
+        assert!(key(&software, "Microsoft\\WindowsRuntime\\Server\\UserManager").is_some());
+        assert!(key(&software, "Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.System.User").is_some());
     }
 }

@@ -5312,7 +5312,13 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   LocalSystem, com o profsvc.dll e o profsvcext.dll no volume; o
   assinante `Profiles` vem com a chave `Control\Winlogon\Notifications`
   inteira; as chaves copiadas daqui perdem os SIDs de conta dos
-  descritores, e um valor com SID de conta fica fora), as
+  descritores, e um valor com SID de conta fica fora), o gerenciador de
+  usuários (UserManager no `svchost -k netsvcs`, início automático depois
+  do RpcSs e do ProfSvc, com o gatilho da interface RPC e sem `Security`,
+  com o usermgr.dll e o UserMgrProxy.dll no volume, `user_services.rs`:
+  com ele RUNNING o winlogon faz o logon pelo UMgrLogonUser e pede o
+  sihost.exe pelo UMgrLaunchShellInfrastructureHost, e o svchost dele fica
+  crítico), as
   fontes de `\SystemRoot\Fonts` com o GRE_Initialize, o FontSubstitutes, o
   FontLink e a chave Fonts, e na SYSTEM o `Control\IDConfigDB` e os perfis
   de `Hardware Profiles` (o `LogPixels` do DPI, `xtask/src/fonts.rs`), o
