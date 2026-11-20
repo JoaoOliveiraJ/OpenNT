@@ -16,6 +16,11 @@
 //! - o mesmo pelo KeWaitForSingleObject dentro do serviço: a thread bloqueia
 //!   no kernel com a espera registrada, e o sinal a apronta e retoma o
 //!   serviço;
+//! - a espera adiada seguida, no mesmo serviço, de uma aquisição contendida
+//!   (o registro e a desistência da espera do lock): os blocos da adiada só
+//!   são ligados na saída da CPU;
+//! - o WaitAny com o mesmo evento duas vezes (dois blocos da thread na mesma
+//!   lista): o sinal conclui com o índice 0;
 //! - suspensa na espera, o sinal não a roda; a retomada conclui a espera;
 //! - o NtWaitForAlertByThreadId: o NtAlertThreadByThreadId do teste a
 //!   apronta na hora e ela volta com STATUS_ALERTED;
@@ -32,7 +37,7 @@ use super::identity::with_test_process;
 use crate::hal::amd64::usermode;
 use crate::ntos::ex::service_table;
 use crate::ntos::inc::types::{DispatcherHeader, Kthread, NtStruct};
-use crate::ntos::ke::{clock, dispatcher, thread_dispatch};
+use crate::ntos::ke::{clock, context_switch, dispatcher, thread_dispatch, wait as ke_wait};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::kernel_stack;
 use crate::ntos::ps::dispatch_perf;
@@ -61,6 +66,13 @@ const MODE_EVENT: u32 = 0;
 const MODE_ALERT: u32 = 1;
 const MODE_DELAY: u32 = 2;
 const MODE_KERNEL: u32 = 3;
+const MODE_LAYERED: u32 = 4;
+const MODE_DUPLICATE: u32 = 5;
+/// As esperas WaitAny no mesmo evento duas vezes.
+const DUPLICATE_PAIRS: u64 = 5;
+/// As esperas adiadas seguidas, no mesmo serviço, de uma aquisição
+/// contendida.
+const LAYERED_PAIRS: u64 = 5;
 /// As esperas de kernel (KeWaitForSingleObject dentro do serviço).
 const KERNEL_PAIRS: u64 = 10;
 
@@ -95,6 +107,25 @@ extern "win64" fn wait_service(_: u64, _: u64, _: u64, _: u64) -> u64 {
         // O KeWaitForSingleObject de KernelMode, sem prazo, no serviço: a
         // thread bloqueia no kernel com a espera registrada.
         MODE_KERNEL => dispatcher::wait_for_single_object(EVENT.load(Ordering::SeqCst), 0, 0, false) as u64,
+        // A espera adiada e, depois dela, ainda no serviço, uma aquisição
+        // contendida de um lock do Ex: o registro da espera do lock (com o
+        // evento estacionado) e a desistência, com a palavra livre na
+        // segunda tentativa. Os blocos da espera adiada só são ligados na
+        // saída da CPU, então os do lock não os encontram ligados.
+        // WaitAny com o mesmo evento nas duas posições (o 19041 aceita o
+        // repetido fora do WaitAll): dois blocos da thread na mesma lista.
+        MODE_DUPLICATE => {
+            let event = EVENT.load(Ordering::SeqCst);
+            threads::wait_objects(Vec::new(), alloc::vec![event, event], 1, 0, false) as u64
+        }
+        MODE_LAYERED => {
+            let event = EVENT.load(Ordering::SeqCst);
+            let status = threads::wait_objects(Vec::new(), alloc::vec![event], 1, 0, false);
+            let mut first = true;
+            let parked = event + 0x20;
+            let _ = context_switch::acquire_signaled(|| if core::mem::replace(&mut first, false) { (Ok(None), Some(parked)) } else { (Ok(Some(())), None) }, ke_wait::reason::WR_RESOURCE, dispatcher::pump_kernel);
+            status as u64
+        }
         _ => threads::wait_objects(Vec::new(), alloc::vec![EVENT.load(Ordering::SeqCst)], 1, 0, false) as u64,
     }
 }
@@ -141,6 +172,10 @@ struct Outcome {
     kernel_pairs: u64,
     kernel_ready: u64,
     kernel_zero: u64,
+    layered_pairs: u64,
+    layered_zero: u64,
+    duplicate_pairs: u64,
+    duplicate_zero: u64,
     held_while_suspended: bool,
     resumed_status: u64,
     alerts: u64,
@@ -177,6 +212,7 @@ fn run_phases() -> Option<Outcome> {
             guest::write_bytes(code, &looping_program());
             guest::write_bytes(event, &[0; 0x40]);
             dispatcher::initialize_event(event, 0, false);
+            dispatcher::initialize_event(event + 0x20, 0, false);
             guest::write64(data, (-((DELAY_MS * 10_000) as i64)) as u64);
             EVENT.store(event, Ordering::SeqCst);
             INTERVAL.store(data, Ordering::SeqCst);
@@ -224,7 +260,7 @@ fn run_phases() -> Option<Outcome> {
                         break;
                     }
                     if outcome.kernel_pairs + 1 == KERNEL_PAIRS {
-                        MODE.store(MODE_EVENT, Ordering::SeqCst);
+                        MODE.store(MODE_LAYERED, Ordering::SeqCst);
                     }
                     dispatcher::set_event(event);
                     if thread_dispatch::thread_state(pointer) == thread_dispatch::state::READY {
@@ -237,6 +273,47 @@ fn run_phases() -> Option<Outcome> {
                     }
                     if LAST_STATUS.load(Ordering::SeqCst) == 0 {
                         outcome.kernel_zero += 1;
+                    }
+                }
+                // Fase 1c: a espera adiada seguida de uma aquisição contendida
+                // no mesmo serviço.
+                while outcome.layered_pairs < LAYERED_PAIRS && outcome.kernel_pairs == KERNEL_PAIRS {
+                    let records = PAIRS + KERNEL_PAIRS + outcome.layered_pairs;
+                    if !tick_until(2_000, || parked(waiter, records)) {
+                        break;
+                    }
+                    if outcome.layered_pairs + 1 == LAYERED_PAIRS {
+                        MODE.store(MODE_DUPLICATE, Ordering::SeqCst);
+                    }
+                    dispatcher::set_event(event);
+                    dispatcher::reset_event(event);
+                    outcome.layered_pairs += 1;
+                    if !tick_until(2_000, || RECORDS.load(Ordering::SeqCst) == records + 1) {
+                        break;
+                    }
+                    if LAST_STATUS.load(Ordering::SeqCst) == 0 {
+                        outcome.layered_zero += 1;
+                    }
+                }
+                // Fase 1d: o mesmo evento duas vezes num WaitAny: o sinal
+                // satisfaz o primeiro bloco e a saída da espera desliga os
+                // dois, sem o teste da lista se perder no desligado.
+                while outcome.duplicate_pairs < DUPLICATE_PAIRS && outcome.layered_pairs == LAYERED_PAIRS {
+                    let records = PAIRS + KERNEL_PAIRS + LAYERED_PAIRS + outcome.duplicate_pairs;
+                    if !tick_until(2_000, || parked(waiter, records)) {
+                        break;
+                    }
+                    if outcome.duplicate_pairs + 1 == DUPLICATE_PAIRS {
+                        MODE.store(MODE_EVENT, Ordering::SeqCst);
+                    }
+                    dispatcher::set_event(event);
+                    dispatcher::reset_event(event);
+                    outcome.duplicate_pairs += 1;
+                    if !tick_until(2_000, || RECORDS.load(Ordering::SeqCst) == records + 1) {
+                        break;
+                    }
+                    if LAST_STATUS.load(Ordering::SeqCst) == 0 {
+                        outcome.duplicate_zero += 1;
                     }
                 }
                 outcome.polls = dispatch_perf::POLLS.load(Ordering::SeqCst) - polls;
@@ -360,6 +437,8 @@ pub fn run(assert: Assert) {
     assert(outcome.ready_on_signal == PAIRS && outcome.polls == 0, "espera-registrada: o KeSetEvent apronta a thread dentro do sinal (KiUnwaitThread), sem nenhuma espera sondada");
     assert(outcome.overlay_kept, "espera-registrada: os blocos de espera embutidos na KTHREAD nao apagam os campos sobrepostos a eles (ThreadCounters, Win32Thread)");
     assert(outcome.kernel_pairs == KERNEL_PAIRS && outcome.kernel_ready == KERNEL_PAIRS && outcome.kernel_zero == KERNEL_PAIRS, "espera-registrada: o KeWaitForSingleObject dentro do servico bloqueia com a espera registrada, e o sinal apronta a thread e retoma o servico com 0");
+    assert(outcome.layered_pairs == LAYERED_PAIRS && outcome.layered_zero == LAYERED_PAIRS, "espera-registrada: o servico que instala a espera adiada e ainda registra e desfaz a espera de um lock nao corrompe as listas, e a espera adiada conclui com 0");
+    assert(outcome.duplicate_pairs == DUPLICATE_PAIRS && outcome.duplicate_zero == DUPLICATE_PAIRS, "espera-registrada: o WaitAny com o mesmo evento duas vezes conclui com o indice 0 e o teste da lista do evento termina");
     assert(outcome.held_while_suspended && outcome.resumed_status == 0, "espera-registrada: suspensa, o sinal nao a roda; a retomada conclui a espera com 0");
     assert(outcome.alerts == ALERTS && outcome.alerted_ready == ALERTS && outcome.alert_statuses == ALERTS, "espera-registrada: o NtAlertThreadByThreadId apronta a thread na hora e o NtWaitForAlertByThreadId volta com STATUS_ALERTED");
     assert(outcome.delays == DELAYS && outcome.delays_on_time == DELAYS, "espera-registrada: o NtDelayExecution conclui com 0 depois do prazo, pelo timer da thread");

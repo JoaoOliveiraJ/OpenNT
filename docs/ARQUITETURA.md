@@ -1010,15 +1010,19 @@ que devolve STATUS_PENDING (o NtWaitForSingleObject, o
 NtWaitForMultipleObjects, o NtSignalAndWaitForSingleObject, o
 NtDelayExecution, a espera do `cm/notify.rs`), `threads::wait_registered`
 tenta os objetos, confere os alertas e a APC de usuário pendente (o
-KiCheckAlertability) e liga os blocos dentro do serviço
-(`wait::begin_user_wait`, WaitInProgress, sem tocar no KTHREAD.State); a APC
-de kernel não interrompe essa espera, que o despachante conclui no
-contexto da thread. Quando a thread deixa a CPU, o despacho de usuário a
-põe Waiting e confirma a espera (`wait::commit_user_wait`, o
-KiCommitThreadWait, depois do `end_execution`, como o `run_step` das threads
-de kernel); um alerta ou uma APC de usuário que chegou com a espera em curso
-a desfaz, e a espera já satisfeita dentro do intervalo (WaitAborted) volta
-direto à fila. O sinal (KeSetEvent, KePulseEvent, KeReleaseSemaphore, o
+KiCheckAlertability) e o prazo zero, e instala a espera sem ligar nada: os
+blocos só são ligados quando a thread deixa a CPU (`threads::execute`,
+`wait::begin_user_wait`, com a tentativa de novo sob o lock), depois de todo
+o código do serviço. O que o serviço ainda faz depois de instalar a espera
+(soltar referências, um lock do Ex contendido, um KeWaitFor*) registra e
+desfaz as esperas dele sem achar os blocos embutidos da KTHREAD já ligados
+(o `link_wait` recusa religar os de uma espera ainda ligada). A APC de
+kernel não interrompe essa espera, que o despachante conclui no contexto
+da thread. Ligada a espera, o despacho de usuário põe a thread Waiting e a
+confirma (`wait::commit_user_wait`, o KiCommitThreadWait, depois do
+`end_execution`, como o `run_step` das threads de kernel); um alerta ou uma
+APC de usuário que chegou com a espera em curso a desfaz, e a espera já
+satisfeita no registro volta direto à fila. O sinal (KeSetEvent, KePulseEvent, KeReleaseSemaphore, o
 mutant, o timer da thread no prazo, o fim de uma thread ou processo) desfaz
 a espera e apronta a thread dentro dele (o KiUnwaitThread -> KiReadyThread);
 o despachante só leva o KTHREAD.WaitStatus ao CONTEXT (ou à retomada do
@@ -1031,7 +1035,11 @@ Os blocos embutidos (KTHREAD.WaitBlock[0..3]) recebem só os campos que o
 KiWaitMultiple grava: o SpareLong e o SparePtr deles são outros campos da
 KTHREAD na mesma memória (ContextSwitches, State/WaitIrql/WaitMode,
 WaitTime, ThreadCounters, XStateSave, o Win32Thread no SparePtr do
-WaitBlock[2], Ucb/Uch). As esperas acordadas (`threads::Registered::woken`)
+WaitBlock[2], Ucb/Uch). O teste das esperas de um objeto (o KiWaitTest,
+`DispatcherLock::wait_test`) segue para o próximo bloco de outra thread: os
+seguintes da mesma thread na mesma lista (um WaitAny no mesmo objeto duas
+vezes) saem com ela no `unwait`, e o vínculo de um bloco desligado aponta
+para ele mesmo. As esperas acordadas (`threads::Registered::woken`)
 são as de uma condição que não é o estado de um objeto: o
 NtWaitForAlertByThreadId (o NtAlertThreadByThreadId a acorda pelo
 `wait::wake`, como o KeAlertThreadByThreadId), a retirada de uma porta de
@@ -1048,8 +1056,10 @@ serviço (a E/S de dispositivo, as condições próprias de um serviço e os
 `context_switch::wait_until` sem objeto) seguem sondadas a cada volta.
 Autoteste: `ntos/test/multiprocess/registered_wait.rs` (a thread pronta
 dentro do KeSetEvent, nenhuma espera sondada, o KeWaitForSingleObject
-dentro do serviço, a suspensa, o alerta por id, o atraso, o fim do processo
-sem bloco na WaitListHead e os campos sobrepostos intactos). O NtDelayExecution com intervalo zero,
+dentro do serviço, a espera adiada seguida de um lock contendido no mesmo
+serviço, o WaitAny com o mesmo evento duas vezes, a suspensa, o alerta por
+id, o atraso, o fim do processo sem bloco na WaitListHead e os campos
+sobrepostos intactos). O NtDelayExecution com intervalo zero,
 sem Alertable e sem UserApcPending, é a troca do NtYieldExecution
 (STATUS_SUCCESS ou STATUS_NO_YIELD_PERFORMED), como no
 KeDelayExecutionThread. Os dois e o ZwYieldExecution escolhem como o

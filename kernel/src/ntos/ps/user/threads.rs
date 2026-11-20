@@ -1146,6 +1146,19 @@ fn execute(thread: &Arc<UserThread>, executor: fn(u64, u64) -> u32) -> Result<(u
         executor(context, teb)
     };
     SLICE_THREAD.store(0, Ordering::Release);
+    // A espera adiada que o serviço instalou liga os blocos agora, com o
+    // serviço concluído e a thread ainda corrente (a sondagem de uma acordada
+    // roda no contexto dela): concluída ali mesmo, a thread volta à fila.
+    if let Some(mut wait) = thread.take_wait() {
+        if wait.registered.as_ref().is_some_and(|registered| registered.serial == 0) {
+            match settle_registered(&mut wait, false) {
+                Some(status) => finish_wait(thread, wait, status),
+                None => thread.restore_wait(wait),
+            }
+        } else {
+            thread.restore_wait(wait);
+        }
+    }
     let (dead, waiting, suspended, registered) = thread.with(|thread| (thread.dead, thread.waiting, thread.suspend_count != 0, thread.wait.as_ref().is_some_and(|wait| wait.registered.is_some())));
     let new_state = if dead {
         thread_dispatch::state::TERMINATED
@@ -1477,8 +1490,7 @@ fn poll_wait(wait: &mut Wait) -> Option<u32> {
 }
 
 fn block_current(mut wait: Wait) {
-    // A registrada já tem os alertas e as APCs pelo despachante (`ke::wait`)
-    // e os campos de espera da KTHREAD gravados pelo registro.
+    // A registrada tem os alertas e as APCs pelo despachante (`ke::wait`).
     let registered = wait.registered.is_some();
     if !registered {
         if let Some(alerts) = wait.alerts.as_mut() {
@@ -1488,8 +1500,9 @@ fn block_current(mut wait: Wait) {
     let Some(current) = current() else { return };
     completion_objects::deactivate(current.pointer());
     // A espera de kernel dentro de um serviço (`block_in_kernel`) já gravou
-    // os campos dela no KeWait*.
-    if !current.blocked_in_kernel() && !registered {
+    // os campos dela no KeWait*; a adiada registrada os grava aqui e de novo
+    // ao ligar os blocos, na saída da CPU.
+    if !current.blocked_in_kernel() {
         crate::ntos::ke::wait::publish_user_wait(current.pointer(), wait_reason(&wait), wait.alertable.unwrap_or(false));
     }
     current.with(|thread| {
@@ -1757,10 +1770,11 @@ fn woken_backstop(wait: &mut Wait) -> Option<u32> {
     wait.poll.as_mut().and_then(|poll| poll())
 }
 
-/// A espera registrada de `wait` já saiu (o desfecho dela está pronto): a
-/// conclusão roda no contexto da thread.
+/// A espera registrada de `wait` já saiu (o desfecho dela está pronto), ou
+/// ainda não foi ligada: a conclusão (ou o registro) roda no contexto da
+/// thread.
 fn registered_done(wait: &Wait) -> bool {
-    wait.registered.as_ref().is_some_and(|registered| registered.outcome().is_some())
+    wait.registered.as_ref().is_some_and(|registered| registered.serial == 0 || registered.outcome().is_some())
 }
 
 /// O desfecho de uma espera registrada ([`Registered`]): `None` enquanto ela
@@ -1773,6 +1787,37 @@ fn registered_done(wait: &Wait) -> bool {
 fn settle_registered(wait: &mut Wait, off_cpu: bool) -> Option<u32> {
     use crate::ntos::ke::wait::{STATUS_ALERTED, STATUS_TIMEOUT, STATUS_USER_APC};
     let reason = wait_reason(wait);
+    // A espera adiada de um serviço só liga os blocos quando a thread deixa
+    // a CPU, depois de todo o código do serviço: o que ele ainda faz depois
+    // de instalar a espera (soltar referências, um lock do Ex, um
+    // KeWaitFor*) não pode encontrar os blocos embutidos da KTHREAD já
+    // ligados. A tentativa sob o lock vem junto, e numa acordada a sondagem
+    // depois do registro (um `wake` entre as duas não se perde).
+    if wait.registered.as_ref()?.serial == 0 {
+        let registered = wait.registered.as_mut()?;
+        if let Some(done) = registered.link(reason) {
+            return Some(done);
+        }
+        if registered.woken {
+            registered.polled_at = clock::uptime_ms();
+            if let Some(done) = wait.poll.as_mut().and_then(|poll| poll()) {
+                if let Some(registered) = wait.registered.as_mut() {
+                    crate::ntos::ke::wait::withdraw_user_wait(registered.thread, registered.serial);
+                    registered.serial = 0;
+                }
+                return Some(done);
+            }
+        }
+        if !off_cpu {
+            return None;
+        }
+        let thread = wait.registered.as_ref()?.thread;
+        let _ = thread_dispatch::suspend(thread, thread_dispatch::state::WAITING);
+        if crate::ntos::ke::wait::commit_user_wait(thread) {
+            return None;
+        }
+        let _ = thread_dispatch::make_ready(thread);
+    }
     loop {
         let registered = wait.registered.as_mut()?;
         let status = registered.outcome()?;
@@ -1809,13 +1854,11 @@ fn settle_registered(wait: &mut Wait, off_cpu: bool) -> Option<u32> {
 /// Uma espera de serviço de UserMode registrada no despachante
 /// ([`Registered`]), como o KeWaitForMultipleObjects do 19041: a tentativa
 /// (os objetos, ou a sondagem numa espera acordada), os alertas e a APC de
-/// usuário pendente (o KiCheckAlertability), o registro dos blocos sob o
-/// lock do despachante (a tentativa de novo e o prazo) e, numa acordada, a
-/// sondagem depois do registro (um `wake` entre as duas não se perde). Sem
-/// conclusão, STATUS_PENDING com a espera instalada: o sinal apronta a
-/// thread e o despachante grava o status no CONTEXT quando a escolhe.
+/// usuário pendente (o KiCheckAlertability) e o prazo zero. Sem conclusão,
+/// STATUS_PENDING com a espera instalada; os blocos são ligados quando a
+/// thread deixa a CPU ([`execute`], `settle_registered`), e então o sinal a
+/// apronta e o despachante grava o status no CONTEXT quando a escolhe.
 fn wait_registered(mut wait: Wait) -> u32 {
-    let reason = wait_reason(&wait);
     let Some((thread, woken, alertable)) = wait.registered.as_ref().map(|registered| (registered.thread, registered.woken, registered.alertable)) else {
         conclude(&mut wait, NOT_SUPPORTED);
         return NOT_SUPPORTED;
@@ -1835,17 +1878,10 @@ fn wait_registered(mut wait: Wait) -> u32 {
     if immediate.is_none() {
         immediate = thread_alert::consume(thread, 1, alertable);
     }
+    // O prazo zero (ou já vencido) volta aqui, sem instalar nada: a consulta
+    // de um objeto não passa pelo despachante.
     if immediate.is_none() {
-        immediate = wait.registered.as_mut().and_then(|registered| registered.link(reason));
-    }
-    if immediate.is_none() && woken {
-        if let Some(done) = wait.poll.as_mut().and_then(|poll| poll()) {
-            if let Some(registered) = wait.registered.as_mut() {
-                crate::ntos::ke::wait::withdraw_user_wait(registered.thread, registered.serial);
-                registered.serial = 0;
-            }
-            immediate = Some(done);
-        }
+        immediate = wait.registered.as_ref().filter(|registered| registered.deadline.remaining() == Some(0)).map(|registered| registered.timeout_status);
     }
     if let Some(status) = immediate {
         conclude(&mut wait, status);

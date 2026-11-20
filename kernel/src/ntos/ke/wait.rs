@@ -292,6 +292,10 @@ impl DispatcherLock {
     /// `thread` (KTHREAD.State Waiting, WaitInProgress). Falha só sem pool
     /// para o vetor de blocos.
     pub fn link_wait(&mut self, thread: u64, objects: &[u64], spec: WaitSpec) -> Result<(), u32> {
+        // Uma thread espera numa coisa só: os blocos embutidos ainda ligados
+        // de outra espera dela seriam religados por cima, e a lista do objeto
+        // antigo ficaria corrompida.
+        assert!(!self.waiting(thread), "espera registrada da thread {:#x} sobre outra ainda ligada", thread);
         let target = kthread(thread);
         let (blocks, allocated) = if objects.len() <= THREAD_WAIT_OBJECTS {
             (target.wait_block[0].address(), false)
@@ -396,8 +400,16 @@ impl DispatcherLock {
         let mut entry = head.flink.get();
         while entry != head.address() {
             let block = block_at(entry);
-            let next = block.wait_list_entry.flink.get();
             let thread = block.thread.get();
+            // O próximo bloco de outra thread: os seguintes da mesma thread na
+            // mesma lista (um WaitAny no mesmo objeto duas vezes, que o 19041
+            // aceita) saem todos com ela no `unwait`, e o vínculo de um bloco
+            // desligado aponta para ele mesmo; testá-los de novo também não
+            // muda nada (o mesmo objeto, a mesma thread).
+            let mut next = block.wait_list_entry.flink.get();
+            while next != head.address() && block_at(next).thread.get() == thread {
+                next = block_at(next).wait_list_entry.flink.get();
+            }
             let key = block.wait_key.get() as u32;
             match block.wait_type.get() {
                 wait_type::ANY => {
