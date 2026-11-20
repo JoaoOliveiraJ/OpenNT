@@ -72,10 +72,29 @@ pub struct Test {
     /// Commit que o QEMU do teste faz ao subir (a memória do convidado
     /// inteira e o do próprio QEMU), em bytes.
     pub memory: u64,
+    /// `na_execucao_de = "<id>"`: o teste tem o mesmo boot que aquele (o
+    /// anfitrião) e, quando os dois entram na rodada, não sobe um QEMU
+    /// próprio: a cadeia dele é conferida na serial do anfitrião
+    /// ([`super::report::derived`]).
+    pub host: Option<String>,
+    /// O marcador e as `--expect`, na ordem: a cadeia que o teste confere.
+    pub chain: Vec<String>,
+    /// As `--expect-any`.
+    pub unordered: Vec<String>,
+    /// `--watch-screen` (a vigia põe marcadores da tela na serial).
+    pub watch_screen: bool,
+    /// O prazo do test-boot.
+    pub timeout: Duration,
+    /// O que o boot do teste é além das imagens: a máquina (CPUs, memória,
+    /// USB, rede, TPM) e o texto das opções de carga.
+    boot: String,
+    /// As opções do comando que só valem num QEMU próprio (entrada pelo
+    /// monitor, espera do fim, depurador, desligamento, parada esperada).
+    own_qemu: Vec<&'static str>,
 }
 
 impl Test {
-    fn new(id: &str, arguments: Vec<String>, suite: bool, expected_failure: bool, covered_by_suite: bool, accelerator: Option<String>) -> Result<Test, String> {
+    pub(super) fn new(id: &str, arguments: Vec<String>, suite: bool, expected_failure: bool, covered_by_suite: bool, accelerator: Option<String>, host: Option<String>) -> Result<Test, String> {
         let mut command = vec![String::from("test-boot")];
         command.extend(arguments.iter().cloned());
         let parsed = crate::parse(command).map_err(|error| format!("teste {id}: {error}"))?;
@@ -90,10 +109,37 @@ impl Test {
                 return Err(format!("teste {id}: acelerador aceita {} ({accelerator} recebido)", ACCELERATORS.join(", ")));
             }
         }
-        let (_, timeout_ms) = crate::marker_and_timeout(&parsed).map_err(|error| format!("teste {id}: {error}"))?;
+        let (marker, timeout_ms) = crate::marker_and_timeout(&parsed).map_err(|error| format!("teste {id}: {error}"))?;
         let options = crate::test_build_options(&parsed);
         // As opções de carga que valem no QEMU: as do teste, inteiras.
         options.load_options_block().map_err(|error| format!("teste {id}: {error}"))?;
+        let machine = &parsed.machine;
+        let boot = format!(
+            "smp={} memoria={} usb={} rede={} tpm={} opcoes de carga: {}",
+            machine.smp,
+            machine.memory_mb,
+            machine.usb,
+            machine.net,
+            machine.tpm,
+            options.load_options().map_err(|error| format!("teste {id}: {error}"))?
+        );
+        let own_qemu = [
+            ("--keys", parsed.keys.is_some()),
+            ("--send/--dismiss/--mouse", !parsed.inputs.is_empty()),
+            ("--hold", parsed.hold_ms > 0),
+            ("--kd", !options.kd.is_empty()),
+            ("--script", parsed.script.is_some()),
+            ("--expect-poweroff", parsed.expect_poweroff),
+            ("--power-cycles", parsed.power_cycles > 0),
+            ("--allow-reboot", parsed.allow_reboot),
+            ("--expect-stop", parsed.expect_stop),
+            ("--manual-crash", parsed.manual_crash),
+        ]
+        .into_iter()
+        .filter_map(|(option, present)| present.then_some(option))
+        .collect();
+        let mut chain = vec![marker];
+        chain.extend(parsed.expect.iter().cloned());
         Ok(Test {
             id: id.to_string(),
             arguments,
@@ -105,7 +151,19 @@ impl Test {
             kernel_key: options.kernel_key(),
             limit: Duration::from_millis(timeout_ms.saturating_add(parsed.hold_ms)) + GRACE,
             memory: (u64::from(parsed.machine.memory_mb) << 20) + QEMU_OVERHEAD,
+            host,
+            chain,
+            unordered: parsed.expect_any.clone(),
+            watch_screen: parsed.watch_screen,
+            timeout: Duration::from_millis(timeout_ms),
+            boot,
+            own_qemu,
         })
+    }
+
+    /// Tudo o que o teste procura na serial: a cadeia e as `--expect-any`.
+    pub fn needles(&self) -> impl Iterator<Item = &String> {
+        self.chain.iter().chain(&self.unordered)
     }
 
     /// O comando como o integrador o digitaria, com a pasta dada.
@@ -118,6 +176,11 @@ impl Test {
         }
         words.join(" ")
     }
+}
+
+/// As palavras como o integrador as digitaria ([`quote`]).
+pub fn quoted(words: &[String]) -> String {
+    words.iter().map(|word| quote(word)).collect::<Vec<_>>().join(" ")
 }
 
 /// Aspas duplas quando a palavra tem espaço ou caractere especial do shell
@@ -201,7 +264,7 @@ pub fn load(root: &Path) -> Result<Vec<Test>, String> {
     for cpus in SUITE_CPUS {
         let mut arguments: Vec<String> = SUITE.iter().map(|word| word.to_string()).collect();
         arguments.push(format!("--smp={cpus}"));
-        tests.push(Test::new(&format!("suite-smp{cpus}"), arguments, true, false, false, None)?);
+        tests.push(Test::new(&format!("suite-smp{cpus}"), arguments, true, false, false, None, None)?);
     }
     let path = root.join(COMPONENTS);
     let text = fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
@@ -223,12 +286,98 @@ pub fn load(root: &Path) -> Result<Vec<Test>, String> {
             Some(toml::Value::String(value)) => Some(value.clone()),
             Some(_) => return Err(format!("teste {id}: acelerador deve ser um texto")),
         };
+        let host = match entry.get("na_execucao_de") {
+            None => None,
+            Some(toml::Value::String(value)) => Some(value.clone()),
+            Some(_) => return Err(format!("teste {id}: na_execucao_de deve ser o id de outro teste")),
+        };
         if tests.iter().any(|test: &Test| test.id == id) {
             return Err(format!("{COMPONENTS}: id de teste repetido: {id}"));
         }
-        tests.push(Test::new(id, arguments, false, expected_failure, covered_by_suite, accelerator)?);
+        tests.push(Test::new(id, arguments, false, expected_failure, covered_by_suite, accelerator, host)?);
     }
+    check_hosts(&tests)?;
     Ok(tests)
+}
+
+/// Confere cada `na_execucao_de`: o anfitrião existe, não é ele mesmo
+/// convidado de outro, sobe o mesmo boot (as imagens, o kernel, a máquina,
+/// as opções de carga e o acelerador) com um prazo que cobre o do
+/// convidado, e o convidado não usa nada que só vale num QEMU próprio. A
+/// vigia da tela, as telas do `--capture-every` e o prazo podem diferir.
+pub fn check_hosts(tests: &[Test]) -> Result<(), String> {
+    for guest in tests {
+        let Some(host_id) = &guest.host else { continue };
+        let fail = |why: String| Err(format!("teste {}: na_execucao_de = \"{host_id}\": {why}", guest.id));
+        let Some(host) = tests.iter().find(|test| &test.id == host_id) else {
+            return fail("teste desconhecido".into());
+        };
+        if host.id == guest.id {
+            return fail("um teste nao roda na execucao dele mesmo".into());
+        }
+        if host.host.is_some() {
+            return fail(format!("{host_id} ja roda na execucao de outro teste"));
+        }
+        if !guest.own_qemu.is_empty() {
+            return fail(format!("{} so vale num QEMU proprio", guest.own_qemu.join(", ")));
+        }
+        if guest.image_key != host.image_key || guest.kernel_key != host.kernel_key {
+            return fail("as imagens do boot diferem das do anfitriao (outro volume ou outro kernel)".into());
+        }
+        if guest.boot != host.boot {
+            return fail(format!("o boot difere do anfitriao ({} contra {})", guest.boot, host.boot));
+        }
+        if guest.accelerator != host.accelerator {
+            return fail("o acelerador difere do anfitriao".into());
+        }
+        if guest.timeout > host.timeout {
+            return fail(format!("o prazo de {} s passa o do anfitriao ({} s)", guest.timeout.as_secs(), host.timeout.as_secs()));
+        }
+    }
+    Ok(())
+}
+
+/// Os convidados que rodam na execução de cada teste escolhido: um teste
+/// com `na_execucao_de` cujo anfitrião também foi escolhido sai das
+/// execuções e vai para a lista do anfitrião (o veredito dele sai da serial
+/// do anfitrião). Fica com o QEMU próprio o `espera_falha` (a falha
+/// conhecida roda à parte, como sempre) e todo teste do `capturas`
+/// (`own_runs`: cada teste grava a própria tela). Devolve os escolhidos que
+/// sobem um QEMU e, para cada um, os convidados dele.
+pub fn split_guests(tests: &[Test], chosen: &[usize], own_runs: bool) -> (Vec<usize>, Vec<Vec<usize>>) {
+    let host_of = |index: usize| -> Option<usize> {
+        let test = &tests[index];
+        if own_runs || test.expected_failure {
+            return None;
+        }
+        let host = tests.iter().position(|other| Some(&other.id) == test.host.as_ref())?;
+        chosen.contains(&host).then_some(host)
+    };
+    let booted: Vec<usize> = chosen.iter().copied().filter(|&index| host_of(index).is_none()).collect();
+    let guests = booted.iter().map(|&host| chosen.iter().copied().filter(|&index| host_of(index) == Some(host)).collect()).collect();
+    (booted, guests)
+}
+
+/// O que o anfitrião passa ao `test-boot` além do comando dele, pelos
+/// `guests`: uma `--expect-any` para cada texto que um convidado procura e
+/// o anfitrião não (assim a execução só acaba com todos na serial, em
+/// qualquer ordem entre eles), e o `--watch-screen` quando um convidado o
+/// tem.
+pub fn host_arguments(tests: &[Test], host: usize, guests: &[usize]) -> Vec<String> {
+    let own: Vec<&String> = tests[host].needles().collect();
+    let mut extra: Vec<String> = Vec::new();
+    for &guest in guests {
+        for needle in tests[guest].needles() {
+            let argument = format!("--expect-any={needle}");
+            if !own.contains(&needle) && !extra.contains(&argument) {
+                extra.push(argument);
+            }
+        }
+    }
+    if !tests[host].watch_screen && guests.iter().any(|&guest| tests[guest].watch_screen) {
+        extra.push("--watch-screen".into());
+    }
+    extra
 }
 
 /// Quais suítes entram quando não há `--only`.
@@ -299,15 +448,21 @@ pub struct Run {
     pub test: usize,
     /// O índice da chave de imagem (`image_key`) entre as desta rodada.
     pub image: usize,
+    /// Os convidados que esta execução decide ([`split_guests`]), com o
+    /// nome do resultado de cada um (`<id>` ou `<id>.<n>`).
+    pub guests: Vec<(usize, String)>,
+    /// O que o anfitrião passa a mais ao `test-boot` ([`host_arguments`]).
+    pub extra: Vec<String>,
 }
 
 /// As execuções na ordem em que vão para as pistas: as de mesmas imagens
 /// juntas (montadas uma vez), os grupos de teste mais longo primeiro e, em
 /// cada grupo, as de prazo maior primeiro, para as longas (as suítes)
-/// começarem cedo e as curtas fecharem a rodada.
-pub fn runs(tests: &[Test], chosen: &[usize], repeat: usize) -> Vec<Run> {
+/// começarem cedo e as curtas fecharem a rodada. `guests[i]` são os
+/// convidados de `booted[i]` ([`split_guests`]).
+pub fn runs(tests: &[Test], booted: &[usize], guests: &[Vec<usize>], repeat: usize) -> Vec<Run> {
     let mut groups: Vec<(&str, Vec<usize>)> = Vec::new();
-    for &index in chosen {
+    for &index in booted {
         let key = tests[index].image_key.as_str();
         match groups.iter_mut().find(|(group, _)| *group == key) {
             Some((_, members)) => members.push(index),
@@ -316,14 +471,23 @@ pub fn runs(tests: &[Test], chosen: &[usize], repeat: usize) -> Vec<Run> {
     }
     let longest = |members: &[usize]| members.iter().map(|&index| tests[index].limit).max().unwrap_or_default();
     groups.sort_by_key(|(_, members)| std::cmp::Reverse(longest(members)));
+    let name = |index: usize, round: usize| {
+        let id = &tests[index].id;
+        if repeat > 1 {
+            format!("{id}.{round}")
+        } else {
+            id.clone()
+        }
+    };
     let mut runs = Vec::new();
     for (image, (_, mut members)) in groups.into_iter().enumerate() {
         members.sort_by_key(|&index| std::cmp::Reverse(tests[index].limit));
         for index in members {
+            let own: &[usize] = booted.iter().position(|&host| host == index).and_then(|at| guests.get(at)).map_or(&[], Vec::as_slice);
+            let extra = host_arguments(tests, index, own);
             for round in 1..=repeat {
-                let id = &tests[index].id;
-                let name = if repeat > 1 { format!("{id}.{round}") } else { id.clone() };
-                runs.push(Run { name, test: index, image });
+                let guests = own.iter().map(|&guest| (guest, name(guest, round))).collect();
+                runs.push(Run { name: name(index, round), test: index, image, guests, extra: extra.clone() });
             }
         }
     }

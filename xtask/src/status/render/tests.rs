@@ -12,6 +12,12 @@ fn test_item(test: &TestRow) -> String {
     if test.covered_by_suite {
         chips.push_str(" <span class=\"chip tag\" title=\"coberto_pela_suite = true: as suítes já conferem os marcadores\">nas suítes</span>");
     }
+    if let Some(host) = &test.host {
+        chips.push_str(&format!(
+            " <span class=\"chip tag\" title=\"na_execucao_de = &quot;{0}&quot;: na rodada, conferido na serial da execução de {0}, sem QEMU próprio\">na execução de {0}</span>",
+            escape(host)
+        ));
+    }
     if let Some(accelerator) = &test.accelerator {
         chips.push_str(&format!(
             " <span class=\"chip tag\" title=\"acelerador = &quot;{0}&quot; no components.toml: roda sempre neste acelerador\">{0}</span>",

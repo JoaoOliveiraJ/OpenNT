@@ -155,7 +155,7 @@ pub fn page(report: &Report) -> String {
          cargo xtask status     # regenera este site</code></pre>\n\
          <p class=\"small muted\">Precisa de Rust nightly e do QEMU; os binários da Microsoft vêm do Windows da máquina de \
          build e nunca entram no repositório.</p>\n",
-        plural(report.tests.iter().filter(|test| !test.covered_by_suite).count() + suites, "execução", "execuções")
+        plural(report.tests.iter().filter(|test| !test.covered_by_suite && test.host.is_none()).count() + suites, "execução", "execuções")
     ));
 
     html(Page {

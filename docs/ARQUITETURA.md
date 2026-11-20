@@ -5752,6 +5752,24 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   reprovar a rodada, e avisa quando passa; `coberto_pela_suite = true` tira
   do padrão um teste cujos marcadores as suítes conferem (roda com `--only`
   ou `--all`).
+  `na_execucao_de = "<id>"` marca um teste com o mesmo boot de outro (as
+  imagens, o kernel, a máquina, o texto das opções de carga e o acelerador,
+  com o prazo dentro do do anfitrião e sem entrada pelo monitor, `--hold`,
+  depurador, desligamento ou parada esperada; `plan::check_hosts` recusa o
+  resto ao carregar). Quando o anfitrião também entra na rodada, o convidado
+  não sobe um QEMU: o anfitrião recebe uma `--expect-any` para cada texto do
+  convidado que ele mesmo não espera (e o `--watch-screen`, se o convidado o
+  tem), e o veredito do convidado sai da serial do anfitrião com a regra do
+  test-boot (`report::derived`: a cadeia em ordem, cada texto depois do
+  anterior, as `--expect-any` em qualquer ponto, e um marcador de falha antes
+  de um texto reprova), com o último texto dentro do prazo do convidado pela
+  hora de chegada no `test-boot.log` do anfitrião. A cadeia do boot do smss
+  até o LogonUI é uma execução (`logonui`, com onze convidados) em vez de
+  doze, e a do `win32k` decide `smss-csrss` e `etw-user`: os marcadores
+  dessas cadeias não têm ordem fixa entre si (o `DWM_STARTED` sai antes ou
+  depois do `LOGONUI_STARTED`), por isso cada convidado guarda a própria
+  cadeia em vez de uma lista ordenada única. Com `--only` só do convidado, ou
+  sendo `espera_falha`, ou no `capturas`, ele sobe o próprio QEMU.
   `--cpu-friendly` baixa a prioridade do test-all para BELOW_NORMAL e tira as
   4 CPUs lógicas de número mais baixo da afinidade dele (kernel32, sem
   crate); o cargo, o rustc e o QEMU herdam as duas.

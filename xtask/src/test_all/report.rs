@@ -55,6 +55,56 @@ pub struct Outcome {
     pub log: String,
     /// O comando que repete o QEMU na mesma imagem.
     pub repeat_command: String,
+    /// O anfitrião de um teste conferido na serial dele (`na_execucao_de`).
+    pub host: Option<String>,
+}
+
+/// O veredito de um teste na serial de outra execução do mesmo boot (o
+/// anfitrião, `na_execucao_de`), com a regra do `test-boot`: os textos da
+/// `chain` (o marcador e as `--expect`) em ordem, cada um depois do
+/// anterior, e os `unordered` (as `--expect-any`) em qualquer ponto; um
+/// marcador de falha antes de um texto reprova, como na espera do
+/// test-boot. Devolve o motivo de uma falha.
+pub fn derived(serial: &str, chain: &[String], unordered: &[String]) -> Result<(), String> {
+    let failure = |from: usize, end: usize| FAILURE_MARKERS.iter().find(|marker| serial[from..end].contains(*marker));
+    let mut from = 0;
+    let mut previous: Option<&str> = None;
+    for needle in chain {
+        let Some(offset) = serial[from..].find(needle.as_str()) else {
+            if let Some(marker) = failure(from, serial.len()) {
+                return Err(format!("falha detectada na serial: {marker}"));
+            }
+            return Err(match previous {
+                Some(previous) => format!("{needle:?} nao aparece na serial do anfitriao depois de {previous:?}"),
+                None => format!("{needle:?} nao aparece na serial do anfitriao"),
+            });
+        };
+        let end = from + offset + needle.len();
+        if let Some(marker) = failure(from, end) {
+            return Err(format!("falha detectada na serial antes de {needle:?}: {marker}"));
+        }
+        (from, previous) = (end, Some(needle.as_str()));
+    }
+    for needle in unordered {
+        let Some(offset) = serial.find(needle.as_str()) else {
+            return Err(format!("{needle:?} nao aparece na serial do anfitriao"));
+        };
+        if let Some(marker) = failure(0, offset + needle.len()) {
+            return Err(format!("falha detectada na serial antes de {needle:?}: {marker}"));
+        }
+    }
+    Ok(())
+}
+
+/// Quando `needle` chegou na execução do anfitrião, pela linha
+/// `[xtask] "<texto>" aos N s` que o test-boot escreve ao achar cada texto
+/// que espera (contado da subida do QEMU; numa `--expect-any`, quando a
+/// espera chegou a ele, um limite de cima).
+pub fn arrival(console: &str, needle: &str) -> Option<Duration> {
+    let prefix = format!("[xtask] {needle:?} aos ");
+    let line = console.lines().find_map(|line| line.strip_prefix(prefix.as_str()))?;
+    let seconds: f64 = line.strip_suffix(" s")?.trim().parse().ok()?;
+    Duration::try_from_secs_f64(seconds).ok()
 }
 
 /// `1h02m`, `6m40s`, `47s`.
@@ -146,8 +196,9 @@ pub fn summary(outcomes: &[Outcome], total: Duration) -> usize {
     println!("  {:<width$}  {:<verdict_width$}  {:>6}  {:>6}  serial", "teste", "resultado", "build", "tempo");
     for outcome in outcomes {
         let log = if outcome.verdict.passed() { "" } else { outcome.log.as_str() };
+        let host = outcome.host.as_ref().map(|host| format!("(na execucao de {host})  ")).unwrap_or_default();
         let line = format!(
-            "  {:<width$}  {:<verdict_width$}  {:>6}  {:>6}  {log}",
+            "  {:<width$}  {:<verdict_width$}  {:>6}  {:>6}  {host}{log}",
             outcome.name,
             outcome.verdict.label(),
             time(outcome.build),

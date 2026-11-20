@@ -1,7 +1,7 @@
 //! Testes do `test-all`: a leitura dos comandos do `components.toml`, a
 //! seleção e o trecho mostrado de uma falha.
 
-use super::plan::{self, split_words, Extras, Suites};
+use super::plan::{self, split_words, Extras, Suites, Test};
 use super::report;
 
 #[test]
@@ -35,7 +35,8 @@ fn every_components_test_is_a_valid_test_boot() {
     assert_eq!(only.len(), 1);
     assert!(plan::select(&tests, &[String::from("nao-existe")], &[], Suites::Included, Extras::default()).is_err());
     // As duas suítes dividem as imagens.
-    let runs = plan::runs(&tests, &plan::select(&tests, &[], &[], Suites::Only, Extras::default()).unwrap(), 2);
+    let suites = plan::select(&tests, &[], &[], Suites::Only, Extras::default()).unwrap();
+    let runs = plan::runs(&tests, &suites, &vec![Vec::new(); suites.len()], 2);
     let names: Vec<&str> = runs.iter().map(|run| run.name.as_str()).collect();
     assert_eq!(names, ["suite-smp4.1", "suite-smp4.2", "suite-smp1.1", "suite-smp1.2"]);
     assert!(runs.iter().all(|run| run.image == 0));
@@ -50,7 +51,10 @@ fn every_components_test_is_a_valid_test_boot() {
 fn the_whole_round_compiles_one_kernel() {
     let tests = plan::load(&crate::build::workspace_root()).unwrap();
     let all: Vec<String> = tests.iter().map(|test| test.id.clone()).collect();
-    let runs = plan::runs(&tests, &plan::select(&tests, &all, &[], Suites::Included, Extras::default()).unwrap(), 1);
+    let chosen = plan::select(&tests, &all, &[], Suites::Included, Extras::default()).unwrap();
+    let (booted, guests) = plan::split_guests(&tests, &chosen, true);
+    assert_eq!(booted, chosen, "no capturas cada teste sobe o proprio QEMU");
+    let runs = plan::runs(&tests, &booted, &guests, 1);
     let mut kernels: Vec<&str> = runs.iter().map(|run| tests[run.test].kernel_key.as_str()).collect();
     kernels.dedup();
     assert_eq!(kernels.len(), 1, "builds do kernel diferentes na rodada");
@@ -107,4 +111,83 @@ fn a_qemu_killed_from_outside_is_told_apart_from_a_real_failure() {
     assert!(!report::qemu_killed(by_itself, ""));
     let failure = "TEST-BOOT FALHOU: falha detectada na serial: *** PANIC (serial em s)\n";
     assert!(!report::qemu_killed(failure, "*** PANIC\n"));
+}
+
+/// Um teste da rodada como o `components.toml` o daria.
+fn test(id: &str, command: &str, host: Option<&str>, expected_failure: bool) -> Test {
+    let arguments = split_words(command).unwrap();
+    Test::new(id, arguments, false, expected_failure, false, None, host.map(String::from)).unwrap()
+}
+
+/// Os convidados (`na_execucao_de`) saem das execuções quando o anfitrião
+/// entra na rodada e vão para a execução dele, que espera também os textos
+/// deles; com `--only` só do convidado, como num `espera_falha` e no
+/// `capturas`, ele sobe o próprio QEMU.
+#[test]
+fn guests_run_inside_the_host_when_both_are_chosen() {
+    let chain = "USER_INITIALIZED 900000 --initial-process=smss --display=basic --smp=1";
+    let tests = vec![
+        test("anfitriao", &format!("{chain} --expect=SESSION1_CONNECTED --expect=LOGONUI_STARTED"), None, false),
+        test("pixel", "FIRST_PIXEL_OK 600000 --initial-process=smss --display=basic --smp=1 --watch-screen", Some("anfitriao"), false),
+        test("dwm", &format!("{chain} --expect=SESSION1_CONNECTED --expect=DWM_STARTED"), Some("anfitriao"), false),
+        test("conhecida", &format!("{chain} --expect=USER_LOGON_OK"), Some("anfitriao"), true),
+    ];
+    plan::check_hosts(&tests).unwrap();
+    let all = [0, 1, 2, 3];
+    let (booted, guests) = plan::split_guests(&tests, &all, false);
+    assert_eq!(booted, [0, 3], "o espera_falha roda sozinho");
+    assert_eq!(guests, [vec![1, 2], vec![]]);
+    // Os textos que o anfitrião já espera não se repetem.
+    assert_eq!(plan::host_arguments(&tests, 0, &guests[0]), ["--expect-any=FIRST_PIXEL_OK", "--expect-any=DWM_STARTED", "--watch-screen"]);
+    let runs = plan::runs(&tests, &booted, &guests, 2);
+    let names: Vec<(&str, Vec<&str>)> = runs.iter().map(|run| (run.name.as_str(), run.guests.iter().map(|(_, name)| name.as_str()).collect())).collect();
+    assert_eq!(names, [("anfitriao.1", vec!["pixel.1", "dwm.1"]), ("anfitriao.2", vec!["pixel.2", "dwm.2"]), ("conhecida.1", vec![]), ("conhecida.2", vec![])]);
+    assert!(runs[0].extra.contains(&String::from("--watch-screen")));
+    // Só o convidado, ou o capturas: QEMU próprio.
+    assert_eq!(plan::split_guests(&tests, &[2], false), (vec![2], vec![vec![]]));
+    assert_eq!(plan::split_guests(&tests, &[0, 2], true).0, [0, 2]);
+}
+
+/// Um convidado precisa do mesmo boot do anfitrião, sem nada que só valha
+/// num QEMU próprio e com o prazo dentro do dele.
+#[test]
+fn a_guest_must_share_the_whole_boot_of_its_host() {
+    let host = || test("anfitriao", "USER_INITIALIZED 900000 --initial-process=smss --display=basic --smp=1", None, false);
+    let refused = |guest: Test| plan::check_hosts(&[host(), guest]).unwrap_err();
+    assert!(refused(test("g", "X 600000 --initial-process=smss --display=basic --smp=1", Some("outro"), false)).contains("teste desconhecido"));
+    assert!(refused(test("g", "X 600000 --initial-process=smss --display=basic --conta-de-teste --smp=1", Some("anfitriao"), false)).contains("as imagens"));
+    assert!(refused(test("g", "X 600000 --initial-process=smss --smp=1", Some("anfitriao"), false)).contains("o boot difere"));
+    assert!(refused(test("g", "X 600000 --initial-process=smss --display=basic --smp=2", Some("anfitriao"), false)).contains("o boot difere"));
+    assert!(refused(test("g", "X 600000 --initial-process=smss --display=basic --smp=1 --hold=5000", Some("anfitriao"), false)).contains("--hold"));
+    assert!(refused(test("g", "X 600000 --initial-process=smss --display=basic --smp=1 --send=X:a", Some("anfitriao"), false)).contains("--send"));
+    assert!(refused(test("g", "X 1200000 --initial-process=smss --display=basic --smp=1", Some("anfitriao"), false)).contains("prazo"));
+    // A vigia da tela, as telas periódicas e um prazo menor podem diferir.
+    plan::check_hosts(&[host(), test("g", "X 600000 --initial-process=smss --display=basic --smp=1 --watch-screen --capture-every=30", Some("anfitriao"), false)]).unwrap();
+    // O anfitrião não é convidado de outro.
+    let chained = [host(), test("g", "X 600000 --initial-process=smss --display=basic --smp=1", Some("anfitriao"), false), test("h", "Y 600000 --initial-process=smss --display=basic --smp=1", Some("g"), false)];
+    assert!(plan::check_hosts(&chained).unwrap_err().contains("ja roda na execucao de outro"));
+}
+
+/// O veredito de um convidado na serial do anfitrião: a cadeia em ordem,
+/// as `--expect-any` em qualquer ponto, e um marcador de falha antes de um
+/// texto reprova.
+#[test]
+fn derived_verdicts_follow_the_test_boot_rules() {
+    let words = |list: &[&str]| list.iter().map(|word| word.to_string()).collect::<Vec<_>>();
+    let serial = "boot\nUSER_INITIALIZED\nLSASS_STARTED\nWINSTA0_OK\nWINLOGON_DESKTOPS_OK\nfim\n";
+    assert!(report::derived(serial, &words(&["USER_INITIALIZED", "WINSTA0_OK", "WINLOGON_DESKTOPS_OK"]), &[]).is_ok());
+    let missing = report::derived(serial, &words(&["USER_INITIALIZED", "WINLOGON_DESKTOPS_OK", "WINSTA0_OK"]), &[]).unwrap_err();
+    assert_eq!(missing, "\"WINSTA0_OK\" nao aparece na serial do anfitriao depois de \"WINLOGON_DESKTOPS_OK\"");
+    assert!(report::derived(serial, &words(&["USER_INITIALIZED"]), &words(&["WINLOGON_DESKTOPS_OK", "LSASS_STARTED"])).is_ok());
+    assert!(report::derived(serial, &words(&["USER_INITIALIZED"]), &words(&["DWM_STARTED"])).unwrap_err().contains("DWM_STARTED"));
+    let stopped = "USER_INITIALIZED\n*** STOP (KeBugCheckEx): 0x0000001e\nWINSTA0_OK\n";
+    let failure = report::derived(stopped, &words(&["USER_INITIALIZED", "WINSTA0_OK"]), &[]).unwrap_err();
+    assert!(failure.starts_with("falha detectada na serial antes de \"WINSTA0_OK\": *** STOP"), "{failure}");
+    assert!(report::derived(stopped, &words(&["USER_INITIALIZED"]), &words(&["WINSTA0_OK"])).unwrap_err().contains("*** STOP"));
+    // Uma falha depois do último texto do convidado não é dele.
+    assert!(report::derived(stopped, &words(&["USER_INITIALIZED"]), &[]).is_ok());
+    let console = "x\n[xtask] \"LOGONUI_STARTED\" aos 45.3 s\n[xtask] \"esquema \\\"x\\\"\" aos 7.0 s\n";
+    assert_eq!(report::arrival(console, "LOGONUI_STARTED"), Some(std::time::Duration::from_millis(45_300)));
+    assert_eq!(report::arrival(console, "esquema \"x\""), Some(std::time::Duration::from_secs(7)));
+    assert_eq!(report::arrival(console, "DWM_STARTED"), None);
 }

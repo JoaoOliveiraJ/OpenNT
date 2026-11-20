@@ -31,6 +31,15 @@
 //! rodada. `coberto_pela_suite = true` marca um teste cujos marcadores as
 //! suítes já conferem (roda com `--all` ou `--only`).
 //!
+//! `na_execucao_de = "<id>"` marca um teste com o mesmo boot de outro (o
+//! anfitrião): quando os dois entram na rodada, o convidado não sobe um
+//! QEMU. O anfitrião recebe uma `--expect-any` para cada texto do convidado
+//! (e o `--watch-screen`, se o convidado o tem), e o veredito do convidado
+//! sai da serial do anfitrião, com a cadeia dele em ordem e a regra dos
+//! marcadores de falha do test-boot (`report::derived`), e com o último
+//! texto dentro do prazo dele. Com `--only` só do convidado, como num
+//! `espera_falha` e no `capturas`, ele sobe o próprio QEMU.
+//!
 //! Um build ou um QEMU morto de fora (o dono da máquina fecha o rustc e os
 //! QEMUs quando o PC fica lento) não é falha: o build sem diagnóstico e o
 //! QEMU que saiu com erro antes da saída esperada, sem marcador de falha na
@@ -214,6 +223,9 @@ impl Console {
 struct Context {
     tests: Vec<Test>,
     runs: Vec<Run>,
+    /// Cada resultado da rodada, na ordem da tabela: o nome (o da execução
+    /// ou o de um convidado dela), o teste e a pasta de imagens.
+    results: Vec<(String, usize, usize)>,
     root: PathBuf,
     executable: PathBuf,
     keep: bool,
@@ -262,11 +274,11 @@ impl Context {
 
     /// Um `test-boot` do próprio xtask (sem passar de novo pelo cargo); com
     /// `images`, sobre as imagens montadas daquela pasta.
-    fn test_boot(&self, test: &Test, directory: &Path, stage: &str, log: &Path, images: Option<&Path>) -> Result<Child, String> {
+    fn test_boot(&self, test: &Test, extra: &[String], directory: &Path, stage: &str, log: &Path, images: Option<&Path>) -> Result<Child, String> {
         let file = File::create(log).map_err(|error| format!("{}: {error}", log.display()))?;
         let errors = file.try_clone().map_err(|error| format!("{}: {error}", log.display()))?;
         let mut command = Command::new(&self.executable);
-        command.arg("test-boot").args(&test.arguments).arg(format!("--build-dir={}", directory.display())).arg(stage);
+        command.arg("test-boot").args(&test.arguments).args(extra).arg(format!("--build-dir={}", directory.display())).arg(stage);
         if let Some(images) = images {
             command.arg(format!("--image-dir={}", images.display()));
             command.arg(format!("--accel={}", self.accelerator(test)));
@@ -340,7 +352,7 @@ fn build_images_retrying(context: &Context, image: usize, test: &Test) -> Result
 fn build_images(context: &Context, image: usize, test: &Test) -> Result<(), String> {
     let directory = context.image_directory(image);
     fresh_directory(&directory)?;
-    let mut child = context.test_boot(test, &directory, "--build-only", &directory.join("build.log"), None)?;
+    let mut child = context.test_boot(test, &[], &directory, "--build-only", &directory.join("build.log"), None)?;
     let status = child.wait().map_err(|error| error.to_string())?;
     if status.success() {
         Ok(())
@@ -407,7 +419,7 @@ fn execute(context: &Context, run: &Run, test: &Test, build: Duration) -> Result
         wait_for_memory(context, run, test, &mut recent);
         let width = context.width;
         context.console.say(&format!("{:<14} {:<width$}  (build {})", "rodando", run.name, report::duration(build)));
-        let child = context.test_boot(test, &directory, "--no-build", &directory.join("test-boot.log"), Some(&images))?;
+        let child = context.test_boot(test, &run.extra, &directory, "--no-build", &directory.join("test-boot.log"), Some(&images))?;
         let started = Instant::now();
         context.running.fetch_add(1, Ordering::SeqCst);
         recent.push((started, test.memory));
@@ -487,34 +499,89 @@ fn lane(context: &Context, ready: &Mutex<Receiver<Prepared>>, outcomes: &Mutex<V
                 }
             }
         };
-        let verdict = match (passed, test.expected_failure) {
-            (true, false) => Verdict::Passed,
-            (false, false) => Verdict::Failed,
-            (false, true) => Verdict::ExpectedFailure,
-            (true, true) => Verdict::UnexpectedPass,
+        let verdict = verdict_of(passed, test.expected_failure);
+        let repeat_flags = format!("--no-build --image-dir={} --accel={}", Context::image_relative(run.image), context.accelerator(test));
+        let repeat_command = match build {
+            Some(_) => test.command_line(&format!("{OUTPUT_DIR}/{}", run.name), [plan::quoted(&run.extra), repeat_flags.clone()].join(" ").trim()),
+            None => String::new(),
         };
-        if verdict.passed() && !context.keep {
+        let mut results = vec![Outcome { name: run.name.clone(), verdict, build, test: time, reason, excerpt, log: log.clone(), repeat_command, host: None }];
+        results.extend(guest_outcomes(context, run, build.is_some(), time, &log, &repeat_flags));
+        // A pasta do anfitrião fica enquanto um convidado que falhou aponta
+        // para a serial dele.
+        if results.iter().all(|outcome| outcome.verdict.passed()) && !context.keep {
             let _ = fs::remove_dir_all(&directory);
         }
         let mut outcomes = outcomes.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let shown = if verdict.passed() { String::new() } else { format!("  {log}") };
-        context.console.say(&format!(
-            "{:<14} {:<width$}  {}{shown}  ({}/{})",
-            verdict.label(),
-            run.name,
-            time.map(report::duration).unwrap_or_else(|| String::from("-")),
-            outcomes.len() + 1,
-            context.runs.len()
-        ));
-        let repeat_command = match build {
-            Some(_) => test.command_line(
-                &format!("{OUTPUT_DIR}/{}", run.name),
-                &format!("--no-build --image-dir={} --accel={}", Context::image_relative(run.image), context.accelerator(test)),
-            ),
-            None => String::new(),
-        };
-        outcomes.push(Outcome { name: run.name.clone(), verdict, build, test: time, reason, excerpt, log, repeat_command });
+        for outcome in results {
+            let shown = if outcome.verdict.passed() { String::new() } else { format!("  {}", outcome.log) };
+            let host = outcome.host.as_ref().map(|host| format!("  (na execucao de {host})")).unwrap_or_default();
+            context.console.say(&format!(
+                "{:<14} {:<width$}  {}{host}{shown}  ({}/{})",
+                outcome.verdict.label(),
+                outcome.name,
+                outcome.test.map(report::duration).unwrap_or_else(|| String::from("-")),
+                outcomes.len() + 1,
+                context.results.len()
+            ));
+            outcomes.push(outcome);
+        }
     }
+}
+
+fn verdict_of(passed: bool, expected_failure: bool) -> Verdict {
+    match (passed, expected_failure) {
+        (true, false) => Verdict::Passed,
+        (false, false) => Verdict::Failed,
+        (false, true) => Verdict::ExpectedFailure,
+        (true, true) => Verdict::UnexpectedPass,
+    }
+}
+
+/// Os resultados dos convidados de `run` ([`plan::split_guests`]), da serial
+/// do anfitrião (`log`, relativo à raiz; `booted`: o QEMU dele subiu): a
+/// cadeia de cada um ([`report::derived`]) e o último texto dele dentro do
+/// prazo dele, pela hora em que o anfitrião o achou ([`report::arrival`];
+/// sem ela, o tempo inteiro do anfitrião, `host_time`). O tempo de cada um
+/// é o do último texto dele.
+fn guest_outcomes(context: &Context, run: &Run, booted: bool, host_time: Option<Duration>, log: &str, repeat_flags: &str) -> Vec<Outcome> {
+    let host = &context.tests[run.test];
+    let directory = context.directory(run);
+    let console = report::read_lossy(&directory.join("test-boot.log")).unwrap_or_default();
+    let serial = report::read_lossy(&directory.join("serial.log")).unwrap_or_else(|| console.clone());
+    run.guests
+        .iter()
+        .map(|(index, name)| {
+            let guest = &context.tests[*index];
+            let arrived = guest.needles().map(|needle| report::arrival(&console, needle)).collect::<Option<Vec<Duration>>>().and_then(|times| times.into_iter().max());
+            let time = arrived.or(host_time);
+            let verdict = if !booted {
+                Err(format!("o build das imagens do anfitriao {} falhou", host.id))
+            } else {
+                report::derived(&serial, &guest.chain, &guest.unordered).and_then(|()| match time {
+                    Some(time) if time > guest.timeout => Err(format!(
+                        "o ultimo texto do teste chegou aos {} na execucao de {}, depois do prazo de {} dele",
+                        report::duration(time),
+                        host.id,
+                        report::duration(guest.timeout)
+                    )),
+                    _ => Ok(()),
+                })
+            };
+            let passed = verdict.is_ok();
+            Outcome {
+                name: name.clone(),
+                verdict: verdict_of(passed, guest.expected_failure),
+                build: None,
+                test: time,
+                reason: verdict.err().unwrap_or_default(),
+                excerpt: if passed { Vec::new() } else { report::serial_excerpt(&serial) },
+                log: log.to_string(),
+                repeat_command: guest.command_line(&format!("{OUTPUT_DIR}/{name}"), repeat_flags),
+                host: Some(host.id.clone()),
+            }
+        })
+        .collect()
 }
 
 fn list(context: &Context, chosen: &[usize]) {
@@ -522,18 +589,29 @@ fn list(context: &Context, chosen: &[usize]) {
         let mark = if chosen.contains(&index) { "x" } else { " " };
         let mut notes = Vec::new();
         if test.expected_failure {
-            notes.push("espera falha");
+            notes.push(String::from("espera falha"));
         }
         if test.covered_by_suite {
-            notes.push("coberto pela suite");
+            notes.push(String::from("coberto pela suite"));
         }
-        let accelerator = format!("acelerador {}", context.accelerator(test));
-        notes.push(&accelerator);
+        let host = context.runs.iter().find(|run| run.guests.iter().any(|(guest, _)| *guest == index));
+        if let Some(run) = host {
+            notes.push(format!("na execucao de {}", context.tests[run.test].id));
+        }
+        notes.push(format!("acelerador {}", context.accelerator(test)));
         let notes = format!(" ({})", notes.join(", "));
         println!("[{mark}] {}{notes}", test.id);
-        println!("      {}", test.command_line(&format!("{OUTPUT_DIR}/{}", test.id), ""));
+        if host.is_none() {
+            let extra = context.runs.iter().find(|run| run.test == index).map(|run| plan::quoted(&run.extra)).unwrap_or_default();
+            println!("      {}", test.command_line(&format!("{OUTPUT_DIR}/{}", test.id), &extra));
+        }
     }
-    println!("{} de {} testes selecionados ([x])", chosen.len(), context.tests.len());
+    println!(
+        "{} de {} testes selecionados ([x]), {} com QEMU proprio",
+        chosen.len(),
+        context.tests.len(),
+        context.runs.iter().map(|run| run.test).collect::<std::collections::BTreeSet<_>>().len()
+    );
 }
 
 pub fn run(arguments: &[String]) -> Result<(), String> {
@@ -558,8 +636,13 @@ fn run_with(mut options: Options, capture: bool) -> Result<(), String> {
     if capture && chosen.iter().any(|&index| tests[index].suite) {
         return Err("as suites nao tem captura: escolha ids de [[teste]]".into());
     }
-    let runs = plan::runs(&tests, &chosen, options.repeat);
-    let width = runs.iter().map(|run| run.name.len()).max().unwrap_or(0);
+    let (booted, guests) = plan::split_guests(&tests, &chosen, capture);
+    let runs = plan::runs(&tests, &booted, &guests, options.repeat);
+    let results: Vec<(String, usize, usize)> = runs
+        .iter()
+        .flat_map(|run| std::iter::once((run.name.clone(), run.test, run.image)).chain(run.guests.iter().map(|(guest, name)| (name.clone(), *guest, run.image))))
+        .collect();
+    let width = results.iter().map(|(name, _, _)| name.len()).max().unwrap_or(0);
     let executable = std::env::current_exe().map_err(|error| format!("executavel do xtask: {error}"))?;
     // Detectado uma vez para a rodada: cada test-boot recebe o --accel dele.
     let detected = crate::qemu::detect_accelerator()?;
@@ -575,6 +658,7 @@ fn run_with(mut options: Options, capture: bool) -> Result<(), String> {
     let context = Context {
         tests,
         runs,
+        results,
         root,
         executable,
         keep: options.keep,
@@ -609,9 +693,11 @@ fn run_with(mut options: Options, capture: bool) -> Result<(), String> {
         keys.dedup();
         keys.len()
     };
+    let derived = context.results.len() - context.runs.len();
     println!(
-        "test-all: {} execucoes ({} {} do kernel, {} {} de imagens) em {jobs} pistas; pastas em {OUTPUT_DIR}/",
+        "test-all: {} execucoes{} ({} {} do kernel, {} {} de imagens) em {jobs} pistas; pastas em {OUTPUT_DIR}/",
         context.runs.len(),
+        if derived > 0 { format!(" e {derived} testes conferidos na serial de outra (na_execucao_de)") } else { String::new() },
         kernels,
         if kernels == 1 { "build" } else { "builds" },
         context.image_count(),
@@ -657,16 +743,16 @@ fn run_with(mut options: Options, capture: bool) -> Result<(), String> {
     // A tabela na ordem da lista (as suítes e depois o components.toml).
     let mut outcomes = outcomes.into_inner().unwrap_or_else(|poisoned| poisoned.into_inner());
     let order = |name: &str| {
-        let position = context.runs.iter().position(|run| run.name == name).unwrap_or(usize::MAX);
-        (context.runs.get(position).map_or(usize::MAX, |run| run.test), position)
+        let position = context.results.iter().position(|(result, _, _)| result == name).unwrap_or(usize::MAX);
+        (context.results.get(position).map_or(usize::MAX, |(_, test, _)| *test), position)
     };
     outcomes.sort_by_key(|outcome| order(&outcome.name));
-    // As imagens de quem passou saem; as de uma falha ficam para o comando
-    // que repete o QEMU.
+    // As imagens de quem passou saem; as de uma falha (também a de um
+    // convidado) ficam para o comando que repete o QEMU.
     if !context.keep {
         for image in 0..context.image_count() {
             let failed = outcomes.iter().any(|outcome| {
-                !outcome.verdict.passed() && context.runs.iter().any(|run| run.name == outcome.name && run.image == image)
+                !outcome.verdict.passed() && context.results.iter().any(|(name, _, at)| *name == outcome.name && *at == image)
             });
             if !failed {
                 let _ = fs::remove_dir_all(context.image_directory(image));

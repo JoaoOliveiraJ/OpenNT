@@ -161,6 +161,8 @@ pub struct TestRow {
     pub covered_by_suite: bool,
     /// `acelerador = "tcg"`: o acelerador fixado do teste.
     pub accelerator: Option<String>,
+    /// `na_execucao_de = "<id>"`: o teste é conferido na serial daquele.
+    pub host: Option<String>,
     /// Arquivo das fontes Rust em que o marcador aparece.
     pub location: Option<String>,
     pub capture: Option<Capture>,
@@ -389,6 +391,7 @@ fn test_rows(document: &toml::Document, root: &Path, rust: &[(String, String)], 
             expected_failure,
             covered_by_suite: flag(entry, "coberto_pela_suite"),
             accelerator: entry.string("acelerador").map(String::from),
+            host: entry.string("na_execucao_de").map(String::from),
             location,
             capture,
             marker,
