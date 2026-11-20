@@ -817,6 +817,35 @@ fn ntfs_writer(assert: Assert) {
     assert(volume.remove("/DIR/A.TXT").is_ok() && volume.remove("/DIR").is_ok() && volume.remove("/RENOMEADO.TXT").is_ok(), "ntfswrite: remocoes");
     let fresh = ntfs::mount(1);
     assert(fresh.as_ref().is_ok_and(|fresh| boot_root(&names(fresh, "/")) && matches!(fresh.read("/HELLO.TXT"), Ok(Some(text)) if text == "Ola do NTFS no OpenNT!\r\n")) && volume.space().is_ok_and(|space| space.free_clusters == initial), "ntfswrite: volume de volta ao estado inicial");
+    // Os bitmaps de alocação numa transação: ela guarda só os setores que
+    // muda; o commit grava todos eles no disco (a montagem nova lê o
+    // $Bitmap de lá) e um aborto, mesmo no meio de uma alocação ou numa
+    // transação aninhada, não deixa bit algum.
+    let free_of = |volume: &ntfs::Ntfs| volume.space().map(|space| space.free_clusters).unwrap_or(0);
+    let on_disk = || ntfs::mount(1).map(|fresh| free_of(&fresh)).unwrap_or(u64::MAX);
+    let cluster = volume.geometry.cluster_size;
+    let free = free_of(&volume);
+    assert(
+        volume.create("/RESERVA.TMP", false, 0, (free + 1) * cluster).is_err_and(|error| error.status == 0xC000_007F) && matches!(volume.exists("/RESERVA.TMP"), Ok(false)) && free_of(&volume) == free && on_disk() == free,
+        "ntfswrite: a criacao com reserva maior que o espaco livre aborta inteira (registro MFT, indice e clusters)",
+    );
+    // Três setores do $Bitmap e mais um pouco: a reserva vem da transação
+    // aninhada do create e usa o registro MFT que o aborto devolveu.
+    let large = volume.geometry.sector_size * 8 * 3 + 100;
+    let reserved = volume.create("/RESERVA.TMP", false, 0, large * cluster);
+    let after_reserve = free_of(&volume);
+    assert(
+        matches!(&reserved, Ok(Some(stat)) if stat.reference == first_free) && after_reserve <= free - large && on_disk() == after_reserve,
+        "ntfswrite: reserva grande numa transacao aninhada, gravada inteira no $Bitmap do disco",
+    );
+    assert(
+        volume.resize("/RESERVA.TMP", (after_reserve + large + 1) * cluster).is_err_and(|error| error.status == 0xC000_007F)
+            && free_of(&volume) == after_reserve
+            && on_disk() == after_reserve
+            && volume.stat("/RESERVA.TMP").is_ok_and(|stat| stat.is_some_and(|stat| stat.size == 0 && stat.allocated == large * cluster)),
+        "ntfswrite: a alocacao que esgota o volume aborta no meio e o $Bitmap fica como estava",
+    );
+    assert(volume.remove("/RESERVA.TMP").is_ok() && free_of(&volume) == free && on_disk() == free, "ntfswrite: a remocao devolve os clusters da reserva, no disco tambem");
 }
 
 static FILTER_SEEN: [core::sync::atomic::AtomicU64; 5] = [const { core::sync::atomic::AtomicU64::new(0) }; 5];

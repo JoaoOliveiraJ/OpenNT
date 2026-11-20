@@ -5,6 +5,7 @@
 //! operação de vários setores. Uma falha de E/S envenena este writer até a
 //! remontagem.
 
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -17,7 +18,7 @@ use crate::drivers::storage::ata_pio;
 use crate::ntos::ke::clock;
 use crate::rtl::{KernelError, SpinLock};
 
-#[derive(Clone)]
+/// Os bitmaps de alocação gravados no volume, como o último commit os deixou.
 struct Allocation {
     bits: Vec<u8>,
     records: Vec<u8>,
@@ -29,12 +30,84 @@ struct Allocation {
     bitmap_runs: Vec<Run>,
 }
 
+/// As cópias dos setores de um bitmap de alocação (o $Bitmap ou o $BITMAP
+/// do $MFT) que a transação mudou, pelo índice do setor no stream do
+/// bitmap. As leituras da transação passam por elas; o commit grava no disco
+/// as que diferem do bitmap e só depois as aplica a ele, e um aborto apenas
+/// as descarta. O bitmap inteiro nunca é copiado: uma transação custa os
+/// setores que tocou.
+#[derive(Default)]
+struct StagedBitmap(BTreeMap<usize, Vec<u8>>);
+
+impl StagedBitmap {
+    /// Os setores que diferem do bitmap gravado, em ordem crescente: o offset
+    /// no stream e os bytes novos. Um setor mudado e desfeito não volta.
+    fn changed(&self, committed: &[u8], sector: usize) -> Vec<(usize, Vec<u8>)> {
+        self.0
+            .iter()
+            .filter(|(&index, copy)| committed[index * sector..index * sector + copy.len()] != copy[..])
+            .map(|(&index, copy)| (index * sector, copy.clone()))
+            .collect()
+    }
+
+    fn apply(self, committed: &mut [u8], sector: usize) {
+        for (index, copy) in self.0 {
+            committed[index * sector..index * sector + copy.len()].copy_from_slice(&copy);
+        }
+    }
+}
+
+/// Um bitmap de alocação visto pela transação: o gravado com os setores
+/// dela por cima.
+struct BitmapView<'a> {
+    committed: &'a [u8],
+    staged: &'a mut StagedBitmap,
+    sector: usize,
+}
+
+impl BitmapView<'_> {
+    fn byte(&self, index: usize) -> u8 {
+        match self.staged.0.get(&(index / self.sector)) {
+            Some(copy) => copy[index % self.sector],
+            None => self.committed[index],
+        }
+    }
+
+    fn get(&self, index: u64) -> bool {
+        self.byte((index >> 3) as usize) & (1 << (index & 7)) != 0
+    }
+
+    fn set(&mut self, index: u64, value: bool) -> Result<(), KernelError> {
+        if index >= self.committed.len() as u64 * 8 {
+            return fail(0xC000_0032, "bitmap fora dos limites");
+        }
+        let byte = (index >> 3) as usize;
+        let start = byte / self.sector * self.sector;
+        let committed = self.committed;
+        let copy = self.staged.0.entry(byte / self.sector).or_insert_with(|| committed[start..(start + self.sector).min(committed.len())].to_vec());
+        let mask = 1u8 << (index & 7);
+        if value {
+            copy[byte - start] |= mask;
+        } else {
+            copy[byte - start] &= !mask;
+        }
+        Ok(())
+    }
+}
+
+/// O que uma transação mudou nos dois bitmaps de alocação.
+#[derive(Default)]
+struct Changes {
+    clusters: StagedBitmap,
+    records: StagedBitmap,
+}
+
 /// Estado do writer de um volume montado.
 #[derive(Default)]
 pub struct WriterState {
     allocation: Option<Allocation>,
     allocation_generation: Option<u64>,
-    tx: Option<Allocation>,
+    tx: Option<Changes>,
     poisoned: bool,
 }
 
@@ -256,8 +329,22 @@ impl Tx<'_> {
         self.volume.geometry.sector_size
     }
 
-    fn tx(&mut self) -> &mut Allocation {
-        self.state.tx.as_mut().expect("NTFS: transacao ativa")
+    fn allocation(&self) -> &Allocation {
+        self.state.allocation.as_ref().expect("alocacao carregada")
+    }
+
+    /// O $Bitmap pela transação ativa.
+    fn cluster_bitmap(&mut self) -> BitmapView<'_> {
+        let sector = self.sector() as usize;
+        let WriterState { allocation, tx, .. } = &mut *self.state;
+        BitmapView { committed: &allocation.as_ref().expect("alocacao carregada").bits, staged: &mut tx.as_mut().expect("NTFS: transacao ativa").clusters, sector }
+    }
+
+    /// O $BITMAP do $MFT pela transação ativa.
+    fn record_bitmap(&mut self) -> BitmapView<'_> {
+        let sector = self.sector() as usize;
+        let WriterState { allocation, tx, .. } = &mut *self.state;
+        BitmapView { committed: &allocation.as_ref().expect("alocacao carregada").records, staged: &mut tx.as_mut().expect("NTFS: transacao ativa").records, sector }
     }
 
     fn nonresident(&self, attribute_type: u32, runs: &[Run], size: u64, name: &str) -> Vec<u8> {
@@ -391,21 +478,27 @@ impl Tx<'_> {
 
     /// Primeiros clusters livres, em runs.
     fn allocate(&mut self, count: u64) -> Result<Vec<Run>, KernelError> {
-        let tx = self.tx();
-        if count > tx.clusters {
+        let clusters = self.allocation().clusters;
+        if count > clusters {
             return fail(0xC000_007F, "volume cheio");
         }
+        let mut bitmap = self.cluster_bitmap();
         let mut runs = Vec::new();
         let mut remaining = count;
         let mut index = 0;
-        while index < tx.clusters && remaining != 0 {
-            if bit(&tx.bits, index) {
+        while index < clusters && remaining != 0 {
+            // Um byte cheio são oito clusters em uso.
+            if index % 8 == 0 && index + 8 <= clusters && bitmap.byte((index / 8) as usize) == 0xFF {
+                index += 8;
+                continue;
+            }
+            if bitmap.get(index) {
                 index += 1;
                 continue;
             }
             let first = index;
-            while index < tx.clusters && remaining != 0 && !bit(&tx.bits, index) {
-                set_bit(&mut tx.bits, index, true)?;
+            while index < clusters && remaining != 0 && !bitmap.get(index) {
+                bitmap.set(index, true)?;
                 index += 1;
                 remaining -= 1;
             }
@@ -418,13 +511,13 @@ impl Tx<'_> {
     }
 
     fn release(&mut self, runs: &[Run]) -> Result<(), KernelError> {
-        let tx = self.tx();
+        let mut bitmap = self.cluster_bitmap();
         for run in runs {
             for cluster in run.lcn as u64..run.lcn as u64 + run.count {
-                if !bit(&tx.bits, cluster) {
+                if !bitmap.get(cluster) {
                     return fail(0xC000_0032, "cluster liberado duas vezes");
                 }
-                set_bit(&mut tx.bits, cluster, false)?;
+                bitmap.set(cluster, false)?;
             }
         }
         Ok(())
@@ -475,15 +568,10 @@ impl Tx<'_> {
         Ok(())
     }
 
-    fn persist_bitmap(&mut self, before: &[u8], after: &[u8], runs: &[Run]) -> Result<(), KernelError> {
-        let sector = self.sector() as usize;
-        let mut offset = 0;
-        while offset < after.len() {
-            let end = (offset + sector).min(after.len());
-            if before[offset..end] != after[offset..end] {
-                self.transfer(runs, offset as u64, Some(&after[offset..end]), (end - offset) as u64)?;
-            }
-            offset += sector;
+    /// Grava os setores mudados de um bitmap não residente pela runlist dele.
+    fn persist_bitmap(&mut self, changed: &[(usize, Vec<u8>)], runs: &[Run]) -> Result<(), KernelError> {
+        for (offset, bytes) in changed {
+            self.transfer(runs, *offset as u64, Some(bytes), bytes.len() as u64)?;
         }
         Ok(())
     }
@@ -497,22 +585,32 @@ impl Tx<'_> {
             return fail(0xC000_0185, "volume requer remontagem apos erro de E/S");
         }
         self.load_allocation()?;
-        self.state.tx = self.state.allocation.clone();
+        self.state.tx = Some(Changes::default());
         self.volume.pending.lock().clear();
         self.volume.invalidate();
         let mut committing = false;
         let result: Result<T, KernelError> = (|| {
             let result = action(self)?;
-            let allocation = self.state.allocation.clone().expect("alocacao carregada");
-            let tx = self.state.tx.clone().expect("transacao ativa");
-            self.persist_bitmap(&allocation.bits, &tx.bits, &tx.bitmap_runs)?;
-            if tx.records != allocation.records {
-                if let Some(runs) = &tx.record_runs {
-                    self.persist_bitmap(&allocation.records, &tx.records, runs)?;
+            let sector = self.sector() as usize;
+            let (clusters, records) = {
+                let allocation = self.allocation();
+                let changes = self.state.tx.as_ref().expect("transacao ativa");
+                (changes.clusters.changed(&allocation.bits, sector), changes.records.changed(&allocation.records, sector))
+            };
+            let bitmap_runs = self.allocation().bitmap_runs.clone();
+            self.persist_bitmap(&clusters, &bitmap_runs)?;
+            if !records.is_empty() {
+                if let Some(runs) = self.allocation().record_runs.clone() {
+                    self.persist_bitmap(&records, &runs)?;
                 } else {
+                    // Residente: o valor inteiro do $BITMAP vai no registro 0.
+                    let mut value = self.allocation().records.clone();
+                    for (offset, bytes) in &records {
+                        value[*offset..*offset + bytes.len()].copy_from_slice(bytes);
+                    }
                     let mft = self.volume.read_record(0)?;
                     let mut list = attributes(&mft)?;
-                    replace(&mut list, 0xB0, Some(resident(0xB0, &tx.records, "")));
+                    replace(&mut list, 0xB0, Some(resident(0xB0, &value, "")));
                     self.record(0, &list, 1, Some(&mft), 1)?;
                 }
             }
@@ -540,7 +638,10 @@ impl Tx<'_> {
                 crate::debug_print!("[ntfs] commit: FLUSH CACHE do disco {} falhou com {:#x}: {}", self.volume.drive, error.status, error.message);
                 return Err(error);
             }
-            self.state.allocation = self.state.tx.clone();
+            let changes = self.state.tx.take().expect("transacao ativa");
+            let allocation = self.state.allocation.as_mut().expect("alocacao carregada");
+            changes.clusters.apply(&mut allocation.bits, sector);
+            changes.records.apply(&mut allocation.records, sector);
             self.volume.changed();
             self.state.allocation_generation = Some(self.volume.generation());
             Ok(result)
@@ -1095,7 +1196,7 @@ impl Tx<'_> {
             _ => size,
         };
         let cluster = self.cluster();
-        if reserve > self.tx().clusters * cluster {
+        if reserve > self.allocation().clusters * cluster {
             return fail(0xC000_007F, "volume cheio");
         }
         let mut list = attributes(&record)?;
@@ -1201,7 +1302,7 @@ impl Tx<'_> {
         let parent = parent_of(&name);
         let remaining = self.volume.root_index(parent)?.into_iter().filter(|child| child.reference != entry.reference).collect();
         self.directory(parent, remaining)?;
-        set_bit(&mut self.tx().records, entry.reference, false)?;
+        self.record_bitmap().set(entry.reference, false)?;
         self.record(entry.reference, &[], 0, None, (u16_at(&record, 16) % 65535) + 1)
     }
 
@@ -1213,15 +1314,16 @@ impl Tx<'_> {
             if tx.volume.find(path)?.is_some() {
                 return fail(0xC000_0035, "nome ja existe");
             }
-            let capacity = tx.tx().capacity;
+            let capacity = tx.allocation().capacity;
+            let mut records = tx.record_bitmap();
             let mut reference = 16;
-            while reference < capacity && bit(&tx.tx().records, reference) {
+            while reference < capacity && records.get(reference) {
                 reference += 1;
             }
             if reference == capacity {
                 return fail(0xC000_007F, "reserva MFT esgotada");
             }
-            set_bit(&mut tx.tx().records, reference, true)?;
+            records.set(reference, true)?;
             let geometry = tx.volume.geometry;
             let raw = tx.volume.read_sectors(geometry.mft_lcn * geometry.sectors_per_cluster + reference * geometry.record_size / geometry.sector_size, 1)?;
             let sequence = if u32_at(&raw, 0) == 0x454C_4946 { u16_at(&raw, 16).max(1) } else { 1 };
