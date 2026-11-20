@@ -192,7 +192,12 @@ pub fn summary(outcomes: &[Outcome], total: Duration) -> usize {
     let verdict_width = outcomes.iter().map(|outcome| outcome.verdict.label().len()).max().unwrap_or(0).max(9);
     let time = |time: Option<Duration>| time.map(duration).unwrap_or_else(|| String::from("-"));
     println!();
-    println!("resumo ({} execucoes em {})", outcomes.len(), duration(total));
+    let derived = outcomes.iter().filter(|outcome| outcome.host.is_some()).count();
+    if derived == 0 {
+        println!("resumo ({} execucoes em {})", outcomes.len(), duration(total));
+    } else {
+        println!("resumo ({} testes, {} execucoes com QEMU, em {})", outcomes.len(), outcomes.len() - derived, duration(total));
+    }
     println!("  {:<width$}  {:<verdict_width$}  {:>6}  {:>6}  serial", "teste", "resultado", "build", "tempo");
     for outcome in outcomes {
         let log = if outcome.verdict.passed() { "" } else { outcome.log.as_str() };
