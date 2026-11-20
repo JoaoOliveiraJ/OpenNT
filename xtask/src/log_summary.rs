@@ -204,7 +204,8 @@ fn pid_tid(text: &str) -> Option<(u64, u64, &str)> {
     Some((pid, tid, scan.0))
 }
 
-/// `[usermode] [PID:TID ]NtX FALHOU com S (rip R[, chamador C])[ resto]`.
+/// `[usermode] [PID:TID ]NtX FALHOU com S (rip R[, chamador C])[ resto]`, C
+/// em hexadecimal ou `módulo+deslocamento`.
 struct Fail<'a> {
     pid: Option<u64>,
     tid: Option<u64>,
@@ -227,7 +228,8 @@ fn parse_fail(line: &str) -> Option<Fail<'_>> {
     let status = scan.hex()?;
     scan.lit(" (rip ")?;
     let rip = scan.hex()?;
-    let caller = if scan.lit(", chamador ").is_some() { Some(scan.hex()?) } else { None };
+    // O chamador: `módulo+deslocamento` ou o endereço cru em hexadecimal.
+    let caller = if scan.lit(", chamador ").is_some() { Some(scan.span(|character| character != ')' && !character.is_whitespace())?) } else { None };
     scan.lit(")")?;
     Some(Fail { pid, tid, name, status, rip, caller, detail: scan.0.trim_start() })
 }
@@ -1834,6 +1836,8 @@ mod tests {
         let fail = parse_fail("[usermode] 60:64 NtOpenKey FALHOU com 0xc0000034 (rip 0x18009d7e4, chamador 0x0) [diag-arquivo] \"\\Registry\"").unwrap();
         assert_eq!((fail.pid, fail.tid, fail.name, fail.status, fail.rip, fail.caller), (Some(60), Some(64), "NtOpenKey", "0xc0000034", "0x18009d7e4", Some("0x0")));
         assert_eq!(fail.detail, "[diag-arquivo] \"\\Registry\"");
+        let named = parse_fail("[usermode] 424:800 NtDuplicateObject FALHOU com 0xc0000022 (rip 0x7ffe0a0b14, chamador rpcss.dll+0x9c5ff) negado: dup-upgrade tipo=process").unwrap();
+        assert_eq!((named.caller, named.detail), (Some("rpcss.dll+0x9c5ff"), "negado: dup-upgrade tipo=process"));
         let old = parse_fail("[usermode] NtClose FALHOU com 0xc0000008 (rip 0x1800a0b14)").unwrap();
         assert_eq!((old.pid, old.caller, old.detail), (None, None, ""));
         assert_eq!(marker_token("HELLO_KERNEL_OK"), Some("HELLO_KERNEL_OK"));

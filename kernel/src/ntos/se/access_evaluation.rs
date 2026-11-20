@@ -488,6 +488,7 @@ fn sep_access_check(descriptor: &OwnedDescriptor, subject: &Subject, desired: u3
     let (mut desired, mut previous) = (desired, previous);
     if desired & ACCESS_SYSTEM_SECURITY != 0 {
         if !subject.privileged(SE_SECURITY_PRIVILEGE) {
+            crate::ntos::ps::user::state::note_denial("privilegio", "", desired, 0);
             return Err(STATUS_PRIVILEGE_NOT_HELD);
         }
         desired &= !ACCESS_SYSTEM_SECURITY;

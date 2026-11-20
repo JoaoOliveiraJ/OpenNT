@@ -141,7 +141,7 @@ pub fn nt_create(handle_output: u64, access: u32, attributes: u64, event_type: u
     if crate::ntos::ps::previous_mode::get()? == 0 {
         return create(handle_output, access, attributes, event_type, initial_state);
     }
-    let record = state::SyscallRecord { raw_arguments: 0, stack: Some(state::ServiceStack { rsp: frame, bytes: 8 }) };
+    let record = state::SyscallRecord { raw_arguments: 0, stack: Some(state::ServiceStack { rsp: frame, bytes: 8 }), user_stack: 0 };
     // SAFETY: o quadro da chamada nativa, na pilha de kernel do chamador.
     let return_address = unsafe { Field::<u64>::at(frame) }.get();
     state::with_syscall_record(record, || index::invoke_service("NtCreateEvent", [handle_output, access as u64, attributes, event_type as u64], return_address, frame))

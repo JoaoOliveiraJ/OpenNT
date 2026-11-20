@@ -656,6 +656,7 @@ pub fn reference_handle(handle: u64, desired_access: u32, object_type: u64, acce
         return Ok(Some(0xC000_0024));
     }
     if access_mode != 0 && desired_access & !access != 0 {
+        crate::ntos::ps::user::state::note_denial("handle", &item.object_type.name, desired_access, access);
         return Ok(Some(0xC000_0022));
     }
     item.reference();

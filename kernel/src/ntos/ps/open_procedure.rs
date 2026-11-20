@@ -120,6 +120,7 @@ fn denied_access(opener: u64, target: u64, denied: u32, terminate: u32) -> u32 {
 pub fn process_open(access_mode: u8, opener: u64, target: u64, granted: u32) -> Result<u32, u32> {
     let denied = denied_access(opener, target, signer_entry(protection(target)).1, PROCESS_TERMINATE);
     if granted & denied != 0 && protected_incompatible(access_mode, opener, target) {
+        crate::ntos::ps::user::state::note_denial("protecao", "Process", granted, granted & !denied);
         return Err(STATUS_ACCESS_DENIED);
     }
     // SAFETY: EPROCESS vivo do handle sendo aberto.
@@ -146,6 +147,7 @@ pub fn thread_open(access_mode: u8, opener: u64, thread: u64, granted: u32) -> R
     if target != 0 {
         let denied = denied_access(opener, target, signer_entry(protection(target)).2, THREAD_TERMINATE);
         if granted & denied != 0 && protected_incompatible(access_mode, opener, target) {
+            crate::ntos::ps::user::state::note_denial("protecao", "Thread", granted, granted & !denied);
             return Err(STATUS_ACCESS_DENIED);
         }
     }

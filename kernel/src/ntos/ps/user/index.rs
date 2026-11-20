@@ -128,13 +128,47 @@ fn connect_port_name(name: &str, arguments: &[u64; 4]) -> Option<alloc::string::
     }
 }
 
-/// O retorno do chamador do stub da ntdll (`[rsp]` na entrada do syscall):
-/// o `rip` da linha é sempre o `ret` do próprio stub.
-fn stub_caller(user_rsp: u64) -> u64 {
-    if user_rsp == 0 || !state::probe_user_read(user_rsp, 8) {
-        return 0;
+/// O retorno do chamador do stub da ntdll (`[rsp]` do RSP de modo usuário
+/// salvo na entrada do syscall, não a pilha de argumentos copiada que os
+/// handlers recebem): o `rip` da linha é sempre o `ret` do próprio stub.
+/// Sai como `módulo+deslocamento` quando o endereço cai num módulo.
+fn stub_caller() -> alloc::string::String {
+    let user_stack = state::syscall_record().user_stack;
+    let caller = if user_stack == 0 || !state::probe_user_read(user_stack, 8) { 0 } else { guest::try_read::<u64>(user_stack).unwrap_or(0) };
+    if caller == 0 {
+        return alloc::string::String::from("0x0");
     }
-    guest::try_read::<u64>(user_rsp).unwrap_or(0)
+    super::crash_report::module_offset(caller)
+}
+
+/// Linhas `negado:` já impressas por (pid, serviço, motivo, tipo).
+static DENIAL_LINES: SpinLock<alloc::collections::BTreeMap<(u64, alloc::string::String, &'static str, alloc::string::String), u32>> = SpinLock::new(alloc::collections::BTreeMap::new());
+
+/// O sufixo ` negado: ...` de uma recusa de acesso (STATUS_ACCESS_DENIED ou
+/// STATUS_PRIVILEGE_NOT_HELD) com a checagem que recusou: as 4 primeiras de
+/// cada (pid, serviço, motivo, tipo), depois uma a cada 64.
+fn denial_detail(name: &str, result: u32, denial: Option<state::Denial>) -> alloc::string::String {
+    let Some(denial) = denial.filter(|_| matches!(result, 0xC000_0022 | 0xC000_0061)) else { return alloc::string::String::new() };
+    let key = (process::get_current_process_id(), alloc::string::String::from(name), denial.reason, denial.type_name.clone());
+    let count = {
+        let mut lines = DENIAL_LINES.lock();
+        let count = lines.entry(key).or_insert(0);
+        *count += 1;
+        *count
+    };
+    if count > 4 && count % 64 != 0 {
+        return alloc::string::String::new();
+    }
+    let missing = denial.desired & !denial.granted;
+    alloc::format!(
+        " negado: {} tipo={} pedido={:#x} concedido={:#x} falta={:#x} imagem={}",
+        denial.reason,
+        if denial.type_name.is_empty() { "-" } else { &denial.type_name },
+        denial.desired,
+        denial.granted,
+        missing,
+        super::crash_report::current_image_name()
+    )
 }
 
 /// Despacha ao handler por nome; NOT_FOUND, TIMEOUT, BUFFER_TOO_SMALL e
@@ -157,7 +191,11 @@ pub fn handle_service(name: Option<&str>, arguments: [u64; 4], rip: u64, user_rs
     let port_name = connect_port_name(name, &arguments);
     // O IoControlCode/FsControlCode (sexto argumento) antes da chamada.
     let control_code = if matches!(name, "NtDeviceIoControlFile" | "NtFsControlFile") { Some(state::stack_arg32(user_rsp, 6)) } else { None };
-    let result = handler(arguments[0], arguments[1], arguments[2], arguments[3], user_rsp)?;
+    // A recusa de acesso é anotada por chamada.
+    let _ = state::take_denial();
+    let result = handler(arguments[0], arguments[1], arguments[2], arguments[3], user_rsp);
+    let denial = state::take_denial();
+    let result = result?;
     if crate::ntos::init::boot_config::TRACE_SYSCALLS {
         crate::debug_print!("[sys] {}:{} {}({:#x}, {:#x}, {:#x}, {:#x}) = {:#x} (rip {:#x}){}", crate::ntos::ps::process::get_current_process_id(), crate::ntos::ps::process::get_current_thread_id(), name, arguments[0], arguments[1], arguments[2], arguments[3], result, rip, traced_name.map_or_else(alloc::string::String::new, |path| alloc::format!(" \"{path}\"")));
     }
@@ -170,7 +208,8 @@ pub fn handle_service(name: Option<&str>, arguments: [u64; 4], rip: u64, user_rs
         if let Some(code) = control_code {
             detail = alloc::format!(" codigo {code:#x}");
         }
-        crate::debug_print!("[usermode] {}:{} {} FALHOU com {:#x} (rip {:#x}, chamador {:#x}){}", crate::ntos::ps::process::get_current_process_id(), crate::ntos::ps::process::get_current_thread_id(), name, result, rip, stub_caller(user_rsp), detail);
+        detail.push_str(&denial_detail(name, result, denial));
+        crate::debug_print!("[usermode] {}:{} {} FALHOU com {:#x} (rip {:#x}, chamador {}){}", crate::ntos::ps::process::get_current_process_id(), crate::ntos::ps::process::get_current_thread_id(), name, result, rip, stub_caller(), detail);
     }
     Ok(result)
 }

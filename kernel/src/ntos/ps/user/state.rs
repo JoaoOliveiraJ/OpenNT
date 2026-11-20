@@ -254,13 +254,51 @@ pub fn is_user_process_id(process_id: u64) -> bool {
 pub struct SyscallRecord {
     pub raw_arguments: u64,
     pub stack: Option<ServiceStack>,
+    /// O RSP de modo usuário na entrada do syscall (`[rsp]` é o retorno do
+    /// stub da ntdll ao chamador dele); 0 fora da entrada de syscall.
+    pub user_stack: u64,
 }
 
 impl SyscallRecord {
     /// Só o vetor bruto, sem pilha sondada.
     pub const fn raw(raw_arguments: u64) -> Self {
-        Self { raw_arguments, stack: None }
+        Self { raw_arguments, stack: None, user_stack: 0 }
     }
+}
+
+/// A primeira recusa de acesso do serviço em curso numa thread: qual
+/// checagem recusou, o tipo do objeto, o pedido e o concedido. A linha
+/// FALHOU de um 0xC0000022/0xC0000061 mostra isso.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Denial {
+    pub reason: &'static str,
+    pub type_name: String,
+    pub desired: u32,
+    pub granted: u32,
+}
+
+/// KTHREAD → a primeira recusa do serviço em curso.
+static DENIALS: SpinLock<BTreeMap<u64, Denial>> = SpinLock::new(BTreeMap::new());
+
+/// Anota a recusa `reason` no serviço de usuário em curso na thread
+/// corrente (fora de um serviço, nada); a primeira de cada chamada fica.
+pub fn note_denial(reason: &'static str, type_name: &str, desired: u32, granted: u32) {
+    let thread = process::get_current_thread();
+    if !SYSCALL_RECORDS.lock().contains_key(&thread) {
+        return;
+    }
+    DENIALS.lock().entry(thread).or_insert_with(|| Denial { reason, type_name: String::from(type_name), desired, granted });
+}
+
+/// Tira a recusa anotada na thread corrente (o início e o fim de cada
+/// serviço).
+pub fn take_denial() -> Option<Denial> {
+    let thread = process::get_current_thread();
+    let mut denials = DENIALS.lock();
+    if denials.is_empty() {
+        return None;
+    }
+    denials.remove(&thread)
 }
 
 /// KTHREAD → registro do serviço em curso. A chave é o KTHREAD porque um

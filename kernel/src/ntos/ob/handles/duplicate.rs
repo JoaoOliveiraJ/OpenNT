@@ -141,7 +141,7 @@ pub fn nt_duplicate_object(source_process: u64, source_handle: u64, target_proce
     if crate::ntos::ps::previous_mode::get()? == 0 {
         return duplicate_object(source_process, source_handle, target_process, target_handle, desired, attributes, options);
     }
-    let record = state::SyscallRecord { raw_arguments: 0, stack: Some(state::ServiceStack { rsp: frame, bytes: 3 * 8 }) };
+    let record = state::SyscallRecord { raw_arguments: 0, stack: Some(state::ServiceStack { rsp: frame, bytes: 3 * 8 }), user_stack: 0 };
     // SAFETY: o quadro da chamada nativa, na pilha de kernel do chamador.
     let return_address = unsafe { Field::<u64>::at(frame) }.get();
     state::with_syscall_record(record, || index::invoke_service("NtDuplicateObject", [source_process, source_handle, target_process, target_handle], return_address, frame))

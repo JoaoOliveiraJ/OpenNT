@@ -414,6 +414,22 @@ fn from_service(trigger: Trigger, exception: Exception) {
     report(Crash { trigger, process: process::get_current_process(), thread_id: process::get_current_thread_id(), key: exception.code, exception, start });
 }
 
+/// `módulo+deslocamento` de um endereço de usuário do processo corrente (o
+/// módulo do loader ou uma região nomeada), ou o endereço cru: o chamador
+/// das linhas FALHOU, sem a busca de exports das linhas `[crash]`.
+pub fn module_offset(address: u64) -> String {
+    let mut modules = Modules::of(process::get_current_process());
+    match modules.index(address) {
+        Some(index) => format!("{}+{:#x}", modules.list[index].name, address - modules.list[index].base),
+        None => format!("{address:#x}"),
+    }
+}
+
+/// O último componente do caminho da imagem do processo corrente.
+pub fn current_image_name() -> String {
+    process_state::get(process::get_current_process()).map_or_else(|| String::from("?"), |state| short_name(&state.image_path()))
+}
+
 /// O fim de um processo que rodou, anexado a ele (`create::finish_exit`).
 /// Devolve se o status é de exceção (o bloco foi impresso agora ou antes);
 /// senão quem chama segue com o post-mortem comum.

@@ -4667,10 +4667,17 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   num bloco próprio no ETHREAD.ThreadName), a ProcessSubsystemProcess (68,
   só do processo mestre da sessão) e a ProcessEnergyTrackingState (82,
   STATUS_NOT_SUPPORTED sem o estimador de energia). A linha
-  `[usermode] pid:tid X FALHOU` traz o chamador do stub da ntdll, o nome da
+  `[usermode] pid:tid X FALHOU` traz o chamador do stub da ntdll (o `[rsp]`
+  do RSP de modo usuário que a entrada de syscall guarda na KPCR, como
+  `módulo+deslocamento`), o nome da
   porta nas falhas de conexão ALPC/LPC (inclusive
   STATUS_OBJECT_NAME_NOT_FOUND) e o código das falhas de
-  NtDeviceIoControlFile/NtFsControlFile. O
+  NtDeviceIoControlFile/NtFsControlFile. Um STATUS_ACCESS_DENIED ou
+  STATUS_PRIVILEGE_NOT_HELD acrescenta ` negado: motivo tipo= pedido=
+  concedido= falta= imagem=`: a primeira recusa anotada na chamada
+  (`state::note_denial`: fora do tipo, DACL/integridade, privilégio, acesso
+  do handle, duplicação além da origem, proteção do processo), as quatro
+  primeiras por (pid, serviço, motivo, tipo) e depois uma a cada 64. O
   ProductPolicy do licenciamento é capturado quando a hive SYSTEM é ligada
   (o CmGetSystemControlValues, `cm/hive_init.rs`) e publicado logo depois,
   antes do primeiro driver (`init/phase1.rs`). O NtDeleteWnfStateName de um nome permanente ou persistente

@@ -235,7 +235,7 @@ static SERVICE_ARGUMENTS: [AtomicU8; 4] = [const { AtomicU8::new(0) }; 4];
 /// NtCreateUserProcess) e o registro de serviço da thread.
 fn forward(name: &'static str, arguments: [u64; 4]) -> u64 {
     let rsp = pcr::current().user_rsp.get();
-    let record = state::SyscallRecord { raw_arguments: 0, stack: Some(state::ServiceStack { rsp, bytes: service_abi::stack_arguments(name).unwrap_or(0) as u64 * 8 }) };
+    let record = state::SyscallRecord { raw_arguments: 0, stack: Some(state::ServiceStack { rsp, bytes: service_abi::stack_arguments(name).unwrap_or(0) as u64 * 8 }), user_stack: 0 };
     let result = state::with_syscall_record(record, || index::invoke_service(name, arguments, 0, rsp));
     result.unwrap_or_else(|error| if error.status != 0 { error.status } else { 0xC000_0001 }) as u64
 }

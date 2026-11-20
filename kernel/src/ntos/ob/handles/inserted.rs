@@ -86,9 +86,13 @@ pub fn duplicate_access(object_type: &ObjectType, item: Option<&Described>, sour
         return Ok(Ok(access));
     }
     if source_attributes & HANDLE_NO_RIGHTS_UPGRADE != 0 || !object_security::uses_default_security_method(object_type) {
+        crate::ntos::ps::user::state::note_denial("dup-sem-upgrade", &object_type.name, access, source_access);
         return Ok(Err(STATUS_ACCESS_DENIED));
     }
-    let Some(item) = item else { return Ok(Err(STATUS_ACCESS_DENIED)) };
+    let Some(item) = item else {
+        crate::ntos::ps::user::state::note_denial("dup-upgrade", &object_type.name, access, source_access);
+        return Ok(Err(STATUS_ACCESS_DENIED));
+    };
     if mode == 0 {
         return Ok(Ok(access));
     }

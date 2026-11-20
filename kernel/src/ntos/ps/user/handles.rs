@@ -275,6 +275,7 @@ fn nt_duplicate_object(source_process: u64, source_handle: u64, target_process: 
             None => {
                 let access = if options & 2 != 0 { source_access } else { requested_access };
                 if access & !source_access != 0 {
+                    state::note_denial("dup-upgrade", entry.as_ref().map_or("process", |entry| entry.kind()), access, source_access);
                     return Ok(0xC000_0022);
                 }
                 access
@@ -595,6 +596,7 @@ pub fn process_pointer(handle: u64, access: u32) -> Result<u64, u32> {
         return Err(TYPE_MISMATCH);
     }
     if entry.access() & access != access {
+        state::note_denial("handle", "process", access, entry.access());
         return Err(DENIED);
     }
     entry.downcast::<UserProcess>().map(|object| object.pointer).ok_or(BAD_HANDLE)

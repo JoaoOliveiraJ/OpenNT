@@ -4,6 +4,7 @@
 
 use super::object_types::ObjectType;
 use crate::ntos::ps::process;
+use crate::ntos::ps::user::state;
 use crate::ntos::se::access_evaluation::{self, Subject};
 use crate::ntos::se::model::{sid, Ace, SecurityPolicy};
 use crate::ntos::se::policy_descriptor::{self, OwnedDescriptor};
@@ -63,6 +64,7 @@ pub fn check(policy: &SecurityPolicy, token: Option<u64>, requested: u32, object
         return Ok((explicit & valid) | if mask & 0x0200_0000 != 0 { object_type.valid_access } else { 0 });
     }
     if explicit & !valid != 0 {
+        state::note_denial("fora-do-tipo", &object_type.name, mask, 0);
         return Err(0xC000_0022);
     }
     let Some(token) = token.and_then(tokens::get) else { return Err(0xC000_007C) };
@@ -88,9 +90,10 @@ pub fn check_token(policy: &SecurityPolicy, token: &tokens::Token, requested: u3
     let mask = map_generic_access(requested, object_type);
     let explicit = mask & !0x0200_0000;
     if explicit & !(object_type.valid_access | 0x0100_0000) != 0 {
+        state::note_denial("fora-do-tipo", &object_type.name, mask, 0);
         return Err(0xC000_0022);
     }
     let descriptor = descriptor_of(policy, object_type)?;
-    let granted = access_evaluation::access_check(Some(&descriptor), &Subject::from_token(token), mask, 0, &object_type.mapping)?;
+    let granted = access_evaluation::access_check(Some(&descriptor), &Subject::from_token(token), mask, 0, &object_type.mapping).inspect_err(|_| state::note_denial("dacl/integridade", &object_type.name, mask, 0))?;
     Ok(if mask & 0x0200_0000 != 0 { granted & (object_type.valid_access | 0x0100_0000) } else { granted })
 }

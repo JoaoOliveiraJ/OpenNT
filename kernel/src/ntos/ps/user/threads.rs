@@ -2191,6 +2191,7 @@ pub fn resolve(handle: u64, access: u32) -> Result<Arc<UserThread>, u32> {
         return Err(0xC000_0024);
     }
     if entry.access() & access != access {
+        state::note_denial("handle", "thread", access, entry.access());
         return Err(0xC000_0022);
     }
     entry.downcast::<ThreadHandleObject>().map(|object| object.thread.clone()).ok_or(0xC000_0008u32)

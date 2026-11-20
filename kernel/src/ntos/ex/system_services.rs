@@ -223,9 +223,13 @@ pub fn dispatch(id: u64, args: &[u64; 14], return_address: u64, frame: u64, cont
     let service_frame = crate::hal::amd64::usermode::user_service_frame();
     // O quadro de serviço guarda o retorno do stub em +8.
     let return_address = if service_frame != 0 { guest::read64(service_frame + 8) } else { block.return_address.get() };
+    // O RSP de modo usuário da entrada do syscall (a KPCR o guarda antes de
+    // trocar de pilha; nenhum código de usuário rodou desde então), para o
+    // chamador do stub nas linhas de falha.
+    let user_stack = if service_frame != 0 { crate::ntos::ke::pcr::current().user_rsp.get() } else { 0 };
     // O registro é da thread que entrou no serviço; um serviço aninhado
     // devolve o de fora ao sair.
-    let record = state::SyscallRecord { raw_arguments: raw, stack: Some(state::ServiceStack { rsp: stack_pointer, bytes: service_abi::stack_arguments(&binding.name).unwrap_or(0) as u64 * 8 }) };
+    let record = state::SyscallRecord { raw_arguments: raw, stack: Some(state::ServiceStack { rsp: stack_pointer, bytes: service_abi::stack_arguments(&binding.name).unwrap_or(0) as u64 * 8 }), user_stack };
     let result = state::with_syscall_record(record, || invoker(&binding.name, values, return_address, stack_pointer));
     guest::free_bytes(raw);
     result.map(|status| status as u64)
