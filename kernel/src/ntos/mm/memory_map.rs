@@ -17,8 +17,9 @@
 //!   0x100000-0x1C7FFFF   frames da imagem do kernel (cap de build: 27,5MB)
 //!   0x1C81000-0x1DFFFFF  frames da pilha de boot
 //!   0x1E00000-0x1FFFFFF  tabela do censo do heap do kernel
-//!   0x2000000-0x5FFFFFF  frames do heap do kernel (kmalloc) e da arena de 16MB
+//!   0x2000000-0x5FFFFFF  frames do heap do kernel (kmalloc, 64MB)
 //!   0x6000000-0xFFFFFFF  primeira arena PFN (160MB)
+//!   0x10000000-0x10FFFFFF frames da arena dos convidados (16MB; com RAM aqui)
 //!   0x20000000-0x2FFFFFFF segunda arena PFN (256MB)
 //!   0x30000000-0x33FFFFFF ring do tracer FULL (64MB)
 //!   0x34000000-0x6FFFFFFF terceira arena PFN (960MB)
@@ -366,15 +367,18 @@ const _: () = assert!(DIRECT_MAP_PD_PHYS + 4 * PAGE_SIZE <= 0x8_1000 && PHYSICAL
 
 // ---- Janela do heap do kernel (metade de sistema) --------------------------
 //
-// O heap do kernel (`hal::kmalloc`, também o alocador global do Rust) e a
-// arena de 16 MB dos convidados, reservada dele no boot (IRPs,
-// DEVICE_OBJECTs, MDLs, ExAllocatePool2 e as demais estruturas NT que os
-// drivers recebem), moram nos frames físicos KERNEL_HEAP_PHYS_BASE..TOP, fora
-// do PFN. Esses frames são endereçados só por esta janela, o papel do pool
-// não paginado inicial do NT: KERNEL_HEAP_BASE + (PA - KERNEL_HEAP_PHYS_BASE),
-// em páginas de 2 MB de supervisor, RW e executáveis (o pool não paginado
-// comum do NT executa; a arena também guarda pequenas rotinas de conclusão
-// geradas em tempo de execução). Toda alocação do heap e da arena é,
+// O heap do kernel (`hal::kmalloc`, também o alocador global do Rust) mora
+// nos frames físicos KERNEL_HEAP_PHYS_BASE..TOP e a arena de 16 MB dos
+// convidados (IRPs, DEVICE_OBJECTs, MDLs, ExAllocatePool2 e as demais
+// estruturas NT que os drivers recebem), nos frames GUEST_ARENA_PHYS_BASE..TOP,
+// o começo da faixa de 256-512 MB que nenhuma arena do PFN usa; os dois fora
+// do PFN. A arena não sai dos 64 MB do kmalloc. Numa máquina sem RAM nessa
+// faixa (menos de 272 MB) ela sai do heap do kernel no boot, como um bloco
+// dele (`hal::host`). Esses frames são endereçados só por esta janela, o papel
+// do pool não paginado inicial do NT, pela mesma conta linear:
+// KERNEL_HEAP_BASE + (PA - KERNEL_HEAP_PHYS_BASE), em páginas de 2 MB de
+// supervisor, RW e sem execução; a VA entre o fim do heap e a arena fica sem
+// mapeamento. Toda alocação do heap e da arena é,
 // portanto, uma VA >= MmSystemRangeStart. `paging::map_kernel_heap_window`
 // monta a janela no boot, antes da primeira alocação, com tabelas fixas
 // abaixo de 1 MB. Como o mapa direto, é um alias físico do kernel: o
@@ -392,7 +396,16 @@ pub const KERNEL_HEAP_PML4_INDEX: u64 = 384;
 pub const KERNEL_HEAP_PDPT_PHYS: u64 = 0x7B000;
 pub const KERNEL_HEAP_PD_PHYS: u64 = 0x7C000;
 
-/// VA da janela do heap do frame `physical_address` (dentro da faixa do heap).
+/// Os frames da arena dos convidados (`hal::host`): fora do PFN e do heap.
+pub const GUEST_ARENA_PHYS_BASE: u64 = 0x1000_0000;
+pub const GUEST_ARENA_SIZE: u64 = 0x100_0000;
+pub const GUEST_ARENA_PHYS_TOP: u64 = GUEST_ARENA_PHYS_BASE + GUEST_ARENA_SIZE;
+/// A VA da arena na janela do heap (quando ela tem os frames próprios).
+pub const GUEST_ARENA_BASE: u64 = kernel_heap_virtual(GUEST_ARENA_PHYS_BASE);
+pub const GUEST_ARENA_TOP: u64 = GUEST_ARENA_BASE + GUEST_ARENA_SIZE;
+
+/// VA da janela do heap do frame `physical_address` (um frame do heap ou da
+/// arena).
 pub const fn kernel_heap_virtual(physical_address: u64) -> u64 {
     KERNEL_HEAP_BASE + (physical_address - KERNEL_HEAP_PHYS_BASE)
 }
@@ -402,9 +415,14 @@ pub const fn kernel_heap_physical(address: u64) -> u64 {
     KERNEL_HEAP_PHYS_BASE + (address - KERNEL_HEAP_BASE)
 }
 
-/// A VA pertence à janela do heap.
+/// A VA pertence à janela do heap: ao heap do kernel ou à faixa da arena.
 pub const fn is_kernel_heap(address: u64) -> bool {
-    address >= KERNEL_HEAP_BASE && address < KERNEL_HEAP_TOP
+    (address >= KERNEL_HEAP_BASE && address < KERNEL_HEAP_TOP) || (address >= GUEST_ARENA_BASE && address < GUEST_ARENA_TOP)
+}
+
+/// O frame é da janela do heap (do heap do kernel ou da arena).
+pub const fn is_kernel_heap_frame(physical_address: u64) -> bool {
+    (physical_address >= KERNEL_HEAP_PHYS_BASE && physical_address < KERNEL_HEAP_PHYS_TOP) || (physical_address >= GUEST_ARENA_PHYS_BASE && physical_address < GUEST_ARENA_PHYS_TOP)
 }
 
 const _: () = assert!((KERNEL_HEAP_BASE >> 39) & 511 == KERNEL_HEAP_PML4_INDEX && KERNEL_HEAP_BASE % 0x4000_0000 == 0);
@@ -415,6 +433,12 @@ const _: () = assert!(KERNEL_HEAP_PML4_INDEX != (KERNEL_POOL_BASE >> 39) & 511 &
 // abaixo da primeira arena do PFN.
 const _: () = assert!(KERNEL_HEAP_PHYS_BASE % LARGE_PAGE_SIZE == 0 && KERNEL_HEAP_PHYS_TOP % LARGE_PAGE_SIZE == 0);
 const _: () = assert!(KERNEL_HEAP_PHYS_TOP - KERNEL_HEAP_PHYS_BASE <= 0x4000_0000 && KERNEL_HEAP_PHYS_TOP <= PFN_RANGES[0].0);
+// A arena fica no buraco entre a primeira e a segunda arena do PFN, alinhada
+// às páginas de 2 MB, e a VA dela cai na mesma PD da janela, com os 32 bits
+// baixos no buraco de MMIO.
+const _: () = assert!(GUEST_ARENA_PHYS_BASE >= PFN_RANGES[0].1 && GUEST_ARENA_PHYS_TOP <= PFN_RANGES[1].0);
+const _: () = assert!(GUEST_ARENA_PHYS_BASE % LARGE_PAGE_SIZE == 0 && GUEST_ARENA_SIZE % LARGE_PAGE_SIZE == 0);
+const _: () = assert!(GUEST_ARENA_TOP - KERNEL_HEAP_BASE <= 0x4000_0000 && (GUEST_ARENA_TOP - 1) & 0xFFFF_FFFF < 0xFEC0_0000);
 const _: () = assert!(KERNEL_HEAP_PDPT_PHYS == DIRECT_MAP_PD_PHYS + 4 * PAGE_SIZE && KERNEL_HEAP_PD_PHYS == KERNEL_HEAP_PDPT_PHYS + PAGE_SIZE && KERNEL_HEAP_PD_PHYS + PAGE_SIZE <= 0x8_1000);
 
 /// Tabela do censo do heap do kernel (`hal::heap_census`: bytes vivos por

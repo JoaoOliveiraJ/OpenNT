@@ -1,8 +1,9 @@
 //! Arena de memória dos convidados (drivers .sys e structs NT) e acesso a
 //! endereços de convidado.
 //!
-//! Arena de 16MB reservada do heap do kernel no boot; blocos livres
-//! separados por tamanho, com split e coalescência. Header de bloco (16B):
+//! Arena de 16MB com frames próprios fora do PFN e do heap do kernel
+//! (`hal::host`; sem RAM para eles, um bloco do heap reservado no boot);
+//! blocos livres separados por tamanho, com split e coalescência. Header de bloco (16B):
 //! +0 size, +4 previous, +8 next, +12 free (u32). Os links das listas livres
 //! ocupam os primeiros 8 bytes do payload livre. Como o heap, a arena mora na
 //! janela do heap da metade de sistema (`KERNEL_HEAP_BASE`): toda alocação é
@@ -108,7 +109,7 @@ use crate::ntos::mm::memory_map as map;
 use crate::ntos::mm::{guard_page, page_residency, paging, physical_layout};
 use crate::rtl::{KernelError, SpinLock};
 
-pub const ARENA_SIZE: u64 = 0x100_0000; // 16MB
+pub const ARENA_SIZE: u64 = map::GUEST_ARENA_SIZE; // 16MB
 const BLOCK_HEADER_SIZE: u64 = 16;
 pub const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
 const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;

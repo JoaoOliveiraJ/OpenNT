@@ -21,7 +21,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::ntos::inc::{types as nt, NtStruct};
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::mm::memory_map::{self as map, KERNEL_HEAP_BASE, KERNEL_HEAP_TOP, SYSTEM_IMAGE_BASE, SYSTEM_IMAGE_TOP};
+use crate::ntos::mm::memory_map::{self as map, SYSTEM_IMAGE_BASE, SYSTEM_IMAGE_TOP};
 use crate::ntos::mm::{loaded_images, paging, system_info};
 use crate::ntos::ob::object_manager;
 
@@ -33,10 +33,10 @@ fn at<T: NtStruct>(address: u64) -> &'static T {
     unsafe { T::at(address) }
 }
 
-/// Bloco da janela do heap cuja VA traduz pela tabela real para o frame
-/// que a janela promete.
+/// Bloco da janela do heap (o heap do kernel ou a arena) cuja VA traduz pela
+/// tabela real para o frame que a janela promete.
 fn in_heap_window(address: u64) -> bool {
-    address >= KERNEL_HEAP_BASE && address < KERNEL_HEAP_TOP && paging::translate(address) == map::kernel_heap_physical(address)
+    map::is_kernel_heap(address) && paging::translate(address) == map::kernel_heap_physical(address)
 }
 
 /// DRIVER_OBJECT e os DEVICE_OBJECTs (com extensões) da sua lista.
@@ -95,6 +95,15 @@ pub fn run(assert: Assert, call_export: CallExport) {
     );
     guest::write64(bytes, 0x0123_4567_89AB_CDEF);
     assert(crate::hal::physical::read64(map::kernel_heap_physical(bytes)) == 0x0123_4567_89AB_CDEF, "sysalloc: VA da arena e frame do heap sao a mesma memoria");
+    // Com RAM na faixa dela, a arena tem os frames próprios entre a primeira
+    // e a segunda arena do PFN, fora dos 64 MB do kmalloc.
+    let own_frames = crate::hal::kmalloc::usable_range(map::GUEST_ARENA_PHYS_BASE, map::GUEST_ARENA_PHYS_TOP);
+    let frame = map::kernel_heap_physical(bytes);
+    let heap_frame = (map::KERNEL_HEAP_PHYS_BASE..map::KERNEL_HEAP_PHYS_TOP).contains(&frame);
+    assert(
+        if own_frames { (map::GUEST_ARENA_PHYS_BASE..map::GUEST_ARENA_PHYS_TOP).contains(&frame) && !heap_frame && crate::hal::host::guest_arena() == map::GUEST_ARENA_BASE } else { heap_frame },
+        "sysalloc: a arena nos frames proprios fora do heap do kernel (ou num bloco dele sem RAM na faixa)",
+    );
     drop(boxed);
     guest::free_bytes(bytes);
     guest::free_bytes(page);

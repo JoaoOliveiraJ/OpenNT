@@ -211,7 +211,7 @@ fn table_of(entry: u64) -> u64 {
 fn physical_alias(va: u64, pa: u64) -> bool {
     va == pa
         || va == map::direct_map(pa)
-        || ((map::KERNEL_HEAP_PHYS_BASE..map::KERNEL_HEAP_PHYS_TOP).contains(&pa) && va == map::kernel_heap_virtual(pa))
+        || (map::is_kernel_heap_frame(pa) && va == map::kernel_heap_virtual(pa))
 }
 
 /// Desfaz a identidade transitória do stage2 (PML4[0] -> uma página de 2 MB
@@ -246,6 +246,19 @@ pub fn map_kernel_heap_window() {
     }
     write_entry(pdpt + pdpt_index(map::KERNEL_HEAP_BASE) * 8, pd | PAGE_PRESENT | PAGE_RW, false);
     write_entry(PML4 + map::KERNEL_HEAP_PML4_INDEX * 8, pdpt | PAGE_PRESENT | PAGE_RW, false);
+    cpu::reload_cr3();
+}
+
+/// Põe na janela do heap os frames próprios da arena dos convidados
+/// (`GUEST_ARENA_BASE..TOP`, na PD da janela), com as mesmas páginas de 2 MB
+/// de supervisor, RW e NX. Roda no boot, só na CPU de boot, depois de
+/// [`map_kernel_heap_window`] e antes da primeira alocação da arena.
+pub fn map_guest_arena_window() {
+    let pd = map::KERNEL_HEAP_PD_PHYS;
+    for index in 0..map::GUEST_ARENA_SIZE / map::LARGE_PAGE_SIZE {
+        let frame = map::GUEST_ARENA_PHYS_BASE + index * map::LARGE_PAGE_SIZE;
+        write_entry(pd + (pd_index(map::GUEST_ARENA_BASE) + index) * 8, frame | PAGE_PRESENT | PAGE_RW | PAGE_PS, true);
+    }
     cpu::reload_cr3();
 }
 

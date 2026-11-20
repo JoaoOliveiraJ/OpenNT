@@ -324,6 +324,12 @@ impl Heap {
     }
 }
 
+/// A faixa física [base, top) está inteira num descritor utilizável do E820
+/// e nenhum descritor reservado a toca.
+pub fn usable_range(base: u64, top: u64) -> bool {
+    Heap::usable_range(base, top)
+}
+
 /// Monta a janela do heap e o bloco livre inicial.
 pub fn init() {
     paging::map_kernel_heap_window();

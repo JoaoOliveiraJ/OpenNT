@@ -19,7 +19,7 @@
 //!   do HalGetAdapterV2 e do HalGetAdapterV3 (o bit 31 do MaximumLength é
 //!   ignorado).
 //! - AllocateCommonBuffer: memória contígua da arena do kernel (abaixo de
-//!   96 MB), alinhada à página; LogicalAddress = endereço físico.
+//!   272 MB), alinhada à página; LogicalAddress = endereço físico.
 //! - AllocateAdapterChannel: chama o ExecutionRoutine(DeviceObject,
 //!   DeviceObject->CurrentIrp, MapRegisterBase NULL, Context) em
 //!   DISPATCH_LEVEL; DeallocateObject e KeepObject liberam o canal no fim.
@@ -240,14 +240,14 @@ pub(super) fn allocate_common_buffer(call: &Call) -> Result<u64, KernelError> {
 }
 
 /// AllocateCommonBufferEx(Adapter, MaximumAddress*, Length, LogicalAddress*,
-/// CacheEnabled, PreferredNode): a arena fica abaixo de qualquer limite
-/// acima de 96 MB.
+/// CacheEnabled, PreferredNode): a arena fica abaixo de qualquer limite a
+/// partir do fim físico dela.
 pub(super) fn allocate_common_buffer_ex(call: &Call) -> Result<u64, KernelError> {
     let limit = call.arg(2);
     if limit != 0 {
         // SAFETY: PPHYSICAL_ADDRESS do driver.
         let maximum = unsafe { Field::<u64>::at(limit) }.get();
-        if maximum < 0x0600_0000 {
+        if maximum < crate::hal::host::guest_arena_physical_top() {
             return Ok(0);
         }
     }

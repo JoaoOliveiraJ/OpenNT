@@ -93,7 +93,7 @@ pub fn run(assert: Assert) {
     let arena = guest::alloc_bytes(16);
     let boxed = Box::new([0u8; 64]);
     let heap = boxed.as_ptr() as u64;
-    let in_window = |va: u64| (map::KERNEL_HEAP_BASE..map::KERNEL_HEAP_TOP).contains(&va);
+    let in_window = map::is_kernel_heap;
     assert(arena != 0 && in_window(arena) && in_window(heap) && no_execute(arena) && no_execute(heap), "heap nx: a arena e o heap do kernel ficam na janela do heap, sem execucao");
 
     let Ok(mut image) = loader::load(calling_image(), &LoadOptions { image_name: Some(String::from("opennt-heapnx.sys")), ..Default::default() }) else {

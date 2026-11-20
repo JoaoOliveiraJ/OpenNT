@@ -46,7 +46,7 @@
 //! - AllocateCommonBufferWithBounds e os vetores de buffers comuns
 //!   (AllocateCommonBufferVector, GetCommonBufferFromVectorByIndex,
 //!   FreeCommonBufferFromVector, FreeCommonBufferVector) usam a mesma
-//!   memória contígua da arena do kernel (abaixo de 96 MB).
+//!   memória contígua da arena do kernel (abaixo de 272 MB).
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -72,8 +72,11 @@ const DMA_SYNCHRONOUS_CALLBACK: u32 = 1;
 const ADAPTER_INFO_BUS_MASTER_FLAGS: u32 = 3;
 /// DMA_TRANSFER_CONTEXT_SIZE_V1.
 const TRANSFER_CONTEXT_SIZE: u64 = 0x80;
-/// Limite da arena dos buffers comuns (`dma::common_buffer`).
-const COMMON_BUFFER_LIMIT: u64 = 0x0600_0000;
+/// Limite da arena dos buffers comuns (`dma::common_buffer`): o fim físico
+/// dela.
+fn common_buffer_limit() -> u64 {
+    crate::hal::host::guest_arena_physical_top()
+}
 
 /// O estado V3 de um adaptador: o domínio de DMA (a largura de endereço
 /// fica no objeto de `dma`).
@@ -497,7 +500,7 @@ fn allocate_domain_common_buffer(call: &Call) -> Result<u64, KernelError> {
     if domain == 0 || state(adapter).map(|state| state.domain) != Some(domain) || logical == 0 || virtual_address == 0 {
         return Ok(STATUS_INVALID_PARAMETER as u64);
     }
-    if maximum != 0 && out64(maximum).get() < COMMON_BUFFER_LIMIT {
+    if maximum != 0 && out64(maximum).get() < common_buffer_limit() {
         return Ok(STATUS_INSUFFICIENT_RESOURCES as u64);
     }
     let va = dma::common_buffer(length, logical);
@@ -511,7 +514,7 @@ fn allocate_common_buffer_with_bounds(call: &Call) -> Result<u64, KernelError> {
     let (minimum, maximum, length, logical) = (call.arg(2), call.arg(3), call.arg(4) as u32, call.arg(8));
     let low = if minimum != 0 { out64(minimum).get() } else { 0 };
     let high = if maximum != 0 { out64(maximum).get() } else { u64::MAX };
-    if low >= COMMON_BUFFER_LIMIT || high < COMMON_BUFFER_LIMIT {
+    if low >= common_buffer_limit() || high < common_buffer_limit() {
         return Ok(0);
     }
     Ok(dma::common_buffer(length, logical))
@@ -524,7 +527,7 @@ fn allocate_common_buffer_vector(call: &Call) -> Result<u64, KernelError> {
     if output == 0 || count == 0 || size == 0 || size > u32::MAX as u64 {
         return Ok(STATUS_INVALID_PARAMETER as u64);
     }
-    if low >= COMMON_BUFFER_LIMIT || high < COMMON_BUFFER_LIMIT {
+    if low >= common_buffer_limit() || high < common_buffer_limit() {
         return Ok(STATUS_INSUFFICIENT_RESOURCES as u64);
     }
     let logical = guest::alloc_bytes(8);

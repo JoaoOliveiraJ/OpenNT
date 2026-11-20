@@ -261,7 +261,7 @@ pertence só aos processos:
 | 0xFFFF8080_00000000 | 257 | banco de PFNs nativo (MmPfnDatabase) |
 | 0xFFFFA000_00000000 | 320 | pool executivo, PTEs de sistema dos MDLs (0xFFFFA001_40000000..0xFFFFA001_80000000), dump, memória contígua e independente, visões de sistema, VirtualAlloc de kernel, VAs globais das sessões (0xFFFFA006_80000000), pilhas de kernel das threads (0xFFFFA007_00000000..0xFFFFA008_00000000) |
 | 0xFFFFB000_00000000 | 352 | **mapa direto**: toda a faixa física [0, 4 GB) em `DIRECT_MAP_BASE + PA` |
-| 0xFFFFC000_C0000000 | 384 | **janela do heap**: heap do kernel (kmalloc, o alocador do Rust) e a arena dos convidados (IRPs, DEVICE_OBJECTs, MDLs, ExAllocatePool2...) sobre os frames de 32 MB a 96 MB |
+| 0xFFFFC000_C0000000 | 384 | **janela do heap**: heap do kernel (kmalloc, o alocador do Rust) sobre os frames de 32 MB a 96 MB e a arena dos convidados (IRPs, DEVICE_OBJECTs, MDLs, ExAllocatePool2...) sobre os de 256 MB a 272 MB, na VA `KERNEL_HEAP_BASE + 224 MB` |
 | 0xFFFFF780_00000000 | 495 | KUSER_SHARED_DATA (visão do kernel) |
 | 0xFFFFF800_00000000 | 496 | KPCR, pool de dados, a **imagem do kernel** (0xFFFFF800_40000000), a pilha de boot (topo em 0xFFFFF800_41200000) e a janela de imagens de kernel (0xFFFFF801_00000000..0xFFFFF802_00000000) |
 | 0xFFFFF900_00000000 | 498 | **espaço de sessão**: tabela de topo própria de cada sessão (vazio na raiz do System e dos processos sem sessão); SessionCore, VA dinâmica (pool de sessão) e imagens de sessão |
@@ -1602,8 +1602,10 @@ em 0x76000-0x7AFFF) antes de entrar no kernel. A regra:
   ponteiro de kernel abaixo de MmSystemRangeStart falta no anel 0 e para o
   sistema com o diagnóstico.
 
-**Heap do kernel e arena dos convidados.** Os frames de 32 MB a 96 MB (fora
-do PFN) aparecem só na janela do heap, `KERNEL_HEAP_BASE + (PA - 32 MB)`, o
+**Heap do kernel e arena dos convidados.** Os frames de 32 MB a 96 MB, do
+`kmalloc`, e os de 256 MB a 272 MB, da arena (o começo da faixa entre a
+primeira e a segunda arena do PFN, que nenhuma delas usa), ficam fora do PFN
+e aparecem só na janela do heap, `KERNEL_HEAP_BASE + (PA - 32 MB)`, o
 papel do pool não paginado inicial do NT: páginas de 2 MB de supervisor, RW e
 sem execução (NX), como o NonPagedPoolNx; os remapeamentos de páginas da
 janela (o mapeamento reservado das MDLs) também ficam NX. Nada executa do
@@ -1633,7 +1635,9 @@ com POOL_FLAG_NON_PAGED_EXECUTE, e num bloco do NonPagedPoolNx ou do
 ExAllocatePool2 com POOL_FLAG_NON_PAGED falta da mesma forma.
 `paging::map_kernel_heap_window` monta a janela no boot, antes da primeira
 alocação, com a PDPT e a PD fixas em 0x7B000-0x7CFFF. O `kmalloc` (e com ele
-todo `Box`/`Vec` do kernel) e a arena de 16 MB reservada dele devolvem VAs
+todo `Box`/`Vec` do kernel) e a arena de 16 MB, que não sai dos 64 MB dele
+(numa máquina sem RAM na faixa da arena, menos de 272 MB, ela volta a ser um
+bloco do heap reservado no boot, `hal/host.rs`), devolvem VAs
 dessa janela: toda IRP, DEVICE_OBJECT, MDL, pool do ExAllocatePool2 e
 estrutura NT que um driver recebe fica acima de MmSystemRangeStart, como os
 drivers reais esperam ao comparar ponteiros com MmUserProbeAddress. Os
