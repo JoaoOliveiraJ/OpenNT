@@ -1574,7 +1574,17 @@ além da KUSER_SHARED_DATA:
   memória (`page_residency`, o MiDeleteUnusedSegments), a mais antiga
   primeiro. Antes, metade dos bytes de imagem lidos no boot até a tela de
   logon era de recargas (o d3d10warp.dll seis vezes, a kernelbase.dll
-  cinco). Teste: `retained_image_segments` na fase 7. A vista (`image_view.rs`, o
+  cinco). Teste: `retained_image_segments` na fase 7. O
+  NtAreMappedFilesTheSame (`are_mapped_files_the_same`, 19041 0x6a0330)
+  acha a vista de cada endereço no registro do processo, de dados ou de
+  imagem: a vista de imagem dá STATUS_SUCCESS contra outra vista do mesmo
+  arquivo do volume (o registro do arquivo, `SectionFile::file_id`, igual
+  em toda abertura), e o LdrpFindLoadedDllByMappingLockHeld da ntdll usa o
+  módulo que já existe quando a mesma DLL chega por outro caminho (o
+  explorer, em `\Windows`, carrega os imports de System32 por
+  `C:\Windows\X.dll`, e o gancho de API do win32k pede o UxTheme.dll por
+  `C:\Windows\system32`). Teste: `mapped_images` em
+  `user_desktop_services`. A vista (`image_view.rs`, o
   MiMapViewOfImageSection) mapeia na raiz do processo as páginas de código
   e somente leitura sobre os frames protótipo, divididos entre os processos
   e sem escrita, e as páginas graváveis sobre cópias privadas feitas no
