@@ -556,18 +556,30 @@ fn poll_user_waits() {
             blocked || (runnable && process_started(process))
         })
         .collect();
-    candidates.sort_by_key(|thread| core::cmp::Reverse(thread_priority::query_priority(thread.pointer())));
+    // Pela prioridade e, entre as de mesma prioridade, pelo processo: as
+    // sondagens seguidas do mesmo processo não recarregam o CR3 (sem PCID nem
+    // páginas globais, cada carga esvazia o TLB, também o do kernel).
+    candidates.sort_by_cached_key(|thread| (core::cmp::Reverse(thread_priority::query_priority(thread.pointer())), thread.with(|thread| thread.process_pointer)));
     for candidate in candidates {
         let pointer = candidate.pointer();
         if let Some(mut wait) = candidate.take_wait() {
-            process::set_current_thread(pointer);
             dispatch_perf::POLLS.fetch_add(1, Ordering::Relaxed);
-            match poll_wait(&mut wait) {
+            let outcome = match poll_delay(&wait) {
+                Some(outcome) => outcome,
+                None => {
+                    process::set_current_thread(pointer);
+                    poll_wait(&mut wait)
+                }
+            };
+            match outcome {
                 None => {
                     candidate.restore_wait(wait);
                     continue;
                 }
-                Some(status) => finish_wait(&candidate, wait, status),
+                Some(status) => {
+                    process::set_current_thread(pointer);
+                    finish_wait(&candidate, wait, status)
+                }
             }
         } else if candidate.waiting() {
             continue;
@@ -650,8 +662,8 @@ pub fn run(thread: &Arc<UserThread>, rip: u64, rsp: u64, argument: u64, ntdll_ba
     wait_for_process(thread.with(|thread| thread.process_pointer))
 }
 
-/// Um intervalo de usuário de qualquer processo: sonda as esperas de todas
-/// as threads, roda os pumps do kernel e dos objetos de usuário, retoma as
+/// Um intervalo de usuário de qualquer processo: roda os pumps do kernel e
+/// dos objetos de usuário, sonda as esperas de todas as threads, retoma as
 /// terminadas que precisam desfazer um serviço bloqueado, conclui os fins de
 /// processo adiados e dá um intervalo à thread de usuário pronta mais
 /// prioritária, com a raiz do processo dela carregada pela troca de thread
@@ -700,8 +712,9 @@ pub fn refresh_waiting() {
 
 /// O corpo de [`dispatch_one`], com o despacho já marcado como em curso.
 fn dispatch_from(executor: fn(u64, u64) -> u32, caller: u64) -> Result<Dispatched, KernelError> {
-    refresh_ready_user_threads();
-    process::set_current_thread(caller);
+    // Uma sondagem só, depois dos pumps e antes da escolha: o tique sondou
+    // no começo dele e depois de cada intervalo que deixou a fila vazia, e o
+    // que os pumps concluírem entra nela também.
     dispatcher::pump_kernel();
     let pumps = *PUMPS.lock();
     for routine in pumps.into_iter().flatten() {
@@ -1182,6 +1195,22 @@ fn finish_wait(thread: &UserThread, mut wait: Wait, status: u32) {
         // SAFETY: CONTEXT salvo da thread (memória do kernel).
         unsafe { Context::at(context) }.rax.set(status as u64);
     }
+}
+
+/// A sondagem de um NtDelayExecution que já foi sondado uma vez (os alertas
+/// armados para a thread dele): o mesmo que [`poll_wait`] faz nele, mas sem o
+/// contexto da thread, porque nada ali lê a memória do processo (o alerta e
+/// as APCs são conferidos pelo ponteiro da thread). `None` = a espera não é
+/// dessas e precisa do contexto.
+fn poll_delay(wait: &Wait) -> Option<Option<u32>> {
+    if !wait.delay || wait.alert.is_some() {
+        return None;
+    }
+    let alerts = wait.alerts.as_ref()?;
+    if let Some(interrupted) = alerts.pending() {
+        return Some(Some(interrupted));
+    }
+    Some((clock::uptime_ms() >= wait.deadline.unwrap_or(0)).then_some(0))
 }
 
 fn poll_wait(wait: &mut Wait) -> Option<u32> {

@@ -30,6 +30,7 @@ use alloc::vec::Vec;
 use core::cell::Cell;
 use core::future::Future;
 use core::pin::Pin;
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll, Waker};
 
 use super::{cid, process};
@@ -506,9 +507,26 @@ pub fn tick(minimum_priority: i32) {
             // espera ALPC, a resposta adiada de uma worker factory, o
             // KeSetEvent de uma thread de kernel) entra aqui, não no próximo
             // tique de 10 ms.
+            // Com intervalo disponível, o próprio despacho sonda (depois dos
+            // pumps) e já dá o intervalo à thread que achar pronta: uma
+            // sondagem só, não uma aqui e outra no despacho.
             Ok(None) if minimum_priority < 0 && !repolled => {
                 repolled = true;
-                user_threads::refresh_waiting();
+                if !user_slices(slices) {
+                    user_threads::refresh_waiting();
+                    continue;
+                }
+                match user_threads::dispatch_one() {
+                    Ok(Dispatched::Ran { .. }) => {
+                        slices += 1;
+                        repolled = false;
+                    }
+                    Ok(Dispatched::Idle) => {}
+                    Err(error) => {
+                        debug_print!("[sched] despacho de usuario falhou: {}", error);
+                        break;
+                    }
+                }
                 continue;
             }
             Ok(None) => break,
@@ -543,14 +561,28 @@ pub fn tick(minimum_priority: i32) {
         }
     }
     reap();
+    if minimum_priority < 0 {
+        POLLED_BY_TICK.store(true, Ordering::Relaxed);
+    }
+}
+
+/// O tique desta volta do laço ocioso terminou sondando as esperas, e nada
+/// rodou depois dele: o [`idle`] não precisa sondar de novo.
+static POLLED_BY_TICK: AtomicBool = AtomicBool::new(false);
+
+/// O começo de uma volta do laço ocioso (antes dos timers, das DPCs e das
+/// IRQs dela).
+pub fn idle_round() {
+    POLLED_BY_TICK.store(false, Ordering::Relaxed);
 }
 
 /// O laço ocioso do processador de boot sem thread pronta: como o KiIdleLoop
 /// do 19041 chama o HalProcessorIdle (`sti; hlt`), o processador dorme até a
 /// próxima interrupção (o tique do relógio a 100 Hz, um dispositivo, uma
 /// IPI). Antes, as esperas sondadas (de kernel e de usuário) são conferidas
-/// uma vez: a que um DPC, um timer, uma IRQ ou um trabalho do kernel acabou
-/// de satisfazer entra na fila agora, não no próximo tique. Um KTIMER que vence
+/// uma vez, se o tique desta volta não acabou de fazê-lo: a que um DPC, um
+/// timer, uma IRQ ou um trabalho do kernel acabou de satisfazer entra na
+/// fila agora, não no próximo tique. Um KTIMER que vence
 /// antes do próximo tique faz o laço girar até ele, para vencer na hora; com
 /// as interrupções desligadas, uma IRQ ainda não despachada, um DPC na fila
 /// ou uma thread pronta também não deixam dormir.
@@ -561,8 +593,10 @@ pub fn idle() {
         return;
     }
     super::dispatch_perf::not_spinning();
-    let _ = refresh_waiting_threads();
-    user_threads::refresh_waiting();
+    if !POLLED_BY_TICK.swap(false, Ordering::Relaxed) {
+        let _ = refresh_waiting_threads();
+        user_threads::refresh_waiting();
+    }
     if thread_dispatch::has_ready_threads() {
         return;
     }

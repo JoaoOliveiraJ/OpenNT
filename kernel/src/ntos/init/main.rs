@@ -295,6 +295,7 @@ pub fn kmain() -> ! {
     if interrupts::irqs_arriving() {
         debug_print!("[kernel] preempcao por timer ativa (quantum 10ms, LAPIC timer vetor 0x40)");
         loop {
+            scheduler::idle_round();
             shared_user_data::update_system_times();
             crate::ntos::ke::run_kernel_tasks();
             interrupts::dispatch_pending(); // IRQ do timer -> scheduler::tick
