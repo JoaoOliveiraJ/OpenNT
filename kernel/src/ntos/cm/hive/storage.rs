@@ -92,6 +92,29 @@ impl Drop for Bin {
     }
 }
 
+/// A janela das leituras de um primário carregado bin a bin.
+pub const READ_WINDOW: u64 = 0x4_0000;
+
+/// Os bytes de um arquivo de hive lidos de uma vez a partir de `start`.
+struct Window {
+    start: u64,
+    bytes: Vec<u8>,
+}
+
+impl Window {
+    /// Os bytes do arquivo em `[at, at + count)`, relendo a janela (até
+    /// `end`) quando eles não estão nela.
+    fn fetch(&mut self, read: &dyn Fn(u64, u64) -> Result<Vec<u8>, u32>, at: u64, count: u64, end: u64) -> Result<&[u8], u32> {
+        if at < self.start || at + count > self.start + self.bytes.len() as u64 {
+            self.bytes = Vec::new();
+            self.bytes = read(at, count.max(READ_WINDOW).min(end.saturating_sub(at)))?;
+            self.start = at;
+        }
+        let local = (at - self.start) as usize;
+        self.bytes.get(local..local + count as usize).ok_or(STATUS_REGISTRY_CORRUPT)
+    }
+}
+
 fn round_up(value: u32, alignment: u32) -> u32 {
     value.div_ceil(alignment) * alignment
 }
@@ -205,6 +228,18 @@ impl Storage {
         let bin = &self.bins[self.bin_index(cell)?];
         let local = (cell - bin.offset + 4) as usize;
         Some(bin.bytes()[local..local + length as usize].to_vec())
+    }
+
+    /// Os bytes de dados de uma célula alocada, sem cópia: valem enquanto a
+    /// célula não é liberada (o endereço que o HvGetCell devolve).
+    pub fn cell_bytes(&self, cell: u32, length: u32) -> Option<&[u8]> {
+        let size = self.cell_size(cell)?;
+        if length.checked_add(4)? > size {
+            return None;
+        }
+        let bin = &self.bins[self.bin_index(cell)?];
+        let local = (cell - bin.offset + 4) as usize;
+        bin.bytes().get(local..local + length as usize)
     }
 
     /// Escreve bytes nos dados de uma célula alocada e a marca suja.
@@ -359,6 +394,51 @@ impl Storage {
         Some(new)
     }
 
+    /// Uma hive sem bins com o bloco base `base` (0x1000 bytes lidos do
+    /// arquivo).
+    fn with_base(base: &[u8]) -> Result<Storage, u32> {
+        let base = base.get(..HBLOCK_SIZE as usize).ok_or(STATUS_REGISTRY_CORRUPT)?;
+        let mut storage = Storage { base: vec![0u64; (HBLOCK_SIZE / 8) as usize], bins: Vec::new(), free: BTreeMap::new(), dirty: Vec::new(), base_dirty: false, broken: false };
+        // SAFETY: bloco próprio de 0x1000 bytes.
+        unsafe { core::slice::from_raw_parts_mut(storage.base.as_mut_ptr() as *mut u8, HBLOCK_SIZE as usize) }.copy_from_slice(base);
+        Ok(storage)
+    }
+
+    /// O tamanho do bin em `offset` pelo cabeçalho dele: assinatura, offset
+    /// e tamanho coerentes com os `length` bytes de dados de bins.
+    fn bin_size(header: &[u8], offset: u32, length: u32) -> Result<u32, u32> {
+        let read32 = |at: usize| header.get(at..at + 4).map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])).ok_or(STATUS_REGISTRY_CORRUPT);
+        let size = read32(8)?;
+        if read32(0)? != HBIN_SIGNATURE || read32(4)? != offset || size < HBLOCK_SIZE || size % HBLOCK_SIZE != 0 || offset as u64 + size as u64 > length as u64 {
+            return Err(STATUS_REGISTRY_CORRUPT);
+        }
+        Ok(size)
+    }
+
+    /// Copia um bin lido (`bytes` é o bin inteiro, cabeçalho incluído) para
+    /// um bloco próprio, com as células cobrindo o bin todo; as livres entram
+    /// no mapa de livres.
+    fn load_bin(&mut self, offset: u32, bytes: &[u8]) -> Result<(), u32> {
+        let size = bytes.len() as u32;
+        let read32 = |at: usize| u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
+        let mut bin = Bin::new(offset, size).ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        bin.bytes_mut().copy_from_slice(bytes);
+        let mut cursor = HBIN_HEADER;
+        while cursor < size {
+            let raw = read32(cursor as usize) as i32;
+            let cell_size = raw.unsigned_abs();
+            if raw == 0 || cell_size % 8 != 0 || cursor as u64 + cell_size as u64 > size as u64 {
+                return Err(STATUS_REGISTRY_CORRUPT);
+            }
+            if raw > 0 {
+                self.free.insert(offset + cursor, cell_size);
+            }
+            cursor += cell_size;
+        }
+        self.bins.push(bin);
+        Ok(())
+    }
+
     /// Carrega a imagem de um arquivo primário já validada pelo bloco base:
     /// cada bin com assinatura, offset e tamanho coerentes, e as células
     /// cobrindo o bin inteiro.
@@ -366,38 +446,42 @@ impl Storage {
         if image.len() < HBLOCK_SIZE as usize {
             return Err(STATUS_REGISTRY_CORRUPT);
         }
-        let mut storage = Storage { base: vec![0u64; (HBLOCK_SIZE / 8) as usize], bins: Vec::new(), free: BTreeMap::new(), dirty: Vec::new(), base_dirty: false, broken: false };
-        // SAFETY: bloco próprio de 0x1000 bytes.
-        unsafe { core::slice::from_raw_parts_mut(storage.base.as_mut_ptr() as *mut u8, HBLOCK_SIZE as usize) }.copy_from_slice(&image[..HBLOCK_SIZE as usize]);
+        let mut storage = Storage::with_base(image)?;
         let length = storage.base_block().length.get();
         if length % HBLOCK_SIZE != 0 || HBLOCK_SIZE as usize + length as usize > image.len() {
             return Err(STATUS_REGISTRY_CORRUPT);
         }
         let data = &image[HBLOCK_SIZE as usize..HBLOCK_SIZE as usize + length as usize];
-        let read32 = |offset: usize| u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]);
         let mut offset = 0u32;
         while offset < length {
             let at = offset as usize;
-            let size = read32(at + 8);
-            if read32(at) != HBIN_SIGNATURE || read32(at + 4) != offset || size < HBLOCK_SIZE || size % HBLOCK_SIZE != 0 || offset as u64 + size as u64 > length as u64 {
-                return Err(STATUS_REGISTRY_CORRUPT);
-            }
-            let mut bin = Bin::new(offset, size).ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
-            bin.bytes_mut().copy_from_slice(&data[at..at + size as usize]);
-            let mut cursor = HBIN_HEADER;
-            while cursor < size {
-                let raw = read32(at + cursor as usize) as i32;
-                let cell_size = raw.unsigned_abs();
-                if raw == 0 || cell_size % 8 != 0 || cursor as u64 + cell_size as u64 > size as u64 {
-                    return Err(STATUS_REGISTRY_CORRUPT);
-                }
-                if raw > 0 {
-                    storage.free.insert(offset + cursor, cell_size);
-                }
-                cursor += cell_size;
-            }
-            storage.bins.push(bin);
+            let size = Storage::bin_size(&data[at..], offset, length)?;
+            storage.load_bin(offset, &data[at..at + size as usize])?;
             offset += size;
+        }
+        Ok(storage)
+    }
+
+    /// Carrega um primário de `size` bytes direto do arquivo, um bin de cada
+    /// vez, sem a imagem inteira na memória: `read(offset, tamanho)` lê do
+    /// arquivo, e as leituras andam numa janela de [`READ_WINDOW`] bytes (o
+    /// bin maior que ela é lido inteiro). O bloco base é validado antes dos
+    /// bins (`base_block::validate_primary`).
+    pub fn from_file(size: u64, read: &dyn Fn(u64, u64) -> Result<Vec<u8>, u32>) -> Result<Storage, u32> {
+        if size < HBLOCK_SIZE as u64 {
+            return Err(STATUS_REGISTRY_CORRUPT);
+        }
+        let mut storage = Storage::with_base(&read(0, HBLOCK_SIZE as u64)?)?;
+        super::base_block::validate_primary(storage.base_block(), size)?;
+        let length = storage.base_block().length.get();
+        let end = HBLOCK_SIZE as u64 + length as u64;
+        let mut window = Window { start: 0, bytes: Vec::new() };
+        let mut offset = 0u32;
+        while offset < length {
+            let at = HBLOCK_SIZE as u64 + offset as u64;
+            let bin = Storage::bin_size(window.fetch(read, at, HBIN_HEADER as u64, end)?, offset, length)?;
+            storage.load_bin(offset, window.fetch(read, at, bin as u64, end)?)?;
+            offset += bin;
         }
         Ok(storage)
     }

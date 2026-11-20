@@ -199,10 +199,23 @@ fn log_name(primary: &str, index: usize) -> String {
 }
 
 /// Lê e valida um primário, aplicando os logs a um primário invalidado.
-/// Os logs já abertos pela carga são lidos pelo handle deles; um log que a
+/// Um primário válido (Sequence1 = Sequence2) vai do arquivo para os bins
+/// um bin de cada vez, sem a imagem inteira na memória
+/// (`Storage::from_file`); só a recuperação pelos logs monta a imagem. Os
+/// logs já abertos pela carga são lidos pelo handle deles; um log que a
 /// carga não abriu é procurado pelo nome. Devolve as células e se houve
 /// recuperação.
 fn read_primary(primary: &HiveFile, logs: &[Option<HiveFile>; 2], file_name: &str) -> Result<(Storage, bool), u32> {
+    let size = primary.size();
+    if size < HBLOCK_SIZE as u64 {
+        return Err(STATUS_REGISTRY_CORRUPT);
+    }
+    let base = primary.read_range(0, HBLOCK_SIZE as u64)?;
+    if base[4..8] == base[8..12] {
+        let storage = Storage::from_file(size, &|offset, length| primary.read_range(offset, length))?;
+        return Ok((storage, false));
+    }
+    drop(base);
     let mut image = primary.read()?;
     if image.len() < HBLOCK_SIZE as usize {
         return Err(STATUS_REGISTRY_CORRUPT);
@@ -742,11 +755,9 @@ pub fn save(node: NodeId, file: &HiveFile, minor: u32) -> u32 {
     }
 }
 
-/// As chaves de uma hive de arquivo (o primário validado).
+/// As chaves de uma hive de arquivo (o primário validado, lido bin a bin).
 fn read_hive_file(file: &HiveFile) -> Result<Vec<tree::FlatKey>, u32> {
-    let image = file.read()?;
-    let storage = Storage::from_image(&image)?;
-    base_block::validate_primary(storage.base_block(), image.len() as u64)?;
+    let storage = Storage::from_file(file.size(), &|offset, length| file.read_range(offset, length))?;
     tree::read(&storage)
 }
 

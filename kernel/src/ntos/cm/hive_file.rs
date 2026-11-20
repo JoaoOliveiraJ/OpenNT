@@ -307,6 +307,14 @@ impl HiveFile {
         self.volume.size(&self.path).unwrap_or(0)
     }
 
+    /// CmpFileRead de `length` bytes a partir de `offset`.
+    pub fn read_range(&self, offset: u64, length: u64) -> Result<Vec<u8>, u32> {
+        match self.volume.read_range(&self.path, offset, length) {
+            Ok(Some(bytes)) if bytes.len() as u64 == length => Ok(bytes),
+            _ => Err(STATUS_REGISTRY_IO_FAILED),
+        }
+    }
+
     /// CmpFileRead do arquivo inteiro.
     pub fn read(&self) -> Result<Vec<u8>, u32> {
         let size = self.size();

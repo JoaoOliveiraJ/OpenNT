@@ -209,6 +209,21 @@ pub fn read_bytes(path: &str) -> Option<Vec<u8>> {
     }
 }
 
+/// Os bytes `[offset, offset + length)` de um arquivo binário (cortados no
+/// fim dele), sem copiar o arquivo inteiro.
+pub fn read_range(path: &str, offset: u64, length: u64) -> Option<Vec<u8>> {
+    let path = norm(path).ok()?;
+    let files = FILES.lock();
+    let bytes: &[u8] = match files.get(&path)? {
+        Stored::Data(FileData::Binary(bytes)) => bytes,
+        Stored::Embedded(bytes) => bytes,
+        Stored::Data(FileData::Text(_)) => return None,
+    };
+    let start = (offset as usize).min(bytes.len());
+    let end = start.saturating_add(length as usize).min(bytes.len());
+    Some(bytes[start..end].to_vec())
+}
+
 pub fn is_binary(path: &str) -> bool {
     let Ok(path) = norm(path) else { return false };
     matches!(FILES.lock().get(&path), Some(Stored::Data(FileData::Binary(_)) | Stored::Embedded(_)))
@@ -267,6 +282,10 @@ impl crate::drivers::fs::volume::FileSystem for MemoryVolume {
 
     fn size(&self, path: &str) -> Option<u64> {
         size(path).map(|size| size as u64)
+    }
+
+    fn read_range(&self, path: &str, offset: u64, length: u64) -> Result<Option<Vec<u8>>, KernelError> {
+        Ok(read_range(path, offset, length))
     }
 
     fn write_at(&self, path: &str, offset: u64, bytes: &[u8]) -> Result<u64, KernelError> {
