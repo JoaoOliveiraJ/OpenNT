@@ -180,7 +180,10 @@ test-boot:         --keys=TEXTO (\\n = Enter) --expect=TEXTO (repetivel)
                    --dismiss=MARCADOR[+MS]:TECLAS (repetivel: espera a tela de bloqueio parada, com
                    o relogio, digita as teclas e confere que ela saiu: LOGON_DISMISS_OK na serial)
                    --mouse=MARCADOR[+MS]:DX,DY (repetivel: o mouse PS/2 anda DX,DY pelo monitor e
-                   o test-boot confere na tela que o ponteiro andou: CURSOR_MOVED_OK na serial)";
+                   o test-boot confere na tela que o ponteiro andou: CURSOR_MOVED_OK na serial)
+                   --start-menu=MARCADOR[+MS]:TECLAS (repetivel: espera a area de trabalho com a
+                   barra parada, digita as teclas ({meta_l} e a tecla do Windows), confere o menu
+                   Iniciar aberto e que o Esc o fecha: START_MENU_OK na serial)";
 
 struct Arguments {
     command: String,
@@ -381,6 +384,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             "--send" => parsed.inputs.push(qemu::InputSend::keys(&required()?)?),
             "--mouse" => parsed.inputs.push(qemu::InputSend::mouse(&required()?)?),
             "--dismiss" => parsed.inputs.push(qemu::InputSend::dismiss(&required()?)?),
+            "--start-menu" => parsed.inputs.push(qemu::InputSend::start_menu(&required()?)?),
             "--hold" => parsed.hold_ms = required()?.parse().map_err(|_| "--hold invalido")?,
             "--build-only" => parsed.build_only = true,
             "--no-build" => parsed.no_build = true,
@@ -446,7 +450,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
         return Err("--capture-every e opcao do test-boot".into());
     }
     if !parsed.inputs.is_empty() && parsed.command != "test-boot" {
-        return Err("--send, --dismiss e --mouse sao opcoes do test-boot".into());
+        return Err("--send, --dismiss, --mouse e --start-menu sao opcoes do test-boot".into());
     }
     if parsed.manual_crash && parsed.command != "test-boot" {
         return Err("--manual-crash e opcao do test-boot".into());
@@ -757,6 +761,10 @@ mod tests {
             assert!(parse_words(&["test-boot", bad]).is_err(), "{bad}");
         }
         assert!(parse_words(&["run", "--mouse=X:1,1"]).is_err());
+        let parsed = parse_words(&["test-boot", "--start-menu=TASKBAR_OK+3000:{meta_l}"]).unwrap();
+        assert_eq!(parsed.inputs, vec![InputSend { after: "TASKBAR_OK".into(), delay: Duration::from_millis(3000), action: InputAction::StartMenu("{meta_l}".into()) }]);
+        assert!(parse_words(&["test-boot", "--start-menu=X"]).is_err());
+        assert!(parse_words(&["test-boot", "--start-menu=X:{win}"]).is_err());
         // Os nomes do QEMU passam, também nos combos e no --keys.
         assert!(parse_words(&["test-boot", "--send=X:{meta_l}", "--send=X:{ctrl_r-scroll_lock-scroll_lock}{clique}", "--keys=run hello\nps\n{kp_enter}"]).is_ok());
     }

@@ -1067,6 +1067,121 @@ pub fn clock_ticked(reference: &Image, image: &Image, layout: &TaskbarLayout) ->
     }
 }
 
+// ---- menu Iniciar ---------------------------------------------------------------
+//
+// A tecla do Windows abre o menu Iniciar do StartMenuExperienceHost.exe: um
+// painel (acrílico escuro no tema escuro do sistema, claro no tema claro)
+// colado no canto de baixo à esquerda, com a borda de baixo no topo da barra,
+// com a coluna de ícones, a lista de aplicativos e os blocos. A conferência
+// compara a tela antes e depois da tecla (os limites, em função de h, estão
+// em [`start_menu_open`]). Com o menu em tela inteira a caixa cobre toda a
+// área acima da barra e passa do mesmo jeito. O h sai sempre da tela de
+// antes: o painel escuro logo acima da barra estenderia a faixa escura de
+// baixo na tela de depois.
+
+/// O marcador do menu Iniciar.
+pub const START_MENU_MARKER: &str = "START_MENU_OK";
+
+/// [`taskbar_layout`] como descrição, para a espera da área de trabalho
+/// parada antes da tecla.
+pub fn taskbar_screen(image: &Image) -> Result<String, String> {
+    taskbar_layout(image).map(|layout| layout.describe())
+}
+
+/// As `rows` primeiras linhas de `image`.
+fn top_rows(image: &Image, rows: usize) -> Image {
+    Image { width: image.width, height: rows, rgb: image.rgb[..rows * image.width * 3].to_vec() }
+}
+
+/// O menu Iniciar aberto em `after` sobre `before` (a área de trabalho com a
+/// barra, [`taskbar_layout`]): a barra muda em até 1/8 dos pixels (o botão
+/// Iniciar realçado); acima dela, o maior grupo de mudanças fica colado à
+/// esquerda (até h/2) e à barra (até h/4), tem 6h x 6h pixels ou mais e 3/4
+/// ou mais dos pixels mudados, tem texto e ícones (de 1/200 a 1/2 dos pixels
+/// longe da mediana por 0x60) e é liso (metade ou mais dos vizinhos suaves);
+/// fora dele a tela muda em até 1/32. Uma notificação embaixo à direita, uma
+/// dica pequena, um painel vazio, lixo e a tela inteira trocada não passam.
+pub fn start_menu_open(before: &Image, after: &Image) -> Result<String, String> {
+    if (before.width, before.height) != (after.width, after.height) || before.rgb.len() != after.rgb.len() {
+        return Err(format!("a tela mudou de tamanho ({}x{} para {}x{})", before.width, before.height, after.width, after.height));
+    }
+    let h = taskbar_layout(before)?.rows;
+    let (width, area) = (before.width, before.height - h);
+    let at = |x: usize, y: usize| (y * width + x) * 3;
+    if after.rgb.chunks_exact(3).filter(|pixel| [pixel[0], pixel[1], pixel[2]] == BUGCHECK_BACKGROUND).count() * 2 > width * before.height {
+        return Err("a tela de bugcheck".into());
+    }
+    let band = (area..before.height).map(|y| (0..width).filter(|&x| before.rgb[at(x, y)..at(x, y) + 3] != after.rgb[at(x, y)..at(x, y) + 3]).count()).sum::<usize>();
+    if band * 8 > h * width {
+        return Err(format!("a barra de tarefas mudou em {}% dos pixels (maximo 12%)", band * 100 / (h * width)));
+    }
+    let groups = changes(&top_rows(before, area), &top_rows(after, area));
+    let Some(menu) = groups.iter().max_by_key(|group| group.width() * group.height()) else {
+        return Err("a tela acima da barra nao mudou".into());
+    };
+    let inside = |x: usize, y: usize| (menu.left..=menu.right).contains(&x) && (menu.top..=menu.bottom).contains(&y);
+    let (mut changed_in, mut changed_out) = (0usize, 0usize);
+    for y in 0..area {
+        for x in 0..width {
+            if before.rgb[at(x, y)..at(x, y) + 3] != after.rgb[at(x, y)..at(x, y) + 3] {
+                if inside(x, y) {
+                    changed_in += 1;
+                } else {
+                    changed_out += 1;
+                }
+            }
+        }
+    }
+    let size = menu.width() * menu.height();
+    let median = median_luma(after, menu.left..menu.right + 1, menu.top..menu.bottom + 1);
+    let (mut content, mut pairs, mut smooth) = (0usize, 0usize, 0usize);
+    for y in menu.top..=menu.bottom {
+        for x in menu.left..=menu.right {
+            let pixel = &after.rgb[at(x, y)..at(x, y) + 3];
+            if luma(pixel).abs_diff(median) >= TEXT_CONTRAST {
+                content += 1;
+            }
+            if x < menu.right {
+                let next = &after.rgb[at(x + 1, y)..at(x + 1, y) + 3];
+                pairs += 1;
+                if pixel.iter().zip(next).all(|(a, b)| a.abs_diff(*b) <= SMOOTH_STEP) {
+                    smooth += 1;
+                }
+            }
+        }
+    }
+    let mut missing = Vec::new();
+    if menu.left > h / 2 || menu.bottom + 1 + h / 4 < area {
+        missing.push(format!("o painel {} nao esta colado a esquerda e a barra", menu.describe()));
+    }
+    if menu.width() < 6 * h || menu.height() < 6 * h {
+        missing.push(format!("o painel {} e menor que {}x{}", menu.describe(), 6 * h, 6 * h));
+    }
+    if changed_in * 4 < size * 3 {
+        missing.push(format!("{}% do painel mudou (minimo 75%)", changed_in * 100 / size));
+    }
+    let outside = width * area - size;
+    if changed_out * 32 > outside.max(1) {
+        missing.push(format!("{}% da tela fora do painel mudou (maximo 3%)", changed_out * 100 / outside.max(1)));
+    }
+    if content * 200 < size || content * 2 > size {
+        missing.push(format!("{}% do painel e texto ou icone (de 0,5% a 50%)", content * 100 / size));
+    }
+    if smooth * LOGON_SMOOTH_DIVISOR < pairs {
+        missing.push(format!("{}% dos vizinhos do painel suaves (minimo 50%)", smooth * 100 / pairs.max(1)));
+    }
+    if missing.is_empty() {
+        Ok(format!(
+            "menu Iniciar {} sobre a barra de {h} linhas; {}% do painel mudou, {}% de texto e icones, fora dele {changed_out} pixels mudaram",
+            menu.describe(),
+            changed_in * 100 / size,
+            content * 100 / size
+        ))
+    } else {
+        Err(missing.join("; "))
+    }
+}
+
 /// Telas sintéticas para os testes da vigia.
 #[cfg(test)]
 pub mod samples {
@@ -1240,6 +1355,36 @@ pub mod samples {
         let mut image = wallpaper();
         taskbar(&mut image, height, alpha, search_box);
         image
+    }
+
+    /// O menu Iniciar de `width` x `height` sobre a `desktop` com a barra de
+    /// `taskbar` linhas: o painel (escuro, ou claro com `light`) colado à
+    /// esquerda e à barra, a coluna de ícones, a lista de aplicativos (o ícone
+    /// e o nome de cada um) e os blocos azuis.
+    pub fn start_menu(desktop: &Image, width: usize, height: usize, taskbar: usize, light: bool) -> Image {
+        let mut menu = desktop.clone();
+        let (bottom, top) = (desktop.height - taskbar, desktop.height - taskbar - height);
+        let background = if light { [0xE6, 0xE6, 0xE6] } else { [0x1F, 0x22, 0x26] };
+        paint(&mut menu, 0..width, top..bottom, |_, _| background);
+        let text = if light { [0x10, 0x10, 0x10] } else { [0xFF, 0xFF, 0xFF] };
+        for row in (top + 60..bottom - 20).step_by(36) {
+            paint(&mut menu, 60..84, row..row + 24, |_, _| [0x00, 0x78, 0xD7]);
+            paint(&mut menu, 96..96 + 140 - row % 50, row + 8..row + 18, |_, _| text);
+        }
+        for index in 0..6 {
+            if top + 32 + index * 48 < bottom {
+                paint(&mut menu, 16..32, top + 16 + index * 48..top + 32 + index * 48, |_, _| text);
+            }
+        }
+        for column in 0..3 {
+            for line in 0..3 {
+                let (left, upper) = (330 + column * 104, top + 50 + line * 104);
+                if left + 100 < width {
+                    paint(&mut menu, left..left + 100, upper..upper + 100, |_, _| [0x00, 0x63, 0xB1]);
+                }
+            }
+        }
+        menu
     }
 
     /// O relógio da [`taskbar`] no minuto seguinte: um entalhe de 8x8 no fim
@@ -1581,5 +1726,39 @@ mod tests {
         paint(&mut repainted, 400..600, HEIGHT - 40..HEIGHT, |_, _| [0x40, 0x40, 0x40]);
         assert!(clock_ticked(&reference, &repainted, &layout).unwrap_err().contains("resto da barra"));
         assert!(clock_ticked(&reference, &filled(800, 600, [0, 0, 0]), &layout).unwrap_err().contains("mudou de tamanho"));
+    }
+
+    /// O menu Iniciar: o painel colado embaixo à esquerda, escuro, claro, em
+    /// tela inteira ou com o botão Iniciar realçado, passa; uma caixa pequena,
+    /// uma notificação embaixo à direita, um painel vazio, lixo e a tela de
+    /// bugcheck não.
+    #[test]
+    fn start_menu_open_sees_a_flyout_anchored_bottom_left() {
+        let before = desktop(40, 218, true);
+        for (width, height, light) in [(640, 600, false), (WIDTH, HEIGHT - 40, false), (640, 600, true)] {
+            let open = start_menu_open(&before, &start_menu(&before, width, height, 40, light)).unwrap_or_else(|missing| panic!("{width}x{height} {light}: {missing}"));
+            assert!(open.starts_with(&format!("menu Iniciar {width}x{height} em (0,{})", HEIGHT - 40 - height)), "{open}");
+        }
+        let mut lit = start_menu(&before, 640, 600, 40, false);
+        paint(&mut lit, 0..48, HEIGHT - 40..HEIGHT, |_, _| [0x40, 0x40, 0x40]);
+        assert!(start_menu_open(&before, &lit).is_ok(), "{:?}", start_menu_open(&before, &lit));
+        assert!(start_menu_open(&before, &start_menu(&before, 300, 200, 40, false)).unwrap_err().contains("menor que 240x240"));
+        let mut toast = before.clone();
+        paint(&mut toast, 660..1020, 618..718, |_, _| [0x1F, 0x1F, 0x1F]);
+        assert!(start_menu_open(&before, &toast).unwrap_err().contains("nao esta colado"));
+        let mut blank = before.clone();
+        paint(&mut blank, 0..640, 128..728, |_, _| [0x1F, 0x22, 0x26]);
+        assert!(start_menu_open(&before, &blank).unwrap_err().contains("texto ou icone"));
+        let memory = memory_as_pixels();
+        let mut garbage = before.clone();
+        paint(&mut garbage, 0..640, 128..728, |x, y| {
+            let at = (y * WIDTH + x) * 3;
+            [memory.rgb[at], memory.rgb[at + 1], memory.rgb[at + 2]]
+        });
+        assert!(start_menu_open(&before, &garbage).is_err());
+        assert_eq!(start_menu_open(&before, &filled(WIDTH, HEIGHT, BUGCHECK_BACKGROUND)).unwrap_err(), "a tela de bugcheck");
+        assert!(start_menu_open(&before, &before).unwrap_err().contains("nao mudou"));
+        // Sem a barra na tela de antes, não há o que comparar.
+        assert!(start_menu_open(&wallpaper(), &start_menu(&before, 640, 600, 40, false)).unwrap_err().contains("linhas embaixo"));
     }
 }

@@ -32,7 +32,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::screen_check::{self, CURSOR_MOVED_MARKER, DESKTOP_AFTER, DESKTOP_MARKER, FIRST_PIXEL_MARKER, LOGON_DISMISS_MARKER, LOGON_SCREEN_MARKER, TASKBAR_AFTER, TASKBAR_MARKER};
+use crate::screen_check::{self, CURSOR_MOVED_MARKER, DESKTOP_AFTER, DESKTOP_MARKER, FIRST_PIXEL_MARKER, LOGON_DISMISS_MARKER, LOGON_SCREEN_MARKER, START_MENU_MARKER, TASKBAR_AFTER, TASKBAR_MARKER};
 
 #[derive(Clone, Debug)]
 pub struct MachineOptions {
@@ -613,6 +613,11 @@ pub enum InputAction {
     /// Espera a tela de bloqueio parada, digita as teclas e confere que ela
     /// saiu ([`screen_check::lock_dismissed`], o `LOGON_DISMISS_OK`).
     Dismiss(String),
+    /// Espera a área de trabalho com a barra parada, digita as teclas (a
+    /// tecla do Windows), confere o menu Iniciar aberto
+    /// ([`screen_check::start_menu_open`]) e que o Esc o fecha (o
+    /// `START_MENU_OK`).
+    StartMenu(String),
 }
 
 /// `--send=MARCADOR[+MS]:TECLAS`, `--dismiss=MARCADOR[+MS]:TECLAS` e
@@ -654,6 +659,13 @@ impl InputSend {
         let (after, delay, keys) = Self::when("--dismiss", text)?;
         key_names(keys)?;
         Ok(InputSend { after, delay, action: InputAction::Dismiss(keys.to_string()) })
+    }
+
+    /// `--start-menu=MARCADOR[+MS]:TECLAS`.
+    pub fn start_menu(text: &str) -> Result<InputSend, String> {
+        let (after, delay, keys) = Self::when("--start-menu", text)?;
+        key_names(keys)?;
+        Ok(InputSend { after, delay, action: InputAction::StartMenu(keys.to_string()) })
     }
 
     /// `--mouse=MARCADOR[+MS]:DX,DY`.
@@ -1399,6 +1411,28 @@ fn dismiss_lock(monitor: &mut TcpStream, ppm: &Path, keys: &str, sent: &mut Opti
 /// sobe numa animação).
 const DISMISS_WAIT: Duration = Duration::from_secs(60);
 
+/// Quanto o `--start-menu` espera o menu abrir e fechar (o pacote sai do
+/// congelamento e desenha a primeira vez no WARP).
+const START_MENU_WAIT: Duration = Duration::from_secs(60);
+
+/// O `--start-menu`: espera a área de trabalho com a barra parada
+/// ([`screen_check::taskbar_screen`], por até [`STILL_WAIT`]), digita as
+/// teclas (a tecla do Windows, `{meta_l}`; a hora vai para `sent`), espera o
+/// menu aberto e parado ([`screen_check::start_menu_open`]), aperta o Esc e
+/// espera a tela de antes de volta ([`screen_check::same_screen`]), cada
+/// espera por até [`START_MENU_WAIT`]. Devolve o menu achado, ou o que faltou.
+fn open_start_menu(monitor: &mut TcpStream, ppm: &Path, keys: &str, sent: &mut Option<Instant>) -> Result<String, String> {
+    let before = still_screen(monitor, ppm, STILL_WAIT, screen_check::taskbar_screen).map_err(|missing| format!("a area de trabalho com a barra nao parou: {missing}"))?;
+    *sent = Some(Instant::now());
+    type_keys(monitor, keys)?;
+    let open = still_screen(monitor, ppm, START_MENU_WAIT, |image| screen_check::start_menu_open(&before, image)).map_err(|missing| format!("o menu Iniciar nao abriu: {missing}"))?;
+    let opened = screen_check::start_menu_open(&before, &open)?;
+    type_keys(monitor, "{esc}")?;
+    let back = |image: &crate::png::Image| if screen_check::same_screen(&before, image) { Ok(String::new()) } else { Err("a tela nao voltou a de antes da tecla".to_string()) };
+    still_screen(monitor, ppm, START_MENU_WAIT, back).map_err(|missing| format!("o menu Iniciar abriu ({opened}), mas nao fechou com o Esc: {missing}"))?;
+    Ok(format!("{opened}; fechou com o Esc"))
+}
+
 /// O `--mouse`: espera a tela desenhada parada
 /// ([`screen_check::drawn_screen`], por até [`STILL_WAIT`]), anda o mouse
 /// PS/2 (`dx`, `dy`) em [`MOUSE_STEPS`] `mouse_move` (a hora vai para
@@ -1884,6 +1918,19 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
                         Err(missing) => {
                             note(format!("[xtask] a tela de bloqueio nao saiu com {keys} (aos {at:.1} s): {missing}"));
                             return Err(format!("a tela de bloqueio nao saiu com {keys}: {missing}"));
+                        }
+                    }
+                }
+                InputAction::StartMenu(keys) => {
+                    let ppm = log.with_file_name("tela-monitor.ppm");
+                    let mut sent = None;
+                    let outcome = with_monitor(&mut |monitor| open_start_menu(monitor, &ppm, keys, &mut sent));
+                    let at = sent.map_or(at, |sent| sent.duration_since(launched).as_secs_f64());
+                    match outcome {
+                        Ok(description) => note(format!("{KEYS_SENT}: {keys} (aos {at:.1} s)\n[xtask] menu Iniciar: {description}\n{START_MENU_MARKER}")),
+                        Err(missing) => {
+                            note(format!("[xtask] o menu Iniciar nao abriu e fechou com {keys} (aos {at:.1} s): {missing}"));
+                            return Err(format!("o menu Iniciar nao abriu e fechou com {keys}: {missing}"));
                         }
                     }
                 }
