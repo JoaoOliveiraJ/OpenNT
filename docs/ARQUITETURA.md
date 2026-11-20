@@ -4833,9 +4833,14 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   SystemCodeIntegrityPolicyInformation (164, pelo callback de política da
   CI, `se/code_integrity.rs`), a SystemShadowStackInformation (221, sem
   CET), a SystemPolicyInformation (134: exatamente 0x20 bytes, com 0x20 no
-  ReturnLength; desvio: sem o decodificador do SPCall, responde
-  STATUS_OBJECT_NAME_NOT_FOUND, que o slc e o lsm tratam como valor de
-  licença ausente e seguem com o padrão), as classes 210 e 211 do NtQuerySystemInformationEx sobre o
+  ReturnLength; o pedido cifrado do slc passa pelo despachante do SPCall
+  em `ex/license/system_policy.rs`, com a cifra em `policy_cipher.rs`: o
+  código 0 lê o valor de licença pelo nome no armazém do convidado e faz a
+  verificação de cópia genuína do kernel, o código 5 é a espera do
+  trabalhador da marca d'água do explorer pela notificação de cópia não
+  genuína, e os outros códigos respondem E_NOTIMPL como o tratador padrão
+  do 19041; desvio: os códigos que o 19041 trata e que nada no convidado
+  usa também caem nesse tratador), as classes 210 e 211 do NtQuerySystemInformationEx sobre o
   armazém de features vazio (`cm/feature_configuration.rs`), a
   ThreadIoPriority (22) do NtQuery/SetInformationThread e o
   TokenLinkedToken (19), que sem sessão irmã devolve

@@ -589,10 +589,16 @@ fn expired(timeout: Option<u64>, deadline: Option<u64>) -> bool {
 /// sondando o objeto (ou o pulso, [`PolledObjects`]) e girando o
 /// `pump_kernel`.
 pub fn wait_for_single_object(object: u64, timeout_pointer: u64, wait_mode: u8, alertable: bool) -> u32 {
+    wait_for_single_object_reason(object, wait::reason::EXECUTIVE, wait_mode, alertable, timeout_to_100ns(timeout_pointer))
+}
+
+/// [`wait_for_single_object`] com o WaitReason do chamador e o prazo já
+/// convertido (100 ns; `None` = infinito).
+pub fn wait_for_single_object_reason(object: u64, wait_reason: u8, wait_mode: u8, alertable: bool, timeout: Option<u64>) -> u32 {
     if wait::can_wait() {
-        return wait::wait_for_objects(&[object], false, wait::Deadline::after(timeout_to_100ns(timeout_pointer)), wait_mode, alertable, wait::reason::EXECUTIVE);
+        return wait::wait_for_objects(&[object], false, wait::Deadline::after(timeout), wait_mode, alertable, wait_reason);
     }
-    let (timeout, deadline) = deadline(timeout_pointer);
+    let deadline = timeout.map(|timeout| clock::uptime_100ns() + timeout);
     let polled = PolledObjects::new(alloc::vec![object], 1);
     if alertable {
         let mut poll = || polled.try_now().or_else(|| expired(timeout, deadline).then_some(STATUS_TIMEOUT));

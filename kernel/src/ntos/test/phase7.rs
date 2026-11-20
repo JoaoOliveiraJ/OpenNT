@@ -2913,6 +2913,8 @@ fn user_syscalls_core(assert: Assert) {
     // Informações do sistema.
     assert(call("NtQuerySystemInformation", 0, buffer, 0x40, info) == 0 && { let system = unsafe { nt::SystemBasicInformation::at(buffer) }; system.page_size.get() == 0x1000 && system.allocation_granularity.get() == 0x10000 && system.minimum_user_mode_address.get() == 0x1_0000 && system.maximum_user_mode_address.get() == 0x7FFF_FFFE_FFFF } && guest::read32(info) == 0x40, "usercore: SYSTEM_BASIC_INFORMATION (usuario de 64 KB a MmHighestUserAddress)");
     assert(call("NtQuerySystemInformation", 0, buffer, 0x20, info) == 0xC000_0004 && guest::read32(info) == 0x40 && call("NtQuerySystemInformation", 50, buffer, 8, 0) == 0 && guest::read64(buffer) == 0xFFFF_8000_0000_0000, "usercore: tamanho curto e inicio do sistema");
+    // SystemPolicyInformation (classe 134): `test/system_policy`.
+    super::system_policy::user_service(assert);
     // SystemNumaProcessorMap como o ExpQueryNumaProcessorMap: o
     // HighestNodeNumber a partir de 4 bytes (o Reserved fica como está), os
     // GROUP_AFFINITY dos nós que cabem a partir de 8 + 16, ReturnLength 4
@@ -2990,14 +2992,17 @@ fn user_syscalls_core(assert: Assert) {
     assert(dfss && energy && usage && memory_topology && shadow_stack, "usercore: DFSS desligado, estimador de energia, uso de memoria, topologia de memoria e CET");
     // SystemPolicyInformation (o SLGetWindowsInformation do lsm no logon de
     // um usuário): exatamente 0x20 bytes, com 0x20 no ReturnLength também na
-    // recusa, alinhamento 4, e a política sem o valor pedido.
+    // recusa, alinhamento 4, e o SYSTEM_POLICY_INFORMATION sem InputData
+    // recusado pela captura (0x6c8260) com STATUS_BUFFER_TOO_SMALL. O pedido
+    // cifrado: `test/system_policy`.
+    guest::write_bytes(buffer, &[0; 0x20]);
     guest::write32(info, 0);
     let policy_short = call("NtQuerySystemInformation", 134, buffer, 0x1F, info) == 0xC000_0004 && guest::read32(info) == 0x20;
     guest::write32(info, 0);
     let policy_long = call("NtQuerySystemInformation", 134, buffer, 0x28, info) == 0xC000_0004 && guest::read32(info) == 0x20;
     guest::write32(info, 0);
-    let policy_absent = call("NtQuerySystemInformation", 134, buffer, 0x20, info) == 0xC000_0034 && guest::read32(info) == 0x20 && call("NtQuerySystemInformation", 134, buffer + 2, 0x20, info) == 0x8000_0002;
-    assert(policy_short && policy_long && policy_absent, "usercore: SystemPolicyInformation confere 0x20 bytes e responde valor ausente");
+    let policy_empty = call("NtQuerySystemInformation", 134, buffer, 0x20, info) == 0xC000_0023 && guest::read32(info) == 0x20 && call("NtQuerySystemInformation", 134, buffer + 2, 0x20, info) == 0x8000_0002;
+    assert(policy_short && policy_long && policy_empty, "usercore: SystemPolicyInformation confere 0x20 bytes e recusa o pedido sem InputData");
     // SystemRecommendedSharedDataAlignment (o CoreMessaging): o
     // KeLargestCacheLine em pelo menos 4 bytes, alinhamento 4.
     guest::write32(info, 0);

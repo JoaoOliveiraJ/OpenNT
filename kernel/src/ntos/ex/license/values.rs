@@ -84,6 +84,21 @@ pub fn query(name: u64, type_pointer: u64, buffer: u64, capacity: u32, length: u
     Ok(status)
 }
 
+/// O g_kernelCallbacks+0x128 do 19041 (rva 0x71f3c0, posto pelo
+/// ClipInitHandles), por onde o SystemPolicyInformation lê os valores: o
+/// contexto de licença do server silo corrente e o
+/// SLQueryLicenseValueInternal (o provedor do ClipSp, quando registrado,
+/// responde no lugar dele), sem as guardas de argumento do
+/// ZwQueryLicenseValue.
+pub fn query_silo(name: u64, type_pointer: u64, buffer: u64, capacity: u32, length: u64) -> Result<u32, KernelError> {
+    let context = current_context()?;
+    let providers = Providers::default();
+    if let Some(query_license) = providers.query_license {
+        return Ok(query_license(context, name, type_pointer, buffer, capacity, length));
+    }
+    license_service::query(context, name, type_pointer, buffer, capacity, length, &providers)
+}
+
 pub fn host_context() -> u64 {
     VALUES.lock().host_context
 }

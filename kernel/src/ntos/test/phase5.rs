@@ -1458,6 +1458,7 @@ pub fn run(assert: Assert) {
     license_cache_index_and_state(assert);
     license_service_queries(assert);
     license_boot_values_and_anonymous(assert);
+    super::system_policy::run(assert);
     capability_policy_and_check(assert);
     super::registry_hive::run(assert);
     super::registry_model::run(assert);

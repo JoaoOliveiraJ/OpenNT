@@ -97,7 +97,7 @@ pub fn query_reported(class: u32, output: u64, length: u32, previous_mode: u8) -
             platform_binary_information(output, length)
         }
         SYSTEM_MEMORY_TOPOLOGY_INFORMATION => crate::ntos::mm::memory_information::memory_topology_information(output, length, &mut reported),
-        SYSTEM_POLICY_INFORMATION => Ok(policy_information(length, &mut reported)),
+        SYSTEM_POLICY_INFORMATION => policy_information(output, length, &mut reported),
         _ if SYSTEM_CODE_INTEGRITY_POLICY_CLASSES.contains(&class) => crate::ntos::se::code_integrity::query_policy_information(class, 0, 0, output, length, &mut reported),
         _ => return None,
     };
@@ -106,23 +106,15 @@ pub fn query_reported(class: u32, output: u64, length: u32, previous_mode: u8) -
 
 /// SystemPolicyInformation (ExpQuerySystemInformation 19041, rva 0x6cc402):
 /// a célula do tamanho recebe 0x20 antes de tudo e o comprimento tem de ser
-/// exatamente 0x20 (senão STATUS_INFO_LENGTH_MISMATCH). O 19041 decodifica
-/// então o pedido do SYSTEM_POLICY_INFORMATION (rva 0x6c8260, que o captura
-/// e o passa ao despachante do SPCall, rva 0x5fe2ac) e responde com o valor
-/// da política de licença. O OpenNT não tem esse decodificador e responde
-/// que a política não tem o valor pedido (STATUS_OBJECT_NAME_NOT_FOUND).
-/// Desvio: o cliente do slc (e a cópia dele no lsm, rva 0x4ab79) traduz esse
-/// status para SL_E_VALUE_NOT_FOUND, o resultado comum de um valor ausente,
-/// e cada chamador segue com o padrão do valor (o CSLQuery::Initialize do
-/// lsm, que o RpcGetRequestForWinlogon chama no logon de um usuário).
-fn policy_information(length: u32, reported: &mut u32) -> u32 {
-    const SIZE: u32 = 0x20;
-    const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
-    *reported = SIZE;
-    if length != SIZE {
-        return STATUS_INFO_LENGTH_MISMATCH;
+/// exatamente 0x20 (senão STATUS_INFO_LENGTH_MISMATCH); depois a captura e
+/// o despachante do pedido cifrado (`license/system_policy`).
+fn policy_information(output: u64, length: u32, reported: &mut u32) -> Result<u32, KernelError> {
+    use crate::ntos::ex::license::system_policy;
+    *reported = system_policy::INFORMATION_SIZE;
+    if length != system_policy::INFORMATION_SIZE {
+        return Ok(STATUS_INFO_LENGTH_MISMATCH);
     }
-    STATUS_OBJECT_NAME_NOT_FOUND
+    system_policy::query(output)
 }
 
 /// ExpGetSystemPlatformBinary (ntoskrnl 19041, rva 0x7cfd64): o
