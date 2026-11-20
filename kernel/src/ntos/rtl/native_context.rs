@@ -14,8 +14,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use core::mem::{offset_of, size_of};
 
 use crate::hal::amd64::win32_thunk;
-use crate::hal::lapic;
 use crate::ntos::inc::types::{Context, Field, NtStruct, XsaveFormat};
+use crate::ntos::ke::pcr;
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::{kernel_stack, memory_map};
 use crate::rtl::{KernelError, SpinLock};
@@ -147,7 +147,8 @@ static NEXT_SIGNAL: AtomicU64 = AtomicU64::new(1);
 /// A pilha em que a CPU executa: a reserva da pilha de kernel que contém o
 /// RSP (cada thread tem a sua, e uma thread que deixou a CPU no meio de uma
 /// chamada a reencontra ao voltar) ou, fora da janela das pilhas, a CPU (a
-/// pilha de boot e as de reserva).
+/// pilha de boot e as de reserva), pelo KPRCB.Number do GS: o registrador de
+/// ID do LAPIC custaria uma saída da máquina virtual a cada chamada.
 fn current_stack() -> u64 {
     let rsp: u64;
     // SAFETY: só lê o registrador.
@@ -155,7 +156,10 @@ fn current_stack() -> u64 {
     if memory_map::is_kernel_stack(rsp) {
         return (1 << 63) | (rsp - memory_map::KERNEL_STACK_BASE) / kernel_stack::SLOT_SIZE;
     }
-    (lapic::read(0x20) >> 24) as u64
+    if pcr::get_pcr_address() == 0 {
+        return 0;
+    }
+    pcr::current().prcb.number.get() as u64
 }
 
 fn top_invocation() -> Option<(u64, u64)> {
