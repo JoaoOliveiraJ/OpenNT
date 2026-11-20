@@ -17,12 +17,14 @@
 //! valores de `Control` que
 //! o services.exe lê no início automático (o `EarlyStartServices`, a lista
 //! do conjunto inicial, e o `SvcHostSplitThresholdInKB`, o limite de
-//! memória para separar os serviços de um svchost em processos próprios),
+//! memória para separar os serviços de um svchost em processos próprios,
+//! com o valor de uma instalação nova),
 //! o `FullProcessInformationSID` de `Control\Windows`, que o
 //! BrokerInfrastructure lê ao subir,
-//! a configuração de energia (`Control\Power`, com "Desligar a tela: Nunca"
-//! no esquema ativo: `power_policy`), as definições WNF
-//! (`Control\Notifications`), as opções do produto (`Control\ProductOptions`,
+//! a configuração de energia (`Control\Power`, com os esquemas padrão da
+//! instalação, `default_power_schemes`, e "Desligar a tela: Nunca" no
+//! esquema ativo: `power_policy`), as definições dos nomes WNF bem
+//! conhecidos (`Control\Notifications`), as opções do produto (`Control\ProductOptions`,
 //! com a política de licença de uma instalação limpa e não ativada desta
 //! edição: `product_policy`) e, na SOFTWARE, os grupos do svchost (`Microsoft\Windows NT\CurrentVersion\
 //! Svchost`, os valores com a lista de serviços de cada grupo e as subchaves
@@ -38,7 +40,8 @@
 //! lsasrv.dll, o efslsaext.dll e a interface do dpapisrv.dll), que o
 //! LsapLoadRequiredExtensions do lsass.exe lê depois de conectar ao
 //! Reference Monitor, e o `Control\Lsa` com as subchaves, menos as da chave
-//! de boot. Fora do Windows nada é copiado.
+//! de boot e o cache dos pacotes de segurança. Fora do Windows nada é
+//! copiado.
 
 use crate::host_language::HostKey;
 
@@ -62,11 +65,19 @@ const SERVICES: &[&str] = &["DcomLaunch", "RpcEptMapper", "RpcSs", "LSM", "PlugP
 
 /// Os valores de `Control` que o services.exe lê: o EarlyStartServices (o
 /// ScStartEarlySetOfServices; sem ele todo serviço automático entra no
-/// conjunto inicial) e o SvcHostSplitThresholdInKB (o
-/// ScReadSCMConfiguration separa os serviços de um svchost quando a memória
-/// física chega ao limite; sem ele não separa).
+/// conjunto inicial), copiado desta máquina, e o SvcHostSplitThresholdInKB
+/// ([`SVCHOST_SPLIT_THRESHOLD_KB`]).
 #[cfg(windows)]
-const CONTROL_VALUES: &[&str] = &["EarlyStartServices", "SvcHostSplitThresholdInKB"];
+const CONTROL_VALUES: &[&str] = &["EarlyStartServices"];
+
+/// O SvcHostSplitThresholdInKB de uma instalação nova: 0x380000 KB (3,5 GB),
+/// o valor que a imagem do Windows traz. Nenhum programa o calcula: o
+/// services.exe só o lê (o ScReadSCMConfiguration separa os serviços de um
+/// svchost quando a memória física do GlobalMemoryStatusEx chega ao limite;
+/// sem o valor não separa), então quem decide é a memória do convidado, e o
+/// valor desta máquina, que pode ter sido trocado, não vai.
+#[cfg_attr(not(windows), allow(dead_code))]
+const SVCHOST_SPLIT_THRESHOLD_KB: u32 = 0x38_0000;
 
 /// As chaves da hive SYSTEM, já no conjunto de controle que a hive guarda
 /// (`control_set`, como `ControlSet001`).
@@ -85,6 +96,7 @@ pub fn system_keys(control_set: &str) -> Vec<HostKey> {
         registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\Control"), &format!("{control_set}\\Control"), false, &mut keys);
         if let Some(control) = keys.get_mut(first) {
             control.values.retain(|(name, _, _)| CONTROL_VALUES.iter().any(|kept| kept.eq_ignore_ascii_case(name)));
+            control.values.push((String::from("SvcHostSplitThresholdInKB"), 4, SVCHOST_SPLIT_THRESHOLD_KB.to_le_bytes().to_vec()));
         }
         // Só o FullProcessInformationSID da chave Control\Windows (um SID de
         // serviço, S-1-5-80-...): o PsmpInitializeQueryDescriptor do
@@ -128,19 +140,29 @@ pub fn system_keys(control_set: &str) -> Vec<HostKey> {
         // esquemas, as configurações e os padrões (o Control\Power com as
         // subchaves que esta conta lê).
         registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\Control\\Power"), &format!("{control_set}\\Control\\Power"), true, &mut keys);
-        // "Desligar a tela: Nunca" no esquema ativo (`power_policy`).
+        // Os esquemas de uma instalação nova (`default_power_schemes`) e,
+        // neles, "Desligar a tela: Nunca" no esquema ativo (`power_policy`).
+        default_power_schemes(control_set, &mut keys);
         power_policy(control_set, &mut keys);
         registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\Control\\LsaExtensionConfig"), &format!("{control_set}\\Control\\LsaExtensionConfig"), true, &mut keys);
-        // As definições dos nomes WNF permanentes e persistentes desta
-        // instalação (`Control\Notifications`: um REG_BINARY por nome, com o
-        // descritor, o limite de dados e o tipo, sem dados publicados). O
-        // ExpWnfLookupNameDefinition do kernel lê a definição para cada
-        // NtQueryWnfStateData e NtSubscribeWnfStateChange de um nome bem
-        // conhecido ou permanente; sem ela o rpcss (o
-        // WNF_UMGR_SESSIONUSER_TOKEN_CHANGE), o CPolicyMonitor do lsm (o
+        // As definições dos nomes WNF bem conhecidos (`Control\Notifications`:
+        // um REG_BINARY por nome, com o descritor, o limite de dados e o
+        // tipo, sem dados publicados). O ExpWnfLookupNameDefinition do kernel
+        // lê a definição para cada NtQueryWnfStateData e
+        // NtSubscribeWnfStateChange de um nome bem conhecido; sem ela o rpcss
+        // (o WNF_UMGR_SESSIONUSER_TOKEN_CHANGE), o CPolicyMonitor do lsm (o
         // WNF_GPOL_SYSTEM_CHANGES), o psmsrv e o brokerlib recebem
-        // STATUS_OBJECT_NAME_NOT_FOUND e param.
+        // STATUS_OBJECT_NAME_NOT_FOUND e param. Só os nomes bem conhecidos
+        // (`well_known_wnf`), que os componentes do Windows definem na
+        // instalação e nenhum programa cria depois; os descritores levam SIDs
+        // de serviço, de capacidade e um domínio S-1-5-21 fixo que os próprios
+        // binários do Windows trazem nas cadeias SDDL (o lsasrv.dll, o
+        // cdp.dll, o diagtrack.dll), não o desta máquina.
+        let notifications = keys.len();
         registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\Control\\Notifications"), &format!("{control_set}\\Control\\Notifications"), false, &mut keys);
+        if let Some(key) = keys.get_mut(notifications) {
+            key.values.retain(|(name, _, _)| well_known_wnf(name));
+        }
         // A configuração dos Serviços de Terminal com as subchaves
         // (WinStations, AddIns, TerminalTypes, RCM e as outras): o
         // CPolicyMonitor do CService::Start do lsm.dll abre `Terminal Server`
@@ -157,8 +179,12 @@ pub fn system_keys(control_set: &str) -> Vec<HostKey> {
         // as políticas de acesso central que o LsapOpenCapDb abre, a
         // auditoria, o Kerberos), sem as que guardam a chave de boot da
         // instalação nas classes (JD, Skew1, GBG, Data): o lsasrv do
-        // convidado gera a dele no primeiro boot (o WxSaveSysKey). As chaves
-        // que esta conta não lê ficam de fora.
+        // convidado gera a dele no primeiro boot (o WxSaveSysKey). Fica de
+        // fora também o cache dos pacotes de segurança (`SspiCache`), que a
+        // instalação não traz: o SecCacheSspiPackages do sspicli.dll o cria
+        // quando falta, com a hora do arquivo de cada pacote e a hora da
+        // gravação (o GetSystemTimeAsFileTime), e o do convidado grava o dele.
+        // As chaves que esta conta não lê ficam de fora.
         registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\Control\\Lsa"), &format!("{control_set}\\Control\\Lsa"), false, &mut keys);
         // O convidado não tem as hives SECURITY e SAM desta instalação (as
         // contas e os segredos daqui ficam fora do volume): o kernel as
@@ -174,7 +200,7 @@ pub fn system_keys(control_set: &str) -> Vec<HostKey> {
             key.values.push((String::from("CreatePolicyDatabaseOnFirstBoot"), 4, 1u32.to_le_bytes().to_vec()));
         }
         for name in registry::list(registry::LOCAL_MACHINE, &format!("{host}\\Control\\Lsa")) {
-            if ["JD", "Skew1", "GBG", "Data"].iter().any(|boot_key| boot_key.eq_ignore_ascii_case(&name)) {
+            if ["JD", "Skew1", "GBG", "Data", "SspiCache"].iter().any(|excluded| excluded.eq_ignore_ascii_case(&name)) {
                 continue;
             }
             registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\Control\\Lsa\\{name}"), &format!("{control_set}\\Control\\Lsa\\{name}"), true, &mut keys);
@@ -235,10 +261,77 @@ fn power_policy(control_set: &str, keys: &mut Vec<HostKey>) {
     }
 }
 
+/// Os esquemas de energia de uma instalação nova: `User\PowerSchemes` passa a
+/// ser a cópia de `User\Default\PowerSchemes`, os esquemas padrão que a
+/// instalação traz (o que o `powercfg -restoredefaultschemes` refaz), com o
+/// ActivePowerScheme padrão. As mudanças desta máquina nos esquemas (os
+/// índices trocados, o modo de energia `ActiveOverlay*PowerScheme`, o esquema
+/// ativo) não vão ao convidado.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn default_power_schemes(control_set: &str, keys: &mut Vec<HostKey>) {
+    let user = format!("{control_set}\\Control\\Power\\User\\PowerSchemes");
+    let defaults = format!("{control_set}\\Control\\Power\\User\\Default\\PowerSchemes");
+    let under = |path: &str, root: &str| path.len() >= root.len() && path[..root.len()].eq_ignore_ascii_case(root) && (path.len() == root.len() || path.as_bytes()[root.len()] == b'\\');
+    keys.retain(|key| !under(&key.path, &user));
+    let copies: Vec<HostKey> = keys.iter().filter(|key| under(&key.path, &defaults)).map(|key| HostKey { path: format!("{user}{}", &key.path[defaults.len()..]), values: key.values.clone() }).collect();
+    keys.extend(copies);
+}
+
+/// Um valor de `Control\Notifications` cujo nome é o de um nome WNF bem
+/// conhecido: o nome é o WNF_STATE_NAME em hexadecimal, e o nome real (com o
+/// XOR de 0x41C64E6DA3BC0074) traz o tempo de vida nos bits 4 e 5, zero para
+/// os bem conhecidos (WnfWellKnownStateName). Os permanentes, persistentes e
+/// temporários são criados depois da instalação.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn well_known_wnf(value_name: &str) -> bool {
+    const STATE_NAME_XOR: u64 = 0x41C6_4E6D_A3BC_0074;
+    value_name.len() == 16 && u64::from_str_radix(value_name, 16).is_ok_and(|name| ((name ^ STATE_NAME_XOR) >> 4) & 3 == 0)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{power_policy, BALANCED, SUB_VIDEO, VIDEO_TIMEOUTS};
+    use super::{default_power_schemes, power_policy, well_known_wnf, BALANCED, SUB_VIDEO, VIDEO_TIMEOUTS};
     use crate::host_language::HostKey;
+
+    /// Os esquemas do convidado são os padrão: os de `User\PowerSchemes`
+    /// desta máquina saem e entram os de `User\Default\PowerSchemes`, com o
+    /// esquema ativo padrão.
+    #[test]
+    fn power_schemes_come_from_the_defaults() {
+        let utf16 = |text: &str| text.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect::<Vec<u8>>();
+        let power = "ControlSet001\\Control\\Power\\User";
+        let key = |path: &str, values: Vec<(String, u32, Vec<u8>)>| HostKey { path: format!("{power}{path}"), values };
+        let index = |value: u32| vec![(String::from("ACSettingIndex"), 4, value.to_le_bytes().to_vec())];
+        let mut keys = vec![
+            key("\\PowerSchemes", vec![(String::from("ActivePowerScheme"), 1, utf16("custom")), (String::from("ActiveOverlayAcPowerScheme"), 1, utf16("custom"))]),
+            key("\\PowerSchemes\\custom", vec![(String::from("FriendlyName"), 1, utf16("Meu plano"))]),
+            key("\\PowerSchemes\\381b4222\\sub\\setting", index(7)),
+            key("\\PowerSchemesOther", vec![]),
+            key("\\Default\\PowerSchemes", vec![(String::from("ActivePowerScheme"), 1, utf16("381b4222"))]),
+            key("\\Default\\PowerSchemes\\381b4222\\sub\\setting", index(3)),
+        ];
+        default_power_schemes("ControlSet001", &mut keys);
+        let find = |path: &str| keys.iter().find(|key| key.path == format!("{power}{path}"));
+        assert!(find("\\PowerSchemes\\custom").is_none());
+        assert_eq!(find("\\PowerSchemes").unwrap().values, vec![(String::from("ActivePowerScheme"), 1, utf16("381b4222"))]);
+        assert_eq!(find("\\PowerSchemes\\381b4222\\sub\\setting").unwrap().values, index(3));
+        assert_eq!(keys.iter().filter(|key| key.path.ends_with("\\PowerSchemes\\381b4222\\sub\\setting")).count(), 2);
+        assert!(find("\\PowerSchemesOther").is_some());
+        assert!(find("\\Default\\PowerSchemes\\381b4222\\sub\\setting").is_some());
+    }
+
+    /// Só os nomes WNF bem conhecidos (tempo de vida zero depois do XOR).
+    #[test]
+    fn only_well_known_wnf_names() {
+        // WNF_GPOL_SYSTEM_CHANGES (0x0D891E2AA3BC0875): bem conhecido.
+        assert!(well_known_wnf("0D891E2AA3BC0875"));
+        // O mesmo com o tempo de vida 1 (permanente), 2 e 3.
+        assert!(!well_known_wnf("0D891E2AA3BC0865"));
+        assert!(!well_known_wnf("0D891E2AA3BC0855"));
+        assert!(!well_known_wnf("0D891E2AA3BC0845"));
+        assert!(!well_known_wnf("Persistent"));
+        assert!(!well_known_wnf("0D891E2AA3BC08"));
+    }
 
     /// O plano de energia do convidado: sem o EnforceConsoleLockScreenTimeout
     /// desta máquina e com os dois timeouts de tela em zero no esquema ativo
