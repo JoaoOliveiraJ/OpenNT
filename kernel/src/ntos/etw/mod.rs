@@ -6,6 +6,7 @@ pub mod activity;
 pub mod logger;
 pub mod realtime;
 pub mod autologger;
+pub mod diagnostic;
 pub mod rundown;
 pub mod user_registration;
 pub mod wmi;

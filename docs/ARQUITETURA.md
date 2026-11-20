@@ -2808,9 +2808,13 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   sessão de `Control\WMI\Autologger` com Start, com as propriedades da
   chave, habilitam os provedores das subchaves (Enabled, EnableLevel,
   MatchAnyKeyword, MatchAllKeyword, EnableProperty) e gravam o Status de
-  cada chave; o arquivo da sessão e o RtBackup não existem. Testes:
+  cada chave; o arquivo da sessão e o RtBackup não existem. Diagnóstico
+  (`diagnostic.rs`, só serial): cada evento do provedor do Service Control
+  Manager que alguma sessão aceita sai como `[scm] evento <Id> <campos>`
+  (no boot da cadeia, pela EventLog-System), com os começos e paradas de
+  serviço e as falhas 7000-7045 do services.exe. Testes:
   `etw_trace_session`, `etw_user_registration` e `etw_realtime` (com os
-  autologgers) na fase 6;
+  autologgers e o diagnóstico `[scm]`) na fase 6;
   o marcador `ETW_USER_REGISTRATION_OK` no boot do smss real.
 - **Trava e energia do KD** (`kd/power.rs`): KdDebuggerLock em
   DISPATCH_LEVEL, a lista dos tratadores de energia do transporte e, com o

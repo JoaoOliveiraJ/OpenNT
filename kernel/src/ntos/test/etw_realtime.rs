@@ -190,6 +190,60 @@ pub fn run(assert: Assert) {
     guest::free_bytes(space);
     guest::free_bytes(block);
     autologgers(assert);
+    scm_diagnostic(assert);
+}
+
+/// O diagnóstico `[scm]` (`etw/diagnostic.rs`): um evento 7036 do provedor
+/// do Service Control Manager, aceito por uma sessão, vira a linha com o id
+/// e os campos (os dois UnicodeString como texto, o inteiro de 4 bytes em
+/// hexadecimal) e chega à sessão do mesmo jeito.
+fn scm_diagnostic(assert: Assert) {
+    use crate::ntos::etw::diagnostic;
+    let block = guest::alloc_bytes(0x300);
+    let (properties, returned, name, cells) = (block, block + 0x180, block + 0x100, block + 0x1C0);
+    let text: Vec<u16> = "OpenNT-SCM".encode_utf16().collect();
+    guest::write_bytes(name, &text.iter().flat_map(|unit| unit.to_le_bytes()).collect::<Vec<u8>>());
+    let prepare = || {
+        guest::write_bytes(properties, &[0; 0xB0]);
+        guest::write32(properties, 0xB0);
+        guest::write32(properties + 0x2C, 0x2_0000);
+        guest::write32(properties + 0x30, 4);
+        guest::write16(properties + 0x90, (text.len() * 2) as u16);
+        guest::write16(properties + 0x92, (text.len() * 2) as u16);
+        guest::write64(properties + 0x98, name);
+    };
+    let control = |code: u64| call_export("ZwTraceControl", &[code, properties, 0xB0, properties, 0xB0, returned]);
+    prepare();
+    let started = control(1);
+    let logger_id = (guest::read64(properties + 8) & 0xFFFF) as u16;
+    // {555908d1-a6d7-4695-8e1e-26931d2012f4}
+    let scm: [u8; 16] = [0xD1, 0x08, 0x59, 0x55, 0xD7, 0xA6, 0x95, 0x46, 0x8E, 0x1E, 0x26, 0x93, 0x1D, 0x20, 0x12, 0xF4];
+    let (provider, registration, descriptor, data, first, second, error) = (cells, cells + 0x10, cells + 0x18, cells + 0x28, cells + 0x58, cells + 0x78, cells + 0xA0);
+    guest::write_bytes(provider, &scm);
+    let registered = call_export("EtwRegister", &[provider, 0, 0, registration]);
+    let handle = guest::read64(registration);
+    let enabled = logger::enable_provider(logger_id, scm, 4, 0x8000_0000_0000_0000);
+    let wide = |text: &str| text.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect::<Vec<u8>>();
+    let (service, state) = (wide("Teste"), wide("em execução"));
+    guest::write_bytes(first, &service);
+    guest::write_bytes(second, &state);
+    guest::write32(error, 0x41D);
+    for (index, (pointer, length)) in [(first, service.len()), (second, state.len()), (error, 4)].into_iter().enumerate() {
+        guest::write64(data + index as u64 * 0x10, pointer);
+        guest::write32(data + index as u64 * 0x10 + 8, length as u32);
+    }
+    guest::write_bytes(descriptor, &[0; 16]);
+    guest::write16(descriptor, 7036);
+    guest::write8(descriptor + 4, 4);
+    guest::write64(descriptor + 8, 0x8000_0000_0000_0000);
+    let written = call_export("EtwWrite", &[handle, descriptor, 0, 3, data]);
+    let records = logger::records(logger_id).map_or(0, |records| records.len());
+    let line = diagnostic::last_scm_line();
+    assert(started == Some(0) && registered == Some(0) && matches!(enabled, Ok(0)) && written == Some(0) && records == 1 && line.as_deref() == Some("evento 7036 Teste / em execução / 0x41d"), "etw-scm: o evento do SCM sai na serial com o id e os campos e chega a sessao");
+    let _ = call_export("EtwUnregister", &[handle]);
+    prepare();
+    let _ = control(2);
+    guest::free_bytes(block);
 }
 
 /// As chaves de autologger do teste, fora de `Control\WMI\Autologger`.

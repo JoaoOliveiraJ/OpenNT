@@ -744,6 +744,8 @@ pub fn deliver(handle: u64, descriptor: [u8; 16], payload: impl FnOnce() -> Resu
         thread_id: if thread != 0 { crate::ntos::ps::thread_accessors::id(thread) as u32 } else { 0 },
         data: payload.segments,
     };
+    // O diagnóstico na serial (os eventos do SCM), uma vez por evento.
+    super::diagnostic::observe(&event);
     for session in recipients {
         let Some(consumer) = with(|etw| etw.sessions.get_mut(&session).map(|found| {
             found.delivered += 1;
