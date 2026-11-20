@@ -1093,36 +1093,86 @@ pub fn unmap(view: &Arc<View>, authority: Option<&secured_views::SecuredToken>) 
     Ok(())
 }
 
+/// Páginas por escrita do writeback: o agrupamento do escritor de páginas
+/// modificadas do Mm (16 páginas, 64 KB por escrita).
+const WRITEBACK_CLUSTER: usize = 16;
+
+/// Uma página alterada da control area: o frame da seção, a cópia original
+/// e a faixa `[first, end)` entre o primeiro e o último byte que diferem.
+struct DirtyPage {
+    page: u64,
+    frame: u64,
+    original: u64,
+    first: usize,
+    end: usize,
+}
+
 /// Compara com os bytes lidos desta control area: páginas não alteradas
 /// nunca sobrescrevem I/O independente; frames COW privados nunca são
-/// gravados. Só as diferenças são escritas, e a cópia só é atualizada
-/// depois de o dispositivo aceitar a escrita.
+/// gravados. As páginas alteradas vizinhas vão numa escrita só, até 16 (o
+/// agrupamento do escritor de páginas modificadas), do primeiro ao último
+/// byte alterado do grupo; os bytes que a vista não mudou no meio levam o
+/// conteúdo atual do arquivo, lido antes, então só as diferenças mudam o
+/// arquivo. A cópia só é atualizada depois de o dispositivo aceitar a
+/// escrita.
 pub fn flush(section: &Section) -> Result<(), KernelError> {
     let Some(file) = &section.file else { return Ok(()) };
     let Some(area) = section.control_area() else { return Ok(()) };
     let originals: Vec<(u64, u64)> = area.lock().original.iter().map(|(&page, &frame)| (page, frame)).collect();
+    let size = file.size();
+    let mut group: Vec<DirtyPage> = Vec::new();
     for (page, original) in originals {
         let Some(frame) = section.frame(page) else { continue };
-        let length = PAGE.min(file.size().saturating_sub(page * PAGE)) as usize;
+        let length = PAGE.min(size.saturating_sub(page * PAGE)) as usize;
         let current = physical::read_bytes(frame, length);
         let saved = physical::read_bytes(original, length);
-        if current == saved {
-            continue;
+        let differs = |index: &usize| current[*index] != saved[*index];
+        let Some(first) = (0..length).find(differs) else { continue };
+        let end = (0..length).rfind(differs).map_or(length, |last| last + 1);
+        if group.last().is_some_and(|last| last.page + 1 != page) || group.len() == WRITEBACK_CLUSTER {
+            write_dirty_group(file.as_ref(), &group)?;
+            group.clear();
         }
-        let mut first: Option<usize> = None;
-        for index in 0..=length {
-            let changed = index < length && current[index] != saved[index];
-            if changed && first.is_none() {
-                first = Some(index);
-            }
-            if !changed {
-                if let Some(start) = first.take() {
-                    let bytes = &current[start..index];
-                    file.write_at(page * PAGE + start as u64, bytes).map_err(|error| KernelError::with_status(format!("section writeback failed: {}", error.message), status_of(&error, 0xC000_0185)))?;
-                    physical::write_bytes(original + start as u64, bytes);
-                }
+        group.push(DirtyPage { page, frame, original, first, end });
+    }
+    write_dirty_group(file.as_ref(), &group)
+}
+
+/// Grava um grupo de páginas alteradas vizinhas numa escrita: o conteúdo
+/// atual do arquivo na faixa com os bytes que a vista mudou por cima. Só
+/// esses bytes entram na cópia original depois da escrita.
+fn write_dirty_group(file: &dyn SectionFile, group: &[DirtyPage]) -> Result<(), KernelError> {
+    let (Some(head), Some(tail)) = (group.first(), group.last()) else { return Ok(()) };
+    let failed = |error: KernelError| KernelError::with_status(format!("section writeback failed: {}", error.message), status_of(&error, 0xC000_0185));
+    let start = head.page * PAGE + head.first as u64;
+    let span = (tail.page * PAGE + tail.end as u64 - start) as usize;
+    let mut bytes = file.read_at(start, span as u64).map_err(failed)?;
+    if bytes.len() != span {
+        return Err(KernelError::with_status("section writeback short read", 0xC000_0185));
+    }
+    // Um bit por byte da faixa: os que a vista mudou.
+    let mut changed = alloc::vec![0u64; span.div_ceil(64)];
+    for dirty in group {
+        let base = (dirty.page * PAGE + dirty.first as u64 - start) as usize;
+        let current = physical::read_bytes(dirty.frame + dirty.first as u64, dirty.end - dirty.first);
+        let saved = physical::read_bytes(dirty.original + dirty.first as u64, dirty.end - dirty.first);
+        for (index, (&now, &before)) in current.iter().zip(&saved).enumerate() {
+            if now != before {
+                bytes[base + index] = now;
+                changed[(base + index) / 64] |= 1 << ((base + index) % 64);
             }
         }
+    }
+    file.write_at(start, &bytes).map_err(failed)?;
+    for dirty in group {
+        let base = (dirty.page * PAGE + dirty.first as u64 - start) as usize;
+        let mut copy = physical::read_bytes(dirty.original + dirty.first as u64, dirty.end - dirty.first);
+        for (index, byte) in copy.iter_mut().enumerate() {
+            if changed[(base + index) / 64] & (1 << ((base + index) % 64)) != 0 {
+                *byte = bytes[base + index];
+            }
+        }
+        physical::write_bytes(dirty.original + dirty.first as u64, &copy);
     }
     Ok(())
 }

@@ -439,6 +439,41 @@ fn file_and_named_sections(assert: Assert) {
     }
 }
 
+/// O writeback agrupa as páginas alteradas vizinhas numa escrita, do
+/// primeiro ao último byte alterado, com o conteúdo atual do arquivo nos
+/// bytes que a vista não mudou (uma escrita independente no meio fica). Um
+/// cache de dados de UTF-16 escrito numa vista (metade dos bytes zero, como
+/// os bytes de antes) dava uma escrita no volume por byte.
+fn grouped_section_writeback(assert: Assert) {
+    use crate::hal::physical;
+    use crate::ntos::ps::user::sections::{self, CreateOptions};
+    let file = MemoryFile::new(None, alloc::vec![0u8; 0x4000]);
+    let shared: Arc<dyn sections::SectionFile> = file.clone();
+    let Ok(Ok(section)) = sections::create(CreateOptions { size: 0x4000, page_protect: 4, attributes: 0x0800_0000, file: Some(shared), ..CreateOptions::default() }) else {
+        assert(false, "sections: secao gravavel de arquivo para o writeback agrupado");
+        return;
+    };
+    // Páginas 0 e 1: um byte sim, um não, de 0x10 a 0x1FF0 (texto UTF-16);
+    // página 3: um byte. A página 2 fica como estava.
+    let text: alloc::vec::Vec<u8> = (0x10..0x1FF2usize).map(|offset| if offset % 2 == 0 { b'a' + (offset / 2 % 26) as u8 } else { 0 }).collect();
+    physical::write_bytes(section.frame(0).unwrap_or(0) + 0x10, &text[..0x1000 - 0x10]);
+    physical::write_bytes(section.frame(1).unwrap_or(0), &text[0x1000 - 0x10..]);
+    physical::write_bytes(section.frame(3).unwrap_or(0) + 0x40, b"Z");
+    // Uma escrita independente num byte que a vista não mudou.
+    file.bytes.lock()[0x101] = b'W';
+    let flushed = sections::flush(&section).is_ok();
+    let writes = file.writes.lock().clone();
+    let bytes = file.bytes.lock().clone();
+    let text_kept = (0x10..0x1FF2usize).all(|offset| offset == 0x101 || bytes[offset] == text[offset - 0x10]);
+    assert(flushed && writes == [(0x10u64, 0x1FE1usize), (0x3040, 1)] && text_kept && bytes[0x101] == b'W' && bytes[0x3040] == b'Z' && bytes[0x2000..0x3000].iter().all(|&byte| byte == 0), "sections: o writeback grava as paginas alteradas vizinhas numa escrita e preserva o byte escrito por fora");
+    assert(sections::flush(&section).is_ok() && file.writes.lock().len() == 2, "sections: o segundo flush sem alteracao nao grava");
+    // Depois do flush, a cópia original tem os bytes da vista: só um byte
+    // novo vai na escrita seguinte, e o byte de fora não volta ao da vista.
+    physical::write_bytes(section.frame(1).unwrap_or(0) + 0x800, b"Q");
+    assert(sections::flush(&section).is_ok() && file.writes.lock().get(2) == Some(&(0x1800u64, 1usize)) && file.bytes.lock()[0x1800] == b'Q' && file.bytes.lock()[0x101] == b'W', "sections: a copia original acompanha o writeback agrupado");
+    assert(crate::ntos::ob::objects::section::collect(section.pointer()).is_ok() && sections::by_pointer(section.pointer()).is_none(), "sections: secao do writeback agrupado coletada");
+}
+
 fn image_sections(assert: Assert) {
     use crate::hal::physical;
     use crate::ntos::mm::{paging, system_image_pages};
@@ -7487,6 +7522,7 @@ pub fn run(assert: Assert) {
     map_view_parameter_validation(assert);
     data_sections(assert);
     file_and_named_sections(assert);
+    grouped_section_writeback(assert);
     image_sections(assert);
     retained_image_segments(assert);
     flat_image_sections(assert);
