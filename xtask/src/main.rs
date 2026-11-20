@@ -7,6 +7,8 @@
 //!                        [--build-only|--no-build [--image-dir=DIR]] [--kd=com2 --script=ARQ] [--capture=ARQ.png]
 //!                        [--expect-stop] [--watch-screen] [--capture-every=SEGUNDOS]
 //!                        [--expect-poweroff] [--power-cycles=N] [--allow-reboot] [--manual-crash]
+//!                        [--send=MARCADOR[+MS]:TECLAS]... [--dismiss=MARCADOR[+MS]:TECLAS]...
+//!                        [--mouse=MARCADOR[+MS]:DX,DY]...
 //! cargo xtask test-all   [--jobs=N] [--only=ID,...] [--skip=ID,...] [--repeat=N] [--keep] [--cpu-friendly]
 //! cargo xtask capturas   [--jobs=N] [--only=ID,...] [--skip=ID,...] [--keep] [--cpu-friendly]
 //! cargo xtask debug      [opções] [--launch [--no-client [--headless]]] [--connect=HOST:PORTA]
@@ -46,7 +48,12 @@
 //! o tem; o `run` e o `debug` usam o TCG), `--memory-mb=N`, `--smp=N`, `--kd-port=N`,
 //! `--monitor-port=N` (o monitor HMP do QEMU num socket local, no `debug`)
 //! (a porta TCP da COM2; `run` usa 1234 por padrão).
-//! Em `--keys`, `\n` digita Enter.
+//! Em `--keys`, `\n` digita Enter. O `--send` digita as teclas (na sintaxe do `--keys`, com
+//! `{clique}` para o clique do botão esquerdo do mouse) MS ms
+//! depois de o MARCADOR (o do teste ou um `--expect`) aparecer na serial; o `--dismiss` espera a
+//! tela de bloqueio parada, digita as teclas e confere que ela saiu (o `LOGON_DISMISS_OK`); o
+//! `--mouse` anda o mouse PS/2 (DX, DY) e confere na tela que o ponteiro andou (o
+//! `CURSOR_MOVED_OK` na serial).
 
 // As tabelas de semente do kernel (`hive_image`) usam `alloc::`.
 extern crate alloc;
@@ -150,7 +157,14 @@ test-boot:         --keys=TEXTO (\\n = Enter) --expect=TEXTO (repetivel)
                    --manual-crash (no fim, com o QEMU vivo e sem STOP, a parada manual pelo
                    teclado: Ctrl direito + Scroll Lock duas vezes, 0xE2; os dados secundarios do
                    bugcheck, como o WdLog do dxgkrnl, saem na serial e o resumo da parada no fim)
-                   no --keys, {combo} vai cru ao sendkey: {ctrl_r-scroll_lock-scroll_lock}";
+                   no --keys, {combo} vai cru ao sendkey: {ctrl_r-scroll_lock-scroll_lock}
+                   --send=MARCADOR[+MS]:TECLAS (repetivel: MS ms depois do MARCADOR na serial, as
+                   teclas pelo monitor HMP, na sintaxe do --keys; {spc} e a barra de espaco e
+                   {clique} o clique do botao esquerdo do mouse)
+                   --dismiss=MARCADOR[+MS]:TECLAS (repetivel: espera a tela de bloqueio parada, com
+                   o relogio, digita as teclas e confere que ela saiu: LOGON_DISMISS_OK na serial)
+                   --mouse=MARCADOR[+MS]:DX,DY (repetivel: o mouse PS/2 anda DX,DY pelo monitor e
+                   o test-boot confere na tela que o ponteiro andou: CURSOR_MOVED_OK na serial)";
 
 struct Arguments {
     command: String,
@@ -159,6 +173,8 @@ struct Arguments {
     positional: Vec<String>,
     keys: Option<String>,
     expect: Vec<String>,
+    /// `--send` e `--mouse`, na ordem da linha de comando.
+    inputs: Vec<qemu::InputSend>,
     hold_ms: u64,
     console_mirror_set: bool,
     /// `--build-only`: o test-boot monta a imagem e para antes do QEMU.
@@ -240,6 +256,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
         },
         positional: Vec::new(),
         keys: None,
+        inputs: Vec::new(),
         expect: Vec::new(),
         hold_ms: 0,
         console_mirror_set: false,
@@ -332,6 +349,9 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             "--smp" => parsed.machine.smp = required()?.parse().map_err(|_| "--smp invalido")?,
             "--keys" => parsed.keys = Some(required()?.replace("\\n", "\n")),
             "--expect" => parsed.expect.push(required()?),
+            "--send" => parsed.inputs.push(qemu::InputSend::keys(&required()?)?),
+            "--mouse" => parsed.inputs.push(qemu::InputSend::mouse(&required()?)?),
+            "--dismiss" => parsed.inputs.push(qemu::InputSend::dismiss(&required()?)?),
             "--hold" => parsed.hold_ms = required()?.parse().map_err(|_| "--hold invalido")?,
             "--build-only" => parsed.build_only = true,
             "--no-build" => parsed.no_build = true,
@@ -387,6 +407,9 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
     }
     if parsed.capture_every.is_some() && parsed.command != "test-boot" {
         return Err("--capture-every e opcao do test-boot".into());
+    }
+    if !parsed.inputs.is_empty() && parsed.command != "test-boot" {
+        return Err("--send, --dismiss e --mouse sao opcoes do test-boot".into());
     }
     if parsed.manual_crash && parsed.command != "test-boot" {
         return Err("--manual-crash e opcao do test-boot".into());
@@ -497,6 +520,7 @@ fn execute(arguments: Arguments) -> Result<(), String> {
                     expect_poweroff: arguments.expect_poweroff,
                     watch_screen: arguments.watch_screen,
                     capture_every: arguments.capture_every.map(Duration::from_secs),
+                    inputs: arguments.inputs,
                 },
                 &log,
                 session,
@@ -664,5 +688,26 @@ mod tests {
         assert!(parse_words(&["test-boot", "--manual-crash"]).unwrap().manual_crash);
         assert!(!parse_words(&["test-boot"]).unwrap().manual_crash);
         assert!(parse_words(&["run", "--manual-crash"]).is_err());
+    }
+
+    /// `--send`, `--dismiss` e `--mouse` ficam na ordem da linha de comando,
+    /// com o marcador, o atraso e o que mandar; as teclas sem mapa, o
+    /// movimento inválido e a falta do marcador são recusados.
+    #[test]
+    fn input_options_keep_the_command_line_order() {
+        use qemu::{InputAction, InputSend};
+        let parsed = parse_words(&["test-boot", "--dismiss=LOGONUI_STARTED:{spc}", "--mouse=LOGON_DISMISS_OK+2000:150,-100", "--send=X+5:ab{ret}"]).unwrap();
+        assert_eq!(
+            parsed.inputs,
+            vec![
+                InputSend { after: "LOGONUI_STARTED".into(), delay: Duration::ZERO, action: InputAction::Dismiss("{spc}".into()) },
+                InputSend { after: "LOGON_DISMISS_OK".into(), delay: Duration::from_millis(2000), action: InputAction::Mouse { dx: 150, dy: -100 } },
+                InputSend { after: "X".into(), delay: Duration::from_millis(5), action: InputAction::Keys("ab{ret}".into()) },
+            ]
+        );
+        for bad in ["--send=X", "--send=:a", "--send=X:", "--send=X+y:a", "--send=X:{}", "--send=X:\u{e9}", "--mouse=X:0,0", "--mouse=X:1", "--mouse=X:a,b", "--mouse=X:2000,1", "--dismiss=X"] {
+            assert!(parse_words(&["test-boot", bad]).is_err(), "{bad}");
+        }
+        assert!(parse_words(&["run", "--mouse=X:1,1"]).is_err());
     }
 }

@@ -2,7 +2,9 @@
 //!
 //! `run` abre a janela do QEMU com a serial no terminal. `test-boot` roda
 //! sem tela, espera um marcador na serial, opcionalmente digita comandos no
-//! shell pelo monitor HMP (`sendkey`) e confere a saída esperada. Com o
+//! shell pelo monitor HMP (`sendkey`), manda teclas e move o mouse pelo
+//! mesmo monitor depois de um marcador (`--send` e `--mouse`, como uma
+//! pessoa na frente da máquina: [`InputSend`]) e confere a saída esperada. Com o
 //! depurador do kernel (`--kd`), a segunda porta serial (COM2) vira um
 //! socket TCP em 127.0.0.1 (`kd_port`), onde o cliente (`cargo xtask
 //! debug`) ou o GDB se conectam; uma sessão de roteiro roda em paralelo ao
@@ -30,7 +32,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::screen_check::{self, FIRST_PIXEL_MARKER, LOGON_SCREEN_MARKER};
+use crate::screen_check::{self, CURSOR_MOVED_MARKER, FIRST_PIXEL_MARKER, LOGON_DISMISS_MARKER, LOGON_SCREEN_MARKER};
 
 #[derive(Clone, Debug)]
 pub struct MachineOptions {
@@ -552,10 +554,85 @@ pub struct TestOptions {
     /// na pasta do log a cada intervalo (só quando mudou) e, no fim do teste
     /// (passando ou não), para `tela-final.png` ([`FrameSeries`]).
     pub capture_every: Option<Duration>,
+    /// `--send`, `--dismiss` e `--mouse` (repetíveis, na ordem da linha de
+    /// comando): a entrada pelo monitor HMP depois de um marcador
+    /// ([`InputSend`]).
+    pub inputs: Vec<InputSend>,
 }
 
 /// Intervalo entre duas leituras da tela.
 const SCREEN_POLL: Duration = Duration::from_secs(2);
+
+/// O que o test-boot faz pelo monitor HMP depois de um marcador.
+#[derive(Clone, Debug, PartialEq)]
+pub enum InputAction {
+    /// Teclas na sintaxe do `--keys` ([`key_names`]): `{spc}` é a barra de
+    /// espaço; `{combo}` vai cru ao `sendkey`; `{clique}` é o clique do mouse.
+    Keys(String),
+    /// O mouse PS/2 anda (`dx`, `dy`) pelo `mouse_move`; o test-boot lê a
+    /// tela antes e depois e confere que o ponteiro andou
+    /// ([`screen_check::cursor_moved`], o `CURSOR_MOVED_OK`).
+    Mouse { dx: i32, dy: i32 },
+    /// Espera a tela de bloqueio parada, digita as teclas e confere que ela
+    /// saiu ([`screen_check::lock_dismissed`], o `LOGON_DISMISS_OK`).
+    Dismiss(String),
+}
+
+/// `--send=MARCADOR[+MS]:TECLAS`, `--dismiss=MARCADOR[+MS]:TECLAS` e
+/// `--mouse=MARCADOR[+MS]:DX,DY`: a entrada que o test-boot manda pelo
+/// monitor HMP `delay` depois de `after`
+/// aparecer na serial (o MARCADOR ou um `--expect`), como uma pessoa na
+/// frente da máquina: a tecla que dispensa a tela de bloqueio, o mouse que
+/// move o ponteiro.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InputSend {
+    pub after: String,
+    pub delay: Duration,
+    pub action: InputAction,
+}
+
+impl InputSend {
+    /// O `MARCADOR[+MS]` e o resto de `text`, depois do primeiro `:`.
+    fn when<'a>(option: &str, text: &'a str) -> Result<(String, Duration, &'a str), String> {
+        let (when, rest) = text.split_once(':').ok_or_else(|| format!("{option}={text}: falta o ':' depois do marcador"))?;
+        let (after, delay) = match when.split_once('+') {
+            Some((after, ms)) => (after, ms.parse::<u64>().map_err(|_| format!("{option}={text}: atraso invalido ({ms})"))?),
+            None => (when, 0),
+        };
+        if after.is_empty() || rest.is_empty() {
+            return Err(format!("{option}={text}: o marcador e o que mandar nao podem ser vazios"));
+        }
+        Ok((after.to_string(), Duration::from_millis(delay), rest))
+    }
+
+    /// `--send=MARCADOR[+MS]:TECLAS`; as teclas são conferidas aqui.
+    pub fn keys(text: &str) -> Result<InputSend, String> {
+        let (after, delay, keys) = Self::when("--send", text)?;
+        key_names(keys)?;
+        Ok(InputSend { after, delay, action: InputAction::Keys(keys.to_string()) })
+    }
+
+    /// `--dismiss=MARCADOR[+MS]:TECLAS`.
+    pub fn dismiss(text: &str) -> Result<InputSend, String> {
+        let (after, delay, keys) = Self::when("--dismiss", text)?;
+        key_names(keys)?;
+        Ok(InputSend { after, delay, action: InputAction::Dismiss(keys.to_string()) })
+    }
+
+    /// `--mouse=MARCADOR[+MS]:DX,DY`.
+    pub fn mouse(text: &str) -> Result<InputSend, String> {
+        let (after, delay, motion) = Self::when("--mouse", text)?;
+        let parsed = motion.split_once(',').and_then(|(dx, dy)| Some((dx.trim().parse::<i32>().ok()?, dy.trim().parse::<i32>().ok()?)));
+        match parsed {
+            Some((dx, dy)) if (dx, dy) != (0, 0) && dx.abs() <= 1000 && dy.abs() <= 1000 => Ok(InputSend { after, delay, action: InputAction::Mouse { dx, dy } }),
+            _ => Err(format!("--mouse={text}: o movimento e DX,DY inteiros, nao os dois zero, ate 1000 em cada eixo")),
+        }
+    }
+}
+
+/// O começo da linha que o test-boot põe na serial depois de mandar as
+/// teclas de um `--send`.
+pub const KEYS_SENT: &str = "[xtask] teclas enviadas pelo monitor";
 
 /// Grava uma captura da tela em `target`, com a descrição nos metadados.
 fn save_capture(image: &crate::png::Image, target: &std::path::Path, result: &str, description: &str) {
@@ -1018,13 +1095,16 @@ fn connect_monitor(port: u16, deadline: Instant) -> Result<TcpStream, String> {
     }
 }
 
-/// Digita `text`; `{combo}` manda o combo cru ao `sendkey` (nomes de tecla
-/// do QEMU separados por `-`, pressionados em ordem e soltos ao contrário,
-/// como `{ctrl_r-scroll_lock-scroll_lock}`).
-fn type_keys(monitor: &mut TcpStream, text: &str) -> Result<(), String> {
+/// Os nomes do `sendkey` de `text`: cada caractere pelo [`key_name`];
+/// `{combo}` vai cru (nomes de tecla do QEMU separados por `-`,
+/// pressionados em ordem e soltos ao contrário, como
+/// `{ctrl_r-scroll_lock-scroll_lock}` ou `{spc}`). `{clique}` ([`CLICK`]) é o
+/// clique do botão esquerdo do mouse onde o ponteiro estiver.
+fn key_names(text: &str) -> Result<Vec<String>, String> {
+    let mut names = Vec::new();
     let mut characters = text.chars();
     while let Some(character) = characters.next() {
-        let name = if character == '{' {
+        names.push(if character == '{' {
             let combo: String = characters.by_ref().take_while(|&next| next != '}').collect();
             if combo.is_empty() || !combo.chars().all(|next| next.is_ascii_alphanumeric() || next == '_' || next == '-') {
                 return Err(format!("combo de teclas invalido: {{{combo}}}"));
@@ -1032,13 +1112,122 @@ fn type_keys(monitor: &mut TcpStream, text: &str) -> Result<(), String> {
             combo
         } else {
             key_name(character).ok_or_else(|| format!("tecla sem mapa no sendkey: {character:?}"))?
-        };
-        monitor
-            .write_all(format!("sendkey {name} 30\n").as_bytes())
-            .map_err(|error| format!("monitor HMP: {error}"))?;
+        });
+    }
+    Ok(names)
+}
+
+/// O nome que [`type_keys`] manda como clique do mouse (o `mouse_button 1`
+/// e o `mouse_button 0` do HMP), não como tecla: o QEMU não tem tecla com
+/// esse nome.
+const CLICK: &str = "clique";
+
+/// Digita `text` ([`key_names`]): cada tecla presa 30 ms, 70 ms entre elas;
+/// o [`CLICK`] aperta e solta o botão esquerdo do mouse.
+fn type_keys(monitor: &mut TcpStream, text: &str) -> Result<(), String> {
+    let mut send = |command: String| monitor.write_all(command.as_bytes()).map_err(|error| format!("monitor HMP: {error}"));
+    for name in key_names(text)? {
+        if name == CLICK {
+            send("mouse_button 1\n".into())?;
+            thread::sleep(Duration::from_millis(50));
+            send("mouse_button 0\n".into())?;
+        } else {
+            send(format!("sendkey {name} 30\n"))?;
+        }
         thread::sleep(Duration::from_millis(70));
     }
     Ok(())
+}
+
+/// Quantos `mouse_move` um movimento do `--mouse` leva: o mouse anda aos
+/// poucos, como a mão, em vez de um salto num pacote só.
+const MOUSE_STEPS: i32 = 10;
+/// Quanto o `--mouse` espera o ponteiro andar na tela.
+const MOUSE_WAIT: Duration = Duration::from_secs(15);
+
+/// A tela do QEMU pelo `screendump` do monitor HMP (a vigia da tela ocupa o
+/// QMP): espera o arquivo ficar inteiro e o lê.
+fn hmp_screen(monitor: &mut TcpStream, ppm: &Path) -> Result<crate::png::Image, String> {
+    let _ = std::fs::remove_file(ppm);
+    let file = ppm.display().to_string().replace('\\', "/");
+    monitor.write_all(format!("screendump {file}\n").as_bytes()).map_err(|error| format!("monitor HMP: {error}"))?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        thread::sleep(Duration::from_millis(100));
+        if let Ok(image) = std::fs::read(ppm).map_err(|error| error.to_string()).and_then(|bytes| crate::png::read_ppm(&bytes)) {
+            let _ = std::fs::remove_file(ppm);
+            return Ok(image);
+        }
+        if Instant::now() > deadline {
+            return Err(format!("screendump do monitor HMP nao gravou {}", ppm.display()));
+        }
+    }
+}
+
+/// Quanto a entrada espera uma tela parada antes de agir.
+const STILL_WAIT: Duration = Duration::from_secs(180);
+
+/// A tela parada que passa em `check`: duas leituras seguidas, a
+/// [`SCREEN_POLL`] uma da outra, iguais ([`screen_check::same_screen`]) e
+/// aprovadas, por até `wait`. Devolve a segunda, ou o que faltou na última.
+fn still_screen(monitor: &mut TcpStream, ppm: &Path, wait: Duration, check: impl Fn(&crate::png::Image) -> Result<String, String>) -> Result<crate::png::Image, String> {
+    let deadline = Instant::now() + wait;
+    let mut previous: Option<crate::png::Image> = None;
+    loop {
+        let image = hmp_screen(monitor, ppm)?;
+        let verdict = check(&image);
+        if verdict.is_ok() && previous.as_ref().is_some_and(|previous| screen_check::same_screen(previous, &image)) {
+            return Ok(image);
+        }
+        if Instant::now() > deadline {
+            return Err(verdict.err().unwrap_or_else(|| "a tela nao parou em duas leituras seguidas".into()));
+        }
+        previous = verdict.is_ok().then_some(image);
+        thread::sleep(SCREEN_POLL);
+    }
+}
+
+/// O `--dismiss`: espera a tela de bloqueio parada
+/// ([`screen_check::lock_screen_shown`], por até [`STILL_WAIT`]), digita as
+/// teclas (a hora vai para `sent`) e lê a tela até ela sair e a seguinte parar
+/// ([`screen_check::lock_dismissed`] em duas leituras seguidas iguais), por
+/// até [`DISMISS_WAIT`]. Devolve o que mudou, ou o que faltou.
+fn dismiss_lock(monitor: &mut TcpStream, ppm: &Path, keys: &str, sent: &mut Option<Instant>) -> Result<String, String> {
+    let before = still_screen(monitor, ppm, STILL_WAIT, screen_check::lock_screen_shown).map_err(|missing| format!("a tela de bloqueio nao apareceu: {missing}"))?;
+    *sent = Some(Instant::now());
+    type_keys(monitor, keys)?;
+    let after = still_screen(monitor, ppm, DISMISS_WAIT, |image| screen_check::lock_dismissed(&before, image))?;
+    screen_check::lock_dismissed(&before, &after)
+}
+
+/// Quanto o `--dismiss` espera a tela de bloqueio sair depois da tecla (ela
+/// sobe numa animação).
+const DISMISS_WAIT: Duration = Duration::from_secs(60);
+
+/// O `--mouse`: espera a tela parada (por até [`STILL_WAIT`]), anda o mouse
+/// PS/2 (`dx`, `dy`) em [`MOUSE_STEPS`] `mouse_move` e lê a tela de novo
+/// até o ponteiro ter andado ([`screen_check::cursor_moved`]), por até
+/// [`MOUSE_WAIT`]. Devolve de onde para onde ele foi, ou o que faltou na
+/// última leitura.
+fn move_mouse(monitor: &mut TcpStream, ppm: &Path, dx: i32, dy: i32) -> Result<String, String> {
+    let before = still_screen(monitor, ppm, STILL_WAIT, |_| Ok(String::new()))?;
+    for step in 0..MOUSE_STEPS {
+        // Os passos somam o movimento inteiro, com o resto da divisão
+        // distribuído.
+        let part = |total: i32| total * (step + 1) / MOUSE_STEPS - total * step / MOUSE_STEPS;
+        monitor.write_all(format!("mouse_move {} {}\n", part(dx), part(dy)).as_bytes()).map_err(|error| format!("monitor HMP: {error}"))?;
+        thread::sleep(Duration::from_millis(20));
+    }
+    let deadline = Instant::now() + MOUSE_WAIT;
+    loop {
+        thread::sleep(Duration::from_millis(500));
+        let after = hmp_screen(monitor, ppm)?;
+        match screen_check::cursor_moved(&before, &after, dx, dy) {
+            Ok(description) => return Ok(description),
+            Err(missing) if Instant::now() > deadline => return Err(missing),
+            Err(_) => {}
+        }
+    }
 }
 
 /// O `sendkey` da parada manual: Ctrl direito segurado e Scroll Lock duas
@@ -1431,17 +1620,71 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
     // tempo de cada fase do boot no test-boot.log).
     let started = Instant::now();
     let arrived = |needle: &str| println!("\n[xtask] {needle:?} aos {:.1} s", started.elapsed().as_secs_f64());
+    // As teclas do `--keys` e cada entrada do `--send`, do `--dismiss` e do
+    // `--mouse` abrem uma conexão do monitor HMP e a fecham no fim: o
+    // servidor do QEMU atende um cliente por vez, e a parada manual do fim
+    // (ou um depurador) abre outra.
+    let with_monitor = |action: &mut dyn FnMut(&mut TcpStream) -> Result<String, String>| -> Result<String, String> {
+        let mut monitor = connect_monitor(port, deadline)?;
+        action(&mut monitor)
+    };
+    let note = |line: String| {
+        let line = format!("\n{line}\n");
+        print!("{line}");
+        output.lock().unwrap().push_str(&line);
+    };
+    // A entrada que espera `marker`, cada uma depois do atraso dela; a linha
+    // de cada uma vai para a serial (sem repetir o nome do marcador, que um
+    // `--expect` seguinte não pode casar). O `--mouse` cujo ponteiro não
+    // andou encerra o teste.
+    let send_after = |marker: &str| -> Result<(), String> {
+        for input in test.inputs.iter().filter(|input| input.after == marker) {
+            thread::sleep(input.delay);
+            let at = launched.elapsed().as_secs_f64();
+            match &input.action {
+                InputAction::Keys(keys) => {
+                    with_monitor(&mut |monitor| type_keys(monitor, keys).map(|()| String::new()))?;
+                    note(format!("{KEYS_SENT}: {keys} (aos {at:.1} s)"));
+                }
+                InputAction::Dismiss(keys) => {
+                    let ppm = log.with_file_name("tela-monitor.ppm");
+                    let mut sent = None;
+                    let outcome = with_monitor(&mut |monitor| dismiss_lock(monitor, &ppm, keys, &mut sent));
+                    let at = sent.map_or(at, |sent| sent.duration_since(launched).as_secs_f64());
+                    match outcome {
+                        Ok(description) => note(format!("{KEYS_SENT}: {keys} (aos {at:.1} s)\n[xtask] tela de bloqueio dispensada: {description}\n{LOGON_DISMISS_MARKER}")),
+                        Err(missing) => {
+                            note(format!("[xtask] a tela de bloqueio nao saiu com {keys} (aos {at:.1} s): {missing}"));
+                            return Err(format!("a tela de bloqueio nao saiu com {keys}: {missing}"));
+                        }
+                    }
+                }
+                InputAction::Mouse { dx, dy } => {
+                    let ppm = log.with_file_name("tela-monitor.ppm");
+                    match with_monitor(&mut |monitor| move_mouse(monitor, &ppm, *dx, *dy)) {
+                        Ok(description) => note(format!("[xtask] mouse movido pelo monitor (aos {at:.1} s): {description}\n{CURSOR_MOVED_MARKER}")),
+                        Err(missing) => {
+                            note(format!("[xtask] mouse movido pelo monitor (aos {at:.1} s), mas o ponteiro nao andou: {missing}"));
+                            return Err(format!("o ponteiro nao andou depois do mouse ({dx},{dy}): {missing}"));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    };
     let result = (|| -> Result<(), String> {
         let mut cursor = wait_for(&test.marker, 0)?;
         arrived(&test.marker);
+        send_after(&test.marker)?;
         if let Some(keys) = &test.keys {
             cursor = wait_for("[shell] pronto", 0)?;
-            let mut monitor = connect_monitor(port, deadline)?;
-            type_keys(&mut monitor, keys)?;
+            with_monitor(&mut |monitor| type_keys(monitor, keys).map(|()| String::new()))?;
         }
         for expected in &test.expect {
             cursor = wait_for(expected, cursor)?;
             arrived(expected);
+            send_after(expected)?;
         }
         if test.expect_poweroff {
             // O convidado precisa desligar a máquina sozinho, pelo ACPI.

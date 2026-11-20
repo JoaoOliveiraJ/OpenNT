@@ -288,6 +288,246 @@ pub fn same_screen(a: &Image, b: &Image) -> bool {
     different * SAME_SCREEN_DIVISOR <= a.width * a.height
 }
 
+// ---- ponteiro do mouse -------------------------------------------------------
+//
+// O `--mouse` do test-boot move o mouse PS/2 do QEMU pelo monitor e lê a tela
+// antes e depois ([`cursor_moved`]). O ponteiro do Windows é a seta branca
+// com contorno preto (12x19 pixels no tamanho padrão) que o adaptador de
+// vídeo desenha por cima da tela: quando ele anda, a tela muda só em dois
+// lugares do tamanho dele, onde ele estava e onde está.
+
+/// O marcador do ponteiro que andou.
+pub const CURSOR_MOVED_MARKER: &str = "CURSOR_MOVED_OK";
+/// O lado das células em que as mudanças da tela se agrupam: duas mudanças
+/// a menos de uma célula uma da outra são do mesmo desenho.
+const CURSOR_CELL: usize = 8;
+/// O maior lado de um grupo de mudanças que pode ser o ponteiro.
+const CURSOR_MAXIMUM: usize = 40;
+/// Pixels brancos que o ponteiro tem, no mínimo (o preenchimento da seta).
+const CURSOR_WHITE_MINIMUM: usize = 20;
+/// Pixels pretos que o ponteiro tem, no mínimo (o contorno da seta).
+const CURSOR_BLACK_MINIMUM: usize = 10;
+/// O menor deslocamento que conta como o ponteiro ter andado.
+const CURSOR_MINIMUM_STEP: i64 = 8;
+
+/// Um grupo de pixels que mudaram de uma tela para a outra.
+#[derive(Debug)]
+struct Change {
+    left: usize,
+    top: usize,
+    right: usize,
+    bottom: usize,
+}
+
+impl Change {
+    fn width(&self) -> usize {
+        self.right - self.left + 1
+    }
+
+    fn height(&self) -> usize {
+        self.bottom - self.top + 1
+    }
+
+    fn center(&self) -> (i64, i64) {
+        (((self.left + self.right) / 2) as i64, ((self.top + self.bottom) / 2) as i64)
+    }
+
+    /// Os pixels de `image` dentro do grupo que passam em `test`.
+    fn count_in(&self, image: &Image, test: impl Fn(&[u8]) -> bool) -> usize {
+        (self.top..=self.bottom)
+            .flat_map(|y| (self.left..=self.right).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                let at = (y * image.width + x) * 3;
+                test(&image.rgb[at..at + 3])
+            })
+            .count()
+    }
+
+    /// O ponteiro está no grupo em `image`: o miolo branco da seta e o
+    /// contorno preto ([`CURSOR_WHITE_MINIMUM`] e [`CURSOR_BLACK_MINIMUM`]).
+    /// O texto branco do relógio, sem contorno, não passa.
+    fn pointer_in(&self, image: &Image) -> bool {
+        self.count_in(image, |rgb| rgb.iter().all(|&channel| channel >= 0xF0)) >= CURSOR_WHITE_MINIMUM
+            && self.count_in(image, |rgb| rgb.iter().all(|&channel| channel <= BLACK_LEVEL)) >= CURSOR_BLACK_MINIMUM
+    }
+
+    fn describe(&self) -> String {
+        format!("{}x{} em ({},{})", self.width(), self.height(), self.left, self.top)
+    }
+}
+
+/// Os grupos de pixels que mudaram de `before` para `after` (mesmo tamanho):
+/// as células de [`CURSOR_CELL`] pixels com mudança, ligadas pelos vizinhos
+/// (inclusive na diagonal), com a caixa dos pixels mudados de cada grupo.
+fn changes(before: &Image, after: &Image) -> Vec<Change> {
+    let (columns, rows) = (before.width.div_ceil(CURSOR_CELL), before.height.div_ceil(CURSOR_CELL));
+    let mut cells: Vec<Option<Change>> = (0..columns * rows).map(|_| None).collect();
+    for (index, (old, new)) in before.rgb.chunks_exact(3).zip(after.rgb.chunks_exact(3)).enumerate() {
+        if old == new {
+            continue;
+        }
+        let (x, y) = (index % before.width, index / before.width);
+        let cell = &mut cells[(y / CURSOR_CELL) * columns + x / CURSOR_CELL];
+        match cell {
+            Some(change) => {
+                change.left = change.left.min(x);
+                change.right = change.right.max(x);
+                change.top = change.top.min(y);
+                change.bottom = change.bottom.max(y);
+            }
+            None => *cell = Some(Change { left: x, top: y, right: x, bottom: y }),
+        }
+    }
+    let mut groups = Vec::new();
+    for start in 0..cells.len() {
+        let Some(first) = cells[start].take() else { continue };
+        let mut group = first;
+        let mut pending = vec![start];
+        while let Some(cell) = pending.pop() {
+            let (column, row) = (cell % columns, cell / columns);
+            for next_row in row.saturating_sub(1)..=(row + 1).min(rows - 1) {
+                for next_column in column.saturating_sub(1)..=(column + 1).min(columns - 1) {
+                    let next = next_row * columns + next_column;
+                    if let Some(change) = cells[next].take() {
+                        group.left = group.left.min(change.left);
+                        group.right = group.right.max(change.right);
+                        group.top = group.top.min(change.top);
+                        group.bottom = group.bottom.max(change.bottom);
+                        pending.push(next);
+                    }
+                }
+            }
+        }
+        groups.push(group);
+    }
+    groups
+}
+
+/// O ponteiro andou de `before` para `after`, depois de o mouse andar
+/// (`dx`, `dy`) (o sinal de cada eixo; a aceleração do Windows muda a
+/// distância): entre as mudanças da tela há um grupo do tamanho do ponteiro
+/// com a seta (branca com contorno preto) só antes, onde ele estava, e um
+/// só depois, onde ele está, o segundo deslocado do primeiro no sentido do movimento. Outras
+/// mudanças maiores (o relógio que virou o minuto) não contam. Devolve de
+/// onde para onde o ponteiro foi, ou o que faltou.
+pub fn cursor_moved(before: &Image, after: &Image, dx: i32, dy: i32) -> Result<String, String> {
+    if (before.width, before.height) != (after.width, after.height) || before.rgb.len() != after.rgb.len() {
+        return Err(format!("a tela mudou de tamanho ({}x{} para {}x{})", before.width, before.height, after.width, after.height));
+    }
+    let groups = changes(before, after);
+    if groups.is_empty() {
+        return Err("a tela nao mudou".into());
+    }
+    let pointer_sized = |change: &&Change| change.width() <= CURSOR_MAXIMUM && change.height() <= CURSOR_MAXIMUM;
+    let left: Vec<&Change> = groups.iter().filter(pointer_sized).filter(|change| change.pointer_in(before) && !change.pointer_in(after)).collect();
+    let arrived: Vec<&Change> = groups.iter().filter(pointer_sized).filter(|change| change.pointer_in(after) && !change.pointer_in(before)).collect();
+    let all: Vec<String> = groups.iter().take(6).map(Change::describe).collect();
+    let (old, new) = match (left.as_slice(), arrived.as_slice()) {
+        ([old], [new]) => (old, new),
+        _ => {
+            return Err(format!(
+                "{} mudanca(s) na tela ({}), {} com o ponteiro so antes e {} com o ponteiro so depois (esperado 1 e 1)",
+                groups.len(),
+                all.join(", "),
+                left.len(),
+                arrived.len()
+            ))
+        }
+    };
+    let ((x0, y0), (x1, y1)) = (old.center(), new.center());
+    let (step_x, step_y) = (x1 - x0, y1 - y0);
+    let follows = |step: i64, wanted: i32| match wanted.signum() {
+        0 => true,
+        sign => step.signum() == i64::from(sign),
+    };
+    if step_x.abs().max(step_y.abs()) < CURSOR_MINIMUM_STEP || !follows(step_x, dx) || !follows(step_y, dy) {
+        return Err(format!("o ponteiro foi de ({x0},{y0}) para ({x1},{y1}), fora do sentido do mouse ({dx},{dy})"));
+    }
+    Ok(format!("o ponteiro foi de ({x0},{y0}) para ({x1},{y1}) com o mouse em ({dx},{dy})"))
+}
+
+// ---- tela de bloqueio dispensada --------------------------------------------
+//
+// O `--dismiss` do test-boot espera a tela de bloqueio parada, aperta a tecla
+// e lê a tela até ela sair ([`lock_dismissed`]). A tela de bloqueio do
+// LogonUI tem o relógio e a data em branco embaixo à esquerda; quando ela é
+// dispensada, sobe e mostra a tela de credenciais por baixo, com outro fundo
+// e sem o relógio.
+
+/// O marcador da tela de bloqueio dispensada.
+pub const LOGON_DISMISS_MARKER: &str = "LOGON_DISMISS_OK";
+/// Pixels brancos que o relógio e a data da tela de bloqueio têm, no mínimo.
+const CLOCK_WHITE_MINIMUM: usize = 500;
+
+/// Os pixels brancos da área do relógio e da data da tela de bloqueio: as
+/// 2/5 de baixo das linhas e as 3/5 da esquerda das colunas.
+pub fn lock_clock(image: &Image) -> usize {
+    let (left, right) = (0, image.width * 3 / 5);
+    let (top, bottom) = (image.height * 3 / 5, image.height);
+    (top..bottom)
+        .flat_map(|y| (left..right).map(move |x| (x, y)))
+        .filter(|&(x, y)| {
+            let at = (y * image.width + x) * 3;
+            image.rgb[at..at + 3].iter().all(|&channel| channel >= 0xF0)
+        })
+        .count()
+}
+
+/// `before` é a tela de bloqueio (desenhada, com o relógio e a data: ao
+/// menos [`CLOCK_WHITE_MINIMUM`] pixels brancos em [`lock_clock`]); serve de
+/// referência para [`lock_dismissed`].
+pub fn lock_screen_shown(before: &Image) -> Result<String, String> {
+    if !is_graphics(before) {
+        return Err(format!("a tela e {}x{}, nao a grafica", before.width, before.height));
+    }
+    let clock = lock_clock(before);
+    if clock < CLOCK_WHITE_MINIMUM {
+        return Err(format!("{clock} pixels brancos na area do relogio (minimo {CLOCK_WHITE_MINIMUM})"));
+    }
+    let drawn = before.rgb.chunks_exact(3).filter(|pixel| !is_black([pixel[0], pixel[1], pixel[2]])).count();
+    if drawn * 4 < before.width * before.height {
+        return Err(format!("{}% da tela desenhada (minimo 25%)", drawn * 100 / (before.width * before.height)));
+    }
+    Ok(format!("{clock} pixels brancos na area do relogio, {}% da tela desenhada", drawn * 100 / (before.width * before.height)))
+}
+
+/// A tela de bloqueio `before` ([`lock_screen_shown`]) saiu em `after`: a
+/// metade ou mais dos pixels mudou, o relógio e a data sumiram (na área
+/// deles ficou 1/10 ou menos dos pixels brancos) e a tela continua
+/// desenhada (um quarto ou mais fora do preto, sem ser a tela de bugcheck):
+/// a tela de credenciais, não a tela apagada nem uma parada.
+pub fn lock_dismissed(before: &Image, after: &Image) -> Result<String, String> {
+    if (before.width, before.height) != (after.width, after.height) || before.rgb.len() != after.rgb.len() {
+        return Err(format!("a tela mudou de tamanho ({}x{} para {}x{})", before.width, before.height, after.width, after.height));
+    }
+    let total = after.width * after.height;
+    let changed = before.rgb.chunks_exact(3).zip(after.rgb.chunks_exact(3)).filter(|(x, y)| x != y).count();
+    let (clock_before, clock_after) = (lock_clock(before), lock_clock(after));
+    let drawn = after.rgb.chunks_exact(3).filter(|pixel| !is_black([pixel[0], pixel[1], pixel[2]])).count();
+    let bugcheck = after.rgb.chunks_exact(3).filter(|pixel| [pixel[0], pixel[1], pixel[2]] == BUGCHECK_BACKGROUND).count();
+    let mut missing = Vec::new();
+    if changed * 2 < total {
+        missing.push(format!("{}% dos pixels mudaram (minimo 50%)", changed * 100 / total));
+    }
+    if clock_after * 10 > clock_before {
+        missing.push(format!("o relogio ainda na tela ({clock_after} de {clock_before} pixels brancos)"));
+    }
+    if drawn * 4 < total {
+        missing.push(format!("{}% da tela desenhada (minimo 25%)", drawn * 100 / total));
+    }
+    if bugcheck * 2 > total {
+        missing.push("a tela de bugcheck".into());
+    }
+    if !missing.is_empty() {
+        return Err(missing.join("; "));
+    }
+    Ok(format!(
+        "{}% dos pixels mudaram, o relogio saiu ({clock_before} -> {clock_after} pixels brancos), {}% da tela desenhada",
+        changed * 100 / total,
+        drawn * 100 / total
+    ))
+}
+
 /// Telas sintéticas para os testes da vigia.
 #[cfg(test)]
 pub mod samples {
@@ -353,6 +593,19 @@ pub mod samples {
             clock(&mut image, 0);
         }
         image
+    }
+
+    /// A seta do ponteiro (12x19, contorno preto e miolo branco) com a
+    /// ponta em (`x`, `y`).
+    pub fn pointer(image: &mut Image, x: usize, y: usize) {
+        for row in 0..19 {
+            let width = (row + 1).min(12);
+            for column in 0..width {
+                let edge = column == 0 || column + 1 == width || row == 18;
+                let at = ((y + row) * image.width + x + column) * 3;
+                image.rgb[at..at + 3].copy_from_slice(if edge { &[0, 0, 0] } else { &[0xFF, 0xFF, 0xFF] });
+            }
+        }
     }
 
     /// As linhas fora de `rows` pretas: um quadro rasgado ou pela metade.
@@ -487,6 +740,72 @@ mod tests {
             let missing = logon_screen(&only_columns(&full, half.clone())).unwrap_err();
             assert!(missing.contains("% das colunas"), "{half:?}: {missing}");
         }
+    }
+
+    /// O ponteiro que andou: a seta sai de um lugar e aparece no outro, no
+    /// sentido do mouse, mesmo com o relógio virando o minuto; a tela
+    /// parada, só o relógio, a seta no sentido contrário e a seta que sumiu
+    /// não passam.
+    #[test]
+    fn cursor_moved_sees_the_arrow_leave_and_arrive() {
+        let background = |minute| {
+            let mut image = filled(WIDTH, HEIGHT, [0x00, 0x4A, 0x7F]);
+            clock(&mut image, minute);
+            image
+        };
+        let with_pointer = |minute, x, y| {
+            let mut image = background(minute);
+            pointer(&mut image, x, y);
+            image
+        };
+        let before = with_pointer(0, 512, 384);
+        let moved = cursor_moved(&before, &with_pointer(0, 640, 470), 150, 100).unwrap();
+        assert!(moved.starts_with("o ponteiro foi de (517,393) para (645,479)"), "{moved}");
+        let ticked = cursor_moved(&before, &with_pointer(1, 640, 470), 150, 100);
+        assert!(ticked.is_ok(), "o relogio virou o minuto: {ticked:?}");
+        assert_eq!(cursor_moved(&before, &before, 150, 100).unwrap_err(), "a tela nao mudou");
+        let clock_only = cursor_moved(&before, &with_pointer(1, 512, 384), 150, 100).unwrap_err();
+        assert!(clock_only.contains("0 com o ponteiro so antes e 0 com o ponteiro so depois"), "{clock_only}");
+        let backwards = cursor_moved(&before, &with_pointer(0, 400, 300), 150, 100).unwrap_err();
+        assert!(backwards.contains("fora do sentido do mouse"), "{backwards}");
+        let gone = cursor_moved(&before, &background(0), 150, 100).unwrap_err();
+        assert!(gone.contains("1 com o ponteiro so antes e 0 com o ponteiro so depois"), "{gone}");
+        let resized = cursor_moved(&before, &filled(800, 600, [0, 0, 0]), 150, 100).unwrap_err();
+        assert!(resized.contains("mudou de tamanho"), "{resized}");
+    }
+
+    /// A tela de bloqueio dispensada: a de credenciais (outro fundo, sem o
+    /// relógio) passa; a mesma tela, só o ponteiro, a tela apagada e a de
+    /// bugcheck não. Sem o relógio, a tela não serve de referência.
+    #[test]
+    fn lock_dismissed_needs_the_clock_gone_and_a_drawn_screen() {
+        let mut lock = filled(WIDTH, HEIGHT, [0x00, 0x4A, 0x7F]);
+        clock(&mut lock, 0);
+        pointer(&mut lock, 512, 384);
+        assert!(lock_screen_shown(&lock).is_ok(), "{:?}", lock_screen_shown(&lock));
+        let flat = filled(WIDTH, HEIGHT, [0x00, 0x4A, 0x7F]);
+        assert!(lock_screen_shown(&flat).unwrap_err().contains("area do relogio"));
+        let mut black = filled(WIDTH, HEIGHT, [0, 0, 0]);
+        clock(&mut black, 0);
+        assert!(lock_screen_shown(&black).unwrap_err().contains("da tela desenhada"));
+
+        let mut credentials = filled(WIDTH, HEIGHT, [0x00, 0x33, 0x58]);
+        paint(&mut credentials, 900..930, 700..730, |_, _| [0xFF, 0xFF, 0xFF]);
+        pointer(&mut credentials, 512, 384);
+        let dismissed = lock_dismissed(&lock, &credentials).unwrap();
+        assert!(dismissed.contains("o relogio saiu"), "{dismissed}");
+
+        assert!(lock_dismissed(&lock, &lock).unwrap_err().contains("0% dos pixels mudaram"));
+        let mut moved = lock.clone();
+        pointer(&mut moved, 700, 500);
+        assert!(lock_dismissed(&lock, &moved).unwrap_err().contains("o relogio ainda na tela"));
+        assert!(lock_dismissed(&lock, &filled(WIDTH, HEIGHT, [0, 0, 0])).unwrap_err().contains("da tela desenhada"));
+        assert!(lock_dismissed(&lock, &filled(WIDTH, HEIGHT, BUGCHECK_BACKGROUND)).unwrap_err().contains("bugcheck"));
+        // O fundo que muda com o relógio ainda lá (a imagem da tela de
+        // bloqueio que chegou tarde) não é a tela dispensada.
+        let mut repainted = filled(WIDTH, HEIGHT, [0x30, 0x50, 0x20]);
+        clock(&mut repainted, 0);
+        assert!(lock_dismissed(&lock, &repainted).unwrap_err().contains("o relogio ainda na tela"));
     }
 
     #[test]
