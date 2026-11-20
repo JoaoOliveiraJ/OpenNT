@@ -328,7 +328,14 @@ impl HiveFile {
     pub fn write(&self, offset: u64, data: &[u8]) -> Result<(), u32> {
         match self.volume.write_at(&self.path, offset, data) {
             Ok(written) if written == data.len() as u64 => Ok(()),
-            _ => Err(STATUS_REGISTRY_IO_FAILED),
+            Ok(written) => {
+                debug_print!("[cm] escrita de {} em {:#x}: {} de {} bytes", self.path, offset, written, data.len());
+                Err(STATUS_REGISTRY_IO_FAILED)
+            }
+            Err(error) => {
+                debug_print!("[cm] escrita de {} em {:#x} ({} bytes): {}", self.path, offset, data.len(), error);
+                Err(STATUS_REGISTRY_IO_FAILED)
+            }
         }
     }
 
@@ -339,7 +346,11 @@ impl HiveFile {
         }
         match self.volume.resize(&self.path, size) {
             Some(Ok(_)) => Ok(()),
-            _ => Err(STATUS_REGISTRY_IO_FAILED),
+            Some(Err(error)) => {
+                debug_print!("[cm] tamanho de {} para {:#x}: {}", self.path, size, error);
+                Err(STATUS_REGISTRY_IO_FAILED)
+            }
+            None => Err(STATUS_REGISTRY_IO_FAILED),
         }
     }
 }

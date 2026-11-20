@@ -660,6 +660,8 @@ impl Tx<'_> {
             // descritor lido dele não vale mais.
             self.volume.secure_cache.lock().clear();
             if committing {
+                // Toda escrita seguinte falha até a remontagem: a causa fica na
+                // serial.
                 crate::debug_print!("[ntfs] volume do disco {} marcado para remontagem: o commit falhou com {:#x} ({})", self.volume.drive, error.status, error.message);
                 self.state.poisoned = true;
                 self.state.allocation = None;

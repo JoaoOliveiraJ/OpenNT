@@ -551,7 +551,8 @@ fn flush_hive_locked(identifier: u32) -> u32 {
     };
     match write_plan(&primary, log.as_ref(), &plan) {
         Ok(()) => 0,
-        Err(_) => {
+        Err(status) => {
+            debug_print!("[cm] descarga de {} falhou: {:#x}", primary.volume_path(), status);
             registry::with_storage(identifier, |storage| sync::abandon(storage, &plan));
             STATUS_REGISTRY_IO_FAILED
         }
