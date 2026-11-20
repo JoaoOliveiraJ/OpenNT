@@ -23,8 +23,8 @@
 //!   PopShutdownCleanly diferente de zero (0x9b110b; o `PoCleanShutdownFlags`
 //!   de `Session Manager\Kernel` pelo CmControlVector, 0 no boot comum), o
 //!   PsShutdownSystem, o PopShutdownEvent sinalizado e as threads do
-//!   PoRequestShutdownEvent esperadas; CmShutdownSystem(0); ExShutdownSystem(0) (o ShutdownTime);
-//!   IoShutdownSystem(0) (PnpShutdownDevices e o IRP_MJ_SHUTDOWN dos
+//!   PoRequestShutdownEvent esperadas; CmShutdownSystem(0);
+//!   ExShutdownSystem(0) (o ShutdownTime); IoShutdownSystem(0) (PnpShutdownDevices e o IRP_MJ_SHUTDOWN dos
 //!   IoRegisterShutdownNotification); CmShutdownSystem(1) (todas as hives no
 //!   disco); ExShutdownSystem(1); MmShutdownSystem(0) (as páginas alteradas
 //!   das vistas de arquivo); IoShutdownSystem(1) (os file systems, que

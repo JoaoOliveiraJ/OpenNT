@@ -78,18 +78,23 @@ pub fn record_shutdown_time() -> Result<Option<u64>, KernelError> {
     request.attributes.attributes.set(ATTRIBUTES);
     let time = guest::read64(SYSTEM_TIME);
     request.time.set(time);
-    let opened = invoke_handler("ZwOpenKey", &[request.handle.address(), KEY_ACCESS, request.attributes.address()])? as u32;
-    let result = if opened & 0x8000_0000 == 0 {
+    // As chamadas Zw entram com PreviousMode = KernelMode, como pelo
+    // KiServiceInternal: o desligamento da cadeia roda na thread do wininit,
+    // dentro do NtShutdownSystem de modo usuário.
+    let result = crate::ntos::ps::previous_mode::with_kernel(|| -> Result<Option<u64>, KernelError> {
+        let opened = invoke_handler("ZwOpenKey", &[request.handle.address(), KEY_ACCESS, request.attributes.address()])? as u32;
+        if opened & 0x8000_0000 != 0 {
+            return Ok(None);
+        }
         let key = request.handle.get();
         let set = invoke_handler("ZwSetValueKey", &[key, request.value_name.address(), 0, REG_BINARY, request.time.address(), 8])? as u32;
         invoke_handler("ZwFlushKey", &[key])?;
         invoke_handler("ZwClose", &[key])?;
-        (set & 0x8000_0000 == 0).then_some(time)
-    } else {
-        None
-    };
+        Ok((set & 0x8000_0000 == 0).then_some(time))
+    })
+    .and_then(|result| result);
     guest::free_bytes(block);
-    Ok(result)
+    result
 }
 
 /// ExShutdownSystem(Phase).

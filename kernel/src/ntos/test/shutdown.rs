@@ -172,6 +172,18 @@ fn shutdown_time(assert: Assert) {
     assert(matches, "shutdown: ExpRecordShutdownTime grava o SystemTime em Control\\Windows\\ShutdownTime (REG_BINARY de 8 bytes)");
 }
 
+/// O desligamento da cadeia roda na thread de modo usuário que chamou o
+/// NtShutdownSystem (a do wininit): o ExpRecordShutdownTime grava assim
+/// mesmo, com as chamadas Zw em KernelMode, e o PreviousMode volta.
+fn shutdown_time_from_user_thread(assert: Assert) {
+    let outcome = with_test_process("desligamento-hora", None, |_| {
+        let mode = crate::ntos::ps::previous_mode::get().unwrap_or(0);
+        let recorded = crate::ntos::ex::shutdown::record_shutdown_time().ok().flatten();
+        (mode, recorded, crate::ntos::ps::previous_mode::get().unwrap_or(0))
+    });
+    assert(matches!(outcome, Some((1, Some(_), 1))), "shutdown: ExpRecordShutdownTime grava o ShutdownTime de uma thread de modo usuario (Zw em KernelMode) e o PreviousMode volta");
+}
+
 fn policy(assert: Assert) {
     use crate::ntos::po::shutdown;
     let block = guest::alloc_bytes(0x400);
@@ -387,6 +399,7 @@ pub fn run(assert: Assert) {
     io_queues(assert);
     hal_power_off(assert);
     shutdown_time(assert);
+    shutdown_time_from_user_thread(assert);
     policy(assert);
     clean_shutdown_gate(assert);
     ntfs_shut_down(assert);
