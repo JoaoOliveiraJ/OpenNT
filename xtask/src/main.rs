@@ -144,6 +144,8 @@ opcoes de maquina: --accel=auto|tcg|whpx (test-boot: auto = whpx quando a maquin
                    convidado volta uma vez com erro de E/S; ATA_RETRY_OK quando o driver ATA a
                    manda de novo e ela conclui)
 test-boot:         --keys=TEXTO (\\n = Enter) --expect=TEXTO (repetivel)
+                   --expect-any=TEXTO (repetivel: aparece na serial em qualquer ordem, desde o
+                   comeco; esperado depois dos --expect)
                    --hold=MS (segue rodando MS ms sem falha depois da ultima saida)
                    --build-only (so monta a imagem do teste) --no-build (usa a imagem ja montada)
                    --image-dir=DIR (com --no-build: as imagens de DIR, com as opcoes de carga
@@ -181,6 +183,8 @@ struct Arguments {
     positional: Vec<String>,
     keys: Option<String>,
     expect: Vec<String>,
+    /// `--expect-any`: saídas esperadas em qualquer ordem.
+    expect_any: Vec<String>,
     /// `--send` e `--mouse`, na ordem da linha de comando.
     inputs: Vec<qemu::InputSend>,
     hold_ms: u64,
@@ -268,6 +272,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
         keys: None,
         inputs: Vec::new(),
         expect: Vec::new(),
+        expect_any: Vec::new(),
         hold_ms: 0,
         console_mirror_set: false,
         build_only: false,
@@ -366,6 +371,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
                 parsed.keys = Some(keys);
             }
             "--expect" => parsed.expect.push(required()?),
+            "--expect-any" => parsed.expect_any.push(required()?),
             "--send" => parsed.inputs.push(qemu::InputSend::keys(&required()?)?),
             "--mouse" => parsed.inputs.push(qemu::InputSend::mouse(&required()?)?),
             "--dismiss" => parsed.inputs.push(qemu::InputSend::dismiss(&required()?)?),
@@ -536,6 +542,7 @@ fn execute(arguments: Arguments) -> Result<(), String> {
                     timeout: Duration::from_millis(timeout_ms),
                     keys: arguments.keys,
                     expect: arguments.expect,
+                    expect_any: arguments.expect_any,
                     hold: Duration::from_millis(arguments.hold_ms),
                     capture: arguments.capture.map(|path| if path.is_absolute() { path } else { build::workspace_root().join(path) }),
                     expect_stop: arguments.expect_stop,
@@ -713,6 +720,16 @@ mod tests {
         assert!(parse_words(&["test-boot", "--manual-crash"]).unwrap().manual_crash);
         assert!(!parse_words(&["test-boot"]).unwrap().manual_crash);
         assert!(parse_words(&["run", "--manual-crash"]).is_err());
+    }
+
+    /// `--expect-any` é repetível, fica à parte das `--expect` e exige um
+    /// texto.
+    #[test]
+    fn expect_any_is_kept_apart_from_the_ordered_expects() {
+        let parsed = parse_words(&["test-boot", "--expect=A", "--expect-any=X", "--expect=B", "--expect-any=Y"]).unwrap();
+        assert_eq!(parsed.expect, ["A", "B"]);
+        assert_eq!(parsed.expect_any, ["X", "Y"]);
+        assert!(parse_words(&["test-boot", "--expect-any"]).is_err());
     }
 
     /// `--send`, `--dismiss` e `--mouse` ficam na ordem da linha de comando,

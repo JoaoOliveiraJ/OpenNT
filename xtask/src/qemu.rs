@@ -550,6 +550,10 @@ pub struct TestOptions {
     pub timeout: Duration,
     pub keys: Option<String>,
     pub expect: Vec<String>,
+    /// Saídas esperadas em qualquer ordem (`--expect-any`): cada uma é
+    /// procurada desde o começo da serial, depois das de `expect`, com o
+    /// mesmo marcador de falha encerrando a espera.
+    pub expect_any: Vec<String>,
     /// Depois da última saída esperada, o sistema segue rodando por este
     /// tempo sem nenhuma falha na serial (`--hold=MS`).
     pub hold: Duration,
@@ -1778,6 +1782,14 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
             arrived(expected);
             send_after(expected)?;
         }
+        // As de qualquer ordem: desde o começo da serial (um marcador de
+        // falha em qualquer ponto dela reprova, como na cadeia acima). A
+        // espera do fim conta da última achada.
+        for expected in &test.expect_any {
+            cursor = cursor.max(wait_for(expected, 0)?);
+            arrived(expected);
+            send_after(expected)?;
+        }
         if test.expect_poweroff {
             // O convidado precisa desligar a máquina sozinho, pelo ACPI.
             loop {
@@ -1836,7 +1848,7 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
     let ScreenOutcome { last: last_screen, frames, logon } = screen_watcher.and_then(|watcher| watcher.join().ok()).unwrap_or_default();
     // O teste da tela de logon que falhou diz no log o que faltou na última
     // tela lida.
-    let logon_test = test.marker == LOGON_SCREEN_MARKER || test.expect.iter().any(|expected| expected == LOGON_SCREEN_MARKER);
+    let logon_test = test.marker == LOGON_SCREEN_MARKER || test.expect.iter().chain(&test.expect_any).any(|expected| expected == LOGON_SCREEN_MARKER);
     if let (true, Err(_), None, Some(last)) = (logon_test, &result, &logon, &last_screen) {
         let verdict = match screen_check::logon_screen(last) {
             Ok(description) => format!("passou numa leitura, mas nao em duas seguidas iguais: {description}"),
@@ -1857,7 +1869,7 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
     if let Some(qmp) = qmp_port.filter(|_| test.capture.is_some() || frames.is_some()) {
         let alive = matches!(machine.process.0.try_wait(), Ok(None));
         let mut needles = vec![test.marker.as_str()];
-        needles.extend(test.expect.iter().map(String::as_str));
+        needles.extend(test.expect.iter().chain(&test.expect_any).map(String::as_str));
         let serial = serial_proof(&output.lock().unwrap(), &needles);
         if let Some(series) = &frames {
             let target = log.with_file_name(FINAL_FRAME);
