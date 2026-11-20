@@ -333,7 +333,7 @@ fn terminated_text(data: &[u8]) -> String {
 
 /// O nome da chave como está na hive (o Name do KEY_BASIC_INFORMATION).
 fn key_name(handle: u32) -> Option<String> {
-    registry::get_node(handle).and_then(|node| registry::with_node(node, |key| key.name.clone()))
+    registry::get_node(handle).and_then(|node| registry::with_node(node, |key| key.name()))
 }
 
 /// IopBuildFullDriverPath: o caminho NT da imagem do driver.

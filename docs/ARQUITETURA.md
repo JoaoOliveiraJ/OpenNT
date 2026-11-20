@@ -1606,9 +1606,12 @@ leitura dos arquivos do volume guarda os blocos em frames do PFN, os bins das
 hives ficam em páginas do VirtualAlloc de kernel (o papel do pool paginado),
 a ntdll de sistema vai do volume para os frames e as notificações a leem do
 arquivo, e os arquivos embutidos ficam no RAMFS por referência. Os nós do
-Registro compartilham o descritor de segurança entre as chaves com o mesmo
-descritor e não guardam cópias dos nomes em minúsculas (um hash por
-subchave).
+Registro não copiam o conteúdo das hives: o nome, os valores, a classe e o
+LastWriteTime de uma chave guardada numa hive são lidos das células a cada
+consulta, o nó guarda só a identidade (pai, subchaves com um hash por nome,
+a célula, as flags) e o descritor, compartilhado entre as chaves da mesma
+célula 'sk'; a hive é lida do arquivo um bin de cada vez, sem a imagem
+inteira no heap.
 
 **Raízes e metade de sistema congelada.** Como no NT, a metade de sistema é
 a mesma em todo espaço de endereçamento, e é compartilhada pelas entradas da
@@ -3092,9 +3095,9 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     booleano; o corpo é `#[cold]`. O chamador de um IofCallDriver é o
     endereço de retorno do export em curso no processador (guardado pelo
     gancho do despacho, com a ETHREAD conferida).
-  - Exploradores (`kd/explore.rs`): `reg keys|values|value` lê a arena do
-    `cm/registry` (`node_by_path`, `with_node`, `hive_of`), seguindo os
-    links; `objdir` lista um diretório do `ob/object_manager` (tipo, corpo
+  - Exploradores (`kd/explore.rs`): `reg keys|values|value` lê o
+    `cm/registry` (`node_by_path`, `with_node` com as células, `hive_of`),
+    seguindo os links; `objdir` lista um diretório do `ob/object_manager` (tipo, corpo
     nativo, filhos, destino do link ou arquivo); `fs ls|read` usa o leitor
     NTFS do kernel (`drivers/fs/ntfs::mounted`, ATA PIO por consulta).
     Todos alocam e tomam as travas do Rust: só rodam com
@@ -5417,17 +5420,31 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   `kernel/build.rs` inclui `ntos/ke/services.rs` para gerar a ntdll de
   bring-up.
 - **Hives do Registro** (`ntos/cm/hive/`, `hive_list.rs`): a arena de
-  `cm/registry.rs` é o namespace (o papel dos KCBs com cache completo); um
-  nó de uma hive de arquivo guarda a célula 'nk' dele, e cada mudança no nó
-  (chave criada ou excluída, valor gravado ou removido) vai na mesma hora,
-  sob a mesma trava, para as células da hive (`hive/key_cells.rs`,
-  `hive/index.rs`, `hive/security_cells.rs`), marcando os setores de 512
-  bytes sujos. O NtFlushKey grava o log incremental (.LOG1/.LOG2
+  `cm/registry.rs` (blocos de 128 nós pelo NodeId, que nunca se repete) é
+  o namespace, com um nó no papel do KCB de cada chave: pai, subchaves,
+  descritor, flags e a célula 'nk'. O conteúdo de uma chave guardada numa
+  hive (nome, valores, classe, LastWriteTime) não é copiado para o nó: ele
+  é lido das células a cada consulta (`registry::KeyView`, sobre
+  `hive/key_cells.rs`), como o 19041 lê pelo mapa de células; só os nós
+  sem célula (as chaves mestras, as voláteis, as subárvores montadas em
+  memória) guardam o próprio conteúdo, e a raiz de uma hive tem o nome do
+  ponto de montagem. A carga lê o primário um bin de cada vez
+  (`Storage::from_file`, numa janela de 256 KB; só a recuperação pelos logs
+  monta a imagem inteira), confere a hive sem copiar nada (`tree::check`,
+  que lê cada célula 'sk' uma vez) e liga um nó por chave
+  (`registry::link_hive`). Cada mudança (chave criada ou excluída, valor
+  gravado ou removido) vai direto às células, sob a mesma trava
+  (`hive/key_cells.rs`, `hive/index.rs`, `hive/security_cells.rs`),
+  marcando os setores de 512 bytes sujos; uma operação de célula que falha
+  não muda a chave e marca a hive como quebrada (a descarga dela fica
+  recusada). Uma chave excluída, ou de uma hive descarregada, sai da arena
+  na hora; com handle aberto, fica só o nome e o LastWriteTime até o
+  último handle fechar. O NtFlushKey grava o log incremental (.LOG1/.LOG2
   alternados) e as faixas sujas no primário, entre o bloco base
   invalidado e o validado (`hive/sync.rs`); a carga de um primário
   invalidado aplica os logs (`hive/log.rs`). As chaves voláteis não ganham
   célula. A classe de uma chave (o Class do NtCreateKey, capturado como no
-  CmCreateKey: Length ímpar dá STATUS_INVALID_PARAMETER) fica no nó e numa
+  CmCreateKey: Length ímpar dá STATUS_INVALID_PARAMETER) fica numa
   célula própria da hive (Class e ClassLength do 'nk', com o MaxClassLen
   do pai). O KeyNodeInformation a põe depois do nome, com o ClassOffset
   alinhado a 8, e o KeyFullInformation logo depois do cabeçalho (0x2C),

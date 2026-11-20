@@ -326,7 +326,7 @@ fn boot_empty_and_private(assert: Assert) {
     let empty_file = create_file("\\??\\D:\\opennt-hive-vazia.dat");
     zw_files::close_file_entry(empty_file as u32);
     let (loaded, _) = load_ex(EMPTY, "\\??\\D:\\opennt-hive-vazia.dat", 0, 0, false);
-    let fresh = registry::node_by_path(EMPTY).and_then(|node| registry::with_node(node, |key| key.children.is_empty() && key.values.is_empty())).unwrap_or(false);
+    let fresh = registry::node_by_path(EMPTY).and_then(|node| registry::with_node(node, |key| key.children.is_empty() && key.value_count() == 0)).unwrap_or(false);
     let image = read_volume("/opennt-hive-vazia.dat");
     assert(empty_file != 0 && loaded == 0 && fresh && image.get(..4) == Some(&b"regf"[..]), "userhive: um primario vazio carrega como hive nova");
     assert(unload_with("ZwUnloadKey", EMPTY, &[]) == 0, "userhive: ZwUnloadKey da hive nova");

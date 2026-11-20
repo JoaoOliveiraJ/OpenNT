@@ -68,7 +68,7 @@ pub fn initialize_system(image: Option<&[u8]>) -> Result<(), u32> {
 pub fn initialize_dynamic() {
     let path = "\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Errata\\Dynamic";
     let Ok(handle) = crate::ntos::cm::registry::open_or_create(path, None) else { return };
-    let values = crate::ntos::cm::registry::get_node(handle).and_then(|node| crate::ntos::cm::registry::with_node(node, |key| key.values.len())).unwrap_or(0);
+    let values = crate::ntos::cm::registry::get_node(handle).and_then(|node| crate::ntos::cm::registry::with_node(node, |key| key.value_count())).unwrap_or(0);
     crate::ntos::cm::registry::close_handle(handle);
     if values != 0 {
         crate::debug_print!("[em] Control\\Errata\\Dynamic com {} banco(s) adicional(is), que o OpenNT ainda nao mescla", values);

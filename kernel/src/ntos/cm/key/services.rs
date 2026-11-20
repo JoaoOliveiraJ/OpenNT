@@ -953,10 +953,10 @@ pub fn key_operation(kind: Kind, handle: u64, arguments: &Fields, previous_mode:
                     Kind::QueryValue | Kind::EnumerateValue => {
                         let value: Option<Value> = if kind == Kind::QueryValue {
                             let name = read_unicode_string(field("name"), false)?.to_lowercase();
-                            registry::with_node(node, |key| key.value(&name).cloned()).flatten()
+                            registry::with_node(node, |key| key.value(&name)).flatten()
                         } else {
                             let index = field("index") as u32 as usize;
-                            registry::with_node(node, |key| key.values.get(index).cloned()).flatten()
+                            registry::with_node(node, |key| key.value_at(index)).flatten()
                         };
                         match value {
                             Some(value) => value_information::write(&value, field("klass") as u32, field("out"), field("length") as u32, field("returned")),
@@ -965,7 +965,7 @@ pub fn key_operation(kind: Kind, handle: u64, arguments: &Fields, previous_mode:
                         }
                     }
                     Kind::EnumerateKey | Kind::QueryKey => {
-                        let child = if kind == Kind::EnumerateKey { registry::children(node).get(field("index") as u32 as usize).copied() } else { Some(node) };
+                        let child = if kind == Kind::EnumerateKey { registry::child_at(node, field("index") as u32 as usize) } else { Some(node) };
                         if kind == Kind::EnumerateKey && field("klass") > 2 {
                             0xC000_0003
                         } else {
@@ -1038,7 +1038,7 @@ fn query_multiple(node: NodeId, entries: u64, count: u32, buffer: u64, length: u
             name.pop();
         }
         let lower = String::from_utf16_lossy(&name).to_lowercase();
-        let Some(value) = registry::with_node(node, |key| key.value(&lower).cloned()).flatten() else { return Ok(0xC000_0034) };
+        let Some(value) = registry::with_node(node, |key| key.value(&lower)).flatten() else { return Ok(0xC000_0034) };
         let data_length = value.data.len() as u32 & 0x7FFF_FFFF;
         offset = (offset + 3) & !3;
         needed = (needed + 3) & !3;

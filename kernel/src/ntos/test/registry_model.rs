@@ -98,7 +98,7 @@ fn control_set_link(assert: Assert) {
     // OBJ_OPENLINK (0x100) abre o próprio link.
     let (opened, link) = open_with("\\Registry\\Machine\\System\\CurrentControlSet", 0, 0x340, false, 0);
     let node = registry::get_node(link as u32);
-    let shape = node.and_then(|node| registry::with_node(node, |key| (key.link, key.volatile, key.cell.is_none(), key.value("symboliclinkvalue").cloned())));
+    let shape = node.and_then(|node| registry::with_node(node, |key| (key.link, key.volatile, key.cell.is_none(), key.value("symboliclinkvalue"))));
     let expected = link_data("\\Registry\\Machine\\SYSTEM\\ControlSet001");
     assert(opened == 0 && shape.as_ref().is_some_and(|(is_link, volatile, no_cell, value)| *is_link && *volatile && *no_cell && value.as_ref().is_some_and(|value| value.value_type == 6 && value.data == expected)), "cmmodel: CurrentControlSet e link volatil com SymbolicLinkValue REG_LINK = \\Registry\\Machine\\SYSTEM\\ControlSet001 sem NUL");
     close(link);
@@ -176,7 +176,7 @@ fn machine_hives(assert: Assert) {
     }
     // CmpLinkKeyToHive: S-1-5-18 é link volátil para .Default.
     let (opened, system_user) = open_with("\\Registry\\User\\S-1-5-18", 0, 0x340, false, 0);
-    let shape = registry::get_node(system_user as u32).and_then(|node| registry::with_node(node, |key| (key.link, key.volatile, key.value("symboliclinkvalue").cloned())));
+    let shape = registry::get_node(system_user as u32).and_then(|node| registry::with_node(node, |key| (key.link, key.volatile, key.value("symboliclinkvalue"))));
     close(system_user);
     let expected = link_data("\\Registry\\User\\.Default");
     let followed = registry::node_by_path("\\Registry\\User\\S-1-5-18");
@@ -216,7 +216,7 @@ fn hardware_profiles(assert: Assert) {
     let profile = registry::read_value_by_path(&configuration, "CurrentConfig").filter(|value| value.value_type == 4 && value.data.len() >= 4).map(|value| u32::from_le_bytes([value.data[0], value.data[1], value.data[2], value.data[3]]));
     let link = alloc::format!("{profiles}\\Current");
     let (opened, current) = open_with(&link, 0, 0x340, false, 0);
-    let shape = registry::get_node(current as u32).and_then(|node| registry::with_node(node, |key| (key.link, key.volatile, key.value("symboliclinkvalue").cloned())));
+    let shape = registry::get_node(current as u32).and_then(|node| registry::with_node(node, |key| (key.link, key.volatile, key.value("symboliclinkvalue"))));
     let expected = profile.map(|profile| link_data(&alloc::format!("{profiles}\\{profile:04}")));
     let followed = registry::node_by_path(&alloc::format!("{link}\\Software"));
     let target = profile.and_then(|profile| registry::node_by_path(&alloc::format!("{profiles}\\{profile:04}\\Software")));
@@ -390,7 +390,7 @@ fn new_hive_from_missing_file(assert: Assert) {
     let target = attributes(MOUNT);
     let (loaded, root) = load_ex(target, FILE, 0x10, 0, true);
     let node = registry::node_by_path(MOUNT);
-    let empty = node.and_then(|node| registry::with_node(node, |key| key.children.is_empty() && key.values.is_empty() && key.name.eq_ignore_ascii_case("{6f70656e-6e74-4000-8000-000000000003}")));
+    let empty = node.and_then(|node| registry::with_node(node, |key| key.children.is_empty() && key.value_count() == 0 && key.name().eq_ignore_ascii_case("{6f70656e-6e74-4000-8000-000000000003}")));
     let file = read_volume("/opennt-hive-nova.dat");
     assert(loaded == 0 && root != 0 && registry::get_node(root as u32) == node && empty == Some(true) && file.len() >= 0x2000 && file[..4] == *b"regf", "cmmodel: NtLoadKeyEx de arquivo ausente cria a hive nova com a raiz vazia");
     close(root);

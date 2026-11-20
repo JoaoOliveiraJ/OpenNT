@@ -339,14 +339,14 @@ fn new_hive_image(target: &str, file_name: &str) -> Result<Vec<u8>, u32> {
 }
 
 /// O que o CmpInitHiveFromFile deixa pronto: o primário e os logs abertos,
-/// as células lidas (com os logs aplicados a um primário invalidado) e as
-/// chaves.
+/// as células lidas (com os logs aplicados a um primário invalidado) e a
+/// conferência delas.
 struct HiveFromFile {
     primary: HiveFile,
     logs: [Option<HiveFile>; 2],
     storage: Storage,
     recovered: bool,
-    keys: Vec<tree::FlatKey>,
+    checked: tree::Checked,
 }
 
 /// CmpInitHiveFromFile (rva 0x6e9cb8): o primário (FILE_OPEN_IF quando a
@@ -367,8 +367,8 @@ fn init_hive_from_file(target: &str, file_name: &str, allocate: bool, mode: Open
         }
     }
     let (storage, recovered) = read_primary(&primary, &logs, file_name)?;
-    let keys = tree::read(&storage)?;
-    Ok(HiveFromFile { primary, logs, storage, recovered, keys })
+    let checked = tree::check(&storage)?;
+    Ok(HiveFromFile { primary, logs, storage, recovered, checked })
 }
 
 /// Os status do primeiro CmpInitHiveFromFile que levam o CmpCmdHiveOpen
@@ -415,12 +415,12 @@ fn load_hive_files(target: &str, file_name: &str, request: &mut LoadRequest, all
     // As hives do boot vêm do CmpLoadHiveThread, sem o CmpCmdHiveOpen: não
     // repetem a abertura.
     let opened = if boot { init_hive_from_file(target, file_name, allocate, mode) } else { cmd_hive_open(target, file_name, allocate, mode, flags) };
-    let HiveFromFile { primary, logs, mut storage, recovered, mut keys } = opened?;
+    let HiveFromFile { primary, logs, mut storage, recovered, mut checked } = opened?;
     // CmpReorganizeHive: o pedido do NtCompressKey (LastReorganizeTime = 1)
     // recompõe a hive compacta na carga.
     let reorganize = write && storage.base_block().last_reorganize_time.get() == 1;
     if reorganize {
-        let new_keys: Vec<tree::NewKey> = keys.iter().map(|key| tree::NewKey { name: key.record.name.clone(), last_write_time: key.record.last_write_time, security: key.record.security.clone(), values: key.record.values.clone(), parent: key.parent, link: key.record.flags & crate::ntos::cm::hive::key_cells::KEY_SYM_LINK != 0, class: key.record.class.clone() }).collect();
+        let new_keys = tree::records(&storage, &checked)?;
         let sequence = storage.base_block().sequence1.get();
         let Some((rebuilt, _)) = tree::build(&new_keys, storage.minor(), now(), file_name) else { return Err(STATUS_INSUFFICIENT_RESOURCES) };
         storage = rebuilt;
@@ -428,7 +428,7 @@ fn load_hive_files(target: &str, file_name: &str, request: &mut LoadRequest, all
         base.sequence1.set(sequence);
         base.sequence2.set(sequence);
         base.last_reorganize_time.set(now());
-        keys = tree::read(&storage)?;
+        checked = tree::check(&storage)?;
     }
     if write && (recovered || reorganize) {
         // O primário recuperado (ou recomposto) volta inteiro ao arquivo.
@@ -442,7 +442,7 @@ fn load_hive_files(target: &str, file_name: &str, request: &mut LoadRequest, all
     // A classe de confiança é decidida antes do CmpLinkHiveToMaster: uma
     // recusa não liga nada.
     let class = if boot { None } else { trust_class_for(identifier, request)? };
-    if let Err((status, _)) = registry::link_hive(target, identifier, storage, keys) {
+    if let Err((status, _)) = registry::link_hive(target, identifier, storage, checked) {
         return Err(status);
     }
     registry::set_trust_class(identifier, class);
@@ -755,22 +755,24 @@ pub fn save(node: NodeId, file: &HiveFile, minor: u32) -> u32 {
     }
 }
 
-/// As chaves de uma hive de arquivo (o primário validado, lido bin a bin).
-fn read_hive_file(file: &HiveFile) -> Result<Vec<tree::FlatKey>, u32> {
+/// As células de uma hive de arquivo (o primário validado, lido bin a bin)
+/// e a conferência delas.
+fn read_hive_file(file: &HiveFile) -> Result<(Storage, tree::Checked), u32> {
     let storage = Storage::from_file(file.size(), &|offset, length| file.read_range(offset, length))?;
-    tree::read(&storage)
+    let checked = tree::check(&storage)?;
+    Ok((storage, checked))
 }
 
 /// CmRestoreKey: troca a subárvore da chave pela hive do arquivo.
 pub fn restore(node: NodeId, file: &HiveFile, flags: u32) -> u32 {
-    let keys = match read_hive_file(file) {
-        Ok(keys) => keys,
+    let (source, checked) = match read_hive_file(file) {
+        Ok(read) => read,
         Err(status) => return status,
     };
     if flags & REG_FORCE_RESTORE == 0 && registry::subtree_has_open_handles(node, false) {
         return STATUS_CANNOT_DELETE;
     }
-    match registry::restore_subtree(node, keys) {
+    match registry::restore_subtree(node, &source, &checked) {
         Ok(()) => match registry::hive_of(node) {
             Some((identifier, _)) => flush_hive(identifier),
             None => 0,
@@ -786,22 +788,27 @@ pub fn restore_volatile(node: NodeId, file: &HiveFile) -> u32 {
     if registry::hive_of(node).is_some() || registry::path_of(node).is_none() {
         return STATUS_INVALID_PARAMETER;
     }
-    let keys = match read_hive_file(file) {
-        Ok(keys) => keys,
+    let (source, checked) = match read_hive_file(file) {
+        Ok(read) => read,
         Err(status) => return status,
     };
-    let Some(root_name) = keys.first().map(|key| key.record.name.clone()) else { return STATUS_REGISTRY_CORRUPT };
+    let copies = match tree::records(&source, &checked) {
+        Ok(copies) => copies,
+        Err(status) => return status,
+    };
+    drop(source);
+    let Some(root_name) = copies.first().map(|key| key.name.clone()) else { return STATUS_REGISTRY_CORRUPT };
     let Some(base) = registry::path_of(node) else { return STATUS_INVALID_PARAMETER };
     let mount = alloc::format!("{base}\\{root_name}");
     // CmpCopySyncTree para a hive volátil.
-    let copies: Vec<tree::NewKey> = keys.iter().map(|key| tree::NewKey { name: key.record.name.clone(), last_write_time: key.record.last_write_time, security: key.record.security.clone(), values: key.record.values.clone(), parent: key.parent, link: key.record.flags & crate::ntos::cm::hive::key_cells::KEY_SYM_LINK != 0, class: key.record.class.clone() }).collect();
     let Some((storage, _)) = tree::build(&copies, LATEST_MINOR, now(), "") else { return STATUS_INSUFFICIENT_RESOURCES };
-    let keys = match tree::read(&storage) {
-        Ok(keys) => keys,
+    drop(copies);
+    let checked = match tree::check(&storage) {
+        Ok(checked) => checked,
         Err(status) => return status,
     };
     let identifier = NEXT_HIVE.fetch_add(1, Ordering::AcqRel);
-    if let Err((status, _)) = registry::link_hive(&mount, identifier, storage, keys) {
+    if let Err((status, _)) = registry::link_hive(&mount, identifier, storage, checked) {
         return status;
     }
     VOLATILE.lock().push((identifier, mount.clone()));
@@ -820,11 +827,11 @@ pub fn refresh(node: NodeId) -> u32 {
         Ok(read) => read,
         Err(status) => return status,
     };
-    let keys = match tree::read(&storage) {
-        Ok(keys) => keys,
+    let checked = match tree::check(&storage) {
+        Ok(checked) => checked,
         Err(status) => return status,
     };
-    match registry::refresh_hive(identifier, storage, keys) {
+    match registry::refresh_hive(identifier, storage, checked) {
         Ok(()) => 0,
         Err(status) => status,
     }

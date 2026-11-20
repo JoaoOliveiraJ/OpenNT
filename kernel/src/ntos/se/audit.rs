@@ -176,7 +176,7 @@ pub fn set_global_sacl_from_lsa(type_name: &[u16]) -> u32 {
     let name = String::from_utf16_lossy(type_name);
     let path = format!("{GLOBAL_SACL_KEY_PREFIX}{name}");
     let Some(node) = crate::ntos::cm::registry::node_by_path(&path) else { return STATUS_OBJECT_NAME_NOT_FOUND };
-    let Some(value) = crate::ntos::cm::registry::with_node(node, |key| key.value("").map(|value| value.data.clone())) else { return STATUS_OBJECT_NAME_NOT_FOUND };
+    let Some(value) = crate::ntos::cm::registry::with_node(node, |key| key.value("").map(|value| value.data)) else { return STATUS_OBJECT_NAME_NOT_FOUND };
     let Some(data) = value else { return STATUS_OBJECT_NAME_NOT_FOUND };
     // O ResultLength da primeira leitura (KEY_VALUE_PARTIAL_INFORMATION):
     // acima do limite, o STATUS_BUFFER_TOO_SMALL dela volta ao LSA.

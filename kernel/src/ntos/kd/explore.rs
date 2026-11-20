@@ -86,7 +86,7 @@ pub fn registry(line: &str, out: &mut Payload) {
         "keys" => {
             let start = rest.trim().parse::<usize>().unwrap_or(0);
             let children = registry::children(node);
-            let header = registry::with_node(node, |key| (key.values.len(), key.last_write_time, key.volatile, key.link)).unwrap_or((0, 0, false, false));
+            let header = registry::with_node(node, |key| (key.value_count(), key.last_write_time(), key.volatile, key.link)).unwrap_or((0, 0, false, false));
             let hive = registry::hive_of(node).and_then(|(identifier, _)| registry::hive_path(identifier)).unwrap_or_default();
             out.push_str("chave\t");
             push_clean(out, &registry::path_of(node).unwrap_or_else(|| String::from(path)));
@@ -96,7 +96,7 @@ pub fn registry(line: &str, out: &mut Payload) {
                     let _ = writeln!(out, "mais: {}", index);
                     return;
                 }
-                let Some((name, subkeys, values)) = registry::with_node(*child, |key| (key.name.clone(), key.children.len(), key.values.len())) else { continue };
+                let Some((name, subkeys, values)) = registry::with_node(*child, |key| (key.name(), key.children.len(), key.value_count())) else { continue };
                 out.push_str("k\t");
                 push_clean(out, &name);
                 let _ = writeln!(out, "\t{}\t{}", subkeys, values);
@@ -104,13 +104,13 @@ pub fn registry(line: &str, out: &mut Payload) {
         }
         "values" => {
             let start = rest.trim().parse::<usize>().unwrap_or(0);
-            let count = registry::with_node(node, |key| key.values.len()).unwrap_or(0);
+            let count = registry::with_node(node, |key| key.value_count()).unwrap_or(0);
             for index in start..count {
                 if out.len() > PAGE_BYTES {
                     let _ = writeln!(out, "mais: {}", index);
                     return;
                 }
-                let Some(value) = registry::with_node(node, |key| key.values.get(index).cloned()).flatten() else { continue };
+                let Some(value) = registry::with_node(node, |key| key.value_at(index)).flatten() else { continue };
                 out.push_str("v\t");
                 push_clean(out, &value.name);
                 let _ = write!(out, "\t{}\t{}\t", value.value_type, value.data.len());
@@ -123,7 +123,7 @@ pub fn registry(line: &str, out: &mut Payload) {
             let offset = rest.trim().parse::<usize>().unwrap_or(0);
             let lower = name.to_lowercase();
             let wanted = if lower == "(padrao)" || lower == "@" { String::new() } else { lower };
-            let Some(value) = registry::with_node(node, |key| key.value(&wanted).cloned()).flatten() else {
+            let Some(value) = registry::with_node(node, |key| key.value(&wanted)).flatten() else {
                 let _ = writeln!(out, "{}: valor {} nao encontrado", path, name);
                 return;
             };

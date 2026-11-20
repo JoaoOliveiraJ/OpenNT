@@ -19,6 +19,11 @@
 //!   blocos de 100 (CmpAddValueToListEx, rva 0x6e0174);
 //! - MaxNameLen, MaxValueNameLen e MaxValueDataLen guardam os maiores
 //!   comprimentos em bytes de UTF-16 e de dados vistos pela chave.
+//!
+//! As leituras (nome, valores, classe e LastWriteTime de uma chave) vêm
+//! direto das células, sem cópia do nome: o Registro não guarda outra cópia
+//! do conteúdo de uma hive (o HvpGetCellPaged e o CmpFindValueByName do
+//! 19041).
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -81,25 +86,80 @@ fn stored_name(name: &[u16]) -> (Vec<u8>, bool) {
     }
 }
 
-fn decode_name(bytes: &[u8], compressed: bool) -> Vec<u16> {
-    if compressed {
-        bytes.iter().map(|&byte| byte as u16).collect()
-    } else {
-        bytes.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect()
+/// O nome guardado numa célula ('nk' ou 'vk'), em caracteres UTF-16: um
+/// byte por caractere num nome comprimido, pares little-endian no outro.
+#[derive(Clone, Copy)]
+pub struct Units<'a> {
+    bytes: &'a [u8],
+    compressed: bool,
+}
+
+impl<'a> Units<'a> {
+    /// Caracteres UTF-16 do nome.
+    pub fn len(&self) -> usize {
+        if self.compressed { self.bytes.len() } else { self.bytes.len() / 2 }
     }
+
+    pub fn iter(&self) -> UnitIter<'a> {
+        UnitIter { bytes: self.bytes, compressed: self.compressed, at: 0 }
+    }
+
+    pub fn to_vec(&self) -> Vec<u16> {
+        self.iter().collect()
+    }
+
+    /// O nome como texto (um substituto no lugar de cada surrogate solto,
+    /// como o `String::from_utf16_lossy`).
+    pub fn to_string_lossy(&self) -> String {
+        char::decode_utf16(self.iter()).map(|unit| unit.unwrap_or(char::REPLACEMENT_CHARACTER)).collect()
+    }
+}
+
+/// Os caracteres de [`Units`] em ordem.
+#[derive(Clone)]
+pub struct UnitIter<'a> {
+    bytes: &'a [u8],
+    compressed: bool,
+    at: usize,
+}
+
+impl Iterator for UnitIter<'_> {
+    type Item = u16;
+
+    fn next(&mut self) -> Option<u16> {
+        if self.compressed {
+            let byte = *self.bytes.get(self.at)?;
+            self.at += 1;
+            Some(byte as u16)
+        } else {
+            let pair = self.bytes.get(self.at..self.at + 2)?;
+            self.at += 2;
+            Some(u16::from_le_bytes([pair[0], pair[1]]))
+        }
+    }
+}
+
+/// O nome de uma chave, lido da célula.
+pub fn key_name_units(storage: &Storage, cell: u32) -> Option<Units<'_>> {
+    let node = node(storage, cell)?;
+    let bytes = storage.cell_bytes(cell, 0x4c + node.name_length.get() as u32)?;
+    Some(Units { bytes: &bytes[0x4c..], compressed: node.flags.get() & KEY_COMP_NAME != 0 })
 }
 
 /// O nome de uma chave em UTF-16.
 pub fn key_name(storage: &Storage, cell: u32) -> Option<Vec<u16>> {
-    let node = node(storage, cell)?;
-    let bytes = storage.read_cell(cell, 0x4c + node.name_length.get() as u32)?;
-    Some(decode_name(&bytes[0x4c..], node.flags.get() & KEY_COMP_NAME != 0))
+    key_name_units(storage, cell).map(|units| units.to_vec())
+}
+
+/// O nome de um valor, lido da célula 'vk'.
+pub fn value_name_units(storage: &Storage, cell: u32) -> Option<Units<'_>> {
+    let value = vk(storage, cell)?;
+    let bytes = storage.cell_bytes(cell, 0x14 + value.name_length.get() as u32)?;
+    Some(Units { bytes: &bytes[0x14..], compressed: value.flags.get() & VALUE_COMP_NAME != 0 })
 }
 
 fn value_name(storage: &Storage, cell: u32) -> Option<Vec<u16>> {
-    let value = vk(storage, cell)?;
-    let bytes = storage.read_cell(cell, 0x14 + value.name_length.get() as u32)?;
-    Some(decode_name(&bytes[0x14..], value.flags.get() & VALUE_COMP_NAME != 0))
+    value_name_units(storage, cell).map(|units| units.to_vec())
 }
 
 fn units(text: &str) -> Vec<u16> {
@@ -179,19 +239,23 @@ pub fn create_key(storage: &mut Storage, parent: u32, name: &str, class: &[u16],
     Some(cell)
 }
 
-/// O dado de um valor.
-fn read_data(storage: &Storage, value: &CmKeyValue) -> Result<Vec<u8>, u32> {
+/// Os trechos do dado de um valor em ordem, sem cópia: o campo Data (até
+/// 4 bytes, CM_KEY_VALUE_SPECIAL_SIZE), a célula de dados ou os segmentos
+/// de uma célula 'db'. Um dado que não cabe nas células é
+/// STATUS_REGISTRY_CORRUPT.
+fn data_chunks(storage: &Storage, value: &CmKeyValue, mut chunk: impl FnMut(&[u8])) -> Result<(), u32> {
     let length = value.data_length.get();
     if length & SPECIAL_SIZE != 0 {
         let length = length & !SPECIAL_SIZE;
         if length > 4 {
             return Err(STATUS_REGISTRY_CORRUPT);
         }
-        return Ok(value.data.get().to_le_bytes()[..length as usize].to_vec());
+        chunk(&value.data.get().to_le_bytes()[..length as usize]);
+        return Ok(());
     }
     let cell = value.data.get();
     if length == 0 {
-        return Ok(Vec::new());
+        return Ok(());
     }
     if storage.minor() >= 4 && length > BIG_SEGMENT {
         let address = storage.cell(cell, 8).ok_or(STATUS_REGISTRY_CORRUPT)?;
@@ -201,19 +265,28 @@ fn read_data(storage: &Storage, value: &CmKeyValue) -> Result<Vec<u8>, u32> {
         if big.signature.get() != DB || count == 0 || count.saturating_mul(BIG_SEGMENT) < length {
             return Err(STATUS_REGISTRY_CORRUPT);
         }
-        let list = storage.read_cell(big.list.get(), count * 4).ok_or(STATUS_REGISTRY_CORRUPT)?;
-        let mut data = Vec::with_capacity(length as usize);
+        let list = storage.cell_bytes(big.list.get(), count * 4).ok_or(STATUS_REGISTRY_CORRUPT)?;
+        let mut taken = 0u32;
         for segment in list.chunks_exact(4) {
             let segment = u32::from_le_bytes([segment[0], segment[1], segment[2], segment[3]]);
-            let take = (length - data.len() as u32).min(BIG_SEGMENT);
-            data.extend(storage.read_cell(segment, take).ok_or(STATUS_REGISTRY_CORRUPT)?);
-            if data.len() as u32 == length {
+            let take = (length - taken).min(BIG_SEGMENT);
+            chunk(storage.cell_bytes(segment, take).ok_or(STATUS_REGISTRY_CORRUPT)?);
+            taken += take;
+            if taken == length {
                 break;
             }
         }
-        return Ok(data);
+        return Ok(());
     }
-    storage.read_cell(cell, length).ok_or(STATUS_REGISTRY_CORRUPT)
+    chunk(storage.cell_bytes(cell, length).ok_or(STATUS_REGISTRY_CORRUPT)?);
+    Ok(())
+}
+
+/// O dado de um valor.
+fn read_data(storage: &Storage, value: &CmKeyValue) -> Result<Vec<u8>, u32> {
+    let mut data = Vec::with_capacity((value.data_length.get() & !SPECIAL_SIZE) as usize);
+    data_chunks(storage, value, |bytes| data.extend_from_slice(bytes))?;
+    Ok(data)
 }
 
 /// CmpSetValueDataNew: a célula de dados (ou 'db') para dados acima de 4
@@ -302,10 +375,19 @@ fn find_value(storage: &Storage, key: &CmKeyNode, name: &[u16]) -> Option<(usize
 /// CmSetValueKey sobre a hive: troca o dado de um valor existente ou cria
 /// o 'vk' no fim da lista.
 pub fn set_value(storage: &mut Storage, key_cell: u32, name: &str, value_type: u32, data: &[u8], time: u64) -> Option<()> {
-    let name_units = units(name);
     let key = node(storage, key_cell)?;
-    match find_value(storage, key, &name_units) {
-        Some((_, cell)) => {
+    let existing = find_value(storage, key, &units(name)).map(|(_, cell)| cell);
+    set_value_at(storage, key_cell, existing, name, value_type, data, time)
+}
+
+/// [`set_value`] com o valor já procurado: `existing` é a célula 'vk' do
+/// valor com esse nome (o dado dela é trocado), ou nenhuma para um 'vk' novo
+/// no fim da lista.
+pub fn set_value_at(storage: &mut Storage, key_cell: u32, existing: Option<u32>, name: &str, value_type: u32, data: &[u8], time: u64) -> Option<()> {
+    let name_units = units(name);
+    node(storage, key_cell)?;
+    match existing {
+        Some(cell) => {
             let old = vk(storage, cell)?;
             let (length, field) = (old.data_length.get(), old.data.get());
             free_data(storage, length, field);
@@ -342,10 +424,16 @@ pub fn set_value(storage: &mut Storage, key_cell: u32, name: &str, value_type: u
 
 /// CmDeleteValueKey sobre a hive. `None` quando o valor não existe.
 pub fn delete_value(storage: &mut Storage, key_cell: u32, name: &str, time: u64) -> Option<()> {
-    let name_units = units(name);
     let key = node(storage, key_cell)?;
-    let (position, cell) = find_value(storage, key, &name_units)?;
+    let (_, cell) = find_value(storage, key, &units(name))?;
+    delete_value_at(storage, key_cell, cell, time)
+}
+
+/// [`delete_value`] do valor da célula 'vk' `cell` da chave.
+pub fn delete_value_at(storage: &mut Storage, key_cell: u32, cell: u32, time: u64) -> Option<()> {
+    let key = node(storage, key_cell)?;
     let mut cells = value_cells(storage, key)?;
+    let position = cells.iter().position(|&candidate| candidate == cell)?;
     cells.remove(position);
     let value = vk(storage, cell)?;
     let (length, field) = (value.data_length.get(), value.data.get());
@@ -413,39 +501,91 @@ pub fn set_last_write_time(storage: &mut Storage, key_cell: u32, time: u64) {
     }
 }
 
-/// Uma chave lida da hive.
-pub struct KeyRecord {
-    pub name: String,
-    pub last_write_time: u64,
-    pub security: Captured,
-    pub values: Vec<Value>,
-    pub children: Vec<u32>,
-    pub flags: u16,
-    /// A classe da chave em UTF-16 (vazia sem classe).
-    pub class: Vec<u16>,
+/// CmpCheckKey em versão de leitura, sem copiar nada: o nome, a lista de
+/// valores com cada 'vk', o nome e o dado dele, e a classe cabem nas
+/// células. A lista de subchaves e o descritor ficam com o passeio
+/// (`tree::check`).
+pub fn check_key(storage: &Storage, cell: u32) -> Result<(), u32> {
+    let key = node(storage, cell).ok_or(STATUS_REGISTRY_CORRUPT)?;
+    key_name_units(storage, cell).ok_or(STATUS_REGISTRY_CORRUPT)?;
+    let count = key.value_list.count.get();
+    if count != 0 {
+        let length = count.checked_mul(4).ok_or(STATUS_REGISTRY_CORRUPT)?;
+        let list = storage.cell_bytes(key.value_list.list.get(), length).ok_or(STATUS_REGISTRY_CORRUPT)?;
+        for entry in list.chunks_exact(4) {
+            let value_cell = u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
+            let value = vk(storage, value_cell).ok_or(STATUS_REGISTRY_CORRUPT)?;
+            value_name_units(storage, value_cell).ok_or(STATUS_REGISTRY_CORRUPT)?;
+            data_chunks(storage, value, |_| {})?;
+        }
+    }
+    match (key.class.get(), key.class_length.get() as u32) {
+        (HCELL_NIL, _) | (_, 0) => Ok(()),
+        (class, length) => storage.cell_bytes(class, length).map(|_| ()).ok_or(STATUS_REGISTRY_CORRUPT),
+    }
 }
 
-/// Lê um 'nk' com os valores, a segurança e as células das subchaves
-/// (CmpCheckKey em versão de leitura: assinaturas, contagens e limites).
-pub fn read_key(storage: &Storage, cell: u32) -> Result<KeyRecord, u32> {
-    let key = node(storage, cell).ok_or(STATUS_REGISTRY_CORRUPT)?;
-    let name = key_name(storage, cell).ok_or(STATUS_REGISTRY_CORRUPT)?;
-    let security = security_cells::read(storage, key.security.get())?;
-    let children = index::enumerate(storage, key.sub_key_lists[0].get())?;
-    if children.len() != key.sub_key_counts[0].get() as usize {
-        return Err(STATUS_REGISTRY_CORRUPT);
+/// Os valores de uma chave (o ValueList.Count).
+pub fn value_count(storage: &Storage, key_cell: u32) -> u32 {
+    node(storage, key_cell).map_or(0, |key| key.value_list.count.get())
+}
+
+/// A célula 'vk' do valor `index` de uma chave, na ordem da lista.
+pub fn value_cell(storage: &Storage, key_cell: u32, index: u32) -> Option<u32> {
+    let key = node(storage, key_cell)?;
+    if index >= key.value_list.count.get() {
+        return None;
     }
-    let mut values = Vec::new();
-    for value_cell in value_cells(storage, key).ok_or(STATUS_REGISTRY_CORRUPT)? {
-        let value = vk(storage, value_cell).ok_or(STATUS_REGISTRY_CORRUPT)?;
-        let value_name = value_name(storage, value_cell).ok_or(STATUS_REGISTRY_CORRUPT)?;
-        values.push(Value { name: String::from_utf16_lossy(&value_name), value_type: value.type_.get(), data: read_data(storage, value)? });
-    }
-    let class = match (key.class.get(), key.class_length.get() as u32) {
+    let entry = storage.cell_bytes(key.value_list.list.get(), (index + 1) * 4)?;
+    let at = index as usize * 4;
+    Some(u32::from_le_bytes([entry[at], entry[at + 1], entry[at + 2], entry[at + 3]]))
+}
+
+/// A primeira célula 'vk' de uma chave cujo nome satisfaz `matches`.
+pub fn find_value_cell(storage: &Storage, key_cell: u32, matches: impl Fn(Units) -> bool) -> Option<u32> {
+    (0..value_count(storage, key_cell)).filter_map(|index| value_cell(storage, key_cell, index)).find(|&cell| value_name_units(storage, cell).is_some_and(&matches))
+}
+
+/// A cópia de um valor (nome, tipo e dado) de uma célula 'vk'.
+pub fn read_value(storage: &Storage, cell: u32) -> Option<Value> {
+    let value = vk(storage, cell)?;
+    let name = value_name_units(storage, cell)?.to_string_lossy();
+    Some(Value { name, value_type: value.type_.get(), data: read_data(storage, value).ok()? })
+}
+
+/// O tamanho do nome (bytes de UTF-16) e o do dado de um valor.
+pub fn value_sizes(storage: &Storage, cell: u32) -> Option<(u32, u32)> {
+    let value = vk(storage, cell)?;
+    let name = value_name_units(storage, cell)?.len() as u32 * 2;
+    Some((name, value.data_length.get() & !SPECIAL_SIZE))
+}
+
+/// A classe de uma chave em UTF-16 (vazia sem classe).
+pub fn class_units(storage: &Storage, key_cell: u32) -> Vec<u16> {
+    let Some(key) = node(storage, key_cell) else { return Vec::new() };
+    match (key.class.get(), key.class_length.get() as u32) {
         (HCELL_NIL, _) | (_, 0) => Vec::new(),
-        (cell, length) => storage.read_cell(cell, length).ok_or(STATUS_REGISTRY_CORRUPT)?.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect(),
-    };
-    Ok(KeyRecord { name: String::from_utf16_lossy(&name), last_write_time: key.last_write_time.quad_part.get() as u64, security, values, children, flags: key.flags.get(), class })
+        (cell, length) => storage.cell_bytes(cell, length).map_or(Vec::new(), |bytes| bytes.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect()),
+    }
+}
+
+/// O tamanho em bytes da classe de uma chave (o que [`class_units`] lê).
+pub fn class_length(storage: &Storage, key_cell: u32) -> u32 {
+    let Some(key) = node(storage, key_cell) else { return 0 };
+    match (key.class.get(), key.class_length.get() as u32) {
+        (HCELL_NIL, _) | (_, 0) => 0,
+        (cell, length) => storage.cell_bytes(cell, length).map_or(0, |_| length & !1),
+    }
+}
+
+/// LastWriteTime de uma chave.
+pub fn last_write_time(storage: &Storage, key_cell: u32) -> u64 {
+    node(storage, key_cell).map_or(0, |key| key.last_write_time.quad_part.get() as u64)
+}
+
+/// SubKeyCounts[Stable] de uma chave.
+pub fn sub_key_count(storage: &Storage, key_cell: u32) -> u32 {
+    node(storage, key_cell).map_or(0, |key| key.sub_key_counts[0].get())
 }
 
 /// A célula de uma subchave pelo nome (para os testes de conferência).

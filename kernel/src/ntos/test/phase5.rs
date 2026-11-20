@@ -47,14 +47,16 @@ fn registry_hive(assert: Assert) {
     assert(registry::object_stats().handles == statistics.handles + 3 && registry::object_stats().objects >= statistics.objects + 2, "registry: estatisticas de objetos e handles");
     let names = registry::list_keys(base);
     assert(names.len() == 2 && names[0] == "Filho" && names[1] == "opennttest", "registry: subchaves em ordem de insercao com nome preservado");
-    // Valores sem diferença de caixa; regravar mantém a posição.
-    let before = registry::with_node(registry::get_node(child).unwrap_or(0), |key| key.last_write_time).unwrap_or(0);
+    // Valores sem diferença de caixa; regravar mantém a posição e o nome
+    // gravado primeiro (o CmpSetValueKeyExisting, rva 0x6df998, só troca
+    // DataLength, Data e Type do 'vk' que já existe).
+    let before = registry::with_node(registry::get_node(child).unwrap_or(0), |key| key.last_write_time()).unwrap_or(0);
     assert(registry::set_value(child, "Primeiro", 4, alloc::vec![1, 0, 0, 0]) && registry::set_value(child, "Segundo", 1, alloc::vec![b'a', 0]) && registry::set_value(reopened, "PRIMEIRO", 4, alloc::vec![2, 0, 0, 0]), "registry: valores gravados");
     let value = registry::get_value(child, "primeiro");
-    let order = registry::with_node(registry::get_node(child).unwrap_or(0), |key| key.values.iter().map(|value| value.name.clone()).collect::<alloc::vec::Vec<_>>()).unwrap_or_default();
-    assert(value.is_some_and(|value| value.name == "PRIMEIRO" && value.data == [2, 0, 0, 0]) && order.len() == 2 && order[0] == "PRIMEIRO", "registry: regravar substitui no lugar");
+    let order = registry::with_node(registry::get_node(child).unwrap_or(0), |key| key.values().iter().map(|value| value.name.clone()).collect::<alloc::vec::Vec<_>>()).unwrap_or_default();
+    assert(value.is_some_and(|value| value.name == "Primeiro" && value.data == [2, 0, 0, 0]) && order.len() == 2 && order[0] == "Primeiro", "registry: regravar substitui no lugar");
     assert(registry::read_value_by_path("\\registry\\machine\\software\\openntselftest\\opennttest", "segundo").is_none() && registry::read_value_by_path(&(alloc::string::String::from(base) + "\\Filho"), "segundo").is_some_and(|value| value.value_type == 1), "registry: consulta interna por caminho");
-    let after = registry::with_node(registry::get_node(child).unwrap_or(0), |key| key.last_write_time).unwrap_or(0);
+    let after = registry::with_node(registry::get_node(child).unwrap_or(0), |key| key.last_write_time()).unwrap_or(0);
     assert(after >= before && NOTIFICATIONS.load(Ordering::SeqCst) == 5, "registry: LastWriteTime e notificacao a cada gravacao");
     assert(registry::delete_value(child, "SEGUNDO") && !registry::delete_value(child, "segundo") && NOTIFICATIONS.load(Ordering::SeqCst) == 6, "registry: exclusao de valor so notifica quando remove");
     // Exclusão: só folhas; handles antigos deixam de resolver a identidade.
