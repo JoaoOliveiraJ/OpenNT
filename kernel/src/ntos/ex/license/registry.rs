@@ -3,7 +3,8 @@
 //! Os dados pertencem à hive e ao provedor de informações do sistema; este
 //! módulo conserva a ordem das consultas e não cria políticas nem estados de
 //! ativação. ZwQuerySystemInformation (classe 0xBE, Cloudbook) entra por
-//! [`set_system_information`] com o Zw da fase 6.
+//! [`set_system_information`], posto por `values::init_runtime` com o Zw de
+//! modo kernel.
 
 use crate::ntos::ex::pool_allocation;
 use crate::ntos::cm::key::services::{self as key_services, fields, Kind};
@@ -65,6 +66,10 @@ static SYSTEM_INFORMATION: SpinLock<Option<SystemInformation>> = SpinLock::new(N
 
 pub fn set_system_information(provider: Option<SystemInformation>) {
     *SYSTEM_INFORMATION.lock() = provider;
+}
+
+pub fn system_information() -> Option<SystemInformation> {
+    *SYSTEM_INFORMATION.lock()
 }
 
 /// Nome do valor: constante interna ou UNICODE_STRING do chamador (não lida

@@ -10,6 +10,7 @@ use alloc::vec::Vec;
 
 use crate::ntos::ex::license::boot::{self as license_boot, BootProviders};
 use crate::ntos::ex::license::service as license_service;
+use crate::ntos::ex::license::registry as license_registry;
 use crate::ntos::ex::license::special::Providers;
 use crate::ntos::cm::registry;
 use crate::ntos::ps::silo::query as silo_query;
@@ -39,6 +40,10 @@ pub fn init() {
 }
 
 pub fn init_runtime(providers: &BootProviders) -> Result<(), KernelError> {
+    // Os callbacks Cloudbook do ProductOptions (os nomes de dispositivo do
+    // SLQueryLicenseValueInternal) leem a classe 0xBE pelo
+    // ZwQuerySystemInformation de modo kernel.
+    license_registry::set_system_information(Some(query_system_information));
     let policy = {
         let values = VALUES.lock();
         if values.host_context != 0 {
@@ -55,6 +60,12 @@ pub fn init_runtime(providers: &BootProviders) -> Result<(), KernelError> {
     values.host_context = context;
     values.policy = None;
     Ok(())
+}
+
+/// O ZwQuerySystemInformation de modo kernel (`ex/system_information`) com
+/// o status de uma falha interna no lugar do erro.
+fn query_system_information(class: u32, buffer: u64, length: u32, returned: u64) -> u32 {
+    crate::ntos::ex::system_information::query(class, buffer, length, returned).unwrap_or_else(|error| error.status)
 }
 
 /// Um server silo empresta o contexto de SILO_GLOBALS; ausência ou

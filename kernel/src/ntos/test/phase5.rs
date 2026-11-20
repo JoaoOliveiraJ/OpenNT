@@ -1281,12 +1281,14 @@ fn license_service_queries(assert: Assert) {
     crate::ntos::cm::registry::set_value(options, "OSProductPfn", 1, crate::ntos::cm::registry::encode_wide("OpenNT.Pfn"));
     assert(ask("Kernel-OsProduct-PFN", 64, &providers) == 0 && guest::read32(value_type) == 1 && guest::read32(length) == 22 && guest::read16(output) == b'O' as u16, "licenseregistry: OSProductPfn lido de ProductOptions");
     assert(ask("Kernel-OsProduct-PFN", 4, &providers) == 0xC000_0023 && guest::read32(length) == 22, "licenseregistry: buffer curto");
-    // Cloudbook pela classe 0xBE quando ProductOptions não tem o valor.
+    // Cloudbook pela classe 0xBE quando ProductOptions não tem o valor; o
+    // provedor do boot volta no fim.
+    let boot_provider = registry::system_information();
     registry::set_system_information(Some(test_cloudbook_information));
     assert(ask("FDE6DEB3-F790-48FF-8F27-43461944FD3E", 32, &providers) == 0 && guest::read32(value_type) == 3 && guest::read_bytes(output, 32) == [0xAB; 32], "licenseregistry: identificador Cloudbook pelo provedor do sistema");
     assert(ask("CE163B38-1AEC-47AF-854D-FC90ABD6951C", 4, &providers) == 0 && guest::read32(value_type) == 4 && guest::read32(output) == 1, "licenseregistry: Cloudbook bloqueado (flags 5)");
     assert(ask("FDE6DEB3-F790-48FF-8F27-43461944FD3E", 16, &providers) == 0xC000_0023, "licenseregistry: capacidade do identificador");
-    registry::set_system_information(None);
+    registry::set_system_information(boot_provider);
     crate::ntos::cm::registry::delete_key(options);
     crate::ntos::cm::registry::close_handle(options);
     // Guardas da entrada Nt.
