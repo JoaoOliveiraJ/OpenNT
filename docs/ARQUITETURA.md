@@ -6753,12 +6753,24 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   cria o explorer.exe, os dois com o token desse usuário; testes
   logon-do-usuario, perfil-do-usuario, userinit e explorer; o teste
   area-de-trabalho espera o `DESKTOP_OK` da vigia da tela);
+  `SHELL_TRAY_CREATED` (depois do `USER_LOGON_OK`, o NtUserCreateWindowEx do
+  explorer.exe da sessão 1 volta com uma janela da classe Shell_TrayWnd, o
+  nome lido pelo `LargeString` que o user32 passa no segundo argumento;
+  `initial_process::win32k_window_created`) e `STARTMENU_HOST_STARTED` (o
+  StartMenuExperienceHost.exe nasce na sessão 1 com o token LowBox desse
+  usuário); os testes barra-de-tarefas e menu-iniciar esperam também o
+  `TASKBAR_OK` e o `START_MENU_OK` da vigia e do `--start-menu`;
   os de falha são `*** PANIC`, `*** EXCECAO`, `SELFTEST FALHOU` e `*** STOP`
   (a parada do KeBugCheckEx; com `--expect-stop` o STOP faz parte do teste,
   como no `bugcheck`). O `test-boot` procura falhas desde o boot até
-  a última saída esperada e, com `--hold=MS`, por mais MS milissegundos. No
-  `--keys`, `{combo}` vai cru ao `sendkey` do monitor (teclas pressionadas
-  em ordem e soltas ao contrário, como `{ctrl_r-scroll_lock-scroll_lock}`).
+  a última saída esperada e, com `--hold=MS`, por mais MS milissegundos;
+  cada `--expect-any` é procurada desde o começo da serial, depois das
+  `--expect`, em qualquer ordem. No `--keys`, `{combo}` vai ao `sendkey` do
+  monitor (teclas pressionadas em ordem e soltas ao contrário, como
+  `{ctrl_r-scroll_lock-scroll_lock}`), com cada nome conferido na lista dos
+  que o `sendkey` do QEMU 11 aceita (`qemu::QEMU_KEYS`; a tecla do Windows é
+  `meta_l`): o monitor só responderia `invalid parameter`, e o teste
+  esgotaria o prazo sem a tecla.
 
 ## 6. Documentação e status
 
@@ -6794,6 +6806,11 @@ resultado nos textos do PNG; o `cargo xtask status` os lê de lá. Um teste
 que passa com a tela de logon confirmada pela vigia do `--watch-screen`
 (abaixo) grava como captura essa tela, a que o provou, mesmo se o QEMU já
 terminou; uma tela de foto não cabe em 60 KB e vai pela metade (512x384).
+Todo PNG que o test-boot grava leva no texto `opennt-tela` o tamanho da tela
+que as conferências leram (1024x768): elas leem o `screendump` inteiro, nunca
+o PNG, e quem confere um PNG de novo o amplia antes, pelo vizinho mais
+próximo, para esse tamanho (o branco do relógio e o ponteiro são limites
+absolutos que só valem na tela inteira).
 
 O `test-boot --watch-screen` lê a tela durante o teste, pelo mesmo QMP, a
 cada 2 s (`qemu::watch_screen`). Uma tela gráfica de pelo menos 800x600 com
@@ -6805,8 +6822,9 @@ e o aviso do QEMU antes da VGA iniciar (640x480) não contam. O vídeo de boot
 do OpenNT (o modo VBE 1024x768) é todo preto, e o kernel só desenha nele a
 tela de bugcheck: o que aparece ali vem de quem desenha depois do boot.
 
-Depois do primeiro pixel, a mesma vigia procura a tela de logon
-(`screen_check::logon_screen`): um quarto ou mais da tela fora do preto,
+Depois do primeiro pixel e do `LOGONUI_STARTED` na serial (antes do LogonUI
+nenhuma imagem cobrindo a tela é a de logon), a mesma vigia procura a tela de
+logon (`screen_check::logon_screen`): um quarto ou mais da tela fora do preto,
 pelo menos metade dos pares de pixels vizinhos desenhados com cada canal
 mudando até 16 de um para o outro, 8 cores ou mais com 1/1536 da tela cada e
 desenho (1% dos pixels) em 3/5 das linhas e 3/5 das colunas. Quando duas
@@ -6824,6 +6842,25 @@ suaves), a cor de destaque com o relógio, que o LogonUI mostra sem a imagem
 linhas ou das colunas); um quadro rasgado mais perto do fim e a imagem
 surgindo do preto não ficam iguais na leitura seguinte. O teste da tela de
 logon que falha escreve no log o que faltou na última tela lida.
+
+Num teste que espera o `TASKBAR_OK`, a vigia segue depois do `DESKTOP_OK` e,
+com o `SHELL_TRAY_CREATED` na serial, confere a barra de tarefas
+(`screen_check::taskbar_layout`), com todas as medidas em função da altura h
+da faixa escura de baixo (40 linhas a 96 DPI; o tamanho dos elementos da
+barra segue o DPI, não o da tela): nos primeiros 6h/5 pixels, o logotipo
+claro do Iniciar, de h/4 a 3h/5 pixels de lado e de h²/20 a 7h²/20 pixels;
+nas 6h colunas da direita, o relógio, o grupo de colunas com texto mais à
+direita (grupos separados por mais de max(h/5, 3) colunas vazias) com duas
+linhas de h/8 a h/2 linhas cada, de h a 4h colunas. Um pixel é de texto
+quando a luminância (2R+5G+B)/8 passa a mediana da barra por 0x60, na barra
+opaca ou translúcida sobre o img0; o indicador de idioma, também em duas
+linhas, fica à esquerda do relógio, e os ícones da área de notificação têm
+uma linha só. Uma leitura com a barra vira a referência; o `TASKBAR_OK` sai
+quando uma leitura seguinte tem a linha da hora mudada em max(h²/100, 4)
+pixels ou mais, o resto da barra em até 1/20 e a tela acima em até 1/32
+(`screen_check::clock_ticked`: o relógio passou de minuto, o caminho do
+SetTimer, da repintura e do dwm, não um quadro congelado), e a leitura
+seguinte é igual; a tela vai para `<build>/barra-de-tarefas.png`.
 
 O `test-boot --capture-every=SEGUNDOS` grava a tela durante o teste em
 `<build>/tela-NNNN.png` (`qemu::FrameSeries`): a NNNN é a dos NNNN×SEGUNDOS
@@ -6862,8 +6899,22 @@ o mouse (DX, DY) em dez `mouse_move` e lê a tela por até 15 s, até achar entr
 do tamanho do ponteiro com a seta (miolo branco e contorno preto) só antes e
 outro só depois, deslocado no sentido do movimento
 (`screen_check::cursor_moved`; a aceleração do Windows muda a distância), e
-o log ganha o `CURSOR_MOVED_OK`. Um `--dismiss` ou `--mouse` que não vê a tela
-mudar encerra o teste com o que faltou na última leitura.
+o log ganha o `CURSOR_MOVED_OK`. A seta é achada pela forma dentro de cada
+mudança (`screen_check::arrows_in`: um miolo branco fechado pelo contorno
+preto, metade ou mais dos pixels em volta dele pretos, em até 40 pixels de
+lado), não pelo tamanho da mudança: o controle que se acende sob o ponteiro
+(o botão de energia do LogonUI, 48x48) muda junto em volta da seta, e a seta
+que anda pouco deixa os dois lugares numa mudança só. O
+`--start-menu=...:TECLAS` espera a área de trabalho com a barra parada,
+digita as teclas (`{meta_l}`, a tecla do Windows), espera o menu aberto e
+parado e aperta o Esc até a tela de antes voltar
+(`screen_check::start_menu_open`, com h da barra da tela de antes: a barra
+muda em até 1/8; acima dela, o maior grupo de mudanças fica colado à esquerda
+e à barra, tem 6h por 6h pixels ou mais, 3/4 deles mudados, de 1/200 a 1/2 de
+texto e ícones longe da mediana por 0x60 e a maioria dos vizinhos suaves; fora
+dele, a tela muda em até 1/32), e o log ganha o `START_MENU_OK`. Um
+`--dismiss`, `--mouse` ou `--start-menu` que não vê a tela mudar encerra o
+teste com o que faltou na última leitura.
 
 ## 7. O nome OpenNT nos arquivos
 
