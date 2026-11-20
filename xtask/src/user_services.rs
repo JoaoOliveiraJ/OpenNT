@@ -12,9 +12,9 @@
 //! Como os binários de System32, as chaves vêm desta máquina no build, com os
 //! valores daqui: as chaves de serviço desses quatro e as do PlugPlay, do
 //! Power, do BrokerInfrastructure, do SystemEventsBroker, do registrador
-//! do CoreMessaging e da política de vídeo (com Parameters e Security) e a
+//! do CoreMessaging e da política de vídeo (com Parameters e Security), a
 //! do gerenciador de usuários (UserManager, com Parameters e TriggerInfo e
-//! sem Security), a
+//! sem Security) e a do StateRepository (com parameters e Security), a
 //! ordem dos grupos de serviço (`Control\ServiceGroupOrder`), os dois
 //! valores de `Control` que
 //! o services.exe lê no início automático (o `EarlyStartServices`, a lista
@@ -30,7 +30,10 @@
 //! com a política de licença de uma instalação limpa e não ativada desta
 //! edição: `product_policy`) e, na SOFTWARE, os grupos do svchost (`Microsoft\Windows NT\CurrentVersion\
 //! Svchost`, os valores com a lista de serviços de cada grupo e as subchaves
-//! do `LocalServiceNoNetwork` e do `LocalService`), os descritores das
+//! do `LocalServiceNoNetwork`, do `LocalService` e do `appmodel`), os
+//! diretórios do AppX de uma instalação nova
+//! (`Microsoft\Windows\CurrentVersion\Appx`: o `PackageRepositoryRoot` e o
+//! `PackageRoot`), os descritores das
 //! portas de nome transitório
 //! (`Microsoft\SecurityManager\TransientObjects`),
 //! `Microsoft\Rpc\SecurityService`, os provedores de autenticação do RPC, e
@@ -75,7 +78,30 @@ use crate::host_language::HostKey;
 /// sem elas; e marca o svchost dele como crítico (RtlSetProcessIsCritical,
 /// com o `ShellInfrastructure` do Winlogon). A chave não tem Security: o
 /// services.exe dá ao serviço o descritor padrão (ScCreateScServiceObject).
-const SERVICES: &[&str] = &["DcomLaunch", "RpcEptMapper", "RpcSs", "LSM", "PlugPlay", "Power", "BrokerInfrastructure", "SystemEventsBroker", "CoreMessagingRegistrar", "DispBrokerDesktopSvc", "UserManager"];
+/// E o StateRepository (o windows.staterepository.dll no
+/// `svchost.exe -k appmodel -p` com a conta LocalSystem, início sob
+/// demanda): o servidor das classes WinRT Windows.Internal.StateRepository.*
+/// (o servidor StateRepository de `logon_screen`) que os componentes do
+/// sihost, o shell32 e o explorer ativam pelo RPCSS, o que inicia o serviço.
+/// Ao subir ele cria os bancos `StateRepository-Machine.srd` e
+/// `StateRepository-Deployment.srd` em `%AppRepository%` (o
+/// `PackageRepositoryRoot` de [`software_keys`]), na pasta que o volume já
+/// leva (`host_security`): o serviço não cria pastas.
+const SERVICES: &[&str] = &["DcomLaunch", "RpcEptMapper", "RpcSs", "LSM", "PlugPlay", "Power", "BrokerInfrastructure", "SystemEventsBroker", "CoreMessagingRegistrar", "DispBrokerDesktopSvc", "UserManager", "StateRepository"];
+
+/// A chave do AppX na SOFTWARE (relativa à raiz da hive).
+const APPX: &str = "Microsoft\\Windows\\CurrentVersion\\Appx";
+
+/// Os diretórios do AppX de uma instalação nova (REG_SZ): o
+/// `PackageRepositoryRoot`, que o Windows.StateRepository.dll expande como
+/// `%AppRepository%` no caminho dos bancos (sem ele, todo caminho fica
+/// errado), e o `PackageRoot` dos pacotes.
+const APPX_DIRECTORIES: &[(&str, &str)] = &[("PackageRepositoryRoot", "C:\\ProgramData\\Microsoft\\Windows\\AppRepository"), ("PackageRoot", "C:\\Program Files\\WindowsApps")];
+
+/// UTF-16LE terminado em NUL, como o Registro guarda um REG_SZ.
+fn registry_string(text: &str) -> Vec<u8> {
+    text.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect()
+}
 
 /// Os valores de `Control` que o services.exe lê: o EarlyStartServices (o
 /// ScStartEarlySetOfServices; sem ele todo serviço automático entra no
@@ -376,10 +402,11 @@ mod tests {
     }
 }
 
-/// As chaves da hive SOFTWARE: os grupos do svchost, os provedores de
+/// As chaves da hive SOFTWARE: os diretórios do AppX
+/// ([`APPX_DIRECTORIES`]), os grupos do svchost, os provedores de
 /// autenticação do RPC e a configuração do WUDF.
 pub fn software_keys() -> Vec<HostKey> {
-    let mut keys = Vec::new();
+    let mut keys = vec![HostKey { path: String::from(APPX), values: APPX_DIRECTORIES.iter().map(|(name, path)| (String::from(*name), 1, registry_string(path))).collect() }];
     #[cfg(windows)]
     {
         use crate::host_language::registry;
@@ -396,6 +423,10 @@ pub fn software_keys() -> Vec<HostKey> {
         // desempacotamento do svchost que registra a fábrica da
         // GlobalBrokerInstance).
         registry::copy(registry::LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Svchost\\LocalService", "Microsoft\\Windows NT\\CurrentVersion\\Svchost\\LocalService", true, &mut keys);
+        // A do grupo do StateRepository (`appmodel`: o AuthenticationLevel,
+        // as flags do CoInitializeSecurity que deixam os contêineres e os
+        // usuários interativos chamarem e a política de desempacotamento).
+        registry::copy(registry::LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Svchost\\appmodel", "Microsoft\\Windows NT\\CurrentVersion\\Svchost\\appmodel", true, &mut keys);
         // Os desempacotadores de confiança do sistema
         // (`Classes\Unmarshalers\System\{clsid}`): com a política de
         // desempacotamento forte dos grupos do svchost (`COM_UnmarshalingPolicy`
@@ -480,5 +511,26 @@ mod service_tests {
         let software = crate::logon_screen::software_keys();
         assert!(key(&software, "Microsoft\\WindowsRuntime\\Server\\UserManager").is_some());
         assert!(key(&software, "Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.System.User").is_some());
+    }
+
+    /// O StateRepository como numa instalação nova: o
+    /// windows.staterepository.dll no svchost do appmodel com a conta
+    /// LocalSystem e início sob demanda, a configuração do grupo, o
+    /// `%AppRepository%` dos bancos e os dois DLLs no volume.
+    #[test]
+    fn state_repository_as_fresh_install() {
+        let keys = super::system_keys("ControlSet001");
+        let service = key(&keys, "ControlSet001\\Services\\StateRepository").expect("Services\\StateRepository");
+        assert_eq!(text(service, "ObjectName"), ["LocalSystem"]);
+        assert!(text(service, "ImagePath").first().is_some_and(|path| path.to_ascii_lowercase().ends_with("svchost.exe -k appmodel -p")));
+        let parameters = key(&keys, "ControlSet001\\Services\\StateRepository\\parameters").expect("Services\\StateRepository\\parameters");
+        assert!(text(parameters, "ServiceDll").first().is_some_and(|path| path.to_ascii_lowercase().ends_with("windows.staterepository.dll")));
+        let software = super::software_keys();
+        assert!(key(&software, "Microsoft\\Windows NT\\CurrentVersion\\Svchost\\appmodel").is_some_and(|group| group.values.iter().any(|(name, _, _)| name.eq_ignore_ascii_case("CoInitializeSecurityParam"))));
+        let appx = key(&software, super::APPX).expect("Appx");
+        assert_eq!(text(appx, "PackageRepositoryRoot"), ["C:\\ProgramData\\Microsoft\\Windows\\AppRepository"]);
+        for program in ["Windows.StateRepository.dll", "StateRepository.Core.dll"] {
+            assert!(crate::windows_binaries::user_programs().any(|staged| staged.eq_ignore_ascii_case(program)), "{program}");
+        }
     }
 }

@@ -5318,7 +5318,13 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   com o usermgr.dll e o UserMgrProxy.dll no volume, `user_services.rs`:
   com ele RUNNING o winlogon faz o logon pelo UMgrLogonUser e pede o
   sihost.exe pelo UMgrLaunchShellInfrastructureHost, e o svchost dele fica
-  crítico), as
+  crítico), o StateRepository (no `svchost -k appmodel`, início sob
+  demanda pela ativação das classes Windows.Internal.StateRepository.*,
+  com o Windows.StateRepository.dll e o StateRepository.Core.dll no volume,
+  a subchave `Svchost\appmodel`, o `PackageRepositoryRoot` e o
+  `PackageRoot` de `Microsoft\Windows\CurrentVersion\Appx` e a pasta vazia
+  `\ProgramData\Microsoft\Windows\AppRepository` dos bancos, nunca os
+  bancos desta máquina), as
   fontes de `\SystemRoot\Fonts` com o GRE_Initialize, o FontSubstitutes, o
   FontLink e a chave Fonts, e na SYSTEM o `Control\IDConfigDB` e os perfis
   de `Hardware Profiles` (o `LogPixels` do DPI, `xtask/src/fonts.rs`), o

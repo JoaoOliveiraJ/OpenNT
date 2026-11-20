@@ -546,21 +546,32 @@ pub struct SystemSecurity {
     pub root: Option<Vec<u8>>,
 }
 
-/// As pastas vazias de uma instalação nova que a cadeia usa: o caminho no
-/// volume (achatado como o `nt_path_to_volume_path`) e o daqui, relativo a
-/// `%SystemRoot%` (`None`: o `%ProgramData%`). O ProgramData, o Temp do
-/// Windows, os perfis do LocalService e do NetworkService, o perfil do
-/// SYSTEM, o LogFiles de System32 e o Logs do Windows. A lista certa sai do
-/// log de auditoria do passo 2 (as negações de pasta que falta).
+/// A pasta daqui de uma pasta vazia do volume: relativa ao `%SystemRoot%` ou
+/// ao `%ProgramData%` (vazia: o próprio `%ProgramData%`).
 #[cfg_attr(not(windows), allow(dead_code))]
-const EMPTY_DIRECTORIES: &[(&str, Option<&str>)] = &[
-    ("ProgramData", None),
-    ("Temp", Some("Temp")),
-    ("ServiceProfiles/LocalService", Some("ServiceProfiles/LocalService")),
-    ("ServiceProfiles/NetworkService", Some("ServiceProfiles/NetworkService")),
-    ("config/systemprofile", Some("System32/config/systemprofile")),
-    ("LogFiles", Some("System32/LogFiles")),
-    ("Logs", Some("Logs")),
+#[derive(Clone, Copy)]
+enum HostFolder {
+    Windows(&'static str),
+    ProgramData(&'static str),
+}
+
+/// As pastas vazias de uma instalação nova que a cadeia usa: o caminho no
+/// volume (achatado como o `nt_path_to_volume_path`) e o daqui. O
+/// ProgramData, o AppRepository dele (os bancos do StateRepository, que o
+/// serviço cria só dentro de uma pasta que já existe; o conteúdo daqui não
+/// vai), o Temp do Windows, os perfis do LocalService e do NetworkService, o
+/// perfil do SYSTEM, o LogFiles de System32 e o Logs do Windows. A lista
+/// certa sai do log de auditoria do passo 2 (as negações de pasta que falta).
+#[cfg_attr(not(windows), allow(dead_code))]
+const EMPTY_DIRECTORIES: &[(&str, HostFolder)] = &[
+    ("ProgramData", HostFolder::ProgramData("")),
+    ("ProgramData/Microsoft/Windows/AppRepository", HostFolder::ProgramData("Microsoft/Windows/AppRepository")),
+    ("Temp", HostFolder::Windows("Temp")),
+    ("ServiceProfiles/LocalService", HostFolder::Windows("ServiceProfiles/LocalService")),
+    ("ServiceProfiles/NetworkService", HostFolder::Windows("ServiceProfiles/NetworkService")),
+    ("config/systemprofile", HostFolder::Windows("System32/config/systemprofile")),
+    ("LogFiles", HostFolder::Windows("System32/LogFiles")),
+    ("Logs", HostFolder::Windows("Logs")),
 ];
 
 /// FILE_ATTRIBUTE_DIRECTORY e FILE_ATTRIBUTE_ARCHIVE: os atributos que o
@@ -598,7 +609,7 @@ pub fn system_nodes(files: &[(String, Option<PathBuf>)], existing: &[Node], empt
 #[cfg(windows)]
 mod host {
     use super::descriptor::{self, Descriptor};
-    use super::{parent_of, security_of, settle, Node, SystemSecurity, DIRECTORY_ATTRIBUTES, EMPTY_DIRECTORIES, FILE_ATTRIBUTES};
+    use super::{parent_of, security_of, settle, HostFolder, Node, SystemSecurity, DIRECTORY_ATTRIBUTES, EMPTY_DIRECTORIES, FILE_ATTRIBUTES};
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::{Path, PathBuf};
 
@@ -624,11 +635,15 @@ mod host {
         let mut entries: Vec<(String, bool, Option<PathBuf>)> = files.iter().map(|(path, host)| (String::from(path.trim_end_matches('/')), path.ends_with('/'), host.clone())).collect();
         if empty_directories {
             let program_data = std::env::var("ProgramData").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("C:/ProgramData"));
-            for (volume, relative) in EMPTY_DIRECTORIES {
-                let host = relative.map_or_else(|| program_data.clone(), |relative| windows.join(relative));
-                if host.is_dir() {
-                    entries.push((String::from(*volume), true, Some(host)));
-                }
+            for (volume, origin) in EMPTY_DIRECTORIES {
+                let host = match *origin {
+                    HostFolder::Windows(relative) => windows.join(relative),
+                    HostFolder::ProgramData("") => program_data.clone(),
+                    HostFolder::ProgramData(relative) => program_data.join(relative),
+                };
+                // Uma pasta que esta máquina não deixa ver vai com o
+                // descritor herdado do pai no volume.
+                entries.push((String::from(*volume), true, host.is_dir().then_some(host)));
             }
         }
         let taken = |path: &str| existing.iter().any(|node| node.path.eq_ignore_ascii_case(path));

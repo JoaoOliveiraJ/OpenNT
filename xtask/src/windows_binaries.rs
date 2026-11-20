@@ -542,8 +542,11 @@ const SMSS_PROGRAMS: &[&str] = &[
 /// UserManager) e o UserMgrProxy.dll (os proxies das interfaces WinRT que o
 /// serviço atende, como IUserStatics, e três classes em processo); a carga
 /// atrasada do ADSI (activeds.dll, só de conta de domínio) fica com o stub do
-/// KernelBase. Os imports estáticos deles já estão no volume.
-const SERVICE_CHAIN_PROGRAMS: &[&str] = &["umpo.dll", "psmsrv.dll", "SystemEventsBrokerServer.dll", "brokerlib.dll", "umpnpmgr.dll", "profsvc.dll", "profext.dll", "profsvcext.dll", "wevtsvc.dll", "wevtapi.dll", "usermgr.dll", "UserMgrProxy.dll"];
+/// KernelBase. E o StateRepository (`user_services`): o
+/// Windows.StateRepository.dll (o ServiceDll) e o StateRepository.Core.dll,
+/// a camada de dados com o SQLite que ele importa. Os imports estáticos
+/// deles já estão no volume.
+const SERVICE_CHAIN_PROGRAMS: &[&str] = &["umpo.dll", "psmsrv.dll", "SystemEventsBrokerServer.dll", "brokerlib.dll", "umpnpmgr.dll", "profsvc.dll", "profext.dll", "profsvcext.dll", "wevtsvc.dll", "wevtapi.dll", "usermgr.dll", "UserMgrProxy.dll", "Windows.StateRepository.dll", "StateRepository.Core.dll"];
 
 /// O console: o conhost.exe que o condrv.sys cria para um programa de
 /// console, o cmd.exe (com o cmdext.dll do ext-ms-win-cmd-util), o net.exe,
