@@ -11,6 +11,7 @@ pub mod irql;
 pub mod pcr;
 pub mod processor_identity;
 pub mod processor_information;
+pub mod cpu_set;
 pub mod smp;
 pub mod thread_dispatch;
 pub mod thread_lock;

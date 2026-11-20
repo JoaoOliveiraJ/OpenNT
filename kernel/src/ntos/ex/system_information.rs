@@ -344,12 +344,44 @@ pub fn query(class: u32, output: u64, length: u32, returned: u64) -> Result<u32,
         // SystemPerformanceInformation e SystemPageFileInformation(Ex):
         // `mm/memory_information`.
         2 | 18 | 144 => return query_memory_information(class, output, length, returned),
+        // SystemProcessorPerformanceInformation do grupo do processador
+        // corrente (o grupo 0), `ke/processor_information`.
+        SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION => {
+            let (status, reported) = processor_information::query_performance(0, output, length, &mut |address, bytes| {
+                guest::write_bytes(address, bytes);
+                true
+            });
+            set_reported(returned, reported);
+            return Ok(status);
+        }
+        // SystemFirmwareTableInformation: `ex/firmware_table`, em KernelMode.
+        SYSTEM_FIRMWARE_TABLE_INFORMATION => {
+            let (status, reported) = crate::ntos::ex::firmware_table::query_system_information(output, length, false)?;
+            set_reported(returned, reported);
+            return Ok(status);
+        }
         5 => {}
         _ => return Ok(0xC000_000D),
     }
     system_process_information::query(output, length as u64, returned, false)
 }
 
+/// O ReturnLength opcional de um chamador de modo kernel recebe a célula de
+/// tamanho do ExpQuerySystemInformation.
+fn set_reported(returned: u64, reported: u32) {
+    if returned != 0 {
+        // SAFETY: o PULONG ReturnLength do chamador (modo kernel).
+        unsafe { Field::<u32>::at(returned) }.set(reported);
+    }
+}
+
+/// SystemRegisterFirmwareTableInformationHandler (só de modo kernel).
+pub const SYSTEM_REGISTER_FIRMWARE_TABLE_INFORMATION_HANDLER: u32 = 75;
+/// SystemProcessorPerformanceInformation, SystemFirmwareTableInformation e
+/// SystemCpuSetInformation.
+pub const SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION: u32 = 8;
+pub const SYSTEM_FIRMWARE_TABLE_INFORMATION: u32 = 76;
+pub const SYSTEM_CPU_SET_INFORMATION: u32 = 175;
 /// SYSTEM_BASIC_INFORMATION para um chamador de modo kernel, com os valores
 /// da consulta de modo usuário (`ps/user/syscalls_core.rs`): resolução do
 /// timer de 15,625 ms, páginas de 4 KB, a memória física, a granularidade de
@@ -423,8 +455,31 @@ const SYSTEM_LOGICAL_PROCESSOR_AND_GROUP_INFORMATION: u32 = 107;
 const SYSTEM_NODE_DISTANCE_INFORMATION: u32 = 121;
 /// SystemInterruptSteeringInformation: SYSTEM_INTERRUPT_STEERING_INFORMATION_INPUT.
 const SYSTEM_INTERRUPT_STEERING_INFORMATION: u32 = 180;
+/// PROCESS_QUERY_LIMITED_INFORMATION.
+const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
 /// Classes que o NtQuerySystemInformationEx aceita (as com entrada).
-const EX_CLASSES: [u32; 21] = [8, 23, 42, 61, 72, 73, 83, 100, 107, 108, 121, 141, 160, 165, 175, 178, 180, 181, 209, 210, 211];
+pub const EX_CLASSES: [u32; 21] = [8, 23, 42, 61, 72, 73, 83, 100, 107, 108, 121, 141, 160, 165, 175, 178, 180, 181, 209, 210, 211];
+
+/// O alinhamento com que o NtQuerySystemInformationEx (0x6c7760) sonda a
+/// entrada de modo usuário de cada classe: 2 para o USHORT do grupo ou do
+/// nó, 4 para um ULONG, 8 para um HANDLE.
+pub fn ex_input_alignment(class: u32) -> u64 {
+    match class {
+        72 | 107 | 180 | 210 => 4,
+        165 | 175 | 178 | 181 | 209 | 211 => 8,
+        _ => 2,
+    }
+}
+
+/// O USHORT do grupo da entrada das classes por grupo
+/// (ExpQuerySystemInformation 0x6ca066): pelo menos 2 bytes e um grupo
+/// ativo, senão STATUS_INVALID_PARAMETER.
+pub fn ex_group(input_length: u32, group: u16) -> Result<u16, u32> {
+    if input_length < 2 || group as u64 >= crate::ntos::ke::processor_group::group_count() {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    Ok(group)
+}
 
 /// SYSTEM_INTERRUPT_STEERING_INFORMATION_INPUT (ntexapi): Gsiv, os três
 /// BOOLEANs e o GROUP_AFFINITY alvo.
@@ -456,6 +511,47 @@ pub fn query_ex(class: u32, input: u64, input_length: u32, output: u64, length: 
     // A célula de tamanho do ExpQuerySystemInformation.
     let mut reported = 0u32;
     let status = match class {
+        // SystemProcessorPerformanceInformation do grupo da entrada.
+        SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION => {
+            // SAFETY: entrada de modo kernel com pelo menos um byte.
+            let group = if input_length >= 2 { unsafe { Field::<u16>::at(input) }.get() } else { 0 };
+            let group = match ex_group(input_length, group) {
+                Ok(group) => group,
+                Err(status) => return Ok(status),
+            };
+            let (status, size) = processor_information::query_performance(group, output, length, &mut |address, bytes| {
+                guest::write_bytes(address, bytes);
+                true
+            });
+            reported = size;
+            status
+        }
+        // SystemCpuSetInformation (0x6ccbac): a entrada é exatamente o HANDLE
+        // do processo alvo (NULL, o corrente), referenciado com
+        // PROCESS_QUERY_LIMITED_INFORMATION.
+        SYSTEM_CPU_SET_INFORMATION => {
+            if input_length != 8 {
+                return Ok(STATUS_INVALID_PARAMETER);
+            }
+            // SAFETY: entrada de modo kernel com 8 bytes conferidos.
+            let handle = unsafe { Field::<u64>::at(input) }.get();
+            let mut target = None;
+            if handle != 0 {
+                match crate::ntos::ob::process_reference::reference(handle, PROCESS_QUERY_LIMITED_INFORMATION, 0)? {
+                    Ok(process) => target = Some(process),
+                    Err(status) => return Ok(status),
+                }
+            }
+            let (status, size) = crate::ntos::ke::cpu_set::query(output, length, &mut |address, bytes| {
+                guest::write_bytes(address, bytes);
+                true
+            });
+            if let Some(mut process) = target {
+                process.release()?;
+            }
+            reported = size;
+            status
+        }
         SYSTEM_LOGICAL_PROCESSOR_AND_GROUP_INFORMATION => {
             if input_length < 4 {
                 return Ok(STATUS_INVALID_PARAMETER);
@@ -561,6 +657,9 @@ pub fn set(class: u32, buffer: u64, length: u32) -> u32 {
         SYSTEM_THREAD_PRIORITY_CLIENT_ID_INFORMATION => return thread_priority_client_id(buffer, length, 0).unwrap_or_else(status_of),
         SYSTEM_PRIORITY_SEPERATION => return priority_seperation(buffer, length, 0),
         crate::ntos::ex::console_information::SYSTEM_CONSOLE_INFORMATION => return crate::ntos::ex::console_information::set(buffer, length, 0),
+        // SystemRegisterFirmwareTableInformationHandler (0x708532):
+        // `ex/firmware_table`.
+        SYSTEM_REGISTER_FIRMWARE_TABLE_INFORMATION_HANDLER => return crate::ntos::ex::firmware_table::register_handler(buffer, length, false),
         _ => {}
     }
     if class == 131 {
@@ -863,6 +962,9 @@ pub fn set_from_user_mode(class: u32, buffer: u64, length: u32) -> Result<u32, K
     }
     if class == SYSTEM_PRIORITY_SEPERATION {
         return Ok(priority_seperation(buffer, length, 1));
+    }
+    if class == SYSTEM_REGISTER_FIRMWARE_TABLE_INFORMATION_HANDLER {
+        return Ok(crate::ntos::ex::firmware_table::register_handler(buffer, length, true));
     }
     if class != SYSTEM_EXTEND_SERVICE_TABLE_INFORMATION {
         debug_print!("[usermode] NtSetSystemInformation classe {} (sem suporte de modo usuario)", class);

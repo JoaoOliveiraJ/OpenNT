@@ -90,3 +90,92 @@ pub fn query_features(output: u64, buffer_length: u32, output_length_pointer: u6
     }
     0
 }
+
+// ---- SystemProcessorPerformanceInformation (8) -----------------------------
+//
+// ExpQuerySystemInformation 19041, 0x6ca568: um
+// SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION de 0x30 bytes por processador do
+// grupo pedido (o NtQuerySystemInformation passa o grupo do processador
+// corrente; o NtQuerySystemInformationEx, o USHORT da entrada). Um
+// comprimento zero ou que não é múltiplo de 0x30 dá
+// STATUS_INFO_LENGTH_MISMATCH com 0x30 vezes os processadores do grupo no
+// ReturnLength; um comprimento menor que todos devolve só os que cabem, com
+// sucesso. Cada campo é uma contagem de ticks vezes o KeMaximumIncrement:
+// IdleTime e KernelTime do PoGetIdleTimes (o KernelTime inclui o ocioso),
+// UserTime, DpcTime, InterruptTime e InterruptCount da KPRCB.
+//
+// O OpenNT soma por processador o tempo de kernel e de usuário que o
+// `ps::process::account_thread` cobra das threads (em 100 ns); o ocioso é o
+// resto do tempo desde o boot. O DPC e as interrupções entram no tempo de
+// kernel de quem roda, sem contagem própria (DpcTime, InterruptTime e
+// InterruptCount ficam zero).
+
+use core::sync::atomic::{AtomicU64, Ordering};
+
+use crate::ntos::inc::types::extra_ps_user::SystemProcessorPerformanceInformation;
+use crate::ntos::mm::memory_map::MAX_CPUS;
+
+/// O tempo de kernel (fora do ocioso) e o de usuário de cada processador,
+/// em 100 ns.
+static KERNEL_BUSY_TIME: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+static USER_TIME: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+/// O tamanho de um SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION.
+pub const PERFORMANCE_INFORMATION_SIZE: u32 = SystemProcessorPerformanceInformation::SIZE as u32;
+
+/// Cobra `elapsed_100ns` de kernel ou de usuário do processador corrente.
+pub fn charge_processor_time(kernel: bool, elapsed_100ns: u64) {
+    let cpu = (processor_group::current_processor_number() as usize).min(MAX_CPUS - 1);
+    let counter = if kernel { &KERNEL_BUSY_TIME[cpu] } else { &USER_TIME[cpu] };
+    counter.fetch_add(elapsed_100ns, Ordering::Relaxed);
+}
+
+/// Os tempos de um processador em 100 ns, arredondados para baixo ao tick
+/// (a contagem de ticks do NT vezes o KeMaximumIncrement): (IdleTime,
+/// KernelTime, UserTime).
+fn processor_times(cpu: usize) -> (i64, i64, i64) {
+    let increment = super::clock::MAXIMUM_INCREMENT as u64;
+    let ticks = |value: u64| (value / increment * increment) as i64;
+    let elapsed = super::clock::uptime_100ns();
+    let user = USER_TIME[cpu].load(Ordering::Relaxed).min(elapsed);
+    let busy = KERNEL_BUSY_TIME[cpu].load(Ordering::Relaxed).min(elapsed - user);
+    (ticks(elapsed - user - busy), ticks(elapsed - user), ticks(user))
+}
+
+/// SystemProcessorPerformanceInformation do grupo `group` (o chamador já
+/// conferiu que o grupo existe) em `output`: (NTSTATUS, ReturnLength). Cada
+/// estrutura vai para o chamador por `write` (sondado no modo usuário); uma
+/// escrita recusada é STATUS_ACCESS_VIOLATION.
+pub fn query_performance(group: u16, output: u64, length: u32, write: &mut dyn FnMut(u64, &[u8]) -> bool) -> (u32, u32) {
+    let count = processor_group::active_processor_count_ex(group as u32) as u32;
+    if length == 0 || length % PERFORMANCE_INFORMATION_SIZE != 0 {
+        return (0xC000_0004, PERFORMANCE_INFORMATION_SIZE * count);
+    }
+    let scratch = guest::alloc_bytes(SystemProcessorPerformanceInformation::SIZE);
+    if scratch == 0 {
+        return (0xC000_009A, 0);
+    }
+    let mut written = 0u32;
+    for index in 0..count {
+        if length < written + PERFORMANCE_INFORMATION_SIZE {
+            break;
+        }
+        let (idle, kernel, user) = processor_times((index as usize).min(MAX_CPUS - 1));
+        // SAFETY: o bloco de kernel de 0x30 bytes recém-alocado.
+        let information = unsafe { SystemProcessorPerformanceInformation::at(scratch) };
+        information.idle_time.set(idle);
+        information.kernel_time.set(kernel);
+        information.user_time.set(user);
+        information.dpc_time.set(0);
+        information.interrupt_time.set(0);
+        information.interrupt_count.set(0);
+        information._padding.set(0);
+        if !write(output + written as u64, &guest::read_bytes(scratch, PERFORMANCE_INFORMATION_SIZE as usize)) {
+            guest::free_bytes(scratch);
+            return (0xC000_0005, written);
+        }
+        written += PERFORMANCE_INFORMATION_SIZE;
+    }
+    guest::free_bytes(scratch);
+    (0, written)
+}

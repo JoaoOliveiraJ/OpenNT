@@ -5557,7 +5557,13 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     reserva na entrega ou no rundown);
   - NtQuerySystemInformationEx de modo kernel em `ex/system_information.rs`
     (classes 107, 121 e 180, com o KeNodeDistance e o steering de
-    interrupções de `ke/`), PsChargeProcessPoolQuota/PsReturnPoolQuota em
+    interrupções de `ke/`; 8 com o grupo da entrada e 175, os conjuntos de
+    CPU de `ke/cpu_set.rs`; de modo usuário, a entrada obrigatória, só as
+    classes com entrada e a sonda com o alinhamento de cada uma), as classes
+    8 (o tempo de kernel e de usuário que `ps::process::account_thread`
+    cobra de cada processador, com o ocioso no resto), 76 (as tabelas de
+    firmware nos dois modos) do NtQuerySystemInformation,
+    PsChargeProcessPoolQuota/PsReturnPoolQuota em
     `ps/pool_quota.rs`, ZwSetInformationProcess (ProcessBreakOnTermination e
     ProcessDebugFlags, as mesmas rotinas do NtSetInformationProcess de
     usuário) e a consulta de ProcessDebugFlags em `ps/`, e
@@ -5714,7 +5720,8 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     (ExBlockOnAddressPushLock/ExUnblockOnAddressPushLockEx) e o
     ExEnterCriticalRegionAndAcquireSharedWaitForExclusive;
     ExGetSystemFirmwareTable (`ex/firmware_table.rs`, provedores 'RSMB' e
-    'FIRM'); MmAreMdlPagesCached (o CacheAttribute de cada PFN) e
+    'FIRM' do kernel e os dos drivers, como o 'ACPI' do acpi.sys, pela classe
+    75 do ZwSetSystemInformation); MmAreMdlPagesCached (o CacheAttribute de cada PFN) e
     MmCopyMemory; KeUpdateThreadTag e KeRaiseUserException; os pedidos de
     energia (`po/power_request.rs`, o tipo de objeto PowerRequest com os
     contadores por tipo) e PoNotifyMediaBuffering/

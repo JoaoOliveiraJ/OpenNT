@@ -419,7 +419,7 @@ fn query_system_information(class: u32, buffer: u64, length: u64, returned: u64)
         // As classes de tamanho fixo e as da célula de tamanho
         // (`ex/system_information`): o ProbeForWrite delas exige alinhamento 4.
         use crate::ntos::ex::system_information as information;
-        let reported_class = matches!(class, information::SYSTEM_CPU_QUOTA_INFORMATION | information::SYSTEM_PLATFORM_BINARY_INFORMATION | information::SYSTEM_MEMORY_TOPOLOGY_INFORMATION | information::SYSTEM_POLICY_INFORMATION) || information::SYSTEM_CODE_INTEGRITY_POLICY_CLASSES.contains(&class);
+        let reported_class = matches!(class, information::SYSTEM_CPU_QUOTA_INFORMATION | information::SYSTEM_PLATFORM_BINARY_INFORMATION | information::SYSTEM_MEMORY_TOPOLOGY_INFORMATION | information::SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION | information::SYSTEM_FIRMWARE_TABLE_INFORMATION | information::SYSTEM_POLICY_INFORMATION) || information::SYSTEM_CODE_INTEGRITY_POLICY_CLASSES.contains(&class);
         if (information::is_fixed_class(class) || reported_class) && length != 0 && buffer & 3 != 0 {
             return Ok(0x8000_0002);
         }
@@ -436,6 +436,21 @@ fn query_system_information(class: u32, buffer: u64, length: u64, returned: u64)
             return Ok(status);
         }
         match class {
+            // SystemProcessorPerformanceInformation do grupo do processador
+            // corrente (o NtQuerySystemInformation passa o grupo da KPRCB):
+            // `ke/processor_information`.
+            information::SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION => {
+                let (status, reported) = processor_information::query_performance(0, buffer, length as u32, &mut |address, bytes| guest::try_write_bytes(address, bytes).is_ok());
+                set_returned(reported)?;
+                Ok(status)
+            }
+            // SystemFirmwareTableInformation: `ex/firmware_table`, com a cópia
+            // de kernel do modo usuário.
+            information::SYSTEM_FIRMWARE_TABLE_INFORMATION => {
+                let (status, reported) = crate::ntos::ex::firmware_table::query_system_information(buffer, length as u32, true)?;
+                set_returned(reported)?;
+                Ok(status)
+            }
             // Basic/EmulationBasic/NativeBasic x64.
             0 | 62 | 114 => {
                 if length < SystemBasicInformation::SIZE {
@@ -522,8 +537,12 @@ fn query_system_information(class: u32, buffer: u64, length: u64, returned: u64)
 const TOPOLOGY_SCRATCH_LIMIT: u32 = 0x1_0000;
 
 /// NtQuerySystemInformationEx(class, input, inputLength, buffer, length,
-/// returnLength*): a topologia de processadores e, no resto, a variante
-/// sem entrada.
+/// returnLength*) (19041, 0x6c7760): a entrada é obrigatória (NULL ou
+/// comprimento zero, STATUS_INVALID_PARAMETER), só as classes com entrada
+/// (`EX_CLASSES`, senão STATUS_INVALID_INFO_CLASS), e a entrada é sondada
+/// para leitura com o alinhamento da classe. Depois: a topologia de
+/// processadores, o desempenho e os conjuntos de CPU com a entrada deles e,
+/// no resto, a variante sem entrada.
 /// NtQuerySystemEnvironmentValueEx(VariableName, VendorGuid, Value,
 /// ValueLength, Attributes): o acesso e o firmware em
 /// `hal/firmware_environment.rs`; no BIOS nenhum argumento é tocado.
@@ -536,6 +555,73 @@ fn nt_query_system_information_ex(class: u64, input: u64, input_length: u64, buf
     let returned = stack_arg(rsp, 6);
     let class = class as u32;
     crate::debug_print!("[usermode] NtQuerySystemInformationEx classe {}", class);
+    use crate::ntos::ex::system_information as information;
+    let input_length = input_length as u32;
+    if input == 0 || input_length == 0 {
+        return Ok(STATUS_INVALID_PARAMETER);
+    }
+    if !information::EX_CLASSES.contains(&class) {
+        return Ok(STATUS_INVALID_INFO_CLASS);
+    }
+    if input & (information::ex_input_alignment(class) - 1) != 0 {
+        return Ok(0x8000_0002);
+    }
+    if !probe_user_read(input, input_length as u64) {
+        return Ok(0xC000_0005);
+    }
+    let input_length = input_length as u64;
+    match class {
+        // SystemProcessorPerformanceInformation do grupo da entrada.
+        information::SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION => {
+            if (buffer != 0 && !probe_user_write(buffer, length)) || (returned != 0 && !probe_user_write(returned, 4)) {
+                return Ok(0xC000_0005);
+            }
+            if length != 0 && buffer & 3 != 0 {
+                return Ok(0x8000_0002);
+            }
+            return state::guarded(|| {
+                let group = if input_length >= 2 { guest::try_read::<u16>(input)? } else { 0 };
+                let group = match information::ex_group(input_length as u32, group) {
+                    Ok(group) => group,
+                    Err(status) => return Ok(status),
+                };
+                let (status, reported) = processor_information::query_performance(group, buffer, length as u32, &mut |address, bytes| guest::try_write_bytes(address, bytes).is_ok());
+                if returned != 0 {
+                    guest::try_write::<u32>(returned, reported)?;
+                }
+                Ok(status)
+            });
+        }
+        // SystemCpuSetInformation (0x6ccbac): exatamente o HANDLE do processo
+        // alvo (NULL, o corrente), com PROCESS_QUERY_LIMITED_INFORMATION.
+        information::SYSTEM_CPU_SET_INFORMATION => {
+            if input_length != 8 {
+                return Ok(STATUS_INVALID_PARAMETER);
+            }
+            if (buffer != 0 && !probe_user_write(buffer, length)) || (returned != 0 && !probe_user_write(returned, 4)) {
+                return Ok(0xC000_0005);
+            }
+            return state::guarded(|| {
+                let handle = guest::try_read::<u64>(input)?;
+                let mut target = None;
+                if handle != 0 {
+                    match crate::ntos::ob::process_reference::reference(handle, 0x1000, USER_MODE)? {
+                        Ok(process) => target = Some(process),
+                        Err(status) => return Ok(status),
+                    }
+                }
+                let (status, reported) = crate::ntos::ke::cpu_set::query(buffer, length as u32, &mut |address, bytes| guest::try_write_bytes(address, bytes).is_ok());
+                if let Some(mut process) = target {
+                    process.release()?;
+                }
+                if returned != 0 {
+                    guest::try_write::<u32>(returned, reported)?;
+                }
+                Ok(status)
+            });
+        }
+        _ => {}
+    }
     // SystemSupportedProcessorArchitectures: a entrada é o HANDLE do processo.
     if class == 181 {
         return crate::ntos::ex::supported_architectures::query(input, input_length, buffer, length, returned, queried_process);
@@ -548,9 +634,8 @@ fn nt_query_system_information_ex(class: u64, input: u64, input_length: u64, buf
     if class != 107 {
         return query_system_information(class, buffer, length, returned);
     }
-    // O NtQuerySystemInformationEx recusa entrada nula ou curta; a classe 107
-    // lê a LOGICAL_PROCESSOR_RELATIONSHIP sondada.
-    if input == 0 || (input_length as u32) < 4 {
+    // A classe 107 lê a LOGICAL_PROCESSOR_RELATIONSHIP sondada.
+    if (input_length as u32) < 4 {
         return Ok(STATUS_INVALID_PARAMETER);
     }
     if !probe_user_read(input, 4) || (buffer != 0 && !probe_user_write(buffer, length)) || (returned != 0 && !probe_user_write(returned, 4)) {

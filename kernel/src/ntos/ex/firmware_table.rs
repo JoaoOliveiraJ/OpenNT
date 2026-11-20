@@ -21,8 +21,25 @@
 //!   SystemRegisterFirmwareTableInformationHandler: 'RSMB'
 //!   (WmipRawSMBiosTableHandler 0x2e7a90) sempre e 'FIRM'
 //!   (WmipFirmwareTableHandler 0x3ca8d0) só com firmware BIOS. O OpenNT os
-//!   põe na lista na primeira consulta; o registro de provedores de drivers
-//!   (classe 75 do NtSetSystemInformation) ainda não existe.
+//!   põe na lista na primeira consulta ou no primeiro registro.
+//! - ExpRegisterFirmwareTableInformationHandler 0x7cb498 (a classe 75 do
+//!   NtSetSystemInformation, a do 'ACPI' do acpi.sys): o modo usuário é
+//!   STATUS_PRIVILEGE_NOT_HELD; buffer NULL ou menor que o
+//!   SYSTEM_FIRMWARE_TABLE_HANDLER de 0x18 bytes, STATUS_INFO_LENGTH_MISMATCH.
+//!   Sob o recurso exclusivo: uma assinatura já registrada com Register é
+//!   STATUS_OBJECT_NAME_EXISTS (0x40000000) sem mudar nada; sem Register, o
+//!   mesmo DriverObject tira o provedor (e solta a referência do driver) e
+//!   outro dá STATUS_INVALID_PARAMETER. Uma assinatura nova sem Register é
+//!   STATUS_INVALID_PARAMETER; com Register, o bloco 'ARFT' de 0x28 bytes vai
+//!   ao fim da lista com uma referência ao DriverObject.
+//! - A consulta de modo usuário (a classe 76 do NtQuerySystemInformation)
+//!   copia o buffer inteiro para um bloco de kernel com quota, recusa com
+//!   STATUS_ACCESS_DENIED um processo AppContainer (o 19041 deixa passar o
+//!   'RSMB' quando o token tem a capacidade smbios ou
+//!   Microsoft.firmwareRead, ExpFirmwareAccessAppContainerCheck; o OpenNT
+//!   recusa todos), chama o provedor e devolve a tabela (com sucesso) e o
+//!   TableBufferLength (com sucesso ou STATUS_BUFFER_TOO_SMALL) ao buffer do
+//!   chamador.
 //!
 //! 'FIRM' (WmipFirmwareTableArray 0x20550): as tabelas 0xC0000 e 0xE0000, de
 //! 0x20000 bytes cada, copiadas da memória física. Enumerar devolve os dois
@@ -44,7 +61,9 @@
 
 use alloc::vec::Vec;
 
+use crate::hal::amd64::native_call;
 use crate::ntos::inc::field::{Field, NtStruct, Reserved};
+use crate::ntos::inc::types::extra_ps_user::SystemFirmwareTableHandler;
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::io_space;
 use crate::rtl::{KernelError, SpinLock};
@@ -59,6 +78,13 @@ const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 const STATUS_NOT_FOUND: u32 = 0xC000_0225;
 /// O ExpGetSystemFirmwareTableInformation sem provedor da assinatura.
 const STATUS_NOT_IMPLEMENTED: u32 = 0xC000_0002;
+const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+const STATUS_PRIVILEGE_NOT_HELD: u32 = 0xC000_0061;
+const STATUS_OBJECT_NAME_EXISTS: u32 = 0x4000_0000;
+/// PagedPool com quota (o ExAllocatePoolWithQuotaTag do modo usuário).
+const PAGED_POOL: u32 = 1;
+/// TOKEN_LOWBOX: o token de um processo AppContainer.
+const TOKEN_LOWBOX: u32 = 0x4000;
 const FIRMWARE_TABLE_TAG: u32 = u32::from_le_bytes(*b"ARFT");
 const NON_PAGED_POOL: u32 = 0;
 
@@ -164,12 +190,28 @@ pub struct SmbiosTable {
     pub minor_version: u8,
 }
 
-/// A rotina de um provedor: recebe o bloco e devolve o NTSTATUS.
-type Handler = fn(&TableInformation) -> u32;
+/// A rotina de um provedor: recebe o bloco e devolve o NTSTATUS. Os do
+/// kernel são rotinas internas; os de drivers, o PFNFTH nativo.
+#[derive(Clone, Copy)]
+enum Handler {
+    Kernel(fn(&TableInformation) -> u32),
+    Native(u64),
+}
+
+impl Handler {
+    fn call(self, information: &TableInformation) -> u32 {
+        match self {
+            Handler::Kernel(routine) => routine(information),
+            Handler::Native(routine) => native_call::call(routine, &[information.address()]) as u32,
+        }
+    }
+}
 
 struct Provider {
     signature: u32,
     handler: Handler,
+    /// O DriverObject referenciado do registro (0 nos do kernel).
+    driver_object: u64,
 }
 
 struct Providers {
@@ -217,19 +259,20 @@ fn find_smbios() -> Option<SmbiosTable> {
     modern.or(legacy)
 }
 
-/// Os provedores do kernel na primeira consulta (o registro do WMI no boot).
-fn with_providers<T>(body: impl FnOnce(&Providers) -> T) -> T {
+/// Os provedores do kernel na primeira consulta ou registro (o registro do
+/// WMI no boot, antes dos drivers).
+fn with_providers<T>(body: impl FnOnce(&mut Providers) -> T) -> T {
     let mut providers = PROVIDERS.lock();
     if !providers.initialized {
         providers.initialized = true;
         providers.smbios = find_smbios();
-        providers.list.push(Provider { signature: PROVIDER_RSMB, handler: raw_smbios_handler });
+        providers.list.push(Provider { signature: PROVIDER_RSMB, handler: Handler::Kernel(raw_smbios_handler), driver_object: 0 });
         let firmware_type = crate::ntos::ex::boot_environment::get_information().map_or(0, |information| u32::from_le_bytes([information[16], information[17], information[18], information[19]]));
         if firmware_type == FIRMWARE_TYPE_BIOS {
-            providers.list.push(Provider { signature: PROVIDER_FIRM, handler: firmware_table_handler });
+            providers.list.push(Provider { signature: PROVIDER_FIRM, handler: Handler::Kernel(firmware_table_handler), driver_object: 0 });
         }
     }
-    body(&providers)
+    body(&mut providers)
 }
 
 /// O SMBIOS que o provedor 'RSMB' entrega.
@@ -333,10 +376,110 @@ fn query_information(information: &TableInformation, length: u32) -> (u32, Optio
         return (STATUS_INFO_LENGTH_MISMATCH, Some(HEADER as u32));
     }
     information.table_buffer_length.set(length - HEADER as u32);
-    let handler = with_providers(|providers| providers.list.iter().find(|provider| provider.signature == information.provider_signature.get()).map(|provider| provider.handler));
-    let Some(handler) = handler else { return (STATUS_NOT_IMPLEMENTED, None) };
-    let status = handler(information);
+    let Some(handler) = provider_handler(information.provider_signature.get()) else { return (STATUS_NOT_IMPLEMENTED, None) };
+    let status = handler.call(information);
     (status, Some(information.table_buffer_length.get() + HEADER as u32))
+}
+
+/// O provedor da assinatura (a busca na ExpFirmwareTableProviderListHead).
+fn provider_handler(signature: u32) -> Option<Handler> {
+    with_providers(|providers| providers.list.iter().find(|provider| provider.signature == signature).map(|provider| provider.handler))
+}
+
+/// PsIsProcessAppContainer do processo corrente: o token primário é lowbox.
+fn current_process_is_app_container() -> bool {
+    use crate::ntos::ps::process;
+    process::get_primary_token(process::get_current_process()).is_some_and(|token| crate::ntos::se::token::tokens::body(token).token_flags.get() & TOKEN_LOWBOX != 0)
+}
+
+/// ExpGetSystemFirmwareTableInformation(Buffer, PreviousMode, Length,
+/// &ReturnLength), a classe 76 do NtQuerySystemInformation: (NTSTATUS,
+/// tamanho para o ReturnLength). O tamanho fica 0 quando a assinatura não
+/// tem provedor (a célula local do ExpQuerySystemInformation). No modo
+/// kernel o provedor recebe o próprio buffer; no modo usuário (`user`, o
+/// buffer já sondado para escrita), uma cópia de kernel.
+pub fn query_system_information(buffer: u64, length: u32, user: bool) -> Result<(u32, u32), KernelError> {
+    if length < HEADER as u32 {
+        return Ok((STATUS_INFO_LENGTH_MISMATCH, HEADER as u32));
+    }
+    if !user {
+        // SAFETY: o buffer de modo kernel do chamador, com o cabeçalho.
+        let information = unsafe { TableInformation::at(buffer) };
+        let (status, returned) = query_information(information, length);
+        return Ok((status, returned.unwrap_or(0)));
+    }
+    let block = crate::ntos::ex::pool_allocation::allocate_tagged(PAGED_POOL, length as u64, FIRMWARE_TABLE_TAG)?;
+    if block == 0 {
+        return Ok((STATUS_INSUFFICIENT_RESOURCES, 0));
+    }
+    let result = (|| -> Result<(u32, u32), KernelError> {
+        guest::write_bytes(block, &guest::try_read_bytes(buffer, length as usize)?);
+        // SAFETY: o bloco de kernel com a cópia do buffer do chamador.
+        let information = unsafe { TableInformation::at(block) };
+        if current_process_is_app_container() {
+            return Ok((STATUS_ACCESS_DENIED, 0));
+        }
+        let (status, returned) = query_information(information, length);
+        let Some(returned) = returned else { return Ok((status, 0)) };
+        let table_length = information.table_buffer_length.get();
+        if status & 0x8000_0000 == 0 {
+            guest::try_write_bytes(buffer + HEADER, &guest::read_bytes(block + HEADER, table_length as usize))?;
+        }
+        if status & 0x8000_0000 == 0 || status == STATUS_BUFFER_TOO_SMALL {
+            TableInformation::try_at(buffer)?.table_buffer_length.probe_set(table_length)?;
+        }
+        Ok((status, returned))
+    })();
+    crate::ntos::ex::pool_allocation::free(block, FIRMWARE_TABLE_TAG as u64)?;
+    match result {
+        Ok(answer) => Ok(answer),
+        Err(error) if error.status != 0 => Ok((error.status, 0)),
+        Err(error) => Err(error),
+    }
+}
+
+/// ExpRegisterFirmwareTableInformationHandler(Buffer, Length, PreviousMode):
+/// o NTSTATUS do registro ou da remoção de um provedor de driver.
+pub fn register_handler(buffer: u64, length: u32, user: bool) -> u32 {
+    if user {
+        return STATUS_PRIVILEGE_NOT_HELD;
+    }
+    if buffer == 0 || (length as u64) < SystemFirmwareTableHandler::SIZE {
+        return STATUS_INFO_LENGTH_MISMATCH;
+    }
+    // SAFETY: o SYSTEM_FIRMWARE_TABLE_HANDLER de modo kernel do chamador,
+    // com o tamanho conferido.
+    let request = unsafe { SystemFirmwareTableHandler::at(buffer) };
+    let (signature, register, routine, driver_object) = (request.provider_signature.get(), request.register.get() != 0, request.firmware_table_handler.get(), request.driver_object.get());
+    let released = with_providers(|providers| {
+        if let Some(index) = providers.list.iter().position(|provider| provider.signature == signature) {
+            if register {
+                return Err(STATUS_OBJECT_NAME_EXISTS);
+            }
+            if providers.list[index].driver_object != driver_object {
+                return Err(STATUS_INVALID_PARAMETER);
+            }
+            return Ok(Some(providers.list.remove(index).driver_object));
+        }
+        if !register {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        if driver_object != 0 {
+            crate::ntos::ob::object_header::reference(driver_object, 1);
+        }
+        providers.list.push(Provider { signature, handler: Handler::Native(routine), driver_object });
+        Ok(None)
+    });
+    match released {
+        Ok(Some(driver_object)) => {
+            if driver_object != 0 {
+                crate::ntos::ob::object_header::dereference(driver_object, false);
+            }
+            0
+        }
+        Ok(None) => 0,
+        Err(status) => status,
+    }
 }
 
 /// ExGetSystemFirmwareTable(ProviderSignature, TableID, Buffer, BufferLength,

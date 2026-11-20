@@ -1073,8 +1073,10 @@ pub fn account_thread_handle(delta: i64) -> Result<(), KernelError> {
     object_types::account("Thread", 0, delta)
 }
 
-/// Tempo de CPU em unidades de 100 ns (`mode`: kernel ou usuário).
+/// Tempo de CPU em unidades de 100 ns (`mode`: kernel ou usuário), cobrado
+/// também do processador corrente (o SystemProcessorPerformanceInformation).
 pub fn account_thread(thread: u64, kernel: bool, elapsed_100ns: u64) {
+    crate::ntos::ke::processor_information::charge_processor_time(kernel, elapsed_100ns);
     let mut state = STATE.lock();
     let Some(record) = state.threads.get_mut(&thread) else { return };
     let process = record.process;

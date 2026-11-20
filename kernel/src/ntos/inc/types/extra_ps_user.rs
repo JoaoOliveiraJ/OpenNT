@@ -494,3 +494,129 @@ const _: () = {
     assert!(core::mem::offset_of!(PopPowerWatchdog, arm_time) == 0x128);
     assert!(core::mem::offset_of!(PopPowerWatchdog, arming_thread) == 0x130);
 };
+
+/// `_SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION` (NtQuerySystemInformation
+/// (SystemProcessorPerformanceInformation, classe 8), um por processador do
+/// grupo; 0x30 bytes).
+#[repr(C)]
+pub struct SystemProcessorPerformanceInformation {
+    pub idle_time: Field<i64>,
+    pub kernel_time: Field<i64>,
+    pub user_time: Field<i64>,
+    pub dpc_time: Field<i64>,
+    pub interrupt_time: Field<i64>,
+    pub interrupt_count: Field<u32>,
+    pub _padding: Field<u32>,
+}
+
+unsafe impl NtStruct for SystemProcessorPerformanceInformation {}
+
+const _: () = {
+    assert!(core::mem::size_of::<SystemProcessorPerformanceInformation>() == 0x30);
+    assert!(core::mem::offset_of!(SystemProcessorPerformanceInformation, idle_time) == 0x0);
+    assert!(core::mem::offset_of!(SystemProcessorPerformanceInformation, kernel_time) == 0x8);
+    assert!(core::mem::offset_of!(SystemProcessorPerformanceInformation, user_time) == 0x10);
+    assert!(core::mem::offset_of!(SystemProcessorPerformanceInformation, dpc_time) == 0x18);
+    assert!(core::mem::offset_of!(SystemProcessorPerformanceInformation, interrupt_time) == 0x20);
+    assert!(core::mem::offset_of!(SystemProcessorPerformanceInformation, interrupt_count) == 0x28);
+};
+
+/// `_SYSTEM_CPU_SET_INFORMATION` com o CpuSet (NtQuerySystemInformationEx
+/// (SystemCpuSetInformation, classe 175), um por processador; 0x20 bytes).
+#[repr(C)]
+pub struct SystemCpuSetInformation {
+    pub size: Field<u32>,
+    pub type_: Field<u32>,
+    pub id: Field<u32>,
+    pub group: Field<u16>,
+    pub logical_processor_index: Field<u8>,
+    pub core_index: Field<u8>,
+    pub last_level_cache_index: Field<u8>,
+    pub numa_node_index: Field<u8>,
+    pub efficiency_class: Field<u8>,
+    /// Parked (1), Allocated (2), AllocatedToTargetProcess (4), RealTime (8).
+    pub all_flags: Field<u8>,
+    pub scheduling_class: Field<u8>,
+    pub _reserved: [Field<u8>; 3],
+    pub allocation_tag: Field<u64>,
+}
+
+unsafe impl NtStruct for SystemCpuSetInformation {}
+
+const _: () = {
+    assert!(core::mem::size_of::<SystemCpuSetInformation>() == 0x20);
+    assert!(core::mem::offset_of!(SystemCpuSetInformation, id) == 0x8);
+    assert!(core::mem::offset_of!(SystemCpuSetInformation, group) == 0xC);
+    assert!(core::mem::offset_of!(SystemCpuSetInformation, logical_processor_index) == 0xE);
+    assert!(core::mem::offset_of!(SystemCpuSetInformation, core_index) == 0xF);
+    assert!(core::mem::offset_of!(SystemCpuSetInformation, last_level_cache_index) == 0x10);
+    assert!(core::mem::offset_of!(SystemCpuSetInformation, numa_node_index) == 0x11);
+    assert!(core::mem::offset_of!(SystemCpuSetInformation, efficiency_class) == 0x12);
+    assert!(core::mem::offset_of!(SystemCpuSetInformation, all_flags) == 0x13);
+    assert!(core::mem::offset_of!(SystemCpuSetInformation, scheduling_class) == 0x14);
+    assert!(core::mem::offset_of!(SystemCpuSetInformation, allocation_tag) == 0x18);
+};
+
+/// `_SYSTEM_LOGICAL_PROCESSOR_INFORMATION` (NtQuerySystemInformation
+/// (SystemLogicalProcessorInformation, classe 73); 0x20 bytes): a máscara,
+/// a relação e a união (o nível do cache no primeiro byte, o número do nó
+/// no primeiro ULONG).
+#[repr(C)]
+pub struct SystemLogicalProcessorInformation {
+    pub processor_mask: Field<u64>,
+    pub relationship: Field<u32>,
+    pub _padding: Field<u32>,
+    pub union_first: Field<u32>,
+    pub union_rest: [Field<u32>; 3],
+}
+
+unsafe impl NtStruct for SystemLogicalProcessorInformation {}
+
+const _: () = {
+    assert!(core::mem::size_of::<SystemLogicalProcessorInformation>() == 0x20);
+    assert!(core::mem::offset_of!(SystemLogicalProcessorInformation, relationship) == 0x8);
+    assert!(core::mem::offset_of!(SystemLogicalProcessorInformation, union_first) == 0x10);
+};
+
+/// `_SYSTEM_FIRMWARE_TABLE_HANDLER` (NtSetSystemInformation
+/// (SystemRegisterFirmwareTableInformationHandler, classe 75); 0x18 bytes).
+#[repr(C)]
+pub struct SystemFirmwareTableHandler {
+    pub provider_signature: Field<u32>,
+    pub register: Field<u8>,
+    pub _padding: [Field<u8>; 3],
+    pub firmware_table_handler: Field<u64>,
+    pub driver_object: Field<u64>,
+}
+
+unsafe impl NtStruct for SystemFirmwareTableHandler {}
+
+const _: () = {
+    assert!(core::mem::size_of::<SystemFirmwareTableHandler>() == 0x18);
+    assert!(core::mem::offset_of!(SystemFirmwareTableHandler, register) == 0x4);
+    assert!(core::mem::offset_of!(SystemFirmwareTableHandler, firmware_table_handler) == 0x8);
+    assert!(core::mem::offset_of!(SystemFirmwareTableHandler, driver_object) == 0x10);
+};
+
+/// `_PREFETCHER_INFORMATION` (NtSetSystemInformation
+/// (SystemPrefetcherInformation, classe 56); 0x20 bytes): Version 1, Magic
+/// 'kuhC', a classe do prefetcher e o buffer dela.
+#[repr(C)]
+pub struct PrefetcherInformation {
+    pub version: Field<u32>,
+    pub magic: Field<u32>,
+    pub prefetcher_information_class: Field<u32>,
+    pub _padding: Field<u32>,
+    pub prefetcher_information: Field<u64>,
+    pub prefetcher_information_length: Field<u32>,
+    pub _tail: Field<u32>,
+}
+
+unsafe impl NtStruct for PrefetcherInformation {}
+
+const _: () = {
+    assert!(core::mem::size_of::<PrefetcherInformation>() == 0x20);
+    assert!(core::mem::offset_of!(PrefetcherInformation, prefetcher_information_class) == 0x8);
+    assert!(core::mem::offset_of!(PrefetcherInformation, prefetcher_information) == 0x10);
+    assert!(core::mem::offset_of!(PrefetcherInformation, prefetcher_information_length) == 0x18);
+};

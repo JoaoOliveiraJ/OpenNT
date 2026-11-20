@@ -94,6 +94,7 @@ pub fn run(assert: Assert) {
     resource_wait_exclusive(assert);
     push_lock_address_wait(assert);
     firmware_tables(assert);
+    system_information_classes(assert);
     mdl_pages_cached(assert);
     copy_memory(assert);
     thread_tag(assert);
@@ -358,6 +359,100 @@ fn firmware_tables(assert: Assert) {
     });
     assert(table.is_some() && probe == STATUS_BUFFER_TOO_SMALL && read == 0 && matches, "ex-firmware-table: 'RSMB' devolve RawSMBIOSData com a versao e a tabela do SMBIOS (primeira estrutura do tipo 0)");
     for block in [returned, buffer, raw] {
+        guest::free_bytes(block);
+    }
+}
+
+// ---- ZwQuerySystemInformation(Ex): 8, 76 e 175 ----------------------------------
+
+/// As classes do ExpQuerySystemInformation que o modo kernel agora atende:
+/// SystemProcessorPerformanceInformation (8, 0x30 por processador, também
+/// pelo Ex com o grupo), SystemFirmwareTableInformation (76, o 'RSMB' do
+/// próprio kernel) e SystemCpuSetInformation (175, só pelo Ex, com o HANDLE
+/// do processo).
+fn system_information_classes(assert: Assert) {
+    use crate::ntos::ex::firmware_table::PROVIDER_RSMB;
+    let count = crate::ntos::ke::smp::online_cpu_count() as u64;
+    let returned = zeroed(8);
+    let buffer = zeroed(0x40 * count + 0x40);
+    let query = |class: u64, length: u64| {
+        guest::write32(returned, 0x5555);
+        status("ZwQuerySystemInformation", &[class, buffer, length, returned])
+    };
+    // 8: cada processador com KernelTime >= IdleTime; comprimento que não é
+    // múltiplo de 0x30, STATUS_INFO_LENGTH_MISMATCH com o tamanho de todos.
+    let all = query(8, 0x30 * count);
+    let all_length = guest::read32(returned) as u64;
+    let times_ok = (0..count).all(|index| {
+        let base = buffer + index * 0x30;
+        let (idle, kernel) = (guest::read64(base), guest::read64(base + 8));
+        kernel >= idle && kernel % crate::ntos::ke::clock::MAXIMUM_INCREMENT as u64 == 0
+    });
+    let odd = query(8, 0x20);
+    let odd_length = guest::read32(returned) as u64;
+    let single = query(8, 0x30);
+    let single_length = guest::read32(returned) as u64;
+    assert(
+        all == 0 && all_length == 0x30 * count && times_ok && odd == 0xC000_0004 && odd_length == 0x30 * count && single == 0 && single_length == 0x30,
+        "zw-system-information: SystemProcessorPerformanceInformation (0x30 por processador, o que cabe, e o tamanho de todos no comprimento invalido)",
+    );
+    // 76: o enumerar do 'RSMB' (um TableID 0 de 4 bytes).
+    guest::write32(buffer, PROVIDER_RSMB);
+    guest::write32(buffer + 4, 0);
+    guest::write32(buffer + 8, 0);
+    guest::write32(buffer + 0xC, 0x7777);
+    guest::write32(buffer + 0x10, 0xEEEE_EEEE);
+    let enumerate = query(76, 0x14);
+    let enumerate_answer = (guest::read32(returned), guest::read32(buffer + 0xC), guest::read32(buffer + 0x10));
+    let short = query(76, 0xF);
+    let short_length = guest::read32(returned);
+    guest::write32(buffer, u32::from_be_bytes(*b"XXXX"));
+    let unknown = query(76, 0x14);
+    let unknown_length = guest::read32(returned);
+    assert(
+        enumerate == 0 && enumerate_answer == (0x14, 4, 0) && short == 0xC000_0004 && short_length == 0x10 && unknown == STATUS_NOT_IMPLEMENTED && unknown_length == 0,
+        "zw-system-information: SystemFirmwareTableInformation em KernelMode (o enumerar do 'RSMB', cabecalho curto e provedor desconhecido)",
+    );
+    // O Ex: 8 com o grupo da entrada; 175 com o HANDLE (NULL, o corrente).
+    let input = zeroed(8);
+    let query_ex = |class: u64, input_length: u64, length: u64| {
+        guest::write32(returned, 0x5555);
+        status("ZwQuerySystemInformationEx", &[class, input, input_length, buffer, length, returned])
+    };
+    let group_zero = query_ex(8, 2, 0x30 * count);
+    let group_zero_length = guest::read32(returned) as u64;
+    guest::write16(input, 1);
+    let group_one = query_ex(8, 2, 0x30 * count);
+    guest::write64(input, 0);
+    let cpu_short = query_ex(175, 8, 0x20 * count - 1);
+    let cpu_short_length = guest::read32(returned) as u64;
+    guest::write_bytes(buffer, &alloc::vec![0xEE; (0x20 * count) as usize]);
+    let cpu_sets = query_ex(175, 8, 0x20 * count);
+    let cpu_sets_length = guest::read32(returned) as u64;
+    let entries_ok = (0..count).all(|index| {
+        let base = buffer + index * 0x20;
+        guest::read32(base) == 0x20 && guest::read32(base + 4) == 0 && guest::read32(base + 8) == 0x100 + index as u32 && guest::read16(base + 0xC) == 0 && guest::read8(base + 0xE) == index as u8 && guest::read8(base + 0x13) == 0 && guest::read64(base + 0x18) == 0
+    });
+    let cpu_bad_input = query_ex(175, 4, 0x20 * count);
+    assert(
+        group_zero == 0 && group_zero_length == 0x30 * count && group_one == STATUS_INVALID_PARAMETER && cpu_short == STATUS_BUFFER_TOO_SMALL && cpu_short_length == 0x20 * count && cpu_sets == 0 && cpu_sets_length == 0x20 * count && entries_ok && cpu_bad_input == STATUS_INVALID_PARAMETER,
+        "zw-system-information: o Ex com o grupo (8) e os conjuntos de CPU (175: Id 0x100 + indice, sem flags)",
+    );
+    // 75: o registro de um provedor de driver (sem chamá-lo): uma assinatura
+    // nova com Register, a repetida (STATUS_OBJECT_NAME_EXISTS), a remoção
+    // por outro DriverObject (STATUS_INVALID_PARAMETER), a remoção certa e a
+    // de uma assinatura ausente.
+    let handler = zeroed(0x18);
+    let register = |register: u8, driver_object: u64, length: u64| {
+        guest::write32(handler, u32::from_be_bytes(*b"TST1"));
+        guest::write8(handler + 4, register);
+        guest::write64(handler + 8, 0xFFFF_F800_DEAD_0000);
+        guest::write64(handler + 0x10, driver_object);
+        status("ZwSetSystemInformation", &[75, handler, length])
+    };
+    let registrations = [register(1, 0, 0x18), register(1, 0, 0x18), register(0, 0x1234, 0x18), register(0, 0, 0x18), register(0, 0, 0x18), register(1, 0, 0x10)];
+    assert(registrations == [0, 0x4000_0000, STATUS_INVALID_PARAMETER, 0, STATUS_INVALID_PARAMETER, 0xC000_0004], "zw-system-information: SystemRegisterFirmwareTableInformationHandler registra, recusa a repeticao e remove so pelo mesmo DriverObject");
+    for block in [returned, buffer, input, handler] {
         guest::free_bytes(block);
     }
 }
