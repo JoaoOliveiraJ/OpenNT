@@ -852,6 +852,11 @@ const USER_LOGON_PROGRAMS: &[&str] = &[
     "dui70.dll",
     "duser.dll",
     "oleacc.dll",
+    // A biblioteca de recursos do oleacc (o GetRoleTextW carrega o
+    // OLEACCRC.DLL e lê o texto do papel dele): sem ela o
+    // CPearl::_CreateWindow do botão Iniciar (explorer 0x1e100) dá E_FAIL, a
+    // Shell_TrayWnd não nasce e o explorer sai com 1.
+    "oleaccrc.dll",
     "SndVolSSO.dll",
     "MMDevAPI.dll",
 ];
