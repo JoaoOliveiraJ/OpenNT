@@ -38,7 +38,11 @@
 //! `PROFILE_LOADED` ([`user_hive_loaded`]) quando o NTUSER.DAT desse usuário
 //! é montado em `\REGISTRY\USER\<SID>`, e o `USERINIT_STARTED` e o
 //! `EXPLORER_STARTED` quando o winlogon.exe cria o userinit.exe e o
-//! userinit.exe cria o explorer.exe com o token dele.
+//! userinit.exe cria o explorer.exe com o token dele. Depois dele, o
+//! `SHELL_TRAY_CREATED` ([`win32k_window_created`]) quando o explorer.exe
+//! cria a janela da barra de tarefas (Shell_TrayWnd) e o
+//! `STARTMENU_HOST_STARTED` quando o StartMenuExperienceHost.exe nasce com o
+//! token LowBox do usuário.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -137,7 +141,9 @@ static EXPLORER_STARTED: AtomicBool = AtomicBool::new(false);
 /// StartLogonUI), os dois depois da conexão do console
 /// (`SESSION1_CONNECTED`); o `USERINIT_STARTED` e o `EXPLORER_STARTED` no
 /// userinit.exe do winlogon e no explorer.exe do userinit com o token do
-/// usuário do `USER_LOGON_OK` ([`user_process_created`]).
+/// usuário do `USER_LOGON_OK` ([`user_process_created`]); o
+/// `STARTMENU_HOST_STARTED` no StartMenuExperienceHost.exe com o token LowBox
+/// desse usuário ([`start_menu_host_created`]).
 fn logon_process_created(creation: &Creation, child_pointer: u64) {
     if crate::ntos::mm::session::session_id(child_pointer) != 1 {
         return;
@@ -153,6 +159,8 @@ fn logon_process_created(creation: &Creation, child_pointer: u64) {
         }
     } else if creator.eq_ignore_ascii_case("userinit.exe") && child.eq_ignore_ascii_case("explorer.exe") {
         user_process_created(creation, child_pointer, &EXPLORER_STARTED, "EXPLORER_STARTED");
+    } else if child.eq_ignore_ascii_case("StartMenuExperienceHost.exe") {
+        start_menu_host_created(creation, child_pointer);
     }
 }
 
@@ -589,6 +597,25 @@ fn user_process_created(creation: &Creation, child_pointer: u64, done: &AtomicBo
     }
     crate::debug_print!("[init] {} (pid {}) criou {} (pid {}) com o token de {}", creation.creator_name, creation.creator_id, creation.child_name, creation.child_id, user);
     crate::debug_print!("{}", marker);
+}
+
+static STARTMENU_HOST_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// O `STARTMENU_HOST_STARTED` sai no StartMenuExperienceHost.exe da sessão 1
+/// criado com um token LowBox (AppContainer) do usuário do `USER_LOGON_OK`:
+/// a ativação do pacote Microsoft.Windows.StartMenuExperienceHost pelo
+/// DcomLaunch, no pré-lançamento do logon ou na tecla do Windows. O token
+/// LowBox guarda o SID do usuário e ganha o número do LowBox
+/// (`se/token/tokens.rs`).
+fn start_menu_host_created(creation: &Creation, child_pointer: u64) {
+    let Some(user) = LOGGED_ON_USER.lock().clone() else { return };
+    let token = process::get_primary_token(child_pointer).and_then(|token| crate::ntos::se::token::tokens::with(token, |token| (account_sid_text(&token.user), token.lowbox_number.is_some())));
+    let Some((Some(owner), true)) = token else { return };
+    if owner != user || STARTMENU_HOST_STARTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    crate::debug_print!("[init] {} (pid {}) criou {} (pid {}) com o token LowBox de {}", creation.creator_name, creation.creator_id, creation.child_name, creation.child_id, user);
+    crate::debug_print!("STARTMENU_HOST_STARTED");
 }
 
 /// O explorer.exe da sessão 1 sinalizou o `ShellDesktopSwitchEvent` (o
