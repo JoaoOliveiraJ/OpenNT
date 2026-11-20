@@ -151,6 +151,13 @@ pub fn run() {
         debug_print!("DISK_STRESS_OK");
         return;
     }
+    // `--kernel-test-scope=e-process` (com `--storage=nvme`): processos e
+    // mapeamentos de arquivo a partir do volume E: do ntfs.sys real.
+    if crate::ntos::init::boot_config::kernel_test_scope() == "e-process" {
+        super::e_process::run(assert);
+        debug_print!("E_PROCESS_OK");
+        return;
+    }
     load_options();
     // MemoryFileSystem
     let _ = memory_file_system::write("/tmp/a.txt", "hello OpenNT");

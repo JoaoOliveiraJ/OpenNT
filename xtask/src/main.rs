@@ -21,7 +21,7 @@
 //! ```
 //!
 //! Opções de build: `--release`, `--build-dir=DIR` (padrão `build`),
-//! `--user-program=shell`, `--kernel-test-scope=none|all|disk-stress`, `--console-mirror`,
+//! `--user-program=shell`, `--kernel-test-scope=none|all|disk-stress|e-process`, `--console-mirror`,
 //! `--start-driver=NOME[,NOME...]`, `--trace-driver-api`, `--trace-rpc` (cada mensagem ALPC das
 //! portas de servidor na serial, com a interface e o opnum dos pedidos LRPC), `--heap-census`
 //! (o censo do heap do kernel na serial a cada 4 MB a mais de uso),
@@ -125,7 +125,7 @@ const USAGE: &str = "uso: cargo xtask <build|run|test-boot|test-all|capturas|deb
   logsum     resumo compacto de uma serial: marcadores, fim, processos, FALHOU, lacos
              (cargo xtask logsum --help)
 opcoes de build:   --release --build-dir=DIR --user-program=shell
-                   --kernel-test-scope=none|all|disk-stress --console-mirror --start-driver=NOME[,NOME...]
+                   --kernel-test-scope=none|all|disk-stress|e-process --console-mirror --start-driver=NOME[,NOME...]
                    --trace-driver-api --initial-process=smss --storage=real|nvme --display=basic
                    --trace-rpc (cada mensagem ALPC das portas de servidor na serial, com a
                    interface e o opnum dos pedidos LRPC e o status das respostas)

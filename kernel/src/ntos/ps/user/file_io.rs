@@ -530,6 +530,9 @@ fn query_attributes(attributes: u64, out: u64, length: u64) -> Result<u32, Kerne
         Ok(flags) => flags,
         Err(error) => return Ok(error.status),
     };
+    if super::files::device_file_target(&parsed.path).is_some() {
+        return Ok(query_device_attributes(&parsed.path, out, length));
+    }
     let name = match resolve_query_name(&parsed.path, object_flags) {
         Ok(name) => name,
         Err(status) => return Ok(status),
@@ -563,6 +566,28 @@ fn query_attributes(attributes: u64, out: u64, length: u64) -> Result<u32, Kerne
         Err(error) if error.status != 0 => error.status,
         Err(_) => 0xC000_0185,
     })
+}
+
+/// O NtQueryAttributesFile de um arquivo de file system real (o
+/// IopQueryAttributesFile): uma abertura com FILE_READ_ATTRIBUTES, a
+/// consulta FileBasicInformation (40 bytes) ou FileNetworkOpenInformation
+/// (56) ao file system e o fechamento; a saída vai ao buffer de usuário.
+fn query_device_attributes(name: &str, out: u64, length: u64) -> u32 {
+    const FILE_READ_ATTRIBUTES: u32 = 0x80;
+    let file_object = match super::files::open_device_file(name, FILE_READ_ATTRIBUTES, 7, 0) {
+        Some(Ok(file_object)) => file_object,
+        Some(Err(status)) => return status,
+        None => return 0xC000_0034,
+    };
+    let class = if length == FileBasicInformation::SIZE { 4 } else { 34 };
+    let buffer = guest::alloc_bytes(length);
+    let status = if buffer == 0 { 0xC000_009A } else { crate::ntos::io::file::information::query_native(file_object, class, length as u32, buffer, 0, false, false, 0).unwrap_or(0xC000_0001) };
+    let status = if status & 0x8000_0000 == 0 && guest::try_write_bytes(out, &guest::read_bytes(buffer, length as usize)).is_err() { AV } else { status };
+    if buffer != 0 {
+        guest::free_bytes(buffer);
+    }
+    let _ = crate::ntos::ob::objects::file::dereference(file_object);
+    status
 }
 
 fn nt_query_attributes_file(attributes: u64, out: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {

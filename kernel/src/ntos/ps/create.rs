@@ -65,6 +65,7 @@ use crate::ntos::mm::pe_loader::{self, LoadOptions};
 use crate::ntos::mm::peb_teb::{self, TebDescription};
 use crate::ntos::mm::sysload::kernel_image_source::{ImageSource, MemorySource};
 use crate::ntos::mm::kernel_stack;
+use crate::ntos::mm::section::fsd_file;
 use crate::ntos::ob::objects::file::FileSource;
 use crate::ntos::ob::objects::section as section_objects;
 use crate::ntos::ps::notify::image::{self as image_notify, Image, NotifyOptions};
@@ -468,12 +469,93 @@ impl ImageSource for VolumeImage {
     }
 }
 
-/// O arquivo do executável aberto pela criação: o volume e o acesso
-/// concedido.
+/// O arquivo do executável aberto pela criação e o acesso concedido: um
+/// arquivo do volume do kernel ou um de file system real.
 #[derive(Clone)]
-pub struct ImageFile {
-    pub file: Arc<VolumeFile>,
-    pub access: u32,
+pub enum ImageFile {
+    Volume { file: Arc<VolumeFile>, access: u32 },
+    Driver { file: Arc<DriverImage>, access: u32 },
+}
+
+/// O executável num volume de um file system real (o ntfs.sys de E:): o
+/// FILE_OBJECT do IoCreateFileEx do NtCreateUserProcess (pelo I/O Manager,
+/// em modo kernel), lido pela E/S de paginação (`mm/section/fsd_file`)
+/// depois do MiFlushDataSection, como o MiCreateImageFileMap lê a imagem.
+/// É a fonte do carregador de PE e a das notificações; a abertura fica
+/// retida até a seção de imagem do processo sair.
+pub struct DriverImage {
+    /// O caminho NT pedido (para abrir de novo o handle de quem cria).
+    pub nt_path: String,
+    /// O nome que o file system dá ao arquivo (o IopQueryName).
+    name: String,
+    /// O FILE_OBJECT com a referência do CREATE.
+    file_object: u64,
+    size: u64,
+}
+
+impl Drop for DriverImage {
+    fn drop(&mut self) {
+        let _ = crate::ntos::ob::objects::file::dereference(self.file_object);
+    }
+}
+
+impl ImageSource for DriverImage {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn size(&self) -> u64 {
+        self.size
+    }
+    fn read_bytes(&self, offset: u64, length: u64) -> Result<Vec<u8>, KernelError> {
+        fsd_file::read_at(self.file_object, self.size, offset, length)
+    }
+    fn supports_copy_to_physical(&self) -> bool {
+        true
+    }
+    fn copy_to_physical(&self, offset: u64, address: u64, length: u64) -> Option<Result<(), KernelError>> {
+        Some(fsd_file::copy_to_physical(self.file_object, self.size, offset, address, length))
+    }
+}
+
+impl FileSource for DriverImage {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn size(&self) -> u64 {
+        self.size
+    }
+    fn read_at(&self, offset: u64, length: usize) -> Result<Vec<u8>, KernelError> {
+        fsd_file::read_at(self.file_object, self.size, offset, length as u64)
+    }
+}
+
+/// O executável fora do volume do kernel: a abertura pelo I/O Manager com
+/// SYNCHRONIZE | FILE_EXECUTE | AdditionalFileAccess (de novo só com o
+/// mínimo se o acesso adicional for recusado), FILE_SHARE_READ |
+/// FILE_SHARE_DELETE, o tamanho pelo FsRtlGetFileSize e o
+/// MiFlushDataSection antes da leitura. `None` para um nome que não é de
+/// dispositivo.
+fn open_driver_image(path: &str, additional: u32) -> Option<Result<(Arc<DriverImage>, u32), CreateFailure>> {
+    let open = |access: u32| crate::ntos::ps::user::files::open_device_file(path, access, IMAGE_FILE_SHARE, IMAGE_FILE_OPTIONS);
+    let requested = IMAGE_FILE_ACCESS | additional;
+    let (file_object, access) = match open(requested)? {
+        Ok(file_object) => (file_object, requested),
+        Err(_) if additional != 0 => match open(IMAGE_FILE_ACCESS)? {
+            Ok(file_object) => (file_object, IMAGE_FILE_ACCESS),
+            Err(status) => return Some(Err(CreateFailure::FileOpen(status))),
+        },
+        Err(status) => return Some(Err(CreateFailure::FileOpen(status))),
+    };
+    let size = match fsd_file::file_size(file_object) {
+        Ok(size) => size,
+        Err(status) => {
+            let _ = crate::ntos::ob::objects::file::dereference(file_object);
+            return Some(Err(CreateFailure::FileOpen(status)));
+        }
+    };
+    fsd_file::flush_data_section(file_object);
+    let name = fsd_file::name(file_object).unwrap_or_else(|| String::from(path));
+    Some(Ok((Arc::new(DriverImage { nt_path: String::from(path), name, file_object, size }), access)))
 }
 
 /// O acesso da abertura do executável (o IoCreateFileEx do
@@ -516,7 +598,11 @@ fn open_image(image: &ImageOrigin, image_name: &str, additional_access: u32) -> 
         }
         ImageOrigin::Volume(file) => file.clone(),
         ImageOrigin::NtPath(path) => {
-            let file = volume_files::lookup_volume_file(path).ok_or(CreateFailure::FileOpen(STATUS_OBJECT_NAME_NOT_FOUND))?;
+            let Some(file) = volume_files::lookup_volume_file(path) else {
+                // Um executável num volume de file system real.
+                let (image, access) = open_driver_image(path, additional_access).ok_or(CreateFailure::FileOpen(STATUS_OBJECT_NAME_NOT_FOUND))??;
+                return Ok((image.clone(), image.clone(), Some(ImageFile::Driver { file: image, access })));
+            };
             if file.directory() {
                 return Err(CreateFailure::FileOpen(STATUS_FILE_IS_A_DIRECTORY));
             }
@@ -525,7 +611,7 @@ fn open_image(image: &ImageOrigin, image_name: &str, additional_access: u32) -> 
     };
     let access = image_file_access(&file, additional_access)?;
     let name = crate::drivers::fs::ntfs::nt_path(&file.volume_path());
-    Ok((Arc::new(VolumeImage { name: name.clone(), file: file.clone() }), Arc::new(VolumeSource { name, file: file.clone() }), Some(ImageFile { file, access })))
+    Ok((Arc::new(VolumeImage { name: name.clone(), file: file.clone() }), Arc::new(VolumeSource { name, file: file.clone() }), Some(ImageFile::Volume { file, access })))
 }
 
 /// IMAGE_SUBSYSTEM_WINDOWS_CUI.

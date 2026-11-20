@@ -27,6 +27,7 @@ pub mod platform_support;
 pub mod power_io_support;
 pub mod file_system_mount;
 pub mod fsd_sections;
+pub mod e_process;
 pub mod minifilters;
 pub mod minifilter_support;
 pub mod console_driver;

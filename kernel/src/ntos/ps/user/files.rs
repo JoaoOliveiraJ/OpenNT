@@ -140,9 +140,29 @@ fn device_path_of(path: &str) -> Option<String> {
         let drive = rest.chars().nth(1) == Some(':');
         if !drive {
             device = Some(alloc::format!("\\DosDevices\\{rest}"));
+        } else if let Some(volume) = drive_volume_device(&rest) {
+            // A letra de um volume que não é do kernel (o E: que o
+            // mountmgr.sys deu ao volume do ntfs.sys): o IopParseDevice do
+            // dispositivo do volume, com o resto do nome.
+            device = Some(alloc::format!("{volume}{}", rest.get(2..).unwrap_or("")));
         }
     }
     device
+}
+
+/// O dispositivo de volume para onde a letra `X:` do começo de `rest`
+/// leva, quando ele não é um volume do kernel (que o `file_io` atende).
+fn drive_volume_device(rest: &str) -> Option<String> {
+    let letter = alloc::format!("\\??\\{}", rest.get(..2)?);
+    let (Some(node), remaining) = crate::ntos::ob::object_manager::resolve(&letter) else { return None };
+    if remaining.is_some_and(|remaining| !remaining.is_empty()) {
+        return None;
+    }
+    let device = io_manager::device(node).map(|entry| entry.native_device).filter(|&device| device != 0)?;
+    if crate::drivers::fs::volume_device::is_real_device(device) || crate::drivers::fs::volume_device::is_volume_device(device) {
+        return None;
+    }
+    crate::ntos::ob::object_manager::path_of(node)
 }
 
 /// IO_STATUS_BLOCK (sondado) com o status e Information zero.
@@ -362,6 +382,117 @@ fn on_boot_volume_device(name: &str) -> bool {
     name.len() > device.len() + 1 && name[..device.len()].eq_ignore_ascii_case(&device) && name.as_bytes()[device.len()] == b'\\'
 }
 
+/// O dispositivo e o resto do nome de um arquivo que não é do volume do
+/// kernel (um arquivo de um file system real, como o `\??\E:\...` do
+/// ntfs.sys): `None` para o volume do kernel e para nomes sem dispositivo.
+pub fn device_file_target(name: &str) -> Option<(String, String)> {
+    if on_boot_volume_device(name) || crate::ntos::io::parse::kernel_volume_device(name).is_some() {
+        return None;
+    }
+    device_path_of(name).as_deref().and_then(io_manager::split_device_path)
+}
+
+/// O volume com VPB e o nome dentro dele de um arquivo de file system
+/// (`\Device\HarddiskVolume1` e `\EPROC.EXE`): `None` sem nome restante ou
+/// num dispositivo sem VPB.
+fn mounted_file_target(device_path: &str, rest: &str) -> Option<(u64, String)> {
+    if rest.trim_matches('\\').is_empty() {
+        return None;
+    }
+    crate::ntos::io::parse::split_volume_path(&alloc::format!("{device_path}{rest}"))
+}
+
+/// A abertura de um arquivo de file system pelo kernel (o IoCreateFileEx
+/// de modo kernel, FILE_OPEN, pelo IopParseDevice de `io/parse.rs`, que
+/// monta o volume se preciso): o FILE_OBJECT com a referência do CREATE
+/// (solta com `file_objects::dereference`, que faz o cleanup e o close), ou
+/// o status da recusa. `None` para um nome que não é de um volume com VPB.
+pub fn open_device_file(name: &str, access: u32, share: u32, options: u32) -> Option<Result<u64, u32>> {
+    let (device_path, rest) = device_file_target(name)?;
+    let (device, remaining) = mounted_file_target(&device_path, &rest)?;
+    let request = crate::ntos::io::parse::OpenRequest { desired_access: access, file_attributes: 0, share_access: share, disposition: 1, create_options: options, case_insensitive: true, driver_context: crate::ntos::io::parse::DriverCreateContext::default() };
+    Some(match crate::ntos::io::parse::open_file(device, &remaining, &request) {
+        Ok(opened) if opened.status & 0x8000_0000 == 0 && opened.file_object != 0 => match file_objects::mark_opened(opened.file_object) {
+            Ok(()) => Ok(opened.file_object),
+            Err(_) => {
+                let _ = file_objects::dereference(opened.file_object);
+                Err(0xC000_0001)
+            }
+        },
+        Ok(opened) => Err(if opened.status & 0x8000_0000 != 0 { opened.status } else { 0xC000_0001 }),
+        Err(error) => Err(if error.status != 0 { error.status } else { 0xC000_0001 }),
+    })
+}
+
+/// O mesmo arquivo de file system aberto de novo e publicado como handle
+/// na tabela do processo corrente (o PspPropagateHandle do arquivo do
+/// executável).
+pub fn device_file_handle(name: &str, access: u32, share: u32, options: u32) -> Result<u32, KernelError> {
+    let missing = || KernelError::with_status("arquivo fora de um volume de file system", 0xC000_0034);
+    let (device_path, _) = device_file_target(name).ok_or_else(missing)?;
+    let file_object = open_device_file(name, access, share, options).ok_or_else(missing)?.map_err(|status| KernelError::with_status("abertura do arquivo de file system", status))?;
+    let object = Arc::new(UserDevice { device_path, options, device_handle: 0, file_object, position: crate::rtl::SpinLock::new(0) });
+    match state::alloc_user_handle(object, file_objects::access(access), 0) {
+        Ok(handle) => Ok(handle),
+        Err(error) => {
+            let _ = file_objects::dereference(file_object);
+            Err(error)
+        }
+    }
+}
+
+/// A abertura de usuário de um arquivo num volume com VPB (o E: do
+/// ntfs.sys): o IopParseDevice de `io/parse.rs` monta o volume se preciso e
+/// manda o IRP_MJ_CREATE ao file system dono, com a disposição, as opções,
+/// os atributos e o compartilhamento pedidos; o handle é o de um arquivo de
+/// dispositivo, cuja descrição retém a referência do CREATE.
+#[allow(clippy::too_many_arguments)]
+fn open_mounted_file(handle_pointer: u64, iosb: u64, device_path: String, device: u64, remaining: &str, disposition: u32, request: &OpenRequest, object_flags: u32) -> Result<u32, KernelError> {
+    if let Err(status) = file_io::validate_create(disposition, request) {
+        return Ok(fail_iosb(iosb, status));
+    }
+    let file_request = crate::ntos::io::parse::OpenRequest {
+        desired_access: request.access,
+        file_attributes: request.attributes,
+        share_access: request.share,
+        disposition,
+        create_options: request.options,
+        case_insensitive: object_flags & 0x40 != 0,
+        driver_context: crate::ntos::io::parse::DriverCreateContext::default(),
+    };
+    let opened = match crate::ntos::io::parse::open_file(device, remaining, &file_request) {
+        Ok(opened) => opened,
+        Err(error) if error.status != 0 => return Ok(fail_iosb(iosb, error.status)),
+        Err(error) => return Err(error),
+    };
+    if opened.status & 0x8000_0000 != 0 || opened.file_object == 0 {
+        return Ok(fail_iosb(iosb, if opened.status & 0x8000_0000 != 0 { opened.status } else { 0xC000_0001 }));
+    }
+    if let Err(error) = file_objects::mark_opened(opened.file_object) {
+        let _ = file_objects::dereference(opened.file_object);
+        return Err(error);
+    }
+    let object = Arc::new(UserDevice { device_path, options: request.options, device_handle: 0, file_object: opened.file_object, position: crate::rtl::SpinLock::new(0) });
+    match state::alloc_user_handle(object, file_objects::access(request.access), object_flags & 2) {
+        Ok(handle) => {
+            if guest::try_write::<u64>(handle_pointer, handle as u64).is_err() {
+                close::close_user(handle as u64, true);
+                return Ok(0xC000_0005);
+            }
+            let information = if opened.information != 0 { opened.information } else { 1 };
+            Ok(if state::set_user_iosb(iosb, 0, information).is_err() { 0xC000_0005 } else { 0 })
+        }
+        Err(error) => {
+            let _ = file_objects::dereference(opened.file_object);
+            if error.status != 0 {
+                Ok(fail_iosb(iosb, error.status))
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
 /// O ObOpenObjectByName de uma abertura de arquivo por nome: cada volta
 /// abre `name` no dispositivo (o IopParseDevice) ou no volume de boot
 /// (`file_io::create`); o STATUS_REPARSE de um reparse point no caminho dá
@@ -422,6 +553,12 @@ fn open_device_name(handle_pointer: u64, device_path: Option<String>, object_fla
     // dispositivo, como `\Device\NamedPipe\ProtectedPrefix`), com o
     // IRP_MJ_CREATE completo: acesso, compartilhamento, disposição e opções.
     if let Some((device_path, rest)) = device_path.as_deref().and_then(io_manager::split_device_path) {
+        // Um arquivo num volume com VPB vai ao file system dono.
+        if special.is_none() {
+            if let Some((device, remaining)) = mounted_file_target(&device_path, &rest) {
+                return open_mounted_file(handle_pointer, iosb, device_path, device, &remaining, disposition, request, object_flags);
+            }
+        }
         debug_print!("[usermode] abre device: {}{}", device_path, rest);
         // O EA vai só no IRP_MJ_CREATE de arquivo (o dos pipes e mailslots
         // leva os parâmetros do file system no lugar do EaLength).

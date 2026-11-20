@@ -1634,6 +1634,44 @@ além da KUSER_SHARED_DATA:
   zero depois do fim do arquivo, toda MM_EXECUTE_WRITECOPY (PAGE_EXECUTE_WRITECOPY
   no backing de sistema, cópias privadas PAGE_EXECUTE_READWRITE nas vistas de
   processo) e ImageMappedFlat na SECTION_IMAGE_INFORMATION.
+- **Seções sobre arquivos de um file system real** (`mm/section/fsd_file.rs`,
+  `mm/page_io.rs`, `cc/cache_section.rs`): um FILE_OBJECT servido pela
+  pilha de um file system (o ntfs.sys do volume E: com `--storage=nvme`) dá
+  seção de dados e de imagem. A control area é a do stream, achada pelos
+  SECTION_OBJECT_POINTERS do FCB (a identidade `sop:<endereço>`): todo
+  handle do mesmo arquivo e o cache usam os mesmos frames. A criação roda
+  com o arquivo adquirido pelo FsRtlAcquireToCreateMappedSection
+  (SyncTypeCreateSection pelos callbacks do file system; o do ntfs.sys
+  devolve STATUS_FILE_LOCKED_WITH_ONLY_READERS ou _WITH_WRITERS, que são
+  sucesso), o tamanho vem do FsRtlGetFileSize, e um tamanho máximo maior
+  estende o arquivo pelo FsRtlSetFileSize (o IRP de paginação 0x42 do
+  0x669a10). Uma seção de dados liga FSRTL_FLAG_USER_MAPPED_FILE no
+  cabeçalho do FCB, como o CcZeroEndOfLastPage. As páginas vêm por
+  IoPageRead, até 16 por IRP, num MDL de frames que não precisam ser
+  contíguos (com mais de um frame, PTEs de sistema durante a E/S dão o
+  MappedSystemVa). O frame só entra na control area depois da leitura; uma
+  página que outro caminho publicou nesse meio tempo fica com o frame dele.
+  O flush grava a página alterada inteira pelo IoSynchronousPageWrite.
+  Antes de ler uma imagem roda o MiFlushDataSection: CcFlushCache e o flush
+  das vistas de dados. O cache usa a mesma control area: o
+  CcInitializeCacheMap cria a seção do stream (SharedCacheMap->Section), e
+  cada vista de 256 KB do Cc é uma vista de sistema dela; ReadFile,
+  WriteFile e as vistas de usuário veem o mesmo frame. O purge do Cc tira
+  da control area as páginas que nenhuma vista de usuário mapeia (o
+  MmPurgeSection), o CcFlushCache de um arquivo mapeado por usuário grava
+  antes as vistas (o primeiro passo do 19041), e o MmSetAddressRangeModified
+  de uma página suja de uma vista do cache a marca suja no Cc. Diferenças
+  declaradas: a seção de dados confirma todas as páginas na criação (o NT
+  as traz na falta), nenhuma CONTROL_AREA nativa vai ao DataSectionObject
+  ou ao ImageSectionObject, e não há writer de páginas mapeadas: o que as
+  vistas de usuário alteram sai no flush, na retirada da vista ou no
+  CcFlushCache. A criação de processo aceita um executável fora do volume
+  do kernel (`ps/create.rs`, `DriverImage`): o I/O Manager abre o arquivo
+  como o IoCreateFileEx do NtCreateUserProcess e a imagem é lida pela E/S
+  de paginação. As aberturas de usuário de uma letra que leva a um volume
+  que não é do kernel vão ao IopParseDevice do volume (`ps/user/files.rs`),
+  e o NtQueryAttributesFile desses nomes abre, consulta e fecha pelo file
+  system. Testes: nvme (NVME_SECTION_OK) e e-process (E_PROCESS_OK).
 - **`\Device\PhysicalMemory`** (`mm/section/physical_memory.rs`, o
   MiSectionInitialization): criada no boot com o namespace, permanente e
   com OBJ_KERNEL_EXCLUSIVE. O corpo SECTION aponta para uma CONTROL_AREA

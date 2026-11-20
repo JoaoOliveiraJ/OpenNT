@@ -654,7 +654,10 @@ fn output_flags(created: &Created) -> u32 {
 /// Devolve (FileHandle, SectionHandle); uma falha fecha o que já abriu.
 fn propagate_image_handles(image_name: &str, created: &Created) -> Result<(u64, u64), KernelError> {
     let Some(image) = &created.image_file else { return Ok((0, 0)) };
-    let file = file_io::open_resolved(&image.file, image_name, image.access, create::IMAGE_FILE_SHARE, create::IMAGE_FILE_OPTIONS, 0)? as u64;
+    let file = match image {
+        ImageFile::Volume { file, access } => file_io::open_resolved(file, image_name, *access, create::IMAGE_FILE_SHARE, create::IMAGE_FILE_OPTIONS, 0)? as u64,
+        ImageFile::Driver { file, access } => crate::ntos::ps::user::files::device_file_handle(&file.nt_path, *access, create::IMAGE_FILE_SHARE, create::IMAGE_FILE_OPTIONS)? as u64,
+    };
     let section = process::image_section(created.process_pointer).and_then(InheritedObject::new).ok_or_else(|| KernelError::with_status("processo novo sem secao de imagem", STATUS_INVALID_PARAMETER));
     match section.and_then(|section| state::alloc_user_handle(Arc::new(section), SECTION_ALL_ACCESS, 0)) {
         Ok(section) => Ok((file, section as u64)),

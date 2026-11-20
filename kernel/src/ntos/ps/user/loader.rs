@@ -257,9 +257,19 @@ pub fn ensure_ntdll() -> Result<(), KernelError> {
     map_ntdll(bytes, origin)
 }
 
+/// A ntdll da tabela nativa e dos processos: a real da raiz do volume (a
+/// instalação do smss) ou, sem ela, a de bring-up do bundle. O autoteste do
+/// volume E: (`--kernel-test-scope=e-process`) roda o loader real da ntdll
+/// num boot sem a instalação do smss: usa a cópia real que o build põe em
+/// `Windows\System32`.
 pub fn read_ntdll_input() -> Result<(Vec<u8>, &'static str), KernelError> {
     if let Some(bytes) = ntfs_volume().and_then(|volume| volume.read_bytes("/NTDLL.DLL").ok().flatten()) {
         return Ok((bytes, "real (NTFS)"));
+    }
+    if crate::ntos::init::boot_config::kernel_test_scope() == "e-process" {
+        if let Some(bytes) = ntfs_volume().and_then(|volume| volume.read_bytes("/Windows/System32/ntdll.dll").ok().flatten()) {
+            return Ok((bytes, "real (NTFS)"));
+        }
     }
     if let Some(bytes) = bundle::read("apps/ntdll.dll") {
         return Ok((bytes.to_vec(), "bring-up (bundle)"));
