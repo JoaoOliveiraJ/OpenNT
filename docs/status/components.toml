@@ -266,6 +266,13 @@ espera_falha = true
 descricao = "O boot do teste primeiro-pixel até a tela de logon. O xtask lê a tela do QEMU a cada 2 s (--watch-screen); depois do FIRST_PIXEL_OK, o marcador LOGON_SCREEN_OK sai quando duas leituras seguidas mostram a mesma tela de logon: um quarto ou mais da tela fora do preto, a maior parte dos pixels vizinhos parecidos (uma imagem, não bytes quaisquer lidos como cor), 8 cores ou mais com 1/1536 da tela cada (512 pixels) e desenho em 3/5 das linhas e 3/5 das colunas. A tela de bloqueio de uma instalação nova (o Web\\Screen\\img100.jpg cobrindo a tela, com o relógio e a data) passa, também sem o texto; o ponteiro do mouse, uma cor lisa com texto (o LogonUI sem a imagem), memória lida como cor e um quadro pela metade não passam. O plano de energia do convidado tem 'Desligar a tela: Nunca' (VIDEOIDLE e VIDEOCONLOCK em zero no esquema ativo, o que o powercfg grava): a tela de logon não apaga durante o teste, em qualquer máquina. A tela vai para build/tela-de-logon/tela-de-logon.png e, no cargo xtask capturas, para a captura do site. Com o --capture-every=30, as telas que mudaram durante o teste ficam em build/tela-de-logon/tela-NNNN.png e a do fim em tela-final.png; no test-all, a pasta de uma falha fica com elas. Ainda falha: o winlogon cria o dwm.exe e o LogonUI.exe (testes dwm e logonui), mas os dois terminam antes de a interface XAML do LogonUI ser composta pelo dwm sobre o adaptador WARP do BasicRender."
 
 [[teste]]
+id = "teclado-e-mouse"
+titulo = "Teclado e mouse na tela de bloqueio do LogonUI.exe"
+marcador = "LOGON_DISMISS_OK"
+comando = "cargo xtask test-boot LOGONUI_STARTED 900000 --initial-process=smss --display=basic --build-dir=build/teclado-e-mouse --smp=1 --trace-rpc --mouse=LOGONUI_STARTED:150,100 --expect=CURSOR_MOVED_OK \"--dismiss=CURSOR_MOVED_OK:{spc}\" --expect=KEYBOARD_INPUT_OK \"--expect=lrpc resposta (f3f09ffd-fbcf-4291-944d-70ad6e0e73bb v1.0 opnum 3)\""
+descricao = "O boot do teste logonui com a entrada pelo monitor do QEMU, como uma pessoa na frente da máquina: o teclado e o mouse PS/2 do i8042 chegam pelo i8042prt.sys, pelo kbdclass.sys e pelo mouclass.sys reais ao RIT do win32k da sessão 1, que abre os dispositivos de classe pelas interfaces de dispositivo que eles registram e os lê com o READ assíncrono. O winlogon mostra a tela de bloqueio pelo LogonUI e espera, na chamada LRPC WluiWaitForLockScreenDismiss (f3f09ffd, opnum 3), que ela seja dispensada. Com a tela de bloqueio desenhada e parada, o mouse anda (150, 100) e o win32k move o ponteiro, que o BasicDisplay.sys desenha por cima da tela (CURSOR_MOVED_OK, quando a seta sai de um lugar e aparece no outro, no sentido do movimento). Depois, com a tela de bloqueio parada em duas leituras seguidas (o relógio e a data embaixo à esquerda), o xtask aperta a barra de espaço: a leitura do kbdclass conclui para o RIT (KEYBOARD_INPUT_OK, no csrss da sessão 1), a tecla vai à janela do LogonUI, que tem o foco, a tela de bloqueio sobe e mostra a tela de credenciais, sem o relógio (LOGON_DISMISS_OK, quando a metade ou mais da tela mudou, o relógio saiu e a tela nova parou), e o LogonUI responde ao winlogon (a resposta do opnum 3 no --trace-rpc)."
+
+[[teste]]
 id = "services"
 titulo = "services.exe e lsass.exe reais na sessão 0"
 marcador = "LSASS_STARTED"
@@ -880,7 +887,7 @@ icone = "keyboard"
 descricao = "Driver da Microsoft para a controladora de teclado e mouse PS/2."
 estado = "implementado"
 caminhos = ["kernel/src/drivers/input/keyboard_stack.rs", "kernel/src/ntos/io/pnp/install.rs"]
-testes = ["teclado", "drivers", "shell", "bugcheck"]
+testes = ["teclado", "drivers", "shell", "bugcheck", "teclado-e-mouse"]
 fase = "6"
 notas = "O PnP o anexa aos PDOs PS/2 da placa-mãe, com START_DEVICE e as ISRs nativas conectadas às IRQs 1 e 12; no boot comum, é por ele que o shell recebe as teclas. Com o CrashOnCtrlScroll ligado nos parâmetros do serviço, o Ctrl direito com o Scroll Lock duas vezes faz o próprio driver chamar KeBugCheckEx(MANUALLY_INITIATED_CRASH), como no despejo manual do Windows (teste bugcheck). Sem os binários no build, o teclado usa o driver PS/2 interno."
 
@@ -891,7 +898,7 @@ icone = "keyboard"
 descricao = "Driver de classe de teclado: entrega as teclas pelo dispositivo \\Device\\KeyboardClass0."
 estado = "implementado"
 caminhos = ["kernel/src/drivers/input/keyboard_stack.rs", "kernel/src/ntos/init/main.rs"]
-testes = ["teclado", "drivers", "shell"]
+testes = ["teclado", "drivers", "shell", "teclado-e-mouse"]
 fase = "6"
 notas = "Entra como filtro de classe sobre o i8042prt.sys; o serviço de teclado do kernel mantém um READ pendente em \\Device\\KeyboardClass0 e repassa as teclas ao shell."
 
@@ -902,7 +909,7 @@ icone = "mouse"
 descricao = "Driver de classe de mouse."
 estado = "implementado"
 caminhos = ["kernel/src/drivers/input/keyboard_stack.rs", "kernel/src/ntos/cm/hw_description.rs"]
-testes = ["drivers", "teclado"]
+testes = ["drivers", "teclado", "teclado-e-mouse"]
 fase = "6"
 notas = "Entra como filtro de classe sobre o i8042prt.sys e a pilha do mouse recebe START_DEVICE; nenhum programa consome o mouse ainda."
 

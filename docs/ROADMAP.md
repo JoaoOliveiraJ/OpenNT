@@ -89,9 +89,9 @@ Carregador de PE, funções exportadas pelo kernel, Code Integrity real (ci.dll)
 | Relógio e fuso horário | Funciona | relogio, selftest, fase6, fase7 |
 | Carregador de PE e exports do kernel | Parcial | fase6, boot |
 | hal.dll | Funciona | drivers |
-| i8042prt.sys | Funciona | teclado, drivers, shell, bugcheck |
-| kbdclass.sys | Funciona | teclado, drivers, shell |
-| mouclass.sys | Funciona | drivers, teclado |
+| i8042prt.sys | Funciona | teclado, drivers, shell, bugcheck, teclado-e-mouse |
+| kbdclass.sys | Funciona | teclado, drivers, shell, teclado-e-mouse |
+| mouclass.sys | Funciona | drivers, teclado, teclado-e-mouse |
 | wmilib.sys e WppRecorder.sys | Funciona | teclado, drivers |
 | atapi.sys e ataport.sys | Parcial | drivers |
 | disk.sys e classpnp.sys | Parcial | drivers |

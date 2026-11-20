@@ -2276,7 +2276,10 @@ porta do teclado e o serviço de teclado mantém um READ no
 cada sessão acha o teclado e o mouse pelas interfaces de dispositivo que o
 kbdclass e o mouclass registram, abre cada uma (o CREATE no kbdclass
 desce ao i8042prt e habilita a porta, no KbdEnableDisablePort) e lê com o
-próprio READ assíncrono.
+próprio READ assíncrono. A primeira leitura do teclado concluída com dados
+para um leitor de modo kernel com rotina de APC (o ZwReadFile do RIT, com o
+rimInputApc) sai na serial com o `KEYBOARD_INPUT_OK` (`io/file/request.rs`):
+a tecla chegou ao win32k.
 Os recursos de todos esses nós passam pelos árbitros e tradutores dos
 drivers de barramento (`io/pnp/arbiter.rs`): o teclado recebe as portas
 0x60/0x64 do árbitro do pci.sys e a IRQ 1 do árbitro do acpi.sys, com o
@@ -6550,6 +6553,33 @@ serial naquele instante, e os da tela final também o resultado do teste. As
 telas de uma execução anterior saem quando a série começa. O QMP atende um
 cliente por vez: a vigia da tela e a série dividem uma thread
 (`qemu::screen_thread`), e uma leitura serve às duas quando elas vencem juntas.
+
+O test-boot também manda entrada como uma pessoa na frente da máquina, pelo
+monitor HMP do QEMU, que o convidado recebe pelo teclado e pelo mouse PS/2 do
+i8042 (o i8042prt.sys, o kbdclass.sys e o mouclass.sys reais, lidos pelo RIT
+do win32k). Cada opção espera um marcador na serial (o do teste ou um
+`--expect`) e um atraso, `MARCADOR[+MS]`, e age uma vez, na primeira
+chegada dele, na ordem da linha de comando (`qemu::InputSend`); as telas que elas conferem são lidas pelo `screendump`
+do próprio monitor, porque o QMP pode estar com a vigia. O `--send=...:TECLAS`
+digita as teclas, na sintaxe do `--keys` (o `{clique}` aperta e solta o botão
+esquerdo do mouse onde o ponteiro estiver), e põe no log a linha `[xtask]
+teclas enviadas pelo monitor`. Cada ação abre a própria conexão do monitor e a
+fecha no fim, porque o QEMU atende um cliente por vez. O `--dismiss=...:TECLAS` espera, por até 180 s,
+a tela de bloqueio parada em duas leituras seguidas, com o relógio e a data
+(500 pixels brancos ou mais nas 2/5 de baixo e nas 3/5 da esquerda da tela,
+`screen_check::lock_screen_shown`), digita as teclas e espera, por até 60 s, a
+tela seguinte parada em que a metade ou mais dos pixels mudou, o relógio saiu
+(1/10 ou menos daqueles pixels brancos) e a tela continua desenhada, sem ser a
+de bugcheck (`screen_check::lock_dismissed`): a tela de bloqueio subiu e
+mostrou a de credenciais, e o log ganha o `LOGON_DISMISS_OK`. O
+`--mouse=...:DX,DY` espera a tela parada e desenhada (um quarto ou mais fora
+do preto, sem ser a de bugcheck: não o vídeo de boot com o ponteiro), anda
+o mouse (DX, DY) em dez `mouse_move` e lê a tela por até 15 s, até achar entre as mudanças um grupo
+do tamanho do ponteiro com a seta (miolo branco e contorno preto) só antes e
+outro só depois, deslocado no sentido do movimento
+(`screen_check::cursor_moved`; a aceleração do Windows muda a distância), e
+o log ganha o `CURSOR_MOVED_OK`. Um `--dismiss` ou `--mouse` que não vê a tela
+mudar encerra o teste com o que faltou na última leitura.
 
 ## 7. O nome OpenNT nos arquivos
 
