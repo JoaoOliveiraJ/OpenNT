@@ -506,7 +506,7 @@ pub fn trace_event(handle: u64, flags: u32, _field_size: u32, fields: u64, mode:
             }
             guest::try_read_bytes(address, length)
         };
-        let segments = match provider_state::read_segments(count, data, read) {
+        let segments = match provider_state::read_segments(count, data, read, read) {
             Ok(Ok(segments)) => segments,
             Ok(Err(status)) => return Ok(Err(status)),
             Err(_) => return Ok(Err(STATUS_ACCESS_VIOLATION)),

@@ -1332,6 +1332,20 @@ fn etw_firmware_and_telemetry(assert: Assert) {
     data_descriptor.ptr.set(guid + 0x50);
     data_descriptor.size.set(4);
     assert(matches!(etw::write(plain, descriptor, 0, 0, 1, data), Ok(0)) && ETW_EVENTS.lock().len() == 1 && ETW_EVENTS.lock()[0].data == alloc::vec![b"etw!".to_vec()] && ETW_EVENTS.lock()[0].provider == [0x11; 16] && etw::delivered(session) == Some(1), "etw: EtwWrite entrega o evento ao consumidor");
+    // Um segmento ilegível de um chamador de kernel (o (Signer + 0x34, 4)
+    // com Signer nulo do CiLogSignatureInformation da ci.dll): o
+    // EtwpEventWriteFull do 19041 zera o segmento e entrega o evento.
+    let pair = guest::alloc_bytes(32);
+    guest::write_bytes(pair, &[0; 32]);
+    guest::write_bytes(pair, &guest::read_bytes(data, 16));
+    // SAFETY: bloco próprio de dois descritores.
+    let unreadable = unsafe { EventDataDescriptor::at(pair + 16) };
+    unreadable.ptr.set(0x34);
+    unreadable.size.set(4);
+    let zeroed = matches!(etw::write(plain, descriptor, 0, 0, 2, pair), Ok(0)) && ETW_EVENTS.lock().len() == 2 && ETW_EVENTS.lock()[1].data == alloc::vec![b"etw!".to_vec(), alloc::vec![0; 4]] && etw::delivered(session) == Some(2);
+    ETW_EVENTS.lock().truncate(1);
+    guest::free_bytes(pair);
+    assert(zeroed, "etw: EtwWrite de kernel com segmento ilegivel entrega o segmento zerado");
     assert(matches!(etw::write(plain, descriptor, 0, 0, 129, data), Ok(0xC000_000D)), "etw: descritores demais");
     assert(etw::enable(session, guid, etw::EnableOptions { level: 2, ..Default::default() }).is_ok() && ETW_CALLBACK[2].load(SeqCst) == 2 && matches!(etw::write(plain, descriptor, 0, 0, 1, data), Ok(0)) && ETW_EVENTS.lock().len() == 1, "etw: nivel acima do habilitado nao entrega");
     assert(etw::disable(session, guid).is_ok() && ETW_CALLBACK[1].load(SeqCst) == 0 && event_enabled::query(plain, descriptor) == 0, "etw: desabilitar notifica e limpa IsEnabled");

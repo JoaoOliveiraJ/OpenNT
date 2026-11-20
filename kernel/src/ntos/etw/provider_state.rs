@@ -683,24 +683,35 @@ const MAXIMUM_DESCRIPTORS: u32 = 128;
 const MAXIMUM_EVENT_SIZE: u64 = 0xFFFF;
 const STATUS_BUFFER_OVERFLOW: u32 = 0x8000_0005;
 
-/// Lê os segmentos de usuário (`read` decide se a origem é sondada).
-pub fn read_segments(count: u32, data: u64, read: impl Fn(u64, usize) -> Result<Vec<u8>, KernelError>) -> Result<Result<Vec<Vec<u8>>, u32>, KernelError> {
+/// Lê os segmentos de usuário: `descriptors` lê o vetor de
+/// EVENT_DATA_DESCRIPTOR e `segment` os dados de cada um (cada leitor decide
+/// se a origem é sondada).
+pub fn read_segments(count: u32, data: u64, descriptors: impl Fn(u64, usize) -> Result<Vec<u8>, KernelError>, segment: impl Fn(u64, usize) -> Result<Vec<u8>, KernelError>) -> Result<Result<Vec<Vec<u8>>, u32>, KernelError> {
     if count > MAXIMUM_DESCRIPTORS {
         return Ok(Err(STATUS_INVALID_PARAMETER));
     }
     let mut segments = Vec::new();
     let mut total = core::mem::size_of::<crate::ntos::inc::types::EventHeader>() as u64;
     for index in 0..count as u64 {
-        let item = read(data + index * EventDataDescriptor::SIZE, EventDataDescriptor::SIZE as usize)?;
+        let item = descriptors(data + index * EventDataDescriptor::SIZE, EventDataDescriptor::SIZE as usize)?;
         let pointer = u64::from_le_bytes(item[0..8].try_into().unwrap());
         let size = u32::from_le_bytes(item[8..12].try_into().unwrap()) as u64;
         total += size;
         if total > MAXIMUM_EVENT_SIZE {
             return Ok(Err(STATUS_BUFFER_OVERFLOW));
         }
-        segments.push(if size == 0 { Vec::new() } else { read(pointer, size as usize)? });
+        segments.push(if size == 0 { Vec::new() } else { segment(pointer, size as usize)? });
     }
     Ok(Ok(segments))
+}
+
+/// Um segmento de um chamador de kernel: o EtwpEventWriteFull do 19041
+/// copia cada segmento sob __try (0x25e92c, 0x25e9b9) e, numa falta, zera o
+/// segmento no evento e segue com os próximos, sem mudar o status. O
+/// CiLogSignatureInformation da ci.dll (0x5d1a7) passa (Signer + 0x34, 4)
+/// mesmo com Signer nulo, para uma imagem sem assinante no catálogo.
+fn kernel_segment(address: u64, length: usize) -> Result<Vec<u8>, KernelError> {
+    Ok(guest::try_read_bytes(address, length).unwrap_or_else(|_| alloc::vec![0; length]))
 }
 
 /// Entrega um evento de um registro: um provedor sem sessões nem lê os
@@ -763,7 +774,7 @@ pub fn deliver(handle: u64, descriptor: [u8; 16], payload: impl FnOnce() -> Resu
 pub fn write_ex(handle: u64, descriptor: u64, activity_pointer: u64, related: u64, count: u32, data: u64) -> Result<u32, KernelError> {
     let descriptor_bytes = read_guid(descriptor);
     deliver(handle, descriptor_bytes, || {
-        let segments = match read_segments(count, data, |address, length| Ok(guest::read_bytes(address, length)))? {
+        let segments = match read_segments(count, data, |address, length| Ok(guest::read_bytes(address, length)), kernel_segment)? {
             Ok(segments) => segments,
             Err(status) => return Ok(Err(status)),
         };

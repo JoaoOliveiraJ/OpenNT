@@ -2840,7 +2840,9 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   estendidos e dados), Flush e Stop, e uma thread do logger cada (o
   EtwpLogger, com o LoggerThreadId na consulta); EtwWrite/EtwWriteTransfer/
   EtwWriteEx/EtwWriteString e o NtTraceEvent 0x300 da ntdll entregam só às
-  sessões cujo nível e keywords aceitam o evento. Numa sessão de tempo
+  sessões cujo nível e keywords aceitam o evento; um segmento ilegível de
+  um chamador de kernel vai zerado no evento, como a cópia sob __try do
+  EtwpEventWriteFull. Numa sessão de tempo
   real a thread acorda a cada buffer cheio, a cada flush pedido e a cada
   FlushTimer e entrega os buffers cheios aos consumidores de tempo real
   (`realtime.rs`): o NtTraceControl 11 (EtwpRealtimeConnect) cria o objeto
