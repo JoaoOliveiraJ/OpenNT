@@ -67,6 +67,12 @@ pub trait SectionFile: Send + Sync {
     fn identity(&self) -> Option<String> {
         None
     }
+    /// O arquivo do volume (o volume, o número do registro e a sequência),
+    /// o mesmo em toda abertura: o FCB a que pertence o
+    /// SECTION_OBJECT_POINTERS do NT. `None` = não é arquivo de volume.
+    fn file_id(&self) -> Option<String> {
+        None
+    }
     /// A versão do conteúdo agora (muda com cada escrita): decide se uma
     /// control area de imagem sem uso ainda vale para o arquivo. `None` = o
     /// arquivo não diz, e a control area não fica retida sem uso.

@@ -291,7 +291,7 @@ impl crate::ntos::ps::user::sections::SectionFile for MemoryFile {
 }
 
 /// PE32+ AMD64 mínimo: cabeçalhos em 0x200 e uma seção de código em 0x1000.
-fn minimal_image() -> alloc::vec::Vec<u8> {
+pub(super) fn minimal_image() -> alloc::vec::Vec<u8> {
     let mut bytes = alloc::vec![0u8; 0x400];
     bytes[0] = b'M';
     bytes[1] = b'Z';

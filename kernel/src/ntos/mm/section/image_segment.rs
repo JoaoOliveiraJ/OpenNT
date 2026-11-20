@@ -435,10 +435,22 @@ pub fn exports(segment: &ImageSegment, image_base: u64) -> Result<Exports, Kerne
 ///   SECTION_OBJECT_POINTERS dele), e STATUS_NOT_SAME_DEVICE nos outros
 ///   casos.
 ///
+/// As duas vistas podem ser de dados ou de imagem (o VAD de cada endereço):
+/// o LdrpFindLoadedDllByMappingLockHeld da ntdll (0x145b8) passa a base de
+/// uma DLL já carregada e a da imagem que acabou de mapear, e com
+/// STATUS_SUCCESS usa o módulo que já existe em vez de carregar uma segunda
+/// cópia do mesmo arquivo aberto por outro caminho. A control area de uma
+/// vista de imagem é a da imagem do arquivo; a de uma vista de dados não é
+/// a de imagem de arquivo nenhum. No NT o arquivo tem uma só control area
+/// de imagem; aqui cada abertura de modo usuário pode montar a dela, então
+/// a imagem também é a do arquivo da segunda vista quando os dois são o
+/// mesmo arquivo do volume (`SectionFile::file_id`).
+///
 /// O EXE e a ntdll que a criação do processo mapeia não são vistas de seção
 /// no OpenNT: um endereço neles dá STATUS_CONFLICTING_ADDRESSES.
 pub fn are_mapped_files_the_same(image_address: u64, file_address: u64) -> u32 {
-    use crate::ntos::ps::user::sections;
+    use crate::ntos::mm::section::views::{self, OwnedView};
+    use core::sync::atomic::Ordering;
     const STATUS_INVALID_ADDRESS: u32 = 0xC000_0141;
     const STATUS_CONFLICTING_ADDRESSES: u32 = 0xC000_0018;
     const STATUS_NOT_SAME_DEVICE: u32 = 0xC000_00D4;
@@ -455,16 +467,23 @@ pub fn are_mapped_files_the_same(image_address: u64, file_address: u64) -> u32 {
     if first.allocation_base == second.allocation_base {
         return 0;
     }
-    let view_at = |address: u64| sections::views().into_iter().find(|view| view.owner_process == Some(process) && !view.retiring() && address >= view.base && address - view.base < view.size);
-    let (Some(image_view), Some(file_view)) = (view_at(image_address), view_at(file_address)) else { return STATUS_CONFLICTING_ADDRESSES };
-    let (Some(_), Some(file)) = (image_view.section.file.as_ref(), file_view.section.file.as_ref()) else { return STATUS_CONFLICTING_ADDRESSES };
-    let image_segment = image_view.section.state.lock().image_segment.clone();
+    // A vista viva do processo no endereço, com a seção dela e, numa vista
+    // de imagem, a control area da imagem.
+    let view_at = |address: u64| match views::find(process, address)? {
+        OwnedView::Data(view) if !view.retiring() => Some((view.section.clone(), None)),
+        OwnedView::Image(view) if !view.unmapped.load(Ordering::Acquire) => Some((view.section.clone()?, Some(view.segment.clone()))),
+        _ => None,
+    };
+    let (Some((image_section, image_segment)), Some((file_section, file_view_segment))) = (view_at(image_address), view_at(file_address)) else { return STATUS_CONFLICTING_ADDRESSES };
+    let (Some(image_file), Some(file)) = (image_section.file.as_ref(), file_section.file.as_ref()) else { return STATUS_CONFLICTING_ADDRESSES };
     let file_segment = match file.identity() {
         Some(identity) => SEGMENTS.lock().get(&SegmentKey::File(identity)).and_then(Weak::upgrade),
-        None => file_view.section.state.lock().image_segment.clone(),
+        None => file_view_segment.or_else(|| file_section.state.lock().image_segment.clone()),
     };
+    let same_file = image_file.file_id().is_some_and(|id| file.file_id().as_ref() == Some(&id));
     match (image_segment, file_segment) {
         (Some(first), Some(second)) if Arc::ptr_eq(&first, &second) => 0,
+        (Some(_), _) if same_file => 0,
         _ => STATUS_NOT_SAME_DEVICE,
     }
 }

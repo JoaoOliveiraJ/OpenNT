@@ -47,6 +47,8 @@ pub struct CapturedFile {
     pub name: String,
     pub base_name: String,
     identity: String,
+    /// `SectionFile::file_id`.
+    file_id: Option<String>,
     pointer: AtomicU64,
     pub access: u32,
     backing: Option<(&'static dyn FileSystem, String)>,
@@ -123,6 +125,10 @@ impl CapturedFile {
 impl SectionFile for CapturedFile {
     fn identity(&self) -> Option<String> {
         Some(self.identity.clone())
+    }
+
+    fn file_id(&self) -> Option<String> {
+        self.file_id.clone()
     }
 
     /// O tamanho e as horas de escrita e de mudança do
@@ -288,12 +294,17 @@ fn capture_selected(pointer: u64, access: u32, mode: u8, protect: u32, image: bo
         (None, Some(source)) => key(Arc::as_ptr(source) as *const u8 as usize, "source"),
         (None, None) => unreachable!(),
     };
+    // O arquivo do volume pelo registro, igual em toda abertura (pelo
+    // ZwCreateFile ou pelo modo usuário, por qualquer caminho).
+    let volume = backing.as_ref().map(|(volume, _)| *volume).or_else(|| source.as_ref().and_then(|source| source.volume()));
+    let file_id = volume.zip(stat.as_ref().and_then(|stat| stat.reference.map(|reference| (reference, stat.sequence)))).map(|(volume, (reference, sequence))| format!("{:#x}:{reference}:{sequence}", volume_address(volume)));
     let base_name = String::from(&name[name.rfind('\\').map_or(0, |index| index + 1)..]);
     Ok(Arc::new(CapturedFile {
         size: AtomicU64::new(size),
         name,
         base_name,
         identity,
+        file_id,
         pointer: AtomicU64::new(pointer),
         access,
         backing,

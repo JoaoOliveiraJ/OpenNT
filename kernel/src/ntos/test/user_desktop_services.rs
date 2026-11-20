@@ -49,6 +49,7 @@ pub fn run(assert: Assert) {
     power_levels(assert, block, rsp, &call);
     power_requests(assert, block, rsp, &call);
     flushes(assert, block, rsp, &call);
+    mapped_images(assert, block, rsp, &call);
     signing_levels(assert, block, rsp, &call);
     extended_attributes(assert, block, rsp, &call);
     cancel_synchronous_io(assert, block, &call);
@@ -414,6 +415,96 @@ fn flushes(assert: Assert, block: u64, rsp: u64, call: Call) {
             && attributes_flush == 0xC000_0022,
         "desktop: NtFlushBuffersFileEx e NtFlushBuffersFile pedem FILE_WRITE_DATA ou FILE_APPEND_DATA e recusam parametros",
     );
+}
+
+/// O arquivo PE do volume do teste das vistas de imagem.
+const IMAGE_FILE: &str = "\\??\\D:\\OPENNTIMAGEVM.DLL";
+
+/// NtAreMappedFilesTheSame com vistas de imagem, como o
+/// LdrpFindLoadedDllByMappingLockHeld da ntdll o chama (a base de uma DLL
+/// já carregada e a da imagem que acabou de mapear): as vistas de duas
+/// seções de imagem do mesmo arquivo PE, cada uma de uma abertura (o
+/// LoadLibrary do mesmo arquivo por outro caminho), dão STATUS_SUCCESS, e a
+/// ntdll usa o módulo que já existe; a vista de imagem contra uma vista de
+/// dados do mesmo arquivo também (a control area da primeira é o
+/// ImageSectionObject do arquivo da segunda); a de dados contra a de
+/// imagem, STATUS_NOT_SAME_DEVICE.
+fn mapped_images(assert: Assert, block: u64, rsp: u64, call: Call) {
+    let (out, iosb, cells, data) = (block + 0x600, block + 0x610, block + 0x640, block + 0x1000);
+    let open = |access: u32, disposition: u32| {
+        guest::write64(out, 0);
+        let status = file_io::open(out, IMAGE_FILE, iosb, disposition, &OpenRequest { access, share: 7, options: 0x20, ..OpenRequest::default() }).unwrap_or(1);
+        (status, guest::read64(out))
+    };
+    // O PE mínimo gravado no arquivo, e o handle de escrita fechado antes
+    // da seção de imagem.
+    let image = super::phase7::minimal_image();
+    let (created, writer) = open(0xC010_0000, 5);
+    guest::write_bytes(data, &image);
+    guest::write64(rsp + 0x28, iosb);
+    guest::write64(rsp + 0x30, data);
+    guest::write32(rsp + 0x38, image.len() as u32);
+    guest::write64(rsp + 0x40, 0);
+    guest::write64(rsp + 0x48, 0);
+    let written = call("NtWriteFile", writer, 0, 0, 0);
+    let _ = state::close_user_handle(writer, true, false);
+    // GENERIC_READ | GENERIC_EXECUTE | SYNCHRONIZE, como a ntdll abre a DLL,
+    // duas vezes.
+    let (opened, file) = open(0xA010_0000, 1);
+    let (reopened, other_file) = open(0xA010_0000, 1);
+    // NtCreateSection(handle*, SECTION_ALL_ACCESS, NULL, NULL, protect,
+    // attributes, file): SEC_IMAGE com PAGE_EXECUTE e SEC_COMMIT com
+    // PAGE_READONLY.
+    let section = |file: u64, protect: u64, attributes: u64| {
+        guest::write64(cells, 0);
+        guest::write64(rsp + 0x28, protect);
+        guest::write64(rsp + 0x30, attributes);
+        guest::write64(rsp + 0x38, file);
+        (call("NtCreateSection", cells, 0xF_001F, 0, 0), guest::read64(cells))
+    };
+    // NtMapViewOfSection(section, NtCurrentProcess, base*, 0, 0, NULL,
+    // size*, ViewUnmap, 0, protect) no processo corrente.
+    let map = |section: u64, protect: u64| {
+        guest::write64(cells + 0x10, 0);
+        guest::write64(cells + 0x18, 0);
+        guest::write64(rsp + 0x28, 0);
+        guest::write64(rsp + 0x30, 0);
+        guest::write64(rsp + 0x38, cells + 0x18);
+        guest::write64(rsp + 0x40, 2);
+        guest::write64(rsp + 0x48, 0);
+        guest::write64(rsp + 0x50, protect);
+        (call("NtMapViewOfSection", section, u64::MAX, cells + 0x10, 0), guest::read64(cells + 0x10))
+    };
+    let (image_created, image_section) = section(file, 0x10, 0x0100_0000);
+    let (other_created, other_section) = section(other_file, 0x10, 0x0100_0000);
+    let (first_mapped, first) = map(image_section, 0x80);
+    let (second_mapped, second) = map(other_section, 0x80);
+    let (data_created, data_section) = section(file, 2, 0x0800_0000);
+    let (data_mapped, data_view) = map(data_section, 2);
+    let image_status = |status: u32| status == 0 || status == 0x4000_0003;
+    let ready = created == 0 && written == 0 && opened == 0 && reopened == 0 && image_created == 0 && other_created == 0 && image_status(first_mapped) && image_status(second_mapped) && data_created == 0 && data_mapped == 0;
+    assert(
+        ready && first != 0 && second != 0 && first != second && data_view != 0,
+        &alloc::format!("desktop: duas vistas de imagem e uma de dados do mesmo PE (arquivo {created:#x}/{written:#x}/{opened:#x}/{reopened:#x}, secoes de imagem {image_created:#x} {other_created:#x}, vistas {first_mapped:#x} {second_mapped:#x}, secao de dados {data_created:#x}, vista {data_mapped:#x})"),
+    );
+    if ready {
+        let images = call("NtAreMappedFilesTheSame", first, second, 0, 0);
+        let image_then_data = call("NtAreMappedFilesTheSame", second, data_view + 0x10, 0, 0);
+        let data_then_image = call("NtAreMappedFilesTheSame", data_view, first, 0, 0);
+        assert(
+            images == 0 && image_then_data == 0 && data_then_image == 0xC000_00D4,
+            &alloc::format!("desktop: NtAreMappedFilesTheSame com vistas de imagem do mesmo arquivo (imagem e imagem {images:#x}, imagem e dados {image_then_data:#x}, dados e imagem {data_then_image:#x})"),
+        );
+    }
+    for view in [first, second, data_view].into_iter().filter(|&view| view != 0) {
+        let _ = call("NtUnmapViewOfSection", u64::MAX, view, 0, 0);
+    }
+    for handle in [image_section, other_section, data_section].into_iter().filter(|&handle| handle != 0) {
+        let _ = call("NtClose", handle, 0, 0, 0);
+    }
+    for handle in [file, other_file].into_iter().filter(|&handle| handle != 0) {
+        let _ = state::close_user_handle(handle, true, false);
+    }
 }
 
 /// NtGetCachedSigningLevel num arquivo do volume sem o cache de assinatura
