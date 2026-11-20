@@ -158,7 +158,10 @@ test-boot:         --keys=TEXTO (\\n = Enter) --expect=TEXTO (repetivel)
                    LOGONUI_STARTED, quando um quarto ou mais dela esta desenhado com 8 cores
                    ou mais; com DESKTOP_OK no marcador
                    ou num --expect, DESKTOP_OK depois do EXPLORER_STARTED quando ela mostra o
-                   papel de parede azul do img0 com a barra de tarefas escura embaixo)
+                   papel de parede azul do img0 com a barra de tarefas escura embaixo; com
+                   TASKBAR_OK, depois dele e do SHELL_TRAY_CREATED, TASKBAR_OK quando a barra
+                   tem o logotipo do Iniciar e o relogio de duas linhas e o relogio passa de
+                   minuto com o resto da tela parado)
                    --capture-every=SEGUNDOS (durante o teste, a tela do QEMU em tela-NNNN.png na
                    --build-dir: a NNNN e a dos NNNN*SEGUNDOS s desde a subida do QEMU, gravada
                    so quando mudou; no fim do teste, passando ou nao, tela-final.png)

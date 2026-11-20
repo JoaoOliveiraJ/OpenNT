@@ -870,6 +870,203 @@ pub fn desktop_screen(image: &Image) -> Result<String, String> {
     }
 }
 
+// ---- barra de tarefas ---------------------------------------------------------
+//
+// A barra de tarefas do explorer.exe (a janela Shell_TrayWnd) no tema escuro
+// do 19041: 40 linhas a 96 DPI (h abaixo; 48 a 120 DPI), o botão Iniciar com
+// o logotipo branco de quatro quadrados (16x16 pixels no meio dos primeiros
+// 48) e, à direita, a área de notificação com o relógio em duas linhas
+// brancas (a hora e a data) antes do botão da Central de Ações. Todas as
+// medidas desta parte saem de h: o tamanho dos elementos da barra segue o
+// DPI, não o tamanho da tela, e numa captura reduzida h diminui junto. Um
+// pixel é de texto quando a luminância passa a mediana da barra por 0x60: o
+// branco sobre a barra opaca ou translúcida sobre o img0. O indicador de
+// idioma (também em duas linhas) fica à esquerda do relógio; os ícones da
+// área de notificação e o da Central de Ações têm uma linha só.
+
+/// O marcador da barra de tarefas.
+pub const TASKBAR_MARKER: &str = "TASKBAR_OK";
+/// A vigia só procura a barra depois deste marcador na serial: a janela
+/// Shell_TrayWnd que o explorer.exe do usuário criou (`initial_process.rs`).
+pub const TASKBAR_AFTER: &str = "SHELL_TRAY_CREATED";
+/// A luminância de um pixel de texto passa a mediana da barra por isto.
+const TEXT_CONTRAST: u16 = 0x60;
+
+/// A luminância (2R + 5G + B) / 8.
+fn luma(rgb: &[u8]) -> u16 {
+    (2 * u16::from(rgb[0]) + 5 * u16::from(rgb[1]) + u16::from(rgb[2])) / 8
+}
+
+/// A mediana da luminância dos pixels de `image` em `columns` x `rows`.
+fn median_luma(image: &Image, columns: core::ops::Range<usize>, rows: core::ops::Range<usize>) -> u16 {
+    let mut histogram = [0usize; 256];
+    let mut count = 0usize;
+    for y in rows {
+        for x in columns.clone() {
+            let at = (y * image.width + x) * 3;
+            histogram[luma(&image.rgb[at..at + 3]) as usize] += 1;
+            count += 1;
+        }
+    }
+    let mut seen = 0;
+    for (value, &n) in histogram.iter().enumerate() {
+        seen += n;
+        if seen * 2 >= count.max(1) {
+            return value as u16;
+        }
+    }
+    255
+}
+
+/// As linhas da barra escura embaixo, pela regra do [`desktop_screen`].
+fn taskbar_rows(image: &Image) -> usize {
+    let (part, whole) = TASKBAR_ROW;
+    image
+        .rgb
+        .chunks_exact(image.width * 3)
+        .take(image.height)
+        .rev()
+        .take_while(|row| row.chunks_exact(3).filter(|pixel| is_taskbar_dark([pixel[0], pixel[1], pixel[2]])).count() * whole >= image.width * part)
+        .count()
+}
+
+/// Os grupos de posições ocupadas (`busy`, em ordem), separados por mais de
+/// `gap` posições livres.
+fn runs_of(busy: &[usize], gap: usize) -> Vec<(usize, usize)> {
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for &index in busy {
+        match runs.last_mut() {
+            Some((_, last)) if index - *last <= gap + 1 => *last = index,
+            _ => runs.push((index, index)),
+        }
+    }
+    runs
+}
+
+/// O que a [`taskbar_layout`] achou na barra.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TaskbarLayout {
+    /// As linhas da barra (h).
+    pub rows: usize,
+    /// O logotipo do Iniciar: esquerda, topo, largura, altura e pixels de texto.
+    pub start: (usize, usize, usize, usize, usize),
+    /// As colunas do relógio (primeira e última) e as linhas da hora e da data.
+    pub clock: (usize, usize),
+    pub clock_lines: [(usize, usize); 2],
+}
+
+impl TaskbarLayout {
+    pub fn describe(&self) -> String {
+        let (left, top, width, height, pixels) = self.start;
+        let [(hour_top, hour_bottom), (date_top, date_bottom)] = self.clock_lines;
+        format!(
+            "barra de {} linhas; logotipo do Iniciar de {width}x{height} em ({left},{top}), {pixels} pixels claros; relogio nas colunas {} a {}, hora nas linhas {hour_top} a {hour_bottom}, data nas linhas {date_top} a {date_bottom}",
+            self.rows, self.clock.0, self.clock.1
+        )
+    }
+}
+
+/// A barra de tarefas numa tela do QEMU: a barra escura embaixo (h linhas,
+/// de 24 a 72, pela regra do [`desktop_screen`]); nos primeiros 6h/5 pixels,
+/// o logotipo claro do Iniciar, de h/4 a 3h/5 pixels de lado e de h²/20 a
+/// 7h²/20 pixels claros; nas 6h colunas da direita, o relógio: o grupo de
+/// colunas com texto mais à direita (grupos separados por mais de
+/// max(h/5, 3) colunas vazias) com duas linhas de texto (a hora e a data)
+/// de h/8 a h/2 linhas cada, de h a 4h colunas e de h²/25 a h² pixels
+/// claros. Devolve o que achou, ou o que faltou.
+pub fn taskbar_layout(image: &Image) -> Result<TaskbarLayout, String> {
+    if !is_graphics(image) {
+        return Err(format!("tela {}x{}, nao e uma tela grafica de 800x600 ou mais", image.width, image.height));
+    }
+    let h = taskbar_rows(image);
+    if !TASKBAR_ROWS.contains(&h) {
+        return Err(format!("barra de tarefas escura de {h} linhas embaixo (de {} a {})", TASKBAR_ROWS.start(), TASKBAR_ROWS.end()));
+    }
+    let (width, top) = (image.width, image.height - h);
+    let threshold = median_luma(image, 0..width, top..image.height) + TEXT_CONTRAST;
+    let text = |x: usize, y: usize| {
+        let at = (y * width + x) * 3;
+        luma(&image.rgb[at..at + 3]) >= threshold
+    };
+    // O Iniciar: o logotipo nos primeiros 6h/5 pixels.
+    let (mut left, mut right, mut upper, mut lower, mut count) = (usize::MAX, 0, usize::MAX, 0, 0);
+    for y in top..image.height {
+        for x in 0..(h * 6 / 5).min(width) {
+            if text(x, y) {
+                (left, right, upper, lower, count) = (left.min(x), right.max(x), upper.min(y), lower.max(y), count + 1);
+            }
+        }
+    }
+    if count == 0 {
+        return Err("sem o logotipo do Iniciar no comeco da barra".into());
+    }
+    let (box_width, box_height) = (right - left + 1, lower - upper + 1);
+    let (side, pixels) = (h / 4..=h * 3 / 5, h * h / 20..=h * h * 7 / 20);
+    if !side.contains(&box_width) || !side.contains(&box_height) || !pixels.contains(&count) {
+        return Err(format!(
+            "logotipo do Iniciar de {box_width}x{box_height} com {count} pixels claros (lados de {} a {}, de {} a {} pixels)",
+            side.start(),
+            side.end(),
+            pixels.start(),
+            pixels.end()
+        ));
+    }
+    // O relógio: o grupo de colunas com texto mais à direita, nas 6h colunas
+    // da direita, com duas linhas de texto (a hora e a data).
+    let columns: Vec<usize> = (width.saturating_sub(6 * h)..width).filter(|&x| (top..image.height).any(|y| text(x, y))).collect();
+    let mut clock = None;
+    for &(first, last) in runs_of(&columns, (h / 5).max(3)).iter().rev() {
+        let rows: Vec<usize> = (top..image.height).filter(|&y| (first..=last).any(|x| text(x, y))).collect();
+        let lines = runs_of(&rows, 0);
+        let pixels = (top..image.height).map(|y| (first..=last).filter(|&x| text(x, y)).count()).sum::<usize>();
+        let line = |&(a, b): &(usize, usize)| (h / 8..=h / 2).contains(&(b - a + 1));
+        if lines.len() == 2 && lines.iter().all(line) && (h..=4 * h).contains(&(last - first + 1)) && (h * h / 25..=h * h).contains(&pixels) {
+            clock = Some(((first, last), [lines[0], lines[1]]));
+            break;
+        }
+    }
+    let Some((clock, clock_lines)) = clock else {
+        return Err("sem o relogio de duas linhas (hora e data) a direita da barra".into());
+    };
+    Ok(TaskbarLayout { rows: h, start: (left, upper, box_width, box_height, count), clock, clock_lines })
+}
+
+/// O relógio da barra passou de minuto de `reference` para `image`: a linha
+/// da hora mudou em max(h²/100, 4) pixels ou mais (um dígito), o resto da
+/// barra em até 1/20 dos pixels dela (um ícone da área de notificação) e a
+/// tela acima da barra em até 1/32. Devolve quanto mudou, ou o que faltou.
+pub fn clock_ticked(reference: &Image, image: &Image, layout: &TaskbarLayout) -> Result<String, String> {
+    if (reference.width, reference.height) != (image.width, image.height) || reference.rgb.len() != image.rgb.len() {
+        return Err(format!("a tela mudou de tamanho ({}x{} para {}x{})", reference.width, reference.height, image.width, image.height));
+    }
+    let (h, width, top) = (layout.rows, image.width, image.height - layout.rows);
+    let differs = |x: usize, y: usize| {
+        let at = (y * width + x) * 3;
+        reference.rgb[at..at + 3] != image.rgb[at..at + 3]
+    };
+    let (first, last) = layout.clock;
+    let (hour_top, hour_bottom) = layout.clock_lines[0];
+    let hour = (hour_top..=hour_bottom).map(|y| (first..=last).filter(|&x| differs(x, y)).count()).sum::<usize>();
+    let band = (top..image.height).map(|y| (0..width).filter(|&x| !(first..=last).contains(&x) && differs(x, y)).count()).sum::<usize>();
+    let above = (0..top).map(|y| (0..width).filter(|&x| differs(x, y)).count()).sum::<usize>();
+    let minimum = (h * h / 100).max(4);
+    let mut missing = Vec::new();
+    if hour < minimum {
+        missing.push(format!("{hour} pixels da hora mudaram (minimo {minimum})"));
+    }
+    if band * 20 > h * width {
+        missing.push(format!("{}% do resto da barra mudou (maximo 5%)", band * 100 / (h * width)));
+    }
+    if above * 32 > top * width {
+        missing.push(format!("{}% da tela acima da barra mudou (maximo 3%)", above * 100 / (top * width).max(1)));
+    }
+    if missing.is_empty() {
+        Ok(format!("o relogio passou de minuto: {hour} pixels da hora mudaram, {band} no resto da barra, {above} acima dela"))
+    } else {
+        Err(missing.join("; "))
+    }
+}
+
 /// Telas sintéticas para os testes da vigia.
 #[cfg(test)]
 pub mod samples {
@@ -1043,6 +1240,13 @@ pub mod samples {
         let mut image = wallpaper();
         taskbar(&mut image, height, alpha, search_box);
         image
+    }
+
+    /// O relógio da [`taskbar`] no minuto seguinte: um entalhe de 8x8 no fim
+    /// da linha da hora (um dígito que mudou).
+    pub fn next_minute(image: &mut Image, height: usize) {
+        let (width, middle) = (image.width, image.height - height + height / 2);
+        paint(image, width - 70..width - 62, middle - 12..middle - 4, |_, _| [0x20, 0x20, 0x20]);
     }
 }
 
@@ -1321,5 +1525,61 @@ mod tests {
         faded.rgb.iter_mut().for_each(|channel| *channel /= 2);
         assert!(desktop_screen(&faded).is_err());
         assert!(!same_screen(&full, &faded));
+    }
+
+    /// A barra de tarefas sintética (a barra opaca, a translúcida com a
+    /// caixa de busca e a mais transparente sem ela, a 96 e a 120 DPI): o
+    /// logotipo do Iniciar de 16x16 com 196 pixels claros e o relógio nas
+    /// colunas de largura-120 a largura-61. O modelo não escala os elementos
+    /// com h: a caixa de busca dele começa na coluna 48, dentro do botão
+    /// Iniciar de 58 colunas que a barra de 48 linhas teria, então a 120 DPI
+    /// a barra vai sem ela.
+    #[test]
+    fn taskbar_layout_finds_the_start_logo_and_the_clock() {
+        for (h, alpha, search_box) in [(40, 256, true), (40, 154, true), (40, 218, false), (48, 256, false), (48, 154, false)] {
+            let layout = taskbar_layout(&desktop(h, alpha, search_box)).unwrap_or_else(|missing| panic!("{h} {alpha} {search_box}: {missing}"));
+            let top = HEIGHT - h;
+            assert_eq!(layout.rows, h);
+            assert_eq!(layout.start, (16, top + h / 2 - 8, 16, 16, 196), "{h} {alpha} {search_box}");
+            assert_eq!(layout.clock, (WIDTH - 120, WIDTH - 61), "{h} {alpha} {search_box}");
+            assert!(layout.describe().starts_with(&format!("barra de {h} linhas; logotipo do Iniciar de 16x16")), "{}", layout.describe());
+        }
+    }
+
+    /// Sem a barra, sem o logotipo do Iniciar, sem o relógio de duas linhas
+    /// ou na tela de bloqueio, não é a barra de tarefas.
+    #[test]
+    fn taskbar_layout_rejects_missing_pieces() {
+        assert!(taskbar_layout(&wallpaper()).unwrap_err().contains("linhas embaixo"));
+        let top = HEIGHT - 40;
+        let mut no_start = desktop(40, 256, true);
+        paint(&mut no_start, 0..48, top..HEIGHT, |_, _| [0x20, 0x20, 0x20]);
+        assert!(taskbar_layout(&no_start).unwrap_err().contains("logotipo"));
+        let mut no_clock = desktop(40, 256, true);
+        paint(&mut no_clock, WIDTH - 130..WIDTH - 50, top..HEIGHT, |_, _| [0x20, 0x20, 0x20]);
+        assert!(taskbar_layout(&no_clock).unwrap_err().contains("relogio"));
+        assert!(taskbar_layout(&lock_screen(true)).is_err());
+        assert!(taskbar_layout(&filled(720, 400, [0x20, 0x20, 0x20])).unwrap_err().contains("720x400"));
+    }
+
+    /// O relógio que passou de minuto: só a linha da hora mudou. A mesma
+    /// tela, uma janela que abriu acima da barra e a barra redesenhada não
+    /// passam.
+    #[test]
+    fn clock_ticked_needs_the_hour_to_change_and_the_rest_still() {
+        let reference = desktop(40, 256, true);
+        let layout = taskbar_layout(&reference).unwrap();
+        assert!(clock_ticked(&reference, &reference, &layout).unwrap_err().contains("0 pixels da hora"));
+        let mut ticked = reference.clone();
+        next_minute(&mut ticked, 40);
+        let tick = clock_ticked(&reference, &ticked, &layout).unwrap();
+        assert!(tick.starts_with("o relogio passou de minuto: 64 pixels da hora mudaram, 0 no resto da barra, 0 acima dela"), "{tick}");
+        let mut window = ticked.clone();
+        paint(&mut window, 300..600, 200..400, |_, _| [0xF0, 0xF0, 0xF0]);
+        assert!(clock_ticked(&reference, &window, &layout).unwrap_err().contains("acima da barra"));
+        let mut repainted = ticked.clone();
+        paint(&mut repainted, 400..600, HEIGHT - 40..HEIGHT, |_, _| [0x40, 0x40, 0x40]);
+        assert!(clock_ticked(&reference, &repainted, &layout).unwrap_err().contains("resto da barra"));
+        assert!(clock_ticked(&reference, &filled(800, 600, [0, 0, 0]), &layout).unwrap_err().contains("mudou de tamanho"));
     }
 }

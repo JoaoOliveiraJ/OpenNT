@@ -32,7 +32,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::screen_check::{self, CURSOR_MOVED_MARKER, DESKTOP_AFTER, DESKTOP_MARKER, FIRST_PIXEL_MARKER, LOGON_DISMISS_MARKER, LOGON_SCREEN_MARKER};
+use crate::screen_check::{self, CURSOR_MOVED_MARKER, DESKTOP_AFTER, DESKTOP_MARKER, FIRST_PIXEL_MARKER, LOGON_DISMISS_MARKER, LOGON_SCREEN_MARKER, TASKBAR_AFTER, TASKBAR_MARKER};
 
 #[derive(Clone, Debug)]
 pub struct MachineOptions {
@@ -583,7 +583,9 @@ pub struct TestOptions {
     /// seguidas iguais ([`screen_check::logon_screen`]); num teste que espera
     /// o `DESKTOP_OK` (o marcador ou um `--expect`), procura em vez da tela de
     /// logon a área de trabalho ([`screen_check::desktop_screen`]), só depois
-    /// do `EXPLORER_STARTED` na serial.
+    /// do `EXPLORER_STARTED` na serial; num que espera o `TASKBAR_OK`, depois
+    /// da área de trabalho e do `SHELL_TRAY_CREATED`, o relógio da barra de
+    /// tarefas passando de minuto ([`taskbar_step`]).
     pub watch_screen: bool,
     /// `--capture-every=SEGUNDOS`: a tela do QEMU vai para `tela-NNNN.png`
     /// na pasta do log a cada intervalo (só quando mudou) e, no fim do teste
@@ -710,6 +712,17 @@ struct Watch {
     desktop_candidate: Option<crate::png::Image>,
     /// A área de trabalho confirmada (`DESKTOP_OK`).
     desktop: Option<crate::png::Image>,
+    /// O teste espera o `TASKBAR_OK`: depois da área de trabalho, a vigia
+    /// procura o relógio da barra de tarefas passando de minuto.
+    wants_taskbar: bool,
+    /// O `SHELL_TRAY_CREATED` já apareceu na serial.
+    tray_seen: bool,
+    /// A leitura de referência da barra (com a disposição achada nela) e a
+    /// leitura com o relógio no minuto seguinte, à espera da confirmação.
+    taskbar_reference: Option<(crate::png::Image, screen_check::TaskbarLayout)>,
+    taskbar_candidate: Option<crate::png::Image>,
+    /// A barra de tarefas confirmada (`TASKBAR_OK`).
+    taskbar: Option<crate::png::Image>,
 }
 
 /// Um passo da vigia da tela (`--watch-screen`) sobre `image`. Na primeira
@@ -730,6 +743,9 @@ fn watch_step(image: &crate::png::Image, first: &Path, watch: &mut Watch, output
         print!("{line}");
         output.lock().unwrap().push_str(&line);
         save_capture(image, first, "primeira tela desenhada", &description);
+    }
+    if watch.wants_taskbar && watch.desktop.is_some() {
+        return taskbar_step(image, first, watch, output);
     }
     if watch.wants_desktop {
         return desktop_step(image, first, watch, output);
@@ -762,7 +778,8 @@ fn watch_step(image: &crate::png::Image, first: &Path, watch: &mut Watch, output
 /// serial: duas leituras seguidas que passam e são a mesma tela põem no
 /// log a descrição e o `DESKTOP_OK`, e a segunda vai para
 /// `area-de-trabalho.png`, ao lado de `first`, e fica em `watch.desktop`.
-/// Devolve true quando a área de trabalho apareceu.
+/// Devolve true quando a área de trabalho apareceu e o teste não espera
+/// também a barra de tarefas ([`taskbar_step`]).
 fn desktop_step(image: &crate::png::Image, first: &Path, watch: &mut Watch, output: &Mutex<String>) -> bool {
     if !watch.explorer_seen {
         watch.explorer_seen = output.lock().unwrap().contains(DESKTOP_AFTER);
@@ -784,7 +801,53 @@ fn desktop_step(image: &crate::png::Image, first: &Path, watch: &mut Watch, outp
     save_capture(image, &first.with_file_name("area-de-trabalho.png"), "area de trabalho", &description);
     watch.desktop_candidate = None;
     watch.desktop = Some(image.clone());
-    true
+    !watch.wants_taskbar
+}
+
+/// A barra de tarefas na vigia de um teste que espera o `TASKBAR_OK`, depois
+/// do `DESKTOP_OK` e do `SHELL_TRAY_CREATED` na serial: uma leitura com a
+/// barra ([`screen_check::taskbar_layout`]) vira a referência; o
+/// `TASKBAR_OK` sai quando uma leitura seguinte mostra o relógio no minuto
+/// seguinte com o resto parado ([`screen_check::clock_ticked`]) e a leitura
+/// depois dela é igual. Uma leitura sem a barra recomeça; uma que mudou sem
+/// ser o minuto vira a referência nova. A tela vai para
+/// `barra-de-tarefas.png`, ao lado de `first`. Devolve true quando a barra
+/// foi confirmada.
+fn taskbar_step(image: &crate::png::Image, first: &Path, watch: &mut Watch, output: &Mutex<String>) -> bool {
+    if !watch.tray_seen {
+        watch.tray_seen = output.lock().unwrap().contains(TASKBAR_AFTER);
+        if !watch.tray_seen {
+            return false;
+        }
+    }
+    let Ok(layout) = screen_check::taskbar_layout(image) else {
+        (watch.taskbar_reference, watch.taskbar_candidate) = (None, None);
+        return false;
+    };
+    let Some((reference, reference_layout)) = &watch.taskbar_reference else {
+        watch.taskbar_reference = Some((image.clone(), layout));
+        return false;
+    };
+    match screen_check::clock_ticked(reference, image, reference_layout) {
+        Ok(tick) => {
+            if !watch.taskbar_candidate.as_ref().is_some_and(|previous| screen_check::same_screen(previous, image)) {
+                watch.taskbar_candidate = Some(image.clone());
+                return false;
+            }
+            let description = layout.describe();
+            let line = format!("\n[xtask] barra de tarefas (igual em duas leituras seguidas): {description}; {tick}\n{TASKBAR_MARKER}\n");
+            print!("{line}");
+            output.lock().unwrap().push_str(&line);
+            save_capture(image, &first.with_file_name("barra-de-tarefas.png"), "barra de tarefas", &format!("{description}; {tick}"));
+            watch.taskbar = Some(image.clone());
+            true
+        }
+        Err(_) if !screen_check::same_screen(reference, image) => {
+            (watch.taskbar_reference, watch.taskbar_candidate) = (Some((image.clone(), layout)), None);
+            false
+        }
+        Err(_) => false,
+    }
 }
 
 /// O que a thread da tela devolve no fim.
@@ -798,6 +861,8 @@ struct ScreenOutcome {
     logon: Option<crate::png::Image>,
     /// A área de trabalho que a vigia confirmou.
     desktop: Option<crate::png::Image>,
+    /// A barra de tarefas que a vigia confirmou.
+    taskbar: Option<crate::png::Image>,
 }
 
 /// O passo da espera da thread da tela: o fim do teste a encontra em até
@@ -806,7 +871,8 @@ const SCREEN_STEP: Duration = Duration::from_millis(100);
 
 /// A thread da tela. O QMP atende um cliente por vez, então uma thread só
 /// faz as duas leituras periódicas: a vigia (`watch`, o PNG da primeira
-/// tela desenhada e se o teste espera a área de trabalho, a cada
+/// tela desenhada e se o teste espera a área de trabalho ou a barra de
+/// tarefas, a cada
 /// [`SCREEN_POLL`]) e a série do `--capture-every`
 /// (`frames`); quando as duas vencem juntas, uma leitura serve às duas. Os
 /// prazos contam de `launched` (a subida do QEMU). Devolve a última tela
@@ -815,13 +881,14 @@ fn screen_thread(
     port: u16,
     scratch: PathBuf,
     launched: Instant,
-    watch: Option<(PathBuf, bool)>,
+    watch: Option<(PathBuf, bool, bool)>,
     mut frames: Option<FrameSeries>,
     output: Arc<Mutex<String>>,
     stop: Arc<std::sync::atomic::AtomicBool>,
 ) -> ScreenOutcome {
     use std::sync::atomic::Ordering;
-    let mut state = Watch { wants_desktop: watch.as_ref().is_some_and(|(_, desktop)| *desktop), ..Watch::default() };
+    let (wants_desktop, wants_taskbar) = watch.as_ref().map_or((false, false), |(_, desktop, taskbar)| (*desktop || *taskbar, *taskbar));
+    let mut state = Watch { wants_desktop, wants_taskbar, ..Watch::default() };
     let mut watch_at = watch.is_some().then_some(SCREEN_POLL);
     let mut frame = frames.as_ref().map(|series| series.next_index(Duration::ZERO));
     let mut last = None;
@@ -842,7 +909,7 @@ fn screen_thread(
         let elapsed = launched.elapsed();
         if watch_at.is_some_and(|at| at <= elapsed) {
             watch_at = Some(elapsed + SCREEN_POLL);
-            if let (Ok(image), Some((first, _))) = (&screen, &watch) {
+            if let (Ok(image), Some((first, _, _))) = (&screen, &watch) {
                 if watch_step(image, first, &mut state, &output) {
                     watch_at = None;
                 }
@@ -864,7 +931,7 @@ fn screen_thread(
             last = Some(image);
         }
     }
-    ScreenOutcome { last, frames, logon: state.logon, desktop: state.desktop }
+    ScreenOutcome { last, frames, logon: state.logon, desktop: state.desktop, taskbar: state.taskbar }
 }
 
 /// Limite de tamanho de uma captura (a tela gráfica é reduzida até caber).
@@ -1672,11 +1739,15 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
     let screen_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     // O teste da área de trabalho (o DESKTOP_OK no marcador ou num
     // --expect): a vigia procura a área de trabalho em vez da tela de logon.
-    let desktop_test = test.marker == DESKTOP_MARKER || test.expect.iter().any(|expected| expected == DESKTOP_MARKER);
+    let expects = |marker: &str| test.marker == marker || test.expect.iter().chain(&test.expect_any).any(|expected| expected == marker);
+    let desktop_test = expects(DESKTOP_MARKER);
+    // O teste da barra de tarefas: depois da área de trabalho, a vigia
+    // procura o relógio da barra passando de minuto.
+    let taskbar_test = expects(TASKBAR_MARKER);
     let screen_watcher = match (test.watch_screen || test.capture_every.is_some(), qmp_port) {
         (true, Some(qmp)) => {
             let scratch = log.with_file_name("tela.ppm");
-            let first = test.watch_screen.then(|| (log.with_file_name("primeira-tela.png"), desktop_test));
+            let first = test.watch_screen.then(|| (log.with_file_name("primeira-tela.png"), desktop_test, taskbar_test));
             let frames = test.capture_every.map(|every| FrameSeries::new(log.parent().unwrap_or(Path::new(".")), every));
             let (serial, stop) = (Arc::clone(&output), Arc::clone(&screen_stop));
             Some(thread::spawn(move || screen_thread(qmp, scratch, launched, first, frames, serial, stop)))
@@ -1909,7 +1980,7 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
         (result, _) => result,
     };
     screen_stop.store(true, std::sync::atomic::Ordering::Release);
-    let ScreenOutcome { last: last_screen, frames, logon, desktop } = screen_watcher.and_then(|watcher| watcher.join().ok()).unwrap_or_default();
+    let ScreenOutcome { last: last_screen, frames, logon, desktop, taskbar } = screen_watcher.and_then(|watcher| watcher.join().ok()).unwrap_or_default();
     // O teste da tela de logon que falhou diz no log o que faltou na última
     // tela lida.
     let logon_test = test.marker == LOGON_SCREEN_MARKER || test.expect.iter().chain(&test.expect_any).any(|expected| expected == LOGON_SCREEN_MARKER);
@@ -1938,7 +2009,18 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
     }
     // A tela que a vigia confirmou: a área de trabalho no teste dela,
     // senão a tela de logon.
-    let confirmed = if desktop_test { desktop } else { logon };
+    // O teste da barra de tarefas que falhou depois da área de trabalho diz
+    // o que faltou na barra da última tela lida.
+    if let (true, Err(_), Some(_), None, Some(last)) = (taskbar_test, &result, &desktop, &taskbar, &last_screen) {
+        let verdict = match screen_check::taskbar_layout(last) {
+            Ok(layout) => format!("{}, mas o relogio nao passou de minuto com o resto parado em duas leituras seguidas depois do {TASKBAR_AFTER}", layout.describe()),
+            Err(missing) => missing,
+        };
+        let line = format!("\n[xtask] a ultima tela lida nao confirma a barra de tarefas: {verdict}\n");
+        print!("{line}");
+        output.lock().unwrap().push_str(&line);
+    }
+    let confirmed = if taskbar_test { taskbar.or(desktop) } else if desktop_test { desktop } else { logon };
     let mut machine = current.into_inner();
     // As capturas do fim saem com o QEMU ainda vivo, passe o teste ou não
     // (prazo esgotado, STOP); se elas falharem, o resultado do teste não
@@ -2219,8 +2301,8 @@ mod tests {
         let (port, server) = fake_qmp(vec![a.clone(), a.clone(), b.clone(), b.clone(), b, a.clone()], Arc::clone(&stop));
         let output = Arc::new(Mutex::new("primeira linha\nultima linha\n".to_string()));
         let frames = FrameSeries::new(&directory, Duration::from_millis(30));
-        let ScreenOutcome { last, frames, logon, desktop } = screen_thread(port, directory.join("tela.ppm"), Instant::now(), None, Some(frames), output, stop);
-        assert!(logon.is_none() && desktop.is_none(), "sem a vigia, nada de tela de logon nem de area de trabalho");
+        let ScreenOutcome { last, frames, logon, desktop, taskbar } = screen_thread(port, directory.join("tela.ppm"), Instant::now(), None, Some(frames), output, stop);
+        assert!(logon.is_none() && desktop.is_none() && taskbar.is_none(), "sem a vigia, nada de tela de logon, area de trabalho ou barra");
         assert_eq!(server.join().unwrap(), 6);
         let frames = frames.unwrap();
         assert_eq!((frames.saved, frames.repeated), (3, 3));
@@ -2315,6 +2397,44 @@ mod tests {
         assert!(text.find(DESKTOP_AFTER).unwrap() < text.find(DESKTOP_MARKER).unwrap(), "{text}");
         let saved = crate::png::read_info(&std::fs::read(directory.join("area-de-trabalho.png")).unwrap()).unwrap();
         assert_eq!(saved.text("opennt-resultado"), Some("area de trabalho"));
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A vigia de um teste da barra de tarefas: a área de trabalho dá o
+    /// DESKTOP_OK sem encerrar a vigia; a barra só conta depois do
+    /// SHELL_TRAY_CREATED, com o relógio no minuto seguinte (a leitura com o
+    /// minuto novo fica de candidata e a igual a ela dá o TASKBAR_OK).
+    #[test]
+    fn watch_finds_the_taskbar_after_the_desktop_and_a_clock_tick() {
+        use crate::screen_check::samples::*;
+        let directory = scratch_dir("watch-taskbar");
+        let first = directory.join("primeira-tela.png");
+        let area = desktop(40, 256, true);
+        let mut ticked = area.clone();
+        next_minute(&mut ticked, 40);
+        // Sem o SHELL_TRAY_CREATED, a barra nunca conta.
+        let output = Mutex::new(String::from("EXPLORER_STARTED\n"));
+        let mut watch = Watch { wants_desktop: true, wants_taskbar: true, ..Watch::default() };
+        for image in [&area, &area, &area, &ticked, &ticked, &ticked] {
+            assert!(!watch_step(image, &first, &mut watch, &output));
+        }
+        assert!(watch.desktop.is_some() && !output.lock().unwrap().contains(TASKBAR_MARKER));
+        // Com ele, a referência, o minuto novo e a confirmação.
+        let output = Mutex::new(String::from("EXPLORER_STARTED\nSHELL_TRAY_CREATED\n"));
+        let mut watch = Watch { wants_desktop: true, wants_taskbar: true, ..Watch::default() };
+        for image in [&area, &area] {
+            assert!(!watch_step(image, &first, &mut watch, &output), "o DESKTOP_OK nao encerra a vigia");
+        }
+        assert!(output.lock().unwrap().contains(DESKTOP_MARKER));
+        assert!(!watch_step(&area, &first, &mut watch, &output), "a referencia");
+        assert!(!watch_step(&ticked, &first, &mut watch, &output), "o minuto novo fica de candidato");
+        assert!(watch_step(&ticked, &first, &mut watch, &output));
+        assert!(watch.taskbar.as_ref() == Some(&ticked));
+        let text = output.lock().unwrap().clone();
+        assert_eq!(text.matches(TASKBAR_MARKER).count(), 1, "{text}");
+        assert!(text.find(DESKTOP_MARKER).unwrap() < text.find(TASKBAR_MARKER).unwrap(), "{text}");
+        let saved = crate::png::read_info(&std::fs::read(directory.join("barra-de-tarefas.png")).unwrap()).unwrap();
+        assert_eq!(saved.text("opennt-resultado"), Some("barra de tarefas"));
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
