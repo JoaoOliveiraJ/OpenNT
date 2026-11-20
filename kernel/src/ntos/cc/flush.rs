@@ -17,7 +17,7 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
-use super::cache_map::{self, CacheManager, MapState, CACHE};
+use super::cache_map::{self, CacheManager, MapState, PendingPurge, CACHE};
 use super::layout::{self, purge_flags, status, PAGE_SIZE};
 use super::section_io::{self, Fill};
 use super::status::{CcResult, Failure};
@@ -164,15 +164,22 @@ fn purge(cache: &mut CacheManager, base: u64, start: u64, end: u64, flags: u32) 
     }
     let keep_dirty = flags & purge_flags::DO_NOT_PURGE_DIRTY_PAGES != 0;
     let mut retained = false;
+    let mut kept = Vec::new();
     for (&index, view) in map.views.iter_mut() {
         let mut discard = vacb::range_mask(index, start, end);
         if keep_dirty {
             retained |= view.dirty & discard != 0;
+            for (first, count) in vacb::runs(view.dirty & discard) {
+                kept.extend((first..first + count).map(|page| vacb::view_offset(index) / PAGE_SIZE + page));
+            }
             discard &= !view.dirty;
         }
         view.valid &= !discard;
         view.dirty &= !discard;
     }
+    // As páginas da seção do cache saem também (o MmPurgeSection), depois
+    // de soltar o lock.
+    let section = map.section.clone();
     let doomed: Vec<u64> = map.bcbs.iter().filter(|(_, bcb)| bcb.pins == 0 && bcb.offset >= start && bcb.offset + bcb.length as u64 <= end && !(keep_dirty && bcb.dirty)).map(|(&address, _)| address).collect();
     for address in doomed {
         map.bcbs.remove(&address);
@@ -180,7 +187,32 @@ fn purge(cache: &mut CacheManager, base: u64, start: u64, end: u64, flags: u32) 
     }
     clean_bcbs(map);
     cache_map::publish(map);
+    if let Some(section) = section {
+        cache.pending_purges.push(PendingPurge { section, start, end, kept });
+    }
     !retained
+}
+
+/// As purgas da seção do cache decididas com o lock preso: as páginas saem
+/// da control area quando nenhuma vista de fora do cache as usa. false se
+/// alguma ficou (uma vista de usuário mapeia a página).
+pub fn run_pending_purges() -> bool {
+    let pending = core::mem::take(&mut CACHE.lock().pending_purges);
+    let mut purged = true;
+    for job in pending {
+        let mut start = job.start;
+        let mut kept = job.kept;
+        kept.sort_unstable();
+        kept.push(job.end.div_ceil(PAGE_SIZE));
+        for page in kept {
+            let end = page.saturating_mul(PAGE_SIZE).min(job.end);
+            if start < end {
+                purged &= super::cache_section::purge(&job.section, start, end);
+            }
+            start = start.max(page.saturating_add(1).saturating_mul(PAGE_SIZE));
+        }
+    }
+    purged
 }
 
 /// O encolhimento de CcSetFileSizes/CcUninitializeCacheMap: descarta as
@@ -241,10 +273,46 @@ pub fn flush_cache(pointers: u64, offset_pointer: u64, length: u32, io_status: u
         return Ok(());
     };
     let (start, end) = byte_range(offset_pointer, length, false);
+    user_mapped_flush(base);
     let (code, written) = write_range(base, start, end, None)?;
     write_io_status(io_status, code, written);
     super::copy::post_deferred_writes(false);
     Ok(())
+}
+
+/// SCM.Flags 0x20000 e 0x40000000, que pedem o flush da seção inteira.
+const SCM_FLUSH_SECTION: u32 = 0x2_0000 | 0x4000_0000;
+/// FSRTL_COMMON_FCB_HEADER: Flags FSRTL_FLAG_USER_MAPPED_FILE e Flags2
+/// FSRTL_FLAG2_WRITABLE_USER_MAPPED_FILE.
+const FSRTL_FLAG_USER_MAPPED_FILE: u8 = 0x20;
+const FSRTL_FLAG2_WRITABLE_USER_MAPPED_FILE: u8 = 0x10;
+
+/// O primeiro passo do CcFlushCache do 19041 num arquivo mapeado por
+/// usuário (o FCB com FSRTL_FLAG_USER_MAPPED_FILE e
+/// FSRTL_FLAG2_WRITABLE_USER_MAPPED_FILE, ou o mapa com os bits de flush da
+/// seção), fora do lazy writer: o MmFlushSection do intervalo inteiro, que
+/// grava o que as vistas de usuário alteraram na seção do stream.
+fn user_mapped_flush(base: u64) {
+    if super::lazy_writer::on_lazy_writer_thread() {
+        return;
+    }
+    let (identity, file, scm_flags) = {
+        let cache = CACHE.lock();
+        let Some(map) = cache.maps.get(&base) else { return };
+        let Some(section) = map.section.as_ref() else { return };
+        (section.identity(), map.file_object, map.flags())
+    };
+    let context = cache_map::file_object(file).fs_context.get();
+    let mapped = context != 0 && {
+        // SAFETY: o FsContext de um arquivo de file system começa pelo cabeçalho comum do FCB.
+        let header = unsafe { crate::ntos::inc::types::extra_fsrtl::FsrtlCommonFcbHeader::at(context) };
+        header.flags.get() & FSRTL_FLAG_USER_MAPPED_FILE != 0 && header.flags2.get() & FSRTL_FLAG2_WRITABLE_USER_MAPPED_FILE != 0
+    };
+    if mapped || scm_flags & SCM_FLUSH_SECTION != 0 {
+        if let Err(error) = crate::ntos::ps::user::sections::flush_identity(&identity) {
+            debug_print!("[cc] flush da secao mapeada por usuario: {}", error.message);
+        }
+    }
 }
 
 /// CcFlushCacheToLsn(SectionObjectPointer, LsnToFlushTo, IoStatus): grava as
@@ -280,6 +348,7 @@ pub fn purge_cache_section(pointers: u64, offset_pointer: u64, length: u32, flag
         let purged = purge(&mut cache, base, start, end, flags);
         (purged, cache.maps.get(&base).is_some_and(|map| map.open_count == 0))
     };
+    let purged = run_pending_purges() && purged;
     if orphaned {
         let (deferred, deleted) = {
             let mut cache = CACHE.lock();

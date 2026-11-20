@@ -26,6 +26,7 @@ pub mod rtl_ranges_resources;
 pub mod platform_support;
 pub mod power_io_support;
 pub mod file_system_mount;
+pub mod fsd_sections;
 pub mod minifilters;
 pub mod minifilter_support;
 pub mod console_driver;

@@ -11,6 +11,9 @@
 //! * `cache_map` — shared/private cache maps, tamanhos e atributos;
 //! * `vacb` — vistas e cópias de memória;
 //! * `section_io` — a paginação que o Mm faz debaixo do Cc no NT;
+//! * `cache_section` — a seção de dados do stream (SharedCacheMap->Section)
+//!   cujas vistas de sistema são as vistas do cache, com as mesmas páginas
+//!   das vistas de usuário do arquivo;
 //! * `copy`, `pin`, `mdl`, `flush`, `log` — cópias, pin, MDLs, escrita/flush
 //!   e fluxos com log;
 //! * `lazy_writer` — a passada do lazy writer (write-behind e remoção
@@ -21,6 +24,7 @@ pub mod status;
 pub mod cache_map;
 pub mod vacb;
 pub mod section_io;
+pub mod cache_section;
 pub mod copy;
 pub mod pin;
 pub mod mdl;

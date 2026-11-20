@@ -27,7 +27,9 @@
 //! está sobre a LUN do storport e o setor 0 lido pela pilha é o MBR do xtask;
 //! `NVME_VOLUME_OK` quando o volume tem a letra do mountmgr.sys, o ntfs.sys
 //! real montou o volume da partição e leu o arquivo do xtask, e um arquivo
-//! novo foi gravado, fechado e lido de volta pela letra.
+//! novo foi gravado, fechado e lido de volta pela letra; `NVME_SECTION_OK`
+//! quando seções de dados sobre um arquivo do volume compartilham a página
+//! com o cache e a escrita de uma vista chega ao disco (`test/fsd_sections`).
 //!
 //! Sem a opção nada disto roda e o boot comum não muda.
 
@@ -301,6 +303,12 @@ pub fn check() {
         Ok((path, letter)) => {
             debug_print!("[nvme] {}: o ntfs.sys montou o volume da particao, leu {} e gravou e releu {} por {}:", path, NVME_FILE, NVME_NEW_FILE, letter);
             debug_print!("NVME_VOLUME_OK");
+            // Seções de dados sobre um arquivo do ntfs.sys, com o cache e as
+            // vistas na mesma página (`test/fsd_sections`).
+            match crate::ntos::test::fsd_sections::run(&format!("\\??\\{letter}:")) {
+                Ok(()) => debug_print!("NVME_SECTION_OK"),
+                Err(error) => debug_print!("[fsd-section] {}", error),
+            }
         }
         Err(error) => debug_print!("[nvme] volume: {}", error),
     }

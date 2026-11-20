@@ -42,7 +42,7 @@ use crate::rtl::SpinLock;
 const FIRST_DELAY: i64 = -30_000_000;
 const IDLE_DELAY: i64 = -10_000_000;
 /// IoSetTopLevelIrp(FSRTL_CACHE_TOP_LEVEL_IRP).
-const FSRTL_CACHE_TOP_LEVEL_IRP: u64 = 1;
+const FSRTL_CACHE_TOP_LEVEL_IRP: u64 = 2;
 /// THREAD_ALL_ACCESS.
 const THREAD_ALL_ACCESS: u32 = 0x1F_FFFF;
 
@@ -68,6 +68,12 @@ struct LazyWriter {
 static LAZY: SpinLock<LazyWriter> = SpinLock::new(LazyWriter { timer: 0, scan_dpc: 0, scan_event: 0, worker: 0, scan_active: false, other_work: false, pending: false, waiters: Vec::new() });
 /// Serializa a criação dos objetos (a primeira CcInitializeCacheMap).
 static CREATING: SpinLock<()> = SpinLock::new(());
+
+/// A thread corrente é a do lazy writer.
+pub fn on_lazy_writer_thread() -> bool {
+    let worker = LAZY.lock().worker;
+    worker != 0 && worker == process::get_current_thread()
+}
 
 /// Cria os objetos e a thread do lazy writer na primeira vez (fora de
 /// qualquer trava do Cc).

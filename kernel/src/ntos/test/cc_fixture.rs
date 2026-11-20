@@ -2,7 +2,11 @@
 //! sintético que atende as leituras e escritas de paginação do Cc a partir
 //! de um arquivo em memória, como um file system atenderia (IRP_MJ_READ /
 //! IRP_MJ_WRITE com IRP_PAGING_IO e MdlAddress), contando os IRPs e
-//! recusando os que não têm a forma de IoPageRead/IoSynchronousPageWrite.
+//! recusando os que não têm a forma de IoPageRead/IoSynchronousPageWrite:
+//! Flags IRP_PAGING_IO | IRP_NOCACHE | IRP_SYNCHRONOUS_PAGING_IO nos bits
+//! baixos (a prioridade de I/O vai nos bits 17..19, como o IoPageReadEx a
+//! põe) e um MDL travado com VA de sistema (o de pool não paginado do Cc ou
+//! o mapeado no sistema dos frames do Mm).
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -29,8 +33,12 @@ pub static FAIL_WRITES: AtomicBool = AtomicBool::new(false);
 pub const WRITE_FAILURE: u32 = 0xC000_0185;
 /// IRP_PAGING_IO | IRP_NOCACHE | IRP_SYNCHRONOUS_PAGING_IO.
 const PAGING_FLAGS: u32 = 0x43;
-/// MDL_PAGES_LOCKED | MDL_SOURCE_IS_NONPAGED_POOL.
-const MDL_LOCKED_NONPAGED: i16 = 0x6;
+/// Os bits da prioridade de I/O em Irp->Flags (17..19).
+const IRP_PRIORITY_MASK: u32 = 7 << 17;
+/// MDL_PAGES_LOCKED, e a VA de sistema: MDL_MAPPED_TO_SYSTEM_VA ou
+/// MDL_SOURCE_IS_NONPAGED_POOL.
+const MDL_PAGES_LOCKED: i16 = 0x2;
+const MDL_SYSTEM_VA: i16 = 0x1 | 0x4;
 
 /// Conteúdo de referência do arquivo sintético.
 pub fn pattern(offset: u64) -> u8 {
@@ -54,7 +62,8 @@ extern "win64" fn dispatch(_device: u64, packet: u64) -> u64 {
     let (mut status, mut information) = (0u32, 0u64);
     // SAFETY: MdlAddress de um IRP de paginação (verificado não nulo antes do uso).
     let mdl = (descriptor != 0).then(|| unsafe { Mdl::at(descriptor) });
-    let well_formed = irp.flags.get() == PAGING_FLAGS && mdl.is_some_and(|mdl| mdl.byte_count.get() as u64 == length && mdl.mdl_flags.get() & MDL_LOCKED_NONPAGED == MDL_LOCKED_NONPAGED);
+    let paging = irp.flags.get() & !IRP_PRIORITY_MASK == PAGING_FLAGS;
+    let well_formed = paging && mdl.is_some_and(|mdl| mdl.byte_count.get() as u64 == length && mdl.mdl_flags.get() & MDL_PAGES_LOCKED != 0 && mdl.mdl_flags.get() & MDL_SYSTEM_VA != 0 && mdl.mapped_system_va.get() != 0);
     match mdl.filter(|_| well_formed) {
         None => {
             BAD_IRPS.fetch_add(1, Ordering::SeqCst);

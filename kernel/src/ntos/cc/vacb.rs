@@ -1,8 +1,11 @@
 //! Vistas do cache (VACBs), como no Cache Manager do NT.
 //!
-//! Cada vista cobre VACB_MAPPING_GRANULARITY (256 KB) alinhados do arquivo e
-//! é memória de sistema contínua com PFNs independentes
-//! (`mm::independent_pages`), dona dos dados em cache. O estado por página
+//! Cada vista cobre VACB_MAPPING_GRANULARITY (256 KB) alinhados do arquivo.
+//! Num mapa com seção do cache (`cache_section`) a vista é uma vista de
+//! sistema dela (o MmMapViewInSystemCache), sobre os frames da control area
+//! do stream, os mesmos das vistas de usuário; sem seção, é memória de
+//! sistema contínua com PFNs independentes (`mm::independent_pages`), dona
+//! dos dados em cache. O estado por página
 //! (válida, suja, em leitura, em escrita) são máscaras de 64 bits. Um `Vacb`
 //! nativo (BaseAddress, SharedCacheMap, FileOffset|ActiveCount) acompanha a
 //! vista: CcMapData devolve `vacb | 1`, como o NT.
@@ -16,6 +19,8 @@
 //! sondadas de `guest_memory` (STATUS_ACCESS_VIOLATION vira o
 //! STATUS_INVALID_USER_BUFFER do CcCopyRead/CcCopyWrite).
 
+use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
@@ -26,7 +31,17 @@ use crate::ntos::inc::field::NtStruct;
 use crate::ntos::inc::types::extra_cc::Vacb;
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::independent_pages;
-use crate::rtl::KernelError;
+use crate::ntos::ps::user::sections::View as SectionView;
+use crate::rtl::{KernelError, SpinLock};
+
+/// As vistas de sistema da seção do cache, pela VA base da vista do Cc.
+static SECTION_VIEWS: SpinLock<BTreeMap<u64, Arc<SectionView>>> = SpinLock::new(BTreeMap::new());
+
+/// A vista de sistema da seção do cache que está na VA `base` (`None` numa
+/// vista de páginas próprias).
+pub fn section_view(base: u64) -> Option<Arc<SectionView>> {
+    SECTION_VIEWS.lock().get(&base).cloned()
+}
 
 /// Orçamento de vistas (32 MB de cache) antes de reciclar vistas limpas.
 pub const VIEW_BUDGET: u64 = 128;
@@ -77,8 +92,14 @@ pub fn views_in(start: u64, end: u64) -> core::ops::RangeInclusive<u64> {
 /// Libera páginas e VACB de vistas já retiradas da tabela (fora do lock).
 pub fn free_views(views: Vec<View>) {
     for view in views {
-        if let Err(error) = independent_pages::free(view.base) {
-            debug_print!("[cc] view {:#x} release failed: {}", view.base, error);
+        let mapped = SECTION_VIEWS.lock().remove(&view.base);
+        match mapped {
+            Some(section_view) => super::cache_section::unmap_view(&section_view),
+            None => {
+                if let Err(error) = independent_pages::free(view.base) {
+                    debug_print!("[cc] view {:#x} release failed: {}", view.base, error);
+                }
+            }
         }
         guest::free_bytes(view.vacb);
     }
@@ -108,22 +129,33 @@ fn evict(cache: &mut CacheManager) -> Vec<View> {
 
 /// Garante a vista `index` do mapa `base`. Não chamar com o lock preso.
 pub fn ensure_view(base: u64, index: u64) -> CcResult<()> {
-    let retired = {
+    let (retired, section) = {
         let mut cache = CACHE.lock();
         let Some(map) = cache.maps.get(&base) else { return Err(Failure::Kernel(KernelError::new("cache map vanished"))) };
         if map.views.contains_key(&index) {
             return Ok(());
         }
-        evict(&mut cache)
+        let section = map.section.clone();
+        (evict(&mut cache), section)
     };
     free_views(retired);
-    let memory = independent_pages::allocate(VIEW_SIZE, 0)?;
+    let memory = match &section {
+        Some(section) => match super::cache_section::map_view(section, index) {
+            Some(mapped) => {
+                let address = mapped.base;
+                SECTION_VIEWS.lock().insert(address, mapped);
+                address
+            }
+            None => 0,
+        },
+        None => independent_pages::allocate(VIEW_SIZE, 0)?,
+    };
     if memory == 0 {
         return Err(Failure::Raise(layout::status::INSUFFICIENT_RESOURCES));
     }
     let vacb = guest::alloc_bytes(Vacb::SIZE);
     if vacb == 0 {
-        let _ = independent_pages::free(memory);
+        free_views(alloc::vec![View { base: memory, vacb: 0, valid: 0, dirty: 0, reading: 0, writing: 0, refs: 0, maps: 0, last_use: 0 }]);
         return Err(Failure::Raise(layout::status::INSUFFICIENT_RESOURCES));
     }
     let native = vacb_at(vacb);
@@ -153,6 +185,28 @@ pub fn ensure_view(base: u64, index: u64) -> CcResult<()> {
         free_views(alloc::vec![view]);
     }
     Ok(())
+}
+
+/// A página da VA `address` (numa vista do cache, válida) passa a suja: o
+/// MmSetAddressRangeModified de uma página escrita pela vista sem o Cc saber
+/// (o LFS grava o log por um CcMapData).
+pub fn mark_modified(address: u64) {
+    let mut cache = CACHE.lock();
+    let mut changed = None;
+    for (&base, map) in cache.maps.iter_mut() {
+        for view in map.views.values_mut() {
+            if address >= view.base && address < view.base + VIEW_SIZE {
+                let bit = 1u64 << ((address - view.base) / layout::PAGE_SIZE);
+                if view.valid & bit != 0 && view.dirty & bit == 0 {
+                    view.dirty |= bit;
+                    changed = Some(base);
+                }
+            }
+        }
+    }
+    if let Some(map) = changed.and_then(|base| cache.maps.get(&base)) {
+        super::cache_map::publish(map);
+    }
 }
 
 /// Marca uso recente (LRU).

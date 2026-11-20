@@ -10,6 +10,10 @@
 //! têm R/W fixo (o OpenNT não emula o bit sujo por falta de página). Por isso
 //! a sujeira fica onde a gravação do OpenNT a encontra — no PTE, intocado — e
 //! o resultado é o do NT: TRUE se algum PTE válido da faixa tem Dirty.
+//!
+//! Numa vista do Cache Manager (uma vista de sistema da seção do stream,
+//! `cc/cache_section`), a página suja vira página suja do Cc, o Modified do
+//! PFN do NT: o CcFlushCache que o LFS chama em seguida a grava.
 
 use crate::ntos::mm::paging;
 
@@ -25,7 +29,10 @@ pub fn set_address_range_modified(address: u64, length: u64) -> bool {
     loop {
         let step = match paging::query_page(page, false) {
             Some(query) => {
-                dirty |= query.flags & PTE_DIRTY != 0;
+                if query.flags & PTE_DIRTY != 0 {
+                    dirty = true;
+                    crate::ntos::cc::vacb::mark_modified(page);
+                }
                 query.page_size.max(PAGE_SIZE) - (page & (query.page_size.max(PAGE_SIZE) - 1))
             }
             None => PAGE_SIZE,

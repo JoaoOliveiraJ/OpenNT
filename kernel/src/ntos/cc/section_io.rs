@@ -2,10 +2,15 @@
 //! debaixo do Cc no NT (falta de página resolvida por IoPageRead, escrita por
 //! IoSynchronousPageWrite).
 //!
-//! O OpenNT não tem seções de dados sobre arquivos de drivers reais, então o
-//! próprio Cc traz as páginas que vai entregar: antes de copiar, mapear ou
-//! fixar, as páginas ausentes são lidas por um IRP de paginação enviado à
-//! pilha do próprio arquivo (IoGetRelatedDeviceObject), com
+//! Num mapa com seção do cache (`cache_section`), as páginas ausentes de uma
+//! vista são confirmadas na control area do stream: lidas pela E/S de
+//! paginação do Mm (`mm/section/fsd_file`) ou zeradas, e publicadas em todas
+//! as vistas, inclusive as de usuário; uma página que outra seção já trouxe
+//! só é publicada na vista do Cc, sem E/S. Num mapa sem seção (um arquivo
+//! que não é servido pela pilha de um file system), o próprio Cc traz as
+//! páginas que vai entregar: antes de copiar, mapear ou fixar, as páginas
+//! ausentes são lidas por um IRP de paginação enviado à pilha do próprio
+//! arquivo (IoGetRelatedDeviceObject), com
 //! IRP_MJ_READ/WRITE, Flags 0x43 (IRP_PAGING_IO | IRP_NOCACHE |
 //! IRP_SYNCHRONOUS_PAGING_IO, como IoPageReadEx/IoSynchronousPageWriteEx),
 //! MdlAddress descrevendo as páginas da vista e o FILE_OBJECT do cache map no
@@ -144,6 +149,7 @@ pub fn prepare_view(base: u64, index: u64, mask: u64, fill: Fill, wait: bool) ->
             vacb::touch(&mut cache, base, index);
             let Some(map) = cache.maps.get_mut(&base) else { return Err(Failure::Kernel(KernelError::new("cache map vanished"))) };
             let (file_size, goal, file) = (map.file_size, map.valid_data_goal, map.file_object);
+            let section = map.section.clone();
             let Some(view) = map.views.get_mut(&index) else { continue };
             // Páginas sendo lidas por outra thread: esperar.
             if view.reading & mask != 0 {
@@ -170,20 +176,39 @@ pub fn prepare_view(base: u64, index: u64, mask: u64, fill: Fill, wait: bool) ->
                         read |= bit;
                     }
                 }
-                if read != 0 && !wait {
-                    return Ok(None);
+                match &section {
+                    Some(section) => {
+                        // A control area já tem as páginas que outra seção
+                        // trouxe: só falta publicá-las na vista, sem E/S.
+                        let present = super::cache_section::present(section, vacb::view_offset(index) / PAGE_SIZE, layout::PAGES_PER_VIEW) & (zero | read);
+                        let read = read & !present;
+                        if read != 0 && !wait {
+                            return Ok(None);
+                        }
+                        view.refs += 1;
+                        view.reading |= zero | read | present;
+                        Some((view.base, zero | read | present, file, Some((section.clone(), zero & !present, read, file_size))))
+                    }
+                    None => {
+                        if read != 0 && !wait {
+                            return Ok(None);
+                        }
+                        vacb::zero_pages(view.base, zero);
+                        view.valid |= zero;
+                        view.refs += 1;
+                        view.reading |= read;
+                        Some((view.base, read, file, None))
+                    }
                 }
-                vacb::zero_pages(view.base, zero);
-                view.valid |= zero;
-                view.refs += 1;
-                view.reading |= read;
-                Some((view.base, read, file))
             }
         };
-        let Some((view_base, read, file)) = plan else {
+        let Some((view_base, read, file, section_fill)) = plan else {
             dispatcher::pump_kernel();
             continue;
         };
+        if let Some((section, zero, from_file, file_size)) = section_fill {
+            return fill_from_section(base, index, view_base, &section, read, zero, from_file, file_size);
+        }
         if read == 0 {
             return Ok(Some(view_base));
         }
@@ -222,6 +247,57 @@ pub fn prepare_view(base: u64, index: u64, mask: u64, fill: Fill, wait: bool) ->
         }
         return Ok(Some(view_base));
     }
+}
+
+/// As páginas `pages` da vista `index` pela seção do cache: as de `zero`
+/// confirmadas zeradas, as de `from_file` lidas do arquivo, e todas
+/// publicadas na vista de sistema do Cc antes de ficarem válidas.
+#[allow(clippy::too_many_arguments)]
+fn fill_from_section(base: u64, index: u64, view_base: u64, section: &super::cache_section::CacheSection, pages: u64, zero: u64, from_file: u64, file_size: u64) -> CcResult<Option<u64>> {
+    let first_page = vacb::view_offset(index) / PAGE_SIZE;
+    let mut failure = None;
+    match vacb::section_view(view_base) {
+        None => failure = Some(Failure::Kernel(KernelError::new("cache view without section view"))),
+        Some(view) => {
+            // Some(ler do arquivo) confirma; None só publica o que a control area tem.
+            for (mask, read) in [(zero, Some(false)), (from_file, Some(true)), (pages & !(zero | from_file), None)] {
+                for (first, count) in vacb::runs(mask) {
+                    let result = match read {
+                        Some(read) => super::cache_section::fill(section, &view, first_page + first, count, read, file_size),
+                        None => Ok(if super::cache_section::attach(&view, first_page + first, count) { 0 } else { status::INSUFFICIENT_RESOURCES }),
+                    };
+                    match result {
+                        Ok(0) => {}
+                        Ok(code) => {
+                            failure = Some(Failure::Raise(code));
+                            break;
+                        }
+                        Err(error) => {
+                            failure = Some(Failure::Kernel(error));
+                            break;
+                        }
+                    }
+                }
+                if failure.is_some() {
+                    break;
+                }
+            }
+        }
+    }
+    {
+        let mut cache = CACHE.lock();
+        if let Some(view) = cache.maps.get_mut(&base).and_then(|map| map.views.get_mut(&index)) {
+            if failure.is_none() {
+                view.valid |= pages;
+            }
+            view.reading &= !pages;
+        }
+    }
+    if let Some(failure) = failure {
+        cache_map::release_view(base, index);
+        return Err(failure);
+    }
+    Ok(Some(view_base))
 }
 
 /// As vistas de [start, end) preparadas, cada uma com uma referência. Sem

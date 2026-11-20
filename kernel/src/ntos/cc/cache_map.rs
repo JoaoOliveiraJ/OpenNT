@@ -22,6 +22,9 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
+use alloc::sync::Arc;
+
+use super::cache_section::{self, CacheSection};
 use super::layout::{self, scm_flags};
 use super::status::{CcResult, Failure};
 use super::{flush, vacb};
@@ -99,6 +102,8 @@ pub struct MapState {
     pub write_queued: bool,
     /// O último CcUninitializeCacheMap deixou o mapa para o lazy writer apagar.
     pub lazy_delete: bool,
+    /// A seção do cache (`cache_section`); sem ela, vistas de páginas próprias.
+    pub section: Option<Arc<CacheSection>>,
 }
 
 impl MapState {
@@ -150,9 +155,21 @@ pub struct CacheManager {
     pub mdls: BTreeMap<u64, (u64, u64)>,
     /// CcSetLoggedDataThreshold por log handle.
     pub logged_thresholds: BTreeMap<u64, u32>,
+    /// Purgas da seção do cache decididas com o lock preso, feitas depois de
+    /// soltá-lo (`flush::run_pending_purges`).
+    pub pending_purges: Vec<PendingPurge>,
 }
 
-pub static CACHE: SpinLock<CacheManager> = SpinLock::new(CacheManager { maps: BTreeMap::new(), view_count: 0, tick: 0, deferred: Vec::new(), mdls: BTreeMap::new(), logged_thresholds: BTreeMap::new() });
+/// Um MmPurgeSection a fazer: [start, end) sem as páginas que o Cc
+/// conservou (sujas, com DO_NOT_PURGE_DIRTY_PAGES).
+pub struct PendingPurge {
+    pub section: Arc<CacheSection>,
+    pub start: u64,
+    pub end: u64,
+    pub kept: Vec<u64>,
+}
+
+pub static CACHE: SpinLock<CacheManager> = SpinLock::new(CacheManager { maps: BTreeMap::new(), view_count: 0, tick: 0, deferred: Vec::new(), mdls: BTreeMap::new(), logged_thresholds: BTreeMap::new(), pending_purges: Vec::new() });
 
 /// O FILE_OBJECT que o file system passou ao Cc.
 pub fn file_object(address: u64) -> &'static FileObject {
@@ -296,6 +313,10 @@ pub fn initialize_cache_map(file: u64, sizes: u64, pin_access: bool, callbacks: 
     let (allocation, file_size, valid_data_length) = read_file_sizes(sizes);
     let section_size = round_up(allocation, layout::VIEW_SIZE);
     let shared = &pointers_at(pointers).shared_cache_map;
+    // A seção do cache nasce antes do mapa, fora do lock (CcCreateSectionForCache
+    // -> MmCreateSection com o FILE_OBJECT); quem perde a corrida a solta.
+    let existing = shared.get();
+    let mut fresh_section = if existing != 0 && CACHE.lock().maps.contains_key(&existing) { None } else { cache_section::create(file, pointers, file_size) };
     let created = {
         let mut cache = CACHE.lock();
         let existing = shared.get();
@@ -323,11 +344,18 @@ pub fn initialize_cache_map(file: u64, sizes: u64, pin_access: bool, callbacks: 
                 delete_pending: false,
                 write_queued: false,
                 lazy_delete: false,
+                section: fresh_section.take(),
             });
+            if let Some(section) = cache.maps.get(&base).and_then(|map| map.section.as_ref()) {
+                native_map(base).section.set(section.pointer());
+            }
             shared.set(base);
             Some(base)
         }
     };
+    if let Some(unused) = fresh_section {
+        cache_section::release(&unused);
+    }
     // O mapa referencia o FILE_OBJECT da paginação (como a control area do NT).
     if let Some(base) = created {
         let referenced = matches!(file_objects::reference(file), Ok(Some(_)));
@@ -391,6 +419,7 @@ pub struct Deleted {
     referenced: bool,
     events: Vec<u64>,
     views: Vec<View>,
+    section: Option<Arc<CacheSection>>,
 }
 
 /// O KEVENT de um CACHE_UNINITIALIZE_EVENT do file system.
@@ -404,6 +433,10 @@ impl Deleted {
     /// referência do FILE_OBJECT.
     pub fn finish(self) {
         vacb::free_views(self.views);
+        // A seção do cache sai depois das vistas dela.
+        if let Some(section) = &self.section {
+            cache_section::release(section);
+        }
         for event in self.events {
             signal_uninitialize_event(event);
         }
@@ -437,7 +470,7 @@ pub fn delete_if_idle(cache: &mut CacheManager, base: u64) -> Option<Deleted> {
     }
     cache.mdls.retain(|_, &mut (owner, _)| owner != base);
     guest::free_bytes(base);
-    Some(Deleted { file: map.file_object, referenced: map.referenced, events: map.events, views })
+    Some(Deleted { file: map.file_object, referenced: map.referenced, events: map.events, views, section: map.section })
 }
 
 /// O último FILE_OBJECT saiu do mapa (OpenCount 0): como no
@@ -517,6 +550,7 @@ pub fn uninitialize_cache_map(file: u64, truncate_size: u64, event: u64) -> CcRe
                 map.events.push(event);
             }
             drop(cache);
+            flush::run_pending_purges();
             if signal_now {
                 signal_uninitialize_event(event);
             }
@@ -527,10 +561,12 @@ pub fn uninitialize_cache_map(file: u64, truncate_size: u64, event: u64) -> CcRe
         }
         if defer_to_lazy_writer(map, event != 0) {
             drop(cache);
+            flush::run_pending_purges();
             super::lazy_writer::request_other_work(event != 0);
             return Ok(false);
         }
     }
+    flush::run_pending_purges();
     let deleted = {
         let mut cache = CACHE.lock();
         if cache.maps.get(&base).is_some_and(|map| map.open_count != 0) {
@@ -572,6 +608,8 @@ pub fn set_file_sizes(file: u64, sizes: u64) -> CcResult<u32> {
         map.file_size = file_size;
         publish(map);
     }
+    drop(cache);
+    flush::run_pending_purges();
     Ok(status)
 }
 
@@ -696,7 +734,7 @@ pub fn change_backing_file_object(current: u64, new: u64) -> Result<u32, KernelE
         let mut cache = CACHE.lock();
         match cache.maps.get_mut(&base) {
             Some(map) if current == 0 || map.file_object == current => {
-                let previous = (map.file_object, map.referenced);
+                let previous = (map.file_object, map.referenced, map.section.clone());
                 map.native().file_object_fast_ref.object.set(new & !0xF);
                 map.file_object = new;
                 map.referenced = referenced_new;
@@ -705,6 +743,11 @@ pub fn change_backing_file_object(current: u64, new: u64) -> Result<u32, KernelE
             _ => None,
         }
     };
+    // A seção do cache pagina pelo novo FILE_OBJECT também.
+    if let Some((_, _, Some(section))) = &released {
+        cache_section::change_file(section, new);
+    }
+    let released = released.map(|(old, referenced, _)| (old, referenced));
     match released {
         Some((old, true)) => {
             let _ = file_objects::dereference(old);
