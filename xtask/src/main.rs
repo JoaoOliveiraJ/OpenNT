@@ -41,8 +41,8 @@
 //! abre sozinho), `--desligar-contas-embutidas` (com `--initial-process=smss`: o winlogon
 //! desabilita no primeiro boot o Administrador e o Convidado internos, como o modelo de
 //! segurança do Setup; o gancho só entra nas execuções que chegam à tela de credenciais: o
-//! `run` do smss, o `--conta-de-teste` e esta opção, e não nos testes que param na tela de
-//! bloqueio).
+//! `run` do smss, o `--conta-de-teste`, o test-boot com `--send`, `--dismiss` ou `--mouse` e
+//! esta opção, e não nos testes que param na tela de bloqueio).
 //! O kernel dos builds comuns leva só as tabelas de linha do DWARF; o `debug` compila o perfil
 //! `depuracao`, com o DWARF completo (as variáveis locais dos depuradores gráficos).
 //! Fora `--release` e `--windows-dir`, elas não recompilam o kernel: vão no bloco de opções de
@@ -146,8 +146,9 @@ opcoes de build:   --release --build-dir=DIR --user-program=shell
                    a conta local Usuario, sem senha, no grupo Administradores)
                    --desligar-contas-embutidas (com --initial-process=smss: o winlogon desabilita
                    no primeiro boot o Administrador e o Convidado, como numa instalacao nova;
-                   vale sozinho no run do smss e com --conta-de-teste; os testes que param na
-                   tela de bloqueio ficam sem ele, sem o cmd.exe e o net.exe do primeiro boot)
+                   vale sozinho no run do smss, com --conta-de-teste e no test-boot com --send,
+                   --dismiss ou --mouse; os testes que param na tela de bloqueio ficam sem ele,
+                   sem o cmd.exe e o net.exe do primeiro boot)
 opcoes de maquina: --accel=auto|tcg|whpx (test-boot: auto = whpx quando a maquina tem; run e debug: tcg)
                    --memory-mb=N --smp=N --kd-port=N --monitor-port=N
                    --ata-fault=read (o volume de dados atras do blkdebug do QEMU: uma leitura do
@@ -422,9 +423,10 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
         return Err("--desligar-contas-embutidas exige --initial-process=smss (o gancho e do winlogon)".into());
     }
     // O `run` do boot do smss é a execução interativa que chega à tela de
-    // credenciais: as contas embutidas saem desabilitadas, como numa
-    // instalação nova.
-    if parsed.command == "run" && parsed.build.initial_process == "smss" {
+    // credenciais, e o test-boot com entrada (`--send`, `--dismiss`,
+    // `--mouse`) pode tirar a tela de bloqueio: nos dois, as contas
+    // embutidas saem desabilitadas, como numa instalação nova.
+    if (parsed.command == "run" || !parsed.inputs.is_empty()) && parsed.build.initial_process == "smss" {
         parsed.build.builtin_accounts_off = true;
     }
     if parsed.build.console_process && parsed.build.initial_process == "smss" {
