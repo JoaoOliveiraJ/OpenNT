@@ -318,6 +318,19 @@ pub fn security(pointer: u64) -> Option<SecurityPolicy> {
     BODIES.lock().get(&pointer).map(|body| body.security.clone())
 }
 
+/// O censo dos corpos vivos (o diagnóstico do `--heap-census`): por tipo,
+/// quantos, quantos sem handle e as referências somadas.
+pub fn census() -> alloc::vec::Vec<(String, u32, u32, u32)> {
+    let mut groups: BTreeMap<String, (u32, u32, u32)> = BTreeMap::new();
+    for body in BODIES.lock().values() {
+        let group = groups.entry(body.kind.clone()).or_default();
+        group.0 += 1;
+        group.1 += (body.handles == 0) as u32;
+        group.2 += body.refs;
+    }
+    groups.into_iter().map(|(kind, (count, unhandled, refs))| (kind, count, unhandled, refs)).collect()
+}
+
 /// (tipo do objeto, referências, handles) de um corpo vivo.
 pub fn get(pointer: u64) -> Option<(String, u32, u32)> {
     BODIES.lock().get(&pointer).map(|body| (body.kind.clone(), body.refs, body.handles))

@@ -1049,6 +1049,20 @@ pub fn thread_record(pointer: u64) -> Option<ThreadRecord> {
     STATE.lock().threads.get(&pointer).cloned()
 }
 
+/// O censo das ETHREADs registradas (o diagnóstico do `--heap-census`):
+/// quantas, quantas o dono já soltou e seguem referenciadas, e quantas já
+/// saíram.
+pub fn thread_census() -> (u32, u32, u32) {
+    let state = STATE.lock();
+    let mut counts = (0, 0, 0);
+    for record in state.threads.values() {
+        counts.0 += 1;
+        counts.1 += record.owner_released as u32;
+        counts.2 += record.exiting as u32;
+    }
+    counts
+}
+
 /// Troca o descritor de uma thread viva (o SetSecurityDescriptor do tipo
 /// Thread); `false` sem a thread.
 pub fn set_thread_security(pointer: u64, security: SecurityPolicy) -> bool {

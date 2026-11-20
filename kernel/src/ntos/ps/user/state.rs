@@ -866,6 +866,16 @@ pub fn user_handle_values() -> alloc::vec::Vec<u32> {
     process_state::current().map(|table| table.handles.lock().entries.keys().copied().collect()).unwrap_or_default()
 }
 
+/// Os handles da tabela de `table` por tipo (o diagnóstico do
+/// `--heap-census`).
+pub fn user_handle_census(table: &ProcessState) -> BTreeMap<&'static str, u32> {
+    let mut kinds = BTreeMap::new();
+    for entry in table.handles.lock().entries.values() {
+        *kinds.entry(entry.kind()).or_insert(0) += 1;
+    }
+    kinds
+}
+
 /// Os handles de usuário de todos os processos (a contagem de handles de um
 /// objeto é global, como o HandleCount do OBJECT_HEADER).
 pub fn all_user_handles() -> alloc::vec::Vec<Arc<UserHandle>> {

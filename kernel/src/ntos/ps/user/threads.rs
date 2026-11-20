@@ -2623,7 +2623,67 @@ fn terminate_thread(thread: &Arc<UserThread>, status: u32) -> Result<(), KernelE
         terminated?;
     }
     crate::debug_print!("[thread] exit tid={} status={:#x}", thread.thread_id, status);
+    object_census_on_exit(process_pointer);
     Ok(())
+}
+
+/// Threads de usuário que já saíram, para o censo de objetos.
+static EXITED_THREADS: AtomicU32 = AtomicU32::new(0);
+
+/// O censo de objetos do `--heap-census`, a cada 256 threads de usuário que
+/// saem: o heap do kernel, as threads do índice (mortas, mortas com handles
+/// abertos e os handles delas, mortas com regiões), as ETHREADs registradas
+/// (soltas pelo dono e ainda referenciadas, já saídas), os corpos de
+/// despacho por tipo (quantos/sem handle/referências), os pacotes de espera
+/// por fase e os handles do processo da thread por tipo.
+fn object_census_on_exit(process_pointer: u64) {
+    if !crate::ntos::init::boot_config::heap_census() || EXITED_THREADS.fetch_add(1, Ordering::Relaxed) % 256 != 255 {
+        return;
+    }
+    let (mut total, mut dead, mut dead_with_handles, mut open_handles, mut dead_with_regions) = (0u32, 0u32, 0u32, 0u32, 0u32);
+    for thread in all() {
+        thread.with(|thread| {
+            total += 1;
+            if thread.dead {
+                dead += 1;
+                dead_with_handles += (thread.handles != 0) as u32;
+                open_handles += thread.handles;
+                dead_with_regions += thread.regions.is_some() as u32;
+            }
+        });
+    }
+    let (records, released, exiting) = process::thread_census();
+    let (_, heap_used) = crate::hal::kmalloc::info();
+    let mut bodies = String::new();
+    for (kind, count, unhandled, refs) in crate::ntos::ob::objects::dispatcher::census() {
+        bodies.push_str(&alloc::format!(" {kind}={count}/{unhandled}/{refs}"));
+    }
+    let packets = crate::ntos::ob::objects::work::packet_census();
+    let mut handles = String::new();
+    if let Some(table) = process_state::get(process_pointer) {
+        for (kind, count) in state::user_handle_census(&table) {
+            handles.push_str(&alloc::format!(" {kind}={count}"));
+        }
+    }
+    crate::debug_print!(
+        "[heap-census] objetos apos {} saidas: heap {} KB; threads {} (mortas {}, com handles {} [{} handles], com regioes {}); ETHREADs {} (soltas {}, saidas {}); corpos{}; pacotes ociosos/associados/enfileirados/fechados {}/{}/{}/{}; handles do processo{}",
+        EXITED_THREADS.load(Ordering::Relaxed),
+        heap_used / 1024,
+        total,
+        dead,
+        dead_with_handles,
+        open_handles,
+        dead_with_regions,
+        records,
+        released,
+        exiting,
+        bodies,
+        packets[0],
+        packets[1],
+        packets[2],
+        packets[3],
+        handles
+    );
 }
 
 /// A thread termina como no 19041, rodando o próprio PspExitThread no
@@ -2752,6 +2812,7 @@ fn exit_current(thread: &Arc<UserThread>) -> ! {
     thread.with(|thread| thread.dead = true);
     dispatcher::set_event(pointer);
     crate::debug_print!("[thread] exit tid={} status={:#x} (no proprio contexto)", thread.thread_id, status);
+    object_census_on_exit(process_pointer);
     end_process_from_last_thread(thread, process_pointer, status);
     crate::hal::amd64::usermode::end_thread_interval(status)
 }

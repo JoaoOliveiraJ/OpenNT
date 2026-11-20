@@ -243,6 +243,17 @@ pub fn packet_of(pointer: u64) -> Option<Arc<WaitPacket>> {
     PACKETS.lock().get(&pointer).cloned()
 }
 
+/// O censo dos pacotes vivos (o diagnóstico do `--heap-census`): ociosos,
+/// associados, enfileirados e já sem handle.
+pub fn packet_census() -> [u32; 4] {
+    let mut counts = [0u32; 4];
+    for packet in PACKETS.lock().values() {
+        counts[(packet.phase() as usize).min(2)] += 1;
+        counts[3] += packet.closed() as u32;
+    }
+    counts
+}
+
 fn status_error(status: u32) -> KernelError {
     KernelError::with_status("work object status", status)
 }
