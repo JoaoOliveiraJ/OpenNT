@@ -28,7 +28,8 @@
 //! `--initial-process=smss`, `--storage=real|nvme`,
 //! `--display=basic`, `--windows-dir=DIR`, `--pnp-root=acpi|internal` (a raiz da árvore de
 //! dispositivos: o acpi.sys real, o padrão, ou o barramento PCI interno), `--kd=com2` (o
-//! depurador do kernel na COM2), `--shutdown-test=poweroff|reboot` (o teste do desligamento),
+//! depurador do kernel na COM2), `--shutdown-test=poweroff|reboot|cadeia` (o teste do
+//! desligamento; `cadeia`: o desligamento da cadeia real pelo shutdown.exe no logon),
 //! `--usb` (também opção de máquina: a controladora xHCI com teclado e tablet USB),
 //! `--net` (também opção de máquina: a placa de rede e1000 com a rede de modo usuário do QEMU),
 //! `--tpm` (também opção de máquina: um TPM 2.0 tpm-crb sobre o simulador de TPM, em
@@ -138,6 +139,8 @@ opcoes de build:   --release --build-dir=DIR --user-program=shell
                    --tpm (TPM 2.0 tpm-crb sobre o simulador de TPM; run e test-boot)
                    --kd=com2 (depurador do kernel na COM2)
                    --shutdown-test=poweroff|reboot (com --start-driver=ntfs: grava e desliga)
+                   --shutdown-test=cadeia (com --conta-de-teste: o logon grava e desliga pelo
+                   shutdown.exe; o boot seguinte confere o que voltou do disco)
                    --memory-pressure (com --initial-process=smss: teste de pressao de memoria
                    sobre o arquivo de paginacao)
                    --console-process (boot comum: o cmd.exe real com um console sem janela;
@@ -274,6 +277,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             console_process: false,
             test_account: false,
             builtin_accounts_off: false,
+            shutdown_chain: false,
         },
         // O test-boot roda no WHPX quando a máquina o tem (`auto`); o `run`
         // e o `debug` ficam no TCG, que o rastro de instruções do depurador
@@ -432,8 +436,13 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
     if parsed.build.console_process && parsed.build.initial_process == "smss" {
         return Err("--console-process e do boot comum (sem --initial-process=smss)".into());
     }
-    if !matches!(parsed.build.shutdown_test.as_str(), "" | "poweroff" | "reboot") {
-        return Err(format!("--shutdown-test aceita poweroff ou reboot ({} recebido)", parsed.build.shutdown_test));
+    if !matches!(parsed.build.shutdown_test.as_str(), "" | "poweroff" | "reboot" | "cadeia") {
+        return Err(format!("--shutdown-test aceita poweroff, reboot ou cadeia ({} recebido)", parsed.build.shutdown_test));
+    }
+    // O desligamento da cadeia sai do logon da conta de teste.
+    parsed.build.shutdown_chain = parsed.build.shutdown_test == "cadeia";
+    if parsed.build.shutdown_chain && !parsed.build.test_account {
+        return Err("--shutdown-test=cadeia exige --conta-de-teste (o comando roda no logon dela)".into());
     }
     if (parsed.expect_poweroff || parsed.power_cycles > 0 || parsed.allow_reboot) && parsed.command != "test-boot" {
         return Err("--expect-poweroff, --power-cycles e --allow-reboot sao opcoes do test-boot".into());

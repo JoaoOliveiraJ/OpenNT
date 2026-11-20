@@ -62,22 +62,33 @@ pub struct BuiltinNames {
     pub guest: String,
 }
 
+/// O arquivo que o gancho do `--shutdown-test=cadeia` grava antes de
+/// desligar (o kernel o confere no boot seguinte, `test/shutdown.rs`).
+pub const CHAIN_FILE: &str = "C:\\OPENNT-CADEIA.TXT";
+
 /// O `CmdLine` do gancho: cria a conta, põe no grupo Administradores,
 /// desabilita as contas embutidas, põe a máquina no grupo de trabalho
 /// ([`builtin_accounts_command`]: o secinit.exe) e volta o gancho, nessa
-/// ordem (com `&` cada parte roda mesmo se a anterior falhar).
-pub fn setup_command(names: &BuiltinNames) -> Result<String, String> {
+/// ordem (com `&` cada parte roda mesmo se a anterior falhar). Com
+/// `shutdown` (o `--shutdown-test=cadeia`), depois de voltar o gancho grava
+/// [`CHAIN_FILE`] e desliga a máquina pelo shutdown.exe (`/s /t 0`: o
+/// InitiateShutdownW, pelo RPC do wininit). As duas contas embutidas ficam
+/// habilitadas nesse caso: o limite do `CmdLine` não cabe as duas partes, e
+/// o logon automático da conta única não entra no teste.
+pub fn setup_command(names: &BuiltinNames, shutdown: bool) -> Result<String, String> {
     let administrators = argument(&names.administrators)?;
     let administrator = argument(&names.administrator)?;
     let guest = argument(&names.guest)?;
+    let builtins = if shutdown { String::new() } else { format!("&net user {administrator} /active:no&net user {guest} /active:no") };
+    let finish = if shutdown { format!("&echo cadeia>{CHAIN_FILE}&shutdown /s /t 0") } else { String::new() };
     let command = format!(
         "cmd /d /c net user {ACCOUNT_NAME} /add\
          &net localgroup {administrators} {ACCOUNT_NAME} /add\
-         &net user {administrator} /active:no\
-         &net user {guest} /active:no\
+         {builtins}\
          &secinit\
          &reg add HKLM\\SYSTEM\\Setup /v SetupType /t REG_DWORD /d 0 /f\
-         &reg add HKLM\\SYSTEM\\Setup /v CmdLine /d \"\" /f"
+         &reg add HKLM\\SYSTEM\\Setup /v CmdLine /d \"\" /f\
+         {finish}"
     );
     let length = command.encode_utf16().count();
     if length > COMMAND_LINE_MAX {
@@ -229,7 +240,7 @@ mod tests {
     /// do buffer do winlogon e sem senha nenhuma.
     #[test]
     fn the_command_creates_the_account_and_resets_the_hook() {
-        let command = setup_command(&portuguese()).unwrap();
+        let command = setup_command(&portuguese(), false).unwrap();
         assert_eq!(
             command,
             "cmd /d /c net user Usuario /add&net localgroup Administradores Usuario /add&net user Administrador /active:no&net user Convidado /active:no&secinit&reg add HKLM\\SYSTEM\\Setup /v SetupType /t REG_DWORD /d 0 /f&reg add HKLM\\SYSTEM\\Setup /v CmdLine /d \"\" /f"
@@ -247,19 +258,31 @@ mod tests {
         );
     }
 
+    /// O gancho do `--shutdown-test=cadeia`: o mesmo começo com o secinit, o
+    /// gancho desfeito antes do arquivo e do shutdown.exe, dentro do buffer.
+    #[test]
+    fn the_chain_command_resets_the_hook_before_shutting_down() {
+        let command = setup_command(&portuguese(), true).unwrap();
+        assert_eq!(
+            command,
+            "cmd /d /c net user Usuario /add&net localgroup Administradores Usuario /add&secinit&reg add HKLM\\SYSTEM\\Setup /v SetupType /t REG_DWORD /d 0 /f&reg add HKLM\\SYSTEM\\Setup /v CmdLine /d \"\" /f&echo cadeia>C:\\OPENNT-CADEIA.TXT&shutdown /s /t 0"
+        );
+        assert!(command.encode_utf16().count() <= COMMAND_LINE_MAX);
+    }
+
     /// Nome com espaço vai entre aspas; aspas e `%` não passam; um comando
     /// acima de 259 caracteres é recusado.
     #[test]
     fn names_are_quoted_or_refused() {
         let mut names = portuguese();
         names.administrators = "Admin Group".into();
-        assert!(setup_command(&names).unwrap().contains("net localgroup \"Admin Group\" Usuario /add"));
+        assert!(setup_command(&names, false).unwrap().contains("net localgroup \"Admin Group\" Usuario /add"));
         names.administrators = "A\"B".into();
-        assert!(setup_command(&names).is_err());
+        assert!(setup_command(&names, false).is_err());
         names.administrators = "%PATH%".into();
-        assert!(setup_command(&names).is_err());
+        assert!(setup_command(&names, false).is_err());
         names.administrators = "X".repeat(40);
-        assert!(setup_command(&names).is_err());
+        assert!(setup_command(&names, false).is_err());
     }
 
     /// O gancho são só os dois valores, com os tipos que o winlogon lê.
@@ -305,6 +328,7 @@ mod tests {
     fn this_machine_gives_the_names_from_samsrv() {
         let names = super::builtin_names().unwrap();
         assert!(!names.administrators.is_empty() && !names.administrator.is_empty() && !names.guest.is_empty());
-        setup_command(&names).unwrap();
+        setup_command(&names, false).unwrap();
+        setup_command(&names, true).unwrap();
     }
 }

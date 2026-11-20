@@ -96,8 +96,14 @@ pub struct BuildOptions {
     /// depurador).
     pub kd: String,
     /// `--shutdown-test=poweroff|reboot`: o teste do desligamento depois do
-    /// `--start-driver=ntfs` (vazio = sem o teste).
+    /// `--start-driver=ntfs` (vazio = sem o teste); `cadeia`: o desligamento
+    /// da cadeia real a partir do logon (com `shutdown_chain`).
     pub shutdown_test: String,
+    /// `--shutdown-test=cadeia`: o gancho de primeiro boot do
+    /// `--conta-de-teste` termina gravando um arquivo e desligando pelo
+    /// shutdown.exe (`test_account::setup_command`). Muda a hive SYSTEM, não
+    /// o kernel.
+    pub shutdown_chain: bool,
     /// `--usb`: a máquina ganha a controladora xHCI com teclado e tablet USB
     /// e o PnP sobe a pilha USB 3 e HID do Windows sobre ela.
     pub usb: bool,
@@ -262,6 +268,7 @@ impl BuildOptions {
         options.console_process = false;
         options.test_account = false;
         options.builtin_accounts_off = false;
+        options.shutdown_chain = false;
         format!("{options:?}")
     }
 }
@@ -437,9 +444,10 @@ pub fn build(options: &BuildOptions) -> Result<BuildOutput, String> {
     // O gancho de primeiro boot do `--conta-de-teste`, com os nomes do
     // samsrv.dll.mui do idioma do convidado.
     // Sem a conta, o `--desligar-contas-embutidas` só desabilita as contas
-    // embutidas, com o mesmo gancho.
+    // embutidas, com o mesmo gancho. Com o `--shutdown-test=cadeia`, o
+    // gancho da conta termina pelo shutdown.exe.
     let setup_command = if options.test_account {
-        Some(crate::test_account::setup_command(&crate::test_account::builtin_names()?)?)
+        Some(crate::test_account::setup_command(&crate::test_account::builtin_names()?, options.shutdown_chain)?)
     } else if options.builtin_accounts_off && options.initial_process == "smss" {
         Some(crate::test_account::builtin_accounts_command(&crate::test_account::builtin_names()?)?)
     } else {
@@ -533,6 +541,7 @@ mod tests {
             console_process: false,
             test_account: false,
             builtin_accounts_off: false,
+            shutdown_chain: false,
         }
     }
 
@@ -615,6 +624,13 @@ mod tests {
         assert_ne!(smss.image_key(), account.image_key());
         assert_eq!(base.kernel_key(), account.kernel_key());
         assert_eq!(smss.load_options().unwrap(), account.load_options().unwrap());
+        // O desligamento da cadeia muda a hive SYSTEM (outra imagem), não o
+        // kernel.
+        let mut chain = account.clone();
+        chain.shutdown_test = "cadeia".into();
+        chain.shutdown_chain = true;
+        assert_ne!(account.image_key(), chain.image_key());
+        assert_eq!(base.kernel_key(), chain.kernel_key());
         let mut release = options();
         release.release = true;
         assert_ne!(base.kernel_key(), release.kernel_key());
