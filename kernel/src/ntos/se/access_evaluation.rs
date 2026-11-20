@@ -29,7 +29,8 @@
 //! 4. o dono (o usuário que não é só de negação, ou um grupo habilitado;
 //!    num token restrito também um SID restrito) recebe READ_CONTROL e
 //!    WRITE_DAC já concedidos, a menos que a DACL tenha uma ACE de OWNER
-//!    RIGHTS (S-1-3-4), que então vale para ele como as outras;
+//!    RIGHTS (S-1-3-4), que então vale para ele como as outras; num token
+//!    LowBox esses direitos ainda precisam vir das ACEs de pacote no passo 5;
 //! 5. o SepAccessCheck: ACCESS_SYSTEM_SECURITY só com SeSecurityPrivilege
 //!    (senão STATUS_PRIVILEGE_NOT_HELD); sem DACL (ausente ou nula) tudo é
 //!    concedido (GenericAll com MAXIMUM_ALLOWED), exceto a um token LowBox;
@@ -476,7 +477,11 @@ fn finish(granted: u32) -> Result<u32, u32> {
 }
 
 /// SepAccessCheck: privilégios, DACL, segunda passagem restrita e de pacote.
-fn sep_access_check(descriptor: &OwnedDescriptor, subject: &Subject, desired: u32, previous: u32, mapping: &[u32; 4], is_owner: bool) -> Result<u32, u32> {
+/// `owner_implied` é o READ_CONTROL/WRITE_DAC que o dono já recebeu antes
+/// (o ebx do SepCommonAccessCheckExWithAdminlessChecks, 0x373f3c, que vai ao
+/// SepAccessCheck na estrutura do LowBox): um token LowBox também precisa
+/// deles nas ACEs de pacote.
+fn sep_access_check(descriptor: &OwnedDescriptor, subject: &Subject, desired: u32, previous: u32, mapping: &[u32; 4], is_owner: bool, owner_implied: u32) -> Result<u32, u32> {
     // O LowBox confere o pedido de entrada inteiro contra as ACEs de pacote
     // (o DesiredAccess original do SepAccessCheck, 0x2d0032).
     let requested = desired;
@@ -517,7 +522,9 @@ fn sep_access_check(descriptor: &OwnedDescriptor, subject: &Subject, desired: u3
         if subject.restricted() && desired & restriction != 0 && normal_access_check(dacl, subject, desired & restriction, true, is_owner) != 0 {
             return Err(STATUS_ACCESS_DENIED);
         }
-        if subject.lowbox() && requested & !package_granted(dacl, subject) != 0 {
+        // O caminho normal do LowBox (0x2d0042): o pedido e os direitos do
+        // dono precisam vir das ACEs de pacote e de capacidade.
+        if subject.lowbox() && (requested | owner_implied) & !package_granted(dacl, subject) != 0 {
             return Err(STATUS_ACCESS_DENIED);
         }
         return finish(previous | desired);
@@ -526,8 +533,12 @@ fn sep_access_check(descriptor: &OwnedDescriptor, subject: &Subject, desired: u3
     if subject.restricted() {
         granted &= maximum_access_check(dacl, subject, true, is_owner) | !restriction;
     }
+    // O MAXIMUM_ALLOWED do LowBox (0x2d0242): o concedido cortado pelas ACEs
+    // de pacote, e os direitos do dono saem do já concedido (voltam só se
+    // essas ACEs os dão).
     if subject.lowbox() {
         granted &= package_granted(dacl, subject);
+        previous &= !owner_implied;
     }
     if desired & !MAXIMUM_ALLOWED & !granted != 0 {
         return Err(STATUS_ACCESS_DENIED);
@@ -556,19 +567,23 @@ pub fn access_check(descriptor: Option<&OwnedDescriptor>, subject: &Subject, des
     }
     let (mut remaining, mut previous) = (desired, previous);
     let mut is_owner = false;
+    let mut owner_implied = 0;
     if remaining & (MAXIMUM_ALLOWED | WRITE_DAC | READ_CONTROL) != 0 && subject_is_owner(descriptor, subject) {
         is_owner = true;
         if !dacl_has_owner_rights(descriptor) {
             let implied = if remaining & MAXIMUM_ALLOWED != 0 { READ_CONTROL | WRITE_DAC } else { remaining & (READ_CONTROL | WRITE_DAC) };
             remaining &= !(READ_CONTROL | WRITE_DAC);
             previous |= implied;
+            owner_implied = implied;
             is_owner = false;
         }
     }
-    if remaining == 0 {
+    // Os direitos do dono cobrindo o pedido inteiro bastam, salvo num token
+    // LowBox, que ainda passa pelas ACEs de pacote (0x48af28).
+    if remaining == 0 && !(subject.lowbox() && owner_implied != 0) {
         return Ok(previous);
     }
-    let mut granted = sep_access_check(descriptor, subject, remaining, previous, mapping, is_owner)?;
+    let mut granted = sep_access_check(descriptor, subject, remaining, previous, mapping, is_owner, owner_implied)?;
     if desired & MAXIMUM_ALLOWED != 0 {
         if mandatory.policy != 0 && !mandatory.dominates && !lowbox_exempt {
             granted &= mandatory.mask;

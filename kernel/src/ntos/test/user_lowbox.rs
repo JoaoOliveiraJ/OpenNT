@@ -46,6 +46,7 @@ const FILE_ALL: u32 = 0x1F_01FF;
 const READ_EXECUTE: u32 = 0x12_00A9;
 const FILE_READ: u32 = 0x12_0089;
 const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
+const WRITE_DAC: u32 = 0x4_0000;
 const PACKAGE_PATH: &str = "\\Sessions\\0\\AppContainerNamedObjects\\S-1-15-2-1-2-3-4-5-6-7";
 
 /// SID com a autoridade e as subautoridades dadas.
@@ -80,7 +81,9 @@ fn acl(aces: &[Vec<u8>]) -> Vec<u8> {
 
 /// Descritor com a DACL dada e o rótulo Low com NO_WRITE_UP na SACL (o
 /// rótulo dos objetos de um AppContainer): a integridade deixa o token Low
-/// escrever, e o que concede ou recusa é o passe LowBox.
+/// escrever, e o que concede ou recusa é o passe LowBox. O dono são os
+/// Administradores, que o token LowBox (cópia do System) ainda tem: os
+/// direitos do dono também passam pelas ACEs de pacote.
 fn low_object(aces: &[Vec<u8>]) -> OwnedDescriptor {
     let label = ace(0x11, 1, &sid(16, &[0x1000]));
     OwnedDescriptor { control: 0x8014, owner: Some(sid(5, &[32, 544])), group: Some(sid(5, &[18])), dacl: Some(acl(aces)), sacl: Some(acl(&[label])) }
@@ -333,14 +336,14 @@ fn body(assert: Assert, test: &Harness) {
     let subject = tokens::with(pointer, Subject::from_token).unwrap_or_default();
     let check = |descriptor: &OwnedDescriptor, desired: u32| access_check(Some(descriptor), &subject, desired, 0, &FILE_MAPPING);
     let readable = low_object(&[ace(0, FILE_ALL, &everyone), ace(0, READ_EXECUTE, &all_packages)]);
-    let all_packages_ok = check(&readable, FILE_READ) == Ok(FILE_READ) && check(&readable, 2) == Err(0xC000_0022) && check(&readable, MAXIMUM_ALLOWED) == Ok(READ_EXECUTE);
+    let all_packages_ok = check(&readable, FILE_READ) == Ok(FILE_READ) && check(&readable, 2) == Err(0xC000_0022) && check(&readable, MAXIMUM_ALLOWED) == Ok(READ_EXECUTE) && check(&readable, WRITE_DAC) == Err(0xC000_0022);
     let denied = low_object(&[ace(0, FILE_ALL, &everyone), ace(1, FILE_ALL, &all_packages), ace(0, FILE_ALL, &package)]);
     let deny_ignored = check(&denied, 2) == Ok(2);
     let by_capability = check(&low_object(&[ace(0, FILE_ALL, &everyone), ace(0, FILE_READ, &internet)]), FILE_READ) == Ok(FILE_READ);
     let other_capability = check(&low_object(&[ace(0, FILE_ALL, &everyone), ace(0, FILE_READ, &sid(15, &[3, 99]))]), FILE_READ) == Err(0xC000_0022);
     let by_restricted = check(&low_object(&[ace(0, FILE_ALL, &everyone), ace(0, FILE_READ, &restricted_packages)]), FILE_READ) == Ok(FILE_READ);
     let not_lowbox = tokens::with(own_pointer, Subject::from_token).is_some_and(|own_subject| access_check(Some(&readable), &own_subject, 2, 0, &FILE_MAPPING) == Ok(2));
-    assert(all_packages_ok && deny_ignored, "lowbox: ALL APPLICATION PACKAGES concede so o que a ACE dele da (MAXIMUM_ALLOWED 0x1200A9), e a negacao para ele nao conta no passe LowBox");
+    assert(all_packages_ok && deny_ignored, "lowbox: ALL APPLICATION PACKAGES concede so o que a ACE dele da (MAXIMUM_ALLOWED 0x1200A9, sem o WRITE_DAC do dono), e a negacao para ele nao conta no passe LowBox");
     assert(by_capability && other_capability && by_restricted && not_lowbox, "lowbox: a capacidade do token e ALL RESTRICTED APPLICATION PACKAGES concedem, outra capacidade nao, e quem nao e LowBox nao passa pelo passe");
     // 8. TokenIntegrityLevel Medium desfaz o LowBox e larga o número.
     let medium = test.put(&sid(16, &[0x2000]));
