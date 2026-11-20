@@ -2704,6 +2704,16 @@ fn user_syscalls_core(assert: Assert) {
     let memory_topology = call("NtQuerySystemInformation", 138, buffer, 0x10, info) == 0xC000_0023 && guest::read32(info) == topology_size && call("NtQuerySystemInformation", 138, buffer, topology_size as u64, info) == 0 && guest::read64(buffer) == runs.len() as u64 && guest::read64(buffer + 0x18) == runs.first().map_or(0, |run| run.0 >> 12);
     let shadow_stack = call("NtQuerySystemInformation", 221, buffer, 4, info) == 0 && guest::read32(buffer) == 0 && guest::read32(info) == 4 && call("NtQuerySystemInformation", 221, buffer, 8, info) == 0xC000_0004;
     assert(dfss && energy && usage && memory_topology && shadow_stack, "usercore: DFSS desligado, estimador de energia, uso de memoria, topologia de memoria e CET");
+    // SystemPolicyInformation (o SLGetWindowsInformation do lsm no logon de
+    // um usuário): exatamente 0x20 bytes, com 0x20 no ReturnLength também na
+    // recusa, alinhamento 4, e a política sem o valor pedido.
+    guest::write32(info, 0);
+    let policy_short = call("NtQuerySystemInformation", 134, buffer, 0x1F, info) == 0xC000_0004 && guest::read32(info) == 0x20;
+    guest::write32(info, 0);
+    let policy_long = call("NtQuerySystemInformation", 134, buffer, 0x28, info) == 0xC000_0004 && guest::read32(info) == 0x20;
+    guest::write32(info, 0);
+    let policy_absent = call("NtQuerySystemInformation", 134, buffer, 0x20, info) == 0xC000_0034 && guest::read32(info) == 0x20 && call("NtQuerySystemInformation", 134, buffer + 2, 0x20, info) == 0x8000_0002;
+    assert(policy_short && policy_long && policy_absent, "usercore: SystemPolicyInformation confere 0x20 bytes e responde valor ausente");
     // SystemRecommendedSharedDataAlignment (o CoreMessaging): o
     // KeLargestCacheLine em pelo menos 4 bytes, alinhamento 4.
     guest::write32(info, 0);

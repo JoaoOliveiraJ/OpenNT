@@ -4485,7 +4485,10 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   WPBT), a SystemMemoryTopologyInformation (138), a
   SystemCodeIntegrityPolicyInformation (164, pelo callback de política da
   CI, `se/code_integrity.rs`), a SystemShadowStackInformation (221, sem
-  CET), as classes 210 e 211 do NtQuerySystemInformationEx sobre o
+  CET), a SystemPolicyInformation (134: exatamente 0x20 bytes, com 0x20 no
+  ReturnLength; desvio: sem o decodificador do SPCall, responde
+  STATUS_OBJECT_NAME_NOT_FOUND, que o slc e o lsm tratam como valor de
+  licença ausente e seguem com o padrão), as classes 210 e 211 do NtQuerySystemInformationEx sobre o
   armazém de features vazio (`cm/feature_configuration.rs`), a
   ThreadIoPriority (22) do NtQuery/SetInformationThread e o
   TokenLinkedToken (19), que sem sessão irmã devolve

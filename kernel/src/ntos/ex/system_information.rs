@@ -57,6 +57,9 @@ pub const SYSTEM_SHADOW_STACK_INFORMATION: u32 = 221;
 pub const SYSTEM_CPU_QUOTA_INFORMATION: u32 = 113;
 pub const SYSTEM_PLATFORM_BINARY_INFORMATION: u32 = 133;
 pub const SYSTEM_MEMORY_TOPOLOGY_INFORMATION: u32 = 138;
+/// SystemPolicyInformation (o SYSTEM_POLICY_INFORMATION de 0x20 bytes do
+/// SLGetWindowsInformation do slc e das cópias dele no lsm e no msv1_0).
+pub const SYSTEM_POLICY_INFORMATION: u32 = 134;
 /// SystemCodeIntegrityPolicyInformation e as classes de política de CI que
 /// dividem o ramo dela no ExpQuerySystemInformation (rva 0x6cc0f9).
 pub const SYSTEM_CODE_INTEGRITY_POLICY_CLASSES: [u32; 5] = [164, 172, 189, 190, 199];
@@ -82,6 +85,7 @@ const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
 /// - SystemCodeIntegrityPolicyInformation (164) e as classes do mesmo ramo:
 ///   o SeCodeIntegrityQueryPolicyInformation (`se/code_integrity`), sem
 ///   entrada pelo NtQuerySystemInformation.
+/// - SystemPolicyInformation (134, rva 0x6cc402): [`policy_information`].
 pub fn query_reported(class: u32, output: u64, length: u32, previous_mode: u8) -> Option<Result<(u32, Option<u32>), KernelError>> {
     let mut reported = 0u32;
     let status = match class {
@@ -93,10 +97,32 @@ pub fn query_reported(class: u32, output: u64, length: u32, previous_mode: u8) -
             platform_binary_information(output, length)
         }
         SYSTEM_MEMORY_TOPOLOGY_INFORMATION => crate::ntos::mm::memory_information::memory_topology_information(output, length, &mut reported),
+        SYSTEM_POLICY_INFORMATION => Ok(policy_information(length, &mut reported)),
         _ if SYSTEM_CODE_INTEGRITY_POLICY_CLASSES.contains(&class) => crate::ntos::se::code_integrity::query_policy_information(class, 0, 0, output, length, &mut reported),
         _ => return None,
     };
     Some(status.map(|status| (status, Some(reported))))
+}
+
+/// SystemPolicyInformation (ExpQuerySystemInformation 19041, rva 0x6cc402):
+/// a célula do tamanho recebe 0x20 antes de tudo e o comprimento tem de ser
+/// exatamente 0x20 (senão STATUS_INFO_LENGTH_MISMATCH). O 19041 decodifica
+/// então o pedido do SYSTEM_POLICY_INFORMATION (rva 0x6c8260, que o captura
+/// e o passa ao despachante do SPCall, rva 0x5fe2ac) e responde com o valor
+/// da política de licença. O OpenNT não tem esse decodificador e responde
+/// que a política não tem o valor pedido (STATUS_OBJECT_NAME_NOT_FOUND).
+/// Desvio: o cliente do slc (e a cópia dele no lsm, rva 0x4ab79) traduz esse
+/// status para SL_E_VALUE_NOT_FOUND, o resultado comum de um valor ausente,
+/// e cada chamador segue com o padrão do valor (o CSLQuery::Initialize do
+/// lsm, que o RpcGetRequestForWinlogon chama no logon de um usuário).
+fn policy_information(length: u32, reported: &mut u32) -> u32 {
+    const SIZE: u32 = 0x20;
+    const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
+    *reported = SIZE;
+    if length != SIZE {
+        return STATUS_INFO_LENGTH_MISMATCH;
+    }
+    STATUS_OBJECT_NAME_NOT_FOUND
 }
 
 /// ExpGetSystemPlatformBinary (ntoskrnl 19041, rva 0x7cfd64): o

@@ -419,7 +419,7 @@ fn query_system_information(class: u32, buffer: u64, length: u64, returned: u64)
         // As classes de tamanho fixo e as da célula de tamanho
         // (`ex/system_information`): o ProbeForWrite delas exige alinhamento 4.
         use crate::ntos::ex::system_information as information;
-        let reported_class = matches!(class, information::SYSTEM_CPU_QUOTA_INFORMATION | information::SYSTEM_PLATFORM_BINARY_INFORMATION | information::SYSTEM_MEMORY_TOPOLOGY_INFORMATION) || information::SYSTEM_CODE_INTEGRITY_POLICY_CLASSES.contains(&class);
+        let reported_class = matches!(class, information::SYSTEM_CPU_QUOTA_INFORMATION | information::SYSTEM_PLATFORM_BINARY_INFORMATION | information::SYSTEM_MEMORY_TOPOLOGY_INFORMATION | information::SYSTEM_POLICY_INFORMATION) || information::SYSTEM_CODE_INTEGRITY_POLICY_CLASSES.contains(&class);
         if (information::is_fixed_class(class) || reported_class) && length != 0 && buffer & 3 != 0 {
             return Ok(0x8000_0002);
         }
