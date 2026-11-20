@@ -124,6 +124,12 @@ fn take_step(context: u64) -> Option<(u64, bool)> {
     Some(found)
 }
 
+/// O depurador armou um passo para a thread do CONTEXT `context`: a volta
+/// dela ao anel 3 passa pelo CONTEXT (o TF do passo).
+pub fn step_armed(context: u64) -> bool {
+    context != 0 && STEPS.iter().any(|slot| slot.context.load(Ordering::Acquire) == context)
+}
+
 /// Passos pendentes agora (o `monitor uex`).
 fn pending_steps() -> usize {
     STEPS.iter().filter(|slot| slot.context.load(Ordering::Acquire) != 0).count()

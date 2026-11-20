@@ -43,6 +43,9 @@ pub const TRACE_RPC: &str = "TRACERPC";
 /// O censo do heap do kernel (`hal::heap_census`) vai para a serial cada
 /// vez que o uso passa um múltiplo novo de 4 MB.
 pub const HEAP_CENSUS: &str = "HEAPCENSUS";
+/// Toda saída de serviço passa pelo despachante, sem a volta direta ao anel
+/// 3 (a comparação e a bissecção da volta direta).
+pub const SLOW_SERVICE_EXIT: &str = "SLOWSERVICEEXIT";
 /// O texto do console também vai para a serial.
 pub const CONSOLE_MIRROR: &str = "CONSOLEMIRROR";
 /// `smss`: o primeiro processo de usuário é o smss.exe real.

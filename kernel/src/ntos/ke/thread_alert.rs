@@ -51,6 +51,7 @@ fn signal(thread: u64) -> bool {
 
 /// KeAlertThread: devolve o byte anterior; alertas repetidos não contam.
 pub fn alert(thread: u64, mode: u8) -> Result<u8, KernelError> {
+    super::dispatcher::note_wake();
     let mode_index = mode as i8 as i64;
     let mut delivered = false;
     let target = kthread(thread);

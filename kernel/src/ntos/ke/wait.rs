@@ -421,6 +421,7 @@ pub fn set_signal_observer(observer: fn(u64)) {
 /// espera nele: as threads de kernel registradas e, já fora do lock do
 /// despachante, os pacotes de espera associados ao objeto.
 pub fn signal(object: u64) {
+    dispatcher::note_wake();
     lock().wait_test(object);
     let observer = *SIGNAL_OBSERVER.lock();
     if let Some(observer) = observer {
@@ -682,6 +683,7 @@ fn cancel(thread: u64) {
 /// conclusão, uma mensagem ALPC que chegou): ela volta à fila e sonda de
 /// novo. Uma espera de objeto não é tocada.
 pub fn wake(thread: u64) -> bool {
+    dispatcher::note_wake();
     let mut lock = lock();
     if !lock.table().waits.get(&thread).is_some_and(|wait| wait.explicit) {
         return false;

@@ -89,6 +89,8 @@ const OPEN_STATUS: u8 = 0x1C;
 const VICTIM_AT_KILL: u8 = 0x20;
 const VICTIM_VIEW: u8 = 0x28;
 const KILLER_VIEW: u8 = 0x30;
+/// O teste já olhou a vítima liberada: o matador faz as voltas dele.
+const KILLER_GO: u8 = 0x38;
 const ARRIVED: u8 = 0x40;
 /// Os diários: um por processo, `ROUNDS` valores de 32 bits.
 const LOG: u32 = 0x100;
@@ -400,8 +402,10 @@ fn victim_program(services: &Services) -> Vec<u8> {
 
 /// O matador: espera o contador da vítima andar, abre o processo dela pelo
 /// PID publicado, o termina com `KILL_CODE`, anota os status e o contador da
-/// vítima naquele instante, faz `KILLER_ROUNDS` voltas (incremento e
-/// cessão) e sai com `KILLER_CODE`.
+/// vítima naquele instante, cede a CPU até o teste olhar a vítima liberada
+/// (`KILLER_GO`; as cessões sem outra thread pronta voltam direto ao anel 3,
+/// como no 19041, e as voltas inteiras caberiam num tique), faz
+/// `KILLER_ROUNDS` voltas (incremento e cessão) e sai com `KILLER_CODE`.
 fn killer_program(services: &Services) -> Vec<u8> {
     let mut asm = Code::new();
     asm.map_section(services);
@@ -430,6 +434,13 @@ fn killer_program(services: &Services) -> Vec<u8> {
     asm.syscall(services.terminate_process);
     // mov [rbx+KILL_STATUS], eax; mov eax, [rbx+VICTIM_COUNTER]; mov [rbx+VICTIM_AT_KILL], eax
     asm.put(&[0x89, 0x43, KILL_STATUS, 0x8B, 0x43, VICTIM_COUNTER, 0x89, 0x43, VICTIM_AT_KILL]);
+    // hold: cmp dword [rbx+KILLER_GO], 0; jnz go; NtYieldExecution; jmp hold
+    let hold = asm.here();
+    asm.put(&[0x83, 0x7B, KILLER_GO, 0x00]);
+    let go = asm.jcc_forward(JNZ);
+    asm.syscall(services.yield_execution);
+    asm.jmp_to(hold);
+    asm.bind(go);
     // xor esi, esi
     asm.put(&[0x31, 0xF6]);
     let round = asm.here();
@@ -683,7 +694,8 @@ fn termination(assert: Assert, services: &Services, shared: &Shared) {
     let killer_root = address_space::root_of(killer).unwrap_or(0);
 
     // Só o tick: ninguém espera os dois. No instante em que o término da
-    // vítima aparece, o matador ainda está no meio das voltas.
+    // vítima aparece, o matador ainda está antes das voltas (ele as segura
+    // até o teste olhar, `KILLER_GO`).
     let deadline = clock::uptime_ms() + TICK_DEADLINE_MS;
     let mut during_kill = None;
     while clock::uptime_ms() < deadline && process_state::get(killer).is_some() {
@@ -695,6 +707,7 @@ fn termination(assert: Assert, services: &Services, shared: &Shared) {
             let released = process_state::get(victim).is_none() && no_threads(victim) && victim_view != 0 && views::find(victim, victim_view).is_none() && only_kuser(victim_root) && (victim_stack == 0 || kernel_stack::find(victim_stack).is_none());
             let killer_alive = process_state::get(killer).is_some() && shared.read32(KILLER_COUNTER as u32) < KILLER_ROUNDS && killer_view != 0 && paging::translate_in(killer_root, killer_view) != 0;
             during_kill = Some((released, killer_alive, shared.read32(VICTIM_COUNTER as u32)));
+            shared.write32(KILLER_GO as u32, 1);
         }
     }
     let ticked = process_state::get(killer).is_none();

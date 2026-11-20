@@ -152,6 +152,7 @@ pub fn read_state(queue: &Kqueue) -> i32 {
 /// anterior. A entrada vai direto à thread parada na fila quando há vaga e
 /// quem insere não está associado a ela; senão entra na lista.
 pub fn insert_entry(queue: &Kqueue, entry: &ListEntry, at_head: bool) -> i32 {
+    super::dispatcher::note_wake();
     let mut lock = wait::lock();
     let previous = queue.header.signal_state.get();
     let caller = process::get_current_thread();

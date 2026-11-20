@@ -192,6 +192,7 @@ pub fn insert(apc: u64, first: u64, second: u64) -> bool {
     let (user_mode, special) = (packet.apc_mode.get() != 0, packet.reserved[NORMAL_ROUTINE].get() == 0);
     let inserted = insert_locked(apc, first, second);
     if inserted {
+        super::dispatcher::note_wake();
         // O KiInsertQueueApc: uma thread de kernel parada numa espera que a
         // APC interrompe sai dela (STATUS_KERNEL_APC/STATUS_USER_APC).
         super::wait::apc_queued(thread, user_mode, special);

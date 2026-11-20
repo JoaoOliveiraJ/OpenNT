@@ -43,6 +43,7 @@ static WAITERS: SpinLock<BTreeSet<u64>> = SpinLock::new(BTreeSet::new());
 /// O transporte mudou: as threads de kernel paradas numa espera do ALPC
 /// voltam à fila e sondam a operação delas de novo.
 pub fn notify_waiters() {
+    crate::ntos::ke::dispatcher::note_wake();
     let waiters: alloc::vec::Vec<u64> = WAITERS.lock().iter().copied().collect();
     for thread in waiters {
         wait::wake(thread);

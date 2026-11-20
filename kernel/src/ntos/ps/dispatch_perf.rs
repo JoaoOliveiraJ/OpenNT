@@ -69,6 +69,11 @@ pub fn spinning() {
     }
 }
 
+/// Quantos intervalos de usuário rodaram.
+pub fn slices() -> u64 {
+    SLICE.count.load(Ordering::Relaxed)
+}
+
 /// Quantas vezes o laço ocioso dormiu no HLT.
 pub fn halts() -> u64 {
     IDLE_HALT.count.load(Ordering::Relaxed)
@@ -77,6 +82,61 @@ pub fn halts() -> u64 {
 /// O laço ocioso deixou de girar.
 pub fn not_spinning() {
     SPIN_SINCE.store(0, Ordering::Relaxed);
+}
+
+/// Os serviços que voltaram direto ao anel 3, no mesmo intervalo.
+pub static FAST_RETURNS: AtomicU64 = AtomicU64::new(0);
+
+/// Os motivos de uma saída de serviço pelo despachante
+/// (`threads::may_return_to_user`), na ordem da linha `[perf]`.
+pub mod slow {
+    pub const NOT_DISPATCHED: usize = 0;
+    pub const CALLBACK: usize = 1;
+    pub const STATE: usize = 2;
+    pub const THREAD: usize = 3;
+    pub const USER_APC: usize = 4;
+    pub const KERNEL_APC: usize = 5;
+    pub const YIELD: usize = 6;
+    pub const PREEMPT: usize = 7;
+    pub const TICK: usize = 8;
+    pub const INTERRUPT: usize = 9;
+    pub const WAKE: usize = 10;
+    pub const DEBUG: usize = 11;
+    pub const CONTEXT: usize = 12;
+    pub const DISABLED: usize = 13;
+    pub const COUNT: usize = 14;
+    pub const NAMES: [&str; COUNT] = ["fora do despacho", "callback", "estado", "espera/thread", "APC de usuario", "APC de kernel", "cessao", "preempcao", "tique", "interrupcao", "despertar", "depurador", "CONTEXT", "desligada"];
+}
+
+/// As saídas de serviço pelo despachante, por motivo.
+static SLOW_EXITS: [AtomicU64; slow::COUNT] = [const { AtomicU64::new(0) }; slow::COUNT];
+
+/// Uma saída de serviço pelo despachante, pelo motivo `reason`.
+pub fn note_slow(reason: usize) {
+    if let Some(counter) = SLOW_EXITS.get(reason) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// O que andou desde a linha anterior nos retornos diretos e nas saídas
+/// lentas.
+static LAST_EXITS: crate::rtl::SpinLock<[u64; slow::COUNT + 1]> = crate::rtl::SpinLock::new([0; slow::COUNT + 1]);
+
+fn report_exits() {
+    let mut last = LAST_EXITS.lock();
+    let fast = FAST_RETURNS.load(Ordering::Relaxed);
+    let mut line = alloc::format!("[perf] servicos: {} retornos diretos; saidas lentas:", fast.wrapping_sub(last[slow::COUNT]));
+    last[slow::COUNT] = fast;
+    for (index, counter) in SLOW_EXITS.iter().enumerate() {
+        let value = counter.load(Ordering::Relaxed);
+        let delta = value.wrapping_sub(last[index]);
+        last[index] = value;
+        if delta != 0 {
+            line.push_str(&alloc::format!(" {} {},", slow::NAMES[index], delta));
+        }
+    }
+    drop(last);
+    crate::debug_print!("{}", line.trim_end_matches(','));
 }
 
 const VALUES: usize = 13;
@@ -134,4 +194,65 @@ pub fn report_if_due() {
         milliseconds(values[8]),
         values[9]
     );
+    report_exits();
+    report_threads();
+}
+
+/// Os intervalos de uma thread de usuário no intervalo da linha `[perf]`.
+struct ThreadSlices {
+    /// O ImageFileName do processo, lido no primeiro intervalo.
+    name: [u8; 15],
+    process_id: u64,
+    slices: u64,
+    tsc: u64,
+    /// Os serviços que voltaram ao anel 3 sem fim de intervalo.
+    returns: u64,
+}
+
+static THREADS: crate::rtl::SpinLock<alloc::collections::BTreeMap<u64, ThreadSlices>> = crate::rtl::SpinLock::new(alloc::collections::BTreeMap::new());
+
+/// O começo de um intervalo da thread `thread_id` do processo `process`
+/// (vivo aqui): a entrada dela, com o nome e o PID.
+pub fn slice_begin(thread_id: u64, process: u64) {
+    let mut threads = THREADS.lock();
+    if threads.contains_key(&thread_id) {
+        return;
+    }
+    let mut name = [0u8; 15];
+    name.copy_from_slice(&crate::ntos::mm::guest_memory::read_bytes(crate::ntos::ps::process_accessors::image_file_name(process), 15));
+    threads.insert(thread_id, ThreadSlices { name, process_id: crate::ntos::ps::process_accessors::id(process), slices: 0, tsc: 0, returns: 0 });
+}
+
+/// O fim do intervalo da thread `thread_id`, que começou no TSC `started`.
+pub fn slice_end(thread_id: u64, started: u64) {
+    let tsc = cpu::rdtsc().wrapping_sub(started);
+    if let Some(entry) = THREADS.lock().get_mut(&thread_id) {
+        entry.slices += 1;
+        entry.tsc += tsc;
+    }
+}
+
+/// Um serviço da thread `thread_id` voltou direto ao anel 3, no mesmo
+/// intervalo.
+pub fn thread_return(thread_id: u64) {
+    if let Some(entry) = THREADS.lock().get_mut(&thread_id) {
+        entry.returns += 1;
+    }
+}
+
+/// As cinco threads de usuário com mais tempo de intervalo desde a linha
+/// anterior (`[perf] threads:`), com o nome da imagem do processo, os
+/// intervalos e os serviços que voltaram sem fim de intervalo.
+fn report_threads() {
+    let mut taken: alloc::vec::Vec<(u64, ThreadSlices)> = core::mem::take(&mut *THREADS.lock()).into_iter().collect();
+    if taken.is_empty() {
+        return;
+    }
+    taken.sort_by_key(|(_, entry)| core::cmp::Reverse(entry.tsc));
+    let mut line = alloc::string::String::from("[perf] threads:");
+    for (thread_id, entry) in taken.iter().take(5) {
+        let name: alloc::string::String = entry.name.iter().take_while(|&&byte| byte != 0).map(|&byte| byte as char).collect();
+        line.push_str(&alloc::format!(" {} {}:{} {} ms ({}x, {} sem fim);", name, entry.process_id, thread_id, milliseconds(entry.tsc), entry.slices, entry.returns));
+    }
+    crate::debug_print!("{}", line);
 }

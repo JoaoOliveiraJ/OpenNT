@@ -255,6 +255,13 @@ pub fn has_pending() -> bool {
     table.handler_by_vector.keys().any(|&vector| irq_count(vector) != table.last_count_by_vector.get(&vector).copied().unwrap_or(0))
 }
 
+/// Um vetor de dispositivo tem ocorrências que a cadeia dele ainda não
+/// atendeu (o timer do LAPIC fica de fora).
+pub fn has_pending_devices() -> bool {
+    let table = TABLE.lock();
+    table.handler_by_vector.keys().any(|&vector| vector != VECTOR_LAPIC_TIMER && irq_count(vector) != table.last_count_by_vector.get(&vector).copied().unwrap_or(0))
+}
+
 /// O tempo até o próximo tique do timer periódico do LAPIC, em unidades de
 /// 100 ns (pelo contador corrente; 0 sem o timer periódico).
 pub fn until_next_tick_100ns() -> u64 {

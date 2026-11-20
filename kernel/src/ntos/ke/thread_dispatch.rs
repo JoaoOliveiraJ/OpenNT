@@ -358,6 +358,32 @@ pub fn next_thread() -> u64 {
     processor().next_thread.get()
 }
 
+/// O KiSystemServiceExit não testa preempção: no 19041 a pronta acima da
+/// corrente já tomou a CPU dentro do serviço (KiExitDispatcher 0x2c4150:
+/// NextThread -> KiSwapThread, ou o pedido de DISPATCH_LEVEL). Aqui, na
+/// saída do serviço: uma NextThread reservada para outra, ou uma pronta
+/// estritamente acima da corrente (o KiReadyThread só preempta prioridade
+/// menor).
+pub fn preemption_pending(thread: u64) -> bool {
+    if pcr::get_pcr_address() == 0 {
+        return false;
+    }
+    let _queues = QUEUES.lock();
+    let processor = processor();
+    let next = processor.next_thread.get();
+    if next != 0 && next != thread {
+        return true;
+    }
+    let summary = processor.ready_summary.get();
+    summary != 0 && 31 - summary.leading_zeros() > priority(thread) as u32
+}
+
+/// Um KeYieldExecution pedido no serviço (NtYieldExecution, o atraso zero):
+/// a troca é do `end_execution`.
+pub fn yield_pending(thread: u64) -> bool {
+    STATE.lock().owners.get(&thread).is_some_and(|owner| owner.yield_requested || owner.yield_execution)
+}
+
 /// Há thread pronta ou reservada (ReadySummary ou NextThread).
 pub fn has_ready_threads() -> bool {
     pcr::get_pcr_address() != 0 && (processor().ready_summary.get() != 0 || processor().next_thread.get() != 0)

@@ -1300,6 +1300,35 @@ pub extern "C" fn opennt_user_syscall(frame: *mut u64) -> u64 {
     // (o KiServiceExit com UserApcPending): o PspExitThread roda aqui, na
     // pilha dela, e o intervalo acaba sem voltar ao anel 3.
     crate::ntos::ps::user::threads::service_exit_termination();
+    if continues_in_interval() {
+        return result;
+    }
     save_syscall_context(frame, result);
     result
+}
+
+/// O KiSystemServiceExit (19041 0x411510): sem troca de thread a fazer, o
+/// fim de um serviço volta direto ao anel 3 pelo `user_syscall_exit` do stub
+/// (IRETQ, o resultado em RAX) e o intervalo segue. Precisam do caminho do
+/// CONTEXT: o serviço fora de um intervalo, o NtContinue, o callback de
+/// instrumentação e as faixas do CONTEXT gravadas no serviço para a volta
+/// (o SetContext e os registradores de depuração, o KiRestoreSetContextState
+/// e o KiRestoreDebugRegisterState do 19041); e as razões da thread e do
+/// despachante (`threads::may_return_to_user`).
+fn continues_in_interval() -> bool {
+    let block = block();
+    if block.context.get() == 0 || block.continue_flag.get() != 0 || block.instrumentation.get() != 0 || CONTEXT_KEEP.lock().0.contains(&true) {
+        if block.context.get() != 0 {
+            crate::ntos::ps::dispatch_perf::note_slow(crate::ntos::ps::dispatch_perf::slow::CONTEXT);
+        }
+        return false;
+    }
+    if let Err(reason) = crate::ntos::ps::user::threads::may_return_to_user() {
+        crate::ntos::ps::dispatch_perf::note_slow(reason);
+        return false;
+    }
+    STATE.lock().frame_context = 0;
+    crate::ntos::ps::dispatch_perf::FAST_RETURNS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    crate::ntos::ps::dispatch_perf::thread_return(crate::ntos::ps::process::get_current_thread_id());
+    true
 }

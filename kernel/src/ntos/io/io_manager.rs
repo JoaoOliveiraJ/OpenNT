@@ -220,6 +220,7 @@ fn complete_in_requester(irp: &Irp, addresses: [u64; 2], copy_back: impl FnOnce(
 /// interrompe. Depois finaliza o IRP síncrono (UserIosb, UserBuffer,
 /// UserEvent, buffer do I/O Manager).
 pub fn iof_complete_request(packet: u64) -> i32 {
+    crate::ntos::ke::dispatcher::note_wake();
     // Com IoRegisterIoTracking ativo, o tempo do IRP vai aos rastreadores.
     super::io_perf::on_complete_request(packet);
     crate::ntos::kd::irp_trace::completing(packet);

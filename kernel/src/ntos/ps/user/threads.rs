@@ -53,7 +53,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use super::memory;
 use super::process_state;
@@ -549,6 +549,9 @@ fn refresh_ready_user_threads() {
 
 /// O corpo de [`refresh_ready_user_threads`].
 fn poll_user_waits() {
+    // A época antes da sondagem: o que despertar durante ou depois dela faz a
+    // próxima saída de serviço passar pelo despachante.
+    POLLED_EPOCH.store(dispatcher::wake_epoch(), Ordering::Release);
     let mut candidates: Vec<Arc<UserThread>> = all()
         .into_iter()
         .filter(|thread| {
@@ -754,9 +757,11 @@ fn dispatch_from(executor: fn(u64, u64) -> u32, caller: u64) -> Result<Dispatche
                 continue;
             }
         }
+        dispatch_perf::slice_begin(next.thread_id, process);
         let started = crate::hal::cpu::rdtsc();
         let dispatched = run_slice(&next, process, kernel, executor, caller);
         dispatch_perf::SLICE.add_since(started);
+        dispatch_perf::slice_end(next.thread_id, started);
         return Ok(dispatched);
     }
     Ok(Dispatched::Idle)
@@ -930,15 +935,24 @@ fn execute(thread: &Arc<UserThread>, executor: fn(u64, u64) -> u32) -> Result<(u
     let kernel_before = process::thread_kernel_time(pointer);
     let started = clock::uptime_ms();
     thread_dispatch::begin_execution(pointer)?;
+    // O intervalo do despachante em curso: só as saídas de serviço dele podem
+    // voltar direto ao anel 3 (`may_return_to_user`), até o próximo tique.
+    let mark_slice = || {
+        SLICE_TICK.store(crate::nano::interrupts::tick_count(), Ordering::Relaxed);
+        SLICE_THREAD.store(pointer, Ordering::Release);
+    };
     let status = if thread.blocked_in_kernel() {
+        mark_slice();
         context_switch::switch_to(thread)
     } else if thread.termination_deliverable() {
         let (context, teb) = thread.with(|thread| (thread.context, thread.teb_va));
         crate::hal::amd64::usermode::exec_kernel_routine(context, teb, termination_entry, 0)
     } else {
         let (context, teb) = thread.with(|thread| (thread.context, thread.teb_va));
+        mark_slice();
         executor(context, teb)
     };
+    SLICE_THREAD.store(0, Ordering::Release);
     let new_state = thread.with(|thread| {
         if thread.dead {
             thread_dispatch::state::TERMINATED
@@ -1037,6 +1051,7 @@ pub fn begin_exit(process: u64, status: u32) -> bool {
         }
         exiting.push(PendingExit { process, status, rounds: 0, since: clock::uptime_ms(), finishing: false, warned: false });
     }
+    dispatcher::note_wake();
     process::reference(process);
     for thread in of_process(process) {
         if exits_in_own_context(&thread) {
@@ -1972,6 +1987,9 @@ fn change_suspend(handle: u64, out: u64, delta: i32) -> u32 {
 /// KeResumeThread) e devolve a anterior: a thread que deixa de estar
 /// suspensa volta à fila de prontas; a que passa a estar sai dela.
 fn adjust_suspend_count(thread: &UserThread, delta: i32) -> u32 {
+    if delta < 0 {
+        dispatcher::note_wake();
+    }
     let (previous, pointer, registered, suspended, waiting) = thread.with(|thread| {
         let previous = thread.suspend_count;
         thread.suspend_count = (previous as i32 + delta).max(0) as u32;
@@ -2149,6 +2167,7 @@ fn request_termination(thread: &Arc<UserThread>, status: u32) {
             return false;
         }
         thread.termination_requested = true;
+        dispatcher::note_wake();
         if thread.exit_status == PENDING {
             thread.exit_status = status;
         }
@@ -2278,6 +2297,87 @@ pub fn service_exit_termination() {
         return;
     }
     exit_current(&thread)
+}
+
+/// A época de despertar que a última sondagem das esperas de usuário cobriu
+/// (`u64::MAX` antes da primeira: nada volta direto).
+static POLLED_EPOCH: AtomicU64 = AtomicU64::new(u64::MAX);
+/// O intervalo despachado em curso ([`execute`]): a KTHREAD e o tique do
+/// começo dele.
+static SLICE_THREAD: AtomicU64 = AtomicU64::new(0);
+static SLICE_TICK: AtomicU32 = AtomicU32::new(0);
+
+/// O KiSystemServiceExit do 19041 (0x411510): depois de um serviço que não
+/// bloqueou, a thread corrente volta ao anel 3 no mesmo intervalo. O 19041
+/// só testa ali as APCs de usuário (UserApcPendingAll, 0x41155d), os
+/// registradores de depuração e o SetContext: a troca de thread, quando era
+/// preciso, já aconteceu dentro do serviço (a espera, a cessão, a pronta de
+/// prioridade maior no KiExitDispatcher, o fim de quantum, as DPCs). Aqui,
+/// sem preempção dentro do serviço, a saída pergunta, e o intervalo acaba
+/// (pelo CONTEXT e pelo despachante) quando: o intervalo não é do
+/// despachante; a thread está num callback de modo usuário, fora de
+/// PASSIVE_LEVEL, anexada a outro processo ou com uma trava retida;
+/// instalou uma espera, está bloqueada, morta, suspensa, terminando ou com
+/// uma exceção pendente; tem APC de usuário (a de término inclusive), APC
+/// de kernel ou conclusão de E/S pendente; pediu para ceder a CPU; outra
+/// thread deve tomá-la (uma reserva ou uma pronta estritamente acima); um
+/// tique do relógio passou desde o começo do intervalo (o quantum e a
+/// varredura anti-inanição são do tique); há DPC ou IRQ de dispositivo por
+/// atender; algo pode ter concluído uma espera sondada desde a última
+/// sondagem (a época de despertar); a raiz carregada não é a do processo;
+/// ou o depurador armou um passo. `Err` dá o motivo (`dispatch_perf::slow`).
+pub fn may_return_to_user() -> Result<(), usize> {
+    use crate::ntos::ps::dispatch_perf::slow as why;
+    if crate::ntos::init::boot_config::slow_service_exit() {
+        return Err(why::DISABLED);
+    }
+    let pointer = process::get_current_thread();
+    if pointer == 0 || SLICE_THREAD.load(Ordering::Acquire) != pointer {
+        return Err(why::NOT_DISPATCHED);
+    }
+    let tcb = kernel_thread(pointer);
+    if tcb.callback_nesting_level.get() != 0 {
+        return Err(why::CALLBACK);
+    }
+    // 0x41153b..0x41154d: IRQL e ApcStateIndex zerados, nenhuma trava.
+    if irql::get_irql() != irql::PASSIVE_LEVEL || crate::ntos::ke::process_attachment::is_attached() || sync::spin_locks_held() != 0 || sync::shared_locks_held() != 0 {
+        return Err(why::STATE);
+    }
+    let Some(thread) = current().filter(|thread| thread.pointer() == pointer) else { return Err(why::NOT_DISPATCHED) };
+    let (stopped, context, process_pointer) = thread.with(|thread| (thread.waiting || thread.wait.is_some() || thread.kernel != KernelState::User || thread.dead || thread.suspend_count != 0 || thread.termination_requested || thread.pending_exception, thread.context, thread.process_pointer));
+    if stopped {
+        return Err(why::THREAD);
+    }
+    // 0x41155d: UserApcPendingAll -> KiInitiateUserApc (a de término inclusive).
+    let user_queue = &tcb.apc_state.apc_list_head[1];
+    if apc::user_apc_pending_all(pointer) != 0 || tcb.termination_apc_request() != 0 || user_queue.flink.get() != user_queue.address() {
+        return Err(why::USER_APC);
+    }
+    if tcb.apc_state.kernel_apc_pending.get() != 0 || crate::ntos::io::file::request::has_completions_for(pointer) {
+        return Err(why::KERNEL_APC);
+    }
+    if thread_dispatch::yield_pending(pointer) {
+        return Err(why::YIELD);
+    }
+    if thread_dispatch::preemption_pending(pointer) {
+        return Err(why::PREEMPT);
+    }
+    if crate::nano::interrupts::tick_count() != SLICE_TICK.load(Ordering::Relaxed) {
+        return Err(why::TICK);
+    }
+    if crate::ntos::ke::dpc::pending() != 0 || crate::nano::interrupts::has_pending_devices() {
+        return Err(why::INTERRUPT);
+    }
+    if dispatcher::wake_epoch() != POLLED_EPOCH.load(Ordering::Acquire) {
+        return Err(why::WAKE);
+    }
+    if context_switch::require_loadable(process_pointer).ok() != Some(context_switch::loaded_root()) {
+        return Err(why::STATE);
+    }
+    if crate::ntos::kd::user_debug::step_armed(context) {
+        return Err(why::DEBUG);
+    }
+    Ok(())
 }
 
 /// O PID do CLIENT_ID da thread (ETHREAD.Cid); uma thread já recolhida
@@ -2446,6 +2546,7 @@ fn nt_alert_thread_by_thread_id(id: u64, _a2: u64, _a3: u64, _a4: u64, _rsp: u64
         return Ok(0xC000_0022);
     }
     thread.with(|thread| thread.alerted = true);
+    dispatcher::note_wake();
     Ok(0)
 }
 

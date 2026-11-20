@@ -134,8 +134,30 @@ static PULSES: SpinLock<BTreeMap<u64, PulseRecord>> = SpinLock::new(BTreeMap::ne
 /// Eventos lembrados: além disso sai o de pulso mais antigo.
 const PULSED_EVENTS: usize = 256;
 
+/// A época de despertar: anda a cada mudança que pode concluir uma espera
+/// sondada (o sinal de um objeto de despacho, um pulso ou o reset de um
+/// objeto sinalizado, a entrega a uma fila, a uma porta de conclusão ou a
+/// uma porta ALPC, uma APC, um alerta, um IRP concluído, a retomada ou o
+/// término pedido de uma thread). No 19041 quem espera fica pronto dentro do
+/// próprio sinal (KiUnwaitThread -> KiReadyThread 0x247fb0); aqui as esperas
+/// de usuário são sondadas, e a saída de um serviço só volta direto ao anel
+/// 3 quando a época não andou desde a última sondagem
+/// (`ps/user/threads::may_return_to_user`).
+static WAKE_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// Anota uma mudança que pode concluir a espera sondada de outra thread.
+pub fn note_wake() {
+    WAKE_EPOCH.fetch_add(1, Ordering::Release);
+}
+
+/// A época de despertar agora.
+pub fn wake_epoch() -> u64 {
+    WAKE_EPOCH.load(Ordering::Acquire)
+}
+
 /// Anota um pulso (ou o reset de um objeto sinalizado): eventos e timers.
 fn note_pulse(event: u64, unclaimed: bool) {
+    note_wake();
     let mut pulses = PULSES.lock();
     let pulse = PULSE_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
     if !pulses.contains_key(&event) && pulses.len() >= PULSED_EVENTS {

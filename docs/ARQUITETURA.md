@@ -917,7 +917,8 @@ espera no contexto da bloqueada (thread corrente e CR3 dela) e, quando ela
 conclui, retoma o
 serviço na pilha dela (`switch_to` → `usermode::resume_kernel_context`, que
 monta um quadro de despachante novo e entra no quadro salvo) em vez de entrar
-no anel 3; a syscall termina o intervalo como qualquer outra. Passam por aí
+no anel 3; a syscall retomada sai como qualquer outra (direto ao anel 3,
+quando nada pede o despachante). Passam por aí
 KeWaitForSingleObject/Multiple (alertáveis ou não), KeDelayExecutionThread,
 fast/guarded mutex, ERESOURCE, push locks e rundown
 (`context_switch::wait_until`/`acquire_until`), KeRemoveQueue/
@@ -1071,7 +1072,43 @@ cargas de CR3, e no despacho fora dos intervalos) saem na serial a cada
 intervalo, e elas chegavam a 40% do tempo da CPU. O autoteste
 `ntos/test/multiprocess/polled_wake.rs` põe duas threads de usuário em
 pingue-pongue por dois eventos dentro de serviços de teste e conta as
-voltas num número fixo de tiques. Um despacho aninhado (um pump dentro do
+voltas num número fixo de tiques.
+
+A saída de um serviço é a do KiSystemServiceExit do 19041 (0x411510): sem
+troca de thread a fazer, ela volta direto ao anel 3 pelo `user_syscall_exit`
+do stub e o intervalo segue (`usermode::continues_in_interval`). O 19041
+não testa o escalonador ali, porque a troca, quando era preciso, já
+aconteceu dentro do serviço; aqui, sem preempção dentro do serviço,
+`threads::may_return_to_user` pergunta, e o intervalo acaba como antes (o
+CONTEXT e o despachante) quando o intervalo não é do despachante, quando a
+thread está num callback de modo usuário, fora de PASSIVE_LEVEL, anexada
+ou com trava retida, quando instalou uma espera ou está bloqueada, morta,
+suspensa, terminando ou com exceção pendente, quando tem APC de usuário
+(a de término inclusive), APC de kernel ou conclusão de E/S, quando pediu
+para ceder a CPU, quando outra thread deve tomá-la (uma reserva ou uma
+pronta estritamente acima, a regra do KiReadyThread), quando um tique
+passou desde o começo do intervalo (o quantum é do tique), quando há DPC ou
+IRQ de dispositivo por atender, quando o serviço precisa do CONTEXT
+(NtContinue, o callback de instrumentação, as faixas gravadas pelo
+SetContext e pelos registradores de depuração), quando o depurador armou
+um passo e quando algo pode ter concluído uma espera sondada desde a última
+sondagem: a época de despertar (`dispatcher::wake_epoch`) anda no sinal de
+um objeto, num pulso ou no reset de um objeto sinalizado, na entrega a uma
+KQUEUE, a uma porta de conclusão ou a uma porta ALPC, numa APC, num alerta,
+num IRP concluído e na retomada ou no término pedido de uma thread, e a
+sondagem guarda a época de quando começou. Antes, todo serviço acabava o
+intervalo e custava uma passada do despachante (0,1 a 0,36 ms); o thread de
+interface do LogonUI, que faz uma espera de prazo zero em cada comparação
+de strings (o NlsValidateLocale do KERNELBASE num processo do SYSTEM), tinha
+1 a 2% da CPU e ficava à frente da fila da prioridade dele por segundos. A
+linha `[perf] servicos:` conta os retornos diretos e as saídas lentas por
+motivo, e a `[perf] threads:` as cinco threads com mais tempo de
+intervalo. O autoteste `ntos/test/multiprocess/service_exit.rs` confere
+muitas chamadas por intervalo num serviço que só conta, o fim do intervalo
+num serviço que sinaliza (a thread de prioridade maior que esperava roda
+antes da sinalização seguinte) e, numa espera adiada repetida com um
+sinaliza-e-limpa a cada volta, todas as esperas concluídas e nenhum
+STATUS_PENDING no anel 3. Um despacho aninhado (um pump dentro do
 despacho) devolve `Idle`, e só o BSP despacha usuário (assert). Um processo
 entra no despachante por `ps/user/process.rs::start_created` (o CONTEXT do
 LdrInitializeThunk e o registro da thread principal) e anda com os outros,

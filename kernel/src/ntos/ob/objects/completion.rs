@@ -316,6 +316,7 @@ pub fn publish(port: &Arc<Port>, output: u64, access: u32, attributes: u32, succ
 /// Enfileira (FIFO) e entrega aos consumidores e observadores.
 pub fn enqueue(port: &Port, packet: Packet) {
     port.with(|state| state.packets.push_back(packet));
+    crate::ntos::ke::dispatcher::note_wake();
     notify(port);
     let listeners = port.listeners.lock().clone();
     for listener in listeners {
