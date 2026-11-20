@@ -194,10 +194,88 @@ pub fn query_cookie(handle: u64, output: u64, length: u32, returned: u64, proces
     Ok(0)
 }
 
+/// Uma consulta de modo kernel com o `process_of` sobre
+/// [`reference_process`] (o pseudo-handle é o processo corrente): a
+/// referência tomada sai no fim, como no ramo da classe 36.
+fn with_kernel_process(handle: u64, query: impl FnOnce(&dyn Fn(u32) -> Result<u64, u32>) -> Result<u32, KernelError>) -> Result<u32, KernelError> {
+    let referenced = core::cell::Cell::new(0u64);
+    let failure: core::cell::RefCell<Option<KernelError>> = core::cell::RefCell::new(None);
+    let process_of = |access: u32| match reference_process(handle, access) {
+        Ok(Ok(process)) => {
+            referenced.set(process);
+            Ok(process)
+        }
+        Ok(Err(status)) => Err(status),
+        Err(error) => {
+            failure.replace(Some(error));
+            Err(STATUS_INSUFFICIENT_RESOURCES)
+        }
+    };
+    let status = query(&process_of);
+    if referenced.get() != 0 {
+        release_process(referenced.get())?;
+    }
+    if let Some(error) = failure.into_inner() {
+        return Err(error);
+    }
+    status
+}
+
 /// ZwQueryInformationProcess: ProcessImageInformation (37),
 /// ProcessCookie (36), ProcessDebugFlags (31), ProcessBreakOnTermination
-/// (29) e ProcessBasicInformation (0). Devolve o NTSTATUS.
+/// (29), ProcessBasicInformation (0) e, com as mesmas rotinas do modo
+/// usuário (o NtQueryInformationProcess 19041 roda o mesmo switch em
+/// KernelMode, sem as sondagens): ProcessQuotaLimits (1), ProcessVmCounters
+/// (3), ProcessTimes (4), ProcessPriorityClass (18),
+/// ProcessImageFileNameWin32 (43), ProcessMitigationPolicy (52; o
+/// ScrutinizeFontLoad do win32kfull pergunta a FontDisable de todo
+/// AddFontMemResourceEx), ProcessConsoleHostProcess (49),
+/// ProcessCommandLineInformation (60, PsQueryProcessCommandLine) e
+/// ProcessSequenceNumber (92). Devolve o NTSTATUS.
 pub fn query_information(handle: u64, class: u32, output: u64, length: u32, returned: u64) -> Result<u32, KernelError> {
+    if matches!(class, PROCESS_QUOTA_LIMITS | PROCESS_VM_COUNTERS | PROCESS_TIMES | PROCESS_PRIORITY_CLASS | PROCESS_IMAGE_FILE_NAME_WIN32 | PROCESS_MITIGATION_POLICY) {
+        return with_kernel_process(handle, |process_of| match class {
+            PROCESS_QUOTA_LIMITS => query_quota_limits(output, length, returned, process_of),
+            PROCESS_VM_COUNTERS => query_vm_counters(output, length, returned, process_of),
+            PROCESS_TIMES => query_times(output, length, returned, process_of),
+            PROCESS_PRIORITY_CLASS => query_priority_class(output, length, returned, process_of),
+            PROCESS_IMAGE_FILE_NAME_WIN32 => query_image_file_name_win32(output, length, returned, process_of),
+            _ => query_mitigation_policy(output, length, process_of),
+        });
+    }
+    // ProcessConsoleHostProcess (49, o EPROCESS.OwnerProcessId que o
+    // GetConsoleHostProcess do win32kfull lê no NtUserGetThreadDesktop de uma
+    // thread de console) e ProcessSequenceNumber (92): 8 bytes, o handle com
+    // PROCESS_QUERY_LIMITED_INFORMATION, ReturnLength 8.
+    if class == PROCESS_CONSOLE_HOST_PROCESS || class == PROCESS_SEQUENCE_NUMBER {
+        if length != 8 {
+            return Ok(STATUS_INFO_LENGTH_MISMATCH);
+        }
+        return with_kernel_process(handle, |process_of| {
+            let process = match process_of(PROCESS_QUERY_LIMITED_INFORMATION) {
+                Ok(process) => process,
+                Err(status) => return Ok(status),
+            };
+            // SAFETY: EPROCESS retido pela referência do `process_of`.
+            let eprocess = unsafe { Eprocess::at(process) };
+            let value = if class == PROCESS_CONSOLE_HOST_PROCESS { eprocess.owner_process_id.get() } else { eprocess.sequence_number.get() };
+            guest::try_write::<u64>(output, value)?;
+            if returned != 0 {
+                guest::try_write::<u32>(returned, 8)?;
+            }
+            Ok(0)
+        });
+    }
+    if class == PROCESS_COMMAND_LINE_INFORMATION {
+        let process = match reference_process(handle, PROCESS_QUERY_LIMITED_INFORMATION)? {
+            Ok(process) => process,
+            Err(status) => return Ok(status),
+        };
+        // SAFETY: EPROCESS retido pela referência acima.
+        let result = query_command_line(unsafe { Eprocess::at(process) }, output, length, 0, returned);
+        release_process(process)?;
+        return result;
+    }
     if class == 37 {
         return image_information::query(handle, output, length, returned, 0, None);
     }
@@ -405,7 +483,7 @@ pub fn nt_query_information(handle: u64, class: u32, output: u64, length: u32, r
         }
         // As classes atendidas referenciam o handle: um handle de kernel
         // (bit 63, fora os pseudo-handles) não vale em UserMode.
-        if matches!(class, 0 | 29 | 31 | 36 | 37) && (handle as i64) < -8 {
+        if matches!(class, 0 | 1 | 3 | 4 | 18 | 29 | 31 | 36 | 37 | 43 | 49 | 52 | 60 | 92) && (handle as i64) < -8 {
             return Ok(STATUS_INVALID_HANDLE);
         }
     }
@@ -530,6 +608,11 @@ pub const PROCESS_TIMES: u32 = 4;
 pub const PROCESS_PRIORITY_CLASS: u32 = 18;
 pub const PROCESS_IMAGE_FILE_NAME_WIN32: u32 = 43;
 pub const PROCESS_MITIGATION_POLICY: u32 = 52;
+/// ProcessCommandLineInformation, ProcessConsoleHostProcess e
+/// ProcessSequenceNumber.
+pub const PROCESS_COMMAND_LINE_INFORMATION: u32 = 60;
+pub const PROCESS_CONSOLE_HOST_PROCESS: u32 = 49;
+pub const PROCESS_SEQUENCE_NUMBER: u32 = 92;
 
 /// ProcessPriorityClass (o ramo da classe 18 do NtQueryInformationProcess
 /// 19041, rva 0x6227d4): exatamente os 2 bytes do PROCESS_PRIORITY_CLASS

@@ -508,6 +508,34 @@ fn ps_pool_quota_exports(assert: Assert) {
     );
 }
 
+/// ZwQueryInformationProcess de modo kernel com as rotinas do modo usuário
+/// (o NtQueryInformationProcess 19041 roda o mesmo switch em KernelMode):
+/// ProcessMitigationPolicy FontDisable (9), que o ScrutinizeFontLoad do
+/// win32kfull pergunta em todo AddFontMemResourceEx, ProcessPriorityClass com
+/// ReturnLength 2 e ProcessTimes; tamanho errado continua
+/// STATUS_INFO_LENGTH_MISMATCH. No código anterior todas davam
+/// STATUS_INVALID_PARAMETER.
+fn zw_query_information_process_classes(assert: Assert) {
+    let measured = super::multiprocess::identity::with_test_process("consulta-processo.exe", None, |test| {
+        let (buffer, returned) = (guest::alloc_bytes(0x40), guest::alloc_bytes(8));
+        guest::write32(buffer, 9);
+        guest::write32(buffer + 4, 0xFFFF_FFFF);
+        let font = (call_export("ZwQueryInformationProcess", &[u64::MAX, 52, buffer, 8, 0]), guest::read32(buffer + 4));
+        guest::write32(returned, 0);
+        let priority = (call_export("ZwQueryInformationProcess", &[u64::MAX, 18, buffer, 2, returned]), guest::read32(returned));
+        let times = call_export("ZwQueryInformationProcess", &[u64::MAX, 4, buffer, 0x20, returned]);
+        let wrong = call_export("ZwQueryInformationProcess", &[u64::MAX, 52, buffer, 4, 0]);
+        guest::write64(buffer, 0xDEAD);
+        let owner = at::<nt::Eprocess>(test.process).owner_process_id.get();
+        let console = (call_export("ZwQueryInformationProcess", &[u64::MAX, 49, buffer, 8, returned]), guest::read64(buffer) == owner, guest::read32(returned));
+        guest::free_bytes(buffer);
+        guest::free_bytes(returned);
+        (font, priority, times, wrong, console)
+    });
+    let ok = |status: u32| Some(status as i32 as i64 as u64);
+    assert(measured == Some(((ok(0), 0), (ok(0), 2), ok(0), ok(0xC000_0004), (ok(0), true, 8))), "zwqueryprocess: FontDisable, PriorityClass, Times e ConsoleHostProcess respondem em KernelMode e o tamanho errado e STATUS_INFO_LENGTH_MISMATCH");
+}
+
 fn zw_set_information_process_exports(assert: Assert) {
     // No processo de teste (NtCurrentProcess): ProcessBreakOnTermination
     // liga e desliga o Flags.BreakOnTermination sem SeDebugPrivilege (o modo
@@ -16412,6 +16440,7 @@ pub fn run(assert: Assert) {
     ps_pool_quota_exports(assert);
     system_information_ex_exports(assert);
     zw_set_information_process_exports(assert);
+    zw_query_information_process_classes(assert);
     super::critical_process::run(assert);
     super::kernel_crash_trace::run(assert);
     zw_timer_exports(assert);
