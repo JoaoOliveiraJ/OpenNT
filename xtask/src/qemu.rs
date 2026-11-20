@@ -1626,19 +1626,28 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
     // (ou um depurador) abre outra.
     let with_monitor = |action: &mut dyn FnMut(&mut TcpStream) -> Result<String, String>| -> Result<String, String> {
         let mut monitor = connect_monitor(port, deadline)?;
-        action(&mut monitor)
+        let result = action(&mut monitor);
+        // A cópia da conexão que descarta as respostas segura o socket: o
+        // shutdown o fecha de verdade e libera o monitor para a próxima.
+        let _ = monitor.shutdown(std::net::Shutdown::Both);
+        result
     };
     let note = |line: String| {
         let line = format!("\n{line}\n");
         print!("{line}");
         output.lock().unwrap().push_str(&line);
     };
-    // A entrada que espera `marker`, cada uma depois do atraso dela; a linha
+    // A entrada que espera `marker`, cada uma depois do atraso dela e uma vez
+    // só (o mesmo texto esperado de novo mais adiante não a repete); a linha
     // de cada uma vai para a serial (sem repetir o nome do marcador, que um
-    // `--expect` seguinte não pode casar). O `--mouse` cujo ponteiro não
-    // andou encerra o teste.
+    // `--expect` seguinte não pode casar). O `--dismiss` ou o `--mouse` que
+    // não vê a tela mudar encerra o teste.
+    let sent = std::cell::RefCell::new(vec![false; test.inputs.len()]);
     let send_after = |marker: &str| -> Result<(), String> {
-        for input in test.inputs.iter().filter(|input| input.after == marker) {
+        for (index, input) in test.inputs.iter().enumerate() {
+            if input.after != marker || std::mem::replace(&mut sent.borrow_mut()[index], true) {
+                continue;
+            }
             thread::sleep(input.delay);
             let at = launched.elapsed().as_secs_f64();
             match &input.action {
