@@ -29,6 +29,7 @@ pub mod ipi_stall;
 pub mod contention;
 pub mod current_thread;
 pub mod queue_wait;
+pub mod polled_wake;
 pub mod process_tables;
 pub mod heap_nx;
 pub mod pipes;

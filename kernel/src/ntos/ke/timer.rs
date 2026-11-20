@@ -76,7 +76,13 @@ pub fn read_state(timer: u64) -> u32 {
 pub fn set_timer(timer: u64, due_value: i64, dpc_pointer: u64, period_ms: u32) -> bool {
     let was_queued = cancel_timer(timer);
     let object = ktimer(timer);
-    object.header.signal_state.set(0);
+    // O rearme zera o SignalState de um timer que já venceu; as esperas
+    // sondadas que esperavam quando ele venceu ainda o contam
+    // (`dispatcher::note_signal_dropped`), como as que o vencimento já
+    // satisfez no 19041.
+    if object.header.signal_state.atomic().swap(0, core::sync::atomic::Ordering::SeqCst) != 0 {
+        super::dispatcher::note_signal_dropped(timer);
+    }
     object.dpc.set(dpc_pointer);
     object.period.set(period_ms);
     let (due, relative) = due_time(due_value);
@@ -155,6 +161,14 @@ pub fn check_timers() {
         }
     }
     super::timer2::expire_due();
+}
+
+/// Algum KTIMER ou KTIMER2 vence nos próximos `window` (100 ns).
+pub fn due_within(window: u64) -> bool {
+    let system_now = clock::system_time_100ns();
+    let uptime_now = clock::uptime_100ns();
+    let soon = TIMERS.lock().iter().any(|entry| entry.due <= if entry.relative { uptime_now } else { system_now }.saturating_add(window));
+    soon || super::timer2::due_before(uptime_now.saturating_add(window))
 }
 
 fn delay_pump() {

@@ -47,18 +47,24 @@
 //!   WaitAny que já esperavam no evento (todas no de notificação, uma no de
 //!   sincronização), não as que começam depois nem o WaitAll, e o
 //!   KeWaitForSingleObject sondado vê o pulso de uma thread de sistema em
-//!   vez de vencer pelo prazo.
+//!   vez de vencer pelo prazo;
+//! - o KeResetEvent, o KeClearEvent e o rearme de um timer vencido sem
+//!   sondagem desde o sinal: as esperas sondadas que já esperavam ainda veem
+//!   o sinal (no de sincronização, uma só), as que começam depois não;
+//! - o laço ocioso: sem thread pronta o processador dorme no HLT e o tique o
+//!   acorda; com um DPC na fila ele não dorme.
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::phase6::{call_export, kernel_handle_attributes, object_attributes_for, port_message_with, unicode_string_for};
 use crate::ntos::alpc::lpc;
-use crate::ntos::inc::types::{Kevent, Kqueue, Kthread, NtStruct, PortMessage};
+use crate::nano::interrupts;
+use crate::ntos::inc::types::{Kdpc, Kevent, Kqueue, Kthread, NtStruct, PortMessage};
 use crate::ntos::ke::{clock, dispatcher, thread_dispatch, wait};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::ob::object_manager;
-use crate::ntos::ps::{kernel_threads, process, scheduler};
+use crate::ntos::ps::{dispatch_perf, kernel_threads, process, scheduler};
 
 type Assert = fn(bool, &str);
 
@@ -929,8 +935,108 @@ fn pulse_polled_waits(assert: Assert) {
     guest::free_bytes(block);
 }
 
+/// O KeResetEvent (e o KeClearEvent, o mesmo corpo no 19041, 0x344c50) de
+/// um evento sinalizado não tira o sinal das esperas que já esperavam: no
+/// 19041 o KeSetEvent já as tinha satisfeito. As esperas sondadas, sem
+/// bloco, o veem pelo pulso que o reset anota: num evento de notificação
+/// toda espera WaitAny que já esperava, num de sincronização uma só; quem
+/// começa depois do reset e o reset de um evento não sinalizado não contam.
+/// O mesmo no rearme de um KTIMER que venceu (KeSetTimer).
+fn reset_polled_waits(assert: Assert) {
+    let block = guest::alloc_bytes(0x100);
+    guest::write_bytes(block, &[0; 0x100]);
+    let (notification, synchronization, cleared, timer) = (block, block + 0x20, block + 0x40, block + 0x60);
+    dispatcher::initialize_event(notification, 0, false);
+    dispatcher::initialize_event(synchronization, 1, false);
+    dispatcher::initialize_event(cleared, 0, false);
+    let any = |objects: &[u64]| dispatcher::PolledObjects::new(objects.to_vec(), 1);
+    let (first, second) = (any(&[notification]), any(&[cleared, notification]));
+    let quiet = first.try_now().is_none() && second.try_now().is_none();
+    dispatcher::set_event(notification);
+    let previous = dispatcher::reset_event(notification);
+    let late = any(&[notification]);
+    assert(
+        quiet && previous == 1 && dispatcher::read_state(notification) == 0 && first.try_now() == Some(0) && second.try_now() == Some(1) && late.try_now().is_none(),
+        "kwait: KeSetEvent e KeResetEvent sem sondagem no meio satisfazem as esperas sondadas WaitAny que ja esperavam no evento de notificacao; a que comeca depois do reset nao conta",
+    );
+    let (one, two) = (any(&[synchronization]), any(&[synchronization]));
+    dispatcher::set_event(synchronization);
+    let previous = dispatcher::reset_event(synchronization);
+    let (got_one, got_two) = (one.try_now(), two.try_now());
+    let after = any(&[synchronization]);
+    assert(
+        previous == 1 && got_one == Some(0) && got_two.is_none() && after.try_now().is_none(),
+        "kwait: KeSetEvent e KeResetEvent num evento de sincronizacao entregam o sinal a uma so espera sondada que ja esperava",
+    );
+    let waiting = any(&[cleared]);
+    dispatcher::set_event(cleared);
+    dispatcher::clear_event(cleared);
+    let clock = dispatcher::pulse_clock();
+    let unsignalled = dispatcher::reset_event(cleared) == 0 && dispatcher::pulse_clock() == clock;
+    assert(
+        waiting.try_now() == Some(0) && unsignalled,
+        "kwait: o KeClearEvent de um evento sinalizado tambem satisfaz a espera sondada que ja esperava; o reset de um evento nao sinalizado nao anota pulso",
+    );
+    crate::ntos::ke::timer::initialize_notification_timer(timer);
+    let timer_waiter = any(&[timer]);
+    let quiet = timer_waiter.try_now().is_none();
+    crate::ntos::ke::timer::set_timer(timer, -1, 0, 0);
+    let fired = pump(2000, &|| crate::ntos::ke::timer::read_state(timer) != 0);
+    crate::ntos::ke::timer::set_timer(timer, -100_000_000, 0, 0);
+    let rearmed = crate::ntos::ke::timer::read_state(timer) == 0;
+    let released = timer_waiter.try_now();
+    let late = any(&[timer]).try_now();
+    crate::ntos::ke::timer::cancel_timer(timer);
+    assert(
+        quiet && fired && rearmed && released == Some(0) && late.is_none(),
+        "kwait: o KeSetTimer que rearma um timer de notificacao vencido nao tira o vencimento da espera sondada que ja esperava",
+    );
+    guest::free_bytes(block);
+}
+
+static IDLE_DPC_RUNS: AtomicU64 = AtomicU64::new(0);
+
+fn idle_dpc(_: u64, _: u64, _: u64, _: u64) {
+    IDLE_DPC_RUNS.fetch_add(1, Ordering::SeqCst);
+}
+
+/// O laço ocioso (o KiIdleLoop do 19041 chamando o HalProcessorIdle): sem
+/// thread pronta e sem trabalho, `scheduler::idle` para o processador no HLT
+/// com as interrupções ligadas, e a interrupção seguinte (o tique do
+/// relógio) o acorda; com um DPC na fila ele não dorme.
+fn idle_halt(assert: Assert) {
+    let deadline = clock::uptime_ms() + 2_000;
+    let mut halted = false;
+    while !halted && clock::uptime_ms() < deadline {
+        if thread_dispatch::has_ready_threads() {
+            scheduler::tick(-1);
+            continue;
+        }
+        let (halts, ticks) = (dispatch_perf::halts(), interrupts::tick_count());
+        scheduler::idle();
+        // Acordado por outra interrupção que não o tique: tenta de novo.
+        halted = dispatch_perf::halts() != halts && interrupts::tick_count() != ticks;
+    }
+    assert(halted && crate::hal::cpu::interrupts_enabled(), "ocioso: sem thread pronta o processador dorme no HLT e o tique do relogio o acorda, com as interrupcoes ligadas");
+
+    let dpc = guest::alloc_bytes(Kdpc::SIZE);
+    guest::write_bytes(dpc, &alloc::vec![0; Kdpc::SIZE as usize]);
+    crate::ntos::ke::dpc::initialize_kernel_dpc(dpc, idle_dpc, 0);
+    IDLE_DPC_RUNS.store(0, Ordering::SeqCst);
+    let halts = dispatch_perf::halts();
+    let queued = crate::ntos::ke::dpc::insert_queue_dpc(dpc, 0, 0);
+    scheduler::idle();
+    // Uma sondagem dentro do `idle` pode ter drenado a fila antes do HLT.
+    let stayed_awake = IDLE_DPC_RUNS.load(Ordering::SeqCst) != 0 || dispatch_perf::halts() == halts;
+    let _ = crate::ntos::ke::dpc::run_queue();
+    assert(queued && stayed_awake && IDLE_DPC_RUNS.load(Ordering::SeqCst) == 1, "ocioso: com um DPC na fila o processador nao dorme");
+    guest::free_bytes(dpc);
+}
+
 pub fn run(assert: Assert) {
     pulse_polled_waits(assert);
+    reset_polled_waits(assert);
+    idle_halt(assert);
     event_ping_pong(assert);
     queue_ping_pong(assert);
     nested_tick(assert);

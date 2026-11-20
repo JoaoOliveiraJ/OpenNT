@@ -479,6 +479,8 @@ pub fn tick(minimum_priority: i32) {
         }
         return;
     }
+    super::dispatch_perf::not_spinning();
+    super::dispatch_perf::report_if_due();
     reap();
     // Como a interrupção de relógio do NT, cada tick vence os timers devidos
     // (inclusive o prazo das esperas, no KTHREAD.Timer de cada thread) antes
@@ -492,16 +494,31 @@ pub fn tick(minimum_priority: i32) {
     if minimum_priority < 0 {
         user_threads::refresh_waiting();
     }
+    // A sondagem do começo do tick acabou de rodar.
+    let mut repolled = true;
     while steps < budget || user_slices(slices) {
         let selected = refresh_waiting_threads().and_then(|_| thread_dispatch::peek());
         let (thread, owner) = match selected {
             Ok(Some(selected)) => selected,
+            // O 19041 apronta quem espera dentro do sinal (KiUnwaitThread ->
+            // KiReadyThread, 0x247fb0). Uma espera de usuário sondada que o
+            // intervalo ou o passo que acabou de rodar satisfez (um envio e
+            // espera ALPC, a resposta adiada de uma worker factory, o
+            // KeSetEvent de uma thread de kernel) entra aqui, não no próximo
+            // tique de 10 ms.
+            Ok(None) if minimum_priority < 0 && !repolled => {
+                repolled = true;
+                user_threads::refresh_waiting();
+                continue;
+            }
             Ok(None) => break,
             Err(error) => {
                 debug_print!("[sched] seleção falhou: {}", error);
                 break;
             }
         };
+        // Algo vai rodar: depois dele, mais uma sondagem.
+        repolled = false;
         if owner.runtime & thread_dispatch::USER_RUNTIME != 0 {
             if !user_slices(slices) {
                 break;
@@ -526,6 +543,44 @@ pub fn tick(minimum_priority: i32) {
         }
     }
     reap();
+}
+
+/// O laço ocioso do processador de boot sem thread pronta: como o KiIdleLoop
+/// do 19041 chama o HalProcessorIdle (`sti; hlt`), o processador dorme até a
+/// próxima interrupção (o tique do relógio a 100 Hz, um dispositivo, uma
+/// IPI). Antes, as esperas sondadas (de kernel e de usuário) são conferidas
+/// uma vez: a que um DPC, um timer, uma IRQ ou um trabalho do kernel acabou
+/// de satisfazer entra na fila agora, não no próximo tique. Um KTIMER que vence
+/// antes do próximo tique faz o laço girar até ele, para vencer na hora; com
+/// as interrupções desligadas, uma IRQ ainda não despachada, um DPC na fila
+/// ou uma thread pronta também não deixam dormir.
+pub fn idle() {
+    if crate::ntos::ke::timer::due_within(crate::nano::interrupts::until_next_tick_100ns()) {
+        super::dispatch_perf::spinning();
+        core::hint::spin_loop();
+        return;
+    }
+    super::dispatch_perf::not_spinning();
+    let _ = refresh_waiting_threads();
+    user_threads::refresh_waiting();
+    if thread_dispatch::has_ready_threads() {
+        return;
+    }
+    // Só em PASSIVE_LEVEL: com o CR8 acima, o tique (vetor 0x40) e as IRQs
+    // do 8259 ficariam retidos no LAPIC e o HLT não voltaria.
+    let flags = crate::hal::cpu::save_and_disable_interrupts();
+    let quiet = flags & 0x200 != 0
+        && crate::ntos::ke::irql::get_irql() == crate::ntos::ke::irql::PASSIVE_LEVEL
+        && !crate::nano::interrupts::has_pending()
+        && crate::ntos::ke::dpc::pending() == 0
+        && !thread_dispatch::has_ready_threads();
+    if quiet {
+        let started = crate::hal::cpu::rdtsc();
+        crate::hal::cpu::processor_idle();
+        super::dispatch_perf::IDLE_HALT.add_since(started);
+    } else {
+        crate::hal::cpu::restore_interrupts(flags);
+    }
 }
 
 /// No contexto síncrono de boot, o próprio chamador aguarda as concorrentes

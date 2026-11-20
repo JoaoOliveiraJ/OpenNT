@@ -247,6 +247,17 @@ pub fn halt_forever() -> ! {
     }
 }
 
+/// HalProcessorIdle (o `sti; hlt` que o KiIdleLoop do 19041 chama): o
+/// chamador desligou as interrupções e conferiu que não há trabalho. A
+/// sombra do STI cobre o HLT, então uma interrupção que chegou depois da
+/// conferência acorda o processador logo em vez de esperar a próxima. Volta
+/// com as interrupções ligadas. Sem `nomem`: os tratadores que acordam o
+/// processador gravam memória (as contagens de IRQ), e nada lido antes do
+/// HLT pode ser reaproveitado depois dele.
+pub fn processor_idle() {
+    unsafe { asm!("sti", "hlt", options(nostack)) }
+}
+
 /// RDRAND quando disponível.
 pub fn hardware_random_u64() -> Option<u64> {
     if cpuid(1)[2] & (1 << 30) == 0 {

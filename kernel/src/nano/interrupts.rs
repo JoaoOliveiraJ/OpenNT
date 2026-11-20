@@ -13,7 +13,7 @@
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::hal::{cpu, lapic, physical, port};
 use crate::hal::amd64::irqstubs;
@@ -58,6 +58,8 @@ static TABLE: SpinLock<DispatchTable> = SpinLock::new(DispatchTable {
 });
 
 static IDT_LOADED: AtomicBool = AtomicBool::new(false);
+/// Contagens do timer do LAPIC por tique (0 antes do timer periódico).
+static TICKS_PER_QUANTUM: AtomicU32 = AtomicU32::new(0);
 
 fn set_gate(vector: u16, handler_address: u64) {
     let base = IDT_PHYSICAL_ADDRESS + vector as u64 * 16;
@@ -177,6 +179,7 @@ fn start_lapic_timer() {
     // liga o timer periódico no vetor 0x40 a 100 Hz
     lapic::write(LAPIC_LVT_TIMER, VECTOR_LAPIC_TIMER as u32 | 0x20000);
     lapic::write(LAPIC_TIMER_INITIAL, ticks_per_quantum);
+    TICKS_PER_QUANTUM.store(ticks_per_quantum, Ordering::Release);
     debug_print!(
         "[irq] LAPIC timer: {} MHz de bus, {} ticks/quantum",
         fixed1(ticks_per_second, 1_000_000),
@@ -243,6 +246,24 @@ fn dispatch_pending_where(selected: impl Fn(u8) -> bool) {
     for (vector, handler, pending) in due {
         handler(vector, pending);
     }
+}
+
+/// Algum vetor com handler tem ocorrências que o [`dispatch_pending`] ainda
+/// não entregou.
+pub fn has_pending() -> bool {
+    let table = TABLE.lock();
+    table.handler_by_vector.keys().any(|&vector| irq_count(vector) != table.last_count_by_vector.get(&vector).copied().unwrap_or(0))
+}
+
+/// O tempo até o próximo tique do timer periódico do LAPIC, em unidades de
+/// 100 ns (pelo contador corrente; 0 sem o timer periódico).
+pub fn until_next_tick_100ns() -> u64 {
+    let quantum = TICKS_PER_QUANTUM.load(Ordering::Acquire) as u64;
+    if quantum == 0 {
+        return 0;
+    }
+    let current = (lapic::read(LAPIC_TIMER_CURRENT) as u64).min(quantum);
+    current * 100_000 / quantum
 }
 
 /// IRQs estão chegando de verdade? (hardware/emulador entregando)

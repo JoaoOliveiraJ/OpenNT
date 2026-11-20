@@ -299,11 +299,13 @@ pub fn kmain() -> ! {
             crate::ntos::ke::run_kernel_tasks();
             interrupts::dispatch_pending(); // IRQ do timer -> scheduler::tick
             // Como o laço ocioso do NT: uma thread aprontada pelo sinal não
-            // espera o próximo tick do relógio.
+            // espera o próximo tick do relógio; sem nenhuma, o processador
+            // dorme até a próxima interrupção (`scheduler::idle`).
             if crate::ntos::ke::thread_dispatch::has_ready_threads() {
                 scheduler::tick(-1);
+            } else {
+                scheduler::idle();
             }
-            core::hint::spin_loop();
         }
     } else {
         debug_print!("[kernel] AVISO: plataforma nao entrega IRQs — escalonador cooperativo (sem preempcao)");

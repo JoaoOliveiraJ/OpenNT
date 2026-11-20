@@ -170,7 +170,11 @@ pub fn set_with_tolerance(timer: &Ktimer2, due_time: i64, period: i64, tolerance
     let was_set = remove_locked(&mut inserted, timer);
     timer.due_time[0].set(due);
     timer.due_time[1].set(latest);
-    timer.header.signal_state.set(0);
+    // Como no KeSetTimerEx: o rearme de um timer vencido não tira o
+    // vencimento das esperas sondadas que já esperavam.
+    if timer.header.signal_state.atomic().swap(0, Ordering::SeqCst) != 0 {
+        super::dispatcher::note_signal_dropped(timer.address());
+    }
     timer.period.set(period);
     timer.absolute_system_time.set(absolute as u8);
     insert_locked(&mut inserted, timer);
@@ -263,6 +267,11 @@ fn finalize_disablement(timer: &Ktimer2) {
     let previous = irql::raise_at_least(irql::DISPATCH_LEVEL);
     routine(context);
     irql::lower_irql(previous as u64);
+}
+
+/// Algum KTIMER2 inserido vence até `deadline` (uptime em 100 ns).
+pub fn due_before(deadline: u64) -> bool {
+    INSERTED.lock().iter().any(|&address| timer_at(address).due_time[0].get() <= deadline)
 }
 
 /// Expira os KTIMER2 vencidos (chamado pelo pump dos timers).

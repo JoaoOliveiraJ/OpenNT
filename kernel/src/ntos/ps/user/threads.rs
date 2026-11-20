@@ -62,7 +62,7 @@ use crate::hal::amd64::context_switch::{EXIT_BLOCKED, EXIT_THREAD_EXITED};
 use crate::ntos::ke::user_callback::CalloutStacks;
 use crate::ntos::ke::{apc, clock, context_switch, dispatcher, irql, smp, thread_alert, thread_dispatch, thread_lock, thread_priority};
 use crate::ntos::ob::objects::completion as completion_objects;
-use crate::ntos::ps::{alert_thread, cid, process, query_thread, set_thread_information, system_process_information};
+use crate::ntos::ps::{alert_thread, cid, dispatch_perf, process, query_thread, set_thread_information, system_process_information};
 use crate::ntos::se::token::thread as thread_tokens;
 use crate::rtl::{sync, KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
@@ -540,6 +540,15 @@ pub fn attach_scheduling(thread: &Arc<UserThread>) -> Result<(), KernelError> {
 /// roda no contexto da thread (thread corrente e raiz dela); quem chama
 /// restaura a dele.
 fn refresh_ready_user_threads() {
+    let started = crate::hal::cpu::rdtsc();
+    let loads = dispatch_perf::CR3_LOADS.load(Ordering::Relaxed);
+    poll_user_waits();
+    dispatch_perf::SWITCHES.fetch_add(dispatch_perf::CR3_LOADS.load(Ordering::Relaxed).wrapping_sub(loads), Ordering::Relaxed);
+    dispatch_perf::REFRESH.add_since(started);
+}
+
+/// O corpo de [`refresh_ready_user_threads`].
+fn poll_user_waits() {
     let mut candidates: Vec<Arc<UserThread>> = all()
         .into_iter()
         .filter(|thread| {
@@ -552,6 +561,7 @@ fn refresh_ready_user_threads() {
         let pointer = candidate.pointer();
         if let Some(mut wait) = candidate.take_wait() {
             process::set_current_thread(pointer);
+            dispatch_perf::POLLS.fetch_add(1, Ordering::Relaxed);
             match poll_wait(&mut wait) {
                 None => {
                     candidate.restore_wait(wait);
@@ -661,11 +671,13 @@ pub fn dispatch_one() -> Result<Dispatched, KernelError> {
     if RUNNING.swap(true, Ordering::AcqRel) {
         return Ok(Dispatched::Idle);
     }
+    let started = crate::hal::cpu::rdtsc();
     let caller = process::get_current_thread();
     let result = dispatch_from(executor, caller);
     process::set_current_thread(caller);
     *CURRENT.lock() = None;
     RUNNING.store(false, Ordering::Release);
+    dispatch_perf::DISPATCH.add_since(started);
     result
 }
 
@@ -729,7 +741,10 @@ fn dispatch_from(executor: fn(u64, u64) -> u32, caller: u64) -> Result<Dispatche
                 continue;
             }
         }
-        return Ok(run_slice(&next, process, kernel, executor, caller));
+        let started = crate::hal::cpu::rdtsc();
+        let dispatched = run_slice(&next, process, kernel, executor, caller);
+        dispatch_perf::SLICE.add_since(started);
+        return Ok(dispatched);
     }
     Ok(Dispatched::Idle)
 }
@@ -1462,7 +1477,9 @@ pub fn wait_referenced(set: crate::ntos::ob::wait::WaitObjects, wait_type: u32, 
 
 pub fn wait_objects(entries: Vec<Arc<UserHandle>>, objects: Vec<u64>, wait_type: u32, timeout: u64, alertable: bool) -> u32 {
     let ms = dispatcher::timeout_pointer_to_ms(timeout);
-    let mut wait = Wait { entries: Some(entries), objects, wait_type, alertable: Some(alertable), deadline: ms.map(|ms| clock::uptime_ms() + ms), ..Wait::default() };
+    // Pelos PolledObjects: os pulsos e os resets de objeto sinalizado contam.
+    let polled = dispatcher::PolledObjects::new(objects.clone(), wait_type);
+    let mut wait = Wait { entries: Some(entries), objects, wait_type, alertable: Some(alertable), deadline: ms.map(|ms| clock::uptime_ms() + ms), poll: Some(Box::new(move || polled.try_now())), ..Wait::default() };
     if let Some(immediate) = poll_wait(&mut wait) {
         if let Some(alerts) = wait.alerts.as_mut() {
             let _ = alerts.finish(immediate);

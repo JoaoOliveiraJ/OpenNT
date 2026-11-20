@@ -165,6 +165,7 @@ pub fn load_root(root: u64) -> Result<(), KernelError> {
         // livre enquanto esta a carrega.
         loaded.store(root, Ordering::SeqCst);
         cpu::write_cr3(root);
+        crate::ntos::ps::dispatch_perf::CR3_LOADS.fetch_add(1, Ordering::Relaxed);
         Ok(())
     };
     cpu::restore_interrupts(flags);

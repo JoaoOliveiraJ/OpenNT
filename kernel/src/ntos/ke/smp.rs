@@ -508,6 +508,11 @@ pub fn start_job(slot: usize, routine: u64, arguments: [u64; 4]) -> Result<bool,
     physical::write32(record + SLOT_JOB_COMPLETED, 0);
     // A rotina é publicada por último.
     physical::write64(record + SLOT_JOB_ROUTINE, routine);
+    // O AP ocioso dorme no HLT do laço de trabalhos com o IF desligado: a
+    // NMI o acorda (a que chega antes do HLT volta ao teste do trabalho, no
+    // `ap_nmi_done` do trampolim).
+    let identifier = physical::read32(record + SLOT_CONTROLLER_IDENTIFIER);
+    send_processor_interrupt(identifier, 0x4400).map_err(|stall| KernelError::new(alloc::format!("NMI de trabalho ao AP slot {slot} sem entrega em {} ms", stall.elapsed_ms())))?;
     Ok(true)
 }
 

@@ -69,13 +69,30 @@ pub fn set_event(event: u64) -> u32 {
     previous
 }
 
+/// KeClearEvent (19041 0x344c50, o mesmo corpo do KeResetEvent).
 pub fn clear_event(event: u64) {
-    header_at(event).signal_state.set(0);
+    let _ = reset_event(event);
 }
 
-/// KeResetEvent: devolve o estado anterior (troca atômica do SignalState).
+/// KeResetEvent (19041 0x344c50): SignalState = 0 sob a trava do objeto,
+/// devolvendo o anterior; as esperas que o KeSetEvent já satisfez continuam
+/// satisfeitas (0x344c93..0x344c96 só tocam o SignalState). As esperas
+/// sondadas não têm bloco: o reset de um evento sinalizado fica anotado
+/// como pulso, e a espera WaitAny que já esperava quando o evento foi
+/// sinalizado conclui (no de sincronização, uma só).
 pub fn reset_event(event: u64) -> u32 {
-    header_at(event).signal_state.atomic().swap(0, Ordering::SeqCst) as u32
+    let previous = header_at(event).signal_state.atomic().swap(0, Ordering::SeqCst) as u32;
+    if previous != 0 {
+        note_pulse(event, true);
+    }
+    previous
+}
+
+/// O SignalState de um objeto sinalizado (um timer rearmado depois de
+/// vencer) foi zerado: as esperas sondadas que já esperavam ainda o contam,
+/// como em [`reset_event`].
+pub fn note_signal_dropped(object: u64) {
+    note_pulse(object, true);
 }
 
 pub fn read_state(object: u64) -> u32 {
@@ -93,8 +110,10 @@ pub fn read_state(object: u64) -> u32 {
 pub fn pulse_event(event: u64) -> u32 {
     let previous = set_event(event);
     // Ainda sinalizado: nenhuma espera consumiu o sinal (o de sincronização).
-    let unclaimed = reset_event(event) != 0;
-    if previous == 0 {
+    // A troca crua anota o pulso uma vez só (o `reset_event` anotaria de
+    // novo); com o evento já sinalizado antes, é o reset que conta.
+    let unclaimed = header_at(event).signal_state.atomic().swap(0, Ordering::SeqCst) != 0;
+    if previous == 0 || unclaimed {
         note_pulse(event, unclaimed);
     }
     previous
@@ -115,7 +134,7 @@ static PULSES: SpinLock<BTreeMap<u64, PulseRecord>> = SpinLock::new(BTreeMap::ne
 /// Eventos lembrados: além disso sai o de pulso mais antigo.
 const PULSED_EVENTS: usize = 256;
 
-/// Anota um pulso que achou o evento não sinalizado.
+/// Anota um pulso (ou o reset de um objeto sinalizado): eventos e timers.
 fn note_pulse(event: u64, unclaimed: bool) {
     let mut pulses = PULSES.lock();
     let pulse = PULSE_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
@@ -126,7 +145,7 @@ fn note_pulse(event: u64, unclaimed: bool) {
     }
     let record = pulses.entry(event).or_insert(PulseRecord { last: 0, unclaimed: [0; 4] });
     record.last = pulse;
-    if unclaimed && header_at(event).type_.get() == object_type::EVENT_SYNCHRONIZATION {
+    if unclaimed && matches!(header_at(event).type_.get(), object_type::EVENT_SYNCHRONIZATION | object_type::TIMER_SYNCHRONIZATION | object_type::TIMER2_SYNCHRONIZATION) {
         // Sem lugar, o pulso mais antigo cede o dele.
         let slot = record.unclaimed.iter().position(|&value| value == 0).unwrap_or_else(|| record.unclaimed.iter().enumerate().min_by_key(|(_, &value)| value).map_or(0, |(index, _)| index));
         record.unclaimed[slot] = pulse;
@@ -181,8 +200,8 @@ pub fn pulsed_since(objects: &[u64], wait_type: u32, since: u64) -> Option<u32> 
     for (index, object) in objects.iter().enumerate() {
         let Some(record) = pulses.get_mut(object) else { continue };
         match header_at(*object).type_.get() {
-            object_type::EVENT_NOTIFICATION if record.last > since => return Some(index as u32),
-            object_type::EVENT_SYNCHRONIZATION => {
+            object_type::EVENT_NOTIFICATION | object_type::TIMER_NOTIFICATION | object_type::TIMER2_NOTIFICATION if record.last > since => return Some(index as u32),
+            object_type::EVENT_SYNCHRONIZATION | object_type::TIMER_SYNCHRONIZATION | object_type::TIMER2_SYNCHRONIZATION => {
                 if let Some(slot) = record.unclaimed.iter_mut().filter(|value| **value > since).min_by_key(|value| **value) {
                     *slot = 0;
                     return Some(index as u32);

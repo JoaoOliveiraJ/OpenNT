@@ -1427,6 +1427,7 @@ fn launch(qemu: &Path, temp: &Path, arguments: &[String], output: &Arc<Mutex<Str
     let mut stdout = child.stdout.take().unwrap();
     let process = QemuProcess(child);
     let sink = Arc::clone(output);
+    let launched = Instant::now();
     let reader = thread::spawn(move || {
         let mut buffer = [0u8; 4096];
         let mut line = String::new();
@@ -1452,6 +1453,13 @@ fn launch(qemu: &Path, temp: &Path, arguments: &[String], output: &Arc<Mutex<Str
                         print!("{report}");
                         sink.lock().unwrap().push_str(&report);
                     }
+                }
+                // Os contadores do despachante com a hora do hospedeiro: a
+                // linha do convidado só tem o uptime dele.
+                if line.starts_with("[perf]") {
+                    let report = format!("[xtask] [perf] aos {:.1} s\n", launched.elapsed().as_secs_f64());
+                    print!("{report}");
+                    sink.lock().unwrap().push_str(&report);
                 }
                 line.clear();
             }

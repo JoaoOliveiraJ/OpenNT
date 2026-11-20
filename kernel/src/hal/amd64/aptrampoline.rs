@@ -171,7 +171,11 @@ ap_job_loop:
     mov rax, qword ptr [r15 + 0x08]                 # SLOT_JOB_FUNC
     test rax, rax
     jnz ap_run_job
-    pause
+    # Ocioso: dorme com o IF desligado até uma NMI (a do `start_job` depois
+    # de publicar a rotina, um shootdown ou o depurador). Uma NMI que chega
+    # entre o teste e o HLT volta ao teste (`ap_nmi_done`).
+ap_idle_halt:
+    hlt
     jmp ap_job_loop
 ap_run_job:
     # O BSP pode paginar/remapear imagens com os APs ociosos.
@@ -279,6 +283,16 @@ ap_translations:
     mov eax, dword ptr [rcx + 0x30]
     mov dword ptr [rdx + 0x3C], eax                 # SLOT_TLB_ACK
 ap_nmi_done:
+    # Interrompido entre o teste do trabalho e o HLT do laço ocioso: volta
+    # ao teste, para não dormir com uma rotina já publicada.
+    lea rax, [rip + ap_job_loop]
+    cmp qword ptr [rsp + 24], rax
+    jb ap_nmi_return
+    lea rcx, [rip + ap_idle_halt]
+    cmp qword ptr [rsp + 24], rcx
+    ja ap_nmi_return
+    mov qword ptr [rsp + 24], rax
+ap_nmi_return:
     pop rdx
     pop rcx
     pop rax
