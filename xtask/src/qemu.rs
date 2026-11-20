@@ -1204,13 +1204,15 @@ fn dismiss_lock(monitor: &mut TcpStream, ppm: &Path, keys: &str, sent: &mut Opti
 /// sobe numa animação).
 const DISMISS_WAIT: Duration = Duration::from_secs(60);
 
-/// O `--mouse`: espera a tela parada (por até [`STILL_WAIT`]), anda o mouse
-/// PS/2 (`dx`, `dy`) em [`MOUSE_STEPS`] `mouse_move` e lê a tela de novo
-/// até o ponteiro ter andado ([`screen_check::cursor_moved`]), por até
-/// [`MOUSE_WAIT`]. Devolve de onde para onde ele foi, ou o que faltou na
+/// O `--mouse`: espera a tela desenhada parada
+/// ([`screen_check::drawn_screen`], por até [`STILL_WAIT`]), anda o mouse
+/// PS/2 (`dx`, `dy`) em [`MOUSE_STEPS`] `mouse_move` (a hora vai para
+/// `sent`) e lê a tela de novo até o ponteiro ter andado
+/// ([`screen_check::cursor_moved`]), por até [`MOUSE_WAIT`]. Devolve de onde para onde ele foi, ou o que faltou na
 /// última leitura.
-fn move_mouse(monitor: &mut TcpStream, ppm: &Path, dx: i32, dy: i32) -> Result<String, String> {
-    let before = still_screen(monitor, ppm, STILL_WAIT, |_| Ok(String::new()))?;
+fn move_mouse(monitor: &mut TcpStream, ppm: &Path, dx: i32, dy: i32, sent: &mut Option<Instant>) -> Result<String, String> {
+    let before = still_screen(monitor, ppm, STILL_WAIT, screen_check::drawn_screen)?;
+    *sent = Some(Instant::now());
     for step in 0..MOUSE_STEPS {
         // Os passos somam o movimento inteiro, com o resto da divisão
         // distribuído.
@@ -1670,7 +1672,10 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
                 }
                 InputAction::Mouse { dx, dy } => {
                     let ppm = log.with_file_name("tela-monitor.ppm");
-                    match with_monitor(&mut |monitor| move_mouse(monitor, &ppm, *dx, *dy)) {
+                    let mut sent = None;
+                    let outcome = with_monitor(&mut |monitor| move_mouse(monitor, &ppm, *dx, *dy, &mut sent));
+                    let at = sent.map_or(at, |sent| sent.duration_since(launched).as_secs_f64());
+                    match outcome {
                         Ok(description) => note(format!("[xtask] mouse movido pelo monitor (aos {at:.1} s): {description}\n{CURSOR_MOVED_MARKER}")),
                         Err(missing) => {
                             note(format!("[xtask] mouse movido pelo monitor (aos {at:.1} s), mas o ponteiro nao andou: {missing}"));

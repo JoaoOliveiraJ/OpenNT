@@ -403,6 +403,25 @@ fn changes(before: &Image, after: &Image) -> Vec<Change> {
     groups
 }
 
+/// Uma tela desenhada por baixo do ponteiro: a gráfica, com um quarto ou
+/// mais fora do preto e sem ser a de bugcheck. O `--mouse` só anda o mouse
+/// sobre ela (a tela de bloqueio, não o vídeo de boot preto com o ponteiro).
+pub fn drawn_screen(image: &Image) -> Result<String, String> {
+    if !is_graphics(image) {
+        return Err(format!("a tela e {}x{}, nao a grafica", image.width, image.height));
+    }
+    let total = image.width * image.height;
+    let drawn = image.rgb.chunks_exact(3).filter(|pixel| !is_black([pixel[0], pixel[1], pixel[2]])).count();
+    let bugcheck = image.rgb.chunks_exact(3).filter(|pixel| [pixel[0], pixel[1], pixel[2]] == BUGCHECK_BACKGROUND).count();
+    if bugcheck * 2 > total {
+        return Err("a tela de bugcheck".into());
+    }
+    if drawn * 4 < total {
+        return Err(format!("{}% da tela desenhada (minimo 25%)", drawn * 100 / total));
+    }
+    Ok(format!("{}% da tela desenhada", drawn * 100 / total))
+}
+
 /// O ponteiro andou de `before` para `after`, depois de o mouse andar
 /// (`dx`, `dy`) (o sinal de cada eixo; a aceleração do Windows muda a
 /// distância): entre as mudanças da tela há um grupo do tamanho do ponteiro
@@ -772,6 +791,13 @@ mod tests {
         assert!(gone.contains("1 com o ponteiro so antes e 0 com o ponteiro so depois"), "{gone}");
         let resized = cursor_moved(&before, &filled(800, 600, [0, 0, 0]), 150, 100).unwrap_err();
         assert!(resized.contains("mudou de tamanho"), "{resized}");
+        // O mouse só anda sobre uma tela desenhada: a de bloqueio passa; o
+        // vídeo de boot preto com o ponteiro e a tela de bugcheck não.
+        assert!(drawn_screen(&before).is_ok());
+        let mut boot = filled(WIDTH, HEIGHT, [0, 0, 0]);
+        pointer(&mut boot, 512, 384);
+        assert!(drawn_screen(&boot).unwrap_err().contains("da tela desenhada"));
+        assert!(drawn_screen(&filled(WIDTH, HEIGHT, BUGCHECK_BACKGROUND)).unwrap_err().contains("bugcheck"));
     }
 
     /// A tela de bloqueio dispensada: a de credenciais (outro fundo, sem o
