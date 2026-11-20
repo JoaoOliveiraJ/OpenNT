@@ -353,6 +353,13 @@ comando = "cargo xtask test-boot USER_INITIALIZED 900000 --initial-process=smss 
 descricao = "O boot do teste conexao-console até o LogonUI.exe. Depois da conexão, o winlogon da sessão 1 carrega o tema, reabre as Desktops Default, Disconnect e Winlogon da WinSta0 e cria o LogonUI.exe pelo NtCreateUserProcess (LOGONUI_STARTED). O LogonUI mostra a interface XAML da tela de logon, que o dwm compõe (teste tela-de-logon)."
 
 [[teste]]
+id = "gerenciador-de-usuarios"
+titulo = "UserManager real no svchost do netsvcs"
+marcador = "USERMGR_STARTED"
+comando = "cargo xtask test-boot USER_INITIALIZED 900000 --initial-process=smss --display=basic --build-dir=build/gerenciador-de-usuarios --smp=1 --expect=SERVICES_STARTED --expect=USERMGR_STARTED --hold=60000"
+descricao = "O boot do teste services-scm até o gerenciador de usuários. No início automático, depois do RpcSs e do ProfSvc (as dependências dele), o services.exe cria o svchost.exe -k netsvcs -p, que carrega o usermgr.dll, o ServiceDll do UserManager (USERMGR_STARTED). O serviço fica RUNNING e termina de subir num work item: ativa as fábricas WinRT Windows.System.User e Windows.System.Internal.UserManager pelo catálogo (o servidor UserManager da SOFTWARE), cria a chave volátil Winlogon\\VolatileUserMgrKey, marca o próprio svchost como crítico (ProcessBreakOnTermination, porque o Winlogon tem o ShellInfrastructure) e registra as interfaces RPC b18fbab6-56f8-4702-84e0-41053293a869 e 0d3c7f20-1c8d-4654-a1b3-51563b298bda no epmapper. Sem as fábricas ou sem o RPC o serviço para, e o fim do svchost crítico seria o bugcheck 0xEF: o sistema segue 60 s sem falha na serial (--hold)."
+
+[[teste]]
 id = "logon-do-usuario"
 titulo = "Logon da conta de teste pelo winlogon.exe"
 marcador = "USER_LOGON_OK"
@@ -367,6 +374,14 @@ marcador = "PROFILE_LOADED"
 comando = "cargo xtask test-boot USER_INITIALIZED 900000 --initial-process=smss --display=basic --conta-de-teste --build-dir=build/perfil-do-usuario --smp=1 --expect=USER_LOGON_OK --expect=PROFILE_LOADED"
 espera_falha = true
 descricao = "O boot do teste logon-do-usuario até o perfil da conta. No NotifyLogon, o winlogon avisa o serviço de perfis (o assinante Profiles de Control\\Winlogon\\Notifications). No primeiro logon, o profsvc cria C:\\Users\\Usuario, copia o perfil Default (o CopyFile do KernelBase move os dados pelo NtCopyFileChunk), grava o ProfileList\\<SID> e monta o NTUSER.DAT em \\Registry\\User\\<SID> pelo NtLoadKey3 com o token do usuário (PROFILE_LOADED: a hive do usuário do USER_LOGON_OK, não a <SID>_Classes). Depois monta o UsrClass.dat em <SID>_Classes e grava o Volatile Environment, que o winlogon lê para montar o ambiente do usuário. Ainda falha: a cadeia não chega ao logon da conta (teste logon-do-usuario)."
+
+[[teste]]
+id = "sihost"
+titulo = "sihost.exe real da conta de teste"
+marcador = "SIHOST_READY"
+comando = "cargo xtask test-boot USER_INITIALIZED 1200000 --initial-process=smss --display=basic --conta-de-teste --build-dir=build/sihost --smp=1 --expect=USERMGR_STARTED --expect=USER_LOGON_OK --expect=UMGR_USER_LOGIN \"--expect=criou sihost.exe\" --expect=SIHOST_READY --expect=USERINIT_STARTED"
+espera_falha = true
+descricao = "O boot dos testes gerenciador-de-usuarios e perfil-do-usuario até o sihost.exe. Com o UserManager RUNNING, o winlogon faz o logon da conta pelo UMgrLogonUser: o usermgr chama o LsaLogonUser e devolve o token como atributo de handle ALPC (USER_LOGON_OK). No NotifyLogon, depois dos assinantes, o UMgrInformUserLogon leva o token ao UserManager, que carrega a referência do perfil (LoadUserProfileW pelo ProfSvc), manda ao services.exe o controle dos serviços por usuário e publica o WNF_UMGR_USER_LOGIN (UMGR_USER_LOGIN). O UMgrLaunchShellInfrastructureHost faz o svchost da sessão 0 pegar o token do usuário no LSM (WTSQueryUserToken) e criar o sihost.exe na sessão 1 pelo CreateProcessAsUserW (criou sihost.exe). O sihost sobe os componentes em processo (área de transferência, ativação, tempo de vida dos aplicativos, gerenciamento de janelas, notificações, compartilhamento, UI Automation, áudio) e chama o UMgrLaunchShell, e o UserManager publica o WNF_UMGR_SIHOST_READY com o escopo da sessão do usuário (SIHOST_READY). O ShellStartup do winlogon, que espera esse nome até 30 s, cria o userinit.exe logo depois (USERINIT_STARTED). Ainda falha: a cadeia não chega ao logon da conta (teste logon-do-usuario), e os componentes que consultam o StateRepository precisam dos bancos dele, que pedem a FileFsSectorSizeInformation (classe 11) dos arquivos do volume."
 
 [[teste]]
 id = "userinit"

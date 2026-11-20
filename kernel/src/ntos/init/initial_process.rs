@@ -42,7 +42,10 @@
 //! `SHELL_TRAY_CREATED` ([`win32k_window_created`]) quando o explorer.exe
 //! cria a janela da barra de tarefas (Shell_TrayWnd) e o
 //! `STARTMENU_HOST_STARTED` quando o StartMenuExperienceHost.exe nasce com o
-//! token LowBox do usuário.
+//! token LowBox do usuário. Os do UserManager também: o `USERMGR_STARTED`
+//! ([`image_mapped`]) quando um svchost.exe mapeia o usermgr.dll, e o
+//! `UMGR_USER_LOGIN` e o `SIHOST_READY` ([`wnf_updated`]) quando esse svchost
+//! publica o aviso do logon e o do sihost.exe pronto.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -438,22 +441,74 @@ fn lsa_endpoint_created(name: &str) {
 }
 
 static SVCHOST_LSM_STARTED: AtomicBool = AtomicBool::new(false);
+static USERMGR_STARTED: AtomicBool = AtomicBool::new(false);
 static TERMSRV_READY: AtomicBool = AtomicBool::new(false);
 static SESSION1_CONNECTED: AtomicBool = AtomicBool::new(false);
 
 /// Uma vista de imagem completa entrou no processo `process`
 /// (`mm/section/image_view.rs`): o `SVCHOST_LSM_STARTED` sai quando um
 /// svchost.exe mapeia o lsm.dll, o ServiceDll do Local Session Manager que
-/// o services.exe pediu.
+/// o services.exe pediu, e o `USERMGR_STARTED` quando um svchost.exe mapeia
+/// o usermgr.dll, o ServiceDll do UserManager (início automático depois do
+/// RpcSs e do ProfSvc).
 pub fn image_mapped(process: u64, dll_name: &str) {
-    if !boot_config::smss_boot() || SVCHOST_LSM_STARTED.load(Ordering::Acquire) || !dll_name.eq_ignore_ascii_case("lsm.dll") {
+    if !boot_config::smss_boot() {
         return;
     }
-    if image_name(process).eq_ignore_ascii_case("svchost.exe") && !SVCHOST_LSM_STARTED.swap(true, Ordering::AcqRel) {
-        // SAFETY: o EPROCESS do processo da vista, retido por ela.
-        let pid = unsafe { Eprocess::at(process) }.unique_process_id.get();
-        crate::debug_print!("[init] svchost.exe (pid {}): lsm.dll mapeado", pid);
-        crate::debug_print!("SVCHOST_LSM_STARTED");
+    let (done, dll, marker) = if dll_name.eq_ignore_ascii_case("lsm.dll") {
+        (&SVCHOST_LSM_STARTED, "lsm.dll", "SVCHOST_LSM_STARTED")
+    } else if dll_name.eq_ignore_ascii_case("usermgr.dll") {
+        (&USERMGR_STARTED, "usermgr.dll", "USERMGR_STARTED")
+    } else {
+        return;
+    };
+    if done.load(Ordering::Acquire) || !image_name(process).eq_ignore_ascii_case("svchost.exe") || done.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    // SAFETY: o EPROCESS do processo da vista, retido por ela.
+    let pid = unsafe { Eprocess::at(process) }.unique_process_id.get();
+    crate::debug_print!("[init] svchost.exe (pid {}): {} mapeado", pid, dll);
+    crate::debug_print!("{}", marker);
+}
+
+/// WNF_UMGR_USER_LOGIN, de escopo de sistema: o SendServiceAndLsaNotification
+/// do usermgr.dll (0x5f140) o publica no UMgrInformUserLogon do winlogon,
+/// depois do LoadUserProfileW, com o contexto e a sessão do usuário.
+const WNF_UMGR_USER_LOGIN: u64 = 0x1381_0338_A3BC_1075;
+/// WNF_UMGR_SIHOST_READY, de escopo de sessão: o LaunchShell do usermgr.dll
+/// (0x896f8) o publica do svchost da sessão 0 com o ExplicitScope da sessão
+/// do usuário, quando o sihost.exe, com todos os componentes de pé, chama o
+/// UMgrLaunchShell; o ShellStartup do winlogon espera por ele até 30 s antes
+/// de criar o userinit.
+const WNF_UMGR_SIHOST_READY: u64 = 0x1381_0338_A3BC_0835;
+
+static UMGR_USER_LOGIN: AtomicBool = AtomicBool::new(false);
+static SIHOST_READY: AtomicBool = AtomicBool::new(false);
+
+/// Um NtUpdateWnfStateData de usuário voltou com sucesso
+/// (`ps/user/wnf.rs`) para o nome `state_name`, com o ULONG do ExplicitScope
+/// em `scope` quando havia um: o `UMGR_USER_LOGIN` sai quando o svchost.exe
+/// do UserManager publica o WNF_UMGR_USER_LOGIN, e o `SIHOST_READY` quando
+/// ele publica o WNF_UMGR_SIHOST_READY para a sessão do usuário.
+pub fn wnf_updated(state_name: u64, scope: Option<u32>) {
+    if !boot_config::smss_boot() || state_name != WNF_UMGR_USER_LOGIN && state_name != WNF_UMGR_SIHOST_READY {
+        return;
+    }
+    if !image_name(process::get_current_process()).eq_ignore_ascii_case("svchost.exe") {
+        return;
+    }
+    let pid = process::get_current_process_id();
+    if state_name == WNF_UMGR_USER_LOGIN {
+        if !UMGR_USER_LOGIN.swap(true, Ordering::AcqRel) {
+            crate::debug_print!("[init] svchost.exe (pid {}): WNF_UMGR_USER_LOGIN publicado", pid);
+            crate::debug_print!("UMGR_USER_LOGIN");
+        }
+        return;
+    }
+    let Some(session) = scope else { return };
+    if !SIHOST_READY.swap(true, Ordering::AcqRel) {
+        crate::debug_print!("[init] svchost.exe (pid {}): WNF_UMGR_SIHOST_READY publicado para a sessao {}", pid, session);
+        crate::debug_print!("SIHOST_READY");
     }
 }
 

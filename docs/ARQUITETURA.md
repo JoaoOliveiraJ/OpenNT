@@ -7275,6 +7275,12 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   WinSta0; ainda não sai: a Desktop Winlogon é criada, mas o
   NtUserCreateDesktopEx não volta, com o wininit e a RawInputThread
   esperando a resposta de mensagens à thread da Desktop do csrss);
+  `USERMGR_STARTED` (um svchost.exe mapeia o usermgr.dll, o ServiceDll do
+  UserManager; teste gerenciador-de-usuarios), `UMGR_USER_LOGIN` e
+  `SIHOST_READY` (com `--conta-de-teste`: o svchost do UserManager publica
+  o WNF_UMGR_USER_LOGIN e o WNF_UMGR_SIHOST_READY com o escopo da sessão
+  do usuário, `initial_process::wnf_updated` chamado pelo
+  NtUpdateWnfStateData de `ps/user/wnf.rs`; teste sihost),
   `USER_LOGON_OK`, `PROFILE_LOADED`, `USERINIT_STARTED` e
   `EXPLORER_STARTED` (com `--conta-de-teste`, observações de
   `initial_process.rs`: o token do logon interativo da conta entra no

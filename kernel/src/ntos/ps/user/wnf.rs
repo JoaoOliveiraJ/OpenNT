@@ -29,7 +29,27 @@ fn nt_update_wnf_state_data(state_name: u64, buffer: u64, length: u64, type_iden
         return Ok(0xC000_0005);
     }
     let check_stamp = state::stack_arg32(rsp, 7) != 0;
-    wnf_service::update_user(state_name, buffer, length as u32, type_identifier, state::stack_arg(rsp, 5), state::stack_arg32(rsp, 6), check_stamp)
+    let explicit_scope = state::stack_arg(rsp, 5);
+    let status = wnf_service::update_user(state_name, buffer, length as u32, type_identifier, explicit_scope, state::stack_arg32(rsp, 6), check_stamp)?;
+    if status == 0 {
+        update_observed(state_name, explicit_scope);
+    }
+    Ok(status)
+}
+
+/// Os marcadores do logon do usuário que saem de uma publicação
+/// (`initial_process::wnf_updated`): o nome e, com ExplicitScope, o ULONG do
+/// escopo (a sessão de um nome de escopo de sessão). Só observação: uma
+/// leitura que falha não muda o resultado do serviço.
+fn update_observed(state_name: u64, explicit_scope: u64) {
+    use crate::ntos::mm::guest_memory as guest;
+    use crate::ntos::ps::user_probe;
+    if !user_probe::probe_user_read(state_name, 8) {
+        return;
+    }
+    let Ok(name) = guest::try_read::<u64>(state_name) else { return };
+    let scope = if explicit_scope != 0 && user_probe::probe_user_read(explicit_scope, 4) { guest::try_read::<u32>(explicit_scope).ok() } else { None };
+    crate::ntos::init::initial_process::wnf_updated(name, scope);
 }
 
 /// NtCreateWnfStateName(StateName, NameLifetime, DataScope, PersistData,
