@@ -24,3 +24,4 @@ pub mod power_request;
 pub mod win32_callout;
 pub mod processor_power;
 pub mod boot_status;
+pub mod transition_checkpoint;

@@ -5,12 +5,15 @@
 //! (cabeça da fila, DO_SHUTDOWN_REGISTERED, retirada das duas filas), o
 //! IRP_MJ_SHUTDOWN de uma entrada entregue ao topo da pilha, o valor do
 //! PM1_CNT do S5 e o HalpShutdownContext do HaliAcpiMachineStateInit, o
-//! ShutdownTime do ExShutdownSystem(0), a política DontPowerOffAfterShutdown
-//! e, de um processo de teste (modo usuário), a validação e o
-//! SeShutdownPrivilege do NtShutdownSystem e do NtSetSystemPowerState.
+//! ShutdownTime do ExShutdownSystem(0), a política DontPowerOffAfterShutdown,
+//! o PoCleanShutdownFlags e o PopShutdownEvent que só ele libera e, de um
+//! processo de teste (modo usuário), a validação e o SeShutdownPrivilege do
+//! NtShutdownSystem e do NtSetSystemPowerState.
 //!
 //! `run_boot_scenario` é o teste de boot do `--shutdown-test`, depois do
-//! `--start-driver=ntfs`: no primeiro boot grava `OPENNT-DESLIGAMENTO.TXT`
+//! `--start-driver=ntfs`: cada boot deixa uma thread do
+//! PoRequestShutdownEvent esperando o evento para sempre (o desligamento
+//! comum não a espera); no primeiro boot grava `OPENNT-DESLIGAMENTO.TXT`
 //! pelo ntfs.sys real no volume do segundo disco e um valor na hive SYSTEM
 //! (`SHUTDOWN_PREPARED`) e chama o NtShutdownSystem com a ação pedida
 //! (ShutdownPowerOff ou ShutdownReboot). No boot seguinte (o QEMU religado,
@@ -252,11 +255,143 @@ fn user_mode_services(assert: Assert) {
     assert(enabled && held && sleep == STATUS_NOT_SUPPORTED && disabled, "shutdown: com o SeShutdownPrivilege habilitado pelo NtAdjustPrivilegesToken a checagem passa (a suspensao nao e suportada)");
 }
 
+/// O PoCleanShutdownFlags do CmControlVector e o começo do
+/// PopGracefulShutdown que depende dele.
+fn clean_shutdown_gate(assert: Assert) {
+    use crate::ntos::po::{shutdown, system_state};
+    let default = shutdown::clean_shutdown_flags();
+    let block = guest::alloc_bytes(0x400);
+    let (handle, name, data) = (block + 0x300, block + 0x320, block + 0x340);
+    let attributes = object_attributes(block, "\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Kernel");
+    let created = status("ZwCreateKey", &[handle, 0xF003F, attributes, 0, 0, 0, 0]);
+    let key = guest::read64(handle);
+    let text = block + 0x360;
+    crate::ntos::rtl::guest_strings::write_wide_string(text, "PoCleanShutdownFlags");
+    let units = "PoCleanShutdownFlags".len() as u16 * 2;
+    guest::write16(name, units);
+    guest::write16(name + 2, units + 2);
+    guest::write64(name + 8, text);
+    // Até quatro bytes de qualquer tipo, sobre o 0 da imagem.
+    let mut observed = Vec::new();
+    for (value_type, bytes) in [(REG_BINARY as u64, &[0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66][..]), (REG_DWORD as u64, &[0x10, 0][..]), (REG_SZ, &[0x31, 0][..])] {
+        guest::write_bytes(data, bytes);
+        let set = status("ZwSetValueKey", &[key, name, 0, value_type, data, bytes.len() as u64]);
+        shutdown::initialize_control_values();
+        observed.push((set, shutdown::clean_shutdown_flags()));
+    }
+    let deleted = status("ZwDeleteValueKey", &[key, name]);
+    shutdown::initialize_control_values();
+    let restored = shutdown::clean_shutdown_flags();
+    let _ = status("ZwClose", &[key]);
+    assert(default == 0 && created == 0 && observed == [(0, 0x4433_2211), (0, 0x10), (0, 0x31)] && deleted == 0 && restored == 0, "shutdown: PoCleanShutdownFlags vem de Session Manager\\Kernel com ate 4 bytes do valor sobre o 0 da imagem");
+    // Com o valor 0 (o boot comum), o PopGracefulShutdown não sinaliza o
+    // PopShutdownEvent nem espera as threads: a do teste está na lista e não
+    // termina, e o passo volta na hora com a lista ainda aberta.
+    let event_out = block + 0x3F0;
+    let thread = crate::ntos::ps::process::get_current_thread();
+    let requested = status("PoRequestShutdownEvent", &[event_out]);
+    let event = guest::read64(event_out);
+    let waited = if restored == 0 { shutdown::shutdown_event_step() } else { usize::MAX };
+    let again = status("PoRequestShutdownEvent", &[event_out]);
+    let signalled = event != 0 && at::<nt::Kevent>(event).header.signal_state.get() != 0;
+    assert(requested == 0 && event != 0 && waited == 0 && !signalled && again == 0 && system_state::shutdown_waiters().contains(&thread), "shutdown: sem PoCleanShutdownFlags o PopGracefulShutdown nao sinaliza o PopShutdownEvent nem espera as threads do PoRequestShutdownEvent");
+    guest::free_bytes(block);
+}
+
+/// O IRP_MJ_SHUTDOWN do NTFS do kernel numa montagem própria do segundo
+/// disco (outra instância do writer: o volume de boot segue gravando).
+fn ntfs_shut_down(assert: Assert) {
+    use crate::drivers::fs::ntfs;
+    let Ok(volume) = ntfs::mount(1) else {
+        assert(false, "shutdown: montagem propria do volume NTFS");
+        return;
+    };
+    let before = volume.read("/HELLO.TXT").ok().flatten();
+    let readable = before.is_some();
+    let same = |text: Result<Option<String>, crate::rtl::KernelError>| text.ok().flatten() == before;
+    let closed = volume.shut_down().is_ok() && volume.is_shut_down();
+    let too_late = |status: Option<u32>| status == Some(0xC000_0189);
+    let create = volume.create_with_security("/OPENNT-TARDE.TXT", false, 0x20, 0, None).err().map(|error| error.status);
+    let write = volume.write("/HELLO.TXT", 0, b"x").err().map(|error| error.status);
+    let rename = volume.rename("/HELLO.TXT", "/HELLO2.TXT", false).err().map(|error| error.status);
+    let security = volume.set_security("/HELLO.TXT", &[1, 0, 4, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).err().map(|error| error.status);
+    let paging = volume.paging_write("/HELLO.TXT", 0, &[0; 512]).err().map(|error| error.status);
+    let still_readable = same(volume.read("/HELLO.TXT"));
+    // Nada chegou ao disco: outra montagem não vê o arquivo nem a mudança.
+    let disk = ntfs::mount(1).ok();
+    let untouched = disk.as_ref().is_some_and(|disk| matches!(disk.exists("/OPENNT-TARDE.TXT"), Ok(false)) && matches!(disk.exists("/HELLO2.TXT"), Ok(false)) && same(disk.read("/HELLO.TXT")));
+    assert(readable && closed && too_late(create) && too_late(write) && too_late(rename) && too_late(security) && too_late(paging) && still_readable && untouched, "shutdown: depois do desligamento o NTFS recusa criacao, escrita, renomeacao, descritor e paginacao com STATUS_TOO_LATE e segue lendo");
+}
+
+/// Corpo da thread do segundo pedido de desligamento: fica para sempre no
+/// PopTransitionLock.
+extern "win64" fn second_shutdown_request(_context: u64) {
+    crate::ntos::po::shutdown::wait_behind_running_shutdown();
+}
+
+/// O segundo pedido espera o primeiro sem parar a CPU dele.
+fn second_request(assert: Assert) {
+    use crate::ntos::ke::{clock, thread_dispatch};
+    use crate::ntos::ps::{kernel_threads, scheduler};
+    let routine: extern "win64" fn(u64) = second_shutdown_request;
+    let handle = kernel_threads::create_system_thread(0, routine as usize as u64, 0, 0x1F_FFFF, 0, None).unwrap_or(0);
+    let thread = kernel_threads::of_handle(handle).unwrap_or(0);
+    let waiting = || thread != 0 && thread_dispatch::thread_state(thread) == thread_dispatch::state::WAITING;
+    let deadline = clock::uptime_ms() + 5000;
+    while clock::uptime_ms() < deadline && !waiting() {
+        scheduler::tick(-1);
+    }
+    // A CPU segue: o relógio anda e a thread continua na espera.
+    let ticks = clock::uptime_ms();
+    while clock::uptime_ms() < ticks + 50 {
+        scheduler::tick(-1);
+    }
+    let kthread = (thread != 0).then(|| at::<nt::Kthread>(thread));
+    assert(waiting() && kthread.is_some_and(|kthread| kthread.wait_mode.get() == 0), "shutdown: o segundo pedido de desligamento espera o PopTransitionLock em KernelMode sem parar a CPU");
+    if handle != 0 {
+        let _ = status("ZwClose", &[handle]);
+    }
+}
+
+/// O PowerInformationInternal TransitionCheckpoint do NtPowerInformation de
+/// modo usuário.
+fn transition_checkpoint(assert: Assert) {
+    use crate::ntos::po::{power_information, transition_checkpoint as checkpoints};
+    let outcome = with_test_process("checkpoint-teste", None, |_| {
+        let region = memory::map_user_region(0x1000).unwrap_or(0);
+        let (input, output) = (region, region + 0x100);
+        guest::write32(input, checkpoints::TRANSITION_CHECKPOINT);
+        guest::write32(input + 4, 0);
+        let call = |id: u32, kind: u32, length: u32, output_length: u32| {
+            guest::write32(input + 8, id);
+            guest::write32(input + 0xC, kind);
+            power_information::query_user(87, input, length, if output_length != 0 { output } else { 0 }, output_length).unwrap_or(u32::MAX)
+        };
+        let short = call(0x55, 7, 0xC, 0);
+        let with_output = call(0x55, 7, 0x10, 4);
+        let first = call(0x55, 7, 0x10, 0);
+        let after_first = checkpoints::latest();
+        let second = call(1, 2, 0x10, 0);
+        (short, with_output, first, after_first, second, checkpoints::latest(), checkpoints::checkpoints().last().copied())
+    });
+    let Some((short, with_output, first, after_first, second, latest, last)) = outcome else {
+        assert(false, "shutdown: processo de teste do TransitionCheckpoint");
+        return;
+    };
+    assert(short == 0xC000_0023 && with_output == 0xC000_000D, "shutdown: TransitionCheckpoint recusa entrada curta (STATUS_BUFFER_TOO_SMALL) e saida (STATUS_INVALID_PARAMETER)");
+    let sequence = after_first.0;
+    assert(first == 0 && after_first.1 == 0x55 && after_first.2 == 7 && second == 0 && latest == (sequence.wrapping_add(1), 1, 2) && last.is_some_and(|entry| entry.sequence == latest.0 && entry.id == 1 && entry.kind == 2 && entry.interrupt_time != 0), "shutdown: TransitionCheckpoint grava o ultimo Id e Type e o Id 1 abre a lista com o InterruptTime");
+}
+
 pub fn run(assert: Assert) {
     io_queues(assert);
     hal_power_off(assert);
     shutdown_time(assert);
     policy(assert);
+    clean_shutdown_gate(assert);
+    ntfs_shut_down(assert);
+    second_request(assert);
+    transition_checkpoint(assert);
     user_mode_services(assert);
 }
 
@@ -379,11 +514,42 @@ fn check_persisted(through_driver: &[u8]) -> Result<String, String> {
     }
 }
 
+/// Corpo da thread que pede o PopShutdownEvent e o espera para sempre, como
+/// o RawInputThread da sessão 0 do win32kfull: o evento só é sinalizado com
+/// o PoCleanShutdownFlags, e o desligamento comum não espera por ela.
+extern "win64" fn shutdown_event_waiter(event_out: u64) {
+    if matches!(crate::ntos::po::system_state::request_shutdown_event(event_out), Ok(0)) {
+        let event = guest::read64(event_out);
+        crate::ntos::ke::dispatcher::wait_for_single_object(event, 0, 0, false);
+    }
+}
+
+/// Cria a thread do PoRequestShutdownEvent e roda o escalonador até ela
+/// entrar na lista de espera de desligamento.
+fn start_shutdown_event_waiter() -> bool {
+    use crate::ntos::ke::clock;
+    use crate::ntos::po::system_state;
+    let before = system_state::shutdown_waiters().len();
+    let event_out = guest::alloc_bytes(8);
+    let routine: extern "win64" fn(u64) = shutdown_event_waiter;
+    if event_out == 0 || crate::ntos::ps::kernel_threads::create_system_thread(0, routine as usize as u64, event_out, 0x1F_FFFF, 0, None).is_err() {
+        return false;
+    }
+    let deadline = clock::uptime_ms() + 5000;
+    while clock::uptime_ms() < deadline && system_state::shutdown_waiters().len() == before {
+        crate::ntos::ps::scheduler::tick(-1);
+    }
+    system_state::shutdown_waiters().len() > before
+}
+
 /// O teste de boot do `--shutdown-test`: só volta se não puder desligar.
 pub fn run_boot_scenario() {
     let action = match boot_config::shutdown_test() {
         "poweroff" => 2,
         "reboot" => 1,
+        // O desligamento da cadeia sai do gancho de primeiro boot do
+        // winlogon; aqui só a conferência do boot seguinte.
+        "cadeia" => return chain_boot_check(),
         other => {
             debug_print!("SELFTEST FALHOU: --shutdown-test={} (poweroff ou reboot)", other);
             return;
@@ -391,6 +557,12 @@ pub fn run_boot_scenario() {
     };
     if ata_volume::device().is_none() {
         debug_print!("SELFTEST FALHOU: desligamento: o volume do ntfs.sys nao foi montado (--start-driver=ntfs)");
+        return;
+    }
+    // Uma thread do PoRequestShutdownEvent que nunca termina: o desligamento
+    // comum (PoCleanShutdownFlags = 0) não a espera.
+    if !start_shutdown_event_waiter() {
+        debug_print!("SELFTEST FALHOU: desligamento: a thread do PoRequestShutdownEvent nao entrou na lista");
         return;
     }
     match read_volume_file(PERSISTED_FILE) {
@@ -408,10 +580,61 @@ pub fn run_boot_scenario() {
                 debug_print!("SELFTEST FALHOU: desligamento: {}", message);
                 return;
             }
-            debug_print!("SHUTDOWN_PREPARED arquivo={} setores_pendentes={} acao={}", PERSISTED_FILE, ata_volume::pending_sectors(), boot_config::shutdown_test());
+            debug_print!("SHUTDOWN_PREPARED arquivo={} setores_pendentes={} acao={} esperando_evento={}", PERSISTED_FILE, ata_volume::pending_sectors(), boot_config::shutdown_test(), crate::ntos::po::system_state::shutdown_waiters().len());
             let refused = crate::ntos::po::shutdown::shutdown_system(action);
             debug_print!("SELFTEST FALHOU: NtShutdownSystem({}) voltou: {:?}", action, refused.map_err(|error| format!("{error}")));
         }
         Err(message) => debug_print!("SELFTEST FALHOU: desligamento: {}", message),
+    }
+}
+
+// ---- o teste do --shutdown-test=cadeia ---------------------------------------
+
+/// O arquivo que o gancho de primeiro boot grava antes do shutdown.exe (o
+/// `test_account::CHAIN_FILE` do xtask), no caminho do volume C:.
+const CHAIN_FILE: &str = "/OPENNT-CADEIA.TXT";
+const SETUP_KEY: &str = "\\Registry\\Machine\\SYSTEM\\Setup";
+/// Os nomes das contas do domínio de contas no SAM e a conta de teste.
+const SAM_NAMES: &str = "\\Registry\\Machine\\SAM\\SAM\\Domains\\Account\\Users\\Names";
+const TEST_ACCOUNT: &str = "Usuario";
+/// O RID da primeira conta criada (o NextRid de um banco novo).
+const FIRST_ACCOUNT_RID: u32 = 1000;
+
+/// O `--shutdown-test=cadeia` no boot, com as hives de máquina carregadas
+/// do volume e antes do smss. Sem o arquivo é o primeiro boot: o gancho de
+/// primeiro boot do winlogon ainda vai criar a conta, desfazer o gancho,
+/// gravar o arquivo e desligar a cadeia pelo shutdown.exe. Com ele, esse
+/// desligamento passou pelo disco: o arquivo (pelo leitor NTFS, que lê o
+/// disco), a conta que o samsrv do lsass gravou no SAM (o tipo do valor
+/// padrão do nome é o RID), o gancho desfeito pelo reg.exe na SYSTEM e o
+/// ShutdownTime do ExShutdownSystem(0) precisam ter voltado
+/// (`SHUTDOWN_CHAIN_PERSISTED_OK`).
+fn chain_boot_check() {
+    use crate::ntos::cm::registry;
+    use crate::ntos::ex::shutdown as executive;
+    let Some(volume) = crate::drivers::fs::ntfs::mounted() else {
+        debug_print!("SELFTEST FALHOU: cadeia: volume C: sem o leitor NTFS");
+        return;
+    };
+    let file = match volume.read_bytes(CHAIN_FILE) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => {
+            debug_print!("[desligamento] cadeia: primeiro boot ({} ausente)", CHAIN_FILE);
+            return;
+        }
+        Err(error) => {
+            debug_print!("SELFTEST FALHOU: cadeia: leitura de {}: {}", CHAIN_FILE, error);
+            return;
+        }
+    };
+    let account = registry::list_keys(SAM_NAMES).into_iter().find(|name| registry::same_name(name, TEST_ACCOUNT)).and_then(|name| registry::read_value_by_path(&format!("{SAM_NAMES}\\{name}"), "")).map(|value| value.value_type);
+    let setup_type = registry::read_value_by_path(SETUP_KEY, "SetupType").as_ref().and_then(dword);
+    let time = registry::read_value_by_path(executive::WINDOWS_KEY, executive::SHUTDOWN_TIME_VALUE).filter(|value| value.value_type == REG_BINARY && value.data.len() == 8).map(|value| u64::from_le_bytes(value.data[..8].try_into().unwrap_or([0; 8])));
+    let now = guest::read64(0xFFFF_F780_0000_0014);
+    let time_ok = time.is_some_and(|time| time != 0 && time <= now);
+    if file.starts_with(b"cadeia") && account.is_some_and(|rid| rid >= FIRST_ACCOUNT_RID) && setup_type == Some(0) && time_ok {
+        debug_print!("SHUTDOWN_CHAIN_PERSISTED_OK arquivo={} bytes conta={} rid={} SetupType=0 ShutdownTime={:#x}", file.len(), TEST_ACCOUNT, account.unwrap_or(0), time.unwrap_or(0));
+    } else {
+        debug_print!("SELFTEST FALHOU: cadeia: arquivo {:?}, conta {} rid {:?}, SetupType = {:?}, ShutdownTime = {:?}", core::str::from_utf8(&file).unwrap_or("?"), TEST_ACCOUNT, account, setup_type, time);
     }
 }

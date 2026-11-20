@@ -371,6 +371,8 @@ fn level_answer(level: u32, input: &[u8], output_length: u32) -> Result<Answer, 
                     Ok(data) => Answer::Data(data),
                     Err(status) => Answer::Status(status),
                 },
+                // TransitionCheckpoint (`po/transition_checkpoint.rs`).
+                crate::ntos::po::transition_checkpoint::TRANSITION_CHECKPOINT => Answer::Status(crate::ntos::po::transition_checkpoint::request(input, has_output)),
                 _ => {
                     crate::debug_print!("[po] NtPowerInformation de modo usuario: PowerInformationInternal tipo {:#x} sem suporte", internal);
                     Answer::Status(STATUS_NOT_IMPLEMENTED)

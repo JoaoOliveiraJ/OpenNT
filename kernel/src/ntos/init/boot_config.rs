@@ -139,7 +139,9 @@ pub fn initial_process() -> &'static str {
 /// `--start-driver=ntfs`, o teste do desligamento (`ntos/test/shutdown.rs`)
 /// grava pelo ntfs.sys e no Registro e chama o NtShutdownSystem com essa
 /// ação; no boot seguinte confere o que sobreviveu e desliga (vazio = sem o
-/// teste).
+/// teste). `SHUTDOWNTEST=cadeia`: no boot do smss, o gancho de primeiro boot
+/// da conta de teste desliga a cadeia real pelo shutdown.exe e, no boot
+/// seguinte, o kernel confere o que voltou do disco.
 pub fn shutdown_test() -> &'static str {
     value(name::SHUTDOWN_TEST).unwrap_or("")
 }

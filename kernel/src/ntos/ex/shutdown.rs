@@ -10,7 +10,9 @@
 //!   ExpTooLateForErrors e ExpShuttingDown ficam ligados e as chaves que o
 //!   Ex mantém abertas são fechadas;
 //! - fase 1: o ExSwapinWorkerThreads, só com o bit 1 do PopShutdownCleanly
-//!   (desligado no boot comum);
+//!   (`po::shutdown::clean_shutdown_flags`, zero no boot comum); as pilhas
+//!   das threads de trabalho do OpenNT nunca saem da memória, então não há
+//!   o que trazer de volta;
 //! - fase 2: nada.
 
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -99,6 +101,8 @@ pub fn shutdown_system(phase: u32) -> Result<(), KernelError> {
         }
         TOO_LATE_FOR_ERRORS.store(true, Ordering::Release);
         SHUTTING_DOWN.store(true, Ordering::Release);
+    } else if phase == 1 && crate::ntos::po::shutdown::clean_shutdown_flags() & 2 != 0 {
+        debug_print!("[ex] desligamento: ExSwapinWorkerThreads (pilhas sempre residentes)");
     }
     Ok(())
 }

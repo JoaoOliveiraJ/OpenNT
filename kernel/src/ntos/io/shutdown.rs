@@ -31,6 +31,10 @@
 //! O NTFS e os outros file systems recebem o desligamento pela fila de file
 //! systems (o ntfs.sys não chama o IoRegisterShutdownNotification); o
 //! mountmgr.sys registra na fila comum e o volmgr.sys na de última chance.
+//! O file system embutido do volume de boot (`\FileSystem\KernelVolume`) não
+//! está na fila de file systems: ele fecha os volumes dele logo depois dos de
+//! disco (`drivers/fs/volume_device::shut_down_volumes`) e conta como um file
+//! system no SHUTDOWN_NOTIFIED.
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -193,6 +197,9 @@ pub fn shutdown_system(phase: u32) -> Result<(), KernelError> {
                 debug_print!("[io] IRP_MJ_SHUTDOWN -> file system {:#x} ({}): {:#x}", target, driver_name(target), status);
                 DELIVERED[1].fetch_add(1, Ordering::AcqRel);
             })?;
+            // O file system embutido do volume de boot recebe o mesmo
+            // desligamento logo depois dos de disco.
+            DELIVERED[1].fetch_add(crate::drivers::fs::volume_device::shut_down_volumes(), Ordering::AcqRel);
             drain(&LAST_CHANCE_QUEUE, &DELIVERED[2])
         }
         _ => Ok(()),

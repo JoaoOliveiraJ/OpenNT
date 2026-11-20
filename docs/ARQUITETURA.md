@@ -3336,21 +3336,34 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   `ex/shutdown.rs`, `hal/firmware_return.rs`): NtShutdownSystem e o
   NtSetSystemPowerState das ações de desligamento, de modo kernel e de
   usuário (SeShutdownPrivilege habilitado), seguem o PopGracefulShutdown do
-  19041: o PopShutdownEvent e as threads do PoRequestShutdownEvent,
-  ExShutdownSystem(0) (o ShutdownTime em Control\Windows),
-  IoShutdownSystem(0) (IRP_MJ_SHUTDOWN síncrono no topo da pilha de cada
-  IoRegisterShutdownNotification, da cabeça para a cauda), CmShutdownSystem
-  (as hives no disco), IoShutdownSystem(1) (os file systems das filas de
-  disco, CD-ROM e fita, sob o IopDatabaseResource que não é mais solto, e
-  a fila de última chance), CcWaitForCurrentLazyWriterActivity e o
+  19041: só com o PoCleanShutdownFlags de `Session Manager\Kernel`
+  (CmControlVector, 0 no boot comum) o PopShutdownEvent é sinalizado e as
+  threads do PoRequestShutdownEvent são esperadas (a thread de entrada da
+  sessão 0 do win32kfull nunca termina sem ele); ExShutdownSystem(0) (o
+  ShutdownTime em Control\Windows), IoShutdownSystem(0) (IRP_MJ_SHUTDOWN
+  síncrono no topo da pilha de cada IoRegisterShutdownNotification, da
+  cabeça para a cauda), CmShutdownSystem (as hives no disco),
+  MmShutdownSystem(0) (`mm/shutdown.rs`: as páginas alteradas de toda
+  seção de dados de arquivo com vista, o MiFlushAllFilesystemPages),
+  IoShutdownSystem(1) (os file systems das filas de disco, CD-ROM e fita,
+  sob o IopDatabaseResource que não é mais solto, o NTFS do volume de boot,
+  que descarrega o disco e passa a recusar criação, escrita, metadado e
+  paginação com STATUS_TOO_LATE como o NtfsShutdownVolume, e a fila de
+  última chance), CcWaitForCurrentLazyWriterActivity e o
   PopShutdownSystem, que vai ao HalReturnToFirmware: S5 pelo PM1x_CNT com
   o HalpShutdownContext do HaliAcpiMachineStateInit (sem o acpi.sys, do
-  `\_S5_` da DSDT) ou o reinício (CMOS 0x0F, 0x472, RESET_REG, 8042). A
+  `\_S5_` da DSDT) ou o reinício (CMOS 0x0F, 0x472, RESET_REG, 8042). Um
+  segundo pedido espera em KernelMode, sem prazo, o PopTransitionLock que o
+  primeiro nunca solta (a CPU dele segue rodando). Os pontos de controle da
+  transição (`po/transition_checkpoint.rs`, o PopTransitionCheckpoint e o
+  PowerInformationInternal 0x1b do wininit e do csrss) são registrados. A
   política DontPowerOffAfterShutdown faz o ShutdownNoReboot parar sem
-  desligar. Os passos de componentes que o OpenNT não tem (Tm, Etw, Mm sem
-  paginação, os IRPs S5 aos dispositivos) ficam de fora. O shell tem
-  `shutdown` e `reboot`; o `--shutdown-test` cobre o caminho inteiro com o
-  ntfs.sys real (testes `shutdown` e `reboot`).
+  desligar. Os passos de componentes que o OpenNT não tem (Tm, Etw, os
+  IRPs S5 aos dispositivos) ficam de fora. O shell tem `shutdown` e
+  `reboot`; o `--shutdown-test` cobre o caminho inteiro com o ntfs.sys real
+  (testes `shutdown` e `reboot`) e, com `cadeia`, o desligamento da cadeia
+  real pelo shutdown.exe e o boot seguinte do disco gravado (teste
+  `desligamento-cadeia`).
 - **Dependências entre dispositivos** (`io/dependency.rs`): o grafo das
   Pip* (nós 'PnpS' em DEVOBJ_EXTENSION.DependencyNode, arestas com os
   pedidos por dispositivo ou por nome de ligação, ids de ligação). Ficam de

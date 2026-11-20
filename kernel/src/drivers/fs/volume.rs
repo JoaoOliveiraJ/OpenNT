@@ -93,6 +93,11 @@ pub trait FileSystem: Sync {
     fn paging_write(&self, _path: &str, _offset: u64, _bytes: &[u8]) -> Option<Result<(), KernelError>> {
         None
     }
+    /// O IRP_MJ_SHUTDOWN do file system: descarrega o volume e passa a
+    /// recusar escritas com STATUS_TOO_LATE; `None` = volume que não grava.
+    fn shut_down(&self) -> Option<Result<(), KernelError>> {
+        None
+    }
     /// Cria vazio ou trunca.
     fn truncate(&self, _path: &str) -> Result<(), KernelError> {
         Err(KernelError::with_status("volume is read-only", STATUS_MEDIA_WRITE_PROTECTED))

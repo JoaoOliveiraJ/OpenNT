@@ -1127,6 +1127,31 @@ pub fn flush(section: &Section) -> Result<(), KernelError> {
     Ok(())
 }
 
+/// O MiFlushAllFilesystemPages do MmShutdownSystem(0) (19041 rva 0x535508):
+/// cada seção de dados de arquivo com vista viva, de usuário ou de sistema,
+/// grava as páginas alteradas pelo [`flush`] (uma vez por seção, qualquer
+/// que seja o número de vistas). As seções de imagem e as sem arquivo ficam
+/// de fora. Devolve (seções gravadas, falhas).
+pub fn flush_all_file_sections() -> (u32, u32) {
+    let mut sections: Vec<Arc<Section>> = Vec::new();
+    for view in views() {
+        if !view.section.is_image && view.section.file.is_some() && !sections.iter().any(|known| Arc::ptr_eq(known, &view.section)) {
+            sections.push(view.section.clone());
+        }
+    }
+    let (mut flushed, mut failed) = (0, 0);
+    for section in &sections {
+        match flush(section) {
+            Ok(()) => flushed += 1,
+            Err(error) => {
+                failed += 1;
+                crate::debug_print!("[mm] desligamento: secao {:?} nao gravou: {}", section.name(), error);
+            }
+        }
+    }
+    (flushed, failed)
+}
+
 /// Falta de escrita presente numa página copy-on-write: copia para um PFN
 /// privado com o atributo de cache da seção e republica a página. Só as
 /// vistas mapeadas na raiz carregada (a do processo que faltou) ou no espaço

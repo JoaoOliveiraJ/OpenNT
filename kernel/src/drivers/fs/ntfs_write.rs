@@ -109,13 +109,19 @@ pub struct WriterState {
     allocation_generation: Option<u64>,
     tx: Option<Changes>,
     poisoned: bool,
+    /// O volume recebeu o desligamento (o bit 0x20 do VcbState do
+    /// NtfsShutdownVolume): nenhuma escrita depois disso.
+    shut_down: bool,
 }
 
 pub type WriterLock = SpinLock<WriterState>;
 
 pub const fn new_writer() -> WriterLock {
-    SpinLock::new(WriterState { allocation: None, allocation_generation: None, tx: None, poisoned: false })
+    SpinLock::new(WriterState { allocation: None, allocation_generation: None, tx: None, poisoned: false, shut_down: false })
 }
+
+/// STATUS_TOO_LATE: o volume já foi desligado.
+const STATUS_TOO_LATE: u32 = 0xC000_0189;
 
 fn fail<T>(status: u32, message: &str) -> Result<T, KernelError> {
     Err(KernelError::with_status(alloc::format!("NTFS: {message}"), status))
@@ -583,6 +589,9 @@ impl Tx<'_> {
         }
         if self.state.poisoned {
             return fail(0xC000_0185, "volume requer remontagem apos erro de E/S");
+        }
+        if self.state.shut_down {
+            return fail(STATUS_TOO_LATE, "volume desligado");
         }
         self.load_allocation()?;
         self.state.tx = Some(Changes::default());
@@ -1401,6 +1410,24 @@ impl Ntfs {
         let mut state = self.writer.lock();
         let mut tx = Tx { volume: self, state: &mut state };
         action(&mut tx)
+    }
+
+    /// O IRP_MJ_SHUTDOWN do volume, como o NtfsShutdownVolume do ntfs.sys
+    /// 19041 (rva 0x250674): com o recurso exclusivo (uma transação em curso
+    /// termina antes), o disco descarregado e o volume marcado desligado
+    /// (`lock or [Vcb+4], 0x20`). Daí em diante criação, escrita e mudança
+    /// de metadado devolvem STATUS_TOO_LATE, como o NtfsCommonWrite e o
+    /// NtfsCommonCreate; leituras seguem.
+    pub fn shut_down(&self) -> Result<(), KernelError> {
+        self.with_writer(|tx| {
+            tx.state.shut_down = true;
+            ata_pio::flush(tx.volume.drive)
+        })
+    }
+
+    /// O volume já recebeu o desligamento.
+    pub fn is_shut_down(&self) -> bool {
+        self.writer.lock().shut_down
     }
 
     pub fn query_ea(&self, path: &str, length: usize, options: &ea::QueryOptions, state: &mut ea::QueryState) -> Result<ea::QueryResult, KernelError> {

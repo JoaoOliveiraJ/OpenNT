@@ -19,18 +19,21 @@
 //!   `DontPowerOffAfterShutdown` (PopReadShutdownPolicy, só para
 //!   PowerActionShutdown) e faz o desligamento ordenado; as de suspensão e
 //!   hibernação dão STATUS_NOT_SUPPORTED: o OpenNT não suspende o sistema.
-//! - PopGracefulShutdown (rva 0x9b10a0), na ordem do original: o
-//!   PopShutdownEvent sinalizado e as threads do PoRequestShutdownEvent
-//!   esperadas; CmShutdownSystem(0); ExShutdownSystem(0) (o ShutdownTime);
+//! - PopGracefulShutdown (rva 0x9b10a0), na ordem do original: só com o
+//!   PopShutdownCleanly diferente de zero (0x9b110b; o `PoCleanShutdownFlags`
+//!   de `Session Manager\Kernel` pelo CmControlVector, 0 no boot comum), o
+//!   PsShutdownSystem, o PopShutdownEvent sinalizado e as threads do
+//!   PoRequestShutdownEvent esperadas; CmShutdownSystem(0); ExShutdownSystem(0) (o ShutdownTime);
 //!   IoShutdownSystem(0) (PnpShutdownDevices e o IRP_MJ_SHUTDOWN dos
 //!   IoRegisterShutdownNotification); CmShutdownSystem(1) (todas as hives no
-//!   disco); ExShutdownSystem(1); IoShutdownSystem(1) (os file systems, que
-//!   descarregam os volumes, e a fila de última chance);
-//!   CcWaitForCurrentLazyWriterActivity; ExShutdownSystem(2) e o
-//!   PopShutdownSystem. Passos de componentes que o OpenNT não tem (TmShutdownSystem,
-//!   ObShutdownSystem e PsWaitForAllProcesses só com PopShutdownCleanly,
-//!   EtwShutdown, MmShutdownSystem sem arquivo de paginação, os IRPs de
-//!   energia S5 aos dispositivos) ficam de fora.
+//!   disco); ExShutdownSystem(1); MmShutdownSystem(0) (as páginas alteradas
+//!   das vistas de arquivo); IoShutdownSystem(1) (os file systems, que
+//!   descarregam os volumes e passam a recusar escritas, e a fila de última
+//!   chance); CcWaitForCurrentLazyWriterActivity; ExShutdownSystem(2) e o
+//!   PopShutdownSystem. Passos de componentes que o OpenNT não tem
+//!   (TmShutdownSystem, ObShutdownSystem e PsWaitForAllProcesses só com
+//!   PopShutdownCleanly, EtwShutdown, os IRPs de energia S5 aos
+//!   dispositivos, o MmShutdownSystem(2)) ficam de fora.
 //! - PopShutdownSystem (rva 0x9b2764): PowerActionShutdown com a política
 //!   DontPowerOffAfterShutdown = 1 mostra que é seguro desligar e para o
 //!   processador (PopShutdownHandler); sem ela, e em PowerActionShutdownOff,
@@ -43,15 +46,18 @@
 //! de todas as filas, `FLUSHED` depois do Cache Manager, e o HAL imprime
 //! `POWER_OFF` ou `REBOOT` antes da escrita final.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::hal::firmware_return::{self, Routine};
 use crate::ntos::cc::lazy_writer;
 use crate::ntos::cm::{lazy_flush, registry};
 use crate::ntos::ex::shutdown as executive;
+use crate::ntos::inc::types::{Kevent, NtStruct};
 use crate::ntos::io::shutdown as io_shutdown;
+use crate::ntos::ke::dispatcher;
+use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::ob::object_access;
-use crate::ntos::po::system_state;
+use crate::ntos::po::{system_state, transition_checkpoint};
 use crate::ntos::ps::previous_mode;
 use crate::ntos::ps::user::state;
 use crate::ntos::se::token::tokens;
@@ -77,8 +83,14 @@ const POLICY_KEY: &str = "\\Registry\\Machine\\Software\\Policies\\Microsoft\\Wi
 const POLICY_VALUE: &str = "DontPowerOffAfterShutdown";
 const REG_DWORD: u32 = 4;
 
+/// A entrada do CmControlVector do PopShutdownCleanly.
+const KERNEL_KEY: &str = "\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Kernel";
+const CLEAN_SHUTDOWN_VALUE: &str = "PoCleanShutdownFlags";
+
 /// PopShutdownPowerOffPolicy.
 static POWER_OFF_POLICY: AtomicBool = AtomicBool::new(false);
+/// PopShutdownCleanly: 0 na imagem do ntoskrnl.
+static CLEAN_SHUTDOWN_FLAGS: AtomicU32 = AtomicU32::new(0);
 /// Um desligamento ordenado já começou (só o primeiro segue).
 static SHUTDOWN_STARTED: AtomicBool = AtomicBool::new(false);
 
@@ -130,6 +142,40 @@ pub fn power_off_policy() -> bool {
     POWER_OFF_POLICY.load(Ordering::SeqCst)
 }
 
+/// A entrada `Session Manager\Kernel\PoCleanShutdownFlags` do CmControlVector
+/// (o CmpGetSystemControlValues logo depois da carga da SYSTEM): até
+/// BufferLength (4, o ULONG do PopShutdownCleanly) bytes do valor, de
+/// qualquer tipo, sobre o 0 da imagem.
+pub fn initialize_control_values() {
+    let mut bytes = [0u8; 4];
+    if let Some(value) = registry::read_value_by_path(KERNEL_KEY, CLEAN_SHUTDOWN_VALUE) {
+        let length = value.data.len().min(4);
+        bytes[..length].copy_from_slice(&value.data[..length]);
+    }
+    CLEAN_SHUTDOWN_FLAGS.store(u32::from_le_bytes(bytes), Ordering::Release);
+}
+
+/// O PopShutdownCleanly capturado no boot.
+pub fn clean_shutdown_flags() -> u32 {
+    CLEAN_SHUTDOWN_FLAGS.load(Ordering::Acquire)
+}
+
+/// O começo do PopGracefulShutdown (0x9b110b): só com o PopShutdownCleanly
+/// diferente de zero o PopShutdownEvent é sinalizado e as threads do
+/// PoRequestShutdownEvent são esperadas (sem prazo); no boot comum nada
+/// disso acontece, a lista continua aberta e o evento, desligado. Devolve
+/// quantas threads foram esperadas.
+pub fn shutdown_event_step() -> usize {
+    let flags = clean_shutdown_flags();
+    if flags == 0 {
+        return 0;
+    }
+    // O PsShutdownSystem e o PsWaitForAllProcesses que acompanham o valor
+    // não existem no OpenNT.
+    debug_print!("[po] PoCleanShutdownFlags={:#x}: threads do PoRequestShutdownEvent esperadas (sem PsShutdownSystem)", flags);
+    step("PopShutdownEvent", system_state::notify_shutdown_waiters()).unwrap_or(0)
+}
+
 /// NtSetSystemPowerState(SystemAction, LightestSystemState, Flags): só
 /// volta em falha.
 pub fn set_system_power_state(action: u32, lightest_state: u32, flags: u32) -> Result<u32, KernelError> {
@@ -178,19 +224,62 @@ fn step<T>(name: &str, result: Result<T, KernelError>) -> Option<T> {
     }
 }
 
+/// O PopTransitionLock que um segundo pedido espera: um KEVENT de
+/// notificação que nunca é sinalizado (o primeiro pedido desliga a máquina
+/// sem soltá-lo).
+static TRANSITION_LOCK: AtomicU64 = AtomicU64::new(0);
+
+fn transition_lock() -> u64 {
+    let current = TRANSITION_LOCK.load(Ordering::Acquire);
+    if current != 0 {
+        return current;
+    }
+    let event = guest::alloc_bytes(Kevent::SIZE);
+    if event == 0 {
+        return 0;
+    }
+    dispatcher::initialize_event(event, 0, false);
+    match TRANSITION_LOCK.compare_exchange(0, event, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => event,
+        Err(existing) => {
+            guest::free_bytes(event);
+            existing
+        }
+    }
+}
+
+/// Um segundo pedido de desligamento: no 19041 ele para no
+/// PopAcquireTransitionLock (rva 0x991abe) até a máquina desligar. A espera
+/// é de KernelMode, sem prazo e sem alerta; a CPU de quem pediu segue
+/// atendendo DPCs, timers e as outras threads.
+pub fn wait_behind_running_shutdown() -> ! {
+    let event = transition_lock();
+    loop {
+        if event == 0 {
+            // Sem memória para o evento: nada a esperar além da parada.
+            crate::hal::cpu::halt_forever();
+        }
+        dispatcher::wait_for_single_object(event, 0, 0, false);
+    }
+}
+
 /// PopGracefulShutdown(Action): a sequência ordenada e o PopShutdownSystem.
 fn graceful_shutdown(action: u32) -> ! {
     if SHUTDOWN_STARTED.swap(true, Ordering::SeqCst) {
-        // Um segundo pedido espera o primeiro terminar a máquina.
-        crate::hal::cpu::halt_forever();
+        wait_behind_running_shutdown();
     }
     debug_print!("[po] desligamento ordenado: acao {}", action);
-    let waited = step("PopShutdownEvent", system_state::notify_shutdown_waiters()).unwrap_or(0);
+    transition_checkpoint::record(10, 1);
+    let waited = shutdown_event_step();
     // CmShutdownSystem(0): sem transações do Registro no OpenNT.
     step("ExShutdownSystem(0)", executive::shutdown_system(0));
     step("IoShutdownSystem(0)", io_shutdown::shutdown_system(0));
     let hives = lazy_flush::shutdown();
     step("ExShutdownSystem(1)", executive::shutdown_system(1));
+    // MmShutdownSystem(0): as vistas de arquivo no disco antes de os file
+    // systems fecharem os volumes.
+    crate::ntos::mm::shutdown::shutdown_system(0);
+    transition_checkpoint::record(10, 2);
     step("IoShutdownSystem(1)", io_shutdown::shutdown_system(1));
     let (devices, file_systems, last_chance) = io_shutdown::delivered();
     debug_print!("SHUTDOWN_NOTIFIED threads={} dispositivos={} file_systems={} ultima_chance={}", waited, devices, file_systems, last_chance);

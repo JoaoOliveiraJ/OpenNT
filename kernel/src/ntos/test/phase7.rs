@@ -401,6 +401,11 @@ fn file_and_named_sections(assert: Assert) {
         return;
     };
     assert(view.name.as_deref() == Some("\\Device\\HarddiskVolume1\\opennt-secao.bin") && crate::ntos::mm::paging::translate(view.base) == frame, "sections: vista de arquivo nomeada pelo caminho NT");
+    // MmShutdownSystem(0): a seção com vista viva grava a diferença sem o
+    // unmap (as outras seções de arquivo vivas do boot também passam).
+    physical::write_bytes(frame + 0x200, b"desl");
+    let (flushed, _) = sections::flush_all_file_sections();
+    assert(flushed >= 1 && file.writes.lock().last() == Some(&(0x200u64, 4usize)) && &file.bytes.lock()[0x200..0x204] == b"desl", "sections: o MiFlushAllFilesystemPages do desligamento grava a vista de arquivo viva");
     // A segunda seção do mesmo arquivo reutiliza a control area.
     let reused = sections::create(CreateOptions { size: 0x1800, page_protect: 4, file: Some(shared.clone()), committed: Some(false), ..CreateOptions::default() });
     assert(reused.as_ref().is_ok_and(|created| created.as_ref().is_ok_and(|other| other.frame(0) == Some(frame))) && sections::create(CreateOptions { size: 0x1800, page_protect: 0x204, file: Some(shared), ..CreateOptions::default() }).is_ok_and(|created| created.is_err_and(|status| status == 0xC000_004E)), "sections: control area compartilhada pela identidade e cache divergente recusado");

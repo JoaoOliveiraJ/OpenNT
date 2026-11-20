@@ -349,6 +349,10 @@ impl super::volume::FileSystem for Ntfs {
         Some(Ntfs::paging_write(self, path, offset, bytes))
     }
 
+    fn shut_down(&self) -> Option<Result<(), KernelError>> {
+        Some(Ntfs::shut_down(self))
+    }
+
     fn truncate(&self, path: &str) -> Result<(), KernelError> {
         if Ntfs::exists(self, path)? {
             Ntfs::resize(self, path, 0).map(|_| ())
@@ -1046,6 +1050,11 @@ impl Ntfs {
     /// escrita vai ao disco pelos LCNs dele).
     pub fn paging_write(&self, path: &str, offset: u64, bytes: &[u8]) -> Result<(), KernelError> {
         let _shared = self.resource().acquire_shared();
+        // Depois do desligamento do volume nada mais vai ao disco (no NT os
+        // arquivos de paginação já saíram no MmShutdownSystem(0)).
+        if self.is_shut_down() {
+            return Err(KernelError::with_status("NTFS: volume desligado", 0xC000_0189));
+        }
         let length = bytes.len() as u64;
         if offset % 512 != 0 || length % 512 != 0 {
             return Err(error("NTFS: escrita de paginacao desalinhada"));

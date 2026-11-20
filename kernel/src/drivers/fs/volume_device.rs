@@ -295,6 +295,26 @@ pub fn mount(index: u32, file_system: &'static dyn FileSystem) -> Result<String,
     Ok(device_path(index))
 }
 
+/// O IRP_MJ_SHUTDOWN do file system embutido, no lugar do
+/// IopShutdownBaseFileSystems (ele não está na fila dos file systems de
+/// disco): cada volume que grava descarrega o disco e passa a recusar
+/// escritas. Devolve quantos volumes foram fechados.
+pub fn shut_down_volumes() -> u32 {
+    let volumes: Vec<KernelVolume> = VOLUMES.lock().clone();
+    let mut closed = 0;
+    for volume in volumes {
+        match volume.file_system.shut_down() {
+            Some(Ok(())) => {
+                debug_print!("[ntfs] desligamento: {} fechado", device_path(volume.index));
+                closed += 1;
+            }
+            Some(Err(error)) => debug_print!("[ntfs] desligamento: {} falhou: {}", device_path(volume.index), error),
+            None => {}
+        }
+    }
+    closed
+}
+
 /// O dispositivo é o real de um volume do kernel (`\Device\KernelVolumeN`).
 pub fn is_real_device(device: u64) -> bool {
     device != 0 && VOLUMES.lock().iter().any(|entry| entry.real == device)
