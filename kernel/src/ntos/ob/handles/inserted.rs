@@ -117,12 +117,27 @@ pub fn duplicate_access(object_type: &ObjectType, item: Option<&Described>, sour
 // dos da origem passam pelo descritor no destino) e os atributos de
 // [`duplicate_attributes`].
 // DUPLICATE_CLOSE_SOURCE fecha a origem no processo de origem, também quando
-// o destino é nulo.
+// o destino é nulo; com OBJ_KERNEL_HANDLE em KernelMode o destino nunca é
+// nulo (é o System).
 #[allow(clippy::too_many_arguments)]
 pub fn duplicate(source_process: u64, source_handle: u64, target_process: u64, target_handle_out: u64, desired: u32, handle_attributes: u32, options: u32, mode: u8) -> Result<u32, KernelError> {
+    // O ObDuplicateObject 19041 zera o *TargetHandle na entrada (0x5f524a),
+    // antes de qualquer recusa.
+    if target_handle_out != 0 {
+        crate::ntos::mm::guest_memory::write64(target_handle_out, 0);
+    }
     if options & !(DUPLICATE_CLOSE_SOURCE | DUPLICATE_SAME_ACCESS | DUPLICATE_SAME_ATTRIBUTES | DUPLICATE_NO_RIGHTS_UPGRADE) != 0 {
         return Ok(STATUS_INVALID_PARAMETER);
     }
+    // OBJ_KERNEL_HANDLE em KernelMode troca o destino pelo System
+    // (PsInitialSystemProcess, a tabela de handles de kernel) antes de olhar
+    // o TargetProcess, também quando ele é nulo (ObDuplicateObject
+    // 0x5f5237 -> 0x5f55cf); em UserMode o bit só é descartado. O
+    // bSpDwmUpdateSurface do win32kfull (0x2ded8: leitura da tela composta
+    // pelo DWM no BitBlt/GetPixel de um DC de tela e no PrintWindow) faz
+    // ObDuplicateObject(dwm, h, NULL, &k, SECTION_MAP_READ,
+    // OBJ_KERNEL_HANDLE, DUPLICATE_CLOSE_SOURCE, KernelMode) e usa o `k`.
+    let kernel = handle_attributes & OBJ_KERNEL_HANDLE != 0 && mode == 0;
     let source = if source_process != 0 { source_process } else { process::get_current_process() };
     let close_source = || -> Result<(), KernelError> {
         attached(source, || close::close(source_handle, Some(mode)))??;
@@ -134,7 +149,7 @@ pub fn duplicate(source_process: u64, source_handle: u64, target_process: u64, t
         Some(Err(status)) => return Ok(status),
         None => return Ok(STATUS_INVALID_HANDLE),
     };
-    if target_process == 0 {
+    if target_process == 0 && !kernel {
         if options & DUPLICATE_CLOSE_SOURCE == 0 {
             return Ok(STATUS_INVALID_PARAMETER);
         }
@@ -142,10 +157,6 @@ pub fn duplicate(source_process: u64, source_handle: u64, target_process: u64, t
         return Ok(STATUS_SUCCESS);
     }
     let attributes = duplicate_attributes(resolved.attributes, handle_attributes & HANDLE_ATTRIBUTE_MASK, options);
-    // OBJ_KERNEL_HANDLE em KernelMode troca o destino pelo System
-    // (PsInitialSystemProcess, a tabela de handles de kernel), qualquer que
-    // seja o TargetProcess; em UserMode o bit só é descartado.
-    let kernel = handle_attributes & OBJ_KERNEL_HANDLE != 0 && mode == 0;
     let owner = if kernel { process::get_system_process() } else { target_process };
     let access = match duplicate_access(&resolved.item.object_type, Some(&resolved.item), resolved.access, resolved.attributes, desired, options, mode, owner)? {
         Ok(access) => access,

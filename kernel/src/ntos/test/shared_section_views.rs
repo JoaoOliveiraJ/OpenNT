@@ -34,6 +34,9 @@
 //! - Vistas na saída do processo: só o EPROCESS.Flags.VmDeleted recusa o
 //!   mapeamento; nas rotinas de saída (depois do callout de saída do win32k)
 //!   o processo que sai ainda desmapeia (CddBitmapSw::OnCloseProcess 0x23f0c).
+//! - Leitura da tela composta (bSpDwmUpdateSurface 0x2ded8 do win32kfull): a
+//!   seção que o DWM devolve na tabela dele vai para a tabela do System pelo
+//!   ObDuplicateObject com destino nulo, OBJ_KERNEL_HANDLE e KernelMode.
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -492,6 +495,54 @@ fn exit_callout_views(assert: Assert) {
     guest::free_bytes(block);
 }
 
+/// A leitura da tela composta pelo DWM: o bSpDwmUpdateSurface do win32kfull
+/// (chamado pelo bSpDwmValidateSurface do BitBlt/StretchBlt/AlphaBlend/
+/// GetPixel num DC de tela e pelo GreSpDwmSyncCaptureSurfaceBits do
+/// PrintWindow) recebe do DwmSyncCaptureSurfaceBits um handle de seção da
+/// tabela do dwm.exe e faz ObDuplicateObject(dwm, h, NULL, &k,
+/// SECTION_MAP_READ, OBJ_KERNEL_HANDLE, DUPLICATE_CLOSE_SOURCE, KernelMode)
+/// (0x2ded8), ObReferenceObjectByHandle(k, SECTION_MAP_READ,
+/// MmSectionObjectType, KernelMode) (0x2df11) e ZwClose(k). No
+/// ObDuplicateObject 19041 o OBJ_KERNEL_HANDLE em KernelMode troca o
+/// TargetProcess pelo PsInitialSystemProcess antes de olhar o destino nulo
+/// (0x5f5237 -> 0x5f55cf).
+fn dwm_capture_kernel_handle(assert: Assert) {
+    let section_type = object_types::section_type().pointer;
+    let block = guest::alloc_bytes(0x100);
+    guest::write64(block + 8, 0x2000);
+    let created = status(call_export("MmCreateSection", &[block, 6, 0, block + 8, 4, SEC_COMMIT, 0, 0]));
+    let body = guest::read64(block);
+    if created == 0 {
+        let _ = call_export("ObDeleteCapturedInsertInfo", &[body]);
+    }
+    let outcome = with_test_process("redir-captura.exe", None, |dwm| {
+        let opened = created == 0 && status(call_export("ObOpenObjectByPointer", &[body, 0, 0, 6, 0, 0, block + 0x10])) == 0;
+        let dwm_handle = guest::read64(block + 0x10);
+        guest::write64(block + 0x18, 0);
+        let duplicated = opened && status(call_export("ObDuplicateObject", &[dwm.process, dwm_handle, 0, block + 0x18, 4, 0x200, 1, 0])) == 0;
+        let kernel_handle = guest::read64(block + 0x18);
+        let kernel = duplicated && kernel_handle & 0xFFFF_FFFF_8000_0000 == 0xFFFF_FFFF_8000_0000;
+        let referenced = kernel && status(call_export("ObReferenceObjectByHandle", &[kernel_handle, 4, section_type, 0, block + 0x20, 0])) == 0 && guest::read64(block + 0x20) == body;
+        if referenced {
+            let _ = call_export("ObfDereferenceObject", &[body]);
+        }
+        let source_closed = opened && open_pointer::resolve(dwm_handle, true).is_none_or(|resolved| resolved.is_err());
+        if kernel {
+            let _ = call_export("ObCloseHandle", &[kernel_handle, 0]);
+        } else if duplicated && kernel_handle != 0 {
+            let _ = open_pointer::close(kernel_handle);
+        }
+        if opened && !source_closed {
+            let _ = open_pointer::close(dwm_handle);
+        }
+        (referenced, source_closed)
+    });
+    assert(outcome.is_some_and(|(referenced, _)| referenced), "gdiredir: ObDuplicateObject(dwm, h, NULL, OBJ_KERNEL_HANDLE, KernelMode) poe a copia na tabela do System e ela resolve pelo tipo Section (bSpDwmUpdateSurface)");
+    assert(outcome.is_some_and(|(_, closed)| closed), "gdiredir: DUPLICATE_CLOSE_SOURCE fecha o handle de secao do dwm");
+    let _ = section_objects::dereference(body);
+    guest::free_bytes(block);
+}
+
 pub fn run(assert: Assert) {
     backing_store(assert);
     fence_page(assert);
@@ -499,4 +550,5 @@ pub fn run(assert: Assert) {
     cross_process_objects(assert);
     gdi_redirection_views(assert);
     exit_callout_views(assert);
+    dwm_capture_kernel_handle(assert);
 }
