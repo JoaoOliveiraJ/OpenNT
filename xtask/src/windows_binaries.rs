@@ -520,12 +520,13 @@ const SMSS_PROGRAMS: &[&str] = &[
 /// SystemEventsBrokerServer.dll do SystemEventsBroker, com o brokerlib.dll
 /// que ele importa, e o umpnpmgr.dll do PlugPlay. E o serviço de perfis
 /// (`user_profiles`): o profsvc.dll (o ServiceDll do ProfSvc) e o
-/// profsvcext.dll (carga atrasada do profsvc). O profext.dll (as junções do
-/// perfil novo, com os nomes do `.mui` do idioma) vem junto com os
-/// descritores dos arquivos e das chaves: com ele o winlogon cria o token
-/// LowBox do fontdrvhost, que precisa das ACEs de ALL APPLICATION PACKAGES
-/// nos arquivos e nas chaves. Os imports estáticos deles já estão no volume.
-const SERVICE_CHAIN_PROGRAMS: &[&str] = &["umpo.dll", "psmsrv.dll", "SystemEventsBrokerServer.dll", "brokerlib.dll", "umpnpmgr.dll", "profsvc.dll", "profsvcext.dll"];
+/// profsvcext.dll (carga atrasada do profsvc), e o profext.dll: as junções
+/// do perfil novo, com os nomes do `.mui` do idioma, e o
+/// CreateAppContainerProfile com que o winlogon cria o token LowBox do
+/// fontdrvhost (o UMFD), que lê os arquivos e as chaves pelas ACEs de ALL
+/// APPLICATION PACKAGES dos descritores do volume e das hives. Os imports
+/// estáticos deles já estão no volume.
+const SERVICE_CHAIN_PROGRAMS: &[&str] = &["umpo.dll", "psmsrv.dll", "SystemEventsBrokerServer.dll", "brokerlib.dll", "umpnpmgr.dll", "profsvc.dll", "profext.dll", "profsvcext.dll"];
 
 /// O console: o conhost.exe que o condrv.sys cria para um programa de
 /// console, o cmd.exe (com o cmdext.dll do ext-ms-win-cmd-util), o net.exe,
