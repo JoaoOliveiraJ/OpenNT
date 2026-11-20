@@ -92,8 +92,12 @@ pub fn duplicate_access(object_type: &ObjectType, item: Option<&Described>, sour
     if mode == 0 {
         return Ok(Ok(access));
     }
-    let checked = object_security::has_descriptor(item);
-    let policy = object_security::described_policy(item);
+    // Processos e threads: o descritor do registro do Ps
+    // (`handles::duplicate_policy`); os outros, o do cabeçalho do objeto.
+    let (policy, checked) = match crate::ntos::ps::user::handles::duplicate_policy(object_type, item.pointer) {
+        Some(policy) => (policy, true),
+        None => (object_security::described_policy(item), object_security::has_descriptor(item)),
+    };
     attached(target, || object_access::check(&policy, object_access::subject(), access, object_type, !checked))
 }
 

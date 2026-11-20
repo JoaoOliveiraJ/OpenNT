@@ -560,6 +560,28 @@ fn duplicate_rights_upgrade(assert: Assert) {
         assert(cases.maximum == Ok(0), alloc::format!("acl: NtDuplicateObject ({}): MAXIMUM_ALLOWED sai no corte pelo ValidAccessMask (acesso 0)", table).as_str());
         assert(cases.denied == Some(STATUS_ACCESS_DENIED), alloc::format!("acl: NtDuplicateObject ({}): GENERIC_READ recusado quando o descritor nao da READ_CONTROL", table).as_str());
     }
+    // Um processo: o descritor que decide é o do processo (o do
+    // NtSetSecurityObject no pseudo-handle), não um cabeçalho sem descritor.
+    // O RPCSS, como NetworkService, duplica o handle SYNCHRONIZE de um cliente
+    // pedindo PROCESS_QUERY_LIMITED_INFORMATION; o 19041 recusa pela DACL.
+    let process = as_identity("acl-duplicata-processo.exe", &user_a(), MEDIUM_INTEGRITY, &[], |a, process_id| {
+        let narrow = relative_descriptor(None, Some(&[allow(SYNCHRONIZE, user_a())]));
+        let wide = relative_descriptor(None, Some(&[allow(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, user_a())]));
+        let narrowed = a.set_security(u64::MAX, DACL_SECURITY_INFORMATION, &narrow);
+        let handle = a.open_process(process_id, SYNCHRONIZE);
+        let denied = handle.ok().and_then(|handle| copy_refused(a, a.duplicate(handle, PROCESS_QUERY_LIMITED_INFORMATION, 0)));
+        let widened = a.set_security(u64::MAX, DACL_SECURITY_INFORMATION, &wide);
+        let granted = handle.ok().map(|handle| copy_granted(a, a.duplicate(handle, PROCESS_QUERY_LIMITED_INFORMATION, 0)));
+        if let Ok(handle) = handle {
+            a.close(handle);
+        }
+        (narrowed, widened, handle.is_ok(), denied, granted)
+    });
+    crate::debug_print!("[acl] NtDuplicateObject (processo): {:x?}", process);
+    assert(
+        process == Some((0, 0, true, Some(STATUS_ACCESS_DENIED), Some(Ok(PROCESS_QUERY_LIMITED_INFORMATION)))),
+        "acl: NtDuplicateObject de um handle de processo com mais direitos segue a DACL do processo: recusado sem PROCESS_QUERY_LIMITED_INFORMATION, concedido com",
+    );
 }
 
 /// O descritor do processo e os direitos implícitos de processo e thread.

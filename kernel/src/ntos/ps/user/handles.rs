@@ -623,6 +623,21 @@ fn process_policy(pointer: u64) -> SecurityPolicy {
     process::with_record(pointer, |record| record.security.clone()).unwrap_or_default()
 }
 
+/// O descritor que o ObpGrantAccess de uma duplicação com direitos além dos
+/// da origem confere num processo ou numa thread: o do registro do Ps, o
+/// mesmo do NtOpenProcess e do NtOpenThread (o EPROCESS e a ETHREAD do
+/// OpenNT não levam o descritor no cabeçalho do objeto); a thread sem
+/// registro, o do processo dela. `None` para os outros tipos.
+pub(crate) fn duplicate_policy(object_type: &ObjectType, pointer: u64) -> Option<SecurityPolicy> {
+    if object_type.name == object_types::process_type().name {
+        return Some(process_policy(pointer));
+    }
+    if object_type.name == object_types::thread_type().name {
+        return Some(process::thread_record(pointer).map_or_else(|| process_policy(kthread(pointer).process.get()), |record| record.security));
+    }
+    None
+}
+
 /// Direitos de um novo handle de processo.
 pub(crate) fn process_access(pointer: u64, requested: u32) -> Result<u32, u32> {
     open_access(&object_types::process_type(), &process_policy(pointer), requested)
