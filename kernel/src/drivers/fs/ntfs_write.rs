@@ -526,11 +526,19 @@ impl Tx<'_> {
                         Some(bytes) => bytes[index as usize * sector..(index + count) as usize * sector].to_vec(),
                         None => alloc::vec![0u8; count as usize * sector],
                     };
-                    ata_pio::write_sectors(operation.lba + index, &bytes, self.volume.drive)?;
+                    if let Err(error) = ata_pio::write_sectors(operation.lba + index, &bytes, self.volume.drive) {
+                        // A primeira falha de E/S do commit, antes de o volume
+                        // ser marcado para remontagem.
+                        crate::debug_print!("[ntfs] commit: escrita de {} setores no LBA {:#x} do disco {} falhou com {:#x}: {}", count, operation.lba + index, self.volume.drive, error.status, error.message);
+                        return Err(error);
+                    }
                     index += count;
                 }
             }
-            ata_pio::flush(self.volume.drive)?;
+            if let Err(error) = ata_pio::flush(self.volume.drive) {
+                crate::debug_print!("[ntfs] commit: FLUSH CACHE do disco {} falhou com {:#x}: {}", self.volume.drive, error.status, error.message);
+                return Err(error);
+            }
             self.state.allocation = self.state.tx.clone();
             self.volume.changed();
             self.state.allocation_generation = Some(self.volume.generation());
@@ -541,6 +549,7 @@ impl Tx<'_> {
             // descritor lido dele não vale mais.
             self.volume.secure_cache.lock().clear();
             if committing {
+                crate::debug_print!("[ntfs] volume do disco {} marcado para remontagem: o commit falhou com {:#x} ({})", self.volume.drive, error.status, error.message);
                 self.state.poisoned = true;
                 self.state.allocation = None;
                 if error.status == 0 {
