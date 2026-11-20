@@ -493,6 +493,47 @@ pub fn delete_key(storage: &mut Storage, key_cell: u32, time: u64) -> Option<()>
     Some(())
 }
 
+/// O descritor de uma chave troca (CmpSetSecurityDescriptorInfo): a
+/// célula 'sk' com esses bytes (a que já existe na lista, com a contagem
+/// incrementada, ou uma nova depois da atual), e a antiga perde a
+/// referência (a última a libera). Devolve a célula nova.
+pub fn set_security(storage: &mut Storage, key_cell: u32, security: &Captured) -> Option<u32> {
+    let old = node(storage, key_cell)?.security.get();
+    let root = root_security(storage);
+    let new = security_cells::assign(storage, old, root, security)?;
+    security_cells::release(storage, old);
+    node(storage, key_cell)?.security.set(new);
+    storage.mark_cell_dirty(key_cell);
+    Some(new)
+}
+
+/// A célula 'sk' de uma chave.
+pub fn security_cell(storage: &Storage, key_cell: u32) -> Option<u32> {
+    node(storage, key_cell).map(|key| key.security.get())
+}
+
+/// O tamanho em bytes de UTF-16 do nome guardado de uma chave.
+pub fn name_length(storage: &Storage, key_cell: u32) -> u32 {
+    key_name_units(storage, key_cell).map_or(0, |units| units.len() as u32 * 2)
+}
+
+/// Os máximos que o 'nk' guarda (MaxNameLen, MaxClassLen, MaxValueNameLen
+/// e MaxValueDataLen): os maiores comprimentos que a chave já teve.
+pub fn maxima(storage: &Storage, key_cell: u32) -> (u32, u32, u32, u32) {
+    node(storage, key_cell).map_or((0, 0, 0, 0), |key| (key.max_name_len(), key.max_class_len.get(), key.max_value_name_len.get(), key.max_value_data_len.get()))
+}
+
+/// A subchave de nome `name` (CmpFindSubKeyByName sobre a lista estável).
+pub fn find_subkey(storage: &Storage, key_cell: u32, name: &[u16]) -> Option<u32> {
+    let list = node(storage, key_cell)?.sub_key_lists[0].get();
+    index::find(storage, list, &|child| key_name_units(storage, child).map(|units| index::compare_units(units.iter(), name)))
+}
+
+/// A subchave `index` na ordem da lista estável (CmpFindSubKeyByNumber).
+pub fn nth_subkey(storage: &Storage, key_cell: u32, index: usize) -> Option<u32> {
+    index::nth(storage, node(storage, key_cell)?.sub_key_lists[0].get(), index)
+}
+
 /// LastWriteTime de uma chave.
 pub fn set_last_write_time(storage: &mut Storage, key_cell: u32, time: u64) {
     if let Some(key) = node(storage, key_cell) {

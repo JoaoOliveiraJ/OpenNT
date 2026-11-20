@@ -2,28 +2,40 @@
 //!
 //! Árvore de chaves e valores sem diferença entre maiúsculas e minúsculas. Os
 //! handles internos identificam nós e caminhos; as fronteiras de syscall
-//! acrescentam direitos, captura e notificações nativas. Os nós vivem numa
-//! arena em blocos de [`CHUNK`] e são identificados por [`NodeId`], que
-//! nunca se repete.
+//! acrescentam direitos, captura e notificações nativas.
 //!
-//! Um nó faz o papel do KCB: identidade, pai, subchaves, descritor e
-//! flags. O conteúdo de uma chave guardada numa hive (nome, valores, classe
-//! e LastWriteTime) não é copiado para o nó: ele fica nas células e é lido
-//! delas a cada consulta ([`KeyView`]), como o 19041 lê pelo mapa de células
-//! (HvpGetCellPaged, CmpFindValueByName, CmpGetValueData). Toda mudança
-//! numa chave dessas (chave criada ou excluída, valor gravado ou removido)
-//! vai direto às células, sob a mesma trava, marcando os setores sujos que a
-//! descarga grava; uma operação de célula que falha (sem espaço, ou uma
-//! hive inconsistente) não muda a chave, marca a hive como quebrada e a
-//! descarga dela passa a falhar. Os nós sem célula (as chaves mestras, as
-//! subárvores montadas só em memória e as chaves voláteis) guardam o
+//! Um nó faz o papel do KCB do 19041 e só existe enquanto alguém o usa
+//! (CmpCreateKeyControlBlock, CmpDereferenceKeyControlBlock): um handle
+//! aberto na chave, uma subchave viva (o filho segura o pai) ou a fixação
+//! das chaves que não têm célula (as chaves mestras, as voláteis, as
+//! subárvores montadas em memória) e da raiz de cada hive montada. Um nó de
+//! uma chave guardada numa hive é criado quando um nome passa por ela e,
+//! sem referências, vai para a lista de fechamento adiado
+//! (CmpAddToDelayedClose), de onde volta se a chave é aberta de novo; a
+//! lista guarda no máximo [`DELAYED_CLOSE`] nós (o CmpDelayedCloseSize,
+//! 0x800 no 19041) e o mais antigo sai da arena. Cada célula 'nk' tem no
+//! máximo um nó vivo (o mapa por célula, o papel do
+//! CmpFindKcbInHashEntryByCellIndex). O [`NodeId`] nunca se repete: um id
+//! guardado de um nó que já saiu da arena só deixa de valer.
+//!
+//! O conteúdo de uma chave guardada numa hive (nome, valores, classe,
+//! LastWriteTime, subchaves) não é copiado para o nó: ele fica nas células
+//! e é lido delas a cada consulta ([`KeyView`]), como o 19041 lê pelo mapa
+//! de células. A busca de uma subchave pelo nome é a busca binária no
+//! índice dela (CmpFindSubKeyByName) e a enumeração anda pelo índice
+//! (CmpFindSubKeyByNumber): primeiro as subchaves da hive em ordem de nome,
+//! depois as que só existem em memória (as voláteis), também em ordem de
+//! nome. Toda mudança numa chave dessas (chave criada ou excluída, valor
+//! gravado ou removido, descritor trocado) vai direto às células, sob a
+//! mesma trava, marcando os setores sujos que a descarga grava; uma
+//! operação de célula que falha não muda a chave, marca a hive como
+//! quebrada e a descarga dela passa a falhar. Os nós sem célula guardam o
 //! próprio conteúdo. A raiz de uma hive carregada tem o nome do ponto de
 //! montagem (o nome do link na hive mestra), não o da célula.
 //!
 //! Uma chave excluída (ou de uma hive descarregada) sai da arena na hora;
-//! com handle aberto nela, fica só o nome e o LastWriteTime (o KCB
-//! excluído), sem valores, classe nem subchaves, até o último handle
-//! fechar.
+//! com handle aberto, fica só o nome e o LastWriteTime (o KCB excluído),
+//! sem valores, classe nem subchaves, até o último handle fechar.
 //!
 //! Chaves de link (KEY_SYM_LINK) são seguidas como no CmpDoParseKey do
 //! ntoskrnl 19041: um componente do caminho que é link (no meio do caminho,
@@ -45,16 +57,17 @@
 //! como as de arquivo, mas nenhum arquivo: a descarga não grava nada.
 
 use alloc::boxed::Box;
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::cmp::Ordering;
 use core::num::NonZeroU64;
 use core::ops::{Deref, Index};
 
-use crate::ntos::cm::hive::key_cells;
-use crate::ntos::cm::hive::storage::{Storage, STATUS_INSUFFICIENT_RESOURCES};
+use crate::ntos::cm::hive::storage::{Storage, STATUS_INSUFFICIENT_RESOURCES, STATUS_REGISTRY_CORRUPT};
 use crate::ntos::cm::hive::tree::{self, Checked, NewKey};
+use crate::ntos::cm::hive::{index, key_cells, security_cells};
 use crate::ntos::cm::key::notify as key_notify;
 use crate::ntos::cm::key::policy as key_policy;
 use crate::ntos::ke::clock;
@@ -65,6 +78,10 @@ use crate::rtl::{KernelError, SpinLock};
 pub type NodeId = u64;
 pub const ROOT: NodeId = 1;
 
+/// Os nós sem referências que a lista de fechamento adiado guarda (o
+/// CmpDelayedCloseSize do 19041, lido em .data 0xc12128).
+pub const DELAYED_CLOSE: usize = 0x800;
+
 /// Valor: nome preservado para exibição, tipo REG_* e bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Value {
@@ -73,15 +90,17 @@ pub struct Value {
     pub data: Vec<u8>,
 }
 
-/// Nó da arena: pai, subchaves em ordem de inserção (cada uma com o hash do
-/// nome sem diferença de caixa, [`name_hash`]: a busca compara o hash e
-/// confirma pelo nome do filho), o descritor (compartilhado entre as chaves
-/// da mesma célula 'sk') e as flags. O conteúdo vem das células
-/// ([`KeyView`]); só um nó sem célula guarda o dele. São 64 bytes por nó.
+/// Nó da arena (o KCB): pai, as subchaves que as células não dão, o
+/// descritor (compartilhado entre as chaves da mesma célula 'sk'), as flags
+/// e as referências. O conteúdo vem das células ([`KeyView`]); só um nó
+/// sem célula guarda o dele.
 #[derive(Clone, Debug)]
 pub struct KeyNode {
     parent: Option<NonZeroU64>,
-    pub children: Vec<(u32, NodeId)>,
+    /// As subchaves vivas que não estão nas células da chave: as sem célula
+    /// (voláteis, mestras) e as raízes de hive montadas aqui, em ordem de
+    /// nome, cada uma com o hash do nome sem caixa ([`name_hash`]).
+    linked: Vec<(u32, NodeId)>,
     pub security: Arc<Captured>,
     pub deleted: bool,
     /// (hive, célula 'nk') de um nó guardado numa hive.
@@ -94,9 +113,14 @@ pub struct KeyNode {
     /// uma hive carregada e as chaves excluídas com handle aberto) e o
     /// conteúdo de um nó sem célula.
     extra: Option<Box<Extra>>,
+    /// Handles abertos na chave, subchaves vivas na arena e a fixação de um
+    /// nó sem célula ou da raiz de uma hive montada.
+    refs: u32,
+    /// A marca do nó na lista de fechamento adiado (zero: fora dela).
+    delayed: u64,
 }
 
-const _: () = assert!(core::mem::size_of::<KeyNode>() == 64 && core::mem::size_of::<Option<KeyNode>>() == 64);
+const _: () = assert!(core::mem::size_of::<KeyNode>() <= 80);
 
 /// O que um nó guarda além da identidade: o nome que não vem da célula e,
 /// sem célula, o conteúdo.
@@ -116,15 +140,16 @@ struct OwnedKey {
 }
 
 impl KeyNode {
-    /// Um nó que guarda o próprio conteúdo (sem célula).
+    /// Um nó que guarda o próprio conteúdo (sem célula), fixado.
     fn in_memory(name: &str, parent: Option<NodeId>, security: Arc<Captured>, volatile: bool, link: bool, class: &[u16], time: u64) -> KeyNode {
         let owned = OwnedKey { values: Vec::new(), class: class.to_vec(), last_write_time: time };
-        KeyNode { parent: parent.and_then(NonZeroU64::new), children: Vec::new(), security, deleted: false, cell: None, volatile, link, extra: Some(Box::new(Extra { name: Box::from(name), owned: Some(owned) })) }
+        KeyNode { parent: parent.and_then(NonZeroU64::new), linked: Vec::new(), security, deleted: false, cell: None, volatile, link, extra: Some(Box::new(Extra { name: Box::from(name), owned: Some(owned) })), refs: 1, delayed: 0 }
     }
 
-    /// Um nó de uma chave guardada na célula 'nk' `cell` da hive `hive`.
+    /// Um nó de uma chave guardada na célula 'nk' `cell` da hive `hive`,
+    /// ainda sem referências.
     fn stored(parent: Option<NodeId>, security: Arc<Captured>, hive: u32, cell: u32, link: bool) -> KeyNode {
-        KeyNode { parent: parent.and_then(NonZeroU64::new), children: Vec::new(), security, deleted: false, cell: Some((hive, cell)), volatile: false, link, extra: None }
+        KeyNode { parent: parent.and_then(NonZeroU64::new), linked: Vec::new(), security, deleted: false, cell: Some((hive, cell)), volatile: false, link, extra: None, refs: 0, delayed: 0 }
     }
 
     /// O pai (nenhum só na raiz do Registro).
@@ -145,13 +170,26 @@ impl KeyNode {
     }
 }
 
+/// O que o KeyFullInformation e o KeyCachedInformation contam de uma
+/// chave: subchaves, valores e os maiores comprimentos (bytes de UTF-16 e
+/// de dados).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KeyCounts {
+    pub subkeys: u32,
+    pub max_name: u32,
+    pub max_class: u32,
+    pub values: u32,
+    pub max_value_name: u32,
+    pub max_value_data: u32,
+}
+
 /// Um nó com as células da hive dele: o nome, os valores, a classe e o
 /// LastWriteTime lidos das células (ou do próprio nó, sem célula). Os
-/// campos do nó (`children`, `security`, `deleted`, `cell`, `link`...)
-/// ficam acessíveis pelo `Deref`.
+/// campos do nó (`security`, `deleted`, `cell`, `link`...) ficam acessíveis
+/// pelo `Deref`.
 pub struct KeyView<'a> {
     node: &'a KeyNode,
-    storage: Option<&'a Storage>,
+    hive: &'a Hive,
 }
 
 impl Deref for KeyView<'_> {
@@ -165,11 +203,17 @@ impl Deref for KeyView<'_> {
 impl<'a> KeyView<'a> {
     /// As células e a célula 'nk' de um nó guardado numa hive.
     fn stored(&self) -> Option<(&'a Storage, u32)> {
-        Some((self.storage?, self.node.cell?.1))
+        let (identifier, cell) = self.node.cell?;
+        Some((&self.hive.storages.get(&identifier)?.storage, cell))
     }
 
     fn name_units(&self) -> Option<key_cells::Units<'a>> {
         self.stored().and_then(|(storage, cell)| key_cells::key_name_units(storage, cell))
+    }
+
+    /// As subchaves vivas sem célula (voláteis e raízes de hive), em ordem.
+    fn linked_views(&self) -> impl Iterator<Item = KeyView<'a>> + '_ {
+        self.node.linked.iter().filter_map(|&(_, child)| self.hive.view(child)).filter(|child| !child.deleted)
     }
 
     /// O nome da chave.
@@ -177,6 +221,14 @@ impl<'a> KeyView<'a> {
         match self.node.name_override() {
             Some(name) => name.to_string(),
             None => self.name_units().map(|units| units.to_string_lossy()).unwrap_or_default(),
+        }
+    }
+
+    /// O nome em UTF-16.
+    pub fn name_utf16(&self) -> Vec<u16> {
+        match self.node.name_override() {
+            Some(name) => name.encode_utf16().collect(),
+            None => self.name_units().map(|units| units.to_vec()).unwrap_or_default(),
         }
     }
 
@@ -221,6 +273,54 @@ impl<'a> KeyView<'a> {
             (None, Some((storage, cell))) => key_cells::class_length(storage, cell),
             (None, None) => 0,
         }
+    }
+
+    /// Quantas subchaves a chave tem: as da hive (SubKeyCounts[Stable]) e
+    /// as que só existem em memória.
+    pub fn subkey_count(&self) -> usize {
+        self.stored().map_or(0, |(storage, cell)| key_cells::sub_key_count(storage, cell) as usize) + self.linked_views().count()
+    }
+
+    /// Os nomes das subchaves, na ordem da enumeração.
+    pub fn subkey_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = match self.stored() {
+            Some((storage, cell)) => (0..key_cells::sub_key_count(storage, cell) as usize).filter_map(|index| key_cells::nth_subkey(storage, cell, index)).filter_map(|child| key_cells::key_name_units(storage, child)).map(|units| units.to_string_lossy()).collect(),
+            None => Vec::new(),
+        };
+        names.extend(self.linked_views().map(|child| child.name()));
+        names
+    }
+
+    /// As contagens e os máximos do KeyFullInformation. Numa chave guardada
+    /// numa hive os máximos são os que o 'nk' guarda (MaxNameLen,
+    /// MaxClassLen, MaxValueNameLen e MaxValueDataLen: os maiores que a
+    /// chave já teve, como o CmpQueryKeyData lê do KCB), somados às
+    /// subchaves que só existem em memória; sem célula, os de agora.
+    pub fn counts(&self) -> KeyCounts {
+        let mut counts = KeyCounts::default();
+        match (self.node.owned(), self.stored()) {
+            (Some(owned), _) => {
+                counts.values = owned.values.len() as u32;
+                counts.max_value_name = owned.values.iter().map(|value| value.name.encode_utf16().count() as u32 * 2).max().unwrap_or(0);
+                counts.max_value_data = owned.values.iter().map(|value| value.data.len() as u32).max().unwrap_or(0);
+            }
+            (None, Some((storage, cell))) => {
+                let (name, class, value_name, value_data) = key_cells::maxima(storage, cell);
+                counts.subkeys = key_cells::sub_key_count(storage, cell);
+                counts.max_name = name;
+                counts.max_class = class;
+                counts.values = key_cells::value_count(storage, cell);
+                counts.max_value_name = value_name;
+                counts.max_value_data = value_data;
+            }
+            (None, None) => {}
+        }
+        for child in self.linked_views() {
+            counts.subkeys += 1;
+            counts.max_name = counts.max_name.max(child.name_length());
+            counts.max_class = counts.max_class.max(child.class_length());
+        }
+        counts
     }
 
     /// Quantos valores a chave tem.
@@ -278,16 +378,6 @@ impl<'a> KeyView<'a> {
             (None, None) => Vec::new(),
         }
     }
-
-    /// O tamanho do nome (bytes de UTF-16) e do dado de cada valor, em
-    /// ordem, sem copiar os dados.
-    pub fn value_sizes(&self) -> Vec<(u32, u32)> {
-        match (self.node.owned(), self.stored()) {
-            (Some(owned), _) => owned.values.iter().map(|value| (value.name.encode_utf16().count() as u32 * 2, value.data.len() as u32)).collect(),
-            (None, Some((storage, cell))) => (0..key_cells::value_count(storage, cell)).filter_map(|index| key_cells::value_cell(storage, cell, index)).filter_map(|value| key_cells::value_sizes(storage, value)).collect(),
-            (None, None) => Vec::new(),
-        }
-    }
 }
 
 /// Os caracteres de um nome em UTF-16, com um substituto no lugar de cada
@@ -307,78 +397,101 @@ pub fn same_name(name: &str, other: &str) -> bool {
     same_chars(name.chars(), other.chars())
 }
 
-fn hash_chars(name: impl Iterator<Item = char>) -> u32 {
-    name.flat_map(char::to_uppercase).fold(0x811C_9DC5u32, |hash, character| (hash ^ character as u32).wrapping_mul(0x0100_0193))
-}
-
 /// Hash do nome sem diferença de caixa (FNV-1a sobre os caracteres em
 /// maiúsculas): nomes iguais por [`same_name`] têm o mesmo hash.
 pub fn name_hash(name: &str) -> u32 {
-    hash_chars(name.chars())
+    name.chars().flat_map(char::to_uppercase).fold(0x811C_9DC5u32, |hash, character| (hash ^ character as u32).wrapping_mul(0x0100_0193))
 }
 
-/// Os nós de uma arena bloco: [`CHUNK`] posições pelo NodeId.
-struct Chunk {
-    slots: Box<[Option<KeyNode>]>,
+/// Uma posição da arena: a geração (que muda a cada reuso, para um id
+/// antigo não achar o nó novo) e o nó.
+struct Slot {
+    generation: u32,
+    node: Option<KeyNode>,
+}
+
+/// Posições por bloco da arena.
+pub const CHUNK: usize = 128;
+
+/// A arena dos nós vivos: posições em blocos de [`CHUNK`], reusadas pela
+/// lista de livres. O NodeId é a geração nos 32 bits altos e a posição nos
+/// baixos (a posição 0 não é usada: nenhum id é zero).
+#[derive(Default)]
+struct NodeArena {
+    chunks: Vec<Box<[Slot]>>,
+    free: Vec<u32>,
     live: usize,
 }
 
-/// Nós por bloco da arena.
-pub const CHUNK: usize = 128;
-
-/// A arena dos nós: o bloco `id / CHUNK` guarda o nó na posição
-/// `id % CHUNK`. Um bloco sem nós vivos volta ao heap (salvo o último, onde
-/// os nós novos entram).
-#[derive(Default)]
-struct NodeArena {
-    chunks: Vec<Option<Chunk>>,
-}
-
 impl NodeArena {
+    fn slot(&self, id: NodeId) -> Option<&Slot> {
+        let index = (id & 0xFFFF_FFFF) as usize;
+        let slot = self.chunks.get(index / CHUNK)?.get(index % CHUNK)?;
+        (slot.generation == (id >> 32) as u32).then_some(slot)
+    }
+
     fn get(&self, id: &NodeId) -> Option<&KeyNode> {
-        let chunk = self.chunks.get(*id as usize / CHUNK)?.as_ref()?;
-        chunk.slots[*id as usize % CHUNK].as_ref()
+        self.slot(*id)?.node.as_ref()
     }
 
     fn get_mut(&mut self, id: &NodeId) -> Option<&mut KeyNode> {
-        let chunk = self.chunks.get_mut(*id as usize / CHUNK)?.as_mut()?;
-        chunk.slots[*id as usize % CHUNK].as_mut()
+        let index = (*id & 0xFFFF_FFFF) as usize;
+        let slot = self.chunks.get_mut(index / CHUNK)?.get_mut(index % CHUNK)?;
+        if slot.generation != (*id >> 32) as u32 {
+            return None;
+        }
+        slot.node.as_mut()
     }
 
     fn contains_key(&self, id: &NodeId) -> bool {
         self.get(id).is_some()
     }
 
-    fn insert(&mut self, id: NodeId, node: KeyNode) {
-        let (index, slot) = (id as usize / CHUNK, id as usize % CHUNK);
-        if self.chunks.len() <= index {
-            self.chunks.resize_with(index + 1, || None);
-        }
-        let chunk = self.chunks[index].get_or_insert_with(|| {
+    fn insert(&mut self, node: KeyNode) -> NodeId {
+        if self.free.is_empty() {
+            let base = (self.chunks.len() * CHUNK) as u32;
             let mut slots = Vec::with_capacity(CHUNK);
-            slots.resize_with(CHUNK, || None);
-            Chunk { slots: slots.into_boxed_slice(), live: 0 }
-        });
-        if chunk.slots[slot].replace(node).is_none() {
-            chunk.live += 1;
+            slots.resize_with(CHUNK, || Slot { generation: 0, node: None });
+            self.chunks.push(slots.into_boxed_slice());
+            // As posições mais baixas saem primeiro; a 0 nunca.
+            self.free.extend((base.max(1)..base + CHUNK as u32).rev());
         }
+        let index = self.free.pop().expect("posicao livre na arena do Registro") as usize;
+        let slot = &mut self.chunks[index / CHUNK][index % CHUNK];
+        slot.node = Some(node);
+        self.live += 1;
+        ((slot.generation as u64) << 32) | index as u64
     }
 
     fn remove(&mut self, id: &NodeId) -> Option<KeyNode> {
-        let index = *id as usize / CHUNK;
-        let last = self.chunks.len().saturating_sub(1);
-        let chunk = self.chunks.get_mut(index)?.as_mut()?;
-        let node = chunk.slots[*id as usize % CHUNK].take()?;
-        chunk.live -= 1;
-        if chunk.live == 0 && index != last {
-            self.chunks[index] = None;
+        let index = (*id & 0xFFFF_FFFF) as usize;
+        let slot = self.chunks.get_mut(index / CHUNK)?.get_mut(index % CHUNK)?;
+        if slot.generation != (*id >> 32) as u32 {
+            return None;
         }
+        let node = slot.node.take()?;
+        slot.generation = slot.generation.wrapping_add(1);
+        self.free.push(index as u32);
+        self.live -= 1;
         Some(node)
+    }
+
+    /// Os ids dos nós vivos.
+    fn ids(&self) -> Vec<NodeId> {
+        let mut ids = Vec::with_capacity(self.live);
+        for (chunk_index, chunk) in self.chunks.iter().enumerate() {
+            for (offset, slot) in chunk.iter().enumerate() {
+                if slot.node.is_some() {
+                    ids.push(((slot.generation as u64) << 32) | (chunk_index * CHUNK + offset) as u64);
+                }
+            }
+        }
+        ids
     }
 
     /// Nós vivos e blocos alocados.
     fn counts(&self) -> (usize, usize) {
-        self.chunks.iter().flatten().fold((0, 0), |(nodes, chunks), chunk| (nodes + chunk.live, chunks + 1))
+        (self.live, self.chunks.len())
     }
 }
 
@@ -388,12 +501,6 @@ impl Index<&NodeId> for NodeArena {
     fn index(&self, id: &NodeId) -> &KeyNode {
         self.get(id).expect("no ausente da arena do Registro")
     }
-}
-
-/// A subchave de `node` com o nome `lower` (já em minúsculas).
-fn child_of(hive: &Hive, node: NodeId, lower: &str) -> Option<NodeId> {
-    let hash = name_hash(lower);
-    hive.nodes.get(&node)?.children.iter().filter(|&&(candidate, _)| candidate == hash).map(|&(_, child)| child).find(|&child| hive.view(child).is_some_and(|key| key.name_is(lower)))
 }
 
 /// Entrada da tabela de handles internos: caminho de abertura e identidade.
@@ -422,13 +529,48 @@ pub struct NativeHooks {
 
 pub type Observer = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// Uma hive ligada ao namespace: as células, o nó da raiz (fixado enquanto
+/// a hive está montada) e o descritor de cada célula 'sk' já lida (o
+/// CmpSecurityCache da hive).
+struct LoadedCells {
+    storage: Storage,
+    root: NodeId,
+    security: BTreeMap<u32, Arc<Captured>>,
+}
+
+impl LoadedCells {
+    /// O descritor da célula 'sk' `cell`, do cache ou lido da célula.
+    fn descriptor(&mut self, cell: u32) -> Option<Arc<Captured>> {
+        if let Some(found) = self.security.get(&cell).filter(|_| security_cells::reference_count(&self.storage, cell).is_some()) {
+            return Some(found.clone());
+        }
+        let read = Arc::new(security_cells::read(&self.storage, cell).ok()?);
+        self.security.insert(cell, read.clone());
+        Some(read)
+    }
+
+    /// Tira do cache uma célula 'sk' que deixou de existir.
+    fn forget_descriptor(&mut self, cell: u32) {
+        if security_cells::reference_count(&self.storage, cell).is_none() {
+            self.security.remove(&cell);
+        }
+    }
+}
+
 struct Hive {
     nodes: NodeArena,
-    next_node: NodeId,
     handles: BTreeMap<u32, HandleEntry>,
     statistics: ObjectStatistics,
-    /// As células das hives carregadas e o nó raiz de cada uma.
-    storages: BTreeMap<u32, (Storage, NodeId)>,
+    /// As hives carregadas.
+    storages: BTreeMap<u32, LoadedCells>,
+    /// O nó vivo de cada célula 'nk': (hive, célula) -> nó.
+    cells: BTreeMap<(u32, u32), NodeId>,
+    /// A lista de fechamento adiado: marca (crescente) -> nó.
+    delayed: BTreeMap<u64, NodeId>,
+    clock: u64,
+    /// Os nós que saíram da arena sob a trava (a identidade deles é
+    /// liberada depois, fora dela).
+    destroyed: Vec<NodeId>,
     /// As hives não confiáveis (as do NtLoadKey: o bit 0 de CMHIVE.Flags)
     /// e a classe de confiança de cada uma (a lista
     /// CMHIVE.TrustClassEntry): hives da mesma classe têm o mesmo número.
@@ -441,15 +583,11 @@ struct Hive {
 impl Hive {
     /// O nó com as células da hive dele.
     fn view(&self, id: NodeId) -> Option<KeyView<'_>> {
-        let node = self.nodes.get(&id)?;
-        let storage = node.cell.and_then(|(identifier, _)| self.storages.get(&identifier)).map(|(storage, _)| storage);
-        Some(KeyView { node, storage })
+        Some(KeyView { node: self.nodes.get(&id)?, hive: self })
     }
 
-    fn allocate_id(&mut self) -> NodeId {
-        let id = self.next_node;
-        self.next_node += 1;
-        id
+    fn storage(&self, identifier: u32) -> Option<&Storage> {
+        self.storages.get(&identifier).map(|loaded| &loaded.storage)
     }
 }
 
@@ -478,17 +616,27 @@ fn now() -> u64 {
     clock::system_time_100ns()
 }
 
+/// Registra a rotina chamada quando uma hive de arquivo fica suja.
+pub fn set_dirty_observer(observer: Option<fn()>) {
+    *DIRTY_OBSERVER.lock() = observer;
+}
+
 fn with_hive<T>(body: impl FnOnce(&mut Hive) -> T) -> T {
-    let (result, dirtied) = {
+    let (result, dirtied, destroyed) = {
         let mut hive = HIVE.lock();
         let hive = hive.get_or_insert_with(|| {
             let mut nodes = NodeArena::default();
-            nodes.insert(ROOT, KeyNode::in_memory("", None, Arc::new(key_policy::boot_root()), false, false, &[], now()));
-            Hive { nodes, next_node: ROOT + 1, handles: BTreeMap::new(), statistics: ObjectStatistics::default(), storages: BTreeMap::new(), trust: BTreeMap::new(), dirtied: false }
+            let root = nodes.insert(KeyNode::in_memory("", None, Arc::new(key_policy::boot_root()), false, false, &[], now()));
+            assert_eq!(root, ROOT);
+            Hive { nodes, handles: BTreeMap::new(), statistics: ObjectStatistics::default(), storages: BTreeMap::new(), cells: BTreeMap::new(), delayed: BTreeMap::new(), clock: 0, destroyed: Vec::new(), trust: BTreeMap::new(), dirtied: false }
         });
         let result = body(hive);
-        (result, core::mem::take(&mut hive.dirtied))
+        trim(hive);
+        (result, core::mem::take(&mut hive.dirtied), core::mem::take(&mut hive.destroyed))
     };
+    if !destroyed.is_empty() {
+        crate::ntos::cm::key::objects::forget(&destroyed);
+    }
     if dirtied {
         let observer = *DIRTY_OBSERVER.lock();
         if let Some(observer) = observer {
@@ -498,15 +646,253 @@ fn with_hive<T>(body: impl FnOnce(&mut Hive) -> T) -> T {
     result
 }
 
-/// Registra a rotina chamada quando uma hive de arquivo fica suja.
-pub fn set_dirty_observer(observer: Option<fn()>) {
-    *DIRTY_OBSERVER.lock() = observer;
+// ---- referências e fechamento adiado ----------------------------------------
+
+/// Mais uma referência no nó; um nó na lista de fechamento adiado sai dela
+/// (CmpRemoveFromDelayedClose).
+fn add_ref(hive: &mut Hive, id: NodeId) {
+    let Some(node) = hive.nodes.get_mut(&id) else { return };
+    node.refs += 1;
+    let stamp = core::mem::take(&mut node.delayed);
+    if stamp != 0 {
+        hive.delayed.remove(&stamp);
+    }
+}
+
+/// Uma referência a menos (CmpDereferenceKeyControlBlock): sem nenhuma, a
+/// chave excluída sai da arena (soltando o pai) e a guardada numa hive vai
+/// para a lista de fechamento adiado.
+fn release(hive: &mut Hive, id: NodeId) {
+    let mut pending = Some(id);
+    while let Some(id) = pending.take() {
+        let Some(node) = hive.nodes.get_mut(&id) else { return };
+        node.refs = node.refs.saturating_sub(1);
+        if node.refs != 0 {
+            return;
+        }
+        if node.deleted {
+            pending = destroy(hive, id);
+        } else if node.cell.is_some() {
+            delay(hive, id);
+        }
+    }
+}
+
+/// CmpAddToDelayedClose: o nó sem referências entra no fim da lista.
+fn delay(hive: &mut Hive, id: NodeId) {
+    hive.clock += 1;
+    let stamp = hive.clock;
+    if let Some(node) = hive.nodes.get_mut(&id) {
+        node.delayed = stamp;
+        hive.delayed.insert(stamp, id);
+    }
+}
+
+/// Tira o nó da arena (e do mapa por célula e da lista do pai). Devolve o
+/// pai, cuja referência o chamador solta.
+fn destroy(hive: &mut Hive, id: NodeId) -> Option<NodeId> {
+    let node = hive.nodes.remove(&id)?;
+    if node.delayed != 0 {
+        hive.delayed.remove(&node.delayed);
+    }
+    if let Some(cell) = node.cell {
+        if hive.cells.get(&cell) == Some(&id) {
+            hive.cells.remove(&cell);
+        }
+    }
+    let parent = node.parent();
+    if let Some(parent_key) = parent.and_then(|parent| hive.nodes.get_mut(&parent)) {
+        parent_key.linked.retain(|&(_, child)| child != id);
+    }
+    hive.destroyed.push(id);
+    parent
+}
+
+/// A lista de fechamento adiado volta ao limite: os mais antigos saem da
+/// arena (o pai de cada um perde a referência e pode entrar na lista).
+fn trim(hive: &mut Hive) {
+    while hive.delayed.len() > DELAYED_CLOSE {
+        let Some((&stamp, &id)) = hive.delayed.iter().next() else { break };
+        hive.delayed.remove(&stamp);
+        if let Some(node) = hive.nodes.get_mut(&id) {
+            node.delayed = 0;
+        }
+        if let Some(parent) = destroy(hive, id) {
+            release(hive, parent);
+        }
+    }
+}
+
+/// O nó da chave da célula `cell` da hive `identifier`, filha de `parent`:
+/// o vivo, ou um novo (CmpCreateKeyControlBlock), sem referências e na
+/// lista de fechamento adiado até alguém o usar.
+fn materialize(hive: &mut Hive, parent: NodeId, identifier: u32, cell: u32) -> Option<NodeId> {
+    if let Some(&id) = hive.cells.get(&(identifier, cell)) {
+        return Some(id);
+    }
+    let loaded = hive.storages.get_mut(&identifier)?;
+    let key = key_cells::node(&loaded.storage, cell)?;
+    let (security_cell, link) = (key.security.get(), key.flags.get() & key_cells::KEY_SYM_LINK != 0);
+    let security = loaded.descriptor(security_cell)?;
+    let id = hive.nodes.insert(KeyNode::stored(Some(parent), security, identifier, cell, link));
+    hive.cells.insert((identifier, cell), id);
+    add_ref(hive, parent);
+    delay(hive, id);
+    Some(id)
+}
+
+/// O nome e o LastWriteTime que um nó guarda quando sai do namespace com
+/// referências além da fixação (um handle aberto, uma subchave excluída que
+/// ainda o segura). Lido antes de as células da chave serem liberadas.
+fn tombstone_of(hive: &Hive, node: NodeId) -> Option<(String, u64)> {
+    let key = hive.nodes.get(&node)?;
+    let remaining = key.refs.saturating_sub(key.cell.is_none() as u32);
+    if remaining == 0 {
+        return None;
+    }
+    hive.view(node).map(|key| (key.name(), key.last_write_time()))
+}
+
+/// O nó sai do namespace (chave excluída, hive descarregada ou trocada):
+/// sem referências além da fixação, a arena o libera; com handle aberto (ou
+/// uma subchave excluída que ainda o segura), fica só o nome e o
+/// LastWriteTime (o KCB excluído), até a última referência sair. Chamado
+/// antes de as células dele serem liberadas: o nome ainda vem da célula.
+fn retire(hive: &mut Hive, node: NodeId) {
+    let tombstone = tombstone_of(hive, node);
+    retire_as(hive, node, tombstone);
+}
+
+/// [`retire`] com o nome e o tempo já lidos ([`tombstone_of`]).
+fn retire_as(hive: &mut Hive, node: NodeId, tombstone: Option<(String, u64)>) {
+    let Some(key) = hive.nodes.get(&node) else { return };
+    if key.deleted {
+        return;
+    }
+    let pinned = key.cell.is_none();
+    let remaining = key.refs.saturating_sub(pinned as u32);
+    let Some(key) = hive.nodes.get_mut(&node) else { return };
+    key.deleted = true;
+    let cell = key.cell.take();
+    let stamp = core::mem::take(&mut key.delayed);
+    if let Some((name, time)) = tombstone.filter(|_| remaining > 0) {
+        key.extra = Some(Box::new(Extra { name: name.into_boxed_str(), owned: Some(OwnedKey { values: Vec::new(), class: Vec::new(), last_write_time: time }) }));
+    }
+    if let Some(cell) = cell {
+        if hive.cells.get(&cell) == Some(&node) {
+            hive.cells.remove(&cell);
+        }
+    }
+    if stamp != 0 {
+        hive.delayed.remove(&stamp);
+    }
+    if pinned {
+        release(hive, node);
+    } else if remaining == 0 {
+        if let Some(parent) = destroy(hive, node) {
+            release(hive, parent);
+        }
+    }
+}
+
+/// Os nós vivos da subárvore de `root` (o próprio incluído), dos mais
+/// fundos para os mais rasos.
+fn live_subtree(hive: &Hive, root: NodeId) -> Vec<NodeId> {
+    let mut found: Vec<(usize, NodeId)> = Vec::new();
+    for id in hive.nodes.ids() {
+        let mut depth = 0;
+        let mut current = Some(id);
+        while let Some(at) = current {
+            if at == root {
+                found.push((depth, id));
+                break;
+            }
+            depth += 1;
+            current = hive.nodes.get(&at).and_then(|key| key.parent());
+        }
+    }
+    found.sort_unstable_by(|left, right| right.0.cmp(&left.0));
+    found.into_iter().map(|(_, id)| id).collect()
+}
+
+/// `ancestor` é o próprio `node` ou um ancestral dele?
+fn within(hive: &Hive, node: NodeId, ancestor: NodeId) -> bool {
+    let mut current = Some(node);
+    while let Some(at) = current {
+        if at == ancestor {
+            return true;
+        }
+        current = hive.nodes.get(&at).and_then(|key| key.parent());
+    }
+    false
+}
+
+// ---- nomes e caminhos ------------------------------------------------------
+
+/// A subchave `name` de `node`: as vivas sem célula (sem caixa) e, numa
+/// chave guardada numa hive, a da busca binária no índice
+/// (CmpFindSubKeyByName), com o nó criado se faltar.
+fn lookup_child(hive: &mut Hive, node: NodeId, name: &str) -> Option<NodeId> {
+    let lower = name.to_lowercase();
+    let hash = name_hash(&lower);
+    let key = hive.nodes.get(&node)?;
+    if let Some(child) = key.linked.iter().filter(|&&(candidate, _)| candidate == hash).map(|&(_, child)| child).find(|&child| hive.view(child).is_some_and(|key| !key.deleted && key.name_is(&lower))) {
+        return Some(child);
+    }
+    let (identifier, cell) = key.cell?;
+    let units: Vec<u16> = name.encode_utf16().collect();
+    let child = key_cells::find_subkey(hive.storage(identifier)?, cell, &units)?;
+    materialize(hive, node, identifier, child)
+}
+
+/// Insere uma subchave sem célula (volátil, mestra ou a raiz de uma hive
+/// montada) na lista do pai, em ordem de nome sem caixa.
+fn link_child(hive: &mut Hive, parent: NodeId, child: NodeId, name: &str) {
+    let units: Vec<u16> = name.encode_utf16().collect();
+    let position = match hive.nodes.get(&parent) {
+        Some(key) => key.linked.partition_point(|&(_, other)| hive.view(other).is_some_and(|other| index::compare_units(other.name_utf16().into_iter(), &units) == Ordering::Less)),
+        None => return,
+    };
+    if let Some(key) = hive.nodes.get_mut(&parent) {
+        key.linked.insert(position, (name_hash(&name.to_lowercase()), child));
+    }
+}
+
+/// Uma subchave na enumeração: um nó vivo ou uma célula da hive.
+enum Child {
+    Node(NodeId),
+    Cell(u32, u32),
+}
+
+/// A subchave `index` na ordem da enumeração (CmpFindSubKeyByNumber): as
+/// da hive pelo índice, depois as sem célula.
+fn child_at_index(hive: &Hive, node: NodeId, index: usize) -> Option<Child> {
+    let key = hive.nodes.get(&node)?;
+    let mut index = index;
+    if let Some((identifier, cell)) = key.cell {
+        let storage = hive.storage(identifier)?;
+        let stable = key_cells::sub_key_count(storage, cell) as usize;
+        if index < stable {
+            let child = key_cells::nth_subkey(storage, cell, index)?;
+            return Some(match hive.cells.get(&(identifier, child)) {
+                Some(&id) => Child::Node(id),
+                None => Child::Cell(identifier, child),
+            });
+        }
+        index -= stable;
+    }
+    key.linked.iter().map(|&(_, child)| child).filter(|child| hive.nodes.get(child).is_some_and(|key| !key.deleted)).nth(index).map(Child::Node)
+}
+
+/// A chave tem subchaves (na hive ou em memória)?
+fn has_subkeys(hive: &Hive, node: NodeId) -> bool {
+    hive.view(node).is_some_and(|key| key.subkey_count() != 0)
 }
 
 /// Uma mudança de célula: a hive que estava limpa avisa o escritor
 /// preguiçoso depois de soltar a trava.
 fn note_change(hive: &mut Hive, identifier: u32, was_dirty: bool) {
-    if !was_dirty && hive.storages.get(&identifier).is_some_and(|(storage, _)| storage.is_dirty()) {
+    if !was_dirty && hive.storage(identifier).is_some_and(Storage::is_dirty) {
         hive.dirtied = true;
     }
 }
@@ -514,16 +900,27 @@ fn note_change(hive: &mut Hive, identifier: u32, was_dirty: bool) {
 /// Aplica uma operação às células da hive `identifier` (a da chave da
 /// célula `cell`). Uma falha marca a hive como quebrada: as células podem
 /// ter ficado pela metade e a descarga fica recusada.
-fn cell_op(hive: &mut Hive, identifier: u32, cell: u32, change: impl FnOnce(&mut Storage) -> Option<()>) -> bool {
-    let Some((storage, _)) = hive.storages.get_mut(&identifier) else { return false };
-    let was_dirty = storage.is_dirty();
-    let done = change(storage).is_some();
-    if !done {
-        storage.broken = true;
+fn cell_op<T>(hive: &mut Hive, identifier: u32, cell: u32, change: impl FnOnce(&mut Storage) -> Option<T>) -> Option<T> {
+    let loaded = hive.storages.get_mut(&identifier)?;
+    let was_dirty = loaded.storage.is_dirty();
+    let done = change(&mut loaded.storage);
+    if done.is_none() {
+        loaded.storage.broken = true;
         crate::debug_print!("[cm] hive {}: a mudanca na celula {:#x} falhou; a descarga fica recusada", identifier, cell);
     }
     note_change(hive, identifier, was_dirty);
     done
+}
+
+/// CmpFreeKeyByCell de uma chave sem subchaves, com a célula 'sk' dela
+/// tirada do cache se deixou de existir.
+fn free_key_cells(hive: &mut Hive, identifier: u32, cell: u32) -> bool {
+    let security = hive.storage(identifier).and_then(|storage| key_cells::security_cell(storage, cell));
+    let freed = cell_op(hive, identifier, cell, |storage| key_cells::delete_key(storage, cell, now())).is_some();
+    if let (Some(security), Some(loaded)) = (security, hive.storages.get_mut(&identifier)) {
+        loaded.forget_descriptor(security);
+    }
+    freed
 }
 
 fn is_registry_path(path: &str) -> bool {
@@ -575,7 +972,7 @@ fn ok_to_follow_link(hive: &Hive, source: u32, target: Option<u32>) -> bool {
 /// STATUS_REPARSE), e a chave mais funda que o nome final alcança precisa
 /// estar numa hive da classe de confiança dele (CmpOKToFollowLink, depois
 /// do CmpPerformCompleteKcbCacheLookup).
-fn resolve(hive: &Hive, path: &str, open_link: bool) -> Result<String, u32> {
+fn resolve(hive: &mut Hive, path: &str, open_link: bool) -> Result<String, u32> {
     let mut current = String::from(path);
     let mut reparses = 0;
     let mut link_source: Option<u32> = None;
@@ -583,7 +980,7 @@ fn resolve(hive: &Hive, path: &str, open_link: bool) -> Result<String, u32> {
         let components = split_path(&current);
         let mut node = ROOT;
         for (index, component) in components.iter().enumerate() {
-            let Some(child) = child_of(hive, node, &component.to_lowercase()) else { break };
+            let Some(child) = lookup_child(hive, node, component) else { break };
             let Some(key) = hive.view(child) else { break };
             let last = index + 1 == components.len();
             if key.link && !(last && open_link) {
@@ -591,10 +988,10 @@ fn resolve(hive: &Hive, path: &str, open_link: bool) -> Result<String, u32> {
                 if reparses > MAX_REPARSE {
                     return Err(STATUS_OBJECT_NAME_NOT_FOUND);
                 }
+                let mut target = link_target(&key).ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
                 if link_source.is_none() {
                     link_source = owning_hive_of(hive, child).filter(|identifier| hive.trust.contains_key(identifier));
                 }
-                let mut target = link_target(&key).ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
                 // O nome novo recomeça na raiz do namespace de objetos.
                 if !target.starts_with('\\') {
                     return Err(STATUS_OBJECT_PATH_SYNTAX_BAD);
@@ -682,19 +1079,6 @@ fn report_change(chain: &[NodeId], filter: u32) {
     }
 }
 
-/// O nó existente mais fundo de um caminho já resolvido: o pai da primeira
-/// chave que uma criação acrescentaria.
-fn deepest_existing(hive: &Hive, path: &str) -> NodeId {
-    let mut node = ROOT;
-    for component in split_path(path) {
-        match child_of(hive, node, &component.to_lowercase()) {
-            Some(child) => node = child,
-            None => break,
-        }
-    }
-    node
-}
-
 /// Notifica uma cópia da lista (inscrição e remoção durante a entrega são
 /// permitidas); nenhum lock fica retido durante os callbacks.
 fn notify_path_changed(path: &str) {
@@ -704,30 +1088,6 @@ fn notify_path_changed(path: &str) {
         if target == observed || target.starts_with(&(observed.clone() + "\\")) {
             callback(path);
         }
-    }
-}
-
-/// Os nós com handle aberto.
-fn open_nodes(hive: &Hive) -> BTreeSet<NodeId> {
-    hive.handles.values().map(|entry| entry.node).collect()
-}
-
-/// O nó sai do namespace (chave excluída, hive descarregada ou trocada):
-/// sem handle aberto nele (`open`), a arena o libera; com handle, fica só o
-/// nome e o LastWriteTime (o KCB excluído), sem valores, classe e
-/// subchaves, até o último handle fechar ([`close_raw`]). Chamado antes de
-/// as células dele serem liberadas: o nome ainda vem da célula.
-fn retire(hive: &mut Hive, node: NodeId, open: bool) {
-    if !open {
-        hive.nodes.remove(&node);
-        return;
-    }
-    let Some((name, time)) = hive.view(node).map(|key| (key.name(), key.last_write_time())) else { return };
-    if let Some(key) = hive.nodes.get_mut(&node) {
-        key.deleted = true;
-        key.cell = None;
-        key.children = Vec::new();
-        key.extra = Some(Box::new(Extra { name: name.into_boxed_str(), owned: Some(OwnedKey { values: Vec::new(), class: Vec::new(), last_write_time: time }) }));
     }
 }
 
@@ -743,27 +1103,25 @@ fn create_node(hive: &mut Hive, name: &str, parent: NodeId, security: Option<Cap
     let volatile = volatile || parent_key.volatile;
     let time = now();
     // A chave nova vai para a hive do pai, salvo se for volátil.
-    let node = match parent_key.cell.filter(|_| !volatile) {
+    match parent_key.cell.filter(|_| !volatile) {
         Some((identifier, parent_cell)) => {
-            let mut created = None;
-            let done = cell_op(hive, identifier, parent_cell, |storage| {
+            let created = cell_op(hive, identifier, parent_cell, |storage| {
                 let cell = key_cells::create_key(storage, parent_cell, name, class, &security, time)?;
                 if link {
                     key_cells::set_key_flags(storage, cell, key_cells::KEY_SYM_LINK);
                 }
-                created = Some(cell);
-                Some(())
+                Some(cell)
             });
-            match created.filter(|_| done) {
-                Some(cell) => KeyNode::stored(Some(parent), Arc::new(security), identifier, cell, link),
-                None => return Err(KernelError::with_status("registry: no room for the key cells", STATUS_INSUFFICIENT_RESOURCES)),
-            }
+            let Some(cell) = created else { return Err(KernelError::with_status("registry: no room for the key cells", STATUS_INSUFFICIENT_RESOURCES)) };
+            materialize(hive, parent, identifier, cell).ok_or_else(|| KernelError::with_status("registry: key cell unreadable", STATUS_REGISTRY_CORRUPT))
         }
-        None => KeyNode::in_memory(name, Some(parent), Arc::new(security), volatile, link, class, time),
-    };
-    let identifier = hive.allocate_id();
-    hive.nodes.insert(identifier, node);
-    Ok(identifier)
+        None => {
+            let identifier = hive.nodes.insert(KeyNode::in_memory(name, Some(parent), Arc::new(security), volatile, link, class, time));
+            add_ref(hive, parent);
+            link_child(hive, parent, identifier, name);
+            Ok(identifier)
+        }
+    }
 }
 
 /// Percorre desde a raiz, criando componentes ausentes só quando pedido. Não
@@ -780,21 +1138,26 @@ fn walk_link(hive: &mut Hive, path: &str, create: bool, security: Option<Capture
     let last = components.len().saturating_sub(1);
     let mut security = security;
     for (index, component) in components.iter().enumerate() {
-        let lower = component.to_lowercase();
-        let existing = child_of(hive, node, &lower);
-        node = match existing {
+        node = match lookup_child(hive, node, component) {
             Some(child) => child,
             None if !create => return Ok(None),
-            None => {
-                let child = create_node(hive, component, node, if index == last { security.take() } else { None }, volatile && index == last, link && index == last, if index == last { class } else { &[] })?;
-                if let Some(parent) = hive.nodes.get_mut(&node) {
-                    parent.children.push((name_hash(&lower), child));
-                }
-                child
-            }
+            None => create_node(hive, component, node, if index == last { security.take() } else { None }, volatile && index == last, link && index == last, if index == last { class } else { &[] })?,
         };
     }
     Ok(Some(node))
+}
+
+/// O nó existente mais fundo de um caminho já resolvido: o pai da primeira
+/// chave que uma criação acrescentaria.
+fn deepest_existing(hive: &mut Hive, path: &str) -> NodeId {
+    let mut node = ROOT;
+    for component in split_path(path) {
+        match lookup_child(hive, node, component) {
+            Some(child) => node = child,
+            None => break,
+        }
+    }
+    node
 }
 
 /// Resolve os links e percorre sem criar.
@@ -814,17 +1177,19 @@ fn update_statistics(hive: &mut Hive) {
     statistics.peak_handles = statistics.peak_handles.max(statistics.handles);
 }
 
+/// Um handle novo na chave (que passa a segurar o nó).
 fn publish(hive: &mut Hive, path: &str, node: NodeId) -> Result<u32, KernelError> {
     let handle = handle_ids::allocate(4)?;
     hive.handles.insert(handle, HandleEntry { path: path.to_string(), node });
+    add_ref(hive, node);
     update_statistics(hive);
     Ok(handle)
 }
 
-/// Nomes das subchaves em ordem de inserção.
+/// Nomes das subchaves na ordem da enumeração.
 pub fn list_keys(path: &str) -> Vec<String> {
-    with_hive(|hive| match find(hive, path).and_then(|node| hive.nodes.get(&node)) {
-        Some(key) => key.children.iter().filter_map(|&(_, child)| hive.view(child).map(|child| child.name())).collect(),
+    with_hive(|hive| match find(hive, path) {
+        Some(node) => hive.view(node).map(|key| key.subkey_names()).unwrap_or_default(),
         None => Vec::new(),
     })
 }
@@ -926,34 +1291,32 @@ pub fn delete_key(handle: u32) -> bool {
     delete_node(entry.node, &entry.path)
 }
 
-/// Exclui só nó vivo, sem filhos e com pai resolvido. As células da chave
-/// são liberadas (CmpFreeKeyByCell) e o nó sai da arena; com handles
-/// abertos, fica marcado como excluído para que eles não o tratem como
-/// chave válida.
+/// Exclui só nó vivo, sem subchaves e com pai: as células da chave são
+/// liberadas (CmpFreeKeyByCell) e o nó sai da arena; com handles abertos,
+/// fica marcado como excluído para que eles não o tratem como chave
+/// válida.
 pub fn delete_node(node: NodeId, path: &str) -> bool {
     let removed = with_hive(|hive| {
         let key = hive.nodes.get(&node)?;
         // A raiz de uma hive carregada é KEY_NO_DELETE.
-        if key.deleted || !key.children.is_empty() || hive.storages.values().any(|&(_, root)| root == node) {
+        if key.deleted || hive.storages.values().any(|loaded| loaded.root == node) || has_subkeys(hive, node) {
             return None;
         }
         // O pai é o do próprio nó: um handle aberto por um link guarda o
         // caminho resolvido, e a árvore é a fonte de verdade.
-        let parent = key.parent()?;
-        let cell = key.cell;
+        let (parent, cell) = (key.parent()?, key.cell);
         let real = node_path(hive, node);
-        let parent_chain = ancestry(hive, parent);
-        let parent = hive.nodes.get_mut(&parent)?;
-        let before = parent.children.len();
-        parent.children.retain(|&(_, child)| child != node);
-        if parent.children.len() == before {
-            return None;
-        }
-        let open = hive.handles.values().any(|entry| entry.node == node);
-        retire(hive, node, open);
+        let tombstone = tombstone_of(hive, node);
         if let Some((identifier, cell)) = cell {
-            cell_op(hive, identifier, cell, |storage| key_cells::delete_key(storage, cell, now()));
+            if !free_key_cells(hive, identifier, cell) {
+                return None;
+            }
         }
+        let parent_chain = ancestry(hive, parent);
+        if let Some(parent_key) = hive.nodes.get_mut(&parent) {
+            parent_key.linked.retain(|&(_, child)| child != node);
+        }
+        retire_as(hive, node, tombstone);
         Some((real, parent_chain))
     });
     match removed {
@@ -967,6 +1330,31 @@ pub fn delete_node(node: NodeId, path: &str) -> bool {
             true
         }
         None => false,
+    }
+}
+
+/// CmDeleteKeyRecursive: as subchaves de `node` (as mais fundas primeiro) e
+/// depois a própria chave, cada uma como pelo [`delete_node`].
+pub fn delete_tree(node: NodeId) -> bool {
+    loop {
+        // A primeira folha da subárvore.
+        let leaf = with_hive(|hive| {
+            let mut current = node;
+            while let Some(child) = match child_at_index(hive, current, 0) {
+                Some(Child::Node(id)) => Some(id),
+                Some(Child::Cell(identifier, cell)) => materialize(hive, current, identifier, cell),
+                None => None,
+            } {
+                current = child;
+            }
+            current
+        });
+        if leaf == node {
+            return delete_node(node, "");
+        }
+        if !delete_node(leaf, "") {
+            return false;
+        }
     }
 }
 
@@ -988,8 +1376,9 @@ pub fn close_handle(handle: u32) -> bool {
 }
 
 /// Remove o handle, atualiza contadores e desassocia a identidade nativa; o
-/// hook de remoção controla a exclusividade da operação. O último handle de
-/// uma chave excluída leva o nó dela.
+/// hook de remoção controla a exclusividade da operação. O handle solta o
+/// nó (o último de uma chave excluída a tira da arena; o de uma chave viva
+/// a põe na lista de fechamento adiado).
 pub fn close_raw(handle: u32) -> bool {
     if !with_hive(|hive| hive.handles.contains_key(&handle)) {
         return false;
@@ -1000,9 +1389,7 @@ pub fn close_raw(handle: u32) -> bool {
             let Some(entry) = hive.handles.remove(&handle) else { return false };
             update_statistics(hive);
             handle_ids::release(handle);
-            if hive.nodes.get(&entry.node).is_some_and(|key| key.deleted) && !hive.handles.values().any(|other| other.node == entry.node) {
-                hive.nodes.remove(&entry.node);
-            }
+            release(hive, entry.node);
             true
         });
         if removed {
@@ -1037,7 +1424,7 @@ fn store_value(hive: &mut Hive, node: NodeId, name: &str, value_type: u32, data:
     let Some(key) = hive.view(node) else { return false };
     if let Some((identifier, cell)) = key.cell {
         let existing = key.value_cell(&lower);
-        return cell_op(hive, identifier, cell, |storage| key_cells::set_value_at(storage, cell, existing, name, value_type, &data, time));
+        return cell_op(hive, identifier, cell, |storage| key_cells::set_value_at(storage, cell, existing, name, value_type, &data, time)).is_some();
     }
     let Some(owned) = hive.nodes.get_mut(&node).and_then(|key| key.owned_mut()) else { return false };
     match owned.values.iter_mut().find(|value| same_name(&value.name, &lower)) {
@@ -1101,7 +1488,7 @@ fn remove_value(hive: &mut Hive, node: NodeId, lower: &str, time: u64) -> bool {
     let Some(key) = hive.view(node) else { return false };
     if let Some((identifier, cell)) = key.cell {
         let Some(value) = key.value_cell(lower) else { return false };
-        return cell_op(hive, identifier, cell, |storage| key_cells::delete_value_at(storage, cell, value, time));
+        return cell_op(hive, identifier, cell, |storage| key_cells::delete_value_at(storage, cell, value, time)).is_some();
     }
     let Some(owned) = hive.nodes.get_mut(&node).and_then(|key| key.owned_mut()) else { return false };
     let before = owned.values.len();
@@ -1132,6 +1519,34 @@ pub fn delete_node_value(node: NodeId, path: &str, name: &str) -> bool {
     }
 }
 
+/// Troca o descritor de uma chave viva (o CmpSetSecurityDescriptorInfo): numa
+/// chave guardada numa hive, a célula 'sk' nova vem primeiro (a que já tem
+/// esses bytes, ou uma nova) e a antiga perde a referência; sem célula, só
+/// o nó. `false` para uma chave excluída ou células sem espaço.
+pub fn set_security(node: NodeId, security: Captured) -> bool {
+    with_hive(|hive| {
+        let Some(cell) = hive.nodes.get(&node).filter(|key| !key.deleted).map(|key| key.cell) else { return false };
+        let shared = match cell {
+            Some((identifier, cell)) => {
+                let old = hive.storage(identifier).and_then(|storage| key_cells::security_cell(storage, cell));
+                let Some(new) = cell_op(hive, identifier, cell, |storage| key_cells::set_security(storage, cell, &security)) else { return false };
+                let Some(loaded) = hive.storages.get_mut(&identifier) else { return false };
+                if let Some(old) = old {
+                    loaded.forget_descriptor(old);
+                }
+                let shared = Arc::new(security);
+                loaded.security.insert(new, shared.clone());
+                shared
+            }
+            None => Arc::new(security),
+        };
+        if let Some(key) = hive.nodes.get_mut(&node) {
+            key.security = shared;
+        }
+        true
+    })
+}
+
 /// O nó de um caminho, seguindo os links.
 pub fn node_by_path(path: &str) -> Option<NodeId> {
     with_hive(|hive| find(hive, path))
@@ -1154,25 +1569,37 @@ pub fn arena_counts() -> (usize, usize) {
     with_hive(|hive| hive.nodes.counts())
 }
 
+/// Quantos nós estão na lista de fechamento adiado.
+pub fn delayed_close_count() -> usize {
+    with_hive(|hive| hive.delayed.len())
+}
+
 /// Lê um nó com as células dele (sem chamar o registro de dentro da
 /// closure).
 pub fn with_node<T>(node: NodeId, body: impl FnOnce(&KeyView) -> T) -> Option<T> {
     with_hive(|hive| hive.view(node).map(|view| body(&view)))
 }
 
-/// Altera os campos de um nó da arena (descritor, flags).
-pub fn with_node_mut<T>(node: NodeId, body: impl FnOnce(&mut KeyNode) -> T) -> Option<T> {
-    with_hive(|hive| hive.nodes.get_mut(&node).map(body))
+/// Lê a subchave `index` de `node` na ordem da enumeração
+/// (CmpFindSubKeyByNumber), sem criar nó para ela: uma subchave que não
+/// está viva é lida direto da célula (o CmEnumerateKey não cria KCB).
+pub fn with_child_at<T>(node: NodeId, index: usize, body: impl FnOnce(&KeyView) -> T) -> Option<T> {
+    with_hive(|hive| match child_at_index(hive, node, index)? {
+        Child::Node(child) => hive.view(child).map(|view| body(&view)),
+        Child::Cell(identifier, cell) => {
+            let loaded = hive.storages.get_mut(&identifier)?;
+            let key = key_cells::node(&loaded.storage, cell)?;
+            let (security_cell, link) = (key.security.get(), key.flags.get() & key_cells::KEY_SYM_LINK != 0);
+            let security = loaded.descriptor(security_cell)?;
+            let transient = KeyNode::stored(Some(node), security, identifier, cell, link);
+            Some(body(&KeyView { node: &transient, hive: &*hive }))
+        }
+    })
 }
 
-/// Subchaves vivas em ordem de inserção.
-pub fn children(node: NodeId) -> Vec<NodeId> {
-    with_node(node, |key| key.children.iter().map(|&(_, child)| child).collect()).unwrap_or_default()
-}
-
-/// A subchave `index` na ordem de inserção.
-pub fn child_at(node: NodeId, index: usize) -> Option<NodeId> {
-    with_node(node, |key| key.children.get(index).map(|&(_, child)| child)).flatten()
+/// Quantas subchaves a chave tem.
+pub fn child_count(node: NodeId) -> usize {
+    with_node(node, |key| key.subkey_count()).unwrap_or(0)
 }
 
 pub fn is_deleted(node: NodeId) -> bool {
@@ -1192,77 +1619,37 @@ const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
 const STATUS_OBJECT_NAME_COLLISION: u32 = 0xC000_0035;
 const STATUS_CANNOT_DELETE: u32 = 0xC000_0121;
 
-/// Liga as chaves de uma hive conferida (`tree::check`) em `path`
-/// (CmpLinkHiveToMaster): o pai precisa existir e o nome não (o vínculo
-/// sobre uma chave existente é STATUS_OBJECT_NAME_COLLISION, como no
-/// CmpDoParseKey com CreateLink). Cada chave vira um nó com a célula dela,
-/// sem cópia do conteúdo, e o descritor compartilhado da célula 'sk'. Em
-/// falha as células voltam ao chamador.
+/// Liga uma hive conferida (`tree::check`) em `path` (CmpLinkHiveToMaster):
+/// o pai precisa existir e o nome não (o vínculo sobre uma chave existente
+/// é STATUS_OBJECT_NAME_COLLISION, como no CmpDoParseKey com CreateLink).
+/// Só a raiz ganha nó, fixado enquanto a hive está montada e com o nome do
+/// ponto de montagem; as outras chaves ficam nas células até alguém
+/// passar por elas. Os descritores lidos pela conferência ficam como o
+/// cache da hive. Em falha as células voltam ao chamador.
 pub fn link_hive(path: &str, identifier: u32, storage: Storage, checked: Checked) -> Result<NodeId, (u32, Storage)> {
     let components = split_path(path);
     let Some((name, parents)) = components.split_last() else { return Err((STATUS_OBJECT_NAME_NOT_FOUND, storage)) };
     let parent_path = parents.join("\\");
     let linked = with_hive(|hive| {
         let Some(parent) = find(hive, &parent_path) else { return Err((STATUS_OBJECT_NAME_NOT_FOUND, storage)) };
-        if child_of(hive, parent, &name.to_lowercase()).is_some() {
+        if lookup_child(hive, parent, name).is_some() {
             return Err((STATUS_OBJECT_NAME_COLLISION, storage));
         }
-        let first = hive.next_node;
-        let walked = tree::preorder(&storage, |cell, parent_node: Option<NodeId>| {
-            let node = key_cells::node(&storage, cell).ok_or(crate::ntos::cm::hive::storage::STATUS_REGISTRY_CORRUPT)?;
-            let security = checked.descriptor(node.security.get()).ok_or(crate::ntos::cm::hive::storage::STATUS_REGISTRY_CORRUPT)?;
-            let mut key = KeyNode::stored(Some(parent_node.unwrap_or(parent)), security, identifier, cell, node.flags.get() & key_cells::KEY_SYM_LINK != 0);
-            key.children = Vec::with_capacity(node.sub_key_counts[0].get() as usize);
-            let hash = match parent_node {
-                Some(_) => key_cells::key_name_units(&storage, cell).map_or(0, |units| hash_chars(lossy_chars(units.iter()))),
-                None => {
-                    // A raiz tem o nome do ponto de montagem.
-                    key.extra = Some(Box::new(Extra { name: Box::from(*name), owned: None }));
-                    name_hash(name)
-                }
-            };
-            let id = hive.allocate_id();
-            hive.nodes.insert(id, key);
-            if let Some(parent_key) = hive.nodes.get_mut(&parent_node.unwrap_or(parent)) {
-                parent_key.children.push((hash, id));
-            }
-            Ok(id)
-        });
-        if let Err(status) = walked {
-            // Desfaz o vínculo parcial.
-            if let Some(parent_key) = hive.nodes.get_mut(&parent) {
-                parent_key.children.retain(|&(_, child)| child != first);
-            }
-            for id in first..hive.next_node {
-                hive.nodes.remove(&id);
-            }
-            return Err((status, storage));
-        }
-        hive.storages.insert(identifier, (storage, first));
-        Ok(first)
+        let root_cell = storage.root_cell();
+        let Some((security, link)) = key_cells::node(&storage, root_cell).and_then(|key| Some((checked.descriptor(key.security.get())?, key.flags.get() & key_cells::KEY_SYM_LINK != 0))) else { return Err((STATUS_REGISTRY_CORRUPT, storage)) };
+        let mut root = KeyNode::stored(Some(parent), security, identifier, root_cell, link);
+        root.extra = Some(Box::new(Extra { name: Box::from(*name), owned: None }));
+        // A fixação da hive montada.
+        root.refs = 1;
+        let id = hive.nodes.insert(root);
+        hive.cells.insert((identifier, root_cell), id);
+        add_ref(hive, parent);
+        link_child(hive, parent, id, name);
+        hive.storages.insert(identifier, LoadedCells { storage, root: id, security: checked.security });
+        Ok(id)
     })?;
     notify_path_changed(path);
     Ok(linked)
-}
-
-/// Os nós da subárvore (o próprio incluído), em pré-ordem.
-fn subtree(hive: &Hive, node: NodeId) -> Vec<NodeId> {
-    let mut order = Vec::new();
-    let mut stack = alloc::vec![node];
-    while let Some(current) = stack.pop() {
-        order.push(current);
-        if let Some(key) = hive.nodes.get(&current) {
-            for &(_, child) in key.children.iter().rev() {
-                stack.push(child);
-            }
-        }
-    }
-    order
-}
-
-fn has_open_handles(hive: &Hive, nodes: &[NodeId]) -> bool {
-    let open = open_nodes(hive);
-    nodes.iter().any(|node| open.contains(node))
 }
 
 /// Caminho absoluto de um nó pelos nomes.
@@ -1282,31 +1669,42 @@ fn node_path(hive: &Hive, node: NodeId) -> String {
     path
 }
 
+/// Há handle aberto numa chave da subárvore de `node` (o próprio incluído
+/// quando pedido)?
+fn subtree_handles(hive: &Hive, node: NodeId, include_self: bool) -> bool {
+    hive.handles.values().any(|entry| (include_self || entry.node != node) && within(hive, entry.node, node))
+}
+
 /// Desliga uma hive (CmpPerformUnloadKey): com handles abertos em chaves
 /// dela, STATUS_CANNOT_DELETE, salvo `force` (REG_FORCE_UNLOAD), que deixa
-/// os handles apontando para chaves excluídas. Os nós da hive saem da arena
-/// (os com handle ficam excluídos até o último fechar). Devolve as células.
+/// os handles apontando para chaves excluídas. Os nós vivos da hive saem da
+/// arena (os com handle ficam excluídos até o último fechar). Devolve as
+/// células.
 pub fn unlink_hive(identifier: u32, force: bool) -> Result<Storage, u32> {
     let (storage, path, parent_chain) = with_hive(|hive| {
-        let Some(&(_, root)) = hive.storages.get(&identifier) else { return Err(STATUS_OBJECT_NAME_NOT_FOUND) };
-        let nodes = subtree(hive, root);
-        let open = open_nodes(hive);
-        if !force && nodes.iter().any(|node| open.contains(node)) {
+        let Some(root) = hive.storages.get(&identifier).map(|loaded| loaded.root) else { return Err(STATUS_OBJECT_NAME_NOT_FOUND) };
+        if !force && subtree_handles(hive, root, true) {
             return Err(STATUS_CANNOT_DELETE);
         }
         let path = node_path(hive, root);
         let parent = hive.nodes.get(&root).and_then(|key| key.parent());
         let parent_chain = parent.map(|parent| ancestry(hive, parent)).unwrap_or_default();
         if let Some(parent) = parent.and_then(|parent| hive.nodes.get_mut(&parent)) {
-            parent.children.retain(|&(_, child)| child != root);
+            parent.linked.retain(|&(_, child)| child != root);
         }
-        for &node in &nodes {
-            retire(hive, node, open.contains(&node));
+        for node in live_subtree(hive, root) {
+            if node == root {
+                // A fixação da hive montada sai antes.
+                if let Some(key) = hive.nodes.get_mut(&root) {
+                    key.refs = key.refs.saturating_sub(1);
+                }
+            }
+            retire(hive, node);
         }
-        let (storage, _) = hive.storages.remove(&identifier).expect("hive registrada");
+        let loaded = hive.storages.remove(&identifier).expect("hive registrada");
         // CmpUnJoinClassOfTrust.
         hive.trust.remove(&identifier);
-        Ok((storage, path, parent_chain))
+        Ok((loaded.storage, path, parent_chain))
     })?;
     // CmpPerformUnloadKey: a raiz some do pai.
     report_change(&parent_chain, key_notify::REG_NOTIFY_CHANGE_NAME);
@@ -1325,36 +1723,69 @@ pub fn set_close_observer(observer: Option<fn()>) {
 
 /// O nó raiz de uma hive carregada.
 pub fn hive_root(identifier: u32) -> Option<NodeId> {
-    with_hive(|hive| hive.storages.get(&identifier).map(|&(_, root)| root))
+    with_hive(|hive| hive.storages.get(&identifier).map(|loaded| loaded.root))
 }
 
 /// Executa `body` sobre as células de uma hive carregada.
 pub fn with_storage<T>(identifier: u32, body: impl FnOnce(&mut Storage) -> T) -> Option<T> {
-    with_hive(|hive| hive.storages.get_mut(&identifier).map(|(storage, _)| body(storage)))
+    with_hive(|hive| hive.storages.get_mut(&identifier).map(|loaded| body(&mut loaded.storage)))
 }
 
 /// A hive de arquivo de um nó e se ele é a raiz dela.
 pub fn hive_of(node: NodeId) -> Option<(u32, bool)> {
     with_hive(|hive| {
         let (identifier, _) = hive.nodes.get(&node)?.cell?;
-        let root = hive.storages.get(&identifier)?.1;
+        let root = hive.storages.get(&identifier)?.root;
         Some((identifier, root == node))
     })
+}
+
+/// A cópia de uma chave guardada numa hive (para o CmSaveKey).
+fn stored_record(hive: &mut Hive, identifier: u32, cell: u32, parent: Option<usize>) -> Option<NewKey> {
+    let loaded = hive.storages.get_mut(&identifier)?;
+    let security = loaded.descriptor(key_cells::security_cell(&loaded.storage, cell)?)?;
+    let storage = &loaded.storage;
+    let key = key_cells::node(storage, cell)?;
+    let count = key_cells::value_count(storage, cell);
+    let values = (0..count).filter_map(|index| key_cells::value_cell(storage, cell, index)).filter_map(|value| key_cells::read_value(storage, value)).collect();
+    Some(NewKey { name: key_cells::key_name_units(storage, cell)?.to_string_lossy(), last_write_time: key_cells::last_write_time(storage, cell), security: Captured::clone(&security), values, parent, link: key.flags.get() & key_cells::KEY_SYM_LINK != 0, class: key_cells::class_units(storage, cell) })
 }
 
 /// As chaves da subárvore de um nó em pré-ordem, sem as voláteis (o que o
 /// CmSaveKey copia). A primeira é o próprio nó.
 pub fn snapshot(node: NodeId) -> Option<Vec<NewKey>> {
     with_hive(|hive| {
-        hive.nodes.get(&node).filter(|key| !key.deleted && !key.volatile)?;
-        let mut keys: Vec<NewKey> = Vec::new();
-        let mut stack: Vec<(NodeId, Option<usize>)> = alloc::vec![(node, None)];
-        while let Some((current, parent)) = stack.pop() {
-            let Some(key) = hive.view(current).filter(|key| !key.deleted && !key.volatile) else { continue };
+        let key = hive.view(node).filter(|key| !key.deleted && !key.volatile)?;
+        let mut keys: Vec<NewKey> = alloc::vec![NewKey { name: key.name(), last_write_time: key.last_write_time(), security: Captured::clone(&key.security), values: key.values(), parent: None, link: key.link, class: key.class() }];
+        let mut stack: Vec<(Child, usize)> = Vec::new();
+        let push_children = |hive: &Hive, stack: &mut Vec<(Child, usize)>, node: NodeId, index: usize| {
+            let count = hive.view(node).map_or(0, |key| key.subkey_count());
+            for position in (0..count).rev() {
+                if let Some(child) = child_at_index(hive, node, position) {
+                    stack.push((child, index));
+                }
+            }
+        };
+        push_children(hive, &mut stack, node, 0);
+        while let Some((child, parent)) = stack.pop() {
             let index = keys.len();
-            keys.push(NewKey { name: key.name(), last_write_time: key.last_write_time(), security: Captured::clone(&key.security), values: key.values(), parent, link: key.link, class: key.class() });
-            for &(_, child) in key.children.iter().rev() {
-                stack.push((child, Some(index)));
+            match child {
+                Child::Node(id) => {
+                    let Some(key) = hive.view(id).filter(|key| !key.deleted && !key.volatile) else { continue };
+                    keys.push(NewKey { name: key.name(), last_write_time: key.last_write_time(), security: Captured::clone(&key.security), values: key.values(), parent: Some(parent), link: key.link, class: key.class() });
+                    push_children(hive, &mut stack, id, index);
+                }
+                Child::Cell(identifier, cell) => {
+                    keys.push(stored_record(hive, identifier, cell, Some(parent))?);
+                    let storage = hive.storage(identifier)?;
+                    for position in (0..key_cells::sub_key_count(storage, cell) as usize).rev() {
+                        let child = key_cells::nth_subkey(storage, cell, position)?;
+                        stack.push((match hive.cells.get(&(identifier, child)) {
+                            Some(&id) => Child::Node(id),
+                            None => Child::Cell(identifier, child),
+                        }, index));
+                    }
+                }
             }
         }
         Some(keys)
@@ -1364,43 +1795,77 @@ pub fn snapshot(node: NodeId) -> Option<Vec<NewKey>> {
 /// Há handles abertos em chaves da subárvore (o próprio nó incluído
 /// quando pedido)?
 pub fn subtree_has_open_handles(node: NodeId, include_self: bool) -> bool {
-    with_hive(|hive| {
-        let mut nodes = subtree(hive, node);
-        if !include_self {
-            nodes.retain(|&candidate| candidate != node);
-        }
-        has_open_handles(hive, &nodes)
-    })
+    with_hive(|hive| subtree_handles(hive, node, include_self))
 }
 
 /// Os handles internos abertos em chaves da subárvore de `node` (o próprio
 /// nó incluído) guardadas pela mesma hive, com o caminho de cada chave (o
 /// nome que o CmpConstructNameWithStatus monta para o KCB): primeiro os do
 /// próprio nó (o CmpDumpKeyBodyList do KCB pedido), depois os dos
-/// descendentes (o CmpEnumerateAllOpenSubKeys, rva 0x66d0e4, que percorre
-/// só a tabela de KCBs da hive do KCB: as hives montadas abaixo ficam fora).
+/// descendentes pelo caminho (o CmpEnumerateAllOpenSubKeys, rva 0x66d0e4,
+/// que percorre só a tabela de KCBs da hive do KCB: as hives montadas
+/// abaixo ficam fora).
 pub fn open_handles_in_hive(node: NodeId) -> Vec<(u32, String)> {
     with_hive(|hive| {
         let owner = owning_hive_of(hive, node);
-        let mut by_node: BTreeMap<NodeId, Vec<u32>> = BTreeMap::new();
+        let mut own: Vec<(u32, String)> = Vec::new();
+        let mut below: Vec<(String, u32)> = Vec::new();
         for (&handle, entry) in &hive.handles {
-            by_node.entry(entry.node).or_default().push(handle);
-        }
-        let mut opened = Vec::new();
-        for candidate in subtree(hive, node) {
-            let Some(handles) = by_node.get(&candidate) else { continue };
-            if owning_hive_of(hive, candidate) != owner {
+            if !within(hive, entry.node, node) || owning_hive_of(hive, entry.node) != owner {
                 continue;
             }
-            let path = node_path(hive, candidate);
-            opened.extend(handles.iter().map(|&handle| (handle, path.clone())));
+            let path = node_path(hive, entry.node);
+            if entry.node == node {
+                own.push((handle, path));
+            } else {
+                below.push((path, handle));
+            }
         }
-        opened
+        below.sort();
+        own.extend(below.into_iter().map(|(path, handle)| (handle, path)));
+        own
     })
 }
 
 fn status_of(error: KernelError) -> u32 {
     if error.status != 0 { error.status } else { STATUS_INSUFFICIENT_RESOURCES }
+}
+
+/// Onde uma chave da cópia do CmRestoreKey vai: um nó (a chave restaurada
+/// e as filhas sem célula) ou uma célula da hive do nó.
+#[derive(Clone, Copy)]
+enum Target {
+    Node(NodeId),
+    Cell(u32, u32),
+}
+
+/// Exclui as subchaves de `node` (os nós vivos e as células, das mais
+/// fundas para as mais rasas), sem a própria chave.
+fn clear_subkeys(hive: &mut Hive, node: NodeId) -> bool {
+    for child in live_subtree(hive, node) {
+        if child == node {
+            continue;
+        }
+        if let Some(parent) = hive.nodes.get(&child).and_then(|key| key.parent()).and_then(|parent| hive.nodes.get_mut(&parent)) {
+            parent.linked.retain(|&(_, candidate)| candidate != child);
+        }
+        retire(hive, child);
+    }
+    let Some((identifier, cell)) = hive.nodes.get(&node).and_then(|key| key.cell) else { return true };
+    // As células abaixo da chave, uma folha por vez.
+    loop {
+        let Some(storage) = hive.storage(identifier) else { return false };
+        let mut current = cell;
+        while let Some(child) = key_cells::nth_subkey(storage, current, 0) {
+            current = child;
+        }
+        if current == cell {
+            return true;
+        }
+        if !free_key_cells(hive, identifier, current) {
+            return false;
+        }
+    }
 }
 
 /// CmRestoreKey: troca as subchaves e os valores do nó pelos da hive
@@ -1411,39 +1876,42 @@ pub fn restore_subtree(node: NodeId, source: &Storage, checked: &Checked) -> Res
         if !live(hive, node) {
             return Err(KernelError::with_status("registry: key is gone", STATUS_KEY_DELETED));
         }
-        let mut nodes = subtree(hive, node);
-        nodes.retain(|&candidate| candidate != node);
-        let open = open_nodes(hive);
-        for &child in nodes.iter().rev() {
-            let (parent, cell) = hive.nodes.get(&child).map_or((None, None), |key| (key.parent(), key.cell));
-            if let Some(parent) = parent.and_then(|parent| hive.nodes.get_mut(&parent)) {
-                parent.children.retain(|&(_, candidate)| candidate != child);
-            }
-            retire(hive, child, open.contains(&child));
-            if let Some((identifier, cell)) = cell {
-                cell_op(hive, identifier, cell, |storage| key_cells::delete_key(storage, cell, now()));
-            }
+        if !clear_subkeys(hive, node) {
+            return Err(KernelError::with_status("registry: restore could not free the subkeys", STATUS_INSUFFICIENT_RESOURCES));
         }
         let names = hive.view(node).map(|key| key.value_names()).unwrap_or_default();
         for name in names {
             remove_value(hive, node, &name.to_lowercase(), now());
         }
-        tree::preorder(source, |cell, parent: Option<NodeId>| {
+        tree::preorder(source, |cell, parent: Option<Target>| {
             let key = tree::record(source, checked, cell, None)?;
             let target = match parent {
-                None => node,
-                Some(parent) => {
-                    let child = create_node(hive, &key.name, parent, Some(key.security), false, key.link, &key.class).map_err(status_of)?;
-                    if let Some(parent_key) = hive.nodes.get_mut(&parent) {
-                        parent_key.children.push((name_hash(&key.name), child));
-                    }
-                    child
+                None => Target::Node(node),
+                Some(Target::Node(parent)) if hive.nodes.get(&parent).is_some_and(|key| key.cell.is_none()) => Target::Node(create_node(hive, &key.name, parent, Some(key.security), false, key.link, &key.class).map_err(status_of)?),
+                Some(Target::Node(parent)) => {
+                    let (identifier, parent_cell) = hive.nodes.get(&parent).and_then(|key| key.cell).ok_or(STATUS_REGISTRY_CORRUPT)?;
+                    Target::Cell(identifier, restore_cell(hive, identifier, parent_cell, &key)?)
                 }
+                Some(Target::Cell(identifier, parent_cell)) => Target::Cell(identifier, restore_cell(hive, identifier, parent_cell, &key)?),
             };
-            for value in key.values {
-                store_value(hive, target, &value.name, value.value_type, value.data, now());
+            match target {
+                Target::Node(target) => {
+                    for value in key.values {
+                        store_value(hive, target, &value.name, value.value_type, value.data, now());
+                    }
+                    store_last_write_time(hive, target, key.last_write_time);
+                }
+                Target::Cell(identifier, cell) => {
+                    cell_op(hive, identifier, cell, |storage| {
+                        for value in &key.values {
+                            key_cells::set_value(storage, cell, &value.name, value.value_type, &value.data, now())?;
+                        }
+                        key_cells::set_last_write_time(storage, cell, key.last_write_time);
+                        Some(())
+                    })
+                    .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+                }
             }
-            store_last_write_time(hive, target, key.last_write_time);
             Ok(target)
         })
         .map_err(|status| KernelError::with_status("registry: restore failed", status))?;
@@ -1451,6 +1919,18 @@ pub fn restore_subtree(node: NodeId, source: &Storage, checked: &Checked) -> Res
     })?;
     notify_path_changed(&path);
     Ok(())
+}
+
+/// A célula de uma chave da cópia do CmRestoreKey sob `parent_cell`.
+fn restore_cell(hive: &mut Hive, identifier: u32, parent_cell: u32, key: &NewKey) -> Result<u32, u32> {
+    cell_op(hive, identifier, parent_cell, |storage| {
+        let cell = key_cells::create_key(storage, parent_cell, &key.name, &key.class, &key.security, now())?;
+        if key.link {
+            key_cells::set_key_flags(storage, cell, key_cells::KEY_SYM_LINK);
+        }
+        Some(cell)
+    })
+    .ok_or(STATUS_INSUFFICIENT_RESOURCES)
 }
 
 /// Uma hive volátil nova ligada em `path` (CmpCreateHive com HIVE_VOLATILE
@@ -1468,63 +1948,50 @@ pub fn create_volatile_hive(path: &str, identifier: u32) -> Result<NodeId, u32> 
 }
 
 /// CmpRefreshHive: as células da hive viram as relidas do arquivo
-/// (conferidas por `tree::check`) e a árvore é reconciliada com elas. Uma
-/// chave que existe nas duas fica com o mesmo nó (os handles continuam
-/// valendo), agora com a célula do arquivo (valores, descritor e
-/// LastWriteTime vêm dela); uma chave que só existe na memória (inclusive
-/// as voláteis) é excluída; uma que só existe no arquivo é criada.
+/// (conferidas por `tree::check`) e os nós vivos são reconciliados com
+/// elas. Uma chave viva que existe no arquivo fica com o mesmo nó (os
+/// handles continuam valendo), agora com a célula do arquivo (valores,
+/// descritor e LastWriteTime vêm dela); uma que só existe na memória
+/// (inclusive as voláteis) é excluída.
 pub fn refresh_hive(identifier: u32, storage: Storage, checked: Checked) -> Result<(), u32> {
     let path = with_hive(|hive| -> Result<String, u32> {
-        let Some(&(_, root)) = hive.storages.get(&identifier) else { return Err(STATUS_OBJECT_NAME_NOT_FOUND) };
-        let old: Vec<NodeId> = subtree(hive, root);
-        let mut kept: BTreeSet<NodeId> = BTreeSet::new();
-        // As chaves que ficam recebem a célula nova só depois do passeio:
-        // até lá os nomes delas vêm das células antigas.
-        let mut assigned: Vec<(NodeId, u32, Arc<Captured>, bool)> = Vec::with_capacity(checked.keys);
-        tree::preorder(&storage, |cell, parent: Option<NodeId>| {
-            let key = key_cells::node(&storage, cell).ok_or(crate::ntos::cm::hive::storage::STATUS_REGISTRY_CORRUPT)?;
-            let security = checked.descriptor(key.security.get()).ok_or(crate::ntos::cm::hive::storage::STATUS_REGISTRY_CORRUPT)?;
-            let link = key.flags.get() & key_cells::KEY_SYM_LINK != 0;
-            let node = match parent {
-                None => {
-                    assigned.push((root, cell, security, link));
-                    root
-                }
-                Some(parent) => {
-                    let name = key_cells::key_name_units(&storage, cell).map(|units| units.to_string_lossy()).unwrap_or_default();
-                    let lower = name.to_lowercase();
-                    let hash = name_hash(&lower);
-                    let existing = hive.nodes.get(&parent).and_then(|parent| parent.children.iter().filter(|&&(candidate, child)| candidate == hash && !kept.contains(&child)).map(|&(_, child)| child).find(|&child| hive.view(child).is_some_and(|key| key.name_is(&lower))));
-                    match existing {
-                        Some(child) => {
-                            assigned.push((child, cell, security, link));
-                            child
-                        }
-                        None => {
-                            let mut node = KeyNode::stored(Some(parent), security, identifier, cell, link);
-                            node.children = Vec::with_capacity(key.sub_key_counts[0].get() as usize);
-                            let child = hive.allocate_id();
-                            hive.nodes.insert(child, node);
-                            if let Some(parent_key) = hive.nodes.get_mut(&parent) {
-                                parent_key.children.push((hash, child));
-                            }
-                            child
-                        }
-                    }
+        let Some(root) = hive.storages.get(&identifier).map(|loaded| loaded.root) else { return Err(STATUS_OBJECT_NAME_NOT_FOUND) };
+        // Dos mais rasos para os mais fundos: a célula nova do pai antes.
+        let mut nodes = live_subtree(hive, root);
+        nodes.reverse();
+        let mut mapped: BTreeMap<NodeId, u32> = BTreeMap::new();
+        let mut dropped: Vec<NodeId> = Vec::new();
+        for &node in &nodes {
+            let new_cell = if node == root {
+                Some(storage.root_cell())
+            } else {
+                let key = hive.view(node).filter(|key| !key.deleted);
+                let parent_cell = key.as_ref().and_then(|key| key.parent()).and_then(|parent| mapped.get(&parent).copied());
+                match (key, parent_cell) {
+                    (Some(key), Some(parent_cell)) => key_cells::find_subkey(&storage, parent_cell, &key.name_utf16()),
+                    _ => None,
                 }
             };
-            kept.insert(node);
-            Ok(node)
-        })?;
-        let open = open_nodes(hive);
-        for node in old.into_iter().filter(|node| !kept.contains(node)) {
-            let parent = hive.nodes.get(&node).and_then(|key| key.parent());
-            if let Some(parent) = parent.and_then(|parent| hive.nodes.get_mut(&parent)) {
-                parent.children.retain(|&(_, child)| child != node);
+            match new_cell {
+                Some(cell) => {
+                    mapped.insert(node, cell);
+                }
+                None => dropped.push(node),
             }
-            retire(hive, node, open.contains(&node));
         }
-        for (node, cell, security, link) in assigned {
+        // As que somem: das mais fundas para as mais rasas.
+        for &node in dropped.iter().rev() {
+            if let Some(parent) = hive.nodes.get(&node).and_then(|key| key.parent()).and_then(|parent| hive.nodes.get_mut(&parent)) {
+                parent.linked.retain(|&(_, child)| child != node);
+            }
+            retire(hive, node);
+        }
+        hive.cells.retain(|&(hive_identifier, _), _| hive_identifier != identifier);
+        for (&node, &cell) in &mapped {
+            let Some(key) = key_cells::node(&storage, cell) else { continue };
+            let security = checked.descriptor(key.security.get()).ok_or(STATUS_REGISTRY_CORRUPT)?;
+            let link = key.flags.get() & key_cells::KEY_SYM_LINK != 0;
+            let was_memory = hive.nodes.get(&node).is_some_and(|entry| entry.cell.is_none());
             if let Some(entry) = hive.nodes.get_mut(&node) {
                 entry.cell = Some((identifier, cell));
                 entry.security = security;
@@ -1535,9 +2002,19 @@ pub fn refresh_hive(identifier: u32, storage: Storage, checked: Checked) -> Resu
                     _ => entry.extra = None,
                 }
             }
+            hive.cells.insert((identifier, cell), node);
+            if was_memory && node != root {
+                // Uma chave sem célula que o arquivo tem: deixa a lista do
+                // pai e a fixação.
+                if let Some(parent) = hive.nodes.get(&node).and_then(|key| key.parent()).and_then(|parent| hive.nodes.get_mut(&parent)) {
+                    parent.linked.retain(|&(_, child)| child != node);
+                }
+                release(hive, node);
+            }
         }
-        if let Some(entry) = hive.storages.get_mut(&identifier) {
-            entry.0 = storage;
+        if let Some(loaded) = hive.storages.get_mut(&identifier) {
+            loaded.storage = storage;
+            loaded.security = checked.security;
         }
         Ok(node_path(hive, root))
     })?;
@@ -1572,15 +2049,15 @@ pub fn set_trust_class(identifier: u32, class: Option<u32>) {
 
 /// O caminho da raiz de uma hive carregada.
 pub fn hive_path(identifier: u32) -> Option<String> {
-    with_hive(|hive| hive.storages.get(&identifier).map(|&(_, root)| node_path(hive, root)))
+    with_hive(|hive| hive.storages.get(&identifier).map(|loaded| loaded.root).map(|root| node_path(hive, root)))
 }
 
 /// As hives carregadas (identificador e se a células estão sujas).
 pub fn dirty_hives() -> Vec<(u32, bool)> {
-    with_hive(|hive| hive.storages.iter().map(|(&identifier, (storage, _))| (identifier, storage.is_dirty())).collect())
+    with_hive(|hive| hive.storages.iter().map(|(&identifier, loaded)| (identifier, loaded.storage.is_dirty())).collect())
 }
 
 /// O nó tem handles abertos nele ou na subárvore?
 pub fn hive_has_open_handles(identifier: u32) -> bool {
-    with_hive(|hive| hive.storages.get(&identifier).is_some_and(|&(_, root)| has_open_handles(hive, &subtree(hive, root))))
+    with_hive(|hive| hive.storages.get(&identifier).map(|loaded| loaded.root).is_some_and(|root| subtree_handles(hive, root, true)))
 }

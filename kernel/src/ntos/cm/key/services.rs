@@ -964,19 +964,16 @@ pub fn key_operation(kind: Kind, handle: u64, arguments: &Fields, previous_mode:
                             None => 0x8000_001A,
                         }
                     }
-                    Kind::EnumerateKey | Kind::QueryKey => {
-                        let child = if kind == Kind::EnumerateKey { registry::child_at(node, field("index") as u32 as usize) } else { Some(node) };
-                        if kind == Kind::EnumerateKey && field("klass") > 2 {
+                    Kind::EnumerateKey => {
+                        if field("klass") > 2 {
                             0xC000_0003
                         } else {
-                            match child {
-                                None => 0x8000_001A,
-                                Some(child) => {
-                                    let tags = if kind == Kind::QueryKey { key_objects::for_handle(resolved.khandle).map_or(0, key_objects::handle_tags) } else { 0 };
-                                    key_information::write(child, if kind == Kind::QueryKey { &path } else { "" }, field("klass") as u32, field("out"), field("length") as u32, field("returned"), tags)
-                                }
-                            }
+                            key_information::write_child(node, field("index") as u32 as usize, field("klass") as u32, field("out"), field("length") as u32, field("returned")).unwrap_or(0x8000_001A)
                         }
+                    }
+                    Kind::QueryKey => {
+                        let tags = key_objects::for_handle(resolved.khandle).map_or(0, key_objects::handle_tags);
+                        key_information::write(node, &path, field("klass") as u32, field("out"), field("length") as u32, field("returned"), tags)
                     }
                 };
                 Ok(Outcome { status, object: field("object"), ..Default::default() })

@@ -73,6 +73,98 @@ fn leaf_cells(storage: &Storage, cell: u32) -> Result<(u16, Vec<u32>), u32> {
     Ok((signature, cells))
 }
 
+/// Uma folha conferida: a assinatura, as entradas e o endereço delas.
+fn leaf_header(storage: &Storage, cell: u32) -> Option<(u16, usize, u64)> {
+    let address = storage.cell(cell, 4)?;
+    let header = index_at(address);
+    let (signature, count) = (header.signature.get(), header.count.get() as usize);
+    let entry = match signature {
+        LI => 4,
+        LF | LH => 8,
+        _ => return None,
+    };
+    storage.cell(cell, 4 + (count * entry) as u32)?;
+    Some((signature, count, address + 4))
+}
+
+/// A célula da entrada `index` de uma folha.
+fn leaf_entry(storage: &Storage, leaf: u32, index: usize) -> Option<u32> {
+    let (signature, count, entries) = leaf_header(storage, leaf)?;
+    if index >= count {
+        return None;
+    }
+    if signature == LI {
+        // SAFETY: entrada `index` dentro da folha conferida.
+        Some(unsafe { Field::<u32>::at(entries + index as u64 * 4) }.get())
+    } else {
+        // SAFETY: idem, entrada de 8 bytes.
+        Some(unsafe { CmIndex::at(entries + index as u64 * 8) }.cell.get())
+    }
+}
+
+/// As folhas de uma lista: a própria lista, ou as filhas de uma 'ri'.
+fn leaves(storage: &Storage, list: u32) -> Option<Vec<u32>> {
+    let address = storage.cell(list, 4)?;
+    let header = index_at(address);
+    if header.signature.get() != RI {
+        return Some(alloc::vec![list]);
+    }
+    let count = header.count.get() as usize;
+    storage.cell(list, 4 + 4 * count as u32)?;
+    // SAFETY: `count` células de folha conferidas acima.
+    Some(unsafe { Field::<u32>::array_at(address + 4, count) }.iter().map(|entry| entry.get()).collect())
+}
+
+/// CmpFindSubKeyByName: a subchave de uma lista cujo nome `compare` diz
+/// igual, pela busca binária nas folhas (as entradas estão em ordem de nome
+/// sem caixa). `compare(célula)` compara o nome da subchave com o procurado.
+/// Numa 'ri', a folha é a primeira cuja última entrada não é menor que o
+/// nome (CmpFindSubKeyInRoot).
+pub fn find(storage: &Storage, list: u32, compare: &dyn Fn(u32) -> Option<Ordering>) -> Option<u32> {
+    if list == HCELL_NIL {
+        return None;
+    }
+    for leaf in leaves(storage, list)? {
+        let (_, count, _) = leaf_header(storage, leaf)?;
+        if count == 0 || compare(leaf_entry(storage, leaf, count - 1)?)? == Ordering::Less {
+            continue;
+        }
+        let (mut low, mut high) = (0, count);
+        while low < high {
+            let middle = (low + high) / 2;
+            let cell = leaf_entry(storage, leaf, middle)?;
+            match compare(cell)? {
+                Ordering::Less => low = middle + 1,
+                Ordering::Greater => high = middle,
+                Ordering::Equal => return Some(cell),
+            }
+        }
+        return None;
+    }
+    None
+}
+
+/// CmpFindSubKeyByNumber: a subchave `index` de uma lista, na ordem dela.
+pub fn nth(storage: &Storage, list: u32, mut index: usize) -> Option<u32> {
+    if list == HCELL_NIL {
+        return None;
+    }
+    for leaf in leaves(storage, list)? {
+        let (_, count, _) = leaf_header(storage, leaf)?;
+        if index < count {
+            return leaf_entry(storage, leaf, index);
+        }
+        index -= count;
+    }
+    None
+}
+
+/// Comparação sem caixa de um nome em caracteres UTF-16 com outro (a
+/// ordem das folhas), sem copiar o primeiro.
+pub fn compare_units(left: impl Iterator<Item = u16>, right: &[u16]) -> Ordering {
+    left.map(unicode_case::nls_upcase).cmp(right.iter().map(|&unit| unicode_case::nls_upcase(unit)))
+}
+
 /// Todas as subchaves de uma lista (folha ou 'ri'), em ordem.
 pub fn enumerate(storage: &Storage, list: u32) -> Result<Vec<u32>, u32> {
     if list == HCELL_NIL {

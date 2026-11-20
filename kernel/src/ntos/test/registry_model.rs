@@ -390,7 +390,7 @@ fn new_hive_from_missing_file(assert: Assert) {
     let target = attributes(MOUNT);
     let (loaded, root) = load_ex(target, FILE, 0x10, 0, true);
     let node = registry::node_by_path(MOUNT);
-    let empty = node.and_then(|node| registry::with_node(node, |key| key.children.is_empty() && key.value_count() == 0 && key.name().eq_ignore_ascii_case("{6f70656e-6e74-4000-8000-000000000003}")));
+    let empty = node.and_then(|node| registry::with_node(node, |key| key.subkey_count() == 0 && key.value_count() == 0 && key.name().eq_ignore_ascii_case("{6f70656e-6e74-4000-8000-000000000003}")));
     let file = read_volume("/opennt-hive-nova.dat");
     assert(loaded == 0 && root != 0 && registry::get_node(root as u32) == node && empty == Some(true) && file.len() >= 0x2000 && file[..4] == *b"regf", "cmmodel: NtLoadKeyEx de arquivo ausente cria a hive nova com a raiz vazia");
     close(root);

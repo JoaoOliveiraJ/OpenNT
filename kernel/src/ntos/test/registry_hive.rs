@@ -24,10 +24,15 @@
 //!   KeyFullInformation (o layout do CmpPopulateKeyNodeInformation e do
 //!   CmpPopulateKeyFullInformation do 19041), o MaxClassLen do pai e o
 //!   Length ímpar recusado;
-//! - o heap de uma hive carregada: uma hive de 4041 chaves ocupa no máximo
-//!   [`HEAP_PER_KEY`] bytes de heap por chave (o conteúdo fica nas células,
-//!   sem cópia decodificada), as chaves criadas e excluídas saem da arena e
-//!   do heap, e a descarga devolve os nós e o heap da hive.
+//! - o heap de uma hive carregada: a carga de uma hive de 4041 chaves cria
+//!   só o nó da raiz e ocupa no máximo [`LOAD_HEAP`] bytes de heap (o
+//!   conteúdo fica nas células e os nós só existem para as chaves em uso);
+//!   uma chave fechada fica na lista de fechamento adiado e volta com o
+//!   mesmo nó, a lista não passa de 2048 nós e o mais antigo sai da arena;
+//!   a enumeração dá as subchaves da hive em ordem de nome (as criadas
+//!   depois da carga também) e depois as voláteis; as chaves criadas e
+//!   excluídas devolvem o heap, e a descarga devolve os nós e o heap da
+//!   hive.
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -35,7 +40,7 @@ use alloc::vec::Vec;
 use super::phase6::call_export;
 use crate::drivers::fs::{ntfs, volume::FileSystem};
 use crate::ntos::cm::hive::{base_block, index, key_cells, log, tree};
-use crate::ntos::cm::key::{policy, services as key_services};
+use crate::ntos::cm::key::{information as key_information, policy, services as key_services};
 use crate::ntos::cm::registry::{self, NodeId};
 use crate::ntos::cm::{hive_init, seed};
 use crate::ntos::inc::field::Field;
@@ -118,20 +123,22 @@ fn wide(text: &str) -> Vec<u8> {
 /// As duas árvores têm os mesmos nomes de subchaves, valores, descritores e
 /// LastWriteTime.
 fn same_tree(left: NodeId, right: NodeId, check_root_name: bool) -> bool {
+    let (Some(left), Some(right)) = (registry::path_of(left), registry::path_of(right)) else { return false };
     let mut pending = alloc::vec![(left, right, check_root_name)];
     while let Some((left, right, check_name)) = pending.pop() {
-        let snapshot = |node| {
-            let (name, values, security, time, children) = registry::with_node(node, |key| (key.name().to_lowercase(), key.values().iter().map(|value| (value.name.to_lowercase(), (value.value_type, value.data.clone()))).collect::<BTreeMap<_, _>>(), Captured::clone(&key.security), key.last_write_time(), key.children.iter().map(|&(_, child)| child).collect::<Vec<_>>()))?;
-            let children = children.into_iter().filter_map(|child| registry::with_node(child, |key| (key.name().to_lowercase(), child))).collect::<BTreeMap<_, _>>();
+        let snapshot = |path: &str| {
+            let node = registry::node_by_path(path)?;
+            let (name, values, security, time) = registry::with_node(node, |key| (key.name().to_lowercase(), key.values().iter().map(|value| (value.name.to_lowercase(), (value.value_type, value.data.clone()))).collect::<BTreeMap<_, _>>(), Captured::clone(&key.security), key.last_write_time()))?;
+            let children = registry::list_keys(path).into_iter().map(|child| (child.to_lowercase(), alloc::format!("{path}\\{child}"))).collect::<BTreeMap<_, _>>();
             Some((name, values, security, time, children))
         };
-        let (Some(a), Some(b)) = (snapshot(left), snapshot(right)) else { return false };
+        let (Some(a), Some(b)) = (snapshot(&left), snapshot(&right)) else { return false };
         if (check_name && a.0 != b.0) || a.1 != b.1 || a.2 != b.2 || a.3 != b.3 || a.4.len() != b.4.len() {
             return false;
         }
         for (name, child) in &a.4 {
             let Some(other) = b.4.get(name) else { return false };
-            pending.push((*child, *other, true));
+            pending.push((child.clone(), other.clone(), true));
         }
     }
     true
@@ -294,14 +301,14 @@ fn save_load_round_trip(assert: Assert) {
     assert(layout.is_some_and(|layout| layout.0 && layout.1 && layout.2 && layout.3 && layout.4 && layout.5), "hive: versao 1.5, dado grande em db, ate 4 bytes no campo Data, nome Unicode sem KEY_COMP_NAME e raiz KEY_HIVE_ENTRY|KEY_NO_DELETE");
     // Cada descritor distinto numa 'sk' com a contagem das chaves que o usam.
     let mut descriptors: Vec<(Captured, u32)> = Vec::new();
-    let mut stack = copy_node.map_or(Vec::new(), |node| alloc::vec![node]);
-    while let Some(node) = stack.pop() {
-        if let Some((security, children)) = registry::with_node(node, |key| (Captured::clone(&key.security), key.children.iter().map(|&(_, child)| child).collect::<Vec<_>>())) {
+    let mut stack = copy_node.and_then(registry::path_of).map_or(Vec::new(), |path| alloc::vec![path]);
+    while let Some(path) = stack.pop() {
+        if let Some(security) = registry::node_by_path(&path).and_then(|node| registry::with_node(node, |key| Captured::clone(&key.security))) {
             match descriptors.iter_mut().find(|(known, _)| *known == security) {
                 Some(entry) => entry.1 += 1,
                 None => descriptors.push((security, 1)),
             }
-            stack.extend(children);
+            stack.extend(registry::list_keys(&path).into_iter().map(|child| alloc::format!("{path}\\{child}")));
         }
     }
     let expected = |name: &str| registry::node_by_path(name).and_then(|node| registry::with_node(node, |key| Captured::clone(&key.security))).and_then(|security| descriptors.iter().find(|(known, _)| *known == security).map(|&(_, count)| count));
@@ -401,7 +408,7 @@ fn restore_compress_and_deferred_unload(assert: Assert) {
     let saved = status(call_export("ZwSaveKeyEx", &[source, file, 2]));
     let restored = status(call_export("ZwRestoreKey", &[target, file, 0]));
     zw_files::close_file_entry(file as u32);
-    let same = registry::with_node(registry::node_by_path(SOURCE).unwrap_or(0), |key| key.children.len()) == registry::with_node(registry::node_by_path("\\Registry\\Machine\\Software\\OpenNTHiveRestaurada").unwrap_or(0), |key| key.children.len());
+    let same = registry::node_by_path(SOURCE).map(registry::child_count) == registry::node_by_path("\\Registry\\Machine\\Software\\OpenNTHiveRestaurada").map(registry::child_count);
     let replaced = registry::node_by_path("\\Registry\\Machine\\Software\\OpenNTHiveRestaurada\\Antiga").is_none() && registry::read_value_by_path("\\Registry\\Machine\\Software\\OpenNTHiveRestaurada\\Filho", "Cinco").is_some_and(|value| value.data == [5; 5]);
     assert(saved == 0 && restored == 0 && same && replaced, "hive: ZwRestoreKey troca subchaves e valores pelos do arquivo");
     registry::close_handle(target as u32);
@@ -573,11 +580,12 @@ const BIG_FILE: &str = "\\??\\D:\\opennt-hive-grande.dat";
 /// Filhas da raiz da hive grande e netas de cada filha.
 const BIG_CHILDREN: usize = 40;
 const BIG_GRANDCHILDREN: usize = 100;
-/// O heap (com os cabeçalhos dos blocos) que uma chave de hive carregada
-/// pode ocupar: o nó da arena e a entrada na lista de subchaves do pai. Uma
-/// cópia decodificada de cada chave (nome, valores com os dados, classe)
-/// passaria de 700 bytes por chave desta hive.
-const HEAP_PER_KEY: usize = 256;
+/// O heap (com os cabeçalhos dos blocos) que a carga da hive grande pode
+/// ocupar, qualquer que seja o número de chaves dela: o nó da raiz, o vetor
+/// de bins, o mapa de células livres, o primário e os dois logs abertos
+/// (uns 110 KB medidos). Um nó por chave somaria mais de 300 KB; uma cópia
+/// decodificada de cada chave, 2,8 MB.
+const LOAD_HEAP: usize = 192 << 10;
 /// Chaves criadas e excluídas na hive grande, cada uma com um valor de
 /// [`TEMPORARY_DATA`] bytes.
 const TEMPORARY_KEYS: usize = 400;
@@ -611,8 +619,18 @@ fn big_hive_keys() -> Vec<tree::NewKey> {
     keys
 }
 
-/// O heap de uma hive carregada fica nos nós (o conteúdo é lido das
-/// células), as chaves excluídas saem da arena e a descarga devolve tudo.
+/// O nó vivo de um caminho, pelo handle aberto e fechado na hora.
+fn opened_node(path: &str) -> Option<NodeId> {
+    let handle = registry::open(path).unwrap_or(0);
+    let node = registry::get_node(handle);
+    registry::close_handle(handle);
+    node
+}
+
+/// O heap de uma hive carregada não cresce com o número de chaves (o
+/// conteúdo é lido das células e os nós só existem para as chaves em uso),
+/// a lista de fechamento adiado guarda os nós fechados até o limite, a
+/// enumeração anda pelo índice e a descarga devolve tudo.
 fn heap_of_loaded_hives(assert: Assert) {
     let keys = big_hive_keys();
     let count = keys.len();
@@ -623,8 +641,9 @@ fn heap_of_loaded_hives(assert: Assert) {
     let loaded = load(BIG, BIG_FILE);
     let (nodes_loaded, _) = registry::arena_counts();
     let heap_loaded = crate::hal::kmalloc::occupied();
-    crate::debug_print!("[cm-teste] hive grande: {} chaves, {} nos novos, heap +{} bytes ({} por chave)", count, nodes_loaded - nodes_before, heap_loaded.saturating_sub(heap_before), heap_loaded.saturating_sub(heap_before) / count);
-    assert(written && loaded == 0 && nodes_loaded == nodes_before + count && heap_loaded.saturating_sub(heap_before) <= count * HEAP_PER_KEY, "hive: a carga de uma hive de 4041 chaves cria um no por chave e ocupa no maximo 256 bytes de heap por chave");
+    crate::debug_print!("[cm-teste] hive grande: {} chaves, {} nos novos, heap +{} bytes", count, nodes_loaded.saturating_sub(nodes_before), heap_loaded.saturating_sub(heap_before));
+    assert(written && loaded == 0 && nodes_loaded.saturating_sub(nodes_before) < 16 && heap_loaded.saturating_sub(heap_before) <= LOAD_HEAP, "hive: a carga de uma hive de 4041 chaves cria so os nos do caminho e ocupa no maximo 192 KB de heap");
+    let root_node = registry::hive_of(registry::node_by_path(BIG).unwrap_or(0)).and_then(|(identifier, _)| registry::hive_root(identifier));
     let sample = alloc::format!("{BIG}\\Filha17\\Neta42");
     let index = 1 + 17 * (BIG_GRANDCHILDREN + 1) + 1 + 42;
     let read = registry::read_value_by_path(&sample, "descricao").is_some_and(|value| value.name == "Descricao" && value.data == wide(&alloc::format!("chave numero {index:05} da hive grande")))
@@ -632,8 +651,46 @@ fn heap_of_loaded_hives(assert: Assert) {
         && registry::list_keys(&alloc::format!("{BIG}\\Filha17")).len() == BIG_GRANDCHILDREN
         && registry::node_by_path(&sample).and_then(|node| registry::with_node(node, |key| (key.name(), key.value_count(), key.last_write_time()))) == Some((alloc::string::String::from("Neta42"), 3, 0x01D7_0000_0000_0000));
     assert(read, "hive: nomes, valores e LastWriteTime da hive grande lidos das celulas");
+    // O fechamento adiado: a chave fechada volta com o mesmo nó.
+    let first = opened_node(&alloc::format!("{BIG}\\Filha0\\Neta0"));
+    let again = opened_node(&alloc::format!("{BIG}\\Filha0\\Neta0"));
+    assert(first.is_some() && first == again && registry::delayed_close_count() <= registry::DELAYED_CLOSE, "hive: a chave fechada fica na lista de fechamento adiado e volta com o mesmo no");
+    // 2100 chaves abertas e fechadas: a lista não passa do limite e o nó
+    // mais antigo sai da arena.
+    let mut opened = true;
+    for child in 0..21 {
+        for grandchild in 0..BIG_GRANDCHILDREN {
+            opened &= opened_node(&alloc::format!("{BIG}\\Filha{child}\\Neta{grandchild}")).is_some();
+        }
+    }
+    let evicted = first.is_some_and(|first| registry::with_node(first, |_| ()).is_none());
+    let renewed = opened_node(&alloc::format!("{BIG}\\Filha0\\Neta0"));
+    crate::debug_print!("[cm-teste] hive grande: fechamento adiado com {} nos, arena com {}", registry::delayed_close_count(), registry::arena_counts().0);
+    assert(opened && evicted && renewed.is_some() && renewed != first && registry::delayed_close_count() <= registry::DELAYED_CLOSE, "hive: a lista de fechamento adiado guarda no maximo 2048 nos e o mais antigo sai da arena");
+    // A enumeração: as subchaves da hive em ordem de nome (a criada depois
+    // da carga também), depois as voláteis (CmpFindSubKeyByNumber).
+    let parent9 = alloc::format!("{BIG}\\Filha9");
+    let stable = registry::open_or_create(&alloc::format!("{parent9}\\Aaa"), None).unwrap_or(0);
+    let volatile = registry::open_or_create_options(&alloc::format!("{parent9}\\Abb"), None, true).unwrap_or(0);
+    let names = registry::list_keys(&parent9);
+    let sorted = names.len() == BIG_GRANDCHILDREN + 2 && names[0] == "Aaa" && names[BIG_GRANDCHILDREN + 1] == "Abb" && names[1..=BIG_GRANDCHILDREN].windows(2).all(|pair| index::compare(&pair[0].encode_utf16().collect::<Vec<u16>>(), &pair[1].encode_utf16().collect::<Vec<u16>>()).is_lt());
+    let buffer = guest::alloc_bytes(0x100);
+    let length = guest::alloc_bytes(8);
+    let node9 = registry::node_by_path(&parent9).unwrap_or(0);
+    let first_name = key_information::write_child(node9, 0, 0, buffer, 0x100, length) == Some(0) && guest::read_bytes(buffer + 16, 6) == [b'A', 0, b'a', 0, b'a', 0];
+    let past_end = key_information::write_child(node9, BIG_GRANDCHILDREN + 2, 0, buffer, 0x100, length).is_none();
+    let full = key_information::write(node9, &parent9, 2, buffer, 0x100, length, 0) == 0 && guest::read32(buffer + 20) == BIG_GRANDCHILDREN as u32 + 2 && guest::read32(buffer + 32) == 3;
+    guest::free_bytes(buffer);
+    guest::free_bytes(length);
+    for handle in [stable, volatile] {
+        let node = registry::get_node(handle).unwrap_or(0);
+        registry::delete_node(node, "");
+        registry::close_handle(handle);
+    }
+    assert(stable != 0 && volatile != 0 && sorted && first_name && past_end && full, "hive: a enumeracao da as subchaves da hive em ordem de nome e depois as volateis");
     // Chaves criadas e excluídas: os nós saem da arena e o heap volta.
     let parent = alloc::format!("{BIG}\\Filha3");
+    let (nodes_middle, _) = registry::arena_counts();
     let heap_middle = crate::hal::kmalloc::occupied();
     let mut created = true;
     for key in 0..TEMPORARY_KEYS {
@@ -641,7 +698,6 @@ fn heap_of_loaded_hives(assert: Assert) {
         created &= handle != 0 && registry::set_value(handle, "Valor", 3, alloc::vec![key as u8; TEMPORARY_DATA]);
         registry::close_handle(handle);
     }
-    let (nodes_created, _) = registry::arena_counts();
     let mut deleted = true;
     for key in 0..TEMPORARY_KEYS {
         let path = alloc::format!("{parent}\\Temporaria{key}");
@@ -650,19 +706,21 @@ fn heap_of_loaded_hives(assert: Assert) {
     let (nodes_deleted, _) = registry::arena_counts();
     let heap_deleted = crate::hal::kmalloc::occupied();
     crate::debug_print!("[cm-teste] hive grande: {} chaves temporarias, heap +{} bytes depois de excluidas", TEMPORARY_KEYS, heap_deleted.saturating_sub(heap_middle));
-    assert(created && deleted && nodes_created == nodes_loaded + TEMPORARY_KEYS && nodes_deleted == nodes_loaded && heap_deleted <= heap_middle + DELETE_SLACK, "hive: as chaves excluidas saem da arena e devolvem o heap");
+    assert(created && deleted && registry::list_keys(&parent).len() == BIG_GRANDCHILDREN && nodes_deleted <= nodes_middle && heap_deleted <= heap_middle + DELETE_SLACK, "hive: as chaves excluidas saem da arena e devolvem o heap");
     // Uma chave excluída com handle aberto fica até o handle fechar.
     let held = registry::open_or_create(&alloc::format!("{parent}\\Aberta"), None).unwrap_or(0);
     let held_node = registry::get_node(held);
     let removed = held_node.is_some_and(|node| registry::delete_node(node, ""));
-    let tombstone = held_node.is_some_and(registry::is_deleted) && registry::arena_counts().0 == nodes_loaded + 1 && registry::get_node(held).is_none();
+    let tombstone = held_node.is_some_and(|node| registry::is_deleted(node) && registry::with_node(node, |key| key.name()) == Some(alloc::string::String::from("Aberta"))) && registry::get_node(held).is_none();
     registry::close_handle(held);
-    assert(removed && tombstone && registry::arena_counts().0 == nodes_loaded, "hive: a chave excluida com handle aberto sai da arena quando o handle fecha");
+    let gone = held_node.is_some_and(|node| registry::with_node(node, |_| ()).is_none());
+    assert(removed && tombstone && gone, "hive: a chave excluida com handle aberto sai da arena quando o handle fecha");
     let unloaded = unload(BIG);
     let (nodes_after, _) = registry::arena_counts();
     let heap_after = crate::hal::kmalloc::occupied();
     crate::debug_print!("[cm-teste] hive grande: descarregada, nos {} -> {}, heap {:+} bytes", nodes_before, nodes_after, heap_after as i64 - heap_before as i64);
-    assert(unloaded == 0 && nodes_after == nodes_before && heap_after <= heap_before + UNLOAD_SLACK, "hive: a descarga da hive grande devolve os nos e o heap dela");
+    let root_gone = root_node.is_some_and(|root| registry::with_node(root, |_| ()).is_none());
+    assert(unloaded == 0 && root_gone && registry::node_by_path(BIG).is_none() && nodes_after <= nodes_loaded && heap_after <= heap_before + UNLOAD_SLACK, "hive: a descarga da hive grande devolve os nos e o heap dela");
 }
 
 pub fn run(assert: Assert) {

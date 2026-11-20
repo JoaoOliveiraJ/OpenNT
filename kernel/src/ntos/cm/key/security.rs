@@ -148,7 +148,9 @@ pub fn set(node: registry::NodeId, information: u32, captured: u64) -> u32 {
     match crate::ntos::se::set_security::merge(&current, information, &modified, 0, Some(object_types::key_type().mapping)) {
         Ok(merged) => {
             let security = Captured { control: merged.control & 0x7FFF, owner: merged.owner.unwrap_or_default(), group: merged.group.unwrap_or_default(), dacl: merged.dacl, sacl: merged.sacl };
-            registry::with_node_mut(node, |key| key.security = alloc::sync::Arc::new(security));
+            if !registry::set_security(node, security) {
+                return 0xC000_009A;
+            }
             key_notify::report(&registry::ancestors(node), key_notify::REG_NOTIFY_CHANGE_ATTRIBUTES | key_notify::REG_NOTIFY_CHANGE_SECURITY);
             0
         }

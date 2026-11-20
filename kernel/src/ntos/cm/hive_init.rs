@@ -147,11 +147,7 @@ const DEVICES_CONTROL_SET: &str = "\\Registry\\Machine\\SYSTEM\\CurrentControlSe
 
 /// CmDeleteKeyRecursive: as subchaves primeiro, depois a chave.
 fn delete_key_recursive(node: registry::NodeId) {
-    for child in registry::children(node) {
-        delete_key_recursive(child);
-    }
-    let path = registry::path_of(node).unwrap_or_default();
-    registry::delete_node(node, &path);
+    registry::delete_tree(node);
 }
 
 /// CmpCreateHardwareProfiles (rva 0xa58540), que o CmInitSystem1 chama

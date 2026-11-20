@@ -44,8 +44,13 @@ impl Checked {
 /// lista de subchaves). `visit(célula, ficha do pai)` devolve a ficha da
 /// chave, que vai para os filhos dela; a raiz recebe `None`. A lista de
 /// cada chave precisa ter SubKeyCounts[Stable] entradas.
-pub fn preorder<T: Copy>(storage: &Storage, mut visit: impl FnMut(u32, Option<T>) -> Result<T, u32>) -> Result<(), u32> {
-    let mut stack: Vec<(u32, Option<T>)> = alloc::vec![(storage.root_cell(), None)];
+pub fn preorder<T: Copy>(storage: &Storage, visit: impl FnMut(u32, Option<T>) -> Result<T, u32>) -> Result<(), u32> {
+    preorder_from(storage, storage.root_cell(), visit)
+}
+
+/// [`preorder`] da subárvore da chave da célula `start`.
+pub fn preorder_from<T: Copy>(storage: &Storage, start: u32, mut visit: impl FnMut(u32, Option<T>) -> Result<T, u32>) -> Result<(), u32> {
+    let mut stack: Vec<(u32, Option<T>)> = alloc::vec![(start, None)];
     while let Some((cell, parent)) = stack.pop() {
         let token = visit(cell, parent)?;
         let node = key_cells::node(storage, cell).ok_or(STATUS_REGISTRY_CORRUPT)?;

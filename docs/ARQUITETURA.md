@@ -1667,13 +1667,12 @@ FILE_OBJECT de usuário; sem cópia direta, uma página por vez), o cache de
 leitura dos arquivos do volume guarda os blocos em frames do PFN, os bins das
 hives ficam em páginas do VirtualAlloc de kernel (o papel do pool paginado),
 a ntdll de sistema vai do volume para os frames e as notificações a leem do
-arquivo, e os arquivos embutidos ficam no RAMFS por referência. Os nós do
-Registro não copiam o conteúdo das hives: o nome, os valores, a classe e o
-LastWriteTime de uma chave guardada numa hive são lidos das células a cada
-consulta, o nó guarda só a identidade (pai, subchaves com um hash por nome,
-a célula, as flags) e o descritor, compartilhado entre as chaves da mesma
-célula 'sk'; a hive é lida do arquivo um bin de cada vez, sem a imagem
-inteira no heap.
+arquivo, e os arquivos embutidos ficam no RAMFS por referência. O Registro
+não guarda nada por chave de hive no heap: o conteúdo de uma chave (nome,
+valores, classe, LastWriteTime, subchaves) é lido das células a cada
+consulta, e só as chaves em uso têm nó (o KCB: um handle aberto, uma
+subchave viva, ou um dos 2048 da lista de fechamento adiado); a hive é
+lida do arquivo um bin de cada vez, sem a imagem inteira no heap.
 
 **Raízes e metade de sistema congelada.** Como no NT, a metade de sistema é
 a mesma em todo espaço de endereçamento, e é compartilhada pelas entradas da
@@ -5481,27 +5480,39 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   Esses arquivos de tabela são dados puros: não usam nada do kernel. O
   `kernel/build.rs` inclui `ntos/ke/services.rs` para gerar a ntdll de
   bring-up.
-- **Hives do Registro** (`ntos/cm/hive/`, `hive_list.rs`): a arena de
-  `cm/registry.rs` (blocos de 128 nós pelo NodeId, que nunca se repete) é
-  o namespace, com um nó no papel do KCB de cada chave: pai, subchaves,
-  descritor, flags e a célula 'nk'. O conteúdo de uma chave guardada numa
-  hive (nome, valores, classe, LastWriteTime) não é copiado para o nó: ele
-  é lido das células a cada consulta (`registry::KeyView`, sobre
-  `hive/key_cells.rs`), como o 19041 lê pelo mapa de células; só os nós
-  sem célula (as chaves mestras, as voláteis, as subárvores montadas em
-  memória) guardam o próprio conteúdo, e a raiz de uma hive tem o nome do
-  ponto de montagem. A carga lê o primário um bin de cada vez
-  (`Storage::from_file`, numa janela de 256 KB; só a recuperação pelos logs
-  monta a imagem inteira), confere a hive sem copiar nada (`tree::check`,
-  que lê cada célula 'sk' uma vez) e liga um nó por chave
-  (`registry::link_hive`). Cada mudança (chave criada ou excluída, valor
-  gravado ou removido) vai direto às células, sob a mesma trava
-  (`hive/key_cells.rs`, `hive/index.rs`, `hive/security_cells.rs`),
-  marcando os setores de 512 bytes sujos; uma operação de célula que falha
-  não muda a chave e marca a hive como quebrada (a descarga dela fica
-  recusada). Uma chave excluída, ou de uma hive descarregada, sai da arena
-  na hora; com handle aberto, fica só o nome e o LastWriteTime até o
-  último handle fechar. O NtFlushKey grava o log incremental (.LOG1/.LOG2
+- **Hives do Registro** (`ntos/cm/hive/`, `hive_list.rs`): o namespace
+  de `cm/registry.rs` tem um nó no papel do KCB só para as chaves em uso:
+  pai, descritor, flags, a célula 'nk' e as referências (os handles, as
+  subchaves vivas, a fixação das chaves sem célula e da raiz de cada hive
+  montada). O nó de uma chave de hive nasce quando um nome passa por ela
+  (CmpCreateKeyControlBlock); sem referências, vai para a lista de
+  fechamento adiado (CmpAddToDelayedClose), de onde volta se a chave é
+  aberta de novo, e a lista guarda no máximo 2048 nós (o
+  CmpDelayedCloseSize): o mais antigo sai da arena. Cada célula tem no
+  máximo um nó vivo (o mapa por célula) e o NodeId (geração e posição na
+  arena) nunca se repete: um id de um nó que saiu da arena só deixa de
+  valer. O conteúdo de uma chave guardada numa hive (nome, valores,
+  classe, LastWriteTime, subchaves) é lido das células a cada consulta
+  (`registry::KeyView`, sobre `hive/key_cells.rs`): a busca de uma
+  subchave é a busca binária no índice (CmpFindSubKeyByName,
+  `hive/index.rs::find`) e o NtEnumerateKey anda pelo índice sem criar nó
+  (CmpFindSubKeyByNumber): as subchaves da hive em ordem de nome, depois as
+  que só existem em memória (as voláteis), também em ordem; o
+  KeyFullInformation e o KeyCachedInformation contam pelos máximos que o
+  'nk' guarda. Só os nós sem célula (as chaves mestras, as voláteis, as
+  subárvores montadas em memória) guardam o próprio conteúdo, e a raiz de
+  uma hive tem o nome do ponto de montagem. A carga lê o primário um bin de
+  cada vez (`Storage::from_file`, numa janela de 256 KB; só a recuperação
+  pelos logs monta a imagem inteira), confere a hive sem copiar nada
+  (`tree::check`, que lê cada célula 'sk' uma vez e deixa os descritores
+  como o cache da hive) e liga só a raiz (`registry::link_hive`). Cada
+  mudança (chave criada ou excluída, valor gravado ou removido, descritor
+  trocado) vai direto às células, sob a mesma trava (`hive/key_cells.rs`,
+  `hive/index.rs`, `hive/security_cells.rs`), marcando os setores de 512
+  bytes sujos; uma operação de célula que falha não muda a chave e marca a
+  hive como quebrada (a descarga dela fica recusada). Uma chave excluída,
+  ou de uma hive descarregada, sai da arena na hora; com handle aberto,
+  fica só o nome e o LastWriteTime até o último handle fechar. O NtFlushKey grava o log incremental (.LOG1/.LOG2
   alternados) e as faixas sujas no primário, entre o bloco base
   invalidado e o validado (`hive/sync.rs`); a carga de um primário
   invalidado aplica os logs (`hive/log.rs`). As chaves voláteis não ganham

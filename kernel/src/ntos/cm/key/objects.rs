@@ -96,7 +96,7 @@ fn free_body(pointer: u64) {
 }
 
 /// O bloco de identidade do nó (criado no primeiro corpo dele e mantido
-/// enquanto o nó existe na arena).
+/// enquanto o nó existe na arena: [`forget`]).
 pub fn identity(node: NodeId) -> Option<u64> {
     if let Some(identity) = with(|bodies| bodies.identities.get(&node).copied()) {
         return Some(identity);
@@ -110,6 +110,24 @@ pub fn identity(node: NodeId) -> Option<u64> {
         guest::free_bytes(block);
     }
     Some(chosen)
+}
+
+/// Os nós que saíram da arena do Registro (o KCB liberado): a identidade
+/// de cada um e o nome em cache nela (o 'CMKn' do CmCallbackGetKeyObjectID)
+/// são liberados, salvo a de um nó que um corpo ainda usa.
+pub fn forget(nodes: &[NodeId]) {
+    let freed: alloc::vec::Vec<u64> = with(|bodies| {
+        let used: alloc::collections::BTreeSet<NodeId> = bodies.by_pointer.values().map(|body| body.node).collect();
+        nodes.iter().filter(|node| !used.contains(node)).filter_map(|node| bodies.identities.remove(node)).collect()
+    });
+    for block in freed {
+        // SAFETY: bloco de identidade deste módulo, fora do mapa agora.
+        let name = unsafe { crate::ntos::inc::types::UnicodeString::at(block) }.buffer.get();
+        if name != 0 {
+            let _ = crate::ntos::mm::kernel_pool::free(name, None);
+        }
+        guest::free_bytes(block);
+    }
 }
 
 /// Reutiliza a associação do handle ou materializa um corpo para o nó real;

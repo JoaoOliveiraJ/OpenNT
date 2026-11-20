@@ -85,18 +85,18 @@ pub fn registry(line: &str, out: &mut Payload) {
     match verb {
         "keys" => {
             let start = rest.trim().parse::<usize>().unwrap_or(0);
-            let children = registry::children(node);
+            let children = registry::child_count(node);
             let header = registry::with_node(node, |key| (key.value_count(), key.last_write_time(), key.volatile, key.link)).unwrap_or((0, 0, false, false));
             let hive = registry::hive_of(node).and_then(|(identifier, _)| registry::hive_path(identifier)).unwrap_or_default();
             out.push_str("chave\t");
             push_clean(out, &registry::path_of(node).unwrap_or_else(|| String::from(path)));
-            let _ = writeln!(out, "\t{}\t{}\t{:#x}\t{}\t{}\t{}", children.len(), header.0, header.1, header.2 as u8, header.3 as u8, hive);
-            for (index, child) in children.iter().enumerate().skip(start) {
+            let _ = writeln!(out, "\t{}\t{}\t{:#x}\t{}\t{}\t{}", children, header.0, header.1, header.2 as u8, header.3 as u8, hive);
+            for index in start..children {
                 if out.len() > PAGE_BYTES {
                     let _ = writeln!(out, "mais: {}", index);
                     return;
                 }
-                let Some((name, subkeys, values)) = registry::with_node(*child, |key| (key.name(), key.children.len(), key.value_count())) else { continue };
+                let Some((name, subkeys, values)) = registry::with_child_at(node, index, |key| (key.name(), key.subkey_count(), key.value_count())) else { continue };
                 out.push_str("k\t");
                 push_clean(out, &name);
                 let _ = writeln!(out, "\t{}\t{}", subkeys, values);
