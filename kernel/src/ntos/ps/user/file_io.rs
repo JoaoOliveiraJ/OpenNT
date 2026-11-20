@@ -776,7 +776,12 @@ fn file_transfer(handle: u64, event: u64, apc: u64, rsp: u64, write: bool) -> Re
         if write && handle_access & 2 == 0 {
             offset = file.size();
         }
-        if options & 8 != 0 && (offset % 512 != 0 || length % 512 != 0 || out % 512 != 0) {
+        // FO_NO_INTERMEDIATE_BUFFERING: offset e tamanho no setor; o buffer só
+        // no AlignmentRequirement do dispositivo (o NtReadFile/NtWriteFile do
+        // 19041), que o volume do kernel não tem (copy_chunk.rs). O
+        // EtwpFinalizeLogFileHeader do ntdll lê o cabeçalho de um .etl sem
+        // buffer intermediário num bloco do heap (alinhado a 16).
+        if options & 8 != 0 && (offset % 512 != 0 || length % 512 != 0) {
             return fail(INVALID);
         }
         // As travas de faixa de bytes do stream: o FsRtlCheckLockForReadAccess
