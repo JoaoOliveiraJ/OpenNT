@@ -134,6 +134,11 @@ const SESSION_SPECIFIC_GUIDS: [[u8; 16]; 2] = [GUID_SESSION_DISPLAY_STATUS, GUID
 pub const GUID_CONSOLE_DISPLAY_STATE: [u8; 16] = guid(0x6fe6_9556, 0x704a, 0x47a0, [0x8f, 0x24, 0xc2, 0x8d, 0x93, 0x6f, 0xda, 0x47]);
 /// GUID_MONITOR_POWER_ON {02731015-4510-4526-99e6-e5a17ebd1aea}.
 pub const GUID_MONITOR_POWER_ON: [u8; 16] = guid(0x0273_1015, 0x4510, 0x4526, [0x99, 0xe6, 0xe5, 0xa1, 0x7e, 0xbd, 0x1a, 0xea]);
+/// GUID_ADAPTIVE_INPUT_CONTROLLER_STATE {0E98FAE9-F45A-4DE1-A757-6031F197F6EA}:
+/// o estado do controlador de entrada que o win32kbase grava pelo
+/// PowerInternalInputControllerState (NtPowerInformation 87, tipo interno
+/// 0x1C).
+pub const GUID_ADAPTIVE_INPUT_CONTROLLER_STATE: [u8; 16] = guid(0x0e98_fae9, 0xf45a, 0x4de1, [0xa7, 0x57, 0x60, 0x31, 0xf1, 0x97, 0xf6, 0xea]);
 /// GUID_GLOBAL_USER_PRESENCE {786e8a1d-b427-4344-9207-09e70bdcbea9}: a
 /// presença do usuário da máquina (o PopEvaluateGlobalUserStatus).
 pub const GUID_GLOBAL_USER_PRESENCE: [u8; 16] = guid(0x786e_8a1d, 0xb427, 0x4344, [0x92, 0x07, 0x09, 0xe7, 0x0b, 0xdc, 0xbe, 0xa9]);

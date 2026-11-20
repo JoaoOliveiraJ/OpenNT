@@ -505,11 +505,18 @@ fn power_information(assert: Assert, block: u64, rsp: u64, call: Call) {
     let absence_no_output = power(87, input, 8, 0, 0);
     guest::write32(input, 0x100);
     let internal_invalid = power(87, input, 8, output, 1);
+    // Os tipos internos só de kernel do win32kbase (SessionPowerState 0x13,
+    // SetWatchdog 0x15, InputControllerState 0x1C): STATUS_ACCESS_DENIED ao
+    // modo usuário (PopPowerInformationInternal 0x6f1c77).
+    let internal_denied = [0x13u32, 0x15, 0x1C].map(|internal| {
+        guest::write32(input, internal);
+        power(87, input, 8, 0, 0)
+    });
     let kernel_only = power(41, 0, 0, output, 0x40);
     let out_of_range = power(0x60, 0, 0, output, 4);
     assert(
-        platform == 0 && aoac == 0 && platform_input == STATUS_INVALID_PARAMETER && platform_no_output == STATUS_INVALID_PARAMETER && role == 0 && role_value == 1 && role_short == 0xC000_0023 && absence == 0 && absence_value == 0 && absence_short_input == STATUS_INVALID_PARAMETER && absence_no_output == 0xC000_0023 && internal_invalid == STATUS_INVALID_PARAMETER && kernel_only == STATUS_ACCESS_DENIED && out_of_range == STATUS_INVALID_PARAMETER,
-        "userboot: NtPowerInformation de modo usuario (66, 75, 87 tipo 4, niveis so de kernel)",
+        platform == 0 && aoac == 0 && platform_input == STATUS_INVALID_PARAMETER && platform_no_output == STATUS_INVALID_PARAMETER && role == 0 && role_value == 1 && role_short == 0xC000_0023 && absence == 0 && absence_value == 0 && absence_short_input == STATUS_INVALID_PARAMETER && absence_no_output == 0xC000_0023 && internal_invalid == STATUS_INVALID_PARAMETER && internal_denied == [STATUS_ACCESS_DENIED; 3] && kernel_only == STATUS_ACCESS_DENIED && out_of_range == STATUS_INVALID_PARAMETER,
+        "userboot: NtPowerInformation de modo usuario (66, 75, 87 tipo 4, tipos internos e niveis so de kernel)",
     );
     // SystemVideoState (29, o CProcessStateManager do LogonUI): sem entrada,
     // os 4 bytes do PopConsoleDisplayState, sem privilégio.

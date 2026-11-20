@@ -3448,7 +3448,20 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   ZwOpenFile (ou o `OsBootstatPath` de `Control`), o acesso do chamador ao
   descritor dele, os campos do RtlpBootStatusFields pelo cache, o checksum
   ajustado no Set e o campo gravado no black box. O volume não tem o
-  arquivo, então o pedido devolve o status da abertura.
+  arquivo, então o pedido devolve o status da abertura. O nível 87 de modo
+  kernel passa pelo mesmo PopPowerInformationInternal (sem captura), e os
+  tipos internos só de kernel recusam o modo usuário com
+  STATUS_ACCESS_DENIED. O win32kbase usa três: o SessionPowerState (0x13,
+  0x14 bytes; com o BOOLEAN de console, o GUID_SESSION_DISPLAY_STATUS da
+  sessão e o PopUpdateConsoleDisplayState com o On), o InputControllerState
+  (0x1C, o ULONG em GUID_ADAPTIVE_INPUT_CONTROLLER_STATE) e o SetWatchdog
+  (0x15, `po/watchdog.rs`): o watchdog de energia é o bloco 'POWD' do
+  PopSetWatchdog, criado com um watchdog NULL e saída, armado com um prazo
+  em ms (timer, DPC e item de trabalho na DelayedWorkQueue) e desarmado com
+  prazo 0 ou apagado; vencido, o worker anexa a sessão dos parâmetros e
+  chama o callback deles ou o KeBugCheckEx com o código (o win32kbase usa
+  WIN32K_POWER_WATCHDOG_TIMEOUT, 0x19C, cujo estágio vai ao boot status
+  data).
 - **Desligamento e reinício** (`po/shutdown.rs`, `io/shutdown.rs`,
   `ex/shutdown.rs`, `hal/firmware_return.rs`): NtShutdownSystem e o
   NtSetSystemPowerState das ações de desligamento, de modo kernel e de

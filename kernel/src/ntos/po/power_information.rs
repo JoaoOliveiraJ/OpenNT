@@ -11,9 +11,12 @@
 //! modos (`level_answer`), como o 42 (SessionDisplayState, o aviso de tela
 //! do win32k), o 61 (SessionRITState) e o 62 (SessionConnectNotification),
 //! a entrada e a conexão da sessão (`po/user_presence.rs`), que o modo
-//! usuário não alcança; o 87
-//! (PowerInformationInternal) só é atendido de modo usuário. Os demais
-//! níveis de modo kernel devolvem STATUS_INVALID_PARAMETER.
+//! usuário não alcança, e o 87 (PowerInformationInternal): o
+//! NtPowerInformation de modo kernel passa pelo mesmo
+//! PopPowerInformationInternal (0x6f1b04), sem captura, e os tipos internos
+//! só de kernel (o SessionPowerState, o SetWatchdog e o InputControllerState
+//! do win32kbase) recusam o modo usuário. Os demais níveis de modo kernel
+//! devolvem STATUS_INVALID_PARAMETER.
 //!
 //! Só de modo usuário: LastWakeTime e LastSleepTime (14 e 15, o
 //! PopAction.WakeTime/SleepTime, zero num sistema que nunca dormiu),
@@ -34,7 +37,7 @@ use core::sync::atomic::AtomicU8;
 
 use crate::ntos::inc::types::{NtStruct, SystemPowerCapabilities};
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::po::{black_box, boot_status, display_state, power_request, power_setting, user_presence};
+use crate::ntos::po::{black_box, boot_status, display_state, power_request, power_setting, user_presence, watchdog};
 use crate::rtl::KernelError;
 
 const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
@@ -141,7 +144,7 @@ pub fn query(level: u32, input: u64, input_length: u32, output: u64, output_leng
     if level == SESSION_POWER_CLEANUP {
         return Ok(session_power_cleanup(input, output));
     }
-    if !matches!(level, SYSTEM_POWER_CAPABILITIES | SYSTEM_BATTERY_STATE | SYSTEM_VIDEO_STATE | SESSION_DISPLAY_STATE | POWER_SETTING_NOTIFICATION_NAME | GET_POWER_SETTING_VALUE | PLATFORM_INFORMATION | PLATFORM_ROLE | SESSION_RIT_STATE | SESSION_CONNECT_NOTIFICATION) {
+    if !matches!(level, SYSTEM_POWER_CAPABILITIES | SYSTEM_BATTERY_STATE | SYSTEM_VIDEO_STATE | SESSION_DISPLAY_STATE | POWER_SETTING_NOTIFICATION_NAME | GET_POWER_SETTING_VALUE | PLATFORM_INFORMATION | PLATFORM_ROLE | SESSION_RIT_STATE | SESSION_CONNECT_NOTIFICATION | POWER_INFORMATION_INTERNAL) {
         return Ok(STATUS_INVALID_PARAMETER);
     }
     let input_length = if input == 0 { 0 } else { input_length };
@@ -149,7 +152,7 @@ pub fn query(level: u32, input: u64, input_length: u32, output: u64, output_leng
     let output_length = if output == 0 { 0 } else { output_length };
     let output = if output_length == 0 { 0 } else { output };
     let captured = if input != 0 { guest::read_bytes(input, input_length.min(MAXIMUM_CAPTURE) as usize) } else { Vec::new() };
-    let data = match level_answer(level, &captured, output_length)? {
+    let data = match level_answer(level, &captured, output_length, false)? {
         Answer::Data(data) => data,
         Answer::Status(status) => return Ok(status),
     };
@@ -182,6 +185,7 @@ const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
 const STATUS_NOT_IMPLEMENTED: u32 = 0xC000_0002;
 const STATUS_PRIVILEGE_NOT_HELD: u32 = 0xC000_0061;
+const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 const MAXIMUM_LEVEL: u32 = 0x5F;
 /// Os níveis que o NtPowerInformation recusa ao modo usuário.
 const KERNEL_ONLY_LEVELS: [u32; 33] = [6, 7, 17, 24, 25, 30, 31, 32, 33, 34, 39, 40, 41, 42, 47, 49, 52, 53, 54, 56, 61, 62, 63, 67, 68, 69, 71, 79, 80, 81, 82, 85, 91];
@@ -198,6 +202,18 @@ const PLATFORM_ROLE: u32 = 75;
 const POWER_INFORMATION_INTERNAL: u32 = 87;
 /// POWER_INFORMATION_LEVEL_INTERNAL PowerInternalUserAbsencePredictionCapability.
 const USER_ABSENCE_PREDICTION_CAPABILITY: u32 = 4;
+/// POWER_INFORMATION_LEVEL_INTERNAL PowerInternalSessionPowerState,
+/// PowerInternalSetWatchdog e PowerInternalInputControllerState.
+const SESSION_POWER_STATE: u32 = 0x13;
+const SET_WATCHDOG: u32 = 0x15;
+const INPUT_CONTROLLER_STATE: u32 = 0x1C;
+/// Os tipos internos que o PopPowerInformationInternal (0x6f1c77..0x6f1ca5)
+/// recusa a um chamador de modo usuário com STATUS_ACCESS_DENIED: 0x24,
+/// 0x41, a máscara 0x8E00030014B80105 dos tipos até 0x3F e 0x43.
+const KERNEL_ONLY_INTERNAL_TYPES: [u32; 18] = [0, 2, 8, 19, 20, 21, 23, 26, 28, 36, 40, 41, 57, 58, 59, 63, 65, 67];
+/// O comprimento da entrada do PowerInternalInputControllerState
+/// ({POWER_INFORMATION_INTERNAL_HEADER, ULONG State}).
+const INPUT_CONTROLLER_STATE_INPUT: usize = 0xC;
 /// POWER_PLATFORM_ROLE PlatformRoleDesktop.
 const PLATFORM_ROLE_DESKTOP: u32 = 1;
 /// O maior pedaço de entrada que o OpenNT captura (os níveis suportados
@@ -272,9 +288,9 @@ enum Answer {
     Status(u32),
 }
 
-/// O corpo de cada nível sobre a entrada capturada (`input` vazio = NULL) e
-/// o comprimento da saída (0 = sem saída).
-fn level_answer(level: u32, input: &[u8], output_length: u32) -> Result<Answer, KernelError> {
+/// O corpo de cada nível sobre a entrada capturada (`input` vazio = NULL), o
+/// comprimento da saída (0 = sem saída) e o PreviousMode (`user`).
+fn level_answer(level: u32, input: &[u8], output_length: u32, user: bool) -> Result<Answer, KernelError> {
     let has_output = output_length != 0;
     Ok(match level {
         // SystemPowerCapabilities, SystemBatteryState, SystemVideoState,
@@ -355,6 +371,9 @@ fn level_answer(level: u32, input: &[u8], output_length: u32) -> Result<Answer, 
             if (0x44..=0xFFF).contains(&internal) || internal as i32 >= 0x100B {
                 return Ok(Answer::Status(STATUS_INVALID_PARAMETER));
             }
+            if user && KERNEL_ONLY_INTERNAL_TYPES.contains(&internal) {
+                return Ok(Answer::Status(STATUS_ACCESS_DENIED));
+            }
             match internal {
                 // PopPowerInformationInternal: sem saída é
                 // STATUS_BUFFER_TOO_SMALL; senão um BOOLEAN, FALSE fora de uma
@@ -364,6 +383,44 @@ fn level_answer(level: u32, input: &[u8], output_length: u32) -> Result<Answer, 
                         return Ok(Answer::Status(STATUS_BUFFER_TOO_SMALL));
                     }
                     Answer::Data(alloc::vec![platform_aoac()])
+                }
+                // SessionPowerState (0x81ce97): entrada de exatamente 0x14
+                // bytes e nenhuma saída (`po/display_state.rs`).
+                SESSION_POWER_STATE => {
+                    if input.len() != display_state::SESSION_POWER_STATE_INPUT || has_output {
+                        return Ok(Answer::Status(STATUS_INVALID_PARAMETER));
+                    }
+                    display_state::session_power_state(input)?;
+                    Answer::Data(Vec::new())
+                }
+                // SetWatchdog (0x6f1c02): o watchdog de energia
+                // (`po/watchdog.rs`), sobre uma cópia de kernel da entrada.
+                SET_WATCHDOG => {
+                    if input.len() < watchdog::SET_WATCHDOG_INPUT {
+                        return Ok(Answer::Status(STATUS_BUFFER_TOO_SMALL));
+                    }
+                    let block = guest::alloc_bytes(input.len() as u64);
+                    if block == 0 {
+                        return Ok(Answer::Status(STATUS_INSUFFICIENT_RESOURCES));
+                    }
+                    guest::write_bytes(block, input);
+                    let result = watchdog::set_watchdog_request(block, input.len(), has_output);
+                    guest::free_bytes(block);
+                    match result {
+                        Ok(data) => Answer::Data(data),
+                        Err(status) => Answer::Status(status),
+                    }
+                }
+                // InputControllerState (0x81d055): entrada de exatamente 0xC
+                // bytes; o ULONG de +8 vai a
+                // GUID_ADAPTIVE_INPUT_CONTROLLER_STATE
+                // (PopSetPowerSettingValueAcDc). A saída não é olhada.
+                INPUT_CONTROLLER_STATE => {
+                    if input.len() != INPUT_CONTROLLER_STATE_INPUT {
+                        return Ok(Answer::Status(STATUS_INVALID_PARAMETER));
+                    }
+                    power_setting::set_value_ac_dc(&power_setting::GUID_ADAPTIVE_INPUT_CONTROLLER_STATE, &input[8..12]);
+                    Answer::Data(Vec::new())
                 }
                 // BootStatGet e BootStatSet: o boot status data
                 // (`po/boot_status.rs`).
@@ -507,7 +564,7 @@ pub fn query_user(level: u32, input: u64, input_length: u32, output: u64, output
     if output != 0 && !user_probe::probe_user_write(output, output_length as u64) {
         return Ok(STATUS_ACCESS_VIOLATION);
     }
-    let data = match level_answer(level, &captured, output_length)? {
+    let data = match level_answer(level, &captured, output_length, true)? {
         Answer::Data(data) => data,
         Answer::Status(status) => return Ok(status),
     };

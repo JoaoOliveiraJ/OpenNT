@@ -44,6 +44,9 @@ pub const WNF_PO_PRIMARY_DISPLAY_VISIBLE_STATE: u64 = 0x41C6_013D_A3BC_A075;
 
 /// O comprimento da entrada do SessionDisplayState.
 pub const SESSION_DISPLAY_STATE_INPUT: usize = 0x10;
+/// O comprimento da entrada do PowerInternalSessionPowerState
+/// (NtPowerInformation 87, tipo interno 0x13).
+pub const SESSION_POWER_STATE_INPUT: usize = 0x14;
 
 /// PopConsoleDisplayState.
 static CONSOLE_DISPLAY_STATE: AtomicU32 = AtomicU32::new(0);
@@ -122,6 +125,26 @@ pub fn session_display_state(input: &[u8]) -> Result<(), KernelError> {
     }
     if flag(0xE) && flag(0xC) {
         publish(WNF_PO_PRIMARY_DISPLAY_VISIBLE_STATE, state)?;
+    }
+    Ok(())
+}
+
+/// PowerInternalSessionPowerState (PopPowerInformationInternal 0x81ce97, só
+/// de modo kernel: o UpdateSessionPowerState do win32kbase) sobre a entrada
+/// capturada de [`SESSION_POWER_STATE_INPUT`] bytes {POWER_INFORMATION_INTERNAL_HEADER,
+/// SessionId, BOOLEAN On, BOOLEAN Console, Reason}. O
+/// TtmNotifySessionPowerStateChange não acha sessão com o TTM desligado (só
+/// registra o erro). Com Console, sob o PopPolicyLock, o PopSetDisplayStatus
+/// (GUID_SESSION_DISPLAY_STATUS da sessão de quem chama) e o
+/// PopUpdateConsoleDisplayState com On (1 PowerMonitorOn, 0 PowerMonitorOff);
+/// o SessionId e o Reason só entram no rastro ETW
+/// (PopDiagTraceSessionDisplayStateChange).
+pub fn session_power_state(input: &[u8]) -> Result<(), KernelError> {
+    let on = (input[0xC] != 0) as u32;
+    if input[0xD] != 0 {
+        let session = crate::ntos::mm::session::session_id_ex(crate::ntos::ps::process::get_current_process());
+        power_setting::set_session_display_status(session, on);
+        update_console_display_state(on)?;
     }
     Ok(())
 }

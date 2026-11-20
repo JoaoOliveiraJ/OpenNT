@@ -22,6 +22,10 @@
 //!   e devolve os endereços de dois BOOLEANs do Po, a tampa aberta e o TTM
 //!   desligado; SessionPowerCleanup (63) não aceita buffers; SystemVideoState
 //!   (29) devolve o estado da tela do console;
+//! - PowerInformationInternal (87) de modo kernel, os tipos internos do
+//!   win32kbase: SessionPowerState (0x13), InputControllerState (0x1C) e o
+//!   watchdog de energia do SetWatchdog (0x15) criado, armado, desarmado e
+//!   apagado;
 //! - ZwCreateSection com OBJ_KERNEL_EXCLUSIVE (0x10000, o atributo das seções
 //!   entre sessões do win32k) cria a seção nomeada e devolve o handle;
 //! - SystemThreadPriorityClientIdInformation (82), a classe que a
@@ -152,7 +156,99 @@ fn session_power(assert: Assert) {
     let with_input = call_export("ZwPowerInformation", &[29, buffer + 0x40, 4, buffer, 4]).map(|status| status & 0xFFFF_FFFF);
     assert(with_input == Some(STATUS_INVALID_PARAMETER) && power(29, 0, buffer, 0) == Some(STATUS_INVALID_PARAMETER) && power(29, 0, buffer, 3) == Some(0xC000_0023) && power(29, buffer + 0x40, buffer, 4) == Some(0) && guest::read32(buffer) == crate::ntos::po::display_state::console_display_state(), "power: SystemVideoState sem entrada devolve os 4 bytes do PopConsoleDisplayState");
     session_display_state(assert, buffer);
+    power_internal(assert);
     guest::free_bytes(buffer);
+}
+
+/// PowerInformationInternal (87) de modo kernel: antes recusado com
+/// STATUS_INVALID_PARAMETER, agora pelo PopPowerInformationInternal
+/// (0x6f1b04) do modo usuário, sem captura. O tipo 4 (sem AoAc), o
+/// SessionPowerState (0x13, o UpdateSessionPowerState do win32kbase:
+/// exatamente 0x14 bytes, sem saída; com Console, o
+/// PopUpdateConsoleDisplayState com On), o InputControllerState (0x1C:
+/// exatamente 0xC bytes, o ULONG em GUID_ADAPTIVE_INPUT_CONTROLLER_STATE) e o
+/// SetWatchdog (0x15: pelo menos 0x60 bytes; NULL só com saída, que recebe o
+/// watchdog criado; um prazo arma o timer; prazo 0 desarma; Delete apaga, e o
+/// estágio de um watchdog 0x19C vai ao boot status data).
+fn power_internal(assert: Assert) {
+    use crate::ntos::inc::types::extra_ps_user::PowerInternalSetWatchdogInput;
+    use crate::ntos::po::{display_state, power_setting, watchdog};
+    let block = guest::alloc_bytes(0x100);
+    let (input, output) = (block, block + 0x80);
+    let internal = |length: u64, output_length: u64| call_export("ZwPowerInformation", &[87, input, length, if output_length != 0 { output } else { 0 }, output_length]).map(|status| status & 0xFFFF_FFFF);
+    let ac_value = |setting: &[u8; 16]| power_setting::setting_value(setting, 0x40).ok().filter(|bytes| bytes.len() >= 16).map(|bytes| u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]));
+    // Tipo 4 (PowerInternalUserAbsencePredictionCapability).
+    guest::write32(input, 4);
+    guest::write32(input + 4, 0);
+    guest::write8(output, 0xFF);
+    let absence = internal(8, 1);
+    let absence_value = guest::read8(output);
+    let null_input = call_export("ZwPowerInformation", &[87, 0, 0, output, 1]).map(|status| status & 0xFFFF_FFFF);
+    let short_header = internal(4, 1);
+    assert(absence == Some(0) && absence_value == 0 && null_input == Some(STATUS_INVALID_PARAMETER) && short_header == Some(STATUS_INVALID_PARAMETER), "power: PowerInformationInternal de modo kernel (tipo 4 sem AoAc; sem entrada ou com menos de 8 bytes, STATUS_INVALID_PARAMETER)");
+
+    // SessionPowerState: {header, SessionId, On, Console, Reason}.
+    let session_power = |on: u8, console: u8, length: u64, output_length: u64| {
+        guest::write_bytes(input, &[0u8; 0x18]);
+        guest::write32(input, 0x13);
+        guest::write32(input + 8, 1);
+        guest::write8(input + 0xC, on);
+        guest::write8(input + 0xD, console);
+        internal(length, output_length)
+    };
+    let previous = display_state::console_display_state();
+    let short = session_power(0, 1, 0x10, 0);
+    let with_output = session_power(0, 1, 0x14, 4);
+    let not_console = session_power(0, 0, 0x14, 0);
+    let unchanged = display_state::console_display_state() == previous;
+    let off = session_power(0, 1, 0x14, 0);
+    let off_state = (display_state::console_display_state(), ac_value(&power_setting::GUID_MONITOR_POWER_ON));
+    let on = session_power(1, 1, 0x14, 0);
+    let on_state = (display_state::console_display_state(), ac_value(&power_setting::GUID_MONITOR_POWER_ON));
+    assert(
+        previous == 1 && short == Some(STATUS_INVALID_PARAMETER) && with_output == Some(STATUS_INVALID_PARAMETER) && not_console == Some(0) && unchanged && off == Some(0) && off_state == (0, Some(0)) && on == Some(0) && on_state == (1, Some(1)),
+        "power: SessionPowerState (0x13) de exatamente 0x14 bytes sem saida; com Console, a tela do console segue o On",
+    );
+
+    // InputControllerState: {header, ULONG State}.
+    guest::write32(input, 0x1C);
+    guest::write32(input + 4, 0);
+    guest::write32(input + 8, 2);
+    let controller = internal(0xC, 0);
+    let controller_value = ac_value(&power_setting::GUID_ADAPTIVE_INPUT_CONTROLLER_STATE);
+    let controller_long = internal(0x10, 0);
+    assert(controller == Some(0) && controller_value == Some(2) && controller_long == Some(STATUS_INVALID_PARAMETER), "power: InputControllerState (0x1C) de exatamente 0xC bytes grava GUID_ADAPTIVE_INPUT_CONTROLLER_STATE");
+
+    // SetWatchdog.
+    guest::write_bytes(input, &[0u8; 0x60]);
+    // SAFETY: os 0x60 bytes zerados do bloco do teste.
+    let request = unsafe { PowerInternalSetWatchdogInput::at(input) };
+    request.internal_type.set(0x15);
+    let too_short = internal(0x5F, 8);
+    let null_without_output = internal(0x60, 0);
+    guest::write64(output, 0);
+    let created = internal(0x60, 8);
+    let object = guest::read64(output);
+    let created_idle = object != 0 && watchdog::is_live(object) && !watchdog::is_armed(object);
+    request.watchdog.set(object);
+    request.parameters.timeout.set(60_000);
+    request.parameters.session_id.set(u32::MAX);
+    request.parameters.bug_check_code.set(watchdog::WIN32K_POWER_WATCHDOG_TIMEOUT);
+    request.parameters.parameters[0].set(0x21);
+    let armed = internal(0x60, 0);
+    let armed_state = (watchdog::is_armed(object), watchdog::bsd_power_watchdog());
+    request.parameters.timeout.set(0);
+    let disarmed = internal(0x60, 0);
+    let disarmed_state = (watchdog::is_armed(object), watchdog::bsd_power_watchdog());
+    request.delete.set(1);
+    guest::write64(output, 0xEEEE_EEEE);
+    let deleted = internal(0x60, 8);
+    let deleted_state = (guest::read64(output), watchdog::is_live(object));
+    assert(
+        too_short == Some(0xC000_0023) && null_without_output == Some(0xC000_0023) && created == Some(0) && created_idle && armed == Some(0) && armed_state == (true, (true, 0x21)) && disarmed == Some(0) && disarmed_state == (false, (false, 0x21)) && deleted == Some(0) && deleted_state == (0, false),
+        "power: SetWatchdog (0x15) cria, arma, desarma e apaga o watchdog de energia",
+    );
+    guest::free_bytes(block);
 }
 
 /// SessionDisplayState (42), o aviso de tela do UpdateDisplayState do

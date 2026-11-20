@@ -25,3 +25,4 @@ pub mod win32_callout;
 pub mod processor_power;
 pub mod boot_status;
 pub mod transition_checkpoint;
+pub mod watchdog;

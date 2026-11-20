@@ -390,3 +390,107 @@ const _: () = {
     assert!(core::mem::offset_of!(SystemMemoryUsageInformation, commit_limit_bytes) == 0x28);
     assert!(core::mem::offset_of!(SystemMemoryUsageInformation, peak_commitment_bytes) == 0x30);
 };
+
+/// Os parâmetros de um watchdog de energia do Po: a cópia que o
+/// PopSetWatchdog (ntoskrnl 19041, 0x349578) guarda no watchdog (+0xE0) e o
+/// PopWatchdogWorker (0x578db0) lê no vencimento. O prazo em ms, a sessão a
+/// anexar (-1 nenhuma), o código e os quatro parâmetros do bugcheck (cada
+/// um lido através do ponteiro quando o BOOLEAN dele em `indirect` está
+/// ligado, o PopResolveWatchdogParam 0x578cac) e o callback opcional que o
+/// worker chama no lugar do bugcheck. 0x48 bytes.
+#[repr(C)]
+pub struct PowerWatchdogParameters {
+    pub timeout: Field<u32>,
+    pub session_id: Field<u32>,
+    pub bug_check_code: Field<u32>,
+    pub reserved: Field<u32>,
+    pub parameters: [Field<u64>; 4],
+    pub indirect: [Field<u8>; 4],
+    pub _padding: [Field<u8>; 4],
+    pub callback: Field<u64>,
+    pub callback_context: Field<u64>,
+}
+
+unsafe impl NtStruct for PowerWatchdogParameters {}
+
+const _: () = {
+    assert!(core::mem::size_of::<PowerWatchdogParameters>() == 0x48);
+    assert!(core::mem::offset_of!(PowerWatchdogParameters, timeout) == 0x0);
+    assert!(core::mem::offset_of!(PowerWatchdogParameters, session_id) == 0x4);
+    assert!(core::mem::offset_of!(PowerWatchdogParameters, bug_check_code) == 0x8);
+    assert!(core::mem::offset_of!(PowerWatchdogParameters, parameters) == 0x10);
+    assert!(core::mem::offset_of!(PowerWatchdogParameters, indirect) == 0x30);
+    assert!(core::mem::offset_of!(PowerWatchdogParameters, callback) == 0x38);
+    assert!(core::mem::offset_of!(PowerWatchdogParameters, callback_context) == 0x40);
+};
+
+/// A entrada do PowerInternalSetWatchdog (NtPowerInformation 87, tipo
+/// interno 0x15; PopPowerInformationInternal 0x6f1c02): o cabeçalho
+/// {InternalType, Version}, o watchdog (NULL cria um), os parâmetros e o
+/// BOOLEAN que apaga o watchdog. 0x60 bytes.
+#[repr(C)]
+pub struct PowerInternalSetWatchdogInput {
+    pub internal_type: Field<u32>,
+    pub version: Field<u32>,
+    pub watchdog: Field<u64>,
+    pub parameters: PowerWatchdogParameters,
+    pub delete: Field<u8>,
+    pub _tail: [Field<u8>; 7],
+}
+
+unsafe impl NtStruct for PowerInternalSetWatchdogInput {}
+
+const _: () = {
+    assert!(core::mem::size_of::<PowerInternalSetWatchdogInput>() == 0x60);
+    assert!(core::mem::offset_of!(PowerInternalSetWatchdogInput, internal_type) == 0x0);
+    assert!(core::mem::offset_of!(PowerInternalSetWatchdogInput, watchdog) == 0x8);
+    assert!(core::mem::offset_of!(PowerInternalSetWatchdogInput, parameters) == 0x10);
+    assert!(core::mem::offset_of!(PowerInternalSetWatchdogInput, delete) == 0x58);
+};
+
+/// O watchdog de energia do Po: o bloco de pool 'POWD' de 0x138 bytes que o
+/// PopSetWatchdog (0x349578) cria, na PopWatchdogList. O timer (notificação)
+/// vence pela DPC (PopWatchdogDpc 0x578cd0), que põe o item de trabalho
+/// (PopWatchdogWorker) na DelayedWorkQueue; o evento de notificação fica
+/// sinalizado sem timer nem worker pendentes (PopUpdateWatchdogNoWorkersEvent
+/// 0x349850). Os campos de diagnóstico do 19041 entram com o nome do papel.
+#[repr(C)]
+pub struct PopPowerWatchdog {
+    pub link: ListEntry,
+    /// 'POWD' (0x44574F50) vivo; 'NONO' (0x4F4E4F4E) ao ser solto.
+    pub signature: Field<u32>,
+    pub timer_active: Field<u8>,
+    pub worker_queued: Field<u8>,
+    pub _padding: [Field<u8>; 2],
+    pub no_workers: Kevent,
+    pub timer: Ktimer,
+    pub dpc: Kdpc,
+    pub work_item: WorkQueueItem,
+    /// O tempo de interrupção do vencimento.
+    pub due_time: Field<u64>,
+    pub armed: Field<u8>,
+    pub _padding2: [Field<u8>; 7],
+    pub parameters: PowerWatchdogParameters,
+    /// O tempo de interrupção do armar.
+    pub arm_time: Field<u64>,
+    /// A thread que armou.
+    pub arming_thread: Field<u64>,
+}
+
+unsafe impl NtStruct for PopPowerWatchdog {}
+
+const _: () = {
+    assert!(core::mem::size_of::<PopPowerWatchdog>() == 0x138);
+    assert!(core::mem::offset_of!(PopPowerWatchdog, signature) == 0x10);
+    assert!(core::mem::offset_of!(PopPowerWatchdog, timer_active) == 0x14);
+    assert!(core::mem::offset_of!(PopPowerWatchdog, worker_queued) == 0x15);
+    assert!(core::mem::offset_of!(PopPowerWatchdog, no_workers) == 0x18);
+    assert!(core::mem::offset_of!(PopPowerWatchdog, timer) == 0x30);
+    assert!(core::mem::offset_of!(PopPowerWatchdog, dpc) == 0x70);
+    assert!(core::mem::offset_of!(PopPowerWatchdog, work_item) == 0xB0);
+    assert!(core::mem::offset_of!(PopPowerWatchdog, due_time) == 0xD0);
+    assert!(core::mem::offset_of!(PopPowerWatchdog, armed) == 0xD8);
+    assert!(core::mem::offset_of!(PopPowerWatchdog, parameters) == 0xE0);
+    assert!(core::mem::offset_of!(PopPowerWatchdog, arm_time) == 0x128);
+    assert!(core::mem::offset_of!(PopPowerWatchdog, arming_thread) == 0x130);
+};
