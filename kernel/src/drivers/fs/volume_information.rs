@@ -19,6 +19,8 @@ pub fn minimum(class: u32) -> Option<u32> {
         4 => Some(8),
         5 => Some(12),
         7 => Some(32),
+        // FILE_FS_SECTOR_SIZE_INFORMATION.
+        11 => Some(0x1C),
         _ => None,
     }
 }
@@ -77,7 +79,8 @@ fn put(bytes: &mut [u8], at: usize, value: u64, count: usize) {
     bytes[at..at + count].copy_from_slice(&value.to_le_bytes()[..count]);
 }
 
-/// FileFsVolume (1), Size (3), Device (4), Attribute (5) e FullSize (7). O
+/// FileFsVolume (1), Size (3), Device (4), Attribute (5), FullSize (7) e
+/// SectorSize (11). O
 /// nome é copiado byte a byte, inclusive um último byte ímpar, sem
 /// terminador; o campo de comprimento sempre descreve o nome inteiro.
 pub fn query(volume: Option<&dyn VolumeQuery>, class: u32, length: u32) -> Result<QueryResult, KernelError> {
@@ -99,7 +102,7 @@ pub fn query(volume: Option<&dyn VolumeQuery>, class: u32, length: u32) -> Resul
         offset = 12;
     }
     let mut space = None;
-    if class == 3 || class == 7 {
+    if class == 3 || class == 7 || class == 11 {
         match volume.space() {
             Some(found) => space = Some(found?),
             None => return Ok(fail(0xC000_0010)),
@@ -124,6 +127,21 @@ pub fn query(volume: Option<&dyn VolumeQuery>, class: u32, length: u32) -> Resul
         4 => {
             put(&mut bytes, 0, identity.device_type as u64, 4);
             put(&mut bytes, 4, identity.characteristics as u64, 4);
+        }
+        // FileFsSectorSizeInformation (o NtfsQueryFsSectorSizeInfo do
+        // ntfs.sys 0x160426 copia o FsRtlGetSectorSizeInformation do
+        // dispositivo): os quatro tamanhos de setor iguais ao lógico (o disco
+        // não informa outro alinhamento, IOCTL_STORAGE_QUERY_PROPERTY de
+        // `volume_device.rs`), Flags SSINFO_FLAGS_ALIGNED_DEVICE |
+        // SSINFO_FLAGS_PARTITION_ALIGNED_ON_DEVICE e os dois deslocamentos
+        // zerados. O GetFileInformationByHandleEx(FileStorageInfo) do
+        // kernelbase chega aqui (o GetOptimalPageSize do StateRepository).
+        11 => {
+            let sector = space.expect("espaco consultado").sector_size;
+            for index in 0..4 {
+                put(&mut bytes, index * 4, sector, 4);
+            }
+            put(&mut bytes, 16, 3, 4);
         }
         _ => {
             let space = space.expect("espaco consultado");

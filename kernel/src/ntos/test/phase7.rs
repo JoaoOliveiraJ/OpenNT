@@ -1310,6 +1310,15 @@ fn user_file_io_more(assert: Assert) {
     // Volume da descrição.
     guest::write32(rsp + 0x28, 1);
     assert(call("NtQueryVolumeInformationFile", directory, iosb, buffer, 0x100) == 0 && unsafe { nt::IoStatusBlock::at(iosb) }.information.get() >= 18, "userfiles: FileFsVolumeInformation pelo volume do arquivo");
+    // FileFsSectorSizeInformation (11, o FileStorageInfo do kernelbase): 0x1C
+    // bytes com os quatro tamanhos iguais ao setor do volume, Flags
+    // SSINFO_FLAGS_ALIGNED_DEVICE | PARTITION_ALIGNED_ON_DEVICE e os
+    // deslocamentos zerados; menos que 0x1C é STATUS_INFO_LENGTH_MISMATCH.
+    guest::write32(rsp + 0x28, 11);
+    let sector = call("NtQueryVolumeInformationFile", directory, iosb, buffer, 0x1C);
+    let words: alloc::vec::Vec<u32> = (0..7).map(|index| guest::read32(buffer + index * 4)).collect();
+    let sector_ok = sector == 0 && unsafe { nt::IoStatusBlock::at(iosb) }.information.get() == 0x1C && words[0] >= 512 && words[0].is_power_of_two() && words[1..4].iter().all(|&value| value == words[0]) && words[4..] == [3, 0, 0];
+    assert(sector_ok && call("NtQueryVolumeInformationFile", directory, iosb, buffer, 0x1B) == 0xC000_0004, "userfiles: FileFsSectorSizeInformation com o setor do volume e Flags 3");
     // NtNotifyChangeDirectoryFile(Ex) de modo usuário (o
     // FindFirstChangeNotificationW): o IO_STATUS_BLOCK e o buffer sondados
     // (alinhamento de ULONG), o filtro entre 1 e 0xFFF e o FILE_LIST_DIRECTORY
