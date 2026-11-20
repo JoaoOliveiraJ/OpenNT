@@ -250,6 +250,52 @@ pub fn win32k_service_returned(service_number: u32, result: u64) {
     }
 }
 
+/// O número de serviço do NtUserCreateWindowEx (0: ainda não lido; u32::MAX:
+/// o stub não foi achado).
+static CREATE_WINDOW_SERVICE: AtomicU32 = AtomicU32::new(0);
+static SHELL_TRAY_CREATED: AtomicBool = AtomicBool::new(false);
+/// A classe da janela da barra de tarefas do explorer.exe.
+const SHELL_TRAY_CLASS: &str = "Shell_TrayWnd";
+
+/// Um serviço da tabela do win32k voltou ao modo usuário com `result`, com
+/// os argumentos `arguments` (o pacote do serviço): o `SHELL_TRAY_CREATED`
+/// sai quando o NtUserCreateWindowEx (o número do stub do win32u.dll) do
+/// explorer.exe da sessão 1 volta, depois do `USER_LOGON_OK`, com uma janela
+/// da classe Shell_TrayWnd: o CreateWindowExW do CTray::_CreateTrayWindow
+/// (explorer 19041, 0x2e2d8). O user32 passa o nome da classe no segundo
+/// argumento, um [`LargeString`](crate::ntos::inc::types::extra_usermode::LargeString)
+/// (VerNtUserCreateWindowEx, 0x7766); um átomo de classe não é o nome.
+pub fn win32k_window_created(service_number: u32, arguments: &[u64], result: u64) {
+    use crate::ntos::inc::types::extra_usermode::LargeString;
+    use crate::ntos::ps::user::state;
+    if !boot_config::smss_boot() || result == 0 || arguments.len() < 2 || !USER_LOGON_OK.load(Ordering::Acquire) || SHELL_TRAY_CREATED.load(Ordering::Acquire) {
+        return;
+    }
+    let current = process::get_current_process();
+    if crate::ntos::mm::session::session_id(current) != 1 || !image_name(current).eq_ignore_ascii_case("explorer.exe") {
+        return;
+    }
+    let mut number = CREATE_WINDOW_SERVICE.load(Ordering::Acquire);
+    if number == 0 {
+        number = user_service_number("win32u.dll", "NtUserCreateWindowEx").unwrap_or(u32::MAX);
+        CREATE_WINDOW_SERVICE.store(number, Ordering::Release);
+    }
+    if service_number != number || !state::probe_user_read(arguments[1], core::mem::size_of::<LargeString>() as u64) {
+        return;
+    }
+    let Ok(class) = state::user_struct::<LargeString>(arguments[1]) else { return };
+    let (Ok(length), Ok(buffer)) = (class.length.probe_get(), class.buffer.probe_get()) else { return };
+    if buffer < 0x1_0000 || length as usize != SHELL_TRAY_CLASS.len() * 2 {
+        return;
+    }
+    let named = state::try_read_user_wide_string(buffer, u64::from(length / 2)).is_ok_and(|name| name.eq_ignore_ascii_case(SHELL_TRAY_CLASS));
+    if !named || SHELL_TRAY_CREATED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    crate::debug_print!("[init] explorer.exe (pid {}): janela {} criada (hwnd {:#x})", process::get_current_process_id(), SHELL_TRAY_CLASS, result);
+    crate::debug_print!("SHELL_TRAY_CREATED");
+}
+
 /// O marcador de um processo que abre as Desktops Winlogon e Default da
 /// WinSta0 da sessão dele.
 struct DesktopMarker {

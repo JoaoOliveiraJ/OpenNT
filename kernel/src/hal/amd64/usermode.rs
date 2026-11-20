@@ -1287,6 +1287,7 @@ pub extern "C" fn opennt_user_syscall(frame: *mut u64) -> u64 {
         trace_win32k_service(number, &packet, result);
         if number & 0x1000 != 0 {
             crate::ntos::init::initial_process::win32k_service_returned(number as u32, result);
+            crate::ntos::init::initial_process::win32k_window_created(number as u32, &packet, result);
             crate::ntos::ps::user::win32k_status::returned(number as u32, result, entry_rsp);
         }
     } else {
