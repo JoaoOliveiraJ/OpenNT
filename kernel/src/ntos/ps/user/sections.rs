@@ -67,6 +67,12 @@ pub trait SectionFile: Send + Sync {
     fn identity(&self) -> Option<String> {
         None
     }
+    /// A versão do conteúdo agora (muda com cada escrita): decide se uma
+    /// control area de imagem sem uso ainda vale para o arquivo. `None` = o
+    /// arquivo não diz, e a control area não fica retida sem uso.
+    fn version(&self) -> Option<Vec<u8>> {
+        None
+    }
     fn size(&self) -> u64;
     fn read_at(&self, offset: u64, length: u64) -> Result<Vec<u8>, KernelError>;
     /// Cópia direta para a memória física (sem buffer intermediário).

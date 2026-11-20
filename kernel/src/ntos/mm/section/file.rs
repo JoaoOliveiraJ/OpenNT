@@ -120,6 +120,18 @@ impl SectionFile for CapturedFile {
         Some(self.identity.clone())
     }
 
+    /// O tamanho e as horas de escrita e de mudança do
+    /// $STANDARD_INFORMATION (+8..+24), que toda escrita no arquivo
+    /// atualiza; só nos arquivos de um volume que as tem.
+    fn version(&self) -> Option<Vec<u8>> {
+        let (volume, path) = self.backing.as_ref()?;
+        let stat = volume.stat(path)?;
+        let times = stat.times.get(8..24).filter(|times| times.iter().any(|&byte| byte != 0))?;
+        let mut version = stat.size.to_le_bytes().to_vec();
+        version.extend_from_slice(times);
+        Some(version)
+    }
+
     fn size(&self) -> u64 {
         self.size.load(Ordering::Acquire)
     }

@@ -8,7 +8,9 @@
 //! area, como o ImageSectionObject dos SECTION_OBJECT_POINTERS: a chave é a
 //! identidade do arquivo (`SectionFile::identity`) e, sem ela, o próprio
 //! objeto seção. A seção retém a control area enquanto existe, e cada vista
-//! também; a última referência devolve os frames ao PFN. A imagem plana
+//! também; a de um arquivo segue, sem uso, na lista das control areas sem
+//! uso (a MmUnusedSegmentList, [`RETAINED`]) até a pressão de memória ou o
+//! limite dela devolverem os frames ao PFN, ou até o arquivo mudar. A imagem plana
 //! (SectionAlignment menor que a página, `image_header`) é o arquivo inteiro
 //! a partir do offset zero, com todas as páginas graváveis por cópia.
 //!
@@ -57,6 +59,10 @@ pub struct ImageSegment {
     /// A ImageBase do cabeçalho (a das páginas protótipo).
     pub preferred_base: u64,
     pub size_of_image: u64,
+    /// A versão do arquivo quando as páginas foram lidas
+    /// (`SectionFile::version`); sem ela a control area não fica na lista
+    /// das sem uso.
+    version: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -68,6 +74,120 @@ enum SegmentKey {
 /// As control areas vivas, para que uma nova seção do mesmo arquivo use a
 /// mesma (a seção e as vistas guardam as referências fortes).
 static SEGMENTS: SpinLock<BTreeMap<SegmentKey, Weak<ImageSegment>>> = SpinLock::new(BTreeMap::new());
+
+/// As control areas de arquivo retidas, da usada há mais tempo à mais
+/// recente: a MmUnusedSegmentList do 19041. O MiCheckControlArea põe nela a
+/// control area de imagem que perdeu a última seção e a última vista, com as
+/// páginas protótipo (em standby) ainda válidas, e o MiDeleteUnusedSegments
+/// só as devolve sob pressão de memória. Assim um processo novo que mapeia a
+/// kernelbase, ou o LoadLibrary do WARP depois do FreeLibrary, não lê o
+/// arquivo de novo. Uma control area daqui sem outra referência é a sem uso;
+/// as sem uso passam de [`unused_budget`] ou voltam ao PFN pela recuperação
+/// de memória (`page_residency`), a mais antiga primeiro.
+static RETAINED: SpinLock<alloc::collections::VecDeque<Arc<ImageSegment>>> = SpinLock::new(alloc::collections::VecDeque::new());
+static RECLAIM_REGISTERED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// As páginas protótipo que as control areas sem uso podem reter: um oitavo
+/// da memória física, até 128 MB.
+fn unused_budget() -> u64 {
+    (pfn::total_count() / 8).min(128 * 1024 * 1024 / PAGE)
+}
+
+/// Só a lista retém a control area (o próprio chamador conta `extra`).
+fn unused(segment: &Arc<ImageSegment>, extra: usize) -> bool {
+    Arc::strong_count(segment) <= 1 + extra
+}
+
+/// Tira da lista as sem uso mais antigas até as restantes caberem em
+/// `budget` páginas; devolve as tiradas, para o `Drop` rodar fora da trava.
+fn trim(retained: &mut alloc::collections::VecDeque<Arc<ImageSegment>>, budget: u64) -> Vec<Arc<ImageSegment>> {
+    let mut held: u64 = retained.iter().filter(|segment| unused(segment, 0)).map(|segment| segment.frames.len() as u64).sum();
+    let mut evicted = Vec::new();
+    let mut index = 0;
+    while held > budget && index < retained.len() {
+        if unused(&retained[index], 0) {
+            if let Some(segment) = retained.remove(index) {
+                held -= segment.frames.len() as u64;
+                evicted.push(segment);
+            }
+        } else {
+            index += 1;
+        }
+    }
+    evicted
+}
+
+/// Põe a control area no fim da lista (a mais recente).
+fn retain(segment: &Arc<ImageSegment>) {
+    if segment.version.is_none() || !matches!(segment.key, SegmentKey::File(_)) {
+        return;
+    }
+    if !RECLAIM_REGISTERED.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        let provider = crate::ntos::mm::page_residency::Provider {
+            fault: |_, _| crate::ntos::mm::page_residency::FaultResult::NotMine,
+            resolve: |_| Ok(None),
+            reclaim: reclaim_unused,
+            prepare: || Ok(()),
+            resolve_range: Some((0, 0)),
+        };
+        if let Err(error) = crate::ntos::mm::page_residency::register("unused image segments", provider) {
+            crate::debug_print!("[section-image] {}", error);
+        }
+    }
+    let evicted = {
+        let mut retained = RETAINED.lock();
+        if let Some(position) = retained.iter().position(|existing| Arc::ptr_eq(existing, segment)) {
+            retained.remove(position);
+        }
+        retained.push_back(segment.clone());
+        trim(&mut retained, unused_budget())
+    };
+    drop(evicted);
+}
+
+/// Tira da lista uma control area retida (o arquivo mudou).
+fn forget(segment: &Arc<ImageSegment>) {
+    let removed = {
+        let mut retained = RETAINED.lock();
+        retained.iter().position(|existing| Arc::ptr_eq(existing, segment)).and_then(|position| retained.remove(position))
+    };
+    drop(removed);
+}
+
+/// A recuperação de memória: devolve ao PFN as control areas sem uso mais
+/// antigas até liberar `count` frames (o MiDeleteUnusedSegments). Com a
+/// lista em uso (a recuperação nasceu de uma alocação dentro dela), nada.
+fn reclaim_unused(count: u64) -> Result<u64, KernelError> {
+    let before = pfn::free_count();
+    let evicted = {
+        let Some(mut retained) = RETAINED.try_lock() else { return Ok(0) };
+        let mut freed = 0;
+        let mut evicted = Vec::new();
+        let mut index = 0;
+        while freed < count && index < retained.len() {
+            if unused(&retained[index], 0) {
+                if let Some(segment) = retained.remove(index) {
+                    freed += segment.frames.len() as u64;
+                    evicted.push(segment);
+                }
+            } else {
+                index += 1;
+            }
+        }
+        evicted
+    };
+    drop(evicted);
+    Ok(pfn::free_count().saturating_sub(before))
+}
+
+/// Devolve ao PFN todas as control areas sem uso (o que a pressão de
+/// memória faria aos poucos). Devolve quantas páginas soltou.
+pub fn flush_unused() -> u64 {
+    let evicted = trim(&mut RETAINED.lock(), 0);
+    let pages = evicted.iter().map(|segment| segment.frames.len() as u64).sum();
+    drop(evicted);
+    pages
+}
 
 impl Drop for ImageSegment {
     fn drop(&mut self) {
@@ -134,9 +254,23 @@ pub fn of_section(section: &Arc<Section>, name: &str) -> Result<Result<Arc<Image
     let Some(file) = section.file.clone() else { return Ok(Err(0xC000_0185)) };
     let key = key_of(section);
     let existing = SEGMENTS.lock().get(&key).and_then(Weak::upgrade);
+    // Uma control area sem uso cujo arquivo mudou desde a leitura não serve
+    // mais (no NT, a abertura do arquivo para escrita a apaga pelo
+    // MmFlushImageSection): sai da lista e outra é montada.
+    let existing = match existing {
+        Some(segment) if unused(&segment, 1) && segment.version.is_some() && segment.version != file.version() => {
+            forget(&segment);
+            None
+        }
+        other => other,
+    };
     let segment = match existing {
-        Some(segment) => segment,
+        Some(segment) => {
+            retain(&segment);
+            segment
+        }
         None => {
+            let version = file.version();
             let source: Arc<dyn ImageSource> = Arc::new(SegmentSource { name: String::from(name), file });
             let options = LoadOptions { user_space: true, prototype: true, skip_imports: true, skip_relocations: true, skip_security_cookie: true, notify_image: false, no_execute: section.no_execute, ..LoadOptions::default() };
             let mut image = match pe_loader::load_from_source(source, &options) {
@@ -150,11 +284,11 @@ pub fn of_section(section: &Arc<Section>, name: &str) -> Result<Result<Arc<Image
             // Os vetores passam para a control area (a carga guardada só
             // devolve os frames, pela lista própria dela).
             let (frames, protections) = (core::mem::take(&mut image.pages), core::mem::take(&mut image.page_protects));
-            let created = Arc::new(ImageSegment { key: key.clone(), frames, protections, preferred_base: image.preferred_base, size_of_image: image.size_of_image, image: SpinLock::new(Some(image)) });
+            let created = Arc::new(ImageSegment { key: key.clone(), frames, protections, preferred_base: image.preferred_base, size_of_image: image.size_of_image, image: SpinLock::new(Some(image)), version });
             // Outra seção do mesmo arquivo pode ter montado a dela enquanto
             // esta lia o arquivo: fica a primeira, e esta volta ao PFN.
             let mut segments = SEGMENTS.lock();
-            match segments.get(&key).and_then(Weak::upgrade) {
+            let segment = match segments.get(&key).and_then(Weak::upgrade) {
                 Some(winner) => {
                     drop(segments);
                     drop(created);
@@ -162,9 +296,12 @@ pub fn of_section(section: &Arc<Section>, name: &str) -> Result<Result<Arc<Image
                 }
                 None => {
                     segments.insert(key, Arc::downgrade(&created));
+                    drop(segments);
                     created
                 }
-            }
+            };
+            retain(&segment);
+            segment
         }
     };
     let mut state = section.state.lock();

@@ -8,7 +8,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 
 use crate::ntos::inc::field::{Field, NtStruct, Reserved};
 use crate::ntos::inc::types as nt;
@@ -453,6 +453,89 @@ fn image_sections(assert: Assert) {
     assert(code != 0 && physical::read8(code) == 0xC3 && physical::read8(paging::translate(view.base)) == b'M' && paging::access_flags(view.base) & paging::PAGE_RW == 0, "sections: vista de imagem com o layout virtual do PE");
     let pointer = image.pointer();
     assert(sections::unmap(&view, None).is_ok() && sections::by_pointer(pointer).is_none(), "sections: imagem destruida na ultima vista");
+}
+
+/// Arquivo de imagem com versão (`SectionFile::version`, que cada escrita
+/// muda) e a contagem das leituras que tocam a seção de código.
+struct VersionedImage {
+    bytes: crate::rtl::SpinLock<alloc::vec::Vec<u8>>,
+    version: AtomicU64,
+    code_reads: AtomicU64,
+}
+
+impl crate::ntos::ps::user::sections::SectionFile for VersionedImage {
+    fn identity(&self) -> Option<String> {
+        Some(String::from("teste:imagem-retida"))
+    }
+    fn version(&self) -> Option<alloc::vec::Vec<u8>> {
+        Some(self.version.load(Ordering::SeqCst).to_le_bytes().to_vec())
+    }
+    fn size(&self) -> u64 {
+        self.bytes.lock().len() as u64
+    }
+    fn read_at(&self, offset: u64, length: u64) -> Result<alloc::vec::Vec<u8>, KernelError> {
+        if offset < 0x400 && offset + length > 0x200 {
+            self.code_reads.fetch_add(1, Ordering::SeqCst);
+        }
+        let bytes = self.bytes.lock();
+        let end = ((offset + length) as usize).min(bytes.len());
+        Ok(bytes[(offset as usize).min(end)..end].to_vec())
+    }
+    fn nt_path(&self) -> Option<String> {
+        Some(String::from("\\Device\\HarddiskVolume1\\opennt-retida.dll"))
+    }
+}
+
+/// A control area de imagem sem seção nem vista fica na lista das sem uso
+/// (a MmUnusedSegmentList do 19041): a seção seguinte do mesmo arquivo usa
+/// a mesma control area, sem ler o arquivo; depois de uma escrita no arquivo
+/// (outra versão) a control area é montada de novo, com o conteúdo novo, e a
+/// antiga volta ao PFN; devolvidas as sem uso, a seguinte lê o arquivo de
+/// novo.
+fn retained_image_segments(assert: Assert) {
+    use crate::hal::physical;
+    use crate::ntos::mm::section::image_segment::{self, ImageSegment};
+    use crate::ntos::mm::section::image_view;
+    use crate::ntos::mm::section::map_view_parameters::View as Request;
+    use crate::ntos::mm::section::views::{self as section_views, OwnedView};
+    use crate::ntos::mm::{memory_map, paging};
+    use crate::ntos::ps::process;
+    use crate::ntos::ps::user::sections;
+    use crate::ntos::ps::user::state::RegionKind;
+    use alloc::sync::Weak;
+    let file = Arc::new(VersionedImage { bytes: crate::rtl::SpinLock::new(minimal_image()), version: AtomicU64::new(1), code_reads: AtomicU64::new(0) });
+    let request = Request { base: 0, size: 0x2000, offset: 0, upper: memory_map::USER_ADDRESS_LIMIT - 1, alignment: 0x10000, protect: 0x80, allocation: 0, inherit: 2, commit: 0, preferred_node_plus_one: 0 };
+    // Uma seção nova do arquivo e uma vista dela: o byte de código da vista,
+    // a control area (fraca) e as leituras do código que a montagem fez;
+    // soltas a vista e a seção, a seção morreu.
+    let round = || -> Option<(u8, Weak<ImageSegment>, u64)> {
+        let shared: Arc<dyn sections::SectionFile> = file.clone();
+        let Ok(Ok(section)) = sections::create_image(shared, None, 0x80, false) else { return None };
+        let reads = file.code_reads.load(Ordering::SeqCst);
+        let Ok(Ok(mapped)) = image_view::map(&section, &request, process::get_current_process(), RegionKind::Detached) else { return None };
+        let reads = file.code_reads.load(Ordering::SeqCst) - reads;
+        let code = physical::read8(paging::translate(mapped.view.base + 0x1000));
+        let segment = Arc::downgrade(&mapped.view.segment);
+        let pointer = section.pointer();
+        let released = section_views::unmap(&OwnedView::Image(mapped.view.clone())).is_ok();
+        drop((mapped, section));
+        (released && sections::by_pointer(pointer).is_none()).then_some((code, segment, reads))
+    };
+    let first = round();
+    let second = round();
+    let retained = matches!((&first, &second), (Some((0xC3, first_segment, first_reads)), Some((0xC3, second_segment, second_reads))) if *first_reads != 0 && second_reads < first_reads && first_segment.upgrade().is_some() && Weak::ptr_eq(first_segment, second_segment));
+    crate::debug_print!("[secao-retida] leituras do codigo: {:?} {:?}", first.as_ref().map(|round| round.2), second.as_ref().map(|round| round.2));
+    assert(retained, "sections: a control area de imagem sem uso fica retida e a secao seguinte do arquivo a usa sem ler o arquivo");
+    file.bytes.lock()[0x200] = 0xCC;
+    file.version.fetch_add(1, Ordering::SeqCst);
+    let changed = round();
+    let renewed = matches!((&first, &changed), (Some((_, old, _)), Some((0xCC, new, reads))) if *reads != 0 && old.upgrade().is_none() && new.upgrade().is_some());
+    assert(renewed, "sections: o arquivo mudado (outra versao) ganha uma control area nova, com o conteudo novo, e a antiga volta ao PFN");
+    let released = image_segment::flush_unused();
+    let after_flush = round();
+    let reread = matches!((&changed, &after_flush), (Some((_, old, _)), Some((0xCC, _, reads))) if *reads != 0 && old.upgrade().is_none());
+    assert(released != 0 && reread, "sections: devolvidas as sem uso ao PFN, a secao seguinte le o arquivo de novo");
+    image_segment::flush_unused();
 }
 
 /// PE32+ plano: SectionAlignment = FileAlignment = 0x80, o offset no arquivo
@@ -7078,6 +7161,7 @@ pub fn run(assert: Assert) {
     data_sections(assert);
     file_and_named_sections(assert);
     image_sections(assert);
+    retained_image_segments(assert);
     flat_image_sections(assert);
     section_image_views(assert);
     section_creation(assert);
