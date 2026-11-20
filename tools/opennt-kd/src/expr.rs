@@ -4,9 +4,10 @@
 //! - números: `0x1f`, `0xfffff800`40000000`, decimais (`42`, `0n42`) e
 //!   hexadecimal sem prefixo com letras (`fffff80040000000`) quando não é
 //!   um símbolo;
-//! - registradores `@rax`, `%rax` ou só `rax`; variáveis `$nome`;
-//!   símbolos (`ntfs!NtfsCommonCreate`, `kernel::ntos::ke::run_kernel_tasks`,
-//!   `create<u64>`, `<A as B>::f`);
+//! - registradores `@rax`, `%rax` ou só `rax` (`@gs_base`, `@fs_base`);
+//!   variáveis `$nome` (ou `@$nome`); símbolos (`ntfs!NtfsCommonCreate`,
+//!   `kernel::ntos::ke::run_kernel_tasks`, `create<u64>`, `<A as B>::f`) e
+//!   módulo mais RVA (`Windows.UI.Logon+0x48b50`);
 //! - memória: `poi(x)`, `by(x)`, `wo(x)`, `dwo(x)`, `qwo(x)`, `[x]`,
 //!   `byte[x]`, `word[x]`, `dword[x]`, `qword[x]`; `$iment(módulo)` (o
 //!   ponto de entrada), `sizeof(_IRP)`;
@@ -146,10 +147,17 @@ fn tokenize(text: &str) -> Result<Vec<Token>, String> {
             }
             continue;
         }
-        if (character == '@' || character == '%') && characters.get(index + 1).is_some_and(|next| next.is_ascii_alphabetic()) {
+        // `@$nome` (a forma do WinDbg para as pseudo-variáveis) é `$nome`.
+        if character == '@' && characters.get(index + 1) == Some(&'$') {
+            index += 1;
+            continue;
+        }
+        // Registradores: `@gs_base`, `%rax`. O `%` só no lugar de um operando
+        // (`a%b` é o resto da divisão).
+        if (character == '@' || (character == '%' && expects_operand)) && characters.get(index + 1).is_some_and(|next| next.is_ascii_alphabetic()) {
             let start = index + 1;
             index = start;
-            while index < characters.len() && characters[index].is_ascii_alphanumeric() {
+            while index < characters.len() && (characters[index].is_ascii_alphanumeric() || characters[index] == '_') {
                 index += 1;
             }
             tokens.push(Token::Register(characters[start..index].iter().collect::<String>().to_ascii_lowercase()));
@@ -164,8 +172,11 @@ fn tokenize(text: &str) -> Result<Vec<Token>, String> {
             tokens.push(Token::Variable(characters[start..index].iter().collect()));
             continue;
         }
-        // Nomes: identificadores do Rust e do C, `módulo!símbolo` (o módulo
-        // pode ter `.`), `<A as B>::f` no começo e genéricos `f<T>`.
+        // Nomes: identificadores do Rust e do C, `módulo!símbolo` e
+        // `módulo+RVA` (o módulo pode ter `.`: `Windows.UI.Logon+0x48b50`),
+        // `<A as B>::f` no começo e genéricos `f<T>`. Um nome solto nunca tem
+        // tipo, então `a.b` não é acesso a campo; depois de `->` ou `.` o
+        // nome com pontos é dividido em campos.
         let starts_qualified = character == '<' && expects_operand && generic_end(&characters, index).is_some_and(|end| characters.get(end + 1) == Some(&':') && characters.get(end + 2) == Some(&':'));
         if character.is_ascii_alphabetic() || character == '_' || character == '?' || starts_qualified {
             let start = index;
@@ -181,8 +192,9 @@ fn tokenize(text: &str) -> Result<Vec<Token>, String> {
                     index += 1;
                 }
                 match characters.get(index) {
-                    // `ksecdd.sys!Funcao`: o ponto antes de um `!`.
-                    Some('.') if characters[index + 1..].iter().take_while(|next| is_name_character(**next) || **next == '.').any(|next| *next == '!') => index += 1,
+                    // `ksecdd.sys!Funcao`, `Windows.UI.Logon+0x10`: o ponto
+                    // seguido de mais nome.
+                    Some('.') if characters.get(index + 1).is_some_and(|next| next.is_ascii_alphanumeric() || *next == '_') => index += 1,
                     Some('<') => match generic_end(&characters, index) {
                         Some(end) => index = end + 1,
                         None => break,
@@ -669,6 +681,61 @@ mod tests {
     }
 
     #[test]
+    fn every_register_name_is_one_token() {
+        // Todos os nomes que o cliente aceita (os de `registers::find`),
+        // com `@` e com `%`, inclusive os com `_` (FS_BASE e GS_BASE).
+        let layouts = crate::registers::GENERAL.iter().chain(crate::registers::EXTRA).chain(crate::registers::X87_CONTROL).chain(crate::registers::DEBUG).chain(std::iter::once(&crate::registers::MXCSR));
+        for layout in layouts {
+            for prefix in ["@", "%"] {
+                let text = format!("{prefix}{}", layout.name);
+                assert_eq!(tokenize(&text), Ok(vec![Token::Register(layout.name.to_string())]), "{text}");
+            }
+        }
+        assert_eq!(tokenize("@GS_BASE+0x188"), Ok(vec![Token::Register("gs_base".into()), Token::Operator("+"), Token::Number(0x188)]));
+        assert_eq!(tokenize("@rflags"), Ok(vec![Token::Register("rflags".into())]));
+    }
+
+    #[test]
+    fn underscored_registers() {
+        let mut environment = fake();
+        // O KPCR em 0x1000: CurrentThread (+0x188) = 0x1010; o processo
+        // (+0xb8 da thread) = 0x1000 - 0x5a8 + 8, onde mora 0xdeadbeef.
+        environment.registers.insert("gs_base".into(), 0x1000);
+        environment.registers.insert("fs_base".into(), 0x20);
+        environment.registers.insert("rip".into(), 0xfffff800_40001234);
+        let memory = &mut environment.memory[0].1;
+        memory.resize(0x200, 0);
+        memory[0x188..0x190].copy_from_slice(&0x1010u64.to_le_bytes());
+        memory[0x10 + 0xb8..0x10 + 0xc0].copy_from_slice(&(0x1008u64 - 0x5a8).to_le_bytes());
+        assert_eq!(number(&mut environment, "@gs_base"), Ok(0x1000));
+        assert_eq!(number(&mut environment, "%gs_base"), Ok(0x1000));
+        assert_eq!(number(&mut environment, "gs_base"), Ok(0x1000));
+        assert_eq!(number(&mut environment, "@GS_BASE+1"), Ok(0x1001));
+        assert_eq!(number(&mut environment, "@fs_base"), Ok(0x20));
+        assert_eq!(number(&mut environment, "@rip"), Ok(0xfffff800_40001234));
+        assert_eq!(number(&mut environment, "@rip-@gs_base"), Ok(0xfffff800_40000234));
+        // O `cur=` dos roteiros da tela preta.
+        assert_eq!(number(&mut environment, "dwo(poi(poi(@gs_base+0x188)+0xb8)+0x5a8)"), Ok(0xdeadbeef));
+        assert!(number(&mut environment, "@gs_basex").is_err());
+    }
+
+    #[test]
+    fn pseudo_variables_modulo_and_dotted_modules() {
+        let mut environment = fake();
+        environment.symbols.insert("Windows.UI.Logon".into(), 0x7ff8_1000_0000);
+        environment.symbols.insert("ntdll.dll".into(), 0x7ff8_2000_0000);
+        // `@$nome` é a variável `$nome`.
+        assert_eq!(number(&mut environment, "@$base+8"), Ok(0x1008));
+        // `%` depois de um operando é o resto, não um registrador.
+        assert_eq!(number(&mut environment, "7%rax"), Ok(2));
+        assert_eq!(number(&mut environment, "$base%rax"), Ok(0x1000 % 5));
+        // Módulo com pontos e RVA, sem `!`.
+        assert_eq!(number(&mut environment, "Windows.UI.Logon+0x48b50"), Ok(0x7ff8_1004_8b50));
+        assert_eq!(number(&mut environment, "ntdll.dll+0x10"), Ok(0x7ff8_2000_0010));
+        assert_eq!(tokenize("x."), Ok(vec![Token::Name("x".into()), Token::Operator(".")]));
+    }
+
+    #[test]
     fn typed_access() {
         let mut environment = fake();
         environment.types = Some(Arc::new(crate::types::tests::sample()));
@@ -681,6 +748,8 @@ mod tests {
         device[0x30..0x32].copy_from_slice(&4u16.to_le_bytes());
         assert_eq!(number(&mut environment, "((_DEVICE_OBJECT*)0x1010)->Type"), Ok(3));
         assert_eq!(number(&mut environment, "((nt!_DEVICE_OBJECT*)0x1010)->DriverObject->Type"), Ok(4));
+        // `DriverObject.Type` vem como um nome só e vira dois campos.
+        assert_eq!(number(&mut environment, "((_DEVICE_OBJECT*)0x1010)->DriverObject.Type"), Ok(4));
         assert_eq!(number(&mut environment, "(*(_DEVICE_OBJECT*)0x1010).Power"), Ok(1));
         assert_eq!(number(&mut environment, "&((_DEVICE_OBJECT*)0x1010)->Power"), Ok(0x1020));
         assert_eq!(number(&mut environment, "sizeof(_DEVICE_OBJECT)"), Ok(0x20));

@@ -5636,8 +5636,9 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     símbolo. `dt módulo!tipo endereço` usa o PDB do módulo. O PDB carrega na
     primeira expressão tipada.
   - Expressões (`expr.rs`): números (`0x`, `` ` ``, `0n`, hexadecimal sem
-    prefixo), registradores (`@rax`, `%rax`, `rax`), `$variáveis`,
-    símbolos do Rust e `módulo!símbolo`, `poi`/`by`/`wo`/`dwo`/`qwo`,
+    prefixo), registradores (`@rax`, `%rax`, `rax`, `@gs_base`),
+    `$variáveis` (ou `@$nome`), símbolos do Rust, `módulo!símbolo` e
+    `módulo+RVA` (`Windows.UI.Logon+0x48b50`), `poi`/`by`/`wo`/`dwo`/`qwo`,
     `[x]`, `$iment(módulo)`, `sizeof(tipo)`, os operadores do C e os acessos
     tipados (`((_IRP*)@rcx)->Tail.Overlay.CurrentStackLocation`, `*p`,
     `&s.Campo`, `p[2]`).
