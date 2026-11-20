@@ -863,7 +863,10 @@ impl Ntfs {
         let standard = find_attribute(&record, 0x10)?;
         let ea = find_attribute(&record, 0xD0)?.filter(|ea| !ea.non_resident);
         let directory = u16_at(&record, 22) & 2 != 0;
-        let file_attributes = standard.as_ref().map(|standard| u32_at(&standard.value, 32)).filter(|&value| value != 0).unwrap_or(if directory { 0x10 } else { 0x20 });
+        // O $STANDARD_INFORMATION de um diretório não guarda o
+        // FILE_ATTRIBUTE_DIRECTORY (o NTFS marca o diretório nas flags do
+        // registro): um diretório oculto tem só 0x02 ali e aparece como 0x12.
+        let file_attributes = standard.as_ref().map(|standard| u32_at(&standard.value, 32)).filter(|&value| value != 0).unwrap_or(if directory { 0x10 } else { 0x20 }) | if directory { 0x10 } else { 0 };
         let reparse_tag = if file_attributes & super::ntfs_reparse::FILE_ATTRIBUTE_REPARSE_POINT != 0 { self.reparse_value(&record)?.filter(|value| value.len() >= 4).map_or(0, |value| u32_at(&value, 0)) } else { 0 };
         Ok(Some(Stat {
             reference: entry.reference,

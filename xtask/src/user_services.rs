@@ -29,8 +29,8 @@
 //! portas de nome transitório
 //! (`Microsoft\SecurityManager\TransientObjects`),
 //! `Microsoft\Rpc\SecurityService`, os provedores de autenticação do RPC, e
-//! os valores de `Microsoft\Windows NT\CurrentVersion\WUDF` e da
-//! `ProfileList`, só com os perfis das contas de serviço).
+//! os valores de `Microsoft\Windows NT\CurrentVersion\WUDF`; a
+//! `ProfileList` vem de `user_profiles`).
 //! A SYSTEM leva ainda o `Control\Terminal Server` com as subchaves, que o
 //! lsm.dll exige ao subir. E a
 //! configuração das extensões do LSA (`Control\LsaExtensionConfig`: o
@@ -288,15 +288,6 @@ pub fn software_keys() -> Vec<HostKey> {
         // services.exe recusa a falta do DefaultHostProcessGUID, e o
         // SvcctrlMain sai antes do início automático.
         registry::copy(registry::LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\WUDF", "Microsoft\\Windows NT\\CurrentVersion\\WUDF", false, &mut keys);
-        // A lista de perfis: os diretórios (ProgramData, Public, Default e
-        // ProfilesDirectory), que o wininit lê para definir o %ProgramData% e
-        // as outras variáveis do sistema, e os perfis das contas de serviço
-        // (S-1-5-18, -19 e -20). Os perfis das contas de usuário desta
-        // máquina ficam de fora.
-        registry::copy(registry::LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList", "Microsoft\\Windows NT\\CurrentVersion\\ProfileList", false, &mut keys);
-        for account in ["S-1-5-18", "S-1-5-19", "S-1-5-20"] {
-            registry::copy(registry::LOCAL_MACHINE, &format!("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList\\{account}"), &format!("Microsoft\\Windows NT\\CurrentVersion\\ProfileList\\{account}"), true, &mut keys);
-        }
     }
     keys
 }

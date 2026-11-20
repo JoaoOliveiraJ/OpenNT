@@ -432,6 +432,10 @@ pub fn machine_hives(smss_boot: bool, setup_command: Option<&str>) -> Vec<(&'sta
         // Os serviços Win32 da cadeia do LSM (`user_services`).
         system.extend(crate::user_services::system_keys(&control_set).into_iter().map(seed_of));
         software.extend(crate::user_services::software_keys().into_iter().map(seed_of));
+        // A `ProfileList` e o serviço de perfis com o assinante do
+        // winlogon (`user_profiles`).
+        software.extend(crate::user_profiles::software_keys().into_iter().map(seed_of));
+        system.extend(crate::user_profiles::system_keys(&control_set).into_iter().map(seed_of));
         // As chaves que os serviços do início automático e o LSM leem
         // (`service_chain`).
         system.extend(crate::service_chain::system_keys(&control_set).into_iter().map(seed_of));

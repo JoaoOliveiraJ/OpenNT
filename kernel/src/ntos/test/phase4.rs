@@ -656,6 +656,24 @@ fn ntfs_reader(assert: Assert) {
     assert(matches!(volume.exists("/hello.txt"), Ok(true)) && matches!(volume.exists("/NADA.TXT"), Ok(false)) && volume.find("/../HELLO.TXT").is_err(), "ntfs: busca sem diferenca de caixa e caminho nao canonico recusado");
     assert(matches!(volume.read("/HELLO.TXT"), Ok(Some(text)) if text == "Ola do NTFS no OpenNT!\r\n") && matches!(volume.size("/HELLO.TXT"), Ok(24)) && matches!(volume.size("/NADA"), Ok(-1)), "ntfs: $DATA residente do HELLO.TXT");
     assert(volume.stat("/HELLO.TXT").is_ok_and(|stat| stat.is_some_and(|stat| stat.reference == 16 && !stat.directory && stat.size == 24 && stat.attributes == 0x20 && stat.sequence == 1)), "ntfs: stat do registro 16");
+    // Diretório oculto: o $STANDARD_INFORMATION só com 0x02 (o NTFS não
+    // guarda o FILE_ATTRIBUTE_DIRECTORY ali), numa escrita pendente sobre o
+    // registro do /Windows; o stat devolve 0x12.
+    let windows = volume.find("/Windows").ok().flatten().map(|entry| entry.reference);
+    let hidden = windows.and_then(|reference| {
+        let record = volume.read_record(reference).ok()?;
+        let standard = ntfs::find_attribute(&record, 0x10).ok().flatten()?;
+        let at = standard.record_offset + ntfs::u16_at(&record, standard.record_offset + 20) as usize + 32;
+        let lba = (geometry.mft_lcn * geometry.cluster_size + reference * geometry.record_size) / geometry.sector_size;
+        let count = geometry.record_size / geometry.sector_size;
+        let mut raw = volume.read_sectors(lba, count).ok()?;
+        raw[at..at + 4].copy_from_slice(&2u32.to_le_bytes());
+        volume.pending.lock().push(PendingWrite { lba, count, bytes: Some(raw) });
+        let stat = volume.stat("/Windows");
+        volume.pending.lock().clear();
+        stat.ok().flatten()
+    });
+    assert(hidden.is_some_and(|stat| stat.directory && stat.attributes == 0x12) && volume.stat("/Windows").is_ok_and(|stat| stat.is_some_and(|stat| stat.attributes == 0x10)), "ntfs: diretorio oculto com FILE_ATTRIBUTE_DIRECTORY");
     assert(matches!(volume.read_range("/HELLO.TXT", 4, 4), Ok(Some(bytes)) if bytes == b"do N") && matches!(volume.read_range("/HELLO.TXT", 100, 4), Ok(Some(bytes)) if bytes.is_empty()) && volume.file_layout("/HELLO.TXT").is_ok_and(|layout| layout.is_some_and(|layout| layout.runs.is_none())), "ntfs: faixa de arquivo residente");
     // Registros de sistema não residentes ($MFT e $Bitmap).
     let mft = volume.read_record(0).unwrap_or_default();

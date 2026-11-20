@@ -4059,7 +4059,9 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     pré-carrega, $MFTMirr, $LogFile de 2 MB com as páginas em
     0xFF — um log novo, que o LFS inicializa —, $Volume 3.1, $AttrDef com a
     tabela do ntfs.sys, $Bitmap, $Boot, $BadClus com o $Bad esparso,
-    $Secure com um descritor no $SDS e os índices $SDH/$SII, $UpCase pelo
+    $Secure com o descritor comum e os dos nós no $SDS (cada entrada
+    alinhada a 16 bytes, com a cópia no bloco seguinte) e os índices
+    $SDH/$SII, $UpCase pelo
     RtlUpcaseUnicodeChar, $Extend; 12..15 reservados), $Quota, $ObjId e
     $Reparse depois dos registros de usuário (o NTFS só aceita uma entrada de
     índice que aponte um registro abaixo de 16 na raiz), os índices $I30 nomeados e em B-tree quando não cabem no
@@ -4069,8 +4071,15 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     `nvme.img` (0xA344) vai em três bytes (44 A3 00); em dois seria um run
     de -23740 clusters e o NtfsCheckFileRecord recusaria o $BadClus
     (STATUS_FILE_CORRUPT_ERROR na montagem).
+    Os nós do volume (`ntfs_image::Node`) dão a um caminho atributos e
+    descritor de segurança próprios (um SecurityId por descritor
+    distinto, a partir de 0x101) e põem no volume diretórios vazios; o
+    $STANDARD_INFORMATION e o $FILE_NAME guardam os atributos sem o de
+    diretório, que o NTFS marca no registro (e no
+    DUP_FILE_NAME_INDEX_PRESENT).
     O leitor do kernel lê o mesmo volume; a listagem dele esconde os
-    registros abaixo de 16, como a enumeração do NTFS.
+    registros abaixo de 16, como a enumeração do NTFS, e o stat soma o
+    FILE_ATTRIBUTE_DIRECTORY aos atributos de um diretório.
   - O ntfs.sys importa o clfs.sys (pelo ext-ms-win-fs-clfs) e o clipsp.sys
     (pelo ext-ms-win-ntos-clipsp, que importa o fltmgr.sys): o carregador os
     resolve como dependências, do volume e validados pelo Code Integrity
@@ -4889,7 +4898,24 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   o `timezones.xml` de `\Windows\Globalization\Time Zone`
   (`LOGON_SCREEN_FOLDERS`) e as do bloco do usuário
   de `%ProgramData%\Microsoft\User Account Pictures`, sem os `.dat` das
-  contas desta máquina (`USER_ACCOUNT_PICTURES`), as
+  contas desta máquina (`USER_ACCOUNT_PICTURES`), os perfis de usuário
+  de uma instalação nova antes do primeiro logon
+  (`xtask/src/user_profiles.rs`: `\Users` com o `desktop.ini`, o
+  `Default` com a árvore de pastas, o `NTUSER.DAT`, o `.LOG1` e o
+  `.LOG2`, e o `Public` só com as pastas conhecidas, cada pasta e
+  arquivo com os atributos e o descritor desta máquina sem SID de
+  conta; o DACL do `Public\Desktop` vem da definição da pasta conhecida
+  e os filhos herdam de novo; nenhum perfil de conta nem arquivo com o
+  SID, o caminho ou o nome de uma conta daqui, o nome do computador ou
+  um endereço MAC dos adaptadores; as junções do perfil ficam
+  listadas em `juncoes.txt` do build até o volume levar pontos de
+  reanálise), a `ProfileList` com os diretórios de uma instalação nova,
+  as definições das pastas conhecidas (`Explorer\FolderDescriptions`),
+  o serviço de perfis (ProfSvc no `svchost -k netsvcs`, só com a conta
+  LocalSystem, com o profsvc.dll e o profsvcext.dll no volume; o
+  assinante `Profiles` vem com a chave `Control\Winlogon\Notifications`
+  inteira; as chaves copiadas daqui perdem os SIDs de conta dos
+  descritores, e um valor com SID de conta fica fora), as
   fontes de `\SystemRoot\Fonts` com o GRE_Initialize, o FontSubstitutes, o
   FontLink e a chave Fonts, e na SYSTEM o `Control\IDConfigDB` e os perfis
   de `Hardware Profiles` (o `LogPixels` do DPI, `xtask/src/fonts.rs`), o

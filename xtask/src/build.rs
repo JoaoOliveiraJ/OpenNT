@@ -431,11 +431,26 @@ pub fn build(options: &BuildOptions) -> Result<BuildOutput, String> {
     for (name, image) in crate::hive_image::machine_hives(options.initial_process == "smss", setup_command.as_deref()) {
         ntfs_files.push((format!("Windows/System32/config/{name}"), image));
     }
+    // No boot do smss, os perfis de usuário de uma instalação nova
+    // (`user_profiles`): `\Users`, o perfil padrão e o público, com os
+    // atributos e os descritores de cada pasta e arquivo. As junções do
+    // perfil ficam listadas em `juncoes.txt` até o volume levar pontos de
+    // reanálise.
+    let mut nodes = Vec::new();
+    if options.initial_process == "smss" {
+        let profiles = crate::user_profiles::stage();
+        let folders = profiles.nodes.iter().filter(|node| node.directory).count();
+        println!("perfis de usuario no volume NTFS: {folders} pastas e {} arquivos; juncoes pendentes: {} (juncoes.txt)", profiles.files.len(), profiles.junctions.len());
+        let report = build_dir.join("juncoes.txt");
+        fs::write(&report, crate::user_profiles::junction_report(&profiles.junctions)).map_err(|error| format!("{}: {error}", report.display()))?;
+        ntfs_files.extend(profiles.files);
+        nodes = profiles.nodes;
+    }
     // O boot do smss cria o arquivo de paginação do `PagingFiles` (192 MB a
     // 256 MB em D:): o volume dele tem espaço livre para o arquivo crescer
     // até o máximo.
     let free_space_mib = if options.initial_process == "smss" { SMSS_FREE_SPACE_MIB } else { 32 };
-    let ntfs_bytes = crate::ntfs_image::build(&ntfs_path, &ntfs_files, free_space_mib, 256)?;
+    let ntfs_bytes = crate::ntfs_image::build(&ntfs_path, &ntfs_files, &nodes, free_space_mib, 256)?;
     // O disco do controlador NVMe do QEMU, particionado, com um volume NTFS
     // próprio: montado em todo build (a opção de carga `--storage=nvme`
     // não muda as imagens), ligado só às máquinas com a opção.

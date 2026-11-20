@@ -78,6 +78,7 @@ mod screen_check;
 mod service_chain;
 mod side_by_side;
 mod theme;
+mod user_profiles;
 mod user_services;
 mod window_manager;
 mod windows_binaries;
