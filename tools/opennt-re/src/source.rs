@@ -79,7 +79,7 @@ impl LineTable {
         if let Some(lines) = self.files.get(path) {
             return Some(Arc::clone(lines));
         }
-        let text = std::fs::read_to_string(path).ok()?;
+        let text = std::fs::read_to_string(path).ok().or_else(|| read_beside_elf(&self.path, path))?;
         let lines = Arc::new(text.lines().map(|line| line.replace('\t', "    ")).collect::<Vec<_>>());
         self.files.insert(path.to_string(), Arc::clone(&lines));
         Some(lines)
@@ -193,6 +193,17 @@ impl LineTable {
         }
         Ok(locals)
     }
+}
+
+/// Um caminho relativo do DWARF (o kernel e o stage2 saem com a pasta do
+/// workspace trocada por `.`, o trim-paths do Cargo.toml) lido a partir das
+/// pastas acima do ELF, a primeira que tiver o arquivo.
+fn read_beside_elf(elf: &Path, path: &str) -> Option<String> {
+    let relative = Path::new(path);
+    if relative.is_absolute() {
+        return None;
+    }
+    elf.ancestors().skip(1).find_map(|folder| std::fs::read_to_string(folder.join(relative)).ok())
 }
 
 fn format_value(value: u64, size: u64) -> String {

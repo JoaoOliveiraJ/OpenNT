@@ -29,6 +29,16 @@ opt-level = 1
 # rápido e ocupa menos disco.
 [profile.dev.package.kernel]
 debug = "line-tables-only"
+# O kernel e o stage2 vão para a imagem do convidado: os caminhos absolutos
+# desta máquina (o código-fonte da biblioteca padrão no rustup, a pasta do
+# workspace e a de build) não entram neles. O file!(), o local de cada pânico
+# e o DWARF ficam com /rustc/<commit>, caminhos relativos ao workspace e
+# /cargo/build-dir (o trim-paths "object"); os depuradores procuram um
+# arquivo relativo a partir das pastas do ELF.
+trim-paths = "object"
+
+[profile.dev.package.boot]
+trim-paths = "object"
 
 # `cargo xtask debug` (e os depuradores gráficos, que o chamam): o DWARF
 # completo, com os tipos e as variáveis locais que eles mostram.
@@ -37,8 +47,18 @@ inherits = "dev"
 
 [profile.depuracao.package.kernel]
 debug = "full"
+trim-paths = "object"
+
+[profile.depuracao.package.boot]
+trim-paths = "object"
 
 [profile.release]
 panic = "abort"
 opt-level = 2
 debug = true
+
+[profile.release.package.kernel]
+trim-paths = "object"
+
+[profile.release.package.boot]
+trim-paths = "object"
