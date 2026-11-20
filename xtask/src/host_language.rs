@@ -14,7 +14,9 @@
 //!   `Versions`), `Normalization` (o arquivo de cada forma, que o
 //!   NtGetNlsSectionPtr lê) e `Calendars`; `Control\MUI\UILanguages` (os
 //!   idiomas de interface instalados, que a ntdll consulta ao procurar um
-//!   `.mui`), `Control\Keyboard Layouts` (os layouts de teclado instalados,
+//!   `.mui`), `Control\MUI\StringCacheSettings` (a geração do cache de
+//!   cadeias MUI que a KernelBase lê antes de resolver uma cadeia indireta),
+//!   `Control\Keyboard Layouts` (os layouts de teclado instalados,
 //!   com o `Layout File` de cada um) e `Control\Keyboard Layout`;
 //! - na DEFAULT (`\Registry\User\.DEFAULT`), `Control Panel\International`,
 //!   `Control Panel\Desktop\MuiCached` (a localidade e os idiomas de
@@ -385,6 +387,13 @@ pub fn system_keys(control_set: &str) -> Vec<HostKey> {
         registry::copy(registry::LOCAL_MACHINE, &format!("{control}\\Nls"), &nls, true, &mut keys);
         clean_install_nls(&mut keys[first..], &nls);
         registry::copy(registry::LOCAL_MACHINE, &format!("{control}\\MUI\\UILanguages"), &format!("{control_set}\\Control\\MUI\\UILanguages"), true, &mut keys);
+        // O StringCacheGeneration (REG_DWORD): o LoadStringByReference da
+        // KernelBase o lê antes de resolver toda cadeia indireta
+        // ("@arquivo,-id") que não é do shell32.dll, para achar o cache de
+        // cadeias MUI do usuário (`Local Settings\MuiCache\<geração>`); sem
+        // a chave a resolução falha, e o explorer mostra o nome padrão do
+        // Registro no lugar do traduzido (o "This PC" do Este Computador).
+        registry::copy(registry::LOCAL_MACHINE, &format!("{control}\\MUI\\StringCacheSettings"), &format!("{control_set}\\Control\\MUI\\StringCacheSettings"), false, &mut keys);
         registry::copy(registry::LOCAL_MACHINE, &format!("{control}\\Keyboard Layouts"), &format!("{control_set}\\Control\\Keyboard Layouts"), true, &mut keys);
         registry::copy(registry::LOCAL_MACHINE, &format!("{control}\\Keyboard Layout"), &format!("{control_set}\\Control\\Keyboard Layout"), true, &mut keys);
     }
@@ -548,6 +557,21 @@ mod tests {
         let language = nls_key(&keys, "Language").expect("Nls\\Language nao copiada");
         let lcid = |text: Option<String>| text.and_then(|text| u32::from_str_radix(text.trim(), 16).ok());
         assert_eq!(lcid(text_value(language, "Default")), lcid(text_value(language, "InstallLanguage")), "Language\\Default diferente do idioma da instalacao");
+    }
+
+    /// O `Control\MUI\StringCacheSettings` vai com o StringCacheGeneration
+    /// (REG_DWORD, 4 bytes), o valor que a KernelBase exige para resolver as
+    /// cadeias indiretas fora do shell32.
+    #[test]
+    fn mui_string_cache_generation_is_copied() {
+        let keys = system_keys("ControlSet001");
+        let host = registry::list(registry::LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Control\\MUI");
+        if !host.iter().any(|name| name.eq_ignore_ascii_case("StringCacheSettings")) {
+            return;
+        }
+        let key = keys.iter().find(|key| key.path.eq_ignore_ascii_case("ControlSet001\\Control\\MUI\\StringCacheSettings")).expect("StringCacheSettings nao copiada");
+        let generation = key.values.iter().find(|(name, _, _)| name.eq_ignore_ascii_case("StringCacheGeneration"));
+        assert!(generation.is_some_and(|(_, kind, data)| *kind == 4 && data.len() == 4), "StringCacheGeneration ausente ou fora de REG_DWORD");
     }
 
     /// Os layouts pré-carregados desta máquina resolvem para arquivos de
