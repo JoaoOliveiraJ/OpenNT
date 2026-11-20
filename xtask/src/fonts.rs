@@ -78,6 +78,13 @@ const FONTS: &[&str] = &[
     "consolai.ttf",
     "consolaz.ttf",
     "lucon.ttf",
+    // As fontes raster do console da página de código OEM (os valores de
+    // `Console\RasterFonts`, que vai inteiro; 850 no pt-BR, como o vga850.fon).
+    "app850.fon",
+    "cga40850.fon",
+    "cga80850.fon",
+    "ega40850.fon",
+    "ega80850.fon",
 ];
 
 /// As fontes: (caminho no volume, arquivo de origem).

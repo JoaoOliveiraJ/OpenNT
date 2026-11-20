@@ -315,6 +315,8 @@ const SMSS_PROGRAMS: &[&str] = &[
     "kernel32.dll",
     "kernelbase.dll",
     "user32.dll",
+    // AlphaBlend, carga atrasada do user32.
+    "msimg32.dll",
     "win32u.dll",
     "gdi32.dll",
     "gdi32full.dll",
@@ -572,6 +574,10 @@ const LOGON_SCREEN_PROGRAMS: &[&str] = &[
     "DWrite.dll",
     "TextShaping.dll",
     "WindowsCodecs.dll",
+    // A política de metadados do WIC (o CMetadataQueryReaderWriter::
+    // EnsurePolicyComponent do WindowsCodecs.dll): a orientação da imagem
+    // da tela de bloqueio e do papel de parede.
+    "PhotoMetadataHandler.dll",
     "rometadata.dll",
     // O que a thread de eventos do DWM cria no
     // CDesktopManager::InitializeComObjects do uDWM.dll, cuja falha encerra
@@ -614,6 +620,11 @@ const LOGON_SCREEN_PROGRAMS: &[&str] = &[
     "propsys.dll",
     "Bcp47Langs.dll",
     "WinLangdb.dll",
+    // Os nomes de localidade traduzidos do GetStringTableEntry do
+    // KernelBase e o input.dll, carga atrasada do winlangdb que o MSCTF
+    // carrega (o caminho do idioma e da troca de entrada do LogonUI).
+    "winnlsres.dll",
+    "input.dll",
     "MSCTF.dll",
     "credui.dll",
     "uxinit.dll",
@@ -740,6 +751,9 @@ const LOGON_SCREEN_PROGRAMS: &[&str] = &[
     "bcp47mrm.dll",
     "twinapi.appcore.dll",
     "MrmCoreR.dll",
+    // ext-ms-win-resources-languageoverlay: o OpenOverlayPaths do MrmCoreR em
+    // todo início do LogonUI, o winbrand e o explorer no primeiro logon.
+    "LanguageOverlayUtil.dll",
     "XmlLite.dll",
     // O ICU que o Windows.Globalization.dll carrega na primeira Calendar (a
     // do relógio da tela de bloqueio, no
@@ -851,6 +865,20 @@ const LOGON_SCREEN_FOLDERS: &[(&str, &str)] = &[
 /// usa para o "Outro usuário" e as contas sem imagem própria; os
 /// `<conta>.dat` das contas desta máquina ficam de fora.
 const USER_ACCOUNT_PICTURES: &[&str] = &["user.png", "user-32.png", "user-40.png", "user-48.png", "user-192.png", "user.bmp", "guest.png", "guest.bmp"];
+
+/// Os cursores do esquema padrão que o `Control Panel\Cursors` da hive
+/// Default nomeia (`%SystemRoot%\cursors`), que o
+/// UpdatePerUserSystemParameters do logon carrega; sem eles o win32k fica
+/// com os cursores embutidos do user32.
+const DEFAULT_CURSORS: &[&str] = &["aero_arrow.cur", "aero_helpsel.cur", "aero_link.cur", "aero_unavail.cur", "aero_pen.cur", "aero_move.cur", "aero_nesw.cur", "aero_ns.cur", "aero_nwse.cur", "aero_ew.cur", "aero_up.cur", "aero_busy.ani", "aero_working.ani"];
+
+/// A animação do primeiro logon de `System32\oobe`: o LaunchFirstLogonAnimationProcess
+/// do logoncontroller (0x8f7c8) cria o `oobe\FirstLogonAnim.exe
+/// /RunFirstLogonAnim` no primeiro logon de uma conta, que carrega o
+/// msoobeFirstLogonAnim.dll e a página FirstLogonAnim.html. (caminho no
+/// volume, origem relativa ao diretório do Windows); o `.mui` do idioma vem
+/// de `oobe\<idioma>`.
+const FIRST_LOGON_ANIMATION: &[&str] = &["FirstLogonAnim.exe", "msoobeFirstLogonAnim.dll", "FirstLogonAnim.html"];
 
 /// O papel de parede padrão do perfil Default: o `Control Panel\Desktop`
 /// da hive Default nomeia o `C:\Windows\Web\Wallpaper\Windows\img0.jpg`
@@ -1337,6 +1365,35 @@ pub fn ntfs_files(root: &Path, kernel_pe: &[u8], initial_process: &str) -> Resul
             }
         }
         println!("papel de parede padrao no volume NTFS: {wallpapers} imagens");
+        // Os cursores do esquema padrão (`DEFAULT_CURSORS`) e a animação do
+        // primeiro logon (`FIRST_LOGON_ANIMATION`), com os `.mui` dela.
+        let mut session = 0;
+        for name in DEFAULT_CURSORS {
+            let source = windows.join("Cursors").join(name);
+            if let Ok(bytes) = fs::read(&source) {
+                files.push(Staged::copied(format!("Cursors/{name}"), bytes, &source));
+                session += 1;
+            }
+        }
+        let oobe = windows.join("System32/oobe");
+        for name in FIRST_LOGON_ANIMATION {
+            let source = oobe.join(name);
+            match fs::read(&source) {
+                Ok(bytes) => {
+                    files.push(Staged::copied(format!("oobe/{name}"), bytes, &source));
+                    session += 1;
+                }
+                Err(_) => println!("AVISO: {} ausente no Windows desta maquina", source.display()),
+            }
+            for language in &languages {
+                let source = oobe.join(language).join(format!("{name}.mui"));
+                if let Ok(bytes) = fs::read(&source) {
+                    files.push(Staged::copied(format!("oobe/{language}/{name}.mui"), bytes, &source));
+                    session += 1;
+                }
+            }
+        }
+        println!("cursores e animacao do primeiro logon no volume NTFS: {session}");
     }
     files.push(Staged::generated(String::from("NTOSKRNL.EXE"), kernel_pe.to_vec()));
     files.push(Staged::generated(String::from("Windows/System32/ntoskrnl.exe"), kernel_pe.to_vec()));
