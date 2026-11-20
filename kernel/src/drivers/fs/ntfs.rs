@@ -121,10 +121,14 @@ pub struct SectorRun {
     pub sectors: u64,
 }
 
-/// Tamanho real e runs (`None` = residente).
+/// Tamanho real, ValidDataLength e runs (`None` = residente).
 #[derive(Clone, Debug)]
 pub struct Layout {
     pub size: u64,
+    /// O tamanho inicializado do $DATA (o ValidDataLength): entre ele e o
+    /// tamanho real a leitura dá zeros, como no NTFS, que não grava zeros
+    /// nos clusters que aloca.
+    pub valid: u64,
     pub runs: Option<Vec<SectorRun>>,
 }
 
@@ -338,7 +342,7 @@ impl super::volume::FileSystem for Ntfs {
     }
 
     fn paging_read(&self, path: &str, offset: u64, physical: u64) -> Option<Result<(), KernelError>> {
-        Some(Ntfs::copy_range_to_physical(self, path, offset, physical, 0x1000))
+        Some(Ntfs::paging_copy_to_physical(self, path, offset, physical, 0x1000))
     }
 
     fn paging_write(&self, path: &str, offset: u64, bytes: &[u8]) -> Option<Result<(), KernelError>> {
@@ -577,19 +581,22 @@ impl Ntfs {
             return Ok(data.value);
         }
         let runs = parse_runs(record, data.run_offset)?;
+        // Acima do tamanho inicializado, zeros (sem ler os clusters).
+        let valid = data.initialized_size.min(data.real_size);
         let mut out = Vec::with_capacity(data.real_size as usize);
         for run in runs {
-            if out.len() as u64 >= data.real_size {
+            if out.len() as u64 >= valid {
                 break;
             }
             let spc = self.geometry.sectors_per_cluster;
             let chunk = self.read_sectors(run.lcn as u64 * spc, run.count * spc)?;
-            let take = chunk.len().min(data.real_size as usize - out.len());
+            let take = chunk.len().min(valid as usize - out.len());
             out.extend_from_slice(&chunk[..take]);
         }
-        if (out.len() as u64) < data.real_size {
+        if (out.len() as u64) < valid {
             return Err(error("NTFS: runlist menor que atributo"));
         }
+        out.resize(data.real_size as usize, 0);
         Ok(out)
     }
 
@@ -745,9 +752,11 @@ impl Ntfs {
             let end = (offset.saturating_add(length) as usize).min(attribute.value.len());
             return Ok(attribute.value[start..end].to_vec());
         }
-        let length = length.min(attribute.real_size.saturating_sub(offset));
+        let total = length.min(attribute.real_size.saturating_sub(offset));
+        // Acima do tamanho inicializado, zeros.
+        let length = total.min(attribute.initialized_size.min(attribute.real_size).saturating_sub(offset));
         let (cluster, sector) = (self.geometry.cluster_size, self.geometry.sector_size);
-        let mut out = Vec::with_capacity(length as usize);
+        let mut out = Vec::with_capacity(total as usize);
         let mut base = 0u64;
         for run in parse_runs(record, attribute.run_offset)? {
             if out.len() as u64 >= length {
@@ -769,6 +778,7 @@ impl Ntfs {
         if (out.len() as u64) < length {
             return Err(error("NTFS: runlist menor que atributo"));
         }
+        out.resize(total as usize, 0);
         Ok(out)
     }
 
@@ -904,10 +914,10 @@ impl Ntfs {
         let record = self.read_record(entry.reference)?;
         let layout = match find_attribute(&record, 0x80)? {
             None => None,
-            Some(data) if !data.non_resident => Some(Layout { size: data.value.len() as u64, runs: None }),
+            Some(data) if !data.non_resident => Some(Layout { size: data.value.len() as u64, valid: data.value.len() as u64, runs: None }),
             Some(data) => {
                 let spc = self.geometry.sectors_per_cluster;
-                Some(Layout { size: data.real_size, runs: Some(parse_runs(&record, data.run_offset)?.iter().map(|run| SectorRun { lba: run.lcn as u64 * spc, sectors: run.count * spc }).collect()) })
+                Some(Layout { size: data.real_size, valid: data.initialized_size.min(data.real_size), runs: Some(parse_runs(&record, data.run_offset)?.iter().map(|run| SectorRun { lba: run.lcn as u64 * spc, sectors: run.count * spc }).collect()) })
             }
         };
         self.caches.lock().layouts.insert(key, layout.clone());
@@ -928,7 +938,10 @@ impl Ntfs {
             let value = find_attribute(&record, 0x80)?.map(|data| data.value).unwrap_or_default();
             return Ok(Some(value[offset as usize..(offset + length) as usize].to_vec()));
         };
-        let mut out = Vec::with_capacity(length as usize);
+        // Acima do ValidDataLength, zeros (sem ler os clusters).
+        let total = length;
+        let length = total.min(layout.valid.saturating_sub(offset));
+        let mut out = Vec::with_capacity(total as usize);
         let mut file_sector_base = 0u64;
         for run in runs {
             let run_start = file_sector_base * 512;
@@ -956,12 +969,25 @@ impl Ntfs {
             }
             file_sector_base += run.sectors;
         }
+        out.resize(total as usize, 0);
         Ok(Some(out))
     }
 
     /// Copia `[offset, offset+length)` do $DATA direto para a memória física:
-    /// o miolo alinhado vai por DMA de bus master e os cantos por um setor.
+    /// o miolo alinhado vai por DMA de bus master e os cantos por um setor;
+    /// acima do ValidDataLength, zeros.
     pub fn copy_range_to_physical(&self, path: &str, offset: u64, destination: u64, length: u64) -> Result<(), KernelError> {
+        self.copy_range_to_physical_with(path, offset, destination, length, false)
+    }
+
+    /// [`Ntfs::copy_range_to_physical`] da E/S de paginação do arquivo de
+    /// paginação: os clusters crus, sem o ValidDataLength (o MiCreatePagingFile
+    /// do 19041 só põe o EndOfFile, e o Mm só lê o que gravou).
+    pub fn paging_copy_to_physical(&self, path: &str, offset: u64, destination: u64, length: u64) -> Result<(), KernelError> {
+        self.copy_range_to_physical_with(path, offset, destination, length, true)
+    }
+
+    fn copy_range_to_physical_with(&self, path: &str, offset: u64, destination: u64, length: u64, raw: bool) -> Result<(), KernelError> {
         let _shared = self.resource().acquire_shared();
         let layout = self.file_layout(path)?.filter(|layout| offset + length <= layout.size).ok_or_else(|| error("NTFS: faixa de copia invalida"))?;
         let Some(runs) = layout.runs else {
@@ -969,7 +995,8 @@ impl Ntfs {
             physical::write_bytes(destination, &bytes);
             return Ok(());
         };
-        let (mut cursor, mut target, mut remaining, mut run_start) = (offset, destination, length, 0u64);
+        let readable = if raw { length } else { length.min(layout.valid.saturating_sub(offset)) };
+        let (mut cursor, mut target, mut remaining, mut run_start) = (offset, destination, readable, 0u64);
         for run in runs {
             let run_end = run_start + run.sectors * 512;
             if cursor >= run_end {
@@ -996,12 +1023,15 @@ impl Ntfs {
                 remaining -= take;
             }
             if remaining == 0 {
-                return Ok(());
+                break;
             }
             run_start = run_end;
         }
         if remaining != 0 {
             return Err(error("NTFS: runlist menor que o tamanho do arquivo"));
+        }
+        if readable < length {
+            physical::zero(destination + readable, (length - readable) as usize);
         }
         Ok(())
     }

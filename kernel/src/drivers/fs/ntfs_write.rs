@@ -260,6 +260,12 @@ impl Tx<'_> {
     }
 
     fn nonresident(&self, attribute_type: u32, runs: &[Run], size: u64, name: &str) -> Vec<u8> {
+        self.nonresident_valid(attribute_type, runs, size, size, name)
+    }
+
+    /// O atributo não residente com o tamanho inicializado (o
+    /// ValidDataLength, +56) `valid`.
+    fn nonresident_valid(&self, attribute_type: u32, runs: &[Run], size: u64, valid: u64, name: &str) -> Vec<u8> {
         let name_bytes = wide(name);
         let run_offset = align(64 + name_bytes.len());
         let runlist = encode_runs(runs);
@@ -278,7 +284,7 @@ impl Tx<'_> {
         put16(&mut attribute, 32, run_offset as u64);
         put64(&mut attribute, 40, allocated);
         put64(&mut attribute, 48, size);
-        put64(&mut attribute, 56, size);
+        put64(&mut attribute, 56, valid.min(size));
         attribute[run_offset..run_offset + runlist.len()].copy_from_slice(&runlist);
         attribute
     }
@@ -1064,6 +1070,7 @@ impl Tx<'_> {
         }
         let data = find_attribute(&record, 0x80)?.ok_or_else(|| KernelError::with_status("NTFS: arquivo sem $DATA", 0xC000_0032))?;
         let old_size = if data.non_resident { data.real_size } else { data.value.len() as u64 };
+        let old_valid = if data.non_resident { data.initialized_size.min(old_size) } else { old_size };
         let write_end = offset + bytes.map_or(0, |bytes| bytes.len() as u64);
         let size = match (reservation, new_size) {
             (Some(reservation), _) => old_size.min(reservation),
@@ -1096,8 +1103,9 @@ impl Tx<'_> {
             let need = reserve.div_ceil(cluster);
             let have: u64 = runs.iter().map(|run| run.count).sum();
             if need > have {
+                // Como o NTFS: os clusters novos não recebem zeros; o que fica
+                // acima do ValidDataLength lê zeros.
                 let extra = self.allocate(need - have)?;
-                self.transfer(&extra, 0, None, (need - have) * cluster)?;
                 runs.extend(extra);
                 runs = merge_runs(&runs);
             } else if need < have {
@@ -1118,20 +1126,23 @@ impl Tx<'_> {
                 runs = kept;
             }
             allocated = need * cluster;
+            // O ValidDataLength: a extensão (SetEndOfFile, AllocationSize) não
+            // o muda; uma escrita acima dele zera só o vão até ela e o leva
+            // ao fim dela; o corte o traz ao tamanho novo.
+            let mut valid = old_valid.min(size);
             if !data.non_resident && old_size != 0 {
                 let keep = data.value.len().min(size as usize);
                 self.transfer(&runs, 0, Some(&data.value[..keep]), keep as u64)?;
-            }
-            if size > old_size {
-                self.transfer(&runs, old_size, None, size - old_size)?;
+                valid = keep as u64;
             }
             if let Some(bytes) = bytes.filter(|bytes| !bytes.is_empty()) {
+                if offset > valid {
+                    self.transfer(&runs, valid, None, offset - valid)?;
+                }
                 self.transfer(&runs, offset, Some(bytes), bytes.len() as u64)?;
+                valid = valid.max(offset + bytes.len() as u64).min(size);
             }
-            if allocated > size {
-                self.transfer(&runs, size, None, allocated - size)?;
-            }
-            let attribute = if allocated != 0 { self.nonresident(0x80, &runs, size, "") } else { resident(0x80, &[], "") };
+            let attribute = if allocated != 0 { self.nonresident_valid(0x80, &runs, size, valid, "") } else { resident(0x80, &[], "") };
             replace(&mut list, 0x80, Some(attribute));
         }
         if size != old_size || bytes.is_some_and(|bytes| !bytes.is_empty()) {

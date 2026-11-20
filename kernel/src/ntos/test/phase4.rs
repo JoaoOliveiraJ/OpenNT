@@ -745,6 +745,30 @@ fn ntfs_writer(assert: Assert) {
     let remounted = ntfs::mount(1);
     assert(remounted.as_ref().is_ok_and(|fresh| matches!(fresh.read_bytes("/NOVO.TXT"), Ok(Some(bytes)) if bytes == pattern)), "ntfswrite: dados persistidos no disco");
     assert(matches!(volume.resize("/NOVO.TXT", 100), Ok(100)) && matches!(volume.read_bytes("/NOVO.TXT"), Ok(Some(bytes)) if bytes[..] == pattern[..100]) && volume.space().is_ok_and(|space| space.free_clusters == created_free - 1), "ntfswrite: reducao libera clusters");
+    // O ValidDataLength (o tamanho inicializado, +56 do $DATA): como o NTFS,
+    // a extensão não grava zeros nos clusters que aloca (os da redução acima
+    // ainda têm o padrão) e a leitura acima dele dá zeros; uma escrita acima
+    // dele zera só o vão e o leva ao fim dela.
+    let initialized = |volume: &ntfs::Ntfs| {
+        volume.find("/NOVO.TXT").ok().flatten().and_then(|entry| volume.read_record(entry.reference).ok()).and_then(|record| ntfs::find_attribute(&record, 0x80).ok().flatten()).map(|data| (data.real_size, data.initialized_size))
+    };
+    let extended = matches!(volume.resize("/NOVO.TXT", 20_000), Ok(20_000));
+    let read = volume.read_bytes("/NOVO.TXT").ok().flatten();
+    assert(
+        extended && initialized(&volume) == Some((20_000, 100)) && read.as_ref().is_some_and(|bytes| bytes.len() == 20_000 && bytes[..100] == pattern[..100] && bytes[100..].iter().all(|&byte| byte == 0)),
+        "ntfswrite: a extensao deixa o ValidDataLength no fim dos dados e a leitura acima dele da zeros",
+    );
+    let written = matches!(volume.write("/NOVO.TXT", 10_000, b"xyz"), Ok(3));
+    let fresh = ntfs::mount(1);
+    let reread = fresh.as_ref().ok().and_then(|fresh| fresh.read_bytes("/NOVO.TXT").ok().flatten());
+    let tail = fresh.as_ref().ok().and_then(|fresh| fresh.read_range("/NOVO.TXT", 15_000, 64).ok().flatten());
+    assert(
+        written
+            && fresh.as_ref().is_ok_and(|fresh| initialized(fresh) == Some((20_000, 10_003)))
+            && reread.as_ref().is_some_and(|bytes| bytes.len() == 20_000 && bytes[..100] == pattern[..100] && bytes[100..10_000].iter().all(|&byte| byte == 0) && &bytes[10_000..10_003] == b"xyz" && bytes[10_003..].iter().all(|&byte| byte == 0))
+            && tail.is_some_and(|bytes| bytes == alloc::vec![0u8; 64]),
+        "ntfswrite: a escrita acima do ValidDataLength zera so o vao e o leva ao fim dela (depois de remontar)",
+    );
     // Renomeação, diretórios e EAs.
     assert(volume.rename("/NOVO.TXT", "/RENOMEADO.TXT", false).is_ok() && matches!(volume.exists("/RENOMEADO.TXT"), Ok(true)) && matches!(volume.exists("/NOVO.TXT"), Ok(false)), "ntfswrite: renomeacao");
     assert(volume.create("/DIR", true, 0, 0).is_ok_and(|stat| stat.is_some_and(|stat| stat.directory)) && volume.create("/DIR/A.TXT", false, 0, 0).is_ok() && names(&volume, "/DIR") == alloc::vec![String::from("/DIR/A.TXT")], "ntfswrite: diretorio com filho");
