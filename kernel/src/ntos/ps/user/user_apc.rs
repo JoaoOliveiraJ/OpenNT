@@ -307,6 +307,9 @@ impl FrameLayout {
 /// copiada em bloco para a pilha de usuário; o CONTEXT salvo passa a
 /// retomar no despachante.
 fn build_frame(live: &Context, layout: &FrameLayout, apc: &UserApc, dispatcher: u64, thread: u64) -> Result<(), KernelError> {
+    // Um passo do depurador armado no CONTEXT acaba antes da cópia: o TF
+    // dele não vai para o CONTEXT da pilha de usuário.
+    crate::ntos::kd::user_debug::context_redirected(live);
     let (frame, rsp) = (layout.frame, live.rsp.get());
     let total = rsp - frame;
     let scratch = guest::alloc_aligned(total, 16, true);

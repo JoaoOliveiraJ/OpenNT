@@ -7,8 +7,12 @@
 # breakpoint por um passo da thread (o byte original por uma instrução, o
 # TF e o 0xCC de volta no #DB). O #DB desse passo é do depurador: não pode
 # chegar ao processo como STATUS_SINGLE_STEP (0x80000004), nem quando outra
-# thread sai de um breakpoint antes de ele chegar. O csrss.exe segue vivo
-# depois dos acertos e o boot chega ao fim do roteiro do smss.
+# thread sai de um breakpoint antes de ele chegar, nem quando o host pede um
+# passo (s) numa parada de usuário e continua depois. O csrss.exe segue vivo
+# depois dos acertos e o boot chega ao fim do roteiro do smss. No fim, a
+# pilha de cada thread do csrss.exe em espera chega ao RtlUserThreadStart,
+# também a das threads sem serviço suspenso (uma espera adiada), lida do
+# CONTEXT do anel 3 delas.
 
 attach
 expect-stop SIGINT
@@ -16,6 +20,16 @@ expect-stop SIGINT
 # Adiado, só no csrss.exe, com log, desligado depois de 200 acertos.
 bu /p csrss.exe ntdll!RtlAllocateHeap /log "heap tamanho {@r8:d}" /max 200
 expect modelo
+# Outro adiado no csrss.exe que para uma vez: um passo da thread nessa
+# parada e o continuar depois dele.
+bu /p csrss.exe ntdll!RtlFreeHeap /max 1
+expect modelo
+continue
+wait-stop 600000
+expect-stop RtlFreeHeap
+s
+expect-stop SIGTRAP
+expect-stop RtlFreeHeap+
 continue
 wait-serial /t 600000 SMSS_CSRSS_OK
 break
@@ -29,6 +43,22 @@ ps
 expect csrss.exe
 if serial-has "first chance 0x80000004" {
     fail o passo do depurador chegou ao processo como STATUS_SINGLE_STEP
+}
+
+# A pilha das threads do csrss.exe em espera: a de uma espera adiada sai do
+# CONTEXT do anel 3 (sem quadro de troca), a de um serviço bloqueado do
+# quadro de troca e atravessa a syscall.
+set anel3 nao
+for-each thread t process csrss state Waiting {
+    btt $t 48
+    expect-not #0  0x0000000000000000
+    expect RtlUserThreadStart
+    if output-has "no anel 3" {
+        set anel3 sim
+    }
+}
+if "${anel3}" != "sim" {
+    fail nenhuma thread do csrss.exe em espera adiada (a pilha pelo CONTEXT do anel 3)
 }
 
 # Sem o breakpoint, o csrss.exe continua rodando.
