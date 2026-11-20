@@ -1410,13 +1410,20 @@ fn launch(qemu: &Path, temp: &Path, arguments: &[String], output: &Arc<Mutex<Str
     // Cada QEMU (também o religado de um ciclo de energia) começa com o
     // relógio da CMOS na hora local corrente.
     let arguments = with_current_rtc(arguments);
+    // A entrada é um pipe fechado logo depois da criação, não o NUL: com o
+    // `-serial stdio`, a thread de leitura da entrada do QEMU no Windows
+    // (`win_stdio_thread`, chardev/char-win-stdio.c) só sai num erro do
+    // ReadFile e repete a leitura que volta com 0 bytes, o que o NUL faz
+    // sempre: um núcleo do hospedeiro girando o teste inteiro. No pipe
+    // fechado o ReadFile falha (ERROR_BROKEN_PIPE) e a thread termina.
     let mut child = qemu_command(qemu, temp)
         .args(&arguments)
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
         .map_err(|error| format!("{}: {error}", qemu.display()))?;
+    drop(child.stdin.take());
     let mut stdout = child.stdout.take().unwrap();
     let process = QemuProcess(child);
     let sink = Arc::clone(output);
