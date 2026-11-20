@@ -1100,7 +1100,9 @@ pub fn unmap(view: &Arc<View>, authority: Option<&secured_views::SecuredToken>) 
 }
 
 /// Páginas por escrita do writeback: o agrupamento do escritor de páginas
-/// modificadas do Mm (16 páginas, 64 KB por escrita).
+/// modificadas do Mm (16 páginas, 64 KB por escrita; o MiBuildMappedCluster
+/// do 19041 limita o cluster à janela [PTE - 0x78, PTE + 0x80) das PTEs
+/// protótipo).
 const WRITEBACK_CLUSTER: usize = 16;
 
 /// Uma página alterada da control area: o frame da seção, a cópia original

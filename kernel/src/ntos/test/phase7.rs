@@ -472,6 +472,21 @@ fn grouped_section_writeback(assert: Assert) {
     physical::write_bytes(section.frame(1).unwrap_or(0) + 0x800, b"Q");
     assert(sections::flush(&section).is_ok() && file.writes.lock().get(2) == Some(&(0x1800u64, 1usize)) && file.bytes.lock()[0x1800] == b'Q' && file.bytes.lock()[0x101] == b'W', "sections: a copia original acompanha o writeback agrupado");
     assert(crate::ntos::ob::objects::section::collect(section.pointer()).is_ok() && sections::by_pointer(section.pointer()).is_none(), "sections: secao do writeback agrupado coletada");
+    // O cluster para em 16 páginas, como a janela do MiBuildMappedCluster:
+    // 17 páginas alteradas seguidas dão duas escritas.
+    let long_file = MemoryFile::new(None, alloc::vec![0u8; 0x15000]);
+    let long_shared: Arc<dyn sections::SectionFile> = long_file.clone();
+    let Ok(Ok(long)) = sections::create(CreateOptions { size: 0x15000, page_protect: 4, attributes: 0x0800_0000, file: Some(long_shared), ..CreateOptions::default() }) else {
+        assert(false, "sections: secao de 21 paginas para o limite do cluster");
+        return;
+    };
+    for page in 3..20u64 {
+        physical::write_bytes(long.frame(page).unwrap_or(0) + 0x100, &[2]);
+    }
+    let flushed = sections::flush(&long).is_ok();
+    let writes = long_file.writes.lock().clone();
+    assert(flushed && writes == [(0x3100u64, 0xF001usize), (0x13100, 1)] && (3..20usize).all(|page| long_file.bytes.lock()[page * 0x1000 + 0x100] == 2), "sections: o cluster do writeback para em 16 paginas");
+    assert(crate::ntos::ob::objects::section::collect(long.pointer()).is_ok() && sections::by_pointer(long.pointer()).is_none(), "sections: secao do limite do cluster coletada");
 }
 
 fn image_sections(assert: Assert) {
