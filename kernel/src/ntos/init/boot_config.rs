@@ -95,6 +95,12 @@ pub fn trace_rpc() -> bool {
     TRACE_RPC.load(Ordering::Relaxed)
 }
 
+/// `USERSMP` (`--user-smp`): os APs armam o anel 3 no boot
+/// (`ke::smp::start_scheduling`).
+pub fn user_smp() -> bool {
+    flag(name::USER_SMP)
+}
+
 /// A saída de um serviço volta direto ao anel 3 quando nada pede o
 /// despachante (`threads::may_return_to_user`); com `SLOWSERVICEEXIT`
 /// (`--slow-service-exit`) toda saída passa por ele.

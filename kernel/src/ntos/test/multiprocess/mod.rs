@@ -31,6 +31,7 @@ pub mod current_thread;
 pub mod queue_wait;
 pub mod polled_wake;
 pub mod dispatch_overhead;
+pub mod processor_ring3;
 pub mod registered_wait;
 pub mod service_exit;
 pub mod process_tables;

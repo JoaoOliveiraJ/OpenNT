@@ -64,6 +64,17 @@ struct Smp {
     invalidation_active: bool,
     /// A pilha de boot (a da thread ociosa) de cada slot que recebeu SIPI.
     boot_stacks: Vec<(usize, KernelStack)>,
+    /// O que cada AP com o anel 3 armado guarda para sempre
+    /// ([`start_scheduling`]).
+    armed: Vec<ArmedProcessor>,
+}
+
+/// As pilhas e a IDT de um AP com o anel 3 armado.
+struct ArmedProcessor {
+    slot: usize,
+    fallback: KernelStack,
+    double_fault: KernelStack,
+    idt_frame: u64,
 }
 
 static STATE: SpinLock<Smp> = SpinLock::new(Smp {
@@ -74,7 +85,15 @@ static STATE: SpinLock<Smp> = SpinLock::new(Smp {
     prepare_job: None,
     invalidation_active: false,
     boot_stacks: Vec::new(),
+    armed: Vec::new(),
 });
+
+/// Os slots cujos APs deixaram o laço de trabalhos do trampolim pelo laço
+/// ocioso com o anel 3 armado ([`start_scheduling`]): as interrupções
+/// ligadas, a IDT, a GDT e a TSS próprias e o timer local.
+static SCHEDULING_SLOTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Os slots cujo AP não conseguiu armar o anel 3.
+static ARM_FAILED_SLOTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Prazo para o ICR voltar a ocioso (DeliveryStatus) na partida dos APs,
 /// medido em tempo, em hardware e sob hipervisor. Os IPIs do sistema em
@@ -559,6 +578,12 @@ pub fn start_job(slot: usize, routine: u64, arguments: [u64; 4]) -> Result<bool,
     if !send_processor_interrupt(identifier, 0x4400) {
         return Err(KernelError::new(alloc::format!("NMI de trabalho ao AP slot {slot}: identificador {identifier} fora do xAPIC")));
     }
+    // O AP armado dorme no HLT com as interrupções ligadas: a NMI que chega
+    // entre o teste do trabalho e o HLT não o acorda de novo, e o IPI de
+    // reescalonamento, que fica pendente no IRR até o `sti; hlt`, sim.
+    if is_scheduling(slot) {
+        send_processor_interrupt(identifier, 0x4000 | crate::nano::interrupts::VECTOR_RESCHEDULE as u32);
+    }
     Ok(true)
 }
 
@@ -579,6 +604,138 @@ pub fn wait_job(slot: usize, timeout_ms: u64) -> Result<u64, KernelError> {
 pub fn run_on_ap(slot: usize, routine: u64, arguments: [u64; 4]) -> Result<u64, KernelError> {
     start_job(slot, routine, arguments)?;
     wait_job(slot, 0)
+}
+
+/// O AP do `slot` está no laço ocioso com o anel 3 armado.
+pub fn is_scheduling(slot: usize) -> bool {
+    slot < 64 && SCHEDULING_SLOTS.load(core::sync::atomic::Ordering::Acquire) & (1 << slot) != 0
+}
+
+/// Arma o anel 3 no AP do `slot` (o KiInitializeProcessor do 19041 dá a
+/// cada processador a GDT, a TSS, a IDT, as pilhas e os MSRs de syscall): a
+/// pilha reserva e a da falta dupla dele, a cópia da IDT do BSP (com a NMI
+/// dos APs no vetor 2) e o trabalho [`ap_scheduler_entry`], que se desprende
+/// do laço de trabalhos do trampolim e fica no laço ocioso
+/// ([`processor_loop`]), com as interrupções ligadas e o timer local. Os
+/// trabalhos seguintes continuam pela mesma mailbox. Espera o AP confirmar.
+/// Exige o anel 3 do BSP já armado (a IDT copiada tem o vetor 8 na IST1).
+pub fn start_scheduling(slot: usize) -> Result<(), KernelError> {
+    use core::sync::atomic::Ordering;
+    if is_scheduling(slot) {
+        return Ok(());
+    }
+    if !crate::hal::amd64::usermode::ready() {
+        return Err(KernelError::new("anel 3 do BSP ainda nao armado"));
+    }
+    let fallback = kernel_stack::create(false)?;
+    let double_fault = match kernel_stack::create(false) {
+        Ok(stack) => stack,
+        Err(error) => {
+            kernel_stack::delete(fallback);
+            return Err(error);
+        }
+    };
+    let Some((idt, idt_frame)) = crate::nano::interrupts::processor_idt(aptrampoline::nmi_handler()) else {
+        kernel_stack::delete(fallback);
+        kernel_stack::delete(double_fault);
+        return Err(KernelError::new("sem frame para a IDT do AP"));
+    };
+    let routine = ap_scheduler_entry as extern "win64" fn(u64, u64, u64, u64) -> u64 as usize as u64;
+    let posted = start_job(slot, routine, [slot as u64, fallback.initial, double_fault.initial, idt]);
+    if !matches!(posted, Ok(true)) {
+        kernel_stack::delete(fallback);
+        kernel_stack::delete(double_fault);
+        pfn::free_page(idt_frame);
+        return Err(posted.err().unwrap_or_else(|| KernelError::new(alloc::format!("AP slot {slot} ocupado"))));
+    }
+    // As pilhas e a IDT passam a ser do AP, armado ou não.
+    STATE.lock().armed.push(ArmedProcessor { slot, fallback, double_fault, idt_frame });
+    let deadline = clock::now_ms() + 5_000;
+    while clock::now_ms() < deadline {
+        if is_scheduling(slot) {
+            return Ok(());
+        }
+        if ARM_FAILED_SLOTS.load(Ordering::Acquire) & (1 << slot) != 0 {
+            return Err(KernelError::new(alloc::format!("AP slot {slot} nao armou o anel 3")));
+        }
+        cpu::pause();
+    }
+    Err(KernelError::new(alloc::format!("AP slot {slot} sem confirmar o anel 3 em 5 s")))
+}
+
+/// As pilhas que o AP armado do `slot` guarda nas entradas da TSS dele: o
+/// topo da pilha reserva (RSP0 fora de um intervalo) e o da falta dupla
+/// (IST1), e o frame da IDT dele.
+pub fn scheduling_resources(slot: usize) -> Option<(u64, u64, u64)> {
+    STATE.lock().armed.iter().find(|armed| armed.slot == slot).map(|armed| (armed.fallback.initial, armed.double_fault.initial, armed.idt_frame))
+}
+
+/// [`start_scheduling`] em todo AP online, com o resultado na serial.
+pub fn start_scheduling_all() {
+    for index in 0..ap_slot_count() {
+        let Some(slot) = ap_slot(index) else { continue };
+        match start_scheduling(slot) {
+            Ok(()) => debug_print!("[smp] CPU {}: anel 3 armado, laco ocioso com o timer local", index + 1),
+            Err(error) => debug_print!("[smp] CPU {}: anel 3 nao armado: {}", index + 1, error),
+        }
+    }
+}
+
+/// O trabalho que arma um AP ([`start_scheduling`]), no próprio AP: marca o
+/// trabalho concluído na hora (o laço do trampolim nunca volta a vê-lo),
+/// carrega a IDT própria (KPCR.IdtBase), arma o anel 3
+/// (`usermode::processor_user_mode_init`: GDT, TSS, MSRs, RspBase), liga o
+/// timer local e entra no laço ocioso com as interrupções ligadas.
+extern "win64" fn ap_scheduler_entry(slot: u64, fallback: u64, double_fault: u64, idt: u64) -> u64 {
+    use core::sync::atomic::Ordering;
+    let slot = slot as usize;
+    let record = slot_address(slot);
+    physical::write64(record + SLOT_JOB_RESULT, 0);
+    physical::write32(record + SLOT_JOB_COMPLETED, 1);
+    crate::nano::interrupts::load_processor_idt(idt);
+    pcr::current().idt_base.set(idt);
+    match crate::hal::amd64::usermode::processor_user_mode_init(fallback, double_fault) {
+        Ok(_) => {
+            crate::nano::interrupts::start_processor_timer();
+            SCHEDULING_SLOTS.fetch_or(1 << slot, Ordering::AcqRel);
+        }
+        Err(error) => {
+            debug_print!("[smp] AP slot {} nao armou o anel 3: {}", slot, error);
+            ARM_FAILED_SLOTS.fetch_or(1 << slot, Ordering::AcqRel);
+        }
+    }
+    processor_loop(slot)
+}
+
+/// O laço ocioso de um AP armado, como o KiIdleLoop do 19041 (0x402020):
+/// atende os trabalhos da mailbox (a rotina publicada por último, os quatro
+/// argumentos, o resultado e a conclusão, como o laço do trampolim) e, sem
+/// trabalho, dorme no HLT com as interrupções ligadas (`sti; hlt`, o
+/// HalProcessorIdle); o timer local, uma NMI ou o IPI de reescalonamento o
+/// acordam. Cada trabalho começa com o mesmo `mov cr3, cr3` do laço do
+/// trampolim (o BSP pode remapear imagens com os APs ociosos).
+fn processor_loop(slot: usize) -> ! {
+    let record = slot_address(slot);
+    loop {
+        let routine = physical::read64(record + SLOT_JOB_ROUTINE);
+        if routine != 0 {
+            cpu::write_cr3(cpu::read_cr3());
+            let arguments: [u64; 4] = core::array::from_fn(|index| physical::read64(record + SLOT_FIRST_ARGUMENT + index as u64 * 8));
+            physical::write64(record + SLOT_JOB_ROUTINE, 0);
+            // SAFETY: a rotina MS x64 que `start_job` publicou.
+            let job: extern "win64" fn(u64, u64, u64, u64) -> u64 = unsafe { core::mem::transmute(routine as usize) };
+            let result = job(arguments[0], arguments[1], arguments[2], arguments[3]);
+            physical::write64(record + SLOT_JOB_RESULT, result);
+            physical::write32(record + SLOT_JOB_COMPLETED, 1);
+            continue;
+        }
+        let flags = cpu::save_and_disable_interrupts();
+        if physical::read64(record + SLOT_JOB_ROUTINE) == 0 {
+            cpu::processor_idle();
+        } else {
+            cpu::restore_interrupts(flags);
+        }
+    }
 }
 
 /// APIC ids da MADT, na ordem dos índices de processador.

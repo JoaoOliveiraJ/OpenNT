@@ -348,6 +348,13 @@ pub fn bytes() -> &'static [u8] {
     unsafe { core::slice::from_raw_parts(start, end as usize - start as usize) }
 }
 
+/// A rotina de NMI dos APs (o shootdown de TLB e o congelamento do
+/// depurador; acha o slot pelo LAPIC, sem GS), para a IDT própria de um AP
+/// com o anel 3 armado (`nano::interrupts::processor_idt`).
+pub fn nmi_handler() -> u64 {
+    core::ptr::addr_of!(ap_tlb_nmi) as u64
+}
+
 /// Grava o portão de NMI (vetor 2, interrupção de 64 bits, DPL 0) da IDT
 /// dos APs com a VA da rotina de shootdown na imagem do kernel. O BSP chama
 /// antes do primeiro SIPI; a IDT não muda depois.

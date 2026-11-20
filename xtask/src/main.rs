@@ -132,6 +132,8 @@ opcoes de build:   --release --build-dir=DIR --user-program=shell
                    --slow-service-exit (toda saida de servico passa pelo despachante; sem a
                    opcao ela volta direto ao anel 3 quando nada pede o despachante;
                    --fast-service-exit, o padrao, e aceita e nao muda nada)
+                   --user-smp (os APs armam o anel 3 no boot: GDT, TSS, IDT, MSRs de syscall e
+                   timer local de cada um, esperando no laco ocioso deles)
                    --windows-dir=DIR (binarios do Windows do bundle; padrao build/windows)
                    --pnp-root=acpi|internal (raiz da arvore de dispositivos; padrao acpi)
                    --usb (controladora xHCI com teclado e tablet USB)
@@ -263,6 +265,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             trace_rpc: false,
             heap_census: false,
             slow_service_exit: false,
+            user_smp: false,
             initial_process: String::new(),
             storage: String::new(),
             display: String::new(),
@@ -338,6 +341,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             "--trace-rpc" => parsed.build.trace_rpc = true,
             "--heap-census" => parsed.build.heap_census = true,
             "--slow-service-exit" => parsed.build.slow_service_exit = true,
+            "--user-smp" => parsed.build.user_smp = true,
             "--fast-service-exit" => {}
             "--memory-pressure" => parsed.build.memory_pressure = true,
             "--console-process" => parsed.build.console_process = true,

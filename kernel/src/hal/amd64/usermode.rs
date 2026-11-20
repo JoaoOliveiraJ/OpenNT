@@ -37,7 +37,9 @@ use crate::ntos::ex::system_services;
 use crate::ntos::inc::field::{Field, NtStruct, Reserved};
 use crate::ntos::inc::types::{Kthread, KthreadView1};
 use crate::ntos::ke::pcr::{self, layout};
+use crate::ntos::mm::memory_map::MAX_CPUS;
 use crate::rtl::SpinLock;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 /// Estado de execução de usuário de uma CPU (`gs:[pcr::layout::USER_EXECUTION]`).
 #[repr(C)]
@@ -444,6 +446,10 @@ user_syscall_entry:
     mov rax, [rbx + {dispatcher_rsp}]
     fxrstor64 [rax]
     call opennt_user_syscall
+    # O serviço pode ter bloqueado numa CPU e sido retomado em outra: o RBX
+    # que a troca recolocou é a KPCR de onde ele bloqueou. Depois da chamada
+    # vale a desta CPU (no anel 0 o GS é sempre a KPCR corrente).
+    mov rbx, gs:[{pcr_self}]
     fxrstor64 [rsp]
     add rsp, 0x208
     cmp dword ptr [rbx + {continue_flag}], 0
@@ -553,12 +559,6 @@ user_terminate_current:
     pop rbx
     ret
 .popsection
-
-.pushsection .data.usermode, "aw", @progbits
-.balign 16
-.global user_tss_storage
-user_tss_storage:    .zero 136
-.popsection
 "#,
     pcr_self = const layout::SELF,
     user_rsp = const layout::USER_RSP,
@@ -590,7 +590,6 @@ extern "C" {
     fn user_exec_ring3(rip: u64, rsp: u64, kernel_stack: u64, argument1: u64, rflags: u64, argument2: u64) -> u64;
     fn user_exec_context(context: u64, kernel_stack: u64) -> u64;
     fn user_terminate_current(exit_code: u64) -> !;
-    static mut user_tss_storage: [u8; 136];
 }
 
 /// `nt_service_lookup` (MS x64): a mesma tabela consumida pela invocação.
@@ -599,22 +598,45 @@ fn service_lookup(number: u64, shadow: u64, stack_count: &mut u64) -> u64 {
     routine(number, shadow, stack_count)
 }
 
+/// O estado de execução de usuário de uma CPU.
 struct Execution {
     /// Topo da pilha reserva da CPU (thread sem pilha de kernel própria).
     fallback_stack: u64,
-    ready: bool,
+    /// A CPU tem a GDT, a TSS e os MSRs de syscall dela
+    /// ([`processor_user_mode_init`]).
+    armed: bool,
     running: bool,
     /// CONTEXT salvo pela syscall em curso (`g_userFrameContext`).
     frame_context: u64,
     service_frame: u64,
 }
 
-static STATE: SpinLock<Execution> = SpinLock::new(Execution { fallback_stack: 0, ready: false, running: false, frame_context: 0, service_frame: 0 });
+/// O estado de cada CPU, pelo número do processador: uma syscall que
+/// bloqueia numa CPU leva o dela (`SuspendedService`) e o recoloca na CPU
+/// em que é retomada.
+static EXECUTION: [SpinLock<Execution>; MAX_CPUS] = [const { SpinLock::new(Execution { fallback_stack: 0, armed: false, running: false, frame_context: 0, service_frame: 0 }) }; MAX_CPUS];
+/// O anel 3 foi armado (o BSP, [`user_mode_init`]).
+static READY: AtomicBool = AtomicBool::new(false);
 /// Faixas do CONTEXT escritas pelo kernel durante a syscall, preservadas
 /// sobre o salvamento do retorno.
-static CONTEXT_KEEP: SpinLock<([bool; CONTEXT_SIZE], [u8; CONTEXT_SIZE])> = SpinLock::new(([false; CONTEXT_SIZE], [0; CONTEXT_SIZE]));
-/// GDT nova: as 5 entradas do stage2, dados/código de usuário e a TSS.
-static mut GDT: [u64; 16] = [0; 16];
+type Keep = ([bool; CONTEXT_SIZE], [u8; CONTEXT_SIZE]);
+/// As faixas preservadas de cada CPU.
+static CONTEXT_KEEP: [SpinLock<Keep>; MAX_CPUS] = [const { SpinLock::new(([false; CONTEXT_SIZE], [0; CONTEXT_SIZE])) }; MAX_CPUS];
+
+/// O número do processador corrente (KPRCB.Number pelo GS).
+fn processor_number() -> usize {
+    (pcr::current().prcb.number.get() as usize).min(MAX_CPUS - 1)
+}
+
+/// O estado de execução de usuário da CPU corrente.
+fn state() -> &'static SpinLock<Execution> {
+    &EXECUTION[processor_number()]
+}
+
+/// As faixas preservadas do CONTEXT da CPU corrente.
+fn context_keep() -> &'static SpinLock<Keep> {
+    &CONTEXT_KEEP[processor_number()]
+}
 
 fn read64(address: u64) -> u64 {
     unsafe { core::ptr::read_volatile(address as *const u64) }
@@ -639,13 +661,31 @@ const TSS_IST1: usize = 0x24;
 const DOUBLE_FAULT_VECTOR: u8 = 8;
 const DOUBLE_FAULT_IST: u8 = 1;
 
-/// GDT com os segmentos de usuário e a TSS (RSP0 = pilha reserva da CPU,
-/// IST1 = pilha da falta dupla), LGDT/LTR, o portão do vetor 8 na IST1,
-/// EFER.SCE e STAR/LSTAR/SFMASK. A KPCR continua no GS do kernel; o
-/// KernelGSbase do usuário vai a zero.
+/// O anel 3 no processador de boot: a GDT, a TSS e os MSRs dele
+/// ([`processor_user_mode_init`]) e o portão do vetor 8 da IDT na IST1.
+/// Devolve a GDT.
 pub fn user_mode_init(stack_top: u64, double_fault_stack: u64) -> Result<u64, crate::rtl::KernelError> {
-    if STATE.lock().ready {
+    if READY.load(Ordering::Acquire) {
         return Err(crate::rtl::KernelError::new("userModeInit: ja inicializado"));
+    }
+    let gdt = processor_user_mode_init(stack_top, double_fault_stack)?;
+    // Só com a TSS carregada o portão pode apontar a IST. A IDT dos APs é
+    // uma cópia desta, feita depois (`nano::interrupts::processor_idt`).
+    crate::nano::interrupts::set_interrupt_stack(DOUBLE_FAULT_VECTOR, DOUBLE_FAULT_IST);
+    READY.store(true, Ordering::Release);
+    Ok(gdt)
+}
+
+/// O anel 3 numa CPU, como o KiInitializeProcessor do 19041 monta a GDT e a
+/// TSS de cada processador: a GDT da CPU (cópia da de boot, com os dados e o
+/// código de usuário em 0x28/0x30 e a TSS de 16 bytes em 0x38) e a TSS (RSP0
+/// = a pilha reserva da CPU, IST1 = a pilha da falta dupla) na reserva da
+/// KPCR dela, publicadas em KPCR.GdtBase/TssBase; LGDT/LTR, EFER.SCE e
+/// STAR/LSTAR/SFMASK, e KPRCB.RspBase. A KPCR continua no GS do kernel; o
+/// KernelGSbase do usuário vai a zero. Devolve a GDT.
+pub fn processor_user_mode_init(stack_top: u64, double_fault_stack: u64) -> Result<u64, crate::rtl::KernelError> {
+    if state().lock().armed {
+        return Err(crate::rtl::KernelError::new("userModeInit: CPU ja armada"));
     }
     if stack_top == 0 || stack_top & 0xF != 0 || double_fault_stack == 0 || double_fault_stack & 0xF != 0 {
         return Err(crate::rtl::KernelError::new("userModeInit: pilha invalida"));
@@ -663,7 +703,10 @@ pub fn user_mode_init(stack_top: u64, double_fault_stack: u64) -> Result<u64, cr
     if limit + 1 > 5 * 8 {
         return Err(crate::rtl::KernelError::new("userModeInit: GDT de boot inesperada"));
     }
-    let (gdt, tss) = (core::ptr::addr_of_mut!(GDT) as *mut u64, core::ptr::addr_of_mut!(user_tss_storage) as *mut u8);
+    let base = pcr::current_address();
+    let (gdt, tss) = ((base + layout::PROCESSOR_GDT) as *mut u64, (base + layout::PROCESSOR_TSS) as *mut u8);
+    // SAFETY: a GDT e a TSS ficam na reserva da KPCR desta CPU, mapeada por
+    // toda a vida do sistema e de uso só dela.
     unsafe {
         core::ptr::copy_nonoverlapping(current.base as *const u8, gdt as *mut u8, limit + 1);
         *gdt.add((SEL_USER_DATA / 8) as usize) = 0x0000_F200_0000_0000;
@@ -679,10 +722,10 @@ pub fn user_mode_init(stack_top: u64, double_fault_stack: u64) -> Result<u64, cr
         asm!("lgdt [{}]", in(reg) &register, options(readonly, nostack));
         asm!("mov ax, {selector}", "ltr ax", selector = const SEL_TSS, out("ax") _, options(nostack));
     }
-    // Só com a TSS carregada o portão pode apontar a IST.
-    crate::nano::interrupts::set_interrupt_stack(DOUBLE_FAULT_VECTOR, DOUBLE_FAULT_IST);
     // A entrada de syscall desta CPU carrega a mesma pilha da TSS.RSP0.
     let kpcr = pcr::current();
+    kpcr.gdt_base.set(gdt as u64);
+    kpcr.tss_base.set(tss as u64);
     kpcr.prcb.rsp_base.set(stack_top);
     kpcr.user_rsp.set(0);
     let efer = cpu::read_msr(MSR_EFER);
@@ -691,16 +734,28 @@ pub fn user_mode_init(stack_top: u64, double_fault_stack: u64) -> Result<u64, cr
     cpu::write_msr(MSR_LSTAR, user_syscall_entry as unsafe extern "C" fn() as usize as u64);
     cpu::write_msr(MSR_SFMASK, SFMASK_VALUE);
     cpu::write_msr(MSR_KERNEL_GS_BASE, 0);
-    let mut state = STATE.lock();
+    let mut state = state().lock();
     state.fallback_stack = stack_top;
-    state.ready = true;
+    state.armed = true;
     Ok(gdt as u64)
+}
+
+/// A CPU corrente tem a GDT, a TSS e os MSRs de syscall dela.
+pub fn processor_armed() -> bool {
+    state().lock().armed
+}
+
+/// A TSS desta CPU (KPCR.TssBase).
+fn current_tss() -> *mut u8 {
+    let tss = pcr::current().tss_base.get();
+    assert!(tss != 0, "TSS da CPU ainda nao montada");
+    tss as *mut u8
 }
 
 /// RSP0 e IST1 da TSS desta CPU.
 pub fn tss_stacks() -> (u64, u64) {
-    let tss = core::ptr::addr_of!(user_tss_storage) as *const u8;
-    // SAFETY: a TSS é uma variável estática da imagem.
+    let tss = current_tss();
+    // SAFETY: a TSS desta CPU, na reserva da KPCR dela.
     unsafe { (core::ptr::read_unaligned(tss.add(TSS_RSP0) as *const u64), core::ptr::read_unaligned(tss.add(TSS_IST1) as *const u64)) }
 }
 
@@ -725,27 +780,27 @@ fn current_xstate_area() -> u64 {
 /// nenhuma aponta para a pilha de uma thread que o ceifador pode devolver.
 fn load_kernel_stack(top: u64) {
     pcr::current().prcb.rsp_base.set(top);
-    let tss = core::ptr::addr_of_mut!(user_tss_storage) as *mut u8;
-    // SAFETY: a TSS é uma variável estática da imagem; a CPU só lê o RSP0
-    // numa entrada vinda do anel 3, e aqui ela está no anel 0.
+    let tss = current_tss();
+    // SAFETY: a TSS desta CPU; ela só lê o RSP0 numa entrada vinda do anel
+    // 3, e aqui está no anel 0.
     unsafe { core::ptr::write_unaligned(tss.add(TSS_RSP0) as *mut u64, top) };
 }
 
 /// O anel 3 foi armado.
 pub fn ready() -> bool {
-    STATE.lock().ready
+    READY.load(Ordering::Acquire)
 }
 
 /// Uma execução de usuário (intervalo, retomada no kernel ou o anel 3 cru
 /// dos autotestes) está em curso nesta CPU.
 pub fn executing() -> bool {
-    STATE.lock().running
+    state().lock().running
 }
 
-/// No M0 só o BSP executa o anel 3: só ele tem a TSS, o LSTAR e a pilha
-/// reserva armados.
-fn assert_boot_processor() {
-    assert!(pcr::current().prcb.number.get() == 0, "anel 3 fora do processador de boot");
+/// O anel 3 só entra numa CPU com a GDT, a TSS, o LSTAR e a pilha reserva
+/// dela ([`processor_user_mode_init`]).
+fn assert_armed() {
+    assert!(processor_armed(), "anel 3 numa CPU sem GDT, TSS e MSRs de syscall");
 }
 
 /// Entra no processo e só volta no término (protocolo GS: GS.base = TEB e
@@ -753,13 +808,13 @@ fn assert_boot_processor() {
 /// entrada de syscall ou de interrupção o desfaz).
 pub fn exec_user_mode(entry: u64, user_rsp: u64, teb: u64, argument1: u64, rflags: u64, argument2: u64) -> u64 {
     let fallback = {
-        let mut state = STATE.lock();
-        assert!(state.ready, "execUserMode: userModeInit nao rodou");
+        let mut state = state().lock();
+        assert!(state.armed, "execUserMode: userModeInit nao rodou nesta CPU");
         assert!(!state.running, "execUserMode: ja ha processo em ring 3");
         state.running = true;
         state.fallback_stack
     };
-    assert_boot_processor();
+    assert_armed();
     let stack = dispatch_stack(fallback);
     load_kernel_stack(stack);
     let previous_swap = cpu::read_msr(MSR_KERNEL_GS_BASE);
@@ -769,7 +824,7 @@ pub fn exec_user_mode(entry: u64, user_rsp: u64, teb: u64, argument1: u64, rflag
     let exit_code = unsafe { user_exec_ring3(entry, user_rsp, stack, argument1, rflags, argument2) };
     load_kernel_stack(fallback);
     cpu::write_msr(MSR_KERNEL_GS_BASE, previous_swap);
-    STATE.lock().running = false;
+    state().lock().running = false;
     exit_code
 }
 
@@ -779,14 +834,14 @@ pub fn exec_user_mode(entry: u64, user_rsp: u64, teb: u64, argument1: u64, rflag
 /// despachante volta ao de antes da entrada.
 pub fn exec_user_context(context: u64, teb: u64) -> u32 {
     let fallback = {
-        let mut state = STATE.lock();
-        assert!(state.ready && !state.running, "execUserContext: invalid execution state");
+        let mut state = state().lock();
+        assert!(state.armed && !state.running, "execUserContext: invalid execution state");
         assert!(context & 15 == 0, "execUserContext: unaligned CONTEXT");
         state.running = true;
         state.frame_context = 0;
         state.fallback_stack
     };
-    assert_boot_processor();
+    assert_armed();
     let stack = dispatch_stack(fallback);
     load_kernel_stack(stack);
     let block = block();
@@ -807,7 +862,7 @@ pub fn exec_user_context(context: u64, teb: u64) -> u32 {
     block.xstate_area.set(0);
     cpu::write_msr(MSR_KERNEL_GS_BASE, swap_gs);
     native_call::restore_state(native);
-    let mut state = STATE.lock();
+    let mut state = state().lock();
     state.frame_context = 0;
     state.running = false;
     result as u32
@@ -817,7 +872,7 @@ pub fn exec_user_context(context: u64, teb: u64) -> u32 {
 /// com CONTEXT (o anel 3 cru dos autotestes não tem). Só nela uma espera
 /// pode deixar a CPU.
 pub fn in_service() -> bool {
-    STATE.lock().running && block().context.get() != 0
+    state().lock().running && block().context.get() != 0
 }
 
 /// O estado por CPU do serviço em curso que uma thread bloqueada leva
@@ -841,19 +896,22 @@ struct SuspendedService {
 /// KiSwapContext): leva o estado do serviço, salva o quadro de troca, grava
 /// o RSP em `kernel_stack` (KTHREAD.KernelStack) e devolve a CPU ao
 /// despachante, cujo intervalo termina com `EXIT_BLOCKED`. Retorna quando o
-/// despachante a retoma ([`resume_kernel_context`]), com o estado de volta.
+/// despachante a retoma ([`resume_kernel_context`]), com o estado de volta,
+/// na CPU que a retomou. Só o serviço de um intervalo despachado bloqueia no
+/// sistema (`ke::context_switch::can_block`); o anel 3 cru dos autotestes
+/// também pode, para a retomada em outra CPU.
 pub fn block_in_service(kernel_stack: &Field<u64>) {
-    assert!(in_service(), "bloqueio fora de um servico despachado");
+    assert!(state().lock().running, "bloqueio fora de uma execucao de usuario");
     let block = block();
     let (frame_context, service_frame) = {
-        let mut state = STATE.lock();
+        let mut state = state().lock();
         (core::mem::replace(&mut state.frame_context, 0), core::mem::replace(&mut state.service_frame, 0))
     };
     let saved = SuspendedService {
         context: block.context.get(),
         frame_context,
         service_frame,
-        keep: *CONTEXT_KEEP.lock(),
+        keep: *context_keep().lock(),
         user_rsp: pcr::current().user_rsp.get(),
         continue_flag: block.continue_flag.get(),
         continue_rcx: block.continue_rcx.get(),
@@ -871,9 +929,9 @@ pub fn block_in_service(kernel_stack: &Field<u64>) {
     block.continue_rcx.set(saved.continue_rcx);
     block.continue_r11.set(saved.continue_r11);
     pcr::current().user_rsp.set(saved.user_rsp);
-    *CONTEXT_KEEP.lock() = saved.keep;
+    *context_keep().lock() = saved.keep;
     native_call::restore_state(saved.native);
-    let mut state = STATE.lock();
+    let mut state = state().lock();
     state.frame_context = saved.frame_context;
     state.service_frame = saved.service_frame;
 }
@@ -886,12 +944,12 @@ pub fn block_in_service(kernel_stack: &Field<u64>) {
 /// [`exec_user_context`].
 pub fn resume_kernel_context(saved_rsp: u64, teb: u64) -> u32 {
     let fallback = {
-        let mut state = STATE.lock();
-        assert!(state.ready && !state.running, "resumeKernelContext: invalid execution state");
+        let mut state = state().lock();
+        assert!(state.armed && !state.running, "resumeKernelContext: invalid execution state");
         state.running = true;
         state.fallback_stack
     };
-    assert_boot_processor();
+    assert_armed();
     let stack = dispatch_stack(fallback);
     load_kernel_stack(stack);
     let block = block();
@@ -908,7 +966,7 @@ pub fn resume_kernel_context(saved_rsp: u64, teb: u64) -> u32 {
     block.xstate_area.set(0);
     cpu::write_msr(MSR_KERNEL_GS_BASE, swap_gs);
     native_call::restore_state(native);
-    let mut state = STATE.lock();
+    let mut state = state().lock();
     state.frame_context = 0;
     state.service_frame = 0;
     state.running = false;
@@ -928,14 +986,14 @@ pub fn resume_kernel_context(saved_rsp: u64, teb: u64) -> u32 {
 /// [`exec_user_context`]; o tipo de saída fica no bloco da CPU.
 pub fn exec_kernel_routine(context: u64, teb: u64, routine: extern "C" fn(u64) -> !, argument: u64) -> u32 {
     let fallback = {
-        let mut state = STATE.lock();
-        assert!(state.ready && !state.running, "execKernelRoutine: invalid execution state");
+        let mut state = state().lock();
+        assert!(state.armed && !state.running, "execKernelRoutine: invalid execution state");
         state.running = true;
         state.frame_context = 0;
         state.service_frame = 0;
         state.fallback_stack
     };
-    assert_boot_processor();
+    assert_armed();
     let stack = dispatch_stack(fallback);
     assert!(stack != fallback, "execKernelRoutine: thread sem pilha de kernel propria");
     load_kernel_stack(stack);
@@ -957,7 +1015,7 @@ pub fn exec_kernel_routine(context: u64, teb: u64, routine: extern "C" fn(u64) -
     block.context.set(0);
     cpu::write_msr(MSR_KERNEL_GS_BASE, swap_gs);
     native_call::restore_state(native);
-    let mut state = STATE.lock();
+    let mut state = state().lock();
     state.frame_context = 0;
     state.service_frame = 0;
     state.running = false;
@@ -970,7 +1028,7 @@ pub fn exec_kernel_routine(context: u64, teb: u64, routine: extern "C" fn(u64) -
 /// [`context_switch::EXIT_THREAD_EXITED`] com `code`.
 pub fn end_thread_interval(code: u32) -> ! {
     assert!(in_service(), "fim de thread fora de um intervalo de servico");
-    STATE.lock().frame_context = 0;
+    state().lock().frame_context = 0;
     block().exit_kind.set(context_switch::EXIT_THREAD_EXITED);
     // SAFETY: dentro de um intervalo despachado (`dispatcher_rsp` válido);
     // nada desta pilha é usado depois.
@@ -1030,18 +1088,18 @@ pub fn resume_user_callback(saved_rsp: u64, teb: u64) -> (u32, u32) {
 /// intervalo aninhado por `enter` e, no fim dele, recoloca tudo.
 fn nested_interval(teb: u64, enter: impl FnOnce(&UserExecutionBlock, u64) -> u64) -> (u32, u32) {
     assert!(in_service(), "callback de usuario fora de um servico despachado");
-    assert_boot_processor();
+    assert_armed();
     let block = block();
     let kpcr = pcr::current();
     let (fallback, frame_context, service_frame) = {
-        let mut state = STATE.lock();
+        let mut state = state().lock();
         (state.fallback_stack, core::mem::replace(&mut state.frame_context, 0), core::mem::replace(&mut state.service_frame, 0))
     };
     let saved = SuspendedService {
         context: block.context.get(),
         frame_context,
         service_frame,
-        keep: *CONTEXT_KEEP.lock(),
+        keep: *context_keep().lock(),
         user_rsp: kpcr.user_rsp.get(),
         continue_flag: block.continue_flag.get(),
         continue_rcx: block.continue_rcx.get(),
@@ -1077,10 +1135,10 @@ fn nested_interval(teb: u64, enter: impl FnOnce(&UserExecutionBlock, u64) -> u64
     block.continue_rcx.set(saved.continue_rcx);
     block.continue_r11.set(saved.continue_r11);
     kpcr.user_rsp.set(saved.user_rsp);
-    *CONTEXT_KEEP.lock() = saved.keep;
+    *context_keep().lock() = saved.keep;
     native_call::restore_state(saved.native);
     {
-        let mut state = STATE.lock();
+        let mut state = state().lock();
         state.frame_context = saved.frame_context;
         state.service_frame = saved.service_frame;
     }
@@ -1091,7 +1149,7 @@ fn nested_interval(teb: u64, enter: impl FnOnce(&UserExecutionBlock, u64) -> u64
 /// O banco preparado entra no intervalo de usuário pausado.
 pub fn set_user_debug_registers(bank: u64) {
     let frame_context = {
-        let state = STATE.lock();
+        let state = state().lock();
         assert!(state.running, "no paused user execution");
         state.frame_context
     };
@@ -1106,7 +1164,7 @@ pub fn set_user_debug_registers(bank: u64) {
             write64(context + 0x48 + index as u64 * 8, value);
         }
         if frame_context == context {
-            let mut keep = CONTEXT_KEEP.lock();
+            let mut keep = context_keep().lock();
             for index in 0..48 {
                 keep.0[0x48 + index] = true;
                 keep.1[0x48 + index] = (values[index / 8] >> ((index % 8) * 8)) as u8;
@@ -1140,13 +1198,13 @@ pub fn arm_user_call_capture(address: u64) -> Result<(), crate::rtl::KernelError
 /// Bytes do CONTEXT escritos pelo kernel que sobrevivem ao salvamento do
 /// retorno da syscall.
 pub fn retain_user_context_ranges(context: u64, ranges: &[(u32, u32)]) -> bool {
-    let frame_context = STATE.lock().frame_context;
+    let frame_context = state().lock().frame_context;
     if frame_context == 0 || context != frame_context {
         return false;
     }
     assert!(ranges.len() <= 64, "invalid context ranges");
     assert!(ranges.iter().all(|&(offset, length)| offset as usize <= CONTEXT_SIZE && length as usize <= CONTEXT_SIZE - offset as usize), "context range outside saved frame");
-    let mut keep = CONTEXT_KEEP.lock();
+    let mut keep = context_keep().lock();
     for &(offset, length) in ranges {
         for index in offset as usize..(offset + length) as usize {
             keep.1[index] = unsafe { core::ptr::read_volatile((context + index as u64) as *const u8) };
@@ -1158,7 +1216,7 @@ pub fn retain_user_context_ranges(context: u64, ranges: &[(u32, u32)]) -> bool {
 
 /// O frame da syscall em despacho.
 pub fn user_service_frame() -> u64 {
-    STATE.lock().service_frame
+    state().lock().service_frame
 }
 
 /// Registradores da syscall para o CONTEXT do intervalo.
@@ -1211,16 +1269,16 @@ fn save_syscall_context(frame: *const u64, result: u64) {
         write64(context + 0xF8, callback);
         write64(context + 0x80, callback);
     }
-    let frame_context = STATE.lock().frame_context;
+    let frame_context = state().lock().frame_context;
     if frame_context == context {
-        let keep = CONTEXT_KEEP.lock();
+        let keep = context_keep().lock();
         for index in 0..CONTEXT_SIZE {
             if keep.0[index] {
                 unsafe { core::ptr::write_volatile((context + index as u64) as *mut u8, keep.1[index]) };
             }
         }
     }
-    STATE.lock().frame_context = 0;
+    state().lock().frame_context = 0;
     block.exit_kind.set(1);
     unsafe { user_terminate_current(0) }
 }
@@ -1250,9 +1308,9 @@ pub extern "C" fn opennt_user_syscall(frame: *mut u64) -> u64 {
     // dentro dela; o quadro do callback sai do RSP e do RIP desse CONTEXT, e
     // sem a captura eles seriam os da entrada anterior no kernel.
     capture_syscall_registers(frame, number);
-    STATE.lock().frame_context = block().context.get();
+    state().lock().frame_context = block().context.get();
     {
-        let mut keep = CONTEXT_KEEP.lock();
+        let mut keep = context_keep().lock();
         keep.0 = [false; CONTEXT_SIZE];
     }
     let mut target = service_lookup(number, crate::ntos::ps::win32::is_gui_thread() as u64, &mut stack_count);
@@ -1280,9 +1338,9 @@ pub extern "C" fn opennt_user_syscall(frame: *mut u64) -> u64 {
             // O trampolim comum também captura posições sem uso: catorze
             // slots zerados no mínimo.
             let count = (stack_count as usize + 4).max(14);
-            let previous = core::mem::replace(&mut STATE.lock().service_frame, frame as u64);
+            let previous = core::mem::replace(&mut state().lock().service_frame, frame as u64);
             result = crate::hal::amd64::native_call::call(target, &packet[..count]);
-            STATE.lock().service_frame = previous;
+            state().lock().service_frame = previous;
         }
         trace_win32k_service(number, &packet, result);
         if number & 0x1000 != 0 {
@@ -1318,7 +1376,7 @@ pub extern "C" fn opennt_user_syscall(frame: *mut u64) -> u64 {
 /// despachante (`threads::may_return_to_user`).
 fn continues_in_interval() -> bool {
     let block = block();
-    if block.context.get() == 0 || block.continue_flag.get() != 0 || block.instrumentation.get() != 0 || CONTEXT_KEEP.lock().0.contains(&true) {
+    if block.context.get() == 0 || block.continue_flag.get() != 0 || block.instrumentation.get() != 0 || context_keep().lock().0.contains(&true) {
         if block.context.get() != 0 {
             crate::ntos::ps::dispatch_perf::note_slow(crate::ntos::ps::dispatch_perf::slow::CONTEXT);
         }
@@ -1328,7 +1386,7 @@ fn continues_in_interval() -> bool {
         crate::ntos::ps::dispatch_perf::note_slow(reason);
         return false;
     }
-    STATE.lock().frame_context = 0;
+    state().lock().frame_context = 0;
     crate::ntos::ps::dispatch_perf::FAST_RETURNS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     crate::ntos::ps::dispatch_perf::thread_return(crate::ntos::ps::process::get_current_thread_id());
     true

@@ -7331,6 +7331,9 @@ pub fn run(assert: Assert) {
     crate::ntos::test::multiprocess::service_exit::run(assert);
     crate::ntos::test::multiprocess::registered_wait::run(assert);
     crate::ntos::test::multiprocess::dispatch_overhead::run(assert);
+    // Por último entre os do despachante: arma o anel 3 nos APs, que daqui
+    // em diante atendem os trabalhos pelo laço ocioso deles.
+    crate::ntos::test::multiprocess::processor_ring3::run(assert);
     user_handle_table(assert);
     user_memory_helpers(assert);
     map_view_parameter_validation(assert);

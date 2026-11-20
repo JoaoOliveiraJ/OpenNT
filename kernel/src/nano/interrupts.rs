@@ -33,6 +33,13 @@ const INTERRUPT_GATE: u8 = 0x8E; // presente, ring 0, interrupt gate
 pub const VECTOR_TIMER: u8 = 0x20; // IRQ0 (PIT — legado, mascarado)
 pub const VECTOR_KEYBOARD: u8 = 0x21; // IRQ1 (PS/2)
 pub const VECTOR_LAPIC_TIMER: u8 = 0x40; // timer do LAPIC (o quantum real)
+/// O timer local de um AP com o anel 3 armado: o 0x40 continua sendo só o
+/// relógio do BSP (o tique global do escalonador).
+pub const VECTOR_LAPIC_TIMER_AP: u8 = 0x41;
+/// O IPI de reescalonamento, o vetor do HalpInterruptSendIpi do 19041 (0xE1):
+/// acorda o AP do HLT do laço ocioso dele. Fora da faixa do árbitro do
+/// acpi.sys (a partir de 0x37 até 0xDF) e acima de 0x30 (o EOI é o do LAPIC).
+pub const VECTOR_RESCHEDULE: u8 = 0xE1;
 
 // registros do LAPIC (xAPIC MMIO)
 const LAPIC_SPURIOUS: u32 = 0x0F0;
@@ -86,6 +93,65 @@ pub fn set_interrupt_stack(vector: u8, ist: u8) {
 /// A entrada da IST do portão de `vector` (0 = a pilha corrente).
 pub fn interrupt_stack(vector: u8) -> u8 {
     physical::read8(IDT_PHYSICAL_ADDRESS + vector as u64 * 16 + 4) & 7
+}
+
+/// A IDT de um AP com o anel 3 armado, como a que o KiInitializeProcessor
+/// do 19041 dá a cada processador: uma página nova com a cópia da do BSP
+/// (todos os vetores, o vetor 8 na IST1 e os portões de DPL 3), menos o
+/// vetor 2, que vai à rotina de NMI dos APs (`nmi_handler`, o shootdown e o
+/// congelamento do depurador, sem GS). Devolve a VA (mapa direto) e o frame.
+pub fn processor_idt(nmi_handler: u64) -> Option<(u64, u64)> {
+    let page = crate::ntos::mm::pfn::alloc_page();
+    if page == 0 {
+        return None;
+    }
+    let bytes = physical::read_bytes(IDT_PHYSICAL_ADDRESS, 0x1000);
+    physical::write_bytes(page, &bytes);
+    let gate = page + 2 * 16;
+    physical::write16(gate, (nmi_handler & 0xFFFF) as u16);
+    physical::write16(gate + 2, CODE64_SELECTOR);
+    physical::write8(gate + 4, 0);
+    physical::write8(gate + 5, INTERRUPT_GATE);
+    physical::write16(gate + 6, ((nmi_handler >> 16) & 0xFFFF) as u16);
+    physical::write32(gate + 8, (nmi_handler >> 32) as u32);
+    physical::write32(gate + 12, 0);
+    Some((physical::to_virtual(page), page))
+}
+
+/// Carrega a IDT `base` (256 portões) nesta CPU, sem mudar o IF.
+pub fn load_processor_idt(base: u64) {
+    #[repr(C, packed)]
+    struct TableRegister {
+        limit: u16,
+        base: u64,
+    }
+    let register = TableRegister { limit: 256 * 16 - 1, base };
+    // SAFETY: a IDT copiada tem os 256 portões do BSP.
+    unsafe { core::arch::asm!("lidt [{}]", in(reg) &register, options(readonly, nostack)) };
+}
+
+/// O LAPIC de um AP com o anel 3 armado: habilitado (SVR 0x1FF), TPR do
+/// IRQL, LINT0 mascarado (só o BSP é o virtual wire do 8259), LINT1 = NMI e
+/// o timer periódico no vetor [`VECTOR_LAPIC_TIMER_AP`] com o mesmo período
+/// do relógio do BSP (o quantum de cada CPU).
+pub fn start_processor_timer() {
+    lapic::write(LAPIC_SPURIOUS, 0x1FF);
+    lapic::write(LAPIC_TPR, (crate::ntos::ke::irql::get_irql() as u32) << 4);
+    lapic::write(LAPIC_LVT_LINT0, 0x10000);
+    lapic::write(LAPIC_LVT_LINT1, 0x400);
+    lapic::write(LAPIC_TIMER_DIVIDE, 0x3);
+    lapic::write(LAPIC_LVT_TIMER, VECTOR_LAPIC_TIMER_AP as u32 | 0x20000);
+    lapic::write(LAPIC_TIMER_INITIAL, TICKS_PER_QUANTUM.load(Ordering::Acquire).max(1000));
+}
+
+/// Os tiques do timer desta CPU: o relógio global (0x40) no BSP, e no AP os
+/// do timer local dele (0x41), contados na KPCR.
+pub fn processor_tick_count() -> u32 {
+    if crate::ntos::ke::pcr::current().prcb.number.get() == 0 {
+        return tick_count();
+    }
+    // SAFETY: a célula dos tiques fica na reserva da KPCR desta CPU.
+    unsafe { core::ptr::read_volatile((crate::ntos::ke::pcr::current_address() + crate::ntos::ke::pcr::layout::PROCESSOR_TICKS) as *const u32) }
 }
 
 // ---- detecção de plataforma (CPUID, só para log) ----

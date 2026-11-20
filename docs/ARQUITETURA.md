@@ -397,11 +397,42 @@ depurador do kernel lê o de cada processador parado. A execução em curso do `
 pilha de execuções aninhadas e o início da contagem de ciclos) é de cada CPU;
 as filas prontas, a NextThread e o lock delas são os da KPRCB do processador
 que despacha as threads (o de boot, no M0), de onde quer que venha a
-prontidão. No M0 só o BSP executa o anel 3
-(assert em `exec_user_mode`/`exec_user_context`); os APs têm KPCR e bloco,
-mas não têm TSS, LSTAR nem pilha reserva. O autoteste
-`ntos/test/multiprocess/per_cpu.rs` confere os blocos distintos de cada CPU
-e uma syscall de teste que devolve gs:[10h] igual ao RSP do usuário.
+prontidão. O anel 3 só entra numa CPU armada (assert em
+`exec_user_mode`/`exec_user_context`): como o KiInitializeProcessor do 19041
+dá a cada processador a GDT, a TSS, a IDT, as pilhas e os MSRs de syscall,
+`usermode::processor_user_mode_init` monta a GDT da CPU (a de boot com os
+dados e o código de usuário em 0x28/0x30 e a TSS de 16 bytes em 0x38) e a
+TSS (RSP0 = a pilha reserva da CPU, IST1 = a da falta dupla) na reserva da
+KPCR dela (`pcr::layout::PROCESSOR_GDT`/`PROCESSOR_TSS`), publicadas em
+KPCR.GdtBase/TssBase, e grava o EFER.SCE, o STAR, o LSTAR, o SFMASK e a
+KPRCB.RspBase. O estado de execução de usuário (em curso, o CONTEXT da
+syscall, o quadro do serviço, a pilha reserva) e as faixas preservadas do
+CONTEXT são de cada CPU, pelo número do processador; uma syscall que
+bloqueia leva os dela e os recoloca na CPU que a retoma. O stub de syscall
+relê o RBX (a KPCR) depois do serviço: um serviço que bloqueou numa CPU e
+foi retomado em outra volta pela KPCR da CPU que o retomou (a pilha do
+usuário, o NtContinue e o callback de instrumentação dela). O BSP se arma no
+`user_mode_init`; um AP, pelo `smp::start_scheduling` (no boot com a opção
+`--user-smp`, USERSMP, ou pelo autoteste): o trabalho dele recebe a cópia
+da IDT do BSP (com o vetor 8 na IST1 e o vetor 2 na NMI dos APs, que acha o
+slot pelo LAPIC, sem GS), se arma, liga o timer local no vetor 0x41 (o
+0x40 continua sendo o relógio global do BSP; o stub conta os tiques do AP
+na KPCR dele e trata o 0x41 como o 0x40 no fim de um intervalo de usuário)
+e fica no laço ocioso (`smp::processor_loop`, o KiIdleLoop do 19041): atende
+os trabalhos da mailbox e, sem trabalho, dorme no `sti; hlt`; o
+`start_job` manda, depois da NMI, o IPI de reescalonamento (vetor 0xE1, o
+do HalpInterruptSendIpi), que fica pendente no IRR até o HLT. Ainda não há
+thread de usuário despachada num AP. As linhas da serial têm uma trava
+própria com espera limitada (`rtl::print`), para duas CPUs não misturarem
+linhas. O autoteste `ntos/test/multiprocess/per_cpu.rs` confere os blocos
+distintos de cada CPU e uma syscall de teste que devolve gs:[10h] igual ao
+RSP do usuário; o `ntos/test/multiprocess/processor_ring3.rs` arma os APs e
+confere as tabelas de cada um (a GDT e a TSS na reserva da KPCR, distintas
+entre as CPUs, com as pilhas que o AP recebeu, a IDT própria com o vetor 8
+na IST1, o LSTAR, o STAR, o SFMASK e o CR4 do BSP), o timer local, o anel 3
+cru no CPU 1 (a syscall atendida nele) e uma syscall que bloqueia no BSP e
+é retomada no CPU 1 com a KPCR.UserRsp do BSP envenenada: a volta ao anel 3
+sai pela KPCR do CPU 1.
 
 **Thread corrente por CPU.** Como no NT, a thread corrente é a
 KPRCB.CurrentThread da KPCR de cada processador: `ps::process::
@@ -3227,7 +3258,8 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     Todos alocam e tomam as travas do Rust: só rodam com
     `stop::locks_held()` falso. Saída paginada pelo tamanho (`mais: N`),
     campos separados por tabulação. A linha do `qRcmd` aceita 512 bytes.
-  - Os APs ainda usam a própria IDT de três vetores: só o BSP trata
+  - Os APs não armados usam a própria IDT de três vetores (os armados,
+    a cópia da do BSP, com a NMI dos APs no vetor 2): só o BSP trata
     `int 3`/#DB, e os comparadores de hardware são carregados só no
     processador da parada.
 - **Bugcheck** (`ke/bugcheck.rs`, `ke/bugcheck_reason.rs`,

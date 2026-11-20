@@ -176,6 +176,11 @@ pub fn kmain() -> ! {
     if let Err(error) = crate::ntos::ps::user::index::init() {
         debug_print!("[usermode] anel 3 nao armado: {}", error);
     }
+    // `--user-smp`: os APs armam o anel 3 (a GDT, a TSS, a IDT, os MSRs de
+    // syscall e o timer local de cada um) e esperam no laço ocioso deles.
+    if boot_config::user_smp() {
+        crate::ntos::ke::smp::start_scheduling_all();
+    }
     // Os valores iniciais de GUID_ACDC_POWER_SOURCE (o
     // PopInitilizeAcDcSettings do PoInitSystem).
     crate::ntos::po::power_setting::initialize_ac_dc_settings();

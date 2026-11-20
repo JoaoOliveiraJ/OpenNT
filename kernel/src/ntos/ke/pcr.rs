@@ -67,11 +67,20 @@ pub mod layout {
     /// síncrona, células da thread corrente que a troca leva.
     pub const NATIVE_FRAME: u64 = SPIN_LOCKS_HELD + 8;
     pub const NATIVE_OWNER: u64 = NATIVE_FRAME + 8;
+    /// A GDT da CPU (16 entradas) e a TSS dela (104 bytes), que o
+    /// `usermode::processor_user_mode_init` monta e publica em
+    /// KPCR.GdtBase/TssBase, como as que o KiInitializeProcessor do 19041
+    /// aloca para cada processador.
+    pub const PROCESSOR_GDT: u64 = (NATIVE_OWNER + 8 + 63) & !63;
+    pub const PROCESSOR_TSS: u64 = PROCESSOR_GDT + 0x80;
+    /// Os tiques do timer local de um AP (vetor 0x41), contados pelo stub de
+    /// interrupção pelo GS.
+    pub const PROCESSOR_TICKS: u64 = PROCESSOR_TSS + 0x70;
     pub const SIZE: u64 = 0xC000;
 
     const _: () = assert!(size_of::<Kpcr>() as u64 <= SIZE);
     const _: () = assert!(USER_EXECUTION + size_of::<UserExecutionBlock>() as u64 <= SIZE);
-    const _: () = assert!(SHARED_LOCKS_HELD + 4 <= NATIVE_FRAME && NATIVE_OWNER + 8 <= SIZE);
+    const _: () = assert!(SHARED_LOCKS_HELD + 4 <= NATIVE_FRAME && NATIVE_OWNER + 8 <= PROCESSOR_GDT && PROCESSOR_TICKS + 4 <= SIZE);
     const _: () = assert!(USER_RSP == 0x10 && PRCB_CURRENT_THREAD == 0x188 && PRCB_RSP_BASE == 0x1A8);
 }
 

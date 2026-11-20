@@ -46,6 +46,10 @@ pub const HEAP_CENSUS: &str = "HEAPCENSUS";
 /// Toda saída de serviço passa pelo despachante (a volta direta ao anel 3,
 /// o KiSystemServiceExit, desligada): para isolar um problema nela.
 pub const SLOW_SERVICE_EXIT: &str = "SLOWSERVICEEXIT";
+/// Os APs armam o anel 3 no boot (a GDT, a TSS, a IDT, os MSRs de syscall e
+/// o timer local de cada um) e esperam no laço ocioso deles, com as
+/// interrupções ligadas (`ke::smp::start_scheduling`).
+pub const USER_SMP: &str = "USERSMP";
 /// O texto do console também vai para a serial.
 pub const CONSOLE_MIRROR: &str = "CONSOLEMIRROR";
 /// `smss`: o primeiro processo de usuário é o smss.exe real.

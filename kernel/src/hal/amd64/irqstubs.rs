@@ -202,8 +202,9 @@ irq_gs_ready:
     # R9 = pagina de IRQ pelo mapa direto (ja salvo no quadro).
     movabs r9, {irq_page}
 
-    # irq_count[vetor]++
-    inc dword ptr [r9 + rdi*4 + {irq_count}]
+    # irq_count[vetor]++, atomico: com o anel 3 nos APs, varias CPUs contam
+    # (o vetor 0x41 do timer de cada AP, as NMIs, as excecoes).
+    lock inc dword ptr [r9 + rdi*4 + {irq_count}]
 
     # excecoes (0-31), int 0x29 (fast fail) e int 0x2D (servico de depuracao)
     cmp edi, 0x20
@@ -214,9 +215,15 @@ irq_gs_ready:
     je irq_exception
 
     # O timer pode encerrar um intervalo de usuario: o CONTEXT e capturado
-    # antes de qualquer ISR tocar x87/SSE.
+    # antes de qualquer ISR tocar x87/SSE. O 0x40 e o relogio do BSP; o 0x41,
+    # o timer local de cada AP com o anel 3 armado, que tambem conta os
+    # tiques dele na KPCR (pelo GS: o do usuario ja foi trocado acima).
     cmp edi, 0x40
+    je irq_timer_context
+    cmp edi, 0x41
     jne irq_context_saved
+    lock inc dword ptr gs:[{processor_ticks}]
+irq_timer_context:
     cmp word ptr [rsp + 88], 0x33
     jne irq_context_saved
     mov rax, gs:[{context}]
@@ -337,9 +344,13 @@ irq_kd_tick_enter:
     OPENNT_KD_ENTER
     mov edi, 0x40
 irq_restore_interval:
-    # Fim do intervalo de usuario pelo timer: volta ao escalonador (tipo 2).
+    # Fim do intervalo de usuario pelo timer (o do BSP ou o de um AP): volta
+    # ao escalonador (tipo 2).
     cmp edi, 0x40
+    je irq_timer_interval
+    cmp edi, 0x41
     jne irq_restore_registers
+irq_timer_interval:
     cmp word ptr [rsp + 88], 0x33
     jne irq_restore_registers
     cmp qword ptr gs:[{context}], 0
@@ -763,6 +774,7 @@ irq_kernel_resume_vector:
     fault_cr2 = const gs_offset(offset_of!(UserExecutionBlock, fault_cr2)),
     native_frame = const crate::ntos::ke::pcr::layout::NATIVE_FRAME,
     native_owner = const crate::ntos::ke::pcr::layout::NATIVE_OWNER,
+    processor_ticks = const crate::ntos::ke::pcr::layout::PROCESSOR_TICKS,
 );
 
 extern "C" {

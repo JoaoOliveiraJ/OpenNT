@@ -73,6 +73,9 @@ pub struct BuildOptions {
     /// `--slow-service-exit`: toda saída de serviço passa pelo despachante
     /// (sem a volta direta ao anel 3, o KiSystemServiceExit, que é o padrão).
     pub slow_service_exit: bool,
+    /// `--user-smp`: os APs armam o anel 3 no boot e esperam no laço ocioso
+    /// deles (`ke::smp::start_scheduling`).
+    pub user_smp: bool,
     /// `--initial-process=smss`: o kernel inicia o smss.exe real como o
     /// primeiro processo de usuário (vazio = o boot comum).
     pub initial_process: String,
@@ -180,6 +183,9 @@ impl BuildOptions {
         if self.slow_service_exit {
             words.push(String::from(name::SLOW_SERVICE_EXIT));
         }
+        if self.user_smp {
+            words.push(String::from(name::USER_SMP));
+        }
         if self.console_mirror {
             words.push(String::from(name::CONSOLE_MIRROR));
         }
@@ -237,6 +243,7 @@ impl BuildOptions {
             trace_rpc: false,
             heap_census: false,
             slow_service_exit: false,
+            user_smp: false,
             storage: String::new(),
             display: String::new(),
             pnp_root: String::new(),
@@ -527,6 +534,7 @@ mod tests {
             trace_rpc: false,
             heap_census: false,
             slow_service_exit: false,
+            user_smp: false,
             initial_process: String::new(),
             storage: String::new(),
             display: String::new(),
