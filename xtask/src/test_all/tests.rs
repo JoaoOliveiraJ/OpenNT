@@ -47,8 +47,9 @@ fn every_components_test_is_a_valid_test_boot() {
 /// nas opções de carga, e só o volume do smss, o do processo de console
 /// (`--console-process`), o da conta de teste (`--conta-de-teste`), o das
 /// contas embutidas desligadas (os testes com entrada: `--send`,
-/// `--dismiss`, `--mouse`) e o do gancho que desliga a cadeia
-/// (`--shutdown-test=cadeia`) pedem outras pastas de imagens.
+/// `--dismiss`, `--mouse`, `--start-menu`) e o do gancho que desliga a
+/// cadeia (`--shutdown-test=cadeia`) pedem outras pastas de imagens, uma
+/// por volume, e a lista dos volumes é esta.
 #[test]
 fn the_whole_round_compiles_one_kernel() {
     let tests = plan::load(&crate::build::workspace_root()).unwrap();
@@ -60,8 +61,33 @@ fn the_whole_round_compiles_one_kernel() {
     let mut kernels: Vec<&str> = runs.iter().map(|run| tests[run.test].kernel_key.as_str()).collect();
     kernels.dedup();
     assert_eq!(kernels.len(), 1, "builds do kernel diferentes na rodada");
+    // Cada pasta de imagens é um volume: o processo inicial, o processo de
+    // console, a conta de teste, as contas embutidas desligadas e o gancho
+    // que desliga a cadeia.
+    let volume = |test: &Test| {
+        let mut command = vec![String::from("test-boot")];
+        command.extend(test.arguments.iter().cloned());
+        let options = crate::test_build_options(&crate::parse(command).unwrap());
+        (options.initial_process.clone(), options.console_process, options.test_account, options.builtin_accounts_off, options.shutdown_chain)
+    };
+    let mut volumes: Vec<(String, bool, bool, bool, bool)> = Vec::new();
+    for run in &runs {
+        let found = volume(&tests[run.test]);
+        if !volumes.contains(&found) {
+            volumes.push(found);
+        }
+    }
+    volumes.sort();
+    // O boot comum, o do processo de console, o do smss, o do smss com as
+    // contas embutidas desligadas (os testes com entrada), o da conta de
+    // teste, o da conta de teste com o gancho que desliga a cadeia (o
+    // desligamento-cadeia) e o da conta de teste com entrada (o
+    // --start-menu do menu-iniciar também é entrada e liga o gancho das
+    // contas embutidas).
+    let expected = [("", false, false, false, false), ("", true, false, false, false), ("smss", false, false, false, false), ("smss", false, false, true, false), ("smss", false, true, false, false), ("smss", false, true, false, true), ("smss", false, true, true, false)];
+    assert_eq!(volumes, expected.map(|(process, console, account, builtin, chain)| (String::from(process), console, account, builtin, chain)), "volumes da rodada");
     let images = runs.iter().map(|run| run.image + 1).max().unwrap_or(0);
-    assert!(images <= 6, "{images} pastas de imagens");
+    assert_eq!(images, volumes.len(), "uma pasta de imagens por volume");
     // As execuções de uma pasta vêm juntas, e a de cada teste é a da chave dele.
     for pair in runs.windows(2) {
         assert!(pair[0].image <= pair[1].image);
