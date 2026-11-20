@@ -487,6 +487,13 @@ comando = "cargo xtask test-boot STORAGE_REAL_OK 300000 --pnp-root=internal --st
 descricao = "Com --pnp-root=internal a raiz da árvore é o barramento PCI interno do kernel (os PDOs respondem como os do pci.sys), sem drivers de barramento com árbitros: os recursos vêm dos árbitros da raiz e as IRQs de linha são traduzidas pela HAL para o vetor fixo do 8259. A pilha IDE real (intelide/pciidex, atapi/ataport, disk/partmgr) sobe nas funções desse barramento e os setores lidos pela pilha conferem com os do driver ATA interno (STORAGE_REAL_OK)."
 
 [[teste]]
+id = "ata-falha"
+titulo = "Erro de leitura no disco ATA e nova tentativa"
+marcador = "ATA_RETRY_OK"
+comando = "cargo xtask test-boot ATA_RETRY_OK 120000 --ata-fault=read --build-dir=build/ata-falha \"--expect=[boot] NTFS montado em D:\" --expect=KERNEL_RS_OK"
+descricao = "Com --ata-fault=read o volume NTFS de dados (o segundo disco do canal IDE primário) fica atrás do filtro blkdebug do QEMU, que deixa passar a primeira leitura do disco (a do próprio QEMU, que lê o setor 0 para a geometria CHS) e devolve um erro de E/S, uma vez, à leitura seguinte, que já é do kernel. O IDE do QEMU termina o READ DMA com ERR no status e ABRT no registrador de erro; o driver ATA do kernel registra a falha numa linha [ata] (comando, drive, LBA, setores, status, erro, bus master e tempo) e manda o comando de novo, como o classpnp faz com um pedido que falhou (até 4 novas tentativas). A segunda tentativa conclui (ATA_RETRY_OK), o NTFS monta em D: e o boot chega ao fim (KERNEL_RS_OK)."
+
+[[teste]]
 id = "nvme"
 titulo = "Disco NVMe pela pilha storport do Windows"
 marcador = "NVME_VOLUME_OK"
@@ -864,7 +871,7 @@ icone = "disk"
 descricao = "Lê e grava setores dos discos do canal IDE primário (LBA28) por DMA de bus master da controladora PIIX3, com PIO como alternativa."
 estado = "em desenvolvimento"
 caminhos = ["kernel/src/drivers/storage/ata_pio.rs", "kernel/src/drivers/storage/ata_volume.rs"]
-testes = ["fase4"]
+testes = ["fase4", "ata-falha"]
 fase = "4"
 notas = "Suporte de boot do próprio kernel, não um substituto do atapi.sys: é por ele que o kernel lê e grava o volume NTFS do segundo disco, de onde vêm o cng.sys, a ci.dll e os catálogos. No boot comum ele atende todo acesso a disco; com --storage=real a pilha de disco do Windows assume a controladora no fim da fase 1, depois de este driver ler o que o boot precisa. Um comando por vez no canal, sob o lock do canal (testado com leitores em outras CPUs), e prazos em tempo de relógio em vez de um número fixo de leituras do status, que sob carga no host dava por falho um flush ainda em andamento. As falhas seguem a pilha de disco do 19041 num disco IDE: o prazo de cada comando é o TimeOutValue do disk.sys (10 s, ou o valor de Services\\disk\\TimeOutValue) e o do FLUSH CACHE quatro vezes ele; um comando vencido leva o canal ao reset (o SRST do atapi.sys, com até 60 s para o BSY cair) e o pedido é mandado de novo até 4 vezes (o MaxNumberOfIoRetries do classpnp, ou o valor de Control\\Classpnp) antes de falhar. Cada tentativa que falha sai numa linha [ata] da serial com o comando, o drive, o LBA, os setores, o status, o registrador de erro, o status do bus master e o tempo. Também expõe o segundo disco como o dispositivo de volume \\Device\\AtaVolume1, que os file systems reais montam pelo IopMountVolume: VPB, DO_DIRECT_IO, a capacidade do IDENTIFY DEVICE e os IOCTLs de disco, armazenamento e mount manager da montagem; as escritas do file system ficam numa sobreposição em memória, porque o leitor NTFS do kernel continua dono do disco."
 

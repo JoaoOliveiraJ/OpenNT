@@ -54,6 +54,11 @@ pub struct MachineOptions {
     /// Porta TCP do monitor HMP (o rastro rápido do depurador gráfico liga
     /// o log de execução do QEMU por ele), se houver.
     pub monitor_port: Option<u16>,
+    /// `--ata-fault=read`: o volume NTFS de dados (o drive 1 do canal IDE
+    /// primário) atrás do filtro blkdebug do QEMU, que devolve um erro de
+    /// E/S a uma leitura do convidado ([`data_drive_file`]); vazio = o
+    /// arquivo direto.
+    pub ata_fault: String,
 }
 
 /// A COM2 como servidor TCP local, depois da COM1 (a ordem dos `-serial`
@@ -399,6 +404,29 @@ fn tpm_arguments(port: u16) -> Vec<String> {
     ]
 }
 
+/// Valores aceitos por `--ata-fault`.
+pub const ATA_FAULTS: &[&str] = &["read"];
+
+/// O arquivo do volume de dados no `-drive`: direto, ou, com
+/// `--ata-fault=read`, atrás do filtro blkdebug do QEMU. A primeira leitura
+/// do disco passa e muda o estado do filtro de 1 para 2 (é a do próprio
+/// QEMU, que lê o setor 0 para adivinhar a geometria CHS do disco IDE; sem
+/// ela, a primeira leitura do convidado); a leitura seguinte, já do
+/// convidado, volta uma vez com EIO. O IDE do QEMU relata o erro de leitura
+/// (rerror=report, o padrão) com ERR no status e ABRT no registrador de
+/// erro, e o driver ATA do kernel manda o comando de novo.
+fn data_drive_file(image: &Path, fault: &str) -> String {
+    match fault {
+        "read" => format!(
+            "file.driver=blkdebug,file.image.driver=file,file.image.filename={},\
+             file.set-state.0.event=read_aio,file.set-state.0.state=1,file.set-state.0.new_state=2,\
+             file.inject-error.0.event=read_aio,file.inject-error.0.state=2,file.inject-error.0.errno=5,file.inject-error.0.once=on",
+            image.display()
+        ),
+        _ => format!("file={}", image.display()),
+    }
+}
+
 /// Os argumentos da máquina; `no_reboot` faz o reinício do convidado
 /// encerrar o QEMU; `tpm` é a porta do simulador de TPM (`--tpm`).
 fn machine_arguments(disks: &Disks, machine: &MachineOptions, no_reboot: bool, tpm: Option<u16>) -> Vec<String> {
@@ -435,7 +463,7 @@ fn machine_arguments(disks: &Disks, machine: &MachineOptions, no_reboot: bool, t
     // Volume NTFS de dados no mestre-escravo primário, quando gerado.
     if let Some(ntfs) = &disks.data {
         let snapshot = if disks.data_snapshot { ",snapshot=on" } else { "" };
-        arguments.extend(["-drive".to_string(), format!("format=raw,if=ide,index=1,media=disk{snapshot},file={}", ntfs.display())]);
+        arguments.extend(["-drive".to_string(), format!("format=raw,if=ide,index=1,media=disk{snapshot},{}", data_drive_file(ntfs, &machine.ata_fault))]);
     }
     // Controlador NVMe (PCI\VEN_1B36&DEV_0010, classe 01.08.02) com o disco
     // particionado, com `--storage=nvme`.
@@ -1897,7 +1925,7 @@ mod tests {
     #[test]
     fn tpm_machine_has_the_simulator_backend_and_the_crb_device() {
         let disks = Disks { boot: PathBuf::from("os.img"), data: None, data_snapshot: false, nvme: None, nvme_snapshot: false };
-        let machine = MachineOptions { accelerator: "tcg".into(), memory_mb: 512, smp: 1, kd_port: None, usb: false, net: false, tpm: true, monitor_port: None };
+        let machine = MachineOptions { accelerator: "tcg".into(), memory_mb: 512, smp: 1, kd_port: None, usb: false, net: false, tpm: true, monitor_port: None, ata_fault: String::new() };
         let arguments = machine_arguments(&disks, &machine, true, Some(40_000));
         let at = arguments.iter().position(|argument| argument == "-tpmdev").expect("-tpmdev");
         assert_eq!(arguments[at + 1], "mssim,id=tpm0,host=127.0.0.1,port=40000");
@@ -1910,6 +1938,26 @@ mod tests {
         assert_eq!(machine_accelerator(&MachineOptions { accelerator: "auto".into(), ..machine.clone() }), Ok("tcg".to_string()));
         assert!(machine_accelerator(&MachineOptions { accelerator: "whpx".into(), ..machine.clone() }).is_err());
         assert_eq!(machine_accelerator(&MachineOptions { accelerator: "whpx".into(), tpm: false, ..machine }), Ok("whpx".to_string()));
+    }
+
+    /// Com `--ata-fault=read` o volume de dados vai ao QEMU atrás do
+    /// blkdebug, com a regra que deixa passar a primeira leitura e falha a
+    /// seguinte uma vez; sem a opção, o arquivo vai direto.
+    #[test]
+    fn ata_fault_puts_the_data_disk_behind_blkdebug() {
+        let disks = Disks { boot: PathBuf::from("os.img"), data: Some(PathBuf::from("ntfs.img")), data_snapshot: true, nvme: None, nvme_snapshot: false };
+        let machine = MachineOptions { accelerator: "tcg".into(), memory_mb: 512, smp: 1, kd_port: None, usb: false, net: false, tpm: false, monitor_port: None, ata_fault: "read".into() };
+        let arguments = machine_arguments(&disks, &machine, true, None);
+        let data = arguments.iter().find(|argument| argument.contains("index=1")).expect("drive 1");
+        assert_eq!(
+            data,
+            "format=raw,if=ide,index=1,media=disk,snapshot=on,file.driver=blkdebug,file.image.driver=file,file.image.filename=ntfs.img,\
+             file.set-state.0.event=read_aio,file.set-state.0.state=1,file.set-state.0.new_state=2,\
+             file.inject-error.0.event=read_aio,file.inject-error.0.state=2,file.inject-error.0.errno=5,file.inject-error.0.once=on"
+        );
+        let plain = machine_arguments(&disks, &MachineOptions { ata_fault: String::new(), ..machine }, true, None);
+        assert!(plain.iter().any(|argument| argument == "format=raw,if=ide,index=1,media=disk,snapshot=on,file=ntfs.img"));
+        assert!(!plain.iter().any(|argument| argument.contains("blkdebug")));
     }
 
     fn screen(width: usize, height: usize, fill: [u8; 3]) -> Image {

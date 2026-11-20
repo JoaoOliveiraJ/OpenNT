@@ -3960,7 +3960,9 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     serial (comando, drive, LBA, setores, status, erro, status do bus
     master e tempo), e o primeiro pedido que só conclui numa nova tentativa
     imprime `ATA_RETRY_OK`. O autoteste da fase 4 confere o reset do canal e
-    os prazos lidos do Registro.
+    os prazos lidos do Registro; o teste `ata-falha` (`--ata-fault=read`)
+    põe o volume de dados atrás do filtro blkdebug do QEMU, que devolve um
+    erro de E/S a uma leitura do kernel.
   - O `--start-driver` de um driver de file system (Type 2) cria o volume e
     abre e lê um arquivo conhecido pelos exports
     (`ntos/test/file_system_mount.rs`); a fase 6 cobre o caminho com dois

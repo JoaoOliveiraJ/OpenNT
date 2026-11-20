@@ -138,6 +138,9 @@ opcoes de build:   --release --build-dir=DIR --user-program=shell
                    a conta local Usuario, sem senha, no grupo Administradores)
 opcoes de maquina: --accel=auto|tcg|whpx (test-boot: auto = whpx quando a maquina tem; run e debug: tcg)
                    --memory-mb=N --smp=N --kd-port=N --monitor-port=N
+                   --ata-fault=read (o volume de dados atras do blkdebug do QEMU: uma leitura do
+                   convidado volta uma vez com erro de E/S; ATA_RETRY_OK quando o driver ATA a
+                   manda de novo e ela conclui)
 test-boot:         --keys=TEXTO (\\n = Enter) --expect=TEXTO (repetivel)
                    --hold=MS (segue rodando MS ms sem falha depois da ultima saida)
                    --build-only (so monta a imagem do teste) --no-build (usa a imagem ja montada)
@@ -256,6 +259,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             net: false,
             tpm: false,
             monitor_port: None,
+            ata_fault: String::new(),
         },
         positional: Vec::new(),
         keys: None,
@@ -328,6 +332,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             }
             "--kd-port" => parsed.machine.kd_port = Some(required()?.parse().map_err(|_| "--kd-port invalido")?),
             "--monitor-port" => parsed.machine.monitor_port = Some(required()?.parse().map_err(|_| "--monitor-port invalido")?),
+            "--ata-fault" => parsed.machine.ata_fault = required()?,
             "--script" => parsed.script = Some(required()?),
             "--connect" => parsed.connect = Some(required()?),
             // O padrão do `debug`; explícito no comando que o opennt-dbg roda.
@@ -388,6 +393,14 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
     }
     if parsed.expect_poweroff && parsed.hold_ms > 0 {
         return Err("--expect-poweroff e --hold se excluem (a maquina desliga)".into());
+    }
+    if !parsed.machine.ata_fault.is_empty() && !qemu::ATA_FAULTS.contains(&parsed.machine.ata_fault.as_str()) {
+        return Err(format!("--ata-fault aceita {} ({} recebido)", qemu::ATA_FAULTS.join(", "), parsed.machine.ata_fault));
+    }
+    // A gravação, a reprodução e os overlays do debug trocam os discos da
+    // máquina, e o filtro do volume de dados sairia junto.
+    if !parsed.machine.ata_fault.is_empty() && parsed.time_travel.is_some() {
+        return Err("--ata-fault nao vale com --vm-snapshots, --record ou --replay (os discos sao trocados)".into());
     }
     if !qemu::ACCELERATORS.contains(&parsed.machine.accelerator.as_str()) {
         return Err(format!("--accel aceita {} ({} recebido)", qemu::ACCELERATORS.join(", "), parsed.machine.accelerator));
