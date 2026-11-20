@@ -264,12 +264,26 @@ pub fn slice_begin(thread_id: u64, process: u64) {
     threads.insert(thread_id, ThreadSlices { name, process_id: crate::ntos::ps::process_accessors::id(process), slices: 0, tsc: 0, returns: 0 });
 }
 
+/// Um intervalo mais longo que isto (ms) vai para a serial na hora: o
+/// código de kernel não é preemptado, então nenhuma outra thread roda
+/// enquanto o serviço não volta ao despachante, e um trecho acima do
+/// timeout de controle do services.exe (30 s) derruba a partida do serviço
+/// que esperava.
+const LONG_SLICE_MS: u64 = 2_000;
+
 /// O fim do intervalo da thread `thread_id`, que começou no TSC `started`.
 pub fn slice_end(thread_id: u64, started: u64) {
     let tsc = cpu::rdtsc().wrapping_sub(started);
-    if let Some(entry) = THREADS.lock().get_mut(&thread_id) {
+    let long = {
+        let mut threads = THREADS.lock();
+        let Some(entry) = threads.get_mut(&thread_id) else { return };
         entry.slices += 1;
         entry.tsc += tsc;
+        (milliseconds(tsc) >= LONG_SLICE_MS).then_some((entry.process_id, entry.name))
+    };
+    if let Some((process_id, name)) = long {
+        let name: alloc::string::String = name.iter().take_while(|&&byte| byte != 0).map(|&byte| byte as char).collect();
+        crate::debug_print!("[sched] intervalo longo: thread {}:{} ({}) {} ms sem voltar ao despachante", process_id, thread_id, name, milliseconds(tsc));
     }
 }
 
