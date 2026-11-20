@@ -607,6 +607,8 @@ fn motherboard_bus_driver(assert: Assert) {
 
 fn ata_disk(assert: Assert) {
     use crate::drivers::storage::ata_pio as ata;
+    use crate::ntos::cm::registry;
+    use crate::ntos::io::pnp::install;
     assert(matches!(ata::present(0), Ok(true)) && matches!(ata::present(1), Ok(true)), "ata: discos mestre e escravo primarios presentes");
     let volume = ata::read_sectors(0, 1, 1).unwrap_or_default();
     assert(volume.len() == 512 && &volume[3..11] == b"NTFS    " && volume[510] == 0x55 && volume[511] == 0xAA, "ata: setor de boot NTFS no segundo disco");
@@ -621,6 +623,22 @@ fn ata_disk(assert: Assert) {
     let pattern: alloc::vec::Vec<u8> = (0..512u32).map(|index| (index as u8) ^ 0xA5).collect();
     assert(original.len() == 512 && ata::write_sectors(SECTOR, &pattern, 0).is_ok() && ata::read_sectors(SECTOR, 1, 0).is_ok_and(|back| back == pattern), "ata: WRITE DMA e leitura de volta");
     assert(ata::write_sectors_pio(SECTOR, &original, 0).is_ok() && ata::flush(0).is_ok() && ata::read_sectors(SECTOR, 1, 0).is_ok_and(|back| back == original), "ata: WRITE SECTORS por PIO restaura o setor e FLUSH CACHE");
+    // O reset do canal que segue um comando vencido (o SRST do HwReset do
+    // atapi.sys): o BSY cai e os dois discos respondem de novo com os mesmos
+    // setores.
+    assert(ata::reset_channel() && matches!(ata::present(0), Ok(true)) && matches!(ata::present(1), Ok(true)) && ata::read_sectors(0, 1, 1).is_ok_and(|again| again == volume) && ata::read_sectors(0, 1, 0).is_ok_and(|again| again == boot), "ata: reset do canal (SRST) e os discos respondem com os mesmos setores");
+    // Prazos e novas tentativas da pilha de disco do 19041: o TimeOutValue do
+    // disk.sys (10 s sem o valor na chave do serviço disk, o valor quando
+    // há), o FLUSH CACHE com quatro vezes ele e as 4 novas tentativas do
+    // classpnp.
+    let disk = alloc::format!("{}\\Services\\disk", install::CONTROL_SET);
+    let defaults = ata::timeout_ms(ata::Command::ReadDma) == 10_000 && ata::timeout_ms(ata::Command::FlushCache) == 40_000 && ata::retries() == 4;
+    let written = install::write_dword(&disk, "TimeOutValue", 0x41).is_ok();
+    ata::configure_from_registry();
+    let configured = ata::timeout_ms(ata::Command::WriteDma) == 65_000 && ata::timeout_ms(ata::Command::FlushCache) == 260_000 && ata::retries() == 4;
+    let removed = registry::node_by_path(&disk).is_some_and(|node| registry::delete_node_value(node, &disk, "TimeOutValue"));
+    ata::configure_from_registry();
+    assert(defaults && written && configured && removed && ata::timeout_ms(ata::Command::ReadDma) == 10_000, "ata: TimeOutValue do disk.sys (10 s ou o do Registro), FLUSH CACHE com 4 vezes ele e 4 novas tentativas");
     // Faixas e argumentos inválidos.
     assert(ata::read_sectors(0x0FFF_FFFF, 2, 0).is_err() && ata::read_sectors(0, 1, 2).is_err() && ata::write_sectors(0, &[0; 100], 0).is_err() && ata::read_sectors_dma_to_physical(0, 1, 0, 0x1001).is_err(), "ata: LBA28, drive, setores incompletos e destino impar recusados");
 }

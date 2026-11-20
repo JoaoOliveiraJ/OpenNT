@@ -3947,6 +3947,20 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     fila de última chance do desligamento (depois do IRP_MJ_SHUTDOWN dos
     file systems) o volume grava no disco só os setores que o file system
     gravou e manda o FLUSH CACHE; dali em diante as escritas vão direto.
+  - O driver ATA interno (`drivers/storage/ata_pio.rs`) trata falhas como a
+    pilha de disco do 19041 num disco IDE (disk.sys e classpnp.sys sobre
+    atapi.sys e ataport.sys). O prazo de cada comando é o TimeOutValue do
+    disco (10 s, ou o valor de `Services\disk\TimeOutValue`, lido quando a
+    hive SYSTEM existe), e o do FLUSH CACHE é quatro vezes ele. Um comando
+    vencido leva o canal ao reset (o SRST do atapi.sys, com até 60 s para o
+    BSY cair); um comando que o dispositivo termina com erro volta sem
+    reset. Nos dois casos o pedido é mandado de novo até 4 vezes (o
+    MaxNumberOfIoRetries do classpnp, ou o valor de `Control\Classpnp`)
+    antes de falhar. Cada tentativa que falha sai numa linha `[ata]` da
+    serial (comando, drive, LBA, setores, status, erro, status do bus
+    master e tempo), e o primeiro pedido que só conclui numa nova tentativa
+    imprime `ATA_RETRY_OK`. O autoteste da fase 4 confere o reset do canal e
+    os prazos lidos do Registro.
   - O `--start-driver` de um driver de file system (Type 2) cria o volume e
     abre e lê um arquivo conhecido pelos exports
     (`ntos/test/file_system_mount.rs`); a fase 6 cobre o caminho com dois

@@ -79,6 +79,10 @@ pub fn init() {
     // CurrentControlSet, as hives SOFTWARE, SAM, SECURITY e DEFAULT e a
     // lista de hives; sem um arquivo, as mesmas chaves em memória.
     crate::ntos::cm::hive_init::initialize_hives().unwrap_or_else(|error| panic!("hives de maquina: {error}"));
+    // O TimeOutValue do serviço disk e o MaxNumberOfIoRetries do classpnp,
+    // que o disk.sys e o classpnp.sys leem do Registro quando iniciam: o
+    // driver ATA interno usou os padrões deles até a hive SYSTEM existir.
+    crate::drivers::storage::ata_pio::configure_from_registry();
     // O contexto de licenciamento do host com o ProductPolicy capturado da
     // SYSTEM: a inicialização que o Phase1InitializationIoReady do NT faz
     // (a rotina em rva 0x7ab058: cabeçalho validado, política publicada numa
