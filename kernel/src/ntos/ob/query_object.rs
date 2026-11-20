@@ -140,7 +140,14 @@ pub fn resolve(handle: u64) -> Result<Collected, u32> {
 
 fn resolve_user(entry: Arc<UserHandle>) -> Result<Collected, u32> {
     let pointer = user_pointer(&entry);
-    if pointer != 0 {
+    // O CM_KEY_BODY de um handle `key` não tem OBJECT_HEADER nem dono no
+    // open_pointer: o tipo e o nome vêm do registro, como o CmpQueryKeyName
+    // do 19041 (o caminho da chave, para qualquer acesso do handle). O
+    // ntmarta pede esse nome no GetSecurityInfo de uma chave de ACL sem
+    // herança (MartaGetRightsFromContext → MartaConvertRegistryKeyContextToName
+    // 0x1647), como o IsUserSecuritySetInKey do profsvc faz na raiz nova do
+    // UsrClass.dat.
+    if pointer != 0 && entry.kind() != "key" {
         return from_body(pointer, entry.attributes(), entry.access());
     }
     let Some(object_type) = object_types::user_type(entry.kind()) else { return Err(0xC000_00BB) };
