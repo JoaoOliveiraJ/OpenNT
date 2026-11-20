@@ -5026,7 +5026,8 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   xtask; o ProductPolicy é o de uma instalação limpa e não ativada da
   edição (`xtask/src/product_policy.rs`: só as entradas das licenças PPD da
   edição, com os dados delas, e o estado de ativação de uma instalação
-  nova), e o NtGetCompleteWnfStateSubscription entrega ao modo usuário os
+  nova não ativada, com o Security-SPP-GenuineLocalStatus 0 da cópia não
+  genuína), e o NtGetCompleteWnfStateSubscription entrega ao modo usuário os
   callbacks WNF (`ex/wnf/notifications.rs`). O svchost do rpcss sobe o
   RpcEptMapper (`\RPC Control\epmapper`) e o RpcSs, que pede o
   NtPowerInformation 58 (o PowerSettingRegisterNotification do powrprof),

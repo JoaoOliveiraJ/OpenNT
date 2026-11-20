@@ -68,7 +68,7 @@ enum Clean {
 ///
 /// | Entrada | Quem grava | Valor no convidado |
 /// |---|---|---|
-/// | Security-SPP-GenuineLocalStatus | sppwinob.dll e ClipSp.sys, o estado genuíno | o da licença: 1 (SL_GEN_STATE_INVALID_LICENSE, não ativado) |
+/// | Security-SPP-GenuineLocalStatus | sppwinob.dll e ClipSp.sys, o estado genuíno | 0: cópia não genuína (ver abaixo) |
 /// | Security-SPP-LastWindowsActivationTime | sppwinob.dll e ClipSp.sys, na ativação | o da licença: 8 bytes zero (nenhuma ativação) |
 /// | Security-SPP-LastWindowsActivationHResult | sppwinob.dll e ClipSp.sys, na ativação | o da licença: 0xC004F012 (SL_E_VALUE_NOT_FOUND, nenhuma tentativa) |
 /// | Security-SPP-Action-StateData | ClipSp.sys, no consumo da licença | o da licença, que é também o padrão embutido no ClipSp.sys |
@@ -80,12 +80,26 @@ enum Clean {
 /// | Security-SPP-Reserved-TBLRemainingTime | sppwinob.dll, a licença por tempo | 0, pelo mesmo caminho |
 /// | 4A0C606B-2CE9-4A35-9B3E-A57D37F18632 | sppwinob.dll: acrescenta cada `Kernel-Session-Machine-Identifier` novo | removida: é o histórico das máquinas desta instalação, e o sppwinob do convidado cria a dele |
 ///
+/// O Security-SPP-GenuineLocalStatus não é o SL_GENUINE_STATE: 1 é a cópia
+/// genuína. O SLIsWindowsGenuineLocal do slc.dll lê o valor pelo
+/// SystemPolicyInformation e devolve SL_GEN_STATE_IS_GENUINE para 1,
+/// SL_GEN_STATE_INVALID_LICENSE para 0, para 3 e para o valor ausente e
+/// SL_GEN_STATE_OFFLINE para 2. O kernel trata qualquer valor diferente de
+/// zero como genuíno; 0 ou o valor ausente é o caminho da cópia não genuína
+/// (a WNF_OLIC_OS_LICENSE_NON_GENUINE e a notificação da marca d'água do
+/// explorer). O 1 das licenças da edição é o padrão que o sppsvc substitui:
+/// o sppwinob.dll (rva 0x3dd2c) grava 1 só com a licença do Windows avaliada,
+/// fora do modo de notificação (SL_LICENSING_STATUS_NOTIFICATION, rva
+/// 0x16679) e com o SL_GENUINE_RESULT sem erro, e grava 0 nos outros casos e
+/// quando cria o valor. Uma instalação não ativada fora do período de
+/// carência fica em notificação: 0.
+///
 /// As outras entradas `Security-SPP-*` que o ClipSp.sys pode atualizar (as
 /// contagens de rearme, `AllowOSReactivation`, `SharedLicense`,
 /// `AzureImdsResponse` e as demais) são definidas pelas licenças da edição
 /// e já recebem o valor delas pela regra geral.
 const INSTALL_STATE: &[(&str, Clean)] = &[
-    ("Security-SPP-GenuineLocalStatus", Clean::License),
+    ("Security-SPP-GenuineLocalStatus", Clean::Dword(0)),
     ("Security-SPP-LastWindowsActivationTime", Clean::License),
     ("Security-SPP-LastWindowsActivationHResult", Clean::License),
     ("Security-SPP-Action-StateData", Clean::License),
@@ -451,7 +465,7 @@ mod tests {
             entry("Kernel-EditionName", 1, utf16z("Professional")),
             entry("Kernel-ProductInfo", 4, 48u32.to_le_bytes().to_vec()),
             entry("Kernel-MUI-Number-Allowed", 4, 7u32.to_le_bytes().to_vec()),
-            entry("Security-SPP-GenuineLocalStatus", 4, 0u32.to_le_bytes().to_vec()),
+            entry("Security-SPP-GenuineLocalStatus", 4, 1u32.to_le_bytes().to_vec()),
             entry("Security-SPP-LastWindowsActivationTime", 3, vec![0xAA; 8]),
             entry("Security-SPP-LastWindowsActivationHResult", 3, vec![0; 4]),
             entry("Security-SPP-TokenActivation-AdditionalInfo", 1, utf16z("host")),
@@ -471,7 +485,9 @@ mod tests {
         assert_eq!(data("Kernel-ProductInfo"), Some(48u32.to_le_bytes().to_vec()));
         assert_eq!(data("Kernel-MUI-Number-Allowed"), Some(1000u32.to_le_bytes().to_vec()));
         assert_eq!(find(&guest, "Kernel-MUI-Number-Allowed").unwrap().flags, REBOOT_REQUIRED);
-        assert_eq!(data("Security-SPP-GenuineLocalStatus"), Some(1u32.to_le_bytes().to_vec()));
+        // A cópia genuína desta máquina (1) vira a não genuína de uma instalação
+        // não ativada, não o 1 padrão das licenças.
+        assert_eq!(data("Security-SPP-GenuineLocalStatus"), Some(0u32.to_le_bytes().to_vec()));
         assert_eq!(data("Security-SPP-LastWindowsActivationTime"), Some(vec![0; 8]));
         assert_eq!(data("Security-SPP-LastWindowsActivationHResult"), Some(0xC004_F012u32.to_le_bytes().to_vec()));
         assert_eq!(data("Security-SPP-TokenActivation-AdditionalInfo"), Some(vec![0, 0]));
