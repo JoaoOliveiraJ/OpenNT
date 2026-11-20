@@ -12552,6 +12552,33 @@ fn ke_kernel_stacks_exports(assert: Assert) {
         expanded == Some(0) && cells[0].get() == 1 && cells[1].get() == 1 && after == before && refused == Some(0xFFFF_FFFF_C000_00F1) && cells[0].get() == 1,
         "ke-kernel-stacks: KeExpandKernelStackAndCallout chama com CalloutActive e valida o tamanho",
     );
+    // O segmento novo: Size igual ao KeKernelStackSize (0x6000) troca de
+    // pilha; o callout roda com o RSP e a KTHREAD (StackBase, StackLimit) no
+    // segmento novo, e a KTHREAD volta ao de antes. Um Size pequeno não troca.
+    extern "win64" fn stack_probe(parameter: u64) {
+        let rsp: u64;
+        // SAFETY: só lê o registrador.
+        unsafe { core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags)) };
+        // SAFETY: as três células do teste e a KTHREAD corrente.
+        let (cells, thread) = unsafe { (crate::ntos::inc::types::Field::<u64>::array_at(parameter, 3), crate::ntos::inc::types::Kthread::at(crate::ntos::ps::process::get_current_thread())) };
+        cells[0].set(rsp);
+        cells[1].set(thread.stack_base.get());
+        cells[2].set(thread.stack_limit.get());
+    }
+    let probe = native(stack_probe as extern "win64" fn(u64) as usize as u64);
+    let probe_block = guest::alloc_bytes(24);
+    // SAFETY: as três células alocadas acima.
+    let probe_cells = unsafe { nt::Field::<u64>::array_at(probe_block, 3) };
+    probe_cells.iter().for_each(|cell| cell.set(0));
+    let (outer_base, outer_limit) = (thread.stack_base.get(), thread.stack_limit.get());
+    let switched = call_export("KeExpandKernelStackAndCallout", &[probe, probe_block, 0x6000]);
+    let (segment_rsp, segment_base, segment_limit) = (probe_cells[0].get(), probe_cells[1].get(), probe_cells[2].get());
+    let on_segment = segment_base != outer_base && segment_rsp >= segment_limit && segment_rsp < segment_base;
+    let restored = thread.stack_base.get() == outer_base && thread.stack_limit.get() == outer_limit;
+    let small = call_export("KeExpandKernelStackAndCallout", &[probe, probe_block, 0x100]);
+    let in_place = probe_cells[1].get() == outer_base;
+    assert(switched == Some(0) && on_segment && restored && small == Some(0) && in_place, "ke-kernel-stacks: KeExpandKernelStackAndCallout troca para um segmento novo de pilha (KeKernelStackSize) e volta; Size pequeno fica na pilha corrente");
+    guest::free_bytes(probe_block);
 
     // KeAllocateCalloutStackEx: validação dos parâmetros e o contexto 'Stak'.
     let output_address = guest::alloc_bytes(8);

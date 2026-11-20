@@ -2,8 +2,9 @@
 //! KeExpandKernelStackAndCalloutEx, KeIpiGenericCall e KeGenericCallDpc
 //! (com KeSignalCallDpcDone e KeSignalCallDpcSynchronize).
 //!
-//! O callout é chamado de verdade, na pilha corrente (o OpenNT não troca
-//! para um segmento novo de pilha). Os drivers rodam no processador de boot: o broadcast do
+//! O callout é chamado de verdade: na pilha corrente quando ela basta, ou num
+//! segmento novo de pilha de kernel (o KiExpandKernelStackAndCalloutSwitchStack
+//! do 19041). Os drivers rodam no processador de boot: o broadcast do
 //! KeIpiGenericCall é local, e a rotina do KeGenericCallDpc roda como DPC
 //! (DISPATCH_LEVEL) nesse processador, com SystemArgument1 apontando a
 //! contagem de pendentes (KeSignalCallDpcDone) e SystemArgument2 a barreira
@@ -52,10 +53,10 @@ const _: () = {
 /// no ntoskrnl 19041 (0x2aa650) é o KeExpandKernelStackAndCalloutInternal
 /// com Wait virando 2 ou 0 e o contexto de pilhas do chamador; o callout é
 /// `VOID Callout(Parameter)` e o resultado é o NTSTATUS da expansão, não o
-/// que o callout deixa em RAX. Sem troca de pilha no OpenNT, Wait e o
-/// contexto não mudam nada: é o mesmo caminho do KeExpandKernelStackAndCallout.
-pub fn expand_kernel_stack_and_callout(callout: u64, parameter: u64, size: u64) -> u32 {
-    expand_kernel_stack_and_callout_internal(callout, parameter, size)
+/// que o callout deixa em RAX. O segmento novo vem sempre do Mm (o OpenNT
+/// não reaproveita as pilhas de um contexto do KeAllocateCalloutStackEx).
+pub fn expand_kernel_stack_and_callout(callout: u64, parameter: u64, size: u64, wait: bool) -> u32 {
+    expand_kernel_stack_and_callout_internal(callout, parameter, size, if wait { EXPAND_WAIT } else { 0 })
 }
 
 /// KeIpiGenericCall: a rotina roda uma vez, no processador corrente.
@@ -124,14 +125,13 @@ pub fn signal_call_dpc_synchronize(barrier: u64) -> bool {
 //
 // KeExpandKernelStackAndCalloutInternal (Wait=2, Context=NULL): Size acima de
 // MAXIMUM_EXPANSION_SIZE -> STATUS_INVALID_PARAMETER_3; IRQL acima de
-// DISPATCH_LEVEL -> KeBugCheckEx(0xA, 2, irql, 0, 0); quando a pilha corrente
-// basta, o callout roda no lugar com KTHREAD.MiscFlags.CalloutActive ligado
-// e o IRQL tem de voltar igual (senão KeBugCheckEx(0xC8, ...)). O OpenNT
-// sempre segue esse caminho (sem troca para um segmento novo de pilha). Os
-// contextos de KeAllocateCalloutStackEx têm o layout real e uma pilha de
-// kernel real por nível (`mm/kernel_stack`, o MmCreateKernelStack, grande no
-// tipo 1), guardada pelo StackBase; os callouts ainda usam a pilha corrente,
-// como o KeExpandKernelStackAndCalloutEx acima.
+// DISPATCH_LEVEL -> KeBugCheckEx(0xA, 2, irql, 0, 0); o callout roda com
+// KTHREAD.MiscFlags.CalloutActive ligado, na pilha corrente quando ela basta
+// ou num segmento novo, e o IRQL tem de voltar igual (senão
+// KeBugCheckEx(0xC8, ...)). Os contextos de KeAllocateCalloutStackEx têm o
+// layout real e uma pilha de kernel real por nível (`mm/kernel_stack`, o
+// MmCreateKernelStack, grande no tipo 1), guardada pelo StackBase; o
+// segmento novo do KeExpandKernelStackAndCallout vem do Mm a cada chamada.
 
 const STATUS_NO_MEMORY: u32 = 0xC000_0017;
 const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
@@ -180,8 +180,94 @@ impl CalloutStackContext {
     }
 }
 
-/// KeExpandKernelStackAndCallout: NTSTATUS.
-pub fn expand_kernel_stack_and_callout_internal(callout: u64, parameter: u64, size: u64) -> u32 {
+/// O bit Wait do KeExpandKernelStackAndCalloutInternal (2 no
+/// KeExpandKernelStackAndCallout; o Wait do Ex).
+pub const EXPAND_WAIT: u32 = 2;
+/// STATUS_INVALID_PARAMETER_4: o Wait em DISPATCH_LEVEL.
+const STATUS_INVALID_PARAMETER_4: u32 = 0xC000_00F2;
+/// KeKernelStackSize do 19041 (KERNEL_STACK_SIZE): um pedido desse tamanho
+/// sempre ganha um segmento novo; acima dele, o segmento é uma pilha grande.
+const NT_KERNEL_STACK_SIZE: u64 = 0x6000;
+
+/// O RSP de quem chama.
+fn current_rsp() -> u64 {
+    let rsp: u64;
+    // SAFETY: só lê o registrador.
+    unsafe { core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags)) };
+    rsp
+}
+
+/// O callout e o parâmetro, para o trampolim na pilha nova.
+#[repr(C)]
+struct SegmentCall {
+    callout: u64,
+    parameter: u64,
+}
+
+/// O trampolim que roda no segmento novo: o callout pelo portão nativo.
+extern "sysv64" fn segment_trampoline(call: *const SegmentCall) {
+    // SAFETY: o bloco vive no quadro de `call_on_segment`, que espera a volta.
+    let call = unsafe { &*call };
+    native_call::call(call.callout, &[call.parameter]);
+}
+
+/// KiSwitchKernelStackAndCallout (0x401d70): o RSP passa para `top` (alinhado
+/// a 16), o callout roda e o RSP anterior volta.
+fn call_on_segment(top: u64, callout: u64, parameter: u64) {
+    let call = SegmentCall { callout, parameter };
+    // SAFETY: `top` é o topo de uma pilha de kernel viva e alinhada; o RSP
+    // anterior fica em r12 (preservado pelo trampolim sysv64) e volta antes
+    // de sair do asm.
+    unsafe {
+        core::arch::asm!(
+            "mov r12, rsp",
+            "mov rsp, {top}",
+            "call {trampoline}",
+            "mov rsp, r12",
+            top = in(reg) top,
+            trampoline = sym segment_trampoline,
+            in("rdi") &call as *const SegmentCall,
+            out("r12") _,
+            clobber_abi("sysv64"),
+        );
+    }
+}
+
+/// KiExpandKernelStackAndCalloutOnStackSegment (0x2aa8c0): uma pilha de
+/// kernel nova (grande acima do KeKernelStackSize) com o KERNEL_STACK_CONTROL
+/// apontando o segmento anterior; a KTHREAD passa a ela (InitialStack,
+/// StackBase, StackLimit) enquanto o callout roda e volta depois; a pilha sai
+/// com o MmDeleteKernelStack. Sem memória, STATUS_NO_MEMORY.
+fn callout_on_new_segment(thread: &crate::ntos::inc::types::Kthread, callout: u64, parameter: u64, size: u64) -> u32 {
+    use crate::ntos::inc::types::extra_fs_fat::KernelStackControl;
+    use crate::ntos::mm::kernel_stack;
+    let Ok(stack) = kernel_stack::create(size > NT_KERNEL_STACK_SIZE) else { return STATUS_NO_MEMORY };
+    let outer = (thread.initial_stack.get(), thread.stack_base.get(), thread.stack_limit.get());
+    // SAFETY: o KERNEL_STACK_CONTROL da pilha recém-criada.
+    let control = unsafe { KernelStackControl::at(stack.initial) };
+    control.current_stack_base.set(stack.base);
+    control.actual_limit.set(stack.limit);
+    control.previous.stack_base.set(outer.1);
+    control.previous.stack_limit.set(outer.2);
+    control.previous.initial_stack.set(outer.0);
+    thread.initial_stack.set(stack.initial);
+    thread.stack_base.set(stack.base);
+    thread.stack_limit.set(stack.limit);
+    call_on_segment(stack.initial & !0xF, callout, parameter);
+    thread.initial_stack.set(outer.0);
+    thread.stack_base.set(outer.1);
+    thread.stack_limit.set(outer.2);
+    kernel_stack::delete(stack);
+    0
+}
+
+/// KeExpandKernelStackAndCalloutInternal(Callout, Parameter, Size, Flags):
+/// NTSTATUS. O KiExpandKernelStackAndCalloutSwitchStack (0x2aa760) troca
+/// para um segmento novo quando o espaço que resta abaixo do RSP (até o
+/// StackLimit) é menor que Size, ou quando Size é o KeKernelStackSize; senão
+/// o callout roda na pilha corrente. Em DISPATCH_LEVEL, o Wait é
+/// STATUS_INVALID_PARAMETER_4.
+pub fn expand_kernel_stack_and_callout_internal(callout: u64, parameter: u64, size: u64, flags: u32) -> u32 {
     use crate::ntos::ke::bugcheck;
     if size > MAXIMUM_EXPANSION_SIZE {
         return STATUS_INVALID_PARAMETER_3;
@@ -190,17 +276,36 @@ pub fn expand_kernel_stack_and_callout_internal(callout: u64, parameter: u64, si
     if level > irql::DISPATCH_LEVEL {
         bugcheck::bug_check_ex(IRQL_NOT_LESS_OR_EQUAL, 2, level as u64, 0, 0);
     }
+    if level == irql::DISPATCH_LEVEL && flags & EXPAND_WAIT != 0 {
+        return STATUS_INVALID_PARAMETER_4;
+    }
     let address = crate::ntos::ps::process::get_current_thread();
     // SAFETY: a KTHREAD corrente está viva durante a chamada.
     let thread = (address != 0).then(|| unsafe { crate::ntos::inc::types::Kthread::at(address) });
+    // O espaço que resta só se mede com o RSP dentro da pilha que a KTHREAD
+    // descreve; fora dela (a pilha de boot do System), o callout fica onde
+    // está.
+    let switch = thread.is_some_and(|thread| {
+        let (rsp, base, limit) = (current_rsp(), thread.stack_base.get(), thread.stack_limit.get());
+        size == NT_KERNEL_STACK_SIZE || (rsp >= limit && rsp < base && rsp - limit < size)
+    });
     // CalloutActive já ligado = callout aninhado: quem ligou é quem desliga.
     let owner = thread.filter(|thread| thread.callout_active() == 0);
     if let Some(thread) = owner {
         thread.set_callout_active(1);
     }
-    native_call::call(callout, &[parameter]);
+    let status = match thread.filter(|_| switch) {
+        Some(thread) => callout_on_new_segment(thread, callout, parameter, size),
+        None => {
+            native_call::call(callout, &[parameter]);
+            0
+        }
+    };
     if let Some(thread) = owner {
         thread.set_callout_active(0);
+    }
+    if status != 0 {
+        return status;
     }
     let after = irql::get_irql();
     if after != level {

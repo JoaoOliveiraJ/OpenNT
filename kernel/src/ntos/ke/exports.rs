@@ -240,7 +240,7 @@ fn bug_check(call: &Call) -> Result<u64, KernelError> {
     bugcheck::raise_bug_check(call.arg(1) as u32, 0, 0, 0, 0)
 }
 fn expand_kernel_stack_and_callout_ex(call: &Call) -> Result<u64, KernelError> {
-    Ok(signed_status(callout::expand_kernel_stack_and_callout(call.arg(1), call.arg(2), call.arg(3))))
+    Ok(signed_status(callout::expand_kernel_stack_and_callout(call.arg(1), call.arg(2), call.arg(3), call.arg(4) as u8 != 0)))
 }
 /// Em x86-64 a coerência de DMA é do hardware.
 fn flush_io_buffers(_: &Call) -> Result<u64, KernelError> {
@@ -824,7 +824,7 @@ pub mod ke_kernel_stacks {
     use crate::rtl::KernelError;
 
     fn expand_kernel_stack_and_callout(call: &Call) -> Result<u64, KernelError> {
-        Ok(signed_status(callout::expand_kernel_stack_and_callout_internal(call.arg(1), call.arg(2), call.arg(3))))
+        Ok(signed_status(callout::expand_kernel_stack_and_callout_internal(call.arg(1), call.arg(2), call.arg(3), callout::EXPAND_WAIT)))
     }
     fn set_kernel_stack_swap_enable(call: &Call) -> Result<u64, KernelError> {
         // SAFETY: a KTHREAD corrente (o export só existe com uma thread corrente).

@@ -747,8 +747,14 @@ e ActualLimit) e KernelStack = InitialStack; com `None` a KTHREAD descreve a
 pilha de boot (o kmain e o System rodam nela). Usam pilha própria as threads
 de usuário (a primeira, da criação em `ps/create.rs`, e as de
 NtCreateThreadEx), as threads de kernel (as de sistema dos drivers e os
-processos de kernel do escalonador, veja abaixo) e os níveis dos contextos
-de KeAllocateCalloutStackEx. Como no KiSwapContext, o
+processos de kernel do escalonador, veja abaixo), os níveis dos contextos
+de KeAllocateCalloutStackEx e o segmento novo do
+KeExpandKernelStackAndCallout(Ex) (`ke/callout.rs`): quando o espaço abaixo
+do RSP até o StackLimit é menor que o Size pedido, ou o Size é o
+KeKernelStackSize do NT (0x6000), o callout roda numa pilha nova (grande
+acima de 0x6000), com a KTHREAD (InitialStack, StackBase, StackLimit) nela e
+o KERNEL_STACK_CONTROL apontando o segmento anterior; a KTHREAD volta e a
+pilha sai no fim. Como no KiSwapContext, o
 despacho para o anel 3 (`usermode::exec_user_context`/`exec_user_mode`) grava
 em KPRCB.RspBase e TSS.RSP0 a InitialStack da KTHREAD corrente: syscalls,
 IRQs e exceções do anel 3 caem na pilha da própria thread, e o frame da
