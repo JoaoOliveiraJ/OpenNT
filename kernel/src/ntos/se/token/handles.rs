@@ -190,6 +190,30 @@ pub fn create(token: u64, access: u32, attributes: u32, from_user_mode: bool) ->
     Ok(if kernel { 0xFFFF_FFFF_8000_0000 | identifier as u64 } else { identifier as u64 })
 }
 
+/// Um handle do token, já referenciado por quem chama, na tabela do
+/// processo `target` (o ObDuplicateObject de um objeto capturado: o
+/// AlpcpExposeHandleAttribute e a classe 3 do NtAlpcQueryInformationMessage
+/// com o token de uma mensagem): num processo comum, um handle da tabela de
+/// usuário, o mesmo que o NtOpenProcessToken ou o NtDuplicateObject dele
+/// publicam, anexado ao destino; no System, um handle de kernel. Só OBJ_INHERIT
+/// passa de `attributes`. Devolve o valor do handle.
+pub fn insert_for(token: u64, access: u32, attributes: u32, target: u64) -> Result<u64, KernelError> {
+    let exclusive = tokens::with(token, |record| record.exclusive_process).unwrap_or(0);
+    if exclusive != 0 && exclusive != target {
+        return Err(KernelError::with_status("Token belongs to another exclusive process", 0xC000_0022));
+    }
+    if target == process::get_system_process() {
+        return create(token, access, (attributes & 2) | 0x200, false);
+    }
+    let Some(table) = crate::ntos::ps::user::process_state::get(target) else { return Err(KernelError::with_status("process handle table is closing", 0xC000_010A)) };
+    tokens::retain(token)?;
+    let insert = || crate::ntos::ps::user::state::alloc_user_handle_in(&table, Arc::new(UserToken { token }), access, attributes & 2, None);
+    let inserted = if target == process::get_current_process() { insert() } else { crate::ntos::ps::process_context::with_process(target, insert).and_then(|inserted| inserted) };
+    inserted.map(|handle| handle as u64).inspect_err(|_| {
+        let _ = tokens::release(token);
+    })
+}
+
 /// Token do handle pela tabela de kernel ou pela tabela do System.
 pub fn resolve_native(handle: u64) -> Option<ObjectData> {
     let identifier = KERNEL_HANDLES.lock().get(&handle).copied();

@@ -5417,9 +5417,13 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     NtAlpcQueryInformationMessage duplica cada handle no cliente, até o
     reenvio da resposta sem flags e sem atributos (o DropMsgAttributes do
     rpcrt4) ou o fechamento da porta. Só com ALLOW_DUP_OBJECT a recepção
-    traz o único handle já duplicado no cliente, e a mensagem sai. É o
-    `[system_handle]` do RPC: o UMgrLogonUser do UserManager devolve assim
-    o token do logon ao winlogon;
+    traz o único handle já duplicado no cliente, e a mensagem sai. Um token
+    entra no destino como os handles de token dele (a tabela de usuário de
+    um processo comum, onde o NtQueryInformationToken os procura, ou um
+    handle de kernel no System); os outros tipos, como linha do Object
+    Manager. É o `[system_handle]` do RPC: o UMgrLogonUser do UserManager
+    devolve assim o token do logon ao winlogon, e o RpcGetUserToken do LSM
+    o token da sessão ao DcomLaunch;
   - todo pedido sem RELEASE_MESSAGE chega com LPC_CONTINUATION_REQUIRED
     (os assíncronos também), e a desconexão ou o fechamento da porta de
     comunicação pelo servidor termina com STATUS_PORT_DISCONNECTED os

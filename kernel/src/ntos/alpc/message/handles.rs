@@ -17,10 +17,14 @@ use crate::ntos::ob::{handle_table, object_access, object_manager};
 use crate::ntos::ob::handles::process as process_handles;
 use crate::ntos::ps::process;
 use crate::ntos::ps::user::state;
+use crate::ntos::se::token::handles as token_handles;
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::alpc::message::buffer::read_field;
 use crate::ntos::inc::types::{AlpcHandleAttr, AlpcHandleAttr32, AlpcMessageAttributes, NtStruct};
 use core::mem::offset_of;
+
+/// O código ALPC do tipo Token (`type_code`).
+const TOKEN_TYPE: u32 = 0x200;
 
 /// Códigos ALPC são máscaras por espécie, não índices dinâmicos de OBJECT_TYPE.
 fn type_code(name: &str) -> Option<u32> {
@@ -384,7 +388,11 @@ pub fn duplicate(entry: &Entry, port: &Arc<Port>, mode: u8) -> Result<Result<Dup
     let mut published: Option<Duplicated> = None;
     let outcome = callbacks::perform(&item, entry.access, &options, &mut |granted| {
         let granted = implied_access(&item.object_type, granted);
-        match open_pointer::insert(&item, granted, attributes, target) {
+        // O token entra como os handles de token do destino (a tabela de
+        // usuário, onde o NtQueryInformationToken os procura); os outros
+        // tipos, como linha do Object Manager.
+        let inserted = if entry.object_type == TOKEN_TYPE { token_handles::insert_for(item.pointer, granted, attributes, target).map(|handle| handle as u32) } else { open_pointer::insert(&item, granted, attributes, target) };
+        match inserted {
             Ok(handle) => {
                 published = Some(Duplicated { granted, handle: handle | if kernel_handle { 0x8000_0000 } else { 0 }, object_type: entry.object_type });
                 Outcome { status: 0, granted: Some(granted), value: handle, error: None }
@@ -400,9 +408,8 @@ pub fn duplicate(entry: &Entry, port: &Arc<Port>, mode: u8) -> Result<Result<Dup
         return failure(outcome).map(Err);
     }
     // O token da resposta do UMLogonUser do UserManager ao winlogon
-    // (`initial_process::token_handle_received`); 0x200 é o código ALPC do
-    // tipo Token (`type_code`).
-    if entry.object_type == 0x200 {
+    // (`initial_process::token_handle_received`).
+    if entry.object_type == TOKEN_TYPE {
         crate::ntos::init::initial_process::token_handle_received(entry.source_process, target, entry.item.pointer);
     }
     published.map(Ok).ok_or_else(|| KernelError::new("ALPC duplicated handle was not published"))
