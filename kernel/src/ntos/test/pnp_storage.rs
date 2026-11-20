@@ -12,7 +12,12 @@
 //! - IoGetDmaAdapter no PDO chega ao adaptador da HAL pela interface do
 //!   barramento: tabela V2 (Size 0x138, rotinas V3 nulas), 17 registradores
 //!   de mapa para 64 KB, buffer comum com endereço lógico físico,
-//!   CalculateScatterGatherList e MapTransfer pelos stubs nativos.
+//!   CalculateScatterGatherList (uma entrada por página coberta; com
+//!   registradores de mapa, o contexto de 0xA0 bytes) e MapTransfer pelos
+//!   stubs nativos. Com RAM acima de 4 GB, o adaptador de 32 bits passa
+//!   páginas de lá pelos buffers de passagem: a lista de uma escrita já traz
+//!   os dados abaixo de 4 GB, a de uma leitura os devolve no Put, e o canal
+//!   com MapTransfer e FlushAdapterBuffers faz o mesmo.
 //! - O hash do ParentIdPrefix confere com o prefixo real de um Windows nesta
 //!   VM (`ACPI\PNP0A03\0` -> 267a616a, o "3&267a616a&0" das instâncias PCI).
 //! - A escolha de driver pelos INFs segue o posto (intelide para 7010,
@@ -212,8 +217,15 @@ fn dma_adapter(assert: Assert) {
     assert(physical == guest::read64(logical) + 0x100 && guest::read32(length) == 0x1000, "pnp-storage: MapTransfer devolve o trecho fisico contiguo");
     let size = guest::alloc_bytes(4);
     let status = native_call::call(operations.calculate_scatter_gather_list.get(), &[adapter, mdl, va + 0x100, 0x1000, size, 0]);
-    assert(status == 0 && guest::read32(size) == 0x10 + 0x18, "pnp-storage: CalculateScatterGatherList com um elemento (pagina fisica contigua)");
+    // HalpCalculateScatterGatherListSize: as duas páginas que [va + 0x100,
+    // + 0x1000) cobre; com registradores de mapa, o contexto (mínimo 0xA0).
+    let mapped = crate::hal::dma_map_registers::uses_map_registers(adapter);
+    let expected = if mapped { 0xA0 } else { 0x10 + 0x18 * 2 };
+    assert(status == 0 && guest::read32(size) == expected && mapped == (crate::hal::dma_map_registers::maximum_physical_memory_address() >= 0x1_0000_0000), "pnp-storage: CalculateScatterGatherList com uma entrada por pagina coberta (registradores de mapa so com RAM acima de 4 GB)");
     native_call::call(operations.free_common_buffer.get(), &[adapter, 0x2000, guest::read64(logical), va, 1]);
+    if mapped {
+        dma_bounce(assert, adapter, operations);
+    }
     native_call::call(operations.put_dma_adapter.get(), &[adapter]);
     assert(!crate::hal::dma::is_adapter(adapter), "pnp-storage: PutDmaAdapter");
     // DEVICE_DESCRIPTION da versão 3 (a do KMDF): a tabela HalpDmaOperationsV3.
@@ -271,6 +283,125 @@ fn dma_adapter(assert: Assert) {
         guest::free_bytes(block);
     }
     dma_adapter_v3(assert, ide.pdo_pointer);
+}
+
+/// As listas e o canal do teste de buffers de passagem: os elementos da
+/// última lista e o MapRegisterBase do último canal.
+static BOUNCE_ELEMENTS: crate::rtl::SpinLock<Vec<(u64, u32)>> = crate::rtl::SpinLock::new(Vec::new());
+static BOUNCE_BASE: AtomicU64 = AtomicU64::new(0);
+static BOUNCE_LIST: AtomicU64 = AtomicU64::new(0);
+
+/// DRIVER_LIST_CONTROL do teste: guarda os elementos; numa leitura (Context
+/// não nulo, a semente) o "dispositivo" grava o padrão da semente neles.
+extern "win64" fn bounce_list_routine(_device: u64, _irp: u64, list: u64, context: u64) {
+    let count = guest::read32(list) as u64;
+    let elements: Vec<(u64, u32)> = (0..count).map(|index| (guest::read64(list + 0x10 + index * 0x18), guest::read32(list + 0x18 + index * 0x18))).collect();
+    if context != 0 {
+        let mut offset = 0u64;
+        for &(address, length) in &elements {
+            let bytes: Vec<u8> = (0..length as u64).map(|byte| ((offset + byte) as u8) ^ context as u8).collect();
+            crate::hal::physical::write_bytes(address, &bytes);
+            offset += length as u64;
+        }
+    }
+    *BOUNCE_ELEMENTS.lock() = elements;
+    BOUNCE_LIST.store(list, Ordering::SeqCst);
+}
+
+/// DRIVER_CONTROL do teste: guarda o MapRegisterBase e solta o canal com os
+/// registradores (DeallocateObjectKeepRegisters).
+extern "win64" fn bounce_channel_routine(_device: u64, _irp: u64, base: u64, _context: u64) -> u64 {
+    BOUNCE_BASE.store(base, Ordering::SeqCst);
+    3
+}
+
+/// O padrão de `length` bytes da semente.
+fn bounce_pattern(seed: u8, length: u64) -> Vec<u8> {
+    (0..length).map(|byte| (byte as u8) ^ seed).collect()
+}
+
+/// Buffers de passagem de um adaptador V2 de 32 bits com scatter/gather numa
+/// máquina com RAM acima de 4 GB: duas páginas de lá (MmAllocatePagesForMdlEx)
+/// vão ao dispositivo pela lista (escrita, os dados já nos buffers) e voltam
+/// dele (leitura, os dados nas páginas depois do Put); o canal com
+/// MapTransfer e FlushAdapterBuffers faz o mesmo.
+fn dma_bounce(assert: Assert, adapter: u64, operations: &DmaOperations) {
+    const FOUR_GB: u64 = 0x1_0000_0000;
+    let top = crate::hal::dma_map_registers::maximum_physical_memory_address();
+    let mdl = super::phase6::call_export("MmAllocatePagesForMdlEx", &[FOUR_GB, top, 0, 0x2000, 1, 4]).unwrap_or(0);
+    let frames: Vec<u64> = (0..2).map(|index| if mdl != 0 { guest::read64(mdl + crate::ntos::inc::types::Mdl::SIZE + index * 8) << 12 } else { 0 }).collect();
+    assert(mdl != 0 && frames.iter().all(|&frame| frame >= FOUR_GB), "pnp-storage: MmAllocatePagesForMdlEx da duas paginas acima de 4 GB");
+    if mdl == 0 {
+        return;
+    }
+    let device = guest::alloc_bytes(DeviceObject::SIZE);
+    let write_pages = |seed: u8| {
+        let pattern = bounce_pattern(seed, 0x2000);
+        for (index, &frame) in frames.iter().enumerate() {
+            crate::hal::physical::write_bytes(frame, &pattern[index * 0x1000..(index + 1) * 0x1000]);
+        }
+    };
+    let pages_hold = |seed: u8| {
+        let pattern = bounce_pattern(seed, 0x2000);
+        frames.iter().enumerate().all(|(index, &frame)| crate::hal::physical::equal_bytes(frame, &pattern[index * 0x1000..(index + 1) * 0x1000]))
+    };
+    let elements_hold = |seed: u8| {
+        let elements = BOUNCE_ELEMENTS.lock().clone();
+        let mut offset = 0u64;
+        let held = elements.iter().all(|&(address, length)| {
+            let pattern: Vec<u8> = (0..length as u64).map(|byte| ((offset + byte) as u8) ^ seed).collect();
+            offset += length as u64;
+            address + length as u64 <= FOUR_GB && crate::hal::physical::equal_bytes(address, &pattern)
+        });
+        held && offset == 0x2000
+    };
+    // CalculateScatterGatherList: duas páginas, o contexto de 0xA0 bytes.
+    let (size, registers) = (guest::alloc_bytes(4), guest::alloc_bytes(4));
+    let calculated = native_call::call(operations.calculate_scatter_gather_list.get(), &[adapter, mdl, 0, 0x2000, size, registers]) == 0 && guest::read32(size) == 0xA0 && guest::read32(registers) == 2;
+    // Escrita: a lista aponta para buffers abaixo de 4 GB com os dados.
+    write_pages(0x5A);
+    BOUNCE_ELEMENTS.lock().clear();
+    BOUNCE_LIST.store(0, Ordering::SeqCst);
+    let routine = bounce_list_routine as extern "win64" fn(u64, u64, u64, u64) as usize as u64;
+    let written = native_call::call(operations.get_scatter_gather_list.get(), &[adapter, device, mdl, 0, 0x2000, routine, 0, 1]) == 0;
+    let write_list = elements_hold(0x5A);
+    assert(calculated && written && write_list, "pnp-storage: com RAM acima de 4 GB, a lista de uma escrita aponta para buffers de passagem abaixo de 4 GB com os dados");
+    // O Put devolve os registradores; a leitura seguinte usa a mesma cadeia.
+    put_last_list(adapter, operations, true);
+    BOUNCE_ELEMENTS.lock().clear();
+    let read = native_call::call(operations.get_scatter_gather_list.get(), &[adapter, device, mdl, 0, 0x2000, routine, 0xC3, 0]) == 0;
+    let read_list = elements_hold(0xC3);
+    put_last_list(adapter, operations, false);
+    assert(read && read_list && pages_hold(0xC3), "pnp-storage: a lista de uma leitura recebe o dispositivo nos buffers de passagem e o Put devolve os dados as paginas acima de 4 GB");
+    // O canal: MapTransfer de uma escrita copia para o buffer, o Flush de
+    // uma leitura copia de volta.
+    write_pages(0x77);
+    BOUNCE_BASE.store(0, Ordering::SeqCst);
+    let granted = native_call::call(operations.allocate_adapter_channel.get(), &[adapter, device, 2, bounce_channel_routine as extern "win64" fn(u64, u64, u64, u64) -> u64 as usize as u64, 0]) == 0;
+    let base = BOUNCE_BASE.load(Ordering::SeqCst);
+    let length = guest::alloc_bytes(4);
+    guest::write32(length, 0x2000);
+    let logical = native_call::call(operations.map_transfer.get(), &[adapter, mdl, base, 0, length, 1]);
+    let piece = guest::read32(length) as u64;
+    let mapped = base != 0 && logical != 0 && logical + piece <= FOUR_GB && piece != 0 && crate::hal::physical::equal_bytes(logical, &bounce_pattern(0x77, piece.min(0x1000)));
+    crate::hal::physical::write_bytes(logical, &bounce_pattern(0x99, piece.min(0x1000)));
+    let flushed = native_call::call(operations.flush_adapter_buffers.get(), &[adapter, mdl, base, 0, piece, 0]) == 1;
+    let returned = crate::hal::physical::equal_bytes(frames[0], &bounce_pattern(0x99, piece.min(0x1000)));
+    native_call::call(operations.free_map_registers.get(), &[adapter, base, 2]);
+    assert(granted && mapped && flushed && returned, "pnp-storage: o canal com registradores de mapa, MapTransfer copia a escrita ao buffer e FlushAdapterBuffers devolve a leitura");
+    super::phase6::call_export("MmFreePagesFromMdl", &[mdl]);
+    for block in [mdl, device, size, registers, length] {
+        guest::free_bytes(block);
+    }
+}
+
+/// O PutScatterGatherList da última lista do teste de buffers de passagem
+/// (a lista fica no contexto, 0x30 bytes depois do começo dele).
+fn put_last_list(adapter: u64, operations: &DmaOperations, write: bool) {
+    let list = BOUNCE_LIST.swap(0, Ordering::SeqCst);
+    if list != 0 {
+        native_call::call(operations.put_scatter_gather_list.get(), &[adapter, list, u64::from(write)]);
+    }
 }
 
 /// DEVICE_DESCRIPTION versão 3 (o HalGetAdapterV3 que o storport.sys pede):

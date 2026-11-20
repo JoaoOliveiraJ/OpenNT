@@ -44,6 +44,7 @@ pub mod public_dispatch;
 pub mod system_information;
 pub mod hypervisor;
 pub mod dma;
+pub mod dma_map_registers;
 pub mod dma_v3;
 pub mod x86bios;
 pub mod exports;

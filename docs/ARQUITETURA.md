@@ -2247,7 +2247,20 @@ routine_stubs.rs` (ids privados 0x80000400+). O adaptador de DMA é o da HAL
 DEVICE_DESCRIPTION da versão 3, o HalGetAdapterV3 com a largura de endereço
 do DmaAddressWidth e a tabela V3 de `hal/dma_v3.rs`, descrita abaixo com a
 pilha USB), alcançado pelo IoGetDmaAdapter
-através da interface do barramento. IoGetDeviceProperty,
+através da interface do barramento. Como o HalGetAdapterV2 do 19041, um bus
+master sem scatter/gather, ou um de 32 bits (sem Dma64BitAddresses) numa
+máquina com RAM acima de 4 GB, recebe registradores de mapa
+(`hal/dma_map_registers.rs`): entradas de tradução com páginas de passagem
+abaixo de 4 GB, num pool próprio montado no HalGetAdapter (contíguo, um
+bitmap, ou de scatter, uma pilha) e no do adaptador mestre (o buffer de boot
+de 64 KB, ou 192 KB com RAM acima de 4 GB, abaixo de 2 GB). O canal
+(AllocateAdapterChannel/IoFreeAdapterChannel) serializa os WAIT_CONTEXT_BLOCKs
+e entrega o MapRegisterBase; quem não acha registradores espera na fila do
+mestre até um FreeMapRegisters. O MapTransfer de uma página acima do limite
+usa o buffer (a escrita copiada na hora), o FlushAdapterBuffers devolve a
+leitura, e a lista de scatter/gather desses adaptadores é montada pelo
+MapTransfer num contexto (a lista em +0x30) quando o canal sai, com o
+PutScatterGatherList esvaziando os buffers. IoGetDeviceProperty,
 IoOpenDeviceRegistryKey, IoRegisterDeviceInterface (links
 `\??\<instância>#{guid}`) e o IoConnectInterruptEx LINE_BASED leem o
 devnode; o MESSAGE_BASED, sem interrupções por mensagem atribuídas, conecta

@@ -3,34 +3,45 @@
 //!
 //! O IoGetDmaAdapter pede ao barramento (BUS_INTERFACE_STANDARD.GetDmaAdapter)
 //! e o barramento PCI chega aqui com a DEVICE_DESCRIPTION do driver. Esta
-//! plataforma não tem IOMMU nem memória física acima de 4 GB no mapa do
-//! kernel: um dispositivo bus master enxerga a memória pelo endereço físico,
-//! sem registradores de mapa nem buffers de passagem, e o endereço lógico de
-//! um buffer é o físico. O adaptador é um DMA_ADAPTER (Version 1, Size do
-//! objeto). Uma DEVICE_DESCRIPTION das versões 0 a 2 recebe a tabela V2
+//! plataforma não tem IOMMU: um dispositivo bus master enxerga a memória pelo
+//! endereço físico, e o endereço lógico de um buffer é o físico. Um bus
+//! master sem scatter/gather, ou um de 32 bits numa máquina com RAM acima de
+//! 4 GB, recebe registradores de mapa e buffers de passagem abaixo de 4 GB
+//! (`dma_map_registers`, o caminho V2 do NT). O adaptador é um DMA_ADAPTER
+//! (Version 1, Size do objeto). Uma DEVICE_DESCRIPTION das versões 0 a 2 recebe a tabela V2
 //! (Size 0x138; as rotinas da versão 3 ficam nulas, como na tabela V2 do
 //! NT); a versão 3 (o HalGetAdapterV3, pedido pelo storport.sys quando o
 //! miniport prefere o DMA v3) recebe a tabela V3, com a largura de endereço
 //! do DmaAddressWidth (`dma_v3`). Só adaptadores bus master de pelo menos 32 bits são
-//! atendidos (sem o controlador 8237 nem buffers de passagem); os outros
+//! atendidos (sem o controlador 8237 nem buffers abaixo de 16 MB); os outros
 //! pedidos devolvem NULL.
 //!
 //! - NumberOfMapRegisters = MaximumLength / 4 KB + 1 (+1 com resto), a conta
 //!   do HalGetAdapterV2 e do HalGetAdapterV3 (o bit 31 do MaximumLength é
-//!   ignorado).
+//!   ignorado); com registradores de mapa, no máximo 64 (sem scatter/gather)
+//!   ou 512, e o que o pool próprio do adaptador conseguiu. O HalGetAdapterV2
+//!   liga o Dma32BitAddresses da DEVICE_DESCRIPTION do chamador num bus
+//!   master com scatter/gather ou com Dma64BitAddresses.
 //! - AllocateCommonBuffer: memória contígua da arena do kernel (abaixo de
 //!   272 MB), alinhada à página; LogicalAddress = endereço físico.
-//! - AllocateAdapterChannel: chama o ExecutionRoutine(DeviceObject,
-//!   DeviceObject->CurrentIrp, MapRegisterBase NULL, Context) em
-//!   DISPATCH_LEVEL; DeallocateObject e KeepObject liberam o canal no fim.
-//! - MapTransfer: o endereço físico de CurrentVa e o trecho fisicamente
-//!   contíguo dentro de *Length.
-//! - GetScatterGatherList/BuildScatterGatherList: SCATTER_GATHER_LIST com um
-//!   elemento por trecho físico contíguo do MDL (as páginas do vetor de PFNs
-//!   a partir de CurrentVa), entregue ao ExecutionRoutine(DeviceObject,
-//!   CurrentIrp, lista, Context) em DISPATCH_LEVEL; PutScatterGatherList
-//!   devolve a lista que a HAL alocou. Um trecho acima da largura de
-//!   endereço do adaptador é recusado.
+//! - AllocateAdapterChannel: o canal do adaptador, um WAIT_CONTEXT_BLOCK por
+//!   vez (o Queue.Wcb do DeviceObject), e o ExecutionRoutine(DeviceObject,
+//!   DeviceObject->CurrentIrp, MapRegisterBase, Context) em DISPATCH_LEVEL;
+//!   sem registradores de mapa, MapRegisterBase NULL (`dma_map_registers`).
+//! - MapTransfer sem MapRegisterBase: o endereço físico de CurrentVa e o
+//!   trecho fisicamente contíguo (na mesma região de 4 GB) dentro de
+//!   *Length; com ele, o buffer de passagem quando a página não alcança o
+//!   limite do adaptador. FlushAdapterBuffers traz de volta uma leitura.
+//! - GetScatterGatherList/BuildScatterGatherList: sem registradores de mapa,
+//!   SCATTER_GATHER_LIST com um elemento por trecho físico contíguo do MDL
+//!   (as páginas do vetor de PFNs a partir de CurrentVa), entregue ao
+//!   ExecutionRoutine(DeviceObject, CurrentIrp, lista, Context) no IRQL de
+//!   quem chamou, com Reserved 0 (lista da HAL) ou 1 (buffer do chamador);
+//!   com eles, a lista do contexto montada pelo MapTransfer quando o canal
+//!   sai. PutScatterGatherList esvazia os buffers e devolve o que a HAL
+//!   alocou. CalculateScatterGatherList conta as páginas (acima de
+//!   MapRegistersPerChannel, STATUS_INSUFFICIENT_RESOURCES). Um trecho acima
+//!   da largura de endereço de um adaptador V3 é recusado.
 //!
 //! A tabela V3 inteira (as variantes V3 das rotinas da V2 e as rotinas novas
 //! da versão 3) fica em `dma_v3`, sobre este mesmo objeto adaptador.
@@ -53,8 +64,7 @@ const STATUS_SUCCESS: u64 = 0;
 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
-/// IO_ALLOCATION_ACTION.
-const DEALLOCATE_OBJECT_KEEP_REGISTERS: u64 = 3;
+const FOUR_GB: u64 = 0x1_0000_0000;
 
 /// O objeto adaptador (privado da HAL; os drivers só veem o DMA_ADAPTER).
 #[repr(C)]
@@ -71,7 +81,13 @@ pub(super) struct AdapterObject {
     /// Largura de endereço do dispositivo (DmaAddressWidth da versão 3;
     /// 32 ou 64 bits pelos flags das anteriores).
     pub(super) address_width: Field<u32>,
-    _reserved: Reserved<0x14>,
+    /// NeedsMapRegisters.
+    pub(super) needs_map_registers: Field<u8>,
+    _pad_2d: Reserved<0x3>,
+    /// MaximumPhysicalAddress: o limite dos buffers de passagem e comuns
+    /// (u64::MAX sem registradores de mapa).
+    pub(super) maximum_physical_address: Field<u64>,
+    _reserved: Reserved<0x8>,
 }
 
 // SAFETY: #[repr(C)] só de células.
@@ -82,6 +98,7 @@ const _: () = {
     assert!(core::mem::offset_of!(AdapterObject, map_registers) == 0x10);
     assert!(core::mem::offset_of!(AdapterObject, device_object) == 0x20);
     assert!(core::mem::offset_of!(AdapterObject, address_width) == 0x28);
+    assert!(core::mem::offset_of!(AdapterObject, maximum_physical_address) == 0x30);
 };
 
 /// Tabela V2 (alocada uma vez; a V3 é a de `dma_v3`) e os adaptadores vivos.
@@ -173,14 +190,34 @@ pub fn get_adapter(device: u64, description: u64, map_registers: u64) -> u64 {
         _ => 32,
     };
     if address_width < 32 {
-        // Abaixo de 32 bits a HAL precisaria de buffers de passagem.
+        // Abaixo de 32 bits a HAL precisaria de buffers abaixo de 16 MB.
         debug_print!("[dma] adaptador bus master de {} bits sem suporte", address_width);
+        return 0;
+    }
+    // HalGetAdapterV2: Dma32BitAddresses ligado na DEVICE_DESCRIPTION do
+    // chamador num bus master com scatter/gather ou com Dma64; sem ele, um
+    // bus master que precisa de registradores de mapa é de 24 bits.
+    let scatter_gather = description.scatter_gather.get() != 0;
+    let dma64 = description.dma64_bit_addresses.get() != 0;
+    let needs = version < 3 && super::dma_map_registers::needs_map_registers(scatter_gather, dma64);
+    if version < 3 && (scatter_gather || dma64) {
+        description.dma32_bit_addresses.set(1);
+    }
+    if needs && description.dma32_bit_addresses.get() == 0 {
+        debug_print!("[dma] adaptador bus master de 24 bits sem buffers abaixo de 16 MB");
         return 0;
     }
     let Ok(table) = (if version == 3 { super::dma_v3::operations() } else { operations() }) else { return 0 };
     let maximum = description.maximum_length.get() & 0x7FFF_FFFF;
-    let count = (maximum >> 12) + 1 + u32::from(maximum & 0xFFF != 0);
+    let pages = (maximum >> 12) + 1 + u32::from(maximum & 0xFFF != 0);
+    let requested = if needs { pages.min(super::dma_map_registers::cap(scatter_gather)) } else { pages };
     let address = guest::alloc_bytes(AdapterObject::SIZE);
+    let count = super::dma_map_registers::register(address, needs, scatter_gather, requested);
+    if count == 0 {
+        guest::free_bytes(address);
+        debug_print!("[dma] sem buffers de passagem para o adaptador ({} registradores pedidos)", requested);
+        return 0;
+    }
     let object = adapter(address);
     object.header.version.set(1);
     object.header.size.set(AdapterObject::SIZE as u16);
@@ -194,6 +231,8 @@ pub fn get_adapter(device: u64, description: u64, map_registers: u64) -> u64 {
     object.dma64.set(description.dma64_bit_addresses.get() | u8::from(address_width >= 64));
     object.device_object.set(device);
     object.address_width.set(address_width);
+    object.needs_map_registers.set(u8::from(needs));
+    object.maximum_physical_address.set(if needs { super::dma_map_registers::LIMIT_32 } else { u64::MAX });
     ADAPTERS.lock().insert(address);
     if version == 3 {
         super::dma_v3::register(address);
@@ -202,7 +241,7 @@ pub fn get_adapter(device: u64, description: u64, map_registers: u64) -> u64 {
         // SAFETY: PULONG de saída do driver.
         unsafe { Field::<u32>::at(map_registers) }.set(count);
     }
-    debug_print!("[dma] adaptador {:#x} (versao {}, master de {} bits, max {:#x}, {} registradores de mapa)", address, version, address_width, maximum, count);
+    debug_print!("[dma] adaptador {:#x} (versao {}, master de {} bits, max {:#x}, {} registradores de mapa{})", address, version, address_width, maximum, count, if needs { ", com buffers de passagem" } else { "" });
     address
 }
 
@@ -214,6 +253,7 @@ pub fn is_adapter(address: u64) -> bool {
 pub(super) fn put_dma_adapter(call: &Call) -> Result<u64, KernelError> {
     if ADAPTERS.lock().remove(&call.arg(1)) {
         super::dma_v3::unregister(call.arg(1));
+        super::dma_map_registers::unregister(call.arg(1));
         guest::free_bytes(call.arg(1));
     }
     Ok(0)
@@ -282,29 +322,39 @@ pub(super) fn call_at_dispatch(routine: u64, arguments: &[u64]) -> u64 {
 }
 
 /// AllocateAdapterChannel(Adapter, DeviceObject, NumberOfMapRegisters,
-/// ExecutionRoutine, Context): sem registradores de mapa, o canal está
-/// sempre livre; a rotina recebe MapRegisterBase NULL.
+/// ExecutionRoutine, Context): o canal do adaptador (`dma_map_registers`).
 pub(super) fn allocate_adapter_channel(call: &Call) -> Result<u64, KernelError> {
     let (object, device, count, routine, context) = (call.arg(1), call.arg(2), call.arg(3) as u32, call.arg(4), call.arg(5));
-    if !is_adapter(object) || routine == 0 || count > adapter(object).map_registers.get() {
+    if !is_adapter(object) || device == 0 || routine == 0 {
         return Ok(STATUS_INSUFFICIENT_RESOURCES as u64);
     }
-    let action = call_at_dispatch(routine, &[device, current_irp(device), 0, context]);
-    if action == DEALLOCATE_OBJECT_KEEP_REGISTERS {
-        debug_print!("[dma] canal liberado com registradores mantidos");
-    }
-    Ok(STATUS_SUCCESS)
+    Ok(super::dma_map_registers::allocate_adapter_channel(object, device, count, routine, context) as u64)
 }
 
-pub(super) fn flush_adapter_buffers(_: &Call) -> Result<u64, KernelError> {
+/// FlushAdapterBuffers(Adapter, Mdl, MapRegisterBase, CurrentVa, Length,
+/// WriteToDevice): TRUE sempre; com MapRegisterBase, uma leitura volta do
+/// buffer de passagem.
+pub(super) fn flush_adapter_buffers(call: &Call) -> Result<u64, KernelError> {
+    let (object, mdl, base, va, length, write) = (call.arg(1), call.arg(2), call.arg(3), call.arg(4), call.arg(5) as u32, call.arg(6) as u8 != 0);
+    if is_adapter(object) && mdl != 0 && base != 0 {
+        super::dma_map_registers::flush_adapter_buffers(object, mdl, base, va, length, write);
+    }
     Ok(1)
 }
 
-pub(super) fn free_adapter_channel(_: &Call) -> Result<u64, KernelError> {
+/// FreeAdapterChannel(Adapter).
+pub(super) fn free_adapter_channel(call: &Call) -> Result<u64, KernelError> {
+    if is_adapter(call.arg(1)) {
+        super::dma_map_registers::free_adapter_channel(call.arg(1));
+    }
     Ok(0)
 }
 
-pub(super) fn free_map_registers(_: &Call) -> Result<u64, KernelError> {
+/// FreeMapRegisters(Adapter, MapRegisterBase, NumberOfMapRegisters).
+pub(super) fn free_map_registers(call: &Call) -> Result<u64, KernelError> {
+    if is_adapter(call.arg(1)) {
+        super::dma_map_registers::free_map_registers(call.arg(1), call.arg(2), call.arg(3) as u32);
+    }
     Ok(0)
 }
 
@@ -350,7 +400,7 @@ pub(super) fn physical_runs(mdl_address: u64, current_va: u64, length: u32) -> O
             let chunk = (PAGE_SIZE - in_page).min(remaining).min(end - cursor);
             let physical = frame * PAGE_SIZE + in_page;
             match runs.last_mut() {
-                Some((base, size)) if *base + *size as u64 == physical && (*size as u64 + chunk) <= u32::MAX as u64 => *size += chunk as u32,
+                Some((base, size)) if *base + *size as u64 == physical && *base / FOUR_GB == physical / FOUR_GB && (*size as u64 + chunk) <= u32::MAX as u64 => *size += chunk as u32,
                 _ => runs.push((physical, chunk as u32)),
             }
             cursor += chunk;
@@ -366,10 +416,9 @@ pub(super) fn physical_runs(mdl_address: u64, current_va: u64, length: u32) -> O
     Some(runs)
 }
 
-/// Os trechos ficam dentro da largura de endereço do adaptador. Esta
-/// plataforma não admite RAM acima de 4 GB (o mapa físico do kernel termina
-/// ali), então não há buffers de passagem a montar; um trecho além disso é
-/// recusado em vez de entregue truncado ao dispositivo.
+/// Os trechos ficam dentro da largura de endereço do adaptador. Um adaptador
+/// V2 que não alcança toda a RAM tem registradores de mapa; um V3 recusa o
+/// trecho além da largura em vez de entregá-lo truncado ao dispositivo.
 pub(super) fn reachable(object: u64, runs: &[(u64, u32)]) -> bool {
     let width = adapter(object).address_width.get();
     width >= 64 || runs.iter().all(|&(physical, size)| physical + size as u64 <= 1u64 << width)
@@ -383,6 +432,11 @@ pub(super) fn map_transfer(call: &Call) -> Result<u64, KernelError> {
     }
     // SAFETY: PULONG Length do driver.
     let length = unsafe { Field::<u32>::at(length_pointer) };
+    if call.arg(3) != 0 && is_adapter(call.arg(1)) && call.arg(2) != 0 {
+        let (logical, piece) = super::dma_map_registers::map_transfer(call.arg(1), call.arg(2), call.arg(3), call.arg(4), length.get(), call.arg(6) as u8 != 0);
+        length.set(piece);
+        return Ok(logical);
+    }
     let Some(runs) = physical_runs(call.arg(2), call.arg(4), length.get()) else { return Ok(0) };
     if !is_adapter(call.arg(1)) || !reachable(call.arg(1), &runs) {
         return Ok(0);
@@ -400,12 +454,18 @@ pub(super) fn list_size(elements: usize) -> u64 {
     LIST_ELEMENTS + elements as u64 * ScatterGatherElement::SIZE
 }
 
-/// Escreve a lista em `buffer`.
+/// Escreve a lista em `buffer` (Reserved 0: a lista é da HAL).
 pub(super) fn write_list(buffer: u64, runs: &[(u64, u32)]) {
+    write_list_marked(buffer, runs, 0);
+}
+
+/// Escreve a lista em `buffer` com o Reserved dado (0 = alocada pela HAL,
+/// 1 = no buffer do chamador).
+fn write_list_marked(buffer: u64, runs: &[(u64, u32)], reserved: u64) {
     // SAFETY: buffer do tamanho de `list_size(runs.len())`.
     let list = unsafe { ScatterGatherList::at(buffer) };
     list.number_of_elements.set(runs.len() as u32);
-    list.reserved.set(0);
+    list.reserved.set(reserved);
     for (index, &(physical, size)) in runs.iter().enumerate() {
         // SAFETY: elemento dentro do mesmo buffer.
         let element = unsafe { ScatterGatherElement::at(buffer + LIST_ELEMENTS + index as u64 * ScatterGatherElement::SIZE) };
@@ -415,15 +475,62 @@ pub(super) fn write_list(buffer: u64, runs: &[(u64, u32)]) {
     }
 }
 
+/// HalpCalculateScatterGatherListSize: as páginas que [CurrentVa,
+/// CurrentVa + Length) cobre em cada MDL da cadeia (sem MDL, as do
+/// endereço), ou o status de uma cadeia curta demais.
+fn list_pages(mdl: u64, current_va: u64, length: u32) -> Result<u64, u32> {
+    if mdl == 0 {
+        return Ok(((current_va & (PAGE_SIZE - 1)) + length as u64).div_ceil(PAGE_SIZE));
+    }
+    let mut pages = 0;
+    let (mut descriptor_address, mut cursor, mut remaining) = (mdl, current_va, length as u64);
+    while remaining > 0 {
+        if descriptor_address == 0 {
+            return Err(STATUS_BUFFER_TOO_SMALL);
+        }
+        // SAFETY: MDL da cadeia do chamador.
+        let descriptor = unsafe { Mdl::at(descriptor_address) };
+        let end = descriptor.start_va.get() + descriptor.byte_offset.get() as u64 + descriptor.byte_count.get() as u64;
+        let bytes = end.saturating_sub(cursor).min(remaining);
+        pages += ((cursor & (PAGE_SIZE - 1)) + bytes).div_ceil(PAGE_SIZE);
+        remaining -= bytes;
+        descriptor_address = descriptor.next.get();
+        if descriptor_address != 0 {
+            // SAFETY: MDL seguinte da cadeia.
+            let next = unsafe { Mdl::at(descriptor_address) };
+            cursor = next.start_va.get() + next.byte_offset.get() as u64;
+        }
+    }
+    Ok(pages)
+}
+
+/// O tamanho da lista de um adaptador (com registradores de mapa, o
+/// contexto com a lista em +0x30) e as páginas, ou o status.
+fn list_size_for(object: u64, mdl: u64, current_va: u64, length: u32) -> Result<(u64, u64), u32> {
+    let pages = list_pages(mdl, current_va, length)?;
+    if pages > super::dma_map_registers::per_channel(object) as u64 {
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    }
+    let size = if adapter(object).needs_map_registers.get() != 0 { super::dma_map_registers::list_context_size(pages) } else { list_size(pages as usize) };
+    Ok((size, pages))
+}
+
 /// GetScatterGatherList(Adapter, DeviceObject, Mdl, CurrentVa, Length,
 /// ExecutionRoutine, Context, WriteToDevice).
 pub(super) fn get_scatter_gather_list(call: &Call) -> Result<u64, KernelError> {
-    let (device, mdl, current_va, length, routine, context) = (call.arg(2), call.arg(3), call.arg(4), call.arg(5) as u32, call.arg(6), call.arg(7));
-    if !is_adapter(call.arg(1)) || mdl == 0 || routine == 0 {
+    let (object, device, mdl, current_va, length, routine, context, write) = (call.arg(1), call.arg(2), call.arg(3), call.arg(4), call.arg(5) as u32, call.arg(6), call.arg(7), call.arg(8) as u8 != 0);
+    if !is_adapter(object) || mdl == 0 || routine == 0 {
         return Ok(STATUS_INVALID_PARAMETER as u64);
     }
+    let pages = match list_size_for(object, mdl, current_va, length) {
+        Ok((_, pages)) => pages,
+        Err(status) => return Ok(status as u64),
+    };
+    if adapter(object).needs_map_registers.get() != 0 {
+        return Ok(super::dma_map_registers::scatter_gather_list(object, device, mdl, current_va, length, routine, context, write, 0, 0, pages) as u64);
+    }
     let Some(runs) = physical_runs(mdl, current_va, length) else { return Ok(STATUS_INVALID_PARAMETER as u64) };
-    if !reachable(call.arg(1), &runs) {
+    if !reachable(object, &runs) {
         return Ok(STATUS_INSUFFICIENT_RESOURCES as u64);
     }
     let buffer = guest::alloc_bytes(list_size(runs.len()));
@@ -432,7 +539,7 @@ pub(super) fn get_scatter_gather_list(call: &Call) -> Result<u64, KernelError> {
     }
     write_list(buffer, &runs);
     OWNED_LISTS.lock().insert(buffer);
-    call_at_dispatch(routine, &[device, current_irp(device), buffer, context]);
+    native_call::call(routine, &[device, current_irp(device), buffer, context]);
     Ok(STATUS_SUCCESS)
 }
 
@@ -448,24 +555,40 @@ pub(super) fn release_list(list: u64) {
     }
 }
 
-/// PutScatterGatherList(Adapter, ScatterGather, WriteToDevice).
+/// PutScatterGatherList(Adapter, ScatterGather, WriteToDevice): uma lista
+/// com contexto esvazia os buffers de passagem e solta os registradores.
 pub(super) fn put_scatter_gather_list(call: &Call) -> Result<u64, KernelError> {
-    if OWNED_LISTS.lock().remove(&call.arg(2)) {
-        guest::free_bytes(call.arg(2));
+    let (object, list, write) = (call.arg(1), call.arg(2), call.arg(3) as u8 != 0);
+    if list == 0 {
+        return Ok(0);
+    }
+    let context = super::dma_map_registers::list_context_of(list);
+    if context != 0 && is_adapter(object) {
+        super::dma_map_registers::put_scatter_gather_list(object, context, write);
+        return Ok(0);
+    }
+    if OWNED_LISTS.lock().remove(&list) {
+        guest::free_bytes(list);
     }
     Ok(0)
 }
 
 /// CalculateScatterGatherList(Adapter, Mdl, CurrentVa, Length,
-/// ScatterGatherListSize*, NumberOfMapRegisters*): sem MDL, o pior caso de
-/// uma página por elemento.
+/// ScatterGatherListSize*, NumberOfMapRegisters*): uma entrada por página
+/// coberta (HalpCalculateScatterGatherListSize); mais páginas que
+/// MapRegistersPerChannel é STATUS_INSUFFICIENT_RESOURCES.
 pub(super) fn calculate_scatter_gather_list(call: &Call) -> Result<u64, KernelError> {
-    let (mdl, current_va, length, size_output, registers_output) = (call.arg(2), call.arg(3), call.arg(4) as u32, call.arg(5), call.arg(6));
-    let pages = ((current_va & (PAGE_SIZE - 1)) + length as u64).div_ceil(PAGE_SIZE) as usize;
-    let elements = if mdl != 0 { physical_runs(mdl, current_va, length).map_or(pages, |runs| runs.len()) } else { pages };
+    let (object, mdl, current_va, length, size_output, registers_output) = (call.arg(1), call.arg(2), call.arg(3), call.arg(4) as u32, call.arg(5), call.arg(6));
+    if !is_adapter(object) {
+        return Ok(STATUS_INVALID_PARAMETER as u64);
+    }
+    let (size, pages) = match list_size_for(object, mdl, current_va, length) {
+        Ok(result) => result,
+        Err(status) => return Ok(status as u64),
+    };
     if size_output != 0 {
         // SAFETY: PULONG de saída do driver.
-        unsafe { Field::<u32>::at(size_output) }.set(list_size(elements.max(1)) as u32);
+        unsafe { Field::<u32>::at(size_output) }.set(size as u32);
     }
     if registers_output != 0 {
         // SAFETY: PULONG de saída do driver.
@@ -477,19 +600,26 @@ pub(super) fn calculate_scatter_gather_list(call: &Call) -> Result<u64, KernelEr
 /// BuildScatterGatherList(Adapter, DeviceObject, Mdl, CurrentVa, Length,
 /// ExecutionRoutine, Context, WriteToDevice, Buffer, BufferLength).
 pub(super) fn build_scatter_gather_list(call: &Call) -> Result<u64, KernelError> {
-    let (device, mdl, current_va, length, routine, context, buffer, buffer_length) = (call.arg(2), call.arg(3), call.arg(4), call.arg(5) as u32, call.arg(6), call.arg(7), call.arg(9), call.arg(10) as u32);
-    if !is_adapter(call.arg(1)) || mdl == 0 || routine == 0 || buffer == 0 {
+    let (object, device, mdl, current_va, length, routine, context, write, buffer, buffer_length) = (call.arg(1), call.arg(2), call.arg(3), call.arg(4), call.arg(5) as u32, call.arg(6), call.arg(7), call.arg(8) as u8 != 0, call.arg(9), call.arg(10) as u32);
+    if !is_adapter(object) || mdl == 0 || routine == 0 || buffer == 0 {
         return Ok(STATUS_INVALID_PARAMETER as u64);
     }
+    let (size, pages) = match list_size_for(object, mdl, current_va, length) {
+        Ok(result) => result,
+        Err(status) => return Ok(status as u64),
+    };
+    if adapter(object).needs_map_registers.get() != 0 {
+        return Ok(super::dma_map_registers::scatter_gather_list(object, device, mdl, current_va, length, routine, context, write, buffer, buffer_length, pages) as u64);
+    }
     let Some(runs) = physical_runs(mdl, current_va, length) else { return Ok(STATUS_INVALID_PARAMETER as u64) };
-    if !reachable(call.arg(1), &runs) {
+    if !reachable(object, &runs) {
         return Ok(STATUS_INSUFFICIENT_RESOURCES as u64);
     }
-    if list_size(runs.len()) > buffer_length as u64 {
+    if size > buffer_length as u64 || list_size(runs.len()) > buffer_length as u64 {
         return Ok(STATUS_BUFFER_TOO_SMALL as u64);
     }
-    write_list(buffer, &runs);
-    call_at_dispatch(routine, &[device, current_irp(device), buffer, context]);
+    write_list_marked(buffer, &runs, 1);
+    native_call::call(routine, &[device, current_irp(device), buffer, context]);
     Ok(STATUS_SUCCESS)
 }
 
