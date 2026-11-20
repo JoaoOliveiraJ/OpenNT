@@ -136,7 +136,16 @@ pub fn system_keys(control_set: &str) -> Vec<HostKey> {
         let guest_service = format!("{control_set}\\Services\\EventLog");
         registry::copy(registry::LOCAL_MACHINE, service, &guest_service, false, &mut keys);
         for subkey in SERVICE_SUBKEYS {
-            registry::copy(registry::LOCAL_MACHINE, &format!("{service}\\{subkey}"), &format!("{guest_service}\\{subkey}"), false, &mut keys);
+            let path = format!("{guest_service}\\{subkey}");
+            let before = keys.len();
+            registry::copy(registry::LOCAL_MACHINE, &format!("{service}\\{subkey}"), &path, false, &mut keys);
+            // As chaves que só um administrador lê nesta máquina (o canal
+            // Security e o State): o canal com os valores de uma instalação
+            // nova, o State vazio. Sem o canal o wevtsvc sai com
+            // ERROR_FILE_NOT_FOUND ao montar os canais clássicos.
+            if keys.len() == before {
+                keys.push(if *subkey == "Security" { security_channel(&path) } else { HostKey { path, values: Vec::new() } });
+            }
         }
         for channel in CLASSIC_CHANNELS {
             for source in registry::list(registry::LOCAL_MACHINE, &format!("{service}\\{channel}")) {
@@ -147,10 +156,36 @@ pub fn system_keys(control_set: &str) -> Vec<HostKey> {
                 }
             }
         }
+        // `Control\WMI\Security`, os descritores dos GUIDs do WMI e do ETW,
+        // que o RegistryPaths do wevtsvc abre: só um administrador lê os
+        // desta máquina, e a chave vazia dá a segurança padrão a cada GUID.
+        keys.push(HostKey { path: format!("{control_set}\\Control\\WMI\\Security"), values: Vec::new() });
     }
     #[cfg(not(windows))]
     let _ = control_set;
     keys
+}
+
+/// O canal clássico Security como uma instalação nova o grava: o nome
+/// "Segurança" (a mensagem 257 do wevtapi.dll, entre o Aplicativo 256 e o
+/// Sistema 258), o `Security.evtx` e os mesmos tamanho, retenção e acesso
+/// de convidado dos canais Application e System.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn security_channel(path: &str) -> HostKey {
+    let text = |value: &str| value.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect::<Vec<u8>>();
+    let dword = |value: u32| value.to_le_bytes().to_vec();
+    HostKey {
+        path: String::from(path),
+        values: vec![
+            (String::from("DisplayNameFile"), 2, text("%SystemRoot%\\system32\\wevtapi.dll")),
+            (String::from("DisplayNameID"), 4, dword(257)),
+            (String::from("File"), 2, text("%SystemRoot%\\system32\\winevt\\Logs\\Security.evtx")),
+            (String::from("MaxSize"), 4, dword(20_971_520)),
+            (String::from("PrimaryModule"), 1, text("Security")),
+            (String::from("Retention"), 4, dword(0)),
+            (String::from("RestrictGuestAccess"), 4, dword(1)),
+        ],
+    }
 }
 
 /// As chaves da hive SOFTWARE: os provedores e os canais do Windows em
@@ -182,7 +217,19 @@ pub fn software_keys() -> Vec<HostKey> {
 
 #[cfg(test)]
 mod tests {
-    use super::{windows_file, windows_source, without_status};
+    use super::{security_channel, windows_file, windows_source, without_status};
+
+    /// O canal Security de uma instalação nova: a mensagem 257 do wevtapi.dll
+    /// e o `Security.evtx` em `winevt\Logs`.
+    #[test]
+    fn security_channel_values() {
+        let key = security_channel("ControlSet001\\Services\\EventLog\\Security");
+        let value = |name: &str| key.values.iter().find(|(value, _, _)| value == name).map(|(_, kind, data)| (*kind, data.clone()));
+        assert_eq!(value("DisplayNameID"), Some((4, 257u32.to_le_bytes().to_vec())));
+        let file: Vec<u8> = "%SystemRoot%\\system32\\winevt\\Logs\\Security.evtx".encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect();
+        assert_eq!(value("File"), Some((2, file)));
+        assert_eq!(value("PrimaryModule").map(|(kind, _)| kind), Some(1));
+    }
     use crate::host_language::HostKey;
 
     fn text(name: &str, value: &str) -> (String, u32, Vec<u8>) {

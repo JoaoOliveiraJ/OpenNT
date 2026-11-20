@@ -534,9 +534,11 @@ const SMSS_PROGRAMS: &[&str] = &[
 /// CreateAppContainerProfile com que o winlogon cria o token LowBox do
 /// fontdrvhost (o UMFD), que lê os arquivos e as chaves pelas ACEs de ALL
 /// APPLICATION PACKAGES dos descritores do volume e das hives. E o
-/// wevtsvc.dll do serviço do log de eventos (EventLog, `event_log`). Os
-/// imports estáticos deles já estão no volume.
-const SERVICE_CHAIN_PROGRAMS: &[&str] = &["umpo.dll", "psmsrv.dll", "SystemEventsBrokerServer.dll", "brokerlib.dll", "umpnpmgr.dll", "profsvc.dll", "profext.dll", "profsvcext.dll", "wevtsvc.dll"];
+/// wevtsvc.dll do serviço do log de eventos (EventLog, `event_log`), com o
+/// wevtapi.dll: o arquivo de nomes dos canais clássicos (DisplayNameFile) e
+/// o de recursos padrão do PublisherMetadata do wevtsvc. Os imports
+/// estáticos deles já estão no volume.
+const SERVICE_CHAIN_PROGRAMS: &[&str] = &["umpo.dll", "psmsrv.dll", "SystemEventsBrokerServer.dll", "brokerlib.dll", "umpnpmgr.dll", "profsvc.dll", "profext.dll", "profsvcext.dll", "wevtsvc.dll", "wevtapi.dll"];
 
 /// O console: o conhost.exe que o condrv.sys cria para um programa de
 /// console, o cmd.exe (com o cmdext.dll do ext-ms-win-cmd-util), o net.exe,
