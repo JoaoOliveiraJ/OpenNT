@@ -73,6 +73,9 @@ struct Heap {
     free_list: *mut Block,
     total: usize,
     used: usize,
+    /// Blocos ocupados (cada um com o cabeçalho de HDR_SIZE bytes, que
+    /// `used` não conta).
+    blocks: usize,
     ram_top: u64,
     /// Próximo uso que imprime o censo (opção HEAPCENSUS); 0 sem a opção.
     next_census: usize,
@@ -86,6 +89,7 @@ static HEAP: SpinLock<Heap> = SpinLock::new(Heap {
     free_list: null_mut(),
     total: 0,
     used: 0,
+    blocks: 0,
     ram_top: 0,
     next_census: 0,
 });
@@ -198,6 +202,7 @@ impl Heap {
         heap_end &= !15;
         self.total = 0;
         self.used = 0;
+        self.blocks = 0;
         self.free_list = null_mut();
         self.free_bins = [null_mut(); HEAP_BIN_COUNT];
         if heap_end < HEAP_START + HDR_SIZE as u64 + 16 {
@@ -249,6 +254,7 @@ impl Heap {
             (*block).free = 0;
             (*block).site = heap_census::record(chain, (*block).size);
             self.used += (*block).size;
+            self.blocks += 1;
             if self.next_census != 0 && self.used >= self.next_census {
                 self.next_census = (self.used / heap_census::WATERMARK_STEP + 1) * heap_census::WATERMARK_STEP;
                 heap_census::print("marca de uso", self.used, self.total, 25, 0x1_0000);
@@ -264,6 +270,7 @@ impl Heap {
         }
         let mut block = pointer.sub(HDR_SIZE) as *mut Block;
         self.used -= (*block).size;
+        self.blocks -= 1;
         heap_census::forget((*block).site, (*block).size);
         (*block).site = 0;
         (*block).free = 1;
@@ -338,6 +345,14 @@ pub fn kfree(pointer: *mut u8) {
 pub fn info() -> (usize, usize) {
     let heap = HEAP.lock();
     (heap.total, heap.used)
+}
+
+/// O heap ocupado com os cabeçalhos: os bytes dos blocos vivos mais
+/// HDR_SIZE por bloco (o que `info` conta como usado deixa os cabeçalhos
+/// de fora).
+pub fn occupied() -> usize {
+    let heap = HEAP.lock();
+    heap.used + heap.blocks * HDR_SIZE
 }
 
 /// Topo da RAM utilizável (limitado a 4 GB).
