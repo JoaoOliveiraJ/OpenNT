@@ -425,6 +425,12 @@ fn with_table_mutation<T>(table: u64, action: impl FnOnce(&mut Table) -> Result<
     })
 }
 
+/// O ULONG alto da HANDLE_TABLE_ENTRY: GrantedAccessBits (bits 0..=24) e o
+/// NoRightsUpgrade (bit 25), que o atributo 8 da duplicação liga.
+fn granted_access_word(access: u32, attributes: u32) -> i64 {
+    ((access & 0x01FF_FFFF) | ((attributes & 8) << 22)) as i64
+}
+
 /// Codifica o corpo conforme a decodificação nativa de HANDLE_TABLE_ENTRY.
 pub fn encode_object_pointer(pointer: u64, attributes: u32) -> Result<u64, KernelError> {
     let header = pointer.wrapping_sub(OBJECT_HEADER_BODY);
@@ -451,7 +457,7 @@ pub fn insert(table: u64, handle: u64, description: &HandleDescription) -> Resul
             return Err(KernelError::new("free native handle entry was modified externally"));
         }
         owner.take_free(handle)?;
-        native.high_value.set(description.access as i64);
+        native.high_value.set(granted_access_word(description.access, description.attributes));
         let row = Row {
             pointer: description.pointer,
             type_name: description.type_name.clone(),
@@ -530,7 +536,7 @@ pub fn change(table: u64, handle: u64, attributes: u32, access: u32) -> Result<b
     let handle = handle_value(handle)?;
     entry_operation(table, handle, false, |row| {
         let entry = entry_at(row.entry);
-        entry.high_value.set(access as i64);
+        entry.high_value.set(granted_access_word(access, attributes));
         // CAS nos bits Attributes (17..=19); a entrada continua travada.
         entry.set_attributes((attributes & 7) as u64);
         if let Some(stored) = REGISTRY.lock().tables.get_mut(&table).and_then(|owner| owner.rows.get_mut(&handle)) {

@@ -54,6 +54,8 @@ const WRITE_DAC: u32 = 0x0004_0000;
 const WRITE_OWNER: u32 = 0x0008_0000;
 const GENERIC_ALL: u32 = 0x1000_0000;
 const GENERIC_READ: u32 = 0x8000_0000;
+const DUPLICATE_NO_RIGHTS_UPGRADE: u32 = 0x8;
+const DUPLICATE_SAME_ACCESS: u32 = 0x2;
 const EVENT_QUERY_STATE: u32 = 0x0001;
 const EVENT_MODIFY_STATE: u32 = 0x0002;
 const EVENT_ALL_ACCESS: u32 = 0x001F_0003;
@@ -449,46 +451,115 @@ fn take_ownership(assert: Assert) {
     assert(ran.is_some(), "acl: processo de A");
 }
 
-/// NtDuplicateObject com direitos além dos do handle de origem num objeto
-/// do Object Manager (um diretório): o ObDuplicateObject 19041
-/// (0x5f55e7..0x5f5663) só recusa direto com DUPLICATE_NO_RIGHTS_UPGRADE (8)
-/// ou um tipo com SecurityProcedure própria; senão o SeCreateAccessState e o
-/// ObpGrantAccess no processo de destino checam o pedido contra o descritor.
-/// O GetSharingHandleDuplicate do dwmredir (GENERIC_READ de um handle
-/// Composition aberto com acesso 1) depende disso.
+/// Os casos do ObDuplicateObject 19041 num objeto com descritor aberto só
+/// com o direito de consulta: GENERIC_READ além da origem concedido pelo
+/// descritor no destino (SeCreateAccessState e ObpGrantAccess,
+/// 0x5f5608..0x5f5663); DUPLICATE_NO_RIGHTS_UPGRADE não recusa a cópia que o
+/// pede, só a marca (0x5f5373), e a marca recusa direitos novos nas cópias
+/// dela e passa às cópias das cópias (0x5f55e7, 0x5f5365); MAXIMUM_ALLOWED
+/// cai no corte pelo ValidAccessMask (0x5f53c6) e a cópia sai com acesso 0;
+/// num descritor sem READ_CONTROL, GENERIC_READ é recusado.
+#[derive(Debug, PartialEq)]
+struct DuplicateCases {
+    upgraded: Result<u32, u32>,
+    marked: Result<u32, u32>,
+    from_marked: Option<u32>,
+    from_marked_copy: Option<u32>,
+    maximum: Result<u32, u32>,
+    denied: Option<u32>,
+}
+
+/// O acesso de uma cópia que deu certo (fechada em seguida) ou o NTSTATUS.
+fn copy_granted(calls: &Calls, result: Result<u64, u32>) -> Result<u32, u32> {
+    result.map(|copy| {
+        let granted = calls.granted(copy);
+        calls.close(copy);
+        granted
+    })
+}
+
+/// O NTSTATUS de uma cópia que devia falhar (`None` se deu certo, e a cópia
+/// é fechada).
+fn copy_refused(calls: &Calls, result: Result<u64, u32>) -> Option<u32> {
+    match result {
+        Ok(copy) => {
+            calls.close(copy);
+            None
+        }
+        Err(status) => Some(status),
+    }
+}
+
+/// `source` com o direito de consulta num objeto de descritor largo,
+/// `source_tight` num de descritor sem READ_CONTROL; `wider` é um pedido que
+/// o descritor largo concede.
+fn duplicate_cases(calls: &Calls, source: u64, source_tight: u64, wider: u32) -> DuplicateCases {
+    let upgraded = copy_granted(calls, calls.duplicate(source, GENERIC_READ, 0));
+    let marked = calls.duplicate(source, GENERIC_READ, DUPLICATE_NO_RIGHTS_UPGRADE);
+    let from_marked = marked.ok().and_then(|copy| copy_refused(calls, calls.duplicate(copy, wider, 0)));
+    let marked_copy = marked.ok().and_then(|copy| calls.duplicate(copy, 0, DUPLICATE_SAME_ACCESS).ok());
+    let from_marked_copy = marked_copy.and_then(|copy| copy_refused(calls, calls.duplicate(copy, wider, 0)));
+    if let Some(copy) = marked_copy {
+        calls.close(copy);
+    }
+    let marked = copy_granted(calls, marked);
+    let maximum = copy_granted(calls, calls.duplicate(source_tight, MAXIMUM_ALLOWED, 0));
+    let denied = copy_refused(calls, calls.duplicate(source_tight, GENERIC_READ, 0));
+    DuplicateCases { upgraded, marked, from_marked, from_marked_copy, maximum, denied }
+}
+
+/// [`duplicate_cases`] num diretório (tabela do Object Manager) e num evento
+/// de processo de usuário (tabela de usuário). O GetSharingHandleDuplicate do
+/// dwmredir (GENERIC_READ de um handle Composition aberto com acesso 1)
+/// depende da concessão pelo descritor.
 fn duplicate_rights_upgrade(assert: Assert) {
-    let ran = as_identity("acl-duplicata.exe", &user_a(), MEDIUM_INTEGRITY, &[], |a, _| {
+    let directories = as_identity("acl-duplicata.exe", &user_a(), MEDIUM_INTEGRITY, &[], |a, _| {
         let generous = relative_descriptor(Some(&user_a()), Some(&[allow(DIRECTORY_ALL_ACCESS, user_a())]));
         // Sem READ_CONTROL: a ACE de OWNER RIGHTS tira do dono o implícito.
         let narrow = relative_descriptor(Some(&user_a()), Some(&[allow(DIRECTORY_QUERY | DIRECTORY_TRAVERSE, sid(3, &[4])), allow(DIRECTORY_QUERY | DIRECTORY_TRAVERSE, user_a())]));
         let wide = a.create_directory("\\OpenNtAcl\\DupLarga", &generous);
         let tight = a.create_directory("\\OpenNtAcl\\DupEstreita", &narrow);
         let source = a.open_directory("\\OpenNtAcl\\DupLarga", DIRECTORY_QUERY);
-        let upgraded = source.map(|handle| a.duplicate(handle, GENERIC_READ, 0));
-        let upgraded_granted = match upgraded {
-            Ok(Ok(copy)) => {
-                let granted = a.granted(copy);
-                a.close(copy);
-                Ok(granted)
-            }
-            Ok(Err(status)) | Err(status) => Err(status),
-        };
-        let no_upgrade = source.map(|handle| a.duplicate(handle, GENERIC_READ, 8).err());
         let source_tight = a.open_directory("\\OpenNtAcl\\DupEstreita", DIRECTORY_QUERY);
-        let denied = source_tight.map(|handle| a.duplicate(handle, GENERIC_READ, 0).err());
+        let cases = match (source, source_tight) {
+            (Ok(source), Ok(source_tight)) => Some(duplicate_cases(a, source, source_tight, DIRECTORY_ALL_ACCESS)),
+            _ => None,
+        };
         for handle in [wide, tight, source, source_tight].into_iter().flatten() {
             a.close(handle);
         }
-        (upgraded_granted, no_upgrade, denied)
-    });
-    let Some((upgraded_granted, no_upgrade, denied)) = ran else {
-        assert(false, "acl: processo de A para o NtDuplicateObject");
-        return;
-    };
-    crate::debug_print!("[acl] NtDuplicateObject: GENERIC_READ -> {:x?}, opcao 8 -> {:x?}, sem READ_CONTROL -> {:x?}", upgraded_granted, no_upgrade, denied);
-    assert(upgraded_granted == Ok(READ_CONTROL | DIRECTORY_QUERY | DIRECTORY_TRAVERSE), "acl: NtDuplicateObject com GENERIC_READ de um diretorio aberto so com DIRECTORY_QUERY concede pelo descritor (ObpGrantAccess no destino)");
-    assert(no_upgrade == Ok(Some(STATUS_ACCESS_DENIED)), "acl: NtDuplicateObject com DUPLICATE_NO_RIGHTS_UPGRADE recusa direitos alem dos da origem");
-    assert(denied == Ok(Some(STATUS_ACCESS_DENIED)), "acl: NtDuplicateObject com GENERIC_READ recusado quando o descritor nao da READ_CONTROL");
+        cases
+    })
+    .flatten();
+    crate::debug_print!("[acl] NtDuplicateObject (diretorio): {:x?}", directories);
+    let events = as_identity("acl-duplicata-evento.exe", &user_a(), MEDIUM_INTEGRITY, &[], |a, _| {
+        let generous = relative_descriptor(Some(&user_a()), Some(&[allow(EVENT_ALL_ACCESS, user_a())]));
+        let narrow = relative_descriptor(Some(&user_a()), Some(&[allow(EVENT_QUERY_STATE | SYNCHRONIZE, sid(3, &[4])), allow(EVENT_QUERY_STATE | SYNCHRONIZE, user_a())]));
+        let wide = a.create_event("\\OpenNtAcl\\DupEventoLargo", Some(&generous));
+        let tight = a.create_event("\\OpenNtAcl\\DupEventoEstreito", Some(&narrow));
+        let source = a.open_event("\\OpenNtAcl\\DupEventoLargo", EVENT_QUERY_STATE);
+        let source_tight = a.open_event("\\OpenNtAcl\\DupEventoEstreito", EVENT_QUERY_STATE);
+        let cases = match (source, source_tight) {
+            (Ok(source), Ok(source_tight)) => Some(duplicate_cases(a, source, source_tight, EVENT_ALL_ACCESS)),
+            _ => None,
+        };
+        for handle in [wide, tight, source, source_tight].into_iter().flatten() {
+            a.close(handle);
+        }
+        cases
+    })
+    .flatten();
+    crate::debug_print!("[acl] NtDuplicateObject (evento de processo de usuario): {:x?}", events);
+    for (cases, read, table) in [(&directories, READ_CONTROL | DIRECTORY_QUERY | DIRECTORY_TRAVERSE, "diretorio"), (&events, READ_CONTROL | EVENT_QUERY_STATE, "evento de processo de usuario")] {
+        let Some(cases) = cases else {
+            assert(false, "acl: NtDuplicateObject: objetos e handles de origem do teste");
+            continue;
+        };
+        assert(cases.upgraded == Ok(read) && cases.marked == Ok(read), alloc::format!("acl: NtDuplicateObject ({}): GENERIC_READ alem da origem concedido pelo descritor, tambem com DUPLICATE_NO_RIGHTS_UPGRADE", table).as_str());
+        assert(cases.from_marked == Some(STATUS_ACCESS_DENIED) && cases.from_marked_copy == Some(STATUS_ACCESS_DENIED), alloc::format!("acl: NtDuplicateObject ({}): a copia marcada por DUPLICATE_NO_RIGHTS_UPGRADE, e a copia dela, nao ganham direitos", table).as_str());
+        assert(cases.maximum == Ok(0), alloc::format!("acl: NtDuplicateObject ({}): MAXIMUM_ALLOWED sai no corte pelo ValidAccessMask (acesso 0)", table).as_str());
+        assert(cases.denied == Some(STATUS_ACCESS_DENIED), alloc::format!("acl: NtDuplicateObject ({}): GENERIC_READ recusado quando o descritor nao da READ_CONTROL", table).as_str());
+    }
 }
 
 /// O descritor do processo e os direitos implícitos de processo e thread.

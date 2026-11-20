@@ -618,8 +618,23 @@ fn scenario(assert: Assert, services: &Services) {
     let denied_target = caller.duplicate(u64::MAX, event, synchronize_only, 0, 0, DUPLICATE_SAME_ACCESS).0;
     assert(synchronize_opened == 0 && denied_query == ACCESS_DENIED && denied_target == ACCESS_DENIED, "entre-processos: handle do filho so com SYNCHRONIZE nao consulta nem recebe duplicata");
     let (narrowed, event_synchronize) = caller.duplicate(u64::MAX, event, u64::MAX, SYNCHRONIZE, 0, 0);
-    let widened = caller.duplicate(u64::MAX, event_synchronize, child_handle, EVENT_MODIFY_STATE, 0, 0).0;
-    assert(narrowed == 0 && seen(parent_pointer, event_synchronize).is_some_and(|(_, _, access, _)| access == SYNCHRONIZE) && widened == ACCESS_DENIED, "entre-processos: a duplicacao estreita o acesso e nao concede direitos que a origem nao tem");
+    // Um evento sem nome não tem descritor: o ObpGrantAccess do
+    // ObDuplicateObject 19041 (0x5f5663) concede no destino o pedido além da
+    // origem. Uma cópia feita com DUPLICATE_NO_RIGHTS_UPGRADE (8) leva a marca
+    // (0x5f5373) e a cópia dela com mais direitos é recusada (0x5f55e7). As
+    // cópias saem do filho e do pai logo em seguida.
+    let (widened, widened_handle) = caller.duplicate(u64::MAX, event_synchronize, child_handle, EVENT_MODIFY_STATE, 0, 0);
+    let widened_access = seen(child_pointer, widened_handle).map(|(_, _, access, _)| access);
+    let removed = widened == 0 && caller.duplicate(child_handle, widened_handle, 0, 0, 0, DUPLICATE_CLOSE_SOURCE).0 == 0;
+    let (marked, marked_handle) = caller.duplicate(u64::MAX, event_synchronize, u64::MAX, 0, 0, DUPLICATE_SAME_ACCESS | 8);
+    let no_upgrade = caller.duplicate(u64::MAX, marked_handle, child_handle, EVENT_MODIFY_STATE, 0, 0).0;
+    if marked == 0 {
+        caller.close(marked_handle);
+    }
+    assert(
+        narrowed == 0 && seen(parent_pointer, event_synchronize).is_some_and(|(_, _, access, _)| access == SYNCHRONIZE) && widened_access == Some(EVENT_MODIFY_STATE) && removed && marked == 0 && no_upgrade == ACCESS_DENIED,
+        "entre-processos: a duplicacao estreita o acesso; num evento sem descritor o pedido alem da origem vem do ObpGrantAccess, e a copia marcada por DUPLICATE_NO_RIGHTS_UPGRADE nao ganha direitos",
+    );
     assert(handle_count(child_pointer) == baseline, "entre-processos: nada negado entra na tabela do filho");
 
     // Para o filho e de volta com DUPLICATE_CLOSE_SOURCE.

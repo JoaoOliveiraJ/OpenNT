@@ -223,9 +223,8 @@ fn nt_duplicate_object(source_process: u64, source_handle: u64, target_process: 
     // Os argumentos de pilha moram na memória de quem chama: lidos antes de
     // qualquer attach.
     // Options não é validado (o ObDuplicateObject só olha os bits que
-    // conhece). DUPLICATE_NO_RIGHTS_UPGRADE (8) proíbe que cópias da cópia
-    // ganhem direitos novos; aqui uma duplicação nunca acrescenta direitos
-    // (abaixo), então a marca não muda nada.
+    // conhece); DUPLICATE_NO_RIGHTS_UPGRADE (8) marca a cópia
+    // (`inserted::duplicate_attributes`).
     let (requested_access, requested_attributes, options) = (state::stack_arg32(rsp, 5), state::stack_arg32(rsp, 6), state::stack_arg32(rsp, 7));
     let (source, source_table) = match duplication_process(source_process) {
         Ok(found) => found,
@@ -253,16 +252,34 @@ fn nt_duplicate_object(source_process: u64, source_handle: u64, target_process: 
         if out != 0 && !state::probe_user_write(out, 8) {
             return Ok(AV);
         }
-        let attributes = if options & 4 != 0 { source_attributes } else { requested_attributes };
-        if attributes & !3 != 0 {
+        if options & 4 == 0 && requested_attributes & !3 != 0 {
             return Ok(INVALID);
         }
-        let access = if options & 2 != 0 { source_access } else { requested_access };
-        // Direitos ausentes na origem exigem nova checagem de segurança:
-        // nunca são concedidos em silêncio pela duplicação.
-        if access & !source_access != 0 {
-            return Ok(0xC000_0022);
-        }
+        let attributes = crate::ntos::ob::handles::inserted::duplicate_attributes(source_attributes, requested_attributes, options);
+        // O acesso do ObDuplicateObject (`inserted::duplicate_access`), com o
+        // objeto do handle (o processo de origem no pseudo-handle) e o tipo
+        // dele; sem corpo nativo, o tipo do handle de usuário.
+        let described = match (&entry, pseudo_process) {
+            (Some(entry), false) => entry.object.native_body().and_then(|body| open_pointer::describe(body.pointer)),
+            _ => open_pointer::describe(source),
+        };
+        let object_type = described.as_ref().map(|described| described.object_type.clone()).or_else(|| match (&entry, pseudo_process) {
+            (Some(entry), false) => object_types::user_type(entry.kind()),
+            _ => Some(object_types::process_type()),
+        });
+        let access = match object_type {
+            Some(object_type) => match crate::ntos::ob::handles::inserted::duplicate_access(&object_type, described.as_ref(), source_access, source_attributes, requested_access, options, 1, target)? {
+                Ok(access) => access,
+                Err(status) => return Ok(status),
+            },
+            None => {
+                let access = if options & 2 != 0 { source_access } else { requested_access };
+                if access & !source_access != 0 {
+                    return Ok(0xC000_0022);
+                }
+                access
+            }
+        };
         let inserted = attached(target, || match (&entry, pseudo_process) {
             (Some(entry), false) => state::duplicate_user_handle_in(entry, source, &target_table, access, attributes),
             _ => {
@@ -353,9 +370,9 @@ fn duplicate_current_thread(target_process: u64, out: u64, requested_access: u32
 /// links e os demais corpos que o Ob publica pelo ObInsertObject e pelo
 /// ObOpenObjectByPointer): o corpo é resolvido na tabela do processo de
 /// origem, anexado a ele, e a cópia entra na tabela do destino com o acesso
-/// da origem (DUPLICATE_SAME_ACCESS) ou o pedido, com os genéricos mapeados
-/// pelo tipo; direitos além dos da origem são recusados, como na tabela de
-/// usuário. DUPLICATE_CLOSE_SOURCE fecha a origem mesmo quando a cópia falha.
+/// e os atributos do ObDuplicateObject (`inserted::duplicate_access` e
+/// `duplicate_attributes`), como na tabela de usuário. DUPLICATE_CLOSE_SOURCE
+/// fecha a origem mesmo quando a cópia falha.
 fn duplicate_object_manager_handle(source: u64, source_handle: u64, target_process: u64, out: u64, requested_access: u32, requested_attributes: u32, options: u32) -> Result<u32, KernelError> {
     let resolved = match attached(source, || open_pointer::resolve(source_handle, true))? {
         Some(Ok(resolved)) => resolved,
@@ -373,45 +390,19 @@ fn duplicate_object_manager_handle(source: u64, source_handle: u64, target_proce
         if out != 0 && !state::probe_user_write(out, 8) {
             return Ok(AV);
         }
-        let attributes = if options & 4 != 0 { resolved.attributes } else { requested_attributes };
-        if attributes & !3 != 0 {
+        if options & 4 == 0 && requested_attributes & !3 != 0 {
             return Ok(INVALID);
         }
-        let object_type = &resolved.item.object_type;
-        let access = if options & 2 != 0 {
-            resolved.access
-        } else {
-            let mut access = requested_access & 0x0FFF_FFFF;
-            for (bit, mapped) in [(0x8000_0000u32, object_type.mapping[0]), (0x4000_0000, object_type.mapping[1]), (0x2000_0000, object_type.mapping[2]), (0x1000_0000, object_type.mapping[3])] {
-                if requested_access & bit != 0 {
-                    access |= mapped;
-                }
-            }
-            access & (object_type.valid_access | 0x0100_0000)
-        };
-        // ObDuplicateObject (ntoskrnl 19041, 0x5f55e7..0x5f5663): direitos além
-        // dos do handle de origem não são recusados direto. Com
-        // DUPLICATE_NO_RIGHTS_UPGRADE (8) ou um tipo com SecurityProcedure
-        // própria, ACCESS_DENIED; senão o SeCreateAccessState e o
-        // ObpGrantAccess(ObDuplicateHandle) no processo de destino (anexado,
-        // 0x5f5608) checam o pedido contra o descritor do objeto. O
+        let attributes = crate::ntos::ob::handles::inserted::duplicate_attributes(resolved.attributes, requested_attributes, options);
+        // Direitos além dos da origem passam pelo descritor no destino: o
         // GetSharingHandleDuplicate do dwmredir (DuplicateHandle com
         // GENERIC_READ de um handle Composition aberto com acesso 1) depende
         // disso para o CWindowList::CreateSprite do uDWM pôr a janela na cena.
-        let mut access = access;
-        if access & !resolved.access != 0 {
-            let procedure = object_types::type_object(object_type.pointer).map_or(0, |native| native.type_info.security_procedure.get());
-            if options & 8 != 0 || (procedure != 0 && procedure != crate::ntos::ob::object_security::default_object_method_address()) {
-                return Ok(0xC000_0022);
-            }
-            let checked = crate::ntos::ob::object_security::has_descriptor(&resolved.item);
-            let policy = crate::ntos::ob::object_security::described_policy(&resolved.item);
-            access = match attached(target, || crate::ntos::ob::object_access::check(&policy, crate::ntos::ob::object_access::subject(), access, object_type, !checked))? {
-                Ok(granted) => granted,
-                Err(status) => return Ok(status),
-            };
-        }
-        let inserted = open_pointer::insert(&resolved.item, access, attributes & 2, target)?;
+        let access = match crate::ntos::ob::handles::inserted::duplicate_access(&resolved.item.object_type, Some(&resolved.item), resolved.access, resolved.attributes, requested_access, options, 1, target)? {
+            Ok(access) => access,
+            Err(status) => return Ok(status),
+        };
+        let inserted = open_pointer::insert(&resolved.item, access, attributes & crate::ntos::ob::handles::inserted::HANDLE_ENTRY_ATTRIBUTES, target)?;
         if out != 0 {
             if let Err(error) = guest::try_write::<u64>(out, inserted as u64) {
                 let _ = attached(target, || open_pointer::close(inserted as u64));

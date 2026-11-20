@@ -1057,6 +1057,9 @@ pub fn change_user_handle_attributes(handle: u64, attributes: u32) -> Result<u32
     let handle = handle as u32;
     let Some(table) = process_state::current() else { return Ok(STATUS_INVALID_HANDLE) };
     let Some(entry) = table.handles.lock().entries.get(&handle).cloned() else { return Ok(STATUS_INVALID_HANDLE) };
+    // Só OBJ_PROTECT_CLOSE e OBJ_INHERIT mudam (ObpSetHandleAttributes); o
+    // OBJ_AUDIT_OBJECT_CLOSE e o sem-mais-direitos ficam.
+    let attributes = (entry.attributes() & !3) | (attributes & 3);
     let mut commit = || entry.local.lock().attributes = attributes;
     let binding = table.handles.lock().bindings.get(&handle).copied();
     match binding {

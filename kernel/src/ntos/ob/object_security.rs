@@ -1003,6 +1003,20 @@ pub extern "win64" fn default_object_method(object: u64, operation: u32, informa
     }
 }
 
+/// O tipo tem o SeDefaultObjectMethod como SecurityProcedure. No 19041 o
+/// File e o Device têm o IopGetSetSecurityObject (IoCreateObjectTypes,
+/// 0xa3cbf0 e 0xa3ce01) e a Key o CmpSecurityMethod (CmpCreateObjectTypes,
+/// 0xa58028); o OpenNT atende a segurança desses três pelos próprios caminhos
+/// (`query_security`, `key_services`) e deixa o padrão no campo do tipo, então
+/// eles contam aqui como de SecurityProcedure própria.
+pub fn uses_default_security_method(object_type: &object_types::ObjectType) -> bool {
+    if object_type.name == object_types::file_type().name || object_type.name == object_types::device_type().name || object_type.name == object_types::key_type().name {
+        return false;
+    }
+    let procedure = object_types::type_object(object_type.pointer).map_or(0, |native| native.type_info.security_procedure.get());
+    procedure == 0 || procedure == default_object_method_address()
+}
+
 /// O endereço do SeDefaultObjectMethod (o SecurityProcedure padrão).
 pub fn default_object_method_address() -> u64 {
     default_object_method as extern "win64" fn(u64, u32, u64, u64, u64, u64, u32, u64, u8) -> u32 as usize as u64

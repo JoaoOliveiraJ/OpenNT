@@ -716,11 +716,11 @@ fn publish(id: NodeId, handle: u32, snapshot: &Node, options: Option<&OpenOption
     merged.owner_process = Some(owner);
     merged.kernel_handle = kernel_handle;
     merged.open_attributes = Some(flags);
-    merged.attributes = Some(attributes & 7);
+    merged.attributes = Some(attributes & crate::ntos::ob::handles::inserted::HANDLE_ENTRY_ATTRIBUTES);
     merged.access = Some(access);
     with_state(|state| state.options.insert(handle, merged));
     let native_body = if snapshot.native_namespace != 0 { snapshot.native_namespace } else if let Some(open) = data.native_open { open.record } else { data.native_body };
-    let description = HandleDescription { pointer, type_name: snapshot.type_name.clone(), identity: id, native_body, attributes: attributes & 7, access };
+    let description = HandleDescription { pointer, type_name: snapshot.type_name.clone(), identity: id, native_body, attributes: attributes & crate::ntos::ob::handles::inserted::HANDLE_ENTRY_ATTRIBUTES, access };
     process_handles::publish(
         owner,
         handle as u64,
@@ -804,6 +804,8 @@ pub fn close(handle: u32) -> Result<bool, KernelError> {
 /// do dono. `false` = handle desconhecido ou linha que já saiu da tabela.
 pub fn change_attributes(handle: u32, attributes: u32) -> Result<bool, KernelError> {
     let Some(record) = handle_record(handle) else { return Ok(false) };
+    // Só OBJ_PROTECT_CLOSE e OBJ_INHERIT mudam; os bits 2-3 ficam.
+    let attributes = (record.attributes & !3) | (attributes & 3);
     let binding = with_state(|state| state.bindings.get(&handle).copied());
     let mut commit = || {
         with_state(|state| {

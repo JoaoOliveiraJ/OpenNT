@@ -505,7 +505,10 @@ pub fn insert_counted(item: &Described, granted: u32, attributes: u32, owner: u6
 }
 
 fn publish_handle(item: &Described, granted: u32, attributes: u32, owner: u64, counted: bool) -> Result<u32, KernelError> {
-    let handle_flags = attributes & 2; // OB_HANDLE_FLAG_INHERIT
+    // Os atributos da linha (OBJ_PROTECT_CLOSE, OBJ_INHERIT,
+    // OBJ_AUDIT_OBJECT_CLOSE e o sem-mais-direitos da duplicação), como o
+    // ObpCreateHandle guarda.
+    let handle_flags = attributes & crate::ntos::ob::handles::inserted::HANDLE_ENTRY_ATTRIBUTES;
     let mut data = item.data();
     data.native_pointer = item.pointer;
     data.native_open = Some(NativeOpen { record: item.pointer, node: item.owner.node(item.pointer) });
