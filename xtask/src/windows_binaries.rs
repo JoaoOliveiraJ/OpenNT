@@ -533,9 +533,10 @@ const SMSS_PROGRAMS: &[&str] = &[
 /// do perfil novo, com os nomes do `.mui` do idioma, e o
 /// CreateAppContainerProfile com que o winlogon cria o token LowBox do
 /// fontdrvhost (o UMFD), que lê os arquivos e as chaves pelas ACEs de ALL
-/// APPLICATION PACKAGES dos descritores do volume e das hives. Os imports
-/// estáticos deles já estão no volume.
-const SERVICE_CHAIN_PROGRAMS: &[&str] = &["umpo.dll", "psmsrv.dll", "SystemEventsBrokerServer.dll", "brokerlib.dll", "umpnpmgr.dll", "profsvc.dll", "profext.dll", "profsvcext.dll"];
+/// APPLICATION PACKAGES dos descritores do volume e das hives. E o
+/// wevtsvc.dll do serviço do log de eventos (EventLog, `event_log`). Os
+/// imports estáticos deles já estão no volume.
+const SERVICE_CHAIN_PROGRAMS: &[&str] = &["umpo.dll", "psmsrv.dll", "SystemEventsBrokerServer.dll", "brokerlib.dll", "umpnpmgr.dll", "profsvc.dll", "profext.dll", "profsvcext.dll", "wevtsvc.dll"];
 
 /// O console: o conhost.exe que o condrv.sys cria para um programa de
 /// console, o cmd.exe (com o cmdext.dll do ext-ms-win-cmd-util), o net.exe,
@@ -1430,6 +1431,12 @@ pub fn ntfs_files(root: &Path, kernel_pe: &[u8], initial_process: &str) -> Resul
             }
         }
         println!("cursores e animacao do primeiro logon no volume NTFS: {session}");
+        // O diretório dos logs do serviço do log de eventos, vazio como numa
+        // instalação nova: o wevtsvc.dll cria nele os `.evtx` dos canais
+        // (`%SystemRoot%\System32\winevt\Logs`). Um nome terminado em '/' é
+        // um diretório vazio (`ntfs_image`), com o descritor da pasta daqui.
+        let event_logs = system32.join("winevt/Logs");
+        files.push(Staged { path: String::from("Windows/System32/winevt/Logs/"), bytes: Vec::new(), host: event_logs.is_dir().then_some(event_logs) });
     }
     files.push(Staged::generated(String::from("NTOSKRNL.EXE"), kernel_pe.to_vec()));
     files.push(Staged::generated(String::from("Windows/System32/ntoskrnl.exe"), kernel_pe.to_vec()));

@@ -574,8 +574,9 @@ pub fn machine_hives(smss_boot: bool, setup_command: Option<&str>) -> Vec<(&'sta
         // (`service_chain`).
         system.extend(crate::service_chain::system_keys(&control_set).into_iter().map(seed_of));
         // As sessões de autologger do log de eventos, com os provedores do
-        // Windows (`event_log`).
+        // Windows, e o serviço EventLog com os canais (`event_log`).
         system.extend(crate::event_log::system_keys(&control_set).into_iter().map(seed_of));
+        software.extend(crate::event_log::software_keys().into_iter().map(seed_of));
         software.extend(crate::service_chain::software_keys().into_iter().map(seed_of));
         default.extend(crate::host_language::default_keys().into_iter().map(seed_of));
         // E a SOFTWARE, os assemblies lado a lado do contexto de ativação

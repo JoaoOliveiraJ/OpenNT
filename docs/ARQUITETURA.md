@@ -5050,7 +5050,15 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   svchost), o Control\ServiceGroupOrder, os valores EarlyStartServices
   e SvcHostSplitThresholdInKB de Control (o conjunto inicial e a separação
   dos serviços de um svchost) e os grupos do svchost
-  (`xtask/src/user_services.rs`). A tela de logon da sessão 1 leva o fecho
+  (`xtask/src/user_services.rs`). O serviço do log de eventos (EventLog, o
+  wevtsvc.dll no grupo `LocalServiceNetworkRestricted` do svchost) vem como
+  numa instalação nova: a chave dele com o Parameters, o State e os canais
+  clássicos com as fontes de eventos do Windows, os provedores e canais do
+  Windows de `WINEVT`, as sessões de autologger EventLog-System e
+  EventLog-Application com os provedores do Windows, e o
+  `System32\winevt\Logs` vazio no volume (`xtask/src/event_log.rs`); o
+  wevtsvc consome as duas sessões pelo tempo real do ETW
+  (`etw/realtime.rs`). A tela de logon da sessão 1 leva o fecho
   de imports do dwm.exe e do LogonUI.exe com o XAML e os provedores de
   credencial (`LOGON_SCREEN_PROGRAMS` em `xtask/src/windows_binaries.rs`:
   com o que a thread de eventos do DWM cria no
