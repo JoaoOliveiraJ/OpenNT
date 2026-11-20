@@ -284,6 +284,15 @@ impl UserThread {
         }
     }
 
+    /// Põe (ou tira) a espera instalada sem passar por um serviço: os
+    /// autotestes que montam o estado de uma thread parada (um worker numa
+    /// espera de outro objeto ou na fila da fábrica).
+    pub fn set_wait_for_test(&self, wait: Option<Wait>) {
+        let mut thread = self.m.lock();
+        thread.waiting = wait.is_some();
+        thread.wait = wait;
+    }
+
     fn take_wait(&self) -> Option<Wait> {
         self.m.lock().wait.take()
     }

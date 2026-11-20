@@ -5633,6 +5633,29 @@ fn user_worker_factory(assert: Assert) {
     let released = call("NtReleaseWorkerFactoryWorker", handle, 0, 0, 0);
     let packets = port.as_ref().map_or(0, |port| port.with(|state| state.packets.len()));
     assert(released.is_some() && factory.release_count() == 1 && packets >= 1, "userwf: liberacao enfileira o dreno");
+    // A criação pela fila (o fim do NtWaitForWorkViaWorkerFactory do 19041,
+    // 0x2040fd: ExpWorkerFactoryCheckCreate sem worker esperando na fila): um
+    // worker pronto parado na fila da fábrica atende o trabalho novo, e nada
+    // é criado; o mesmo worker parado em outra espera (um evento, uma chamada
+    // ALPC) não atende a fila, e o trabalho novo pede um worker, cuja criação
+    // falha aqui (fora do runtime) e fica no último status.
+    {
+        use crate::ntos::ps::user::threads::{UserThread, Wait};
+        let worker = UserThread::new(0, 0, 0, start);
+        worker.with(|thread| {
+            thread.worker_factory = pointer;
+            thread.worker_ready = true;
+        });
+        factory.add_worker(worker.clone());
+        worker.set_wait_for_test(Some(Wait { worker_factory: pointer, ..Wait::default() }));
+        factory.set_last_status(0);
+        let on_queue = (call("NtReleaseWorkerFactoryWorker", handle, 0, 0, 0), factory.last_status(), factory.workers().len());
+        worker.set_wait_for_test(Some(Wait::default()));
+        let elsewhere = (call("NtReleaseWorkerFactoryWorker", handle, 0, 0, 0), factory.last_status());
+        worker.set_wait_for_test(None);
+        factory.remove_worker(&worker);
+        assert(on_queue == (Some(0), 0, 1) && elsewhere.0 == Some(0) && elsewhere.1 != 0, "userwf: worker parado em outra espera nao atende a fila e o trabalho novo pede um worker; parado na fila, nenhum");
+    }
     // Fora de uma thread worker.
     let ready = call("NtWorkerFactoryWorkerReady", handle, 0, 0, 0);
     stack(&[0]);

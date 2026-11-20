@@ -219,8 +219,13 @@ fn shutdown(factory: &Arc<Factory>) {
     cancel_deferred_creation(factory);
 }
 
-/// O limite flexível adia a expansão automática: a demanda real da fila
-/// passa por duas reavaliações (30 e 120 ms) antes de criar acima dele.
+/// A criação pela fila, como o fim do NtWaitForWorkViaWorkerFactory do 19041
+/// (0x2040fd..0x204176): com trabalho na fila e nenhum worker esperando nela,
+/// um worker novo (o ExpWorkerFactoryCheckCreate). Um worker pronto parado
+/// em outra espera (um evento, uma chamada ALPC, um lock) não atende a fila:
+/// conta como ocupado, como o que roda. O limite flexível adia a expansão
+/// automática: a demanda real da fila passa por duas reavaliações (30 e 120
+/// ms) antes de criar acima dele.
 fn request_queued_worker(factory: &Arc<Factory>, from_deferred_timer: bool) -> Result<u32, KernelError> {
     if factory.port.closed() {
         shutdown(factory);
@@ -236,7 +241,7 @@ fn request_queued_worker(factory: &Arc<Factory>, from_deferred_timer: bool) -> R
     }
     let workers = live(factory);
     let ready: Vec<&Arc<UserThread>> = workers.iter().filter(|thread| thread.with(|thread| thread.worker_ready)).collect();
-    let busy = ready.iter().filter(|thread| !thread.waiting()).count() as u32;
+    let busy = ready.iter().filter(|thread| !(thread.waiting() && thread.wait_worker_factory() == factory.pointer)).count() as u32;
     let desired = (busy + 1).max(factory.minimum()).min(factory.maximum());
     if factory.port.with(|state| state.packets.is_empty()) || workers.len() as u32 >= desired {
         factory.set_soft_creation_phase(0);
