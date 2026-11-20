@@ -1967,7 +1967,7 @@ fn user_threads_in(assert: Assert, test: &TestProcess) {
         entry.value.set(target);
         entry.return_length.set(returned);
     }
-    assert(call("NtCreateThreadEx", out, 0x1F_FFFF, 0, u64::MAX) == 0xC000_0005 && call("NtCreateThreadEx", out, 0x1F_FFFF, 0, 4) == 0xC000_0008, "userthreads: criacao fora do laco e processo alheio recusados");
+    assert(call("NtCreateThreadEx", out, 0x1F_FFFF, 0, u64::MAX) == 0xC000_0005 && call("NtCreateThreadEx", out, 0x1F_FFFF, 0, 0x7FF0) == 0xC000_0008, "userthreads: criacao fora do laco e handle de processo invalido recusados");
     threads::set_running(true, None);
     guest::write64(rsp + 0x38, 0x80);
     assert(call("NtCreateThreadEx", out, 0x1F_FFFF, 0, u64::MAX) == 0xC000_000D, "userthreads: flags invalidas");
@@ -2108,6 +2108,105 @@ fn user_threads_in(assert: Assert, test: &TestProcess) {
     if let Some(region) = memory::find_region(block) {
         memory::release_private_region(&region);
     }
+}
+
+/// NtCreateThreadEx num processo alheio (o CreateRemoteThread; é assim que
+/// o csrss manda o CtrlRoutine do CTRL_SHUTDOWN_EVENT ao services.exe): de
+/// A, com um handle de B na tabela de A.
+fn remote_threads(assert: Assert) {
+    use crate::ntos::ps::process;
+    use crate::ntos::ps::user::{memory, process_state};
+    let ran = with_test_process("criador.exe", None, |creator| {
+        let Ok(block) = memory::map_user_region(0x4000) else { return false };
+        let mut handle_to_target = 0u64;
+        let checked = with_test_process("alvo.exe", None, |target| {
+            // B está no despachante; a TEB e a pilha nascem nele.
+            if let Some(state) = process_state::get(target.process) {
+                state.started.store(true, Ordering::Release);
+            }
+            process::set_current_thread(creator.thread);
+            let result = remote_threads_in(assert, creator, target, block, &mut handle_to_target);
+            process::set_current_thread(target.thread);
+            result
+        });
+        // B terminou; o handle de A ainda o referencia.
+        let rsp = block + 0x3000;
+        let late = state::handler("NtCreateThreadEx").map(|handler| handler(block, 0x1F_FFFF, 0, handle_to_target, rsp).unwrap_or(1)).unwrap_or(1);
+        assert(handle_to_target != 0 && late == 0xC000_010A, "remotethreads: o processo alvo que terminou recusa a thread com STATUS_PROCESS_IS_TERMINATING");
+        let _ = state::close_user_handle(handle_to_target, true, false);
+        if let Some(region) = memory::find_region(block) {
+            memory::release_private_region(&region);
+        }
+        checked == Some(true)
+    });
+    assert(ran == Some(true), "remotethreads: processos de teste criador e alvo");
+}
+
+fn remote_threads_in(assert: Assert, creator: &TestProcess, target: &TestProcess, block: u64, handle_to_target: &mut u64) -> bool {
+    use crate::ntos::ps::{process, process_context};
+    use crate::ntos::ps::user::handles::UserProcess;
+    use crate::ntos::ps::user::threads;
+    let (out, info, list, cid, rsp) = (block, block + 0x40, block + 0x100, block + 0x180, block + 0x3000);
+    let call = |name: &str, a1: u64, a2: u64, a3: u64, a4: u64| state::handler(name).map(|handler| handler(a1, a2, a3, a4, rsp).unwrap_or(1)).unwrap_or(1);
+    // Rotina inicial (a página da PEB de B, legível só nele), argumento,
+    // CREATE_SUSPENDED, ZeroBits, commit e reserva explícitos e a lista com
+    // o PS_ATTRIBUTE_CLIENT_ID.
+    for (offset, value) in [(0x28u64, target.peb), (0x30, 0x6), (0x38, 1), (0x40, 0), (0x48, 0x2000), (0x50, 0x1_0000), (0x58, list)] {
+        guest::write64(rsp + offset, value);
+    }
+    let attribute_list = unsafe { nt::PsAttributeList::at(list) };
+    attribute_list.total_length.set(8 + nt::PsAttribute::SIZE);
+    let entry = unsafe { nt::PsAttribute::at(attribute_list.attributes[0].address()) };
+    entry.attribute.set(0x10003);
+    entry.size.set(16);
+    entry.value.set(cid);
+    entry.return_length.set(0);
+    let handle_with = |access: u32| state::alloc_user_handle(Arc::new(UserProcess { pointer: target.process, process_id: target.process_id }), access, 0).map_or(0, |handle| handle as u64);
+    let (full, limited) = (handle_with(0x1F_FFFF), handle_with(0x400));
+    *handle_to_target = full;
+    let denied = call("NtCreateThreadEx", out, 0x1F_FFFF, 0, limited);
+    let invalid = call("NtCreateThreadEx", out, 0x1F_FFFF, 0, 0x7FF0);
+    let mismatch = call("NtCreateThreadEx", out, 0x1F_FFFF, 0, u64::MAX - 1);
+    assert(full != 0 && limited != 0 && denied == 0xC000_0022 && invalid == 0xC000_0008 && mismatch == 0xC000_0024, "remotethreads: handle sem PROCESS_CREATE_THREAD, invalido e NtCurrentThread recusados");
+    let created = call("NtCreateThreadEx", out, 0x1F_FFFF, 0, full);
+    let handle = guest::read64(out);
+    let Some(thread) = threads::resolve(handle, 0).ok().filter(|_| created == 0) else {
+        assert(false, "remotethreads: NtCreateThreadEx com o handle de B");
+        let _ = state::close_user_handle(limited, true, false);
+        return false;
+    };
+    let client = unsafe { nt::ClientId::at(cid) };
+    let owner = thread.with(|thread| thread.process_pointer);
+    let teb = thread.with(|thread| thread.teb_va);
+    let listed = threads::of_process(target.process).iter().any(|candidate| Arc::ptr_eq(candidate, &thread)) && !threads::of_process(creator.process).iter().any(|candidate| Arc::ptr_eq(candidate, &thread));
+    // A TEB está em B, com o PID e a PEB de B.
+    let in_target = process_context::with_process(target.process, || {
+        let block = unsafe { nt::Teb::at(teb) };
+        block.client_id.unique_process.get() == target.process_id && block.client_id.unique_thread.get() == thread.thread_id && block.process_environment_block.get() == target.peb
+    })
+    .unwrap_or(false);
+    guest::write64(rsp + 0x28, 0);
+    let basic = unsafe { nt::ThreadBasicInformation::at(info) };
+    let queried = call("NtQueryInformationThread", handle, 0, info, 48) == 0 && basic.client_id.unique_process.get() == target.process_id && basic.teb_base_address.get() == teb;
+    assert(owner == target.process && listed && client.unique_process.get() == target.process_id && client.unique_thread.get() == thread.thread_id && in_target && queried, "remotethreads: a thread nasce em B (TEB, PEB e PID de B) com o handle na tabela de A");
+    // Fim: o handle de A sai, e a thread termina e é solta no contexto de B.
+    let _ = call("NtClose", handle, 0, 0, 0);
+    let _ = state::close_user_handle(limited, true, false);
+    process::set_current_thread(target.thread);
+    let in_b = threads::thread_handle(&thread, 0x1F_FFFF, 0).unwrap_or(0);
+    let terminated = in_b != 0 && call_in(rsp, "NtTerminateThread", in_b) == 0 && thread.dead();
+    if in_b != 0 {
+        let _ = state::close_user_handle(in_b, true, false);
+    }
+    threads::release_execution_resources(&thread);
+    process::set_current_thread(creator.thread);
+    assert(terminated && thread.pointer() == 0, "remotethreads: a thread de B termina e e solta no contexto de B");
+    terminated
+}
+
+/// Chamada de serviço de um argumento com a pilha de syscall dada.
+fn call_in(rsp: u64, name: &str, handle: u64) -> u32 {
+    state::handler(name).map(|handler| handler(handle, 0x77, 0, 0, rsp).unwrap_or(1)).unwrap_or(1)
 }
 
 fn user_wait_packets(assert: Assert) {
@@ -7273,6 +7372,7 @@ pub fn run(assert: Assert) {
     user_mutants_and_timers(assert);
     user_io_completion(assert);
     user_threads(assert);
+    remote_threads(assert);
     super::yield_execution::run(assert);
     super::anti_starvation::run(assert);
     user_wait_packets(assert);

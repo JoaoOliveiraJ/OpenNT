@@ -2183,26 +2183,50 @@ pub struct CreateRequest {
     pub reserve: u64,
 }
 
+/// PROCESS_CREATE_THREAD.
+const PROCESS_CREATE_THREAD: u32 = 0x2;
+const STATUS_PROCESS_IS_TERMINATING: u32 = 0xC000_010A;
+
 /// NtCreateThreadEx(out, access, oa, process, start, argument, flags,
 /// zeroBits, commit, reserve, attributeList).
 fn nt_create_thread_ex(out: u64, access: u64, attributes: u64, process_handle: u64, rsp: u64) -> Result<u32, KernelError> {
-    if process_handle as i64 != -1 {
-        return Ok(0xC000_0008);
-    }
     if !probe_user_write(out, 8) || !state::probe_syscall_stack(rsp, 56) || (attributes != 0 && !probe_user_read(attributes, 48)) {
         return Ok(0xC000_0005);
     }
-    state::guarded(|| create_thread_ex(out, access, attributes, rsp))
+    state::guarded(|| create_thread_ex(out, access, attributes, process_handle, rsp))
 }
 
-fn create_thread_ex(out: u64, access: u64, attributes: u64, rsp: u64) -> Result<u32, KernelError> {
+/// O processo de um handle que não é o NtCurrentProcess, como o
+/// PspCreateThread o pega (19041 rva 0x6c1a0c): o ObReferenceObjectByHandle
+/// com PROCESS_CREATE_THREAD na tabela de quem chama (sem o direito,
+/// STATUS_ACCESS_DENIED; o NtCurrentThread ou outro tipo,
+/// STATUS_OBJECT_TYPE_MISMATCH; um valor fora da tabela,
+/// STATUS_INVALID_HANDLE) e a proteção de rundown do alvo (um processo que
+/// sai, STATUS_PROCESS_IS_TERMINATING). O EPROCESS volta referenciado.
+fn remote_target(handle: u64) -> Result<u64, u32> {
+    if handle as i64 == -2 {
+        return Err(0xC000_0024);
+    }
+    if handle > 0x7FFF_FFFF && handle != 0xFFFF_FFFF {
+        return Err(0xC000_0008);
+    }
+    let pointer = super::handles::process_pointer(handle, PROCESS_CREATE_THREAD)?;
+    if process::with_record(pointer, |record| record.exiting || record.terminated) != Some(false) || process::reference(pointer).is_none() {
+        return Err(STATUS_PROCESS_IS_TERMINATING);
+    }
+    Ok(pointer)
+}
+
+fn create_thread_ex(out: u64, access: u64, attributes: u64, process_handle: u64, rsp: u64) -> Result<u32, KernelError> {
     let start = state::stack_arg(rsp, 5);
     let flags = state::stack_arg32(rsp, 7);
     let zero_bits = state::stack_arg(rsp, 8);
     let commit = state::stack_arg(rsp, 9);
     let reserve = state::stack_arg(rsp, 10);
     let list = state::stack_arg(rsp, 11);
-    if !current_process_started() || !probe_user_read(start, 1) {
+    let local = process_handle as i64 == -1;
+    // A rotina inicial de outro processo é conferida no espaço dele, anexado.
+    if local && (!current_process_started() || !probe_user_read(start, 1)) {
         return Ok(0xC000_0005);
     }
     if flags & !0x77 != 0 || zero_bits > 32 {
@@ -2250,13 +2274,31 @@ fn create_thread_ex(out: u64, access: u64, attributes: u64, rsp: u64) -> Result<
             at += PsAttribute::SIZE;
         }
     }
-    let thread = match create_user_thread(&CreateRequest { start, argument_words: state::syscall_arg_words(rsp, 6), flags, zero_bits, commit, reserve }) {
-        Ok(thread) => thread,
-        Err(status) => return Ok(status),
+    let request = CreateRequest { start, argument_words: state::syscall_arg_words(rsp, 6), flags, zero_bits, commit, reserve };
+    // Num processo alheio, a TEB, a pilha e a ETHREAD nascem com a thread
+    // anexada a ele (o MmCreateTeb do PspAllocateThread); o PID do
+    // CLIENT_ID é o dele.
+    let created = if local {
+        Ok(create_user_thread(&request).map(|thread| (thread, state::current_process_id())))
+    } else {
+        let target = match remote_target(process_handle) {
+            Ok(target) => target,
+            Err(status) => return Ok(status),
+        };
+        let created = crate::ntos::ps::process_context::with_process(target, || create_user_thread(&request).map(|thread| (thread, state::current_process_id())));
+        process::dereference(target)?;
+        created
     };
-    // PHANDLE de saída e os atributos de saída, todos sondados acima.
+    let (thread, process_id) = match created {
+        Ok(Ok(created)) => created,
+        Ok(Err(status)) => return Ok(status),
+        // A raiz do alvo já não carrega: ele está saindo.
+        Err(_) => return Ok(STATUS_PROCESS_IS_TERMINATING),
+    };
+    // PHANDLE de saída (na tabela de quem chama) e os atributos de saída,
+    // todos sondados acima.
     guest::try_write::<u64>(out, thread_handle(&thread, access as u32, 0)?)?;
-    let (process_id, teb) = (state::current_process_id(), thread.with(|thread| thread.teb_va));
+    let teb = thread.with(|thread| thread.teb_va);
     for (attribute, target, returned, size) in outputs {
         if attribute == 0x10003 {
             // PS_ATTRIBUTE_CLIENT_ID.

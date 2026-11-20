@@ -3804,8 +3804,13 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   próximo. As threads de usuário ficam na lista do processo
   (`ProcessState.threads`, com `started` marcando a entrada no despachante) e no
   índice global de `ps/user/threads.rs` (despachante, APCs, busca por id de
-  cliente) até serem liberadas; os módulos do loader do kernel, com as
-  imagens, ficam em `ProcessState` (a ntdll é do sistema e vale em todos).
+  cliente) até serem liberadas. O NtCreateThreadEx com o handle de outro
+  processo (PROCESS_CREATE_THREAD; o CtrlRoutine que o csrss manda aos
+  processos no desligamento e no logoff) cria a thread anexado ao alvo, como
+  o PspCreateThread: TEB, pilha e ETHREAD no processo dele, o PID dele no
+  CLIENT_ID e o handle na tabela de quem chamou. Os módulos do loader do
+  kernel, com as imagens, ficam em `ProcessState` (a ntdll é do sistema e
+  vale em todos).
   O término (`terminate_process`) chama as rotinas de saída de processo, e a
   de `ps/user/files.rs::release_user_resources(process)` libera E/S pendente
   de `device_io`, fábricas de workers, a cópia do callback de
