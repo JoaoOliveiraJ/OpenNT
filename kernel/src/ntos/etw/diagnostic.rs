@@ -5,7 +5,10 @@
 //!   provedor do services.exe): cada evento que alguma sessão aceita (no
 //!   boot da cadeia, a EventLog-System do autologger, que habilita o
 //!   provedor como num Windows recém-instalado) sai como
-//!   `[scm] evento <Id> <dados>`, um segmento de dados por campo do evento:
+//!   `[scm] evento <Id> <dados>`. Os eventos 7000-7045 do services.exe são
+//!   clássicos (o ScLogEvent grava pelo EvtIntReportEventAndSourceAsync da
+//!   ntdll, descritor com Id 0): o Id sai do EventID do evento e os dados são
+//!   as cadeias de inserção. Num evento de manifesto, um segmento por campo:
 //!   os UTF-16 terminados em NUL como texto, os de 4 e 8 bytes em
 //!   hexadecimal (os códigos de erro), os outros UTF-16 entre colchetes e o
 //!   resto pelo tamanho. Os ids que contam: 7000 (o serviço não iniciou, com
@@ -36,13 +39,48 @@ pub fn observe(event: &Event) {
 
 fn service_control_manager(event: &Event) {
     let id = u16::from_le_bytes([event.descriptor[0], event.descriptor[1]]);
-    let mut line = format!("evento {id}");
-    for (index, segment) in event.data.iter().enumerate() {
-        line.push_str(if index == 0 { " " } else { " / " });
-        line.push_str(&describe(segment));
-    }
+    let classic = if id == 0 { classic(event) } else { None };
+    let line = classic.unwrap_or_else(|| {
+        let mut line = format!("evento {id}");
+        for (index, segment) in event.data.iter().enumerate() {
+            line.push_str(if index == 0 { " " } else { " / " });
+            line.push_str(&describe(segment));
+        }
+        line
+    });
     crate::debug_print!("[scm] {}", line);
     *LAST_SCM.lock() = Some(line);
+}
+
+/// O evento clássico pelo ETW, como o EvtIntReportEventWorker da ntdll o
+/// grava (o ScLogEvent do services.exe chega a ele pelo
+/// EvtIntReportEventAndSourceAsync): o descritor com Id 0 e os campos
+/// TimeStamp (8 bytes, a hora do sistema), EventID (4, os qualificadores
+/// no alto), o tamanho do nome da fonte em caracteres com o NUL (2), o
+/// nome, o tamanho do SID (2), o SID quando o tamanho não é zero,
+/// NumStrings (2), as cadeias com o NUL, DataSize (4) e os dados. A linha
+/// leva o id sem os qualificadores e as cadeias de inserção (`%%N` é uma
+/// mensagem do sistema, o erro N).
+fn classic(event: &Event) -> Option<String> {
+    let data = &event.data;
+    if data.len() < 6 || data[0].len() != 8 || data[1].len() != 4 {
+        return None;
+    }
+    let word = |segment: &[u8]| (segment.len() == 2).then(|| u16::from_le_bytes([segment[0], segment[1]]));
+    let event_id = u32::from_le_bytes([data[1][0], data[1][1], data[1][2], data[1][3]]);
+    word(&data[2])?;
+    let sid_length = word(data.get(4)?)?;
+    let count_index = if sid_length != 0 { 6 } else { 5 };
+    let count = word(data.get(count_index)?)? as usize;
+    let first = count_index + 1;
+    let strings: Vec<String> = data.get(first..first + count)?.iter().map(|segment| unicode(segment)).collect();
+    Some(format!("evento {} {}", event_id & 0xFFFF, strings.join(" / ")))
+}
+
+/// Uma cadeia UTF-16 até o NUL (uma cadeia de inserção do evento clássico).
+fn unicode(segment: &[u8]) -> String {
+    let units: Vec<u16> = segment.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).take_while(|&unit| unit != 0).collect();
+    String::from_utf16_lossy(&units)
 }
 
 /// A última linha `[scm]` impressa.

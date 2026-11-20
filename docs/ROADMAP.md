@@ -67,7 +67,7 @@ I/O Manager, ACPI e PCI, gerência de energia, ETW, drivers de barramento, disco
 | Console | Parcial | boot, shell, condrv |
 | Barramento PCI | Parcial | fase4, storage, basicdisplay, usb |
 | Dispositivos da placa-mãe | Parcial | fase4 |
-| Disco ATA (interno) | Parcial | fase4 |
+| Disco ATA (interno) | Parcial | fase4, ata-falha |
 | NTFS (leitor do kernel) | Parcial | fase4 |
 
 ## Fase 5 — Registro e serviços (concluída)

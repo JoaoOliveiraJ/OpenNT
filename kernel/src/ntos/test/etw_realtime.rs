@@ -240,6 +240,35 @@ fn scm_diagnostic(assert: Assert) {
     let records = logger::records(logger_id).map_or(0, |records| records.len());
     let line = diagnostic::last_scm_line();
     assert(started == Some(0) && registered == Some(0) && matches!(enabled, Ok(0)) && written == Some(0) && records == 1 && line.as_deref() == Some("evento 7036 Teste / em execução / 0x41d"), "etw-scm: o evento do SCM sai na serial com o id e os campos e chega a sessao");
+    // O evento clássico do ScLogEvent (o layout do EvtIntReportEventWorker,
+    // descritor com Id 0): 7023 com as cadeias "EventLog" e "%%2".
+    let classic = guest::alloc_bytes(0x400);
+    let segments: [Vec<u8>; 10] = [
+        0x01DD_78D0_3523_8786u64.to_le_bytes().to_vec(),
+        0xC000_1B6Fu32.to_le_bytes().to_vec(),
+        24u16.to_le_bytes().to_vec(),
+        wide("Service Control Manager"),
+        0u16.to_le_bytes().to_vec(),
+        2u16.to_le_bytes().to_vec(),
+        wide("EventLog"),
+        wide("%%2"),
+        18u32.to_le_bytes().to_vec(),
+        wide("EventLog"),
+    ];
+    let mut cursor = classic + 0x100;
+    for (index, segment) in segments.iter().enumerate() {
+        guest::write_bytes(cursor, segment);
+        guest::write64(classic + index as u64 * 0x10, cursor);
+        guest::write32(classic + index as u64 * 0x10 + 8, segment.len() as u32);
+        cursor += (segment.len() as u64 + 15) & !15;
+    }
+    guest::write_bytes(descriptor, &[0; 16]);
+    guest::write8(descriptor + 4, 2);
+    guest::write64(descriptor + 8, 0x8000_0000_0000_0000);
+    let written_classic = call_export("EtwWrite", &[handle, descriptor, 0, segments.len() as u64, classic]);
+    let classic_line = diagnostic::last_scm_line();
+    assert(written_classic == Some(0) && classic_line.as_deref() == Some("evento 7023 EventLog / %%2"), "etw-scm: o evento classico do SCM sai com o EventID e as cadeias de insercao");
+    guest::free_bytes(classic);
     let _ = call_export("EtwUnregister", &[handle]);
     prepare();
     let _ = control(2);
