@@ -372,6 +372,21 @@ fn flushes(assert: Assert, block: u64, rsp: u64, call: Call) {
     let _ = call("NtUnmapViewOfSection", u64::MAX, second_view, 0, 0);
     let _ = call("NtUnmapViewOfSection", u64::MAX, view, 0, 0);
     let _ = call("NtClose", section, 0, 0, 0);
+    // Uma seção maior que o arquivo aberto com escrita pelo modo usuário (o
+    // CreateFileMapping do explorer no Caches\cversions.2.db novo): o
+    // MmCreateSection do 19041 estende o arquivo até o MaximumSize.
+    guest::write64(cells + 0x58, 0x3000);
+    guest::write64(cells + 0x60, 0);
+    guest::write64(rsp + 0x28, 4);
+    guest::write64(rsp + 0x30, 0x0800_0000);
+    guest::write64(rsp + 0x38, file);
+    let grown = call("NtCreateSection", cells + 0x60, 0xF_001F, 0, cells + 0x58);
+    let grown_size = file_io::volume_open(file).ok().map(|(_, opened)| {
+        opened.file.refresh();
+        opened.file.size()
+    });
+    let _ = call("NtClose", guest::read64(cells + 0x60), 0, 0, 0);
+    assert(grown == 0 && grown_size == Some(0x3000), &alloc::format!("desktop: NtCreateSection maior que o arquivo aberto com escrita estende o arquivo ({grown:#x}, {grown_size:?})"));
     // NtFlushBuffersFileEx(handle, flags, parameters, size, iosb).
     let flush_ex = |handle: u64, flags: u64, parameters: u64, size: u64, io_status: u64| {
         guest::write64(rsp + 0x28, io_status);

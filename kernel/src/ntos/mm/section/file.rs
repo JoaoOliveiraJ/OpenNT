@@ -98,13 +98,18 @@ impl CapturedFile {
         Ok(())
     }
 
-    /// Estende o arquivo até o tamanho máximo pedido pela seção.
+    /// Estende o arquivo até o tamanho máximo pedido pela seção (o
+    /// MmCreateSection do 19041 num arquivo aberto com escrita). Como a
+    /// escrita (`write_at`), um arquivo aberto pelo modo usuário, sem o
+    /// backing do ZwCreateFile, usa o volume e o caminho da fonte do
+    /// FILE_OBJECT.
     pub fn resize(&self, length: u64) -> Result<u32, KernelError> {
         if self.access & 2 == 0 {
             return Ok(0xC000_0022);
         }
-        let Some((volume, path)) = &self.backing else { return Ok(0xC000_00A2) };
-        match volume.resize(path, length) {
+        let source = || self.source.as_ref().and_then(|source| Some((source.volume()?, source.volume_path()?)));
+        let Some((volume, path)) = self.backing.as_ref().map(|(volume, path)| (*volume, path.clone())).or_else(source) else { return Ok(0xC000_00A2) };
+        match volume.resize(&path, length) {
             None => Ok(0xC000_00A2),
             Some(result) => {
                 result?;
