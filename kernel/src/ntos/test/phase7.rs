@@ -3898,6 +3898,36 @@ fn user_create_token(assert: Assert) {
     assert(ran.is_some(), "usercreatetoken: processo de teste");
 }
 
+/// O descritor do processo criado com o token do PS_ATTRIBUTE_TOKEN sai do
+/// token novo (o PspInsertProcess 19041 cria o ACCESS_STATE com o próprio
+/// processo como sujeito quando o PspInitializeProcessSecurity diz que o
+/// token veio do atributo): o dono, o grupo e a DACL padrão dele. Sem o
+/// atributo (o token do pai), o descritor de quem criou fica.
+fn process_security_from_explicit_token(assert: Assert) {
+    use crate::ntos::ps::process;
+    use crate::ntos::se::model::{sid, Ace};
+    use crate::ntos::se::token::tokens as token_records;
+    let ran = with_test_process("token-sd.exe", None, |_| {
+        let current = process::get_current_process();
+        let Some(copy) = process::get_primary_token(current).and_then(|primary| token_records::duplicate(primary, 0, false, 1).ok()) else {
+            assert(false, "processsd: token do processo de teste");
+            return;
+        };
+        let service = sid(5, &[19]);
+        token_records::update(copy, |token| {
+            token.owner = service.clone();
+            token.default_dacl = Some(alloc::vec![Ace::allow(service.clone(), 0x1000_0000)]);
+        });
+        let owner_of = || process::with_record(current, |record| (record.security.owner.clone(), record.security.dacl.as_ref().map(|dacl| dacl.len())));
+        let before = owner_of();
+        let inherited = process::replace_primary_token(current, copy, 0, false).is_ok() && owner_of() == before;
+        let explicit = process::replace_primary_token(current, copy, 0, true).is_ok() && owner_of() == Some((service.clone(), Some(1)));
+        let _ = token_records::release(copy);
+        assert(before.is_some_and(|(owner, _)| owner != service) && inherited && explicit, "processsd: o token do PS_ATTRIBUTE_TOKEN da o dono e a DACL padrao do descritor do processo; o token do pai nao troca o descritor");
+    });
+    assert(ran.is_some(), "processsd: processo de teste");
+}
+
 /// O token da conta virtual "Window Manager\DWM-1", como o
 /// LsapCreateTokenObject do lsasrv o pede ao NtCreateTokenEx (o usuário
 /// S-1-5-90-0-1, o grupo Window Manager Group S-1-5-90-0 vindo do
@@ -7237,6 +7267,7 @@ pub fn run(assert: Assert) {
     user_create_token(assert);
     user_virtual_account_token(assert);
     super::user_lowbox::run(assert);
+    process_security_from_explicit_token(assert);
     user_query_object(assert);
     user_remove_completion(assert);
     user_alpc_foundation(assert);

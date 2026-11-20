@@ -1143,6 +1143,17 @@ pub fn replace_primary_token(process: u64, source: u64, session_id: u32, explici
     let copy = tokens::sub_process_token(source, session_id, explicit)?;
     let previous = STATE.lock().primary_tokens.insert(process, copy);
     eprocess(process).token.object.set(copy);
+    // Com o token do PS_ATTRIBUTE_TOKEN, o descritor do processo sai do
+    // token novo: o PspInsertProcess (0x607cf9) cria o ACCESS_STATE com o
+    // próprio processo como sujeito quando o PspInitializeProcessSecurity
+    // diz que o token veio do atributo (o bit 1 do NtCreateUserProcess,
+    // 0x60b1f7), e o dono, o grupo e a DACL padrão são os dele. Sem isso o
+    // processo de um serviço ou do usuário ficava com o descritor de quem o
+    // criou e o próprio dono não o abria (o NtAlpcOpenSenderProcess do
+    // rpcss).
+    if explicit {
+        update_record(process, |record| record.security = object_access::capture(Some(copy)));
+    }
     // PspAssignPrimaryToken: o mapa de devices DOS do token anterior sai
     // (ObDereferenceDeviceMap); o próximo `\??` o refaz pelo token novo.
     crate::ntos::ob::device_map::dereference_process(process);
