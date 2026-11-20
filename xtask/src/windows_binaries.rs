@@ -200,6 +200,15 @@ const NTFS_FILES: &[(&str, &str)] = &[
         "Windows/System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package0110~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
         "System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package0110~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
     ),
+    // O catálogo que cobre o explorer.exe (achado pelo hash da imagem no
+    // CatRoot desta máquina): com ele a CI dá à imagem o nível Windows, e o
+    // PsConvertToGuiThread passa o bit 2 ao callout de processo do win32k,
+    // que faz do explorer um "immersive broker" (as bandas de janela da
+    // barra de tarefas, como a do "Notícias e interesses").
+    (
+        "Windows/System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package04~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
+        "System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package04~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",
+    ),
     // O catálogo que cobre a pilha PS/2 do bundle (i8042prt.sys, kbdclass.sys
     // e mouclass.sys, achado pelo hash da imagem no CatRoot desta máquina):
     // num boot com a CI ativa (`--start-driver`), a pilha de teclado passa

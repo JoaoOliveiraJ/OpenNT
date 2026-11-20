@@ -41,6 +41,10 @@ pub struct SectionState {
     /// O SECTION_IMAGE_INFORMATION de uma seção de imagem (o da imagem
     /// principal de um processo, capturado ao mapeá-la).
     pub image_information: Option<alloc::vec::Vec<u8>>,
+    /// O nível de assinatura que a CI deu à imagem principal de um processo
+    /// (no 19041, o Segment+0xF bits 4-7 da seção, gravado na criação):
+    /// `None` antes da primeira resposta, `Some(None)` para a imagem recusada.
+    pub signing_level: Option<Option<u8>>,
 }
 
 /// Nome e flags capturados antes da inserção (sem publicar no namespace).
@@ -219,6 +223,12 @@ pub fn state(pointer: u64) -> Option<SectionState> {
 /// O SECTION_IMAGE_INFORMATION da seção de imagem `pointer`.
 pub fn set_image_information(pointer: u64, information: alloc::vec::Vec<u8>) -> Option<()> {
     SECTIONS.lock().get_mut(&pointer).map(|record| record.state.image_information = Some(information))
+}
+
+/// O nível de assinatura guardado da seção de imagem `pointer`
+/// ([`SectionState::signing_level`]); `None` para seção desconhecida.
+pub fn signing_level(pointer: u64) -> Option<Option<Option<u8>>> {
+    SECTIONS.lock().get(&pointer).map(|record| record.state.signing_level)
 }
 
 /// Segurança definida pelo criador (descritor capturado ou padrão).

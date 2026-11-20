@@ -201,8 +201,34 @@ fn thread_callout(thread: u64, callout_type: u32) -> u32 {
     status
 }
 
-/// Callout de processo {Process, Initialize}.
-fn process_callout(process: u64, initialize: bool) -> u32 {
+/// SE_SIGNING_LEVEL_WINDOWS, o nível que o PsConvertToGuiThread compara.
+const SIGNING_LEVEL_WINDOWS: u8 = 12;
+
+/// As flags do callout de processo do PsConvertToGuiThread (19041
+/// 0x6838ad..0x6838ef): 1 (Initialize) e o bit 2 quando o
+/// PsQuerySectionSignatureInformation dá o nível de assinatura da imagem
+/// principal e o SeCiCallbacks->CompareSigningLevels (+0x40) o acha pelo
+/// menos SE_SIGNING_LEVEL_WINDOWS (sem o callback, o bit fica 0). O
+/// UserProcessImmersiveType do win32kbase (0x879f8) só procura a seção
+/// `.imrsiv` da imagem com esse bit (0x87b09); achada, num processo que não
+/// é AppContainer e tem integridade média ou maior, o processo vira
+/// "immersive broker" (tipo 2 no W32PROCESS+0x334, IsImmersiveBroker
+/// 0x3aab0). Só um broker cria janelas na banda ZBID_SYSTEM_TOOLS
+/// (IsValidBandForProcess do win32kfull, 0x32518): sem o bit, o
+/// CreateWindowInBand do FeedsContent::Initialize do explorer (0x11d4c4)
+/// dava ERROR_ACCESS_DENIED e o explorer caía no ~CompositionHost.
+fn initialize_flags(process: u64) -> u32 {
+    let Some(level) = super::process_image::section_signature_level(process) else { return 1 };
+    if crate::ntos::se::signing_level::compare(level, SIGNING_LEVEL_WINDOWS) != 0 {
+        3
+    } else {
+        1
+    }
+}
+
+/// Callout de processo {Process, Flags}: Initialize (bit 1) e o nível de
+/// assinatura da imagem (bit 2) na criação; 0 na saída.
+fn process_callout(process: u64, flags: u32) -> u32 {
     let block = guest::alloc_bytes(Win32ProcessCalloutParameters::SIZE);
     if block == 0 {
         return STATUS_INSUFFICIENT_RESOURCES;
@@ -210,7 +236,7 @@ fn process_callout(process: u64, initialize: bool) -> u32 {
     // SAFETY: bloco recém-alocado com o tamanho do tipo, zerado e alinhado.
     let parameters = unsafe { Win32ProcessCalloutParameters::at(block) };
     parameters.process.set(process);
-    parameters.initialize.set(initialize as u32);
+    parameters.initialize.set(flags);
     let status = invoke_callout(PS_W32_PROCESS_CALLOUT, block);
     guest::free_bytes(block);
     status
@@ -228,7 +254,7 @@ pub fn thread_exit_callout(thread: u64) {
 /// Win32Process, o callout de processo {Process, Initialize = FALSE}.
 pub fn process_exit_callout(process: u64) {
     if eprocess(process).win32_process.get() != 0 {
-        let _ = process_callout(process, false);
+        let _ = process_callout(process, 0);
     }
 }
 
@@ -253,8 +279,8 @@ const FILTERED_WIN32K_APIS: u32 = 0xC000;
 /// GUI = STATUS_ALREADY_WIN32; DisallowWin32kSystemCalls =
 /// STATUS_ACCESS_DENIED (o AuditDisallowWin32kSystemCalls só audita, e o
 /// OpenNT não tem a auditoria). O callout de processo vai sempre, com Flags
-/// 1 (o valor 2, do nível de assinatura da imagem, vem de um callback da CI
-/// que o OpenNT não registra); falhando, o status volta. Liga
+/// 1 e o bit 2 do nível de assinatura da imagem (`initialize_flags`);
+/// falhando, o status volta. Liga
 /// KTHREAD.GuiThread (e RestrictedGuiThread, com o filtro de syscalls Win32k
 /// do processo) por LOCK BTS antes do callout de thread
 /// (PsW32ThreadCalloutInitialize), cujo status é o do serviço; se ele falha,
@@ -277,7 +303,7 @@ pub fn convert_to_gui_thread() -> u32 {
     // Sem o PsEstablishWin32Callouts do win32k (ou fora de uma sessão com
     // ele), o ExReferenceCallBackBlock não acha a rotina:
     // STATUS_INVALID_PARAMETER.
-    let status = process_callout(process, true);
+    let status = process_callout(process, initialize_flags(process));
     if (status as i32) < 0 {
         return status;
     }

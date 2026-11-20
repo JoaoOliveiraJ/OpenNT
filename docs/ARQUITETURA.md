@@ -5874,7 +5874,18 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   (o primeiro empacotamento COM de um processo). Os drivers que o PnP carrega (o
   acpi.sys, o pci.sys, o msisadrv.sys com o KMDF, o i8042prt.sys e os
   filtros de classe) passam pela validação
-  (`CI_KERNEL_IMAGE_RESULT name=\FS\i8042prt.sys status=0x0`). Os testes
+  (`CI_KERNEL_IMAGE_RESULT name=\FS\i8042prt.sys status=0x0`). A imagem
+  principal de um processo de usuário também passa pela CI, na primeira
+  conversão GUI do processo (não na criação da seção, como no 19041): o
+  PsConvertToGuiThread pergunta o nível de assinatura
+  (`ps/process_image::section_signature_level`, o
+  PsQuerySectionSignatureInformation), a CI responde pelo arquivo da imagem
+  (`CI_USER_IMAGE_RESULT`) e o nível fica no estado da seção, como no
+  Segment+0xF; com nível de pelo menos SE_SIGNING_LEVEL_WINDOWS (12), o
+  callout de processo do win32k leva o bit 2, e um processo com a seção
+  `.imrsiv` (o explorer.exe) vira "immersive broker" e pode criar janelas
+  nas bandas privilegiadas. Uma imagem sem catálogo no volume fica sem o
+  bit. Os testes
   `watchdog` e `dxgkrnl` do `components.toml` esperam essa validação e
   depois iniciam o watchdog.sys e o núcleo gráfico (serviço `DXGKrnl`, com
   os valores da chave do Windows) com

@@ -150,3 +150,39 @@ pub fn locate_name(process: u64, output: u64) -> Result<u32, KernelError> {
     unsafe { Field::<u64>::at(output) }.set(copy);
     Ok(0)
 }
+
+/// PsQuerySectionSignatureInformation (19041 0x683970), a consulta que o
+/// PsConvertToGuiThread faz a cada thread convertida: o nível de assinatura
+/// da imagem principal do processo. O 19041 só responde para o processo da
+/// thread corrente e com EPROCESS.SectionObject, e lê o nível do segmento
+/// da seção (ControlArea → Segment+0xF, bits 4-7), onde o
+/// MiValidateSectionCreate gravou o que a CI deu na criação da seção. Aqui a
+/// mesma pergunta vai à CI pelo arquivo da imagem (o nome de auditoria do
+/// processo, o caminho NT do volume que `create` guardou) na primeira
+/// consulta, e a resposta fica no estado da seção, como no segmento: as
+/// threads seguintes só a leem. Sem resposta, `None`: o 19041 deixa as flags
+/// do callout em 1 quando a consulta falha.
+pub fn section_signature_level(process: u64) -> Option<u8> {
+    if process != process::get_current_process() {
+        return None;
+    }
+    // SAFETY: EPROCESS vivo do processo corrente.
+    let owner = unsafe { Eprocess::at(process) };
+    let section = owner.section_object.get();
+    if section == 0 {
+        return None;
+    }
+    if let Some(level) = section_objects::signing_level(section)? {
+        return level;
+    }
+    let cache = owner.se_audit_process_creation_info.image_file_name.get();
+    if cache == 0 {
+        return None;
+    }
+    let name = crate::ntos::rtl::guest_strings::try_read_unicode_string(cache).ok()?;
+    // Sem CI ou sem o arquivo, nada fica guardado (a próxima thread pergunta
+    // de novo); a recusa da CI fica, como o nível.
+    let answer = crate::ntos::se::code_integrity::user_image_signing_level(&name)?;
+    section_objects::update(section, |state| state.signing_level = Some(answer));
+    answer
+}

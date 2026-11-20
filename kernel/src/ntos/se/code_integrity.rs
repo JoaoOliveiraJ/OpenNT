@@ -413,6 +413,76 @@ impl SendRequest {
     }
 }
 
+/// O nível de assinatura que a CI dá ao arquivo de uma imagem de usuário,
+/// para o PsQuerySectionSignatureInformation do PsConvertToGuiThread
+/// (`ps/process_image`). O 19041 valida toda imagem na criação da seção
+/// (MiValidateSectionCreate 0x66b20c → SeValidateImageHeader 0x66b7da →
+/// CiValidateImageHeader) e guarda o nível no segmento (Segment+0xF, bits
+/// 4-7, gravado em 0x66bad6). O OpenNT ainda não valida imagens de usuário
+/// na criação da seção: a mesma chamada à CI que o carregador de kernel faz
+/// roda aqui sobre o arquivo da imagem. `None` quando não há resposta (sem
+/// CI, ou o arquivo não abre); `Some(None)` com a imagem recusada (sem
+/// catálogo no CatRoot, por exemplo) ou com um contexto por página. Um
+/// contexto por página deixa a posse retida (a CI ainda pode ler a visão),
+/// sem bloquear as próximas cargas de kernel.
+pub fn user_image_signing_level(name: &str) -> Option<Option<u8>> {
+    {
+        let state = STATE.lock();
+        if state.failure.is_some() || state.quarantined || state.callbacks == 0 {
+            return None;
+        }
+    }
+    let routine = callback(|table| &table.validate_image_header).ok()?;
+    let mut request = open_image(name).ok()?;
+    let outcome = (|| -> Option<(u32, u64, u8)> {
+        let section = request.section.clone()?;
+        let view = request.view.clone()?;
+        let image_file_object = section.state.lock().image_file_object;
+        // SAFETY: o FILE_OBJECT da SECTION, retido por ela até o release.
+        if image_file_object == 0 || unsafe { FileObject::at(image_file_object) }.section_object_pointer.get() == 0 {
+            return None;
+        }
+        let outputs = &request_at(request.storage).validation;
+        outputs.validation_mode.set(2);
+        outputs.signing_level.set(1);
+        let arguments = [
+            image_file_object,
+            view.base,
+            section.size,
+            view.base,
+            section.size,
+            outputs.validation_mode.address(),
+            process::get_current_process(),
+            0,
+            1,
+            outputs.signature_context.address(),
+            1,
+            0,
+            outputs.signing_level.address(),
+            outputs.image_flags.address(),
+            0,
+            outputs.verification_flags.address(),
+        ];
+        let status = invoke(routine, &arguments);
+        Some((status, outputs.signature_context.get(), outputs.signing_level.get()))
+    })();
+    match outcome {
+        Some((status, context, level)) => {
+            debug_print!("CI_USER_IMAGE_RESULT name={} status=0x{:x} signatureContext=0x{:x} signingLevel={}", name, status, context, level);
+            if context != 0 {
+                core::mem::forget(request);
+                return Some(None);
+            }
+            let _ = request.release();
+            Some((status & 0x8000_0000 == 0).then_some(level))
+        }
+        None => {
+            let _ = request.release();
+            None
+        }
+    }
+}
+
 /// SystemCodeIntegrityInformation pela consulta da própria CI. Como o
 /// ExpQuerySystemInformation, o SeCodeIntegrityQueryInformation recebe o
 /// ReturnLength numa variável local do kernel (a CI grava nele sem conferir
