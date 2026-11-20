@@ -2752,7 +2752,7 @@ static SLICE_TICK: AtomicU32 = AtomicU32::new(0);
 static FAST_EXIT_FORCED: AtomicBool = AtomicBool::new(false);
 
 /// Liga ou desliga a volta direta ao anel 3 independentemente da opção
-/// `FASTSERVICEEXIT` (autoteste `multiprocess/service_exit`).
+/// `SLOWSERVICEEXIT` (autoteste `multiprocess/service_exit`).
 pub fn force_fast_exit(on: bool) {
     FAST_EXIT_FORCED.store(on, Ordering::Relaxed);
 }

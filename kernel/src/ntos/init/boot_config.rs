@@ -95,15 +95,15 @@ pub fn trace_rpc() -> bool {
     TRACE_RPC.load(Ordering::Relaxed)
 }
 
-/// `FASTSERVICEEXIT` (`--fast-service-exit`): a saída de um serviço volta
-/// direto ao anel 3 quando nada pede o despachante
-/// (`threads::may_return_to_user`); sem a opção, toda saída passa por ele.
+/// A saída de um serviço volta direto ao anel 3 quando nada pede o
+/// despachante (`threads::may_return_to_user`); com `SLOWSERVICEEXIT`
+/// (`--slow-service-exit`) toda saída passa por ele.
 pub fn fast_service_exit() -> bool {
     // Consultada em toda saída de serviço: a opção lida uma vez.
     static CACHED: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
     match CACHED.load(Ordering::Relaxed) {
         0 => {
-            let value = flag(name::FAST_SERVICE_EXIT);
+            let value = !flag(name::SLOW_SERVICE_EXIT);
             CACHED.store(1 + value as u8, Ordering::Relaxed);
             value
         }

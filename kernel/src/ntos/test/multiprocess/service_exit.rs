@@ -335,7 +335,7 @@ pub fn run(assert: Assert) {
         let _ = service_table::restore_shadow_second_table(saved_shadow);
         return;
     }
-    // A volta direta é opcional no boot (`--fast-service-exit`): ligada
+    // A volta direta pode ser desligada no boot (`--slow-service-exit`):
     // para o teste dela.
     threads::force_fast_exit(true);
     let outcome = run_phases();

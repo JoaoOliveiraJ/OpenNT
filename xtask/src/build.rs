@@ -70,9 +70,9 @@ pub struct BuildOptions {
     /// `--heap-census`: o censo do heap do kernel na serial a cada 4 MB a
     /// mais de uso (`hal::heap_census`).
     pub heap_census: bool,
-    /// `--fast-service-exit`: a saída de um serviço volta direto ao anel 3
-    /// quando nada pede o despachante (o KiSystemServiceExit).
-    pub fast_service_exit: bool,
+    /// `--slow-service-exit`: toda saída de serviço passa pelo despachante
+    /// (sem a volta direta ao anel 3, o KiSystemServiceExit, que é o padrão).
+    pub slow_service_exit: bool,
     /// `--initial-process=smss`: o kernel inicia o smss.exe real como o
     /// primeiro processo de usuário (vazio = o boot comum).
     pub initial_process: String,
@@ -162,8 +162,8 @@ impl BuildOptions {
         if self.heap_census {
             words.push(String::from(name::HEAP_CENSUS));
         }
-        if self.fast_service_exit {
-            words.push(String::from(name::FAST_SERVICE_EXIT));
+        if self.slow_service_exit {
+            words.push(String::from(name::SLOW_SERVICE_EXIT));
         }
         if self.console_mirror {
             words.push(String::from(name::CONSOLE_MIRROR));
@@ -221,7 +221,7 @@ impl BuildOptions {
             trace_driver_api: false,
             trace_rpc: false,
             heap_census: false,
-            fast_service_exit: false,
+            slow_service_exit: false,
             storage: String::new(),
             display: String::new(),
             pnp_root: String::new(),
@@ -471,7 +471,7 @@ mod tests {
             trace_driver_api: false,
             trace_rpc: false,
             heap_census: false,
-            fast_service_exit: false,
+            slow_service_exit: false,
             initial_process: String::new(),
             storage: String::new(),
             display: String::new(),

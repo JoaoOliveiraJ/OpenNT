@@ -1138,9 +1138,9 @@ intervalo, e elas chegavam a 40% do tempo da CPU. O autoteste
 pingue-pongue por dois eventos dentro de serviços de teste e conta as
 voltas num número fixo de tiques.
 
-Com a opção de boot `--fast-service-exit` (FASTSERVICEEXIT; desligada por
-padrão enquanto a cadeia até a tela de logon ainda para às vezes com ela),
-a saída de um serviço é a do KiSystemServiceExit do 19041 (0x411510): sem
+A saída de um serviço é a do KiSystemServiceExit do 19041 (0x411510; a
+opção de boot `--slow-service-exit`, SLOWSERVICEEXIT, a desliga para isolar
+um problema nela, e o `--fast-service-exit` de antes é aceito sem efeito): sem
 troca de thread a fazer, ela volta direto ao anel 3 pelo `user_syscall_exit`
 do stub e o intervalo segue (`usermode::continues_in_interval`). O 19041
 não testa o escalonador ali, porque a troca, quando era preciso, já
@@ -1158,7 +1158,8 @@ IRQ de dispositivo por atender, quando o serviço precisa do CONTEXT
 (NtContinue, o callback de instrumentação, as faixas gravadas pelo
 SetContext e pelos registradores de depuração), quando o depurador armou
 um passo e quando algo pode ter concluído uma espera sondada desde a última
-sondagem: a época de despertar (`dispatcher::wake_epoch`) anda no sinal de
+sondagem (as registradas no despachante ficam prontas no próprio sinal, e a
+pronta acima da corrente já pede a troca): a época de despertar (`dispatcher::wake_epoch`) anda no sinal de
 um objeto, num pulso ou no reset de um objeto sinalizado, na entrega a uma
 KQUEUE, a uma porta de conclusão ou a uma porta ALPC, numa APC, num alerta,
 num IRP concluído e na retomada ou no término pedido de uma thread, e a

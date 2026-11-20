@@ -43,9 +43,9 @@ pub const TRACE_RPC: &str = "TRACERPC";
 /// O censo do heap do kernel (`hal::heap_census`) vai para a serial cada
 /// vez que o uso passa um múltiplo novo de 4 MB.
 pub const HEAP_CENSUS: &str = "HEAPCENSUS";
-/// A saída de um serviço volta direto ao anel 3 quando nada pede o
-/// despachante (o KiSystemServiceExit); sem a opção, toda saída passa por ele.
-pub const FAST_SERVICE_EXIT: &str = "FASTSERVICEEXIT";
+/// Toda saída de serviço passa pelo despachante (a volta direta ao anel 3,
+/// o KiSystemServiceExit, desligada): para isolar um problema nela.
+pub const SLOW_SERVICE_EXIT: &str = "SLOWSERVICEEXIT";
 /// O texto do console também vai para a serial.
 pub const CONSOLE_MIRROR: &str = "CONSOLEMIRROR";
 /// `smss`: o primeiro processo de usuário é o smss.exe real.
