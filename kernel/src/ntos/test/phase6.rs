@@ -4815,17 +4815,28 @@ fn etw_trace_session(assert: Assert, block: u64, prepare: &dyn Fn(u32)) {
         disabled == Some(0) && disabled_seen == 0 && reserved == Some(0xFFFF_FFFF_C000_0022) && bad_control == Some(0xFFFF_FFFF_C000_000D) && missing == Some(0xFFFF_FFFF_C000_0296) && reenabled == Some(0) && ETW_SESSION_CALLBACK[1].load(SeqCst) == 1 && ETW_SESSION_CALLBACK[2].load(SeqCst) == 4,
         "etw-session: NtTraceControl 17 (EnableTraceEx2) desabilita e habilita o provedor na sessao; LoggerId 3, IsEnabled invalido e sessao ausente recusados",
     );
-    let list = call_export("ZwTraceControl", &[21, 0, 0, notify, 0x200, returned]);
-    let list_length = guest::read32(returned);
-    let listed = (0..list_length.min(0x200) / 16).any(|index| guest::read_bytes(notify + index as u64 * 16, 16) == guest::read_bytes(provider, 16));
+    // A saída curta devolve o tamanho de todos; a lista inteira cabe num
+    // buffer desse tamanho (com folga para um provedor que se registre
+    // entre as duas chamadas).
     let short_list = call_export("ZwTraceControl", &[21, 0, 0, notify, 0x10, returned]);
+    let needed = guest::read32(returned);
+    let room = needed + 0x400;
+    let guids = guest::alloc_bytes(room as u64);
+    let list = call_export("ZwTraceControl", &[21, 0, 0, guids, room as u64, returned]);
+    let list_length = guest::read32(returned);
+    let listed = (0..list_length.min(room) / 16).any(|index| guest::read_bytes(guids + index as u64 * 16, 16) == guest::read_bytes(provider, 16));
+    guest::free_bytes(guids);
     guest::write32(notify + 0x100, logger_id as u32);
     let reference = call_export("ZwTraceControl", &[25, notify + 0x100, 4, notify, 0x10, returned]);
     let reference_ok = guest::read64(notify) != 0 && guest::read32(returned) == 0x10;
     guest::write32(notify + 0x100, 0x3F);
     let reference_missing = call_export("ZwTraceControl", &[25, notify + 0x100, 4, notify, 0x10, returned]);
+    let lists_ok = short_list == Some(0xFFFF_FFFF_C000_0023) && needed >= 11 * 16 && needed % 16 == 0 && list == Some(0) && list_length >= needed && list_length % 16 == 0 && listed;
+    if !lists_ok || reference != Some(0) || !reference_ok || reference_missing != Some(0xFFFF_FFFF_C000_0296) {
+        crate::debug_print!("[etw-session] 21: curta {:x?} tamanho {:#x}, lista {:x?} tamanho {:#x} com o provedor {}; 25: {:x?} {} ausente {:x?}", short_list, needed, list, list_length, listed, reference, reference_ok, reference_missing);
+    }
     assert(
-        list == Some(0) && list_length >= 11 * 16 && list_length % 16 == 0 && listed && short_list == Some(0xFFFF_FFFF_C000_0023) && guest::read32(returned) == list_length && reference == Some(0) && reference_ok && reference_missing == Some(0xFFFF_FFFF_C000_0296),
+        lists_ok && reference == Some(0) && reference_ok && reference_missing == Some(0xFFFF_FFFF_C000_0296),
         "etw-session: NtTraceControl 21 (lista de GUIDs com o provedor e os 10 do global logger) e 25 (ETW_REF_CLOCK da sessao)",
     );
     guest::free_bytes(notify);
