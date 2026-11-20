@@ -19,7 +19,7 @@ use alloc::vec::Vec;
 use crate::hal::amd64::aptrampoline;
 use crate::hal::{cpu, lapic, physical};
 use crate::hal::acpi;
-use crate::ntos::ke::{bugcheck, clock, pcr};
+use crate::ntos::ke::{clock, pcr};
 use crate::ntos::mm::kernel_stack::{self, KernelStack};
 use crate::ntos::mm::memory_map as map;
 use crate::ntos::mm::paging::{self, MapOptions};
@@ -76,23 +76,29 @@ static STATE: SpinLock<Smp> = SpinLock::new(Smp {
     boot_stacks: Vec::new(),
 });
 
-/// IPI_WATCHDOG_TIMEOUT: um processador esperou tempo demais pela resposta
-/// a um IPI.
-pub const IPI_WATCHDOG_TIMEOUT: u32 = 0x1DB;
-/// Prazo para o ICR voltar a ocioso (DeliveryStatus), medido em tempo, em
-/// hardware e sob hipervisor.
+/// Prazo para o ICR voltar a ocioso (DeliveryStatus) na partida dos APs,
+/// medido em tempo, em hardware e sob hipervisor. Os IPIs do sistema em
+/// funcionamento esperam o ICR sem prazo, como o HalpApic1WriteIcr do 19041
+/// (0x2efaf2..0x2efb05, `bt [ICR], 12` em laço).
 const INTERRUPT_DELIVERY_TIMEOUT_MS: u64 = 100;
-/// Prazo das confirmações de um shootdown de TLB, em hardware e sob
-/// hipervisor.
-const SHOOTDOWN_TIMEOUT_MS: u64 = 5_000;
-/// Num emulador (o TCG do QEMU) os prazos valem este múltiplo: cada CPU
-/// virtual é uma thread comum do hospedeiro, e a entrega de uma NMI e a
-/// execução do tratador dela passam pela trava global do emulador, que as
-/// voltas de `pause` das outras CPUs virtuais disputam. Com o hospedeiro
-/// carregado, a thread de um alvo fica segundos sem rodar (o hospedeiro só
-/// promove uma thread faminta depois de alguns segundos), e nada no
-/// convidado o evita: nem o IF nem o IRQL do alvo contam, porque a
-/// confirmação vem pela NMI. Um alvo realmente mudo ainda é detectado.
+/// Quanto um IPI do sistema em funcionamento (a NMI de shootdown, a de um
+/// trabalho de AP) espera antes do diagnóstico na serial, em hardware e sob
+/// hipervisor. Não é prazo: o 19041 espera as confirmações de um flush de
+/// TLB sem limite, girando no PacketBarrier da KPRCB (KeFlushMultipleRangeTb
+/// 0x2bbdce..0x2bbdf8, KeFlushProcessWriteBuffers 0x343dbd..0x343dc9, só com
+/// o aviso de espera longa ao hipervisor, HvlNotifyLongSpinWait), e o único
+/// IPI_WATCHDOG_TIMEOUT dele é a barreira do KeIpiGenericCall
+/// (KiIpiGenericCallTarget 0x3a49c2..0x3a4a07: 300 s a partir do
+/// BaselineInterruptTimeQpc, e nenhum com KiBarrierWait ou com o tempo
+/// relaxado que o hipervisor recomenda, HvlEnlightenments bit 5). Sob um
+/// hipervisor com o hospedeiro carregado, a CPU virtual de um alvo fica
+/// segundos sem rodar (o hospedeiro só promove uma thread faminta depois de
+/// uns 4 s), e nada no convidado o evita.
+const SLOW_INTERRUPT_REPORT_MS: u64 = 5_000;
+/// Num emulador (o TCG do QEMU) os prazos e o diagnóstico valem este
+/// múltiplo: cada CPU virtual é uma thread comum do hospedeiro, e a entrega
+/// de uma NMI e a execução do tratador dela passam pela trava global do
+/// emulador, que as voltas de `pause` das outras CPUs virtuais disputam.
 const EMULATED_TIMEOUT_SCALE: u64 = 12;
 
 /// O múltiplo dos prazos de IPI desta plataforma (0 = ainda não decidido).
@@ -109,21 +115,21 @@ fn timeout_scale() -> u64 {
     scale
 }
 
-/// O prazo do ICR desta plataforma (100 ms em hardware e sob hipervisor).
+/// O prazo do ICR na partida dos APs nesta plataforma (100 ms em hardware e
+/// sob hipervisor).
 pub fn interrupt_delivery_timeout_ms() -> u64 {
     INTERRUPT_DELIVERY_TIMEOUT_MS * timeout_scale()
 }
 
-/// O prazo das confirmações de um shootdown nesta plataforma (5 s em
-/// hardware e sob hipervisor).
-pub fn shootdown_timeout_ms() -> u64 {
-    SHOOTDOWN_TIMEOUT_MS * timeout_scale()
+/// Depois de quanto tempo um IPI do sistema em funcionamento sem resposta
+/// vai à serial (5 s em hardware e sob hipervisor); a espera continua.
+pub fn slow_interrupt_report_ms() -> u64 {
+    SLOW_INTERRUPT_REPORT_MS * timeout_scale()
 }
 
-/// Uma espera de IPI que venceu o prazo. Leva os parâmetros do
-/// IPI_WATCHDOG_TIMEOUT do KiIpiGenericCallTarget do 19041 — a frequência
-/// que o KeQueryPerformanceCounter devolve (10 MHz), o valor corrente do
-/// contador e o do início da espera — e a máscara dos processadores (pelo
+/// Uma espera de IPI com prazo que venceu: a frequência do contador de
+/// desempenho (a do KeQueryPerformanceCounter, 10 MHz), o valor corrente do
+/// contador, o do início da espera e a máscara dos processadores (pelo
 /// número) que não responderam.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IpiStall {
@@ -176,20 +182,42 @@ pub fn stall_on_targets(timeout_ms: u64, mut pending: impl FnMut() -> u64) -> Re
     }
 }
 
-/// O diagnóstico de um IPI sem resposta: imprime quem não respondeu e em
-/// quanto tempo e para o sistema com IPI_WATCHDOG_TIMEOUT (frequência,
-/// contador corrente, contador do início, 0), os parâmetros do NT.
-pub fn ipi_stall_bug_check(stall: &IpiStall, what: &str) -> ! {
-    debug_print!(
-        "*** IPI SEM RESPOSTA ({}): processadores {:#x} pendentes depois de {} ms (contador {:#x} -> {:#x}, {} Hz)",
-        what,
-        stall.pending,
-        stall.elapsed_ms(),
-        stall.start,
-        stall.current,
-        stall.frequency
-    );
-    bugcheck::bug_check_ex(IPI_WATCHDOG_TIMEOUT, stall.frequency, stall.current, stall.start, 0)
+/// Como terminou uma espera sem prazo de IPI ([`wait_on_targets`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IpiWait {
+    /// Milissegundos até o último alvo responder.
+    pub elapsed_ms: u64,
+    /// A máscara dos que ainda faltavam quando a espera passou do tempo do
+    /// diagnóstico (0 se todos responderam antes).
+    pub slow: u64,
+}
+
+/// Espera, sem prazo, até `pending` devolver 0 (os processadores que ainda
+/// não responderam), como o 19041 espera o PacketBarrier de um flush de TLB:
+/// girando com `pause`. Passado `report_ms`, a serial recebe uma linha com
+/// os pendentes (`what` diz o quê) e a espera continua; a resposta tardia
+/// também vai à serial, com o tempo total.
+pub fn wait_on_targets(report_ms: u64, what: &str, mut pending: impl FnMut() -> u64) -> IpiWait {
+    let frequency = clock::QPC_FREQUENCY;
+    let start = clock::query_performance_counter_value();
+    let mut slow = 0;
+    loop {
+        let waiting = pending();
+        let current = clock::query_performance_counter_value();
+        let elapsed = current.wrapping_sub(start);
+        if waiting == 0 {
+            let elapsed_ms = (elapsed as u128 * 1000 / frequency as u128) as u64;
+            if slow != 0 {
+                debug_print!("[smp] {}: os processadores {:#x} responderam depois de {} ms", what, slow, elapsed_ms);
+            }
+            return IpiWait { elapsed_ms, slow };
+        }
+        if slow == 0 && deadline_passed(elapsed, frequency, report_ms) {
+            slow = waiting;
+            debug_print!("[smp] {}: processadores {:#x} sem resposta ha {} ms; a espera continua (sem prazo, como o flush de TLB do 19041)", what, waiting, report_ms);
+        }
+        cpu::pause();
+    }
 }
 
 /// O bit deste processador (o número da KPRCB; 0 antes da KPCR do BSP).
@@ -198,29 +226,45 @@ fn own_processor_bit() -> u64 {
     1 << (number & 63)
 }
 
-/// Espera, em tempo, a entrega do comando anterior (o bit DeliveryStatus
-/// do ICR deste processador volta a ocioso).
-fn wait_for_interrupt_delivery() -> Result<(), IpiStall> {
-    stall_on_targets(interrupt_delivery_timeout_ms(), || if lapic::read(LAPIC_COMMAND_LOW) & 0x1000 != 0 { own_processor_bit() } else { 0 })
+/// O bit DeliveryStatus do ICR deste processador (o comando anterior ainda
+/// não saiu), como a máscara deste processador.
+fn interrupt_delivery_pending() -> u64 {
+    if lapic::read(LAPIC_COMMAND_LOW) & 0x1000 != 0 { own_processor_bit() } else { 0 }
 }
 
-/// Um identificador x2APIC acima de 255 não pode ser truncado e enviado a
-/// outro processador pelo xAPIC (`Ok(false)`); um ICR que não fica ocioso no
-/// prazo é o atraso.
-fn send_processor_interrupt(identifier: u32, command_low: u32) -> Result<bool, IpiStall> {
+/// A partida de um AP: um ICR que não fica ocioso no prazo é o atraso, e um
+/// identificador x2APIC acima de 255 não pode ser truncado e enviado a outro
+/// processador pelo xAPIC (`Ok(false)`).
+fn send_startup_command(identifier: u32, command_low: u32) -> Result<bool, IpiStall> {
     if identifier > 255 {
         return Ok(false);
     }
-    wait_for_interrupt_delivery()?;
+    stall_on_targets(interrupt_delivery_timeout_ms(), interrupt_delivery_pending)?;
     lapic::write(LAPIC_COMMAND_HIGH, identifier << 24);
     lapic::write(LAPIC_COMMAND_LOW, command_low);
-    wait_for_interrupt_delivery()?;
+    stall_on_targets(interrupt_delivery_timeout_ms(), interrupt_delivery_pending)?;
     Ok(true)
 }
 
 /// Envio da partida dos APs: a falha vira erro do boot.
 fn send_startup_interrupt(identifier: u32, command_low: u32) -> bool {
-    matches!(send_processor_interrupt(identifier, command_low), Ok(true))
+    matches!(send_startup_command(identifier, command_low), Ok(true))
+}
+
+/// Um IPI do sistema em funcionamento (a NMI de shootdown, a de um trabalho,
+/// a do depurador): o ICR é esperado sem prazo antes e depois da escrita,
+/// como o HalpApic1WriteIcr do 19041. `false` só para um identificador
+/// x2APIC acima de 255, que o xAPIC não alcança.
+fn send_processor_interrupt(identifier: u32, command_low: u32) -> bool {
+    if identifier > 255 {
+        return false;
+    }
+    let what = "entrega de IPI pelo ICR";
+    wait_on_targets(slow_interrupt_report_ms(), what, interrupt_delivery_pending);
+    lapic::write(LAPIC_COMMAND_HIGH, identifier << 24);
+    lapic::write(LAPIC_COMMAND_LOW, command_low);
+    wait_on_targets(slow_interrupt_report_ms(), what, interrupt_delivery_pending);
+    true
 }
 
 /// Entradas Local APIC e Local x2APIC habilitadas da MADT.
@@ -512,7 +556,9 @@ pub fn start_job(slot: usize, routine: u64, arguments: [u64; 4]) -> Result<bool,
     // NMI o acorda (a que chega antes do HLT volta ao teste do trabalho, no
     // `ap_nmi_done` do trampolim).
     let identifier = physical::read32(record + SLOT_CONTROLLER_IDENTIFIER);
-    send_processor_interrupt(identifier, 0x4400).map_err(|stall| KernelError::new(alloc::format!("NMI de trabalho ao AP slot {slot} sem entrega em {} ms", stall.elapsed_ms())))?;
+    if !send_processor_interrupt(identifier, 0x4400) {
+        return Err(KernelError::new(alloc::format!("NMI de trabalho ao AP slot {slot}: identificador {identifier} fora do xAPIC")));
+    }
     Ok(true)
 }
 
@@ -615,7 +661,7 @@ pub fn send_nmi_to_application_processors() -> u32 {
             continue;
         }
         let identifier = physical::read32(record + SLOT_CONTROLLER_IDENTIFIER);
-        if identifier != own && matches!(send_processor_interrupt(identifier, 0x4400), Ok(true)) {
+        if identifier != own && send_processor_interrupt(identifier, 0x4400) {
             sent += 1;
         }
     }
@@ -623,10 +669,10 @@ pub fn send_nmi_to_application_processors() -> u32 {
 }
 
 /// NMI direcionada aos processadores online e espera da confirmação da
-/// geração de invalidação; `flush_caches` pede WBINVD também. A espera é
-/// medida em tempo ([`stall_on_targets`]): um processador que não confirma
-/// em [`shootdown_timeout_ms`] (ou um ICR que não fica ocioso) para o sistema
-/// com o diagnóstico de IPI sem resposta, como o IPI_WATCHDOG_TIMEOUT do NT.
+/// geração de invalidação; `flush_caches` pede WBINVD também. A espera não
+/// tem prazo ([`wait_on_targets`]), como a do PacketBarrier no flush de TLB
+/// do 19041: um alvo que demora mais que [`slow_interrupt_report_ms`] vai à
+/// serial e a espera segue.
 pub fn flush_remote_tlb(flush_caches: bool) -> Result<(), KernelError> {
     shootdown(u64::MAX, flush_caches, false)
 }
@@ -664,16 +710,12 @@ fn shootdown(targets: u64, flush_caches: bool, wait_busy: bool) -> Result<(), Ke
         physical::write32(MAILBOX + 0x34, flush_caches as u32);
         physical::write32(MAILBOX + 0x30, generation);
         for &(_, slot) in &selected {
-            match send_processor_interrupt(physical::read32(slot_address(slot) + SLOT_CONTROLLER_IDENTIFIER), 0x4400) {
-                Ok(true) => {}
-                Ok(false) => return Err(KernelError::new("TLB shootdown delivery failed")),
-                Err(stall) => ipi_stall_bug_check(&stall, "entrega do shootdown de TLB"),
+            if !send_processor_interrupt(physical::read32(slot_address(slot) + SLOT_CONTROLLER_IDENTIFIER), 0x4400) {
+                return Err(KernelError::new("TLB shootdown delivery failed"));
             }
         }
         let pending = || selected.iter().filter(|&&(_, slot)| physical::read32(slot_address(slot) + 0x3C) != generation).fold(0u64, |mask, &(index, _)| mask | processor_bit(index));
-        if let Err(stall) = stall_on_targets(shootdown_timeout_ms(), pending) {
-            ipi_stall_bug_check(&stall, "confirmacao do shootdown de TLB");
-        }
+        wait_on_targets(slow_interrupt_report_ms(), "confirmacao do shootdown de TLB", pending);
         Ok(())
     })();
     cpu::restore_interrupts(flags);

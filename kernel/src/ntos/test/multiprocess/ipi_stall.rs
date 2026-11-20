@@ -1,9 +1,8 @@
-//! Esperas de IPI medidas em tempo (`ke/smp.rs`): a entrega pelo ICR e as
-//! confirmações do shootdown de TLB esperam pelo contador de desempenho
-//! (`smp::stall_on_targets`), não por um número de voltas, e um alvo que não
-//! responde no prazo vira o diagnóstico de IPI sem resposta
-//! (IPI_WATCHDOG_TIMEOUT, com a frequência e os contadores do início e da
-//! detecção).
+//! Esperas de IPI medidas em tempo (`ke/smp.rs`): a entrega pelo ICR na
+//! partida dos APs espera com prazo pelo contador de desempenho
+//! (`smp::stall_on_targets`), não por um número de voltas; as confirmações
+//! do shootdown de TLB esperam sem prazo (`smp::wait_on_targets`), como o
+//! PacketBarrier do flush de TLB do 19041, e o alvo lento só vai à serial.
 //!
 //! - uma resposta que chega 50 ms depois, num prazo de 200 ms, é aceita: uma
 //!   espera por voltas (100 000 leituras) desiste antes, porque cada volta
@@ -20,9 +19,12 @@
 //!   KeQueryPerformanceCounter, 10 MHz) e os dois contadores coerentes com o
 //!   tempo medido;
 //! - o shootdown real, com todos os APs respondendo, conclui;
-//! - os prazos são 100 ms para o ICR e 5 s para as confirmações em hardware
-//!   e sob hipervisor, e maiores num emulador, em que uma CPU virtual fica
-//!   segundos sem rodar com o hospedeiro carregado;
+//! - a espera sem prazo de um alvo que responde 60 ms depois, com o
+//!   diagnóstico em 20 ms, conclui com o alvo dado como lento (sem parada do
+//!   sistema), e a de um que responde antes do diagnóstico, sem;
+//! - o prazo do ICR na partida é 100 ms e o diagnóstico de um IPI lento 5 s,
+//!   em hardware e sob hipervisor, e maiores num emulador, em que uma CPU
+//!   virtual fica segundos sem rodar com o hospedeiro carregado;
 //! - um AP girando com as interrupções desligadas em HIGH_LEVEL (CR8 = 15)
 //!   confirma 64 shootdowns seguidos: a confirmação vem pela NMI, que nem o
 //!   IF nem o IRQL do alvo retêm;
@@ -70,14 +72,25 @@ pub fn run(assert: Assert) {
             && smp::deadline_passed(stall.current.wrapping_sub(stall.start), stall.frequency, 30)
             && (30..30 + HOST_SLACK_MS).contains(&stall.elapsed_ms())
     });
-    assert(coherent, "ipi: o atraso traz os pendentes, a frequencia do contador de desempenho e os contadores do inicio e da deteccao (parametros do IPI_WATCHDOG_TIMEOUT)");
+    assert(coherent, "ipi: o atraso traz os pendentes, a frequencia do contador de desempenho e os contadores do inicio e da deteccao");
 
     if smp::ap_slot_count() > 0 {
         assert(smp::flush_remote_tlb(false).is_ok(), "ipi: shootdown de TLB com todos os APs respondendo");
     }
 
+    // A espera sem prazo: o alvo que responde depois do diagnóstico ainda
+    // conclui (o flush de TLB do 19041 gira no PacketBarrier sem limite).
+    let start = clock::uptime_ms();
+    let arrival = start + 60;
+    let slow = smp::wait_on_targets(20, "autoteste de IPI lento", || if clock::uptime_ms() < arrival { 0b100 } else { 0 });
+    let waited = clock::uptime_ms() - start;
+    assert(slow.slow == 0b100 && slow.elapsed_ms >= 60 && waited >= 60, "ipi: o alvo que responde depois do diagnostico conclui a espera sem prazo, dado como lento, sem parar o sistema");
+    let arrival = clock::uptime_ms() + 5;
+    let prompt = smp::wait_on_targets(2_000, "autoteste de IPI", || if clock::uptime_ms() < arrival { 0b10 } else { 0 });
+    assert(prompt.slow == 0 && prompt.elapsed_ms < 2_000, "ipi: o alvo que responde antes do diagnostico conclui a espera sem ser dado como lento");
+
     let scale = if crate::hal::hypervisor::is_emulator() { 12 } else { 1 };
-    assert(smp::interrupt_delivery_timeout_ms() == 100 * scale && smp::shootdown_timeout_ms() == 5_000 * scale, "ipi: prazos de 100 ms (ICR) e 5 s (shootdown) em hardware e sob hipervisor, 12 vezes maiores num emulador");
+    assert(smp::interrupt_delivery_timeout_ms() == 100 * scale && smp::slow_interrupt_report_ms() == 5_000 * scale, "ipi: prazo de 100 ms (ICR na partida) e diagnostico de 5 s (IPI lento) em hardware e sob hipervisor, 12 vezes maiores num emulador");
 
     if smp::ap_slot_count() > 0 {
         masked_target_acknowledges(assert);

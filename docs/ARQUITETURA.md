@@ -600,27 +600,39 @@ que o test-boot agora fecha com um pipe em vez do NUL). O autoteste
 acorda, com as interrupções ligadas, e que um DPC na fila não o deixa
 dormir.
 
-**IPIs medidos em tempo.** Toda espera de resposta a um IPI (`ke/smp.rs`:
-o ICR voltar a ocioso depois do envio e as confirmações do shootdown de
-TLB) passa por `smp::stall_on_targets`, que lê o contador de desempenho (o
-KeQueryPerformanceCounter, 10 MHz, o mesmo que o KiIpiGenericCallTarget do
-19041 lê) e compara o decorrido com a frequência vezes o prazo, em vez de
-contar voltas: o prazo é o mesmo em qualquer CPU, hipervisor ou emulador. A
+**IPIs medidos em tempo.** As esperas de resposta a um IPI (`ke/smp.rs`)
+leem o contador de desempenho (o KeQueryPerformanceCounter, 10 MHz, o mesmo
+que o KiIpiGenericCallTarget do 19041 lê) em vez de contar voltas: o tempo
+é o mesmo em qualquer CPU, hipervisor ou emulador. Como no 19041, as
+confirmações de um shootdown de TLB e do KeFlushProcessWriteBuffers não têm
+prazo (`smp::wait_on_targets`): o KeFlushMultipleRangeTb e o
+KeFlushProcessWriteBuffers giram no PacketBarrier da KPRCB sem limite
+(0x2bbdce..0x2bbdf8, 0x343dbd..0x343dc9), e o ICR do sistema em
+funcionamento também é esperado sem prazo (o HalpApic1WriteIcr). O único
+IPI_WATCHDOG_TIMEOUT (0x1DB) do 19041 é a barreira do KeIpiGenericCall
+(KiIpiGenericCallTarget 0x3a49c2..0x3a4a07: 300 s a partir do
+BaselineInterruptTimeQpc, e nenhum com o tempo relaxado que o hipervisor
+recomenda, o bit 5 do CPUID 0x40000004), que o OpenNT não tem (o
+KeIpiGenericCall roda só no processador corrente). Um alvo que demora mais
+de 5 s vai à serial com os pendentes e a espera segue; a resposta tardia
+também vai, com o tempo total. Antes, o shootdown parava o sistema com o
+IPI_WATCHDOG_TIMEOUT depois de 5 s: sob WHPX com o hospedeiro carregado, a
+CPU virtual de um AP fica segundos sem rodar (o agendador do Windows só
+promove uma thread faminta depois de uns 4 s), e a suíte com 4 CPUs parava
+assim no meio de um teste de registro. Só a partida dos APs (INIT/SIPI)
+tem prazo, 100 ms para o ICR voltar a ocioso, por `smp::stall_on_targets`,
+e devolve erro ao boot. A
 comparação (`smp::deadline_passed`) é a estrita do 19041 (`ja`) e exata, em
 128 bits: um prazo que não cai numa unidade inteira do contador não vence
 na unidade de baixo, uma fração de unidade antes da hora. Com o TSC e o
 prazo pela unidade de baixo, uma leitura que caía exatamente nela (cerca de
 1 espera em 100 no QEMU sob WHPX) era detectada com 29 ms num prazo de 30.
-Um processador que não confirma o shootdown em 5 s, ou um ICR que não fica
-ocioso em 100 ms, para o sistema com o diagnóstico (os processadores
-pendentes, pelo número, e o tempo) e o IPI_WATCHDOG_TIMEOUT (0x1DB) com os
-parâmetros do KiIpiGenericCallTarget do 19041: a frequência do contador de
-desempenho, o contador corrente e o do início da espera. A partida dos APs
-(INIT/SIPI) usa o mesmo envio e devolve erro ao boot. O autoteste
+O autoteste
 `ntos/test/multiprocess/ipi_stall.rs` confere a fronteira exata do prazo,
 que uma resposta que chega em 50 ms num prazo de 200 ms é aceita, que um
 alvo mudo é detectado depois dos 30 ms do prazo, não antes, com contadores
-coerentes, e o shootdown real.
+coerentes, que a espera sem prazo de um alvo que responde depois do
+diagnóstico conclui com ele dado como lento, e o shootdown real.
 A confirmação do shootdown vem pela NMI, que nem o IF nem o IRQL (o CR8) do
 alvo retêm: o mesmo autoteste faz um AP girar com as interrupções
 desligadas em HIGH_LEVEL e confirma 64 shootdowns seguidos (na casa das

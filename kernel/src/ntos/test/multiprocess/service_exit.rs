@@ -267,6 +267,15 @@ fn run_phases() -> Option<Outcome> {
                 if threads::start(counter, code, stacks + 0x4000 - 0x28, 0, 0).is_ok() {
                     let deadline = clock::uptime_ms() + 20_000;
                     let calls = CALLS.load(Ordering::SeqCst);
+                    // Um intervalo por volta (`dispatch_round`), não um tique
+                    // inteiro: o par seguinte sai assim que a espera nova
+                    // está instalada. Um `scheduler::tick` dá até
+                    // USER_SLICES_PER_TICK intervalos, quase todos da que
+                    // conta, e só então o teste voltava a olhar; com o
+                    // hospedeiro carregado, cada intervalo dura várias vezes
+                    // os 10 ms do tique (a CPU virtual fica sem rodar) e os
+                    // 40 pares não cabiam no prazo, sem nenhuma espera
+                    // perdida.
                     while outcome.pairs < PAIRS && clock::uptime_ms() < deadline && !PENDING_SEEN.load(Ordering::SeqCst) {
                         // Um par só com a espera instalada e todas as
                         // anteriores concluídas.
@@ -275,11 +284,11 @@ fn run_phases() -> Option<Outcome> {
                             dispatcher::reset_event(block);
                             outcome.pairs += 1;
                         }
-                        scheduler::tick(-1);
+                        let _ = threads::dispatch_round();
                     }
                     let settle = clock::uptime_ms() + 2_000;
                     while DEFERRED_CALLS.load(Ordering::SeqCst) <= outcome.pairs && clock::uptime_ms() < settle {
-                        scheduler::tick(-1);
+                        let _ = threads::dispatch_round();
                     }
                     outcome.completed = DEFERRED_CALLS.load(Ordering::SeqCst).saturating_sub(1);
                     outcome.counted_beside = CALLS.load(Ordering::SeqCst) - calls;

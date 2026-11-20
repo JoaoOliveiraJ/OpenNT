@@ -34,8 +34,8 @@ const ROUNDS: u64 = 0x20;
 const STOP: u64 = 0x28;
 const STATUS: u64 = 0x30;
 
-/// O bloco em uso (o teste roda uma vez por boot).
-static BLOCK: AtomicU64 = AtomicU64::new(0);
+/// Os sinais já dados à thread: parada de novo, ela completou tantas voltas.
+static SIGNALED: AtomicU64 = AtomicU64::new(0);
 
 extern "win64" fn waiter(block: u64) {
     loop {
@@ -98,8 +98,7 @@ enum Signal {
 /// Um caso: espera a thread parada, grava `before`, sinaliza e devolve o
 /// que ela levou para a fila (`None` se ela não parou ou não ficou Ready).
 fn case(thread: u64, block: u64, before: Before, signal: Signal) -> Option<After> {
-    let rounds = guest::read64(block + ROUNDS);
-    if !pump(5_000, &|| wait::is_waiting(thread) && thread_dispatch::thread_state(thread) == thread_dispatch::state::WAITING && guest::read64(block + ROUNDS) == rounds) {
+    if !parked(thread, block) {
         return None;
     }
     let target = kthread(thread);
@@ -123,6 +122,7 @@ fn case(thread: u64, block: u64, before: Before, signal: Signal) -> Option<After
             call_export("KeAlertThread", &[thread, 0]);
         }
     }
+    SIGNALED.fetch_add(1, Ordering::SeqCst);
     process.vm.instance.flags.memory_priority.set(saved_memory_priority);
     target.set_disable_boost(0);
     if thread_dispatch::thread_state(thread) != thread_dispatch::state::READY {
@@ -130,6 +130,11 @@ fn case(thread: u64, block: u64, before: Before, signal: Signal) -> Option<After
     }
     let renewed = cycles.wrapping_add(target.quantum_reset.get() as u64 * thread_dispatch::cycles_per_quantum() as u64);
     Some(After { priority: target.priority.get(), decrement: target.priority_decrement.get() as u8, quantum_renewed: target.quantum_target.get() == renewed && quantum_target != renewed })
+}
+
+/// A thread completou a volta de cada sinal e parou de novo no evento.
+fn parked(thread: u64, block: u64) -> bool {
+    pump(5_000, &|| wait::is_waiting(thread) && thread_dispatch::thread_state(thread) == thread_dispatch::state::WAITING && guest::read64(block + ROUNDS) == SIGNALED.load(Ordering::SeqCst))
 }
 
 fn short(base: i8, priority: i8) -> Before {
@@ -144,7 +149,7 @@ pub fn run(assert: Assert) {
     }
     guest::write_bytes(block, &[0; 0x40]);
     dispatcher::initialize_event(block, 1, false);
-    BLOCK.store(block, Ordering::SeqCst);
+    SIGNALED.store(0, Ordering::SeqCst);
     let handle = kernel_threads::create_system_thread(0, waiter as *const () as usize as u64, block, 0x1F_FFFF, 0, None).unwrap_or(0);
     let thread = kernel_threads::of_handle(handle).unwrap_or(0);
     if thread == 0 {
@@ -196,8 +201,7 @@ pub fn run(assert: Assert) {
     );
 
     // A thread volta à prioridade de antes e sai.
-    let rounds = guest::read64(block + ROUNDS);
-    let parked = pump(5_000, &|| wait::is_waiting(thread) && guest::read64(block + ROUNDS) == rounds);
+    let parked = parked(thread, block);
     if parked {
         kthread(thread).base_priority.set(original_base);
         kthread(thread).priority.set(original_priority);
@@ -209,5 +213,4 @@ pub fn run(assert: Assert) {
     assert(parked && finished, "impulso: a thread de sistema sai no fim");
     let _ = object_manager::close(handle as u32);
     guest::free_bytes(block);
-    BLOCK.store(0, Ordering::SeqCst);
 }
