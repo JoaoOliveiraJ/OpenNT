@@ -16,7 +16,7 @@ pub fn fmt(bytes: u64) -> String {
 
 pub fn cmd_mem() {
     let (total, used) = kmalloc::info();
-    console::print(&format!("RAM total : {} (via E820)", fmt(kmalloc::ram_top())));
+    console::print(&format!("RAM total : {} (via E820)", fmt(super::physical_layout::number_of_physical_pages() * 0x1000)));
     console::print(&format!("heap      : {} usados / {} total", fmt(used as u64), fmt(total as u64)));
     console::print(&format!("livre     : {}", fmt(total.saturating_sub(used) as u64)));
 }

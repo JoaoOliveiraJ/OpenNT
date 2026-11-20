@@ -98,7 +98,7 @@ fn halt(_: &[Value]) -> Result<Value, KernelError> {
 }
 
 fn ramsize(_: &[Value]) -> Result<Value, KernelError> {
-    Ok(Value::Number(kmalloc::ram_top()))
+    Ok(Value::Number(crate::ntos::mm::physical_layout::number_of_physical_pages() * 0x1000))
 }
 
 /// `open`/`close` pertencem ao Object Manager, ainda não implementado.

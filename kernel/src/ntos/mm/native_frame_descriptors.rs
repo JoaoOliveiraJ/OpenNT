@@ -231,29 +231,23 @@ pub fn initialize(configuration: Configuration) -> Result<(), KernelError> {
     {
         return Err(KernelError::new("invalid native frame descriptor configuration"));
     }
-    let mut free_frames: Vec<u32> = Vec::with_capacity(configuration.free_count as usize);
-    for range in &configuration.allocation_ranges {
-        for (index, &used) in range.bitmap.iter().enumerate() {
-            if used == 0 {
-                free_frames.push((range.base / 4096 + index as u64) as u32);
-            }
-        }
-    }
-    if free_frames.len() as u64 != configuration.free_count {
-        return Err(KernelError::new("PFN snapshot accounting mismatch"));
-    }
-    state.physical_base = configuration.physical_base;
-    state.virtual_base = configuration.virtual_base;
-    state.frame_count = configuration.frame_count;
-    state.first_free_frame = free_frames.first().map_or(LIST_END, |&frame| frame as u64);
-    state.last_free_frame = free_frames.last().map_or(LIST_END, |&frame| frame as u64);
-    state.free_frame_count = free_frames.len() as u64;
-
     let admitted: Vec<(u64, u64)> =
         configuration.physical_ranges.iter().map(|&(base, top)| (base / map::PAGE_SIZE, top / map::PAGE_SIZE)).collect();
+    // Cada faixa do alocador fica dentro do bloco: um frame livre fora dele
+    // nunca entraria na lista.
+    let inside = |first: u64, frames: u64| admitted.iter().any(|&(low, high)| first >= low && first + frames <= high);
+    let ranges = &configuration.allocation_ranges;
+    if ranges.iter().any(|range| !inside(range.base / map::PAGE_SIZE, range.frames as u64)) {
+        return Err(KernelError::new("free PFN outside admitted memory"));
+    }
     physical::zero(configuration.physical_base, (configuration.frame_count * DESCRIPTOR_SIZE) as usize);
-    let mut free_index = 0usize;
+    // A lista livre é encadeada andando os frames em ordem: o livre anterior
+    // recebe o Flink quando o próximo aparece.
+    let mut first_free = LIST_END;
+    let mut previous_free = LIST_END;
+    let mut free_count = 0u64;
     let mut admitted_index = 0usize;
+    let mut range_index = 0usize;
     for frame_number in 0..configuration.frame_count {
         while admitted_index < admitted.len() && frame_number >= admitted[admitted_index].1 {
             admitted_index += 1;
@@ -261,22 +255,38 @@ pub fn initialize(configuration: Configuration) -> Result<(), KernelError> {
         if admitted_index == admitted.len() || frame_number < admitted[admitted_index].0 {
             continue;
         }
+        while range_index < ranges.len() && frame_number >= ranges[range_index].base / map::PAGE_SIZE + ranges[range_index].frames as u64 {
+            range_index += 1;
+        }
+        let available = ranges.get(range_index).is_some_and(|range| {
+            let first = range.base / map::PAGE_SIZE;
+            frame_number >= first && !range.used((frame_number - first) as usize)
+        });
         let entry = pfn(configuration.physical_base + frame_number * DESCRIPTOR_SIZE);
-        let available = free_frames.get(free_index).is_some_and(|&frame| frame as u64 == frame_number);
         entry.u4.entire_field.set(FRAME_EXISTS);
         entry.u3.reference_count.set(if available { 0 } else { 1 });
         entry.u3.e1.bitfield_0.set(entry_byte(if available { FREE_PAGE } else { ACTIVE_PAGE }, CACHED_MEMORY));
         if available {
-            let next = free_frames.get(free_index + 1).map_or(LIST_END, |&frame| frame as u64);
-            let previous = if free_index > 0 { free_frames[free_index - 1] as u64 } else { LIST_END };
-            entry.u1.next.set(next);
-            entry.u2.entire_field.set(previous);
-            free_index += 1;
+            entry.u1.next.set(LIST_END);
+            entry.u2.entire_field.set(previous_free);
+            if previous_free == LIST_END {
+                first_free = frame_number;
+            } else {
+                pfn(configuration.physical_base + previous_free * DESCRIPTOR_SIZE).u1.next.set(frame_number);
+            }
+            previous_free = frame_number;
+            free_count += 1;
         }
     }
-    if free_index != free_frames.len() {
-        return Err(KernelError::new("free PFN outside admitted memory"));
+    if free_count != configuration.free_count {
+        return Err(KernelError::new("PFN snapshot accounting mismatch"));
     }
+    state.physical_base = configuration.physical_base;
+    state.virtual_base = configuration.virtual_base;
+    state.frame_count = configuration.frame_count;
+    state.first_free_frame = first_free;
+    state.last_free_frame = previous_free;
+    state.free_frame_count = free_count;
     Ok(())
 }
 
@@ -425,6 +435,38 @@ pub fn remove_reference(frame_number: u64, entry_physical_address: u64) {
 /// sem criar outra referência às mesmas células físicas.
 pub fn refresh_reference(frame_number: u64, reference: Reference) {
     STATE.lock().refresh_reference(frame_number, &reference);
+}
+
+/// A lista livre andada pelos Flinks (`walk_free_list`).
+#[derive(Clone, Copy, Debug)]
+pub struct FreeListWalk {
+    /// Nós alcançados do primeiro ao fim da lista.
+    pub reached: u64,
+    /// Todos livres (PageLocation) com o Blink no anterior.
+    pub linked: bool,
+    pub last_reached: u64,
+    pub free_count: u64,
+    pub last_free: u64,
+}
+
+/// Anda a lista livre inteira sob o lock (autotestes); para no tamanho
+/// contado mais um, para uma lista em ciclo não prender o teste.
+pub fn walk_free_list() -> FreeListWalk {
+    let state = STATE.lock();
+    let (mut reached, mut linked, mut previous, mut frame) = (0u64, true, LIST_END, state.first_free_frame);
+    while frame != LIST_END && reached <= state.free_frame_count {
+        let address = state.existing_address(frame);
+        if address == 0 {
+            linked = false;
+            break;
+        }
+        let entry = pfn(address);
+        linked &= page_location(address) == FREE_PAGE && entry.u2.blink() == previous;
+        reached += 1;
+        previous = frame;
+        frame = entry.u1.flink();
+    }
+    FreeListWalk { reached, linked, last_reached: previous, free_count: state.free_frame_count, last_free: state.last_free_frame }
 }
 
 #[derive(Clone, Copy, Debug)]

@@ -69,6 +69,50 @@ fn load_options() {
     assert(options::text_of(&block).is_none(), "opcoes de carga: sem assinatura");
 }
 
+/// O bloco de memória física e o alocador de frames: o bloco tem toda a RAM
+/// do E820 abaixo do limite do mapa direto (menos a página 0) e é o total
+/// da partição; o alocador recebe o bloco inteiro menos PFN_EXCLUDED, até o
+/// topo da RAM; a lista livre do banco nativo encadeia exatamente os frames
+/// livres do bitmap.
+fn physical_memory_block(assert: fn(bool, &str)) {
+    use crate::ntos::mm::physical_layout;
+    let block = physical_layout::ranges();
+    let page = memory_map::PAGE_SIZE;
+    let block_pages: u64 = block.iter().map(|&(base, top)| (top - base) / page).sum();
+    assert(
+        block_pages == physical_layout::number_of_physical_pages() && pfn::total_count() == block_pages && pfn::partition().total == block_pages,
+        "bloco de memoria fisica: MmNumberOfPhysicalPages e o total da particao",
+    );
+    let (lowest, highest) = pfn::physical_page_bounds();
+    assert(
+        block.first().is_some_and(|&(base, _)| base >= page && base / page == lowest) && block.last().is_some_and(|&(_, top)| top / page - 1 == highest) && !physical_layout::contains_ram_range(0, page),
+        "bloco de memoria fisica: Lowest/Highest nas pontas, pagina 0 fora",
+    );
+    let firmware = physical_layout::firmware_map();
+    let whole_ram = firmware.iter().filter(|range| range.range_type == 1).all(|ram| {
+        let base = ram.base.max(page).div_ceil(page) * page;
+        let top = (ram.base + ram.length).min(memory_map::PHYSICAL_MEMORY_LIMIT) / page * page;
+        let touched = firmware.iter().any(|other| other.range_type != 1 && other.base < ram.base + ram.length && other.base + other.length > ram.base);
+        base >= top || touched || physical_layout::contains_ram_range(base, top - base)
+    });
+    assert(whole_ram, "bloco de memoria fisica: toda a RAM do E820 abaixo do limite do mapa direto");
+    let overlap = |(low, high): (u64, u64), (base, top): (u64, u64)| high.min(top).saturating_sub(low.max(base));
+    let excluded: u64 = block.iter().map(|&range| memory_map::PFN_EXCLUDED.iter().map(|&reserved| overlap(range, reserved)).sum::<u64>()).sum();
+    let ranges = pfn::ranges();
+    let managed: u64 = ranges.iter().map(|&(base, top)| (top - base) / page).sum();
+    assert(
+        pfn::frame_count() == block_pages - excluded / page && managed == pfn::frame_count() && ranges == pfn::allocator_ranges(&block, &memory_map::PFN_EXCLUDED),
+        "alocador de frames: o bloco inteiro menos PFN_EXCLUDED",
+    );
+    assert(
+        ranges.iter().all(|&(base, top)| physical_layout::contains_ram_range(base, top - base) && memory_map::PFN_EXCLUDED.iter().all(|&reserved| overlap((base, top), reserved) == 0))
+            && ranges.last().map(|range| range.1) == block.last().map(|range| range.1),
+        "alocador de frames: so RAM do bloco fora de PFN_EXCLUDED, ate o topo da RAM",
+    );
+    let (walk, available) = pfn::native_free_list();
+    assert(walk.linked && walk.reached == walk.free_count && walk.last_reached == walk.last_free && walk.free_count == available, "banco de PFN nativo: a lista livre encadeia os frames livres do bitmap");
+}
+
 fn is_text(data: Option<FileData>, expected: &str) -> bool {
     matches!(data, Some(FileData::Text(text)) if text == expected)
 }
@@ -119,6 +163,7 @@ pub fn run() {
     let frame2 = pfn::alloc_page();
     assert(frame2 == frame1, "pfn reusa frame livre");
     pfn::free_page(frame2);
+    physical_memory_block(assert);
 
     // a imagem do kernel na ImageBase traduz para os frames que o stage2
     // carregou; a metade de usuário não tem identidade

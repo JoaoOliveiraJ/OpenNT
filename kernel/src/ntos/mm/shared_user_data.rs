@@ -19,7 +19,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::paging::{self, MapOptions};
 use super::pfn;
-use crate::hal::{cpu, kmalloc, physical};
+use crate::hal::{cpu, physical};
 use crate::ntos::cm::state_separation;
 use crate::ntos::ke::{clock, processor_identity, smp};
 use crate::ntos::inc::field::NtStruct;
@@ -169,7 +169,7 @@ pub fn init() -> bool {
     crate::ntos::ke::xsave::publish(data);
     processor_identity::publish_processor_features(data);
     data.suite_mask.set(0x110);
-    data.number_of_physical_pages.set((kmalloc::ram_top() / 0x1000) as u32);
+    data.number_of_physical_pages.set(super::physical_layout::number_of_physical_pages() as u32);
     data.active_processor_count.set(smp::online_cpu_count() as u32);
     data.active_group_count.set(1); // um grupo de processadores
     data.kd_debugger_enabled.set(0);

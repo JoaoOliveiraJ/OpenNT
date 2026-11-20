@@ -445,15 +445,16 @@ fn basic_information(output: u64, length: u32, returned: u64) -> u32 {
     if length < size {
         return 0xC000_0004;
     }
-    let pages = crate::hal::kmalloc::ram_top() / 0x1000;
+    use crate::ntos::mm::physical_layout;
     let processors = crate::ntos::ke::smp::online_cpu_count();
     guest::write_bytes(output, &[0u8; SystemBasicInformation::SIZE as usize]);
     // SAFETY: o buffer de saída do chamador, com o tamanho da estrutura.
     let basic = unsafe { SystemBasicInformation::at(output) };
     basic.timer_resolution.set(156_250);
     basic.page_size.set(0x1000);
-    basic.number_of_physical_pages.set(pages as u32);
-    basic.highest_physical_page_number.set((pages - 1) as u32);
+    basic.number_of_physical_pages.set(physical_layout::number_of_physical_pages() as u32);
+    basic.lowest_physical_page_number.set(physical_layout::lowest_physical_page() as u32);
+    basic.highest_physical_page_number.set(physical_layout::highest_physical_page() as u32);
     basic.allocation_granularity.set(memory_map::ALLOCATION_GRANULARITY as u32);
     basic.minimum_user_mode_address.set(memory_map::LOWEST_USER_ADDRESS);
     basic.maximum_user_mode_address.set(memory_map::HIGHEST_USER_ADDRESS);

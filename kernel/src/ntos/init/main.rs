@@ -8,7 +8,6 @@
 use alloc::format;
 
 use crate::drivers::{console, input::keyboard, video::vga};
-use crate::hal::kmalloc;
 use crate::ntos::init::{boot_config, phase0, phase1};
 use crate::nano::{interrupts, message_channels};
 use crate::ntos::ke::clock;
@@ -19,7 +18,7 @@ fn banner() {
     console::print("=================================================");
     console::print(&format!(" OpenNT v{} - kernel 100% Rust", crate::VERSION));
     console::print(" bare metal x86-64 (BIOS real mode -> long mode)");
-    console::print(&format!(" RAM: {} MB", kmalloc::ram_top() / 1_048_576));
+    console::print(&format!(" RAM: {} MB", crate::ntos::mm::physical_layout::number_of_physical_pages() / 256));
     console::print("=================================================");
 }
 
@@ -150,9 +149,9 @@ fn timer_tick(_vector: u8, _count: u32) {
 
 pub fn kmain() -> ! {
     vga::clear();
-    banner();
-
     phase0::init(); // nanokernel + escalonador + arquivos em memória
+    // Depois da fase 0: a RAM do banner é o bloco de memória física do PFN.
+    banner();
     phase1::init(); // I/O manager + drivers internos + NTFS + serviços + PnP
     if let Err(error) = crate::ntos::ex::system_services::initialize() {
         debug_print!("[services] tabela nativa nao registrada: {}", error);

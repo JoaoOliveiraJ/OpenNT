@@ -1,16 +1,38 @@
-//! RAM admitida por este boot.
+//! RAM admitida por este boot: o MmPhysicalMemoryBlock.
 //!
-//! RAM de firmware habilitada abaixo do limite do mapa direto do stage2.
-//! Reservas de kernel/heap/imagens/PFN continuam sendo RAM física; reservas
-//! de firmware e MMIO não. Uma consulta nunca relê o E820 mutável.
+//! Como no 19041 (o MmInitializeMemoryLimits sobre a lista de descritores de
+//! memória do carregador), o bloco de memória física é toda a RAM que o
+//! firmware entrega, abaixo do limite do mapa direto do stage2: os
+//! descritores de RAM do E820 menos os reservados, ACPI e NVS, em páginas
+//! inteiras. A página física 0 fica de fora, como a página do firmware que
+//! o carregador do Windows reserva (num 19041 o primeiro trecho do bloco
+//! começa no PFN 1). A memória que o kernel já ocupa no boot (a imagem, a
+//! pilha de boot, o heap, as tabelas abaixo de 1 MB) continua sendo RAM
+//! física do bloco, como a memória do carregador no NT; só não entra no
+//! alocador de frames (`pfn`).
+//!
+//! O bloco é a fonte única dos totais que o 19041 tira do
+//! MmNumberOfPhysicalPages, do MmLowestPhysicalPage e do
+//! MmHighestPhysicalPage (`number_of_physical_pages`, `lowest_physical_page`,
+//! `highest_physical_page`): SystemBasicInformation, as classes 182 e 184, a
+//! KUSER_SHARED_DATA, o commit inicial e o MmGetPhysicalMemoryRanges. Uma
+//! consulta nunca relê o E820 mutável.
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::memory_map as map;
 use crate::hal::physical;
 use crate::rtl::{KernelError, SpinLock};
 
 static ADMITTED: SpinLock<Option<Vec<(u64, u64)>>> = SpinLock::new(None);
+/// MmNumberOfPhysicalPages, MmLowestPhysicalPage e MmHighestPhysicalPage do
+/// bloco, gravados uma vez no `init`.
+static NUMBER_OF_PHYSICAL_PAGES: AtomicU64 = AtomicU64::new(0);
+static LOWEST_PHYSICAL_PAGE: AtomicU64 = AtomicU64::new(0);
+static HIGHEST_PHYSICAL_PAGE: AtomicU64 = AtomicU64::new(0);
+/// A página física 0, que o bloco nunca inclui.
+const FIRMWARE_PAGE_TOP: u64 = map::PAGE_SIZE;
 
 /// Uma entrada do mapa de memória do firmware (INT 15h E820), como a BIOS a
 /// entregou: base, tamanho e tipo (1 = RAM, 2 = reservada, 3 = ACPI, 4 = NVS).
@@ -75,14 +97,36 @@ pub fn init() -> Result<(), KernelError> {
         }
     }
     let page = map::PAGE_SIZE;
-    let admitted = merged
+    let admitted: Vec<(u64, u64)> = merged
         .into_iter()
-        .map(|(base, top)| (base.div_ceil(page) * page, top / page * page))
+        .map(|(base, top)| (base.max(FIRMWARE_PAGE_TOP).div_ceil(page) * page, top / page * page))
         .filter(|(base, top)| base < top)
         .collect();
+    let (Some(&(lowest, _)), Some(&(_, highest))) = (admitted.first(), admitted.last()) else {
+        return Err(KernelError::new("E820 without usable RAM"));
+    };
+    NUMBER_OF_PHYSICAL_PAGES.store(admitted.iter().map(|&(base, top)| (top - base) / page).sum(), Ordering::Release);
+    LOWEST_PHYSICAL_PAGE.store(lowest / page, Ordering::Release);
+    HIGHEST_PHYSICAL_PAGE.store(highest / page - 1, Ordering::Release);
     *ADMITTED.lock() = Some(admitted);
     *FIRMWARE_MAP.lock() = firmware;
     Ok(())
+}
+
+/// MmNumberOfPhysicalPages: as páginas do bloco de memória física (0 antes
+/// do init).
+pub fn number_of_physical_pages() -> u64 {
+    NUMBER_OF_PHYSICAL_PAGES.load(Ordering::Acquire)
+}
+
+/// MmLowestPhysicalPage: o primeiro PFN do bloco.
+pub fn lowest_physical_page() -> u64 {
+    LOWEST_PHYSICAL_PAGE.load(Ordering::Acquire)
+}
+
+/// MmHighestPhysicalPage: o último PFN do bloco.
+pub fn highest_physical_page() -> u64 {
+    HIGHEST_PHYSICAL_PAGE.load(Ordering::Acquire)
 }
 
 /// O mapa de memória do firmware, na ordem da BIOS.

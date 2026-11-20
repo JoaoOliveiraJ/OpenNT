@@ -248,6 +248,16 @@ fn system_classes(assert: Assert, block: u64, call: Call) {
         memory_status == 0 && total == crate::ntos::mm::pfn::total_count() << 12 && lowest == low_page << 12 && highest == (high_page << 12) | 0xFFF && lowest < highest && memory_long == STATUS_INFO_LENGTH_MISMATCH && guest::read32(returned) == 0x18,
         "userboot: SystemPhysicalMemoryInformation com o total e os limites da RAM",
     );
+    // SystemBasicInformation e a KUSER_SHARED_DATA contam o mesmo bloco de
+    // memória física (MmNumberOfPhysicalPages, MmLowestPhysicalPage,
+    // MmHighestPhysicalPage) que a classe 184.
+    let basic_status = query(0, buffer, 0x40);
+    let (basic_pages, basic_lowest, basic_highest) = (guest::read32(buffer + 0xC) as u64, guest::read32(buffer + 0x10) as u64, guest::read32(buffer + 0x14) as u64);
+    let kuser_pages = crate::ntos::mm::shared_user_data::data().map_or(0, |data| data.number_of_physical_pages.get() as u64);
+    assert(
+        basic_status == 0 && basic_pages << 12 == total && basic_lowest == low_page && basic_highest == high_page && kuser_pages == basic_pages && basic_pages == crate::ntos::mm::physical_layout::number_of_physical_pages(),
+        "userboot: SystemBasicInformation e KUSER_SHARED_DATA com as paginas, o Lowest e o Highest do bloco de memoria fisica",
+    );
     guest::write64(buffer, u64::MAX);
     let shared = query(197, buffer, 16);
     let shared_page = guest::read64(buffer);

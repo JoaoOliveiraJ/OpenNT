@@ -386,7 +386,7 @@ fn run() -> Result<String, String> {
         pause(200);
     }
     let services = services().ok_or_else(|| String::from("numeros de servico da ntdll"))?;
-    let ram = crate::hal::kmalloc::ram_top();
+    let ram = crate::ntos::mm::physical_layout::number_of_physical_pages() * 0x1000;
     let chunks = (ram + BEYOND_RAM).div_ceil(CHUNK_BYTES);
     if chunks > MAXIMUM_CHUNKS {
         return Err(alloc::format!("RAM de {} MB grande demais para o teste", ram >> 20));

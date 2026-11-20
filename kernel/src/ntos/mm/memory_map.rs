@@ -18,11 +18,9 @@
 //!   0x1C81000-0x1DFFFFF  frames da pilha de boot
 //!   0x1E00000-0x1FFFFFF  tabela do censo do heap do kernel
 //!   0x2000000-0x5FFFFFF  frames do heap do kernel (kmalloc, 64MB)
-//!   0x6000000-0xFFFFFFF  primeira arena PFN (160MB)
-//!   0x10000000-0x10FFFFFF frames da arena dos convidados (16MB; com RAM aqui)
-//!   0x20000000-0x2FFFFFFF segunda arena PFN (256MB)
-//!   0x30000000-0x33FFFFFF ring do tracer FULL (64MB)
-//!   0x34000000-0x6FFFFFFF terceira arena PFN (960MB)
+//!   0x6000000-topo       frames do PFN: toda a RAM do bloco de memória
+//!                        física (`physical_layout`) daqui para cima, menos
+//!   0x10000000-0x10FFFFFF os frames da arena dos convidados (16MB; com RAM aqui)
 //! ```
 //!
 //! Espaço virtual. A metade de usuário, PML4[0..256), é só dos processos:
@@ -152,8 +150,8 @@ pub const fn is_kernel_image(address: u64) -> bool {
 const _: () = assert!((KERNEL_VIRTUAL_BASE >> 39) & 511 == KERNEL_PML4_INDEX && KERNEL_VIRTUAL_BASE % 0x4000_0000 == 0);
 // Uma PD cobre a imagem (PDEs 0..KERNEL_PT_COUNT) e a pilha (uma PT própria,
 // fora das da imagem), sem cruzar a KPCR nem a janela de imagens de sistema.
-// Imagem e pilha abaixo do heap do kernel (32 MB), fora das arenas do PFN.
-const _: () = assert!(KERNEL_IMAGE_PHYS + KERNEL_IMAGE_MAX <= BOOT_STACK_PHYS_BASE - PAGE_SIZE && BOOT_STACK_PHYS_TOP <= 0x200_0000 && BOOT_STACK_PHYS_TOP <= PFN_RANGES[0].0);
+// Imagem e pilha abaixo do heap do kernel (32 MB), fora do PFN.
+const _: () = assert!(KERNEL_IMAGE_PHYS + KERNEL_IMAGE_MAX <= BOOT_STACK_PHYS_BASE - PAGE_SIZE && BOOT_STACK_PHYS_TOP <= 0x200_0000 && BOOT_STACK_PHYS_TOP <= PFN_EXCLUDED[0].1);
 const _: () = assert!(KERNEL_IMAGE_MAX % PAGE_SIZE == 0 && BOOT_STACK_SIZE % PAGE_SIZE == 0 && BOOT_STACK_TOP % LARGE_PAGE_SIZE == 0);
 const _: () = assert!((BOOT_STACK_LIMIT - PAGE_SIZE) / LARGE_PAGE_SIZE == (BOOT_STACK_TOP - 1) / LARGE_PAGE_SIZE);
 const _: () = assert!((BOOT_STACK_TOP - 1 - KERNEL_VIRTUAL_BASE) / LARGE_PAGE_SIZE >= KERNEL_PT_COUNT && BOOT_STACK_TOP - KERNEL_VIRTUAL_BASE <= 0x4000_0000);
@@ -164,10 +162,15 @@ const _: () = assert!(KERNEL_PDPT_PHYS >= 0x8_3000 && BOOT_STACK_PT_PHYS + PAGE_
 // setores do kernel num campo de 16 bits (`kernel_sectors`).
 const _: () = assert!(KERNEL_IMAGE_PHYS % 0x1_0000 == 0 && KERNEL_IMAGE_MAX <= 0xFFFF * 512);
 
-/// Candidatas, não declaração de RAM: o PFN intersecta estas faixas com a
-/// RAM utilizável do E820 e subtrai entradas reservadas.
-pub const PFN_RANGES: [(u64, u64); 3] =
-    [(0x0600_0000, 0x1000_0000), (0x2000_0000, 0x3000_0000), (0x3400_0000, 0x7000_0000)];
+/// Frames de RAM que o alocador de frames (`pfn`) nunca recebe, como a
+/// memória do carregador e da imagem no MiInitializePfnDatabase do NT: tudo
+/// abaixo do fim do heap do kernel (as tabelas e células fixas abaixo de
+/// 1 MB, a imagem do kernel, a pilha de boot, a tabela do censo e o heap) e
+/// os frames da arena dos convidados (quando há RAM ali; sem RAM, a faixa
+/// já fica de fora do bloco). O PFN recebe o resto da RAM do bloco de
+/// memória física (`physical_layout`) até o topo da RAM; firmware, ACPI,
+/// MMIO e o buraco de PCI já ficam de fora do bloco.
+pub const PFN_EXCLUDED: [(u64, u64); 2] = [(0, KERNEL_HEAP_PHYS_TOP), (GUEST_ARENA_PHYS_BASE, GUEST_ARENA_PHYS_TOP)];
 pub const BOOT_FIRMWARE_PHYS: u64 = 0x4FE0;
 /// GDTR do stage2 gravado por SGDT no modo real (limite em +0, base de 32
 /// bits em +2).
@@ -371,8 +374,7 @@ const _: () = assert!(DIRECT_MAP_PD_PHYS + 4 * PAGE_SIZE <= 0x8_1000 && PHYSICAL
 // nos frames físicos KERNEL_HEAP_PHYS_BASE..TOP e a arena de 16 MB dos
 // convidados (IRPs, DEVICE_OBJECTs, MDLs, ExAllocatePool2 e as demais
 // estruturas NT que os drivers recebem), nos frames GUEST_ARENA_PHYS_BASE..TOP,
-// o começo da faixa de 256-512 MB que nenhuma arena do PFN usa; os dois fora
-// do PFN. A arena não sai dos 64 MB do kmalloc. Numa máquina sem RAM nessa
+// em 256 MB; os dois fora do PFN (PFN_EXCLUDED). A arena não sai dos 64 MB do kmalloc. Numa máquina sem RAM nessa
 // faixa (menos de 272 MB) ela sai do heap do kernel no boot, como um bloco
 // dele (`hal::host`). Esses frames são endereçados só por esta janela, o papel
 // do pool não paginado inicial do NT, pela mesma conta linear:
@@ -387,7 +389,7 @@ const _: () = assert!(DIRECT_MAP_PD_PHYS + 4 * PAGE_SIZE <= 0x8_1000 && PHYSICAL
 // (0xC0000000) caem no buraco de MMIO acima de 3 GB; como a metade de usuário
 // não tem nada do kernel, um ponteiro do heap truncado para 32 bits falta.
 pub const KERNEL_HEAP_PHYS_BASE: u64 = 0x200_0000;
-/// Fim exclusivo dos frames do heap (início da primeira arena do PFN).
+/// Fim exclusivo dos frames do heap (início dos frames do PFN).
 pub const KERNEL_HEAP_PHYS_TOP: u64 = 0x600_0000;
 pub const KERNEL_HEAP_BASE: u64 = 0xFFFF_C000_C000_0000;
 pub const KERNEL_HEAP_TOP: u64 = KERNEL_HEAP_BASE + (KERNEL_HEAP_PHYS_TOP - KERNEL_HEAP_PHYS_BASE);
@@ -430,13 +432,13 @@ const _: () = assert!(KERNEL_HEAP_BASE & 0xFFFF_FFFF >= 0xC000_0000 && (KERNEL_H
 const _: () = assert!(KERNEL_HEAP_PML4_INDEX != PAGE_TABLE_RECURSIVE_INDEX && KERNEL_HEAP_PML4_INDEX != (PFN_DATABASE_BASE >> 39) & 511 && KERNEL_HEAP_PML4_INDEX != DIRECT_MAP_PML4_INDEX);
 const _: () = assert!(KERNEL_HEAP_PML4_INDEX != (KERNEL_POOL_BASE >> 39) & 511 && KERNEL_HEAP_PML4_INDEX != (PCR_VIRTUAL_BASE >> 39) & 511 && KERNEL_HEAP_PML4_INDEX != (SYSTEM_IMAGE_BASE >> 39) & 511);
 // Uma PD (1 GB) cobre a faixa inteira, em páginas de 2 MB; os frames ficam
-// abaixo da primeira arena do PFN.
+// abaixo dos frames do PFN (PFN_EXCLUDED).
 const _: () = assert!(KERNEL_HEAP_PHYS_BASE % LARGE_PAGE_SIZE == 0 && KERNEL_HEAP_PHYS_TOP % LARGE_PAGE_SIZE == 0);
-const _: () = assert!(KERNEL_HEAP_PHYS_TOP - KERNEL_HEAP_PHYS_BASE <= 0x4000_0000 && KERNEL_HEAP_PHYS_TOP <= PFN_RANGES[0].0);
-// A arena fica no buraco entre a primeira e a segunda arena do PFN, alinhada
-// às páginas de 2 MB, e a VA dela cai na mesma PD da janela, com os 32 bits
+const _: () = assert!(KERNEL_HEAP_PHYS_TOP - KERNEL_HEAP_PHYS_BASE <= 0x4000_0000 && KERNEL_HEAP_PHYS_TOP <= PFN_EXCLUDED[0].1 && PFN_EXCLUDED[0].0 == 0);
+// A arena fica fora do PFN (PFN_EXCLUDED), acima do heap, alinhada às
+// páginas de 2 MB, e a VA dela cai na mesma PD da janela, com os 32 bits
 // baixos no buraco de MMIO.
-const _: () = assert!(GUEST_ARENA_PHYS_BASE >= PFN_RANGES[0].1 && GUEST_ARENA_PHYS_TOP <= PFN_RANGES[1].0);
+const _: () = assert!(PFN_EXCLUDED[1].0 == GUEST_ARENA_PHYS_BASE && PFN_EXCLUDED[1].1 == GUEST_ARENA_PHYS_TOP && GUEST_ARENA_PHYS_BASE >= KERNEL_HEAP_PHYS_TOP);
 const _: () = assert!(GUEST_ARENA_PHYS_BASE % LARGE_PAGE_SIZE == 0 && GUEST_ARENA_SIZE % LARGE_PAGE_SIZE == 0);
 const _: () = assert!(GUEST_ARENA_TOP - KERNEL_HEAP_BASE <= 0x4000_0000 && (GUEST_ARENA_TOP - 1) & 0xFFFF_FFFF < 0xFEC0_0000);
 const _: () = assert!(KERNEL_HEAP_PDPT_PHYS == DIRECT_MAP_PD_PHYS + 4 * PAGE_SIZE && KERNEL_HEAP_PD_PHYS == KERNEL_HEAP_PDPT_PHYS + PAGE_SIZE && KERNEL_HEAP_PD_PHYS + PAGE_SIZE <= 0x8_1000);

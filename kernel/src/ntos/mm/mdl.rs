@@ -620,7 +620,8 @@ pub fn allocate_pages_ex(low: u64, high: u64, skip: u64, total: u64, cache_type:
     // MiValidateMdlAllocationRequest.
     let low_pfn = low >> 12;
     let high_pfn = (high >> 12).min(MDL_ALLOCATION_PFN_LIMIT);
-    if low_pfn == 0 && high_pfn >= (super::memory_map::PHYSICAL_MEMORY_LIMIT >> 12) - 1 {
+    // Até o MmHighestPhysicalPage, a faixa pedida cobre o bloco inteiro.
+    if low_pfn == 0 && high_pfn >= super::physical_layout::highest_physical_page() {
         flags |= MM_ALLOCATE_WHOLE_RANGE;
     }
     if skip & (MDL_ALLOCATION_PAGE - 1) != 0 {

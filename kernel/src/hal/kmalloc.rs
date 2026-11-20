@@ -24,7 +24,6 @@ use crate::rtl::SpinLock;
 
 const HEAP_START: u64 = map::KERNEL_HEAP_PHYS_BASE; // 32 MB
 const HEAP_END: u64 = map::KERNEL_HEAP_PHYS_TOP; // 96 MB: início dos frames PFN
-const RAM_CAP: u64 = map::PHYSICAL_MEMORY_LIMIT; // cap de 4 GB (o mapa direto cobre 4 GB)
 
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
@@ -76,7 +75,6 @@ struct Heap {
     /// Blocos ocupados (cada um com o cabeçalho de HDR_SIZE bytes, que
     /// `used` não conta).
     blocks: usize,
-    ram_top: u64,
     /// Próximo uso que imprime o censo (opção HEAPCENSUS); 0 sem a opção.
     next_census: usize,
 }
@@ -90,7 +88,6 @@ static HEAP: SpinLock<Heap> = SpinLock::new(Heap {
     total: 0,
     used: 0,
     blocks: 0,
-    ram_top: 0,
     next_census: 0,
 });
 
@@ -130,24 +127,6 @@ impl Heap {
         }
     }
 
-    fn detect_ram(&mut self) {
-        let count = e820_count();
-        self.ram_top = 0;
-        for index in 0..count.min(64) {
-            let entry = e820_entry(index);
-            let (kind, length, base) = (entry.kind, entry.length, entry.base);
-            if kind == 1 && length != 0 {
-                let top = base.wrapping_add(length);
-                if top > self.ram_top {
-                    self.ram_top = top;
-                }
-            }
-        }
-        if self.ram_top == 0 || self.ram_top > RAM_CAP {
-            self.ram_top = RAM_CAP;
-        }
-    }
-
     /// A faixa física [base, top) está inteira num descritor utilizável do
     /// E820 e nenhum descritor reservado a toca.
     fn usable_range(base: u64, top: u64) -> bool {
@@ -170,7 +149,6 @@ impl Heap {
     }
 
     unsafe fn init(&mut self) {
-        self.detect_ram();
         heap_census::init(Self::usable_range(map::KERNEL_HEAP_CENSUS_PHYS, map::KERNEL_HEAP_CENSUS_PHYS + map::KERNEL_HEAP_CENSUS_SIZE));
         self.next_census = if crate::ntos::init::boot_config::heap_census() { heap_census::WATERMARK_STEP } else { 0 };
         let count = e820_count();
@@ -359,11 +337,6 @@ pub fn info() -> (usize, usize) {
 pub fn occupied() -> usize {
     let heap = HEAP.lock();
     heap.used + heap.blocks * HDR_SIZE
-}
-
-/// Topo da RAM utilizável (limitado a 4 GB).
-pub fn ram_top() -> u64 {
-    HEAP.lock().ram_top
 }
 
 /// O local do censo do bloco vivo `pointer` (um ponteiro devolvido por este

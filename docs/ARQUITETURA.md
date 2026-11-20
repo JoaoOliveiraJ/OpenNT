@@ -266,6 +266,22 @@ pertence só aos processos:
 | 0xFFFFF800_00000000 | 496 | KPCR, pool de dados, a **imagem do kernel** (0xFFFFF800_40000000), a pilha de boot (topo em 0xFFFFF800_41200000) e a janela de imagens de kernel (0xFFFFF801_00000000..0xFFFFF802_00000000) |
 | 0xFFFFF900_00000000 | 498 | **espaço de sessão**: tabela de topo própria de cada sessão (vazio na raiz do System e dos processos sem sessão); SessionCore, VA dinâmica (pool de sessão) e imagens de sessão |
 
+**Memória física.** O bloco de memória física (`mm/physical_layout.rs`, o
+MmPhysicalMemoryBlock) é toda a RAM do mapa E820 abaixo do limite do mapa
+direto, menos os descritores reservados, ACPI e NVS e menos a página 0 (o
+primeiro PFN do bloco é 1, como num 19041). Dele saem o
+MmNumberOfPhysicalPages, o MmLowestPhysicalPage e o MmHighestPhysicalPage,
+os únicos totais que o sistema mostra: SystemBasicInformation (classes 0,
+62 e 114), as classes 182 e 184, o NumberOfPhysicalPages da
+KUSER_SHARED_DATA, o total da partição, o commit inicial e o banner. O
+alocador de frames (`mm/pfn.rs`, um bit por frame) recebe o bloco inteiro
+menos `memory_map::PFN_EXCLUDED`, a memória que o kernel ocupa desde o boot
+(as tabelas e células abaixo de 1 MB, a imagem, a pilha de boot, a tabela do
+censo, o heap e os frames da arena dos convidados), como o MiInitializePfnDatabase põe na lista livre só os
+descritores livres do carregador. Esses frames ficam no banco nativo como
+páginas em uso. A lista livre do banco nativo é encadeada na ordem dos
+frames, a partir do bitmap.
+
 **Imagem do kernel.** O ntoskrnl é ligado na sua VA de sistema, como no NT:
 a ImageBase do PE é `KERNEL_VIRTUAL_BASE` = 0xFFFFF800_40000000 (cabeçalhos
 na primeira página, `.text` em +0x1000), e é essa base que a lista de módulos
