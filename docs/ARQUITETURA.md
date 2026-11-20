@@ -1467,7 +1467,8 @@ além da KUSER_SHARED_DATA:
   MiCreateImageFileMap): a primeira vista de um arquivo SEC_IMAGE monta as
   páginas protótipo da control area, frames do PFN com os cabeçalhos e as
   seções do PE no layout virtual (o `pe_loader` com `prototype`: sem VA,
-  sem relocação, sem imports, sem cookie e sem a tabela de exports). Todas
+  sem relocação, sem imports, sem cookie e sem a tabela de exports; a carga
+  entrega a lista de frames à control area, que os devolve ao PFN). Todas
   as seções do mesmo arquivo usam a mesma control area (a identidade do
   arquivo, o papel do ImageSectionObject); a seção e cada vista a retêm.
   Sem seção nem vista, a control area de um arquivo segue na lista das sem
@@ -3529,6 +3530,14 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   gravou). Antes, os 448 MB do `D:\pagefile.sys` e do `C:\swapfile.sys`
   eram gravados com zeros em todo boot do smss (de 5 a 17 s com a thread do
   smss parada). Teste: `ntfs_writer` na fase 4.
+- **Transações do NTFS do volume de boot** (`drivers/fs/ntfs_write.rs`): o
+  writer guarda uma cópia só do $Bitmap e do $BITMAP do $MFT, os do último
+  commit. Uma transação guarda a cópia de cada setor desses bitmaps que ela
+  muda; as leituras dela passam por essas cópias, o commit grava no disco as
+  que diferem e só depois do FLUSH as aplica, e um aborto apenas as
+  descarta. Nenhuma operação copia o bitmap inteiro (cerca de 300 KB num
+  volume de 2,5 M clusters). Teste: `ntfs_writer` na fase 4 (abortos no meio
+  da alocação e numa transação aninhada, reserva grande gravada no disco).
 - **Estado por processo**: o que no NT mora no EPROCESS e o OpenNT ainda não
   guarda numa estrutura do NT fica em `ps/user/process_state.rs`, um
   `ProcessState` por EPROCESS (o System inclusive), criado por
