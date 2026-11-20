@@ -28,8 +28,9 @@
 //!   conclusão grava o IO_STATUS_BLOCK, sinaliza o evento e entrega a APC
 //!   (`file_request`); num arquivo síncrono a thread espera a conclusão.
 //!
-//! Os arquivos dos volumes do próprio kernel não têm pilha de dispositivos
-//! nem file system que acompanhe as mudanças: STATUS_INVALID_DEVICE_REQUEST.
+//! Num arquivo do volume de boot, o IRP vai ao dispositivo de volume do file
+//! system embutido, que guarda a lista de notificação do diretório e relata
+//! as mudanças pelo FsRtl (`drivers/fs/volume_streams.rs`).
 
 use alloc::boxed::Box;
 
@@ -102,9 +103,6 @@ const FILE_NOTIFY_EXTENDED_INFORMATION: u32 = 2;
 const IRP_MN_NOTIFY_CHANGE_DIRECTORY_EX: u8 = 0x03;
 const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
-const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
-/// FILE_LIST_DIRECTORY.
-const FILE_LIST_DIRECTORY: u32 = 0x1;
 
 /// O minor e a classe do IRP da notificação.
 pub fn notify_minor(class: u32) -> (u8, Option<u32>) {
@@ -116,10 +114,9 @@ pub fn notify_minor(class: u32) -> (u8, Option<u32>) {
 /// IO_STATUS_BLOCK para escrita, o Buffer por ProbeForWrite com alinhamento
 /// de ULONG (quando há Length) e exige o CompletionFilter entre 1 e 0xFFF
 /// (STATUS_INVALID_PARAMETER). Depois o IopReferenceFileObject pede o
-/// FILE_LIST_DIRECTORY do handle. Um arquivo dos volumes do próprio kernel
-/// não tem file system que acompanhe as mudanças
-/// (STATUS_INVALID_DEVICE_REQUEST); um arquivo de driver segue o IRP do I/O
-/// Manager (`io/file/irp_service.rs`). Devolve o NTSTATUS.
+/// FILE_LIST_DIRECTORY do handle e o IRP segue pelo I/O Manager
+/// (`io/file/irp_service.rs`), ao driver do arquivo ou, num arquivo do volume
+/// de boot, ao file system embutido. Devolve o NTSTATUS.
 pub fn notify_change_directory_user(arguments: &NotifyChange) -> u32 {
     use crate::ntos::io::file::read::probe;
     if !probe(arguments.io_status, 4, true) {
@@ -135,9 +132,6 @@ pub fn notify_change_directory_user(arguments: &NotifyChange) -> u32 {
     }
     if arguments.completion_filter == 0 || arguments.completion_filter & 0xFFFF_F000 != 0 {
         return STATUS_INVALID_PARAMETER;
-    }
-    if let Some(entry) = crate::ntos::ps::user::state::get_user_handle(arguments.handle).filter(|entry| entry.kind() == "file") {
-        return if entry.access() & FILE_LIST_DIRECTORY == 0 { STATUS_ACCESS_DENIED } else { STATUS_INVALID_DEVICE_REQUEST };
     }
     crate::ntos::io::file::irp_service::notify_change_directory(arguments)
 }
@@ -164,7 +158,7 @@ pub fn notify_change_directory(arguments: &NotifyChange) -> Result<u32, KernelEr
     if file_at(file).completion_context.get() != 0 && arguments.apc_routine & !1 != 0 {
         return Ok(STATUS_INVALID_PARAMETER);
     }
-    let device = file_information::related_device(file)?;
+    let device = file_information::request_device(file, IRP_MJ_DIRECTORY_CONTROL)?;
     if device == 0 {
         return Ok(STATUS_INVALID_DEVICE_REQUEST);
     }

@@ -1283,9 +1283,10 @@ fn user_file_io_more(assert: Assert) {
     assert(call("NtQueryVolumeInformationFile", directory, iosb, buffer, 0x100) == 0 && unsafe { nt::IoStatusBlock::at(iosb) }.information.get() >= 18, "userfiles: FileFsVolumeInformation pelo volume do arquivo");
     // NtNotifyChangeDirectoryFile(Ex) de modo usuário (o
     // FindFirstChangeNotificationW): o IO_STATUS_BLOCK e o buffer sondados
-    // (alinhamento de ULONG), o filtro entre 1 e 0xFFF, o FILE_LIST_DIRECTORY
-    // do handle e, no volume do kernel, sem file system que acompanhe as
-    // mudanças, STATUS_INVALID_DEVICE_REQUEST.
+    // (alinhamento de ULONG), o filtro entre 1 e 0xFFF e o FILE_LIST_DIRECTORY
+    // do handle, todos antes do IRP. O pedido aceito fica pendente no file
+    // system embutido (num diretório síncrono a chamada esperaria uma
+    // mudança): volume_notify_locks o confere.
     let notify = |handle: u64, io_status: u64, address: u64, filter: u32, extended: bool| {
         guest::write64(rsp + 0x28, io_status);
         guest::write64(rsp + 0x30, address);
@@ -1296,12 +1297,11 @@ fn user_file_io_more(assert: Assert) {
         call(if extended { "NtNotifyChangeDirectoryFileEx" } else { "NtNotifyChangeDirectoryFile" }, handle, 0, 0, 0)
     };
     let (attributes_status, attributes_only) = open("\\??\\D:\\", 1, 0x10_0080, 7, 0x21);
-    let notified = (notify(directory, iosb, buffer, 0x17, false), notify(directory, iosb, buffer, 0x17, true));
     let refusals = (notify(directory, iosb, buffer, 0, false), notify(directory, iosb, buffer, 0x1000, false), notify(directory, iosb, buffer + 2, 0x17, false), notify(directory, 0, buffer, 0x17, false), notify(attributes_only, iosb, buffer, 0x17, false));
     let _ = state::close_user_handle(attributes_only, true, false);
     assert(
-        attributes_status == 0 && notified == (0xC000_0010, 0xC000_0010) && refusals == (0xC000_000D, 0xC000_000D, 0x8000_0002, 0xC000_0005, 0xC000_0022),
-        "userfiles: NtNotifyChangeDirectoryFile(Ex) de modo usuario (sondas, filtro, acesso e o volume do kernel sem notificacao)",
+        attributes_status == 0 && refusals == (0xC000_000D, 0xC000_000D, 0x8000_0002, 0xC000_0005, 0xC000_0022),
+        "userfiles: NtNotifyChangeDirectoryFile(Ex) de modo usuario (sondas, filtro e acesso)",
     );
     let _ = state::close_user_handle(directory, true, false);
     // Fim de arquivo, posição, renomeação e disposição de exclusão.

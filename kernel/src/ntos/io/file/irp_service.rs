@@ -573,6 +573,25 @@ fn complete(packet: u64, in_thread: bool) {
     dereference_file(request.file);
 }
 
+/// O NtCancelIoFile(Ex) dos pedidos que este módulo acompanha (o laço do
+/// NtCancelIoFileEx 0x6823b8 pela IrpList das threads e pela lista do
+/// FILE_OBJECT): o IoCancelIrp de cada IRP do processo corrente para `file`,
+/// só os de `thread` quando dada, e só os do IO_STATUS_BLOCK `iosb` quando
+/// não é 0. Devolve quantos.
+pub fn cancel_file_requests(file: u64, iosb: u64, thread: Option<u64>) -> usize {
+    let current = process::get_current_process();
+    let packets: Vec<u64> = REQUESTS
+        .lock()
+        .iter()
+        .filter(|(&packet, request)| request.file == file && request.process == current && thread.is_none_or(|thread| request.thread == thread) && (iosb == 0 || irp_at(packet).user_iosb.get() == iosb))
+        .map(|(&packet, _)| packet)
+        .collect();
+    for &packet in &packets {
+        let _ = cancel::irp(packet);
+    }
+    packets.len()
+}
+
 /// IoCancelThreadIo: a thread que sai cancela as IRPs dela; as conclusões
 /// que vierem depois não tocam na memória de usuário.
 fn rundown(thread: u64) {
@@ -1093,7 +1112,9 @@ pub fn notify_change_directory(arguments: &super::directory_notify::NotifyChange
     use super::directory_notify;
     const IRP_MJ_DIRECTORY_CONTROL: u8 = 0x0C;
     const FILE_LIST_DIRECTORY: u32 = 0x1;
-    let target = match reference(arguments.handle) {
+    // Num arquivo do volume de boot, o dispositivo de volume do file system
+    // embutido atende a notificação (`volume_device::serves`).
+    let target = match reference_for(arguments.handle, Some(IRP_MJ_DIRECTORY_CONTROL)) {
         Ok(target) => target,
         Err(status) => return status,
     };

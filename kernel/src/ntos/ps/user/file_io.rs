@@ -795,8 +795,12 @@ fn file_transfer(handle: u64, event: u64, apc: u64, rsp: u64, write: bool) -> Re
             if write {
                 let data = guest::try_read_bytes(out, length as usize)?;
                 let volume = volume_files::volume().ok_or_else(|| KernelError::with_status("volume de boot ausente", 0xC000_000E))?;
+                let size_before = file.size();
                 count = volume.write(&file.volume_path(), offset, &data)?;
                 file.refresh();
+                // O Fcb->InfoFlags do NtfsCommonWrite: LAST_WRITE e, com o
+                // arquivo maior, SIZE, relatados no cleanup.
+                crate::drivers::fs::volume_streams::mark_modified(user_file.file_object(), 0x10 | if file.size() > size_before { 0x8 } else { 0 });
             } else if offset >= file.size() {
                 status = 0xC000_0011;
             } else {

@@ -319,7 +319,12 @@ fn cancel_io(handle: u64, target: u64, out: u64, thread_only: bool) -> u32 {
     if !state::probe_user_write(out, 16) {
         return 0xC000_0005;
     }
-    let found = device(&entry).is_some_and(|device| cancel_entry(device, target, thread_only));
+    // Os pedidos do I/O Manager para o FILE_OBJECT do handle (a notificação
+    // de diretório e as travas dos arquivos do volume, os IRPs de driver).
+    let file_object = entry.object.native_body().map_or(0, |body| body.pointer);
+    let thread = thread_only.then(crate::ntos::ps::process::get_current_thread);
+    let queued = file_object != 0 && crate::ntos::io::file::irp_service::cancel_file_requests(file_object, target, thread) != 0;
+    let found = device(&entry).is_some_and(|device| cancel_entry(device, target, thread_only)) | queued;
     let status = if found || thread_only { 0 } else { 0xC000_0225 };
     if state::set_user_iosb(out, status, 0).is_err() {
         return 0xC000_0005;

@@ -65,8 +65,9 @@ pub fn related_device(file: u64) -> Result<u64, KernelError> {
 
 /// O dispositivo de um IRP `major` do arquivo: o de [`related_device`],
 /// salvo os IRPs que o file system embutido atende por despacho
-/// (`volume_device::serves`: o IRP_MJ_LOCK_CONTROL), que vão ao dispositivo
-/// de volume dele.
+/// (`volume_device::serves`: o IRP_MJ_LOCK_CONTROL e o
+/// IRP_MJ_DIRECTORY_CONTROL de notificação), que vão ao dispositivo de
+/// volume dele.
 pub fn request_device(file: u64, major: u8) -> Result<u64, KernelError> {
     let device = related_device_object(file)?;
     let volume_open = file_at(file).flags.get() & FO_VOLUME_OPEN != 0;

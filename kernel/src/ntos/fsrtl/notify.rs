@@ -21,8 +21,9 @@
 //! numa tabela por NOTIFY_CHANGE; `buffer` é publicado não nulo enquanto há dados.
 //! Ao concluir, o buffer vai num SystemBuffer novo com IRP_BUFFERED_IO |
 //! IRP_DEALLOCATE_BUFFER | IRP_INPUT_OPERATION (o I/O Manager copia para o
-//! UserBuffer). O IRP pendente não ganha rotina de cancelamento (o NT instala
-//! FsRtlCancelNotify): o cancelamento chega pelo cleanup do diretório.
+//! UserBuffer). O IRP pendente leva a rotina de cancelamento do
+//! FsRtlCancelNotify ([`cancel_notify`]): o IoCancelIrp (o NtCancelIoFileEx,
+//! a saída da thread) o conclui com STATUS_CANCELLED.
 //! Nomes ANSI (CharacterSize 1) são registrados como bytes alargados a WCHAR.
 
 use alloc::collections::BTreeMap;
@@ -35,7 +36,7 @@ use crate::ntos::ex::pool_allocation;
 use crate::ntos::inc::field::{Field, NtStruct, Reserved};
 use crate::ntos::inc::types::{FastMutex, FileObject, IoStackLocation, Irp, Kthread, ListEntry, String as AnsiString};
 use crate::ntos::init::exports::invoke_handler;
-use crate::ntos::io::io_manager;
+use crate::ntos::io::{cancel, io_manager};
 use crate::ntos::ke::{critical_region, fast_mutex};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::ps::process;
@@ -45,6 +46,7 @@ const STATUS_SUCCESS: u32 = 0;
 const STATUS_NOTIFY_CLEANUP: u32 = 0x10B;
 const STATUS_NOTIFY_ENUM_DIR: u32 = 0x10C;
 const STATUS_DELETE_PENDING: u32 = 0xC000_0056;
+const STATUS_CANCELLED: u32 = 0xC000_0120;
 const NOTIFY_TAG: u32 = 0x4E72_5346; // 'FSrN'
 const WATCH_TREE: u16 = 0x01;
 const ENUM_DIR: u16 = 0x02;
@@ -282,11 +284,20 @@ fn take_pending(notify: &NotifyChange) -> Vec<u8> {
     PENDING.lock().remove(&notify.address()).unwrap_or_default()
 }
 
-/// Retira o primeiro IRP pendente (o elo vira lista vazia, como RemoveHeadList).
+/// Retira o primeiro IRP pendente (o elo vira lista vazia, como
+/// RemoveHeadList) cuja rotina de cancelamento sai na troca
+/// (IoSetCancelRoutine(Irp, NULL)): o IRP cancelado com a rotina já tomada
+/// pelo IoCancelIrp fica para o [`cancel_notify`].
 fn first_irp(notify: &NotifyChange) -> Option<&'static Irp> {
-    let entry = *list_entries(&notify.notify_irps).first()?;
-    remove_entry(list_at(entry));
-    Some(irp_at(entry - IRP_LIST_ENTRY))
+    for entry in list_entries(&notify.notify_irps) {
+        let irp = irp_at(entry - IRP_LIST_ENTRY);
+        if cancel::set_cancel_routine(irp.address(), 0) == 0 && irp.cancel.get() != 0 {
+            continue;
+        }
+        remove_entry(list_at(entry));
+        return Some(irp);
+    }
+    None
 }
 
 /// Retira e conclui os IRPs pendentes de um NOTIFY_CHANGE.
@@ -331,12 +342,47 @@ pub struct ChangeDirectory<'a> {
     pub filter_callback: u64,
 }
 
+/// Enfileira o IRP no NOTIFY_CHANGE (Information = o NOTIFY_CHANGE, como o
+/// FsRtl guarda) com a rotina [`cancel_notify`]; um IRP já cancelado antes
+/// da rotina sai na hora com STATUS_CANCELLED.
 fn queue_irp(notify: &NotifyChange, irp: &Irp) -> Result<(), KernelError> {
     irp.io_status.information.set(notify.address());
     mark_pending(irp);
     insert_tail(&notify.notify_irps, &irp.tail.overlay.list_entry)?;
     notify.reference_count.atomic().fetch_add(1, Ordering::AcqRel);
+    cancel::set_cancel_routine(irp.address(), cancel_routine());
+    if irp.cancel.get() != 0 && cancel::set_cancel_routine(irp.address(), 0) != 0 {
+        remove_entry(&irp.tail.overlay.list_entry);
+        complete(irp, STATUS_CANCELLED, 0);
+        dereference(notify);
+    }
     Ok(())
+}
+
+/// FsRtlCancelNotify (ntoskrnl 0x303070), a rotina de cancelamento dos IRPs
+/// pendentes: solta o spin lock de cancelamento, toma o NOTIFY_SYNC, tira o
+/// IRP da lista (se ele ainda estiver nela) e o conclui com
+/// STATUS_CANCELLED.
+extern "win64" fn cancel_notify(_device: u64, irp_address: u64) {
+    let irp = irp_at(irp_address);
+    let notify = irp.io_status.information.get();
+    let _ = cancel::release(irp.cancel_irql.get());
+    if notify == 0 {
+        return;
+    }
+    let notify = notify_at(notify);
+    let _ = with_sync(notify.notify_sync.get(), || {
+        if list_entries(&notify.notify_irps).contains(&irp.tail.overlay.list_entry.address()) {
+            remove_entry(&irp.tail.overlay.list_entry);
+            complete(irp, STATUS_CANCELLED, 0);
+            dereference(notify);
+        }
+        Ok(())
+    });
+}
+
+fn cancel_routine() -> u64 {
+    cancel_notify as extern "win64" fn(u64, u64) as usize as u64
 }
 
 /// STRING/UNICODE_STRING do nome do diretório: (Length, primeira unidade

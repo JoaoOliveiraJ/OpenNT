@@ -12,6 +12,7 @@ use alloc::vec::Vec;
 use super::extended_attributes::{self as ea, Entry};
 use super::ntfs::{attribute_name, each_attribute, find_attribute, find_named_attribute, parse_runs, u16_at, u32_at, u64_at, IndexEntry, Ntfs, PendingWrite, RawIndexEntry, Run, Stat};
 use super::ntfs_security::{self as security, Header, FIRST_SECURITY_ID, SDS_MIRROR, SECURE_RECORD};
+use super::volume_streams;
 use crate::drivers::storage::ata_pio;
 use crate::ntos::ke::clock;
 use crate::rtl::{KernelError, SpinLock};
@@ -1353,7 +1354,11 @@ impl Ntfs {
                 tx.create(path, directory, file_attributes, reservation, security_id)
             })
         })?;
-        self.stat(path)
+        let stat = self.stat(path)?;
+        // O NtfsReportDirNotify da criação, fora do escritor.
+        let filter = if directory { volume_streams::FILE_NOTIFY_CHANGE_DIR_NAME } else { volume_streams::FILE_NOTIFY_CHANGE_FILE_NAME };
+        volume_streams::report(self, path, stat.as_ref(), filter, volume_streams::FILE_ACTION_ADDED);
+        Ok(stat)
     }
 
     /// Troca o descritor do arquivo (o NtfsModifySecurity depois da mescla,
@@ -1436,10 +1441,44 @@ impl Ntfs {
     }
 
     pub fn remove(&self, path: &str) -> Result<(), KernelError> {
-        self.with_writer(|writer| writer.transaction(|tx| tx.remove(path)))
+        let before = self.stat(path).ok().flatten();
+        self.with_writer(|writer| writer.transaction(|tx| tx.remove(path)))?;
+        // O relato da remoção e, num diretório, o fim dos pedidos de
+        // notificação dele (STATUS_DELETE_PENDING).
+        if let Some(stat) = &before {
+            let filter = if stat.directory { volume_streams::FILE_NOTIFY_CHANGE_DIR_NAME } else { volume_streams::FILE_NOTIFY_CHANGE_FILE_NAME };
+            volume_streams::report(self, path, Some(stat), filter, volume_streams::FILE_ACTION_REMOVED);
+            volume_streams::directory_removed(self, stat);
+        }
+        Ok(())
     }
 
     pub fn rename(&self, path: &str, target: &str, replace_existing: bool) -> Result<(), KernelError> {
+        let replaced = self.stat(target).ok().flatten();
+        let moved = self.stat(path).ok().flatten();
+        self.rename_unreported(path, target, replace_existing)?;
+        // O NtfsReportDirNotify da renomeação: o destino substituído sai
+        // (FILE_ACTION_REMOVED); no mesmo diretório, RENAMED_OLD_NAME e
+        // RENAMED_NEW_NAME (o FsRtl Lite segura a conclusão entre os dois);
+        // entre diretórios, REMOVED na origem e ADDED no destino.
+        let Some(stat) = moved else { return Ok(()) };
+        let filter = if stat.directory { volume_streams::FILE_NOTIFY_CHANGE_DIR_NAME } else { volume_streams::FILE_NOTIFY_CHANGE_FILE_NAME };
+        if let Some(replaced) = replaced.filter(|replaced| replaced.reference != stat.reference) {
+            volume_streams::report(self, target, Some(&replaced), filter, volume_streams::FILE_ACTION_REMOVED);
+        }
+        let after = self.stat(target).ok().flatten();
+        let parent = |name: &str| name.trim_end_matches('/').rsplit_once('/').map_or(String::new(), |(parent, _)| parent.to_ascii_uppercase());
+        if parent(path) == parent(target) {
+            volume_streams::report(self, path, Some(&stat), filter, volume_streams::FILE_ACTION_RENAMED_OLD_NAME);
+            volume_streams::report(self, target, after.as_ref(), filter, volume_streams::FILE_ACTION_RENAMED_NEW_NAME);
+        } else {
+            volume_streams::report(self, path, Some(&stat), filter, volume_streams::FILE_ACTION_REMOVED);
+            volume_streams::report(self, target, after.as_ref(), filter, volume_streams::FILE_ACTION_ADDED);
+        }
+        Ok(())
+    }
+
+    fn rename_unreported(&self, path: &str, target: &str, replace_existing: bool) -> Result<(), KernelError> {
         self.with_writer(|writer| {
             writer.transaction(|tx| {
                 let (entry, record) = tx.require_file(path)?;

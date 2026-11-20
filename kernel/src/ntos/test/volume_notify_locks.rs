@@ -17,8 +17,26 @@
 //! - a faixa inteira do BaseDllOpenIniFileOnDisk do kernel32;
 //! - o fechamento do handle solta as travas do processo (IopCloseFile);
 //! - um handle de evento inválido é ignorado (0x656004).
+//!
+//! E a notificação de mudança de diretório (NtNotifyChangeDirectoryFile pelo
+//! I/O Manager; o IRP_MN_NOTIFY_CHANGE_DIRECTORY do file system embutido,
+//! `volume_streams::notify_change_directory`; o FsRtl Lite,
+//! `fsrtl/notify.rs`), contra o ntfs.sys 19041:
+//!
+//! - o pedido pendente (STATUS_PENDING, o IO_STATUS_BLOCK intocado) e a
+//!   criação que o conclui com FILE_ACTION_ADDED;
+//! - a renomeação no mesmo diretório numa conclusão só (RENAMED_OLD_NAME e
+//!   RENAMED_NEW_NAME);
+//! - o relato guardado sem pedido pendente;
+//! - WatchTree: o subdiretório só conta com ele, com o nome relativo;
+//! - o NtCancelIoFileEx (STATUS_CANCELLED, depois STATUS_NOT_FOUND);
+//! - o buffer curto (STATUS_NOTIFY_ENUM_DIR);
+//! - a escrita relatada como FILE_ACTION_MODIFIED só no fechamento;
+//! - o pedido num arquivo (STATUS_INVALID_PARAMETER) e o fechamento do
+//!   diretório (STATUS_NOTIFY_CLEANUP).
 
 use alloc::string::String;
+use alloc::vec::Vec;
 
 use crate::drivers::fs::volume_files;
 use crate::ntos::inc::field::NtStruct;
@@ -139,6 +157,7 @@ fn dos(path: &str) -> String {
 
 pub fn run(assert: Assert) {
     locks(assert);
+    notify(assert);
 }
 
 /// As travas de faixa de bytes (Q-FSGAPS G3).
@@ -235,6 +254,155 @@ fn locks(assert: Assert) {
     }
     let _ = volume.remove(FILE);
     volume_files::forget(FILE);
+    if let Some(region) = memory::find_region(block) {
+        memory::release_private_region(&region);
+    }
+}
+
+/// O diretório da notificação de mudança e os arquivos dele.
+const WATCHED: &str = "/OPENNTNW";
+
+impl Harness {
+    const NOTIFY_IOSB: u64 = 0x30;
+    const NOTIFY_BUFFER: u64 = 0x3000;
+
+    /// NtNotifyChangeDirectoryFile(handle, event, NULL, NULL, iosb, buffer,
+    /// length, filter, watch_tree) com o IOSB preenchido com um valor
+    /// conhecido antes.
+    fn notify(&self, handle: u64, event: u64, length: u32, filter: u32, watch_tree: bool) -> u32 {
+        guest::write64(self.at(Self::NOTIFY_IOSB), 0xDEAD_BEEF);
+        guest::write64(self.at(Self::NOTIFY_IOSB) + 8, 0xDEAD_BEEF);
+        guest::write_bytes(self.at(Self::NOTIFY_BUFFER), &[0u8; 0x100]);
+        self.arguments(&[self.at(Self::NOTIFY_IOSB), self.at(Self::NOTIFY_BUFFER), length as u64, filter as u64, watch_tree as u64]);
+        self.call("NtNotifyChangeDirectoryFile", handle, event, 0, 0)
+    }
+
+    /// O IO_STATUS_BLOCK do pedido de notificação: (Status, Information).
+    fn notify_iosb(&self) -> (u32, u64) {
+        (guest::read32(self.at(Self::NOTIFY_IOSB)), guest::read64(self.at(Self::NOTIFY_IOSB) + 8))
+    }
+
+    /// Os registros FILE_NOTIFY_INFORMATION do buffer: (Action, nome).
+    fn records(&self) -> Vec<(u32, String)> {
+        let mut records = Vec::new();
+        let mut at = self.at(Self::NOTIFY_BUFFER);
+        loop {
+            let next = guest::read32(at);
+            let action = guest::read32(at + 4);
+            let length = guest::read32(at + 8) as u64;
+            let units: Vec<u16> = (0..length / 2).map(|index| guest::read16(at + 12 + index * 2)).collect();
+            records.push((action, String::from_utf16_lossy(&units)));
+            if next == 0 || records.len() > 8 {
+                break;
+            }
+            at += next as u64;
+        }
+        records
+    }
+
+    /// NtCancelIoFileEx(handle, iosb, out).
+    fn cancel(&self, handle: u64, iosb: u64) -> u32 {
+        self.call("NtCancelIoFileEx", handle, iosb, self.at(Self::IOSB), 0)
+    }
+}
+
+fn record(action: u32, name: &str) -> (u32, String) {
+    (action, String::from(name))
+}
+
+/// A notificação de mudança de diretório (Q-FSGAPS G1): o IRP pendente no
+/// file system embutido e os relatos do NtfsReportDirNotify pelo FsRtl Lite.
+fn notify(assert: Assert) {
+    let Some(volume) = volume_files::volume() else {
+        assert(false, "notify: volume de boot");
+        return;
+    };
+    let cleanup = || {
+        for path in ["/OPENNTNW/A.TXT", "/OPENNTNW/B.TXT", "/OPENNTNW/C.TXT", "/OPENNTNW/SUB/D.TXT", "/OPENNTNW/SUB", WATCHED] {
+            let _ = volume.remove(path);
+            volume_files::forget(path);
+        }
+    };
+    cleanup();
+    let Ok(block) = memory::map_user_region(0x4000) else {
+        assert(false, "notify: memoria de usuario");
+        return;
+    };
+    let test = Harness { block };
+    let created = volume.create(WATCHED, true, 0x10, 0).is_ok() && volume.create("/OPENNTNW/C.TXT", false, 0x20, 0).is_ok();
+    // FILE_LIST_DIRECTORY | SYNCHRONIZE, assíncrono (sem FILE_SYNCHRONOUS_IO_*).
+    let (status, directory) = test.open(&dos(WATCHED), 0x10_0001, 7, 0x1);
+    let event = test.event();
+    if !created || status != 0 || event == 0 {
+        assert(false, "notify: diretorio, abertura assincrona e evento");
+        cleanup();
+        return;
+    }
+    // O pedido fica pendente: STATUS_PENDING e o IO_STATUS_BLOCK intocado.
+    let pending = test.notify(directory, event, 0x400, 0x1B, false) == 0x103 && test.notify_iosb() == (0xDEAD_BEEF, 0xDEAD_BEEF) && !test.signalled(event);
+    let _ = volume.create("/OPENNTNW/A.TXT", false, 0x20, 0);
+    let added = test.notify_iosb() == (0, 0x16) && test.records() == [record(1, "A.TXT")] && test.signalled(event);
+    assert(pending && added, "notify: o pedido fica pendente e a criacao de A.TXT o conclui com FILE_ACTION_ADDED");
+    // A renomeação no mesmo diretório: os dois registros numa conclusão só.
+    let rearmed = test.notify(directory, event, 0x400, 0x1B, false) == 0x103;
+    let _ = volume.rename("/OPENNTNW/A.TXT", "/OPENNTNW/B.TXT", false);
+    let renamed = test.notify_iosb().0 == 0 && test.records() == [record(4, "A.TXT"), record(5, "B.TXT")];
+    assert(rearmed && renamed, "notify: a renomeacao da RENAMED_OLD_NAME e RENAMED_NEW_NAME numa conclusao");
+    // Sem pedido pendente, o relato fica guardado e o próximo pedido sai
+    // concluído na hora.
+    let _ = volume.remove("/OPENNTNW/B.TXT");
+    let kept = test.notify(directory, event, 0x400, 0x1B, false) == 0x103 && test.notify_iosb().0 == 0 && test.records() == [record(2, "B.TXT")];
+    assert(kept, "notify: a remocao sem pedido pendente fica guardada para o pedido seguinte");
+    // Sem WatchTree, a mudança num subdiretório não conta; com ele, o nome
+    // vem relativo.
+    // A criação do SUB sem pedido pendente fica guardada: o pedido seguinte
+    // a leva.
+    let _ = volume.create("/OPENNTNW/SUB", true, 0x10, 0);
+    let sub_added = test.notify(directory, event, 0x400, 0x1B, false) == 0x103 && test.records() == [record(1, "SUB")];
+    let _ = test.notify(directory, event, 0x400, 0x1B, false);
+    let _ = volume.create("/OPENNTNW/SUB/D.TXT", false, 0x20, 0);
+    let shallow = test.notify_iosb() == (0xDEAD_BEEF, 0xDEAD_BEEF);
+    assert(sub_added && shallow, "notify: o subdiretorio criado e relatado; sem WatchTree a mudanca dentro dele nao conta");
+    let cancel_status = test.cancel(directory, test.at(Harness::NOTIFY_IOSB));
+    let cancelled = cancel_status == 0 && test.notify_iosb().0 == 0xC000_0120;
+    let again = test.cancel(directory, test.at(Harness::NOTIFY_IOSB));
+    if !cancelled || again != 0xC000_0225 {
+        crate::debug_print!("notify: NtCancelIoFileEx {:#x}, IOSB {:#x?}, segundo {:#x}", cancel_status, test.notify_iosb(), again);
+    }
+    assert(cancelled && again == 0xC000_0225, "notify: o NtCancelIoFileEx conclui o pedido com STATUS_CANCELLED e o segundo da STATUS_NOT_FOUND");
+    // O WatchTree vale para o NOTIFY_CHANGE do FILE_OBJECT, criado no
+    // primeiro pedido dele (o FsRtl reusa o mesmo nos seguintes): outra
+    // abertura do diretório, com WatchTree desde o primeiro pedido.
+    let (tree_opened, tree_handle) = test.open(&dos(WATCHED), 0x10_0001, 7, 0x1);
+    let _ = test.notify(tree_handle, event, 0x400, 0x1B, true);
+    let _ = volume.remove("/OPENNTNW/SUB/D.TXT");
+    let tree = tree_opened == 0 && test.notify_iosb().0 == 0 && test.records() == [record(2, "SUB\\D.TXT")];
+    if tree_opened == 0 {
+        test.close(tree_handle);
+    }
+    assert(tree, "notify: com WatchTree o nome vem relativo ao diretorio observado");
+    // O buffer pequeno demais dá STATUS_NOTIFY_ENUM_DIR.
+    let _ = test.notify(directory, event, 16, 0x1B, false);
+    let _ = volume.create("/OPENNTNW/A.TXT", false, 0x20, 0);
+    let enum_dir = test.notify_iosb() == (0x10C, 0);
+    // A escrita relata FILE_ACTION_MODIFIED no fechamento, não na escrita.
+    let (opened, file) = test.open(&dos("/OPENNTNW/A.TXT"), 0x12_0116, 7, 0x20);
+    let _ = test.notify(directory, event, 0x400, 0x1B, false);
+    let written = opened == 0 && test.transfer(file, true, 0, 3) == 0 && test.notify_iosb() == (0xDEAD_BEEF, 0xDEAD_BEEF);
+    test.close(file);
+    let modified = test.notify_iosb().0 == 0 && test.records() == [record(3, "A.TXT")];
+    assert(enum_dir && written && modified, "notify: buffer curto da STATUS_NOTIFY_ENUM_DIR; a escrita relata FILE_ACTION_MODIFIED so no fechamento");
+    // Num arquivo, STATUS_INVALID_PARAMETER; o fechamento do diretório
+    // conclui o pedido com STATUS_NOTIFY_CLEANUP.
+    let (_, file) = test.open(&dos("/OPENNTNW/C.TXT"), 0x10_0001, 7, 0x40);
+    let not_directory = test.notify(file, 0, 0x400, 0x1B, false) == 0xC000_000D;
+    test.close(file);
+    let _ = test.notify(directory, event, 0x400, 0x1B, false);
+    test.close(directory);
+    let closed = test.notify_iosb() == (0x10B, 0);
+    assert(not_directory && closed, "notify: num arquivo da STATUS_INVALID_PARAMETER; o fechamento do diretorio conclui com STATUS_NOTIFY_CLEANUP");
+    test.close(event);
+    cleanup();
     if let Some(region) = memory::find_region(block) {
         memory::release_private_region(&region);
     }

@@ -27,7 +27,9 @@
 //!   (`FileSystem::paging_read`/`paging_write`);
 //! - o IRP_MJ_LOCK_CONTROL do NtLockFile/NtUnlockFile ([`serves`],
 //!   `io/file/information.rs::request_device`), que vai às travas do stream
-//!   (`volume_streams::lock_control`, o NtfsCommonLockControl).
+//!   (`volume_streams::lock_control`, o NtfsCommonLockControl), e o
+//!   IRP_MJ_DIRECTORY_CONTROL do NtNotifyChangeDirectoryFile(Ex), que vai à
+//!   lista de notificação do diretório (`volume_streams::notify_change_directory`).
 //!
 //! O volume inteiro, aberto pelo nome do volume sem nome restante (`\??\C:`,
 //! o `\\.\C:` do Win32), chega por IRP, como no NT (`io/parse.rs`):
@@ -107,6 +109,10 @@ const IRP_MJ_QUERY_VOLUME_INFORMATION: u8 = 0x0A;
 const IRP_MJ_FILE_SYSTEM_CONTROL: u8 = 0x0D;
 const IRP_MJ_DEVICE_CONTROL: u8 = 0x0E;
 const IRP_MJ_LOCK_CONTROL: u8 = 0x11;
+const IRP_MJ_DIRECTORY_CONTROL: u8 = 0x0C;
+/// IRP_MN_NOTIFY_CHANGE_DIRECTORY e IRP_MN_NOTIFY_CHANGE_DIRECTORY_EX.
+const IRP_MN_NOTIFY_CHANGE_DIRECTORY: u8 = 0x02;
+const IRP_MN_NOTIFY_CHANGE_DIRECTORY_EX: u8 = 0x03;
 const IRP_MJ_CLEANUP: u8 = 0x12;
 /// IRP_MN_USER_FS_REQUEST e IRP_MN_KERNEL_CALL do IRP_MJ_FILE_SYSTEM_CONTROL.
 const IRP_MN_USER_FS_REQUEST: u8 = 0x00;
@@ -310,9 +316,10 @@ pub fn is_volume_device(device: u64) -> bool {
 
 /// Os IRPs dos arquivos do volume que o dispositivo de volume atende por
 /// despacho (`io/file/information.rs::request_device`): o
-/// IRP_MJ_LOCK_CONTROL das travas de faixa de bytes.
+/// IRP_MJ_LOCK_CONTROL das travas de faixa de bytes e o
+/// IRP_MJ_DIRECTORY_CONTROL da notificação de mudança de diretório.
 pub fn serves(major: u8) -> bool {
-    major == IRP_MJ_LOCK_CONTROL
+    major == IRP_MJ_LOCK_CONTROL || major == IRP_MJ_DIRECTORY_CONTROL
 }
 
 /// O dispositivo real do volume (o `\Device\KernelVolumeN`).
@@ -400,8 +407,9 @@ fn paging_io(device: u64, irp: &Irp) -> Option<(u32, u64)> {
     }
 }
 
-/// A rotina de despacho do file system embutido: o IRP_MJ_LOCK_CONTROL dos
-/// arquivos do volume ([`serves`]), a E/S de paginação dos arquivos de
+/// A rotina de despacho do file system embutido: o IRP_MJ_LOCK_CONTROL e o
+/// IRP_MJ_DIRECTORY_CONTROL de notificação dos arquivos do volume
+/// ([`serves`]), a E/S de paginação dos arquivos de
 /// paginação e as aberturas do volume inteiro ([`answer`]); as outras
 /// operações dos arquivos do volume são respondidas no lugar pelo I/O
 /// Manager.
@@ -412,8 +420,15 @@ extern "win64" fn dispatch(device: u64, packet: u64) -> i32 {
         // SAFETY: a stack location corrente do IRP entregue a este dispositivo.
         let stack = unsafe { IoStackLocation::at(irp.tail.overlay.current_stack_location.get()) };
         // O FsRtl conclui o IRP ou o deixa na fila de espera.
-        if stack.major_function.get() == IRP_MJ_LOCK_CONTROL {
-            return super::volume_streams::lock_control(packet, irp, stack);
+        match stack.major_function.get() {
+            IRP_MJ_LOCK_CONTROL => return super::volume_streams::lock_control(packet, irp, stack),
+            IRP_MJ_DIRECTORY_CONTROL if matches!(stack.minor_function.get(), IRP_MN_NOTIFY_CHANGE_DIRECTORY | IRP_MN_NOTIFY_CHANGE_DIRECTORY_EX) => return super::volume_streams::notify_change_directory(packet, irp, stack),
+            // O NtfsCommonDirectoryControl só atende a notificação por IRP
+            // aqui (a listagem do diretório é respondida no lugar pelo I/O
+            // Manager): outro minor é STATUS_INVALID_DEVICE_REQUEST
+            // (0x1ca363).
+            IRP_MJ_DIRECTORY_CONTROL => return super::volume_streams::complete(packet, irp, STATUS_INVALID_DEVICE_REQUEST),
+            _ => {}
         }
     }
     let (status, information) = paging_io(device, irp).unwrap_or_else(|| answer(device, irp));

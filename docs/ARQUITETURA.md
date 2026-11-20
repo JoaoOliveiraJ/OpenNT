@@ -3384,14 +3384,21 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   embutido não tem pilha de IRP, então o I/O Manager responde no lugar as
   operações desses arquivos (`information::related_device` dá 0 para eles)
   e um IRP mandado ao dispositivo de volume termina com
-  STATUS_INVALID_DEVICE_REQUEST. A exceção é o IRP_MJ_LOCK_CONTROL do
-  NtLockFile/NtUnlockFile (`information::request_device`,
-  `volume_device::serves`): o dispositivo de volume o entrega às travas do
+  STATUS_INVALID_DEVICE_REQUEST. As exceções (`information::request_device`,
+  `volume_device::serves`) são o IRP_MJ_LOCK_CONTROL do
+  NtLockFile/NtUnlockFile, que o dispositivo de volume entrega às travas do
   stream (`drivers/fs/volume_streams.rs`, o NtfsCommonLockControl sobre o
-  FsRtlProcessFileLock), a leitura e a escrita de modo usuário conferem
+  FsRtlProcessFileLock): a leitura e a escrita de modo usuário conferem
   essas travas (STATUS_FILE_LOCK_CONFLICT) e o cleanup e o fechamento do
-  último handle de um processo soltam as dele (teste `volume_notify_locks`
-  na fase 7). Os serviços de modo usuário NtFlushBuffersFile(Ex) (acesso de
+  último handle de um processo soltam as dele; e o IRP_MN_NOTIFY_CHANGE_DIRECTORY
+  do NtNotifyChangeDirectoryFile(Ex), que vai à lista de notificação do
+  diretório (o NtfsNotifyChangeDirectory sobre o FsRtl Lite, com o
+  FsRtlCancelNotify): a criação, a remoção e a renomeação do volume relatam
+  as mudanças a cada diretório acima com lista (o NtfsReportDirNotify), a
+  escrita relata FILE_ACTION_MODIFIED no cleanup do arquivo, um diretório
+  removido conclui os pedidos com STATUS_DELETE_PENDING e o NtCancelIoFileEx
+  de um handle de arquivo cancela os IRPs que o I/O Manager acompanha para o
+  FILE_OBJECT (teste `volume_notify_locks` na fase 7). Os serviços de modo usuário NtFlushBuffersFile(Ex) (acesso de
   escrita ou de acréscimo; o IRP_MJ_FLUSH_BUFFERS com o minor dos flags num
   arquivo de driver), NtFlushVirtualMemory (a vista de arquivo gravada de
   volta), NtQueryEaFile/NtSetEaFile (sondas, a lista FILE_GET_EA_INFORMATION
@@ -5487,9 +5494,9 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     (`io/file/directory_notify.rs`, que também atende o
     NtNotifyChangeDirectoryFile(Ex) de modo usuário: as sondas do
     IO_STATUS_BLOCK e do buffer alinhado a ULONG, o filtro entre 1 e 0xFFF,
-    o FILE_LIST_DIRECTORY, o IRP de um arquivo de driver por
-    `io/file/irp_service.rs` e STATUS_INVALID_DEVICE_REQUEST nos volumes do
-    kernel, que o DirectWrite tolera), NtSetInformationFile, NtFsControlFile e
+    o FILE_LIST_DIRECTORY e o IRP pelo `io/file/irp_service.rs`, ao driver
+    do arquivo ou ao file system embutido nos arquivos do volume de boot),
+    NtSetInformationFile, NtFsControlFile e
     ZwCreateSymbolicLinkObject;
   - Ke, Ex, Po, Mm e Io: IoSizeOfIrpEx/IoInitializeIrpEx/IoCleanupIrp,
     IoEnqueueIrp, IoSetIoAttributionIrp e IoReportResourceForDetection; os
