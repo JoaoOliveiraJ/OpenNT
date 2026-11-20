@@ -361,6 +361,7 @@ fn genuine_check(environment: &Environment, state: &GenuineState, flags: u32) ->
     if state.wnf_state.load(Ordering::SeqCst) != genuine {
         state.wnf_since.store(now, Ordering::SeqCst);
         state.wnf_state.store(genuine, Ordering::SeqCst);
+        debug_print!("[sl] SystemPolicyInformation: {} desde {} ms (Security-SPP-GenuineLocalStatus {:#x}, tipo {}, valor {:#x})", if genuine != 0 { "copia genuina" } else { "copia nao genuina" }, now, value.status, value.value_type, value.dword());
     }
     let elapsed = now.wrapping_sub(state.wnf_since.load(Ordering::SeqCst));
     if genuine == 0 && state.wnf_fired.load(Ordering::SeqCst) == 0 && elapsed >= WNF_DELAY_MS {
@@ -507,16 +508,18 @@ fn query_license_value(items: &[&[u8]], cipher: &ReplyCipher, output_capacity: u
 fn wait_genuine_state(items: &[&[u8]], cipher: &ReplyCipher, environment: &Environment, state: &GenuineState) -> Outcome<ReplyItems> {
     let nonce = nonce_item(items)?;
     let value = (environment.query_value)(&units_of(GENUINE_LOCAL_STATUS), Some(4), 0, 0)?;
+    let mut genuine = false;
     if value.status != STATUS_OBJECT_NAME_NOT_FOUND {
         if value.status & 0x8000_0000 != 0 {
             return fail(value.status);
         }
         if value.value_type == REG_DWORD && value.dword() != 0 {
+            genuine = true;
             dispatcher::reset_event(state.event);
         }
     }
     state.waiter.store(1, Ordering::SeqCst);
-    debug_print!("[sl] SystemPolicyInformation codigo 0x5: esperando a notificacao de copia nao genuina");
+    debug_print!("[sl] SystemPolicyInformation codigo 0x5: esperando a notificacao de copia nao genuina ({})", if genuine { "copia genuina: evento zerado" } else { "copia nao genuina" });
     let mut status = wait_until_not_alerted(state.event);
     if status & 0x8000_0000 == 0 && status != STATUS_USER_APC {
         status = wait_until_not_alerted(state.mutex);
