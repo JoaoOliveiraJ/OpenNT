@@ -310,13 +310,54 @@ impl StackTarget<'_> {
     }
 }
 
+/// Por onde começa a pilha de uma thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Start {
+    /// No RIP exato do processador ou da passagem.
+    Exact,
+    /// No retorno do quadro de troca (uma thread fora da CPU bloqueada num
+    /// serviço).
+    SwitchFrame,
+    /// No anel 3, pelo CONTEXT do intervalo (uma thread fora da CPU sem
+    /// serviço suspenso): as leituras passam ao processo dela antes.
+    UserContext,
+}
+
+/// Uma thread fora da CPU, pelo `monitor context`: o RIP no anel 3 vem do
+/// CONTEXT do intervalo (nenhum quadro de troca na pilha de kernel); senão,
+/// do retorno do quadro de troca.
+fn thread_start(context: &ThreadContext, rip: u64) -> Start {
+    if context.processor.is_some() {
+        Start::Exact
+    } else if rip != 0 && rip < USER_LIMIT {
+        Start::UserContext
+    } else {
+        Start::SwitchFrame
+    }
+}
+
+/// A faixa da pilha de usuário que o `monitor context` dá de uma thread no
+/// anel 3 (NT_TIB.StackLimit e StackBase da TEB dela).
+pub fn user_stack_range(header: &str) -> Option<(u64, u64)> {
+    let range = header.split_once("pilha de usuario ")?.1.split_whitespace().next()?;
+    let (limit, base) = range.split_once('-')?;
+    let (limit, base) = (super::parse_number(limit)?, super::parse_number(base)?);
+    (limit != 0 && limit < base).then_some((limit, base))
+}
+
 impl Client {
     /// Desenrola com as passagens do OpenNT. `thread`/`processor`: a thread
     /// da pilha (para a parte de usuário); `user`: atravessar a syscall.
-    fn walk_thread(&mut self, context: Context, top_is_return: bool, limit: usize, user: bool, thread: Option<u64>, processor: Option<u64>) -> Walk {
+    fn walk_thread(&mut self, context: Context, start: Start, limit: usize, user: bool, thread: Option<u64>, processor: Option<u64>) -> Walk {
         let labels = KernelLabels::from_symbols(&self.symbols);
         let mut target = StackTarget { client: &mut *self, labels, thread, processor, user, process: None, switched_from: None };
-        let walk = unwind::walk_stack(&mut target, context, top_is_return, limit);
+        let walk = match start {
+            Start::UserContext => match target.enter_process() {
+                Ok(()) => unwind::walk_stack(&mut target, context, false, limit),
+                Err(reason) => Walk { frames: Vec::new(), stop: unwind::Stop::End(format!("anel 3 em {:#x}: {reason}", context.rip)) },
+            },
+            _ => unwind::walk_stack(&mut target, context, start == Start::SwitchFrame, limit),
+        };
         let switched_from = target.switched_from;
         // Sem processo escolhido antes, as leituras voltam ao processador;
         // os módulos de usuário da thread ficam nos símbolos (os nomes dos
@@ -337,18 +378,31 @@ impl Client {
         let named: Vec<(&str, u64)> = values.iter().filter_map(|value| value.value.map(|number| (value.layout.name, number))).collect();
         let context = Context::from_named(rip, &named);
         let processor = self.selected_thread().map(|thread| thread.saturating_sub(1)).or_else(|| self.stop_reply().and_then(|stop| stop.processor()));
-        Ok(self.walk_thread(context, false, limit, user, None, processor))
+        Ok(self.walk_thread(context, Start::Exact, limit, user, None, processor))
     }
 
-    /// A pilha de uma thread pelo `monitor context` (a de uma thread fora da
-    /// CPU começa no quadro de troca: o RIP já é um retorno), com o motivo
-    /// do fim.
+    /// A pilha de uma thread pelo `monitor context`, com o motivo do fim. A
+    /// de uma thread fora da CPU começa no quadro de troca (o RIP já é um
+    /// retorno) ou, sem serviço suspenso (uma espera adiada, o fim do
+    /// intervalo), no CONTEXT do anel 3 dela, lido no processo dela.
     pub fn thread_stack(&mut self, thread: u64, limit: usize, user: bool) -> Result<(ThreadContext, Walk), String> {
-        let context = self.thread_context(thread)?;
+        let mut context = self.thread_context(thread)?;
         let Some(rip) = context.register("rip") else { return Err(format!("contexto de {thread:#x}: {}", context.header)) };
         let named: Vec<(&str, u64)> = context.registers.iter().map(|(name, value)| (name.as_str(), *value)).collect();
-        let start = Context::from_named(rip, &named);
-        let walk = self.walk_thread(start, context.processor.is_none(), limit, user, Some(thread), context.processor);
+        let registers = Context::from_named(rip, &named);
+        let start = thread_start(&context, rip);
+        // A pilha de usuário da TEB: um RSP do CONTEXT fora dela fica dito.
+        if start == Start::UserContext {
+            let rsp = context.register("rsp").unwrap_or(0);
+            if let Some((low, high)) = user_stack_range(&context.header).filter(|(low, high)| !(*low..*high).contains(&rsp)) {
+                context.header.push_str(&format!("\naviso: o rsp {rsp:#x} do CONTEXT esta fora da pilha da TEB ({low:#x}-{high:#x})"));
+            }
+        }
+        if start == Start::UserContext && !user {
+            let walk = Walk { frames: Vec::new(), stop: unwind::Stop::End(format!("a thread esta no anel 3 em {rip:#x}, sem servico suspenso (a pilha de usuario nao foi pedida)")) };
+            return Ok((context, walk));
+        }
+        let walk = self.walk_thread(registers, start, limit, user, Some(thread), context.processor);
         Ok((context, walk))
     }
 
@@ -359,7 +413,7 @@ impl Client {
         let rip = registers.iter().find(|(name, _)| name == "rip").map(|(_, value)| *value).unwrap_or(0);
         let named: Vec<(&str, u64)> = registers.iter().map(|(name, value)| (name.as_str(), *value)).collect();
         let start = Context::from_named(rip, &named);
-        let walk = self.walk_thread(start, false, limit, false, Some(thread.ethread), None);
+        let walk = self.walk_thread(start, Start::Exact, limit, false, Some(thread.ethread), None);
         Ok((registers, walk))
     }
 
@@ -444,6 +498,30 @@ mod tests {
         let mut memory = Captured { regions: vec![(rsp + SYSCALL_SAVE_AREA, syscall_frame(0x7ffe_1234_0014, 0x200))] };
         assert!(syscall_context(&mut memory, rsp).is_err());
         assert!(syscall_context(&mut Captured { regions: Vec::new() }, rsp).unwrap_err().contains("ilegivel"));
+    }
+
+    #[test]
+    fn a_thread_off_the_cpu_starts_in_its_user_context_without_a_switch_frame() {
+        // A resposta do `monitor context` de uma thread de usuário numa
+        // espera adiada (sem quadro de troca), como as do dwm no b2-idle.
+        let text = "ETHREAD 0xffffc000c01513b0 estado Waiting no anel 3, sem servico suspenso: CONTEXT 0xffffa00701a3f000 TEB 0x3a5000 pilha de usuario 0x2c9c000-0x2ca0000\nrip=0x7ffd0009d6e4 rsp=0x2c9fc48 rbp=0x0 rbx=0x5 rsi=0x0 rdi=0x0 r12=0x0 r13=0x0 r14=0x0 r15=0x0 rflags=0x246\n";
+        let context = crate::monitor::thread_context(text).unwrap();
+        assert_eq!(context.processor, None);
+        assert_eq!((context.register("rip"), context.register("rsp"), context.register("rbx")), (Some(0x7ffd_0009_d6e4), Some(0x2c9_fc48), Some(5)));
+        assert_eq!(thread_start(&context, 0x7ffd_0009_d6e4), Start::UserContext);
+        assert_eq!(user_stack_range(&context.header), Some((0x2c9_c000, 0x2ca_0000)));
+        // O quadro de troca de uma thread bloqueada num serviço.
+        let text = "ETHREAD 0xffffc000c012f2c0 estado Waiting quadro de troca em 0xffffa0070173dd30\nrip=0xfffff800408cf349 rsp=0xffffa0070173de30 rflags=0x2 rbp=0xffffa0070173de80\n";
+        let context = crate::monitor::thread_context(text).unwrap();
+        assert_eq!(thread_start(&context, 0xffff_f800_408c_f349), Start::SwitchFrame);
+        assert_eq!(user_stack_range(&context.header), None);
+        // Uma thread num processador parado: os registradores do protocolo.
+        let text = "ETHREAD 0xffffc000c012f2c0 roda na CPU 1: registradores da thread 2 do protocolo\nrip=0x7ffd0009d6e4 rsp=0x1000 rbp=0x0\n";
+        let context = crate::monitor::thread_context(text).unwrap();
+        assert_eq!(thread_start(&context, 0x7ffd_0009_d6e4), Start::Exact);
+        // Faixa vazia ou invertida (TEB ilegível) não vale.
+        assert_eq!(user_stack_range("x pilha de usuario 0x0-0x0"), None);
+        assert_eq!(user_stack_range("x pilha de usuario 0x2000-0x1000"), None);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Comandos do OpenNT para o host (`monitor` no GDB, o `qRcmd` do
 //! protocolo): processos, threads (e os registradores de uma thread fora da
-//! CPU, do quadro de troca na pilha de kernel dela), módulos, processadores
+//! CPU, do quadro de troca na pilha de kernel dela ou, sem ele, do CONTEXT do
+//! anel 3), módulos, processadores
 //! e IRQL, objetos por nome, o log do DbgPrint, breakpoints e o bugcheck.
 //!
 //! As listas andam nas estruturas nativas do NT (EPROCESS.ActiveProcessLinks,
@@ -28,7 +29,7 @@ const HELP: &str = "comandos do OpenNT:
   threads [pid]      threads (ETHREAD, TID, estado, inicio) de todos ou de um processo
   lm                 modulos carregados (base, fim, nome, caminho)
   cpus | irql        processadores: IRQL, KPCR, thread e processo correntes, RIP
-  context <ethread>  registradores de uma thread (fora da CPU: o quadro de troca)
+  context <ethread>  registradores de uma thread (fora da CPU: o quadro de troca, ou o CONTEXT do anel 3)
   obj <caminho>      objeto do namespace por nome (tipo e corpo)
   log [bytes]        saida recente do DbgPrint
   bl                 breakpoints armados
@@ -277,9 +278,22 @@ fn thread_context(cr3: u64, argument: &str, out: &mut Payload) {
     }
     let state = memory::read_u8(cr3, thread + offset_of!(KthreadView1, state) as u64).unwrap_or(0xFF);
     let Some(stack) = memory::read_u64(cr3, thread + offset_of!(Kthread, kernel_stack) as u64).filter(|&stack| stack != 0) else {
-        let _ = writeln!(out, "ETHREAD {:#x}: KernelStack ilegivel", thread);
+        if state == STATE_TERMINATED {
+            let _ = writeln!(out, "ETHREAD {:#x}: thread terminada, KernelStack ilegivel (a pilha de kernel ja foi liberada)", thread);
+        } else {
+            let _ = writeln!(out, "ETHREAD {:#x}: KernelStack ilegivel", thread);
+        }
         return;
     };
+    // KernelStack = InitialStack: nenhum quadro de troca salvo. Uma thread
+    // de usuário fica assim fora de um serviço: no fim do intervalo pelo
+    // tique, ou numa espera adiada (NtWaitFor*, ALPC, a worker factory), que
+    // volta STATUS_PENDING e deixa a CPU no fim do intervalo. O estado dela
+    // está inteiro no CONTEXT do intervalo.
+    if memory::read_u64(cr3, thread + offset_of!(Kthread, initial_stack) as u64) == Some(stack) {
+        user_thread_context(cr3, thread, state, out);
+        return;
+    }
     let Some(rip) = memory::read_u64(cr3, stack + SWITCH_RETURN) else {
         let _ = writeln!(out, "ETHREAD {:#x}: quadro de troca em {:#x} ilegivel", thread, stack);
         return;
@@ -288,6 +302,51 @@ fn thread_context(cr3: u64, argument: &str, out: &mut Payload) {
     let _ = write!(out, "rip={:#x} rsp={:#x}", rip, stack + crate::hal::amd64::context_switch::SWITCH_FRAME_SIZE);
     for (name, offset) in SWITCH_REGISTERS {
         let _ = write!(out, " {}={:#x}", name, read_u64(cr3, stack + offset));
+    }
+    out.push(b'\n');
+}
+
+/// KTHREAD.State Terminated.
+const STATE_TERMINATED: u8 = 4;
+
+/// Os registradores do CONTEXT do intervalo que valem na pilha (a ordem do
+/// CONTEXT do x64).
+const USER_CONTEXT_REGISTERS: [&str; 10] = ["rsp", "rbp", "rbx", "rsi", "rdi", "r12", "r13", "r14", "r15", "rflags"];
+
+/// Uma thread de usuário sem quadro de troca: os registradores do anel 3 do
+/// CONTEXT do intervalo dela, com a TEB e a faixa da pilha de usuário
+/// (NT_TIB.StackLimit e StackBase da TEB, pela raiz do processo dela).
+fn user_thread_context(cr3: u64, thread: u64, state: u8, out: &mut Payload) {
+    let state_text = THREAD_STATES.get(state as usize).copied().unwrap_or("?");
+    if stop::locks_held() {
+        let _ = writeln!(out, "ETHREAD {:#x} estado {} sem quadro de troca; CONTEXT indisponivel: um processador parado tinha trava do kernel", thread, state_text);
+        return;
+    }
+    let Some((context, teb, process)) = crate::ntos::ps::user::threads::find_by_pointer(thread).map(|user| user.with(|user| (user.context, user.teb_va, user.process_pointer))).filter(|&(context, _, _)| context != 0) else {
+        let _ = writeln!(out, "ETHREAD {:#x} estado {} sem quadro de troca e sem CONTEXT de usuario", thread, state_text);
+        return;
+    };
+    use crate::ntos::inc::types::Context;
+    let field = |offset: usize| read_u64(cr3, context + offset as u64);
+    let values = [
+        field(offset_of!(Context, rsp)),
+        field(offset_of!(Context, rbp)),
+        field(offset_of!(Context, rbx)),
+        field(offset_of!(Context, rsi)),
+        field(offset_of!(Context, rdi)),
+        field(offset_of!(Context, r12)),
+        field(offset_of!(Context, r13)),
+        field(offset_of!(Context, r14)),
+        field(offset_of!(Context, r15)),
+        memory::read_u32(cr3, context + offset_of!(Context, e_flags) as u64).unwrap_or(0) as u64,
+    ];
+    // NT_TIB.StackBase (+8) e StackLimit (+0x10) da TEB.
+    let root = process_context::root_of(cr3, process).unwrap_or(cr3);
+    let (base, limit) = if teb != 0 { (memory::read_u64(root, teb + 8).unwrap_or(0), memory::read_u64(root, teb + 0x10).unwrap_or(0)) } else { (0, 0) };
+    let _ = writeln!(out, "ETHREAD {:#x} estado {} no anel 3, sem servico suspenso: CONTEXT {:#x} TEB {:#x} pilha de usuario {:#x}-{:#x}", thread, state_text, context, teb, limit, base);
+    let _ = write!(out, "rip={:#x}", field(offset_of!(Context, rip)));
+    for (name, value) in USER_CONTEXT_REGISTERS.iter().zip(values) {
+        let _ = write!(out, " {}={:#x}", name, value);
     }
     out.push(b'\n');
 }
