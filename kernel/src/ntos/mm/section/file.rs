@@ -4,6 +4,11 @@
 //! é dona desta referência até a última vista, handle ou ponteiro. O ramo de
 //! handles de arquivo de usuário entra com `ps/user/files`; hoje o resolvedor
 //! devolve handles nativos e de kernel.
+//!
+//! Três origens: um arquivo do volume do kernel (o backing do ZwCreateFile
+//! ou a fonte do FILE_OBJECT), uma fonte sem volume e um arquivo servido por
+//! um file system real, como o ntfs.sys (`fsd_file`), cuja control area é a
+//! dos SECTION_OBJECT_POINTERS do FCB e cujos bytes vêm por E/S de paginação.
 
 use alloc::collections::BTreeMap;
 use alloc::format;
@@ -16,6 +21,7 @@ use crate::hal::physical;
 use crate::drivers::fs::native_file_name;
 use crate::drivers::fs::volume::FileSystem;
 use crate::ntos::io::file::{lifetime as file_lifetime, query as query_file};
+use crate::ntos::mm::section::fsd_file;
 use crate::ntos::ob::objects::file::{self as file_objects, FileSource};
 use crate::ntos::ps::user::sections::SectionFile;
 use crate::rtl::{KernelError, SpinLock};
@@ -56,6 +62,9 @@ pub struct CapturedFile {
     image: bool,
     held: AtomicBool,
     backing_reference: AtomicU64,
+    /// Os SECTION_OBJECT_POINTERS de um arquivo servido por um file system
+    /// (0 nas outras origens).
+    driver_pointers: u64,
 }
 
 impl CapturedFile {
@@ -69,6 +78,42 @@ impl CapturedFile {
 
     pub fn volume_path(&self) -> Option<String> {
         self.backing.as_ref().map(|(_, path)| path.clone())
+    }
+
+    /// Arquivo servido por um file system (`fsd_file`).
+    pub fn driver_file(&self) -> bool {
+        self.driver_pointers != 0
+    }
+
+    /// O tamanho de um arquivo de file system de novo pelo FsRtlGetFileSize
+    /// (com o arquivo adquirido para a criação da seção).
+    pub fn refresh_size(&self) -> Result<(), u32> {
+        if self.driver_file() {
+            self.size.store(fsd_file::file_size(self.pointer())?, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    /// O tamanho que o dono do stream conhece (o FileSize do SharedCacheMap,
+    /// para a seção do Cache Manager): limita as leituras de paginação.
+    pub fn note_size(&self, size: u64) {
+        self.size.store(size, Ordering::Release);
+    }
+
+    /// O FILE_OBJECT da paginação passa a ser `new` (o
+    /// CcChangeBackingFileObject do stream do cache); a referência retida
+    /// vai junto.
+    pub fn replace_pointer(&self, new: u64) -> Result<(), KernelError> {
+        if !self.held.load(Ordering::Acquire) {
+            self.pointer.store(new, Ordering::Release);
+            return Ok(());
+        }
+        if file_objects::reference(new)?.is_none() {
+            return Err(KernelError::new("section file replacement disappeared"));
+        }
+        let old = self.pointer.swap(new, Ordering::AcqRel);
+        file_objects::dereference(old)?;
+        Ok(())
     }
 
     /// Retém o FILE_OBJECT e, com backing de volume, a vida do arquivo para
@@ -108,6 +153,15 @@ impl CapturedFile {
     pub fn resize(&self, length: u64) -> Result<u32, KernelError> {
         if self.access & 2 == 0 {
             return Ok(0xC000_0022);
+        }
+        if self.driver_file() {
+            return Ok(match fsd_file::set_file_size(self.pointer(), length) {
+                0 => {
+                    self.size.store(length, Ordering::Release);
+                    0
+                }
+                status => status,
+            });
         }
         let source = || self.source.as_ref().and_then(|source| Some((source.volume()?, source.volume_path()?)));
         let Some((volume, path)) = self.backing.as_ref().map(|(volume, path)| (*volume, path.clone())).or_else(source) else { return Ok(0xC000_00A2) };
@@ -164,6 +218,9 @@ impl SectionFile for CapturedFile {
 
     /// Bytes desligados (arquivo apagado com seção viva) têm precedência.
     fn read_at(&self, offset: u64, length: u64) -> Result<Vec<u8>, KernelError> {
+        if self.driver_file() {
+            return fsd_file::read_at(self.pointer(), self.size(), offset, length);
+        }
         if let Some(detached) = file_lifetime::read_detached(self.backing_reference.load(Ordering::Acquire), offset as usize, length as usize) {
             return Ok(detached);
         }
@@ -193,6 +250,9 @@ impl SectionFile for CapturedFile {
     /// fonte sem volume passam por buffer, uma página por vez, nunca a faixa
     /// inteira no heap.
     fn copy_to_physical(&self, offset: u64, address: u64, length: u64) -> Result<(), KernelError> {
+        if self.driver_file() {
+            return fsd_file::copy_to_physical(self.pointer(), self.size(), offset, address, length);
+        }
         if file_lifetime::read_detached(self.backing_reference.load(Ordering::Acquire), 0, 0).is_none() {
             let direct = match (&self.backing, &self.source) {
                 (Some((volume, path)), _) => volume.copy_range_to_physical(path, offset, address, length),
@@ -220,6 +280,9 @@ impl SectionFile for CapturedFile {
     }
 
     fn write_at(&self, offset: u64, data: &[u8]) -> Result<(), KernelError> {
+        if self.driver_file() {
+            return fsd_file::write_at(self.pointer(), self.size(), offset, data);
+        }
         if file_lifetime::write_detached(self.backing_reference.load(Ordering::Acquire), offset as usize, data)? {
             return Ok(());
         }
@@ -232,6 +295,21 @@ impl SectionFile for CapturedFile {
             },
             _ => Err(KernelError::with_status("readonly section file", 0xC000_00A2)),
         }
+    }
+
+    fn page_io(&self) -> bool {
+        self.driver_file()
+    }
+
+    /// Páginas inteiras pela escrita de paginação (arquivo de file system).
+    fn write_frames(&self, first_page: u64, frames: &[u64]) -> Option<Result<(), KernelError>> {
+        self.driver_file().then(|| fsd_file::write_frames(self.pointer(), first_page, frames))
+    }
+
+    /// As páginas que faltam, lidas pela E/S de paginação em grupos (o
+    /// arquivo de file system).
+    fn read_frames(&self, first_page: u64, frames: &[u64]) -> Option<Result<(), KernelError>> {
+        self.driver_file().then(|| fsd_file::read_frames(self.pointer(), self.size(), first_page, frames))
     }
 
     fn nt_path(&self) -> Option<String> {
@@ -266,10 +344,15 @@ fn capture_selected(pointer: u64, access: u32, mode: u8, protect: u32, image: bo
     }
     let source = file_objects::source(pointer);
     let backing = crate::ntos::io::file::zw::file_backing(pointer);
-    // Um dispositivo sem provedor de seções de sistema de arquivos não
-    // fornece control area: é o tipo real do arquivo, não um leitor inventado.
     if source.is_none() && backing.is_none() {
-        return Err(0xC000_0020);
+        // Um arquivo de file system real; um dispositivo sem
+        // SECTION_OBJECT_POINTERS não fornece control area
+        // (STATUS_INVALID_FILE_FOR_SECTION, como o NT).
+        let pointers = fsd_file::section_pointers(pointer);
+        if pointers == 0 {
+            return Err(0xC000_0020);
+        }
+        return capture_driver_file(pointer, pointers, access, image);
     }
     let stat = match &backing {
         Some((volume, path)) => volume.stat(path),
@@ -327,5 +410,56 @@ fn capture_selected(pointer: u64, access: u32, mode: u8, protect: u32, image: bo
         image,
         held: AtomicBool::new(false),
         backing_reference: AtomicU64::new(0),
+        driver_pointers: 0,
+    }))
+}
+
+/// O stream file do Cache Manager como arquivo da seção do cache
+/// (CcInitializeCacheMap -> MmCreateSection com o FILE_OBJECT): o tamanho
+/// vem do CC_FILE_SIZES do file system, sem consulta ao file system, que
+/// pode estar no meio da montagem; a identidade é a dos
+/// SECTION_OBJECT_POINTERS, a mesma das seções de usuário do stream.
+pub fn capture_stream(pointer: u64, pointers: u64, size: u64) -> Arc<CapturedFile> {
+    Arc::new(CapturedFile {
+        size: AtomicU64::new(size),
+        name: String::new(),
+        base_name: String::new(),
+        identity: fsd_file::identity(pointers),
+        pointer: AtomicU64::new(pointer),
+        access: 3,
+        backing: None,
+        source: None,
+        image: false,
+        held: AtomicBool::new(false),
+        backing_reference: AtomicU64::new(0),
+        driver_pointers: pointers,
+    })
+}
+
+/// O arquivo de um file system real: o tamanho pelo FsRtlGetFileSize
+/// (diretório: STATUS_FILE_IS_A_DIRECTORY), a identidade pelos
+/// SECTION_OBJECT_POINTERS e o nome pelo IopQueryName. A permissão de
+/// escrita é a do acesso concedido ao handle (conferido antes); o
+/// somente-leitura do arquivo é do file system.
+fn capture_driver_file(pointer: u64, pointers: u64, access: u32, image: bool) -> Result<Arc<CapturedFile>, u32> {
+    let size = fsd_file::file_size(pointer)?;
+    if size > (1 << 53) - 1 {
+        return Err(0xC000_0123);
+    }
+    let name = fsd_file::name(pointer).unwrap_or_default();
+    let base_name = String::from(&name[name.rfind('\\').map_or(0, |index| index + 1)..]);
+    Ok(Arc::new(CapturedFile {
+        size: AtomicU64::new(size),
+        name,
+        base_name,
+        identity: fsd_file::identity(pointers),
+        pointer: AtomicU64::new(pointer),
+        access,
+        backing: None,
+        source: None,
+        image,
+        held: AtomicBool::new(false),
+        backing_reference: AtomicU64::new(0),
+        driver_pointers: pointers,
     }))
 }

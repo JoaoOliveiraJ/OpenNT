@@ -9,6 +9,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::ntos::mm::section::file::{self as section_file, CapturedFile};
+use crate::ntos::mm::section::fsd_file;
 use crate::ntos::mm::section::parameters::{self as section_parameters, Decoded};
 use crate::ntos::mm::partition;
 use crate::ntos::ex::callback_security;
@@ -412,6 +413,10 @@ fn create_common(output: u64, access: u32, object_attributes: u64, size_pointer:
     let mut held = false;
     let mut created: Option<Arc<sections::Section>> = None;
     let result = (|| -> Result<u32, KernelError> {
+        // O arquivo de um file system fica adquirido para sincronização de
+        // seção (FsRtlAcquireToCreateMappedSection) do tamanho até a seção
+        // existir; o `Drop` faz o FsRtlReleaseFile.
+        let mut create_lock: Option<fsd_file::CreateSectionLock> = None;
         let file_object = object_request.unwrap_or(0);
         if file_handle != 0 || file_object != 0 {
             let required = match section_parameters::file_request(&request) {
@@ -427,6 +432,15 @@ fn create_common(output: u64, access: u32, object_attributes: u64, size_pointer:
             };
             captured.acquire()?;
             held = true;
+            if captured.driver_file() {
+                match fsd_file::acquire_for_create_section(captured.pointer(), request.page_protect) {
+                    Ok(lock) => create_lock = Some(lock),
+                    Err(status) => return Ok(status),
+                }
+                if let Err(status) = captured.refresh_size() {
+                    return Ok(status);
+                }
+            }
             file = Some(captured);
         }
         let mut dimensions = None;
@@ -469,17 +483,38 @@ fn create_common(output: u64, access: u32, object_attributes: u64, size_pointer:
             return Ok(0xC000_00BB);
         }
         let backing: Option<Arc<dyn SectionFile>> = file.clone().map(|captured| captured as Arc<dyn SectionFile>);
+        let driver_file = file.as_ref().is_some_and(|captured| captured.driver_file());
+        // A seção de dados de um arquivo de file system confirma as páginas
+        // depois de soltar o arquivo: as leituras de paginação não correm
+        // com a aquisição da criação.
+        let mut deferred_commit = false;
         let outcome = if image {
+            // O MiFlushDataSection do MiCreateImageFileMap: o que o cache e as
+            // vistas de dados alteraram vai ao disco antes de a imagem ser lida.
+            if let Some(captured) = file.as_ref().filter(|captured| captured.driver_file()) {
+                fsd_file::flush_data_section(captured.pointer());
+            }
             sections::create_image(backing.ok_or_else(|| KernelError::new("image section without file"))?, None, request.page_protect, request.flags & 0x400 == 0)?
         } else {
             let (section_size, committed, large) = dimensions.unwrap_or((0, false, false));
-            sections::create(CreateOptions { size: section_size, page_protect: request.page_protect, attributes: request.attributes, file: backing, large, committed: Some(committed), ..CreateOptions::default() })?
+            deferred_commit = committed && driver_file;
+            if let Some(captured) = file.as_ref().filter(|captured| captured.driver_file()) {
+                fsd_file::mark_user_mapped(captured.pointer());
+            }
+            sections::create(CreateOptions { size: section_size, page_protect: request.page_protect, attributes: request.attributes, file: backing, large, committed: Some(committed && !driver_file), ..CreateOptions::default() })?
         };
+        drop(create_lock.take());
         let section = match outcome {
             Ok(section) => section,
             Err(status) => return Ok(status),
         };
         created = Some(section.clone());
+        if deferred_commit {
+            let status = sections::commit(&section, 0, section.size / sections::PAGE)?;
+            if status != 0 {
+                return Ok(status);
+            }
+        }
         let pointer = section.pointer();
         // A seção retém a partição escolhida até a destruição.
         if let Some(body) = partition_body {

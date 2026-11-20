@@ -20,7 +20,7 @@
 //!   PeakUsage e HighestPage do MMPAGING_FILE acompanham.
 //! - E/S de paginação: a leitura é o IoPageRead e a escrita o
 //!   IoSynchronousPageWrite do FILE_OBJECT do arquivo (IRP_MJ_READ/WRITE com
-//!   IRP_PAGING_IO | IRP_NOCACHE | IRP_SYNCHRONOUS_PAGING_IO, `io/paging_io`),
+//!   IRP_PAGING_IO | IRP_NOCACHE | IRP_SYNCHRONOUS_PAGING_IO, `mm/page_io`),
 //!   com um MDL que descreve os frames, enviados ao file system dono do
 //!   volume pelo IoGetRelatedDeviceObject.
 //! - MmGetPageFileInformation (rva 0x6a1644): a SystemPageFileInformation
@@ -47,11 +47,8 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::ntos::inc::field::NtStruct;
-use crate::ntos::inc::types::{IoStatusBlock, Kevent, LargeInteger, Mdl, MmpagingFile, FileObject};
-use crate::ntos::io::paging_io::{self, PagingRequest};
-use crate::ntos::ke::dispatcher;
+use crate::ntos::inc::types::MmpagingFile;
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::mm::mdl as mm_mdl;
 use crate::ntos::mm::memory_map as map;
 use crate::rtl::SpinLock;
 
@@ -62,12 +59,8 @@ pub const RESERVED_PAGES: u64 = 2;
 /// Páginas de uma escrita do modified page writer (MM_MAXIMUM_WRITE_CLUSTER).
 pub const MAXIMUM_WRITE_CLUSTER: usize = 16;
 pub const STATUS_TOO_MANY_PAGING_FILES: u32 = 0xC000_0097;
-const STATUS_PENDING: u32 = 0x103;
 const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 const PAGE: u64 = map::PAGE_SIZE;
-/// MdlFlags dos MDLs de paginação.
-const MDL_PAGES_LOCKED: i16 = 0x0002;
-const MDL_IO_PAGE_READ: i16 = 0x0040;
 
 /// Onde mora a cópia de uma página: o arquivo (PageFileLow) e a página
 /// dentro dele (PageFileHigh).
@@ -401,36 +394,9 @@ pub fn information() -> Vec<Information> {
         .collect()
 }
 
-/// O MDL de paginação dos frames (MDL_PAGES_LOCKED, e MDL_IO_PAGE_READ na
-/// leitura), com o vetor de PFNs deles; um frame só também fica mapeado no
-/// sistema pelo mapa direto.
-fn paging_mdl(frames: &[u64], read: bool) -> u64 {
-    let base = map::direct_map(frames[0]);
-    let descriptor = mm_mdl::create(0, base, frames.len() as u64 * PAGE);
-    if descriptor == 0 {
-        return 0;
-    }
-    // SAFETY: MDL recém-criado por MmCreateMdl, com espaço para os PFNs.
-    let mdl = unsafe { Mdl::at(descriptor) };
-    for (index, &frame) in frames.iter().enumerate() {
-        guest::write64(descriptor + Mdl::SIZE + index as u64 * 8, frame / PAGE);
-    }
-    mdl.process.set(0);
-    let mut flags = MDL_PAGES_LOCKED;
-    if frames.len() == 1 {
-        mdl.mapped_system_va.set(base);
-        flags |= 0x0001;
-    }
-    if read {
-        flags |= MDL_IO_PAGE_READ;
-    }
-    mdl.mdl_flags.set(flags);
-    descriptor
-}
-
 /// Um IRP de paginação síncrono ao arquivo `number` em `offset` (páginas),
-/// com os frames: IoPageRead (`read`) ou IoSynchronousPageWrite. Devolve o
-/// NTSTATUS final.
+/// com os frames: IoPageRead (`read`) ou IoSynchronousPageWrite
+/// (`mm/page_io`). Devolve o NTSTATUS final.
 fn page_io(number: u32, offset: u64, frames: &[u64], read: bool) -> u32 {
     let Some(file) = file_object(number) else { return 0xC000_0008 };
     file_page_io(file, offset, frames, read)
@@ -438,40 +404,7 @@ fn page_io(number: u32, offset: u64, frames: &[u64], read: bool) -> u32 {
 
 /// [`page_io`] sobre o FILE_OBJECT.
 fn file_page_io(file: u64, offset: u64, frames: &[u64], read: bool) -> u32 {
-    let descriptor = paging_mdl(frames, read);
-    let event = guest::alloc_bytes(Kevent::SIZE);
-    let status_block = guest::alloc_bytes(IoStatusBlock::SIZE);
-    let position = guest::alloc_bytes(LargeInteger::SIZE);
-    let release = || {
-        for block in [descriptor, event, status_block, position] {
-            if block != 0 {
-                guest::free_bytes(block);
-            }
-        }
-    };
-    if descriptor == 0 || event == 0 || status_block == 0 || position == 0 {
-        release();
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-    dispatcher::initialize_event(event, 0, false);
-    // SAFETY: blocos recém-alocados dos tipos certos; o FILE_OBJECT é retido
-    // pela lista de arquivos de paginação.
-    let (status_cell, offset_cell, mdl, file_body) = unsafe { (IoStatusBlock::at(status_block), LargeInteger::at(position), Mdl::at(descriptor), FileObject::at(file)) };
-    offset_cell.quad_part.set((offset * PAGE) as i64);
-    status_cell.status.set(STATUS_PENDING as i32);
-    let request = PagingRequest { file: file_body, descriptor: mdl, offset: offset_cell, event, io_status: status_cell };
-    let issued = if read { paging_io::page_read(&request, 0, 0) } else { paging_io::synchronous_page_write(&request) };
-    let status = match issued {
-        Ok(STATUS_PENDING) => {
-            dispatcher::wait_for_single_object(event, 0, 0, false);
-            status_cell.status.get() as u32
-        }
-        Ok(status) if status & 0x8000_0000 != 0 => status,
-        Ok(_) => status_cell.status.get() as u32,
-        Err(error) => if error.status != 0 { error.status } else { 0xC000_0001 },
-    };
-    release();
-    status
+    crate::ntos::mm::page_io::transfer(file, offset * PAGE, frames, read).0
 }
 
 /// Grava os frames nas páginas `slot.offset..` do arquivo (a escrita do

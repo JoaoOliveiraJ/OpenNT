@@ -16,7 +16,7 @@ use crate::ntos::ps::process;
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::inc::field::Field;
-use crate::ntos::inc::types::{DeviceObject, DriverObject, FastIoDispatch, FileObject, FileStandardInformation, IoStackLocation, IoStatusBlock, IopFileObjectExtension, Irp, LargeInteger, NtStruct, Vpb};
+use crate::ntos::inc::types::{DeviceObject, DriverObject, FastIoDispatch, FileObject, FileStandardInformation, IoStackLocation, IoStatusBlock, IopFileObjectExtension, Irp, Kevent, LargeInteger, NtStruct, Vpb};
 use crate::ntos::io::irp_builder::{self, BuildOptions};
 
 const RESOURCE: u32 = 0xC000_009A;
@@ -245,6 +245,53 @@ pub fn query_native(file: u64, class: u32, length: u32, buffer: u64, return_leng
     }
     guest::free_bytes(scratch);
     result
+}
+
+/// FsRtlSetFileSize (RVA 0x669a10, do MiCreateDataFileMap e do
+/// MmExtendSection): IRP_MJ_SET_INFORMATION FileEndOfFileInformation com
+/// Flags IRP_PAGING_IO | IRP_SYNCHRONOUS_PAGING_IO (0x42), o tamanho no
+/// SystemBuffer e o modo de erro grave da thread desligado durante o
+/// pedido. Devolve o NTSTATUS (o do envio, se for falha).
+pub fn set_size(file: u64, size: u64) -> Result<u32, KernelError> {
+    let device = related_device(file)?;
+    if device == 0 {
+        return Ok(0xC000_0010);
+    }
+    // O LARGE_INTEGER do tamanho, o IO_STATUS_BLOCK e o KEVENT.
+    let scratch = guest::alloc_bytes(8 + IoStatusBlock::SIZE + Kevent::SIZE);
+    if scratch == 0 {
+        return Ok(RESOURCE);
+    }
+    let count = match device_at(device).stack_size.get() as u8 {
+        0 => 1,
+        count => count as u32,
+    };
+    let packet = guest::alloc_bytes(irp_builder::size_for(count));
+    if packet == 0 {
+        guest::free_bytes(scratch);
+        return Ok(RESOURCE);
+    }
+    let (buffer, io_status, event) = (scratch, scratch + 8, scratch + 8 + IoStatusBlock::SIZE);
+    guest::write64(buffer, size);
+    dispatcher::initialize_event(event, 0, false);
+    irp_builder::build(packet, &BuildOptions { major: SET_IRP_MJ_SET_INFORMATION, buffer, buffer_length: 8, device_object: device, stack_count: count, file_object: file, user_event: event, user_iosb: io_status, thread: process::get_current_thread(), requestor_mode: 0, ..Default::default() });
+    // SAFETY: IRP recém-construído e o slot do topo dele.
+    let (irp, stack) = unsafe { (Irp::at(packet), IoStackLocation::at(irp_builder::first_stack_location(packet, count))) };
+    stack.parameters.set_file.file_information_class.set(crate::ntos::inc::types::FileInformationClass(20));
+    irp.flags.set(0x42);
+    let old_hard_error = thread_io::set_hard_error_mode(0);
+    let status = io_manager::iof_call_driver(device, packet);
+    if status == 0x103 {
+        dispatcher::wait_for_single_object(event, 0, 0, false);
+    }
+    // SAFETY: IO_STATUS_BLOCK de rascunho dentro de `scratch`.
+    let completed = unsafe { IoStatusBlock::at(io_status) }.status.get();
+    if let Ok(mode) = old_hard_error {
+        let _ = thread_io::set_hard_error_mode(mode as u8);
+    }
+    guest::free_bytes(packet);
+    guest::free_bytes(scratch);
+    Ok((if status < 0 { status } else { completed }) as u32)
 }
 
 /// FsRtlGetFileSize: Fast I/O (FastIoQueryStandardInfo) quando o driver tem,

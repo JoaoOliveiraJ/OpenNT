@@ -38,6 +38,7 @@ pub mod process_commit;
 pub mod process_usage;
 pub mod commit;
 pub mod paging_file;
+pub mod page_io;
 pub mod working_set;
 pub mod modified_writer;
 pub mod memory_information;

@@ -10,6 +10,7 @@ pub mod image_segment;
 pub mod image_view;
 pub mod views;
 pub mod file;
+pub mod fsd_file;
 pub mod create;
 pub mod extend;
 pub mod insert;

@@ -100,6 +100,22 @@ pub trait SectionFile: Send + Sync {
     fn set_size(&self, _length: u64) -> Option<Result<u32, KernelError>> {
         None
     }
+    /// O arquivo é servido pela E/S de paginação de um file system
+    /// (`mm/section/fsd_file`): as páginas são lidas e gravadas inteiras,
+    /// em frames que não precisam ser contíguos.
+    fn page_io(&self) -> bool {
+        false
+    }
+    /// IoPageRead das páginas a partir de `first_page` nos frames (só com
+    /// [`SectionFile::page_io`]).
+    fn read_frames(&self, _first_page: u64, _frames: &[u64]) -> Option<Result<(), KernelError>> {
+        None
+    }
+    /// IoSynchronousPageWrite dos frames nas páginas a partir de
+    /// `first_page` (só com [`SectionFile::page_io`]).
+    fn write_frames(&self, _first_page: u64, _frames: &[u64]) -> Option<Result<(), KernelError>> {
+        None
+    }
     fn nt_path(&self) -> Option<String> {
         None
     }
@@ -510,6 +526,13 @@ fn status_of(error: &KernelError, default: u32) -> u32 {
 /// página em todas. Sem frames livres para as páginas já cobradas, a
 /// recusa é STATUS_NO_MEMORY, com uma linha `[section]` na serial.
 pub fn commit(section: &Arc<Section>, first: u64, count: u64) -> Result<u32, KernelError> {
+    commit_pages(section, first, count, true)
+}
+
+/// [`commit`], com `read_file` falso para as páginas novas de um arquivo que
+/// ficam zeradas sem leitura (as que o Cache Manager vai sobrescrever
+/// inteiras ou que passam do fim do arquivo).
+pub fn commit_pages(section: &Arc<Section>, first: u64, count: u64, read_file: bool) -> Result<u32, KernelError> {
     if first > MAX_SAFE_INTEGER || count > MAX_SAFE_INTEGER || first + count > section.count_pages() {
         return Ok(0xC000_000D);
     }
@@ -517,6 +540,9 @@ pub fn commit(section: &Arc<Section>, first: u64, count: u64) -> Result<u32, Ker
         return Ok(0xC000_000D);
     }
     let Some(area) = section.control_area() else { return Err(KernelError::new("section without control area")) };
+    if let Some(file) = section.file.as_ref().filter(|file| file.page_io() && !section.is_image && !section.large) {
+        return commit_paged_file(section, &area, file, first, count, read_file);
+    }
     let existing = section.frames().len() as u64;
     let charged = if section.file.is_none() && !section.is_image { (first..first + count).filter(|&page| section.frame(page).is_none()).count() as u64 } else { 0 };
     if charged != 0 && !system_commit::charge(charged) {
@@ -648,6 +674,220 @@ pub fn commit(section: &Arc<Section>, first: u64, count: u64) -> Result<u32, Ker
     Ok(status)
 }
 
+/// Retira páginas da control area: as PTEs de todas as vistas, o atributo de
+/// cache, os frames e as cópias originais.
+fn discard_pages(area: &AreaRef, pages: &[u64]) -> Result<(), KernelError> {
+    let frames: Vec<u64> = pages.iter().filter_map(|page| area.lock().frames.get(page).copied()).collect();
+    section_cache::restore(&frames)?;
+    let views = area.lock().views.clone();
+    for &page in pages {
+        for view in &views {
+            detach_page(view, page);
+        }
+        let frame = area.lock().frames.remove(&page);
+        if let Some(frame) = frame {
+            pfn::free_page(frame);
+        }
+        release_original_file_page(area, page)?;
+    }
+    Ok(())
+}
+
+/// Tira a página `page` da control area da vista (PTE e estado da vista); a
+/// cópia privada copy-on-write de uma vista fica.
+fn detach_page(view: &View, page: u64) {
+    let first_page = view.offset / PAGE;
+    if page < first_page || page - first_page >= view.size / PAGE {
+        return;
+    }
+    let index = page - first_page;
+    if view.state.lock().private_frames.contains_key(&index) {
+        return;
+    }
+    if view.large {
+        if index % 512 == 0 {
+            paging::unmap_large_page_in(view.root, view_address(view, index * PAGE), None);
+        }
+    } else {
+        paging::unmap_page_in(view.root, view_address(view, index * PAGE), MapOptions::default());
+    }
+    let mut state = view.state.lock();
+    state.committed_pages.remove(&index);
+    state.frames.remove(&index);
+    state.page_protects.remove(&index);
+}
+
+/// A confirmação de páginas de um arquivo servido por um file system
+/// (`mm/section/fsd_file`): os frames das páginas que faltam são lidos pela
+/// E/S de paginação (IoPageRead, até 16 páginas por IRP, sem exigir frames
+/// contíguos) antes de entrarem na control area; uma página que outro
+/// caminho (o Cache Manager, outra seção) publicou enquanto isso fica com o
+/// frame dele, e o lido aqui volta ao PFN. Assim ninguém vê uma página em
+/// leitura: é a página em transição do NT, resolvida pela publicação
+/// depois da leitura. Páginas além do fim do arquivo e, sem `read_file`,
+/// todas as novas ficam zeradas.
+fn commit_paged_file(section: &Arc<Section>, area: &AreaRef, file: &Arc<dyn SectionFile>, first: u64, count: u64, read_file: bool) -> Result<u32, KernelError> {
+    let missing: Vec<u64> = {
+        let owner = area.lock();
+        (first..first + count).filter(|page| !owner.frames.contains_key(page)).collect()
+    };
+    if missing.is_empty() {
+        return Ok(0);
+    }
+    if missing.len() as u64 > pfn::free_count() {
+        return Ok(0xC000_012D);
+    }
+    let release_frames = |frames: &[u64]| {
+        for &frame in frames {
+            pfn::free_page(frame);
+        }
+    };
+    let mut fresh: Vec<u64> = Vec::with_capacity(missing.len());
+    for _ in &missing {
+        let frame = pfn::alloc_page();
+        if frame == 0 {
+            release_frames(&fresh);
+            return Ok(0xC000_0017);
+        }
+        physical::zero(frame, PAGE as usize);
+        fresh.push(frame);
+    }
+    if read_file {
+        let size_pages = file.size().div_ceil(PAGE);
+        let mut index = 0usize;
+        while index < missing.len() {
+            let page = missing[index];
+            let mut run = 1usize;
+            while index + run < missing.len() && missing[index + run] == page + run as u64 && run < 64 {
+                run += 1;
+            }
+            if page < size_pages {
+                let take = run.min((size_pages - page) as usize);
+                let result = file.read_frames(page, &fresh[index..index + take]).unwrap_or_else(|| Err(KernelError::new("section file without paging reads")));
+                if let Err(error) = result {
+                    debug_print!("[section] file read failed: {}", error.message);
+                    release_frames(&fresh);
+                    let status = status_of(&error, 0xC000_0185);
+                    return Ok(if status & 0x8000_0000 == 0 { 0xC000_0185 } else { status });
+                }
+            }
+            index += run;
+        }
+    }
+    if !section_cache::set(&fresh, section.page_protect())? {
+        release_frames(&fresh);
+        return Ok(0xC000_0017);
+    }
+    let mut added: Vec<u64> = Vec::new();
+    let mut lost: Vec<u64> = Vec::new();
+    {
+        let mut owner = area.lock();
+        for (&page, &frame) in missing.iter().zip(fresh.iter()) {
+            if let alloc::collections::btree_map::Entry::Vacant(slot) = owner.frames.entry(page) {
+                slot.insert(frame);
+                added.push(page);
+            } else {
+                lost.push(frame);
+            }
+        }
+    }
+    if !lost.is_empty() {
+        section_cache::restore(&lost)?;
+        release_frames(&lost);
+    }
+    let result = (|| -> Result<u32, KernelError> {
+        if area.lock().writeback {
+            for &page in &added {
+                if page * PAGE < file.size() {
+                    let frame = area.lock().frames.get(&page).copied().unwrap_or(0);
+                    capture_original_file_page(area, page, frame)?;
+                }
+            }
+        }
+        let views = area.lock().views.clone();
+        for &page in &added {
+            for view in &views {
+                if !attach_page(view, page) {
+                    return Ok(0xC000_0017);
+                }
+            }
+        }
+        Ok(0)
+    })();
+    match result {
+        Ok(0) => Ok(0),
+        other => {
+            discard_pages(area, &added)?;
+            other
+        }
+    }
+}
+
+/// As páginas [first, end) de uma control area de arquivo saem da memória
+/// (o MmPurgeSection do CcPurgeCacheSection): o frame de cada página volta
+/// ao PFN quando nenhuma vista além das de `keep` (as vistas do próprio
+/// Cache Manager, que o chamador já invalidou) a mapeia. Devolve false se
+/// alguma página ficou porque outra vista a usa.
+pub fn purge_file_pages(section: &Arc<Section>, first: u64, end: u64, keep: &dyn Fn(&View) -> bool) -> Result<bool, KernelError> {
+    let Some(area) = section.control_area() else { return Ok(true) };
+    let pages: Vec<u64> = area.lock().frames.range(first..end).map(|(&page, _)| page).collect();
+    if pages.is_empty() {
+        return Ok(true);
+    }
+    let views = area.lock().views.clone();
+    let mut purged = true;
+    let mut doomed = Vec::new();
+    for page in pages {
+        let used = views.iter().any(|view| {
+            let first_page = view.offset / PAGE;
+            !keep(view) && page >= first_page && page - first_page < view.size / PAGE && view.state.lock().committed_pages.contains(&(page - first_page))
+        });
+        if used {
+            purged = false;
+        } else {
+            doomed.push(page);
+        }
+    }
+    if !doomed.is_empty() {
+        discard_pages(&area, &doomed)?;
+        remote_flush()?;
+    }
+    Ok(purged)
+}
+
+/// As páginas [first, first + count) (até 64) que a control area já tem:
+/// bit `n` para a página `first + n`.
+pub fn present_mask(section: &Section, first: u64, count: u64) -> u64 {
+    let Some(area) = section.control_area() else { return 0 };
+    let owner = area.lock();
+    (0..count.min(64)).filter(|&offset| owner.frames.contains_key(&(first + offset))).fold(0u64, |mask, offset| mask | 1 << offset)
+}
+
+/// Publica de novo na vista as páginas [first, first + count) que a
+/// control area tem (a vista de sistema do Cache Manager antes de usar uma
+/// página que outro caminho confirmou). Devolve false se faltou tabela.
+pub fn attach_pages(view: &View, first: u64, count: u64) -> bool {
+    (first..first + count).all(|page| view.section.frame(page).is_none() || attach_page(view, page))
+}
+
+/// Grava o que as vistas da control area de arquivo `identity` alteraram
+/// (o MmFlushSection da seção de dados inteira): cada seção com vista
+/// escreve pelo próprio arquivo.
+pub fn flush_identity(identity: &str) -> Result<(), KernelError> {
+    let Some(area) = FILE_AREAS.lock().get(identity).cloned() else { return Ok(()) };
+    let mut flushed: Vec<u64> = Vec::new();
+    let views = area.lock().views.clone();
+    for view in views {
+        let pointer = Arc::as_ptr(&view.section) as u64;
+        if flushed.contains(&pointer) {
+            continue;
+        }
+        flushed.push(pointer);
+        flush(&view.section)?;
+    }
+    Ok(())
+}
+
 /// A última referência da control area devolve cache, PFNs e cópias; o nome
 /// é removido e o arquivo e a partição retidos são soltos.
 fn destroy_section(section: &Arc<Section>) -> Result<(), KernelError> {
@@ -738,6 +978,10 @@ pub struct CreateOptions {
     pub permanent: bool,
     /// `None` = SEC_COMMIT nos atributos.
     pub committed: Option<bool>,
+    /// A seção do Cache Manager sobre o stream (SharedCacheMap->Section):
+    /// as escritas do Cc saem pelo flush do próprio Cc, então ela não liga
+    /// o writeback das vistas.
+    pub cache: bool,
 }
 
 /// Seção criada ou o NTSTATUS da recusa.
@@ -802,7 +1046,7 @@ fn new_section(size: u64, maximum_size: u64, page_protect: u32, attributes: u32,
 /// control area do arquivo reutilizada com o mesmo atributo de cache, SEC_COMMIT
 /// confirmando tudo de uma vez.
 pub fn create(options: CreateOptions) -> Result<Created, KernelError> {
-    let CreateOptions { size, page_protect, attributes, name, file, large, permanent, committed } = options;
+    let CreateOptions { size, page_protect, attributes, name, file, large, permanent, committed, cache } = options;
     if size == 0 || size > 0xFFFF_FFFF_FFFF_F000 {
         return Ok(Err(if size == 0 { 0xC000_0040 } else { 0xC000_000D }));
     }
@@ -822,7 +1066,7 @@ pub fn create(options: CreateOptions) -> Result<Created, KernelError> {
     if let Some(identity) = &identity {
         FILE_AREAS.lock().insert(identity.clone(), area.clone());
     }
-    let writeback = file.as_ref().filter(|_| writable(page_protect)).map(|file| file.size());
+    let writeback = file.as_ref().filter(|_| writable(page_protect) && !cache).map(|file| file.size());
     let section = new_section(rounded, size, page_protect, attributes, name.clone(), file, false, false, large, permanent, Some(area.clone()));
     if let Some(file_size) = writeback {
         if !enable_writeback(&area, file_size) {
@@ -1049,6 +1293,17 @@ pub fn map(section: &Arc<Section>, options: &MapRequest) -> Result<Mapped, Kerne
 /// que uma CPU possa ter escrito pelo TLB antigo e só então solta o
 /// backing. Uma falha conserva a vista para nova tentativa.
 pub fn unmap(view: &Arc<View>, authority: Option<&secured_views::SecuredToken>) -> Result<(), KernelError> {
+    unmap_view(view, authority, true)
+}
+
+/// A retirada de uma vista do Cache Manager (CcUnmapVacb ->
+/// MmUnmapViewInSystemCache): as escritas pelo cache saem pelo flush do
+/// próprio Cc, com o write-ahead do log, e nunca pelo writeback das vistas.
+pub fn unmap_cache_view(view: &Arc<View>) -> Result<(), KernelError> {
+    unmap_view(view, None, false)
+}
+
+fn unmap_view(view: &Arc<View>, authority: Option<&secured_views::SecuredToken>, flush_file: bool) -> Result<(), KernelError> {
     if !VIEWS.lock().iter().any(|candidate| same_view(candidate, view)) {
         return Err(KernelError::new("invalid or duplicate section view removal"));
     }
@@ -1058,7 +1313,9 @@ pub fn unmap(view: &Arc<View>, authority: Option<&secured_views::SecuredToken>) 
     }
     if view.state.lock().retirement.is_none() {
         // Se a persistência falhar, as PTEs e a propriedade continuam válidas.
-        flush(&view.section)?;
+        if flush_file {
+            flush(&view.section)?;
+        }
         let mut state = view.state.lock();
         let pages = state.committed_pages.iter().copied().filter(|&index| !view.large || index % 512 == 0).collect();
         state.retirement = Some(Retirement { pages, ..Retirement::default() });
@@ -1081,7 +1338,9 @@ pub fn unmap(view: &Arc<View>, authority: Option<&secured_views::SecuredToken>) 
             remote_flush()?;
             retirement.acknowledged = true;
         }
-        flush(&view.section)?;
+        if flush_file {
+            flush(&view.section)?;
+        }
         let private: Vec<u64> = view.state.lock().private_frames.values().copied().collect();
         section_cache::restore(&private)?;
         while let Some(&frame) = retirement.tables.last() {
@@ -1155,6 +1414,9 @@ pub fn flush(section: &Section) -> Result<(), KernelError> {
     let Some(file) = &section.file else { return Ok(()) };
     let Some(area) = section.control_area() else { return Ok(()) };
     let originals: Vec<(u64, u64)> = area.lock().original.iter().map(|(&page, &frame)| (page, frame)).collect();
+    if file.page_io() {
+        return flush_pages(section, file, &originals);
+    }
     let size = file.size();
     let mut group: Vec<DirtyPage> = Vec::new();
     for (page, original) in originals {
@@ -1236,6 +1498,28 @@ pub fn flush_all_file_sections() -> (u32, u32) {
         }
     }
     (flushed, failed)
+}
+
+/// O flush de um arquivo de file system: a página alterada vai inteira pela
+/// escrita de paginação (o IoSynchronousPageWrite do MmFlushSection; o file
+/// system corta o que passa do fim do arquivo). A cópia original recebe os
+/// bytes tirados antes da escrita: uma escrita da vista durante a E/S fica
+/// para o próximo flush.
+fn flush_pages(section: &Section, file: &Arc<dyn SectionFile>, originals: &[(u64, u64)]) -> Result<(), KernelError> {
+    for &(page, original) in originals {
+        let Some(frame) = section.frame(page) else { continue };
+        if page * PAGE >= file.size() {
+            continue;
+        }
+        let current = physical::read_bytes(frame, PAGE as usize);
+        if current == physical::read_bytes(original, PAGE as usize) {
+            continue;
+        }
+        let written = file.write_frames(page, &[frame]).unwrap_or_else(|| Err(KernelError::new("section file without paging writes")));
+        written.map_err(|error| KernelError::with_status(format!("section writeback failed: {}", error.message), status_of(&error, 0xC000_0185)))?;
+        physical::write_bytes(original, &current);
+    }
+    Ok(())
 }
 
 /// Falta de escrita presente numa página copy-on-write: copia para um PFN
