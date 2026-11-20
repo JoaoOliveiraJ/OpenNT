@@ -729,6 +729,9 @@ pub fn create_user_process(request: &CreateProcessRequest<'_>) -> Result<Created
     // mesma tabela dos PIDs, reservado antes porque a TEB o recebe antes de a
     // thread existir.
     let load_options = LoadOptions { user_space: true, skip_imports: true, skip_relocations: true, skip_security_cookie: true, notify_image: false, ..LoadOptions::default() };
+    // O ParentProcess do PspAllocateProcess (o do atributo ou quem cria),
+    // guardado antes do attach: anexado, o processo corrente é o novo.
+    let creator = request.parent.unwrap_or_else(process::get_current_process);
     let built = cid::allocate(cid::Kind::Thread).and_then(|thread_id| {
         process_context::with_process(process_pointer, || -> Result<Built, KernelError> {
             loader::map_system_images()?;
@@ -754,7 +757,7 @@ pub fn create_user_process(request: &CreateProcessRequest<'_>) -> Result<Created
             let manifest_flag = if manifest.is_some() { APP_MANIFEST_PRESENT } else { 0 };
             let parameter_flags = manifest_flag | crate::ntos::ps::process_parameters::NORMALIZED;
             let block = parameters.write(parameter_flags)?;
-            fixup_console_handle(block, request.parent.unwrap_or_else(process::get_current_process), process_pointer, parameters.console_handle, &image_information);
+            fixup_console_handle(block, creator, process_pointer, parameters.console_handle, &image_information);
             // SAFETY: a PEB recém-criada no processo corrente.
             unsafe { Peb::at(peb) }.process_parameters.set(block);
             let teb = peb_teb::create_teb(&TebDescription { process_id, thread_id, peb, stack_base, stack_limit, deallocation_stack, current_locale: crate::ntos::ps::locale::thread_locale_of(process_pointer) })?;
