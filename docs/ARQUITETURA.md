@@ -2748,8 +2748,11 @@ patch, o QEMU compromete a RAM toda ao subir: um convidado de 8 GB cobra
 8,2 GB do commit do host desde o primeiro segundo, embora o boot até o
 LogonUI toque uns 500 MB. No mesmo boot do teste `logonui` com 8 GB, os
 bytes privados do QEMU chegam a 8508 MB sem o patch e a 777 MB com ele, e
-o LogonUI sobe no mesmo tempo (31,7 s e 31,8 s). Três caminhos comprometem
-a RAM. O WHvMapGpaRange aceita uma faixa só reservada, e o acesso do
+o LogonUI sobe no mesmo tempo (31,7 s e 31,8 s). No `test-all --jobs 2`
+(66 testes passando, convidados de 8 GB), os dois QEMUs somaram no máximo
+3,6 GB de bytes privados (1,9 GB em média), contra 17,0 GB sem o patch, e o
+limite de commit do host não mudou: o arquivo de paginação não cresceu.
+Três caminhos comprometem a RAM. O WHvMapGpaRange aceita uma faixa só reservada, e o acesso do
 convidado a uma página sem commit volta do WHvRunVirtualProcessor como
 WHvRunVpExitReasonMemoryAccess, com o GPA mapeado (GpaUnmapped = 0) e a
 instrução por executar: o acelerador compromete o pedaço e roda a
