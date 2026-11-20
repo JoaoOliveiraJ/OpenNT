@@ -872,6 +872,16 @@ const USER_LOGON_PROGRAMS: &[&str] = &[
     "oleaccrc.dll",
     "SndVolSSO.dll",
     "MMDevAPI.dll",
+    // A área de notificação: o SysTray do stobject.dll (a CLSID_SysTray que
+    // o passo SSO1 da bandeja cria, explorer 0x2ad8c), com o wmiclnt.dll que
+    // ele importa e o batmeter.dll (carga atrasada do Power_CheckEnable,
+    // stobject 0x4e1a). O CShellServiceObjectMgr::LoadObjects dele (0x2740)
+    // cria as SSOs de `Explorer\ShellServiceObjects`
+    // (`logon_screen::software_keys`), como o ícone de volume do
+    // SndVolSSO.dll acima.
+    "stobject.dll",
+    "wmiclnt.dll",
+    "batmeter.dll",
 ];
 
 /// Os programas do logon do usuário que ficam em `\Windows`, não em

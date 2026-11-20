@@ -233,6 +233,19 @@ pub fn software_keys() -> Vec<HostKey> {
                 servers.insert(class.to_ascii_lowercase());
             }
         }
+        // Os objetos de serviço do shell de início automático: o
+        // CShellServiceObjectMgr::LoadObjects do stobject.dll (0x2740) abre
+        // `Explorer\ShellServiceObjects` da HKLM e cria cada CLSID com o
+        // valor AutoStart, como o ícone de volume do SndVolSSO.dll; sem a
+        // chave a área de notificação fica sem ícones de sistema. Só os das
+        // classes copiadas acima (a DLL no volume); os valores são o
+        // AutoStart vazio e, em alguns, o nome padrão.
+        let service_objects = "Microsoft\\Windows\\CurrentVersion\\Explorer\\ShellServiceObjects";
+        for class in registry::list(registry::LOCAL_MACHINE, &format!("SOFTWARE\\{service_objects}")) {
+            if servers.contains(&class.to_ascii_lowercase()) {
+                registry::copy(registry::LOCAL_MACHINE, &format!("SOFTWARE\\{service_objects}\\{class}"), &format!("{service_objects}\\{class}"), false, &mut keys);
+            }
+        }
         // As interfaces cujo proxy (`ProxyStubClsid32`) é uma dessas classes,
         // menos as que o oleaut32.dll empacota pela biblioteca de tipos
         // (PSOAInterface e PSDispatch), que pedem o `Classes\TypeLib` delas.
