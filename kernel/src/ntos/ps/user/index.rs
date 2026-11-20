@@ -147,7 +147,7 @@ static DENIAL_LINES: SpinLock<alloc::collections::BTreeMap<(u64, alloc::string::
 /// O sufixo ` negado: ...` de uma recusa de acesso (STATUS_ACCESS_DENIED ou
 /// STATUS_PRIVILEGE_NOT_HELD) com a checagem que recusou: as 4 primeiras de
 /// cada (pid, serviço, motivo, tipo), depois uma a cada 64.
-fn denial_detail(name: &str, result: u32, denial: Option<state::Denial>) -> alloc::string::String {
+fn denial_detail(name: &str, arguments: &[u64; 4], result: u32, denial: Option<state::Denial>) -> alloc::string::String {
     let Some(denial) = denial.filter(|_| matches!(result, 0xC000_0022 | 0xC000_0061)) else { return alloc::string::String::new() };
     let key = (process::get_current_process_id(), alloc::string::String::from(name), denial.reason, denial.type_name.clone());
     let count = {
@@ -160,14 +160,18 @@ fn denial_detail(name: &str, result: u32, denial: Option<state::Denial>) -> allo
         return alloc::string::String::new();
     }
     let missing = denial.desired & !denial.granted;
+    // O nome do OBJECT_ATTRIBUTES de uma abertura ou criação por nome (a
+    // chave do NtOpenKeyEx, o evento do NtOpenEvent...).
+    let object = traced_object_name(name, arguments).map_or_else(alloc::string::String::new, |path| alloc::format!(" objeto=\"{path}\""));
     alloc::format!(
-        " negado: {} tipo={} pedido={:#x} concedido={:#x} falta={:#x} imagem={}",
+        " negado: {} tipo={} pedido={:#x} concedido={:#x} falta={:#x} imagem={}{}",
         denial.reason,
         if denial.type_name.is_empty() { "-" } else { &denial.type_name },
         denial.desired,
         denial.granted,
         missing,
-        super::crash_report::current_image_name()
+        super::crash_report::current_image_name(),
+        object
     )
 }
 
@@ -208,7 +212,7 @@ pub fn handle_service(name: Option<&str>, arguments: [u64; 4], rip: u64, user_rs
         if let Some(code) = control_code {
             detail = alloc::format!(" codigo {code:#x}");
         }
-        detail.push_str(&denial_detail(name, result, denial));
+        detail.push_str(&denial_detail(name, &arguments, result, denial));
         crate::debug_print!("[usermode] {}:{} {} FALHOU com {:#x} (rip {:#x}, chamador {}){}", crate::ntos::ps::process::get_current_process_id(), crate::ntos::ps::process::get_current_thread_id(), name, result, rip, stub_caller(), detail);
     }
     Ok(result)
