@@ -262,7 +262,7 @@ No `cargo xtask debug`: `--vm-snapshots` (os discos em overlays qcow2 em
 arquivo) e `--replay=ARQ [--gdb-port=N]` (a reprodução, com o gdbstub do
 QEMU no lugar do depurador do kernel).
 Opções de máquina: `--accel=tcg|whpx`,
-`--memory-mb=N` (padrão 4096), `--smp=N` (padrão 4), `--ata-fault=read` (o
+`--memory-mb=N` (padrão 8192), `--smp=N` (padrão 4), `--ata-fault=read` (o
 volume NTFS de dados atrás do filtro blkdebug do QEMU, que devolve um erro de
 E/S, uma vez, a uma leitura do kernel; o driver ATA manda o comando de novo e
 imprime `ATA_RETRY_OK`). Em `--keys`, `\n` digita

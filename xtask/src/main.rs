@@ -50,7 +50,7 @@
 //! carga da imagem de boot (`build.rs`), e o `--initial-process=smss` também troca o volume
 //! NTFS; o `--conta-de-teste`, só a hive SYSTEM dele.
 //! Opções de máquina: `--accel=auto|tcg|whpx` (o test-boot usa `auto`, o WHPX quando a máquina
-//! o tem; o `run` e o `debug` usam o TCG), `--memory-mb=N`, `--smp=N`, `--kd-port=N`,
+//! o tem; o `run` e o `debug` usam o TCG), `--memory-mb=N` (padrão 8192), `--smp=N`, `--kd-port=N`,
 //! `--monitor-port=N` (o monitor HMP do QEMU num socket local, no `debug`)
 //! (a porta TCP da COM2; `run` usa 1234 por padrão).
 //! Em `--keys`, `\n` digita Enter. O `--send` digita as teclas (na sintaxe do `--keys`, com
@@ -156,7 +156,7 @@ opcoes de build:   --release --build-dir=DIR --user-program=shell
                    --dismiss ou --mouse; os testes que param na tela de bloqueio ficam sem ele,
                    sem o cmd.exe e o net.exe do primeiro boot)
 opcoes de maquina: --accel=auto|tcg|whpx (test-boot: auto = whpx quando a maquina tem; run e debug: tcg)
-                   --memory-mb=N --smp=N --kd-port=N --monitor-port=N
+                   --memory-mb=N (padrao 8192) --smp=N --kd-port=N --monitor-port=N
                    --ata-fault=read (o volume de dados atras do blkdebug do QEMU: uma leitura do
                    convidado volta uma vez com erro de E/S; ATA_RETRY_OK quando o driver ATA a
                    manda de novo e ela conclui)
@@ -288,7 +288,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
         // gráfico exige.
         machine: MachineOptions {
             accelerator: if command == "test-boot" { "auto" } else { "tcg" }.into(),
-            memory_mb: 4096,
+            memory_mb: 8192,
             smp: 4,
             kd_port: None,
             usb: false,
