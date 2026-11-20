@@ -164,7 +164,8 @@ test-boot:         --keys=TEXTO (\\n = Enter) --expect=TEXTO (repetivel)
                    --manual-crash (no fim, com o QEMU vivo e sem STOP, a parada manual pelo
                    teclado: Ctrl direito + Scroll Lock duas vezes, 0xE2; os dados secundarios do
                    bugcheck, como o WdLog do dxgkrnl, saem na serial e o resumo da parada no fim)
-                   no --keys, {combo} vai cru ao sendkey: {ctrl_r-scroll_lock-scroll_lock}
+                   no --keys, {combo} vai ao sendkey com nomes de tecla do QEMU, conferidos:
+                   {ctrl_r-scroll_lock-scroll_lock}; a tecla do Windows e {meta_l}
                    --send=MARCADOR[+MS]:TECLAS (repetivel: MS ms depois do MARCADOR na serial, as
                    teclas pelo monitor HMP, na sintaxe do --keys; {spc} e a barra de espaco e
                    {clique} o clique do botao esquerdo do mouse)
@@ -359,7 +360,11 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
                 parsed.machine.memory_mb = required()?.parse().map_err(|_| "--memory-mb invalido")?
             }
             "--smp" => parsed.machine.smp = required()?.parse().map_err(|_| "--smp invalido")?,
-            "--keys" => parsed.keys = Some(required()?.replace("\\n", "\n")),
+            "--keys" => {
+                let keys = required()?.replace("\\n", "\n");
+                qemu::check_keys(&keys)?;
+                parsed.keys = Some(keys);
+            }
             "--expect" => parsed.expect.push(required()?),
             "--send" => parsed.inputs.push(qemu::InputSend::keys(&required()?)?),
             "--mouse" => parsed.inputs.push(qemu::InputSend::mouse(&required()?)?),
@@ -725,9 +730,11 @@ mod tests {
                 InputSend { after: "X".into(), delay: Duration::from_millis(5), action: InputAction::Keys("ab{ret}".into()) },
             ]
         );
-        for bad in ["--send=X", "--send=:a", "--send=X:", "--send=X+y:a", "--send=X:{}", "--send=X:\u{e9}", "--mouse=X:0,0", "--mouse=X:1", "--mouse=X:a,b", "--mouse=X:2000,1", "--dismiss=X"] {
+        for bad in ["--send=X", "--send=:a", "--send=X:", "--send=X+y:a", "--send=X:{}", "--send=X:\u{e9}", "--mouse=X:0,0", "--mouse=X:1", "--mouse=X:a,b", "--mouse=X:2000,1", "--dismiss=X", "--send=X:{win}", "--dismiss=X:{ctrl-altgr}", "--send=X:{ctrl-clique}", "--keys={win}"] {
             assert!(parse_words(&["test-boot", bad]).is_err(), "{bad}");
         }
         assert!(parse_words(&["run", "--mouse=X:1,1"]).is_err());
+        // Os nomes do QEMU passam, também nos combos e no --keys.
+        assert!(parse_words(&["test-boot", "--send=X:{meta_l}", "--send=X:{ctrl_r-scroll_lock-scroll_lock}{clique}", "--keys=run hello\nps\n{kp_enter}"]).is_ok());
     }
 }

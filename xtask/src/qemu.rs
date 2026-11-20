@@ -1123,9 +1123,30 @@ fn connect_monitor(port: u16, deadline: Instant) -> Result<TcpStream, String> {
     }
 }
 
+/// Os nomes de tecla (o QKeyCode) que o `sendkey` do HMP do QEMU 11 aceita
+/// num `{combo}`: o monitor responde `invalid parameter` a qualquer outro, e
+/// essa resposta é descartada ([`connect_monitor`]), então um nome errado
+/// (`{win}`; a tecla do Windows é `meta_l`) não faria nada e o teste só
+/// esgotaria o prazo. Conferidos um a um no `sendkey` do QEMU desta máquina
+/// (`altgr` não existe nele: o AltGr é o `alt_r`).
+const QEMU_KEYS: &[&str] = &[
+    "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z", "0", "1",
+    "2", "3", "4", "5", "6", "7", "8", "9", "shift", "shift_r", "alt", "alt_r", "ctrl", "ctrl_r", "meta_l", "meta_r", "menu", "compose", "esc",
+    "ret", "spc", "tab", "backspace", "delete", "insert", "home", "end", "pgup", "pgdn", "up", "down", "left", "right", "f1", "f2", "f3", "f4",
+    "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12", "print", "sysrq", "scroll_lock", "pause", "caps_lock", "num_lock", "minus", "equal",
+    "bracket_left", "bracket_right", "semicolon", "apostrophe", "grave_accent", "backslash", "comma", "dot", "slash", "less", "asterisk",
+    "kp_0", "kp_1", "kp_2", "kp_3", "kp_4", "kp_5", "kp_6", "kp_7", "kp_8", "kp_9", "kp_enter", "kp_add", "kp_subtract", "kp_multiply",
+    "kp_divide", "kp_decimal",
+];
+
+/// Confere as teclas de `text` na sintaxe do `--keys` ([`key_names`]).
+pub fn check_keys(text: &str) -> Result<(), String> {
+    key_names(text).map(|_| ())
+}
+
 /// Os nomes do `sendkey` de `text`: cada caractere pelo [`key_name`];
-/// `{combo}` vai cru (nomes de tecla do QEMU separados por `-`,
-/// pressionados em ordem e soltos ao contrário, como
+/// `{combo}` vai cru (nomes de tecla do QEMU, [`QEMU_KEYS`], separados por
+/// `-`, pressionados em ordem e soltos ao contrário, como
 /// `{ctrl_r-scroll_lock-scroll_lock}` ou `{spc}`). `{clique}` ([`CLICK`]) é o
 /// clique do botão esquerdo do mouse onde o ponteiro estiver.
 fn key_names(text: &str) -> Result<Vec<String>, String> {
@@ -1136,6 +1157,11 @@ fn key_names(text: &str) -> Result<Vec<String>, String> {
             let combo: String = characters.by_ref().take_while(|&next| next != '}').collect();
             if combo.is_empty() || !combo.chars().all(|next| next.is_ascii_alphanumeric() || next == '_' || next == '-') {
                 return Err(format!("combo de teclas invalido: {{{combo}}}"));
+            }
+            if combo != CLICK {
+                if let Some(part) = combo.split('-').find(|part| !QEMU_KEYS.contains(part)) {
+                    return Err(format!("tecla desconhecida do QEMU: {part} em {{{combo}}} (a tecla do Windows e meta_l)"));
+                }
             }
             combo
         } else {
