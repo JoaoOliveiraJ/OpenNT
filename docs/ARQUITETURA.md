@@ -2144,8 +2144,14 @@ A árvore de dispositivos do NT mora em `ntos/io/pnp/`:
   (PiCMCaptureObjectInputData) e o resultado gravado no buffer de saída
   ({tamanho, status, ...}): GetDeviceStatus (DN_* e problema pelo nó),
   ValidateDeviceInstance (CM_Locate_DevNode), GetDeviceDepth e
-  GetRelatedDeviceInstance sobre a árvore de `devnode.rs`; os demais
-  códigos conhecidos ainda respondem STATUS_NOT_IMPLEMENTED.
+  GetRelatedDeviceInstance sobre a árvore de `devnode.rs`;
+  GetObjectProperty (DEVPROPKEY) e GetRegistryProperty (CM_DRP_*) sobre
+  `io/device_property.rs`: na segunda, os valores da chave da instância
+  (o texto indireto do INF resolvido), as propriedades do PnP pelo devnode,
+  EnumeratorName pelo nome, Class pela classe de instalação do ClassGUID e
+  as da classe pelo GUID (chave da classe e subchave Properties), com as
+  recusas do _CmGetDeviceRegPropWorker; os demais códigos conhecidos ainda
+  respondem STATUS_NOT_IMPLEMENTED.
 - `cm_notify.rs`: o `\CMNotify` (PiUEventDispatch e PiUEventHandleIoctl),
   por onde o CM_Register_Notification do cfgmgr32 registra o interesse em
   interfaces e dispositivos. O registro (0x470800) cria um nome WNF

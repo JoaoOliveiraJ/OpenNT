@@ -710,10 +710,70 @@ fn get_object_property(buffers: &Buffers) -> (u32, u64) {
     return_buffer(buffers, status, required, property_type, &data, input.result_size)
 }
 
+/// O pedido de propriedade de registro do cfgmgr32 depois do
+/// PiCMCaptureRegistryPropertyInputData (19041 0x68dd54; 64 bits: 0x38
+/// bytes, Size em +0): +4 os flags, +8 o tipo do objeto, +0x10/+0x18 o
+/// nome, +0x1C a propriedade CM_DRP_*, +0x20 e +0x28/+0x30 (um segundo
+/// texto) que a leitura exige zerados, e +0x34 o tamanho do resultado
+/// esperado.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RegistryPropertyInput {
+    pub flags: u32,
+    pub object_type: u32,
+    pub name: Option<String>,
+    pub property: u32,
+    pub reserved: u32,
+    pub second: Option<String>,
+    pub result_size: u32,
+}
+
+pub fn capture_registry_property_input(buffers: &Buffers) -> Result<RegistryPropertyInput, u32> {
+    let (bytes, user) = capture_fixed(buffers, 0x38)?;
+    let pointer = |offset: usize| u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap_or([0; 8]));
+    let name = capture_name(pointer(0x10), u32_at(&bytes, 0x18), user)?;
+    let second = capture_name(pointer(0x28), u32_at(&bytes, 0x30), user)?;
+    Ok(RegistryPropertyInput { flags: u32_at(&bytes, 4), object_type: u32_at(&bytes, 8), name, property: u32_at(&bytes, 0x1C), reserved: u32_at(&bytes, 0x20), second, result_size: u32_at(&bytes, 0x34) })
+}
+
+/// PiCMGetRegistryProperty (0x206; 19041 0x68da00): o nome é obrigatório e
+/// os flags, +0x20 e o segundo texto têm de vir zerados, com saída de ao
+/// menos 0x14 bytes; a propriedade fora de 1..=0x25 (o
+/// PiCMConvertRegistryProperty) e o tipo de objeto que não é dispositivo (1)
+/// nem classe de instalação (2) também são STATUS_INVALID_PARAMETER, todos
+/// no resultado (o tipo errado com Required = o espaço do buffer, que o
+/// 19041 já guardou ali). A leitura é a do `io/device_property.rs`
+/// (_CmGetDeviceRegProp e _CmGetInstallerClassRegProp): Required = o
+/// tamanho e Extra = o tipo REG_*, com os dados só no sucesso; buffer curto
+/// é STATUS_BUFFER_TOO_SMALL com o tamanho e o tipo.
+fn get_registry_property(buffers: &Buffers) -> (u32, u64) {
+    use crate::ntos::io::device_property::{registry_property, RegistryObject};
+    let input = match capture_registry_property_input(buffers) {
+        Ok(input) => input,
+        Err(status) => return (status, 0),
+    };
+    let valid = input.name.is_some() && input.flags == 0 && input.reserved == 0 && input.second.is_none() && buffers.output != 0 && buffers.output_length >= 0x14;
+    let name = input.name.as_deref().unwrap_or("");
+    let room = buffers.output_length.saturating_sub(0x14);
+    let invalid = |required: u32| (STATUS_INVALID_PARAMETER, required, 0, Vec::new());
+    let (status, required, value_type, data) = match input.object_type {
+        _ if !valid || !(1..=0x25).contains(&input.property) => invalid(0),
+        1 | 2 => {
+            let object = if input.object_type == 1 { RegistryObject::Device(name) } else { RegistryObject::InstallerClass(name) };
+            match registry_property(object, input.property, room) {
+                Ok((value_type, bytes)) => (0, bytes.len() as u32, value_type, bytes),
+                Err(refusal) => (refusal.status, refusal.required, refusal.value_type, Vec::new()),
+            }
+        }
+        _ => invalid(room),
+    };
+    return_buffer(buffers, status, required, value_type, &data, input.result_size)
+}
+
 /// PiCMHandleIoctl: NTSTATUS e o Information.
 pub fn handle_ioctl(code: u32, buffers: &Buffers) -> (u32, u64) {
     match code {
         code::GET_OBJECT_PROPERTY => get_object_property(buffers),
+        code::GET_REGISTRY_PROPERTY => get_registry_property(buffers),
         code::GET_DEVICE_STATUS => get_device_status(buffers),
         code::VALIDATE_DEVICE_INSTANCE => validate_device_instance(buffers),
         code::GET_DEVICE_DEPTH => get_device_depth(buffers),

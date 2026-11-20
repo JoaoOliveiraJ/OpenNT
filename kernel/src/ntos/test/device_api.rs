@@ -20,6 +20,7 @@ const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 const STATUS_NO_SUCH_DEVICE: u32 = 0xC000_000E;
 const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
 const STATUS_OBJECT_NAME_INVALID: u32 = 0xC000_0033;
+const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
 
 fn status(value: Option<u64>) -> u32 {
     value.map_or(u32::MAX, |value| value as u32)
@@ -236,6 +237,94 @@ pub fn run(assert: Assert) {
             && no_node == [0x14, STATUS_NO_SUCH_DEVICE, 0, 0]
             && bad_flags == [0x14, STATUS_INVALID_PARAMETER, 0, 0],
         "deviceapi: GetObjectProperty devolve a propriedade do no (tamanho e tipo), BUFFER_TOO_SMALL, NOT_FOUND, NO_SUCH_DEVICE e flags recusados no resultado",
+    );
+    // PiCMGetRegistryProperty (0x206): o pedido de 0x38 bytes com a
+    // propriedade CM_DRP_*; os valores da chave da instância (o texto
+    // indireto do INF resolvido), EnumeratorName pelo nome, Class pela
+    // classe de instalação do ClassGUID, RemovalPolicy do devnode, a classe
+    // pelo GUID (tipo 2, Properties) e as recusas no resultado.
+    use crate::ntos::cm::{registry, seed::REG_DWORD};
+    use crate::ntos::io::pnp::install;
+    let class_guid = "{0E0E0E0E-0000-4000-8000-0000CA0A0001}";
+    let instance_key = alloc::format!("{}\\Enum\\Root\\OPENNT_CMAPI\\0000", install::CONTROL_SET);
+    let class_key = alloc::format!("{}\\Control\\Class\\{}", install::CONTROL_SET, class_guid);
+    let _ = install::write_text(&instance_key, "DeviceDesc", "@oem9.inf,%cmapi.desc%;Dispositivo CMApi");
+    let _ = install::write_dword(&instance_key, "ConfigFlags", 0x20);
+    let _ = install::write_value(&instance_key, "Capabilities", REG_DWORD, alloc::vec![1, 0]);
+    let _ = install::write_text(&instance_key, "ClassGUID", class_guid);
+    let _ = install::write_text(&class_key, "Class", "OpenNTCmApi");
+    let _ = install::write_dword(&alloc::format!("{class_key}\\Properties"), "DeviceType", 0x22);
+    let registry_input = |object_type: u32, name: &str, property: u32, flags: u32| {
+        guest::write_bytes(input, &[0u8; 0x200]);
+        guest::write32(input, 0x38);
+        guest::write32(input + 4, flags);
+        guest::write32(input + 8, object_type);
+        let units: Vec<u16> = name.encode_utf16().chain(core::iter::once(0)).collect();
+        guest::write_bytes(input + 0x80, &units.iter().flat_map(|unit| unit.to_le_bytes()).collect::<Vec<u8>>());
+        guest::write64(input + 0x10, input + 0x80);
+        guest::write32(input + 0x18, units.len() as u32 * 2);
+        guest::write32(input + 0x1C, property);
+        guest::write32(input + 0x34, 0x14);
+    };
+    let text_at = |offset: u64, bytes: usize| -> String {
+        let units: Vec<u16> = (0..bytes / 2).map(|index| guest::read16(result + offset + index as u64 * 2)).take_while(|&unit| unit != 0).collect();
+        String::from_utf16_lossy(&units)
+    };
+    let device = "Root\\OPENNT_CMAPI\\0000";
+    let mut answers: Vec<(u32, u64, Vec<u32>)> = Vec::new();
+    let mut ask = |object_type: u32, name: &str, property: u32, flags: u32, output_length: u32, count: usize| {
+        registry_input(object_type, name, property, flags);
+        let (returned, information) = control(cm_api::code::GET_REGISTRY_PROPERTY, 0x38, output_length);
+        answers.push((returned, information, words(count)));
+    };
+    ask(1, device, 0x01, 0, 0x100, 4);
+    let description = text_at(0x10, 0x24);
+    ask(1, device, 0x01, 0, 0x14, 4);
+    ask(1, device, 0x0B, 0, 0x100, 5);
+    ask(1, device, 0x10, 0, 0x100, 4);
+    ask(1, device, 0x17, 0, 0x100, 4);
+    let enumerator = text_at(0x10, 0x0A);
+    ask(1, device, 0x08, 0, 0x100, 4);
+    let class_name = text_at(0x10, 0x18);
+    ask(1, device, 0x20, 0, 0x100, 5);
+    ask(1, device, 0x24, 0, 0x100, 4);
+    ask(1, device, 0x06, 0, 0x100, 4);
+    ask(1, device, 0x26, 0, 0x100, 4);
+    ask(3, device, 0x01, 0, 0x100, 4);
+    ask(1, device, 0x01, 1, 0x100, 4);
+    ask(1, "OPENNT\\CMAPI_CHILD\\1", 0x01, 0, 0x100, 4);
+    ask(2, class_guid, 0x1A, 0, 0x100, 5);
+    ask(2, class_guid, 0x01, 0, 0x100, 4);
+    for key in [alloc::format!("{class_key}\\Properties"), class_key.clone(), instance_key.clone()] {
+        if let Ok(opened) = registry::open(&key) {
+            registry::delete_key(opened);
+            registry::close_handle(opened);
+        }
+    }
+    let expected: [(u32, u64, &[u32]); 15] = [
+        (0, 0x38, &[0x14, 0, 0x24, 1]),
+        (0, 0x14, &[0x14, 0xC000_0023, 0x24, 1]),
+        (0, 0x18, &[0x14, 0, 4, 4, 0x20]),
+        (0, 0x14, &[0x14, 0xC000_0225, 0, 0]),
+        (0, 0x1E, &[0x14, 0, 0x0A, 1]),
+        (0, 0x2C, &[0x14, 0, 0x18, 1]),
+        (0, 0x18, &[0x14, 0, 4, 4, 1]),
+        (0, 0x14, &[0x14, 0xC000_0225, 0, 0]),
+        (0, 0x14, &[0x14, 0xC000_0230, 0, 0]),
+        (0, 0x14, &[0x14, STATUS_INVALID_PARAMETER, 0, 0]),
+        (0, 0x14, &[0x14, STATUS_INVALID_PARAMETER, 0xEC, 0]),
+        (0, 0x14, &[0x14, STATUS_INVALID_PARAMETER, 0, 0]),
+        (0, 0x14, &[0x14, STATUS_OBJECT_NAME_NOT_FOUND, 0, 0]),
+        (0, 0x18, &[0x14, 0, 4, 4, 0x22]),
+        (0, 0x14, &[0x14, 0xC000_0230, 0, 0]),
+    ];
+    let mismatch = answers.iter().zip(expected.iter()).position(|(answer, wanted)| answer.0 != wanted.0 || answer.1 != wanted.1 || answer.2.as_slice() != wanted.2);
+    if let Some(index) = mismatch {
+        crate::debug_print!("[deviceapi] GetRegistryProperty caso {}: {:x?}", index, answers[index]);
+    }
+    assert(
+        answers.len() == expected.len() && mismatch.is_none() && description == "Dispositivo CMApi" && enumerator == "Root" && class_name == "OpenNTCmApi",
+        "deviceapi: GetRegistryProperty devolve os valores da instancia (texto indireto resolvido, DWORD), EnumeratorName, Class pela classe do ClassGUID, RemovalPolicy do devnode e a classe pelo GUID; DWORD curto e LocationPaths NOT_FOUND, propriedade nao lida PROPSET_NOT_FOUND, fora da faixa, tipo e flags INVALID_PARAMETER, instancia sem chave OBJECT_NAME_NOT_FOUND",
     );
     devnode::remove(fake_child);
     devnode::remove(fake_pdo);

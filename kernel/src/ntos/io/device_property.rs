@@ -418,3 +418,207 @@ pub fn query_interface_property_data(link: u64, key: &Devpropkey, lcid: u32, _fl
     }
     read_property(&read_key(Owner::Interface(name), key, lcid), size, data, required, type_output)
 }
+
+/// O objeto de um PiCMGetRegistryProperty (19041 0x68da00): um dispositivo
+/// pelo caminho de instância (tipo 1, o _CmGetDeviceRegProp) ou uma classe
+/// de instalação pelo GUID (tipo 2, o _CmGetInstallerClassRegProp).
+pub enum RegistryObject<'a> {
+    Device(&'a str),
+    InstallerClass(&'a str),
+}
+
+/// Recusa de uma propriedade CM_DRP_*: o NTSTATUS e, no
+/// STATUS_BUFFER_TOO_SMALL, o tamanho e o tipo REG_* da propriedade.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RegistryPropertyError {
+    pub status: u32,
+    pub required: u32,
+    pub value_type: u32,
+}
+
+const REGISTRY_STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+const REGISTRY_STATUS_NO_SUCH_DEVICE: u32 = 0xC000_000E;
+const REGISTRY_STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
+const REGISTRY_STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
+const REGISTRY_STATUS_INTERNAL_ERROR: u32 = 0xC000_00E5;
+const REGISTRY_STATUS_NOT_FOUND: u32 = 0xC000_0225;
+const REGISTRY_STATUS_PROPSET_NOT_FOUND: u32 = 0xC000_0230;
+
+fn registry_refusal(status: u32) -> RegistryPropertyError {
+    RegistryPropertyError { status, required: 0, value_type: 0 }
+}
+
+/// A propriedade CM_DRP_* (já validada em 1..=0x25 pelo
+/// PiCMConvertRegistryProperty) de um dispositivo ou de uma classe de
+/// instalação, com `room` bytes no buffer de quem chama: `Ok((tipo REG_*,
+/// dados))` ou a recusa.
+pub fn registry_property(object: RegistryObject, property: u32, room: u32) -> Result<(u32, alloc::vec::Vec<u8>), RegistryPropertyError> {
+    match object {
+        RegistryObject::Device(instance) => device_registry_property(instance, property, room),
+        RegistryObject::InstallerClass(guid) => class_registry_property(guid, property, room),
+    }
+}
+
+/// O tamanho contra o buffer: maior que `room` é STATUS_BUFFER_TOO_SMALL com
+/// o tamanho e o tipo; nos valores do registro, `room` zero também.
+fn fit_registry_property(value_type: u32, data: alloc::vec::Vec<u8>, room: u32, zero_room_is_short: bool) -> Result<(u32, alloc::vec::Vec<u8>), RegistryPropertyError> {
+    if data.len() > room as usize || (zero_room_is_short && room == 0) {
+        return Err(RegistryPropertyError { status: REGISTRY_STATUS_BUFFER_TOO_SMALL, required: data.len() as u32, value_type });
+    }
+    Ok((value_type, data))
+}
+
+/// _PnpRegQueryValueIndirect (19041 0x67dd80) e as conferências dos
+/// workers: o texto "@inf,%chave%;texto" volta como o texto depois do ';'
+/// (o _PnpParseIndirectInfString); REG_SZ ou REG_MULTI_SZ com menos de 2
+/// bytes e REG_DWORD sem 4 bytes são STATUS_NOT_FOUND, como o valor
+/// ausente.
+fn checked_registry_value(key: &str, name: &str) -> Result<(u32, alloc::vec::Vec<u8>), RegistryPropertyError> {
+    use crate::ntos::cm::seed::{REG_DWORD, REG_EXPAND_SZ, REG_MULTI_SZ, REG_SZ};
+    let Some(value) = crate::ntos::cm::registry::read_value_by_path(key, name) else { return Err(registry_refusal(REGISTRY_STATUS_NOT_FOUND)) };
+    let mut data = value.data;
+    if matches!(value.value_type, REG_SZ | REG_EXPAND_SZ) {
+        let units: alloc::vec::Vec<u16> = data.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).take_while(|&unit| unit != 0).collect();
+        let text = String::from_utf16_lossy(&units);
+        if let Some((_, display)) = text.strip_prefix('@').and_then(|indirect| indirect.rsplit_once(';')) {
+            data = crate::ntos::cm::registry::encode_wide(display);
+        }
+    }
+    let short_text = data.len() < 2 && matches!(value.value_type, REG_SZ | REG_MULTI_SZ);
+    if short_text || (value.value_type == REG_DWORD && data.len() != 4) {
+        return Err(registry_refusal(REGISTRY_STATUS_NOT_FOUND));
+    }
+    Ok((value.value_type, data))
+}
+
+/// O valor da chave da instância de cada CM_DRP_* lido do registro
+/// (_MapCmDevicePropertyToRegValue, 19041 0x32e8dc).
+fn device_registry_value_name(property: u32) -> Option<&'static str> {
+    Some(match property {
+        0x01 => "DeviceDesc",
+        0x02 => "HardwareID",
+        0x03 => "CompatibleIDs",
+        0x05 => "Service",
+        0x08 => "Class",
+        0x09 => "ClassGUID",
+        0x0A => "Driver",
+        0x0B => "ConfigFlags",
+        0x0C => "Mfg",
+        0x0D => "FriendlyName",
+        0x0E => "LocationInformation",
+        0x10 => "Capabilities",
+        0x11 => "UINumber",
+        0x12 => "UpperFilters",
+        0x13 => "LowerFilters",
+        0x18 => "Security",
+        0x1A => "DeviceType",
+        0x1B => "Exclusive",
+        0x1C => "DeviceCharacteristics",
+        0x1D => "Address",
+        0x1E => "UINumberDescFormat",
+        0x22 => "RemovalPolicy",
+        0x25 => "ContainerID",
+        _ => return None,
+    })
+}
+
+/// _CmGetDeviceRegPropWorker (19041 0x6ba3cc), na ordem dele: a propriedade
+/// fora do _CmDevicePropertyRead é STATUS_PROPSET_NOT_FOUND; a chave
+/// `Enum\<instância>` tem de existir (senão o status da abertura,
+/// STATUS_OBJECT_NAME_NOT_FOUND); EnumeratorName (0x17) é o texto antes da
+/// primeira '\' do nome (sem ela, STATUS_INVALID_PARAMETER); Class (8) é o
+/// valor Class da classe de instalação do ClassGUID (ClassGUID maior que
+/// 0x4E bytes é STATUS_INTERNAL_ERROR); as propriedades do PnP
+/// (_MapCmDevicePropertyToNtProperty: PDO, BusTypeGuid, LegacyBusType,
+/// BusNumber, PowerData, RemovalPolicy e o padrão do hardware,
+/// InstallState) vêm do devnode, com o tipo do _MapCmDevicePropertyToRegType
+/// (sem devnode, STATUS_NO_SUCH_DEVICE; ausente, STATUS_NOT_FOUND); as demais
+/// são valores da chave da instância. LocationPaths (0x24) sai da interface
+/// de localização dos drivers da pilha, que nenhum driver do OpenNT
+/// publica: STATUS_NOT_FOUND, como a pilha sem ela. PowerData (0x1F) também:
+/// o devnode do OpenNT não guarda o CM_POWER_DATA.
+fn device_registry_property(instance: &str, property: u32, room: u32) -> Result<(u32, alloc::vec::Vec<u8>), RegistryPropertyError> {
+    use crate::ntos::cm::seed::{REG_BINARY, REG_DWORD, REG_SZ};
+    use crate::ntos::io::pnp::{devnode, install};
+    if !matches!(property, 0x01..=0x03 | 0x05 | 0x08..=0x18 | 0x1A..=0x25) {
+        return Err(registry_refusal(REGISTRY_STATUS_PROPSET_NOT_FOUND));
+    }
+    let key = format!("{}\\Enum\\{}", install::CONTROL_SET, instance);
+    if crate::ntos::cm::registry::node_by_path(&key).is_none() {
+        return Err(registry_refusal(REGISTRY_STATUS_OBJECT_NAME_NOT_FOUND));
+    }
+    // DEVICE_REGISTRY_PROPERTY do devnode e o tipo REG_* de cada propriedade
+    // do PnP.
+    let pnp = match property {
+        0x0F => Some((Some(0x0B), REG_SZ)),
+        0x14 => Some((Some(0x0C), REG_BINARY)),
+        0x15 => Some((Some(0x0D), REG_DWORD)),
+        0x16 => Some((Some(0x0E), REG_DWORD)),
+        0x1F => Some((None, REG_BINARY)),
+        0x20 | 0x21 => Some((Some(0x13), REG_DWORD)),
+        0x23 => Some((Some(0x12), REG_DWORD)),
+        _ => None,
+    };
+    match property {
+        0x17 => {
+            let Some((enumerator, _)) = instance.split_once('\\') else { return Err(registry_refusal(REGISTRY_STATUS_INVALID_PARAMETER)) };
+            fit_registry_property(REG_SZ, crate::ntos::cm::registry::encode_wide(enumerator), room, false)
+        }
+        0x08 => {
+            let guid = match device_registry_property(instance, 0x09, 0x4E) {
+                Ok((_, bytes)) => bytes,
+                Err(refusal) if refusal.status == REGISTRY_STATUS_BUFFER_TOO_SMALL => return Err(registry_refusal(REGISTRY_STATUS_INTERNAL_ERROR)),
+                Err(refusal) => return Err(registry_refusal(refusal.status)),
+            };
+            let units: alloc::vec::Vec<u16> = guid.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).take(38).take_while(|&unit| unit != 0).collect();
+            class_registry_property(&String::from_utf16_lossy(&units), 0x08, room)
+        }
+        0x24 => Err(registry_refusal(REGISTRY_STATUS_NOT_FOUND)),
+        _ => match pnp {
+            Some((source, value_type)) => {
+                let Some(node) = devnode::by_instance_path(instance).and_then(devnode::get) else { return Err(registry_refusal(REGISTRY_STATUS_NO_SUCH_DEVICE)) };
+                let Some(bytes) = source.and_then(|source| devnode_property(&node, source)) else { return Err(registry_refusal(REGISTRY_STATUS_NOT_FOUND)) };
+                fit_registry_property(value_type, bytes, room, false)
+            }
+            None => {
+                let Some(name) = device_registry_value_name(property) else { return Err(registry_refusal(REGISTRY_STATUS_PROPSET_NOT_FOUND)) };
+                let (value_type, data) = checked_registry_value(&key, name)?;
+                fit_registry_property(value_type, data, room, true)
+            }
+        },
+    }
+}
+
+/// _CmGetInstallerClassRegPropWorker (19041 0x73bccc): a propriedade fora do
+/// _CmClassPropertyRead é STATUS_PROPSET_NOT_FOUND; a chave
+/// `Control\Class\<GUID>` tem de existir; Class (8), ClassDesc (0xD) e os
+/// filtros (0x12, 0x13) são valores dela, Security (0x18), DeviceType
+/// (0x1A), Exclusive (0x1B) e DeviceCharacteristics (0x1C) da subchave
+/// Properties (ausente, STATUS_NOT_FOUND). Class acima de 0x40 bytes é
+/// STATUS_INTERNAL_ERROR.
+fn class_registry_property(guid: &str, property: u32, room: u32) -> Result<(u32, alloc::vec::Vec<u8>), RegistryPropertyError> {
+    let key = format!("{}\\Control\\Class\\{}", crate::ntos::io::pnp::install::CONTROL_SET, guid);
+    let (in_properties, name) = match property {
+        0x08 => (false, "Class"),
+        0x0D => (false, "ClassDesc"),
+        0x12 => (false, "UpperFilters"),
+        0x13 => (false, "LowerFilters"),
+        0x18 => (true, "Security"),
+        0x1A => (true, "DeviceType"),
+        0x1B => (true, "Exclusive"),
+        0x1C => (true, "DeviceCharacteristics"),
+        _ => return Err(registry_refusal(REGISTRY_STATUS_PROPSET_NOT_FOUND)),
+    };
+    if crate::ntos::cm::registry::node_by_path(&key).is_none() {
+        return Err(registry_refusal(REGISTRY_STATUS_OBJECT_NAME_NOT_FOUND));
+    }
+    let key = if in_properties { format!("{key}\\Properties") } else { key };
+    if in_properties && crate::ntos::cm::registry::node_by_path(&key).is_none() {
+        return Err(registry_refusal(REGISTRY_STATUS_NOT_FOUND));
+    }
+    let (value_type, data) = checked_registry_value(&key, name)?;
+    if property == 0x08 && data.len() > 0x40 {
+        return Err(registry_refusal(REGISTRY_STATUS_INTERNAL_ERROR));
+    }
+    fit_registry_property(value_type, data, room, true)
+}
