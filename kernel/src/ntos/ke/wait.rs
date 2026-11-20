@@ -277,15 +277,19 @@ impl DispatcherLock {
             }
             (vector, true)
         };
+        // Só os campos do bloco que o KiWaitMultiple do 19041 grava: o
+        // SpareLong e o SparePtr dos blocos embutidos são outros campos da
+        // KTHREAD na mesma memória (WaitBlockFill4..11: ContextSwitches,
+        // State/WaitIrql/WaitMode, WaitTime, ThreadCounters, XStateSave,
+        // Win32Thread no SparePtr do WaitBlock[2], Ucb/Uch), e zerá-los apagaria
+        // a W32THREAD de uma thread de usuário que espera em três objetos.
         for (index, &object) in objects.iter().enumerate() {
             let block = block_at(blocks + (index as u64) * KwaitBlock::SIZE);
             block.wait_type.set(spec.kind);
             block.block_state.set(BLOCK_ACTIVE);
             block.wait_key.set(index as u16);
-            block.spare_long.set(0);
             block.thread.set(thread);
             block.object.set(object);
-            block.spare_ptr.set(0);
             let head = &header(object).wait_list_head;
             ensure_list(head);
             insert(head, &block.wait_list_entry, spec.at_head);
