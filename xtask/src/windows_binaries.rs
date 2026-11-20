@@ -667,6 +667,19 @@ const LOGON_SCREEN_PROGRAMS: &[&str] = &[
     "NInput.dll",
     "Windows.Internal.UI.Logon.ProxyStub.dll",
     "ActXPrxy.dll",
+    // O OneCoreUAPCommonProxyStub.dll, a DLL de proxies das interfaces WinRT
+    // do OneCore (a classe PSFactoryBuffer
+    // {95E15D0A-66E6-93D9-C53C-76E6219D3341}): o
+    // ProjectedShadowManager::EnsureFallbackPolicy do Windows.UI.Xaml.dll (a
+    // ThemeShadow de um popup) registra um tratador no
+    // MaterialPropsBase::add_TransparencyPolicyChanged do
+    // twinapi.appcore.dll, que o empacota pelo RoGetAgileReference; o
+    // CStdMarshal::CreateStub procura o proxy de
+    // ITypedEventHandler<IMaterialProperties, IInspectable>
+    // ({727D1449-1A71-5A00-8746-E4A1C8CAAEE1}) e, sem a interface registrada,
+    // o XAML guarda o REGDB_E_IIDNOTREG (0x80040155) e o LogonUI termina com
+    // 0xC000027B.
+    "OneCoreUAPCommonProxyStub.dll",
     // O XAML da experiência de logon: as classes WinRT Windows.UI.Xaml.*, o
     // XAMLHostWindow, o Windows.UI.dll, o Windows.Globalization.dll e o
     // modelo de dados dos provedores de credencial (CredProvDataModel.dll),
