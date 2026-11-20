@@ -621,6 +621,38 @@ fn process_and_thread(assert: Assert) {
     assert(ran.is_some(), "acl: processo de A para o descritor do processo");
 }
 
+/// O descritor explícito de um processo, como o NtCreateUserProcess o aplica
+/// com o SecurityDescriptor do ProcessObjectAttributes (o ObAssignSecurity do
+/// PspInsertProcess 0x607d35; o DcomLaunch lança assim cada servidor COM):
+/// com a DACL `(A;;0x1fffff;;;SY)(A;;0x100000;;;WD)`, o NtOpenProcess de
+/// outro usuário recebe SYNCHRONIZE e é recusado em
+/// PROCESS_QUERY_LIMITED_INFORMATION.
+fn explicit_process_descriptor(assert: Assert) {
+    let ran = with_test_process("acl-explicito.exe", None, |target| {
+        let mut acl = alloc::vec![2u8, 0, 48, 0, 2, 0, 0, 0];
+        for (mask, owner) in [(0x1F_FFFFu32, system()), (SYNCHRONIZE, sid(1, &[0]))] {
+            acl.extend_from_slice(&[0, 0, 20, 0]);
+            acl.extend_from_slice(&mask.to_le_bytes());
+            acl.extend_from_slice(&owner);
+        }
+        let explicit = crate::ntos::se::policy_descriptor::OwnedDescriptor { control: 0x8004, owner: None, group: None, dacl: Some(acl), sacl: None };
+        let system_token = process::get_primary_token(process::get_system_process()).unwrap_or(0);
+        let policy = crate::ntos::ob::object_security::assign_explicit_for_token(&crate::ntos::ob::object_types::process_type(), &explicit, system_token).ok()?;
+        process::update_record(target.process, |record| record.security = policy);
+        let process_id = target.process_id;
+        as_identity("acl-abridor.exe", &user_a(), MEDIUM_INTEGRITY, &[], |a, _| {
+            let limited = a.open_process(process_id, PROCESS_QUERY_LIMITED_INFORMATION).err();
+            let synchronize = a.open_process(process_id, SYNCHRONIZE);
+            if let Ok(handle) = synchronize {
+                a.close(handle);
+            }
+            (limited, synchronize.is_ok())
+        })
+    })
+    .flatten();
+    assert(ran == Some((Some(STATUS_ACCESS_DENIED), true)), "acl: o descritor explicito do processo decide o NtOpenProcess (SYNCHRONIZE concedido, PROCESS_QUERY_LIMITED_INFORMATION recusado)");
+}
+
 /// Um evento do ZwCreateEvent de modo kernel (OBJ_KERNEL_HANDLE, com o
 /// nome e o descritor pedidos) e o KEVENT retido; `None` na falha.
 fn kernel_event(name: &str, descriptor: Option<&[u8]>) -> Option<(u64, u64)> {
@@ -733,6 +765,7 @@ pub fn run(assert: Assert) {
         process_and_thread(assert);
         kernel_events_without_descriptor(assert);
         duplicate_rights_upgrade(assert);
+        explicit_process_descriptor(assert);
         if let Ok(directory) = directory {
             root.close(directory);
         }

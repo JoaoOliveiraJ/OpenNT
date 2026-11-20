@@ -113,6 +113,7 @@ use crate::ntos::ps::user::handles::{self, InheritedObject, UserProcess};
 use crate::ntos::ps::user::process as user_process;
 use crate::ntos::ps::user::{state, threads};
 use crate::ntos::se::model::SecurityPolicy;
+use crate::ntos::se::policy_descriptor::OwnedDescriptor;
 use crate::rtl::KernelError;
 
 const STATUS_SUCCESS: u32 = 0;
@@ -354,19 +355,21 @@ fn capture_create_info(address: u64, mode: u8) -> Result<CreateInfoInput, u32> {
 
 /// Os OBJECT_ATTRIBUTES de processo ou de thread (opcionais): sem nome; o
 /// OBJ_INHERIT vira o atributo do handle, e de um chamador de modo kernel
-/// também o OBJ_KERNEL_HANDLE.
-fn capture_object_attributes(address: u64, mode: u8) -> Result<u32, u32> {
+/// também o OBJ_KERNEL_HANDLE. O SecurityDescriptor é capturado como o do
+/// ObCreateObject do PspAllocateProcess (0x704231) e do PspAllocateThread
+/// (0x6c418c): um descritor inválido recusa a criação antes do processo.
+fn capture_object_attributes(address: u64, mode: u8) -> Result<(u32, Option<OwnedDescriptor>), u32> {
     if address == 0 {
-        return Ok(0);
+        return Ok((0, None));
     }
     if !probe_read(mode, address, ObjectAttributes::SIZE) {
         return Err(STATUS_ACCESS_VIOLATION);
     }
-    let read = || -> Result<(u32, u64, u32), KernelError> {
+    let read = || -> Result<(u32, u64, u32, u64), KernelError> {
         let attributes = state::user_struct::<ObjectAttributes>(address)?;
-        Ok((attributes.length.probe_get()?, attributes.object_name.probe_get()?, attributes.attributes.probe_get()?))
+        Ok((attributes.length.probe_get()?, attributes.object_name.probe_get()?, attributes.attributes.probe_get()?, attributes.security_descriptor.probe_get()?))
     };
-    let (length, name, attributes) = read().map_err(|error| status_of(&error))?;
+    let (length, name, attributes, descriptor) = read().map_err(|error| status_of(&error))?;
     if length as u64 != ObjectAttributes::SIZE {
         return Err(STATUS_INVALID_PARAMETER);
     }
@@ -374,7 +377,8 @@ fn capture_object_attributes(address: u64, mode: u8) -> Result<u32, u32> {
     if name != 0 {
         return Err(STATUS_OBJECT_NAME_INVALID);
     }
-    Ok(attributes & if mode == 0 { OBJ_INHERIT | OBJ_KERNEL_HANDLE } else { OBJ_INHERIT })
+    let descriptor = crate::ntos::ob::object_security::capture_descriptor(descriptor, mode != 0)?;
+    Ok((attributes & if mode == 0 { OBJ_INHERIT | OBJ_KERNEL_HANDLE } else { OBJ_INHERIT }, descriptor))
 }
 
 /// Uma saída de tamanho `size` em `value` (e o PSIZE_T, se veio), sondadas
@@ -772,8 +776,8 @@ fn capture_and_create(request: &UserCreateRequest) -> Result<u32, u32> {
     if request.process_flags & PROCESS_FORCE_BREAKAWAY != 0 && mode != 0 && !crate::ntos::se::privilege::acquired_privilege_check(SE_TCB_PRIVILEGE, 1) {
         return Err(STATUS_PRIVILEGE_NOT_HELD);
     }
-    let process_handle_attributes = capture_object_attributes(request.process_attributes, mode)?;
-    let thread_handle_attributes = capture_object_attributes(request.thread_attributes, mode)?;
+    let (process_handle_attributes, process_descriptor) = capture_object_attributes(request.process_attributes, mode)?;
+    let (thread_handle_attributes, thread_descriptor) = capture_object_attributes(request.thread_attributes, mode)?;
     let attributes = capture_attributes(request.attribute_list, mode)?;
     let Some(image_name) = attributes.image_name.clone() else { return Err(STATUS_INVALID_PARAMETER) };
     let dos_path = String::from(image_name.strip_prefix("\\??\\").unwrap_or(&image_name));
@@ -818,6 +822,18 @@ fn capture_and_create(request: &UserCreateRequest) -> Result<u32, u32> {
             if request.process_flags & PROCESS_CREATE_SESSION != 0 {
                 return Err(STATUS_INVALID_PARAMETER);
             }
+        }
+    }
+    // O sujeito do SeAssignSecurityEx do PspInsertProcess (0x607cab..0x607cbf)
+    // para os descritores explícitos: o System quando o pai é o processo do
+    // System, o token do processo novo com PS_ATTRIBUTE_TOKEN e, senão, quem
+    // cria. Em UserMode o dono explícito precisa ser atribuível por ele
+    // (STATUS_INVALID_OWNER) antes de o processo existir.
+    let system_parent = attributes.parent.unwrap_or_else(process::get_current_process) == process::get_system_process();
+    let explicit_subject = if system_parent { process::get_primary_token(process::get_system_process()) } else { primary_token.or_else(crate::ntos::ob::object_access::subject) }.unwrap_or(0);
+    if mode != 0 {
+        for descriptor in [process_descriptor.as_ref(), thread_descriptor.as_ref()].into_iter().flatten() {
+            crate::ntos::ob::object_security::check_explicit_for_user(descriptor, explicit_subject)?;
         }
     }
     let process_access = creator_access(request.process_access, &object_types::process_type())?;
@@ -871,6 +887,21 @@ fn capture_and_create(request: &UserCreateRequest) -> Result<u32, u32> {
     if let Some(class) = attributes.priority_class {
         // SAFETY: o EPROCESS recém-criado, retido pelo processo criado.
         unsafe { Eprocess::at(created.process_pointer) }.priority_class.set(class);
+    }
+    // Os descritores explícitos (o ObAssignSecurity do PspInsertProcess
+    // 0x607d35 e do PspInsertThread 0x6c22db): o do processo e o da thread
+    // principal, com o sujeito acima; o processo novo com PS_ATTRIBUTE_TOKEN
+    // responde pelo próprio token. Sem descritor, o padrão do token.
+    let subject = if !system_parent && primary_token.is_some() { process::get_primary_token(created.process_pointer).unwrap_or(explicit_subject) } else { explicit_subject };
+    if let Some(descriptor) = process_descriptor.as_ref() {
+        if let Ok(policy) = crate::ntos::ob::object_security::assign_explicit_for_token(&object_types::process_type(), descriptor, subject) {
+            process::update_record(created.process_pointer, |record| record.security = policy);
+        }
+    }
+    if let Some(descriptor) = thread_descriptor.as_ref() {
+        if let Ok(policy) = crate::ntos::ob::object_security::assign_explicit_for_token(&object_types::thread_type(), descriptor, subject) {
+            process::set_thread_security(created.thread.pointer(), policy);
+        }
     }
     // O OwnerProcessId do PspAllocateProcess: o processo que cria.
     let creator = crate::ntos::ps::process::get_current_process();

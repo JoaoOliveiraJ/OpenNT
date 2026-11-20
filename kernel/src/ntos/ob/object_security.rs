@@ -260,6 +260,16 @@ pub fn assign_new(object_type: &object_types::ObjectType, parent: Option<crate::
     Ok(policy_descriptor::policy_of(&owned))
 }
 
+/// O descritor de um objeto sem diretório pai (processo, thread) com o
+/// descritor explícito já capturado e o token `token` como sujeito do
+/// SeAssignSecurityEx (o explícito vence; sem DACL, a padrão do token).
+pub fn assign_explicit_for_token(object_type: &object_types::ObjectType, explicit: &crate::ntos::se::policy_descriptor::OwnedDescriptor, token: u64) -> Result<SecurityPolicy, u32> {
+    let explicit = Captured { control: explicit.control, owner: explicit.owner.clone().unwrap_or_default(), group: explicit.group.clone().unwrap_or_default(), dacl: explicit.dacl.clone(), sacl: explicit.sacl.clone() };
+    let assigned = crate::ntos::se::assign::assign_components_for_token(None, Some(&explicit), &object_type.mapping, false, 0, token)?;
+    let owned = crate::ntos::se::policy_descriptor::OwnedDescriptor { control: assigned.control, owner: Some(assigned.owner), group: Some(assigned.group), dacl: assigned.dacl, sacl: assigned.sacl };
+    Ok(policy_descriptor::policy_of(&owned))
+}
+
 /// As validações de UserMode de um descritor explícito (o
 /// SEF_FORCE_USER_MODE do SeAssignSecurityEx): o dono precisa ser
 /// atribuível pelo token (o usuário, um grupo com SE_GROUP_OWNER ou o

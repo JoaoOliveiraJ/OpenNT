@@ -331,6 +331,10 @@ pub fn capture(input: u64, output: u64) -> u32 {
         output.set(0);
         return 0;
     }
+    // A revisão é conferida antes do resto nos dois modos (0x6d4951).
+    if header(input).revision.get() != 1 {
+        return 0xC000_0058;
+    }
     if !valid(input) {
         return STATUS_INVALID_SECURITY_DESCR;
     }
@@ -364,8 +368,10 @@ pub fn capture_mode(input: u64, mode: u8, output: u64) -> u32 {
     if !crate::ntos::mm::section::create::descriptor_probe(input) {
         return 0xC000_0005;
     }
+    // A revisão diferente de SECURITY_DESCRIPTOR_REVISION é
+    // STATUS_UNKNOWN_REVISION (SeCaptureSecurityDescriptor 19041 0x6d4951).
     if guest::try_read::<u8>(input).ok() != Some(1) {
-        return STATUS_INVALID_SECURITY_DESCR;
+        return 0xC000_0058;
     }
     let Some(owned) = super::query_descriptor::read_descriptor(input) else { return STATUS_INVALID_SECURITY_DESCR };
     let bytes = super::set_security::serialize_owned(&owned);

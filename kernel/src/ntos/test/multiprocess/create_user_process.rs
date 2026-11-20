@@ -1007,11 +1007,16 @@ fn parent_creates_child(assert: Assert, services: &Services, system: u64, system
 /// Chama o handler direto, do System, com os buffers em `scratch`; devolve o
 /// status e o handle de processo de saída.
 pub(super) fn call_create(scratch: &Scratch, process_flags: u32, info: &[u8], attributes: &[u8]) -> (u32, u64) {
+    call_create_with(scratch, 0, process_flags, info, attributes)
+}
+
+/// [`call_create`] com o ProcessObjectAttributes `process_attributes`.
+fn call_create_with(scratch: &Scratch, process_attributes: u64, process_flags: u32, info: &[u8], attributes: &[u8]) -> (u32, u64) {
     let (out, info_at, list_at, rsp) = (scratch.block, scratch.block + 0x100, scratch.block + 0x200, scratch.block + 0x800);
     guest::write_bytes(out, &[0u8; 16]);
     guest::write_bytes(info_at, info);
     guest::write_bytes(list_at, attributes);
-    for (index, value) in [0u64, 0, process_flags as u64, create::THREAD_CREATE_SUSPENDED as u64, 0, info_at, list_at].into_iter().enumerate() {
+    for (index, value) in [process_attributes, 0, process_flags as u64, create::THREAD_CREATE_SUSPENDED as u64, 0, info_at, list_at].into_iter().enumerate() {
         guest::write64(rsp + 0x28 + index as u64 * 8, value);
     }
     let status = state::handler("NtCreateUserProcess").map_or(1, |handler| handler(out, out + 8, ALL_ACCESS as u64, ALL_ACCESS as u64, rsp).unwrap_or(1));
@@ -1068,7 +1073,30 @@ fn rejections(assert: Assert, services: &Services) {
     let dll_info = unsafe { PsCreateInfo::at(scratch.block + 0x100) };
     let dll_state = (dll_info.state.get(), dll_info.exe_format().dll_characteristics.get());
     remove_volume_file(DLL_NT_PATH);
-    crate::debug_print!("[ntcreateuserprocess] recusas: {:x?} {:x?} {:x?} {:x?} {:x?} {:x?} {:x?} {:x?}", unknown, debug, nameless, short_info, stale_info, minimal_process, prohibited, dll_state);
+    // ProcessObjectAttributes com um SecurityDescriptor de revisão 0: o
+    // ObCreateObject do PspAllocateProcess (0x704231) o captura e recusa
+    // antes de o processo existir (STATUS_UNKNOWN_REVISION).
+    let (oa_at, sd_at) = (scratch.block + 0x740, scratch.block + 0x780);
+    guest::write_bytes(oa_at, &[0u8; 0x30]);
+    guest::write_bytes(sd_at, &[0u8; 20]);
+    // SAFETY: OBJECT_ATTRIBUTES no bloco do teste.
+    let oa = unsafe { crate::ntos::inc::types::ObjectAttributes::at(oa_at) };
+    oa.length.set(0x30);
+    oa.security_descriptor.set(sd_at);
+    let bad_descriptor = call_create_with(&scratch, oa_at, 0, &valid, &attribute_list(&[image_name]));
+    crate::debug_print!("[ntcreateuserprocess] recusas: {:x?} {:x?} {:x?} {:x?} {:x?} {:x?} {:x?} {:x?} {:x?}", unknown, debug, nameless, short_info, stale_info, minimal_process, prohibited, dll_state, bad_descriptor);
+    assert(bad_descriptor == (0xC000_0058, 0), "ntcreateuserprocess: o SecurityDescriptor do ProcessObjectAttributes e capturado e o invalido recusa antes do processo");
+    // O descritor explícito do processo (o ObAssignSecurity do
+    // PspInsertProcess 0x607d35): a DACL dele vence a padrão do token.
+    let mut acl = alloc::vec![2u8, 0, 28, 0, 1, 0, 0, 0, 0, 0, 20, 0];
+    acl.extend_from_slice(&0x0010_0000u32.to_le_bytes());
+    acl.extend_from_slice(&[1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0]);
+    let explicit = crate::ntos::se::policy_descriptor::OwnedDescriptor { control: 0x8004, owner: None, group: None, dacl: Some(acl), sacl: None };
+    let system_token = process::get_primary_token(process::get_system_process()).unwrap_or(0);
+    let assigned = crate::ntos::ob::object_security::assign_explicit_for_token(&crate::ntos::ob::object_types::process_type(), &explicit, system_token);
+    let everyone = crate::ntos::se::model::sid(1, &[0]);
+    let only_synchronize = assigned.as_ref().is_ok_and(|policy| policy.dacl.as_ref().is_some_and(|dacl| dacl.len() == 1 && dacl[0].sid.as_ref() == Some(&everyone) && dacl[0].mask == 0x0010_0000 && !dacl[0].deny));
+    assert(only_synchronize, "ntcreateuserprocess: o descritor explicito do processo vale como veio (a DACL dele, nao a padrao do token)");
     assert(unknown == (STATUS_INVALID_PARAMETER, 0) && nameless == (STATUS_INVALID_PARAMETER, 0) && short_info == (STATUS_INVALID_PARAMETER, 0) && stale_info == (STATUS_INVALID_PARAMETER, 0), "ntcreateuserprocess: atributo desconhecido, ImageName ausente e PS_CREATE_INFO de tamanho errado ou fora do PsCreateInitialState dao STATUS_INVALID_PARAMETER");
     assert(bad_class == (STATUS_INVALID_PARAMETER, 0) && class_size == (STATUS_INVALID_PARAMETER, 0), "ntcreateuserprocess: a PriorityClass e um UCHAR lido pelo ponteiro, com Size 1");
     assert(debug == (STATUS_NOT_SUPPORTED, 0) && minimal_process == (STATUS_NOT_SUPPORTED, 0), "ntcreateuserprocess: DebugObject e PROCESS_CREATE_FLAGS_MINIMAL_PROCESS dao STATUS_NOT_SUPPORTED");
