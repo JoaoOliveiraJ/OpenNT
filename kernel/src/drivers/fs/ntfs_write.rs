@@ -658,7 +658,9 @@ impl Tx<'_> {
             if !group.is_empty() {
                 groups.push(group);
             }
-            if groups.len() <= 1 {
+            // Um grupo só vira uma folha com a raiz apontando para ela (o
+            // PushIndexRoot do ntfs.sys): a raiz fica com o END e o VCN 0.
+            if groups.is_empty() {
                 return fail(0xC000_007F, "indice nao cabe na MFT");
             }
             let group_count = groups.len();

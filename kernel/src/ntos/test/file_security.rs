@@ -43,6 +43,9 @@ const FILE: &str = "/OPENNTFS/PAI/F.TXT";
 const DIRECTORY: &str = "/OPENNTFS/PAI/D";
 const PROTECTED: &str = "/OPENNTFS/PAI/P.TXT";
 const BIG: usize = 5;
+/// Descritores pequenos e diferentes, mais do que as raízes do $SII e do
+/// $SDH guardam no registro do $Secure.
+const MANY: usize = 60;
 /// FILE_ALL_ACCESS e FILE_GENERIC_READ | FILE_GENERIC_EXECUTE.
 const FILE_ALL: u32 = 0x1F_01FF;
 const READ_EXECUTE: u32 = 0x12_00A9;
@@ -244,6 +247,8 @@ fn cleanup(volume: &Ntfs) {
     let mut paths = vec![FILE, DIRECTORY, PROTECTED, PARENT, "/OPENNTFS/A", "/OPENNTFS/B", "/OPENNTFS/DC/R.TXT", "/OPENNTFS/DC/E.TXT", "/OPENNTFS/ND/R.TXT", "/OPENNTFS/DC", "/OPENNTFS/ND", "/OPENNTFS/AD"];
     let big: Vec<alloc::string::String> = (0..BIG).map(|index| alloc::format!("/OPENNTFS/G{index}")).collect();
     paths.extend(big.iter().map(|path| path.as_str()));
+    let many: Vec<alloc::string::String> = (0..MANY).map(|index| alloc::format!("/OPENNTFS/M{index}")).collect();
+    paths.extend(many.iter().map(|path| path.as_str()));
     paths.push(ROOT);
     for path in paths {
         let _ = volume.remove(path);
@@ -281,6 +286,21 @@ fn storage(assert: Assert, volume: &Ntfs) {
     }
     assert(headers.iter().all(Option::is_some), "filesec: entradas grandes do $SDS sem cortar a metade principal do bloco");
     assert(headers.iter().flatten().any(|header| header.offset >= 2 * SDS_MIRROR), "filesec: a entrada que nao cabe vai ao bloco seguinte (+0x80000)");
+    // Muitos descritores pequenos: o $SII e o $SDH passam da raiz no
+    // registro e cabem num bloco INDX só, que fica como folha com a raiz
+    // apontando para ele (o PushIndexRoot do ntfs.sys); cada um ganha um id
+    // novo e os dois índices acham todos.
+    let mut ids = Vec::new();
+    for index in 0..MANY {
+        let principal = sid(5, &[21, 2000 + index as u32, 5, 6, 7]);
+        let bytes = descriptor(0, &administrators, &system, &[ace(0, FILE_ALL, &system), ace(0, READ_EXECUTE, &principal)]);
+        let path = alloc::format!("/OPENNTFS/M{index}");
+        let id = volume.create_with_security(&path, false, 0x20, 0, Some(&bytes)).ok().flatten().map_or(0, |stat| stat.security_id);
+        ids.push((id, ntfs_security::hash(&bytes)));
+    }
+    let (sii, sdh) = secure_keys(volume);
+    let distinct = ids.iter().all(|&(id, _)| id >= 0x100) && ids.windows(2).all(|pair| pair[1].0 == pair[0].0 + 1);
+    assert(distinct && ids.iter().all(|&(id, hash)| sii.contains(&id) && sdh.contains(&(hash, id))), "filesec: 60 descritores novos com ids seguidos, o $SII e o $SDH numa folha INDX abaixo da raiz");
 }
 
 /// A herança no NtCreateFile, o descritor explícito e o FILE_SUPERSEDE e o
