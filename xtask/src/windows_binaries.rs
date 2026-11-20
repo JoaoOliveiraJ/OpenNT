@@ -1584,9 +1584,17 @@ mod tests {
         names
     }
 
+    /// As bibliotecas só de recursos da lista do logon do usuário: sem código
+    /// (ponto de entrada 0) e sem imports, carregadas como dados (o
+    /// GetRoleTextW do oleacc carrega o OLEACCRC.DLL e lê o texto do papel).
+    #[cfg(windows)]
+    const RESOURCE_ONLY: &[&str] = &["oleaccrc.dll"];
+
     /// Todo import estático dos programas do logon do usuário e do
     /// explorer.exe resolve, pelos API sets desta máquina, para um programa
-    /// do volume (como o carregador do convidado os resolve).
+    /// do volume (como o carregador do convidado os resolve). Só as
+    /// bibliotecas de recursos de `RESOURCE_ONLY` não têm imports, e elas
+    /// continuam sem nenhum.
     #[cfg(windows)]
     #[test]
     fn user_logon_programs_close_under_static_imports() {
@@ -1601,6 +1609,10 @@ mod tests {
             let importer = path.file_name().and_then(|name| name.to_str()).unwrap_or_default().to_ascii_lowercase();
             let bytes = std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
             let imports = static_imports(&bytes);
+            if RESOURCE_ONLY.contains(&importer.as_str()) {
+                assert!(imports.is_empty(), "{importer} tem imports estáticos e não é só de recursos: {imports:?}");
+                continue;
+            }
             assert!(!imports.is_empty(), "{importer} sem imports estáticos");
             for import in imports {
                 if let Some(host) = host_of(&sets, &import, &importer).filter(|host| !staged.contains(host)) {
