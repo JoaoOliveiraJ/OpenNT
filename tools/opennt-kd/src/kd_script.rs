@@ -758,6 +758,20 @@ impl<'c, 'h> Runner<'c, 'h> {
         self.client.evaluate(text).map_err(|error| format!("{text:?} nao e um prazo em milissegundos ({error})"))
     }
 
+    /// Uma fatia de espera na conexão. Se o alvo fechou a conexão (o QEMU
+    /// terminou ou foi fechado), o erro traz o fim da COM1: um bugcheck ou
+    /// pânico do kernel aparece ali.
+    fn poll(&mut self, line: usize, shown: &str, slice: Duration) -> Result<Option<String>, String> {
+        match self.client.poll(slice) {
+            Ok(stop) => Ok(stop),
+            Err(error) if error.contains("fechou a conexao") => {
+                let tail = self.serial_tail();
+                Err(self.error(line, shown, &format!("{error}\n  a conexao caiu durante a espera (o QEMU terminou ou foi fechado); fim da COM1:{tail}")))
+            }
+            Err(error) => Err(self.error(line, shown, &error)),
+        }
+    }
+
     /// O prazo e o texto de `[/t <ms>] <texto>`.
     fn wait_arguments<'t>(&mut self, argument: &'t str) -> Result<(Duration, &'t str), String> {
         let (number, text) = wait_options(argument);
@@ -1480,7 +1494,7 @@ impl<'c, 'h> Runner<'c, 'h> {
             if remaining.is_zero() {
                 return Ok(StopWait::Timeout);
             }
-            let stop = self.client.poll(remaining.min(POLL)).map_err(|error| self.error(line, shown, &error))?;
+            let stop = self.poll(line, shown, remaining.min(POLL))?;
             self.flush_log();
             self.tick();
             let Some(stop) = stop else { continue };
@@ -1530,7 +1544,7 @@ impl<'c, 'h> Runner<'c, 'h> {
                 continue;
             }
             stopped_since = None;
-            let stop = self.client.poll(slice).map_err(|error| self.error(line, shown, &error))?;
+            let stop = self.poll(line, shown, slice)?;
             self.flush_log();
             self.tick();
             let Some(stop) = stop else { continue };
@@ -1562,7 +1576,7 @@ impl<'c, 'h> Runner<'c, 'h> {
                 self.tick();
                 continue;
             }
-            let stop = self.client.poll(slice).map_err(|error| self.error(line, shown, &error))?;
+            let stop = self.poll(line, shown, slice)?;
             self.flush_log();
             self.tick();
             let Some(stop) = stop else { continue };

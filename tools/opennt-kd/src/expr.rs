@@ -716,6 +716,8 @@ mod tests {
         assert_eq!(number(&mut environment, "@rip-@gs_base"), Ok(0xfffff800_40000234));
         // O `cur=` dos roteiros da tela preta.
         assert_eq!(number(&mut environment, "dwo(poi(poi(@gs_base+0x188)+0xb8)+0x5a8)"), Ok(0xdeadbeef));
+        // A forma sem `@` dos roteiros da tela preta (kd_black4, kd_udwm).
+        assert_eq!(number(&mut environment, "dwo(poi(poi(gs_base+0x188)+0xb8)+0x5a8)"), Ok(0xdeadbeef));
         assert!(number(&mut environment, "@gs_basex").is_err());
     }
 

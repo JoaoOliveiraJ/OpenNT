@@ -5801,7 +5801,9 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
       <texto>` (padrão 300000; o texto em qualquer ponto da COM1) e `sleep
       <ms>` (padrão 1000) leem a conexão enquanto esperam. O prazo é um
       número, `$variável` ou expressão (`sleep $espera`, `sleep 2*0n60000`);
-      um prazo que não dá número é erro. Um breakpoint de log, uma
+      um prazo que não dá número é erro. Se o alvo fecha a conexão durante
+      uma espera (o QEMU terminou ou foi fechado), o erro traz o fim da
+      COM1. Um breakpoint de log, uma
       condição falsa e a carga de um módulo seguem sozinhos, e um tratador
       roda. Uma parada sem tratador encerra o `wait-stop`. No `wait-serial`
       ela é erro, porque a COM1 não anda com a máquina parada (com a máquina

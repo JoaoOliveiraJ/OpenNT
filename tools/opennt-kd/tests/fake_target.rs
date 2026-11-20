@@ -556,6 +556,19 @@ fn script_sleep_takes_variables_and_rejects_text() {
     assert!(error.contains("/t:"), "{error}");
 }
 
+/// O alvo que fecha a conexão durante uma espera (o QEMU que termina): o
+/// erro diz que a conexão caiu e traz o fim da COM1.
+#[test]
+fn script_wait_reports_the_com1_tail_when_the_target_closes() {
+    // Sem paradas roteirizadas: o `c` derruba o alvo de mentira.
+    let (address, _) = start(Vec::new());
+    let mut client = connect(&address);
+    client.set_serial(Arc::new(Mutex::new("[boot] ok\n*** STOP: 0x000000E2 (teste)\n".to_string())));
+    let error = client.run_script("continue\nsleep 5000\n").unwrap_err();
+    assert!(error.contains("linha 2: sleep 5000: o alvo fechou a conexao"), "{error}");
+    assert!(error.contains("a conexao caiu durante a espera") && error.contains("  | *** STOP: 0x000000E2 (teste)"), "{error}");
+}
+
 /// Um anfitrião de teste: guarda as linhas, o progresso e as voltas, e
 /// responde ao `attach` e ao `detach` como a janela e o servidor MCP.
 #[derive(Default)]

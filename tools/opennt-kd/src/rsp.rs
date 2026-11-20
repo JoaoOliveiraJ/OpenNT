@@ -217,6 +217,9 @@ impl Connection {
             // ERROR_IO_PENDING (997): no Windows, um recv com prazo curto que
             // venceu durante a operação; os bytes chegam na próxima leitura.
             Err(error) if error.raw_os_error() == Some(997) => Err(TIMEOUT.into()),
+            // O QEMU que termina (ou é fechado) derruba o socket: a mesma
+            // mensagem do fim normal, com o erro do sistema junto.
+            Err(error) if matches!(error.kind(), std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::BrokenPipe) => Err(format!("o alvo fechou a conexao ({error})")),
             Err(error) => Err(error.to_string()),
         }
     }

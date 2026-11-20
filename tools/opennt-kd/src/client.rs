@@ -1255,7 +1255,10 @@ impl Client {
     /// Os registradores de uma thread (`monitor context`).
     pub fn thread_context(&mut self, thread: u64) -> Result<ThreadContext, String> {
         let text = self.monitor(&format!("context {thread:x}"))?;
-        monitor::thread_context(&text).ok_or_else(|| format!("contexto de {thread:#x}: {}", text.trim()))
+        // A pilha de kernel de uma thread terminada já foi liberada (o
+        // kd_idle parou num `btt` dentro de um for-each).
+        let hint = if text.contains("KernelStack ilegivel") { " (thread terminada? num for-each thread, filtre com state Waiting ou teste \"${t_state}\" != \"Terminated\")" } else { "" };
+        monitor::thread_context(&text).ok_or_else(|| format!("contexto de {thread:#x}: {}{hint}", text.trim()))
     }
 
     /// Os registradores gerais do processador escolhido (os adiados da
