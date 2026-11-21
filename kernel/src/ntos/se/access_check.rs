@@ -426,6 +426,7 @@ fn subject_from_access_information(information: u64) -> Option<Subject> {
         capabilities: hash_entries(information.capabilities_hash.get()),
         less_privileged_app_container: less_privileged(information.security_attributes.get()),
         attributes: attributes_of(information.security_attributes.get()),
+        trust_level_sid: (information.trust_level_sid.get() != 0).then(|| read_sid(information.trust_level_sid.get())),
     })
 }
 
@@ -613,6 +614,7 @@ fn subject_from_token(token: u64) -> Option<Subject> {
         // de segurança no `_TOKEN` montado: um AppContainer comum.
         less_privileged_app_container: false,
         attributes: Vec::new(),
+        trust_level_sid: (native.trust_level_sid.get() != 0).then(|| read_sid(native.trust_level_sid.get())),
     })
 }
 
@@ -845,14 +847,27 @@ fn trust_label_ace(object_descriptor: u64) -> Option<u64> {
     None
 }
 
-/// RtlSidDominatesForTrust com o token sem TrustLevelSid: domina só um SID
-/// de confiança válido do tipo 0 (S-1-19-0-0); SID inválido não domina. O
-/// SID segue a ACE em SidStart.
-fn token_dominates(ace: u64) -> bool {
+/// RtlSidDominatesForTrust do SID de confiança do sujeito (`subject`, o
+/// SepLocateTokenTrustLevel) sobre o rótulo da ACE (o SID em SidStart); um
+/// SID inválido não domina.
+fn token_dominates(ace: u64, subject: Option<&[u8]>) -> bool {
     // SAFETY: a ACE está numa ACL validada (ACEs com AceSize múltiplo de 4,
     // o alinhamento do SID).
-    let trust_sid = unsafe { crate::ntos::inc::types::Sid::at(ace + offset_of!(AccessAllowedAce, sid_start) as u64) };
-    acl::is_valid_process_trust_label_sid(trust_sid) && trust_sid.sub_authority[0].get() == 0
+    let at = ace + offset_of!(AccessAllowedAce, sid_start) as u64;
+    let trust_sid = unsafe { crate::ntos::inc::types::Sid::at(at) };
+    if !acl::is_valid_process_trust_label_sid(trust_sid) {
+        return false;
+    }
+    let label = guest::read_bytes(at, 16);
+    crate::ntos::se::token::trust::dominates(subject, Some(&label)) == Ok(true)
+}
+
+/// O SID de confiança do SECURITY_SUBJECT_CONTEXT `context` (o
+/// SepLocateTokenTrustLevel do ClientToken e do PrimaryToken).
+fn context_trust_sid(context: &SecuritySubjectContext) -> Option<alloc::vec::Vec<u8>> {
+    let client = context.client_token.get();
+    let primary = context.primary_token.get();
+    crate::ntos::se::token::trust::subject_trust_sid(primary, (client != 0).then_some(client))
 }
 
 /// SeAdjustAccessStateForAccessConstraints(ObjectType, Sd, AccessState):
@@ -863,7 +878,8 @@ pub fn adjust_access_state_for_access_constraints(object_type: u64, object_descr
     if flags & (TOKEN_HAS_BACKUP_PRIVILEGE | TOKEN_HAS_RESTORE_PRIVILEGE) == 0 {
         return;
     }
-    let Some(ace) = trust_label_ace(object_descriptor).filter(|&ace| !token_dominates(ace)) else { return };
+    let subject = context_trust_sid(&access_state.subject_security_context);
+    let Some(ace) = trust_label_ace(object_descriptor).filter(|&ace| !token_dominates(ace, subject.as_deref())) else { return };
     let denied = !guest::read::<u32>(ace + offset_of!(AccessAllowedAce, mask) as u64);
     let (backup, restore) = match object_types::find(object_type).map(|object_type| object_type.name).as_deref() {
         Some("File") => (0x0112_0089u32, 0x011F_0116u32),
@@ -881,8 +897,10 @@ pub fn adjust_access_state_for_access_constraints(object_type: u64, object_descr
 }
 
 /// SeShouldCheckForAccessRightsFromParent(ObjectType, ChildSd, AccessState):
-/// TRUE quando o token domina o rótulo de confiança do filho (ou não há
-/// rótulo); sem avaliador de filtros, nenhum filtro corta o acesso pedido.
-pub fn should_check_for_access_rights_from_parent(child_descriptor: u64) -> bool {
-    trust_label_ace(child_descriptor).is_none_or(token_dominates)
+/// TRUE quando o sujeito do ACCESS_STATE domina o rótulo de confiança do
+/// filho (ou não há rótulo); sem avaliador de filtros, nenhum filtro corta o
+/// acesso pedido.
+pub fn should_check_for_access_rights_from_parent(child_descriptor: u64, access_state: &AccessState) -> bool {
+    let subject = context_trust_sid(&access_state.subject_security_context);
+    trust_label_ace(child_descriptor).is_none_or(|ace| token_dominates(ace, subject.as_deref()))
 }

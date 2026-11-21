@@ -12105,6 +12105,15 @@ fn se_access_check_ex_exports(assert: Assert) {
             && call_export("SeShouldCheckForAccessRightsFromParent", &[file_type, untrusted, state_address]) == Some(1),
         "se-access-check-ex: SeShouldCheckForAccessRightsFromParent segue o rotulo de confianca",
     );
+    // Com o token do System (TrustLevelSid WinTcb) como primário do sujeito,
+    // o rótulo do protegido leve WinTcb é dominado: nada é cortado.
+    let system_token = crate::ntos::ps::process::get_primary_token(crate::ntos::ps::process::get_system_process()).unwrap_or(0);
+    access_state.subject_security_context.primary_token.set(system_token);
+    assert(
+        adjust(2, 0x0112_0089, protected) == 0x0112_0089 && call_export("SeShouldCheckForAccessRightsFromParent", &[file_type, protected, state_address]) == Some(1),
+        "se-access-check-ex: o sujeito com TrustLevelSid WinTcb domina o rotulo de confianca",
+    );
+    access_state.subject_security_context.primary_token.set(0);
     call_export("SeReleaseSubjectContext", &[context]);
 }
 

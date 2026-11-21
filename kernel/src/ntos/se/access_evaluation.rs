@@ -14,10 +14,11 @@
 //! Em UserMode, na ordem do NT:
 //! 1. descritor nulo, ou nada pedido sem nada já concedido: negado;
 //!    nada pedido com acesso já concedido: o já concedido;
-//! 2. (o rótulo de confiança de processo, SYSTEM_PROCESS_TRUST_LABEL_ACE,
-//!    não é aplicado: o OpenNT não tem processos protegidos, e o smss.exe,
-//!    que no NT roda como WinTcb e domina o rótulo do \KnownDlls, ficaria
-//!    sem escrever nele);
+//! 2. o rótulo de confiança de processo (o SepTrustLevelCheck, a primeira
+//!    SYSTEM_PROCESS_TRUST_LABEL_ACE da SACL que não é inherit-only): o
+//!    token cujo TrustLevelSid não o domina só recebe a máscara da ACE mais
+//!    ACCESS_SYSTEM_SECURITY; um direito pedido fora dela é negado e o
+//!    MAXIMUM_ALLOWED é cortado por ela no fim;
 //! 3. integridade obrigatória: o rótulo é a primeira SYSTEM_MANDATORY_LABEL
 //!    da SACL (Medium com NO_WRITE_UP quando não há, ou quando ela é
 //!    inherit-only); o token que não domina o rótulo só pode GenericRead,
@@ -144,6 +145,9 @@ pub struct Subject {
     /// Os atributos de segurança do token (as afirmações locais das ACEs
     /// condicionais).
     pub attributes: Vec<SecurityAttribute>,
+    /// O TrustLevelSid do token (o nível de confiança do processo
+    /// protegido; nenhum fora dele).
+    pub trust_level_sid: Option<Sid>,
 }
 
 impl Subject {
@@ -162,6 +166,7 @@ impl Subject {
             capabilities: token.capabilities.iter().map(|group| (group.sid.clone(), group.attributes)).collect(),
             less_privileged_app_container: crate::ntos::se::token::tokens::less_privileged(token),
             attributes: token.security_attributes.clone(),
+            trust_level_sid: token.trust_level_sid.clone(),
         }
     }
 
@@ -579,6 +584,40 @@ fn sep_access_check(descriptor: &OwnedDescriptor, subject: &Subject, desired: u3
     finish(previous | granted)
 }
 
+/// SYSTEM_PROCESS_TRUST_LABEL_ACE_TYPE.
+const TRUST_LABEL_ACE_TYPE: u8 = 0x14;
+
+/// O SepTrustLevelCheck do SeAccessCheckWithHintWithAdminlessChecks: o
+/// rótulo é a primeira SYSTEM_PROCESS_TRUST_LABEL_ACE da SACL que não é
+/// inherit-only (o SeGetTrustLabelAce); sem rótulo, ou com um token cujo
+/// TrustLevelSid o domina (RtlSidDominatesForTrust), nada é cortado; senão
+/// só a máscara da ACE mais ACCESS_SYSTEM_SECURITY. Um SID de confiança
+/// inválido é o NTSTATUS do RtlSidDominatesForTrust.
+pub fn trust_level_mask(descriptor: &OwnedDescriptor, subject: &Subject) -> Result<u32, u32> {
+    if descriptor.control & SACL_PRESENT == 0 {
+        return Ok(u32::MAX);
+    }
+    let Some(sacl) = descriptor.sacl.as_deref() else { return Ok(u32::MAX) };
+    let count = u16_at(sacl, 4) as usize;
+    let mut offset = 8usize;
+    for _ in 0..count {
+        let size = u16_at(sacl, offset + 2) as usize;
+        if size < 8 || offset + size > sacl.len() {
+            break;
+        }
+        if sacl[offset] == TRUST_LABEL_ACE_TYPE && sacl[offset + 1] & INHERIT_ONLY_ACE == 0 {
+            let label = &sacl[offset + 8..offset + size];
+            return match crate::ntos::se::token::trust::dominates(subject.trust_level_sid.as_deref(), Some(label)) {
+                Ok(true) => Ok(u32::MAX),
+                Ok(false) => Ok(u32_at(sacl, offset + 4) | ACCESS_SYSTEM_SECURITY),
+                Err(status) => Err(status),
+            };
+        }
+        offset += size;
+    }
+    Ok(u32::MAX)
+}
+
 /// SeAccessCheck em KernelMode: o pedido inteiro (GenericAll com
 /// MAXIMUM_ALLOWED) mais o já concedido, sem olhar o descritor.
 pub fn kernel_mode_grant(desired: u32, previous: u32, mapping: &[u32; 4]) -> u32 {
@@ -593,6 +632,12 @@ pub fn access_check(descriptor: Option<&OwnedDescriptor>, subject: &Subject, des
         return if previous == 0 { Err(STATUS_ACCESS_DENIED) } else { Ok(previous) };
     }
     let explicit = desired & !MAXIMUM_ALLOWED;
+    // O rótulo de confiança de processo antes da integridade: um direito
+    // pedido fora da máscara dele é negado.
+    let trust_mask = trust_level_mask(descriptor, subject)?;
+    if explicit & trust_mask != explicit {
+        return Err(STATUS_ACCESS_DENIED);
+    }
     let mandatory = mandatory_integrity_check(descriptor, subject, mapping)?;
     let lowbox_exempt = subject.lowbox() && mandatory.object_level <= MEDIUM_INTEGRITY;
     if mandatory.policy != 0 && mandatory.mask & explicit != explicit && !lowbox_exempt {
@@ -618,6 +663,7 @@ pub fn access_check(descriptor: Option<&OwnedDescriptor>, subject: &Subject, des
     }
     let mut granted = sep_access_check(descriptor, subject, remaining, previous, mapping, is_owner, owner_implied)?;
     if desired & MAXIMUM_ALLOWED != 0 {
+        granted &= trust_mask;
         if mandatory.policy != 0 && !mandatory.dominates && !lowbox_exempt {
             granted &= mandatory.mask;
         }

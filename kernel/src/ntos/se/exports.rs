@@ -663,7 +663,9 @@ pub mod se_access_check_ex {
 
     /// SeShouldCheckForAccessRightsFromParent(ObjectType, ChildSd, AccessState) -> BOOLEAN.
     fn should_check_for_access_rights_from_parent(call: &Call) -> Result<u64, KernelError> {
-        Ok(access_check::should_check_for_access_rights_from_parent(call.arg(2)) as u64)
+        // SAFETY: PACCESS_STATE de um chamador de kernel (NtfsAccessCheck).
+        let access_state = unsafe { AccessState::at(call.arg(3)) };
+        Ok(access_check::should_check_for_access_rights_from_parent(call.arg(2), access_state) as u64)
     }
 
     pub static GROUP: Group = Group {

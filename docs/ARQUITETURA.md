@@ -3311,7 +3311,11 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   componentes de um descritor (`OwnedDescriptor`) e a identidade do token
   efetivo (`Subject`: usuário, grupos, SIDs restritos, privilégios
   habilitados, SID de integridade, MandatoryPolicy, pacote e capacidades).
-  Na ordem do NT: integridade obrigatória
+  Na ordem do NT: o rótulo de confiança de processo (SepTrustLevelCheck: a
+  primeira SYSTEM_PROCESS_TRUST_LABEL_ACE da SACL que não é inherit-only;
+  o token cujo TrustLevelSid não a domina só recebe a máscara dela mais
+  ACCESS_SYSTEM_SECURITY, e o MAXIMUM_ALLOWED é cortado por ela);
+  integridade obrigatória
   (SepMandatoryIntegrityCheck: o rótulo é a primeira ACE de rótulo da SACL,
   Medium com NO_WRITE_UP quando não há; quem não domina só tem GenericRead,
   GenericExecute, READ_CONTROL e SYNCHRONIZE, menos NO_READ_UP/NO_EXECUTE_UP,
@@ -8436,8 +8440,9 @@ dos pacotes (`kernel`, `boot`).
   tokens, objetos de despacho, namespace, seções) o guardam no registro do
   dono como `SecurityPolicy`, convertida de e para os componentes do
   descritor. O rótulo de confiança de processo (SYSTEM_PROCESS_TRUST_LABEL)
-  não é aplicado: sem processos protegidos nenhum token tem TrustLevelSid, e
-  o smss.exe (WinTcb no NT) perderia a escrita no \KnownDlls. A criação
+  vale pelo TrustLevelSid do token (`se/token/trust.rs`: o do PS_PROTECTION
+  do processo protegido, WinTcb no System e no smss.exe, que domina o
+  rótulo do \KnownDlls). A criação
   num diretório já existente confere o DIRECTORY_CREATE_OBJECT, mas o
   criador recebe o acesso pedido ao objeto novo sem verificação, como no
   ObInsertObject. A avaliação não interpreta as ACEs de callback de objeto

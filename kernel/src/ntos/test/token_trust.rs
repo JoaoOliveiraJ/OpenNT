@@ -93,7 +93,48 @@ pub fn run(assert: Assert) {
     let system_trust = process::get_primary_token(process::get_system_process()).and_then(trust::token_trust_sid);
     assert(system_trust.as_ref() == Some(&wintcb), "trust: o token do System tem o SeProcTrustWinTcbSid");
 
+    trust_level_check(assert, &lite_windows, &lite_wintcb);
+
     labels(assert, &lite_windows, &lite_wintcb, &none);
+}
+
+/// O SepTrustLevelCheck da checagem de acesso: num objeto com o rótulo
+/// WinTcb leve de leitura (a DACL dá tudo a Everyone), o token sem SID de
+/// confiança e o leve Windows só leem (o pedido de escrita é negado e o
+/// MAXIMUM_ALLOWED sai cortado na máscara mais ACCESS_SYSTEM_SECURITY); o
+/// leve WinTcb domina e recebe tudo; o rótulo inherit-only não conta; o SID
+/// de confiança inválido no token é STATUS_INVALID_PARAMETER.
+fn trust_level_check(assert: Assert, lite_windows: &[u8], lite_wintcb: &[u8]) {
+    use crate::ntos::se::access_evaluation::{access_check, Subject};
+    use crate::ntos::se::policy_descriptor::OwnedDescriptor;
+    const READ: u32 = 0x0002_0019;
+    const WRITE: u32 = 0x0002_0006;
+    const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
+    let mapping = [READ, WRITE, 0x0002_0020, 0x000F_003F];
+    let everyone = sid(1, &[0]);
+    let mut dacl = alloc::vec![2u8, 0];
+    dacl.extend_from_slice(&((8 + 8 + everyone.len()) as u16).to_le_bytes());
+    dacl.extend_from_slice(&[1, 0, 0, 0, 0, 0]);
+    dacl.extend_from_slice(&((8 + everyone.len()) as u16).to_le_bytes());
+    dacl.extend_from_slice(&0x000F_003Fu32.to_le_bytes());
+    dacl.extend_from_slice(&everyone);
+    let system = sid(5, &[18]);
+    let labelled = |sacl: alloc::vec::Vec<u8>| OwnedDescriptor { control: 0x8014, owner: Some(system.clone()), group: Some(system.clone()), dacl: Some(dacl.clone()), sacl: Some(sacl) };
+    let object = labelled(trust_sacl(lite_wintcb, READ));
+    let subject = |trust: Option<&[u8]>| Subject { user: sid(5, &[21, 1, 2, 3, 1000]), groups: alloc::vec![(everyone.clone(), 7)], integrity: sid(16, &[0x3000]), trust_level_sid: trust.map(<[u8]>::to_vec), ..Default::default() };
+    let untrusted = subject(None);
+    let windows = subject(Some(lite_windows));
+    let wintcb = subject(Some(lite_wintcb));
+    let limited = access_check(Some(&object), &untrusted, READ, 0, &mapping) == Ok(READ)
+        && access_check(Some(&object), &untrusted, WRITE, 0, &mapping) == Err(0xC000_0022)
+        && access_check(Some(&object), &windows, WRITE, 0, &mapping) == Err(0xC000_0022)
+        && access_check(Some(&object), &untrusted, MAXIMUM_ALLOWED, 0, &mapping) == Ok(READ & 0x000F_003F);
+    let dominant = access_check(Some(&object), &wintcb, WRITE, 0, &mapping) == Ok(WRITE) && access_check(Some(&object), &wintcb, MAXIMUM_ALLOWED, 0, &mapping) == Ok(0x000F_003F);
+    let mut inherit_only = trust_sacl(lite_wintcb, READ);
+    inherit_only[9] |= 0x08;
+    let ignored = access_check(Some(&labelled(inherit_only)), &untrusted, WRITE, 0, &mapping) == Ok(WRITE);
+    let invalid = access_check(Some(&object), &subject(Some(&sid(19, &[0, 0x1000]))), READ, 0, &mapping) == Err(0xC000_000D);
+    assert(limited && dominant && ignored && invalid, "trust: SepTrustLevelCheck corta o acesso de quem nao domina o rotulo de confianca do objeto");
 }
 
 /// Uma SACL com uma SYSTEM_PROCESS_TRUST_LABEL_ACE (OI|CI) de `mask` para
