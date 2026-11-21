@@ -150,7 +150,9 @@ fn text(values: &[(String, u32, Vec<u8>)], name: &str) -> Option<String> {
 
 /// O nome do arquivo de uma DLL de System32 (`%SystemRoot%\system32\x`,
 /// `%windir%\system32\x`, `C:\Windows\System32\x` ou só o nome, que o
-/// carregador procura em System32).
+/// carregador procura em System32). Separadores repetidos valem como um, como
+/// no carregador: o PSFactoryBuffer das interfaces do StateRepository
+/// registra `C:\Windows\System32\\Windows.StateRepositoryPS.dll`.
 #[cfg(windows)]
 fn system32_file(path: &str) -> Option<&str> {
     let path = path.trim_matches('"');
@@ -160,7 +162,8 @@ fn system32_file(path: &str) -> Option<&str> {
     ["%systemroot%\\system32\\", "%windir%\\system32\\", "c:\\windows\\system32\\"]
         .iter()
         .find_map(|prefix| path.get(..prefix.len()).filter(|head| head.eq_ignore_ascii_case(prefix)).and_then(|_| path.get(prefix.len()..)))
-        .filter(|name| !name.contains('\\'))
+        .map(|name| name.trim_start_matches('\\'))
+        .filter(|name| !name.is_empty() && !name.contains('\\'))
 }
 
 /// Um caminho com o SID de uma conta local ou de domínio (`S-1-5-21-...`).
@@ -184,7 +187,7 @@ fn without_users(keys: &mut Vec<HostKey>) {
 /// subautoridades, autoridade 5 e a primeira subautoridade 21), ou em texto
 /// (`S-1-5-21-` num REG_SZ, REG_EXPAND_SZ ou REG_MULTI_SZ).
 #[cfg_attr(not(windows), allow(dead_code))]
-fn holds_account_sid(kind: u32, data: &[u8]) -> bool {
+pub(crate) fn holds_account_sid(kind: u32, data: &[u8]) -> bool {
     if data.windows(12).any(|window| window[0] == 1 && (1..=15).contains(&window[1]) && window[2..8] == [0, 0, 0, 0, 0, 5] && window[8..12] == [21, 0, 0, 0]) {
         return true;
     }
@@ -588,6 +591,20 @@ fn volume_associations(keys: Vec<HostKey>, servers: &std::collections::BTreeSet<
 mod tests {
     use super::{clean_install_defaults, command_program, holds_account_sid, utf16_value, volume_associations, without_account_sids};
     use crate::host_language::HostKey;
+
+    /// O nome da DLL de System32 de um InprocServer32, com separadores
+    /// repetidos como o do PSFactoryBuffer do StateRepository.
+    #[cfg(windows)]
+    #[test]
+    fn system32_file_accepts_repeated_separators() {
+        use super::system32_file;
+        assert_eq!(system32_file("C:\\Windows\\System32\\\\Windows.StateRepositoryPS.dll"), Some("Windows.StateRepositoryPS.dll"));
+        assert_eq!(system32_file("%SystemRoot%\\system32\\combase.dll"), Some("combase.dll"));
+        assert_eq!(system32_file("\"ole32.dll\""), Some("ole32.dll"));
+        assert_eq!(system32_file("C:\\Windows\\System32\\wbem\\fastprox.dll"), None);
+        assert_eq!(system32_file("C:\\Program Files\\x\\y.dll"), None);
+        assert_eq!(system32_file("C:\\Windows\\System32\\"), None);
+    }
 
     /// O programa do começo de uma linha de comando de verbo.
     #[test]
