@@ -50,6 +50,7 @@ pub fn run(assert: Assert) {
     events(assert, block, rsp, &call);
     directory_query(assert, block, rsp, &call);
     executive_timer(assert, block, rsp, &call);
+    timer_with_user_descriptor(assert, block, &call);
     coalescable_timer(assert, block, rsp, &call);
     adjust_groups(assert, block, rsp, &call);
     power_information(assert, block, rsp, &call);
@@ -420,6 +421,49 @@ fn executive_timer(assert: Assert, block: u64, rsp: u64, call: Call) {
         named == 0 && opened == 0 && opened_handle != 0 && opened_handle != named_handle && missing == 0xC000_0034 && directory == 0 && mismatch == 0xC000_0024 && closed == [0, 0, 0],
         "userboot: NtOpenTimer abre o ETIMER nomeado e recusa nome ausente e objeto de outro tipo",
     );
+}
+
+/// O NtCreateTimer de modo usuário com um descritor nos OBJECT_ATTRIBUTES,
+/// como o CreateWaitableTimerExW do ServiceMain do AppXSvc: o descritor
+/// self-relative (dono SYSTEM, uma ACE OI|CI que dá 0x1E_FFFF ao SYSTEM)
+/// mora na memória do processo, e o ObCreateObject o captura para o kernel
+/// antes de validar, porque o RtlValidSid recusa um SID no endereço de
+/// usuário; o timer sai com esse descritor. Um descritor com revisão 2 é
+/// STATUS_UNKNOWN_REVISION.
+fn timer_with_user_descriptor(assert: Assert, block: u64, call: Call) {
+    let (handle_cell, oa, descriptor) = (block + 0x760, block + 0x1C00, block + 0x1E00);
+    let system = [1u8, 1, 0, 0, 0, 0, 0, 5, 0x12, 0, 0, 0];
+    let mut bytes = alloc::vec![1u8, 0, 0x04, 0x80];
+    bytes.extend_from_slice(&0x30u32.to_le_bytes());
+    bytes.extend_from_slice(&[0; 8]);
+    bytes.extend_from_slice(&0x14u32.to_le_bytes());
+    bytes.extend_from_slice(&[2, 0, 0x1C, 0, 1, 0, 0, 0]);
+    bytes.extend_from_slice(&[0, 3, 0x14, 0]);
+    bytes.extend_from_slice(&0x1E_FFFFu32.to_le_bytes());
+    bytes.extend_from_slice(&system);
+    bytes.extend_from_slice(&system);
+    guest::write_bytes(descriptor, &bytes);
+    // SAFETY: memória de usuário do teste, mapeada pelo kernel.
+    let object = unsafe { ObjectAttributes::at(oa) };
+    object.length.set(ObjectAttributes::SIZE as u32);
+    object.root_directory.set(0);
+    object.object_name.set(0);
+    object.attributes.set(0);
+    object.security_descriptor.set(descriptor);
+    object.security_quality_of_service.set(0);
+    let thread = process::get_current_thread();
+    // SAFETY: o ETHREAD corrente.
+    let previous_mode = &unsafe { Ethread::at(thread) }.tcb.previous_mode;
+    let saved = previous_mode.get();
+    previous_mode.set(1);
+    guest::write64(handle_cell, 0);
+    let created = call("NtCreateTimer", handle_cell, 0x1F_0003, oa, 0);
+    let handle = guest::read64(handle_cell);
+    guest::write8(descriptor, 2);
+    let revision = call("NtCreateTimer", handle_cell, 0x1F_0003, oa, 0);
+    previous_mode.set(saved);
+    let closed = if handle != 0 { call("NtClose", handle, 0, 0, 0) } else { u32::MAX };
+    assert(created == 0 && handle != 0 && closed == 0 && revision == 0xC000_0058, "userboot: NtCreateTimer de modo usuario com descritor na memoria do processo (capturado para o kernel antes do RtlValidSid) e revisao errada");
 }
 
 /// NtSetTimerEx no ETIMER (o SetWaitableTimer do kernelbase): as recusas de

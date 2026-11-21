@@ -209,7 +209,10 @@ fn capture(probe_mode: u8, owner_mode: u8, attributes: u64, create_info: u64) ->
         }
     };
     if sd != 0 {
-        let status = descriptor::capture(sd, create.security_descriptor.address());
+        // O SeCaptureSecurityDescriptor com o modo da sonda: em UserMode o
+        // descritor é copiado para o kernel antes da validação, porque o
+        // RtlValidSid do ntoskrnl recusa um SID no endereço de usuário.
+        let status = descriptor::capture_mode(sd, probe as u8, create.security_descriptor.address());
         if status != STATUS_SUCCESS {
             create.security_descriptor.set(0);
             return Err(status);
