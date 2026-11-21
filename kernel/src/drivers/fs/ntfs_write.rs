@@ -5,7 +5,7 @@
 //! operação de vários setores. Uma falha de E/S envenena este writer até a
 //! remontagem.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -95,11 +95,14 @@ impl BitmapView<'_> {
     }
 }
 
-/// O que uma transação mudou nos dois bitmaps de alocação.
+/// O que uma transação mudou nos dois bitmaps de alocação e os registros do
+/// MFT que ela regravou (todo arquivo ou diretório mudado passa pelo
+/// `record` dele): no commit, só os caches que dependem deles caem.
 #[derive(Default)]
 struct Changes {
     clusters: StagedBitmap,
     records: StagedBitmap,
+    touched: BTreeSet<u64>,
 }
 
 /// Estado do writer de um volume montado.
@@ -450,7 +453,12 @@ impl Tx<'_> {
         if reference < 4 {
             self.stage(geometry.mirror_lcn * geometry.sectors_per_cluster + reference * sectors, Some(record), sectors)?;
         }
-        self.volume.invalidate();
+        // As leituras seguintes da transação veem o registro novo; o que foi
+        // montado do antigo cai.
+        self.volume.forget_reference(reference);
+        if let Some(changes) = self.state.tx.as_mut() {
+            changes.touched.insert(reference);
+        }
         Ok(())
     }
 
@@ -603,8 +611,9 @@ impl Tx<'_> {
         }
         self.load_allocation()?;
         self.state.tx = Some(Changes::default());
+        // Os caches valem para o disco gravado: a transação anterior terminou
+        // confirmada ou os descartou ao falhar.
         self.volume.pending.lock().clear();
-        self.volume.invalidate();
         let mut committing = false;
         let result: Result<T, KernelError> = (|| {
             let result = action(self)?;
@@ -659,7 +668,7 @@ impl Tx<'_> {
             let allocation = self.state.allocation.as_mut().expect("alocacao carregada");
             changes.clusters.apply(&mut allocation.bits, sector);
             changes.records.apply(&mut allocation.records, sector);
-            self.volume.changed();
+            self.volume.changed_references(&changes.touched);
             self.state.allocation_generation = Some(self.volume.generation());
             Ok(result)
         })();
@@ -683,7 +692,11 @@ impl Tx<'_> {
         }
         self.volume.pending.lock().clear();
         self.state.tx = None;
-        self.volume.invalidate();
+        // Desfeita, a transação deixou nos caches o que só existia nas
+        // escritas pendentes; confirmada, o que eles têm é o que foi gravado.
+        if result.is_err() {
+            self.volume.invalidate();
+        }
         result
     }
 

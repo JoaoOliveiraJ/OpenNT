@@ -159,7 +159,7 @@ impl Ntfs {
                 Err(error) if error.status == STATUS_NOT_A_DIRECTORY => return Ok(None),
                 Err(error) => return Err(error),
             };
-            let Some(entry) = entries.find(part).cloned() else { return Ok(None) };
+            let Some(entry) = entries.find(part) else { return Ok(None) };
             let last = index + 1 == parts.len();
             let marked = entry.value.len() >= 60 && u32_at(&entry.value, 56) & FILE_ATTRIBUTE_REPARSE_POINT != 0;
             if marked && !(last && open_reparse_point) {

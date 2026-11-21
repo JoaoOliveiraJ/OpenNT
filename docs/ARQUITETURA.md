@@ -4640,7 +4640,12 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     atapi.sys assumir a controladora. Antes, cada `stat`,
     passo de caminho e enumeração de diretório lia o disco de novo: no boot
     até a barra de tarefas, um terço do tempo da CPU ia para o DMA dessas
-    leituras.
+    leituras. Acima dele, os diretórios lidos e os layouts do `Ntfs` e o
+    stat, os bytes e os blocos de leitura de cada arquivo do volume
+    (`volume_files`) caem por registro do MFT: o commit de uma transação
+    marca com a geração nova do drive só os registros que ela regravou, e
+    cada cache guarda os registros de que depende (os diretórios do caminho
+    e o arquivo).
   - O `--start-driver` de um driver de file system (Type 2) cria o volume e
     abre e lê um arquivo conhecido pelos exports
     (`ntos/test/file_system_mount.rs`); a fase 6 cobre o caminho com dois

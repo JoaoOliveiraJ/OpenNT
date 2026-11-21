@@ -249,7 +249,12 @@ struct FileState {
     size: u64,
     directory: bool,
     stat: Stat,
+    /// A geração do drive em que o estado foi conferido pela última vez.
     generation: u64,
+    /// Os registros de que a resolução do caminho depende: os diretórios
+    /// da raiz ao pai e, por último, o próprio arquivo
+    /// (`Ntfs::stat_with_references`).
+    references: Vec<u64>,
     bytes: Option<Arc<Vec<u8>>>,
 }
 
@@ -317,29 +322,54 @@ impl VolumeFile {
         self.state.lock().stat.clone()
     }
 
-    /// Uma geração nova invalida bytes e blocos; referência e sequência do
-    /// registro distinguem o mesmo arquivo de outro que reutilizou a posição.
+    /// Confere o estado contra as mudanças confirmadas no volume desde a
+    /// última conferência, por registro: sem mudança no arquivo nem nos
+    /// diretórios do caminho, nada muda (os bytes e os blocos continuam
+    /// valendo); com um diretório do caminho mudado, o caminho é resolvido de
+    /// novo (referência e sequência do registro distinguem o mesmo arquivo
+    /// de outro que reutilizou a posição); com o próprio registro mudado
+    /// (conteúdo, tamanho ou atributos), o stat é relido e os bytes e os
+    /// blocos caem.
     pub fn refresh(&self) {
         let current_generation = self.volume.generation();
-        if self.state.lock().generation == current_generation {
+        let (since, references) = {
+            let state = self.state.lock();
+            if state.generation == current_generation {
+                return;
+            }
+            (state.generation, state.references.clone())
+        };
+        let changed = |reference: &u64| self.volume.changed_since(*reference, since);
+        let (file, path) = references.split_last().map_or((true, true), |(file, path)| (changed(file), path.iter().any(changed)));
+        if !file && !path {
+            let mut state = self.state.lock();
+            if state.generation == since {
+                state.generation = current_generation;
+            }
             return;
         }
-        let current = self.volume.stat(&self.volume_path()).ok().flatten();
+        let current = self.volume.stat_with_references(&self.volume_path()).ok().flatten();
+        let mut drop_blocks = file;
         {
             let mut state = self.state.lock();
-            let deleted = current.as_ref().is_none_or(|stat| stat.reference != state.stat.reference || stat.sequence != state.stat.sequence);
+            let deleted = current.as_ref().is_none_or(|(stat, _)| stat.reference != state.stat.reference || stat.sequence != state.stat.sequence);
             self.marks.deleted.store(deleted, Ordering::Release);
-            if !deleted {
-                if let Some(stat) = current {
-                    state.size = stat.size;
-                    state.directory = stat.directory;
-                    state.stat = stat;
-                }
+            if deleted {
+                drop_blocks = true;
+            } else if let Some((stat, references)) = current {
+                state.size = stat.size;
+                state.directory = stat.directory;
+                state.stat = stat;
+                state.references = references;
             }
-            state.bytes = None;
+            if drop_blocks {
+                state.bytes = None;
+            }
             state.generation = current_generation;
         }
-        CACHE.lock().clear(self.id);
+        if drop_blocks {
+            CACHE.lock().clear(self.id);
+        }
     }
 
     /// Materializa o arquivo inteiro só no primeiro uso da geração. Os bytes
@@ -506,12 +536,12 @@ pub fn lookup_volume_file(nt_path: &str) -> Option<Arc<VolumeFile>> {
     // arquivo numa geração velha (e o próximo refresh relê), nunca um stat
     // velho numa geração nova.
     let generation = volume.generation();
-    let stat = volume.stat(&volume_path).ok().flatten()?;
+    let (stat, references) = volume.stat_with_references(&volume_path).ok().flatten()?;
     let fs: &'static dyn super::volume::FileSystem = fixed;
     let file = Arc::new(VolumeFile {
         id: NEXT_FILE.fetch_add(1, Ordering::Relaxed),
         paths: SpinLock::new(Paths { nt_path: native_file_name::from_volume(fs, &volume_path).unwrap_or_else(|| String::from(nt_path)), base_name: String::from(&volume_path[1..]), volume_path }),
-        state: SpinLock::new(FileState { size: stat.size, directory: stat.directory, generation, stat, bytes: None }),
+        state: SpinLock::new(FileState { size: stat.size, directory: stat.directory, generation, stat, references, bytes: None }),
         volume,
         marks: Arc::new(FileMarks::default()),
         opens: SpinLock::new(Vec::new()),

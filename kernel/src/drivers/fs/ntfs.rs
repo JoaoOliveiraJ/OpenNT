@@ -11,7 +11,7 @@
 //! nenhuma CPU lê no meio de um commit (com parte dos setores gravados) nem
 //! enche os caches com o que o commit acabou de invalidar.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -176,41 +176,172 @@ pub struct Stat {
 
 /// As entradas de um diretório, na ordem do índice, com a busca pelo nome
 /// sem diferença de caixa (o lookup do NTFS desce a árvore B pelo nome; aqui
-/// o diretório inteiro já lido ganha um mapa do nome em maiúsculas).
+/// o diretório inteiro já lido ganha um vetor das posições em ordem do nome
+/// em maiúsculas, buscado por bisseção). O diretório fica no cache até
+/// mudar, então guarda o mínimo: as chaves $FILE_NAME das entradas numa
+/// área só (o nome sai da própria chave) e, por entrada, a posição dela, a
+/// referência e a sequência; uma `IndexEntry` é montada só para quem a pede.
 pub struct Directory {
-    pub entries: Vec<IndexEntry>,
-    /// O nome em maiúsculas (`str::to_uppercase`) -> a primeira entrada com
-    /// ele na ordem do índice.
-    by_name: BTreeMap<String, usize>,
+    /// As chaves $FILE_NAME, uma depois da outra.
+    values: Vec<u8>,
+    slots: Vec<DirectorySlot>,
+    /// As posições das entradas em ordem do nome em maiúsculas
+    /// (`str::to_uppercase`) e, num nome repetido, da posição no índice.
+    by_name: Vec<u32>,
+}
+
+#[derive(Clone, Copy)]
+struct DirectorySlot {
+    start: u32,
+    length: u32,
+    reference: u64,
+    sequence: u16,
+}
+
+/// Os caracteres do nome de uma chave $FILE_NAME (UTF-16 em +66, o tamanho
+/// em +64), decodificados como o `file_name_of`.
+fn key_name_chars(value: &[u8]) -> impl Iterator<Item = char> + '_ {
+    char::decode_utf16((0..value[64] as usize).map(move |index| u16_at(value, 66 + index * 2))).map(|unit| unit.unwrap_or(char::REPLACEMENT_CHARACTER))
+}
+
+/// A ordem de `str::cmp` sobre `str::to_uppercase` (os bytes UTF-8 seguem a
+/// ordem dos code points), caractere a caractere.
+fn upper_cmp(left: impl Iterator<Item = char>, right: impl Iterator<Item = char>) -> core::cmp::Ordering {
+    left.flat_map(char::to_uppercase).cmp(right.flat_map(char::to_uppercase))
 }
 
 impl Directory {
     fn new(entries: Vec<IndexEntry>) -> Self {
-        let mut by_name = BTreeMap::new();
-        for (index, entry) in entries.iter().enumerate() {
-            by_name.entry(entry.name.to_uppercase()).or_insert(index);
+        let mut values = Vec::with_capacity(entries.iter().map(|entry| entry.value.len()).sum());
+        let mut slots = Vec::with_capacity(entries.len());
+        for entry in &entries {
+            slots.push(DirectorySlot { start: values.len() as u32, length: entry.value.len() as u32, reference: entry.reference, sequence: entry.sequence });
+            values.extend_from_slice(&entry.value);
         }
-        Self { entries, by_name }
+        drop(entries);
+        let mut directory = Self { values, slots, by_name: Vec::new() };
+        let mut by_name: Vec<u32> = (0..directory.slots.len() as u32).collect();
+        by_name.sort_unstable_by(|&left, &right| upper_cmp(key_name_chars(directory.value(left as usize)), key_name_chars(directory.value(right as usize))).then(left.cmp(&right)));
+        directory.by_name = by_name;
+        directory
+    }
+
+    fn value(&self, index: usize) -> &[u8] {
+        let slot = self.slots[index];
+        &self.values[slot.start as usize..(slot.start + slot.length) as usize]
+    }
+
+    /// A entrada `index` (na ordem do índice).
+    pub fn entry(&self, index: usize) -> IndexEntry {
+        let (slot, value) = (self.slots[index], self.value(index));
+        IndexEntry { name: file_name_of(value), reference: slot.reference, sequence: slot.sequence, value: value.to_vec() }
+    }
+
+    /// As entradas, na ordem do índice.
+    pub fn entries(&self) -> impl Iterator<Item = IndexEntry> + '_ {
+        (0..self.slots.len()).map(|index| self.entry(index))
+    }
+
+    /// O registro e a chave da entrada `index`, sem cópia.
+    pub fn raw(&self, index: usize) -> (u64, &[u8]) {
+        (self.slots[index].reference, self.value(index))
+    }
+
+    pub fn len(&self) -> usize {
+        self.slots.len()
     }
 
     /// A primeira entrada (na ordem do índice) com o nome `name`, sem
     /// diferença de caixa.
-    pub fn find(&self, name: &str) -> Option<&IndexEntry> {
-        self.by_name.get(&name.to_uppercase()).map(|&index| &self.entries[index])
+    pub fn find(&self, name: &str) -> Option<IndexEntry> {
+        let first = self.by_name.partition_point(|&index| upper_cmp(key_name_chars(self.value(index as usize)), name.chars()).is_lt());
+        let index = *self.by_name.get(first)? as usize;
+        upper_cmp(key_name_chars(self.value(index)), name.chars()).is_eq().then(|| self.entry(index))
     }
+}
+
+/// Um layout guardado e os registros de que ele depende: os diretórios
+/// percorridos pelo caminho e o próprio arquivo. Uma mudança em qualquer um
+/// deles (uma entrada criada, removida ou renomeada num dos diretórios, ou o
+/// $DATA do arquivo) o descarta.
+struct CachedLayout {
+    layout: Option<Layout>,
+    references: Vec<u64>,
 }
 
 struct Caches {
     generation: u64,
     directories: BTreeMap<u64, Arc<Directory>>,
-    layouts: BTreeMap<String, Option<Layout>>,
+    layouts: BTreeMap<String, CachedLayout>,
 }
 
-/// Gerações por drive: mudanças invalidam caches entre montagens.
-static GENERATIONS: SpinLock<BTreeMap<u8, u64>> = SpinLock::new(BTreeMap::new());
+impl Caches {
+    /// Descarta o que depende do registro `reference`.
+    fn forget(&mut self, reference: u64) {
+        self.directories.remove(&reference);
+        self.layouts.retain(|_, cached| !cached.references.contains(&reference));
+    }
+
+    fn clear(&mut self) {
+        self.directories.clear();
+        self.layouts.clear();
+    }
+}
+
+/// As mudanças confirmadas de um drive. Cada transação confirmada avança a
+/// geração e marca com ela os registros do MFT que mudou (o registro de cada
+/// arquivo cujo conteúdo, tamanho, nome ou atributos mudaram e o de cada
+/// diretório cujo índice mudou): o anel guarda os pares (geração, registro)
+/// mais recentes, para os caches descartarem só o que depende deles. O anel
+/// tem capacidade fixa, reservada na montagem do drive: nenhuma transação
+/// aloca no heap por ele. Um cache mais atrasado que o anel (uma
+/// geração até `floor` pode ter perdido os pares) e uma mudança sem lista
+/// (`Ntfs::changed`) valem para todos os registros.
+struct DriveChanges {
+    generation: u64,
+    /// A última geração que mudou tudo.
+    everything: u64,
+    /// A maior geração cujos pares já saíram do anel.
+    floor: u64,
+    ring: VecDeque<(u64, u64)>,
+}
+
+/// Quantos pares (geração, registro) o anel guarda.
+const CHANGE_RING: usize = 4096;
+
+impl DriveChanges {
+    fn new() -> Self {
+        DriveChanges { generation: 0, everything: 0, floor: 0, ring: VecDeque::with_capacity(CHANGE_RING) }
+    }
+
+    /// Mudanças depois de `since` que o anel não sabe dizer quais foram.
+    fn unknown_since(&self, since: u64) -> bool {
+        self.everything > since || self.floor > since
+    }
+}
+
+/// As mudanças por drive: valem para todas as montagens do mesmo disco.
+static CHANGES: SpinLock<BTreeMap<u8, DriveChanges>> = SpinLock::new(BTreeMap::new());
 
 fn generation_of(drive: u8) -> u64 {
-    GENERATIONS.lock().get(&drive).copied().unwrap_or(0)
+    CHANGES.lock().get(&drive).map_or(0, |changes| changes.generation)
+}
+
+/// Os registros mudados depois da geração `since`; `None` quando o
+/// histórico não chega até ela ou uma das mudanças valeu para todos.
+fn changes_since(drive: u8, since: u64) -> Option<Vec<u64>> {
+    let changes = CHANGES.lock();
+    let Some(changes) = changes.get(&drive) else { return Some(Vec::new()) };
+    if since >= changes.generation {
+        return Some(Vec::new());
+    }
+    if changes.unknown_since(since) {
+        return None;
+    }
+    let mut references: Vec<u64> = changes.ring.iter().rev().take_while(|(generation, _)| *generation > since).map(|&(_, reference)| reference).collect();
+    references.sort_unstable();
+    references.dedup();
+    Some(references)
 }
 
 /// Recursos dos drives 0 e 1. São por drive, não por montagem: as montagens
@@ -260,7 +391,9 @@ pub fn mount(drive: u8) -> Result<Arc<Ntfs>, KernelError> {
     if sector_size != 512 || sectors_per_cluster == 0 || !(512..=65536).contains(&record_size) {
         return Err(error("NTFS: geometria nao suportada"));
     }
-    let generation = generation_of(drive);
+    // O anel das mudanças do drive nasce com a montagem, com a capacidade
+    // inteira: as transações depois dela não alocam por ele.
+    let generation = CHANGES.lock().entry(drive).or_insert_with(DriveChanges::new).generation;
     Ok(Arc::new(Ntfs { drive, geometry, boot, pending: SpinLock::new(Vec::new()), caches: SpinLock::new(Caches { generation, directories: BTreeMap::new(), layouts: BTreeMap::new() }), writer: super::ntfs_write::new_writer(), secure_cache: SpinLock::new(BTreeMap::new()) }))
 }
 
@@ -653,32 +786,84 @@ impl Ntfs {
         generation_of(self.drive)
     }
 
-    pub fn invalidate(&self) {
-        let mut caches = self.caches.lock();
-        caches.directories.clear();
-        caches.layouts.clear();
+    /// O registro `reference` mudou depois da geração `since` (ou uma
+    /// mudança depois dela valeu para todos).
+    pub fn changed_since(&self, reference: u64, since: u64) -> bool {
+        let changes = CHANGES.lock();
+        let Some(changes) = changes.get(&self.drive) else { return false };
+        if since >= changes.generation {
+            return false;
+        }
+        changes.unknown_since(since) || changes.ring.iter().rev().take_while(|(generation, _)| *generation > since).any(|&(_, changed)| changed == reference)
     }
 
+    pub fn invalidate(&self) {
+        self.caches.lock().clear();
+    }
+
+    /// Descarta deste volume o que depende do registro `reference` (o
+    /// writer, ao preparar um registro novo dele).
+    pub fn forget_reference(&self, reference: u64) {
+        self.caches.lock().forget(reference);
+    }
+
+    /// Alcança a geração do drive: descarta só o que depende dos registros
+    /// mudados desde a última vez, ou tudo quando o histórico não basta.
     fn fresh(&self) {
         let current = generation_of(self.drive);
         let mut caches = self.caches.lock();
-        if caches.generation != current {
-            caches.directories.clear();
-            caches.layouts.clear();
-            caches.generation = current;
+        if caches.generation == current {
+            return;
         }
+        match changes_since(self.drive, caches.generation) {
+            Some(references) => references.into_iter().for_each(|reference| caches.forget(reference)),
+            None => caches.clear(),
+        }
+        caches.generation = current;
     }
 
-    /// Mutação persistente: avança a geração do drive.
+    /// Mutação persistente sem a lista do que mudou: avança a geração do
+    /// drive e vale para todos os registros.
     pub fn changed(&self) {
+        self.record_change(None);
+    }
+
+    /// A transação confirmada que mudou os registros `references`: avança
+    /// a geração do drive e marca só eles.
+    pub fn changed_references(&self, references: &BTreeSet<u64>) {
+        self.record_change(Some(references));
+    }
+
+    fn record_change(&self, references: Option<&BTreeSet<u64>>) {
         let _exclusive = self.resource().acquire_exclusive();
-        *GENERATIONS.lock().entry(self.drive).or_insert(0) += 1;
+        {
+            let mut changes = CHANGES.lock();
+            let changes = changes.entry(self.drive).or_insert_with(DriveChanges::new);
+            changes.generation += 1;
+            let generation = changes.generation;
+            match references {
+                Some(references) => {
+                    for &reference in references {
+                        if changes.ring.len() == CHANGE_RING {
+                            if let Some((evicted, _)) = changes.ring.pop_front() {
+                                changes.floor = changes.floor.max(evicted);
+                            }
+                        }
+                        changes.ring.push_back((generation, reference));
+                    }
+                }
+                None => {
+                    changes.everything = generation;
+                    changes.ring.clear();
+                }
+            }
+        }
         self.fresh();
     }
 
     /// Entradas do diretório `reference`, com blocos INDX dos índices grandes.
     pub fn root_index(&self, reference: u64) -> Result<Vec<IndexEntry>, KernelError> {
-        Ok(self.directory(reference)?.entries.clone())
+        Ok(self.directory(reference)?.entries().collect())
     }
 
     /// O diretório `reference` lido (e guardado até a próxima mudança do
@@ -840,19 +1025,28 @@ impl Ntfs {
 
     /// Resolve um caminho `/A/B` sem diferença de caixa; `.` e `..` são recusados.
     pub fn find(&self, path: &str) -> Result<Option<IndexEntry>, KernelError> {
+        Ok(self.find_with_references(path)?.0)
+    }
+
+    /// O `find` e os registros de que a resposta depende: os diretórios
+    /// consultados, da raiz ao último, e o registro achado.
+    pub fn find_with_references(&self, path: &str) -> Result<(Option<IndexEntry>, Vec<u64>), KernelError> {
         let _shared = self.resource().acquire_shared();
         self.fresh();
         let mut found = IndexEntry { name: String::new(), reference: 5, sequence: 0, value: Vec::new() };
+        let mut references = Vec::new();
         for part in path.split('/').filter(|part| !part.is_empty()) {
             if part == "." || part == ".." {
                 return Err(error("NTFS: caminho nao canonico"));
             }
+            references.push(found.reference);
             match self.directory(found.reference)?.find(part) {
-                Some(entry) => found = entry.clone(),
-                None => return Ok(None),
+                Some(entry) => found = entry,
+                None => return Ok((None, references)),
             }
         }
-        Ok(Some(found))
+        references.push(found.reference);
+        Ok((Some(found), references))
     }
 
     /// O nome longo gravado de `path` (`/A/B`): o da entrada do índice do pai
@@ -867,7 +1061,8 @@ impl Ntfs {
         let trimmed = path.trim_end_matches('/');
         let Some(separator) = trimmed.rfind('/') else { return Ok(Some(String::new())) };
         let Some(parent) = self.find(if separator == 0 { "/" } else { &trimmed[..separator] })? else { return Ok(None) };
-        let stored = self.directory(parent.reference)?.entries.iter().find(|candidate| candidate.reference == entry.reference && candidate.value.get(0x41).is_some_and(|namespace| namespace & 3 != 2)).map(|candidate| candidate.name.clone());
+        let directory = self.directory(parent.reference)?;
+        let stored = (0..directory.len()).map(|index| directory.raw(index)).find(|(reference, value)| *reference == entry.reference && value.get(0x41).is_some_and(|namespace| namespace & 3 != 2)).map(|(_, value)| file_name_of(value));
         Ok(Some(stored.unwrap_or(entry.name)))
     }
 
@@ -938,12 +1133,19 @@ impl Ntfs {
         let prefix = path.trim_end_matches('/');
         // Como na enumeração do NTFS, os arquivos de metadados (registros
         // abaixo de 16: $MFT, '.', $Extend...) não aparecem na listagem.
-        Ok(Some(self.directory(entry.reference)?.entries.iter().filter(|child| child.reference >= FIRST_USER_RECORD).map(|child| alloc::format!("{prefix}/{}", child.name)).collect()))
+        let directory = self.directory(entry.reference)?;
+        Ok(Some((0..directory.len()).map(|index| directory.raw(index)).filter(|(reference, _)| *reference >= FIRST_USER_RECORD).map(|(_, value)| alloc::format!("{prefix}/{}", file_name_of(value))).collect()))
     }
 
     pub fn stat(&self, path: &str) -> Result<Option<Stat>, KernelError> {
+        Ok(self.stat_with_references(path)?.map(|(stat, _)| stat))
+    }
+
+    /// O `stat` e os registros de que a resposta depende (os diretórios do
+    /// caminho e o arquivo, `find_with_references`).
+    pub fn stat_with_references(&self, path: &str) -> Result<Option<(Stat, Vec<u64>)>, KernelError> {
         let _shared = self.resource().acquire_shared();
-        let Some(entry) = self.find(path)? else { return Ok(None) };
+        let (Some(entry), references) = self.find_with_references(path)? else { return Ok(None) };
         let record = self.read_record(entry.reference)?;
         let data = find_attribute(&record, 0x80)?;
         let standard = find_attribute(&record, 0x10)?;
@@ -954,7 +1156,7 @@ impl Ntfs {
         // registro): um diretório oculto tem só 0x02 ali e aparece como 0x12.
         let file_attributes = standard.as_ref().map(|standard| u32_at(&standard.value, 32)).filter(|&value| value != 0).unwrap_or(if directory { 0x10 } else { 0x20 }) | if directory { 0x10 } else { 0 };
         let reparse_tag = if file_attributes & super::ntfs_reparse::FILE_ATTRIBUTE_REPARSE_POINT != 0 { self.reparse_value(&record)?.filter(|value| value.len() >= 4).map_or(0, |value| u32_at(&value, 0)) } else { 0 };
-        Ok(Some(Stat {
+        let stat = Stat {
             reference: entry.reference,
             sequence: u16_at(&record, 16),
             directory,
@@ -966,7 +1168,8 @@ impl Ntfs {
             reparse_tag,
             security_id: standard.as_ref().filter(|standard| standard.value.len() >= 72).map_or(0, |standard| u32_at(&standard.value, 52)),
             times: standard.map_or(alloc::vec![0; 32], |standard| standard.value[..32].to_vec()),
-        }))
+        };
+        Ok(Some((stat, references)))
     }
 
     /// Os nomes do arquivo, na ordem dos $FILE_NAME do registro, sem os do
@@ -1038,10 +1241,10 @@ impl Ntfs {
         let _shared = self.resource().acquire_shared();
         self.fresh();
         let key = path.to_lowercase();
-        if let Some(layout) = self.caches.lock().layouts.get(&key) {
-            return Ok(layout.clone());
+        if let Some(cached) = self.caches.lock().layouts.get(&key) {
+            return Ok(cached.layout.clone());
         }
-        let Some(entry) = self.find(path)? else { return Ok(None) };
+        let (Some(entry), references) = self.find_with_references(path)? else { return Ok(None) };
         let record = self.read_record(entry.reference)?;
         let layout = match find_attribute(&record, 0x80)? {
             None => None,
@@ -1051,7 +1254,7 @@ impl Ntfs {
                 Some(Layout { size: data.real_size, valid: data.initialized_size.min(data.real_size), runs: Some(parse_runs(&record, data.run_offset)?.iter().map(|run| SectorRun { lba: run.lcn as u64 * spc, sectors: run.count * spc }).collect()) })
             }
         };
-        self.caches.lock().layouts.insert(key, layout.clone());
+        self.caches.lock().layouts.insert(key, CachedLayout { layout: layout.clone(), references });
         Ok(layout)
     }
 
