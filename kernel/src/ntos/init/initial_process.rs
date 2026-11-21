@@ -43,7 +43,10 @@
 //! cria a janela da barra de tarefas (Shell_TrayWnd), o `SHELL_RESTARTED`
 //! quando o explorer.exe que o winlogon.exe recria depois de o shell sair
 //! ([`shell_recreated`]) cria a dele, e o `STARTMENU_HOST_STARTED` quando o
-//! StartMenuExperienceHost.exe nasce com o token LowBox do usuário. Os do UserManager também: o `USERMGR_STARTED`
+//! StartMenuExperienceHost.exe nasce com o token LowBox do usuário, e a
+//! primeira janela principal de cada programa que o usuário abre
+//! ([`program_window_created`]: a janela de pasta do explorer.exe, o Bloco de
+//! Notas, o console do conhost.exe e o Gerenciador de Tarefas). Os do UserManager também: o `USERMGR_STARTED`
 //! ([`image_mapped`]) quando um svchost.exe mapeia o usermgr.dll, e o
 //! `UMGR_USER_LOGIN` e o `SIHOST_READY` ([`wnf_updated`]) quando esse svchost
 //! publica o aviso do logon e o do sihost.exe pronto.
@@ -275,6 +278,37 @@ static SHELL_RESTARTED: AtomicBool = AtomicBool::new(false);
 /// A classe da janela da barra de tarefas do explorer.exe.
 const SHELL_TRAY_CLASS: &str = "Shell_TrayWnd";
 
+/// As janelas principais dos programas que a sessão do usuário abre, como
+/// observação ([`program_window_created`]): a imagem, a classe que ela
+/// registra e cria pelo nome e o marcador.
+const PROGRAM_WINDOWS: &[(&str, &str, &str)] = &[
+    // A janela de pasta do explorer.exe (o CExplorerFrame do ExplorerFrame.dll).
+    ("explorer.exe", "CabinetWClass", "EXPLORER_WINDOW_CREATED"),
+    // A caixa Executar do explorer.exe (Win+R) é um diálogo #32770: sem
+    // marcador próprio, a janela do programa que ela abre é o que conta.
+    ("notepad.exe", "Notepad", "NOTEPAD_WINDOW_CREATED"),
+    // A janela do console do cmd.exe é do conhost.exe que o condrv.sys sobe.
+    ("conhost.exe", "ConsoleWindowClass", "CONSOLE_WINDOW_CREATED"),
+    ("taskmgr.exe", "TaskManagerWindow", "TASKMGR_WINDOW_CREATED"),
+];
+/// Os marcadores de [`PROGRAM_WINDOWS`] que já saíram (um bit por linha).
+static PROGRAM_WINDOWS_SEEN: AtomicU32 = AtomicU32::new(0);
+
+/// O NtUserCreateWindowEx de um processo da sessão 1 voltou com a janela
+/// `hwnd` da classe `class`: a primeira janela de cada linha de
+/// [`PROGRAM_WINDOWS`] põe na serial a linha e o marcador dela.
+fn program_window_created(image: &str, class: &str, hwnd: u64) {
+    for (index, (program, window_class, marker)) in PROGRAM_WINDOWS.iter().enumerate() {
+        if !image.eq_ignore_ascii_case(program) || !class.eq_ignore_ascii_case(window_class) {
+            continue;
+        }
+        if PROGRAM_WINDOWS_SEEN.fetch_or(1 << index, Ordering::AcqRel) & (1 << index) == 0 {
+            crate::debug_print!("[init] {} (pid {}): janela {} criada (hwnd {:#x})", image, process::get_current_process_id(), window_class, hwnd);
+            crate::debug_print!("{}", marker);
+        }
+    }
+}
+
 /// Um serviço da tabela do win32k voltou ao modo usuário com `result`, com
 /// os argumentos `arguments` (o pacote do serviço): o `SHELL_TRAY_CREATED`
 /// sai quando o NtUserCreateWindowEx (o número do stub do win32u.dll) do
@@ -291,13 +325,8 @@ pub fn win32k_window_created(service_number: u32, arguments: &[u64], result: u64
     if !boot_config::smss_boot() || result == 0 || arguments.len() < 2 || !USER_LOGON_OK.load(Ordering::Acquire) {
         return;
     }
-    let restarted = RESTARTED_SHELL.load(Ordering::Acquire);
-    let restart = restarted != 0 && !SHELL_RESTARTED.load(Ordering::Acquire) && process::get_current_process_id() == restarted;
-    if !restart && SHELL_TRAY_CREATED.load(Ordering::Acquire) {
-        return;
-    }
     let current = process::get_current_process();
-    if crate::ntos::mm::session::session_id(current) != 1 || !image_name(current).eq_ignore_ascii_case("explorer.exe") {
+    if crate::ntos::mm::session::session_id(current) != 1 {
         return;
     }
     let mut number = CREATE_WINDOW_SERVICE.load(Ordering::Acquire);
@@ -310,10 +339,18 @@ pub fn win32k_window_created(service_number: u32, arguments: &[u64], result: u64
     }
     let Ok(class) = state::user_struct::<LargeString>(arguments[1]) else { return };
     let (Ok(length), Ok(buffer)) = (class.length.probe_get(), class.buffer.probe_get()) else { return };
-    if buffer < 0x1_0000 || length as usize != SHELL_TRAY_CLASS.len() * 2 {
+    if buffer < 0x1_0000 || length == 0 || length > 512 {
         return;
     }
-    if !state::try_read_user_wide_string(buffer, u64::from(length / 2)).is_ok_and(|name| name.eq_ignore_ascii_case(SHELL_TRAY_CLASS)) {
+    let Ok(class_name) = state::try_read_user_wide_string(buffer, u64::from(length / 2)) else { return };
+    let image = image_name(current);
+    program_window_created(&image, &class_name, result);
+    let restarted = RESTARTED_SHELL.load(Ordering::Acquire);
+    let restart = restarted != 0 && !SHELL_RESTARTED.load(Ordering::Acquire) && process::get_current_process_id() == restarted;
+    if !restart && SHELL_TRAY_CREATED.load(Ordering::Acquire) {
+        return;
+    }
+    if !image.eq_ignore_ascii_case("explorer.exe") || !class_name.eq_ignore_ascii_case(SHELL_TRAY_CLASS) {
         return;
     }
     if restart {
