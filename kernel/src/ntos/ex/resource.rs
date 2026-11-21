@@ -30,13 +30,15 @@ struct WaitBlock {
     /// -> `_KTHREAD`
     thread: Field<u64>,
     event: Kevent,
+    /// O ERESOURCE esperado (o diagnóstico de parada chega ao dono por ele).
+    resource: Field<u64>,
 }
 
 // SAFETY: #[repr(C)] só de células.
 unsafe impl NtStruct for WaitBlock {}
 
 const _: () = {
-    assert!(core::mem::size_of::<WaitBlock>() == 0x30);
+    assert!(core::mem::size_of::<WaitBlock>() == 0x38);
     assert!(core::mem::offset_of!(WaitBlock, thread) == 0x10);
     assert!(core::mem::offset_of!(WaitBlock, event) == 0x18);
 };
@@ -343,6 +345,23 @@ fn wake_exclusive(resource: &Eresource) -> Result<(), KernelError> {
     Ok(())
 }
 
+/// Diagnóstico de parada: `event` é o evento de um bloco de espera de
+/// ERESOURCE (a espera WrResource de uma thread): o recurso, o dono
+/// exclusivo (KTHREAD, 0 sem dono exclusivo) e as entradas ativas.
+pub fn describe_wait_event(event: u64) -> Option<(u64, u64, u32)> {
+    let address = event.checked_sub(core::mem::offset_of!(WaitBlock, event) as u64)?;
+    // SAFETY: o evento de um bloco publicado por `Request::poll`, vivo
+    // enquanto a thread espera nele.
+    let block = unsafe { WaitBlock::at(address) };
+    let resource = block.resource.get();
+    if resource < 0xFFFF_8000_0000_0000 {
+        return None;
+    }
+    let body = resource_at(resource);
+    let owner = if is_exclusive(body) { body.owner_entry.owner_thread.get() } else { 0 };
+    Some((resource, owner, body.active_entries.get()))
+}
+
 /// Aquisição suspensível.
 pub struct Request {
     resource: u64,
@@ -351,6 +370,14 @@ pub struct Request {
     wait: bool,
     critical: bool,
     block: u64,
+    /// O bloco cuja posse já foi entregue, solto só no fim da requisição.
+    /// O `acquire_signaled` sonda dentro do `wait_once`, que registra a espera
+/// no evento do bloco antes de sondar e só a desfaz depois: o bloco (com o
+/// evento) não pode voltar ao pool nem ser reiniciado enquanto a sondagem
+/// roda; solto antes, outra CPU o recebia com o KWAIT_BLOCK ainda na lista
+/// do evento (o 0x139 no ExEnterCriticalRegionAndAcquireResourceExclusive
+/// do win32k).
+    finished: u64,
     result: Option<u64>,
 }
 
@@ -362,7 +389,7 @@ pub fn begin(resource: u64, mode: Mode, wait: bool, enter_critical: bool) -> Res
     if enter_critical {
         critical_region::enter_critical()?;
     }
-    Ok(Request { resource, thread, mode, wait: enter_critical || wait, critical: enter_critical, block: 0, result: None })
+    Ok(Request { resource, thread, mode, wait: enter_critical || wait, critical: enter_critical, block: 0, finished: 0, result: None })
 }
 
 impl Request {
@@ -380,8 +407,7 @@ impl Request {
                 if unsafe { WaitBlock::at(self.block) }.event.header.signal_state.get() == 0 {
                     return Ok(None);
                 }
-                guest::free_bytes(self.block);
-                self.block = 0;
+                self.finished = core::mem::replace(&mut self.block, 0);
                 return Ok(Some(1));
             }
             let active = resource.active_entries.get();
@@ -419,6 +445,7 @@ impl Request {
             // SAFETY: alocação nova do tamanho do bloco.
             let block = unsafe { WaitBlock::at(allocation) };
             block.thread.set(thread);
+            block.resource.set(self.resource);
             // Evento de sincronização (Type 1, Size 6); SignalState é o
             // indicador de posse concedida.
             block.event.header.lock.set(0x0006_0001);
@@ -450,6 +477,14 @@ impl Request {
         let value = if self.critical { unsafe { Kthread::at(thread) }.win32_thread.get() } else { value };
         self.result = Some(value);
         Ok(Some(value))
+    }
+}
+
+impl Drop for Request {
+    fn drop(&mut self) {
+        if self.finished != 0 {
+            guest::free_bytes(self.finished);
+        }
     }
 }
 

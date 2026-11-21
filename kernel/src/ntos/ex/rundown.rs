@@ -141,6 +141,22 @@ pub struct RundownRequest {
     block: u64,
     done: bool,
     observer: u64,
+    /// O bloco do encerramento concluído, solto só no fim da requisição.
+    /// O `acquire_signaled` sonda dentro do `wait_once`, que registra a espera
+/// no evento do bloco antes de sondar e só a desfaz depois: o bloco (com o
+/// evento) não pode voltar ao pool nem ser reiniciado enquanto a sondagem
+/// roda; solto antes, outra CPU o recebia com o KWAIT_BLOCK ainda na lista
+/// do evento (o 0x139 no ExEnterCriticalRegionAndAcquireResourceExclusive
+/// do win32k).
+    finished: u64,
+}
+
+impl Drop for RundownRequest {
+    fn drop(&mut self) {
+        if self.finished != 0 {
+            guest::free_bytes(self.finished);
+        }
+    }
 }
 
 impl RundownRequest {
@@ -149,9 +165,8 @@ impl RundownRequest {
             word(slot).swap(1, SeqCst);
         }
         if self.block != 0 {
-            guest::free_bytes(self.block);
+            self.finished = core::mem::replace(&mut self.block, 0);
         }
-        self.block = 0;
         self.done = true;
     }
 
@@ -180,7 +195,7 @@ impl RundownRequest {
 pub fn begin(pointer: u64, cache_aware: bool) -> Result<RundownRequest, KernelError> {
     require_irql(1)?;
     let slots = if cache_aware { cache_reference_slots(pointer)? } else { alloc::vec![pointer] };
-    let mut request = RundownRequest { slots, block: 0, done: false, observer: 0 };
+    let mut request = RundownRequest { slots, block: 0, done: false, observer: 0, finished: 0 };
     let first = word(request.slots[0]);
     if !cache_aware {
         let mut value = cas(first, 0, 1);

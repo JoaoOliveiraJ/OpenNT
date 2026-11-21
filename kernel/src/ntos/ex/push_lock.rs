@@ -4,6 +4,7 @@
 //! aguardante possui sua alocação até ser desligado e retomar. Os caminhos
 //! rápidos inline dos drivers observam os mesmos bits e ligações.
 
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering::SeqCst};
 
 use crate::ntos::inc::field::{Field, NtStruct};
@@ -175,11 +176,30 @@ pub struct PushLockRequest {
     allocation: u64,
     queued: bool,
     parked: bool,
+    /// Blocos já publicados, soltos só no fim da requisição.
+    /// O `acquire_signaled` sonda dentro do `wait_once`, que registra a espera
+/// no evento do bloco antes de sondar e só a desfaz depois: o bloco (com o
+/// evento) não pode voltar ao pool nem ser reiniciado enquanto a sondagem
+/// roda; solto antes, outra CPU o recebia com o KWAIT_BLOCK ainda na lista
+/// do evento (o 0x139 no ExEnterCriticalRegionAndAcquireResourceExclusive
+/// do win32k).
+    retired: Vec<u64>,
+}
+
+impl Drop for PushLockRequest {
+    fn drop(&mut self) {
+        for block in self.retired.drain(..) {
+            guest::free_bytes(block);
+        }
+        if self.allocation != 0 {
+            guest::free_bytes(self.allocation);
+        }
+    }
 }
 
 pub fn begin(pointer: u64, shared: bool, flags: u32) -> Result<PushLockRequest, KernelError> {
     validate(flags, 1)?;
-    Ok(PushLockRequest { pointer, shared, allocation: 0, queued: false, parked: false })
+    Ok(PushLockRequest { pointer, shared, allocation: 0, queued: false, parked: false, retired: Vec::new() })
 }
 
 impl PushLockRequest {
@@ -196,13 +216,15 @@ impl PushLockRequest {
             }
             self.queued = false;
             self.parked = false;
+            // O bloco publicado pode ainda estar vigiado: uma espera nova usa
+            // outro.
+            self.retired.push(core::mem::replace(&mut self.allocation, 0));
         }
         loop {
             if try_acquire(word, self.shared) {
                 if self.allocation != 0 {
-                    guest::free_bytes(self.allocation);
+                    self.retired.push(core::mem::replace(&mut self.allocation, 0));
                 }
-                self.allocation = 0;
                 return Ok(Some(()));
             }
             if self.allocation == 0 {
@@ -246,6 +268,7 @@ impl PushLockRequest {
             }
             self.queued = false;
             self.parked = false;
+            self.retired.push(core::mem::replace(&mut self.allocation, 0));
         }
     }
 }
