@@ -203,13 +203,21 @@ fn size_bar(bus: u32, device: u32, function: u32, offset: u32, original: u32) ->
 }
 
 /// Varre os 256 barramentos e habilita IO/Memory/BusMaster nas funções com
-/// BARs, como o pci.sys no START_DEVICE.
+/// BARs, como o pci.sys no START_DEVICE. Como manda a especificação do PCI
+/// (e como o pci.sys enumera), um dispositivo sem a função 0 não existe, e
+/// as funções 1 a 7 só são lidas no dispositivo multifunção (o bit 7 do
+/// HeaderType da função 0): sob um hipervisor cada leitura de configuração
+/// são duas saídas da máquina virtual.
 pub fn enumerate() -> Result<usize, KernelError> {
     let mut found = Vec::new();
     let mut pdo_index = 0;
     for bus in 0..256 {
         for device in 0..32 {
-            for function in 0..8 {
+            if pci_config::read(bus, device, 0, 0x00, 2)? == 0xFFFF {
+                continue;
+            }
+            let functions = if pci_config::read(bus, device, 0, 0x0E, 1)? & 0x80 != 0 { 8 } else { 1 };
+            for function in 0..functions {
                 let vendor_id = pci_config::read(bus, device, function, 0x00, 2)?;
                 if vendor_id == 0xFFFF {
                     continue;
