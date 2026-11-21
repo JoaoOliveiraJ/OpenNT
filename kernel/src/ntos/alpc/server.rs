@@ -89,7 +89,7 @@ use crate::ntos::alpc::message::view as message_view;
 use crate::ntos::alpc::port_reference;
 use crate::ntos::alpc::rpc_trace::{self, Direction, Record};
 use crate::ntos::alpc::small::context_attribute;
-use crate::ntos::alpc::transport::{self, Job, JobResult, Listener, Reply, Request, Sender, Service};
+use crate::ntos::alpc::transport::{self, ConnectWait, Job, JobResult, Listener, Reply, Request, Sender, Service};
 use crate::ntos::inc::field::NtStruct;
 use crate::ntos::alpc::message::handles::{self as message_handles, HandleData};
 use crate::ntos::alpc::message::identity::Retained;
@@ -458,7 +458,7 @@ impl UserServer {
             (core::mem::take(&mut state.connections), core::mem::take(&mut state.requests), core::mem::take(&mut state.queue), core::mem::take(&mut state.exposed_views), core::mem::take(&mut state.received), core::mem::take(&mut state.callbacks))
         };
         for connection in connections.values() {
-            refuse(connection);
+            refuse(connection, None);
         }
         for slot in requests.values().chain(callbacks.values()) {
             *slot.result.lock() = Some(JobResult { status: STATUS_PORT_DISCONNECTED, ..JobResult::default() });
@@ -487,6 +487,12 @@ impl UserServer {
     /// servidor distingue por ele o cliente de kernel (o CoreMessagingK do
     /// win32kbase no registrar do CoreMessaging).
     pub fn request_connection(&self, port: &Arc<Port>, data: &[u8], view: Option<Arc<ClientView>>, kernel_mode: bool) -> Decision {
+        self.request_connection_waiting(port, data, view, kernel_mode, ConnectWait::default())
+    }
+
+    /// `request_connection` com o modo e a alertabilidade da espera pela
+    /// decisão; uma espera interrompida devolve o status dela.
+    pub fn request_connection_waiting(&self, port: &Arc<Port>, data: &[u8], view: Option<Arc<ClientView>>, kernel_mode: bool, wait: ConnectWait) -> Decision {
         let message_type = LPC_CONTINUATION_REQUIRED | LPC_CONNECTION_REQUEST | if kernel_mode { LPC_KERNELMODE_MESSAGE } else { 0 };
         let sender = current_sender();
         let pending = Arc::new(PendingConnection { client: port.clone(), sender, view: view.clone(), decision: SpinLock::new(None) });
@@ -505,7 +511,7 @@ impl UserServer {
         }
         self.enqueue(Delivery { id, message_type, data: Vec::from(data), sender, port_context: 0, view, sequence, ..Delivery::default() });
         let decision = pending.clone();
-        let status = kernel_entry::wait_transport(&mut || decision.decision.lock().as_ref().map(|decision| decision.status), crate::ntos::ke::wait::Deadline::Infinite, 0, false);
+        let status = kernel_entry::wait_transport(&mut || decision.decision.lock().as_ref().map(|decision| decision.status), crate::ntos::ke::wait::Deadline::Infinite, wait.mode, wait.alertable);
         let decision = pending.decision.lock().take().unwrap_or(Decision { status, ..Decision::default() });
         if rpc_trace::enabled() {
             rpc_trace::connection_decided(self.listener.pointer, sender.process, self.listener.process_id(), id, decision.status);
@@ -528,12 +534,32 @@ impl UserServer {
 }
 
 /// A recusa de uma conexão: STATUS_PORT_CONNECTION_REFUSED para o cliente e
-/// a vista dele, se o servidor já a tinha, fora do servidor.
-fn refuse(connection: &PendingConnection) {
+/// a vista dele, se o servidor já a tinha, fora do servidor. A recusa do
+/// servidor (`port_context`, o PortContext do accept) vai ao PortContext de
+/// um cliente com ReturnExtendedInfo, como no AlpcpAcceptConnectPort do
+/// 19041 (0x5e162c); o fechamento da porta de conexão não tem PortContext.
+fn refuse(connection: &PendingConnection, port_context: Option<u64>) {
     if let Some(view) = &connection.view {
         view.withdraw();
     }
+    if let Some(port_context) = port_context {
+        connection.client.with(|state| {
+            if state.return_extended_info {
+                state.port_context = port_context;
+            }
+        });
+    }
     *connection.decision.lock() = Some(Decision { status: STATUS_PORT_CONNECTION_REFUSED, ..Decision::default() });
+}
+
+/// O valor que um cliente com ReturnExtendedInfo recebe em *PortHandle numa
+/// conexão recusada (STATUS_PORT_CONNECTION_REFUSED): o PortContext que o
+/// servidor deu na recusa (AlpcpConnectPort do 19041, 0x7eccda).
+pub fn extended_refusal(port: &Arc<Port>, status: u32) -> Option<u64> {
+    if status != STATUS_PORT_CONNECTION_REFUSED {
+        return None;
+    }
+    port.with(|state| state.return_extended_info.then_some(state.port_context))
 }
 
 /// A continuação do pedido de um cliente: conclui quando o servidor responde;
@@ -583,9 +609,13 @@ impl Service for UserServer {
     /// `request` é o PORT_MESSAGE de conexão já formatado, com o Type que o
     /// chamador de kernel deu.
     fn connect(&self, port: &Arc<Port>, data: &[u8], request: Option<&[u8]>) -> Reply {
+        self.connect_waiting(port, data, request, ConnectWait::default())
+    }
+
+    fn connect_waiting(&self, port: &Arc<Port>, data: &[u8], request: Option<&[u8]>, wait: ConnectWait) -> Reply {
         let type_offset = offset_of!(PortMessage, u2.s2.type_);
         let kernel_mode = request.and_then(|bytes| bytes.get(type_offset..type_offset + 2)).is_some_and(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]) & LPC_KERNELMODE_MESSAGE != 0);
-        let decision = self.request_connection(port, data, None, kernel_mode);
+        let decision = self.request_connection_waiting(port, data, None, kernel_mode, wait);
         let server = Sender { process: self.listener.process_id(), thread: self.listener.thread_id(), thread_pointer: 0 };
         Reply::Now(JobResult { status: decision.status, data: decision.data, sender: Some(server) })
     }
@@ -1641,7 +1671,7 @@ pub fn accept_legacy(out: u64, port_context: u64, request: u64, accept: bool, vi
         return Ok(Err(STATUS_INVALID_CID));
     }
     if !accept {
-        refuse(&pending);
+        refuse(&pending, Some(port_context));
         kernel_entry::notify_waiters();
         return Ok(Ok(LegacyAccepted::default()));
     }
@@ -2023,7 +2053,7 @@ pub fn accept_connect_port_with(out: u64, connection: u64, attributes: u64, port
         let id = u32::from_le_bytes([captured.header[id_offset], captured.header[id_offset + 1], captured.header[id_offset + 2], captured.header[id_offset + 3]]);
         let Some(pending) = server.state.lock().connections.get(&id).cloned() else { return Ok(STATUS_REPLY_MESSAGE_MISMATCH) };
         if !accept {
-            refuse(&pending);
+            refuse(&pending, Some(port_context));
             kernel_entry::notify_waiters();
             return Ok(STATUS_SUCCESS);
         }

@@ -19,6 +19,7 @@ use crate::ntos::alpc::resource::handles::Communication;
 use crate::ntos::alpc::small::{context_attribute, direct_event};
 use crate::ntos::alpc::transport::{JobResult, Message, Reply, Request, RequestState, Sender};
 use crate::ntos::alpc::kernel_wait;
+use crate::ntos::alpc::server;
 use crate::ntos::alpc::message::{buffer as message_buffer, handles as message_handles, security as message_security};
 use crate::ntos::ke::{critical_region, dispatcher, irql};
 use crate::ntos::ob::objects::port::{self as port_objects, Port, PortState, Role};
@@ -326,6 +327,23 @@ fn cleanup(shared: &Shared, status: u32) -> Result<(), KernelError> {
     result.and(left)
 }
 
+/// A recusa de um cliente com ReturnExtendedInfo: o PortContext da recusa
+/// em *PortHandle (AlpcpConnectPort, 0x7eccda); o status segue o mesmo.
+fn extended_refusal(shared: &Shared, port: &Arc<Port>, status: u32) -> u32 {
+    let Some(context) = server::extended_refusal(port, status) else { return status };
+    let (output, mode) = {
+        let connection = shared.lock();
+        (connection.output, connection.mode)
+    };
+    if !message_buffer::writable(output, 8, mode) {
+        return 0xC000_0005;
+    }
+    match message_buffer::write_field::<u64>(output, 0, context) {
+        Ok(()) => status,
+        Err(fault) => fault,
+    }
+}
+
 fn publish(shared: &Shared) -> u32 {
     let mut connection = shared.lock();
     if !message_buffer::writable(connection.output, 8, connection.mode) {
@@ -420,6 +438,8 @@ fn connect(shared: &Shared, transferred: &mut bool, pointers: [u64; 10], flags: 
         connection_state: port_objects::CONNECTION_PENDING,
         message_sequence: 1,
         port_context: 0,
+        // A flag 0x80000: o ReturnExtendedInfo (AlpcpCreateClientPort, 0x5e084e).
+        return_extended_info: flags & 0x8_0000 != 0,
         creation_flags: creation.flags,
         exclusive_process: if creation.flags & 0x20 != 0 { process::get_current_process() } else { 0 },
         on_disconnect: Some(transport::disconnect_transport),
@@ -544,7 +564,7 @@ fn connect(shared: &Shared, transferred: &mut bool, pointers: [u64; 10], flags: 
     // O callback pode fechar a própria porta: o job é publicado antes que
     // `run` reavalie a limpeza, para que o cancelamento também o libere.
     let bytes = request.state.lock().connect_bytes.clone();
-    let decision = port.run(|| service.connect(&port, &message.data, Some(&bytes)));
+    let decision = port.run(|| service.connect_waiting(&port, &message.data, Some(&bytes), crate::ntos::alpc::transport::ConnectWait::from_flags(flags, mode)));
     let immediate = match decision {
         Reply::Now(result) => Some(result),
         Reply::Later(job) => {
@@ -575,7 +595,7 @@ fn connect(shared: &Shared, transferred: &mut bool, pointers: [u64; 10], flags: 
                 poll_request(request)?;
                 let Some((status, bytes)) = request.state.lock().connect_result.clone() else { return Ok(None) };
                 if status != 0 {
-                    return Ok(Some(status));
+                    return Ok(Some(extended_refusal(shared, port, status)));
                 }
                 if connection_message != 0 {
                     let delivered = message_buffer::deliver(&receive_buffer, bytes.as_deref().unwrap_or(&[]), true);

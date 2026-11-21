@@ -111,6 +111,12 @@ pub struct PortState {
     pub service_process: u64,
     pub context: u64,
     pub port_context: u64,
+    /// ALPC_PORT.u1.State.ReturnExtendedInfo (bit 8): a porta de cliente de
+    /// uma conexão com a flag 0x80000. Na recusa o AlpcpAcceptConnectPort
+    /// grava o PortContext do servidor no PortContext dela, e o
+    /// AlpcpConnectPort o devolve em *PortHandle com
+    /// STATUS_PORT_CONNECTION_REFUSED.
+    pub return_extended_info: bool,
     pub closing: bool,
     pub skip_pending_flush: bool,
     pub peer_disconnected: bool,

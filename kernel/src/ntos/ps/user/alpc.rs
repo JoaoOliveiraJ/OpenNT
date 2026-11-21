@@ -36,6 +36,10 @@ const AV: u32 = 0xC000_0005;
 const INVALID: u32 = 0xC000_000D;
 /// ALPC_PORFLG_WAITABLE_PORT.
 const WAITABLE_PORT: u32 = 0x4_0000;
+/// A flag de conexão que liga o ReturnExtendedInfo da porta do cliente.
+const RETURN_EXTENDED_INFO: u32 = 0x8_0000;
+/// ALPC_MSGFLG_RELEASE_MESSAGE.
+const RELEASE_MESSAGE: u32 = 0x1_0000;
 
 /// Conexões com trabalho de transporte.
 static PORTS: SpinLock<Vec<Arc<Port>>> = SpinLock::new(Vec::new());
@@ -693,12 +697,26 @@ fn connect_port(out: u64, name: u64, oa: u64, port_attributes: u64, rsp: u64, re
     if let Err(status) = crate::ntos::alpc::server::check_connect_access(node, &path) {
         return Ok(status);
     }
-    let flags = state::stack_arg32(rsp, 5);
+    // AlpcpConnectPort (0x5df6bc) fica só com as flags altas. A 0x80000 liga
+    // o ReturnExtendedInfo da porta do cliente (AlpcpCreateClientPort,
+    // 0x5e084e): o UMPDC.dll conecta à \PdcPort com 0xA0000 e lê a recusa do
+    // pdc.sys em *PortHandle. As de espera (0x100000, 0x200000) vão à espera
+    // pela decisão; as demais não têm efeito na conexão.
+    let flags = state::stack_arg32(rsp, 5) & 0xFFFF_0000;
     let message = state::stack_arg(rsp, 7);
     let length = state::stack_arg(rsp, 8);
     let send_attributes = state::stack_arg(rsp, 9);
     let receive_attributes = state::stack_arg(rsp, 10);
-    if flags & !0x2_0000 != 0 {
+    // AlpcpProcessConnectionRequest (0x5ded2c): RELEASE_MESSAGE numa conexão
+    // é STATUS_INVALID_PARAMETER.
+    if flags & RELEASE_MESSAGE != 0 {
+        return Ok(INVALID);
+    }
+    // ALPC_MSGFLG_WOW64_CALL sem o bit 30: o PORT_MESSAGE e os atributos de
+    // 32 bits (AlpcpProbeAndCaptureMessageHeader, 0x5e0288), que o OpenNT não
+    // tem.
+    if flags & 0xC000_0000 == 0x8000_0000 {
+        crate::debug_print!("[alpc] conexao com mensagem de 32 bits (ALPC_MSGFLG_WOW64_CALL) sem suporte");
         return Ok(0xC000_00BB);
     }
     let mut status = check_server_security(state::stack_arg(rsp, 6), required_sid, listener.process);
@@ -785,6 +803,7 @@ fn connect_port(out: u64, name: u64, oa: u64, port_attributes: u64, rsp: u64, re
         // conclusão da conexão é a entrega 1.
         message_sequence: 1,
         port_context: 0,
+        return_extended_info: flags & RETURN_EXTENDED_INFO != 0,
         role: Role::Client,
         port_flags,
         duplicate_object_types,
@@ -829,12 +848,16 @@ fn connect_port(out: u64, name: u64, oa: u64, port_attributes: u64, rsp: u64, re
     }
     let result = port.run(|| -> Result<u32, KernelError> {
         port.set_started(true);
-        let result = match service.connect(&port, &data, None) {
+        // A espera pela decisão no modo anterior (UserMode).
+        let result = match service.connect_waiting(&port, &data, None, crate::ntos::alpc::transport::ConnectWait::from_flags(flags, 1)) {
             Reply::Now(result) => result,
             Reply::Later(_) => return Err(KernelError::new("ALPC service deferred a direct connection")),
         };
         if port.closed() {
             return Ok(0xC000_0037);
+        }
+        if let Some(context) = crate::ntos::alpc::server::extended_refusal(&port, result.status) {
+            guest::try_write::<u64>(out, context)?;
         }
         if result.status != 0 {
             return Ok(result.status);

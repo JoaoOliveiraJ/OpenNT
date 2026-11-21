@@ -5310,8 +5310,18 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   ALPC_PORT_ATTRIBUTES usa os atributos padrão do 19041 (ALLOW_IMPERSONATION,
   o QOS anônimo, dinâmico e só efetivo e MaxMessageLength 0x200); com eles,
   o MaxMessageLength da porta do cliente é o pedido (de 0x28 a 0xFFFF, senão
-  STATUS_INVALID_PARAMETER) limitado ao da porta de conexão. O NtQueryInformationPort só
-  confere o handle e zera o ReturnLength.
+  STATUS_INVALID_PARAMETER) limitado ao da porta de conexão. As flags da
+  conexão (de modo usuário e do ZwAlpcConnectPort) seguem o AlpcpConnectPort:
+  só as altas contam; RELEASE_MESSAGE dá STATUS_INVALID_PARAMETER; a espera
+  pela decisão do servidor é no modo anterior (UserMode com 0x100000) e
+  alertável com 0x200000; a 0x80000 liga o ReturnExtendedInfo da porta do
+  cliente, e numa recusa o PortContext que o servidor deu no
+  NtAlpcAcceptConnectPort volta em *PortHandle junto com
+  STATUS_PORT_CONNECTION_REFUSED (o UMPDC.dll conecta assim à `\PdcPort` e
+  lê ali o motivo da recusa do pdc.sys). A mensagem de 32 bits
+  (ALPC_MSGFLG_WOW64_CALL) não existe: STATUS_NOT_SUPPORTED, com registro.
+  O autoteste `kwait` recusa uma conexão com e sem a 0x80000. O
+  NtQueryInformationPort só confere o handle e zera o ReturnLength.
   NtReplyWaitReplyPort e as mensagens com PORT_DATA_INFORMATION
   (NtReadRequestData/NtWriteRequestData) não existem no transporte:
   STATUS_NOT_SUPPORTED, com registro. Em volta: NtRegisterThreadTerminatePort

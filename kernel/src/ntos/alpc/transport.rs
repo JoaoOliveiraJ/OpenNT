@@ -110,6 +110,24 @@ pub enum Reply {
     Later(Box<dyn Job>),
 }
 
+/// A espera de uma conexão síncrona pela decisão do servidor: o
+/// AlpcpProcessConnectionRequest do 19041 (0x5dee9d) espera no modo anterior
+/// (UserMode com ALPC_MSGFLG_WAIT_USER_MODE, 0x100000) e o
+/// AlpcpSignalAndWait (0x205175) é alertável com ALPC_MSGFLG_WAIT_ALERTABLE
+/// (0x200000) nas flags da conexão.
+#[derive(Clone, Copy, Default)]
+pub struct ConnectWait {
+    pub mode: u8,
+    pub alertable: bool,
+}
+
+impl ConnectWait {
+    /// A espera de uma conexão com estas flags, feita a partir de `previous_mode`.
+    pub fn from_flags(flags: u32, previous_mode: u8) -> ConnectWait {
+        ConnectWait { mode: if flags & 0x10_0000 != 0 { 1 } else { previous_mode }, alertable: flags & 0x20_0000 != 0 }
+    }
+}
+
 /// Serviço hospedado no kernel por trás de um nome de porta. `connect`
 /// recebe a carga da conexão (e, nas entradas Ex/Zw, o PORT_MESSAGE
 /// montado); `exchange` cada pedido; `request` o contrato LPC legado.
@@ -120,6 +138,11 @@ pub trait Service: Send + Sync {
         0
     }
     fn connect(&self, port: &Arc<Port>, data: &[u8], request: Option<&[u8]>) -> Reply;
+    /// `connect` com o modo e a alertabilidade da espera pela decisão do
+    /// servidor; um serviço que decide sem esperar ignora os dois.
+    fn connect_waiting(&self, port: &Arc<Port>, data: &[u8], request: Option<&[u8]>, _wait: ConnectWait) -> Reply {
+        self.connect(port, data, request)
+    }
     fn exchange(&self, _port: &Arc<Port>, _data: &[u8], _request: &Arc<Request>) -> Reply {
         Reply::Now(JobResult { status: 0xC000_00BB, ..JobResult::default() })
     }

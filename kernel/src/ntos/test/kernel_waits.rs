@@ -31,6 +31,12 @@
 //!   CLIENT_ID do servidor), com um pedido síncrono; o servidor recebe esse
 //!   pedido e responde com RELEASE_MESSAGE, que chega como LPC_REPLY e não se
 //!   responde mais;
+//! - a recusa de uma conexão ALPC com ReturnExtendedInfo (o UMPDC.dll na
+//!   \PdcPort do pdc.sys): o servidor recusa com um PortContext; o cliente
+//!   que conectou com a flag 0x80000 recebe STATUS_PORT_CONNECTION_REFUSED e
+//!   o PortContext em *PortHandle, o que conectou sem ela só o status, e a
+//!   conexão com RELEASE_MESSAGE é STATUS_INVALID_PARAMETER sem chegar ao
+//!   servidor;
 //! - o handle que a resposta ALPC leva (o token do UMgrLogonUser do
 //!   UserManager ao winlogon): o servidor responde com o atributo de handles
 //!   de um token; o cliente com as flags da porta de cliente do RPC recebe a
@@ -609,6 +615,85 @@ fn alpc_answer_pair(assert: Assert) {
         "kwait: resposta ALPC sem RELEASE_MESSAGE chega como LPC_REQUEST com LPC_CONTINUATION_REQUIRED e o cliente a responde pelo MessageId, no buffer reaproveitado; a resposta com RELEASE_MESSAGE e LPC_REPLY e nao se responde",
     );
     let _ = call_export("ZwClose", &[guest::read64(block + 8)]);
+    let _ = call_export("ZwClose", &[guest::read64(block)]);
+    for handle in [server_handle, client_handle] {
+        let _ = object_manager::close(handle as u32);
+    }
+    guest::free_bytes(name);
+    guest::free_bytes(block);
+}
+
+// ---- a recusa com ReturnExtendedInfo ---------------------------------------
+
+/// A porta da recusa; o bloco usa os campos do par ALPC. Resultados: [0]
+/// criação, [1] e [3] as conexões recebidas, [2] e [4] as recusas delas,
+/// [5] a conexão com RELEASE_MESSAGE e [6] o *PortHandle dela, [7] a conexão
+/// com ReturnExtendedInfo e [8] o *PortHandle dela, [9] a conexão sem a flag
+/// e [10] o *PortHandle dela.
+const ALPC_REFUSAL_NAME: &str = "\\OpenNtAlpcRefusal";
+/// O PortContext da recusa (o NTSTATUS que o servidor devolve por ele).
+const REFUSAL_CONTEXT: u64 = 0xC000_0022;
+/// O *PortHandle antes de cada conexão.
+const HANDLE_SENTINEL: u64 = 0x5A5A_5A5A;
+
+extern "win64" fn alpc_refusal_server(block: u64) {
+    let (server_out, communication_out, length, attributes, receive) = (block, block + 8, block + 0x10, block + 0x40, block + 0x100);
+    let object_attributes = object_attributes_for(block + 0x700, ALPC_REFUSAL_NAME, 0x200);
+    let created = call_export("ZwAlpcCreatePort", &[server_out, object_attributes, attributes]).unwrap_or(u64::MAX);
+    record(block, 0, created);
+    call_export("KeSetEvent", &[block + 0x28, 0, 0]);
+    if created != 0 {
+        return;
+    }
+    let server = guest::read64(server_out);
+    for round in 0..2 {
+        guest::write64(length, 0x200);
+        record(block, 1 + round * 2, call_export("ZwAlpcSendWaitReceivePort", &[server, 0, 0, 0, receive, length, 0, 0]).unwrap_or(u64::MAX));
+        record(block, 2 + round * 2, call_export("ZwAlpcAcceptConnectPort", &[communication_out, server, 0, 0, 0, REFUSAL_CONTEXT, receive, 0, 0]).unwrap_or(u64::MAX));
+    }
+}
+
+extern "win64" fn alpc_refusal_client(block: u64) {
+    let (client_out, length, attributes, connect) = (block + 0x20, block + 0x18, block + 0x40, block + 0x400);
+    let ready = call_export("KeWaitForSingleObject", &[block + 0x28, 0, 0, 0, 0]).unwrap_or(u64::MAX);
+    if ready != 0 || guest::read64(block + RESULTS) != 0 {
+        record(block, 5, ready | 0x1_0000_0000);
+        return;
+    }
+    let name = guest::read64(block + 0x800);
+    let attempt = |flags: u64, index: u64| {
+        port_message_with(connect, b"HELO");
+        guest::write64(length, 0x100);
+        guest::write64(client_out, HANDLE_SENTINEL);
+        record(block, index, call_export("ZwAlpcConnectPort", &[client_out, name, 0, attributes, flags, 0, connect, length, 0, 0, 0]).unwrap_or(u64::MAX));
+        record(block, index + 1, guest::read64(client_out));
+    };
+    attempt(0x3_0000, 5);
+    attempt(0xA_0000, 7);
+    attempt(0x2_0000, 9);
+}
+
+fn alpc_refused_extended_info(assert: Assert) {
+    let block = guest::alloc_bytes(0xA00);
+    guest::write_bytes(block, &alloc::vec![0; 0xA00]);
+    for index in 0..11 {
+        record(block, index, PENDING_RESULT);
+    }
+    dispatcher::initialize_event(block + 0x28, 0, false);
+    // SAFETY: ALPC_PORT_ATTRIBUTES do teste.
+    unsafe { AlpcPortAttributes::at(block + 0x40) }.max_message_length.set(0x200);
+    let name = unicode_string_for(ALPC_REFUSAL_NAME);
+    guest::write64(block + 0x800, name);
+    let (server_handle, server) = start(alpc_refusal_server, block);
+    let (client_handle, client) = start(alpc_refusal_client, block);
+    let finished = server != 0 && client != 0 && pump(20_000, &|| kernel_threads::is_terminated(server) && kernel_threads::is_terminated(client));
+    let results: Vec<u64> = (0..11).map(|index| guest::read64(block + RESULTS + index * 8)).collect();
+    debug_print!("[kwait] recusa ALPC com ReturnExtendedInfo: {:x?}", results);
+    let status = |index: usize| results[index] as u32;
+    assert(
+        finished && results[..5] == [0, 0, 0, 0, 0] && status(5) == 0xC000_000D && results[6] == HANDLE_SENTINEL && status(7) == 0xC000_0041 && results[8] == REFUSAL_CONTEXT && status(9) == 0xC000_0041 && results[10] == HANDLE_SENTINEL,
+        "kwait: conexao ALPC recusada com ReturnExtendedInfo devolve o PortContext da recusa em *PortHandle; sem a flag so o status; RELEASE_MESSAGE na conexao e STATUS_INVALID_PARAMETER",
+    );
     let _ = call_export("ZwClose", &[guest::read64(block)]);
     for handle in [server_handle, client_handle] {
         let _ = object_manager::close(handle as u32);
@@ -1229,6 +1314,7 @@ pub fn run(assert: Assert) {
     alpc_kernel_pair(assert);
     lpc_kernel_pair(assert);
     alpc_answer_pair(assert);
+    alpc_refused_extended_info(assert);
     alpc_reply_handle_pair(assert);
     shared_queue_waiters(assert, true);
     shared_queue_waiters(assert, false);
