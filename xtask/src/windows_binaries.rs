@@ -1025,8 +1025,13 @@ const USER_LOGON_PROGRAMS: &[&str] = &[
     // Gerenciador de Tarefas (Ctrl+Shift+Esc), com os imports estáticos deles
     // que faltavam: o comctl32.dll de System32 (o 6.0 vem do WinSxS, pelo
     // manifesto) e, do Taskmgr, os contadores de desempenho (pdh.dll), a
-    // SetupAPI e o Direct3D 12.
+    // SetupAPI e o Direct3D 12. O atalho não cria o Taskmgr.exe direto: o
+    // WinlogonHotkeyCallback do win32kfull manda o PostWinlogonMessage(0x404,
+    // 4), e o WLGeneric_AppLauncher_Enter do winlogon cria o `launchtm.exe`
+    // na sessão do usuário, que abre o `%WINDIR%\System32\Taskmgr.exe` pelo
+    // ShellExecuteExW.
     "notepad.exe",
+    "LaunchTM.exe",
     "Taskmgr.exe",
     "comctl32.dll",
     "pdh.dll",
