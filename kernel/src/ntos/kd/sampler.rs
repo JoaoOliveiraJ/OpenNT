@@ -53,9 +53,9 @@ static SAMPLE_TIMER: AtomicU8 = AtomicU8::new(0);
 static SAMPLE_NMI: AtomicU8 = AtomicU8::new(0);
 
 /// Endereços de retorno guardados de uma amostra do anel 0.
-const FRAMES: usize = 6;
+const FRAMES: usize = 12;
 /// Posições do anel: o tique o esvazia a cada 10 ms.
-const RING: usize = 1024;
+const RING: usize = 4096;
 /// A cadeia de frames fica dentro desta distância do RSP interrompido.
 const STACK_SPAN: u64 = 0x1_0000;
 const KERNEL_HALF: u64 = 0xFFFF_8000_0000_0000;
@@ -113,10 +113,18 @@ fn present(address: u64) -> bool {
 /// e sem alocação.
 #[no_mangle]
 pub extern "sysv64" fn opennt_sampler_record(rip: u64, cs: u64, root: u64, rbp: u64, rsp: u64) {
-    let index = WRITE.fetch_add(1, Ordering::AcqRel);
-    if index.wrapping_sub(READ.load(Ordering::Acquire)) >= RING as u64 {
-        DROPPED.fetch_add(1, Ordering::Relaxed);
-        return;
+    // A posição só é tomada com lugar no anel: uma posição tomada é sempre
+    // publicada, e o leitor nunca espera por uma que ninguém vai escrever.
+    let mut index = WRITE.load(Ordering::Acquire);
+    loop {
+        if index.wrapping_sub(READ.load(Ordering::Acquire)) >= RING as u64 {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        match WRITE.compare_exchange_weak(index, index + 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => break,
+            Err(current) => index = current,
+        }
     }
     let slot = &SLOTS[index as usize % RING];
     slot.rip.store(rip, Ordering::Relaxed);
@@ -232,12 +240,8 @@ pub fn drain() {
         let slot = &SLOTS[index as usize % RING];
         let sequence = slot.sequence.load(Ordering::Acquire);
         if sequence != index + 1 {
-            if sequence > index + 1 {
-                // O escritor deu a volta (não acontece com o descarte do anel
-                // cheio, mas a posição seguinte fica consistente).
-                READ.store(index + 1, Ordering::Release);
-                continue;
-            }
+            // A posição ainda não foi publicada (o escritor foi interrompido
+            // entre tomá-la e publicá-la, ou não há mais amostras).
             break;
         }
         let rip = slot.rip.load(Ordering::Relaxed);

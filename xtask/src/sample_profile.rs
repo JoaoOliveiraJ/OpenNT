@@ -266,7 +266,8 @@ fn report(profile: Profile, elf: &Path, top: usize) {
     for (name, count) in ranked(own).into_iter().take(top) {
         println!("  {:>6.1}% {:>6}  {}", percent(count, total), count, short(&name, 120));
     }
-    println!("\nanel 0, inclusivo (a funcao em qualquer ponto das {} primeiras posicoes da pilha):", 7);
+    let depth = profile.kernel.keys().map(|(_, stack)| stack.len()).max().unwrap_or(0);
+    println!("\nanel 0, inclusivo (a funcao em qualquer ponto das {depth} primeiras posicoes da pilha):");
     for (name, count) in ranked(inclusive).into_iter().take(top) {
         println!("  {:>6.1}% {:>6}  {}", percent(count, total), count, short(&name, 120));
     }

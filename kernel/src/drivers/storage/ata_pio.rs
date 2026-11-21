@@ -28,7 +28,7 @@
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::hal::{cpu, port, volatile};
 use crate::hal::pci_config;
@@ -396,11 +396,27 @@ impl Channel {
             let chunk = (count - done).min(256);
             let sector = lba + done as u64;
             write_prd_table(table, destination + done as u64 * 512, chunk);
-            self.run(command, sector, chunk, drive, |timeout| dma_attempt(bmide, table, sector, chunk, drive, write, timeout))?;
+            let started = cpu::rdtsc();
+            let result = self.run(command, sector, chunk, drive, |timeout| dma_attempt(bmide, table, sector, chunk, drive, write, timeout));
+            DMA_TSC.fetch_add(cpu::rdtsc().wrapping_sub(started), Ordering::Relaxed);
+            DMA_COMMANDS.fetch_add(1, Ordering::Relaxed);
+            DMA_SECTORS.fetch_add(chunk as u64, Ordering::Relaxed);
+            result?;
             done += chunk;
         }
         Ok(())
     }
+}
+
+/// O TSC gasto nos comandos de DMA, os comandos e os setores desde o boot
+/// (a linha `[perf]` mostra o que andou em cada intervalo).
+static DMA_TSC: AtomicU64 = AtomicU64::new(0);
+static DMA_COMMANDS: AtomicU64 = AtomicU64::new(0);
+static DMA_SECTORS: AtomicU64 = AtomicU64::new(0);
+
+/// (TSC, comandos, setores) dos comandos de DMA desde o boot.
+pub fn dma_cost() -> (u64, u64, u64) {
+    (DMA_TSC.load(Ordering::Relaxed), DMA_COMMANDS.load(Ordering::Relaxed), DMA_SECTORS.load(Ordering::Relaxed))
 }
 
 /// Tabela PRD (Physical Region Descriptors) de um bloco: regiões quebradas

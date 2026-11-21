@@ -153,7 +153,7 @@ fn report_exits() {
     crate::debug_print!("{}", line.trim_end_matches(','));
 }
 
-const VALUES: usize = 20;
+const VALUES: usize = 23;
 
 /// O uptime da próxima linha e os totais da anterior.
 struct Last {
@@ -205,6 +205,9 @@ pub fn report_if_due() {
             POLLS_SKIPPED.load(Ordering::Relaxed),
             crate::hal::serial::cost().0,
             crate::hal::serial::cost().1,
+            crate::drivers::storage::ata_pio::dma_cost().0,
+            crate::drivers::storage::ata_pio::dma_cost().1,
+            crate::drivers::storage::ata_pio::dma_cost().2,
         ];
         let mut delta = [0u64; VALUES];
         for (index, value) in current.iter().enumerate() {
@@ -216,7 +219,7 @@ pub fn report_if_due() {
     // O despacho sem os intervalos: as sondagens dele, os pumps, os fins de
     // processo e a escolha; os passos de kernel ficam fora do despacho.
     crate::debug_print!(
-        "[perf] t={} ms: hlt {} ms ({}x), giro {} ms ({}x), sondagem {} ms ({}x, {} dispensadas, {} esperas, {} de {} cargas de CR3), despacho fora dos intervalos {} ms ({}x; pumps {} ms, fins {} ms), intervalos {} ms ({}x), passos de kernel {} ms ({}x), serial {} ms ({} bytes)",
+        "[perf] t={} ms: hlt {} ms ({}x), giro {} ms ({}x), sondagem {} ms ({}x, {} dispensadas, {} esperas, {} de {} cargas de CR3), despacho fora dos intervalos {} ms ({}x; pumps {} ms, fins {} ms), intervalos {} ms ({}x), passos de kernel {} ms ({}x), serial {} ms ({} bytes), DMA {} ms ({}x, {} setores)",
         now,
         milliseconds(values[0]),
         values[1],
@@ -237,7 +240,10 @@ pub fn report_if_due() {
         milliseconds(values[15]),
         values[16],
         milliseconds(values[18]),
-        values[19]
+        values[19],
+        milliseconds(values[20]),
+        values[21],
+        values[22]
     );
     report_exits();
     report_threads();
