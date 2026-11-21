@@ -2900,7 +2900,10 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   dele com ExRegisterExtension; o componente a usa entre
   ExGetExtensionTable/ExReleaseExtensionTable, sob o rundown do host. Os
   hosts registrados na fase 1 são o PCW (id 1, o pcw.sys; `ex/pcw.rs`
-  despacha os Pcw* para ele), a autorização (id 2, o ksecdd.sys) e o BCrypt
+  despacha os cinco Pcw* para ele: PcwRegister, PcwUnregister,
+  PcwCreateInstance, PcwCloseInstance e PcwAddInstance, as rotinas 0 a 4 da
+  tabela, como no ntoskrnl 19041; sem a extensão, o status do
+  ExpPcwDisabledStatus pelo Start do serviço pcw), a autorização (id 2, o ksecdd.sys) e o BCrypt
   (id 3, o cng.sys) do Se (`se/extension_hosts.rs`) e o controle de taxa de
   rede (id 4, o tcpip.sys) do Ps (`ps/net_rate_control.rs`).
 - **Consultas de token** (`se/token/query.rs`): o NtQueryInformationToken
@@ -5540,8 +5543,15 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   listas de OpenWith e sem valores com caminhos fora do Windows do
   convidado, e com os valores de uma instalação nova no open de `Folder`,
   dos programas e do `txtfile`; o que sai vai num AVISO) e as zonas de
-  segurança (`Internet Settings\Zones` e os protocolos padrão do mapa de
-  zonas, que o ZoneCheckUrlExW do ShellExecute consulta)
+  segurança (`Internet Settings\Zones`, as zonas do bloqueio da máquina
+  local `Internet Settings\Lockdown_Zones` e os protocolos padrão do mapa de
+  zonas, que o ZoneCheckUrlExW do ShellExecute consulta: o
+  CUrlZoneManager::Initialize do urlmon liga um CRegZoneContainer para as
+  `Zones` e outro para as `Lockdown_Zones`, e sem a segunda chave o
+  primeiro InternetCreateZoneManager de cada processo falha, o
+  MapUrlToZoneEx2Internal devolve E_UNEXPECTED e o ZoneCheckFile do
+  windows.storage recusa o `.exe`, o que fazia o primeiro Executar de cada
+  explorer.exe e o `launchtm.exe` do Ctrl+Shift+Esc falharem)
   (`xtask/src/logon_screen.rs`), e a chave `Microsoft\Windows\DWM`
   que o dwm.exe, o dwmcore e o dcomp leem e em que o dwminit grava a
   atividade de cada sessão (sem os `DwmInitSessionActivityId_*` desta
@@ -7780,6 +7790,19 @@ da sessão 1 com a classe da janela principal dele põe na serial o
 `TASKMGR_WINDOW_CREATED` (a TaskManagerWindow do Taskmgr.exe). Uma entrada
 de tela que não vê a tela mudar como esperado encerra o teste com o que
 faltou na última leitura.
+
+O Ctrl+Shift+Esc segue o caminho do 19041 (teste gerenciador-de-tarefas):
+a tecla de atalho que o SetWinlogonHotKeys do win32kfull registra (id 4)
+chama o WinlogonHotkeyCallback, que manda o PostWinlogonMessage(0x404, 4)
+ao winlogon; o WLGeneric_AppLauncher_Enter cria o `launchtm.exe` na sessão
+do usuário, e ele abre o Taskmgr.exe pelo ShellExecuteExW. O Taskmgr.exe
+consulta os contadores de processador pelo pcwum.dll e o `\Device\PcwDrv`
+do pcw.sys, que no boot do processo inicial real é driver de boot, como na
+instalação. Os conjuntos de contadores do próprio kernel (o
+ExpPcwHostCallback do 19041, que registra Processor Information,
+Synchronization, FileSystem Disk Activity, Thermal Zone Information e os
+do ETW quando o pcw.sys liga a extensão) ainda não existem; o Taskmgr.exe
+consulta o Processor Information e o FileSystem Disk Activity.
 
 ## 7. O nome OpenNT nos arquivos
 
