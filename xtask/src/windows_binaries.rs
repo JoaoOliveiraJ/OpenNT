@@ -877,7 +877,13 @@ const LOGON_SCREEN_PROGRAMS: &[&str] = &[
 /// pacote (PackageStateChangeHandler.dll), o gerenciador da UI Automation
 /// (UiaManager.dll), o componente de áudio (AudioSes.dll), o tempo de vida
 /// dos aplicativos de desktop empacotados e da busca (daxexec.dll e
-/// mssrch.dll) e o registrador COM do shell (CoreShellExtFramework.dll); os
+/// mssrch.dll) e o registrador COM do shell (CoreShellExtFramework.dll); o
+/// fcon.dll, servidor em processo da classe WinRT
+/// Windows.Internal.Flighting.FeatureConfiguration.FeatureConfigurationsManager,
+/// que o ShellFeatureRolloutCoordinator::Initialize do DesktopShellExt.dll
+/// ativa no PreInitialize (sem a classe, o get_activation_factory do
+/// C++/WinRT lança um hresult_error com REGDB_E_CLASSNOTREG, o CATCH_LOG do
+/// DesktopShellExt não reconhece o tipo e o sihost para em fail fast); os
 /// imports estáticos deles que faltavam (AppXDeploymentClient.dll,
 /// fltLib.dll, container.dll, tquery.dll e esent.dll); e as cargas
 /// atrasadas de primeiro nível deles com o fecho estático de cada uma: o
@@ -938,6 +944,7 @@ const USER_LOGON_PROGRAMS: &[&str] = &[
     "CoreShellExtFramework.dll",
     "cdp.dll",
     "NPSM.dll",
+    "fcon.dll",
     // Os imports estáticos dos componentes.
     "AppXDeploymentClient.dll",
     "fltLib.dll",

@@ -5455,7 +5455,9 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   explorer.exe de `\Windows` com o `.mui`, na raiz do volume, o
   shell32.dll, o ExplorerFrame.dll da barra e o SndVolSSO.dll do ícone de
   volume, e o sihost.exe que o UserManager cria na sessão do usuário, com
-  o Windows.Shell.ServiceHostBuilder.dll, o DesktopShellExt.dll, os
+  o Windows.Shell.ServiceHostBuilder.dll, o DesktopShellExt.dll, o
+  fcon.dll da classe WinRT FeatureConfigurationsManager que o
+  coordenador de rollout do DesktopShellExt ativa, os
   componentes que ele cria em processo, os imports estáticos deles e as
   cargas atrasadas de primeiro nível, porque um componente que falha
   derruba o sihost: `USER_LOGON_PROGRAMS` e `WINDOWS_PROGRAMS`; o shell
