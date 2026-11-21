@@ -69,8 +69,20 @@ pub fn map(section: &Arc<Section>, request: &Request, process: u64, regions: Reg
     let space = user_memory::Space::of(process);
     let root = space.root();
     let options = FindOptions { base: request.base, size, upper: Some(request.upper), alignment: memory_map::ALLOCATION_GRANULARITY, top_down, root, ..FindOptions::default() };
-    // Da escolha da faixa até a vista entrar no VAD (a control area pode ser
-    // montada no meio, lendo o arquivo): a AddressCreationLock.
+    let name = file.nt_path().or_else(|| section.name()).unwrap_or_default();
+    let source = Arc::new(SectionSource { name: name.clone(), file: file.clone() });
+    // A control area da imagem (montada uma vez por arquivo, lendo o
+    // arquivo) não depende da VA e vem antes da AddressCreationLock: com um
+    // SharedLock retido o PFN não roda o modified page writer na hora.
+    let segment = match image_segment::of_section(section, &name)? {
+        Ok(segment) => segment,
+        Err(status) => return Ok(Err(status)),
+    };
+    // A vista cabe nas páginas da control area (o SizeOfImage arredondado).
+    if offset % 4096 != 0 || size % 4096 != 0 || offset.checked_add(size).is_none_or(|end| end > segment.frames.len() as u64 * 4096) {
+        return Ok(Err(0xC000_007B));
+    }
+    // Da escolha da faixa até a vista entrar no VAD: a AddressCreationLock.
     let _creation = user_memory::address_creation(space);
     let occupied = user_memory::occupied(space);
     // Sem base pedida: a ImageBase do cabeçalho quando está livre, senão a
@@ -87,18 +99,7 @@ pub fn map(section: &Arc<Section>, request: &Request, process: u64, regions: Reg
             Err(status) => return Ok(Err(status)),
         },
     };
-    let name = file.nt_path().or_else(|| section.name()).unwrap_or_default();
-    let source = Arc::new(SectionSource { name: name.clone(), file: file.clone() });
-    // A control area da imagem (montada uma vez por arquivo) e a vista sobre
-    // ela, na raiz do processo alvo.
-    let segment = match image_segment::of_section(section, &name)? {
-        Ok(segment) => segment,
-        Err(status) => return Ok(Err(status)),
-    };
-    // A vista cabe nas páginas da control area (o SizeOfImage arredondado).
-    if offset % 4096 != 0 || size % 4096 != 0 || offset.checked_add(size).is_none_or(|end| end > segment.frames.len() as u64 * 4096) {
-        return Ok(Err(0xC000_007B));
-    }
+    // A vista sobre a control area, na raiz do processo alvo.
     let pages = match image_segment::map_view(&segment, root, base, offset, size) {
         Ok(pages) => pages,
         Err(status) => return Ok(Err(status)),

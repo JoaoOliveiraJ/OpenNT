@@ -536,7 +536,9 @@ de página e a captura de chamada de um intervalo são tratadas com a thread
 ainda Running na CPU dela, antes do fim da execução (o KiDispatchException
 roda no contexto da thread). A escolha de uma faixa livre de VA
 de usuário e o registro dela no VAD são um passo só, sob a
-AddressCreationLock do processo (`memory::address_creation`). A thread
+AddressCreationLock do processo (`memory::address_creation`); os frames
+do commit e da control area vêm fora dela (com um SharedLock retido o PFN
+não roda o modified page writer na hora). A thread
 criada suspensa vai direto à espera, com a decisão tomada sob o PrcbLock
 pela contagem de suspensão (`attach_scheduling`), sem passar pela fila. A
 posse de uma thread consultada fora da CPU dela lê o ponteiro da KTHREAD

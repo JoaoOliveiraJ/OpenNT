@@ -91,7 +91,10 @@ static SYSTEM_ADDRESS_CREATION: SharedLock = SharedLock::new();
 /// `section_address::find`) e o registro da região no VAD são um passo só.
 /// Com as threads de um processo em CPUs diferentes, duas alocações (a pilha
 /// de uma thread nova e a vista de uma DLL) achariam a mesma faixa livre. A
-/// posse é solta antes do estado que ela retém.
+/// posse é solta antes do estado que ela retém. Os frames do commit (que o
+/// 19041 só dá na falta) vêm com a trava solta: com um SharedLock retido o
+/// PFN não roda o modified page writer na hora, e a alocação sob pressão
+/// de memória falharia em vez de paginar.
 pub struct AddressCreation {
     _guard: SharedLockGuard<'static>,
     _state: Option<Arc<ProcessState>>,
@@ -658,7 +661,7 @@ fn allocate_region(space: Space, base_pointer: u64, size_pointer: u64, allocatio
     if space.state().is_none() {
         return Ok(STATUS_PROCESS_IS_TERMINATING);
     }
-    let _creation = address_creation(space);
+    let creation = address_creation(space);
     if !write_watch::valid_allocation_type(allocation_type) {
         return Ok(STATUS_INVALID_PARAMETER);
     }
@@ -706,6 +709,8 @@ fn allocate_region(space: Space, base_pointer: u64, size_pointer: u64, allocatio
                 if secured != 0 {
                     return Ok(secured);
                 }
+                // O commit numa região que já está no VAD não escolhe VA.
+                drop(creation);
                 if let Some(view) = view {
                     let status = sections::commit_view(&view, base, size, protect)?;
                     if status != 0 {
@@ -753,23 +758,27 @@ fn allocate_region(space: Space, base_pointer: u64, size_pointer: u64, allocatio
         Err(status) => return Ok(status),
     };
     let region = PrivateRegion::new(base, size, protect, allocation_type, pageable);
+    // A região entra no VAD sob a trava (o MiInsertVadCharges do 19041) e as
+    // páginas do commit vêm depois, com a trava solta; uma falha retira a
+    // região do VAD.
+    let entry: Region = region.clone();
+    if !space.insert(RegionKind::User, entry.clone()) {
+        return Ok(STATUS_PROCESS_IS_TERMINATING);
+    }
+    drop(creation);
     if allocation_type & MEM_COMMIT != 0 {
         // O commit da região inteira é cobrado do processo (e dos jobs dele)
         // antes das páginas.
         let charged = process_commit::charge(space.process(), size / PAGE);
         if charged != 0 {
+            space.remove(&entry);
             return Ok(charged);
         }
         if !map_region_pages(space.root(), &region) {
+            space.remove(&entry);
             process_commit::release(space.process(), size / PAGE);
             return Ok(0xC000_0017);
         }
-    }
-    let entry: Region = region.clone();
-    if !space.insert(RegionKind::User, entry) {
-        // O processo saiu no meio da alocação: as páginas voltam ao PFN.
-        free_region_pages(space.process(), space.root(), &region);
-        return Ok(STATUS_PROCESS_IS_TERMINATING);
     }
     guest::try_write::<u64>(base_pointer, base)?;
     guest::try_write::<u64>(size_pointer, size)?;
@@ -830,21 +839,24 @@ fn register_user_region(space: Space, size: u64, alignment: u64, top_down: bool)
     if space.state().is_none() {
         return Err(KernelError::with_status("regiao de usuario num processo sem VAD", STATUS_PROCESS_IS_TERMINATING));
     }
-    let _creation = address_creation(space);
+    let creation = address_creation(space);
     let base = find_free(space, size, alignment, top_down).map_err(|status| KernelError::with_status("sem VA livre na metade de usuario", status))?;
     let region = PrivateRegion::new(base, size, 4, MEM_COMMIT | MEM_RESERVE, false);
+    // No VAD sob a trava; as páginas depois, com ela solta.
+    let entry: Region = region.clone();
+    if !space.insert(RegionKind::User, entry.clone()) {
+        return Err(KernelError::with_status("processo saiu durante a regiao de usuario", STATUS_PROCESS_IS_TERMINATING));
+    }
+    drop(creation);
     let charged = process_commit::charge(space.process(), size / PAGE);
     if charged != 0 {
+        space.remove(&entry);
         return Err(KernelError::with_status("commit da regiao de usuario acima do limite", charged));
     }
     if !map_region_pages(space.root(), &region) {
+        space.remove(&entry);
         process_commit::release(space.process(), size / PAGE);
         return Err(KernelError::new("PFN esgotado na regiao de usuario"));
-    }
-    let entry: Region = region.clone();
-    if !space.insert(RegionKind::User, entry) {
-        free_region_pages(space.process(), space.root(), &region);
-        return Err(KernelError::with_status("processo saiu durante a regiao de usuario", STATUS_PROCESS_IS_TERMINATING));
     }
     Ok(region)
 }

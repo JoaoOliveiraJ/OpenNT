@@ -1266,6 +1266,20 @@ pub fn map(section: &Arc<Section>, options: &MapRequest) -> Result<Mapped, Kerne
     // a vista vai: a dele, ou a do System no espaço de sistema.
     let space = super::memory::Space::of(options.owner_process.unwrap_or_else(crate::ntos::ps::process::get_current_process));
     let root = if options.system_space { SYSTEM_ROOT } else { space.root() };
+    // Uma vista nova não herda buracos de uma control area paginada. Os
+    // frames da control area (o materialize e o commit abaixo, que não
+    // dependem da VA) vêm antes da AddressCreationLock: com um SharedLock
+    // retido o PFN não roda o modified page writer na hora.
+    let system_paging = section.control_area().and_then(|area| area.lock().system_paging.clone());
+    if let Some(system_paging) = system_paging {
+        system_paging.materialize(section)?;
+    }
+    let available = section.size().saturating_sub(offset);
+    let commit_size = options.commit_size.min(size).min(available);
+    let status = if commit_size != 0 { commit(section, offset / PAGE, commit_size.div_ceil(PAGE))? } else { 0 };
+    if status != 0 {
+        return Ok(Err(status));
+    }
     // Primeira faixa livre (de baixo para cima, ou de cima no MEM_TOP_DOWN),
     // da escolha até a vista entrar no VAD (a AddressCreationLock).
     let _creation = super::memory::address_creation(if options.system_space { super::memory::Space::system() } else { space });
@@ -1274,11 +1288,6 @@ pub fn map(section: &Arc<Section>, options: &MapRequest) -> Result<Mapped, Kerne
         Ok(base) => base,
         Err(status) => return Ok(Err(status)),
     };
-    // Uma vista nova não herda buracos de uma control area paginada.
-    let system_paging = section.control_area().and_then(|area| area.lock().system_paging.clone());
-    if let Some(system_paging) = system_paging {
-        system_paging.materialize(section)?;
-    }
     let view = Arc::new(View {
         base,
         size,
@@ -1296,12 +1305,6 @@ pub fn map(section: &Arc<Section>, options: &MapRequest) -> Result<Mapped, Kerne
         name: section.file.as_ref().and_then(|file| file.nt_path()),
         state: SpinLock::new(ViewMut { regions: options.regions, frames: BTreeMap::new(), private_frames: BTreeMap::new(), committed_pages: BTreeSet::new(), page_protects: BTreeMap::new(), retirement: None, unmapped: false, secured_reads: Vec::new(), system_paging: false, in_page_exceptions: false, release_process_view: None }),
     });
-    let available = section.size().saturating_sub(offset);
-    let commit_size = options.commit_size.min(size).min(available);
-    let status = if commit_size != 0 { commit(section, offset / PAGE, commit_size.div_ceil(PAGE))? } else { 0 };
-    if status != 0 {
-        return Ok(Err(status));
-    }
     for (page, _) in section.frames() {
         if page < offset / PAGE || page >= (offset + size) / PAGE {
             continue;
