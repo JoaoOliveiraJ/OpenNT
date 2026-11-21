@@ -322,6 +322,18 @@ const CURSOR_MAXIMUM: usize = 40;
 const CURSOR_WHITE_MINIMUM: usize = 20;
 /// Pixels pretos que o ponteiro tem, no mínimo (o contorno da seta).
 const CURSOR_BLACK_MINIMUM: usize = 10;
+/// A luminância até a qual um pixel em volta do miolo conta como o contorno
+/// da seta. O cursor do 19041 (aero_arrow) tem o contorno com alfa,
+/// misturado ao fundo: sobre o azul do img0 ele mede de #000E21 a #002946
+/// (luminância de 13 a 34), e a sombra suave em volta dele, de #005E91 para
+/// cima (77 ou mais); sobre o preto da tela de bloqueio, é preto.
+const CURSOR_OUTLINE_LUMA: u16 = 0x30;
+
+/// Um pixel do contorno da seta ([`CURSOR_OUTLINE_LUMA`]): preto, ou o preto
+/// do contorno misturado ao fundo.
+fn is_outline(rgb: [u8; 3]) -> bool {
+    luma(&rgb) <= CURSOR_OUTLINE_LUMA
+}
 /// O menor deslocamento que conta como o ponteiro ter andado.
 const CURSOR_MINIMUM_STEP: i64 = 8;
 
@@ -360,7 +372,8 @@ impl Change {
 /// contorno): cada miolo branco (os canais em 0xF0 ou mais, vizinhos na
 /// linha ou na coluna) de [`CURSOR_WHITE_MINIMUM`] pixels ou mais, fechado
 /// pelo contorno preto: dos pixels em volta dele, a metade ou mais são
-/// pretos e pelo menos [`CURSOR_BLACK_MINIMUM`], e o miolo com o contorno
+/// pretos ([`is_outline`]: o preto do contorno com alfa misturado ao fundo
+/// também) e pelo menos [`CURSOR_BLACK_MINIMUM`], e o miolo com o contorno
 /// cabe em [`CURSOR_MAXIMUM`] de lado. Devolve a caixa de cada uma (o miolo
 /// e o contorno). O fundo em volta não conta: a seta sobre um controle
 /// aceso, sobre o branco ou sobre a foto é achada do mesmo jeito; o texto
@@ -414,7 +427,7 @@ fn arrows_in(image: &Image, area: &Change) -> Vec<Change> {
                     }
                 }
             }
-            let black: Vec<&(usize, usize)> = outline.iter().filter(|&&(nx, ny)| is_black(pixel(nx, ny))).collect();
+            let black: Vec<&(usize, usize)> = outline.iter().filter(|&&(nx, ny)| is_outline(pixel(nx, ny))).collect();
             if black.len() < CURSOR_BLACK_MINIMUM || black.len() * 2 < outline.len() {
                 continue;
             }
@@ -1187,6 +1200,141 @@ pub fn start_menu_open(before: &Image, after: &Image) -> Result<String, String> 
     }
 }
 
+// ---- ponteiro num ponto da tela e menu de contexto ---------------------------
+//
+// O `--context-menu` do test-boot leva o ponteiro a um ponto da tela pelo
+// mouse PS/2 relativo, como a mão, olhando onde a seta está
+// ([`pointer_near`]): a aceleração do Windows ("Aumentar precisão do
+// ponteiro") faz o deslocamento na tela depender da velocidade, então o
+// movimento é corrigido a cada leitura. Depois aperta o botão direito e
+// confere o menu aberto ([`context_menu_open`]).
+
+/// A ponta da seta do ponteiro em `image` mais perto de (`x`, `y`), a até
+/// `radius` pixels dele em cada eixo (a seta inteira no quadrado; zero
+/// procura na tela toda). A ponta é o canto de cima à esquerda do contorno
+/// da seta ([`arrows_in`]), o ponto ativo do cursor padrão.
+pub fn pointer_near(image: &Image, x: usize, y: usize, radius: usize) -> Option<(usize, usize)> {
+    let area = if radius == 0 {
+        Change { left: 0, top: 0, right: image.width - 1, bottom: image.height - 1 }
+    } else {
+        Change { left: x.saturating_sub(radius), top: y.saturating_sub(radius), right: (x + radius).min(image.width - 1), bottom: (y + radius).min(image.height - 1) }
+    };
+    arrows_in(image, &area).into_iter().map(|arrow| (arrow.left, arrow.top)).min_by_key(|&(left, top)| left.abs_diff(x).pow(2) + top.abs_diff(y).pow(2))
+}
+
+/// Para onde a seta do ponteiro foi de `before` para `after`: a ponta da
+/// seta que só existe depois, dentro das mudanças da tela (como em
+/// [`cursor_moved`]), a mais perto de (`x`, `y`). Um desenho parado que
+/// parece a seta (o ícone claro com contorno escuro da barra de tarefas)
+/// não muda e não conta. `None` se nenhuma seta chegou.
+pub fn pointer_moved(before: &Image, after: &Image, x: usize, y: usize) -> Option<(usize, usize)> {
+    if (before.width, before.height) != (after.width, after.height) || before.rgb.len() != after.rgb.len() {
+        return None;
+    }
+    let mut arrived = Vec::new();
+    for group in changes(before, after) {
+        let old = arrows_in(before, &group);
+        arrived.extend(arrows_in(after, &group).into_iter().filter(|arrow| !old.iter().any(|other| arrow.same_box(other))));
+    }
+    arrived.into_iter().map(|arrow| (arrow.left, arrow.top)).min_by_key(|&(left, top)| left.abs_diff(x).pow(2) + top.abs_diff(y).pow(2))
+}
+
+/// O marcador do menu de contexto aberto pelo botão direito.
+pub const CONTEXT_MENU_MARKER: &str = "CONTEXT_MENU_OK";
+/// Luminância a partir da qual o pixel é o fundo claro de um menu (o
+/// #EEEEEE do menu do 19041 no tema claro) ou da barra de título.
+const LIGHT_LUMA: u16 = 0xE0;
+/// Luminância abaixo da qual o pixel é texto escuro.
+const DARK_LUMA: u16 = 0x60;
+
+/// As linhas de texto escuro de `image` dentro de `area`: as faixas de
+/// linhas com algum pixel escuro, separadas por pelo menos duas linhas sem
+/// nenhum.
+fn text_lines(image: &Image, area: &Change) -> usize {
+    let at = |x: usize, y: usize| (y * image.width + x) * 3;
+    let (mut lines, mut blank, mut inside) = (0usize, 2usize, false);
+    for y in area.top..=area.bottom {
+        let dark = (area.left..=area.right).any(|x| luma(&image.rgb[at(x, y)..at(x, y) + 3]) < DARK_LUMA);
+        if dark {
+            if !inside && blank >= 2 {
+                lines += 1;
+            }
+            inside = true;
+            blank = 0;
+        } else {
+            inside = false;
+            blank += 1;
+        }
+    }
+    lines
+}
+
+/// O menu de contexto aberto em `after` pelo botão direito em (`x`, `y`)
+/// sobre `before`: o maior grupo de mudanças tem o canto de cima à esquerda
+/// a até 12 pixels do clique (o menu abre com o canto no ponto ativo do
+/// ponteiro), de 80x40 a 600x700 pixels, 3/4 ou mais dos pixels claros (o
+/// fundo do menu), de 1/500 a 1/5 de texto escuro em duas linhas ou mais
+/// (os itens; os desabilitados são cinza e não contam); fora dele a tela
+/// muda em até 1/64. O menu do 19041 na área de trabalho (Exibir,
+/// Classificar por, Atualizar, Colar...) mede 186x127, 91% claro e 1% de
+/// texto escuro. Uma dica (uma linha de texto), uma janela que abriu em
+/// outro lugar, a tela trocada e o clique sem efeito não passam.
+pub fn context_menu_open(before: &Image, after: &Image, x: usize, y: usize) -> Result<String, String> {
+    if (before.width, before.height) != (after.width, after.height) || before.rgb.len() != after.rgb.len() {
+        return Err(format!("a tela mudou de tamanho ({}x{} para {}x{})", before.width, before.height, after.width, after.height));
+    }
+    let (width, height) = (before.width, before.height);
+    let at = |x: usize, y: usize| (y * width + x) * 3;
+    let groups = changes(before, after);
+    let Some(menu) = groups.iter().max_by_key(|group| group.width() * group.height()) else {
+        return Err("a tela nao mudou".into());
+    };
+    let inside = |px: usize, py: usize| (menu.left..=menu.right).contains(&px) && (menu.top..=menu.bottom).contains(&py);
+    let mut changed_out = 0usize;
+    for py in 0..height {
+        for px in 0..width {
+            if !inside(px, py) && before.rgb[at(px, py)..at(px, py) + 3] != after.rgb[at(px, py)..at(px, py) + 3] {
+                changed_out += 1;
+            }
+        }
+    }
+    let size = menu.width() * menu.height();
+    let (mut light, mut dark) = (0usize, 0usize);
+    for py in menu.top..=menu.bottom {
+        for px in menu.left..=menu.right {
+            let value = luma(&after.rgb[at(px, py)..at(px, py) + 3]);
+            light += usize::from(value >= LIGHT_LUMA);
+            dark += usize::from(value < DARK_LUMA);
+        }
+    }
+    let lines = text_lines(after, menu);
+    let mut missing = Vec::new();
+    if menu.left.abs_diff(x) > 12 || menu.top.abs_diff(y) > 12 {
+        missing.push(format!("o maior grupo de mudancas {} nao comeca no clique ({x},{y})", menu.describe()));
+    }
+    if !(80..=600).contains(&menu.width()) || !(40..=700).contains(&menu.height()) {
+        missing.push(format!("o grupo {} nao tem o tamanho de um menu (de 80x40 a 600x700)", menu.describe()));
+    }
+    if light * 4 < size * 3 {
+        missing.push(format!("{}% do grupo e claro (minimo 75%)", light * 100 / size));
+    }
+    if dark * 500 < size || dark * 5 > size {
+        missing.push(format!("{}% do grupo e texto escuro (de 0,2% a 20%)", dark * 100 / size));
+    }
+    if lines < 2 {
+        missing.push(format!("{lines} linha(s) de texto no grupo (minimo 2)"));
+    }
+    let outside = width * height - size;
+    if changed_out * 64 > outside.max(1) {
+        missing.push(format!("{changed_out} pixels mudaram fora do grupo (maximo 1/64 da tela)"));
+    }
+    if missing.is_empty() {
+        Ok(format!("menu {} no clique ({x},{y}): {}% claro, {}% de texto escuro em {lines} linhas, fora dele {changed_out} pixels mudaram", menu.describe(), light * 100 / size, dark * 100 / size))
+    } else {
+        Err(missing.join("; "))
+    }
+}
+
 /// Telas sintéticas para os testes da vigia.
 #[cfg(test)]
 pub mod samples {
@@ -1265,6 +1413,22 @@ pub mod samples {
                 image.rgb[at..at + 3].copy_from_slice(if edge { &[0, 0, 0] } else { &[0xFF, 0xFF, 0xFF] });
             }
         }
+    }
+
+    /// O menu de contexto do 19041 no tema claro com o canto em (`x`, `y`):
+    /// fundo #EEEEEE, borda #A0A0A0 e `items` itens de 22 linhas com texto
+    /// #252525 (os `disabled` últimos em #A0A0A0), e o ponteiro por cima.
+    pub fn context_menu(image: &Image, x: usize, y: usize, width: usize, items: usize, disabled: usize) -> Image {
+        let mut out = image.clone();
+        let height = items * 22 + 8;
+        paint(&mut out, x..x + width, y..y + height, |px, py| if px == x || py == y || px + 1 == x + width || py + 1 == y + height { [0xA0, 0xA0, 0xA0] } else { [0xEE, 0xEE, 0xEE] });
+        for item in 0..items {
+            let color = if item + disabled >= items { [0xA0, 0xA0, 0xA0] } else { [0x25, 0x25, 0x25] };
+            let top = y + 4 + item * 22 + 7;
+            paint(&mut out, x + 34..x + 34 + 60 + item * 7, top..top + 9, |px, py| if (px + py) % 3 == 0 { color } else { [0xEE, 0xEE, 0xEE] });
+        }
+        pointer(&mut out, x, y);
+        out
     }
 
     /// As linhas fora de `rows` pretas: um quadro rasgado ou pela metade.
@@ -1765,5 +1929,62 @@ mod tests {
         assert!(start_menu_open(&before, &before).unwrap_err().contains("nao mudou"));
         // Sem a barra na tela de antes, não há o que comparar.
         assert!(start_menu_open(&wallpaper(), &start_menu(&before, 640, 600, 40, false)).unwrap_err().contains("linhas embaixo"));
+    }
+
+    /// A ponta da seta é achada perto do ponto pedido, na tela toda com raio
+    /// zero, e não onde não há seta.
+    #[test]
+    fn pointer_near_finds_the_arrow_tip() {
+        // A ponta (a primeira linha da seta, um pixel) pode ficar fora do
+        // contorno que toca o miolo: a caixa começa nela ou na linha de baixo.
+        let at = |found: Option<(usize, usize)>, x: usize, y: usize| found.is_some_and(|(fx, fy)| fx == x && (y..=y + 1).contains(&fy));
+        let mut image = desktop(40, 218, true);
+        pointer(&mut image, 300, 200);
+        assert!(at(pointer_near(&image, 310, 190, 60), 300, 200));
+        assert!(at(pointer_near(&image, 420, 330, 0), 300, 200));
+        assert_eq!(pointer_near(&image, 700, 500, 60), None);
+        pointer(&mut image, 600, 400);
+        assert!(at(pointer_near(&image, 590, 410, 0), 600, 400));
+        // O contorno com alfa do cursor do 19041 sobre o azul do img0 (de
+        // #000E21 a #002946) também é contorno; a sombra (#005E91) não.
+        let mut blended = wallpaper();
+        pointer(&mut blended, 200, 150);
+        for channel in blended.rgb.chunks_exact_mut(3) {
+            if channel == [0, 0, 0] {
+                channel.copy_from_slice(&[0x00, 0x29, 0x46]);
+            }
+        }
+        assert!(at(pointer_near(&blended, 210, 160, 60), 200, 150));
+        for channel in blended.rgb.chunks_exact_mut(3) {
+            if channel == [0x00, 0x29, 0x46] {
+                channel.copy_from_slice(&[0x00, 0x5E, 0x91]);
+            }
+        }
+        assert_eq!(pointer_near(&blended, 210, 160, 60), None);
+    }
+
+    /// O menu de contexto sintético do 19041 (fundo claro, itens escuros e
+    /// cinza) no clique passa; o menu longe do clique, uma dica de uma linha,
+    /// um painel vazio, uma janela grande, lixo e a tela parada não.
+    #[test]
+    fn context_menu_open_sees_the_menu_at_the_click() {
+        let mut before = desktop(40, 218, true);
+        pointer(&mut before, 360, 308);
+        let open = context_menu_open(&before, &context_menu(&before, 360, 308, 186, 5, 2), 360, 308).unwrap_or_else(|missing| panic!("{missing}"));
+        assert!(open.starts_with("menu 18") && open.contains("no clique (360,308)"), "{open}");
+        assert!(context_menu_open(&before, &context_menu(&before, 500, 400, 186, 5, 2), 360, 308).unwrap_err().contains("nao comeca no clique"));
+        assert!(context_menu_open(&before, &context_menu(&before, 360, 308, 186, 1, 0), 360, 308).unwrap_err().contains("linha(s) de texto"));
+        let mut blank = before.clone();
+        paint(&mut blank, 360..546, 308..426, |_, _| [0xEE, 0xEE, 0xEE]);
+        assert!(context_menu_open(&before, &blank, 360, 308).unwrap_err().contains("texto escuro"));
+        assert!(context_menu_open(&before, &context_menu(&before, 300, 308, 700, 10, 0), 300, 308).unwrap_err().contains("tamanho de um menu"));
+        let memory = memory_as_pixels();
+        let mut garbage = before.clone();
+        paint(&mut garbage, 360..546, 308..426, |x, y| {
+            let at = (y * WIDTH + x) * 3;
+            [memory.rgb[at], memory.rgb[at + 1], memory.rgb[at + 2]]
+        });
+        assert!(context_menu_open(&before, &garbage, 360, 308).is_err());
+        assert!(context_menu_open(&before, &before, 360, 308).unwrap_err().contains("nao mudou"));
     }
 }

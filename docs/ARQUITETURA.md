@@ -7704,7 +7704,9 @@ outro só depois, deslocado no sentido do movimento
 o log ganha o `CURSOR_MOVED_OK`. A seta é achada pela forma dentro de cada
 mudança (`screen_check::arrows_in`: um miolo branco fechado pelo contorno
 preto, metade ou mais dos pixels em volta dele pretos, em até 40 pixels de
-lado), não pelo tamanho da mudança: o controle que se acende sob o ponteiro
+lado; conta como preto a luminância até 0x30, porque o contorno do cursor do
+19041 tem alfa e sobre o azul do img0 mede de #000E21 a #002946, e a sombra
+suave em volta, de #005E91 para cima), não pelo tamanho da mudança: o controle que se acende sob o ponteiro
 (o botão de energia do LogonUI, 48x48) muda junto em volta da seta, e a seta
 que anda pouco deixa os dois lugares numa mudança só. O
 `--start-menu=...:TECLAS` espera a área de trabalho com a barra parada,
@@ -7714,9 +7716,28 @@ parado e aperta o Esc até a tela de antes voltar
 muda em até 1/8; acima dela, o maior grupo de mudanças fica colado à esquerda
 e à barra, tem 6h por 6h pixels ou mais, 3/4 deles mudados, de 1/200 a 1/2 de
 texto e ícones longe da mediana por 0x60 e a maioria dos vizinhos suaves; fora
-dele, a tela muda em até 1/32), e o log ganha o `START_MENU_OK`. Um
-`--dismiss`, `--mouse` ou `--start-menu` que não vê a tela mudar encerra o
-teste com o que faltou na última leitura.
+dele, a tela muda em até 1/32), e o log ganha o `START_MENU_OK`. O
+`--context-menu=...:X,Y` espera a tela desenhada parada, leva o ponteiro ao
+ponto (X, Y) (`qemu::point_at`) e aperta o botão direito (`mouse_button 2`).
+O mouse PS/2 é relativo e a aceleração do Windows muda a distância com a
+velocidade, então o ponteiro vai como a mão olhando a tela: oito
+`mouse_move -250 -250` o param no canto de cima à esquerda, onde a seta é
+achada parada (`screen_check::pointer_near`, a ponta da seta é o canto da
+caixa dela), e cada correção anda até 120 mickeys, em pacotes de até 2 a
+cada 15 ms, pelo ganho medido na correção anterior em cada eixo; a seta que
+chegou é achada entre as mudanças da tela (`screen_check::pointer_moved`:
+um desenho parado parecido com a seta, como um ícone claro da barra de
+tarefas, não conta) quando duas leituras seguidas, a 250 ms uma da outra, a
+acham no mesmo lugar (o ponteiro desenhado anda depois do mouse), até a
+ponta ficar a 2 pixels do ponto, em até 24 correções. Depois espera o menu
+aberto e parado e aperta o Esc até a tela de antes voltar
+(`screen_check::context_menu_open`: o maior grupo de mudanças começa a até
+12 pixels do clique, tem de 80x40 a 600x700 pixels, 3/4 ou mais claros, de
+1/500 a 1/5 de texto escuro em duas linhas ou mais, e fora dele a tela muda
+em até 1/64; o menu do 19041 na área de trabalho mede 187x127, 91% claro e
+1% de texto escuro em 3 linhas), e o log ganha o `CONTEXT_MENU_OK`. Um
+`--dismiss`, `--mouse`, `--start-menu` ou `--context-menu` que não vê a tela
+mudar encerra o teste com o que faltou na última leitura.
 
 ## 7. O nome OpenNT nos arquivos
 

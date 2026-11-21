@@ -32,7 +32,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::screen_check::{self, CURSOR_MOVED_MARKER, DESKTOP_AFTER, DESKTOP_MARKER, FIRST_PIXEL_MARKER, LOGON_DISMISS_MARKER, LOGON_SCREEN_MARKER, RESTART_AFTER, START_MENU_MARKER, TASKBAR_AFTER, TASKBAR_MARKER};
+use crate::screen_check::{self, CONTEXT_MENU_MARKER, CURSOR_MOVED_MARKER, DESKTOP_AFTER, DESKTOP_MARKER, FIRST_PIXEL_MARKER, LOGON_DISMISS_MARKER, LOGON_SCREEN_MARKER, RESTART_AFTER, START_MENU_MARKER, TASKBAR_AFTER, TASKBAR_MARKER};
 
 #[derive(Clone, Debug)]
 pub struct MachineOptions {
@@ -621,6 +621,11 @@ pub enum InputAction {
     /// ([`screen_check::start_menu_open`]) e que o Esc o fecha (o
     /// `START_MENU_OK`).
     StartMenu(String),
+    /// Leva o ponteiro ao ponto (`x`, `y`) da tela ([`point_at`]), aperta o
+    /// botão direito, confere o menu de contexto aberto
+    /// ([`screen_check::context_menu_open`]) e que o Esc o fecha (o
+    /// `CONTEXT_MENU_OK`).
+    ContextMenu { x: usize, y: usize },
 }
 
 /// `--send=MARCADOR[+MS]:TECLAS`, `--dismiss=MARCADOR[+MS]:TECLAS` e
@@ -671,6 +676,15 @@ impl InputSend {
         Ok(InputSend { after, delay, action: InputAction::StartMenu(keys.to_string()) })
     }
 
+    /// `--context-menu=MARCADOR[+MS]:X,Y`, um ponto da tela de 1024x768.
+    pub fn context_menu(text: &str) -> Result<InputSend, String> {
+        let (after, delay, point) = Self::when("--context-menu", text)?;
+        match screen_point(point) {
+            Some((x, y)) => Ok(InputSend { after, delay, action: InputAction::ContextMenu { x, y } }),
+            None => Err(format!("--context-menu={text}: o ponto e X,Y inteiros dentro da tela de 1024x768")),
+        }
+    }
+
     /// `--mouse=MARCADOR[+MS]:DX,DY`.
     pub fn mouse(text: &str) -> Result<InputSend, String> {
         let (after, delay, motion) = Self::when("--mouse", text)?;
@@ -680,6 +694,13 @@ impl InputSend {
             _ => Err(format!("--mouse={text}: o movimento e DX,DY inteiros, nao os dois zero, ate 1000 em cada eixo")),
         }
     }
+}
+
+/// `X,Y` dentro da tela de 1024x768 do vídeo dos testes.
+fn screen_point(text: &str) -> Option<(usize, usize)> {
+    let (x, y) = text.split_once(',')?;
+    let (x, y) = (x.trim().parse::<usize>().ok()?, y.trim().parse::<usize>().ok()?);
+    (x < 1024 && y < 768).then_some((x, y))
 }
 
 /// O começo da linha que o test-boot põe na serial depois de mandar as
@@ -1563,6 +1584,132 @@ fn move_mouse(monitor: &mut TcpStream, ppm: &Path, dx: i32, dy: i32, sent: &mut 
     }
 }
 
+/// Quanto o ponteiro pode ficar do ponto pedido, em pixels em cada eixo.
+const POINT_TOLERANCE: i64 = 2;
+/// Quantas correções o [`point_at`] faz até desistir.
+const POINT_ROUNDS: usize = 24;
+/// O maior pacote do mouse nas correções do [`point_at`], em mickeys em cada
+/// eixo, um a cada 15 ms: a mão devagar, na parte baixa da curva de
+/// aceleração.
+const POINT_PACKET: i64 = 2;
+/// O maior movimento de uma correção, em mickeys em cada eixo: perto do
+/// previsto, a seta é achada e o ganho medido vale para a próxima.
+const POINT_STEP: i64 = 120;
+/// Quanto o [`settled_pointer`] espera a seta parar.
+const POINTER_SETTLE: Duration = Duration::from_secs(5);
+
+/// Leva o ponteiro do mouse PS/2 relativo ao ponto (`x`, `y`) da tela, como
+/// a mão olhando a tela: primeiro ao canto de cima à esquerda (o movimento
+/// grande para no canto), depois em correções de até [`POINT_STEP`]
+/// mickeys, em pacotes de até [`POINT_PACKET`], achando para onde a seta foi
+/// ([`settled_pointer`]) e acertando o ganho de cada eixo pelo que ela andou
+/// (a aceleração do Windows muda o ganho com a velocidade). Devolve onde a
+/// ponta ficou, a até [`POINT_TOLERANCE`] pixels do ponto.
+fn point_at(monitor: &mut TcpStream, ppm: &Path, x: usize, y: usize) -> Result<(usize, usize), String> {
+    let send = |monitor: &mut TcpStream, dx: i64, dy: i64| monitor.write_all(format!("mouse_move {dx} {dy}
+").as_bytes()).map_err(|error| format!("monitor HMP: {error}"));
+    for _ in 0..8 {
+        send(monitor, -250, -250)?;
+        thread::sleep(Duration::from_millis(15));
+    }
+    // No canto, a seta é a que está lá (a de antes pode ter saído de
+    // qualquer lugar).
+    let mut screen = hmp_screen(monitor, ppm)?;
+    let mut current = None;
+    let deadline = Instant::now() + POINTER_SETTLE;
+    while Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(250));
+        let image = hmp_screen(monitor, ppm)?;
+        let found = screen_check::pointer_near(&image, 0, 0, 40);
+        let still = found.is_some() && screen_check::pointer_near(&screen, 0, 0, 40) == found;
+        screen = image;
+        if still {
+            current = found;
+            break;
+        }
+    }
+    let mut current = current.ok_or("a seta do ponteiro nao parou no canto de cima a esquerda")?;
+    let (mut gain_x, mut gain_y) = (1.0f64, 1.0f64);
+    for _ in 0..POINT_ROUNDS {
+        let (error_x, error_y) = (x as i64 - current.0 as i64, y as i64 - current.1 as i64);
+        if error_x.abs() <= POINT_TOLERANCE && error_y.abs() <= POINT_TOLERANCE {
+            return Ok(current);
+        }
+        // O mickey que falta, pelo ganho medido; ao menos um no eixo que
+        // ainda está longe.
+        let mickeys = |error: i64, gain: f64| match ((error as f64 / gain).round() as i64).clamp(-POINT_STEP, POINT_STEP) {
+            0 if error.abs() > POINT_TOLERANCE => error.signum(),
+            value => value,
+        };
+        let (move_x, move_y) = (mickeys(error_x, gain_x), mickeys(error_y, gain_y));
+        let packets = (move_x.abs().max(move_y.abs()) + POINT_PACKET - 1) / POINT_PACKET;
+        for step in 0..packets {
+            let part = |total: i64| total * (step + 1) / packets - total * step / packets;
+            send(monitor, part(move_x), part(move_y))?;
+            thread::sleep(Duration::from_millis(15));
+        }
+        let predicted = ((current.0 as f64 + move_x as f64 * gain_x).clamp(0.0, 1023.0) as usize, (current.1 as f64 + move_y as f64 * gain_y).clamp(0.0, 767.0) as usize);
+        let (found, image) = settled_pointer(monitor, ppm, &screen, current, predicted)?;
+        let found = found.ok_or_else(|| format!("a seta do ponteiro nao apareceu parada depois de andar ({move_x},{move_y}) de ({},{})", current.0, current.1))?;
+        let measure = |moved: i64, sent: i64, gain: f64| if sent.abs() >= 3 && moved != 0 && moved.signum() == sent.signum() { (moved as f64 / sent as f64).clamp(0.3, 4.0) } else { gain };
+        gain_x = measure(found.0 as i64 - current.0 as i64, move_x, gain_x);
+        gain_y = measure(found.1 as i64 - current.1 as i64, move_y, gain_y);
+        (current, screen) = (found, image);
+    }
+    Err(format!("o ponteiro ficou em ({},{}), longe de ({x},{y}) depois de {POINT_ROUNDS} correcoes", current.0, current.1))
+}
+
+/// Onde a seta do ponteiro parou depois de um movimento a partir de
+/// `before` (a tela com ela em `current`): o ponteiro desenhado pelo vídeo
+/// anda depois do mouse, então vale a seta que chegou
+/// ([`screen_check::pointer_moved`], a mais perto de `predicted`) quando
+/// duas leituras seguidas (250 ms uma da outra) a acham no mesmo lugar; a
+/// seta que não saiu do lugar (um movimento pequeno demais para a tela)
+/// fica em `current`. Espera por até [`POINTER_SETTLE`] e devolve a ponta e
+/// a última tela lida.
+fn settled_pointer(monitor: &mut TcpStream, ppm: &Path, before: &crate::png::Image, current: (usize, usize), predicted: (usize, usize)) -> Result<(Option<(usize, usize)>, crate::png::Image), String> {
+    let deadline = Instant::now() + POINTER_SETTLE;
+    let mut previous = None;
+    loop {
+        thread::sleep(Duration::from_millis(250));
+        let image = hmp_screen(monitor, ppm)?;
+        let found = screen_check::pointer_moved(before, &image, predicted.0, predicted.1).or_else(|| (screen_check::pointer_near(&image, current.0, current.1, 2) == Some(current)).then_some(current));
+        if found.is_some() && found == previous {
+            return Ok((found, image));
+        }
+        if Instant::now() > deadline {
+            return Ok((None, image));
+        }
+        previous = found;
+    }
+}
+
+/// Quanto o `--context-menu` espera o menu abrir e fechar.
+const CONTEXT_MENU_WAIT: Duration = Duration::from_secs(30);
+
+/// O `--context-menu`: espera a tela desenhada parada
+/// ([`screen_check::drawn_screen`], por até [`STILL_WAIT`]), leva o ponteiro
+/// a (`x`, `y`) ([`point_at`]), espera a tela parada de novo, aperta e solta
+/// o botão direito (a hora vai para `sent`), espera o menu aberto e parado
+/// ([`screen_check::context_menu_open`]), aperta o Esc e espera a tela de
+/// antes de volta, cada espera por até [`CONTEXT_MENU_WAIT`]. Devolve o menu
+/// achado, ou o que faltou.
+fn open_context_menu(monitor: &mut TcpStream, ppm: &Path, x: usize, y: usize, sent: &mut Option<Instant>) -> Result<String, String> {
+    still_screen(monitor, ppm, STILL_WAIT, screen_check::drawn_screen)?;
+    let (px, py) = point_at(monitor, ppm, x, y)?;
+    let before = still_screen(monitor, ppm, CONTEXT_MENU_WAIT, screen_check::drawn_screen)?;
+    *sent = Some(Instant::now());
+    monitor.write_all(b"mouse_button 2\n").map_err(|error| format!("monitor HMP: {error}"))?;
+    thread::sleep(Duration::from_millis(60));
+    monitor.write_all(b"mouse_button 0\n").map_err(|error| format!("monitor HMP: {error}"))?;
+    let open = still_screen(monitor, ppm, CONTEXT_MENU_WAIT, |image| screen_check::context_menu_open(&before, image, px, py)).map_err(|missing| format!("o menu de contexto nao abriu no clique em ({px},{py}): {missing}"))?;
+    let opened = screen_check::context_menu_open(&before, &open, px, py)?;
+    type_keys(monitor, "{esc}")?;
+    let back = |image: &crate::png::Image| if screen_check::same_screen(&before, image) { Ok(String::new()) } else { Err("a tela nao voltou a de antes do clique".to_string()) };
+    still_screen(monitor, ppm, CONTEXT_MENU_WAIT, back).map_err(|missing| format!("o menu de contexto abriu ({opened}), mas nao fechou com o Esc: {missing}"))?;
+    Ok(format!("{opened}; fechou com o Esc"))
+}
+
 /// O `sendkey` da parada manual: Ctrl direito segurado e Scroll Lock duas
 /// vezes. O i8042prt.sys real (CrashOnCtrlScroll=1 na semente do Registro)
 /// chama o KeBugCheckEx(0xE2) na ISR do teclado; com CrashDumpEnabled o
@@ -2048,6 +2195,19 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
                         Err(missing) => {
                             note(format!("[xtask] o menu Iniciar nao abriu e fechou com {keys} (aos {at:.1} s): {missing}"));
                             return Err(format!("o menu Iniciar nao abriu e fechou com {keys}: {missing}"));
+                        }
+                    }
+                }
+                InputAction::ContextMenu { x, y } => {
+                    let ppm = log.with_file_name("tela-monitor.ppm");
+                    let mut sent = None;
+                    let outcome = with_monitor(&mut |monitor| open_context_menu(monitor, &ppm, *x, *y, &mut sent));
+                    let at = sent.map_or(at, |sent| sent.duration_since(launched).as_secs_f64());
+                    match outcome {
+                        Ok(description) => note(format!("[xtask] botao direito em ({x},{y}) pelo monitor (aos {at:.1} s): {description}\n{CONTEXT_MENU_MARKER}")),
+                        Err(missing) => {
+                            note(format!("[xtask] botao direito em ({x},{y}) pelo monitor (aos {at:.1} s), sem o menu de contexto: {missing}"));
+                            return Err(format!("o menu de contexto nao abriu e fechou com o botao direito em ({x},{y}): {missing}"));
                         }
                     }
                 }
