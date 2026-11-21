@@ -3868,6 +3868,48 @@ pub fn set_base_priority_increment(pointer: u64, value: i32) -> Result<u32, Kern
     Ok(0)
 }
 
+/// ThreadActualBasePriority.
+const THREAD_ACTUAL_BASE_PRIORITY: u64 = 25;
+
+/// ThreadActualBasePriority (25) do NtSetInformationThread 19041: o
+/// tamanho (4 bytes, STATUS_INFO_LENGTH_MISMATCH), a base absoluta de 1 a
+/// 31 (STATUS_INVALID_PARAMETER) e o handle com
+/// THREAD_SET_LIMITED_INFORMATION; só depois do handle, uma base de 16 ou
+/// mais fora de um processo da classe de tempo real exige
+/// SeIncreaseBasePriorityPrivilege (STATUS_PRIVILEGE_NOT_HELD). A base vai
+/// ao KeSetActualBasePriorityThread. O AppXSvc pede a classe para a thread
+/// de cada implantação (o ThreadPriority do prioritypolicy.cpp).
+fn set_actual_base_priority(handle: u64, input: u64, length: u64) -> Result<u32, KernelError> {
+    if length != 4 {
+        return Ok(0xC000_0004);
+    }
+    if !probe_user_read(input, 4) {
+        return Ok(0xC000_0005);
+    }
+    // LONG: a base absoluta (sondada acima).
+    let value = match guest::try_read::<i32>(input) {
+        Ok(value) => value,
+        Err(error) => return Ok(error.status),
+    };
+    if !(1..=31).contains(&value) {
+        return Ok(0xC000_000D);
+    }
+    let thread = match resolve(handle, THREAD_SET_LIMITED_INFORMATION) {
+        Ok(thread) => thread,
+        Err(status) => return Ok(status),
+    };
+    let pointer = thread.pointer();
+    if value >= 16 {
+        // SAFETY: o EPROCESS dono de uma thread viva.
+        let owner = unsafe { crate::ntos::inc::types::Eprocess::at(kernel_thread(pointer).process.get()) };
+        if owner.priority_class.get() != PRIORITY_CLASS_REALTIME && !crate::ntos::se::privilege::single_privilege_check(SE_INCREASE_BASE_PRIORITY_PRIVILEGE, 1) {
+            return Ok(0xC000_0061);
+        }
+    }
+    thread_priority::set_actual_base_priority(pointer, value as i64 as u64)?;
+    Ok(0)
+}
+
 /// ThreadImpersonationToken.
 const THREAD_IMPERSONATION_TOKEN: u64 = 5;
 /// THREAD_SET_THREAD_TOKEN e TOKEN_IMPERSONATE.
@@ -3923,6 +3965,9 @@ fn nt_set_information_thread(handle: u64, class: u64, input: u64, length: u64, r
     }
     if class == THREAD_IMPERSONATION_TOKEN {
         return set_impersonation_token(handle, input, length);
+    }
+    if class == THREAD_ACTUAL_BASE_PRIORITY {
+        return set_actual_base_priority(handle, input, length);
     }
     // Cada classe confere o tamanho e captura o valor antes do handle (a
     // tabela de 0x64b5f4); uma classe desconhecida nem referencia o handle.

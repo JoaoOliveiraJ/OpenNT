@@ -2159,6 +2159,17 @@ fn user_threads_in(assert: Assert, test: &TestProcess) {
     let times_refused = call("NtSetInformationThread", handle, 1, info, 4) == 0xC000_0003;
     guest::write32(info, 40);
     assert(priority && base && increment_refused && times_refused && call("NtSetInformationThread", handle, 2, info, 4) == 0xC000_000D && call("NtSetInformationThread", handle, 17, info, 1) == 0xC000_0004, "userthreads: prioridade, base e recusas");
+    // ThreadActualBasePriority (25): a base absoluta de 1 a 31 pelo
+    // KeSetActualBasePriorityThread, como o AppXSvc pede para a thread de
+    // cada implantação; 0 é STATUS_INVALID_PARAMETER e outro tamanho,
+    // STATUS_INFO_LENGTH_MISMATCH.
+    guest::write32(info, 12);
+    let actual = call("NtSetInformationThread", handle, 25, info, 4) == 0 && thread_priority::query_base_priority(pointer) == 12;
+    guest::write32(info, 0);
+    let actual_refused = call("NtSetInformationThread", handle, 25, info, 4) == 0xC000_000D && call("NtSetInformationThread", handle, 25, info, 8) == 0xC000_0004 && thread_priority::query_base_priority(pointer) == 12;
+    guest::write32(info, 10);
+    let actual_restored = call("NtSetInformationThread", handle, 25, info, 4) == 0 && thread_priority::query_base_priority(pointer) == 10;
+    assert(actual && actual_refused && actual_restored, "userthreads: ThreadActualBasePriority troca a base absoluta e recusa 0 e o tamanho errado");
     teb_view.tls_slots[5].set(0x55);
     guest::write32(info, 5);
     assert(call("NtSetInformationThread", handle, 10, info, 4) == 0 && teb_view.tls_slots[5].get() == 0, "userthreads: ThreadZeroTlsCell zera o indice nas TEBs");
