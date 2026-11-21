@@ -1021,6 +1021,17 @@ const USER_LOGON_PROGRAMS: &[&str] = &[
     "bindfltapi.dll",
     "dbghelp.dll",
     "Windows.Storage.Search.dll",
+    // Os programas que o usuário abre pela caixa Executar e pelo atalho do
+    // Gerenciador de Tarefas (Ctrl+Shift+Esc), com os imports estáticos deles
+    // que faltavam: o comctl32.dll de System32 (o 6.0 vem do WinSxS, pelo
+    // manifesto) e, do Taskmgr, os contadores de desempenho (pdh.dll), a
+    // SetupAPI e o Direct3D 12.
+    "notepad.exe",
+    "Taskmgr.exe",
+    "comctl32.dll",
+    "pdh.dll",
+    "setupapi.dll",
+    "d3d12.dll",
 ];
 
 /// Os programas do logon do usuário que ficam em `\Windows`, não em
@@ -1107,6 +1118,12 @@ pub fn windows_directory() -> PathBuf {
 /// Os programas de modo usuário do boot do smss, na raiz do volume.
 pub fn user_programs() -> impl Iterator<Item = &'static str> {
     SMSS_PROGRAMS.iter().chain(SERVICE_CHAIN_PROGRAMS).chain(LOGON_SCREEN_PROGRAMS).chain(CONSOLE_PROGRAMS).chain(USER_LOGON_PROGRAMS).copied()
+}
+
+/// Os programas de `\Windows` que o volume também leva ([`WINDOWS_PROGRAMS`]).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn windows_programs() -> impl Iterator<Item = &'static str> {
+    WINDOWS_PROGRAMS.iter().copied()
 }
 
 /// Os nomes, em minúsculas, das imagens que o boot do smss põe no volume:

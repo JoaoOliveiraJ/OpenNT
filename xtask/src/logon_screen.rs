@@ -335,14 +335,349 @@ pub fn software_keys() -> Vec<HostKey> {
         // usuário nos dados.
         without_account_sids(&mut found);
         keys.extend(found);
+        // As associações do shell da instalação, só com o que é do Windows
+        // do volume.
+        let mut associations = Vec::new();
+        for class in SHELL_ASSOCIATIONS {
+            registry::copy(registry::LOCAL_MACHINE, &format!("SOFTWARE\\Classes\\{class}"), &format!("Classes\\{class}"), true, &mut associations);
+        }
+        let mut volume_programs: Vec<&str> = programs.clone();
+        volume_programs.extend(crate::windows_binaries::windows_programs());
+        let (mut kept, dropped) = volume_associations(associations, &servers, &volume_programs);
+        for line in dropped {
+            println!("AVISO: associacao do shell fora do convidado: {line}");
+        }
+        for line in clean_install_defaults(&mut kept) {
+            println!("AVISO: associacao do shell com o valor de uma instalacao nova: {line}");
+        }
+        keys.extend(kept);
+        // As zonas de segurança da instalação (`Internet Settings\Zones`, de
+        // 0, Meu Computador, a 4, Sites Restritos) e os protocolos padrão do
+        // mapa de zonas: o ZoneCheckFile do windows.storage (o
+        // CheckSmartScreen do ShellExecute de um programa) pergunta ao
+        // ZoneCheckUrlExW do urlmon a política da ação na zona do arquivo, e
+        // sem as zonas o urlmon responde E_FAIL com URLPOLICY_DISALLOW: o
+        // ShellExecute da caixa Executar volta ERROR_CANCELLED e o programa
+        // não abre. O resto de `Internet Settings` (proxy, cache, sites do
+        // mapa de zonas, agente de usuário) é desta máquina e fica fora.
+        let internet = "Microsoft\\Windows\\CurrentVersion\\Internet Settings";
+        for path in ["Zones", "ZoneMap\\ProtocolDefaults"] {
+            registry::copy(registry::LOCAL_MACHINE, &format!("SOFTWARE\\{internet}\\{path}"), &format!("{internet}\\{path}"), true, &mut keys);
+        }
     }
     keys
 }
 
+/// Os valores das associações que uma instalação nova do 19041 grava e que
+/// o convidado leva assim, seja qual for o valor desta máquina: a chave, o
+/// nome do valor, o tipo (1 REG_SZ, 2 REG_EXPAND_SZ) e o texto.
+#[cfg_attr(not(windows), allow(dead_code))]
+const CLEAN_INSTALL_ASSOCIATIONS: &[(&str, &str, u32, &str)] = &[
+    ("Classes\\Folder\\shell\\open\\command", "", 2, "%SystemRoot%\\Explorer.exe"),
+    ("Classes\\Folder\\shell\\open\\command", "DelegateExecute", 1, "{11dbb47c-a525-400b-9e80-a54615a090c0}"),
+    ("Classes\\exefile\\shell\\open\\command", "", 1, "\"%1\" %*"),
+    ("Classes\\comfile\\shell\\open\\command", "", 1, "\"%1\" %*"),
+    ("Classes\\batfile\\shell\\open\\command", "", 1, "\"%1\" %*"),
+    ("Classes\\cmdfile\\shell\\open\\command", "", 1, "\"%1\" %*"),
+    ("Classes\\txtfile\\shell\\open\\command", "", 2, "%SystemRoot%\\system32\\NOTEPAD.EXE %1"),
+    ("Classes\\.exe", "", 1, "exefile"),
+    ("Classes\\.com", "", 1, "comfile"),
+    ("Classes\\.bat", "", 1, "batfile"),
+    ("Classes\\.cmd", "", 1, "cmdfile"),
+    ("Classes\\.txt", "", 1, "txtfile"),
+    ("Classes\\.lnk", "", 1, "lnkfile"),
+    ("Classes\\lnkfile", "IsShortcut", 1, ""),
+];
+
+/// O texto de `text` como dados de um valor de cadeia (UTF-16 com o NUL).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn utf16_value(text: &str) -> Vec<u8> {
+    text.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect()
+}
+
+/// Põe nas associações (`keys`) os valores de [`CLEAN_INSTALL_ASSOCIATIONS`]
+/// no lugar dos desta máquina, criando a chave ou o valor que faltar.
+/// Devolve as trocas, para o aviso.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn clean_install_defaults(keys: &mut Vec<HostKey>) -> Vec<String> {
+    let mut changes = Vec::new();
+    for &(path, name, kind, value) in CLEAN_INSTALL_ASSOCIATIONS {
+        let data = utf16_value(value);
+        let index = match keys.iter().position(|key| key.path.eq_ignore_ascii_case(path)) {
+            Some(index) => index,
+            None => {
+                keys.push(HostKey { path: String::from(path), values: Vec::new() });
+                keys.len() - 1
+            }
+        };
+        let values = &mut keys[index].values;
+        match values.iter_mut().find(|(existing, _, _)| existing.eq_ignore_ascii_case(name)) {
+            Some(existing) if existing.1 == kind && existing.2 == data => {}
+            Some(existing) => {
+                changes.push(format!("{path}\\{name} = {value:?} (o desta maquina era outro)"));
+                *existing = (String::from(name), kind, data);
+            }
+            None => {
+                changes.push(format!("{path}\\{name} = {value:?} (ausente nesta maquina)"));
+                values.push((String::from(name), kind, data));
+            }
+        }
+    }
+    changes
+}
+
+/// Um valor de cadeia que cita um caminho fora do Windows do convidado: os
+/// programas instalados nesta máquina (`Program Files`, `ProgramData`), os
+/// perfis (`Users`, `%USERPROFILE%`, `%APPDATA%`, `%LOCALAPPDATA%`) ou outra
+/// unidade.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn outside_windows(kind: u32, data: &[u8]) -> bool {
+    if !matches!(kind, 1 | 2 | 7) {
+        return false;
+    }
+    let units: Vec<u16> = data.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect();
+    let text = String::from_utf16_lossy(&units).to_ascii_lowercase();
+    let markers = ["program files", "programdata", "\\users\\", "%userprofile%", "%appdata%", "%localappdata%", "%programfiles", "%programdata%"];
+    if markers.iter().any(|marker| text.contains(marker)) {
+        return true;
+    }
+    // Um caminho absoluto de unidade que não é o C:\Windows.
+    text.char_indices().any(|(at, character)| character.is_ascii_alphabetic() && text[at + 1..].starts_with(":\\") && !text[at..].starts_with("c:\\windows"))
+}
+
+/// As classes de associação do shell que uma instalação nova traz em
+/// `Classes` e que o shell do convidado usa: as pastas (o `Folder`, de onde
+/// vem o verbo `open` de Este Computador e de toda pasta, com o
+/// DelegateExecute {11dbb47c-...} do ExplorerFrame.dll; o `Directory`, o
+/// `Drive` e o fundo de uma pasta), os programas (`.exe`, `.com`, `.bat`,
+/// `.cmd` e as classes deles: o ShellExecute da caixa Executar acha o
+/// `notepad` como `notepad.exe` e abre pelo `exefile\shell\open\command`), o
+/// texto (`.txt` e `txtfile`) e os atalhos (`.lnk` e `lnkfile`). Sem elas o
+/// clique duplo em Este Computador volta ERROR_NO_ASSOCIATION
+/// (0x80070483) do SHInvokeCommandOnContextMenu2 do s_DoInvokeVerb do
+/// shell32, e nada abre.
+#[cfg(windows)]
+const SHELL_ASSOCIATIONS: &[&str] = &["Folder", "Directory", "Drive", ".exe", "exefile", ".com", "comfile", ".bat", "batfile", ".cmd", "cmdfile", ".txt", "txtfile", ".lnk", "lnkfile"];
+
+/// O nome do programa (em minúsculas) do começo de uma linha de comando de
+/// verbo, entre aspas ou até o primeiro espaço, com o `%SystemRoot%`, o
+/// `%windir%` e o `C:\Windows` (e o `System32` deles) tirados; `None` para o
+/// próprio arquivo (`"%1"`, o `exefile` e o `comfile`).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn command_program(command: &str) -> Option<String> {
+    let command = command.trim();
+    let first = match command.strip_prefix('"') {
+        Some(rest) => rest.split('"').next().unwrap_or(rest),
+        None => command.split(' ').next().unwrap_or(command),
+    };
+    if first == "%1" || first.is_empty() {
+        return None;
+    }
+    let lower = first.to_ascii_lowercase();
+    let name = ["%systemroot%\\system32\\", "%windir%\\system32\\", "c:\\windows\\system32\\", "%systemroot%\\", "%windir%\\", "c:\\windows\\"]
+        .iter()
+        .find_map(|prefix| lower.strip_prefix(prefix))
+        .unwrap_or(&lower);
+    Some(name.to_string())
+}
+
+/// As chaves das associações (`keys`, com os caminhos `Classes\<classe>...`)
+/// que são do Windows do volume: só as classes de [`SHELL_ASSOCIATIONS`]; um
+/// verbo de `shell` fica quando o DelegateExecute ou o
+/// ExplorerCommandHandler dele é uma das classes COM copiadas (`servers`, em
+/// minúsculas e com chaves) ou quando o comando abre o próprio arquivo
+/// (`"%1"`) ou um programa do volume (`programs`); um manipulador de
+/// `shellex` fica quando a classe dele (o valor padrão ou o nome) é uma das
+/// copiadas; um valor que cita um caminho fora do Windows do convidado
+/// ([`outside_windows`]) sai. O resto (os verbos e os manipuladores dos
+/// programas de terceiros desta máquina, as listas de `OpenWithProgids` e de
+/// `OpenWithList`, que citam os programas daqui) fica fora do convidado.
+/// Devolve as chaves que ficam e uma linha para cada coisa que saiu.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn volume_associations(keys: Vec<HostKey>, servers: &std::collections::BTreeSet<String>, programs: &[&str]) -> (Vec<HostKey>, Vec<String>) {
+    let listed = |path: &str| path.split('\\').nth(1).is_some_and(|class| SHELL_ASSOCIATIONS.iter().any(|known| known.eq_ignore_ascii_case(class)));
+    let mut log: Vec<String> = keys.iter().filter(|key| !listed(&key.path)).map(|key| format!("{} (classe fora da lista)", key.path)).collect();
+    let keys: Vec<HostKey> = keys.into_iter().filter(|key| listed(&key.path)).collect();
+    let class_of = |value: Option<String>| value.map(|value| format!("{{{}}}", value.trim().trim_matches(|c| c == '{' || c == '}').to_ascii_lowercase())).filter(|class| servers.contains(class));
+    let staged = |program: &str| programs.iter().any(|known| known.eq_ignore_ascii_case(program));
+    // Os prefixos que saem: os verbos e os manipuladores de fora.
+    let mut dropped: Vec<String> = Vec::new();
+    for key in &keys {
+        let parts: Vec<&str> = key.path.split('\\').collect();
+        let lower: Vec<String> = parts.iter().map(|part| part.to_ascii_lowercase()).collect();
+        let Some(at) = lower.iter().position(|part| part == "shell" || part == "shellex" || part == "openwithprogids" || part == "openwithlist") else { continue };
+        let prefix = |count: usize| parts[..count].join("\\");
+        match lower[at].as_str() {
+            "openwithprogids" | "openwithlist" => dropped.push(prefix(at + 1)),
+            "shell" if parts.len() == at + 2 => {
+                let verb = prefix(at + 2);
+                let command = keys.iter().find(|other| other.path.eq_ignore_ascii_case(&format!("{verb}\\command")));
+                let handler = class_of(text(&key.values, "ExplorerCommandHandler")).is_some() || command.is_some_and(|command| class_of(text(&command.values, "DelegateExecute")).is_some());
+                let launches = command.and_then(|command| text(&command.values, "")).is_some_and(|line| command_program(&line).is_none_or(|program| staged(&program)));
+                if !handler && !launches {
+                    dropped.push(verb);
+                }
+            }
+            // `shellex\{IID}` com a classe no valor padrão.
+            "shellex" if parts.len() == at + 2 && parts[at + 1].starts_with('{') => {
+                if class_of(text(&key.values, "")).is_none() {
+                    dropped.push(prefix(at + 2));
+                }
+            }
+            // `shellex\<tipo>\<nome>`: a classe no valor padrão ou no nome.
+            "shellex" if parts.len() == at + 3 => {
+                if class_of(text(&key.values, "")).or_else(|| class_of(Some(parts[at + 2].to_string()))).is_none() {
+                    dropped.push(prefix(at + 3));
+                }
+            }
+            _ => {}
+        }
+    }
+    let inside = |path: &str, prefix: &str| path.len() >= prefix.len() && path[..prefix.len()].eq_ignore_ascii_case(prefix) && (path.len() == prefix.len() || path.as_bytes()[prefix.len()] == b'\\');
+    dropped.sort();
+    dropped.dedup();
+    log.extend(dropped.iter().map(|prefix| format!("{prefix} (verbo ou manipulador de fora do volume)")));
+    let mut kept: Vec<HostKey> = keys.into_iter().filter(|key| !dropped.iter().any(|prefix| inside(&key.path, prefix))).collect();
+    for key in &mut kept {
+        let path = key.path.clone();
+        key.values.retain(|(name, kind, data)| {
+            let outside = outside_windows(*kind, data);
+            if outside {
+                log.push(format!("{path}\\{name} (caminho fora do Windows do convidado)"));
+            }
+            !outside
+        });
+    }
+    (kept, log)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{holds_account_sid, without_account_sids};
+    use super::{clean_install_defaults, command_program, holds_account_sid, utf16_value, volume_associations, without_account_sids};
     use crate::host_language::HostKey;
+
+    /// O programa do começo de uma linha de comando de verbo.
+    #[test]
+    fn command_program_reads_the_first_word() {
+        assert_eq!(command_program("\"%1\" %*"), None);
+        assert_eq!(command_program("%SystemRoot%\\Explorer.exe").as_deref(), Some("explorer.exe"));
+        assert_eq!(command_program("%SystemRoot%\\system32\\NOTEPAD.EXE %1").as_deref(), Some("notepad.exe"));
+        assert_eq!(command_program("\"C:\\Program Files\\Editor\\editor.exe\" \"%1\"").as_deref(), Some("c:\\program files\\editor\\editor.exe"));
+    }
+
+    /// Das associações ficam os verbos e os manipuladores do Windows do
+    /// volume; os de programas de fora e as listas de OpenWith saem.
+    #[test]
+    fn volume_associations_keep_only_the_windows_of_the_volume() {
+        let sz = |name: &str, text: &str| (String::from(name), 1u32, text.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect::<Vec<u8>>());
+        let key = |path: &str, values: Vec<(String, u32, Vec<u8>)>| HostKey { path: String::from(path), values };
+        let keys = vec![
+            key("Classes\\Folder", vec![sz("", "Folder")]),
+            key("Classes\\Folder\\shell", vec![]),
+            key("Classes\\Folder\\shell\\open", vec![sz("MultiSelectModel", "Document")]),
+            key("Classes\\Folder\\shell\\open\\command", vec![sz("", "%SystemRoot%\\Explorer.exe"), sz("DelegateExecute", "{11dbb47c-a525-400b-9e80-a54615a090c0}")]),
+            key("Classes\\Folder\\shell\\editor", vec![]),
+            key("Classes\\Folder\\shell\\editor\\command", vec![sz("", "\"C:\\Program Files\\Editor\\editor.exe\" \"%V\"")]),
+            key("Classes\\Folder\\shellex\\ContextMenuHandlers", vec![]),
+            key("Classes\\Folder\\shellex\\ContextMenuHandlers\\Library Location", vec![sz("", "{3dad6c5d-2167-4cae-9914-f99e41c12cfa}")]),
+            key("Classes\\Folder\\shellex\\ContextMenuHandlers\\Archiver", vec![sz("", "{B41DB860-64E4-11D2-9906-E49FADC173CA}")]),
+            key("Classes\\exefile\\shell\\open\\command", vec![sz("", "\"%1\" %*")]),
+            key("Classes\\txtfile\\shell\\open\\command", vec![sz("", "%SystemRoot%\\system32\\NOTEPAD.EXE %1")]),
+            key("Classes\\.txt\\OpenWithProgids", vec![sz("txtfile", "")]),
+            key("Classes\\.txt\\shellex\\{8895b1c6-b41f-4c1c-a562-0d564250836f}", vec![sz("", "{00000000-1111-2222-3333-444444444444}")]),
+            key("Classes\\Directory\\DefaultIcon", vec![sz("", "%SystemRoot%\\System32\\imageres.dll,-3")]),
+            key("Classes\\Drive\\DefaultIcon", vec![sz("", "\"C:\\Program Files\\Tool\\icons.dll\",0"), sz("Other", "%USERPROFILE%\\icons.dll")]),
+            key("Classes\\Applications\\editor.exe\\shell\\open\\command", vec![sz("", "\"%1\"")]),
+            key("Classes\\SomeVendor.Document\\DefaultIcon", vec![sz("", "%SystemRoot%\\System32\\shell32.dll,1")]),
+        ];
+        let servers: std::collections::BTreeSet<String> = ["{11dbb47c-a525-400b-9e80-a54615a090c0}", "{3dad6c5d-2167-4cae-9914-f99e41c12cfa}"].iter().map(|class| class.to_string()).collect();
+        let (kept, log) = volume_associations(keys, &servers, &["explorer.exe", "NOTEPAD.EXE"]);
+        let drive = kept.iter().find(|key| key.path == "Classes\\Drive\\DefaultIcon").expect("a chave fica, sem os valores de fora");
+        assert!(drive.values.is_empty(), "os caminhos fora do Windows do convidado saem: {:?}", drive.values);
+        let kept: Vec<String> = kept.into_iter().map(|key| key.path).collect();
+        // Nenhum verbo ou manipulador de terceiros e nenhuma classe fora da lista.
+        for third_party in ["editor", "Archiver", "OpenWithProgids", "{8895b1c6", "Applications", "SomeVendor"] {
+            assert!(!kept.iter().any(|path| path.contains(third_party)), "{third_party} ficou: {kept:?}");
+            assert!(log.iter().any(|line| line.contains(third_party)), "{third_party} saiu sem aviso: {log:?}");
+        }
+        assert!(log.iter().any(|line| line.contains("Program Files") || line.contains("Drive\\DefaultIcon\\")), "{log:?}");
+        assert_eq!(
+            kept,
+            [
+                "Classes\\Folder",
+                "Classes\\Folder\\shell",
+                "Classes\\Folder\\shell\\open",
+                "Classes\\Folder\\shell\\open\\command",
+                "Classes\\Folder\\shellex\\ContextMenuHandlers",
+                "Classes\\Folder\\shellex\\ContextMenuHandlers\\Library Location",
+                "Classes\\exefile\\shell\\open\\command",
+                "Classes\\txtfile\\shell\\open\\command",
+                "Classes\\Directory\\DefaultIcon",
+                "Classes\\Drive\\DefaultIcon",
+            ]
+        );
+    }
+
+    /// Os valores conhecidos de uma instalação nova ficam como nela, também
+    /// quando esta máquina os mudou ou não os tem.
+    #[test]
+    fn clean_install_defaults_replace_the_host_values() {
+        let mut keys = vec![HostKey { path: String::from("Classes\\exefile\\shell\\open\\command"), values: vec![(String::new(), 1, utf16_value("\"C:\\Tools\\wrapper.exe\" \"%1\" %*"))] }];
+        let changes = clean_install_defaults(&mut keys);
+        let exefile = keys.iter().find(|key| key.path == "Classes\\exefile\\shell\\open\\command").unwrap();
+        assert_eq!(exefile.values, vec![(String::new(), 1, utf16_value("\"%1\" %*"))]);
+        assert!(changes.iter().any(|line| line.starts_with("Classes\\exefile") && line.contains("outro")), "{changes:?}");
+        let folder = keys.iter().find(|key| key.path == "Classes\\Folder\\shell\\open\\command").expect("a chave que faltava entra");
+        assert!(folder.values.contains(&(String::from("DelegateExecute"), 1, utf16_value("{11dbb47c-a525-400b-9e80-a54615a090c0}"))));
+        // Uma segunda passada não muda nada.
+        assert!(clean_install_defaults(&mut keys).is_empty());
+    }
+
+    /// As associações que a hive SOFTWARE do convidado leva desta máquina:
+    /// só as classes da lista, nenhum verbo cujo comando abra um programa de
+    /// fora do volume, nenhum manipulador cuja classe não esteja copiada,
+    /// nenhuma lista de OpenWith e nenhum caminho fora do Windows do
+    /// convidado; os verbos open de Folder, exefile e txtfile ficam.
+    #[cfg(windows)]
+    #[test]
+    fn host_associations_carry_only_the_windows_of_the_volume() {
+        use super::{command_program, outside_windows, text, SHELL_ASSOCIATIONS};
+        let keys = super::software_keys();
+        let classes: std::collections::BTreeSet<String> = keys.iter().filter(|key| key.path.starts_with("Classes\\CLSID\\")).filter_map(|key| key.path.split('\\').nth(2).map(str::to_ascii_lowercase)).collect();
+        let mut programs: Vec<String> = crate::windows_binaries::user_programs().chain(crate::windows_binaries::windows_programs()).map(str::to_ascii_lowercase).collect();
+        programs.sort();
+        let associations: Vec<&HostKey> = keys.iter().filter(|key| {
+            let mut parts = key.path.split('\\');
+            parts.next() == Some("Classes") && parts.next().is_some_and(|class| !class.eq_ignore_ascii_case("CLSID") && !class.eq_ignore_ascii_case("Interface") && !class.eq_ignore_ascii_case("AppID"))
+        }).collect();
+        for key in &associations {
+            let class = key.path.split('\\').nth(1).unwrap_or_default();
+            assert!(SHELL_ASSOCIATIONS.iter().any(|known| known.eq_ignore_ascii_case(class)), "classe fora da lista: {}", key.path);
+            let lower = key.path.to_ascii_lowercase();
+            assert!(!lower.contains("\\openwithprogids") && !lower.contains("\\openwithlist"), "{}", key.path);
+            for (name, kind, data) in &key.values {
+                assert!(!outside_windows(*kind, data), "{}\\{name} cita um caminho fora do Windows do convidado", key.path);
+            }
+            if lower.ends_with("\\command") {
+                if let Some(line) = text(&key.values, "") {
+                    let delegate = text(&key.values, "DelegateExecute").is_some_and(|class| classes.contains(&class.trim().to_ascii_lowercase()));
+                    assert!(delegate || command_program(&line).is_none_or(|program| programs.binary_search(&program).is_ok()), "{} abre um programa de fora do volume: {line}", key.path);
+                }
+            }
+            let parts: Vec<&str> = key.path.split('\\').collect();
+            if let Some(at) = parts.iter().position(|part| part.eq_ignore_ascii_case("shellex")) {
+                if parts.len() == at + 3 {
+                    // A classe no valor padrão ou, quando ele é só um nome, no nome da chave.
+                    let named = parts[at + 2].trim().to_ascii_lowercase();
+                    let handler = text(&key.values, "").map(|value| value.trim().to_ascii_lowercase()).filter(|value| classes.contains(value)).unwrap_or(named);
+                    assert!(classes.contains(&handler), "manipulador de fora do volume: {} ({handler})", key.path);
+                }
+            }
+        }
+        for open in ["Classes\\Folder\\shell\\open\\command", "Classes\\exefile\\shell\\open\\command", "Classes\\txtfile\\shell\\open\\command"] {
+            assert!(associations.iter().any(|key| key.path.eq_ignore_ascii_case(open)), "{open} faltou");
+        }
+    }
 
     /// Um SID em binário: revisão 1, o número de subautoridades, a
     /// autoridade 5 (big-endian) e as subautoridades em little-endian.
