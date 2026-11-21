@@ -922,7 +922,7 @@ pub mod ex_processor_usage {
 
 pub mod pcw_counters {
     //! Adaptadores de PcwRegister/PcwUnregister/PcwAddInstance (lógica em
-    //! `ex/pcw.rs`: o ramo do ntoskrnl sem a extensão do pcw.sys).
+    //! `ex/pcw.rs`: o despacho para o pcw.sys e o ramo sem a extensão).
 
     use crate::ntos::ex::pcw;
     use crate::ntos::inc::types::{Field, NtStruct};
@@ -1468,8 +1468,8 @@ pub mod ex_processor_feature {
 }
 
 pub mod pcw_instances {
-    //! PcwCreateInstance/PcwCloseInstance (lógica em `ex/pcw.rs`: o ramo do
-    //! ntoskrnl sem a extensão do pcw.sys).
+    //! PcwCreateInstance/PcwCloseInstance (lógica em `ex/pcw.rs`: o
+    //! despacho para o pcw.sys e o ramo sem a extensão).
 
     use crate::ntos::ex::pcw;
     use crate::ntos::inc::types::{Field, NtStruct};

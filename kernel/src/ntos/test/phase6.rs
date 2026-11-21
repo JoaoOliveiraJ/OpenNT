@@ -15543,6 +15543,35 @@ fn pcw_instances_exports(assert: Assert) {
     const KEY: &str = "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\pcw";
     let out = guest::alloc_bytes(8);
     let instance = at::<nt::Field<u64>>(out);
+    if pcw::extension_registered() {
+        // Com o pcw.sys carregado, PcwCreateInstance e PcwCloseInstance vão
+        // às rotinas 2 e 3 dele: um conjunto de um contador de 4 bytes e uma
+        // instância com nome e um PCW_DATA.
+        let info = guest::alloc_bytes(0x40);
+        guest::write_bytes(info, &[0; 0x40]);
+        let descriptor = guest::alloc_bytes(8);
+        guest::write_bytes(descriptor, &[0, 0, 0, 0, 0, 0, 4, 0]);
+        guest::write32(info, 0x100);
+        guest::write64(info + 8, unicode_string_for("OpenNTInstancias"));
+        guest::write32(info + 0x10, 1);
+        guest::write64(info + 0x18, descriptor);
+        let registration_out = guest::alloc_bytes(8);
+        let registration = at::<nt::Field<u64>>(registration_out);
+        registration.set(0);
+        let registered = call_export("PcwRegister", &[registration_out, info]) == Some(0) && registration.get() != 0;
+        let value = guest::alloc_bytes(4);
+        guest::write32(value, 7);
+        let data = guest::alloc_bytes(0x10);
+        guest::write64(data, value);
+        guest::write32(data + 8, 4);
+        instance.set(0);
+        let created = call_export("PcwCreateInstance", &[out, registration.get(), unicode_string_for("0"), 1, data]);
+        assert(registered && created == Some(0) && instance.get() != 0, "pcw-instances: com o pcw.sys carregado, PcwCreateInstance cria a instancia por ele");
+        let _ = call_export("PcwCloseInstance", &[instance.get()]);
+        let _ = call_export("PcwUnregister", &[registration.get()]);
+        guest::free_bytes(out);
+        return;
+    }
     let preexisting = registry::node_by_path(KEY).is_some();
     let handle = registry::open_or_create(KEY, None).unwrap_or(0);
     let saved = registry::get_value(handle, "Start");

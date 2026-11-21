@@ -88,6 +88,8 @@ const PCW_HOST: HostParameters = HostParameters { extension_id: 1, extension_ver
 /// Posições da tabela de funções do pcw.sys.
 const REGISTER: u64 = 0;
 const UNREGISTER: u64 = 1;
+const CREATE_INSTANCE: u64 = 2;
+const CLOSE_INSTANCE: u64 = 3;
 const ADD_INSTANCE: u64 = 4;
 
 /// O ExRegisterHost do ExpInitSystemPhase1; uma falha deixa o host nulo.
@@ -141,16 +143,21 @@ pub fn add_instance(buffer: u64, name: u64, id: u32, count: u32, data: u64) -> u
 }
 
 /// PcwCreateInstance(Instance*, Registration, Name, Count, Data) (0x666980):
-/// sem tabela de extensão, *Instance = NULL e o status de
-/// ExpPcwDisabledStatus.
-pub fn create_instance(instance: &Field<u64>, _registration: u64, _name: u64, _count: u32, _data: u64) -> u32 {
+/// pela rotina 2 do pcw.sys (os cinco argumentos como vieram); sem tabela
+/// de extensão, *Instance = NULL e o status de ExpPcwDisabledStatus.
+pub fn create_instance(instance: &Field<u64>, registration: u64, name: u64, count: u32, data: u64) -> u32 {
+    if let Some(status) = with_extension(CREATE_INSTANCE, |routine| native_call::call(routine, &[instance.address(), registration, name, count as u64, data]) as u32) {
+        return status;
+    }
     instance.set(0);
     disabled_status()
 }
 
-/// PcwCloseInstance(Instance) (0x666940): sem tabela de extensão, nada a
-/// fechar (o argumento não é lido).
-pub fn close_instance(_instance: u64) {}
+/// PcwCloseInstance(Instance) (0x666940): pela rotina 3 do pcw.sys; sem
+/// tabela de extensão, nada a fechar (o argumento não é lido).
+pub fn close_instance(instance: u64) {
+    with_extension(CLOSE_INSTANCE, |routine| native_call::call(routine, &[instance]));
+}
 
 /// Esquece o estado calculado (o teste de fase 6 reconsulta o Registro).
 pub fn reset_enable_state_for_test() {
