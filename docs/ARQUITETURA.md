@@ -5664,6 +5664,20 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   de falha do RPC) e a resposta do bind mostram o pedido a que respondem,
   pelo MessageId. O rastro só observa; sem a opção, cada ponto de envio só
   lê a célula que o `boot_config::capture` preencheu.
+- **O alarme das esperas em processos** (`ob/wait.rs`, sempre ligado): o
+  services.exe dá um serviço como caído pelo IsProcessCrashed (um
+  WaitForSingleObject de prazo zero no handle do svchost que o
+  CreateProcessAsUserW devolveu), e o UpdateStartState então marca o
+  serviço como falho e os dependentes não sobem (o UserManager depende do
+  ProfSvc). Uma linha `[diag] espera satisfeita num processo vivo` sai
+  quando uma espera de modo usuário (NtWaitForSingleObject,
+  NtWaitForMultipleObjects) ou um pacote de espera é satisfeito num
+  KPROCESS cujo processo não começou a terminar. Uma linha `[diag] espera
+  satisfeita num handle de processo reaproveitado` sai quando o valor era
+  um handle de processo do NtCreateUserProcess e hoje resolve para outro
+  objeto sem que o dono o tenha fechado em modo usuário; ela traz quem
+  fechou o valor (o fechamento passa por `ps/user/state.rs`). O alarme só
+  observa.
 - **Os tokens de logon** (`se/token/create.rs`, `se/token/set_information.rs`):
   o NtCreateToken e o NtCreateTokenEx do LSA (SeCreateTokenPrivilege
   habilitado, TokenType, o nível pelo QoS num token de impersonação, a sessão
