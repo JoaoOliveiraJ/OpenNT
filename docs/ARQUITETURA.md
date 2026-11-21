@@ -5648,11 +5648,8 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   Microsoft.Windows.StartMenuExperienceHost e do ShellExperienceHost em
   `\Windows\SystemApps`, sem a `microsoft.system.package.metadata` que o
   AppXSvc gera; os serviços AppReadiness e AppXSvc com as DLLs deles; as
-  chaves de uma instalação nova: os valores de configuração do AppX, o
-  volume de pacotes padrão de `Appx\PackageVolumes`, as extensões de
-  implantação da caixa, as filas vazias do AppXSvc, a chave `Applications`
-  vazia do AppxAllUserStore, as entradas dos dois pacotes em
-  `AppxAllUserStore\InboxApplications` e `Config`, a classe COM e o AppID
+  chaves do AppX de uma instalação nova (a lista e o porquê em "Chaves do
+  AppX que o xtask grava", abaixo), a classe COM e o AppID
   do AppReadiness, os SIPs do AppxSip.dll, o provedor
   WINTRUST_ACTION_GENERIC_VERIFY_V2 e as raízes públicas da Microsoft;
   o registro é dos serviços reais no convidado, e os bancos do
@@ -6539,6 +6536,38 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   comando tem no máximo 259 caracteres (o buffer do winlogon). O banco novo tem
   a complexidade de senha ligada: a conta fica sem senha porque o `net user
   /add` não grava senha nenhuma.
+- **Chaves do AppX que o xtask grava** (`xtask/src/inbox_packages.rs`): só a
+  configuração estática que a imagem do 19041 já traz antes de qualquer
+  logon, igual em toda instalação; o AppXSvc e o AppReadiness abrem essas
+  chaves e não as criam. Nada por máquina, por pacote registrado ou por
+  usuário: nenhum banco do StateRepository, registro de pacote,
+  identificador de pacote, GUID de volume ou SID; o registro dos pacotes, o
+  estado por usuário e os identificadores são feitos pelos serviços no
+  convidado. O teste `appx_keys_carry_no_package_state` confere a lista.
+  - `Appx`: os valores de configuração da imagem (`APPX_VALUES`: os
+    diretórios `PackageRepositoryRoot` e `PackageRoot`, os tipos de sistema
+    de arquivos aceitos, as ACEs condicionais e os recursos ligados), sem as
+    subchaves de estado (Inventory, PackageState, PackageRepair...).
+  - `Appx\PackageVolumes` com o volume padrão `1`: `DefaultVolumeKey` e
+    `EnableExternalVolumes` 1, `Flags` 0x17A, `SISPath`
+    `C:\Program Files\WindowsApps` e `MediaId`, `MountPoint` e `Name`
+    vazios, sem identificador; o `MutablePackagesOnline` vazio. O
+    VolumeManager abre a chave em cada implantação.
+  - `Appx\DeploymentExtensionModules`: as duas extensões da caixa de
+    System32, na ordem em que o AppXSvc as carrega.
+  - `Appx\NewDeploymentOperation`, `Appx\ByteCodeQueue` e `Appx\PurgeList`:
+    as filas do serviço, vazias numa instalação nova.
+  - `AppxAllUserStore\Applications`: a lista dos pacotes provisionados,
+    vazia (o convidado não tem pacotes provisionados; os desta máquina não
+    vão).
+  - `AppxAllUserStore\InboxApplications` e as entradas dos dois pacotes da
+    caixa (o `Path` do manifesto em `\Windows\SystemApps`), e
+    `AppxAllUserStore\Config\<família>` deles: a lista dos pacotes da caixa
+    que a imagem traz e que o AppReadiness registra no primeiro logon.
+  - As pastas vazias `\Program Files\WindowsApps` (o `SISPath`) e
+    `\ProgramData\Microsoft\Windows\AppRepository\Packages` (onde o AppXSvc
+    cria a pasta de metadados de cada pacote que registra), com o descritor
+    da instalação (`host_security`); o conteúdo desta máquina não vai.
 
 ## 5. Testes
 

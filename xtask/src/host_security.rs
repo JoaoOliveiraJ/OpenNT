@@ -546,32 +546,40 @@ pub struct SystemSecurity {
     pub root: Option<Vec<u8>>,
 }
 
-/// A pasta daqui de uma pasta vazia do volume: relativa ao `%SystemRoot%` ou
-/// ao `%ProgramData%` (vazia: o próprio `%ProgramData%`).
+/// A pasta daqui de uma pasta vazia do volume: relativa ao `%SystemRoot%`,
+/// ao `%ProgramData%` ou ao `%ProgramFiles%` (vazia: a própria pasta).
 #[cfg_attr(not(windows), allow(dead_code))]
 #[derive(Clone, Copy)]
 enum HostFolder {
     Windows(&'static str),
     ProgramData(&'static str),
+    ProgramFiles(&'static str),
 }
 
 /// As pastas vazias de uma instalação nova que a cadeia usa: o caminho no
 /// volume (achatado como o `nt_path_to_volume_path`) e o daqui. O
 /// ProgramData, o AppRepository dele (os bancos do StateRepository, que o
 /// serviço cria só dentro de uma pasta que já existe; o conteúdo daqui não
-/// vai), o Temp do Windows, os perfis do LocalService e do NetworkService, o
-/// perfil do SYSTEM, o LogFiles de System32 e o Logs do Windows. A lista
+/// vai) com o `Packages` vazio (o AppXSvc cria nele a pasta de metadados de
+/// cada pacote que registra, e não cria o `Packages`), o Temp do Windows, os perfis do LocalService e do NetworkService, o
+/// perfil do SYSTEM, o LogFiles de System32, o Logs do Windows e o
+/// `Program Files\WindowsApps` do volume de pacotes padrão (o `SISPath` de
+/// `Appx\PackageVolumes`, que o AppXSvc confere em cada registro pelo
+/// sistema de arquivos dele; os pacotes desta máquina não vão). A lista
 /// certa sai do log de auditoria do passo 2 (as negações de pasta que falta).
 #[cfg_attr(not(windows), allow(dead_code))]
 const EMPTY_DIRECTORIES: &[(&str, HostFolder)] = &[
     ("ProgramData", HostFolder::ProgramData("")),
     ("ProgramData/Microsoft/Windows/AppRepository", HostFolder::ProgramData("Microsoft/Windows/AppRepository")),
+    ("ProgramData/Microsoft/Windows/AppRepository/Packages", HostFolder::ProgramData("Microsoft/Windows/AppRepository/Packages")),
     ("Temp", HostFolder::Windows("Temp")),
     ("ServiceProfiles/LocalService", HostFolder::Windows("ServiceProfiles/LocalService")),
     ("ServiceProfiles/NetworkService", HostFolder::Windows("ServiceProfiles/NetworkService")),
     ("config/systemprofile", HostFolder::Windows("System32/config/systemprofile")),
     ("LogFiles", HostFolder::Windows("System32/LogFiles")),
     ("Logs", HostFolder::Windows("Logs")),
+    ("Program Files", HostFolder::ProgramFiles("")),
+    ("Program Files/WindowsApps", HostFolder::ProgramFiles("WindowsApps")),
 ];
 
 /// FILE_ATTRIBUTE_DIRECTORY e FILE_ATTRIBUTE_ARCHIVE: os atributos que o
@@ -635,11 +643,14 @@ mod host {
         let mut entries: Vec<(String, bool, Option<PathBuf>)> = files.iter().map(|(path, host)| (String::from(path.trim_end_matches('/')), path.ends_with('/'), host.clone())).collect();
         if empty_directories {
             let program_data = std::env::var("ProgramData").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("C:/ProgramData"));
+            let program_files = std::env::var("ProgramW6432").or_else(|_| std::env::var("ProgramFiles")).map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("C:/Program Files"));
             for (volume, origin) in EMPTY_DIRECTORIES {
                 let host = match *origin {
                     HostFolder::Windows(relative) => windows.join(relative),
                     HostFolder::ProgramData("") => program_data.clone(),
                     HostFolder::ProgramData(relative) => program_data.join(relative),
+                    HostFolder::ProgramFiles("") => program_files.clone(),
+                    HostFolder::ProgramFiles(relative) => program_files.join(relative),
                 };
                 // Uma pasta que esta máquina não deixa ver vai com o
                 // descritor herdado do pai no volume.

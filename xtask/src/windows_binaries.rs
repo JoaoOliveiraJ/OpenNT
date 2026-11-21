@@ -1862,9 +1862,10 @@ mod tests {
 
     /// As bibliotecas só de recursos da lista do logon do usuário: sem código
     /// (ponto de entrada 0) e sem imports, carregadas como dados (o
-    /// GetRoleTextW do oleacc carrega o OLEACCRC.DLL e lê o texto do papel).
+    /// GetRoleTextW do oleacc carrega o OLEACCRC.DLL e lê o texto do papel;
+    /// o Resources::classInit do msxml6.dll carrega o msxml6r.dll).
     #[cfg(windows)]
-    const RESOURCE_ONLY: &[&str] = &["oleaccrc.dll"];
+    const RESOURCE_ONLY: &[&str] = &["oleaccrc.dll", "msxml6r.dll"];
 
     /// Todo import estático dos programas do logon do usuário e do
     /// explorer.exe resolve, pelos API sets desta máquina, para um programa

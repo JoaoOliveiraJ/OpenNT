@@ -62,6 +62,24 @@ const GENERATED: &str = "microsoft.system.package.metadata";
 const APPX: &str = "Microsoft\\Windows\\CurrentVersion\\Appx";
 const ALL_USER_STORE: &str = "Microsoft\\Windows\\CurrentVersion\\Appx\\AppxAllUserStore";
 
+/// Os valores de configuração de `Appx` que a imagem do Windows traz, iguais
+/// em toda instalação: os diretórios (o `PackageRepositoryRoot` dos bancos e
+/// o `PackageRoot` dos pacotes), os tipos de sistema de arquivos aceitos, as
+/// ACEs condicionais e os recursos ligados no 19041. Outro valor desta
+/// máquina (ajustes de diagnóstico como o PauseOnFailure) não vai.
+#[cfg_attr(not(windows), allow(dead_code))]
+const APPX_VALUES: &[&str] = &[
+    "ConditionalACE",
+    "IUILayoutPolicyModule",
+    "MutablePackageDirectoryEnabled",
+    "PackagedFullTrustEnabled",
+    "PackageRepositoryRoot",
+    "PackageRoot",
+    "SupportedExternalFSTypes",
+    "SupportedInternalFSTypes",
+    "Win32alacarteEnabled",
+];
+
 /// O volume de pacotes de uma instalação nova (`Appx\PackageVolumes`): o
 /// volume 1, o padrão, com o `SISPath` em `C:\Program Files\WindowsApps`. A
 /// imagem do Windows já traz a chave (o volume é criado quando a imagem é
@@ -259,10 +277,13 @@ pub fn software_keys() -> Vec<HostKey> {
         use crate::host_language::registry;
         let machine = registry::LOCAL_MACHINE;
         let windows = crate::windows_binaries::windows_directory();
-        // Os valores de configuração do AppX (os diretórios, os tipos de
-        // sistema de arquivos aceitos, as ACEs condicionais...), sem as
+        // Os valores de configuração do AppX de [`APPX_VALUES`], sem as
         // subchaves.
+        let first = keys.len();
         registry::copy(machine, &format!("SOFTWARE\\{APPX}"), APPX, false, &mut keys);
+        if let Some(key) = keys.get_mut(first).filter(|key| key.path == APPX) {
+            key.values.retain(|(name, _, _)| APPX_VALUES.iter().any(|kept| kept.eq_ignore_ascii_case(name)));
+        }
         // O repositório da caixa: só a chave InboxApplications (com o valor
         // dela) e as entradas dos pacotes que o volume leva.
         let inbox = format!("{ALL_USER_STORE}\\InboxApplications");
@@ -437,5 +458,49 @@ mod tests {
         }
         let windows = crate::windows_binaries::windows_directory();
         assert!(super::files(&windows).iter().all(|(path, _)| !path.to_ascii_lowercase().contains("microsoft.system.package.metadata")));
+    }
+
+    /// Embaixo de `Appx` o xtask só escreve a configuração da imagem: as
+    /// chaves conhecidas, nenhum outro pacote além das duas entradas da
+    /// caixa (o `InboxApplications` e o `Config` deles), nenhum SID de conta
+    /// ou de pacote, nenhum GUID de volume e nenhum valor nas filas, no
+    /// `Applications` e no `MutablePackagesOnline`. O volume padrão não
+    /// traz identificador: `MediaId`, `MountPoint` e `Name` vazios.
+    #[cfg(windows)]
+    #[test]
+    fn appx_keys_carry_no_package_state() {
+        use super::{text, ALL_USER_STORE, APPX, DEPLOYMENT_EXTENSIONS, EMPTY_QUEUES, PACKAGE_VOLUMES};
+        let inbox = ["Microsoft.Windows.StartMenuExperienceHost_", "Microsoft.Windows.ShellExperienceHost_"];
+        let empty = |path: &str| path.eq_ignore_ascii_case(&format!("{ALL_USER_STORE}\\Applications")) || path.eq_ignore_ascii_case(&format!("{PACKAGE_VOLUMES}\\1\\MutablePackagesOnline")) || EMPTY_QUEUES.iter().any(|queue| path.eq_ignore_ascii_case(&format!("{APPX}\\{queue}")));
+        let mut seen = 0;
+        for key in super::software_keys() {
+            let lower = key.path.to_ascii_lowercase();
+            if !lower.starts_with(&APPX.to_ascii_lowercase()) {
+                continue;
+            }
+            seen += 1;
+            let entry = |parent: &str| key.path.len() > parent.len() + 1 && key.path[..parent.len()].eq_ignore_ascii_case(parent) && !key.path[parent.len() + 1..].contains('\\');
+            let package = |parent: &str| entry(parent) && inbox.iter().any(|name| key.path[parent.len() + 1..].starts_with(name));
+            let known = [APPX, PACKAGE_VOLUMES, &format!("{PACKAGE_VOLUMES}\\1"), DEPLOYMENT_EXTENSIONS, &format!("{ALL_USER_STORE}\\InboxApplications")].iter().any(|path| key.path.eq_ignore_ascii_case(path));
+            assert!(known || empty(&key.path) || package(&format!("{ALL_USER_STORE}\\InboxApplications")) || package(&format!("{ALL_USER_STORE}\\Config")), "chave fora da configuracao da imagem: {}", key.path);
+            if empty(&key.path) {
+                assert!(key.values.is_empty(), "{} tem valores", key.path);
+            }
+            assert!(!lower.contains("s-1-5-21-") && !lower.contains("s-1-15-2-"), "{}", key.path);
+            for (name, kind, data) in &key.values {
+                assert!(!crate::logon_screen::holds_account_sid(*kind, data), "{}\\{name}", key.path);
+                if matches!(kind, 1 | 2 | 7) {
+                    let value = text(data).to_ascii_lowercase();
+                    assert!(!value.contains("s-1-15-2-") && !value.contains("volume{"), "{}\\{name} = {value}", key.path);
+                }
+            }
+            if key.path.eq_ignore_ascii_case(&format!("{PACKAGE_VOLUMES}\\1")) {
+                for name in ["MediaId", "MountPoint", "Name"] {
+                    let value = key.values.iter().find(|(found, _, _)| found == name).map(|(_, _, data)| text(data));
+                    assert_eq!(value.as_deref(), Some(""), "{name} do volume padrao");
+                }
+            }
+        }
+        assert!(seen > 0, "nenhuma chave de Appx");
     }
 }
