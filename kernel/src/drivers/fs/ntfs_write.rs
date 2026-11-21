@@ -77,6 +77,16 @@ impl BitmapView<'_> {
         self.byte((index >> 3) as usize) & (1 << (index & 7)) != 0
     }
 
+    /// Os bytes do setor `sector` do bitmap estão todos cheios (0xFF), na
+    /// cópia da transação ou, sem ela, no gravado.
+    fn sector_full(&self, sector: usize) -> bool {
+        let bytes = match self.staged.0.get(&sector) {
+            Some(copy) => &copy[..],
+            None => &self.committed[sector * self.sector..((sector + 1) * self.sector).min(self.committed.len())],
+        };
+        bytes.iter().all(|&byte| byte == 0xFF)
+    }
+
     fn set(&mut self, index: u64, value: bool) -> Result<(), KernelError> {
         if index >= self.committed.len() as u64 * 8 {
             return fail(0xC000_0032, "bitmap fora dos limites");
@@ -508,8 +518,15 @@ impl Tx<'_> {
         let mut runs = Vec::new();
         let mut remaining = count;
         let mut index = 0;
+        // Os clusters de um setor do bitmap.
+        let per_sector = bitmap.sector as u64 * 8;
         while index < clusters && remaining != 0 {
-            // Um byte cheio são oito clusters em uso.
+            // Um setor cheio são 8 x 512 clusters em uso, e um byte cheio,
+            // oito.
+            if index % per_sector == 0 && index + per_sector <= clusters && bitmap.sector_full((index / per_sector) as usize) {
+                index += per_sector;
+                continue;
+            }
             if index % 8 == 0 && index + 8 <= clusters && bitmap.byte((index / 8) as usize) == 0xFF {
                 index += 8;
                 continue;
