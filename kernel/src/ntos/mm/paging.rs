@@ -891,6 +891,63 @@ pub fn write_leaf_in(root: u64, va: u64, value: u64) -> bool {
     true
 }
 
+/// O endereço físico da folha de 4 KB de `va` na raiz `root` (0 sem tabela
+/// ou numa página grande).
+fn leaf_address_in(root: u64, va: u64) -> u64 {
+    if is_recursive_mapping_address(va) {
+        return 0;
+    }
+    let pd_entry_address = pd_entry_address(root, va, false, false);
+    if pd_entry_address == 0 {
+        return 0;
+    }
+    let entry = read_entry(pd_entry_address);
+    if entry & PAGE_PRESENT == 0 || entry & PAGE_PS != 0 {
+        return 0;
+    }
+    table_of(entry) + pt_index(va) * 8
+}
+
+/// O bit Dirty (6) de uma PTE.
+pub const PAGE_DIRTY: u64 = 0x40;
+
+/// Apaga o bit Dirty da folha presente de `va` na raiz `root` numa operação
+/// atômica (a CPU grava Accessed e Dirty na mesma entrada) e devolve a
+/// entrada de antes quando ela estava presente e suja (o
+/// MiCaptureDirtyBitToPfn de uma PTE válida). Invalida a VA nesta CPU; o
+/// shootdown das outras fica com quem chama, antes de dar a página como
+/// limpa.
+pub fn clear_dirty_in(root: u64, va: u64) -> Option<u64> {
+    let at = leaf_address_in(root, va);
+    if at == 0 || read_entry(at) & (PAGE_PRESENT | PAGE_DIRTY) != PAGE_PRESENT | PAGE_DIRTY {
+        return None;
+    }
+    let previous = physical::atomic_u64(at).fetch_and(!PAGE_DIRTY, Ordering::SeqCst);
+    if root == current_root() || in_kernel_half(va) {
+        cpu::invalidate_page(va);
+    }
+    (previous & PAGE_PRESENT != 0 && previous & PAGE_DIRTY != 0).then_some(previous & ENTRY_MASK)
+}
+
+/// Troca a folha de 4 KB de `va` por zero numa operação atômica e devolve a
+/// entrada de antes (a retirada de uma PTE que não perde o Dirty que outra
+/// CPU grave no meio). As tabelas ficam para o `unmap_page_in` seguinte; a
+/// invalidação das outras CPUs fica com quem chama.
+pub fn take_leaf_in(root: u64, va: u64) -> Option<u64> {
+    let at = leaf_address_in(root, va);
+    if at == 0 {
+        return None;
+    }
+    let previous = physical::atomic_u64(at).swap(0, Ordering::SeqCst);
+    if observed() && tracker::tracks_entry(at) {
+        tracker::entry_changed(at, previous, 0);
+    }
+    if root == current_root() || in_kernel_half(va) {
+        cpu::invalidate_page(va);
+    }
+    Some(previous)
+}
+
 /// Mapeia uma página de 2MB na raiz corrente.
 pub fn map_large_page(va: u64, pa: u64, flags: u64, nx: bool) -> bool {
     map_large_page_in(current_root(), va, pa, flags, nx)

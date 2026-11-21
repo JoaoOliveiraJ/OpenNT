@@ -9,19 +9,20 @@
 //! apagada (ou marcada para apagar), FALSE quando ainda está em uso. As
 //! seções do OpenNT (`ps::user::sections`) compartilham a control area pela
 //! identidade do arquivo e não publicam CONTROL_AREA nos
-//! SECTION_OBJECT_POINTERS do FCB de um driver — o caso comum aqui é "sem
-//! seção", com o resultado exato do NT. Uma CONTROL_AREA nativa publicada é
-//! avaliada pelos contadores do NT (NumberOfSectionReferences,
-//! NumberOfMappedViews, u.Flags.BeingCreated); o MiCleanSection que apagaria
-//! uma CONTROL_AREA ociosa não existe no OpenNT, então ela é relatada como
-//! ainda em uso.
+//! SECTION_OBJECT_POINTERS do FCB de um driver só a seção de dados de um
+//! arquivo de file system (`mm/section/control_area`), enquanto a control
+//! area tem seções; sem seção, o resultado é o exato do NT. A CONTROL_AREA
+//! publicada é avaliada pelos contadores do NT (NumberOfSectionReferences,
+//! NumberOfMappedViews, u.Flags.BeingCreated): ela só fica publicada com
+//! alguma seção, então nunca está ociosa, e o MiCleanSection que apagaria
+//! uma ociosa não é preciso.
 
 use core::sync::atomic::Ordering;
 
 use crate::ntos::ex::spin_lock;
-use crate::ntos::inc::field::{Field, NtStruct, Reserved};
-use crate::ntos::inc::types::{ControlArea, SectionObjectPointers};
-use crate::ntos::mm::guest_memory as guest;
+use crate::ntos::inc::field::{Field, NtStruct};
+use crate::ntos::inc::types::{ControlArea, RtlBalancedNode, SectionObjectPointers, Subsection};
+use crate::ntos::mm::section::control_area;
 use crate::rtl::KernelError;
 
 /// u.Flags.BeingCreated.
@@ -38,12 +39,13 @@ enum ForceClose {
 
 /// MiForceSectionClosed(Pointers, Flags) para um dos dois slots.
 fn force_closed(slot: &Field<u64>, delay_close: bool) -> ForceClose {
-    let pointer = slot.get();
-    if pointer == 0 {
-        return ForceClose::NoSection;
-    }
-    // SAFETY: um slot de SECTION_OBJECT_POINTERS não nulo aponta para uma CONTROL_AREA.
-    let control_area = unsafe { ControlArea::at(pointer) };
+    control_area::with_slot(slot, |control_area| match control_area {
+        None => ForceClose::NoSection,
+        Some(control_area) => force_closed_area(control_area, delay_close),
+    })
+}
+
+fn force_closed_area(control_area: &ControlArea, delay_close: bool) -> ForceClose {
     let flags = &control_area.u.long_flags;
     let busy = control_area.number_of_section_references.get() != 0 || control_area.number_of_mapped_views.get() != 0 || flags.get() & BEING_CREATED != 0;
     if busy && delay_close {
@@ -87,35 +89,6 @@ const NO_MODIFIED_WRITING: u32 = 0x08;
 /// u.Flags.Image.
 const IMAGE: u32 = 0x20;
 
-/// `_SUBSECTION` (0x38 bytes, símbolos do ntoskrnl 19041): o que o
-/// MiEndingOffset lê. Numa seção de dados de arquivo o `_MSUBSECTION`
-/// estende o SUBSECTION com o nó da árvore de subseções em +0x38.
-#[repr(C)]
-struct Subsection {
-    control_area: Field<u64>,
-    subsection_base: Field<u64>,
-    next_subsection: Field<u64>,
-    _global_per_session_head: Reserved<0x8>,
-    /// u.SubsectionFlags: StartingSector4132 nos bits 6..16 e
-    /// SectorEndOffset nos bits 20..32.
-    flags: Field<u32>,
-    starting_sector: Field<u32>,
-    number_of_full_sectors: Field<u32>,
-    ptes_in_subsection: Field<u32>,
-    _u1: Reserved<0x8>,
-}
-
-// SAFETY: #[repr(C)] só de células.
-unsafe impl NtStruct for Subsection {}
-
-const _: () = {
-    assert!(core::mem::size_of::<Subsection>() == 0x38);
-    assert!(core::mem::offset_of!(Subsection, next_subsection) == 0x10);
-    assert!(core::mem::offset_of!(Subsection, flags) == 0x20);
-    assert!(core::mem::offset_of!(Subsection, starting_sector) == 0x24);
-    assert!(core::mem::offset_of!(Subsection, number_of_full_sectors) == 0x28);
-};
-
 /// A primeira subseção segue a CONTROL_AREA; numa seção de dados de arquivo
 /// a raiz da árvore de subseções fica depois do primeiro `_MSUBSECTION`
 /// (0x80 + 0x90).
@@ -124,25 +97,17 @@ const SUBSECTION_TREE_ROOT: u64 = 0x110;
 /// MSUBSECTION.SubsectionNode.
 const SUBSECTION_NODE: u64 = 0x38;
 
-/// Avalia `test` com a CONTROL_AREA do slot presa; None sem CONTROL_AREA.
+/// Avalia `test` com a CONTROL_AREA do slot presa (a associação SOP ->
+/// CONTROL_AREA e o lock da CONTROL_AREA); None sem CONTROL_AREA.
 fn with_control_area<T>(slot: &Field<u64>, test: impl Fn(&ControlArea) -> T) -> Result<Option<T>, KernelError> {
-    loop {
-        let address = slot.get();
-        if address == 0 {
-            return Ok(None);
-        }
-        // SAFETY: CONTROL_AREA publicada na SOP pelo Mm.
-        let control_area = unsafe { ControlArea::at(address) };
+    control_area::with_slot(slot, |control_area| {
+        let Some(control_area) = control_area else { return Ok(None) };
         let lock = control_area.control_area_lock.address();
         let previous = spin_lock::acquire_exclusive(lock);
-        if slot.get() != address {
-            spin_lock::release_exclusive(lock, previous)?;
-            continue;
-        }
         let result = test(control_area);
         spin_lock::release_exclusive(lock, previous)?;
-        return Ok(Some(result));
-    }
+        Ok(Some(result))
+    })
 }
 
 /// MiAttemptSectionDelete(ControlArea, ..., 0) da seção de imagem: em uso
@@ -171,7 +136,7 @@ pub fn flush_image_section(pointers: &SectionObjectPointers, flush_type: u32) ->
 fn ending_offset(subsection: &Subsection) -> u64 {
     // SAFETY: Subsection->ControlArea de uma CONTROL_AREA viva.
     let control_area = unsafe { ControlArea::at(subsection.control_area.get()) };
-    let flags = subsection.flags.get();
+    let flags = subsection.u.long_flags.get();
     let sector_end = (flags >> 20) as u64;
     let full = subsection.number_of_full_sectors.get() as u64;
     let starting = subsection.starting_sector.get() as u64;
@@ -187,11 +152,12 @@ fn ending_offset(subsection: &Subsection) -> u64 {
 fn last_subsection(control_area: &ControlArea) -> &'static Subsection {
     let mut address = control_area.address() + FIRST_SUBSECTION;
     if control_area.file_pointer.value.get() != 0 {
-        let mut node = guest::read64(control_area.address() + SUBSECTION_TREE_ROOT);
+        // SAFETY: a raiz da árvore e os nós das subseções da CONTROL_AREA presa.
+        let mut node = unsafe { Field::<u64>::at(control_area.address() + SUBSECTION_TREE_ROOT) }.get();
         let mut rightmost = 0;
         while node != 0 {
             rightmost = node;
-            node = guest::read64(node + 8);
+            node = unsafe { RtlBalancedNode::at(node) }.right.get();
         }
         address = rightmost.wrapping_sub(SUBSECTION_NODE);
     }

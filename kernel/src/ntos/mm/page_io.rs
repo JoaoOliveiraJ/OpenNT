@@ -16,6 +16,8 @@
 //! dos bytes (a correção de USA do NTFS, um filtro) devolve uma VA que cobre
 //! todos os frames, e o DMA usa o vetor de PFNs.
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use crate::ntos::inc::field::NtStruct;
 use crate::ntos::inc::types::{FileObject, IoStatusBlock, Kevent, LargeInteger, Mdl};
 use crate::ntos::io::paging_io::{self, PagingRequest};
@@ -32,6 +34,15 @@ const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 const MDL_MAPPED_TO_SYSTEM_VA: i16 = 0x0001;
 const MDL_PAGES_LOCKED: i16 = 0x0002;
 const MDL_IO_PAGE_READ: i16 = 0x0040;
+
+/// Escritas de paginação bem-sucedidas: IRPs e páginas.
+static WRITE_IRPS: AtomicU64 = AtomicU64::new(0);
+static PAGES_WRITTEN: AtomicU64 = AtomicU64::new(0);
+
+/// (IRPs, páginas) das escritas de paginação bem-sucedidas até agora.
+pub fn write_statistics() -> (u64, u64) {
+    (WRITE_IRPS.load(Ordering::Acquire), PAGES_WRITTEN.load(Ordering::Acquire))
+}
 
 /// O MDL de paginação dos frames e a faixa de PTEs de sistema que ele usa
 /// (0 com um frame só).
@@ -129,6 +140,10 @@ pub fn transfer(file: u64, byte_offset: u64, frames: &[u64], read: bool) -> (u32
         }
     };
     let information = if status & 0x8000_0000 == 0 { status_cell.information.get() } else { 0 };
+    if !read && status & 0x8000_0000 == 0 {
+        WRITE_IRPS.fetch_add(1, Ordering::AcqRel);
+        PAGES_WRITTEN.fetch_add(frames.len() as u64, Ordering::AcqRel);
+    }
     release();
     drop(descriptor);
     (status, information)

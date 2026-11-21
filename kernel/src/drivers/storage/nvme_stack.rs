@@ -309,6 +309,13 @@ pub fn check() {
                 Ok(()) => debug_print!("NVME_SECTION_OK"),
                 Err(error) => debug_print!("[fsd-section] {}", error),
             }
+            // A seção paginada sob demanda, a CONTROL_AREA no FCB, o writer
+            // de páginas mapeadas, o flush em grupos, o MmExtendSection e a
+            // leitura em cache assíncrona (`test/fsd_mapped`).
+            match crate::ntos::test::fsd_mapped::run(&format!("\\??\\{letter}:")) {
+                Ok(()) => debug_print!("FSD_MAPPED_OK"),
+                Err(error) => debug_print!("[fsd-mapped] {}", error),
+            }
         }
         Err(error) => debug_print!("[nvme] volume: {}", error),
     }

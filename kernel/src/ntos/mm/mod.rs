@@ -41,6 +41,7 @@ pub mod paging_file;
 pub mod page_io;
 pub mod working_set;
 pub mod modified_writer;
+pub mod mapped_writer;
 pub mod memory_information;
 pub mod peb_teb;
 pub mod recursive_mapping;

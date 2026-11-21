@@ -421,6 +421,174 @@ pub fn acquire_file_exclusive(file: u64) -> Result<u32, KernelError> {
     acquire_file_exclusive_common(file, &SectionSync { sync_type: FsFilterSectionSyncType::SYNC_TYPE_OTHER.0 as u32, page_protection: 0, flags: 0, output_information: 0 })
 }
 
+/// FS_FILTER_ACQUIRE_FOR_MOD_WRITE e FS_FILTER_RELEASE_FOR_MOD_WRITE.
+const ACQUIRE_FOR_MOD_WRITE: u8 = 0xFD;
+const RELEASE_FOR_MOD_WRITE: u8 = 0xFC;
+pub const STATUS_CANT_WAIT: u32 = 0xC000_00D8;
+/// FSRTL_COMMON_FCB_HEADER.Flags: FSRTL_FLAG_ACQUIRE_MAIN_RSRC_EX e _SH.
+const FSRTL_FLAG_ACQUIRE_MAIN_RSRC_EX: u8 = 0x08;
+const FSRTL_FLAG_ACQUIRE_MAIN_RSRC_SH: u8 = 0x10;
+
+/// As rotinas Pre/Post das operações do modified page writer, cobertas por
+/// SizeOfFsFilterCallbacks.
+fn mod_write_callbacks(operation: u8, table: u64) -> (u64, u64) {
+    if table == 0 {
+        return (0, 0);
+    }
+    let callbacks = callbacks_at(table);
+    let size = callbacks.size_of_fs_filter_callbacks.get();
+    match operation {
+        ACQUIRE_FOR_MOD_WRITE => (
+            if size >= 0x50 { callbacks.pre_acquire_for_modified_page_writer.get() } else { 0 },
+            if size >= 0x58 { callbacks.post_acquire_for_modified_page_writer.get() } else { 0 },
+        ),
+        _ => (
+            if size >= 0x60 { callbacks.pre_release_for_modified_page_writer.get() } else { 0 },
+            if size >= 0x68 { callbacks.post_release_for_modified_page_writer.get() } else { 0 },
+        ),
+    }
+}
+
+/// Algum filtro da pilha (ou o file system de base) registrou rotinas da
+/// operação.
+fn stack_has_mod_write_callbacks(operation: u8, top: u64) -> bool {
+    let mut device = top;
+    while device != 0 {
+        let (pre, post) = mod_write_callbacks(operation, driver_tables(device).1);
+        if pre != 0 || post != 0 {
+            return true;
+        }
+        device = attached_to(device);
+    }
+    false
+}
+
+/// As rotinas Pre de cima para baixo e as Post de baixo para cima, como o
+/// FsFilterPerformCallbacks das operações do writer (a falha de uma Pre
+/// encerra a descida com o status).
+fn perform_mod_write_callbacks(operation: u8, top: u64, file: u64, ending_offset: u64, resource_cell: u64) -> Result<u32, KernelError> {
+    let (address, initialized) = ctrl_init(operation, top, file)?;
+    if initialized != 0 {
+        if address != 0 {
+            ctrl_free(address)?;
+        }
+        return Ok(initialized);
+    }
+    // SAFETY: controle criado acima.
+    let ctrl = unsafe { FilterCtrl::at(address) };
+    if operation == ACQUIRE_FOR_MOD_WRITE {
+        let parameters = &ctrl.data.parameters.acquire_for_modified_page_writer;
+        parameters.ending_offset.set(ending_offset);
+        parameters.resource_to_release.set(resource_cell);
+    } else {
+        ctrl.data.parameters.release_for_modified_page_writer.resource_to_release.set(resource_cell);
+    }
+    let mut status = 0u32;
+    let mut device = top;
+    let mut posts: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::new();
+    while device != 0 {
+        ctrl.data.device_object.set(device);
+        let (pre, post) = mod_write_callbacks(operation, driver_tables(device).1);
+        if pre != 0 {
+            let context = guest::alloc_bytes(8);
+            let result = native_call::call(pre, &[ctrl.data.address(), context]) as u32;
+            let saved = if context != 0 { guest::read64(context) } else { 0 };
+            if context != 0 {
+                guest::free_bytes(context);
+            }
+            if result != 0 {
+                status = if result == STATUS_FSFILTER_OP_COMPLETED_SUCCESSFULLY { 0 } else { result };
+                if post != 0 && result & 0x8000_0000 == 0 {
+                    posts.push((post, saved));
+                }
+                break;
+            }
+            if post != 0 {
+                posts.push((post, saved));
+            }
+        } else if post != 0 {
+            posts.push((post, 0));
+        }
+        device = attached_to(device);
+    }
+    for (post, context) in posts.into_iter().rev() {
+        native_call::call(post, &[ctrl.data.address(), status as u64, context]);
+    }
+    ctrl_free(address)?;
+    Ok(status)
+}
+
+/// FsRtlAcquireFileForModWriteEx(FileObject, EndingOffset, ResourceToRelease)
+/// do modified page writer: os filtros, o Fast I/O AcquireForModWrite do
+/// file system (sem espera; o do ntfs.sys devolve STATUS_CANT_WAIT com o
+/// arquivo ocupado) e, sem ele, o recurso do cabeçalho do FCB que as flags
+/// dele pedem (o principal com FSRTL_FLAG_ACQUIRE_MAIN_RSRC_EX/_SH, senão o
+/// de paginação compartilhado; exclusivo quando a escrita passa do
+/// ValidDataLength), sem espera. Devolve (status, recurso a soltar).
+pub fn acquire_for_mod_write(file: u64, ending_offset: u64) -> Result<(u32, u64), KernelError> {
+    let top = information::related_device_object(file)?;
+    let base = file_system::base_file_system_device(file_object(file));
+    let cells = guest::alloc_bytes(16);
+    if cells == 0 {
+        return Ok((STATUS_INSUFFICIENT_RESOURCES, 0));
+    }
+    let (offset_cell, resource_cell) = (cells, cells + 8);
+    guest::write64(offset_cell, ending_offset);
+    guest::write64(resource_cell, 0);
+    let mut status = if stack_has_mod_write_callbacks(ACQUIRE_FOR_MOD_WRITE, top) { perform_mod_write_callbacks(ACQUIRE_FOR_MOD_WRITE, top, file, offset_cell, resource_cell)? } else { 0 };
+    if status == 0 {
+        let routine = fast_io_routine(driver_tables(base).0, 0x80, |dispatch| dispatch.acquire_for_mod_write.get());
+        status = if routine != 0 { native_call::call(routine, &[file, offset_cell, resource_cell, base]) as u32 } else { default_acquire_for_mod_write(file, ending_offset, resource_cell)? };
+    }
+    let resource = guest::read64(resource_cell);
+    guest::free_bytes(cells);
+    Ok((status, resource))
+}
+
+fn default_acquire_for_mod_write(file: u64, ending_offset: u64, resource_cell: u64) -> Result<u32, KernelError> {
+    let fcb = file_object(file).fs_context.get();
+    if fcb == 0 {
+        return Ok(0);
+    }
+    // SAFETY: o FsContext de um FILE_OBJECT de file system começa pelo cabeçalho comum.
+    let header = unsafe { FsrtlCommonFcbHeader::at(fcb) };
+    let flags = header.flags.get();
+    let (lock, exclusive) = if flags & FSRTL_FLAG_ACQUIRE_MAIN_RSRC_EX != 0 {
+        (header.resource.get(), true)
+    } else if flags & FSRTL_FLAG_ACQUIRE_MAIN_RSRC_SH != 0 {
+        (header.resource.get(), false)
+    } else {
+        (header.paging_io_resource.get(), ending_offset > header.valid_data_length.quad_part.get() as u64)
+    };
+    if lock == 0 {
+        return Ok(0);
+    }
+    let acquired = if exclusive { resource::acquire_exclusive(lock, false)? } else { resource::acquire_shared(lock, false)? };
+    if acquired == 0 {
+        return Ok(STATUS_CANT_WAIT);
+    }
+    guest::write64(resource_cell, lock);
+    Ok(0)
+}
+
+/// FsRtlReleaseFileForModWrite(FileObject, ResourceToRelease): os filtros, o
+/// Fast I/O ReleaseForModWrite do file system e, sem ele, o recurso.
+pub fn release_for_mod_write(file: u64, resource_to_release: u64) -> Result<(), KernelError> {
+    let top = information::related_device_object(file)?;
+    let base = file_system::base_file_system_device(file_object(file));
+    let mut status = if stack_has_mod_write_callbacks(RELEASE_FOR_MOD_WRITE, top) { perform_mod_write_callbacks(RELEASE_FOR_MOD_WRITE, top, file, 0, resource_to_release)? } else { 0 };
+    if status == 0 {
+        let routine = fast_io_routine(driver_tables(base).0, 0xD0, |dispatch| dispatch.release_for_mod_write.get());
+        if routine != 0 {
+            status = native_call::call(routine, &[file, resource_to_release, base]) as u32;
+        } else if resource_to_release != 0 {
+            resource::release(resource_to_release)?;
+        }
+    }
+    let _ = status;
+    Ok(())
+}
+
 /// FsRtlReleaseFile(FileObject): desfaz a aquisição (filtros, Fast I/O
 /// ReleaseFileForNtCreateSection ou o ERESOURCE do FCB) e sai da região
 /// crítica.

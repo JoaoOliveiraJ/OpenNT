@@ -5466,3 +5466,456 @@ const _: () = {
     assert!(core::mem::offset_of!(MmpageFileExpansionFlags, bitfield_2) == 0x2);
     assert!(core::mem::offset_of!(MmpageFileExpansionFlags, bitfield_3) == 0x3);
 };
+
+/// `_MSUBSECTION` (0x90 bytes).
+#[repr(C)]
+pub struct Msubsection {
+    pub core: Subsection,
+    pub subsection_node: RtlBalancedNode,
+    pub dereference_list: ListEntry,
+    pub number_of_mapped_views: Field<u64>,
+    pub number_of_pfn_references: Field<u32>,
+    pub large_views: Field<u32>,
+    pub protos_node: MiPrototypePtesNode,
+}
+
+unsafe impl NtStruct for Msubsection {}
+
+const _: () = {
+    assert!(core::mem::size_of::<Msubsection>() == 0x90);
+    assert!(core::mem::offset_of!(Msubsection, core) == 0x0);
+    assert!(core::mem::offset_of!(Msubsection, subsection_node) == 0x38);
+    assert!(core::mem::offset_of!(Msubsection, dereference_list) == 0x50);
+    assert!(core::mem::offset_of!(Msubsection, number_of_mapped_views) == 0x60);
+    assert!(core::mem::offset_of!(Msubsection, number_of_pfn_references) == 0x68);
+    assert!(core::mem::offset_of!(Msubsection, large_views) == 0x6c);
+    assert!(core::mem::offset_of!(Msubsection, protos_node) == 0x70);
+};
+
+/// `_SUBSECTION` (0x38 bytes).
+///
+/// Membros sobrepostos (uniões anônimas do C) ficam nas vistas
+/// `SubsectionView1`..`SubsectionView2`, alcançadas por `Deref`.
+#[repr(C)]
+pub struct Subsection {
+    /// -> `_CONTROL_AREA`
+    pub control_area: Field<u64>,
+    /// -> `_MMPTE`
+    pub subsection_base: Field<u64>,
+    /// -> `_SUBSECTION`
+    pub next_subsection: Field<u64>,
+    pub global_per_session_head: RtlAvlTree,
+    pub u: SubsectionU,
+    pub starting_sector: Field<u32>,
+    pub number_of_full_sectors: Field<u32>,
+    pub ptes_in_subsection: Field<u32>,
+    pub u1: SubsectionU1,
+    pub bitfield_34: Field<u32>,
+}
+
+/// Vista 1 de `_SUBSECTION` (membros sobrepostos à vista anterior).
+#[repr(C)]
+pub struct SubsectionView1 {
+    _pad_0: Reserved<0x18>,
+    /// -> `_MI_CONTROL_AREA_WAIT_BLOCK`
+    pub creation_wait_list: Field<u64>,
+    _pad_20: Reserved<0x18>,
+}
+
+/// Vista 2 de `_SUBSECTION` (membros sobrepostos à vista anterior).
+#[repr(C)]
+pub struct SubsectionView2 {
+    _pad_0: Reserved<0x18>,
+    /// -> `_MI_PER_SESSION_PROTOS`
+    pub session_driver_protos: Field<u64>,
+    _pad_20: Reserved<0x18>,
+}
+
+impl core::ops::Deref for Subsection {
+    type Target = SubsectionView1;
+    #[inline(always)]
+    fn deref(&self) -> &SubsectionView1 {
+        // SAFETY: vistas do mesmo objeto, mesmo tamanho e alinhamento, só de células.
+        unsafe { &*(self as *const Self).cast::<SubsectionView1>() }
+    }
+}
+
+impl core::ops::Deref for SubsectionView1 {
+    type Target = SubsectionView2;
+    #[inline(always)]
+    fn deref(&self) -> &SubsectionView2 {
+        // SAFETY: vistas do mesmo objeto, mesmo tamanho e alinhamento, só de células.
+        unsafe { &*(self as *const Self).cast::<SubsectionView2>() }
+    }
+}
+
+unsafe impl NtStruct for Subsection {}
+
+impl Subsection {
+    /// `UnusedPtes`: bits 0..=29 de `bitfield_34`.
+    pub const UNUSED_PTES_SHIFT: u32 = 0;
+    pub const UNUSED_PTES_MASK: u32 = 0x3fffffff;
+    #[inline(always)]
+    pub fn unused_ptes(&self) -> u32 {
+        self.bitfield_34.bits(0, 30) as u32
+    }
+    #[inline(always)]
+    pub fn set_unused_ptes(&self, value: u32) {
+        self.bitfield_34.set_bits(0, 30, value as u64)
+    }
+    /// `ExtentQueryNeeded`: bits 30..=30 de `bitfield_34`.
+    pub const EXTENT_QUERY_NEEDED_SHIFT: u32 = 30;
+    pub const EXTENT_QUERY_NEEDED_MASK: u32 = 0x40000000;
+    #[inline(always)]
+    pub fn extent_query_needed(&self) -> u32 {
+        self.bitfield_34.bits(30, 1) as u32
+    }
+    #[inline(always)]
+    pub fn set_extent_query_needed(&self, value: u32) {
+        self.bitfield_34.set_bits(30, 1, value as u64)
+    }
+    /// `DirtyPages`: bits 31..=31 de `bitfield_34`.
+    pub const DIRTY_PAGES_SHIFT: u32 = 31;
+    pub const DIRTY_PAGES_MASK: u32 = 0x80000000;
+    #[inline(always)]
+    pub fn dirty_pages(&self) -> u32 {
+        self.bitfield_34.bits(31, 1) as u32
+    }
+    #[inline(always)]
+    pub fn set_dirty_pages(&self, value: u32) {
+        self.bitfield_34.set_bits(31, 1, value as u64)
+    }
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<Subsection>() == 0x38);
+    assert!(core::mem::offset_of!(Subsection, control_area) == 0x0);
+    assert!(core::mem::offset_of!(Subsection, subsection_base) == 0x8);
+    assert!(core::mem::offset_of!(Subsection, next_subsection) == 0x10);
+    assert!(core::mem::offset_of!(Subsection, global_per_session_head) == 0x18);
+    assert!(core::mem::offset_of!(Subsection, u) == 0x20);
+    assert!(core::mem::offset_of!(Subsection, starting_sector) == 0x24);
+    assert!(core::mem::offset_of!(Subsection, number_of_full_sectors) == 0x28);
+    assert!(core::mem::offset_of!(Subsection, ptes_in_subsection) == 0x2c);
+    assert!(core::mem::offset_of!(Subsection, u1) == 0x30);
+    assert!(core::mem::offset_of!(Subsection, bitfield_34) == 0x34);
+    assert!(core::mem::size_of::<SubsectionView1>() == 0x38);
+    assert!(core::mem::align_of::<SubsectionView1>() == core::mem::align_of::<Subsection>());
+    assert!(core::mem::offset_of!(SubsectionView1, creation_wait_list) == 0x18);
+    assert!(core::mem::size_of::<SubsectionView2>() == 0x38);
+    assert!(core::mem::align_of::<SubsectionView2>() == core::mem::align_of::<Subsection>());
+    assert!(core::mem::offset_of!(SubsectionView2, session_driver_protos) == 0x18);
+};
+
+/// `_SUBSECTION::u` (0x4 bytes).
+///
+/// Membros sobrepostos (uniões anônimas do C) ficam nas vistas
+/// `SubsectionUView1`, alcançada por `Deref`.
+#[repr(C)]
+pub struct SubsectionU {
+    pub long_flags: Field<u32>,
+}
+
+/// Vista 1 de `_SUBSECTION::u` (membros sobrepostos à vista anterior).
+#[repr(C)]
+pub struct SubsectionUView1 {
+    _align: [u32; 0],
+    pub subsection_flags: MmsubsectionFlags,
+}
+
+impl core::ops::Deref for SubsectionU {
+    type Target = SubsectionUView1;
+    #[inline(always)]
+    fn deref(&self) -> &SubsectionUView1 {
+        // SAFETY: vistas do mesmo objeto, mesmo tamanho e alinhamento, só de células.
+        unsafe { &*(self as *const Self).cast::<SubsectionUView1>() }
+    }
+}
+
+unsafe impl NtStruct for SubsectionU {}
+
+const _: () = {
+    assert!(core::mem::size_of::<SubsectionU>() == 0x4);
+    assert!(core::mem::offset_of!(SubsectionU, long_flags) == 0x0);
+    assert!(core::mem::size_of::<SubsectionUView1>() == 0x4);
+    assert!(core::mem::align_of::<SubsectionUView1>() == core::mem::align_of::<SubsectionU>());
+    assert!(core::mem::offset_of!(SubsectionUView1, subsection_flags) == 0x0);
+};
+
+/// `_MMSUBSECTION_FLAGS` (0x4 bytes).
+#[repr(C)]
+pub struct MmsubsectionFlags {
+    pub bitfield_0: Field<u16>,
+    pub bitfield_2: Field<u16>,
+}
+
+unsafe impl NtStruct for MmsubsectionFlags {}
+
+impl MmsubsectionFlags {
+    /// `SubsectionAccessed`: bits 0..=0 de `bitfield_0`.
+    pub const SUBSECTION_ACCESSED_SHIFT: u32 = 0;
+    pub const SUBSECTION_ACCESSED_MASK: u16 = 0x1;
+    #[inline(always)]
+    pub fn subsection_accessed(&self) -> u16 {
+        self.bitfield_0.bits(0, 1) as u16
+    }
+    #[inline(always)]
+    pub fn set_subsection_accessed(&self, value: u16) {
+        self.bitfield_0.set_bits(0, 1, value as u64)
+    }
+    /// `Protection`: bits 1..=5 de `bitfield_0`.
+    pub const PROTECTION_SHIFT: u32 = 1;
+    pub const PROTECTION_MASK: u16 = 0x3e;
+    #[inline(always)]
+    pub fn protection(&self) -> u16 {
+        self.bitfield_0.bits(1, 5) as u16
+    }
+    #[inline(always)]
+    pub fn set_protection(&self, value: u16) {
+        self.bitfield_0.set_bits(1, 5, value as u64)
+    }
+    /// `StartingSector4132`: bits 6..=15 de `bitfield_0`.
+    pub const STARTING_SECTOR4132_SHIFT: u32 = 6;
+    pub const STARTING_SECTOR4132_MASK: u16 = 0xffc0;
+    #[inline(always)]
+    pub fn starting_sector4132(&self) -> u16 {
+        self.bitfield_0.bits(6, 10) as u16
+    }
+    #[inline(always)]
+    pub fn set_starting_sector4132(&self, value: u16) {
+        self.bitfield_0.set_bits(6, 10, value as u64)
+    }
+    /// `SubsectionStatic`: bits 0..=0 de `bitfield_2`.
+    pub const SUBSECTION_STATIC_SHIFT: u32 = 0;
+    pub const SUBSECTION_STATIC_MASK: u16 = 0x1;
+    #[inline(always)]
+    pub fn subsection_static(&self) -> u16 {
+        self.bitfield_2.bits(0, 1) as u16
+    }
+    #[inline(always)]
+    pub fn set_subsection_static(&self, value: u16) {
+        self.bitfield_2.set_bits(0, 1, value as u64)
+    }
+    /// `GlobalMemory`: bits 1..=1 de `bitfield_2`.
+    pub const GLOBAL_MEMORY_SHIFT: u32 = 1;
+    pub const GLOBAL_MEMORY_MASK: u16 = 0x2;
+    #[inline(always)]
+    pub fn global_memory(&self) -> u16 {
+        self.bitfield_2.bits(1, 1) as u16
+    }
+    #[inline(always)]
+    pub fn set_global_memory(&self, value: u16) {
+        self.bitfield_2.set_bits(1, 1, value as u64)
+    }
+    /// `Spare`: bits 2..=2 de `bitfield_2`.
+    pub const SPARE_SHIFT: u32 = 2;
+    pub const SPARE_MASK: u16 = 0x4;
+    #[inline(always)]
+    pub fn spare(&self) -> u16 {
+        self.bitfield_2.bits(2, 1) as u16
+    }
+    #[inline(always)]
+    pub fn set_spare(&self, value: u16) {
+        self.bitfield_2.set_bits(2, 1, value as u64)
+    }
+    /// `OnDereferenceList`: bits 3..=3 de `bitfield_2`.
+    pub const ON_DEREFERENCE_LIST_SHIFT: u32 = 3;
+    pub const ON_DEREFERENCE_LIST_MASK: u16 = 0x8;
+    #[inline(always)]
+    pub fn on_dereference_list(&self) -> u16 {
+        self.bitfield_2.bits(3, 1) as u16
+    }
+    #[inline(always)]
+    pub fn set_on_dereference_list(&self, value: u16) {
+        self.bitfield_2.set_bits(3, 1, value as u64)
+    }
+    /// `SectorEndOffset`: bits 4..=15 de `bitfield_2`.
+    pub const SECTOR_END_OFFSET_SHIFT: u32 = 4;
+    pub const SECTOR_END_OFFSET_MASK: u16 = 0xfff0;
+    #[inline(always)]
+    pub fn sector_end_offset(&self) -> u16 {
+        self.bitfield_2.bits(4, 12) as u16
+    }
+    #[inline(always)]
+    pub fn set_sector_end_offset(&self, value: u16) {
+        self.bitfield_2.set_bits(4, 12, value as u64)
+    }
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<MmsubsectionFlags>() == 0x4);
+    assert!(core::mem::offset_of!(MmsubsectionFlags, bitfield_0) == 0x0);
+    assert!(core::mem::offset_of!(MmsubsectionFlags, bitfield_2) == 0x2);
+};
+
+/// `_SUBSECTION::u1` (0x4 bytes).
+///
+/// Membros sobrepostos (uniões anônimas do C) ficam nas vistas
+/// `SubsectionU1View1`, alcançada por `Deref`.
+#[repr(C)]
+pub struct SubsectionU1 {
+    pub e1: MiSubsectionEntry1,
+}
+
+/// Vista 1 de `_SUBSECTION::u1` (membros sobrepostos à vista anterior).
+#[repr(C)]
+pub struct SubsectionU1View1 {
+    pub entire_field: Field<u32>,
+}
+
+impl core::ops::Deref for SubsectionU1 {
+    type Target = SubsectionU1View1;
+    #[inline(always)]
+    fn deref(&self) -> &SubsectionU1View1 {
+        // SAFETY: vistas do mesmo objeto, mesmo tamanho e alinhamento, só de células.
+        unsafe { &*(self as *const Self).cast::<SubsectionU1View1>() }
+    }
+}
+
+unsafe impl NtStruct for SubsectionU1 {}
+
+const _: () = {
+    assert!(core::mem::size_of::<SubsectionU1>() == 0x4);
+    assert!(core::mem::offset_of!(SubsectionU1, e1) == 0x0);
+    assert!(core::mem::size_of::<SubsectionU1View1>() == 0x4);
+    assert!(core::mem::align_of::<SubsectionU1View1>() == core::mem::align_of::<SubsectionU1>());
+    assert!(core::mem::offset_of!(SubsectionU1View1, entire_field) == 0x0);
+};
+
+/// `_MI_SUBSECTION_ENTRY1` (0x4 bytes).
+#[repr(C)]
+pub struct MiSubsectionEntry1 {
+    pub bitfield_0: Field<u32>,
+}
+
+unsafe impl NtStruct for MiSubsectionEntry1 {}
+
+impl MiSubsectionEntry1 {
+    /// `CrossPartitionReferences`: bits 0..=29 de `bitfield_0`.
+    pub const CROSS_PARTITION_REFERENCES_SHIFT: u32 = 0;
+    pub const CROSS_PARTITION_REFERENCES_MASK: u32 = 0x3fffffff;
+    #[inline(always)]
+    pub fn cross_partition_references(&self) -> u32 {
+        self.bitfield_0.bits(0, 30) as u32
+    }
+    #[inline(always)]
+    pub fn set_cross_partition_references(&self, value: u32) {
+        self.bitfield_0.set_bits(0, 30, value as u64)
+    }
+    /// `SubsectionMappedLarge`: bits 30..=31 de `bitfield_0`.
+    pub const SUBSECTION_MAPPED_LARGE_SHIFT: u32 = 30;
+    pub const SUBSECTION_MAPPED_LARGE_MASK: u32 = 0xc0000000;
+    #[inline(always)]
+    pub fn subsection_mapped_large(&self) -> u32 {
+        self.bitfield_0.bits(30, 2) as u32
+    }
+    #[inline(always)]
+    pub fn set_subsection_mapped_large(&self, value: u32) {
+        self.bitfield_0.set_bits(30, 2, value as u64)
+    }
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<MiSubsectionEntry1>() == 0x4);
+    assert!(core::mem::offset_of!(MiSubsectionEntry1, bitfield_0) == 0x0);
+};
+
+/// `_MI_PROTOTYPE_PTES_NODE` (0x20 bytes).
+#[repr(C)]
+pub struct MiPrototypePtesNode {
+    pub node: RtlBalancedNode,
+    pub u1: MiPrototypePtesNodeU1,
+}
+
+unsafe impl NtStruct for MiPrototypePtesNode {}
+
+const _: () = {
+    assert!(core::mem::size_of::<MiPrototypePtesNode>() == 0x20);
+    assert!(core::mem::offset_of!(MiPrototypePtesNode, node) == 0x0);
+    assert!(core::mem::offset_of!(MiPrototypePtesNode, u1) == 0x18);
+};
+
+/// `_MI_PROTOTYPE_PTES_NODE::u1` (0x8 bytes).
+///
+/// Membros sobrepostos (uniões anônimas do C) ficam nas vistas
+/// `MiPrototypePtesNodeU1View1`, alcançada por `Deref`.
+#[repr(C)]
+pub struct MiPrototypePtesNodeU1 {
+    pub e1: MiPrototypePtesNodeU1E1,
+}
+
+/// Vista 1 de `_MI_PROTOTYPE_PTES_NODE::u1` (membros sobrepostos à vista anterior).
+#[repr(C)]
+pub struct MiPrototypePtesNodeU1View1 {
+    pub e2: MiPrototypePtesNodeU1E2,
+}
+
+impl core::ops::Deref for MiPrototypePtesNodeU1 {
+    type Target = MiPrototypePtesNodeU1View1;
+    #[inline(always)]
+    fn deref(&self) -> &MiPrototypePtesNodeU1View1 {
+        // SAFETY: vistas do mesmo objeto, mesmo tamanho e alinhamento, só de células.
+        unsafe { &*(self as *const Self).cast::<MiPrototypePtesNodeU1View1>() }
+    }
+}
+
+unsafe impl NtStruct for MiPrototypePtesNodeU1 {}
+
+const _: () = {
+    assert!(core::mem::size_of::<MiPrototypePtesNodeU1>() == 0x8);
+    assert!(core::mem::offset_of!(MiPrototypePtesNodeU1, e1) == 0x0);
+    assert!(core::mem::size_of::<MiPrototypePtesNodeU1View1>() == 0x8);
+    assert!(core::mem::align_of::<MiPrototypePtesNodeU1View1>() == core::mem::align_of::<MiPrototypePtesNodeU1>());
+    assert!(core::mem::offset_of!(MiPrototypePtesNodeU1View1, e2) == 0x0);
+};
+
+/// `_MI_PROTOTYPE_PTES_NODE::u1::e1` (0x8 bytes).
+#[repr(C)]
+pub struct MiPrototypePtesNodeU1E1 {
+    pub bitfield_0: Field<u64>,
+}
+
+unsafe impl NtStruct for MiPrototypePtesNodeU1E1 {}
+
+impl MiPrototypePtesNodeU1E1 {
+    /// `AllocationType`: bits 0..=2 de `bitfield_0`.
+    pub const ALLOCATION_TYPE_SHIFT: u32 = 0;
+    pub const ALLOCATION_TYPE_MASK: u64 = 0x7;
+    #[inline(always)]
+    pub fn allocation_type(&self) -> u64 {
+        self.bitfield_0.bits(0, 3) as u64
+    }
+    #[inline(always)]
+    pub fn set_allocation_type(&self, value: u64) {
+        self.bitfield_0.set_bits(0, 3, value as u64)
+    }
+    /// `Inserted`: bits 3..=3 de `bitfield_0`.
+    pub const INSERTED_SHIFT: u32 = 3;
+    pub const INSERTED_MASK: u64 = 0x8;
+    #[inline(always)]
+    pub fn inserted(&self) -> u64 {
+        self.bitfield_0.bits(3, 1) as u64
+    }
+    #[inline(always)]
+    pub fn set_inserted(&self, value: u64) {
+        self.bitfield_0.set_bits(3, 1, value as u64)
+    }
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<MiPrototypePtesNodeU1E1>() == 0x8);
+    assert!(core::mem::offset_of!(MiPrototypePtesNodeU1E1, bitfield_0) == 0x0);
+};
+
+/// `_MI_PROTOTYPE_PTES_NODE::u1::e2` (0x8 bytes).
+#[repr(C)]
+pub struct MiPrototypePtesNodeU1E2 {
+    pub prototype_ptes_flags: Field<u64>,
+}
+
+unsafe impl NtStruct for MiPrototypePtesNodeU1E2 {}
+
+const _: () = {
+    assert!(core::mem::size_of::<MiPrototypePtesNodeU1E2>() == 0x8);
+    assert!(core::mem::offset_of!(MiPrototypePtesNodeU1E2, prototype_ptes_flags) == 0x0);
+};

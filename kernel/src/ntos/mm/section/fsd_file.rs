@@ -86,6 +86,17 @@ pub fn file_size(file: u64) -> Result<u64, u32> {
     Ok(size)
 }
 
+/// O FileSize do cabeçalho comum do FCB (FsContext), sem IRP: o limite das
+/// escritas de paginação do writer de páginas mapeadas. None sem FsContext.
+pub fn header_file_size(file: u64) -> Option<u64> {
+    let context = file_object(file).fs_context.get();
+    if context == 0 {
+        return None;
+    }
+    // SAFETY: o FsContext de um arquivo de file system começa pelo cabeçalho comum do FCB.
+    Some(unsafe { FsrtlCommonFcbHeader::at(context) }.file_size.quad_part.get() as u64)
+}
+
 /// FsRtlSetFileSize: o arquivo cresce até o tamanho máximo pedido pela
 /// seção de dados (o MiCreateDataFileMap). Devolve o NTSTATUS.
 pub fn set_file_size(file: u64, size: u64) -> u32 {

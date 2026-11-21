@@ -311,16 +311,11 @@ fn prepare(list: &ReadList) -> Result<(), u32> {
     // SAFETY: SECTION_OBJECT_POINTERS do FCB do file system dono do arquivo.
     let pointers = unsafe { SectionObjectPointers::at(pointers_address) };
     let slot = if list.is_image.get() != 0 { &pointers.image_section_object } else { &pointers.data_section_object };
-    let address = slot.get();
-    if address == 0 {
-        return Ok(());
-    }
-    // SAFETY: CONTROL_AREA publicada na SOP pelo Mm.
-    let control_area = unsafe { ControlArea::at(address) };
-    if control_area.u.long_flags.get() & PHYSICAL_MEMORY != 0 || control_area.file_pointer.value.get() == 0 {
-        return Err(STATUS_INVALID_PARAMETER_1);
-    }
-    Ok(())
+    // A CONTROL_AREA publicada na SOP pelo Mm, com a associação presa.
+    crate::ntos::mm::section::control_area::with_slot(slot, |control_area: Option<&ControlArea>| match control_area {
+        Some(control_area) if control_area.u.long_flags.get() & PHYSICAL_MEMORY != 0 || control_area.file_pointer.value.get() == 0 => Err(STATUS_INVALID_PARAMETER_1),
+        _ => Ok(()),
+    })
 }
 
 /// MmPrefetchPages(NumberOfLists, ReadLists) -> NTSTATUS.

@@ -768,6 +768,18 @@ pub fn query_volume_information_file(handle: u64, io_status: u64, buffer: u64, l
 pub fn set_information_file(handle: u64, io_status: u64, input: u64, class: u32) -> Result<u32, KernelError> {
     let Some(entry) = entry_of(handle) else { return Ok(STATUS_INVALID_HANDLE) };
     if class == FILE_END_OF_FILE_INFORMATION {
+        if let Backing::Mounted { .. } = &entry.backing {
+            // Um arquivo de file system real: IRP_MJ_SET_INFORMATION ao
+            // dispositivo do arquivo, com o acesso conferido pelo handle.
+            if entry.access & 2 == 0 {
+                return Ok(STATUS_ACCESS_DENIED);
+            }
+            // SAFETY: FILE_END_OF_FILE_INFORMATION (um LARGE_INTEGER) do chamador Zw.
+            let size = unsafe { Field::<u64>::at(input) }.get();
+            let status = super::information::set_size(entry.file_object, size)?;
+            write_io_status(io_status, status, 0);
+            return Ok(status);
+        }
         let Backing::Volume { volume, path } = &entry.backing else { return Ok(STATUS_INVALID_PARAMETER) };
         if entry.access & 2 == 0 {
             return Ok(STATUS_ACCESS_DENIED);

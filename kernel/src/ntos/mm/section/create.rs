@@ -484,10 +484,6 @@ fn create_common(output: u64, access: u32, object_attributes: u64, size_pointer:
         }
         let backing: Option<Arc<dyn SectionFile>> = file.clone().map(|captured| captured as Arc<dyn SectionFile>);
         let driver_file = file.as_ref().is_some_and(|captured| captured.driver_file());
-        // A seção de dados de um arquivo de file system confirma as páginas
-        // depois de soltar o arquivo: as leituras de paginação não correm
-        // com a aquisição da criação.
-        let mut deferred_commit = false;
         let outcome = if image {
             // O MiFlushDataSection do MiCreateImageFileMap: o que o cache e as
             // vistas de dados alteraram vai ao disco antes de a imagem ser lida.
@@ -497,7 +493,9 @@ fn create_common(output: u64, access: u32, object_attributes: u64, size_pointer:
             sections::create_image(backing.ok_or_else(|| KernelError::new("image section without file"))?, None, request.page_protect, request.flags & 0x400 == 0)?
         } else {
             let (section_size, committed, large) = dimensions.unwrap_or((0, false, false));
-            deferred_commit = committed && driver_file;
+            // A seção de dados de um arquivo de file system não lê o arquivo
+            // (o MiCreateDataFileMap): as páginas vêm pela falta das vistas
+            // e pelo Cache Manager.
             if let Some(captured) = file.as_ref().filter(|captured| captured.driver_file()) {
                 fsd_file::mark_user_mapped(captured.pointer());
             }
@@ -509,12 +507,6 @@ fn create_common(output: u64, access: u32, object_attributes: u64, size_pointer:
             Err(status) => return Ok(status),
         };
         created = Some(section.clone());
-        if deferred_commit {
-            let status = sections::commit(&section, 0, section.size() / sections::PAGE)?;
-            if status != 0 {
-                return Ok(status);
-            }
-        }
         let pointer = section.pointer();
         // A seção retém a partição escolhida até a destruição.
         if let Some(body) = partition_body {

@@ -24,7 +24,7 @@ use super::{flush, vacb};
 use crate::hal::amd64::native_call;
 use crate::ntos::inc::field::NtStruct;
 use crate::ntos::inc::types::extra_cc::PrivateCacheMap;
-use crate::ntos::inc::types::IoStatusBlock;
+use crate::ntos::inc::types::{CcAsyncReadContext, IoStatusBlock};
 
 /// Páginas sujas toleradas antes de o CcCanIWrite estrangular.
 pub const DIRTY_PAGE_THRESHOLD: u64 = vacb::VIEW_BUDGET * layout::PAGES_PER_VIEW / 2;
@@ -92,10 +92,33 @@ pub fn copy_read_at(file: u64, offset: u64, length: u32, wait: bool, buffer: u64
     Ok(true)
 }
 
-/// CcCopyRead/CcCopyReadEx/CcAsyncCopyRead(FileObject, FileOffset, Length, Wait, Buffer, IoStatus, ...).
-/// O contexto assíncrono do CcAsyncCopyRead não é usado: o caminho é o síncrono.
+/// CcCopyRead/CcCopyReadEx(FileObject, FileOffset, Length, Wait, Buffer, IoStatus, ...).
 pub fn copy_read(file: u64, offset_pointer: u64, length: u32, wait: bool, buffer: u64, io_status: u64) -> CcResult<bool> {
     copy_read_at(file, flush::large_integer(offset_pointer), length, wait, buffer, io_status)
+}
+
+/// CcAsyncCopyRead(FileObject, FileOffset, Length, Wait, Buffer, IoStatus,
+/// IoIssuerThread, AsyncReadContext). Quem chama devolve STATUS_PENDING
+/// depois de um TRUE (o NtfsAsyncCachedReadRequest do ntfs.sys) e conclui o
+/// IRP na rotina de conclusão do CC_ASYNC_READ_CONTEXT, que recebe o Context
+/// e o IoStatus; num FALSE ele levanta STATUS_CANT_WAIT e posta o pedido.
+/// O 19041 devolve TRUE com as leituras das páginas que faltam em curso
+/// (E/S assíncrona, também sem Wait) e chama a rotina na conclusão delas;
+/// aqui a leitura é a síncrona do CcCopyRead, no contexto de quem pede, e a
+/// rotina roda antes do retorno.
+pub fn async_copy_read(file: u64, offset_pointer: u64, length: u32, _wait: bool, buffer: u64, io_status: u64, context: u64) -> CcResult<bool> {
+    if !copy_read(file, offset_pointer, length, true, buffer, io_status)? {
+        return Ok(false);
+    }
+    if context != 0 {
+        // SAFETY: o CC_ASYNC_READ_CONTEXT de kernel de quem chama.
+        let async_context = unsafe { CcAsyncReadContext::at(context) };
+        let routine = async_context.completion_routine.get();
+        if routine != 0 {
+            native_call::call(routine, &[async_context.context.get(), io_status]);
+        }
+    }
+    Ok(true)
 }
 
 /// Escrita em cache em `offset` (CcCopyWrite/CcFastCopyWrite).

@@ -1777,12 +1777,53 @@ além da KUSER_SHARED_DATA:
   sucesso), o tamanho vem do FsRtlGetFileSize, e um tamanho máximo maior
   estende o arquivo pelo FsRtlSetFileSize (o IRP de paginação 0x42 do
   0x669a10). Uma seção de dados liga FSRTL_FLAG_USER_MAPPED_FILE no
-  cabeçalho do FCB, como o CcZeroEndOfLastPage. As páginas vêm por
-  IoPageRead, até 16 por IRP, num MDL de frames que não precisam ser
-  contíguos (com mais de um frame, PTEs de sistema durante a E/S dão o
-  MappedSystemVa). O frame só entra na control area depois da leitura; uma
-  página que outro caminho publicou nesse meio tempo fica com o frame dele.
-  O flush grava a página alterada inteira pelo IoSynchronousPageWrite.
+  cabeçalho do FCB, como o CcZeroEndOfLastPage. A seção de dados é
+  paginada sob demanda, como a do MiCreateDataFileMap: a criação não lê o
+  arquivo, e a falta de uma página ausente numa vista (de usuário, de
+  sistema ou uma sonda do kernel; o provedor `section-file` de
+  `page_residency`, o MiResolveMappedFileFault) traz a página e as
+  seguintes que faltam, até 16, com a proteção da vista conferida antes. As
+  páginas vêm por IoPageRead, até 16 por IRP, num MDL de frames que não
+  precisam ser contíguos (com mais de um frame, PTEs de sistema durante a
+  E/S dão o MappedSystemVa). O frame só entra na control area depois da
+  leitura; uma página que outro caminho publicou nesse meio tempo fica com
+  o frame dele. Uma vista dessas conta toda a faixa dentro da seção como
+  confirmada (NtQueryVirtualMemory), e o NtProtectVirtualMemory guarda a
+  proteção das páginas que ainda não vieram. O estado das páginas é o do
+  NT: o bit Dirty das PTEs das vistas que não são do cache passa ao bit
+  Modified da página na control area (o MiCaptureDirtyBitToPfn), com o
+  shootdown dos TLBs antes de a página contar como capturada, no flush, na
+  retirada de cada PTE (uma troca atômica, o MiDeletePte) e antes de uma
+  PTE ser regravada com outra proteção. O flush (o MmFlushSection, também o
+  do CcFlushCache sem SharedCacheMap) grava cada sequência de páginas
+  modificadas vizinhas numa escrita de paginação (IoSynchronousPageWrite,
+  até 16 páginas por IRP, como o cluster do MiFlushSectionInternal) pelo
+  FILE_OBJECT da CONTROL_AREA. O writer de páginas mapeadas
+  (`mm/mapped_writer.rs`, o MiMappedPageWriter) é uma thread de sistema que
+  a cada 5 s, ou acordada, colhe o bit Dirty das vistas e grava as páginas
+  modificadas com o arquivo adquirido pelo FsRtlAcquireFileForModWriteEx
+  (`fsrtl/fs_filter.rs`: os filtros, o Fast I/O AcquireForModWrite do file
+  system, sem espera, e o recurso do FCB sem ele; STATUS_CANT_WAIT deixa o
+  arquivo para a passada seguinte) e o FSRTL_MOD_WRITE_TOP_LEVEL_IRP como
+  IRP de nível de topo; uma vista que fica aberta não guarda as alterações
+  só na memória. As vistas do Cache Manager ficam fora da captura: o que o
+  cache altera sai pelo flush do Cc, com o write-ahead do log, e as control
+  areas com NoModifiedWriting ficam fora do writer. A última referência da
+  control area grava o que ainda está modificado (o MiCleanSection). A
+  CONTROL_AREA nativa (`mm/section/control_area.rs`) vai ao DataSectionObject
+  do FCB com a primeira seção do stream (a do Cache Manager ou uma de
+  usuário) e sai com a última: a CONTROL_AREA, o MSUBSECTION que cobre o
+  tamanho mapeado (que o MmExtendSection estende), a raiz da árvore de
+  subseções e o SEGMENT, com os contadores da control area do OpenNT
+  (seções, vistas mapeadas e do cache, referências de usuário e as
+  graváveis, páginas residentes), u.Flags.File e o FILE_OBJECT referenciado
+  em FilePointer. O ntfs.sys e as rotinas do Mm que recebem os
+  SECTION_OBJECT_POINTERS (MmCanFileBeTruncated, MmForceSectionClosed,
+  MmDoesFileHaveUserWritableReferences, MmChangeSectionBackingFile,
+  MmPrefetchPages) veem a seção; o NtfsSetEndOfFileInfo de um arquivo
+  mapeado com escrita recusa o truncamento com STATUS_USER_MAPPED_FILE. A
+  troca do slot e a leitura dele pelas rotinas do Mm ficam sob um lock de
+  associação, e a CONTROL_AREA retirada nunca é lida depois de liberada.
   Antes de ler uma imagem roda o MiFlushDataSection: CcFlushCache e o flush
   das vistas de dados. O cache usa a mesma control area: o
   CcInitializeCacheMap cria a seção do stream (SharedCacheMap->Section), e
@@ -1791,18 +1832,23 @@ além da KUSER_SHARED_DATA:
   da control area as páginas que nenhuma vista de usuário mapeia (o
   MmPurgeSection), o CcFlushCache de um arquivo mapeado por usuário grava
   antes as vistas (o primeiro passo do 19041), e o MmSetAddressRangeModified
-  de uma página suja de uma vista do cache a marca suja no Cc. Diferenças
-  declaradas: a seção de dados confirma todas as páginas na criação (o NT
-  as traz na falta), nenhuma CONTROL_AREA nativa vai ao DataSectionObject
-  ou ao ImageSectionObject, e não há writer de páginas mapeadas: o que as
-  vistas de usuário alteram sai no flush, na retirada da vista ou no
-  CcFlushCache. A criação de processo aceita um executável fora do volume
+  de uma página suja de uma vista do cache a marca suja no Cc. O
+  CcAsyncCopyRead (a leitura em cache de um handle assíncrono, o
+  NtfsAsyncCachedReadRequest do ntfs.sys) chama a rotina de conclusão do
+  CC_ASYNC_READ_CONTEXT, que conclui o IRP. Diferenças declaradas: a
+  leitura do CcAsyncCopyRead é síncrona, no contexto de quem pede (o NT
+  devolve com a E/S em curso); a escrita do writer de páginas mapeadas é
+  síncrona, um cluster por vez; as páginas de uma control area de arquivo
+  de file system ficam residentes até a control area sumir ou o purge do
+  Cc (sem lista de espera nem corte das vistas); nenhuma CONTROL_AREA vai
+  ao ImageSectionObject. A criação de processo aceita um executável fora do volume
   do kernel (`ps/create.rs`, `DriverImage`): o I/O Manager abre o arquivo
   como o IoCreateFileEx do NtCreateUserProcess e a imagem é lida pela E/S
   de paginação. As aberturas de usuário de uma letra que leva a um volume
   que não é do kernel vão ao IopParseDevice do volume (`ps/user/files.rs`),
   e o NtQueryAttributesFile desses nomes abre, consulta e fecha pelo file
-  system. Testes: nvme (NVME_SECTION_OK) e e-process (E_PROCESS_OK).
+  system. Testes: nvme (NVME_SECTION_OK e FSD_MAPPED_OK, de
+  `ntos/test/fsd_mapped.rs`) e e-process (E_PROCESS_OK).
 - **`\Device\PhysicalMemory`** (`mm/section/physical_memory.rs`, o
   MiSectionInitialization): criada no boot com o namespace, permanente e
   com OBJ_KERNEL_EXCLUSIVE. O corpo SECTION aponta para uma CONTROL_AREA
@@ -1821,7 +1867,11 @@ além da KUSER_SHARED_DATA:
   MmCreateSection (`SectionFile::set_size`, `mm/section/file.rs`); o
   SizeOfSection e o tamanho em páginas da seção (`Section::extend`, agora
   atômicos) crescem, com as páginas novas confirmadas na control area como
-  na criação, e as vistas novas cobrem a faixa nova. O NewSectionSize volta
+  na criação, e as vistas novas cobrem a faixa nova. Num arquivo de file
+  system o tamanho do arquivo vem do FsRtlGetFileSize, o arquivo cresce pelo
+  FsRtlSetFileSize (o IRP_MJ_SET_INFORMATION ao file system), as páginas
+  novas vêm pela falta e a CONTROL_AREA publicada passa a descrever o
+  tamanho novo. O NewSectionSize volta
   com o tamanho que ficou, qualquer que seja o status. Como no 19041, a
   seção de arquivo guarda o SizeOfSection pedido (ou o tamanho do arquivo)
   sem arredondar à página.

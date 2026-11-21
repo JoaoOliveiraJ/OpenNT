@@ -443,3 +443,28 @@ const _: () = {
     assert!(core::mem::offset_of!(CacheUninitializeEvent, next) == 0x0);
     assert!(core::mem::offset_of!(CacheUninitializeEvent, event) == 0x8);
 };
+
+/// `_CC_ASYNC_READ_CONTEXT` (0x20 bytes).
+#[repr(C)]
+pub struct CcAsyncReadContext {
+    /// -> `fn`
+    pub completion_routine: Field<u64>,
+    /// -> `void`
+    pub context: Field<u64>,
+    /// -> `_MDL`
+    pub mdl: Field<u64>,
+    pub requestor_mode: Field<i8>,
+    _pad_19: Reserved<0x3>,
+    pub nesting_level: Field<u32>,
+}
+
+unsafe impl NtStruct for CcAsyncReadContext {}
+
+const _: () = {
+    assert!(core::mem::size_of::<CcAsyncReadContext>() == 0x20);
+    assert!(core::mem::offset_of!(CcAsyncReadContext, completion_routine) == 0x0);
+    assert!(core::mem::offset_of!(CcAsyncReadContext, context) == 0x8);
+    assert!(core::mem::offset_of!(CcAsyncReadContext, mdl) == 0x10);
+    assert!(core::mem::offset_of!(CcAsyncReadContext, requestor_mode) == 0x18);
+    assert!(core::mem::offset_of!(CcAsyncReadContext, nesting_level) == 0x1c);
+};

@@ -269,7 +269,13 @@ fn byte_range(offset_pointer: u64, length: u32, zero_means_all: bool) -> (u64, u
 /// CcFlushCache(SectionObjectPointer, FileOffset, Length, IoStatus).
 pub fn flush_cache(pointers: u64, offset_pointer: u64, length: u32, io_status: u64) -> CcResult<()> {
     let Some(base) = cache_map::map_of_pointers(pointers) else {
-        write_io_status(io_status, status::SUCCESS, 0);
+        // Sem SharedCacheMap, o MmFlushSection da seção de dados do arquivo
+        // (as vistas que o mapeiam), como o CcFlushCache do 19041.
+        let flushed = crate::ntos::ps::user::sections::flush_identity(&crate::ntos::mm::section::fsd_file::identity(pointers));
+        match flushed {
+            Ok(()) => write_io_status(io_status, status::SUCCESS, 0),
+            Err(error) => write_io_status(io_status, if error.status != 0 { error.status } else { 0xC000_0185 }, 0),
+        }
         return Ok(());
     };
     let (start, end) = byte_range(offset_pointer, length, false);

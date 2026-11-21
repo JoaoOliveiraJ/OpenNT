@@ -90,6 +90,10 @@ pub mod cc_copy {
         status::into_export(copy::copy_read(call.arg(1), call.arg(2), call.arg(3) as u32, call.arg(4) as u8 != 0, call.arg(5), call.arg(6)).map(u64::from))
     }
 
+    fn async_copy_read(call: &Call) -> Result<u64, KernelError> {
+        status::into_export(copy::async_copy_read(call.arg(1), call.arg(2), call.arg(3) as u32, call.arg(4) as u8 != 0, call.arg(5), call.arg(6), call.arg(8)).map(u64::from))
+    }
+
     fn fast_copy_read(call: &Call) -> Result<u64, KernelError> {
         status::into_export(copy::copy_read_at(call.arg(1), call.arg(2) as u32 as u64, call.arg(3) as u32, true, call.arg(5), call.arg(6)).map(|_| 0))
     }
@@ -128,7 +132,7 @@ pub mod cc_copy {
             "CcCanIWrite",
             "CcDeferWrite",
         ],
-        handlers: &[copy_read, copy_read, copy_read, fast_copy_read, copy_write, copy_write, fast_copy_write, copy_write_wont_flush, can_i_write, defer_write],
+        handlers: &[copy_read, copy_read, async_copy_read, fast_copy_read, copy_write, copy_write, fast_copy_write, copy_write_wont_flush, can_i_write, defer_write],
         data_exports: &[],
     };
 }

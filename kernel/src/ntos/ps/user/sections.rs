@@ -40,6 +40,7 @@ use crate::ntos::mm::commit as system_commit;
 use crate::ntos::mm::pfn;
 use crate::ntos::mm::process_address_space::SYSTEM_ROOT;
 use crate::ntos::mm::section::{address as section_address, cache as section_cache};
+use crate::ntos::mm::section::control_area::{self, Counters, NativeControlArea};
 use crate::ntos::ob::object_manager::{self, NodeId, ObjectData};
 use crate::ntos::ob::objects::section::{self as section_objects, SectionState};
 use crate::rtl::{KernelError, SpinLock};
@@ -123,6 +124,15 @@ pub trait SectionFile: Send + Sync {
     fn base_name(&self) -> Option<String> {
         None
     }
+    /// Os SECTION_OBJECT_POINTERS do FCB de um arquivo de file system, onde
+    /// a CONTROL_AREA nativa é publicada (0 nas outras origens).
+    fn section_object_pointers(&self) -> u64 {
+        0
+    }
+    /// O FILE_OBJECT da E/S de paginação (0 nas outras origens).
+    fn file_object(&self) -> u64 {
+        0
+    }
 }
 
 /// Paginação de sistema de uma control area (`mm/system_view_paging`).
@@ -159,11 +169,37 @@ pub struct Area {
     /// exigem proteção compatível com a da seção, e as vistas copy-on-write
     /// escrevem em frames privados), então o flush não tem o que gravar.
     pub writeback: bool,
+    /// Páginas de um arquivo de file system cujo conteúdo é mais novo que o
+    /// do arquivo (o bit Modified do PFN): o bit Dirty das PTEs das vistas
+    /// que não são do cache, colhido no flush, pelo writer de páginas
+    /// mapeadas e na retirada de cada PTE ([`capture_dirty`]).
+    pub modified: BTreeSet<u64>,
+    /// A CONTROL_AREA nativa publicada no DataSectionObject do FCB
+    /// (`mm/section/control_area`), só nos arquivos de file system.
+    pub native: Option<NativeControlArea>,
+    /// Seções que não são do Cache Manager, e as graváveis entre elas.
+    pub user_sections: u64,
+    pub writable_user_sections: u64,
 }
 
 impl Area {
     pub fn new(identity: Option<String>, cache: u32) -> Self {
-        Self { frames: BTreeMap::new(), original: BTreeMap::new(), references: 0, views: Vec::new(), identity, cache, image_layout: Vec::new(), image_key: None, system_paging: None, commit_charge: 0, writeback: false }
+        Self { frames: BTreeMap::new(), original: BTreeMap::new(), references: 0, views: Vec::new(), identity, cache, image_layout: Vec::new(), image_key: None, system_paging: None, commit_charge: 0, writeback: false, modified: BTreeSet::new(), native: None, user_sections: 0, writable_user_sections: 0 }
+    }
+
+    /// Os contadores que a CONTROL_AREA nativa espelha.
+    fn counters(&self) -> Counters {
+        let cache_views = self.views.iter().filter(|view| view.section.cache).count() as u64;
+        let writable_user_views = self.views.iter().filter(|view| !view.section.cache && writable(view.protect)).count() as u64;
+        Counters { sections: self.references as u64, user_sections: self.user_sections, writable_user_sections: self.writable_user_sections, views: self.views.len() as u64, cache_views, writable_user_views, resident_pages: self.frames.len() as u64 }
+    }
+}
+
+/// Os contadores da control area na CONTROL_AREA nativa publicada.
+fn sync_native(area: &AreaRef) {
+    let owner = area.lock();
+    if let Some(native) = &owner.native {
+        control_area::update(native, &owner.counters());
     }
 }
 
@@ -204,7 +240,17 @@ pub struct Section {
     pub no_execute: bool,
     pub large: bool,
     pub permanent: bool,
+    /// A seção do Cache Manager sobre o stream (SharedCacheMap->Section).
+    pub cache: bool,
     pub state: SpinLock<SectionMut>,
+}
+
+/// A seção de dados de um arquivo de file system é paginada sob demanda,
+/// como a do MiCreateDataFileMap do 19041: a criação não lê o arquivo, e
+/// cada página entra na control area pela falta (IoPageRead, com o cluster
+/// de leitura) ou pelo Cache Manager.
+pub fn demand_paged(section: &Section) -> bool {
+    !section.is_image && !section.large && section.file.as_ref().is_some_and(|file| file.page_io())
 }
 
 impl Section {
@@ -341,7 +387,12 @@ impl UserRegion for View {
     fn as_any(&self) -> &dyn Any {
         self
     }
+    /// Numa vista paginada sob demanda toda página dentro da seção está
+    /// confirmada (a vista de arquivo do NT), residente ou não.
     fn committed_pages(&self) -> Option<BTreeSet<u64>> {
+        if demand_paged(&self.section) {
+            return Some((0..self.demand_pages()).collect());
+        }
         Some(self.state.lock().committed_pages.clone())
     }
     fn page_protect(&self, index: u64) -> Option<u32> {
@@ -364,6 +415,11 @@ impl UserRegion for View {
 impl View {
     pub fn retiring(&self) -> bool {
         self.state.lock().retirement.is_some()
+    }
+
+    /// As páginas da vista que caem dentro da seção.
+    fn demand_pages(&self) -> u64 {
+        (self.size / PAGE).min(self.section.count_pages().saturating_sub(self.offset / PAGE))
     }
 }
 
@@ -711,12 +767,17 @@ fn discard_pages(area: &AreaRef, pages: &[u64]) -> Result<(), KernelError> {
         for view in &views {
             detach_page(view, page);
         }
-        let frame = area.lock().frames.remove(&page);
+        let frame = {
+            let mut owner = area.lock();
+            owner.modified.remove(&page);
+            owner.frames.remove(&page)
+        };
         if let Some(frame) = frame {
             pfn::free_page(frame);
         }
         release_original_file_page(area, page)?;
     }
+    sync_native(area);
     Ok(())
 }
 
@@ -842,7 +903,10 @@ fn commit_paged_file(section: &Arc<Section>, area: &AreaRef, file: &Arc<dyn Sect
         Ok(0)
     })();
     match result {
-        Ok(0) => Ok(0),
+        Ok(0) => {
+            sync_native(area);
+            Ok(0)
+        }
         other => {
             discard_pages(area, &added)?;
             other
@@ -880,6 +944,12 @@ pub fn purge_file_pages(section: &Arc<Section>, first: u64, end: u64, keep: &dyn
         remote_flush()?;
     }
     Ok(purged)
+}
+
+/// Páginas modificadas da control area da seção ainda não gravadas
+/// (diagnóstico e testes).
+pub fn modified_count(section: &Section) -> usize {
+    section.control_area().map_or(0, |area| area.lock().modified.len())
 }
 
 /// As páginas [first, first + count) (até 64) que a control area já tem:
@@ -939,6 +1009,12 @@ fn destroy_section(section: &Arc<Section>) -> Result<(), KernelError> {
                 return Err(KernelError::new("section area reference underflow"));
             }
             owner.references -= 1;
+            if !section.cache && !section.is_image {
+                owner.user_sections = owner.user_sections.saturating_sub(1);
+                if writable(section.page_protect()) {
+                    owner.writable_user_sections = owner.writable_user_sections.saturating_sub(1);
+                }
+            }
             let last = owner.references == 0;
             if last {
                 if let Some(identity) = owner.identity.clone() {
@@ -949,7 +1025,22 @@ fn destroy_section(section: &Arc<Section>) -> Result<(), KernelError> {
             }
             last
         };
+        if !last {
+            sync_native(&area);
+        }
         if last {
+            // O MiCleanSection de um arquivo mapeado: as páginas que as vistas
+            // alteraram e ainda não foram gravadas vão ao arquivo antes de a
+            // control area sumir; depois a CONTROL_AREA nativa sai do FCB.
+            let native = area.lock().native.take();
+            if let Some(native) = native {
+                if !area.lock().modified.is_empty() {
+                    if let Err(error) = write_modified(&area, control_area::file_object(&native), false) {
+                        debug_print!("[section] paginas alteradas do arquivo nao gravadas no fim da control area: {}", error.message);
+                    }
+                }
+                control_area::unpublish(native);
+            }
             let frames: Vec<(u64, u64)> = area.lock().frames.iter().map(|(&page, &frame)| (page, frame)).collect();
             section_cache::restore(&frames.iter().map(|&(_, frame)| frame).collect::<Vec<u64>>())?;
             let system_paging = area.lock().system_paging.clone();
@@ -1067,7 +1158,46 @@ fn register(section: &Arc<Section>) -> Result<u64, KernelError> {
     Ok(pointer)
 }
 
-fn new_section(size: u64, maximum_size: u64, page_protect: u32, attributes: u32, name: Option<String>, file: Option<Arc<dyn SectionFile>>, is_image: bool, no_execute: bool, large: bool, permanent: bool, area: Option<AreaRef>) -> Arc<Section> {
+/// Publica a CONTROL_AREA nativa da control area de um arquivo de file
+/// system no FCB (uma vez por control area), ou estende o tamanho que ela
+/// descreve para `size`; os contadores vão em seguida.
+fn publish_native(area: &AreaRef, file: &dyn SectionFile, size: u64) {
+    let present = {
+        let owner = area.lock();
+        if let Some(native) = &owner.native {
+            if size > control_area::size(native) {
+                control_area::set_size(native.address, size);
+            }
+        }
+        owner.native.is_some()
+    };
+    if !present {
+        if let Some(native) = control_area::publish(file.section_object_pointers(), file.file_object(), size) {
+            let mut owner = area.lock();
+            if owner.native.is_none() {
+                owner.native = Some(native);
+            } else {
+                drop(owner);
+                control_area::unpublish(native);
+            }
+        }
+    }
+    sync_native(area);
+}
+
+/// O tamanho mapeado da CONTROL_AREA nativa cresce com a seção (o
+/// MmExtendSection de um arquivo de file system).
+pub fn extend_native(section: &Section, size: u64) {
+    if let Some(area) = section.control_area() {
+        let owner = area.lock();
+        if let Some(native) = owner.native.as_ref().filter(|native| size > control_area::size(native)) {
+            control_area::set_size(native.address, size);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn new_section(size: u64, maximum_size: u64, page_protect: u32, attributes: u32, name: Option<String>, file: Option<Arc<dyn SectionFile>>, is_image: bool, no_execute: bool, large: bool, permanent: bool, cache: bool, area: Option<AreaRef>) -> Arc<Section> {
     Arc::new(Section {
         pointer: AtomicU64::new(0),
         size: AtomicU64::new(size),
@@ -1079,6 +1209,7 @@ fn new_section(size: u64, maximum_size: u64, page_protect: u32, attributes: u32,
         no_execute,
         large,
         permanent,
+        cache,
         state: SpinLock::new(SectionMut { area, area_released: false, views: Vec::new(), destroyed: false, node: None, release_file: None, partition: None, image_file_object: 0, mapped_base: 0, mapped_size: 0, cache_flags: 0, name, image_segment: None }),
     })
 }
@@ -1110,14 +1241,32 @@ pub fn create(options: CreateOptions) -> Result<Created, KernelError> {
             return Ok(Err(0xC000_004E));
         }
         owner.references += 1;
+        if !cache {
+            owner.user_sections += 1;
+            if writable(page_protect) {
+                owner.writable_user_sections += 1;
+            }
+        }
         drop(owner);
         if let Some(identity) = &identity {
             areas.insert(identity.clone(), area.clone());
         }
         area
     };
-    let writeback = file.as_ref().filter(|_| writable(page_protect) && !cache).map(|file| file.size());
-    let section = new_section(rounded, size, page_protect, attributes, name.clone(), file, false, false, large, permanent, Some(area.clone()));
+    // Um arquivo de file system é paginado sob demanda e grava as páginas
+    // inteiras que o bit Dirty marcou: sem as cópias originais do writeback.
+    let page_io = file.as_ref().is_some_and(|file| file.page_io()) && !large;
+    let writeback = file.as_ref().filter(|_| writable(page_protect) && !cache && !page_io).map(|file| file.size());
+    if page_io {
+        if let Some(file) = &file {
+            publish_native(&area, file.as_ref(), size);
+        }
+        install_data_faults()?;
+        if writable(page_protect) && !cache {
+            crate::ntos::mm::mapped_writer::start();
+        }
+    }
+    let section = new_section(rounded, size, page_protect, attributes, name.clone(), file, false, false, large, permanent, cache, Some(area.clone()));
     if let Some(file_size) = writeback {
         if !enable_writeback(&area, file_size) {
             destroy_section(&section)?;
@@ -1164,7 +1313,7 @@ pub fn create_image(file: Arc<dyn SectionFile>, name: Option<String>, page_prote
     if let Some(status) = name.as_deref().and_then(check_name) {
         return Ok(Err(status));
     }
-    let section = new_section(size, size, page_protect, if no_execute { 0x1100_0000 } else { 0x0100_0000 }, name.clone(), Some(file), true, no_execute, false, false, None);
+    let section = new_section(size, size, page_protect, if no_execute { 0x1100_0000 } else { 0x0100_0000 }, name.clone(), Some(file), true, no_execute, false, false, false, None);
     if register(&section)? == 0 {
         return Ok(Err(0xC000_009A));
     }
@@ -1275,7 +1424,9 @@ pub fn map(section: &Arc<Section>, options: &MapRequest) -> Result<Mapped, Kerne
         system_paging.materialize(section)?;
     }
     let available = section.size().saturating_sub(offset);
-    let commit_size = options.commit_size.min(size).min(available);
+    // O CommitSize só vale para as seções de pagefile; a vista de um arquivo
+    // de file system traz as páginas pela falta.
+    let commit_size = if demand_paged(section) { 0 } else { options.commit_size.min(size).min(available) };
     let status = if commit_size != 0 { commit(section, offset / PAGE, commit_size.div_ceil(PAGE))? } else { 0 };
     if status != 0 {
         return Ok(Err(status));
@@ -1327,6 +1478,7 @@ pub fn map(section: &Arc<Section>, options: &MapRequest) -> Result<Mapped, Kerne
     section_objects::update(section.pointer(), |state| state.views += 1);
     if let Some(area) = section.control_area() {
         area.lock().views.push(view.clone());
+        sync_native(&area);
     }
     VIEWS.lock().push(view.clone());
     if section.is_image || copy_on_write(view.protect) {
@@ -1376,9 +1528,15 @@ fn unmap_view(view: &Arc<View>, authority: Option<&secured_views::SecuredToken>,
         state.retirement = Some(Retirement { pages, ..Retirement::default() });
     }
     let mut retirement = view.state.lock().retirement.take().unwrap_or_default();
+    // O bit Dirty de cada PTE retirada de uma vista de arquivo de file
+    // system vai à control area (o MiDeletePte), para o flush abaixo.
+    let capture = demand_paged(&view.section) && !view.section.cache && !view.large;
     let result = (|| -> Result<(), KernelError> {
         while retirement.next < retirement.pages.len() {
             let address = view_address(view, retirement.pages[retirement.next] * PAGE);
+            if capture {
+                capture_retired_pte(view, retirement.pages[retirement.next], address);
+            }
             let removed = if view.large { paging::unmap_large_page_in(view.root, address, Some(&mut retirement.tables)) } else { paging::unmap_page_in(view.root, address, MapOptions { deferred_tables: Some(&mut retirement.tables), ..MapOptions::default() }) };
             if !removed {
                 return Err(KernelError::new("section view page removal failed"));
@@ -1427,6 +1585,7 @@ fn unmap_view(view: &Arc<View>, authority: Option<&secured_views::SecuredToken>,
     }
     if let Some(area) = section.control_area() {
         area.lock().views.retain(|candidate| !same_view(candidate, view));
+        sync_native(&area);
     }
     VIEWS.lock().retain(|candidate| !same_view(candidate, view));
     let kind = {
@@ -1468,10 +1627,10 @@ struct DirtyPage {
 pub fn flush(section: &Section) -> Result<(), KernelError> {
     let Some(file) = &section.file else { return Ok(()) };
     let Some(area) = section.control_area() else { return Ok(()) };
-    let originals: Vec<(u64, u64)> = area.lock().original.iter().map(|(&page, &frame)| (page, frame)).collect();
     if file.page_io() {
-        return flush_pages(section, file, &originals);
+        return flush_pages(&area, file.as_ref());
     }
+    let originals: Vec<(u64, u64)> = area.lock().original.iter().map(|(&page, &frame)| (page, frame)).collect();
     let size = file.size();
     let mut group: Vec<DirtyPage> = Vec::new();
     for (page, original) in originals {
@@ -1555,26 +1714,162 @@ pub fn flush_all_file_sections() -> (u32, u32) {
     (flushed, failed)
 }
 
-/// O flush de um arquivo de file system: a página alterada vai inteira pela
-/// escrita de paginação (o IoSynchronousPageWrite do MmFlushSection; o file
-/// system corta o que passa do fim do arquivo). A cópia original recebe os
-/// bytes tirados antes da escrita: uma escrita da vista durante a E/S fica
-/// para o próximo flush.
-fn flush_pages(section: &Section, file: &Arc<dyn SectionFile>, originals: &[(u64, u64)]) -> Result<(), KernelError> {
-    for &(page, original) in originals {
-        let Some(frame) = section.frame(page) else { continue };
-        if page * PAGE >= file.size() {
-            continue;
+/// O flush de um arquivo de file system (o MmFlushSection da seção
+/// inteira): o bit Dirty das PTEs das vistas passa às páginas modificadas
+/// da control area, e cada sequência de páginas modificadas vizinhas vai
+/// pela escrita de paginação (IoSynchronousPageWrite, até 16 páginas por
+/// IRP, como o cluster do MiFlushSectionInternal) pelo FILE_OBJECT da
+/// CONTROL_AREA (ou o da seção). O file system corta o que passa do fim do
+/// arquivo.
+fn flush_pages(area: &AreaRef, file: &dyn SectionFile) -> Result<(), KernelError> {
+    capture_dirty(area)?;
+    let paging = area.lock().native.as_ref().map(control_area::file_object).filter(|&object| object != 0).unwrap_or_else(|| file.file_object());
+    write_modified(area, paging, false)
+}
+
+/// O bit Dirty das PTEs presentes das vistas da control area que não são do
+/// cache passa às páginas modificadas (o MiCaptureDirtyBitToPfn de cada
+/// PTE); as outras CPUs descartam as traduções antes de a página contar
+/// como capturada, então uma escrita depois disso marca a PTE de novo. As
+/// vistas do Cache Manager ficam de fora: o que o cache altera sai pelo
+/// flush do próprio Cc, com o write-ahead do log.
+fn capture_dirty(area: &AreaRef) -> Result<(), KernelError> {
+    let views: Vec<Arc<View>> = area.lock().views.iter().filter(|view| !view.section.cache && !view.large).cloned().collect();
+    let mut dirty: Vec<(u64, u64)> = Vec::new();
+    for view in views {
+        let first = view.offset / PAGE;
+        let pages: Vec<(u64, u64)> = {
+            let state = view.state.lock();
+            state.frames.iter().filter(|(index, _)| !state.private_frames.contains_key(index)).map(|(&index, &frame)| (index, frame)).collect()
+        };
+        for (index, frame) in pages {
+            if let Some(entry) = paging::clear_dirty_in(view.root, view_address(&view, index * PAGE)) {
+                if entry & FRAME_MASK == frame {
+                    dirty.push((first + index, frame));
+                }
+            }
         }
-        let current = physical::read_bytes(frame, PAGE as usize);
-        if current == physical::read_bytes(original, PAGE as usize) {
-            continue;
+    }
+    if dirty.is_empty() {
+        return Ok(());
+    }
+    remote_flush()?;
+    let mut owner = area.lock();
+    for (page, frame) in dirty {
+        if owner.frames.get(&page) == Some(&frame) {
+            owner.modified.insert(page);
         }
-        let written = file.write_frames(page, &[frame]).unwrap_or_else(|| Err(KernelError::new("section file without paging writes")));
-        written.map_err(|error| KernelError::with_status(format!("section writeback failed: {}", error.message), status_of(&error, 0xC000_0185)))?;
-        physical::write_bytes(original, &current);
     }
     Ok(())
+}
+
+/// Os bits do frame numa PTE.
+const FRAME_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+
+/// A PTE de uma vista de arquivo de file system sai numa troca atômica, e
+/// o Dirty dela vai às páginas modificadas da control area (o MiDeletePte).
+fn capture_retired_pte(view: &View, index: u64, address: u64) {
+    let Some(entry) = paging::take_leaf_in(view.root, address) else { return };
+    if entry & paging::PAGE_PRESENT == 0 || entry & paging::PAGE_DIRTY == 0 || view.state.lock().private_frames.contains_key(&index) {
+        return;
+    }
+    let Some(area) = view.section.control_area() else { return };
+    let page = view.offset / PAGE + index;
+    let mut owner = area.lock();
+    if owner.frames.get(&page) == Some(&(entry & FRAME_MASK)) {
+        owner.modified.insert(page);
+    }
+}
+
+/// Grava as páginas modificadas da control area pelo FILE_OBJECT `file`: as
+/// vizinhas numa escrita de paginação só (o file system recebe IRPs de até
+/// 16 páginas); as que ficam além do fim do arquivo (o FileSize do FCB)
+/// saem da lista sem escrita. Uma página sai da lista antes da escrita (uma
+/// escrita nela durante a E/S marca a PTE de novo) e volta se a escrita
+/// falha. `modified_writer` (o MiMappedPageWriter): o arquivo é adquirido
+/// pelo FsRtlAcquireFileForModWriteEx e o IRP de nível de topo é o
+/// FSRTL_MOD_WRITE_TOP_LEVEL_IRP (`mm/mapped_writer`). Devolve o primeiro
+/// erro.
+fn write_modified(area: &AreaRef, file: u64, modified_writer: bool) -> Result<(), KernelError> {
+    if file == 0 {
+        return Err(KernelError::with_status("section file without paging file object", 0xC000_0185));
+    }
+    let end = crate::ntos::mm::section::fsd_file::header_file_size(file);
+    let runs: Vec<(u64, Vec<u64>)> = {
+        let mut owner = area.lock();
+        let beyond: Vec<u64> = owner.modified.iter().copied().filter(|&page| end.is_some_and(|end| page * PAGE >= end)).collect();
+        for page in beyond {
+            owner.modified.remove(&page);
+        }
+        let mut runs: Vec<(u64, Vec<u64>)> = Vec::new();
+        for &page in owner.modified.iter() {
+            let Some(&frame) = owner.frames.get(&page) else { continue };
+            match runs.last_mut() {
+                Some((first, frames)) if *first + frames.len() as u64 == page => frames.push(frame),
+                _ => runs.push((page, alloc::vec![frame])),
+            }
+        }
+        for (first, frames) in &runs {
+            for page in *first..*first + frames.len() as u64 {
+                owner.modified.remove(&page);
+            }
+        }
+        runs
+    };
+    let mut result = Ok(());
+    for (first, frames) in runs {
+        if let Err(error) = crate::ntos::mm::mapped_writer::write_run(file, first, &frames, modified_writer) {
+            let mut owner = area.lock();
+            for (offset, frame) in frames.iter().enumerate() {
+                let page = first + offset as u64;
+                if owner.frames.get(&page) == Some(frame) {
+                    owner.modified.insert(page);
+                }
+            }
+            if result.is_ok() {
+                result = Err(KernelError::with_status(format!("section writeback failed: {}", error.message), status_of(&error, 0xC000_0185)));
+            }
+        }
+    }
+    result
+}
+
+/// Uma passada do writer de páginas mapeadas (o MiMappedPageWriter): cada
+/// control area de arquivo de file system com vistas que não são do cache
+/// colhe o bit Dirty delas e grava as páginas modificadas, com o arquivo
+/// adquirido pelo FsRtlAcquireFileForModWriteEx sem espera (um arquivo
+/// ocupado fica para a passada seguinte). As control areas com
+/// NoModifiedWriting (os streams com log, pelo Cc) ficam de fora. Devolve as
+/// páginas gravadas.
+pub fn write_mapped_pages() -> u64 {
+    let areas: Vec<AreaRef> = FILE_AREAS.lock().values().cloned().collect();
+    let mut written = 0u64;
+    for area in areas {
+        let (file, user_views) = {
+            let owner = area.lock();
+            let Some(native) = owner.native.as_ref() else { continue };
+            if control_area::no_modified_writing(native) {
+                continue;
+            }
+            (control_area::file_object(native), owner.views.iter().any(|view| !view.section.cache))
+        };
+        if file == 0 || (!user_views && area.lock().modified.is_empty()) {
+            continue;
+        }
+        if capture_dirty(&area).is_err() {
+            continue;
+        }
+        let pending = area.lock().modified.len() as u64;
+        if pending == 0 {
+            continue;
+        }
+        match write_modified(&area, file, true) {
+            Ok(()) => written += pending.saturating_sub(area.lock().modified.len() as u64),
+            Err(error) if error.status == crate::ntos::mm::mapped_writer::STATUS_CANT_WAIT => {}
+            Err(error) => debug_print!("[section] writer de paginas mapeadas: {}", error.message),
+        }
+    }
+    written
 }
 
 /// Falta de escrita presente numa página copy-on-write: copia para um PFN
@@ -1650,6 +1945,106 @@ fn install_faults() -> Result<(), KernelError> {
     page_residency::register("section-cow", Provider { fault: residency_fault, resolve: |_| Ok(None), reclaim: |_| Ok(0), prepare: || Ok(()), resolve_range: Some((0, 0)) })
 }
 
+/// O Dirty da PTE residente `index` de uma vista de arquivo de file system
+/// vai à control area antes de a PTE ser regravada.
+fn capture_page_dirty(view: &View, index: u64) {
+    let Some(&frame) = view.state.lock().frames.get(&index) else { return };
+    if view.state.lock().private_frames.contains_key(&index) {
+        return;
+    }
+    if let Some(entry) = paging::clear_dirty_in(view.root, view_address(view, index * PAGE)) {
+        if entry & FRAME_MASK == frame {
+            if let Some(area) = view.section.control_area() {
+                area.lock().modified.insert(view.offset / PAGE + index);
+            }
+        }
+    }
+}
+
+/// Páginas lidas por falta numa vista de arquivo (a página da falta e as
+/// seguintes que faltam, dentro da vista e da seção): o cluster de leitura
+/// do MiResolveMappedFileFault.
+const DATA_FAULT_CLUSTER: u64 = 16;
+
+static DATA_FAULTS: AtomicBool = AtomicBool::new(false);
+
+/// A vista de arquivo paginada sob demanda que cobre `address`: na raiz
+/// carregada (a do processo que faltou) ou no espaço de sistema.
+fn demand_view_at(address: u64) -> Option<Arc<View>> {
+    let root = paging::current_root();
+    VIEWS.lock().iter().find(|view| address >= view.base && address < view.base + view.size && (view.system_space || view.root == root) && demand_paged(&view.section) && !view.large).cloned()
+}
+
+/// Traz a página `index` da vista (e o cluster seguinte) para a control
+/// area pela E/S de paginação e a publica nas vistas. Devolve o NTSTATUS
+/// (STATUS_ACCESS_VIOLATION fora da seção).
+fn page_in_view(view: &View, index: u64) -> Result<u32, KernelError> {
+    if view.retiring() {
+        return Ok(0xC000_0005);
+    }
+    let pages = view.demand_pages();
+    if index >= pages {
+        return Ok(0xC000_0005);
+    }
+    let section_page = view.offset / PAGE + index;
+    let Some(area) = view.section.control_area() else { return Ok(0xC000_0005) };
+    let Some(file) = view.section.file.clone() else { return Ok(0xC000_0005) };
+    let present = |page: u64| area.lock().frames.contains_key(&page);
+    if present(section_page) {
+        return Ok(if attach_page(view, section_page) { 0 } else { 0xC000_0017 });
+    }
+    let mut count = 1u64;
+    while count < DATA_FAULT_CLUSTER && index + count < pages && !present(section_page + count) {
+        count += 1;
+    }
+    commit_paged_file(&view.section, &area, &file, section_page, count, true)
+}
+
+/// A falta de página ausente numa vista de arquivo paginada sob demanda (o
+/// MiResolveMappedFileFault): proteção conferida como a do acesso, a
+/// página lida e publicada, e a instrução repetida (uma escrita numa vista
+/// copy-on-write volta com a página presente e passa à cópia). Uma falha de
+/// leitura é STATUS_IN_PAGE_ERROR com o status do file system.
+fn data_fault(address: u64, error: u32) -> FaultResult {
+    if error & 9 != 0 {
+        return FaultResult::NotMine;
+    }
+    let Some(view) = demand_view_at(address) else { return FaultResult::NotMine };
+    if error & 4 != 0 && view.supervisor {
+        return FaultResult::NotMine;
+    }
+    let index = (address - view.base) / PAGE;
+    let protect = view.state.lock().page_protects.get(&index).copied().filter(|&protect| protect != 0).unwrap_or(view.protect);
+    if protect & 255 == 1 || (error & 16 != 0 && !executable(protect)) || (error & 2 != 0 && !writable(protect) && !copy_on_write(protect)) {
+        return FaultResult::NotMine;
+    }
+    match page_in_view(&view, index) {
+        Ok(0) => FaultResult::Resolved,
+        Ok(0xC000_0005) => FaultResult::NotMine,
+        Ok(status) => FaultResult::InPageError(status),
+        Err(error) => FaultResult::InPageError(status_of(&error, 0xC000_0006)),
+    }
+}
+
+/// A mesma página trazida para uma sonda do kernel (o acesso que faltaria).
+fn data_resolve(address: u64) -> Result<Option<u64>, KernelError> {
+    let Some(view) = demand_view_at(address) else { return Ok(None) };
+    match page_in_view(&view, (address - view.base) / PAGE)? {
+        0 => Ok(Some(paging::translate(address)).filter(|&physical| physical != 0)),
+        0xC000_0005 => Ok(None),
+        status => Err(KernelError::with_status("section page-in failed", status)),
+    }
+}
+
+/// O provedor das faltas das vistas de arquivo, instalado com a primeira
+/// seção paginada sob demanda.
+fn install_data_faults() -> Result<(), KernelError> {
+    if DATA_FAULTS.swap(true, Ordering::AcqRel) {
+        return Ok(());
+    }
+    page_residency::register("section-file", Provider { fault: data_fault, resolve: data_resolve, reclaim: |_| Ok(0), prepare: || Ok(()), resolve_range: None })
+}
+
 /// A política 0x400000 do NtMapViewOfSection pertence à VAD de dados;
 /// SEC_NO_CHANGE vale para toda vista e precede os modificadores de cache.
 /// Vistas de imagem mantêm a política PE própria.
@@ -1691,11 +2086,22 @@ pub fn protect_view(view: &View, base: u64, size: u64, protect: u32) -> u32 {
     if view.large && (first % 512 != 0 || count % 512 != 0) {
         return 0xC000_000D;
     }
-    if (first..first + count).any(|index| !view.state.lock().committed_pages.contains(&index)) {
+    // Numa vista paginada sob demanda a página que ainda não veio guarda só a
+    // proteção, que a falta aplica; a residente perde a PTE e o Dirty dela
+    // vai antes à control area.
+    let demand = demand_paged(&view.section);
+    if demand {
+        if first + count > view.demand_pages() {
+            return 0xC000_002D;
+        }
+    } else if (first..first + count).any(|index| !view.state.lock().committed_pages.contains(&index)) {
         return 0xC000_002D;
     }
     let mut old: Vec<Option<u32>> = Vec::new();
     for index in first..first + count {
+        if demand && !view.section.cache {
+            capture_page_dirty(view, index);
+        }
         old.push(view.state.lock().page_protects.insert(index, protect));
         if !attach_page(view, index + view.offset / PAGE) {
             for (position, restored) in (first..=index).enumerate() {

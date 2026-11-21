@@ -14,19 +14,20 @@
 //! PrefetchCreated é desligado quando a thread corrente não está em prefetch
 //! (ETHREAD.SameThreadApcFlags.Prefetching).
 //!
-//! Diferenças declaradas: o NT segura também um spin lock global de
-//! associação SOP->CONTROL_AREA; aqui a associação é revalidada sob o lock
-//! da CONTROL_AREA (como `mm::image_file_signature`). As referências do
-//! object manager são ajustadas logo depois de soltar o lock, porque o OB do
-//! OpenNT pode apagar objetos de forma síncrona (o NT adia a deleção). Sem
-//! CONTROL_AREA publicada na SOP — o caso de todo arquivo de driver no
-//! OpenNT hoje — o resultado é o do NT: STATUS_SUCCESS sem mudança.
+//! Como no NT, a associação SOP->CONTROL_AREA fica presa (o lock de
+//! associação de `mm/section/control_area`) junto com o lock da
+//! CONTROL_AREA. As referências do object manager são ajustadas logo depois
+//! de soltar os locks, porque o OB do OpenNT pode apagar objetos de forma
+//! síncrona (o NT adia a deleção). Sem CONTROL_AREA publicada na SOP (só a
+//! seção de dados de um arquivo de file system é publicada, enquanto tem
+//! seções) o resultado é o do NT: STATUS_SUCCESS sem mudança.
 
 use core::sync::atomic::Ordering;
 
 use crate::ntos::ex::spin_lock;
 use crate::ntos::inc::field::{Field, NtStruct};
 use crate::ntos::inc::types::{ControlArea, Ethread, FileObject, SectionObjectPointers};
+use crate::ntos::mm::section::control_area;
 use crate::ntos::ob::object_reference;
 use crate::ntos::ps::process;
 use crate::rtl::KernelError;
@@ -83,31 +84,34 @@ pub fn change_section_backing_file(current: Option<&FileObject>, new: &FileObjec
         BackingSection::Data => &pointers.data_section_object,
         BackingSection::Image => &pointers.image_section_object,
     };
-    let replaced = loop {
-        let address = slot.get();
-        if address == 0 {
-            return Ok(0);
-        }
-        // SAFETY: CONTROL_AREA publicada na SOP pelo Mm.
-        let control_area = unsafe { ControlArea::at(address) };
+    if slot.get() == 0 {
+        return Ok(0);
+    }
+    // ObFastReplaceObject referencia o novo antes da troca (as referências
+    // em cache e a do NT); sem troca, elas voltam.
+    for _ in 0..MAX_FAST_REFS + 1 {
+        object_reference::reference_with_tag(new.address(), TAG, false)?;
+    }
+    let replaced = control_area::with_slot(slot, |control_area| {
+        let control_area: &ControlArea = control_area?;
         let lock = control_area.control_area_lock.address();
         let previous = spin_lock::acquire_exclusive(lock);
-        if slot.get() != address {
-            spin_lock::release_exclusive(lock, previous)?;
-            continue;
-        }
         let replaced = replace_under_lock(control_area, current, new);
-        spin_lock::release_exclusive(lock, previous)?;
-        break replaced;
-    };
-    if let Some((old, cached)) = replaced {
-        // ObFastReplaceObject + ObfReferenceObjectWithTag(new) +
-        // ObDereferenceObjectDeferDeleteWithTag(old).
-        for _ in 0..MAX_FAST_REFS + 1 {
-            object_reference::reference_with_tag(new.address(), TAG, false)?;
+        let _ = spin_lock::release_exclusive(lock, previous);
+        replaced
+    });
+    match replaced {
+        Some((old, cached)) => {
+            // ObDereferenceObjectDeferDeleteWithTag(old) com as referências
+            // em cache dele.
+            for _ in 0..cached + 1 {
+                object_reference::dereference_with_tag(old, TAG, false)?;
+            }
         }
-        for _ in 0..cached + 1 {
-            object_reference::dereference_with_tag(old, TAG, false)?;
+        None => {
+            for _ in 0..MAX_FAST_REFS + 1 {
+                object_reference::dereference_with_tag(new.address(), TAG, false)?;
+            }
         }
     }
     Ok(0)

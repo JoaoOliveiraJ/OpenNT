@@ -215,7 +215,9 @@ struct Alias {
 pub fn evict(view: &View, page_index: u64) -> Result<bool, KernelError> {
     let Some(record) = record_of(view) else { return Ok(false) };
     let section = &view.section;
-    if record.lock().busy || view.retiring() || section.large || section.page_protect() & 0x600 != 0 || section.file.is_none() || smp::has_active_jobs() {
+    // Uma seção de arquivo de file system (paginada sob demanda) guarda o
+    // estado das páginas pelo bit Dirty das PTEs e não despeja por aqui.
+    if record.lock().busy || view.retiring() || section.large || section.page_protect() & 0x600 != 0 || section.file.is_none() || sections::demand_paged(section) || smp::has_active_jobs() {
         return Ok(false);
     }
     if irql::get_irql() > 1 {

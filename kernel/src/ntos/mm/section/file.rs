@@ -208,6 +208,10 @@ impl SectionFile for CapturedFile {
     /// O EndOfFile de agora: o do volume, ou o da fonte do FILE_OBJECT de
     /// um arquivo aberto pelo modo usuário.
     fn file_size(&self) -> u64 {
+        if self.driver_file() {
+            // FsRtlGetFileSize, como o MmExtendSection.
+            return fsd_file::file_size(self.pointer()).unwrap_or_else(|_| self.size());
+        }
         if let Some(stat) = self.backing.as_ref().and_then(|(volume, path)| volume.stat(path)) {
             return stat.size;
         }
@@ -322,6 +326,14 @@ impl SectionFile for CapturedFile {
 
     fn base_name(&self) -> Option<String> {
         Some(self.base_name.clone()).filter(|name| !name.is_empty())
+    }
+
+    fn section_object_pointers(&self) -> u64 {
+        self.driver_pointers
+    }
+
+    fn file_object(&self) -> u64 {
+        if self.driver_file() { self.pointer() } else { 0 }
     }
 }
 

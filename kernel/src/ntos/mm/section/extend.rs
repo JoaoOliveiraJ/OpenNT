@@ -62,11 +62,15 @@ pub fn extend(section: &Arc<Section>, new_size: &mut u64) -> Result<u32, KernelE
         }
     }
     // As páginas novas entram na control area como as da criação (lidas do
-    // arquivo e postas nas vistas que as cobrem).
+    // arquivo e postas nas vistas que as cobrem); numa seção paginada sob
+    // demanda (um arquivo de file system) elas vêm pela falta, e a
+    // CONTROL_AREA publicada passa a descrever o tamanho novo.
     let old_pages = section.count_pages();
     section.extend(*new_size);
     let new_pages = section.count_pages();
-    if new_pages > old_pages {
+    if sections::demand_paged(section) {
+        sections::extend_native(section, *new_size);
+    } else if new_pages > old_pages {
         let status = sections::commit(section, old_pages, new_pages - old_pages)?;
         if status != 0 {
             return Ok(status);
