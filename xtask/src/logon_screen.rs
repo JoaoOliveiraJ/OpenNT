@@ -337,18 +337,9 @@ pub fn software_keys() -> Vec<HostKey> {
         keys.extend(found);
         // As associações do shell da instalação, só com o que é do Windows
         // do volume.
-        let mut associations = Vec::new();
-        for class in SHELL_ASSOCIATIONS {
-            registry::copy(registry::LOCAL_MACHINE, &format!("SOFTWARE\\Classes\\{class}"), &format!("Classes\\{class}"), true, &mut associations);
-        }
-        let mut volume_programs: Vec<&str> = programs.clone();
-        volume_programs.extend(crate::windows_binaries::windows_programs());
-        let (mut kept, dropped) = volume_associations(associations, &servers, &volume_programs);
-        for line in dropped {
-            println!("AVISO: associacao do shell fora do convidado: {line}");
-        }
-        for line in clean_install_defaults(&mut kept) {
-            println!("AVISO: associacao do shell com o valor de uma instalacao nova: {line}");
+        let (kept, log) = shell_association_keys(&servers);
+        for line in log {
+            println!("AVISO: {line}");
         }
         keys.extend(kept);
         // As zonas de segurança da instalação (`Internet Settings\Zones`, de
@@ -443,6 +434,24 @@ fn outside_windows(kind: u32, data: &[u8]) -> bool {
     }
     // Um caminho absoluto de unidade que não é o C:\Windows.
     text.char_indices().any(|(at, character)| character.is_ascii_alphabetic() && text[at + 1..].starts_with(":\\") && !text[at..].starts_with("c:\\windows"))
+}
+
+/// As associações do shell desta máquina ([`SHELL_ASSOCIATIONS`]) como o
+/// convidado as leva ([`volume_associations`] com as classes COM copiadas,
+/// `servers`, e os valores de [`CLEAN_INSTALL_ASSOCIATIONS`]), com uma linha
+/// de aviso para cada coisa que saiu ou foi trocada.
+#[cfg(windows)]
+fn shell_association_keys(servers: &std::collections::BTreeSet<String>) -> (Vec<HostKey>, Vec<String>) {
+    use crate::host_language::registry;
+    let mut associations = Vec::new();
+    for class in SHELL_ASSOCIATIONS {
+        registry::copy(registry::LOCAL_MACHINE, &format!("SOFTWARE\\Classes\\{class}"), &format!("Classes\\{class}"), true, &mut associations);
+    }
+    let programs: Vec<&str> = crate::windows_binaries::user_programs().chain(crate::windows_binaries::windows_programs()).collect();
+    let (mut kept, dropped) = volume_associations(associations, servers, &programs);
+    let mut log: Vec<String> = dropped.into_iter().map(|line| format!("associacao do shell fora do convidado: {line}")).collect();
+    log.extend(clean_install_defaults(&mut kept).into_iter().map(|line| format!("associacao do shell com o valor de uma instalacao nova: {line}")));
+    (kept, log)
 }
 
 /// As classes de associação do shell que uma instalação nova traz em
@@ -641,15 +650,42 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn host_associations_carry_only_the_windows_of_the_volume() {
-        use super::{command_program, outside_windows, text, SHELL_ASSOCIATIONS};
-        let keys = super::software_keys();
-        let classes: std::collections::BTreeSet<String> = keys.iter().filter(|key| key.path.starts_with("Classes\\CLSID\\")).filter_map(|key| key.path.split('\\').nth(2).map(str::to_ascii_lowercase)).collect();
+        use super::{command_program, outside_windows, shell_association_keys, system32_file, text, SHELL_ASSOCIATIONS};
+        use crate::host_language::registry;
         let mut programs: Vec<String> = crate::windows_binaries::user_programs().chain(crate::windows_binaries::windows_programs()).map(str::to_ascii_lowercase).collect();
         programs.sort();
-        let associations: Vec<&HostKey> = keys.iter().filter(|key| {
-            let mut parts = key.path.split('\\');
-            parts.next() == Some("Classes") && parts.next().is_some_and(|class| !class.eq_ignore_ascii_case("CLSID") && !class.eq_ignore_ascii_case("Interface") && !class.eq_ignore_ascii_case("AppID"))
-        }).collect();
+        // As classes que as associações citam (o DelegateExecute, o
+        // ExplorerCommandHandler e os manipuladores), copiadas pela regra do
+        // build: o InprocServer32 é uma DLL do volume.
+        let mut cited = std::collections::BTreeSet::new();
+        for class in SHELL_ASSOCIATIONS {
+            let mut found = Vec::new();
+            registry::copy(registry::LOCAL_MACHINE, &format!("SOFTWARE\\Classes\\{class}"), "", true, &mut found);
+            for key in &found {
+                for (_, kind, data) in &key.values {
+                    if matches!(kind, 1 | 2) {
+                        let units: Vec<u16> = data.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).take_while(|&unit| unit != 0).collect();
+                        let value = String::from_utf16_lossy(&units).trim().to_ascii_lowercase();
+                        if value.starts_with('{') && value.ends_with('}') {
+                            cited.insert(value);
+                        }
+                    }
+                }
+                if let Some(name) = key.path.rsplit('\\').next().filter(|name| name.starts_with('{') && name.ends_with('}')) {
+                    cited.insert(name.to_ascii_lowercase());
+                }
+            }
+        }
+        let classes: std::collections::BTreeSet<String> = cited
+            .into_iter()
+            .filter(|class| {
+                let mut server = Vec::new();
+                registry::copy(registry::LOCAL_MACHINE, &format!("SOFTWARE\\Classes\\CLSID\\{class}\\InprocServer32"), "", false, &mut server);
+                server.first().and_then(|key| text(&key.values, "")).as_deref().and_then(system32_file).is_some_and(|file| programs.binary_search(&file.to_ascii_lowercase()).is_ok())
+            })
+            .collect();
+        let (associations, _) = shell_association_keys(&classes);
+        let associations: Vec<&HostKey> = associations.iter().collect();
         for key in &associations {
             let class = key.path.split('\\').nth(1).unwrap_or_default();
             assert!(SHELL_ASSOCIATIONS.iter().any(|known| known.eq_ignore_ascii_case(class)), "classe fora da lista: {}", key.path);
