@@ -98,6 +98,16 @@ const APPX: &str = "Microsoft\\Windows\\CurrentVersion\\Appx";
 /// errado), e o `PackageRoot` dos pacotes.
 const APPX_DIRECTORIES: &[(&str, &str)] = &[("PackageRepositoryRoot", "C:\\ProgramData\\Microsoft\\Windows\\AppRepository"), ("PackageRoot", "C:\\Program Files\\WindowsApps")];
 
+/// A chave de configuração do StateRepository, vazia como numa instalação
+/// nova (relativa à raiz da SOFTWARE). O Globals::LoadSettings do
+/// ServiceMain (windows.staterepository.dll) abre a chave e lê dela os
+/// ajustes opcionais (Options, BusyTimeout...); sem ela devolve
+/// ERROR_FILE_NOT_FOUND, o ServiceMain volta logo e o RPCSS espera o
+/// servidor das classes Windows.Internal.StateRepository.* até o prazo. O
+/// `Cache` que o serviço grava embaixo dela não vem desta máquina: é o
+/// serviço que o monta a partir dos bancos dele.
+const STATE_REPOSITORY: &str = "Microsoft\\Windows\\CurrentVersion\\AppModel\\StateRepository";
+
 /// UTF-16LE terminado em NUL, como o Registro guarda um REG_SZ.
 fn registry_string(text: &str) -> Vec<u8> {
     text.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect()
@@ -403,10 +413,14 @@ mod tests {
 }
 
 /// As chaves da hive SOFTWARE: os diretórios do AppX
-/// ([`APPX_DIRECTORIES`]), os grupos do svchost, os provedores de
+/// ([`APPX_DIRECTORIES`]), a chave de configuração do StateRepository
+/// ([`STATE_REPOSITORY`]), os grupos do svchost, os provedores de
 /// autenticação do RPC e a configuração do WUDF.
 pub fn software_keys() -> Vec<HostKey> {
-    let mut keys = vec![HostKey { path: String::from(APPX), values: APPX_DIRECTORIES.iter().map(|(name, path)| (String::from(*name), 1, registry_string(path))).collect() }];
+    let mut keys = vec![
+        HostKey { path: String::from(APPX), values: APPX_DIRECTORIES.iter().map(|(name, path)| (String::from(*name), 1, registry_string(path))).collect() },
+        HostKey { path: String::from(STATE_REPOSITORY), values: Vec::new() },
+    ];
     #[cfg(windows)]
     {
         use crate::host_language::registry;
@@ -529,6 +543,7 @@ mod service_tests {
         assert!(key(&software, "Microsoft\\Windows NT\\CurrentVersion\\Svchost\\appmodel").is_some_and(|group| group.values.iter().any(|(name, _, _)| name.eq_ignore_ascii_case("CoInitializeSecurityParam"))));
         let appx = key(&software, super::APPX).expect("Appx");
         assert_eq!(text(appx, "PackageRepositoryRoot"), ["C:\\ProgramData\\Microsoft\\Windows\\AppRepository"]);
+        assert!(key(&software, super::STATE_REPOSITORY).is_some_and(|settings| settings.values.is_empty()));
         for program in ["Windows.StateRepository.dll", "StateRepository.Core.dll"] {
             assert!(crate::windows_binaries::user_programs().any(|staged| staged.eq_ignore_ascii_case(program)), "{program}");
         }

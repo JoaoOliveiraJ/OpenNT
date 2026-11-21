@@ -554,10 +554,13 @@ const SMSS_PROGRAMS: &[&str] = &[
 /// serviço atende, como IUserStatics, e três classes em processo); a carga
 /// atrasada do ADSI (activeds.dll, só de conta de domínio) fica com o stub do
 /// KernelBase. E o StateRepository (`user_services`): o
-/// Windows.StateRepository.dll (o ServiceDll) e o StateRepository.Core.dll,
-/// a camada de dados com o SQLite que ele importa. Os imports estáticos
-/// deles já estão no volume.
-const SERVICE_CHAIN_PROGRAMS: &[&str] = &["umpo.dll", "psmsrv.dll", "SystemEventsBrokerServer.dll", "brokerlib.dll", "umpnpmgr.dll", "profsvc.dll", "profext.dll", "profsvcext.dll", "wevtsvc.dll", "wevtapi.dll", "usermgr.dll", "UserMgrProxy.dll", "Windows.StateRepository.dll", "StateRepository.Core.dll"];
+/// Windows.StateRepository.dll (o ServiceDll), o StateRepository.Core.dll,
+/// a camada de dados com o SQLite que ele importa, e o
+/// Windows.StateRepositoryUpgrade.dll, que o _Upgrade do ServiceMain carrega
+/// pelo nome ao criar os bancos (sem ele, ERROR_MOD_NOT_FOUND no ponto de
+/// controle 0x320 e o ServiceMain volta logo). Os imports estáticos deles já
+/// estão no volume.
+const SERVICE_CHAIN_PROGRAMS: &[&str] = &["umpo.dll", "psmsrv.dll", "SystemEventsBrokerServer.dll", "brokerlib.dll", "umpnpmgr.dll", "profsvc.dll", "profext.dll", "profsvcext.dll", "wevtsvc.dll", "wevtapi.dll", "usermgr.dll", "UserMgrProxy.dll", "Windows.StateRepository.dll", "StateRepository.Core.dll", "Windows.StateRepositoryUpgrade.dll"];
 
 /// O console: o conhost.exe que o condrv.sys cria para um programa de
 /// console, o cmd.exe (com o cmdext.dll do ext-ms-win-cmd-util), o net.exe,
