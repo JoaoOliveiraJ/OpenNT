@@ -5532,7 +5532,17 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   `Authentication\LogonUI` sem o último logon, o estado do boot nem os SIDs
   de usuário desta máquina, os `Time Zones` que a Calendar lê e os
   serviços de texto de `Microsoft\CTF` que o TSF em processo da caixa de
-  senha lê (`xtask/src/logon_screen.rs`), e a chave `Microsoft\Windows\DWM`
+  senha lê, as associações do shell de uma instalação nova (`Folder`,
+  `Directory`, `Drive`, `.exe`/`exefile`, `.com`, `.bat`, `.cmd`, `.txt`/
+  `txtfile` e `.lnk`/`lnkfile`: só os verbos cujo DelegateExecute é uma
+  classe copiada ou cujo comando abre o próprio arquivo ou um programa do
+  volume, só os manipuladores de `shellex` de classes copiadas, sem as
+  listas de OpenWith e sem valores com caminhos fora do Windows do
+  convidado, e com os valores de uma instalação nova no open de `Folder`,
+  dos programas e do `txtfile`; o que sai vai num AVISO) e as zonas de
+  segurança (`Internet Settings\Zones` e os protocolos padrão do mapa de
+  zonas, que o ZoneCheckUrlExW do ShellExecute consulta)
+  (`xtask/src/logon_screen.rs`), e a chave `Microsoft\Windows\DWM`
   que o dwm.exe, o dwmcore e o dcomp leem e em que o dwminit grava a
   atividade de cada sessão (sem os `DwmInitSessionActivityId_*` desta
   máquina, `xtask/src/window_manager.rs`); a
