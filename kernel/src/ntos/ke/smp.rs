@@ -968,6 +968,43 @@ fn processor_bit(online_index: usize) -> u64 {
 /// A confirmação do BSP na mailbox (a geração de invalidação que ele
 /// atendeu na NMI dele, `irq_common`; os APs confirmam no slot de cada um).
 const MAILBOX_BOOTSTRAP_ACK: u64 = 0x40;
+/// As NMIs de shootdown repetidas ao BSP ainda não vistas pelo tratador
+/// dele: uma NMI sem geração nova é uma delas enquanto a conta não é zero.
+const MAILBOX_BOOTSTRAP_SPARE: u64 = 0x44;
+
+/// O intervalo entre as NMIs repetidas a um alvo que não confirmou
+/// ([`wait_resending`]).
+const NMI_RESEND_MS: u64 = 20;
+
+/// [`wait_on_targets`] que manda de novo, a cada [`NMI_RESEND_MS`], a NMI aos
+/// alvos que ainda não confirmaram (`resend` recebe a máscara deles).
+fn wait_resending(report_ms: u64, what: &str, mut pending: impl FnMut() -> u64, mut resend: impl FnMut(u64)) -> IpiWait {
+    let frequency = clock::QPC_FREQUENCY;
+    let start = clock::query_performance_counter_value();
+    let mut last = start;
+    let mut slow = 0;
+    loop {
+        let waiting = pending();
+        let current = clock::query_performance_counter_value();
+        let elapsed = current.wrapping_sub(start);
+        if waiting == 0 {
+            let elapsed_ms = (elapsed as u128 * 1000 / frequency as u128) as u64;
+            if slow != 0 {
+                debug_print!("[smp] {}: os processadores {:#x} responderam depois de {} ms", what, slow, elapsed_ms);
+            }
+            return IpiWait { elapsed_ms, slow };
+        }
+        if deadline_passed(current.wrapping_sub(last), frequency, NMI_RESEND_MS * timeout_scale()) {
+            resend(waiting);
+            last = current;
+        }
+        if slow == 0 && deadline_passed(elapsed, frequency, report_ms) {
+            slow = waiting;
+            debug_print!("[smp] {}: processadores {:#x} sem resposta ha {} ms; a espera continua (sem prazo, como o flush de TLB do 19041)", what, waiting, report_ms);
+        }
+        cpu::pause();
+    }
+}
 
 /// A NMI de shootdown aos processadores online cujo bit (pelo número do
 /// processador) está em `targets`, menos o corrente, e a espera das
@@ -1013,7 +1050,29 @@ fn shootdown(targets: u64, flush_caches: bool) -> Result<(), KernelError> {
             let aps = selected.iter().filter(|&&(_, slot)| physical::read32(slot_address(slot) + 0x3C) != generation).fold(0u64, |mask, &(index, _)| mask | processor_bit(index));
             aps | (bootstrap && physical::read32(MAILBOX + MAILBOX_BOOTSTRAP_ACK) != generation) as u64
         };
-        wait_on_targets(slow_interrupt_report_ms(), "confirmacao do shootdown de TLB", pending);
+        // Uma NMI pode se perder: o QEMU sob o WHPX injeta a pendente pelo
+        // registro de interrupção pendente mesmo com a CPU ainda dentro do
+        // tratador da anterior (NMIs bloqueadas até o IRET), o hipervisor
+        // recusa ("Failed to set interrupt state registers") e a NMI some,
+        // em vez de ficar retida como no hardware. A espera manda de novo a
+        // quem ainda não confirmou; a NMI repetida não muda nada no alvo (a
+        // geração já confirmada), e a do BSP é contada antes, para o
+        // tratador dele não a tomar por outra coisa.
+        let resend = |waiting: u64| {
+            for &(index, slot) in &selected {
+                if waiting & processor_bit(index) != 0 {
+                    send_processor_interrupt(physical::read32(slot_address(slot) + SLOT_CONTROLLER_IDENTIFIER), 0x4400);
+                }
+            }
+            if waiting & 1 != 0 {
+                // SAFETY: a célula da mailbox, no mapa direto; o tratador do
+                // BSP a decrementa com LOCK DEC.
+                let spare = unsafe { &*(physical::to_virtual(MAILBOX + MAILBOX_BOOTSTRAP_SPARE) as *const core::sync::atomic::AtomicU32) };
+                spare.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+                send_processor_interrupt(bsp_apic_id_unlocked(), 0x4400);
+            }
+        };
+        wait_resending(slow_interrupt_report_ms(), "confirmacao do shootdown de TLB", pending, resend);
         Ok(())
     })();
     cpu::restore_interrupts(flags);

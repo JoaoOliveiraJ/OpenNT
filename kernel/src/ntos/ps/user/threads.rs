@@ -1251,25 +1251,14 @@ fn run_interval(next: &Arc<UserThread>, kernel: KernelState, executor: fn(u64, u
     }
     if exit.is_none() {
         match execute(next, executor) {
-            Ok((status, exit_kind)) => {
+            Ok((status, exit_kind, failed)) => {
                 kind = exit_kind;
                 if exit_kind == 0 {
                     // NtTerminateProcess do próprio processo (ou uma exceção
                     // de segunda chance): o intervalo acabou de vez.
                     exit = Some(status);
-                } else if exit_kind != EXIT_BLOCKED && exit_kind != EXIT_THREAD_EXITED {
-                    // Captura de chamada e exceções (#DB próprio do usuário
-                    // ou pendente); um bloqueio não é saída do serviço. Roda
-                    // no contexto da thread: a entrega escreve na pilha dela.
-                    let handler = *EXIT_HANDLER.lock();
-                    let failed = match handler {
-                        Some(handler) => handler(next, exit_kind, status),
-                        None if exit_kind == 3 => status,
-                        None => 0,
-                    };
-                    if failed != 0 {
-                        exit = Some(failed);
-                    }
+                } else if failed != 0 {
+                    exit = Some(failed);
                 }
             }
             Err(error) => {
@@ -1412,7 +1401,7 @@ fn progress(process: u64) -> Progress {
 /// usuário e o PspExitThread roda na pilha de kernel dela
 /// (`usermode::exec_kernel_routine`, o KiSchedulerApcTerminate). Devolve o
 /// resultado e o tipo da saída.
-fn execute(thread: &Arc<UserThread>, executor: fn(u64, u64) -> u32) -> Result<(u32, u32), KernelError> {
+fn execute(thread: &Arc<UserThread>, executor: fn(u64, u64) -> u32) -> Result<(u32, u32, u32), KernelError> {
     let pointer = thread.pointer();
     let cpu = cpu();
     let kernel_before = process::thread_kernel_time(pointer);
@@ -1437,6 +1426,23 @@ fn execute(thread: &Arc<UserThread>, executor: fn(u64, u64) -> u32) -> Result<(u
         executor(context, teb)
     };
     SLICE_THREAD[cpu].store(0, Ordering::Release);
+    let exit_kind = crate::hal::amd64::usermode::block().exit_kind.get();
+    // A captura de chamada e as exceções do intervalo (#DB próprio do usuário
+    // ou pendente, a falta de página), tratadas com a thread ainda Running
+    // nesta CPU, como o KiDispatchException do 19041 roda no contexto da
+    // thread antes de qualquer troca: a entrega escreve na pilha e no CONTEXT
+    // dela, que outra CPU não pode tomar no meio. Um bloqueio não é saída do
+    // serviço. Devolve o status fatal, se a entrega falhou.
+    let failed = if exit_kind != 0 && exit_kind != EXIT_BLOCKED && exit_kind != EXIT_THREAD_EXITED {
+        let handler = *EXIT_HANDLER.lock();
+        match handler {
+            Some(handler) => handler(thread, exit_kind, status),
+            None if exit_kind == 3 => status,
+            None => 0,
+        }
+    } else {
+        0
+    };
     // Um término pedido por outra CPU durante o intervalo: a espera que ele
     // concluiria conclui agora, pela dona.
     apply_deferred_termination(thread);
@@ -1487,7 +1493,7 @@ fn execute(thread: &Arc<UserThread>, executor: fn(u64, u64) -> u32) -> Result<(u
     let elapsed = (clock::uptime_ms() - started) * 10_000;
     let kernel = process::thread_kernel_time(pointer).saturating_sub(kernel_before);
     process::account_thread(pointer, false, elapsed.saturating_sub(kernel));
-    Ok((status, crate::hal::amd64::usermode::block().exit_kind.get()))
+    Ok((status, exit_kind, failed))
 }
 
 /// Threads de qualquer processo terminadas enquanto bloqueadas no kernel,
@@ -1507,7 +1513,7 @@ fn resume_terminated(executor: fn(u64, u64) -> u32, caller: u64) -> Result<(), K
         process::set_current_thread(thread.pointer());
         let outcome = execute(&thread, executor);
         process::set_current_thread(caller);
-        let (status, kind) = outcome?;
+        let (status, kind, _) = outcome?;
         let process = thread.with(|thread| thread.process_pointer);
         if kind == 0 {
             crate::ntos::ps::create::exit_process(process, status);

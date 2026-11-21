@@ -192,6 +192,13 @@ irq_nmi_translations:
     mov dword ptr [rcx + {bootstrap_ack}], r8d
     jmp irq_nmi_return
 irq_nmi_not_shootdown:
+    # Uma NMI de shootdown repetida (a anterior ja atendida): a conta da
+    # mailbox desce e a NMI acaba aqui.
+    cmp dword ptr [rcx + {bootstrap_spare}], 0
+    je irq_nmi_not_spare
+    lock dec dword ptr [rcx + {bootstrap_spare}]
+    jmp irq_nmi_return
+irq_nmi_not_spare:
     cmp byte ptr [rip + opennt_kd_trap_active], 0
     jne irq_nmi
     # Sem o depurador, a NMI do perfil por amostragem (`kd::sampler`, a
@@ -838,6 +845,7 @@ irq_kernel_resume_vector:
     processor_ticks = const crate::ntos::ke::pcr::layout::PROCESSOR_TICKS,
     direct_mailbox = const memory_map::direct_map(memory_map::SMP_MAILBOX_PHYS),
     bootstrap_ack = const 0x40,
+    bootstrap_spare = const 0x44,
 );
 
 extern "C" {

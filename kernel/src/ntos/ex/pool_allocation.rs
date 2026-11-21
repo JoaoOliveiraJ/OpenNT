@@ -195,6 +195,13 @@ pub fn free(pointer: u64, tag: u64) -> Result<(), KernelError> {
     }
     session_pool::untrack_nonpaged(pointer);
     if guest::in_arena(pointer) {
+        // Um bloco que a arena não tem (já liberado, ou nunca alocado): o
+        // BAD_POOL_CALLER 7 do ExFreePoolWithTag do 19041 (o bloco já
+        // liberado), com a pilha nativa de quem liberou no [kcrash].
+        if !guest::owns_allocation(pointer) {
+            debug_print!("[pool] liberacao de um bloco da arena que nao esta alocado: {:#x} (tag {:#x})", pointer, tag);
+            bugcheck::bug_check_ex(0xC2, 7, 0, tag, pointer);
+        }
         guest::free_bytes(pointer);
     } else if data_pool::owns(pointer) {
         data_pool::free(pointer)?;

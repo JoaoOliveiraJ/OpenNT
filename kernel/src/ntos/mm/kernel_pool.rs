@@ -375,6 +375,10 @@ pub fn allocate(bytes: u64, options: AllocateOptions) -> Result<u64, KernelError
         return Ok(0);
     }
     let mut pool = POOL.lock();
+    // A escolha da primeira passagem é refeita sob a trava: com ela solta
+    // (o reclaim de páginas), outra CPU pode ter alocado da mesma região, e
+    // o índice e o deslocamento livres de antes já não valem.
+    let chosen = chosen.and_then(|(id, _)| pool.regions.get(&id).filter(|region| !region.busy).and_then(|region| fit(region, rounded, options.alignment)).map(|choice| (id, choice)));
     let (id, (free_index, offset)) = match chosen {
         Some(choice) => choice,
         None => match pool.create_region(rounded.div_ceil(4096) * 4096, options.paged, options.nx, options.cold) {
