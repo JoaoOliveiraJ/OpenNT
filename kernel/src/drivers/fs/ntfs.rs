@@ -1113,10 +1113,10 @@ impl Ntfs {
 
     /// `[offset, offset+length)` do $DATA para as páginas `pages` (frames de
     /// 4 KB), em ordem: cada trecho contíguo no disco num comando de DMA com
-    /// um PRD por página, em vez de um comando por página; acima do
+    /// um PRD por pedaço de página, em vez de um comando por página; acima do
     /// ValidDataLength, zeros, como em [`Ntfs::copy_range_to_physical`]. Um
-    /// `offset` fora da página, clusters menores que a página ou um frame
-    /// acima de 4 GB vão página a página por aquela.
+    /// `offset` fora do setor ou um frame acima de 4 GB vão página a página
+    /// por aquela.
     pub fn copy_range_to_pages(&self, path: &str, offset: u64, pages: &[u64], length: u64) -> Result<(), KernelError> {
         const PAGE: u64 = 4096;
         let _shared = self.resource().acquire_shared();
@@ -1124,7 +1124,7 @@ impl Ntfs {
             return Err(error("NTFS: paginas de destino insuficientes"));
         }
         let layout = self.file_layout(path)?.filter(|layout| offset + length <= layout.size).ok_or_else(|| error("NTFS: faixa de copia invalida"))?;
-        let direct = layout.runs.is_some() && offset % PAGE == 0 && self.geometry.cluster_size % PAGE == 0 && pages.iter().all(|&page| page % PAGE == 0 && page + PAGE <= 0x1_0000_0000);
+        let direct = layout.runs.is_some() && offset % 512 == 0 && self.geometry.cluster_size % 512 == 0 && pages.iter().all(|&page| page % PAGE == 0 && page + PAGE <= 0x1_0000_0000);
         let Some(runs) = layout.runs.filter(|_| direct) else {
             let mut done = 0;
             for &page in pages {
@@ -1145,12 +1145,12 @@ impl Ntfs {
             }
             let run_end = run_start + run.sectors * 512;
             if cursor < run_end {
-                // Os runs começam em fronteira de cluster, múltiplo da página:
-                // cada trecho começa numa página inteira do destino. O último
-                // setor é lido inteiro (cabe na página dele).
+                // Os runs começam em fronteira de cluster, múltiplo do setor:
+                // cada trecho começa num setor inteiro do destino. O último
+                // setor é lido inteiro (cabe na página dele: o destino tem
+                // páginas inteiras).
                 let take = (end - cursor).min(run_end - cursor);
-                let first = ((cursor - offset) / PAGE) as usize;
-                ata_pio::read_sectors_dma_to_pages(run.lba + (cursor - run_start) / 512, take.div_ceil(512) as u32, self.drive, &pages[first..])?;
+                ata_pio::read_sectors_dma_to_pages(run.lba + (cursor - run_start) / 512, take.div_ceil(512) as u32, self.drive, pages, cursor - offset)?;
                 cursor += take;
             }
             run_start = run_end;
