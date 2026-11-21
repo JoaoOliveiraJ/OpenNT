@@ -129,6 +129,10 @@ static DISPATCHERS: AtomicU64 = AtomicU64::new(1);
 /// As CPUs ociosas no HLT do laço ocioso (o KiIdleSummary do 19041): quem
 /// apronta uma thread acorda uma delas.
 static IDLE: AtomicU64 = AtomicU64::new(0);
+/// As CPUs ociosas que um shootdown da metade de sistema deixou de
+/// interromper: descartam a TLB ao acordar ([`leave_idle`]), como o
+/// KiFlushTb do 19041, que não manda o IPI às ociosas.
+static TLB_STALE: AtomicU64 = AtomicU64::new(0);
 /// As CPUs que já receberam o IPI de preempção e ainda não voltaram ao
 /// despacho (um só IPI por vez).
 static KICKED: AtomicU64 = AtomicU64::new(0);
@@ -1479,9 +1483,28 @@ pub fn enter_idle() {
     }
 }
 
-/// A CPU corrente acordou do laço ocioso.
+/// A CPU corrente acordou do laço ocioso: um shootdown que a pulou enquanto
+/// dormia ([`awake_flush_targets`]) vale agora, antes de ela tocar em
+/// qualquer VA de sistema que ele invalidou.
 pub fn leave_idle() {
-    IDLE.fetch_and(!(1 << cpu_index()), Ordering::SeqCst);
+    let bit = 1u64 << cpu_index();
+    IDLE.fetch_and(!bit, Ordering::SeqCst);
+    if TLB_STALE.load(Ordering::SeqCst) & bit != 0 && TLB_STALE.fetch_and(!bit, Ordering::SeqCst) & bit != 0 {
+        cpu::reload_cr3();
+    }
+}
+
+/// Dos `targets` de um shootdown da metade de sistema, as CPUs que precisam
+/// da NMI: as ociosas no HLT ficam marcadas e descartam a TLB ao acordar
+/// ([`leave_idle`]). A marca vem antes da segunda leitura das ociosas: a CPU
+/// que acorda depois dela vê a marca, e a que acordou antes recebe a NMI.
+pub fn awake_flush_targets(targets: u64) -> u64 {
+    let idle = IDLE.load(Ordering::SeqCst) & targets;
+    if idle == 0 {
+        return targets;
+    }
+    TLB_STALE.fetch_or(idle, Ordering::SeqCst);
+    targets & !(IDLE.load(Ordering::SeqCst) & idle)
 }
 
 /// A CPU corrente voltou ao despacho: o IPI de preempção que ela recebeu já

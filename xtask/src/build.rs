@@ -84,8 +84,9 @@ pub struct BuildOptions {
     /// `--slow-service-exit`: toda saída de serviço passa pelo despachante
     /// (sem a volta direta ao anel 3, o KiSystemServiceExit, que é o padrão).
     pub slow_service_exit: bool,
-    /// `--user-smp`: os APs armam o anel 3 no boot e esperam no laço ocioso
-    /// deles (`ke::smp::start_scheduling`).
+    /// `--user-smp`: os APs armam o anel 3 no boot e despacham threads de
+    /// usuário no laço ocioso deles, junto com o BSP
+    /// (`ke::smp::start_scheduling`, `ke::smp::enable_user_dispatch`).
     pub user_smp: bool,
     /// `--initial-process=smss`: o kernel inicia o smss.exe real como o
     /// primeiro processo de usuário (vazio = o boot comum).

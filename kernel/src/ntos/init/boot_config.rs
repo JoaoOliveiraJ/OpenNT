@@ -114,7 +114,8 @@ pub fn trace_files() -> bool {
 }
 
 /// `USERSMP` (`--user-smp`): os APs armam o anel 3 no boot
-/// (`ke::smp::start_scheduling`).
+/// (`ke::smp::start_scheduling`) e despacham threads de usuário junto com o
+/// BSP (`ke::smp::enable_user_dispatch`).
 pub fn user_smp() -> bool {
     flag(name::USER_SMP)
 }

@@ -144,7 +144,8 @@ opcoes de build:   --release --build-dir=DIR --user-program=shell
                    opcao ela volta direto ao anel 3 quando nada pede o despachante;
                    --fast-service-exit, o padrao, e aceita e nao muda nada)
                    --user-smp (os APs armam o anel 3 no boot: GDT, TSS, IDT, MSRs de syscall e
-                   timer local de cada um, esperando no laco ocioso deles)
+                   timer local de cada um, e despacham threads de usuario no laco ocioso deles,
+                   junto com o BSP)
                    --windows-dir=DIR (binarios do Windows do bundle; padrao build/windows)
                    --pnp-root=acpi|internal (raiz da arvore de dispositivos; padrao acpi)
                    --usb (controladora xHCI com teclado e tablet USB)

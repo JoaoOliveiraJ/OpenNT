@@ -944,9 +944,19 @@ pub fn flush_root(root: u64) {
 /// com AllProcessors do 19041): todas as outras CPUs online.
 pub fn flush_kernel_page() {
     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+    let targets = super::thread_dispatch::awake_flush_targets(u64::MAX & !own_processor_bit());
+    if targets & (online_mask() & !own_processor_bit()) == 0 {
+        return;
+    }
     let started = cpu::rdtsc();
-    let _ = shootdown(u64::MAX, false);
+    let _ = shootdown(targets, false);
     crate::ntos::ps::dispatch_perf::KERNEL_SHOOTDOWNS.add_since(started);
+}
+
+/// Os processadores online, pelo número (o BSP e os APs que partiram).
+fn online_mask() -> u64 {
+    let count = online_cpu_count().min(64);
+    if count == 64 { u64::MAX } else { (1u64 << count) - 1 }
 }
 
 /// O bit do processador de número N é o do AP da N-ésima posição entre os

@@ -103,7 +103,11 @@ pub fn initialize(list: u64, allocate_routine: u64, free_routine: u64, flags: u3
     if irql::get_irql() > 2 {
         return Err(KernelError::new("lookaside initialization at invalid IRQL"));
     }
-    if STATE.lock().lists.contains_key(&list) {
+    // O registro (o ExPagedLookasideListHead/ExNPagedLookasideListHead) e
+    // o mapa das listas mudam sob a mesma trava: duas CPUs que inicializam
+    // ou excluem listas ao mesmo tempo não corrompem os vínculos.
+    let mut state = STATE.lock();
+    if state.lists.contains_key(&list) {
         return Err(KernelError::new("lookaside initialized twice"));
     }
     slist::initialize(list)?;
@@ -127,7 +131,6 @@ pub fn initialize(list: u64, allocate_routine: u64, free_routine: u64, flags: u3
     }
     list_entry::insert_tail(head, &descriptor.list_entry);
     let register = {
-        let mut state = STATE.lock();
         state.lists.insert(list, paged);
         let first = !state.pressure_registered;
         if first {
@@ -136,6 +139,7 @@ pub fn initialize(list: u64, allocate_routine: u64, free_routine: u64, flags: u3
         }
         first
     };
+    drop(state);
     if register {
         // O pool já cuida das traduções; o cache só devolve blocos livres.
         page_residency::register(
@@ -213,13 +217,16 @@ pub fn free(list: u64, block: u64) -> Result<(), KernelError> {
 pub fn delete(list: u64) -> Result<(), KernelError> {
     let descriptor = lookaside(list);
     check_irql(descriptor)?;
-    if !STATE.lock().lists.contains_key(&list) {
-        return Err(KernelError::new("lookaside is not registered"));
+    {
+        let mut state = STATE.lock();
+        if !state.lists.contains_key(&list) {
+            return Err(KernelError::new("lookaside is not registered"));
+        }
+        if list_entry::remove(&descriptor.list_entry).is_none() {
+            return Err(KernelError::new("corrupt lookaside registry links"));
+        }
+        state.lists.remove(&list);
     }
-    if list_entry::remove(&descriptor.list_entry).is_none() {
-        return Err(KernelError::new("corrupt lookaside registry links"));
-    }
-    STATE.lock().lists.remove(&list);
     descriptor.depth.set(0);
     descriptor.list_entry.flink.set(0);
     let mut block = slist::flush(list)?;
